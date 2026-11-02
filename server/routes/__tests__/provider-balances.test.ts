@@ -209,11 +209,11 @@ describe("apikey-quota answers every entry point consistently", () => {
 		expect(routeBody[config().id]?.status).toBe("supported");
 	});
 
-	test("a disabled plugin still answers the route from the bundled adapters", async () => {
+	test("a disabled plugin reports plugin_not_enabled instead of answering the route", async () => {
 		const { createApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
 		const { setProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
-		// A disabled plugin surfaces as an unavailable tool; the engine must fall back rather
-		// than fail the request. The bundled transport is what the mocked outbound observes.
+		// The plugin owns the capability, so disabling it must be visible on the route the UI
+		// reads — and the bundled transport must not answer the question behind its back.
 		const engine = createApikeyQuotaEngine({
 			tools: {
 				invoke: async () => {
@@ -228,9 +228,9 @@ describe("apikey-quota answers every entry point consistently", () => {
 			const response = await appForRole("user").request("/api/provider-balances");
 			expect(response.status).toBe(200);
 			expect(await response.json()).toMatchObject({
-				[config().id]: { status: "supported", adapter: "sub2api" },
+				[config().id]: { status: "error", error: "plugin_not_enabled", balance: null },
 			});
-			expect(outbound.outboundFetch).toHaveBeenCalled();
+			expect(outbound.outboundFetch).not.toHaveBeenCalled();
 		} finally {
 			await engine.dispose();
 		}

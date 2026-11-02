@@ -375,8 +375,9 @@ app.route("/api/plugins", pluginUiRoutes);
 // Provider balance (API-key quota) querying is answered by the built-in `apikey-quota`
 // plugin, which ships with the app and is enabled by default. It is a normal plugin: the tool
 // goes through `pluginToolRegistry`, so its process lifecycle, capabilities and health are the
-// shared ones. Disabling it in the plugin list falls back to the bundled adapters with no
-// user-visible change.
+// shared ones. The plugin owns the capability, so disabling it in the plugin list turns quota
+// querying off: the snapshot then reports `plugin_not_enabled` instead of quietly answering
+// from the bundled adapters, and re-enabling it restores the value on the next discovery.
 setApikeyQuotaActivation(pluginManager);
 setProviderBalanceEngine(builtinApikeyQuotaEngine);
 

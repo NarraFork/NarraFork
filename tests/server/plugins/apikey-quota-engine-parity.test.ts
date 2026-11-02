@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { BalanceProbeRequestError } from "@server/lib/provider-balance-adapters";
 import { builtinProviderBalanceEngine } from "@server/lib/provider-balance-engine";
 import type { CustomApiProviderConfig } from "@server/lib/settings";
 import { createApikeyQuotaEngine } from "@server/services/apikey-quota-plugin-engine";
@@ -273,20 +274,20 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 		}
 	});
 
-	test("a disabled plugin answers with the same data as the bundled engine", async () => {
+	test("a disabled plugin reports plugin_disabled instead of answering like the bundled engine", async () => {
 		body = payloads["sub2api wallet"];
+		requests = [];
 		const base = `http://127.0.0.1:${server.port}/v1`;
 		const disabled = await disabledPluginEngine();
 		try {
-			const viaDisabled = await disabled.probe({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-			});
-			const viaBuiltin = await builtinProviderBalanceEngine.probe({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-			});
-			expect(viaDisabled).toEqual(viaBuiltin);
+			const error = await disabled
+				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
+				.catch((thrown) => thrown);
+			// The plugin owns the capability: a disabled plugin is a deterministic failure, not
+			// an invitation for the bundled adapters to answer the same question in-process.
+			expect(error).toBeInstanceOf(BalanceProbeRequestError);
+			expect((error as BalanceProbeRequestError).kind).toBe("plugin_disabled");
+			expect(requests).toEqual([]);
 		} finally {
 			await disabled.dispose();
 		}
@@ -310,6 +311,154 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 		} finally {
 			await plugin.dispose();
 		}
+	});
+
+	/**
+	 * The site-account route (`/api/user/self`) must behave identically through both
+	 * implementations, including its failure classification.
+	 *
+	 * These live inside this describe on purpose: they need the live shared manager. A second
+	 * manager created after this describe's `afterAll` cannot activate the plugin, and the
+	 * engine would then answer from the bundled adapters — turning every case below into a
+	 * comparison of the bundled engine with itself.
+	 */
+	describe("site-account credit", () => {
+		const siteBody = {
+			success: true,
+			data: { quota: 2_500_000, used_quota: 500_000, group: "pro" },
+		};
+		let site: ReturnType<typeof Bun.serve>;
+		/** Swapped per test so one server can answer success or a fixed status. */
+		let respond: () => Response = () => Response.json(siteBody);
+
+		beforeAll(() => {
+			site = Bun.serve({
+				port: 0,
+				fetch: (request) => {
+					const url = new URL(request.url);
+					if (url.pathname !== "/api/user/self") {
+						return new Response("not found", { status: 404 });
+					}
+					return respond();
+				},
+			});
+		});
+
+		afterAll(() => {
+			site.stop(true);
+		});
+
+		/**
+		 * The plugin-backed engine.
+		 *
+		 * This file degrades to a bundled-vs-bundled comparison whenever the plugin cannot be
+		 * activated with a live host context — which is what happens when it runs standalone
+		 * (`CONTEXT_UNAVAILABLE`), for every case in the file, not just the ones below. The
+		 * plugin's own site behaviour is therefore pinned by the contract test, which imports
+		 * the plugin module directly instead of crossing the RPC boundary.
+		 */
+		const pluginEngineForSite = async () => {
+			const manager = await sharedManager();
+			return createApikeyQuotaEngine({
+				tools: pluginPlatformServices.toolRegistry,
+				activator: manager,
+			});
+		};
+
+		const siteConfig = (baseUrl: string): CustomApiProviderConfig => ({
+			...config(baseUrl),
+			quotaSiteUrl: `http://127.0.0.1:${site.port}`,
+			quotaAccessToken: "site-token",
+			quotaUserId: "42",
+		});
+
+		test("probe returns the same USD credit and group", async () => {
+			respond = () => Response.json(siteBody);
+			const base = `http://127.0.0.1:${site.port}/v1`;
+			const plugin = await pluginEngineForSite();
+			try {
+				const viaPlugin = await plugin.probe({
+					config: siteConfig(base),
+					signal: AbortSignal.timeout(20_000),
+				});
+				const viaBuiltin = await builtinProviderBalanceEngine.probe({
+					config: siteConfig(base),
+					signal: AbortSignal.timeout(20_000),
+				});
+				expect(viaPlugin).toEqual(viaBuiltin);
+				expect(viaPlugin?.adapter).toBe("new-api-user");
+				expect(viaPlugin?.balance.amounts[0]).toMatchObject({
+					unit: "USD",
+					remaining: 5,
+					used: 1,
+					total: 6,
+				});
+				expect(viaPlugin?.balance.planName).toBe("pro");
+			} finally {
+				await plugin.dispose();
+			}
+		});
+
+		test("a rejected token is the same deterministic kind in both", async () => {
+			respond = () => new Response(null, { status: 401 });
+			const base = `http://127.0.0.1:${site.port}/v1`;
+			const plugin = await pluginEngineForSite();
+			try {
+				const pluginError = await plugin
+					.probe({ config: siteConfig(base), signal: AbortSignal.timeout(20_000) })
+					.catch((error) => error);
+				const builtinError = await builtinProviderBalanceEngine
+					.probe({ config: siteConfig(base), signal: AbortSignal.timeout(20_000) })
+					.catch((error) => error);
+				expect(pluginError?.kind).toBe("auth");
+				expect(builtinError?.kind).toBe("auth");
+			} finally {
+				await plugin.dispose();
+			}
+		});
+
+		test("a missing user id is invalid_configuration in both", async () => {
+			respond = () => Response.json(siteBody);
+			const base = `http://127.0.0.1:${site.port}/v1`;
+			const missing = { ...siteConfig(base), quotaUserId: "" };
+			const plugin = await pluginEngineForSite();
+			try {
+				const pluginError = await plugin
+					.probe({ config: missing, signal: AbortSignal.timeout(20_000) })
+					.catch((error) => error);
+				const builtinError = await builtinProviderBalanceEngine
+					.probe({ config: missing, signal: AbortSignal.timeout(20_000) })
+					.catch((error) => error);
+				expect(pluginError?.kind).toBe("invalid_configuration");
+				expect(builtinError?.kind).toBe("invalid_configuration");
+			} finally {
+				await plugin.dispose();
+			}
+		});
+
+		test("refresh matches the bundled refresh on the confirmed root", async () => {
+			respond = () => Response.json(siteBody);
+			const base = `http://127.0.0.1:${site.port}/v1`;
+			const root = `http://127.0.0.1:${site.port}`;
+			const plugin = await pluginEngineForSite();
+			try {
+				const viaPlugin = await plugin.refresh({
+					config: siteConfig(base),
+					signal: AbortSignal.timeout(20_000),
+					adapter: "new-api-user",
+					root,
+				});
+				const viaBuiltin = await builtinProviderBalanceEngine.refresh({
+					config: siteConfig(base),
+					signal: AbortSignal.timeout(20_000),
+					adapter: "new-api-user",
+					root,
+				});
+				expect(viaPlugin).toEqual(viaBuiltin);
+			} finally {
+				await plugin.dispose();
+			}
+		});
 	});
 });
 

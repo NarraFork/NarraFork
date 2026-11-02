@@ -40,9 +40,17 @@ const HOP_BY_HOP_HEADERS = new Set([
 	"te",
 ]);
 
+const FAILURE_MESSAGES = {
+	unsupported: "Balance protocol unsupported",
+	transient: "Balance request failed",
+	auth: "Balance credentials rejected",
+	invalid_response: "Balance response was not recognised",
+	invalid_configuration: "Balance configuration is incomplete",
+};
+
 class ProbeRequestError extends Error {
 	constructor(kind) {
-		super(kind === "unsupported" ? "Balance protocol unsupported" : "Balance request failed");
+		super(FAILURE_MESSAGES[kind] ?? FAILURE_MESSAGES.transient);
 		this.name = "ProbeRequestError";
 		this.kind = kind;
 	}
@@ -258,16 +266,130 @@ export function buildBalanceRoots(baseUrl) {
 	return stripped === original ? [original] : [stripped, original];
 }
 
+// --- Site-account credit query (`/api/user/self`) ---
+//
+// Mirrors the host's `provider-balance-adapters.ts` section of the same name. New API sites
+// report an account's credit in internal quota units where 500000 units
+// are one US dollar, authenticated with the site's system access token plus the user id. The
+// inference `sk-` key is rejected by that endpoint.
+
+const NEW_API_USER_QUOTA_DIVISOR = 500_000;
+const NEW_API_USER_ADAPTER = "new-api-user";
+
+export function hasSiteQuotaConfig(input) {
+	return !!(input.siteUrl?.trim?.() || input.accessToken?.trim?.() || input.userId?.trim?.());
+}
+
+/** Resolve or reject the site-account credentials; a half-filled config is deterministic. */
+export function resolveSiteQuotaConfig(input) {
+	const accessToken = typeof input.accessToken === "string" ? input.accessToken.trim() : "";
+	const userId = typeof input.userId === "string" ? input.userId.trim() : "";
+	if (!accessToken || !userId || accessToken.length > 4096 || userId.length > 128) {
+		throw new ProbeRequestError("invalid_configuration");
+	}
+	let roots;
+	try {
+		const siteUrl = typeof input.siteUrl === "string" ? input.siteUrl.trim() : "";
+		roots = buildBalanceRoots(siteUrl || input.baseUrl);
+	} catch {
+		throw new ProbeRequestError("invalid_configuration");
+	}
+	const root = roots[0];
+	if (!root) throw new ProbeRequestError("invalid_configuration");
+	return { root, accessToken, userId };
+}
+
+/** Roots this input can address a quota endpoint at. */
+export function balanceRootCandidates(input) {
+	if (!hasSiteQuotaConfig(input)) return buildBalanceRoots(input.baseUrl);
+	return [resolveSiteQuotaConfig(input).root];
+}
+
+/** Accepts the numeric-string form some New API builds emit for quota fields. */
+function quotaNumber(value) {
+	if (typeof value === "number") return finite(value) ? value : null;
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	if (!/^-?\d{1,18}(?:\.\d{1,9})?$/u.test(trimmed)) return null;
+	const parsed = Number(trimmed);
+	return finite(parsed) ? parsed : null;
+}
+
+export function parseNewApiUserQuota(body) {
+	const wrapper = record(body);
+	if (!wrapper || !bounded(wrapper) || wrapper.success !== true) return null;
+	const data = record(wrapper.data);
+	if (!data) return null;
+	const quota = quotaNumber(data.quota);
+	const used = quotaNumber(data.used_quota);
+	if (quota === null || used === null || quota < -1 || used < 0) return null;
+	const group = typeof data.group === "string" ? data.group.trim() : "";
+	// New API reports -1 when the account has no positive credit limit.
+	if (quota === -1) {
+		const unlimited = { scope: "wallet", unlimited: true, amounts: [] };
+		if (group && group.length <= 128) unlimited.planName = group;
+		return unlimited;
+	}
+	const remaining = quota / NEW_API_USER_QUOTA_DIVISOR;
+	const usedUsd = used / NEW_API_USER_QUOTA_DIVISOR;
+	const total = (quota + used) / NEW_API_USER_QUOTA_DIVISOR;
+	if (![remaining, usedUsd, total].every(finite)) return null;
+	const balance = {
+		scope: "wallet",
+		unlimited: false,
+		amounts: [{ unit: "USD", remaining, used: usedUsd, total }],
+	};
+	if (group && group.length <= 128) balance.planName = group;
+	return balance;
+}
+
+async function readSiteQuota(root, request) {
+	const body = await request(`${root}/api/user/self`, "site-token");
+	const balance = parseNewApiUserQuota(body);
+	if (!balance) throw new ProbeRequestError("invalid_response");
+	return balance;
+}
+
+export async function probeSiteQuota(input, signal, fetcher) {
+	const site = resolveSiteQuotaConfig(input);
+	const request = createRequest(input, signal, fetcher);
+	return {
+		adapter: NEW_API_USER_ADAPTER,
+		root: site.root,
+		balance: await readSiteQuota(site.root, request),
+	};
+}
+
+export async function refreshSiteQuota(input, signal, fetcher) {
+	const site = resolveSiteQuotaConfig(input);
+	const request = createRequest(input, signal, fetcher);
+	return readSiteQuota(normalizeRoot(input.root) || site.root, request);
+}
+
 // --- Bounded transport ---
 
-function buildHeaders(input, authenticated) {
+function buildHeaders(input, auth) {
 	// Public site metadata must not receive even a credential-bearing custom header.
-	if (!authenticated) return { Accept: "application/json" };
+	if (auth === "none") return { Accept: "application/json" };
+	const userAgent =
+		typeof input.userAgent === "string" && input.userAgent.length <= 512
+			? { "User-Agent": input.userAgent }
+			: {};
+	/**
+	 * The site-account query authenticates as the *site* and deliberately carries none of the
+	 * provider's custom headers, which are tuned for the inference endpoint.
+	 */
+	if (auth === "site-token") {
+		return {
+			Authorization: `Bearer ${typeof input.accessToken === "string" ? input.accessToken.trim() : ""}`,
+			"New-Api-User": typeof input.userId === "string" ? input.userId.trim() : "",
+			...userAgent,
+			Accept: "application/json",
+		};
+	}
 	const headers = {
 		Authorization: `Bearer ${input.apiKey}`,
-		...(typeof input.userAgent === "string" && input.userAgent.length <= 512
-			? { "User-Agent": input.userAgent }
-			: {}),
+		...userAgent,
 	};
 	const blocked = new Set(HOP_BY_HOP_HEADERS);
 	const extra = record(input.headers);
@@ -364,15 +486,39 @@ async function readCappedBody(response, signal) {
 }
 
 /**
+ * Map a non-2xx answer onto a failure kind; identical rules to the host transport.
+ *
+ * The legacy endpoints keep their original reading (404/405 means "no such endpoint here").
+ * The site-account endpoint is a fixed path, so 401/403 mean the token or user id was rejected
+ * and other 4xx mean the answer is not the allowance shape — both deterministic.
+ */
+function statusFailureKind(status, auth) {
+	if (auth === "site-token") {
+		if (status === 401 || status === 403) return "auth";
+		if (status === 429 || status >= 500) return "transient";
+		return "invalid_response";
+	}
+	return status === 404 || status === 405 ? "unsupported" : "transient";
+}
+
+/**
  * One allow-listed GET against the provider origin. Every bound the host transport applied
  * is preserved here: single origin, no query/hash, byte cap, JSON-only, no redirects.
  */
 function createRequest(input, signal, fetcher = fetch) {
-	const origin = new URL(input.baseUrl).origin;
-	return async (url, authenticated = true) => {
+	const origins = new Set();
+	for (const value of [input.baseUrl, input.siteUrl]) {
+		if (typeof value !== "string" || value.length === 0) continue;
+		try {
+			origins.add(new URL(value).origin);
+		} catch {
+			// An unusable URL contributes no origin; the caller reports invalid_configuration.
+		}
+	}
+	return async (url, auth = "provider-key") => {
 		const target = new URL(url);
 		if (
-			target.origin !== origin ||
+			!origins.has(target.origin) ||
 			target.username ||
 			target.password ||
 			target.search ||
@@ -388,16 +534,12 @@ function createRequest(input, signal, fetcher = fetch) {
 		try {
 			response = await fetcher(url, {
 				...fetchOptions(input, combined),
-				headers: buildHeaders(input, authenticated),
+				headers: buildHeaders(input, auth),
 			});
-			if (!response.ok) {
-				throw new ProbeRequestError(
-					response.status === 404 || response.status === 405 ? "unsupported" : "transient",
-				);
-			}
+			if (!response.ok) throw new ProbeRequestError(statusFailureKind(response.status, auth));
 			const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
 			if (contentType && contentType !== "application/json" && !contentType.endsWith("+json")) {
-				throw new ProbeRequestError("unsupported");
+				throw new ProbeRequestError(auth === "site-token" ? "invalid_response" : "unsupported");
 			}
 			const declaredLength = Number(response.headers.get("content-length"));
 			if (declaredLength > BALANCE_MAX_RESPONSE_BYTES) {
@@ -407,7 +549,7 @@ function createRequest(input, signal, fetcher = fetch) {
 			try {
 				return JSON.parse(new TextDecoder().decode(bytes));
 			} catch {
-				throw new ProbeRequestError("unsupported");
+				throw new ProbeRequestError(auth === "site-token" ? "invalid_response" : "unsupported");
 			}
 		} catch (error) {
 			if (error instanceof ProbeRequestError) throw error;
@@ -421,7 +563,7 @@ function createRequest(input, signal, fetcher = fetch) {
 async function readNewApi(root, body, request) {
 	let status;
 	try {
-		status = await request(`${root}/api/status`, false);
+		status = await request(`${root}/api/status`, "none");
 	} catch {
 		// Metadata is public and optional; a known key allowance remains supported.
 	}
@@ -435,7 +577,7 @@ export async function probeProviderBalance(input, signal, fetcher) {
 		for (const adapter of ["sub2api", "new-api"]) {
 			try {
 				const path = adapter === "sub2api" ? "/v1/usage" : "/api/usage/token/";
-				const body = await request(root + path, true);
+				const body = await request(root + path, "provider-key");
 				let balance = adapter === "sub2api" ? parseSub2ApiBalance(body) : parseNewApiBalance(body);
 				if (!balance) continue;
 				if (adapter === "new-api") balance = (await readNewApi(root, body, request)) ?? balance;
@@ -454,7 +596,7 @@ export async function refreshProviderBalance(input, signal, fetcher) {
 	const request = createRequest(input, signal, fetcher);
 	try {
 		const path = input.adapter === "sub2api" ? "/v1/usage" : "/api/usage/token/";
-		const body = await request(normalized + path, true);
+		const body = await request(normalized + path, "provider-key");
 		const balance =
 			input.adapter === "sub2api" ? parseSub2ApiBalance(body) : parseNewApiBalance(body);
 		if (!balance) throw new ProbeRequestError("unsupported");
@@ -487,8 +629,18 @@ export function parseToolInput(raw) {
 		input.tlsRejectUnauthorized = raw.tlsRejectUnauthorized;
 	}
 	if (typeof raw.timeoutMs === "number") input.timeoutMs = raw.timeoutMs;
+	// Site-account credit credentials travel per call exactly like the inference key.
+	if (typeof raw.siteUrl === "string" && raw.siteUrl.length <= 2048) input.siteUrl = raw.siteUrl;
+	if (typeof raw.accessToken === "string" && raw.accessToken.length <= 4096) {
+		input.accessToken = raw.accessToken;
+	}
+	if (typeof raw.userId === "string" && raw.userId.length <= 128) input.userId = raw.userId;
 	if (mode === "refresh") {
-		if (raw.adapter !== "sub2api" && raw.adapter !== "new-api") {
+		if (
+			raw.adapter !== "sub2api" &&
+			raw.adapter !== "new-api" &&
+			raw.adapter !== NEW_API_USER_ADAPTER
+		) {
 			throw new ProbeRequestError("unsupported");
 		}
 		if (typeof raw.root !== "string" || raw.root.length > 2048) {
@@ -511,7 +663,11 @@ async function queryBalance(rawInput, signal) {
 	if (input.mode === "probe") {
 		let found;
 		try {
-			found = await probeProviderBalance(input, signal);
+			// A configured site account is authoritative: the inference-key endpoints would
+			// answer a different question, so they are not consulted as a fallback.
+			found = hasSiteQuotaConfig(input)
+				? await probeSiteQuota(input, signal)
+				: await probeProviderBalance(input, signal);
 		} catch (error) {
 			const kind = error instanceof ProbeRequestError ? error.kind : "transient";
 			return failure(kind);
@@ -535,7 +691,10 @@ async function queryBalance(rawInput, signal) {
 	}
 	let balance;
 	try {
-		balance = await refreshProviderBalance(input, signal);
+		balance =
+			input.adapter === NEW_API_USER_ADAPTER
+				? await refreshSiteQuota(input, signal)
+				: await refreshProviderBalance(input, signal);
 	} catch (error) {
 		const kind = error instanceof ProbeRequestError ? error.kind : "transient";
 		return failure(kind);

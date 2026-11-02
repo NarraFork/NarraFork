@@ -13,6 +13,7 @@ import {
 	type ProviderBalanceQueryEngine,
 	type ProviderBalanceRefreshInput,
 } from "../lib/provider-balance-engine";
+import type { CustomApiProviderConfig } from "../lib/settings";
 import { getHttpUserAgent, resolveHttpUserAgent } from "../lib/user-agent";
 import { pluginPlatformServices } from "./plugin-platform-services";
 
@@ -24,16 +25,29 @@ import { pluginPlatformServices } from "./plugin-platform-services";
  * through (`pluginToolRegistry.invoke` with a `plugin_background` principal), so the process
  * lifecycle, capability check, byte limits, timeouts and health accounting are the shared
  * ones. What stays here is only what is specific to this feature: the decision table that maps
- * a plugin answer onto the provider-balance DTO, and the fallback to the bundled adapters.
+ * a plugin answer onto the provider-balance DTO.
  *
  * Decision table:
  * - `ok` / `unsupported` -> authoritative; the bundled adapters do not run.
  * - `failed` -> the existing transient/unsupported probe error.
- * - plugin disabled, unavailable, not registered, or output fails validation -> bundled
- *   adapters, which is exactly the pre-plugin behaviour. Nothing is reported to the user.
+ * - plugin **disabled** -> `plugin_disabled`, a deterministic error. The plugin owns this
+ *   capability, so a disabled plugin means the feature is off: falling back here would keep
+ *   answering quota queries that the administrator switched off. See `pluginDisabled` below.
+ * - plugin unavailable for any *other* reason (not registered, crashed, output fails
+ *   validation) -> bundled adapters, which is the pre-plugin behaviour. An enabled but broken
+ *   plugin must not take the whole feature down with it.
  */
 const FULL_TOOL_ID = `${APIKEY_QUOTA_PLUGIN_ID}/${APIKEY_QUOTA_TOOL_ID}`;
 const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * Error codes that mean "an administrator disabled this plugin", not "the plugin broke".
+ *
+ * Activation is refused by the manager (`PLUGIN_NOT_ENABLED`); a tool call on a plugin whose
+ * registration is already gone is refused by the registry (`PLUGIN_DISABLED`). Both are
+ * configuration states, so both must surface instead of silently falling back.
+ */
+const PLUGIN_DISABLED_CODES = new Set(["PLUGIN_NOT_ENABLED", "PLUGIN_DISABLED"]);
 
 /** The tool-registry slice this engine needs; tests inject a fake. */
 export interface QuotaToolInvoker {
@@ -47,6 +61,12 @@ export interface QuotaToolInvoker {
 /** The manager slice this engine needs: activation is what registers the tool. */
 export interface QuotaPluginActivator {
 	activate(pluginId: string, options?: Record<string, unknown>): Promise<unknown>;
+	/**
+	 * Optional read of the plugin's lifecycle state. The real manager provides it; a test double
+	 * may omit it, in which case the capability is treated as available (the pre-existing
+	 * behaviour for anything that cannot be asked).
+	 */
+	getStatus?(pluginId: string): Promise<{ desiredState?: string } | undefined>;
 }
 
 export interface ApikeyQuotaEngineOptions {
@@ -62,6 +82,36 @@ export type ApikeyQuotaEngine = ProviderBalanceQueryEngine & {
 };
 
 /**
+ * The three things one plugin call can produce.
+ *
+ * `disabled` is deliberately its own outcome rather than an "unavailable" variant: the caller
+ * has to turn it into an error instead of falling back, which is the whole point of the
+ * distinction.
+ */
+type PluginCall =
+	| { outcome: "answer"; answer: ApikeyQuotaToolOutput }
+	| { outcome: "disabled" }
+	| { outcome: "unavailable" };
+
+/**
+ * The plugin's answer, or `undefined` when the bundled adapters should answer instead.
+ *
+ * Throws for `disabled`: the capability belongs to the plugin, so a disabled plugin is a
+ * deterministic "not available right now", never a reason to answer the same question from
+ * the in-process adapters.
+ */
+function usableAnswer(call: PluginCall): ApikeyQuotaToolOutput | undefined {
+	if (call.outcome === "disabled") throw new BalanceProbeRequestError("plugin_disabled");
+	return call.outcome === "answer" ? call.answer : undefined;
+}
+
+/** Is this refusal "an administrator disabled the plugin" rather than "the plugin broke"? */
+function pluginDisabled(error: unknown): boolean {
+	const code = (error as { code?: unknown } | null | undefined)?.code;
+	return typeof code === "string" && PLUGIN_DISABLED_CODES.has(code);
+}
+
+/**
  * Activation hook.
  *
  * `PluginManager` imports the platform services, so importing it back into this module would
@@ -72,6 +122,21 @@ let installedActivator: QuotaPluginActivator | undefined;
 
 export function setApikeyQuotaActivation(activator: QuotaPluginActivator | undefined): void {
 	installedActivator = activator;
+}
+
+/**
+ * Whether the quota-query capability is currently switched on.
+ *
+ * The settings projection asks this so the provider page can hide the site-quota fields and the
+ * balance row entirely while the plugin is disabled: leaving them on screen would offer controls
+ * that cannot work. An unknown answer counts as enabled, which is the safe direction — the
+ * capability then reports itself when a query actually runs.
+ */
+export async function isApikeyQuotaCapabilityEnabled(): Promise<boolean> {
+	const status = await installedActivator
+		?.getStatus?.(APIKEY_QUOTA_PLUGIN_ID)
+		.catch(() => undefined);
+	return status?.desiredState !== "disabled";
 }
 
 export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}): ApikeyQuotaEngine {
@@ -105,11 +170,11 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 			: fallback.refresh(input as ProviderBalanceRefreshInput);
 	}
 
-	/** One plugin call through the shared registry. `undefined` means "no usable answer". */
+	/** One plugin call through the shared registry. */
 	async function callPlugin(
 		input: Record<string, unknown>,
 		signal: AbortSignal,
-	): Promise<ApikeyQuotaToolOutput | undefined> {
+	): Promise<PluginCall> {
 		try {
 			// Activation is what registers the tool; the manager treats a repeat call as a
 			// no-op, so this is safe on every probe.
@@ -118,8 +183,15 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 				automatic: true,
 			});
 		} catch (error) {
+			// Order matters: a disabled plugin is the one refusal that must not fall back.
+			if (pluginDisabled(error)) {
+				diagnose("plugin is disabled; capability reported as unavailable", {
+					tool: FULL_TOOL_ID,
+				});
+				return { outcome: "disabled" };
+			}
 			diagnose("plugin activation failed", { error: errorName(error) });
-			return undefined;
+			return { outcome: "unavailable" };
 		}
 		try {
 			const result = await tools().invoke(FULL_TOOL_ID, input, {
@@ -130,7 +202,7 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 			const output = typeof result?.output === "string" ? result.output : undefined;
 			if (result?.isError === true || output === undefined) {
 				diagnose("plugin returned no usable output", { tool: FULL_TOOL_ID });
-				return undefined;
+				return { outcome: "unavailable" };
 			}
 			const parsed = apikeyQuotaToolOutputSchema.safeParse(parseJson(output));
 			if (!parsed.success) {
@@ -138,14 +210,22 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 					tool: FULL_TOOL_ID,
 					issues: parsed.error.issues.length,
 				});
-				return undefined;
+				return { outcome: "unavailable" };
 			}
-			return parsed.data;
+			return { outcome: "answer", answer: parsed.data };
 		} catch (error) {
-			// A disabled, crashed or unresponsive plugin must not wedge the balance cache: this
-			// round is answered by the bundled adapters.
+			// The plugin can be disabled between activation and the call (or have lost its
+			// registration to a lifecycle revoke), so the refusal is recognised here too.
+			if (pluginDisabled(error)) {
+				diagnose("plugin is disabled; capability reported as unavailable", {
+					tool: FULL_TOOL_ID,
+				});
+				return { outcome: "disabled" };
+			}
+			// A crashed or unresponsive plugin must not wedge the balance cache: this round is
+			// answered by the bundled adapters.
 			diagnose("plugin call failed", { tool: FULL_TOOL_ID, error: errorName(error) });
-			return undefined;
+			return { outcome: "unavailable" };
 		}
 	}
 
@@ -154,15 +234,17 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 
 		async probe(input: ProviderBalanceProbeInput) {
 			if (input.fetch) return seamFallback("probe", input);
-			const answer = await callPlugin(
+			const call = await callPlugin(
 				{
 					mode: "probe",
 					baseUrl: input.config.baseUrl,
 					apiKey: input.config.apiKey,
+					...siteQuotaFields(input.config),
 					...connectionFields(input),
 				},
 				input.signal,
 			);
+			const answer = usableAnswer(call);
 			if (answer?.status === "ok") {
 				// A discovery answer without its endpoint could not be persisted or refreshed.
 				if (!answer.adapter || !answer.root) {
@@ -178,17 +260,19 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
 
 		async refresh(input: ProviderBalanceRefreshInput) {
 			if (input.fetch) return seamFallback("refresh", input);
-			const answer = await callPlugin(
+			const call = await callPlugin(
 				{
 					mode: "refresh",
 					baseUrl: input.config.baseUrl,
 					apiKey: input.config.apiKey,
+					...siteQuotaFields(input.config),
 					adapter: input.adapter,
 					root: input.root,
 					...connectionFields(input),
 				},
 				input.signal,
 			);
+			const answer = usableAnswer(call);
 			if (answer?.status === "ok") return answer.balance;
 			if (answer?.status === "unsupported") throw new BalanceProbeRequestError("unsupported");
 			if (answer?.status === "failed") throw new BalanceProbeRequestError(answer.kind);
@@ -205,6 +289,21 @@ export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}):
  * without threading it through call sites.
  */
 export const builtinApikeyQuotaEngine = createApikeyQuotaEngine();
+
+/**
+ * The site-account credit credentials, forwarded per call exactly like the inference key.
+ *
+ * Sending them only when set keeps the tool input identical to the pre-existing shape for
+ * every provider that queries a key's allowance, so the plugin's own validation cannot start
+ * rejecting inputs the bundled path accepts.
+ */
+function siteQuotaFields(config: CustomApiProviderConfig): Record<string, unknown> {
+	const fields: Record<string, unknown> = {};
+	if (config.quotaSiteUrl?.trim()) fields.siteUrl = config.quotaSiteUrl.trim();
+	if (config.quotaAccessToken?.trim()) fields.accessToken = config.quotaAccessToken.trim();
+	if (config.quotaUserId?.trim()) fields.userId = config.quotaUserId.trim();
+	return fields;
+}
 
 /** The connection facts the plugin needs, mirroring what the host transport would send. */
 function connectionFields(input: ProviderBalanceProbeInput): Record<string, unknown> {
@@ -241,5 +340,11 @@ function parseJson(output: string): unknown {
 }
 
 function errorName(error: unknown): string {
-	return error instanceof Error ? error.name : "unknown";
+	if (error instanceof Error) {
+		// Registry errors carry a fixed code (INVALID_PARAMS, TIMEOUT, …) that is far more
+		// actionable than the class name when a plugin call is rejected.
+		const code = (error as { code?: unknown }).code;
+		return typeof code === "string" ? `${error.name}:${code}` : error.name;
+	}
+	return "unknown";
 }

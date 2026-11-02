@@ -66,14 +66,16 @@
 
 启用状态存在插件状态表里，与外部插件同一张表、同一套接口：
 
-- UI：设置 → 插件 → 「内置插件」区块的开关；
+- UI：设置 → 插件列表中的同一行开关（与外部插件同一套标准）；
 - API：`POST /api/plugins/com.narrafork.apikey-quota/{enable,disable}`（需 admin）。
 
 首次启动时状态记录**隐式创建**为 `desiredState: "enabled"`（没有安装动作，所以也不存在
 「用户选择启用」这一刻）。管理员的显式停用会被尊重并持久化。
 
-关闭后的行为：宿主停用该插件，额度查询回退到内置 `provider-balance` 适配器。返回的 DTO、
-路由、前端展示完全不变，也不会向用户报错。
+关闭后的行为：该能力归插件所有，因此停用插件即关闭额度查询。快照会记录
+`error: "plugin_not_enabled"`，前端在该供应商的额度区块提示「插件已停用」，并且
+`/api/provider-balances` 不会改用过程内的内置适配器回答同一问题；插件重新启用后，下一次
+自动探测（最多 60s）恢复原值。
 
 ### 与外部插件的标准差异（逐条及理由）
 
@@ -112,8 +114,11 @@ bun scripts/validate-plugin-release.ts "$(pwd)/server/builtin-plugins" --runtime
 | 插件 `status: "ok"` | 直接采用（宿主内置路径不执行） |
 | 插件 `status: "unsupported"` | 视为权威结论，不探测内置路径 |
 | 插件 `status: "failed"` | 按既有的 `request_failed` 语义记录 |
-| 插件被停用（状态表 `desiredState: disabled`） | 停用插件进程，回退内置适配器 |
+| 插件被停用（`PLUGIN_NOT_ENABLED` / `PLUGIN_DISABLED`） | 不回落：快照记 `plugin_not_enabled`，前端提示「插件已停用」，重新启用后下一次探测自动恢复 |
 | 包缺失 / 进程启动失败 / 进程崩溃 / 输出非法 | 回退内置适配器（不向用户报错） |
+
+> 该能力归插件所有：停用插件等于关闭额度查询，因此不会静默改用过程内的内置适配器。
+> 只有「插件已启用但自身故障」才回退内置适配器，避免插件故障拖垮整个功能。
 
 ## 宿主侧位置
 
