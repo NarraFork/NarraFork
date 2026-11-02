@@ -17,6 +17,59 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func TestWindowsConditionalBOOLUsesLow32Bits(t *testing.T) {
+	// Match the upstream golang/go#81249 reproducer: only the low DWORD
+	// belongs to BOOL; the high DWORD can contain arbitrary register residue.
+	high := uint64(0xDEADBEEF) << 32
+	for _, tc := range []struct {
+		name    string
+		result  uintptr
+		lastErr error
+		want    error
+	}{
+		{"failure", 0, windows.ERROR_ALREADY_EXISTS, windows.ERROR_ALREADY_EXISTS},
+		{"failure_dirty_high_bits", uintptr(high), windows.ERROR_ALREADY_EXISTS, windows.ERROR_ALREADY_EXISTS},
+		{"failure_without_last_error", uintptr(high), windows.ERROR_SUCCESS, windows.ERROR_GEN_FAILURE},
+		{"failure_nil_last_error", 0, nil, windows.ERROR_GEN_FAILURE},
+		{"success_stale_last_error", 1, windows.ERROR_ACCESS_DENIED, nil},
+		{"success_dirty_high_bits", uintptr(high) | 1, windows.ERROR_ACCESS_DENIED, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := conditionalWindowsBOOLError(tc.result, tc.lastErr); !errors.Is(got, tc.want) {
+				t.Fatalf("BOOL result %#x, LastError %v: got %v, want %v", tc.result, tc.lastErr, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWindowsConditionalNewFileDirtyBOOLFailureIsConflict(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "new.txt")
+	tmp := filepath.Join(dir, "tmp.txt")
+	for path, content := range map[string]string{target: "external", tmp: "next"} {
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rename := conditionalRenameHandle
+	conditionalRenameHandle = func(*os.File, string) error {
+		// The native call failed without moving anything, but its undefined
+		// high register bits are nonzero. This must not become a false success.
+		high := uint64(0xDEADBEEF) << 32
+		return conditionalWindowsBOOLError(uintptr(high), windows.ERROR_ALREADY_EXISTS)
+	}
+	t.Cleanup(func() { conditionalRenameHandle = rename })
+	if err := commitConditionalReplacement(context.Background(), target, tmp, nil, nil, []byte("next")); !errors.Is(err, errConditionalMetadataChanged) {
+		t.Fatalf("failed no-replace rename must report conflict: %v", err)
+	}
+	for path, want := range map[string]string{target: "external", tmp: "next"} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Fatalf("failed rename changed %q: %q %v", path, got, err)
+		}
+	}
+}
+
 func windowsReplacementFixture(t *testing.T) (string, string, os.FileInfo, conditionalMetadata) {
 	t.Helper()
 	target := filepath.Join(t.TempDir(), "target.txt")
