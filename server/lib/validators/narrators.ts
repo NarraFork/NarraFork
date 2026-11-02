@@ -838,3 +838,15 @@ export const optimizePromptSchema = z.object({
 	withContext: z.boolean().optional().default(false),
 	messageId: z.string().optional(),
 });
+
+/**
+ * Optimizing a draft prompt that has no session yet (the "new session" dialog's
+ * project-prompt box).
+ *
+ * Only `text` and `style`, because the omitted fields are exactly the ones that
+ * describe a SESSION: `withContext` would need messages to attach and `messageId`
+ * would need an inline editor. Deriving rather than restating keeps the text cap and
+ * the style list in one place; unknown keys are stripped by Zod, so a client that
+ * sends them gets the documented behaviour (none) instead of a silent context load.
+ */
+export const optimizeDraftPromptSchema = optimizePromptSchema.pick({ text: true, style: true });

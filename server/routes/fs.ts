@@ -9,6 +9,7 @@ import {
 	readFileSync,
 	statSync,
 } from "node:fs";
+import { open, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
 import type { Context } from "hono";
@@ -35,16 +36,23 @@ import {
 	SECRET_PATH_REFUSAL,
 } from "../lib/fs-secret-paths";
 import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
+import { PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
 import { generateId } from "../lib/id";
+import { clearInstructionFileCache } from "../lib/instruction-file-cache";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { getHome, IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { decodeUtf8Prefix, MAX_PROJECT_INSTRUCTIONS_BYTES } from "../lib/read-file-capped";
 import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
 import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { sanitizeSvg } from "../lib/svg-sanitize";
-import { fsWriteSchema } from "../lib/validators/fs";
+import {
+	fsWriteSchema,
+	projectPromptReadSchema,
+	projectPromptWriteSchema,
+} from "../lib/validators/fs";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import type { EditorActor } from "../services/editor-document-service";
 import { LocalFileValidationError } from "../services/file-change-local-io";
@@ -1604,3 +1612,247 @@ function resolveUserDir(key: "desktop" | "documents" | "downloads", home: string
 	const fallback = join(home, englishName[key]);
 	return existsSync(fallback) ? fallback : null;
 }
+
+// ── Project instruction file (AGENTS.md & friends) ─────────────────────────────
+
+/**
+ * Read at most {@link MAX_PROJECT_INSTRUCTIONS_BYTES} of a file, as BYTES.
+ *
+ * The project-prompt editor needs the raw bytes, not just decoded text: the
+ * optimistic lock compares a sha256, and decoding first would make the hash depend
+ * on the decoder's replacement of invalid sequences.
+ *
+ * A file that fills the cap exactly is complete. Truncation means bytes were left
+ * unread: the file was already over the cap, or it grew between the size check and
+ * the read. Comparing `bytesRead >= maxBytes` is the wrong signal — that is also
+ * true of a file whose size is exactly the cap, and it misses growth that stays
+ * under the cap.
+ */
+async function readBoundedBytes(
+	path: string,
+	maxBytes: number,
+): Promise<{ bytes: Uint8Array; truncated: boolean; totalBytes: number } | null> {
+	let fileSize: number;
+	try {
+		const info = await stat(path);
+		if (!info.isFile()) return null;
+		fileSize = info.size;
+	} catch {
+		return null;
+	}
+	const want = Math.min(Math.max(fileSize, 0), maxBytes);
+	const handle = await open(path, "r");
+	try {
+		const buffer = new Uint8Array(want);
+		const { bytesRead } = want > 0 ? await handle.read(buffer, 0, want, 0) : { bytesRead: 0 };
+		let sizeAfter = fileSize;
+		try {
+			sizeAfter = (await stat(path)).size;
+		} catch {
+			// The size observed before the read is the best remaining answer.
+		}
+		return {
+			bytes: buffer.subarray(0, bytesRead),
+			truncated: sizeAfter > maxBytes || bytesRead < sizeAfter,
+			totalBytes: sizeAfter,
+		};
+	} finally {
+		await handle.close();
+	}
+}
+
+/**
+ * The first project instruction file that exists in `cwd`, or the one a save would
+ * create.
+ *
+ * Order and create-target both come from `PROJECT_PROMPT_FILENAMES`, the same list
+ * `narrator-prompt` reads when it injects the file, so the dialog can only ever show
+ * and rewrite the file that actually reaches the system prompt. `AGENTS.md` is the
+ * create target: it is the cross-tool standard, whereas `AGENTS.override.md` is a
+ * local-only override and `CLAUDE.md` is one tool's legacy name.
+ */
+async function resolveProjectPromptFile(cwd: string): Promise<{
+	filename: string;
+	path: string;
+	exists: boolean;
+}> {
+	for (const filename of PROJECT_PROMPT_FILENAMES) {
+		const candidate = join(cwd, filename);
+		try {
+			const info = await stat(candidate);
+			// A directory at a candidate name is not a readable prompt file; keep looking
+			// rather than reporting a broken editor for a perfectly normal checkout.
+			if (info.isFile()) return { filename, path: candidate, exists: true };
+		} catch {
+			// Absent — the next candidate may be the real one.
+		}
+	}
+	const filename = PROJECT_PROMPT_FILENAMES[1] ?? PROJECT_PROMPT_FILENAMES[0];
+	return { filename, path: join(cwd, filename), exists: false };
+}
+
+/** Refuse a `cwd` that is not an existing directory, before it is used as a root. */
+async function requireExistingDirectory(cwd: string): Promise<string> {
+	const absolute = resolve(cwd);
+	let info: Awaited<ReturnType<typeof stat>>;
+	try {
+		info = await stat(absolute);
+	} catch {
+		throw new ValidationError("The working directory does not exist");
+	}
+	if (!info.isDirectory()) throw new ValidationError("The working directory is not a directory");
+	return absolute;
+}
+
+/**
+ * GET /api/fs/project-prompt?cwd=...
+ *
+ * The content of the project instruction file for one directory, as the "new
+ * narrator" dialog needs it: `{ filename, path, exists, content, truncated, hash }`.
+ *
+ * `filename` is always the file to edit — an existing candidate, or the one a save
+ * would create when none exists (`exists: false`, `content: ""`). `hash` is the
+ * optimistic lock to echo back on PUT.
+ *
+ * Read gate: this reads one of four well-known filenames from a directory the caller
+ * names, so there is no traversal to defend against — the only exposure is a read of
+ * a file the user could already read. Credential paths stay refused
+ * (`fs-secret-paths`), because `AGENTS.md` next to someone's secrets is still a file
+ * whose contents a caller should not harvest by directory name alone.
+ */
+fsRoutes.get("/project-prompt", async (c) => {
+	const parsed = projectPromptReadSchema.safeParse({
+		cwd: c.req.query("cwd") ?? "",
+	});
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "cwd is required");
+	}
+	const cwd = await requireExistingDirectory(parsed.data.cwd);
+	const file = await resolveProjectPromptFile(cwd);
+
+	if (isSecretPlatformPath(file.path) || isSecretUserPath(file.path, homedir())) {
+		throw new WriteRefusedError(SECRET_PATH_REFUSAL);
+	}
+
+	const bytes = file.exists
+		? await readBoundedBytes(file.path, MAX_PROJECT_INSTRUCTIONS_BYTES)
+		: null;
+	return c.json({
+		cwd,
+		filename: file.filename,
+		path: file.path,
+		exists: file.exists && bytes !== null,
+		content: bytes ? decodeUtf8Prefix(bytes.bytes) : "",
+		truncated: bytes?.truncated ?? false,
+		totalBytes: bytes?.totalBytes ?? null,
+		hash: bytes ? createHash("sha256").update(bytes.bytes).digest("hex") : null,
+		candidates: [...PROJECT_PROMPT_FILENAMES],
+	});
+});
+
+/**
+ * PUT /api/fs/project-prompt
+ *
+ * Save the project instruction file for one directory.
+ *
+ * Deliberately NOT `/api/fs/write`: that route is bounded by a NARRATOR's worktree
+ * and requires a narrator id, and this dialog runs before any narrator exists. The
+ * bound here is the same one, derived from the directory itself — `cwd` plus the
+ * operator's extra writable roots, through the same `checkWriteBoundary`, so secret
+ * paths, git internals and symlink escapes are refused identically.
+ *
+ * Two properties this must not lose:
+ *
+ * 1. **Optimistic lock.** An agent can rewrite `AGENTS.md` while the dialog is open.
+ *    The client sends the hash it loaded; a mismatch is a 409 carrying the current
+ *    text, never a silent overwrite of someone else's edit.
+ *
+ * 2. **Bounded bytes.** Both directions are capped at the same size the injector
+ *    reads, so this cannot author a file that then blows up every system prompt in
+ *    the directory.
+ */
+fsRoutes.put("/project-prompt", async (c) => {
+	const parsed = projectPromptWriteSchema.safeParse(await readJsonBody(c.req));
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
+	}
+	const { filename, content, baseHash } = parsed.data;
+	const cwd = await requireExistingDirectory(parsed.data.cwd);
+	const target = join(cwd, filename);
+
+	// The filename is a schema enum, so `target` is always directly inside `cwd`; the
+	// boundary check is about what `cwd` RESOLVES to (secrets, `.git`, a symlinked
+	// workspace), not about the name.
+	const decision = checkWriteBoundary(target, [cwd, ...(settings.paths.extraWritableDirs ?? [])]);
+	if (!decision.allowed || !decision.physicalPath) {
+		throw new WriteRefusedError(describeWriteRefusal(decision.reason ?? "unresolvable"));
+	}
+	const physicalPath = decision.physicalPath;
+
+	const payload = encodeFileBytesAs(content, "utf-8");
+	if (payload.byteLength > MAX_PROJECT_INSTRUCTIONS_BYTES) {
+		throw new ValidationError("Content exceeds the maximum prompt file size");
+	}
+
+	const existing = await readBoundedBytes(physicalPath, MAX_PROJECT_INSTRUCTIONS_BYTES);
+	if (existing?.truncated) {
+		throw new ValidationError("The prompt file is too large to edit through this dialog");
+	}
+
+	if (existing) {
+		const currentHash = createHash("sha256").update(existing.bytes).digest("hex");
+		if (!baseHash) {
+			return c.json(
+				{
+					error: "The prompt file already exists",
+					code: "STALE_WRITE",
+					currentHash,
+					currentContent: decodeUtf8Prefix(existing.bytes),
+				},
+				409,
+			);
+		}
+		if (baseHash !== currentHash) {
+			return c.json(
+				{
+					error: "The prompt file changed since it was opened",
+					code: "STALE_WRITE",
+					expectedHash: baseHash,
+					currentHash,
+					currentContent: decodeUtf8Prefix(existing.bytes),
+				},
+				409,
+			);
+		}
+	} else if (baseHash) {
+		return c.json(
+			{
+				error: "The prompt file was deleted since it was opened",
+				code: "STALE_WRITE",
+				expectedHash: baseHash,
+				currentHash: null,
+				currentContent: "",
+			},
+			409,
+		);
+	}
+
+	// Keep the file's own line endings: a CRLF checkout whose prompt is rewritten with
+	// LF would show every line as changed in the user's diff for a one-word edit.
+	const lineEnding = detectLineEnding(existing ? decodeUtf8Prefix(existing.bytes) : content);
+	const body = applyLineEnding(normalizeLineEndings(content), lineEnding);
+	await writeFile(physicalPath, encodeFileBytesAs(body, "utf-8"));
+
+	// The system prompt is rebuilt from the instruction cache on every loop iteration;
+	// a same-size rewrite can keep the old stat signature, so drop the entry rather than
+	// let the next turn inject the previous text.
+	clearInstructionFileCache();
+
+	const written = encodeFileBytesAs(body, "utf-8");
+	return c.json({
+		ok: true,
+		path: physicalPath,
+		filename,
+		hash: createHash("sha256").update(written).digest("hex"),
+	});
+});

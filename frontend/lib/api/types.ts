@@ -968,6 +968,27 @@ export interface HookApiRecord {
 	updatedAt: string;
 }
 
+/**
+ * One reusable system prompt from the library (`/api/prompt-library`).
+ *
+ * A narrator created from an entry stores its own copy of `content`, so deleting the
+ * entry never changes an existing session.
+ */
+export interface PromptLibraryEntryData {
+	id: string;
+	name: string;
+	description: string;
+	content: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface PromptLibraryInputData {
+	name: string;
+	description?: string;
+	content: string;
+}
+
 export interface CustomSubagentData {
 	name: string;
 	description: string;
