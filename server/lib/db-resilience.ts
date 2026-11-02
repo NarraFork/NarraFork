@@ -11,6 +11,17 @@ import {
 import { logger } from "./logger";
 
 /**
+ * The SQLite result code of a failed statement, e.g. `SQLITE_BUSY` or `SQLITE_BUSY_SNAPSHOT`.
+ * Both read "database is locked", but they mean different things: BUSY is another connection
+ * holding the write lock right now; BUSY_SNAPSHOT is another connection having committed since
+ * this transaction's first read. Log it next to the message so the two can be told apart.
+ */
+export function sqliteErrorCode(err: unknown): string | undefined {
+	const code = (err as { code?: unknown } | null)?.code;
+	return typeof code === "string" ? code : undefined;
+}
+
+/**
  * Retry a database operation with exponential backoff.
  * Retries on transient SQLite errors (busy, locked).
  */
@@ -32,6 +43,7 @@ export async function withDbRetry<T>(
 			if (!isRetryable || attempt === maxRetries) {
 				logger.error(`${label} failed after ${attempt} attempt(s)`, {
 					error: msg,
+					code: sqliteErrorCode(err),
 					attempt,
 				});
 				throw err;
@@ -39,6 +51,7 @@ export async function withDbRetry<T>(
 
 			logger.warn(`${label} failed (attempt ${attempt}/${maxRetries}), retrying...`, {
 				error: msg,
+				code: sqliteErrorCode(err),
 			});
 
 			// Exponential backoff: 200ms, 400ms, 800ms

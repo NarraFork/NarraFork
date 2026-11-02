@@ -29,7 +29,7 @@ import {
 import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
-import { withDbRetry } from "../lib/db-resilience";
+import { sqliteErrorCode, withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -2688,6 +2688,7 @@ export async function processEvent(
 						narratorId,
 						toolUseId: event.toolUseId,
 						error: String(err),
+						code: sqliteErrorCode(err),
 					});
 					// Retry once — transient DB lock / busy errors are common with SQLite
 					try {
@@ -2712,6 +2713,7 @@ export async function processEvent(
 							narratorId,
 							toolUseId: event.toolUseId,
 							error: String(retryErr),
+							code: sqliteErrorCode(retryErr),
 						});
 						throw new CriticalEventPersistenceError("Tool result could not be persisted", {
 							cause: retryErr,
