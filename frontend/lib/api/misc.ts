@@ -42,6 +42,8 @@ import type {
 	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
 	OpencodeUsageCache,
+	PromptLibraryEntryData,
+	PromptLibraryInputData,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchRequest,
@@ -327,6 +329,37 @@ export const miscApi = {
 	deleteCustomSubagent: (name: string) =>
 		request<{ ok: boolean }>(`/custom-subagents/${encodeURIComponent(name)}`, {
 			method: "DELETE",
+		}),
+
+	// Prompt library
+	listPromptLibrary: () => request<PromptLibraryEntryData[]>("/prompt-library"),
+	getPromptLibraryEntry: (id: string) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`),
+	createPromptLibraryEntry: (data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>("/prompt-library", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updatePromptLibraryEntry: (id: string, data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
+	deletePromptLibraryEntry: (id: string) =>
+		request<{ ok: boolean }>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "DELETE",
+		}),
+	/**
+	 * One-line description for a prompt body, from the summary model.
+	 *
+	 * Stateless on purpose: the caller may be describing text it has not saved yet,
+	 * which is why the body carries `content` instead of an entry id.
+	 */
+	summarizePromptLibraryContent: (content: string, options?: { signal?: AbortSignal }) =>
+		request<{ summary: string }>("/prompt-library/summarize", {
+			method: "POST",
+			body: JSON.stringify({ content }),
+			signal: options?.signal,
 		}),
 
 	// OpenAI-compatible models
@@ -1035,6 +1068,40 @@ export const miscApi = {
 		request<{
 			candidates: Array<{ path: string; repoCount: number; conventional: boolean }>;
 		}>("/fs/project-dir/candidates"),
+	/**
+	 * The project instruction file (AGENTS.md & friends) for one directory.
+	 *
+	 * `filename` is the file to edit — an existing candidate, or the one a save would
+	 * create; `hash` is the optimistic lock for {@link saveProjectPrompt}.
+	 */
+	getProjectPrompt: (cwd: string) =>
+		request<{
+			cwd: string;
+			filename: string;
+			path: string;
+			exists: boolean;
+			content: string;
+			truncated: boolean;
+			totalBytes: number | null;
+			hash: string | null;
+			candidates: string[];
+		}>(`/fs/project-prompt?cwd=${encodeURIComponent(cwd)}`),
+	/**
+	 * Save the project instruction file.
+	 *
+	 * `baseHash` is the hash of the content that was loaded; the server refuses the save
+	 * with 409 STALE_WRITE when the file moved on, rather than overwriting an agent's edit.
+	 */
+	saveProjectPrompt: (input: {
+		cwd: string;
+		filename: string;
+		content: string;
+		baseHash?: string | null;
+	}) =>
+		request<{ ok: true; path: string; filename: string; hash: string }>("/fs/project-prompt", {
+			method: "PUT",
+			body: JSON.stringify(input),
+		}),
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",

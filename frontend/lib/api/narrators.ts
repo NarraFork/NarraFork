@@ -2315,6 +2315,28 @@ export const narratorsApi = {
 
 	// ── Prompt optimization ────────────────────────────────────────────────────
 
+	/**
+	 * Optimize prompt text that has no narrator yet (the "new session" dialog's
+	 * project-prompt box). Same styles and model as the composer's button, but there is
+	 * no session to authorize against or read conversation context from.
+	 */
+	optimizeDraftPrompt: (
+		text: string,
+		style: "clarify" | "concise" | "structured" | "translate_en",
+		options?: { signal?: AbortSignal },
+	) =>
+		request<{ text: string; model: string; reasoningSummary?: string }>(
+			// NOT under `/narrators`: that router resolves a `:id` for every sub-path it
+			// serves, so a narrator-less call there is read as a narrator id and answered
+			// with "Narrator not found". The draft route is its own group.
+			"/prompt-optimize/draft",
+			{
+				method: "POST",
+				body: JSON.stringify({ text, style }),
+				signal: options?.signal,
+			},
+		),
+
 	optimizePrompt: (
 		narratorId: string,
 		text: string,

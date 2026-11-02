@@ -59,6 +59,8 @@ mock.module("../../lib/agent", () => ({
 }));
 
 const { narratorRoutes } = await import("../narrators");
+const { promptOptimizeRoutes } = await import("../prompt-optimize");
+const { AppError } = await import("../../lib/errors");
 const { db } = await import("../../db");
 const { narrators, users } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
@@ -88,6 +90,35 @@ function app() {
 		await next();
 	});
 	instance.route("/narrators", narratorRoutes);
+	// The app's real error serializer maps AppError (and the Zod-derived
+	// ValidationError) to status + message; without it a refusal would surface as an
+	// opaque 500 and the status assertions below could not tell the two apart.
+	instance.onError((error, c) => {
+		if (error instanceof AppError) {
+			return c.json({ error: error.message, code: error.code }, error.statusCode as 400);
+		}
+		return c.json({ error: String(error) }, 500);
+	});
+	return instance;
+}
+
+/**
+ * The draft surface lives in its own route group (nothing about it is narrator-scoped),
+ * so it needs its own mount. Same error mapping as `app()`.
+ */
+function draftApp() {
+	const instance = new Hono();
+	instance.use("*", async (c, next) => {
+		c.set("user", { sub: OWNER, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		await next();
+	});
+	instance.route("/prompt-optimize", promptOptimizeRoutes);
+	instance.onError((error, c) => {
+		if (error instanceof AppError) {
+			return c.json({ error: error.message, code: error.code }, error.statusCode as 400);
+		}
+		return c.json({ error: String(error) }, 500);
+	});
 	return instance;
 }
 
@@ -442,5 +473,57 @@ describe("schema path and fallback path agree", () => {
 
 		expect(structuredResult).toBe(optimized);
 		expect(fallbackResult).toBe(optimized);
+	});
+});
+
+/**
+ * `POST /api/narrators/optimize-prompt` — the same optimization with no narrator.
+ *
+ * The "new session" dialog's project-prompt box has no session id to send, and the
+ * id-scoped route authorizes against a narrator row. These tests pin that the draft
+ * route resolves a model and produces composer-ready text on its own, and that it
+ * refuses input it cannot act on rather than pretending a context was attached.
+ */
+describe("draft prompt (no narrator)", () => {
+	async function optimizeDraftRaw(body: unknown) {
+		return draftApp().request("http://localhost/prompt-optimize/draft", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	test("optimizes text without a narrator id", async () => {
+		replies.push({ text: "", structured: { optimizedPrompt: "# 约定\n- 使用中文。" } });
+		const response = await optimizeDraftRaw({ text: "# 约定", style: "structured" });
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as { text: string; model: string };
+		expect(body.text).toBe("# 约定\n- 使用中文。");
+		expect(body.model).toBeTruthy();
+	});
+
+	test("an id-scoped narrator is not needed: no narrator is looked up", async () => {
+		replies.push({ text: "", structured: { optimizedPrompt: "ok" } });
+		const response = await optimizeDraftRaw({ text: "x", style: "clarify" });
+		expect(response.status).toBe(200);
+	});
+
+	test("rejects an empty draft", async () => {
+		const response = await optimizeDraftRaw({ text: "", style: "clarify" });
+		expect(response.status).toBe(400);
+	});
+
+	test("rejects an unknown style", async () => {
+		const response = await optimizeDraftRaw({ text: "x", style: "shout" });
+		expect(response.status).toBe(400);
+	});
+
+	test("does not attach conversation context even when asked", async () => {
+		// `withContext` is stripped by the draft schema; the request must reach the
+		// model untagged rather than silently loading this user's messages.
+		replies.push({ text: "", structured: { optimizedPrompt: "x" } });
+		const response = await optimizeDraftRaw({ text: "x", style: "clarify", withContext: true });
+		expect(response.status).toBe(200);
+		expect(calls[0]?.text).not.toContain("<conversation_history>");
 	});
 });
