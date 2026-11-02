@@ -819,7 +819,7 @@ async function pendingForRead(
 	});
 	const own = rows.filter((r) => r.requesterSession === session);
 	const others = rows.filter((r) => r.requesterSession !== session);
-	const notes: string[] = [];
+	const notes: string[] = own.map((row) => text.yours(outlinePendingLabel(row.id), deciderOf(row)));
 	// Changes this session decides: it is the session the locker named (or its subagent).
 	const delegates = [
 		...new Set(others.flatMap((r) => (r.deciderJson.delegate ? [r.deciderJson.delegate] : []))),

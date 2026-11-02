@@ -43,11 +43,12 @@ import {
 } from "./model";
 import { PENDING_WITHDRAW, pendingOps } from "./pending-hold";
 import { outlineStore } from "./store";
-import type {
-	OutlineBlockMeta,
-	OutlinePendingRow,
-	OutlineSpaceRow,
-	OutlineStore,
+import {
+	type OutlineBlockMeta,
+	OutlinePendingMovedError,
+	type OutlinePendingRow,
+	type OutlineSpaceRow,
+	type OutlineStore,
 } from "./store/port";
 import type { OutlineTaskSubject } from "./tasks";
 import {
@@ -72,7 +73,9 @@ export type OutlinePendingErrorCode =
 	/** The caller's own session proposed it: it goes to the locker. */
 	| "OUTLINE_PENDING_OWN"
 	/** Blocks changed since it was proposed and the change no longer applies. */
-	| "OUTLINE_PENDING_CONFLICT";
+	| "OUTLINE_PENDING_CONFLICT"
+	/** Merged into (or decided) while being confirmed: look at it again. */
+	| "OUTLINE_PENDING_CHANGED";
 
 /** A decision that could not be made; nothing was written. */
 export class OutlinePendingError extends AppError {
@@ -188,6 +191,8 @@ export const OUTLINE_PENDING_TEXT = {
 	conflict: (label: string) =>
 		`${label} no longer applies as proposed: blocks it changes were changed since. Nothing was written; reject it, or let its proposer propose again`,
 	unlocked: (label: string) => `${label}: the plan is no longer locked`,
+	changed: (label: string) =>
+		`${label} changed while it was being confirmed (more was proposed into it, or it was decided); look at it again`,
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -360,6 +365,12 @@ export async function confirmOutlinePending(args: {
 				},
 			);
 		} catch (error) {
+			if (error instanceof OutlinePendingMovedError) {
+				throw new OutlinePendingError(
+					OUTLINE_PENDING_TEXT.changed(label),
+					"OUTLINE_PENDING_CHANGED",
+				);
+			}
 			if (error instanceof OutlineWriteError) {
 				throw new OutlinePendingError(
 					OUTLINE_PENDING_TEXT.conflict(label),

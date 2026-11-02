@@ -345,12 +345,15 @@ export const OUTLINE_TOOL_TEXT = {
 			title ? `the session ${quoted(title)} (${id})` : `the session ${id}`,
 		deciderEither: (person: string, delegate: string) =>
 			`${person} (or ${delegate} on their behalf)`,
-		markOwn: (label: string, decider: string) =>
-			`pending ${label}: your proposed change, waiting for ${decider} to confirm`,
-		markOwnDeleted: (label: string, decider: string, n: number) =>
-			`pending ${label}: you proposed deleting ${n === 1 ? "1 block" : `${n} blocks`} here, waiting for ${decider} to confirm`,
-		markOther: (label: string, decider: string) =>
-			`pending ${label}: a proposed change here waits for ${decider} to confirm`,
+		markOwn: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, not confirmed yet`,
+		markOwnDeleted: (label: string, _decider: string, n: number) =>
+			`pending ${label}: you proposed deleting ${n === 1 ? "1 block" : `${n} blocks`} here, not confirmed yet`,
+		markOther: (label: string, _decider: string) =>
+			`pending ${label}: a change proposed here waits for confirmation`,
+		/** After a read: this session's own open changes on the page. */
+		yours: (label: string, decider: string) =>
+			`${label} is your change to this plan, shown above as you proposed it; it waits for ${decider} to confirm (blocks it adds exist once confirmed)`,
 		/** After a read: changes waiting for this session's confirmation. */
 		forYou: (label: string, summary: string, by: string) =>
 			`${label} waits for your confirmation: ${summary} (proposed by ${by}); confirm with OutlineEdit { edits: [{ confirm: "${label}" }] }, or reject with { reject: "${label}", reason }`,
