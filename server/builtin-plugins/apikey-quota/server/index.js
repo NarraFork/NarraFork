@@ -310,6 +310,60 @@ function fetchOptions(input, signal) {
 }
 
 /**
+ * Host-supplied per-request timeout.
+ *
+ * The host transport applies this value verbatim (`setTimeout(..., requestTimeoutMs)`), so the
+ * plugin must not re-clamp it: clamping would make an 800 ms or 90 s round take a different
+ * amount of time here than in the bundled adapters. Only a value that cannot express a bound
+ * at all falls back to the default, and a non-positive value keeps the host's immediate-abort
+ * meaning instead of silently becoming the default.
+ */
+function requestTimeoutMs(input) {
+	const raw = input?.timeoutMs;
+	if (typeof raw !== "number" || !Number.isFinite(raw)) return BALANCE_REQUEST_TIMEOUT_MS;
+	return Math.trunc(raw);
+}
+
+/**
+ * Read the body under the same 64 KiB cap as the host transport, without buffering an
+ * unbounded response first: an oversized body must be rejected while it is still streaming,
+ * not after it has already been read into memory.
+ */
+async function readCappedBody(response, signal) {
+	const reader = response.body?.getReader();
+	if (!reader) throw new ProbeRequestError("unsupported");
+	const chunks = [];
+	let length = 0;
+	let aborted = false;
+	const onAbort = () => {
+		aborted = true;
+		void reader.cancel().catch(() => {});
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			if (aborted) throw new ProbeRequestError("transient");
+			length += value.byteLength;
+			if (length > BALANCE_MAX_RESPONSE_BYTES) throw new ProbeRequestError("transient");
+			chunks.push(value);
+		}
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		void reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
+	const bytes = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return bytes;
+}
+
+/**
  * One allow-listed GET against the provider origin. Every bound the host transport applied
  * is preserved here: single origin, no query/hash, byte cap, JSON-only, no redirects.
  */
@@ -329,7 +383,7 @@ function createRequest(input, signal, fetcher = fetch) {
 		}
 		const controller = new AbortController();
 		const combined = AbortSignal.any([signal, controller.signal]);
-		const timer = setTimeout(() => controller.abort(), BALANCE_REQUEST_TIMEOUT_MS);
+		const timer = setTimeout(() => controller.abort(), requestTimeoutMs(input));
 		let response;
 		try {
 			response = await fetcher(url, {
@@ -349,10 +403,7 @@ function createRequest(input, signal, fetcher = fetch) {
 			if (declaredLength > BALANCE_MAX_RESPONSE_BYTES) {
 				throw new ProbeRequestError("transient");
 			}
-			const bytes = await response.arrayBuffer();
-			if (bytes.byteLength > BALANCE_MAX_RESPONSE_BYTES) {
-				throw new ProbeRequestError("transient");
-			}
+			const bytes = await readCappedBody(response, combined);
 			try {
 				return JSON.parse(new TextDecoder().decode(bytes));
 			} catch {
@@ -418,7 +469,7 @@ export async function refreshProviderBalance(input, signal, fetcher) {
 
 // --- Tool handler ---
 
-function parseToolInput(raw) {
+export function parseToolInput(raw) {
 	if (!record(raw)) throw new ProbeRequestError("unsupported");
 	const mode = raw.mode === "refresh" ? "refresh" : raw.mode === "probe" ? "probe" : null;
 	if (!mode) throw new ProbeRequestError("unsupported");
@@ -435,6 +486,7 @@ function parseToolInput(raw) {
 	if (typeof raw.tlsRejectUnauthorized === "boolean") {
 		input.tlsRejectUnauthorized = raw.tlsRejectUnauthorized;
 	}
+	if (typeof raw.timeoutMs === "number") input.timeoutMs = raw.timeoutMs;
 	if (mode === "refresh") {
 		if (raw.adapter !== "sub2api" && raw.adapter !== "new-api") {
 			throw new ProbeRequestError("unsupported");

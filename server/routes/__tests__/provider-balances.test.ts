@@ -178,3 +178,80 @@ describe("provider balance API and settings integration", () => {
 		expect(outbound.outboundFetch).not.toHaveBeenCalled();
 	});
 });
+
+/**
+ * The bundled `apikey-quota` plugin is the default answerer for every entry point that reads
+ * balance data. These cases pin the switch at the entry points themselves, so a change in the
+ * engine cannot make an entry point silently disagree with the others: the flag flipped off
+ * must produce the pre-plugin answer through the same route, and the saved-config projection
+ * must show exactly what the route returns.
+ */
+describe("apikey-quota switch is honoured at every entry point", () => {
+	const originalEngineFlag = settings.plugins?.apikeyQuotaEnabled;
+
+	afterEach(async () => {
+		const { resetProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
+		resetProviderBalanceEngine();
+		if (settings.plugins) settings.plugins.apikeyQuotaEnabled = originalEngineFlag;
+		providerBalanceCache.sync();
+	});
+
+	test("GET answers from the bundled adapters when the plugin is switched off", async () => {
+		const { builtinApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
+		const { setProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
+		settings.plugins.apikeyQuotaEnabled = false;
+		setProviderBalanceEngine(builtinApikeyQuotaEngine);
+		try {
+			await providerBalanceCache.request(config().id);
+			const response = await appForRole("user").request("/api/provider-balances");
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({
+				[config().id]: { status: "supported", adapter: "sub2api" },
+			});
+			// The bundled transport answered, which is why the mocked outbound was used.
+			expect(outbound.outboundFetch).toHaveBeenCalled();
+		} finally {
+			await builtinApikeyQuotaEngine.dispose();
+		}
+	});
+
+	test("settings generation and the route snapshot are the same key", async () => {
+		await providerBalanceCache.request(config().id);
+		const settingsBody = (await (await appForRole("admin").request("/api/settings")).json()) as {
+			providerBalanceGenerations?: Record<string, unknown>;
+		};
+		const routeBody = (await (
+			await appForRole("user").request("/api/provider-balances")
+		).json()) as Record<string, { generation?: unknown; status?: unknown }>;
+
+		// The badge hook keys its query on the settings generation and treats a mismatch with
+		// the route snapshot as "settings are stale" (see useProviderBalance). Both surfaces
+		// must therefore report the same generation for the same provider.
+		expect(settingsBody.providerBalanceGenerations?.[config().id]).toBe(
+			routeBody[config().id]?.generation,
+		);
+		expect(routeBody[config().id]?.status).toBe("supported");
+	});
+
+	test("a switched-off plugin is not spawned at all", async () => {
+		const { createApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
+		let started = 0;
+		const engine = createApikeyQuotaEngine({
+			isEnabled: () => false,
+			createRuntime: () => {
+				started += 1;
+				throw new Error("must not be constructed while disabled");
+			},
+		});
+		try {
+			await engine.probe({
+				config: { ...config(), baseUrl: "https://relay.invalid/v1" },
+				signal: AbortSignal.timeout(10_000),
+			});
+			expect(started).toBe(0);
+			expect(outbound.outboundFetch).toHaveBeenCalled();
+		} finally {
+			await engine.dispose();
+		}
+	});
+});
