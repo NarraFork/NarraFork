@@ -95,6 +95,8 @@ async function seed(rows = 2) {
 			defaultModel: "",
 		},
 	];
+	// 平台实例也计入供应商数量；默认清空，个别用例自己再写入。
+	(next.agent as unknown as Record<string, unknown>).platformInstances = [];
 	saveSettings(next);
 }
 
