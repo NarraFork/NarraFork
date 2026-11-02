@@ -482,7 +482,8 @@ function toPending(row: PendingSelect): OutlinePendingRow {
 
 /**
  * Lock the pending rows a plan touches, in id order (the order every writer takes them, before
- * the space row): the rows it expects, and the open rows of the lock roots it withdraws. Returns
+ * the space row): the rows it expects, and the open rows of the lock roots it withdraws or moves
+ * to another page. Returns
  * the status and revision of the rows it expects.
  */
 async function lockPending(
@@ -491,11 +492,15 @@ async function lockPending(
 ): Promise<Map<string, { status: string; rev: number }>> {
 	const expected = expectedPendingRevs(pending);
 	const ids = new Set(expected.keys());
-	for (const roots of chunked(pending.withdraw?.rootBlockIds ?? [])) {
+	const roots = [
+		...(pending.withdraw?.rootBlockIds ?? []),
+		...(pending.repage ?? []).map((move) => move.rootBlockId),
+	];
+	for (const chunkOfRoots of chunked(roots)) {
 		const open = await tx
 			.select({ id: outlinePending.id })
 			.from(outlinePending)
-			.where(and(inArray(outlinePending.rootBlockId, roots), sql`"status" = 'open'`));
+			.where(and(inArray(outlinePending.rootBlockId, chunkOfRoots), sql`"status" = 'open'`));
 		for (const row of open) ids.add(row.id);
 	}
 	const found = new Map<string, { status: string; rev: number }>();
@@ -524,7 +529,7 @@ function decisionSet(decision: OutlinePendingDecision) {
 	};
 }
 
-/** Withdraw, decide, put, in that order (the plan's expectations were checked already). */
+/** Withdraw, repage, decide, put, in that order (the plan's expectations were checked already). */
 async function writePending(tx: PgTransaction, pending: OutlinePendingPlan): Promise<void> {
 	const withdraw = pending.withdraw;
 	if (withdraw) {
@@ -540,6 +545,12 @@ async function writePending(tx: PgTransaction, pending: OutlinePendingPlan): Pro
 				})
 				.where(and(inArray(outlinePending.rootBlockId, ids), sql`"status" = 'open'`));
 		}
+	}
+	for (const move of pending.repage ?? []) {
+		await tx
+			.update(outlinePending)
+			.set({ pageId: move.pageId })
+			.where(and(eq(outlinePending.rootBlockId, move.rootBlockId), sql`"status" = 'open'`));
 	}
 	if (pending.decide) {
 		await tx

@@ -420,7 +420,7 @@ function decisionSet(decision: OutlinePendingDecision) {
 	};
 }
 
-/** Withdraw, decide, put, in that order (the plan's expectations were checked already). */
+/** Withdraw, repage, decide, put, in that order (the plan's expectations were checked already). */
 function writePending(tx: Tx, pending: OutlinePendingPlan): void {
 	const withdraw = pending.withdraw;
 	if (withdraw) {
@@ -436,6 +436,12 @@ function writePending(tx: Tx, pending: OutlinePendingPlan): void {
 				.where(and(inArray(outlinePending.rootBlockId, ids), sql`"status" = 'open'`))
 				.run();
 		}
+	}
+	for (const move of pending.repage ?? []) {
+		tx.update(outlinePending)
+			.set({ pageId: move.pageId })
+			.where(and(eq(outlinePending.rootBlockId, move.rootBlockId), sql`"status" = 'open'`))
+			.run();
 	}
 	if (pending.decide) {
 		tx.update(outlinePending)

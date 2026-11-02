@@ -251,6 +251,8 @@ export interface OutlinePendingPlan {
 		decidedBy: OutlineTaskActorRef;
 		reason: string;
 	};
+	/** Locked tasks this commit moves to another page: their open changes follow them. */
+	repage?: Array<{ rootBlockId: string; pageId: string }>;
 }
 
 /** The pending rows a plan expects to find as read (`put` merged into, `decide`), by id. */
@@ -353,8 +355,8 @@ export interface OutlineClaimPlan {
  *      `inProcessStale`, mark the space's in-process answers as not derived
  *      (`in_process_ready` false) for the background rebuild;
  *   8. write `claims`;
- *   9. write `pending`: withdraw, then decide (its `decisionCommitId` is the commit's id), then
- *      put (insert, or update the row merged into).
+ *   9. write `pending`: withdraw, repage, then decide (its `decisionCommitId` is the commit's
+ *      id), then put (insert, or update the row merged into).
  *
  * Step 1 claims `next_seq`, and `in_process_epoch` with it when the plan names one. Before it the
  * section checks that every claim row `claims` expects (`put`, `expire`, `verify`) is still as

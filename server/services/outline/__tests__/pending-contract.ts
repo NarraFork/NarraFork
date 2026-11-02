@@ -716,6 +716,23 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "locks: a locked task a person moves to another page takes its open changes with it",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const r = await write(ctx, space, a, [
+				{ op: "update", block: { id: ids.s1 }, content: "moved along" },
+			]);
+			await write(ctx, space, p.locker, [
+				{ op: "move", block: { id: ids.root }, parent: { id: ids.other } },
+			]);
+			expect(await openPending(ctx, ids.root)).toEqual([]);
+			const moved = await openPending(ctx, ids.other);
+			expect(moved.map((row) => row.id)).toEqual([r.pending?.id as string]);
+			expect((await pendingRow(ctx, r.pending?.id as string)).pageId).toBe(ids.other);
+		},
+	},
+	{
 		name: "nested locks: the nearest lock decides; one call changing two locked plans is refused",
 		async run(ctx) {
 			const p = await lockedPlan(ctx);

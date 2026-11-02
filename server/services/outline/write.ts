@@ -2436,6 +2436,7 @@ class OutlinePlanner {
 		const pending: OutlinePendingPlan = {};
 		const pages = new Set<string>();
 		const gone: WorkingBlock[] = [];
+		const repage: Array<{ rootBlockId: string; pageId: string }> = [];
 		let unlocked = false;
 		for (const block of this.blocks.values()) {
 			const lock = block.base && !block.base.deleted ? block.base.taskJson?.lock : undefined;
@@ -2444,8 +2445,14 @@ class OutlinePlanner {
 			else if (!sameLocker(block.taskJson?.lock, lock)) {
 				gone.push(block);
 				unlocked = true;
+			} else if (block.pageId !== (block.base as OutlineBlockMeta).pageId) {
+				// The locked task moved to another page: its open changes follow it.
+				repage.push({ rootBlockId: block.id, pageId: block.pageId });
+				pages.add((block.base as OutlineBlockMeta).pageId);
+				pages.add(block.pageId);
 			}
 		}
+		if (repage.length > 0) pending.repage = repage;
 		if (gone.length > 0) {
 			pending.withdraw = {
 				rootBlockIds: gone.map((b) => b.id),
@@ -2460,7 +2467,7 @@ class OutlinePlanner {
 			pending.decide = confirmDecision(confirm, this.now, commitId);
 		}
 		return {
-			pending: pending.withdraw || pending.decide ? pending : null,
+			pending: pending.withdraw || pending.decide || pending.repage ? pending : null,
 			pendingPageIds: [...pages],
 		};
 	}
