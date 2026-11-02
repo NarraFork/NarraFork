@@ -16,9 +16,14 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
-const { getTurnTimeline, listTimelineTurns, modelIntervals, toolIntervals } = await import(
-	"../narrator-timeline"
-);
+const {
+	getTurnTimeline,
+	listTimelineTurns,
+	MAX_ROWS_PER_SOURCE,
+	modelIntervals,
+	SUMMARY_SOURCE_MAX_BYTES,
+	toolIntervals,
+} = await import("../narrator-timeline");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -326,6 +331,84 @@ describe("getTurnTimeline", () => {
 		expect(timeline?.turn?.id).toBe("msg:m-user");
 		expect(timeline?.lanes[0].startMs).toBe(T0);
 		expect(timeline?.lanes.length).toBe(2);
+	});
+
+	test("derived turns report a further page when exactly one more input exists", async () => {
+		sqlite.exec("DELETE FROM narrator_turns");
+		await seedMessage("m-user-2", PARENT, "user", 30_000);
+		await seedMessage("m-user-3", PARENT, "user", 40_000);
+		const first = await listTimelineTurns(PARENT, { limit: 2 });
+		expect(first.turns.map((turn) => turn.id)).toEqual(["msg:m-user-3", "msg:m-user-2"]);
+		expect(first.turns.map((turn) => turn.index)).toEqual([3, 2]);
+		expect(first.turns[1].endedAt).toBe(iso(40_000));
+		expect(first.hasMore).toBe(true);
+		const second = await listTimelineTurns(PARENT, { limit: 2, before: first.turns[1].startedAt });
+		expect(second.turns.map((turn) => [turn.id, turn.index])).toEqual([["msg:m-user", 1]]);
+		expect(second.hasMore).toBe(false);
+	});
+
+	test("large inputs are not parsed; file tools fall back to the resolved path", async () => {
+		const content = "x".repeat(SUMMARY_SOURCE_MAX_BYTES + 1);
+		await seedTool("tool-write", PARENT, "m-a1", "Write", 15_500, 16_000, {
+			inputJson: { file_path: "/repo/src/big.ts", content },
+			resolvedFilePath: "/repo/src/resolved.ts",
+		});
+		await seedTool("tool-bash-big", PARENT, "m-a1", "Bash", 16_000, 16_500, {
+			inputJson: { description: "huge heredoc", command: content },
+		});
+		const { eq } = await import("drizzle-orm");
+		await db
+			.update(narratorToolCalls)
+			.set({ inputJson: { description: "explore", prompt: content } })
+			.where(eq(narratorToolCalls.id, "tool-agent"));
+		const timeline = await getTurnTimeline(PARENT, "turn-1", T0 + 60_000);
+		const write = timeline?.items["tool-write"];
+		const bash = timeline?.items["tool-bash-big"];
+		const agent = timeline?.items["tool-agent"];
+		expect(write?.kind === "tool" && write.summary).toBe("resolved.ts");
+		expect(bash?.kind === "tool" && bash.summary).toBeNull();
+		expect(agent?.kind === "tool" && agent.summary).toBe(CHILD);
+		const small = timeline?.items["tool-bash"];
+		expect(small?.kind === "tool" && small.summary).toBe("run tool-bash");
+	});
+
+	test("a foreground child resumed in a later turn keeps its lane within the spawn call", async () => {
+		await seedTool("child-later", CHILD, "c-user", "Read", 500_000, 501_000);
+		const timeline = await getTurnTimeline(PARENT, "turn-1", T0 + 600_000);
+		expect(timeline?.lanes[1].endMs).toBe(T0 + 15_000);
+		expect(timeline?.items["child-later"]).toBeUndefined();
+		expect(timeline?.endMs).toBe(T0 + 20_000);
+	});
+
+	test("a lane past its row budget is flagged and stays bounded", async () => {
+		sqlite.run("BEGIN");
+		for (let i = 0; i <= MAX_ROWS_PER_SOURCE; i++) {
+			await seedTool(`bulk-${i}`, PARENT, "m-a1", "Read", 3000 + i, 3000 + i + 1);
+		}
+		sqlite.run("COMMIT");
+		const timeline = await getTurnTimeline(PARENT, "turn-1", T0 + 60_000);
+		const [primary, child] = timeline?.lanes ?? [];
+		expect(primary.truncated).toBe(true);
+		// Rows are read in (created_at, id) order: 2 seeded + 2001 bulk calls, 2000 read.
+		expect(primary.coveredUntilMs).toBe(T0 + 3000 + MAX_ROWS_PER_SOURCE - 2);
+		expect(primary.endMs).toBe(T0 + 20_000);
+		expect(primary.segments[primary.segments.length - 1].endMs).toBe(primary.coveredUntilMs ?? 0);
+		expect(child.truncated).toBe(false);
+		expect(child.coveredUntilMs).toBeNull();
+		// Details ship only for what the (coarsened) segments reference.
+		const referenced = new Set(primary.segments.flatMap((segment) => segment.itemIds));
+		const shipped = Object.keys(timeline?.items ?? {}).filter((id) => id.startsWith("bulk-"));
+		expect(shipped.every((id) => referenced.has(id))).toBe(true);
+		expect(shipped.length).toBeLessThan(MAX_ROWS_PER_SOURCE);
+	});
+
+	test("concurrent requests for the same turn share one build", async () => {
+		const a = getTurnTimeline(PARENT, "turn-1");
+		const b = getTurnTimeline(PARENT, "turn-1");
+		expect(a).toBe(b);
+		expect(getTurnTimeline(PARENT)).not.toBe(a);
+		expect((await a)?.lanes.length).toBe(2);
+		expect(getTurnTimeline(PARENT, "turn-1")).not.toBe(a);
 	});
 
 	test("unknown narrator or turn", async () => {

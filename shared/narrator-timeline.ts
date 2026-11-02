@@ -48,6 +48,9 @@ export const TIMELINE_CATEGORY_PRIORITY: Record<TimelineCategory, number> = {
 /** Upper bound of segments per lane; denser lanes merge their shortest slivers. */
 export const TIMELINE_MAX_SEGMENTS = 2000;
 
+/** Item ids a merged segment keeps for its detail view. */
+export const TIMELINE_MERGED_MAX_ITEMS = 20;
+
 /** A raw interval produced from one source row. Intervals may overlap freely. */
 export interface TimelineInterval {
 	category: Exclude<TimelineCategory, "overhead" | "after_turn">;
@@ -63,6 +66,11 @@ export interface TimelineSegment {
 	endMs: number;
 	/** Items of the winning category covering this segment (parallel tools > 1). */
 	itemIds: string[];
+	/**
+	 * Set when this segment stands for a run of slivers merged to respect the segment cap:
+	 * `category` is the run's dominant category and `totals` its exact composition.
+	 */
+	merged?: { count: number; totals: TimelineTotals };
 }
 
 export type TimelineTotals = Partial<Record<TimelineCategory, number>>;
@@ -95,24 +103,70 @@ function sameIds(a: readonly string[], b: readonly string[]): boolean {
 	return true;
 }
 
-/** Merge segments shorter than a growing threshold into their predecessor. */
-function capSegments(segments: TimelineSegment[], max: number): TimelineSegment[] {
-	let current = segments;
-	let threshold = 1;
-	while (current.length > max && threshold < Number.MAX_SAFE_INTEGER / 2) {
-		const next: TimelineSegment[] = [];
-		for (const segment of current) {
-			const previous = next[next.length - 1];
-			if (previous && segment.endMs - segment.startMs < threshold) {
-				previous.endMs = segment.endMs;
-				continue;
-			}
-			next.push({ ...segment });
+function addTotals(totals: TimelineTotals, segment: TimelineSegment): void {
+	const ms = segment.endMs - segment.startMs;
+	if (segment.merged) {
+		for (const [category, value] of Object.entries(segment.merged.totals)) {
+			const key = category as TimelineCategory;
+			totals[key] = (totals[key] ?? 0) + (value ?? 0);
 		}
-		current = next;
-		threshold *= 2;
+	} else {
+		totals[segment.category] = (totals[segment.category] ?? 0) + ms;
 	}
-	return current;
+}
+
+/**
+ * Coarsen to at most `max` segments in one pass. Segments at least `width` long are kept;
+ * consecutive shorter ones are accumulated into runs that close once they reach `width`.
+ * Kept segments and closed runs are each ≥ `width`, so together at most `span / width`; runs
+ * cut short by a kept segment add at most as many again, plus the tail. With
+ * `width = 2·span / (max − 1)` the result never exceeds `max`, whatever the distribution.
+ */
+function coarsenSegments(segments: TimelineSegment[], max: number): TimelineSegment[] {
+	const first = segments[0];
+	const last = segments[segments.length - 1];
+	if (!first || !last) return segments;
+	const width = (2 * (last.endMs - first.startMs)) / Math.max(1, max - 1);
+	const out: TimelineSegment[] = [];
+	let run: TimelineSegment[] = [];
+	const flush = () => {
+		if (run.length === 1) out.push(run[0]);
+		else if (run.length > 1) {
+			const totals: TimelineTotals = {};
+			for (const segment of run) addTotals(totals, segment);
+			let dominant: TimelineCategory = run[0].category;
+			for (const category of TIMELINE_CATEGORIES) {
+				if ((totals[category] ?? 0) > (totals[dominant] ?? 0)) dominant = category;
+			}
+			const itemIds = new Set<string>();
+			for (const segment of run) {
+				if (segment.category !== dominant) continue;
+				for (const id of segment.itemIds) {
+					if (itemIds.size >= TIMELINE_MERGED_MAX_ITEMS) break;
+					itemIds.add(id);
+				}
+			}
+			out.push({
+				category: dominant,
+				startMs: run[0].startMs,
+				endMs: run[run.length - 1].endMs,
+				itemIds: [...itemIds].sort(),
+				merged: { count: run.length, totals },
+			});
+		}
+		run = [];
+	};
+	for (const segment of segments) {
+		if (segment.endMs - segment.startMs >= width) {
+			flush();
+			out.push(segment);
+			continue;
+		}
+		run.push(segment);
+		if (segment.endMs - run[0].startMs >= width) flush();
+	}
+	flush();
+	return out;
 }
 
 /**
@@ -191,24 +245,22 @@ export function partitionTimeline(input: PartitionInput): PartitionResult {
 		}
 	}
 
-	const max = input.maxSegments ?? TIMELINE_MAX_SEGMENTS;
-	let truncated = false;
-	let result = segments;
-	if (result.length > max) {
-		result = capSegments(result, max);
-		truncated = true;
-	}
-
 	const padStart = Math.max(startMs, endMs);
 	if (input.padEndMs !== undefined && input.padEndMs > padStart) {
-		result.push({ category: "after_turn", startMs: padStart, endMs: input.padEndMs, itemIds: [] });
+		segments.push({
+			category: "after_turn",
+			startMs: padStart,
+			endMs: input.padEndMs,
+			itemIds: [],
+		});
 	}
 
+	// Totals come from the exact partition, so coarsening never skews the proportions.
 	const totals: TimelineTotals = {};
-	for (const segment of result) {
-		totals[segment.category] = (totals[segment.category] ?? 0) + (segment.endMs - segment.startMs);
-	}
-	return { segments: result, totals, truncated };
+	for (const segment of segments) addTotals(totals, segment);
+	const max = Math.max(2, input.maxSegments ?? TIMELINE_MAX_SEGMENTS);
+	if (segments.length <= max) return { segments, totals, truncated: false };
+	return { segments: coarsenSegments(segments, max), totals, truncated: true };
 }
 
 // ── Wire types ──────────────────────────────────────────────────────────────
@@ -235,10 +287,10 @@ export interface TimelineTurnsResponse {
 	hasMore: boolean;
 }
 
+/** Detail of one tool call; its timing is already expressed by the segments. */
 export interface TimelineToolItem {
 	kind: "tool";
 	id: string;
-	toolUseId: string;
 	toolName: string;
 	summary: string | null;
 	status: string;
@@ -246,11 +298,6 @@ export interface TimelineToolItem {
 	executionDeviceId: string | null;
 	errorMessage: string | null;
 	permissionDecidedBy: string | null;
-	streamStartedAt: string | null;
-	permissionStartedAt: string | null;
-	permissionDecidedAt: string | null;
-	executionStartedAt: string | null;
-	completedAt: string | null;
 	durationMs: number | null;
 	/** Child narrator spawned by this call (Agent/Task). */
 	childNarratorId: string | null;
@@ -261,8 +308,6 @@ export interface TimelineModelItem {
 	id: string;
 	requestKind: string;
 	model: string | null;
-	startedAt: string;
-	endedAt: string;
 	ttftMs: number | null;
 	durationMs: number | null;
 	inputTokens: number;
@@ -289,7 +334,13 @@ export interface TimelineLane {
 	live: boolean;
 	segments: TimelineSegment[];
 	totals: TimelineTotals;
+	/** Slivers were merged, or the lane hit its row cap (see `coveredUntilMs`). */
 	truncated: boolean;
+	/**
+	 * Set when the lane's activity exceeded its row cap: segments stop here, and the rest of
+	 * `[coveredUntilMs, endMs]` is unknown rather than idle.
+	 */
+	coveredUntilMs: number | null;
 }
 
 export interface TurnTimelineResponse {
@@ -301,6 +352,7 @@ export interface TurnTimelineResponse {
 	endMs: number;
 	/** Primary lane first, then each child depth-first after its parent. */
 	lanes: TimelineLane[];
+	/** Details of the items some segment references, so the payload scales with segments. */
 	items: Record<string, TimelineItem>;
 	/** Child lanes omitted because of the lane cap. */
 	omittedLanes: number;

@@ -29,6 +29,7 @@ function lane(over: Partial<TimelineLane>): TimelineLane {
 		segments: [],
 		totals: {},
 		truncated: false,
+		coveredUntilMs: null,
 		...over,
 	};
 }

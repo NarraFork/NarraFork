@@ -1,21 +1,34 @@
 /**
  * narrator-timeline.ts — per-turn, per-agent continuous timelines.
  *
- * Reads only small, indexed columns:
- *   - `narrator_turns` (idx_turns_narrator_started) for the turn window;
- *   - `narrator_tool_calls` (idx_toolcalls_created) lifecycle stamps, plus bounded
- *     `json_extract` hints for a one-line summary — never input/output bodies;
- *   - `api_requests` (idx_api_requests_narrator) timings for model segments;
- *   - `narrators` (idx_narrators_parent) for child lanes.
+ * Every read is bounded and cheap on the HTTP thread:
+ *   - row-heavy reads (`narrator_tool_calls`, `api_requests`) run on the read-worker pool,
+ *     keyset-paged over (narrator_id, created_at) indexes so each page stays inside the
+ *     worker's per-result byte budget whatever the row contents;
+ *   - they select timing stamps only. Summary hints are pulled from `input_json` solely when
+ *     `octet_length` (answered from the record header, no overflow pages) says the input is
+ *     small; large or legacy inputs fall back to `resolved_file_path` / the child's title;
+ *   - point lookups (turn row, children by `origin_tool_call_id`, last message by index) stay
+ *     inline, where a worker round trip would cost more than the query;
+ *   - a response holds at most {@link MAX_LANES} lanes of at most {@link MAX_ROWS_PER_SOURCE}
+ *     rows per source, and only the item details its segments reference, so its size follows
+ *     the (capped) segment count rather than the history; concurrent requests for the same
+ *     turn share one build.
  *
- * Every query is LIMITed; a turn produces at most {@link MAX_LANES} lanes of at most
- * {@link MAX_ROWS_PER_SOURCE} rows per source. The partition itself is the shared
- * pure function in `@shared/narrator-timeline`.
+ * The partition itself is the shared pure function in `@shared/narrator-timeline`.
  */
 
 import { db } from "@server/db";
-import { apiRequests, narrators, narratorToolCalls, narratorTurns } from "@server/db/schema";
+import {
+	apiRequests,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	narratorTurns,
+} from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { redactExecutionLogText } from "@server/lib/execution-log-redaction";
+import { logger } from "@server/lib/logger";
 import {
 	partitionTimeline,
 	type TimelineInterval,
@@ -28,7 +41,22 @@ import {
 	type TimelineTurnsResponse,
 	type TurnTimelineResponse,
 } from "@shared/narrator-timeline";
-import { and, asc, desc, eq, gte, inArray, lt, lte, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	count,
+	desc,
+	eq,
+	gt,
+	gte,
+	inArray,
+	isNull,
+	lt,
+	lte,
+	or,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import { summarizeSubagentToolCall } from "./subagent-activity";
 
 export const MAX_TURNS_PAGE = 50;
@@ -36,8 +64,20 @@ export const MAX_ROWS_PER_SOURCE = 2000;
 export const MAX_LANES = 16;
 export const MAX_CHILDREN_PER_LANE = 20;
 export const MAX_DEPTH = 2;
-const TRIGGER_EXCERPT_LENGTH = 80;
+/** Inputs above this many bytes are never parsed for summary hints. */
+export const SUMMARY_SOURCE_MAX_BYTES = 16 * 1024;
 const SUMMARY_FIELD_MAX_LENGTH = 160;
+/**
+ * Worst case per tool row: 13 hints × 160 chars + a 300-char error, at 4 UTF-8 bytes each,
+ * about 10 KB. 300 rows stay under the worker's 4 MB result budget; model rows are ~1.5 KB.
+ */
+const TOOL_PAGE_ROWS = 300;
+const MODEL_PAGE_ROWS = 1000;
+const READ_TIMEOUT_MS = 10_000;
+/** Sibling lanes built at once; each issues two reads, so at most four are in flight. */
+const LANE_CONCURRENCY = 2;
+const SLOW_BUILD_MS = 1000;
+const TRIGGER_EXCERPT_LENGTH = 80;
 
 /** Tools whose permission window is a question/approval addressed to the user. */
 const USER_REPLY_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
@@ -47,29 +87,32 @@ const SUBAGENT_WAIT_TOOLS = new Set(["Agent", "Task", "Await"]);
 const SPAWN_TOOLS = new Set(["Agent", "Task"]);
 const MAX_SPAWN_LOOKUPS = 200;
 
-function boundedJsonText(path: string) {
+function inputHint(path: string) {
+	const input = narratorToolCalls.inputJson;
 	return sql<string | null>`CASE
-		WHEN json_valid(${narratorToolCalls.inputJson})
-		THEN substr(CAST(json_extract(${narratorToolCalls.inputJson}, ${path}) AS TEXT), 1, ${SUMMARY_FIELD_MAX_LENGTH})
-		ELSE NULL
+		WHEN octet_length(${input}) <= ${SUMMARY_SOURCE_MAX_BYTES} AND json_valid(${input})
+		THEN substr(CAST(json_extract(${input}, ${path}) AS TEXT), 1, ${SUMMARY_FIELD_MAX_LENGTH})
 	END`;
 }
 
 const SUMMARY_HINT_COLUMNS = {
-	description: boundedJsonText("$.description"),
-	filePath: boundedJsonText("$.file_path"),
-	path: boundedJsonText("$.path"),
-	pattern: boundedJsonText("$.pattern"),
-	query: boundedJsonText("$.query"),
-	url: boundedJsonText("$.url"),
-	mode: boundedJsonText("$.mode"),
-	action: boundedJsonText("$.action"),
-	targetId: boundedJsonText("$.id"),
-	targetName: boundedJsonText("$.name"),
-	awaitType: boundedJsonText("$.type"),
-	subagentTypeHint: boundedJsonText("$.subagent_type"),
-	skillName: boundedJsonText("$.skill"),
-	questionHeader: boundedJsonText("$.questions[0].header"),
+	description: inputHint("$.description"),
+	filePath: inputHint("$.file_path"),
+	path: inputHint("$.path"),
+	pattern: inputHint("$.pattern"),
+	query: inputHint("$.query"),
+	url: inputHint("$.url"),
+	mode: inputHint("$.mode"),
+	action: inputHint("$.action"),
+	targetId: inputHint("$.id"),
+	targetName: inputHint("$.name"),
+	awaitType: inputHint("$.type"),
+	subagentTypeHint: inputHint("$.subagent_type"),
+	skillName: inputHint("$.skill"),
+	questionHeader: inputHint("$.questions[0].header"),
+	resolvedFilePath: sql<
+		string | null
+	>`substr(${narratorToolCalls.resolvedFilePath}, 1, ${SUMMARY_FIELD_MAX_LENGTH})`,
 } as const;
 
 type SummaryHintRow = { [K in keyof typeof SUMMARY_HINT_COLUMNS]: string | null };
@@ -77,7 +120,7 @@ type SummaryHintRow = { [K in keyof typeof SUMMARY_HINT_COLUMNS]: string | null 
 function buildSummary(toolName: string, row: SummaryHintRow): string | null {
 	const summary = summarizeSubagentToolCall(toolName, {
 		description: row.description,
-		filePath: row.filePath,
+		filePath: row.filePath ?? row.resolvedFilePath,
 		path: row.path,
 		pattern: row.pattern,
 		query: row.query,
@@ -98,6 +141,10 @@ function parseMs(value: string | null | undefined): number | null {
 	if (!value) return null;
 	const ms = Date.parse(value);
 	return Number.isFinite(ms) ? ms : null;
+}
+
+function toIso(ms: number): string {
+	return new Date(ms).toISOString();
 }
 
 function excerpt(text: string | null): string | null {
@@ -219,195 +266,62 @@ export function modelIntervals(row: ModelTimingRow): TimelineInterval[] {
 	return intervals;
 }
 
-// ── Queries ─────────────────────────────────────────────────────────────────
+// ── Bounded reads ───────────────────────────────────────────────────────────
 
-interface TurnRow {
+interface Cursor {
+	createdAt: string;
 	id: string;
-	status: string;
-	startedAt: string;
-	endedAt: string | null;
-	stopReason: string | null;
-	triggerText: string | null;
 }
 
-function toTurnStatus(status: string): TimelineTurnStatus {
-	return status === "running" || status === "interrupted" || status === "failed"
-		? status
-		: "completed";
-}
-
-async function countTurnsBefore(narratorId: string, startedAt: string): Promise<number> {
-	const row = await db
-		.select({ n: sql<number>`count(*)` })
-		.from(narratorTurns)
-		.where(and(eq(narratorTurns.narratorId, narratorId), lt(narratorTurns.startedAt, startedAt)))
-		.get();
-	return Number(row?.n ?? 0);
-}
-
-function turnRowsQuery(narratorId: string, before: string | undefined, limit: number) {
-	return db
-		.select({
-			id: narratorTurns.id,
-			status: narratorTurns.status,
-			startedAt: narratorTurns.startedAt,
-			endedAt: narratorTurns.endedAt,
-			stopReason: narratorTurns.stopReason,
-			triggerText: sql<string | null>`(SELECT substr(m.content_text, 1, 200)
-				FROM narrator_messages m WHERE m.id = ${narratorTurns.triggerMessageId})`,
-		})
-		.from(narratorTurns)
-		.where(
-			before
-				? and(eq(narratorTurns.narratorId, narratorId), lt(narratorTurns.startedAt, before))
-				: eq(narratorTurns.narratorId, narratorId),
-		)
-		.orderBy(desc(narratorTurns.startedAt), desc(narratorTurns.id))
-		.limit(limit);
-}
+type ReadableQuery<T> = PromiseLike<T[]> & { toSQL(): { sql: string; params: unknown[] } };
 
 /**
- * Turns derived from user inputs, for histories older than `narrator_turns`.
- * Each human input starts a turn that lasts until the next one (or the last
- * recorded activity, approximated by the last message in the window).
+ * Keyset-paged read on the worker pool. At most `cap + 1` rows are read, so whether the
+ * source had more is known without counting; `cutAt` is where the unread rows begin.
  */
-async function derivedTurns(
-	narratorId: string,
-	before: string | undefined,
-	limit: number,
-): Promise<{ turns: TimelineTurnSummary[]; hasMore: boolean }> {
-	const rows = await db.all<{ id: string; createdAt: string; text: string | null }>(sql`
-		SELECT m.id AS id, m.created_at AS createdAt, substr(m.content_text, 1, 200) AS text
-		FROM narrator_messages m
-		WHERE m.narrator_id = ${narratorId} AND m.parent_tool_use_id IS NULL
-			AND m.role = 'user' AND (m.origin IS NULL OR m.origin = 'user')
-			${before ? sql`AND m.created_at < ${before}` : sql``}
-		ORDER BY m.created_at DESC, m.id DESC
-		LIMIT ${limit + 2}
-	`);
-	const hasMore = rows.length > limit + 1;
-	const totalBefore = await db.all<{ n: number }>(sql`
-		SELECT count(*) AS n FROM narrator_messages m
-		WHERE m.narrator_id = ${narratorId} AND m.parent_tool_use_id IS NULL
-			AND m.role = 'user' AND (m.origin IS NULL OR m.origin = 'user')
-			${before ? sql`AND m.created_at < ${before}` : sql``}
-	`);
-	const total = Number(totalBefore[0]?.n ?? rows.length);
-	const turns: TimelineTurnSummary[] = [];
-	const page = rows.slice(0, limit);
-	page.forEach((row, i) => {
-		// rows are newest first: the turn ends where the next-newer input begins.
-		const newer = i === 0 ? null : rows[i - 1];
-		turns.push({
-			id: `msg:${row.id}`,
-			index: total - i,
-			status: "completed",
-			startedAt: row.createdAt,
-			// The newest turn's end is resolved from real activity when it is opened.
-			endedAt: newer ? newer.createdAt : (before ?? null),
-			stopReason: null,
-			triggerExcerpt: excerpt(row.text),
-			derived: true,
+async function readPaged<T extends Cursor>(
+	page: (after: Cursor | null, limit: number) => ReadableQuery<T>,
+	pageSize: number,
+	cap: number,
+): Promise<{ rows: T[]; cutAt: string | null }> {
+	const rows: T[] = [];
+	let after: Cursor | null = null;
+	while (rows.length <= cap) {
+		const limit = Math.min(pageSize, cap + 1 - rows.length);
+		const batch: T[] = await readQuery(page(after, limit), {
+			maxRows: limit,
+			timeoutMs: READ_TIMEOUT_MS,
 		});
-	});
-	return { turns, hasMore };
+		rows.push(...batch);
+		const tail = batch[batch.length - 1];
+		if (!tail || batch.length < limit) break;
+		after = { createdAt: tail.createdAt, id: tail.id };
+	}
+	if (rows.length <= cap) return { rows, cutAt: null };
+	return { rows: rows.slice(0, cap), cutAt: rows[cap].createdAt };
 }
 
-export async function listTimelineTurns(
-	narratorId: string,
-	options: { before?: string; limit?: number } = {},
-): Promise<TimelineTurnsResponse> {
-	const limit = Math.min(Math.max(Math.trunc(options.limit ?? 20), 1), MAX_TURNS_PAGE);
-	const rows = (await turnRowsQuery(narratorId, options.before, limit + 1)) as TurnRow[];
-	if (rows.length === 0) {
-		const derived = await derivedTurns(narratorId, options.before, limit);
-		return { narratorId, ...derived };
-	}
-	const hasMore = rows.length > limit;
-	const page = rows.slice(0, limit);
-	const oldest = page[page.length - 1];
-	const baseIndex = oldest ? await countTurnsBefore(narratorId, oldest.startedAt) : 0;
-	const turns = page.map(
-		(row, i): TimelineTurnSummary => ({
-			id: row.id,
-			index: baseIndex + (page.length - i),
-			status: toTurnStatus(row.status),
-			startedAt: row.startedAt,
-			endedAt: row.endedAt,
-			stopReason: row.stopReason,
-			triggerExcerpt: excerpt(row.triggerText),
-			derived: false,
-		}),
+/** Rows strictly after `cursor` in (created_at, id) order; the first clause keeps the seek. */
+function afterCursor(
+	createdAt: typeof narratorToolCalls.createdAt | typeof apiRequests.createdAt,
+	id: typeof narratorToolCalls.id | typeof apiRequests.id,
+	cursor: Cursor | null,
+): SQL | undefined {
+	if (!cursor) return undefined;
+	return and(
+		gte(createdAt, cursor.createdAt),
+		or(gt(createdAt, cursor.createdAt), gt(id, cursor.id)),
 	);
-	return { narratorId, turns, hasMore };
 }
 
-async function resolveTurn(
-	narratorId: string,
-	turnId: string | undefined,
-): Promise<TimelineTurnSummary | null> {
-	if (turnId?.startsWith("msg:")) {
-		const messageId = turnId.slice(4);
-		const anchor = await db.all<{ createdAt: string }>(sql`
-			SELECT created_at AS createdAt FROM narrator_messages
-			WHERE id = ${messageId} AND narrator_id = ${narratorId}
-		`);
-		if (!anchor[0]) return null;
-		// The page starting just after the anchor contains it as its newest turn.
-		const next = await db.all<{ createdAt: string }>(sql`
-			SELECT m.created_at AS createdAt FROM narrator_messages m
-			WHERE m.narrator_id = ${narratorId} AND m.parent_tool_use_id IS NULL
-				AND m.role = 'user' AND (m.origin IS NULL OR m.origin = 'user')
-				AND (m.created_at > ${anchor[0].createdAt}
-					OR (m.created_at = ${anchor[0].createdAt} AND m.id > ${messageId}))
-			ORDER BY m.created_at ASC, m.id ASC LIMIT 1
-		`);
-		const { turns } = await derivedTurns(narratorId, next[0] ? next[0].createdAt : undefined, 1);
-		const turn = turns[0];
-		if (!turn || turn.id !== turnId) return null;
-		if (next[0]) turn.endedAt = next[0].createdAt;
-		return turn;
-	}
-	if (turnId) {
-		const row = (await db
-			.select({
-				id: narratorTurns.id,
-				status: narratorTurns.status,
-				startedAt: narratorTurns.startedAt,
-				endedAt: narratorTurns.endedAt,
-				stopReason: narratorTurns.stopReason,
-				triggerText: sql<string | null>`(SELECT substr(m.content_text, 1, 200)
-					FROM narrator_messages m WHERE m.id = ${narratorTurns.triggerMessageId})`,
-			})
-			.from(narratorTurns)
-			.where(and(eq(narratorTurns.id, turnId), eq(narratorTurns.narratorId, narratorId)))
-			.get()) as TurnRow | undefined;
-		if (!row) return null;
-		return {
-			id: row.id,
-			index: (await countTurnsBefore(narratorId, row.startedAt)) + 1,
-			status: toTurnStatus(row.status),
-			startedAt: row.startedAt,
-			endedAt: row.endedAt,
-			stopReason: row.stopReason,
-			triggerExcerpt: excerpt(row.triggerText),
-			derived: false,
-		};
-	}
-	const { turns } = await listTimelineTurns(narratorId, { limit: 1 });
-	return turns[0] ?? null;
+interface RowWindow {
+	fromIso: string;
+	/** Inclusive upper bound on `created_at`; open when absent. */
+	toIso?: string;
 }
 
-interface ToolQueryRow extends ToolTimingRow, SummaryHintRow {
-	toolUseId: string;
-	executionDeviceId: string | null;
-	errorMessage: string | null;
-}
-
-async function loadToolRows(narratorId: string, fromIso: string, toIso: string) {
-	// `created_at` is when the row was first written (stream start); a call that began
-	// before the window but is still open (a long Await) must be included too.
-	return (await db
+function toolPage(narratorId: string, window: RowWindow, after: Cursor | null, limit: number) {
+	return db
 		.select({
 			id: narratorToolCalls.id,
 			toolUseId: narratorToolCalls.toolUseId,
@@ -431,25 +345,19 @@ async function loadToolRows(narratorId: string, fromIso: string, toIso: string) 
 		.where(
 			and(
 				eq(narratorToolCalls.narratorId, narratorId),
-				lte(narratorToolCalls.createdAt, toIso),
-				gte(narratorToolCalls.createdAt, fromIso),
+				gte(narratorToolCalls.createdAt, window.fromIso),
+				window.toIso ? lte(narratorToolCalls.createdAt, window.toIso) : undefined,
 				eq(narratorToolCalls.isInternal, false),
 				eq(narratorToolCalls.isFileHistoryCheckpoint, false),
+				afterCursor(narratorToolCalls.createdAt, narratorToolCalls.id, after),
 			),
 		)
-		.orderBy(asc(narratorToolCalls.createdAt))
-		.limit(MAX_ROWS_PER_SOURCE)) as ToolQueryRow[];
+		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+		.limit(limit);
 }
 
-interface ModelQueryRow extends ModelTimingRow {
-	model: string | null;
-	inputTokens: number;
-	outputTokens: number;
-	errorMessage: string | null;
-}
-
-async function loadModelRows(narratorId: string, fromIso: string, toIso: string) {
-	return (await db
+function modelPage(narratorId: string, window: RowWindow, after: Cursor | null, limit: number) {
+	return db
 		.select({
 			id: apiRequests.id,
 			kind: apiRequests.kind,
@@ -465,14 +373,227 @@ async function loadModelRows(narratorId: string, fromIso: string, toIso: string)
 		.where(
 			and(
 				eq(apiRequests.narratorId, narratorId),
-				gte(apiRequests.createdAt, fromIso),
-				lte(apiRequests.createdAt, toIso),
+				gte(apiRequests.createdAt, window.fromIso),
+				window.toIso ? lte(apiRequests.createdAt, window.toIso) : undefined,
 				inArray(apiRequests.kind, ["narrator", "compact", "reflection", "context_ask"]),
+				afterCursor(apiRequests.createdAt, apiRequests.id, after),
 			),
 		)
-		.orderBy(asc(apiRequests.createdAt))
-		.limit(MAX_ROWS_PER_SOURCE)) as ModelQueryRow[];
+		.orderBy(asc(apiRequests.createdAt), asc(apiRequests.id))
+		.limit(limit);
 }
+
+type ToolRow = Awaited<ReturnType<typeof toolPage>>[number];
+type ModelRow = Awaited<ReturnType<typeof modelPage>>[number];
+
+/** Newest message of a narrator in `[fromIso, toIso)`: one seek on idx_messages_narrator. */
+async function lastMessageMs(narratorId: string, fromIso: string, toIso?: string) {
+	const row = await db
+		.select({ at: narratorMessages.createdAt })
+		.from(narratorMessages)
+		.where(
+			and(
+				eq(narratorMessages.narratorId, narratorId),
+				gte(narratorMessages.createdAt, fromIso),
+				toIso ? lt(narratorMessages.createdAt, toIso) : undefined,
+			),
+		)
+		.orderBy(desc(narratorMessages.createdAt))
+		.limit(1)
+		.get();
+	return parseMs(row?.at);
+}
+
+// ── Turns ───────────────────────────────────────────────────────────────────
+
+interface TurnRow {
+	id: string;
+	status: string;
+	startedAt: string;
+	endedAt: string | null;
+	stopReason: string | null;
+	triggerText: string | null;
+}
+
+const TURN_COLUMNS = {
+	id: narratorTurns.id,
+	status: narratorTurns.status,
+	startedAt: narratorTurns.startedAt,
+	endedAt: narratorTurns.endedAt,
+	stopReason: narratorTurns.stopReason,
+	triggerText: sql<string | null>`(SELECT substr(m.content_text, 1, 200)
+		FROM narrator_messages m WHERE m.id = ${narratorTurns.triggerMessageId})`,
+};
+
+function toTurnStatus(status: string): TimelineTurnStatus {
+	return status === "running" || status === "interrupted" || status === "failed"
+		? status
+		: "completed";
+}
+
+function toTurnSummary(row: TurnRow, index: number): TimelineTurnSummary {
+	return {
+		id: row.id,
+		index,
+		status: toTurnStatus(row.status),
+		startedAt: row.startedAt,
+		endedAt: row.endedAt,
+		stopReason: row.stopReason,
+		triggerExcerpt: excerpt(row.triggerText),
+		derived: false,
+	};
+}
+
+/** Counted on the covering (narrator_id, started_at) index. */
+async function countTurnsBefore(narratorId: string, startedAt: string): Promise<number> {
+	const row = await db
+		.select({ n: count() })
+		.from(narratorTurns)
+		.where(and(eq(narratorTurns.narratorId, narratorId), lt(narratorTurns.startedAt, startedAt)))
+		.get();
+	return Number(row?.n ?? 0);
+}
+
+/** Top-level human inputs: the turn boundaries of histories older than `narrator_turns`. */
+function userInputWhere(narratorId: string, before?: string) {
+	return and(
+		eq(narratorMessages.narratorId, narratorId),
+		isNull(narratorMessages.parentToolUseId),
+		eq(narratorMessages.role, "user"),
+		or(isNull(narratorMessages.origin), eq(narratorMessages.origin, "user")),
+		before ? lt(narratorMessages.createdAt, before) : undefined,
+	);
+}
+
+/**
+ * Turns derived from user inputs, for histories older than `narrator_turns`. Each human
+ * input starts a turn that lasts until the next one. Both reads filter on non-indexed
+ * columns over a possibly long history, so they run on the worker pool.
+ */
+async function derivedTurns(
+	narratorId: string,
+	before: string | undefined,
+	limit: number,
+): Promise<{ turns: TimelineTurnSummary[]; hasMore: boolean }> {
+	const [rows, totals] = await Promise.all([
+		readQuery(
+			db
+				.select({
+					id: narratorMessages.id,
+					createdAt: narratorMessages.createdAt,
+					text: sql<string | null>`substr(${narratorMessages.contentText}, 1, 200)`,
+				})
+				.from(narratorMessages)
+				.where(userInputWhere(narratorId, before))
+				.orderBy(desc(narratorMessages.createdAt), desc(narratorMessages.id))
+				.limit(limit + 1),
+			{ maxRows: limit + 1, timeoutMs: READ_TIMEOUT_MS },
+		),
+		readQuery(
+			db.select({ n: count() }).from(narratorMessages).where(userInputWhere(narratorId, before)),
+			{ maxRows: 1, timeoutMs: READ_TIMEOUT_MS },
+		),
+	]);
+	const total = Number(totals[0]?.n ?? rows.length);
+	const page = rows.slice(0, limit);
+	const turns = page.map(
+		(row, i): TimelineTurnSummary => ({
+			id: `msg:${row.id}`,
+			index: total - i,
+			status: "completed",
+			startedAt: row.createdAt,
+			// Rows are newest first: a turn ends where the next-newer input begins. The newest
+			// turn's end is resolved from real activity when it is opened.
+			endedAt: i === 0 ? (before ?? null) : page[i - 1].createdAt,
+			stopReason: null,
+			triggerExcerpt: excerpt(row.text),
+			derived: true,
+		}),
+	);
+	return { turns, hasMore: rows.length > limit };
+}
+
+export async function listTimelineTurns(
+	narratorId: string,
+	options: { before?: string; limit?: number } = {},
+): Promise<TimelineTurnsResponse> {
+	const limit = Math.min(Math.max(Math.trunc(options.limit ?? 20), 1), MAX_TURNS_PAGE);
+	const rows = (await db
+		.select(TURN_COLUMNS)
+		.from(narratorTurns)
+		.where(
+			and(
+				eq(narratorTurns.narratorId, narratorId),
+				options.before ? lt(narratorTurns.startedAt, options.before) : undefined,
+			),
+		)
+		.orderBy(desc(narratorTurns.startedAt), desc(narratorTurns.id))
+		.limit(limit + 1)) as TurnRow[];
+	if (rows.length === 0) {
+		const derived = await derivedTurns(narratorId, options.before, limit);
+		return { narratorId, ...derived };
+	}
+	const page = rows.slice(0, limit);
+	const oldest = page[page.length - 1];
+	const baseIndex = oldest ? await countTurnsBefore(narratorId, oldest.startedAt) : 0;
+	return {
+		narratorId,
+		turns: page.map((row, i) => toTurnSummary(row, baseIndex + (page.length - i))),
+		hasMore: rows.length > limit,
+	};
+}
+
+async function resolveTurn(
+	narratorId: string,
+	turnId: string | undefined,
+): Promise<TimelineTurnSummary | null> {
+	if (turnId?.startsWith("msg:")) {
+		const messageId = turnId.slice(4);
+		const anchor = await db
+			.select({ createdAt: narratorMessages.createdAt })
+			.from(narratorMessages)
+			.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
+			.get();
+		if (!anchor) return null;
+		// The page starting just before the next input holds the anchor as its newest turn.
+		const [next] = await readQuery(
+			db
+				.select({ createdAt: narratorMessages.createdAt })
+				.from(narratorMessages)
+				.where(
+					and(
+						userInputWhere(narratorId),
+						or(
+							gt(narratorMessages.createdAt, anchor.createdAt),
+							and(
+								eq(narratorMessages.createdAt, anchor.createdAt),
+								gt(narratorMessages.id, messageId),
+							),
+						),
+					),
+				)
+				.orderBy(asc(narratorMessages.createdAt), asc(narratorMessages.id))
+				.limit(1),
+			{ maxRows: 1, timeoutMs: READ_TIMEOUT_MS },
+		);
+		const { turns } = await derivedTurns(narratorId, next?.createdAt, 1);
+		const turn = turns[0];
+		return turn && turn.id === turnId ? turn : null;
+	}
+	if (turnId) {
+		const row = (await db
+			.select(TURN_COLUMNS)
+			.from(narratorTurns)
+			.where(and(eq(narratorTurns.id, turnId), eq(narratorTurns.narratorId, narratorId)))
+			.get()) as TurnRow | undefined;
+		if (!row) return null;
+		return toTurnSummary(row, (await countTurnsBefore(narratorId, row.startedAt)) + 1);
+	}
+	const { turns } = await listTimelineTurns(narratorId, { limit: 1 });
+	return turns[0] ?? null;
+}
+
+// ── Lanes ───────────────────────────────────────────────────────────────────
 
 interface NarratorRow {
 	id: string;
@@ -496,66 +617,54 @@ const NARRATOR_COLUMNS = {
 	createdAt: narrators.createdAt,
 };
 
-/** Latest recorded activity of a narrator in `[fromIso, toIso)` (toIso open when omitted). */
-async function lastActivityMs(
-	narratorId: string,
-	fromIso: string,
-	toIso?: string,
-): Promise<number | null> {
-	const upper = (column: string) => (toIso ? sql`AND ${sql.raw(column)} < ${toIso}` : sql``);
-	const rows = await db.all<{ at: string | null }>(sql`
-		SELECT max(at) AS at FROM (
-			SELECT max(coalesce(completed_at, created_at)) AS at FROM narrator_tool_calls
-				WHERE narrator_id = ${narratorId} AND created_at >= ${fromIso} ${upper("created_at")}
-			UNION ALL
-			SELECT max(created_at) AS at FROM api_requests
-				WHERE narrator_id = ${narratorId} AND created_at >= ${fromIso} ${upper("created_at")}
-			UNION ALL
-			SELECT max(created_at) AS at FROM narrator_messages
-				WHERE narrator_id = ${narratorId} AND created_at >= ${fromIso} ${upper("created_at")}
-		)
-	`);
-	return parseMs(rows[0]?.at ?? null);
+interface LaneWindow {
+	startMs: number;
+	/** Known end; `null` derives it from the lane's own latest activity. */
+	endMs: number | null;
+	/** Bound on the activity searched when `endMs` is derived (the next turn's start). */
+	upperMs: number | null;
+	live: boolean;
+}
+
+interface LaneMeta {
+	depth: number;
+	spawnItemId: string | null;
+	spawnAtMs: number | null;
+}
+
+interface BuildContext {
+	nowMs: number;
+	items: Record<string, TimelineItem>;
 }
 
 interface LaneBuild {
 	lane: TimelineLane;
-	toolItems: TimelineToolItem[];
-	/** Child narrators keyed by the spawning tool call id. */
-	children: Map<string, NarratorRow>;
+	/** Spawn calls of this lane with the child narrator each one created. */
+	spawns: Array<{ row: ToolRow; child: NarratorRow }>;
 }
 
-function toToolItem(row: ToolQueryRow, childNarratorId: string | null): TimelineToolItem {
+function toToolItem(row: ToolRow, child: NarratorRow | undefined): TimelineToolItem {
 	return {
 		kind: "tool",
 		id: row.id,
-		toolUseId: row.toolUseId,
 		toolName: row.toolName,
-		summary: buildSummary(row.toolName, row),
+		summary: buildSummary(row.toolName, row) ?? (child?.title ? excerpt(child.title) : null),
 		status: row.status,
 		isBackground: !!row.isBackground,
 		executionDeviceId: row.executionDeviceId,
 		errorMessage: row.errorMessage ? redactExecutionLogText(row.errorMessage) : null,
 		permissionDecidedBy: row.permissionDecidedBy,
-		streamStartedAt: row.streamStartedAt,
-		permissionStartedAt: row.permissionStartedAt,
-		permissionDecidedAt: row.permissionDecidedAt,
-		executionStartedAt: row.executionStartedAt,
-		completedAt: row.completedAt,
 		durationMs: row.durationMs,
-		childNarratorId,
+		childNarratorId: child?.id ?? null,
 	};
 }
 
-function toModelItem(row: ModelQueryRow): TimelineModelItem {
-	const endMs = parseMs(row.createdAt) ?? 0;
+function toModelItem(row: ModelRow): TimelineModelItem {
 	return {
 		kind: "model",
 		id: row.id,
 		requestKind: row.kind,
 		model: row.model,
-		startedAt: new Date(endMs - (row.durationMs ?? 0)).toISOString(),
-		endedAt: row.createdAt,
 		ttftMs: row.ttftMs,
 		durationMs: row.durationMs,
 		inputTokens: row.inputTokens,
@@ -564,60 +673,98 @@ function toModelItem(row: ModelQueryRow): TimelineModelItem {
 	};
 }
 
-async function buildLane(
-	narrator: NarratorRow,
-	window: { startMs: number; endMs: number; live: boolean },
-	meta: {
-		depth: number;
-		spawnItemId: string | null;
-		spawnAtMs: number | null;
-		nowMs: number;
-		loadChildren: boolean;
-	},
-	items: Record<string, TimelineItem>,
-): Promise<LaneBuild> {
-	const fromIso = new Date(window.startMs).toISOString();
-	const toIso = new Date(window.endMs).toISOString();
-	const [toolRows, modelRows] = await Promise.all([
-		loadToolRows(narrator.id, fromIso, toIso),
-		loadModelRows(narrator.id, fromIso, toIso),
-	]);
-	const spawnCallIds = toolRows
+/** Latest moment the loaded rows (or a message) show this narrator active. */
+async function derivedEndMs(
+	narratorId: string,
+	window: LaneWindow,
+	tools: ToolRow[],
+	models: ModelRow[],
+): Promise<number> {
+	let last = window.startMs;
+	for (const row of tools) {
+		last = Math.max(last, parseMs(row.completedAt) ?? parseMs(row.createdAt) ?? last);
+	}
+	for (const row of models) last = Math.max(last, parseMs(row.createdAt) ?? last);
+	const message = await lastMessageMs(
+		narratorId,
+		toIso(window.startMs),
+		window.upperMs !== null ? toIso(window.upperMs) : undefined,
+	);
+	return Math.max(last, message ?? last);
+}
+
+async function loadChildren(
+	narratorId: string,
+	tools: ToolRow[],
+): Promise<Map<string, NarratorRow>> {
+	const spawnCallIds = tools
 		.filter((row) => SPAWN_TOOLS.has(row.toolName))
 		.map((row) => row.id)
 		.slice(0, MAX_SPAWN_LOOKUPS);
-	const children =
-		meta.loadChildren && spawnCallIds.length > 0
-			? ((await db
-					.select(NARRATOR_COLUMNS)
-					.from(narrators)
-					.where(
-						and(
-							inArray(narrators.originToolCallId, spawnCallIds),
-							eq(narrators.parentNarratorId, narrator.id),
-						),
-					)) as NarratorRow[])
-			: [];
-	const childByToolCall = new Map<string, NarratorRow>();
+	const byToolCall = new Map<string, NarratorRow>();
+	if (spawnCallIds.length === 0) return byToolCall;
+	const children = (await db
+		.select(NARRATOR_COLUMNS)
+		.from(narrators)
+		.where(
+			and(
+				inArray(narrators.originToolCallId, spawnCallIds),
+				eq(narrators.parentNarratorId, narratorId),
+			),
+		)) as NarratorRow[];
 	for (const child of children) {
-		if (child.originToolCallId) childByToolCall.set(child.originToolCallId, child);
+		if (child.originToolCallId) byToolCall.set(child.originToolCallId, child);
 	}
+	return byToolCall;
+}
+
+async function buildLane(
+	narrator: NarratorRow,
+	window: LaneWindow,
+	meta: LaneMeta & { loadChildren: boolean },
+	ctx: BuildContext,
+): Promise<LaneBuild> {
+	const upper = window.endMs ?? window.upperMs;
+	const rowWindow: RowWindow = {
+		fromIso: toIso(window.startMs),
+		toIso: upper !== null ? toIso(upper) : undefined,
+	};
+	const [tools, models] = await Promise.all([
+		readPaged(
+			(after, limit) => toolPage(narrator.id, rowWindow, after, limit),
+			TOOL_PAGE_ROWS,
+			MAX_ROWS_PER_SOURCE,
+		),
+		readPaged(
+			(after, limit) => modelPage(narrator.id, rowWindow, after, limit),
+			MODEL_PAGE_ROWS,
+			MAX_ROWS_PER_SOURCE,
+		),
+	]);
+	const endMs =
+		window.endMs ??
+		(window.live ? ctx.nowMs : await derivedEndMs(narrator.id, window, tools.rows, models.rows));
+	// Past the first unread row nothing is known: the lane stops there instead of showing idle.
+	const cuts = [tools.cutAt, models.cutAt].map(parseMs).filter((ms): ms is number => ms !== null);
+	const coveredUntilMs =
+		cuts.length > 0 ? Math.max(window.startMs, Math.min(endMs, ...cuts)) : null;
+	const children = meta.loadChildren ? await loadChildren(narrator.id, tools.rows) : new Map();
 
 	const intervals: TimelineInterval[] = [];
-	const toolItems: TimelineToolItem[] = [];
-	for (const row of toolRows) {
-		intervals.push(...toolIntervals(row, meta.nowMs));
-		const item = toToolItem(row, childByToolCall.get(row.id)?.id ?? null);
-		items[row.id] = item;
-		toolItems.push(item);
+	const spawns: LaneBuild["spawns"] = [];
+	for (const row of tools.rows) {
+		intervals.push(...toolIntervals(row, ctx.nowMs));
+		const child = children.get(row.id);
+		ctx.items[row.id] = toToolItem(row, child);
+		if (child) spawns.push({ row, child });
 	}
-	for (const row of modelRows) {
+	for (const row of models.rows) {
 		intervals.push(...modelIntervals(row));
-		items[row.id] = toModelItem(row);
+		ctx.items[row.id] = toModelItem(row);
 	}
 	const partition = partitionTimeline({
 		startMs: window.startMs,
-		endMs: window.endMs,
+		endMs: coveredUntilMs ?? endMs,
 		intervals,
 	});
 	return {
@@ -631,25 +778,96 @@ async function buildLane(
 			spawnItemId: meta.spawnItemId,
 			spawnAtMs: meta.spawnAtMs,
 			startMs: window.startMs,
-			endMs: window.endMs,
+			endMs,
 			live: window.live,
 			segments: partition.segments,
 			totals: partition.totals,
-			truncated: partition.truncated,
+			truncated: partition.truncated || coveredUntilMs !== null,
+			coveredUntilMs,
 		},
-		toolItems,
-		children: childByToolCall,
+		spawns,
 	};
 }
 
-/**
- * The timeline of one turn: the narrator's own lane plus one lane per child agent
- * spawned during it (and their children, to {@link MAX_DEPTH}).
- */
-export async function getTurnTimeline(
+interface PendingLane extends LaneMeta {
+	narrator: NarratorRow;
+	window: LaneWindow;
+}
+
+/** Child lanes of one built lane, in spawn order. */
+function childLanes(build: LaneBuild, depth: number): { lanes: PendingLane[]; omitted: number } {
+	const lanes: PendingLane[] = [];
+	let omitted = 0;
+	for (const { row, child } of build.spawns) {
+		if (lanes.length >= MAX_CHILDREN_PER_LANE) {
+			omitted++;
+			continue;
+		}
+		const spawnAt =
+			parseMs(row.executionStartedAt) ??
+			parseMs(row.permissionStartedAt) ??
+			parseMs(row.streamStartedAt) ??
+			parseMs(child.createdAt);
+		if (spawnAt === null) continue;
+		const startMs = Math.max(spawnAt, parseMs(child.createdAt) ?? spawnAt);
+		const live = child.status === "working" || (!row.completedAt && row.status === "running");
+		// A foreground spawn returns when its child is done, so its completion ends the child's
+		// lane; a later resume of the same child belongs to another turn.
+		const completedAt = row.isBackground ? null : parseMs(row.completedAt);
+		lanes.push({
+			narrator: child,
+			depth,
+			spawnItemId: row.id,
+			spawnAtMs: spawnAt,
+			window: {
+				startMs,
+				endMs: live || completedAt === null ? null : Math.max(startMs, completedAt),
+				upperMs: null,
+				live,
+			},
+		});
+	}
+	return { lanes, omitted };
+}
+
+async function mapWithConcurrency<T, R>(
+	values: readonly T[],
+	limit: number,
+	fn: (value: T) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(values.length);
+	let next = 0;
+	const run = async () => {
+		while (next < values.length) {
+			const index = next++;
+			results[index] = await fn(values[index]);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, values.length) }, run));
+	return results;
+}
+
+/** Keep only the details some segment (or a branch connector) points at. */
+function referencedItems(
+	lanes: TimelineLane[],
+	items: Record<string, TimelineItem>,
+): Record<string, TimelineItem> {
+	const out: Record<string, TimelineItem> = {};
+	const keep = (id: string | null) => {
+		const item = id ? items[id] : undefined;
+		if (id && item) out[id] = item;
+	};
+	for (const lane of lanes) {
+		keep(lane.spawnItemId);
+		for (const segment of lane.segments) for (const id of segment.itemIds) keep(id);
+	}
+	return out;
+}
+
+async function buildTurnTimeline(
 	narratorId: string,
-	turnId?: string,
-	nowMs: number = Date.now(),
+	turnId: string | undefined,
+	nowMs: number,
 ): Promise<TurnTimelineResponse | null> {
 	const root = (await db
 		.select(NARRATOR_COLUMNS)
@@ -660,128 +878,74 @@ export async function getTurnTimeline(
 
 	const turn = await resolveTurn(narratorId, turnId);
 	if (turnId && !turn) return null;
-	const items: Record<string, TimelineItem> = {};
-	const lanes: TimelineLane[] = [];
-	let omittedLanes = 0;
 
-	let rootStart: number;
-	let rootEnd: number;
-	let rootLive = false;
-	if (turn) {
-		rootStart = parseMs(turn.startedAt) ?? nowMs;
-		rootLive = turn.status === "running";
-		rootEnd = rootLive ? nowMs : (parseMs(turn.endedAt) ?? nowMs);
-		if (turn.derived) {
-			// A derived turn runs until the next input; it ends at its last real activity.
-			const last = await lastActivityMs(narratorId, turn.startedAt, turn.endedAt ?? undefined);
-			rootLive = !turn.endedAt && root.status === "working";
-			rootEnd = rootLive ? nowMs : Math.max(rootStart, last ?? rootStart);
-		}
+	let rootWindow: LaneWindow;
+	if (turn && !turn.derived) {
+		const live = turn.status === "running";
+		const startMs = parseMs(turn.startedAt) ?? nowMs;
+		rootWindow = {
+			startMs,
+			endMs: live ? nowMs : Math.max(startMs, parseMs(turn.endedAt) ?? nowMs),
+			upperMs: null,
+			live,
+		};
+	} else if (turn) {
+		// A derived turn runs until the next input; it ends at its last real activity.
+		const live = !turn.endedAt && root.status === "working";
+		rootWindow = {
+			startMs: parseMs(turn.startedAt) ?? nowMs,
+			endMs: live ? nowMs : null,
+			upperMs: parseMs(turn.endedAt),
+			live,
+		};
 	} else {
 		// No turns at all (a subagent opened directly): its whole recorded activity.
-		rootStart = parseMs(root.createdAt) ?? nowMs;
-		const last = await lastActivityMs(narratorId, root.createdAt);
-		rootLive = root.status === "working" || root.status === "waiting";
-		rootEnd = rootLive ? nowMs : (last ?? rootStart);
-	}
-	if (rootEnd < rootStart) rootEnd = rootStart;
-
-	interface Pending {
-		narrator: NarratorRow;
-		depth: number;
-		startMs: number;
-		endMs: number;
-		live: boolean;
-		spawnItemId: string | null;
-		spawnAtMs: number | null;
+		const live = root.status === "working" || root.status === "waiting";
+		rootWindow = {
+			startMs: parseMs(root.createdAt) ?? nowMs,
+			endMs: live ? nowMs : null,
+			upperMs: null,
+			live,
+		};
 	}
 
-	// Children are discovered lane by lane, so a parent's lane (with its spawn calls)
-	// exists before its children are placed beneath it.
-	const process = (pending: Pending): Promise<LaneBuild> =>
+	const ctx: BuildContext = { nowMs, items: {} };
+	const build = (pending: PendingLane) =>
 		buildLane(
 			pending.narrator,
-			{ startMs: pending.startMs, endMs: pending.endMs, live: pending.live },
-			{
-				depth: pending.depth,
-				spawnItemId: pending.spawnItemId,
-				spawnAtMs: pending.spawnAtMs,
-				nowMs,
-				loadChildren: pending.depth < MAX_DEPTH,
-			},
-			items,
+			pending.window,
+			{ ...pending, loadChildren: pending.depth < MAX_DEPTH },
+			ctx,
 		);
+	let omittedLanes = 0;
+	let slotsLeft = MAX_LANES - 1;
 
-	const placeChildren = async (build: LaneBuild, depth: number): Promise<Pending[]> => {
-		const pendings: Pending[] = [];
-		for (const tool of build.toolItems) {
-			if (!tool.childNarratorId) continue;
-			if (pendings.length >= MAX_CHILDREN_PER_LANE) {
-				omittedLanes++;
-				continue;
-			}
-			const child = build.children.get(tool.id);
-			if (!child) continue;
-			const spawnAt =
-				parseMs(tool.executionStartedAt) ??
-				parseMs(tool.permissionStartedAt) ??
-				parseMs(tool.streamStartedAt) ??
-				parseMs(child.createdAt);
-			if (spawnAt === null) continue;
-			const childStart = Math.max(spawnAt, parseMs(child.createdAt) ?? spawnAt);
-			const childLive =
-				child.status === "working" || (!tool.completedAt && tool.status === "running");
-			const last = await lastActivityMs(child.id, new Date(childStart).toISOString());
-			const childEnd = childLive
-				? nowMs
-				: Math.max(
-						childStart,
-						parseMs(tool.isBackground ? null : tool.completedAt) ?? 0,
-						last ?? 0,
-					);
-			pendings.push({
-				narrator: child,
-				depth,
-				startMs: childStart,
-				endMs: childEnd,
-				live: childLive,
-				spawnItemId: tool.id,
-				spawnAtMs: spawnAt,
-			});
-		}
-		return pendings;
+	// Siblings claim lane slots before their descendants and are built together; the
+	// output is still depth-first, each lane followed by its own subtree.
+	const subtree = async (pending: PendingLane, built: LaneBuild): Promise<TimelineLane[]> => {
+		if (pending.depth >= MAX_DEPTH) return [built.lane];
+		const children = childLanes(built, pending.depth + 1);
+		const admitted = children.lanes.slice(0, Math.max(0, slotsLeft));
+		slotsLeft -= admitted.length;
+		omittedLanes += children.omitted + children.lanes.length - admitted.length;
+		const builds = await mapWithConcurrency(admitted, LANE_CONCURRENCY, build);
+		const out = [built.lane];
+		for (let i = 0; i < admitted.length; i++) out.push(...(await subtree(admitted[i], builds[i])));
+		return out;
 	};
-
-	const rootBuild = await process({
+	const rootPending: PendingLane = {
 		narrator: root,
+		window: rootWindow,
 		depth: 0,
-		startMs: rootStart,
-		endMs: rootEnd,
-		live: rootLive,
 		spawnItemId: null,
 		spawnAtMs: null,
-	});
-
-	// Depth-first: each lane is followed by its own descendants.
-	const emit = async (build: LaneBuild, children: Pending[]) => {
-		lanes.push(build.lane);
-		for (const pending of children) {
-			if (lanes.length >= MAX_LANES) {
-				omittedLanes++;
-				continue;
-			}
-			const childBuild = await process(pending);
-			const grandChildren =
-				pending.depth < MAX_DEPTH ? await placeChildren(childBuild, pending.depth + 1) : [];
-			await emit(childBuild, grandChildren);
-		}
 	};
-	await emit(rootBuild, await placeChildren(rootBuild, 1));
+	const lanes = await subtree(rootPending, await build(rootPending));
 
 	// The primary lane is padded to the overall window, so a child outliving the turn
 	// shows as `after_turn` on its parent instead of the parent simply stopping.
-	const overallEnd = Math.max(rootEnd, ...lanes.map((lane) => lane.endMs));
 	const primary = lanes[0];
+	const overallEnd = Math.max(...lanes.map((lane) => lane.endMs));
 	if (primary && overallEnd > primary.endMs) {
 		primary.segments.push({
 			category: "after_turn",
@@ -797,10 +961,49 @@ export async function getTurnTimeline(
 		narratorId,
 		turn,
 		nowMs,
-		startMs: rootStart,
-		endMs: overallEnd,
+		startMs: rootWindow.startMs,
+		endMs: primary?.endMs ?? rootWindow.startMs,
 		lanes,
-		items,
+		items: referencedItems(lanes, ctx.items),
 		omittedLanes,
 	};
+}
+
+const inFlight = new Map<string, Promise<TurnTimelineResponse | null>>();
+
+/**
+ * The timeline of one turn: the narrator's own lane plus one lane per child agent
+ * spawned during it (and their children, to {@link MAX_DEPTH}). The latest turn when
+ * `turnId` is omitted.
+ *
+ * Callers are authorized before this runs, so concurrent requests for the same turn (several
+ * viewers polling a live one) share a single build.
+ */
+export function getTurnTimeline(
+	narratorId: string,
+	turnId?: string,
+	nowMs?: number,
+): Promise<TurnTimelineResponse | null> {
+	if (nowMs !== undefined) return buildTurnTimeline(narratorId, turnId, nowMs);
+	const key = `${narratorId}\u0000${turnId ?? ""}`;
+	const pending = inFlight.get(key);
+	if (pending) return pending;
+	const startedAt = performance.now();
+	const build = buildTurnTimeline(narratorId, turnId, Date.now())
+		.then((result) => {
+			const elapsedMs = performance.now() - startedAt;
+			if (elapsedMs > SLOW_BUILD_MS && result) {
+				logger.warn("Slow narrator timeline build", {
+					narratorId,
+					turnId: result.turn?.id ?? null,
+					elapsedMs: Math.round(elapsedMs),
+					lanes: result.lanes.length,
+					items: Object.keys(result.items).length,
+				});
+			}
+			return result;
+		})
+		.finally(() => inFlight.delete(key));
+	inFlight.set(key, build);
+	return build;
 }
