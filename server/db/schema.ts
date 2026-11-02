@@ -5767,7 +5767,9 @@ export const outlinePending = sqliteTable(
 			.$type<OutlinePendingRequesterJson>()
 			.notNull(),
 		requesterSession: text("requester_session"),
-		deciderJson: text("decider_json", { mode: "json" }).$type<OutlinePendingDeciderJson>().notNull(),
+		deciderJson: text("decider_json", { mode: "json" })
+			.$type<OutlinePendingDeciderJson>()
+			.notNull(),
 		deciderUserId: text("decider_user_id"),
 		rev: integer("rev").notNull().default(1),
 		createdAt: text("created_at").notNull(),
@@ -5789,9 +5791,7 @@ export const outlinePending = sqliteTable(
 		index("idx_outline_pending_requester_unreported")
 			.on(table.requesterSession)
 			.where(sql`"reported_at" IS NULL`),
-		index("idx_outline_pending_decider_open")
-			.on(table.deciderUserId)
-			.where(sql`"status" = 'open'`),
+		index("idx_outline_pending_decider_open").on(table.deciderUserId).where(sql`"status" = 'open'`),
 		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
 	],
 );
