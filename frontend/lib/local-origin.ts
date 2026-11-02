@@ -39,7 +39,18 @@ export function isLoopbackBrowserOrigin(win?: Window): boolean {
 	}
 }
 
+/**
+ * Whether an action executed on the SERVER host would be visible to this browser.
+ *
+ * This is the general form of the check above: "open in file explorer" and "copy this file to
+ * the clipboard" both run on the server machine, and both are pointless (or land on somebody
+ * else's desktop) unless the browser is on that machine too.
+ */
+export function isLocalBrowserSession(treatAsLocalAccess = false, win?: Window): boolean {
+	return treatAsLocalAccess === true || isLoopbackBrowserOrigin(win);
+}
+
 /** An opt-in overrides origin detection only; file-manager execution stays on the server. */
 export function canRevealFromBrowser(treatAsLocalAccess = false, win?: Window): boolean {
-	return treatAsLocalAccess === true || isLoopbackBrowserOrigin(win);
+	return isLocalBrowserSession(treatAsLocalAccess, win);
 }
