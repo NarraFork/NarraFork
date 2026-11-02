@@ -36,12 +36,24 @@ import { LocalProcessRunner, PluginRuntime } from "./plugin-runtime";
 const FULL_TOOL_ID = `${APIKEY_QUOTA_PLUGIN_ID}/${APIKEY_QUOTA_TOOL_ID}`;
 const PLUGIN_DIR = join(import.meta.dir, "../builtin-plugins/apikey-quota");
 const REQUEST_TIMEOUT_MS = 15_000;
+/**
+ * How long the process may sit unused before it is reaped.
+ *
+ * Deliberately not the request timeout: quota probes are minutes apart (`providerBalanceCache`
+ * refreshes on its own schedule), so a request-sized idle window would reap the process after
+ * every single probe and make the plugin pay a spawn on every call. Reaping is still normal —
+ * the engine restarts on demand (see `ensureRuntime`) — this just keeps a warm process for the
+ * common interval instead of one that is almost always gone.
+ */
+const IDLE_TIMEOUT_MS = 5 * 60_000;
 
 /** The slice of `PluginRuntime` this engine needs; tests inject a fake. */
 export interface QuotaPluginRuntime {
 	start(signal?: AbortSignal): Promise<void>;
 	request<T = unknown>(method: string, params?: unknown, options?: unknown): Promise<T>;
 	shutdown(): Promise<void>;
+	/** Fires when the process goes away on its own (idle reap, crash, broken pipe). */
+	onClose?(handler: (error?: Error) => void): () => void;
 }
 
 export interface ApikeyQuotaEngineOptions {
@@ -83,6 +95,11 @@ export function createApikeyQuotaEngine(
 				const created = options.createRuntime ? options.createRuntime() : createBundledRuntime();
 				if (!created) return undefined;
 				await created.start(signal);
+				// A reaped or crashed process must never stay cached: the next probe would send
+				// into a closed pipe and fall back for the rest of the host's life.
+				created.onClose?.(() => {
+					if (runtime === created) runtime = undefined;
+				});
 				runtime = created;
 				return created;
 			} catch (error) {
@@ -237,7 +254,7 @@ function createBundledRuntime(): QuotaPluginRuntime | undefined {
 		allowedCwds: [PLUGIN_DIR],
 		allowUnboundedResourceUsage: process.platform === "win32",
 		spawnTimeoutMs: REQUEST_TIMEOUT_MS,
-		idleTimeoutMs: REQUEST_TIMEOUT_MS,
+		idleTimeoutMs: IDLE_TIMEOUT_MS,
 	});
 	return new PluginRuntime({
 		pluginId: APIKEY_QUOTA_PLUGIN_ID,
@@ -257,7 +274,7 @@ function createBundledRuntime(): QuotaPluginRuntime | undefined {
 			shutdownMs: 500,
 			cancelGraceMs: 100,
 		},
-		idleTimeoutMs: REQUEST_TIMEOUT_MS,
+		idleTimeoutMs: IDLE_TIMEOUT_MS,
 	});
 }
 
