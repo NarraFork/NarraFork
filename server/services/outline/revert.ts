@@ -67,6 +67,11 @@ export interface OutlineRevertInput {
 	toolCallId?: string | null;
 	/** Default: `revert #seq: <the reverted commit's summary>`. */
 	summary?: string;
+	/**
+	 * Whether the actor may take away someone else's lock (a manager of the space, an admin; the
+	 * caller decides). Without it a revert that would unlock keeps the lock (`lock-kept`).
+	 */
+	unlockAuthority?: () => Promise<boolean>;
 }
 
 export interface OutlineRevertSkip extends OutlineBlockAddressed {
@@ -514,6 +519,7 @@ async function revertAttempts(
 					messageId: input.messageId ?? null,
 					toolCallId: input.toolCallId ?? null,
 					summary: input.summary ?? OUTLINE_TEXT.revertSummary(commit.seq, commit.summary),
+					...(input.unlockAuthority ? { unlockAuthority: input.unlockAuthority } : {}),
 				},
 				{
 					store,
@@ -552,7 +558,9 @@ async function revertAttempts(
 						)
 					: adjustment.kind === "order-key-moved"
 						? OUTLINE_TEXT.orderKeyMoved(adjustment.wanted)
-						: OUTLINE_TEXT.taskNotStarted,
+						: adjustment.kind === "lock-kept"
+							? OUTLINE_TEXT.lockKept
+							: OUTLINE_TEXT.taskNotStarted,
 		}));
 		return {
 			...base,

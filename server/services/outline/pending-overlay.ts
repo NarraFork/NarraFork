@@ -6,19 +6,25 @@
  *   - THE PROPOSER (its session, subagents included): its open changes on the page are laid over
  *     the tree in memory: a rewritten block shows the proposed text, an added block appears with
  *     the id it will get, a deleted one is gone, a moved one is in its new place, a task change
- *     shows. Each such spot gets a `‹pending P…›` line naming who decides. The read ledger still
- *     records the blocks' stored versions, and an added block is not in it: it exists only once
- *     confirmed, so nothing can be written under it before (an edit naming it says so).
- *   - EVERYONE ELSE: the stored outline, a `‹pending P…›` line under each block a change touches.
+ *     shows. Each such spot gets a `‹pending P…›` line naming who decides. A rewritten block
+ *     someone changed since the proposal shows what confirming would write: the proposal merged
+ *     over their change (the three-way merge confirmation uses, `mergeProposal` in `pending.ts`),
+ *     marked as changed since; where they no longer merge, the block as it is now, marked with
+ *     the conflict (review S-2). The read ledger still records the blocks' stored versions, and
+ *     an added block is not in it: it exists only once confirmed, so nothing can be written
+ *     under it before (an edit naming it says so).
+ *   - EVERYONE ELSE: the stored outline, a `‹pending P…›` line under each block a change targets
+ *     and each block it adds under (from the row's head: its operations are not read).
  *
  * The marks are annotations (`render.ts`): an edit copying a read back drops them. Pure, over the
  * tree a read built; no database access.
  */
 import { compareOrderKeys } from "@shared/outline";
 import type { OutlineTaskJson } from "./model";
+import type { OutlineProposalMerge } from "./pending";
 import { pendingOps } from "./pending-hold";
 import type { OutlinePageState } from "./read";
-import type { OutlinePendingRow } from "./store/port";
+import type { OutlinePendingHead, OutlinePendingRow } from "./store/port";
 import { canonicalTaskJson } from "./task-json";
 import type { OutlineNode } from "./tree";
 import type { OutlineOp, OutlinePosition } from "./write";
@@ -31,6 +37,10 @@ export interface OutlinePendingMarkText {
 	ownDeleted: (label: string, decider: string, n: number) => string;
 	/** Under a block someone else's change touches. */
 	other: (label: string, decider: string) => string;
+	/** Under a block of the reader's own change that someone changed since; merged over it. */
+	ownMerged: (label: string, decider: string) => string;
+	/** Under a block of the reader's own change that no longer applies (shown as it is now). */
+	ownConflict: (label: string, decider: string, detail: string) => string;
 }
 
 export interface OutlinePendingOverlay {
@@ -44,22 +54,28 @@ export interface OutlinePendingOverlay {
 	readonly added: ReadonlySet<string>;
 }
 
-interface Labeled {
-	row: OutlinePendingRow;
+interface Labeled<Row> {
+	row: Row;
 	/** `P…`. */
 	label: string;
 	/** Who decides, as the marks name them. */
 	decider: string;
 }
 
+/** One of the reader's own changes: whole, with its rewrites laid over the blocks as they are. */
+export interface OutlineOwnPending extends Labeled<OutlinePendingRow> {
+	/** `mergeProposal` of the row: by rewritten block, as proposed, merged or in conflict. */
+	merges: ReadonlyMap<string, OutlineProposalMerge>;
+}
+
 /**
  * The overlay of a read: `own` are the reader's session's open changes on the page (laid over),
- * `others` everyone else's (marked). `label` names a change as the marks show it (`P…` and who
- * decides).
+ * `others` everyone else's (marked, from their heads). `label` names a change as the marks show
+ * it (`P…` and who decides).
  */
 export function pendingOverlay(args: {
-	own: readonly Labeled[];
-	others: readonly Labeled[];
+	own: readonly OutlineOwnPending[];
+	others: readonly Labeled<OutlinePendingHead>[];
 	text: OutlinePendingMarkText;
 }): OutlinePendingOverlay {
 	const marks = new Map<string, string>();
@@ -67,8 +83,11 @@ export function pendingOverlay(args: {
 	const overrides = new Map<string, { content?: string; alias?: string | null; tags?: string[] }>();
 	const added = new Set<string>();
 	for (const { row, label, decider } of args.others) {
-		for (const id of row.blockIdsJson)
-			if (!marks.has(id)) marks.set(id, args.text.other(label, decider));
+		const ids = [
+			...row.blockIdsJson,
+			...row.addsJson.flatMap((add) => (add.parentId ? [add.parentId] : [])),
+		];
+		for (const id of ids) if (!marks.has(id)) marks.set(id, args.text.other(label, decider));
 	}
 
 	const prepare = (state: OutlinePageState) => {
@@ -102,8 +121,17 @@ export function pendingOverlay(args: {
 		};
 		const idOf = (ref: { id: string } | { sid: string } | { tempId: string } | null | undefined) =>
 			ref && "id" in ref ? ref.id : undefined;
-		for (const { row, label, decider } of args.own) {
+		for (const { row, label, decider, merges } of args.own) {
 			const mark = args.text.own(label, decider);
+			// A rewritten block someone changed since: merged over their change, or left as it is.
+			const rewrite = (id: string): OutlineProposalMerge | undefined => {
+				const m = merges.get(id);
+				if (m?.state === "merged") marks.set(id, args.text.ownMerged(label, decider));
+				else if (m?.state === "conflict")
+					marks.set(id, args.text.ownConflict(label, decider, m.detail));
+				else marks.set(id, mark);
+				return m;
+			};
 			for (const op of pendingOps(row) as OutlineOp[]) {
 				switch (op.op) {
 					case "insert": {
@@ -139,22 +167,29 @@ export function pendingOverlay(args: {
 						const id = idOf(op.block);
 						if (!id || !nodes.has(id)) break;
 						const node = nodes.get(id) as OutlineNode;
+						const m = rewrite(id);
+						if (m?.state === "conflict") break;
+						const fields =
+							m?.state === "merged"
+								? { content: m.content, alias: m.alias, tags: m.tags }
+								: { content: op.content, alias: op.alias, tags: op.tags };
 						const o = overrides.get(id) ?? {};
-						if (op.content !== undefined) o.content = op.content;
-						if (op.alias !== undefined) {
-							o.alias = op.alias;
-							node.alias = op.alias;
+						if (fields.content !== undefined) o.content = fields.content;
+						if (fields.alias !== undefined) {
+							o.alias = fields.alias;
+							node.alias = fields.alias;
 						}
-						if (op.tags !== undefined) o.tags = [...op.tags].sort();
+						if (fields.tags !== undefined) o.tags = [...fields.tags].sort();
 						overrides.set(id, o);
-						marks.set(id, mark);
 						break;
 					}
 					case "setTask": {
 						const node = nodes.get(idOf(op.block) ?? "");
 						if (!node) break;
+						const m = rewrite(node.id);
+						if (m?.state === "conflict") break;
 						const before: OutlineTaskJson = node.task ?? { status: "todo", assignee: null };
-						const patch = op.task;
+						const patch = m?.state === "merged" && op.task !== null ? (m.task ?? {}) : op.task;
 						node.task =
 							patch === null
 								? null
@@ -165,7 +200,6 @@ export function pendingOverlay(args: {
 										...(patch.depends !== undefined ? { depends: patch.depends } : {}),
 										...(patch.due !== undefined ? { due: patch.due } : {}),
 									});
-						marks.set(node.id, mark);
 						break;
 					}
 					case "move": {

@@ -15,6 +15,7 @@ import { eventBus } from "../../../../lib/event-bus";
 import { generateId } from "../../../../lib/id";
 import { settings } from "../../../../lib/settings";
 import { OutlineConflictError } from "../../errors";
+import { lockOutlineTask, unlockOutlineTask } from "../../pending";
 import { ensureProjectSpace } from "../../spaces";
 import { outlineStore } from "../../store";
 import type { OutlineSpaceRow } from "../../store/port";
@@ -614,5 +615,36 @@ describe("task claims", () => {
 			expiresAt: null,
 			epoch: 1,
 		});
+	});
+});
+
+describe("locks", () => {
+	test("taking a locked task's checkbox away is refused to a writer who may not unlock; a manager of the space may", async () => {
+		const r = await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "insert", tempId: "p", parent: null, content: "Plan page" },
+				{ op: "insert", parent: { tempId: "p" }, content: "the plan", task: { status: "todo" } },
+			],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const [pageId, plan] = r.results.map((x) => x.blockId) as [string, string];
+		await lockOutlineTask({ blockId: plan, userId: owner });
+		const a = open(link(writer), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		struct(a, [{ t: "k", id: plan, task: null }]);
+		await waitFor(() => a.stats.rejects === 1, 3000, "refused");
+		expect(a.lastReject?.code).toBe("conflict");
+		expect((await outlineStore.getBlock(plan))?.taskJson?.lock?.by.id).toBe(owner);
+		// Locked by the writer now: the owner (a manager of the space) takes the checkbox away.
+		await unlockOutlineTask({ blockId: plan, userId: owner });
+		await lockOutlineTask({ blockId: plan, userId: writer });
+		const m = open(link(owner), pageId);
+		await waitFor(() => m.ready, 3000, "joined");
+		struct(m, [{ t: "k", id: plan, task: null }]);
+		await settle(60);
+		expect((await outlineStore.getBlock(plan))?.taskJson).toBeNull();
+		expect(m.stats.rejects).toBe(0);
 	});
 });

@@ -32,11 +32,13 @@ import { titleOf } from "@shared/outline";
 import { readDisplayNames } from "./access-reads";
 import { type AgentReplace, mergeAgentReplaces } from "./agent-merge";
 import { OutlineWriteError } from "./errors";
-import { contentLinks } from "./links";
+import { contentLinks, type ExtractedLink } from "./links";
 import { withOutlineLiveBarrier } from "./live-barrier";
-import { OUTLINE_TEXT } from "./messages";
+import { OUTLINE_TEXT, OUTLINE_TOOL_TEXT } from "./messages";
 import {
+	OUTLINE_LIMITS,
 	OUTLINE_PENDING_LIMITS,
+	type OutlinePendingDeciderJson,
 	type OutlineTaskActorRef,
 	type OutlineTaskLockJson,
 	outlinePendingLabel,
@@ -45,6 +47,7 @@ import { PENDING_WITHDRAW, pendingOps } from "./pending-hold";
 import { outlineStore } from "./store";
 import {
 	type OutlineBlockMeta,
+	type OutlinePendingHead,
 	OutlinePendingMovedError,
 	type OutlinePendingRow,
 	type OutlineSpaceRow,
@@ -116,7 +119,7 @@ export type OutlinePendingRight = "decider" | "proposer" | "none";
 /** The lock on a pending change's tree now (null when the tree is no longer locked). */
 async function currentLock(
 	store: OutlineStore,
-	row: OutlinePendingRow,
+	row: OutlinePendingHead,
 ): Promise<{ lock: OutlineTaskLockJson | null; root: OutlineBlockMeta | null }> {
 	if (!row.rootBlockId) return { lock: null, root: null };
 	const [root] = await store.getBlockMetas(row.spaceId, { ids: [row.rootBlockId] });
@@ -134,7 +137,7 @@ async function sessionOf(store: OutlineStore, narratorId: string): Promise<strin
  * named since the proposal decides it).
  */
 export async function pendingRightOf(
-	row: OutlinePendingRow,
+	row: OutlinePendingHead,
 	actor: OutlinePendingActor,
 	options: { store?: OutlineStore; lock?: OutlineTaskLockJson | null } = {},
 ): Promise<OutlinePendingRight> {
@@ -191,6 +194,8 @@ export const OUTLINE_PENDING_TEXT = {
 	conflict: (label: string) =>
 		`${label} no longer applies as proposed: blocks it changes were changed since. Nothing was written; reject it, or let its proposer propose again`,
 	unlocked: (label: string) => `${label}: the plan is no longer locked`,
+	subtreeChanged: (sid: string, n: number) =>
+		`[${sid}], which it deletes, changed since it was proposed: ${n === 1 ? "1 block" : `${n} blocks`} in it or under it added, changed or gone`,
 	changed: (label: string) =>
 		`${label} changed while it was being confirmed (more was proposed into it, or it was decided); look at it again`,
 } as const;
@@ -205,11 +210,171 @@ export interface OutlineConfirmResult {
 	write: OutlineWriteResult;
 }
 
+/** One rewritten block of a pending change, laid over the block as it is now. */
+export type OutlineProposalMerge =
+	/** The block is as it was when proposed: the proposal applies as written. */
+	| { state: "as-proposed" }
+	/** Changed since, the changes do not overlap: the proposal merged over them. */
+	| {
+			state: "merged";
+			content: string;
+			links: ExtractedLink[];
+			alias?: string;
+			tags?: string[];
+			task?: OutlineTaskPatch;
+	  }
+	/** Changed since, and the proposal no longer applies (why, for the agent and people). */
+	| { state: "conflict"; detail: string };
+
 /**
- * The stored operations, rebased onto the blocks as they are now: a block changed since the
- * proposal is merged three ways (text and fields); structural operations go as they are (the
- * write path checks the targets exist and nothing lands under itself). Throws
- * {@link OutlinePendingError} (`OUTLINE_PENDING_CONFLICT`) when a merge fails.
+ * The blocks a change rewrites (text, fields, checkbox), laid over each block as it is now:
+ * unchanged since proposed, merged three ways from the version proposed against (text that does
+ * not overlap, fields one by one; `agent-merge.ts`), or in conflict. What a confirmation writes
+ * and what the proposer reads (review S-2) both come from here.
+ */
+export async function mergeProposal(
+	store: OutlineStore,
+	row: Pick<OutlinePendingRow, "spaceId" | "baseJson" | "opsJson">,
+): Promise<Map<string, OutlineProposalMerge>> {
+	const ops = pendingOps(row);
+	const base = row.baseJson;
+	const rewritten = new Set<string>();
+	for (const op of ops) {
+		if ((op.op === "update" || op.op === "setTask") && "id" in op.block) rewritten.add(op.block.id);
+	}
+	const out = new Map<string, OutlineProposalMerge>();
+	if (rewritten.size === 0) return out;
+	const metas = new Map(
+		(await store.getBlockMetas(row.spaceId, { ids: [...rewritten] })).map((m) => [m.id, m]),
+	);
+	const changed: string[] = [];
+	for (const id of rewritten) {
+		const meta = metas.get(id);
+		if (meta !== undefined && base[id] !== undefined && meta.versionSeq !== base[id])
+			changed.push(id);
+		else out.set(id, { state: "as-proposed" });
+	}
+	if (changed.length === 0) return out;
+	// The proposed text of each changed block (its version as proposed when only its fields were
+	// rewritten), and its task patch.
+	const baseVersions = new Map(
+		(
+			await store.listVersionsAtSeqs(
+				changed.map((id) => ({ blockId: id, seq: base[id] as number })),
+			)
+		).map((v) => [v.blockId, v]),
+	);
+	const replaces: AgentReplace[] = [];
+	for (const id of changed) {
+		const update = ops.find(
+			(o): o is Extract<OutlineOp, { op: "update" }> =>
+				o.op === "update" && "id" in o.block && o.block.id === id,
+		);
+		const setTask = ops.find(
+			(o): o is Extract<OutlineOp, { op: "setTask" }> =>
+				o.op === "setTask" && "id" in o.block && o.block.id === id,
+		);
+		if (setTask?.task === null) {
+			// Taking the checkbox away: only while the task is as proposed against.
+			const before = baseVersions.get(id)?.taskJson ?? null;
+			if (JSON.stringify(before) !== JSON.stringify(metas.get(id)?.taskJson ?? null))
+				out.set(id, {
+					state: "conflict",
+					detail: OUTLINE_TOOL_TEXT.edit.bothChanged(["checkbox"]),
+				});
+			else out.set(id, { state: "as-proposed" });
+			continue;
+		}
+		replaces.push({
+			blockId: id,
+			seen: base[id] as number,
+			content: update?.content ?? baseVersions.get(id)?.content ?? "",
+			...(update?.alias !== undefined && update.alias !== null ? { alias: update.alias } : {}),
+			...(update?.tags !== undefined ? { tags: update.tags } : {}),
+			...(setTask?.task ? { task: setTask.task } : {}),
+		});
+	}
+	for (const m of await mergeAgentReplaces(store, replaces)) {
+		if (m.ok) {
+			out.set(m.blockId, {
+				state: "merged",
+				content: m.content,
+				links: m.links,
+				...(m.alias !== undefined ? { alias: m.alias } : {}),
+				...(m.tags !== undefined ? { tags: m.tags } : {}),
+				...(m.task !== undefined ? { task: m.task } : {}),
+			});
+		} else {
+			out.set(m.blockId, {
+				state: "conflict",
+				detail:
+					m.reason === "overlap"
+						? OUTLINE_TOOL_TEXT.edit.overlaps(m.overlaps ?? [])
+						: m.reason === "fields"
+							? OUTLINE_TOOL_TEXT.edit.bothChanged(m.fields ?? [])
+							: m.reason === "deleted"
+								? OUTLINE_TOOL_TEXT.edit.nowDeleted
+								: m.reason === "no-base"
+									? OUTLINE_TOOL_TEXT.edit.noBase
+									: OUTLINE_TOOL_TEXT.edit.mergeUnstable,
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * Of the blocks a change deletes, those whose subtree changed since it was proposed: blocks under
+ * it added, changed or gone, or the block itself changed (review S-9; the direct delete path
+ * refuses the same, design §6.5). By block, how many. Reads each subtree level by level, bounded.
+ */
+export async function deletedSubtreeChanges(
+	store: OutlineStore,
+	row: Pick<OutlinePendingRow, "spaceId" | "baseJson" | "opsJson" | "subtreeJson">,
+): Promise<Map<string, number>> {
+	const out = new Map<string, number>();
+	const deleted = pendingOps(row).flatMap((op) =>
+		op.op === "delete" && "id" in op.block ? [op.block.id] : [],
+	);
+	if (deleted.length === 0) return out;
+	const metas = new Map(
+		(await store.getBlockMetas(row.spaceId, { ids: deleted })).map((m) => [m.id, m]),
+	);
+	const max = OUTLINE_LIMITS.maxRowsTouched;
+	for (const id of deleted) {
+		const recorded = row.subtreeJson[id] ?? {};
+		const meta = metas.get(id);
+		let changed = meta && row.baseJson[id] !== undefined && meta.versionSeq !== row.baseJson[id];
+		let n = changed ? 1 : 0;
+		const seen = new Set<string>();
+		let frontier = meta && !meta.deleted ? [id] : [];
+		let read = 0;
+		while (frontier.length > 0) {
+			const kids = await store.listChildMetas(row.spaceId, frontier, max - read + 1);
+			read += kids.length;
+			if (read > max) {
+				n = Math.max(n, 1);
+				break;
+			}
+			for (const kid of kids) {
+				seen.add(kid.id);
+				if (recorded[kid.id] !== kid.versionSeq) n++;
+			}
+			frontier = kids.map((k) => k.id);
+		}
+		// Blocks that were under it and are gone (deleted or moved away) count as changes too.
+		for (const was of Object.keys(recorded)) if (!seen.has(was)) n++;
+		changed = n > 0;
+		if (changed) out.set(id, n);
+	}
+	return out;
+}
+
+/**
+ * The stored operations, rebased onto the blocks as they are now (`mergeProposal`); structural
+ * operations go as they are (the write path checks the targets exist and nothing lands under
+ * itself), except a delete whose subtree changed since it was proposed. Throws
+ * {@link OutlinePendingError} (`OUTLINE_PENDING_CONFLICT`) naming what no longer applies.
  */
 async function rebase(
 	store: OutlineStore,
@@ -219,82 +384,25 @@ async function rebase(
 		const { baseVersionSeq: _base, ...rest } = op as OutlineOp & { baseVersionSeq?: number };
 		return rest as OutlineOp;
 	});
-	const base = row.baseJson;
-	const rewritten = new Set<string>();
-	for (const op of ops) {
-		if ((op.op === "update" || op.op === "setTask") && "id" in op.block) rewritten.add(op.block.id);
-	}
-	const metas = new Map(
-		(await store.getBlockMetas(row.spaceId, { ids: [...rewritten] })).map((m) => [m.id, m]),
-	);
-	const changed = [...rewritten].filter((id) => {
-		const meta = metas.get(id);
-		return meta !== undefined && base[id] !== undefined && meta.versionSeq !== base[id];
-	});
 	const label = outlinePendingLabel(row.id);
+	const merges = await mergeProposal(store, row);
 	const conflicts: string[] = [];
-	if (changed.length > 0) {
-		// The proposed text of each changed block (its version as proposed when only its fields
-		// were rewritten), and its task patch.
-		const baseVersions = new Map(
-			(
-				await store.listVersionsAtSeqs(
-					changed.map((id) => ({ blockId: id, seq: base[id] as number })),
-				)
-			).map((v) => [v.blockId, v]),
+	const sids = new Map(
+		(await store.getBlockMetas(row.spaceId, { ids: [...merges.keys()] })).map((m) => [m.id, m.sid]),
+	);
+	for (const [id, m] of merges) {
+		if (m.state === "conflict") conflicts.push(`[${sids.get(id) ?? id}] ${m.detail}`);
+	}
+	const subtrees = await deletedSubtreeChanges(store, row);
+	if (subtrees.size > 0) {
+		const deletedSids = new Map(
+			(await store.getBlockMetas(row.spaceId, { ids: [...subtrees.keys()] })).map((m) => [
+				m.id,
+				m.sid,
+			]),
 		);
-		const replaces: AgentReplace[] = [];
-		for (const id of changed) {
-			const update = ops.find(
-				(o): o is Extract<OutlineOp, { op: "update" }> =>
-					o.op === "update" && "id" in o.block && o.block.id === id,
-			);
-			const setTask = ops.find(
-				(o): o is Extract<OutlineOp, { op: "setTask" }> =>
-					o.op === "setTask" && "id" in o.block && o.block.id === id,
-			);
-			if (setTask?.task === null) {
-				// Taking the checkbox away: only while the task is as proposed against.
-				const before = baseVersions.get(id)?.taskJson ?? null;
-				if (JSON.stringify(before) !== JSON.stringify(metas.get(id)?.taskJson ?? null))
-					conflicts.push(`${id}: checkbox`);
-				continue;
-			}
-			replaces.push({
-				blockId: id,
-				seen: base[id] as number,
-				content: update?.content ?? baseVersions.get(id)?.content ?? "",
-				...(update?.alias !== undefined && update.alias !== null ? { alias: update.alias } : {}),
-				...(update?.tags !== undefined ? { tags: update.tags } : {}),
-				...(setTask?.task ? { task: setTask.task } : {}),
-			});
-		}
-		const merged = await mergeAgentReplaces(store, replaces);
-		for (const m of merged) {
-			if (!m.ok) {
-				conflicts.push(`${m.blockId}: ${m.reason}${m.fields ? ` (${m.fields.join(", ")})` : ""}`);
-				continue;
-			}
-			for (let k = 0; k < ops.length; k++) {
-				const op = ops[k] as OutlineOp;
-				if (!("block" in op) || !("id" in op.block) || op.block.id !== m.blockId) continue;
-				if (op.op === "update") {
-					const { alias: _a, tags: _t, ...rest } = op;
-					ops[k] = {
-						...rest,
-						content: m.content,
-						...(m.alias !== undefined ? { alias: m.alias } : {}),
-						...(m.tags !== undefined ? { tags: m.tags } : {}),
-						merged: true,
-					};
-				} else if (op.op === "setTask") {
-					// Only the fields the proposal changed and nobody else did; none left, no change.
-					ops[k] = m.task
-						? { ...op, task: m.task as OutlineTaskPatch }
-						: { ...op, task: {} as OutlineTaskPatch };
-				}
-			}
-		}
+		for (const [id, n] of subtrees)
+			conflicts.push(OUTLINE_PENDING_TEXT.subtreeChanged(deletedSids.get(id) ?? id, n));
 	}
 	if (conflicts.length > 0) {
 		throw new OutlinePendingError(
@@ -302,6 +410,25 @@ async function rebase(
 			"OUTLINE_PENDING_CONFLICT",
 			conflicts,
 		);
+	}
+	for (let k = 0; k < ops.length; k++) {
+		const op = ops[k] as OutlineOp;
+		if (!("block" in op) || !("id" in op.block)) continue;
+		const m = merges.get(op.block.id);
+		if (m?.state !== "merged") continue;
+		if (op.op === "update") {
+			const { alias: _a, tags: _t, ...rest } = op;
+			ops[k] = {
+				...rest,
+				content: m.content,
+				...(m.alias !== undefined ? { alias: m.alias } : {}),
+				...(m.tags !== undefined ? { tags: m.tags } : {}),
+				merged: true,
+			};
+		} else if (op.op === "setTask" && op.task !== null) {
+			// Only the fields the proposal changed and nobody else did; none left, no change.
+			ops[k] = { ...op, task: m.task ?? ({} as OutlineTaskPatch) };
+		}
 	}
 	// A task patch the merge emptied changes nothing: drop it.
 	const kept = ops.filter(
@@ -438,11 +565,16 @@ export async function rejectOutlinePending(args: {
 
 /**
  * Lock a task's tree on a person's behalf (owner decision Q5: only people lock), naming the
- * session that may confirm step changes for them (`delegate`, D25: per plan, no default). The
- * routes check that the person may write the space and the delegate; `/goal` (plan PR 5) and
- * plan mode (PR 8) call this for the person whose choice it is. Locking a task that is locked
- * already replaces the lock: the same person keeps its version (only the delegate changes),
- * someone else's lock is a new one, which withdraws the open changes of the old.
+ * session that may confirm step changes for them (`delegate`, D25: per plan, no default).
+ *
+ * PRECONDITIONS, for every caller (the routes, `/goal` in plan PR 5, plan mode in PR 8):
+ *   - the person may write the space, and may write the delegate session (callers check: this
+ *     function decides nothing about access);
+ *   - the task is not locked by someone else. Locking it again would take their lock over, which
+ *     is refused (`OUTLINE_LOCK_HELD`, here and in the write path): it has to be unlocked first
+ *     ({@link unlockOutlineTask}), by someone allowed to unlock (the locker, a manager of the
+ *     space, an admin). Locking a task the same person locked already only changes the delegate
+ *     and keeps the lock (its version, its open changes).
  */
 export async function lockOutlineTask(args: {
 	blockId: string;
@@ -457,6 +589,15 @@ export async function lockOutlineTask(args: {
 	if (!block || block.deleted) throw new NotFoundError("Outline block", args.blockId);
 	if (!block.taskJson)
 		throw new OutlineWriteError("only a task can be locked", "OUTLINE_INVALID_OP");
+	const current = block.taskJson.lock;
+	if (current && !(current.by.kind === "human" && current.by.id === args.userId)) {
+		// Checked again by the write path, against the state it plans on.
+		const space = await store.getSpace(block.spaceId);
+		throw new OutlineWriteError(
+			OUTLINE_TEXT.lockHeld(`${space?.key ?? "?"}/${block.sid}`),
+			"OUTLINE_LOCK_HELD",
+		);
+	}
 	return await writeOutline(
 		{
 			spaceId: block.spaceId,
@@ -480,6 +621,11 @@ export async function lockOutlineTask(args: {
 export async function unlockOutlineTask(args: {
 	blockId: string;
 	userId: string;
+	/**
+	 * Whether the person may unlock someone else's lock (a manager of the space, an admin; the
+	 * route decides). Without it only the locker unlocks.
+	 */
+	mayUnlockAnyone?: boolean;
 	store?: OutlineStore;
 	now?: () => Date;
 }): Promise<OutlineWriteResult> {
@@ -492,6 +638,7 @@ export async function unlockOutlineTask(args: {
 			ops: [{ op: "setTask", block: { id: block.id }, task: { lock: null } }],
 			actor: { kind: "human", id: args.userId },
 			responsibleUserId: args.userId,
+			unlockAuthority: async () => args.mayUnlockAnyone === true,
 		},
 		{ store, ...(args.now ? { now: args.now } : {}) },
 	);
@@ -505,7 +652,7 @@ export async function unlockOutlineTask(args: {
 export async function readPagePending(
 	pageId: string,
 	options: { store?: OutlineStore } = {},
-): Promise<{ pending: OutlinePendingRow[]; locked: OutlineBlockMeta[] }> {
+): Promise<{ pending: OutlinePendingHead[]; locked: OutlineBlockMeta[] }> {
 	const store = options.store ?? outlineStore;
 	const [pending, locked] = await Promise.all([
 		store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerPage),
@@ -516,7 +663,7 @@ export async function readPagePending(
 
 /** Whether any block a change touches changed since it was proposed. */
 export async function pendingBaseChanged(
-	rows: readonly OutlinePendingRow[],
+	rows: readonly OutlinePendingHead[],
 	options: { store?: OutlineStore } = {},
 ): Promise<Set<string>> {
 	const store = options.store ?? outlineStore;
@@ -569,8 +716,52 @@ export async function findTasksWaitingForConfirmation(
 	return out;
 }
 
+/**
+ * Who decides each open change now: the lock on its tree as it is (a delegate the locker named
+ * since the proposal decides it, review S-8), or the decider recorded at proposal time when the
+ * tree is no longer locked. One indexed read of the roots per space.
+ */
+export async function currentDeciders(
+	rows: readonly OutlinePendingHead[],
+	options: { store?: OutlineStore } = {},
+): Promise<Map<string, OutlinePendingDeciderJson>> {
+	const store = options.store ?? outlineStore;
+	const bySpace = new Map<string, Set<string>>();
+	for (const row of rows) {
+		if (!row.rootBlockId) continue;
+		const set = bySpace.get(row.spaceId) ?? new Set<string>();
+		set.add(row.rootBlockId);
+		bySpace.set(row.spaceId, set);
+	}
+	const locks = new Map<string, OutlineTaskLockJson>();
+	for (const [spaceId, ids] of bySpace) {
+		for (const meta of await store.getBlockMetas(spaceId, { ids: [...ids] }))
+			if (!meta.deleted && meta.taskJson?.lock) locks.set(meta.id, meta.taskJson.lock);
+	}
+	const out = new Map<string, OutlinePendingDeciderJson>();
+	for (const row of rows) {
+		const lock = row.rootBlockId ? locks.get(row.rootBlockId) : undefined;
+		out.set(
+			row.id,
+			lock
+				? { by: { kind: lock.by.kind, id: lock.by.id }, delegate: lock.delegate ?? null }
+				: row.deciderJson,
+		);
+	}
+	return out;
+}
+
+/** The rows with who decides them now ({@link currentDeciders}) as their decider. */
+export async function withCurrentDeciders<Row extends OutlinePendingHead>(
+	rows: readonly Row[],
+	options: { store?: OutlineStore } = {},
+): Promise<Row[]> {
+	const deciders = await currentDeciders(rows, options);
+	return rows.map((row) => ({ ...row, deciderJson: deciders.get(row.id) ?? row.deciderJson }));
+}
+
 /** People and sessions a pending change names, for showing them. */
-export async function pendingNames(rows: readonly OutlinePendingRow[]): Promise<{
+export async function pendingNames(rows: readonly OutlinePendingHead[]): Promise<{
 	users: Map<string, string>;
 	narrators: Map<string, string | null>;
 }> {
@@ -606,6 +797,11 @@ export interface OutlinePendingDiffEntry {
 	task?: OutlineTaskPatch | null;
 	/** For a move or an insert: the parent it goes under (title), null for the top level. */
 	parentTitle?: string | null;
+	/**
+	 * For a delete: blocks in or under it added, changed or gone since it was proposed (a
+	 * confirmation refuses then).
+	 */
+	changedUnder?: number;
 }
 
 /**
@@ -640,6 +836,7 @@ export async function readPendingDiff(
 			(v) => [v.blockId, v],
 		),
 	);
+	const subtrees = await deletedSubtreeChanges(store, row);
 	const titleOfBlock = (id: string | undefined) => {
 		const b = id ? blocks.get(id) : undefined;
 		return b ? titleOf(b.content).slice(0, 200) : null;
@@ -691,27 +888,28 @@ export async function readPendingDiff(
 			...(op.op === "move"
 				? { parentTitle: op.parent && "id" in op.parent ? titleOfBlock(op.parent.id) : null }
 				: {}),
+			...(op.op === "delete" && subtrees.has(id) ? { changedUnder: subtrees.get(id) } : {}),
 		});
 	}
 	return { entries, truncated: ops.length > shown.length };
 }
 
 /**
- * Decisions on a session's changes it has not been shown, oldest first: shown once on its next
- * read, then marked reported. Open rows are left out (they are not decided).
+ * Decisions on a session's changes on a page it has not been shown, oldest first: shown once on
+ * its next read of the page, then marked reported.
  */
 export async function takePendingReports(
 	session: string,
-	options: { store?: OutlineStore; now?: () => Date; pageId?: string } = {},
-): Promise<OutlinePendingRow[]> {
+	options: { store?: OutlineStore; now?: () => Date; pageId: string },
+): Promise<OutlinePendingHead[]> {
 	const store = options.store ?? outlineStore;
-	const rows = (
-		await store.listUnreportedPending(session, OUTLINE_PENDING_LIMITS.reportsPerRead * 4)
-	).filter(
-		(row) =>
-			row.status !== "open" && (options.pageId === undefined || row.pageId === options.pageId),
+	// Decided rows of this page only (the unreported index): open rows and other pages never
+	// crowd them out (review S-6); each read tells the oldest and marks them told.
+	const taken = await store.listUnreportedPending(
+		session,
+		options.pageId,
+		OUTLINE_PENDING_LIMITS.reportsPerRead,
 	);
-	const taken = rows.slice(0, OUTLINE_PENDING_LIMITS.reportsPerRead);
 	if (taken.length > 0) {
 		await store.markPendingReported(
 			taken.map((r) => r.id),

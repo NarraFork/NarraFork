@@ -34,7 +34,11 @@ import {
 } from "./access-reads";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import { type OutlineResolution, resolveAddress } from "./resolve";
-import { canSessionReadSpace, listSessionReadableSpaces } from "./session-scope";
+import {
+	canSessionReadNarrator,
+	canSessionReadSpace,
+	listSessionReadableSpaces,
+} from "./session-scope";
 import {
 	ensurePersonalSpace,
 	ensureProjectSpace,
@@ -157,6 +161,23 @@ export class OutlineAgentScope {
 
 	get projectId(): string | null {
 		return this.spaces?.projectId ?? null;
+	}
+
+	/**
+	 * Session titles as this session may see them (review S-5): the title of a session it may
+	 * read (`canSessionReadNarrator`), null for any other (texts name it by id only).
+	 */
+	async readableTitles(
+		titles: ReadonlyMap<string, string | null>,
+	): Promise<Map<string, string | null>> {
+		const out = new Map<string, string | null>();
+		for (const [id, title] of titles) {
+			out.set(
+				id,
+				title !== null && (await canSessionReadNarrator(this.ctx.narratorId, id)) ? title : null,
+			);
+		}
+		return out;
 	}
 
 	/** Whether the session may read the space (memoized for this scope). */

@@ -175,6 +175,8 @@ export interface OutlineBlockViewRequest {
 	view?: OutlineViewMode;
 	budget?: Partial<OutlineBudget>;
 	store?: OutlineStore;
+	/** Whether the viewer may read a session (locks name it by title only then, review S-5). */
+	narratorVisible?: (narratorId: string) => Promise<boolean>;
 }
 
 export type OutlineBlockView = Omit<OutlineBlockViewResponse, "space">;
@@ -229,9 +231,11 @@ export async function readBlockView(
 	const inProgressOf = new Map<OutlineNode, OutlineNode[]>();
 	const listed: OutlineNode[] = [];
 	for (const node of shown) {
+		const room = IN_PROGRESS_TITLES - listed.length;
+		if (room <= 0) break;
 		const open = node.children.filter((c) => c.task && OPEN_TASK.has(c.task.status));
-		const take = open.slice(0, OUTLINE_PENDING_API_LIMITS.inProgressItems);
-		if (listed.length + take.length > IN_PROGRESS_TITLES) continue;
+		// Past the titles a view loads, a marker lists what fits (the client says how many more).
+		const take = open.slice(0, Math.min(OUTLINE_PENDING_API_LIMITS.inProgressItems, room));
 		inProgressOf.set(node, take);
 		listed.push(...take);
 	}
@@ -245,6 +249,7 @@ export async function readBlockView(
 	}
 	const locks = await describeLocks(
 		shown.flatMap((node) => (node.task?.lock ? [{ blockId: node.id, lock: node.task.lock }] : [])),
+		{ narratorVisible: request.narratorVisible },
 	);
 
 	let hiddenByView = 0;
@@ -323,21 +328,29 @@ export async function readBlockView(
 const IN_PROGRESS_TITLES = 200;
 
 /**
- * Locks as the client shows them, with the names of the people and sessions they name.
- * `canUnlock` is the caller's to decide (the routes know the person); false here.
+ * Locks as the client shows them, with the names of the people and sessions they name: a
+ * session by title only when `narratorVisible` says the viewer may read it (review S-5; without
+ * it, never). `canUnlock` is the caller's to decide (the routes know the person); false here.
  */
 export async function describeLocks(
 	locks: ReadonlyArray<{ blockId: string; lock: OutlineTaskLockJson }>,
+	options: { narratorVisible?: (narratorId: string) => Promise<boolean> } = {},
 ): Promise<Map<string, OutlineLockView>> {
 	const out = new Map<string, OutlineLockView>();
 	if (locks.length === 0) return out;
-	const names = await readDisplayNames({
+	const found = await readDisplayNames({
 		userIds: locks.flatMap((l) => (l.lock.by.kind === "human" ? [l.lock.by.id] : [])),
 		narratorIds: locks.flatMap((l) => [
 			...(l.lock.by.kind === "agent" ? [l.lock.by.id] : []),
 			...(l.lock.delegate ? [l.lock.delegate] : []),
 		]),
 	});
+	const titles = new Map<string, string | null>();
+	for (const [id, title] of found.narrators) {
+		const visible = title !== null && (await options.narratorVisible?.(id)) === true;
+		titles.set(id, visible ? title : null);
+	}
+	const names = { users: found.users, narrators: titles };
 	for (const { blockId, lock } of locks) {
 		out.set(blockId, {
 			blockId,

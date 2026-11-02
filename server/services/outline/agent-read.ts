@@ -45,9 +45,13 @@ import { type OutlineAgentScope, type OutlineSpaceWord, spaceRootName } from "./
 import { LINK_DISPLAY_LIMITS, linkTitles, withLinkTitles } from "./link-display";
 import { OUTLINE_LISTED_NAMES, OUTLINE_TOOL_TEXT } from "./messages";
 import { OUTLINE_PENDING_LIMITS, outlinePendingLabel } from "./model";
-import { pendingNames, takePendingReports } from "./pending";
+import { mergeProposal, pendingNames, takePendingReports, withCurrentDeciders } from "./pending";
 import { PENDING_WITHDRAW } from "./pending-hold";
-import { type OutlinePendingOverlay, pendingOverlay } from "./pending-overlay";
+import {
+	type OutlineOwnPending,
+	type OutlinePendingOverlay,
+	pendingOverlay,
+} from "./pending-overlay";
 import { commitSeqAt, loadBodiesWithin, readOutline } from "./read";
 import { recordOutlineReads } from "./read-ledger";
 import {
@@ -62,7 +66,7 @@ import {
 import type { OutlineResolvedBlock } from "./resolve";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
 import { sessionScopeEpoch, yieldToEventLoop } from "./session-scope";
-import type { OutlineBlockMeta, OutlinePendingRow, OutlineSpaceRow } from "./store/port";
+import type { OutlineBlockMeta, OutlinePendingHead, OutlineSpaceRow } from "./store/port";
 import type { OutlinePageListRow, OutlineStructureRow } from "./store/read-port";
 import { buildTree, type OutlineNode, type OutlineView } from "./tree";
 
@@ -796,43 +800,66 @@ async function pendingForRead(
 	pageId: string,
 ): Promise<{ overlay: OutlinePendingOverlay | null; notes: string[] } | null> {
 	const session = scope.rootNarratorId ?? scope.narratorId;
-	const rows = await scope.store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerPage);
-	const reports = await takePendingReports(session, { store: scope.store, pageId });
-	if (rows.length === 0 && reports.length === 0) return null;
+	const store = scope.store;
+	// Heads only (review S-7): the operations of this session's own changes are read below.
+	const heads = await store.listOpenPendingByPage(pageId, OUTLINE_PENDING_LIMITS.openPerPage);
+	const reports = await takePendingReports(session, { store, pageId });
+	if (heads.length === 0 && reports.length === 0) return null;
+	// Who decides each change is the lock as it is now (review S-8).
+	const rows = await withCurrentDeciders(heads, { store });
 	const names = await pendingNames([...rows, ...reports]);
+	// Sessions are named by title only when this session may read them (review S-5).
+	const titles = await scope.readableTitles(names.narrators);
 	const text = OUTLINE_TOOL_TEXT.pending;
-	const sessionName = (id: string) => text.deciderSession(names.narrators.get(id) ?? null, id);
+	const sessionName = (id: string) => text.deciderSession(titles.get(id) ?? null, id);
 	const actorName = (ref: { kind: string; id: string }) =>
 		ref.kind === "human"
 			? text.deciderPerson(names.users.get(ref.id) ?? null, ref.id)
 			: sessionName(ref.id);
-	const deciderOf = (row: OutlinePendingRow) => {
+	const deciderOf = (row: OutlinePendingHead) => {
 		const by = actorName(row.deciderJson.by);
 		return row.deciderJson.delegate
 			? text.deciderEither(by, sessionName(row.deciderJson.delegate))
 			: by;
 	};
-	const labeled = (row: OutlinePendingRow) => ({
+	const labeled = (row: OutlinePendingHead) => ({
 		row,
 		label: outlinePendingLabel(row.id),
 		decider: deciderOf(row),
 	});
-	const own = rows.filter((r) => r.requesterSession === session);
 	const others = rows.filter((r) => r.requesterSession !== session);
-	const notes: string[] = own.map((row) => text.yours(outlinePendingLabel(row.id), deciderOf(row)));
+	// This session's own changes whole, laid over the blocks as they are now (review S-2).
+	const ownIds = new Set(rows.filter((r) => r.requesterSession === session).map((r) => r.id));
+	const deciderById = new Map(rows.map((r) => [r.id, r.deciderJson]));
+	const own: OutlineOwnPending[] = [];
+	if (ownIds.size > 0) {
+		for (const whole of await store.getPending([...ownIds])) {
+			if (whole.status !== "open") continue;
+			const row = { ...whole, deciderJson: deciderById.get(whole.id) ?? whole.deciderJson };
+			own.push({ ...labeled(row), row, merges: await mergeProposal(store, row) });
+		}
+	}
+	const notes: string[] = own.map(({ label, decider, merges }) => {
+		const states = [...merges.values()].map((m) => m.state);
+		return text.yours(
+			label,
+			decider,
+			states.includes("conflict") ? "conflict" : states.includes("merged") ? "merged" : "none",
+		);
+	});
 	// Changes this session decides: it is the session the locker named (or its subagent).
 	const delegates = [
 		...new Set(others.flatMap((r) => (r.deciderJson.delegate ? [r.deciderJson.delegate] : []))),
 	];
 	if (delegates.length > 0) {
-		const roots = await scope.store.getNarratorRoots(delegates);
+		const roots = await store.getNarratorRoots(delegates);
 		for (const row of others) {
 			const delegate = row.deciderJson.delegate;
 			if (!delegate || (roots.get(delegate)?.root ?? delegate) !== session) continue;
 			notes.push(
 				text.forYou(
 					outlinePendingLabel(row.id),
-					row.summary,
+					row.summary || text.summaryOf(row.opCount),
 					row.requesterSession ? sessionName(row.requesterSession) : actorName(row.requestedByJson),
 				),
 			);
@@ -843,7 +870,7 @@ async function pendingForRead(
 		const by = row.decidedByJson ? actorName(row.decidedByJson) : OUTLINE_TOOL_TEXT.edit.someone;
 		if (row.status === "confirmed") {
 			const seq = row.decisionCommitId
-				? ((await scope.store.getCommit(row.decisionCommitId))?.seq ?? null)
+				? ((await store.getCommit(row.decisionCommitId))?.seq ?? null)
 				: null;
 			notes.push(text.reportConfirmed(label, by, seq));
 		} else if (row.status === "rejected") notes.push(text.reportRejected(label, by, row.reason));
@@ -857,9 +884,15 @@ async function pendingForRead(
 	}
 	return {
 		overlay: pendingOverlay({
-			own: own.map(labeled),
+			own,
 			others: others.map(labeled),
-			text: { own: text.markOwn, ownDeleted: text.markOwnDeleted, other: text.markOther },
+			text: {
+				own: text.markOwn,
+				ownDeleted: text.markOwnDeleted,
+				other: text.markOther,
+				ownMerged: text.markOwnMerged,
+				ownConflict: text.markOwnConflict,
+			},
 		}),
 		notes,
 	};

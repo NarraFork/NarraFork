@@ -19,6 +19,7 @@ import {
 	asc,
 	desc,
 	eq,
+	getTableColumns,
 	gt,
 	inArray,
 	isNotNull,
@@ -71,6 +72,7 @@ import {
 	type OutlineLinkRow,
 	type OutlineLiveUpdateRow,
 	type OutlinePendingDecision,
+	type OutlinePendingHead,
 	OutlinePendingMovedError,
 	type OutlinePendingPlan,
 	type OutlinePendingRow,
@@ -382,6 +384,21 @@ function applyCommitSection(
 type PendingSelect = typeof outlinePending.$inferSelect;
 
 function toPending(row: PendingSelect): OutlinePendingRow {
+	return {
+		...row,
+		kind: row.kind as OutlinePendingKind,
+		status: row.status as OutlinePendingStatus,
+		decidedByJson: row.decidedByJson ?? null,
+	};
+}
+
+/** Every column but the operations and the deleted subtrees: what lists and summaries read. */
+const pendingHeadColumns = (() => {
+	const { opsJson: _ops, subtreeJson: _subtree, ...columns } = getTableColumns(outlinePending);
+	return columns;
+})();
+
+function toPendingHead(row: Omit<PendingSelect, "opsJson" | "subtreeJson">): OutlinePendingHead {
 	return {
 		...row,
 		kind: row.kind as OutlinePendingKind,
@@ -908,24 +925,34 @@ export const sqliteOutlineStore: OutlineStore = {
 	async listOpenPendingByPage(pageId, limit) {
 		// `"status" = 'open'` is the partial index's own predicate, word for word.
 		return db
-			.select()
+			.select(pendingHeadColumns)
 			.from(outlinePending)
 			.where(and(eq(outlinePending.pageId, pageId), sql`"status" = 'open'`))
 			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
 			.limit(limit)
 			.all()
-			.map(toPending);
+			.map(toPendingHead);
+	},
+
+	async countOpenPendingByPage(pageId, limit) {
+		// A raw `get` returns the row's values in order.
+		const row = db.get<[number]>(sql`
+			SELECT count(*) AS n FROM (
+				SELECT 1 FROM outline_pending WHERE page_id = ${pageId} AND "status" = 'open' LIMIT ${limit}
+			)
+		`);
+		return Number(row?.[0] ?? 0);
 	},
 
 	async listOpenPendingBySpace(spaceId, limit) {
 		return db
-			.select()
+			.select(pendingHeadColumns)
 			.from(outlinePending)
 			.where(and(eq(outlinePending.spaceId, spaceId), sql`"status" = 'open'`))
 			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
 			.limit(limit)
 			.all()
-			.map(toPending);
+			.map(toPendingHead);
 	},
 
 	async findOpenPending(requesterSession, rootBlockId) {
@@ -944,15 +971,22 @@ export const sqliteOutlineStore: OutlineStore = {
 		return row ? toPending(row) : null;
 	},
 
-	async listUnreportedPending(requesterSession, limit) {
+	async listUnreportedPending(requesterSession, pageId, limit) {
+		// The predicate is the unreported index's own, word for word.
 		return db
-			.select()
+			.select(pendingHeadColumns)
 			.from(outlinePending)
-			.where(and(eq(outlinePending.requesterSession, requesterSession), sql`"reported_at" IS NULL`))
+			.where(
+				and(
+					eq(outlinePending.requesterSession, requesterSession),
+					eq(outlinePending.pageId, pageId),
+					sql`"reported_at" IS NULL AND "status" <> 'open'`,
+				),
+			)
 			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
 			.limit(limit)
 			.all()
-			.map(toPending);
+			.map(toPendingHead);
 	},
 
 	async markPendingReported(ids, at) {

@@ -260,3 +260,141 @@ describe("OutlineEdit on a locked plan", () => {
 		expect(bad.output).toContain("is not a pending change");
 	});
 });
+
+describe("review round 1", () => {
+	test("the proposer reads its change over what is there now: merged where it does not overlap, the conflict shown where it does (S-2)", async () => {
+		const w = await lockedPlan();
+		await read(w.a, w.sids.root);
+		const label = labelIn(
+			(await edit(w.a, [{ replace: w.sids.s1, text: "[ ] Parse the header fast" }])).output,
+		);
+		const s1 = (await outlineStore.getBlockBySid(w.space.id, w.sids.s1))?.id as string;
+		const person = (content: string) =>
+			writeOutline({
+				spaceId: w.space.id,
+				ops: [{ op: "update", block: { id: s1 }, content }],
+				actor: { kind: "human", id: w.alice },
+				responsibleUserId: w.alice,
+			});
+		// A person's change that does not overlap: the read shows what confirming would write.
+		await person("Carefully parse the header");
+		const merged = await read(w.a, w.sids.root);
+		expect(merged).toContain(`[${w.sids.s1}] [ ] Carefully parse the header fast`);
+		expect(merged).toContain(`‹pending ${label}: your proposed change, merged over changes`);
+		expect(merged).toContain(`${label} is your change to this plan, shown above merged`);
+		// One that overlaps: the block as it is now, with the conflict, and what to do.
+		await person("Do NOT parse the header; use the library");
+		const conflict = await read(w.a, w.sids.root);
+		expect(conflict).toContain(`[${w.sids.s1}] [ ] Do NOT parse the header; use the library`);
+		expect(conflict).toContain("your change no longer applies here");
+		expect(conflict).toContain("it cannot be confirmed as it is");
+		// Others read the outline as it is, marked.
+		const other = await read(w.b, w.sids.root);
+		expect(other).toContain("Do NOT parse the header; use the library");
+		expect(other).toContain(`‹pending ${label}: a change proposed here waits for confirmation›`);
+	});
+
+	test("a rewrite proposed again over a person's change carries the version it was written against, so it confirms as written (S-3)", async () => {
+		const w = await lockedPlan();
+		await read(w.a, w.sids.root);
+		const label = labelIn(
+			(await edit(w.a, [{ replace: w.sids.s1, text: "[ ] Parse the header fast" }])).output,
+		);
+		const s1 = (await outlineStore.getBlockBySid(w.space.id, w.sids.s1))?.id as string;
+		await writeOutline({
+			spaceId: w.space.id,
+			ops: [{ op: "update", block: { id: s1 }, content: "Carefully parse the header" }],
+			actor: { kind: "human", id: w.alice },
+			responsibleUserId: w.alice,
+		});
+		// Not read again: the replace merges with the person's change, and goes into the same change.
+		const again = await edit(w.a, [
+			{ replace: w.sids.s1, text: "[ ] Parse the header fast and safe" },
+		]);
+		expect(again.output).toContain("merged into the change this session had already proposed");
+		const confirmed = await edit(w.d, [{ confirm: label }]);
+		expect(confirmed.isError).toBeUndefined();
+		expect((await outlineStore.getBlock(s1))?.content).toBe(
+			"Carefully parse the header fast and safe",
+		);
+	});
+
+	test("a step added through nested markdown, or a block of the plan given a checkbox, is held (B-1); a step's checkbox alone is not (S-1)", async () => {
+		const w = await lockedPlan();
+		await read(w.a, w.sids.root);
+		const nested = await edit(w.a, [
+			{ add: w.sids.root, markdown: "- Phase 2\n  - [ ] Deploy to production" },
+		]);
+		expect(nested.output).toContain("held in part for confirmation");
+		expect(nested.output).toContain("Held for confirmation as P");
+		const boxed = await edit(w.a, [
+			{ replace: w.sids.acc, text: "[ ] Acceptance: old exports load" },
+		]);
+		expect(boxed.output).toContain("Nothing was written directly");
+		expect(boxed.output).toContain("Held for confirmation as P");
+		expect((await outlineStore.getBlockBySid(w.space.id, w.sids.acc))?.taskJson).toBeNull();
+		// The checkbox of a step (progress) with its text unchanged is written directly.
+		const progress = await edit(w.a, [{ replace: w.sids.s1, text: "[/] Parse the header" }]);
+		expect(progress.output).toMatch(/^Committed #\d+/);
+		expect(progress.output).not.toContain("held");
+		expect((await outlineStore.getBlockBySid(w.space.id, w.sids.s1))?.taskJson?.status).toBe(
+			"doing",
+		);
+	});
+
+	test("reads and results name who decides now: a delegate named since is asked; the delegate's own change goes to the locker alone (S-8)", async () => {
+		const w = await lockedPlan();
+		await read(w.a, w.sids.root);
+		const label = labelIn(
+			(await edit(w.a, [{ replace: w.sids.s1, text: "[ ] Parse the header fast" }])).output,
+		);
+		const rootId = (await outlineStore.getBlockBySid(w.space.id, w.sids.root))?.id as string;
+		await lockOutlineTask({ blockId: rootId, userId: w.alice, delegate: w.ids.b });
+		expect(await read(w.b, w.sids.root)).toContain(`${label} waits for your confirmation`);
+		expect(await read(w.d, w.sids.root)).not.toContain(`${label} waits for your confirmation`);
+		expect(await read(w.a, w.sids.root)).toContain(`(or the session "reviewer"`);
+		// The delegate proposing: its change waits for the locker only.
+		await read(w.b, w.sids.root);
+		const own = await edit(w.b, [{ replace: w.sids.s2, text: "[ ] Load the rows twice" }]);
+		expect(own.output).toMatch(/waiting for alice-[^ ]+ to confirm\./);
+		expect(own.output).not.toContain("on their behalf");
+	});
+
+	test("deciding needs write access: a delegate run by someone who may not write the space neither confirms nor rejects (B-3)", async () => {
+		const w = await lockedPlan();
+		await read(w.a, w.sids.root);
+		const label = labelIn(
+			(await edit(w.a, [{ replace: w.sids.s1, text: "[ ] Parse the header fast" }])).output,
+		);
+		const readOnly = { ...w.d, userId: await user("viewer") } as ToolContext;
+		for (const decision of [{ confirm: label }, { reject: label, reason: "no" }]) {
+			const refused = await edit(readOnly, [decision]);
+			expect(refused.isError).toBe(true);
+			expect(refused.output).toContain("may not write");
+		}
+		const row = (await outlineStore.getPending([label.slice(1)]))[0];
+		expect(row?.status).toBe("open");
+	});
+
+	test("sessions are named by title only to sessions that may read them (S-5)", async () => {
+		const w = await lockedPlan();
+		const bob = await user("bob");
+		const secret = generateId();
+		await db.insert(narrators).values({
+			id: secret,
+			title: "Secret: layoffs plan",
+			ownerUserId: bob,
+			visibility: "private",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		const rootId = (await outlineStore.getBlockBySid(w.space.id, w.sids.root))?.id as string;
+		await lockOutlineTask({ blockId: rootId, userId: w.alice, delegate: secret });
+		await read(w.a, w.sids.root);
+		const held = await edit(w.a, [{ replace: w.sids.s1, text: "[ ] Parse the header fast" }]);
+		expect(held.output).toContain(`(or the session ${secret} on their behalf)`);
+		const reads = await read(w.a, w.sids.root);
+		expect(held.output + reads).not.toContain("layoffs");
+		expect(reads).toContain(`the session ${secret}`);
+	});
+});

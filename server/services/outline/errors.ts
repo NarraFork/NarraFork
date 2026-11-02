@@ -34,8 +34,11 @@ export type OutlineWriteErrorCode =
 	| "OUTLINE_TASK_CLAIMED"
 	/** An agent's write sets or clears a lock: only people lock (`lockOutlineTask`). */
 	| "OUTLINE_LOCK_DENIED"
-	/** A page holds more locked tasks than an agent's change can be checked against. */
-	| "OUTLINE_TOO_MANY_LOCKS"
+	/**
+	 * The task is locked by someone else: locking it again would take their lock over. Unlocking
+	 * comes first, by someone who may (the locker, a manager of the space, an admin).
+	 */
+	| "OUTLINE_LOCK_HELD"
 	/** One write changes several locked plans; one call per plan. */
 	| "OUTLINE_LOCKED_MANY"
 	/** The page has as many open pending changes as it may hold. */

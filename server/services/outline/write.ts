@@ -150,6 +150,7 @@ import {
 	OUTLINE_ACTOR_KINDS,
 	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
+	OUTLINE_PENDING_LIMITS,
 	OUTLINE_TASK_IDLE_LEASE_MS,
 	type OutlineActorKind,
 	type OutlineCommitKind,
@@ -337,6 +338,13 @@ export interface OutlineWriteInput {
 	toolCallId?: string | null;
 	/** Short description for the timeline; derived from the operations when omitted. */
 	summary?: string;
+	/**
+	 * Whether the writer may take away locks other than their own (a manager of the space or an
+	 * admin; owner decision Q5): asked only when the write would unlock someone else's locked task
+	 * (unlocking it, deleting it, taking its checkbox away, a revert to before it was locked).
+	 * Absent: only the locker may (and the system).
+	 */
+	unlockAuthority?: () => Promise<boolean>;
 }
 
 export interface OutlineBlockAddressed {
@@ -356,7 +364,12 @@ export type OutlineAdjustment =
 	 * A write nobody makes (a system job without a session) cannot claim, so the task it would
 	 * have put in progress was left to do (`blockId`).
 	 */
-	| { kind: "task-not-started"; blockId: string };
+	| { kind: "task-not-started"; blockId: string }
+	/**
+	 * A revert would have taken away someone else's lock, which the writer may not do: the task
+	 * keeps its lock (`blockId`), the rest of the revert is written.
+	 */
+	| { kind: "lock-kept"; blockId: string };
 
 /**
  * A task someone else was doing that this commit finished or reopened: a person's commit, or a
@@ -994,7 +1007,15 @@ interface Hold {
 /** What one operation did, recorded for the lock rules (`classifyLocked`). */
 type OpTouch =
 	| { kind: "insert" | "restore"; block: WorkingBlock; parent: WorkingBlock | null }
-	| { kind: "update"; block: WorkingBlock }
+	| {
+			kind: "update";
+			block: WorkingBlock;
+			/** The operation writes other content, or another alias, than the block had. */
+			content: boolean;
+			alias: boolean;
+			/** The tags it gives (compared with the block's when classifying). */
+			tags?: string[];
+	  }
 	| {
 			kind: "setTask";
 			block: WorkingBlock;
@@ -1004,8 +1025,11 @@ type OpTouch =
 	| { kind: "move"; block: WorkingBlock; to: WorkingBlock | null }
 	| { kind: "delete"; block: WorkingBlock };
 
-/** Locked blocks of one page the classification reads at most. */
-const LOCKS_PER_PAGE = 1000;
+/**
+ * Locked blocks of one page the classification lists at most (tests lower it): past it, the
+ * locks are read off the blocks the operations name (`classifyLocked`).
+ */
+export const OUTLINE_LOCK_SCAN = { perPage: 1000 };
 
 /** Options of a planning pass beyond the transaction itself. */
 interface PlannerExtra {
@@ -1177,16 +1201,21 @@ class OutlinePlanner {
 			humanCreated: pick(given.humanCreated, base?.humanCreated ?? null),
 			lock:
 				given.lock !== undefined
-					? this.lockFrom(given.lock, base?.lock ?? null)
+					? this.lockFrom(given.lock, base?.lock ?? null, opIndex)
 					: (base?.lock ?? null),
 			claimable: pick(given.claimable, base?.claimable ?? null),
 		});
 	}
 
-	/** A lock as stored: the version is this commit's seq unless the lock is unchanged. */
+	/**
+	 * A lock as stored: the version is this commit's seq unless the lock is unchanged. Taking over
+	 * someone else's lock is refused (`OUTLINE_LOCK_HELD`, review B-2): it has to be unlocked first,
+	 * by someone who may (see `guardLocks`). A compensating commit restores what it read.
+	 */
 	private lockFrom(
 		given: OutlineTaskLockInput | null,
 		current: OutlineTaskLockJson | null,
+		opIndex: number,
 	): OutlineTaskLockJson | null {
 		if (given === null) return null;
 		const by = given.by ? { kind: given.by.kind, id: given.by.id } : this.writer;
@@ -1197,7 +1226,54 @@ class OutlinePlanner {
 		if (current && sameTaskLock(candidate, current)) return current;
 		// The same locker naming another delegate keeps the lock (and so what its plan is).
 		if (current && sameLocker(candidate, current)) return candidate;
+		if (current) {
+			const op = this.input.ops[opIndex];
+			const ref = op && op.op !== "insert" ? this.known(op.block) : undefined;
+			throw new OutlineWriteError(
+				OUTLINE_TEXT.lockHeld(ref ? this.address(ref.sid) : "the task"),
+				"OUTLINE_LOCK_HELD",
+				opIndex,
+			);
+		}
 		return { by, delegate, versionSeq: this.space.nextSeq };
+	}
+
+	/**
+	 * Locks this commit would take away (unlocking, deleting the locked task or what holds it,
+	 * taking its checkbox away, a revert to before the lock, another locker) need the right to
+	 * unlock (owner decision Q5, review S-4): the locker themselves, or whoever
+	 * `unlockAuthority` vouches for (a manager of the space, an admin); the system and a
+	 * confirmation (its decider is the locker or acts for them) may. Without it an ordinary write
+	 * is refused (`OUTLINE_LOCK_DENIED`); a revert keeps the lock and writes the rest
+	 * (`lock-kept`), unless it would delete the task or take its checkbox, which is refused too.
+	 */
+	private async guardLocks(): Promise<void> {
+		if (this.commitKind === "confirm" || this.input.actor.kind === "system") return;
+		let authority: boolean | undefined;
+		for (const block of this.blocks.values()) {
+			const lock = block.base && !block.base.deleted ? block.base.taskJson?.lock : undefined;
+			if (!lock) continue;
+			const now = block.deleted ? undefined : block.taskJson?.lock;
+			if (now && sameLocker(now, lock)) continue;
+			if (lock.by.kind === this.input.actor.kind && lock.by.id === this.input.actor.id) continue;
+			authority ??= (await this.input.unlockAuthority?.()) === true;
+			if (authority) continue;
+			const opIndex = this.taskOp.get(block.id) ?? null;
+			if (this.compensating && !block.deleted && block.taskJson) {
+				block.taskJson = canonicalTaskJson({ ...block.taskJson, lock });
+				const result = opIndex === null ? undefined : this.results[opIndex];
+				if (result) {
+					const kept: OutlineAdjustment = { kind: "lock-kept", blockId: block.id };
+					result.adjustments = [...(result.adjustments ?? []), kept];
+				}
+				continue;
+			}
+			throw new OutlineWriteError(
+				OUTLINE_TEXT.unlockDenied(this.address(block.sid)),
+				"OUTLINE_LOCK_DENIED",
+				opIndex,
+			);
+		}
 	}
 
 	/** Record that operation `opIndex` set `block` to in progress (a claim attempt). */
@@ -1679,7 +1755,14 @@ class OutlinePlanner {
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
 		if (op.merged) block.merged = true;
 		this.results[i] = this.result(block, { split, notes }, [aliasDropped]);
-		this.touches.set(i, { kind: "update", block });
+		const base = block.base;
+		this.touches.set(i, {
+			kind: "update",
+			block,
+			content: op.content !== undefined && this.prep(i).contentHash !== base?.contentHash,
+			alias: op.alias !== undefined && (op.alias ?? null) !== (base?.alias ?? null),
+			...(op.tags !== undefined ? { tags: canonicalTags(op.tags) } : {}),
+		});
 	}
 
 	private async move(op: Extract<OutlineOp, { op: "move" }>, i: number): Promise<void> {
@@ -1798,6 +1881,9 @@ class OutlinePlanner {
 		this.checkLockInput(op.task, i);
 		if (op.task !== undefined)
 			block.taskJson = op.task ? this.taskFrom(block.taskJson, op.task, false, i) : null;
+		// An agent never brings a lock back: only people lock (Q5).
+		if (this.input.actor.kind === "agent" && this.commitKind === "edit" && block.taskJson?.lock)
+			block.taskJson = canonicalTaskJson({ ...block.taskJson, lock: null });
 		this.taskOp.set(block.id, i);
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
 		else if (block.base?.deleted) {
@@ -1827,10 +1913,13 @@ class OutlinePlanner {
 	/**
 	 * Which operations of this pass change a locked plan (rules in `locks.ts`): those are held for
 	 * confirmation, with every operation naming a block a held insert creates. Null when none is.
-	 * Everything is judged on the state before the transaction. Reads: the locked blocks of the
-	 * pages the operations touch (the lock index; none, the common case, ends it there), the
-	 * ancestors of the blocks named, level by level, the subtrees a delete or a move takes, and the
-	 * creation of the blocks whose being part of the plan decides an operation.
+	 * Everything is judged on the state before the transaction.
+	 *
+	 * Reads: the locked blocks of the pages the operations touch (the lock index; none, the common
+	 * case, ends it there; a page with more than {@link OUTLINE_LOCK_SCAN} skips that shortcut and is
+	 * judged from the blocks themselves), the ancestors of the blocks named, level by level, the
+	 * subtrees a delete or a move takes, the tags an update replaces, and the creation of the
+	 * blocks whose being part of the plan decides an operation.
 	 */
 	private async classifyLocked(): Promise<Hold["hold"] | null> {
 		if (this.touches.size === 0) return null;
@@ -1840,30 +1929,30 @@ class OutlinePlanner {
 		const named = new Set<WorkingBlock>();
 		for (const t of this.touches.values()) {
 			if (existing(t.block)) named.add(t.block);
-			const parent = t.kind === "insert" || t.kind === "restore" ? t.parent : null;
-			if (existing(parent)) named.add(parent);
-			if (t.kind === "move") {
-				const to = this.existingAnchor(t.to);
-				if (to) named.add(to);
-			}
+			const parent =
+				t.kind === "insert" || t.kind === "restore" ? t.parent : t.kind === "move" ? t.to : null;
+			const anchor = this.existingAnchor(parent);
+			if (anchor) named.add(anchor);
 		}
 		const locked = new Map<string, WorkingBlock>();
+		let unlisted = false;
 		for (const pageId of new Set([...named].map((b) => (b.base as OutlineBlockMeta).pageId))) {
-			const metas = await this.store.listLockedBlocks(pageId, LOCKS_PER_PAGE + 1);
-			if (metas.length > LOCKS_PER_PAGE)
-				throw new OutlineWriteError(
-					OUTLINE_TEXT.tooManyLocks(LOCKS_PER_PAGE),
-					"OUTLINE_TOO_MANY_LOCKS",
-				);
+			const metas = await this.store.listLockedBlocks(pageId, OUTLINE_LOCK_SCAN.perPage + 1);
+			if (metas.length > OUTLINE_LOCK_SCAN.perPage) {
+				// Too many to list: no shortcut; the locks are read off the blocks themselves.
+				unlisted = true;
+				continue;
+			}
 			for (const meta of metas) {
 				this.adopt(meta);
 				const block = this.block(meta.id);
 				if (block.base?.taskJson?.lock && !block.base.deleted) locked.set(block.id, block);
 			}
 		}
-		if (locked.size === 0) return null;
+		if (locked.size === 0 && !unlisted) return null;
 
 		await this.loadBaseAncestors([...named, ...locked.values()]);
+		const lockAt = (b: WorkingBlock) => !!b.base && !b.base.deleted && !!b.base.taskJson?.lock;
 		const chain = (block: WorkingBlock): WorkingBlock[] => {
 			const out: WorkingBlock[] = [];
 			let current: WorkingBlock | undefined = block;
@@ -1874,13 +1963,52 @@ class OutlinePlanner {
 			}
 			return out;
 		};
-		const rootOf = (block: WorkingBlock): WorkingBlock | null =>
-			chain(block).find((b) => locked.has(b.id)) ?? null;
 		const lockOf = (root: WorkingBlock) => root.base?.taskJson?.lock as OutlineTaskLockJson;
+		const rootOf = (block: WorkingBlock): WorkingBlock | null => chain(block).find(lockAt) ?? null;
+		/** The nearest task at or above a block, as it was (`start` may be new: its parents are). */
+		const taskAnchor = (start: WorkingBlock | null): WorkingBlock | null => {
+			const from = this.existingAnchor(start);
+			return from ? (chain(from).find((b) => !!b.base?.taskJson) ?? null) : null;
+		};
+
+		// Subtrees a delete or a move takes, as they were (live).
+		const subtreeRoots: WorkingBlock[] = [];
+		for (const t of this.touches.values()) {
+			if ((t.kind === "delete" || t.kind === "move") && existing(t.block))
+				subtreeRoots.push(t.block);
+		}
+		const subtrees = await this.baseSubtrees(subtreeRoots);
+		this.heldSubtrees = subtrees;
+
+		// Where a task would be added: the nearest task above it, and that task's children.
+		const anchors = new Map<number, WorkingBlock | null>();
+		for (const [i, t] of this.touches) {
+			if (t.kind === "insert" || t.kind === "restore") anchors.set(i, taskAnchor(t.parent));
+			else if (t.kind === "move") anchors.set(i, t.to ? taskAnchor(t.to) : null);
+			else if (t.kind === "setTask" && t.before === null && t.after !== null && existing(t.block))
+				anchors.set(
+					i,
+					t.block.base?.parentId
+						? taskAnchor(this.blocks.get(t.block.base.parentId) ?? null)
+						: null,
+				);
+		}
+		await this.readBaseKids([...new Set([...anchors.values()].flatMap((a) => (a ? [a.id] : [])))]);
 
 		// A lock an agent holds does not bind its own session.
+		const roots = new Set<WorkingBlock>(locked.values());
+		for (const b of named) {
+			const r = rootOf(b);
+			if (r) roots.add(r);
+		}
+		for (const list of subtrees.values()) for (const b of list) if (lockAt(b)) roots.add(b);
+		for (const a of anchors.values()) {
+			const r = a ? rootOf(a) : null;
+			if (r) roots.add(r);
+		}
+		if (roots.size === 0) return null;
 		const exempt = new Set<string>();
-		const agentLocked = [...locked.values()].filter((b) => lockOf(b).by.kind === "agent");
+		const agentLocked = [...roots].filter((b) => lockOf(b).by.kind === "agent");
 		if (agentLocked.length > 0) {
 			const writer = this.input.narratorId ?? this.input.actor.id;
 			const sessions = await this.store.getNarratorRoots([
@@ -1897,32 +2025,24 @@ class OutlinePlanner {
 			const root = rootOf(block);
 			return root && !exempt.has(root.id) ? root : null;
 		};
-
-		// Subtrees a delete or a move takes, as they were (live), when a lock is involved.
-		const subtreeRoots: WorkingBlock[] = [];
-		for (const t of this.touches.values()) {
-			if ((t.kind === "delete" || t.kind === "move") && existing(t.block))
-				subtreeRoots.push(t.block);
-		}
-		const subtrees = await this.baseSubtrees(subtreeRoots);
 		const lockedUnder = (block: WorkingBlock) =>
-			[...locked.values()].filter((l) => l !== block && chain(l).includes(block));
+			(subtrees.get(block.id) ?? []).filter((b) => lockAt(b) && !exempt.has(b.id));
+		const baseTaskChildren = (parent: WorkingBlock) =>
+			[...(this.baseKids.get(parent.id) ?? [])].filter((c) => c.base?.taskJson);
 
 		// What to ask: whether each of these blocks is part of its tree's plan.
 		const ask = new Map<string, WorkingBlock>();
-		const baseTaskChildren = (parent: WorkingBlock) =>
-			[...(this.baseKids.get(parent.id) ?? [])].filter((c) => c.base?.taskJson);
-		for (const t of this.touches.values()) {
-			if (t.kind === "update" || t.kind === "setTask") {
-				if (existing(t.block) && rootIn(t.block)) ask.set(t.block.id, t.block);
-			} else if (t.kind === "insert" || t.kind === "restore") {
-				if (existing(t.parent) && rootIn(t.parent))
-					for (const c of baseTaskChildren(t.parent)) ask.set(c.id, c);
-			} else if (existing(t.block)) {
+		for (const [i, t] of this.touches) {
+			if ((t.kind === "update" || t.kind === "setTask") && existing(t.block) && rootIn(t.block))
+				ask.set(t.block.id, t.block);
+			if ((t.kind === "delete" || t.kind === "move") && existing(t.block)) {
 				for (const b of [t.block, ...(subtrees.get(t.block.id) ?? [])])
 					if (rootIn(b)) ask.set(b.id, b);
-				if (t.kind === "move" && existing(t.to) && rootIn(t.to))
-					for (const c of baseTaskChildren(t.to)) ask.set(c.id, c);
+			}
+			const anchor = anchors.get(i);
+			if (anchor && rootIn(anchor)) {
+				ask.set(anchor.id, anchor);
+				for (const c of baseTaskChildren(anchor)) ask.set(c.id, c);
 			}
 		}
 		const creations = await this.creationsOf([...ask.keys()]);
@@ -1930,9 +2050,22 @@ class OutlinePlanner {
 			const root = rootIn(block);
 			return root !== null && planBlockBy(creations.get(block.id), lockOf(root));
 		};
-		/** A task of the plan under `parent` (adding a task there adds a step). */
-		const hasPlanTask = (parent: WorkingBlock, except?: WorkingBlock) =>
-			baseTaskChildren(parent).some((c) => c !== except && !c.base?.deleted && isPlan(c));
+		/**
+		 * A task added under `anchor` (the nearest task above it) is a step of the plan, unless it
+		 * splits a leaf: the anchor is not the plan, or is a task of the plan with no task of the
+		 * plan under it.
+		 */
+		const addsStep = (anchor: WorkingBlock | null | undefined, except?: WorkingBlock) =>
+			!!anchor &&
+			isPlan(anchor) &&
+			baseTaskChildren(anchor).some((c) => c !== except && !c.base?.deleted && isPlan(c));
+		const tagsBefore = await this.tagsOf(
+			[...this.touches.values()].flatMap((t) =>
+				t.kind === "update" && t.tags !== undefined && existing(t.block) && rootIn(t.block)
+					? [t.block.id]
+					: [],
+			),
+		);
 
 		// Each operation: held or not, and for which tree.
 		const trees = new Map<string, WorkingBlock>();
@@ -1942,20 +2075,33 @@ class OutlinePlanner {
 		for (const [i, t] of this.touches) {
 			let root: WorkingBlock | null = null;
 			switch (t.kind) {
-				case "update":
-					if (existing(t.block) && isPlan(t.block)) root = rootIn(t.block);
+				case "update": {
+					// Only a change: an update writing what is there already changes nothing.
+					if (!existing(t.block) || !isPlan(t.block)) break;
+					const changed =
+						t.content ||
+						t.alias ||
+						(t.tags !== undefined &&
+							JSON.stringify([...new Set(t.tags)].sort()) !==
+								JSON.stringify(tagsBefore.get(t.block.id) ?? []));
+					if (changed) root = rootIn(t.block);
 					break;
+				}
 				case "setTask":
-					if (existing(t.block) && isPlan(t.block)) {
+					if (!existing(t.block)) break;
+					if (isPlan(t.block)) {
 						const r = rootIn(t.block) as WorkingBlock;
 						if (taskChangeHeld(t.before, t.after, r === t.block)) root = r;
+					} else if (t.before === null && t.after !== null && addsStep(anchors.get(i))) {
+						// A block of the tree becoming a task adds a step.
+						root = rootIn(anchors.get(i) as WorkingBlock);
 					}
 					break;
 				case "insert":
 				case "restore":
 					// A task added (or brought back) as a step of the plan; splitting a leaf is not.
-					if (t.block.taskJson && existing(t.parent) && rootIn(t.parent) && hasPlanTask(t.parent))
-						root = rootIn(t.parent);
+					if (t.block.taskJson && addsStep(anchors.get(i)))
+						root = rootIn(anchors.get(i) as WorkingBlock);
 					break;
 				case "delete":
 				case "move": {
@@ -1964,7 +2110,7 @@ class OutlinePlanner {
 					const planRoots = new Set<WorkingBlock>();
 					for (const b of taken) if (isPlan(b)) planRoots.add(rootIn(b) as WorkingBlock);
 					// A locked task inside the subtree is the plan of its own tree.
-					for (const l of lockedUnder(t.block)) if (!exempt.has(l.id)) planRoots.add(l);
+					for (const l of lockedUnder(t.block)) planRoots.add(l);
 					const from = rootIn(t.block);
 					if (planRoots.size > 0) {
 						// The tree the block is in decides; a subtree holding other locked plans too, the
@@ -1979,19 +2125,15 @@ class OutlinePlanner {
 						break;
 					}
 					if (t.kind !== "move") break;
-					const anchor = this.existingAnchor(t.to);
-					const destination = anchor ? rootIn(anchor) : null;
+					const target = this.existingAnchor(t.to);
+					const destination = target ? rootIn(target) : null;
 					const withTask = taken.some((b) => b.base?.taskJson) || t.block.taskJson !== null;
-					if (withTask && (from?.id ?? null) !== (destination?.id ?? null)) {
+					if (!withTask) break;
+					if ((from?.id ?? null) !== (destination?.id ?? null)) {
 						// A task into or out of a locked tree.
 						if (from && destination) throw several(i);
 						root = from ?? destination;
-					} else if (
-						t.block.taskJson &&
-						existing(t.to) &&
-						destination &&
-						hasPlanTask(t.to, t.block)
-					) {
+					} else if (destination && addsStep(anchors.get(i), t.block)) {
 						root = destination;
 					}
 					break;
@@ -2041,6 +2183,24 @@ class OutlinePlanner {
 		};
 	}
 
+	/** Subtrees the last classification read (for a held delete's record of what it takes). */
+	private heldSubtrees = new Map<string, WorkingBlock[]>();
+
+	/** Tag targets of blocks now (their open tag links), sorted, by block. */
+	private async tagsOf(ids: readonly string[]): Promise<Map<string, string[]>> {
+		const out = new Map<string, string[]>(ids.map((id) => [id, []]));
+		if (ids.length === 0) return out;
+		const links = await this.store.listLinksAt(
+			ids,
+			null,
+			["tag"],
+			ids.length * OUTLINE_LIMITS.maxTagsPerBlock,
+		);
+		for (const link of links) out.get(link.fromBlockId)?.push(link.targetRef);
+		for (const list of out.values()) list.sort();
+		return out;
+	}
+
 	/** The nearest block at or above `block` (in the working copy) that existed before. */
 	private existingAnchor(block: WorkingBlock | null): WorkingBlock | null {
 		let current: WorkingBlock | null = block;
@@ -2081,17 +2241,9 @@ class OutlinePlanner {
 
 	/**
 	 * The live subtree (as it was) of each root, read level by level from the store (live children
-	 * are the stored state), at most the commit's row limit in all. Children lists of the roots'
-	 * parents-to-be are read too (`baseKids`).
+	 * are the stored state), at most the commit's row limit in all.
 	 */
 	private async baseSubtrees(roots: readonly WorkingBlock[]): Promise<Map<string, WorkingBlock[]>> {
-		const parents = new Set<string>();
-		for (const t of this.touches.values()) {
-			const parent =
-				t.kind === "insert" || t.kind === "restore" ? t.parent : t.kind === "move" ? t.to : null;
-			if (parent?.base && !parent.base.deleted) parents.add(parent.id);
-		}
-		await this.readBaseKids([...parents]);
 		const out = new Map<string, WorkingBlock[]>();
 		let total = 0;
 		for (const root of roots) {
@@ -2142,7 +2294,6 @@ class OutlinePlanner {
 	private heldOp(i: number, root: WorkingBlock): OutlineHeldOp {
 		const op = this.input.ops[i] as OutlineOp;
 		const result = this.results[i] as OutlineOpResult;
-		const touch = this.touches.get(i);
 		const idOf = (ref: OutlineBlockRef): string =>
 			this.known(ref)?.id ?? ("id" in ref ? ref.id : "");
 		const position = (p: OutlinePosition | undefined): OutlinePosition | undefined =>
@@ -2154,11 +2305,14 @@ class OutlinePlanner {
 						? { before: { id: idOf(p.before) } }
 						: p;
 		const prep = this.prepared[i];
+		// The blocks it targets (what waits), with the versions the change was computed against.
 		const touched: Array<{ blockId: string; versionSeq: number }> = [];
 		const touch_ = (b: WorkingBlock | null | undefined) => {
 			if (b?.base && !b.base.deleted)
 				touched.push({ blockId: b.id, versionSeq: b.base.versionSeq });
 		};
+		const adds: Array<{ sid: string; parentId: string | null }> = [];
+		const subtree: Record<string, Record<string, number>> = {};
 		const ops: OutlineOp[] = [];
 		const taskInput = (task: OutlineTaskJson | null): OutlineTaskInput | null =>
 			task
@@ -2172,7 +2326,7 @@ class OutlinePlanner {
 		switch (op.op) {
 			case "insert": {
 				const block = this.block(result.blockId);
-				touch_(touch?.kind === "insert" ? touch.parent : null);
+				adds.push({ sid: block.sid, parentId: block.parentId });
 				ops.push({
 					op: "insert",
 					id: block.id,
@@ -2203,7 +2357,6 @@ class OutlinePlanner {
 				break;
 			case "move":
 				touch_(this.blocks.get(result.blockId));
-				touch_(touch?.kind === "move" ? this.existingAnchor(touch.to) : null);
 				ops.push({
 					op: "move",
 					block: { id: result.blockId },
@@ -2211,12 +2364,17 @@ class OutlinePlanner {
 					...(position(op.position) ? { position: position(op.position) } : {}),
 				});
 				break;
-			case "delete":
+			case "delete": {
 				touch_(this.blocks.get(result.blockId));
+				// What it takes with it as proposed: a confirmation refuses when that changed.
+				const under: Record<string, number> = {};
+				for (const b of this.heldSubtrees.get(result.blockId) ?? [])
+					if (b.base) under[b.id] = b.base.versionSeq;
+				subtree[result.blockId] = under;
 				ops.push({ op: "delete", block: { id: result.blockId } });
 				break;
+			}
 			case "restore":
-				touch_(touch?.kind === "restore" ? touch.parent : null);
 				ops.push({
 					op: "restore",
 					block: { id: result.blockId },
@@ -2234,6 +2392,7 @@ class OutlinePlanner {
 		// Blocks split off the content: inserted after it, in order.
 		for (const split of result.split) {
 			const block = this.block(split.blockId);
+			adds.push({ sid: block.sid, parentId: block.parentId });
 			ops.push({
 				op: "insert",
 				id: block.id,
@@ -2249,6 +2408,8 @@ class OutlinePlanner {
 			rootId: root.id,
 			ops,
 			touched,
+			adds,
+			subtree,
 			result: { ...result, adjustments: undefined, pending: true },
 		};
 	}
@@ -2257,6 +2418,8 @@ class OutlinePlanner {
 
 	private async assemble(): Promise<Planned | null> {
 		this.leaveUnclaimedToDo();
+		await this.guardLocks();
+		await this.checkRepage();
 		// May load more blocks (ancestors, children whose in-process changes): before `all`.
 		await this.planInProcess();
 		const all = [...this.blocks.values()];
@@ -2423,6 +2586,38 @@ class OutlinePlanner {
 			},
 			pageIds: [...pageIds],
 		};
+	}
+
+	/**
+	 * A locked task this commit moves to another page takes its open changes there: refused when
+	 * the page would hold more open changes than it may (`OUTLINE_PENDING_FULL`).
+	 */
+	private async checkRepage(): Promise<void> {
+		const moving = [...this.blocks.values()].filter((block) => {
+			const lock = block.base && !block.base.deleted ? block.base.taskJson?.lock : undefined;
+			return (
+				!!lock &&
+				!block.deleted &&
+				sameLocker(block.taskJson?.lock, lock) &&
+				block.pageId !== (block.base as OutlineBlockMeta).pageId
+			);
+		});
+		if (moving.length === 0) return;
+		const limit = OUTLINE_PENDING_LIMITS.openPerPage;
+		const arriving = new Map<string, number>();
+		for (const block of moving) {
+			const open = await this.store.listOpenPendingByPage(
+				(block.base as OutlineBlockMeta).pageId,
+				limit,
+			);
+			const n = open.filter((row) => row.rootBlockId === block.id).length;
+			if (n > 0) arriving.set(block.pageId, (arriving.get(block.pageId) ?? 0) + n);
+		}
+		for (const [pageId, n] of arriving) {
+			if ((await this.store.countOpenPendingByPage(pageId, limit)) + n > limit) {
+				throw new OutlineWriteError(OUTLINE_TEXT.pendingFull(limit), "OUTLINE_PENDING_FULL");
+			}
+		}
 	}
 
 	/**
@@ -3023,7 +3218,10 @@ async function writePrepared(
 		let planner: OutlinePlanner;
 		let planned: Planned | null = null;
 		let collided = false;
-		for (;;) {
+		// Each pass holds at least one more operation, so there are at most as many passes as
+		// operations, and one more to plan what is left.
+		for (let pass = 0; ; pass++) {
+			if (pass > input.ops.length) throw new Error("outline write: holding did not settle");
 			planner = new OutlinePlanner(
 				store,
 				space,

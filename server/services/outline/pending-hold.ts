@@ -3,7 +3,8 @@
  * AND PENDING CONFIRMATION), turned into the `outline_pending` row the write puts: a new row, or
  * the proposal merged into the open change the writer's session already has on the same locked
  * tree (one per session and tree, builder decision 5). Reads: the writer's session, its open row
- * on the tree, and (for a new row) the open rows of the page, all indexed and bounded.
+ * on the tree (whole: it is merged into), and for a new row how many the page has open (a
+ * bounded count), all indexed.
  */
 import { OutlineWriteError } from "./errors";
 import { newOutlinePendingId } from "./keys";
@@ -26,8 +27,12 @@ export interface OutlineHeldOp {
 	rootId: string;
 	/** As stored: every block by id (new ones with their ids and sids), content canonical. */
 	ops: OutlineOp[];
-	/** Existing blocks it touches (targets, parents), with their version when proposed. */
+	/** The existing blocks it targets, with the versions its change was computed against. */
 	touched: Array<{ blockId: string; versionSeq: number }>;
+	/** The blocks it adds (sid and parent). */
+	adds: Array<{ sid: string; parentId: string | null }>;
+	/** For a delete: the live blocks under the deleted block and their versions. */
+	subtree: Record<string, Record<string, number>>;
 	/** What the writer's result says for it. */
 	result: OutlineOpResult;
 }
@@ -42,7 +47,7 @@ export interface OutlineHeldTree {
 
 /** Why open changes were withdrawn (the `reason` of a `withdrawn` row). */
 export const PENDING_WITHDRAW = {
-	/** The tree was unlocked, or locked again by someone else. */
+	/** The tree was unlocked. */
 	unlocked: "unlocked",
 	/** The locked task was deleted. */
 	deleted: "lock-deleted",
@@ -55,45 +60,52 @@ export function pendingOps(row: Pick<OutlinePendingRow, "opsJson">): OutlineOp[]
 	return row.opsJson as unknown as OutlineOp[];
 }
 
+function targetId(op: OutlineOp): string | undefined {
+	return op.op !== "insert" && "id" in op.block ? op.block.id : undefined;
+}
+
 /**
- * A second proposal merged into an open change: a rewrite of a block replaces the earlier one
- * (field by field, the later wins), task changes of a block are merged likewise; everything else
- * is appended in order.
+ * A second proposal merged into an open change, so the change says what the proposer means now:
+ *
+ *   - a rewrite of a block replaces the earlier one field by field (the later wins);
+ *   - task changes of a block merge field by field, but taking the checkbox away, or giving it
+ *     back after that, replaces what was proposed for the task before (the later intent wins:
+ *     `[setTask null]` then `[setTask {due}]` is a task with that due date, not both);
+ *   - everything else is appended in order.
+ *
+ * Returns the merged operations and the blocks whose rewritten text now comes from `incoming`
+ * (their base moves to the version that text was computed against).
  */
 export function mergePendingOps(
 	existing: readonly OutlineOp[],
 	incoming: readonly OutlineOp[],
-): OutlineOp[] {
+): { ops: OutlineOp[]; rebased: Set<string> } {
 	const out = [...existing];
+	const rebased = new Set<string>();
 	for (const op of incoming) {
-		if (op.op === "update") {
-			const at = out.findIndex(
-				(o) =>
-					o.op === "update" && "id" in o.block && "id" in op.block && o.block.id === op.block.id,
-			);
+		const id = targetId(op);
+		if (op.op === "update" && id !== undefined) {
+			const at = out.findIndex((o) => o.op === "update" && targetId(o) === id);
+			if (op.content !== undefined) rebased.add(id);
 			if (at >= 0) {
 				out[at] = { ...(out[at] as OutlineOp & { op: "update" }), ...op };
 				continue;
 			}
 		}
-		if (op.op === "setTask" && op.task !== null) {
-			const at = out.findIndex(
-				(o) =>
-					o.op === "setTask" &&
-					o.task !== null &&
-					"id" in o.block &&
-					"id" in op.block &&
-					o.block.id === op.block.id,
-			);
+		if (op.op === "setTask" && id !== undefined) {
+			const at = out.findIndex((o) => o.op === "setTask" && targetId(o) === id);
 			if (at >= 0) {
 				const earlier = out[at] as OutlineOp & { op: "setTask" };
-				out[at] = { ...earlier, task: { ...earlier.task, ...op.task } };
+				out[at] =
+					op.task === null || earlier.task === null
+						? op
+						: { ...earlier, task: { ...earlier.task, ...op.task } };
 				continue;
 			}
 		}
 		out.push(op);
 	}
-	return out;
+	return { ops: out, rebased };
 }
 
 function contentBytes(ops: readonly OutlineOp[]): number {
@@ -106,12 +118,6 @@ function contentBytes(ops: readonly OutlineOp[]): number {
 			total += Buffer.byteLength(op.content, "utf8");
 	}
 	return total;
-}
-
-function autoSummary(ops: readonly OutlineOp[]): string {
-	const counts = new Map<string, number>();
-	for (const op of ops) counts.set(op.op, (counts.get(op.op) ?? 0) + 1);
-	return [...counts].map(([kind, n]) => `${kind} ${n}`).join(", ");
 }
 
 /**
@@ -137,8 +143,11 @@ export async function buildPendingPut(args: {
 		: null;
 	const existing = session ? await store.findOpenPending(session, tree.rootId) : null;
 	if (!existing) {
-		const open = await store.listOpenPendingByPage(tree.pageId, OUTLINE_PENDING_LIMITS.openPerPage);
-		if (open.length >= OUTLINE_PENDING_LIMITS.openPerPage) {
+		const open = await store.countOpenPendingByPage(
+			tree.pageId,
+			OUTLINE_PENDING_LIMITS.openPerPage,
+		);
+		if (open >= OUTLINE_PENDING_LIMITS.openPerPage) {
 			throw new OutlineWriteError(
 				OUTLINE_TEXT.pendingFull(OUTLINE_PENDING_LIMITS.openPerPage),
 				"OUTLINE_PENDING_FULL",
@@ -146,7 +155,10 @@ export async function buildPendingPut(args: {
 		}
 	}
 	const incoming = held.flatMap((h) => h.ops);
-	const ops = existing ? mergePendingOps(pendingOps(existing), incoming) : incoming;
+	const merged = existing
+		? mergePendingOps(pendingOps(existing), incoming)
+		: { ops: incoming, rebased: new Set<string>() };
+	const ops = merged.ops;
 	const opsBytes = Buffer.byteLength(JSON.stringify(ops), "utf8");
 	if (
 		ops.length > OUTLINE_PENDING_LIMITS.maxOps ||
@@ -161,21 +173,30 @@ export async function buildPendingPut(args: {
 			"OUTLINE_PENDING_TOO_LARGE",
 		);
 	}
-	// The version each block had when first proposed: a merge keeps the first.
-	const base: Record<string, number> = {};
-	for (const h of held) for (const t of h.touched) base[t.blockId] ??= t.versionSeq;
-	Object.assign(base, existing?.baseJson ?? {});
+	// The version each block's proposed change was computed against: the first proposal's,
+	// unless a later one rewrote the block's text (then that text's, review S-3).
+	const base: Record<string, number> = { ...(existing?.baseJson ?? {}) };
+	for (const h of held) {
+		for (const t of h.touched) {
+			if (base[t.blockId] === undefined || merged.rebased.has(t.blockId))
+				base[t.blockId] = t.versionSeq;
+		}
+	}
+	const subtree = { ...(existing?.subtreeJson ?? {}) };
+	for (const h of held) Object.assign(subtree, h.subtree);
 	const blockIds = [
 		...new Set([
 			...(existing?.blockIdsJson ?? []),
 			...held.flatMap((h) => h.touched.map((t) => t.blockId)),
 		]),
 	];
-	const said = input.summary?.trim() || autoSummary(incoming);
-	const summary = (existing ? `${existing.summary}; ${said}` : said).slice(
-		0,
-		OUTLINE_LIMITS.maxSummaryChars,
-	);
+	const adds = [...(existing?.addsJson ?? []), ...held.flatMap((h) => h.adds)];
+	// What the proposer said; nothing when it said nothing (readers show the count instead).
+	const said = input.summary?.trim() ?? "";
+	const summary = [existing?.summary ?? "", said]
+		.filter((part) => part !== "")
+		.join("; ")
+		.slice(0, OUTLINE_LIMITS.maxSummaryChars);
 	const decider: OutlinePendingDeciderJson = {
 		by: { kind: tree.lock.by.kind, id: tree.lock.by.id },
 		delegate: tree.lock.delegate ?? null,
@@ -191,8 +212,11 @@ export async function buildPendingPut(args: {
 		pageId: tree.pageId,
 		rootBlockId: tree.rootId,
 		opsJson: ops as unknown as Array<Record<string, unknown>>,
+		opCount: ops.length,
 		baseJson: base,
+		subtreeJson: subtree,
 		blockIdsJson: blockIds,
+		addsJson: adds,
 		summary,
 		requestedByJson: {
 			kind: input.actor.kind,

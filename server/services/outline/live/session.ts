@@ -73,6 +73,7 @@ import {
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
 import * as Y from "yjs";
+import { canManageSpace } from "../access";
 import { readDisplayNames } from "../access-reads";
 import { OutlineEditTextError } from "../edit-text-runner";
 import {
@@ -1338,6 +1339,7 @@ export class LivePage {
 		responsible: string | null,
 		summary: string,
 		groups?: ReadonlyArray<readonly [number, number]>,
+		unlockAuthority?: () => Promise<boolean>,
 	): Promise<OutlineWriteResult[]> {
 		const chunks = planChunks(ops, groups);
 		const out: OutlineWriteResult[] = [];
@@ -1352,6 +1354,7 @@ export class LivePage {
 								actor,
 								responsibleUserId: responsible,
 								...(summary ? { summary } : {}),
+								...(unlockAuthority ? { unlockAuthority } : {}),
 							},
 							{ canonical: canonical.slice(a, b) },
 						),
@@ -1367,6 +1370,14 @@ export class LivePage {
 			}
 		}
 		return out;
+	}
+
+	/** Whether the participant may take away someone else's lock: a manager of the space. */
+	private async mayUnlockAnyone(p: Participant): Promise<boolean> {
+		const space = await outlineStore.getSpace(this.spaceId);
+		return space
+			? await canManageSpace({ userId: p.userId, isAdmin: p.socket.isAdmin }, space)
+			: false;
 	}
 
 	/** Record what the database holds for a block now (logged for replay, see `persistStep`). */
@@ -1620,6 +1631,10 @@ export class LivePage {
 						{ kind: "human", id: p.userId },
 						p.userId,
 						"",
+						undefined,
+						// Taking a lock away (the locked task's checkbox, the task itself) needs the
+						// right to unlock: the locker, a manager of the space, an admin (review S-4).
+						async () => await this.mayUnlockAnyone(p),
 					);
 				} catch (error) {
 					const cause = error instanceof LiveChunkError ? error.cause : error;
@@ -2689,6 +2704,8 @@ export function isConflict(error: unknown): boolean {
 				"OUTLINE_CYCLE",
 				"OUTLINE_ID_TAKEN",
 				"OUTLINE_TASK_CLAIMED",
+				"OUTLINE_LOCK_DENIED",
+				"OUTLINE_LOCK_HELD",
 			].includes(error.code))
 	);
 }

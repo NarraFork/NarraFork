@@ -195,10 +195,16 @@ export interface OutlinePendingRow {
 	/** The lock's root (a `locked_plan`). */
 	rootBlockId: string | null;
 	opsJson: Array<Record<string, unknown>>;
-	/** Each existing block's `version_seq` when proposed, by id. */
+	/** How many operations `opsJson` holds. */
+	opCount: number;
+	/** Each existing block's `version_seq` its proposed change was computed against, by id. */
 	baseJson: Record<string, number>;
-	/** The existing blocks the change touches. */
+	/** For each block the change deletes: the live blocks under it and their versions then. */
+	subtreeJson: Record<string, Record<string, number>>;
+	/** The existing blocks the change targets: what waits for confirmation. */
 	blockIdsJson: string[];
+	/** The blocks the change adds: their sids and parents. */
+	addsJson: Array<{ sid: string; parentId: string | null }>;
 	summary: string;
 	requestedByJson: OutlinePendingRequesterJson;
 	/** The proposer's session (a subagent's root). */
@@ -216,6 +222,13 @@ export interface OutlinePendingRow {
 	/** When the proposer was shown the decision; null while it has not been. */
 	reportedAt: string | null;
 }
+
+/**
+ * A pending change without its operations and deleted subtrees (up to hundreds of KiB): what
+ * lists, summaries, marks and waits read. The operations are read by id (`getPending`), for the
+ * reader's own changes, a diff, a confirmation.
+ */
+export type OutlinePendingHead = Omit<OutlinePendingRow, "opsJson" | "subtreeJson">;
 
 /** A decision on a pending change: written only while it is open and at `expectRev`. */
 export interface OutlinePendingDecision {
@@ -750,19 +763,25 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	// a guard (`applyPending`), or decided alone (`decidePending`). Every read is indexed and
 	// bounded.
 
-	/** Pending rows by id. */
+	/** Pending rows by id, whole. */
 	getPending(ids: readonly string[]): Promise<OutlinePendingRow[]>;
-	/** Open pending rows of a page, oldest first, at most `limit`. */
-	listOpenPendingByPage(pageId: string, limit: number): Promise<OutlinePendingRow[]>;
-	/** Open pending rows of a space, oldest first, at most `limit`. */
-	listOpenPendingBySpace(spaceId: string, limit: number): Promise<OutlinePendingRow[]>;
-	/** The open row a session has on a lock root, if any. */
+	/** Open pending changes of a page (heads), oldest first, at most `limit`. */
+	listOpenPendingByPage(pageId: string, limit: number): Promise<OutlinePendingHead[]>;
+	/** Open pending changes of a space (heads), oldest first, at most `limit`. */
+	listOpenPendingBySpace(spaceId: string, limit: number): Promise<OutlinePendingHead[]>;
+	/** How many open pending changes a page has, counting at most `limit`. */
+	countOpenPendingByPage(pageId: string, limit: number): Promise<number>;
+	/** The open row a session has on a lock root, if any, whole. */
 	findOpenPending(requesterSession: string, rootBlockId: string): Promise<OutlinePendingRow | null>;
 	/**
-	 * Rows of a session it has not been shown (open ones, and decisions not reported yet), oldest
-	 * first, at most `limit`.
+	 * Decisions on a session's changes on a page it has not been told of (heads), oldest first,
+	 * at most `limit` (the unreported index: open rows and other pages are not read).
 	 */
-	listUnreportedPending(requesterSession: string, limit: number): Promise<OutlinePendingRow[]>;
+	listUnreportedPending(
+		requesterSession: string,
+		pageId: string,
+		limit: number,
+	): Promise<OutlinePendingHead[]>;
 	/** Mark decided rows as shown to their proposer. */
 	markPendingReported(ids: readonly string[], at: string): Promise<void>;
 	/**

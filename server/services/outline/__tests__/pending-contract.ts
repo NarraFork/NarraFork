@@ -10,12 +10,14 @@
  */
 import { expect } from "bun:test";
 import { OutlineWriteError } from "../errors";
-import { outlinePendingLabel } from "../model";
+import { OUTLINE_PENDING_LIMITS, outlinePendingLabel } from "../model";
 import {
 	confirmOutlinePending,
 	findTasksWaitingForConfirmation,
 	lockOutlineTask,
+	mergeProposal,
 	OutlinePendingError,
+	readPendingDiff,
 	rejectOutlinePending,
 	takePendingReports,
 	unlockOutlineTask,
@@ -24,10 +26,11 @@ import { pendingOps } from "../pending-hold";
 import { pendingOverlay } from "../pending-overlay";
 import { readOutline } from "../read";
 import { stripReadAnnotations } from "../render";
-import type { OutlinePendingRow, OutlineSpaceRow } from "../store/port";
+import { revertCommit } from "../revert";
+import type { OutlinePendingHead, OutlinePendingRow, OutlineSpaceRow } from "../store/port";
 import { deriveOutlineTaskWaits } from "../tasks";
 import { readBlockView } from "../views";
-import { type OutlineOp, type OutlineWriteResult, writeOutline } from "../write";
+import { OUTLINE_LOCK_SCAN, type OutlineOp, type OutlineWriteResult, writeOutline } from "../write";
 import { type ContractCase, checkSpaceInvariants, type OutlineContractContext } from "./contract";
 
 const NOW = "2026-10-26T00:00:00.000Z";
@@ -134,7 +137,7 @@ async function contentOf(ctx: OutlineContractContext, id: string): Promise<strin
 async function openPending(
 	ctx: OutlineContractContext,
 	pageId: string,
-): Promise<OutlinePendingRow[]> {
+): Promise<OutlinePendingHead[]> {
 	return await ctx.store.listOpenPendingByPage(pageId, 100);
 }
 
@@ -175,18 +178,26 @@ async function readAs(
 	session: string,
 ): Promise<string> {
 	const rows = await openPending(ctx, pageId);
-	const labeled = (row: OutlinePendingRow) => ({
+	const labeled = <Row extends OutlinePendingHead>(row: Row) => ({
 		row,
 		label: outlinePendingLabel(row.id),
 		decider: "the locker",
 	});
+	// The reader's own changes whole, laid over the blocks as they are now (as `OutlineRead`).
+	const ownIds = rows.filter((r) => r.requesterSession === session).map((r) => r.id);
+	const own = [];
+	for (const row of ownIds.length > 0 ? await ctx.store.getPending(ownIds) : [])
+		own.push({ ...labeled(row), merges: await mergeProposal(ctx.store, row) });
 	const overlay = pendingOverlay({
-		own: rows.filter((r) => r.requesterSession === session).map(labeled),
+		own,
 		others: rows.filter((r) => r.requesterSession !== session).map(labeled),
 		text: {
 			own: (label, decider) => `pending ${label}: yours, for ${decider}`,
 			ownDeleted: (label, decider, n) => `pending ${label}: you delete ${n}, for ${decider}`,
 			other: (label, decider) => `pending ${label}: waits for ${decider}`,
+			ownMerged: (label, decider) => `pending ${label}: yours merged, for ${decider}`,
+			ownConflict: (label, decider, detail) =>
+				`pending ${label}: yours in conflict (${detail}), for ${decider}`,
 		},
 	});
 	const read = await readOutline({
@@ -362,7 +373,15 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			});
 			expect(ops[2]).toMatchObject({ op: "insert", parent: { id: docs } });
 			expect(row.baseJson[ids.s1]).toBe((await ctx.store.getBlock(ids.s1))?.versionSeq as number);
-			expect(row.blockIdsJson.sort()).toEqual([ids.root, ids.s1].sort());
+			// Only the blocks it targets wait; the blocks it adds are listed with their parents.
+			expect(row.blockIdsJson).toEqual([ids.s1]);
+			expect(row.addsJson).toEqual([
+				{ sid: r.results[2]?.sid as string, parentId: ids.root },
+				{ sid: r.results[3]?.sid as string, parentId: docs },
+			]);
+			expect(row.opCount).toBe(3);
+			// What the proposer said, nothing made up when it said nothing (readers show the count).
+			expect(row.summary).toBe("");
 			expect(r.pending).toMatchObject({
 				label: outlinePendingLabel(row.id),
 				rootBlockId: ids.root,
@@ -378,7 +397,7 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "pending: a session's proposals on one tree merge (subagents too), the base kept; another session's is its own",
+		name: "pending: a session's proposals on one tree merge (subagents too), a rewrite's base the version it was written against; another session's is its own",
 		async run(ctx) {
 			const p = await lockedPlan(ctx);
 			const { space, a, ids } = p;
@@ -386,10 +405,14 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			const first = await write(ctx, space, a, [
 				{ op: "update", block: { id: ids.s1 }, content: "v1" },
 			]);
-			// A person changes it meanwhile: the base stays the version first proposed against.
+			expect((await pendingRow(ctx, first.pending?.id as string)).baseJson[ids.s1]).toBe(s1Version);
+			// A person changes it meanwhile; the session rewrites it again, from the text as it is
+			// now: the base moves to that version (review S-3), so confirming applies "v2" as is.
 			await write(ctx, space, p.locker, [
 				{ op: "update", block: { id: ids.s1 }, content: "Parse the header!" },
 			]);
+			const s1Now = (await ctx.store.getBlock(ids.s1))?.versionSeq as number;
+			expect(s1Now).not.toBe(s1Version);
 			const second = await write(ctx, space, a, [
 				{ op: "update", block: { id: ids.s1 }, content: "v2" },
 			]);
@@ -401,7 +424,7 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			expect(third.pending?.merged).toBe(true);
 			const row = await pendingRow(ctx, first.pending?.id as string);
 			expect(row.rev).toBe(3);
-			expect(row.baseJson[ids.s1]).toBe(s1Version);
+			expect(row.baseJson[ids.s1]).toBe(s1Now);
 			expect(pendingOps(row)).toEqual([
 				{ op: "update", block: { id: ids.s1 }, content: "v2" },
 				{ op: "update", block: { id: ids.acc }, content: "Acceptance: v2" },
@@ -650,7 +673,7 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "locks: unlocking, deleting the locked task or another person's lock withdraws open changes in that commit; a new delegate keeps them; unlocked, agents write directly",
+		name: "locks: unlocking or deleting the locked task withdraws open changes in that commit; another person's lock is refused until unlocked; a new delegate keeps them; unlocked, agents write directly",
 		async run(ctx) {
 			const p = await lockedPlan(ctx);
 			const { space, a, ids } = p;
@@ -692,21 +715,59 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			]);
 			expect(direct.pending).toBeUndefined();
 			expect(await contentOf(ctx, ids.s1)).toBe("x");
-			// Another person's lock replaces it: what was open under the old lock is withdrawn.
+			// Another person cannot take the lock over (review B-2), by the lock function or a write
+			// of their own: the lock and what is open under it stay.
 			await lockOutlineTask({ blockId: ids.root, userId: p.lockerId, store: ctx.store });
 			const second = await write(ctx, space, a, [
 				{ op: "update", block: { id: ids.s1 }, content: "y" },
 			]);
 			expect(second.pending).toBeDefined();
 			const other = await ctx.seedUser();
+			const takeover = await refusedWith(
+				lockOutlineTask({ blockId: ids.root, userId: other, store: ctx.store }),
+				OutlineWriteError,
+			);
+			expect(takeover.code).toBe("OUTLINE_LOCK_HELD");
+			const overWrite = await refusedWith(
+				write(ctx, space, { kind: "human", userId: other }, [
+					{
+						op: "setTask",
+						block: { id: ids.root },
+						task: { lock: { by: { kind: "human", id: other } } },
+					},
+				]),
+				OutlineWriteError,
+			);
+			expect(overWrite.code).toBe("OUTLINE_LOCK_HELD");
+			// Nor unlock it without the right to (a manager of the space, an admin).
+			const denied = await refusedWith(
+				unlockOutlineTask({ blockId: ids.root, userId: other, store: ctx.store }),
+				OutlineWriteError,
+			);
+			expect(denied.code).toBe("OUTLINE_LOCK_DENIED");
+			expect((await ctx.store.getBlock(ids.root))?.taskJson?.lock?.by.id).toBe(p.lockerId);
+			expect((await pendingRow(ctx, second.pending?.id as string)).status).toBe("open");
+			// Someone who may unlock does; what was open is withdrawn; then they lock it themselves.
+			await unlockOutlineTask({
+				blockId: ids.root,
+				userId: other,
+				mayUnlockAnyone: true,
+				store: ctx.store,
+			});
+			expect(await pendingRow(ctx, second.pending?.id as string)).toMatchObject({
+				status: "withdrawn",
+				reason: "unlocked",
+				decidedByJson: { kind: "human", id: other },
+			});
 			await lockOutlineTask({ blockId: ids.root, userId: other, store: ctx.store });
-			expect((await pendingRow(ctx, second.pending?.id as string)).status).toBe("withdrawn");
 			// Deleting the locked task withdraws too.
 			const third = await write(ctx, space, a, [
 				{ op: "update", block: { id: ids.s1 }, content: "z" },
 			]);
 			expect(third.pending?.decider.by).toEqual({ kind: "human", id: other });
-			await write(ctx, space, p.locker, [{ op: "delete", block: { id: ids.root } }]);
+			await write(ctx, space, { kind: "human", userId: other }, [
+				{ op: "delete", block: { id: ids.root } },
+			]);
 			expect(await pendingRow(ctx, third.pending?.id as string)).toMatchObject({
 				status: "withdrawn",
 				reason: "lock-deleted",
@@ -769,7 +830,8 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			expect(mine.size).toBe(1);
 			const rows = await openPending(ctx, ids.root);
 			expect(rows).toHaveLength(2);
-			const row = rows.find((r) => r.requesterSession === p.narrators.a) as OutlinePendingRow;
+			const head = rows.find((r) => r.requesterSession === p.narrators.a) as OutlinePendingHead;
+			const row = await pendingRow(ctx, head.id);
 			expect(
 				pendingOps(row)
 					.map((op) => ("block" in op && "id" in op.block ? op.block.id : ""))
@@ -948,6 +1010,355 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			expect(locked?.pending).toHaveLength(1);
 			const plan = await readBlockView({ blockId: ids.root, view: "all", store: ctx.store });
 			expect(plan?.blocks.find((b) => b.id === ids.root)?.lock?.by.id).toBe(p.lockerId);
+		},
+	},
+	{
+		name: "locked plan: a block becoming a task in the tree adds a step (review B-1): with its checkbox at once or later, under a plain block of the plan or a new one, restored or moved in; splitting a leaf, or under a task not of the plan, is direct",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const taskKids = async (id: string) =>
+				(await ctx.store.listChildMetas(space.id, [id], 100)).filter(
+					(m) => !m.deleted && m.taskJson,
+				).length;
+			const before = await taskKids(ids.root);
+			// A plain block and its checkbox in one call: the new task is held (and what names it).
+			const once = await write(ctx, space, a, [
+				{ op: "insert", tempId: "n", parent: { id: ids.root }, content: "Step three" },
+				{ op: "setTask", block: { tempId: "n" }, task: { status: "todo" } },
+			]);
+			expect(held(once)).toEqual([0, 1]);
+			// A plain block written directly, its checkbox given in a later call: held then.
+			const plain = await write(ctx, space, a, [
+				{ op: "insert", parent: { id: ids.root }, content: "Step four" },
+			]);
+			expect(plain.pending).toBeUndefined();
+			const checkbox = await write(ctx, space, a, [
+				{
+					op: "setTask",
+					block: { id: plain.results[0]?.blockId as string },
+					task: { status: "todo" },
+				},
+			]);
+			expect(held(checkbox)).toEqual([0]);
+			// Under a new plain block: the plain block is written, the task under it held.
+			const phase = await write(ctx, space, a, [
+				{ op: "insert", tempId: "c", parent: { id: ids.root }, content: "Phase 2" },
+				{
+					op: "insert",
+					parent: { tempId: "c" },
+					content: "Deploy to production",
+					task: { status: "todo" },
+				},
+			]);
+			expect(held(phase)).toEqual([1]);
+			// Under a plain block of the plan (the acceptance criteria).
+			const underAcc = await write(ctx, space, a, [
+				{
+					op: "insert",
+					parent: { id: ids.acc },
+					content: "Drop the old format",
+					task: { status: "todo" },
+				},
+			]);
+			expect(held(underAcc)).toEqual([0]);
+			expect(await taskKids(ids.root)).toBe(before);
+			// Only what the changes target waits: the parent of a proposed step does not (decision 20).
+			expect(
+				await findTasksWaitingForConfirmation(
+					[{ id: ids.root, spaceId: space.id, taskJson: null }],
+					{ store: ctx.store },
+				),
+			).toEqual(new Set());
+			// Splitting a leaf of the plan is direct; so is a task under a task not of the plan (one
+			// another person added after the lock).
+			const split = await write(ctx, space, a, [
+				{ op: "insert", parent: { id: ids.s2 }, content: "row batches", task: { status: "todo" } },
+			]);
+			expect(split.pending).toBeUndefined();
+			const other = { kind: "human" as const, userId: await ctx.seedUser() };
+			const side = (
+				await write(ctx, space, other, [
+					{
+						op: "insert",
+						parent: { id: ids.root },
+						content: "Side quest",
+						task: { status: "todo" },
+					},
+				])
+			).results[0]?.blockId as string;
+			const underSide = await write(ctx, space, a, [
+				{ op: "insert", parent: { id: side }, content: "look into it", task: { status: "todo" } },
+			]);
+			expect(underSide.pending).toBeUndefined();
+			// Brought back into the plan by an agent: held.
+			await write(ctx, space, p.locker, [{ op: "delete", block: { id: side } }]);
+			const back = await write(ctx, space, a, [{ op: "restore", block: { id: side } }]);
+			expect(held(back)).toEqual([0]);
+			// A task moved in from outside the tree: held.
+			const outside = (
+				await write(ctx, space, p.locker, [
+					{
+						op: "insert",
+						parent: { id: ids.other },
+						content: "Stray task",
+						task: { status: "todo" },
+					},
+				])
+			).results[0]?.blockId as string;
+			const moved = await write(ctx, space, a, [
+				{ op: "move", block: { id: outside }, parent: { id: ids.root } },
+			]);
+			expect(held(moved)).toEqual([0]);
+			expect(await taskKids(ids.root)).toBe(before);
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "locked plan: an update that changes nothing is not a change (review S-1); taking the checkbox away then setting a field is one task change (merge)",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const same = await write(ctx, space, a, [
+				{ op: "update", block: { id: ids.s1 }, content: "Parse the header" },
+				{ op: "setTask", block: { id: ids.s1 }, task: { status: "doing" } },
+			]);
+			expect(same.pending).toBeUndefined();
+			expect((await ctx.store.getBlock(ids.s1))?.taskJson?.status).toBe("doing");
+			const waits = await deriveOutlineTaskWaits(
+				[{ id: ids.s1, spaceId: space.id, taskJson: null }],
+				{ store: ctx.store },
+			);
+			expect(waits.get(ids.s1)?.confirmation ?? false).toBe(false);
+			// [setTask null] then [setTask {due}] merge into what was meant last: a task with a due date.
+			const first = await write(ctx, space, a, [
+				{ op: "setTask", block: { id: ids.s2 }, task: null },
+			]);
+			await write(ctx, space, a, [
+				{ op: "setTask", block: { id: ids.s2 }, task: { due: "2026-12-01" } },
+			]);
+			const row = await pendingRow(ctx, first.pending?.id as string);
+			expect(pendingOps(row)).toEqual([
+				{ op: "setTask", block: { id: ids.s2 }, task: { due: "2026-12-01" } },
+			]);
+			expect(row.opCount).toBe(1);
+		},
+	},
+	{
+		name: "locks: a revert or a checkbox taken away by someone who may not unlock keeps the lock and its open changes (review S-4); who may, unlocks",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const lockSeq = (await ctx.store.getBlock(ids.root))?.taskJson?.lock?.versionSeq as number;
+			const lockCommit = (
+				await ctx.store.listCommits(space.id, { limit: 1, afterSeq: lockSeq - 1 })
+			)[0];
+			expect(lockCommit?.seq).toBe(lockSeq);
+			const proposal = await write(ctx, space, a, [
+				{ op: "update", block: { id: ids.s1 }, content: "Step one, reworded" },
+			]);
+			const someone = await ctx.seedUser();
+			const reverted = await revertCommit(
+				{
+					commitId: lockCommit?.id as string,
+					actor: { kind: "human", id: someone },
+					responsibleUserId: someone,
+				},
+				{ store: ctx.store },
+			);
+			expect(reverted.notes.map((n) => n.adjustment)).toEqual([
+				{ kind: "lock-kept", blockId: ids.root },
+			]);
+			expect((await ctx.store.getBlock(ids.root))?.taskJson?.lock?.by.id).toBe(p.lockerId);
+			expect((await pendingRow(ctx, proposal.pending?.id as string)).status).toBe("open");
+			// Taking the checkbox away (the live editor's way of removing it) is refused.
+			const box = await refusedWith(
+				write(ctx, space, { kind: "human", userId: someone }, [
+					{ op: "setTask", block: { id: ids.root }, task: null },
+				]),
+				OutlineWriteError,
+			);
+			expect(box.code).toBe("OUTLINE_LOCK_DENIED");
+			const gone = await refusedWith(
+				write(ctx, space, { kind: "human", userId: someone }, [
+					{ op: "delete", block: { id: ids.root } },
+				]),
+				OutlineWriteError,
+			);
+			expect(gone.code).toBe("OUTLINE_LOCK_DENIED");
+			expect((await pendingRow(ctx, proposal.pending?.id as string)).status).toBe("open");
+			// With the right to unlock (a manager of the space, an admin), the revert unlocks.
+			await revertCommit(
+				{
+					commitId: lockCommit?.id as string,
+					actor: { kind: "human", id: someone },
+					responsibleUserId: someone,
+					unlockAuthority: async () => true,
+				},
+				{ store: ctx.store },
+			);
+			expect((await ctx.store.getBlock(ids.root))?.taskJson?.lock).toBeUndefined();
+			expect(await pendingRow(ctx, proposal.pending?.id as string)).toMatchObject({
+				status: "withdrawn",
+				reason: "unlocked",
+			});
+			// An agent restoring a deleted locked task never brings the lock back.
+			await lockOutlineTask({ blockId: ids.root, userId: p.lockerId, store: ctx.store });
+			await write(ctx, space, p.locker, [{ op: "delete", block: { id: ids.root } }]);
+			await write(ctx, space, a, [{ op: "restore", block: { id: ids.root } }]);
+			const restored = await ctx.store.getBlock(ids.root);
+			expect(restored?.deleted).toBe(false);
+			expect(restored?.taskJson?.lock).toBeUndefined();
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "reports: a decision is told on its page however many open changes the session has elsewhere (review S-6)",
+		async run(ctx) {
+			const lockerId = await ctx.seedUser();
+			const locker = { kind: "human" as const, userId: lockerId };
+			const space = await ctx.store.ensureSpace({ kind: "personal", ownerUserId: lockerId }, NOW);
+			const a = { kind: "agent" as const, narratorId: await ctx.seedNarrator() };
+			const ops: OutlineOp[] = [{ op: "insert", tempId: "pa", parent: null, content: "Page A" }];
+			for (let i = 0; i < 41; i++)
+				ops.push({
+					op: "insert",
+					parent: { tempId: "pa" },
+					content: `Plan ${i}`,
+					task: { status: "todo" },
+				});
+			const pageA = await write(ctx, space, locker, ops);
+			for (const r of pageA.results.slice(1)) {
+				await lockOutlineTask({ blockId: r.blockId, userId: lockerId, store: ctx.store });
+				await write(ctx, space, a, [
+					{ op: "update", block: { id: r.blockId }, content: "changed" },
+				]);
+			}
+			const rootB = (
+				await write(ctx, space, locker, [
+					{ op: "insert", parent: null, content: "Plan B", task: { status: "todo" } },
+				])
+			).results[0]?.blockId as string;
+			await lockOutlineTask({ blockId: rootB, userId: lockerId, store: ctx.store });
+			const proposal = await write(ctx, space, a, [
+				{ op: "update", block: { id: rootB }, content: "B changed" },
+			]);
+			await rejectOutlinePending({
+				pendingId: proposal.pending?.id as string,
+				by: { kind: "human", userId: lockerId },
+				reason: "no",
+				store: ctx.store,
+			});
+			const told = await takePendingReports(a.narratorId, { store: ctx.store, pageId: rootB });
+			expect(told.map((r) => r.id)).toEqual([proposal.pending?.id as string]);
+			expect(await takePendingReports(a.narratorId, { store: ctx.store, pageId: rootB })).toEqual(
+				[],
+			);
+		},
+	},
+	{
+		name: "confirm a delete: refused while blocks were added, changed or moved under it since the proposal (review S-9); the diff says how many",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const proposal = await write(ctx, space, a, [{ op: "delete", block: { id: ids.s2 } }]);
+			const other = { kind: "human" as const, userId: await ctx.seedUser() };
+			const added = await write(ctx, space, other, [
+				{ op: "insert", parent: { id: ids.s2 }, content: "Important finding by a teammate" },
+			]);
+			const refused = await refusedWith(
+				confirmOutlinePending({
+					pendingId: proposal.pending?.id as string,
+					by: { kind: "human", userId: p.lockerId },
+					store: ctx.store,
+				}),
+				OutlinePendingError,
+			);
+			expect(refused.pendingCode).toBe("OUTLINE_PENDING_CONFLICT");
+			expect(refused.details.join("\n")).toContain("1 block");
+			expect((await ctx.store.getBlock(added.results[0]?.blockId as string))?.deleted).toBe(false);
+			expect((await pendingRow(ctx, proposal.pending?.id as string)).status).toBe("open");
+			const diff = await readPendingDiff(await pendingRow(ctx, proposal.pending?.id as string), {
+				store: ctx.store,
+			});
+			expect(diff.entries[0]).toMatchObject({ kind: "delete", changedUnder: 1 });
+		},
+	},
+	{
+		name: "locks: past the locks a page lists, a write outside every locked tree goes on, one inside is still held; a locked task moving takes its changes only where they fit",
+		async run(ctx) {
+			const lockerId = await ctx.seedUser();
+			const locker = { kind: "human" as const, userId: lockerId };
+			const space = await ctx.store.ensureSpace({ kind: "personal", ownerUserId: lockerId }, NOW);
+			const a = { kind: "agent" as const, narratorId: await ctx.seedNarrator() };
+			const b = { kind: "agent" as const, narratorId: await ctx.seedNarrator() };
+			const r = await write(ctx, space, locker, [
+				{ op: "insert", tempId: "p", parent: null, content: "Page" },
+				{
+					op: "insert",
+					tempId: "t",
+					parent: { tempId: "p" },
+					content: "Plan",
+					task: { status: "todo" },
+				},
+				{ op: "insert", parent: { tempId: "t" }, content: "Step", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "p" }, content: "A note" },
+				{ op: "insert", tempId: "q", parent: null, content: "Other page" },
+				{ op: "insert", parent: { tempId: "q" }, content: "Plan Q", task: { status: "todo" } },
+			]);
+			const [, plan, step, note, otherPage, planQ] = r.results.map((x) => x.blockId) as string[];
+			await lockOutlineTask({ blockId: plan as string, userId: lockerId, store: ctx.store });
+			await lockOutlineTask({ blockId: planQ as string, userId: lockerId, store: ctx.store });
+			const scan = OUTLINE_LOCK_SCAN.perPage;
+			OUTLINE_LOCK_SCAN.perPage = 0;
+			try {
+				const outside = await write(ctx, space, a, [
+					{ op: "update", block: { id: note as string }, content: "A note, edited" },
+				]);
+				expect(outside.pending).toBeUndefined();
+				expect(outside.commit).not.toBeNull();
+				const inside = await write(ctx, space, a, [
+					{ op: "update", block: { id: step as string }, content: "Step, reworded" },
+				]);
+				expect(held(inside)).toEqual([0]);
+			} finally {
+				OUTLINE_LOCK_SCAN.perPage = scan;
+			}
+			// The other page holds as many open changes as it may: the plan cannot move there.
+			await write(ctx, space, b, [
+				{ op: "update", block: { id: planQ as string }, content: "Plan Q, reworded" },
+			]);
+			const limits = OUTLINE_PENDING_LIMITS as { openPerPage: number };
+			const open = limits.openPerPage;
+			limits.openPerPage = 1;
+			try {
+				const full = await refusedWith(
+					write(ctx, space, locker, [
+						{ op: "move", block: { id: plan as string }, parent: { id: otherPage as string } },
+					]),
+					OutlineWriteError,
+				);
+				expect(full.code).toBe("OUTLINE_PENDING_FULL");
+				// A new change there is refused too; the open one still takes more.
+				const another = await refusedWith(
+					write(ctx, space, a, [
+						{ op: "update", block: { id: planQ as string }, content: "Plan Q, a's way" },
+					]),
+					OutlineWriteError,
+				);
+				expect(another.code).toBe("OUTLINE_PENDING_FULL");
+				const more = await write(ctx, space, b, [
+					{ op: "update", block: { id: planQ as string }, content: "Plan Q, reworded again" },
+				]);
+				expect(more.pending?.merged).toBe(true);
+			} finally {
+				limits.openPerPage = open;
+			}
+			const moved = await write(ctx, space, locker, [
+				{ op: "move", block: { id: plan as string }, parent: { id: otherPage as string } },
+			]);
+			expect(moved.commit).not.toBeNull();
+			expect((await openPending(ctx, otherPage as string)).length).toBe(2);
 		},
 	},
 ];

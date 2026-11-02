@@ -38,6 +38,9 @@ export const OUTLINE_TEXT = {
 	/** A write by no session or person left a task to do instead of in progress. */
 	taskNotStarted:
 		"it would be in progress with nobody doing it (a write by no session), so it was left to do",
+	/** A revert would have taken a lock away its author may not take: the lock stays. */
+	lockKept:
+		"it is locked, and only the person who locked it, a manager of the space or an admin may unlock it: the lock was kept",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
 
@@ -83,8 +86,12 @@ export const OUTLINE_TEXT = {
 	/** An agent's write tried to lock or unlock (only people lock, through the page). */
 	lockDenied:
 		"only people lock or unlock a task (from the outline page); an agent cannot change a lock",
-	tooManyLocks: (max: number) =>
-		`the page has more than ${max} locked tasks; an agent's change to it cannot be checked against them`,
+	/** Locking a task someone else locked. */
+	lockHeld: (address: string) =>
+		`${address} is locked by someone else; it has to be unlocked first (by them, a manager of the space or an admin) before anyone locks it again`,
+	/** Taking a lock away (unlocking, deleting the task, its checkbox) without the right to. */
+	unlockDenied: (address: string) =>
+		`${address} is locked; only the person who locked it, a manager of the space or an admin may unlock it, delete it or take its checkbox away`,
 	severalLockedPlans:
 		"the change touches several locked plans at once; change each plan in a call of its own",
 	pendingTooLarge: (ops: number, bytes: number) =>
@@ -351,9 +358,19 @@ export const OUTLINE_TOOL_TEXT = {
 			`pending ${label}: you proposed deleting ${n === 1 ? "1 block" : `${n} blocks`} here, not confirmed yet`,
 		markOther: (label: string, _decider: string) =>
 			`pending ${label}: a change proposed here waits for confirmation`,
+		markOwnMerged: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, merged over changes made here since you proposed it; not confirmed yet`,
+		markOwnConflict: (label: string, _decider: string, detail: string) =>
+			`pending ${label}: changed since you proposed it, your change no longer applies here (${detail}); shown as it is now`,
 		/** After a read: this session's own open changes on the page. */
-		yours: (label: string, decider: string) =>
-			`${label} is your change to this plan, shown above as you proposed it; it waits for ${decider} to confirm (blocks it adds exist once confirmed)`,
+		yours: (label: string, decider: string, since: "none" | "merged" | "conflict") =>
+			since === "conflict"
+				? `${label} is your change to this plan; blocks it changes were changed since you proposed it and part of it no longer applies (marked above, shown as they are now): it cannot be confirmed as it is. Propose those blocks again from the text as it is now (they merge into ${label}), or reject ${label} to withdraw it. It waits for ${decider}`
+				: since === "merged"
+					? `${label} is your change to this plan, shown above merged over changes made since you proposed it (marked); it waits for ${decider} to confirm (blocks it adds exist once confirmed)`
+					: `${label} is your change to this plan, shown above as you proposed it; it waits for ${decider} to confirm (blocks it adds exist once confirmed)`,
+		/** A change its proposer said nothing about, by its size. */
+		summaryOf: (n: number) => (n === 1 ? "1 change" : `${n} changes`),
 		/** After a read: changes waiting for this session's confirmation. */
 		forYou: (label: string, summary: string, by: string) =>
 			`${label} waits for your confirmation: ${summary} (proposed by ${by}); confirm with OutlineEdit { edits: [{ confirm: "${label}" }] }, or reject with { reject: "${label}", reason }`,

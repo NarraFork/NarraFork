@@ -105,8 +105,8 @@ import {
 	OutlinePendingError,
 	pendingNames,
 	rejectOutlinePending,
+	withCurrentDeciders,
 } from "./pending";
-import { pendingOps } from "./pending-hold";
 import { forgetOutlineReads, recordOutlineReads, seenOutlineVersion } from "./read-ledger";
 import type { OutlineResolvedBlock } from "./resolve";
 import type {
@@ -437,10 +437,14 @@ async function pendingNewBlock(scope: OutlineAgentScope, ref: string): Promise<s
 			space.id,
 			OUTLINE_PENDING_LIMITS.scanPerSpace,
 		);
-		for (const row of rows) {
-			const adds = pendingOps(row).some((op) => op.op === "insert" && op.sid === sid);
-			if (!adds) continue;
+		// Heads only: the blocks a change adds are listed by sid (review S-7).
+		const found = rows.find((row) => row.addsJson.some((add) => add.sid === sid));
+		if (found) {
+			// Who decides is the lock as it is now (review S-8).
+			const [row] = await withCurrentDeciders([found], { store: scope.store });
+			if (!row) continue;
 			const names = await pendingNames([row]);
+			const titles = await scope.readableTitles(names.narrators);
 			const by =
 				row.deciderJson.by.kind === "human"
 					? OUTLINE_TOOL_TEXT.pending.deciderPerson(
@@ -448,10 +452,20 @@ async function pendingNewBlock(scope: OutlineAgentScope, ref: string): Promise<s
 							row.deciderJson.by.id,
 						)
 					: OUTLINE_TOOL_TEXT.pending.deciderSession(
-							names.narrators.get(row.deciderJson.by.id) ?? null,
+							titles.get(row.deciderJson.by.id) ?? null,
 							row.deciderJson.by.id,
 						);
-			return OUTLINE_TOOL_TEXT.edit.pendingNewBlock(bare, outlinePendingLabel(row.id), by);
+			const delegate = row.deciderJson.delegate;
+			return OUTLINE_TOOL_TEXT.edit.pendingNewBlock(
+				bare,
+				outlinePendingLabel(row.id),
+				delegate
+					? OUTLINE_TOOL_TEXT.pending.deciderEither(
+							by,
+							OUTLINE_TOOL_TEXT.pending.deciderSession(titles.get(delegate) ?? null, delegate),
+						)
+					: by,
+			);
 		}
 	}
 	return null;
@@ -484,21 +498,21 @@ async function decideEdits(
 			continue;
 		}
 		const label = outlinePendingLabel(row.id);
+		// Deciding (confirming, rejecting, withdrawing) writes the space: it needs write access
+		// (review B-3).
+		const refusal = await scope.writeRefusal(space);
+		if (refusal) {
+			failures++;
+			lines.push(`${prefix}${refusalText(refusal, await scope.describe(space))}`);
+			continue;
+		}
 		try {
 			if ("confirm" in request) {
-				const refusal = await scope.writeRefusal(space);
-				if (refusal) {
-					failures++;
-					lines.push(`${prefix}${refusalText(refusal, await scope.describe(space))}`);
-					continue;
-				}
 				const done = await confirmOutlinePending({ pendingId: row.id, by });
 				const names = await pendingNames([row]);
+				const titles = await scope.readableTitles(names.narrators);
 				const proposer = row.requesterSession
-					? text.deciderSession(
-							names.narrators.get(row.requesterSession) ?? null,
-							row.requesterSession,
-						)
+					? text.deciderSession(titles.get(row.requesterSession) ?? null, row.requesterSession)
 					: OUTLINE_TOOL_TEXT.edit.someone;
 				lines.push(`${prefix}${text.confirmed(label, done.write.commit?.seq ?? null, proposer)}`);
 				decided.push({ confirm: label, commit: done.write.commit });
@@ -1803,15 +1817,23 @@ async function heldSection(
 			...(decider.delegate ? [decider.delegate] : []),
 		],
 	}).catch(() => null);
+	// Sessions by title only when this one may read them (review S-5).
+	const titles = await scope.readableTitles(names?.narrators ?? new Map());
 	const person =
 		decider.by.kind === "human"
 			? text.deciderPerson(names?.users.get(decider.by.id) ?? null, decider.by.id)
-			: text.deciderSession(names?.narrators.get(decider.by.id) ?? null, decider.by.id);
-	const who = decider.delegate
-		? text.deciderEither(
-				person,
-				text.deciderSession(names?.narrators.get(decider.delegate) ?? null, decider.delegate),
-			)
+			: text.deciderSession(titles.get(decider.by.id) ?? null, decider.by.id);
+	// A change the delegate's own session proposed goes to the locker alone (it never confirms
+	// its own).
+	const session = scope.rootNarratorId ?? scope.narratorId;
+	const delegate =
+		decider.delegate &&
+		((await scope.store.getNarratorRoots([decider.delegate])).get(decider.delegate)?.root ??
+			decider.delegate) !== session
+			? decider.delegate
+			: null;
+	const who = delegate
+		? text.deciderEither(person, text.deciderSession(titles.get(delegate) ?? null, delegate))
 		: person;
 	const ids = [...new Set([pending.rootBlockId, ...pending.blockIds])].slice(0, 50);
 	const rows = new Map((await scope.store.getBlocks(ids)).map((b) => [b.id, b]));

@@ -37,6 +37,7 @@ import {
 	asc,
 	desc,
 	eq,
+	getTableColumns,
 	gt,
 	inArray,
 	isNotNull,
@@ -50,16 +51,17 @@ import {
 } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { newOutlineKey } from "../keys";
-import type {
-	OutlineActorKind,
-	OutlineCommitKind,
-	OutlineLinkKind,
-	OutlinePendingDeciderJson,
-	OutlinePendingKind,
-	OutlinePendingRequesterJson,
-	OutlinePendingStatus,
-	OutlineSpaceKind,
-	OutlineTaskActorRef,
+import {
+	OUTLINE_PENDING_LIMITS,
+	type OutlineActorKind,
+	type OutlineCommitKind,
+	type OutlineLinkKind,
+	type OutlinePendingDeciderJson,
+	type OutlinePendingKind,
+	type OutlinePendingRequesterJson,
+	type OutlinePendingStatus,
+	type OutlineSpaceKind,
+	type OutlineTaskActorRef,
 } from "../model";
 import {
 	chunked,
@@ -78,6 +80,7 @@ import {
 	type OutlineLinkRow,
 	type OutlineLiveUpdateRow,
 	type OutlinePendingDecision,
+	type OutlinePendingHead,
 	OutlinePendingMovedError,
 	type OutlinePendingPlan,
 	type OutlinePendingRow,
@@ -334,7 +337,7 @@ async function applyCommitSection(
 		return "claims";
 	}
 	// Then the pending rows it merges into, decides or withdraws, in id order, before the space
-	// row as well; those it expects must be as read.
+	// row as well (see `lockPending` for the one exception); those it expects must be as read.
 	if (plan.pending && !pendingAsExpected(plan.pending, await lockPending(tx, plan.pending))) {
 		return "pending";
 	}
@@ -466,25 +469,45 @@ async function applyCommitSection(
 
 type PendingSelect = typeof outlinePending.$inferSelect;
 
-function toPending(row: PendingSelect): OutlinePendingRow {
+function toPendingHead(row: Omit<PendingSelect, "opsJson" | "subtreeJson">): OutlinePendingHead {
 	return {
 		...row,
 		kind: row.kind as OutlinePendingKind,
 		status: row.status as OutlinePendingStatus,
-		opsJson: row.opsJson as Array<Record<string, unknown>>,
 		baseJson: row.baseJson as Record<string, number>,
 		blockIdsJson: row.blockIdsJson as string[],
+		addsJson: row.addsJson as OutlinePendingHead["addsJson"],
 		requestedByJson: row.requestedByJson as OutlinePendingRequesterJson,
 		deciderJson: row.deciderJson as OutlinePendingDeciderJson,
 		decidedByJson: (row.decidedByJson as OutlineTaskActorRef | null | undefined) ?? null,
 	};
 }
 
+function toPending(row: PendingSelect): OutlinePendingRow {
+	return {
+		...toPendingHead(row),
+		opsJson: row.opsJson as Array<Record<string, unknown>>,
+		subtreeJson: row.subtreeJson as OutlinePendingRow["subtreeJson"],
+	};
+}
+
+/** Every column but the operations and the deleted subtrees: what lists and summaries read. */
+const pendingHeadColumns = (() => {
+	const { opsJson: _ops, subtreeJson: _subtree, ...columns } = getTableColumns(outlinePending);
+	return columns;
+})();
+
 /**
  * Lock the pending rows a plan touches, in id order (the order every writer takes them, before
  * the space row): the rows it expects, and the open rows of the lock roots it withdraws or moves
- * to another page. Returns
- * the status and revision of the rows it expects.
+ * to another page (bounded: a page holds at most `openPerPage` open rows). Returns the status and
+ * revision of the rows it expects.
+ *
+ * Not strictly every row: an open row put on such a root after this select (by a write that took
+ * the space row first) is locked by the withdraw or repage `UPDATE`, after the space row. Such a
+ * writer has committed by then (it held the space row this commit waited for), so the order only
+ * reverses against a row nobody holds; a deadlock it might still cause is retried (`40P01`,
+ * `withPgRetry`) like any other.
  */
 async function lockPending(
 	tx: PgTransaction,
@@ -500,7 +523,8 @@ async function lockPending(
 		const open = await tx
 			.select({ id: outlinePending.id })
 			.from(outlinePending)
-			.where(and(inArray(outlinePending.rootBlockId, chunkOfRoots), sql`"status" = 'open'`));
+			.where(and(inArray(outlinePending.rootBlockId, chunkOfRoots), sql`"status" = 'open'`))
+			.limit(OUTLINE_PENDING_LIMITS.openPerPage * chunkOfRoots.length);
 		for (const row of open) ids.add(row.id);
 	}
 	const found = new Map<string, { status: string; rev: number }>();
@@ -1074,22 +1098,34 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 
 		async listOpenPendingByPage(pageId, limit) {
 			const rows = await db
-				.select()
+				.select(pendingHeadColumns)
 				.from(outlinePending)
 				.where(and(eq(outlinePending.pageId, pageId), sql`"status" = 'open'`))
 				.orderBy(asc(outlinePending.createdAt), sql`${outlinePending.id} COLLATE "C"`)
 				.limit(limit);
-			return rows.map(toPending);
+			return rows.map(toPendingHead);
+		},
+
+		async countOpenPendingByPage(pageId, limit) {
+			const rows = await db.execute(sql`
+				SELECT count(*)::int AS n FROM (
+					SELECT 1 FROM outline_pending
+					WHERE page_id = CAST(${pageId} AS text) AND "status" = 'open'
+					LIMIT CAST(${limit} AS integer)
+				) AS open_rows
+			`);
+			const first = (rows as unknown as Array<{ n: number | string }>)[0];
+			return Number(first?.n ?? 0);
 		},
 
 		async listOpenPendingBySpace(spaceId, limit) {
 			const rows = await db
-				.select()
+				.select(pendingHeadColumns)
 				.from(outlinePending)
 				.where(and(eq(outlinePending.spaceId, spaceId), sql`"status" = 'open'`))
 				.orderBy(asc(outlinePending.createdAt), sql`${outlinePending.id} COLLATE "C"`)
 				.limit(limit);
-			return rows.map(toPending);
+			return rows.map(toPendingHead);
 		},
 
 		async findOpenPending(requesterSession, rootBlockId) {
@@ -1107,16 +1143,21 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return rows[0] ? toPending(rows[0]) : null;
 		},
 
-		async listUnreportedPending(requesterSession, limit) {
+		async listUnreportedPending(requesterSession, pageId, limit) {
+			// The predicate is the unreported index's own.
 			const rows = await db
-				.select()
+				.select(pendingHeadColumns)
 				.from(outlinePending)
 				.where(
-					and(eq(outlinePending.requesterSession, requesterSession), sql`"reported_at" IS NULL`),
+					and(
+						eq(outlinePending.requesterSession, requesterSession),
+						eq(outlinePending.pageId, pageId),
+						sql`"reported_at" IS NULL AND "status" <> 'open'`,
+					),
 				)
 				.orderBy(asc(outlinePending.createdAt), sql`${outlinePending.id} COLLATE "C"`)
 				.limit(limit);
-			return rows.map(toPending);
+			return rows.map(toPendingHead);
 		},
 
 		async markPendingReported(ids, at) {

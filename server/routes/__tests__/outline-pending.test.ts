@@ -8,7 +8,10 @@
  *  - a page's pending summary and a change's diff need read access (404 otherwise, as for a
  *    change that does not exist); the locker decides (`canDecide`), others are 403;
  *  - a confirmation that no longer applies is 409 with what failed; a block view carries locks
- *    with `canUnlock` for the caller.
+ *    with `canUnlock` for the caller;
+ *  - review round 1: no lock takeover (409 until unlocked), deciding needs write access, session
+ *    titles only for people who may read the session, a revert keeps a lock its author may not
+ *    take away.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
  */
@@ -20,6 +23,7 @@ import type {
 	OutlinePendingDecisionResponse,
 	OutlinePendingDetailResponse,
 } from "@shared/outline-api";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
 import { aclGrants, narrators, projects, users } from "../../db/schema";
@@ -363,5 +367,135 @@ describe("pending changes", () => {
 		expect(conflict.body.code).toBe("OUTLINE_PENDING_CONFLICT");
 		expect(conflict.body.details.length).toBeGreaterThan(0);
 		expect((await outlineStore.getPending([second.pending?.id as string]))[0]?.status).toBe("open");
+	});
+});
+
+describe("review round 1", () => {
+	test("a task someone else locked is 409 to lock again (no takeover); unlocking comes first, by who may (B-2)", async () => {
+		const p = await plan();
+		const lockPath = `/spaces/${space.id}/blocks/${p.root}/lock`;
+		expect((await call(alice, lockPath, "POST", {})).status).toBe(200);
+		const proposed = await propose([{ op: "update", block: { id: p.one }, content: "x" }]);
+		for (const who of [writer, manager, admin]) {
+			const takeover = await call<{ code: string; message: string }>(who, lockPath, "POST", {});
+			expect(takeover.status).toBe(409);
+			expect(takeover.body.code).toBe("OUTLINE_LOCK_HELD");
+			expect(takeover.body.message).toContain("unlocked first");
+		}
+		expect((await outlineStore.getBlock(p.root))?.taskJson?.lock?.by.id).toBe(alice.id);
+		expect((await outlineStore.getPending([proposed.pending?.id as string]))[0]?.status).toBe(
+			"open",
+		);
+		// The locker locking again only names another delegate: the change stays open.
+		expect((await call(alice, lockPath, "POST", { delegate })).status).toBe(200);
+		expect((await outlineStore.getPending([proposed.pending?.id as string]))[0]?.status).toBe(
+			"open",
+		);
+		// A writer may not unlock; a manager does, and may then lock it themselves.
+		expect((await call(writer, lockPath, "DELETE")).status).toBe(403);
+		expect((await call(manager, lockPath, "DELETE")).status).toBe(200);
+		expect((await call(manager, lockPath, "POST", {})).status).toBe(200);
+		expect((await outlineStore.getBlock(p.root))?.taskJson?.lock?.by.id).toBe(manager.id);
+	});
+
+	test("confirming and rejecting need write access to the space (B-3)", async () => {
+		const p = await plan();
+		const locker = await user("locker");
+		const [row] = await db
+			.insert(aclGrants)
+			.values({
+				id: generateId(),
+				scopeType: "project",
+				scopeId: projectId,
+				principalType: "user",
+				principalId: locker.id,
+				capability: "write",
+				createdAt: NOW,
+			})
+			.returning();
+		expect(
+			(await call(locker, `/spaces/${space.id}/blocks/${p.root}/lock`, "POST", {})).status,
+		).toBe(200);
+		const proposed = await propose([
+			{ op: "update", block: { id: p.one }, content: "by the agent" },
+		]);
+		const id = proposed.pending?.id as string;
+		const pagePath = `/spaces/${space.id}/pages/${p.root}/pending`;
+		expect(
+			(await call<OutlinePagePendingResponse>(locker, pagePath)).body.pending[0]?.canDecide,
+		).toBe(true);
+		// The locker can only read the project now.
+		await db
+			.update(aclGrants)
+			.set({ capability: "read" })
+			.where(eq(aclGrants.id, row?.id as string));
+		expect(
+			(await call<OutlinePagePendingResponse>(locker, pagePath)).body.pending[0]?.canDecide,
+		).toBe(false);
+		expect((await call(locker, `/pending/${id}/confirm`, "POST")).status).toBe(403);
+		expect((await call(locker, `/pending/${id}/reject`, "POST", { reason: "no" })).status).toBe(
+			403,
+		);
+		expect((await outlineStore.getBlock(p.one))?.content).toBe("Step one");
+		expect((await outlineStore.getPending([id]))[0]?.status).toBe("open");
+	});
+
+	test("session titles reach only people who may read the session (S-5)", async () => {
+		const p = await plan();
+		const secret = await session(alice.id, {
+			contextProjectId: null,
+			title: "Secret: layoffs plan",
+		});
+		const lockPath = `/spaces/${space.id}/blocks/${p.root}/lock`;
+		const locked = await call<OutlineLockResponse>(alice, lockPath, "POST", { delegate: secret });
+		// Alice owns it: she sees its title.
+		expect(locked.body.lock?.delegate).toEqual({
+			narratorId: secret,
+			title: "Secret: layoffs plan",
+		});
+		await propose([{ op: "update", block: { id: p.one }, content: "x" }]);
+		const summary = await call<OutlinePagePendingResponse>(
+			reader,
+			`/spaces/${space.id}/pages/${p.root}/pending`,
+		);
+		const view = await call<OutlineBlockViewResponse>(
+			reader,
+			`/spaces/${space.id}/blocks/${p.root}?view=all`,
+		);
+		expect(summary.body.pending[0]?.decider.delegate).toEqual({ narratorId: secret, title: null });
+		expect(summary.body.locks[0]?.delegate).toEqual({ narratorId: secret, title: null });
+		expect(view.body.blocks[0]?.lock?.delegate).toEqual({ narratorId: secret, title: null });
+		expect(JSON.stringify(summary.body)).not.toContain("layoffs");
+		expect(JSON.stringify(view.body)).not.toContain("layoffs");
+		// The proposing session is Alice's private one: named to her, not to the reader.
+		expect(summary.body.pending[0]?.proposer).toEqual({ narratorId: agent, title: null });
+		const asAlice = await call<OutlinePagePendingResponse>(
+			alice,
+			`/spaces/${space.id}/pages/${p.root}/pending`,
+		);
+		expect(asAlice.body.pending[0]?.proposer.title).toBe("session");
+		expect(asAlice.body.pending[0]?.decider.delegate?.title).toBe("Secret: layoffs plan");
+		// And the change says how big it is without its operations being read.
+		expect(summary.body.pending[0]?.ops).toBe(1);
+	});
+
+	test("reverting the lock commit keeps the lock for a writer who may not unlock; a manager's revert unlocks (S-4)", async () => {
+		const p = await plan();
+		const lockPath = `/spaces/${space.id}/blocks/${p.root}/lock`;
+		const locked = await call<OutlineLockResponse>(alice, lockPath, "POST", {});
+		const commitId = locked.body.commit?.id as string;
+		const proposed = await propose([{ op: "update", block: { id: p.one }, content: "x" }]);
+		const kept = await call<{ adjusted: number }>(writer, `/commits/${commitId}/revert`, "POST");
+		expect(kept.status).toBe(200);
+		expect(kept.body.adjusted).toBe(1);
+		expect((await outlineStore.getBlock(p.root))?.taskJson?.lock?.by.id).toBe(alice.id);
+		expect((await outlineStore.getPending([proposed.pending?.id as string]))[0]?.status).toBe(
+			"open",
+		);
+		expect((await call(manager, `/commits/${commitId}/revert`, "POST")).status).toBe(200);
+		expect((await outlineStore.getBlock(p.root))?.taskJson?.lock).toBeUndefined();
+		expect((await outlineStore.getPending([proposed.pending?.id as string]))[0]?.status).toBe(
+			"withdrawn",
+		);
 	});
 });
