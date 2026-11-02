@@ -835,6 +835,37 @@ function maskApiKey(key?: string): string {
 	return maskSecret(key);
 }
 
+/**
+ * 平台实例的 config 里只有 apiKey 是密钥。回填规则与 API key 类供应商一致：
+ * GET 只给脱敏值，前端改配置时把脱敏值原样带回来。
+ */
+function maskPlatformInstances(
+	instances: NarraForkSettings["agent"]["platformInstances"],
+): NarraForkSettings["agent"]["platformInstances"] {
+	return instances?.map((instance) => {
+		const apiKey = instance.config?.apiKey;
+		return typeof apiKey === "string" && apiKey
+			? { ...instance, config: { ...instance.config, apiKey: maskApiKey(apiKey) } }
+			: instance;
+	});
+}
+
+/** 脱敏值不能落库：按实例 id 取回原 key；新实例带脱敏值时置空，与其它供应商一致。 */
+function restorePlatformInstanceSecrets(
+	instances: NonNullable<NarraForkSettings["agent"]["platformInstances"]>,
+	current: NarraForkSettings["agent"]["platformInstances"],
+): void {
+	for (const instance of instances) {
+		const apiKey = instance.config?.apiKey;
+		if (typeof apiKey !== "string" || !apiKey.startsWith("*")) continue;
+		const existing = current?.find((entry) => entry.id === instance.id)?.config?.apiKey;
+		instance.config = {
+			...instance.config,
+			apiKey: typeof existing === "string" ? existing : "",
+		};
+	}
+}
+
 function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["vnet"] {
 	if (!vnet) return undefined;
 	return {
@@ -978,6 +1009,11 @@ async function buildSettingsResponse(
 				: undefined,
 		},
 		auth: maskAuthSettings(source.auth),
+		// 平台实例的 key 与 API key 类供应商同样只回传脱敏值。
+		agent: {
+			...safeSource.agent,
+			platformInstances: maskPlatformInstances(safeSource.agent?.platformInstances),
+		},
 		// Multi-provider — mask all keys
 		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
 			...p,
@@ -1584,6 +1620,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// Preserve real VNet relay token when the client sends a masked display value.
 		if (validated.vnet?.relayToken?.startsWith("*")) {
 			validated.vnet.relayToken = current.vnet?.relayToken;
+		}
+
+		// 平台实例的 apiKey 同理：回到设置页看到的是脱敏值，保存时不能把它当新 key。
+		if (validated.agent?.platformInstances) {
+			restorePlatformInstanceSecrets(
+				validated.agent.platformInstances,
+				current.agent?.platformInstances,
+			);
 		}
 
 		// A newly chosen default project directory must already exist: nothing creates it,
