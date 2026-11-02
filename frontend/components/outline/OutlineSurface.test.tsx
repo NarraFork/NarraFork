@@ -48,6 +48,10 @@ mock.module("../../hooks/useOutline", () => ({
 	useOutlineBlockHistory: () => ({ ...idle, hasNextPage: false }),
 	useOutlineTimeline: () => ({ ...idle, hasNextPage: false }),
 	useRevertOutlineCommit: () => ({ mutate: () => {}, isPending: false }),
+	useOutlinePagePending: () => idle,
+	useOutlinePendingDetail: () => idle,
+	useDecideOutlinePending: () => ({ mutate: () => {}, isPending: false }),
+	useOutlineLock: () => ({ mutate: () => {}, isPending: false }),
 }));
 
 const { OutlineSurface } = await import("./OutlineSurface");

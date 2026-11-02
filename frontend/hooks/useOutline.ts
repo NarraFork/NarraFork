@@ -40,6 +40,9 @@ export const outlineKeys = {
 	backlinks: (spaceId: string, blockId: string) =>
 		["outline", "backlinks", spaceId, blockId] as const,
 	search: (q: string, spaceId: string | null) => ["outline", "search", q, spaceId] as const,
+	pagePending: (spaceId: string, pageId: string) =>
+		["outline", "pending", spaceId, pageId] as const,
+	pending: (pendingId: string) => ["outline", "pending-detail", pendingId] as const,
 };
 
 export function useOutlineSpaces(enabled: boolean) {
@@ -282,9 +285,55 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 		// Views as of a commit never change.
 		predicate: (query) => query.queryKey[4] === null,
 	});
-	for (const kind of ["timeline", "history", "backlinks", "pages", "space"]) {
+	for (const kind of ["timeline", "history", "backlinks", "pages", "space", "pending"]) {
 		void queryClient.invalidateQueries({ queryKey: ["outline", kind, spaceId] });
 	}
+	void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
+}
+
+/** What waits for confirmation on a page, and its locked tasks (design §2.2, §2.6). */
+export function useOutlinePagePending(spaceId: string, pageId: string | undefined, enabled = true) {
+	return useQuery({
+		queryKey: outlineKeys.pagePending(spaceId, pageId ?? ""),
+		queryFn: () => api.getOutlinePagePending(spaceId, pageId as string),
+		enabled: enabled && !!pageId,
+		retry: false,
+		staleTime: 5_000,
+	});
+}
+
+/** One pending change block by block. */
+export function useOutlinePendingDetail(pendingId: string | null) {
+	return useQuery({
+		queryKey: outlineKeys.pending(pendingId ?? ""),
+		queryFn: () => api.getOutlinePending(pendingId as string),
+		enabled: !!pendingId,
+		retry: false,
+	});
+}
+
+/** Confirm or reject a pending change; the page's summaries and views re-read after. */
+export function useDecideOutlinePending(spaceId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (input: { pendingId: string; decision: "confirm" | "reject"; reason?: string }) =>
+			input.decision === "confirm"
+				? api.confirmOutlinePending(input.pendingId)
+				: api.rejectOutlinePending(input.pendingId, input.reason?.trim() || null),
+		onSettled: () => invalidateOutlineSpace(queryClient, spaceId),
+	});
+}
+
+/** Lock (with an optional delegate session) or unlock a task's tree. */
+export function useOutlineLock(spaceId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (input: { blockId: string; lock: boolean; delegate?: string | null }) =>
+			input.lock
+				? api.lockOutlineBlock(spaceId, input.blockId, input.delegate ?? null)
+				: api.unlockOutlineBlock(spaceId, input.blockId),
+		onSettled: () => invalidateOutlineSpace(queryClient, spaceId),
+	});
 }
 
 export function useRevertOutlineCommit(spaceId: string) {
@@ -327,6 +376,10 @@ export function useOutlinePageLive(
 				}
 			} else if (hint.kind === "denied") {
 				invalidateOutlineSpace(queryClient, spaceId);
+			} else if (hint.kind === "pending") {
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.pagePending(spaceId, pageId) });
+				void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
+				void queryClient.invalidateQueries({ queryKey: outlineKeys.blocks(spaceId) });
 			}
 		});
 	}, [spaceId, pageId, queryClient]);

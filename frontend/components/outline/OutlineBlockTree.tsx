@@ -1,4 +1,4 @@
-import { ActionIcon, Badge, Box, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Badge, Box, Popover, Stack, Text, Tooltip } from "@mantine/core";
 import type {
 	OutlineBlockViewResponse,
 	OutlineTaskStatus,
@@ -7,6 +7,7 @@ import type {
 import {
 	IconChevronDown,
 	IconChevronRight,
+	IconLock,
 	IconSquare,
 	IconSquareCheck,
 	IconSquareHalf,
@@ -104,6 +105,8 @@ const OutlineRow = memo(function OutlineRow({
 					block.task?.assignee ||
 					block.task?.due ||
 					(factsView && block.openTasks > 0) ||
+					block.lock ||
+					block.pending.length > 0 ||
 					block.hidden > 0) && (
 					<div className={classes.meta}>
 						{block.task?.assignee && (
@@ -127,11 +130,37 @@ const OutlineRow = memo(function OutlineRow({
 							</Badge>
 						))}
 						{factsView && block.openTasks > 0 && (
-							<Tooltip label={t("page.inProgressHint")} openDelay={300}>
-								<Badge size="xs" variant="dot" color="yellow" tt="none">
-									{t("page.inProgress", { count: block.openTasks })}
-								</Badge>
-							</Tooltip>
+							<InProgressMarker block={block} spaceId={spaceId} search={search} />
+						)}
+						{block.lock && (
+							<Badge
+								size="xs"
+								variant="light"
+								color="indigo"
+								tt="none"
+								leftSection={<IconLock size={10} />}
+								data-testid="outline-lock-badge"
+							>
+								{t("lock.badge", {
+									name:
+										block.lock.by.kind === "human"
+											? (block.lock.by.name ?? t("lock.someone"))
+											: block.lock.by.name
+												? t("lock.session", { title: block.lock.by.name })
+												: t("lock.untitledSession"),
+								})}
+							</Badge>
+						)}
+						{block.pending.length > 0 && (
+							<Badge
+								size="xs"
+								variant="light"
+								color="orange"
+								tt="none"
+								data-testid="outline-pending-badge"
+							>
+								{t("pending.badge")}
+							</Badge>
 						)}
 						{block.hidden > 0 &&
 							!collapsed &&
@@ -142,6 +171,71 @@ const OutlineRow = memo(function OutlineRow({
 		</div>
 	);
 });
+
+/**
+ * The "in progress" marker of a fact (design §3.1): the open tasks under it; opening it lists them
+ * (title, state, who, whether a change to it waits for confirmation), each focusable.
+ */
+function InProgressMarker({
+	block,
+	spaceId,
+	search,
+}: {
+	block: OutlineViewBlock;
+	spaceId: string;
+	search: OutlineBlockSearch;
+}) {
+	const { t } = useTranslation("outline");
+	return (
+		<Popover position="bottom-start" withinPortal shadow="sm" width={300}>
+			<Popover.Target>
+				<Badge
+					size="xs"
+					variant="dot"
+					color="yellow"
+					tt="none"
+					component="button"
+					style={{ cursor: "pointer" }}
+					aria-label={t("page.inProgressHint")}
+					data-testid="outline-in-progress"
+				>
+					{t("page.inProgress", { count: block.openTasks })}
+				</Badge>
+			</Popover.Target>
+			<Popover.Dropdown p={4}>
+				<Text size="xs" c="dimmed" px={6} pb={2}>
+					{t("page.inProgressHint")}
+				</Text>
+				<Stack gap={0}>
+					{block.inProgress.map((item) => (
+						<OutlineLink
+							key={item.id}
+							to={outlineBlockTarget(spaceId, item.id, search.view, search.asOf)}
+							className={classes.listItem}
+						>
+							<Box style={{ display: "flex", gap: 6, alignItems: "center", minWidth: 0 }}>
+								<OutlineTaskIcon status={item.status} />
+								<Text size="sm" className={classes.ellipsis}>
+									{item.title || item.sid}
+								</Text>
+							</Box>
+							{(item.assignee || item.waiting) && (
+								<Text size="xs" c="dimmed" className={classes.ellipsis}>
+									{[
+										item.assignee ? `@${item.assignee}` : null,
+										item.waiting ? t("page.waitingConfirmation") : null,
+									]
+										.filter(Boolean)
+										.join(" · ")}
+								</Text>
+							)}
+						</OutlineLink>
+					))}
+				</Stack>
+			</Popover.Dropdown>
+		</Popover>
+	);
+}
 
 export interface OutlineBlockTreeProps {
 	view: OutlineBlockViewResponse;
