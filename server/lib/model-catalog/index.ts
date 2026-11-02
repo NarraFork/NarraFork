@@ -182,6 +182,15 @@ export function queryForModel(
 								? { reasoning_effort_levels: info.effortLevels, reasoning_mode: "levels" }
 								: {}),
 						};
+			// The gateway's per-model tier list — including `[]`, which asserts "no thinking
+			// tiers" — is an authority claim the frontend menu already acts on. A complete
+			// card may omit the reasoning keys (or mark them unknown), so fill them here when
+			// the card is silent, never over it. Without this, the same gateway model could
+			// offer no menu and still receive an effort the upstream rejects.
+			if (info.effortLevels !== undefined && discovered.reasoning_effort_levels == null) {
+				discovered.reasoning_effort_levels = info.effortLevels;
+				if (discovered.reasoning_mode == null) discovered.reasoning_mode = "levels";
+			}
 			return { query, discovered };
 		} catch {
 			/* Old gateway without cache: keep opaque upstream identity. */
