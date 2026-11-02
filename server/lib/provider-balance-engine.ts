@@ -2,8 +2,12 @@ import type { ProviderBalanceAdapter, ProviderBalanceData } from "@shared/provid
 import type { outboundFetch } from "./net/outbound-fetch";
 import {
 	type BalanceProbeResult,
+	hasSiteQuotaConfig,
+	NEW_API_USER_ADAPTER,
 	probeProviderBalance,
+	probeSiteQuota,
 	refreshProviderBalance,
+	refreshSiteQuota,
 } from "./provider-balance-adapters";
 import { createBalanceRequest } from "./provider-balance-transport";
 import type { CustomApiProviderConfig } from "./settings";
@@ -40,15 +44,22 @@ export interface ProviderBalanceQueryEngine {
 /**
  * The historical in-process implementation: host transport (`outboundFetch`, proxy,
  * TLS flags, header filtering) plus the bundled sub2api/new-api adapters.
+ *
+ * A provider whose site-account credentials are configured takes the `/api/user/self` route
+ * instead. That route is authoritative — it is the only one that answers with the account's
+ * credit — so its failures propagate rather than falling back to the inference-key endpoints,
+ * which would answer a different question.
  */
 export const builtinProviderBalanceEngine: ProviderBalanceQueryEngine = {
 	id: "builtin",
 	probe({ config, signal, requestTimeoutMs, fetch }) {
 		const request = createBalanceRequest(config, signal, { fetch, requestTimeoutMs });
+		if (hasSiteQuotaConfig(config)) return probeSiteQuota(config, request);
 		return probeProviderBalance(config.baseUrl, request);
 	},
 	refresh({ config, signal, requestTimeoutMs, fetch, adapter, root }) {
 		const request = createBalanceRequest(config, signal, { fetch, requestTimeoutMs });
+		if (adapter === NEW_API_USER_ADAPTER) return refreshSiteQuota(config, root, request);
 		return refreshProviderBalance(adapter, root, request);
 	},
 };

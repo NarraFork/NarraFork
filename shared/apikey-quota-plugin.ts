@@ -40,12 +40,28 @@ export const apikeyQuotaToolOutputSchema = z.discriminatedUnion("status", [
 		.object({
 			status: z.literal("ok"),
 			balance: balanceDataSchema,
-			adapter: z.enum(["sub2api", "new-api"]).optional(),
+			adapter: z.enum(["sub2api", "new-api", "new-api-user"]).optional(),
 			root: z.string().max(2048).optional(),
 		})
 		.strict(),
 	z.object({ status: z.literal("unsupported") }).strict(),
-	z.object({ status: z.literal("failed"), kind: z.enum(["unsupported", "transient"]) }).strict(),
+	z
+		.object({
+			status: z.literal("failed"),
+			/**
+			 * `unsupported`/`transient` keep their original meaning. `auth`,
+			 * `invalid_response` and `invalid_configuration` are deterministic: the host must
+			 * surface them immediately and drop the cached allowance instead of retrying.
+			 */
+			kind: z.enum([
+				"unsupported",
+				"transient",
+				"auth",
+				"invalid_response",
+				"invalid_configuration",
+			]),
+		})
+		.strict(),
 ]);
 
 export type ApikeyQuotaToolOutput = z.infer<typeof apikeyQuotaToolOutputSchema>;
@@ -66,8 +82,16 @@ export const apikeyQuotaToolInputSchema = z
 		 * answered by the fallback.
 		 */
 		timeoutMs: z.number().min(0).max(2_147_483_647).optional(),
-		adapter: z.enum(["sub2api", "new-api"]).optional(),
+		adapter: z.enum(["sub2api", "new-api", "new-api-user"]).optional(),
 		root: z.string().max(2048).optional(),
+		/**
+		 * Site-account credit credentials. Sent per call like `apiKey` and never persisted by
+		 * the plugin. When any of them is present the site query (`/api/user/self`) is
+		 * authoritative, and `siteUrl` overrides the root derived from `baseUrl`.
+		 */
+		siteUrl: z.string().max(2048).optional(),
+		accessToken: z.string().max(4096).optional(),
+		userId: z.string().max(128).optional(),
 	})
 	.strict();
 

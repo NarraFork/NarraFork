@@ -179,17 +179,60 @@ describe("apikey-quota builtin engine", () => {
 		expect(state.fallbackCalls).toEqual(["probe"]);
 	});
 
-	test("a disabled plugin falls back without surfacing an error", async () => {
+	test("a disabled plugin is a deterministic failure, not a fallback", async () => {
+		const { state, engine } = setup(okProbe, {
+			activateThrows: Object.assign(new Error("Plugin must be enabled"), {
+				code: "PLUGIN_NOT_ENABLED",
+			}),
+		});
+
+		const error = await engine
+			.probe({ config: config(), signal: signal() })
+			.catch((thrown) => thrown);
+
+		expect(error).toBeInstanceOf(BalanceProbeRequestError);
+		expect(error.kind).toBe("plugin_disabled");
+		// The plugin owns the capability: answering from the bundled adapters would keep
+		// serving quota queries the administrator switched off.
+		expect(state.fallbackCalls).toEqual([]);
+		expect(state.invocations).toEqual([]);
+	});
+
+	test("a plugin disabled between activation and the call is recognised too", async () => {
 		const { state, engine } = setup(okProbe, {
 			invokeThrows: Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" }),
 		});
 
-		const found = await engine.probe({ config: config(), signal: signal() });
-		expect(found?.adapter).toBe("new-api");
-		expect(state.fallbackCalls).toEqual(["probe"]);
+		const error = await engine
+			.probe({ config: config(), signal: signal() })
+			.catch((thrown) => thrown);
+
+		expect(error.kind).toBe("plugin_disabled");
+		expect(state.invocations).toHaveLength(1);
+		expect(state.fallbackCalls).toEqual([]);
 	});
 
-	test("a failed activation falls back", async () => {
+	test("refresh reports a disabled plugin the same way", async () => {
+		const { state, engine } = setup(okRefresh, {
+			activateThrows: Object.assign(new Error("Plugin must be enabled"), {
+				code: "PLUGIN_NOT_ENABLED",
+			}),
+		});
+
+		const error = await engine
+			.refresh({
+				config: config(),
+				signal: signal(),
+				adapter: "sub2api",
+				root: "https://relay.example.com",
+			})
+			.catch((thrown) => thrown);
+
+		expect(error.kind).toBe("plugin_disabled");
+		expect(state.fallbackCalls).toEqual([]);
+	});
+
+	test("an enabled plugin that fails for another reason still falls back", async () => {
 		const { state, engine } = setup(okProbe, { activateThrows: new Error("activation failed") });
 
 		await engine.probe({ config: config(), signal: signal() });

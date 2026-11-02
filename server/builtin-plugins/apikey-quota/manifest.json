@@ -47,8 +47,12 @@
 						"userAgent": { "type": "string", "maxLength": 512 },
 						"proxy": { "type": ["string", "null"], "maxLength": 2048 },
 						"tlsRejectUnauthorized": { "type": "boolean" },
-						"adapter": { "enum": ["sub2api", "new-api"] },
-						"root": { "type": "string", "maxLength": 2048 }
+						"timeoutMs": { "type": "number" },
+						"adapter": { "enum": ["sub2api", "new-api", "new-api-user"] },
+						"root": { "type": "string", "maxLength": 2048 },
+						"siteUrl": { "type": "string", "maxLength": 2048 },
+						"accessToken": { "type": "string", "maxLength": 4096 },
+						"userId": { "type": "string", "maxLength": 128 }
 					},
 					"required": ["mode", "baseUrl", "apiKey"],
 					"additionalProperties": false

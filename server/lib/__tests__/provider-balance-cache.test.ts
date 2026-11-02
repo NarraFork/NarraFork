@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
+import { BalanceProbeRequestError } from "../provider-balance-adapters";
 import { isProviderBalanceCandidate, ProviderBalanceCache } from "../provider-balance-cache";
 import type { CustomApiProviderConfig } from "../settings";
 
@@ -345,5 +346,241 @@ describe("provider balance discovery lifecycle", () => {
 		const result = await cache.request("relay-test");
 		expect(result).toMatchObject({ status: "error", error: "request_failed" });
 		expect(fetch.mock.calls.length).toBeLessThanOrEqual(2);
+	});
+});
+
+describe("site-account credit failures", () => {
+	// The base URL keeps /v1 (Codex-style preset), so the site root must be separate.
+	const siteProvider = (): CustomApiProviderConfig => ({
+		...provider(),
+		baseUrl: "https://relay.example/v1",
+		quotaSiteUrl: "https://relay.example",
+		quotaAccessToken: "site-token",
+		quotaUserId: "42",
+	});
+	const siteBody = {
+		success: true,
+		data: { quota: 5_000_000, used_quota: 1_000_000, group: "vip" },
+	};
+
+	function siteFixture() {
+		let providers = [siteProvider()];
+		let now = 100_000;
+		let respond: (url: string) => Promise<Response> = async () => Response.json(siteBody);
+		const fetch = mock(async (input: RequestInfo | URL) => respond(String(input)));
+		const persistence = {
+			restore: mock(() => undefined as never),
+			save: mock(() => {}),
+			remove: mock(() => {}),
+			flush: mock(async () => {}),
+		};
+		const cache = new ProviderBalanceCache({
+			providers: () => providers,
+			globalProxy: () => undefined,
+			fetch,
+			now: () => now,
+			persistence,
+		});
+		return {
+			cache,
+			fetch,
+			persistence,
+			advance: (delta: number) => {
+				now += delta;
+			},
+			respond: (value: typeof respond) => {
+				respond = value;
+			},
+			setProviders: (value: CustomApiProviderConfig[]) => {
+				providers = value;
+			},
+		};
+	}
+
+	test("probes /api/user/self on the site root and reports USD credit", async () => {
+		const f = siteFixture();
+		const requested: string[] = [];
+		f.respond(async (url) => {
+			requested.push(url);
+			return Response.json(siteBody);
+		});
+		const snapshot = await f.cache.request("relay-test");
+		expect(requested).toEqual(["https://relay.example/api/user/self"]);
+		expect(snapshot).toMatchObject({ status: "supported", adapter: "new-api-user" });
+		expect(snapshot?.balance).toMatchObject({
+			scope: "wallet",
+			planName: "vip",
+			amounts: [{ unit: "USD", remaining: 10, used: 2, total: 12 }],
+		});
+	});
+
+	test("a transient failure keeps the last good value inside the 10 minute window", async () => {
+		const f = siteFixture();
+		const fresh = await f.cache.request("relay-test");
+		f.advance(60_000);
+		f.respond(async () => new Response(null, { status: 503 }));
+		const failed = await f.cache.request("relay-test", "refresh");
+		expect(failed).toMatchObject({
+			status: "supported",
+			error: "request_failed",
+			balance: fresh?.balance,
+			fetchedAt: fresh?.fetchedAt,
+		});
+	});
+
+	test("the last good value is withdrawn once the window closes", async () => {
+		const f = siteFixture();
+		await f.cache.request("relay-test");
+		f.advance(10 * 60_000 + 1);
+		f.respond(async () => new Response(null, { status: 500 }));
+		const failed = await f.cache.request("relay-test", "refresh");
+		expect(failed).toMatchObject({ status: "error", error: "request_failed", balance: null });
+	});
+
+	test("a rejected token clears the value instead of retrying it", async () => {
+		const f = siteFixture();
+		await f.cache.request("relay-test");
+		f.advance(60_000);
+		f.respond(async () => new Response(null, { status: 401 }));
+		const failed = await f.cache.request("relay-test", "refresh");
+		expect(failed).toMatchObject({ status: "error", error: "auth_failed", balance: null });
+		// The persisted copy must go too, or a restart would restore retired credit.
+		expect(f.persistence.remove).toHaveBeenCalledWith("relay-test");
+		// Deterministic failures are not polled again without a manual rediscovery.
+		const calls = f.fetch.mock.calls.length;
+		f.advance(120_000);
+		f.cache.read();
+		expect(f.fetch).toHaveBeenCalledTimes(calls);
+	});
+
+	test("an unparsable answer is deterministic, not a network blip", async () => {
+		const f = siteFixture();
+		await f.cache.request("relay-test");
+		f.advance(60_000);
+		f.respond(async () => Response.json({ success: true, data: { nothing: 1 } }));
+		const failed = await f.cache.request("relay-test", "refresh");
+		expect(failed).toMatchObject({ status: "error", error: "invalid_response", balance: null });
+	});
+
+	test("a half-filled site configuration reports invalid_configuration immediately", async () => {
+		const f = siteFixture();
+		f.setProviders([{ ...siteProvider(), quotaUserId: "" }]);
+		const snapshot = await f.cache.request("relay-test");
+		expect(snapshot).toMatchObject({ status: "error", error: "invalid_configuration" });
+		expect(f.fetch).not.toHaveBeenCalled();
+	});
+
+	test("rotating the access token discards the previous account's value", async () => {
+		const f = siteFixture();
+		const before = await f.cache.request("relay-test");
+		f.setProviders([{ ...siteProvider(), quotaAccessToken: "rotated-token" }]);
+		const after = f.cache.peek("relay-test");
+		expect(after?.generation).not.toBe(before?.generation);
+		expect(after?.balance).toBeNull();
+	});
+});
+
+describe("capability plugin gating", () => {
+	/**
+	 * The plugin owns quota querying, so a disabled plugin has to be observable: the snapshot
+	 * reports `plugin_not_enabled` and the previously cached allowance is dropped, exactly like
+	 * any other deterministic failure.
+	 */
+	function gatedFixture() {
+		let enabled = false;
+		let now = 100_000;
+		let engineCalls = 0;
+		const persistence = {
+			restore: mock(() => undefined as never),
+			save: mock(() => {}),
+			remove: mock(() => {}),
+			flush: mock(async () => {}),
+		};
+		const cache = new ProviderBalanceCache({
+			providers: () => [provider()],
+			globalProxy: () => undefined,
+			now: () => now,
+			persistence,
+			engine: () => ({
+				id: "test-connector",
+				probe: async () => {
+					engineCalls++;
+					if (!enabled) throw new BalanceProbeRequestError("plugin_disabled");
+					return {
+						adapter: "sub2api",
+						root: "https://relay.example",
+						balance: {
+							scope: "wallet",
+							unlimited: false,
+							amounts: [{ unit: "USD", remaining: 7 }],
+						},
+					};
+				},
+				refresh: async () => {
+					engineCalls++;
+					if (!enabled) throw new BalanceProbeRequestError("plugin_disabled");
+					return { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 7 }] };
+				},
+			}),
+		});
+		return {
+			cache,
+			persistence,
+			engineCalls: () => engineCalls,
+			setEnabled: (value: boolean) => {
+				enabled = value;
+			},
+			advance: (delta: number) => {
+				now += delta;
+			},
+		};
+	}
+
+	test("a disabled plugin is reported instead of being answered by the bundled adapters", async () => {
+		const f = gatedFixture();
+
+		const snapshot = await f.cache.request("relay-test");
+
+		expect(snapshot).toMatchObject({ status: "error", error: "plugin_not_enabled", balance: null });
+		// Deterministic: no value may survive behind the disabled state.
+		expect(f.persistence.remove).toHaveBeenCalledWith("relay-test");
+	});
+
+	test("a value cached while enabled is withdrawn once the plugin is disabled", async () => {
+		const f = gatedFixture();
+		f.setEnabled(true);
+		await f.cache.request("relay-test");
+		expect(f.cache.peek("relay-test")).toMatchObject({ status: "supported" });
+
+		f.setEnabled(false);
+		f.advance(60_000);
+		await f.cache.request("relay-test", "refresh");
+
+		expect(f.cache.peek("relay-test")).toMatchObject({
+			status: "error",
+			error: "plugin_not_enabled",
+			balance: null,
+		});
+	});
+
+	test("re-enabling the plugin restores the value on the next read", async () => {
+		const f = gatedFixture();
+		await f.cache.request("relay-test");
+		expect(f.cache.peek("relay-test")?.error).toBe("plugin_not_enabled");
+
+		f.setEnabled(true);
+		// Inside the stale window reads are served from the snapshot without touching the
+		// engine; the recovery attempt happens on the first read past it.
+		f.cache.read("relay-test");
+		expect(f.engineCalls()).toBe(1);
+		f.advance(60_000);
+		f.cache.read("relay-test");
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+		expect(f.cache.peek("relay-test")).toMatchObject({
+			status: "supported",
+			error: null,
+		});
+		expect(f.cache.peek("relay-test")?.balance?.amounts[0]?.remaining).toBe(7);
 	});
 });

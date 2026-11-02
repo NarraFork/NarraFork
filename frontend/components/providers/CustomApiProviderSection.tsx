@@ -23,6 +23,7 @@ import {
 	useProviderModelRefreshCapability,
 	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
+import { useProviderBalanceCapability } from "../../hooks/useProviderBalance";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { extractPrimaryDomainLabel } from "../../lib/url";
@@ -199,6 +200,10 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		[t],
 	);
 	const geminiTransport = provider.geminiTransport ?? "generate-content";
+	// Quota querying is the apikey-quota plugin's capability: with the plugin disabled the
+	// site-quota inputs are removed instead of being shown as controls that cannot take effect.
+	// The stored values are untouched — they round-trip on save and reappear when it is enabled.
+	const quotaCapabilityEnabled = useProviderBalanceCapability();
 	const geminiTransportData = useMemo(
 		() => [
 			{ value: "generate-content", label: t("geminiTransportGenerateContent") },
@@ -462,6 +467,48 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					providerId={provider.id}
 					dirty={isProviderDirty?.(provider.id) ?? false}
 				/>
+
+				{/*
+				 * Site-account credit query. Kept apart from the inference key on purpose: this
+				 * endpoint authenticates as the site (system access token + user id), and needs
+				 * the site root because several presets keep `/v1` in the inference base URL.
+				 * Shown only while the capability plugin is enabled.
+				 */}
+				{quotaCapabilityEnabled && (
+					<Stack gap={6}>
+						<Text size="sm" fw={500}>
+							{t("customApiQuotaTitle")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("customApiQuotaDesc")}
+						</Text>
+						<TextInput
+							label={t("customApiQuotaSiteUrl")}
+							description={t("customApiQuotaSiteUrlDesc")}
+							placeholder={t("customApiQuotaSiteUrlPlaceholder")}
+							value={provider.quotaSiteUrl ?? ""}
+							size="xs"
+							onChange={(e) => updateProvider("quotaSiteUrl", e.currentTarget.value)}
+						/>
+						<PasswordInput
+							label={t("customApiQuotaAccessToken")}
+							description={t("customApiQuotaAccessTokenDesc")}
+							placeholder={t("customApiQuotaAccessTokenPlaceholder")}
+							value={provider.quotaAccessToken ?? ""}
+							size="xs"
+							autoComplete="off"
+							onChange={(e) => updateProvider("quotaAccessToken", e.currentTarget.value)}
+						/>
+						<TextInput
+							label={t("customApiQuotaUserId")}
+							description={t("customApiQuotaUserIdDesc")}
+							placeholder={t("customApiQuotaUserIdPlaceholder")}
+							value={provider.quotaUserId ?? ""}
+							size="xs"
+							onChange={(e) => updateProvider("quotaUserId", e.currentTarget.value)}
+						/>
+					</Stack>
+				)}
 
 				<ProxyOverrideField
 					value={provider.proxy}

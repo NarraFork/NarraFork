@@ -88,6 +88,21 @@ export interface CustomApiProviderConfig {
 	customUserAgent?: string;
 	/** Additional request headers injected on outbound requests. */
 	extraHeaders?: Record<string, string>;
+	/**
+	 * Interface root used only by the site-account credit query (`/api/user/self`).
+	 *
+	 * Separate from `baseUrl` on purpose: several presets keep `/v1` in the inference base URL,
+	 * and `{baseUrl}/api/user/self` would resolve to `/v1/api/user/self` and 404. Empty means
+	 * "derive it from `baseUrl`", with `/v1` and trailing slashes stripped.
+	 */
+	quotaSiteUrl?: string;
+	/**
+	 * Site system access token (the one issued by the site console), not the inference
+	 * `sk-` key: `sk-` keys are rejected by `/api/user/self` with 401.
+	 */
+	quotaAccessToken?: string;
+	/** Site user id, sent as the `New-Api-User` header. */
+	quotaUserId?: string;
 }
 
 /**

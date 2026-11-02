@@ -6,6 +6,7 @@ import { NARRAFORK_RPC_PROTOCOL, PLUGIN_TO_HOST_FEATURES } from "@server/lib/plu
 import {
 	buildBalanceRoots,
 	parseNewApiBalance,
+	parseNewApiUserQuota,
 	parseSub2ApiBalance,
 } from "@server/lib/provider-balance-adapters";
 
@@ -31,6 +32,23 @@ const plugin = (await import(`${pluginRoot}/server/index.js`)) as {
 		signal: AbortSignal,
 		fetcher?: typeof fetch,
 	) => Promise<unknown>;
+	hasSiteQuotaConfig: (input: Record<string, unknown>) => boolean;
+	resolveSiteQuotaConfig: (input: Record<string, unknown>) => {
+		root: string;
+		accessToken: string;
+		userId: string;
+	};
+	parseNewApiUserQuota: (body: unknown) => unknown;
+	probeSiteQuota: (
+		input: Record<string, unknown>,
+		signal: AbortSignal,
+		fetcher?: typeof fetch,
+	) => Promise<{ adapter: string; root: string; balance: Record<string, unknown> }>;
+	refreshSiteQuota: (
+		input: Record<string, unknown>,
+		signal: AbortSignal,
+		fetcher?: typeof fetch,
+	) => Promise<Record<string, unknown>>;
 };
 
 const sub2apiWallet = { mode: "unrestricted", isValid: true, balance: 12.5, unit: "USD" };
@@ -257,5 +275,115 @@ describe("apikey-quota plugin probe over real HTTP", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect((error as Error).name).toBe("ProbeRequestError");
 		expect(reached).toBe(false);
+	});
+});
+
+/**
+ * Site-account credit (`/api/user/self`).
+ *
+ * The plugin is a separate process that cannot share host code, so these cases prove the
+ * plugin's own copy of the rules answers identically to the bundled adapters — the same
+ * negotiation the rest of this file performs for the key-usage endpoints.
+ */
+describe("apikey-quota plugin site-account credit", () => {
+	const siteBody = { success: true, data: { quota: 2_500_000, used_quota: 500_000, group: "pro" } };
+	const siteInput = {
+		baseUrl: "https://site.test/v1",
+		apiKey: "sk-live",
+		siteUrl: "https://site.test",
+		accessToken: "site-token",
+		userId: "42",
+	};
+
+	test("parses the account credit to USD exactly like the host adapter", () => {
+		expect(plugin.parseNewApiUserQuota(siteBody)).toEqual(parseNewApiUserQuota(siteBody));
+		expect(plugin.parseNewApiUserQuota(siteBody)).toEqual({
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: 5, used: 1, total: 6 }],
+			planName: "pro",
+		});
+	});
+
+	test("accepts numeric strings like the host adapter", () => {
+		const body = { success: true, data: { quota: "2500000", used_quota: "500000" } };
+		expect(plugin.parseNewApiUserQuota(body)).toEqual(parseNewApiUserQuota(body));
+	});
+
+	test("rejects the same non-answers as the host adapter", () => {
+		for (const body of [
+			{ success: false, data: { quota: 1, used_quota: 0 } },
+			{ success: true },
+			{ success: true, data: { quota: 1 } },
+			{ success: true, data: { quota: -2, used_quota: 0 } },
+		]) {
+			expect(plugin.parseNewApiUserQuota(body)).toBeNull();
+			expect(parseNewApiUserQuota(body)).toBeNull();
+		}
+	});
+
+	test("resolves the site root away from the /v1 inference base URL", () => {
+		expect(plugin.hasSiteQuotaConfig({})).toBe(false);
+		expect(plugin.hasSiteQuotaConfig(siteInput)).toBe(true);
+		expect(plugin.resolveSiteQuotaConfig(siteInput)).toEqual({
+			root: "https://site.test",
+			accessToken: "site-token",
+			userId: "42",
+		});
+		// No site root configured: derived from the base URL, with /v1 stripped.
+		expect(plugin.resolveSiteQuotaConfig({ ...siteInput, siteUrl: undefined })).toMatchObject({
+			root: "https://site.test",
+		});
+		expect(() => plugin.resolveSiteQuotaConfig({ ...siteInput, userId: "" })).toThrow(
+			expect.objectContaining({ kind: "invalid_configuration" }),
+		);
+	});
+
+	test("sends the site token, the New-Api-User header and the site path", async () => {
+		let url = "";
+		let headers = new Headers();
+		const found = await plugin.probeSiteQuota(siteInput, AbortSignal.timeout(5_000), (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			url = String(input);
+			headers = new Headers(init?.headers);
+			return Response.json(siteBody);
+		}) as unknown as typeof fetch);
+
+		expect(url).toBe("https://site.test/api/user/self");
+		expect(headers.get("authorization")).toBe("Bearer site-token");
+		expect(headers.get("new-api-user")).toBe("42");
+		expect([...headers.values()]).not.toContain("Bearer sk-live");
+		expect(found.adapter).toBe("new-api-user");
+		expect(found.root).toBe("https://site.test");
+	});
+
+	test("classifies a rejected token as a deterministic auth failure", async () => {
+		const error = await plugin
+			.probeSiteQuota(
+				siteInput,
+				AbortSignal.timeout(5_000),
+				(async () => new Response(null, { status: 401 })) as unknown as typeof fetch,
+			)
+			.catch((e) => e);
+		expect(error).toMatchObject({ name: "ProbeRequestError", kind: "auth" });
+	});
+
+	test("keeps 5xx transient and other 4xx deterministic, like the host transport", async () => {
+		for (const [status, kind] of [
+			[503, "transient"],
+			[429, "transient"],
+			[404, "invalid_response"],
+		] as const) {
+			const error = await plugin
+				.probeSiteQuota(
+					siteInput,
+					AbortSignal.timeout(5_000),
+					(async () => new Response(null, { status })) as unknown as typeof fetch,
+				)
+				.catch((e) => e);
+			expect(error).toMatchObject({ kind });
+		}
 	});
 });
