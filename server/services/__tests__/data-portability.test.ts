@@ -279,7 +279,7 @@ describe("data portability · 数据安全", () => {
 		const exported = await exportData({ requests: false, sessions: false, providers: true });
 		expect(exported.counts).toMatchObject({ requests: 0, sessions: 0 });
 		const zip = await readFile(exported.zipPath);
-		// 只勾供应商时不应把整库快照打进包（那是几百 MB 的无关数据）。
+		// 只勾供应商时不应把会话/请求快照打进包（那是几百 MB 的无关数据）。
 		expect(zip.includes(Buffer.from("snapshot.db"))).toBe(false);
 		expect(zip.includes(Buffer.from("providers.json"))).toBe(true);
 
@@ -502,5 +502,215 @@ describe("逐模型设置随供应商一起导出", () => {
 		} finally {
 			saveSettings(original);
 		}
+	});
+
+	const apiProvider = (id: string, prefix: string, apiKey: string, baseUrl: string) => ({
+		id,
+		name: prefix,
+		prefix,
+		protocol: "completions-compatible" as const,
+		baseUrl,
+		apiKey,
+		defaultModel: "",
+	});
+
+	test("前缀冲突时逐模型设置改挂到新前缀，且不误伤更长的前缀", async () => {
+		const original = structuredClone(settings);
+		try {
+			const exported = structuredClone(settings);
+			exported.customApiProviders = [
+				apiProvider("remote-openai", "openai", "remote-key", "https://remote.example/v1"),
+			];
+			(exported.agent as unknown as Record<string, unknown>).hiddenModels = [
+				"openai:hidden",
+				"openai-2:already",
+				"openai-extra:stay",
+			];
+			(exported.agent as unknown as Record<string, unknown>).modelProtocols = {
+				"openai:proto": "anthropic-messages",
+				"openai-extra:stay": "gemini-compatible",
+			};
+			(exported.agent as unknown as Record<string, unknown>).customModels = [
+				{ value: "openai:custom", label: "remote", provider: "openai" },
+			];
+			saveSettings(exported);
+
+			const zip = await readFile(
+				(await exportData({ requests: false, sessions: false, providers: true })).zipPath,
+			);
+			const preview = await previewImport(toArrayBuffer(zip), "prefix.zip");
+
+			const local = structuredClone(original);
+			local.customApiProviders = [
+				apiProvider("local-openai", "openai", "local-key", "https://local.example/v1"),
+			];
+			(local.agent as unknown as Record<string, unknown>).hiddenModels = ["openai:local-only"];
+			(local.agent as unknown as Record<string, unknown>).modelProtocols = {
+				"openai:local": "completions-compatible",
+			};
+			(local.agent as unknown as Record<string, unknown>).customModels = [];
+			saveSettings(local);
+
+			await applyImport(preview.token, { conflictDefault: "skip" });
+
+			expect((settings.customApiProviders ?? []).map((item) => item.prefix).sort()).toEqual([
+				"openai",
+				"openai-2",
+			]);
+			expect(agent().hiddenModels).toEqual([
+				"openai:local-only",
+				"openai-2:hidden",
+				"openai-2:already",
+				"openai-extra:stay",
+			]);
+			expect(agent().modelProtocols).toEqual({
+				"openai:local": "completions-compatible",
+				"openai-2:proto": "anthropic-messages",
+				"openai-extra:stay": "gemini-compatible",
+			});
+			expect(agent().customModels).toEqual([
+				{ value: "openai-2:custom", label: "remote", provider: "openai-2" },
+			]);
+		} finally {
+			saveSettings(original);
+		}
+	});
+
+	test("同一端点已存在但前缀不同时，模型设置改挂到本地前缀", async () => {
+		const original = structuredClone(settings);
+		try {
+			const exported = structuredClone(settings);
+			exported.customApiProviders = [
+				apiProvider("remote", "remote", "shared-key", "https://same.example/v1"),
+			];
+			(exported.agent as unknown as Record<string, unknown>).hiddenModels = ["remote:hidden"];
+			saveSettings(exported);
+
+			const zip = await readFile(
+				(await exportData({ requests: false, sessions: false, providers: true })).zipPath,
+			);
+			const preview = await previewImport(toArrayBuffer(zip), "same-endpoint.zip");
+
+			const local = structuredClone(original);
+			local.customApiProviders = [
+				apiProvider("local", "local", "shared-key", "https://same.example/v1"),
+			];
+			(local.agent as unknown as Record<string, unknown>).hiddenModels = ["local:keep"];
+			saveSettings(local);
+
+			const result = await applyImport(preview.token, { conflictDefault: "skip" });
+			expect(result.providersAdded).toBe(0);
+			expect(settings.customApiProviders ?? []).toHaveLength(1);
+			expect(settings.customApiProviders?.[0]?.prefix).toBe("local");
+			expect(agent().hiddenModels).toEqual(["local:keep", "local:hidden"]);
+		} finally {
+			saveSettings(original);
+		}
+	});
+});
+
+describe("跳过会话不带回子行，覆盖按主键补回", () => {
+	test("跳过不恢复已删的消息、块和请求；覆盖会补回，且不删本地新增", async () => {
+		sqlite.run(
+			`INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at)
+			 VALUES ('msg-new', 'sess-1', 'user', '[]', '2026-10-02T00:00:00Z')`,
+		);
+		sqlite.run(
+			`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq)
+			 VALUES ('ref-new', 'sess-1', 'msg-new', 3)`,
+		);
+		sqlite.run(
+			`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, created_at)
+			 VALUES ('tc-new', 'sess-1', 'msg-new', 'tu-new', 'Read', '2026-10-02T00:00:01Z')`,
+		);
+		sqlite.run(
+			`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, phase, created_at, payload)
+			 VALUES ('blk-new', 'msg-new', 0, 'input', 'done', '2026-10-02T00:00:00Z', '{"text":"new"}')`,
+		);
+		sqlite.run(
+			`INSERT INTO api_requests (id, narrator_id, created_at, input_tokens, output_tokens, cached_input_tokens)
+			 VALUES ('req-new', 'sess-1', '2026-10-02T00:00:00Z', 1, 1, 0)`,
+		);
+
+		const zip = await readFile((await exportData()).zipPath);
+		sqlite.run(`DELETE FROM api_requests WHERE id = 'req-new'`);
+		sqlite.run(`DELETE FROM narrator_message_refs WHERE id = 'ref-new'`);
+		sqlite.run(`DELETE FROM narrator_tool_calls WHERE id = 'tc-new'`);
+		sqlite.run(`DELETE FROM narrator_messages WHERE id = 'msg-new'`);
+		sqlite.run(
+			`INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at)
+			 VALUES ('msg-local', 'sess-1', 'user', '["local"]', '2026-10-03T00:00:00Z')`,
+		);
+
+		const skipped = await applyImport((await previewImport(toArrayBuffer(zip), "skip.zip")).token, {
+			conflictDefault: "skip",
+		});
+		expect(skipped.sessionsSkipped).toBe(1);
+		expect(skipped.requestsInserted).toBe(0);
+		for (const [table, id] of [
+			["narrator_messages", "msg-new"],
+			["narrator_message_refs", "ref-new"],
+			["narrator_tool_calls", "tc-new"],
+			["narrator_blocks", "blk-new"],
+			["api_requests", "req-new"],
+		] as const) {
+			expect(sqlite.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id)).toBeNull();
+		}
+		expect(
+			sqlite.prepare(`SELECT 1 FROM narrator_messages WHERE id = 'msg-local'`).get(),
+		).toBeTruthy();
+
+		await applyImport((await previewImport(toArrayBuffer(zip), "overwrite.zip")).token, {
+			conflictDefault: "overwrite",
+		});
+		expect(
+			sqlite.prepare(`SELECT payload FROM narrator_blocks WHERE id = 'blk-new'`).get(),
+		).toEqual({
+			payload: '{"text":"new"}',
+		});
+		expect(
+			sqlite.prepare(`SELECT narrator_id FROM api_requests WHERE id = 'req-new'`).get(),
+		).toEqual({ narrator_id: "sess-1" });
+		expect(
+			sqlite.prepare(`SELECT 1 FROM narrator_message_refs WHERE id = 'ref-new'`).get(),
+		).toBeTruthy();
+		expect(
+			sqlite.prepare(`SELECT 1 FROM narrator_tool_calls WHERE id = 'tc-new'`).get(),
+		).toBeTruthy();
+		expect(
+			sqlite.prepare(`SELECT 1 FROM narrator_messages WHERE id = 'msg-local'`).get(),
+		).toBeTruthy();
+		expect(count("narrator_messages")).toBe(4);
+	});
+
+	test("body_rows_only 的正文随 narrator_blocks 导出再导入", async () => {
+		sqlite.run(
+			`UPDATE narrator_messages
+			    SET content_json = '[]', body_rows_only = 1, body_format = 2
+			  WHERE id = 'msg-1'`,
+		);
+		sqlite.run(
+			`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, phase, created_at, payload)
+			 VALUES ('blk-1', 'msg-1', 0, 'input', 'done', '2026-10-01T00:00:01Z', '{"text":"block-body"}')`,
+		);
+		const zip = await readFile(
+			(await exportData({ requests: false, sessions: true, providers: false })).zipPath,
+		);
+		await clearData("sessions");
+		expect(count("narrator_blocks")).toBe(0);
+
+		const preview = await previewImport(toArrayBuffer(zip), "blocks.zip");
+		const result = await applyImport(preview.token, {
+			conflictDefault: "skip",
+			include: { sessions: true, requests: false, providers: false },
+		});
+		expect(result.sessionsInserted).toBe(1);
+		const message = sqlite
+			.prepare(`SELECT body_rows_only FROM narrator_messages WHERE id = 'msg-1'`)
+			.get() as { body_rows_only: number };
+		expect(message.body_rows_only).toBe(1);
+		expect(sqlite.prepare(`SELECT payload FROM narrator_blocks WHERE id = 'blk-1'`).get()).toEqual({
+			payload: '{"text":"block-body"}',
+		});
 	});
 });

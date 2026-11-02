@@ -400,7 +400,7 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/db/integrity-probe-worker.ts", "read-only `PRAGMA integrity_check` subprocess"],
 	[
 		"server/db/snapshot-builder-worker.ts",
-		"整库快照的构建子进程：ATTACH 源库后逐表 `INSERT … SELECT` 拷贝，再 `VACUUM` 压实；两者都是 SQLite 专属且 O(数据量) 的同步操作",
+		"固定表清单的快照构建子进程：ATTACH 源库后逐表 `INSERT … SELECT` 拷贝，再 `VACUUM` 压实；两者都是 SQLite 专属且 O(数据量) 的同步操作",
 	],
 	[
 		"server/db/integrity-check.ts",
@@ -427,7 +427,7 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	],
 	[
 		"server/services/data-portability.ts",
-		"整库快照的导出与导入：`VACUUM INTO` 只存在于 SQLite，ATTACH 之后靠 `sqlite_master` 与 `rowid` 逐表按列交集拷贝；PostgreSQL 侧要走 `pg_dump`/`COPY` 的另一套实现",
+		"固定表清单的导出与导入：子进程逐表复制后再压实，ATTACH 之后靠 `sqlite_master` 与 `rowid` 按列交集拷贝；PostgreSQL 侧要走 `pg_dump`/`COPY` 的另一套实现",
 	],
 ]);
 
@@ -495,8 +495,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
-	// 整库快照的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
-	// （VACUUM 压实），ATTACH + 按列交集拷贝回库，`INSERT OR IGNORE` 跳过已存在的行，
+	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
+	// （复制后压实），ATTACH + 按列交集拷贝回库，`INSERT OR IGNORE` 跳过已存在的行，
 	// `SQLITE_BUSY` 之类的错误码决定重试；源库与目标库都按文件路径打开。
 	"server/services/data-portability.ts": [
 		"connectionModule",
@@ -521,7 +521,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
 	// Dual-backend snapshot worker: these capabilities belong to its SQLite branch.
 	"server/services/narrator-prefix-snapshots-worker.ts": ["driver", "pragma", "errorCode"],
-	// 整库快照的构建同样放在独立进程：`INSERT … SELECT` 与 `VACUUM` 都是 O(数据量) 的同步操作。
+	// 固定表清单的构建同样放在独立进程：`INSERT … SELECT` 与 `VACUUM` 都是 O(数据量) 的同步操作。
 	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],

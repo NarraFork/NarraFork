@@ -1,7 +1,7 @@
 /**
  * 数据可移植性：导出 / 导入预览 / 导入 / 清空。
  *
- * 性能取向：导出用 `VACUUM INTO` 生成原生 SQLite 快照，导入用 `ATTACH` + 纯 SQL 合并
+ * 性能取向：导出在子进程里把固定的几张表复制成 SQLite 快照，导入用 `ATTACH` + 纯 SQL 合并
  * （`INSERT OR IGNORE ... SELECT`、行值 `UPDATE`），全程不把表数据搬进 JS 再逐行写回——
  * 请求历史与消息表可能有数十万行，SQLite 引擎内部完成合并比 JSON 往返快几个数量级。
  *
@@ -11,8 +11,8 @@
  * 清空：分项（requests / sessions / providers）与全量；调用方先校验当前用户密码。
  *
  * ⚠️ 维护约定（修改 server/db/schema.ts 时必读）：
- * - 导出 = 整库快照，**新增表会自动导出**，无需改本文件；
- * - 导入 = 只合并 `copyTable` 里显式列举的表。新增需要跨机迁移的表必须在此补 `copyTable`，
+ * - 导出 = `SNAPSHOT_TABLES` 里的表。新增需要跨机迁移的表必须加进那份清单，否则不会进 ZIP；
+ * - 导入 = 只合并 `copyTable` 里显式列举的表。同一张表还要在 `applyImport` 里补 `copyTable`，
  *   否则导入会静默丢数据；
  * - 新增 NOT NULL 且无默认值的列会让旧快照导入缺列（列交集只能拷贝双方都有的列），
  *   需要补默认值或拒绝旧版本；
@@ -27,6 +27,7 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { access, type FileHandle, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
 import { AppError, catalogError } from "@server/lib/errors";
@@ -34,11 +35,17 @@ import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { saveSettings, settings } from "@server/lib/settings";
 import type { NarraForkSettings } from "@server/lib/settings/types";
-import { MAX_IMPORT_BYTES, MAX_IMPORT_LABEL } from "@shared/storage-transfer";
+import {
+	MAX_IMPORT_BYTES,
+	MAX_IMPORT_LABEL,
+	MAX_SNAPSHOT_LABEL,
+	MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
+} from "@shared/storage-transfer";
 import archiver from "archiver";
 import { sqlite } from "../db";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
+import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
 
 const EXPORT_VERSION = 1;
 const PREVIEW_TTL_MS = 30 * 60 * 1000;
@@ -193,7 +200,9 @@ async function readSmallEntry(zipPath: string, entry: ZipEntryIndex): Promise<Bu
 	try {
 		const raw = Buffer.allocUnsafe(entry.compressedSize);
 		await readFully(handle, raw, entry.dataStart);
-		return entry.method === 0 ? raw : inflateRawSync(raw);
+		const inflated = entry.method === 0 ? raw : inflateRawSync(raw);
+		if (inflated.byteLength > MAX_SMALL_ENTRY_BYTES) throw catalogError("IMPORT_ZIP_INVALID");
+		return inflated;
 	} finally {
 		await handle.close();
 	}
@@ -210,9 +219,21 @@ async function extractEntryToFile(
 		end: entry.dataStart + entry.compressedSize - 1,
 	});
 	const target = createWriteStream(destination);
-	await (entry.method === 0
-		? pipeline(source, target)
-		: pipeline(source, createInflateRaw(), target));
+	// 解压后的字节数才是磁盘占用。压缩包停在 4 GB，展开后仍可能把磁盘写满。
+	let seen = 0;
+	const limited = new Transform({
+		transform(chunk, _encoding, callback) {
+			const bytes = Buffer.isBuffer(chunk) ? chunk.byteLength : Buffer.byteLength(chunk);
+			seen += bytes;
+			if (seen > MAX_SNAPSHOT_UNCOMPRESSED_BYTES) {
+				callback(catalogError("IMPORT_FILE_TOO_LARGE", { limit: MAX_SNAPSHOT_LABEL }));
+				return;
+			}
+			callback(null, chunk);
+		},
+	});
+	if (entry.method === 0) await pipeline(source, limited, target);
+	else await pipeline(source, createInflateRaw(), limited, target);
 }
 
 // ── 导出 ─────────────────────────────────────────────────────────────────
@@ -319,8 +340,8 @@ export async function exportData(
 	const zipPath = join(dir, "narrafork-export.zip");
 	const output = createWriteStream(zipPath);
 	const archive = archiver("zip", { zlib: { level: 1 } });
-	// 只导出供应商时不需要快照：供应商配置在 settings.json 里，整库快照只会把
-	// 与选择无关的数据（用户、知识库、认证会话……）带出几百 MB。
+	// 只导出供应商时不建快照：供应商配置在 settings.json 里。快照会把
+	// 与选择无关的会话和请求历史一起带走。
 	const needsSnapshot = selection.requests || selection.sessions;
 	try {
 		if (needsSnapshot) {
@@ -511,13 +532,7 @@ function createEmptySnapshot(snapshotPath: string): void {
 	const attachName = `empty_${randomBytes(4).toString("hex")}`;
 	sqlite.run(`ATTACH DATABASE ? AS ${attachName}`, [snapshotPath]);
 	try {
-		for (const table of [
-			"api_requests",
-			"narrators",
-			"narrator_messages",
-			"narrator_message_refs",
-			"narrator_tool_calls",
-		]) {
+		for (const table of [...SNAPSHOT_TABLES.requests, ...SNAPSHOT_TABLES.sessions]) {
 			sqlite.run(`CREATE TABLE ${attachName}.${table} AS SELECT * FROM main.${table} LIMIT 0`);
 		}
 	} finally {
@@ -659,8 +674,23 @@ const IMPORTED_TABLES = [
 	"narrator_messages",
 	"narrator_message_refs",
 	"narrator_tool_calls",
+	"narrator_blocks",
 	"api_requests",
 ] as const;
+
+/** 单条 SQL 的占位符上限按 400 切段，避免顶到 SQLite 的变量个数限制。 */
+const SQL_PARAM_CHUNK = 400;
+
+function chunkedInLists(ids: string[]): { groups: string[]; params: string[] } {
+	const groups: string[] = [];
+	const params: string[] = [];
+	for (let offset = 0; offset < ids.length; offset += SQL_PARAM_CHUNK) {
+		const chunk = ids.slice(offset, offset + SQL_PARAM_CHUNK);
+		groups.push(`(${chunk.map(() => "?").join(", ")})`);
+		params.push(...chunk);
+	}
+	return { groups, params };
+}
 
 /**
  * 该表指向「未导入表」的外键列 → 目标表。
@@ -831,10 +861,22 @@ function copyTable(
 		params.push(where.value);
 	}
 	if (excluded.length > 0 && shared.includes("narrator_id")) {
+		const { groups, params: chunkParams } = chunkedInLists(excluded);
+		const absent = groups.map((group) => `narrator_id NOT IN ${group}`).join(" AND ");
+		filters.push(`(narrator_id IS NULL OR (${absent}))`);
+		params.push(...chunkParams);
+	} else if (
+		excluded.length > 0 &&
+		table === "narrator_blocks" &&
+		tableColumns(attachName, "narrator_messages").includes("id")
+	) {
+		// 块行没有 narrator_id。跳过的会话只通过它的消息把块排除掉。
+		const { groups, params: chunkParams } = chunkedInLists(excluded);
+		const owned = groups.map((group) => `narrator_id IN ${group}`).join(" OR ");
 		filters.push(
-			`(narrator_id IS NULL OR narrator_id NOT IN (${excluded.map(() => "?").join(", ")}))`,
+			`message_id NOT IN (SELECT id FROM ${attachName}.narrator_messages WHERE ${owned})`,
 		);
-		params.push(...excluded);
+		params.push(...chunkParams);
 	}
 	const clause = filters.length > 0 ? ` WHERE ${filters.join(" AND ")}` : "";
 	return changesOf(
@@ -849,8 +891,9 @@ function copyTable(
  * 按预览 token 执行导入：全程用 SQLite 原生 SQL 合并。
  *
  * 请求历史按主键 `INSERT OR IGNORE` 追加；会话按冲突决策「UPDATE 现有行」或「跳过」，
- * 新会话直接插入；消息 `INSERT OR IGNORE`（fork 共享的消息被复用，不覆盖其它会话的内容）；
- * 引用与工具调用在覆盖时先删本会话旧行再插入。整个数据合并在一个事务里完成。
+ * 新会话直接插入；消息、引用、工具调用和消息块都按主键合并，不删除本地行。
+ * 跳过的会话连同它的消息、引用、工具调用、消息块，以及指向它的请求，一起不导入。
+ * 整个数据合并在一个事务里完成。
  */
 export async function applyImport(token: string, options: ImportOptions): Promise<ImportResult> {
 	const preview = getPreview(token);
@@ -928,6 +971,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 			}
 
 			const rejected: string[] = [];
+			const skipped: string[] = [];
 			if (include.sessions) {
 				const existing = new Set(
 					(sqlite.prepare(`SELECT id FROM main.narrators`).all() as Array<{ id: string }>).map(
@@ -951,6 +995,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					}
 					if (decision === "skip") {
 						counts.sessionsSkipped += 1;
+						skipped.push(id);
 						continue;
 					}
 					// 覆盖只更新会话行本身：删掉本地 refs/tool_calls 会级联抹掉其它表对它们的引用，
@@ -967,23 +1012,28 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				}
 			}
 
-			// 2) 消息与引用/工具调用：全量追加（主键冲突跳过，保持 fork 共享语义）
+			// 跳过或被唯一约束挡住的会话：子行和指向它的请求都不进来。
+			const excludedNarrators = [...rejected, ...skipped];
+
+			// 2) 消息、引用、工具调用、消息块：按主键追加。
+			//    `body_rows_only = 1` 时正文只在块行里，漏掉块就等于丢了会话内容。
 			if (include.sessions) {
 				copyTable(attachName, "narrator_messages", {
 					nullAbsentFks: true,
-					excludeNarrators: rejected,
+					excludeNarrators: excludedNarrators,
 				});
-				copyTable(attachName, "narrator_message_refs", { excludeNarrators: rejected });
+				copyTable(attachName, "narrator_message_refs", { excludeNarrators: excludedNarrators });
 				copyTable(attachName, "narrator_tool_calls", {
 					nullAbsentFks: true,
-					excludeNarrators: rejected,
+					excludeNarrators: excludedNarrators,
 				});
+				copyTable(attachName, "narrator_blocks", { excludeNarrators: excludedNarrators });
 			}
 
 			// 3) 请求历史最后：它同时引用会话与消息，必须在两者就位后插入
 			if (include.requests) {
 				counts.requestsInserted = copyTable(attachName, "api_requests", {
-					excludeNarrators: rejected,
+					excludeNarrators: excludedNarrators,
 					// 会话整类没有导入时，请求上的会话/消息引用必然悬空
 					forceNull: include.sessions ? [] : ["narrator_id", "message_id"],
 				});
@@ -1132,6 +1182,73 @@ function mergeModelCatalog(current: unknown, incoming: unknown): unknown {
 	};
 }
 
+/**
+ * 按模型键的第一段（`prefix:model`）改写。
+ *
+ * 不用 `startsWith(prefix + ":")` 扫整张表：`openai` 会误中 `openai-2:model`。
+ * 只认冒号前的完整前缀。`__agg__:prefix:model` 的前缀在第二段。
+ */
+function rewritePrefixedModelKey(value: string, remaps: Map<string, string>): string {
+	if (value.startsWith("__agg__:")) {
+		const rest = value.slice("__agg__:".length);
+		const colon = rest.indexOf(":");
+		if (colon < 0) return value;
+		const next = remaps.get(rest.slice(0, colon));
+		if (!next) return value;
+		return `__agg__:${next}:${rest.slice(colon + 1)}`;
+	}
+	const colon = value.indexOf(":");
+	if (colon < 0) return value;
+	const next = remaps.get(value.slice(0, colon));
+	if (!next) return value;
+	return `${next}:${value.slice(colon + 1)}`;
+}
+
+function rememberPrefixRemap(remaps: Map<string, string>, from: string, to: string): void {
+	if (!from || !to || from === to) return;
+	const existing = remaps.get(from);
+	if (existing && existing !== to) return;
+	remaps.set(from, to);
+}
+
+/**
+ * 前缀改名之后，逐模型设置仍指向旧前缀就会挂到本地那个同名供应商上。
+ *
+ * 每次从原始 `incoming` 复制一份再改：导入事务遇到 `SQLITE_BUSY` 会整段重跑，
+ * 改到原对象上会把 `openai:model` 再写成 `openai-2-2:model`。
+ */
+function remapIncomingModelSettings(
+	incoming: Partial<Record<ProviderKey, unknown>>,
+	remaps: Map<string, string>,
+): Partial<Record<ProviderKey, unknown>> {
+	if (remaps.size === 0) return incoming;
+	const rewrite = (value: string) => rewritePrefixedModelKey(value, remaps);
+	const next: Partial<Record<ProviderKey, unknown>> = { ...incoming };
+	if (Array.isArray(incoming.hiddenModels)) {
+		next.hiddenModels = incoming.hiddenModels.map((item) => rewrite(String(item)));
+	}
+	for (const key of ["modelProtocols", "modelProtocolOverrides"] as const) {
+		const record = incoming[key];
+		if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+		const rewritten: Record<string, unknown> = {};
+		for (const [modelKey, value] of Object.entries(record as Record<string, unknown>)) {
+			rewritten[rewrite(modelKey)] = value;
+		}
+		next[key] = rewritten;
+	}
+	if (Array.isArray(incoming.customModels)) {
+		next.customModels = (incoming.customModels as Array<Record<string, unknown>>).map((entry) => {
+			const copy = { ...entry };
+			if (typeof copy.value === "string") copy.value = rewrite(copy.value);
+			if (typeof copy.provider === "string") {
+				copy.provider = remaps.get(copy.provider) ?? copy.provider;
+			}
+			return copy;
+		});
+	}
+	return next;
+}
+
 /** 合并 `agent` 下的逐模型设置；返回是否产生了变化。 */
 function mergeAgentModelSettings(
 	current: NarraForkSettings,
@@ -1195,6 +1312,7 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	let added = 0;
 	let renamed = 0;
 	let skipped = 0;
+	const prefixRemaps = new Map<string, string>();
 
 	const listKeys = ["customApiProviders", "nugProviders"] as const;
 	for (const key of listKeys) {
@@ -1212,7 +1330,14 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			const copy = { ...item };
 			// 同一端点（同 apiKey + 同 baseUrl）已在本地：默认不导入，避免出现一堆
 			// 内容相同、id 也相同的副本——那会让整个供应商列表无法编辑。
-			if (currentList.some((existing) => sameProvider(existing, copy))) {
+			const sameEndpoint = currentList.find((existing) => sameProvider(existing, copy));
+			if (sameEndpoint) {
+				// 同一端点留在本地供应商上。两边前缀不同时，模型设置要改挂到本地前缀。
+				rememberPrefixRemap(
+					prefixRemaps,
+					String(copy.prefix ?? ""),
+					String(sameEndpoint.prefix ?? ""),
+				);
 				skipped += 1;
 				continue;
 			}
@@ -1246,6 +1371,7 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				}
 				copy.prefix = candidate;
 				existingPrefixes.add(candidate);
+				rememberPrefixRemap(prefixRemaps, prefix, candidate);
 			} else if (prefix) {
 				existingPrefixes.add(prefix);
 			}
@@ -1289,6 +1415,7 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				}
 				copy.prefix = candidate;
 				existingPrefixes.add(candidate);
+				rememberPrefixRemap(prefixRemaps, prefix, candidate);
 				renamed += 1;
 			} else if (prefix) {
 				existingPrefixes.add(prefix);
@@ -1301,7 +1428,12 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	}
 
 	// 逐模型设置（隐藏、协议、自定义模型、上下文元数据）跟着供应商一起搬。
-	if (mergeAgentModelSettings(current, incoming, merged)) changed = true;
+	// 前缀避让发生在上面：这里用改写后的键，避免设置还粘在本地那个同名供应商上。
+	if (
+		mergeAgentModelSettings(current, remapIncomingModelSettings(incoming, prefixRemaps), merged)
+	) {
+		changed = true;
+	}
 
 	// 单例平台：本地已配置就不动它。覆盖本地配置是"导入后反而坏了"的直接来源。
 	for (const key of ["codex", "tokendance", "commandCode"] as const) {

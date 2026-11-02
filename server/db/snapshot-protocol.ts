@@ -9,15 +9,20 @@ export const DB_SNAPSHOT_OUTPUT_ENV = "NARRAFORK_SNAPSHOT_OUTPUT";
 /** `requests,sessions` 的子集；缺省表示两类都要。 */
 export const DB_SNAPSHOT_KINDS_ENV = "NARRAFORK_SNAPSHOT_KINDS";
 
-/** 导入只读这 5 张表（外加 settings 里的 providers），快照因此只带它们。 */
+/**
+ * 导入会读的表（外加 settings 里的 providers）。快照只带它们。
+ * 新表不会自动进来：要跨机迁移就必须加进这里，并在 `applyImport` 里 `copyTable`。
+ */
 export const SNAPSHOT_TABLES = {
 	requests: ["api_requests"],
 	sessions: [
-		// 顺序即建表顺序：narrator_messages 的外键指向 narrators。
+		// 顺序即建表顺序：消息指向会话，块指向消息。
 		"narrators",
 		"narrator_messages",
 		"narrator_message_refs",
 		"narrator_tool_calls",
+		// `body_rows_only = 1` 时正文只在块行里，content_json 是空数组。
+		"narrator_blocks",
 	],
 } as const;
 

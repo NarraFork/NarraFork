@@ -9,8 +9,9 @@
 请求历史与消息表可能有数十万行。逐行转 JSON、再逐行 INSERT 的方案会把大量数据搬进 JS
 主线程（CLAUDE.md「后端主线程性能规则」），所以：
 
-- **导出**：`VACUUM INTO` 生成**原生 SQLite 快照**（单条 SQL，含 WAL 已提交数据），
-  打进 ZIP 的 `snapshot.db`；不经过 JS 序列化。
+- **导出**：子进程把 `SNAPSHOT_TABLES` 里的固定表复制成**原生 SQLite 快照**
+  （`CREATE TABLE … AS SELECT` + `INSERT … SELECT`，再压实），打进 ZIP 的 `snapshot.db`；
+  不经过 JS 序列化。新表不会自动进来。
 - **导入**：`ATTACH` 快照后用**纯 SQL 合并**（`INSERT OR IGNORE ... SELECT`、
   行值 `UPDATE`），SQLite 引擎内部完成，JS 侧零逐行。
 - **预览**：`ATTACH` + 联查检出会话 id 冲突，确认后再执行。
@@ -19,7 +20,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `snapshot.db` | 整库原生快照（`VACUUM INTO`）——**新增的表会自动包含** |
+| `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`。**新增的表不会自动包含** |
 | `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`（**含凭据**） |
 | `manifest.json` | `{ version, exportedAt, counts }`，导入时校验 `version <= 1` |
 
@@ -27,14 +28,16 @@
 
 | 数据 | 规则 |
 |---|---|
-| 请求历史 `api_requests` | 按主键 `INSERT OR IGNORE` 追加（重复 id 跳过） |
+| 请求历史 `api_requests` | 按主键 `INSERT OR IGNORE` 追加（重复 id 跳过）。指向被跳过会话的请求不导入 |
 | 会话 `narrators` | 预览列出 id 冲突 → 用户逐条或统一选择**覆盖**或**跳过**；新会话直接插入 |
-| 覆盖会话 | 保留会话行（`narrator_messages.narrator_id` 是 NOT NULL，删行会失败），用导入行 `UPDATE` 各列；先删本会话的 `narrator_message_refs` / `narrator_tool_calls` 后按快照重建 |
+| 跳过会话 | 不导入该会话的消息、引用、工具调用、消息块，以及 `narrator_id` 指向它的请求 |
+| 覆盖会话 | 保留会话行（`narrator_messages.narrator_id` 是 NOT NULL，删行会失败），用导入行 `UPDATE` 各列。子行按主键合并，不删除本地的引用、工具调用或消息块 |
 | 消息 `narrator_messages` | `INSERT OR IGNORE`（主键相同的消息被复用，保持 fork 共享语义，不覆盖其它会话内容） |
 | 引用 / 工具调用 | `INSERT OR IGNORE` |
-| 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则覆盖 |
-| 平台实例 | 同按前缀避让：本地已有同平台同前缀时先改前缀再追加，同前缀同平台视为重复跳过 |
-| 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的本地编辑层按 id 合并，`revision` 前进一格 |
+| 消息块 `narrator_blocks` | `INSERT OR IGNORE`。`body_rows_only = 1` 时正文只在块行里，旧包没有这张表时跳过 |
+| 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则跳过 |
+| 平台实例 | 同按前缀避让：本地已有同平台同前缀时跳过，前缀被占用则改名后追加 |
+| 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的本地编辑层按 id 合并，`revision` 前进一格。供应商前缀被改名，或同一端点因已存在而跳过但两边前缀不同时，`prefix:model` 的第一段改到新前缀（`openai` 不会误改 `openai-2`） |
 
 **列交集**：拷贝与 UPDATE 都按「两库 `PRAGMA table_info` 的交集」生成列清单。这样快照与
 当前库的迁移进度不同（列多了/少了）也能导入——但也意味着**旧快照缺少的新列会用数据库默认值**，
@@ -43,7 +46,8 @@
 ## 四、清空语义
 
 - 分项：`requests`（只删 `api_requests`）、`sessions`（删会话及其消息/引用/工具调用，
-  并把 `terminals` / `benchmark_task_results` 的 `narrator_id` 置空，保留这些数据本体）、
+  消息块随消息级联删除；并把 `terminals` / `benchmark_task_results` 的 `narrator_id` 置空，
+  保留这些数据本体）、
   `providers`（清空全部供应商配置：含平台实例、隐藏模型、逐模型协议与自定义模型；
   **不清模型目录**，那里有用户手写的模型卡片）。
 - 全量：以上全部。
@@ -55,17 +59,17 @@
 
 修改 `server/db/schema.ts` 时，请对照本清单：
 
-1. **新增需要跨机迁移/备份还原的表** → 在 `applyImport` 里补一行
-   `copyTable(attachName, "新表名")`；否则**导入会静默丢这张表的数据**。
-   （导出不需要改：`VACUUM INTO` 自动包含新表。）
+1. **新增需要跨机迁移/备份还原的表** → 加进 `server/db/snapshot-protocol.ts` 的
+   `SNAPSHOT_TABLES`，并在 `applyImport` 里补一行 `copyTable(attachName, "新表名")`。
+   两处缺一都会丢数据：导出不会自动包含新表。
 2. **新增 NOT NULL 且无默认值的列** → 旧快照导入会因缺列失败。二选一：
    - 给列加数据库默认值；或
    - 在导入时识别「旧版本快照」并补齐默认值，或明确报错拒绝（当前行为：`version` 校验 + 列交集）。
 3. **新增需要随「清空」处理的数据** → 在 `clearData` 的 `clearSessions` / `clearRequests` /
    `clearProviders` 对应分支补删除或断引用逻辑；引用 `narrators.id` 的新表若为 NOT NULL，
    还必须先把它拆开（当前做法：可空列置 NULL；不可空列保留行、改为 UPDATE）。
-4. **新增会话级关联表** → 导出自动包含；导入若需要合并，补 `copyTable`；
-   覆盖会话时若新表引用该会话，按第 3 条处理引用。
+4. **新增会话级关联表** → 加进 `SNAPSHOT_TABLES` 并补 `copyTable`。跳过会话时要按
+   `narrator_id`（或经消息间接）排除该会话的行。覆盖会话只按主键合并，不删除本地行。
 5. **改完必跑**：
    ```bash
    bun test --isolate server/services/__tests__/data-portability*.test.ts
