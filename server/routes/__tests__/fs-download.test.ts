@@ -19,7 +19,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
-import { resetDownloadTickets } from "../../lib/fs-download-ticket";
+import { DOWNLOAD_TICKET_MAX_CLAIMS, resetDownloadTickets } from "../../lib/fs-download-ticket";
 import { narraforkDir } from "../../lib/settings";
 import { fsPublicDownloadRoutes, fsRoutes } from "../fs";
 
@@ -432,18 +432,24 @@ describe("public ticket route and the session gate", () => {
 		expect(res.status).toBe(401);
 	});
 
-	test("refuses a replayed ticket with no session", async () => {
+	test("serves the claim budget, then refuses another replay with no session", async () => {
 		const file = join(dir, "replay.txt");
 		writeFileSync(file, "once");
 		const ticket = await mint(file);
 
-		expect(
-			(await layered.request(downloadUrl(`ticket=${encodeURIComponent(ticket)}`))).status,
-		).toBe(200);
+		for (let i = 0; i < DOWNLOAD_TICKET_MAX_CLAIMS; i += 1) {
+			const res = await layered.request(downloadUrl(`ticket=${encodeURIComponent(ticket)}`));
+			expect(res.status).toBe(200);
+			expect(await res.text()).toBe("once");
+		}
 
 		const replay = await layered.request(downloadUrl(`ticket=${encodeURIComponent(ticket)}`));
 		expect(replay.status).toBe(403);
-		expect(await replay.json()).toMatchObject({ code: "DOWNLOAD_TICKET_ALREADY_USED" });
+		expect(replay.headers.get("content-type")).toContain("text/html");
+		const body = await replay.text();
+		expect(body).toContain("DOWNLOAD_TICKET_ALREADY_USED");
+		expect(body).toContain("already used");
+		expect(body).not.toContain(file);
 	});
 
 	test("refuses a forged ticket without leaking the path", async () => {
@@ -479,7 +485,11 @@ describe("public ticket route and the session gate", () => {
 		const res = await layered.request(downloadUrl(`ticket=${encodeURIComponent(ticket)}`));
 
 		expect(res.status).toBe(403);
-		expect(await res.json()).toMatchObject({ code: "DOWNLOAD_UNAVAILABLE" });
+		expect(res.headers.get("content-type")).toContain("text/html");
+		const body = await res.text();
+		expect(body).toContain("DOWNLOAD_UNAVAILABLE");
+		expect(body).toContain("no longer available");
+		expect(body).not.toContain(file);
 	});
 
 	test("carries a non-ASCII name through RFC 5987 on the ticket route too", async () => {

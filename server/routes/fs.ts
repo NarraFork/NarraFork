@@ -300,15 +300,19 @@ fsRoutes.post("/reveal", async (c) => {
  * process that already holds the file can do it with one helper call. The clipboard involved is
  * the server machine's, so this is only meaningful for a browser running on that machine: a
  * remote caller would copy the file onto someone else's clipboard and see nothing happen. Hence
- * the `isLocalMachineAddress` refusal, which is the same test `POST /fs/reveal` uses to decide
- * whether an action is visible to the caller.
+ * the `isLocalMachineAddress` refusal. The menu may also show the action when the user has opted
+ * into "treat as local access"; that preference is not a credential, so a remote browser still
+ * gets 403 here.
  *
  * The response is deliberately only `{ ok: true }`: the copy is not observable from here, and
  * reporting success is honest because the helper exits 0 only after taking the clipboard.
  */
 fsRoutes.post("/copy-file-to-clipboard", async (c) => {
-	const body = await c.req.json<{ path?: string }>();
-	const { path: rawPath } = body;
+	const body = await readJsonBody(c.req);
+	const rawPath =
+		typeof (body as { path?: unknown } | null)?.path === "string"
+			? (body as { path: string }).path
+			: "";
 	if (!rawPath) {
 		throw new ValidationError("path is required");
 	}
@@ -342,7 +346,11 @@ fsRoutes.post("/copy-file-to-clipboard", async (c) => {
 	} catch (error) {
 		// Missing wl-copy/xclip, a helper that refuses the path, a desktop that never answers:
 		// all of it is the caller's environment, not a server fault, and the message says which.
-		throw new AppError(error instanceof Error ? error.message : String(error), 500);
+		throw new AppError(
+			error instanceof Error ? error.message : String(error),
+			422,
+			"CLIPBOARD_UNAVAILABLE",
+		);
 	}
 
 	return c.json({ ok: true });
@@ -1000,9 +1008,42 @@ function buildFileDownloadResponse(absPath: string, size: number): Response {
 	});
 }
 
-/** The over-limit answer, identical on both routes so a client can rely on one code. */
+/** The over-limit answer for a session client, which reads JSON. */
 function tooLargeToDownload(c: Context): Response {
 	return c.json({ error: "File too large to download" }, 413);
+}
+
+function escapeHtml(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
+/**
+ * What a human sees when the ticket navigation itself fails.
+ *
+ * The browser opened this URL in a tab. JSON would be readable but looks like a broken download;
+ * an HTML page with no path in it is the sentence, and CSP keeps it from becoming a script.
+ */
+function downloadFailureDocument(message: string, code: string, status: 403 | 413): Response {
+	const html = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Download failed</title>
+<p>${escapeHtml(message)}</p>
+<p><code>${escapeHtml(code)}</code></p>
+`;
+	return new Response(html, {
+		status,
+		headers: {
+			"Content-Type": "text/html; charset=utf-8",
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
+			"Content-Security-Policy": "default-src 'none'",
+		},
+	});
 }
 
 /**
@@ -1028,14 +1069,14 @@ fsRoutes.get("/download", async (c) => {
 });
 
 /**
- * POST /api/fs/download-ticket — mint a single-use URL credential for one file.
+ * POST /api/fs/download-ticket — mint a short-lived URL credential for one file.
  *
  * Exists so the browser can perform the download itself. The client cannot simply be
  * pointed at `/download?path=…`: that route authenticates with an `Authorization`
  * header, and a navigation carries none. Fetching the bytes into a Blob instead costs a
- * full copy in page memory, cannot report progress, loses Range, and lands in the
- * browser's "download not triggered by a user gesture" heuristics because the click
- * gesture is over by the time the first `await` resolves.
+ * full copy in page memory and cannot report progress. The click handler opens the tab
+ * before this request is awaited, then navigates that tab here; the gesture is the
+ * `window.open`, not this response.
  *
  * The path is validated HERE, while a session is present and the answer can be a specific
  * JSON error. The ticket then carries only a random nonce — never the path — so the URL
@@ -1096,7 +1137,7 @@ fsPublicDownloadRoutes.get("/download", async (c, next) => {
 				: claim.reason === "expired"
 					? "This download link has expired. Try downloading the file again."
 					: "Invalid download link.";
-		return c.json({ error: message, code: `DOWNLOAD_TICKET_${claim.reason.toUpperCase()}` }, 403);
+		return downloadFailureDocument(message, `DOWNLOAD_TICKET_${claim.reason.toUpperCase()}`, 403);
 	}
 
 	// Re-validate: up to a minute passed since the ticket was minted, and the bytes on disk
@@ -1111,14 +1152,15 @@ fsPublicDownloadRoutes.get("/download", async (c, next) => {
 		logger.debug("Download ticket path no longer downloadable", {
 			error: error instanceof Error ? error.message : String(error),
 		});
-		return c.json(
-			{ error: "This file is no longer available for download.", code: "DOWNLOAD_UNAVAILABLE" },
+		return downloadFailureDocument(
+			"This file is no longer available for download.",
+			"DOWNLOAD_UNAVAILABLE",
 			403,
 		);
 	}
 
 	if (resolved.size > MAX_DOWNLOAD_BYTES) {
-		return tooLargeToDownload(c);
+		return downloadFailureDocument("File too large to download", "DOWNLOAD_TOO_LARGE", 413);
 	}
 
 	return buildFileDownloadResponse(resolved.absPath, resolved.size);

@@ -6,7 +6,7 @@
  * `.jar`, a `.zip` or a `.pdf` can never be copied from the page — while the same file can be
  * copied with one OS call by the process that already has it on disk. The result is a real file
  * on the clipboard (`CF_HDROP` on Windows, a file URL elsewhere): something the user can paste
- * into Explorer / Finder / Nautilus and get the file itself.
+ * into Explorer / Finder / a file manager and get the file itself.
  *
  * That also fixes the visibility rule. The clipboard written here belongs to the machine the
  * SERVER runs on, so from a remote browser the user would see nothing happen. The menu item is
@@ -28,6 +28,12 @@ const STDERR_GRACE_MS = 300;
 /** Cap on captured stderr. These tools print one line, not a log. */
 const MAX_STDERR_CHARS = 2_048;
 
+/** What Nautilus and Thunar paste as a file. `text/uri-list` alone is ignored by Nautilus. */
+const GNOME_COPIED_FILES = "x-special/gnome-copied-files";
+
+/** What Dolphin and most non-GNOME receivers paste as a file. */
+const URI_LIST = "text/uri-list";
+
 export class ClipboardCopyError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -40,6 +46,13 @@ export interface ClipboardCommand {
 	args: string[];
 	/** Fed to the child's stdin, which is then closed. */
 	stdin?: string;
+}
+
+export interface ClipboardCommandOptions {
+	platform?: string;
+	which?: (name: string) => string | null;
+	/** Session variables. Defaults to the process environment. */
+	env?: NodeJS.ProcessEnv;
 }
 
 /** PowerShell single-quoted literal: the value is taken verbatim, quotes doubled. */
@@ -61,15 +74,36 @@ function fileUrl(path: string): string {
 	return `file://${encoded}`;
 }
 
+function desktopNames(env: NodeJS.ProcessEnv): string {
+	return [env.XDG_CURRENT_DESKTOP, env.XDG_SESSION_DESKTOP, env.DESKTOP_SESSION]
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
+		.join(":")
+		.toLowerCase();
+}
+
+/** KDE pastes `text/uri-list`. GNOME Files does not; it wants the gnome-copied-files target. */
+function prefersUriList(env: NodeJS.ProcessEnv): boolean {
+	const names = desktopNames(env);
+	return names.includes("kde") || names.includes("plasma");
+}
+
+function linuxClipboardBody(path: string, env: NodeJS.ProcessEnv): { type: string; body: string } {
+	const uri = fileUrl(path);
+	if (prefersUriList(env)) return { type: URI_LIST, body: `${uri}\r\n` };
+	// `copy` is the operation. A trailing newline is part of the format Nautilus writes.
+	return { type: GNOME_COPIED_FILES, body: `copy\n${uri}\n` };
+}
+
 /**
  * Windows: put the file in the clipboard's file drop list (`CF_HDROP`), which is what makes a
  * paste in Explorer copy the file rather than its path.
  *
  * Not `Set-Clipboard -LiteralPath`, the obvious call, for two measured reasons: Windows
  * PowerShell 5.1 has it but PowerShell 7 does not (`-Path` is gone from 7 as well — it only
- * accepts `-Value`), so the same script cannot serve both shells. The WinForms call works
- * identically in 5.1 and 7, needs no STA apartment, and treats the value as a literal path
- * (no wildcard expansion, unlike `-Path`).
+ * accepts `-Value`), so the same script cannot serve both shells. The WinForms call works in
+ * both, and treats the value as a literal path (no wildcard expansion, unlike `-Path`).
+ * `-STA` is required: PowerShell 7 starts in MTA, and `Clipboard.SetFileDropList` throws unless
+ * the thread is STA. Windows PowerShell 5.1 accepts the same flag.
  */
 function windowsClipboardScript(path: string): string {
 	return [
@@ -80,61 +114,84 @@ function windowsClipboardScript(path: string): string {
 	].join("; ");
 }
 
-/**
- * The command that puts `path` on this machine's clipboard.
- *
- * Exported for tests: the argv shape decides whether a path containing quotes, spaces or a
- * leading dash is copied or silently mangled.
- */
-export function buildClipboardCommand(
+function linuxCommands(
 	path: string,
-	options: { platform?: string; which?: (name: string) => string | null } = {},
-): ClipboardCommand {
-	const platform = options.platform ?? process.platform;
-	const which = options.which ?? ((name: string) => Bun.which(name));
+	which: (name: string) => string | null,
+	env: NodeJS.ProcessEnv,
+): ClipboardCommand[] {
+	const { type, body } = linuxClipboardBody(path, env);
+	const wlCopy = which("wl-copy");
+	const xclip = which("xclip");
+	const wayland = wlCopy ? { command: wlCopy, args: ["--type", type], stdin: body } : null;
+	const x11 = xclip
+		? { command: xclip, args: ["-selection", "clipboard", "-t", type], stdin: body }
+		: null;
 
-	if (platform === "win32") {
-		// Windows PowerShell is on every install; pwsh is the fallback for hosts that removed it.
-		const shell = which("powershell.exe") ?? which("pwsh") ?? "powershell.exe";
-		return {
-			command: shell,
-			args: ["-NoProfile", "-NonInteractive", "-Command", windowsClipboardScript(path)],
-		};
-	}
-
-	if (platform === "darwin") {
-		// `POSIX file` puts a file reference (furl) on the pasteboard: pasting in Finder copies it.
-		return {
-			command: "osascript",
-			args: ["-e", `set the clipboard to (POSIX file ${appleScriptLiteral(path)})`],
-		};
-	}
-
-	if (platform === "linux") {
-		// Wayland first (wl-copy), then X11 (xclip). `text/uri-list` is the target that makes a
-		// file manager paste the file itself instead of its path as plain text.
-		const wlCopy = which("wl-copy");
-		if (wlCopy) {
-			return {
-				command: wlCopy,
-				args: ["--type", "text/uri-list"],
-				stdin: `${fileUrl(path)}\r\n`,
-			};
-		}
-		const xclip = which("xclip");
-		if (xclip) {
-			return {
-				command: xclip,
-				args: ["-selection", "clipboard", "-t", "text/uri-list"],
-				stdin: `${fileUrl(path)}\r\n`,
-			};
-		}
+	// Prefer the helper that matches the session. The other is only a fallback when the first
+	// exits non-zero: installing wl-copy on an X11 box must not steal the clipboard attempt.
+	const waylandSession = Boolean(env.WAYLAND_DISPLAY);
+	const x11Session = Boolean(env.DISPLAY);
+	const ordered: Array<ClipboardCommand | null> =
+		waylandSession || !x11Session ? [wayland, x11] : [x11, wayland];
+	const commands = ordered.filter((command): command is ClipboardCommand => command !== null);
+	if (commands.length === 0) {
 		throw new ClipboardCopyError(
 			"Copying a file needs wl-copy (Wayland) or xclip (X11); neither is installed",
 		);
 	}
+	return commands;
+}
+
+/**
+ * The commands that put `path` on this machine's clipboard, in the order they should be tried.
+ *
+ * Exported for tests: the argv shape decides whether a path containing quotes, spaces or a
+ * leading dash is copied or silently mangled, and which MIME type a file manager will paste.
+ */
+export function buildClipboardCommands(
+	path: string,
+	options: ClipboardCommandOptions = {},
+): ClipboardCommand[] {
+	const platform = options.platform ?? process.platform;
+	const which = options.which ?? ((name: string) => Bun.which(name));
+	const env = options.env ?? process.env;
+
+	if (platform === "win32") {
+		// Windows PowerShell is on every install; pwsh is the fallback for hosts that removed it.
+		const shell = which("powershell.exe") ?? which("pwsh") ?? "powershell.exe";
+		return [
+			{
+				command: shell,
+				args: ["-NoProfile", "-NonInteractive", "-STA", "-Command", windowsClipboardScript(path)],
+			},
+		];
+	}
+
+	if (platform === "darwin") {
+		// `POSIX file` puts a file reference (furl) on the pasteboard: pasting in Finder copies it.
+		return [
+			{
+				command: "osascript",
+				args: ["-e", `set the clipboard to (POSIX file ${appleScriptLiteral(path)})`],
+			},
+		];
+	}
+
+	if (platform === "linux") return linuxCommands(path, which, env);
 
 	throw new ClipboardCopyError(`Copying a file to the clipboard is not supported on ${platform}`);
+}
+
+/** The first command `buildClipboardCommands` would try. */
+export function buildClipboardCommand(
+	path: string,
+	options: ClipboardCommandOptions = {},
+): ClipboardCommand {
+	const [command] = buildClipboardCommands(path, options);
+	if (!command) {
+		throw new ClipboardCopyError(`Copying a file to the clipboard is not supported`);
+	}
+	return command;
 }
 
 function delay(ms: number): Promise<void> {
@@ -178,16 +235,21 @@ async function run(command: ClipboardCommand, path: string): Promise<void> {
 	})();
 
 	let timedOut = false;
-	const timeout = delay(CLIPBOARD_TIMEOUT_MS).then(() => {
-		timedOut = true;
-		try {
-			child.kill();
-		} catch {
-			// Already gone; the timeout message below is the real outcome.
-		}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<null>((resolve) => {
+		timer = setTimeout(() => {
+			timedOut = true;
+			try {
+				child.kill();
+			} catch {
+				// Already gone; the timeout message below is the real outcome.
+			}
+			resolve(null);
+		}, CLIPBOARD_TIMEOUT_MS);
 	});
 
-	const exitCode = await Promise.race([child.exited, timeout.then(() => null)]);
+	const exitCode = await Promise.race([child.exited, timeout]);
+	if (timer) clearTimeout(timer);
 	// Let a normal helper's stderr land, without waiting on one that forked.
 	await Promise.race([drain, delay(STDERR_GRACE_MS)]);
 
@@ -208,10 +270,21 @@ async function run(command: ClipboardCommand, path: string): Promise<void> {
  * Copy `path` to this machine's clipboard.
  *
  * The caller must already have established that the request came from a browser on this machine
- * and that `path` is an existing file; this function only performs the copy.
+ * and that `path` is an existing file; this function only performs the copy. On Linux the first
+ * helper that exits 0 wins, so a Wayland session does not stop at a failing `xclip`.
  */
 export async function copyFileToSystemClipboard(path: string): Promise<void> {
-	await run(buildClipboardCommand(path), path);
+	const commands = buildClipboardCommands(path);
+	let lastError: Error | undefined;
+	for (const command of commands) {
+		try {
+			await run(command, path);
+			return;
+		} catch (error) {
+			lastError = error instanceof Error ? error : new ClipboardCopyError(String(error));
+		}
+	}
+	throw lastError ?? new ClipboardCopyError("Could not copy the file to the clipboard");
 }
 
 /** Whether this platform has a clipboard helper to call at all (the menu gate). */

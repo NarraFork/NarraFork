@@ -1,16 +1,16 @@
 /**
- * fs-download-ticket.ts — one-time tickets that let the BROWSER download a file itself.
+ * fs-download-ticket.ts — short-lived tickets that let the BROWSER download a file itself.
  *
  * ## Why this exists
  *
  * `GET /api/fs/download?path=…` authenticates with a `Bearer` header, so a URL cannot simply be
- * handed to the browser: a navigation carries no such header. The alternative — `fetch()` the
- * bytes into a Blob — costs a full copy in page memory, cannot report progress, loses Range, and
- * is subject to the browser's "download not triggered by a gesture" heuristics because the click
- * gesture ends at the first `await`.
+ * handed to the browser: a navigation carries no such header. Fetching the bytes into a Blob
+ * copies the whole file into page memory, cannot report progress, and loses Range.
  *
- * A ticket fixes all of that by being a credential that travels IN the query string, so the native
- * download path (streamed to disk, progress, resume) stays available.
+ * A ticket is a credential that travels in the query string. The click handler opens a tab
+ * synchronously, then points that tab at the ticket URL once this module has minted one. The
+ * file itself is saved because the response carries `Content-Disposition: attachment`. A rejected
+ * claim is an HTML page in that same tab, not a file saved under the real name.
  *
  * ## What each layer contributes
  *
@@ -24,19 +24,20 @@
  *    rather than trusted. `SIGNING_CONTEXT` domain-separates these signatures from the other uses
  *    of the same secret (MFA challenges, auth-attempt fingerprints) — sharing a key across
  *    protocols without separation is how a signature made for one purpose gets replayed at another.
- * 3. **Consumption is single-use.** A ticket is spent the moment it is claimed, so a leaked URL
- *    cannot be reused after the legitimate download started.
+ * 3. **A ticket may be claimed a few times, then it is spent.** Browsers and download managers
+ *    often probe the URL and then request it again. One claim would make that second request
+ *    fail the download the user just clicked. The cap stays small so a leaked URL is not a
+ *    reusable bearer. Past the cap, the replay is `already_used`, distinct from `unknown`.
  *
- * Spent records are kept until their expiry so a replay is reported as `already_used` rather than
- * the indistinguishable `unknown` — the first is the signature of a leaked URL, the second of a
- * guess.
+ * Records are kept until their expiry so a replay inside the window is reported as `already_used`
+ * rather than the indistinguishable `unknown` — the first is the signature of a leaked URL, the
+ * second of a guess.
  *
  * ## Known trade-off
  *
- * Single-use means a download manager that retries, or a user who resumes an interrupted GB-scale
- * transfer, needs a fresh ticket. That is the correct trade for a credential in a URL (the opposite
- * — a reusable ticket — is a longer-lived bearer token in the clear), and the client asks for a
- * ticket per click, so retrying is a second click rather than a broken state.
+ * A download manager that resumes an interrupted transfer after the window, or after the claim
+ * cap, needs a fresh ticket. That is a second click. The opposite — an unbounded reusable ticket —
+ * would be a longer-lived bearer token sitting in the clear.
  *
  * Tickets are in-memory only: 60 seconds is far too short for persistence to buy anything, and a
  * restart legitimately invalidates every outstanding download URL.
@@ -45,11 +46,18 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { settings } from "./settings";
 
 /**
- * One minute — a ticket only has to survive the trip from an issued response to the browser's
- * navigation, which is the next statement in the click handler. Short enough that a leaked URL is
- * usually already dead by the time anyone finds it.
+ * One minute. Long enough for the click handler to mint a ticket and navigate the tab it already
+ * opened, short enough that a leaked URL is usually dead by the time anyone finds it.
  */
 export const DOWNLOAD_TICKET_TTL_MS = 60_000;
+
+/**
+ * How many times one ticket may be redeemed.
+ *
+ * Two is the browser probe plus the real GET. The third covers a download manager that retries
+ * once inside the same click. It is not a resume token.
+ */
+export const DOWNLOAD_TICKET_MAX_CLAIMS = 3;
 
 /** Bound on live tickets, so clicking download repeatedly cannot grow memory without limit. */
 const MAX_LIVE_TICKETS = 200;
@@ -70,8 +78,8 @@ interface TicketRecord {
 	/** Absolute path, already validated when the ticket was issued. */
 	path: string;
 	expiresAt: number;
-	/** Set once claimed; kept until expiry so a replay says `already_used`. */
-	consumed: boolean;
+	/** Successful claims so far. Kept until expiry so an over-cap replay says `already_used`. */
+	claims: number;
 }
 
 /** Keyed by nonce. */
@@ -96,6 +104,25 @@ function pruneExpired(now: number): void {
 	for (const [nonce, record] of tickets) {
 		if (record.expiresAt <= now) tickets.delete(nonce);
 	}
+}
+
+/**
+ * Free one slot. A ticket the browser already fetched is dropped before one that has not been
+ * claimed yet, so a burst of finished downloads does not cancel a click that is still in flight.
+ */
+function evictOneTicket(): void {
+	const entries = [...tickets.entries()];
+	const claimed = entries.filter(([, record]) => record.claims > 0);
+	const pool = claimed.length > 0 ? claimed : entries;
+	let oldestNonce: string | null = null;
+	let oldestExpiry = Number.POSITIVE_INFINITY;
+	for (const [nonce, record] of pool) {
+		if (record.expiresAt < oldestExpiry) {
+			oldestExpiry = record.expiresAt;
+			oldestNonce = nonce;
+		}
+	}
+	if (oldestNonce) tickets.delete(oldestNonce);
 }
 
 /**
@@ -126,23 +153,11 @@ function signaturesMatch(presented: string, expected: string): boolean {
  */
 export function issueDownloadTicket(absPath: string, now = Date.now()): IssuedDownloadTicket {
 	pruneExpired(now);
-	if (tickets.size >= MAX_LIVE_TICKETS) {
-		// Drop the oldest rather than refusing: a user clicking download should always succeed, and
-		// the evicted ticket is one whose download never started.
-		let oldestNonce: string | null = null;
-		let oldestExpiry = Number.POSITIVE_INFINITY;
-		for (const [nonce, record] of tickets) {
-			if (record.expiresAt < oldestExpiry) {
-				oldestExpiry = record.expiresAt;
-				oldestNonce = nonce;
-			}
-		}
-		if (oldestNonce) tickets.delete(oldestNonce);
-	}
+	if (tickets.size >= MAX_LIVE_TICKETS) evictOneTicket();
 
 	const nonce = randomBytes(NONCE_BYTES).toString("hex");
 	const expiresAt = now + DOWNLOAD_TICKET_TTL_MS;
-	tickets.set(nonce, { path: absPath, expiresAt, consumed: false });
+	tickets.set(nonce, { path: absPath, expiresAt, claims: 0 });
 
 	return {
 		ticket: `${expiresAt.toString(36)}.${nonce}.${sign(absPath, expiresAt, nonce)}`,
@@ -152,7 +167,7 @@ export function issueDownloadTicket(absPath: string, now = Date.now()): IssuedDo
 }
 
 /**
- * Redeem a ticket, consuming it.
+ * Redeem a ticket, counting one claim.
  *
  * Rejections are ordered so the message is the most specific true statement: a forged token is named
  * as forged (not "unknown"), and a spent one as spent (not "unknown"), because those two cases are
@@ -187,17 +202,17 @@ export function claimDownloadTicket(
 		return { ok: false, reason: "forged" };
 	}
 
-	if (record.consumed) {
-		pruneExpired(now);
-		return { ok: false, reason: "already_used" };
-	}
 	if (record.expiresAt <= now) {
 		tickets.delete(nonce);
 		pruneExpired(now);
 		return { ok: false, reason: "expired" };
 	}
+	if (record.claims >= DOWNLOAD_TICKET_MAX_CLAIMS) {
+		pruneExpired(now);
+		return { ok: false, reason: "already_used" };
+	}
 
-	record.consumed = true;
+	record.claims += 1;
 	pruneExpired(now);
 	return { ok: true, path: record.path };
 }

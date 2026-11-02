@@ -7,15 +7,16 @@
  *
  *   - a token that was not minted by this server is refused (`forged`, `unknown`);
  *   - the expiry cannot be extended by editing the token;
- *   - a token is spent the first time it is claimed, and a replay says so as a DISTINCT
- *     reason — "already used" is the signature of a leaked URL, "unknown" of a guess, and an
- *     operator investigating one has to be able to tell them apart;
+ *   - a token may be claimed a few times (a browser probe plus the real GET), and the next
+ *     replay says so as a DISTINCT reason — "already used" is the signature of a leaked URL,
+ *     "unknown" of a guess, and an operator investigating one has to be able to tell them apart;
  *   - the path never travels in the token, so a leaked URL does not disclose the workspace.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
 	claimDownloadTicket,
 	countLiveDownloadTickets,
+	DOWNLOAD_TICKET_MAX_CLAIMS,
 	DOWNLOAD_TICKET_TTL_MS,
 	issueDownloadTicket,
 	resetDownloadTickets,
@@ -75,14 +76,17 @@ describe("claimDownloadTicket", () => {
 	});
 
 	/**
-	 * The single-use property. A leaked URL that was already redeemed by someone else must fail
-	 * HERE — silently serving the file twice is the failure mode a capability URL invites.
+	 * A few claims are allowed so a browser that probes and then downloads still succeeds.
+	 * Past that cap the replay fails HERE — an unlimited URL is the failure mode a capability
+	 * invites.
 	 */
-	test("refuses a replay with a distinct reason", () => {
-		const { issued, now } = mint();
-		expect(claimDownloadTicket(issued.ticket, now + 1).ok).toBe(true);
+	test("allows a few claims, then refuses a replay with a distinct reason", () => {
+		const { issued, path, now } = mint();
+		for (let i = 0; i < DOWNLOAD_TICKET_MAX_CLAIMS; i += 1) {
+			expect(claimDownloadTicket(issued.ticket, now + 1 + i)).toEqual({ ok: true, path });
+		}
 
-		const replay = claimDownloadTicket(issued.ticket, now + 2);
+		const replay = claimDownloadTicket(issued.ticket, now + 10);
 		expect(replay).toEqual({ ok: false, reason: "already_used" });
 	});
 
@@ -230,5 +234,16 @@ describe("bookkeeping", () => {
 
 		// The oldest was dropped, so it reads as unknown rather than granting access.
 		expect(claimDownloadTicket(first.ticket, now + 1)).toEqual({ ok: false, reason: "unknown" });
+	});
+
+	test("a ticket the browser already fetched is evicted before one still waiting", () => {
+		const now = 9_000_000;
+		const pending = issueDownloadTicket("/work/pending.ts", now);
+		const spent = issueDownloadTicket("/work/spent.ts", now);
+		expect(claimDownloadTicket(spent.ticket, now).ok).toBe(true);
+		for (let i = 0; i < 199; i += 1) issueDownloadTicket(`/work/filler-${i}.ts`, now);
+
+		expect(claimDownloadTicket(pending.ticket, now + 1).ok).toBe(true);
+		expect(claimDownloadTicket(spent.ticket, now + 1)).toEqual({ ok: false, reason: "unknown" });
 	});
 });

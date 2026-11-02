@@ -1151,17 +1151,16 @@ export const miscApi = {
 	},
 
 	/**
-	 * Mint a single-use ticket that lets the BROWSER download `path` itself.
+	 * Mint a short-lived ticket that lets the BROWSER download `path` itself.
 	 *
 	 * The alternative — `fsDownload` — fetches the bytes into a Blob, which copies the whole
-	 * file into page memory, cannot show progress, loses Range/resume, and can be blocked by
-	 * the browser's "download not triggered by a user gesture" heuristics because the click
-	 * gesture is over by the time the fetch resolves.
+	 * file into page memory and cannot show progress. The caller opens a tab in the click
+	 * turn, then navigates it to the ticket URL (`navigateDownloadTab`).
 	 *
 	 * The path is validated server-side while the session is present, so a refused path, an
 	 * over-limit file or a vanished file still comes back here as a readable error the caller
-	 * can put in a notification. The returned URL is then navigated to (see
-	 * `fsDownloadUrl`), which is why the ticket — not the path — has to be the credential.
+	 * can put in a notification. The ticket — not the path — is the credential, because the
+	 * URL ends up in history and proxy logs.
 	 */
 	fsDownloadTicket: (path: string) =>
 		request<{ ticket: string; expiresInMs: number }>("/fs/download-ticket", {

@@ -360,7 +360,7 @@ app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
 app.route("/api/update", localPeerUpdateRoutes);
 app.route("/api/system/lifecycle", managerLifecycleRoutes);
 
-// Public: the browser's own file download, authorized by a single-use ticket minted from
+// Public: the browser's own file download, authorized by a short-lived ticket minted from
 // the authenticated `POST /api/fs/download-ticket`. A navigation cannot carry the session's
 // `Authorization` header, so this is what lets the browser stream a download to disk
 // instead of the client buffering it into a Blob. Registered BEFORE the session gate:

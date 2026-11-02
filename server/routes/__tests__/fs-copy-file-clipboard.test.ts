@@ -85,7 +85,21 @@ describe("POST /fs/copy-file-to-clipboard", () => {
 	test("a helper failure is reported with the helper's own message", async () => {
 		copyFailure = new Error("wl-copy is not installed");
 		const response = await copy(filePath, "127.0.0.1");
-		expect(response.status).toBe(500);
+		expect(response.status).toBe(422);
 		expect(await response.text()).toContain("wl-copy is not installed");
+	});
+
+	test("a malformed body is a validation error", async () => {
+		const response = await app.request(
+			"http://localhost/fs/copy-file-to-clipboard",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: "{not json",
+			},
+			{ clientIp: "127.0.0.1" },
+		);
+		expect(response.status).toBe(400);
+		expect(copyCalls).toEqual([]);
 	});
 });

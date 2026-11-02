@@ -8,9 +8,10 @@
  *
  * Why the two items differ in availability:
  *  - download  — the bytes are served by the server to this browser, so it works whether NarraFork
- *                is reached on the server machine or across the network. It downloads through a
- *                single-use ticket so the browser can stream the file to disk itself, rather than
- *                the page buffering the whole file first (`lib/file-download.ts`).
+ *                is reached on the server machine or across the network. The click opens a tab
+ *                immediately, then that tab navigates to a short-lived ticket URL so the browser
+ *                streams the file to disk (`lib/file-download.ts`). A mint failure closes the tab
+ *                and shows a notification. A claim failure stays in the tab as HTML.
  *  - copy file — the file is placed on the clipboard of the machine running NarraFork, which is
  *                why it is offered only when the browser is on that machine
  *                (`isLocalBrowserSession`). A page cannot do this itself: the clipboard API accepts
@@ -21,8 +22,12 @@
  */
 
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
-import { api } from "@frontend/lib/api";
-import { fsDownloadUrl } from "@frontend/lib/file-download";
+import { ApiError, api } from "@frontend/lib/api";
+import {
+	closeDownloadTab,
+	navigateDownloadTab,
+	openDownloadTab,
+} from "@frontend/lib/file-download";
 import { isLocalBrowserSession } from "@frontend/lib/local-origin";
 import { Menu } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
@@ -61,21 +66,33 @@ export function FileLinkMenuItems({
 			notifications.show({
 				color: "red",
 				title: tNarrator("contextMenu_copyFileFailed"),
-				message: error instanceof Error ? error.message : String(error),
+				message:
+					error instanceof ApiError && error.status === 403
+						? tNarrator("contextMenu_copyFileRemote")
+						: error instanceof Error
+							? error.message
+							: String(error),
 			});
 		}
 	};
 
-	const downloadFile = async () => {
+	const downloadFile = async (tab: Window | null) => {
+		if (!tab) {
+			notifications.show({
+				color: "red",
+				title: tNarrator("fileViewer.downloadFailed"),
+				message: tNarrator("contextMenu_downloadPopupBlocked"),
+			});
+			return;
+		}
 		try {
-			// Ask for a single-use ticket first: the validation (path refused, file gone, too
-			// large) happens while the session is present, so the failures a user can actually
-			// act on arrive as notifications instead of a browser error page.
+			// Validation (path refused, file gone, too large) happens while the session is
+			// present, so those failures close the blank tab and show a notification. The tab
+			// was opened in the click handler, before this await.
 			const { ticket } = await api.fsDownloadTicket(target.path);
-			// The navigation IS the download: the browser streams it to disk, so this page
-			// never holds the bytes and stays put while the file saves.
-			fsDownloadUrl(ticket, fileLinkBaseName(target.path));
+			navigateDownloadTab(tab, ticket);
 		} catch (error) {
+			closeDownloadTab(tab);
 			notifications.show({
 				color: "red",
 				title: tNarrator("fileViewer.downloadFailed"),
@@ -100,8 +117,11 @@ export function FileLinkMenuItems({
 			<Menu.Item
 				leftSection={<IconDownload size={14} />}
 				onClick={() => {
+					// Open before any await. `onClose` may unmount this item; the tab handle
+					// is already in the closure that continues the download.
+					const tab = openDownloadTab();
 					onClose();
-					void downloadFile();
+					void downloadFile(tab);
 				}}
 			>
 				{tNarrator("contextMenu_downloadFile")}
