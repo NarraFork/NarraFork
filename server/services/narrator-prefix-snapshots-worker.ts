@@ -1,8 +1,12 @@
 // This worker must never import db/index: no bootstrap, migrations or main-thread DB handle.
-import { Database } from "bun:sqlite";
+// db/connection is fine: it only opens a connection with the shared PRAGMAs.
+import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { parentPort } from "node:worker_threads";
 import { SQL } from "bun";
+import { openDatabase } from "../db/connection";
+import { logger } from "../lib/logger";
 import {
 	PrefixSnapshotCollector,
 	type PrefixSnapshotGcOptions,
@@ -76,15 +80,36 @@ let cache: PrefixSnapshotCache | undefined;
 let collector: PrefixSnapshotCollector | undefined;
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 
+/**
+ * This connection writes to the main NarraFork database, so it comes from `openDatabase()`
+ * like every other writable main-DB handle (see db/connection.ts), keeping the shared PRAGMAs
+ * and the test-database guard. It used to be a bare `new Database()`, which left
+ * `synchronous` at SQLite's default FULL: every GC delete / touch / put then fsynced the WAL
+ * while still holding the write lock. A main-thread store transaction that had already read
+ * (a deferred reader upgrading to a writer, which SQLite does not let wait in the busy
+ * handler) hit that window and failed with "database is locked".
+ * Only the lock wait and page cache are tuned down for this background connection.
+ */
+export function openPrefixSnapshotSqlite(path: string): Database {
+	// openDatabase creates a missing file; this worker never should (the old `create: false`).
+	if (!existsSync(path)) throw new Error("Prefix snapshot database is missing");
+	const db = openDatabase(path);
+	db.run("PRAGMA busy_timeout = 50");
+	db.run("PRAGMA cache_size = -4096");
+	return db;
+}
+
+/** A write statement taking longer than this is logged: it held the database write lock. */
+const SLOW_WRITE_MS = 25;
+const WRITE_STATEMENT = /^\s*(INSERT|UPDATE|DELETE)\b(?:\s+INTO|\s+FROM)?\s+(\w+)/i;
+
 async function connect(request: PrefixSnapshotRequest): Promise<void> {
 	cache ??= new PrefixSnapshotCache(request.cacheBytes);
 	if (request.backend.backend === "sqlite") {
 		if (sqlite) return;
 		if (!request.backend.path || request.backend.path === ":memory:")
 			throw new Error("Prefix snapshots require a file-backed SQLite database");
-		sqlite = new Database(request.backend.path, { readwrite: true, create: false });
-		sqlite.run("PRAGMA busy_timeout = 50");
-		sqlite.run("PRAGMA cache_size = -4096");
+		sqlite = openPrefixSnapshotSqlite(request.backend.path);
 	} else if (!postgres) {
 		postgres = new SQL(request.backend.url, { max: 1, connectTimeout: 5 });
 		await postgres.unsafe("SET statement_timeout = '110s'");
@@ -93,7 +118,23 @@ async function connect(request: PrefixSnapshotRequest): Promise<void> {
 }
 
 async function query<T>(statement: string, parameters: Array<string | number>): Promise<T[]> {
-	if (sqlite) return sqlite.query(statement).all(...parameters) as T[];
+	if (sqlite) {
+		const started = performance.now();
+		const rows = sqlite.query(statement).all(...parameters) as T[];
+		const elapsedMs = performance.now() - started;
+		if (elapsedMs > SLOW_WRITE_MS) {
+			// Autocommit: the statement's duration is how long the main connection was locked
+			// out (plus any time it waited for the lock itself, up to busy_timeout).
+			const write = WRITE_STATEMENT.exec(statement);
+			if (write)
+				logger.warn("Prefix snapshot write held the database write lock", {
+					statement: `${write[1].toUpperCase()} ${write[2]}`,
+					elapsedMs: Math.round(elapsedMs),
+					rows: rows.length,
+				});
+		}
+		return rows;
+	}
 	if (!postgres) throw new Error("Prefix snapshot connection unavailable");
 	let index = 0;
 	return (await postgres.unsafe(
