@@ -31,7 +31,7 @@
 import { AppError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
-import { blockTitle } from "@shared/outline";
+import { blockTitle, compareOrderKeys } from "@shared/outline";
 import type {
 	OutlineAnswerInput,
 	OutlineQuestionGroupResponse,
@@ -86,6 +86,8 @@ export const OUTLINE_QUESTION_LIMITS = {
 	sweepAfterMs: 2 * 60_000,
 	/** Aliases `Qn` read to number new questions; past it questions get no alias. */
 	aliasScan: 5000,
+	/** Children of a block (and of its questions) one read of its questions looks through. */
+	childScan: 2000,
 	/** Messages of the conversation read to find the one a relayed answer came from. */
 	relayMessageScan: 200,
 } as const;
@@ -1336,28 +1338,47 @@ export async function readQuestionsUnder(
 	const space = await store.getSpace(head.spaceId);
 	if (!space) return null;
 	const limit = OUTLINE_QUESTION_LIMITS.group;
-	const firstLevel = head.askJson
-		? [head]
-		: (await store.listChildren(space.id, head.id, OUTLINE_LIMITS.maxSiblings)).filter(
-				(b) => b.askJson,
-			);
-	const questions: OutlineBlockRow[] = [];
+	// Structure first (no content): the questions among the children, and their sub-questions,
+	// in sibling order; then the content of at most `limit` of them.
+	const bySiblingOrder = (x: OutlineBlockMeta, y: OutlineBlockMeta) =>
+		compareOrderKeys(x.orderKey, y.orderKey) || (x.id < y.id ? -1 : 1);
+	const questionsAmong = (metas: readonly OutlineBlockMeta[]) =>
+		metas.filter((m) => !m.deleted && m.askJson !== null).sort(bySiblingOrder);
+	const scan = OUTLINE_QUESTION_LIMITS.childScan;
 	let truncated = false;
-	for (const q of firstLevel) {
-		if (questions.length >= limit) {
-			truncated = true;
-			break;
-		}
-		questions.push(q);
-		const items = (await store.listChildren(space.id, q.id, limit + 1)).filter((b) => b.askJson);
-		for (const item of items) {
-			if (questions.length >= limit) {
-				truncated = true;
-				break;
-			}
-			questions.push(item);
+	let firstLevel: OutlineBlockMeta[];
+	if (head.askJson) firstLevel = [head];
+	else {
+		const children = await store.listChildMetas(space.id, [head.id], scan + 1);
+		truncated = children.length > scan;
+		firstLevel = questionsAmong(children.slice(0, scan));
+	}
+	const items = new Map<string, OutlineBlockMeta[]>();
+	if (firstLevel.length > 0) {
+		const below = await store.listChildMetas(
+			space.id,
+			firstLevel.map((q) => q.id),
+			scan + 1,
+		);
+		if (below.length > scan) truncated = true;
+		for (const meta of questionsAmong(below.slice(0, scan))) {
+			const list = items.get(meta.parentId as string) ?? [];
+			list.push(meta);
+			items.set(meta.parentId as string, list);
 		}
 	}
+	const chosen: string[] = [];
+	for (const q of firstLevel) {
+		for (const meta of [q, ...(items.get(q.id) ?? [])]) {
+			if (chosen.length >= limit) truncated = true;
+			else chosen.push(meta.id);
+		}
+	}
+	const loaded = await blocksById(store, chosen);
+	const questions = chosen.flatMap((id) => {
+		const block = loaded.get(id);
+		return block?.askJson ? [block] : [];
+	});
 	const rows = new Map(
 		(await store.getQuestions(questions.map((q) => q.id))).map((r) => [r.blockId, r]),
 	);
