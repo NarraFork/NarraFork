@@ -26,6 +26,7 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { HumanAttentionItem } from "@shared/human-attention";
+import { parseOriginLabel } from "@shared/message-origin";
 import type {
 	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
@@ -82,10 +83,17 @@ function answerText(t: Translate, q: OutlineQuestionView): string {
 		.filter(Boolean)
 		.join(" · ");
 	const by = a.by.name ?? a.by.userId;
-	return t(a.relayed ? "questions.answeredRelayed" : "questions.answeredBy", {
-		choice: choice || t("questions.theRecommendation"),
-		name: by,
-	});
+	// Relayed from a gateway or an OAuth client: who actually typed (review N-1).
+	const via = a.relayedVia ? parseOriginLabel(a.relayedVia) : null;
+	const door = via ? (via.detail ?? via.source ?? via.raw) : null;
+	return t(
+		a.relayed
+			? door
+				? "questions.answeredRelayedVia"
+				: "questions.answeredRelayed"
+			: "questions.answeredBy",
+		{ choice: choice || t("questions.theRecommendation"), name: by, via: door },
+	);
 }
 
 /**

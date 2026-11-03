@@ -18,9 +18,9 @@
  *   - ANSWER ({@link answerOutlineQuestions}): only the person asked, while they may write the
  *     space: one `answer` commit written as them, their confirmation (§2.3). The asking session
  *     may also write down what that person answered in its own conversation (Q3: `answered`,
- *     relayed, the person still responsible), only in a run their own message started after the
- *     question was asked (the run's trigger; review B1; refused on PostgreSQL); nobody else
- *     answers.
+ *     relayed, the person still responsible), only in the pass of a run their own message started
+ *     after the question was asked (the run's trigger, nothing else written in the run since;
+ *     review B1 and S-1; refused on PostgreSQL); nobody else answers.
  *   - TELLING THE ASKER ({@link deliverOutlineAnswers}): one user message per answering commit,
  *     asking session and asking turn's person, under an id derived from those (a retry finds it),
  *     waking the session when idle (a running loop reads it on its next pass). The wake runs as
@@ -195,6 +195,8 @@ export const OUTLINE_QUESTION_TEXT = {
 		"answers cannot be written down from the conversation on this server yet (its messages are not readable here); ask the person to answer in their inbox",
 	relayNotTheirTurn:
 		"this run was not started by a message from the person asked (a continuation, a wake, a routine or an injected turn started it): only an answer in the message they sent to start this run can be written down; otherwise they answer in their inbox",
+	relayPassOver:
+		"this run went on past the part their message started (a continuation, a wake or another input came in since): only an answer given in the message that started this pass can be written down; otherwise they answer in their inbox",
 	relayBeforeQuestion:
 		"their message that started this run was written before the question was asked, so it cannot be its answer; they answer in their inbox",
 } as const;
@@ -815,27 +817,43 @@ async function withdrawQuestions(
 /** Origin labels of messages a person sent through another door (a gateway, an OAuth app). */
 const PERSON_LABEL = /^(gateway|oauth)(:|$)/;
 
+/** Top-level inputs of one run read to see that nothing but the person spoke after its trigger. */
+const RELAY_PASS_SCAN = 200;
+
 /**
- * The message a relayed answer comes from (review B1, round 2): the message that started the
- * session's run in progress (`narrator_turns.trigger_message_id` of its active turn). A run a
- * continuation or a wake started has no trigger (their prompts are `sys` rows), and one started
- * by an injected user turn (an answer delivered, a notice) carries a system injection block: both
- * are refused. The trigger must be the person's own words (sent by them, a human origin, no
- * routine or agent label) written after the question was asked (`after`). Read on SQLite, by
- * id; refused on PostgreSQL, where runs and the session's messages are not readable here.
+ * The message a relayed answer comes from (review B1), and the door it came through: the message
+ * that started the session's run in progress (`narrator_turns.trigger_message_id` of its active
+ * turn), within the pass it started.
+ *
+ *   - A run a continuation or a wake started has no trigger (their prompts are `sys` rows); one
+ *     an injected user turn (an answer delivered, a notice) started carries a system injection
+ *     block. Both are refused.
+ *   - The trigger must be the person's own words (sent by them, a human origin, no routine or
+ *     agent label: a gateway or an OAuth client may carry them), written after the question was
+ *     asked (`after`).
+ *   - Only the pass it started (review S-1, round 3): an outline continuation, a wake, a `Send`
+ *     resuming a held run or any input not the person's own, written in the run after the
+ *     trigger, ends that pass; a relay after it is refused. Their own further words do not.
+ *
+ * `via`: the trigger's origin label (a gateway handle, an OAuth client), so the record shows who
+ * actually typed (review N-1). Read on SQLite; refused on PostgreSQL, where runs and the
+ * session's messages are not readable here.
  */
 async function relayMessageOf(
 	narratorId: string,
 	userId: string,
 	after: string,
-): Promise<{ id: string } | { problem: string }> {
+): Promise<{ id: string; via: string | null } | { problem: string }> {
 	const { getNarratorMessageRefsPort } = await import("../narrator-refs/store");
 	if (getNarratorMessageRefsPort()) return { problem: OUTLINE_QUESTION_TEXT.relayUnavailable };
 	const { activeTurnId } = await import("../narrator-turns");
 	const turnId = activeTurnId(narratorId);
 	if (!turnId) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
-	const [{ db }, { narratorBlocks, narratorMessages, narratorTurns }, { and, eq, sql }] =
-		await Promise.all([import("@server/db"), import("@server/db/schema"), import("drizzle-orm")]);
+	const [
+		{ db },
+		{ narratorBlocks, narratorMessages, narratorTurns },
+		{ and, asc, eq, gte, inArray, isNull, ne, sql },
+	] = await Promise.all([import("@server/db"), import("@server/db/schema"), import("drizzle-orm")]);
 	const turn = db
 		.select({ trigger: narratorTurns.triggerMessageId })
 		.from(narratorTurns)
@@ -844,42 +862,66 @@ async function relayMessageOf(
 	if (!turn?.trigger) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
 	const m = narratorMessages;
 	const b = narratorBlocks;
+	const columns = {
+		id: m.id,
+		role: m.role,
+		parentToolUseId: m.parentToolUseId,
+		createdBy: m.createdBy,
+		origin: m.origin,
+		originLabel: m.originLabel,
+		createdAt: m.createdAt,
+		// An injected turn carries a system injection block in the envelope's content...
+		injected: sql<number>`instr(${m.contentJson}, '"system_injection"')`,
+	};
 	const row = db
-		.select({
-			id: m.id,
-			role: m.role,
-			parentToolUseId: m.parentToolUseId,
-			createdBy: m.createdBy,
-			origin: m.origin,
-			originLabel: m.originLabel,
-			createdAt: m.createdAt,
-			// An injected turn carries a system injection block in the envelope's content...
-			injected: sql<number>`instr(${m.contentJson}, '"system_injection"')`,
-		})
+		.select(columns)
 		.from(m)
 		.where(and(eq(m.id, turn.trigger), eq(m.narratorId, narratorId)))
 		.get();
+	if (!row) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
+	// The inputs written in this run after its trigger, top level (the toplevel index from the
+	// trigger on, this run's rows only).
+	const later = db
+		.select(columns)
+		.from(m)
+		.where(
+			and(
+				eq(m.narratorId, narratorId),
+				isNull(m.parentToolUseId),
+				gte(m.createdAt, row.createdAt),
+				eq(m.turnId, turnId),
+				ne(m.id, row.id),
+				inArray(m.role, ["user", "sys"]),
+			),
+		)
+		.orderBy(asc(m.createdAt))
+		.limit(RELAY_PASS_SCAN + 1)
+		.all();
 	// ...or, its body kept in rows only (`narratorBlocks.compactJson`), as a context block.
-	const injectedRow =
-		!!row &&
-		!!db
-			.select({ id: b.id })
+	const ids = [row.id, ...later.map((r) => r.id)];
+	const injectedRows = new Set(
+		db
+			.select({ messageId: b.messageId })
 			.from(b)
-			.where(and(eq(b.messageId, row.id), eq(b.kind, "context"), eq(b.subtype, "system_injection")))
-			.limit(1)
-			.get();
-	const ownWords =
-		!!row &&
-		row.role === "user" &&
-		row.parentToolUseId === null &&
-		row.createdBy === userId &&
-		isHumanOrigin(row.origin) &&
-		(row.originLabel === null || PERSON_LABEL.test(row.originLabel)) &&
-		Number(row.injected) === 0 &&
-		!injectedRow;
-	if (!row || !ownWords) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
+			.where(
+				and(inArray(b.messageId, ids), eq(b.kind, "context"), eq(b.subtype, "system_injection")),
+			)
+			.all()
+			.map((r) => r.messageId),
+	);
+	const ownWords = (r: typeof row) =>
+		r.role === "user" &&
+		r.parentToolUseId === null &&
+		r.createdBy === userId &&
+		isHumanOrigin(r.origin) &&
+		(r.originLabel === null || PERSON_LABEL.test(r.originLabel)) &&
+		Number(r.injected) === 0 &&
+		!injectedRows.has(r.id);
+	if (!ownWords(row)) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
 	if (row.createdAt <= after) return { problem: OUTLINE_QUESTION_TEXT.relayBeforeQuestion };
-	return { id: row.id };
+	if (later.length > RELAY_PASS_SCAN || later.some((r) => !ownWords(r)))
+		return { problem: OUTLINE_QUESTION_TEXT.relayPassOver };
+	return { id: row.id, via: row.originLabel };
 }
 
 /** The answer an input gives to a question, or the problem. */
@@ -965,7 +1007,11 @@ async function relayAnswers(
 			problems.push(answer);
 			continue;
 		}
-		answer.relayed = { narratorId: scope.narratorId, messageId: message.id };
+		answer.relayed = {
+			narratorId: scope.narratorId,
+			messageId: message.id,
+			...(message.via ? { via: message.via } : {}),
+		};
 		updates.push({ ...q, ask: { ...q.ask, answer } });
 	}
 	if (problems.length > 0) return failed(problems);
@@ -1202,7 +1248,8 @@ export function outlineAnswerMessageId(
  *
  *   - SQLite: written under the chosen id, then the session is woken when idle (`wakeIfIdle`). A
  *     message already there means a retry: nothing is written again, and the wake the crash may
- *     have cut off is tried again (review N-b; an idle session only).
+ *     have cut off is tried again (review N-b; an idle session only), unless the session already
+ *     replied after the message (review N-2: it read it).
  *   - PostgreSQL (review S6): the message is written through the narrator store's PostgreSQL port,
  *     and NO wake is attempted: the session runtime does not run on PostgreSQL yet, so the session
  *     reads the answer on its next turn. The chosen id is not used there (`deliverInjection`
@@ -1218,7 +1265,7 @@ const realDelivery: OutlineAnswerDelivery = {
 			? { version: 1 as const, userId: message.executionUserId }
 			: undefined;
 		if (!postgres) {
-			const [{ db }, { narratorMessages }, { and, eq }] = await Promise.all([
+			const [{ db }, { narratorMessageRefs, narratorMessages }, { and, eq }] = await Promise.all([
 				import("@server/db"),
 				import("@server/db/schema"),
 				import("drizzle-orm"),
@@ -1233,11 +1280,28 @@ const realDelivery: OutlineAnswerDelivery = {
 					),
 				)
 				.get();
-			if (existing)
+			if (existing) {
+				// A session that already replied after the message read it: no wake (review N-2, as
+				// the async-question recovery decides it).
+				const ref = db
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, existing.id),
+						),
+					)
+					.limit(1)
+					.get();
+				const { assistantReplyFollowsAnswer } = await import("../narrator-session");
+				if (ref && assistantReplyFollowsAnswer(narratorId, ref.seq))
+					return { written: true, woke: false };
 				return {
 					written: true,
 					woke: await wakeIdleAfterDelivery(narratorId, "en", executionPrincipal),
 				};
+			}
 		}
 		const result = await deliverInjection(narratorId, {
 			...(postgres ? {} : { messageId: message.messageId }),
@@ -1744,6 +1808,7 @@ export async function readQuestionsUnder(
 						by: { userId: ask.answer.by.id, name: names.users.get(ask.answer.by.id) ?? null },
 						at: ask.answer.at,
 						relayed: ask.answer.relayed !== undefined,
+						relayedVia: ask.answer.relayed?.via ?? null,
 					}
 				: null,
 			askedBy: askedBy(row?.askerNarratorId ?? null),

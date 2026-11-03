@@ -78,6 +78,7 @@ const group: OutlineQuestionGroupResponse = {
 				by: { userId: "alice", name: "alice" },
 				at: "2026-11-03T01:00:00.000Z",
 				relayed: true,
+				relayedVia: null,
 			},
 		}),
 	],
@@ -115,6 +116,25 @@ describe("the questions form", () => {
 		// Adopting takes every answerable question with a recommendation.
 		expect(doc.querySelector("[data-testid=outline-questions-adopt-all]")?.textContent).toContain(
 			"(2)",
+		);
+	});
+
+	test("an answer relayed from a gateway says through which door it came (review N-1)", () => {
+		const answered = group.questions[3] as OutlineQuestionView;
+		const doc = render(<OutlineQuestionsForm blockId="task" showOpenLink={false} />, {
+			...group,
+			questions: [
+				{
+					...answered,
+					answer: {
+						...(answered.answer as NonNullable<OutlineQuestionView["answer"]>),
+						relayedVia: "gateway:Telegram @im_stranger",
+					},
+				},
+			],
+		});
+		expect(doc.querySelector("[data-testid=outline-question-4]")?.textContent).toContain(
+			"alice answered in the conversation (via Telegram @im_stranger): v1",
 		);
 	});
 

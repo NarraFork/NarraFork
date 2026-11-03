@@ -19,8 +19,10 @@ import { askTool, outlineEditTool, outlineReadTool } from "../../../lib/agent/to
 import type { ToolContext, ToolResult } from "../../../lib/agent/types";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
+import { buildAgentMessageOrigin } from "../../agent-message-origin";
 import { listHumanAttentionForPrincipal } from "../../human-attention-service";
 import { deliverInjection } from "../../narrator-injection";
+import { narratorService } from "../../narrator-service";
 import { narratorStore } from "../../narrator-store";
 import { endTurn, startTurn } from "../../narrator-turns";
 import { stopEditTextWorker } from "../edit-text-runner";
@@ -505,11 +507,97 @@ describe("Ask", () => {
 		// Her own words after the question, through a gateway too, start a run that may relay.
 		const said = await says(w.a, w.alice, "yes", {
 			origin: "user",
-			originLabel: "gateway:telegram",
+			originLabel: "gateway:telegram @alice_im",
 		});
 		const relayed = await inRun(w.a, relay);
 		expect(relayed.isError).toBeUndefined();
-		expect((await outlineStore.getBlock(q))?.askJson?.answer?.relayed?.messageId).toBe(said);
+		// The record names the message and the door it came through (review N-1).
+		expect((await outlineStore.getBlock(q))?.askJson?.answer?.relayed).toEqual({
+			narratorId: w.a,
+			messageId: said,
+			via: "gateway:telegram @alice_im",
+		});
+		const read = await readQuestionsUnder(w.task.blockId, { userId: w.alice, isAdmin: false });
+		expect(read?.questions[0]?.answer?.relayedVia).toBe("gateway:telegram @alice_im");
+	});
+
+	test("a relay is refused once the run goes on past the pass the person's message started (review S-1)", async () => {
+		const w = await world();
+		await ask(w.ca, {
+			questions: [
+				{ question: "Drop the legacy table?", options: ["no", "yes"], recommend: 2 },
+				{ question: "Keep the backups?", recommend: "yes" },
+			],
+		});
+		const relay = (question: string) => ask(w.ca, { answered: [{ question, adopt: true }] });
+		const passOver = "went on past the part their message started";
+		const prompt = "Outline task continuation: keep working on the task.";
+		// Probe R1c: Alice's unrelated message after the question starts the run; the outline's
+		// continuation then goes on inside the same run, written as narrator-session writes it.
+		await tick();
+		await says(w.a, w.alice, "also fix the typo in the README");
+		await inRun(w.a, async () => {
+			await narratorService.persistSystemMessage(w.a, prompt, [
+				{
+					type: "spec_continuation",
+					task: "Ship the importer",
+					protected: false,
+					modelText: prompt,
+				},
+			]);
+			const refused = await relay("Q1");
+			expect(refused.isError).toBe(true);
+			expect(refused.output).toContain(passOver);
+		});
+		// The same continuation through deliverInjection (the bounded and subagent form).
+		await tick();
+		await says(w.a, w.alice, "and the changelog");
+		await inRun(w.a, async () => {
+			await deliverInjection(w.a, {
+				content: prompt,
+				source: "spec_continuation",
+				schedule: "none",
+				originSource: "autoContinuation",
+			});
+			expect((await relay("Q1")).output).toContain(passOver);
+		});
+		// A held run resumed by another agent's Send, written with the attribution Send carries.
+		await tick();
+		await says(w.a, w.alice, "carry on");
+		await inRun(w.a, async () => {
+			await narratorStore.appendInput(
+				w.a,
+				"The migration is ready",
+				undefined,
+				null,
+				w.alice,
+				buildAgentMessageOrigin({
+					id: w.c,
+					label: "other worker",
+					title: "other worker",
+					isParent: false,
+				}),
+			);
+			expect((await relay("Q1")).output).toContain(passOver);
+		});
+		// Alice's own pass relays, her own further words in it included.
+		await tick();
+		const said = await says(w.a, w.alice, "yes, drop it");
+		await inRun(w.a, async () => {
+			await says(w.a, w.alice, "and keep the backups");
+			const relayed = await relay("Q1");
+			expect(relayed.isError).toBeUndefined();
+		});
+		const q1 = (await outlineStore.getQuestions(
+			(
+				await readQuestionsUnder(w.task.blockId, { userId: w.alice, isAdmin: false })
+			)?.questions.map((q) => q.blockId) ?? [],
+		)) as Array<{ blockId: string; state: string }>;
+		expect(q1.map((r) => r.state).sort()).toEqual(["answered", "open"]);
+		const answered = await outlineStore.getBlock(
+			q1.find((r) => r.state === "answered")?.blockId as string,
+		);
+		expect(answered?.askJson?.answer?.relayed?.messageId).toBe(said);
 	});
 
 	test("a relay with no message from the person at all is refused (probe P1b)", async () => {

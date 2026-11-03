@@ -522,7 +522,7 @@ export function questionNote(node: OutlineNode): string | null {
 			.filter(Boolean)
 			.join(": ");
 		parts.push(
-			`answered${a.relayed ? " (relayed)" : ""}: ${choice || "the recommendation"}${a.adopted ? " (as recommended)" : ""}`,
+			`answered${a.relayed ? (a.relayed.via ? ` (relayed, via ${a.relayed.via})` : " (relayed)") : ""}: ${choice || "the recommendation"}${a.adopted ? " (as recommended)" : ""}`,
 		);
 	} else parts.push("open");
 	return clip(parts.join(" · "), QUESTION_NOTE_CHARS);

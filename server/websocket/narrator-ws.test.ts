@@ -201,6 +201,20 @@ describe("HumanAttention global invalidation", () => {
 		expect(sent.filter((message) => message.type === "human_attention_changed")).toHaveLength(1);
 	});
 
+	it("a targeted wake-up followed by a pending change tells everyone, at the short delay (review N-3)", async () => {
+		const asked = openFakeWs({ userId: "attention-target" });
+		const other = openFakeWs({ userId: "attention-bystander" });
+		const count = (sent: typeof asked.sent) =>
+			sent.filter((message) => message.type === "human_attention_changed").length;
+		eventBus.emit({ type: "human_attention:changed", userIds: ["attention-target"] });
+		eventBus.emit({ type: "outline:pending", spaceId: "space", pageIds: ["page"] });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		// The pending change joined the pending 50 ms wake-up, which now concerns everyone.
+		expect([count(asked.sent), count(other.sent)]).toEqual([1, 1]);
+		await new Promise((resolve) => setTimeout(resolve, 1_100));
+		expect([count(asked.sent), count(other.sent)]).toEqual([1, 1]);
+	});
+
 	it("does not hold a permission request or question back behind an open pending window (review N-c)", async () => {
 		const { sent } = openFakeWs({ userId: "attention-approver" });
 		const count = () => sent.filter((message) => message.type === "human_attention_changed").length;

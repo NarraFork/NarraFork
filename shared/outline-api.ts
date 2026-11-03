@@ -510,6 +510,8 @@ export interface OutlineQuestionView {
 		at: string;
 		/** Written down by the asking session from the conversation. */
 		relayed: boolean;
+		/** The door the relayed message came through (`gateway:…`, `oauth:…`), when not NarraFork. */
+		relayedVia: string | null;
 	} | null;
 	/**
 	 * The asking session. `hidden`: the viewer may not read it, so neither its id nor its title is

@@ -318,6 +318,7 @@
 		"theRecommendation": "采纳建议",
 		"answeredBy": "{{name}} 已回答：{{choice}}",
 		"answeredRelayed": "{{name}} 在对话里回答：{{choice}}",
+		"answeredRelayedVia": "{{name}} 在对话里回答（经 {{via}}）：{{choice}}",
 		"withdrawn": "已撤回",
 		"waitingFor": "等 {{name}} 回答",
 		"notePlaceholder": "补充说明，或用自己的话回答",

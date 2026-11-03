@@ -318,6 +318,7 @@
 		"theRecommendation": "the recommendation",
 		"answeredBy": "Answered by {{name}}: {{choice}}",
 		"answeredRelayed": "{{name}} answered in the conversation: {{choice}}",
+		"answeredRelayedVia": "{{name}} answered in the conversation (via {{via}}): {{choice}}",
 		"withdrawn": "Withdrawn",
 		"waitingFor": "Waiting for {{name}} to answer",
 		"notePlaceholder": "Add a note, or answer in your own words",

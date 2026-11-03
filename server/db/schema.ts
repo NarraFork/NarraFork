@@ -5495,7 +5495,11 @@ export interface OutlineAskAnswerJson {
 	/** The person whose decision it is. */
 	by: OutlineTaskActorRef;
 	at: string;
-	relayed?: { narratorId: string; messageId: string | null };
+	/**
+	 * `via`: the origin label of the message it came from when it did not come through NarraFork
+	 * itself (`gateway:<platform handle>`, `oauth:<client>`): who actually typed it.
+	 */
+	relayed?: { narratorId: string; messageId: string | null; via?: string };
 }
 
 /**

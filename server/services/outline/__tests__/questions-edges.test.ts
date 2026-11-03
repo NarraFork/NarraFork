@@ -23,6 +23,7 @@ import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { outlineAnswerBodySchema } from "../../../lib/validators/outline";
 import { setInjectionScheduler } from "../../narrator-injection";
+import { narratorPersistence } from "../../narrator-persistence";
 import { narratorStore } from "../../narrator-store";
 import { endTurn, startTurn } from "../../narrator-turns";
 import { stopEditTextWorker } from "../edit-text-runner";
@@ -691,6 +692,44 @@ describe("telling", () => {
 			.where(eq(narratorMessages.narratorId, w.a));
 		expect(rows.map((r) => r.id)).toEqual([id]);
 		expect((await outlineStore.getQuestions([q]))[0]?.deliveredAt).not.toBeNull();
+	});
+
+	test("a retry does not wake a session that already replied after the answer (review N-2)", async () => {
+		const w = await world();
+		const asked = await ask(w.ca, { questions: [{ question: "Format?", recommend: "v2" }] });
+		const { id: q } = await questionOf(asked);
+		const done = await answerOutlineQuestions({
+			userId: w.alice.id,
+			answers: [{ blockId: q, adopt: true }],
+			deliver: false,
+		});
+		const id = outlineAnswerMessageId(done.commitId as string, w.a, {
+			askerNarratorId: w.a,
+			askerUserId: w.alice.id,
+		});
+		// The message was written (with its ref) and the session went on and replied to it; then
+		// the process died before the row was marked.
+		await narratorStore.appendInput(
+			w.a,
+			"alice answered your questions",
+			undefined,
+			null,
+			w.alice.id,
+			undefined,
+			{
+				messageId: id,
+			},
+		);
+		await narratorPersistence.persistAssistantMessage(w.a, {
+			uuid: generateId(),
+			session_id: "outline-answer-reply",
+			message: { content: [{ type: "text", text: "Noted: v2 it is." }] },
+		});
+		setOutlineAnswerDelivery(null);
+		const wakes = fakeWakes(true);
+		const retried = await deliverOutlineAnswers([q]);
+		expect(retried).toMatchObject({ delivered: 1, told: [w.a], woke: 0 });
+		expect(wakes).toEqual([]);
 	});
 
 	test("two archived askers told through the task's holder get a message each (review R2)", async () => {
