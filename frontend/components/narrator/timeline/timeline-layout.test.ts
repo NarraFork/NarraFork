@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { TimelineLane } from "@shared/narrator-timeline";
+import type { TimelineLane, TimelineSegment } from "@shared/narrator-timeline";
 import {
 	branchConnectors,
 	chooseTickStep,
@@ -8,10 +8,17 @@ import {
 	fitPxPerSec,
 	formatSpan,
 	laneCenterY,
+	MAX_CONTENT_PX,
 	MAX_PX_PER_SEC,
+	segmentIndexAt,
 	ticks,
 	timeToX,
+	visibleSegmentIndices,
 } from "./timeline-layout";
+
+function seg(startMs: number, endMs: number): TimelineSegment {
+	return { category: "tool", startMs, endMs, itemIds: [] };
+}
 
 function lane(over: Partial<TimelineLane>): TimelineLane {
 	return {
@@ -49,6 +56,49 @@ describe("timeline layout", () => {
 		expect(chooseTickStep(10)).toBe(10_000);
 		expect(chooseTickStep(1000)).toBe(100);
 		expect(ticks(2500, 1000)).toEqual([0, 1000, 2000]);
+	});
+
+	test("ticks cover only the requested window and stay bounded", () => {
+		expect(ticks(10_000, 1000, 2500, 5000)).toEqual([3000, 4000, 5000]);
+		expect(ticks(10_000, 1000, 9500, 20_000)).toEqual([10_000]);
+		expect(ticks(1e12, 1, 0, 1e12)).toHaveLength(400);
+		expect(ticks(1000, 0)).toEqual([]);
+	});
+
+	test("caps zoom so the track stays within the max content width", () => {
+		const spanMs = 24 * 3600_000;
+		const px = clampPxPerSec(MAX_PX_PER_SEC, spanMs);
+		expect((spanMs / 1000) * px).toBeLessThanOrEqual(MAX_CONTENT_PX + 1e-6);
+		expect(clampPxPerSec(5, 10_000)).toBe(5);
+	});
+
+	test("draws only segments in the pixel window, merging slivers", () => {
+		const segments = [
+			seg(0, 1000),
+			seg(1000, 1001),
+			seg(1001, 1005),
+			seg(1005, 3000),
+			seg(3000, 9000),
+		];
+		// 1 px per 10 ms: the two short segments fall under one pixel, the longer one wins.
+		expect(visibleSegmentIndices(segments, 0, 100, 0, 1000)).toEqual([0, 2, 3, 4]);
+		expect(visibleSegmentIndices(segments, 0, 100, 150, 250)).toEqual([3]);
+		expect(visibleSegmentIndices(segments, 0, 100, 900, 1000)).toEqual([]);
+	});
+
+	test("visible segment count is bounded by window width", () => {
+		const segments = Array.from({ length: 100_000 }, (_, i) => seg(i, i + 1));
+		const out = visibleSegmentIndices(segments, 0, 10, 0, 500);
+		expect(out.length).toBeLessThanOrEqual(500);
+		expect(out.length).toBeGreaterThan(0);
+	});
+
+	test("finds a segment by start", () => {
+		const segments = [seg(0, 10), seg(10, 20), seg(20, 30)];
+		expect(segmentIndexAt(segments, 10)).toBe(1);
+		expect(segmentIndexAt(segments, 20)).toBe(2);
+		expect(segmentIndexAt(segments, 15)).toBe(-1);
+		expect(segmentIndexAt([], 0)).toBe(-1);
 	});
 
 	test("formats spans", () => {

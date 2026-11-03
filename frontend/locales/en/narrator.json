@@ -2570,6 +2570,7 @@
 		"branchFrom": "Spawned by {{tool}} at {{at}}",
 		"omittedLanes": "{{count}} more subagents not shown",
 		"truncated": "Too many segments; the shortest were merged",
+		"notCovered": "{{lane}} has more activity than the read limit; the part after {{at}} is not shown",
 		"openSubagent": "Open subagent session",
 		"closeDetail": "Close details",
 		"clickHint": "Click a segment on the timeline to see its details",
@@ -2590,7 +2591,8 @@
 			"ttft": "Time to first token",
 			"tokens": "Input / output tokens",
 			"noItems": "No record covers this span: usually scheduling between model requests, result persistence and context preparation.",
-			"afterTurn": "The turn has ended while a subagent is still running."
+			"afterTurn": "The turn has ended while a subagent is still running.",
+			"merged": "Merged from {{count}} short segments, coloured by the largest share:"
 		},
 		"category": {
 			"model_wait": "Waiting for first token",

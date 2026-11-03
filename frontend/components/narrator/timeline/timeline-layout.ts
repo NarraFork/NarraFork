@@ -3,7 +3,7 @@
  * the dashed branch connector from a parent lane to a child lane.
  */
 
-import type { TimelineCategory, TimelineLane } from "@shared/narrator-timeline";
+import type { TimelineCategory, TimelineLane, TimelineSegment } from "@shared/narrator-timeline";
 
 export const LANE_HEIGHT = 30;
 export const LANE_GAP = 10;
@@ -33,9 +33,17 @@ export const CATEGORY_OPACITY: Partial<Record<TimelineCategory, number>> = {
 	after_turn: 0.25,
 };
 
-export function clampPxPerSec(value: number): number {
+/** Widest scrollable track; browsers stop laying out elements somewhere past 16M px. */
+export const MAX_CONTENT_PX = 8_000_000;
+
+/** Clamp a zoom; with `spanMs`, also keep the whole track within {@link MAX_CONTENT_PX}. */
+export function clampPxPerSec(value: number, spanMs?: number): number {
 	if (!Number.isFinite(value)) return 1;
-	return Math.min(MAX_PX_PER_SEC, Math.max(MIN_PX_PER_SEC, value));
+	const max =
+		spanMs && spanMs > 0
+			? Math.max(MIN_PX_PER_SEC, Math.min(MAX_PX_PER_SEC, (MAX_CONTENT_PX * 1000) / spanMs))
+			: MAX_PX_PER_SEC;
+	return Math.min(max, Math.max(MIN_PX_PER_SEC, value));
 }
 
 /** Zoom that fits `spanMs` into `widthPx`. */
@@ -61,11 +69,76 @@ export function chooseTickStep(pxPerSec: number, minGapPx = 80): number {
 	return TICK_STEPS_MS[TICK_STEPS_MS.length - 1];
 }
 
-/** Tick offsets (ms from origin) covering `[0, spanMs]`. Bounded to 400 ticks. */
-export function ticks(spanMs: number, stepMs: number): number[] {
+/**
+ * Tick offsets (ms from origin) on the step grid within `[fromMs, toMs] ∩ [0, spanMs]`.
+ * Bounded to 400 ticks; callers pass the visible window, so any zoom stays labelled.
+ */
+export function ticks(spanMs: number, stepMs: number, fromMs = 0, toMs = spanMs): number[] {
 	const out: number[] = [];
-	for (let t = 0; t <= spanMs && out.length < 400; t += stepMs) out.push(t);
+	if (!(stepMs > 0)) return out;
+	const last = Math.min(spanMs, toMs);
+	for (let t = Math.max(0, Math.ceil(fromMs / stepMs) * stepMs); t <= last; t += stepMs) {
+		out.push(t);
+		if (out.length >= 400) break;
+	}
 	return out;
+}
+
+/**
+ * Indices of the segments to draw for the track pixels `[fromPx, toPx)`. Segments are sorted
+ * and contiguous, so the first one is found by binary search; a segment entirely under the
+ * previously drawn one (slivers narrower than {@link MIN_SEGMENT_PX}) is not drawn, except
+ * that the longest sliver of such a run takes the slot. Output is bounded by the pixel width
+ * of the range, however many segments the lane has.
+ */
+export function visibleSegmentIndices(
+	segments: readonly TimelineSegment[],
+	originMs: number,
+	pxPerSec: number,
+	fromPx: number,
+	toPx: number,
+): number[] {
+	let lo = 0;
+	let hi = segments.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >> 1;
+		if (timeToX(segments[mid].endMs, originMs, pxPerSec) <= fromPx) lo = mid + 1;
+		else hi = mid;
+	}
+	const out: number[] = [];
+	let drawnRight = Number.NEGATIVE_INFINITY;
+	let drawnIsSliver = false;
+	for (let i = lo; i < segments.length; i++) {
+		const segment = segments[i];
+		const left = timeToX(segment.startMs, originMs, pxPerSec);
+		if (left >= toPx) break;
+		const right = timeToX(segment.endMs, originMs, pxPerSec);
+		if (right <= drawnRight) {
+			const drawn = segments[out[out.length - 1]];
+			if (drawnIsSliver && drawn && segment.endMs - segment.startMs > drawn.endMs - drawn.startMs) {
+				out[out.length - 1] = i;
+			}
+			continue;
+		}
+		out.push(i);
+		drawnIsSliver = right - left < MIN_SEGMENT_PX;
+		drawnRight = Math.max(right, left + MIN_SEGMENT_PX);
+	}
+	return out;
+}
+
+/** Index of the segment starting exactly at `startMs`, or -1. */
+export function segmentIndexAt(segments: readonly TimelineSegment[], startMs: number): number {
+	let lo = 0;
+	let hi = segments.length - 1;
+	while (lo <= hi) {
+		const mid = (lo + hi) >> 1;
+		const at = segments[mid].startMs;
+		if (at === startMs) return mid;
+		if (at < startMs) lo = mid + 1;
+		else hi = mid - 1;
+	}
+	return -1;
 }
 
 /** Compact relative duration label: 850ms, 12.3s, 4m 05s, 1h 02m. */

@@ -5,6 +5,10 @@
  * each subagent spawned during it gets its own lane underneath, joined to the moment
  * on its parent lane it was spawned from by a dashed connector. Every segment is
  * clickable for details. Data comes from `/api/narrators/:id/timeline`.
+ *
+ * Rendering is bounded by the viewport, not the data: each lane draws only the segments
+ * around the visible scroll window, at most one per pixel column, and shares one hover
+ * tooltip, so a dense turn at any zoom keeps a small, steady DOM.
  */
 
 import {
@@ -46,7 +50,15 @@ import {
 	IconZoomReset,
 } from "@tabler/icons-react";
 import type { TFunction } from "i18next";
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import {
+	type CSSProperties,
+	type MouseEvent,
+	memo,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { formatLocaleTime } from "../../../lib/intl-format";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
@@ -65,8 +77,10 @@ import {
 	LANE_HEIGHT,
 	laneCenterY,
 	MIN_SEGMENT_PX,
+	segmentIndexAt,
 	ticks,
 	timeToX,
+	visibleSegmentIndices,
 } from "./timeline-layout";
 import { useNarratorTimeline } from "./useNarratorTimeline";
 
@@ -74,9 +88,10 @@ const LABEL_WIDTH = 168;
 const TRACK_PADDING_RIGHT = 24;
 const TICK_LABEL_WIDTH = 60;
 
+/** A segment is identified by its lane and start, which survive a live refresh. */
 interface Selection {
-	laneIndex: number;
-	segmentIndex: number;
+	narratorId: string;
+	startMs: number;
 }
 
 function formatClock(ms: number): string {
@@ -93,6 +108,8 @@ function segmentStyle(segment: TimelineSegment, left: number, width: number): CS
 		background: CATEGORY_COLOR[segment.category],
 		opacity: CATEGORY_OPACITY[segment.category] ?? 1,
 		cursor: "pointer",
+		border: "none",
+		padding: 0,
 	};
 	if (segment.category === "after_turn") {
 		style.background = `repeating-linear-gradient(45deg, ${CATEGORY_COLOR.after_turn} 0 4px, transparent 4px 8px)`;
@@ -123,6 +140,186 @@ function TurnSelectLabel(turn: TimelineTurnSummary, t: TFunction) {
 	return parts.join(" · ");
 }
 
+function segmentTitle(
+	segment: TimelineSegment,
+	items: Record<string, TimelineItem>,
+	t: TFunction,
+): string {
+	const head = `${t(`timeline.category.${segment.category}`)} · ${formatSpan(
+		segment.endMs - segment.startMs,
+	)}`;
+	if (segment.merged)
+		return `${head} · ${t("timeline.detail.merged", { count: segment.merged.count })}`;
+	if (segment.itemIds.length > 1)
+		return `${head} · ${t("timeline.parallel", { count: segment.itemIds.length })}`;
+	const item = segment.itemIds[0] ? items[segment.itemIds[0]] : undefined;
+	if (!item) return head;
+	if (item.kind === "tool")
+		return `${head} · ${item.toolName}${item.summary ? `: ${item.summary}` : ""}`;
+	return item.model ? `${head} · ${item.model}` : head;
+}
+
+interface LaneTrackProps {
+	lane: TimelineLane;
+	laneIndex: number;
+	items: Record<string, TimelineItem>;
+	origin: number;
+	scale: number;
+	/** Track pixels to draw: the visible window plus a margin on both sides. */
+	fromPx: number;
+	toPx: number;
+	selectedStartMs: number | null;
+	onSelect: (narratorId: string, startMs: number | null) => void;
+	onOpenSubagent?: (narratorId: string) => void;
+}
+
+const LaneTrack = memo(function LaneTrack({
+	lane,
+	laneIndex,
+	items,
+	origin,
+	scale,
+	fromPx,
+	toPx,
+	selectedStartMs,
+	onSelect,
+	onOpenSubagent,
+}: LaneTrackProps) {
+	const { t } = useTranslation("narrator");
+	const [hovered, setHovered] = useState<number | null>(null);
+	const selectedIndex =
+		selectedStartMs === null ? -1 : segmentIndexAt(lane.segments, selectedStartMs);
+
+	const indices = useMemo(() => {
+		const visible = visibleSegmentIndices(lane.segments, origin, scale, fromPx, toPx);
+		if (selectedIndex >= 0 && !visible.includes(selectedIndex)) visible.push(selectedIndex);
+		return visible;
+	}, [lane.segments, origin, scale, fromPx, toPx, selectedIndex]);
+
+	// Built once per data/zoom/window change; hovering only re-renders the tooltip label.
+	const segments = useMemo(
+		() =>
+			indices.map((index) => {
+				const segment = lane.segments[index];
+				const left = timeToX(segment.startMs, origin, scale);
+				const width = timeToX(segment.endMs, origin, scale) - left;
+				const isSelected = index === selectedIndex;
+				const style = segmentStyle(segment, left, width);
+				if (failedSegment(segment, items)) {
+					style.boxShadow = "inset 0 0 0 2px var(--mantine-color-red-6)";
+				}
+				if (isSelected) {
+					style.outline = "2px solid var(--mantine-color-text)";
+					style.zIndex = 1;
+				}
+				const button = (
+					<Box
+						key={segment.startMs}
+						component="button"
+						type="button"
+						data-index={index}
+						aria-label={t(`timeline.category.${segment.category}`)}
+						aria-expanded={isSelected}
+						data-category={segment.category}
+						style={style}
+						onClick={() => onSelect(lane.narratorId, isSelected ? null : segment.startMs)}
+					/>
+				);
+				if (!isSelected) return button;
+				// The detail floats over the page instead of growing the panel.
+				return (
+					<Popover
+						key={segment.startMs}
+						opened
+						onChange={(opened) => !opened && onSelect(lane.narratorId, null)}
+						onDismiss={() => onSelect(lane.narratorId, null)}
+						position="bottom"
+						withArrow
+						shadow="md"
+						width={340}
+						withinPortal
+						closeOnEscape
+						trapFocus={false}
+						middlewares={{ flip: true, shift: true }}
+					>
+						<Popover.Target>{button}</Popover.Target>
+						<Popover.Dropdown p="xs">
+							<ScrollArea.Autosize mah={360} type="auto">
+								<SegmentDetail
+									lane={lane}
+									segment={segment}
+									items={items}
+									onClose={() => onSelect(lane.narratorId, null)}
+									onOpenSubagent={onOpenSubagent}
+								/>
+							</ScrollArea.Autosize>
+						</Popover.Dropdown>
+					</Popover>
+				);
+			}),
+		[indices, lane, items, origin, scale, selectedIndex, onSelect, onOpenSubagent, t],
+	);
+
+	const hoveredSegment =
+		hovered !== null && hovered !== selectedIndex ? lane.segments[hovered] : undefined;
+	const onMouseOver = (event: MouseEvent<HTMLDivElement>) => {
+		const target = (event.target as HTMLElement).closest<HTMLElement>("[data-index]");
+		const index = target ? Number(target.dataset.index) : null;
+		setHovered(index !== null && Number.isFinite(index) ? index : null);
+	};
+
+	return (
+		<Tooltip.Floating
+			label={hoveredSegment ? segmentTitle(hoveredSegment, items, t) : ""}
+			disabled={!hoveredSegment}
+		>
+			<Box
+				data-testid="timeline-lane"
+				onMouseOver={onMouseOver}
+				onMouseLeave={() => setHovered(null)}
+				style={{
+					position: "absolute",
+					left: 0,
+					right: 0,
+					top: laneCenterY(laneIndex) - LANE_HEIGHT / 2,
+					height: LANE_HEIGHT,
+				}}
+			>
+				{segments}
+				{lane.coveredUntilMs !== null && (
+					<Box
+						aria-hidden
+						style={{
+							position: "absolute",
+							left: timeToX(lane.coveredUntilMs, origin, scale),
+							width: Math.max(
+								MIN_SEGMENT_PX,
+								timeToX(lane.endMs, origin, scale) - timeToX(lane.coveredUntilMs, origin, scale),
+							),
+							top: (LANE_HEIGHT - BAR_HEIGHT) / 2,
+							height: BAR_HEIGHT,
+							border: "1px dashed var(--mantine-color-default-border)",
+							pointerEvents: "none",
+						}}
+					/>
+				)}
+				{lane.live && (
+					<Box
+						style={{
+							position: "absolute",
+							left: timeToX(lane.endMs, origin, scale) - 1,
+							top: 2,
+							bottom: 2,
+							width: 2,
+							background: "var(--mantine-color-blue-5)",
+						}}
+					/>
+				)}
+			</Box>
+		</Tooltip.Floating>
+	);
+});
+
 export function NarratorTimelinePanel({
 	narratorId,
 	onContentHeight,
@@ -137,12 +334,19 @@ export function NarratorTimelinePanel({
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null);
-	const { turns, timeline } = useNarratorTimeline(narratorId, selectedTurnId);
+	const {
+		turns: turnList,
+		turnsQuery: turns,
+		timeline,
+		hasOlderTurns,
+		loadOlderTurns,
+	} = useNarratorTimeline(narratorId, selectedTurnId);
 	const [pxPerSec, setPxPerSec] = useState<number | null>(null);
 	const [selection, setSelection] = useState<Selection | null>(null);
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const rootRef = useRef<HTMLDivElement>(null);
 	const [viewportWidth, setViewportWidth] = useState(0);
+	const [scrollX, setScrollX] = useState(0);
 
 	useEffect(() => {
 		const node = rootRef.current;
@@ -165,18 +369,22 @@ export function NarratorTimelinePanel({
 	}, []);
 
 	const data: TurnTimelineResponse | undefined = timeline.data;
-	const turnList = turns.data?.turns ?? [];
 	const activeTurnId = data?.turn?.id ?? null;
 
 	// Escape closes the detail popover. Focus stays on the segment (no focus trap, so the
 	// timeline keeps scrolling and zooming), which is outside the dropdown Mantine listens on.
 	useEffect(() => {
 		if (!selection) return;
+		// Capture phase: the segment button keeps focus, and the portaled popover
+		// stops the bubbling Escape before it reaches a document bubble listener.
 		const onKey = (event: KeyboardEvent) => {
-			if (event.key === "Escape") setSelection(null);
+			if (event.key !== "Escape") return;
+			event.preventDefault();
+			event.stopPropagation();
+			setSelection(null);
 		};
-		document.addEventListener("keydown", onKey);
-		return () => document.removeEventListener("keydown", onKey);
+		document.addEventListener("keydown", onKey, true);
+		return () => document.removeEventListener("keydown", onKey, true);
 	}, [selection]);
 
 	// Switching turns resets the zoom (fit) and the selection.
@@ -189,11 +397,18 @@ export function NarratorTimelinePanel({
 	const spanMs = data ? Math.max(1, data.endMs - data.startMs) : 1;
 	const trackWidth = Math.max(0, viewportWidth - LABEL_WIDTH - TRACK_PADDING_RIGHT);
 	const fit = fitPxPerSec(spanMs, trackWidth);
-	const scale = pxPerSec ?? fit;
+	const scale = pxPerSec === null ? fit : clampPxPerSec(pxPerSec, spanMs);
 	const contentWidth = Math.floor(
 		Math.max(trackWidth, (spanMs / 1000) * scale) + TRACK_PADDING_RIGHT,
 	);
 	const origin = data?.startMs ?? 0;
+
+	// Draw one viewport of margin either side, re-windowed only when the scroll position
+	// crosses into another viewport-sized page, so scrolling does not re-render every frame.
+	const pageWidth = Math.max(1, trackWidth);
+	const page = Math.floor(scrollX / pageWidth);
+	const fromPx = (page - 1) * pageWidth;
+	const toPx = (page + 2) * pageWidth;
 
 	const connectors = useMemo(
 		() => (data ? branchConnectors(data.lanes, origin, scale) : []),
@@ -202,15 +417,28 @@ export function NarratorTimelinePanel({
 	const tickStep = chooseTickStep(scale);
 	// A label is ~60px wide and starts at its tick, so the last one would overhang
 	// the track and add a horizontal scrollbar at fit width.
-	const tickList = ticks(spanMs, tickStep).filter(
+	const tickList = ticks(spanMs, tickStep, (fromPx / scale) * 1000, (toPx / scale) * 1000).filter(
 		(offset) => timeToX(origin + offset, origin, scale) <= contentWidth - TICK_LABEL_WIDTH,
 	);
 
 	const turnIndex = turnList.findIndex((turn) => turn.id === activeTurnId);
 	const olderTurn = turnIndex >= 0 ? turnList[turnIndex + 1] : undefined;
 	const newerTurn = turnIndex > 0 ? turnList[turnIndex - 1] : undefined;
+	const canGoOlder = !!olderTurn || (turnIndex >= 0 && hasOlderTurns);
+	const goOlder = async () => {
+		if (olderTurn) return setSelectedTurnId(olderTurn.id);
+		const result = await loadOlderTurns();
+		const list = result.data?.pages.flatMap((p) => p.turns) ?? [];
+		const next = list[list.findIndex((turn) => turn.id === activeTurnId) + 1];
+		if (next) setSelectedTurnId(next.id);
+	};
 
-	const zoom = (factor: number) => setPxPerSec(clampPxPerSec(scale * factor));
+	const zoom = (factor: number) => setPxPerSec(clampPxPerSec(scale * factor, spanMs));
+	const onSelect = useMemo(
+		() => (laneId: string, startMs: number | null) =>
+			setSelection(startMs === null ? null : { narratorId: laneId, startMs }),
+		[],
+	);
 
 	const totals = useMemo(() => {
 		const sum: Partial<Record<TimelineCategory, number>> = {};
@@ -222,6 +450,10 @@ export function NarratorTimelinePanel({
 		return sum;
 	}, [data]);
 	const primarySpan = data?.lanes[0] ? data.lanes[0].endMs - data.lanes[0].startMs : 0;
+	// Shares of the covered time, which is the whole lane unless it hit its row cap.
+	const coveredSpan = Object.values(totals).reduce((sum, ms) => sum + (ms ?? 0), 0);
+	const merged = data?.lanes.some((lane) => lane.segments.some((segment) => segment.merged));
+	const uncovered = data?.lanes.filter((lane) => lane.coveredUntilMs !== null) ?? [];
 
 	if (turns.isError || timeline.isError) {
 		return (
@@ -248,9 +480,10 @@ export function NarratorTimelinePanel({
 				<ActionIcon
 					variant="subtle"
 					size="sm"
-					disabled={!olderTurn}
+					disabled={!canGoOlder}
+					loading={turns.isFetchingNextPage}
 					aria-label={t("timeline.prevTurn")}
-					onClick={() => olderTurn && setSelectedTurnId(olderTurn.id)}
+					onClick={() => void goOlder()}
 				>
 					<IconChevronLeft size={16} />
 				</ActionIcon>
@@ -341,8 +574,8 @@ export function NarratorTimelinePanel({
 							{t(`timeline.category.${category}`)} {formatSpan(totals[category] ?? 0)}
 							<Text span size="xs" c="dimmed">
 								{" "}
-								{primarySpan > 0
-									? `${Math.round(((totals[category] ?? 0) / primarySpan) * 100)}%`
+								{coveredSpan > 0
+									? `${Math.round(((totals[category] ?? 0) / coveredSpan) * 100)}%`
 									: ""}
 							</Text>
 						</Text>
@@ -403,7 +636,12 @@ export function NarratorTimelinePanel({
 								</Group>
 							))}
 						</Box>
-						<ScrollArea style={{ flex: 1, minWidth: 0 }} type="auto" scrollbarSize={8}>
+						<ScrollArea
+							style={{ flex: 1, minWidth: 0 }}
+							type="auto"
+							scrollbarSize={8}
+							onScrollPositionChange={({ x }) => setScrollX(x)}
+						>
 							<Box
 								style={{
 									position: "relative",
@@ -455,102 +693,21 @@ export function NarratorTimelinePanel({
 									))}
 								</svg>
 								{data.lanes.map((lane, laneIndex) => (
-									<Box
+									<LaneTrack
 										key={lane.narratorId}
-										data-testid="timeline-lane"
-										style={{
-											position: "absolute",
-											left: 0,
-											right: 0,
-											top: laneCenterY(laneIndex) - LANE_HEIGHT / 2,
-											height: LANE_HEIGHT,
-										}}
-									>
-										{lane.segments.map((segment, segmentIndex) => {
-											const left = timeToX(segment.startMs, origin, scale);
-											const width = timeToX(segment.endMs, origin, scale) - left;
-											const isSelected =
-												selection?.laneIndex === laneIndex &&
-												selection.segmentIndex === segmentIndex;
-											const failed = failedSegment(segment, data.items);
-											const style = segmentStyle(segment, left, width);
-											if (failed) style.boxShadow = "inset 0 0 0 2px var(--mantine-color-red-6)";
-											if (isSelected) {
-												style.outline = "2px solid var(--mantine-color-text)";
-												style.zIndex = 1;
-											}
-											const button = (
-												<Box
-													component="button"
-													type="button"
-													aria-label={t(`timeline.category.${segment.category}`)}
-													aria-expanded={isSelected}
-													data-category={segment.category}
-													style={{ ...style, border: "none", padding: 0 }}
-													onClick={() =>
-														setSelection(isSelected ? null : { laneIndex, segmentIndex })
-													}
-												/>
-											);
-											const key = `${segment.startMs}-${segment.category}`;
-											if (isSelected) {
-												// The detail floats over the page instead of growing the panel.
-												return (
-													<Popover
-														key={key}
-														opened
-														onChange={(opened) => !opened && setSelection(null)}
-														onDismiss={() => setSelection(null)}
-														position="bottom"
-														withArrow
-														shadow="md"
-														width={340}
-														withinPortal
-														closeOnEscape
-														trapFocus={false}
-														middlewares={{ flip: true, shift: true }}
-													>
-														<Popover.Target>{button}</Popover.Target>
-														<Popover.Dropdown p="xs">
-															<ScrollArea.Autosize mah={360} type="auto">
-																<SegmentDetail
-																	lane={lane}
-																	segment={segment}
-																	items={data.items}
-																	onClose={() => setSelection(null)}
-																	onOpenSubagent={dock?.openSubagentPanel}
-																/>
-															</ScrollArea.Autosize>
-														</Popover.Dropdown>
-													</Popover>
-												);
-											}
-											return (
-												<Tooltip
-													key={key}
-													label={`${t(`timeline.category.${segment.category}`)} · ${formatSpan(
-														segment.endMs - segment.startMs,
-													)}${segmentTitle(segment, data.items, t)}`}
-													openDelay={150}
-													withinPortal
-												>
-													{button}
-												</Tooltip>
-											);
-										})}
-										{lane.live && (
-											<Box
-												style={{
-													position: "absolute",
-													left: timeToX(lane.endMs, origin, scale) - 1,
-													top: 2,
-													bottom: 2,
-													width: 2,
-													background: "var(--mantine-color-blue-5)",
-												}}
-											/>
-										)}
-									</Box>
+										lane={lane}
+										laneIndex={laneIndex}
+										items={data.items}
+										origin={origin}
+										scale={scale}
+										fromPx={fromPx}
+										toPx={toPx}
+										selectedStartMs={
+											selection?.narratorId === lane.narratorId ? selection.startMs : null
+										}
+										onSelect={onSelect}
+										onOpenSubagent={dock?.openSubagentPanel}
+									/>
 								))}
 							</Box>
 						</ScrollArea>
@@ -563,11 +720,19 @@ export function NarratorTimelinePanel({
 					{t("timeline.omittedLanes", { count: data.omittedLanes })}
 				</Text>
 			)}
-			{data?.lanes.some((lane) => lane.truncated) && (
+			{merged && (
 				<Text size="xs" c="dimmed">
 					{t("timeline.truncated")}
 				</Text>
 			)}
+			{uncovered.map((lane) => (
+				<Text key={lane.narratorId} size="xs" c="dimmed">
+					{t("timeline.notCovered", {
+						lane: laneLabel(lane, t),
+						at: formatClock(lane.coveredUntilMs ?? lane.endMs),
+					})}
+				</Text>
+			))}
 
 			{data && data.lanes.length > 0 && !selection && (
 				<Text size="xs" c="dimmed">
@@ -576,19 +741,6 @@ export function NarratorTimelinePanel({
 			)}
 		</Stack>
 	);
-}
-
-function segmentTitle(
-	segment: TimelineSegment,
-	items: Record<string, TimelineItem>,
-	t: TFunction,
-): string {
-	if (segment.itemIds.length > 1)
-		return ` · ${t("timeline.parallel", { count: segment.itemIds.length })}`;
-	const item = segment.itemIds[0] ? items[segment.itemIds[0]] : undefined;
-	if (!item) return "";
-	if (item.kind === "tool") return ` · ${item.toolName}${item.summary ? `: ${item.summary}` : ""}`;
-	return item.model ? ` · ${item.model}` : "";
 }
 
 function DetailRow({ label, value }: { label: string; value: string | number | null | undefined }) {
@@ -686,6 +838,9 @@ function SegmentDetail({
 	const segmentItems = segment.itemIds
 		.map((id) => items[id])
 		.filter((item): item is TimelineItem => !!item);
+	const composition = segment.merged
+		? TIMELINE_CATEGORIES.filter((category) => (segment.merged?.totals[category] ?? 0) > 0)
+		: [];
 	return (
 		<Stack gap={6} data-testid="timeline-detail">
 			<Group justify="space-between" wrap="nowrap">
@@ -715,12 +870,32 @@ function SegmentDetail({
 					{t("timeline.detail.afterTurn")}
 				</Text>
 			)}
-			{segment.category === "overhead" && (
+			{segment.category === "overhead" && !segment.merged && (
 				<Text size="xs" c="dimmed">
 					{t("timeline.detail.noItems")}
 				</Text>
 			)}
-			{segmentItems.length > 1 && (
+			{segment.merged && (
+				<Stack gap={2}>
+					<Text size="xs" c="dimmed">
+						{t("timeline.detail.merged", { count: segment.merged.count })}
+					</Text>
+					{composition.map((category) => (
+						<Group key={category} gap={6} wrap="nowrap">
+							<Box
+								w={8}
+								h={8}
+								style={{ borderRadius: 2, background: CATEGORY_COLOR[category], flex: "none" }}
+							/>
+							<Text size="xs">
+								{t(`timeline.category.${category}`)}{" "}
+								{formatSpan(segment.merged?.totals[category] ?? 0)}
+							</Text>
+						</Group>
+					))}
+				</Stack>
+			)}
+			{!segment.merged && segmentItems.length > 1 && (
 				<Text size="xs" c="dimmed">
 					{t("timeline.parallel", { count: segmentItems.length })}
 				</Text>

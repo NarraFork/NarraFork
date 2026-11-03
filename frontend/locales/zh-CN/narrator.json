@@ -2567,6 +2567,7 @@
 		"branchFrom": "由 {{tool}} 在 {{at}} 派生",
 		"omittedLanes": "另有 {{count}} 个子代理未显示",
 		"truncated": "片段过多，已合并最短的片段",
+		"notCovered": "{{lane}}的活动记录超过读取上限，{{at}} 之后的部分未显示",
 		"openSubagent": "打开子代理会话",
 		"closeDetail": "关闭详情",
 		"clickHint": "点击时间轴上的片段查看详情",
@@ -2587,7 +2588,8 @@
 			"ttft": "首 token 耗时",
 			"tokens": "输入 / 输出 tokens",
 			"noItems": "这段时间没有对应的记录：通常是模型请求之间的调度、结果写入与上下文准备。",
-			"afterTurn": "该轮次已结束，子代理仍在运行。"
+			"afterTurn": "该轮次已结束，子代理仍在运行。",
+			"merged": "由 {{count}} 个短片段合并而成，颜色取占比最大的类别："
 		},
 		"category": {
 			"model_wait": "等待模型首 token",
