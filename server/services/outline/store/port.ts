@@ -661,6 +661,15 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		options?: { excludePageIds?: readonly string[] },
 	): Promise<OutlineBlockMeta[]>;
 	/**
+	 * Live finished tasks (done or cancelled) of a space, latest change first: by `version_seq`
+	 * descending, then id descending (bytewise), strictly after `before` in that order when given,
+	 * at most `limit`. Served by the finished-task index (the task board's finished lists).
+	 */
+	listFinishedTasks(
+		spaceId: string,
+		options: { before?: { versionSeq: number; id: string } | null; limit: number },
+	): Promise<OutlineBlockMeta[]>;
+	/**
 	 * Session claims whose lease ended at or before `now`, oldest first, at most `limit`, with the
 	 * space of the task.
 	 */

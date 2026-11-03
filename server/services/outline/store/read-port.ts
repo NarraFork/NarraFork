@@ -213,6 +213,11 @@ export interface OutlineReadPort {
 	): Promise<string[]>;
 	/** Blocks by id, live or deleted, in any space. */
 	getBlocks(ids: readonly string[]): Promise<OutlineBlockRow[]>;
+	/**
+	 * The first {@link OUTLINE_PAGE_HEAD_CHARS} characters of the content of blocks, by id, in any
+	 * space: enough for their titles (a task list shows many, and a whole body is up to 16 KiB).
+	 */
+	getBlockHeads(ids: readonly string[]): Promise<Array<{ id: string; contentHead: string }>>;
 	/** Live blocks of the given spaces with a sid or an alias, at most `limit`. */
 	findLiveBlocks(
 		spaceIds: readonly string[],

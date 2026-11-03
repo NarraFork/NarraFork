@@ -416,6 +416,14 @@
 			"prevId": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
 			"version": "7",
 			"snapshotDigest": "878acdef2d1c086d9e32b2c5bd249e2a33127ed11420885ca2a3984f4ec3a056"
+		},
+		{
+			"idx": 52,
+			"tag": "0052_outline_finished_tasks",
+			"id": "867e706a-c94c-4fcb-9bc7-42c3cb9a12ea",
+			"prevId": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
+			"version": "7",
+			"snapshotDigest": "784831795fe45949e96a096394e4132c815648f6cea4a7410140aea5283414de"
 		}
 	]
 }

@@ -24,6 +24,7 @@ import {
 	inArray,
 	isNotNull,
 	isNull,
+	lt,
 	lte,
 	ne,
 	notInArray,
@@ -1131,6 +1132,31 @@ export const sqliteOutlineStore: OutlineStore = {
 			.limit(limit)
 			.all();
 		return rows.map(toMeta);
+	},
+
+	async listFinishedTasks(spaceId, { before, limit }) {
+		// The predicate is the finished-task index's own, word for word, so the index serves it,
+		// in its order (SQLite compares the ids bytewise).
+		const b = outlineBlocks;
+		return db
+			.select(metaColumns)
+			.from(b)
+			.where(
+				and(
+					eq(b.spaceId, spaceId),
+					sql`json_extract("task_json", '$.status') IN ('done', 'cancelled') AND "deleted" = 0`,
+					before
+						? or(
+								lt(b.versionSeq, before.versionSeq),
+								and(eq(b.versionSeq, before.versionSeq), lt(b.id, before.id)),
+							)
+						: undefined,
+				),
+			)
+			.orderBy(desc(b.versionSeq), desc(b.id))
+			.limit(limit)
+			.all()
+			.map(toMeta);
 	},
 
 	async listExpiredTaskClaims(now, limit) {

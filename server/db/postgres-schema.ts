@@ -3523,6 +3523,13 @@ export const outlineBlocks = pgTable(
 		index("idx_outline_blocks_locked")
 			.on(table.pageId)
 			.where(sql.raw('("task_json"::jsonb #>> \'{lock}\') IS NOT NULL AND "deleted" = FALSE')),
+		index("idx_outline_blocks_finished_tasks")
+			.on(table.spaceId, table.versionSeq, table.id)
+			.where(
+				sql.raw(
+					"(\"task_json\"::jsonb #>> '{status}') IN ('done', 'cancelled') AND \"deleted\" = FALSE",
+				),
+			),
 	],
 );
 
@@ -24470,6 +24477,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "(\"task_json\"::jsonb #>> '{lock}') IS NOT NULL AND \"deleted\" = FALSE"
+        },
+        {
+          "name": "idx_outline_blocks_finished_tasks",
+          "columns": [
+            "spaceId",
+            "versionSeq",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "(\"task_json\"::jsonb #>> '{status}') IN ('done', 'cancelled') AND \"deleted\" = FALSE"
         }
       ],
       "checks": [],

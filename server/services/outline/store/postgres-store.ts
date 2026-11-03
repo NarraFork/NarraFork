@@ -1289,6 +1289,29 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return rows.map(toMeta);
 		},
 
+		async listFinishedTasks(spaceId, { before, limit }) {
+			// The predicate is the finished-task index's own, so the planner can use the index; ids
+			// compare bytewise, as on SQLite, so a cursor means the same on both.
+			const b = outlineBlocks;
+			const id = sql`${b.id} COLLATE "C"`;
+			const rows = await db
+				.select(metaColumns)
+				.from(b)
+				.where(
+					and(
+						eq(b.spaceId, spaceId),
+						sql`("task_json"::jsonb #>> '{status}') IN ('done', 'cancelled') AND "deleted" = FALSE`,
+						before
+							? sql`(${b.versionSeq} < ${before.versionSeq}
+								OR (${b.versionSeq} = ${before.versionSeq} AND ${id} < ${before.id}))`
+							: undefined,
+					),
+				)
+				.orderBy(desc(b.versionSeq), sql`${id} DESC`)
+				.limit(limit);
+			return rows.map(toMeta);
+		},
+
 		async listExpiredTaskClaims(now, limit) {
 			return await db
 				.select({ claim: outlineTaskClaims, spaceId: outlineBlocks.spaceId })

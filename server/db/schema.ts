@@ -5600,6 +5600,11 @@ export const outlineBlocks = sqliteTable(
 		index("idx_outline_blocks_locked")
 			.on(table.pageId)
 			.where(sql`json_extract("task_json", '$.lock') IS NOT NULL AND "deleted" = 0`),
+		// Finished tasks of a space (done or cancelled, live), latest change first: the task
+		// board's finished lists, paged by (version_seq, id) (outline P2 PR 5).
+		index("idx_outline_blocks_finished_tasks")
+			.on(table.spaceId, table.versionSeq, table.id)
+			.where(sql`json_extract("task_json", '$.status') IN ('done', 'cancelled') AND "deleted" = 0`),
 	],
 );
 
