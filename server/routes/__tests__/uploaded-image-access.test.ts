@@ -25,6 +25,7 @@ import {
 import { buildAppErrorResponse } from "../../lib/app-error-response";
 import type { SessionPayload } from "../../lib/auth";
 import { generateId } from "../../lib/id";
+import { logger } from "../../lib/logger";
 import { saveUploadedMedia } from "../../lib/media-uploads";
 import {
 	type ImageRef,
@@ -39,8 +40,13 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { narratorService } = await import("../../services/narrator-service");
 const { narratorPersistence } = await import("../../services/narrator-persistence");
-const { narratorReferencesImage, narratorReferencesMedia, setReferenceLookupLimitsForTests } =
-	await import("../../services/narrator-media-access");
+const {
+	lastReferenceLookupStatsForTests,
+	narratorReferencesImage,
+	narratorReferencesMedia,
+	setReferenceLookupLimitsForTests,
+} = await import("../../services/narrator-media-access");
+const { insertEnvelope } = await import("../../services/narrator-body-writes");
 const { grantNarratorAccess } = await import("../../services/narrator-sharing");
 const { uploadRoutes } = await import("../uploads");
 const { sessionInterchangeRoutes } = await import("../session-interchange");
@@ -633,5 +639,107 @@ describe("bounded reference lookup", () => {
 			false,
 		);
 		expect(await first).toBe(true);
+	});
+
+	test("queued short lookups yield to the event loop instead of running back to back", async () => {
+		// One window each (well under 256 refs), so only the yield after getting a slot can
+		// let a timer run before the whole burst has drained.
+		const { source, context } = await longContext(-1, 50);
+		const burst = 8;
+		let completed = 0;
+		let completedWhenTimerFired = -1;
+		setTimeout(() => {
+			completedWhenTimerFired = completed;
+		}, 0);
+		const results = await Promise.all(
+			Array.from({ length: burst }, (_, index) =>
+				narratorReferencesImage(context, source, `missing${index}`, { principal: forkOwner }).then(
+					(found) => {
+						completed++;
+						return found;
+					},
+				),
+			),
+		);
+		expect(results).toEqual(Array(burst).fill(false));
+		expect(completedWhenTimerFired).toBeGreaterThanOrEqual(0);
+		expect(completedWhenTimerFired).toBeLessThan(burst);
+	});
+
+	test("windows are cut by stored bytes, and a row over the budget is scanned alone", async () => {
+		const source = addNarrator(sourceOwner);
+		const context = addNarrator(forkOwner);
+		const image = await saveUploadedImage(source, png());
+		db.transaction(() => {
+			for (let seq = 0; seq < 40; seq++)
+				addMessage(context, seq, [{ type: "text", text: "x".repeat(10 * 1024) }]);
+			addMessage(context, 40, [{ type: "text", text: "y".repeat(100 * 1024) }]);
+			addMessage(context, 41, [imageRefToContentBlock(image)]);
+		});
+		setReferenceLookupLimitsForTests({ windowBytes: 32 * 1024 });
+		expect(await narratorReferencesImage(context, source, image.imageId)).toBe(true);
+		const stats = lastReferenceLookupStatsForTests();
+		// About three 10 KB rows per window, then the 100 KB row by itself.
+		expect(stats.statements).toBeGreaterThanOrEqual(15);
+		expect(stats.largestStatementBytes).toBeGreaterThan(100 * 1024);
+		expect(stats.largestStatementBytes).toBeLessThan(120 * 1024);
+		setReferenceLookupLimitsForTests(null);
+		expect(await narratorReferencesImage(context, source, image.imageId)).toBe(true);
+		expect(lastReferenceLookupStatsForTests().statements).toBe(1);
+	});
+
+	test("a block-format body counts both of its stored copies against the byte budget", async () => {
+		const source = addNarrator(sourceOwner);
+		const context = addNarrator(forkOwner);
+		const image = await saveUploadedImage(source, png());
+		const id = generateId();
+		db.transaction((tx) =>
+			insertEnvelope(tx, {
+				id,
+				narratorId: context,
+				role: "user",
+				bodyFormat: 2,
+				contentJson: [{ type: "text", text: "z".repeat(64 * 1024) }, imageRefToContentBlock(image)],
+				contentText: "z",
+				createdAt: now,
+			}),
+		);
+		addRef(context, id, 0);
+		expect(await narratorReferencesImage(context, source, image.imageId)).toBe(true);
+		expect(lastReferenceLookupStatsForTests().largestStatementBytes).toBeGreaterThan(128 * 1024);
+	});
+
+	test("waiting lookups are served round-robin across users", async () => {
+		setReferenceLookupLimitsForTests({ processRunning: 1 });
+		const { source, context, image } = await longContext(0);
+		const order: string[] = [];
+		const lookup = (principal: string) =>
+			narratorReferencesImage(context, source, image.imageId, { principal }).then((found) => {
+				order.push(principal);
+				return found;
+			});
+		// "a" queues three lookups before "b" asks once: "b" must not wait behind all of them.
+		const pending = [lookup("a"), lookup("a"), lookup("a"), lookup("b")];
+		expect(await Promise.all(pending)).toEqual([true, true, true, true]);
+		expect(order.indexOf("b")).toBeLessThan(3);
+	});
+
+	test("denials are logged per request at debug level, not as warnings", async () => {
+		const { source, context, image } = await longContext(0);
+		setReferenceLookupLimitsForTests({ maxRefs: 0 });
+		const debug = spyOn(logger, "debug");
+		const warn = spyOn(logger, "warn");
+		try {
+			for (let index = 0; index < 5; index++)
+				expect(await narratorReferencesImage(context, source, image.imageId)).toBe(false);
+			const denials = debug.mock.calls.filter(([message]) =>
+				String(message).includes("lookup denied"),
+			);
+			expect(denials).toHaveLength(5);
+			expect(warn.mock.calls.filter(([message]) => String(message).includes("denied"))).toEqual([]);
+		} finally {
+			debug.mockRestore();
+			warn.mockRestore();
+		}
 	});
 });

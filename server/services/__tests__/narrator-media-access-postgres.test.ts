@@ -40,16 +40,20 @@ const pgDb = drizzle(async (sql, params) => {
 		return { rows: revoked ? [] : [[params[0]]] };
 	}
 	if (sql.includes('from "narrator_message_refs"')) {
-		// A full first window of non-candidates, then one candidate in the second window.
-		if (params.includes("ref-255")) return { rows: [["ref-256", 0, "message-256", true]] };
+		// Keys: a full first read of 256 small refs, then one more ref in the second read.
+		if (params.includes("ref-255")) return { rows: [["ref-256", 0, "message-256", "100"]] };
 		return {
 			rows: Array.from({ length: 256 }, (_, i) => [
 				`ref-${String(i).padStart(3, "0")}`,
 				0,
 				`message-${i}`,
-				false,
+				"100",
 			]),
 		};
+	}
+	if (sql.includes('from "narrator_messages"') && sql.includes("strpos(")) {
+		// The candidate test: only message-256 holds the id.
+		return { rows: params.includes("message-256") ? [["message-256"]] : [] };
 	}
 	if (sql.includes('from "narrator_messages"')) {
 		return { rows: [["message-256", "other", stored(fixture.content)]] };
@@ -90,18 +94,24 @@ beforeEach(() => {
 	revoked = false;
 });
 
-const windows = () => queries.filter((q) => q.sql.includes('join "narrator_messages"'));
+const keyReads = () => queries.filter((q) => q.sql.includes('join "narrator_messages"'));
+const candidateTests = () =>
+	queries.filter((q) => q.sql.includes('from "narrator_messages"') && q.sql.includes("strpos("));
 
-test("PostgreSQL prefilters windows in SQL and decodes only candidates", async () => {
+test("PostgreSQL sizes windows, prefilters them in SQL and decodes only candidates", async () => {
 	fixture = { content: [mediaBlock], output: undefined };
 	expect(await narratorReferencesMedia("context", "source", MEDIA_ID)).toBe(true);
-	expect(windows()).toHaveLength(2);
-	expect(windows()[0].sql).toContain("strpos(");
-	expect(windows()[0].params).toContain("context");
-	expect(windows()[0].params).toContain(MEDIA_ID);
-	expect(windows()[1].params).toContain("ref-255");
+	expect(keyReads()).toHaveLength(2);
+	expect(keyReads()[0].sql).toContain("octet_length(");
+	expect(keyReads()[0].params).toContain("context");
+	expect(keyReads()[1].params).toContain("ref-255");
+	expect(candidateTests()).toHaveLength(2);
+	expect(candidateTests()[0].params).toContain(MEDIA_ID);
 	const bodies = queries.filter(
-		(q) => q.sql.includes('from "narrator_messages"') && !q.sql.includes("join"),
+		(q) =>
+			q.sql.includes('from "narrator_messages"') &&
+			!q.sql.includes("join") &&
+			!q.sql.includes("strpos("),
 	);
 	expect(bodies).toHaveLength(1);
 	expect(bodies[0].params).toEqual(["message-256"]);

@@ -5,9 +5,13 @@
  *
  * The lookup is bounded for the main thread:
  *   - a SQL prefilter (`instr`/`strpos` on the stored JSON text) walks the refs in
- *     fixed windows, so only rows that contain the id at all are decoded in JS;
- *   - hard caps on refs examined, wall time and rows decoded deny (fail closed);
- *   - a per-user and per-process concurrency gate denies when its queue is full.
+ *     windows cut by stored bytes, so one statement scans a bounded amount of text and
+ *     only rows that contain the id at all are decoded in JS;
+ *   - hard caps on refs examined, wall time and rows decoded deny (fail closed), checked
+ *     before every statement;
+ *   - a per-user and per-process concurrency gate, served round-robin across users,
+ *     denies when its queue is full, and every lookup yields to the event loop at least
+ *     once after it gets its slot and between windows.
  *
  * Only structurally decoded values count. Drizzle returns JSON columns already decoded
  * (SQLite JSON mode, the PostgreSQL `jsonText` codec), so a string here is genuine string
@@ -23,7 +27,7 @@ import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../db/
 import { logger } from "../lib/logger";
 import { contentJsonSql, fillBodies } from "./narrator-body-reads";
 
-/** Refs examined per statement: the unit of synchronous database work. */
+/** Ref keys read ahead per statement; the byte budget then cuts the scanned window. */
 const WINDOW = 256;
 /** Tool outputs decoded per statement. */
 const MAX_TOOLS_PER_PAGE = 64;
@@ -37,6 +41,8 @@ interface LookupLimits {
 	maxMs: number;
 	/** Candidate messages plus tool outputs one lookup may decode. */
 	maxDecoded: number;
+	/** Stored bytes one candidate-test statement may scan (at least one ref). */
+	windowBytes: number;
 	/** Lookups running at once in this process. */
 	processRunning: number;
 	/** Lookups running at once for one user. */
@@ -51,10 +57,11 @@ const DEFAULT_LIMITS: LookupLimits = {
 	maxRefs: 100_000,
 	maxMs: 2_000,
 	maxDecoded: 256,
+	windowBytes: 4 * 1024 * 1024,
 	processRunning: 4,
 	userRunning: 2,
 	userPending: 32,
-	processPending: 256,
+	processPending: 1_024,
 };
 let limits = DEFAULT_LIMITS;
 
@@ -159,11 +166,20 @@ export function narratorReferencesImage(
 
 // ── Concurrency gate ────────────────────────────────────────────────────────
 
+interface Waiter {
+	wake: () => void;
+}
+
 let running = 0;
 let pendingTotal = 0;
 const runningByUser = new Map<string, number>();
 const pendingByUser = new Map<string, number>();
-const waiters: Array<{ principal: string; wake: () => void }> = [];
+/**
+ * Waiting lookups per user. Map order is the round-robin order: a user who is served
+ * moves to the back, so one user's long queue never sits in front of another user's
+ * first lookup.
+ */
+const waiting = new Map<string, Waiter[]>();
 
 function bump(map: Map<string, number>, key: string, delta: number) {
 	const next = (map.get(key) ?? 0) + delta;
@@ -182,13 +198,23 @@ function markRunning(principal: string) {
 	bump(runningByUser, principal, 1);
 }
 
+function wakeNext() {
+	for (const [principal, queue] of waiting) {
+		if (!mayStart(principal)) continue;
+		const waiter = queue.shift();
+		waiting.delete(principal);
+		if (queue.length > 0) waiting.set(principal, queue);
+		waiter?.wake();
+		return;
+	}
+}
+
 function finish(principal: string) {
 	running--;
 	bump(runningByUser, principal, -1);
 	bump(pendingByUser, principal, -1);
 	pendingTotal--;
-	const next = waiters.findIndex((waiter) => mayStart(waiter.principal));
-	if (next >= 0) waiters.splice(next, 1)[0].wake();
+	wakeNext();
 }
 
 /** Run `lookup` in a slot, waiting in a bounded queue; a full queue denies at once. */
@@ -206,8 +232,7 @@ async function withLookupSlot(
 	else {
 		try {
 			await new Promise<void>((resolve, reject) => {
-				const waiter = {
-					principal,
+				const waiter: Waiter = {
 					wake: () => {
 						signal?.removeEventListener("abort", abort);
 						markRunning(principal);
@@ -215,10 +240,14 @@ async function withLookupSlot(
 					},
 				};
 				const abort = () => {
-					waiters.splice(waiters.indexOf(waiter), 1);
+					const queue = waiting.get(principal) ?? [];
+					queue.splice(queue.indexOf(waiter), 1);
+					if (queue.length === 0) waiting.delete(principal);
 					reject(signal?.reason);
 				};
-				waiters.push(waiter);
+				const queue = waiting.get(principal);
+				if (queue) queue.push(waiter);
+				else waiting.set(principal, [waiter]);
 				signal?.addEventListener("abort", abort, { once: true });
 			});
 		} catch (error) {
@@ -228,24 +257,61 @@ async function withLookupSlot(
 		}
 	}
 	try {
+		// Yield once per slot: a lookup that ends within its first window never reaches the
+		// between-window yield, and finish() wakes the next waiter synchronously, so without
+		// this a queue of short lookups would run back to back without the event loop.
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		signal?.throwIfAborted();
 		return await lookup();
 	} finally {
 		finish(principal);
 	}
 }
 
+// Denials are logged per request at debug level only; a burst of refused requests would
+// otherwise flood the log. A warning summarizes them at most once per interval.
+const DENIAL_SUMMARY_MS = 60_000;
+const deniedCounts = new Map<string, number>();
+let denialSummary: ReturnType<typeof setTimeout> | undefined;
+
 function denied(reason: string, detail: Record<string, unknown> = {}): false {
-	logger.warn("Upload reference lookup denied", { reason, ...detail });
+	logger.debug("Upload reference lookup denied", { reason, ...detail });
+	bump(deniedCounts, reason, 1);
+	if (!denialSummary) {
+		denialSummary = setTimeout(() => {
+			denialSummary = undefined;
+			logger.warn("Upload reference lookups denied", {
+				intervalMs: DENIAL_SUMMARY_MS,
+				...Object.fromEntries(deniedCounts),
+			});
+			deniedCounts.clear();
+		}, DENIAL_SUMMARY_MS);
+		denialSummary.unref?.();
+	}
 	return false;
 }
 
 // ── Lookup ──────────────────────────────────────────────────────────────────
 
-interface WindowRow {
+interface KeyRow {
 	refId: string;
 	seq: number;
 	messageId: string;
-	candidate: unknown;
+	/** Stored bytes the candidate test reads for this ref (body, block rows, tool outputs). */
+	bytes: number;
+}
+
+interface LookupStats {
+	/** Candidate-test statements run. */
+	statements: number;
+	/** Stored bytes the largest candidate-test statement covered. */
+	largestStatementBytes: number;
+}
+let lastStats: LookupStats = { statements: 0, largestStatementBytes: 0 };
+
+/** Test hook: what the most recent lookup did. */
+export function lastReferenceLookupStatsForTests(): LookupStats {
+	return { ...lastStats };
 }
 
 /**
@@ -254,11 +320,14 @@ interface WindowRow {
  * by messageId, not narratorId, because forks can share another owner's message.
  * Never searches arbitrary narrators or treats knowledge of an upload id as access.
  *
- * Each window statement reads at most WINDOW refs and tests their stored JSON text for
- * the id in SQL; only those candidates are decoded and matched exactly in JS. The text
- * test can only produce false positives (stale `content_json` beside current block rows,
- * the id inside unrelated text), never false negatives, because upload ids need no JSON
- * escaping and every place a reference is read from is tested.
+ * Each window first reads up to WINDOW ref keys with the stored size of what the
+ * candidate test would read (`octet_length`, answered without loading the values), then
+ * cuts the window at `windowBytes` so one candidate-test statement scans a bounded number
+ * of bytes, block-format bodies counted twice because both copies are scanned. Only the
+ * candidates are decoded and matched exactly in JS. The text test can only produce false
+ * positives (stale `content_json` beside current block rows, the id inside unrelated
+ * text), never false negatives, because upload ids need no JSON escaping and every place
+ * a reference is read from is tested.
  */
 async function narratorReferencesUpload(
 	referencingNarratorId: string,
@@ -280,21 +349,22 @@ async function lookupReference(
 ): Promise<boolean> {
 	const pgDb = postgresRuntime?.client.db;
 	const startedAt = performance.now();
+	const stats: LookupStats = { statements: 0, largestStatementBytes: 0 };
+	lastStats = stats;
 	let examined = 0;
 	let decoded = 0;
 	let cursor: { seq: number; refId: string } | undefined;
 
-	const readWindow = async (): Promise<WindowRow[]> => {
+	const readKeys = async (): Promise<KeyRow[]> => {
 		if (pgDb) {
 			return pgDb
 				.select({
 					refId: pg.narratorMessageRefs.id,
 					seq: pg.narratorMessageRefs.seq,
 					messageId: pg.narratorMessageRefs.messageId,
-					candidate: sql<boolean>`(strpos(${pg.narratorMessages.contentJson}, ${uploadId}) > 0
-						OR EXISTS (SELECT 1 FROM narrator_tool_calls t
-							WHERE t.message_id = ${pg.narratorMessages.id}
-								AND strpos(t.output_json, ${uploadId}) > 0))`,
+					bytes: sql<number>`(coalesce(octet_length(${pg.narratorMessages.contentJson}), 0)
+						+ coalesce((SELECT sum(octet_length(t.output_json)) FROM narrator_tool_calls t
+							WHERE t.message_id = ${pg.narratorMessages.id}), 0))`.mapWith(Number),
 				})
 				.from(pg.narratorMessageRefs)
 				.innerJoin(
@@ -323,12 +393,12 @@ async function lookupReference(
 				refId: narratorMessageRefs.id,
 				seq: narratorMessageRefs.seq,
 				messageId: narratorMessageRefs.messageId,
-				// Block rows hold the body of block-format envelopes, so they are tested too.
-				candidate: sql<number>`(instr(${narratorMessages.contentJson}, ${uploadId}) > 0
-					OR EXISTS (SELECT 1 FROM narrator_blocks b
-						WHERE b.message_id = ${narratorMessages.id} AND instr(b.payload, ${uploadId}) > 0)
-					OR EXISTS (SELECT 1 FROM narrator_tool_calls t
-						WHERE t.message_id = ${narratorMessages.id} AND instr(t.output_json, ${uploadId}) > 0))`,
+				// Block rows hold the body of block-format envelopes and are scanned too.
+				bytes: sql<number>`(coalesce(octet_length(${narratorMessages.contentJson}), 0)
+					+ coalesce((SELECT sum(octet_length(b.payload)) FROM narrator_blocks b
+						WHERE b.message_id = ${narratorMessages.id}), 0)
+					+ coalesce((SELECT sum(octet_length(t.output_json)) FROM narrator_tool_calls t
+						WHERE t.message_id = ${narratorMessages.id}), 0))`.mapWith(Number),
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
@@ -348,6 +418,38 @@ async function lookupReference(
 			)
 			.orderBy(narratorMessageRefs.seq, narratorMessageRefs.id)
 			.limit(WINDOW);
+	};
+
+	/** The ids among `ids` whose stored JSON text contains the upload id. */
+	const readCandidates = async (ids: string[]): Promise<Set<string>> => {
+		const rows = pgDb
+			? await pgDb
+					.select({ id: pg.narratorMessages.id })
+					.from(pg.narratorMessages)
+					.where(
+						and(
+							inArray(pg.narratorMessages.id, ids),
+							sql`(strpos(${pg.narratorMessages.contentJson}, ${uploadId}) > 0
+								OR EXISTS (SELECT 1 FROM narrator_tool_calls t
+									WHERE t.message_id = ${pg.narratorMessages.id}
+										AND strpos(t.output_json, ${uploadId}) > 0))`,
+						),
+					)
+			: await db
+					.select({ id: narratorMessages.id })
+					.from(narratorMessages)
+					.where(
+						and(
+							inArray(narratorMessages.id, ids),
+							sql`(instr(${narratorMessages.contentJson}, ${uploadId}) > 0
+								OR EXISTS (SELECT 1 FROM narrator_blocks b
+									WHERE b.message_id = ${narratorMessages.id} AND instr(b.payload, ${uploadId}) > 0)
+								OR EXISTS (SELECT 1 FROM narrator_tool_calls t
+									WHERE t.message_id = ${narratorMessages.id}
+										AND instr(t.output_json, ${uploadId}) > 0))`,
+						),
+					);
+		return new Set(rows.map((row) => row.id));
 	};
 
 	const readBodies = async (ids: string[]) => {
@@ -439,19 +541,24 @@ async function lookupReference(
 		return rows.length > 0;
 	};
 
-	/** `false` (deny) once a decode or time cap is exceeded, otherwise null. */
-	const overBudget = () => {
+	/**
+	 * `false` (deny) once a cap is exceeded, otherwise null. Checked before every
+	 * statement, so a lookup overruns its time cap by at most one bounded statement.
+	 */
+	const overBudget = (refsToCome = true) => {
+		signal?.throwIfAborted();
 		const detail = { referencingNarratorId, examined, decoded };
+		if (refsToCome && examined >= limits.maxRefs) return denied("ref cap", detail);
 		if (decoded > limits.maxDecoded) return denied("decode cap", detail);
 		if (performance.now() - startedAt > limits.maxMs) return denied("time cap", detail);
 		return null;
 	};
 
 	/** Decode the window's candidates and match them exactly, in history order. */
-	const candidatesReference = async (candidates: WindowRow[]): Promise<boolean | null> => {
+	const candidatesReference = async (candidates: KeyRow[]): Promise<boolean | null> => {
 		const ids = candidates.map((row) => row.messageId);
 		decoded += ids.length;
-		const capped = overBudget();
+		const capped = overBudget(false);
 		if (capped !== null) return capped;
 		const bodies = new Map((await readBodies(ids)).map((row) => [row.id, row]));
 		signal?.throwIfAborted();
@@ -466,12 +573,11 @@ async function lookupReference(
 		}
 		let toolCursor: string | undefined;
 		while (true) {
-			signal?.throwIfAborted();
+			const toolCapped = overBudget(false);
+			if (toolCapped !== null) return toolCapped;
 			const calls = await readCalls(ids, toolCursor);
 			signal?.throwIfAborted();
 			decoded += calls.length;
-			const toolCapped = overBudget();
-			if (toolCapped !== null) return toolCapped;
 			for (const call of calls) {
 				const ref = candidates.find((row) => row.messageId === call.messageId);
 				if (
@@ -487,23 +593,45 @@ async function lookupReference(
 		}
 	};
 
+	// Keys read ahead but not yet scanned, and whether the refs have run out.
+	let keys: KeyRow[] = [];
+	let exhausted = false;
 	while (true) {
-		signal?.throwIfAborted();
-		if (examined >= limits.maxRefs)
-			return denied("ref cap", { referencingNarratorId, examined, decoded });
 		const capped = overBudget();
 		if (capped !== null) return capped;
-		const rows = await readWindow();
-		signal?.throwIfAborted();
-		examined += rows.length;
-		const candidates = rows.filter((row) => Boolean(row.candidate));
+		if (keys.length === 0) {
+			if (exhausted) return false;
+			keys = await readKeys();
+			exhausted = keys.length < WINDOW;
+			if (keys.length === 0) return false;
+			const last = keys[keys.length - 1];
+			cursor = { seq: last.seq, refId: last.refId };
+		}
+		// Cut the window at the byte budget; a single ref larger than it is still scanned.
+		let bytes = 0;
+		let take = 0;
+		while (
+			take < keys.length &&
+			examined + take < limits.maxRefs &&
+			(take === 0 || bytes + keys[take].bytes <= limits.windowBytes)
+		) {
+			bytes += keys[take].bytes;
+			take++;
+		}
+		const slice = keys.slice(0, take);
+		keys = keys.slice(take);
+		examined += slice.length;
+		const sliceCapped = overBudget(false);
+		if (sliceCapped !== null) return sliceCapped;
+		const matched = await readCandidates(slice.map((row) => row.messageId));
+		stats.statements++;
+		stats.largestStatementBytes = Math.max(stats.largestStatementBytes, bytes);
+		const candidates = slice.filter((row) => matched.has(row.messageId));
 		if (candidates.length > 0) {
 			const found = await candidatesReference(candidates);
 			if (found !== null) return found;
 		}
-		if (rows.length < WINDOW) return false;
-		const last = rows[rows.length - 1];
-		cursor = { seq: last.seq, refId: last.refId };
+		if (keys.length === 0 && exhausted) return false;
 		// Yield between windows so HTTP/WS/Agent work can run.
 		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 	}
