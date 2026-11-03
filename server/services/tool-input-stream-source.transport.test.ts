@@ -3,6 +3,7 @@ import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { TEXT_DOCUMENT_PACKET_BYTES } from "@shared/pretext-layout/text-document";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -22,6 +23,7 @@ const { db, sqlite } = getTestDb();
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,

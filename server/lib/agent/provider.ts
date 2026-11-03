@@ -12,6 +12,7 @@ import type {
 	WebSearchAction,
 } from "@shared/agent-protocol/types";
 import type { ContextInputCharacters } from "@shared/context-usage";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import type { ProviderReadiness } from "@shared/provider-readiness";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
@@ -231,6 +232,11 @@ export interface GenerateMetaResult {
 // === The adapter interface ===
 
 export interface ProviderAdapter {
+	/** Native wire capability, intersected with effective model input metadata. */
+	supportsNativeMediaInput?(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean;
 	/** Convert ToolDefinition[] to provider-specific tool format */
 	formatTools(tools: import("./types").ResolvedToolDefinition[]): unknown[];
 

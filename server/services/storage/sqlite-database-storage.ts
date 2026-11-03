@@ -28,7 +28,6 @@
  */
 
 import { getDbWorkerAvailability } from "@server/lib/db-worker/pool";
-import { databaseCleanupService } from "@server/services/database-cleanup-service";
 import {
 	type DatabaseStorageCapabilities,
 	type DatabaseStoragePort,
@@ -61,12 +60,17 @@ export const sqliteDatabaseStoragePort: DatabaseStoragePort = {
 
 	async scanBreakdown(options: DatabaseStorageScanOptions = {}): Promise<DatabaseStorageReport> {
 		const budgetMs = options.budgetMs ?? DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS;
-		const breakdown = await runWithScanBudget(budgetMs, options.signal, (linked) =>
-			databaseCleanupService.scanDatabaseBreakdown({
+		const breakdown = await runWithScanBudget(budgetMs, options.signal, async (linked) => {
+			// Cleanup imports narrator-service, which imports storage-service and this port's store.
+			// Loading it only when scanning breaks that initialization cycle in every import order.
+			const { databaseCleanupService } = await import("@server/services/database-cleanup-service");
+			// The import itself cannot be cancelled; do not start a scan if it settled too late.
+			linked.throwIfAborted();
+			return databaseCleanupService.scanDatabaseBreakdown({
 				onProgress: options.onProgress,
 				signal: linked,
-			}),
-		);
+			});
+		});
 
 		return enforceReportLimits({
 			// The SQLite file set IS the database's footprint, and it is exact even when individual

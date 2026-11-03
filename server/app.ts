@@ -38,7 +38,7 @@ import executionLogRoutes from "./routes/execution-log";
 import { executorBootstrapRoutes } from "./routes/executor-bootstrap";
 import { externalV1Routes } from "./routes/external-v1";
 import { favoriteRoutes } from "./routes/favorites";
-import { fsRoutes } from "./routes/fs";
+import { fsPublicDownloadRoutes, fsRoutes } from "./routes/fs";
 import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
 import { geminiRoutes } from "./routes/gemini";
 import { genUiRoutes } from "./routes/gen-ui";
@@ -67,6 +67,8 @@ import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
 import { projectRoutes } from "./routes/projects";
+import { promptLibraryRoutes } from "./routes/prompt-library";
+import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
 import {
@@ -84,6 +86,7 @@ import { skillRoutes } from "./routes/skills";
 import { specRoutes } from "./routes/spec";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
+import { exportTicketDownloadRoutes, storageTransferRoutes } from "./routes/storage-transfer";
 import { managerLifecycleRoutes, systemLifecycleRoutes } from "./routes/system-lifecycle";
 import { terminalRoutes } from "./routes/terminals";
 import { tlsRoutes } from "./routes/tls";
@@ -360,6 +363,19 @@ app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
 app.route("/api/update", localPeerUpdateRoutes);
 app.route("/api/system/lifecycle", managerLifecycleRoutes);
 
+// 导出包可能有数 GB。没有 File System Access API 的浏览器只能用普通导航下载，
+// `<a href>` 带不上 Authorization，所以这张一次性票据必须挂在会话认证之前。
+// 票据由已登录的管理员签发，本身就是凭证。
+app.route("/api/storage/export/download", exportTicketDownloadRoutes);
+
+// Public: the browser's own file download, authorized by a short-lived ticket minted from
+// the authenticated `POST /api/fs/download-ticket`. A navigation cannot carry the session's
+// `Authorization` header, so this is what lets the browser stream a download to disk
+// instead of the client buffering it into a Blob. Registered BEFORE the session gate:
+// Hono matches in registration order, so a mount below `requireSessionAuth` would never be
+// reached. Only that one path is public — the rest of /api/fs stays behind the gate.
+app.route("/api/fs", fsPublicDownloadRoutes);
+
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
@@ -430,6 +446,7 @@ app.route("/api/integrations", integrationRoutes);
 app.route("/api/oauth-apps", oauthAppRoutes);
 app.route("/api/oauth/grants", oauthGrantRoutes);
 app.route("/api/fs", fsRoutes);
+app.route("/api/prompt-optimize", promptOptimizeRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);
@@ -450,8 +467,10 @@ app.route("/api/knowledge/packs", knowledgePackRoutes);
 app.route("/api/knowledge", knowledgeRoutes);
 app.route("/api/outline", outlineRoutes);
 app.route("/api/storage", storageRoutes);
+app.route("/api/storage", storageTransferRoutes);
 app.route("/api/runtime", runtimeRoutes);
 app.route("/api/custom-subagents", customSubagentRoutes);
+app.route("/api/prompt-library", promptLibraryRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/scheduled-tasks", scheduledTaskRoutes);
 app.route("/api/hooks", hookRoutes);

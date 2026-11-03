@@ -37,11 +37,12 @@ export interface NarratorComposerRowProps {
 	onComposerPasteImages: (files: File[]) => void;
 	attachedImages?: File[];
 	attachedTextFiles?: File[];
+	attachedMedia?: File[];
 	attachmentsHydrating?: boolean;
 	attachmentsRestoreFailed?: boolean;
 	onRetryAttachments?: () => void;
 	restoredAttachmentResources?: ReadonlyMap<string, File>;
-	onAttachmentsChange?: (images: File[], textFiles: File[]) => void;
+	onAttachmentsChange?: (images: File[], textFiles: File[], media: File[]) => void;
 	onDocumentAssetsChange?: (ids: readonly string[]) => void;
 
 	// Actions
@@ -364,6 +365,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 				onPasteImages={props.onComposerPasteImages}
 				attachedImages={props.attachedImages}
 				attachedTextFiles={props.attachedTextFiles}
+				attachedMedia={props.attachedMedia}
 				attachmentsHydrating={props.attachmentsHydrating}
 				attachmentsRestoreFailed={props.attachmentsRestoreFailed}
 				onRetryAttachments={props.onRetryAttachments}

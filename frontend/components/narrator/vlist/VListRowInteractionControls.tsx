@@ -5,6 +5,7 @@ import { usePlatform } from "@frontend/hooks/usePlatform";
 import type { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
+import type { FileTarget } from "@shared/file-reference";
 import {
 	IconArrowBackUp,
 	IconArrowsMaximize,
@@ -28,6 +29,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { copyTextToClipboard } from "../../../lib/clipboard";
 import { CompactMenuSub } from "../compact/CompactMenuSub";
+import { FileLinkMenuItems } from "../message/FileLinkMenuItems";
 import { openHostedToolCallInspector } from "../tool-call/tool-call-inspector-host";
 import { useToolFileNavigation } from "../tool-call/useToolFileNavigation";
 import { useToolEditNavigation } from "../useToolEditNavigation";
@@ -48,7 +50,11 @@ const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 type VListRowInteractionControlsProps = Omit<
 	VListRowInteractionProps,
 	"children" | "blockId" | "messageId" | "selected" | "onToggleSelect"
-> & { swipe: ReturnType<typeof useSwipeMenu> };
+> & {
+	swipe: ReturnType<typeof useSwipeMenu>;
+	/** File behind this row's context-menu gesture (file links only). */
+	fileLinkTarget: FileTarget | null;
+};
 
 export function VListRowInteractionControls({
 	blockIndex,
@@ -63,6 +69,7 @@ export function VListRowInteractionControls({
 	onViewOriginal,
 	onOpenFullscreen,
 	inspectContent,
+	fileLinkTarget,
 	swipe,
 }: VListRowInteractionControlsProps) {
 	const { t } = useTranslation("common");
@@ -78,6 +85,11 @@ export function VListRowInteractionControls({
 		toolMeta?.isFileTool || toolMeta?.toolName === "Read" || toolMeta?.toolName === "Write";
 	const openFile = requiresFileTarget ? openToolFile : toolActions?.onOpenFilePanel;
 	const [contentInspectorOpened, setContentInspectorOpened] = useState(false);
+	// A file link in this row's body answers the context menu with file actions. Only the local
+	// device can: the file lives on the server host, so nothing here could reach another device.
+	// Gated on the context menu too — a touch swipe cannot name a file, so a target left over from
+	// an earlier right-click must not follow the menu into the swipe reveal.
+	const hasFileLinkActions = swipe.ctxMenuOpened && fileLinkTarget?.deviceId === "local";
 	const editNavigation = useToolEditNavigation({
 		toolName: toolMeta?.toolName,
 		narratorId,
@@ -225,7 +237,8 @@ export function VListRowInteractionControls({
 		</>
 	) : null;
 
-	const hasViewActions = copyText != null || onOpenFullscreen != null || inspectContent != null;
+	const hasViewActions =
+		copyText != null || onOpenFullscreen != null || inspectContent != null || hasFileLinkActions;
 
 	const menuItemsNode = showMenuItems ? (
 		<>
@@ -250,6 +263,9 @@ export function VListRowInteractionControls({
 				>
 					{t("copy")}
 				</Menu.Item>
+			)}
+			{hasFileLinkActions && (
+				<FileLinkMenuItems target={fileLinkTarget} onClose={() => swipe.closeSwipe()} />
 			)}
 			{inspectContent && (
 				<Menu.Item

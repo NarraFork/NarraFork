@@ -15,6 +15,7 @@ import {
 	waitUntilUpdateGateOpens,
 } from "@server/services/update-coordinator";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import type { MediaContentBlock, NativeMediaInput } from "@shared/media-attachments";
 import { logger } from "../logger";
 import {
 	getOutlineSpecUnavailableHint,
@@ -87,6 +88,8 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	media?: NativeMediaInput[];
+	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
@@ -1752,6 +1755,8 @@ export async function executeTool(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						media: result.media,
+						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
 						pipelineExitConfirmation,
 						pipelineExitConfirmationStateId,
@@ -1771,6 +1776,8 @@ export async function executeTool(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					media: result.media,
+					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
 					pipelineExitConfirmation,
 					pipelineExitConfirmationStateId,
@@ -1787,6 +1794,8 @@ export async function executeTool(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				media: result.media,
+				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,
 				pipelineExitConfirmation,
 				pipelineExitConfirmationStateId,

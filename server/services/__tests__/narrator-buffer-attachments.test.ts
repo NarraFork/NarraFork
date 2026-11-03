@@ -1095,6 +1095,167 @@ describe("persistent staging ownership", () => {
 	});
 });
 
+describe("native media mailbox durability", () => {
+	const media = {
+		mediaId: "audio-id",
+		filename: "voice.wav",
+		mediaType: "audio/wav",
+		size: 60,
+		uploadNarratorId: NARRATOR_ID,
+	};
+	async function enqueue(text = "") {
+		return enqueueBufferedMessage(
+			NARRATOR_ID,
+			text,
+			undefined,
+			null,
+			null,
+			null,
+			undefined,
+			"back",
+			undefined,
+			undefined,
+			"fifo",
+			undefined,
+			undefined,
+			undefined,
+			[media],
+		);
+	}
+	async function row(id: string) {
+		const stored = await db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, id))
+			.get();
+		if (!stored) throw new Error(`Missing buffered media row: ${id}`);
+		return stored;
+	}
+	test("media-only admission stores metadata, projects summaries and survives cold restore", async () => {
+		const accepted = await enqueue();
+		expect(accepted.ok).toBe(true);
+		const stored = await row(accepted.id);
+		expect(JSON.parse(stored.mediaJson ?? "null")).toEqual([media]);
+		activeNarrators.clear();
+		const projected = projectMailboxUserMessage(stored);
+		expect(projected.text).toBe("");
+		expect(projected.media).toEqual([media]);
+		expect(toBufferSummary([projected])[0].media).toEqual([media]);
+	});
+	test("text-only update preserves media; explicit empty list nulls durable column", async () => {
+		const accepted = await enqueue("before");
+		expect(await updateBufferedMessage(NARRATOR_ID, accepted.id, "after")).toBe(true);
+		expect(JSON.parse((await row(accepted.id)).mediaJson ?? "null")).toEqual([media]);
+		expect(await updateBufferedMessage(NARRATOR_ID, accepted.id, "without", { media: [] })).toBe(
+			true,
+		);
+		expect((await row(accepted.id)).mediaJson).toBeNull();
+		expect(getBufferedMessages(NARRATOR_ID)[0].media).toBeUndefined();
+	});
+	test("appended refs survive reload and caller mutation cannot rewrite the admitted metadata", async () => {
+		const accepted = await enqueue("before");
+		const added = { ...media, mediaId: "added" };
+		await updateBufferedMessage(NARRATOR_ID, accepted.id, "after", { media: [media, added] });
+		added.filename = "mutated";
+		expect(
+			projectMailboxUserMessage(await row(accepted.id)).media?.map((ref) => ref.filename),
+		).toEqual(["voice.wav", "voice.wav"]);
+	});
+	test("subagent uses the unified durable mailbox and preserves the original upload owner", async () => {
+		const accepted = await enqueueBufferedMessage(
+			SUBAGENT_ID,
+			"",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"tool",
+			undefined,
+			[media],
+		);
+		expect(accepted.ok).toBe(true);
+		const [queued] = getBufferedMessages(SUBAGENT_ID);
+		expect(queued.media).toEqual([media]);
+		expect(queued.queueMode).toBe("tool");
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const [claimed] = createMailboxStore(db).claimBatch(
+			SUBAGENT_ID,
+			{ token: "media-owner", epoch: "media-epoch" },
+			{ count: 1 },
+		);
+		expect(claimed.id).toBe(accepted.id);
+		expect(projectMailboxUserMessage(claimed).media).toEqual([media]);
+	});
+	test("runtime extras never enter durable queue refs or client summaries", async () => {
+		const dirty = { ...media, base64: "secret-bytes", source: { data: "embedded" } };
+		const accepted = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"before",
+			undefined,
+			null,
+			null,
+			null,
+			undefined,
+			"back",
+			undefined,
+			undefined,
+			"fifo",
+			undefined,
+			undefined,
+			undefined,
+			[dirty],
+		);
+		expect((await row(accepted.id))?.mediaJson).toBe(JSON.stringify([media]));
+		await updateBufferedMessage(NARRATOR_ID, accepted.id, "after", { media: [dirty] });
+		expect((await row(accepted.id))?.mediaJson).toBe(JSON.stringify([media]));
+		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID))[0].media).toEqual([media]);
+	});
+	test("tracked schema upgrades an existing SQLite queue without ignored migration assets", async () => {
+		const { sqlite: upgrade } = getTestDb();
+		try {
+			upgrade.run("ALTER TABLE narrator_buffered_messages DROP COLUMN media_json");
+			upgrade.run(
+				"INSERT INTO narrator_buffered_messages (id, narrator_id, text, seq, buffered_at) VALUES ('legacy', 'owner', 'keep me', 1, '2026-10-28')",
+			);
+			const { ensureColumns } = await import("../../db/ensure-columns");
+			ensureColumns(upgrade);
+			expect(
+				upgrade
+					.query("SELECT text, media_json FROM narrator_buffered_messages WHERE id = 'legacy'")
+					.get(),
+			).toEqual({ text: "keep me", media_json: null });
+			upgrade.run("UPDATE narrator_buffered_messages SET media_json = ? WHERE id = 'legacy'", [
+				JSON.stringify([media]),
+			]);
+			expect(
+				upgrade
+					.query("SELECT media_json FROM narrator_buffered_messages WHERE id = 'legacy'")
+					.get(),
+			).toEqual({ media_json: JSON.stringify([media]) });
+		} finally {
+			upgrade.close();
+		}
+	});
+	test("PostgreSQL schema and generated coverage map mediaJson to media_json", async () => {
+		const pg = await import("../../db/postgres-schema");
+		expect(pg.narratorBufferedMessages.mediaJson.name).toBe("media_json");
+		const table = pg.POSTGRES_SCHEMA_COVERAGE.tables.find(
+			(entry) => entry.name === "narrator_buffered_messages",
+		);
+		expect(
+			table?.columns.some(
+				(column) => column.property === "mediaJson" && column.name === "media_json",
+			),
+		).toBe(true);
+	});
+});
+
 describe("unrelated files are untouched", () => {
 	test("deleteBufferedTextFile refuses a non-mailbox path", () => {
 		const dir = mkdtempSync(join(HOME, "single-"));

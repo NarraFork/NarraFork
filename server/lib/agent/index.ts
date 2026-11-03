@@ -95,6 +95,8 @@ export async function buildHistory(
 	provider: string,
 	narratorId?: string,
 	options?: {
+		/** Only supplied when media is also sent in a separate current-input lane. */
+		currentMedia?: readonly import("@shared/media-attachments").MediaRef[];
 		/**
 		 * Loading state the request's `tools` array is built from, and the strategy
 		 * resolved for this model. Tool loads inside the history are rendered for it.
@@ -105,6 +107,7 @@ export async function buildHistory(
 	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
 	return buildAdapterHistory(resolved.adapter, dbMessages, resolved, {
 		narratorId,
+		...(options?.currentMedia ? { currentMedia: options.currentMedia } : {}),
 		...(options?.toolLoading ? { toolLoading: options.toolLoading } : {}),
 	});
 }

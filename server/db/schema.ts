@@ -1,3 +1,19 @@
+/**
+ * ⚠️ 修改本文件（数据库结构）时必须同步检查「数据导入 / 导出」功能：
+ * `server/services/data-portability.ts` 的导出只带 `SNAPSHOT_TABLES` 里的表
+ * （子进程按表复制，不是整库快照，新表不会自动包含）。导入只合并显式列举的表
+ * （api_requests / narrators / narrator_messages / narrator_message_refs /
+ * narrator_tool_calls / narrator_blocks）并按「列交集」拷贝。
+ *
+ * 因此，schema 变更时：
+ * - 新增需要跨机迁移/备份还原的表 → 加进 `SNAPSHOT_TABLES`，并在 `applyImport` 里补
+ *   `copyTable(...)`，同时改 `docs/DATA_PORTABILITY.md` 的表清单；
+ * - 新增 NOT NULL 且**无默认值**的列 → 旧快照导入会因缺列失败（列交集只能保证已有列可拷贝），
+ *   需在导入时补默认值、或明确拒绝旧版本快照；
+ * - 新增需要随「清空」处理的数据 → 在 `clearData` 的对应分支补删除/断引用逻辑；
+ * - 改动后请跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
+ * 细节见 docs/DATA_PORTABILITY.md。
+ */
 import type {
 	ContextCharCache,
 	ContextCharStats,
@@ -3682,6 +3698,7 @@ export const narratorBufferedMessages = sqliteTable(
 		narratorId: text("narrator_id").notNull(),
 		text: text("text").notNull(),
 		imagesJson: text("images_json"), // JSON: ImageRef[] | null
+		mediaJson: text("media_json"), // JSON: MediaRef[] | null
 		commandText: text("command_text"),
 		bashCommand: text("bash_command"), // runBashFirst command to execute before the prompt
 		createdBy: text("created_by"),

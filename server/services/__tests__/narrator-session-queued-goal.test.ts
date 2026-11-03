@@ -1,5 +1,30 @@
 import { describe, expect, test } from "bun:test";
-import { parseQueuedGoalCommand, parseQueuedNewCommand } from "../narrator-session";
+import {
+	parseQueuedGoalCommand,
+	parseQueuedNewCommand,
+	shouldSendQueuedNewInitialMessage,
+} from "../narrator-session";
+import type { BufferedMessage } from "../narrator-session-state";
+
+describe("queued /new initial message", () => {
+	test("only media adds a new attachment-only trigger", () => {
+		const buffered: BufferedMessage = {
+			id: "queued",
+			text: "/new",
+			bufferedAt: "2026-01-01",
+			images: [{ imageId: "image", filename: "image.png", mediaType: "image/png" }],
+			textFiles: [new File(["text"], "note.txt")],
+		};
+		expect(shouldSendQueuedNewInitialMessage("", buffered)).toBe(false);
+		expect(shouldSendQueuedNewInitialMessage("hello", buffered)).toBe(true);
+		expect(
+			shouldSendQueuedNewInitialMessage("", {
+				...buffered,
+				media: [{ mediaId: "audio", filename: "audio.wav", mediaType: "audio/wav", size: 5 }],
+			}),
+		).toBe(true);
+	});
+});
 
 describe("parseQueuedGoalCommand", () => {
 	test("mixed semantic documents never become /new or /goal controls after queuing", () => {

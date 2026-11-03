@@ -28,7 +28,10 @@ interface RuntimeCallLog {
 	requests: Array<{ method: string; params: unknown }>;
 }
 
-function fakeRuntime(log: RuntimeCallLog): ProviderRuntimeLike {
+function fakeRuntime(
+	log: RuntimeCallLog,
+	mediaCapabilities: { inputAudio?: boolean; inputVideo?: boolean } = {},
+): ProviderRuntimeLike {
 	// The RPC client consumes stream events as notifications, so the fake plugin has
 	// to push a terminal `done` for every accepted operation or the adapter waits
 	// forever for output.
@@ -61,7 +64,13 @@ function fakeRuntime(log: RuntimeCallLog): ProviderRuntimeLike {
 							displayName: "Lazy Provider",
 							defaultModelId: "lazy/base",
 							configSchema: { type: "object", additionalProperties: true },
-							capabilities: { validateConfig: true, listModels: true, chat: true, generate: true },
+							capabilities: {
+								validateConfig: true,
+								listModels: true,
+								chat: true,
+								generate: true,
+								...mediaCapabilities,
+							},
 							limits: {
 								maxConcurrentChat: 2,
 								maxConcurrentGenerate: 1,
@@ -91,14 +100,20 @@ function fakeRuntime(log: RuntimeCallLog): ProviderRuntimeLike {
 	};
 }
 
-function registryWithLazyProvider(log: RuntimeCallLog, options: { failActivation?: boolean } = {}) {
+function registryWithLazyProvider(
+	log: RuntimeCallLog,
+	options: {
+		failActivation?: boolean;
+		mediaCapabilities?: { inputAudio?: boolean; inputVideo?: boolean };
+	} = {},
+) {
 	const registry = new PluginProviderRegistry();
 	registry.setRemoteProviderAdapterFactory(
 		createPluginProviderAdapterFactory({
 			resolveRuntime: async (id) => {
 				log.activations.push(id);
 				if (options.failActivation) throw new Error("runtime refused to start");
-				return fakeRuntime(log);
+				return fakeRuntime(log, options.mediaCapabilities);
 			},
 		}),
 	);
@@ -110,7 +125,12 @@ function registryWithLazyProvider(log: RuntimeCallLog, options: { failActivation
 		providerPrefix: "lazy",
 		displayName: "Lazy Provider",
 		defaultModelId: "lazy/base",
-		capabilities: { chat: true, generate: true, mayLeakXmlToolCalls: true },
+		capabilities: {
+			chat: true,
+			generate: true,
+			mayLeakXmlToolCalls: true,
+			...options.mediaCapabilities,
+		},
 		models: [
 			{
 				id: "lazy/base",
@@ -121,6 +141,7 @@ function registryWithLazyProvider(log: RuntimeCallLog, options: { failActivation
 					streaming: true,
 					tools: false,
 					sessionMode: "stateless",
+					...options.mediaCapabilities,
 				},
 			},
 		],
@@ -144,6 +165,62 @@ function chatParams(): Parameters<
 }
 
 describe("plugin provider adapter factory", () => {
+	test("projects declared native media support through factory and negotiated RPC", async () => {
+		const log: RuntimeCallLog = { activations: [], requests: [] };
+		const registry = registryWithLazyProvider(log, {
+			mediaCapabilities: { inputAudio: true, inputVideo: true },
+		});
+		const adapter = registry.resolveProvider("lazy:lazy/base").adapter;
+		if (!adapter) throw new Error("adapter was not created");
+		const audio = {
+			type: "audio" as const,
+			mediaType: "audio/wav",
+			base64: Buffer.from("RIFF0000WAVE").toString("base64"),
+		};
+		await adapter.chat({ ...chatParams(), media: [audio] }).next();
+		const sent = log.requests.find((call) => call.method === "provider.chat")?.params;
+		expect(isRecord(sent) && sent.request).toMatchObject({
+			current: { media: [{ type: "audio", mediaType: "audio/wav", dataBase64: audio.base64 }] },
+		});
+	});
+
+	test("legacy factory refuses native media without even starting its runtime", async () => {
+		const log: RuntimeCallLog = { activations: [], requests: [] };
+		const registry = registryWithLazyProvider(log);
+		registry.setModelCatalog(`${pluginId}/lazy`, [
+			{
+				id: "lazy/base",
+				displayName: "Native-capable model",
+				capabilities: {
+					chat: true,
+					generate: true,
+					streaming: true,
+					tools: true,
+					sessionMode: "stateless",
+					inputAudio: true,
+					inputVideo: true,
+				},
+			},
+		]);
+		const adapter = registry.resolveProvider("lazy:lazy/base").adapter;
+		if (!adapter) throw new Error("adapter was not created");
+		await expect(
+			adapter
+				.chat({
+					...chatParams(),
+					media: [
+						{
+							type: "audio",
+							mediaType: "audio/wav",
+							base64: Buffer.from("RIFF0000WAVE").toString("base64"),
+						},
+					],
+				})
+				.next(),
+		).rejects.toMatchObject({ code: "UNSUPPORTED_MEDIA" });
+		expect(log.activations).toEqual([]);
+		expect(log.requests).toEqual([]);
+	});
 	test("builds an adapter without starting the plugin runtime", () => {
 		const log: RuntimeCallLog = { activations: [], requests: [] };
 		const registry = registryWithLazyProvider(log);

@@ -318,6 +318,20 @@ export function MessageEditorPanel({
 
 	const attachments: ExistingComposerAttachment[] = [
 		...blocks
+			.filter(
+				(block) =>
+					(block.type === "audio" || block.type === "video") && typeof block.mediaId === "string",
+			)
+			.map((block) => ({
+				kind: block.type as "audio" | "video",
+				mediaId: block.mediaId,
+				name: block.filename ?? "media",
+				size: block.size ?? 0,
+				mimeType: block.mediaType,
+				uploadNarratorId: block.uploadNarratorId ?? imageNarratorId ?? narratorId,
+				previewUrl: block.previewUrl,
+			})),
+		...blocks
 			.filter((block) => block.type === "image" && typeof block.imageId === "string")
 			.map((block) => ({
 				kind: "image" as const,

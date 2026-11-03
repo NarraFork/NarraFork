@@ -17,6 +17,8 @@ export interface UrgentDispatch {
 
 export interface QueuedEditPayload {
 	keepImageIds: string[];
+	keepMediaIds?: string[];
+	newMedia?: File[];
 	keepTextFiles: { index: number; filename: string }[];
 	newImages: File[];
 	newTextFiles: File[];

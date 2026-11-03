@@ -31,6 +31,7 @@ let edits: Record<string, string> = {};
 mock.module("@mantine/core", () => ({
 	Alert: box,
 	Badge: box,
+	Box: box,
 	Card: box,
 	Code: box,
 	Divider: box,
@@ -49,6 +50,16 @@ mock.module("@mantine/core", () => ({
 	Switch: box,
 	Select: box,
 	SegmentedControl: box,
+	// 新建会话弹窗里的提示词优化按钮用的是 TextareaOptimizeControls，它渲染 Mantine 的
+	// Menu 与 NumberInput。这里只需形状，不需要行为。
+	Menu: Object.assign(box, {
+		Target: box,
+		Dropdown: box,
+		Item: box,
+		Label: box,
+		Divider: box,
+	}),
+	NumberInput: box,
 	TextInput: input,
 	Textarea: input,
 	PasswordInput: input,
@@ -110,6 +121,13 @@ const update = mock((_data: unknown, _options?: unknown) => {});
 const createProject = mock((_data: unknown, _options?: unknown) => {});
 const mutation = { mutate: mock(() => {}), reset: mock(() => {}), isPending: false };
 mock.module("../../hooks/useNarrator", () => ({ useCreateNarrator: () => ({ mutate: create }) }));
+// 弹窗右侧的项目提示词框带「从提示词库插入」，读一个空库即可；库本身有独立测试。
+mock.module("../../hooks/usePromptLibrary", () => ({
+	usePromptLibrary: () => ({ data: [], isLoading: false }),
+	useCreatePrompt: () => mutation,
+	useUpdatePrompt: () => mutation,
+	useDeletePrompt: () => mutation,
+}));
 mock.module("../../hooks/useFavoriteDirectories", () => ({
 	useFavoriteDirectories: () => ({ data: [] }),
 	useCreateFavoriteDirectory: () => mutation,

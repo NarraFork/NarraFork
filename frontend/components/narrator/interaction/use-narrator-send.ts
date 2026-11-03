@@ -28,16 +28,29 @@ export function snapshotComposerFiles(
 	document: ComposerDocument | undefined,
 	images: File[],
 	textFiles: File[],
-): { images: File[]; textFiles: File[] } | undefined {
-	if (!document) return { images: [...images], textFiles: [...textFiles] };
-	const byId = new Map([...images, ...textFiles].map((file) => [getComposerAssetId(file), file]));
-	const snapshot = { images: [] as File[], textFiles: [] as File[] };
+	media: File[] = [],
+): { images: File[]; textFiles: File[]; media: File[] } | undefined {
+	if (!document) return { images: [...images], textFiles: [...textFiles], media: [...media] };
+	const byId = new Map(
+		[...images, ...textFiles, ...media].map((file) => [getComposerAssetId(file), file]),
+	);
+	const snapshot = { images: [] as File[], textFiles: [] as File[], media: [] as File[] };
 	for (const asset of document.assets) {
 		const file = byId.get(asset.id);
 		if (!file || file.name !== asset.name || file.size !== asset.size) return undefined;
-		if (asset.kind === "image" ? !images.includes(file) : !textFiles.includes(file))
+		const source = asset.kind === "image" ? images : asset.kind === "textFile" ? textFiles : media;
+		if (
+			!source.includes(file) ||
+			((asset.kind === "audio" || asset.kind === "video") &&
+				!file.type.startsWith(`${asset.kind}/`))
+		)
 			return undefined;
-		(asset.kind === "image" ? snapshot.images : snapshot.textFiles).push(file);
+		(asset.kind === "image"
+			? snapshot.images
+			: asset.kind === "textFile"
+				? snapshot.textFiles
+				: snapshot.media
+		).push(file);
 	}
 	return snapshot;
 }
@@ -88,6 +101,7 @@ export interface UseNarratorSendOptions {
 	// Attachments (owned by useComposerAttachments, shared with the composer).
 	attachedImages: File[];
 	attachedTextFiles: File[];
+	attachedMedia?: File[];
 	clearAttachedFilesAndDraft: () => void;
 
 	// Shared send guard (also read by the composer's disabled state).
@@ -180,6 +194,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		composerRef,
 		attachedImages,
 		attachedTextFiles,
+		attachedMedia = [],
 		clearAttachedFilesAndDraft,
 		sendingRef,
 		setQueuedMessages,
@@ -240,7 +255,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	);
 	// AbortController for the in-flight send request; used by cancel and unmount.
 	const sendAbortRef = useRef<AbortController | null>(null);
-	const interruptedFilesRef = useRef<{ images: File[]; textFiles: File[] } | null>(null);
+	const interruptedFilesRef = useRef<{ images: File[]; textFiles: File[]; media: File[] } | null>(
+		null,
+	);
 	useLayoutEffect(() => {
 		currentSendScopeRef.current = sendScope;
 		setSendingState(null);
@@ -257,6 +274,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					sendScope.narratorId,
 					files.images,
 					files.textFiles,
+					files.media,
 				);
 			}
 			sendAbortRef.current = null;
@@ -374,6 +392,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		interrupt?: boolean,
 		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 		composerDocument?: ComposerDocument,
+		media: File[] = [],
 	) => {
 		if (interrupt) priority = true;
 		const optimisticBlocks: ContentBlock[] = [
@@ -388,6 +407,13 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				type: "text_file",
 				filename: f.name,
 				size: f.size,
+			})),
+			...media.map((file) => ({
+				type: file.type.startsWith("video/") ? "video" : "audio",
+				filename: file.name,
+				mediaType: file.type,
+				size: file.size,
+				previewUrl: URL.createObjectURL(file),
 			})),
 			{ type: "text", text: msg },
 		];
@@ -404,7 +430,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				fileReferences,
 				interrupt,
 				queueMode,
-				...(composerDocument ? [{ composerDocument }] : []),
+				composerDocument ? { composerDocument } : undefined,
+				media.length ? media : undefined,
 			);
 			if (!isCurrentSendScope()) return;
 			// Handle /load tool response — not a real message, just a tool load confirmation
@@ -469,7 +496,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		interrupt?: boolean,
 		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 		composerDocument?: ComposerDocument,
-		attachmentSnapshot?: { images: File[]; textFiles: File[] },
+		attachmentSnapshot?: { images: File[]; textFiles: File[]; media: File[] },
 		preserveComposerDraft = false,
 	): Promise<boolean> => {
 		if (interrupt) priority = true;
@@ -483,7 +510,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		const fileReferences = references ?? (draft.text === msg ? draft.fileReferences : []);
 		const files =
 			attachmentSnapshot ??
-			snapshotComposerFiles(composerDocument, attachedImages, attachedTextFiles);
+			snapshotComposerFiles(composerDocument, attachedImages, attachedTextFiles, attachedMedia);
 		if (!files) throw new Error(t("composerMissingAssets"));
 		const images = files.images;
 		const textFiles = files.textFiles;
@@ -498,7 +525,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			fileReferences,
 			interrupt,
 			queueMode,
-			...(composerDocument ? [{ composerDocument }] : []),
+			composerDocument ? { composerDocument } : undefined,
+			files.media.length ? files.media : undefined,
 		);
 		if (!isCurrentSendScope()) return false;
 		const buffered = applyBufferedSendResult(
@@ -570,7 +598,12 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				p.children.every((n) => n.type === "text" || n.type === "break"),
 			);
 		if (sendingRef.current) return;
-		const files = snapshotComposerFiles(composerDocument, attachedImages, attachedTextFiles);
+		const files = snapshotComposerFiles(
+			composerDocument,
+			attachedImages,
+			attachedTextFiles,
+			attachedMedia,
+		);
 		if (!files || composerRef.current?.hasMissingAssets?.()) {
 			notifications.show({
 				color: "red",
@@ -579,7 +612,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			});
 			return;
 		}
-		const attachmentCount = files.images.length + files.textFiles.length + fileReferences.length;
+		const attachmentCount =
+			files.images.length + files.textFiles.length + files.media.length + fileReferences.length;
 		// An attachment-only message is a valid turn: images (and text files) carry the
 		// content by themselves, so an empty textarea must not block the send.
 		if (
@@ -587,6 +621,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				text: composerText,
 				imageCount: files.images.length,
 				textFileCount: files.textFiles.length,
+				mediaCount: files.media.length,
 				fileReferenceCount: fileReferences.length,
 			}) ||
 			sendingRef.current
@@ -736,7 +771,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 
 				if (!isCurrentSendScope()) return;
 				abortController.signal.throwIfAborted();
-				if (initialMessage || images.length > 0 || textFiles.length > 0) {
+				if (initialMessage || images.length > 0 || textFiles.length > 0 || files.media.length > 0) {
 					const initialInput = editFileReferenceInput(
 						{ text: msg, fileReferences, composerDocument },
 						initialMessage,
@@ -754,6 +789,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 						sendArgs[7] = initialInput.fileReferences;
 						sendArgs[10] = { composerDocument: initialInput.composerDocument };
 					}
+					if (files.media.length) sendArgs[11] = files.media;
 					await api.sendNarratorMessage(...sendArgs);
 				}
 
@@ -797,6 +833,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					undefined,
 					mode,
 					composerDocument,
+					files.media,
 				);
 				if (!isCurrentSendScope()) return;
 				composerRef.current?.hideTextForSend();
@@ -818,6 +855,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				mode === "interrupt" ? true : undefined,
 				mode,
 				composerDocument,
+				files.media,
 			);
 			if (!isCurrentSendScope()) return;
 			composerRef.current?.hideTextForSend();
@@ -909,7 +947,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 						undefined,
 						"turn",
 						undefined,
-						{ images: [], textFiles: [] },
+						{ images: [], textFiles: [], media: [] },
 						true,
 					);
 				} catch (err) {

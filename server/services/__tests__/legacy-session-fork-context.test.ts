@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
@@ -56,7 +57,12 @@ for (const table of Object.values(schema)) {
 	sqlite.run(`CREATE TABLE IF NOT EXISTS ${config.name} (${columns.join(",")})`);
 }
 const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+}));
 const { canReadNarrator, canWriteNarrator } = await import("../narrator-acl");
 const { narratorService } = await import("../narrator-service");
 const { resolveSkillContextForNarrator } = await import("../skill-service");

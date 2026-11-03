@@ -5,6 +5,7 @@ import {
 	composerDocumentText,
 	readComposerDocument,
 } from "@shared/composer-document";
+import { mediaModality } from "@shared/media-attachments";
 import { parseComposerQuotePrefix } from "./composer-quotes";
 import { getComposerAssetId } from "./draft-image-attachments";
 import { type FileReferenceInput, readFileReferences } from "./file-reference-input";
@@ -69,10 +70,18 @@ export function composerInputFromDocument(composerDocument: ComposerDocument): F
 	return { ...composerDocumentText(composerDocument), composerDocument };
 }
 
-export function composerAssetsFromFiles(images: File[], textFiles: File[]): ComposerAsset[] {
+export function composerAssetsFromFiles(
+	images: File[],
+	textFiles: File[],
+	mediaFiles: File[] = [],
+): ComposerAsset[] {
 	return [
 		...images.map((file) => ({ file, kind: "image" as const })),
 		...textFiles.map((file) => ({ file, kind: "textFile" as const })),
+		...mediaFiles.flatMap((file) => {
+			const kind = mediaModality(file.type);
+			return kind ? [{ file, kind }] : [];
+		}),
 	].map(({ file, kind }) => ({
 		id: getComposerAssetId(file),
 		kind,
@@ -87,8 +96,9 @@ export function withComposerAttachments(
 	document: ComposerDocument,
 	images: File[],
 	textFiles: File[],
+	mediaFiles: File[] = [],
 ): ComposerDocument {
-	const files = composerAssetsFromFiles(images, textFiles);
+	const files = composerAssetsFromFiles(images, textFiles, mediaFiles);
 	const known = new Set(document.assets.map((asset) => asset.id));
 	const fresh = files.filter((asset) => !known.has(asset.id));
 	if (!fresh.length) return document;

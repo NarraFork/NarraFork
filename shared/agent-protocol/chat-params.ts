@@ -10,6 +10,8 @@
  * callers can keep passing their existing object unchanged.
  */
 
+import type { NativeMediaInput } from "../media-attachments";
+
 /** Base64 image attached to the current user message. */
 export interface ProtocolChatImage {
 	format: string;
@@ -26,4 +28,6 @@ export interface ChatParams {
 	toolResults: unknown[];
 	/** Base64-encoded images to attach to the current user message. */
 	images?: ProtocolChatImage[];
+	/** Actual audio/video data; adapters must either serialize it natively or reject it. */
+	media?: NativeMediaInput[];
 }

@@ -4,6 +4,12 @@ import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mo
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import {
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+	type NativeMediaFallbackWarning,
+} from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
@@ -364,9 +370,21 @@ export async function runAgentLoopUnlocked(
 	run?: RunControl,
 	/** An accepted `/bash` pre-command the runtime runs (and owns) before the first pass. */
 	prePromptBashCommand?: string,
+	media?: MediaRef[],
 ): Promise<RuntimeRunOutcome> {
 	const { narratorId, locale } = active;
-	const runState = createRuntimeRunState({ kind: "current", text, images }, prePromptBashCommand);
+	const runState = createRuntimeRunState(
+		{ kind: "current", text, images, media },
+		prePromptBashCommand,
+	);
+	const mediaFallbackWarningKeys = new Set<string>();
+	const newMediaFallbackWarnings = (warnings: NativeMediaFallbackWarning[]) =>
+		warnings.filter((warning) => {
+			const key = JSON.stringify([warning.model, warning.uploadNarratorId, warning.mediaId]);
+			if (mediaFallbackWarningKeys.has(key)) return false;
+			mediaFallbackWarningKeys.add(key);
+			return true;
+		});
 	const continuationState = createSpecContinuationState();
 	let continuationStopNote: string | null = null;
 	let abortedBeforeCleanup: boolean | undefined;
@@ -575,6 +593,7 @@ export async function runAgentLoopUnlocked(
 			const delivered = await drainAndPersistPendingInjections(active, placement);
 			if (delivered) {
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				return "continue";
@@ -744,6 +763,7 @@ export async function runAgentLoopUnlocked(
 				});
 				if (continuationPrompt) {
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					return "continue";
@@ -772,6 +792,7 @@ export async function runAgentLoopUnlocked(
 			const persistBlocks: Array<
 				| { type: "text"; text: string }
 				| PersistedUserImageBlock
+				| MediaContentBlock
 				| FileReferenceSnapshot
 				| {
 						type: "text_file";
@@ -785,6 +806,8 @@ export async function runAgentLoopUnlocked(
 					persistBlocks.push(imageRefToContentBlock(img));
 				}
 			}
+			for (const ref of buffered.media ?? [])
+				persistBlocks.push(mediaRefToContentBlock(ref, narratorId));
 			if (savedBufferedTextFiles.length > 0) {
 				for (const tf of savedBufferedTextFiles) {
 					persistBlocks.push({
@@ -852,12 +875,14 @@ export async function runAgentLoopUnlocked(
 						signal: urgentActivitySignal(active, active.abortController.signal),
 					},
 				);
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				return "continue";
 			}
 			runState.input.text = projectFileReferenceText(effectiveBufferedText, fileReferences);
 			runState.input.images = buffered.images;
+			runState.input.media = buffered.media;
 			return "continue";
 		}
 		return "none";
@@ -899,6 +924,7 @@ export async function runAgentLoopUnlocked(
 						signal: AbortSignal.any([active.abortController.signal, passUrgentGuidance.signal]),
 					},
 				);
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.firstPass = false;
 				// A stop during the pre-command ends the turn before any model request.
@@ -1293,6 +1319,7 @@ export async function runAgentLoopUnlocked(
 				model: preparedPrefix.model,
 				provider: preparedPrefix.provider,
 				currentInput: runState.input.text,
+				currentMedia: runState.input.media,
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
 				toolLoading: preparedPrefix.toolLoading,
@@ -2204,6 +2231,11 @@ export async function runAgentLoopUnlocked(
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
 				onEvent: (event) => {
+					if (event.type === "media_fallback") {
+						const warnings = newMediaFallbackWarnings(event.warnings);
+						if (!warnings.length) return;
+						event = { ...event, warnings };
+					}
 					processEvent(event, eventContext, hooks).catch((err) => {
 						logger.error("Side-channel event processing error", {
 							narratorId,
@@ -2383,6 +2415,7 @@ export async function runAgentLoopUnlocked(
 					});
 				await narratorService.updateStatus(narratorId, "working");
 				if (keptPartial) {
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 				}
@@ -2431,6 +2464,15 @@ export async function runAgentLoopUnlocked(
 
 			active._tokenUsageBaseline = active._requestTokenTotal ?? 0;
 			active._interruptCleanupDone = false;
+			const fallbackWarnings = newMediaFallbackWarnings(
+				preparedHistory.mediaFallbackWarnings ?? [],
+			);
+			if (fallbackWarnings.length)
+				await processEvent(
+					{ type: "media_fallback", warnings: fallbackWarnings },
+					eventContext,
+					hooks,
+				);
 			let result: ExecuteLoopResult;
 			try {
 				result = await executeAgentLoop({
@@ -2440,6 +2482,7 @@ export async function runAgentLoopUnlocked(
 					history: { rows: preparedHistory.modelMessages, built: preparedHistory.history },
 					startedWithToolResults: preparedHistory.endsWithToolResults,
 					images: loopImages,
+					media: preparedHistory.currentMedia,
 					eventContext,
 					hooks,
 				}).finally(() => {
@@ -2476,6 +2519,7 @@ export async function runAgentLoopUnlocked(
 					...sideCarBodyWithText("workspace_changed", { kind: "notice" }, locale),
 					locale,
 				});
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
@@ -2839,6 +2883,7 @@ export async function runAgentLoopUnlocked(
 				}
 				if (outcome.kind === "replay") {
 					if (outcome.keptPartial) {
+						runState.input.media = undefined;
 						runState.input.text = "";
 						runState.input.images = undefined;
 					}
@@ -2866,6 +2911,7 @@ export async function runAgentLoopUnlocked(
 				const continuationPrompt = await continueForSpec("maxTurns", false);
 				if (continuationPrompt) {
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;
@@ -2972,6 +3018,7 @@ export async function runAgentLoopUnlocked(
 						narratorId,
 						retries: interruptionPlan.retries,
 					});
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;
@@ -2999,6 +3046,7 @@ export async function runAgentLoopUnlocked(
 						data: fileReferenceMessageForDisplay(userMsg),
 					});
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = continueText;
 					runState.input.images = undefined;
 					continue;
@@ -3083,6 +3131,7 @@ export async function runAgentLoopUnlocked(
 					data: fileReferenceMessageForDisplay(userMsg),
 				});
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = promptText;
 				runState.input.images = undefined;
 				continue;
@@ -3132,6 +3181,7 @@ export async function runAgentLoopUnlocked(
 					data: fileReferenceMessageForDisplay(userMsg),
 				});
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
 				// cut-in message queued during the same tool call needs its boundary back.
@@ -3203,6 +3253,7 @@ export async function runAgentLoopUnlocked(
 			const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
 			if (bgCompletionPrompt) {
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				// This drain starts a fresh pass before the buffer consumer below is
@@ -3232,6 +3283,7 @@ export async function runAgentLoopUnlocked(
 				if (!runState.hadError && active.alive) {
 					logger.info("Resuming turn after a cancelled cut-in queued message", { narratorId });
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;
@@ -3244,6 +3296,7 @@ export async function runAgentLoopUnlocked(
 				await narratorService.updateStatus(narratorId, "working");
 				// The continuation prompt was persisted as a system message; the next
 				// provider call only needs an empty turn to advance the conversation.
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
@@ -3259,6 +3312,7 @@ export async function runAgentLoopUnlocked(
 					active.abortController.signal.aborted,
 				)
 			) {
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
@@ -3286,6 +3340,7 @@ export async function runAgentLoopUnlocked(
 				const bgCompletionAfterIdle = await drainAndPersistPendingInjections(active, placement);
 				if (bgCompletionAfterIdle) {
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;

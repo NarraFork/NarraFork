@@ -5,9 +5,11 @@
  * these bytes.
  */
 
+import type { NativeMediaInput } from "@shared/media-attachments";
 import type { CanonicalEnvelope, ImagePart } from "@shared/narrator-blocks/types";
 import { logger } from "../../logger";
 import { getImagePath, imageToBase64 } from "../../uploads";
+import { resolveNativeMediaBlocks } from "../native-media";
 import type { ProjectionAssets, ResolvedImage } from "./turns";
 
 const FORMAT_BY_MEDIA_TYPE: Record<string, string> = {
@@ -98,6 +100,8 @@ export async function resolveProjectionAssets(
 	envelopes: readonly CanonicalEnvelope[],
 	narratorId?: string,
 ): Promise<ProjectionAssets> {
+	const inputMedia = new Map<string, NativeMediaInput[]>();
+	const toolResultMedia = new Map<string, NativeMediaInput[]>();
 	const inputImages = new Map<string, Array<ResolvedImage | null>>();
 	const generatedImages = new Map<string, string>();
 	const toolResultImages = new Map<string, ResolvedImage[]>();
@@ -105,6 +109,10 @@ export async function resolveProjectionAssets(
 		const owner = envelope.narratorId ?? narratorId;
 		for (const block of envelope.blocks) {
 			if (block.kind === "input") {
+				const media = block.payload.parts.filter(
+					(part) => part.type === "audio" || part.type === "video",
+				);
+				if (media.length) inputMedia.set(block.id, await resolveNativeMediaBlocks(media, owner));
 				const images = block.payload.parts.filter((part) => part.type === "image");
 				if (!images.length) continue;
 				const slots: Array<ResolvedImage | null> = [];
@@ -125,8 +133,12 @@ export async function resolveProjectionAssets(
 			if (block.kind === "tool" && block.payload.executor === "local") {
 				const parts = block.payload.result?.parts ?? [];
 				if (!parts.length || block.phase !== "done") continue;
+				const media = parts.filter((part) => part.type === "audio" || part.type === "video");
+				if (media.length)
+					toolResultMedia.set(block.id, await resolveNativeMediaBlocks(media, owner));
 				const images: ResolvedImage[] = [];
 				for (const part of parts) {
+					if (part.type !== "image") continue;
 					const uploader = part.uploadNarratorId ?? owner;
 					const image =
 						part.data || !uploader
@@ -154,5 +166,5 @@ export async function resolveProjectionAssets(
 			}
 		}
 	}
-	return { inputImages, generatedImages, toolResultImages };
+	return { inputImages, generatedImages, toolResultImages, inputMedia, toolResultMedia };
 }

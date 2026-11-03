@@ -35,7 +35,7 @@ let loads: {
 }[];
 let saved: Map<string, Draft>;
 let save: ReturnType<typeof spyOn<typeof storage, "saveDraftImageAttachments">>;
-const empty = (): Draft => ({ images: [], textFiles: [], droppedCount: 0 });
+const empty = (): Draft => ({ images: [], textFiles: [], media: [], droppedCount: 0 });
 function image(id: string) {
 	const file = new File([id], `${id}.png`, { type: "image/png" });
 	storage.setComposerAssetId(file, id);
@@ -101,10 +101,11 @@ beforeEach(async () => {
 			),
 	);
 	save = spyOn(storage, "saveDraftImageAttachments").mockImplementation(
-		async (userId, narrator, images, textFiles = []) => {
+		async (userId, narrator, images, textFiles = [], media = []) => {
 			saved.set(storage.getDraftImageAttachmentKey(userId, narrator), {
 				images: [...images],
 				textFiles: [...textFiles],
+				media: [...media],
 				droppedCount: 0,
 			});
 		},
@@ -136,7 +137,12 @@ test("manifest arriving before IndexedDB filters deleted files but preserves ref
 	const removedText = text("removed-text");
 	await act(async () => hook.reconcileDocumentAssets(["keep", "keep-text"]));
 	expect(save).not.toHaveBeenCalled();
-	await hydrate({ images: [keep, removed], textFiles: [keepText, removedText], droppedCount: 0 });
+	await hydrate({
+		images: [keep, removed],
+		textFiles: [keepText, removedText],
+		media: [],
+		droppedCount: 0,
+	});
 	expect(hook.attachedImages).toEqual([keep]);
 	expect(hook.attachedTextFiles).toEqual([keepText]);
 	expect(hook.composerAssets.map((asset) => asset.id)).toEqual(["keep", "keep-text"]);
@@ -146,7 +152,12 @@ test("manifest arriving before IndexedDB filters deleted files but preserves ref
 		keepText,
 		removedText,
 	]);
-	expect(persisted()).toEqual({ images: [keep], textFiles: [keepText], droppedCount: 0 });
+	expect(persisted()).toEqual({
+		images: [keep],
+		textFiles: [keepText],
+		media: [],
+		droppedCount: 0,
+	});
 });
 
 test("latest manifest wins during hydrate, including an empty remote document", async () => {
@@ -154,7 +165,7 @@ test("latest manifest wins during hydrate, including an empty remote document", 
 		hook.reconcileDocumentAssets(["f"]);
 		hook.reconcileDocumentAssets([]);
 	});
-	await hydrate({ images: [image("f")], textFiles: [], droppedCount: 0 });
+	await hydrate({ images: [image("f")], textFiles: [], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([]);
 	expect(persisted()).toEqual(empty());
 });
@@ -163,7 +174,7 @@ test("manifest after hydrate removes F from arrays and persistence before adding
 	const f = image("f");
 	const oldText = text("old-text");
 	const g = image("g");
-	await hydrate({ images: [f], textFiles: [oldText], droppedCount: 0 });
+	await hydrate({ images: [f], textFiles: [oldText], media: [], droppedCount: 0 });
 	await act(async () => {
 		hook.reconcileDocumentAssets([]);
 		// Exercise a same-event functional append: its previous array must already
@@ -172,7 +183,7 @@ test("manifest after hydrate removes F from arrays and persistence before adding
 	});
 	expect(hook.attachedImages).toEqual([g]);
 	expect(hook.attachedTextFiles).toEqual([]);
-	expect(persisted()).toEqual({ images: [g], textFiles: [], droppedCount: 0 });
+	expect(persisted()).toEqual({ images: [g], textFiles: [], media: [], droppedCount: 0 });
 	await act(async () => hook.reconcileDocumentAssets(["g"]));
 	expect(hook.attachedImagesRef.current).toEqual([g]);
 	const stored = persisted();
@@ -195,10 +206,15 @@ test("new local G wins over a late hydrate and is allowed before document adopti
 		hook.updateAttachedImages((previous) => [...previous, g]);
 		hook.updateAttachedTextFiles((previous) => [...previous, newText]);
 	});
-	await hydrate({ images: [image("f")], textFiles: [text("old-text")], droppedCount: 0 });
+	await hydrate({
+		images: [image("f")],
+		textFiles: [text("old-text")],
+		media: [],
+		droppedCount: 0,
+	});
 	expect(hook.attachedImages).toEqual([g]);
 	expect(hook.attachedTextFiles).toEqual([newText]);
-	expect(persisted()).toEqual({ images: [g], textFiles: [newText], droppedCount: 0 });
+	expect(persisted()).toEqual({ images: [g], textFiles: [newText], media: [], droppedCount: 0 });
 	await act(async () => hook.reconcileDocumentAssets(["g", "new-text"]));
 	expect(hook.composerAssets.map((asset) => asset.id)).toEqual(["g", "new-text"]);
 });
@@ -207,7 +223,7 @@ test("document declarations alone do not suppress valid F hydration", async () =
 	const f = image("f");
 	await act(async () => hook.reconcileDocumentAssets(["f"]));
 	await act(async () => hook.reconcileDocumentAssets(["f"]));
-	await hydrate({ images: [f], textFiles: [], droppedCount: 0 });
+	await hydrate({ images: [f], textFiles: [], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([f]);
 	expect(persisted()?.images).toEqual([f]);
 });
@@ -216,7 +232,7 @@ for (const switchScope of ["narrator", "user"] as const) {
 	test(`${switchScope} switch exposes empty arrays, refs and manifest on its first reused-hook render`, async () => {
 		const f = image("f");
 		const oldText = text("old-text");
-		await hydrate({ images: [f], textFiles: [oldText], droppedCount: 0 });
+		await hydrate({ images: [f], textFiles: [oldText], media: [], droppedCount: 0 });
 		const imageRef = hook.attachedImagesRef;
 		const textRef = hook.attachedTextFilesRef;
 		expect(attachmentRenders.at(-1)?.images).toEqual([f]);
@@ -238,7 +254,7 @@ for (const switchScope of ["narrator", "user"] as const) {
 		expect(hook.attachedTextFilesRef).toBe(textRef);
 		const b = image("b");
 		const bText = text("b-text");
-		await hydrate({ images: [b], textFiles: [bText], droppedCount: 0 }, 1);
+		await hydrate({ images: [b], textFiles: [bText], media: [], droppedCount: 0 }, 1);
 		expect(hook.attachedImages).toEqual([b]);
 		expect(hook.attachedTextFiles).toEqual([bText]);
 		expect(hook.attachedImagesRef.current).toEqual([b]);
@@ -274,8 +290,8 @@ for (const switchScope of ["narrator", "user"] as const) {
 		expect(attachmentRenders[firstNewOwnerRender].imageRefs).toEqual([]);
 		expect(attachmentRenders[firstNewOwnerRender].textFileRefs).toEqual([]);
 		const fresh = image("fresh-b");
-		await hydrate({ images: [fresh], textFiles: [], droppedCount: 0 }, 1);
-		await hydrate({ images: [old], textFiles: [oldText], droppedCount: 0 }, 0);
+		await hydrate({ images: [fresh], textFiles: [], media: [], droppedCount: 0 }, 1);
+		await hydrate({ images: [old], textFiles: [oldText], media: [], droppedCount: 0 }, 0);
 		expect(hook.attachedImages).toEqual([fresh]);
 		expect(hook.attachedTextFiles).toEqual([]);
 		expect(hook.attachedImagesRef.current).toEqual([fresh]);
@@ -292,8 +308,8 @@ for (const switchScope of ["narrator", "user"] as const) {
 		await render();
 		expect(hook.attachmentsHydrating).toBe(true);
 		const fresh = image("fresh");
-		await hydrate({ images: [fresh], textFiles: [], droppedCount: 0 }, 1);
-		await hydrate({ images: [image("stale")], textFiles: [], droppedCount: 0 }, 0);
+		await hydrate({ images: [fresh], textFiles: [], media: [], droppedCount: 0 }, 1);
+		await hydrate({ images: [image("stale")], textFiles: [], media: [], droppedCount: 0 }, 0);
 		expect(hook.attachedImages).toEqual([fresh]);
 		expect(persisted()?.images).toEqual([fresh]);
 		expect(persisted("user-a", "narrator-a")).toBeUndefined();
@@ -314,10 +330,10 @@ for (const switchScope of ["narrator", "user"] as const) {
 			hook.updateAttachedImages([local]);
 		});
 		expect(save).not.toHaveBeenCalled();
-		await hydrate({ images: [image("stale")], textFiles: [], droppedCount: 0 }, 0);
+		await hydrate({ images: [image("stale")], textFiles: [], media: [], droppedCount: 0 }, 0);
 		expect(hook.attachmentsHydrating).toBe(true);
 		expect(hook.attachedImages).toEqual([local]);
-		await hydrate({ images: [fresh], textFiles: [], droppedCount: 0 }, 1);
+		await hydrate({ images: [fresh], textFiles: [], media: [], droppedCount: 0 }, 1);
 		expect(hook.attachedImages).toEqual([fresh, local]);
 		expect(persisted()?.images).toEqual([fresh, local]);
 		expect(persisted("user-a", "narrator-a")).toBeUndefined();
@@ -331,15 +347,15 @@ test("narrator A to B to A does not reuse the first A ownership declaration or h
 	narratorId = "narrator-a";
 	await render();
 	const current = image("current");
-	await hydrate({ images: [current], textFiles: [], droppedCount: 0 }, 2);
-	await hydrate({ images: [image("stale")], textFiles: [], droppedCount: 0 }, 0);
+	await hydrate({ images: [current], textFiles: [], media: [], droppedCount: 0 }, 2);
+	await hydrate({ images: [image("stale")], textFiles: [], media: [], droppedCount: 0 }, 0);
 	expect(hook.attachedImages).toEqual([current]);
 	expect(persisted()?.images).toEqual([current]);
 });
 
 test("send hide during hydrate keeps files hidden without overwriting the recovery draft", async () => {
 	const f = image("f");
-	const draft = { images: [f], textFiles: [], droppedCount: 0 };
+	const draft = { images: [f], textFiles: [], media: [], droppedCount: 0 };
 	saved.set(storage.getDraftImageAttachmentKey("user-a", narratorId), draft);
 	await act(async () => {
 		hook.reconcileDocumentAssets(["f"]);
@@ -378,11 +394,16 @@ test("F pending plus newly attached G merges the declared document before any pa
 	});
 	expect(hook.attachmentsHydrating).toBe(true);
 	expect(save).not.toHaveBeenCalled();
-	await hydrate({ images: [f], textFiles: [fText], droppedCount: 0 });
+	await hydrate({ images: [f], textFiles: [fText], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([f, g]);
 	expect(hook.attachedTextFiles).toEqual([fText, gText]);
 	expect(hook.attachmentsHydrating).toBe(false);
-	expect(persisted()).toEqual({ images: [f, g], textFiles: [fText, gText], droppedCount: 0 });
+	expect(persisted()).toEqual({
+		images: [f, g],
+		textFiles: [fText, gText],
+		media: [],
+		droppedCount: 0,
+	});
 	for (const [, , images, textFiles] of save.mock.calls) {
 		expect(images).toEqual([f, g]);
 		expect(textFiles).toEqual([fText, gText]);
@@ -398,7 +419,7 @@ test("deleting unhydrated F while adding G never resurrects F", async () => {
 	});
 	await act(async () => hook.reconcileDocumentAssets(["g"]));
 	expect(save).not.toHaveBeenCalled();
-	await hydrate({ images: [image("f")], textFiles: [], droppedCount: 0 });
+	await hydrate({ images: [image("f")], textFiles: [], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([g]);
 	expect(persisted()?.images).toEqual([g]);
 });
@@ -414,7 +435,7 @@ test("same filename never merges different asset IDs and a local same-ID file wi
 		hook.reconcileDocumentAssets(["f", "g"]);
 		hook.updateAttachedImages([replacement]);
 	});
-	await hydrate({ images: [original, other], textFiles: [], droppedCount: 0 });
+	await hydrate({ images: [original, other], textFiles: [], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([replacement, other]);
 	expect(hook.attachedImages[0]).toBe(replacement);
 	expect(hook.restoredAttachmentResources.get("f")).toBe(replacement);
@@ -430,7 +451,7 @@ test("explicit clear during hydrate empties membership and the persisted draft",
 	await act(async () => hook.reconcileDocumentAssets(["f"]));
 	await act(async () => hook.clearAttachedFilesAndDraft());
 	expect(storage.clearDraftImageAttachments).toHaveBeenCalledWith("user-a", narratorId);
-	await hydrate({ images: [image("f")], textFiles: [text("old")], droppedCount: 0 });
+	await hydrate({ images: [image("f")], textFiles: [text("old")], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([]);
 	expect(hook.attachedTextFiles).toEqual([]);
 	expect(persisted()).toEqual(empty());
@@ -440,10 +461,10 @@ test("legacy callers with no membership retain local-version replacement semanti
 	const g = image("g");
 	await act(async () => hook.updateAttachedImages([g]));
 	expect(save).not.toHaveBeenCalled();
-	await hydrate({ images: [image("f")], textFiles: [text("old")], droppedCount: 0 });
+	await hydrate({ images: [image("f")], textFiles: [text("old")], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([g]);
 	expect(hook.attachedTextFiles).toEqual([]);
-	expect(persisted()).toEqual({ images: [g], textFiles: [], droppedCount: 0 });
+	expect(persisted()).toEqual({ images: [g], textFiles: [], media: [], droppedCount: 0 });
 });
 
 test("hydration status resets on the first owner render and only current completion settles it", async () => {
@@ -478,6 +499,7 @@ for (const missingKind of ["image", "textFile"] as const) {
 		const draft = {
 			images: missingKind === "image" ? [f] : [],
 			textFiles: missingKind === "textFile" ? [f] : [],
+			media: [],
 			droppedCount: 0,
 		};
 		saved.set(storage.getDraftImageAttachmentKey("user-a", narratorId), draft);
@@ -501,12 +523,12 @@ for (const missingKind of ["image", "textFile"] as const) {
 		const imagesBeforeDeletion = hook.attachedImages;
 		await act(async () => hook.reconcileDocumentAssets(["g"]));
 		expect(hook.attachedImages).toBe(imagesBeforeDeletion);
-		expect(persisted()).toEqual({ images: [g], textFiles: [], droppedCount: 0 });
+		expect(persisted()).toEqual({ images: [g], textFiles: [], media: [], droppedCount: 0 });
 	});
 }
 
 test("explicit clear after a failed read can remove the protected stored record", async () => {
-	const draft = { images: [image("f")], textFiles: [], droppedCount: 0 };
+	const draft = { images: [image("f")], textFiles: [], media: [], droppedCount: 0 };
 	saved.set(storage.getDraftImageAttachmentKey("user-a", narratorId), draft);
 	await act(async () => {
 		hook.reconcileDocumentAssets(["f", "g"]);
@@ -523,7 +545,7 @@ test("explicit clear after a failed read can remove the protected stored record"
 
 test("returning to the owner retries a failed read without losing its original stored F", async () => {
 	const f = image("f");
-	const draft = { images: [f], textFiles: [], droppedCount: 0 };
+	const draft = { images: [f], textFiles: [], media: [], droppedCount: 0 };
 	saved.set(storage.getDraftImageAttachmentKey("user-a", narratorId), draft);
 	await act(async () => {
 		hook.reconcileDocumentAssets(["f", "g"]);
@@ -545,7 +567,7 @@ test("returning to the owner retries a failed read without losing its original s
 });
 
 test("failed read with unknown membership never replaces an unknown stored draft with local G", async () => {
-	const draft = { images: [image("f")], textFiles: [], droppedCount: 0 };
+	const draft = { images: [image("f")], textFiles: [], media: [], droppedCount: 0 };
 	saved.set(storage.getDraftImageAttachmentKey("user-a", narratorId), draft);
 	await act(async () => hook.updateAttachedImages([image("g")]));
 	await act(async () => loads[0].reject(new Error("storage read failed")));
@@ -567,22 +589,22 @@ test("declared deleted assets restore from the undo pool only when referenced ag
 	const textFile = new File(["text"], "text.png", { type: "image/png" });
 	storage.setComposerAssetId(textFile, "text");
 	await act(async () => hook.reconcileDocumentAssets(["g"]));
-	await hydrate({ images: [f, g], textFiles: [textFile], droppedCount: 0 });
+	await hydrate({ images: [f, g], textFiles: [textFile], media: [], droppedCount: 0 });
 	expect(hook.attachedImages).toEqual([g]);
 	expect(hook.attachedTextFiles).toEqual([]);
 	expect(hook.restoredAttachmentResources.get("f")).toBe(f);
 	expect(hook.restoredAttachmentResources.get("text")).toBe(textFile);
-	expect(persisted()).toEqual({ images: [g], textFiles: [], droppedCount: 0 });
+	expect(persisted()).toEqual({ images: [g], textFiles: [], media: [], droppedCount: 0 });
 	// Replacing G with F has the same length but different resource identity.
 	await act(async () => hook.reconcileDocumentAssets(["f", "text"]));
 	expect(hook.attachedImages).toEqual([f]);
 	expect(hook.attachedTextFiles).toEqual([textFile]);
-	expect(persisted()).toEqual({ images: [f], textFiles: [textFile], droppedCount: 0 });
+	expect(persisted()).toEqual({ images: [f], textFiles: [textFile], media: [], droppedCount: 0 });
 });
 
 test("an undo pool declaration cannot unhide sending attachments or rewrite their stored draft", async () => {
 	const f = image("f");
-	await hydrate({ images: [f], textFiles: [], droppedCount: 0 });
+	await hydrate({ images: [f], textFiles: [], media: [], droppedCount: 0 });
 	const beforeHide = save.mock.calls.length;
 	await act(async () => hook.hideAttachedFilesForSend());
 	await act(async () => hook.reconcileDocumentAssets(["f"]));
@@ -594,7 +616,7 @@ test("an undo pool declaration cannot unhide sending attachments or rewrite thei
 
 for (const switchScope of ["user", "narrator"] as const) {
 	test(`undo resource pool resets on the first ${switchScope} scope render and ignores stale loads`, async () => {
-		await hydrate({ images: [image("a")], textFiles: [], droppedCount: 0 }, 0);
+		await hydrate({ images: [image("a")], textFiles: [], media: [], droppedCount: 0 }, 0);
 		expect(hook.restoredAttachmentResources.has("a")).toBe(true);
 		const beforeSwitch = resourceRenders.length;
 		if (switchScope === "user") currentUserId = "user-b";
@@ -604,10 +626,10 @@ for (const switchScope of ["user", "narrator"] as const) {
 		if (switchScope === "user") currentUserId = "user-a";
 		else narratorId = "narrator-a";
 		await render();
-		await hydrate({ images: [image("stale-b")], textFiles: [], droppedCount: 0 }, 1);
+		await hydrate({ images: [image("stale-b")], textFiles: [], media: [], droppedCount: 0 }, 1);
 		expect(hook.restoredAttachmentResources.size).toBe(0);
 		const fresh = image("fresh");
-		await hydrate({ images: [fresh], textFiles: [], droppedCount: 0 }, 2);
+		await hydrate({ images: [fresh], textFiles: [], media: [], droppedCount: 0 }, 2);
 		expect([...hook.restoredAttachmentResources.values()]).toEqual([fresh]);
 	});
 }
@@ -641,14 +663,19 @@ for (const knownMembership of [false, true]) {
 		expect(hook.attachedTextFiles).toBe(textBeforeRetry);
 		expect(hook.restoredAttachmentResources).toBe(poolBeforeRetry);
 		expect(save).not.toHaveBeenCalled();
-		await hydrate({ images: [f, remoteG], textFiles: [], droppedCount: 0 }, 1);
+		await hydrate({ images: [f, remoteG], textFiles: [], media: [], droppedCount: 0 }, 1);
 		expect(hook.attachmentsRestoreFailed).toBe(false);
 		expect(hook.attachmentsHydrating).toBe(false);
 		expect(hook.attachedImages).toEqual([f, g]);
 		expect(hook.attachedImages[1]).toBe(g);
 		expect(hook.attachedTextFiles).toEqual([localText]);
 		expect(hook.restoredAttachmentResources.get("g")).toBe(g);
-		expect(persisted()).toEqual({ images: [f, g], textFiles: [localText], droppedCount: 0 });
+		expect(persisted()).toEqual({
+			images: [f, g],
+			textFiles: [localText],
+			media: [],
+			droppedCount: 0,
+		});
 	});
 }
 
@@ -665,7 +692,7 @@ test("a failed retry retains local G and can be retried again without any partia
 	expect(save).not.toHaveBeenCalled();
 	await act(async () => hook.retryAttachmentRestore());
 	const f = image("f");
-	await hydrate({ images: [f], textFiles: [], droppedCount: 0 }, 2);
+	await hydrate({ images: [f], textFiles: [], media: [], droppedCount: 0 }, 2);
 	expect(hook.attachedImages).toEqual([f, g]);
 	expect(hook.attachmentsRestoreFailed).toBe(false);
 	expect(persisted()?.images).toEqual([f, g]);
@@ -722,7 +749,10 @@ for (const switchScope of ["user", "narrator"] as const) {
 		expect(failureRenders[firstOwnerRender]).toBe(false);
 		expect(hook.attachedImages).toEqual([]);
 		if (switchScope === "user") {
-			await hydrate({ images: [image("stale-retry")], textFiles: [], droppedCount: 0 }, 1);
+			await hydrate(
+				{ images: [image("stale-retry")], textFiles: [], media: [], droppedCount: 0 },
+				1,
+			);
 		} else {
 			await act(async () => loads[1].reject(new Error("old owner retry failed")));
 		}
@@ -730,7 +760,7 @@ for (const switchScope of ["user", "narrator"] as const) {
 		expect(hook.attachmentsRestoreFailed).toBe(false);
 		expect(hook.restoredAttachmentResources.size).toBe(0);
 		const fresh = image("fresh");
-		await hydrate({ images: [fresh], textFiles: [], droppedCount: 0 }, 2);
+		await hydrate({ images: [fresh], textFiles: [], media: [], droppedCount: 0 }, 2);
 		expect(hook.attachedImages).toEqual([fresh]);
 		expect(persisted()?.images).toEqual([fresh]);
 	});
@@ -747,7 +777,7 @@ test("A to B to A isolates the original A retry failure from the new A restore",
 	expect(hook.attachmentsHydrating).toBe(true);
 	expect(hook.attachmentsRestoreFailed).toBe(false);
 	const fresh = image("fresh-a");
-	await hydrate({ images: [fresh], textFiles: [], droppedCount: 0 }, 3);
+	await hydrate({ images: [fresh], textFiles: [], media: [], droppedCount: 0 }, 3);
 	expect(hook.attachedImages).toEqual([fresh]);
 	expect(hook.attachmentsRestoreFailed).toBe(false);
 });
@@ -758,7 +788,7 @@ test("unknown users are not hydrating and a late known-user read cannot apply", 
 	await render();
 	expect(hydrationRenders[beforeSwitch]).toBe(false);
 	expect(hook.attachmentsHydrating).toBe(false);
-	await hydrate({ images: [image("stale")], textFiles: [], droppedCount: 0 }, 0);
+	await hydrate({ images: [image("stale")], textFiles: [], media: [], droppedCount: 0 }, 0);
 	expect(hook.attachedImages).toEqual([]);
 	expect(loads).toHaveLength(1);
 	expect(save).not.toHaveBeenCalled();
