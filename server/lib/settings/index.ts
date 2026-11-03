@@ -37,6 +37,7 @@ import {
 } from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
+import { changeSecretEncryption, setSecretEncryption } from "../secret-store";
 import { withSettingsFileLock } from "../settings-file-lock";
 import {
 	type ManagerOwnedFields,
@@ -970,6 +971,9 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
+// Credential files follow `secrets.encrypt`; a change rewrites them in the new form.
+setSecretEncryption(settings.secrets?.encrypt !== false);
+settingsChangeListeners.add(() => changeSecretEncryption(settings.secrets?.encrypt !== false));
 // Bind settings to provider module so it can access the singleton
 _bindSettings(settings);
 bindModelCatalogSettings(settings, () => saveSettings(settings));

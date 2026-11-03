@@ -2,7 +2,7 @@
 // Manages ChatGPT Pro/Plus OAuth tokens for the codex provider
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
 	type CredentialNetwork,
@@ -57,6 +57,12 @@ import { eventBus } from "./event-bus";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkHome } from "./narrafork-home";
+import {
+	onSecretEncryptionChange,
+	readSecretJSON,
+	SecretStoreError,
+	writeSecretJSON,
+} from "./secret-store";
 
 // === Constants ===
 
@@ -367,30 +373,6 @@ function getCredentialsPath(baseDir?: string): string {
 
 function getStatsPath(baseDir?: string): string {
 	return resolve(getCodexDataDir(baseDir), STATS_FILE);
-}
-
-/**
- * Write a file containing secrets with owner-only permissions (0o600).
- *
- * The Codex credential file holds refresh tokens, personal access tokens and
- * Agent Identity Ed25519 private keys. A plain writeFileSync lands on the umask
- * default (usually 0o644), i.e. world-readable — every other secret store in the
- * repo (settings/index.ts, plugin-secret-vault.ts) pins 0o600,
- * so this matches.
- *
- * `mode` only applies when the file is created, so pre-existing files from
- * earlier versions are chmod'd as well. Both the mode argument and the chmod are
- * no-ops on Windows, where NTFS ACLs govern access instead; the chmod failure is
- * swallowed rather than treated as an error there.
- */
-function writeSecretFile(path: string, contents: string): void {
-	writeFileSync(path, contents, { mode: 0o600 });
-	if (process.platform === "win32") return;
-	try {
-		chmodSync(path, 0o600);
-	} catch {
-		// Network filesystems can reject chmod; the file content is already written.
-	}
 }
 
 // === Helpers ===
@@ -736,6 +718,10 @@ export class CodexManager {
 	// An upstream-triggered refresh must not waive quota exhaustion on credits alone.
 	private readonly upstreamQuotaRefreshes = new Set<string>();
 
+	/** Set when the stored credentials could not be decrypted; saving is refused. */
+	private credentialsUnreadable = false;
+	private unsubscribeSecretRewrite?: () => void;
+
 	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
 		this.stats = new Map();
@@ -757,10 +743,13 @@ export class CodexManager {
 		};
 		if (this.options?.registerProcessHooks ?? true) {
 			process.on("beforeExit", this.beforeExitHandler);
+			// Turning credential encryption on or off rewrites the file in the new form.
+			this.unsubscribeSecretRewrite = onSecretEncryptionChange(() => this.saveCredentials());
 		}
 	}
 
 	dispose(): void {
+		this.unsubscribeSecretRewrite?.();
 		this.stopUsageRefreshScheduler();
 		if (this.quotaOverviewBroadcastTimer) {
 			clearTimeout(this.quotaOverviewBroadcastTimer);
@@ -2382,9 +2371,18 @@ export class CodexManager {
 		try {
 			const baseDir = this.options?.homeDir;
 			const path = getCredentialsPath(baseDir);
-			if (!existsSync(path)) return;
-
-			const raw = JSON.parse(readFileSync(path, "utf-8"));
+			let raw: unknown;
+			try {
+				raw = readSecretJSON(path);
+			} catch (error) {
+				if (!(error instanceof SecretStoreError)) throw error;
+				// Never write over a file we could not read: it is the only copy.
+				this.credentialsUnreadable = true;
+				logger.error("Codex credentials are unreadable; leaving the file untouched", {
+					error: error.message,
+				});
+				return;
+			}
 			if (!Array.isArray(raw)) return;
 
 			const seen = new Set<string>();
@@ -2440,11 +2438,13 @@ export class CodexManager {
 	}
 
 	private saveCredentials(): void {
+		if (this.credentialsUnreadable) {
+			logger.warn("Codex credentials not saved: the stored file could not be read");
+			return;
+		}
 		try {
 			const baseDir = this.options?.homeDir;
-			const path = getCredentialsPath(baseDir);
-			mkdirSync(getCodexDataDir(baseDir), { recursive: true });
-			writeSecretFile(path, JSON.stringify(this.entries, null, 2));
+			writeSecretJSON(getCredentialsPath(baseDir), this.entries);
 		} catch (err) {
 			logger.warn("Failed to save Codex credentials", {
 				error: err instanceof Error ? err.message : String(err),

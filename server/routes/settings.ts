@@ -326,6 +326,7 @@ export const updateSettingsSchema = z
 	.object({
 		// Optional request precondition, never a persisted setting.
 		expectedUpdateSettingsKey: z.string().max(2048).optional(),
+		secrets: z.object({ encrypt: z.boolean().optional() }).optional(),
 		server: z
 			.object({
 				port: z.number().int().min(1).max(65535),

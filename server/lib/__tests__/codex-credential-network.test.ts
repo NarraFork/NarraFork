@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,7 +11,11 @@ import { createCodexRequestIdentity } from "../agent/codex-request";
 import { CodexManager } from "../codex-manager";
 import { codexFingerprintConfig, codexInstallationId, codexProxy } from "../codex-network";
 import { getInstallationId } from "../installation-id";
+import { readSecretJSON } from "../secret-store";
 import { settings } from "../settings";
+
+/** Credential files are encrypted at rest; tests compare their decrypted JSON. */
+const secretText = (path: string) => JSON.stringify(readSecretJSON(path));
 
 const homes: string[] = [];
 afterEach(() => {
@@ -41,7 +45,7 @@ function managerWith(ids: string[]) {
 		home,
 		manager: new CodexManager({ homeDir: home, registerProcessHooks: false }),
 		stored: () =>
-			JSON.parse(readFileSync(join(home, ".narrafork", "codex-credentials.json"), "utf8")) as Array<
+			JSON.parse(secretText(join(home, ".narrafork", "codex-credentials.json"))) as Array<
 				Record<string, unknown>
 			>,
 	};

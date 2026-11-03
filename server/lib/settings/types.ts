@@ -585,6 +585,11 @@ export interface NarraForkSettings {
 		installationId?: string;
 		claudeDeviceId?: string;
 	};
+	/** How credential files (e.g. codex-credentials.json) are stored. See lib/secret-store.ts. */
+	secrets?: {
+		/** Encrypt credential files with the instance key in secret.key. Default true. */
+		encrypt?: boolean;
+	};
 	/**
 	 * Unified outbound proxy policy applied to every outbound network channel.
 	 * Defaults to "system" (follow the OS/env proxy). Replaces the previous

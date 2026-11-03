@@ -2767,5 +2767,7 @@
 			"extraHeaders": "Each line must be a valid header name, a colon and a value.",
 			"deviceId": "The device ID must be a UUID."
 		}
-	}
+	},
+	"encryptSecrets": "Encrypt credential files",
+	"encryptSecretsDesc": "Stores subscription logins and keys (such as codex-credentials.json) encrypted with a key in secret.key in the NarraFork data folder. This protects a credential file that is copied on its own, like a backup or a synced folder; it does not protect against someone who can read the whole data folder. Turning it off rewrites the files as plain JSON."
 }
