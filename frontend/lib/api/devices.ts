@@ -1,5 +1,6 @@
 import type { ExecutorPathRule } from "@shared/executor-path-rules";
 import type {
+	ExecutorInstallTarget,
 	ExecutorManifest,
 	ExecutorPlatform,
 	ExecutorPlatformInfo,
@@ -179,7 +180,7 @@ export interface ExecutorManifestResponse {
 export type ExecutorTokenDelivery = "enroll" | "prompt";
 
 export interface InstallScriptInput {
-	platform: ExecutorPlatform;
+	target: ExecutorInstallTarget;
 	mode: "system" | "user";
 	disableShell?: boolean;
 	/**
@@ -198,13 +199,12 @@ export interface InstallScriptResult {
 	script: string;
 	filename: string;
 	shell: "sh" | "powershell";
-	/** Public URL serving the script body; what the one-liner fetches. */
-	scriptUrl: string;
 	/** The single command to paste on the target machine. */
 	oneLiner: string;
 	tokenDelivery: ExecutorTokenDelivery;
 	executorVersion: string;
-	platform: ExecutorPlatform;
+	target: ExecutorInstallTarget;
+	platforms: ExecutorPlatform[];
 	/** The embedded enrollment ticket stops working after this time. */
 	expiresAt: string;
 }
