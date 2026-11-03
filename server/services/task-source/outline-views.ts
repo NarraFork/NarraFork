@@ -54,12 +54,17 @@ import {
 import { blockTitle } from "@shared/outline";
 import type { ContextPart } from "@shared/prefix-context";
 import { readNarrator } from "../outline/access-reads";
-import { loadBodiesWithin, readSubtree } from "../outline/read";
+import { loadBodies, readSubtree } from "../outline/read";
 import { renderOutline } from "../outline/render";
 import { outlineStore } from "../outline/store";
-import { breadthFirst } from "../outline/tree";
+import { breadthFirst, type OutlineNode } from "../outline/tree";
 import { readTaskSession } from "./backend";
-import { findBehaviorPage, importLeftover, readOldBehaviorFence } from "./outline-behavior";
+import {
+	findBehaviorPage,
+	graphemeBoundary,
+	importLeftover,
+	readOldBehaviorFence,
+} from "./outline-behavior";
 import {
 	type OpenEntry,
 	type OutlineSession,
@@ -86,6 +91,25 @@ export const OUTLINE_VIEW_LIMITS = {
 	behaviorChars: 4000,
 	/** Blocks of the behavior page the view reads at most. */
 	behaviorBlocks: 400,
+	/**
+	 * Characters every block of the behavior page is shown with at least (its whole content when
+	 * shorter), however long the blocks before it: no rule is hidden behind a long one.
+	 */
+	behaviorBlockMinChars: 80,
+	/**
+	 * Characters a block is shown with at most when not even every block's start fits (a page of
+	 * more rules than the view holds). The share is then the length most of the page's blocks
+	 * have (nine in ten), within the minimum and this: typical rules are shown whole, a long one
+	 * cut to about their length, and the last ones are left out.
+	 */
+	behaviorBlockMaxShare: 400,
+	/**
+	 * Characters and blocks of the behavior page in the spec fence while the outline is switched
+	 * off: injected on the spec cadence like the whole old fence was, not in the cached prefix,
+	 * and the agent has no outline tool then to read the rest.
+	 */
+	switchedOffChars: 30_000,
+	switchedOffBlocks: 1000,
 	/** How long a cached view is served without a change that drops it. */
 	maxAgeMs: 60_000,
 	/** Narrators' views kept, the least recently used dropped first. */
@@ -246,10 +270,11 @@ function clip(text: string, max: number): string {
 	return line.length > max ? `${line.slice(0, Math.max(0, max - 1))}…` : line;
 }
 
-/** Text of at most `max` characters, its lines kept. */
+/** Text of at most `max` characters, its lines kept, never cut inside a character. */
 function cut(text: string, max: number): string {
 	const trimmed = text.trim();
-	return trimmed.length > max ? `${trimmed.slice(0, Math.max(0, max - 1)).trimEnd()}…` : trimmed;
+	if (trimmed.length <= max) return trimmed;
+	return `${trimmed.slice(0, graphemeBoundary(trimmed, Math.max(0, max - 1))).trimEnd()}…`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,40 +422,176 @@ export async function outlineTasksView(narratorId: string, locale: Locale): Prom
 // Behavior boundary
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The behavior page as a markdown outline within `maxChars`, and whether all of it fit. */
+/**
+ * A block's content shown with at most `max` characters: whole when it fits, else its start (cut
+ * at a space or line break in the second half when there is one, else at a grapheme boundary)
+ * and `…`. A code fence left open by the cut is cut off before it, or closed when it opens the
+ * block, so the blocks after it are not read as code.
+ */
+function clipContent(content: string, max: number): string {
+	if (content.length <= max) return content;
+	let end = graphemeBoundary(content, Math.max(1, max - 1));
+	const soft = Math.max(content.lastIndexOf("\n", end - 1), content.lastIndexOf(" ", end - 1));
+	if (soft >= end / 2) end = soft;
+	const kept = content.slice(0, end).trimEnd();
+	const fences = [...kept.matchAll(/^[ \t]*(`{3,}|~{3,})/gm)];
+	const open = fences.length % 2 === 1 ? fences[fences.length - 1] : undefined;
+	if (!open) return `${kept}…`;
+	const before = kept.slice(0, open.index).trimEnd();
+	return before ? `${before}…` : `${kept}…\n${open[1]}`;
+}
+
+/**
+ * The share of characters each block is shown with (a block shorter than it is shown whole): the
+ * largest one that lets all of `blocks` fit `room`, at least `min`. When not even `min` lets them
+ * all fit, the render leaves out the last ones (breadth first); the share is then the length nine
+ * in ten blocks do not exceed, within `min` and `cap`, so typical rules are shown whole rather
+ * than every one cut short, and a long block costs about what one of them does instead of
+ * taking the place of many.
+ */
+function fairShare(
+	blocks: ReadonlyArray<{ length: number; overhead: number }>,
+	room: number,
+	min: number,
+	cap: number,
+): { share: number; all: boolean } {
+	const total = (share: number) => {
+		let sum = 0;
+		for (const block of blocks) sum += Math.min(block.length, share) + block.overhead;
+		return sum;
+	};
+	let longest = min;
+	for (const block of blocks) longest = Math.max(longest, block.length);
+	if (total(longest) <= room) return { share: longest, all: true };
+	if (total(min) > room) {
+		const lengths = blocks.map((block) => block.length).sort((a, b) => a - b);
+		const typical = lengths[Math.floor(0.9 * (lengths.length - 1))] ?? min;
+		return { share: Math.min(Math.max(min, typical), Math.max(min, cap)), all: false };
+	}
+	let fits = min;
+	let over = longest;
+	while (over - fits > 1) {
+		const mid = Math.floor((fits + over) / 2);
+		if (total(mid) <= room) fits = mid;
+		else over = mid;
+	}
+	return { share: fits, all: true };
+}
+
+/** Load the bodies `order` may show: until even their fair minimum would overrun `maxBytes`. */
+async function loadBehaviorBodies(
+	state: Parameters<typeof loadBodies>[0],
+	order: readonly OutlineNode[],
+	maxBytes: number,
+	minBytes: number,
+): Promise<void> {
+	let counted = 0;
+	for (let i = 0; i < order.length && counted <= maxBytes; ) {
+		const chunk = order.slice(i, i + OUTLINE_BEHAVIOR_BODY_CHUNK);
+		await loadBodies(state, chunk);
+		for (const node of chunk) {
+			counted += Math.min(Buffer.byteLength(node.content ?? "", "utf8"), minBytes) + 4;
+			i++;
+			if (counted > maxBytes) break;
+		}
+	}
+}
+
+/** Blocks whose bodies one statement of the behavior render loads. */
+const OUTLINE_BEHAVIOR_BODY_CHUNK = 25;
+
+interface BehaviorPageRender {
+	markdown: string;
+	/**
+	 * Blocks shown with only their start or left out by the budget (at least one when the page
+	 * was read cut short: it has more blocks than one read loads).
+	 */
+	notInFull: number;
+	truncated: boolean;
+}
+
+/**
+ * The behavior page as a markdown outline within `maxChars`, fair to every block: each is shown
+ * with the same share of the budget (whole when shorter), the largest share that lets all of them
+ * fit, never less than `behaviorBlockMinChars`. So one long block (a paragraph of prose an old
+ * fence opened with, a 15 KiB piece of an oversize item) shows its start and the rules after it
+ * still show, and what the short ones leave goes to the long ones. Only when not even every
+ * block's start fits are the last ones (breadth first) left out, the typical ones still whole
+ * (`behaviorBlockMaxShare`). `notInFull` counts what is not shown in full.
+ */
 async function renderBehaviorPage(
 	pageId: string,
 	maxChars: number,
-): Promise<{ markdown: string; truncated: boolean } | null> {
+	maxBlocks: number = OUTLINE_VIEW_LIMITS.behaviorBlocks,
+): Promise<BehaviorPageRender | null> {
 	if (maxChars <= 0) return null;
 	const subtree = await readSubtree(pageId);
 	if (!subtree) return null;
 	const { state, root } = subtree;
-	// A character is at most three UTF-8 bytes in the text a page holds: load what that shows.
-	let bytes = Math.max(64, maxChars * 3);
-	const order = breadthFirst(root, "all", OUTLINE_VIEW_LIMITS.behaviorBlocks);
-	await loadBodiesWithin(state, order, bytes);
-	for (let attempt = 0; ; attempt++) {
+	const min = OUTLINE_VIEW_LIMITS.behaviorBlockMinChars;
+	const order = breadthFirst(root, "all", maxBlocks);
+	// A character is at most three UTF-8 bytes in the text a page holds.
+	await loadBehaviorBodies(state, order, maxChars * 3, min * 3);
+
+	// What each loaded block costs besides its content: the bullet, the indentation of each of
+	// its lines, the line break and the `…` of a shortened one.
+	const depth = new Map<OutlineNode, number>([[root, 0]]);
+	const blocks: Array<{ length: number; overhead: number }> = [];
+	for (const node of order) {
+		if (node.content === null) break;
+		const level = node.parent ? (depth.get(node.parent) ?? 0) + 1 : 0;
+		depth.set(node, level);
+		const lines = 1 + (node.content.match(/\n/g)?.length ?? 0);
+		blocks.push({ length: node.content.length, overhead: lines * (2 * level + 3) + 1 });
+	}
+
+	const fair = fairShare(blocks, maxChars, min, OUTLINE_VIEW_LIMITS.behaviorBlockMaxShare);
+	let share = fair.share;
+	let bytes = maxChars * 3;
+	let last: { markdown: string; notInFull: number } | null = null;
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const shortened = new Set<string>();
 		const rendered = renderOutline(root, {
 			view: "all",
-			budget: { blocks: OUTLINE_VIEW_LIMITS.behaviorBlocks, bytes },
-			// The page's own `alias:: behavior` says nothing the heading does not.
+			budget: { blocks: maxBlocks, bytes },
 			display: (node, item) => {
-				if (node !== root || item.props.alias === undefined) return item;
-				const { alias: _alias, ...props } = item.props;
-				return { ...item, props };
+				let shown = item;
+				// The page's own `alias:: behavior` says nothing the heading does not.
+				if (node === root && item.props.alias !== undefined) {
+					const { alias: _alias, ...props } = item.props;
+					shown = { ...item, props };
+				}
+				const content = clipContent(shown.content, share);
+				if (content === shown.content) return shown;
+				shortened.add(node.id);
+				return { ...shown, content };
 			},
 			truncatedRead: state.truncated ? { blocksRead: state.nodes.size } : undefined,
 		});
 		const markdown = rendered.markdown.trimEnd();
-		const truncated = rendered.hiddenByBudget > 0 || state.truncated;
-		if (markdown.length <= maxChars || bytes <= 64 || attempt >= 4) {
-			return markdown.length <= maxChars
-				? { markdown, truncated }
-				: { markdown: cut(markdown, maxChars), truncated: true };
+		const shownShortened = rendered.blockIds.filter((id) => shortened.has(id)).length;
+		last = {
+			markdown,
+			notInFull: Math.max(shownShortened + rendered.hiddenByBudget, state.truncated ? 1 : 0),
+		};
+		if (markdown.length <= maxChars) return { ...last, truncated: last.notInFull > 0 };
+		// Over: when every block was to fit (the cost estimate is close, not exact), a smaller
+		// share first; else, or at the minimum, fewer blocks.
+		if (fair.all && share > min) {
+			share = Math.max(min, Math.floor((share * maxChars) / markdown.length) - 8);
+		} else {
+			// From what this render took, not the budget it had: a budget far above what the page
+			// holds would take many rounds to bind.
+			const took = Math.min(bytes, rendered.bytes);
+			bytes = Math.max(64, Math.floor((took * maxChars) / markdown.length) - 8);
 		}
-		bytes = Math.max(64, Math.floor((bytes * maxChars) / markdown.length) - 8);
 	}
+	if (!last) return null;
+	return {
+		markdown: cut(last.markdown, maxChars),
+		notInFull: Math.max(1, last.notInFull),
+		truncated: true,
+	};
 }
 
 /**
@@ -472,12 +633,14 @@ async function readBehaviorView(
 		const space = await outlineStore.getSpace(page.spaceId);
 		const address = `${space?.key ?? page.spaceId}/${page.sid}`;
 		const intro = getOutlineBehaviorViewPage(address, locale);
-		const note = getOutlineBehaviorViewTruncated(address, locale);
+		// Room for the note with the largest count it can carry.
+		const longestNote = getOutlineBehaviorViewTruncated(address, 99_999, locale);
 		const rendered = await renderBehaviorPage(
 			page.id,
-			room - 1 - intro.length - 1 - note.length - 1,
+			room - 1 - intro.length - 1 - longestNote.length - 1,
 		);
 		if (rendered?.markdown.trim()) {
+			const note = getOutlineBehaviorViewTruncated(address, rendered.notInFull, locale);
 			take([intro, rendered.markdown, ...(rendered.truncated ? [note] : [])].join("\n"));
 		}
 	}
@@ -574,11 +737,13 @@ export async function behaviorPageForSpecFence(narratorId: string): Promise<stri
 	const locale: Locale = owner ? await getUserLanguage(owner) : "en";
 	const address = `${space.key}/${page.sid}`;
 	const intro = getOutlineBehaviorViewPage(address, locale);
-	const note = getOutlineBehaviorFenceTruncated(address, locale);
+	const longestNote = getOutlineBehaviorFenceTruncated(99_999, locale);
 	const rendered = await renderBehaviorPage(
 		page.id,
-		OUTLINE_VIEW_LIMITS.behaviorChars - intro.length - 1 - note.length - 1,
+		OUTLINE_VIEW_LIMITS.switchedOffChars - intro.length - 1 - longestNote.length - 1,
+		OUTLINE_VIEW_LIMITS.switchedOffBlocks,
 	);
 	if (!rendered?.markdown.trim()) return null;
+	const note = getOutlineBehaviorFenceTruncated(rendered.notInFull, locale);
 	return [intro, rendered.markdown, ...(rendered.truncated ? [note] : [])].join("\n");
 }

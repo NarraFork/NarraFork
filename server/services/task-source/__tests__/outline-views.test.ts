@@ -252,8 +252,9 @@ describe("the behavior view", () => {
 		const view = part(await parts(id), "outline.behavior") ?? "";
 		expect(view.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.behaviorChars);
 		expect(view).toContain("Rule zero.");
+		expect(view).toMatch(/\n‹not all shown: \d+ blocks are shortened or left out; read `[^`]+`/);
 		expect(view).toContain(
-			`‹not all shown; read \`${await addressOf(pageId)}\` with OutlineRead for the whole page›`,
+			`; read \`${await addressOf(pageId)}\` with OutlineRead for the whole page›`,
 		);
 	});
 

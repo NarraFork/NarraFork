@@ -170,10 +170,31 @@ function importSids(text: string): { page: string; block: (n: number) => string 
 	return { page: `fp${tag}`, block: (n) => `fi${tag}${n.toString(36)}` };
 }
 
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
 /**
- * Text cut into pieces of at most `maxBytes` UTF-8 bytes, at a line break or a space when one is
- * in the second half of a piece, never inside a character. An item longer than one block may
- * hold becomes several blocks instead of refusing its commit on every run.
+ * The last grapheme boundary of `text` at or before `at` (a UTF-16 index), so a cut there never
+ * splits a ZWJ emoji or a letter from its combining marks. Only a short window around `at` is
+ * segmented, never the whole text; a cluster longer than that window (none in practice) may be
+ * cut inside.
+ */
+export function graphemeBoundary(text: string, at: number): number {
+	if (at <= 0) return 0;
+	if (at >= text.length) return text.length;
+	const from = Math.max(0, at - 64);
+	let boundary = from;
+	for (const { index } of graphemes.segment(text.slice(from, Math.min(text.length, at + 64)))) {
+		if (from + index > at) break;
+		boundary = from + index;
+	}
+	return boundary;
+}
+
+/**
+ * Text cut into pieces of at most `maxBytes` UTF-8 bytes, losing nothing: the pieces joined are
+ * the text. A cut falls after a line break or a space when one is in the second half of a piece
+ * (it stays with the first piece), else at the last grapheme boundary. An item longer than one
+ * block may hold becomes several blocks instead of refusing its commit on every run.
  */
 export function cutToBlocks(text: string, maxBytes: number): string[] {
 	const out: string[] = [];
@@ -187,11 +208,14 @@ export function cutToBlocks(text: string, maxBytes: number): string[] {
 			bytes += size;
 			end += char.length;
 		}
-		const soft = Math.max(rest.lastIndexOf("\n", end), rest.lastIndexOf(" ", end));
-		if (soft > end / 2) end = soft;
-		const piece = rest.slice(0, end).trimEnd();
-		if (piece) out.push(piece);
-		rest = rest.slice(end).trimStart();
+		const soft = Math.max(rest.lastIndexOf("\n", end - 1), rest.lastIndexOf(" ", end - 1));
+		if (soft >= end / 2) end = soft + 1;
+		else {
+			const boundary = graphemeBoundary(rest, end);
+			if (boundary > 0) end = boundary;
+		}
+		out.push(rest.slice(0, end));
+		rest = rest.slice(end);
 	}
 	if (rest) out.push(rest);
 	return out;
@@ -242,7 +266,10 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 	const nodes: ImportNode[] = [];
 	const walk = (items: readonly EditTextItem[], parentSid: string | null, depth: number) => {
 		for (const item of items) {
-			const pieces = cutToBlocks(item.content, OUTLINE_BEHAVIOR_LIMITS.importBlockBytes);
+			// A piece of nothing but whitespace (a long run of it at a cut) would be an empty block.
+			const pieces = cutToBlocks(item.content, OUTLINE_BEHAVIOR_LIMITS.importBlockBytes).filter(
+				(piece) => piece.trim() !== "",
+			);
 			let first: string | null = null;
 			for (const piece of pieces.length > 0 ? pieces : [item.content]) {
 				const sid = sids.block(nodes.length);

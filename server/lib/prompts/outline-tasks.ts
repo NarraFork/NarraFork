@@ -274,21 +274,29 @@ export function getOutlineBehaviorViewPage(address: string, locale: Locale): str
 		: `From this session's behavior page \`${address}\`:`;
 }
 
-/** The note after a behavior page the view could not show whole. */
-export function getOutlineBehaviorViewTruncated(address: string, locale: Locale): string {
+/**
+ * The note after a behavior page the view could not show whole: `count` blocks are shown with
+ * only their start, or not at all.
+ */
+export function getOutlineBehaviorViewTruncated(
+	address: string,
+	count: number,
+	locale: Locale,
+): string {
 	return locale === "zh-CN"
-		? `‹没有全部列出；完整内容用 OutlineRead 读 \`${address}\`›`
-		: `‹not all shown; read \`${address}\` with OutlineRead for the whole page›`;
+		? `‹没有全部列出：${count} 块只显示了开头或没有列出；完整内容用 OutlineRead 读 \`${address}\`›`
+		: `‹not all shown: ${count} ${count === 1 ? "block is" : "blocks are"} shortened or left out; read \`${address}\` with OutlineRead for the whole page›`;
 }
 
 /**
- * The note after a behavior page cut to fit the spec fence while the outline is switched off (no
- * outline tool is offered then, so it names only where the page is).
+ * The note after a behavior page cut to fit the spec fence while the outline is switched off. No
+ * outline tool is offered then, so it points at nothing the agent would have to read: the person
+ * sees the whole page in the outline.
  */
-export function getOutlineBehaviorFenceTruncated(address: string, locale: Locale): string {
+export function getOutlineBehaviorFenceTruncated(count: number, locale: Locale): string {
 	return locale === "zh-CN"
-		? `‹没有全部列出；其余的在大纲的行为边界页 \`${address}\`›`
-		: `‹not all shown; the rest is on the behavior page \`${address}\` in the outline›`;
+		? `‹这一页有 ${count} 块在这里只显示了开头或没有列出；用户可以在大纲里看到整页›`
+		: `‹${count} ${count === 1 ? "block" : "blocks"} of this page ${count === 1 ? "is" : "are"} shortened or left out here; the user can see the whole page in the outline›`;
 }
 
 /** The line before old fence text that was not moved to the page (its import did not happen). */

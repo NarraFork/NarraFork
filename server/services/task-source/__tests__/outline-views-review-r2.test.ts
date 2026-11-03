@@ -183,8 +183,9 @@ describe("S-R2-1: an import that cannot write everything at once (probe R2-1)", 
 		const words = Array.from({ length: 50 }, (_, n) => `word${n}`).join(" ");
 		const pieces = cutToBlocks(words, 64);
 		for (const piece of pieces) expect(Buffer.byteLength(piece, "utf8")).toBeLessThanOrEqual(64);
-		expect(pieces.join(" ")).toBe(words);
-		for (const piece of pieces) expect(piece).toMatch(/^word\d+( word\d+)*$/);
+		// Nothing is lost: the space at a cut stays with the first piece (round 3, N-R3-2).
+		expect(pieces.join("")).toBe(words);
+		for (const piece of pieces.slice(0, -1)) expect(piece).toMatch(/^word\d+( word\d+)* $/);
 		const cjk = "边界".repeat(40);
 		const cut = cutToBlocks(cjk, 31);
 		for (const piece of cut) expect(Buffer.byteLength(piece, "utf8")).toBeLessThanOrEqual(31);
@@ -456,35 +457,40 @@ describe("N-R2-9: the page in the spec fence with the outline off, and the fork 
 			const id = await session({ owner: await user(language) });
 			const pageId = await seedBehaviorPage(id, "Rule zero.");
 			const space = await ensureSessionSpace(id);
-			await writeOutline({
-				spaceId: space.id,
-				ops: Array.from({ length: 150 }, (_, n) => ({
-					op: "insert" as const,
-					parent: { id: pageId },
-					content: `Rule ${n + 1}: ${"keep this in mind ".repeat(3)}`,
-				})),
-				actor: { kind: "human", id: "pat" },
-				responsibleUserId: null,
-			});
+			// Over the switched-off budget (30k characters, round 3 S-R3-2).
+			for (let i = 0; i < 600; i += 150) {
+				await writeOutline({
+					spaceId: space.id,
+					ops: Array.from({ length: 150 }, (_, n) => ({
+						op: "insert" as const,
+						parent: { id: pageId },
+						content: `Rule ${i + n + 1}: ${"keep this in mind ".repeat(3)}`,
+					})),
+					actor: { kind: "human", id: "pat" },
+					responsibleUserId: null,
+				});
+			}
 			const [page] = await outlineStore.getBlocks([pageId]);
 			const address = `${space.key}/${page?.sid}`;
 			settings.outline.enabled = false;
 			const body = await buildBehaviorFenceBody(id);
 			settings.outline.enabled = true;
 			const text = body?.kind === "prose" ? body.text : "";
-			expect(text.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.behaviorChars);
+			expect(text.length).toBeGreaterThan(OUTLINE_VIEW_LIMITS.behaviorChars);
+			expect(text.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.switchedOffChars);
 			expect(text).toContain("Rule zero.");
+			expect(text).toContain("Rule 300:");
 			expect(text).not.toContain("OutlineRead");
 			if (language === "en") {
 				expect(text.startsWith(`From this session's behavior page \`${address}\`:`)).toBe(true);
-				expect(
-					text.endsWith(
-						`‹not all shown; the rest is on the behavior page \`${address}\` in the outline›`,
-					),
-				).toBe(true);
+				expect(text).toMatch(
+					/\n‹\d+ blocks of this page are shortened or left out here; the user can see the whole page in the outline›$/,
+				);
 			} else {
 				expect(text.startsWith(`来自本会话的行为边界页 \`${address}\`：`)).toBe(true);
-				expect(text.endsWith(`‹没有全部列出；其余的在大纲的行为边界页 \`${address}\`›`)).toBe(true);
+				expect(text).toMatch(
+					/\n‹这一页有 \d+ 块在这里只显示了开头或没有列出；用户可以在大纲里看到整页›$/,
+				);
 			}
 		}
 	});
