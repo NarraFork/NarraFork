@@ -21,6 +21,21 @@
 - 发布通过 `withPrefixSnapshotPublication` 持有并刷新 publication lease，保护尚未挂上历史引用的根及 manifest 子定义。后台 GC 分批标记已登记资产、兼容历史载荷与 manifest 子引用，只在完整标记后清理过宽限期的无根快照；畸形载荷或失败不按“无引用”继续 sweep。关闭时停止维护、取消并等待相关工作，`close()` 清缓存并等待队列与 worker 退出，不把异步退出当作已经完成。见 [narrator-prefix-snapshots.ts](../server/services/narrator-prefix-snapshots.ts) 与 [narrator-prefix-snapshot-gc.ts](../server/services/narrator-prefix-snapshot-gc.ts)。
 - `senders` 是具名上下文部分，冻结同代首次见到的具名 human 用户名（未知名称也冻结为空）；后来改名不改写旧 sender 投影，新出现身份追加进该部分。`projectFrozenSenders` 只投影显示名，不改持久行、身份、role 或 origin。当前实现不应被扩大描述为已冻结所有 agent 标题。见 [sender-context.ts](../server/lib/agent/sender-context.ts)。
 
+## 上下文稳定性与审计边界
+
+- `workspace` 使用结构化稳定序列化，忽略顶层和嵌套对象的键顺序；路径内容、空白和真实字段变化仍有意义。Git 探测不能只因为同一组字段换了顺序就发布更新或回写缓存。
+- 回复语言是 narrator 的持久 `replyContext`（`locale` + `replyInUserLanguage`），不是通知的显示语言。可信人类输入在接受时冻结二元组，排队不会提前修改当前回合；实际消费提交时才采用。后台通知、Send、问答回执和恢复沿用收件会话的已采用值。语言上下文不授予权限，也不替换执行主体。
+- 计划文件的 `mode` 提醒只区分是否非空，不随每次编辑后的精确字节数变化。指令文件及计划状态探测仅把 ENOENT/ENOTDIR 当作缺失，其余 IO 错误阻止该次准备，不能用删除区块或旧缓存掩盖错误。
+- 新 conversationId 在出站前等待持久化；以旧 ID 和历史 revision 做 CAS，并与短历史变更共享 admission。teardown 不补写 ID，避免意外重启失去尚未落库的 key，或延迟写入复活被清理的 ID。compact 的 transport reset 与 live key 语义保持不变。
+- 会话导出必须携带 prefix 引用的文本快照和 tools manifest children；只带 hash 不能在另一数据库恢复。旧缺内容包不能凭 hash 修复，需从仍保留内容的实例重新导出。详见 [DATA_PORTABILITY.md](DATA_PORTABILITY.md)。
+
+这些措施不等于保证每次上游缓存命中。审计还确认以下边界，不能通过静默改写旧历史或随意开启新 epoch 来掩盖：
+
+1. 历史图片及旧相对附件路径仍会按当前 cwd/复制结果重投影；复制从失败恢复也可能改变旧提示。旧数据未记录首次发送结果，完整修复需要首次发送前持久冻结，并设计共享/fork 与旧历史迁移。
+2. 同名模型的音视频输入能力发生变化时，实时投影可能把旧原生媒体变成文本 fallback 或反向变化。完整修复需要持久记录投影决策及能力撤销的明确处理，不能为了缓存继续发送不合法 payload。
+3. task backend 的专属提醒仍在冻结 contract 中；运行中切换 backend 的旧 epoch 迁移需要明确边界，不能声称新 backend 的提示已经替换旧 contract。
+4. 下述 Codex hosted 原生工具撤权例外仍存在；缓存过期、上游路由及真实请求参数变化也不由应用保证。
+
 ## NUG 网关事件与图片去重
 
 - **gateway 事件**：NUG 用自有事件名下发排队状态、配额余额、模型目录与图片缓存确认，在 `shared/agent-protocol/gateway-events.ts` 里解析。`AnthropicProvider` / `OpenAIProvider` 的 SSE 循环有泛化的 gateway 事件短路（走 `isGatewayEventType`），新增事件名无需改动它们。

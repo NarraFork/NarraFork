@@ -126,6 +126,7 @@ import {
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
 import { freezeNarratorContextComposition } from "../narrator-context-composition";
+import { ensureConversationIdentityPersisted } from "../narrator-conversation-identity";
 import { currentCompactMessageId } from "../narrator-epochs";
 import {
 	clearStreamingSnapshot,
@@ -184,7 +185,6 @@ import {
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
-	persistConversationIdIfUnchanged,
 	prepareOutlineRun,
 	rearmCutInSoftStopBeforeContinuing,
 	resolveRuntimeReasoningEffort,
@@ -211,7 +211,6 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 	recordNarratorRuntimeModel,
-	resetActiveUpstreamSession,
 	withNarratorMutationAdmission,
 } from "../narrator-session-state";
 import { clearAliasRegistry, clearTeamFileChanges } from "../narrator-subagent";
@@ -345,7 +344,7 @@ export function runtimeBasePrompt(
 	locale: Locale,
 	policy: RuntimePolicy,
 ): string | null {
-	const base = row.systemPrompt;
+	const base = row.systemPrompt ?? settings.agent.defaultSystemPrompt ?? null;
 	const sections: string[] = [];
 	if (isBotNarrator(row.traits)) sections.push(getBotModePrompt(locale));
 	const deliverTo = runDeliverToOf(row);
@@ -377,6 +376,10 @@ export async function runAgentLoopUnlocked(
 	media?: MediaRef[],
 ): Promise<RuntimeRunOutcome> {
 	const { narratorId, locale } = active;
+	const getReplyContext = () => ({
+		locale: active.locale,
+		replyInUserLanguage: active._replyInUserLanguage ?? false,
+	});
 	const runState = createRuntimeRunState(
 		{ kind: "current", text, images, media },
 		prePromptBashCommand,
@@ -1209,7 +1212,10 @@ export async function runAgentLoopUnlocked(
 
 			// Main and delegated narrators share this builder, both initially and before
 			// every provider request. Values are collected before epoch publication.
-			const buildPrefixPrompt = async (model: RequestModelIdentity) => {
+			const buildPrefixPrompt = async (
+				model: RequestModelIdentity,
+				{ locale, replyInUserLanguage }: import("@shared/reply-context").ReplyContext,
+			) => {
 				active.abortController.signal.throwIfAborted();
 				// A compact racing this read is retried by the shared request preparer.
 				const compactMessageId = await currentCompactMessageId(narratorId);
@@ -1251,7 +1257,7 @@ export async function runAgentLoopUnlocked(
 					},
 					active.cwd,
 					locale,
-					active._replyInUserLanguage ?? false,
+					replyInUserLanguage,
 					planMode,
 					active._planFileId,
 					settings.agent.defaultSystemPrompt,
@@ -1317,6 +1323,10 @@ export async function runAgentLoopUnlocked(
 			const preparedPrefix = await preparePrefixRequest({
 				narratorId,
 				locale,
+				getReplyContext,
+				ensureRequestIdentity: async () => {
+					await ensureConversationIdentityPersisted(narratorId, active);
+				},
 				getModel: () => resolved.model,
 				getProvider: () => resolved.provider,
 				signal: active.abortController.signal,
@@ -1506,6 +1516,10 @@ export async function runAgentLoopUnlocked(
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
+				getReplyContext,
+				ensureRequestIdentity: async () => {
+					await ensureConversationIdentityPersisted(narratorId, active);
+				},
 				// UI changes update active first; only the loop's model-switch boundary
 				// updates config and the adapter that will send this prepared request.
 				getModel: () => config.model,
@@ -1521,8 +1535,8 @@ export async function runAgentLoopUnlocked(
 				clearCompactDone: () => {
 					compactDoneFlag = false;
 				},
-				buildPrefixPrompt: async (identity) => {
-					const result = await buildPrefixPrompt(identity);
+				buildPrefixPrompt: async (identity, replyContext) => {
+					const result = await buildPrefixPrompt(identity, replyContext);
 					runtimeSummaryChars = result.summaryChars;
 					return result;
 				},
@@ -1668,7 +1682,6 @@ export async function runAgentLoopUnlocked(
 							approval === "compact" && planText
 								? async () => {
 										await runPlanCompact(narratorId, planText);
-										resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
 										broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 									}
 								: undefined,
@@ -1854,6 +1867,9 @@ export async function runAgentLoopUnlocked(
 			let adoptedInput: { history: unknown[]; content: string } | undefined;
 			let afterToolsInput: { history: unknown[]; content: string; mailbox: boolean } | undefined;
 			const config: import("../../lib/agent").AgentConfig = {
+				beforeProviderRequest: async () => {
+					await ensureConversationIdentityPersisted(narratorId, active);
+				},
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
@@ -3540,16 +3556,6 @@ export async function runAgentLoopUnlocked(
 			}
 
 			if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-			// Persist conversationId so the next activation can resume the API session
-			// (avoids cache miss from generating a new random UUID every time).
-			//
-			// Compare-and-set against the id this session started from. A compact clears
-			// the column to demand a fresh upstream session on the next request, and a
-			// background compact can land after the turn that started it — including on a
-			// turn that ended perfectly normally. An unconditional write would undo that
-			// signal, and the next activation would resume a session still holding the
-			// pre-compact history alongside the compacted one.
-			persistConversationIdIfUnchanged(narratorId, active);
 			active._preparedPlanModes?.clear();
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);

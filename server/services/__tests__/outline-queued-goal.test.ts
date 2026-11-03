@@ -161,7 +161,10 @@ describe("the queue consumers drop an outline session's /goal unsaved", () => {
 		await enqueueBufferedMessage(id, "/goal ship it", undefined, "/goal ship it");
 		const [buffered] = await getBufferedMessagesAsync(id);
 		if (!buffered) throw new Error("expected a queued message");
-		expect(await executeQueuedGoalCommand(id, buffered, "ship it")).toEqual({ refused: false });
+		expect(await executeQueuedGoalCommand(id, buffered, "ship it")).toEqual({
+			refused: false,
+			added: true,
+		});
 		expect(await savedMessages(id)).toContain("/goal ship it");
 	});
 

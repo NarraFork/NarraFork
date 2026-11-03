@@ -1,6 +1,7 @@
 import { closeSync, openSync, readSync } from "node:fs";
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators, narratorToolCalls } from "../db/schema";
@@ -731,6 +732,7 @@ export async function restoreCarriedOrdinaryTargets(
 	source: RecoverySource,
 	driven: ReadonlySet<string>,
 	includedNarratorIds?: ReadonlySet<string>,
+	humanReplyContext?: { narratorId: string; context: ReplyContext },
 ): Promise<void> {
 	const { continueNarrator } = await import("./narrator-session");
 	const failures: string[] = [];
@@ -761,11 +763,18 @@ export async function restoreCarriedOrdinaryTargets(
 				if (valid) {
 					// The same persisted run continues (deadline kept); its result was already
 					// owed through its own task/tool call, so recovery does not deliver it again.
-					const resumed = await continueNarrator(row.id, "en", false, undefined, {
-						resumeRunId: row.logicalRunId ?? undefined,
-						recovered: true,
-						deliver: false,
-					});
+					const resumed = await continueNarrator(
+						row.id,
+						"en",
+						false,
+						undefined,
+						{
+							resumeRunId: row.logicalRunId ?? undefined,
+							recovered: true,
+							deliver: false,
+						},
+						humanReplyContext?.narratorId === row.id ? humanReplyContext.context : undefined,
+					);
 					if (!resumed.ok) throw new Error("Standalone delivering run recovery did not start");
 				}
 				const original = getRegisteredRecoverySource(source.updateEpoch);
@@ -789,7 +798,11 @@ export async function restoreCarriedOrdinaryTargets(
 
 export async function restoreOrdinaryRestartRecovery(
 	prepared: RestartStartupRecovery,
-	options: { manual?: boolean; includedNarratorIds?: ReadonlySet<string> } = {},
+	options: {
+		manual?: boolean;
+		includedNarratorIds?: ReadonlySet<string>;
+		humanReplyContext?: { narratorId: string; context: ReplyContext };
+	} = {},
 ) {
 	if (!prepared.manifest || (!options.manual && !automaticResumeEnabled())) return null;
 	const { manifest, protection } = prepared;
@@ -813,8 +826,14 @@ export async function restoreOrdinaryRestartRecovery(
 		{ snapshot: manifest.snapshot, protection },
 		{
 			includedNarratorIds: options.includedNarratorIds,
+			humanReplyContext: options.humanReplyContext,
 			onSendWaitersSettled: () =>
-				restoreCarriedOrdinaryTargets(source, driven, options.includedNarratorIds),
+				restoreCarriedOrdinaryTargets(
+					source,
+					driven,
+					options.includedNarratorIds,
+					options.humanReplyContext,
+				),
 			onQueueCompleted: async () => {
 				if (!options.includedNarratorIds) {
 					await removeManifest(manifest.snapshot.updateEpoch);
@@ -836,7 +855,11 @@ export async function restoreOrdinaryRestartRecovery(
 }
 
 /** Explicit Continue bypasses only the startup flag, and only for this narrator's subtree. */
-export async function manuallyResumeRestartRecovery(narratorId: string): Promise<boolean> {
+export async function manuallyResumeRestartRecovery(
+	narratorId: string,
+	humanReplyContext?: ReplyContext,
+): Promise<boolean> {
+	const context = parseReplyContext(humanReplyContext);
 	const prepared = processState.pausedRecovery;
 	if (!prepared?.manifest?.targets.some((target) => target.narratorId === narratorId)) return false;
 	const ids = new Set([narratorId]);
@@ -857,6 +880,7 @@ export async function manuallyResumeRestartRecovery(narratorId: string): Promise
 	const handle = await restoreOrdinaryRestartRecovery(prepared, {
 		manual: true,
 		includedNarratorIds: ids,
+		humanReplyContext: context ? { narratorId, context } : undefined,
 	});
 	if (!handle) return false;
 	processState.pausedRecovery = {

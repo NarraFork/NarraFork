@@ -1,3 +1,4 @@
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
@@ -25,7 +26,7 @@ import {
 	isAgentDependentToolExecutionGroup,
 } from "../lib/agent/tool-execution-groups";
 import { listRunningAwaits } from "../lib/agent/tools/await";
-import { NotFoundError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
@@ -1943,8 +1944,16 @@ export async function restoreNarratorsAfterPlannedUpdate(
 		/** Ordinary independent children share the global Send waiter installation barrier. */
 		onSendWaitersSettled?: () => Promise<void>;
 		includedNarratorIds?: ReadonlySet<string>;
+		/** Explicit Continue affects only its clicked recipient, never the recovered subtree. */
+		humanReplyContext?: { narratorId: string; context: ReplyContext };
 	} = {},
 ): Promise<PlannedUpdateRecoveryHandle | null> {
+	const humanReplyContext = options.humanReplyContext
+		? {
+				narratorId: options.humanReplyContext.narratorId,
+				context: parseReplyContext(options.humanReplyContext.context),
+			}
+		: undefined;
 	const startup = prepared ?? (await getPlannedUpdateStartupProtection());
 	const { snapshot, protection } = startup;
 	const severedNarratorIds = startup.severedNarratorIds ?? new Set<string>();
@@ -1972,40 +1981,62 @@ export async function restoreNarratorsAfterPlannedUpdate(
 			registration: ReturnType<typeof registerPlannedUpdateRecoveryController>;
 		}
 	>();
-	try {
-		for (const narratorId of new Set(queue.map(({ record }) => record.narratorId))) {
-			const controller = new AbortController();
-			const recoveryToken = generateId();
-			await withRecoveryAdvance(scope, () =>
-				toolContinuationService.bindRecoveryTokenForNarrator(narratorId, scope, recoveryToken),
-			);
-			const registration = registerPlannedUpdateRecoveryController(
-				narratorId,
-				controller,
-				(token) =>
-					finalizeInterruptedRecoveryParent(
-						narratorId,
-						scope,
-						localeFor(snapshot, narratorId),
-						token,
-					),
-				{
-					token: recoveryToken,
-					foregroundSubagentIds: queue.flatMap(({ record }) => {
-						if (record.narratorId !== narratorId || record.kind !== "foreground_agent") return [];
-						const subagentId = payloadString(record.payloadJson, "subagentId");
-						return subagentId ? [subagentId] : [];
-					}),
-				},
-			);
-			parentControls.set(narratorId, { controller, registration });
+	const registerRecovery = async () => {
+		try {
+			for (const narratorId of new Set(queue.map(({ record }) => record.narratorId))) {
+				const controller = new AbortController();
+				const recoveryToken = generateId();
+				await withRecoveryAdvance(scope, () =>
+					toolContinuationService.bindRecoveryTokenForNarrator(narratorId, scope, recoveryToken),
+				);
+				const registration = registerPlannedUpdateRecoveryController(
+					narratorId,
+					controller,
+					(token) =>
+						finalizeInterruptedRecoveryParent(
+							narratorId,
+							scope,
+							localeFor(snapshot, narratorId),
+							token,
+						),
+					{
+						token: recoveryToken,
+						foregroundSubagentIds: queue.flatMap(({ record }) => {
+							if (record.narratorId !== narratorId || record.kind !== "foreground_agent") return [];
+							const subagentId = payloadString(record.payloadJson, "subagentId");
+							return subagentId ? [subagentId] : [];
+						}),
+					},
+				);
+				parentControls.set(narratorId, { controller, registration });
+			}
+			if (humanReplyContext?.context && parentControls.has(humanReplyContext.narratorId)) {
+				const { adoptHumanReplyContext } = await import("./narrator-reply-context");
+				await adoptHumanReplyContext(humanReplyContext.narratorId, humanReplyContext.context);
+			}
+		} catch (error) {
+			// No queue has started yet: release partial registrations so startup failure
+			// reconciliation can distinguish these owners from genuinely mounted work.
+			for (const control of parentControls.values()) control.registration.unregister();
+			throw error;
 		}
-	} catch (error) {
-		// No queue has started yet: release partial registrations so startup failure
-		// reconciliation can distinguish these owners from genuinely mounted work.
-		for (const control of parentControls.values()) control.registration.unregister();
-		throw error;
-	}
+	};
+	if (humanReplyContext) {
+		const { isNarratorRuntimeBusy, withNarratorStartAdmission } = await import(
+			"./narrator-session-state"
+		);
+		const { getExecutionOwner } = await import("./agent-runtime/ownership");
+		await withNarratorStartAdmission(humanReplyContext.narratorId, async () => {
+			if (
+				getExecutionOwner(humanReplyContext.narratorId) ||
+				isNarratorRuntimeBusy(humanReplyContext.narratorId)
+			) {
+				throw new ValidationError("Cannot continue while narrator is already running");
+			}
+			await registerRecovery();
+		});
+	} else await registerRecovery();
+	// Release start admission before a recovery can re-enter continueNarrator.
 	const queueRecovery = restoreRecoveryQueue(
 		queue,
 		snapshot,

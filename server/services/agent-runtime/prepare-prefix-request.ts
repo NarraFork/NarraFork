@@ -1,3 +1,4 @@
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
 import {
 	currentCompactMessageId,
@@ -22,13 +23,19 @@ export interface PreparePrefixRequestOptions<
 > {
 	narratorId: string;
 	locale: Locale;
+	getReplyContext?: () => ReplyContext;
+	/** Persist upstream identity before any prepared request can leave the runtime. */
+	ensureRequestIdentity?: () => Promise<void>;
 	getModel: () => string;
 	getProvider: () => string;
 	signal?: AbortSignal;
 	getToolLoading?: (identity: RequestModelIdentity) => RuntimeHistoryOptions["toolLoading"];
 	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
 	/** Runs after tool refresh under the existing /load serialization queue. */
-	buildPrefixPrompt?: (identity: RequestModelIdentity) => Promise<Prompt>;
+	buildPrefixPrompt?: (
+		identity: RequestModelIdentity,
+		replyContext: ReplyContext,
+	) => Promise<Prompt>;
 }
 
 export interface PreparedPrefixRequest<Prompt extends RequestPrefixPrompt = RequestPrefixPrompt>
@@ -48,7 +55,12 @@ export interface PreparedPrefixRequest<Prompt extends RequestPrefixPrompt = Requ
 export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 	options: PreparePrefixRequestOptions<Prompt>,
 ): Promise<PreparedPrefixRequest<Prompt>> {
-	const { narratorId, locale, signal } = options;
+	const { narratorId, signal } = options;
+	const replyContext = parseReplyContext(options.getReplyContext?.()) ?? {
+		locale: options.locale,
+		replyInUserLanguage: false,
+	};
+	const { locale } = replyContext;
 	// A UI selection change is consumed by the loop's next model-switch boundary,
 	// not by a queued prepare or a compact retry within this request.
 	const identity: RequestModelIdentity = {
@@ -68,7 +80,8 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 		if (!capturedLoading) {
 			// Compatibility for standalone callers without loading-aware prefix epochs.
 			const sourceMessages = await readHistory();
-			const prompt = await options.buildPrefixPrompt?.(identity);
+			const prompt = await options.buildPrefixPrompt?.(identity, replyContext);
+			await options.ensureRequestIdentity?.();
 			signal?.throwIfAborted();
 			return { ...identity, sourceMessages, prompt };
 		}
@@ -86,7 +99,7 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 				refreshTools: async () => {
 					await options.refreshToolLoading?.(identity);
 					signal?.throwIfAborted();
-					prompt = await options.buildPrefixPrompt?.(identity);
+					prompt = await options.buildPrefixPrompt?.(identity, replyContext);
 					return { ...(options.getToolLoading?.(identity) ?? capturedLoading), prompt };
 				},
 				noticeText: (kind, toolName) =>
@@ -100,6 +113,7 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 			signal?.throwIfAborted();
 			if (reconciled.changed) sourceMessages = await readHistory();
 			else sourceMessages = reconciled.sourceMessages ?? sourceMessages ?? (await readHistory());
+			await options.ensureRequestIdentity?.();
 			if (
 				prompt?.compactMessageId !== undefined &&
 				prompt.compactMessageId !== (await currentCompactMessageId(narratorId))

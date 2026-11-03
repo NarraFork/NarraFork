@@ -171,6 +171,8 @@ export async function extractSubagentToPrimary(
 			? (await resolveSubagentModelForRun(source, source.ownerUserId)).model
 			: (source.model ?? FOLLOW_DEFAULT_MODEL);
 	const audiences = await resolveExtractAudiences(source);
+	const { ensureReplyContext } = await import("./narrator-reply-context");
+	const replyContext = await ensureReplyContext(source.id);
 	const now = new Date().toISOString();
 	const id = generateId();
 	const title = opts?.title?.trim() || defaultExtractTitle(source.title, subagentType, locale);
@@ -194,6 +196,7 @@ export async function extractSubagentToPrimary(
 							subagentType: null,
 							traits: ["standalone", "extracted-from-subagent"],
 							model: storedModel,
+							replyContext,
 							// Never inherit the subagent system prompt — primary control plane.
 							systemPrompt: null,
 							// Do not inherit explore/plan readOnly lockdown.

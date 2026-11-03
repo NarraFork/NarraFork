@@ -3330,57 +3330,9 @@ async function* agentLoopInMetadataSnapshot(
 
 		if (!newModel && !reasoningChanged) return null;
 
+		let newResolved: ReturnType<typeof resolveProviderAndModel> | undefined;
 		try {
-			let providerChanged = false;
-			let modelChanged = false;
-			if (newModel) {
-				const newResolved = resolveProviderAndModel(newModel);
-				providerChanged = newResolved.provider !== effectiveProvider;
-				modelChanged = newResolved.model !== effectiveModel;
-				provider = newResolved.adapter;
-				effectiveModel = newResolved.model;
-				effectiveProvider = newResolved.provider;
-				config.model = newResolved.model;
-				config.provider = newResolved.provider;
-				if (providerChanged || modelChanged) {
-					tools = formatRequestToolsForProvider();
-					await reportToolsCharacters(tools);
-				}
-			}
-
-			if (hasReasoningOverride) {
-				config.reasoningEffort = nextReasoningEffort;
-			}
-
-			if (providerChanged || modelChanged) {
-				// Force history/tool-result rebuild so the next API call uses the new
-				// provider protocol even when this switch happens inside a retry loop.
-				const replacement = await config.onBeforeTurn?.(turnIndex, {
-					force: true,
-					cause: "model_switch",
-				});
-				if (replacement) applyHistoryReplacement(replacement);
-				// Without a rebuild the transcript is projected for the new protocol.
-				else hostHistory = null;
-			}
-
-			logger.info("Agent loop switched runtime settings before API call", {
-				narratorId: config.narratorId,
-				cause,
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort,
-				modelChanged,
-				providerChanged,
-				reasoningChanged,
-			});
-			return {
-				type: "model_switched",
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort ?? null,
-				cause,
-			};
+			if (newModel) newResolved = resolveProviderAndModel(newModel);
 		} catch (err) {
 			if (err instanceof ToolEpochError) throw err;
 			logger.warn("Failed to switch runtime settings during agent loop", {
@@ -3392,6 +3344,55 @@ async function* agentLoopInMetadataSnapshot(
 			});
 			return null;
 		}
+
+		// Once the adapter or request state changes, preparation must succeed before
+		// dispatch. In particular, identity/storage failures cannot reuse the old
+		// prepared first attempt under a new model or provider.
+		let providerChanged = false;
+		let modelChanged = false;
+		if (newResolved) {
+			providerChanged = newResolved.provider !== effectiveProvider;
+			modelChanged = newResolved.model !== effectiveModel;
+			provider = newResolved.adapter;
+			effectiveModel = newResolved.model;
+			effectiveProvider = newResolved.provider;
+			config.model = newResolved.model;
+			config.provider = newResolved.provider;
+			if (providerChanged || modelChanged) {
+				tools = formatRequestToolsForProvider();
+				await reportToolsCharacters(tools);
+			}
+		}
+
+		if (hasReasoningOverride) config.reasoningEffort = nextReasoningEffort;
+
+		if (providerChanged || modelChanged) {
+			// Force history/tool-result rebuild even when switching inside a retry loop.
+			const replacement = await config.onBeforeTurn?.(turnIndex, {
+				force: true,
+				cause: "model_switch",
+			});
+			if (replacement) applyHistoryReplacement(replacement);
+			else hostHistory = null;
+		}
+
+		logger.info("Agent loop switched runtime settings before API call", {
+			narratorId: config.narratorId,
+			cause,
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort,
+			modelChanged,
+			providerChanged,
+			reasoningChanged,
+		});
+		return {
+			type: "model_switched",
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort ?? null,
+			cause,
+		};
 	}
 
 	turnLoop: while (turnIndex < maxTurns) {
@@ -4612,6 +4613,10 @@ async function* agentLoopInMetadataSnapshot(
 					applyHistoryReplacement(await config.rebuildRequestHistory());
 				}
 				prefixPreparedForAttempt = false;
+				// Reflection and legacy configurations may have no prefix/history hook.
+				// Every attempt still needs durable identity before dispatch. Keep this
+				// outside transport retry handling: a failed admission is not an API error.
+				await config.beforeProviderRequest?.();
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the

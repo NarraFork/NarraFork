@@ -147,6 +147,7 @@ import {
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
+import { ensureReplyContext } from "./narrator-reply-context";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
@@ -1644,6 +1645,7 @@ export const narratorService = {
 				throw new ValidationError("Standalone subagents cannot have an Agent tool-call origin");
 			}
 			const parent = await this.getById(input.parentNarratorId);
+			const replyContext = await ensureReplyContext(parent.id);
 
 			const { resolveNarratorRuntimePolicy } = await import("./trait-layer-service");
 			if (!(await resolveNarratorRuntimePolicy(parent.id)).capabilities.spawnAgent) {
@@ -1748,6 +1750,7 @@ export const narratorService = {
 					.values({
 						id,
 						type: "subagent",
+						replyContext,
 						subagentType: input.subagentType,
 						variant: subagentVariant(input.subagentType),
 						traits: subTraits,
@@ -2450,6 +2453,7 @@ export const narratorService = {
 			const executionContext = await resolveForkExecutionContext(parent);
 			const inheritedTraits = await forkTraits(parent);
 			const policySource = forkPolicySource(parent);
+			const replyContext = await ensureReplyContext(parent.id);
 
 			// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
 			// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
@@ -2469,6 +2473,7 @@ export const narratorService = {
 								variant: "primary",
 								traits: inheritedTraits,
 								...policySource,
+								replyContext,
 								...executionContext,
 								...creationWorkspace,
 								model: storedModel,
@@ -2657,6 +2662,7 @@ export const narratorService = {
 
 			const forkTraits2 = await forkTraits(parent);
 			const policySource = forkPolicySource(parent);
+			const replyContext = await ensureReplyContext(parent.id);
 			const executionContext = await resolveForkExecutionContext(parent);
 
 			// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
@@ -2675,6 +2681,7 @@ export const narratorService = {
 								variant: "primary",
 								traits: forkTraits2,
 								...policySource,
+								replyContext,
 								...executionContext,
 								...creationWorkspace,
 								model: storedModel,

@@ -94,7 +94,9 @@ export class InstructionFileCache {
 		let facts: FileFacts;
 		try {
 			facts = await this.statFile(absolutePath);
-		} catch {
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
 			this.remove(key);
 			return null;
 		}
@@ -134,7 +136,10 @@ export class InstructionFileCache {
 		const pending = this.readFile(absolutePath, maxBytes).then(async (value) => {
 			// An atomic replacement/change during the read cannot label new bytes with
 			// the old signature. Return the read, but do not retain the race.
-			const after = await this.statFile(absolutePath).catch(() => null);
+			const after = await this.statFile(absolutePath).catch((error: NodeJS.ErrnoException) => {
+				if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+				throw error;
+			});
 			if (this.entries.get(key) === entry) {
 				if (value && after?.isFile() && signature(after) === observed) {
 					entry.value = { ...value };
