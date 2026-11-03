@@ -293,5 +293,82 @@
 		"taskRemoved": "Checkbox taken away",
 		"taskDue": "Due: {{date}}",
 		"taskAssignee": "Assignee: {{name}}"
+	},
+	"board": {
+		"title": "Tasks",
+		"projectTitle": "Task board",
+		"empty": "No tasks yet.",
+		"emptyProject": "No tasks in this project's outline yet.",
+		"loadFailed": "Could not load the task board.",
+		"thisSession": "This session",
+		"untitledSession": "Untitled session",
+		"nobody": "Unassigned",
+		"agent": "Agent {{name}}",
+		"you": "{{name}} (you)",
+		"status": {
+			"doing": "In progress",
+			"waiting": "Waiting",
+			"todo": "To do",
+			"done": "Done",
+			"cancelled": "Cancelled"
+		},
+		"count": "{{count}} open",
+		"humanCreated": "Set by a person",
+		"locked": "Locked · {{name}}",
+		"lockedSomeone": "Locked",
+		"waitPrerequisites": "Waits for {{count}} prerequisite(s)",
+		"waitPeople": "Waits for an answer",
+		"waitConfirmation": "Waits for confirmation",
+		"openTruncated": "More open tasks than shown: open the outline for the rest.",
+		"space": "In {{label}}",
+		"claimedElsewhere": "Held in {{label}}",
+		"moreFinished": "More finished tasks",
+		"moreSpaces": "More sessions",
+		"add": {
+			"placeholder": "Add a task for this session (Enter for a new line, Ctrl+Enter to add)",
+			"lock": "Lock it (its text and completion wait for your confirmation)",
+			"add": "Add",
+			"addAndStart": "Add and start",
+			"added": "Task added",
+			"exists": "This task is on the board already",
+			"started": "The session started on its tasks",
+			"failed": "Could not add the task"
+		},
+		"action": {
+			"menu": "Task actions",
+			"done": "Mark done",
+			"cancel": "Cancel task",
+			"stop": "Back to to do",
+			"reopen": "Reopen",
+			"reopenAndStart": "Reopen and start",
+			"assignMe": "Hand to me",
+			"assignUser": "Hand to someone…",
+			"assignSession": "Hand back to the session",
+			"usernamePlaceholder": "Username",
+			"assign": "Hand over",
+			"open": "Open in the outline",
+			"failed": "Could not change the task",
+			"conflict": "The task changed meanwhile; the board was reloaded.",
+			"updated": "Task updated"
+		},
+		"completion": {
+			"asks": "The agent marked it {{status}}: waiting for your confirmation",
+			"asksOther": "The agent marked it {{status}}: waiting for {{name}} to confirm",
+			"showChange": "Show the change",
+			"hideChange": "Hide the change",
+			"confirm": "Confirm",
+			"reject": "Reject",
+			"reasonPlaceholder": "Why (the agent reads this)",
+			"confirmed": "Completion confirmed",
+			"rejected": "Completion rejected",
+			"failed": "Could not decide"
+		},
+		"legacy": {
+			"show": "Old Spec files (read only)",
+			"back": "Back to the task board"
+		},
+		"statusBar": {
+			"awaiting": "{{count}} goal(s) wait for your confirmation"
+		}
 	}
 }

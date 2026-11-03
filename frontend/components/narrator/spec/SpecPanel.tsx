@@ -13,6 +13,7 @@ import {
 } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import type { OutlineBoardTask } from "@shared/outline-task-board";
 import { IconChecklist, IconInfoCircle, IconLock, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -30,10 +31,12 @@ import {
 	useSpecTasks,
 	useUpdateSpecFile,
 } from "../../../hooks/useSpec";
+import { useNarratorCurrentTask } from "../../../hooks/useTaskBoard";
 import { api } from "../../../lib/api";
 import type { SpecOutlineBehavior, SpecTaskItem } from "../../../lib/api/spec";
 import { outlineTargetHref } from "../../../lib/outline-href";
 import { isOpenClick, useOutlineOpener, wantsNewPanel } from "../../../lib/outline-opener";
+import { SessionTaskBoard } from "../../outline/task-board/TaskBoardViews";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecTaskBoard } from "./SpecTaskBoard";
@@ -64,7 +67,105 @@ interface SpecPanelProps {
 
 const TASKS_URI = "spec://tasks.json";
 
-export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanelProps) {
+/**
+ * The session's task panel. A session whose tasks live in the outline shows the task board (outline
+ * P2 PR 5: it replaces the Spec task list), with its old Spec files (the plugins' SOP fence, old
+ * notes) one click away, read-only; a Dynamic Spec session shows the Spec files as before.
+ */
+export function SpecPanel(props: SpecPanelProps) {
+	const current = useNarratorCurrentTask(props.narratorId);
+	const [legacy, setLegacy] = useState(false);
+	if (current.isLoading)
+		return (
+			<Center h="100%">
+				<Loader size="sm" />
+			</Center>
+		);
+	if (current.data?.backend === "outline" && !legacy)
+		return <OutlineTasksPanel {...props} onShowLegacy={() => setLegacy(true)} />;
+	return (
+		<SpecFilesPanel
+			{...props}
+			onBackToBoard={current.data?.backend === "outline" ? () => setLegacy(false) : undefined}
+		/>
+	);
+}
+
+/** An outline session's task board, with the continuation mode and a way to the old Spec files. */
+function OutlineTasksPanel({
+	narratorId,
+	onClose,
+	chromeless = false,
+	onShowLegacy,
+}: SpecPanelProps & { onShowLegacy: () => void }) {
+	const { t } = useTranslation("outline");
+	const opener = useOutlineOpener();
+	const openTask = useCallback(
+		(task: OutlineBoardTask) => {
+			const state = {
+				spaceId: task.spaceId,
+				blockId: task.id,
+				pageId: task.pageId,
+				view: "all" as const,
+			};
+			if (opener?.open(state)) return;
+			window.location.assign(
+				outlineTargetHref({ kind: "block", spaceId: task.spaceId, blockId: task.id }),
+			);
+		},
+		[opener],
+	);
+	return (
+		<Box
+			h="100%"
+			style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}
+			data-testid="outline-tasks-panel"
+		>
+			{!chromeless && (
+				<Group
+					gap={6}
+					px="xs"
+					py={4}
+					wrap="nowrap"
+					style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-default-border)" }}
+				>
+					<IconChecklist size={15} color="var(--mantine-color-indigo-4)" />
+					<Text size="xs" fw={600}>
+						{t("board.title")}
+					</Text>
+					<Box style={{ flex: 1 }} />
+					<ActionIcon size="sm" variant="subtle" color="gray" onClick={onClose}>
+						<IconX size={14} />
+					</ActionIcon>
+				</Group>
+			)}
+			<ScrollArea style={{ flex: 1 }}>
+				<AutoContinuationControl narratorId={narratorId} />
+				<Box px="xs" pb="xs">
+					<SessionTaskBoard narratorId={narratorId} onOpenTask={openTask} />
+					<Anchor
+						component="button"
+						type="button"
+						size="xs"
+						c="dimmed"
+						mt="sm"
+						onClick={onShowLegacy}
+						data-testid="outline-tasks-legacy"
+					>
+						{t("board.legacy.show")}
+					</Anchor>
+				</Box>
+			</ScrollArea>
+		</Box>
+	);
+}
+
+function SpecFilesPanel({
+	narratorId,
+	onClose,
+	chromeless = false,
+	onBackToBoard,
+}: SpecPanelProps & { onBackToBoard?: () => void }) {
 	const { t } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const { data: files } = useSpecFiles(narratorId);
@@ -343,6 +444,7 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 				</Group>
 			)}
 
+			{onBackToBoard && <BackToBoard onClick={onBackToBoard} />}
 			{/* File tabs */}
 			<Box px="xs" py={6} style={{ flexShrink: 0 }}>
 				<SpecFileTabStrip
@@ -466,6 +568,24 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 }
 
 // === Outline session: where the behavior boundary lives ===
+
+/** Back from an outline session's old Spec files to its task board. */
+function BackToBoard({ onClick }: { onClick: () => void }) {
+	const { t } = useTranslation("outline");
+	return (
+		<Box px="xs" pt={6} style={{ flexShrink: 0 }}>
+			<Anchor
+				component="button"
+				type="button"
+				size="xs"
+				onClick={onClick}
+				data-testid="outline-tasks-back"
+			>
+				{t("board.legacy.back")}
+			</Anchor>
+		</Box>
+	);
+}
 
 /**
  * The fence tab of a session whose tasks live in the outline: its behavior boundary is the

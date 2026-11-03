@@ -23,6 +23,21 @@ mock.module("@mantine/core", () => ({
 	Text: box,
 	Title: box,
 	Skeleton: () => <div data-skeleton />,
+	SegmentedControl: ({
+		data,
+		onChange,
+	}: {
+		data: Array<{ value: string; label: string }>;
+		onChange: (value: string) => void;
+	}) => (
+		<div data-view-switch>
+			{data.map((item) => (
+				<button key={item.value} type="button" onClick={() => onChange(item.value)}>
+					{item.label}
+				</button>
+			))}
+		</div>
+	),
 	Loader: () => <div data-loader />,
 	Button: ({
 		children,
@@ -118,6 +133,16 @@ mock.module("../../lib/api-error", () => ({
 }));
 const list = mock(async (_options: unknown) => ({}));
 mock.module("../../lib/api", () => ({ api: { listNarratorsPaginated: list } }));
+// The project's task board (outline P2 PR 5) is its own component, tested on its own.
+const boardProjects: string[] = [];
+mock.module("../outline/task-board/TaskBoardViews", () => ({
+	ProjectTaskBoard: ({ projectId }: { projectId: string }) => {
+		boardProjects.push(projectId);
+		return <div data-task-board={projectId} />;
+	},
+	SessionTaskBoard: () => null,
+}));
+mock.module("../../lib/outline-router", () => ({ useOpenOutlinePage: () => () => {} }));
 mock.module("./ProjectSettingsPanel", () => ({
 	ProjectSettingsPanel: () => {
 		if (settingsError) throw new Error("optional settings failed");
@@ -291,4 +316,20 @@ test("the outline entry appears only while the outline is on and opens the proje
 	expect(openOutline).toHaveBeenCalledWith("project", "original-project");
 	outlineCallbacks?.onMissing();
 	expect(notify).toHaveBeenCalledWith({ color: "gray", message: "outlineNotCreated" });
+});
+test("with the outline on, the Tasks view shows the project's task board instead of the sessions", async () => {
+	await act(async () => root.render(<Page />));
+	expect(container.querySelector("[data-view-switch]")).toBeNull();
+	outlineEnabled = true;
+	await act(async () => root.render(<Page />));
+	expect(container.querySelector('a[href="/narrators/old-session"]')).not.toBeNull();
+	await click("board.projectTitle");
+	// The lazy board settles.
+	for (let i = 0; i < 20 && !container.querySelector("[data-task-board]"); i++)
+		await act(async () => await new Promise((resolve) => setTimeout(resolve, 5)));
+	expect(container.querySelector('[data-task-board="original-project"]')).not.toBeNull();
+	expect(container.querySelector('a[href="/narrators/old-session"]')).toBeNull();
+	await click("compatibility.sessions");
+	expect(container.querySelector("[data-task-board]")).toBeNull();
+	expect(container.querySelector('a[href="/narrators/old-session"]')).not.toBeNull();
 });

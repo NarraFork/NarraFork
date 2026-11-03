@@ -1,6 +1,7 @@
 import {
 	ActionIcon,
 	Avatar,
+	Badge,
 	Box,
 	Button,
 	Group,
@@ -111,6 +112,11 @@ export interface NarratorInteractionStatusBarProps {
 		isRetrying: boolean;
 		isCompacting: boolean;
 		currentSpecTask: SpecTaskItem | null;
+		/**
+		 * "N goals wait for your confirmation" (outline P2 PR 5: a locked goal the agent ticked done,
+		 * D26b), shown while idle; a click opens the task board. Null when none waits.
+		 */
+		awaitingConfirmationLabel?: string | null;
 		retryInfo: RetryInfo | null;
 		compactingMarkerMessageId: string | null;
 		compactFailure: CompactFailureInfo | null;
@@ -491,6 +497,17 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									serviceCount={tasks.serviceCount}
 									onOpen={tasks.onOpenPanel}
 								/>
+							)}
+							{workIndicator.awaitingConfirmationLabel && !isWorkspacePreview && (
+								<UnstyledButton
+									onClick={workIndicator.onOpenSpecTool}
+									style={{ flexShrink: 0 }}
+									data-testid="status-awaiting-confirmation"
+								>
+									<Badge size="xs" color="orange" variant="light" tt="none">
+										{workIndicator.awaitingConfirmationLabel}
+									</Badge>
+								</UnstyledButton>
 							)}
 							{workIndicator.compactFailure && !workIndicator.isCompacting && (
 								<Text

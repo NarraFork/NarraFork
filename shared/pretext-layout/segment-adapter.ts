@@ -169,6 +169,10 @@ export interface AdapterContentBlock {
 	added?: boolean | null;
 	/** spec_*: whether the task is a protected commitment. */
 	protected?: boolean | null;
+	/** spec_goal_added: `outline` for a goal added to the outline (outline P2 PR 5). */
+	taskBackend?: string | null;
+	/** spec_goal_added (outline): whether the goal is locked. */
+	locked?: boolean | null;
 	/** command block (bash_command): the shell command body. */
 	command?: string | null;
 	/** spec_fork_carryover / spec_context_cleared summary counts. */
@@ -2236,6 +2240,11 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	specGoalAddedBadge: "Goal added",
 	specGoalExistsBadge: "Already tracked",
 	specGoalViewTasks: "View tasks",
+	outlineGoalBadge: "Set by you",
+	outlineGoalLockedBadge: "Locked goal",
+	outlineGoalAddedBadge: "Added to the outline",
+	outlineGoalExistsBadge: "Already on the board",
+	outlineGoalViewBoard: "View task board",
 	specContinuation: "Task",
 	specBlockedContinuation: "Blocked",
 	segmentCompactFailed: "Compaction failed",
@@ -3634,6 +3643,9 @@ function adaptSystemTextData(
 		}
 		case "spec_goal_added": {
 			const added = block.added !== false;
+			// A goal added to the outline (outline P2 PR 5): a person's task, locked; the same
+			// layout (two badges, one button) with its own words, and the button opens the board.
+			const outline = block.taskBackend === "outline";
 			return {
 				kind: "spec_goal_added",
 				// chunk: goalBlock.task ?? message.contentText
@@ -3641,10 +3653,26 @@ function adaptSystemTextData(
 				added,
 				color: "indigo",
 				badges: [
-					sysLabel(ctx, "specProtectedBadge"),
-					sysLabel(ctx, added ? "specGoalAddedBadge" : "specGoalExistsBadge"),
+					sysLabel(
+						ctx,
+						outline
+							? block.locked === false
+								? "outlineGoalBadge"
+								: "outlineGoalLockedBadge"
+							: "specProtectedBadge",
+					),
+					sysLabel(
+						ctx,
+						added
+							? outline
+								? "outlineGoalAddedBadge"
+								: "specGoalAddedBadge"
+							: outline
+								? "outlineGoalExistsBadge"
+								: "specGoalExistsBadge",
+					),
 				],
-				buttons: [sysLabel(ctx, "specGoalViewTasks")],
+				buttons: [sysLabel(ctx, outline ? "outlineGoalViewBoard" : "specGoalViewTasks")],
 			};
 		}
 		case "spec_fork_carryover":

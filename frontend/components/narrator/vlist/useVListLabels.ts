@@ -423,6 +423,11 @@ export function useVListLabels(): VListLabels {
 			specGoalAddedBadge: t("specGoalAddedBadge"),
 			specGoalExistsBadge: t("specGoalExistsBadge"),
 			specGoalViewTasks: t("specGoalViewTasks"),
+			outlineGoalBadge: t("outlineGoalBadge"),
+			outlineGoalLockedBadge: t("outlineGoalLockedBadge"),
+			outlineGoalAddedBadge: t("outlineGoalAddedBadge"),
+			outlineGoalExistsBadge: t("outlineGoalExistsBadge"),
+			outlineGoalViewBoard: t("outlineGoalViewBoard"),
 			specContinuation: t("specContinuation"),
 			specBlockedContinuation: t("specBlockedContinuation"),
 			// ── spec fork-carryover / context-cleared card ──────────────────────────
