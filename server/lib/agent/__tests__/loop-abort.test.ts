@@ -16,6 +16,7 @@ let providerScenario:
 	| "streaming_field_boundaries"
 	| "codex_rebuild_after_text"
 	| "codex_rebuild_after_tool"
+	| "relaxed_plan_multiple_turns"
 	| "soft_stop_serial"
 	| "soft_stop_parallel"
 	| "soft_stop_interleaved"
@@ -170,6 +171,20 @@ const testProvider: ProviderAdapter = {
 					input: "nline2",
 				},
 			};
+			return;
+		}
+		if (providerScenario === "relaxed_plan_multiple_turns") {
+			if (providerAttempts <= 2) {
+				yield {
+					toolUses: [1, 2].map((index) => ({
+						toolUseId: `tu_plan_${providerAttempts}_${index}`,
+						name: TEST_TOOL_NAME,
+						input: { value: `plan-${providerAttempts}-${index}` },
+					})),
+				};
+			} else {
+				yield { text: "Planning complete" };
+			}
 			return;
 		}
 		if (providerScenario === "soft_stop_serial") {
@@ -1031,6 +1046,34 @@ describe("agentLoop abort result draining", () => {
 		expect(
 			delivered.some((injection) => injection.content.includes("<relaxed_plan_reminder>")),
 		).toBe(true);
+	});
+
+	test("宽松计划提醒每次运行只投递一次，跨工具和回合去重，下次运行重新提醒", async () => {
+		providerScenario = "relaxed_plan_multiple_turns";
+		for (let run = 0; run < 2; run++) {
+			providerAttempts = 0;
+			const delivered: string[] = [];
+			const completed: string[] = [];
+			for await (const event of agentLoop(
+				makeConfig(new AbortController().signal, {
+					planMode: true,
+					relaxedPlan: true,
+					deliverInjectionRow: (injection) => {
+						delivered.push(injection.source);
+						return injection.content;
+					},
+				}),
+				"continue planning",
+				{ rows: [] },
+			)) {
+				if (event.type === "tool_result") completed.push(event.toolUseId);
+			}
+			// Four distinct eligible calls over two provider turns, not just repeated
+			// processing of the same tool result. Each fresh run gets its own nudge.
+			expect(completed).toHaveLength(4);
+			expect(providerAttempts).toBe(3);
+			expect(delivered.filter((source) => source === "relaxed_plan")).toHaveLength(1);
+		}
 	});
 
 	test("流式工具参数跨 chunk 的换行转义会被正确还原", async () => {
