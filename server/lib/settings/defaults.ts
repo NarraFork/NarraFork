@@ -303,6 +303,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "是否启用 HTTPS。启用后需要配置 certFile 和 keyFile。",
 		type: "boolean",
 	},
+	"server.tls.autoReissue": {
+		desc: "启动时，本机 IP 变化则自动重新签发内置证书，保留原 CA。默认开启。",
+		type: "boolean",
+	},
 	"server.tls.certFile": {
 		desc: "PEM 格式 TLS 证书文件路径。",
 		type: "string",

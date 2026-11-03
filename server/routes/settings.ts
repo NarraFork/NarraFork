@@ -334,6 +334,7 @@ export const updateSettingsSchema = z
 				tls: z
 					.object({
 						enabled: z.boolean(),
+						autoReissue: z.boolean().default(true),
 						certFile: z.string(),
 						keyFile: z.string(),
 						passphrase: z.string().optional(),
@@ -1810,9 +1811,10 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		const newPort = merged.server.port;
 		const newTls = merged.server.tls;
 		const serverAddressChanged = newHost !== oldHost || newPort !== oldPort;
-		// Compare TLS configs — treat undefined and {enabled:false} as equivalent (both mean "no TLS")
-		const oldTlsEffective = oldTls?.enabled ? oldTls : undefined;
-		const newTlsEffective = newTls?.enabled ? newTls : undefined;
+		// autoReissue only affects the next startup, not the running TLS listener.
+		// Disabled and absent TLS configs are equivalent.
+		const oldTlsEffective = oldTls?.enabled ? { ...oldTls, autoReissue: undefined } : undefined;
+		const newTlsEffective = newTls?.enabled ? { ...newTls, autoReissue: undefined } : undefined;
 		const tlsChanged = JSON.stringify(oldTlsEffective) !== JSON.stringify(newTlsEffective);
 		const needsRestart = serverAddressChanged || tlsChanged;
 
