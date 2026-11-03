@@ -46,12 +46,20 @@ export async function enrichTabs(
 					id: narrators.id,
 					status: narrators.status,
 					substatus: narrators.substatus,
+					// 系统内部叙述者（ModelTrace 舱）不留在最近标签里：按钮按 id 打开，
+					// 但侧栏不该因此多出一条。
+					hiddenFromLists: narrators.hiddenFromLists,
 				})
 				.from(narrators)
 				.where(inArray(narrators.id, narratorIds)),
 			getNarratorIdsWithDraft(userId, narratorIds),
 		]);
-		const narratorMap = new Map(rows.map((r) => [r.id, r]));
+		const hiddenIds = new Set(rows.filter((r) => r.hiddenFromLists).map((r) => r.id));
+		const narratorMap = new Map(rows.filter((r) => !r.hiddenFromLists).map((r) => [r.id, r]));
+		for (let i = tabs.length - 1; i >= 0; i--) {
+			const nId = getTabNarratorId(tabs[i] ?? {});
+			if (nId && hiddenIds.has(nId)) tabs.splice(i, 1);
+		}
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
 			const row = nId ? narratorMap.get(nId) : undefined;

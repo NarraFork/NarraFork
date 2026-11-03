@@ -1,3 +1,19 @@
+/**
+ * ⚠️ 修改本文件（数据库结构）时必须同步检查「数据导入 / 导出」功能：
+ * `server/services/data-portability.ts` 的导出只带 `SNAPSHOT_TABLES` 里的表
+ * （子进程按表复制，不是整库快照，新表不会自动包含）。导入只合并显式列举的表
+ * （api_requests / narrators / narrator_messages / narrator_message_refs /
+ * narrator_tool_calls / narrator_blocks）并按「列交集」拷贝。
+ *
+ * 因此，schema 变更时：
+ * - 新增需要跨机迁移/备份还原的表 → 加进 `SNAPSHOT_TABLES`，并在 `applyImport` 里补
+ *   `copyTable(...)`，同时改 `docs/DATA_PORTABILITY.md` 的表清单；
+ * - 新增 NOT NULL 且**无默认值**的列 → 旧快照导入会因缺列失败（列交集只能保证已有列可拷贝），
+ *   需在导入时补默认值、或明确拒绝旧版本快照；
+ * - 新增需要随「清空」处理的数据 → 在 `clearData` 的对应分支补删除/断引用逻辑；
+ * - 改动后请跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
+ * 细节见 docs/DATA_PORTABILITY.md。
+ */
 import type {
 	ContextCharCache,
 	ContextCharStats,
@@ -308,6 +324,13 @@ export const narrators = sqliteTable(
 			.notNull()
 			.default("primary"),
 		subagentType: text("subagent_type"),
+		/**
+		 * 系统内部叙述者不进叙述者列表、最近标签与搜索，只能凭 id 从自己的入口打开。
+		 * 目前只有 ModelTrace 舱（每个模型一个）用它。
+		 */
+		hiddenFromLists: integer("hidden_from_lists", { mode: "boolean" }).notNull().default(false),
+		/** ModelTrace 舱的不透明绑定键；NULL 表示还没有收编。 */
+		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()
@@ -384,6 +407,17 @@ export const narrators = sqliteTable(
 		})
 			.notNull()
 			.default("inherit"),
+		/**
+		 * Where the session's tasks live (outline P2, plan §3): `spec` (`spec://tasks.json`) or
+		 * `outline` (checkbox blocks, claims, derived waiting). Set when a root session is created
+		 * (`outline` while `outline.enabled` is on) and kept for its life; existing sessions stay
+		 * `spec` until the import (plan PR 12) moves them. Meaningful on roots only: a subagent
+		 * follows its root's (D31) — it is written with the root's value, and the task source reads
+		 * the root's (`services/task-source`).
+		 */
+		taskBackend: text("task_backend", { enum: ["spec", "outline"] })
+			.notNull()
+			.default("spec"),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
@@ -652,6 +686,8 @@ export const narrators = sqliteTable(
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
+		// 一个模型只有一个 ModelTrace 舱；SQLite 的唯一索引允许多个 NULL。
+		uniqueIndex("idx_narrators_modeltrace_key").on(table.modeltraceKey),
 		index("idx_narrators_context_project").on(table.contextProjectId),
 		index("idx_narrators_oauth_owner").on(table.oauthOwnerGrantId),
 		uniqueIndex("idx_narrators_oauth_provision").on(
@@ -3662,6 +3698,7 @@ export const narratorBufferedMessages = sqliteTable(
 		narratorId: text("narrator_id").notNull(),
 		text: text("text").notNull(),
 		imagesJson: text("images_json"), // JSON: ImageRef[] | null
+		mediaJson: text("media_json"), // JSON: MediaRef[] | null
 		commandText: text("command_text"),
 		bashCommand: text("bash_command"), // runBashFirst command to execute before the prompt
 		createdBy: text("created_by"),

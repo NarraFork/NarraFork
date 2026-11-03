@@ -168,3 +168,15 @@ export class InstructionFileCache {
 const instructionFileCache = new InstructionFileCache();
 export const readInstructionFileCached = (path: string, maxBytes?: number) =>
 	instructionFileCache.read(path, maxBytes);
+
+/**
+ * Drop every cached instruction file.
+ *
+ * Called after this server itself rewrites a project prompt file. The cache keys on
+ * a stat signature — `dev:ino:size:mtimeMs:ctimeMs` — which is enough to notice an
+ * agent's edit, but NOT a same-size rewrite inside the filesystem's timestamp
+ * granularity: the signature is unchanged, so the freshly saved text would be ignored
+ * for up to the entry's TTL. Clearing on our own write makes "save, then talk to the
+ * narrator" deterministic instead of a race against that TTL.
+ */
+export const clearInstructionFileCache = () => instructionFileCache.clear();

@@ -274,12 +274,16 @@ export async function remove(name: string): Promise<void> {
  * (live delegation, review conversion, session import) uses this, so stored rows
  * carry their ceiling and runtime never re-reads the template.
  */
-export async function compileDelegationCeiling(template: string): Promise<RuntimePolicyTrait> {
+export async function compileDelegationCeiling(
+	template: string,
+	options: { outlineSession?: boolean } = {},
+): Promise<RuntimePolicyTrait> {
 	return compileDelegationPolicy({
 		template,
 		customDefinition: BUILTIN_DELEGATION_TEMPLATES.has(template)
 			? null
 			: await loadByName(template),
+		outlineSession: options.outlineSession,
 	});
 }
 

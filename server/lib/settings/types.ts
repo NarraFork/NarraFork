@@ -637,7 +637,10 @@ export interface NarraForkSettings {
 	outline: {
 		/**
 		 * Master switch, off by default while the feature is built: when off the outline agent
-		 * tools are not offered, its routes answer 404 and navigation hides it.
+		 * tools are not offered, its routes answer 404 and navigation hides it. When on, root
+		 * sessions created from then on keep their tasks in the outline (`narrators.task_backend`
+		 * `outline`); existing sessions keep Dynamic Spec. Turned off again, every session reads
+		 * as a spec session until it is back on (`services/task-source`).
 		 */
 		enabled: boolean;
 	};

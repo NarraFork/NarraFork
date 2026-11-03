@@ -251,3 +251,94 @@ describe("semantic composer document", () => {
 		expect("composerDocument" in displayed).toBe(false);
 	});
 });
+
+describe("native media composer documents", () => {
+	const assets: ComposerDocument["assets"] = [
+		{ id: "v", kind: "video", name: "clip.mp4", size: 8, mimeType: "video/mp4" },
+		{ id: "a", kind: "audio", name: "voice.wav", size: 9, mimeType: "audio/wav" },
+	];
+	test("media-only manifests roundtrip while keeping the historical empty text projection", () => {
+		const doc: ComposerDocument = {
+			version: 1,
+			assets,
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "audio-node", assetId: "a" },
+						{ type: "attachment", id: "video-node", assetId: "v" },
+					],
+				},
+			],
+		};
+		expect(parseComposerDocument(JSON.parse(JSON.stringify(doc)))).toEqual(doc);
+		expect(composerDocumentText(doc)).toEqual({ text: "", fileReferences: [] });
+		expect(composerDocumentTextCandidates(doc)).toHaveLength(1);
+	});
+	test("audio/video placeholders share upload ordinals but retain document position and unicode spans", () => {
+		const doc: ComposerDocument = {
+			version: 1,
+			assets,
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "audio-node", assetId: "a" },
+						{ type: "text", text: "看😀" },
+						{ type: "attachment", id: "video-node", assetId: "v" },
+					],
+				},
+			],
+		};
+		const projection = composerDocumentProjection(parseComposerDocument(doc));
+		expect(projection.text).toBe("[audio #2: voice.wav]看😀[video #1: clip.mp4]");
+		expect(projection.spans.map((span) => projection.text.slice(span.start, span.end))).toEqual([
+			"[audio #2: voice.wav]",
+			"看😀",
+			"[video #1: clip.mp4]",
+		]);
+		expect(composerDocumentTextCandidates(doc).map((item) => item.text)).toEqual([
+			projection.text,
+			"看😀",
+		]);
+	});
+	test("typed audio/video look-alikes escape once without changing text-only legacy documents", () => {
+		const typed = "[audio #1: voice.wav] \\[video #2: clip.mp4]";
+		expect(unescapeComposerText(escapeComposerText(typed))).toBe(typed);
+		const textOnly: ComposerDocument = {
+			...empty(),
+			paragraphs: [{ children: [{ type: "text", text: typed }] }],
+		};
+		expect(composerDocumentText(textOnly).text).toBe(typed);
+		const withMedia: ComposerDocument = {
+			version: 1,
+			assets: [assets[1]],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: typed },
+						{ type: "attachment", id: "audio-node", assetId: "a" },
+					],
+				},
+			],
+		};
+		expect(composerDocumentText(withMedia).text).toBe(
+			`${escapeComposerText(typed)}[audio #1: voice.wav]`,
+		);
+	});
+	test("native assets still reject non-manifest fields, invalid kinds and dangling identities", () => {
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [assets[1]],
+			paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "a" }] }],
+		};
+		for (const extra of [
+			{ base64: "private" },
+			{ path: "/private/voice.wav" },
+			{ kind: "sound" },
+			{ id: "unknown" },
+		]) {
+			expect(() =>
+				parseComposerDocument({ ...doc, assets: [{ ...assets[1], ...extra }] }),
+			).toThrow();
+		}
+	});
+});

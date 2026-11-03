@@ -355,6 +355,7 @@ const releasedPayload = {
 	metadataJson: null,
 	payloadRefJson: null,
 	imagesJson: null,
+	mediaJson: null,
 	textFilePathsJson: null,
 	fileReferencesJson: null,
 	creatorJson: null,
@@ -408,6 +409,7 @@ function validatePgInput(input: MailboxInput) {
 	if (input.kind === "user_input") {
 		const refs = [
 			input.imagesJson,
+			input.mediaJson,
 			input.creatorJson,
 			input.textFilePathsJson,
 			input.fileReferencesJson,
@@ -745,6 +747,7 @@ export function createPostgresRuntimeQueue(
 				...(input.kind === "user_input"
 					? {
 							imagesJson: input.imagesJson,
+							mediaJson: input.mediaJson,
 							creatorJson: input.creatorJson,
 							textFilePathsJson: input.textFilePathsJson,
 							fileReferencesJson: input.fileReferencesJson,
@@ -1939,6 +1942,7 @@ export function createPostgresRuntimeQueue(
 				byteSize: number;
 				payloadRefJson: string | null;
 				imagesJson: string | null;
+				mediaJson: string | null;
 				textFilePathsJson: string | null;
 				fileReferencesJson: string | null;
 				metadataJson: string;
@@ -1962,6 +1966,7 @@ export function createPostgresRuntimeQueue(
 						bufferedAt: now(),
 						updatedAt: now(),
 						imagesJson: patch.imagesJson,
+						mediaJson: patch.mediaJson,
 						textFilePathsJson: patch.textFilePathsJson,
 						fileReferencesJson: patch.fileReferencesJson,
 						metadataJson: patch.metadataJson,

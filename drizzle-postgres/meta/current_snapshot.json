@@ -1,6 +1,6 @@
 {
-  "id": "87e33132-68f8-41ad-9605-925309958431",
-  "prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
+  "id": "297184e9-2ffa-48e9-b8e6-70237e9adde4",
+  "prevId": "5ac21501-be67-4be3-b3bb-5bd339833e99",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10300,6 +10300,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "media_json": {
+          "name": "media_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "command_text": {
           "name": "command_text",
           "type": "text",
@@ -14702,6 +14708,19 @@
           "primaryKey": false,
           "notNull": false
         },
+        "hidden_from_lists": {
+          "name": "hidden_from_lists",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "modeltrace_key": {
+          "name": "modeltrace_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "title": {
           "name": "title",
           "type": "text",
@@ -14883,6 +14902,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'inherit'"
+        },
+        "task_backend": {
+          "name": "task_backend",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'spec'"
         },
         "message_count": {
           "name": "message_count",
@@ -15349,6 +15375,21 @@
           "columns": [
             {
               "expression": "handle_fold",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_modeltrace_key": {
+          "name": "idx_narrators_modeltrace_key",
+          "columns": [
+            {
+              "expression": "modeltrace_key",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

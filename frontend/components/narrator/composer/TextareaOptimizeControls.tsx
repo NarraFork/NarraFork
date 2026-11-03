@@ -55,6 +55,14 @@ export interface TextareaOptimizeControlsProps {
 	onExpand?: () => void;
 	/** Number of context messages (for display in hint), default 10 */
 	contextMessageCount?: number;
+	/**
+	 * False hides the "optimize with context" entry.
+	 *
+	 * A surface with no conversation to read — the new-session dialog's project prompt —
+	 * must not offer a toggle it cannot honour; the server-side draft route does not
+	 * accept `withContext` at all.
+	 */
+	contextAvailable?: boolean;
 	/** Allow user to change context message count in dropdown */
 	onContextMessageCountChange?: (count: number) => void;
 }
@@ -114,14 +122,16 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 							{t("optimizeStyleTranslateEn")}
 						</Menu.Item>
 						<Menu.Divider />
-						<Menu.Item
-							leftSection={<IconMessageCircle size={16} />}
-							rightSection={props.withContext ? <IconCheck size={16} /> : null}
-							onClick={props.onToggleContext}
-						>
-							{t("optimizeWithContext")}
-						</Menu.Item>
-						{props.onContextMessageCountChange && (
+						{props.contextAvailable === false ? null : (
+							<Menu.Item
+								leftSection={<IconMessageCircle size={16} />}
+								rightSection={props.withContext ? <IconCheck size={16} /> : null}
+								onClick={props.onToggleContext}
+							>
+								{t("optimizeWithContext")}
+							</Menu.Item>
+						)}
+						{props.contextAvailable !== false && props.onContextMessageCountChange && (
 							<Menu.Item closeMenuOnClick={false}>
 								<NumberInput
 									label={t("optimizeContextMessageCount")}
@@ -150,11 +160,13 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 								/>
 							</Menu.Item>
 						)}
-						<Text size="xs" c="dimmed" px="sm" py={4} style={{ maxWidth: 280 }}>
-							{props.withContext
-								? t("optimizeWithContextHintEnabled", { count: contextCount })
-								: t("optimizeWithContextHint")}
-						</Text>
+						{props.contextAvailable === false ? null : (
+							<Text size="xs" c="dimmed" px="sm" py={4} style={{ maxWidth: 280 }}>
+								{props.withContext
+									? t("optimizeWithContextHintEnabled", { count: contextCount })
+									: t("optimizeWithContextHint")}
+							</Text>
+						)}
 					</Menu.Dropdown>
 				</Menu>
 			)}

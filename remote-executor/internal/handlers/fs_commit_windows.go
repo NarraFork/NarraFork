@@ -12,12 +12,36 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 var replaceFileW = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReplaceFileW")
+var setFileInformationByHandle = windows.NewLazySystemDLL("kernel32.dll").NewProc("SetFileInformationByHandle")
+
+// Win32 BOOL is 32 bits. The upper half of a 64-bit return register is
+// undefined and may be nonzero even on failure (golang/go#81249). The pinned
+// x/sys version checks the whole register, so do not use its generated wrapper
+// for the native transaction boundary until the upstream fix is available on
+// our minimum Go version.
+func conditionalWindowsBOOLError(result uintptr, callErr error) error {
+	if uint32(result) != 0 {
+		return nil
+	}
+	if callErr == nil || callErr == windows.ERROR_SUCCESS {
+		return windows.ERROR_GEN_FAILURE
+	}
+	return callErr
+}
+
+func setConditionalWindowsFileInformation(f *os.File, class uint32, info []byte) error {
+	result, _, callErr := setFileInformationByHandle.Call(uintptr(f.Fd()), uintptr(class), uintptr(unsafe.Pointer(&info[0])), uintptr(len(info)))
+	runtime.KeepAlive(f)
+	runtime.KeepAlive(info)
+	return conditionalWindowsBOOLError(result, callErr)
+}
 
 // Injectable native boundary; tests must not run overrides in parallel.
 var conditionalReplaceFile = nativeConditionalReplaceFile
@@ -37,13 +61,7 @@ func nativeConditionalReplaceFile(target, replacement, backup string) error {
 		return err
 	}
 	ok, _, callErr := replaceFileW.Call(uintptr(unsafe.Pointer(t)), uintptr(unsafe.Pointer(r)), uintptr(unsafe.Pointer(b)), 0, 0, 0)
-	if ok == 0 {
-		if callErr == windows.ERROR_SUCCESS {
-			return windows.ERROR_GEN_FAILURE
-		}
-		return callErr
-	}
-	return nil
+	return conditionalWindowsBOOLError(ok, callErr)
 }
 
 func openConditionalWindowsFile(path string, access uint32) (*os.File, error) {
@@ -94,7 +112,7 @@ func renameConditionalHandle(f *os.File, destination string) error {
 	info := (*renameInfo)(unsafe.Pointer(&buf[0]))
 	info.Length = uint32(len(name) * 2)
 	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[offset])), len(name)), name)
-	return windows.SetFileInformationByHandle(windows.Handle(f.Fd()), windows.FileRenameInfo, &buf[0], uint32(len(buf)))
+	return setConditionalWindowsFileInformation(f, windows.FileRenameInfo, buf)
 }
 
 // The backup name must not be published in a writable directory: ReplaceFileW
@@ -188,8 +206,7 @@ func newWindowsRecoveryDirectory(target string) (string, *os.File, error) {
 }
 
 func disposeConditionalHandle(f *os.File) error {
-	disposition := byte(1)
-	return windows.SetFileInformationByHandle(windows.Handle(f.Fd()), windows.FileDispositionInfo, &disposition, 1)
+	return setConditionalWindowsFileInformation(f, windows.FileDispositionInfo, []byte{1})
 }
 
 func removeConditionalTemporary(path string, expectedInfo os.FileInfo) error {
@@ -215,13 +232,23 @@ func removeConditionalTemporary(path string, expectedInfo os.FileInfo) error {
 }
 
 func conditionalFileIdentity(path string, info os.FileInfo) bool {
+	return verifyConditionalFileIdentity(path, info) == nil
+}
+
+func verifyConditionalFileIdentity(path string, info os.FileInfo) error {
 	f, err := openConditionalWindowsFile(path, windows.FILE_READ_ATTRIBUTES)
 	if err != nil {
-		return false
+		return fmt.Errorf("open identity path %q: %w", path, err)
 	}
 	defer f.Close()
 	got, err := f.Stat()
-	return err == nil && os.SameFile(got, info)
+	if err != nil {
+		return fmt.Errorf("stat identity handle %q: %w", path, err)
+	}
+	if !os.SameFile(got, info) {
+		return fmt.Errorf("file identity mismatch at %q", path)
+	}
+	return nil
 }
 
 func verifyWindowsCommitted(f *os.File, replacementInfo os.FileInfo, metadata conditionalMetadata, next []byte) error {
@@ -283,8 +310,8 @@ func commitConditionalReplacementBudget(ctx context.Context, target, tmpPath str
 		if err := verifyWindowsCommitted(replacement, replacementInfo, nil, next); err != nil {
 			return fmt.Errorf("created file verification failed; retained at %q: %w", target, err)
 		}
-		if !conditionalFileIdentity(target, replacementInfo) {
-			return fmt.Errorf("created file path changed; original replacement handle was verified, state uncertain")
+		if err := verifyConditionalFileIdentity(target, replacementInfo); err != nil {
+			return fmt.Errorf("created file path verification failed; original replacement handle was verified, state uncertain: %w", err)
 		}
 		return nil
 	}

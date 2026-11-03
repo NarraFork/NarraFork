@@ -1,4 +1,5 @@
 import { DB_INTEGRITY_WORKER_FLAG } from "./db/integrity-protocol";
+import { DB_SNAPSHOT_WORKER_FLAG } from "./db/snapshot-protocol";
 import { captureManagerTokenFromEnv } from "./lib/manager-token";
 import { neutralizeAmbientProxyEnv } from "./lib/net/proxy-env";
 import { waitForPreviousServerShutdown } from "./lib/restart-handoff";
@@ -29,6 +30,9 @@ if (parseRevealActivation(process.argv)) {
 	// Read-only integrity probe subprocess. Must be checked before anything else: importing ./main
 	// (or the watcher worker) would open the database read-write and take the instance lock.
 	await import("./db/integrity-probe-worker");
+} else if (process.argv.includes(DB_SNAPSHOT_WORKER_FLAG)) {
+	// 导出快照构建子进程：只读源库、只写目标库，同样必须在 ./main 之前分流。
+	await import("./db/snapshot-builder-worker");
 } else if (process.argv.includes(WATCHER_WORKER_FLAG)) {
 	await import("./lib/watcher/parcel-watcher-worker");
 } else if (process.argv.includes(PLUGIN_RUNTIME_WORKER_FLAG)) {

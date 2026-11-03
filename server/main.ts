@@ -12,6 +12,12 @@ import {
 } from "../frontend/plugin-runtime/paths";
 import { CHROMIUM_PATHS } from "../shared/browser-paths";
 import { urlHost } from "../shared/server-host";
+import {
+	declaredBodyExceeds,
+	isStorageImportUpload,
+	MAX_IMPORT_BYTES,
+	MAX_ORDINARY_BODY_BYTES,
+} from "../shared/storage-transfer";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -872,6 +878,40 @@ function stopHttpListener(): void {
 
 let boundTlsConfig = settings.server.tls;
 
+const BODYLESS_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * `maxRequestBodySize` 是全局的，导入预览把它抬到 4 GB。
+ * 其它带正文的请求仍按 128 MB 拒绝：声明的 Content-Length 直接 413，
+ * 缺省或偏小的长度则在读流时计数，避免未声明长度的请求把 4 GB 吃满。
+ * WebSocket 升级在调用这里之前已经返回。
+ */
+function limitOrdinaryRequestBody(req: Request, url: URL): Request | Response {
+	if (isStorageImportUpload(req.method, url.pathname)) return req;
+	if (BODYLESS_METHODS.has(req.method.toUpperCase())) return req;
+	if (declaredBodyExceeds(req.headers.get("content-length"), MAX_ORDINARY_BODY_BYTES)) {
+		return new Response("Request body too large", {
+			status: 413,
+			headers: { "content-type": "text/plain; charset=utf-8" },
+		});
+	}
+	if (!req.body) return req;
+	let seen = 0;
+	const limited = req.body.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				seen += chunk.byteLength;
+				if (seen > MAX_ORDINARY_BODY_BYTES) {
+					controller.error(new Error("Request body too large"));
+					return;
+				}
+				controller.enqueue(chunk);
+			},
+		}),
+	);
+	return new Request(req, { body: limited, duplex: "half" } as RequestInit);
+}
+
 function startServer(
 	listenPort: number,
 	tlsCfg: typeof settings.server.tls,
@@ -1117,7 +1157,9 @@ function startServer(
 				xRealIp: req.headers.get("x-real-ip"),
 				trustedProxyCidrs,
 			});
-			return app.fetch(req, {
+			const limited = limitOrdinaryRequestBody(req, url);
+			if (limited instanceof Response) return limited;
+			return app.fetch(limited, {
 				clientIp,
 				peerIp,
 				trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
@@ -1137,6 +1179,9 @@ function startServer(
 					port: listenPort,
 					hostname: host,
 					idleTimeout: 255,
+					// Bun 只能设一个全局请求体上限。导入预览要收最大 4 GB 的包，所以这里取
+					// MAX_IMPORT_BYTES；其它请求在 limitOrdinaryRequestBody 里按 128 MB 拒绝。
+					maxRequestBodySize: MAX_IMPORT_BYTES,
 					tls,
 					fetch: fetchRequest,
 					websocket: wsHandlers,
@@ -1489,6 +1534,11 @@ startHeartbeat();
 initDeviceConnectionService();
 // Wire the file-transfer chunk-frame receiver.
 initDeviceTransferService();
+// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
+// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
+await import("./services/modeltrace-compat")
+	.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
+	.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
 // Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
 // These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
 // instead of letting a fire-and-forget promise hit that proxy and swallow the failure.

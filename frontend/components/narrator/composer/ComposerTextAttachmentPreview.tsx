@@ -30,10 +30,12 @@ export async function readComposerTextAttachment(file: File): Promise<TextPrevie
 export function ComposerTextAttachmentPreview({
 	file,
 	name,
+	mediaKind,
 	onClose,
 }: {
 	file: File | undefined;
 	name: string;
+	mediaKind?: "audio" | "video";
 	onClose: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -55,9 +57,17 @@ export function ComposerTextAttachmentPreview({
 		failed?: boolean;
 	} | null>(null);
 
+	const [mediaUrl, setMediaUrl] = useState<{ file: File; url: string } | null>(null);
+	useEffect(() => {
+		setMediaUrl(null);
+		if (!file || !mediaKind) return;
+		const url = URL.createObjectURL(file);
+		setMediaUrl({ file, url });
+		return () => URL.revokeObjectURL(url);
+	}, [file, mediaKind]);
 	useEffect(() => {
 		setResult(null);
-		if (!file) return;
+		if (!file || mediaKind) return;
 		let active = true;
 		const timeout = setTimeout(() => {
 			active = false;
@@ -80,7 +90,7 @@ export function ComposerTextAttachmentPreview({
 			active = false;
 			clearTimeout(timeout);
 		};
-	}, [file]);
+	}, [file, mediaKind]);
 
 	const current = result?.file === file ? result : null;
 	return (
@@ -94,7 +104,33 @@ export function ComposerTextAttachmentPreview({
 			closeOnEscape={false}
 		>
 			<Stack gap="xs">
-				{!file || current?.failed ? (
+				{file && mediaKind ? (
+					mediaUrl?.file === file ? (
+						mediaKind === "video" ? (
+							<video
+								controls
+								preload="metadata"
+								src={mediaUrl.url}
+								aria-label={name}
+								style={{ width: "100%", maxHeight: "60vh" }}
+							>
+								<track kind="captions" />
+							</video>
+						) : (
+							<audio
+								controls
+								preload="metadata"
+								src={mediaUrl.url}
+								aria-label={name}
+								style={{ width: "100%" }}
+							>
+								<track kind="captions" />
+							</audio>
+						)
+					) : (
+						<Text role="status">{t("attachments.previewLoading")}</Text>
+					)
+				) : !file || current?.failed ? (
 					<Text c="red" size="sm" role="alert">
 						{t("attachments.previewFailed")}
 					</Text>

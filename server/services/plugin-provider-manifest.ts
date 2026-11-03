@@ -89,6 +89,8 @@ function capabilitiesFor(provider: ManifestProvider): Partial<ProviderTypeCapabi
 		result.reasoningContinuation = declared.reasoningContinuation;
 	}
 	if (declared.inputImages !== undefined) result.inputImages = declared.inputImages;
+	if (declared.inputAudio !== undefined) result.inputAudio = declared.inputAudio;
+	if (declared.inputVideo !== undefined) result.inputVideo = declared.inputVideo;
 	if (declared.mayLeakXmlToolCalls !== undefined) {
 		result.mayLeakXmlToolCalls = declared.mayLeakXmlToolCalls;
 	}
