@@ -2,6 +2,7 @@
  * Queries and live updates of the read-only outline pages.
  */
 import type {
+	OutlineAnswerInput,
 	OutlineBlockViewResponse,
 	OutlineSpaceSummary,
 	OutlineViewMode,
@@ -43,6 +44,8 @@ export const outlineKeys = {
 	pagePending: (spaceId: string, pageId: string) =>
 		["outline", "pending", spaceId, pageId] as const,
 	pending: (pendingId: string) => ["outline", "pending-detail", pendingId] as const,
+	questions: (blockId: string) => ["outline", "questions", blockId] as const,
+	digest: () => ["outline", "digest"] as const,
 };
 
 export function useOutlineSpaces(enabled: boolean) {
@@ -289,6 +292,53 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 		void queryClient.invalidateQueries({ queryKey: ["outline", kind, spaceId] });
 	}
 	void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
+	void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
+}
+
+/** The questions under a block, with who may answer which (the inbox, the side panel). */
+export function useOutlineQuestions(blockId: string | null, enabled = true) {
+	return useQuery({
+		queryKey: outlineKeys.questions(blockId ?? ""),
+		queryFn: () => api.getOutlineQuestions(blockId as string),
+		enabled: enabled && !!blockId,
+		retry: false,
+		staleTime: 5_000,
+	});
+}
+
+/** Answer questions of one space at once; questions, views and the inbox re-read after. */
+export function useAnswerOutlineQuestions(spaceId: string | null) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (answers: OutlineAnswerInput[]) => api.answerOutlineQuestions({ answers }),
+		onSettled: () => {
+			if (spaceId) invalidateOutlineSpace(queryClient, spaceId);
+			void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
+}
+
+/** What agents confirmed on the person's behalf that they have not acknowledged. */
+export function useOutlineDigest(enabled = true) {
+	return useQuery({
+		queryKey: outlineKeys.digest(),
+		queryFn: () => api.getOutlineDigest(),
+		enabled,
+		retry: false,
+	});
+}
+
+/** Acknowledge confirmations in the digest. */
+export function useMarkOutlineDigestSeen() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (pendingIds: string[]) => api.markOutlineDigestSeen(pendingIds),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: outlineKeys.digest() });
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
 }
 
 /** What waits for confirmation on a page, and its locked tasks (design §2.2, §2.6). */

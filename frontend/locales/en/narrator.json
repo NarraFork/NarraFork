@@ -2364,7 +2364,9 @@
 		"blocking_question": "Blocking question",
 		"permission": "Tool permission",
 		"plan_approval": "Plan approval",
-		"reflection": "Reflection · human decision"
+		"reflection": "Reflection · human decision",
+		"outline_decision": "Outline · your decision",
+		"outline_digest": "Outline · confirmed for you"
 	},
 	"optimizePrompt": "Optimize prompt",
 	"optimizeCancel": "Cancel optimization",
@@ -2642,5 +2644,11 @@
 			"overhead": "Scheduling / idle",
 			"after_turn": "Turn ended"
 		}
+	},
+	"outlineAttention": {
+		"questions": "{{title}} · {{count}} question(s) for you",
+		"pending": "{{summary}} · a change to your locked plan ({{count}} edit(s)) waits for your confirmation",
+		"digest": "{{count}} change(s) an agent confirmed on your behalf",
+		"from": "From: {{narrator}}"
 	}
 }

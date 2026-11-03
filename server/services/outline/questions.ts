@@ -606,6 +606,9 @@ async function askQuestions(
 		output: lines.join("\n"),
 		metadata: {
 			tool: "Ask",
+			space: { key: space.key, kind: space.kind },
+			under: `${space.key}/${anchor.block.sid}`,
+			addresses: result.results.slice(0, ops.length).map((r) => r.address),
 			spaceId: space.id,
 			groupBlockId: anchor.block.id,
 			blockIds: result.results.slice(0, ops.length).map((r) => r.blockId),

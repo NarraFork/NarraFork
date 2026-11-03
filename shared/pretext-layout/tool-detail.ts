@@ -3470,6 +3470,64 @@ function classifyOutline(
 			}),
 		]);
 	}
+	if (toolName === "Ask") {
+		// The questions asked, each linking to its block; the block they are under links too: its
+		// side panel shows the questions with the answer form.
+		const input = asObject(inputJson);
+		const questions = Array.isArray(input?.questions) ? (input.questions as unknown[]) : [];
+		const addresses = stringArray(metadata?.addresses);
+		const under = metadata ? readLeafText(metadata.under) : undefined;
+		const underHref = outlineAddressPath(under);
+		const entries: ToolStructuredEntry[] = [];
+		let k = 0;
+		const push = (raw: unknown, sub: boolean) => {
+			const q = asObject(raw) ?? {};
+			const address = addresses[k++];
+			const href = outlineAddressPath(address);
+			const options = stringArray(q.options);
+			const rec = q.recommend;
+			const recommended =
+				typeof rec === "number" ? options[rec - 1] : readLeafText(rec as unknown) || undefined;
+			entries.push({
+				title: `${sub ? "↳ " : ""}${readLeafText(q.question) ?? ""}`,
+				...(href ? { href } : {}),
+				...(options.length > 0 ? { meta: options.map((o, i) => `${i + 1}. ${o}`).join("  ") } : {}),
+				badges: chips([chip(recommended ? `→ ${recommended}`.slice(0, 60) : undefined, "teal")]),
+			});
+		};
+		for (const raw of questions.slice(0, 10)) {
+			push(raw, false);
+			const items = asObject(raw)?.items;
+			if (Array.isArray(items)) for (const item of items.slice(0, 10)) push(item, true);
+		}
+		return sections([
+			section(
+				"meta.ask",
+				undefined,
+				metaRows([
+					under ? pathRow(under, underHref ? { href: underHref } : {}) : null,
+					badgeRow(
+						chips([
+							chip(spaceKey, "teal"),
+							chip(metadata?.proceed === true ? "went ahead" : undefined, "yellow"),
+						]),
+					),
+				]),
+			),
+			entries.length > 0
+				? section("output.questions", undefined, {
+						kind: "structured",
+						badgeRows: 1,
+						badges: chips([chip(`${entries.length} questions`, "teal")]),
+						bodyLines: [],
+						entries,
+					})
+				: null,
+			outputJson != null
+				? textSection("output.main", outputJson, "result", { format: "markdown" })
+				: null,
+		]);
+	}
 	if (toolName === "OutlineEdit") {
 		const edits = asObject(inputJson)?.edits;
 		// What each edit touched, once committed: one summary per edit, in order.

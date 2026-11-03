@@ -293,5 +293,42 @@
 		"taskRemoved": "去掉复选框",
 		"taskDue": "截止：{{date}}",
 		"taskAssignee": "指派：{{name}}"
+	},
+	"questions": {
+		"title": "提问",
+		"under": "「{{title}}」下的提问",
+		"single": "一条提问及其细项",
+		"openInOutline": "在大纲中打开",
+		"askedOf": "问 {{name}}",
+		"askedBy": "{{title}} 提问",
+		"proceeded": "agent 已先按建议做",
+		"recommended": "建议：{{choice}}",
+		"recommendedWhy": "建议：{{choice}}（{{reason}}）",
+		"recommendedMark": "（建议）",
+		"theRecommendation": "采纳建议",
+		"answeredBy": "{{name}} 已回答：{{choice}}",
+		"answeredRelayed": "{{name}} 在对话里回答：{{choice}}",
+		"withdrawn": "已撤回",
+		"waitingFor": "等 {{name}} 回答",
+		"notePlaceholder": "补充说明，或用自己的话回答",
+		"answerPlaceholder": "你的回答",
+		"adoptAll": "全部采纳建议（{{count}}）",
+		"submit": "回答",
+		"nothingToSend": "先选一个选项或写下回答",
+		"answered": "已回答 {{count}} 条提问，已通知 agent",
+		"answerFailed": "回答没有保存",
+		"loadFailed": "提问加载失败",
+		"none": "这里没有提问",
+		"truncated": "提问比显示的多：先回答这些"
+	},
+	"digest": {
+		"intro": "你指定代你确认的会话确认了你锁定计划里的这些改动；不同意的可以撤回。",
+		"empty": "没有代你确认的改动",
+		"changes": "{{count}} 处改动",
+		"confirmedBy": "{{title}} 代确认",
+		"revert": "撤回",
+		"reverted": "已撤回",
+		"revertFailed": "撤回失败",
+		"gotIt": "知道了"
 	}
 }

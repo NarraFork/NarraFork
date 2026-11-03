@@ -242,7 +242,13 @@ export function OutlinePendingList({
 	);
 }
 
-function PendingDetail({ spaceId, summary }: { spaceId: string; summary: OutlinePendingSummary }) {
+export function PendingDetail({
+	spaceId,
+	summary,
+}: {
+	spaceId: string;
+	summary: OutlinePendingSummary;
+}) {
 	const { t } = useTranslation("outline");
 	const detail = useOutlinePendingDetail(summary.id);
 	const decide = useDecideOutlinePending(spaceId);
