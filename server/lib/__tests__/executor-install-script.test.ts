@@ -20,6 +20,7 @@ const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 const SHA256 = "a".repeat(64);
 const TICKET = "b".repeat(64);
+const unixTest = process.platform === "win32" ? test.skip : test;
 
 function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorInstallScriptInput {
 	const platform: ExecutorPlatform = overrides.platform ?? "linux-amd64";
@@ -44,6 +45,7 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 // not -EncodedCommand (Windows has a 32 KiB command-line limit). No installer is executed.
 function runNativePowerShell(source: string, compileOnly = false) {
 	const harness = [
+		"$ProgressPreference = 'SilentlyContinue'",
 		"$ErrorActionPreference = 'Stop'",
 		"$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))",
 		compileOnly
@@ -291,7 +293,7 @@ describe("the one-line install command", () => {
 	 * shell exit status and no string assertion can establish it. `false` stands in
 	 * for a failing fetch: same "substitution produced nothing" shape, no network.
 	 */
-	test("the generated command really exits non-zero when the fetch fails", async () => {
+	unixTest("the generated command really exits non-zero when the fetch fails", async () => {
 		const oneLiner = buildExecutorInstallOneLiner({
 			scriptUrl: "https://nf.example.com/api/executor/install/linux-amd64?ticket=abc",
 			shell: "sh",
