@@ -63,7 +63,7 @@ import {
 	clearBufferedMessageSoftStopIfIdle,
 	clearBufferedMessages,
 	getBufferedMessagesAsync,
-	isOutlineSessionGoal,
+	isRefusedOutlineGoal,
 	pushBufferedMessage,
 	removeBufferedMessage,
 	resolveDecisionNarratorId,
@@ -504,7 +504,7 @@ export function* toolInputFrames(message: ToolInputChunkMessage): Generator<stri
 type InputLaneSocket = Pick<NarratorWS, "send" | "close" | "getBufferedAmount">;
 const INPUT_LANE_BACKLOG_BYTES = 256 * 1024;
 
-/** What a `/goal` queued over this socket for an outline session is answered with (English, as the
+/** What a `/goal` queued over this socket for an outline subagent is answered with (English, as the
  * socket's other errors; the HTTP admission carries the localized catalog code). */
 const OUTLINE_GOAL_REFUSAL = ERROR_CATALOG.GOAL_IN_OUTLINE_SESSION.en;
 
@@ -2167,9 +2167,9 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
-				// A session whose tasks live in the outline has no /goal yet (plan PR 5): refused
-				// before anything is queued, as the HTTP admission refuses it.
-				if (await isOutlineSessionGoal(msg.narratorId, bufferText, commandText)) {
+				// An outline subagent has no tasks of its own to add a /goal to: refused before
+				// anything is queued, as the HTTP admission refuses it.
+				if (await isRefusedOutlineGoal(msg.narratorId, bufferText, commandText)) {
 					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
 					break;
 				}
@@ -2231,7 +2231,7 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_buffer": {
-				if (await isOutlineSessionGoal(msg.narratorId, msg.text)) {
+				if (await isRefusedOutlineGoal(msg.narratorId, msg.text)) {
 					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
 					break;
 				}

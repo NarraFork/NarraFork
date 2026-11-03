@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4e039a4a-0fa4-48d4-b9af-27dcf6a84b00",
+  "id": "733d53a7-7aa4-459e-b0f2-04ee1fd93bd4",
   "prevId": "b58ddeb0-149b-4b26-92a5-2183c3628441",
   "tables": {
     "acl_events": {
@@ -14369,13 +14369,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "ask_json": {
-          "name": "ask_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "alias": {
           "name": "alias",
           "type": "text",
@@ -14536,13 +14529,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "ask_json": {
-          "name": "ask_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "author_kind": {
           "name": "author_kind",
           "type": "text",
@@ -14638,6 +14624,24 @@
           ],
           "isUnique": false,
           "where": "json_extract(\"task_json\", '$.lock') IS NOT NULL AND \"deleted\" = 0"
+        },
+        "idx_outline_blocks_active_tasks": {
+          "name": "idx_outline_blocks_active_tasks",
+          "columns": [
+            "space_id"
+          ],
+          "isUnique": false,
+          "where": "\"deleted\" = 0 AND (json_extract(\"task_json\", '$.status') = 'doing' OR (json_extract(\"task_json\", '$.status') = 'todo' AND json_extract(\"task_json\", '$.lock') IS NOT NULL))"
+        },
+        "idx_outline_blocks_finished_tasks": {
+          "name": "idx_outline_blocks_finished_tasks",
+          "columns": [
+            "space_id",
+            "version_seq",
+            "id"
+          ],
+          "isUnique": false,
+          "where": "json_extract(\"task_json\", '$.status') IN ('done', 'cancelled') AND \"deleted\" = 0"
         }
       },
       "foreignKeys": {
@@ -15142,13 +15146,6 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
-        },
-        "digest_seen_at": {
-          "name": "digest_seen_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
         }
       },
       "indexes": {
@@ -15207,14 +15204,6 @@
             "decision_commit_id"
           ],
           "isUnique": true
-        },
-        "idx_outline_pending_digest": {
-          "name": "idx_outline_pending_digest",
-          "columns": [
-            "decider_user_id"
-          ],
-          "isUnique": false,
-          "where": "\"status\" = 'confirmed' AND \"digest_seen_at\" IS NULL AND json_extract(\"decided_by_json\", '$.kind') = 'agent'"
         }
       },
       "foreignKeys": {
@@ -15224,148 +15213,6 @@
           "tableTo": "outline_spaces",
           "columnsFrom": [
             "space_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "outline_questions": {
-      "name": "outline_questions",
-      "columns": {
-        "block_id": {
-          "name": "block_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "space_id": {
-          "name": "space_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "state": {
-          "name": "state",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "proceed": {
-          "name": "proceed",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        },
-        "to_user_id": {
-          "name": "to_user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "asker_narrator_id": {
-          "name": "asker_narrator_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "asker_user_id": {
-          "name": "asker_user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "asker_tool_call_id": {
-          "name": "asker_tool_call_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "answered_at": {
-          "name": "answered_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "answer_commit_id": {
-          "name": "answer_commit_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "delivered_at": {
-          "name": "delivered_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_outline_questions_to_open": {
-          "name": "idx_outline_questions_to_open",
-          "columns": [
-            "to_user_id"
-          ],
-          "isUnique": false,
-          "where": "\"state\" = 'open'"
-        },
-        "idx_outline_questions_space_open": {
-          "name": "idx_outline_questions_space_open",
-          "columns": [
-            "space_id"
-          ],
-          "isUnique": false,
-          "where": "\"state\" = 'open'"
-        },
-        "idx_outline_questions_asker_open": {
-          "name": "idx_outline_questions_asker_open",
-          "columns": [
-            "asker_narrator_id"
-          ],
-          "isUnique": false,
-          "where": "\"state\" = 'open'"
-        },
-        "idx_outline_questions_undelivered": {
-          "name": "idx_outline_questions_undelivered",
-          "columns": [
-            "answered_at"
-          ],
-          "isUnique": false,
-          "where": "\"state\" = 'answered' AND \"delivered_at\" IS NULL"
-        }
-      },
-      "foreignKeys": {
-        "outline_questions_block_id_outline_blocks_id_fk": {
-          "name": "outline_questions_block_id_outline_blocks_id_fk",
-          "tableFrom": "outline_questions",
-          "tableTo": "outline_blocks",
-          "columnsFrom": [
-            "block_id"
           ],
           "columnsTo": [
             "id"

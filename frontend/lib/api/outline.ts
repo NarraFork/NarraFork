@@ -23,6 +23,15 @@ import type {
 	OutlineViewStatePutRequest,
 	OutlineViewStateResponse,
 } from "@shared/outline-api";
+import type {
+	NarratorCurrentTaskResponse,
+	OutlineBoardAddRequest,
+	OutlineBoardAddResponse,
+	OutlineBoardFinishedResponse,
+	OutlineBoardTaskUpdateRequest,
+	OutlineBoardTaskUpdateResponse,
+	OutlineTaskBoardResponse,
+} from "@shared/outline-task-board";
 import { request } from "./client";
 
 /** `?a=1&b=2` from the defined values, or "" when there are none. */
@@ -145,4 +154,32 @@ export const outlineApi = {
 			method: "POST",
 			body: JSON.stringify({ pendingIds }),
 		}),
+	/** A session's task board (its dock tab). */
+	getSessionTaskBoard: (narratorId: string) =>
+		request<OutlineTaskBoardResponse>(`/outline/narrators/${enc(narratorId)}/tasks`),
+	/** A project's task board, a page of spaces at a time. */
+	getProjectTaskBoard: (projectId: string, cursor: string | null) =>
+		request<OutlineTaskBoardResponse>(
+			`/outline/projects/${enc(projectId)}/tasks${query({ cursor })}`,
+		),
+	/** A space's next finished tasks. */
+	getFinishedTasks: (spaceId: string, cursor: string) =>
+		request<OutlineBoardFinishedResponse>(
+			`/outline/spaces/${enc(spaceId)}/tasks/finished${query({ cursor })}`,
+		),
+	/** A person adds a task to a session. */
+	addBoardTask: (narratorId: string, body: OutlineBoardAddRequest) =>
+		request<OutlineBoardAddResponse>(`/outline/narrators/${enc(narratorId)}/tasks`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** A person changes one task on the board. */
+	updateBoardTask: (blockId: string, body: OutlineBoardTaskUpdateRequest) =>
+		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
+			method: "PATCH",
+			body: JSON.stringify(body),
+		}),
+	/** The status bar's current task, from the session's task source (either backend). */
+	getNarratorCurrentTask: (narratorId: string) =>
+		request<NarratorCurrentTaskResponse>(`/narrators/${enc(narratorId)}/tasks/current`),
 };

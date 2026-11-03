@@ -565,7 +565,11 @@ test("refused outline goal leaves the adopted language and mailbox unchanged", a
 	await initialChineseTurn();
 	await englishOwnerPreference();
 	settings.outline.enabled = true;
-	db.update(narrators).set({ taskBackend: "outline" }).where(eq(narrators.id, recipient)).run();
+	// Outline sessions take `/goal`; only an outline subagent refuses it.
+	db.update(narrators)
+		.set({ taskBackend: "outline", type: "subagent" })
+		.where(eq(narrators.id, recipient))
+		.run();
 	(await import("../task-source/backend")).invalidateTaskBackend(recipient);
 	const before = mailbox().length;
 	const response = await (await ownerRoutes()).request(`/${recipient}/messages`, {

@@ -747,7 +747,7 @@ export async function runAgentLoopUnlocked(
 					goalCommand.objective,
 				);
 				if (refused) {
-					// An outline session's queued /goal was dropped unsaved; drain on.
+					// A queued /goal an outline subagent cannot take was dropped unsaved; drain on.
 					pendingBufferedDelivery = undefined;
 					if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
 						runState.wasInterrupted = true;

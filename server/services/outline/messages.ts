@@ -122,6 +122,9 @@ export const OUTLINE_TEXT = {
 		/** An agent's write to the session's behavior page without the user turn's grant. */
 		behaviorPageReadonly:
 			"the behavior page of this session (alias behavior) holds the user's standing rules: you may write it only as the first tool call of a user turn in which the user asked you to record a rule",
+		/** An agent's write giving or taking the task page's alias, moving or deleting the page. */
+		tasksPageReserved:
+			"the task page of this session (alias tasks) is where people add their tasks: you may add and change blocks under it, but not give or take its alias, nor move or delete the page",
 	},
 	/** Summary of the commit that imports a session's old behavior fence into its page. */
 	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",

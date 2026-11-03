@@ -1,49 +1,70 @@
-import { afterAll, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import { mediaRefToContentBlock } from "@shared/media-attachments";
 import { drizzle } from "drizzle-orm/pg-proxy";
 
 const realDb = { ...(await import("../../db")) };
 const queries: { sql: string; params: unknown[] }[] = [];
-const block = mediaRefToContentBlock({
-	mediaId: "media",
+const MEDIA_ID = "media-01";
+const IMAGE_ID = "image-01";
+const mediaBlock = mediaRefToContentBlock({
+	mediaId: MEDIA_ID,
 	mediaType: "audio/wav",
 	filename: "a.wav",
 	size: 60,
 	uploadNarratorId: "source",
 });
-let mode: "message" | "tool" = "message";
+const imageBlock = {
+	type: "image",
+	imageId: IMAGE_ID,
+	filename: "a.png",
+	mediaType: "image/png",
+	uploadNarratorId: "source",
+};
+const imagesOutput = {
+	_text: "inspected",
+	_images: [{ imageId: IMAGE_ID, mediaType: "image/png", uploadNarratorId: "source" }],
+};
+
+/** What the second window's candidate holds, and what its tool call stores. */
+let fixture: { content: unknown[]; output: unknown | undefined };
 let revoked = false;
+
+// The jsonText codec JSON.parses every stored value on read, so a row's driver value is
+// the JSON text of what the application stored. A plain-string tool output arrives as
+// JSON text of a string, and must stay a string after decoding.
+const stored = (value: unknown) => JSON.stringify(value);
+
 const pgDb = drizzle(async (sql, params) => {
 	queries.push({ sql, params });
 	if (sql.includes('from "narrator_message_refs"') && !sql.includes('join "narrator_messages"')) {
 		return { rows: revoked ? [] : [[params[0]]] };
 	}
 	if (sql.includes('from "narrator_message_refs"')) {
-		const secondPage = params.includes("ref-15");
-		const rows = secondPage
-			? [["message-16", "other", 0, "ref-16", JSON.stringify(mode === "message" ? [block] : [])]]
-			: Array.from({ length: 16 }, (_, i) => [
-					`message-${i}`,
-					"other",
-					0,
-					`ref-${String(i).padStart(2, "0")}`,
-					"[]",
-				]);
-		return { rows };
+		// Keys: a full first read of 256 small refs, then one more ref in the second read.
+		if (params.includes("ref-255")) return { rows: [["ref-256", 0, "message-256", "100"]] };
+		return {
+			rows: Array.from({ length: 256 }, (_, i) => [
+				`ref-${String(i).padStart(3, "0")}`,
+				0,
+				`message-${i}`,
+				"100",
+			]),
+		};
+	}
+	if (sql.includes('from "narrator_messages"') && sql.includes("strpos(")) {
+		// The candidate test: only message-256 holds the id.
+		return { rows: params.includes("message-256") ? [["message-256"]] : [] };
+	}
+	if (sql.includes('from "narrator_messages"')) {
+		return { rows: [["message-256", "other", stored(fixture.content)]] };
 	}
 	if (sql.includes('from "narrator_tool_calls"')) {
-		if (mode === "tool" && params.includes("tool-63"))
-			return { rows: [["tool-64", "message-0", "source", JSON.stringify({ _media: [block] })]] };
-		if (mode === "tool")
-			return {
-				rows: Array.from({ length: 64 }, (_, i) => [
-					`tool-${String(i).padStart(2, "0")}`,
-					"message-0",
-					"source",
-					"{}",
-				]),
-			};
-		return { rows: [] };
+		return {
+			rows:
+				fixture.output === undefined
+					? []
+					: [["tool-1", "message-256", "other", stored(fixture.output)]],
+		};
 	}
 	throw new Error(`Unexpected PostgreSQL query: ${sql}`);
 });
@@ -61,41 +82,62 @@ mock.module("../../db", () => ({
 	sqlite: unavailable,
 	postgresRuntime: { client: { db: pgDb } },
 }));
-const { narratorReferencesMedia } = await import("../narrator-media-access");
+const { narratorReferencesMedia, narratorReferencesImage } = await import(
+	"../narrator-media-access"
+);
 afterAll(() => {
 	mock.module("../../db", () => realDb);
 	mock.restore();
 });
-
-test("PostgreSQL pages exact message references without accessing SQLite", async () => {
-	mode = "message";
+beforeEach(() => {
 	queries.length = 0;
-	expect(await narratorReferencesMedia("context", "source", "media")).toBe(true);
-	expect(queries.filter((q) => q.sql.includes('join "narrator_messages"'))).toHaveLength(2);
-	expect(queries[0].params).toContain("context");
-	expect(queries[2].params).toContain("ref-15");
-	expect(await narratorReferencesMedia("context", "wrong", "media")).toBe(false);
+	revoked = false;
 });
 
-test("PostgreSQL pages tool calls joined by referenced message", async () => {
-	mode = "tool";
-	queries.length = 0;
-	expect(await narratorReferencesMedia("context", "source", "media")).toBe(true);
-	const tools = queries.filter((q) => q.sql.includes('from "narrator_tool_calls"'));
-	expect(tools).toHaveLength(2);
-	expect(tools[0].params).toContain("message-0");
-	expect(tools[1].params).toContain("tool-63");
-	const recheck = queries.find(
+const keyReads = () => queries.filter((q) => q.sql.includes('join "narrator_messages"'));
+const candidateTests = () =>
+	queries.filter((q) => q.sql.includes('from "narrator_messages"') && q.sql.includes("strpos("));
+
+test("PostgreSQL sizes windows, prefilters them in SQL and decodes only candidates", async () => {
+	fixture = { content: [mediaBlock], output: undefined };
+	expect(await narratorReferencesMedia("context", "source", MEDIA_ID)).toBe(true);
+	expect(keyReads()).toHaveLength(2);
+	expect(keyReads()[0].sql).toContain("octet_length(");
+	expect(keyReads()[0].params).toContain("context");
+	expect(keyReads()[1].params).toContain("ref-255");
+	expect(candidateTests()).toHaveLength(2);
+	expect(candidateTests()[0].params).toContain(MEDIA_ID);
+	const bodies = queries.filter(
 		(q) =>
-			q.sql.includes('from "narrator_message_refs"') && !q.sql.includes('join "narrator_messages"'),
+			q.sql.includes('from "narrator_messages"') &&
+			!q.sql.includes("join") &&
+			!q.sql.includes("strpos("),
 	);
-	expect(recheck?.params).toContain("ref-00");
-	expect(recheck?.params).toContain("message-0");
-	expect(recheck?.params).toContain("context");
+	expect(bodies).toHaveLength(1);
+	expect(bodies[0].params).toEqual(["message-256"]);
+	expect(await narratorReferencesMedia("context", "wrong", MEDIA_ID)).toBe(false);
+});
+
+test("PostgreSQL proves image references in content and tool output, re-checking the ref", async () => {
+	fixture = { content: [imageBlock], output: undefined };
+	expect(await narratorReferencesImage("context", "source", IMAGE_ID)).toBe(true);
+	expect(await narratorReferencesImage("context", "wrong", IMAGE_ID)).toBe(false);
+
+	fixture = { content: [], output: imagesOutput };
+	expect(await narratorReferencesImage("context", "source", IMAGE_ID)).toBe(true);
+	const tools = queries.filter((q) => q.sql.includes('from "narrator_tool_calls"'));
+	expect(tools.at(-1)?.sql).toContain("strpos(");
+	expect(tools.at(-1)?.params).toContain("message-256");
 	revoked = true;
-	try {
-		expect(await narratorReferencesMedia("context", "source", "media")).toBe(false);
-	} finally {
-		revoked = false;
-	}
+	expect(await narratorReferencesImage("context", "source", IMAGE_ID)).toBe(false);
+});
+
+test("PostgreSQL never re-parses a plain-string tool output into a reference", async () => {
+	fixture = { content: [], output: JSON.stringify(imagesOutput) };
+	expect(await narratorReferencesImage("context", "source", IMAGE_ID)).toBe(false);
+	fixture = { content: [], output: JSON.stringify({ _media: [mediaBlock] }) };
+	expect(await narratorReferencesMedia("context", "source", MEDIA_ID)).toBe(false);
+	// The structured form of the same media output still counts.
+	fixture = { content: [], output: { _media: [mediaBlock] } };
+	expect(await narratorReferencesMedia("context", "source", MEDIA_ID)).toBe(true);
 });

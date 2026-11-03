@@ -39,6 +39,7 @@ import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useSta
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
+import { useNarratorCurrentTask } from "../../../hooks/useTaskBoard";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import { lazyWithRetry } from "../../../lib/lazy-with-retry";
@@ -596,22 +597,25 @@ export function DetailsDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPa
 // ── Spec ──
 export function SpecDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("narrator");
+	const { t: tOutline } = useTranslation("outline");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
 	const close = useCallback(() => props.api.close(), [props.api]);
+	// A session whose tasks live in the outline shows its task board here (outline P2 PR 5).
+	const backend = useNarratorCurrentTask(narratorId).data?.backend;
+	const panelTitle = backend === "outline" ? tOutline("board.title") : t("spec.title");
 
 	// Sync Dockview tab title with localization
 	useLayoutEffect(() => {
-		const title = t("spec.title");
-		if (title && title !== props.api.title) {
-			props.api.setTitle(title);
+		if (panelTitle && panelTitle !== props.api.title) {
+			props.api.setTitle(panelTitle);
 		}
-	}, [t, props.api]);
+	}, [panelTitle, props.api]);
 
 	return (
 		<ToolPanelShell
-			title={t("spec.title")}
+			title={panelTitle}
 			icon={<IconNotebook size={16} color="var(--mantine-color-indigo-4)" />}
 			props={props}
 			subjectId="__spec__"

@@ -544,6 +544,23 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out;
 	},
 
+	async getBlockHeads(ids) {
+		const out: Array<{ id: string; contentHead: string }> = [];
+		for (const chunk of chunked(ids)) {
+			out.push(
+				...db
+					.select({
+						id: outlineBlocks.id,
+						contentHead: sql<string>`substr(${outlineBlocks.content}, 1, ${OUTLINE_PAGE_HEAD_CHARS})`,
+					})
+					.from(outlineBlocks)
+					.where(inArray(outlineBlocks.id, chunk))
+					.all(),
+			);
+		}
+		return out;
+	},
+
 	async findLiveBlocks(spaceIds, by, limit) {
 		const out: OutlineBlockRow[] = [];
 		for (const spaces of chunked(spaceIds)) {

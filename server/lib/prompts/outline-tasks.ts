@@ -423,3 +423,117 @@ const specUnavailable: LocalizedValue<string> = {
 export function getOutlineSpecUnavailableHint(locale: Locale): string {
 	return pickLocalizedValue(specUnavailable, locale);
 }
+
+// ─── People's changes to the session's tasks (outline P2 PR 5) ───
+
+/** One change a person made to a task of the session (the board, the outline editor). */
+export type OutlineTaskEditChange =
+	| { kind: "added" | "deleted" | "unchecked" | "moved" | "locked" | "unlocked" | "fields" }
+	| { kind: "status"; from: "todo" | "doing" | "done" | "cancelled" | null; to: string }
+	| { kind: "assigned"; to: string | null }
+	/** The person rejected the agent's marking a locked goal done or cancelled (D26b). */
+	| { kind: "rejected"; status: "done" | "cancelled"; reason: string | null };
+
+export interface OutlineTaskEdit {
+	/** `key/sid`. */
+	address: string;
+	title: string;
+	/** Created by a person (`/goal`, the board). */
+	humanCreated: boolean;
+	locked: boolean;
+	changes: OutlineTaskEditChange[];
+}
+
+/** The changes one person made, as a note lists them. */
+export interface OutlineTaskEditGroup {
+	/** The person's name (a username), never their words: the note is the system's. */
+	person: string;
+	edits: OutlineTaskEdit[];
+}
+
+const STATUS_WORDS: Record<string, LocalizedValue<string>> = {
+	todo: { en: "to do", "zh-CN": "待办" },
+	doing: { en: "in progress", "zh-CN": "进行中" },
+	done: { en: "done", "zh-CN": "完成" },
+	cancelled: { en: "cancelled", "zh-CN": "取消" },
+};
+
+function editStatusWord(status: string, locale: Locale): string {
+	return pickLocalizedValue(STATUS_WORDS[status] ?? { en: status, "zh-CN": status }, locale);
+}
+
+function changeText(change: OutlineTaskEditChange, locale: Locale): string {
+	const zh = locale === "zh-CN";
+	switch (change.kind) {
+		case "added":
+			return zh ? "新加" : "added";
+		case "deleted":
+			return zh ? "删除" : "deleted";
+		case "unchecked":
+			return zh ? "去掉了复选框，不再是任务" : "no longer a task (checkbox removed)";
+		case "moved":
+			return zh ? "移动了位置" : "moved";
+		case "locked":
+			return zh ? "锁定" : "locked";
+		case "unlocked":
+			return zh ? "解锁" : "unlocked";
+		case "fields":
+			return zh ? "改了前置或截止日期" : "prerequisites or due date changed";
+		case "assigned":
+			return change.to
+				? zh
+					? `交给 @${change.to}`
+					: `handed to @${change.to}`
+				: zh
+					? "交回本会话（去掉指派）"
+					: "handed back to this session (assignee removed)";
+		case "status": {
+			if (change.to === "todo" && (change.from === "done" || change.from === "cancelled"))
+				return zh ? "重开（回到待办）" : "reopened (back to to do)";
+			return zh
+				? `改成${editStatusWord(change.to, locale)}`
+				: `set to ${editStatusWord(change.to, locale)}`;
+		}
+		case "rejected": {
+			const reason = change.reason
+				? zh
+					? `，理由：${change.reason}`
+					: `; reason: ${change.reason}`
+				: "";
+			return zh
+				? `退回了你把它标为${editStatusWord(change.status, locale)}的改动${reason}。它仍未完成，接着做`
+				: `rejected your marking it ${editStatusWord(change.status, locale)}${reason}. It is still open; carry on with it`;
+		}
+	}
+}
+
+/**
+ * The notice people's changes to the session's tasks leave for the agent: a system notice (not
+ * the user speaking), grouped by who made them, one line per task with its address. Only what the
+ * outline holds: names, task titles, the changes. Delivered at the next tool boundary while the
+ * agent works, else ahead of its next turn.
+ */
+export function getOutlineTaskEditNote(
+	groups: readonly OutlineTaskEditGroup[],
+	more: number,
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const blocks = groups.map((group) => {
+		const lines = group.edits.map((edit) => {
+			const marks = [
+				edit.humanCreated ? (zh ? "人建" : "set by a person") : null,
+				edit.locked ? (zh ? "已锁定" : "locked") : null,
+			].filter(Boolean);
+			const tail = marks.length > 0 ? ` (${marks.join(zh ? "，" : ", ")})` : "";
+			const what = edit.changes.map((c) => changeText(c, locale)).join(zh ? "；" : "; ");
+			return `- \`${edit.address}\` ${edit.title}${tail}${zh ? "：" : ": "}${what}`;
+		});
+		return `${zh ? `${group.person}：` : `${group.person}:`}\n${lines.join("\n")}`;
+	});
+	if (more > 0)
+		blocks.push(zh ? `还有 ${more} 处改动未列出。` : `${more} more changes not listed.`);
+	return zh
+		? `系统通知（不是用户发言）：有人在界面上改了本会话的任务。\n\n${blocks.join("\n\n")}\n\n请据此调整你的工作；要确认细节就用 OutlineRead 读这些任务。`
+		: `System notice (not the user speaking): people changed tasks of this session in the interface.\n\n${blocks.join("\n\n")}\n\nAdjust your work to these changes; read the tasks with OutlineRead if you need the details.`;
+}

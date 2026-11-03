@@ -125,7 +125,9 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 				(await deriveOutlineTaskWaits([subject], { store: ctx.store })).get(s.task)?.people,
 			).toBe(true);
 			expect(
-				(await ctx.store.listOpenQuestionsBySpace(s.space.id, 10)).map((r) => r.blockId),
+				(await ctx.store.listOpenQuestionsBySpaces([s.space.id, "no-such-space"], 10)).map(
+					(r) => r.blockId,
+				),
 			).toEqual([q]);
 			expect(
 				(await ctx.store.listOpenQuestionsByAsker(s.narratorId, 10)).map((r) => r.blockId),
@@ -317,6 +319,26 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 				{ op: "insert", parent: { id: q1a as string }, content: "Q deeper", ask: ask(s.person) },
 			]);
 			const q1b = deep.results[0]?.blockId as string;
+			// Open questions of many spaces in one read, at most so many of each, oldest first.
+			const elsewhere = await ctx.store.ensureSpace(
+				{ kind: "session", narratorId: s.narratorId },
+				NOW,
+			);
+			const third = await ctx.seedUser();
+			const there = await agentAsks(ctx, elsewhere, s.narratorId, s.person, [
+				{ op: "insert", parent: null, content: "Q elsewhere", ask: ask(third) },
+			]);
+			const capped = await ctx.store.listOpenQuestionsBySpaces([s.space.id, elsewhere.id], 2);
+			const here = [q1, q1a, q2, q3, top, onFact, q1b].sort() as string[];
+			const bySpaceThenId = (a: string[], b: string[]) =>
+				(a[0] as string) < (b[0] as string) ? -1 : (a[0] as string) > (b[0] as string) ? 1 : 0;
+			expect(capped.map((r) => [r.spaceId, r.blockId])).toEqual(
+				[
+					[s.space.id, here[0] as string],
+					[s.space.id, here[1] as string],
+					[elsewhere.id, there.results[0]?.blockId as string],
+				].sort(bySpaceThenId),
+			);
 			const { groups, truncated } = await listQuestionGroupsForUser(s.person, { store: ctx.store });
 			expect(truncated).toBe(false);
 			const byGroup = new Map(groups.map((g) => [g.groupBlockId, g]));

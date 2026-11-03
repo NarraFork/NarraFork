@@ -266,7 +266,8 @@ async function nearestTasks(
 /**
  * Of the given tasks, those an unanswered question waits under (D27b): the question's nearest
  * task above it waits, unless the asker went ahead with its recommendation (`proceed`). One read
- * of the space's open questions (at most {@link OUTLINE_QUESTION_LIMITS.waitScan}), then the
+ * of the spaces' open questions, however many spaces (at most
+ * {@link OUTLINE_QUESTION_LIMITS.waitScan} of each), then, only in spaces that have some, the
  * questions' ancestors level by level.
  */
 export async function questionWaits(
@@ -281,11 +282,20 @@ export async function questionWaits(
 		set.add(task.id);
 		bySpace.set(task.spaceId, set);
 	}
-	for (const [spaceId, wanted] of bySpace) {
-		const open = (
-			await store.listOpenQuestionsBySpace(spaceId, OUTLINE_QUESTION_LIMITS.waitScan)
-		).filter((q) => !q.proceed);
-		if (open.length === 0) continue;
+	if (bySpace.size === 0) return out;
+	const openBySpace = new Map<string, OutlineQuestionRow[]>();
+	for (const q of await store.listOpenQuestionsBySpaces(
+		[...bySpace.keys()],
+		OUTLINE_QUESTION_LIMITS.waitScan,
+	)) {
+		if (q.proceed) continue;
+		const list = openBySpace.get(q.spaceId);
+		if (list) list.push(q);
+		else openBySpace.set(q.spaceId, [q]);
+	}
+	for (const [spaceId, open] of openBySpace) {
+		const wanted = bySpace.get(spaceId);
+		if (!wanted) continue;
 		const metas = await store.getBlockMetas(spaceId, { ids: open.map((q) => q.blockId) });
 		const live = metas.filter((m) => !m.deleted && m.askJson !== null);
 		for (const task of (await nearestTasks(store, spaceId, live, { includeSelf: false })).values())
