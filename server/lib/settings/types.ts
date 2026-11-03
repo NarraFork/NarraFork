@@ -398,6 +398,8 @@ export interface McpServerConfig {
 
 export interface TlsConfig {
 	enabled: boolean;
+	/** Reissue built-in certificates on startup when SANs change. Defaults to true. */
+	autoReissue?: boolean;
 	/** Path to PEM-formatted TLS certificate file. */
 	certFile: string;
 	/** Path to PEM-formatted TLS private key file. */

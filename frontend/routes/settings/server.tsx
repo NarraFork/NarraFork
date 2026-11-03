@@ -38,6 +38,8 @@ function SettingsServerPage() {
 				handlePwaUpdate={handlePwaUpdate}
 				tlsEnabled={is.tlsEnabled}
 				setTlsEnabled={is.setTlsEnabled}
+				tlsAutoReissue={is.tlsAutoReissue}
+				setTlsAutoReissue={is.setTlsAutoReissue}
 				tlsCertFile={is.tlsCertFile}
 				setTlsCertFile={is.setTlsCertFile}
 				tlsKeyFile={is.tlsKeyFile}
