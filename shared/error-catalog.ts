@@ -130,11 +130,14 @@ export const ERROR_CATALOG = {
 		code: "SPEC_OUTLINE_SESSION",
 		en: "This session keeps its tasks in the outline, so its Dynamic Spec tasks and notes are not used. Only the behavior fence still applies.",
 	},
-	/** `/goal` in such a session: its outline form arrives with the task board. */
+	/**
+	 * `/goal` sent to a subagent of such a session: the goal is a task of the session, and an
+	 * outline subagent has no tasks of its own (D27c).
+	 */
 	GOAL_IN_OUTLINE_SESSION: {
 		status: 409,
 		code: "SPEC_OUTLINE_SESSION",
-		en: "/goal is not available yet in sessions whose tasks live in the outline. Ask the agent to write the goal as a task instead.",
+		en: "/goal adds a task to the session itself. Send it in the main session, not to a subagent.",
 	},
 
 	// --- git -------------------------------------------------------------------

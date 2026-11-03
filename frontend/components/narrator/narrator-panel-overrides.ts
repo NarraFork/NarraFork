@@ -148,6 +148,8 @@ export type BufferedSendResult = {
 	specGoalQueued?: boolean;
 	/** The protected task text carried by a queued `/goal`. */
 	objective?: string;
+	/** `outline` when the session keeps its tasks in the outline (outline P2 PR 5). */
+	taskBackend?: "outline";
 };
 
 export function getMessageViewportScrollBottom(scroller: HTMLElement) {

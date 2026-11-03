@@ -195,6 +195,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 | `bg_bash` | `tasksDone` (bash) | `onNextTurn` | 后台 bash 任务完成 |
 | `subagent_message` | `messages` | `onNextTurn` | 子代理 `Send({ id: "parent" })` + `subagent_messages` extraBlock |
 | `spec_update` | `specUpdates` | `onNextTurn` | 用户在 UI 编辑 spec 文件（仅空闲回退路径） |
+| `outline_task_edit` | `prose` | `onNextTurn` | 大纲会话运行中有人改了它的任务（看板、大纲编辑器、退回目标完成）：`outline-task-edits.ts` 在内存里攒着，本函数在工具边界取走（`takeOutlineTaskEditNotice`，仅主会话，子代理不取） |
 
 **空闲**路径是分开的函数，`schedule: "none"`：
 
@@ -204,6 +205,16 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 | `drainAndPersistParentInboundNotice` | `subagent_message` | 同上 |
 
 这两条空闲路径的**文本**仍来自各自原有的格式化函数（那套措辞是它们一直发送的、且在别处被断言），body 只是随行给读者。
+
+**大纲任务的人为改动（`outline_task_edit`，`server/services/outline-task-edits.ts`，outline P2 PR 5）**：一律 `role: sys`，不带 `createdBy`，正文以「系统通知（不是用户发言）」开头，按人分组写明谁改了哪个任务（地址、标题、改动），不多于大纲里本来就有的内容。改动的人可能读不到这个会话（项目空间的写者改了某个私有会话认领的任务），所以它从不作为那个人的消息、也从不成为运行的主体（principal）。按会话合并（安静 1 秒、最长 4 秒），每个人的改动各自成组：
+
+| 会话状态 | schedule | 去处 |
+|---|---|---|
+| 空闲 | `none` | 直接写一行，下一回合读到；不唤醒（有人整理任务不该花一次请求） |
+| 运行中 | `onNextTurn` | 在内存里等，下一个工具边界由 `drainInjectionsIntoHistory` 取走并写行 |
+| 运行在工具边界前就结束了 | `none` | 守望定时器（2 秒）发现运行已结束，把还在等的通知写成一行 |
+
+看板的「添加并开始」「重新打开并开始」在启动会话前先 `flushOutlineTaskEdits`，让这一回合读到通知。`/goal` 自己的提交不发通知（它的消息已经说了）。行为边界页上的复选框是规则不是任务，不发通知。
 
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
@@ -308,6 +319,8 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 ### 6.1 12 个来源标签
 
 `silent_progress`、`todo_reminder`（`living_work_spec` 映射到它）、`relaxed_plan`、`knowledge_base_hint`、`bg_agent`、`bg_bash`、`team_message`、`buffered_user`、`subagent_message`、`spec_update`、`behavior_fence`、`pipeline_exit_confirmation`。
+
+之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的两个：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）和 `outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）。
 
 ---
 

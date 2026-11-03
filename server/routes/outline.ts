@@ -1,7 +1,8 @@
 /**
  * The outline HTTP API, mounted at `/api/outline` behind session auth. Read-only views of
- * spaces, pages, history, backlinks and search, plus reverting a commit; editing goes through the
- * page's live session over WebSocket, not through here.
+ * spaces, pages, history, backlinks and search, plus reverting a commit, locks and pending
+ * changes, and the task board's changes to single tasks; editing pages goes through the page's
+ * live session over WebSocket, not through here.
  *
  * GATES, IN ORDER
  * ---------------
@@ -24,6 +25,10 @@
  *      locker, a manager of the space or an admin (403 otherwise); confirming and rejecting are
  *      for the person who locked the plan (403 otherwise; a session confirms through
  *      `OutlineEdit`).
+ *   7. The task board (P2 PR 5): a session's board needs read access to the session, a project's
+ *      board read access to the project, and lists only the session spaces the person may read.
+ *      Adding a task needs write access to the session; changing one (finish, cancel, reopen,
+ *      hand over) write access to its space (404 when it cannot be read, 403 otherwise).
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
@@ -52,12 +57,22 @@ import {
 	type OutlineTimelineResponse,
 	type OutlineViewStateResponse,
 } from "@shared/outline-api";
+import type {
+	OutlineBoardAddResponse,
+	OutlineBoardFinishedResponse,
+	OutlineBoardTaskUpdateResponse,
+	OutlineTaskBoardResponse,
+} from "@shared/outline-task-board";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
+import { getUserLanguage, getUserReplyInLanguage } from "../lib/i18n";
 import {
 	outlineBacklinksQuerySchema,
 	outlineBlockViewQuerySchema,
+	outlineBoardAddBodySchema,
+	outlineBoardTaskUpdateBodySchema,
+	outlineFinishedTasksQuerySchema,
 	outlineHistoryQuerySchema,
 	outlineIdSchema,
 	outlineLockBodySchema,
@@ -66,6 +81,7 @@ import {
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
+	outlineTaskBoardQuerySchema,
 	outlineViewStatePutSchema,
 } from "../lib/validators/outline";
 import {
@@ -98,6 +114,7 @@ import {
 	rejectOutlinePending,
 	unlockOutlineTask,
 } from "../services/outline/pending";
+import { addPersonTask, changePersonTask } from "../services/outline/person-tasks";
 import { commitSeqAt } from "../services/outline/read";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
@@ -117,6 +134,11 @@ import type {
 	OutlinePendingRow,
 	OutlineSpaceRow,
 } from "../services/outline/store/port";
+import {
+	readFinishedTasks,
+	readProjectTaskBoard,
+	readSessionTaskBoard,
+} from "../services/outline/task-board";
 import { readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeLocks,
@@ -126,6 +148,8 @@ import {
 	readBlockView,
 	readTimelineView,
 } from "../services/outline/views";
+import { flushOutlineTaskEdits } from "../services/outline-task-edits";
+import { resolveTaskBackend } from "../services/task-source";
 
 export const outlineRoutes = new Hono();
 
@@ -868,6 +892,163 @@ outlineRoutes.delete("/spaces/:spaceId/blocks/:blockId/lock", async (c) => {
 		throw error;
 	}
 	const body: OutlineLockResponse = { lock: null, commit: result.commit };
+	return c.json(body);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task board (P2 PR 5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A session the person may read (404 otherwise, as for its space). */
+async function readableNarrator(principal: OutlinePrincipal, narratorId: string) {
+	const narrator = await readNarrator(narratorId);
+	if (!narrator || !(await holds(principal, "read", { narrator }))) {
+		throw new NotFoundError("Narrator", narratorId);
+	}
+	return narrator;
+}
+
+/**
+ * Start the session on `taskId` when it is idle ("Add and start", "Reopen and start"; owner Q5,
+ * review round 1 S4), as `/goal` starts its first turn: once even when continuation is off, never
+ * in plan mode. The task is started for the session (the system start a continuation's promotion
+ * makes, actor `outline-task-start`) before the turn, whose prompt names it; when it cannot be
+ * started, the session is not. The person's changes are told to it first, so the turn reads them.
+ * The caller has checked that the person may write the session: the turn runs on their behalf.
+ */
+async function startSessionOn(
+	narratorId: string,
+	userId: string,
+	taskId: string,
+): Promise<boolean> {
+	await flushOutlineTaskEdits(narratorId);
+	const { startSpecContinuationIfPossible } = await import("../services/narrator-session");
+	const [locale, reply] = await Promise.all([
+		getUserLanguage(userId),
+		getUserReplyInLanguage(userId),
+	]);
+	const { started } = await startSpecContinuationIfPossible(narratorId, locale, reply, userId, {
+		preferTaskId: taskId,
+	});
+	return started;
+}
+
+/**
+ * A session's task board (its dock tab): its session space's tasks and what it holds elsewhere.
+ * Read access to the session; a subagent's board is its root's.
+ */
+outlineRoutes.get("/narrators/:narratorId/tasks", async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	const canAdd =
+		narrator.type !== "subagent" &&
+		(await resolveTaskBackend(narrator.id)) === "outline" &&
+		(await holds(principal, "write", { narrator }));
+	const body: OutlineTaskBoardResponse = await readSessionTaskBoard(principal, narrator.id, {
+		canAdd,
+	});
+	return c.json(body);
+});
+
+/**
+ * A project's task board (the project page): the project space, then the session spaces of the
+ * project's sessions the person may read, a page of spaces at a time.
+ */
+outlineRoutes.get("/projects/:projectId/tasks", async (c) => {
+	const principal = principalOf(c);
+	const projectId = idParam(c, "projectId");
+	const project = await readProject(projectId);
+	if (!project || !(await holds(principal, "read", { project }))) {
+		throw new NotFoundError("Project", projectId);
+	}
+	const query = parse(outlineTaskBoardQuerySchema, c.req.query());
+	const body: OutlineTaskBoardResponse = await readProjectTaskBoard(principal, projectId, {
+		cursor: query.cursor ?? null,
+	});
+	return c.json(body);
+});
+
+/** A space's next finished tasks (done or cancelled), latest change first. */
+outlineRoutes.get("/spaces/:spaceId/tasks/finished", async (c) => {
+	const principal = principalOf(c);
+	const space = await readableSpace(principal, idParam(c, "spaceId"));
+	const query = parse(outlineFinishedTasksQuerySchema, c.req.query());
+	const body: OutlineBoardFinishedResponse = await readFinishedTasks(principal, space, {
+		cursor: query.cursor ?? null,
+		limit: query.limit,
+	});
+	return c.json(body);
+});
+
+/**
+ * A person adds a task to a session (the board's form): person-created, locked unless asked
+ * otherwise, deduped by body; with `start`, the session starts on it when idle. Write access to
+ * the session, whose tasks must live in the outline.
+ */
+outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 1024 }), async (c) => {
+	const principal = principalOf(c);
+	const narrator = await readableNarrator(principal, idParam(c, "narratorId"));
+	if (!(await holds(principal, "write", { narrator }))) throw new ForbiddenError();
+	if ((await resolveTaskBackend(narrator.id)) !== "outline")
+		throw new ValidationError("This session keeps its tasks in Dynamic Spec");
+	const input = parse(outlineBoardAddBodySchema, await c.req.json().catch(() => ({})));
+	const locale = await getUserLanguage(principal.userId);
+	const task = await addPersonTask({
+		narratorId: narrator.id,
+		userId: principal.userId,
+		text: input.text,
+		lock: input.lock !== false,
+		locale: locale === "zh-CN" ? "zh-CN" : "en",
+	});
+	const started = input.start
+		? await startSessionOn(narrator.id, principal.userId, task.blockId)
+		: false;
+	const body: OutlineBoardAddResponse = {
+		added: task.added,
+		task: { id: task.blockId, address: task.address, spaceId: task.spaceId },
+		locked: task.locked,
+		started,
+	};
+	return c.json(body, task.added ? 201 : 200);
+});
+
+/**
+ * A person changes one task on the board: finish, cancel or reopen it, hand it to someone or
+ * back to the session; with `start`, the session whose space holds it starts on it when idle,
+ * which takes write access to that session (403 otherwise, before anything changes). Write
+ * access to the task's space (404 when it cannot be read); 409 when the task changed since it
+ * was read.
+ */
+outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async (c) => {
+	const principal = principalOf(c);
+	const blockId = idParam(c, "blockId");
+	const block = await outlineStore.getBlock(blockId);
+	const space = block ? await outlineStore.getSpace(block.spaceId) : null;
+	if (!block || !space || !(await canReadSpace(principal, space)))
+		throw new NotFoundError("Outline task", blockId);
+	const input = parse(outlineBoardTaskUpdateBodySchema, await c.req.json().catch(() => ({})));
+	// Starting a session runs a turn on the person's behalf: only someone who may write it.
+	const startable =
+		input.start && space.kind === "session" && space.narratorId
+			? await readNarrator(space.narratorId)
+			: null;
+	if (input.start && !(startable && (await holds(principal, "write", { narrator: startable }))))
+		throw new ForbiddenError("You cannot start this session");
+	const { result } = await changePersonTask({
+		principal,
+		blockId,
+		baseVersionSeq: input.baseVersionSeq,
+		status: input.status,
+		assign: input.assign,
+	});
+	const started =
+		startable && (await resolveTaskBackend(startable.id)) === "outline"
+			? await startSessionOn(startable.id, principal.userId, blockId)
+			: false;
+	const body: OutlineBoardTaskUpdateResponse = {
+		versionSeq: result?.commit?.seq ?? null,
+		started,
+	};
 	return c.json(body);
 });
 

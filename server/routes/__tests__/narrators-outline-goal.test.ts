@@ -1,7 +1,8 @@
 /**
- * Editing a queued message into `/goal` is refused for a session whose tasks live in the outline
- * (outline P2 PR 3), as sending one is: the consumer would otherwise reach a `/goal` the session
- * cannot run. A spec session's edit goes through as before.
+ * Editing a queued message into `/goal`: a session whose tasks live in the outline runs it (outline
+ * P2 PR 5: a person-created, locked task), as a spec session does. An outline subagent has no tasks
+ * of its own, so the edit is refused for it, as sending one is: the consumer would otherwise reach
+ * a `/goal` it cannot run.
  */
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -27,6 +28,7 @@ const { enqueueBufferedMessage, getBufferedMessagesAsync } = await import(
 const OWNER = "outline-goal-owner";
 const OUTLINE = "outline-goal-outline";
 const SPEC = "outline-goal-spec";
+const SUBAGENT = "outline-goal-subagent";
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -47,6 +49,16 @@ beforeAll(async () => {
 	await db.insert(narrators).values([
 		{ id: OUTLINE, ...base, taskBackend: "outline", createdAt: now, updatedAt: now },
 		{ id: SPEC, ...base, taskBackend: "spec", createdAt: now, updatedAt: now },
+		{
+			id: SUBAGENT,
+			...base,
+			type: "subagent",
+			parentNarratorId: OUTLINE,
+			aclRootNarratorId: OUTLINE,
+			taskBackend: "outline",
+			createdAt: now,
+			updatedAt: now,
+		},
 	]);
 });
 
@@ -85,17 +97,23 @@ function edit(narratorId: string, messageId: string, text: string) {
 const texts = async (narratorId: string) =>
 	(await getBufferedMessagesAsync(narratorId)).map((message) => message.text);
 
-test("an outline session's queued message cannot be edited into /goal", async () => {
+test("an outline session's queued message can be edited into /goal (outline P2 PR 5)", async () => {
 	const queued = await enqueueBufferedMessage(OUTLINE, "fix the build");
-	const response = await edit(OUTLINE, queued.id, "/goal ship the release");
+	expect((await edit(OUTLINE, queued.id, "/goal ship the release")).status).toBe(200);
+	expect(await texts(OUTLINE)).toEqual(["/goal ship the release"]);
+});
+
+test("an outline subagent's queued message cannot be edited into /goal", async () => {
+	const queued = await enqueueBufferedMessage(SUBAGENT, "fix the build");
+	const response = await edit(SUBAGENT, queued.id, "/goal ship the release");
 	expect(response.status).toBe(409);
 	expect(((await response.json()) as { messageCode?: string }).messageCode).toBe(
 		"GOAL_IN_OUTLINE_SESSION",
 	);
-	expect(await texts(OUTLINE)).toEqual(["fix the build"]);
+	expect(await texts(SUBAGENT)).toEqual(["fix the build"]);
 	// Any other wording is an ordinary edit.
-	expect((await edit(OUTLINE, queued.id, "fix the build, then the docs")).status).toBe(200);
-	expect(await texts(OUTLINE)).toEqual(["fix the build, then the docs"]);
+	expect((await edit(SUBAGENT, queued.id, "fix the build, then the docs")).status).toBe(200);
+	expect(await texts(SUBAGENT)).toEqual(["fix the build, then the docs"]);
 });
 
 test("a spec session's edit into /goal goes through as before", async () => {
