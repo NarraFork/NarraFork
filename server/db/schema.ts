@@ -3502,6 +3502,11 @@ export const apiRequests = sqliteTable(
 		/** Request initiator, frozen at start; null for unknown legacy/system usage.
 		 * No FK: removing a user must not rewrite the accounting identity. */
 		userId: text("user_id"),
+		/** Who pays: the owner of the (root) narrator, else the initiator. Frozen at write.
+		 * Differs from userId when a collaborator drives someone else's narrator. No FK. */
+		billingUserId: text("billing_user_id"),
+		/** The narrator's primary project at request time; never rewritten. No FK. */
+		projectId: text("project_id"),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		// 外部 Agent 写入时可自带的叙述者文本（无 narrator 关联时用于占位显示）
 		agentLabel: text("agent_label"),
@@ -3585,6 +3590,45 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 	lastUsedAt: text("last_used_at").notNull(),
 });
 
+// === usage_daily ===
+// Durable per-day usage ledger: one row per (UTC day, billing user, project, provider,
+// credential, model), upserted in the same transaction as the api_requests detail row and
+// never touched by narrator cleanup. Backs usage analysis and budgets without scanning
+// api_requests. Key columns store "" for "none" so the unique index always matches.
+// Costs are reference-price USD (server/lib/model-pricing.ts).
+export const usageDaily = sqliteTable(
+	"usage_daily",
+	{
+		id: text("id").primaryKey(),
+		/** UTC calendar day, YYYY-MM-DD. */
+		day: text("day").notNull(),
+		billingUserId: text("billing_user_id").notNull(),
+		projectId: text("project_id").notNull(),
+		provider: text("provider").notNull(),
+		credentialId: text("credential_id").notNull(),
+		model: text("model").notNull(),
+		requestCount: integer("request_count").notNull().default(0),
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+		cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		costUsd: real("cost_usd").notNull().default(0),
+		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	},
+	(table) => [
+		// Natural key; leading `day` also serves every date-range read.
+		uniqueIndex("idx_usage_daily_key").on(
+			table.day,
+			table.billingUserId,
+			table.projectId,
+			table.provider,
+			table.credentialId,
+			table.model,
+		),
+	],
+);
+
 // === credential_usage_totals ===
 // Lifetime token/cost rollup per (provider, credential, model).
 //
@@ -3599,15 +3643,11 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 // server/lib/model-pricing.ts). For subscription-based access that is an
 // equivalent-consumption figure, not an amount actually billed.
 //
-// SCOPE — this is NOT a full ledger of the deployment's spend. Rows only exist
-// for providers that have credential management (codex). Anthropic and
-// OpenAI direct connections carry credentialId = null (see
-// usage-history-service.getCredentialName) and are deliberately not rolled up
-// here: a synthetic bucket would give every unrelated keyless provider one
-// shared row, and the natural key would stop meaning "one credential".
-// "How much has this deployment spent in total" is answered from `api_requests`
-// for as long as those rows live. Do not read a sum over this table as the
-// deployment total.
+// SCOPE — rows exist for every source that can be identified: pooled credentials
+// (codex accounts, plugins) and API connections (keyed by their stable connection
+// id, see lib/request-source.ts). Requests from an unidentifiable source are not
+// rolled up here, and neither are failed requests, so a sum over this table is not
+// a deployment total; use usage_daily for that.
 export const credentialUsageTotals = sqliteTable(
 	"credential_usage_totals",
 	{
