@@ -127,6 +127,8 @@ export interface SeedBlock {
 	/** The block's markdown, as the live document holds it. */
 	content: string;
 	task: LiveTaskChar | null;
+	/** A question put to a person (`Ask`). */
+	question?: boolean;
 	/** Children in sibling order (those the read included). */
 	childIds: readonly string[];
 }
@@ -207,7 +209,9 @@ export type ClientEvent =
 	| "deleted"
 	| "rejected"
 	| "readonly"
-	| "closed";
+	| "closed"
+	/** A local delete took questions put to people: it withdraws them (`withdrawnQuestions`). */
+	| "withdrew";
 
 let idCounter = 0;
 
@@ -222,7 +226,7 @@ function randomId(length: number): string {
 
 function storeFromSnapshot(pageId: string, blocks: readonly LiveBlockWire[]): Store {
 	const store = new Store(pageId);
-	for (const [id, parent, orderKey, sid, task] of blocks) {
+	for (const [id, parent, orderKey, sid, task, question] of blocks) {
 		store.put({
 			id,
 			parentId: parent < 0 ? null : (blocks[parent]?.[0] ?? null),
@@ -230,6 +234,7 @@ function storeFromSnapshot(pageId: string, blocks: readonly LiveBlockWire[]): St
 			task: task === "" ? null : task,
 			deleted: false,
 			sid,
+			question: question === 1,
 		});
 	}
 	return store;
@@ -284,6 +289,8 @@ export class LiveClient {
 	 * (`claimed`; shown by the editor later). Unknown fields of a newer server are kept as is.
 	 */
 	lastReject: LiveRejectHead | null = null;
+	/** Questions the last local delete that took any withdrew (the editor says so). */
+	withdrawnQuestions = 0;
 
 	private handle: number | null = null;
 	private n = 0;
@@ -507,6 +514,7 @@ export class LiveClient {
 				task: b.task,
 				deleted: false,
 				sid: b.sid,
+				question: b.question === true,
 			};
 			this.confirmed.put({ ...rec });
 			this.visible.put(rec);
@@ -676,6 +684,10 @@ export class LiveClient {
 		const inverses: ClientOp[] = [];
 		const ops: ClientOp[] = [];
 		const bodies = new Map<string, { before: string; after: string }>();
+		let withdrawn = 0;
+		const questionGoes = (id: string) => {
+			if (this.visible.alive(id)?.question) withdrawn++;
+		};
 		try {
 			const created = input.ops.filter((op) => op.t === "i" && !this.ytext(op.id));
 			if (created.length > 0) {
@@ -693,10 +705,12 @@ export class LiveClient {
 					// deepest first, so undo brings every one of them back.
 					for (const id of this.visible.subtree(op.id).slice(1).reverse()) {
 						if (!this.visible.alive(id)) continue;
+						questionGoes(id);
 						const inv = this.visible.apply({ t: "d", id }, (x) => this.textOf(x));
 						if (inv) inverses.unshift(inv);
 						ops.push({ t: "d", id });
 					}
+					questionGoes(op.id);
 				}
 				const inv = this.visible.apply(op, (id) => this.textOf(id));
 				if (inv) inverses.unshift(inv);
@@ -715,6 +729,10 @@ export class LiveClient {
 		this.redoStack = [];
 		this.enqueue(ops, bodies, ops.length > 0);
 		this.syncViews(input.view);
+		if (withdrawn > 0) {
+			this.withdrawnQuestions = withdrawn;
+			this.emit("withdrew");
+		}
 	}
 
 	/** Queue what the last local transaction sent; text-only batches wait a moment. */
@@ -1323,6 +1341,7 @@ export class LiveClient {
 				p: b.parentId,
 				k: b.orderKey,
 				task: b.task,
+				...(b.question ? { q: true as const } : {}),
 				content: this.textOf(id),
 			});
 			for (const [kid, rec] of this.confirmed.blocks)

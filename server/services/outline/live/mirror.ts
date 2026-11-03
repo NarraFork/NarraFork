@@ -150,13 +150,15 @@ export class PageMirror {
 		for (const id of this.subtree(this.pageId)) {
 			const b = this.blocks.get(id) as MirrorBlock;
 			index.set(id, out.length);
-			out.push([
+			const row: LiveBlockWire = [
 				b.id,
 				b.parentId === null ? -1 : (index.get(b.parentId) ?? -1),
 				b.orderKey,
 				b.sid,
 				taskCharOf(b.taskJson) ?? "",
-			]);
+			];
+			if (b.question) row.push(1);
+			out.push(row);
 		}
 		return out;
 	}

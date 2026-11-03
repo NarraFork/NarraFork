@@ -17,6 +17,11 @@ export interface BlockRec {
 	deleted: boolean;
 	/** The block's short id in its space (empty until the server confirmed the block). */
 	sid: string;
+	/**
+	 * A question put to a person (`Ask`): it has no checkbox, and deleting it withdraws it. Only
+	 * the server makes one; a restore keeps it.
+	 */
+	question?: boolean;
 }
 
 /**
@@ -155,6 +160,8 @@ export class Store {
 					task: op.task === undefined ? (old?.deleted ? old.task : null) : op.task,
 					deleted: false,
 					sid: old?.sid ?? "",
+					// The server says so; an undo here brings back what the block was.
+					question: op.q === true || (old?.deleted === true && old.question === true),
 				});
 				return { t: "d", id: op.id };
 			}
@@ -174,6 +181,7 @@ export class Store {
 					p: b.parentId ?? "",
 					k: b.orderKey,
 					task: b.task,
+					...(b.question ? { q: true as const } : {}),
 					content: textOf(b.id),
 				};
 				this.put({ ...b, deleted: true });

@@ -1682,16 +1682,20 @@ export class LivePage {
 								: op.task
 									? { status: LIVE_STATUS_OF_TASK[op.task], assignee: null }
 									: null;
+						// A restored question is still one (review S9: undoing its delete brings the
+						// question back, and its checkbox stays refused). A client cannot make one.
+						const question = prior?.question === true;
 						this.mirror.put({
 							id: op.id,
 							sid: r?.sid ?? prior?.sid ?? "",
 							parentId: op.p,
 							orderKey: key,
 							taskJson,
+							question,
 							deleted: false,
 							dbContent: prior?.dbContent ?? "",
 						});
-						canonicalOps.push({ ...op, k: key });
+						canonicalOps.push({ ...op, k: key, ...(question ? { q: true as const } : {}) });
 						break;
 					}
 					case "m":
@@ -2010,6 +2014,7 @@ export class LivePage {
 					p: v.parentId,
 					k: v.orderKey,
 					...(task ? { task } : {}),
+					...(v.askJson !== null ? { q: true as const } : {}),
 				});
 			}
 		}

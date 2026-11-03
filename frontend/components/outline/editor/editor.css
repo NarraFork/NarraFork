@@ -123,6 +123,18 @@
 	cursor: pointer;
 }
 
+/* A question put to a person (`Ask`): marked where a task has its checkbox, not clickable. */
+.nf-outline-editor .ob-block[data-question="1"] > .ob-gutter {
+	width: 56px;
+}
+
+.nf-outline-editor .ob-check.is-question {
+	cursor: help;
+	font-weight: 600;
+	text-align: center;
+	color: var(--mantine-color-teal-text);
+}
+
 .nf-outline-editor .ob-peers {
 	display: none;
 }
