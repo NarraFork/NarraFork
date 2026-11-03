@@ -23,7 +23,9 @@ uploadRoutes.get("/avatars/:userId/:imageId", async (c) => {
 	return new Response(file, {
 		headers: {
 			"Content-Type": file.type || "application/octet-stream",
-			"Cache-Control": "public, max-age=31536000, immutable",
+			// Readable by every signed-in user, but only behind the session gate: a shared
+			// cache must not hand it to a request that never passed that gate.
+			"Cache-Control": "private, max-age=31536000, immutable",
 		},
 	});
 });
@@ -33,14 +35,19 @@ uploadRoutes.get("/:narratorId/media/:mediaId", async (c) => {
 	const { narratorId, mediaId } = c.req.param();
 	const referencingNarratorId = c.req.query("referencingNarratorId");
 	await requireNarratorAccess(c, referencingNarratorId || narratorId, "read");
-	const path = getMediaPath(narratorId, mediaId);
-	if (!path) throw new NotFoundError("Media", mediaId);
+	// The bounded reference lookup runs before the file is looked up, so its cost does
+	// not reveal whether the media exists.
 	if (
 		referencingNarratorId &&
-		!(await narratorReferencesMedia(referencingNarratorId, narratorId, mediaId, c.req.raw.signal))
+		!(await narratorReferencesMedia(referencingNarratorId, narratorId, mediaId, {
+			signal: c.req.raw.signal,
+			principal: (c.get("user") as { sub?: string } | undefined)?.sub,
+		}))
 	) {
 		throw new NotFoundError("Media", mediaId);
 	}
+	const path = getMediaPath(narratorId, mediaId);
+	if (!path) throw new NotFoundError("Media", mediaId);
 	const file = Bun.file(path);
 	const headers = new Headers({
 		"Content-Type": file.type || "application/octet-stream",
@@ -81,45 +88,47 @@ uploadRoutes.get("/:narratorId/media/:mediaId", async (c) => {
 // narrator the caller can read whose history references this exact owner/image, which
 // is how a fork or COW copy shows its source's images to someone who cannot read the
 // source. Unlike the media route the owner is tried first, so the common case (the
-// reader can see both) never pays for the paged reference scan.
+// reader can see both) never runs the reference lookup.
 //
-// Every refusal and every missing file is the same 404, so the route cannot be used to
-// learn whether an image or a narrator exists.
+// Every refusal and every missing file gives the same status, body and headers. Timing
+// is not uniform: a refusal that runs the reference lookup takes as long as that bounded
+// lookup, one that does not answers at once. The lookup runs BEFORE the file is looked
+// up, so its cost does not depend on whether the image exists; what remains observable
+// is only whether the caller can read the owner or the context, which they can learn by
+// opening those sessions anyway.
 //
-// `private` keeps shared caches out. The long lifetime stays because an image id names
-// one file that is never rewritten, and `Vary: Authorization` ties the browser's copy to
-// the session token that passed this check: another login in the same browser profile
-// misses the cache and comes back here.
+// `private` keeps shared caches out, and `Vary: Authorization` ties the browser's copy
+// to the session token that passed this check: another login in the same browser profile
+// misses the cache and comes back here. The hour-long lifetime covers a viewing session
+// (the virtual list re-mounts rows and re-fetches while scrolling) while bounding how
+// long a copy outlives revoked access on that browser.
 uploadRoutes.get("/:narratorId/:imageId", async (c) => {
 	const { narratorId, imageId } = c.req.param();
 	const referencingNarratorId = c.req.query("referencingNarratorId");
 	const notFound = () => new NotFoundError("Image", imageId);
 
-	let referenceContext: string | null = null;
-	if (!(await mayReadNarrator(c, narratorId))) {
-		if (
-			!referencingNarratorId ||
-			referencingNarratorId === narratorId ||
-			!(await mayReadNarrator(c, referencingNarratorId))
-		) {
-			throw notFound();
-		}
-		referenceContext = referencingNarratorId;
-	}
-	const filePath = getImagePath(narratorId, imageId);
-	if (!filePath) throw notFound();
 	if (
-		referenceContext &&
-		!(await narratorReferencesImage(referenceContext, narratorId, imageId, c.req.raw.signal))
+		!(await mayReadNarrator(c, narratorId)) &&
+		!(
+			referencingNarratorId &&
+			referencingNarratorId !== narratorId &&
+			(await mayReadNarrator(c, referencingNarratorId)) &&
+			(await narratorReferencesImage(referencingNarratorId, narratorId, imageId, {
+				signal: c.req.raw.signal,
+				principal: (c.get("user") as { sub?: string } | undefined)?.sub,
+			}))
+		)
 	) {
 		throw notFound();
 	}
+	const filePath = getImagePath(narratorId, imageId);
+	if (!filePath) throw notFound();
 
 	const file = Bun.file(filePath);
 	return new Response(file, {
 		headers: {
 			"Content-Type": file.type || "application/octet-stream",
-			"Cache-Control": "private, max-age=31536000, immutable",
+			"Cache-Control": "private, max-age=3600, immutable",
 			Vary: "Authorization",
 			"X-Content-Type-Options": "nosniff",
 		},
