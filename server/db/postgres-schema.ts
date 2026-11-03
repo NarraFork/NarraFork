@@ -3523,6 +3523,13 @@ export const outlineBlocks = pgTable(
 		index("idx_outline_blocks_locked")
 			.on(table.pageId)
 			.where(sql.raw('("task_json"::jsonb #>> \'{lock}\') IS NOT NULL AND "deleted" = FALSE')),
+		index("idx_outline_blocks_active_tasks")
+			.on(table.spaceId)
+			.where(
+				sql.raw(
+					"\"deleted\" = FALSE AND ((\"task_json\"::jsonb #>> '{status}') = 'doing' OR ((\"task_json\"::jsonb #>> '{status}') = 'todo' AND (\"task_json\"::jsonb #>> '{lock}') IS NOT NULL))",
+				),
+			),
 		index("idx_outline_blocks_finished_tasks")
 			.on(table.spaceId, table.versionSeq, table.id)
 			.where(
@@ -24477,6 +24484,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "(\"task_json\"::jsonb #>> '{lock}') IS NOT NULL AND \"deleted\" = FALSE"
+        },
+        {
+          "name": "idx_outline_blocks_active_tasks",
+          "columns": [
+            "spaceId"
+          ],
+          "unique": false,
+          "predicate": "\"deleted\" = FALSE AND ((\"task_json\"::jsonb #>> '{status}') = 'doing' OR ((\"task_json\"::jsonb #>> '{status}') = 'todo' AND (\"task_json\"::jsonb #>> '{lock}') IS NOT NULL))"
         },
         {
           "name": "idx_outline_blocks_finished_tasks",

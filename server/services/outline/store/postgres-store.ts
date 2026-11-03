@@ -1344,27 +1344,31 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		},
 
 		async listOpenTasksOfSpaces(parts, limit) {
-			// One compound statement per chunk: each member is the open-task index's own predicate
-			// on one space, with its own limit. Ids first, then the rows by key.
-			const ids: string[] = [];
+			// One compound statement per chunk: two members per space, each an index's own
+			// predicate on one space with its own limit: the active-task index (in progress, or
+			// locked to-dos) and the open-task index. Ids first, then the rows by key.
+			const ids = new Set<string>();
 			for (const chunk of chunked(parts, OUTLINE_BATCH_SPACES)) {
-				const members = chunk.map((part) => {
+				const members = chunk.flatMap((part) => {
 					const exclude = part.excludePageIds ?? [];
-					return sql`(select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and ("task_json"::jsonb #>> '{status}') IN ('todo', 'doing') AND "deleted" = FALSE${
+					const pages =
 						exclude.length > 0
 							? sql` and "page_id" not in (${sql.join(
 									exclude.map((id) => sql`${id}`),
 									sql`, `,
 								)})`
-							: sql``
-					} limit ${limit})`;
+							: sql``;
+					return [
+						sql`(select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and "deleted" = FALSE AND (("task_json"::jsonb #>> '{status}') = 'doing' OR (("task_json"::jsonb #>> '{status}') = 'todo' AND ("task_json"::jsonb #>> '{lock}') IS NOT NULL))${pages} limit ${limit})`,
+						sql`(select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and ("task_json"::jsonb #>> '{status}') IN ('todo', 'doing') AND "deleted" = FALSE${pages} limit ${limit})`,
+					];
 				});
 				const rows = (await db.execute(sql.join(members, sql` union all `))) as unknown as Array<{
 					id: string;
 				}>;
-				for (const row of rows) ids.push(row.id);
+				for (const row of rows) ids.add(row.id);
 			}
-			return await store.getBlockMetasByIds(ids);
+			return await store.getBlockMetasByIds([...ids]);
 		},
 
 		async listFinishedTasksOfSpaces(spaceIds, limit) {

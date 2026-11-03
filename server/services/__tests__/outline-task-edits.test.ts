@@ -39,10 +39,12 @@ const { canReadSpace, canWriteSpace } = await import("../outline/access");
 const { ensureProjectSpace, ensureSessionSpace } = await import("../outline/spaces");
 const { OUTLINE_BEHAVIOR_ALIAS } = await import("../outline/model");
 const { writeOutline } = await import("../outline/write");
+const { lockOutlineTask } = await import("../outline/pending");
 const { getBufferedMessagesAsync } = await import("../narrator-buffer");
 const { invalidateTaskBackend } = await import("../task-source");
 const {
 	flushOutlineTaskEdits,
+	OUTLINE_TASK_EDIT_LIMITS,
 	OUTLINE_TASK_EDIT_TIMING,
 	resetOutlineTaskEditsForTests,
 	settleOutlineTaskEditsForTests,
@@ -485,5 +487,76 @@ describe("a person's changes to a session's tasks", () => {
 		});
 		await settleOutlineTaskEditsForTests();
 		expect(await notes(spec)).toEqual([]);
+	});
+
+	test("past the waiting cap the oldest changes go, and the notice still counts them", async () => {
+		const owner = await person();
+		const id = await session(owner);
+		const space = await ensureSessionSpace(id);
+		const limits = OUTLINE_TASK_EDIT_LIMITS as { queuedPerSession: number };
+		const cap = limits.queuedPerSession;
+		limits.queuedPerSession = 3;
+		try {
+			working = true;
+			for (let i = 0; i < 5; i++) {
+				await writeOutline({
+					spaceId: space.id,
+					ops: [{ op: "insert", parent: null, content: `Task ${i}`, task: { status: "todo" } }],
+					...byPerson(owner),
+				});
+				await flushOutlineTaskEdits(id);
+			}
+			const taken = await takeOutlineTaskEditNotice(id, "en");
+			// Three listed (the newest), two let go and counted.
+			expect(taken?.content).toContain("Task 4: added");
+			expect(taken?.content).not.toContain("Task 0: added");
+			expect(taken?.content).toContain("2 more changes not listed.");
+		} finally {
+			limits.queuedPerSession = cap;
+		}
+	});
+
+	test("a change held for confirmation on a project task refreshes the board of the session doing it", async () => {
+		const owner = await person();
+		const id = await session(owner);
+		const projectId = generateId();
+		await db.insert(projects).values({
+			id: projectId,
+			name: `p-${projectId}`,
+			ownerUserId: owner,
+			visibility: "private",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		const projectSpace = await ensureProjectSpace(projectId);
+		const written = await writeOutline({
+			spaceId: projectSpace.id,
+			ops: [{ op: "insert", parent: null, content: "Team plan", task: { status: "todo" } }],
+			...byPerson(owner),
+		});
+		const taskId = written.results[0]?.blockId as string;
+		await lockOutlineTask({ blockId: taskId, userId: owner });
+		const agent = {
+			actor: { kind: "agent" as const, id },
+			narratorId: id,
+			responsibleUserId: owner,
+		};
+		// The session takes it up (its board refreshes for that), then rewrites the locked plan.
+		await writeOutline({
+			spaceId: projectSpace.id,
+			ops: [{ op: "setTask", block: { id: taskId }, task: { status: "doing" } }],
+			...agent,
+		});
+		await settleOutlineTaskEditsForTests();
+		await Bun.sleep(OUTLINE_TASK_EDIT_TIMING.boardMs + 50);
+		broadcasts.length = 0;
+		const held = await writeOutline({
+			spaceId: projectSpace.id,
+			ops: [{ op: "update", block: { id: taskId }, content: "Team plan, rewritten" }],
+			...agent,
+		});
+		expect(held.pending).toBeDefined();
+		await settleOutlineTaskEditsForTests();
+		expect(await boardRefreshes(id)).toBeGreaterThan(0);
 	});
 });

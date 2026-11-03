@@ -319,7 +319,7 @@
 		"waitPrerequisites": "Waits for {{count}} prerequisite(s)",
 		"waitPeople": "Waits for an answer",
 		"waitConfirmation": "Waits for confirmation",
-		"openTruncated": "More open tasks than shown: open the outline for the rest.",
+		"openTruncatedIn": "More open tasks in {{label}} than shown: open the outline for the rest.",
 		"space": "In {{label}}",
 		"claimedElsewhere": "Held in {{label}}",
 		"moreFinished": "More finished tasks",
@@ -369,6 +369,7 @@
 		},
 		"statusBar": {
 			"awaitingYou": "{{count}} goal(s) wait for your confirmation",
+			"awaitingFrom": "{{count}} goal(s) wait for {{names}} to confirm",
 			"awaitingOthers": "{{count}} goal(s) wait for confirmation"
 		}
 	}

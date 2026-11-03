@@ -1,7 +1,9 @@
 /**
  * The project board's queries (outline P2 PR 5; review round 1 S5): one query per page of spaces,
  * so window focus and the half-minute timer re-read the first page only, never the pages loaded
- * with "More sessions"; a person's own change re-reads every loaded page once.
+ * with "More sessions"; a person's own change re-reads every loaded page once. When a refresh
+ * moves where a page ends, the pages after it are read again from its new end (review round 2
+ * S1): no session shows twice or goes missing.
  */
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { parseHTML } from "linkedom";
@@ -27,6 +29,8 @@ const { PROJECT_BOARD_REFRESH_MS, invalidateTaskBoards, useProjectTaskBoard } = 
 let root: Root;
 let client: InstanceType<typeof QueryClient>;
 const reads: Array<string | null> = [];
+/** The sessions the project has now, two a page (the cursor is the last id of a page). */
+let sessions: string[] | null = null;
 let board: ReturnType<typeof useProjectTaskBoard> | undefined;
 
 function Harness() {
@@ -40,9 +44,21 @@ async function flush() {
 
 beforeEach(async () => {
 	reads.length = 0;
+	sessions = null;
 	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	spyOn(api, "getProjectTaskBoard").mockImplementation(async (_projectId, cursor) => {
 		reads.push(cursor);
+		if (sessions) {
+			const ids = sessions.filter((id) => cursor === null || id > cursor).slice(0, 2);
+			const more = sessions.some((id) => id > (ids.at(-1) ?? ""));
+			return {
+				scope: { kind: "project", projectId: "p1" },
+				sections: ids.map((id) => ({ space: { id } }) as never),
+				canAdd: false,
+				nextCursor: more ? (ids.at(-1) ?? null) : null,
+				me: { userId: "u1", name: "u1" },
+			};
+		}
 		return {
 			scope: { kind: "project", projectId: "p1" },
 			sections: [],
@@ -110,4 +126,33 @@ test("pages load on demand; only the first refreshes on its own", async () => {
 	invalidateTaskBoards(client);
 	await flush();
 	expect([...reads].sort()).toEqual(["c1", "c2", null].sort());
+});
+
+test("a refresh that moves where the first page ends re-reads the pages after it", async () => {
+	sessions = ["s1", "s2", "s3", "s4"];
+	await client.resetQueries();
+	await flush();
+	board?.fetchNextPage();
+	await flush();
+	const shown = () =>
+		(board?.pages ?? []).flatMap((page) =>
+			page.sections.map((section) => (section as { space: { id: string } }).space.id),
+		);
+	expect(shown()).toEqual(["s1", "s2", "s3", "s4"]);
+	const refreshFirst = async () => {
+		await client
+			.getQueryCache()
+			.find({ queryKey: ["task-board", "project", "p1", ""] })
+			?.fetch();
+		await flush();
+	};
+	// s2 is archived: the first page now ends at s3 (review round 2 probe: s3 showed twice).
+	sessions = ["s1", "s3", "s4"];
+	await refreshFirst();
+	expect(shown()).toEqual(["s1", "s3", "s4"]);
+	// A new session lands inside the first page: its old last session moves to the next page.
+	sessions = ["s1", "s10", "s3", "s4"].sort();
+	await refreshFirst();
+	expect(shown()).toEqual(["s1", "s10", "s3", "s4"]);
+	expect(board?.hasNextPage).toBe(false);
 });

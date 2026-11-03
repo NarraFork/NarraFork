@@ -319,7 +319,7 @@
 		"waitPrerequisites": "等 {{count}} 个前置任务",
 		"waitPeople": "等人回答",
 		"waitConfirmation": "等确认",
-		"openTruncated": "未完成的任务比这里显示的多，其余的请在大纲里看。",
+		"openTruncatedIn": "{{label}} 里未完成的任务比这里显示的多，其余的请在大纲里看。",
 		"space": "在 {{label}}",
 		"claimedElsewhere": "在 {{label}} 领取",
 		"moreFinished": "更多已完成的任务",
@@ -369,6 +369,7 @@
 		},
 		"statusBar": {
 			"awaitingYou": "{{count}} 个目标等你确认",
+			"awaitingFrom": "{{count}} 个目标等 {{names}} 确认",
 			"awaitingOthers": "{{count}} 个目标等人确认"
 		}
 	}

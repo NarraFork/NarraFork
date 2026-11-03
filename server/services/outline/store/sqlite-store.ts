@@ -1191,25 +1191,29 @@ export const sqliteOutlineStore: OutlineStore = {
 	},
 
 	async listOpenTasksOfSpaces(parts, limit) {
-		// One compound statement per chunk: each member is the open-task index's own predicate on
-		// one space, with its own limit (a bounded seek). Ids first, then the rows by key.
-		const ids: string[] = [];
+		// One compound statement per chunk: two members per space, each an index's own predicate
+		// on one space with its own limit (a bounded seek): the active-task index (in progress, or
+		// locked to-dos) and the open-task index. Ids first, then the rows by key.
+		const ids = new Set<string>();
 		for (const chunk of chunked(parts, OUTLINE_BATCH_SPACES)) {
-			const members = chunk.map((part) => {
+			const members = chunk.flatMap((part) => {
 				const exclude = part.excludePageIds ?? [];
-				return sql`select * from (select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0${
+				const pages =
 					exclude.length > 0
 						? sql` and "page_id" not in (${sql.join(
 								exclude.map((id) => sql`${id}`),
 								sql`, `,
 							)})`
-						: sql``
-				} limit ${limit})`;
+						: sql``;
+				return [
+					sql`select * from (select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and "deleted" = 0 AND (json_extract("task_json", '$.status') = 'doing' OR (json_extract("task_json", '$.status') = 'todo' AND json_extract("task_json", '$.lock') IS NOT NULL))${pages} limit ${limit})`,
+					sql`select * from (select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0${pages} limit ${limit})`,
+				];
 			});
 			for (const row of db.all<{ id: string }>(sql.join(members, sql` union all `)))
-				ids.push(row.id);
+				ids.add(row.id);
 		}
-		return await sqliteOutlineStore.getBlockMetasByIds(ids);
+		return await sqliteOutlineStore.getBlockMetasByIds([...ids]);
 	},
 
 	async listFinishedTasksOfSpaces(spaceIds, limit) {

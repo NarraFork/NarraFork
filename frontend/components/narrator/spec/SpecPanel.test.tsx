@@ -192,6 +192,7 @@ beforeEach(async () => {
 			current: null,
 			awaitingConfirmation: 0,
 			awaitingYourConfirmation: 0,
+			awaitingFrom: [],
 		})),
 		spyOn(api, "getSessionTaskBoard").mockImplementation(async () => ({
 			scope: { kind: "session", narratorId: NARRATOR },

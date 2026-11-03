@@ -29,7 +29,8 @@ mock.module("@mantine/core", () => ({
 }));
 mock.module("react-i18next", () => ({
 	useTranslation: () => ({
-		t: (key: string, options?: { count?: number }) => `${key}:${options?.count ?? ""}`,
+		t: (key: string, options?: { count?: number; names?: string }) =>
+			`${key}:${options?.count ?? ""}${options?.names ? `:${options.names}` : ""}`,
 	}),
 }));
 
@@ -51,7 +52,8 @@ afterEach(() => {
 	act(() => root.unmount());
 });
 
-const t = (key: string, options: { count: number }) => `${key}:${options.count}`;
+const t = (key: string, options: { count: number; names?: string }) =>
+	`${key}:${options.count}${options.names ? `:${options.names}` : ""}`;
 
 test("the text: nothing waiting, waiting for the viewer, waiting for someone else", () => {
 	expect(awaitingConfirmationText(null, t)).toBeNull();
@@ -59,6 +61,13 @@ test("the text: nothing waiting, waiting for the viewer, waiting for someone els
 	expect(awaitingConfirmationText({ total: 2, yours: 1 }, t)).toBe("board.statusBar.awaitingYou:1");
 	expect(awaitingConfirmationText({ total: 2, yours: 0 }, t)).toBe(
 		"board.statusBar.awaitingOthers:2",
+	);
+	// Someone else decides: named (the locker; a session confirming for them is not "you").
+	expect(awaitingConfirmationText({ total: 2, yours: 0, from: ["alice", "bob"] }, t)).toBe(
+		"board.statusBar.awaitingFrom:2:alice, bob",
+	);
+	expect(awaitingConfirmationText({ total: 2, yours: 1, from: ["bob"] }, t)).toBe(
+		"board.statusBar.awaitingYou:1",
 	);
 });
 

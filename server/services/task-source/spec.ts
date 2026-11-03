@@ -204,7 +204,7 @@ export function createSpecTaskSource(narratorId: string): NarratorTaskSource {
 				current: compiled.currentTask
 					? { ...toTaskView(compiled.currentTask), address: null }
 					: null,
-				awaitingConfirmation: { total: 0, mine: 0 },
+				awaitingConfirmation: { total: 0, mine: 0, from: [] },
 			};
 		},
 		async nextTask() {

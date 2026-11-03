@@ -428,7 +428,14 @@ async function ownSections(
 	const shownFinished: OutlineBlockMeta[] = [];
 	const cursors = new Map<string, string | null>();
 	for (const space of spaces) {
-		shownOpen.push(...(openOf.get(space.id) ?? []).slice(0, limits.open));
+		// A space with more open tasks than shown shows the ones in progress or locked first (who
+		// does what, a goal waiting for its person), then other to-dos; document order after.
+		const openRows = openOf.get(space.id) ?? [];
+		const byKey = (a: OutlineBlockMeta, b: OutlineBlockMeta) =>
+			a.orderKey < b.orderKey ? -1 : a.orderKey > b.orderKey ? 1 : a.id < b.id ? -1 : 1;
+		const active = openRows.filter(isActiveTask).sort(byKey);
+		const rest = openRows.filter((row) => !isActiveTask(row)).sort(byKey);
+		shownOpen.push(...[...active, ...rest].slice(0, limits.open));
 		// The cursor follows the rows read, whether or not the behavior page's were left out.
 		const rows = finishedOf.get(space.id) ?? [];
 		const window = rows.slice(0, limits.finished);
@@ -455,6 +462,11 @@ async function ownSections(
 		finished: finishedBySpace.get(space.id) ?? [],
 		finishedCursor: cursors.get(space.id) ?? null,
 	}));
+}
+
+/** An open task the board always shows of its space: in progress, or locked. */
+function isActiveTask(meta: OutlineBlockMeta): boolean {
+	return meta.taskJson?.status === "doing" || !!meta.taskJson?.lock;
 }
 
 /** The caller's name, for "assign to me". */

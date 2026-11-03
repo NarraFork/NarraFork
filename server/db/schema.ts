@@ -5600,6 +5600,14 @@ export const outlineBlocks = sqliteTable(
 		index("idx_outline_blocks_locked")
 			.on(table.pageId)
 			.where(sql`json_extract("task_json", '$.lock') IS NOT NULL AND "deleted" = 0`),
+		// Open tasks of a space that are in progress or locked (a person's goal, a locked plan,
+		// one waiting for its locker to confirm it done): what the task board always shows of a
+		// space with more open tasks than it shows (outline P2 PR 5).
+		index("idx_outline_blocks_active_tasks")
+			.on(table.spaceId)
+			.where(
+				sql`"deleted" = 0 AND (json_extract("task_json", '$.status') = 'doing' OR (json_extract("task_json", '$.status') = 'todo' AND json_extract("task_json", '$.lock') IS NOT NULL))`,
+			),
 		// Finished tasks of a space (done or cancelled, live), latest change first: the task
 		// board's finished lists, paged by (version_seq, id) (outline P2 PR 5).
 		index("idx_outline_blocks_finished_tasks")

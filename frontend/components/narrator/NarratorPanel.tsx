@@ -3635,6 +3635,7 @@ function NarratorPanelBody({
 									? {
 											total: currentTaskData.awaitingConfirmation,
 											yours: currentTaskData.awaitingYourConfirmation,
+											from: currentTaskData.awaitingFrom,
 										}
 									: null,
 								retryInfo,

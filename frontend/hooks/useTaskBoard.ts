@@ -10,6 +10,7 @@
 import type {
 	OutlineBoardAddRequest,
 	OutlineBoardTaskUpdateRequest,
+	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { OUTLINE_TASKS_CHANGED_EVENT } from "@shared/outline-task-board";
 import {
@@ -93,15 +94,27 @@ export const PROJECT_BOARD_REFRESH_MS = 30_000;
 
 /**
  * A project's task board, a page of spaces at a time: one query per page, so the timer and window
- * focus re-read the first page only. A page's cursor comes from the page before it as first read;
- * a later refresh of that page does not move the pages after it.
+ * focus re-read the first page only. Each later page's cursor is the page before it's
+ * `nextCursor` as last read: when a refresh moves where a page ends (a session archived, added
+ * or no longer readable), the pages after it are read again from the new cursor, so no session
+ * shows twice or goes missing (review round 2). The board also shows each space once.
  */
 export function useProjectTaskBoard(projectId: string, enabled = true) {
-	const [state, setState] = useState<{ projectId: string; cursors: Array<string | null> }>({
+	const queryClient = useQueryClient();
+	const [state, setState] = useState<{ projectId: string; pages: number }>({
 		projectId,
-		cursors: [null],
+		pages: 1,
 	});
-	const cursors = state.projectId === projectId ? state.cursors : [null];
+	const wanted = state.projectId === projectId ? state.pages : 1;
+	// The cursors, chained from what each page read last (its query re-renders this on change).
+	const cursors: Array<string | null> = [null];
+	while (cursors.length < wanted) {
+		const before = queryClient.getQueryData<OutlineTaskBoardResponse>(
+			taskBoardKeys.projectPage(projectId, cursors[cursors.length - 1] ?? null),
+		);
+		if (!before?.nextCursor) break;
+		cursors.push(before.nextCursor);
+	}
 	const results = useQueries({
 		queries: cursors.map((cursor, index) => ({
 			queryKey: taskBoardKeys.projectPage(projectId, cursor),
@@ -115,13 +128,15 @@ export function useProjectTaskBoard(projectId: string, enabled = true) {
 	});
 	const last = results.at(-1);
 	const nextCursor = last?.data?.nextCursor ?? null;
+	const loaded = results.length;
 	const fetchNextPage = useCallback(() => {
 		if (!nextCursor) return;
 		setState((prev) => {
-			const current = prev.projectId === projectId ? prev.cursors : [null];
-			return current.includes(nextCursor) ? prev : { projectId, cursors: [...current, nextCursor] };
+			const current = prev.projectId === projectId ? prev.pages : 1;
+			// Once per page shown: a second click before it arrives asks for nothing more.
+			return current > loaded ? prev : { projectId, pages: loaded + 1 };
 		});
-	}, [nextCursor, projectId]);
+	}, [nextCursor, projectId, loaded]);
 	const first = results[0];
 	const pages = results.flatMap((result) => (result.data ? [result.data] : []));
 	return {

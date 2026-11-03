@@ -49,11 +49,14 @@ function get(userId: string, narratorId: string) {
 	return instance.request(`http://localhost/narrators/${narratorId}/tasks/current`);
 }
 
+const usernames = new Map<string, string>();
+
 async function person(): Promise<string> {
 	const id = generateId();
+	usernames.set(id, `cur${id.replace(/[^A-Za-z0-9]/g, "")}`);
 	await db.insert(users).values({
 		id,
-		username: `cur${id.replace(/[^A-Za-z0-9]/g, "")}`,
+		username: usernames.get(id) as string,
 		passwordHash: "x",
 		role: "user",
 		createdAt: NOW,
@@ -104,6 +107,7 @@ describe("the current task route", () => {
 			current: { text: "Ship", address: goal.address, protected: true },
 			awaitingConfirmation: 0,
 			awaitingYourConfirmation: 0,
+			awaitingFrom: [],
 		});
 
 		// The agent ticks the goal done: held for the person who locked it (D26b).
@@ -119,17 +123,19 @@ describe("the current task route", () => {
 			current: null,
 			awaitingConfirmation: 1,
 			awaitingYourConfirmation: 1,
+			awaitingFrom: [],
 		});
-		// Someone who only reads the session sees that a goal waits, not that it waits for them.
+		// Someone who only reads the session sees that a goal waits, and for whom.
 		expect(await (await get(reader, id)).json()).toEqual({
 			backend: "outline",
 			current: null,
 			awaitingConfirmation: 1,
 			awaitingYourConfirmation: 0,
+			awaitingFrom: [usernames.get(owner)],
 		});
 	});
 
-	test("outline: a goal whose locker named a session to confirm for them waits for that session's person too", async () => {
+	test("outline: a goal whose locker named a session to confirm for them still waits for the locker, as the board says", async () => {
 		const owner = await person();
 		const delegatePerson = await person();
 		const reader = await person();
@@ -148,11 +154,14 @@ describe("the current task route", () => {
 		});
 		const counts = async (userId: string) => {
 			const body = (await (await get(userId, id)).json()) as NarratorCurrentTaskResponse;
-			return [body.awaitingConfirmation, body.awaitingYourConfirmation];
+			return [body.awaitingConfirmation, body.awaitingYourConfirmation, body.awaitingFrom];
 		};
-		expect(await counts(owner)).toEqual([1, 1]);
-		expect(await counts(delegatePerson)).toEqual([1, 1]);
-		expect(await counts(reader)).toEqual([1, 0]);
+		// Only the locker gets Confirm and Reject on the board, so only they read "yours"; the
+		// person of the session confirming for them reads whose confirmation it waits for.
+		expect(await counts(owner)).toEqual([1, 1, []]);
+		const lockerName = usernames.get(owner) ?? "";
+		expect(await counts(delegatePerson)).toEqual([1, 0, [lockerName]]);
+		expect(await counts(reader)).toEqual([1, 0, [lockerName]]);
 	});
 
 	test("outline: the open tasks are read once per request", async () => {
@@ -178,6 +187,7 @@ describe("the current task route", () => {
 			current: null,
 			awaitingConfirmation: 0,
 			awaitingYourConfirmation: 0,
+			awaitingFrom: [],
 		});
 	});
 

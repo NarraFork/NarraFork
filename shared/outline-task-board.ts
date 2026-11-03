@@ -104,7 +104,10 @@ export interface OutlineBoardSection {
 	role: "own" | "claimed";
 	/** Open tasks in document order. */
 	open: OutlineBoardTask[];
-	/** More open tasks than the board shows. */
+	/**
+	 * More open tasks than the board shows. Those in progress or locked are shown first, so a cut
+	 * leaves out to-dos only (while the space has no more of those than the cap).
+	 */
 	openTruncated: boolean;
 	/** Finished tasks, latest change first (none for a `claimed` section). */
 	finished: OutlineBoardTask[];
@@ -184,8 +187,10 @@ export interface NarratorCurrentTaskResponse {
 	current: { text: string; address: string | null; protected: boolean } | null;
 	/** Person-created goals of the session whose completion waits for confirmation (outline). */
 	awaitingConfirmation: number;
-	/** Of those, the ones the caller decides (they locked the goal, or confirm for its locker). */
+	/** Of those, the ones the caller decides: they locked the goal (the board gives them Confirm). */
 	awaitingYourConfirmation: number;
+	/** Who decides the others (usernames, at most three): "waits for alice's confirmation". */
+	awaitingFrom: string[];
 }
 
 /** WebSocket event: the tasks a session's board shows changed (ids only; the client re-reads). */

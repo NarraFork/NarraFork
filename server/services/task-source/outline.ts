@@ -66,7 +66,7 @@ import {
 	type Locale,
 	type OutlineTaskPromptTask,
 } from "../../lib/prompt-i18n";
-import { readNarrator } from "../outline/access-reads";
+import { readDisplayNames, readNarrator } from "../outline/access-reads";
 import {
 	OutlineBusyError,
 	OutlineConflictError,
@@ -75,7 +75,7 @@ import {
 } from "../outline/errors";
 import { OUTLINE_TEXT } from "../outline/messages";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "../outline/model";
-import { findCompletionsAwaitingConfirmation, pendingRightOf } from "../outline/pending";
+import { findCompletionsAwaitingConfirmation } from "../outline/pending";
 import { recordOutlineReads, seenOutlineVersion } from "../outline/read-ledger";
 import { resolveNarratorSpaces } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
@@ -134,6 +134,9 @@ export const OUTLINE_TASK_SOURCE_LIMITS = {
 	/** To-dos tried in turn when the write path refuses to start one. */
 	promotionAttempts: 3,
 } as const;
+
+/** People the status bar names as deciding goals the viewer does not. */
+const STATUS_BAR_DECIDERS = 3;
 
 /** The system actor of the commit that starts a session's next task. */
 export const OUTLINE_TASK_START_ACTOR = "outline-task-start";
@@ -491,7 +494,8 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			const waiting = read.entries.filter(
 				(entry) => isProtected(entry) && entry.wait?.confirmation,
 			);
-			if (waiting.length === 0) return { current, awaitingConfirmation: { total: 0, mine: 0 } };
+			if (waiting.length === 0)
+				return { current, awaitingConfirmation: { total: 0, mine: 0, from: [] } };
 			const found = await findCompletionsAwaitingConfirmation(
 				waiting.map((entry) => ({
 					id: entry.ref.blockId,
@@ -499,36 +503,21 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 					taskJson: entry.ref.taskJson,
 				})),
 			);
-			// The viewer's: they locked it, or they are the person of the session the locker named
-			// to confirm for them (its owner).
+			// The viewer's: they locked it, so the board gives them Confirm and Reject. The others
+			// wait for their lockers, named (a session confirming for its locker confirms through
+			// the outline, not here).
 			let mine = 0;
-			if (viewerUserId) {
-				const delegateOwners = new Map<string, string | null>();
-				const ownerOfDelegate = async (delegate: string) => {
-					if (!delegateOwners.has(delegate)) {
-						const root =
-							(await outlineStore.getNarratorRoots([delegate])).get(delegate)?.root ?? delegate;
-						delegateOwners.set(delegate, (await readNarrator(root))?.ownerUserId ?? null);
-					}
-					return delegateOwners.get(delegate) ?? null;
-				};
-				for (const entry of waiting) {
-					const completion = found.get(entry.ref.blockId);
-					if (!completion) continue;
-					const lock = entry.ref.taskJson.lock ?? null;
-					const right = await pendingRightOf(
-						completion.row,
-						{ kind: "human", userId: viewerUserId },
-						{ lock },
-					);
-					if (
-						right === "decider" ||
-						(lock?.delegate && (await ownerOfDelegate(lock.delegate)) === viewerUserId)
-					)
-						mine++;
-				}
+			const others = new Set<string>();
+			for (const entry of waiting) {
+				if (!found.has(entry.ref.blockId)) continue;
+				const by = entry.ref.taskJson.lock?.by;
+				if (by?.kind === "human" && viewerUserId !== null && by.id === viewerUserId) mine++;
+				else if (by?.kind === "human") others.add(by.id);
 			}
-			return { current, awaitingConfirmation: { total: found.size, mine } };
+			const named = [...others].slice(0, STATUS_BAR_DECIDERS);
+			const names = named.length > 0 ? await readDisplayNames({ userIds: named }) : null;
+			const from = named.map((id) => names?.users.get(id) ?? id);
+			return { current, awaitingConfirmation: { total: found.size, mine, from } };
 		},
 		prepareContinuation: ({ promoteTodo, preferTaskId }) =>
 			prepareContinuation(promoteTodo, preferTaskId),

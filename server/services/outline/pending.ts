@@ -180,9 +180,14 @@ function actorRef(actor: OutlinePendingActor): OutlineTaskActorRef {
 		: { kind: "agent", id: actor.narratorId };
 }
 
-function emit(spaceId: string, pageIds: readonly string[]): void {
+function emit(spaceId: string, pageIds: readonly string[], narratorId?: string | null): void {
 	if (pageIds.length > 0)
-		eventBus.emit({ type: "outline:pending", spaceId, pageIds: [...pageIds] });
+		eventBus.emit({
+			type: "outline:pending",
+			spaceId,
+			pageIds: [...pageIds],
+			...(narratorId ? { narratorIds: [narratorId] } : {}),
+		});
 }
 
 /** Agent- and API-facing text of decisions (English, like the rest of the outline's). */
@@ -779,7 +784,7 @@ export async function rejectOutlinePending(args: {
 			reportedAt: withdrawn ? now : null,
 		});
 		if (ok) {
-			emit(row.spaceId, [row.pageId]);
+			emit(row.spaceId, [row.pageId], row.requesterSession);
 			if (!withdrawn)
 				eventBus.emit({
 					type: "outline:pending_rejected",

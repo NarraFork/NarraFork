@@ -1,6 +1,6 @@
 {
-  "id": "867e706a-c94c-4fcb-9bc7-42c3cb9a12ea",
-  "prevId": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
+  "id": "1801023f-020a-496f-9811-f04fddff6c0d",
+  "prevId": "867e706a-c94c-4fcb-9bc7-42c3cb9a12ea",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -17715,6 +17715,22 @@
           ],
           "isUnique": false,
           "where": "(\"task_json\"::jsonb #>> '{lock}') IS NOT NULL AND \"deleted\" = FALSE",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_blocks_active_tasks": {
+          "name": "idx_outline_blocks_active_tasks",
+          "columns": [
+            {
+              "expression": "space_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"deleted\" = FALSE AND ((\"task_json\"::jsonb #>> '{status}') = 'doing' OR ((\"task_json\"::jsonb #>> '{status}') = 'todo' AND (\"task_json\"::jsonb #>> '{lock}') IS NOT NULL))",
           "concurrently": false,
           "method": "btree",
           "with": {}

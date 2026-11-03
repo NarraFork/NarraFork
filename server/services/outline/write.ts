@@ -3447,8 +3447,9 @@ async function writePrepared(
 			// got there first: then plan again, and the reopened task is claimed afresh).
 			const quiet = planner.quietClaims;
 			if (quiet.length > 0 && !(await store.updateTaskClaims(quiet))) continue;
-			if (hold) emitPending(space.id, [hold.put.row.pageId]);
-			if (options.confirm) emitPending(space.id, options.confirmPageIds ?? []);
+			if (hold) emitPending(space.id, [hold.put.row.pageId], proposerOfWrite(input));
+			if (options.confirm)
+				emitPending(space.id, options.confirmPageIds ?? [], proposerOfWrite(input));
 			return {
 				spaceId: space.id,
 				commit: null,
@@ -3490,7 +3491,12 @@ async function writePrepared(
 		if (hold) pendingPages.add(hold.put.row.pageId);
 		for (const pageId of options.confirmPageIds ?? [])
 			if (options.confirm) pendingPages.add(pageId);
-		if (pendingPages.size > 0) emitPending(space.id, [...pendingPages]);
+		if (pendingPages.size > 0)
+			emitPending(
+				space.id,
+				[...pendingPages],
+				hold || options.confirm ? proposerOfWrite(input) : null,
+			);
 		return {
 			spaceId: space.id,
 			commit: { id: commit.id, seq: commit.seq },
@@ -3516,8 +3522,25 @@ function isStalePending(error: unknown): boolean {
 	);
 }
 
-/** Pending changes of these pages changed: page subscribers re-read their summaries. */
-function emitPending(spaceId: string, pageIds: readonly string[]): void {
+/** The session a held or confirmed change is about: the writer's (an agent's own session). */
+function proposerOfWrite(input: OutlineWriteInput): string | null {
+	return input.narratorId ?? (input.actor.kind === "agent" ? input.actor.id : null);
+}
+
+/**
+ * Pending changes of these pages changed: page subscribers re-read their summaries, and the
+ * boards of the sessions it is about (`narratorId`, the proposer) read again.
+ */
+function emitPending(
+	spaceId: string,
+	pageIds: readonly string[],
+	narratorId?: string | null,
+): void {
 	if (pageIds.length === 0) return;
-	eventBus.emit({ type: "outline:pending", spaceId, pageIds: [...pageIds] });
+	eventBus.emit({
+		type: "outline:pending",
+		spaceId,
+		pageIds: [...pageIds],
+		...(narratorId ? { narratorIds: [narratorId] } : {}),
+	});
 }

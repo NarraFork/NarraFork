@@ -78,7 +78,13 @@ export interface OpenTaskList {
 /** What the status bar shows of a session's tasks (`NarratorTaskSource.statusBar`). */
 export interface StatusBarView {
 	current: (TaskView & { address: string | null }) | null;
-	awaitingConfirmation: { total: number; mine: number };
+	awaitingConfirmation: {
+		total: number;
+		/** Those the viewer decides: they locked the goal. */
+		mine: number;
+		/** The people who decide the others (their usernames), at most a few. */
+		from: string[];
+	};
 }
 
 /** The one task a continuation names. */
@@ -172,8 +178,9 @@ export interface NarratorTaskSource {
 	/**
 	 * The status bar's read, in one read of the tasks: the first task in progress (with its address
 	 * when the backend has one), and the person-created tasks whose completion waits for
-	 * confirmation (outline: a locked goal the agent ticked done, D26b), in all and those
-	 * `viewerUserId` decides. Spec: its current task, no address, nothing waits.
+	 * confirmation (outline: a locked goal the agent ticked done, D26b), in all, those
+	 * `viewerUserId` decides (on the board: its locker), and who decides the others. Spec: its
+	 * current task, no address, nothing waits.
 	 */
 	statusBar(viewerUserId: string | null): Promise<StatusBarView>;
 

@@ -289,7 +289,11 @@ describe("/goal in an outline session writes a locked, person-created task", () 
 		});
 		expect(done.results[0]?.pending).toBe(true);
 		expect(await source.protectedOpenCount()).toBe(0);
-		expect((await source.statusBar(owner)).awaitingConfirmation).toEqual({ total: 1, mine: 1 });
+		expect((await source.statusBar(owner)).awaitingConfirmation).toEqual({
+			total: 1,
+			mine: 1,
+			from: [],
+		});
 		expect((await source.prepareContinuation({ promoteTodo: true })).protectedOpenCount).toBe(0);
 	});
 
@@ -319,7 +323,11 @@ describe("/goal in an outline session writes a locked, person-created task", () 
 		await settleOutlineTaskEditsForTests();
 		// The goal is open again: protectedOnly continues it.
 		expect(await source.protectedOpenCount()).toBe(1);
-		expect((await source.statusBar(owner)).awaitingConfirmation).toEqual({ total: 0, mine: 0 });
+		expect((await source.statusBar(owner)).awaitingConfirmation).toEqual({
+			total: 0,
+			mine: 0,
+			from: [],
+		});
 		const target = await source.prepareContinuation({ promoteTodo: true });
 		expect(target.protectedOpenCount).toBe(1);
 		// The agent is told, by the system, who rejected it and why.

@@ -179,7 +179,14 @@ export function TaskBoard({
 	const scope = first?.scope;
 	const ownSession = scope?.kind === "session" ? scope.narratorId : null;
 	const me = first?.me.name ?? "";
-	const sections = useMemo(() => pages.flatMap((page) => page.sections), [pages]);
+	// Each space once: a project board's pages are read at different times, and a space can move
+	// from one page to the next in between.
+	const sections = useMemo(() => {
+		const seen = new Set<string>();
+		return pages
+			.flatMap((page) => page.sections)
+			.filter((section) => !seen.has(section.space.id) && !!seen.add(section.space.id));
+	}, [pages]);
 	// Finished tasks loaded past the board's first ones, by space.
 	const [extra, setExtra] = useState<
 		Record<string, { tasks: OutlineBoardTask[]; cursor: string | null }>
@@ -228,7 +235,7 @@ export function TaskBoard({
 	});
 
 	if (!first) return null;
-	const truncated = sections.some((section) => section.openTruncated);
+	const truncated = sections.filter((section) => section.openTruncated);
 	return (
 		<Stack gap="sm" data-testid="task-board" data-scope={scope?.kind}>
 			{scope?.kind === "session" && first.canAdd && <AddTaskForm narratorId={scope.narratorId} />}
@@ -248,11 +255,17 @@ export function TaskBoard({
 					onOpenTask={onOpenTask}
 				/>
 			))}
-			{truncated && (
-				<Text size="xs" c="dimmed">
-					{t("board.openTruncated")}
+			{truncated.map((section) => (
+				<Text
+					key={section.space.id}
+					size="xs"
+					c="dimmed"
+					data-testid="task-board-open-truncated"
+					data-space-id={section.space.id}
+				>
+					{t("board.openTruncatedIn", { label: section.space.label ?? section.space.key })}
 				</Text>
-			)}
+			))}
 			{moreFinished.map((section) => (
 				<Button
 					key={section.space.id}

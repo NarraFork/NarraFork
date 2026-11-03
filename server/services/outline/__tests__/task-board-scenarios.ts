@@ -16,6 +16,7 @@ import { canWriteSpace, type OutlinePrincipal } from "../access";
 import { readProjectSessionSpacePage } from "../access-reads";
 import { OutlineConflictError } from "../errors";
 import { OUTLINE_BEHAVIOR_ALIAS } from "../model";
+import { lockOutlineTask } from "../pending";
 import { addPersonTask, changePersonTask, OUTLINE_TASKS_PAGE_ALIAS } from "../person-tasks";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import { outlineStore } from "../store";
@@ -408,6 +409,70 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 					});
 				}
 			}
+		},
+	},
+	{
+		name: "a space with more open tasks than shown shows the ones in progress or locked, and says which space",
+		async run(ctx) {
+			const owner = await ctx.user();
+			const projectId = await ctx.project({ owner: owner.id });
+			const space = await ensureProjectSpace(projectId);
+			const human = {
+				actor: { kind: "human" as const, id: owner.id },
+				responsibleUserId: owner.id,
+			};
+			// The backlog first (the oldest rows), then a page placed first in document order.
+			const backlog = OUTLINE_TASK_BOARD_LIMITS.projectOpen + 5;
+			await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{ op: "insert", tempId: "b", parent: null, content: "Backlog" },
+					...Array.from({ length: backlog }, (_, i) => ({
+						op: "insert" as const,
+						parent: { tempId: "b" },
+						content: `backlog ${i}`,
+						task: { status: "todo" as const },
+					})),
+				],
+				...human,
+			});
+			const now = await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{ op: "insert", tempId: "n", parent: null, position: { first: true }, content: "Now" },
+					{
+						op: "insert",
+						parent: { tempId: "n" },
+						content: "URGENT in progress",
+						task: { status: "doing" },
+					},
+					{
+						op: "insert",
+						parent: { tempId: "n" },
+						content: "Locked goal",
+						task: { status: "todo" },
+					},
+				],
+				...human,
+			});
+			await lockOutlineTask({ blockId: now.results[2]?.blockId as string, userId: owner.id });
+			const board = await readProjectTaskBoard(as(owner.id), projectId);
+			const section = board.sections.find((s) => s.space.id === space.id);
+			if (!section) throw new Error("expected the project space");
+			expect(section.openTruncated).toBe(true);
+			expect(section.open).toHaveLength(OUTLINE_TASK_BOARD_LIMITS.projectOpen);
+			// In document order: the page placed first comes first.
+			expect(titles(section.open).slice(0, 2)).toEqual(["URGENT in progress", "Locked goal"]);
+			expect(titles(section.open).filter((t) => t.startsWith("backlog"))).toHaveLength(
+				OUTLINE_TASK_BOARD_LIMITS.projectOpen - 2,
+			);
+			// A space within its cap is not cut.
+			const session = await ctx.session({ owner: owner.id, projectId, visibility: "project" });
+			await addPersonTask({ narratorId: session, userId: owner.id, text: "Small", lock: false });
+			const again = await readProjectTaskBoard(as(owner.id), projectId);
+			const small = again.sections.find((s) => s.space.narratorId === session);
+			expect(small?.openTruncated).toBe(false);
+			expect(again.sections.find((s) => s.space.id === space.id)?.openTruncated).toBe(true);
 		},
 	},
 	{

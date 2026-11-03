@@ -678,9 +678,12 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		options: { before?: { versionSeq: number; id: string } | null; limit: number },
 	): Promise<OutlineBlockMeta[]>;
 	/**
-	 * Live open tasks of several spaces at once (a project's task board): at most `limit` of each
-	 * space, unordered within it, each space's `excludePageIds` left out before its limit. One
-	 * statement per chunk of spaces (the open-task index, a bounded seek per space), then the rows.
+	 * Live open tasks of several spaces at once (the task boards), each space's `excludePageIds`
+	 * left out before its limits: of each space, its active open tasks (in progress, or to do and
+	 * locked: the active-task index) and its open tasks (the open-task index), at most `limit` of
+	 * each, unordered, every task once. So a space with more open tasks than `limit` still yields
+	 * the ones in progress (up to `limit`), and more than `limit` rows tell that it has more. One
+	 * statement per chunk of spaces (two bounded seeks per space), then the rows.
 	 */
 	listOpenTasksOfSpaces(
 		parts: ReadonlyArray<{ spaceId: string; excludePageIds?: readonly string[] }>,

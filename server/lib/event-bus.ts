@@ -436,6 +436,11 @@ export type NarraForkEvent =
 			type: "outline:pending";
 			spaceId: string;
 			pageIds: string[];
+			/**
+			 * The narrators the change is about, when known (its proposer): their sessions' task
+			 * boards show it, wherever the task lives (outline P2 PR 5).
+			 */
+			narratorIds?: string[];
 	  }
 	| {
 			/**

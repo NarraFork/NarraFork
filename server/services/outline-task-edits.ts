@@ -39,7 +39,8 @@
  * ----------
  * A commit that changes tasks a session's board shows (structurally, by anyone: the session
  * itself, the session holding a project's task, a person), and a change of what waits for
- * confirmation, send that session's subscribers `outline_tasks_changed` (ids only, merged within
+ * confirmation (on its own space, or proposed by it anywhere: `outline:pending` names the
+ * proposer), send that session's subscribers `outline_tasks_changed` (ids only, merged within
  * {@link OUTLINE_TASK_EDIT_TIMING.boardMs}); the board and the status bar read again. Text-only
  * commits (a task reworded, a note) do not: the board's next read shows the new words.
  *
@@ -113,6 +114,12 @@ interface Entry {
 	commits: Set<string>;
 }
 
+/** A running session's waiting notice: its changes, and how many the cap let go (counted). */
+interface Waiting {
+	entries: Map<string, Entry>;
+	dropped: number;
+}
+
 interface Batch {
 	narratorId: string;
 	/** By person and task, in the order first changed. */
@@ -126,7 +133,7 @@ const state = hotSafe("narrafork.outlineTaskEdits", () => ({
 	inflight: new Set<Promise<void>>(),
 	skip: new Map<string, number>(),
 	/** Notices waiting for a running session's next tool boundary, by session. */
-	waiting: new Map<string, Map<string, Entry>>(),
+	waiting: new Map<string, Waiting>(),
 	watchers: new Map<string, ReturnType<typeof setInterval>>(),
 	boardTimers: new Map<string, ReturnType<typeof setTimeout>>(),
 	spaces: new Map<string, Pick<OutlineSpaceRow, "kind" | "narratorId" | "key">>(),
@@ -407,12 +414,14 @@ async function flushBatch(batch: Batch): Promise<void> {
 		const { isLoopRunning } = await import("./narrator-session");
 		if (isLoopRunning(batch.narratorId)) {
 			// The run takes it at its next tool boundary (`takeOutlineTaskEditNotice`).
-			const waiting = state.waiting.get(batch.narratorId) ?? new Map<string, Entry>();
-			for (const entry of entries) mergeInto(waiting, entry);
-			while (waiting.size > OUTLINE_TASK_EDIT_LIMITS.queuedPerSession) {
-				const oldest = waiting.keys().next().value;
+			const waiting = state.waiting.get(batch.narratorId) ?? { entries: new Map(), dropped: 0 };
+			for (const entry of entries) mergeInto(waiting.entries, entry);
+			// Past the cap the oldest go, counted: the notice says how many more there were.
+			while (waiting.entries.size > OUTLINE_TASK_EDIT_LIMITS.queuedPerSession) {
+				const oldest = waiting.entries.keys().next().value;
 				if (oldest === undefined) break;
-				waiting.delete(oldest);
+				waiting.entries.delete(oldest);
+				waiting.dropped++;
 			}
 			state.waiting.set(batch.narratorId, waiting);
 			watch(batch.narratorId);
@@ -433,7 +442,7 @@ function watch(narratorId: string): void {
 	const timer = setInterval(() => {
 		void (async () => {
 			const waiting = state.waiting.get(narratorId);
-			if (!waiting || waiting.size === 0) {
+			if (!waiting || waiting.entries.size === 0) {
 				clearInterval(timer);
 				state.watchers.delete(narratorId);
 				return;
@@ -443,7 +452,7 @@ function watch(narratorId: string): void {
 			state.waiting.delete(narratorId);
 			clearInterval(timer);
 			state.watchers.delete(narratorId);
-			await writeNotice(narratorId, [...waiting.values()]).catch((error) =>
+			await writeNotice(narratorId, [...waiting.entries.values()], waiting.dropped).catch((error) =>
 				logger.warn("Failed to write a waiting task-change notice", {
 					narratorId,
 					error: String(error),
@@ -458,6 +467,8 @@ function watch(narratorId: string): void {
 async function noticeOf(
 	entries: readonly Entry[],
 	locale: Locale,
+	/** Changes the waiting cap let go: counted with those not listed. */
+	dropped = 0,
 ): Promise<{ content: string; body: SideCarBody }> {
 	const names = await readDisplayNames({
 		userIds: entries.filter((e) => e.who.kind === "human").map((e) => e.who.id),
@@ -477,17 +488,21 @@ async function noticeOf(
 	}
 	const content = getOutlineTaskEditNote(
 		[...groups.values()],
-		entries.length - shown.length,
+		entries.length - shown.length + dropped,
 		locale,
 	);
 	return { content, body: { kind: "prose", text: content } };
 }
 
 /** Write the notice as a system row the session's next turn reads (no wake). */
-async function writeNotice(narratorId: string, entries: readonly Entry[]): Promise<void> {
+async function writeNotice(
+	narratorId: string,
+	entries: readonly Entry[],
+	dropped = 0,
+): Promise<void> {
 	const owner = (await readNarrator(narratorId))?.ownerUserId ?? null;
 	const locale = owner ? await getUserLanguage(owner).catch(() => "en" as const) : "en";
-	const { content, body } = await noticeOf(entries, locale);
+	const { content, body } = await noticeOf(entries, locale, dropped);
 	const { deliverInjection } = await import("./narrator-injection");
 	await deliverInjection(narratorId, {
 		content,
@@ -507,9 +522,9 @@ export async function takeOutlineTaskEditNotice(
 	locale: Locale,
 ): Promise<{ content: string; body: SideCarBody } | null> {
 	const waiting = state.waiting.get(narratorId);
-	if (!waiting || waiting.size === 0) return null;
+	if (!waiting || waiting.entries.size === 0) return null;
 	state.waiting.delete(narratorId);
-	return await noticeOf([...waiting.values()], locale);
+	return await noticeOf([...waiting.entries.values()], locale, waiting.dropped);
 }
 
 /**
@@ -522,11 +537,11 @@ export async function flushOutlineTaskEdits(narratorId: string): Promise<void> {
 	const batch = state.batches.get(narratorId);
 	if (batch) await flushBatch(batch);
 	const waiting = state.waiting.get(narratorId);
-	if (waiting && waiting.size > 0) {
+	if (waiting && waiting.entries.size > 0) {
 		const { isLoopRunning } = await import("./narrator-session");
 		if (!isLoopRunning(narratorId)) {
 			state.waiting.delete(narratorId);
-			await writeNotice(narratorId, [...waiting.values()]);
+			await writeNotice(narratorId, [...waiting.entries.values()], waiting.dropped);
 		}
 	}
 }
@@ -599,11 +614,16 @@ if (hotOnce("narrafork.outlineTaskEdits.listeners")) {
 	eventBus.on("outline:pending", (event) => {
 		if (!isOutlineEnabled()) return;
 		track(
-			spaceOf(event.spaceId)
-				.then((space) => {
-					if (space?.kind === "session" && space.narratorId) refreshBoard(space.narratorId);
-				})
-				.catch(() => {}),
+			(async () => {
+				const space = await spaceOf(event.spaceId);
+				if (space?.kind === "session" && space.narratorId) refreshBoard(space.narratorId);
+				// The session the change is about (its proposer), wherever the task lives: a held
+				// change to a project task shows on the board of the session doing it.
+				const about = event.narratorIds ?? [];
+				if (about.length === 0) return;
+				const roots = await outlineStore.getNarratorRoots(about);
+				for (const id of about) refreshBoard(roots.get(id)?.root ?? id);
+			})().catch(() => {}),
 		);
 	});
 	eventBus.on("outline:pending_rejected", (event) => {

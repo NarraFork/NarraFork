@@ -1634,6 +1634,7 @@ narratorRoutes.get("/:id/tasks/current", async (c) => {
 			: null,
 		awaitingConfirmation: view?.awaitingConfirmation.total ?? 0,
 		awaitingYourConfirmation: view?.awaitingConfirmation.mine ?? 0,
+		awaitingFrom: view?.awaitingConfirmation.from ?? [],
 	};
 	return c.json(body);
 });
