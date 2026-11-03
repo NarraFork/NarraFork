@@ -1,9 +1,11 @@
 /**
  * The task board's queries (outline P2 PR 5): a session's board (its dock tab), a project's board
  * (the project page), the board's changes, and the status bar's current task. A session's board
- * and current task refresh on `outline_tasks_changed` (any outline write to the session's tasks)
- * and `spec_changed` (tasks.json); a project's board on window focus and every half minute, and
- * after the person's own changes.
+ * and current task refresh on `outline_tasks_changed` (a structural change to the session's tasks,
+ * never a text-only commit) and `spec_changed` (tasks.json). A project's board is one query per
+ * page of spaces: only the first refreshes on window focus and every half minute (review round 1
+ * S5: the pages loaded with "More sessions" are not re-read on a timer); every loaded page
+ * re-reads after the person's own changes.
  */
 import type {
 	OutlineBoardAddRequest,
@@ -12,12 +14,12 @@ import type {
 import { OUTLINE_TASKS_CHANGED_EVENT } from "@shared/outline-task-board";
 import {
 	type QueryClient,
-	useInfiniteQuery,
 	useMutation,
+	useQueries,
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
@@ -25,19 +27,24 @@ export const taskBoardKeys = {
 	all: ["task-board"] as const,
 	session: (narratorId: string) => ["task-board", "session", narratorId] as const,
 	project: (projectId: string) => ["task-board", "project", projectId] as const,
+	projectPage: (projectId: string, cursor: string | null) =>
+		["task-board", "project", projectId, cursor ?? ""] as const,
 	current: (narratorId: string) => ["narrators", narratorId, "tasks", "current"] as const,
 };
 
 /** Every board and current task re-reads (after a person's change, which may show anywhere). */
 export function invalidateTaskBoards(queryClient: QueryClient): void {
-	void queryClient.invalidateQueries({ queryKey: taskBoardKeys.all });
-	void queryClient.invalidateQueries({
-		predicate: (query) =>
-			Array.isArray(query.queryKey) &&
-			query.queryKey[0] === "narrators" &&
-			query.queryKey[2] === "tasks" &&
-			query.queryKey[3] === "current",
-	});
+	void queryClient.invalidateQueries({ queryKey: taskBoardKeys.all }, { cancelRefetch: false });
+	void queryClient.invalidateQueries(
+		{
+			predicate: (query) =>
+				Array.isArray(query.queryKey) &&
+				query.queryKey[0] === "narrators" &&
+				query.queryKey[2] === "tasks" &&
+				query.queryKey[3] === "current",
+		},
+		{ cancelRefetch: false },
+	);
 }
 
 /**
@@ -53,8 +60,16 @@ function useSessionTaskEvents(narratorId: string): void {
 			(data) => {
 				if (data.type === "spec_changed" && data.path !== "tasks.json" && data.source !== "reset")
 					return;
-				void queryClient.invalidateQueries({ queryKey: taskBoardKeys.session(narratorId) });
-				void queryClient.invalidateQueries({ queryKey: taskBoardKeys.current(narratorId) });
+				// Several views of one session each listen: a read already under way is shared,
+				// not restarted.
+				void queryClient.invalidateQueries(
+					{ queryKey: taskBoardKeys.session(narratorId) },
+					{ cancelRefetch: false },
+				);
+				void queryClient.invalidateQueries(
+					{ queryKey: taskBoardKeys.current(narratorId) },
+					{ cancelRefetch: false },
+				);
 			},
 		);
 		return () => narratorWSManager.removeListener(handle);
@@ -73,19 +88,50 @@ export function useSessionTaskBoard(narratorId: string, enabled = true) {
 	});
 }
 
-/** A project's task board, a page of spaces at a time. */
+/** How often the first page of a project's board refreshes on its own. */
+export const PROJECT_BOARD_REFRESH_MS = 30_000;
+
+/**
+ * A project's task board, a page of spaces at a time: one query per page, so the timer and window
+ * focus re-read the first page only. A page's cursor comes from the page before it as first read;
+ * a later refresh of that page does not move the pages after it.
+ */
 export function useProjectTaskBoard(projectId: string, enabled = true) {
-	return useInfiniteQuery({
-		queryKey: taskBoardKeys.project(projectId),
-		queryFn: ({ pageParam }) => api.getProjectTaskBoard(projectId, pageParam),
-		initialPageParam: null as string | null,
-		getNextPageParam: (page) => page.nextCursor,
-		enabled: enabled && !!projectId,
-		retry: false,
-		staleTime: 10_000,
-		refetchInterval: 30_000,
-		refetchOnWindowFocus: true,
+	const [state, setState] = useState<{ projectId: string; cursors: Array<string | null> }>({
+		projectId,
+		cursors: [null],
 	});
+	const cursors = state.projectId === projectId ? state.cursors : [null];
+	const results = useQueries({
+		queries: cursors.map((cursor, index) => ({
+			queryKey: taskBoardKeys.projectPage(projectId, cursor),
+			queryFn: () => api.getProjectTaskBoard(projectId, cursor),
+			enabled: enabled && !!projectId,
+			retry: false,
+			staleTime: index === 0 ? 10_000 : Number.POSITIVE_INFINITY,
+			refetchInterval: index === 0 ? PROJECT_BOARD_REFRESH_MS : (false as const),
+			refetchOnWindowFocus: index === 0,
+		})),
+	});
+	const last = results.at(-1);
+	const nextCursor = last?.data?.nextCursor ?? null;
+	const fetchNextPage = useCallback(() => {
+		if (!nextCursor) return;
+		setState((prev) => {
+			const current = prev.projectId === projectId ? prev.cursors : [null];
+			return current.includes(nextCursor) ? prev : { projectId, cursors: [...current, nextCursor] };
+		});
+	}, [nextCursor, projectId]);
+	const first = results[0];
+	const pages = results.flatMap((result) => (result.data ? [result.data] : []));
+	return {
+		pages,
+		isLoading: !!first?.isLoading,
+		error: first?.error ?? null,
+		hasNextPage: nextCursor !== null,
+		isFetchingNextPage: results.length > 1 && !!last?.isLoading,
+		fetchNextPage,
+	};
 }
 
 /** A person adds a task to a session ("Add", "Add and start"). */

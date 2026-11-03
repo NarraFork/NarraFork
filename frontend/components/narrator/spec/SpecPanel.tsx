@@ -160,6 +160,11 @@ function OutlineTasksPanel({
 	);
 }
 
+/**
+ * The Spec files. With `onBackToBoard` (an outline session's old files) they are read only: every
+ * file is shown as a preview, with no editor, save, reload or task controls (the server refuses
+ * those writes with `SPEC_IN_OUTLINE_SESSION`).
+ */
 function SpecFilesPanel({
 	narratorId,
 	onClose,
@@ -223,8 +228,10 @@ function SpecFilesPanel({
 	const uiEditable = fileData?.uiEditable ?? selectedMeta?.uiEditable ?? true;
 	// Agent-readonly: the assistant's tools can't write it (e.g. behavior_fence).
 	const isAgentReadonly = fileData?.readonly ?? selectedMeta?.readonly ?? false;
-	// Preview-only in the UI: not a task file and not UI-editable.
-	const isPreviewOnly = !isTasksFile && !uiEditable;
+	// An outline session's old Spec files: read only, every one of them.
+	const readOnly = onBackToBoard !== undefined;
+	// Preview-only in the UI: read only, or not a task file and not UI-editable.
+	const isPreviewOnly = readOnly || (!isTasksFile && !uiEditable);
 	// Show the behavior-fence hint: agent-readonly but the user may still edit it.
 	const showFenceEditHint = !isTasksFile && isAgentReadonly && uiEditable;
 
@@ -462,6 +469,12 @@ function SpecFilesPanel({
 					<Center style={{ flex: 1 }}>
 						<Loader size="sm" />
 					</Center>
+				) : isPreviewOnly && isTasksFile ? (
+					<ScrollArea style={{ flex: 1 }} p="sm" data-testid="spec-tasks-readonly">
+						<MarkdownContent
+							text={`\`\`\`json\n${JSON.stringify(tasksData?.document ?? { tasks: [] }, null, 2)}\n\`\`\``}
+						/>
+					</ScrollArea>
 				) : isPreviewOnly ? (
 					<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
 						{outlineBehavior && selectedMeta?.path === "behavior_fence" && (

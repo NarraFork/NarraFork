@@ -559,6 +559,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
 			sidecarSourceOutlineTurnEnd: t("sidecar.sources.outline_task_turn_end"),
+			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
 			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
 			contextViewOutlineTasks: t("sidecar.contextViews.outlineTasks"),
 			contextViewOutlineBehavior: t("sidecar.contextViews.outlineBehavior"),

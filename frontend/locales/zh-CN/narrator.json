@@ -2014,6 +2014,7 @@
 			"review_feedback": "代码评审",
 			"interrupt_task_guard": "中断任务提醒",
 			"outline_task_turn_end": "回合末任务提醒",
+			"outline_task_edit": "有人改了任务",
 			"tutorial_lesson": "教程课程",
 			"turn_nudge": "轮次预算",
 			"broken_call": "无效的工具调用",

@@ -1383,7 +1383,7 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		const exists = sysData([
 			{ type: "spec_goal_added", task: "x", added: false, taskBackend: "outline", locked: false },
 		]);
-		expect(exists.badges).toEqual(["Set by you", "Already on the board"]);
+		expect(exists.badges).toEqual(["Set by a person", "Already on the board"]);
 	});
 
 	it("spec_continuation: framed as a bubble task row (glyph + lock + wrapping text)", () => {

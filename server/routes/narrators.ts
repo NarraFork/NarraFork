@@ -1616,21 +1616,24 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 
 /**
  * The status bar's current task, from the task source (outline P2 PR 5): the first task in
- * progress for either task backend, and for an outline session how many of its person-created
- * goals wait for their person to confirm them done.
+ * progress for either task backend (with its outline address), and for an outline session how
+ * many of its person-created goals wait for confirmation of being done, and how many of those the
+ * caller decides. Read access to the session.
  */
 narratorRoutes.get("/:id/tasks/current", async (c) => {
 	const id = c.req.param("id");
 	getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
 	const source = await taskSourceForNarrator(id);
-	const [current, awaitingConfirmation] = await Promise.all([
-		source.currentTask().catch(() => null),
-		source.awaitingConfirmation ? source.awaitingConfirmation().catch(() => 0) : 0,
-	]);
+	// One read of the tasks; an unreadable source shows nothing rather than failing the bar.
+	const view = await source.statusBar(c.get("user").sub).catch(() => null);
+	const current = view?.current ?? null;
 	const body: NarratorCurrentTaskResponse = {
 		backend: source.backend,
-		current: current ? { text: current.text, address: null, protected: current.protected } : null,
-		awaitingConfirmation,
+		current: current
+			? { text: current.text, address: current.address, protected: current.protected }
+			: null,
+		awaitingConfirmation: view?.awaitingConfirmation.total ?? 0,
+		awaitingYourConfirmation: view?.awaitingConfirmation.mine ?? 0,
 	};
 	return c.json(body);
 });

@@ -17,9 +17,15 @@
  * the session space (adding to a session takes its write access) and the task is new, so nobody
  * else holds a lock on it.
  *
- * Dedupe (as `/goal` did in Dynamic Spec): a task of the task page that is not cancelled and has
- * the same title is not added again; done ones count too. Adds of one session run one at a time,
- * so the same text sent twice at once is added once.
+ * Dedupe by body (as `/goal` did in Dynamic Spec, review round 1 S2): a task of the task page that
+ * is not cancelled and holds the same text is not added again; done ones count too. "The same
+ * text" is the whole body the person wrote, whitespace runs taken as one space: the task's own
+ * block and the paragraphs written with it (its blocks created in the same commit, as they read
+ * now), in order; steps added under it later are not part of it. The scan is bounded and
+ * deterministic (the task page's last {@link DEDUPE_SCAN} children, last first); it compares
+ * the heads it reads ({@link OUTLINE_PAGE_HEAD_CHARS} characters) first, and reads whole
+ * contents only for the few whose head matches. Adds of one session run one at a time, so the
+ * same text sent twice at once is added once.
  *
  * CHANGING (the board)
  * --------------------
@@ -30,23 +36,26 @@
  * version the board read, so a change made since is refused (409) and the board reads again.
  */
 import { catalogError, ForbiddenError, NotFoundError, ValidationError } from "@server/lib/errors";
-import { blockTitle, normalizeBlock, titleOf } from "@shared/outline";
+import { type BlockNode, normalizeBlock, serializeBody } from "@shared/outline";
 import {
 	OUTLINE_TASK_BOARD_LIMITS,
 	type OutlineBoardAssignTarget,
 } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
 import { readDisplayNames, readUserByUsername } from "./access-reads";
+import { OUTLINE_TASKS_PAGE_ALIAS } from "./model";
 import { resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
+import { OUTLINE_PAGE_HEAD_CHARS } from "./store/read-port";
 import { type OutlineTaskPatch, type OutlineWriteResult, writeOutline } from "./write";
 
-/** The alias of a session space's task page, where `/goal` and the board's form add tasks. */
-export const OUTLINE_TASKS_PAGE_ALIAS = "tasks";
+export { OUTLINE_TASKS_PAGE_ALIAS };
 
-/** Children of the task page the dedupe reads (the newest are last; older ones are rarely sent again). */
+/** Children of the task page the dedupe reads: the last ones, where tasks are added. */
 const DEDUPE_SCAN = 500;
+/** Tasks whose head matches that the dedupe reads whole. */
+const DEDUPE_FULL_READS = 8;
 
 const TASKS_PAGE_TITLE: Record<"en" | "zh-CN", string> = { en: "Tasks", "zh-CN": "任务" };
 
@@ -89,9 +98,28 @@ export function personTaskText(text: string): string {
 	return trimmed;
 }
 
-/** The title a task written from `text` gets: its first block's first line. */
-function titleFromText(text: string): string {
-	return titleOf(normalizeBlock(text).content).replace(/\s+/g, " ").trim();
+/** A block's text as dedupe compares it: whitespace runs as one space, trimmed. */
+function bodyKey(content: string): string {
+	return content.replace(/\s+/g, " ").trim();
+}
+
+/** The body a task written from `text` gets: its block, and the blocks split off it in order. */
+interface TaskBody {
+	first: string;
+	rest: string[];
+}
+
+function bodyFromText(text: string): TaskBody {
+	const normalized = normalizeBlock(text);
+	const rest: string[] = [];
+	const walk = (nodes: readonly BlockNode[]) => {
+		for (const node of nodes) {
+			rest.push(bodyKey(serializeBody(node.body)));
+			walk(node.children);
+		}
+	};
+	walk(normalized.children);
+	return { first: bodyKey(normalized.content), rest };
 }
 
 /**
@@ -123,9 +151,8 @@ export async function addPersonTask(args: {
 			at.toISOString(),
 		);
 		const [owner] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
-		const title = titleFromText(text);
 		if (owner) {
-			const existing = await findSameTask(store, space, owner.id, title);
+			const existing = await findSameTask(store, space, owner.id, bodyFromText(text));
 			if (existing) {
 				return {
 					added: false,
@@ -183,27 +210,78 @@ export async function addPersonTask(args: {
 	});
 }
 
-/** A task directly on the task page with this title that is not cancelled, if any. */
+/** A task directly on the task page with this body that is not cancelled, if any. */
 async function findSameTask(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
 	pageId: string,
-	title: string,
+	body: TaskBody,
 ): Promise<{ id: string; sid: string; locked: boolean } | null> {
-	const children = (await store.listChildMetas(space.id, [pageId], DEDUPE_SCAN)).filter(
-		(meta) => !meta.deleted && meta.taskJson && meta.taskJson.status !== "cancelled",
+	const children = (await store.listLastChildMetas(space.id, pageId, DEDUPE_SCAN)).filter(
+		(meta) => meta.taskJson && meta.taskJson.status !== "cancelled",
 	);
 	if (children.length === 0) return null;
 	const heads = new Map(
 		(await store.getBlockHeads(children.map((c) => c.id))).map((h) => [h.id, h.contentHead]),
 	);
-	for (const child of children) {
-		const head = heads.get(child.id);
-		if (head === undefined) continue;
-		if (blockTitle(head).replace(/\s+/g, " ").trim() === title)
+	// Heads that match: the whole content when it is shorter than a head, else its beginning.
+	const matching = children
+		.filter((child) => {
+			const head = heads.get(child.id);
+			if (head === undefined) return false;
+			// The head counts characters (code points), as the store cuts it.
+			if ([...head].length < OUTLINE_PAGE_HEAD_CHARS) return bodyKey(head) === body.first;
+			return body.first.startsWith(bodyKey(head));
+		})
+		.slice(0, DEDUPE_FULL_READS);
+	for (const child of matching) {
+		if (await sameBody(store, child.id, body))
 			return { id: child.id, sid: child.sid, locked: !!child.taskJson?.lock };
 	}
 	return null;
+}
+
+/** Whether task `taskId` holds `body`: its whole content, then the blocks written with it. */
+async function sameBody(store: OutlineStore, taskId: string, body: TaskBody): Promise<boolean> {
+	const [task] = await store.getBlocks([taskId]);
+	if (!task || bodyKey(task.content) !== body.first) return false;
+	// The blocks written with it: created under it in the commit that created it.
+	const [created] = await store.getFirstVersions([taskId]);
+	if (!created) return body.rest.length === 0;
+	const versions = await store.listCommitVersions(created.commitId, body.rest.length + 50);
+	const under = new Set([taskId]);
+	for (let grew = true; grew; ) {
+		grew = false;
+		for (const v of versions) {
+			if (v.parentId && under.has(v.parentId) && !under.has(v.blockId)) {
+				under.add(v.blockId);
+				grew = true;
+			}
+		}
+	}
+	under.delete(taskId);
+	if (under.size !== body.rest.length) return false;
+	if (under.size === 0) return true;
+	// As they read now, in document order.
+	const rows = (await store.getBlocks([...under])).filter((row) => !row.deleted);
+	const byParent = new Map<string, typeof rows>();
+	for (const row of rows) {
+		const siblings = byParent.get(row.parentId ?? "") ?? [];
+		siblings.push(row);
+		byParent.set(row.parentId ?? "", siblings);
+	}
+	const rest: string[] = [];
+	const walk = (parentId: string) => {
+		const siblings = (byParent.get(parentId) ?? []).sort((a, b) =>
+			a.orderKey < b.orderKey ? -1 : a.orderKey > b.orderKey ? 1 : a.id < b.id ? -1 : 1,
+		);
+		for (const row of siblings) {
+			rest.push(bodyKey(row.content));
+			walk(row.id);
+		}
+	};
+	walk(taskId);
+	return rest.length === body.rest.length && rest.every((key, i) => key === body.rest[i]);
 }
 
 /**
@@ -277,7 +355,9 @@ async function assigneeOf(
 		throw new ValidationError("Invalid username");
 	const user = await readUserByUsername(username);
 	// Someone who cannot write the space could not do the task there: the same answer as unknown.
-	if (!user || !(await canWriteSpace({ userId: user.id, isAdmin: user.isAdmin }, space)))
+	// Their own grants decide, not an admin's reach everywhere: otherwise a writer of the space
+	// could tell admins' names from everyone else's.
+	if (!user || !(await canWriteSpace({ userId: user.id, isAdmin: false }, space)))
 		throw new ValidationError(`No one named ${username} can work on this task`);
 	return assigneeLabel(user.username);
 }
@@ -285,7 +365,7 @@ async function assigneeOf(
 /** `human:name`, when the name can be written as an assignee. */
 function assigneeLabel(username: string): string {
 	const label = `human:${username}`;
-	if (!/^human:[\p{L}\p{N}_.-]*[\p{L}\p{N}_]$/u.test(label))
+	if (!/^human:[\p{L}\p{N}_.-]*[\p{L}\p{N}_-]$/u.test(label))
 		throw new ValidationError(`${username} cannot be named as an assignee`);
 	return label;
 }

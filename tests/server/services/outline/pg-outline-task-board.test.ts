@@ -49,7 +49,7 @@ function postgresContext(pg: BunSQLDatabase): BoardScenarioContext {
 	return {
 		async user(options = {}) {
 			const id = generateId();
-			const username = `board${id.replace(/[^A-Za-z0-9]/g, "")}`;
+			const username = `board${id.replace(/[^A-Za-z0-9]/g, "")}${options.suffix ?? ""}`;
 			await pg.insert(pgSchema.users).values({
 				id,
 				username,
@@ -71,14 +71,14 @@ function postgresContext(pg: BunSQLDatabase): BoardScenarioContext {
 			});
 			return id;
 		},
-		async session({ owner, projectId, visibility, archived }) {
+		async session({ owner, projectId, visibility, archived, writeAudience }) {
 			const id = generateId();
 			await pg.insert(pgSchema.narrators).values({
 				id,
 				title: `board session ${id}`,
 				ownerUserId: owner,
 				visibility: visibility ?? "private",
-				writeAudience: "owner",
+				writeAudience: writeAudience ?? "owner",
 				contextProjectId: projectId ?? null,
 				taskBackend: "outline",
 				status: archived ? "archived" : "idle",
@@ -92,6 +92,17 @@ function postgresContext(pg: BunSQLDatabase): BoardScenarioContext {
 				id: generateId(),
 				scopeType: "project",
 				scopeId: projectId,
+				principalType: "user",
+				principalId: userId,
+				capability,
+				createdAt: NOW,
+			});
+		},
+		async grantSession(narratorId, userId, capability) {
+			await pg.insert(pgSchema.aclGrants).values({
+				id: generateId(),
+				scopeType: "narrator",
+				scopeId: narratorId,
 				principalType: "user",
 				principalId: userId,
 				capability,

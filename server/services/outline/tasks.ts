@@ -50,6 +50,7 @@ import { outlineStore } from "./store";
 import {
 	chunked,
 	type OutlineBlockMeta,
+	type OutlinePendingHead,
 	type OutlineSpaceRow,
 	type OutlineStore,
 	type OutlineTaskClaimRow,
@@ -789,7 +790,14 @@ export async function findTasksWaitingForPeople(
  */
 export async function deriveOutlineTaskWaits(
 	tasks: readonly OutlineTaskSubject[],
-	options: { store?: OutlineStore } = {},
+	options: {
+		store?: OutlineStore;
+		/**
+		 * The open pending changes that may touch these tasks, already read by the caller (the task
+		 * board reads them by lock root for many spaces at once); read per space when absent.
+		 */
+		openPending?: readonly OutlinePendingHead[];
+	} = {},
 ): Promise<Map<string, OutlineTaskWait>> {
 	const store = options.store ?? outlineStore;
 	const out = new Map<string, OutlineTaskWait>(
@@ -867,7 +875,10 @@ export async function deriveOutlineTaskWaits(
 		const wait = out.get(id);
 		if (wait) wait.people = true;
 	}
-	for (const id of await findTasksWaitingForConfirmation(tasks, { store })) {
+	for (const id of await findTasksWaitingForConfirmation(tasks, {
+		store,
+		openPending: options.openPending,
+	})) {
 		const wait = out.get(id);
 		if (wait) wait.confirmation = true;
 	}
@@ -1012,24 +1023,26 @@ export async function inDocumentOrder(
 	store: OutlineStore,
 	blocks: readonly OutlineBlockMeta[],
 	first: string | null,
+	options: {
+		/** Space keys the caller has already read, by space id (the rest are read here). */
+		keys?: ReadonlyMap<string, string>;
+		/** Ancestors read on the way, by id, for a caller that needs them too. */
+		ancestors?: Map<string, OutlineBlockMeta>;
+	} = {},
 ): Promise<OutlineBlockMeta[]> {
 	const known = new Map(blocks.map((b) => [b.id, b]));
 	for (let depth = 0; ; depth++) {
-		const missing = new Map<string, Set<string>>();
+		// Every space's missing parents of this level in one read (by primary key).
+		const missing = new Set<string>();
 		for (const block of known.values()) {
-			if (block.parentId !== null && !known.has(block.parentId)) {
-				const set = missing.get(block.spaceId);
-				if (set) set.add(block.parentId);
-				else missing.set(block.spaceId, new Set([block.parentId]));
-			}
+			if (block.parentId !== null && !known.has(block.parentId)) missing.add(block.parentId);
 		}
 		if (missing.size === 0 || depth >= OUTLINE_LIMITS.maxDepth) break;
 		let found = 0;
-		for (const [spaceId, ids] of missing) {
-			for (const meta of await store.getBlockMetas(spaceId, { ids: [...ids] })) {
-				known.set(meta.id, meta);
-				found++;
-			}
+		for (const meta of await store.getBlockMetasByIds([...missing])) {
+			known.set(meta.id, meta);
+			options.ancestors?.set(meta.id, meta);
+			found++;
 		}
 		if (found === 0) break;
 	}
@@ -1044,7 +1057,11 @@ export async function inDocumentOrder(
 	};
 	const keys = new Map<string, string>();
 	for (const spaceId of new Set(blocks.map((b) => b.spaceId))) {
-		keys.set(spaceId, spaceId === first ? "" : ((await store.getSpace(spaceId))?.key ?? spaceId));
+		const known = options.keys?.get(spaceId);
+		keys.set(
+			spaceId,
+			spaceId === first ? "" : (known ?? (await store.getSpace(spaceId))?.key ?? spaceId),
+		);
 	}
 	const paths = new Map(blocks.map((b) => [b.id, pathOf(b)]));
 	return [...blocks].sort((a, b) => {

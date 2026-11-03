@@ -20,6 +20,7 @@ export type {
 	OutlineCompactNote,
 	OutlineTaskEdit,
 	OutlineTaskEditChange,
+	OutlineTaskEditGroup,
 	OutlineTaskPromptTask,
 	OutlineTasksViewSection,
 	OutlineTaskWaitText,

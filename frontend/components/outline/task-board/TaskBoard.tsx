@@ -7,7 +7,9 @@
  *     by default, owner Q5), finish, cancel or reopen a task ("Reopen and start" for a session's
  *     own), hand it to themselves or someone else, or back to the session.
  *   - A locked goal whose completion waits for its person (D26b) shows that, with the change and
- *     Confirm / Reject for the person who decides (PR 6's diff and decisions).
+ *     Confirm / Reject for the person who decides (PR 6's diff and decisions); finishing or
+ *     cancelling it from the menu is not offered meanwhile, so no waiting change is left behind.
+ *   - Cancelled tasks are folded under their count until opened.
  *   - Every task opens in the outline.
  *
  * Changes are the person's writes; the board re-reads after each, and when the session's tasks
@@ -29,6 +31,7 @@ import {
 	Textarea,
 	TextInput,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type {
@@ -41,6 +44,8 @@ import type {
 import {
 	IconArrowBackUp,
 	IconCheck,
+	IconChevronDown,
+	IconChevronRight,
 	IconCircle,
 	IconCircleDot,
 	IconCircleX,
@@ -294,6 +299,7 @@ function ExecutorGroupView({
 	onOpenTask?: (task: OutlineBoardTask) => void;
 }) {
 	const { t } = useTranslation("outline");
+	const [showCancelled, setShowCancelled] = useState(false);
 	const byStatus = new Map<StatusGroup, OutlineBoardTask[]>();
 	for (const task of group.tasks) {
 		const status = statusGroupOf(task);
@@ -319,24 +325,48 @@ function ExecutorGroupView({
 				{STATUS_ORDER.map((status) => {
 					const tasks = byStatus.get(status);
 					if (!tasks?.length) return null;
+					// Cancelled tasks are folded until opened.
+					const folded = status === "cancelled" && !showCancelled;
+					const heading = (
+						<Group gap={4}>
+							{status === "cancelled" &&
+								(folded ? <IconChevronRight size={12} /> : <IconChevronDown size={12} />)}
+							{STATUS_ICON[status]}
+							<Text size="xs" c="dimmed" fw={500}>
+								{t(`board.status.${status}`)} · {tasks.length}
+							</Text>
+						</Group>
+					);
 					return (
-						<Stack key={status} gap={2} data-testid="task-board-status" data-status={status}>
-							<Group gap={4}>
-								{STATUS_ICON[status]}
-								<Text size="xs" c="dimmed" fw={500}>
-									{t(`board.status.${status}`)} · {tasks.length}
-								</Text>
-							</Group>
-							{tasks.map((task) => (
-								<TaskRow
-									key={task.id}
-									task={task}
-									section={sectionOf.get(task.spaceId)}
-									scopeKind={scopeKind}
-									me={me}
-									onOpenTask={onOpenTask}
-								/>
-							))}
+						<Stack
+							key={status}
+							gap={2}
+							data-testid="task-board-status"
+							data-status={status}
+							data-folded={folded ? "true" : undefined}
+						>
+							{status === "cancelled" ? (
+								<UnstyledButton
+									onClick={() => setShowCancelled((shown) => !shown)}
+									aria-expanded={!folded}
+									data-testid="task-board-cancelled-toggle"
+								>
+									{heading}
+								</UnstyledButton>
+							) : (
+								heading
+							)}
+							{!folded &&
+								tasks.map((task) => (
+									<TaskRow
+										key={task.id}
+										task={task}
+										section={sectionOf.get(task.spaceId)}
+										scopeKind={scopeKind}
+										me={me}
+										onOpenTask={onOpenTask}
+									/>
+								))}
 						</Stack>
 					);
 				})}
@@ -366,6 +396,8 @@ function TaskRow({
 	const canWrite = section?.canWrite ?? false;
 	const sessionSpace = section?.space.kind === "session";
 	const open = task.status === "todo" || task.status === "doing";
+	// Its completion waits for a person: Confirm / Reject decide it, not the menu.
+	const ending = !task.completion;
 	const assignedToMe = task.assignee === `human:${me}`;
 
 	const change = (body: {
@@ -484,13 +516,15 @@ function TaskRow({
 								<Menu.Dropdown>
 									{canWrite && open && (
 										<>
-											<Menu.Item
-												leftSection={<IconCheck size={14} />}
-												onClick={() => change({ status: "done" })}
-												data-testid="task-action-done"
-											>
-												{t("board.action.done")}
-											</Menu.Item>
+											{ending && (
+												<Menu.Item
+													leftSection={<IconCheck size={14} />}
+													onClick={() => change({ status: "done" })}
+													data-testid="task-action-done"
+												>
+													{t("board.action.done")}
+												</Menu.Item>
+											)}
 											{task.status === "doing" && (
 												<Menu.Item
 													leftSection={<IconArrowBackUp size={14} />}
@@ -500,13 +534,15 @@ function TaskRow({
 													{t("board.action.stop")}
 												</Menu.Item>
 											)}
-											<Menu.Item
-												leftSection={<IconCircleX size={14} />}
-												onClick={() => change({ status: "cancelled" })}
-												data-testid="task-action-cancel"
-											>
-												{t("board.action.cancel")}
-											</Menu.Item>
+											{ending && (
+												<Menu.Item
+													leftSection={<IconCircleX size={14} />}
+													onClick={() => change({ status: "cancelled" })}
+													data-testid="task-action-cancel"
+												>
+													{t("board.action.cancel")}
+												</Menu.Item>
+											)}
 										</>
 									)}
 									{canWrite && !open && (

@@ -43,6 +43,7 @@ import {
 	parseQueuedGoalCommand,
 	resumeNextBufferedMessage,
 } from "../narrator-session";
+import { rejectOutlinePending } from "../outline/pending";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../outline/person-tasks";
 import { outlineStore } from "../outline/store";
 import type { OutlineBlockRow } from "../outline/store/port";
@@ -288,8 +289,59 @@ describe("/goal in an outline session writes a locked, person-created task", () 
 		});
 		expect(done.results[0]?.pending).toBe(true);
 		expect(await source.protectedOpenCount()).toBe(0);
-		expect(await source.awaitingConfirmation?.()).toBe(1);
+		expect((await source.statusBar(owner)).awaitingConfirmation).toEqual({ total: 1, mine: 1 });
 		expect((await source.prepareContinuation({ promoteTodo: true })).protectedOpenCount).toBe(0);
+	});
+
+	test("the person rejecting its completion is told to the agent, and protectedOnly runs on again", async () => {
+		const owner = await user();
+		const id = await session({ owner });
+		await runGoal(id, "ship the release", owner);
+		await settleOutlineTaskEditsForTests();
+		const source = await taskSourceForNarrator(id);
+		const [goal] = (await taskPage(id)).tasks;
+		if (!goal) throw new Error("expected the goal");
+		const done = await writeOutline({
+			spaceId: goal.spaceId,
+			ops: [{ op: "setTask", block: { id: goal.id }, task: { status: "done" } }],
+			actor: { kind: "agent", id },
+			narratorId: id,
+			responsibleUserId: owner,
+		});
+		const pendingId = done.pending?.id;
+		if (!pendingId) throw new Error("expected the completion held");
+		expect(await source.protectedOpenCount()).toBe(0);
+		await rejectOutlinePending({
+			pendingId,
+			by: { kind: "human", userId: owner },
+			reason: "the smoke tests fail",
+		});
+		await settleOutlineTaskEditsForTests();
+		// The goal is open again: protectedOnly continues it.
+		expect(await source.protectedOpenCount()).toBe(1);
+		expect((await source.statusBar(owner)).awaitingConfirmation).toEqual({ total: 0, mine: 0 });
+		const target = await source.prepareContinuation({ promoteTodo: true });
+		expect(target.protectedOpenCount).toBe(1);
+		// The agent is told, by the system, who rejected it and why.
+		const notes = (await contentBlocks(id)).filter(
+			(block) => block.type === "system_injection" && block.source === "outline_task_edit",
+		);
+		expect(notes).toHaveLength(1);
+		const rows = await db
+			.select({
+				role: narratorMessages.role,
+				createdBy: narratorMessages.createdBy,
+				text: narratorMessages.contentText,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(eq(narratorMessageRefs.narratorId, id));
+		const note = rows.find((row) => row.text?.includes("System notice"));
+		expect(note).toMatchObject({ role: "sys", createdBy: null });
+		expect(note?.text).toContain("rejected your marking it done; reason: the smoke tests fail");
+		expect(note?.text).toContain(`/${goal.sid}`);
+		// The person's only message is the /goal they sent.
+		expect(rows.filter((row) => row.role === "user")).toHaveLength(1);
 	});
 });
 

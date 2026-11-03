@@ -1,7 +1,6 @@
 import {
 	ActionIcon,
 	Avatar,
-	Badge,
 	Box,
 	Button,
 	Group,
@@ -31,6 +30,10 @@ import {
 	statusRegistry,
 } from "../../../lib/constants";
 import { TruncatedText } from "../../common/TruncatedText";
+import {
+	AwaitingConfirmationBadge,
+	type AwaitingConfirmationCounts,
+} from "../../outline/task-board/AwaitingConfirmationBadge";
 import { UserAvatar } from "../../UserAvatar";
 import {
 	BackgroundTasksStatusButton,
@@ -113,10 +116,10 @@ export interface NarratorInteractionStatusBarProps {
 		isCompacting: boolean;
 		currentSpecTask: SpecTaskItem | null;
 		/**
-		 * "N goals wait for your confirmation" (outline P2 PR 5: a locked goal the agent ticked done,
-		 * D26b), shown while idle; a click opens the task board. Null when none waits.
+		 * Goals whose completion waits for a person (outline P2 PR 5: a locked goal the agent ticked
+		 * done, D26b), and how many the viewer decides; a click opens the task board.
 		 */
-		awaitingConfirmationLabel?: string | null;
+		awaitingConfirmation?: AwaitingConfirmationCounts | null;
 		retryInfo: RetryInfo | null;
 		compactingMarkerMessageId: string | null;
 		compactFailure: CompactFailureInfo | null;
@@ -498,16 +501,11 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									onOpen={tasks.onOpenPanel}
 								/>
 							)}
-							{workIndicator.awaitingConfirmationLabel && !isWorkspacePreview && (
-								<UnstyledButton
-									onClick={workIndicator.onOpenSpecTool}
-									style={{ flexShrink: 0 }}
-									data-testid="status-awaiting-confirmation"
-								>
-									<Badge size="xs" color="orange" variant="light" tt="none">
-										{workIndicator.awaitingConfirmationLabel}
-									</Badge>
-								</UnstyledButton>
+							{!isWorkspacePreview && (
+								<AwaitingConfirmationBadge
+									counts={workIndicator.awaitingConfirmation}
+									onOpen={workIndicator.onOpenSpecTool}
+								/>
 							)}
 							{workIndicator.compactFailure && !workIndicator.isCompacting && (
 								<Text

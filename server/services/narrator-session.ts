@@ -2071,6 +2071,12 @@ export interface SpecContinuationOptions {
 	state?: SpecContinuationState;
 	/** Delivery/transcript placement changes only persistence, never continuation decisions. */
 	placement?: InjectionRecipientPlacement;
+	/**
+	 * The task a person asked the session to start (outline P2 PR 5: "Add and start", "Reopen and
+	 * start"): started for the session and named by the continuation; nothing else when it cannot
+	 * be (`NarratorTaskSource.prepareContinuation`).
+	 */
+	preferTaskId?: string;
 }
 
 /**
@@ -2080,9 +2086,13 @@ export interface SpecContinuationOptions {
 async function readContinuationTarget(
 	taskSource: NarratorTaskSource,
 	promoteTodo: boolean,
+	preferTaskId?: string,
 ): Promise<ContinuationTarget> {
 	try {
-		return await taskSource.prepareContinuation({ promoteTodo });
+		return await taskSource.prepareContinuation({
+			promoteTodo,
+			...(preferTaskId ? { preferTaskId } : {}),
+		});
 	} catch {
 		return { openTask: null, protectedOpenCount: 0 };
 	}
@@ -2140,7 +2150,11 @@ async function maybeStartSpecContinuation(
 		suppressed: active._continuationSuppressed === true,
 	};
 	const taskSource = await taskSourceForNarrator(active.narratorId);
-	const spec = await readContinuationTarget(taskSource, policy.continuation.promoteTodo);
+	const spec = await readContinuationTarget(
+		taskSource,
+		policy.continuation.promoteTodo,
+		options?.preferTaskId,
+	);
 	const cause = options?.cause ?? "spec";
 	// A narrator without tasks of its own (an outline subagent, D27c) continues only when a pass
 	// spent its turn budget before the final reply: the mode's task conditions do not apply to
@@ -2879,6 +2893,24 @@ export async function drainInjectionsIntoHistory(
 			locale,
 		});
 		if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
+	}
+
+	// Outline tasks people changed while this session worked: a system notice naming who
+	// changed what, never a person's message (outline-task-edits.ts). Sessions only; a
+	// subagent's tasks are its session's.
+	if (!subagent) {
+		const { takeOutlineTaskEditNotice } = await import("./outline-task-edits");
+		const notice = await takeOutlineTaskEditNotice(narratorId, locale).catch(() => null);
+		if (notice) {
+			const { messageId, turnText } = await deliverInjection(narratorId, {
+				content: notice.content,
+				body: notice.body,
+				source: "outline_task_edit",
+				schedule: "onNextTurn",
+				locale,
+			});
+			if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
+		}
 	}
 
 	return {
@@ -4588,6 +4620,10 @@ export async function startSpecContinuationIfPossible(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
+	options: {
+		/** The task the person asked to start (outline): the continuation names it. */
+		preferTaskId?: string;
+	} = {},
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
 		if (isLoopRunning(narratorId)) return { started: false };
@@ -4609,6 +4645,7 @@ export async function startSpecContinuationIfPossible(
 
 		const prompt = await maybeStartContinuation(active, false, {
 			explicitStart: true,
+			...(options.preferTaskId ? { preferTaskId: options.preferTaskId } : {}),
 		});
 		if (!prompt) return { started: false };
 

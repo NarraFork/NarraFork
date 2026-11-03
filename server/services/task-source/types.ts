@@ -75,6 +75,12 @@ export interface OpenTaskList {
 	revision: string | null;
 }
 
+/** What the status bar shows of a session's tasks (`NarratorTaskSource.statusBar`). */
+export interface StatusBarView {
+	current: (TaskView & { address: string | null }) | null;
+	awaitingConfirmation: { total: number; mine: number };
+}
+
 /** The one task a continuation names. */
 export interface ContinuationTask {
 	text: string;
@@ -164,10 +170,12 @@ export interface NarratorTaskSource {
 	 */
 	protectedOpenCount(): Promise<number>;
 	/**
-	 * Person-created tasks whose completion waits for their person's confirmation (outline: a
-	 * locked goal the agent ticked done, D26b), for the status bar. Absent: none (spec).
+	 * The status bar's read, in one read of the tasks: the first task in progress (with its address
+	 * when the backend has one), and the person-created tasks whose completion waits for
+	 * confirmation (outline: a locked goal the agent ticked done, D26b), in all and those
+	 * `viewerUserId` decides. Spec: its current task, no address, nothing waits.
 	 */
-	awaitingConfirmation?(): Promise<number>;
+	statusBar(viewerUserId: string | null): Promise<StatusBarView>;
 
 	// ── Continuation ──────────────────────────────────────────────────────────
 
@@ -179,7 +187,17 @@ export interface NarratorTaskSource {
 	 * promotion therefore lands even when no continuation follows. Delegated subagents do
 	 * not promote (`policy.continuation.promoteTodo`).
 	 */
-	prepareContinuation(options: { promoteTodo: boolean }): Promise<ContinuationTarget>;
+	prepareContinuation(options: {
+		promoteTodo: boolean;
+		/**
+		 * The task a person just asked the session to start ("Add and start", "Reopen and start";
+		 * outline P2 PR 5): a to-do of the session's own is started for it (the same system start
+		 * as a promotion, even with `promoteTodo` off and something else in progress), and the
+		 * target is this task, or none when it cannot be started. A backend without task ids
+		 * (spec) ignores it.
+		 */
+		preferTaskId?: string;
+	}): Promise<ContinuationTarget>;
 	/** The continuation prompt: names one task, says the system sent it, lists the outcomes. */
 	continuationPrompt(input: ContinuationPromptInput): string;
 

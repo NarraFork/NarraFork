@@ -442,7 +442,6 @@ function NarratorPanelBody({
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: balanceT } = useTranslation("settings");
-	const { t: tOutline } = useTranslation("outline");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -3632,10 +3631,11 @@ function NarratorPanelBody({
 								isRetrying,
 								isCompacting,
 								currentSpecTask,
-								awaitingConfirmationLabel: currentTaskData?.awaitingConfirmation
-									? tOutline("board.statusBar.awaiting", {
-											count: currentTaskData.awaitingConfirmation,
-										})
+								awaitingConfirmation: currentTaskData
+									? {
+											total: currentTaskData.awaitingConfirmation,
+											yours: currentTaskData.awaitingYourConfirmation,
+										}
 									: null,
 								retryInfo,
 								compactingMarkerMessageId,

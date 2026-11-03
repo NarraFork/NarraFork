@@ -909,18 +909,27 @@ async function readableNarrator(principal: OutlinePrincipal, narratorId: string)
 }
 
 /**
- * Start the session on its tasks when it is idle ("Add and start", "Reopen and start"; owner Q5),
- * as `/goal` starts its first turn: once even when continuation is off, never in plan mode. The
- * person's changes are told to it first, so the turn reads them.
+ * Start the session on `taskId` when it is idle ("Add and start", "Reopen and start"; owner Q5,
+ * review round 1 S4), as `/goal` starts its first turn: once even when continuation is off, never
+ * in plan mode. The task is started for the session (the system start a continuation's promotion
+ * makes, actor `outline-task-start`) before the turn, whose prompt names it; when it cannot be
+ * started, the session is not. The person's changes are told to it first, so the turn reads them.
+ * The caller has checked that the person may write the session: the turn runs on their behalf.
  */
-async function startSession(narratorId: string, userId: string): Promise<boolean> {
+async function startSessionOn(
+	narratorId: string,
+	userId: string,
+	taskId: string,
+): Promise<boolean> {
 	await flushOutlineTaskEdits(narratorId);
 	const { startSpecContinuationIfPossible } = await import("../services/narrator-session");
 	const [locale, reply] = await Promise.all([
 		getUserLanguage(userId),
 		getUserReplyInLanguage(userId),
 	]);
-	const { started } = await startSpecContinuationIfPossible(narratorId, locale, reply, userId);
+	const { started } = await startSpecContinuationIfPossible(narratorId, locale, reply, userId, {
+		preferTaskId: taskId,
+	});
 	return started;
 }
 
@@ -973,8 +982,8 @@ outlineRoutes.get("/spaces/:spaceId/tasks/finished", async (c) => {
 
 /**
  * A person adds a task to a session (the board's form): person-created, locked unless asked
- * otherwise, deduped by title; with `start`, the session starts on its tasks when idle. Write
- * access to the session, whose tasks must live in the outline.
+ * otherwise, deduped by body; with `start`, the session starts on it when idle. Write access to
+ * the session, whose tasks must live in the outline.
  */
 outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 1024 }), async (c) => {
 	const principal = principalOf(c);
@@ -991,7 +1000,9 @@ outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 102
 		lock: input.lock !== false,
 		locale: locale === "zh-CN" ? "zh-CN" : "en",
 	});
-	const started = input.start ? await startSession(narrator.id, principal.userId) : false;
+	const started = input.start
+		? await startSessionOn(narrator.id, principal.userId, task.blockId)
+		: false;
 	const body: OutlineBoardAddResponse = {
 		added: task.added,
 		task: { id: task.blockId, address: task.address, spaceId: task.spaceId },
@@ -1003,7 +1014,8 @@ outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 102
 
 /**
  * A person changes one task on the board: finish, cancel or reopen it, hand it to someone or
- * back to the session; with `start`, the session whose space holds it starts when idle. Write
+ * back to the session; with `start`, the session whose space holds it starts on it when idle,
+ * which takes write access to that session (403 otherwise, before anything changes). Write
  * access to the task's space (404 when it cannot be read); 409 when the task changed since it
  * was read.
  */
@@ -1015,6 +1027,13 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 	if (!block || !space || !(await canReadSpace(principal, space)))
 		throw new NotFoundError("Outline task", blockId);
 	const input = parse(outlineBoardTaskUpdateBodySchema, await c.req.json().catch(() => ({})));
+	// Starting a session runs a turn on the person's behalf: only someone who may write it.
+	const startable =
+		input.start && space.kind === "session" && space.narratorId
+			? await readNarrator(space.narratorId)
+			: null;
+	if (input.start && !(startable && (await holds(principal, "write", { narrator: startable }))))
+		throw new ForbiddenError("You cannot start this session");
 	const { result } = await changePersonTask({
 		principal,
 		blockId,
@@ -1022,10 +1041,9 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 		status: input.status,
 		assign: input.assign,
 	});
-	const session = space.kind === "session" ? space.narratorId : null;
 	const started =
-		input.start && session && (await resolveTaskBackend(session)) === "outline"
-			? await startSession(session, principal.userId)
+		startable && (await resolveTaskBackend(startable.id)) === "outline"
+			? await startSessionOn(startable.id, principal.userId, blockId)
 			: false;
 	const body: OutlineBoardTaskUpdateResponse = {
 		versionSeq: result?.commit?.seq ?? null,

@@ -67,9 +67,11 @@ import {
 	chunked,
 	claimsAsExpected,
 	expectedPendingRevs,
+	inIdOrder,
 	lockedClaimIds,
 	type NarratorStateRow,
 	narratorSessions,
+	OUTLINE_BATCH_SPACES,
 	OUTLINE_RENEW_LIMIT,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
@@ -786,7 +788,7 @@ async function ensureSpaceSection(
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
-	return {
+	const store: OutlineStore = {
 		backendId: "postgres",
 		...createPostgresOutlineReads(db),
 
@@ -870,6 +872,22 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				for (const row of rows) out.push(toMeta(row));
 			}
 			return out;
+		},
+
+		async listLastChildMetas(spaceId, parentId, limit) {
+			const rows = await db
+				.select(metaColumns)
+				.from(outlineBlocks)
+				.where(
+					and(
+						eq(outlineBlocks.spaceId, spaceId),
+						eq(outlineBlocks.parentId, parentId),
+						eq(outlineBlocks.deleted, false),
+					),
+				)
+				.orderBy(sql`${orderKeyBytewise} desc`, sql`${outlineBlocks.id} COLLATE "C" desc`)
+				.limit(limit);
+			return rows.map(toMeta);
 		},
 
 		async findAliasOwners(spaceId, aliases) {
@@ -1128,6 +1146,20 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return rows.map(toPendingHead);
 		},
 
+		async listOpenPendingByRoots(rootIds, limit) {
+			const out: OutlinePendingHead[] = [];
+			for (const chunk of chunked(rootIds)) {
+				if (out.length >= limit) break;
+				const rows = await db
+					.select(pendingHeadColumns)
+					.from(outlinePending)
+					.where(and(inArray(outlinePending.rootBlockId, chunk), sql`"status" = 'open'`))
+					.limit(limit - out.length);
+				out.push(...rows.map(toPendingHead));
+			}
+			return out;
+		},
+
 		async findOpenPending(requesterSession, rootBlockId) {
 			const rows = await db
 				.select()
@@ -1290,10 +1322,10 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		},
 
 		async listFinishedTasks(spaceId, { before, limit }) {
-			// The predicate is the finished-task index's own, so the planner can use the index; ids
-			// compare bytewise, as on SQLite, so a cursor means the same on both.
+			// The predicate is the finished-task index's own and the cursor a row-value comparison in
+			// the column's own collation, so the planner seeks the index backwards to the page
+			// instead of reading and sorting every finished task of the space.
 			const b = outlineBlocks;
-			const id = sql`${b.id} COLLATE "C"`;
 			const rows = await db
 				.select(metaColumns)
 				.from(b)
@@ -1302,14 +1334,84 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 						eq(b.spaceId, spaceId),
 						sql`("task_json"::jsonb #>> '{status}') IN ('done', 'cancelled') AND "deleted" = FALSE`,
 						before
-							? sql`(${b.versionSeq} < ${before.versionSeq}
-								OR (${b.versionSeq} = ${before.versionSeq} AND ${id} < ${before.id}))`
+							? sql`(${b.versionSeq}, ${b.id}) < (${before.versionSeq}, ${before.id})`
 							: undefined,
 					),
 				)
-				.orderBy(desc(b.versionSeq), sql`${id} DESC`)
+				.orderBy(desc(b.versionSeq), desc(b.id))
 				.limit(limit);
 			return rows.map(toMeta);
+		},
+
+		async listOpenTasksOfSpaces(parts, limit) {
+			// One compound statement per chunk: each member is the open-task index's own predicate
+			// on one space, with its own limit. Ids first, then the rows by key.
+			const ids: string[] = [];
+			for (const chunk of chunked(parts, OUTLINE_BATCH_SPACES)) {
+				const members = chunk.map((part) => {
+					const exclude = part.excludePageIds ?? [];
+					return sql`(select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and ("task_json"::jsonb #>> '{status}') IN ('todo', 'doing') AND "deleted" = FALSE${
+						exclude.length > 0
+							? sql` and "page_id" not in (${sql.join(
+									exclude.map((id) => sql`${id}`),
+									sql`, `,
+								)})`
+							: sql``
+					} limit ${limit})`;
+				});
+				const rows = (await db.execute(sql.join(members, sql` union all `))) as unknown as Array<{
+					id: string;
+				}>;
+				for (const row of rows) ids.push(row.id);
+			}
+			return await store.getBlockMetasByIds(ids);
+		},
+
+		async listFinishedTasksOfSpaces(spaceIds, limit) {
+			const ids: string[] = [];
+			for (const chunk of chunked(spaceIds, OUTLINE_BATCH_SPACES)) {
+				const members = chunk.map(
+					(spaceId) =>
+						sql`(select "id" from "outline_blocks" where "space_id" = ${spaceId} and ("task_json"::jsonb #>> '{status}') IN ('done', 'cancelled') AND "deleted" = FALSE order by "version_seq" desc, "id" desc limit ${limit})`,
+				);
+				const rows = (await db.execute(sql.join(members, sql` union all `))) as unknown as Array<{
+					id: string;
+				}>;
+				for (const row of rows) ids.push(row.id);
+			}
+			return inIdOrder(ids, await store.getBlockMetasByIds(ids));
+		},
+
+		async getBlockMetasByIds(ids) {
+			const out: OutlineBlockMeta[] = [];
+			for (const chunk of chunked(ids)) {
+				const rows = await db
+					.select(metaColumns)
+					.from(outlineBlocks)
+					.where(inArray(outlineBlocks.id, chunk));
+				out.push(...rows.map(toMeta));
+			}
+			return out;
+		},
+
+		async findAliasOwnersInSpaces(spaceIds, alias) {
+			const out: Array<{ spaceId: string; id: string }> = [];
+			for (const chunk of chunked(spaceIds)) {
+				out.push(
+					...(await db
+						.select({ spaceId: outlineBlocks.spaceId, id: outlineBlocks.id })
+						.from(outlineBlocks)
+						.where(
+							and(
+								inArray(outlineBlocks.spaceId, chunk),
+								eq(outlineBlocks.alias, alias),
+								// The literal lets the planner use the partial unique alias index.
+								sql`${outlineBlocks.deleted} = false`,
+							),
+						)),
+				);
+			}
+			return out;
 		},
 
 		async listExpiredTaskClaims(now, limit) {
@@ -1507,4 +1609,5 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			);
 		},
 	};
+	return store;
 }

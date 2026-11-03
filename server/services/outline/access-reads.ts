@@ -504,6 +504,68 @@ export async function readProjectSessionSpacePage(
 	return rows.map(toSpace);
 }
 
+/** What a session's write rule is decided from, for many sessions at once (the task board). */
+export interface SessionWriteFacts {
+	id: string;
+	ownerUserId: string | null;
+	writeAudience: string;
+	type: string;
+	/**
+	 * The project `resolveNarratorProjectId` gives (the explicit project, else on SQLite the primary
+	 * working-directory link; PostgreSQL knows the explicit project alone so far).
+	 */
+	gateProjectId: string | null;
+}
+
+/** The write facts of the given narrators, one statement per chunk of ids. */
+export async function readSessionWriteFacts(
+	narratorIds: readonly string[],
+): Promise<Map<string, SessionWriteFacts>> {
+	const pg = executor().dialect === "postgres";
+	const gate = sql.raw(pg ? "n.context_project_id" : narratorProjectIdText("n"));
+	const out = new Map<string, SessionWriteFacts>();
+	for (const chunk of chunked([...new Set(narratorIds)])) {
+		const rows = await all(sql`
+			select n.id, n.owner_user_id, n.write_audience, n.type, ${gate} as gate_project_id
+			from narrators n where n.id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows) {
+			const id = text(row, "id");
+			out.set(id, {
+				id,
+				ownerUserId: textOrNull(row, "owner_user_id"),
+				writeAudience: text(row, "write_audience"),
+				type: text(row, "type"),
+				gateProjectId: textOrNull(row, "gate_project_id"),
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * Of the given narrators, those on which `userId` holds a write grant, directly or through the
+ * `user` role (domain credentials are never capabilities). One statement per chunk of ids.
+ */
+export async function readNarratorWriteGrants(
+	narratorIds: readonly string[],
+	userId: string,
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	for (const chunk of chunked([...new Set(narratorIds)])) {
+		const rows = await all(sql`
+			select distinct scope_id from acl_grants
+			where scope_type = 'narrator' and scope_id in (${idList(chunk)}) and domain_kind is null
+				and capability = 'write'
+				and ((principal_type = 'user' and principal_id = ${userId})
+					or (principal_type = 'role' and principal_id = 'user'))
+			limit ${chunk.length}
+		`);
+		for (const row of rows) out.add(text(row, "scope_id"));
+	}
+	return out;
+}
+
 /**
  * Where the spaces a session might read are looked for (`session-scope.ts` judges each one):
  *

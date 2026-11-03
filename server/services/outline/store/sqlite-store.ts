@@ -24,7 +24,6 @@ import {
 	inArray,
 	isNotNull,
 	isNull,
-	lt,
 	lte,
 	ne,
 	notInArray,
@@ -61,8 +60,10 @@ import {
 	claimsAsExpected,
 	expectedClaimIds,
 	expectedPendingRevs,
+	inIdOrder,
 	type NarratorStateRow,
 	narratorSessions,
+	OUTLINE_BATCH_SPACES,
 	OUTLINE_RENEW_LIMIT,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
@@ -640,6 +641,24 @@ export const sqliteOutlineStore: OutlineStore = {
 		return out;
 	},
 
+	async listLastChildMetas(spaceId, parentId, limit) {
+		// SQLite compares text bytewise (BINARY), which is the order-key order.
+		return db
+			.select(metaColumns)
+			.from(outlineBlocks)
+			.where(
+				and(
+					eq(outlineBlocks.spaceId, spaceId),
+					eq(outlineBlocks.parentId, parentId),
+					eq(outlineBlocks.deleted, false),
+				),
+			)
+			.orderBy(desc(outlineBlocks.orderKey), desc(outlineBlocks.id))
+			.limit(limit)
+			.all()
+			.map(toMeta);
+	},
+
 	async findAliasOwners(spaceId, aliases) {
 		const out: Array<{ alias: string; id: string }> = [];
 		for (const chunk of chunked(aliases)) {
@@ -956,6 +975,23 @@ export const sqliteOutlineStore: OutlineStore = {
 			.map(toPendingHead);
 	},
 
+	async listOpenPendingByRoots(rootIds, limit) {
+		const out: OutlinePendingHead[] = [];
+		for (const chunk of chunked(rootIds)) {
+			if (out.length >= limit) break;
+			out.push(
+				...db
+					.select(pendingHeadColumns)
+					.from(outlinePending)
+					.where(and(inArray(outlinePending.rootBlockId, chunk), sql`"status" = 'open'`))
+					.limit(limit - out.length)
+					.all()
+					.map(toPendingHead),
+			);
+		}
+		return out;
+	},
+
 	async findOpenPending(requesterSession, rootBlockId) {
 		const row = db
 			.select()
@@ -1135,8 +1171,8 @@ export const sqliteOutlineStore: OutlineStore = {
 	},
 
 	async listFinishedTasks(spaceId, { before, limit }) {
-		// The predicate is the finished-task index's own, word for word, so the index serves it,
-		// in its order (SQLite compares the ids bytewise).
+		// The predicate is the finished-task index's own, word for word, and the cursor a row-value
+		// comparison, so the index seeks straight to the page, in its order.
 		const b = outlineBlocks;
 		return db
 			.select(metaColumns)
@@ -1145,18 +1181,84 @@ export const sqliteOutlineStore: OutlineStore = {
 				and(
 					eq(b.spaceId, spaceId),
 					sql`json_extract("task_json", '$.status') IN ('done', 'cancelled') AND "deleted" = 0`,
-					before
-						? or(
-								lt(b.versionSeq, before.versionSeq),
-								and(eq(b.versionSeq, before.versionSeq), lt(b.id, before.id)),
-							)
-						: undefined,
+					before ? sql`("version_seq", "id") < (${before.versionSeq}, ${before.id})` : undefined,
 				),
 			)
 			.orderBy(desc(b.versionSeq), desc(b.id))
 			.limit(limit)
 			.all()
 			.map(toMeta);
+	},
+
+	async listOpenTasksOfSpaces(parts, limit) {
+		// One compound statement per chunk: each member is the open-task index's own predicate on
+		// one space, with its own limit (a bounded seek). Ids first, then the rows by key.
+		const ids: string[] = [];
+		for (const chunk of chunked(parts, OUTLINE_BATCH_SPACES)) {
+			const members = chunk.map((part) => {
+				const exclude = part.excludePageIds ?? [];
+				return sql`select * from (select "id" from "outline_blocks" where "space_id" = ${part.spaceId} and json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0${
+					exclude.length > 0
+						? sql` and "page_id" not in (${sql.join(
+								exclude.map((id) => sql`${id}`),
+								sql`, `,
+							)})`
+						: sql``
+				} limit ${limit})`;
+			});
+			for (const row of db.all<{ id: string }>(sql.join(members, sql` union all `)))
+				ids.push(row.id);
+		}
+		return await sqliteOutlineStore.getBlockMetasByIds(ids);
+	},
+
+	async listFinishedTasksOfSpaces(spaceIds, limit) {
+		const ids: string[] = [];
+		for (const chunk of chunked(spaceIds, OUTLINE_BATCH_SPACES)) {
+			const members = chunk.map(
+				(spaceId) =>
+					sql`select * from (select "id" from "outline_blocks" where "space_id" = ${spaceId} and json_extract("task_json", '$.status') IN ('done', 'cancelled') AND "deleted" = 0 order by "version_seq" desc, "id" desc limit ${limit})`,
+			);
+			for (const row of db.all<{ id: string }>(sql.join(members, sql` union all `)))
+				ids.push(row.id);
+		}
+		return inIdOrder(ids, await sqliteOutlineStore.getBlockMetasByIds(ids));
+	},
+
+	async getBlockMetasByIds(ids) {
+		const out: OutlineBlockMeta[] = [];
+		for (const chunk of chunked(ids)) {
+			out.push(
+				...db
+					.select(metaColumns)
+					.from(outlineBlocks)
+					.where(inArray(outlineBlocks.id, chunk))
+					.all()
+					.map(toMeta),
+			);
+		}
+		return out;
+	},
+
+	async findAliasOwnersInSpaces(spaceIds, alias) {
+		const out: Array<{ spaceId: string; id: string }> = [];
+		for (const chunk of chunked(spaceIds)) {
+			out.push(
+				...db
+					.select({ spaceId: outlineBlocks.spaceId, id: outlineBlocks.id })
+					.from(outlineBlocks)
+					.where(
+						and(
+							inArray(outlineBlocks.spaceId, chunk),
+							eq(outlineBlocks.alias, alias),
+							// The literal lets the planner use the partial unique alias index.
+							sql`${outlineBlocks.deleted} = 0`,
+						),
+					)
+					.all(),
+			);
+		}
+		return out;
 	},
 
 	async listExpiredTaskClaims(now, limit) {

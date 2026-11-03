@@ -780,6 +780,12 @@ export async function rejectOutlinePending(args: {
 		});
 		if (ok) {
 			emit(row.spaceId, [row.pageId]);
+			if (!withdrawn)
+				eventBus.emit({
+					type: "outline:pending_rejected",
+					spaceId: row.spaceId,
+					pendingId: row.id,
+				});
 			return (await store.getPending([row.id]))[0] ?? row;
 		}
 		// Merged into or decided meanwhile: look again.
@@ -930,19 +936,29 @@ export async function pendingBaseChanged(
  */
 export async function findTasksWaitingForConfirmation(
 	tasks: readonly OutlineTaskSubject[],
-	options: { store?: OutlineStore } = {},
+	options: {
+		store?: OutlineStore;
+		/** The open changes to look at, already read by the caller; read per space when absent. */
+		openPending?: readonly OutlinePendingHead[];
+	} = {},
 ): Promise<Set<string>> {
 	const store = options.store ?? outlineStore;
 	const out = new Set<string>();
+	const ids = new Set(tasks.map((task) => task.id));
+	if (options.openPending) {
+		for (const row of options.openPending)
+			for (const id of row.blockIdsJson) if (ids.has(id)) out.add(id);
+		return out;
+	}
 	const bySpace = new Map<string, Set<string>>();
 	for (const task of tasks) {
 		const set = bySpace.get(task.spaceId) ?? new Set();
 		set.add(task.id);
 		bySpace.set(task.spaceId, set);
 	}
-	for (const [spaceId, ids] of bySpace) {
+	for (const [spaceId, spaceIds] of bySpace) {
 		const open = await store.listOpenPendingBySpace(spaceId, OUTLINE_PENDING_LIMITS.scanPerSpace);
-		for (const row of open) for (const id of row.blockIdsJson) if (ids.has(id)) out.add(id);
+		for (const row of open) for (const id of row.blockIdsJson) if (spaceIds.has(id)) out.add(id);
 	}
 	return out;
 }
@@ -956,24 +972,26 @@ export async function findTasksWaitingForConfirmation(
  */
 export async function findCompletionsAwaitingConfirmation(
 	tasks: ReadonlyArray<OutlineTaskSubject & { deleted?: boolean }>,
-	options: { store?: OutlineStore } = {},
+	options: {
+		store?: OutlineStore;
+		/** The open changes to look at, already read by the caller; read by root when absent. */
+		openPending?: readonly OutlinePendingHead[];
+	} = {},
 ): Promise<Map<string, { row: OutlinePendingHead; status: "done" | "cancelled" }>> {
 	const store = options.store ?? outlineStore;
 	const out = new Map<string, { row: OutlinePendingHead; status: "done" | "cancelled" }>();
-	const bySpace = new Map<string, Set<string>>();
-	for (const task of tasks) {
-		if (!task.taskJson?.lock || task.deleted) continue;
-		const set = bySpace.get(task.spaceId) ?? new Set<string>();
-		set.add(task.id);
-		bySpace.set(task.spaceId, set);
-	}
+	const roots = new Set(
+		tasks.filter((task) => task.taskJson?.lock && !task.deleted).map((task) => task.id),
+	);
+	if (roots.size === 0) return out;
+	// A completion is a change on the locked task's own tree: read by root (the open-root index).
+	const open =
+		options.openPending ??
+		(await store.listOpenPendingByRoots([...roots], OUTLINE_PENDING_LIMITS.scanPerSpace));
 	const candidates = new Map<string, OutlinePendingHead>();
-	for (const [spaceId, ids] of bySpace) {
-		const open = await store.listOpenPendingBySpace(spaceId, OUTLINE_PENDING_LIMITS.scanPerSpace);
-		for (const row of open) {
-			const root = row.rootBlockId;
-			if (root && ids.has(root) && row.blockIdsJson.includes(root)) candidates.set(row.id, row);
-		}
+	for (const row of open) {
+		const root = row.rootBlockId;
+		if (root && roots.has(root) && row.blockIdsJson.includes(root)) candidates.set(row.id, row);
 	}
 	if (candidates.size === 0) return out;
 	for (const row of await store.getPending([...candidates.keys()])) {

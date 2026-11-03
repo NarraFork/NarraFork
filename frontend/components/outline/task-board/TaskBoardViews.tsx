@@ -48,7 +48,7 @@ export function ProjectTaskBoard({
 				<Loader size="sm" />
 			</Center>
 		);
-	if (board.error || !board.data)
+	if (board.error || board.pages.length === 0)
 		return (
 			<Alert color="red" variant="light">
 				{t("board.loadFailed")}
@@ -56,11 +56,11 @@ export function ProjectTaskBoard({
 		);
 	return (
 		<TaskBoard
-			pages={board.data.pages}
+			pages={board.pages}
 			onOpenTask={onOpenTask}
 			hasMoreSpaces={board.hasNextPage}
 			loadingMoreSpaces={board.isFetchingNextPage}
-			onLoadMoreSpaces={() => void board.fetchNextPage()}
+			onLoadMoreSpaces={board.fetchNextPage}
 		/>
 	);
 }

@@ -17,6 +17,7 @@ import { outlineRoutes } from "../../../routes/outline";
 import { invalidateTaskBackend } from "../../task-source";
 import { addPersonTask } from "../person-tasks";
 import { outlineStore } from "../store";
+import { readProjectTaskBoard } from "../task-board";
 import { type BoardScenarioContext, OUTLINE_TASK_BOARD_SCENARIOS } from "./task-board-scenarios";
 
 const NOW = "2026-11-03T00:00:00.000Z";
@@ -29,7 +30,7 @@ beforeEach(() => {
 const ctx: BoardScenarioContext = {
 	async user(options = {}) {
 		const id = generateId();
-		const username = `board${id.replace(/[^A-Za-z0-9]/g, "")}`;
+		const username = `board${id.replace(/[^A-Za-z0-9]/g, "")}${options.suffix ?? ""}`;
 		await db.insert(users).values({
 			id,
 			username,
@@ -51,14 +52,14 @@ const ctx: BoardScenarioContext = {
 		});
 		return id;
 	},
-	async session({ owner, projectId, visibility, archived }) {
+	async session({ owner, projectId, visibility, archived, writeAudience }) {
 		const id = generateId();
 		await db.insert(narrators).values({
 			id,
 			title: `board session ${id}`,
 			ownerUserId: owner,
 			visibility: visibility ?? "private",
-			writeAudience: "owner",
+			writeAudience: writeAudience ?? "owner",
 			contextProjectId: projectId ?? null,
 			taskBackend: "outline",
 			status: archived ? "archived" : "idle",
@@ -78,6 +79,17 @@ const ctx: BoardScenarioContext = {
 			createdAt: NOW,
 		});
 	},
+	async grantSession(narratorId, userId, capability) {
+		await db.insert(aclGrants).values({
+			id: generateId(),
+			scopeType: "narrator",
+			scopeId: narratorId,
+			principalType: "user",
+			principalId: userId,
+			capability,
+			createdAt: NOW,
+		});
+	},
 };
 
 describe("task board scenarios (SQLite)", () => {
@@ -86,6 +98,49 @@ describe("task board scenarios (SQLite)", () => {
 			await scenario.run(ctx);
 		});
 	}
+});
+
+describe("a project board page's cost", () => {
+	test("its reads do not grow with the sessions on the page (one batched read each)", async () => {
+		const owner = await ctx.user();
+		const projectId = await ctx.project({ owner: owner.id });
+		const principal = { userId: owner.id, isAdmin: false };
+		const addSessions = async (n: number) => {
+			for (let i = 0; i < n; i++) {
+				const narratorId = await ctx.session({ owner: owner.id, projectId, visibility: "project" });
+				for (const text of ["one", "two", "three"])
+					await addPersonTask({ narratorId, userId: owner.id, text, lock: i % 2 === 0 });
+			}
+		};
+		const storeCalls = async () => {
+			const calls: string[] = [];
+			const restores: Array<() => void> = [];
+			for (const key of Object.keys(outlineStore) as Array<keyof typeof outlineStore>) {
+				const original = outlineStore[key];
+				if (typeof original !== "function") continue;
+				const wrapped = (...args: unknown[]) => {
+					calls.push(String(key));
+					return (original as (...a: unknown[]) => unknown).apply(outlineStore, args);
+				};
+				(outlineStore as unknown as Record<string, unknown>)[key] = wrapped;
+				restores.push(() => {
+					(outlineStore as unknown as Record<string, unknown>)[key] = original;
+				});
+			}
+			try {
+				const board = await readProjectTaskBoard(principal, projectId);
+				return { calls: calls.length, sections: board.sections.length };
+			} finally {
+				for (const restore of restores) restore();
+			}
+		};
+		await addSessions(2);
+		const few = await storeCalls();
+		await addSessions(6);
+		const many = await storeCalls();
+		expect(many.sections).toBe(few.sections + 6);
+		expect(many.calls).toBe(few.calls);
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

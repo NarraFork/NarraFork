@@ -152,38 +152,15 @@ export async function interjectSpecEditAsUserMessage(
 	}
 
 	const text = formatSpecEditInterjection(update, locale);
-	if (await cutInUserMessage(narratorId, text, userId, specEditInterjectIds)) {
-		return { delivered: "interjected" };
-	}
-	// Queue full, or the narrator is not active in memory (e.g. a subagent, whose queue lives in
-	// a separate map). Fall back so nothing is lost.
-	pushSpecUpdateForNarrator(narratorId, update);
-	return { delivered: "queued" };
-}
 
-/**
- * Deliver `text` to a RUNNING narrator as a cut-in user message: pushed to the front of its
- * queue with a soft stop, so the loop takes it as a real `role: "user"` turn after the current
- * tool call. `tracker` remembers the still-unconsumed message per narrator: while it is queued, a
- * later call rewrites it in place (rapid edits collapse into one message at its original
- * position) instead of stacking another. Returns false when nothing could be queued (the queue
- * is full, or the narrator is not active in memory); the caller falls back.
- *
- * Shared by Dynamic Spec panel edits and people's changes to outline tasks
- * (`outline-task-edits.ts`), each with its own tracker.
- */
-export async function cutInUserMessage(
-	narratorId: string,
-	text: string,
-	userId: string | null,
-	tracker: Map<string, string>,
-): Promise<boolean> {
-	const trackedId = tracker.get(narratorId);
+	// Rewrite the previous cut-in when it is still queued, so rapid saves collapse
+	// into one message at its original position rather than stacking in reverse.
+	const trackedId = specEditInterjectIds.get(narratorId);
 	if (trackedId && getBufferedMessages(narratorId).some((msg) => msg.id === trackedId)) {
 		if (await updateBufferedMessage(narratorId, trackedId, text)) {
 			requestBufferedMessageSoftStop(narratorId);
 			broadcastBufferSnapshot(narratorId);
-			return true;
+			return { delivered: "interjected" };
 		}
 	}
 
@@ -199,12 +176,15 @@ export async function cutInUserMessage(
 		"front",
 	);
 	if (!result.ok) {
-		tracker.delete(narratorId);
-		return false;
+		// Queue full, or the narrator is not active in memory (e.g. a subagent,
+		// whose queue lives in a separate map). Fall back so nothing is lost.
+		specEditInterjectIds.delete(narratorId);
+		pushSpecUpdateForNarrator(narratorId, update);
+		return { delivered: "queued" };
 	}
 
-	tracker.set(narratorId, result.id);
+	specEditInterjectIds.set(narratorId, result.id);
 	requestBufferedMessageSoftStop(narratorId);
 	broadcastBufferSnapshot(narratorId);
-	return true;
+	return { delivered: "interjected" };
 }

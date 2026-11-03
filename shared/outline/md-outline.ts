@@ -124,7 +124,8 @@ const ITEM_RE = /^([ \t]*)([-*+]|\d{1,9}[.)])(?:([ \t]+)(.*))?$/;
 const RULE_RE = /^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const TASK_BOX_RE = /^\[([ xX/-])\](?:[ \t]+|$)/;
 const PROP_RE = /^([a-z][a-z0-9_-]*)::(?:[ \t]+(.*?))?[ \t]*$/;
-const ASSIGNEE_RE = /(?<![\\\p{L}\p{N}_`])@((?:agent|human):[\p{L}\p{N}_.-]*[\p{L}\p{N}_])/gu;
+// A name may end in `-` (usernames, SSO-derived ones too), never in `.` (a sentence's end).
+const ASSIGNEE_RE = /(?<![\\\p{L}\p{N}_`])@((?:agent|human):[\p{L}\p{N}_.-]*[\p{L}\p{N}_-])/gu;
 const DUE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?$/;
 const FENCE_OPEN_RE = /^[ \t]*(`{3,}|~{3,})(.*)$/;
 const BLOCK_START_RE = /^[ \t]*(?:#{1,6}(?:[ \t]|$)|>|\||`{3,}|~{3,})/;

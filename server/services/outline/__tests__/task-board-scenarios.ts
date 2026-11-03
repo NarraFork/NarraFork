@@ -12,7 +12,7 @@
  */
 import { expect } from "bun:test";
 import { OUTLINE_TASK_BOARD_LIMITS, type OutlineBoardTask } from "@shared/outline-task-board";
-import type { OutlinePrincipal } from "../access";
+import { canWriteSpace, type OutlinePrincipal } from "../access";
 import { readProjectSessionSpacePage } from "../access-reads";
 import { OutlineConflictError } from "../errors";
 import { OUTLINE_BEHAVIOR_ALIAS } from "../model";
@@ -23,7 +23,8 @@ import { readFinishedTasks, readProjectTaskBoard, readSessionTaskBoard } from ".
 import { writeOutline } from "../write";
 
 export interface BoardScenarioContext {
-	user(options?: { admin?: boolean }): Promise<{ id: string; username: string }>;
+	/** A person; `suffix` ends their (otherwise generated) username. */
+	user(options?: { admin?: boolean; suffix?: string }): Promise<{ id: string; username: string }>;
 	project(options: { owner: string; visibility?: "private" | "public" }): Promise<string>;
 	/** A root session, under `projectId` through its explicit project. */
 	session(options: {
@@ -31,9 +32,13 @@ export interface BoardScenarioContext {
 		projectId?: string | null;
 		visibility?: "private" | "project" | "public";
 		archived?: boolean;
+		/** Who besides its owner may write it (default `owner`). */
+		writeAudience?: "owner" | "project" | "public";
 	}): Promise<string>;
 	/** A project grant to a person. */
 	grant(projectId: string, userId: string, capability: "read" | "write"): Promise<void>;
+	/** A session grant to a person. */
+	grantSession(narratorId: string, userId: string, capability: "read" | "write"): Promise<void>;
 }
 
 export interface BoardScenario {
@@ -108,7 +113,7 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 		},
 	},
 	{
-		name: "a person's task: locked in the commit that adds it, on the task page, deduped by title",
+		name: "a person's task: locked in the commit that adds it, on the task page, deduped",
 		async run(ctx) {
 			const owner = await ctx.user();
 			const session = await ctx.session({ owner: owner.id });
@@ -150,6 +155,259 @@ export const OUTLINE_TASK_BOARD_SCENARIOS: BoardScenario[] = [
 			]);
 			expect([x.added, y.added].sort()).toEqual([false, true]);
 			expect(x.blockId).toBe(y.blockId);
+		},
+	},
+	{
+		name: "dedupe compares the whole body: long first lines, the paragraphs written with it",
+		async run(ctx) {
+			const owner = await ctx.user();
+			const session = await ctx.session({ owner: owner.id });
+			const add = (text: string) =>
+				addPersonTask({ narratorId: session, userId: owner.id, text, lock: true });
+			// A first line longer than the head the scan reads (review round 1, P1).
+			const long = `Fix ${"the login flow and ".repeat(30)}end`;
+			expect(long.length).toBeGreaterThan(500);
+			const first = await add(long);
+			expect(first.added).toBe(true);
+			expect(await add(long)).toMatchObject({ added: false, blockId: first.blockId });
+			// The same beginning past the head, a different end: another task.
+			expect((await add(`${long} too`)).added).toBe(true);
+			// Same first paragraph, different acceptance: another goal; the same again: not.
+			const a = await add("Ship the release\n\nAcceptance: the smoke tests pass");
+			expect(a.added).toBe(true);
+			const b = await add("Ship the release\n\nAcceptance: the docs are out");
+			expect(b.added).toBe(true);
+			expect(await add("Ship the release\n\nAcceptance:  the docs are out ")).toMatchObject({
+				added: false,
+				blockId: b.blockId,
+			});
+			// The first paragraph alone is a goal of its own.
+			const c = await add("Ship the release");
+			expect(c.added).toBe(true);
+			// Steps the agent adds under a goal later are not its body.
+			const space = await tasksOf(session);
+			await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{
+						op: "insert",
+						parent: { id: a.blockId },
+						content: "tag the build",
+						task: { status: "todo" },
+					},
+				],
+				actor: { kind: "agent", id: session },
+				narratorId: session,
+				responsibleUserId: owner.id,
+			});
+			expect(await add("Ship the release\n\nAcceptance: the smoke tests pass")).toMatchObject({
+				added: false,
+				blockId: a.blockId,
+			});
+		},
+	},
+	{
+		name: "the task page's alias is reserved from agents in session spaces, not from people",
+		async run(ctx) {
+			const owner = await ctx.user();
+			const session = await ctx.session({ owner: owner.id });
+			const goal = await addPersonTask({
+				narratorId: session,
+				userId: owner.id,
+				text: "Ship the release",
+				lock: true,
+			});
+			const space = await tasksOf(session);
+			const pageId = (await outlineStore.getBlock(goal.blockId))?.parentId as string;
+			const agent = {
+				actor: { kind: "agent" as const, id: session },
+				narratorId: session,
+				responsibleUserId: owner.id,
+			};
+			const refused = async (ops: Parameters<typeof writeOutline>[0]["ops"]) => {
+				let code: string | undefined;
+				try {
+					await writeOutline({ spaceId: space.id, ops, ...agent });
+				} catch (error) {
+					code = (error as { code?: string }).code;
+				}
+				expect(code).toBe("OUTLINE_TASKS_PAGE_RESERVED");
+			};
+			// The agent writes under it: a step under the goal, a task of its own on the page.
+			const steps = await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{
+						op: "insert",
+						parent: { id: goal.blockId },
+						content: "tag it",
+						task: { status: "todo" },
+					},
+					{
+						op: "insert",
+						parent: { id: pageId },
+						content: "my own step",
+						task: { status: "todo" },
+					},
+					{ op: "insert", tempId: "elsewhere", parent: null, content: "Notes" },
+				],
+				...agent,
+			});
+			const notes = steps.results[2]?.blockId as string;
+			// It may not take the alias away, move the page under a block, or delete it.
+			await refused([{ op: "update", block: { id: pageId }, alias: null }]);
+			await refused([{ op: "move", block: { id: pageId }, parent: { id: notes } }]);
+			await refused([{ op: "delete", block: { id: pageId } }]);
+			// Nor give it to a page of its own in a session without one.
+			const other = await ctx.session({ owner: owner.id });
+			const otherSpace = await tasksOf(other);
+			let code: string | undefined;
+			try {
+				await writeOutline({
+					spaceId: otherSpace.id,
+					ops: [{ op: "insert", parent: null, content: "Tasks", alias: OUTLINE_TASKS_PAGE_ALIAS }],
+					actor: { kind: "agent", id: other },
+					narratorId: other,
+					responsibleUserId: owner.id,
+				});
+			} catch (error) {
+				code = (error as { code?: string }).code;
+			}
+			expect(code).toBe("OUTLINE_TASKS_PAGE_RESERVED");
+			expect((await outlineStore.getBlock(pageId))?.alias).toBe(OUTLINE_TASKS_PAGE_ALIAS);
+			// A person may: the alias moves to another page, and the next goal goes there.
+			await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{ op: "update", block: { id: pageId }, alias: null },
+					{ op: "update", block: { id: notes }, alias: OUTLINE_TASKS_PAGE_ALIAS },
+				],
+				actor: { kind: "human", id: owner.id },
+				responsibleUserId: owner.id,
+			});
+			const next = await addPersonTask({
+				narratorId: session,
+				userId: owner.id,
+				text: "Write the notes",
+				lock: true,
+			});
+			expect((await outlineStore.getBlock(next.blockId))?.parentId).toBe(notes);
+			// In a project space the alias means nothing: an agent may hold it.
+			const projectId = await ctx.project({ owner: owner.id });
+			const projectSpace = await ensureProjectSpace(projectId);
+			await writeOutline({
+				spaceId: projectSpace.id,
+				ops: [{ op: "insert", parent: null, content: "Tasks", alias: OUTLINE_TASKS_PAGE_ALIAS }],
+				...agent,
+			});
+		},
+	},
+	{
+		name: "hand to someone: names ending in -, and an admin without access answers as unknown",
+		async run(ctx) {
+			// SSO derives names such as `user-` or `<base>-<id>`: they can be named and hand to self.
+			const owner = await ctx.user({ suffix: "-" });
+			expect(owner.username).toEndWith("-");
+			const admin = await ctx.user({ admin: true });
+			const session = await ctx.session({ owner: owner.id });
+			const goal = await addPersonTask({
+				narratorId: session,
+				userId: owner.id,
+				text: "Hand me over",
+				lock: false,
+			});
+			const version = async () => (await outlineStore.getBlock(goal.blockId))?.versionSeq as number;
+			await changePersonTask({
+				principal: as(owner.id),
+				blockId: goal.blockId,
+				baseVersionSeq: await version(),
+				assign: { kind: "me" },
+			});
+			expect((await outlineStore.getBlock(goal.blockId))?.taskJson?.assignee).toBe(
+				`human:${owner.username}`,
+			);
+			await changePersonTask({
+				principal: as(owner.id),
+				blockId: goal.blockId,
+				baseVersionSeq: await version(),
+				assign: { kind: "session" },
+			});
+			await changePersonTask({
+				principal: as(owner.id),
+				blockId: goal.blockId,
+				baseVersionSeq: await version(),
+				assign: { kind: "user", username: `@${owner.username}` },
+			});
+			expect((await outlineStore.getBlock(goal.blockId))?.taskJson?.assignee).toBe(
+				`human:${owner.username}`,
+			);
+			// An admin who holds no grant here, and a name nobody has: the same refusal.
+			const refusal = async (username: string) => {
+				try {
+					await changePersonTask({
+						principal: as(owner.id),
+						blockId: goal.blockId,
+						baseVersionSeq: await version(),
+						assign: { kind: "user", username },
+					});
+				} catch (error) {
+					return (error as Error).message.replace(username, "<name>");
+				}
+				return "accepted";
+			};
+			const unknown = await refusal(`nobody${owner.id.replace(/[^A-Za-z0-9]/g, "")}`);
+			expect(unknown).toContain("No one named <name> can work on this task");
+			expect(await refusal(admin.username)).toBe(unknown);
+		},
+	},
+	{
+		name: "the project board's writable sections match the write rule for every kind of writer",
+		async run(ctx) {
+			const owner = await ctx.user();
+			const writer = await ctx.user();
+			const reader = await ctx.user();
+			const granted = await ctx.user();
+			const admin = await ctx.user({ admin: true });
+			const projectId = await ctx.project({ owner: owner.id });
+			await ctx.grant(projectId, writer.id, "write");
+			await ctx.grant(projectId, reader.id, "read");
+			await ctx.grant(projectId, granted.id, "read");
+			const sessions = {
+				open: await ctx.session({
+					owner: owner.id,
+					projectId,
+					visibility: "project",
+					writeAudience: "public",
+				}),
+				project: await ctx.session({
+					owner: owner.id,
+					projectId,
+					visibility: "project",
+					writeAudience: "project",
+				}),
+				ownerOnly: await ctx.session({ owner: owner.id, projectId, visibility: "project" }),
+				grantedOnly: await ctx.session({ owner: owner.id, projectId, visibility: "project" }),
+				writersOwn: await ctx.session({ owner: writer.id, projectId, visibility: "project" }),
+			};
+			await ctx.grantSession(sessions.grantedOnly, granted.id, "write");
+			for (const narratorId of Object.values(sessions))
+				await addPersonTask({ narratorId, userId: owner.id, text: "A task", lock: false });
+			for (const person of [owner, writer, reader, granted, admin]) {
+				const principal: OutlinePrincipal = {
+					userId: person.id,
+					isAdmin: person === admin,
+				};
+				const board = await readProjectTaskBoard(principal, projectId);
+				expect(board.sections.length).toBeGreaterThanOrEqual(5);
+				for (const section of board.sections) {
+					const space = await outlineStore.getSpace(section.space.id);
+					if (!space) throw new Error("expected the space");
+					expect({ space: space.narratorId, canWrite: section.canWrite }).toEqual({
+						space: space.narratorId,
+						canWrite: await canWriteSpace(principal, space),
+					});
+				}
+			}
 		},
 	},
 	{

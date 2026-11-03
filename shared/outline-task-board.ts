@@ -9,8 +9,11 @@ import type { OutlineActorKind, OutlineSpaceKind, OutlineTaskStatus } from "./ou
 export const OUTLINE_TASK_BOARD_LIMITS = {
 	/** Open tasks a session board shows of its session space (more are counted as truncated). */
 	sessionOpen: 200,
-	/** Open tasks a project board shows of each space. */
-	projectOpen: 50,
+	/**
+	 * Open tasks a project board shows of each space (more are counted as truncated; the session's
+	 * own board shows them all). Kept small with {@link projectSpaces}: a page is one bounded read.
+	 */
+	projectOpen: 20,
 	/** Tasks a session holds in other spaces that its board shows. */
 	claimedElsewhere: 50,
 	/** Finished tasks a session board shows at first, and per page after. */
@@ -20,7 +23,7 @@ export const OUTLINE_TASK_BOARD_LIMITS = {
 	/** Finished tasks one page of a space's finished list holds at most. */
 	maxFinishedPage: 50,
 	/** Session spaces one page of a project board covers (the project space comes first). */
-	projectSpaces: 20,
+	projectSpaces: 10,
 	/** Characters of a task's text (`/goal`, the add form). */
 	maxTaskChars: 4000,
 	/** Characters of a username an assignment names. */
@@ -179,8 +182,10 @@ export interface NarratorCurrentTaskResponse {
 	/** The session's task backend in effect (`spec` while the outline is switched off). */
 	backend: "spec" | "outline";
 	current: { text: string; address: string | null; protected: boolean } | null;
-	/** Person-created tasks of the session whose completion waits for confirmation (outline). */
+	/** Person-created goals of the session whose completion waits for confirmation (outline). */
 	awaitingConfirmation: number;
+	/** Of those, the ones the caller decides (they locked the goal, or confirm for its locker). */
+	awaitingYourConfirmation: number;
 }
 
 /** WebSocket event: the tasks a session's board shows changed (ids only; the client re-reads). */

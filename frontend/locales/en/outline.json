@@ -368,7 +368,8 @@
 			"back": "Back to the task board"
 		},
 		"statusBar": {
-			"awaiting": "{{count}} goal(s) wait for your confirmation"
+			"awaitingYou": "{{count}} goal(s) wait for your confirmation",
+			"awaitingOthers": "{{count}} goal(s) wait for confirmation"
 		}
 	}
 }

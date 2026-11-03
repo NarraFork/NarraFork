@@ -29,7 +29,9 @@
  * tasks are read again and the next to-do is tried, a few times at most
  * ({@link OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts}). With nothing in progress the target is
  * the first waiting task, and the prompt then asks to split out an unblocking task or ask a
- * person (D27b).
+ * person (D27b). A task a person asked to start (`preferTaskId`: the board's "Add and start",
+ * "Reopen and start") is started the same way, whatever else is in progress, and is the target;
+ * when it cannot be started, there is none (nothing else is started or continued instead).
  *
  * A subagent has no tasks of its own (D27c): every read is empty, it continues on its turn
  * budget only (`turnBudgetOnly`), and its behavior boundary is its root's.
@@ -73,7 +75,7 @@ import {
 } from "../outline/errors";
 import { OUTLINE_TEXT } from "../outline/messages";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "../outline/model";
-import { findCompletionsAwaitingConfirmation } from "../outline/pending";
+import { findCompletionsAwaitingConfirmation, pendingRightOf } from "../outline/pending";
 import { recordOutlineReads, seenOutlineVersion } from "../outline/read-ledger";
 import { resolveNarratorSpaces } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
@@ -106,6 +108,7 @@ import type {
 	OpenTaskList,
 	OpenTaskStatus,
 	OpenTaskView,
+	StatusBarView,
 	TaskView,
 } from "./types";
 
@@ -280,11 +283,24 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		}
 	}
 
-	async function prepareContinuation(promoteTodo: boolean): Promise<ContinuationTarget> {
+	async function prepareContinuation(
+		promoteTodo: boolean,
+		preferTaskId?: string,
+	): Promise<ContinuationTarget> {
 		const current = await session();
 		if (current.subagent) return { openTask: null, protectedOpenCount: 0, turnBudgetOnly: true };
 		let read = await readOpen(current);
-		if (promoteTodo) {
+		if (preferTaskId) {
+			// A task a person asked the session to start ("Add and start", "Reopen and start"; review
+			// round 1 S4): started for the session through the same system start as a promotion,
+			// whatever else is in progress, and named by the continuation. Nothing else is started
+			// or named instead: when it cannot be started, nothing continues.
+			const wanted = read.entries.find((entry) => entry.ref.blockId === preferTaskId);
+			if (wanted?.status === "todo" && wanted.ref.spaceId === current.spaceId) {
+				if (await claim(current, wanted)) wanted.status = "doing";
+				else read = await readOpen(current);
+			}
+		} else if (promoteTodo) {
 			// Only a task of the session's own space is started on its behalf: anything else it
 			// may continue it holds already. A refused start moves on to the next to-do (a task
 			// changed meanwhile may be tried again at its new version), a few times at most.
@@ -306,7 +322,13 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 				read = await readOpen(current);
 			}
 		}
-		const chosen = firstOf(read, "doing") ?? firstOf(read, "blocked");
+		const chosen = preferTaskId
+			? (read.entries.find(
+					(entry) =>
+						entry.ref.blockId === preferTaskId &&
+						(entry.status === "doing" || entry.status === "blocked"),
+				) ?? null)
+			: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
 		const protectedOpenCount = (await protectedOpen(read)).length;
 		if (!chosen) return { openTask: null, protectedOpenCount };
 		const text = (await titlesOf([chosen])).get(chosen.ref.blockId) ?? chosen.ref.sid;
@@ -455,11 +477,61 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		async protectedOpenCount() {
 			return (await protectedOpen(await readOpen(await session()))).length;
 		},
-		async awaitingConfirmation() {
+		async statusBar(viewerUserId: string | null): Promise<StatusBarView> {
 			const read = await readOpen(await session());
-			return (await completionsAwaited(read.entries.filter(isProtected))).size;
+			const doing = firstOf(read, "doing");
+			const current = doing
+				? {
+						text: (await titlesOf([doing])).get(doing.ref.blockId) ?? doing.ref.sid,
+						status: "doing" as const,
+						protected: isProtected(doing),
+						address: doing.ref.address,
+					}
+				: null;
+			const waiting = read.entries.filter(
+				(entry) => isProtected(entry) && entry.wait?.confirmation,
+			);
+			if (waiting.length === 0) return { current, awaitingConfirmation: { total: 0, mine: 0 } };
+			const found = await findCompletionsAwaitingConfirmation(
+				waiting.map((entry) => ({
+					id: entry.ref.blockId,
+					spaceId: entry.ref.spaceId,
+					taskJson: entry.ref.taskJson,
+				})),
+			);
+			// The viewer's: they locked it, or they are the person of the session the locker named
+			// to confirm for them (its owner).
+			let mine = 0;
+			if (viewerUserId) {
+				const delegateOwners = new Map<string, string | null>();
+				const ownerOfDelegate = async (delegate: string) => {
+					if (!delegateOwners.has(delegate)) {
+						const root =
+							(await outlineStore.getNarratorRoots([delegate])).get(delegate)?.root ?? delegate;
+						delegateOwners.set(delegate, (await readNarrator(root))?.ownerUserId ?? null);
+					}
+					return delegateOwners.get(delegate) ?? null;
+				};
+				for (const entry of waiting) {
+					const completion = found.get(entry.ref.blockId);
+					if (!completion) continue;
+					const lock = entry.ref.taskJson.lock ?? null;
+					const right = await pendingRightOf(
+						completion.row,
+						{ kind: "human", userId: viewerUserId },
+						{ lock },
+					);
+					if (
+						right === "decider" ||
+						(lock?.delegate && (await ownerOfDelegate(lock.delegate)) === viewerUserId)
+					)
+						mine++;
+				}
+			}
+			return { current, awaitingConfirmation: { total: found.size, mine } };
 		},
-		prepareContinuation: ({ promoteTodo }) => prepareContinuation(promoteTodo),
+		prepareContinuation: ({ promoteTodo, preferTaskId }) =>
+			prepareContinuation(promoteTodo, preferTaskId),
 		continuationPrompt,
 		// Retired for the outline: the views carry the tasks and the boundary (plan PR 4).
 		taskDigest: async () => null,

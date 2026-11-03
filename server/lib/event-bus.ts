@@ -437,6 +437,16 @@ export type NarraForkEvent =
 			spaceId: string;
 			pageIds: string[];
 	  }
+	| {
+			/**
+			 * Someone rejected a pending change (not its proposer withdrawing it). Ids only: a
+			 * listener re-reads the row. The proposing session is told when the change asked to end a
+			 * locked goal (outline P2 PR 5): the rejection writes no commit, so nothing else tells it.
+			 */
+			type: "outline:pending_rejected";
+			spaceId: string;
+			pendingId: string;
+	  }
 	// Human-to-human chat. Ids and scalars only — never message bodies — so a
 	// listener (WS fan-out today, an IM bridge later) can route without holding a
 	// copy of content it has no authorization story for.

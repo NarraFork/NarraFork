@@ -604,6 +604,11 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		parentIds: readonly (string | null)[],
 		limit: number,
 	): Promise<OutlineBlockMeta[]>;
+	/**
+	 * The last `limit` live children of a parent, last first (sibling order read backwards on the
+	 * children index): a bounded scan whose rows do not depend on the plan.
+	 */
+	listLastChildMetas(spaceId: string, parentId: string, limit: number): Promise<OutlineBlockMeta[]>;
 	/** Live blocks of `spaceId` holding any of `aliases`. */
 	findAliasOwners(
 		spaceId: string,
@@ -662,13 +667,41 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	): Promise<OutlineBlockMeta[]>;
 	/**
 	 * Live finished tasks (done or cancelled) of a space, latest change first: by `version_seq`
-	 * descending, then id descending (bytewise), strictly after `before` in that order when given,
-	 * at most `limit`. Served by the finished-task index (the task board's finished lists).
+	 * descending, then id descending, strictly after `before` in that order when given, at most
+	 * `limit`. Served by the finished-task index, `before` included in its seek (a row-value
+	 * comparison on `(version_seq, id)`), so a later page reads no more than a first one. Ids
+	 * compare in the column's own order, which differs between the backends: a cursor is only
+	 * meaningful to the backend that made it (the task board's finished lists).
 	 */
 	listFinishedTasks(
 		spaceId: string,
 		options: { before?: { versionSeq: number; id: string } | null; limit: number },
 	): Promise<OutlineBlockMeta[]>;
+	/**
+	 * Live open tasks of several spaces at once (a project's task board): at most `limit` of each
+	 * space, unordered within it, each space's `excludePageIds` left out before its limit. One
+	 * statement per chunk of spaces (the open-task index, a bounded seek per space), then the rows.
+	 */
+	listOpenTasksOfSpaces(
+		parts: ReadonlyArray<{ spaceId: string; excludePageIds?: readonly string[] }>,
+		limit: number,
+	): Promise<OutlineBlockMeta[]>;
+	/**
+	 * Live finished tasks of several spaces at once, at most `limit` of each, latest change first
+	 * within a space, in the order `listFinishedTasks` gives (the finished-task index, a bounded
+	 * seek per space), then the rows.
+	 */
+	listFinishedTasksOfSpaces(
+		spaceIds: readonly string[],
+		limit: number,
+	): Promise<OutlineBlockMeta[]>;
+	/** Blocks by id in any space, live or deleted, without content (primary key, chunked). */
+	getBlockMetasByIds(ids: readonly string[]): Promise<OutlineBlockMeta[]>;
+	/** Live blocks holding `alias` in any of the spaces (the alias index, chunked). */
+	findAliasOwnersInSpaces(
+		spaceIds: readonly string[],
+		alias: string,
+	): Promise<Array<{ spaceId: string; id: string }>>;
 	/**
 	 * Session claims whose lease ended at or before `now`, oldest first, at most `limit`, with the
 	 * space of the task.
@@ -786,6 +819,8 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	listOpenPendingByPage(pageId: string, limit: number): Promise<OutlinePendingHead[]>;
 	/** Open pending changes of a space (heads), oldest first, at most `limit`. */
 	listOpenPendingBySpace(spaceId: string, limit: number): Promise<OutlinePendingHead[]>;
+	/** Open pending changes (heads) on any of the given lock roots (the open-root index), at most `limit`. */
+	listOpenPendingByRoots(rootIds: readonly string[], limit: number): Promise<OutlinePendingHead[]>;
 	/** How many open pending changes a page has, counting at most `limit`. */
 	countOpenPendingByPage(pageId: string, limit: number): Promise<number>;
 	/** The open row a session has on a lock root, if any, whole. */
@@ -865,6 +900,18 @@ export const OUTLINE_RENEW_LIMIT = 1000;
 
 /** Ids per `IN (…)` list, well under every engine's bound-parameter limit. */
 export const OUTLINE_SQL_CHUNK = 500;
+
+/** Spaces one compound statement reads, one bounded member each (`listOpenTasksOfSpaces`). */
+export const OUTLINE_BATCH_SPACES = 50;
+
+/** `rows` in the order of `ids` (a read by key returns them in no particular order). */
+export function inIdOrder<T extends { id: string }>(
+	ids: readonly string[],
+	rows: readonly T[],
+): T[] {
+	const at = new Map(ids.map((id, index) => [id, index]));
+	return [...rows].sort((a, b) => (at.get(a.id) ?? 0) - (at.get(b.id) ?? 0));
+}
 
 export function chunked<T>(items: readonly T[], size = OUTLINE_SQL_CHUNK): T[][] {
 	const out: T[][] = [];

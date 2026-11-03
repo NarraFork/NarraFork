@@ -26,9 +26,14 @@
  * pending change, and whether the person reading decides it (the locker). The board confirms or
  * rejects it through the pending routes (PR 6).
  *
- * Every read is indexed and bounded: open tasks through the open-task index, finished ones
- * through the finished-task index, titles as the head of each block's content only, claims,
- * waits and open changes per space with their own limits.
+ * COST
+ * ----
+ * Every read is indexed and bounded, and batched across the spaces of a page: a project board's
+ * page costs a fixed number of statements, not a number per session. Open and finished tasks of
+ * every space in one compound statement each (a bounded seek per space), ancestors one level at a
+ * time for all of them, titles as the head of each block's content only, claims, names and the
+ * open changes (by the tasks' lock roots) in one read each, and whether the person may write each
+ * session space from the sessions' write facts and one grant read (`writableSpaces`).
  */
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import { blockTitle } from "@shared/outline";
@@ -39,14 +44,27 @@ import {
 	type OutlineBoardTask,
 	type OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
-import { canReadSpace, canWriteSpace, type OutlinePrincipal } from "./access";
-import { readDisplayNames, readProjectSessionSpacePage } from "./access-reads";
-import { OUTLINE_BEHAVIOR_ALIAS, type OutlineTaskActorRef, type OutlineTaskJson } from "./model";
+import { canReadSpace, canWriteSpace, type OutlinePrincipal, projectUsersWith } from "./access";
+import {
+	readDisplayNames,
+	readNarratorWriteGrants,
+	readProject,
+	readProjectSessionSpacePage,
+	readSessionWriteFacts,
+} from "./access-reads";
+import {
+	OUTLINE_BEHAVIOR_ALIAS,
+	OUTLINE_LIMITS,
+	OUTLINE_PENDING_LIMITS,
+	type OutlineTaskActorRef,
+	type OutlineTaskJson,
+} from "./model";
 import { findCompletionsAwaitingConfirmation, pendingRightOf } from "./pending";
-import { resolveSessionSpaceNarrator } from "./spaces";
+import { isOrphanedSpace, resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
 import type {
 	OutlineBlockMeta,
+	OutlinePendingHead,
 	OutlineSpaceRow,
 	OutlineStore,
 	OutlineTaskClaimRow,
@@ -108,8 +126,33 @@ function sessionOfSpace(space: OutlineSpaceRow | undefined): string | null {
 }
 
 /**
- * Board entries for blocks of known spaces. `open` ones are read with their waits and in
- * document order (`first` space first); the others as given.
+ * The open changes that may touch the given open tasks: those on each task's nearest locked
+ * ancestor (or itself), the lock that applies to it. One read by root, whatever the spaces.
+ */
+async function openPendingOf(
+	store: OutlineStore,
+	tasks: readonly OutlineBlockMeta[],
+	known: ReadonlyMap<string, OutlineBlockMeta>,
+): Promise<OutlinePendingHead[]> {
+	const roots = new Set<string>();
+	for (const task of tasks) {
+		let current: OutlineBlockMeta | undefined = task;
+		for (let depth = 0; current && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+			if (current.taskJson?.lock) {
+				roots.add(current.id);
+				break;
+			}
+			current = current.parentId === null ? undefined : known.get(current.parentId);
+		}
+	}
+	if (roots.size === 0) return [];
+	return await store.listOpenPendingByRoots([...roots], OUTLINE_PENDING_LIMITS.scanPerSpace);
+}
+
+/**
+ * Board entries for blocks of known spaces (`ctx.spaces`), of any number of spaces at once.
+ * `open` ones are read with their waits and in document order (`first` space first); the others
+ * as given.
  */
 async function describe(
 	ctx: Context,
@@ -118,17 +161,22 @@ async function describe(
 ): Promise<OutlineBoardTask[]> {
 	if (metas.length === 0) return [];
 	const { store } = ctx;
+	const known = new Map<string, OutlineBlockMeta>(metas.map((m) => [m.id, m]));
+	const keys = new Map([...ctx.spaces.values()].map((space) => [space.id, space.key]));
 	const ordered = options.open
-		? await inDocumentOrder(store, metas, options.first ?? null)
+		? await inDocumentOrder(store, metas, options.first ?? null, { keys, ancestors: known })
 		: [...metas];
 	const ids = ordered.map((m) => m.id);
 	const now = new Date().toISOString();
+	const openPending = options.open ? await openPendingOf(store, ordered, known) : [];
 	const [heads, claimRows, waits, completions] = await Promise.all([
 		store.getBlockHeads(ids),
 		store.getTaskClaims(ids),
-		options.open ? deriveOutlineTaskWaits(ordered, { store }) : Promise.resolve(new Map()),
 		options.open
-			? findCompletionsAwaitingConfirmation(ordered, { store })
+			? deriveOutlineTaskWaits(ordered, { store, openPending })
+			: Promise.resolve(new Map()),
+		options.open
+			? findCompletionsAwaitingConfirmation(ordered, { store, openPending })
 			: Promise.resolve(new Map()),
 	]);
 	const titles = new Map(heads.map((h) => [h.id, blockTitle(h.contentHead)]));
@@ -245,58 +293,168 @@ async function describe(
 // Sections
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The pages of a space whose checkboxes are not tasks: a session's behavior page. */
-async function excludedPages(store: OutlineStore, space: OutlineSpaceRow): Promise<string[]> {
-	if (space.kind !== "session") return [];
-	return (await store.findAliasOwners(space.id, [OUTLINE_BEHAVIOR_ALIAS])).map((o) => o.id);
-}
-
-async function describeSpace(space: OutlineSpaceRow) {
+/** Spaces as the board names them: the project's name or the session's title, in one read. */
+async function describeSpaces(spaces: readonly OutlineSpaceRow[]) {
 	const names = await readDisplayNames({
-		projectIds: space.kind === "project" && space.projectId ? [space.projectId] : [],
-		narratorIds: space.kind === "session" && space.narratorId ? [space.narratorId] : [],
+		projectIds: spaces.flatMap((s) => (s.kind === "project" && s.projectId ? [s.projectId] : [])),
+		narratorIds: spaces.flatMap((s) =>
+			s.kind === "session" && s.narratorId ? [s.narratorId] : [],
+		),
 	});
-	return {
-		id: space.id,
-		key: space.key,
-		kind: space.kind,
-		projectId: space.projectId,
-		narratorId: space.narratorId,
-		label:
-			space.kind === "project" && space.projectId
-				? (names.projects.get(space.projectId) ?? null)
-				: space.kind === "session" && space.narratorId
-					? (names.narrators.get(space.narratorId) ?? null)
-					: null,
-	};
+	return new Map(
+		spaces.map((space) => [
+			space.id,
+			{
+				id: space.id,
+				key: space.key,
+				kind: space.kind,
+				projectId: space.projectId,
+				narratorId: space.narratorId,
+				label:
+					space.kind === "project" && space.projectId
+						? (names.projects.get(space.projectId) ?? null)
+						: space.kind === "session" && space.narratorId
+							? (names.narrators.get(space.narratorId) ?? null)
+							: null,
+			},
+		]),
+	);
 }
 
-/** One space's own section: open tasks (up to `openLimit`) and the latest finished ones. */
-async function ownSection(
+/**
+ * Which of the spaces the person may write, as `canWriteSpace` answers it, with session spaces
+ * judged together: the sessions' write facts in one read, then by the narrator write rule
+ * (`narratorUsersWith`) for the ones whose project gate is the board's project, which the person
+ * reads (the route checked): the owner; everyone past the gate when the write audience is public;
+ * the project's writers when it is the project; otherwise a write grant (one read for all). Any
+ * other space, and a session filed under another project, is asked of `canWriteSpace` itself.
+ * `task-board-scenarios.ts` holds the answers to `canWriteSpace`'s.
+ */
+export async function writableSpaces(
+	principal: OutlinePrincipal,
+	spaces: readonly OutlineSpaceRow[],
+	boardProjectId: string | null,
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	const sessions = spaces.filter(
+		(space) => space.kind === "session" && space.narratorId !== null && !isOrphanedSpace(space),
+	);
+	const sessionSet = new Set(sessions);
+	const fallback = spaces.filter((space) => !sessionSet.has(space));
+	if (sessions.length > 0 && principal.isAdmin) for (const space of sessions) out.add(space.id);
+	else if (sessions.length > 0) {
+		const facts = await readSessionWriteFacts(sessions.map((s) => s.narratorId as string));
+		let projectWriter: boolean | undefined;
+		const byGrant: OutlineSpaceRow[] = [];
+		for (const space of sessions) {
+			const fact = facts.get(space.narratorId as string);
+			if (!fact) continue;
+			if (fact.ownerUserId !== null && fact.ownerUserId === principal.userId) {
+				out.add(space.id);
+				continue;
+			}
+			if (
+				fact.type === "subagent" ||
+				boardProjectId === null ||
+				fact.gateProjectId !== boardProjectId
+			) {
+				fallback.push(space);
+				continue;
+			}
+			if (fact.writeAudience === "public") out.add(space.id);
+			else if (fact.writeAudience === "project") {
+				if (projectWriter === undefined) {
+					const project = await readProject(boardProjectId);
+					projectWriter =
+						project !== null &&
+						(await projectUsersWith(project, [principal.userId], "write")).has(principal.userId);
+				}
+				if (projectWriter) out.add(space.id);
+				else byGrant.push(space);
+			} else byGrant.push(space);
+		}
+		if (byGrant.length > 0) {
+			const granted = await readNarratorWriteGrants(
+				byGrant.map((s) => s.narratorId as string),
+				principal.userId,
+			);
+			for (const space of byGrant) if (granted.has(space.narratorId as string)) out.add(space.id);
+		}
+	}
+	for (const space of fallback) if (await canWriteSpace(principal, space)) out.add(space.id);
+	return out;
+}
+
+/**
+ * The own sections of the given spaces, in that order: each space's open tasks (up to
+ * `limits.open`, in document order) and its latest finished ones (up to `limits.finished`), its
+ * behavior page left out. Every read is one for all the spaces.
+ */
+async function ownSections(
 	ctx: Context,
-	space: OutlineSpaceRow,
+	spaces: readonly OutlineSpaceRow[],
 	limits: { open: number; finished: number },
-): Promise<OutlineBoardSection> {
+	boardProjectId: string | null,
+): Promise<OutlineBoardSection[]> {
+	if (spaces.length === 0) return [];
 	const { store } = ctx;
-	ctx.spaces.set(space.id, space);
-	const exclude = await excludedPages(store, space);
-	const open = await store.listOpenTasks(space.id, limits.open + 1, { excludePageIds: exclude });
-	const excluded = new Set(exclude);
-	// The cursor follows the rows read, whether or not the behavior page's were left out.
-	const finishedRows = await store.listFinishedTasks(space.id, { limit: limits.finished + 1 });
-	const window = finishedRows.slice(0, limits.finished);
-	const finished = window.filter((m) => !excluded.has(m.pageId));
-	const last = window.at(-1);
-	return {
-		space: await describeSpace(space),
-		canWrite: await canWriteSpace(ctx.principal, space),
-		role: "own",
-		open: await describe(ctx, open.slice(0, limits.open), { open: true, first: space.id }),
-		openTruncated: open.length > limits.open,
-		finished: await describe(ctx, finished, { open: false }),
-		finishedCursor:
-			finishedRows.length > limits.finished && last ? encodeFinishedCursor(last) : null,
+	for (const space of spaces) ctx.spaces.set(space.id, space);
+	const sessionSpaces = spaces.filter((space) => space.kind === "session").map((s) => s.id);
+	const excluded = new Map<string, string[]>();
+	if (sessionSpaces.length > 0) {
+		for (const owner of await store.findAliasOwnersInSpaces(sessionSpaces, OUTLINE_BEHAVIOR_ALIAS))
+			excluded.set(owner.spaceId, [...(excluded.get(owner.spaceId) ?? []), owner.id]);
+	}
+	const [openRows, finishedRows, described, writable] = await Promise.all([
+		store.listOpenTasksOfSpaces(
+			spaces.map((space) => ({ spaceId: space.id, excludePageIds: excluded.get(space.id) })),
+			limits.open + 1,
+		),
+		store.listFinishedTasksOfSpaces(
+			spaces.map((space) => space.id),
+			limits.finished + 1,
+		),
+		describeSpaces(spaces),
+		writableSpaces(ctx.principal, spaces, boardProjectId),
+	]);
+	const bySpace = <T extends { spaceId: string }>(rows: readonly T[]) => {
+		const map = new Map<string, T[]>();
+		for (const row of rows) map.set(row.spaceId, [...(map.get(row.spaceId) ?? []), row]);
+		return map;
 	};
+	const openOf = bySpace(openRows);
+	const finishedOf = bySpace(finishedRows);
+	const shownOpen: OutlineBlockMeta[] = [];
+	const shownFinished: OutlineBlockMeta[] = [];
+	const cursors = new Map<string, string | null>();
+	for (const space of spaces) {
+		shownOpen.push(...(openOf.get(space.id) ?? []).slice(0, limits.open));
+		// The cursor follows the rows read, whether or not the behavior page's were left out.
+		const rows = finishedOf.get(space.id) ?? [];
+		const window = rows.slice(0, limits.finished);
+		const pages = new Set(excluded.get(space.id) ?? []);
+		shownFinished.push(...window.filter((m) => !pages.has(m.pageId)));
+		const last = window.at(-1);
+		cursors.set(
+			space.id,
+			rows.length > limits.finished && last ? encodeFinishedCursor(last) : null,
+		);
+	}
+	const [open, finished] = await Promise.all([
+		describe(ctx, shownOpen, { open: true, first: spaces[0]?.id ?? null }),
+		describe(ctx, shownFinished, { open: false }),
+	]);
+	const openBySpace = bySpace(open);
+	const finishedBySpace = bySpace(finished);
+	return spaces.map((space) => ({
+		space: described.get(space.id) as OutlineBoardSection["space"],
+		canWrite: writable.has(space.id),
+		role: "own" as const,
+		open: openBySpace.get(space.id) ?? [],
+		openTruncated: (openOf.get(space.id)?.length ?? 0) > limits.open,
+		finished: finishedBySpace.get(space.id) ?? [],
+		finishedCursor: cursors.get(space.id) ?? null,
+	}));
 }
 
 /** The caller's name, for "assign to me". */
@@ -319,15 +477,17 @@ export async function readSessionTaskBoard(
 	if (!root) throw new NotFoundError("Narrator", narratorId);
 	const ctx: Context = { store, principal, spaces: new Map() };
 	const space = await store.findSpace({ kind: "session", narratorId: root.id });
-	const sections: OutlineBoardSection[] = [];
-	if (space) {
-		sections.push(
-			await ownSection(ctx, space, {
-				open: OUTLINE_TASK_BOARD_LIMITS.sessionOpen,
-				finished: OUTLINE_TASK_BOARD_LIMITS.sessionFinished,
-			}),
-		);
-	}
+	const sections: OutlineBoardSection[] = space
+		? await ownSections(
+				ctx,
+				[space],
+				{
+					open: OUTLINE_TASK_BOARD_LIMITS.sessionOpen,
+					finished: OUTLINE_TASK_BOARD_LIMITS.sessionFinished,
+				},
+				null,
+			)
+		: [];
 	// What the session holds elsewhere (a project's tasks it took up), grouped by space.
 	const claimed = (
 		await store.listClaimedTasks(root.id, OUTLINE_TASK_BOARD_LIMITS.claimedElsewhere + 1)
@@ -343,20 +503,34 @@ export async function readSessionTaskBoard(
 		list.push(block);
 		bySpace.set(block.spaceId, list);
 	}
-	for (const [spaceId, blocks] of bySpace) {
+	const others: OutlineSpaceRow[] = [];
+	for (const spaceId of bySpace.keys()) {
 		const other = await store.getSpace(spaceId);
 		// A space the person may not read is not shown, not even as a name.
-		if (!other || !(await canReadSpace(principal, other))) continue;
-		ctx.spaces.set(other.id, other);
-		sections.push({
-			space: await describeSpace(other),
-			canWrite: await canWriteSpace(principal, other),
-			role: "claimed",
-			open: await describe(ctx, blocks, { open: true, first: other.id }),
-			openTruncated: claimed.length > OUTLINE_TASK_BOARD_LIMITS.claimedElsewhere,
-			finished: [],
-			finishedCursor: null,
-		});
+		if (other && (await canReadSpace(principal, other))) others.push(other);
+	}
+	if (others.length > 0) {
+		for (const other of others) ctx.spaces.set(other.id, other);
+		const [described, writable, open] = await Promise.all([
+			describeSpaces(others),
+			writableSpaces(principal, others, null),
+			describe(
+				ctx,
+				others.flatMap((other) => bySpace.get(other.id) ?? []),
+				{ open: true, first: others[0]?.id ?? null },
+			),
+		]);
+		for (const other of others) {
+			sections.push({
+				space: described.get(other.id) as OutlineBoardSection["space"],
+				canWrite: writable.has(other.id),
+				role: "claimed",
+				open: open.filter((task) => task.spaceId === other.id),
+				openTruncated: claimed.length > OUTLINE_TASK_BOARD_LIMITS.claimedElsewhere,
+				finished: [],
+				finishedCursor: null,
+			});
+		}
 	}
 	return {
 		scope: { kind: "session", narratorId: root.id },
@@ -379,24 +553,28 @@ export async function readProjectTaskBoard(
 ): Promise<OutlineTaskBoardResponse> {
 	const store = options.store ?? outlineStore;
 	const ctx: Context = { store, principal, spaces: new Map() };
-	const limits = {
-		open: OUTLINE_TASK_BOARD_LIMITS.projectOpen,
-		finished: OUTLINE_TASK_BOARD_LIMITS.projectFinished,
-	};
-	const sections: OutlineBoardSection[] = [];
 	const after = options.cursor ? decodeSpaceCursor(options.cursor) : undefined;
+	const spaces: OutlineSpaceRow[] = [];
 	if (after === undefined) {
 		const projectSpace = await store.findSpace({ kind: "project", projectId });
-		if (projectSpace && (await canReadSpace(principal, projectSpace)))
-			sections.push(await ownSection(ctx, projectSpace, limits));
+		if (projectSpace && (await canReadSpace(principal, projectSpace))) spaces.push(projectSpace);
 	}
 	const page = await readProjectSessionSpacePage(principal, projectId, {
 		afterNarratorId: after,
 		limit: OUTLINE_TASK_BOARD_LIMITS.projectSpaces + 1,
 	});
-	const spaces = page.slice(0, OUTLINE_TASK_BOARD_LIMITS.projectSpaces);
-	for (const space of spaces) sections.push(await ownSection(ctx, space, limits));
-	const last = spaces.at(-1);
+	const sessions = page.slice(0, OUTLINE_TASK_BOARD_LIMITS.projectSpaces);
+	spaces.push(...sessions);
+	const sections = await ownSections(
+		ctx,
+		spaces,
+		{
+			open: OUTLINE_TASK_BOARD_LIMITS.projectOpen,
+			finished: OUTLINE_TASK_BOARD_LIMITS.projectFinished,
+		},
+		projectId,
+	);
+	const last = sessions.at(-1);
 	return {
 		scope: { kind: "project", projectId },
 		sections,
@@ -424,7 +602,11 @@ export async function readFinishedTasks(
 		OUTLINE_TASK_BOARD_LIMITS.maxFinishedPage,
 	);
 	const ctx: Context = { store, principal, spaces: new Map([[space.id, space]]) };
-	const excluded = new Set(await excludedPages(store, space));
+	const excluded = new Set(
+		space.kind === "session"
+			? (await store.findAliasOwners(space.id, [OUTLINE_BEHAVIOR_ALIAS])).map((o) => o.id)
+			: [],
+	);
 	const rows = await store.listFinishedTasks(space.id, {
 		before: options.cursor ? decodeFinishedCursor(options.cursor) : null,
 		limit: limit + 1,
