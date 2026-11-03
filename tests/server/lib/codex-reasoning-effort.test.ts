@@ -4,8 +4,8 @@ import {
 	normalizeCodexReasoningEffort,
 	resolveCodexRequestReasoningEffort,
 } from "../../../server/lib/agent/openai-provider";
-import { bindModelCatalogSettings } from "../../../server/lib/model-catalog";
-import { getDefaults, settings } from "../../../server/lib/settings";
+import { replaceModelOverridesForTests } from "../../../server/lib/model-catalog";
+import { settings } from "../../../server/lib/settings";
 import { REASONING_EFFORT_VALUES } from "../../../shared/reasoning-effort";
 
 /**
@@ -17,35 +17,23 @@ import { REASONING_EFFORT_VALUES } from "../../../shared/reasoning-effort";
  */
 
 const originalDefaultEffort = settings.agent.defaultReasoningEffort;
+let restoreOverrides: () => void;
 
 beforeEach(() => {
 	// Pin declared capabilities rather than relying on a changing bundled catalog.
-	const local = getDefaults();
-	local.agent.modelCatalog = {
-		schemaVersion: 2,
-		migrationVersion: 2,
-		autoApply: false,
-		pinnedVersion: null,
-		local: {
-			revision: 1,
-			models: [
-				{
-					id: "gpt-6-astra",
-					metadata: {
-						supports_reasoning: true,
-						reasoning_effort_levels: ["low", "medium", "high", "xhigh", "max"],
-						can_disable_reasoning: false,
-					},
-				},
-			],
+	restoreOverrides = replaceModelOverridesForTests({
+		models: {
+			"gpt-6-astra": {
+				reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
+				canDisableReasoning: false,
+			},
 		},
-	} as unknown as NonNullable<typeof local.agent.modelCatalog>;
-	bindModelCatalogSettings(local, () => {});
+	});
 });
 
 afterEach(() => {
 	settings.agent.defaultReasoningEffort = originalDefaultEffort;
-	bindModelCatalogSettings(settings, () => {});
+	restoreOverrides();
 });
 
 describe("unknown models expose all efforts", () => {

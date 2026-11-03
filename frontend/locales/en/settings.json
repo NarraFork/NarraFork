@@ -2743,5 +2743,29 @@
 	"dataImportSkip": "Skip",
 	"dataImportOverwrite": "Overwrite",
 	"dataImportConfirm": "Start import",
-	"dataImportCancel": "Cancel"
+	"dataImportCancel": "Cancel",
+	"credentialNetwork": {
+		"button": "Network identity",
+		"title": "Network identity · {{name}}",
+		"description": "How this account appears to the upstream. Fields left on \"Follow\" use the Codex settings; requests, token refreshes and usage checks for this account all go out this way.",
+		"proxy": "Proxy",
+		"userAgent": "Client (User-Agent)",
+		"follow": "Follow Codex settings",
+		"custom": "Custom",
+		"deviceId": "Device ID",
+		"deviceFollow": "Same as this instance",
+		"deviceOwn": "Own device ID",
+		"regenerate": "Regenerate",
+		"headers": "Extra headers",
+		"headersHint": "One per line as Name: value. Added to the Codex settings' headers; a name set here wins.",
+		"reset": "Follow everything",
+		"cancel": "Cancel",
+		"save": "Save",
+		"invalid": {
+			"proxy.url": "Enter a proxy URL such as http://host:port or socks5://host:port.",
+			"customUserAgent": "Enter a single-line User-Agent.",
+			"extraHeaders": "Each line must be a valid header name, a colon and a value.",
+			"deviceId": "The device ID must be a UUID."
+		}
+	}
 }

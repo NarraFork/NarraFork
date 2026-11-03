@@ -139,6 +139,11 @@ export interface OpenAIProviderConfig {
 	apiMode?: "responses" | "completions" | "codex";
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header (for org subscriptions). */
 	codexAccountId?: string;
+	/**
+	 * Internal: the installation id a Codex-mode request sends in `client_metadata`, set per
+	 * credential by the Codex provider. Absent = this instance's id. Not persisted.
+	 */
+	codexInstallationId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP (experimental; falls back to HTTP when unavailable). */
 	codexWebSocket?: boolean;
 	/** Codex: allow the native web_search tool to be sent to the model. */

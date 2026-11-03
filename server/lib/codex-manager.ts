@@ -5,6 +5,11 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+	type CredentialNetwork,
+	publicCredentialNetwork,
+	restoreMaskedProxy,
+} from "@shared/credential-network";
+import {
 	type AgentIdentityKey,
 	buildAgentAssertion,
 	isAgentTaskInvalidResponse,
@@ -143,6 +148,8 @@ export interface CodexCredential {
 	archivedAt?: number;
 	/** Cached usage snapshot persisted with credential. */
 	usage?: CodexUsageResult;
+	/** This account's own proxy, client fingerprint and device id; absent fields follow Codex settings. */
+	network?: CredentialNetwork;
 	/** Rolling usage snapshots used to extend quota forecasts into the recent past. */
 	usageHistory?: CodexUsageHistoryEntry[];
 }
@@ -205,6 +212,8 @@ export interface CredentialSnapshot {
 	expiresAt?: number;
 	quotaResetsAt?: number;
 	usage?: CodexUsageResult;
+	/** Network identity with proxy passwords masked. */
+	network?: CredentialNetwork;
 }
 
 export interface UsageSchedulerSnapshot {
@@ -995,9 +1004,8 @@ export class CodexManager {
 		}
 
 		const promise = (async () => {
-			const { resolveOverride } = await import("./net/proxy");
-			const { settings } = await import("./settings");
-			const proxy = resolveOverride(settings.codex?.proxy);
+			const { codexProxy } = await import("./codex-network");
+			const proxy = codexProxy(entry);
 			const key: AgentIdentityKey = { runtimeId, privateKey };
 			const taskId = await registerAgentIdentityTask(key, proxy);
 			entry.taskId = taskId;
@@ -1049,9 +1057,8 @@ export class CodexManager {
 		}
 
 		const promise = (async () => {
-			const { resolveOverride } = await import("./net/proxy");
-			const { settings } = await import("./settings");
-			const proxy = resolveOverride(settings.codex?.proxy);
+			const { codexProxy } = await import("./codex-network");
+			const proxy = codexProxy(cred);
 			const tokens = await refreshCodexToken(refreshToken, proxy);
 			return {
 				...cred,
@@ -1495,6 +1502,7 @@ export class CodexManager {
 				expiresAt: e.expiresAt,
 				quotaResetsAt: e.quotaResetsAt,
 				usage: e.usage,
+				...(e.network ? { network: publicCredentialNetwork(e.network) } : {}),
 			};
 		};
 
@@ -1714,10 +1722,21 @@ export class CodexManager {
 
 	updateCredential(
 		id: string,
-		fields: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+		fields: {
+			displayName?: string;
+			priority?: number;
+			useCreditQuota?: boolean;
+			/** Replaces the network identity; `null` clears it. Validated by the caller. */
+			network?: CredentialNetwork | null;
+		},
 	): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
+		if (fields.network !== undefined) {
+			const next = fields.network && restoreMaskedProxy(fields.network, entry.network);
+			if (next && Object.keys(next).length) entry.network = next;
+			else delete entry.network;
+		}
 		if (fields.displayName !== undefined) entry.displayName = fields.displayName;
 		if (fields.priority !== undefined) entry.priority = fields.priority;
 		if (fields.useCreditQuota !== undefined) entry.useCreditQuota = fields.useCreditQuota === true;
@@ -1738,9 +1757,8 @@ export class CodexManager {
 		/** False when the local callback listener failed to start; the user must paste the callback URL. */
 		localCallbackServer: boolean;
 	}> {
-		const { resolveOverride } = await import("./net/proxy");
-		const { settings } = await import("./settings");
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const { codexProxy } = await import("./codex-network");
+		const proxy = codexProxy();
 		const generation = ++this.browserAuthGeneration;
 		const { authorizeUrl, tokenPromise, localCallbackServer } = await startBrowserOAuth(proxy);
 
@@ -1798,9 +1816,8 @@ export class CodexManager {
 		// Cancel any existing flow
 		this.cancelDeviceAuth();
 
-		const { resolveOverride } = await import("./net/proxy");
-		const { settings } = await import("./settings");
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const { codexProxy } = await import("./codex-network");
+		const proxy = codexProxy();
 		const { deviceAuthId, userCode, verificationUrl, interval } = await startDeviceCodeFlow(proxy);
 
 		const abortController = new AbortController();
@@ -2008,9 +2025,8 @@ export class CodexManager {
 			}
 			const authorization = buildAgentAssertion({ runtimeId, privateKey, taskId });
 
-			const { resolveOverride } = await import("./net/proxy");
-			const { settings } = await import("./settings");
-			const proxy = resolveOverride(settings.codex?.proxy);
+			const { codexProxy } = await import("./codex-network");
+			const proxy = codexProxy(entry);
 			// `authorization` overrides the Authorization header entirely, so the
 			// accessToken positional arg is unused for Agent Identity — pass "".
 			return { accessToken: "", accountId: entry.accountId, proxy, authorization };
@@ -2044,9 +2060,8 @@ export class CodexManager {
 			throw new Error("Account ID not available for this credential");
 		}
 
-		const { resolveOverride } = await import("./net/proxy");
-		const { settings } = await import("./settings");
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const { codexProxy } = await import("./codex-network");
+		const proxy = codexProxy(entry);
 
 		if (!entry.accessToken) {
 			throw new Error("Access token not available");

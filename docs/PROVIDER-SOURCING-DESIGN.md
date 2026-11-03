@@ -174,6 +174,8 @@ resolveRoute({ model, source, billingOwner, narratorId, epoch, caps }) →
 
 额度探测器先覆盖已有实现：Codex `/wham/usage`、Kimi `/coding/v1/usages`、OpenCode Go `/usage`、NUG 余额、TokenDance。其余 Token Plan（MiniMax、智谱、MiMo）按官方接口逐个补，拿不到时只靠 429 被动发现。
 
+网络身份（`CredentialNetwork`）每项都可缺省，缺省即跟随所属服务的设置；代理密码只保存在服务端，接口返回时打码，编辑时原样回传的打码地址会保留原密码。
+
 Codex 现有的能力（优先级、档位排序、会话亲和、连续失败停用、归档、配额预测）上移为**通用凭据池**，Codex 只保留 OAuth、PAT、Agent Identity 的登录实现与额度探测器。
 
 ## 7. 存储与安全
@@ -305,7 +307,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 |---|---|---|
 | **P0 地基**（已完成） | 所有来源写 `credentialId`；`api_requests` 记录计费主体与项目；`usage_daily`；修复首页汇总越权 | 用量可按来源区分；首页只显示自己的开销 |
 | **P1 目录重做**（已完成） | 按 §8 重做模型目录：3 层合并、8 类字段、独立覆盖文件、精简在线更新、新模型卡界面；删除变体 / 绑定 / 遗留归档 | 模型参数页只剩必要字段，不再报错和卡顿。后续逻辑模型路由依赖这里的模型身份匹配，所以提前 |
-| **P2 存储** | 服务 / 凭据入库并加密；通用凭据池（从 CodexManager 上移）；逐凭据网络身份 | Kimi / OpenCode 等获得 Codex 式详情页 |
+| **P2 存储**（进行中） | 服务 / 凭据入库并加密；通用凭据池（从 CodexManager 上移）；逐凭据网络身份（Codex 账号已完成：`shared/credential-network.ts` + `server/lib/codex-network.ts`，请求、令牌刷新、额度查询与 Agent Identity 注册都走账号自己的代理 / UA / 设备 ID / 请求头） | Kimi / OpenCode 等获得 Codex 式详情页 |
 | **P3 路由** | 逻辑模型、默认聚合、`resolveRoute`、策略预设、纪元锁、模型选择器二级菜单；迁移旧模型值与聚合 | “模型聚合”消失，来源变为二级菜单 |
 | **P4 个人来源** | 个人凭据、计费主体规则、团队回落、团队策略与个人预算 | 非管理员可登录自己的订阅 |
 | **P5 开销与分析** | 计费配置、实际开销、节省量、我的用量 / 团队用量、隐私、项目预算 | 用量页对所有人开放 |

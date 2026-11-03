@@ -607,7 +607,13 @@ export const miscApi = {
 		),
 	codexCredentialUpdate: (
 		id: string,
-		data: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+		data: {
+			displayName?: string;
+			priority?: number;
+			useCreditQuota?: boolean;
+			/** `null` clears the account's network identity back to the Codex settings. */
+			network?: import("@shared/credential-network").CredentialNetwork | null;
+		},
 	) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
 			method: "PATCH",

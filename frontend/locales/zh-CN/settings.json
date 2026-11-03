@@ -2743,5 +2743,29 @@
 	"dataImportSkip": "跳过",
 	"dataImportOverwrite": "覆盖",
 	"dataImportConfirm": "开始导入",
-	"dataImportCancel": "取消"
+	"dataImportCancel": "取消",
+	"credentialNetwork": {
+		"button": "网络身份",
+		"title": "网络身份 · {{name}}",
+		"description": "这个账号对上游呈现的样子。保持「跟随」的项使用 Codex 设置；这个账号的请求、令牌刷新和额度查询都按这里发出。",
+		"proxy": "代理",
+		"userAgent": "客户端（User-Agent）",
+		"follow": "跟随 Codex 设置",
+		"custom": "自定义",
+		"deviceId": "设备 ID",
+		"deviceFollow": "与本实例相同",
+		"deviceOwn": "独立设备 ID",
+		"regenerate": "重新生成",
+		"headers": "额外请求头",
+		"headersHint": "每行一个，格式为 名称: 值。叠加在 Codex 设置的请求头之上，同名以这里为准。",
+		"reset": "全部改为跟随",
+		"cancel": "取消",
+		"save": "保存",
+		"invalid": {
+			"proxy.url": "请输入代理地址，例如 http://host:port 或 socks5://host:port。",
+			"customUserAgent": "请输入单行的 User-Agent。",
+			"extraHeaders": "每行需要是合法的请求头名称、冒号和值。",
+			"deviceId": "设备 ID 必须是 UUID。"
+		}
+	}
 }
