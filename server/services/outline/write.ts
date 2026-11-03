@@ -153,6 +153,7 @@ import {
 	OUTLINE_LIMITS,
 	OUTLINE_PENDING_LIMITS,
 	OUTLINE_TASK_IDLE_LEASE_MS,
+	OUTLINE_TASKS_PAGE_ALIAS,
 	type OutlineActorKind,
 	type OutlineCommitKind,
 	type OutlineLinkKind,
@@ -514,7 +515,8 @@ const CALLER_ID_CONSTRAINTS: ReadonlySet<string> = new Set([
 // Validation and preparation (no database access)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ASSIGNEE_RE = /^(?:agent|human):[\p{L}\p{N}_.-]*[\p{L}\p{N}_]$/u;
+/** As `shared/outline/md-outline.ts` reads it: a name may end in `-`, never in `.`. */
+const ASSIGNEE_RE = /^(?:agent|human):[\p{L}\p{N}_.-]*[\p{L}\p{N}_-]$/u;
 const DUE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?$/;
 const CLIENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const TASK_STATUSES: ReadonlySet<string> = new Set(["todo", "doing", "done", "cancelled"]);
@@ -1156,6 +1158,8 @@ class OutlinePlanner {
 					break;
 			}
 		}
+		// Before anything is held for confirmation: a refused change is never proposed.
+		this.checkTasksPage([...this.blocks.values()]);
 		if (this.constrained) {
 			const hold = await this.classifyLocked();
 			if (hold) return { hold };
@@ -2536,6 +2540,29 @@ class OutlinePlanner {
 		);
 	}
 
+	/**
+	 * An agent's commit in a session space may not give or take the task page's alias
+	 * ({@link OUTLINE_TASKS_PAGE_ALIAS}), nor move the page under another block or delete it; it
+	 * writes under the page freely (its steps under a goal). People and the system are never
+	 * checked. No read: the working copy's blocks carry their alias and parent before and after
+	 * (a block the operations did not change has the same both).
+	 */
+	private checkTasksPage(changed: readonly WorkingBlock[]): void {
+		if (this.input.actor.kind !== "agent" || this.space.kind !== "session") return;
+		const touches = changed.some((block) => {
+			const was =
+				block.base !== null && !block.base.deleted && block.base.alias === OUTLINE_TASKS_PAGE_ALIAS;
+			const is = !block.deleted && block.alias === OUTLINE_TASKS_PAGE_ALIAS;
+			if (was !== is) return true;
+			return was && block.parentId !== block.base?.parentId;
+		});
+		if (!touches) return;
+		throw new OutlineWriteError(
+			OUTLINE_TEXT.errors.tasksPageReserved,
+			"OUTLINE_TASKS_PAGE_RESERVED",
+		);
+	}
+
 	private async assemble(): Promise<Planned | null> {
 		this.leaveUnclaimedToDo();
 		await this.guardLocks();
@@ -3420,8 +3447,9 @@ async function writePrepared(
 			// got there first: then plan again, and the reopened task is claimed afresh).
 			const quiet = planner.quietClaims;
 			if (quiet.length > 0 && !(await store.updateTaskClaims(quiet))) continue;
-			if (hold) emitPending(space.id, [hold.put.row.pageId]);
-			if (options.confirm) emitPending(space.id, options.confirmPageIds ?? []);
+			if (hold) emitPending(space.id, [hold.put.row.pageId], proposerOfWrite(input));
+			if (options.confirm)
+				emitPending(space.id, options.confirmPageIds ?? [], proposerOfWrite(input));
 			return {
 				spaceId: space.id,
 				commit: null,
@@ -3463,7 +3491,12 @@ async function writePrepared(
 		if (hold) pendingPages.add(hold.put.row.pageId);
 		for (const pageId of options.confirmPageIds ?? [])
 			if (options.confirm) pendingPages.add(pageId);
-		if (pendingPages.size > 0) emitPending(space.id, [...pendingPages]);
+		if (pendingPages.size > 0)
+			emitPending(
+				space.id,
+				[...pendingPages],
+				hold || options.confirm ? proposerOfWrite(input) : null,
+			);
 		return {
 			spaceId: space.id,
 			commit: { id: commit.id, seq: commit.seq },
@@ -3489,8 +3522,25 @@ function isStalePending(error: unknown): boolean {
 	);
 }
 
-/** Pending changes of these pages changed: page subscribers re-read their summaries. */
-function emitPending(spaceId: string, pageIds: readonly string[]): void {
+/** The session a held or confirmed change is about: the writer's (an agent's own session). */
+function proposerOfWrite(input: OutlineWriteInput): string | null {
+	return input.narratorId ?? (input.actor.kind === "agent" ? input.actor.id : null);
+}
+
+/**
+ * Pending changes of these pages changed: page subscribers re-read their summaries, and the
+ * boards of the sessions it is about (`narratorId`, the proposer) read again.
+ */
+function emitPending(
+	spaceId: string,
+	pageIds: readonly string[],
+	narratorId?: string | null,
+): void {
 	if (pageIds.length === 0) return;
-	eventBus.emit({ type: "outline:pending", spaceId, pageIds: [...pageIds] });
+	eventBus.emit({
+		type: "outline:pending",
+		spaceId,
+		pageIds: [...pageIds],
+		...(narratorId ? { narratorIds: [narratorId] } : {}),
+	});
 }

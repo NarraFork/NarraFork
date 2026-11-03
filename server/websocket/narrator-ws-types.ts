@@ -1246,6 +1246,14 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 	  }
 	| {
+			/**
+			 * The tasks a session's task board shows changed (outline P2 PR 5): ids only, merged
+			 * within 250 ms; the board and the status bar read again over HTTP.
+			 */
+			type: "outline_tasks_changed";
+			narratorId: string;
+	  }
+	| {
 			type: "spec_changed";
 			narratorId: string;
 			uri: string;

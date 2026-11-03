@@ -461,6 +461,22 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			return out;
 		},
 
+		async getBlockHeads(ids) {
+			const out: Array<{ id: string; contentHead: string }> = [];
+			for (const chunk of chunked(ids)) {
+				out.push(
+					...(await db
+						.select({
+							id: outlineBlocks.id,
+							contentHead: sql<string>`substring(${outlineBlocks.content} from 1 for ${sql.raw(String(OUTLINE_PAGE_HEAD_CHARS))})`,
+						})
+						.from(outlineBlocks)
+						.where(inArray(outlineBlocks.id, chunk))),
+				);
+			}
+			return out;
+		},
+
 		async findLiveBlocks(spaceIds, by, limit) {
 			const out: OutlineBlockRow[] = [];
 			for (const spaces of chunked(spaceIds)) {

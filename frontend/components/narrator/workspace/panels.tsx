@@ -32,6 +32,7 @@ import {
 	SubagentSessionPanelContent,
 	TasksDockPanel as TasksToolAdapter,
 	TerminalDockPanel as TerminalToolAdapter,
+	TimelineDockPanel as TimelineToolAdapter,
 	ToolPanelShell,
 	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
@@ -237,6 +238,9 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "filetree":
 			inner = <FileTreeToolAdapter {...toolProps} />;
+			break;
+		case "timeline":
+			inner = <TimelineToolAdapter {...toolProps} />;
 			break;
 		default:
 			inner = null;

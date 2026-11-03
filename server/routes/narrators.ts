@@ -17,6 +17,7 @@ import {
 } from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -394,6 +395,7 @@ import {
 	editAndRegenerate,
 	editAssistantMessage,
 	editOutputBlock,
+	executeQueuedGoalCommand,
 	getBufferedMessagesAsync,
 	getNarratorExecutionDeviceState,
 	interruptAndWaitForIdle,
@@ -401,9 +403,8 @@ import {
 	isCompactInProgress,
 	isLoopRunning,
 	isNarratorActive,
-	isOutlineSessionGoal,
+	isRefusedOutlineGoal,
 	normalizeRollbackBlockIndexForMessage,
-	persistGoalAddedNotice,
 	readSessionDeliverTo,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
@@ -418,7 +419,7 @@ import {
 	rollbackToBlocks,
 	runCustomCompact,
 	runSegmentCompact,
-	sendMessage,
+	sendHumanMessage as sendMessage,
 	setNarratorDefaultDevice,
 	startSpecContinuationIfPossible,
 	toBufferSummary,
@@ -478,15 +479,13 @@ import {
 	SnapshotRevertError,
 	unavailableSnapshotRevert,
 } from "../services/snapshot-revert";
-import { broadcastSpecChanged } from "../services/spec-broadcast";
-import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
 import {
 	resolveSubagentModelForRun,
 	resolveSubagentModelInheritance,
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
-import { resolveTaskBackend } from "../services/task-source";
+import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -1615,6 +1614,31 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 	return c.json(summary);
 });
 
+/**
+ * The status bar's current task, from the task source (outline P2 PR 5): the first task in
+ * progress for either task backend (with its outline address), and for an outline session how
+ * many of its person-created goals wait for confirmation of being done, and how many of those the
+ * caller decides. Read access to the session.
+ */
+narratorRoutes.get("/:id/tasks/current", async (c) => {
+	const id = c.req.param("id");
+	getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const source = await taskSourceForNarrator(id);
+	// One read of the tasks; an unreadable source shows nothing rather than failing the bar.
+	const view = await source.statusBar(c.get("user").sub).catch(() => null);
+	const current = view?.current ?? null;
+	const body: NarratorCurrentTaskResponse = {
+		backend: source.backend,
+		current: current
+			? { text: current.text, address: current.address, protected: current.protected }
+			: null,
+		awaitingConfirmation: view?.awaitingConfirmation.total ?? 0,
+		awaitingYourConfirmation: view?.awaitingConfirmation.mine ?? 0,
+		awaitingFrom: view?.awaitingConfirmation.from ?? [],
+	};
+	return c.json(body);
+});
+
 narratorRoutes.get("/:id/panel-state", async (c) => {
 	const id = c.req.param("id");
 	const result = await getNarratorPanelState(id, c.get("user").sub, {
@@ -2186,6 +2210,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Set when a busy `/goal` falls through to the buffer path, so the buffered
 		// response can prompt the UI to show a "queued protected task" toast.
 		let specGoalQueued = false;
+		let specGoalOutline = false;
 		let specGoalObjective = "";
 		const cmdResult =
 			queuedNewCommand || mixedDocument
@@ -2214,7 +2239,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			!("loadSkill" in cmdResult) &&
 			!("specGoal" in cmdResult)
 		) {
+			const locale = await getUserLanguage(userId);
+			const replyInUserLanguage = await getUserReplyInLanguage(userId);
 			const result = await acceptUserMessage(id, message, {
+				humanReplyContext: { locale, replyInUserLanguage },
 				userId,
 				commandText: message,
 				locale: await getUserLanguage(userId),
@@ -2298,18 +2326,19 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			);
 			return c.json(bashResult, 201);
 		}
-		// Handle /goal <objective> — add a protected task to spec://tasks.json and
-		// immediately start its first Spec execution turn. When the narrator is busy,
-		// queue the command and append/start it once the buffer consumer reaches it;
-		// this avoids mutating tasks.json in the middle of the current turn.
+		// Handle /goal <objective> — add its task where the session keeps its tasks (a protected
+		// todo in spec://tasks.json, or a person-created, locked task in the outline: P2 PR 5) and
+		// immediately start its first execution turn. When the narrator is busy, queue the command
+		// and add/start it once the buffer consumer reaches it; this avoids changing the tasks in
+		// the middle of the current turn.
 		if (cmdResult.resolved && "specGoal" in cmdResult) {
-			// A session whose tasks live in the outline has no tasks.json to add the goal to; its
-			// `/goal` (a person-created, locked task) arrives with the task board (plan PR 5).
-			// Refused before anything is persisted, so nothing lands where the session cannot see.
-			if ((await resolveTaskBackend(id)) === "outline") {
+			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			// An outline subagent has no tasks of its own to add the goal to. Refused before
+			// anything is persisted, so nothing lands where the session cannot see.
+			if (await isRefusedOutlineGoal(id, rawCommand)) {
 				throw catalogError("GOAL_IN_OUTLINE_SESSION");
 			}
-			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			const goalBackend = await resolveTaskBackend(id);
 			// A compacting narrator counts as busy here for the same reason a running one
 			// does: appending the protected task now and starting its Spec turn would run
 			// that turn against the history the compact is replacing.
@@ -2319,59 +2348,176 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				isLoopRunning(id) ||
 				queueBehindCompaction;
 			if (!goalNarratorBusy) {
-				// Idle: persist the typed /goal command as the canonical user message and
-				// append the protected task immediately.
-				const userMsg = await narratorService.persistUserMessage(
-					id,
-					rawCommand,
-					[{ type: "text", text: rawCommand }],
-					rawCommand,
-					userId,
-				);
-				broadcastToNarrator(id, {
-					type: "user_message",
-					narratorId: id,
-					message: {
-						id: userMsg.id,
-						narratorId: id,
-						role: "user",
-						contentJson: userMsg.contentJson,
-						contentText: userMsg.contentText,
-						commandText: rawCommand,
-						createdAt: userMsg.createdAt,
-						seq: userMsg.seq,
-						children: [],
-						creator: userMsg.creator ?? null,
-					},
-				});
-				const { added, written } = await appendProtectedSpecTask(id, objective);
-				if (added) {
-					broadcastSpecChanged(
-						id,
-						{ uri: written.uri, path: written.path, revisionId: written.revisionId },
-						"ui",
-						"user",
-					);
-				}
-				// Leave a durable, self-explanatory card in the conversation so the
-				// effect of /goal is visible on scrollback, not only via a toast. This
-				// display-only side effect must not turn an already-applied goal into a
-				// failed command if message persistence is temporarily unavailable.
-				await persistGoalAddedNotice(id, objective, added).catch((err) => {
-					logger.warn("Failed to persist /goal confirmation notice", {
-						narratorId: id,
-						error: String(err),
-					});
-				});
 				const locale = await getUserLanguage(userId);
 				const replyInUserLanguage = await getUserReplyInLanguage(userId);
-				const { started } = await startSpecContinuationIfPossible(
-					id,
-					locale,
-					replyInUserLanguage,
-					userId,
+				const {
+					enqueueBufferedMessage,
+					projectMailboxUserMessage,
+					readBufferedMessageDeliveryReceipt,
+				} = await import("../services/narrator-buffer");
+				const { isNarratorRuntimeBusy, withNarratorStartAdmission } = await import(
+					"../services/narrator-session-state"
 				);
-				return c.json({ specGoal: true, added, objective, started }, 200);
+				const { getExecutionOwner } = await import("../services/agent-runtime/ownership");
+				const { claimInboxHead, withInboxOwner, wakeInboxIfEligible } = await import(
+					"../services/agent-runtime/inbox"
+				);
+				const result = await withNarratorStartAdmission(id, async () => {
+					// Recheck under admission: an idle HTTP snapshot does not own execution.
+					if (getExecutionOwner(id) || isNarratorRuntimeBusy(id) || isCompactInProgress(id))
+						return null;
+					const accepted = await enqueueBufferedMessage(
+						id,
+						rawCommand,
+						undefined,
+						rawCommand,
+						userId,
+						undefined,
+						undefined,
+						"back",
+						undefined,
+						undefined,
+						"fifo",
+						undefined,
+						"turn",
+						undefined,
+						undefined,
+						{ locale, replyInUserLanguage },
+					);
+					if (!accepted.ok) throw new ValidationError("Message queue is full");
+					try {
+						return await withInboxOwner(id, async () => {
+							const claimed = await claimInboxHead(
+								id,
+								(row) => row.id === accepted.id && row.kind === "user_input",
+							);
+							if (!claimed) return { accepted, outcome: null };
+							const outcome = await executeQueuedGoalCommand(
+								id,
+								projectMailboxUserMessage(claimed),
+								objective,
+							);
+							return { accepted, outcome };
+						});
+					} catch (error) {
+						// Acceptance already committed. Owner cleanup releases an uncommitted
+						// claim; never make the client retry and duplicate that durable input.
+						logger.warn("Accepted goal dispatch failed", {
+							narratorId: id,
+							messageId: accepted.id,
+							error: String(error),
+						});
+						const receipt = await readBufferedMessageDeliveryReceipt(id, accepted.id).catch(
+							() => undefined,
+						);
+						if (
+							receipt &&
+							(receipt.state === "queued" ||
+								receipt.state === "failed" ||
+								receipt.state === "claimed")
+						)
+							return { accepted, outcome: null };
+						// After materialization the user message/policy is committed, but a later
+						// task write can fail. Acknowledge it without claiming it is still queued.
+						return {
+							accepted,
+							outcome: null,
+							dispatchFailure: {
+								messageId: receipt?.recipientMessageId,
+								error: String(error),
+							},
+						};
+					}
+				});
+				if (result?.outcome) {
+					if (result.outcome.refused) throw catalogError("GOAL_IN_OUTLINE_SESSION");
+					const { started } = await startSpecContinuationIfPossible(
+						id,
+						locale,
+						replyInUserLanguage,
+						userId,
+					).catch((error) => {
+						logger.warn("Accepted goal continuation deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+						return { started: false };
+					});
+					const outcome = result.outcome;
+					return c.json(
+						{
+							specGoal: true,
+							added: outcome.added,
+							objective,
+							started,
+							...(outcome.outline
+								? {
+										taskBackend: "outline" as const,
+										address: outcome.outline.address,
+										locked: outcome.outline.locked,
+									}
+								: {}),
+						},
+						200,
+					);
+				}
+				if (result && "dispatchFailure" in result && result.dispatchFailure) {
+					try {
+						broadcastToNarrator(id, {
+							type: "narrator_error",
+							narratorId: id,
+							error:
+								locale === "zh-CN"
+									? `/goal 输入已接收，但目标处理失败。请检查任务列表后再决定是否重试。${result.dispatchFailure.error}`
+									: `The /goal input was accepted, but goal processing failed. Check the task list before retrying. ${result.dispatchFailure.error}`,
+						});
+					} catch (error) {
+						logger.warn("Accepted goal error notification deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+					}
+					return c.json(
+						{
+							accepted: true,
+							buffered: false,
+							objective,
+							started: false,
+							messageId: result.dispatchFailure.messageId,
+							goalError: result.dispatchFailure.error,
+						},
+						202,
+					);
+				}
+				if (result) {
+					// An earlier inbox row owns the next turn; do not consume this goal twice.
+					try {
+						broadcastToNarrator(id, {
+							type: "buffer_set",
+							narratorId: id,
+							messages: toBufferSummary(await getBufferedMessagesAsync(id)),
+						});
+					} catch (error) {
+						logger.warn("Accepted goal buffer notification deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+					}
+					void wakeInboxIfEligible(id, locale).catch((error) =>
+						logger.warn("Queued goal wake deferred", { narratorId: id, error: String(error) }),
+					);
+					return c.json(
+						{
+							buffered: true,
+							id: result.accepted.id,
+							bufferedAt: result.accepted.bufferedAt,
+							specGoalQueued: true,
+							objective,
+							...(goalBackend === "outline" ? { taskBackend: "outline" as const } : {}),
+						},
+						202,
+					);
+				}
 			}
 			// Busy: fall through to the shared buffer path. Carry the raw command so the
 			// buffer consumer recognizes it as a /goal, appends the task, and starts its
@@ -2380,6 +2526,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			commandText = rawCommand;
 			specGoalQueued = true;
 			specGoalObjective = objective;
+			specGoalOutline = goalBackend === "outline";
 		}
 		let prePromptBashCommand: string | undefined;
 		if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
@@ -2494,6 +2641,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// The service atomically enqueues and claims this message, or leaves it queued
 		// behind an existing owner/backlog. HTTP status observations never decide admission.
 		const result = await acceptUserMessage(id, finalMessage, {
+			humanReplyContext: { locale, replyInUserLanguage },
 			images,
 			media,
 			locale,
@@ -2519,7 +2667,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					buffered: true,
 					bufferedAt: result.bufferedAt,
 					id: result.id,
-					...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
+					...(specGoalQueued
+						? {
+								specGoalQueued: true,
+								objective: specGoalObjective,
+								...(specGoalOutline ? { taskBackend: "outline" as const } : {}),
+							}
+						: {}),
 				},
 				202,
 			);
@@ -2565,7 +2719,10 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId);
+	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId, {
+		locale,
+		replyInUserLanguage,
+	});
 	return c.json(result);
 });
 
@@ -2604,8 +2761,10 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: [recoveryMessageId],
 		});
 	};
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+	const humanReplyContext = { locale, replyInUserLanguage };
 	const { manuallyResumeRestartRecovery } = await import("../services/restart-recovery-service");
-	if (await manuallyResumeRestartRecovery(id)) {
+	if (await manuallyResumeRestartRecovery(id, humanReplyContext)) {
 		await dismissRecoveryMessage();
 		return c.json({
 			ok: true,
@@ -2613,7 +2772,6 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
 		});
 	}
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	// Seamless subagent recovery: when the latest assistant turn still holds
 	// unfinished Agent / Await work, re-drive it first. The recovery flow owns the
@@ -2624,6 +2782,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 		locale,
 		replyInUserLanguage,
 		userId,
+		humanReplyContext,
 	});
 	if (recovery.recovering) {
 		await dismissRecoveryMessage();
@@ -2634,7 +2793,14 @@ narratorRoutes.post("/:id/continue", async (c) => {
 		});
 	}
 
-	const result = await continueNarrator(id, locale, replyInUserLanguage, userId);
+	const result = await continueNarrator(
+		id,
+		locale,
+		replyInUserLanguage,
+		userId,
+		undefined,
+		humanReplyContext,
+	);
 	await dismissRecoveryMessage();
 	return c.json({
 		...result,
@@ -2692,6 +2858,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			locale,
 			replyInUserLanguage,
 			userId,
+			humanReplyContext: { locale, replyInUserLanguage },
 		});
 		return c.json({ ok: true, mode: "await", resumed: resumed.length, skipped });
 	}
@@ -2959,6 +3126,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage, {
+		humanReplyContext: { locale, replyInUserLanguage },
 		fileReferences: snapshots,
 		composerDocument,
 		keepImageIds,
@@ -3258,9 +3426,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	) {
 		throw new ValidationError("File references are not supported by queued /new or /goal commands");
 	}
-	// Nor the outline session's refusal of /goal: an edit must not turn a queued message into one.
+	// Nor an outline subagent's refusal of /goal: an edit must not turn a queued message into one.
 	if (
-		await isOutlineSessionGoal(
+		await isRefusedOutlineGoal(
 			id,
 			text,
 			located.message.commandText,

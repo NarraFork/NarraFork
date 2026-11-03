@@ -311,6 +311,7 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	humanReplyContext?: import("@shared/reply-context").ReplyContext;
 	composerDocumentPath?: string;
 	queueMode?: BufferQueueMode;
 	executionIntent?: BufferedMessage["executionIntent"];
@@ -651,7 +652,9 @@ export async function enqueueBufferedMessage(
 	queueMode?: BufferQueueMode,
 	composerDocument?: ComposerDocument,
 	media?: MediaRef[],
+	humanReplyContext?: import("@shared/reply-context").ReplyContext,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+	humanReplyContext = humanReplyContext ? { ...humanReplyContext } : undefined;
 	composerDocument = parseOptionalComposerDocument(composerDocument);
 	validateComposerProjection(
 		composerDocument,
@@ -682,7 +685,7 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
+		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode, humanReplyContext };
 		if (composerDocument)
 			metadata.composerDocumentPath = await writeStagingText(
 				stagingId,

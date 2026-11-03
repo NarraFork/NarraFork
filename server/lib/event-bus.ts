@@ -12,6 +12,8 @@ import { logger } from "./logger";
 
 export type NarraForkEvent =
 	| { type: "auth:changed"; userId?: string }
+	// Invalidation only: lifecycle details are fetched through the authorized status API.
+	| { type: "system:lifecycle_changed" }
 	| { type: "git:workspace_invalidated"; queryKey: string }
 	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
 	| {
@@ -434,6 +436,21 @@ export type NarraForkEvent =
 			type: "outline:pending";
 			spaceId: string;
 			pageIds: string[];
+			/**
+			 * The narrators the change is about, when known (its proposer): their sessions' task
+			 * boards show it, wherever the task lives (outline P2 PR 5).
+			 */
+			narratorIds?: string[];
+	  }
+	| {
+			/**
+			 * Someone rejected a pending change (not its proposer withdrawing it). Ids only: a
+			 * listener re-reads the row. The proposing session is told when the change asked to end a
+			 * locked goal (outline P2 PR 5): the rejection writes no commit, so nothing else tells it.
+			 */
+			type: "outline:pending_rejected";
+			spaceId: string;
+			pendingId: string;
 	  }
 	// Human-to-human chat. Ids and scalars only — never message bodies — so a
 	// listener (WS fan-out today, an IM bridge later) can route without holding a

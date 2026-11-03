@@ -64,6 +64,8 @@ export type BufferedSendResult = {
 	specGoalQueued?: boolean;
 	/** The protected task text carried by a queued `/goal`. */
 	objective?: string;
+	/** `outline` when the session keeps its tasks in the outline (outline P2 PR 5). */
+	taskBackend?: "outline";
 };
 
 /** Live sending/upload progress surfaced to the composer + cancel button. */
@@ -355,7 +357,10 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			// the protected task will be added once the queued command is consumed.
 			if (result.specGoalQueued) {
 				notifications.show({
-					title: t("spec.specGoalQueued"),
+					title:
+						result.taskBackend === "outline"
+							? t("spec.outlineGoalQueued")
+							: t("spec.specGoalQueued"),
 					message: result.objective ?? undefined,
 					color: "blue",
 					autoClose: 4000,
@@ -447,8 +452,11 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				scrollToBottom(true);
 			} else if (result?.specGoal) {
 				// /goal added a protected task; the real user message arrives via WS.
+				const outline = result.taskBackend === "outline";
 				notifications.show({
-					title: result.added ? t("spec.specGoalAdded") : t("spec.specGoalExists"),
+					title: result.added
+						? t(outline ? "spec.outlineGoalAdded" : "spec.specGoalAdded")
+						: t(outline ? "spec.outlineGoalExists" : "spec.specGoalExists"),
 					message: result.objective ?? undefined,
 					color: result.added ? "green" : "yellow",
 					autoClose: 4000,

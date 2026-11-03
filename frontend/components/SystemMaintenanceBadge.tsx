@@ -3,7 +3,10 @@ import { IconPlayerPause } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
-import { useSystemLifecycleStatus } from "../hooks/useSystemLifecycleStatus";
+import {
+	useSystemLifecycleStatus,
+	useSystemLifecycleSync,
+} from "../hooks/useSystemLifecycleStatus";
 import { api } from "../lib/api";
 import {
 	systemLifecycleNoticeQueryKey,
@@ -17,12 +20,12 @@ export function SystemMaintenanceBadge() {
 	const client = useQueryClient();
 	const isAdmin = user?.role === "admin";
 	const lifecycle = useSystemLifecycleStatus(isAdmin);
+	useSystemLifecycleSync(!!user && !isAdmin);
 	const notice = useQuery({
 		queryKey: systemLifecycleNoticeQueryKey,
 		queryFn: ({ signal }) => api.getSystemLifecycleNotice(signal),
 		enabled: !!user && !isAdmin,
-		refetchInterval: (query) => (query.state.data?.phase === "shutting_down" ? false : 2_000),
-		refetchIntervalInBackground: true,
+		refetchInterval: false,
 		retry: false,
 	});
 	const cancel = useMutation({

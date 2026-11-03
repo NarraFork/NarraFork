@@ -1,17 +1,21 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Worker } from "node:worker_threads";
 import { SQL } from "bun";
 import { withPostgres } from "../../tests/db/pg-test-harness";
 import type { ToolDefinitionSnapshot } from "../lib/agent/tool-loading";
+import * as compiledWorker from "../lib/compiled-worker";
 import { PREFIX_TOOLS_FORMAT, type PrefixToolsManifest } from "./narrator-prefix-snapshot-values";
 import {
 	createPrefixSnapshotMaintenance,
 	createPrefixSnapshotStore,
 	type PrefixSnapshotStore,
 } from "./narrator-prefix-snapshots";
+import type { PrefixSnapshotRequest } from "./narrator-prefix-snapshots-worker";
 import { createPrefixToolSnapshots } from "./narrator-prefix-tool-snapshots";
 
 const schema = `
@@ -157,20 +161,150 @@ test("all cancelled read subscribers stop before dispatching the next body batch
 	expect((await tools.getPrefixToolDefinitions("root")).length).toBe(200);
 });
 
+// Test the real store scheduler independently of worker startup/SQLite wall time.
+// The other fixtures in this file retain real workers and file-backed SQLite.
+function controlledQueue() {
+	const timeoutMs = 220;
+	let now = 1000;
+	const timers: Array<{ callback: () => void; started: number; cleared: boolean }> = [];
+	const timerHandles = new Map<ReturnType<typeof setTimeout>, (typeof timers)[number]>();
+	const setTimer = globalThis.setTimeout;
+	const clearTimer = globalThis.clearTimeout;
+	const clockSpy = spyOn(Date, "now").mockImplementation(() => now);
+	const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: TimerHandler,
+		delay?: number,
+		...args: unknown[]
+	) => {
+		if (delay !== timeoutMs || typeof callback !== "function")
+			return setTimer(callback, delay, ...args);
+		const timer = { callback: () => callback(...args), started: now, cleared: false };
+		timers.push(timer);
+		const handle = setTimer(() => {}, delay);
+		clearTimer(handle);
+		timerHandles.set(handle, timer);
+		return handle;
+	}) as typeof setTimeout);
+	const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(((
+		handle?: ReturnType<typeof setTimeout>,
+	) => {
+		const timer = handle === undefined ? undefined : timerHandles.get(handle);
+		if (timer) timer.cleared = true;
+		clearTimer(handle);
+	}) as typeof clearTimeout);
+	type Dispatch = { worker: ControlledWorker; request: PrefixSnapshotRequest };
+	const dispatched: Dispatch[] = [];
+	const waiters: Array<(value: Dispatch) => void> = [];
+	class ControlledWorker extends EventEmitter {
+		terminated = false;
+		ref() {
+			return this;
+		}
+		unref() {
+			return this;
+		}
+		async terminate() {
+			this.terminated = true;
+			return 0;
+		}
+		postMessage(request: PrefixSnapshotRequest) {
+			const dispatch = { worker: this, request };
+			const waiter = waiters.shift();
+			if (waiter) waiter(dispatch);
+			else dispatched.push(dispatch);
+		}
+	}
+	const connectSpy = spyOn(compiledWorker, "connectCompiledWorker").mockImplementation(
+		async () => ({
+			worker: new ControlledWorker() as unknown as Worker,
+			specifier: "controlled-prefix-worker",
+		}),
+	);
+	const store = createPrefixSnapshotStore(
+		{ backend: "sqlite", path: "unused-controlled-worker.db" },
+		{ timeoutMs },
+	);
+	cleanups.push(async () => {
+		try {
+			await store.close();
+		} finally {
+			connectSpy.mockRestore();
+			clearSpy.mockRestore();
+			timerSpy.mockRestore();
+			clockSpy.mockRestore();
+		}
+	});
+	return {
+		store,
+		timeoutMs,
+		timers,
+		advance: (elapsed: number) => (now += elapsed),
+		nextDispatch: () =>
+			new Promise<Dispatch>((resolve) => {
+				const dispatch = dispatched.shift();
+				if (dispatch) resolve(dispatch);
+				else waiters.push(resolve);
+			}),
+	};
+}
+
 test("queue execution timeout starts when work starts, not while waiting behind another task", async () => {
-	const { store, db } = await fixture({ timeoutMs: 220 });
-	await store.putPrefixText("warmup");
-	db.run("BEGIN IMMEDIATE");
+	const { store, timeoutMs, timers, advance, nextDispatch } = controlledQueue();
 	const controller = new AbortController();
 	const first = store
 		.putPrefixText("cancelled blocked task", controller.signal)
-		.catch((error) => error);
+		.catch((error: Error) => error);
+	const firstDispatch = await nextDispatch();
+	expect(firstDispatch.request.value).toBe("cancelled blocked task");
+	expect(timers).toHaveLength(1);
+	const queuedAt = timers[0].started;
 	const second = store.putPrefixText("waits longer than its execution budget");
-	setTimeout(() => controller.abort(new Error("release queue")), 160);
-	setTimeout(() => db.run("ROLLBACK"), 300);
-	expect((await first).message).toBe("release queue");
-	expect(await second).toMatch(/^[a-f0-9]{64}$/);
+	expect(timers).toHaveLength(1);
+	const started = advance(timeoutMs + 1);
+	// Advancing the clock does not dispatch an expired timer: as with a delayed
+	// event loop, cancellation can release the first task before that callback runs.
+	controller.abort(new Error("release queue"));
+	expect(((await first) as Error).message).toBe("release queue");
+	const secondDispatch = await nextDispatch();
+	expect(firstDispatch.worker.terminated).toBe(true);
+	expect(timers[0].cleared).toBe(true);
+	expect(timers).toHaveLength(2);
+	expect(timers[1].started).toBe(started);
+	expect(secondDispatch.request.value).toBe("waits longer than its execution budget");
+	expect(secondDispatch.request.deadline).toBe(started + timeoutMs);
+	expect(started - queuedAt).toBeGreaterThan(timeoutMs);
+	advance(timeoutMs - 1);
+	const hash = "a".repeat(64);
+	secondDispatch.worker.emit("message", { value: hash });
+	expect(await second).toBe(hash);
+	expect(timers[1].cleared).toBe(true);
 });
+
+for (const completion of ["timer", "late response"] as const) {
+	test(`active execution still times out via ${completion} and the queue recovers`, async () => {
+		const { store, timeoutMs, timers, advance, nextDispatch } = controlledQueue();
+		const pending = store.putPrefixText("too slow").catch((error: Error) => error);
+		const dispatch = await nextDispatch();
+		expect(timers).toHaveLength(1);
+		expect(dispatch.request.deadline).toBe(timers[0].started + timeoutMs);
+		advance(timeoutMs);
+		if (completion === "timer") timers[0].callback();
+		else dispatch.worker.emit("message", { value: "b".repeat(64) });
+		const result = await pending;
+		expect(result).toBeInstanceOf(Error);
+		expect((result as Error).message).toBe("Prefix snapshot operation timed out");
+		expect(dispatch.worker.terminated).toBe(true);
+		expect(timers[0].cleared).toBe(true);
+		const recovered = store.putPrefixText("recovered");
+		const recovery = await nextDispatch();
+		expect(recovery.worker).not.toBe(dispatch.worker);
+		expect(timers).toHaveLength(2);
+		expect(recovery.request.deadline).toBe(timers[1].started + timeoutMs);
+		const hash = "c".repeat(64);
+		recovery.worker.emit("message", { value: hash });
+		expect(await recovered).toBe(hash);
+	});
+}
 
 type Query = <T>(sql: string, params?: Array<string | number>) => Promise<T[]>;
 async function cycle(store: PrefixSnapshotStore): Promise<number> {

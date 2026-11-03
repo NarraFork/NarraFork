@@ -1,6 +1,6 @@
 {
-  "id": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
-  "prevId": "297184e9-2ffa-48e9-b8e6-70237e9adde4",
+  "id": "81304305-168a-41ef-8fc3-187e57817aed",
+  "prevId": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -15153,6 +15153,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "reply_context": {
+          "name": "reply_context",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "runtime_registration_json": {
           "name": "runtime_registration_json",
           "type": "text",
@@ -17709,6 +17715,50 @@
           ],
           "isUnique": false,
           "where": "(\"task_json\"::jsonb #>> '{lock}') IS NOT NULL AND \"deleted\" = FALSE",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_blocks_active_tasks": {
+          "name": "idx_outline_blocks_active_tasks",
+          "columns": [
+            {
+              "expression": "space_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"deleted\" = FALSE AND ((\"task_json\"::jsonb #>> '{status}') = 'doing' OR ((\"task_json\"::jsonb #>> '{status}') = 'todo' AND (\"task_json\"::jsonb #>> '{lock}') IS NOT NULL))",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_blocks_finished_tasks": {
+          "name": "idx_outline_blocks_finished_tasks",
+          "columns": [
+            {
+              "expression": "space_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "version_seq",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "(\"task_json\"::jsonb #>> '{status}') IN ('done', 'cancelled') AND \"deleted\" = FALSE",
           "concurrently": false,
           "method": "btree",
           "with": {}

@@ -197,6 +197,9 @@ function fixture(
 		eq: () => undefined,
 		logger: { warn: () => {} },
 		resolveTaskBackend: async () => options.taskBackend ?? "spec",
+		// Only an outline subagent refuses `/goal` (outline P2 PR 5).
+		isRefusedOutlineGoal: async (_id: string, text: string) =>
+			options.taskBackend === "outline" && !!options.subagent && text.startsWith("/goal"),
 		catalogError,
 	};
 	new Function(...Object.keys(bindings), compiled)(...Object.values(bindings));
@@ -574,14 +577,30 @@ describe("primary HTTP message admission", () => {
 		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
 	});
 
+	test("a busy outline session queues /goal like a spec session, saying where its task goes", async () => {
+		const f = fixture({ status: "working", busy: true, buffered: true, taskBackend: "outline" });
+		const response = await f.post({ message: "/goal do work" });
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({
+			buffered: true,
+			id: "queued-message",
+			bufferedAt: "now",
+			specGoalQueued: true,
+			objective: "do work",
+			taskBackend: "outline",
+		});
+		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
+	});
+
 	test.each([
 		false,
 		true,
-	])("/goal in an outline session is refused before anything is persisted (busy=%s)", async (busy) => {
+	])("/goal to an outline subagent is refused before anything is persisted (busy=%s)", async (busy) => {
 		const f = fixture({
 			status: busy ? "working" : "idle",
 			busy,
 			buffered: busy,
+			subagent: true,
 			taskBackend: "outline",
 		});
 		const response = await f.post({ message: "/goal do work" });

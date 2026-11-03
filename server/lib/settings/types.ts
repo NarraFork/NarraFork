@@ -6,6 +6,7 @@
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { RecordingSettings } from "@shared/request-recording";
+import type { SpeechSettings } from "@shared/speech";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
@@ -398,6 +399,8 @@ export interface McpServerConfig {
 
 export interface TlsConfig {
 	enabled: boolean;
+	/** Reissue built-in certificates on startup when SANs change. Defaults to true. */
+	autoReissue?: boolean;
 	/** Path to PEM-formatted TLS certificate file. */
 	certFile: string;
 	/** Path to PEM-formatted TLS private key file. */
@@ -521,6 +524,8 @@ export interface TokenDanceSettings {
 }
 
 export interface NarraForkSettings {
+	/** Independent ASR/TTS providers; absent legacy configurations remain disabled. */
+	speech?: SpeechSettings;
 	/** Backend-only singleton credentials; never return this object to clients. */
 	tokendance?: TokenDanceSettings;
 	/** Tool-triggered local filesystem safety; absent older settings use safe defaults. */

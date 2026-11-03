@@ -1,3 +1,5 @@
+import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
+
 /**
  * The one way a narrator run starts, is controlled, and ends.
  *
@@ -362,10 +364,21 @@ async function executeRun(
 	let publicationRun: PublicationRun | undefined;
 	let finished = false;
 	try {
+		// Notification locale is display-only. A trusted recovery snapshot may seed a legacy row.
+		const replyContext = await ensureReplyContext(
+			id,
+			req.recovered
+				? {
+						locale: req.locale,
+						replyInUserLanguage: req.replyInUserLanguage ?? false,
+					}
+				: undefined,
+		);
 		// The one session construction, outside every admission transaction.
 		active =
 			req.active ??
 			(await sessionModule.ensureNarrator(id, req.locale, req.replyInUserLanguage ?? false));
+		syncActiveReplyContext(id, replyContext);
 		const session = active;
 		const source = await readRunSource(id);
 		// Only human input or this session's own registration establishes identity.

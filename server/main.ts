@@ -78,6 +78,7 @@ import {
 	shouldServeRequests,
 	shouldStartGatedBackgroundWork,
 } from "./lib/startup-readiness";
+import { reissueBuiltinTlsOnStartup } from "./lib/tls";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
@@ -1209,6 +1210,13 @@ function startServer(
 
 function startServerWithHostFallback(listenPort: number) {
 	return startServer(listenPort, settings.server.tls, true);
+}
+
+// Refresh the built-in certificate before the listener reads it, without a restart.
+try {
+	await reissueBuiltinTlsOnStartup(settings.server.tls);
+} catch (error) {
+	logger.warn("Could not update TLS certificate on startup; check TLS settings", { error });
 }
 
 let actualPort = port;

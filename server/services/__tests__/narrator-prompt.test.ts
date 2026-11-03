@@ -1,7 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { contextChanges } from "@shared/prefix-context";
 import { getDynamicSpecSystemReminder, getRunDeliveryHint } from "../../lib/prompt-i18n";
 import { MAX_PROJECT_INSTRUCTIONS_BYTES } from "../../lib/read-file-capped";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
@@ -218,6 +220,73 @@ describe("plan mode designated plan file state", () => {
 		}
 	});
 
+	for (const locale of ["en", "zh-CN"] as const) {
+		test(`only empty-to-nonempty plan transitions change mode (${locale})`, async () => {
+			const cwd = makeWorkdir();
+			const planFileId = "stable-plan--0000000000000000";
+			const path = join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`);
+			const options = { basePrompt: null, cwd, locale, planMode: true, planFileId };
+			try {
+				mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+				writeFileSync(path, "");
+				const empty = await buildEffectiveSystemPrompt(options);
+				writeFileSync(path, "# Plan\n");
+				const first = await buildEffectiveSystemPrompt(options);
+				const baseline = new Map(first.parts.map((part) => [part.key, part.text]));
+				const mode = baseline.get("mode") ?? null;
+				expect(mode).not.toBeNull();
+				expect(
+					contextChanges(new Map(empty.parts.map((part) => [part.key, part.text])), first.parts),
+				).toEqual([{ key: "mode", value: mode }]);
+				for (const content of ["# Plan\n\nStep one.\nStep two.\n", "# 计划\n", "x"]) {
+					writeFileSync(path, content);
+					const edited = await buildEffectiveSystemPrompt(options);
+					expect(edited.parts.find((part) => part.key === "mode")?.text).toBe(baseline.get("mode"));
+					expect(contextChanges(baseline, edited.parts)).toEqual([]);
+				}
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const code of ["EIO", "ESTALE", "EACCES", "ENOENT", "ENOTDIR"]) {
+		test(`plan stat ${code} distinguishes errors from missing files and recovers mode`, async () => {
+			const cwd = makeWorkdir();
+			const planFileId = "recover-plan--0000000000000000";
+			const path = join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`);
+			const options = { basePrompt: null, cwd, locale: "en" as const, planMode: true, planFileId };
+			const realStat = fsPromises.stat;
+			const error = Object.assign(new Error(code), { code });
+			let statSpy: ReturnType<typeof spyOn<typeof fsPromises, "stat">> | undefined;
+			try {
+				mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+				writeFileSync(path, "# Existing plan\n");
+				const first = await buildEffectiveSystemPrompt(options);
+				const baseline = new Map(first.parts.map((part) => [part.key, part.text]));
+				expect(baseline.get("mode")).toContain("Designated Plan File — Current State");
+				statSpy = spyOn(fsPromises, "stat").mockImplementation(((...args) =>
+					args[0] === path ? Promise.reject(error) : realStat(...args)) as typeof realStat);
+				if (code === "ENOENT" || code === "ENOTDIR") {
+					const missing = await buildEffectiveSystemPrompt(options);
+					expect(missing.prompt).not.toContain("Designated Plan File — Current State");
+					expect(contextChanges(baseline, missing.parts).map((change) => change.key)).toEqual([
+						"mode",
+					]);
+				} else {
+					await expect(buildEffectiveSystemPrompt(options)).rejects.toBe(error);
+				}
+				expect(statSpy.mock.calls.some(([requested]) => requested === path)).toBe(true);
+				statSpy.mockRestore();
+				const recovered = await buildEffectiveSystemPrompt(options);
+				expect(contextChanges(baseline, recovered.parts)).toEqual([]);
+			} finally {
+				statSpy?.mockRestore();
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
 	test("warns that the plan file already has content so a compact cannot cause a Write truncation", async () => {
 		const cwd = makeWorkdir();
 		const planFileId = "resumed-plan--0000000000000000";
@@ -237,7 +306,11 @@ describe("plan mode designated plan file state", () => {
 			});
 
 			expect(prompt).toContain("Designated Plan File — Current State");
-			expect(prompt).toContain("bytes of plan content you wrote earlier");
+			expect(prompt).toContain("holds plan content you wrote earlier");
+			expect(prompt).not.toContain("bytes of plan content");
+			expect(prompt).toContain(
+				"Read `.narrafork/plans/plan-resumed-plan--0000000000000000.md` first",
+			);
 			expect(prompt).toContain("Write on this path REPLACES the entire file");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });

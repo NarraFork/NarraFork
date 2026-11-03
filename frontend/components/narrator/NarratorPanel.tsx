@@ -84,7 +84,7 @@ import {
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
-import { useSpecTasks } from "../../hooks/useSpec";
+import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
@@ -95,6 +95,7 @@ import {
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
+import type { SpecTaskItem } from "../../lib/api/spec";
 import { describeApiError } from "../../lib/api-error";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
@@ -1530,9 +1531,20 @@ function NarratorPanelBody({
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
 
-	// Dynamic Spec current task, for the compact status bar above the input.
-	const { data: specTasksData } = useSpecTasks(narratorId, firstScreenActivity);
-	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
+	// The current task, for the compact status bar above the input: from the session's task source
+	// (Dynamic Spec or the outline, outline P2 PR 5).
+	const { data: currentTaskData } = useNarratorCurrentTask(narratorId, firstScreenActivity);
+	const currentSpecTask = useMemo<SpecTaskItem | null>(
+		() =>
+			currentTaskData?.current
+				? {
+						text: currentTaskData.current.text,
+						status: "doing",
+						...(currentTaskData.current.protected ? { protected: true as const } : {}),
+					}
+				: null,
+		[currentTaskData],
+	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
@@ -3619,6 +3631,13 @@ function NarratorPanelBody({
 								isRetrying,
 								isCompacting,
 								currentSpecTask,
+								awaitingConfirmation: currentTaskData
+									? {
+											total: currentTaskData.awaitingConfirmation,
+											yours: currentTaskData.awaitingYourConfirmation,
+											from: currentTaskData.awaitingFrom,
+										}
+									: null,
 								retryInfo,
 								compactingMarkerMessageId,
 								compactFailure,

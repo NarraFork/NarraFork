@@ -61,9 +61,9 @@ const common = {
 	ValidationError,
 	NotFoundError,
 	catalogError,
-	// Spec sessions: the outline-only /goal refusals stay out of the way.
+	// Spec sessions: the outline subagent's /goal refusal stays out of the way.
 	resolveTaskBackend: async () => "spec",
-	isOutlineSessionGoal: async () => false,
+	isRefusedOutlineGoal: async () => false,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
