@@ -22,11 +22,10 @@ describe("SQLite native media branch upgrade", () => {
 	] as const)("repairs the skipped upstream migration with old %s ledger", (lineEnding) => {
 		const source = join(import.meta.dir, "../../drizzle");
 		const journal = JSON.parse(readFileSync(join(source, "meta/_journal.json"), "utf8"));
-		const entries = journal.entries.slice(-2);
-		expect(entries.map((entry: { tag: string }) => entry.tag)).toEqual([
-			"0230_wealthy_sir_ram",
-			"0231_native_media",
-		]);
+		// The two migrations this upgrade is about, wherever later migrations put them.
+		const tags = ["0230_wealthy_sir_ram", "0231_native_media"];
+		const entries = journal.entries.filter((entry: { tag: string }) => tags.includes(entry.tag));
+		expect(entries.map((entry: { tag: string }) => entry.tag)).toEqual(tags);
 		const folder = mkdtempSync(join(tmpdir(), "nf-sqlite-media-upgrade-"));
 		const database = new Database(":memory:");
 		try {

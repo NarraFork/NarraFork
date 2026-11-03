@@ -21,7 +21,7 @@ import {
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../../lib/composer-document";
-import { AppError, NotFoundError, ValidationError } from "../../lib/errors";
+import { AppError, catalogError, NotFoundError, ValidationError } from "../../lib/errors";
 import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
@@ -60,6 +60,10 @@ function execute(text: string, bindings: Record<string, unknown>) {
 const common = {
 	ValidationError,
 	NotFoundError,
+	catalogError,
+	// Spec sessions: the outline-only /goal refusals stay out of the way.
+	resolveTaskBackend: async () => "spec",
+	isOutlineSessionGoal: async () => false,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
