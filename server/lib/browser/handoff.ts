@@ -35,6 +35,10 @@ export interface BrowserHandoffFile {
 	sessions: BrowserSessionHandoff[];
 }
 
+function isOptionalString(value: unknown): value is string | undefined {
+	return value === undefined || typeof value === "string";
+}
+
 function isHandoffSession(value: unknown): value is BrowserSessionHandoff {
 	if (!value || typeof value !== "object") return false;
 	const v = value as Record<string, unknown>;
@@ -43,7 +47,9 @@ function isHandoffSession(value: unknown): value is BrowserSessionHandoff {
 		typeof v.narratorId === "string" &&
 		typeof v.url === "string" &&
 		typeof v.currentPageUrl === "string" &&
-		typeof v.contextId === "string" &&
+		isOptionalString(v.contextId) &&
+		isOptionalString(v.targetId) &&
+		Boolean(v.contextId || v.targetId) &&
 		(v.interruptedProfileId === undefined ||
 			(typeof v.interruptedProfileId === "string" &&
 				/^[A-Za-z0-9_-]{1,64}$/.test(v.interruptedProfileId))) &&

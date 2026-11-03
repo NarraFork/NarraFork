@@ -1,12 +1,16 @@
+import type { PromptOptimizeSnapshot } from "@frontend/lib/prompt-optimize-tasks";
 import type { ComposerDocument } from "@shared/composer-document";
 import { fileReferenceToken } from "./file-reference-input";
-import type { InlineComposerEditorHandle } from "./InlineComposerEditor";
+import type { InlineComposerEditorHandle, InlineComposerSelection } from "./InlineComposerEditor";
 
-export function composerOptimizeTarget(editor: InlineComposerEditorHandle | null) {
-	if (!editor) return null;
-	const original = editor.getDocument();
+export function composerOptimizeTarget(
+	editor: InlineComposerEditorHandle | null,
+	snapshot?: PromptOptimizeSnapshot,
+) {
+	if (!editor?.getElement()) return null;
+	const original = snapshot?.document ?? editor.getDocument();
 	const signature = JSON.stringify(original);
-	const selection = editor.getSelection();
+	const selection: InlineComposerSelection = snapshot?.selection ?? editor.getSelection();
 	if (selection.type === "node") return null;
 	const selected = selection.empty === false || selection.start !== selection.end;
 	const fragments: { p: number; n: number; text: string; from: number; to: number }[] = [];
@@ -26,13 +30,18 @@ export function composerOptimizeTarget(editor: InlineComposerEditorHandle | null
 	}
 	if (!fragments.length) return null;
 	const plain = fragments.length === 1;
-	const token = globalThis.crypto?.randomUUID?.() ?? String(Date.now());
+	const token = snapshot?.token ?? globalThis.crypto?.randomUUID?.() ?? String(Date.now());
 	const marker = (index: number, end = false) => `<<<NF_${token}_${index}${end ? "_END" : ""}>>>`;
 	const text = plain
 		? fragments[0].text
 		: `Optimize each text segment below separately. Preserve every marker exactly, in order, with no introduction or conclusion. Do not merge segments.\n${fragments.map((fragment, i) => `${marker(i)}\n${fragment.text}\n${marker(i, true)}`).join("\n")}`;
 	return {
 		text,
+		snapshot: {
+			document: original,
+			selection: { start: selection.start, end: selection.end },
+			token,
+		},
 		apply(result: string) {
 			if (JSON.stringify(editor.getDocument()) !== signature) return false;
 			const replacements: string[] = [];

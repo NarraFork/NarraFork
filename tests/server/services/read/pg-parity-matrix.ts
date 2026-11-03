@@ -80,15 +80,35 @@ export function principal(userId: string, isAdmin = false): ProjectPrincipal {
 	return { userId, isAdmin };
 }
 
-/** Every migration in the PostgreSQL journal, verbatim. */
+/**
+ * The migration ledger Drizzle's PostgreSQL migrator creates before it runs anything (same
+ * schema, table and columns). Migrations may read it: 0048 replays an upstream migration only
+ * when its ledger fingerprint is absent. Applying the journal's SQL by hand skips the migrator,
+ * so the ledger is created here, empty: a fresh database has applied nothing yet.
+ */
+const MIGRATION_LEDGER_SQL = `CREATE SCHEMA IF NOT EXISTS "drizzle";
+CREATE TABLE IF NOT EXISTS "drizzle"."__drizzle_migrations" (
+	id SERIAL PRIMARY KEY,
+	hash text NOT NULL,
+	created_at bigint
+);
+`;
+
+/**
+ * Every migration in the PostgreSQL journal, verbatim, one entry per migration. The first entry
+ * also creates the migrator's (empty) ledger first, so callers that apply `[0]` as the baseline
+ * and the rest as upgrades keep working.
+ */
 export async function migrationSql(): Promise<string[]> {
 	const journal = JSON.parse(await readFile("drizzle-postgres/meta/_journal.json", "utf8")) as {
 		entries: Array<{ tag: string }>;
 	};
 	if (journal.entries.length === 0) throw new Error("PostgreSQL migration journal is empty");
-	return Promise.all(
+	const sqls = await Promise.all(
 		journal.entries.map((entry) => readFile(`drizzle-postgres/${entry.tag}.sql`, "utf8")),
 	);
+	sqls[0] = `${MIGRATION_LEDGER_SQL}${sqls[0]}`;
+	return sqls;
 }
 
 /** SQL literal for a fixture value. Only strings, numbers, booleans and null occur. */

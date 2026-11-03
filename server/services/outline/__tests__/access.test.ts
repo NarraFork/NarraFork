@@ -26,6 +26,8 @@ import {
 	canSessionReadSpace,
 	getSessionReadScope,
 	invalidateSessionReadScopes,
+	listSessionReadableSpaces,
+	listSessionReadCandidates,
 	SESSION_SCOPE_TTL_MS,
 } from "../session-scope";
 import { ensurePersonalSpace, ensureProjectSpace, ensureSessionSpace } from "../spaces";
@@ -103,6 +105,16 @@ const sqliteFixtures: AccessFixtures = {
 	async deleteUser(id) {
 		await db.delete(users).where(eq(users.id, id));
 	},
+	async linkProject(narratorId, projectId) {
+		await db.insert(narratorProjectLinks).values({
+			narratorId,
+			projectId,
+			role: "primary",
+			source: "cwd",
+			directory: `/tmp/${narratorId}`,
+			updatedAt: NOW,
+		});
+	},
 };
 
 let world: AccessWorld;
@@ -118,7 +130,7 @@ afterEach(() => {
 });
 
 describe("the access matrix on SQLite", () => {
-	for (const group of ["spaces", "person", "session", "cap", "list"] as const) {
+	for (const group of ["spaces", "person", "session", "cap", "list", "listing", "agent"] as const) {
 		test(group, async () => {
 			const selected = cases().filter((testCase) => testCase.group === group);
 			expect(selected.length).toBeGreaterThan(0);
@@ -148,6 +160,38 @@ describe("a project derived from the working directory", () => {
 		expect(await canSessionReadSpace(session, await ensureProjectSpace(linked))).toBe(true);
 		// Alice reads the session through the linked project and cannot read `elsewhere`.
 		expect(await canSessionReadSpace(session, await ensureProjectSpace(elsewhere))).toBe(false);
+	});
+});
+
+describe("sessions filed by their working directory", () => {
+	test("under a project the readers cannot pass, they are no candidates and use up nothing", async () => {
+		const { owner, carol } = world.people;
+		const theirs = await sqliteFixtures.project({ owner: carol, visibility: "private" });
+		const filed: string[] = [];
+		for (let i = 0; i < 30; i++) {
+			const narratorId = await sqliteFixtures.narrator({ owner: carol, visibility: "project" });
+			await sqliteFixtures.linkProject(narratorId, theirs);
+			filed.push((await ensureSessionSpace(narratorId)).id);
+		}
+		const main = await sqliteFixtures.project({ owner, visibility: "private" });
+		const session = await sqliteFixtures.narrator({
+			owner,
+			visibility: "private",
+			projectId: main,
+		});
+		const mine = await ensureProjectSpace(main);
+		const candidates = await listSessionReadCandidates(session, {
+			executingUserId: owner,
+			max: 10_000,
+		});
+		expect(candidates.filter((space) => filed.includes(space.id))).toEqual([]);
+		const listed = await listSessionReadableSpaces(session, {
+			executingUserId: owner,
+			limit: 200,
+			maxCandidates: 10_000,
+		});
+		expect(listed.complete).toBe(true);
+		expect(listed.spaces.map((space) => space.id)).toContain(mine.id);
 	});
 });
 

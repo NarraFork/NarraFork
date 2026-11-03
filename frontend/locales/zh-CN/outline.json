@@ -49,7 +49,12 @@
 		"alias": "别名 {{alias}}",
 		"inProgress_one": "进行中 · {{count}}",
 		"inProgress_other": "进行中 · {{count}}",
-		"inProgressHint": "这个块下面有未完成的任务。切到「全部」可以看到。",
+		"inProgressHint": "这个块下面未完成的任务；点一条聚焦到它。",
+		"inProgressMore_one": "还有 {{count}} 个，聚焦到这个块查看",
+		"inProgressMore_other": "还有 {{count}} 个，聚焦到这个块查看",
+		"hiddenUnder_one": "任务下 +{{count}}",
+		"hiddenUnder_other": "任务下 +{{count}}",
+		"hiddenUnderHint": "这个块下面只有已完成或已取消的任务，事实视图不显示它们；切到“全部”查看。",
 		"more_one": "… 还有 {{count}} 项",
 		"more_other": "… 还有 {{count}} 项",
 		"moreAtRoot_one": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
@@ -67,7 +72,8 @@
 		"truncated": "这一页太大，无法一次读完；请聚焦到其中一部分。",
 		"processHidden_one": "任务下的 {{count}} 个块没有显示。",
 		"processHidden_other": "任务下的 {{count}} 个块没有显示。",
-		"showAll": "显示全部"
+		"showAll": "显示全部",
+		"waitingConfirmation": "等确认"
 	},
 	"side": {
 		"backlinks": "反链",
@@ -90,7 +96,8 @@
 			"restore": "恢复",
 			"task": "任务",
 			"page": "换页",
-			"props": "别名或标签"
+			"props": "别名或标签",
+			"merge": "合并"
 		},
 		"viewAt": "查看提交 #{{seq}} 时的页面"
 	},
@@ -105,7 +112,8 @@
 		"kind": {
 			"edit": "编辑",
 			"revert": "撤销",
-			"import": "导入"
+			"import": "导入",
+			"confirm": "确认"
 		},
 		"actor": {
 			"unknown": "某人",
@@ -136,8 +144,6 @@
 	},
 	"editor": {
 		"changeStatus": "切换状态",
-		"hiddenUnder_one": "任务下还有 {{count}} 块",
-		"hiddenUnder_other": "任务下还有 {{count}} 块",
 		"tooLarge": "一个块最多 16 KB，请拆成几个块。",
 		"rootKept": "正在聚焦的块不能在这里删除；退到上一层再删。",
 		"peerEditing": "{{name}} 正在编辑",
@@ -172,7 +178,13 @@
 		"tooLargePage": "这一页太大（超过 2000 块或 4 MB），不能实时编辑，先以只读显示；可以聚焦到其中一部分，或把页拆开。",
 		"unavailable": "现在不能实时编辑，先以只读显示这一页。",
 		"retry": "重试",
-		"tabLimit": "当前为只读：这个标签页已经有 {{count}} 个大纲页处于实时编辑状态。关闭或隐藏其中一个后再重试。"
+		"tabLimit": "当前为只读：这个标签页已经有 {{count}} 个大纲页处于实时编辑状态。关闭或隐藏其中一个后再重试。",
+		"inProgress_one": "进行中 · {{count}}",
+		"inProgress_other": "进行中 · {{count}}",
+		"inProgressHint": "这个块下面未完成的任务",
+		"hiddenUnder_one": "任务下 +{{count}}",
+		"hiddenUnder_other": "任务下 +{{count}}",
+		"waitingConfirmation": "等确认"
 	},
 	"map": {
 		"viewLabel": "视图",
@@ -222,5 +234,64 @@
 	},
 	"workspace": {
 		"addTitle": "添加大纲页"
+	},
+	"lock": {
+		"badge": "已锁定 · {{name}}",
+		"someone": "某人",
+		"section": "锁定",
+		"lockedBy": "{{name}} 锁定",
+		"delegate": "{{name}} 可以代锁定人确认",
+		"explainLocked": "agent 对这个计划的改动（步骤、目标和验收）要等确认才生效。人照常编辑。",
+		"explainUnlocked": "锁定这个计划：之后 agent 改它的步骤、目标和验收，都要等你确认。",
+		"delegateLabel": "代你确认的会话（可选）",
+		"delegatePlaceholder": "不指定：由你确认",
+		"lock": "锁定",
+		"unlock": "解锁",
+		"lockedNotice": "计划已锁定",
+		"unlockedNotice": "计划已解锁",
+		"failed": "没能改动锁定",
+		"unlockHint": "解锁会撤回所有等确认的改动。",
+		"session": "会话「{{title}}」",
+		"untitledSession": "某个会话"
+	},
+	"pending": {
+		"badge": "等确认",
+		"tab": "待确认",
+		"none": "这里没有等确认的改动。",
+		"proposedBy": "{{name}} 提议",
+		"decider": "交给 {{name}} 确认",
+		"deciderWithDelegate": "交给 {{name}}（或 {{delegate}}）确认",
+		"changedSince": "提议之后又有人改过：确认时会合并，有重叠就会失败。",
+		"changedUnder_one": "提议删除之后，它下面有 {{count}} 个块被新增、修改或移走：确认会被拒绝。",
+		"changedUnder_other": "提议删除之后，它下面有 {{count}} 个块被新增、修改或移走：确认会被拒绝。",
+		"subtreeUnchecked": "下面的块太多，这里没法检查提议删除之后有没有改动。",
+		"subtreeUncheckedWriters": "没法检查提议删除之后有没有改动：提议会话里先后写过同一块的写入者太多，分不出有没有别人改过。",
+		"changes_one": "{{count}} 处改动",
+		"changes_other": "{{count}} 处改动",
+		"confirm": "确认",
+		"reject": "拒绝",
+		"reasonPlaceholder": "理由（agent 会读到）",
+		"confirmed": "已确认 {{label}}",
+		"rejected": "已拒绝 {{label}}",
+		"failed": "没能处理 {{label}}",
+		"notYours": "由锁定人确认，或者他指定的会话代为确认。",
+		"kind": {
+			"update": "改写",
+			"insert": "新增",
+			"delete": "删除",
+			"move": "移动",
+			"task": "任务改动",
+			"restore": "恢复"
+		},
+		"base": "原来",
+		"proposed": "提议",
+		"now": "现在",
+		"under": "放在「{{title}}」下面",
+		"topLevel": "放在顶层",
+		"truncated": "改动比这里列出的多。",
+		"taskStatus": "复选框：{{status}}",
+		"taskRemoved": "去掉复选框",
+		"taskDue": "截止：{{date}}",
+		"taskAssignee": "指派：{{name}}"
 	}
 }

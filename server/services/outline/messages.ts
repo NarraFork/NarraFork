@@ -35,8 +35,77 @@ export const OUTLINE_TEXT = {
 	/** A restored or moved-back block whose old place among its siblings is taken. */
 	orderKeyMoved: (wanted: string) =>
 		`its old position (${wanted}) is taken; it was placed right after the block holding it`,
+	/** A write by no session or person left a task to do instead of in progress. */
+	taskNotStarted:
+		"it would be in progress with nobody doing it (a write by no session), so it was left to do",
+	/** A revert (or bringing a task back) would have changed a lock its author may not: as it is. */
+	lockKept:
+		"only the person who locked it, a manager of the space or an admin may lock, unlock or change its lock: its lock was left as it is",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
+
+	/**
+	 * The block the lease expiry job writes under a task it reopens (design §4.5: the progress
+	 * under the task stays, and this records why it is open again).
+	 */
+	leaseExpired: {
+		/** Text before the session id (which is written as code). */
+		lead: (title: string | null) =>
+			`The previous executor's lease expired (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	/** The block the lease job writes under a task in progress that nobody was holding. */
+	unclaimedReopened:
+		"This task was in progress, but no session or person was holding it; it is open again.",
+	/**
+	 * Summary of the commit that starts a session's next task when nothing of it is in progress
+	 * (§4.8). Written at the end of a turn whether or not a continuation follows.
+	 */
+	startedForSession: (address: string, narratorId: string) =>
+		`started ${address} for session ${narratorId}`,
+	/** Summary of a commit that only hands tasks over (their lease had run out). */
+	claimTakenOver: (addresses: readonly string[]) =>
+		`took over ${addresses.join(", ")} (the previous lease had run out)`,
+	/** Added to the summary of a commit that ended tasks someone else was doing. */
+	endedClaims: (addresses: readonly string[]) =>
+		`ended work someone else was doing on ${addresses.join(", ")}`,
+	/** Summary of the lease expiry job's commit. */
+	leaseExpiredSummary: (n: number) =>
+		n === 1 ? "lease expired: 1 task reopened" : `lease expired: ${n} tasks reopened`,
+	/** Summary of the lease job's commit that reopens tasks in progress nobody was holding. */
+	unclaimedReopenedSummary: (n: number) =>
+		`nobody was doing it: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
+	/**
+	 * The block written under a task reopened because the session doing it (or the session its
+	 * subagent belongs to) was archived or deleted.
+	 */
+	sessionEnded: {
+		/** Text before the session id (which is written as code). */
+		lead: (reason: "archived" | "deleted", title: string | null) =>
+			`The previous executor's session was ${reason} (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	/** Summary of the commit that reopens the tasks of a session archived or deleted. */
+	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
+		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
+
+	/** An agent's write tried to lock or unlock (only people lock, through the page). */
+	lockDenied:
+		"only people lock or unlock a task (from the outline page); an agent cannot change a lock",
+	/** Locking a task someone else locked. */
+	lockHeld: (address: string) =>
+		`${address} is locked by someone else; it has to be unlocked first (by them, a manager of the space or an admin) before anyone locks it again`,
+	/** Taking a lock away (unlocking, deleting the task, its checkbox) or changing it without the right to. */
+	unlockDenied: (address: string) =>
+		`${address} is locked (or would be, in someone else's name); only the person who locked it, a manager of the space or an admin may unlock it, change its lock, delete it or take its checkbox away`,
+	severalLockedPlans:
+		"the change touches several locked plans at once; change each plan in a call of its own",
+	pendingTooLarge: (ops: number, bytes: number) =>
+		`the change waiting for confirmation on this plan would grow past ${ops} operations or ${bytes} bytes of text; wait until it is confirmed or rejected`,
+	pendingFull: (max: number) =>
+		`the page already has ${max} changes waiting for confirmation; wait until some are decided`,
+	/** Summary of a commit that confirms a pending change. */
+	confirmSummary: (label: string, summary: string) => `confirm ${label}: ${summary}`,
 
 	/** Why a read or search was refused. */
 	errors: {
@@ -46,12 +115,32 @@ export const OUTLINE_TEXT = {
 		badTime: "not a valid time",
 		tooManySpaces: (max: number, got: number) =>
 			`a search covers at most ${max} spaces (got ${got})`,
+		/** An agent's write to the session's behavior page without the user turn's grant. */
+		behaviorPageReadonly:
+			"the behavior page of this session (alias behavior) holds the user's standing rules: you may write it only as the first tool call of a user turn in which the user asked you to record a rule",
 	},
+	/** Summary of the commit that imports a session's old behavior fence into its page. */
+	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",
+	/** Summary of the commit that copies the behavior page into a fork. */
+	behaviorForkSummary: (from: string) => `copied the behavior page from session ${from}`,
 } as const;
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;
 
-function list(items: readonly string[], max = 6): string {
+/** How a merge names the fields of a block (`agent-merge.ts`). */
+const MERGE_FIELD_NAMES: Record<string, string> = {
+	checkbox: "checkbox",
+	assignee: "assignee",
+	depends: "prerequisites (depends::)",
+	due: "due date",
+	alias: "alias",
+	tags: "tags",
+};
+
+/** Items a list in a message names; the rest are counted. */
+export const OUTLINE_LISTED_NAMES = 6;
+
+function list(items: readonly string[], max = OUTLINE_LISTED_NAMES): string {
 	const shown = items.slice(0, max).join(", ");
 	return items.length > max ? `${shown} and ${items.length - max} more` : shown;
 }
@@ -81,19 +170,43 @@ export const OUTLINE_TOOL_TEXT = {
 	},
 
 	overviewHeader:
-		'the outline spaces of this session and their pages; read one with OutlineRead { address: "<id>" }',
+		'the outline spaces of this session and their pages; read one with OutlineRead { address: "<id>" }; address "*" gives an overview of every space this session can read',
 	spaceSection: (space: string, isDefault: boolean) =>
 		`space ${space}${isDefault ? "; bare ids and titles are looked up here first" : ""}`,
 	noPages: "no pages yet",
 	morePages: "more pages not listed; find them with OutlineSearch",
 	writeHint:
 		"to write, use OutlineEdit (if it is not in your tool list, load it with /load OutlineEdit)",
+
+	allSpacesHeader: (n: number) =>
+		`overview of ${n === 1 ? "the 1 space" : `${n} spaces`} this session can read, its own first: each space's pages, expanded level by level within the budget. Blocks of its own spaces are labeled with their id, blocks of other spaces with key/id; read one with OutlineRead { address: "<id or key/id>" }`,
+	allSpacesNone:
+		'This session can read no outline space yet. OutlineEdit creates its own on the first write: { add: "/", markdown: "- A page" }.',
+	moreSpaces:
+		'this session can read more spaces than the overview lists: read one by its key (key/), or search them all with OutlineSearch { spaces: ["*"] }',
+	spacesUnchecked:
+		"the overview stops after checking a number of spaces, so a space this session can read may be missing from it: name it by its key (key/) to read it",
+	/** Pages of a space the overview leaves out; never shorter as `n` grows. */
+	morePagesOf: (key: string, n: number, more: boolean) =>
+		`${n === 0 ? "more pages" : `${n}${more ? "+" : ""} more ${n === 1 && !more ? "page" : "pages"}`} not shown; OutlineRead { address: "${key}/" } lists them`,
+	taskPagesHidden: (n: number) =>
+		`facts only: ${n === 1 ? "1 page that is a task" : `${n} pages that are tasks`} not shown; read with view "all" to include them`,
+	notExpandedLarge: (labels: readonly string[]) =>
+		`shown without what is under them, each has more blocks than one read of the overview takes: read ${list(labels)} on their own`,
+	notExpandedLimit: (labels: readonly string[]) =>
+		`shown without what is under them, past the blocks one overview reads in all: read ${list(labels)} on their own`,
+	accessChanged:
+		"Who may read this session kept changing while the outline was being read, so nothing is shown. Read it again.",
+	overviewNotAsOf:
+		'asOf reads one block as it was; the overview ("*") shows the spaces as they are now. Read a block with asOf instead.',
+	otherSessionPages: (n: number, more: boolean) =>
+		`${more ? `more than ${n} pages` : n === 1 ? "1 page" : `${n} pages`}, not listed: another session's notes are process; read them with view "all", or by address (key/ lists them)`,
 	noSpaces:
 		'This session has no outline pages yet. OutlineEdit creates its space on the first write: { add: "/", markdown: "- A page" } writes to the project\'s space (or, where this turn may not write it, to this session\'s notes); add: "session/" writes to the session\'s notes.',
 	noSuchSpace: (name: string) =>
 		`No outline space ${quoted(name)} that this session can read. Name a space by its key, or project/, session/ or personal/.`,
 	notFound: (ref: string) =>
-		`Nothing this session can read matches ${quoted(ref)}. An address is key/id (Kx81mPqa/Ab3dEf9Q), an id, an alias such as Q17, or a block's title. Find blocks with OutlineSearch, or list the session's spaces with OutlineRead and no address.`,
+		`Nothing this session can read matches ${quoted(ref)}. An address is key/id (Kx81mPqa/Ab3dEf9Q), an id, an alias such as Q17, or a block's title; ids, aliases and titles alone are looked up in this session's own spaces. Find blocks with OutlineSearch, or list the spaces with OutlineRead (no address: this session's own; "*": every space it can read).`,
 	ambiguous: (ref: string) => `${quoted(ref)} matches several blocks; read one by its address`,
 	deleted: (address: string) =>
 		`${address} is deleted. Read it as it was with asOf (a commit number or a time before it was deleted).`,
@@ -106,6 +219,10 @@ export const OUTLINE_TOOL_TEXT = {
 
 	searchHeader: (n: number, query: string, spaces: readonly string[]) =>
 		`${n === 1 ? "1 result" : `${n} results`} for ${quoted(query)} in ${list(spaces)}`,
+	searchedSome: (n: number) =>
+		`searched the first ${n} spaces this session can read; there are more: name them in spaces to search them`,
+	searchUnchecked:
+		"searched the spaces found within what one search checks, so a space this session can read may be missing: name it in spaces to search it",
 	spacesNotSearched: (names: readonly string[]) =>
 		`not searched (no readable space by that name): ${list(names)}`,
 	inPath: (titles: readonly string[]) => `in ${titles.join(" › ")}`,
@@ -113,6 +230,8 @@ export const OUTLINE_TOOL_TEXT = {
 	isTask: "a task",
 	sessionNotes: "in a session's notes",
 	noResults: "No blocks match. Try other words, or fewer of them.",
+	noResultsOwn:
+		'No blocks match in this session\'s own spaces. Try other words, or fewer of them, or spaces: ["*"] to search every space this session can read.',
 
 	textTooLarge: (bytes: number, max: number) =>
 		`The edit carries ${bytes} bytes of text; one call takes at most ${max}. Split it into several calls.`,
@@ -134,6 +253,12 @@ export const OUTLINE_TOOL_TEXT = {
 		ambiguous: (ref: string, candidates: readonly string[]) =>
 			`${quoted(ref)} matches several blocks (${list(candidates)}); use an address`,
 		deletedBlock: (address: string) => `${address} is deleted`,
+		/** Setting a task to in progress claims it; someone else is doing it. */
+		taskClaimed: (address: string, holder: string) =>
+			`${address} is already being done by ${holder}; nothing was written. Pick another task, or ask them`,
+		claimHolderSession: (title: string | null, id: string) =>
+			title ? `the session ${quoted(title)} (${id})` : `the session ${id}`,
+		claimHolderPerson: (name: string | null, id: string) => (name ? `${name}` : `the person ${id}`),
 		oneSpace: (keys: readonly string[]) =>
 			`the edits touch several spaces (${list(keys)}); one OutlineEdit call writes one space, so split it into one call per space (blocks never move between spaces)`,
 		parseNote: (n: number, line: number, message: string) => `edit ${n}, line ${line}: ${message}`,
@@ -158,14 +283,43 @@ export const OUTLINE_TOOL_TEXT = {
 			`a page titled ${quoted(title)} already existed: ${list(addresses.map((a) => `[[${a}]]`))}; merge them if they are the same`,
 		busy: "the space kept changing while the edit was written; nothing was written, try again",
 		conflictHeader:
-			"Nothing was written: blocks you are changing changed after you last read them.",
+			"Nothing was written: blocks you are changing (or deleting with what is under them) changed after you last read them, or you have not read them, and your edits could not be merged with those changes.",
 		someone: "someone",
 		aPerson: "a person",
 		anotherAgent: "another agent",
 		theSystem: "the system",
 		conflict: (sid: string, who: string, now: number, seen: number) =>
 			`[${sid}] was changed by ${who} in commit #${now} (you read it as of #${seen})`,
+		notRead: (sid: string, who: string, now: number) =>
+			`[${sid}] was last written by ${who} in commit #${now}, and you have not read it`,
+		readFirst:
+			"Read a block before you replace or delete what anyone but this session wrote in it (another session or a subagent counts as someone else); what you read is forgotten when the server restarts. Read it, then make the edit.",
+		underDeleted: (sid: string) => `it is under [${sid}], which you are deleting with it`,
+		tooLargeToDelete: (sid: string, limit: number, max: number) =>
+			limit >= max
+				? `[${sid}] has more than ${max} blocks under it, too many to check what changed in them since you read them; delete it in smaller parts, the blocks under it first`
+				: `[${sid}] has more than ${limit} blocks under it, which is what was left to check after the other blocks this call deletes (at most ${max} in all); delete it in a call of its own`,
+		shownBelow: "its current text is shown in full below",
+		shownHeader:
+			"They read as follows now. Shown here, they count as read: redo the edit on this text, or make the same edit again if it still holds:",
+		moreConflicts: (n: number) =>
+			`… and ${n === 1 ? "1 more block" : `${n} more blocks`} like these, not listed`,
 		nowReads: (text: string) => `it now reads: ${text}`,
+		notMerged:
+			"only a block's one replace is merged with later changes; a move, delete or set (or several edits of one block) needs the block as you read it",
+		overlaps: (excerpts: readonly string[]) =>
+			`your change and theirs overlap at ${list(excerpts.map((e) => `«${e}»`))}`,
+		bothChanged: (fields: readonly string[]) =>
+			`you and they both changed its ${list(fields.map((f) => MERGE_FIELD_NAMES[f] ?? f))}`,
+		mergeUnstable:
+			"your change and theirs meet in the same formatting, so the merged text would not read as either of you wrote it",
+		noBase: "the version you read is no longer in its history, so there is nothing to merge from",
+		mergeBodyTooLarge: (bytes: number, max: number) =>
+			`a replace carries ${bytes} bytes of text for one block; one block takes at most ${max}`,
+		mergeTooLarge: (bytes: number, max: number) =>
+			`the blocks to merge your edits into hold ${bytes} bytes of text, more than the ${max} one call can merge and write besides its other text; split the call`,
+		mergeTooSlow: (ms: number) =>
+			`merging your edits with the changes made since you read the blocks took longer than ${Math.round(ms / 1000)} s and was stopped; split the call into smaller ones`,
 		nowDeleted: "it is deleted now",
 		conflictRecover: (key: string) =>
 			`Read those blocks again with OutlineRead (${key}/<id>), then redo the edit on what they say now.`,
@@ -175,6 +329,16 @@ export const OUTLINE_TOOL_TEXT = {
 		topLevel: "the top level (it is a page now)",
 		added: (where: string | null) => (where ? `added under ${where}:` : "added new pages:"),
 		replaced: (sid: string) => `replaced [${sid}]`,
+		replacedMerged: (sid: string) =>
+			`replaced [${sid}], merged with changes made after you read it (shown below)`,
+		replacedMergedUnshown: (sid: string) =>
+			`replaced [${sid}], merged with changes made after you read it; not shown: read it before changing it again`,
+		mergedHeader:
+			"Merged: these blocks had been changed by someone else after you read them. Your edits were applied on top of those changes where they did not overlap; they now read as follows (build further edits on this text):",
+		mergedBlock: (sid: string, who: string, now: number, seen: number) =>
+			`[${sid}] changed by ${who} in commit #${now} after you read it as of #${seen}; merged:`,
+		mergedNotShown: (sids: readonly string[]) =>
+			`also merged, not shown here: ${list(sids, 20)}; read them before changing them again`,
 		moved: (sid: string, where: string) => `moved [${sid}] under ${where}`,
 		deleted: (sid: string) => `deleted [${sid}] and everything under it`,
 		noCheckbox: "no checkbox",
@@ -183,5 +347,68 @@ export const OUTLINE_TOOL_TEXT = {
 		set: (sid: string, parts: readonly string[]) => `set [${sid}]: ${parts.join(", ")}`,
 		notesHeader: "Notes:",
 		hintsHeader: "Hints:",
+		/** An edit some of whose operations were held for confirmation. */
+		heldEdit: (n: number, what: string, all: boolean) =>
+			`${n}. ${all ? "held for confirmation" : "held in part for confirmation"}: ${what}`,
+		nothingWrittenDirectly:
+			"Nothing was written directly: the change waits for confirmation (below).",
+		mixedDecisions: "confirm and reject go in a call of their own, without block edits",
+		pendingNewBlock: (ref: string, label: string, decider: string) =>
+			`${ref} is a block ${label} adds; it exists once ${decider} confirms ${label}, so nothing can be written under it or to it before`,
+	},
+
+	/** Changes to locked plans waiting for confirmation (design §2.6). */
+	pending: {
+		/** The decider, as marks and results name them. */
+		deciderPerson: (name: string | null, id: string) => (name ? name : `the person ${id}`),
+		deciderSession: (title: string | null, id: string) =>
+			title ? `the session ${quoted(title)} (${id})` : `the session ${id}`,
+		deciderEither: (person: string, delegate: string) =>
+			`${person} (or ${delegate} on their behalf)`,
+		markOwn: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, not confirmed yet`,
+		markOwnDeleted: (label: string, _decider: string, n: number) =>
+			`pending ${label}: you proposed deleting ${n === 1 ? "1 block" : `${n} blocks`} here, not confirmed yet`,
+		markOther: (label: string, _decider: string) =>
+			`pending ${label}: a change proposed here waits for confirmation`,
+		markOwnMerged: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, merged over changes made here since you proposed it; not confirmed yet`,
+		markOwnConflict: (label: string, _decider: string, detail: string) =>
+			`pending ${label}: changed since you proposed it, your change no longer applies here (${detail}); shown as it is now`,
+		/** After a read: this session's own open changes on the page. */
+		yours: (label: string, decider: string, since: "none" | "merged" | "conflict") =>
+			since === "conflict"
+				? `${label} is your change to this plan; blocks it changes were changed since you proposed it and part of it no longer applies (marked above, shown as they are now): it cannot be confirmed as it is. Propose those blocks again from the text as it is now (they merge into ${label}), or reject ${label} to withdraw it. It waits for ${decider}`
+				: since === "merged"
+					? `${label} is your change to this plan, shown above merged over changes made since you proposed it (marked); it waits for ${decider} to confirm (blocks it adds exist once confirmed)`
+					: `${label} is your change to this plan, shown above as you proposed it; it waits for ${decider} to confirm (blocks it adds exist once confirmed)`,
+		/** A change its proposer said nothing about, by its size. */
+		summaryOf: (n: number) => (n === 1 ? "1 change" : `${n} changes`),
+		/** After a read: changes waiting for this session's confirmation. */
+		forYou: (label: string, summary: string, by: string) =>
+			`${label} waits for your confirmation: ${summary} (proposed by ${by}); confirm with OutlineEdit { edits: [{ confirm: "${label}" }] }, or reject with { reject: "${label}", reason }`,
+		reportConfirmed: (label: string, by: string, seq: number | null) =>
+			`${label} was confirmed by ${by}${seq === null ? "" : ` (commit #${seq})`}: its changes are in the outline now`,
+		reportRejected: (label: string, by: string, reason: string | null) =>
+			`${label} was rejected by ${by}${reason ? `: ${reason}` : ""}`,
+		reportWithdrawn: (label: string, why: string) => `${label} was withdrawn: ${why}`,
+		whyUnlocked: "the plan was unlocked",
+		whyDeleted: "the locked task was deleted",
+		/** The result of an edit that was held. */
+		held: (label: string, n: number, root: string, decider: string, merged: boolean) =>
+			`Held for confirmation as ${label}: ${n === 1 ? "1 change" : `${n} changes`} to the locked plan ${root}, waiting for ${decider} to confirm${merged ? " (merged into the change this session had already proposed there)" : ""}.`,
+		heldWaiting: (tasks: readonly string[]) =>
+			`Tasks that wait for it: ${list(tasks, 10)}. Do not start them; carry on with work it does not affect.`,
+		heldCarryOn: "Carry on with work it does not affect.",
+		heldRead:
+			"Reading the plan shows your proposed version, marked ‹pending›. Blocks it adds exist once confirmed: write under them after that.",
+		confirmed: (label: string, seq: number | null, by: string) =>
+			seq === null
+				? `Confirmed ${label} (proposed by ${by}); the outline already read as it proposes, so no commit was written.`
+				: `Confirmed ${label} (proposed by ${by}): committed #${seq}.`,
+		rejected: (label: string) => `Rejected ${label}; its proposer is told on its next read.`,
+		withdrew: (label: string) => `Withdrew ${label}, which this session had proposed.`,
+		badLabel: (ref: string) =>
+			`${quoted(ref)} is not a pending change: name it as a read shows it, P and 8 characters (P1a2B3c4D)`,
 	},
 } as const;

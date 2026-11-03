@@ -29,6 +29,8 @@ export interface ProviderModelCapabilities {
 	tools: boolean;
 	parallelToolCalls?: boolean;
 	inputImages?: boolean;
+	inputAudio?: boolean;
+	inputVideo?: boolean;
 	reasoning?: boolean;
 	reasoningEfforts?: ProviderReasoningEffort[];
 	sessionMode: ProviderSessionMode;
@@ -54,6 +56,8 @@ export interface ProviderTypeCapabilities {
 	generate: boolean;
 	reasoningContinuation?: boolean;
 	inputImages?: boolean;
+	inputAudio?: boolean;
+	inputVideo?: boolean;
 	mayLeakXmlToolCalls?: boolean;
 }
 
@@ -407,6 +411,8 @@ function normalizeCapabilities(
 		generate: input?.generate ?? true,
 		reasoningContinuation: input?.reasoningContinuation,
 		inputImages: input?.inputImages,
+		inputAudio: input?.inputAudio === true,
+		inputVideo: input?.inputVideo === true,
 		mayLeakXmlToolCalls: input?.mayLeakXmlToolCalls,
 	};
 }
@@ -450,6 +456,8 @@ function normalizeModelDescriptor(model: ProviderModelDescriptor): ProviderModel
 			tools: capabilities.tools ?? false,
 			parallelToolCalls: capabilities.parallelToolCalls,
 			inputImages: capabilities.inputImages,
+			inputAudio: capabilities.inputAudio === true,
+			inputVideo: capabilities.inputVideo === true,
 			reasoning: capabilities.reasoning,
 			reasoningEfforts: capabilities.reasoningEfforts
 				? [...capabilities.reasoningEfforts]

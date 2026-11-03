@@ -59,13 +59,18 @@ export {
 } from "./devices";
 export { type FsWriteInput, fsWriteSchema } from "./fs";
 export {
+	gitBranchNameSchema,
+	gitCheckoutSchema,
 	gitCommitDiffQuerySchema,
 	gitCommitSchema,
 	gitCommitShaSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
+	gitFetchSchema,
 	gitLogQuerySchema,
 	gitModificationsQuerySchema,
+	gitPushSchema,
+	gitRemoteNameSchema,
 	gitResetSchema,
 	gitStageSchema,
 	gitStashSchema,
@@ -115,6 +120,10 @@ export {
 	listKnowledgePacksQuerySchema,
 	updateKnowledgePackSchema,
 } from "./knowledge-packs";
+export {
+	narratorTimelineQuerySchema,
+	narratorTimelineTurnsQuerySchema,
+} from "./narrator-timeline";
 export {
 	askInPassingSchema,
 	askInPassingStartSchema,

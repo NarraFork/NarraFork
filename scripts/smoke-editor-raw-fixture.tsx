@@ -538,8 +538,34 @@ export async function checkpointRaw() {
 			operation: row.operation,
 		}));
 }
+/**
+ * Chrome's inspector holds the promise returned to `Runtime.callFunctionOn` (puppeteer's
+ * `page.evaluate`) only weakly. When an async fixture call settles, nothing in the page still
+ * references its promise, and the inspector's own reaction is merely queued; a major GC in between
+ * (likely after a large synchronous render such as `restoreCold`) collects the settled promise and
+ * the test sees "Promise was collected" for a call that actually succeeded. Keep every returned
+ * promise reachable until a task after it settles, by which time that reaction has run.
+ */
+const inspectorResults = new Set<Promise<unknown>>();
+function retainResultsForInspector<T extends Record<string, (...args: never[]) => unknown>>(
+	api: T,
+): T {
+	const wrapped: Record<string, unknown> = {};
+	for (const [name, call] of Object.entries(api))
+		wrapped[name] = (...args: never[]) => {
+			const result = call(...args);
+			if (result instanceof Promise) {
+				inspectorResults.add(result);
+				const release = () => setTimeout(() => inspectorResults.delete(result), 0);
+				result.then(release, release);
+			}
+			return result;
+		};
+	return wrapped as T;
+}
+
 Object.assign(window, {
-	rawFixture: {
+	rawFixture: retainResultsForInspector({
 		encodeRaw,
 		saveRaw,
 		verifyRaw,
@@ -574,5 +600,5 @@ Object.assign(window, {
 		saveV1,
 		beginHiddenLoad,
 		loadingViews,
-	},
+	}),
 });

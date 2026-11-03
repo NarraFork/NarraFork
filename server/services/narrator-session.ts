@@ -3,7 +3,16 @@ import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import type { ComposerDocument } from "@shared/composer-document";
+import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import {
+	isMediaContentBlock,
+	MAX_MEDIA_ATTACHMENTS,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { parseStored } from "@shared/narrator-blocks/plan";
@@ -64,11 +73,17 @@ import {
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
-import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
+import {
+	deleteUploadedMedia,
+	getMediaPath,
+	saveUploadedMedia,
+	validateUploadedMedia,
+} from "../lib/media-uploads";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
@@ -82,7 +97,7 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -181,7 +196,7 @@ import type { InjectionRecipientPlacement } from "./narrator-injection";
 import { deliverInjection } from "./narrator-injection";
 import { isFirstUserTurn } from "./narrator-message-count";
 import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
-import { buildEffectiveSystemPrompt } from "./narrator-prompt";
+import { buildEffectiveSystemPrompt, taskSectionFor } from "./narrator-prompt";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
 import { getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { enrichToolUseBlocks, narratorService, truncateToolIO } from "./narrator-service";
@@ -199,19 +214,23 @@ import {
 } from "./parent-injection-queue";
 import { syncNarratorProjectLinksSafely } from "./project-index";
 import { broadcastSpecChanged } from "./spec-broadcast";
-import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
-import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
 import { readSubagentExecutionBoundary } from "./subagent-execution-boundary";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
+import {
+	type ContinuationTarget,
+	type InterruptGuardNote,
+	type NarratorTaskSource,
+	resolveTaskBackend,
+	taskSourceForNarrator,
+} from "./task-source";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker } from "./tool-load-markers";
 import { resolveEffectiveTraits, resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
-	buildSpecContinuationPrompt,
 	createSpecContinuationState,
 	planSpecContinuation,
 	type SpecContinuationCause,
@@ -381,6 +400,7 @@ import {
 import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
+	dropBufferedMessage,
 	enqueueBufferedMessage,
 	getBufferedMessages,
 	getBufferedMessagesAsync,
@@ -679,6 +699,13 @@ export async function setNarratorDefaultDevice(
 	return { defaultDeviceId: resolvedDeviceId, current };
 }
 
+export function shouldSendQueuedNewInitialMessage(
+	initialMessage: string,
+	buffered: Pick<BufferedMessage, "fileReferences" | "media">,
+): boolean {
+	return Boolean(initialMessage || buffered.fileReferences?.length || buffered.media?.length);
+}
+
 export async function executeQueuedNewCommand(
 	active: ActiveNarrator,
 	buffered: BufferedMessage,
@@ -717,7 +744,7 @@ export async function executeQueuedNewCommand(
 		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
 	});
 
-	if (initialMessage || buffered.fileReferences?.length) {
+	if (shouldSendQueuedNewInitialMessage(initialMessage, buffered)) {
 		await sendMessage(
 			newNarrator.id,
 			initialMessage,
@@ -730,6 +757,9 @@ export async function executeQueuedNewCommand(
 			undefined,
 			undefined,
 			buffered.fileReferences,
+			// `/new` has been removed from the prompt; its original document no longer projects it.
+			undefined,
+			buffered.media,
 		);
 	}
 
@@ -774,7 +804,12 @@ export async function executeQueuedGoalCommand(
 	narratorId: string,
 	buffered: BufferedMessage,
 	objective: string,
-): Promise<void> {
+): Promise<{ refused: boolean }> {
+	// Before anything is saved: a session whose tasks live in the outline has no tasks.json.
+	if ((await resolveTaskBackend(narratorId)) === "outline") {
+		await refuseQueuedOutlineGoal(narratorId, buffered);
+		return { refused: true };
+	}
 	const rawCommand = buffered.commandText?.trim() || buffered.text;
 	const userMsg = await withInboxOwner(narratorId, async () => {
 		const row = buffered._mailboxClaim
@@ -835,6 +870,85 @@ export async function executeQueuedGoalCommand(
 			error: String(err),
 		});
 	});
+	return { refused: false };
+}
+
+/**
+ * Whether this input is a `/goal` the queue consumer would run, for a session whose tasks live in
+ * the outline (outline P2). Such a session has no tasks.json to add the goal to; its `/goal` (a
+ * person-created, locked task) arrives with the task board (plan PR 5). Every entry point that
+ * queues input refuses it before anything is queued or saved.
+ */
+export async function isOutlineSessionGoal(
+	narratorId: string,
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
+): Promise<boolean> {
+	if (!parseQueuedGoalCommand(message, commandText, composerDocument, intent)) return false;
+	return (await resolveTaskBackend(narratorId)) === "outline";
+}
+
+/**
+ * The consumers' backstop for a queued `/goal` that reached an outline session anyway (queued
+ * while the outline was switched off, say): the row is dropped from the queue without its message
+ * ever being saved, the person is told why, and the caller drains on as after any terminal
+ * command. Never throws: a refusal must not stall the queue.
+ */
+async function refuseQueuedOutlineGoal(narratorId: string, buffered: BufferedMessage) {
+	const refusal = catalogError("GOAL_IN_OUTLINE_SESSION");
+	try {
+		await withInboxOwner(narratorId, async () => {
+			let message = buffered;
+			if (!message._mailboxClaim) {
+				// Claim the exact row first, as the consumers do, so what is dropped is what was read.
+				const row = await claimInboxHead(
+					narratorId,
+					(candidate) => candidate.id === buffered.id && candidate.kind === "user_input",
+				);
+				// Not at the queue's head (or gone): its consumer will meet it and refuse it then.
+				if (!row) return;
+				message = projectMailboxUserMessage(row);
+				// Edited since it was read into something that is no /goal: not ours to drop.
+				if (
+					!parseQueuedGoalCommand(
+						message.text,
+						message.commandText,
+						message.composerDocument,
+						message.executionIntent,
+					)
+				) {
+					await releaseInboxClaim(row, "Edited before a refused /goal was dropped");
+					return;
+				}
+			}
+			await dropBufferedMessage(narratorId, message, refusal.message);
+		});
+	} catch (error) {
+		logger.warn("Failed to drop a queued /goal refused for an outline session", {
+			narratorId,
+			error: String(error),
+		});
+	}
+	broadcastToNarrator(narratorId, {
+		type: "narrator_error",
+		narratorId,
+		error: serializeCatalogErrorMessage(refusal),
+		errorCode: refusal.code,
+	});
+	try {
+		broadcastToNarrator(narratorId, {
+			type: "buffer_set",
+			narratorId,
+			messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+		});
+	} catch (error) {
+		logger.warn("Failed to broadcast the queue after a refused /goal", {
+			narratorId,
+			error: String(error),
+		});
+	}
 }
 
 /**
@@ -1035,8 +1149,13 @@ async function resumeNextBufferedMessageUnlocked(
 			// Queued /goal: persist the protected task, then launch its first Spec turn.
 			// If plan mode or another guard prevents starting, keep draining as before.
 			await executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
-				.then(async () => {
+				.then(async ({ refused }) => {
 					inputOwner.release();
+					// Refused for an outline session: nothing to start, drain on.
+					if (refused) {
+						await settleAfterTerminalCommand();
+						return;
+					}
 					const result = await startSpecContinuationIfPossible(
 						narratorId,
 						locale,
@@ -1065,6 +1184,8 @@ async function resumeNextBufferedMessageUnlocked(
 				},
 				undefined,
 				first.fileReferences,
+				first.composerDocument,
+				first.media,
 			)
 				.then(async ({ userMsg, userBroadcasted }) => {
 					// Delivered: the attachments have been re-materialized into the turn, so the
@@ -1169,7 +1290,13 @@ export async function buildSystemPrompt(
 	planFilePath?: string,
 	context?: Pick<
 		import("./narrator-prompt").BuildPromptOptions,
-		"workspaceContext" | "skillsContext" | "modelsContext" | "modeContext" | "runtimeHints"
+		| "workspaceContext"
+		| "skillsContext"
+		| "modelsContext"
+		| "modeContext"
+		| "runtimeHints"
+		| "taskSection"
+		| "contextParts"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1310,6 +1437,12 @@ async function createNarrator(
 			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
 		},
 		planFilePath,
+		{
+			taskSection: taskSectionFor(
+				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+				narrator.type,
+			),
+		},
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -1603,10 +1736,11 @@ export async function finalizeInterruptedRun(
 // === Interrupt task guard ===
 
 /**
- * Dedupe key for the interrupt task guard: narratorId → tasks.json revisionId the
- * guard last fired for. `hotSafe` so a dev hot-reload does not re-arm every guard.
- * When the spec has not changed since the last injection there is nothing new to
- * tell the model, so repeated interrupts stay quiet instead of stacking cards.
+ * Dedupe key for the interrupt task guard: narratorId → the task source revision key
+ * (spec: the tasks.json revisionId) the guard last fired for. `hotSafe` so a dev
+ * hot-reload does not re-arm every guard. When the tasks have not changed since the last
+ * injection there is nothing new to tell the model, so repeated interrupts stay quiet
+ * instead of stacking cards.
  */
 const interruptTaskGuardRevisions = hotSafe<Map<string, string | null>>(
 	"narrafork.interruptTaskGuardRevisions",
@@ -1630,9 +1764,12 @@ const suppressSpecContinuationOnce = hotSafe<Set<string>>(
 	() => new Set(),
 );
 
+/** How many open tasks the interrupt guard lists; the rest stay in the task source. */
+const INTERRUPT_TASK_GUARD_MAX_TASKS = 8;
+
 /**
- * After an interrupt, if spec://tasks.json still has open tasks, suppress the next
- * auto-continuation once and persist a system note telling the model to reconcile
+ * After an interrupt, if the narrator's task source still has open tasks, suppress the
+ * next auto-continuation once and persist a system note telling the model to reconcile
  * the open tasks against the user's next message before resuming anything.
  *
  * Best-effort: any failure is logged and swallowed so interrupt cleanup can never
@@ -1643,11 +1780,8 @@ async function maybeDeliverInterruptTaskGuard(
 	narratorId: string,
 ): Promise<void> {
 	try {
-		const file = await specVfsService.readTasksFileForNarrator(narratorId);
-		const compiled = compileSpecTasks(parseSpecTasksDocument(file.content));
-		const openTasks = compiled.tasks.filter(
-			(task) => task.status === "doing" || task.status === "todo" || task.status === "blocked",
-		);
+		const taskSource = await taskSourceForNarrator(narratorId);
+		const { tasks: openTasks, revision } = await taskSource.openTasks();
 		if (openTasks.length === 0) return;
 
 		// One-shot suppression: the user's next turn decides the direction; a stale
@@ -1656,32 +1790,13 @@ async function maybeDeliverInterruptTaskGuard(
 		// (see suppressSpecContinuationOnce).
 		suppressSpecContinuationOnce.add(narratorId);
 
-		const revisionId = file.revisionId ?? null;
-		if (interruptTaskGuardRevisions.get(narratorId) === revisionId) return;
-		interruptTaskGuardRevisions.set(narratorId, revisionId);
+		if (interruptTaskGuardRevisions.get(narratorId) === revision) return;
+		interruptTaskGuardRevisions.set(narratorId, revision);
 
-		const isZh = active.locale === "zh-CN";
-		const taskLines = openTasks
-			.slice(0, 8)
-			.map((task) => `- [${task.status}] ${task.text}${task.protected ? " [protected]" : ""}`)
-			.join("\n");
-		const content = isZh
-			? `刚才的运行被用户中断，这通常意味着方向有变化。当前 spec://tasks.json 中仍有以下开放任务：\n\n${taskLines}\n\n这些任务可能已经过期或与用户最新意图不一致。回复用户的下一条消息时，以用户消息为准；如需调整计划，先更新/删除过期任务（protected 任务变更会触发 taskReflection），再继续执行。不要无视用户新指令而直接恢复旧任务。`
-			: `The run was just interrupted by the user, which usually means the direction changed. spec://tasks.json still has these open tasks:\n\n${taskLines}\n\nThey may be stale or no longer match the user's latest intent. When the user's next message arrives, treat it as the source of truth; update or remove outdated tasks first if the plan changed (protected task changes trigger taskReflection), then continue. Do not resume an old task over the user's new instruction.`;
-		const body = {
-			kind: "tasks" as const,
-			variant: "current" as const,
-			tasks: openTasks.slice(0, 8).map((task) => ({
-				role:
-					task.status === "doing"
-						? ("doing" as const)
-						: task.status === "blocked"
-							? ("blocked" as const)
-							: ("todo" as const),
-				text: task.text,
-				...(task.protected ? { protected: true as const } : {}),
-			})),
-		};
+		const { content, body } = taskSource.interruptGuardNote(
+			openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS),
+			active.locale,
+		);
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
@@ -1699,6 +1814,115 @@ async function maybeDeliverInterruptTaskGuard(
 			error: String(err),
 		});
 	}
+}
+
+/**
+ * Completed tool calls a run must have made for its end to leave the turn-end note (outline plan
+ * PR 4, decision 2026-11-02 Q4).
+ */
+export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
+
+/**
+ * At the start of a run of an outline session: move the old behavior fence's text to the
+ * session's behavior page (once; `importOutlineBehaviorFence`), then note where the run starts
+ * for the turn-end note (the completed tool count and the revision of the open tasks). Spec
+ * sessions only resolve their (cached) backend. Never rejects.
+ */
+export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
+	active._outlineTurnStart = undefined;
+	try {
+		if ((await resolveTaskBackend(active.narratorId)) !== "outline") return;
+		const { readTaskSession } = await import("./task-source/backend");
+		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
+		const { importOutlineBehaviorFence } = await import("./task-source/outline-behavior");
+		await importOutlineBehaviorFence(active.narratorId, active.locale);
+		const source = await taskSourceForNarrator(active.narratorId);
+		if (!source.turnEndNote) return;
+		const { revision } = await source.openTasks();
+		active._outlineTurnStart = {
+			toolCount: active._todoReminderCompletedToolCount ?? 0,
+			revision,
+		};
+	} catch (err) {
+		logger.warn("Failed to prepare an outline run", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * The turn-end note (outline plan PR 4, decision 2026-11-02 Q4), the smallest deterministic form
+ * of "sync at natural points" (design §4.8): at the end of a run after which no continuation
+ * follows, when the run made at least {@link OUTLINE_TURN_END_MIN_TOOL_CALLS} tool calls, none of
+ * the session's tasks changed during it (the revision of its open tasks is the one the run started
+ * with) and a task is still in progress, one line names that task and asks to tick it done when it
+ * is. Persisted as a plain row the next turn reads; it starts no turn. At most once per run.
+ * Best-effort: failures are logged.
+ *
+ * Two steps, so the orchestrator keeps the pre-idle drain and its takeover-vs-terminal arbitration
+ * back to back: this one (reads only) runs before that drain, after the continuation, compact
+ * restart and hold decisions; {@link deliverOutlineTurnEndNote} (one row) runs once the run has
+ * settled terminal. A note decided for a run the drain or a hold continues is dropped, and the
+ * run's start stays, so its real end decides again.
+ *
+ * "Unchanged" compares the revision of the open tasks read (at most the candidate read's limits):
+ * a task created and finished within the run, or one beyond those limits, leaves it unchanged.
+ */
+export async function decideOutlineTurnEndNote(
+	active: ActiveNarrator,
+): Promise<InterruptGuardNote | null> {
+	const start = active._outlineTurnStart;
+	if (!start) return null;
+	try {
+		const calls = (active._todoReminderCompletedToolCount ?? 0) - start.toolCount;
+		if (calls < OUTLINE_TURN_END_MIN_TOOL_CALLS) return null;
+		const source = await taskSourceForNarrator(active.narratorId);
+		if (!source.turnEndNote) return null;
+		const { tasks, revision } = await source.openTasks();
+		if (revision !== start.revision) return null;
+		const doing = tasks.find((task) => task.status === "doing");
+		if (!doing) return null;
+		return source.turnEndNote(doing, active.locale);
+	} catch (err) {
+		logger.warn("Failed to decide the outline turn-end note", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+		return null;
+	}
+}
+
+/** Persist a note {@link decideOutlineTurnEndNote} decided, once per run. */
+export async function deliverOutlineTurnEndNote(
+	active: ActiveNarrator,
+	note: InterruptGuardNote,
+): Promise<boolean> {
+	if (!active._outlineTurnStart) return false;
+	active._outlineTurnStart = undefined;
+	try {
+		await deliverInjection(active.narratorId, {
+			content: note.content,
+			body: note.body,
+			source: "outline_task_turn_end",
+			// A plain row: the next turn reads it from history; no turn starts for it.
+			schedule: "none",
+			locale: active.locale,
+		});
+		return true;
+	} catch (err) {
+		logger.warn("Failed to deliver the outline turn-end note", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+		return false;
+	}
+}
+
+/** Both steps at once (tests, and any caller with no arbitration between them). */
+export async function maybeDeliverOutlineTurnEndNote(active: ActiveNarrator): Promise<boolean> {
+	const note = await decideOutlineTurnEndNote(active);
+	return note ? await deliverOutlineTurnEndNote(active, note) : false;
 }
 
 // === Agent loop execution ===
@@ -1778,49 +2002,33 @@ export interface SpecContinuationOptions {
 	placement?: InjectionRecipientPlacement;
 }
 
-async function loadCompiledSpecForContinuation(narratorId: string, promoteTodo = true) {
-	const file = await specVfsService.readTasksFileForNarrator(narratorId);
-	let document = parseSpecTasksDocument(file.content);
-	let compiled = compileSpecTasks(document);
-	if (promoteTodo && !compiled.currentTask && compiled.nextTask) {
-		let promoted = false;
-		document = {
-			tasks: document.tasks.map((task) => {
-				if (!promoted && task.status === "todo") {
-					promoted = true;
-					return { ...task, status: "doing" as const };
-				}
-				return task;
-			}),
-		};
-		const content = `${JSON.stringify(document, null, "\t")}\n`;
-		await specVfsService.writeSpecFile(narratorId, "spec://tasks.json", content, {
-			createdBy: "system",
-			allowProtectedTaskMutation: true,
-		});
-		compiled = compileSpecTasks(document);
-	}
-	return compiled;
-}
-
-/** Read only this narrator's spec; promotion is granted by the policy, not its relationships. */
-export async function readSpecContinuationState(narratorId: string, promoteTodo = true) {
+/**
+ * The continuation input from one narrator's task source, promoting the first todo when
+ * the policy allows. An unreadable source means nothing to continue.
+ */
+async function readContinuationTarget(
+	taskSource: NarratorTaskSource,
+	promoteTodo: boolean,
+): Promise<ContinuationTarget> {
 	try {
-		const compiled = await loadCompiledSpecForContinuation(narratorId, promoteTodo);
-		const chosen = compiled.currentTask ?? compiled.tasks.find((task) => task.status === "blocked");
-		return {
-			openTask: chosen
-				? {
-						text: chosen.text,
-						protected: chosen.protected === true,
-						status: chosen === compiled.currentTask ? ("doing" as const) : ("blocked" as const),
-					}
-				: null,
-			protectedOpenCount: compiled.protectedOpenCount,
-		};
+		return await taskSource.prepareContinuation({ promoteTodo });
 	} catch {
 		return { openTask: null, protectedOpenCount: 0 };
 	}
+}
+
+/**
+ * The task a turn-budget continuation is planned for (`ContinuationTarget.turnBudgetOnly`): the
+ * narrator has none of its own, so the prompt names none (`turnBudgetOnly` on the prompt input).
+ */
+const TURN_BUDGET_TASK = Object.freeze({ text: "", protected: false, status: "doing" as const });
+
+/** Read only this narrator's tasks; promotion is granted by the policy, not its relationships. */
+export async function readSpecContinuationState(
+	narratorId: string,
+	promoteTodo = true,
+): Promise<ContinuationTarget> {
+	return readContinuationTarget(await taskSourceForNarrator(narratorId), promoteTodo);
 }
 
 async function maybeStartSpecContinuation(
@@ -1860,11 +2068,19 @@ async function maybeStartSpecContinuation(
 		key: active._continuationStallKey,
 		suppressed: active._continuationSuppressed === true,
 	};
-	const spec = await readSpecContinuationState(active.narratorId, policy.continuation.promoteTodo);
+	const taskSource = await taskSourceForNarrator(active.narratorId);
+	const spec = await readContinuationTarget(taskSource, policy.continuation.promoteTodo);
+	const cause = options?.cause ?? "spec";
+	// A narrator without tasks of its own (an outline subagent, D27c) continues only when a pass
+	// spent its turn budget before the final reply: the mode's task conditions do not apply to
+	// it (only `off` still stops it), the pass ceiling and stall rules do.
+	const budgetOnly = spec.turnBudgetOnly === true;
+	if (budgetOnly) state.turnBudgetOnly = true;
 	const plan = planSpecContinuation({
-		cause: options?.cause ?? "spec",
-		mode: effectiveMode,
-		...spec,
+		cause,
+		mode: budgetOnly && effectiveMode !== "off" ? "always" : effectiveMode,
+		openTask: budgetOnly ? (cause === "maxTurns" ? TURN_BUDGET_TASK : null) : spec.openTask,
+		protectedOpenCount: spec.protectedOpenCount,
 		previous: state,
 		maxPasses: policy.continuation.maxPasses,
 		explicitStart: options?.explicitStart,
@@ -1879,14 +2095,16 @@ async function maybeStartSpecContinuation(
 	state.passes = plan.passes;
 	const task = plan.task;
 	const canAskUserQuestion = policy.capabilities.askUserQuestion !== "disabled";
-	if (policy.continuation.maxPasses !== null || !canAskUserQuestion) {
-		const content = buildSpecContinuationPrompt({
+	if (policy.continuation.maxPasses !== null || !canAskUserQuestion || budgetOnly) {
+		const content = taskSource.continuationPrompt({
+			form: "bounded",
 			cause: plan.cause,
 			task,
 			passes: plan.passes,
 			maxPasses: policy.continuation.maxPasses,
 			canAskUserQuestion,
 			locale: active.locale,
+			...(budgetOnly ? { turnBudgetOnly: true } : {}),
 		});
 		await deliverInjection(active.narratorId, {
 			content,
@@ -1902,15 +2120,11 @@ async function maybeStartSpecContinuation(
 	const current = task.status === "doing" ? task : null;
 	if (!current) {
 		const blocked = task;
-		const actionInstruction = getBlockedTaskActionInstruction(active.locale);
-		// `actionInstruction` already classifies the blocker and covers both branches, so
-		// this copy only adds what it cannot: that the message is system-generated, the tool
-		// name for asking, and that a stale entry may be rewritten. Restating its branches
-		// here (an earlier revision did) just made the prompt longer and self-repeating.
-		const prompt =
-			active.locale === "zh-CN"
-				? `Dynamic Spec blocked 任务续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 有 blocked 条目时自动发出这条消息。\n\nblocked 任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n需要用户介入时，用 AskUserQuestion 提问并结束回合；不要靠反复改写 tasks.json 或重跑同样的调查来绕开。如果该条目已不符合当前实际，可在保留用户原意图的前提下改写或删除它，并说明原因。改动 tasks.json 时先读取再就地修改，不要按本消息重写整个文件。`
-				: `Dynamic Spec blocked-task continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json has a \`blocked\` entry.\n\nBlocked task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nWhen the blocker needs the user, ask with AskUserQuestion and end the turn; do not work around it by rewriting tasks.json or re-running the same investigation. If the entry no longer matches reality, rewrite or remove it while preserving the user's original intent, and say why. When you change tasks.json, read it first and edit in place; do not rewrite the file from this message.`;
+		const prompt = taskSource.continuationPrompt({
+			form: "open",
+			task: blocked,
+			locale: active.locale,
+		});
 		if (options?.placement) {
 			await deliverInjection(active.narratorId, {
 				content: prompt,
@@ -1948,35 +2162,11 @@ async function maybeStartSpecContinuation(
 		active._continuationTurn = "blocked";
 		return prompt;
 	}
-	const protectedNote = current.protected
-		? active.locale === "zh-CN"
-			? "\n- protected：只有具备具体验收证据才能标记 done，该变更会触发 taskReflection。"
-			: "\n- Protected: mark it done only with concrete completion evidence; that change runs taskReflection."
-		: "";
-	// ⚠️ Compiled from tasks.json, not written by the user, and emitted purely because a
-	// `doing` entry is still open — so it has to say so.
-	//
-	// The wording it replaces restated the task and ordered the model to continue ("Do not
-	// ask the user whether to continue"), which is indistinguishable from the user insisting
-	// the work is unfinished. Three observed failure modes came from that:
-	//
-	//  1. Work done, tasks.json not yet updated → the model reads the restated task as "you
-	//     are not done" and reworks code that was already correct.
-	//  2. The task needs the user (one was titled "需用户跑") → being told to act rather than
-	//     ask, the model edited tasks and got nudged again, 37 times in one session.
-	//  3. The task no longer matches reality → with no licence to say so, it grinds a stale
-	//     objective.
-	//
-	// Hence: state provenance, then enumerate the legitimate outcomes. The list must not be
-	// framed as "ways to END the turn" — "keep working" is one of the branches.
-	//
-	// It also names ONE task while tasks.json may hold many, so it says so. A model that
-	// reads this single line as the whole file concludes its other entries were lost and
-	// "restores" them by rewriting tasks.json — destroying the entries that were fine.
-	const prompt =
-		active.locale === "zh-CN"
-			? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 仍有 doing 条目时自动发出这条消息。它只说明该条目尚未标记完成 —— 不代表系统判断你没做完，条目内容也可能已经过时。\n\n当前任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${current.text}${current.protected ? " [protected]" : ""}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户提供信息、权限、决策，或需要用户亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提出一个精确问题并结束回合。\n- 已不符合当前实际：在保留用户原意图的前提下改写或删除该条目，并说明原因。\n\n改动 spec://tasks.json 时先读取再就地修改，不要按本消息重写整个文件。${protectedNote}`
-			: `Dynamic Spec auto-continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json still has a \`doing\` entry. It only means the entry is not marked finished — not that the system judged your work incomplete, and its content may be out of date.\n\nCurrent task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${current.text}${current.protected ? " [protected]" : ""}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs the user's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with AskUserQuestion and end the turn.\n- No longer matches reality: rewrite or remove the entry while preserving the user's original intent, and say why.\n\nWhen you change spec://tasks.json, read it first and edit in place; do not rewrite the file from this message.${protectedNote}`;
+	const prompt = taskSource.continuationPrompt({
+		form: "open",
+		task: current,
+		locale: active.locale,
+	});
 	if (options?.placement) {
 		await deliverInjection(active.narratorId, {
 			content: prompt,
@@ -2570,7 +2760,17 @@ export async function drainInjectionsIntoHistory(
 		() => active._fenceInterval ?? -1,
 	).due(count);
 
-	const tasksBody = atTasksCadence ? await buildSpecTaskDigestBody(narratorId) : null;
+	// Both bodies come from the narrator's task source, resolved only when a cadence is due
+	// and at most once per drain. Injection reads resolve to null rather than reject; the
+	// catch keeps it that way for any source, since nothing above this drain catches.
+	let taskSource: NarratorTaskSource | undefined;
+	const getTaskSource = async () => {
+		taskSource ??= await taskSourceForNarrator(narratorId);
+		return taskSource;
+	};
+	const tasksBody = atTasksCadence
+		? await (await getTaskSource()).taskDigest().catch(() => null)
+		: null;
 	if (tasksBody) {
 		// Stamp the cadence that raised this digest so the reader-facing header can say
 		// "每 N 次工具调用", distinguishing a routine digest from a turn-end
@@ -2593,7 +2793,7 @@ export async function drainInjectionsIntoHistory(
 	// The fence goes out on its own cadence, or alongside a tasks reminder when the
 	// narrator is configured to attach the two.
 	if (atFenceCadence || (!!active._fenceAttach && !!tasksBody)) {
-		const fenceBody = await buildBehaviorFenceBody(narratorId);
+		const fenceBody = await (await getTaskSource()).behaviorFence().catch(() => null);
 		if (fenceBody) {
 			const { body, content } = sideCarBodyWithText("behavior_fence", fenceBody, locale);
 			const { messageId, turnText } = await deliverInjection(narratorId, {
@@ -2867,6 +3067,9 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+			...(result.mediaFallbackWarnings?.length
+				? { mediaFallbackWarnings: result.mediaFallbackWarnings }
+				: {}),
 			...(result.toolLoading
 				? {
 						toolLoading: result.toolLoading,
@@ -3118,6 +3321,8 @@ async function feedMessageUnlocked(
 	},
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
@@ -3125,7 +3330,12 @@ async function feedMessageUnlocked(
 	/** Settles when the started run reaches its terminal. */
 	terminal?: Promise<unknown>;
 	/** Input for a fresh pass; ownership and terminal promises remain with run.ts. */
-	preparedInput?: { text: string; images?: ImageRef[]; prePromptBashCommand?: string };
+	preparedInput?: {
+		text: string;
+		images?: ImageRef[];
+		media?: MediaRef[];
+		prePromptBashCommand?: string;
+	};
 	/** The message is durable, but a later dispatch step failed and was reported. */
 	postCommitError?: unknown;
 }> {
@@ -3197,6 +3407,11 @@ async function feedMessageUnlocked(
 					"back",
 					preBashCommand,
 					acceptedReferences,
+					undefined,
+					undefined,
+					undefined,
+					composerDocument,
+					media,
 				)
 			).id;
 		acceptedInputId = acceptedId;
@@ -3219,6 +3434,7 @@ async function feedMessageUnlocked(
 		const accepted = projectMailboxUserMessage(claimedInput);
 		prompt = accepted.text;
 		images = accepted.images;
+		media = accepted.media;
 		commandText = accepted.commandText;
 		// A mailbox null means no known principal, not permission to erase the
 		// session's identity. Preserve an explicit null only on this direct call.
@@ -3240,6 +3456,7 @@ async function feedMessageUnlocked(
 		const persistBlocks: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| MediaContentBlock
 			| FileReferenceSnapshot
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 		> = [];
@@ -3248,6 +3465,7 @@ async function feedMessageUnlocked(
 				persistBlocks.push(imageRefToContentBlock(img));
 			}
 		}
+		for (const item of media ?? []) persistBlocks.push(mediaRefToContentBlock(item, narratorId));
 		if (savedTextFiles.length > 0) {
 			for (const tf of savedTextFiles) {
 				persistBlocks.push({
@@ -3267,7 +3485,12 @@ async function feedMessageUnlocked(
 
 		// When the user sends images without text, inject a placeholder so that
 		// providers that gate on non-empty content still include the image blocks.
-		const effectiveText = !prompt.trim() && images?.length ? "[user sent image(s)]" : prompt;
+		const effectiveText =
+			!prompt.trim() && media?.length
+				? "[user sent media]"
+				: !prompt.trim() && images?.length
+					? "[user sent image(s)]"
+					: prompt;
 
 		// Build the effective prompt with attached file hints
 		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
@@ -3365,6 +3588,7 @@ async function feedMessageUnlocked(
 		const input = {
 			text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
 			images: preBashCommand ? undefined : images,
+			media: preBashCommand ? undefined : media,
 			...(preBashCommand ? { prePromptBashCommand: preBashCommand } : {}),
 		};
 		if (internalOptions?.prepareOnly) return { active, userMsg, preparedInput: input };
@@ -3383,6 +3607,7 @@ async function feedMessageUnlocked(
 			...internalOptions?.run,
 			...(userId !== undefined ? { principal: userId } : {}),
 			prePromptBashCommand: input.prePromptBashCommand,
+			media,
 			recoveryStart,
 		});
 		terminal.catch(async (err) => {
@@ -3411,7 +3636,10 @@ export async function prepareQueuedRunInput(
 	active: ActiveNarrator,
 	owner: ExecutionOwner,
 	run: import("./agent-runtime/ownership").RunControl,
-): Promise<{ text: string; images?: ImageRef[]; prePromptBashCommand?: string } | undefined> {
+): Promise<
+	| { text: string; images?: ImageRef[]; media?: MediaRef[]; prePromptBashCommand?: string }
+	| undefined
+> {
 	const id = active.narratorId;
 	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
 	const delivered = await drainAndPersistPendingInjections(active);
@@ -3465,6 +3693,8 @@ export async function prepareQueuedRunInput(
 			},
 			undefined,
 			first.fileReferences,
+			first.composerDocument,
+			first.media,
 		);
 		if (result.postCommitError) throw result.postCommitError;
 		if (first.createdBy != null) {
@@ -3717,6 +3947,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 export interface UserMessageAdmissionOptions {
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	locale?: Locale;
 	replyInUserLanguage?: boolean;
 	commandText?: string | null;
@@ -3816,6 +4047,7 @@ export async function acceptUserMessage(
 					options.executionIntent,
 					queueMode,
 					options.composerDocument,
+					options.media,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3883,6 +4115,8 @@ export async function acceptUserMessage(
 								},
 								undefined,
 								options.fileReferences,
+								options.composerDocument,
+								options.media,
 							);
 							if (!userBroadcasted)
 								broadcastToNarrator(narratorId, {
@@ -3960,6 +4194,8 @@ export async function sendMessage(
 	preBashCommand?: string | null,
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const { userMsg, userBroadcasted } = await feedMessage(
@@ -3975,6 +4211,8 @@ export async function sendMessage(
 		undefined,
 		origin,
 		acceptedReferences,
+		composerDocument,
+		media,
 	);
 	if (!userBroadcasted) {
 		broadcastToNarrator(narratorId, {
@@ -4100,6 +4338,10 @@ export async function createNarratorForPlugin(
 		cwd: input.cwd,
 		permissionMode: input.permissionMode,
 		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+		// The recruiting plugin drives its members through the Dynamic Spec commands (dispatch,
+		// read, write), which an outline session refuses; members stay spec until the block-based
+		// commands exist (plan PR 12, D27d), as OAuth-provisioned sessions do.
+		taskBackend: "spec",
 	});
 	return {
 		narratorId: narrator.id,
@@ -4122,6 +4364,10 @@ export async function deleteNarratorForPlugin(narratorId: string): Promise<void>
  * to track the shared task queue it maintains for each member.
  */
 export async function readSpecTasksForPlugin(narratorId: string) {
+	// An outline session's tasks are not in Dynamic Spec: an empty list would read as an idle
+	// member to a plugin that then dispatches to it (refused too). Refused like the writes.
+	const { assertSpecTasksUsed } = await import("./task-source/backend");
+	await assertSpecTasksUsed(narratorId);
 	const { readTasksFileForNarrator } = await import("./spec-vfs-service");
 	const { parseSpecTasksDocument, compileSpecTasks } = await import("./spec-task-service");
 	const file = await readTasksFileForNarrator(narratorId);
@@ -4167,13 +4413,6 @@ export async function addSpecTaskForPlugin(
 	};
 }
 
-/** Marker that scopes plugin-written team-SOP sections inside spec://behavior_fence. */
-const TEAM_SOP_MARKER = "team-sop:com.whisent.narrator-team";
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 /**
  * Upsert or clear a plugin-managed team-SOP section inside a narrator's
  * `spec://behavior_fence`.
@@ -4198,24 +4437,25 @@ export async function setSpecBehaviorFenceForPlugin(
 	} catch {
 		// Fence may not exist yet; treat as empty.
 	}
-	const openTag = `<!-- ${TEAM_SOP_MARKER} -->`;
-	const closeTag = `<!-- /${TEAM_SOP_MARKER} -->`;
-	const sopPattern = new RegExp(
-		`\\s*${escapeRegExp(openTag)}[\\s\\S]*?${escapeRegExp(closeTag)}\\s*`,
+	const { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, fenceWithoutFirstPluginSop } = await import(
+		"./behavior-fence-sop"
 	);
-	const withoutSop = current.replace(sopPattern, "").trim();
+	const withoutSop = fenceWithoutFirstPluginSop(current);
 	const body = text.trim();
 	let next: string;
 	if (mode === "clear" || !body) {
 		next = withoutSop;
 	} else {
-		const section = `${openTag}\n${body}\n${closeTag}`;
+		const section = `${TEAM_SOP_OPEN}\n${body}\n${TEAM_SOP_CLOSE}`;
 		next = withoutSop ? `${withoutSop}\n\n${section}` : section;
 	}
+	// `pluginSop`: in an outline session the old fence is closed to everyone but this channel
+	// (the plugin's SOP, until its block commands exist, outline plan PR 12).
 	const written = await writeSpecFile(narratorId, "spec://behavior_fence", next, {
 		actor: "agent",
 		allowFenceMutation: true,
 		createdBy: "assistant",
+		pluginSop: true,
 	});
 	return { updated: true, revisionId: written.revisionId ?? null };
 }
@@ -5239,6 +5479,9 @@ async function retryLastMessageUnlocked(
 	}
 
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
+	const mediaRefs = (Array.isArray(lastMsg.contentJson) ? lastMsg.contentJson : [])
+		.filter(isMediaContentBlock)
+		.map((item) => mediaRefToContentBlock(item, lastMsg.narratorId));
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
@@ -5247,6 +5490,7 @@ async function retryLastMessageUnlocked(
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined, {
 		principal: userId,
+		media: mediaRefs.length > 0 ? mediaRefs : undefined,
 	}).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
 		await reportUnsettledRunLoopError(narratorId, err);
@@ -5815,7 +6059,9 @@ async function reExecuteDeniedToolCallUnlocked(
 					input: toolInput,
 				});
 
-				const { executePersistedToolAfterReflections } = await import("../lib/agent/loop");
+				const { createDurableMediaReferences, executePersistedToolAfterReflections } = await import(
+					"../lib/agent/loop"
+				);
 				const toolName = toolCall.toolName;
 				const reflectionHistory = await buildRuntimeHistory({
 					narratorId,
@@ -5849,6 +6095,7 @@ async function reExecuteDeniedToolCallUnlocked(
 				const config: import("../lib/agent").AgentConfig = {
 					narratorId,
 					runtimePolicy,
+					taskBackend: await resolveTaskBackend(narratorId).catch(() => "spec" as const),
 					systemPrompt: active.systemPrompt ?? undefined,
 					permissionMode: oauthRuntime?.permissionMode ?? narrator.permissionMode ?? "default",
 					planMode: !oauthRuntime && isPlanModeTrait(narrator.traits),
@@ -6022,6 +6269,12 @@ async function reExecuteDeniedToolCallUnlocked(
 						},
 					);
 
+					const mediaRefs = result.mediaRefs?.length
+						? result.mediaRefs
+						: result.media?.length
+							? await createDurableMediaReferences(config)(result.media)
+							: undefined;
+
 					if (!result.isError && toolName === "ExitPlanMode") {
 						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
 						const planState = await exitNarratorPlanMode(narratorId);
@@ -6056,7 +6309,10 @@ async function reExecuteDeniedToolCallUnlocked(
 					await narratorStore.settleTool(
 						toolUseId,
 						{
-							output: encodeToolOutput(result.output, { metadata: result.metadata }),
+							output: encodeToolOutput(result.output, {
+								metadata: result.metadata,
+								media: mediaRefs,
+							}),
 							status: result.isError ? "fail" : "success",
 							errorMessage: result.isError ? result.output : undefined,
 							durationMs: result.durationMs,
@@ -6076,7 +6332,10 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						toolName,
 						status: result.isError ? "fail" : "success",
-						output: encodeToolOutput(result.output, { metadata: result.metadata }),
+						output: encodeToolOutput(result.output, {
+							metadata: result.metadata,
+							media: mediaRefs,
+						}),
 						durationMs: result.durationMs,
 						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
 						...(result.metadata ? { metadata: result.metadata } : {}),
@@ -6411,6 +6670,7 @@ type EditableUserContentBlock =
 	| { type: "text"; text: string }
 	| FileReferenceSnapshot
 	| PersistedUserImageBlock
+	| MediaContentBlock
 	// `fileId` is optional: legacy uploads stored files under
 	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
 	// filePath, while newer uploads live in the worktree and omit fileId.
@@ -6468,6 +6728,8 @@ function buildEditedUserContentJson(
 	opts?: {
 		fallbackUploadNarratorId?: string | null;
 		keepImageIds?: string[];
+		keepMediaIds?: string[];
+		newMedia?: MediaRef[];
 		newImages?: ImageRef[];
 		keepTextFilePaths?: string[];
 		newTextFiles?: TextFileRef[];
@@ -6482,9 +6744,19 @@ function buildEditedUserContentJson(
 	const seenImageIds = new Set<string>();
 	const seenTextFilePaths = new Set<string>();
 	const imageBlocks: EditableUserContentBlock[] = [];
+	const mediaBlocks: MediaContentBlock[] = [];
+	const keepMediaSet = opts?.keepMediaIds === undefined ? null : new Set(opts.keepMediaIds);
+	const seenMediaIds = new Set<string>();
 	const textFileBlocks: EditableUserContentBlock[] = [];
 
 	for (const block of blocks) {
+		if (isMediaContentBlock(block)) {
+			if (keepMediaSet && !keepMediaSet.has(block.mediaId)) continue;
+			if (!seenMediaIds.has(block.mediaId))
+				mediaBlocks.push(mediaRefToContentBlock(block, fallbackUploadNarratorId));
+			seenMediaIds.add(block.mediaId);
+			continue;
+		}
 		if (
 			block.type === "image" &&
 			typeof block.imageId === "string" &&
@@ -6561,7 +6833,14 @@ function buildEditedUserContentJson(
 	const references = freezeFileReferenceSnapshots(
 		opts?.fileReferences ?? getFileReferenceSnapshots(contentJson),
 	);
-	return [...imageBlocks, ...textFileBlocks, ...references, { type: "text", text: newContent }];
+	return [
+		...imageBlocks,
+		...mediaBlocks,
+		...(opts?.newMedia ?? []).map((item) => mediaRefToContentBlock(item, fallbackUploadNarratorId)),
+		...textFileBlocks,
+		...references,
+		{ type: "text", text: newContent },
+	];
 }
 
 /**
@@ -6597,6 +6876,8 @@ export interface EditAndRegenerateOptions {
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
 	fileReferences?: FileReferenceSnapshot[];
 	keepImageIds?: string[];
+	keepMediaIds?: string[];
+	newMedia?: File[];
 	newImages?: File[];
 	keepTextFilePaths?: string[];
 	newTextFiles?: File[];
@@ -6672,6 +6953,28 @@ async function editAndRegenerateUnlocked(
 		.filter((block) => block.type === "text_file" && typeof block.filePath === "string")
 		.map((block) => block.filePath as string);
 	const keepImageIds = resolveRequestedAttachmentKeys(actualImageIds, opts?.keepImageIds);
+	const actualMedia = originalBlocks.filter(
+		(block): block is Record<string, unknown> & MediaContentBlock => isMediaContentBlock(block),
+	);
+	const keepMediaIds = resolveRequestedAttachmentKeys(
+		actualMedia.map((item) => item.mediaId),
+		opts?.keepMediaIds,
+	);
+	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
+		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	let retainedAttachmentBytes = 0;
+	const countedMediaIds = new Set<string>();
+	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
+		const owner = item.uploadNarratorId || targetMsg.narratorId;
+		const mediaPath = getMediaPath(owner, item.mediaId);
+		if (!mediaPath) throw new ValidationError(`Attached media not found: ${item.filename}`);
+		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
+		if (!countedMediaIds.has(mediaKey)) {
+			countedMediaIds.add(mediaKey);
+			retainedAttachmentBytes += Bun.file(mediaPath).size;
+		}
+	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
 		actualTextFilePaths,
 		opts?.keepTextFilePaths,
@@ -6692,6 +6995,12 @@ async function editAndRegenerateUnlocked(
 					.filter((_, index) => keepTextFilePaths.includes(actualTextFilePaths[index])),
 				...(opts?.newTextFiles ?? []),
 			],
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "audio" || asset.kind === "video")
+					.filter((_, index) => keepMediaIds.includes(actualMedia[index]?.mediaId)),
+				...(opts?.newMedia ?? []),
+			],
 		);
 	}
 	validateComposerAssets(
@@ -6708,13 +7017,18 @@ async function editAndRegenerateUnlocked(
 			),
 			...(opts?.newTextFiles ?? []),
 		],
+		[
+			...actualMedia.filter((item) => keepMediaIds.includes(item.mediaId)),
+			...(opts?.newMedia ?? []),
+		],
 	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])].reduce(
-		(total, file) => total + file.size,
-		0,
-	);
+	const uploadBytes = [
+		...(opts?.newImages ?? []),
+		...(opts?.newTextFiles ?? []),
+		...(opts?.newMedia ?? []),
+	].reduce((total, file) => total + file.size, 0);
 	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 	}
@@ -6730,9 +7044,10 @@ async function editAndRegenerateUnlocked(
 	if (
 		!newContent.trim() &&
 		keepImageIds.length === 0 &&
+		keepMediaIds.length === 0 &&
 		keepTextFilePaths.length === 0 &&
 		selectedReferences.length === 0 &&
-		!(opts?.newImages?.length || opts?.newTextFiles?.length)
+		!(opts?.newImages?.length || opts?.newTextFiles?.length || opts?.newMedia?.length)
 	) {
 		throw new ValidationError("content is required");
 	}
@@ -6746,7 +7061,6 @@ async function editAndRegenerateUnlocked(
 	const keepTextFileSet = new Set(keepTextFilePaths);
 	const countedImageIds = new Set<string>();
 	const countedTextFilePaths = new Set<string>();
-	let retainedAttachmentBytes = 0;
 	const textFilesToCopy = new Map<string, TextFileRef>();
 	for (const block of originalBlocks) {
 		if (
@@ -6860,14 +7174,22 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const createdImageIds: string[] = [];
+	const createdMediaIds: string[] = [];
 	const createdFilePaths: string[] = [];
 	let copyOnWriteSucceeded = false;
 	let privateMessageId: string;
 	let newContentJson: EditableUserContentBlock[];
 	let existingImages: ImageRef[];
+	let existingMedia: MediaRef[];
 	let existingTextFiles: TextFileRef[];
 	let effectivePrompt: string;
 	try {
+		const savedNewMedia: MediaRef[] = [];
+		for (const file of opts?.newMedia ?? []) {
+			const item = await saveUploadedMedia(narratorId, file);
+			createdMediaIds.push(item.mediaId);
+			savedNewMedia.push(item);
+		}
 		const savedNewImages: ImageRef[] = [];
 		for (const file of opts?.newImages ?? []) {
 			const ref = await saveUploadedImage(narratorId, file);
@@ -6905,14 +7227,21 @@ async function editAndRegenerateUnlocked(
 			fallbackUploadNarratorId: targetMsg.narratorId,
 			keepImageIds,
 			newImages: savedNewImages,
+			keepMediaIds,
+			newMedia: savedNewMedia,
 			keepTextFilePaths: relocatedKeepTextFilePaths,
 			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
 			fileReferences: selectedReferences,
 		});
 		existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
+		existingMedia = newContentJson.filter(isMediaContentBlock);
 		existingTextFiles = extractTextFileRefs(newContentJson);
 		const effectiveText =
-			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
+			!newContent.trim() && newContentJson.some(isMediaContentBlock)
+				? "[user sent media]"
+				: !newContent.trim() && existingImages.length > 0
+					? "[user sent image(s)]"
+					: newContent;
 		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
 
 		// A loop may have started while the files were being materialized (the route
@@ -6933,6 +7262,7 @@ async function editAndRegenerateUnlocked(
 		copyOnWriteSucceeded = true;
 	} catch (error) {
 		if (!copyOnWriteSucceeded) {
+			for (const mediaId of createdMediaIds) deleteUploadedMedia(narratorId, mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(narratorId, imageId);
 			deleteCreatedAttachmentFiles(createdFilePaths);
 		}
@@ -6985,7 +7315,7 @@ async function editAndRegenerateUnlocked(
 		active,
 		projectFileReferenceText(effectivePrompt, selectedReferences),
 		imageRefs.length > 0 ? imageRefs : undefined,
-		{ principal: opts?.userId },
+		{ principal: opts?.userId, media: existingMedia.length > 0 ? existingMedia : undefined },
 	).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
 			narratorId,

@@ -1,8 +1,15 @@
 import { usePromptOptimize } from "@frontend/hooks/usePromptOptimize";
-import { ActionIcon, Box, Button, Group, Stack, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Button, Group, Modal, Stack, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
+import {
+	MAX_MEDIA_ATTACHMENTS,
+	MAX_MEDIA_FILE_SIZE,
+	MEDIA_MIME_TO_EXT,
+	mediaModality,
+	normalizeMediaFile,
+} from "@shared/media-attachments";
 import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import { IconPaperclip } from "@tabler/icons-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
@@ -13,6 +20,7 @@ import { apiUrl } from "../../../lib/base-path";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
+import { ComposerTextAttachmentPreview } from "../composer/ComposerTextAttachmentPreview";
 import { composerOptimizeTarget } from "../composer/composer-optimize-target";
 import type { ComposerQuote } from "../composer/composer-quotes";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
@@ -43,6 +51,7 @@ import {
 	MAX_IMAGE_SIZE,
 	resizeImageIfNeeded,
 } from "../narrator-panel-types";
+import { MediaAttachment } from "./MediaAttachment";
 
 export interface EditableComposerDocumentProps {
 	narratorId?: string;
@@ -86,6 +95,21 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 	);
 	const [fullscreen, setFullscreen] = useState(false);
 	const [quoteDetail, setQuoteDetail] = useState<ComposerQuote | null>(null);
+	const [mediaPreviewId, setMediaPreviewId] = useState<string>();
+	const previewAsset = document?.assets.find((asset) => asset.id === mediaPreviewId);
+	const previewResource = previewAsset ? session?.bindings.get(previewAsset.id) : undefined;
+	// The nested viewer owns Escape before fullscreen's document listener sees it.
+	useEffect(() => {
+		if (!mediaPreviewId) return;
+		const close = (event: globalThis.KeyboardEvent) => {
+			if (event.key !== "Escape" || event.isComposing || event.defaultPrevented) return;
+			event.preventDefault();
+			event.stopPropagation();
+			setMediaPreviewId(undefined);
+		};
+		window.addEventListener("keydown", close, true);
+		return () => window.removeEventListener("keydown", close, true);
+	}, [mediaPreviewId]);
 	// 原地 position: fixed 全屏(保住光标/撤销栈);中和祖先层叠上下文,
 	// 否则全屏框会画在 AppShell 导航栏/顶栏之下。
 	const fullscreenBoxRef = useRef<HTMLDivElement>(null);
@@ -95,12 +119,13 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 		narratorId: props.narratorId ?? "",
 		messageId: props.messageId,
 		textareaRef: unusedTextarea,
-		target: () => {
+		ready: !!document,
+		target: (snapshot) => {
 			if (latest.current.disabled || inserting.current) return null;
-			const target = composerOptimizeTarget(editor.current);
+			const target = composerOptimizeTarget(editor.current, snapshot);
 			return target
 				? {
-						text: target.text,
+						...target,
 						apply: (text) => !latest.current.disabled && !inserting.current && target.apply(text),
 					}
 				: null;
@@ -159,6 +184,10 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 		for (const [id, resource] of session.bindings) {
 			if (resource instanceof File) {
 				next.set(id, resource);
+				continue;
+			}
+			if (resource.kind === "audio" || resource.kind === "video") {
+				next.set(id, resource.previewUrl?.startsWith("blob:") ? resource.previewUrl : "kept-media");
 				continue;
 			}
 			if (resource.kind === "textFile") {
@@ -250,10 +279,36 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 			const current = editor.current?.getDocument() ?? session.document;
 			let images = current.assets.filter((asset) => asset.kind === "image").length;
 			let texts = current.assets.filter((asset) => asset.kind === "textFile").length;
+			let mediaCount = current.assets.filter(
+				(asset) => asset.kind === "audio" || asset.kind === "video",
+			).length;
 			const additions: ReturnType<typeof bindComposerEditFiles> = { nodes: [], assets: [] };
 			for (let file of files) {
+				file = normalizeMediaFile(file);
 				const image = ACCEPTED_TYPES.includes(file.type);
-				if (image) {
+				const mediaKind = mediaModality(file.type);
+				if (mediaKind) {
+					if (
+						!Object.hasOwn(MEDIA_MIME_TO_EXT, file.type) ||
+						!file.size ||
+						file.size > MAX_MEDIA_FILE_SIZE ||
+						mediaCount >= MAX_MEDIA_ATTACHMENTS
+					) {
+						notifications.show({
+							color: "yellow",
+							title: t(
+								!Object.hasOwn(MEDIA_MIME_TO_EXT, file.type)
+									? "unsupportedFileType"
+									: mediaCount >= MAX_MEDIA_ATTACHMENTS
+										? "mediaTooMany"
+										: "mediaFileTooLarge",
+							),
+							message: file.name,
+						});
+						continue;
+					}
+					mediaCount++;
+				} else if (image) {
 					if (file.size > MAX_IMAGE_SIZE || images >= MAX_QUEUED_IMAGES) {
 						notifications.show({
 							color: "yellow",
@@ -295,7 +350,11 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					texts++;
 				}
 				if (!mounted.current || latest.current.disabled) return;
-				const added = bindComposerEditFiles(session, [file], image ? "image" : "textFile");
+				const added = bindComposerEditFiles(
+					session,
+					[file],
+					mediaKind ?? (image ? "image" : "textFile"),
+				);
 				additions.nodes.push(...added.nodes);
 				additions.assets.push(...added.assets);
 			}
@@ -375,6 +434,38 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 				onClose={() => setQuoteDetail(null)}
 				onJump={(quote) => revealComposerQuote(dock, quote, editor.current?.getElement() ?? null)}
 			/>
+			{previewAsset &&
+				previewResource &&
+				(previewAsset.kind === "audio" || previewAsset.kind === "video") &&
+				(previewResource instanceof File ? (
+					<ComposerTextAttachmentPreview
+						key={previewAsset.id}
+						file={previewResource}
+						name={previewAsset.name}
+						mediaKind={previewAsset.kind}
+						onClose={() => setMediaPreviewId(undefined)}
+					/>
+				) : (
+					<Modal
+						opened
+						title={t("attachments.previewTitle", { name: previewAsset.name })}
+						zIndex={500}
+						closeOnEscape={false}
+						onClose={() => setMediaPreviewId(undefined)}
+					>
+						<MediaAttachment
+							narratorId={props.narratorId ?? ""}
+							block={{
+								type: previewAsset.kind,
+								mediaId: previewResource.mediaId,
+								filename: previewAsset.name,
+								mediaType: previewAsset.mimeType,
+								size: previewAsset.size,
+								uploadNarratorId: previewResource.uploadNarratorId,
+							}}
+						/>
+					</Modal>
+				))}
 			{fullscreen && (
 				<Group justify="flex-end" mb="xs">
 					<Button size="xs" variant="subtle" onClick={() => setFullscreen(false)}>
@@ -404,6 +495,10 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 				onOpenFile={(reference) => {
 					if (fileScope.openFile) fileScope.openFile(reference);
 					else revealQuotedFile(dock, reference);
+				}}
+				onOpenAttachment={(asset) => {
+					if ((asset.kind === "audio" || asset.kind === "video") && session?.bindings.has(asset.id))
+						setMediaPreviewId(asset.id);
 				}}
 				onOpenImage={(asset) => {
 					const resource = resources.get(asset.id);

@@ -29,10 +29,8 @@ describe("useLocalPref — defaults", () => {
 		// planners that lose a whole group's animation when the two levels' geometries
 		// disagree. The switch remains only as an opt-OUT.
 		expect(localPrefDefault("narrafork_unified_morph")).toBe(true);
-		// Identity entry points stay hidden until the user opts in. Session details
-		// remains available either way.
-		expect(localPrefDefault("narrafork_git_identity_context_menu")).toBe(false);
-		expect(localPrefDefault("narrafork_git_identity_create_modal")).toBe(false);
+		// Identity entry points are no longer browser-local: they live in
+		// `user_preferences` so they follow the account (see useGitIdentityVisibility).
 	});
 });
 

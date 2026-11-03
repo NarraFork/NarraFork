@@ -146,9 +146,17 @@ test("no-signal fallback uses the device probe and other managers execute only t
 			true,
 		);
 		expect(command).toContain("node_modules/vite/bin/vite.js");
-		expect(command).not.toContain("dlx");
-		expect(command).not.toContain("bunx");
-		expect(command).not.toContain("npx");
+		// The local CLI path sits under a random mkdtemp directory (CI once got
+		// `kit-runner-5dlxmy`), so the downloader checks run on the runner tokens only.
+		const entry = quoteKitArgument(
+			backend,
+			backend.paths.resolve(root, "node_modules/vite/bin/vite.js"),
+		);
+		expect(command).toContain(entry);
+		const runnerTokens = command.replace(entry, "<local-vite-cli>");
+		expect(runnerTokens).not.toContain("dlx");
+		expect(runnerTokens).not.toContain("bunx");
+		expect(runnerTokens).not.toContain("npx");
 	}
 });
 

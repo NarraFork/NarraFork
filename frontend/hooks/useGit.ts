@@ -165,6 +165,11 @@ export const GIT_FACT_QUERIES = [
  * Live facts invalidated by a WS `git_status` push. Derived from
  * GIT_FACT_QUERIES so a new live fact cannot drift out of the push path;
  * commit previews are immutable and excluded.
+ *
+ * The branch listing is not a fact query. One listing is six git processes, and
+ * every stage, discard, or commit-message request flows through this list. HEAD
+ * changes refetch it from the branch bar; checkout, push, and fetch invalidate
+ * it themselves because a push does not move HEAD.
  */
 export const GIT_LIVE_FACT_QUERIES = GIT_FACT_QUERIES.filter(
 	(prefix) => prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff",
@@ -402,6 +407,7 @@ async function readWorkspace<T>(
 		// Re-probing would unmount/reopen its consumer and repeat the same failure.
 		const unsupportedOperation =
 			(failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED) ||
+			(failure?.status === 409 && failure.data?.code === "GIT_BRANCHES_UNSUPPORTED") ||
 			failure?.data?.code === "GIT_LINE_STATS_UNSUPPORTED";
 		if (
 			target &&
@@ -761,6 +767,32 @@ export function useGitStatus<V extends GitWorkspaceView = "details">(
 }
 
 /**
+ * The branch listing behind the panel's branch bar and picker.
+ *
+ * Read on demand only: it costs six git processes (two ref walks, worktree list,
+ * remote list, and two HEAD reads), which is acceptable once when the panel opens
+ * and far too much on the ~1/s `git_status` push. It stays out of
+ * {@link GIT_FACT_QUERIES}. Checkout, push, and fetch invalidate it; other git
+ * writes do not.
+ */
+export function useGitBranches(target: GitTarget | undefined | null, enabled = true) {
+	const qc = useQueryClient();
+	const key = gitTargetKey(target);
+	return useQuery({
+		queryKey: ["gitBranches", key],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () => api.getGitBranches(target as GitTarget, signal)),
+		enabled: Boolean(target && key) && enabled,
+		// Short enough that reopening the panel re-reads, long enough that the bar and
+		// the picker share one response instead of racing each other.
+		staleTime: 10_000,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+		refetchOnWindowFocus: false,
+		retry: false,
+	});
+}
+
+/**
  * Minimum interval between two badge refreshes (ms). `focus` and
  * `visibilitychange` co-fire on a single return gesture, and a foreground return
  * usually also triggers the WS reconnect that raises the second signal
@@ -922,13 +954,20 @@ export function useGitCommitDiff(
 	});
 }
 
-function useGitMutation<T, R>(target: GitTarget, run: (value: T) => Promise<R>) {
+function useGitMutation<T, R>(
+	target: GitTarget,
+	run: (value: T) => Promise<R>,
+	options?: { refreshBranches?: boolean },
+) {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: run,
 		retry: false,
 		onSettled: () => {
 			invalidateWorkspaceQueries(qc, target, false);
+			if (!options?.refreshBranches) return;
+			const key = gitTargetKey(target);
+			if (key) void qc.invalidateQueries({ queryKey: ["gitBranches", key] });
 		},
 	});
 }
@@ -963,4 +1002,27 @@ export function useGitReset(target: GitTarget) {
 }
 export function useGitAiCommitMessage(target: GitTarget) {
 	return useGitMutation<void, { message: string }>(target, () => api.gitAiCommitMessage(target));
+}
+/** Switch, create (`create` + `startPoint`), or track a remote branch by name. */
+export function useGitCheckoutBranch(target: GitTarget) {
+	return useGitMutation(
+		target,
+		(body: { branch: string; create?: boolean; startPoint?: string }) =>
+			api.gitCheckoutBranch(target, body),
+		{ refreshBranches: true },
+	);
+}
+export function useGitPushBranch(target: GitTarget) {
+	return useGitMutation(
+		target,
+		(body: { remote?: string; setUpstream?: boolean }) => api.gitPushBranch(target, body),
+		{ refreshBranches: true },
+	);
+}
+export function useGitFetchRemote(target: GitTarget) {
+	return useGitMutation(
+		target,
+		(body: { remote?: string; prune?: boolean }) => api.gitFetchRemote(target, body),
+		{ refreshBranches: true },
+	);
 }

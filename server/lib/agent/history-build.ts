@@ -8,7 +8,12 @@
  * projection (neutral turns, then its wire format).
  */
 
+import type { MediaRef } from "@shared/media-attachments";
 import { projectFileReferencesForModel } from "./file-reference-projection";
+import {
+	projectCurrentNativeMediaForModel,
+	projectUnsupportedNativeMediaForModel,
+} from "./native-media";
 import type { BuiltHistory, DbMessage, ProviderAdapter } from "./provider";
 import { projectAskUserQuestionMessagesForModel } from "./question-model-input";
 import { projectMessageSenderForModel } from "./sender-projection";
@@ -24,6 +29,8 @@ import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
 
 export interface AdapterHistoryOptions {
 	narratorId?: string;
+	/** Only references actually sent in a separate current-input lane may be omitted from rows. */
+	currentMedia?: readonly MediaRef[];
 	/**
 	 * Loading state the request's `tools` array is built from, and the strategy
 	 * resolved for this model. Tool loads inside the history are rendered for it.
@@ -32,8 +39,8 @@ export interface AdapterHistoryOptions {
 }
 
 /** Build `adapter`'s history for `model` (the bare id it resolved) from `rows`. */
-export function buildAdapterHistory(
-	adapter: Pick<ProviderAdapter, "buildHistory">,
+export async function buildAdapterHistory(
+	adapter: Pick<ProviderAdapter, "buildHistory" | "supportsNativeMediaInput">,
 	rows: readonly DbMessage[],
 	target: { provider: string; model: string },
 	options: AdapterHistoryOptions = {},
@@ -57,8 +64,14 @@ export function buildAdapterHistory(
 	// later collisions in this in-memory copy — DB rows keep the original ids.
 	// Attribution is a model-only projection, after accepted file material. Roles and
 	// stored rows stay unchanged; every provider receives the same sender format.
+	const mediaProjection = projectUnsupportedNativeMediaForModel(
+		projectCurrentNativeMediaForModel(cleanedMessages, options.currentMedia, options.narratorId),
+		target.model,
+		adapter,
+		options.narratorId,
+	);
 	const uniqueMessages = uniquifyDbMessageToolUseIds(
-		cleanedMessages.map(projectMessageSenderForModel),
+		mediaProjection.messages.map(projectMessageSenderForModel),
 		{ narratorId: options.narratorId, provider: target.provider, model: target.model },
 	);
 	// Last, so builders see exactly these row objects (changes are keyed by row).
@@ -70,7 +83,16 @@ export function buildAdapterHistory(
 				resolveLoadableToolDefinition,
 			)
 		: uniqueMessages;
-	return adapter.buildHistory(projectedMessages, target.model, options.narratorId);
+	const built = await adapter.buildHistory(projectedMessages, target.model, options.narratorId);
+	return mediaProjection.warnings.length
+		? {
+				...built,
+				mediaFallbackWarnings: [
+					...(built.mediaFallbackWarnings ?? []),
+					...mediaProjection.warnings,
+				],
+			}
+		: built;
 }
 
 /** The last top-level row the model reads, and whether it is an answered tool step. */

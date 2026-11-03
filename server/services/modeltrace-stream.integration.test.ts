@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
 import type { StreamingBlock } from "../../frontend/components/narrator/message/message-segments";
 import { applyStreamingDelta } from "../../frontend/components/narrator/streaming/streaming-delta-fold";
@@ -14,6 +15,7 @@ const { db, sqlite } = getTestDb();
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,

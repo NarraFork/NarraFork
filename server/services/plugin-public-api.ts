@@ -3,7 +3,7 @@ import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { narratorMessages, narrators } from "../db/schema";
 import { BOOLEAN_OVERRIDE_VALUES, type BooleanOverride } from "../lib/boolean-override";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import type { Capability } from "../lib/plugins/permissions";
@@ -2912,6 +2912,12 @@ export type NarratorSessionFacade = {
 /** Map core narrator errors to stable public error codes. */
 function mapNarratorCommandError(error: unknown): PluginPublicApiError {
 	if (error instanceof PluginPublicApiError) return error;
+	// A Dynamic Spec command for a session whose tasks live in the outline (outline P2): not a
+	// bad request, the session is in the other task system. The block-based commands come with
+	// the plugin compatibility work (plan PR 12).
+	if (error instanceof AppError && error.code === "SPEC_OUTLINE_SESSION") {
+		return new PluginPublicApiError("CONFLICT", error.message);
+	}
 	if (error instanceof NotFoundError) {
 		return new PluginPublicApiError("NOT_FOUND", "Narrator was not found");
 	}

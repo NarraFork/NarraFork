@@ -123,3 +123,19 @@ test("nothing is sent while disconnected, and pages past the per-socket limit ar
 	expect(f.sent("outline_page_subscribe")).toHaveLength(OUTLINE_PAGE_SUBSCRIPTION_LIMITS.perSocket);
 	stop();
 });
+
+test("a pending frame tells the page's listeners to re-read its pending summary (P2 PR 6)", () => {
+	const f = fixture();
+	const a = mock((_hint: OutlinePageHint) => {});
+	const stop = f.pool.subscribe("page-1", a);
+	const id = f.lastId();
+	f.receive({ type: "outline_page_subscribed", subscriptionId: id, pageId: "page-1", seq: 4 });
+	f.receive({ type: "outline_page_pending", subscriptionId: id, pageId: "page-1" });
+	f.receive({ type: "outline_page_pending", subscriptionId: "other", pageId: "page-1" });
+	f.receive({ type: "outline_page_pending", subscriptionId: id, pageId: "page-2" });
+	expect(a.mock.calls.map(([hint]) => hint)).toEqual([
+		{ kind: "subscribed", seq: 4 },
+		{ kind: "pending" },
+	]);
+	stop();
+});

@@ -48,6 +48,7 @@ function fixture(
 	const target = {
 		type: () => "page",
 		browserContext: () => context,
+		opener: () => undefined,
 		_session: mock(() => client),
 		createCDPSession: mock(async () => {
 			throw new Error("Must borrow the existing session");

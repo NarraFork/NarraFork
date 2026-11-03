@@ -3,12 +3,51 @@ import { ValidationError } from "../lib/errors";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { specFileQuerySchema, updateSpecFileSchema } from "../lib/validators";
+import { isOutlineEnabled } from "../services/outline/feature";
 import { interjectSpecEditAsUserMessage } from "../services/spec-edit-interject";
 import { compileSpecTasks, parseSpecTasksDocument } from "../services/spec-task-service";
 import { specVfsService } from "../services/spec-vfs-service";
+import { readTaskBackend, readTaskSession } from "../services/task-source/backend";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 export const specRoutes = new Hono();
+
+/**
+ * Where an outline session's behavior boundary lives (outline plan PR 4): its session space and
+ * the behavior page in it, either null until it exists. Null for a spec session. In an outline
+ * session the old `behavior_fence` is the plugins' SOP channel only, so the Spec panel shows it
+ * read-only and offers to open the page instead.
+ */
+async function outlineBehaviorOf(
+	narratorId: string,
+): Promise<{ spaceId: string | null; pageId: string | null } | null> {
+	if ((await readTaskBackend(narratorId)) !== "outline") return null;
+	const { findSessionSpace } = await import("../services/outline/spaces");
+	const { findBehaviorPage } = await import("../services/task-source/outline-behavior");
+	const space = await findSessionSpace(narratorId);
+	const page = space ? await findBehaviorPage(space.id) : null;
+	return { spaceId: space?.id ?? null, pageId: page?.id ?? null };
+}
+
+/**
+ * True for an outline session with a behavior page while the outline is switched off: it runs as
+ * a spec session (its fence editable as before), but the page's rules are still put in front of
+ * the agent with the fence (`spec-reminder.ts`). The panel says so, so nobody copies them into the
+ * fence, from where the import would move them to the page a second time.
+ */
+async function outlineSwitchedOff(narratorId: string): Promise<boolean> {
+	if (isOutlineEnabled()) return false;
+	if ((await readTaskSession(narratorId))?.backend !== "outline") return false;
+	const { findSessionSpace } = await import("../services/outline/spaces");
+	const { findBehaviorPage } = await import("../services/task-source/outline-behavior");
+	const space = await findSessionSpace(narratorId);
+	return space ? (await findBehaviorPage(space.id)) !== null : false;
+}
+
+/** An outline session's old fence is not editable in the panel (see `outlineBehaviorOf`). */
+function panelEditable(path: string, uiEditable: boolean, outline: boolean): boolean {
+	return outline && path === "behavior_fence" ? false : uiEditable;
+}
 
 /**
  * Access gate for the spec surface.
@@ -30,15 +69,19 @@ specRoutes.use("/:id/spec/*", async (c, next) => {
 specRoutes.get("/:id/spec/files", async (c) => {
 	const narratorId = c.req.param("id");
 	const files = await specVfsService.listSpecFiles(narratorId);
+	const outlineBehavior = await outlineBehaviorOf(narratorId);
+	const switchedOff = outlineBehavior ? false : await outlineSwitchedOff(narratorId);
 	return c.json({
 		files: files.map((f) => ({
 			path: f.path,
 			uri: f.uri,
 			readonly: f.readonly,
-			uiEditable: f.uiEditable,
+			uiEditable: panelEditable(f.path, f.uiEditable, outlineBehavior !== null),
 			builtin: f.builtin,
 			revisionId: f.revisionId ?? null,
 		})),
+		...(outlineBehavior ? { outlineBehavior } : {}),
+		...(switchedOff ? { outlineSwitchedOff: true } : {}),
 	});
 });
 
@@ -51,12 +94,14 @@ specRoutes.get("/:id/spec/file", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const file = await specVfsService.readSpecFile(narratorId, parsed.data.uri);
+	const outline =
+		file.path === "behavior_fence" && (await readTaskBackend(narratorId)) === "outline";
 	return c.json({
 		path: file.path,
 		uri: file.uri,
 		content: file.content,
 		readonly: file.readonly,
-		uiEditable: file.uiEditable,
+		uiEditable: panelEditable(file.path, file.uiEditable, outline),
 		builtin: file.builtin,
 		revisionId: file.revisionId ?? null,
 	});

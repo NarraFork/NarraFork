@@ -279,6 +279,11 @@ export class LiveClient {
 		resyncs: 0,
 	};
 	log: string[] = [];
+	/**
+	 * The last refusal from the page, with who is doing the task when that was the reason
+	 * (`claimed`; shown by the editor later). Unknown fields of a newer server are kept as is.
+	 */
+	lastReject: LiveRejectHead | null = null;
 
 	private handle: number | null = null;
 	private n = 0;
@@ -617,7 +622,9 @@ export class LiveClient {
 			})();
 		if (hunks.length === 0) return null;
 		this.doc.transact(() => {
-			for (const h of [...hunks].sort((x, y) => y.start - x.start)) {
+			// Last first, so earlier offsets hold; hunks at one offset in reverse too (an insertion
+			// before a deletion there must be applied after it), as `applyHunks` reads them.
+			for (const h of [...hunks].sort((x, y) => x.start - y.start).reverse()) {
 				if (h.end > h.start) t.delete(h.start, h.end - h.start);
 				if (h.text) t.insert(h.start, h.text);
 			}
@@ -1008,7 +1015,11 @@ export class LiveClient {
 				if (!this.resetting) this.onBatch(frame.n, frame.head as LiveBatchHead | null, frame.body);
 				break;
 			case LIVE_FRAME.reject:
-				if (!this.resetting) this.onReject(frame.n, (frame.head as LiveRejectHead | null)?.code);
+				if (!this.resetting) {
+					const head = frame.head as LiveRejectHead | null;
+					this.lastReject = head;
+					this.onReject(frame.n, head?.code);
+				}
 				break;
 			case LIVE_FRAME.presence:
 				if (!this.resetting) this.onPresence(frame.head as LivePresenceDown);

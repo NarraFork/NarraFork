@@ -1,3 +1,4 @@
+import { isMediaContentBlock, type MediaRef } from "@shared/media-attachments";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { contextUpdateOf } from "@shared/prefix-context";
 import { buildHistory, resolveHistoryToolLoadingStrategy } from "../../lib/agent";
@@ -49,6 +50,8 @@ export interface RuntimeHistoryOptions {
 	sourceMessages?: readonly RuntimeHistoryMessage[];
 	/** Already accepted current input, with its original principal/attachment barrier. */
 	currentInput?: string;
+	/** Portable current refs; canonical persisted rows retain their own media blocks. */
+	currentMedia?: MediaRef[];
 	/** Explicit server-local cwd only; never a remote workspace path. */
 	attachmentCwd?: string;
 	attachmentSignal?: AbortSignal;
@@ -79,6 +82,8 @@ export interface PreparedRuntimeHistory extends BuiltHistory {
 	modelMessages: RuntimeHistoryMessage[];
 	/** Current input no persisted row carries; empty when `history` already holds it. */
 	currentText: string;
+	/** Refs not already owned by the accepted current row, for a separate current lane. */
+	currentMedia?: MediaRef[];
 	/** Projected caller packet only, for a subagent whose initial history is already prepared. */
 	currentInputText: string;
 	/** Whether a persisted row (now part of `history`) carries the current input. */
@@ -347,6 +352,18 @@ export async function buildRuntimeHistory(
 	// The history carries every persisted row, the current input included; only text no
 	// row holds is still sent as the request's current content.
 	const current = projectCurrentInput(modelMessages, currentInput ?? "");
+	const accepted = findCurrentSenderMessage(modelMessages);
+	const acceptedBlocks = Array.isArray(accepted?.contentJson) ? accepted.contentJson : [];
+	const currentMedia = options.currentMedia?.filter(
+		(ref) =>
+			!acceptedBlocks.some(
+				(block) =>
+					isMediaContentBlock(block) &&
+					block.mediaId === ref.mediaId &&
+					(block.uploadNarratorId || accepted?.narratorId || options.narratorId) ===
+						(ref.uploadNarratorId || options.narratorId),
+			),
+	);
 	const tail = historyTail(modelMessages);
 	return {
 		...built,
@@ -356,6 +373,7 @@ export async function buildRuntimeHistory(
 		currentInputText: current.text,
 		currentText: current.persisted ? "" : current.text,
 		currentInputPersisted: current.persisted,
+		currentMedia: currentMedia?.length ? currentMedia : undefined,
 		endsWithToolResults: tail.toolResults,
 		endsWithInput: tail.input,
 		...(toolLoadingState ? { toolLoading: toolLoadingState } : {}),

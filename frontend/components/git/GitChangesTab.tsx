@@ -20,7 +20,6 @@ import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
-	IconCopy,
 	IconFilter,
 	IconFilterOff,
 	IconFolder,
@@ -33,7 +32,6 @@ import {
 } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useClipboard } from "../../hooks/useClipboard";
 import {
 	type CurrentDiffTarget,
 	useGitAiCommitMessage,
@@ -162,7 +160,6 @@ export function GitChangesTab({
 	const commit = useGitCommit(target);
 	const discard = useGitDiscard(target);
 	const aiMsg = useGitAiCommitMessage(target);
-	const clipboard = useClipboard({ timeout: 1500 });
 	const { mode: viewMode, setMode: setViewMode } = useGitViewMode(preferenceKey);
 
 	const [message, setMessage] = useState("");
@@ -374,36 +371,11 @@ export function GitChangesTab({
 
 			<Group gap={6} px="xs" py={6} wrap="nowrap" style={{ flexShrink: 0 }}>
 				{/* Counts live on the section headers below; this title is just the panel name. */}
-				<Text size="sm" fw={600} style={{ flexShrink: 0, flexGrow: status.branch ? 0 : 1 }}>
+				<Text size="sm" fw={600} style={{ flexShrink: 0 }}>
 					{t("panel.changes")}
 				</Text>
 				<GitLineStatsSummary {...lineStats} compact />
-				{status.branch && (
-					<Group gap={2} wrap="nowrap" justify="flex-end" style={{ flex: 1, minWidth: 0 }}>
-						<Text
-							size="xs"
-							c="dimmed"
-							ff="monospace"
-							truncate
-							title={status.branch}
-							style={{ minWidth: 0, flexShrink: 1, userSelect: "text" }}
-						>
-							{status.branch}
-						</Text>
-						<Tooltip label={clipboard.copied ? t("panel.branchCopied") : t("panel.copyBranch")}>
-							<ActionIcon
-								variant="subtle"
-								color={clipboard.copied ? "green" : "gray"}
-								size="sm"
-								aria-label={t("panel.copyBranch")}
-								style={{ flexShrink: 0 }}
-								onClick={() => clipboard.copy(status.branch)}
-							>
-								{clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-							</ActionIcon>
-						</Tooltip>
-					</Group>
-				)}
+				<Box style={{ flex: 1, minWidth: 0 }} />
 				<Button.Group style={{ flexShrink: 0 }}>
 					<Button
 						size="compact-xs"

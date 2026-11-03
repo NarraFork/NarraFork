@@ -296,6 +296,12 @@
 	white-space: nowrap;
 }
 
+/* A text of a pending change's diff: as written, wrapped anywhere. */
+.diffText {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
 /*
  * The live editor: the page stops scrolling as a whole; the editor's frame (the outline and the
  * mind map on top of each other, `edit-surface.ts`) fills what is left between the toolbar and

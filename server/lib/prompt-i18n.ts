@@ -17,6 +17,36 @@ export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
 export type {
+	OutlineCompactNote,
+	OutlineTaskPromptTask,
+	OutlineTasksViewSection,
+	OutlineTaskWaitText,
+	OutlineViewTask,
+} from "./prompts/outline-tasks";
+export {
+	getOutlineBehaviorFenceTruncated,
+	getOutlineBehaviorForkCutNote,
+	getOutlineBehaviorPageTitle,
+	getOutlineBehaviorViewFence,
+	getOutlineBehaviorViewHeading,
+	getOutlineBehaviorViewPage,
+	getOutlineBehaviorViewSop,
+	getOutlineBehaviorViewTruncated,
+	getOutlineBoundedContinuationPrompt,
+	getOutlineCompactContext,
+	getOutlineCompactNoteLine,
+	getOutlineCompactTaskLine,
+	getOutlineContinuationPrompt,
+	getOutlineInterruptNote,
+	getOutlineSpecUnavailableHint,
+	getOutlineTaskSystemReminder,
+	getOutlineTasksViewHeading,
+	getOutlineTasksViewMore,
+	getOutlineTasksViewSection,
+	getOutlineTurnEndNote,
+	getOutlineViewTaskLine,
+} from "./prompts/outline-tasks";
+export type {
 	SetupAuthorization,
 	SetupAuthorizationResolution,
 	SetupBriefingDependency,

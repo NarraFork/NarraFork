@@ -34,7 +34,12 @@ import type {
 	OutlineCommitKind,
 	OutlineLinkKind,
 	OutlineLinkTargetKind,
+	OutlinePendingDeciderJson,
+	OutlinePendingKind,
+	OutlinePendingRequesterJson,
+	OutlinePendingStatus,
 	OutlineSpaceKind,
+	OutlineTaskActorRef,
 	OutlineTaskJson,
 } from "../model";
 import type { OutlineReadPort } from "./read-port";
@@ -54,6 +59,11 @@ export interface OutlineSpaceRow {
 	ownerUserId: string | null;
 	nextSeq: number;
 	createdAt: string;
+	/**
+	 * Generation of the space's in-process answers (`outline_spaces.in_process_epoch`): moves when
+	 * the background rebuild rewrites them. A commit is planned against it as against `nextSeq`.
+	 */
+	inProcessEpoch: number;
 }
 
 export interface OutlineBlockRow {
@@ -71,6 +81,11 @@ export interface OutlineBlockRow {
 	authorId: string;
 	versionSeq: number;
 	deleted: boolean;
+	/**
+	 * Derived cache: the block is process (a task, under a task, or in a session space). Not part
+	 * of the block's versions; kept in step by the write path (see `outline_blocks`).
+	 */
+	inProcess: boolean;
 }
 
 /** A block without its content and author: what planning a write needs. */
@@ -146,6 +161,141 @@ export interface OutlineViewStateRow {
 	updatedAt: string;
 }
 
+/**
+ * Who is doing a task (`outline_task_claims`). Held by a session (`holderNarratorId`, with a
+ * lease until `expiresAt`), by a person (`holderUserId`, no lease) or by nobody (both null: the
+ * claim was released; `epoch` still counts, and `lastHolder*` say who held it last).
+ */
+export interface OutlineTaskClaimRow {
+	taskBlockId: string;
+	holderNarratorId: string | null;
+	holderUserId: string | null;
+	/** Claim generation: grows by one whenever the task is claimed by someone new. */
+	epoch: number;
+	/** The task block's `version_seq` right after the claiming commit. */
+	taskVersionAtClaim: number;
+	claimedAt: string;
+	/** End of a session's lease (ISO time); null for a person's claim and a released one. */
+	expiresAt: string | null;
+	/** Who held it when it was last released; null while it is held. */
+	lastHolderNarratorId: string | null;
+	lastHolderUserId: string | null;
+}
+
+/**
+ * A change waiting for someone's confirmation (`outline_pending`, design §2.6). `opsJson` holds
+ * the write path's operations (`OutlineOp`, typed where they are built: `pending.ts`).
+ */
+export interface OutlinePendingRow {
+	id: string;
+	spaceId: string;
+	kind: OutlinePendingKind;
+	status: OutlinePendingStatus;
+	pageId: string;
+	/** The lock's root (a `locked_plan`). */
+	rootBlockId: string | null;
+	opsJson: Array<Record<string, unknown>>;
+	/** How many operations `opsJson` holds. */
+	opCount: number;
+	/** Each existing block's `version_seq` its proposed change was computed against, by id. */
+	baseJson: Record<string, number>;
+	/** For each block the change deletes: the live blocks under it and their versions then. */
+	subtreeJson: Record<string, Record<string, number>>;
+	/** The existing blocks the change targets: what waits for confirmation. */
+	blockIdsJson: string[];
+	/** The blocks the change adds: their sids and parents. */
+	addsJson: Array<{ sid: string; parentId: string | null }>;
+	summary: string;
+	requestedByJson: OutlinePendingRequesterJson;
+	/** The proposer's session (a subagent's root). */
+	requesterSession: string | null;
+	deciderJson: OutlinePendingDeciderJson;
+	deciderUserId: string | null;
+	/** Grows with every merge into the row. */
+	rev: number;
+	createdAt: string;
+	updatedAt: string;
+	decidedAt: string | null;
+	decidedByJson: OutlineTaskActorRef | null;
+	decisionCommitId: string | null;
+	reason: string | null;
+	/** When the proposer was shown the decision; null while it has not been. */
+	reportedAt: string | null;
+}
+
+/**
+ * A pending change without its operations and deleted subtrees (up to hundreds of KiB): what
+ * lists, summaries, marks and waits read. The operations are read by id (`getPending`), for the
+ * reader's own changes, a diff, a confirmation.
+ */
+export type OutlinePendingHead = Omit<OutlinePendingRow, "opsJson" | "subtreeJson">;
+
+/** A decision on a pending change: written only while it is open and at `expectRev`. */
+export interface OutlinePendingDecision {
+	id: string;
+	expectRev: number;
+	status: Exclude<OutlinePendingStatus, "open">;
+	decidedAt: string;
+	decidedBy: OutlineTaskActorRef;
+	/** The `confirm` commit (set by the store from the plan's commit when written with one). */
+	decisionCommitId: string | null;
+	reason: string | null;
+	/** Set when the proposer need not be told (it withdrew the change itself). */
+	reportedAt: string | null;
+}
+
+/** What a write does to pending changes, in the same atomic section as its commit (if any). */
+export interface OutlinePendingPlan {
+	/**
+	 * A proposal: a new row (`expectRev` null; the open-proposer unique index turns a concurrent
+	 * twin into a `WriteConflictError`), or the open row read at `expectRev` with the proposal
+	 * merged into it.
+	 */
+	put?: { row: OutlinePendingRow; expectRev: number | null };
+	/** A decision (a confirmation written with its `confirm` commit). */
+	decide?: OutlinePendingDecision;
+	/**
+	 * Lock roots whose lock this commit removes (unlocked, relocked by someone else, deleted):
+	 * their open changes are withdrawn, whoever proposed them.
+	 */
+	withdraw?: {
+		rootBlockIds: string[];
+		decidedAt: string;
+		decidedBy: OutlineTaskActorRef;
+		reason: string;
+	};
+	/** Locked tasks this commit moves to another page: their open changes follow them. */
+	repage?: Array<{ rootBlockId: string; pageId: string }>;
+}
+
+/** The pending rows a plan expects to find as read (`put` merged into, `decide`), by id. */
+export function expectedPendingRevs(pending: OutlinePendingPlan | undefined): Map<string, number> {
+	const out = new Map<string, number>();
+	if (pending?.put && pending.put.expectRev !== null)
+		out.set(pending.put.row.id, pending.put.expectRev);
+	if (pending?.decide) out.set(pending.decide.id, pending.decide.expectRev);
+	return out;
+}
+
+/** Whether the pending rows found (by id) are open at the revisions the plan expects. */
+export function pendingAsExpected(
+	pending: OutlinePendingPlan | undefined,
+	found: ReadonlyMap<string, { status: string; rev: number }>,
+): boolean {
+	for (const [id, rev] of expectedPendingRevs(pending)) {
+		const row = found.get(id);
+		if (!row || row.status !== "open" || row.rev !== rev) return false;
+	}
+	return true;
+}
+
+/** The creation version of a block: the seq and commit of its first version. */
+export interface OutlineFirstVersion {
+	blockId: string;
+	fromSeq: number;
+	commitId: string;
+}
+
 /** The space a project, a user or a narrator owns. */
 export type OutlineSpaceScope =
 	| { kind: "project"; projectId: string }
@@ -173,6 +323,36 @@ export type OutlineBlockPatch = Partial<
 	>
 >;
 
+/** One claim the commit writes, taken from the row the plan read. */
+export interface OutlineClaimWrite {
+	row: OutlineTaskClaimRow;
+	/**
+	 * The claim as the plan read it (null: there was no row). The section writes only if the row
+	 * still is exactly that: a session may have renewed its lease since, which changes whether
+	 * the plan's takeover was allowed.
+	 */
+	expect: OutlineTaskClaimRow | null;
+}
+
+/** What a commit does to `outline_task_claims`; see {@link OutlineCommitPlan}. */
+export interface OutlineClaimPlan {
+	/** Claims taken, taken over, or (a session's own) renewed or passed within its session. */
+	put: OutlineClaimWrite[];
+	/**
+	 * Tasks that left in progress (or were deleted): released whatever they hold now, the holder
+	 * moving into `lastHolder*`.
+	 */
+	release: string[];
+	/** Lease expiries: released only while the claim is still exactly the row read (`expect`). */
+	expire: Array<{ expect: OutlineTaskClaimRow }>;
+	/**
+	 * Claim rows a decision of the plan rests on without writing them in `put` or `expire` (a
+	 * session ending a task nobody else was holding): the commit is written only while each is
+	 * still exactly as read (null: no row).
+	 */
+	verify: Array<{ taskBlockId: string; expect: OutlineTaskClaimRow | null }>;
+}
+
 /**
  * Everything one commit writes, already decided. Applied in this order inside one atomic
  * section:
@@ -183,12 +363,32 @@ export type OutlineBlockPatch = Partial<
  *      (deletions first), so an alias can move between blocks within one commit;
  *   4. insert `insertBlocks`;
  *   5. open one version per block in `versions`, copied from the block's new row;
- *   6. close `closeLinkIds`, insert `insertLinks`.
+ *   6. close `closeLinkIds`, insert `insertLinks`;
+ *   7. set `in_process` of the blocks in `inProcess` (no version: it is a derived cache); with
+ *      `inProcessStale`, mark the space's in-process answers as not derived
+ *      (`in_process_ready` false) for the background rebuild;
+ *   8. write `claims`;
+ *   9. write `pending`: withdraw, repage, then decide (its `decisionCommitId` is the commit's
+ *      id), then put (insert, or update the row merged into).
+ *
+ * Step 1 claims `next_seq`, and `in_process_epoch` with it when the plan names one. Before it the
+ * section checks that every claim row `claims` expects (`put`, `expire`, `verify`) is still as
+ * read; when one is not, it writes nothing and rejects with {@link OutlineClaimsMovedError}. Then
+ * that every pending row `pending` expects is open at the revision read; when one is not, it
+ * writes nothing and rejects with {@link OutlinePendingMovedError}. (PostgreSQL locks the claim
+ * rows, then the pending rows, then the space row, in that order.)
  */
 export interface OutlineCommitPlan {
 	spaceId: string;
 	/** The space's `next_seq` the plan was computed against; becomes the commit's seq. */
 	seq: number;
+	/**
+	 * The space's `in_process_epoch` the plan's in-process answers were computed from: claimed
+	 * together with `seq`, so a plan that read answers the rebuild has since rewritten is stale.
+	 * Null when the plan read none (it writes none either): the epoch does not matter to it, and
+	 * a rebuild running meanwhile does not send it round again.
+	 */
+	inProcessEpoch: number | null;
 	commit: OutlineCommitRow;
 	/** Existing blocks that get a new version: exactly the non-inserted blocks in `versions`. */
 	closeVersionIds: string[];
@@ -201,6 +401,19 @@ export interface OutlineCommitPlan {
 	closeLinkIds: string[];
 	/** New link rows, `fromSeq` = `seq`, `toSeq` null. */
 	insertLinks: OutlineLinkRow[];
+	/** Existing blocks whose `in_process` changes (new blocks carry it in their row). */
+	inProcess: Array<{ ids: string[]; value: boolean }>;
+	/**
+	 * Some answers this commit changes are not in `inProcess` (they did not fit the row limit):
+	 * the space goes back to "not derived" until the background rebuild has run.
+	 */
+	inProcessStale: boolean;
+	claims: OutlineClaimPlan;
+	/**
+	 * Pending changes written with the commit (step 9): a proposal held back from it, the
+	 * decision a confirmation makes, the changes an unlock withdraws.
+	 */
+	pending?: OutlinePendingPlan;
 }
 
 /**
@@ -215,6 +428,153 @@ export class OutlineStaleWriteError extends Error {
 		super(`outline space ${spaceId} moved past seq ${expectedSeq} while the write was planned`);
 		this.name = "OutlineStaleWriteError";
 	}
+}
+
+/**
+ * A claim the plan read changed before the commit was written (a session renewed its lease).
+ * Nothing was written; plan again. A kind of stale write, so callers that re-plan on one re-plan
+ * on this too.
+ */
+export class OutlineClaimsMovedError extends OutlineStaleWriteError {
+	constructor(spaceId: string, expectedSeq: number) {
+		super(spaceId, expectedSeq);
+		this.message = `a task claim in outline space ${spaceId} changed while the write was planned`;
+		this.name = "OutlineClaimsMovedError";
+	}
+}
+
+/**
+ * A pending row the plan read changed before the write (another proposal merged into it, or it
+ * was decided). Nothing was written; plan again. A kind of stale write.
+ */
+export class OutlinePendingMovedError extends OutlineStaleWriteError {
+	constructor(spaceId: string, expectedSeq: number) {
+		super(spaceId, expectedSeq);
+		this.message = `a pending change in outline space ${spaceId} changed while the write was planned`;
+		this.name = "OutlinePendingMovedError";
+	}
+}
+
+/** Whether a claim row is exactly the one expected (null: no row). */
+export function sameClaimRow(
+	a: OutlineTaskClaimRow | null | undefined,
+	b: OutlineTaskClaimRow | null | undefined,
+): boolean {
+	if (!a || !b) return !a && !b;
+	return (
+		a.taskBlockId === b.taskBlockId &&
+		a.holderNarratorId === b.holderNarratorId &&
+		a.holderUserId === b.holderUserId &&
+		a.epoch === b.epoch &&
+		a.taskVersionAtClaim === b.taskVersionAtClaim &&
+		a.claimedAt === b.claimedAt &&
+		a.expiresAt === b.expiresAt &&
+		a.lastHolderNarratorId === b.lastHolderNarratorId &&
+		a.lastHolderUserId === b.lastHolderUserId
+	);
+}
+
+/**
+ * Ids of the claim rows a commit locks before the space row (PostgreSQL), sorted: those it
+ * expects to find as read and those it releases without checking (a person ending someone else's
+ * task), so a commit never takes a claim row after the space row and never waits in a cycle
+ * with a writer that took them in the other order.
+ */
+export function lockedClaimIds(plan: OutlineCommitPlan): string[] {
+	return [...new Set([...expectedClaimIds(plan), ...plan.claims.release])].sort();
+}
+
+/** Ids of the claim rows a plan expects to find as read, sorted (the order rows are locked in). */
+export function expectedClaimIds(plan: OutlineCommitPlan): string[] {
+	const ids = [
+		...plan.claims.put.map((w) => w.row.taskBlockId),
+		...plan.claims.expire.map((e) => e.expect.taskBlockId),
+		...plan.claims.verify.map((v) => v.taskBlockId),
+	];
+	return [...new Set(ids)].sort();
+}
+
+/** Whether the claim rows found (by task id) are what the plan expects. */
+export function claimsAsExpected(
+	plan: OutlineCommitPlan,
+	found: ReadonlyMap<string, OutlineTaskClaimRow>,
+): boolean {
+	if (!writesAsExpected(plan.claims.put, found)) return false;
+	for (const expiry of plan.claims.expire) {
+		if (!sameClaimRow(found.get(expiry.expect.taskBlockId) ?? null, expiry.expect)) return false;
+	}
+	for (const check of plan.claims.verify) {
+		if (!sameClaimRow(found.get(check.taskBlockId) ?? null, check.expect)) return false;
+	}
+	return true;
+}
+
+/** Whether the claim rows found (by task id) are the ones each write expects. */
+export function writesAsExpected(
+	writes: readonly OutlineClaimWrite[],
+	found: ReadonlyMap<string, OutlineTaskClaimRow>,
+): boolean {
+	for (const write of writes) {
+		if (!sameClaimRow(found.get(write.row.taskBlockId) ?? null, write.expect)) return false;
+	}
+	return true;
+}
+
+/** A task in progress that nobody holds, as the lease job finds it. */
+export interface OutlineUnclaimedTask {
+	blockId: string;
+	spaceId: string;
+	/** Its claim row (released), or null when it never had one (written before claims existed). */
+	claim: OutlineTaskClaimRow | null;
+}
+
+/** The session a narrator belongs to (`getNarratorRoots`). */
+export interface OutlineNarratorSession {
+	/** A subagent's root; anyone else's own id. */
+	root: string;
+	/** The narrator itself is archived. */
+	archived: boolean;
+	/** The session it belongs to is archived (for a session, the same as `archived`). */
+	sessionArchived: boolean;
+}
+
+/** What `getNarratorRoots` reads of a narrator. */
+export interface NarratorStateRow {
+	id: string;
+	type: string;
+	root: string | null;
+	status: string;
+}
+
+/**
+ * Sessions of the narrators read (`rows`), reading the roots not among them with `readRoots`
+ * (primary keys): the store-independent half of `getNarratorRoots`.
+ */
+export async function narratorSessions(
+	rows: readonly NarratorStateRow[],
+	readRoots: (ids: string[]) => NarratorStateRow[] | Promise<NarratorStateRow[]>,
+): Promise<Map<string, OutlineNarratorSession>> {
+	const known = new Map(rows.map((r) => [r.id, r]));
+	const rootOf = (r: NarratorStateRow) => (r.type === "subagent" && r.root ? r.root : r.id);
+	const missing = [...new Set(rows.map(rootOf))].filter((id) => !known.has(id));
+	if (missing.length > 0) for (const r of await readRoots(missing)) known.set(r.id, r);
+	const out = new Map<string, OutlineNarratorSession>();
+	for (const r of rows) {
+		const root = rootOf(r);
+		const archived = r.status === "archived";
+		out.set(r.id, {
+			root,
+			archived,
+			sessionArchived: root === r.id ? archived : known.get(root)?.status === "archived",
+		});
+	}
+	return out;
+}
+
+/** A task a session holds a claim on, with the task's block. */
+export interface OutlineClaimedTask {
+	claim: OutlineTaskClaimRow;
+	block: OutlineBlockMeta;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,6 +637,179 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	/** Write one commit atomically; see {@link OutlineCommitPlan} and the header contract. */
 	applyCommit(plan: OutlineCommitPlan): Promise<void>;
 
+	// ── tasks (`services/outline/tasks.ts`) ─────────────────────────────────────────────
+	// Claims are written by `applyCommit`, and outside a commit only by a session renewing its own
+	// leases (`renewTaskClaims`, `updateTaskClaims`) and handing a subagent's claims to its root
+	// (`handOverTaskClaims`). Every read is one indexed statement (or one per chunk of ids) with a
+	// limit.
+
+	/** Claim rows of the given task blocks (released ones included). */
+	getTaskClaims(blockIds: readonly string[]): Promise<OutlineTaskClaimRow[]>;
+	/**
+	 * Tasks a session holds a claim on (lease running or not), with their blocks, at most
+	 * `limit`, oldest claim first.
+	 */
+	listClaimedTasks(narratorId: string, limit: number): Promise<OutlineClaimedTask[]>;
+	/**
+	 * Live open tasks (to do or in progress) of a space, unordered, at most `limit`, leaving out
+	 * the blocks of `excludePageIds` before the limit applies (a session's behavior page: its
+	 * checkboxes are rules, and must not use up the scan).
+	 */
+	listOpenTasks(
+		spaceId: string,
+		limit: number,
+		options?: { excludePageIds?: readonly string[] },
+	): Promise<OutlineBlockMeta[]>;
+	/**
+	 * Session claims whose lease ended at or before `now`, oldest first, at most `limit`, with the
+	 * space of the task.
+	 */
+	listExpiredTaskClaims(
+		now: string,
+		limit: number,
+	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
+	/**
+	 * Claims held by a session or by one of its subagents (`acl_root_narrator_id` is the session),
+	 * whatever their lease, oldest claim first, at most `limit`, with the space of the task: what
+	 * archiving or deleting the session releases. Two indexed reads (the session's own claims,
+	 * its subagents' through the narrators' root index), each with the limit.
+	 */
+	listSessionTaskClaims(
+		narratorId: string,
+		limit: number,
+	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
+	/**
+	 * Move the lease of the claims a session holds (at most {@link OUTLINE_RENEW_LIMIT}) to
+	 * `expiresAt`; returns how many. Rows are locked in task id order, as a commit locks them.
+	 */
+	renewTaskClaims(narratorId: string, expiresAt: string): Promise<number>;
+	/**
+	 * Write claim rows outside a commit (a session renewing its own lapsed lease, or taking over
+	 * one within its session, without changing a block), atomically and only while every row is
+	 * still exactly the one `expect` names. Returns false, having written nothing, otherwise.
+	 * Rows are locked in task id order, as a commit locks them.
+	 */
+	updateTaskClaims(writes: readonly OutlineClaimWrite[]): Promise<boolean>;
+	/**
+	 * Move the claims `fromNarratorId` holds (at most {@link OUTLINE_RENEW_LIMIT}) to
+	 * `toNarratorId`, with a lease until `expiresAt`: a subagent's run ended and its root takes
+	 * over what it was doing. Returns how many. Rows are locked in task id order.
+	 */
+	handOverTaskClaims(
+		fromNarratorId: string,
+		toNarratorId: string,
+		expiresAt: string,
+	): Promise<number>;
+	/**
+	 * Live tasks in progress that nobody holds (no claim row, or a released one), found among at
+	 * most `scan` tasks in progress by id after `after` (the in-progress index). `next` is where
+	 * the following scan starts, null once the end was reached.
+	 */
+	listUnclaimedDoingTasks(options: {
+		after: string | null;
+		scan: number;
+	}): Promise<{ tasks: OutlineUnclaimedTask[]; next: string | null }>;
+	/**
+	 * The session each narrator belongs to: a subagent's root (`acl_root_narrator_id`, the one
+	 * authority on it), anyone else's own id; and whether it or that session is archived.
+	 * Narrators that do not exist are left out. Primary-key reads: one per chunk of ids, and one
+	 * per chunk of roots not among them.
+	 */
+	getNarratorRoots(narratorIds: readonly string[]): Promise<Map<string, OutlineNarratorSession>>;
+	/**
+	 * Distinct sessions holding claims, by id after `after`, at most `limit` (the holder index,
+	 * read in order): the lease job's sweep for claims of sessions that ended while nobody was
+	 * listening. `next` is where the following sweep starts, null once the end was reached.
+	 */
+	listTaskClaimHolders(options: {
+		after: string | null;
+		limit: number;
+	}): Promise<{ holders: string[]; next: string | null }>;
+
+	/** Of the given spaces: whether their `in_process` answers are derived, and their epoch. */
+	getInProcessState(
+		spaceIds: readonly string[],
+	): Promise<Map<string, { ready: boolean; epoch: number }>>;
+	/**
+	 * Whether a commit of the space after `afterSeq` changed anything an in-process answer
+	 * depends on (a version with a change flag in `flags`: creation, move, deletion, restore,
+	 * task, page). Text-only commits do not count. Looks at no more than `maxCommits` commits:
+	 * more than that counts as a change. Indexed, stops at the first match.
+	 */
+	hasChangesSince(
+		spaceId: string,
+		afterSeq: number,
+		flags: number,
+		maxCommits: number,
+	): Promise<boolean>;
+
+	// ── in-process rebuild (`services/outline/in-process.ts`) ──────────────────────────
+
+	/**
+	 * Spaces whose blocks' `in_process` has not been derived yet
+	 * (`outline_spaces.in_process_ready`), by id (bytewise) after `after`, at most `limit`.
+	 */
+	listSpacesPendingInProcess(options: {
+		after?: string | null;
+		limit: number;
+	}): Promise<OutlineSpaceRow[]>;
+	/**
+	 * Set `in_process` of live blocks of a space (only rows that differ are written), atomically
+	 * and only while the space is still at `expectNextSeq` (no commit landed since the blocks were
+	 * read). `ready` also marks the space as derived. When it writes a row or the mark, the
+	 * space's `in_process_epoch` grows by one. Returns false, having written nothing, when the
+	 * space moved.
+	 */
+	setInProcess(
+		spaceId: string,
+		expectNextSeq: number,
+		values: { inProcess: readonly string[]; notInProcess: readonly string[]; ready?: boolean },
+	): Promise<boolean>;
+
+	// ── pending changes (`services/outline/pending.ts`) ─────────────────────────────────
+	// Written with a commit (`applyCommit`, the plan's `pending`), alone with the space counter as
+	// a guard (`applyPending`), or decided alone (`decidePending`). Every read is indexed and
+	// bounded.
+
+	/** Pending rows by id, whole. */
+	getPending(ids: readonly string[]): Promise<OutlinePendingRow[]>;
+	/** Open pending changes of a page (heads), oldest first, at most `limit`. */
+	listOpenPendingByPage(pageId: string, limit: number): Promise<OutlinePendingHead[]>;
+	/** Open pending changes of a space (heads), oldest first, at most `limit`. */
+	listOpenPendingBySpace(spaceId: string, limit: number): Promise<OutlinePendingHead[]>;
+	/** How many open pending changes a page has, counting at most `limit`. */
+	countOpenPendingByPage(pageId: string, limit: number): Promise<number>;
+	/** The open row a session has on a lock root, if any, whole. */
+	findOpenPending(requesterSession: string, rootBlockId: string): Promise<OutlinePendingRow | null>;
+	/**
+	 * Decisions on a session's changes on a page it has not been told of (heads), oldest first,
+	 * at most `limit` (the unreported index: open rows and other pages are not read).
+	 */
+	listUnreportedPending(
+		requesterSession: string,
+		pageId: string,
+		limit: number,
+	): Promise<OutlinePendingHead[]>;
+	/** Mark decided rows as shown to their proposer. */
+	markPendingReported(ids: readonly string[], at: string): Promise<void>;
+	/**
+	 * Write a plan's pending changes without a commit (a proposal with nothing written directly):
+	 * atomically, and only while the space's counter is still `seq` (no commit landed since the
+	 * plan's reads; the space row is held so none lands meanwhile) and every row it expects is as
+	 * read. Rejects like `applyCommit`: {@link OutlineStaleWriteError},
+	 * {@link OutlinePendingMovedError}, `WriteConflictError`.
+	 */
+	applyPending(plan: { spaceId: string; seq: number; pending: OutlinePendingPlan }): Promise<void>;
+	/** Write a decision alone (a rejection); false, writing nothing, when the row moved. */
+	decidePending(decision: OutlinePendingDecision): Promise<boolean>;
+	/**
+	 * The first version of each block (its creation: seq and commit), one primary-key probe
+	 * each. Blocks with no versions are left out.
+	 */
+	getFirstVersions(blockIds: readonly string[]): Promise<OutlineFirstVersion[]>;
+	/** Live locked blocks of a page (the partial lock index), at most `limit`. */
+	listLockedBlocks(pageId: string, limit: number): Promise<OutlineBlockMeta[]>;
+
 	// ── live session log (`services/outline/live/`) ─────────────────────────────────────
 	// Not part of a page's history: rows are written while a page is edited live and deleted
 	// once the session's text is committed. Each call is one small indexed statement or one
@@ -318,6 +851,9 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	putViewState(row: OutlineViewStateRow, keepPerUser: number): Promise<void>;
 }
 
+/** Claims one renewal moves at most. */
+export const OUTLINE_RENEW_LIMIT = 1000;
+
 /** Ids per `IN (…)` list, well under every engine's bound-parameter limit. */
 export const OUTLINE_SQL_CHUNK = 500;
 
@@ -325,4 +861,26 @@ export function chunked<T>(items: readonly T[], size = OUTLINE_SQL_CHUNK): T[][]
 	const out: T[][] = [];
 	for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
 	return out;
+}
+
+/**
+ * Claims read by several queries, as one list: oldest claim first (then by task id), each task
+ * once, at most `limit`.
+ */
+export function oldestClaimsFirst<T extends { claim: OutlineTaskClaimRow }>(
+	rows: readonly T[],
+	limit: number,
+): T[] {
+	const byTask = new Map(rows.map((row) => [row.claim.taskBlockId, row]));
+	return [...byTask.values()]
+		.sort((a, b) =>
+			a.claim.claimedAt !== b.claim.claimedAt
+				? a.claim.claimedAt < b.claim.claimedAt
+					? -1
+					: 1
+				: a.claim.taskBlockId < b.claim.taskBlockId
+					? -1
+					: 1,
+		)
+		.slice(0, limit);
 }

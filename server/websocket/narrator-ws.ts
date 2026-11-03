@@ -1,3 +1,4 @@
+import { ERROR_CATALOG } from "@shared/error-catalog";
 import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
@@ -62,6 +63,7 @@ import {
 	clearBufferedMessageSoftStopIfIdle,
 	clearBufferedMessages,
 	getBufferedMessagesAsync,
+	isOutlineSessionGoal,
 	pushBufferedMessage,
 	removeBufferedMessage,
 	resolveDecisionNarratorId,
@@ -501,6 +503,10 @@ export function* toolInputFrames(message: ToolInputChunkMessage): Generator<stri
 
 type InputLaneSocket = Pick<NarratorWS, "send" | "close" | "getBufferedAmount">;
 const INPUT_LANE_BACKLOG_BYTES = 256 * 1024;
+
+/** What a `/goal` queued over this socket for an outline session is answered with (English, as the
+ * socket's other errors; the HTTP admission carries the localized catalog code). */
+const OUTLINE_GOAL_REFUSAL = ERROR_CATALOG.GOAL_IN_OUTLINE_SESSION.en;
 
 export interface ToolInputFrameIdentity {
 	narratorId: string;
@@ -1774,6 +1780,11 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 		broadcastToNarrator(event.narratorId, event.message);
 	});
 
+	// No coordinator diagnostics cross the global channel; HTTP retains role checks.
+	eventBus.on("system:lifecycle_changed", () => {
+		broadcastToAll({ type: "system_lifecycle_changed" });
+	});
+
 	// Plugin lifecycle is global host state. Broadcast only an invalidation marker;
 	// clients must refetch the authenticated, bounded contribution snapshot instead
 	// of trusting a potentially stale payload carried over WS.
@@ -2128,6 +2139,12 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
+				// A session whose tasks live in the outline has no /goal yet (plan PR 5): refused
+				// before anything is queued, as the HTTP admission refuses it.
+				if (await isOutlineSessionGoal(msg.narratorId, bufferText, commandText)) {
+					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
+					break;
+				}
 				let { ok } = await pushBufferedMessage(
 					msg.narratorId,
 					bufferText,
@@ -2186,6 +2203,10 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_buffer": {
+				if (await isOutlineSessionGoal(msg.narratorId, msg.text)) {
+					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
+					break;
+				}
 				const ok = await updateBufferedMessage(msg.narratorId, msg.messageId, msg.text);
 				if (ok) await broadcastBufferQueueForNarrator(msg.narratorId);
 				break;

@@ -10,16 +10,29 @@
  * directory lives in the SQLite link index, which PostgreSQL does not have yet, and is covered in
  * `access.test.ts`.
  *
+ * Every space holds one marker block, so the `agent` group can check what the outline tools show
+ * a session of each kind (private, shared with people, project, public, shared by public link,
+ * subagent, without a project, past the reader cap; with and without the turn's person) against
+ * what the session may read: exactly the readable spaces are read, listed, searched and titled
+ * in links, and everything else answers exactly as something that does not exist. The `listing`
+ * group holds the session's listing of readable spaces to the same verdicts.
+ *
  * Cases return data rather than asserting, so a PostgreSQL run can report every mismatch from
  * inside the harness callback.
  */
 import { NotFoundError } from "@server/lib/errors";
 import { canAgentWriteSpace, canReadSpace, canWriteSpace, listReadableSpaces } from "../access";
-import { readNarratorTitle, readProjectName } from "../access-reads";
+import { outlineAccessBackend, readNarratorTitle, readProjectName } from "../access-reads";
+import { OUTLINE_ALL_SPACES, outlineRead, outlineSearch } from "../agent-read";
+import { OutlineAgentScope } from "../agent-scope";
+import { OUTLINE_TOOL_TEXT } from "../messages";
 import {
 	canSessionReadSpace,
 	getSessionReadScope,
 	invalidateSessionReadScopes,
+	listSessionReadableSpaces,
+	listSessionReadCandidates,
+	OUTLINE_SESSION_LIST_LIMITS,
 	OUTLINE_SESSION_READER_CAP,
 } from "../session-scope";
 import {
@@ -32,6 +45,7 @@ import {
 } from "../spaces";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
+import { writeOutline } from "../write";
 
 export type GrantPrincipal = { user: string } | { role: "user" | "admin" };
 
@@ -52,6 +66,11 @@ export interface AccessFixtures {
 		capability: "read" | "write" | "manage",
 	): Promise<void>;
 	shareLink(narratorId: string, options: { revoked: boolean; createdBy: string }): Promise<void>;
+	/**
+	 * File the narrator under a project by its working directory (the primary link). Only SQLite
+	 * resolves a session's project from it so far; PostgreSQL knows the explicit project alone.
+	 */
+	linkProject(narratorId: string, projectId: string): Promise<void>;
 	deleteProject(id: string): Promise<void>;
 	deleteUser(id: string): Promise<void>;
 }
@@ -64,8 +83,31 @@ export interface AccessWorld {
 	projects: Record<string, string>;
 	sessions: Record<string, string>;
 	spaces: Record<string, OutlineSpaceRow>;
+	/** The sid of the marker block of every space, by the space's label. */
+	markers: Record<string, string>;
+	/** The sid of a block in the `open` space linking to marker blocks and to nothing. */
+	links: string;
 	/** People admitted to the cap projects, one more than the cap. */
 	crowd: string[];
+}
+
+/** The word every marker block holds: `Zephyrine <label>.` */
+export const MARKER = "Zephyrine";
+
+const markerText = (label: string) => `${MARKER} ${label}.`;
+
+/** An address no space has. */
+const NOWHERE = "Nokey123/Zz9Zz9Zz";
+
+/** Write the marker block of a space, as a person (nobody's access is checked on this path). */
+async function writeMarker(space: OutlineSpaceRow, label: string, by: string): Promise<string> {
+	const r = await writeOutline({
+		spaceId: space.id,
+		ops: [{ op: "insert", parent: null, content: markerText(label) }],
+		actor: { kind: "human", id: by },
+		responsibleUserId: by,
+	});
+	return r.results[0]?.sid as string;
 }
 
 async function reread(space: OutlineSpaceRow): Promise<OutlineSpaceRow> {
@@ -134,7 +176,12 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 		otherOwnPriv: await session(owner, "private", main),
 		bobPriv: await session(bob, "private", null),
 		adminOwned: await session(admin, "private", main),
+		// Visible to a project only a grant to the `user` role opens: past the gate for everyone.
+		roleOpenVis: await session(carol, "project", projects.roleOpen),
+		// Visible to its project, which only its working directory names: Bob's private one.
+		linkedForeign: await session(bob, "project", null),
 	};
+	await fx.linkProject(sessions.linkedForeign, projects.foreign);
 	sessions.sub = await fx.narrator({ owner, visibility: "private", subagentOf: sessions.grantA });
 	sessions.subPriv = await fx.narrator({ owner, visibility: "private", subagentOf: sessions.priv });
 	sessions.orphanSub = await fx.narrator({ owner, visibility: "private", subagentOf: null });
@@ -159,9 +206,12 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 		"grantA",
 		"projectVis",
 		"publicVis",
+		"shared",
 		"otherOwnPriv",
 		"bobPriv",
 		"noProject",
+		"roleOpenVis",
+		"linkedForeign",
 	]) {
 		spaces[`session:${label}`] = await ensureSessionSpace(sessions[label]);
 	}
@@ -172,6 +222,24 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 	);
 	const departed = await fx.user("departed");
 	spaces.personalGone = await ensurePersonalSpace(departed);
+	// Marker blocks, written before the project and the user go.
+	const markers: Record<string, string> = {};
+	for (const [label, space] of Object.entries(spaces)) {
+		markers[label] = await writeMarker(space, label, owner);
+	}
+	const linkTargets = ["foreign", "main", "ownerOnly", "open", "session:priv", "personalOwner"];
+	const linkText = [
+		...linkTargets.map((label) => `[[${spaces[label]?.key}/${markers[label]}]]`),
+		`[[${NOWHERE}]]`,
+	].join(" ");
+	const links = (
+		await writeOutline({
+			spaceId: spaces.open.id,
+			ops: [{ op: "insert", parent: null, content: `Links ${linkText}` }],
+			actor: { kind: "human", id: carol },
+			responsibleUserId: carol,
+		})
+	).results[0]?.sid as string;
 	await fx.deleteProject(projects.gone);
 	await fx.deleteUser(departed);
 	spaces.gone = await reread(spaces.gone);
@@ -200,12 +268,13 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 	}
 	for (const label of ["capAtLimit", "capOver", "capTarget"]) {
 		spaces[label] = await ensureProjectSpace(projects[label]);
+		markers[label] = await writeMarker(spaces[label], label, owner);
 	}
-	return { people, projects, sessions, spaces, crowd };
+	return { people, projects, sessions, spaces, markers, links, crowd };
 }
 
 export interface AccessCase {
-	group: "spaces" | "person" | "session" | "cap" | "list";
+	group: "spaces" | "person" | "session" | "cap" | "list" | "listing" | "agent";
 	label: string;
 	expected: unknown;
 	actual: () => Promise<unknown>;
@@ -577,7 +646,263 @@ export function accessCases(world: AccessWorld): AccessCase[] {
 			return [...new Set(page.spaces.map((space) => space.kind))];
 		},
 	});
+	agentCases(world, cases);
 	return cases;
+}
+
+/** A session and the person its turn runs for (null: a routine or system turn). */
+type Turn = readonly [session: string, executing: Person | null];
+
+/** Every kind of session the read scope tells apart, in a turn of its owner unless noted. */
+const TURNS: readonly Turn[] = [
+	["priv", "owner"],
+	["priv", "alice"],
+	["priv", null],
+	["grantA", "owner"],
+	["grantBOutside", "owner"],
+	["grantAdmin", "owner"],
+	["roleUser", "owner"],
+	["roleAdmin", "owner"],
+	["projectVis", "owner"],
+	["projectOpenMain", "owner"],
+	["publicVis", "owner"],
+	["shared", "owner"],
+	["revokedShare", "owner"],
+	["noProject", "owner"],
+	["noProjectPublic", "owner"],
+	["sub", "owner"],
+	["subPriv", "owner"],
+	["orphanSub", "owner"],
+	["adminOwned", "admin"],
+	["capAtLimit", "owner"],
+	["capOver", "owner"],
+	["grantedOver", "owner"],
+];
+
+/**
+ * What sessions list and their agents read across spaces: the verdicts of
+ * `canSessionReadSpace` (pinned down case by case above) are what the listing and the outline
+ * tools must follow, and a space a session may not read must answer exactly like one that does
+ * not exist.
+ */
+function agentCases(world: AccessWorld, cases: AccessCase[]): void {
+	const { people, sessions, spaces, markers } = world;
+	const labelOf = new Map(Object.entries(spaces).map(([label, space]) => [space.id, label]));
+	const keyLabel = new Map(Object.entries(spaces).map(([label, space]) => [space.key, label]));
+	const userOf = (who: Person | null) => (who ? people[who] : null);
+	const verdicts = async ([name, who]: Turn): Promise<Map<string, boolean>> => {
+		const out = new Map<string, boolean>();
+		for (const [label, space] of Object.entries(spaces)) {
+			out.set(
+				label,
+				await canSessionReadSpace(sessions[name], space, { executingUserId: userOf(who) }),
+			);
+		}
+		return out;
+	};
+	const readable = (may: Map<string, boolean>) =>
+		[...may].filter(([, ok]) => ok).map(([label]) => label);
+	const scopeFor = ([name, who]: Turn) =>
+		OutlineAgentScope.open({ narratorId: sessions[name], userId: userOf(who) });
+
+	// Explicit expectations for a few, so the listing is not only held to the verdicts.
+	const explicit: Record<string, string[]> = {
+		"publicVis/owner": ["session:publicVis", "open", "roleOpen"],
+		"shared/owner": ["session:shared", "open", "roleOpen"],
+		"noProject/owner": ["session:noProject", "personalOwner"],
+		"noProjectPublic/owner": [],
+		"orphanSub/owner": [],
+		// Read by its owner alone, in a turn of someone else: all the owner reads, nothing personal.
+		"priv/alice": [
+			"session:priv",
+			"main",
+			"allMembers",
+			"ownerOnly",
+			"open",
+			"roleOpen",
+			"capAtLimit",
+			"capOver",
+			"capTarget",
+			"session:grantA",
+			"session:otherOwnPriv",
+			"session:projectVis",
+			"session:publicVis",
+			"session:shared",
+			"session:noProject",
+			"session:roleOpenVis",
+		],
+	};
+	/** The session whose space a session uses: its root, for a subagent. */
+	const rootOf: Record<string, string> = { sub: "grantA", subPriv: "priv" };
+
+	for (const turn of TURNS) {
+		const [name, who] = turn;
+		const label = `${name} (turn of ${who ?? "no user"})`;
+		const key = `${name}/${who ?? "none"}`;
+
+		cases.push({
+			group: "listing",
+			label: `${label} lists exactly the spaces it may read, its own first`,
+			expected: { complete: true, extra: [], missing: [], ownFirst: true, explicit: true },
+			actual: async () => {
+				const may = await verdicts(turn);
+				const listed = await listSessionReadableSpaces(sessions[name], {
+					executingUserId: userOf(who),
+					limit: OUTLINE_SESSION_LIST_LIMITS.maxSpaces,
+					maxCandidates: OUTLINE_SESSION_LIST_LIMITS.maxCandidates,
+				});
+				const seen = listed.spaces
+					.map((space) => labelOf.get(space.id))
+					.filter((l): l is string => l !== undefined);
+				const ownSession = `session:${rootOf[name] ?? name}`;
+				const want = explicit[key];
+				return {
+					complete: listed.complete,
+					extra: seen.filter((l) => !may.get(l)),
+					missing: readable(may).filter((l) => !seen.includes(l)),
+					ownFirst: !may.get(ownSession) || seen[0] === ownSession,
+					explicit: want === undefined || [...want].sort().join() === [...seen].sort().join(),
+				};
+			},
+		});
+
+		cases.push({
+			group: "listing",
+			label: `${label}: the candidates a listing judges cover every space it may read`,
+			expected: [],
+			actual: async () => {
+				const may = await verdicts(turn);
+				const candidates = await listSessionReadCandidates(sessions[name], {
+					executingUserId: userOf(who),
+					max: 10_000,
+				});
+				const ids = new Set(candidates.map((space) => space.id));
+				return readable(may).filter((l) => !ids.has(spaces[l]?.id as string));
+			},
+		});
+
+		cases.push({
+			group: "listing",
+			label: `${label}: a session filed by its working directory under a project it cannot pass is no candidate`,
+			expected: true,
+			actual: async () => {
+				const may = await verdicts(turn);
+				// PostgreSQL resolves no project from the working directory: no gate there.
+				if (outlineAccessBackend() === "postgres" || may.get("session:linkedForeign")) return true;
+				const candidates = await listSessionReadCandidates(sessions[name], {
+					executingUserId: userOf(who),
+					max: 10_000,
+				});
+				return !candidates.some((space) => space.id === spaces["session:linkedForeign"]?.id);
+			},
+		});
+
+		cases.push({
+			group: "agent",
+			label: `${label} reads, lists and searches by key exactly what it may; the rest answers as nothing`,
+			expected: [],
+			actual: async () => {
+				const may = await verdicts(turn);
+				const scope = await scopeFor(turn);
+				const problems: string[] = [];
+				for (const [spaceLabel, space] of Object.entries(spaces)) {
+					const ok = may.get(spaceLabel) === true;
+					const address = `${space.key}/${markers[spaceLabel]}`;
+					const read = await outlineRead(scope, { address });
+					const shown = !read.isError && read.output.includes(markerText(spaceLabel));
+					if (shown !== ok) problems.push(`${spaceLabel}: read shows ${shown}, may ${ok}`);
+					if (!ok && read.output !== OUTLINE_TOOL_TEXT.notFound(address)) {
+						problems.push(`${spaceLabel}: read of what it may not read answers otherwise`);
+					}
+					const list = await outlineRead(scope, { address: `${space.key}/` });
+					if (Boolean(list.isError) === ok) problems.push(`${spaceLabel}: space listing ${ok}`);
+					if (!ok && list.output !== OUTLINE_TOOL_TEXT.noSuchSpace(space.key)) {
+						problems.push(`${spaceLabel}: space listing answers otherwise`);
+					}
+					const search = await outlineSearch(scope, { query: MARKER, spaces: [space.key] });
+					const found = search.output.includes(markerText(spaceLabel));
+					if (found !== ok) problems.push(`${spaceLabel}: search finds ${found}, may ${ok}`);
+					if (!ok && search.output !== OUTLINE_TOOL_TEXT.noSuchSpace(space.key)) {
+						problems.push(`${spaceLabel}: search answers otherwise`);
+					}
+				}
+				const nowhere = await outlineRead(scope, { address: NOWHERE });
+				if (nowhere.output !== OUTLINE_TOOL_TEXT.notFound(NOWHERE)) {
+					problems.push("an address of nothing answers otherwise");
+				}
+				return problems;
+			},
+		});
+
+		cases.push({
+			group: "agent",
+			label: `${label}: the overview and the search of every space show what it may read`,
+			expected: {
+				overview: { extra: [], missing: [], leaked: [] },
+				search: { extra: [], missing: [] },
+			},
+			actual: async () => {
+				const may = await verdicts(turn);
+				const scope = await scopeFor(turn);
+				const overview = await outlineRead(scope, { address: OUTLINE_ALL_SPACES });
+				const listed = ((overview.metadata.spaces ?? []) as Array<{ key: string }>)
+					.map((entry) => keyLabel.get(entry.key))
+					.filter((l): l is string => l !== undefined);
+				const all = await outlineSearch(scope, {
+					query: MARKER,
+					spaces: [OUTLINE_ALL_SPACES],
+					limit: 50,
+				});
+				const hits = Object.keys(spaces).filter((l) => all.output.includes(markerText(l)));
+				const searchedAll = all.metadata.complete !== false;
+				return {
+					overview: {
+						extra: listed.filter((l) => !may.get(l)),
+						missing:
+							overview.metadata.complete === false
+								? []
+								: readable(may).filter((l) => !listed.includes(l)),
+						// Links keep the addresses they store; nothing the session may not read shows.
+						leaked: Object.keys(spaces).filter(
+							(l) => !may.get(l) && overview.output.includes(markerText(l)),
+						),
+					},
+					search: {
+						extra: hits.filter((l) => !may.get(l)),
+						missing: searchedAll ? readable(may).filter((l) => !hits.includes(l)) : [],
+					},
+				};
+			},
+		});
+	}
+
+	// Links: titled where the session may read the target, otherwise as a link to nothing.
+	const linkTargets = ["foreign", "main", "ownerOnly", "open", "session:priv", "personalOwner"];
+	for (const turn of TURNS) {
+		const [name, who] = turn;
+		cases.push({
+			group: "agent",
+			label: `${name} (turn of ${who ?? "no user"}): links show a title only where it may read the target`,
+			expected: [],
+			actual: async () => {
+				const may = await verdicts(turn);
+				if (!may.get("open")) return [];
+				const scope = await scopeFor(turn);
+				const read = await outlineRead(scope, { address: `${spaces.open.key}/${world.links}` });
+				const problems: string[] = [];
+				for (const target of linkTargets) {
+					const address = `${spaces[target]?.key}/${markers[target]}`;
+					const titled = read.output.includes(`[[${address}|${markerText(target)}]]`);
+					const bare = read.output.includes(`[[${address}]]`);
+					if (titled !== may.get(target) || bare === may.get(target)) {
+						problems.push(`${target}: titled ${titled}, may ${may.get(target)}`);
+					}
+				}
+				if (!read.output.includes(`[[${NOWHERE}]]`)) problems.push("the link to nothing changed");
+				return problems;
+			},
+		});
+	}
 }
 
 /** Run cases one after another; the mismatches, described. */

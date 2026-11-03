@@ -1,6 +1,11 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import {
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
@@ -98,7 +103,7 @@ import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/se
 import { escapeLikeNeedle } from "../lib/sql-like";
 import {
 	contentJsonHasImageBlocks,
-	deleteNarratorUploads,
+	getUploadsDir,
 	type ImageRef,
 	imageRefToContentBlock,
 	type PersistedUserImageBlock,
@@ -148,6 +153,9 @@ import { narratorStore } from "./narrator-store";
 import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
+import { removeUploadDirectoryWithoutMedia } from "./storage-service";
+import { defaultTaskBackendForNewSession } from "./task-source";
+import { readTaskBackend } from "./task-source/backend";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 import {
 	assertWorkspaceAdmission,
@@ -277,18 +285,23 @@ function insertRefsBatched(
 	}
 }
 
-function annotateImageBlocksWithUploadOwner(contentJson: unknown, narratorId: string): unknown {
+function annotateUploadBlocksWithOwner(contentJson: unknown, narratorId: string): unknown {
 	if (!Array.isArray(contentJson)) return contentJson;
 
 	let changed = false;
 	const next = contentJson.map((block) => {
 		if (!block || typeof block !== "object") return block;
-		const candidate = block as { type?: unknown; imageId?: unknown; uploadNarratorId?: unknown };
-		if (
-			candidate.type !== "image" ||
-			typeof candidate.imageId !== "string" ||
-			typeof candidate.uploadNarratorId === "string"
-		) {
+		const candidate = block as {
+			type?: unknown;
+			imageId?: unknown;
+			mediaId?: unknown;
+			uploadNarratorId?: unknown;
+		};
+		const isUpload =
+			(candidate.type === "image" && typeof candidate.imageId === "string") ||
+			((candidate.type === "audio" || candidate.type === "video") &&
+				typeof candidate.mediaId === "string");
+		if (!isUpload || typeof candidate.uploadNarratorId === "string") {
 			return block;
 		}
 		changed = true;
@@ -392,6 +405,11 @@ export interface CreateNarratorInput {
 	 * to effective visibility; auto uses the widest legal audience for that visibility.
 	 */
 	writeAudience?: "owner" | "project" | "public";
+	/**
+	 * Where the session's tasks live. Omitted: `outline` while the outline is switched on,
+	 * `spec` otherwise (`defaultTaskBackendForNewSession`). Not accepted by the public API.
+	 */
+	taskBackend?: "spec" | "outline";
 }
 
 interface CreateSubagentInput {
@@ -1093,6 +1111,9 @@ async function applySpecForkCarryover(
 	carryover: SpecForkCarryover,
 ): Promise<void> {
 	try {
+		// A fork of an outline session keeps its tasks in the outline: there are no spec tasks to
+		// clear or offer a card for (and clearing them would be refused).
+		if ((await readTaskBackend(childNarratorId)) === "outline") return;
 		if (carryover === "clear") {
 			await specVfsService.clearSpecTasks(childNarratorId);
 			return;
@@ -1345,6 +1366,10 @@ async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect
 		isAskInPassing: parent.isAskInPassing,
 		contextProjectId,
 		oauthPolicySnapshotJson: parent.oauthPolicySnapshotJson,
+		// A fork carries on the parent's work, so it keeps the parent's task backend: a spec
+		// session's fork inherits its spec namespace, an outline session's fork stays in the
+		// outline (its session space is not copied yet).
+		taskBackend: parent.taskBackend,
 	};
 }
 
@@ -1471,6 +1496,8 @@ export async function prepareNarratorCreation(
 			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
 			behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
 			behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
+			// A new root session: the outline's when it is switched on (plan §3).
+			taskBackend: input.taskBackend ?? defaultTaskBackendForNewSession(),
 			cwd: input.cwd ?? null,
 			contextProjectId: input.contextProjectId ?? null,
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
@@ -1697,7 +1724,10 @@ export const narratorService = {
 			// restrictions are not copied but followed live through the registered
 			// policy source, so a later tightening of the parent reaches the child.
 			const runtimePolicy =
-				input.runtimePolicy ?? (await compileDelegationCeiling(input.subagentType));
+				input.runtimePolicy ??
+				(await compileDelegationCeiling(input.subagentType, {
+					outlineSession: parent.taskBackend === "outline",
+				}));
 			const subTraits = withRuntimePolicyTrait(["standalone"], runtimePolicy);
 			// The delegator is the policy/model source and the controller; the model pool
 			// the child follows the source within is fixed now, from the template.
@@ -1737,6 +1767,9 @@ export const narratorService = {
 						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
+						// Its session's (D31): the task source reads the root's anyway; the copy keeps
+						// the row from claiming a backend its session does not have.
+						taskBackend: parent.taskBackend,
 						parentNarratorId: input.parentNarratorId,
 						originToolCallId: input.originToolCallId ?? null,
 						subagentOriginKind:
@@ -1989,6 +2022,7 @@ export const narratorService = {
 		parentToolUseId: string,
 		options?: {
 			images?: ImageRef[];
+			media?: MediaRef[];
 			textFiles?: TextFileRef[];
 			fileReferences?: import("@shared/file-reference").FileReferenceSnapshot[];
 			composerDocument?: import("@shared/composer-document").ComposerDocument;
@@ -2010,6 +2044,7 @@ export const narratorService = {
 		const contentJson: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| MediaContentBlock
 			| SystemInjectionBlock
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 			| import("@shared/file-reference").FileReferenceSnapshot
@@ -2017,6 +2052,8 @@ export const narratorService = {
 		for (const image of options?.images ?? []) {
 			contentJson.push(imageRefToContentBlock(image));
 		}
+		for (const media of options?.media ?? [])
+			contentJson.push(mediaRefToContentBlock(media, narratorId));
 		for (const file of options?.textFiles ?? []) {
 			contentJson.push({
 				type: "text_file",
@@ -2040,8 +2077,11 @@ export const narratorService = {
 			);
 		}
 		const effectiveText =
-			(!text.trim() && (options?.images?.length ?? 0) > 0 ? "[user sent image(s)]" : text) +
-			buildAttachedFilesHint(options?.textFiles ?? []);
+			(!text.trim() && (options?.media?.length ?? 0) > 0
+				? "[user sent attachment(s)]"
+				: !text.trim() && (options?.images?.length ?? 0) > 0
+					? "[user sent image(s)]"
+					: text) + buildAttachedFilesHint(options?.textFiles ?? []);
 		const msg = await narratorPersistence.persistUserMessage(
 			narratorId,
 			effectiveText,
@@ -2167,6 +2207,14 @@ export const narratorService = {
 	},
 
 	async remove(narratorId: string) {
+		// What names it once the row is gone (the `narrator:deleted` event below).
+		const title =
+			(
+				await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { title: true },
+				})
+			)?.title ?? null;
 		const children = await db.query.narrators.findMany({
 			where: eq(narrators.parentNarratorId, narratorId),
 			columns: { id: true, type: true, variant: true },
@@ -2186,7 +2234,13 @@ export const narratorService = {
 		// the delete below, and a dangling pointer would silently hide its history.
 		await materializeChildrenOf(narratorId);
 
-		const preserveUploads = await hasSharedOwnedImageMessages(narratorId);
+		// COW copies and Read tool outputs can refer to an upload without sharing its
+		// original message. Until media has a dedicated reference index, keep media
+		// directories conservatively rather than scan all message/tool JSON or erase
+		// another session's live bytes. Orphan reclamation belongs in a background job.
+		const preserveUploads =
+			existsSync(resolve(getUploadsDir(), narratorId, "media")) ||
+			(await hasSharedOwnedImageMessages(narratorId));
 
 		const bindingTransition = db.transaction((tx) => {
 			if (survivingForks.length)
@@ -2263,7 +2317,7 @@ export const narratorService = {
 			);
 
 			for (const row of sharedRows) {
-				const contentJson = annotateImageBlocksWithUploadOwner(row.contentJson, narratorId);
+				const contentJson = annotateUploadBlocksWithOwner(row.contentJson, narratorId);
 				writeEnvelopeBody(tx, row.id, contentJson, { set: { narratorId: row.newOwnerId } });
 				// Keep the shared card's exact historical tool rows, but do not transfer
 				// execution authority: a retained provenance clone is never resumable.
@@ -2318,6 +2372,9 @@ export const narratorService = {
 		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
 		eventBus.emit({ type: "human_attention:changed" });
+		// Rows that only name the narrator (no FK), such as outline task claims, are let go by
+		// their owners' listeners.
+		eventBus.emit({ type: "narrator:deleted", narratorId, title });
 		if (bindingTransition) {
 			await integrationResourceBindingService.recordTransitionAudit(
 				"resource_binding.delete",
@@ -2333,11 +2390,11 @@ export const narratorService = {
 		});
 
 		if (preserveUploads) {
-			logger.info("Preserving narrator uploads because shared image messages still exist", {
+			logger.info("Preserving narrator uploads for shared images or retained media", {
 				narratorId,
 			});
 		} else {
-			await deleteNarratorUploads(narratorId);
+			await removeUploadDirectoryWithoutMedia(narratorId, false);
 		}
 
 		// Remove any pack extraction directories this narrator owned. The activation rows +
@@ -2490,6 +2547,9 @@ export const narratorService = {
 
 			await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
 			await applySpecForkCarryover(newNarrator.id, "card");
+			// An outline fork gets its parent's behavior page (outline plan PR 4); never rejects.
+			const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
+			await copyOutlineBehaviorPage(parentNarratorId, newNarrator.id);
 			return newNarrator;
 		});
 	},
@@ -2950,6 +3010,10 @@ export const narratorService = {
 					}
 				}
 			})();
+			// An outline fork gets its parent's behavior page before its first run can read it
+			// (outline plan PR 4): one bounded commit; never rejects.
+			const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
+			await copyOutlineBehaviorPage(parentNarratorId, id);
 			eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
 			broadcastToNarrator(parentNarratorId, {
 				type: "narrator_forked",
@@ -3093,6 +3157,8 @@ export const narratorService = {
 	getModelHistorySinceLastCompact:
 		narratorMessageQueries.getModelHistorySinceLastCompact.bind(narratorMessageQueries),
 	getLatestCompactSeq: narratorMessageQueries.getLatestCompactSeq.bind(narratorMessageQueries),
+	getLatestCompactCreatedAt:
+		narratorMessageQueries.getLatestCompactCreatedAt.bind(narratorMessageQueries),
 	getMessagesBefore: narratorMessageQueries.getMessagesBefore.bind(narratorMessageQueries),
 	getEarliestMessages: narratorMessageQueries.getEarliestMessages.bind(narratorMessageQueries),
 	_getPostCompactTopLevelRefs:

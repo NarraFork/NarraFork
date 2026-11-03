@@ -13,7 +13,7 @@ import {
 	type ModelContextWindowSource,
 } from "../lib/settings/provider";
 import { narratorService } from "./narrator-service";
-import { buildSpecCompactContext } from "./spec-reminder";
+import { taskSourceForNarrator } from "./task-source";
 
 export { estimateTokens };
 
@@ -341,13 +341,16 @@ export const narratorContext = {
 		// ── Compute fixed overhead ──
 		const compactPrompt = getPrompt("compact", locale);
 		const todoSkipHint = getToolMessage("compactTodoSkip", locale);
-		const latestSpecContext = await buildSpecCompactContext(narratorId, locale);
+		// Injection reads resolve to null rather than reject; the catch keeps a compact from
+		// failing over a task list whatever the source.
+		const taskSource = await taskSourceForNarrator(narratorId);
+		const latestTaskContext = await taskSource.compactContext(locale).catch(() => null);
 		const compactSuffix = getPrompt("compactSuffix", locale);
 		const compactSystemPrompt = [
 			compactPrompt,
 			senderSummaryInstruction(locale),
 			todoSkipHint,
-			latestSpecContext,
+			latestTaskContext,
 		]
 			.filter(Boolean)
 			.join("\n\n");

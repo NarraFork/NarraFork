@@ -47,11 +47,13 @@ import {
 	type OutlineStore,
 	type OutlineVersionRow,
 } from "./store/port";
+import { sameTaskJson } from "./task-json";
 import {
 	type OutlineAdjustment,
 	type OutlineBlockAddressed,
 	type OutlineOp,
 	type OutlineTaskInput,
+	type OutlineTaskPatch,
 	writeOutline,
 } from "./write";
 
@@ -65,6 +67,11 @@ export interface OutlineRevertInput {
 	toolCallId?: string | null;
 	/** Default: `revert #seq: <the reverted commit's summary>`. */
 	summary?: string;
+	/**
+	 * Whether the actor may take away someone else's lock (a manager of the space, an admin; the
+	 * caller decides). Without it a revert that would unlock keeps the lock (`lock-kept`).
+	 */
+	unlockAuthority?: () => Promise<boolean>;
 }
 
 export interface OutlineRevertSkip extends OutlineBlockAddressed {
@@ -121,23 +128,30 @@ interface Plan {
 	metas: Map<string, OutlineBlockMeta>;
 }
 
-function sameTask(a: OutlineTaskJson | null, b: OutlineTaskJson | null): boolean {
-	if (a === null || b === null) return a === b;
-	return (
-		a.status === b.status &&
-		a.assignee === b.assignee &&
-		(a.due ?? null) === (b.due ?? null) &&
-		JSON.stringify(a.depends ?? []) === JSON.stringify(b.depends ?? [])
-	);
-}
+const sameTask = sameTaskJson;
 
+/** A task as it was, every field spelled out, so the write puts back exactly that. */
 function taskInput(task: OutlineTaskJson): OutlineTaskInput {
 	return {
 		status: task.status,
 		assignee: task.assignee,
 		depends: task.depends ?? [],
 		due: task.due ?? null,
+		manager: task.manager ?? null,
+		humanCreated: task.humanCreated === true,
+		lock: task.lock ?? null,
+		claimable: task.claimable === true,
 	};
+}
+
+/**
+ * A task put back over the task as it is (`now`): as {@link taskInput}, with the status only when
+ * it changed. Putting back the other fields of a task in progress is not starting it, so it
+ * claims nothing (a `setTask` naming `doing` would).
+ */
+function taskPatch(task: OutlineTaskJson, now: OutlineTaskJson | null): OutlineTaskPatch {
+	const { status, ...rest } = taskInput(task);
+	return now?.status === status ? rest : { status, ...rest };
 }
 
 class RevertAnalysis {
@@ -432,7 +446,7 @@ class RevertAnalysis {
 					{
 						op: "setTask",
 						block: { id: t.id },
-						task: before.taskJson ? taskInput(before.taskJson) : null,
+						task: before.taskJson ? taskPatch(before.taskJson, t.meta.taskJson) : null,
 					},
 					t.id,
 				);
@@ -505,6 +519,7 @@ async function revertAttempts(
 					messageId: input.messageId ?? null,
 					toolCallId: input.toolCallId ?? null,
 					summary: input.summary ?? OUTLINE_TEXT.revertSummary(commit.seq, commit.summary),
+					...(input.unlockAuthority ? { unlockAuthority: input.unlockAuthority } : {}),
 				},
 				{
 					store,
@@ -541,13 +556,28 @@ async function revertAttempts(
 							adjustment.alias,
 							holders.get(adjustment.heldBy) ?? adjustment.heldBy,
 						)
-					: OUTLINE_TEXT.orderKeyMoved(adjustment.wanted),
+					: adjustment.kind === "order-key-moved"
+						? OUTLINE_TEXT.orderKeyMoved(adjustment.wanted)
+						: adjustment.kind === "lock-kept"
+							? OUTLINE_TEXT.lockKept
+							: OUTLINE_TEXT.taskNotStarted,
 		}));
+		// What was put back is what the commit wrote: a lock left as it was (`lock-kept`) may leave
+		// a block, or the whole revert, with nothing written.
+		let changed = written.commit ? plan.changed : [];
+		if (written.commit && notes.some((note) => note.adjustment.kind === "lock-kept")) {
+			const wrote = new Set(
+				(await store.listCommitVersions(written.commit.id, OUTLINE_LIMITS.maxRowsTouched)).map(
+					(v) => v.blockId,
+				),
+			);
+			changed = changed.filter((id) => wrote.has(id));
+		}
 		return {
 			...base,
 			commit: written.commit,
 			pageIds: written.pageIds,
-			changed: plan.changed.map(address),
+			changed: changed.map(address),
 			notes,
 		};
 	}

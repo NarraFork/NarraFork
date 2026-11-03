@@ -51,11 +51,13 @@ import { ReplaceStep } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView, type NodeView } from "prosemirror-view";
 import {
 	applyChrome,
+	type BlockMark,
 	chromeText,
 	createGutter,
 	type Gutter,
 	type MentionResolver,
 	mentionLabel,
+	TASK_GLYPH,
 	TASK_NEXT,
 } from "./chrome";
 import {
@@ -198,6 +200,10 @@ export class OutlineView implements CmdHost, ClientView {
 	lastSelBlock: string | null = null;
 	/** Block id → its frame's DOM (presence, anchors, PR9's animations). */
 	blockEls = new Map<string, HTMLElement>();
+	/** Block id → its node view: marks change without the document changing. */
+	blockViews = new Map<string, BlockView>();
+	/** Locks and pending changes of the page's blocks (P2 PR 6), from the page's summary. */
+	marks: ReadonlyMap<string, BlockMark> = new Map();
 	/** Block selection: the selected sibling range, anchor and head ids. */
 	blockSel: { anchor: string; head: string } | null = null;
 	lens: OutlineLens;
@@ -392,6 +398,35 @@ export class OutlineView implements CmdHost, ClientView {
 	resetCache() {
 		this.nodeCache.clear();
 		this.pendingMap.clear();
+	}
+
+	/** Show these locks and pending changes on the blocks (the page's pending summary). */
+	setMarks(marks: ReadonlyMap<string, BlockMark>): void {
+		const changed = new Set([...this.marks.keys(), ...marks.keys()]);
+		this.marks = marks;
+		for (const id of changed) this.blockViews.get(id)?.renderMarks();
+	}
+
+	/**
+	 * The open tasks the facts view leaves out under a block, for its "in progress" marker: id,
+	 * title, checkbox, and whether a change to it waits for confirmation.
+	 */
+	hiddenTasks(
+		id: string,
+	): Array<{ id: string; title: string; task: LiveTaskChar; waiting: boolean }> {
+		const v = this.client.visible;
+		const out: Array<{ id: string; title: string; task: LiveTaskChar; waiting: boolean }> = [];
+		for (const k of v.children(id)) {
+			const task = v.get(k)?.task;
+			if (task !== " " && task !== "/") continue;
+			out.push({
+				id: k,
+				title: titleOf(this.client.textOf(k)).slice(0, 120),
+				task,
+				waiting: (this.marks.get(k)?.pending?.length ?? 0) > 0,
+			});
+		}
+		return out;
 	}
 
 	/** Switch between the facts view and everything. */
@@ -1528,11 +1563,77 @@ class BlockView implements NodeView {
 		this.chip = document.createElement("span");
 		this.chip.className = "ob-hidden";
 		this.chip.contentEditable = "false";
-		this.dom.append(this.g.el, this.chip, this.contentDOM);
+		this.chip.addEventListener("mousedown", (e) => {
+			e.preventDefault();
+			if (this.chip.dataset.open) this.toggleTaskList();
+		});
+		this.marksEl = document.createElement("span");
+		this.marksEl.className = "ob-marks";
+		this.marksEl.contentEditable = "false";
+		this.dom.append(this.g.el, this.chip, this.marksEl, this.contentDOM);
 		this.render();
 	}
 
 	private chip: HTMLElement;
+	private marksEl: HTMLElement;
+	private taskList: HTMLElement | null = null;
+
+	/** The lock and pending marks of the block (`OutlineView.marks`). */
+	renderMarks() {
+		const mark = this.owner.marks.get(this.node.attrs.id as string);
+		this.marksEl.replaceChildren();
+		if (mark?.lockedBy) {
+			const lock = document.createElement("span");
+			lock.className = "ob-lock";
+			lock.dataset.testid = "outline-lock-badge";
+			lock.textContent = chromeText.locked(mark.lockedBy);
+			this.marksEl.append(lock);
+		}
+		if (mark?.pending?.length) {
+			const pending = document.createElement("span");
+			pending.className = "ob-pending";
+			pending.dataset.testid = "outline-pending-badge";
+			pending.textContent = chromeText.pending;
+			pending.title = mark.pending.join(", ");
+			this.marksEl.append(pending);
+		}
+		this.marksEl.style.display = this.marksEl.childElementCount > 0 ? "" : "none";
+		if (this.taskList) this.fillTaskList(this.taskList);
+	}
+
+	/** Open or close the list of the open tasks the facts view leaves out under the block. */
+	private toggleTaskList() {
+		if (this.taskList) {
+			this.taskList.remove();
+			this.taskList = null;
+			return;
+		}
+		const list = document.createElement("div");
+		list.className = "ob-task-list";
+		list.contentEditable = "false";
+		list.dataset.testid = "outline-in-progress-list";
+		this.fillTaskList(list);
+		this.chip.after(list);
+		this.taskList = list;
+	}
+
+	private fillTaskList(list: HTMLElement) {
+		list.replaceChildren();
+		for (const task of this.owner.hiddenTasks(this.node.attrs.id as string)) {
+			const item = document.createElement("div");
+			item.className = "ob-task-item";
+			item.setAttribute("role", "button");
+			item.dataset.taskId = task.id;
+			item.textContent = `${TASK_GLYPH[task.task]} ${task.title}${task.waiting ? ` · ${chromeText.waiting}` : ""}`;
+			item.addEventListener("mousedown", (e) => {
+				e.preventDefault();
+				this.taskList?.remove();
+				this.taskList = null;
+				this.owner.opts.onBullet?.(task.id);
+			});
+			list.append(item);
+		}
+	}
 
 	private render() {
 		const n = this.node;
@@ -1540,17 +1641,40 @@ class BlockView implements NodeView {
 		if (this.dom.dataset.id && this.dom.dataset.id !== id) {
 			if (this.owner.blockEls.get(this.dom.dataset.id) === this.dom)
 				this.owner.blockEls.delete(this.dom.dataset.id);
+			if (this.owner.blockViews.get(this.dom.dataset.id) === this)
+				this.owner.blockViews.delete(this.dom.dataset.id);
 		}
 		this.dom.dataset.id = id;
-		if (id) this.owner.blockEls.set(id, this.dom);
+		if (id) {
+			this.owner.blockEls.set(id, this.dom);
+			this.owner.blockViews.set(id, this);
+		}
 		applyChrome(this.dom, this.g, {
 			hasKids: n.childCount > 1,
 			collapsed: !!n.attrs.collapsed,
 			task: n.attrs.task ?? null,
 		});
 		const hidden = (n.attrs.hidden as number) ?? 0;
-		this.chip.textContent = hidden > 0 ? chromeText.hidden(hidden) : "";
+		const open = hidden > 0 ? this.owner.hiddenTasks(id).length : 0;
+		// Open tasks: the "in progress" marker, which lists them. Only done or cancelled ones: how
+		// many blocks the facts view leaves out, as before (`+N under tasks`).
+		this.chip.textContent =
+			open > 0 ? chromeText.hidden(open) : hidden > 0 ? chromeText.hiddenUnder(hidden) : "";
 		this.chip.style.display = hidden > 0 ? "" : "none";
+		if (open > 0) {
+			this.chip.dataset.open = "1";
+			this.chip.setAttribute("role", "button");
+			this.chip.title = chromeText.hiddenHint;
+		} else {
+			delete this.chip.dataset.open;
+			this.chip.removeAttribute("role");
+			this.chip.title = "";
+		}
+		if (open === 0 && this.taskList) {
+			this.taskList.remove();
+			this.taskList = null;
+		}
+		this.renderMarks();
 	}
 
 	update(node: PMNode) {
@@ -1563,6 +1687,7 @@ class BlockView implements NodeView {
 	destroy() {
 		const id = this.dom.dataset.id;
 		if (id && this.owner.blockEls.get(id) === this.dom) this.owner.blockEls.delete(id);
+		if (id && this.owner.blockViews.get(id) === this) this.owner.blockViews.delete(id);
 	}
 
 	ignoreMutation(m: MutationRecord | { type: "selection"; target: Node }) {
@@ -1571,7 +1696,13 @@ class BlockView implements NodeView {
 	}
 
 	stopEvent(e: Event) {
-		return this.g.el.contains(e.target as Node) || this.chip.contains(e.target as Node);
+		const target = e.target as Node;
+		return (
+			this.g.el.contains(target) ||
+			this.chip.contains(target) ||
+			this.marksEl.contains(target) ||
+			(this.taskList?.contains(target) ?? false)
+		);
 	}
 }
 

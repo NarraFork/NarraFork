@@ -147,6 +147,19 @@ function pluginEntries(registry: PluginProviderRegistry) {
 }
 
 describe("provider contribution sync", () => {
+	test("accepts and projects optional manifest native media declarations", async () => {
+		const input = manifestInput();
+		const provider = input.contributes?.providers?.[0];
+		if (!provider) throw new Error("Missing fixture provider");
+		provider.capabilities = { ...provider.capabilities, inputAudio: true, inputVideo: false };
+		const manifest = parseManifest(input);
+		const { providerRegistry, coordinator } = harness(manifest);
+		await coordinator.initialize(snapshotFor(manifest), { lifecycleStates: lifecycle("enabled") });
+		expect(pluginEntries(providerRegistry)[0].capabilities).toMatchObject({
+			inputAudio: true,
+			inputVideo: false,
+		});
+	});
 	test("registers manifest providers on the first refresh", async () => {
 		const manifest = parseManifest(manifestInput());
 		const { providerRegistry, coordinator } = harness(manifest);

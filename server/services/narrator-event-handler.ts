@@ -29,7 +29,7 @@ import {
 import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
-import { withDbRetry } from "../lib/db-resilience";
+import { sqliteErrorCode, withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -222,6 +222,7 @@ export async function toolResultLedgerOutput(
 		metadata: event.metadata,
 		broken: !!event.brokenInputOverride,
 		images,
+		media: event.mediaRefs,
 	});
 }
 
@@ -1662,6 +1663,29 @@ export async function processEvent(
 	}
 
 	switch (event.type) {
+		case "media_fallback": {
+			if (!event.warnings.length) return null;
+			const files = event.warnings.map((warning) => warning.filename).join(", ");
+			const message = ctx.locale?.startsWith("zh")
+				? `当前模型不支持读取该模态数据，回退到一般文件。仅提供文件路径和元信息，未读取音视频内容。文件：${files}`
+				: `The current model does not support this audio/video input. Falling back to regular files with paths and metadata only; the media contents have not been read. Files: ${files}`;
+			dualBroadcast(ctx, {
+				type: "warning",
+				narratorId: broadcastTargetId,
+				warningCode: "native_media_fallback",
+				mediaFallbackWarnings: event.warnings,
+				message,
+			});
+			ctx.sseEmitter?.emit("event", {
+				type: "warning",
+				data: {
+					warningCode: "native_media_fallback",
+					mediaFallbackWarnings: event.warnings,
+					message,
+				},
+			});
+			return null;
+		}
 		case "stream_text": {
 			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
 			const textBlockId = event.blockId;
@@ -2666,8 +2690,8 @@ export async function processEvent(
 			// plan-mode file path) the input actually used. Either rides with the result.
 			const settledInput = event.brokenInputOverride ?? event.updatedInput;
 			if (!shouldCommitEnterPlanModeAtomically && resultToolCallId) {
-				try {
-					await narratorStore.settleTool(
+				const settle = () =>
+					narratorStore.settleTool(
 						event.toolUseId,
 						{
 							output: persistedOutput,
@@ -2682,41 +2706,23 @@ export async function processEvent(
 						undefined,
 						resultToolCallId,
 					);
+				try {
+					// 与其它写路径一致：SQLITE_BUSY 交给带退避的 withDbRetry。
+					// 事务本身是 immediate，单次尝试会先忙等一次 busy_timeout；再撞锁就退避
+					// 200+400+800+1600ms 重试，5 次合计约 4.5 秒。只「立即重试一次」会在同一
+					// 个锁窗口里再失败，把瞬时争用升级成 CriticalEventPersistenceError、终止 loop。
+					await withDbRetry(settle, { label: "tool_result.settle", maxRetries: 5 });
 					toolResultPersisted = true;
 				} catch (err) {
-					logger.error("Failed to persist tool result", {
+					logger.error("CRITICAL: tool_result persist failed", {
 						narratorId,
 						toolUseId: event.toolUseId,
 						error: String(err),
+						code: sqliteErrorCode(err),
 					});
-					// Retry once — transient DB lock / busy errors are common with SQLite
-					try {
-						await narratorStore.settleTool(
-							event.toolUseId,
-							{
-								output: persistedOutput,
-								status,
-								errorMessage: event.isError ? event.output : undefined,
-								durationMs: event.durationMs,
-								permissionStartedAt: event.permissionStartedAt,
-								executionStartedAt: event.executionStartedAt,
-								completedAt: event.completedAt,
-								input: settledInput,
-							},
-							undefined,
-							resultToolCallId,
-						);
-						toolResultPersisted = true;
-					} catch (retryErr) {
-						logger.error("CRITICAL: tool_result persist failed after retry", {
-							narratorId,
-							toolUseId: event.toolUseId,
-							error: String(retryErr),
-						});
-						throw new CriticalEventPersistenceError("Tool result could not be persisted", {
-							cause: retryErr,
-						});
-					}
+					throw new CriticalEventPersistenceError("Tool result could not be persisted", {
+						cause: err,
+					});
 				}
 			}
 

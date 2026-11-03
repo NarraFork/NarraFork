@@ -44,13 +44,22 @@ const NarratorUserChatPanel = lazy(() =>
 const FileTreePanel = lazy(() =>
 	import("./file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
 );
+const NarratorTimelinePanel = lazy(() =>
+	import("./timeline/NarratorTimelinePanel").then((m) => ({ default: m.NarratorTimelinePanel })),
+);
 
 /**
  * Tool panels this host can present. A subset of the dock's panel kinds on
  * purpose — `details` already has its own drawer in
  * `NarratorPanel`, and `terminal` / `spec` are hosted by the route.
  */
-export type MobileToolPanelKind = "git" | "search" | "browser" | "userchat" | "filetree";
+export type MobileToolPanelKind =
+	| "git"
+	| "search"
+	| "browser"
+	| "userchat"
+	| "filetree"
+	| "timeline";
 
 const MOBILE_DRAWER_HEADER_HEIGHT = 45;
 
@@ -139,7 +148,9 @@ export function MobileToolPanelHost({
 						? tChat("panelTitle")
 						: kind === "filetree"
 							? t("fileTree.title")
-							: "";
+							: kind === "timeline"
+								? t("timeline.title")
+								: "";
 
 	return (
 		<Drawer
@@ -199,6 +210,13 @@ export function MobileToolPanelHost({
 						onForwardToNarrator={onForwardToNarrator}
 					/>
 				</PanelBoundary>
+			) : null}
+			{kind === "timeline" ? (
+				<Box style={{ height: "100%" }}>
+					<PanelBoundary>
+						<NarratorTimelinePanel narratorId={narratorId} />
+					</PanelBoundary>
+				</Box>
 			) : null}
 			{kind === "filetree" ? (
 				<PanelBoundary>

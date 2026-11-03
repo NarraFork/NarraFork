@@ -1,3 +1,4 @@
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
@@ -9,7 +10,14 @@ import type { UsageData } from "../usage-tracking";
 import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
+import { GeminiMediaFiles } from "./gemini-media-files";
 import { reportInputCharacters } from "./input-characters";
+import {
+	createNativeMediaDumpEncoder,
+	interactionInlineMedia,
+	storedMessageMedia,
+	supportsNativeMediaProtocolInput,
+} from "./native-media";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import { type NeutralTurn, projectHistory, webSearchSummary } from "./projection";
 import type {
@@ -30,6 +38,7 @@ import {
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
+import { unsupportedResponseFormatReason } from "./response-format";
 import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { ApiError, type ResolvedToolDefinition } from "./types";
@@ -90,10 +99,28 @@ interface GeminiFunctionResultStep {
 	call_id: string;
 	name: string;
 	result: unknown;
+	_nativeMedia?: NativeMediaInput[];
+}
+
+function expandInteractionToolResults(
+	results: GeminiFunctionResultStep[],
+): GeminiInteractionStep[] {
+	const steps: GeminiInteractionStep[] = results.map(({ _nativeMedia, ...step }) => step);
+	const media = results.flatMap((result) =>
+		(result._nativeMedia ?? []).flatMap((item): GeminiInputContent[] => [
+			{
+				type: "text",
+				text: `Tool result media source: ${JSON.stringify({ toolCallId: result.call_id })}`,
+			},
+			interactionInlineMedia(item),
+		]),
+	);
+	if (media.length) steps.push({ type: "user_input", content: media });
+	return steps;
 }
 
 interface GeminiInputContent {
-	type: "text" | "image";
+	type: "text" | "image" | "audio" | "video";
 	text?: string;
 	data?: string;
 	mime_type?: string;
@@ -187,9 +214,15 @@ function assertByteLimit(value: string, limit: number, label: string): void {
 
 export class GeminiInteractionsProvider implements ProviderAdapter {
 	private config: GeminiProviderConfig;
+	private mediaFiles: GeminiMediaFiles;
 
 	constructor(config: GeminiProviderConfig) {
 		this.config = config;
+		this.mediaFiles = new GeminiMediaFiles({
+			baseUrl: this.baseUrl(),
+			apiKey: config.apiKey,
+			fetch: (input, init) => this.pfetch(input, init),
+		});
 	}
 
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -207,6 +240,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 
 	private baseUrl(): string {
 		return (this.config.baseUrl || DEFAULT_GEMINI_BASE).replace(/\/+$/, "");
+	}
+
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		return supportsNativeMediaProtocolInput("interactions", media, model);
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
@@ -228,6 +268,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
+		assertModelInputModalities(model, dbMessages.flatMap(storedMessageMedia));
 		const projected = await projectHistory(
 			dbMessages,
 			{
@@ -267,10 +308,12 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const model = parseModelId(params.model).model;
 		const { systemInstruction, steps } = splitSystemAndSteps(params.history as GeminiHistoryItem[]);
-		steps.push(...(params.toolResults as GeminiFunctionResultStep[]));
-		appendCurrentUserInput(steps, params.content, params.images);
+		steps.push(
+			...expandInteractionToolResults((params.toolResults ?? []) as GeminiFunctionResultStep[]),
+		);
+		appendCurrentUserInput(steps, params.content, params.images, params.media);
 
-		const body = this.buildRequestBody({
+		let body = this.buildRequestBody({
 			model: params.model,
 			maxOutputTokens: params.maxOutputTokens,
 			steps,
@@ -279,6 +322,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 			stream: true,
 		});
+		body = await this.mediaFiles.prepare(body, "interactions", params.signal);
 		await reportInputCharacters(params, body);
 		const bodyText = await stringifyRequestBody(body, params.signal);
 
@@ -289,7 +333,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			method: "POST",
 			url,
 			headers: sanitizeHeaders(headers),
-			bodyText,
+			bodyText: await createNativeMediaDumpEncoder()(body, bodyText, params.signal),
 		});
 		logger.debug("Gemini Interactions request", {
 			model,
@@ -346,7 +390,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.generateStreaming({
+		const result = await this.generateStreaming({
 			model,
 			systemInstruction,
 			userText: text,
@@ -356,6 +400,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
+		// The Interactions surface has no JSON-Schema output mode, so a requested
+		// responseFormat is reported as degraded rather than silently dropped.
+		if (!options?.responseFormat || result.responseFormatDegraded) return result;
+		return {
+			...result,
+			responseFormatDegraded: unsupportedResponseFormatReason("Gemini Interactions"),
+		};
 	}
 
 	async generateWithHistory(
@@ -531,24 +582,27 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			if (turn.kind === "input") {
 				for (const item of turn.items) {
 					const images = item.images.flatMap((image) => (image ? [image] : []));
-					if (!images.length) {
+					if (!images.length && !item.media?.length) {
 						if (item.text) history.push({ type: "user_input", content: item.text });
 						continue;
 					}
 					history.push({
 						type: "user_input",
-						content: orderUserContent(item.text, images, "after").map(
-							(part): GeminiInputContent =>
-								part.type === "text"
-									? { type: "text", text: part.text }
-									: { type: "image", data: part.image.base64, mime_type: part.image.mediaType },
-						),
+						content: [
+							...orderUserContent(item.text, images, "after").map(
+								(part): GeminiInputContent =>
+									part.type === "text"
+										? { type: "text", text: part.text }
+										: { type: "image", data: part.image.base64, mime_type: part.image.mediaType },
+							),
+							...(item.media ?? []).map(interactionInlineMedia),
+						],
 					});
 				}
 				continue;
 			}
 			if (turn.kind === "tool_results") {
-				for (const result of turn.results)
+				for (const result of turn.results) {
 					history.push({
 						type: "function_result",
 						call_id: result.wireId,
@@ -567,6 +621,17 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 									]
 								: result.text,
 					});
+				}
+				const media = turn.results.flatMap((result) =>
+					(result.media ?? []).flatMap((item): GeminiInputContent[] => [
+						{
+							type: "text",
+							text: `Tool result media source: ${JSON.stringify({ toolCallId: result.wireId })}`,
+						},
+						interactionInlineMedia(item),
+					]),
+				);
+				if (media.length) history.push({ type: "user_input", content: media });
 				continue;
 			}
 			const searches = turn.items.filter((item) => item.kind === "web_search");
@@ -687,22 +752,24 @@ function appendCurrentUserInput(
 	steps: GeminiHistoryItem[],
 	content: string,
 	images?: Array<{ format: string; base64: string }>,
+	media?: NativeMediaInput[],
 ): void {
 	const hasText = !!content && content !== ".";
-	if (!hasText && !images?.length) {
+	if (!hasText && !images?.length && !media?.length) {
 		if (steps.length === 0) steps.push({ type: "user_input", content: content || "." });
 		return;
 	}
-	if (!images?.length) {
+	if (!images?.length && !media?.length) {
 		steps.push({ type: "user_input", content });
 		return;
 	}
-	const parts = orderUserContent(hasText ? content : "", images, "after").map(
+	const parts = orderUserContent(hasText ? content : "", images ?? [], "after").map(
 		(part): GeminiInputContent =>
 			part.type === "text"
 				? { type: "text", text: part.text }
 				: { type: "image", data: part.image.base64, mime_type: `image/${part.image.format}` },
 	);
+	parts.push(...(media ?? []).map(interactionInlineMedia));
 	steps.push({ type: "user_input", content: parts });
 }
 

@@ -1,6 +1,18 @@
-import { Alert, Badge, Button, Divider, Group, Loader, Modal, Stack, Text } from "@mantine/core";
+import {
+	Alert,
+	Badge,
+	Button,
+	Divider,
+	Group,
+	Loader,
+	Modal,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
 import { modelProfile } from "@shared/model-catalog/profile";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
@@ -64,6 +76,16 @@ export function ModelPriceModal({
 	const qc = useQueryClient();
 	const catalog = useModelCatalog(opened);
 	const actual = useActualResolvedModelCard(opened ? model?.value : undefined);
+	// 每个模型一个 ModelTrace 舱（隐藏叙述者）；这个查询决定“历史”按钮可不可点。
+	const navigate = useNavigate();
+	const traceModelValue = opened ? (model?.value ?? "") : "";
+	const { data: traceTarget } = useQuery({
+		queryKey: ["modeltrace-narrator", traceModelValue],
+		queryFn: () => api.getModelTraceNarrator(traceModelValue),
+		enabled: Boolean(traceModelValue),
+		staleTime: 30_000,
+	});
+	const traceNarratorId = traceTarget?.narratorId ?? null;
 	const reference = actual.data ? modelProfile(actual.data).referencePricing : undefined;
 	const [editor, setEditor] = useState<CatalogEditorTarget | null>(null);
 	const readOnly = user?.role !== "admin";
@@ -139,6 +161,27 @@ export function ModelPriceModal({
 			zIndex={Z.modal}
 		>
 			<Stack gap="sm" mb="md">
+				{model?.value && (
+					<Tooltip label={t("modelTrace.openHistoryHint")} disabled={Boolean(traceNarratorId)}>
+						<span style={{ display: "inline-flex" }}>
+							<Button
+								size="xs"
+								variant="subtle"
+								disabled={!traceNarratorId}
+								onClick={() => {
+									if (!traceNarratorId) return;
+									onClose();
+									navigate({
+										to: "/narrators/$narratorId",
+										params: { narratorId: traceNarratorId },
+									});
+								}}
+							>
+								{t("modelTrace.openHistory")}
+							</Button>
+						</span>
+					</Tooltip>
+				)}
 				{actual.isFetching && <Loader size="sm" />}
 				{actual.error && <Alert color="red">{actual.error.message}</Alert>}
 				{actual.data && (

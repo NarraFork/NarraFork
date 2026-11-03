@@ -135,6 +135,7 @@ function editor(initial: ComposerDocument, start = 0, end = start) {
 	let document = initial;
 	let preserved = false;
 	const handle = {
+		getElement: () => ({}) as HTMLDivElement,
 		getDocument: () => document,
 		getSelection: () => ({ start, end }),
 		setDocument: (value: ComposerDocument, history?: boolean) => {

@@ -9,18 +9,21 @@ test("RemoteBackend Git RPC pins generation, negotiates capabilities and forward
 	const source = `
 import { mock } from "bun:test";
 import assert from "node:assert/strict";
-let online = true, supported = true, previewSupported = true, statusSupported = true, lineStatsSupported = true, generation = 3;
+let online = true, supported = true, previewSupported = true, statusSupported = true, lineStatsSupported = true, branchesSupported = true, switchSupported = true, syncSupported = true, generation = 3;
 const calls = [];
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 65536 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
  getDeviceConnectionGeneration: () => online ? generation : null,
- hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1") || (statusSupported && f === "git.workspace.status.v1") || (lineStatsSupported && f === "git.workspace.line-stats.v1")),
+ hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1") || (statusSupported && f === "git.workspace.status.v1") || (lineStatsSupported && f === "git.workspace.line-stats.v1") || (branchesSupported && f === "git.workspace.branches.v1") || (switchSupported && f === "git.workspace.branch-switch.v1") || (syncSupported && f === "git.workspace.remote-sync.v1")),
  sendRpc: async (id, method, params, opts) => {
   calls.push({id, method, params, opts});
   if (!online) throw new Error("offline");
   if (!supported) throw new Error("unsupported");
   if (!previewSupported && opts.requiredFeatures?.includes("git.workspace.commit-preview.v1")) throw new Error("preview unsupported");
   if (!lineStatsSupported && opts.requiredFeatures?.includes("git.workspace.line-stats.v1")) throw new Error("line stats unsupported");
+  if (!branchesSupported && opts.requiredFeatures?.includes("git.workspace.branches.v1")) throw new Error("branches unsupported");
+  if (!switchSupported && opts.requiredFeatures?.includes("git.workspace.branch-switch.v1")) throw new Error("checkout unsupported");
+  if (!syncSupported && opts.requiredFeatures?.includes("git.workspace.remote-sync.v1")) throw new Error("sync unsupported");
   if (generation !== opts.expectedConnectionGeneration) throw new Error("generation changed");
   if (opts.signal?.aborted) throw new Error("aborted");
   return {stdout:"patch",truncated:true};
@@ -81,8 +84,52 @@ lineStatsSupported=false;
 assert.equal(b.supportsGitLineStats,false);
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"lineStats"}),/line stats unsupported/);
 lineStatsSupported=true;
+// Branch listing, switching and remote sync each negotiate their own feature and
+// must not borrow another operation's capability.
+assert.equal(b.supportsGitBranches,true);
+assert.equal(b.supportsGitBranchSwitch,true);
+assert.equal(b.supportsGitRemoteSync,true);
+for (const [operation, feature] of [
+ ["branches","git.workspace.branches.v1"],
+ ["checkout","git.workspace.branch-switch.v1"],
+ ["push","git.workspace.remote-sync.v1"],
+ ["fetch","git.workspace.remote-sync.v1"],
+]) {
+ const request = {cwd:"/repo",expectedRoot:"/repo",operation,timeoutMs:1250,maxBytes:999999};
+ if (operation === "checkout") Object.assign(request,{branch:"feature/x",create:true,startPoint:"origin/feature/x"});
+ if (operation === "push") Object.assign(request,{remote:"origin",setUpstream:true});
+ if (operation === "fetch") Object.assign(request,{prune:true});
+ await b.gitWorkspace(request,controller.signal);
+ const call = calls.at(-1);
+ assert.equal(call.method,"git.workspace");
+ assert.equal(call.params.operation,operation);
+ assert.equal(call.params.maxBytes,65536);
+ assert.equal(call.opts.signal,controller.signal);
+ assert.equal(call.opts.timeoutMs,6250);
+ assert.equal(call.opts.expectedConnectionGeneration,3);
+ assert.deepEqual(call.opts.requiredFeatures,["git.workspace.v1",feature]);
+ if (operation === "checkout") {
+  assert.equal(call.params.branch,"feature/x"); assert.equal(call.params.create,true); assert.equal(call.params.startPoint,"origin/feature/x");
+ }
+ if (operation === "push") { assert.equal(call.params.remote,"origin"); assert.equal(call.params.setUpstream,true); }
+ if (operation === "fetch") assert.equal(call.params.prune,true);
+}
+branchesSupported=false;
+assert.equal(b.supportsGitBranches,false);
+assert.equal(b.supportsGitWorkspace,true);
+await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"branches"}),/branches unsupported/);
+switchSupported=false;
+assert.equal(b.supportsGitBranchSwitch,false);
+await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"checkout",branch:"x"}),/checkout unsupported/);
+syncSupported=false;
+assert.equal(b.supportsGitRemoteSync,false);
+await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"push"}),/sync unsupported/);
+await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"fetch"}),/sync unsupported/);
 supported=false; assert.equal(b.supportsGitWorkspace,false);
 assert.equal(b.supportsGitLineStats,false);
+assert.equal(b.supportsGitBranches,false);
+assert.equal(b.supportsGitBranchSwitch,false);
+assert.equal(b.supportsGitRemoteSync,false);
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"}),/unsupported/);
 supported=true; generation=4;
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"}),/generation changed/);
@@ -90,7 +137,7 @@ generation=3; online=false;
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"}),/offline/);
 online=true; controller.abort();
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"},controller.signal),/aborted/);
-assert.equal(calls.length,11);
+assert.equal(calls.length,19);
 console.log("remote Git backend assertions passed");
 `;
 	const proc = Bun.spawn([process.execPath, "--eval", source], { stdout: "pipe", stderr: "pipe" });

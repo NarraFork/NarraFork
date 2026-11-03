@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 133 tables and 1743 columns including the outline storage tables", () => {
-		expect(target.tables.length).toBe(133);
+	test("covers 135 tables and 1786 columns including the outline storage tables", () => {
+		expect(target.tables.length).toBe(135);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -541,7 +541,43 @@ describe("real schema parity", () => {
 		// Outline storage adds seven tables (67): outline_spaces (8), outline_blocks (14),
 		// outline_block_versions (13), outline_links (8), outline_commits (12),
 		// outline_live_updates (7) and outline_view_state (5).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1743);
+		// Account-scoped Git identity entry visibility adds two user_preferences columns.
+		// Native media adds narrator_buffered_messages.media_json.
+		// Outline tasks (P2) add outline_task_claims (9), outline_blocks.in_process,
+		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
+		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
+		// The outline task source (P2) adds narrators.task_backend.
+		// Locks and pending confirmation (P2) add outline_pending (25).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1786);
+		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "hiddenFromLists",
+					name: "hidden_from_lists",
+					pgType: "boolean",
+					notNull: true,
+					defaultExpression: "false",
+				}),
+				expect.objectContaining({
+					property: "modeltraceKey",
+					name: "modeltrace_key",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
+		expect(
+			target.tables.find((table) => table.name === "narrator_buffered_messages")?.columns,
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "mediaJson",
+					name: "media_json",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

@@ -34,7 +34,12 @@ export async function generateWithFirstTokenTimeout<T>(
 	});
 	try {
 		return await Promise.race([
-			generate({ signal, onTextDelta: onDelta, onReasoningDelta: onDelta }),
+			generate({
+				signal,
+				onTextDelta: onDelta,
+				onReasoningDelta: onDelta,
+				onGenerationProgress: clearTimer,
+			}),
 			aborted,
 		]);
 	} finally {

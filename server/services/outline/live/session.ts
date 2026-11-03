@@ -58,6 +58,7 @@ import {
 	LIVE_STATUS_OF_TASK,
 	type LiveActor,
 	type LiveBatchHead,
+	type LiveClaimedWire,
 	type LiveCloseCode,
 	type LiveCommitWire,
 	type LiveJoinedHead,
@@ -66,13 +67,21 @@ import {
 	type LivePeerWire,
 	type LivePresenceDown,
 	type LiveRejectCode,
+	type LiveRejectHead,
 	type LiveSelWire,
 	type LiveTaskChar,
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
 import * as Y from "yjs";
+import { canManageSpace } from "../access";
+import { readDisplayNames } from "../access-reads";
 import { OutlineEditTextError } from "../edit-text-runner";
-import { OutlineBusyError, OutlineConflictError, OutlineWriteError } from "../errors";
+import {
+	OutlineBusyError,
+	OutlineConflictError,
+	OutlineTaskClaimedError,
+	OutlineWriteError,
+} from "../errors";
 import { OUTLINE_LIMITS, type OutlineTaskJson } from "../model";
 import { outlineStore } from "../store";
 import type { OutlineVersionRow } from "../store/port";
@@ -996,13 +1005,14 @@ export class LivePage {
 	// Text updates
 	// ─────────────────────────────────────────────────────────────────────────
 
-	private reject(p: Participant, n: number, code: LiveRejectCode): void {
+	private reject(p: Participant, n: number, code: LiveRejectCode, claimed?: LiveClaimedWire): void {
 		this.stats.txRejected++;
 		p.blocked = true;
 		// Everything up to the refused frame is acknowledged first, in order.
 		this.flushBroadcast();
+		const head: LiveRejectHead = claimed ? { code, claimed } : { code };
 		this.deliver(p, "control", () =>
-			encodeLiveFrame({ kind: LIVE_FRAME.reject, handle: p.handle, n, head: { code } }),
+			encodeLiveFrame({ kind: LIVE_FRAME.reject, handle: p.handle, n, head }),
 		);
 	}
 
@@ -1329,6 +1339,7 @@ export class LivePage {
 		responsible: string | null,
 		summary: string,
 		groups?: ReadonlyArray<readonly [number, number]>,
+		unlockAuthority?: () => Promise<boolean>,
 	): Promise<OutlineWriteResult[]> {
 		const chunks = planChunks(ops, groups);
 		const out: OutlineWriteResult[] = [];
@@ -1343,6 +1354,7 @@ export class LivePage {
 								actor,
 								responsibleUserId: responsible,
 								...(summary ? { summary } : {}),
+								...(unlockAuthority ? { unlockAuthority } : {}),
 							},
 							{ canonical: canonical.slice(a, b) },
 						),
@@ -1358,6 +1370,14 @@ export class LivePage {
 			}
 		}
 		return out;
+	}
+
+	/** Whether the participant may take away someone else's lock: a manager of the space. */
+	private async mayUnlockAnyone(p: Participant): Promise<boolean> {
+		const space = await outlineStore.getSpace(this.spaceId);
+		return space
+			? await canManageSpace({ userId: p.userId, isAdmin: p.socket.isAdmin }, space)
+			: false;
 	}
 
 	/** Record what the database holds for a block now (logged for replay, see `persistStep`). */
@@ -1377,7 +1397,9 @@ export class LivePage {
 		const r = merge3(from, to, current, { lenient: true });
 		if (!r.ok || r.result === current) return;
 		this.doc.transact(() => {
-			for (const h of [...r.patch].sort((a, b) => b.start - a.start)) {
+			// Last first, so earlier offsets hold; hunks at one offset in reverse too (an insertion
+			// before a deletion there must be applied after it), as `applyHunks` reads them.
+			for (const h of [...r.patch].sort((a, b) => a.start - b.start).reverse()) {
 				if (h.end > h.start) t.delete(h.start, h.end - h.start);
 				if (h.text) t.insert(h.start, h.text);
 			}
@@ -1544,7 +1566,11 @@ export class LivePage {
 		const mark = this.pendingRows.length;
 		let held: PendingRow[] = [];
 		const intents = new Map<string, string>();
-		const refuse = (code: LiveRejectCode, committed: readonly OutlineWriteResult[] = []) => {
+		const refuse = (
+			code: LiveRejectCode,
+			committed: readonly OutlineWriteResult[] = [],
+			claimed?: LiveClaimedWire,
+		) => {
 			const before = this.pendingRows.length;
 			undo.undo();
 			undo.destroy();
@@ -1552,7 +1578,7 @@ export class LivePage {
 			this.pendingRows.splice(before);
 			held = [];
 			this.cancelIntents(intents.keys());
-			this.reject(p, n, code);
+			this.reject(p, n, code, claimed);
 			return committed;
 		};
 		// While the transaction's change is held back, no snapshot of the document (a
@@ -1605,12 +1631,20 @@ export class LivePage {
 						{ kind: "human", id: p.userId },
 						p.userId,
 						"",
+						undefined,
+						// Taking a lock away (the locked task's checkbox, the task itself) needs the
+						// right to unlock: the locker, a manager of the space, an admin (review S-4).
+						async () => await this.mayUnlockAnyone(p),
 					);
 				} catch (error) {
 					const cause = error instanceof LiveChunkError ? error.cause : error;
+					// A task someone else is doing: the refusal says who, for the editor to show.
+					const claimed =
+						cause instanceof OutlineTaskClaimedError ? await claimedWire(cause) : undefined;
 					const committed = refuse(
 						isConflict(cause) ? "conflict" : "failed",
 						error instanceof LiveChunkError ? error.committed : [],
+						claimed,
 					);
 					// Part of it was written (a large paste over several transactions): the session
 					// takes what the page now holds, as it would a write from outside.
@@ -2638,7 +2672,28 @@ function socketBuffered(socket: LiveSocket): number {
 	}
 }
 
-/** Errors of the write path that mean "the structure moved under this transaction". */
+/** Who is doing the task a refused change touched, as the reject frame carries it. */
+async function claimedWire(error: OutlineTaskClaimedError): Promise<LiveClaimedWire> {
+	const holder = error.holder;
+	const id = holder.kind === "agent" ? holder.narratorId : holder.userId;
+	let name: string | null = null;
+	try {
+		const names = await readDisplayNames(
+			holder.kind === "agent" ? { narratorIds: [id] } : { userIds: [id] },
+		);
+		name = (holder.kind === "agent" ? names.narrators.get(id) : names.users.get(id)) ?? null;
+	} catch {
+		// The id alone still says who.
+	}
+	return { address: error.address, holder: { kind: holder.kind, id, name } };
+}
+
+/**
+ * Errors of the write path that mean "the structure moved under this transaction", or someone
+ * else got there first (a task another session or person is doing: setting it to in progress
+ * is refused), or the state of others' work stands in the way (a lock only its locker, a
+ * manager or an admin may change; a page full of changes waiting for confirmation).
+ */
 export function isConflict(error: unknown): boolean {
 	return (
 		error instanceof OutlineConflictError ||
@@ -2649,6 +2704,11 @@ export function isConflict(error: unknown): boolean {
 				"OUTLINE_BLOCK_DELETED",
 				"OUTLINE_CYCLE",
 				"OUTLINE_ID_TAKEN",
+				"OUTLINE_TASK_CLAIMED",
+				"OUTLINE_LOCK_DENIED",
+				"OUTLINE_LOCK_HELD",
+				// A locked task moving to a page with as many open changes as it may hold.
+				"OUTLINE_PENDING_FULL",
 			].includes(error.code))
 	);
 }

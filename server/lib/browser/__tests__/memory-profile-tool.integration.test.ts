@@ -36,7 +36,7 @@ try {
 	await getBrowser();
 	chrome = true;
 } catch (error) {
-	if (!(error instanceof Error) || !error.message.startsWith("Could not find Chrome/Chromium."))
+	if (!(error instanceof Error) || !error.message.startsWith("Could not find Chrome/Chromium"))
 		throw error;
 	console.warn("SKIP memory profile tool integration: Chrome missing");
 }

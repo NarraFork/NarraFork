@@ -32,6 +32,7 @@ import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-e
  * - `userchat` — the human discussion room beside this narrator (people talking to
  *   each other; its content never enters the narrator's context unless someone
  *   forwards it explicitly).
+ * - `timeline` — per-turn horizontal timeline of this agent and its subagents.
  * - `appearance` — live typography controls for this transcript (font size / letter
  *   spacing / block spacing), so the reader can adjust while watching the effect.
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
@@ -53,6 +54,7 @@ export type PanelKind =
 	| "search"
 	| "userchat"
 	| "appearance"
+	| "timeline"
 	| "filetree"
 	| "subagent"
 	| "file"
@@ -302,6 +304,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	search: "search",
 	userchat: "userchat",
 	appearance: "appearance",
+	timeline: "timeline",
 	filetree: "filetree",
 	subagent: "subagent",
 	file: "file",
@@ -330,6 +333,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	search: "Search",
 	userchat: "Discussion",
 	appearance: "Appearance",
+	timeline: "Timeline",
 	filetree: "Files",
 	subagent: "Subagent",
 	file: "File",

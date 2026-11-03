@@ -16,6 +16,8 @@ interface Transport {
 export type OutlinePageHint =
 	| { kind: "subscribed"; seq: number }
 	| { kind: "changed"; seq: number }
+	/** The page's changes waiting for confirmation changed: re-read its pending summary. */
+	| { kind: "pending" }
 	| { kind: "denied" }
 	| { kind: "unavailable" }
 	| { kind: "disconnect" };
@@ -56,12 +58,23 @@ export class OutlinePageSubscriptions {
 				this.transport.send({ type: "outline_page_subscribe", subscriptionId: id, pageId });
 			};
 			const listener = this.transport.addListener(
-				{ types: ["outline_page_subscribed", "outline_page_changed", "outline_page_error"] },
+				{
+					types: [
+						"outline_page_subscribed",
+						"outline_page_changed",
+						"outline_page_pending",
+						"outline_page_error",
+					],
+				},
 				(frame) => {
 					if (!active || !id || frame.subscriptionId !== id) return;
 					if (frame.type === "outline_page_error") {
 						id = "";
 						emit({ kind: frame.code === "access_denied" ? "denied" : "unavailable" });
+						return;
+					}
+					if (frame.type === "outline_page_pending") {
+						if (frame.pageId === pageId) emit({ kind: "pending" });
 						return;
 					}
 					if (frame.pageId !== pageId || !Number.isSafeInteger(frame.seq)) return;

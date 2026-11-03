@@ -127,17 +127,80 @@
 	display: none;
 }
 
+/* What the facts view leaves out under a block (design §3.1): how many blocks under tasks. */
 .nf-outline-editor .ob-hidden {
 	position: absolute;
 	right: 0;
 	top: 0.15em;
 	font-size: 11px;
-	color: var(--ob-muted);
 	border: 1px solid var(--ob-line);
 	border-radius: 8px;
 	padding: 0 5px;
 	user-select: none;
-	pointer-events: none;
+	color: var(--ob-muted);
+	z-index: 1;
+}
+
+/* Open tasks under the block: the marker opens their list. */
+.nf-outline-editor .ob-hidden[data-open] {
+	color: var(--mantine-color-yellow-text, var(--ob-muted));
+	cursor: pointer;
+}
+
+.nf-outline-editor .ob-task-list {
+	position: absolute;
+	right: 0;
+	top: 1.6em;
+	z-index: 3;
+	min-width: 180px;
+	max-width: min(360px, 90vw);
+	padding: 4px;
+	border: 1px solid var(--ob-line);
+	border-radius: 6px;
+	background: var(--mantine-color-body);
+	box-shadow: var(--mantine-shadow-sm);
+	font-size: 12px;
+	user-select: none;
+}
+
+.nf-outline-editor .ob-task-item {
+	padding: 2px 6px;
+	border-radius: 4px;
+	cursor: pointer;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nf-outline-editor .ob-task-item:hover {
+	background: var(--mantine-color-default-hover);
+}
+
+/* A locked plan's root and blocks a pending change touches (P2 PR 6). */
+.nf-outline-editor .ob-marks {
+	float: right;
+	display: inline-flex;
+	gap: 4px;
+	margin-left: 6px;
+	font-size: 11px;
+	user-select: none;
+}
+
+.nf-outline-editor .ob-lock,
+.nf-outline-editor .ob-pending {
+	border-radius: 8px;
+	padding: 0 6px;
+	white-space: nowrap;
+}
+
+.nf-outline-editor .ob-lock {
+	color: var(--mantine-color-indigo-text);
+	background: var(--mantine-color-indigo-light);
+}
+
+.nf-outline-editor .ob-pending {
+	color: var(--mantine-color-orange-text);
+	background: var(--mantine-color-orange-light);
 }
 
 /* The focused block is the root: its first line is the title. */

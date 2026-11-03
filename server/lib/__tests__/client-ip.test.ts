@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { networkInterfaces } from "node:os";
 import {
+	isLocalMachineAddress,
 	isTrustedProxyAddress,
 	isValidTrustedProxyCidr,
 	normalizeIp,
@@ -102,5 +104,45 @@ describe("resolveClientIp", () => {
 				trustedProxyCidrs: ["::1/128"],
 			}),
 		).toBe("2001:db8::5");
+	});
+});
+
+const nonLoopbackLocalAddress = Object.values(networkInterfaces())
+	.flatMap((entries) => entries ?? [])
+	.map((entry) => entry.address)
+	.find((address) => !address.startsWith("127.") && address !== "::1");
+
+describe("isLocalMachineAddress", () => {
+	test("loopback of both families counts as this machine", () => {
+		expect(isLocalMachineAddress("127.0.0.1")).toBe(true);
+		expect(isLocalMachineAddress("127.5.5.5")).toBe(true);
+		expect(isLocalMachineAddress("::1")).toBe(true);
+		expect(isLocalMachineAddress("::ffff:127.0.0.1")).toBe(true);
+		expect(isLocalMachineAddress("::ffff:7f00:1")).toBe(true);
+	});
+
+	test("host:port and bracketed forms reach the same verdict", () => {
+		expect(isLocalMachineAddress("[::1]:7779")).toBe(true);
+		expect(isLocalMachineAddress("127.0.0.1:7779")).toBe(true);
+		expect(isLocalMachineAddress("[2001:db8::5]:7779")).toBe(false);
+	});
+
+	// Machines with only a loopback interface cannot demonstrate the interface branch;
+	// skip visibly instead of silently passing.
+	test.skipIf(!nonLoopbackLocalAddress)(
+		"an address owned by a local interface counts, even when it is routable",
+		() => {
+			expect(isLocalMachineAddress(nonLoopbackLocalAddress)).toBe(true);
+			// Repeated calls hit the cached interface snapshot and must agree.
+			expect(isLocalMachineAddress(nonLoopbackLocalAddress)).toBe(true);
+		},
+	);
+
+	test("addresses of other machines and unknown values do not", () => {
+		expect(isLocalMachineAddress("203.0.113.9")).toBe(false);
+		expect(isLocalMachineAddress("2001:db8::5")).toBe(false);
+		expect(isLocalMachineAddress("unknown")).toBe(false);
+		expect(isLocalMachineAddress("")).toBe(false);
+		expect(isLocalMachineAddress(null)).toBe(false);
 	});
 });

@@ -1,12 +1,13 @@
 import { X509Certificate } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { generate } from "selfsigned";
 import { ValidationError } from "./errors";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
 import { getLanAddresses } from "./net/lan-addresses";
+import type { TlsConfig } from "./settings/types";
 
 const CERT_FILE = "cert.pem";
 const KEY_FILE = "key.pem";
@@ -16,6 +17,7 @@ const SAN_SIDECAR_FILE = "san-list.json";
 
 const CERT_VALIDITY_YEARS = 10;
 const CA_VALIDITY_YEARS = 20;
+const CLOCK_SKEW_MS = 5 * 60 * 1000;
 /** Also the zod `.max()` in routes/tls.ts — keep the two from drifting apart. */
 export const MAX_CUSTOM_SANS = 50;
 
@@ -202,7 +204,7 @@ async function generateCa(): Promise<CaInfo> {
 		{
 			keySize: 2048,
 			algorithm: "sha256",
-			notBeforeDate: now,
+			notBeforeDate: new Date(now.getTime() - CLOCK_SKEW_MS),
 			notAfterDate: expiresAt,
 			extensions: [
 				{ name: "basicConstraints", cA: true, pathLenConstraint: 0, critical: true },
@@ -304,7 +306,7 @@ export async function issueServerCert(customSans?: string[]): Promise<IssuedServ
 		{
 			keySize: 2048,
 			algorithm: "sha256",
-			notBeforeDate: now,
+			notBeforeDate: new Date(now.getTime() - CLOCK_SKEW_MS),
 			notAfterDate: expiresAt,
 			extensions: [
 				{ name: "basicConstraints", cA: false },
@@ -348,6 +350,40 @@ export async function issueServerCert(customSans?: string[]): Promise<IssuedServ
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
+
+/** Canonicalize IPv6 spellings and DNS case for SAN set comparisons. */
+function normalizeSan(name: string): string {
+	return isIP(name) === 6 ? new URL(`http://[${name}]`).hostname : name.toLowerCase();
+}
+
+/** Run once before binding HTTPS; never replace external certificates or rotate a CA. */
+export async function reissueBuiltinTlsOnStartup(tls: TlsConfig | undefined): Promise<boolean> {
+	if (!tls?.enabled || tls.autoReissue === false) return false;
+	const { certPath, keyPath, caCertPath, caKeyPath } = getTlsPaths();
+	if (
+		!tls.certFile ||
+		!tls.keyFile ||
+		resolve(tls.certFile) !== certPath ||
+		resolve(tls.keyFile) !== keyPath ||
+		tls.passphrase ||
+		![certPath, keyPath, caCertPath, caKeyPath].every(existsSync)
+	)
+		return false;
+
+	const certPem = readFileSync(certPath, "utf8");
+	const cert = new X509Certificate(certPem);
+	const ca = new X509Certificate(readFileSync(caCertPath, "utf8"));
+	if (!cert.checkIssued(ca) || !cert.verify(ca.publicKey)) return false;
+
+	const current = new Set((parseCertFile(certPem)?.sans ?? []).map(normalizeSan));
+	const expected = new Set([...getAutoSans(), ...readCustomSans()].map(normalizeSan));
+	if (current.size === expected.size && [...expected].every((san) => current.has(san))) {
+		return false;
+	}
+	await issueServerCert();
+	logger.info("TLS certificate updated on startup: SANs changed (CA preserved)");
+	return true;
+}
 
 function parseCertFile(
 	certPem: string,
@@ -420,7 +456,7 @@ export async function generateSelfSignedCert(): Promise<GeneratedCert> {
 	const result = await generate(attrs, {
 		keySize: 2048,
 		algorithm: "sha256",
-		notBeforeDate: now,
+		notBeforeDate: new Date(now.getTime() - CLOCK_SKEW_MS),
 		notAfterDate: expiresAt,
 		extensions: [
 			{ name: "basicConstraints", cA: false },
