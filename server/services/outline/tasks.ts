@@ -1006,9 +1006,9 @@ export async function findContinuationCandidates(options: {
 /**
  * Sort blocks into document order: `first` space before the others (by key), then by the path of
  * sibling positions from the page down. Ancestors are read level by level, one indexed query per
- * space and level, at most {@link OUTLINE_LIMITS.maxDepth} levels.
+ * space and level, at most {@link OUTLINE_LIMITS.maxDepth} levels. Also the task board's order.
  */
-async function inDocumentOrder(
+export async function inDocumentOrder(
 	store: OutlineStore,
 	blocks: readonly OutlineBlockMeta[],
 	first: string | null,

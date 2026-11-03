@@ -211,7 +211,7 @@ function fixture(
 		catalogError,
 		// Spec sessions: the outline-only /goal refusals stay out of the way.
 		resolveTaskBackend: async () => "spec",
-		isOutlineSessionGoal: async () => false,
+		isRefusedOutlineGoal: async () => false,
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
 		bindComposerDocumentReferences,

@@ -12,7 +12,9 @@
  *
  *   - `doing` / `todo`: a candidate in progress / to do;
  *   - `blocked`: a waiting task, whatever its checkbox (it cannot be started or continued);
- *   - `protected`: created by a person (`/goal`, the interface; D27a).
+ *   - `protected`: created by a person (`/goal`, the board; D27a). The count that drives
+ *     `protectedOnly` leaves out a person's goal whose completion only waits for that person to
+ *     confirm it (D26b; outline P2 PR 5): the agent has done its part.
  *
  * Order is document order. Current is the first `doing`, next the first `todo` (anywhere, as
  * spec's). At most {@link OUTLINE_TASK_SOURCE_LIMITS.tasks} of each kind are read.
@@ -71,6 +73,7 @@ import {
 } from "../outline/errors";
 import { OUTLINE_TEXT } from "../outline/messages";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "../outline/model";
+import { findCompletionsAwaitingConfirmation } from "../outline/pending";
 import { recordOutlineReads, seenOutlineVersion } from "../outline/read-ledger";
 import { resolveNarratorSpaces } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
@@ -168,6 +171,34 @@ function isRefusedClaim(error: unknown): boolean {
 		error instanceof OutlineBusyError ||
 		error instanceof OutlineStaleWriteError
 	);
+}
+
+/**
+ * Of the given open tasks, those whose being done waits for its person's confirmation (a locked
+ * goal the agent ticked done, D26b), by task id.
+ */
+async function completionsAwaited(entries: readonly OpenEntry[]): Promise<Set<string>> {
+	const waiting = entries.filter((entry) => entry.wait?.confirmation);
+	if (waiting.length === 0) return new Set();
+	const found = await findCompletionsAwaitingConfirmation(
+		waiting.map((entry) => ({
+			id: entry.ref.blockId,
+			spaceId: entry.ref.spaceId,
+			taskJson: entry.ref.taskJson,
+		})),
+	);
+	return new Set(found.keys());
+}
+
+/**
+ * The open person-created tasks that drive `protectedOnly` (D27a): all of them except those whose
+ * completion only waits for the person to confirm it (outline P2 PR 5). The agent has done its
+ * part there, so continuing would only run a pass saying everything waits.
+ */
+async function protectedOpen(read: OpenRead): Promise<OpenEntry[]> {
+	const entries = read.entries.filter(isProtected);
+	const awaited = await completionsAwaited(entries);
+	return awaited.size === 0 ? entries : entries.filter((e) => !awaited.has(e.ref.blockId));
 }
 
 /** One narrator's outline task source. Reads go to the database each time. */
@@ -276,7 +307,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			}
 		}
 		const chosen = firstOf(read, "doing") ?? firstOf(read, "blocked");
-		const protectedOpenCount = read.entries.filter(isProtected).length;
+		const protectedOpenCount = (await protectedOpen(read)).length;
 		if (!chosen) return { openTask: null, protectedOpenCount };
 		const text = (await titlesOf([chosen])).get(chosen.ref.blockId) ?? chosen.ref.sid;
 		const openTask: ContinuationTask = remember(
@@ -422,8 +453,11 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			};
 		},
 		async protectedOpenCount() {
+			return (await protectedOpen(await readOpen(await session()))).length;
+		},
+		async awaitingConfirmation() {
 			const read = await readOpen(await session());
-			return read.entries.filter(isProtected).length;
+			return (await completionsAwaited(read.entries.filter(isProtected))).size;
 		},
 		prepareContinuation: ({ promoteTodo }) => prepareContinuation(promoteTodo),
 		continuationPrompt,

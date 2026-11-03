@@ -98,7 +98,7 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getToolMessage, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -779,6 +779,9 @@ export async function executeQueuedNewCommand(
  * existed. Uses the `disp` role so this UI-only notice never enters the model
  * history (unlike spec_continuation, which is an instruction to the model).
  * Shared by the idle route path and the busy buffer-consumption path.
+ *
+ * An outline session's card (`outline` given) names the task's address and its
+ * lock instead of Dynamic Spec's protection; its button opens the task board.
  */
 export async function persistGoalAddedNotice(
 	...args: Parameters<typeof persistGoalAddedNoticeUnlocked>
@@ -790,7 +793,25 @@ async function persistGoalAddedNoticeUnlocked(
 	narratorId: string,
 	objective: string,
 	added: boolean,
+	outline?: { address: string; locked: boolean },
 ): Promise<void> {
+	if (outline) {
+		const text = added
+			? `Goal added to the outline (${outline.address}${outline.locked ? ", locked" : ""}) — ${objective}`
+			: `Goal already in the outline (${outline.address}) — ${objective}`;
+		await narratorService.persistDisplayMessage(narratorId, text, [
+			{
+				type: "spec_goal_added",
+				task: objective,
+				added,
+				protected: true,
+				taskBackend: "outline",
+				ref: outline.address,
+				locked: outline.locked,
+			},
+		]);
+		return;
+	}
 	const text = added
 		? `Dynamic Spec: protected task added — ${objective}`
 		: `Dynamic Spec: protected task already exists — ${objective}`;
@@ -800,19 +821,70 @@ async function persistGoalAddedNoticeUnlocked(
 	]);
 }
 
+/** What a `/goal` did: whether it added the task, and for an outline session where. */
+export interface GoalApplied {
+	added: boolean;
+	/** An outline session's task (its address and lock); absent for Dynamic Spec. */
+	outline?: { address: string; locked: boolean };
+}
+
+/**
+ * Add a `/goal`'s task where the session keeps its tasks, after its message was saved:
+ *
+ *   - Dynamic Spec: a protected todo appended to tasks.json (deduped by text), as before;
+ *   - the outline (P2 PR 5): a person-created, locked task on the session space's task page,
+ *     deduped by title (`addPersonTask`). Its commit does not also leave the "a person changed
+ *     your tasks" note: the `/goal` message says it already.
+ *
+ * The first turn is started by the caller (`startSpecContinuationIfPossible`), the same way for
+ * both: it runs once even when continuation is off, and never in plan mode.
+ */
+export async function applyGoalCommand(
+	narratorId: string,
+	objective: string,
+	options: { userId: string | null; messageId?: string | null; locale?: Locale },
+): Promise<GoalApplied> {
+	if ((await resolveTaskBackend(narratorId)) === "outline") {
+		if (!options.userId) throw new ValidationError("/goal needs the person who sent it");
+		const { addPersonTask } = await import("./outline/person-tasks");
+		const { skipOutlineTaskEditNotice } = await import("./outline-task-edits");
+		const task = await addPersonTask({
+			narratorId,
+			userId: options.userId,
+			text: objective,
+			lock: true,
+			locale: options.locale === "zh-CN" ? "zh-CN" : "en",
+			messageId: options.messageId ?? null,
+		});
+		if (task.commitId) skipOutlineTaskEditNotice(task.commitId);
+		return { added: task.added, outline: { address: task.address, locked: task.locked } };
+	}
+	const { added, written } = await specVfsService.appendProtectedSpecTask(narratorId, objective);
+	if (added) {
+		broadcastSpecChanged(
+			narratorId,
+			{ uri: written.uri, path: written.path, revisionId: written.revisionId },
+			"ui",
+			"user",
+		);
+	}
+	return { added };
+}
+
 /**
  * Execute a buffered `/goal` command: persist it as the canonical user message
- * (so it stays visible in the conversation) and append the protected task to
- * spec://tasks.json. Runs when a queued /goal is consumed after the turn that
- * was busy at submit time; the caller then starts a Spec continuation turn.
+ * (so it stays visible in the conversation) and add its task where the session
+ * keeps its tasks ({@link applyGoalCommand}). Runs when a queued /goal is consumed
+ * after the turn that was busy at submit time; the caller then starts the goal's
+ * first turn.
  */
 export async function executeQueuedGoalCommand(
 	narratorId: string,
 	buffered: BufferedMessage,
 	objective: string,
-): Promise<{ refused: true } | { refused: false; added: boolean }> {
-	// Before anything is saved: a session whose tasks live in the outline has no tasks.json.
-	if ((await resolveTaskBackend(narratorId)) === "outline") {
+): Promise<{ refused: true } | ({ refused: false } & GoalApplied)> {
+	// Before anything is saved: an outline subagent has no tasks of its own to add the goal to.
+	if (await isRefusedOutlineGoal(narratorId, buffered.text, buffered.commandText)) {
 		await refuseQueuedOutlineGoal(narratorId, buffered);
 		return { refused: true };
 	}
@@ -846,34 +918,36 @@ export async function executeQueuedGoalCommand(
 		narratorId,
 		message: fileReferenceMessageForDisplay(userMsg),
 	});
-	const { added, written } = await specVfsService.appendProtectedSpecTask(narratorId, objective);
-	if (added) {
-		broadcastSpecChanged(
-			narratorId,
-			{ uri: written.uri, path: written.path, revisionId: written.revisionId },
-			"ui",
-			"user",
-		);
-	}
+	const locale = buffered.createdBy
+		? await getUserLanguage(buffered.createdBy).catch(() => "en" as const)
+		: "en";
+	const applied = await applyGoalCommand(narratorId, objective, {
+		userId: buffered.createdBy ?? null,
+		messageId: userMsg.id,
+		locale,
+	});
 	// The task mutation is the command's durable effect. A display-only confirmation
 	// card is best-effort so a transient message persistence failure cannot mark the
 	// narrator errored or prevent later buffered messages from draining.
-	await persistGoalAddedNotice(narratorId, objective, added).catch((err) => {
-		logger.warn("Failed to persist queued /goal confirmation notice", {
-			narratorId,
-			error: String(err),
-		});
-	});
-	return { refused: false, added };
+	await persistGoalAddedNotice(narratorId, objective, applied.added, applied.outline).catch(
+		(err) => {
+			logger.warn("Failed to persist queued /goal confirmation notice", {
+				narratorId,
+				error: String(err),
+			});
+		},
+	);
+	return { refused: false, ...applied };
 }
 
 /**
- * Whether this input is a `/goal` the queue consumer would run, for a session whose tasks live in
- * the outline (outline P2). Such a session has no tasks.json to add the goal to; its `/goal` (a
- * person-created, locked task) arrives with the task board (plan PR 5). Every entry point that
- * queues input refuses it before anything is queued or saved.
+ * Whether this input is a `/goal` the queue consumer would refuse: one sent to a subagent of a
+ * session whose tasks live in the outline. The goal is a task of the session, and an outline
+ * subagent has no tasks of its own (D27c). Every entry point that queues input refuses it before
+ * anything is queued or saved; in a root outline session `/goal` adds a person-created, locked
+ * task (outline P2 PR 5).
  */
-export async function isOutlineSessionGoal(
+export async function isRefusedOutlineGoal(
 	narratorId: string,
 	message: string,
 	commandText?: string | null,
@@ -881,14 +955,16 @@ export async function isOutlineSessionGoal(
 	intent?: BufferedExecutionIntent,
 ): Promise<boolean> {
 	if (!parseQueuedGoalCommand(message, commandText, composerDocument, intent)) return false;
-	return (await resolveTaskBackend(narratorId)) === "outline";
+	if ((await resolveTaskBackend(narratorId)) !== "outline") return false;
+	const { readTaskSession } = await import("./task-source/backend");
+	return (await readTaskSession(narratorId))?.subagent === true;
 }
 
 /**
- * The consumers' backstop for a queued `/goal` that reached an outline session anyway (queued
- * while the outline was switched off, say): the row is dropped from the queue without its message
- * ever being saved, the person is told why, and the caller drains on as after any terminal
- * command. Never throws: a refusal must not stall the queue.
+ * The consumers' backstop for a queued `/goal` an outline subagent cannot take (queued while the
+ * outline was switched off, say): the row is dropped from the queue without its message ever
+ * being saved, the person is told why, and the caller drains on as after any terminal command.
+ * Never throws: a refusal must not stall the queue.
  */
 async function refuseQueuedOutlineGoal(narratorId: string, buffered: BufferedMessage) {
 	const refusal = catalogError("GOAL_IN_OUTLINE_SESSION");
@@ -1140,12 +1216,12 @@ async function resumeNextBufferedMessageUnlocked(
 				})
 				.catch((err) => handleTerminalCommandError("/new", err));
 		} else if (goalCommand) {
-			// Queued /goal: persist the protected task, then launch its first Spec turn.
-			// If plan mode or another guard prevents starting, keep draining as before.
+			// Queued /goal: persist its task (Dynamic Spec or the outline), then launch its first
+			// turn. If plan mode or another guard prevents starting, keep draining as before.
 			await executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
 				.then(async ({ refused }) => {
 					inputOwner.release();
-					// Refused for an outline session: nothing to start, drain on.
+					// Refused (an outline subagent): nothing to start, drain on.
 					if (refused) {
 						await settleAfterTerminalCommand();
 						return;

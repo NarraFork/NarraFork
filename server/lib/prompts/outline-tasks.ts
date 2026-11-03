@@ -423,3 +423,91 @@ const specUnavailable: LocalizedValue<string> = {
 export function getOutlineSpecUnavailableHint(locale: Locale): string {
 	return pickLocalizedValue(specUnavailable, locale);
 }
+
+// ─── People's changes to the session's tasks (outline P2 PR 5) ───
+
+/** One change a person made to a task of the session (the board, the outline editor). */
+export type OutlineTaskEditChange =
+	| { kind: "added" | "deleted" | "unchecked" | "moved" | "locked" | "unlocked" | "fields" }
+	| { kind: "status"; from: "todo" | "doing" | "done" | "cancelled" | null; to: string }
+	| { kind: "assigned"; to: string | null };
+
+export interface OutlineTaskEdit {
+	/** `key/sid`. */
+	address: string;
+	title: string;
+	/** Created by a person (`/goal`, the board). */
+	humanCreated: boolean;
+	locked: boolean;
+	changes: OutlineTaskEditChange[];
+}
+
+const STATUS_WORDS: Record<string, LocalizedValue<string>> = {
+	todo: { en: "to do", "zh-CN": "待办" },
+	doing: { en: "in progress", "zh-CN": "进行中" },
+	done: { en: "done", "zh-CN": "完成" },
+	cancelled: { en: "cancelled", "zh-CN": "取消" },
+};
+
+function changeText(change: OutlineTaskEditChange, locale: Locale): string {
+	const zh = locale === "zh-CN";
+	switch (change.kind) {
+		case "added":
+			return zh ? "新加" : "added";
+		case "deleted":
+			return zh ? "删除" : "deleted";
+		case "unchecked":
+			return zh ? "去掉了复选框，不再是任务" : "no longer a task (checkbox removed)";
+		case "moved":
+			return zh ? "移动了位置" : "moved";
+		case "locked":
+			return zh ? "锁定" : "locked";
+		case "unlocked":
+			return zh ? "解锁" : "unlocked";
+		case "fields":
+			return zh ? "改了前置或截止日期" : "prerequisites or due date changed";
+		case "assigned":
+			return change.to
+				? zh
+					? `交给 @${change.to}`
+					: `handed to @${change.to}`
+				: zh
+					? "交回本会话（去掉指派）"
+					: "handed back to this session (assignee removed)";
+		case "status": {
+			const to = pickLocalizedValue(
+				STATUS_WORDS[change.to] ?? { en: change.to, "zh-CN": change.to },
+				locale,
+			);
+			if (change.to === "todo" && (change.from === "done" || change.from === "cancelled"))
+				return zh ? "重开（回到待办）" : "reopened (back to to do)";
+			return zh ? `改成${to}` : `set to ${to}`;
+		}
+	}
+}
+
+/**
+ * The note a person's changes to the session's tasks leave for the agent: first person (it is
+ * the person's message), one line per task with its address. Delivered as a cut-in user message
+ * while the agent works, else ahead of its next turn.
+ */
+export function getOutlineTaskEditNote(
+	edits: readonly OutlineTaskEdit[],
+	more: number,
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const lines = edits.map((edit) => {
+		const marks = [
+			edit.humanCreated ? (zh ? "人建" : "set by a person") : null,
+			edit.locked ? (zh ? "已锁定" : "locked") : null,
+		].filter(Boolean);
+		const tail = marks.length > 0 ? ` (${marks.join(zh ? "，" : ", ")})` : "";
+		const what = edit.changes.map((c) => changeText(c, locale)).join(zh ? "；" : "; ");
+		return `- \`${edit.address}\` ${edit.title}${tail}: ${what}`;
+	});
+	if (more > 0) lines.push(zh ? `- 还有 ${more} 处改动` : `- ${more} more changes`);
+	return zh
+		? `我在界面上改了本会话的任务：\n${lines.join("\n")}\n\n请据此调整你的工作：要确认细节就用 OutlineRead 读这些任务。`
+		: `I changed tasks of this session in the interface:\n${lines.join("\n")}\n\nAdjust your work to these changes; read the tasks with OutlineRead if you need the details.`;
+}

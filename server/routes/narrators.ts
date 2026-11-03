@@ -17,6 +17,7 @@ import {
 } from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -402,7 +403,7 @@ import {
 	isCompactInProgress,
 	isLoopRunning,
 	isNarratorActive,
-	isOutlineSessionGoal,
+	isRefusedOutlineGoal,
 	normalizeRollbackBlockIndexForMessage,
 	readSessionDeliverTo,
 	reconcileRunningStatus,
@@ -484,7 +485,7 @@ import {
 	resolveSubagentModelInheritance,
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
-import { resolveTaskBackend } from "../services/task-source";
+import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -1613,6 +1614,27 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 	return c.json(summary);
 });
 
+/**
+ * The status bar's current task, from the task source (outline P2 PR 5): the first task in
+ * progress for either task backend, and for an outline session how many of its person-created
+ * goals wait for their person to confirm them done.
+ */
+narratorRoutes.get("/:id/tasks/current", async (c) => {
+	const id = c.req.param("id");
+	getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const source = await taskSourceForNarrator(id);
+	const [current, awaitingConfirmation] = await Promise.all([
+		source.currentTask().catch(() => null),
+		source.awaitingConfirmation ? source.awaitingConfirmation().catch(() => 0) : 0,
+	]);
+	const body: NarratorCurrentTaskResponse = {
+		backend: source.backend,
+		current: current ? { text: current.text, address: null, protected: current.protected } : null,
+		awaitingConfirmation,
+	};
+	return c.json(body);
+});
+
 narratorRoutes.get("/:id/panel-state", async (c) => {
 	const id = c.req.param("id");
 	const result = await getNarratorPanelState(id, c.get("user").sub, {
@@ -2184,6 +2206,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Set when a busy `/goal` falls through to the buffer path, so the buffered
 		// response can prompt the UI to show a "queued protected task" toast.
 		let specGoalQueued = false;
+		let specGoalOutline = false;
 		let specGoalObjective = "";
 		const cmdResult =
 			queuedNewCommand || mixedDocument
@@ -2299,18 +2322,19 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			);
 			return c.json(bashResult, 201);
 		}
-		// Handle /goal <objective> — add a protected task to spec://tasks.json and
-		// immediately start its first Spec execution turn. When the narrator is busy,
-		// queue the command and append/start it once the buffer consumer reaches it;
-		// this avoids mutating tasks.json in the middle of the current turn.
+		// Handle /goal <objective> — add its task where the session keeps its tasks (a protected
+		// todo in spec://tasks.json, or a person-created, locked task in the outline: P2 PR 5) and
+		// immediately start its first execution turn. When the narrator is busy, queue the command
+		// and add/start it once the buffer consumer reaches it; this avoids changing the tasks in
+		// the middle of the current turn.
 		if (cmdResult.resolved && "specGoal" in cmdResult) {
-			// A session whose tasks live in the outline has no tasks.json to add the goal to; its
-			// `/goal` (a person-created, locked task) arrives with the task board (plan PR 5).
-			// Refused before anything is persisted, so nothing lands where the session cannot see.
-			if ((await resolveTaskBackend(id)) === "outline") {
+			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			// An outline subagent has no tasks of its own to add the goal to. Refused before
+			// anything is persisted, so nothing lands where the session cannot see.
+			if (await isRefusedOutlineGoal(id, rawCommand)) {
 				throw catalogError("GOAL_IN_OUTLINE_SESSION");
 			}
-			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			const goalBackend = await resolveTaskBackend(id);
 			// A compacting narrator counts as busy here for the same reason a running one
 			// does: appending the protected task now and starting its Spec turn would run
 			// that turn against the history the compact is replacing.
@@ -2415,7 +2439,23 @@ narratorRoutes.post("/:id/messages", async (c) => {
 						});
 						return { started: false };
 					});
-					return c.json({ specGoal: true, added: result.outcome.added, objective, started }, 200);
+					const outcome = result.outcome;
+					return c.json(
+						{
+							specGoal: true,
+							added: outcome.added,
+							objective,
+							started,
+							...(outcome.outline
+								? {
+										taskBackend: "outline" as const,
+										address: outcome.outline.address,
+										locked: outcome.outline.locked,
+									}
+								: {}),
+						},
+						200,
+					);
 				}
 				if (result && "dispatchFailure" in result && result.dispatchFailure) {
 					try {
@@ -2469,6 +2509,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 							bufferedAt: result.accepted.bufferedAt,
 							specGoalQueued: true,
 							objective,
+							...(goalBackend === "outline" ? { taskBackend: "outline" as const } : {}),
 						},
 						202,
 					);
@@ -2481,6 +2522,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			commandText = rawCommand;
 			specGoalQueued = true;
 			specGoalObjective = objective;
+			specGoalOutline = goalBackend === "outline";
 		}
 		let prePromptBashCommand: string | undefined;
 		if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
@@ -2621,7 +2663,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					buffered: true,
 					bufferedAt: result.bufferedAt,
 					id: result.id,
-					...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
+					...(specGoalQueued
+						? {
+								specGoalQueued: true,
+								objective: specGoalObjective,
+								...(specGoalOutline ? { taskBackend: "outline" as const } : {}),
+							}
+						: {}),
 				},
 				202,
 			);
@@ -3374,9 +3422,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	) {
 		throw new ValidationError("File references are not supported by queued /new or /goal commands");
 	}
-	// Nor the outline session's refusal of /goal: an edit must not turn a queued message into one.
+	// Nor an outline subagent's refusal of /goal: an edit must not turn a queued message into one.
 	if (
-		await isOutlineSessionGoal(
+		await isRefusedOutlineGoal(
 			id,
 			text,
 			located.message.commandText,

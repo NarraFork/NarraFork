@@ -1,9 +1,8 @@
 /**
  * The task source: the one way continuation, the periodic task digest, the behavior
  * fence, the request prefix's task views, the interrupt guard, the turn-end note and
- * compact read a narrator's tasks. `currentTask` is the status bar's read; the status bar
- * itself still reads `GET /spec/tasks` until the task board replaces the Spec panel
- * (outline P2, PR 5).
+ * compact read a narrator's tasks. `currentTask` is the status bar's read
+ * (`GET /api/narrators/:id/tasks/current`, outline P2 PR 5).
  *
  * Shaped by what those readers need, not by tasks.json:
  * - Where a reader's own logic does not depend on the backend (the interrupt guard's
@@ -148,10 +147,7 @@ export interface NarratorTaskSource {
 
 	// ── Task data ─────────────────────────────────────────────────────────────
 
-	/**
-	 * The first task in progress, or null. The status bar shows this task (it still reads
-	 * `GET /spec/tasks` until PR 5 switches it to the task source).
-	 */
+	/** The first task in progress, or null: the task the status bar shows. */
 	currentTask(): Promise<TaskView | null>;
 	/**
 	 * A task not started yet that would be taken up next, or null when none is waiting.
@@ -162,8 +158,16 @@ export interface NarratorTaskSource {
 	nextTask(): Promise<TaskView | null>;
 	/** Unfinished tasks plus the revision key; read by the interrupt guard. */
 	openTasks(): Promise<OpenTaskList>;
-	/** Unfinished protected tasks (outline: unfinished human-created tasks). */
+	/**
+	 * Unfinished protected tasks (outline: unfinished human-created tasks, except those whose
+	 * completion only waits for their person's confirmation).
+	 */
 	protectedOpenCount(): Promise<number>;
+	/**
+	 * Person-created tasks whose completion waits for their person's confirmation (outline: a
+	 * locked goal the agent ticked done, D26b), for the status bar. Absent: none (spec).
+	 */
+	awaitingConfirmation?(): Promise<number>;
 
 	// ── Continuation ──────────────────────────────────────────────────────────
 

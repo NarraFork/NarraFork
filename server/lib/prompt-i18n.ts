@@ -18,6 +18,8 @@ export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
 export type {
 	OutlineCompactNote,
+	OutlineTaskEdit,
+	OutlineTaskEditChange,
 	OutlineTaskPromptTask,
 	OutlineTasksViewSection,
 	OutlineTaskWaitText,
@@ -39,6 +41,7 @@ export {
 	getOutlineContinuationPrompt,
 	getOutlineInterruptNote,
 	getOutlineSpecUnavailableHint,
+	getOutlineTaskEditNote,
 	getOutlineTaskSystemReminder,
 	getOutlineTasksViewHeading,
 	getOutlineTasksViewMore,

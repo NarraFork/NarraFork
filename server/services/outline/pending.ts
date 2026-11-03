@@ -948,6 +948,48 @@ export async function findTasksWaitingForConfirmation(
 }
 
 /**
+ * Of the given tasks, the locked roots whose being done or cancelled waits for confirmation
+ * (design §2.2: "整个计划标完成，要锁定人确认"; D26b for `/goal`), with the open change asking
+ * it and what it sets. Read for the task board and the task source (a person-created goal whose
+ * completion only waits for its person no longer drives `protectedOnly`, outline P2 PR 5). One
+ * bounded read of the open changes per space, then the operations of the few rows on these roots.
+ */
+export async function findCompletionsAwaitingConfirmation(
+	tasks: ReadonlyArray<OutlineTaskSubject & { deleted?: boolean }>,
+	options: { store?: OutlineStore } = {},
+): Promise<Map<string, { row: OutlinePendingHead; status: "done" | "cancelled" }>> {
+	const store = options.store ?? outlineStore;
+	const out = new Map<string, { row: OutlinePendingHead; status: "done" | "cancelled" }>();
+	const bySpace = new Map<string, Set<string>>();
+	for (const task of tasks) {
+		if (!task.taskJson?.lock || task.deleted) continue;
+		const set = bySpace.get(task.spaceId) ?? new Set<string>();
+		set.add(task.id);
+		bySpace.set(task.spaceId, set);
+	}
+	const candidates = new Map<string, OutlinePendingHead>();
+	for (const [spaceId, ids] of bySpace) {
+		const open = await store.listOpenPendingBySpace(spaceId, OUTLINE_PENDING_LIMITS.scanPerSpace);
+		for (const row of open) {
+			const root = row.rootBlockId;
+			if (root && ids.has(root) && row.blockIdsJson.includes(root)) candidates.set(row.id, row);
+		}
+	}
+	if (candidates.size === 0) return out;
+	for (const row of await store.getPending([...candidates.keys()])) {
+		const root = row.rootBlockId as string;
+		for (const op of pendingOps(row)) {
+			if (op.op !== "setTask" || !("id" in op.block) || op.block.id !== root) continue;
+			const status = op.task?.status;
+			const head = candidates.get(row.id);
+			if (head && (status === "done" || status === "cancelled"))
+				out.set(root, { row: head, status });
+		}
+	}
+	return out;
+}
+
+/**
  * Who decides each open change now: the lock on its tree as it is (a delegate the locker named
  * since the proposal decides it, review S-8), or the decider recorded at proposal time when the
  * tree is no longer locked. One indexed read of the roots per space.
