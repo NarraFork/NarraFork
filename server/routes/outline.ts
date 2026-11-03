@@ -82,6 +82,7 @@ import {
 	canWriteSpace,
 	listReadableSpaces,
 	narratorUsersWith,
+	narratorVisibility,
 	type OutlineAccessNeed,
 	type OutlinePrincipal,
 	projectUsersWith,
@@ -573,25 +574,6 @@ function unlockAllowed(
 }
 
 /**
- * Whether the person may read a session: locks and pending changes name it by title only then
- * (review S-5). Memoized for one request.
- */
-function narratorVisibility(principal: OutlinePrincipal): (narratorId: string) => Promise<boolean> {
-	const memo = new Map<string, Promise<boolean>>();
-	return (narratorId) => {
-		let verdict = memo.get(narratorId);
-		if (!verdict) {
-			verdict = (async () => {
-				const narrator = await readNarrator(narratorId);
-				return narrator !== null && (await holds(principal, "read", { narrator }));
-			})();
-			memo.set(narratorId, verdict);
-		}
-		return verdict;
-	};
-}
-
-/**
  * Pending changes as the person sees them listed (names, whether they decide them), from their
  * heads (review S-7: the operations are not read). Who decides is the lock on each change's tree
  * as it is now; deciding needs write access to the space (review B-3).
@@ -945,7 +927,12 @@ outlineRoutes.post("/questions/answer", bodyLimit({ maxSize: 256 * 1024 }), asyn
 	const principal = principalOf(c);
 	const input = parse(outlineAnswerBodySchema, await c.req.json().catch(() => ({})));
 	const { answerOutlineQuestions } = await import("../services/outline/questions");
-	const done = await answerOutlineQuestions({ userId: principal.userId, answers: input.answers });
+	// The askers are told in the background; the delivery sweep catches up on failures.
+	const done = await answerOutlineQuestions({
+		userId: principal.userId,
+		answers: input.answers,
+		deliver: "background",
+	});
 	const body: OutlineAnswerResponse = { commitId: done.commitId, answered: done.answered };
 	return c.json(body);
 });

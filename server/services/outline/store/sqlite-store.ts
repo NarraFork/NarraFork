@@ -1167,6 +1167,22 @@ export const sqliteOutlineStore: OutlineStore = {
 		return out;
 	},
 
+	async getContentHeads(blockIds, chars) {
+		const out = new Map<string, string>();
+		for (const ids of chunked(blockIds)) {
+			const rows = db
+				.select({
+					id: outlineBlocks.id,
+					head: sql<string>`substr(${outlineBlocks.content}, 1, ${Math.max(0, Math.floor(chars))})`,
+				})
+				.from(outlineBlocks)
+				.where(inArray(outlineBlocks.id, ids))
+				.all();
+			for (const row of rows) out.set(row.id, row.head);
+		}
+		return out;
+	},
+
 	async listOpenQuestionsBySpace(spaceId, limit) {
 		return db
 			.select()

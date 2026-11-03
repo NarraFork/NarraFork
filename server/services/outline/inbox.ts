@@ -12,11 +12,12 @@
  *     revertable. Reports join it in plan PR 11.
  *
  * A row is shown only while the person may read its space, and offers acting only while they may
- * write it. Every read is indexed and bounded.
+ * write it. A session is named (id and title) only to people who may read it (P2 PR 6's rule);
+ * others see a placeholder. Every read is indexed and bounded.
  */
 import type { HumanAttentionItem } from "@shared/human-attention";
 import type { OutlineDigestItem, OutlineDigestResponse } from "@shared/outline-api";
-import { canReadSpace, canWriteSpace, type OutlinePrincipal } from "./access";
+import { canReadSpace, canWriteSpace, narratorVisibility, type OutlinePrincipal } from "./access";
 import { readDisplayNames } from "./access-reads";
 import { isOutlineEnabled } from "./feature";
 import { outlinePendingLabel } from "./model";
@@ -68,6 +69,7 @@ export async function listOutlineAttention(
 	if (!isOutlineEnabled() || !principal.userId) return [];
 	const store = options.store ?? outlineStore;
 	const access = accessCache(principal, store);
+	const visible = narratorVisibility(principal);
 	const items: HumanAttentionItem[] = [];
 	const base = {
 		source: "outline" as const,
@@ -92,14 +94,15 @@ export async function listOutlineAttention(
 		const a = await access(group.spaceId);
 		if (!a) continue;
 		const asker = group.askers[0] ?? "";
+		const shown = asker !== "" && (await visible(asker));
 		items.push({
 			...base,
 			id: `outline:q:${group.groupBlockId}`,
 			kind: "outline_decision",
 			requestId: `q:${group.groupBlockId}`,
 			toolName: "Ask",
-			narratorId: asker,
-			narratorTitle: asker ? (names.narrators.get(asker) ?? null) : null,
+			narratorId: shown ? asker : "",
+			narratorTitle: shown ? (names.narrators.get(asker) ?? null) : null,
 			createdAt: group.createdAt,
 			canAct: a.write,
 			summary: clip(group.title),
@@ -110,6 +113,7 @@ export async function listOutlineAttention(
 				blockId: group.groupBlockId,
 				pendingId: null,
 				count: group.questionIds.length,
+				sessionHidden: asker !== "" && !shown,
 			},
 		});
 	}
@@ -121,14 +125,15 @@ export async function listOutlineAttention(
 		const a = await access(row.spaceId);
 		if (!a) continue;
 		const proposer = row.requesterSession ?? "";
+		const shown = proposer !== "" && (await visible(proposer));
 		items.push({
 			...base,
 			id: `outline:p:${row.id}`,
 			kind: "outline_decision",
 			requestId: `p:${row.id}`,
 			toolName: "OutlineEdit",
-			narratorId: proposer,
-			narratorTitle: proposer ? (names.narrators.get(proposer) ?? null) : null,
+			narratorId: shown ? proposer : "",
+			narratorTitle: shown ? (names.narrators.get(proposer) ?? null) : null,
 			createdAt: row.createdAt,
 			canAct: a.write,
 			summary: clip(row.summary || outlinePendingLabel(row.id)),
@@ -139,6 +144,7 @@ export async function listOutlineAttention(
 				blockId: row.rootBlockId,
 				pendingId: row.id,
 				count: row.opCount,
+				sessionHidden: proposer !== "" && !shown,
 			},
 		});
 	}
@@ -165,6 +171,7 @@ export async function listOutlineAttention(
 				blockId: null,
 				pendingId: null,
 				count: digest.items.length,
+				sessionHidden: false,
 			},
 		});
 	}
@@ -185,6 +192,7 @@ export async function readOutlineDigest(
 		OUTLINE_INBOX_LIMITS.digest + 1,
 	);
 	const access = accessCache(principal, store);
+	const visible = narratorVisibility(principal);
 	const narratorIds = rows.flatMap((r) =>
 		r.decidedByJson?.kind === "agent" ? [r.decidedByJson.id] : [],
 	);
@@ -193,6 +201,8 @@ export async function readOutlineDigest(
 	for (const row of rows.slice(0, OUTLINE_INBOX_LIMITS.digest)) {
 		const a = await access(row.spaceId);
 		if (!a || row.decidedByJson?.kind !== "agent") continue;
+		const decider = row.decidedByJson.id;
+		const shown = await visible(decider);
 		items.push({
 			pendingId: row.id,
 			label: outlinePendingLabel(row.id),
@@ -204,10 +214,12 @@ export async function readOutlineDigest(
 			opCount: row.opCount,
 			decidedAt: row.decidedAt,
 			decidedBy: {
-				narratorId: row.decidedByJson.id,
-				title: names.narrators.get(row.decidedByJson.id) ?? null,
+				narratorId: shown ? decider : null,
+				title: shown ? (names.narrators.get(decider) ?? null) : null,
+				hidden: !shown,
 			},
 			commitId: row.decisionCommitId,
+			canRevert: a.write,
 		});
 	}
 	return { items, truncated: rows.length > OUTLINE_INBOX_LIMITS.digest };

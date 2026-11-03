@@ -43,9 +43,10 @@ function question(id: string, extra: Partial<OutlineQuestionView> = {}): Outline
 		state: "open",
 		to: { userId: "alice", name: "alice" },
 		answer: null,
-		askedBy: { narratorId: "n1", title: "Worker" },
+		askedBy: { narratorId: "n1", title: "Worker", hidden: false },
 		createdAt: "2026-11-03T00:00:00.000Z",
 		canAnswer: true,
+		versionSeq: 3,
 		...extra,
 	};
 }
@@ -115,6 +116,20 @@ describe("the questions form", () => {
 		expect(doc.querySelector("[data-testid=outline-questions-adopt-all]")?.textContent).toContain(
 			"(2)",
 		);
+	});
+
+	test("the asking session is named only to a viewer who may read it (review B2)", () => {
+		const shown = render(<OutlineQuestionsForm blockId="task" showOpenLink={false} />, group);
+		expect(shown.querySelector("[data-testid=outline-question-1]")?.textContent).toContain(
+			"asked by Worker",
+		);
+		const hidden = render(<OutlineQuestionsForm blockId="task" showOpenLink={false} />, {
+			...group,
+			questions: [question("1", { askedBy: { narratorId: null, title: null, hidden: true } })],
+		});
+		const text = hidden.querySelector("[data-testid=outline-question-1]")?.textContent ?? "";
+		expect(text).toContain("asked by a session you cannot open");
+		expect(text).not.toContain("Worker");
 	});
 
 	test("the side panel shows questions under the focused block, and nothing without any", () => {

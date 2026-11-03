@@ -459,7 +459,7 @@ export const askTool: ToolDefinition = {
 	name: OUTLINE_ASK_TOOL,
 	description: `Ask a person to decide something. The question is recorded in the outline under the block it is about: your task in progress by default (under: another block). Give each question its options if any, your recommendation (an option's number, or what you would do) and why.
 Asking never blocks. The task the question is under waits for the answer and continuation skips it: do the work it does not affect meanwhile. For a reversible decision, go ahead with your recommendation and set proceed: then nothing waits, and you hear back only if the answer differs. Decide yourself what has a reasonable, reversible default; ask about what is irreversible or a matter of the person's preference.
-Questions about one thing go in one call (they are answered together); a question's sub-questions go in its items. The answer comes back as a message from the person, which wakes this session when it is idle.
+Questions about one thing go in one call (they are answered together); a question's sub-questions go in its items. The answer comes back as a message from the person: it wakes this session when it is idle (on a PostgreSQL server the session reads it on its next turn).
 - to: who is asked (human:name). By default the person who manages the task, else the person you work for.
 - withdraw: questions you asked that no longer matter (Q12, or an address).
 - answered: when the person asked answers in this conversation instead, write their answer down here (option, text, or adopt for your recommendation).

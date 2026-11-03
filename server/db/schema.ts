@@ -5905,14 +5905,17 @@ export const outlinePending = sqliteTable(
  * that changes it (as `outline_task_claims` is to `task_json`), so a revert, a restore or a delete
  * keeps it in step. Not versioned.
  *
- *   - `state`: `open`, `answered` (`answered_at`, `answer_commit_id`) or `withdrawn` (withdrawn,
- *     or the block deleted). `proceed` copies the block's: such a question makes no task wait.
+ *   - `state`: `open`, `answered` or `withdrawn` (withdrawn, or the block deleted). `proceed`
+ *     copies the block's: such a question makes no task wait.
+ *   - `answered_at`, `answer_commit_id`: the last answer and the commit that recorded it. They
+ *     stay when the question leaves answered, so the same answer coming back (an undo) is not
+ *     delivered again.
  *   - `to_user_id`: the person asked: their inbox.
  *   - `asker_*`: the session that asked (its root), the person its turn ran for (the execution
  *     principal an answer wakes it with; never the person answering) and the tool call. Set when
  *     the row is created, never after.
- *   - `delivered_at`: when the asker was told of the answer (or there was nobody to tell); null
- *     while an answer waits to be delivered (a background sweep retries), and while open.
+ *   - `delivered_at`: when the answer's message was written to the asker (or there was nobody to
+ *     tell); null while a new answer waits to be delivered (a background sweep retries).
  *
  * Ids carry no foreign keys but the block's: a session that is gone simply is not woken.
  */

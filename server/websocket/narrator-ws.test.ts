@@ -174,6 +174,33 @@ describe("HumanAttention global invalidation", () => {
 		);
 	});
 
+	it("tells only the people an outline question concerns; an untargeted change tells everyone", async () => {
+		const asked = openFakeWs({ userId: "attention-asked" });
+		const other = openFakeWs({ userId: "attention-other" });
+		const count = (sent: typeof asked.sent) =>
+			sent.filter((message) => message.type === "human_attention_changed").length;
+		eventBus.emit({ type: "human_attention:changed", userIds: ["attention-asked"] });
+		eventBus.emit({ type: "human_attention:changed", userIds: ["attention-asked"] });
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(count(asked.sent)).toBe(1);
+		expect(count(other.sent)).toBe(0);
+		eventBus.emit({ type: "human_attention:changed", userIds: ["attention-asked"] });
+		eventBus.emit({ type: "human_attention:changed" });
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(count(asked.sent)).toBe(2);
+		expect(count(other.sent)).toBe(1);
+	});
+
+	it("coalesces the outline's pending changes over a second", async () => {
+		const { sent } = openFakeWs({ userId: "attention-locker" });
+		for (let i = 0; i < 5; i++)
+			eventBus.emit({ type: "outline:pending", spaceId: "space", pageIds: ["page"] });
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		expect(sent.filter((message) => message.type === "human_attention_changed")).toEqual([]);
+		await new Promise((resolve) => setTimeout(resolve, 1_000));
+		expect(sent.filter((message) => message.type === "human_attention_changed")).toHaveLength(1);
+	});
+
 	it("invalidates cascaded question deletion without exposing the private history frame", async () => {
 		const { sent } = openFakeWs();
 		eventBus.emit({

@@ -54,8 +54,10 @@ import {
 } from "../../../hooks/useHumanAttention";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { api } from "../../../lib/api";
+import { outlineRouterLink, useOutlineRouterNavigate } from "../../../lib/outline-router";
 import { readSession, writeSession } from "../../../lib/session-store";
 import { OutlineAttentionDetail } from "../../outline/OutlineQuestions";
+import { OutlineNavProvider } from "../../outline/outline-nav";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { InlinePermission } from "../permission/InlinePermission";
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
@@ -423,6 +425,8 @@ function HumanAttentionRow({ item }: { item: HumanAttentionItem }) {
 	const { t } = useTranslation("narrator");
 	const [expanded, setExpanded] = useState(false);
 	const onClose = useContext(CloseAttentionContext);
+	// Links of an outline row go through the app's routes (the outline's components are router-free).
+	const navigateOutline = useOutlineRouterNavigate();
 	if (item.source === "outline") {
 		return (
 			<Paper withBorder p="sm" data-attention-id={item.id} data-attention-kind={item.kind}>
@@ -440,10 +444,16 @@ function HumanAttentionRow({ item }: { item: HumanAttentionItem }) {
 					<Text size="sm" style={{ overflowWrap: "anywhere" }}>
 						{outlineRowText(t, item)}
 					</Text>
-					{item.narratorId && (
+					{item.outline?.sessionHidden ? (
 						<Text size="xs" c="dimmed">
-							{t("outlineAttention.from", { narrator: item.narratorTitle || item.narratorId })}
+							{t("outlineAttention.fromHidden")}
 						</Text>
+					) : (
+						item.narratorId && (
+							<Text size="xs" c="dimmed">
+								{t("outlineAttention.from", { narrator: item.narratorTitle || item.narratorId })}
+							</Text>
+						)
 					)}
 					<Group justify="space-between">
 						<Button
@@ -457,7 +467,11 @@ function HumanAttentionRow({ item }: { item: HumanAttentionItem }) {
 						</Button>
 						{item.narratorId && <OwnerLink item={item} />}
 					</Group>
-					{expanded && <OutlineAttentionDetail item={item} onOpen={onClose} />}
+					{expanded && (
+						<OutlineNavProvider onNavigate={navigateOutline} renderLink={outlineRouterLink}>
+							<OutlineAttentionDetail item={item} onOpen={onClose} />
+						</OutlineNavProvider>
+					)}
 				</Stack>
 			</Paper>
 		);

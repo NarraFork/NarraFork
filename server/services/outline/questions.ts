@@ -18,26 +18,32 @@
  *   - ANSWER ({@link answerOutlineQuestions}): only the person asked, while they may write the
  *     space: one `answer` commit written as them, their confirmation (§2.3). The asking session
  *     may also write down what that person answered in its own conversation (Q3: `answered`,
- *     relayed, the person still responsible); nobody else answers.
- *   - TELLING THE ASKER ({@link deliverOutlineAnswers}): one user message per answering commit and
- *     asking session, waking it when idle (a running loop reads it on its next pass). The wake
- *     runs as the person the asking turn ran for, never as the person who answered. A session that
- *     is gone or archived is not woken: the session now doing the task is, if any. A question it
- *     went ahead with (`proceed`) answered as recommended tells nobody. Delivery is marked on the
- *     row; a background sweep retries what a crash left undelivered.
+ *     relayed, the person still responsible), only in a turn their own message started after the
+ *     question was asked (review B1; refused on PostgreSQL); nobody else answers.
+ *   - TELLING THE ASKER ({@link deliverOutlineAnswers}): one user message per answering commit,
+ *     asking session and asking turn's person, under an id derived from those (a retry finds it),
+ *     waking the session when idle (a running loop reads it on its next pass). The wake runs as
+ *     the person the asking turn ran for, never as the person who answered. A session that is gone
+ *     or archived is not woken: the session now doing the task is, if any. A question it went
+ *     ahead with (`proceed`) answered as recommended (no words with it) tells nobody. Delivery is
+ *     marked on the row; a background sweep retries what a crash left undelivered. On PostgreSQL
+ *     the message is written and nothing is woken (review S6): the session reads it next turn.
  *
  * Every read is indexed and bounded; nothing here scans a space.
  */
+
+import { createHash } from "node:crypto";
 import { AppError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
+import { isHumanOrigin } from "@shared/message-origin";
 import { blockTitle, compareOrderKeys } from "@shared/outline";
 import type {
 	OutlineAnswerInput,
 	OutlineQuestionGroupResponse,
 	OutlineQuestionView,
 } from "@shared/outline-api";
-import { canWriteSpace, type OutlinePrincipal } from "./access";
+import { canReadSpace, canWriteSpace, narratorVisibility, type OutlinePrincipal } from "./access";
 import {
 	readDisplayNames,
 	readNarrator,
@@ -46,16 +52,19 @@ import {
 	readUserIdByName,
 } from "./access-reads";
 import type { OutlineAgentScope } from "./agent-scope";
+import { OutlineConflictError, OutlineWriteError } from "./errors";
 import { isOutlineEnabled } from "./feature";
 import { OUTLINE_LIMITS, type OutlineAskAnswerJson, type OutlineAskJson } from "./model";
 import { outlineStore } from "./store";
-import type {
-	OutlineBlockMeta,
-	OutlineBlockRow,
-	OutlineQuestionRow,
-	OutlineSpaceRow,
-	OutlineStore,
+import {
+	type OutlineBlockMeta,
+	type OutlineBlockRow,
+	type OutlineQuestionRow,
+	type OutlineSpaceRow,
+	type OutlineStore,
+	WriteConflictError,
 } from "./store/port";
+import { OUTLINE_PAGE_HEAD_CHARS } from "./store/read-port";
 import type { OutlineTaskSubject } from "./tasks";
 import { type OutlineOp, writeOutline } from "./write";
 
@@ -84,12 +93,16 @@ export const OUTLINE_QUESTION_LIMITS = {
 	sweepBatch: 50,
 	/** An answer younger than this is left to the delivery that follows its commit. */
 	sweepAfterMs: 2 * 60_000,
+	/** Claims of the session `Ask` reads to find its task in progress. */
+	claimScan: 500,
+	/** Times `Ask` numbers its aliases again when another call took them meanwhile. */
+	aliasAttempts: 4,
 	/** Aliases `Qn` read to number new questions; past it questions get no alias. */
 	aliasScan: 5000,
-	/** Children of a block (and of its questions) one read of its questions looks through. */
+	/** Children of a block (and of each level of its questions) one read of its questions takes. */
 	childScan: 2000,
-	/** Messages of the conversation read to find the one a relayed answer came from. */
-	relayMessageScan: 200,
+	/** Levels of questions under questions a group gathers (review N2). */
+	nestDepth: 8,
 } as const;
 
 /** The system actor of the commits that withdraw an archived session's questions. */
@@ -99,6 +112,7 @@ export type OutlineQuestionErrorCode =
 	| "OUTLINE_QUESTION_NOT_FOUND"
 	| "OUTLINE_QUESTION_DECIDED"
 	| "OUTLINE_QUESTION_NOT_YOURS"
+	| "OUTLINE_QUESTION_CHANGED"
 	| "OUTLINE_QUESTION_INVALID";
 
 /** An answer that could not be written; nothing was. */
@@ -113,7 +127,8 @@ export class OutlineQuestionError extends AppError {
 				? 404
 				: questionCode === "OUTLINE_QUESTION_NOT_YOURS"
 					? 403
-					: questionCode === "OUTLINE_QUESTION_DECIDED"
+					: questionCode === "OUTLINE_QUESTION_DECIDED" ||
+							questionCode === "OUTLINE_QUESTION_CHANGED"
 						? 409
 						: 400,
 			questionCode,
@@ -170,7 +185,17 @@ export const OUTLINE_QUESTION_TEXT = {
 	oneSpace: "answer questions of one space at a time",
 	groupTooBig: `answer at most ${OUTLINE_QUESTION_LIMITS.group} questions at a time`,
 	notYours: "these questions were put to someone else",
+	noSuchQuestion: "no such question",
+	twice: "a question is answered twice in one request",
+	changed: (address: string) =>
+		`${address} changed since you read it; read it again before answering`,
 	cannotWriteSpace: "you can no longer write this space, so you cannot answer its questions",
+	relayUnavailable:
+		"answers cannot be written down from the conversation on this server yet (its messages are not readable here); ask the person to answer in their inbox",
+	relayNotTheirTurn:
+		"this turn was not started by a message from the person asked (a continuation, a wake, a routine or an injected turn): only an answer they typed in this turn can be written down; otherwise they answer in their inbox",
+	relayBeforeQuestion:
+		"their message that started this turn was written before the question was asked, so it cannot be its answer; they answer in their inbox",
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -395,21 +420,54 @@ async function resolveRef(scope: OutlineAgentScope, ref: string): Promise<Resolv
 	return { block, space, address: scope.addressIn(space)(block.sid) };
 }
 
-/** The session's task in progress: the first it holds, in document order. */
+/**
+ * The session's task in progress (review S4): of the tasks in progress the session holds, the
+ * innermost (none of the others is under it), the latest claimed when there are several. Read
+ * from the session's claims directly (bounded), whatever its to-dos.
+ */
 async function currentTask(scope: OutlineAgentScope): Promise<ResolvedRef | null> {
-	const { findContinuationCandidates } = await import("./tasks");
 	const session = scope.rootNarratorId ?? scope.narratorId;
-	const read = await findContinuationCandidates({
-		narratorId: session,
-		sessionSpaceId: scope.session?.id ?? null,
-		limit: 5,
-	});
-	const doing = read.ordered.find(
-		(t) => t.status === "doing" && t.claim?.holderNarratorId === session,
+	const claimed = (
+		await scope.store.listClaimedTasks(session, OUTLINE_QUESTION_LIMITS.claimScan)
+	).filter(
+		(c) =>
+			c.claim.holderNarratorId === session &&
+			!c.block.deleted &&
+			c.block.taskJson?.status === "doing",
 	);
-	if (!doing) return null;
-	const block = await scope.store.getBlock(doing.blockId);
-	const space = await scope.store.getSpace(doing.spaceId);
+	if (claimed.length === 0) return null;
+	// A held task with another held task below it is not the innermost: walk up from each.
+	const held = new Set(claimed.map((c) => c.block.id));
+	const outer = new Set<string>();
+	const bySpace = new Map<string, OutlineBlockMeta[]>();
+	for (const { block } of claimed)
+		bySpace.set(block.spaceId, [...(bySpace.get(block.spaceId) ?? []), block]);
+	for (const [spaceId, blocks] of bySpace) {
+		const known = new Map(blocks.map((b) => [b.id, b]));
+		let frontier = blocks.map((b) => b.parentId);
+		for (let depth = 0; depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+			const missing = [...new Set(frontier)].filter(
+				(id): id is string => id !== null && !known.has(id),
+			);
+			if (missing.length > 0)
+				for (const meta of await scope.store.getBlockMetas(spaceId, { ids: missing }))
+					known.set(meta.id, meta);
+			const next: Array<string | null> = [];
+			for (const id of frontier) {
+				if (id === null) continue;
+				if (held.has(id)) outer.add(id);
+				next.push(known.get(id)?.parentId ?? null);
+			}
+			if (next.every((id) => id === null)) break;
+			frontier = next;
+		}
+	}
+	const innermost = claimed
+		.filter((c) => !outer.has(c.block.id))
+		.sort((x, y) => (x.claim.claimedAt < y.claim.claimedAt ? 1 : -1))[0];
+	if (!innermost) return null;
+	const block = await scope.store.getBlock(innermost.block.id);
+	const space = await scope.store.getSpace(innermost.block.spaceId);
 	if (!block || !space || block.deleted) return null;
 	return { block, space, address: scope.addressIn(space)(block.sid) };
 }
@@ -443,6 +501,17 @@ async function recipientOf(
 	return { problem: OUTLINE_QUESTION_TEXT.noPerson };
 }
 
+/**
+ * How an answer reaches the asking session, as `Ask` tells it (review S6): woken when idle on
+ * SQLite; on PostgreSQL the session runtime is not woken, so it reads the answer on its next turn.
+ */
+async function answerArrives(): Promise<string> {
+	const { getNarratorMessageRefsPort } = await import("../narrator-refs/store");
+	return getNarratorMessageRefsPort()
+		? "it reads it on its next turn: this server does not wake the session for it"
+		: "waking it when idle";
+}
+
 /** The next free `Qn` aliases of a space, or nulls when there are too many to number. */
 async function nextAliases(
 	store: OutlineStore,
@@ -463,9 +532,13 @@ async function nextAliases(
 	return Array.from({ length: count }, (_, i) => `Q${max + i + 1}`);
 }
 
-/** Tell inboxes their questions changed (data-free; they read again). */
-function questionsChanged(): void {
-	eventBus.emit({ type: "human_attention:changed" });
+/** A write refused because an alias it gave is taken (planned, or at the unique index). */
+function isAliasTaken(error: unknown): boolean {
+	if (error instanceof OutlineWriteError) return error.code === "OUTLINE_ALIAS_TAKEN";
+	return (
+		error instanceof WriteConflictError &&
+		/uq_outline_blocks_space_alias|outline_blocks\.(space_id|alias)/.test(error.constraint ?? "")
+	);
 }
 
 /**
@@ -528,57 +601,68 @@ async function askQuestions(
 	if (open + count > OUTLINE_QUESTION_LIMITS.openPerSession)
 		return failed([OUTLINE_QUESTION_TEXT.tooManyOpen(open)]);
 
-	const aliases = await nextAliases(store, space.id, count);
 	const proceed = request.proceed === true;
-	const ops: OutlineOp[] = [];
-	const tempIds: string[] = [];
-	let k = 0;
-	const add = (q: OutlineAskQuestionInput, parent: { id: string } | { tempId: string }) => {
-		const tempId = `q${k}`;
-		const alias = aliases[k] ?? null;
-		k++;
-		ops.push({
-			op: "insert",
-			tempId,
-			parent,
-			content: q.question.trim(),
-			...(alias ? { alias } : {}),
-			ask: askOf(q, to, proceed),
-		});
-		tempIds.push(tempId);
-		return tempId;
-	};
-	for (const q of questions) {
-		const id = add(q, { id: anchor.block.id });
-		for (const item of q.items ?? []) add(item, { tempId: id });
-	}
 	const responsible = scope.ctx.userId ?? to;
-	const result = await writeOutline(
-		{
-			spaceId: space.id,
-			ops,
-			actor: { kind: "agent", id: scope.narratorId },
-			responsibleUserId: responsible,
-			narratorId: scope.narratorId,
-			messageId: provenance.messageId,
-			toolCallId: provenance.toolCallId,
-			summary: `Ask ${aliases.filter((a) => a !== null).join(", ") || `${count} questions`}`.slice(
-				0,
-				OUTLINE_LIMITS.maxSummaryChars,
-			),
-		},
-		{
-			question: {
-				askerNarratorId: session,
-				askerUserId: scope.ctx.userId,
-				askerToolCallId: provenance.toolCallId,
-			},
-			...(options.now ? { now: options.now } : {}),
-		},
-	);
-	questionsChanged();
+	// Another call may number its questions in this space at the same moment (review S5): the
+	// aliases are read afresh and the write tried again when one it picked was taken meanwhile.
+	let aliases: Array<string | null> = [];
+	let ops: OutlineOp[] = [];
+	let result: Awaited<ReturnType<typeof writeOutline>> | null = null;
+	for (let attempt = 0; result === null; attempt++) {
+		aliases = await nextAliases(store, space.id, count);
+		ops = [];
+		let k = 0;
+		const add = (q: OutlineAskQuestionInput, parent: { id: string } | { tempId: string }) => {
+			const tempId = `q${k}`;
+			const alias = aliases[k] ?? null;
+			k++;
+			ops.push({
+				op: "insert",
+				tempId,
+				parent,
+				content: q.question.trim(),
+				...(alias ? { alias } : {}),
+				ask: askOf(q, to, proceed),
+			});
+			return tempId;
+		};
+		for (const q of questions) {
+			const id = add(q, { id: anchor.block.id });
+			for (const item of q.items ?? []) add(item, { tempId: id });
+		}
+		try {
+			result = await writeOutline(
+				{
+					spaceId: space.id,
+					ops,
+					actor: { kind: "agent", id: scope.narratorId },
+					responsibleUserId: responsible,
+					narratorId: scope.narratorId,
+					messageId: provenance.messageId,
+					toolCallId: provenance.toolCallId,
+					summary:
+						`Ask ${aliases.filter((a) => a !== null).join(", ") || `${count} questions`}`.slice(
+							0,
+							OUTLINE_LIMITS.maxSummaryChars,
+						),
+				},
+				{
+					question: {
+						askerNarratorId: session,
+						askerUserId: scope.ctx.userId,
+						askerToolCallId: provenance.toolCallId,
+					},
+					...(options.now ? { now: options.now } : {}),
+				},
+			);
+		} catch (error) {
+			if (attempt + 1 < OUTLINE_QUESTION_LIMITS.aliasAttempts && isAliasTaken(error)) continue;
+			throw error;
+		}
+	}
 
 	const label = scope.labelIn(space);
+	const arrives = await answerArrives();
 	const names = await readDisplayNames({ userIds: [to] });
 	const who = names.users.get(to) ?? to;
 	const asked = result.results.slice(0, ops.length).map((r, i) => {
@@ -588,15 +672,15 @@ async function askQuestions(
 	const lines = [`Asked ${asked.join(", ")} under ${label(anchor.block.sid)} for ${who}.`];
 	if (proceed) {
 		lines.push(
-			"You went ahead with your recommendations: nothing waits for the answer. If the answer differs from a recommendation, it comes back to this session as a message (waking it when idle); change what you did then.",
+			`You went ahead with your recommendations: nothing waits for the answer. If the answer differs from a recommendation, it comes back to this session as a message (${arrives}); change what you did then.`,
 		);
 	} else if (task) {
 		lines.push(
-			`${label(task.sid)} now waits for the answer, and continuation skips it: do the work it does not affect meanwhile. The answer comes back to this session as a message (waking it when idle).`,
+			`${label(task.sid)} now waits for the answer, and continuation skips it: do the work it does not affect meanwhile. The answer comes back to this session as a message (${arrives}).`,
 		);
 	} else {
 		lines.push(
-			"No task is above it, so nothing waits for it. The answer comes back to this session as a message (waking it when idle).",
+			`No task is above it, so nothing waits for it. The answer comes back to this session as a message (${arrives}).`,
 		);
 	}
 	if (open + count >= OUTLINE_QUESTION_LIMITS.openPerSessionWarn) {
@@ -652,6 +736,12 @@ async function ownOpenQuestions(
 			problems.push(OUTLINE_QUESTION_TEXT.notAsker(r.address));
 			continue;
 		}
+		// Changing a question needs the write access asking and answering need (review S1).
+		const refusal = await scope.writeRefusal(r.space);
+		if (refusal) {
+			problems.push(OUTLINE_QUESTION_TEXT.cannotWrite(r.space.key, refusal));
+			continue;
+		}
 		found.push({ ...r, ask, row });
 	}
 	if (refs.length > OUTLINE_QUESTION_LIMITS.group) problems.push(OUTLINE_QUESTION_TEXT.groupTooBig);
@@ -705,38 +795,61 @@ async function withdrawQuestions(
 			options.now ? { now: options.now } : {},
 		);
 	});
-	questionsChanged();
 	return {
 		output: `Withdrew ${own.found.map((q) => q.address).join(", ")}; the tasks they held up no longer wait for them.`,
 		metadata: { tool: "Ask", withdrawn: own.found.map((q) => q.block.id) },
 	};
 }
 
-/** The id of the latest message the person sent in this conversation, when it can be found. */
-async function latestMessageOf(narratorId: string, userId: string): Promise<string | null> {
-	try {
-		const { getNarratorMessageRefsPort } = await import("../narrator-refs/store");
-		if (getNarratorMessageRefsPort()) return null;
-		const [{ db }, { narratorMessages }, { and, desc, eq }] = await Promise.all([
-			import("@server/db"),
-			import("@server/db/schema"),
-			import("drizzle-orm"),
-		]);
-		const rows = db
-			.select({
-				id: narratorMessages.id,
-				role: narratorMessages.role,
-				createdBy: narratorMessages.createdBy,
-			})
-			.from(narratorMessages)
-			.where(and(eq(narratorMessages.narratorId, narratorId)))
-			.orderBy(desc(narratorMessages.createdAt))
-			.limit(OUTLINE_QUESTION_LIMITS.relayMessageScan)
-			.all();
-		return rows.find((r) => r.role === "user" && r.createdBy === userId)?.id ?? null;
-	} catch {
-		return null;
-	}
+/** Origin labels of messages a person sent through another door (a gateway, an OAuth app). */
+const PERSON_LABEL = /^(gateway|oauth)(:|$)/;
+
+/**
+ * The message a relayed answer comes from (review B1): the one that started this turn, which
+ * must be the person's own (sent by them: no continuation, routine, wake or other injected turn)
+ * and written after the question was asked (`after`). Read on SQLite from the session's latest
+ * top-level user turn (the toplevel index, one row); refused on PostgreSQL, where the session's
+ * messages are not readable here yet.
+ */
+async function relayMessageOf(
+	narratorId: string,
+	userId: string,
+	after: string,
+): Promise<{ id: string } | { problem: string }> {
+	const { getNarratorMessageRefsPort } = await import("../narrator-refs/store");
+	if (getNarratorMessageRefsPort()) return { problem: OUTLINE_QUESTION_TEXT.relayUnavailable };
+	const [{ db }, { narratorMessages }, { and, desc, eq, isNull, sql }] = await Promise.all([
+		import("@server/db"),
+		import("@server/db/schema"),
+		import("drizzle-orm"),
+	]);
+	const m = narratorMessages;
+	const row = db
+		.select({
+			id: m.id,
+			createdBy: m.createdBy,
+			origin: m.origin,
+			originLabel: m.originLabel,
+			createdAt: m.createdAt,
+			rowsOnly: m.bodyRowsOnly,
+			// An injected turn (an answer delivered, a notice) carries a system injection block.
+			injected: sql<number>`instr(${m.contentJson}, '"system_injection"')`,
+		})
+		.from(m)
+		.where(and(eq(m.narratorId, narratorId), isNull(m.parentToolUseId), eq(m.role, "user")))
+		.orderBy(desc(m.createdAt))
+		.limit(1)
+		.get();
+	const ownWords =
+		!!row &&
+		row.createdBy === userId &&
+		isHumanOrigin(row.origin) &&
+		(row.originLabel === null || PERSON_LABEL.test(row.originLabel)) &&
+		Number(row.injected) === 0 &&
+		Number(row.rowsOnly) === 0;
+	if (!row || !ownWords) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
+	if (row.createdAt <= after) return { problem: OUTLINE_QUESTION_TEXT.relayBeforeQuestion };
+	return { id: row.id };
 }
 
 /** The answer an input gives to a question, or the problem. */
@@ -755,7 +868,8 @@ function answerFor(
 		return {
 			...(ask.recommend.option !== undefined ? { option: ask.recommend.option } : {}),
 			...(text ? { text } : {}),
-			adopted: true,
+			// Words with it may say otherwise (review S2): only the bare recommendation is adopted.
+			...(text ? {} : { adopted: true as const }),
 			by,
 			at,
 		};
@@ -767,7 +881,9 @@ function answerFor(
 	if (input.option === undefined && !text) return OUTLINE_QUESTION_TEXT.noAnswer(address);
 	if (bytes(text) > OUTLINE_QUESTION_LIMITS.answerBytes)
 		return OUTLINE_QUESTION_TEXT.answerTooLong(address);
-	const adopted = input.option !== undefined && input.option === ask.recommend.option;
+	// An answer with words is never "as recommended" (review S2): a note may disagree with the
+	// choice it comes with, so the asker is told, even of a decision it went ahead with.
+	const adopted = !text && input.option !== undefined && input.option === ask.recommend.option;
 	return {
 		...(input.option !== undefined ? { option: input.option } : {}),
 		...(text ? { text } : {}),
@@ -792,23 +908,36 @@ async function relayAnswers(
 	if ("problems" in own) return failed(own.problems);
 	const at = (options.now?.() ?? new Date()).toISOString();
 	const session = scope.rootNarratorId ?? scope.narratorId;
-	const messageId = person ? await latestMessageOf(session, person) : null;
 	const problems: string[] = [];
 	const updates: Array<ResolvedRef & { ask: OutlineAskJson }> = [];
-	own.found.forEach((q, i) => {
+	// The person must still be able to answer directly (review S1).
+	const personWrites = new Map<string, boolean>();
+	for (const [i, q] of own.found.entries()) {
 		if (!person || q.ask.to.kind !== "human" || q.ask.to.id !== person) {
 			problems.push(OUTLINE_QUESTION_TEXT.notTheirs(q.address));
-			return;
+			continue;
+		}
+		if (!personWrites.has(q.space.id))
+			personWrites.set(q.space.id, await canWriteSpace(await principalOf(person), q.space));
+		if (!personWrites.get(q.space.id)) {
+			problems.push(OUTLINE_QUESTION_TEXT.cannotWriteSpace);
+			continue;
+		}
+		// Their words, in this turn, after the question existed (review B1).
+		const message = await relayMessageOf(session, person, q.row.createdAt);
+		if ("problem" in message) {
+			problems.push(`${q.address}: ${message.problem}`);
+			continue;
 		}
 		const input = answered[i] as (typeof answered)[number];
 		const answer = answerFor(q.ask, q.address, input, { kind: "human", id: person }, at);
 		if (typeof answer === "string") {
 			problems.push(answer);
-			return;
+			continue;
 		}
-		answer.relayed = { narratorId: scope.narratorId, messageId };
+		answer.relayed = { narratorId: scope.narratorId, messageId: message.id };
 		updates.push({ ...q, ask: { ...q.ask, answer } });
-	});
+	}
 	if (problems.length > 0) return failed(problems);
 	await writePerSpace(updates, async (space, list) => {
 		await writeOutline(
@@ -844,7 +973,6 @@ async function relayAnswers(
 			},
 		);
 	});
-	questionsChanged();
 	return {
 		output: `Wrote down the answer to ${updates.map((q) => q.address).join(", ")} as the person's (relayed from this conversation); the tasks they held up no longer wait for them.`,
 		metadata: { tool: "Ask", relayed: updates.map((q) => q.block.id) },
@@ -873,84 +1001,110 @@ export async function answerOutlineQuestions(args: {
 	answers: readonly OutlineAnswerInput[];
 	store?: OutlineStore;
 	now?: () => Date;
-	/** Tell the askers (default); tests turn it off to look at the undelivered rows. */
-	deliver?: boolean;
+	/**
+	 * Tell the askers: wait for it (default), start it and return (the route: the sweep is the
+	 * safety net, review N6), or not at all (tests looking at undelivered rows).
+	 */
+	deliver?: "await" | "background" | false;
 }): Promise<OutlineAnswerResult> {
 	const store = args.store ?? outlineStore;
 	if (args.answers.length === 0)
 		throw new OutlineQuestionError(OUTLINE_QUESTION_TEXT.noQuestions, "OUTLINE_QUESTION_INVALID");
 	if (args.answers.length > OUTLINE_QUESTION_LIMITS.group)
 		throw new OutlineQuestionError(OUTLINE_QUESTION_TEXT.groupTooBig, "OUTLINE_QUESTION_INVALID");
-	const blocks = await blocksById(
-		store,
-		args.answers.map((a) => a.blockId),
-	);
-	const spaceIds = new Set([...blocks.values()].map((b) => b.spaceId));
-	if (spaceIds.size > 1)
-		throw new OutlineQuestionError(OUTLINE_QUESTION_TEXT.oneSpace, "OUTLINE_QUESTION_INVALID");
-	const [spaceId] = [...spaceIds];
-	const space = spaceId ? await store.getSpace(spaceId) : null;
-	const at = (args.now?.() ?? new Date()).toISOString();
-	const ops: OutlineOp[] = [];
-	const seen = new Set<string>();
-	for (const input of args.answers) {
-		const block = blocks.get(input.blockId);
-		if (!block || !space || !block.askJson || seen.has(block.id))
+	const ids = args.answers.map((a) => a.blockId);
+	if (new Set(ids).size !== ids.length)
+		throw new OutlineQuestionError(OUTLINE_QUESTION_TEXT.twice, "OUTLINE_QUESTION_INVALID");
+	const principal = await principalOf(args.userId);
+	const blocks = await blocksById(store, ids);
+	// Access first (review S8): a block that is missing, in a space the person cannot read, or not
+	// a question is the same "no such question", whatever it is.
+	const spaces = new Map<string, OutlineSpaceRow | null>();
+	for (const block of blocks.values()) {
+		if (spaces.has(block.spaceId)) continue;
+		const space = await store.getSpace(block.spaceId);
+		spaces.set(block.spaceId, space && (await canReadSpace(principal, space)) ? space : null);
+	}
+	for (const id of ids) {
+		const block = blocks.get(id);
+		if (!block || !spaces.get(block.spaceId) || !block.askJson)
 			throw new OutlineQuestionError(
-				OUTLINE_QUESTION_TEXT.notFound(input.blockId),
+				OUTLINE_QUESTION_TEXT.noSuchQuestion,
 				"OUTLINE_QUESTION_NOT_FOUND",
 			);
-		seen.add(block.id);
+	}
+	if (spaces.size > 1)
+		throw new OutlineQuestionError(OUTLINE_QUESTION_TEXT.oneSpace, "OUTLINE_QUESTION_INVALID");
+	const space = [...spaces.values()][0] as OutlineSpaceRow;
+	const at = (args.now?.() ?? new Date()).toISOString();
+	const ops: OutlineOp[] = [];
+	for (const input of args.answers) {
+		const block = blocks.get(input.blockId) as OutlineBlockRow;
+		const ask = block.askJson as OutlineAskJson;
 		const address = `${space.key}/${block.sid}`;
-		const state = questionState(block.askJson, block.deleted);
+		if (ask.to.kind !== "human" || ask.to.id !== args.userId)
+			throw new OutlineQuestionError(OUTLINE_QUESTION_TEXT.notYours, "OUTLINE_QUESTION_NOT_YOURS");
+		const state = questionState(ask, block.deleted);
 		if (state !== "open")
 			throw new OutlineQuestionError(
 				OUTLINE_QUESTION_TEXT.notOpen(address, state),
 				"OUTLINE_QUESTION_DECIDED",
 			);
-		if (block.askJson.to.kind !== "human" || block.askJson.to.id !== args.userId)
-			throw new OutlineQuestionError(OUTLINE_QUESTION_TEXT.notYours, "OUTLINE_QUESTION_NOT_YOURS");
-		const answer = answerFor(block.askJson, address, input, { kind: "human", id: args.userId }, at);
+		// What the person read is what they answer (review S3).
+		if (input.versionSeq !== undefined && input.versionSeq !== block.versionSeq)
+			throw new OutlineQuestionError(
+				OUTLINE_QUESTION_TEXT.changed(address),
+				"OUTLINE_QUESTION_CHANGED",
+			);
+		const answer = answerFor(ask, address, input, { kind: "human", id: args.userId }, at);
 		if (typeof answer === "string")
 			throw new OutlineQuestionError(answer, "OUTLINE_QUESTION_INVALID");
 		ops.push({
 			op: "update",
 			block: { id: block.id },
-			baseVersionSeq: block.versionSeq,
-			ask: { ...block.askJson, answer },
+			baseVersionSeq: input.versionSeq ?? block.versionSeq,
+			ask: { ...ask, answer },
 		});
 	}
-	if (!space)
-		throw new OutlineQuestionError(
-			OUTLINE_QUESTION_TEXT.notFound("?"),
-			"OUTLINE_QUESTION_NOT_FOUND",
-		);
-	if (!(await canWriteSpace(await principalOf(args.userId), space)))
+	if (!(await canWriteSpace(principal, space)))
 		throw new OutlineQuestionError(
 			OUTLINE_QUESTION_TEXT.cannotWriteSpace,
 			"OUTLINE_QUESTION_NOT_YOURS",
 		);
 	const labels = [...blocks.values()].map((b) => b.alias ?? b.sid);
-	const result = await writeOutline(
-		{
-			spaceId: space.id,
-			ops,
-			actor: { kind: "human", id: args.userId },
-			responsibleUserId: args.userId,
-			summary: `Answered ${labels.join(", ")}`.slice(0, OUTLINE_LIMITS.maxSummaryChars),
-		},
-		{ store, kind: "answer", ...(args.now ? { now: args.now } : {}) },
-	);
-	questionsChanged();
-	const answered = [...seen];
-	if (args.deliver !== false) {
-		try {
-			await deliverOutlineAnswers(answered, { store, ...(args.now ? { now: args.now } : {}) });
-		} catch (error) {
+	let result: Awaited<ReturnType<typeof writeOutline>>;
+	try {
+		result = await writeOutline(
+			{
+				spaceId: space.id,
+				ops,
+				actor: { kind: "human", id: args.userId },
+				responsibleUserId: args.userId,
+				summary: `Answered ${labels.join(", ")}`.slice(0, OUTLINE_LIMITS.maxSummaryChars),
+			},
+			{ store, kind: "answer", ...(args.now ? { now: args.now } : {}) },
+		);
+	} catch (error) {
+		// Changed between the read above and the write (a version the person did not see).
+		if (error instanceof OutlineConflictError)
+			throw new OutlineQuestionError(
+				OUTLINE_QUESTION_TEXT.changed(labels.join(", ")),
+				"OUTLINE_QUESTION_CHANGED",
+			);
+		throw error;
+	}
+	const answered = [...ids];
+	const mode = args.deliver ?? "await";
+	if (mode !== false) {
+		const delivery = deliverOutlineAnswers(answered, {
+			store,
+			...(args.now ? { now: args.now } : {}),
+		}).catch((error) => {
 			logger.warn("Outline answers committed; telling the askers failed (left to the sweep)", {
 				error: String(error),
 			});
-		}
+		});
+		if (mode === "await") await delivery;
 	}
 	return { spaceId: space.id, commitId: result.commit?.id ?? null, answered };
 }
@@ -961,11 +1115,20 @@ export async function answerOutlineQuestions(args: {
 
 /** What delivering needs from the session layer: a seam tests replace. */
 export interface OutlineAnswerDelivery {
-	/** Write the message (as the person's turn) and wake the session when idle. */
+	/**
+	 * Write the message (as the person's turn, under `messageId` where the backend takes a chosen
+	 * id) and wake the session when idle where the runtime can. `written` false: nothing was
+	 * written, so the answers stay undelivered.
+	 */
 	deliver(
 		narratorId: string,
-		message: { content: string; createdBy: string | null; executionUserId: string | null },
-	): Promise<void>;
+		message: {
+			messageId: string;
+			content: string;
+			createdBy: string | null;
+			executionUserId: string | null;
+		},
+	): Promise<{ written: boolean; woke: boolean }>;
 }
 
 let deliverySeam: OutlineAnswerDelivery | null = null;
@@ -979,19 +1142,64 @@ export function setOutlineAnswerDelivery(
 	return previous;
 }
 
+/**
+ * The message id of one delivery: the same for the same answering commit, session and person, so
+ * a retry after a crash finds the message it already wrote (review decision 9).
+ */
+export function outlineAnswerMessageId(
+	answerCommitId: string,
+	narratorId: string,
+	askerUserId: string | null,
+): string {
+	return createHash("sha256")
+		.update(`outline-answer\u0000${answerCommitId}\u0000${narratorId}\u0000${askerUserId ?? ""}`)
+		.digest("base64url")
+		.slice(0, 21);
+}
+
+/**
+ * The real delivery: `deliverInjection` as a user turn.
+ *
+ *   - SQLite: written under the chosen id (a message already there means a retry: nothing is
+ *     written again), then the session is woken when idle (`wakeIfIdle`).
+ *   - PostgreSQL (review S6): the message is written through the narrator store's PostgreSQL port,
+ *     and NO wake is attempted: the session runtime does not run on PostgreSQL yet, so the session
+ *     reads the answer on its next turn. The chosen id is not used there (`deliverInjection`
+ *     reads an existing id's role from the SQLite handle), so a crash between writing and marking
+ *     may deliver twice.
+ */
 const realDelivery: OutlineAnswerDelivery = {
 	async deliver(narratorId, message) {
-		const { deliverInjection } = await import("../narrator-injection");
-		await deliverInjection(narratorId, {
+		const [{ getNarratorMessageRefsPort }, { deliverInjection }] = await Promise.all([
+			import("../narrator-refs/store"),
+			import("../narrator-injection"),
+		]);
+		const postgres = !!getNarratorMessageRefsPort();
+		if (!postgres) {
+			const [{ db }, { narratorMessages }, { eq }] = await Promise.all([
+				import("@server/db"),
+				import("@server/db/schema"),
+				import("drizzle-orm"),
+			]);
+			const existing = db
+				.select({ id: narratorMessages.id })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, message.messageId))
+				.get();
+			if (existing) return { written: true, woke: false };
+		}
+		const result = await deliverInjection(narratorId, {
+			...(postgres ? {} : { messageId: message.messageId }),
 			content: message.content,
 			source: "outline_answer",
 			role: "user",
-			schedule: "wakeIfIdle",
+			schedule: postgres ? "none" : "wakeIfIdle",
 			createdBy: message.createdBy,
 			...(message.executionUserId
 				? { executionPrincipal: { version: 1 as const, userId: message.executionUserId } }
 				: {}),
 		});
+		return { written: result.messageId !== null, woke: result.started };
 	},
 };
 
@@ -1003,7 +1211,9 @@ function describeAnswer(ask: OutlineAskJson): string {
 		const option = ask.options?.[answer.option - 1];
 		parts.push(`option ${answer.option}${option ? ` (${option})` : ""}`);
 	}
-	if (answer.text) parts.push(`"${answer.text}"`);
+	// The person's words are data, quoted as a JSON string: whatever they typed (quotes, new
+	// lines, text that reads like an instruction) stays inside the quotes.
+	if (answer.text) parts.push(JSON.stringify(answer.text));
 	const choice = parts.join(": ") || "your recommendation";
 	return answer.adopted ? `${choice}, your recommendation` : choice;
 }
@@ -1036,13 +1246,13 @@ function answerMessage(
 export async function deliverOutlineAnswers(
 	blockIds: readonly string[],
 	options: { store?: OutlineStore; now?: () => Date } = {},
-): Promise<{ delivered: number; told: string[] }> {
+): Promise<{ delivered: number; told: string[]; woke: number }> {
 	const store = options.store ?? outlineStore;
 	const delivery = deliverySeam ?? realDelivery;
 	const rows = (await store.getQuestions(blockIds)).filter(
 		(r) => r.state === "answered" && r.deliveredAt === null,
 	);
-	if (rows.length === 0) return { delivered: 0, told: [] };
+	if (rows.length === 0) return { delivered: 0, told: [], woke: 0 };
 	const blocks = await blocksById(
 		store,
 		rows.map((r) => r.blockId),
@@ -1052,48 +1262,68 @@ export async function deliverOutlineAnswers(
 		if (!spaces.has(id)) spaces.set(id, await store.getSpace(id));
 		return spaces.get(id) ?? null;
 	};
+	// One message per answering commit, asking session and the person its turn ran for (review N3:
+	// questions asked in different people's turns are woken as each of them).
 	const groups = new Map<string, OutlineQuestionRow[]>();
 	for (const row of rows) {
-		const key = row.askerNarratorId ?? "";
+		const key = [row.answerCommitId ?? "", row.askerNarratorId ?? "", row.askerUserId ?? ""].join(
+			"\u0000",
+		);
 		groups.set(key, [...(groups.get(key) ?? []), row]);
 	}
 	const now = () => (options.now?.() ?? new Date()).toISOString();
 	const told: string[] = [];
 	let delivered = 0;
-	for (const [asker, list] of groups) {
+	let woke = 0;
+	for (const list of groups.values()) {
+		const first = list[0] as OutlineQuestionRow;
+		const asker = first.askerNarratorId;
 		const tell = list.filter((r) => {
 			const ask = blocks.get(r.blockId)?.askJson;
 			return !(r.proceed && ask?.answer?.adopted);
 		});
-		let target: string | null = null;
-		if (tell.length > 0) target = await answerTarget(store, asker || null, tell, blocks);
-		if (target && tell.length > 0) {
-			const entries: Array<{ block: OutlineBlockRow; spaceKey: string; ask: OutlineAskJson }> = [];
-			for (const r of tell) {
-				const block = blocks.get(r.blockId);
-				if (!block?.askJson) continue;
-				entries.push({
-					block,
-					spaceKey: (await spaceOf(block.spaceId))?.key ?? "?",
-					ask: block.askJson,
-				});
-			}
-			const by = entries[0]?.ask.answer?.by.id ?? null;
-			const names = by ? await readDisplayNames({ userIds: [by] }) : null;
-			await delivery.deliver(target, {
-				content: answerMessage(entries, (by && names?.users.get(by)) || "A person"),
-				createdBy: by,
+		try {
+			const target = tell.length > 0 ? await answerTarget(store, asker, tell, blocks) : null;
+			if (target) {
+				const entries: Array<{ block: OutlineBlockRow; spaceKey: string; ask: OutlineAskJson }> =
+					[];
+				for (const r of tell) {
+					const block = blocks.get(r.blockId);
+					if (!block?.askJson) continue;
+					entries.push({
+						block,
+						spaceKey: (await spaceOf(block.spaceId))?.key ?? "?",
+						ask: block.askJson,
+					});
+				}
+				const by = entries[0]?.ask.answer?.by.id ?? null;
+				const names = by ? await readDisplayNames({ userIds: [by] }) : null;
 				// The asking turn's person runs the wake; another session doing the task runs as it is.
-				executionUserId: target === asker ? (tell[0]?.askerUserId ?? null) : null,
+				const executionUserId = target === asker ? first.askerUserId : null;
+				const result = await delivery.deliver(target, {
+					messageId: outlineAnswerMessageId(first.answerCommitId ?? "", target, executionUserId),
+					content: answerMessage(entries, (by && names?.users.get(by)) || "A person"),
+					createdBy: by,
+					executionUserId,
+				});
+				// Nothing written: the answers stay undelivered for the sweep.
+				if (!result.written) continue;
+				told.push(target);
+				if (result.woke) woke++;
+			}
+			delivered += await store.markQuestionsDelivered(
+				list.map((r) => r.blockId),
+				now(),
+			);
+		} catch (error) {
+			logger.warn("Outline answers not delivered; the sweep tries again", {
+				asker,
+				questions: list.map((r) => r.blockId),
+				error: String(error),
 			});
-			told.push(target);
 		}
-		delivered += await store.markQuestionsDelivered(
-			list.map((r) => r.blockId),
-			now(),
-		);
 	}
-	return { delivered, told };
+	return { delivered, told, woke };
 }
 
 /**
@@ -1200,7 +1430,6 @@ export async function withdrawArchivedSessionQuestions(
 		},
 		{ store, ...(options.now ? { now: options.now } : {}) },
 	);
-	questionsChanged();
 	return ops.length;
 }
 
@@ -1278,17 +1507,37 @@ export async function listQuestionGroupsForUser(
 				m,
 			]),
 		);
-		const parentIds = [...metas.values()].flatMap((m) =>
-			m.parentId !== null && !metas.has(m.parentId) ? [m.parentId] : [],
-		);
-		for (const meta of await store.getBlockMetas(spaceId, { ids: [...new Set(parentIds)] }))
-			metas.set(meta.id, meta);
+		// Their parents, and up through questions under questions (review N2), level by level.
+		let frontier = [...metas.values()];
+		for (
+			let depth = 0;
+			depth <= OUTLINE_QUESTION_LIMITS.nestDepth && frontier.length > 0;
+			depth++
+		) {
+			const up = [
+				...new Set(
+					frontier.flatMap((m) =>
+						(depth === 0 || m.askJson) && m.parentId !== null && !metas.has(m.parentId)
+							? [m.parentId]
+							: [],
+					),
+				),
+			];
+			frontier = up.length > 0 ? await store.getBlockMetas(spaceId, { ids: up }) : [];
+			for (const meta of frontier) metas.set(meta.id, meta);
+		}
 		for (const row of list) {
 			const meta = metas.get(row.blockId);
 			if (!meta || meta.deleted) continue;
-			const parent = meta.parentId === null ? undefined : metas.get(meta.parentId);
-			// A sub-question goes with its question's group; a page-level question is its own.
-			const key = parent?.askJson ? (parent.parentId ?? parent.id) : (meta.parentId ?? meta.id);
+			// A question under questions goes with the topmost one's group: the block that one is
+			// under, or itself at the top of a page.
+			let top = meta;
+			for (let depth = 0; depth < OUTLINE_QUESTION_LIMITS.nestDepth; depth++) {
+				const parent = top.parentId === null ? undefined : metas.get(top.parentId);
+				if (!parent?.askJson) break;
+				top = parent;
+			}
+			const key = top.parentId ?? top.id;
 			const group = groups.get(key) ?? {
 				groupBlockId: key,
 				spaceId,
@@ -1305,9 +1554,10 @@ export async function listQuestionGroupsForUser(
 			groups.set(key, group);
 		}
 	}
-	const heads = await blocksById(store, [...groups.keys()]);
+	// Titles from bounded prefixes, never whole bodies (review S10).
+	const heads = await store.getContentHeads([...groups.keys()], OUTLINE_PAGE_HEAD_CHARS);
 	for (const group of groups.values())
-		group.title = blockTitle(heads.get(group.groupBlockId)?.content ?? "").slice(0, 240);
+		group.title = blockTitle(heads.get(group.groupBlockId) ?? "").slice(0, 240);
 	return {
 		groups: [...groups.values()].sort((a, b) =>
 			a.createdAt !== b.createdAt
@@ -1353,27 +1603,36 @@ export async function readQuestionsUnder(
 		truncated = children.length > scan;
 		firstLevel = questionsAmong(children.slice(0, scan));
 	}
+	// The questions under them, level by level (review N2), at most `nestDepth` levels down and
+	// `scan` children per level.
 	const items = new Map<string, OutlineBlockMeta[]>();
-	if (firstLevel.length > 0) {
+	let level = firstLevel;
+	for (let depth = 0; depth < OUTLINE_QUESTION_LIMITS.nestDepth && level.length > 0; depth++) {
 		const below = await store.listChildMetas(
 			space.id,
-			firstLevel.map((q) => q.id),
+			level.map((q) => q.id),
 			scan + 1,
 		);
 		if (below.length > scan) truncated = true;
-		for (const meta of questionsAmong(below.slice(0, scan))) {
+		level = questionsAmong(below.slice(0, scan));
+		for (const meta of level) {
 			const list = items.get(meta.parentId as string) ?? [];
 			list.push(meta);
 			items.set(meta.parentId as string, list);
 		}
+		if (depth === OUTLINE_QUESTION_LIMITS.nestDepth - 1 && level.length > 0) truncated = true;
 	}
+	// Each question followed by those under it (depth first), at most `limit`.
 	const chosen: string[] = [];
-	for (const q of firstLevel) {
-		for (const meta of [q, ...(items.get(q.id) ?? [])]) {
-			if (chosen.length >= limit) truncated = true;
-			else chosen.push(meta.id);
+	const take = (meta: OutlineBlockMeta) => {
+		if (chosen.length >= limit) {
+			truncated = true;
+			return;
 		}
-	}
+		chosen.push(meta.id);
+		for (const child of items.get(meta.id) ?? []) take(child);
+	};
+	for (const q of firstLevel) take(q);
 	const loaded = await blocksById(store, chosen);
 	const questions = chosen.flatMap((id) => {
 		const block = loaded.get(id);
@@ -1393,6 +1652,16 @@ export async function readQuestionsUnder(
 	}
 	const names = await readDisplayNames({ userIds: [...userIds], narratorIds: [...narratorIds] });
 	const canWrite = await canWriteSpace(viewer, space);
+	// The asking session is named only to a viewer who may read it (P2 PR 6's rule, review B2).
+	const visible = narratorVisibility(viewer);
+	const shown = new Set<string>();
+	for (const id of narratorIds) if (await visible(id)) shown.add(id);
+	const askedBy = (id: string | null): OutlineQuestionView["askedBy"] =>
+		id === null
+			? { narratorId: null, title: null, hidden: false }
+			: shown.has(id)
+				? { narratorId: id, title: names.narrators.get(id) ?? null, hidden: false }
+				: { narratorId: null, title: null, hidden: true };
 	const views: OutlineQuestionView[] = questions.map((q) => {
 		const ask = q.askJson as OutlineAskJson;
 		const row = rows.get(q.id);
@@ -1425,12 +1694,10 @@ export async function readQuestionsUnder(
 						relayed: ask.answer.relayed !== undefined,
 					}
 				: null,
-			askedBy: {
-				narratorId: row?.askerNarratorId ?? null,
-				title: row?.askerNarratorId ? (names.narrators.get(row.askerNarratorId) ?? null) : null,
-			},
+			askedBy: askedBy(row?.askerNarratorId ?? null),
 			createdAt: row?.createdAt ?? null,
 			canAnswer: state === "open" && toId === viewer.userId && canWrite,
+			versionSeq: q.versionSeq,
 		};
 	});
 	return {

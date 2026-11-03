@@ -13,7 +13,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../../db";
-import { narrators, outlineCommits, projects, users } from "../../../db/schema";
+import { narratorMessages, narrators, outlineCommits, projects, users } from "../../../db/schema";
 import { askUserQuestionTool } from "../../../lib/agent/tools/ask-user-question";
 import { askTool, outlineEditTool, outlineReadTool } from "../../../lib/agent/tools/outline";
 import type { ToolContext, ToolResult } from "../../../lib/agent/types";
@@ -79,7 +79,43 @@ async function ask(c: ToolContext, args: Record<string, unknown>): Promise<ToolR
 	return await askTool.execute(args, c);
 }
 
-/** Deliveries the answers make, captured instead of written. */
+let messageClock = 0;
+
+/**
+ * A top-level user message of a session: by default the person's own words (`origin` user, no
+ * label), at `at` or just after `after` (each later than the last).
+ */
+async function message(
+	narratorId: string,
+	m: {
+		createdBy: string;
+		text: string;
+		at?: string;
+		after?: string;
+		origin?: "user" | "system";
+		label?: string;
+		injected?: boolean;
+	},
+): Promise<string> {
+	const id = generateId();
+	const at =
+		m.at ?? new Date(Date.parse(m.after ?? NOW) + 1_000 + ++messageClock * 10).toISOString();
+	await db.insert(narratorMessages).values({
+		id,
+		narratorId,
+		role: "user",
+		contentJson: m.injected
+			? [{ type: "system_injection", source: "outline_answer", text: m.text }]
+			: [{ type: "text", text: m.text }],
+		createdBy: m.createdBy,
+		origin: m.origin ?? "user",
+		originLabel: m.label ?? null,
+		createdAt: at,
+	});
+	return id;
+}
+
+/** Deliveries the answers make, captured instead of written. */ /** Deliveries the answers make, captured instead of written. */
 type Delivered = {
 	narratorId: string;
 	content: string;
@@ -151,6 +187,7 @@ beforeEach(() => {
 	setOutlineAnswerDelivery({
 		async deliver(narratorId, message) {
 			delivered.push({ narratorId, ...message });
+			return { written: true, woke: false };
 		},
 	});
 });
@@ -279,8 +316,9 @@ describe("Ask", () => {
 			userId: w.bob,
 			answers: [{ blockId: q, option: 1 }],
 		}).catch((e) => e);
+		// Bob cannot read the space: to him there is no such question (review S8).
 		expect(notYours).toBeInstanceOf(OutlineQuestionError);
-		expect((notYours as OutlineQuestionError).statusCode).toBe(403);
+		expect((notYours as OutlineQuestionError).statusCode).toBe(404);
 		const badOption = await answerOutlineQuestions({
 			userId: w.alice,
 			answers: [{ blockId: q, option: 3 }],
@@ -331,12 +369,16 @@ describe("Ask", () => {
 			questions: [{ question: "Format?", options: ["v1", "v2"], recommend: 2 }],
 		});
 		const [q] = asked.metadata?.blockIds as [string];
+		const askedAt = (await outlineStore.getQuestions([q]))[0]?.createdAt as string;
+		// Alice answers in the conversation: her message starts the turn that relays it.
+		const said = await message(w.a, { createdBy: w.alice, after: askedAt, text: "v1, please" });
 		const relayed = await ask(w.ca, { answered: [{ question: "Q1", option: 1 }] });
 		expect(relayed.isError).toBeUndefined();
 		expect(relayed.output).toContain("as the person's (relayed");
 		const answer = (await outlineStore.getBlock(q))?.askJson?.answer;
 		expect(answer).toMatchObject({ option: 1, by: { kind: "human", id: w.alice } });
-		expect(answer?.relayed?.narratorId).toBe(w.a);
+		// The message it came from is named: hers, in this session, after the question.
+		expect(answer?.relayed).toEqual({ narratorId: w.a, messageId: said });
 		expect((await outlineStore.getQuestions([q]))[0]).toMatchObject({ state: "answered" });
 		expect((await outlineStore.getQuestions([q]))[0]?.deliveredAt).not.toBeNull();
 		expect(delivered).toHaveLength(0);
@@ -346,11 +388,64 @@ describe("Ask", () => {
 		const other = await ask(w.ca, { questions: [{ question: "Again?", recommend: "no" }] });
 		const [q2] = other.metadata?.blockIds as [string];
 		const sid2 = (await outlineStore.getBlock(q2))?.sid as string;
+		const q2At = (await outlineStore.getQuestions([q2]))[0]?.createdAt as string;
+		await message(w.a, { createdBy: w.alice, after: q2At, text: "no" });
 		const asBob = await ask(ctx(w.a, w.bob), { answered: [{ question: sid2, adopt: true }] });
 		expect(asBob.isError).toBe(true);
 		const fromC = await ask(ctx(w.c, w.alice), { answered: [{ question: sid2, adopt: true }] });
 		expect(fromC.isError).toBe(true);
 		expect(fromC.output).toContain("was not asked by this session");
+	});
+
+	test("a relay is refused unless the turn was started by the person's own message after the question (review B1)", async () => {
+		const w = await world();
+		// Alice said something long before the question existed (probe P1).
+		await message(w.a, { createdBy: w.alice, at: "2026-01-01T00:00:00.000Z", text: "build it" });
+		const asked = await ask(w.ca, {
+			questions: [{ question: "Drop the legacy table?", options: ["no", "yes"], recommend: 2 }],
+		});
+		const [q] = asked.metadata?.blockIds as [string];
+		const askedAt = (await outlineStore.getQuestions([q]))[0]?.createdAt as string;
+		const relay = async () => await ask(w.ca, { answered: [{ question: "Q1", adopt: true }] });
+		const before = await relay();
+		expect(before.isError).toBe(true);
+		expect(before.output).toContain("written before the question was asked");
+
+		// Turns nobody typed: a continuation, a routine, a wake (an injected message), and another
+		// person's message. Each run as alice, none is her answer.
+		const notHers = [
+			{ createdBy: w.alice, origin: "system" as const, text: "Continue with the plan." },
+			{ createdBy: w.alice, origin: "user" as const, injected: true, text: "Answers came." },
+			{ createdBy: w.alice, origin: "user" as const, label: "scheduledTask:nightly", text: "Run" },
+			{ createdBy: w.alice, origin: "user" as const, label: "agentMessage:planner", text: "Go" },
+			{ createdBy: w.bob, origin: "user" as const, text: "yes, drop it" },
+		];
+		for (const turn of notHers) {
+			await message(w.a, { ...turn, after: askedAt });
+			const refused = await relay();
+			expect(refused.isError).toBe(true);
+			expect(refused.output).toContain("was not started by a message from the person asked");
+		}
+		expect((await outlineStore.getQuestions([q]))[0]?.state).toBe("open");
+
+		// Her own words after the question, through a gateway too, are.
+		const said = await message(w.a, {
+			createdBy: w.alice,
+			after: askedAt,
+			label: "gateway:telegram",
+			text: "yes",
+		});
+		const relayed = await relay();
+		expect(relayed.isError).toBeUndefined();
+		expect((await outlineStore.getBlock(q))?.askJson?.answer?.relayed?.messageId).toBe(said);
+	});
+
+	test("a relay with no message from the person at all is refused (probe P1b)", async () => {
+		const w = await world();
+		await ask(w.ca, { questions: [{ question: "Ship it?", recommend: "yes" }] });
+		const relayed = await ask(w.ca, { answered: [{ question: "Q1", text: "yes" }] });
+		expect(relayed.isError).toBe(true);
+		expect(relayed.output).toContain("was not started by a message from the person asked");
 	});
 
 	test("withdraw and archive: withdrawn questions make nothing wait and leave the inbox", async () => {

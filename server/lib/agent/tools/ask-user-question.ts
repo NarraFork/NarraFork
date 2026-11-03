@@ -80,6 +80,7 @@ export const askUserQuestionTool: ToolDefinition = {
 		"- Configuration examples\n\n" +
 		"Preview content is rendered as markdown in a monospace box. Multi-line text with newlines is supported. When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right. Do not use previews for simple preference questions where headers and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).\n\n" +
 		"Asynchronous mode (`async: true`):\n" +
+		"Not in a session that has the `Ask` tool (its tasks are outline tasks): there `async: true` is refused; ask without stopping with `Ask` instead (it puts the question under your task with your recommendation). Subagents keep `async`.\n" +
 		"Provide non-empty context (maximum 2KiB UTF-8) describing the task background, applicability and your action while waiting. Question action=get/list recovers historical items after compact; Question action=resolve confirms handling of a specific latest answerMessageId; Question action=withdraw withdraws open items.\n" +
 		"By default this tool BLOCKS until the user answers. Set `async: true` to submit the question without stopping: you get an immediate acknowledgement, keep working with a sensible default, and the user's answer arrives later as a message in the conversation — at which point you adjust.\n" +
 		"Use async when ALL of these hold:\n" +

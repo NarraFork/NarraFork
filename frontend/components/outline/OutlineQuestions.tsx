@@ -32,7 +32,6 @@ import type {
 	OutlineQuestionView,
 } from "@shared/outline-api";
 import { useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -45,8 +44,8 @@ import {
 } from "../../hooks/useOutline";
 import { ApiError, api } from "../../lib/api";
 import { formatSmartTime } from "../../lib/format";
-import { outlineTargetHref, outlineTargetPath } from "../../lib/outline-href";
 import { PendingDetail } from "./OutlinePendingPanel";
+import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 type Translate = ReturnType<typeof useTranslation>["t"];
 
@@ -89,7 +88,10 @@ function answerText(t: Translate, q: OutlineQuestionView): string {
 	});
 }
 
-/** A link that opens a block in the outline (the app's route), closing the inbox first. */
+/**
+ * A link that opens a block in the outline, closing the inbox first. Router-free like the rest of
+ * the outline's components: the host (the inbox) says what a link is (`OutlineNavProvider`).
+ */
 function OpenInOutline({
 	spaceId,
 	blockId,
@@ -100,17 +102,12 @@ function OpenInOutline({
 	onOpen?: () => void;
 }) {
 	const { t } = useTranslation("outline");
-	const navigate = useNavigate();
-	const target = { kind: "block" as const, spaceId, blockId, view: "all" as const };
 	return (
 		<Anchor
 			size="xs"
-			href={outlineTargetHref(target)}
-			onClick={(event) => {
-				event.preventDefault();
-				onOpen?.();
-				void navigate({ href: outlineTargetPath(target) });
-			}}
+			component={OutlineLink}
+			to={outlineBlockTarget(spaceId, blockId, "all")}
+			onClick={() => onOpen?.()}
 		>
 			{t("questions.openInOutline")}
 		</Anchor>
@@ -155,7 +152,11 @@ function QuestionCard({
 				<Text size="xs" c="dimmed">
 					{[
 						q.to.name ? t("questions.askedOf", { name: q.to.name }) : null,
-						q.askedBy.title ? t("questions.askedBy", { title: q.askedBy.title }) : null,
+						q.askedBy.hidden
+							? t("questions.askedByHidden")
+							: q.askedBy.title
+								? t("questions.askedBy", { title: q.askedBy.title })
+								: null,
 						q.createdAt ? formatSmartTime(q.createdAt) : null,
 						q.proceed ? t("questions.proceeded") : null,
 					]
@@ -187,7 +188,9 @@ function QuestionCard({
 								<Stack gap={4}>
 									{q.options.map((option, i) => (
 										<Radio
-											key={option}
+											// Two choices may read the same (review N9).
+											// biome-ignore lint/suspicious/noArrayIndexKey: the choices are positional
+											key={i}
 											size="xs"
 											value={String(i + 1)}
 											disabled={busy}
@@ -267,8 +270,9 @@ export function OutlineQuestionsForm({
 
 	const send = (adoptAll: boolean) => {
 		const answers = answerable.flatMap((q): OutlineAnswerInput[] => {
+			// The version read goes with each answer: a question changed since is refused (S3).
 			const adopt: OutlineAnswerInput[] = hasRecommendation(q)
-				? [{ blockId: q.blockId, adopt: true }]
+				? [{ blockId: q.blockId, adopt: true, versionSeq: q.versionSeq }]
 				: [];
 			if (adoptAll) return adopt;
 			const d = draftOf(q);
@@ -279,6 +283,7 @@ export function OutlineQuestionsForm({
 					blockId: q.blockId,
 					...(d.option !== null ? { option: d.option } : {}),
 					...(text ? { text } : {}),
+					versionSeq: q.versionSeq,
 				},
 			];
 		});
@@ -292,12 +297,24 @@ export function OutlineQuestionsForm({
 					color: "green",
 					message: t("questions.answered", { count: done.answered.length }),
 				}),
-			onError: (error) =>
+			onError: (error) => {
+				// Changed since it was read: the group is read again (the mutation refreshes it) and
+				// the choices start over from what it says now.
+				if (error instanceof ApiError && error.data?.code === "OUTLINE_QUESTION_CHANGED") {
+					setDrafts({});
+					notifications.show({
+						color: "yellow",
+						title: t("questions.changedTitle"),
+						message: errorText(error),
+					});
+					return;
+				}
 				notifications.show({
 					color: "red",
 					title: t("questions.answerFailed"),
 					message: errorText(error),
-				}),
+				});
+			},
 		});
 	};
 	const withRecommendation = answerable.filter(hasRecommendation).length;
@@ -433,9 +450,11 @@ function OutlineDigestList({ onOpen }: { onOpen?: () => void }) {
 						</Group>
 						<Text size="xs" c="dimmed">
 							{[
-								t("digest.confirmedBy", {
-									title: item.decidedBy.title ?? item.decidedBy.narratorId,
-								}),
+								item.decidedBy.hidden
+									? t("digest.confirmedByHidden")
+									: t("digest.confirmedBy", {
+											title: item.decidedBy.title ?? item.decidedBy.narratorId ?? "?",
+										}),
 								item.decidedAt ? formatSmartTime(item.decidedAt) : null,
 							]
 								.filter(Boolean)
@@ -446,6 +465,7 @@ function OutlineDigestList({ onOpen }: { onOpen?: () => void }) {
 								<OpenInOutline spaceId={item.spaceId} blockId={item.rootBlockId} onOpen={onOpen} />
 							)}
 							{item.commitId &&
+								item.canRevert &&
 								(reverted.has(item.pendingId) ? (
 									<Text size="xs" c="dimmed">
 										{t("digest.reverted")}

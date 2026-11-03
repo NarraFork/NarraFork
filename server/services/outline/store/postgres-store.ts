@@ -1282,7 +1282,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 						sql`"status" = 'confirmed' AND "digest_seen_at" IS NULL AND ("decided_by_json"::jsonb #>> '{kind}') = 'agent'`,
 					),
 				)
-				.orderBy(asc(outlinePending.decidedAt), asc(outlinePending.id))
+				.orderBy(asc(outlinePending.decidedAt), sql`${outlinePending.id} COLLATE "C"`)
 				.limit(limit);
 			return rows.map(toPendingHead);
 		},
@@ -1319,6 +1319,21 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 					.from(outlineQuestions)
 					.where(inArray(outlineQuestions.blockId, ids));
 				out.push(...rows.map(toQuestion));
+			}
+			return out;
+		},
+
+		async getContentHeads(blockIds, chars) {
+			const out = new Map<string, string>();
+			for (const ids of chunked(blockIds)) {
+				const rows = await db
+					.select({
+						id: outlineBlocks.id,
+						head: sql<string>`substr(${outlineBlocks.content}, 1, CAST(${Math.max(0, Math.floor(chars))} AS integer))`,
+					})
+					.from(outlineBlocks)
+					.where(inArray(outlineBlocks.id, ids));
+				for (const row of rows) out.set(row.id, row.head);
 			}
 			return out;
 		},

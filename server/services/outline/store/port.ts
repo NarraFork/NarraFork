@@ -875,6 +875,11 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 
 	/** Question rows of the given blocks. */
 	getQuestions(blockIds: readonly string[]): Promise<OutlineQuestionRow[]>;
+	/**
+	 * The first `chars` characters of the given blocks' content, by id (live or deleted): what a
+	 * list shows of them, without reading whole bodies.
+	 */
+	getContentHeads(blockIds: readonly string[], chars: number): Promise<Map<string, string>>;
 	/** Open questions of a space, oldest first, at most `limit`. */
 	listOpenQuestionsBySpace(spaceId: string, limit: number): Promise<OutlineQuestionRow[]>;
 	/** Open questions put to a person, oldest first, at most `limit`. */

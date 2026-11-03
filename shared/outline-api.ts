@@ -511,10 +511,16 @@ export interface OutlineQuestionView {
 		/** Written down by the asking session from the conversation. */
 		relayed: boolean;
 	} | null;
-	askedBy: { narratorId: string | null; title: string | null };
+	/**
+	 * The asking session. `hidden`: the viewer may not read it, so neither its id nor its title is
+	 * given (a placeholder is shown).
+	 */
+	askedBy: { narratorId: string | null; title: string | null; hidden: boolean };
 	createdAt: string | null;
 	/** The viewer is the person asked, it is open, and they may write the space. */
 	canAnswer: boolean;
+	/** The block's version: an answer names it, and is refused when it changed since. */
+	versionSeq: number;
 }
 
 /** `GET /blocks/:blockId/questions`: the questions under a block (or a question and its items). */
@@ -539,6 +545,8 @@ export interface OutlineAnswerInput {
 	option?: number;
 	text?: string;
 	adopt?: boolean;
+	/** The question's version the person read (`OutlineQuestionView.versionSeq`): checked. */
+	versionSeq?: number;
 }
 
 /** `POST /questions/answer`: questions of one space answered at once. */
@@ -564,10 +572,15 @@ export interface OutlineDigestItem {
 	summary: string;
 	opCount: number;
 	decidedAt: string | null;
-	/** The session that confirmed it. */
-	decidedBy: { narratorId: string; title: string | null };
+	/**
+	 * The session that confirmed it. `hidden`: the viewer may not read it, so neither its id nor
+	 * its title is given (a placeholder is shown).
+	 */
+	decidedBy: { narratorId: string | null; title: string | null; hidden: boolean };
 	/** The `confirm` commit: reverting it takes the change back. */
 	commitId: string | null;
+	/** The viewer may write the space, so may revert it (acknowledging needs no access). */
+	canRevert: boolean;
 }
 
 /** `GET /digest`. */

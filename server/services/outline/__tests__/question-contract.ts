@@ -162,8 +162,9 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 			expect(await ctx.store.markQuestionsDelivered([q], NOW)).toBe(0);
 			expect((await ctx.store.listUndeliveredAnswers(10)).map((r) => r.blockId)).not.toContain(q);
 
-			// Reverting the answer reopens the question; the task waits again.
-			await revertCommit(
+			// Reverting the answer reopens the question; the task waits again. The row keeps its last
+			// answer's commit and delivery (review N1).
+			const reopened = await revertCommit(
 				{
 					commitId: answered.commit?.id as string,
 					actor: { kind: "human", id: s.person },
@@ -172,11 +173,34 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 				{ store: ctx.store },
 			);
 			[row] = await ctx.store.getQuestions([q]);
-			expect(row).toMatchObject({ state: "open", answeredAt: null, deliveredAt: null });
+			expect(row).toMatchObject({
+				state: "open",
+				answeredAt: NOW,
+				answerCommitId: answered.commit?.id,
+				deliveredAt: NOW,
+			});
 			expect((await ctx.store.getBlock(q))?.askJson?.answer).toBeUndefined();
 			expect([...(await questionWaits([subject], { store: ctx.store }))]).toEqual([s.task]);
 
-			// Deleting the block withdraws it; bringing it back opens it again.
+			// Reverting the revert brings the same answer back: no new answer, nothing to deliver.
+			await revertCommit(
+				{
+					commitId: reopened.commit?.id as string,
+					actor: { kind: "human", id: s.person },
+					responsibleUserId: s.person,
+				},
+				{ store: ctx.store },
+			);
+			[row] = await ctx.store.getQuestions([q]);
+			expect(row).toMatchObject({
+				state: "answered",
+				answerCommitId: answered.commit?.id,
+				deliveredAt: NOW,
+			});
+			expect((await ctx.store.listUndeliveredAnswers(10)).map((r) => r.blockId)).not.toContain(q);
+
+			// Deleting the block withdraws it; bringing it back is the same answered question, still
+			// delivered (undoing a delete tells the asker nothing again).
 			const deleted = await personWrites(ctx, s.space, s.person, [
 				{ op: "delete", block: { id: q } },
 			]);
@@ -192,8 +216,13 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 				{ store: ctx.store },
 			);
 			[row] = await ctx.store.getQuestions([q]);
-			expect(row?.state).toBe("open");
-			expect(row?.askerNarratorId).toBe(s.narratorId);
+			expect(row).toMatchObject({
+				state: "answered",
+				askerNarratorId: s.narratorId,
+				answerCommitId: answered.commit?.id,
+				deliveredAt: NOW,
+			});
+			expect((await ctx.store.listUndeliveredAnswers(10)).map((r) => r.blockId)).not.toContain(q);
 			dump = await ctx.dump(s.space.id);
 			checkSpaceInvariants(dump);
 			// The history holds every state of the question.
@@ -201,8 +230,8 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 				.filter((v) => v.blockId === q)
 				.sort((a, b) => a.fromSeq - b.fromSeq);
 			expect(
-				versions.map((v) => (v.askJson?.answer ? "answered" : v.deleted ? "gone" : "open")),
-			).toEqual(["open", "answered", "open", "gone", "open"]);
+				versions.map((v) => (v.deleted ? "gone" : v.askJson?.answer ? "answered" : "open")),
+			).toEqual(["open", "answered", "open", "answered", "gone", "answered"]);
 		},
 	},
 	{
@@ -282,11 +311,24 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 				{ op: "insert", parent: { id: s.fact }, content: "Q on a fact", ask: ask(s.person) },
 			]);
 			const [q1, q1a, q2, q3, top, onFact] = asked.results.map((r) => r.blockId) as string[];
+			// A question two levels down (moved under a sub-question) goes with the topmost one's
+			// group, the block that one is under (review N2).
+			const deep = await agentAsks(ctx, s.space, s.narratorId, s.person, [
+				{ op: "insert", parent: { id: q1a as string }, content: "Q deeper", ask: ask(s.person) },
+			]);
+			const q1b = deep.results[0]?.blockId as string;
 			const { groups, truncated } = await listQuestionGroupsForUser(s.person, { store: ctx.store });
 			expect(truncated).toBe(false);
 			const byGroup = new Map(groups.map((g) => [g.groupBlockId, g]));
-			expect(byGroup.get(s.task)?.questionIds.sort()).toEqual([q1, q1a, q2].sort());
+			expect(byGroup.get(s.task)?.questionIds.sort()).toEqual([q1, q1a, q1b, q2].sort());
 			expect(byGroup.get(s.task)?.title).toBe("Ship the importer");
+			// Titles come from bounded prefixes of the content, never whole bodies (review S10).
+			expect(await ctx.store.getContentHeads([s.task, top as string, "nope"], 4)).toEqual(
+				new Map([
+					[s.task, "Ship"],
+					[top as string, "Q at"],
+				]),
+			);
 			expect(byGroup.get(s.task)?.askers).toEqual([s.narratorId]);
 			expect(byGroup.get(top as string)?.questionIds).toEqual([top]);
 			expect(byGroup.get(s.fact)?.questionIds).toEqual([onFact]);
@@ -295,7 +337,7 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 			expect(others.groups.map((g) => [g.groupBlockId, g.questionIds])).toEqual([[s.task, [q3]]]);
 
 			// Answering the group at once: one commit, every row answered.
-			const ids = [q1, q1a, q2] as string[];
+			const ids = [q1, q1a, q1b, q2] as string[];
 			const blocks = await ctx.store.getBlocks(ids);
 			const result = await personWrites(
 				ctx,
@@ -313,7 +355,7 @@ export const OUTLINE_QUESTION_CONTRACT: ContractCase[] = [
 				"answer",
 			);
 			const rows = await ctx.store.getQuestions(ids);
-			expect(rows.map((r) => r.state)).toEqual(["answered", "answered", "answered"]);
+			expect(rows.map((r) => r.state)).toEqual(["answered", "answered", "answered", "answered"]);
 			expect(new Set(rows.map((r) => r.answerCommitId))).toEqual(
 				new Set([result.commit?.id ?? null]),
 			);

@@ -2841,7 +2841,15 @@ class OutlinePlanner {
 						: "open";
 			const existing = rows.get(block.id) ?? null;
 			const answeredNow = state === "answered" && existing?.state !== "answered";
-			const delivered = answeredNow && asker?.delivered === true ? this.now : null;
+			// The last answer stays on the row when the question leaves answered (reopened by a
+			// revert, withdrawn by a delete). Coming back with that same answer (undoing the delete,
+			// reverting the revert) is no new answer: its commit and delivery stay (review N1).
+			const sameAnswer =
+				answeredNow &&
+				!!existing?.answerCommitId &&
+				existing.answeredAt === (ask?.answer?.at ?? null);
+			const newAnswer = answeredNow && !sameAnswer;
+			const delivered = newAnswer && asker?.delivered === true ? this.now : null;
 			const row: OutlineQuestionRow = {
 				blockId: block.id,
 				spaceId: this.space.id,
@@ -2852,22 +2860,12 @@ class OutlinePlanner {
 				askerUserId: existing ? existing.askerUserId : (asker?.askerUserId ?? null),
 				askerToolCallId: existing ? existing.askerToolCallId : (asker?.askerToolCallId ?? null),
 				createdAt: existing?.createdAt ?? this.now,
-				answeredAt:
-					state !== "answered"
-						? null
-						: answeredNow
-							? (ask?.answer?.at ?? this.now)
-							: (existing?.answeredAt ?? this.now),
-				answerCommitId:
-					state !== "answered" ? null : answeredNow ? commitId : (existing?.answerCommitId ?? null),
-				deliveredAt: answeredNow
-					? delivered
-					: state === "answered"
-						? (existing?.deliveredAt ?? null)
-						: null,
+				answeredAt: newAnswer ? (ask?.answer?.at ?? this.now) : (existing?.answeredAt ?? null),
+				answerCommitId: newAnswer ? commitId : (existing?.answerCommitId ?? null),
+				deliveredAt: newAnswer ? delivered : (existing?.deliveredAt ?? null),
 			};
-			// An answer already recorded keeps whatever delivery was marked since it was read.
-			out.push({ row, setDelivered: answeredNow || state !== "answered" });
+			// Only a new answer sets the delivery; otherwise whatever was marked meanwhile stays.
+			out.push({ row, setDelivered: newAnswer });
 		}
 		return out;
 	}
@@ -3637,6 +3635,14 @@ async function writePrepared(
 		for (const pageId of options.confirmPageIds ?? [])
 			if (options.confirm) pendingPages.add(pageId);
 		if (pendingPages.size > 0) emitPending(space.id, [...pendingPages]);
+		// Questions asked, answered, reopened, withdrawn or brought back, by whatever path (an Ask,
+		// an answer, a revert, the editor): the people asked read their inbox again (review S7).
+		const asked = [
+			...new Set(
+				(planned.plan.questions ?? []).flatMap((q) => (q.row.toUserId ? [q.row.toUserId] : [])),
+			),
+		];
+		if (asked.length > 0) eventBus.emit({ type: "human_attention:changed", userIds: asked });
 		return {
 			spaceId: space.id,
 			commit: { id: commit.id, seq: commit.seq },

@@ -2646,6 +2646,7 @@
 		"questions": "{{title}} · {{count}} 条问你的提问",
 		"pending": "{{summary}} · 你锁定的计划有改动（{{count}} 处）等你确认",
 		"digest": "agent 代你确认了 {{count}} 处改动",
-		"from": "来自：{{narrator}}"
+		"from": "来自：{{narrator}}",
+		"fromHidden": "来自一个你无权查看的会话"
 	}
 }

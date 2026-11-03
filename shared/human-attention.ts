@@ -21,6 +21,11 @@ export interface HumanAttentionOutlineRef {
 	pendingId: string | null;
 	/** Questions in the group, operations of the change, confirmations in the digest. */
 	count: number;
+	/**
+	 * The asking or proposing session is one the person may not read: the row names neither its
+	 * id nor its title, and the client shows a placeholder.
+	 */
+	sessionHidden: boolean;
 }
 
 /** List rows never carry full tool inputs, plans, or question forms. */

@@ -178,6 +178,7 @@ beforeAll(async () => {
 	setOutlineAnswerDelivery({
 		async deliver(narratorId, message) {
 			told.push({ narratorId, content: message.content });
+			return { written: true, woke: false };
 		},
 	});
 }, 60_000);
@@ -343,6 +344,55 @@ test("Adopt all recommendations answers a group in one click", async () => {
 	const answers = (await outlineStore.getBlocks(ids)).map((b) => b.askJson?.answer);
 	expect(answers.every((a) => a?.adopted === true)).toBe(true);
 	expect(new Set((await outlineStore.getQuestions(ids)).map((r) => r.answerCommitId)).size).toBe(1);
+	expect(errors).toEqual([]);
+	await page.close();
+}, 60_000);
+
+test("a question changed after it was read is refused and read again; its link opens the outline", async () => {
+	const asked = await askTool.execute(
+		{
+			under: "Importer",
+			questions: [{ question: "Delete the STAGING data?", options: ["no", "yes"], recommend: 2 }],
+		},
+		toolCtx(),
+	);
+	const [q] = asked.metadata?.blockIds as [string];
+	const group = asked.metadata?.groupBlockId as string;
+	const row = `[data-attention-id="outline:q:${group}"]`;
+	const card = `[data-testid=outline-question-${q}]`;
+	const { page, errors } = await openInbox();
+	await until(page, "the inbox row", (f, sel) => f.exists(sel as never), row);
+	await call(
+		page,
+		(f, sel) => f.click(sel as never),
+		`${row} [data-testid=outline-attention-review]`,
+	);
+	await until(page, "the question", (f, sel) => f.exists(sel as never), card);
+	// The asking session rewrites it while the person has it open.
+	await writeOutline({
+		spaceId: (await outlineStore.getBlock(q))?.spaceId as string,
+		ops: [{ op: "update", block: { id: q }, content: "Delete the PRODUCTION data?" }],
+		actor: { kind: "agent", id: session },
+		narratorId: session,
+		responsibleUserId: alice,
+	});
+	await call(page, (f, sel) => f.click(sel as never), "[data-testid=outline-questions-submit]");
+	await until(
+		page,
+		"the question read again",
+		(f, sel) => (f.textOf(sel as never) ?? "").includes("PRODUCTION"),
+		card,
+	);
+	expect(await call(page, () => document.body.innerText.includes("A question changed"))).toBe(true);
+	expect((await outlineStore.getBlock(q))?.askJson?.answer).toBeUndefined();
+
+	// "Open in the outline" goes to the block through the app's routes, closing the inbox.
+	await call(page, (f, sel) => f.click(sel as never), "[data-testid=outline-questions] a");
+	await until(page, "the outline route", (f) => f.location().href.startsWith("/outline/"));
+	const at = await call(page, (f) => f.location());
+	expect(at.href).toContain(`/${group}`);
+	expect(at.href).toContain("view=all");
+	expect(at.closed).toBeGreaterThan(0);
 	expect(errors).toEqual([]);
 	await page.close();
 }, 60_000);

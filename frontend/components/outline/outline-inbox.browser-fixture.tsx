@@ -35,6 +35,9 @@ await i18n.init({
 });
 
 let client: QueryClient | null = null;
+/** Where the router is (read by the test). */
+let currentHref: (() => string) | null = null;
+let closed = 0;
 
 export function ready(): boolean {
 	return true;
@@ -45,24 +48,36 @@ export function open(): void {
 	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	client.setQueryData(["settings"], { outline: { enabled: true } });
 	const queryClient = client;
-	const router = createRouter({
+	const routed = createRouter({
 		routeTree: createRootRoute({
 			component: () => (
-				<NotificationCenterDrawer opened initialTab="attention" onClose={() => {}} />
+				<NotificationCenterDrawer
+					opened
+					initialTab="attention"
+					onClose={() => {
+						closed++;
+					}}
+				/>
 			),
 		}),
 		history: createMemoryHistory({ initialEntries: ["/"] }),
 	});
+	currentHref = () => routed.state.location.href;
 	createRoot(document.getElementById("root") as HTMLElement).render(
 		<QueryClientProvider client={queryClient}>
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider>
 					<Notifications />
-					<RouterProvider router={router} />
+					<RouterProvider router={routed} />
 				</MantineProvider>
 			</I18nextProvider>
 		</QueryClientProvider>,
 	);
+}
+
+/** Where the app's router is now, and how often the drawer was asked to close. */
+export function location(): { href: string; closed: number } {
+	return { href: currentHref?.() ?? "", closed };
 }
 
 /** Read the inbox again (what a `human_attention_changed` frame does in the app). */

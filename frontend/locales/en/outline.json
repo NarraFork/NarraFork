@@ -42,6 +42,12 @@
 			"done": "Done",
 			"cancelled": "Cancelled"
 		},
+		"question": {
+			"open": "A question for a person: waiting for the answer",
+			"openProceeded": "A question for a person: the agent went ahead with its recommendation",
+			"answered": "A question for a person: answered",
+			"withdrawn": "A question for a person: withdrawn"
+		},
 		"expand": "Expand",
 		"collapse": "Collapse",
 		"focus": "Focus on this block",
@@ -144,6 +150,9 @@
 	},
 	"editor": {
 		"changeStatus": "Change status",
+		"questionMark": "A question for a person: answered in the inbox. Deleting it withdraws it.",
+		"questionsWithdrawn_one": "Deleting it withdrew a question put to a person; undo asks it again.",
+		"questionsWithdrawn_other": "Deleting them withdrew {{count}} questions put to people; undo asks them again.",
 		"tooLarge": "A block can hold at most 16 KB. Split it into more blocks.",
 		"rootKept": "The block in focus stays; go up a level to delete it.",
 		"peerEditing": "{{name}} is editing",
@@ -301,6 +310,7 @@
 		"openInOutline": "Open in the outline",
 		"askedOf": "for {{name}}",
 		"askedBy": "asked by {{title}}",
+		"askedByHidden": "asked by a session you cannot open",
 		"proceeded": "the agent went ahead with its recommendation",
 		"recommended": "Recommended: {{choice}}",
 		"recommendedWhy": "Recommended: {{choice}} ({{reason}})",
@@ -317,6 +327,7 @@
 		"nothingToSend": "Choose an option or write an answer first",
 		"answered": "Answered {{count}} question(s); the agent is told",
 		"answerFailed": "The answers were not saved",
+		"changedTitle": "A question changed: read it again",
 		"loadFailed": "The questions could not be loaded",
 		"none": "No questions here",
 		"truncated": "More questions than shown: answer these first"
@@ -326,6 +337,7 @@
 		"empty": "Nothing was confirmed on your behalf",
 		"changes": "{{count}} change(s)",
 		"confirmedBy": "confirmed by {{title}}",
+		"confirmedByHidden": "confirmed by a session you cannot open",
 		"revert": "Revert",
 		"reverted": "Reverted",
 		"revertFailed": "The change could not be reverted",

@@ -111,6 +111,7 @@ export const outlineAnswerBodySchema = z.object({
 					option: z.number().int().min(1).max(100).optional(),
 					text: z.string().max(16_384).optional(),
 					adopt: z.boolean().optional(),
+					versionSeq: z.number().int().min(1).optional(),
 				})
 				.strict(),
 		)
