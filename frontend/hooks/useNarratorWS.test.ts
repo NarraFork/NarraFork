@@ -177,6 +177,9 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		narratorWSManager.leavePresence = (() => {}) as typeof narratorWSManager.leavePresence;
 		const sourceListeners: Array<(data: Record<string, unknown>) => void> = [];
 		const sourceUpdates: unknown[] = [];
+		const warnings: unknown[] = [];
+		const subagentWarnings: unknown[] = [];
+		const errors: unknown[] = [];
 		narratorWSManager.addListener = ((_opts, listener) => {
 			sourceListeners.push(listener);
 			return { _id: nextHandleId++ };
@@ -198,6 +201,9 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			useNarratorWS(
 				props.narratorId,
 				{
+					onNarratorWarning: (info) => warnings.push(info),
+					onSubagentWarning: (id, info) => subagentWarnings.push({ id, ...info }),
+					onNarratorError: (...args) => errors.push(args),
 					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
 					onToolStarted: (...args) => sourceUpdates.push(args[8]),
 					onStreamingSnapshot: (snapshot) =>
@@ -261,6 +267,61 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			])
 				for (const listener of sourceListeners) listener(frame);
 			expect(sourceUpdates).toEqual([inputDocument, inputDocument, inputDocument]);
+			for (const frame of [
+				{
+					type: "warning",
+					narratorId: "n1",
+					message: "voice.mp3：当前模型不支持读取该模态数据，回退到一般文件",
+					warningCode: "native_media_fallback",
+				},
+				{
+					type: "warning",
+					narratorId: "n1",
+					message: "provider busy",
+					retryCount: 1,
+					maxRetries: 3,
+					delayMs: 2000,
+					diagnostics: { kind: "provider_error" },
+				},
+				{
+					type: "warning",
+					narratorId: "n1",
+					message: "unknown warning",
+					warningCode: "future_warning",
+				},
+				{
+					type: "subagent_warning",
+					narratorId: "n1",
+					subagentNarratorId: "child",
+					message: "clip.mp4 downgraded",
+					warningCode: "native_media_fallback",
+				},
+			]) {
+				for (const listener of sourceListeners) listener(frame);
+			}
+			expect(warnings).toEqual([
+				expect.objectContaining({
+					warningCode: "native_media_fallback",
+					message: "voice.mp3：当前模型不支持读取该模态数据，回退到一般文件",
+				}),
+				expect.objectContaining({
+					warningCode: undefined,
+					message: "provider busy",
+					retryCount: 1,
+					maxRetries: 3,
+					delayMs: 2000,
+					diagnostics: { kind: "provider_error" },
+				}),
+				expect.objectContaining({ warningCode: undefined, message: "unknown warning" }),
+			]);
+			expect(subagentWarnings).toEqual([
+				expect.objectContaining({
+					id: "child",
+					warningCode: "native_media_fallback",
+					message: "clip.mp4 downgraded",
+				}),
+			]);
+			expect(errors).toEqual([]);
 			props = { narratorId: "n2" };
 			root.render(createElement(Harness));
 			await settle();

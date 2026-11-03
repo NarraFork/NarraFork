@@ -8,6 +8,7 @@ import {
 	composerDocumentText,
 } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
+import { MAX_MEDIA_FILE_SIZE, type MediaRef } from "@shared/media-attachments";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Editor } from "@tiptap/core";
 import { Slice } from "@tiptap/pm/model";
@@ -981,6 +982,380 @@ function queueRow(overrides: Partial<ComponentProps<typeof QueuedMessageRow>> = 
 		/>
 	);
 }
+
+describe("native media queued rows and manifest editing", () => {
+	beforeEach(() => {
+		previousGlobals.set(
+			"localStorage",
+			Object.getOwnPropertyDescriptor(globalThis, "localStorage"),
+		);
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+	});
+	const media: MediaRef[] = [
+		{
+			mediaId: "video-id",
+			filename: "clip.webm",
+			mediaType: "video/webm",
+			size: 32,
+			uploadNarratorId: "source-owner",
+		},
+		{
+			mediaId: "audio-id",
+			filename: "voice.wav",
+			mediaType: "audio/wav",
+			size: 60,
+			uploadNarratorId: "source-owner",
+		},
+	];
+	const documentFor = (refs: MediaRef[]): ComposerDocument => ({
+		version: 1,
+		assets: refs.map((ref, index) => ({
+			id: `media-${index}`,
+			kind: ref.mediaType.startsWith("audio/") ? "audio" : "video",
+			name: ref.filename,
+			size: ref.size,
+			mimeType: ref.mediaType,
+		})),
+		paragraphs: [
+			{
+				children: refs.map((_, index) => ({
+					type: "attachment",
+					id: `node-${index}`,
+					assetId: `media-${index}`,
+				})),
+			},
+		],
+	});
+	const messageFor = (refs: MediaRef[]): BufferMessageSummary => ({
+		id: "queue-media",
+		text: "",
+		bufferedAt: "now",
+		imageCount: 0,
+		media: refs,
+	});
+	async function selectMedia(files: File[]) {
+		const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+		if (!input) throw new Error("Attachment input missing");
+		Object.defineProperty(input, "files", { configurable: true, value: files });
+		await act(async () => {
+			input.dispatchEvent(new Event("change", { bubbles: true }));
+			await flush();
+		});
+	}
+	test("panel preserves source-owned audio/video previews and ignores media double-clicks for editing", async () => {
+		const fetch = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(async () => new Response("native bytes"), {
+				preconnect: globalThis.fetch.preconnect,
+			}),
+		);
+		const start = mock(() => {});
+		await render(
+			queuePanel({
+				narratorId: "fork-context",
+				queuedMessages: [messageFor(media)],
+				handleStartEditQueued: start,
+			}),
+		);
+		expect(fetch).not.toHaveBeenCalled();
+		expect(document.querySelectorAll("audio, video")).toHaveLength(0);
+		const loadButtons = Array.from(document.querySelectorAll("button")).filter(
+			(item) => item.textContent?.trim() === en.mediaPreviewLoad,
+		);
+		expect(loadButtons).toHaveLength(2);
+		for (const load of loadButtons) await click(load);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(document.querySelectorAll("audio")).toHaveLength(1);
+		expect(document.querySelectorAll("video")).toHaveLength(1);
+		const urls = fetch.mock.calls.map(([url]) => String(url));
+		expect(
+			urls.some((url) =>
+				url.includes("/uploads/source-owner/media/audio-id?referencingNarratorId=fork-context"),
+			),
+		).toBe(true);
+		expect(
+			urls.some((url) =>
+				url.includes("/uploads/source-owner/media/video-id?referencingNarratorId=fork-context"),
+			),
+		).toBe(true);
+		await act(async () =>
+			document.querySelector("audio")?.dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(start).not.toHaveBeenCalled();
+	});
+
+	test("detail media overrides stale row state and actual chip removal/addition forwards native files", async () => {
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(async () => new Response("native bytes"), {
+				preconnect: globalThis.fetch.preconnect,
+			}),
+		);
+		const layout = documentFor(media);
+		spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [],
+			textFiles: [],
+			media,
+			text: composerDocumentText(layout).text,
+		});
+		const save = mock(
+			async (_msg: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(
+			queuePanel({
+				narratorId: "fork-context",
+				queuedMessages: [messageFor([{ ...media[0], mediaId: "stale" }])],
+				editingQueuedId: "queue-media",
+				handleSaveEditQueued: save,
+			}),
+		);
+		await editorKey("Enter");
+		expect(save.mock.calls[0][2].keepMediaIds).toEqual(["video-id", "audio-id"]);
+		expect(save.mock.calls[0][2].newTextFiles).toEqual([]);
+		const videoChip = document.querySelector('[data-composer-asset-id="media-0"]');
+		const remove = videoChip?.querySelectorAll("button")[1];
+		if (!remove) throw new Error("Media remove control missing");
+		await click(remove);
+		const added = new File(["native"], "new.webm", { type: "video/webm" });
+		await selectMedia([added]);
+		await editorKey("Enter");
+		const payload = save.mock.calls.at(-1)?.[2];
+		expect(payload?.keepMediaIds).toEqual(["audio-id"]);
+		expect(payload?.newMedia).toEqual([added]);
+		expect(payload?.newTextFiles).toEqual([]);
+		expect(payload?.composerDocument?.assets.map((asset) => asset.kind)).toEqual([
+			"audio",
+			"video",
+		]);
+		expect(media[1].uploadNarratorId).toBe("source-owner");
+	});
+
+	test("editing normalizes audio aliases and missing MIME without turning them into text attachments", async () => {
+		const layout = documentFor([]);
+		spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [],
+			textFiles: [],
+			media: [],
+			text: "",
+		});
+		const notify = spyOn(notifications, "show").mockReturnValue("notice");
+		const save = mock(
+			async (_msg: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(queueRow({ msg: messageFor([]), isEditing: true, onSaveEdit: save }));
+		const files = [
+			new File(["wav"], "alias.wav", { type: "audio/x-wav", lastModified: 101 }),
+			new File(["mp3"], "alias.mp3", { type: "audio/mp3", lastModified: 102 }),
+			new File(["m4a"], "alias.m4a", { type: "audio/x-m4a", lastModified: 103 }),
+			new File(["flac"], "missing.FLAC", { lastModified: 104 }),
+			new File(["generic"], "generic.WAV", {
+				type: "application/octet-stream",
+				lastModified: 105,
+			}),
+		];
+		await selectMedia([...files, new File(["unknown"], "unknown.wav", { type: "audio/unknown" })]);
+		await editorKey("Enter");
+		const payload = save.mock.calls.at(-1)?.[2];
+		expect(payload?.newMedia?.map((file) => file.type)).toEqual([
+			"audio/wav",
+			"audio/mpeg",
+			"audio/mp4",
+			"audio/flac",
+			"audio/wav",
+		]);
+		expect(payload?.newTextFiles).toEqual([]);
+		expect(payload?.composerDocument?.assets.map((asset) => [asset.kind, asset.name])).toEqual(
+			files.map((file) => ["audio", file.name]),
+		);
+		for (const [index, file] of (payload?.newMedia ?? []).entries()) {
+			expect(file.name).toBe(files[index].name);
+			expect(file.lastModified).toBe(files[index].lastModified);
+			expect(await file.text()).toBe(await files[index].text());
+		}
+		expect(notify).toHaveBeenCalledTimes(1);
+	});
+
+	test("ten kept media block an eleventh, removal creates room, invalid uploads never enter the manifest", async () => {
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(async () => new Response("native bytes"), {
+				preconnect: globalThis.fetch.preconnect,
+			}),
+		);
+		const refs = Array.from({ length: 10 }, (_, index) => ({
+			...media[1],
+			mediaId: `kept-${index}`,
+			filename: `voice-${index}.wav`,
+		}));
+		const layout = documentFor(refs);
+		spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [],
+			textFiles: [],
+			media: refs,
+		});
+		const notify = spyOn(notifications, "show").mockReturnValue("notice");
+		const save = mock(
+			async (_msg: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(
+			queueRow({
+				narratorId: "fork-context",
+				msg: messageFor(refs),
+				isEditing: true,
+				onSaveEdit: save,
+			}),
+		);
+		const extra = new File(["native"], "extra.wav", { type: "audio/wav" });
+		await selectMedia([extra]);
+		await editorKey("Enter");
+		expect(save.mock.calls.at(-1)?.[2].newMedia).toEqual([]);
+		expect(notify).toHaveBeenCalled();
+		const remove = document
+			.querySelector('[data-composer-asset-id="media-0"]')
+			?.querySelectorAll("button")[1];
+		if (!remove) throw new Error("Media remove control missing");
+		await click(remove);
+		const oversized = new File(["x"], "large.wav", { type: "audio/wav" });
+		Object.defineProperty(oversized, "size", { value: MAX_MEDIA_FILE_SIZE + 1 });
+		await selectMedia([
+			new File([], "empty.wav", { type: "audio/wav" }),
+			new File(["x"], "bad.wav", { type: "audio/unknown" }),
+			oversized,
+			extra,
+		]);
+		await editorKey("Enter");
+		const payload = save.mock.calls.at(-1)?.[2];
+		expect(payload?.keepMediaIds).toHaveLength(9);
+		expect(payload?.newMedia).toEqual([extra]);
+		expect(payload?.composerDocument?.assets).toHaveLength(10);
+	});
+});
+
+describe("editable native media chip previews", () => {
+	beforeEach(() => qc.setQueryData(["settings"], {}));
+	async function activateMediaChip(element: Element) {
+		const event = new Event("click", { bubbles: true });
+		Object.defineProperty(event, "detail", { value: 0 });
+		await act(async () => {
+			element.dispatchEvent(event);
+			await flush();
+		});
+	}
+	beforeEach(() => {
+		previousGlobals.set(
+			"localStorage",
+			Object.getOwnPropertyDescriptor(globalThis, "localStorage"),
+		);
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: (key: string) => (key === "narrafork_token" ? "preview-session" : null) },
+		});
+	});
+	for (const kind of ["audio", "video"] as const) {
+		test(`local ${kind} chip opens native controls without decoding text and revokes its URL on close`, async () => {
+			const file = new File([new Uint8Array([0, 255, 1])], `${kind}.webm`, {
+				type: `${kind}/webm`,
+			});
+			const read = spyOn(file, "slice");
+			const createUrl = spyOn(URL, "createObjectURL").mockReturnValue(`blob:local-${kind}`);
+			const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+			const fetchMedia = spyOn(globalThis, "fetch").mockRejectedValue(
+				new Error("Unexpected network"),
+			);
+			await render(
+				editor({
+					blocks: [],
+					composerDocument: { version: 1, assets: [], paragraphs: [{ children: [] }] },
+				}),
+			);
+			const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+			if (!input) throw new Error("Attachment input missing");
+			Object.defineProperty(input, "files", { configurable: true, value: [file] });
+			await act(async () => {
+				input.dispatchEvent(new Event("change", { bubbles: true }));
+				await flush();
+			});
+			expect(document.querySelector(kind)).toBeNull();
+			const open = document.querySelector("[data-composer-asset-id] button");
+			if (!open) throw new Error("Media chip missing");
+			await activateMediaChip(open);
+			const player = document.querySelector(kind);
+			expect(player?.getAttribute("src")).toBe(`blob:local-${kind}`);
+			expect(player?.hasAttribute("controls")).toBe(true);
+			expect(document.querySelector("pre")).toBeNull();
+			expect(read).not.toHaveBeenCalled();
+			expect(createUrl).toHaveBeenCalledWith(file);
+			expect(fetchMedia.mock.calls.map(([url]) => String(url))).toEqual([]);
+			const close = document.querySelector('[role="dialog"] button');
+			if (!close) throw new Error("Preview close control missing");
+			await click(close);
+			expect(document.querySelector(kind)).toBeNull();
+			expect(revoke).toHaveBeenCalledWith(`blob:local-${kind}`);
+		});
+		test(`retained ${kind} chip loads an authorized source-owner blob in the referencing narrator context`, async () => {
+			const media = {
+				mediaId: `retained-${kind}`,
+				filename: `${kind}.webm`,
+				mediaType: `${kind}/webm`,
+				size: 3,
+				uploadNarratorId: "original-owner",
+			};
+			const layout: ComposerDocument = {
+				version: 1,
+				assets: [
+					{
+						id: "kept-media",
+						kind,
+						name: media.filename,
+						mimeType: media.mediaType,
+						size: media.size,
+					},
+				],
+				paragraphs: [
+					{ children: [{ type: "attachment", id: "kept-node", assetId: "kept-media" }] },
+				],
+			};
+			spyOn(URL, "createObjectURL").mockReturnValue(`blob:protected-${kind}`);
+			const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+			const fetchMedia = spyOn(globalThis, "fetch").mockImplementation(
+				Object.assign(
+					async () => new Response("bytes", { headers: { "content-type": media.mediaType } }),
+					{ preconnect: globalThis.fetch.preconnect },
+				),
+			);
+			await render(
+				editor({
+					narratorId: "fork-context",
+					blocks: [{ type: kind, ...media }],
+					composerDocument: layout,
+				}),
+			);
+			expect(fetchMedia.mock.calls.map(([url]) => String(url))).toEqual([]);
+			const open = document.querySelector('[data-composer-asset-id="kept-media"] button');
+			if (!open) throw new Error("Retained media chip missing");
+			await activateMediaChip(open);
+			expect(fetchMedia).not.toHaveBeenCalled();
+			expect(document.querySelector(kind)).toBeNull();
+			await click(button(en.mediaPreviewLoad));
+			expect(fetchMedia).toHaveBeenCalledTimes(1);
+			const [url, options] = fetchMedia.mock.calls[0];
+			expect(String(url)).toContain(
+				`/uploads/original-owner/media/retained-${kind}?referencingNarratorId=fork-context`,
+			);
+			expect(new Headers(options?.headers).get("Authorization")).toBe("Bearer preview-session");
+			expect(document.querySelector(kind)?.getAttribute("src")).toBe(`blob:protected-${kind}`);
+			expect(document.querySelector(kind)?.hasAttribute("controls")).toBe(true);
+			const close = document.querySelector('[role="dialog"] button');
+			if (!close) throw new Error("Preview close control missing");
+			await click(close);
+			expect(document.querySelector(kind)).toBeNull();
+			expect(revoke).toHaveBeenCalledWith(`blob:protected-${kind}`);
+		});
+	}
+});
 
 describe("visible queued message collaboration details", () => {
 	const queued = {

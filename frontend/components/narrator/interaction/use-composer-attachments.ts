@@ -1,7 +1,9 @@
 import { notifications } from "@mantine/notifications";
 import type { ComposerAsset } from "@shared/composer-document";
+import { mediaModality } from "@shared/media-attachments";
 import type React from "react";
 import { type SetStateAction, useCallback, useEffect, useRef, useState } from "react";
+import { composerAssetsFromFiles } from "../composer/composer-document-adapter";
 import {
 	clearDraftImageAttachments,
 	getComposerAssetId,
@@ -33,6 +35,9 @@ export interface UseComposerAttachmentsResult {
 	restoredAttachmentResources: ReadonlyMap<string, File>;
 	attachedImages: File[];
 	attachedTextFiles: File[];
+	attachedMedia: File[];
+	attachedMediaRef: React.RefObject<File[]>;
+	updateAttachedMedia: (next: SetStateAction<File[]>) => void;
 	/** Live mirror of `attachedImages` for callbacks registered once (user-chat bridge). */
 	attachedImagesRef: React.RefObject<File[]>;
 	/** Live mirror of `attachedTextFiles`. */
@@ -78,7 +83,7 @@ export function useComposerAttachments(
 		restoreGeneration: 0,
 		hiddenForSend: false,
 		restoredResources: new Map<string, File>(),
-		restoredKinds: new Map<string, "image" | "textFile">(),
+		restoredKinds: new Map<string, ComposerAsset["kind"]>(),
 	});
 	// Completion (including a failed load) must notify consumers, even when no
 	// files changed. Owner identity is reset synchronously, not by this state.
@@ -102,7 +107,7 @@ export function useComposerAttachments(
 			restoreGeneration: 0,
 			hiddenForSend: false,
 			restoredResources: new Map<string, File>(),
-			restoredKinds: new Map<string, "image" | "textFile">(),
+			restoredKinds: new Map<string, ComposerAsset["kind"]>(),
 		};
 	}
 
@@ -119,6 +124,10 @@ export function useComposerAttachments(
 	const attachmentDraftHydratedKeyRef = useRef<string | null>(null);
 	const attachmentDraftSaveSeqRef = useRef(0);
 	const attachmentDraftLocalVersionRef = useRef(0);
+	const sendHiddenVersionRef = useRef<{
+		scope: typeof documentAssetsRef.current;
+		version: number;
+	} | null>(null);
 	const [textFileState, setAttachedTextFiles] = useState({
 		scope: documentAssetsRef.current,
 		files: [] as File[],
@@ -130,6 +139,13 @@ export function useComposerAttachments(
 	// attachments without re-registering on every change.
 	const attachedTextFilesRef = useRef<File[]>(attachedTextFiles);
 	attachedTextFilesRef.current = attachedTextFiles;
+	const [mediaState, setAttachedMedia] = useState({
+		scope: documentAssetsRef.current,
+		files: [] as File[],
+	});
+	const attachedMedia = mediaState.scope === documentAssetsRef.current ? mediaState.files : [];
+	const attachedMediaRef = useRef<File[]>(attachedMedia);
+	attachedMediaRef.current = attachedMedia;
 	const [isDragging, setIsDragging] = useState(false);
 	const dragCounterRef = useRef(0);
 	const warnDraftAttachmentsPersistenceFailure = useCallback((action: string, err: unknown) => {
@@ -137,7 +153,7 @@ export function useComposerAttachments(
 			console.warn(`[NarratorPanel] Failed to ${action} draft attachments:`, err);
 		}
 	}, []);
-	const updateRestoredResources = useCallback((files: File[], kind: "image" | "textFile") => {
+	const updateRestoredResources = useCallback((files: File[], kind: ComposerAsset["kind"]) => {
 		const scope = documentAssetsRef.current;
 		let resources = scope.restoredResources;
 		for (const file of files) {
@@ -191,6 +207,20 @@ export function useComposerAttachments(
 		},
 		[updateRestoredResources],
 	);
+	const updateAttachedMedia = useCallback(
+		(next: SetStateAction<File[]>) => {
+			attachmentDraftLocalVersionRef.current++;
+			documentAssetsRef.current.hiddenForSend = false;
+			const resolved = typeof next === "function" ? next(attachedMediaRef.current) : next;
+			for (const file of resolved) {
+				documentAssetsRef.current.allowedIds?.add(getComposerAssetId(file));
+				updateRestoredResources([file], mediaModality(file.type) ?? "audio");
+			}
+			attachedMediaRef.current = resolved;
+			setAttachedMedia({ scope: documentAssetsRef.current, files: resolved });
+		},
+		[updateRestoredResources],
+	);
 	const hasUnrestoredDocumentAssets = useCallback(() => {
 		const scope = documentAssetsRef.current;
 		if (!scope.readFailed) return false;
@@ -204,6 +234,7 @@ export function useComposerAttachments(
 		const available = new Set([
 			...attachedImagesRef.current.map(getComposerAssetId),
 			...attachedTextFilesRef.current.map(getComposerAssetId),
+			...attachedMediaRef.current.map(getComposerAssetId),
 		]);
 		for (const id of scope.allowedIds) {
 			if (!available.has(id)) return true;
@@ -219,6 +250,7 @@ export function useComposerAttachments(
 				targetNarratorId,
 				attachedImagesRef.current,
 				attachedTextFilesRef.current,
+				attachedMediaRef.current,
 			).catch((err) => {
 				if (seq === attachmentDraftSaveSeqRef.current) {
 					warnDraftAttachmentsPersistenceFailure("save", err);
@@ -241,13 +273,17 @@ export function useComposerAttachments(
 			const textFiles = attachedTextFilesRef.current.filter((file) =>
 				allowed.has(getComposerAssetId(file)),
 			);
+			const media = attachedMediaRef.current.filter((file) =>
+				allowed.has(getComposerAssetId(file)),
+			);
 			if (scope.hydrated && !scope.hiddenForSend) {
-				const active = new Set([...images, ...textFiles].map(getComposerAssetId));
+				const active = new Set([...images, ...textFiles, ...media].map(getComposerAssetId));
 				for (const id of allowed) {
 					const file = scope.restoredResources.get(id);
 					if (!file || active.has(id)) continue;
 					if (scope.restoredKinds.get(id) === "image") images.push(file);
-					else textFiles.push(file);
+					else if (scope.restoredKinds.get(id) === "textFile") textFiles.push(file);
+					else media.push(file);
 					active.add(id);
 				}
 			}
@@ -264,6 +300,13 @@ export function useComposerAttachments(
 			) {
 				attachedTextFilesRef.current = textFiles;
 				setAttachedTextFiles({ scope: documentAssetsRef.current, files: textFiles });
+			}
+			if (
+				media.length !== attachedMediaRef.current.length ||
+				media.some((file, index) => file !== attachedMediaRef.current[index])
+			) {
+				attachedMediaRef.current = media;
+				setAttachedMedia({ scope: documentAssetsRef.current, files: media });
 			}
 			if (
 				scope.readFailed &&
@@ -287,14 +330,29 @@ export function useComposerAttachments(
 	 */
 	const hideAttachedFilesForSend = useCallback(() => {
 		attachmentDraftLocalVersionRef.current++;
+		sendHiddenVersionRef.current = {
+			scope: documentAssetsRef.current,
+			version: attachmentDraftLocalVersionRef.current,
+		};
 		documentAssetsRef.current.allowedIds = new Set();
 		documentAssetsRef.current.hiddenForSend = true;
 		attachedImagesRef.current = [];
 		attachedTextFilesRef.current = [];
+		attachedMediaRef.current = [];
 		setAttachedImages({ scope: documentAssetsRef.current, files: [] });
 		setAttachedTextFiles({ scope: documentAssetsRef.current, files: [] });
+		setAttachedMedia({ scope: documentAssetsRef.current, files: [] });
 	}, []);
 	const clearAttachedFilesAndDraft = useCallback(() => {
+		const hidden = sendHiddenVersionRef.current;
+		sendHiddenVersionRef.current = null;
+		if (
+			hidden?.scope === documentAssetsRef.current &&
+			hidden.version !== attachmentDraftLocalVersionRef.current
+		) {
+			if (currentUserId) persistCurrentDraftAttachments(currentUserId, narratorId);
+			return;
+		}
 		attachmentDraftLocalVersionRef.current++;
 		const scope = documentAssetsRef.current;
 		scope.allowedIds = new Set();
@@ -307,8 +365,10 @@ export function useComposerAttachments(
 			: null;
 		attachedImagesRef.current = [];
 		attachedTextFilesRef.current = [];
+		attachedMediaRef.current = [];
 		setAttachedImages({ scope: documentAssetsRef.current, files: [] });
 		setAttachedTextFiles({ scope: documentAssetsRef.current, files: [] });
+		setAttachedMedia({ scope: documentAssetsRef.current, files: [] });
 		if (!currentUserId) return;
 		const seq = ++attachmentDraftSaveSeqRef.current;
 		void clearDraftImageAttachments(currentUserId, narratorId).catch((err) => {
@@ -316,7 +376,12 @@ export function useComposerAttachments(
 				warnDraftAttachmentsPersistenceFailure("clear", err);
 			}
 		});
-	}, [currentUserId, narratorId, warnDraftAttachmentsPersistenceFailure]);
+	}, [
+		currentUserId,
+		narratorId,
+		persistCurrentDraftAttachments,
+		warnDraftAttachmentsPersistenceFailure,
+	]);
 	const retryAttachmentRestore = useCallback(() => {
 		const scope = documentAssetsRef.current;
 		if (
@@ -349,8 +414,10 @@ export function useComposerAttachments(
 		if (!isRetry) {
 			attachedImagesRef.current = [];
 			attachedTextFilesRef.current = [];
+			attachedMediaRef.current = [];
 			setAttachedImages({ scope: documentAssetsRef.current, files: [] });
 			setAttachedTextFiles({ scope: documentAssetsRef.current, files: [] });
+			setAttachedMedia({ scope: documentAssetsRef.current, files: [] });
 		}
 		if (!currentUserId || !draftKey) return;
 
@@ -381,14 +448,22 @@ export function useComposerAttachments(
 				// deletes them before hydration. The pool never drives active files or
 				// persistence, and its lifetime is exactly this owner scope.
 				scope.restoredResources = new Map(
-					[...loaded.images, ...loaded.textFiles].map((file) => [getComposerAssetId(file), file]),
+					[...loaded.images, ...loaded.textFiles, ...(loaded.media ?? [])].map((file) => [
+						getComposerAssetId(file),
+						file,
+					]),
 				);
-				scope.restoredKinds = new Map<string, "image" | "textFile">([
+				scope.restoredKinds = new Map<string, ComposerAsset["kind"]>([
 					...loaded.images.map((file) => [getComposerAssetId(file), "image"] as const),
 					...loaded.textFiles.map((file) => [getComposerAssetId(file), "textFile"] as const),
+					...(loaded.media ?? []).map(
+						(file) => [getComposerAssetId(file), mediaModality(file.type) ?? "audio"] as const,
+					),
 				]);
 				updateRestoredResources(attachedImagesRef.current, "image");
 				updateRestoredResources(attachedTextFilesRef.current, "textFile");
+				for (const file of attachedMediaRef.current)
+					updateRestoredResources([file], mediaModality(file.type) ?? "audio");
 				finishHydrating();
 				// A send only hides the UI. Its stored recovery draft must survive,
 				// including when the read completes after the files were hidden.
@@ -403,8 +478,8 @@ export function useComposerAttachments(
 					// Merge by identity, never filename, and let local files win ties
 					// across both attachment kinds. Initial legacy loads without a
 					// manifest retain replacement semantics; retries merge retained edits.
-					const assets = new Map<string, { file: File; kind: "image" | "textFile" }>();
-					const add = (files: File[], kind: "image" | "textFile") => {
+					const assets = new Map<string, { file: File; kind: ComposerAsset["kind"] }>();
+					const add = (files: File[], kind: ComposerAsset["kind"]) => {
 						for (const file of files) {
 							const id = getComposerAssetId(file);
 							if (!allowed || allowed.has(id)) assets.set(id, { file, kind });
@@ -412,9 +487,12 @@ export function useComposerAttachments(
 					};
 					add(loaded.images, "image");
 					add(loaded.textFiles, "textFile");
+					for (const file of loaded.media ?? []) add([file], mediaModality(file.type) ?? "audio");
 					if (allowed || isRetry) {
 						add(attachedImagesRef.current, "image");
 						add(attachedTextFilesRef.current, "textFile");
+						for (const file of attachedMediaRef.current)
+							add([file], mediaModality(file.type) ?? "audio");
 					}
 					const images = [...assets.values()]
 						.filter((asset) => asset.kind === "image")
@@ -422,6 +500,11 @@ export function useComposerAttachments(
 					const textFiles = [...assets.values()]
 						.filter((asset) => asset.kind === "textFile")
 						.map((asset) => asset.file);
+					const media = [...assets.values()]
+						.filter((asset) => asset.kind === "audio" || asset.kind === "video")
+						.map((asset) => asset.file);
+					attachedMediaRef.current = media;
+					setAttachedMedia({ scope: documentAssetsRef.current, files: media });
 					attachedImagesRef.current = images;
 					attachedTextFilesRef.current = textFiles;
 					setAttachedImages({ scope: documentAssetsRef.current, files: images });
@@ -484,6 +567,7 @@ export function useComposerAttachments(
 			narratorId,
 			attachedImages,
 			attachedTextFiles,
+			attachedMedia,
 		).catch((err) => {
 			if (seq === attachmentDraftSaveSeqRef.current) {
 				warnDraftAttachmentsPersistenceFailure("save", err);
@@ -492,6 +576,7 @@ export function useComposerAttachments(
 	}, [
 		attachedImages,
 		attachedTextFiles,
+		attachedMedia,
 		currentUserId,
 		hasUnrestoredDocumentAssets,
 		narratorId,
@@ -499,22 +584,7 @@ export function useComposerAttachments(
 		warnDraftAttachmentsPersistenceFailure,
 	]);
 
-	const composerAssets: ComposerAsset[] = [
-		...attachedImages.map((file) => ({
-			id: getComposerAssetId(file),
-			kind: "image" as const,
-			name: file.name,
-			size: file.size,
-			mimeType: file.type,
-		})),
-		...attachedTextFiles.map((file) => ({
-			id: getComposerAssetId(file),
-			kind: "textFile" as const,
-			name: file.name,
-			size: file.size,
-			mimeType: file.type,
-		})),
-	];
+	const composerAssets = composerAssetsFromFiles(attachedImages, attachedTextFiles, attachedMedia);
 	return {
 		composerAssets,
 		attachmentsHydrating: Boolean(currentUserId && !documentAssetsRef.current.hydrated),
@@ -525,6 +595,9 @@ export function useComposerAttachments(
 		attachedTextFiles,
 		attachedImagesRef,
 		attachedTextFilesRef,
+		attachedMedia,
+		attachedMediaRef,
+		updateAttachedMedia,
 		isDragging,
 		setIsDragging,
 		dragCounterRef,

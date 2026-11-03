@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "6393b1f6-0390-4dda-bb7b-4adb47a8f595",
+  "id": "3d7609dd-490d-4966-9055-ee05676387ee",
   "prevId": "a74a0f62-3ce0-40fe-a150-dab92b01d6c6",
   "tables": {
     "acl_events": {
@@ -8437,6 +8437,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "media_json": {
+          "name": "media_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "command_text": {
           "name": "command_text",
           "type": "text",
@@ -14594,14 +14601,6 @@
           ],
           "isUnique": false,
           "where": "json_extract(\"task_json\", '$.status') = 'doing' AND \"deleted\" = 0"
-        },
-        "idx_outline_blocks_locked": {
-          "name": "idx_outline_blocks_locked",
-          "columns": [
-            "page_id"
-          ],
-          "isUnique": false,
-          "where": "json_extract(\"task_json\", '$.lock') IS NOT NULL AND \"deleted\" = 0"
         }
       },
       "foreignKeys": {
@@ -14925,263 +14924,6 @@
           "name": "outline_live_updates_page_block_id_epoch_seq_pk"
         }
       },
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "outline_pending": {
-      "name": "outline_pending",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "space_id": {
-          "name": "space_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "status": {
-          "name": "status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "page_id": {
-          "name": "page_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "root_block_id": {
-          "name": "root_block_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "ops_json": {
-          "name": "ops_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "base_json": {
-          "name": "base_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "op_count": {
-          "name": "op_count",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "subtree_json": {
-          "name": "subtree_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "block_ids_json": {
-          "name": "block_ids_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "adds_json": {
-          "name": "adds_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "summary": {
-          "name": "summary",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "requested_by_json": {
-          "name": "requested_by_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "requester_session": {
-          "name": "requester_session",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "decider_json": {
-          "name": "decider_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "decider_user_id": {
-          "name": "decider_user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "rev": {
-          "name": "rev",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 1
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "decided_at": {
-          "name": "decided_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "decided_by_json": {
-          "name": "decided_by_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "decision_commit_id": {
-          "name": "decision_commit_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "reason": {
-          "name": "reason",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "reported_at": {
-          "name": "reported_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_outline_pending_space": {
-          "name": "idx_outline_pending_space",
-          "columns": [
-            "space_id"
-          ],
-          "isUnique": false
-        },
-        "idx_outline_pending_page_open": {
-          "name": "idx_outline_pending_page_open",
-          "columns": [
-            "page_id"
-          ],
-          "isUnique": false,
-          "where": "\"status\" = 'open'"
-        },
-        "idx_outline_pending_root_open": {
-          "name": "idx_outline_pending_root_open",
-          "columns": [
-            "root_block_id"
-          ],
-          "isUnique": false,
-          "where": "\"status\" = 'open'"
-        },
-        "uq_outline_pending_open_proposer": {
-          "name": "uq_outline_pending_open_proposer",
-          "columns": [
-            "requester_session",
-            "root_block_id"
-          ],
-          "isUnique": true,
-          "where": "\"status\" = 'open'"
-        },
-        "idx_outline_pending_unreported": {
-          "name": "idx_outline_pending_unreported",
-          "columns": [
-            "requester_session",
-            "page_id"
-          ],
-          "isUnique": false,
-          "where": "\"reported_at\" IS NULL AND \"status\" <> 'open'"
-        },
-        "idx_outline_pending_decider_open": {
-          "name": "idx_outline_pending_decider_open",
-          "columns": [
-            "decider_user_id"
-          ],
-          "isUnique": false,
-          "where": "\"status\" = 'open'"
-        },
-        "uq_outline_pending_decision_commit": {
-          "name": "uq_outline_pending_decision_commit",
-          "columns": [
-            "decision_commit_id"
-          ],
-          "isUnique": true
-        }
-      },
-      "foreignKeys": {
-        "outline_pending_space_id_outline_spaces_id_fk": {
-          "name": "outline_pending_space_id_outline_spaces_id_fk",
-          "tableFrom": "outline_pending",
-          "tableTo": "outline_spaces",
-          "columnsFrom": [
-            "space_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
     },

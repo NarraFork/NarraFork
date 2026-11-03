@@ -131,7 +131,11 @@ function isSmall(value: unknown): boolean {
 }
 
 /** Only the walker runs on the event loop; large strings are escaped in bounded worker packets. */
-async function stringifyLarge(value: unknown, signal?: AbortSignal): Promise<string> {
+async function stringifyLarge(
+	value: unknown,
+	signal?: AbortSignal,
+	transform?: (value: unknown) => unknown,
+): Promise<string> {
 	const output: string[] = [];
 	let packet: JsonPacketPart[] = [];
 	let chars = 0;
@@ -181,6 +185,7 @@ async function stringifyLarge(value: unknown, signal?: AbortSignal): Promise<str
 	const walk = async (item: unknown): Promise<void> => {
 		signal?.throwIfAborted();
 		if (++work % PACKET_PARTS === 0) await Bun.sleep(0);
+		if (transform) item = transform(item);
 		if (typeof item === "string") return quoted(item);
 		if (typeof item !== "object" || item === null) {
 			await emit(JSON.stringify(item) ?? "null");
@@ -221,12 +226,15 @@ async function stringifyLarge(value: unknown, signal?: AbortSignal): Promise<str
  * not mutate during those retries; replacing/deleting a root field is supported.
  * Large tools/history fragments are reused without another traversal/serialization.
  */
-export function createRequestBodyEncoder() {
+export function createRequestBodyEncoder(transform?: (value: unknown) => unknown) {
+	// The optional transform is shallow and pure: apply it during bounded traversal,
+	// without first cloning the whole body. Native stringify is only used on small values.
+	const replacer = transform ? (_key: string, value: unknown) => transform(value) : undefined;
 	const fragments = new Map<string, { value: unknown; text: string }>();
 	let large = false;
 	return async (body: Record<string, unknown>, signal?: AbortSignal): Promise<string> => {
 		signal?.throwIfAborted();
-		if (!large && isSmall(body)) return JSON.stringify(body);
+		if (!large && isSmall(body)) return JSON.stringify(body, replacer);
 		large = true;
 		const started = performance.now();
 		const parts: string[] = [];
@@ -237,7 +245,9 @@ export function createRequestBodyEncoder() {
 			if (!fragment || fragment.value !== value) {
 				fragment = {
 					value,
-					text: isSmall(value) ? JSON.stringify(value) : await stringifyLarge(value, signal),
+					text: isSmall(value)
+						? JSON.stringify(value, replacer)
+						: await stringifyLarge(value, signal, transform),
 				};
 				fragments.set(key, fragment);
 			}

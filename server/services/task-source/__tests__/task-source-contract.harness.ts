@@ -34,6 +34,12 @@ export interface TaskSourceContractHarness {
 	 * runs. Without it the failure-semantics tests are skipped.
 	 */
 	makeUnreadable?(narratorId: string): Promise<() => void>;
+	/**
+	 * What the backend marks every digest body with, exactly (outline: `{ taskBackend: "outline" }`);
+	 * spec marks nothing. Empty digests are compared exactly against `{ kind, variant }` plus this,
+	 * so no other field may ride along unnoticed.
+	 */
+	digestStamp?: { taskBackend?: "outline" };
 }
 
 const texts = (tasks: readonly { text: string }[]) => tasks.map((task) => task.text);
@@ -366,15 +372,26 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				expect(digest.tasks?.[0]).toMatchObject({ role: "doing", text: "Write the parser" });
 			});
 
+			// Exactly the variant plus what the backend declares it stamps (`digestStamp`): a spec
+			// body must never carry a stamp, an outline body exactly its own.
 			test("without open tasks the digest is an empty variant, never null", async () => {
+				const stamp = harness.digestStamp ?? {};
 				const never = await sourceWith();
-				expect(await never.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyNever" });
+				expect(await never.source.taskDigest()).toStrictEqual({
+					kind: "tasks",
+					variant: "emptyNever",
+					...stamp,
+				});
 
 				const done = await sourceWith([
 					{ text: "Write the parser", status: "done" },
 					{ text: "Write the printer", status: "done" },
 				]);
-				expect(await done.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyDone" });
+				expect(await done.source.taskDigest()).toStrictEqual({
+					kind: "tasks",
+					variant: "emptyDone",
+					...stamp,
+				});
 			});
 		});
 

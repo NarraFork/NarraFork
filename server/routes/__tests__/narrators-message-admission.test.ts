@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { ComposerDocument } from "@shared/composer-document";
 import { type FileReference, fileReferenceMessageForDisplay } from "@shared/file-reference";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -8,12 +9,13 @@ import {
 import { Hono } from "hono";
 import {
 	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../../lib/composer-document";
-import { AppError, ValidationError } from "../../lib/errors";
+import { AppError, catalogError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
 import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
 
@@ -48,6 +50,8 @@ function fixture(
 		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
 		canonicalPrefix?: string;
+		/** The session's task backend (outline P2). */
+		taskBackend?: "spec" | "outline";
 	} = {},
 ) {
 	let status = options.status ?? "idle";
@@ -96,11 +100,13 @@ function fixture(
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
 		bindComposerDocumentReferences,
+		bindComposerMediaProjection,
 		restoreMultipartComposerText,
 		validateComposerProjection,
 		validateComposerAssets,
 		sendMessageSchema,
 		bufferQueueModeSchema,
+		MAX_MEDIA_ATTACHMENTS,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 		fileReferenceMessageForDisplay,
@@ -190,6 +196,8 @@ function fixture(
 		users: { id: "id" },
 		eq: () => undefined,
 		logger: { warn: () => {} },
+		resolveTaskBackend: async () => options.taskBackend ?? "spec",
+		catalogError,
 	};
 	new Function(...Object.keys(bindings), compiled)(...Object.values(bindings));
 	const app = new Hono();
@@ -564,6 +572,23 @@ describe("primary HTTP message admission", () => {
 			objective: "do work",
 		});
 		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
+	});
+
+	test.each([
+		false,
+		true,
+	])("/goal in an outline session is refused before anything is persisted (busy=%s)", async (busy) => {
+		const f = fixture({
+			status: busy ? "working" : "idle",
+			busy,
+			buffered: busy,
+			taskBackend: "outline",
+		});
+		const response = await f.post({ message: "/goal do work" });
+		expect(response.status).toBe(409);
+		expect(((await response.json()) as { error: string }).error).toContain("/goal");
+		expect(f.accept).not.toHaveBeenCalled();
+		expect(f.broadcast).not.toHaveBeenCalled();
 	});
 
 	test.each([false, true])("model override travels with admission (busy=%s)", async (busy) => {

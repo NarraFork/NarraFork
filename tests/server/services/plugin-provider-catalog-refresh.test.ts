@@ -124,6 +124,20 @@ function harness(options: FakePluginOptions = {}) {
 }
 
 describe("plugin provider catalog refresh", () => {
+	test("projects explicitly discovered native media capabilities into the registry", async () => {
+		const native = {
+			...model("cat/native"),
+			capabilities: { ...model("cat/native").capabilities, inputAudio: true, inputVideo: false },
+		};
+		const { registry, refresher } = harness({ pages: [{ models: [native] }] });
+		await refresher.refresh(`${pluginId}/cat`);
+		expect(registry.get(`${pluginId}/cat`)?.getModel("cat/native")?.capabilities).toMatchObject({
+			inputAudio: true,
+			inputVideo: false,
+		});
+		// Model discovery must not turn on wire capabilities the plugin never declared.
+		expect(registry.get(`${pluginId}/cat`)?.capabilities.inputAudio).toBe(false);
+	});
 	test("pulls the catalog into the registry and clears the stale flag", async () => {
 		const { log, registry, refresher } = harness({
 			pages: [{ models: [model("cat/a"), model("cat/b")], catalogVersion: "v7" }],

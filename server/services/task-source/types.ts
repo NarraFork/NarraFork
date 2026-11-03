@@ -20,12 +20,11 @@ import type { Locale } from "../../lib/prompt-i18n";
 import type { SpecContinuationCause } from "../turn-continuation-decisions";
 
 /**
- * Where a narrator's tasks live.
- *
- * Only `spec` (`spec://tasks.json`) exists so far. The outline backend (checkbox tasks,
- * claims, derived waiting) is added here and registered with the factory in `index.ts`.
+ * Where a narrator's tasks live: `spec` (`spec://tasks.json`) or `outline` (checkbox blocks in
+ * the session space, claims, derived waiting). Stored per session (`narrators.task_backend`);
+ * a subagent follows its root (design D31).
  */
-export type TaskBackend = "spec";
+export type TaskBackend = "spec" | "outline";
 
 /**
  * The four task states readers see.
@@ -55,7 +54,11 @@ export interface OpenTaskView extends TaskView {
 }
 
 export interface OpenTaskList {
-	/** Unfinished tasks in the source's own order (spec: array order; outline: document order). */
+	/**
+	 * Unfinished tasks in the source's own order (spec: array order; outline: document order).
+	 * A backend may list only a leading part of a long list (outline: the first 20); readers
+	 * show a prefix anyway (the interrupt guard eight).
+	 */
 	tasks: OpenTaskView[];
 	/**
 	 * Must change whenever the open tasks change, and stay put while nothing is written;
@@ -85,6 +88,14 @@ export interface ContinuationTarget {
 	openTask: ContinuationTask | null;
 	/** Unfinished protected tasks; `protectedOnly` does not continue while this is 0. */
 	protectedOpenCount: number;
+	/**
+	 * The narrator has no tasks of its own and continues on its turn budget only (outline
+	 * subagents, design D27c): a pass that spent its turn budget before the final reply gets
+	 * another one, whatever the mode says about tasks (only `off` still stops it); a pass that
+	 * ended on its own does not. The pass ceiling and the stall rules apply as always. `openTask`
+	 * is null then; the reader names no task. Spec never sets it.
+	 */
+	turnBudgetOnly?: boolean;
 }
 
 /** Why another pass is granted: `spec` for open work, `maxTurns` for a spent turn budget. */
@@ -104,6 +115,11 @@ export type ContinuationPromptInput =
 			maxPasses: number | null;
 			canAskUserQuestion: boolean;
 			locale: Locale;
+			/**
+			 * The run has no task of its own and was continued on its turn budget
+			 * (`ContinuationTarget.turnBudgetOnly`): `task` is a placeholder, the prompt names none.
+			 */
+			turnBudgetOnly?: boolean;
 	  }
 	/** An ordinary narrator: no ceiling, may ask the user. */
 	| { form: "open"; task: ContinuationTask; locale: Locale };
@@ -168,11 +184,16 @@ export interface NarratorTaskSource {
 	 *
 	 * Never null while the source is readable: with no open tasks it is an empty variant
 	 * (spec: `emptyNever` / `emptyDone`, which nudge the model to create or reorganize
-	 * tasks). Null means only that the read failed. This is load-bearing beyond the digest
-	 * itself: under the default settings (`behaviorFenceInterval: -1`,
-	 * `behaviorFenceAttachTasks: true`) the behavior fence is injected only alongside a
-	 * non-null digest, so a source that went quiet without tasks would drop the fence too.
-	 * A backend that retires this digest must deliver the fence some other way first.
+	 * tasks). Null means only that the read failed — or, under the outline, that the narrator
+	 * has no tasks of its own (a subagent, D27c), so there is nothing to digest and no nudge to
+	 * give. This is load-bearing beyond the digest itself: under the default settings
+	 * (`behaviorFenceInterval: -1`, `behaviorFenceAttachTasks: true`) the behavior fence is
+	 * injected only alongside a non-null digest, so a source that went quiet without tasks
+	 * would drop the fence too. A backend that retires this digest must deliver the fence some
+	 * other way first.
+	 *
+	 * A non-spec source marks its digest with its backend (`taskBackend`, as on its interrupt
+	 * note), so the text the model reads and the reader's heading use that backend's words.
 	 */
 	taskDigest(): Promise<SideCarBody | null>;
 	/** The behavior fence (`behavior_fence`); null when empty or unreadable, never injected. */

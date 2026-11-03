@@ -33,6 +33,7 @@ export type MailboxInput = InputBase &
 				commandText?: string | null;
 				bashCommand?: string | null;
 				imagesJson?: string | null;
+				mediaJson?: string | null;
 				creatorJson?: string | null;
 				textFilePathsJson?: string | null;
 				fileReferencesJson?: string | null;

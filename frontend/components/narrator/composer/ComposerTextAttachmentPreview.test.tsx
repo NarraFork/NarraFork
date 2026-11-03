@@ -62,12 +62,24 @@ afterEach(async () => {
 	globals.clear();
 });
 
-async function render(file: File | undefined, name = file?.name ?? "missing.txt", mounted = true) {
+async function render(
+	file: File | undefined,
+	name = file?.name ?? "missing.txt",
+	mounted = true,
+	mediaKind?: "audio" | "video",
+) {
 	await act(async () =>
 		root.render(
 			<I18nextProvider i18n={instance}>
 				<MantineProvider env="test">
-					{mounted && <ComposerTextAttachmentPreview file={file} name={name} onClose={onClose} />}
+					{mounted && (
+						<ComposerTextAttachmentPreview
+							file={file}
+							name={name}
+							mediaKind={mediaKind}
+							onClose={onClose}
+						/>
+					)}
 				</MantineProvider>
 			</I18nextProvider>,
 		),
@@ -214,6 +226,61 @@ describe("read-only attachment preview", () => {
 			expect(document.querySelector("pre")).toBeNull();
 		} finally {
 			timer.mockRestore();
+		}
+	});
+});
+
+describe("native composer media playback", () => {
+	for (const kind of ["audio", "video"] as const) {
+		test(`${kind} previews use native controls without decoding binary as text and revoke on close`, async () => {
+			const file = new File([new Uint8Array([255, 0, 128])], `${kind}.mp4`, {
+				type: `${kind}/mp4`,
+			});
+			const slice = spyOn(file, "slice");
+			const create = spyOn(URL, "createObjectURL").mockReturnValue(`blob:${kind}-preview`);
+			const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+			try {
+				await render(file, file.name, true, kind);
+				const player = document.querySelector(kind);
+				expect(player?.hasAttribute("controls")).toBe(true);
+				expect(player?.getAttribute("preload")).toBe("metadata");
+				expect(player?.getAttribute("src")).toBe(`blob:${kind}-preview`);
+				expect(player?.getAttribute("aria-label")).toBe(file.name);
+				expect(document.querySelector("pre")).toBeNull();
+				expect(slice).not.toHaveBeenCalled();
+				expect(create).toHaveBeenCalledWith(file);
+				await render(file, file.name, false, kind);
+				expect(revoke).toHaveBeenCalledWith(`blob:${kind}-preview`);
+				expect(revoke).toHaveBeenCalledTimes(1);
+			} finally {
+				slice.mockRestore();
+				create.mockRestore();
+				revoke.mockRestore();
+			}
+		});
+	}
+	test("switching native resources releases the previous URL and text previews recover independently", async () => {
+		const audio = new File(["audio"], "same.mp4", { type: "audio/mp4" });
+		const video = new File(["video"], "same.mp4", { type: "video/mp4" });
+		let sequence = 0;
+		const create = spyOn(URL, "createObjectURL").mockImplementation(
+			() => `blob:preview-${++sequence}`,
+		);
+		const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+		try {
+			await render(audio, audio.name, true, "audio");
+			await render(video, video.name, true, "video");
+			expect(document.querySelector("audio")).toBeNull();
+			expect(document.querySelector("video")?.getAttribute("src")).toBe("blob:preview-2");
+			expect(revoke).toHaveBeenCalledWith("blob:preview-1");
+			await render(new File(["readable text"], "notes.txt"));
+			expect(document.querySelector("audio, video")).toBeNull();
+			expect(document.querySelector("pre")?.textContent).toBe("readable text");
+			expect(revoke.mock.calls.map(([url]) => url)).toEqual(["blob:preview-1", "blob:preview-2"]);
+			await render(undefined, "closed", false);
+		} finally {
+			create.mockRestore();
+			revoke.mockRestore();
 		}
 	});
 });

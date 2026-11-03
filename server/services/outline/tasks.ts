@@ -886,6 +886,10 @@ export interface OutlineTaskRef {
 	address: string;
 	status: "todo" | "doing";
 	assignee: string | null;
+	/** The task's `version_seq` as read: a write that starts it names it as its base. */
+	versionSeq: number;
+	/** The task's fields as read (`manager`, `humanCreated`, …). */
+	taskJson: OutlineTaskJson;
 	/** The task's claim, when it has a row (it may be released or someone's expired lease). */
 	claim: OutlineTaskClaimRow | null;
 }
@@ -895,6 +899,11 @@ export interface OutlineContinuationCandidates {
 	candidates: OutlineTaskRef[];
 	/** Tasks that would be candidates but wait (for prerequisites or people), in document order. */
 	waiting: Array<OutlineTaskRef & { wait: OutlineTaskWait }>;
+	/**
+	 * `candidates` and `waiting` together, in document order (`wait` null for a candidate): the
+	 * session's open tasks as one list.
+	 */
+	ordered: Array<OutlineTaskRef & { wait: OutlineTaskWait | null }>;
 	/** More tasks than {@link OUTLINE_TASK_LIMITS.candidateScan} were found; the rest were not read. */
 	truncated: boolean;
 }
@@ -945,7 +954,7 @@ export async function findContinuationCandidates(options: {
 		if (!claim || claim.holderNarratorId === options.narratorId) return true;
 		return !isClaimLive(claim, now);
 	});
-	if (open.length === 0) return { candidates: [], waiting: [], truncated };
+	if (open.length === 0) return { candidates: [], waiting: [], ordered: [], truncated };
 
 	const waits = await deriveOutlineTaskWaits(open, { store });
 	const ordered = await inDocumentOrder(store, open, options.sessionSpaceId);
@@ -961,17 +970,27 @@ export async function findContinuationCandidates(options: {
 		address: `${spaces.get(block.spaceId)?.key ?? "?"}/${block.sid}`,
 		status: (block.taskJson as OutlineTaskJson).status as "todo" | "doing",
 		assignee: block.taskJson?.assignee ?? null,
+		versionSeq: block.versionSeq,
+		taskJson: block.taskJson as OutlineTaskJson,
 		claim: claims.get(block.id) ?? null,
 	});
 	const candidates: OutlineTaskRef[] = [];
 	const waiting: OutlineContinuationCandidates["waiting"] = [];
+	const all: OutlineContinuationCandidates["ordered"] = [];
 	for (const block of ordered) {
 		const wait = waits.get(block.id);
 		if (isWaiting(wait)) {
-			if (waiting.length < limit) waiting.push({ ...ref(block), wait: wait as OutlineTaskWait });
-		} else if (candidates.length < limit) candidates.push(ref(block));
+			if (waiting.length >= limit) continue;
+			const entry = { ...ref(block), wait: wait as OutlineTaskWait };
+			waiting.push(entry);
+			all.push(entry);
+		} else if (candidates.length < limit) {
+			const entry = ref(block);
+			candidates.push(entry);
+			all.push({ ...entry, wait: null });
+		}
 	}
-	return { candidates, waiting, truncated };
+	return { candidates, waiting, ordered: all, truncated };
 }
 
 /**

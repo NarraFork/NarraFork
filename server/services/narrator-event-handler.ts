@@ -222,6 +222,7 @@ export async function toolResultLedgerOutput(
 		metadata: event.metadata,
 		broken: !!event.brokenInputOverride,
 		images,
+		media: event.mediaRefs,
 	});
 }
 
@@ -1662,6 +1663,29 @@ export async function processEvent(
 	}
 
 	switch (event.type) {
+		case "media_fallback": {
+			if (!event.warnings.length) return null;
+			const files = event.warnings.map((warning) => warning.filename).join(", ");
+			const message = ctx.locale?.startsWith("zh")
+				? `当前模型不支持读取该模态数据，回退到一般文件。仅提供文件路径和元信息，未读取音视频内容。文件：${files}`
+				: `The current model does not support this audio/video input. Falling back to regular files with paths and metadata only; the media contents have not been read. Files: ${files}`;
+			dualBroadcast(ctx, {
+				type: "warning",
+				narratorId: broadcastTargetId,
+				warningCode: "native_media_fallback",
+				mediaFallbackWarnings: event.warnings,
+				message,
+			});
+			ctx.sseEmitter?.emit("event", {
+				type: "warning",
+				data: {
+					warningCode: "native_media_fallback",
+					mediaFallbackWarnings: event.warnings,
+					message,
+				},
+			});
+			return null;
+		}
 		case "stream_text": {
 			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
 			const textBlockId = event.blockId;

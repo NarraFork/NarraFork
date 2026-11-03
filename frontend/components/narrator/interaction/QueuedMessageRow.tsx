@@ -30,6 +30,7 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { FileReference } from "@shared/file-reference";
+import { type MediaRef, mediaModality, mediaRefToContentBlock } from "@shared/media-attachments";
 import {
 	IconArrowForwardUp,
 	IconBolt,
@@ -55,6 +56,7 @@ import { QueuedImageThumb } from "../composer/EditAttachmentChips";
 import { fileReferenceToken } from "../composer/file-reference-input";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { EditableComposerDocument } from "../message/EditableComposerDocument";
+import { MediaAttachment } from "../message/MediaAttachment";
 import { queuedMessageMode } from "./queue-message-mode";
 import type { ComposerEditSnapshot, QueuedEditPayload } from "./queued-attachment-edit";
 
@@ -90,16 +92,31 @@ function QueuedAttachmentPreview({
 	narratorId,
 	images,
 	textFiles,
+	media = [],
 	fileReferences = [],
 }: {
 	narratorId?: string;
 	images: BufferedImageSummary[];
 	textFiles: BufferedTextFileSummary[];
+	media?: MediaRef[];
 	fileReferences?: FileReference[];
 }) {
-	if (images.length === 0 && textFiles.length === 0 && fileReferences.length === 0) return null;
+	if (
+		images.length === 0 &&
+		textFiles.length === 0 &&
+		media.length === 0 &&
+		fileReferences.length === 0
+	)
+		return null;
 	return (
 		<Group gap={4} wrap="wrap" data-queue-attachment-preview style={{ minWidth: 0 }}>
+			{media.map((attachment) => (
+				<MediaAttachment
+					key={attachment.mediaId}
+					narratorId={narratorId ?? ""}
+					block={mediaRefToContentBlock(attachment)}
+				/>
+			))}
 			{images.map((image) => (
 				<Box
 					key={image.imageId}
@@ -407,6 +424,7 @@ export function QueuedMessageRow({
 					<QueuedAttachmentPreview
 						narratorId={narratorId}
 						images={msg.images ?? []}
+						media={msg.media ?? []}
 						textFiles={msg.textFiles ?? []}
 						fileReferences={msg.fileReferences}
 					/>
@@ -562,6 +580,14 @@ export function QueuedMessageRow({
 							size: 0,
 							mimeType: image.mediaType,
 							uploadNarratorId: image.uploadNarratorId ?? narratorId,
+						})),
+						...(msg.media ?? []).map((media) => ({
+							kind: mediaModality(media.mediaType) ?? "audio",
+							mediaId: media.mediaId,
+							name: media.filename,
+							size: media.size,
+							mimeType: media.mediaType,
+							uploadNarratorId: media.uploadNarratorId ?? narratorId,
 						})),
 						...(msg.textFiles ?? []).map((file) => ({
 							kind: "textFile" as const,

@@ -15,11 +15,23 @@ import {
 	waitUntilUpdateGateOpens,
 } from "@server/services/update-coordinator";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import type { MediaContentBlock, NativeMediaInput } from "@shared/media-attachments";
 import { logger } from "../logger";
-import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import {
+	getOutlineSpecUnavailableHint,
+	getToolMessage,
+	getToolMessageWithParams,
+	type Locale,
+} from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import { settings } from "../settings";
-import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
+import {
+	assertSpecPath,
+	assertToolSpecPaths,
+	isBehaviorFenceToolRoute,
+	toolNamesSpecPath,
+	toolSpecPathError,
+} from "../spec-uri";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
@@ -76,6 +88,8 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	media?: NativeMediaInput[];
+	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
@@ -738,6 +752,26 @@ export function getReflectionToolRejection(
 	};
 }
 
+/**
+ * A tool call that names a `spec://` path in a session whose tasks live in the outline: the
+ * outline session has no Dynamic Spec (plan §3), so instead of reading or writing one it can no
+ * longer see, the call is answered with where its tasks and notes are. Spec sessions pass, and so
+ * does `Read`/`Write`/`Edit` of `spec://behavior_fence`: the fence an outline session keeps until
+ * plan PR 4, whose writes the user-turn grant still gates inside the tools.
+ */
+export function getOutlineSpecRejection(
+	tu: AgentToolUse,
+	config: Pick<AgentConfig, "taskBackend" | "locale">,
+): ToolExecResult | undefined {
+	if (config.taskBackend !== "outline" || !toolNamesSpecPath(tu.name, tu.input)) return undefined;
+	if (isBehaviorFenceToolRoute(tu.name, tu.input)) return undefined;
+	return {
+		output: getOutlineSpecUnavailableHint((config.locale as Locale) ?? "en"),
+		isError: true,
+		durationMs: 0,
+	};
+}
+
 export async function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
@@ -747,6 +781,11 @@ export async function executeTool(
 	if (reflectionRejection) {
 		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
 		return reflectionRejection;
+	}
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
+		return outlineSpecRejection;
 	}
 	const specError = toolSpecPathError(tu.name, tu.input);
 	if (specError) {
@@ -1716,6 +1755,8 @@ export async function executeTool(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						media: result.media,
+						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
 						pipelineExitConfirmation,
 						pipelineExitConfirmationStateId,
@@ -1735,6 +1776,8 @@ export async function executeTool(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					media: result.media,
+					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
 					pipelineExitConfirmation,
 					pipelineExitConfirmationStateId,
@@ -1751,6 +1794,8 @@ export async function executeTool(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				media: result.media,
+				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,
 				pipelineExitConfirmation,
 				pipelineExitConfirmationStateId,

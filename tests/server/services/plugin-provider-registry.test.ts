@@ -82,6 +82,30 @@ function registerPlugin(
 }
 
 describe("PluginProviderRegistry", () => {
+	test("native media capabilities default false and remain scoped to each plugin", () => {
+		const registry = new PluginProviderRegistry();
+		const native = registerPlugin(registry, {
+			capabilities: { inputAudio: true, inputVideo: true },
+			models: [
+				{ ...MODEL, capabilities: { ...MODEL.capabilities, inputAudio: true, inputVideo: false } },
+			],
+		});
+		const legacy = registerPlugin(registry, {
+			pluginId: "com.example.legacy",
+			providerInstanceId: "legacy-instance",
+			providerPrefix: "legacy",
+		});
+		expect(native.capabilities).toMatchObject({ inputAudio: true, inputVideo: true });
+		expect(native.getModel(MODEL.id)?.capabilities).toMatchObject({
+			inputAudio: true,
+			inputVideo: false,
+		});
+		expect(legacy.capabilities).toMatchObject({ inputAudio: false, inputVideo: false });
+		expect(legacy.getModel(MODEL.id)?.capabilities).toMatchObject({
+			inputAudio: false,
+			inputVideo: false,
+		});
+	});
 	test("uses a case-insensitive prefix namespace and permanently protects builtin prefixes", () => {
 		const registry = new PluginProviderRegistry({ reservedPrefixes: ["host-reserved"] });
 		registerBuiltin(registry, { providerPrefix: "BuiltinOne" });

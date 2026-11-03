@@ -175,6 +175,11 @@ export interface SpecContinuationState {
 	grantedKind?: "task" | "blocked";
 	/** The last declined grant, available for result-delivery explanations. */
 	stop?: Extract<SpecContinuationPlan, { action: "stop" }>;
+	/**
+	 * The run has no tasks of its own and continues on its turn budget only (an outline subagent,
+	 * D27c): set with each decision, so the stop note does not speak of tasks it never had.
+	 */
+	turnBudgetOnly?: boolean;
 }
 
 export function createSpecContinuationState(): SpecContinuationState {
@@ -358,8 +363,20 @@ export function buildSpecContinuationPrompt(input: {
 export function specContinuationStopNote(
 	plan: Extract<SpecContinuationPlan, { action: "stop" }>,
 	locale: Locale,
+	options: { turnBudgetOnly?: boolean } = {},
 ): string {
 	const isZh = locale === "zh-CN";
+	if (options.turnBudgetOnly) {
+		// No task list of its own (an outline subagent): what ran out is the turn budget.
+		if (plan.reason === "stalled") {
+			return isZh
+				? "[自动续跑已停止：连续续跑未产生实际进展（未调用任何工具）。本次运行在给出最终回复之前结束。]"
+				: "[Auto-continuation stopped: the extra passes produced no effective progress (no tool calls). The run ended before giving a final reply.]";
+		}
+		return isZh
+			? `[自动续跑已停止：本次运行已达到续跑预算（已续跑 ${plan.passes} 次），尚未给出最终回复，如需继续请重新派发。]`
+			: `[Auto-continuation stopped: this run reached its continuation budget after ${plan.passes} continuation passes, before giving a final reply; dispatch again to continue.]`;
+	}
 	if (plan.reason === "stalled") {
 		return isZh
 			? "[自动续跑已停止：连续续跑未产生实际进展（未调用任何工具，或反复触发同一次 protected 任务驳回）。spec://tasks.json 中仍有未完成条目。]"

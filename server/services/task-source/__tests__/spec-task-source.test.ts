@@ -130,7 +130,7 @@ describe("spec task source keeps the readers' behavior", () => {
 		const source = await taskSourceForNarrator(narratorId);
 		// Never created any task: the digest nudges, compact context is absent, fence empty.
 		expect(await source.taskDigest()).toEqual(await buildSpecTaskDigestBody(narratorId));
-		expect(await source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyNever" });
+		expect(await source.taskDigest()).toStrictEqual({ kind: "tasks", variant: "emptyNever" });
 		expect(await source.behaviorFence()).toBeNull();
 
 		await seedTasks(narratorId, [
@@ -149,6 +149,15 @@ describe("spec task source keeps the readers' behavior", () => {
 				await buildSpecCompactContext(narratorId, locale),
 			);
 		}
+		// Finished tasks only: the reorganize nudge, exactly — never another backend's mark.
+		await seedTasks(narratorId, [{ text: "Done already", status: "done" }]);
+		expect(await source.taskDigest()).toStrictEqual({ kind: "tasks", variant: "emptyDone" });
+		await seedTasks(narratorId, [
+			{ text: "Done already", status: "done" },
+			{ text: "Write the parser", status: "doing", protected: true },
+			{ text: "Waiting on access", status: "blocked" },
+			{ text: "Write the printer", status: "todo" },
+		]);
 		// The compact list still carries finished tasks and the protected marker.
 		expect(await source.compactContext("en")).toBe(
 			"Current Dynamic Spec tasks:\n- [done] Done already\n- [doing] Write the parser [protected]\n- [blocked] Waiting on access\n- [todo] Write the printer",

@@ -18,6 +18,7 @@ import {
 	serializeSpecTasksDocument,
 	taskTextHash,
 } from "./spec-task-service";
+import { assertSpecWritable } from "./task-source/backend";
 
 export { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX };
 
@@ -213,6 +214,8 @@ export async function writeSpecFile(
 	options: SpecWriteOptions = {},
 ): Promise<SpecResolvedFile> {
 	const path = normalizeSpecPath(uri);
+	// An outline session has no Dynamic Spec to write to (its fence excepted).
+	await assertSpecWritable(narratorId, path);
 	const actor = options.actor ?? "agent";
 	const fenceMutationAllowed = path === "behavior_fence" && options.allowFenceMutation === true;
 	if (actor === "agent" && isAgentReadonly(path) && !fenceMutationAllowed) {
@@ -389,6 +392,7 @@ export async function appendSpecTaskForExternalActor(
 ): Promise<{ added: boolean; protected: boolean; written: SpecResolvedFile }> {
 	const text = objective.trim();
 	if (!text) throw new Error("objective must not be empty");
+	await assertSpecWritable(narratorId, SPEC_TASKS_PATH);
 	const current = await readTasksFileForNarrator(narratorId);
 	const document = parseSpecTasksDocument(current.content);
 	const existing = document.tasks.find((task) => task.text.trim() === text);
@@ -485,6 +489,7 @@ export async function clearSpecTasks(narratorId: string): Promise<SpecResolvedFi
  * forked child never affects the parent.
  */
 export async function resetSpecNamespace(narratorId: string): Promise<void> {
+	await assertSpecWritable(narratorId, "");
 	const namespace = await ensureNamespace(narratorId);
 	// The store owns the reset section: drop all tracked files (built-in paths revert
 	// to their defaults because readSpecFile falls back when there is no row), release

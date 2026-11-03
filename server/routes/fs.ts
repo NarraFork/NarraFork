@@ -9,8 +9,10 @@ import {
 	readFileSync,
 	statSync,
 } from "node:fs";
+import { open, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
+import type { Context } from "hono";
 import { Hono } from "hono";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
@@ -27,22 +29,30 @@ import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
 import { getClientIp, isLocalMachineAddress } from "../lib/client-ip";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
 import { AppError, ValidationError } from "../lib/errors";
+import { claimDownloadTicket, issueDownloadTicket } from "../lib/fs-download-ticket";
 import {
 	isSecretPlatformPath,
 	isSecretUserPath,
 	SECRET_PATH_REFUSAL,
 } from "../lib/fs-secret-paths";
 import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
+import { PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
 import { generateId } from "../lib/id";
+import { clearInstructionFileCache } from "../lib/instruction-file-cache";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { getHome, IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { decodeUtf8Prefix, MAX_PROJECT_INSTRUCTIONS_BYTES } from "../lib/read-file-capped";
 import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
 import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { sanitizeSvg } from "../lib/svg-sanitize";
-import { fsWriteSchema } from "../lib/validators/fs";
+import {
+	fsWriteSchema,
+	projectPromptReadSchema,
+	projectPromptWriteSchema,
+} from "../lib/validators/fs";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import type { EditorActor } from "../services/editor-document-service";
 import { LocalFileValidationError } from "../services/file-change-local-io";
@@ -51,6 +61,7 @@ import {
 	executeEditorFileChange,
 	type FileChangeCompletion,
 } from "../services/file-change-runtime";
+import { copyFileToSystemClipboard } from "../services/file-clipboard";
 import { resolveNarratorProjectId } from "../services/narrator-project";
 import { findProjectDirCandidates, getProjectDirStatus } from "../services/project-dir";
 import { closeClaim, openClaim, sealClaim } from "../services/worktree-write-claims";
@@ -283,6 +294,72 @@ fsRoutes.post("/reveal", async (c) => {
 			resolve();
 		});
 	});
+
+	return c.json({ ok: true });
+});
+
+/**
+ * POST /api/fs/copy-file-to-clipboard
+ *
+ * Put a file on THIS machine's OS clipboard, so the user can paste it into a file manager and
+ * get the file itself. Body: { path: string }
+ *
+ * The browser cannot do this — `navigator.clipboard.write` only accepts text/HTML/PNG — while the
+ * process that already holds the file can do it with one helper call. The clipboard involved is
+ * the server machine's, so this is only meaningful for a browser running on that machine: a
+ * remote caller would copy the file onto someone else's clipboard and see nothing happen. Hence
+ * the `isLocalMachineAddress` refusal. The menu may also show the action when the user has opted
+ * into "treat as local access"; that preference is not a credential, so a remote browser still
+ * gets 403 here.
+ *
+ * The response is deliberately only `{ ok: true }`: the copy is not observable from here, and
+ * reporting success is honest because the helper exits 0 only after taking the clipboard.
+ */
+fsRoutes.post("/copy-file-to-clipboard", async (c) => {
+	const body = await readJsonBody(c.req);
+	const rawPath =
+		typeof (body as { path?: unknown } | null)?.path === "string"
+			? (body as { path: string }).path
+			: "";
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	// Refuse before probing existence: an answer about a secret's presence is itself a leak.
+	const absPath = resolve(rawPath);
+	assertReadableThroughFileApi(absPath);
+
+	if (!existsSync(absPath)) {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+	let stat: ReturnType<typeof statSync>;
+	try {
+		stat = statSync(absPath);
+	} catch {
+		throw new ValidationError(`Cannot access: ${absPath}`);
+	}
+	if (!stat.isFile()) {
+		throw new ValidationError(`Not a file: ${absPath}`);
+	}
+
+	if (!isLocalMachineAddress(getClientIp(c))) {
+		throw new AppError(
+			"Copying a file to the clipboard only works for a browser on the machine running NarraFork",
+			403,
+		);
+	}
+
+	try {
+		await copyFileToSystemClipboard(absPath);
+	} catch (error) {
+		// Missing wl-copy/xclip, a helper that refuses the path, a desktop that never answers:
+		// all of it is the caller's environment, not a server fault, and the message says which.
+		throw new AppError(
+			error instanceof Error ? error.message : String(error),
+			422,
+			"CLIPBOARD_UNAVAILABLE",
+		);
+	}
 
 	return c.json({ ok: true });
 });
@@ -880,23 +957,19 @@ function sha256Hex(text: string): string {
 const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
 
 /**
- * GET /api/fs/download?path=...
+ * Resolve a caller-supplied path to a downloadable regular file.
  *
- * Serve a file as an attachment. Separate from `/preview` rather than a flag on
- * it: preview is capped for rendering (1 MB text / 20 MB binary) and marked
- * cacheable, whereas a download must reach files above those caps, must never be
- * cached under a session credential, and must not sniff as HTML.
+ * Shared by the credential-carrying routes and the ticket-claiming one so the two can
+ * never disagree about what counts as downloadable. The order is the security-relevant
+ * part: the secret-path refusal comes FIRST, before existence is probed, because
+ * answering "does not exist" for a secret that is absent on this machine would turn the
+ * route into an existence oracle for exactly the files it is protecting.
+ *
+ * Returns the size too, so the caller decides how to report an over-limit file: a
+ * session route can answer with JSON, while a browser navigation gets a plain 413.
  */
-fsRoutes.get("/download", async (c) => {
-	const rawPath = c.req.query("path");
-	if (!rawPath) {
-		throw new ValidationError("path is required");
-	}
-
+function resolveDownloadableFile(rawPath: string): { absPath: string; size: number } {
 	const absPath = resolve(rawPath);
-	// FIRST, before existence is probed: the refusal is a property of the path, and
-	// answering "does not exist" for a secret that is absent on this machine would turn
-	// the route into an existence oracle for exactly the files it is protecting.
 	assertReadableThroughFileApi(absPath);
 
 	if (!existsSync(absPath)) {
@@ -913,13 +986,22 @@ fsRoutes.get("/download", async (c) => {
 	if (!stat.isFile()) {
 		throw new ValidationError(`Not a file: ${absPath}`);
 	}
-	if (stat.size > MAX_DOWNLOAD_BYTES) {
-		return c.json({ error: "File too large to download" }, 413);
-	}
 
-	// BunFile as the body directly: Bun sets Content-Length from it, so the
-	// browser can show real download progress (a ReadableStream would force
-	// chunked encoding and drop the length).
+	return { absPath, size: stat.size };
+}
+
+/**
+ * Stream a file as an attachment.
+ *
+ * The single place that decides a download's response shape, used by both the session
+ * route and the ticket route — a second copy is how the two would drift into serving
+ * different headers for the same file.
+ *
+ * BunFile goes in as the body directly: Bun sets Content-Length from it, so the browser
+ * can show real download progress (a ReadableStream would force chunked encoding and drop
+ * the length).
+ */
+function buildFileDownloadResponse(absPath: string, size: number): Response {
 	const file = Bun.file(absPath);
 	return new Response(file, {
 		headers: {
@@ -927,11 +1009,169 @@ fsRoutes.get("/download", async (c) => {
 			// `text/html` here would be a stored-XSS vector on a same-origin URL.
 			"Content-Type": "application/octet-stream",
 			"Content-Disposition": buildAttachmentDisposition(basename(absPath)),
-			"Content-Length": String(stat.size),
+			"Content-Length": String(size),
 			"Cache-Control": "no-store",
 			"X-Content-Type-Options": "nosniff",
 		},
 	});
+}
+
+/** The over-limit answer for a session client, which reads JSON. */
+function tooLargeToDownload(c: Context): Response {
+	return c.json({ error: "File too large to download" }, 413);
+}
+
+function escapeHtml(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
+/**
+ * What a human sees when the ticket navigation itself fails.
+ *
+ * The browser opened this URL in a tab. JSON would be readable but looks like a broken download;
+ * an HTML page with no path in it is the sentence, and CSP keeps it from becoming a script.
+ */
+function downloadFailureDocument(message: string, code: string, status: 403 | 413): Response {
+	const html = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Download failed</title>
+<p>${escapeHtml(message)}</p>
+<p><code>${escapeHtml(code)}</code></p>
+`;
+	return new Response(html, {
+		status,
+		headers: {
+			"Content-Type": "text/html; charset=utf-8",
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
+			"Content-Security-Policy": "default-src 'none'",
+		},
+	});
+}
+
+/**
+ * GET /api/fs/download?path=...
+ *
+ * Serve a file as an attachment. Separate from `/preview` rather than a flag on
+ * it: preview is capped for rendering (1 MB text / 20 MB binary) and marked
+ * cacheable, whereas a download must reach files above those caps, must never be
+ * cached under a session credential, and must not sniff as HTML.
+ */
+fsRoutes.get("/download", async (c) => {
+	const rawPath = c.req.query("path");
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	const { absPath, size } = resolveDownloadableFile(rawPath);
+	if (size > MAX_DOWNLOAD_BYTES) {
+		return tooLargeToDownload(c);
+	}
+
+	return buildFileDownloadResponse(absPath, size);
+});
+
+/**
+ * POST /api/fs/download-ticket — mint a short-lived URL credential for one file.
+ *
+ * Exists so the browser can perform the download itself. The client cannot simply be
+ * pointed at `/download?path=…`: that route authenticates with an `Authorization`
+ * header, and a navigation carries none. Fetching the bytes into a Blob instead costs a
+ * full copy in page memory and cannot report progress. The click handler opens the tab
+ * before this request is awaited, then navigates that tab here; the gesture is the
+ * `window.open`, not this response.
+ *
+ * The path is validated HERE, while a session is present and the answer can be a specific
+ * JSON error. The ticket then carries only a random nonce — never the path — so the URL
+ * that ends up in browser history and proxy logs discloses nothing about the workspace.
+ */
+fsRoutes.post("/download-ticket", async (c) => {
+	const raw = await readJsonBody(c.req);
+	const rawPath =
+		typeof (raw as { path?: unknown } | null)?.path === "string"
+			? (raw as { path: string }).path
+			: "";
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	const { absPath, size } = resolveDownloadableFile(rawPath);
+	// Refuse before minting: a ticket for a file that can never be served only produces a
+	// browser error page, which is strictly worse than an error the client can explain.
+	if (size > MAX_DOWNLOAD_BYTES) {
+		return tooLargeToDownload(c);
+	}
+
+	const { ticket, expiresInMs } = issueDownloadTicket(absPath);
+	return c.json({ ticket, expiresInMs });
+});
+
+/**
+ * GET /api/fs/download?ticket=… — the browser's own download, authorized by the ticket.
+ *
+ * Mounted BEFORE the global session gate (`app.ts`), because the whole point is that no
+ * `Authorization` header is sent: the browser navigates here directly and streams the
+ * response to disk. The ticket is the credential, and it authorizes exactly one path that
+ * a session already validated (see `lib/fs-download-ticket.ts`).
+ *
+ * ⚠️ This router deliberately contains that one path and nothing else. Mounting the whole
+ * of `fsRoutes` early would publish every file endpoint — `/write`, `/edit-source`,
+ * `/browse` — to unauthenticated callers, which is why the public surface is a separate
+ * router rather than a flag on the session one.
+ *
+ * When no ticket is present the request falls through with `next()`, so the historical
+ * `?path=` form still reaches the session-authenticated route below it. That fall-through
+ * is what makes adding this router invisible to existing callers.
+ */
+export const fsPublicDownloadRoutes = new Hono();
+
+fsPublicDownloadRoutes.get("/download", async (c, next) => {
+	const ticket = c.req.query("ticket");
+	if (!ticket) return next();
+
+	const claim = claimDownloadTicket(ticket);
+	if (!claim.ok) {
+		// Distinct messages so a human reading the browser tab can tell "click again" from
+		// "this link never existed". Both are 403: the caller presented no valid capability.
+		logger.debug("Download ticket rejected", { reason: claim.reason });
+		const message =
+			claim.reason === "already_used"
+				? "This download link was already used. Try downloading the file again."
+				: claim.reason === "expired"
+					? "This download link has expired. Try downloading the file again."
+					: "Invalid download link.";
+		return downloadFailureDocument(message, `DOWNLOAD_TICKET_${claim.reason.toUpperCase()}`, 403);
+	}
+
+	// Re-validate: up to a minute passed since the ticket was minted, and the bytes on disk
+	// are not frozen in the meantime. The secret-path guard runs again too — a path that
+	// becomes credential-bearing after issuance must not ride an already-issued ticket.
+	let resolved: { absPath: string; size: number };
+	try {
+		resolved = resolveDownloadableFile(claim.path);
+	} catch (error) {
+		// A file deleted between click and navigation is the ordinary case here, and it must
+		// be a readable sentence rather than the route's usual JSON validation body.
+		logger.debug("Download ticket path no longer downloadable", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return downloadFailureDocument(
+			"This file is no longer available for download.",
+			"DOWNLOAD_UNAVAILABLE",
+			403,
+		);
+	}
+
+	if (resolved.size > MAX_DOWNLOAD_BYTES) {
+		return downloadFailureDocument("File too large to download", "DOWNLOAD_TOO_LARGE", 413);
+	}
+
+	return buildFileDownloadResponse(resolved.absPath, resolved.size);
 });
 
 /**
@@ -1372,3 +1612,247 @@ function resolveUserDir(key: "desktop" | "documents" | "downloads", home: string
 	const fallback = join(home, englishName[key]);
 	return existsSync(fallback) ? fallback : null;
 }
+
+// ── Project instruction file (AGENTS.md & friends) ─────────────────────────────
+
+/**
+ * Read at most {@link MAX_PROJECT_INSTRUCTIONS_BYTES} of a file, as BYTES.
+ *
+ * The project-prompt editor needs the raw bytes, not just decoded text: the
+ * optimistic lock compares a sha256, and decoding first would make the hash depend
+ * on the decoder's replacement of invalid sequences.
+ *
+ * A file that fills the cap exactly is complete. Truncation means bytes were left
+ * unread: the file was already over the cap, or it grew between the size check and
+ * the read. Comparing `bytesRead >= maxBytes` is the wrong signal — that is also
+ * true of a file whose size is exactly the cap, and it misses growth that stays
+ * under the cap.
+ */
+async function readBoundedBytes(
+	path: string,
+	maxBytes: number,
+): Promise<{ bytes: Uint8Array; truncated: boolean; totalBytes: number } | null> {
+	let fileSize: number;
+	try {
+		const info = await stat(path);
+		if (!info.isFile()) return null;
+		fileSize = info.size;
+	} catch {
+		return null;
+	}
+	const want = Math.min(Math.max(fileSize, 0), maxBytes);
+	const handle = await open(path, "r");
+	try {
+		const buffer = new Uint8Array(want);
+		const { bytesRead } = want > 0 ? await handle.read(buffer, 0, want, 0) : { bytesRead: 0 };
+		let sizeAfter = fileSize;
+		try {
+			sizeAfter = (await stat(path)).size;
+		} catch {
+			// The size observed before the read is the best remaining answer.
+		}
+		return {
+			bytes: buffer.subarray(0, bytesRead),
+			truncated: sizeAfter > maxBytes || bytesRead < sizeAfter,
+			totalBytes: sizeAfter,
+		};
+	} finally {
+		await handle.close();
+	}
+}
+
+/**
+ * The first project instruction file that exists in `cwd`, or the one a save would
+ * create.
+ *
+ * Order and create-target both come from `PROJECT_PROMPT_FILENAMES`, the same list
+ * `narrator-prompt` reads when it injects the file, so the dialog can only ever show
+ * and rewrite the file that actually reaches the system prompt. `AGENTS.md` is the
+ * create target: it is the cross-tool standard, whereas `AGENTS.override.md` is a
+ * local-only override and `CLAUDE.md` is one tool's legacy name.
+ */
+async function resolveProjectPromptFile(cwd: string): Promise<{
+	filename: string;
+	path: string;
+	exists: boolean;
+}> {
+	for (const filename of PROJECT_PROMPT_FILENAMES) {
+		const candidate = join(cwd, filename);
+		try {
+			const info = await stat(candidate);
+			// A directory at a candidate name is not a readable prompt file; keep looking
+			// rather than reporting a broken editor for a perfectly normal checkout.
+			if (info.isFile()) return { filename, path: candidate, exists: true };
+		} catch {
+			// Absent — the next candidate may be the real one.
+		}
+	}
+	const filename = PROJECT_PROMPT_FILENAMES[1] ?? PROJECT_PROMPT_FILENAMES[0];
+	return { filename, path: join(cwd, filename), exists: false };
+}
+
+/** Refuse a `cwd` that is not an existing directory, before it is used as a root. */
+async function requireExistingDirectory(cwd: string): Promise<string> {
+	const absolute = resolve(cwd);
+	let info: Awaited<ReturnType<typeof stat>>;
+	try {
+		info = await stat(absolute);
+	} catch {
+		throw new ValidationError("The working directory does not exist");
+	}
+	if (!info.isDirectory()) throw new ValidationError("The working directory is not a directory");
+	return absolute;
+}
+
+/**
+ * GET /api/fs/project-prompt?cwd=...
+ *
+ * The content of the project instruction file for one directory, as the "new
+ * narrator" dialog needs it: `{ filename, path, exists, content, truncated, hash }`.
+ *
+ * `filename` is always the file to edit — an existing candidate, or the one a save
+ * would create when none exists (`exists: false`, `content: ""`). `hash` is the
+ * optimistic lock to echo back on PUT.
+ *
+ * Read gate: this reads one of four well-known filenames from a directory the caller
+ * names, so there is no traversal to defend against — the only exposure is a read of
+ * a file the user could already read. Credential paths stay refused
+ * (`fs-secret-paths`), because `AGENTS.md` next to someone's secrets is still a file
+ * whose contents a caller should not harvest by directory name alone.
+ */
+fsRoutes.get("/project-prompt", async (c) => {
+	const parsed = projectPromptReadSchema.safeParse({
+		cwd: c.req.query("cwd") ?? "",
+	});
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "cwd is required");
+	}
+	const cwd = await requireExistingDirectory(parsed.data.cwd);
+	const file = await resolveProjectPromptFile(cwd);
+
+	if (isSecretPlatformPath(file.path) || isSecretUserPath(file.path, homedir())) {
+		throw new WriteRefusedError(SECRET_PATH_REFUSAL);
+	}
+
+	const bytes = file.exists
+		? await readBoundedBytes(file.path, MAX_PROJECT_INSTRUCTIONS_BYTES)
+		: null;
+	return c.json({
+		cwd,
+		filename: file.filename,
+		path: file.path,
+		exists: file.exists && bytes !== null,
+		content: bytes ? decodeUtf8Prefix(bytes.bytes) : "",
+		truncated: bytes?.truncated ?? false,
+		totalBytes: bytes?.totalBytes ?? null,
+		hash: bytes ? createHash("sha256").update(bytes.bytes).digest("hex") : null,
+		candidates: [...PROJECT_PROMPT_FILENAMES],
+	});
+});
+
+/**
+ * PUT /api/fs/project-prompt
+ *
+ * Save the project instruction file for one directory.
+ *
+ * Deliberately NOT `/api/fs/write`: that route is bounded by a NARRATOR's worktree
+ * and requires a narrator id, and this dialog runs before any narrator exists. The
+ * bound here is the same one, derived from the directory itself — `cwd` plus the
+ * operator's extra writable roots, through the same `checkWriteBoundary`, so secret
+ * paths, git internals and symlink escapes are refused identically.
+ *
+ * Two properties this must not lose:
+ *
+ * 1. **Optimistic lock.** An agent can rewrite `AGENTS.md` while the dialog is open.
+ *    The client sends the hash it loaded; a mismatch is a 409 carrying the current
+ *    text, never a silent overwrite of someone else's edit.
+ *
+ * 2. **Bounded bytes.** Both directions are capped at the same size the injector
+ *    reads, so this cannot author a file that then blows up every system prompt in
+ *    the directory.
+ */
+fsRoutes.put("/project-prompt", async (c) => {
+	const parsed = projectPromptWriteSchema.safeParse(await readJsonBody(c.req));
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
+	}
+	const { filename, content, baseHash } = parsed.data;
+	const cwd = await requireExistingDirectory(parsed.data.cwd);
+	const target = join(cwd, filename);
+
+	// The filename is a schema enum, so `target` is always directly inside `cwd`; the
+	// boundary check is about what `cwd` RESOLVES to (secrets, `.git`, a symlinked
+	// workspace), not about the name.
+	const decision = checkWriteBoundary(target, [cwd, ...(settings.paths.extraWritableDirs ?? [])]);
+	if (!decision.allowed || !decision.physicalPath) {
+		throw new WriteRefusedError(describeWriteRefusal(decision.reason ?? "unresolvable"));
+	}
+	const physicalPath = decision.physicalPath;
+
+	const payload = encodeFileBytesAs(content, "utf-8");
+	if (payload.byteLength > MAX_PROJECT_INSTRUCTIONS_BYTES) {
+		throw new ValidationError("Content exceeds the maximum prompt file size");
+	}
+
+	const existing = await readBoundedBytes(physicalPath, MAX_PROJECT_INSTRUCTIONS_BYTES);
+	if (existing?.truncated) {
+		throw new ValidationError("The prompt file is too large to edit through this dialog");
+	}
+
+	if (existing) {
+		const currentHash = createHash("sha256").update(existing.bytes).digest("hex");
+		if (!baseHash) {
+			return c.json(
+				{
+					error: "The prompt file already exists",
+					code: "STALE_WRITE",
+					currentHash,
+					currentContent: decodeUtf8Prefix(existing.bytes),
+				},
+				409,
+			);
+		}
+		if (baseHash !== currentHash) {
+			return c.json(
+				{
+					error: "The prompt file changed since it was opened",
+					code: "STALE_WRITE",
+					expectedHash: baseHash,
+					currentHash,
+					currentContent: decodeUtf8Prefix(existing.bytes),
+				},
+				409,
+			);
+		}
+	} else if (baseHash) {
+		return c.json(
+			{
+				error: "The prompt file was deleted since it was opened",
+				code: "STALE_WRITE",
+				expectedHash: baseHash,
+				currentHash: null,
+				currentContent: "",
+			},
+			409,
+		);
+	}
+
+	// Keep the file's own line endings: a CRLF checkout whose prompt is rewritten with
+	// LF would show every line as changed in the user's diff for a one-word edit.
+	const lineEnding = detectLineEnding(existing ? decodeUtf8Prefix(existing.bytes) : content);
+	const body = applyLineEnding(normalizeLineEndings(content), lineEnding);
+	await writeFile(physicalPath, encodeFileBytesAs(body, "utf-8"));
+
+	// The system prompt is rebuilt from the instruction cache on every loop iteration;
+	// a same-size rewrite can keep the old stat signature, so drop the entry rather than
+	// let the next turn inject the previous text.
+	clearInstructionFileCache();
+
+	const written = encodeFileBytesAs(body, "utf-8");
+	return c.json({
+		ok: true,
+		path: physicalPath,
+		filename,
+		hash: createHash("sha256").update(written).digest("hex"),
+	});
+});

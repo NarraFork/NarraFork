@@ -3,7 +3,16 @@ import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import type { ComposerDocument } from "@shared/composer-document";
+import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import {
+	isMediaContentBlock,
+	MAX_MEDIA_ATTACHMENTS,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { parseStored } from "@shared/narrator-blocks/plan";
@@ -64,11 +73,17 @@ import {
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
-import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
+import {
+	deleteUploadedMedia,
+	getMediaPath,
+	saveUploadedMedia,
+	validateUploadedMedia,
+} from "../lib/media-uploads";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
@@ -181,7 +196,7 @@ import type { InjectionRecipientPlacement } from "./narrator-injection";
 import { deliverInjection } from "./narrator-injection";
 import { isFirstUserTurn } from "./narrator-message-count";
 import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
-import { buildEffectiveSystemPrompt } from "./narrator-prompt";
+import { buildEffectiveSystemPrompt, taskSectionFor } from "./narrator-prompt";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
 import { getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { enrichToolUseBlocks, narratorService, truncateToolIO } from "./narrator-service";
@@ -208,6 +223,7 @@ import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subage
 import {
 	type ContinuationTarget,
 	type NarratorTaskSource,
+	resolveTaskBackend,
 	taskSourceForNarrator,
 } from "./task-source";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
@@ -383,6 +399,7 @@ import {
 import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
+	dropBufferedMessage,
 	enqueueBufferedMessage,
 	getBufferedMessages,
 	getBufferedMessagesAsync,
@@ -681,6 +698,13 @@ export async function setNarratorDefaultDevice(
 	return { defaultDeviceId: resolvedDeviceId, current };
 }
 
+export function shouldSendQueuedNewInitialMessage(
+	initialMessage: string,
+	buffered: Pick<BufferedMessage, "fileReferences" | "media">,
+): boolean {
+	return Boolean(initialMessage || buffered.fileReferences?.length || buffered.media?.length);
+}
+
 export async function executeQueuedNewCommand(
 	active: ActiveNarrator,
 	buffered: BufferedMessage,
@@ -719,7 +743,7 @@ export async function executeQueuedNewCommand(
 		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
 	});
 
-	if (initialMessage || buffered.fileReferences?.length) {
+	if (shouldSendQueuedNewInitialMessage(initialMessage, buffered)) {
 		await sendMessage(
 			newNarrator.id,
 			initialMessage,
@@ -732,6 +756,9 @@ export async function executeQueuedNewCommand(
 			undefined,
 			undefined,
 			buffered.fileReferences,
+			// `/new` has been removed from the prompt; its original document no longer projects it.
+			undefined,
+			buffered.media,
 		);
 	}
 
@@ -776,7 +803,12 @@ export async function executeQueuedGoalCommand(
 	narratorId: string,
 	buffered: BufferedMessage,
 	objective: string,
-): Promise<void> {
+): Promise<{ refused: boolean }> {
+	// Before anything is saved: a session whose tasks live in the outline has no tasks.json.
+	if ((await resolveTaskBackend(narratorId)) === "outline") {
+		await refuseQueuedOutlineGoal(narratorId, buffered);
+		return { refused: true };
+	}
 	const rawCommand = buffered.commandText?.trim() || buffered.text;
 	const userMsg = await withInboxOwner(narratorId, async () => {
 		const row = buffered._mailboxClaim
@@ -837,6 +869,85 @@ export async function executeQueuedGoalCommand(
 			error: String(err),
 		});
 	});
+	return { refused: false };
+}
+
+/**
+ * Whether this input is a `/goal` the queue consumer would run, for a session whose tasks live in
+ * the outline (outline P2). Such a session has no tasks.json to add the goal to; its `/goal` (a
+ * person-created, locked task) arrives with the task board (plan PR 5). Every entry point that
+ * queues input refuses it before anything is queued or saved.
+ */
+export async function isOutlineSessionGoal(
+	narratorId: string,
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
+): Promise<boolean> {
+	if (!parseQueuedGoalCommand(message, commandText, composerDocument, intent)) return false;
+	return (await resolveTaskBackend(narratorId)) === "outline";
+}
+
+/**
+ * The consumers' backstop for a queued `/goal` that reached an outline session anyway (queued
+ * while the outline was switched off, say): the row is dropped from the queue without its message
+ * ever being saved, the person is told why, and the caller drains on as after any terminal
+ * command. Never throws: a refusal must not stall the queue.
+ */
+async function refuseQueuedOutlineGoal(narratorId: string, buffered: BufferedMessage) {
+	const refusal = catalogError("GOAL_IN_OUTLINE_SESSION");
+	try {
+		await withInboxOwner(narratorId, async () => {
+			let message = buffered;
+			if (!message._mailboxClaim) {
+				// Claim the exact row first, as the consumers do, so what is dropped is what was read.
+				const row = await claimInboxHead(
+					narratorId,
+					(candidate) => candidate.id === buffered.id && candidate.kind === "user_input",
+				);
+				// Not at the queue's head (or gone): its consumer will meet it and refuse it then.
+				if (!row) return;
+				message = projectMailboxUserMessage(row);
+				// Edited since it was read into something that is no /goal: not ours to drop.
+				if (
+					!parseQueuedGoalCommand(
+						message.text,
+						message.commandText,
+						message.composerDocument,
+						message.executionIntent,
+					)
+				) {
+					await releaseInboxClaim(row, "Edited before a refused /goal was dropped");
+					return;
+				}
+			}
+			await dropBufferedMessage(narratorId, message, refusal.message);
+		});
+	} catch (error) {
+		logger.warn("Failed to drop a queued /goal refused for an outline session", {
+			narratorId,
+			error: String(error),
+		});
+	}
+	broadcastToNarrator(narratorId, {
+		type: "narrator_error",
+		narratorId,
+		error: serializeCatalogErrorMessage(refusal),
+		errorCode: refusal.code,
+	});
+	try {
+		broadcastToNarrator(narratorId, {
+			type: "buffer_set",
+			narratorId,
+			messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+		});
+	} catch (error) {
+		logger.warn("Failed to broadcast the queue after a refused /goal", {
+			narratorId,
+			error: String(error),
+		});
+	}
 }
 
 /**
@@ -1037,8 +1148,13 @@ async function resumeNextBufferedMessageUnlocked(
 			// Queued /goal: persist the protected task, then launch its first Spec turn.
 			// If plan mode or another guard prevents starting, keep draining as before.
 			await executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
-				.then(async () => {
+				.then(async ({ refused }) => {
 					inputOwner.release();
+					// Refused for an outline session: nothing to start, drain on.
+					if (refused) {
+						await settleAfterTerminalCommand();
+						return;
+					}
 					const result = await startSpecContinuationIfPossible(
 						narratorId,
 						locale,
@@ -1067,6 +1183,8 @@ async function resumeNextBufferedMessageUnlocked(
 				},
 				undefined,
 				first.fileReferences,
+				first.composerDocument,
+				first.media,
 			)
 				.then(async ({ userMsg, userBroadcasted }) => {
 					// Delivered: the attachments have been re-materialized into the turn, so the
@@ -1171,7 +1289,12 @@ export async function buildSystemPrompt(
 	planFilePath?: string,
 	context?: Pick<
 		import("./narrator-prompt").BuildPromptOptions,
-		"workspaceContext" | "skillsContext" | "modelsContext" | "modeContext" | "runtimeHints"
+		| "workspaceContext"
+		| "skillsContext"
+		| "modelsContext"
+		| "modeContext"
+		| "runtimeHints"
+		| "taskSection"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1312,6 +1435,12 @@ async function createNarrator(
 			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
 		},
 		planFilePath,
+		{
+			taskSection: taskSectionFor(
+				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+				narrator.type,
+			),
+		},
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -1777,6 +1906,12 @@ async function readContinuationTarget(
 	}
 }
 
+/**
+ * The task a turn-budget continuation is planned for (`ContinuationTarget.turnBudgetOnly`): the
+ * narrator has none of its own, so the prompt names none (`turnBudgetOnly` on the prompt input).
+ */
+const TURN_BUDGET_TASK = Object.freeze({ text: "", protected: false, status: "doing" as const });
+
 /** Read only this narrator's tasks; promotion is granted by the policy, not its relationships. */
 export async function readSpecContinuationState(
 	narratorId: string,
@@ -1824,10 +1959,17 @@ async function maybeStartSpecContinuation(
 	};
 	const taskSource = await taskSourceForNarrator(active.narratorId);
 	const spec = await readContinuationTarget(taskSource, policy.continuation.promoteTodo);
+	const cause = options?.cause ?? "spec";
+	// A narrator without tasks of its own (an outline subagent, D27c) continues only when a pass
+	// spent its turn budget before the final reply: the mode's task conditions do not apply to
+	// it (only `off` still stops it), the pass ceiling and stall rules do.
+	const budgetOnly = spec.turnBudgetOnly === true;
+	if (budgetOnly) state.turnBudgetOnly = true;
 	const plan = planSpecContinuation({
-		cause: options?.cause ?? "spec",
-		mode: effectiveMode,
-		...spec,
+		cause,
+		mode: budgetOnly && effectiveMode !== "off" ? "always" : effectiveMode,
+		openTask: budgetOnly ? (cause === "maxTurns" ? TURN_BUDGET_TASK : null) : spec.openTask,
+		protectedOpenCount: spec.protectedOpenCount,
 		previous: state,
 		maxPasses: policy.continuation.maxPasses,
 		explicitStart: options?.explicitStart,
@@ -1842,7 +1984,7 @@ async function maybeStartSpecContinuation(
 	state.passes = plan.passes;
 	const task = plan.task;
 	const canAskUserQuestion = policy.capabilities.askUserQuestion !== "disabled";
-	if (policy.continuation.maxPasses !== null || !canAskUserQuestion) {
+	if (policy.continuation.maxPasses !== null || !canAskUserQuestion || budgetOnly) {
 		const content = taskSource.continuationPrompt({
 			form: "bounded",
 			cause: plan.cause,
@@ -1851,6 +1993,7 @@ async function maybeStartSpecContinuation(
 			maxPasses: policy.continuation.maxPasses,
 			canAskUserQuestion,
 			locale: active.locale,
+			...(budgetOnly ? { turnBudgetOnly: true } : {}),
 		});
 		await deliverInjection(active.narratorId, {
 			content,
@@ -2813,6 +2956,9 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+			...(result.mediaFallbackWarnings?.length
+				? { mediaFallbackWarnings: result.mediaFallbackWarnings }
+				: {}),
 			...(result.toolLoading
 				? {
 						toolLoading: result.toolLoading,
@@ -3064,6 +3210,8 @@ async function feedMessageUnlocked(
 	},
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
@@ -3071,7 +3219,12 @@ async function feedMessageUnlocked(
 	/** Settles when the started run reaches its terminal. */
 	terminal?: Promise<unknown>;
 	/** Input for a fresh pass; ownership and terminal promises remain with run.ts. */
-	preparedInput?: { text: string; images?: ImageRef[]; prePromptBashCommand?: string };
+	preparedInput?: {
+		text: string;
+		images?: ImageRef[];
+		media?: MediaRef[];
+		prePromptBashCommand?: string;
+	};
 	/** The message is durable, but a later dispatch step failed and was reported. */
 	postCommitError?: unknown;
 }> {
@@ -3143,6 +3296,11 @@ async function feedMessageUnlocked(
 					"back",
 					preBashCommand,
 					acceptedReferences,
+					undefined,
+					undefined,
+					undefined,
+					composerDocument,
+					media,
 				)
 			).id;
 		acceptedInputId = acceptedId;
@@ -3165,6 +3323,7 @@ async function feedMessageUnlocked(
 		const accepted = projectMailboxUserMessage(claimedInput);
 		prompt = accepted.text;
 		images = accepted.images;
+		media = accepted.media;
 		commandText = accepted.commandText;
 		// A mailbox null means no known principal, not permission to erase the
 		// session's identity. Preserve an explicit null only on this direct call.
@@ -3186,6 +3345,7 @@ async function feedMessageUnlocked(
 		const persistBlocks: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| MediaContentBlock
 			| FileReferenceSnapshot
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 		> = [];
@@ -3194,6 +3354,7 @@ async function feedMessageUnlocked(
 				persistBlocks.push(imageRefToContentBlock(img));
 			}
 		}
+		for (const item of media ?? []) persistBlocks.push(mediaRefToContentBlock(item, narratorId));
 		if (savedTextFiles.length > 0) {
 			for (const tf of savedTextFiles) {
 				persistBlocks.push({
@@ -3213,7 +3374,12 @@ async function feedMessageUnlocked(
 
 		// When the user sends images without text, inject a placeholder so that
 		// providers that gate on non-empty content still include the image blocks.
-		const effectiveText = !prompt.trim() && images?.length ? "[user sent image(s)]" : prompt;
+		const effectiveText =
+			!prompt.trim() && media?.length
+				? "[user sent media]"
+				: !prompt.trim() && images?.length
+					? "[user sent image(s)]"
+					: prompt;
 
 		// Build the effective prompt with attached file hints
 		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
@@ -3311,6 +3477,7 @@ async function feedMessageUnlocked(
 		const input = {
 			text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
 			images: preBashCommand ? undefined : images,
+			media: preBashCommand ? undefined : media,
 			...(preBashCommand ? { prePromptBashCommand: preBashCommand } : {}),
 		};
 		if (internalOptions?.prepareOnly) return { active, userMsg, preparedInput: input };
@@ -3329,6 +3496,7 @@ async function feedMessageUnlocked(
 			...internalOptions?.run,
 			...(userId !== undefined ? { principal: userId } : {}),
 			prePromptBashCommand: input.prePromptBashCommand,
+			media,
 			recoveryStart,
 		});
 		terminal.catch(async (err) => {
@@ -3357,7 +3525,10 @@ export async function prepareQueuedRunInput(
 	active: ActiveNarrator,
 	owner: ExecutionOwner,
 	run: import("./agent-runtime/ownership").RunControl,
-): Promise<{ text: string; images?: ImageRef[]; prePromptBashCommand?: string } | undefined> {
+): Promise<
+	| { text: string; images?: ImageRef[]; media?: MediaRef[]; prePromptBashCommand?: string }
+	| undefined
+> {
 	const id = active.narratorId;
 	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
 	const delivered = await drainAndPersistPendingInjections(active);
@@ -3411,6 +3582,8 @@ export async function prepareQueuedRunInput(
 			},
 			undefined,
 			first.fileReferences,
+			first.composerDocument,
+			first.media,
 		);
 		if (result.postCommitError) throw result.postCommitError;
 		if (first.createdBy != null) {
@@ -3663,6 +3836,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 export interface UserMessageAdmissionOptions {
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	locale?: Locale;
 	replyInUserLanguage?: boolean;
 	commandText?: string | null;
@@ -3762,6 +3936,7 @@ export async function acceptUserMessage(
 					options.executionIntent,
 					queueMode,
 					options.composerDocument,
+					options.media,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3829,6 +4004,8 @@ export async function acceptUserMessage(
 								},
 								undefined,
 								options.fileReferences,
+								options.composerDocument,
+								options.media,
 							);
 							if (!userBroadcasted)
 								broadcastToNarrator(narratorId, {
@@ -3906,6 +4083,8 @@ export async function sendMessage(
 	preBashCommand?: string | null,
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const { userMsg, userBroadcasted } = await feedMessage(
@@ -3921,6 +4100,8 @@ export async function sendMessage(
 		undefined,
 		origin,
 		acceptedReferences,
+		composerDocument,
+		media,
 	);
 	if (!userBroadcasted) {
 		broadcastToNarrator(narratorId, {
@@ -4046,6 +4227,10 @@ export async function createNarratorForPlugin(
 		cwd: input.cwd,
 		permissionMode: input.permissionMode,
 		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+		// The recruiting plugin drives its members through the Dynamic Spec commands (dispatch,
+		// read, write), which an outline session refuses; members stay spec until the block-based
+		// commands exist (plan PR 12, D27d), as OAuth-provisioned sessions do.
+		taskBackend: "spec",
 	});
 	return {
 		narratorId: narrator.id,
@@ -4068,6 +4253,10 @@ export async function deleteNarratorForPlugin(narratorId: string): Promise<void>
  * to track the shared task queue it maintains for each member.
  */
 export async function readSpecTasksForPlugin(narratorId: string) {
+	// An outline session's tasks are not in Dynamic Spec: an empty list would read as an idle
+	// member to a plugin that then dispatches to it (refused too). Refused like the writes.
+	const { assertSpecTasksUsed } = await import("./task-source/backend");
+	await assertSpecTasksUsed(narratorId);
 	const { readTasksFileForNarrator } = await import("./spec-vfs-service");
 	const { parseSpecTasksDocument, compileSpecTasks } = await import("./spec-task-service");
 	const file = await readTasksFileForNarrator(narratorId);
@@ -5185,6 +5374,9 @@ async function retryLastMessageUnlocked(
 	}
 
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
+	const mediaRefs = (Array.isArray(lastMsg.contentJson) ? lastMsg.contentJson : [])
+		.filter(isMediaContentBlock)
+		.map((item) => mediaRefToContentBlock(item, lastMsg.narratorId));
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
@@ -5193,6 +5385,7 @@ async function retryLastMessageUnlocked(
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined, {
 		principal: userId,
+		media: mediaRefs.length > 0 ? mediaRefs : undefined,
 	}).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
 		await reportUnsettledRunLoopError(narratorId, err);
@@ -5761,7 +5954,9 @@ async function reExecuteDeniedToolCallUnlocked(
 					input: toolInput,
 				});
 
-				const { executePersistedToolAfterReflections } = await import("../lib/agent/loop");
+				const { createDurableMediaReferences, executePersistedToolAfterReflections } = await import(
+					"../lib/agent/loop"
+				);
 				const toolName = toolCall.toolName;
 				const reflectionHistory = await buildRuntimeHistory({
 					narratorId,
@@ -5795,6 +5990,7 @@ async function reExecuteDeniedToolCallUnlocked(
 				const config: import("../lib/agent").AgentConfig = {
 					narratorId,
 					runtimePolicy,
+					taskBackend: await resolveTaskBackend(narratorId).catch(() => "spec" as const),
 					systemPrompt: active.systemPrompt ?? undefined,
 					permissionMode: oauthRuntime?.permissionMode ?? narrator.permissionMode ?? "default",
 					planMode: !oauthRuntime && isPlanModeTrait(narrator.traits),
@@ -5968,6 +6164,12 @@ async function reExecuteDeniedToolCallUnlocked(
 						},
 					);
 
+					const mediaRefs = result.mediaRefs?.length
+						? result.mediaRefs
+						: result.media?.length
+							? await createDurableMediaReferences(config)(result.media)
+							: undefined;
+
 					if (!result.isError && toolName === "ExitPlanMode") {
 						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
 						const planState = await exitNarratorPlanMode(narratorId);
@@ -6002,7 +6204,10 @@ async function reExecuteDeniedToolCallUnlocked(
 					await narratorStore.settleTool(
 						toolUseId,
 						{
-							output: encodeToolOutput(result.output, { metadata: result.metadata }),
+							output: encodeToolOutput(result.output, {
+								metadata: result.metadata,
+								media: mediaRefs,
+							}),
 							status: result.isError ? "fail" : "success",
 							errorMessage: result.isError ? result.output : undefined,
 							durationMs: result.durationMs,
@@ -6022,7 +6227,10 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						toolName,
 						status: result.isError ? "fail" : "success",
-						output: encodeToolOutput(result.output, { metadata: result.metadata }),
+						output: encodeToolOutput(result.output, {
+							metadata: result.metadata,
+							media: mediaRefs,
+						}),
 						durationMs: result.durationMs,
 						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
 						...(result.metadata ? { metadata: result.metadata } : {}),
@@ -6357,6 +6565,7 @@ type EditableUserContentBlock =
 	| { type: "text"; text: string }
 	| FileReferenceSnapshot
 	| PersistedUserImageBlock
+	| MediaContentBlock
 	// `fileId` is optional: legacy uploads stored files under
 	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
 	// filePath, while newer uploads live in the worktree and omit fileId.
@@ -6414,6 +6623,8 @@ function buildEditedUserContentJson(
 	opts?: {
 		fallbackUploadNarratorId?: string | null;
 		keepImageIds?: string[];
+		keepMediaIds?: string[];
+		newMedia?: MediaRef[];
 		newImages?: ImageRef[];
 		keepTextFilePaths?: string[];
 		newTextFiles?: TextFileRef[];
@@ -6428,9 +6639,19 @@ function buildEditedUserContentJson(
 	const seenImageIds = new Set<string>();
 	const seenTextFilePaths = new Set<string>();
 	const imageBlocks: EditableUserContentBlock[] = [];
+	const mediaBlocks: MediaContentBlock[] = [];
+	const keepMediaSet = opts?.keepMediaIds === undefined ? null : new Set(opts.keepMediaIds);
+	const seenMediaIds = new Set<string>();
 	const textFileBlocks: EditableUserContentBlock[] = [];
 
 	for (const block of blocks) {
+		if (isMediaContentBlock(block)) {
+			if (keepMediaSet && !keepMediaSet.has(block.mediaId)) continue;
+			if (!seenMediaIds.has(block.mediaId))
+				mediaBlocks.push(mediaRefToContentBlock(block, fallbackUploadNarratorId));
+			seenMediaIds.add(block.mediaId);
+			continue;
+		}
 		if (
 			block.type === "image" &&
 			typeof block.imageId === "string" &&
@@ -6507,7 +6728,14 @@ function buildEditedUserContentJson(
 	const references = freezeFileReferenceSnapshots(
 		opts?.fileReferences ?? getFileReferenceSnapshots(contentJson),
 	);
-	return [...imageBlocks, ...textFileBlocks, ...references, { type: "text", text: newContent }];
+	return [
+		...imageBlocks,
+		...mediaBlocks,
+		...(opts?.newMedia ?? []).map((item) => mediaRefToContentBlock(item, fallbackUploadNarratorId)),
+		...textFileBlocks,
+		...references,
+		{ type: "text", text: newContent },
+	];
 }
 
 /**
@@ -6543,6 +6771,8 @@ export interface EditAndRegenerateOptions {
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
 	fileReferences?: FileReferenceSnapshot[];
 	keepImageIds?: string[];
+	keepMediaIds?: string[];
+	newMedia?: File[];
 	newImages?: File[];
 	keepTextFilePaths?: string[];
 	newTextFiles?: File[];
@@ -6618,6 +6848,28 @@ async function editAndRegenerateUnlocked(
 		.filter((block) => block.type === "text_file" && typeof block.filePath === "string")
 		.map((block) => block.filePath as string);
 	const keepImageIds = resolveRequestedAttachmentKeys(actualImageIds, opts?.keepImageIds);
+	const actualMedia = originalBlocks.filter(
+		(block): block is Record<string, unknown> & MediaContentBlock => isMediaContentBlock(block),
+	);
+	const keepMediaIds = resolveRequestedAttachmentKeys(
+		actualMedia.map((item) => item.mediaId),
+		opts?.keepMediaIds,
+	);
+	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
+		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	let retainedAttachmentBytes = 0;
+	const countedMediaIds = new Set<string>();
+	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
+		const owner = item.uploadNarratorId || targetMsg.narratorId;
+		const mediaPath = getMediaPath(owner, item.mediaId);
+		if (!mediaPath) throw new ValidationError(`Attached media not found: ${item.filename}`);
+		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
+		if (!countedMediaIds.has(mediaKey)) {
+			countedMediaIds.add(mediaKey);
+			retainedAttachmentBytes += Bun.file(mediaPath).size;
+		}
+	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
 		actualTextFilePaths,
 		opts?.keepTextFilePaths,
@@ -6638,6 +6890,12 @@ async function editAndRegenerateUnlocked(
 					.filter((_, index) => keepTextFilePaths.includes(actualTextFilePaths[index])),
 				...(opts?.newTextFiles ?? []),
 			],
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "audio" || asset.kind === "video")
+					.filter((_, index) => keepMediaIds.includes(actualMedia[index]?.mediaId)),
+				...(opts?.newMedia ?? []),
+			],
 		);
 	}
 	validateComposerAssets(
@@ -6654,13 +6912,18 @@ async function editAndRegenerateUnlocked(
 			),
 			...(opts?.newTextFiles ?? []),
 		],
+		[
+			...actualMedia.filter((item) => keepMediaIds.includes(item.mediaId)),
+			...(opts?.newMedia ?? []),
+		],
 	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])].reduce(
-		(total, file) => total + file.size,
-		0,
-	);
+	const uploadBytes = [
+		...(opts?.newImages ?? []),
+		...(opts?.newTextFiles ?? []),
+		...(opts?.newMedia ?? []),
+	].reduce((total, file) => total + file.size, 0);
 	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 	}
@@ -6676,9 +6939,10 @@ async function editAndRegenerateUnlocked(
 	if (
 		!newContent.trim() &&
 		keepImageIds.length === 0 &&
+		keepMediaIds.length === 0 &&
 		keepTextFilePaths.length === 0 &&
 		selectedReferences.length === 0 &&
-		!(opts?.newImages?.length || opts?.newTextFiles?.length)
+		!(opts?.newImages?.length || opts?.newTextFiles?.length || opts?.newMedia?.length)
 	) {
 		throw new ValidationError("content is required");
 	}
@@ -6692,7 +6956,6 @@ async function editAndRegenerateUnlocked(
 	const keepTextFileSet = new Set(keepTextFilePaths);
 	const countedImageIds = new Set<string>();
 	const countedTextFilePaths = new Set<string>();
-	let retainedAttachmentBytes = 0;
 	const textFilesToCopy = new Map<string, TextFileRef>();
 	for (const block of originalBlocks) {
 		if (
@@ -6806,14 +7069,22 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const createdImageIds: string[] = [];
+	const createdMediaIds: string[] = [];
 	const createdFilePaths: string[] = [];
 	let copyOnWriteSucceeded = false;
 	let privateMessageId: string;
 	let newContentJson: EditableUserContentBlock[];
 	let existingImages: ImageRef[];
+	let existingMedia: MediaRef[];
 	let existingTextFiles: TextFileRef[];
 	let effectivePrompt: string;
 	try {
+		const savedNewMedia: MediaRef[] = [];
+		for (const file of opts?.newMedia ?? []) {
+			const item = await saveUploadedMedia(narratorId, file);
+			createdMediaIds.push(item.mediaId);
+			savedNewMedia.push(item);
+		}
 		const savedNewImages: ImageRef[] = [];
 		for (const file of opts?.newImages ?? []) {
 			const ref = await saveUploadedImage(narratorId, file);
@@ -6851,14 +7122,21 @@ async function editAndRegenerateUnlocked(
 			fallbackUploadNarratorId: targetMsg.narratorId,
 			keepImageIds,
 			newImages: savedNewImages,
+			keepMediaIds,
+			newMedia: savedNewMedia,
 			keepTextFilePaths: relocatedKeepTextFilePaths,
 			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
 			fileReferences: selectedReferences,
 		});
 		existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
+		existingMedia = newContentJson.filter(isMediaContentBlock);
 		existingTextFiles = extractTextFileRefs(newContentJson);
 		const effectiveText =
-			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
+			!newContent.trim() && newContentJson.some(isMediaContentBlock)
+				? "[user sent media]"
+				: !newContent.trim() && existingImages.length > 0
+					? "[user sent image(s)]"
+					: newContent;
 		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
 
 		// A loop may have started while the files were being materialized (the route
@@ -6879,6 +7157,7 @@ async function editAndRegenerateUnlocked(
 		copyOnWriteSucceeded = true;
 	} catch (error) {
 		if (!copyOnWriteSucceeded) {
+			for (const mediaId of createdMediaIds) deleteUploadedMedia(narratorId, mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(narratorId, imageId);
 			deleteCreatedAttachmentFiles(createdFilePaths);
 		}
@@ -6931,7 +7210,7 @@ async function editAndRegenerateUnlocked(
 		active,
 		projectFileReferenceText(effectivePrompt, selectedReferences),
 		imageRefs.length > 0 ? imageRefs : undefined,
-		{ principal: opts?.userId },
+		{ principal: opts?.userId, media: existingMedia.length > 0 ? existingMedia : undefined },
 	).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
 			narratorId,

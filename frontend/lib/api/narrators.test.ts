@@ -879,6 +879,90 @@ describe("narrators API", () => {
 		}
 	});
 
+	describe("native media request fields", () => {
+		test.each([
+			"audio/wav",
+			"video/mp4",
+		])("media-only %s send/edit/queue use binary multipart and preserve explicit keep lists", async (mediaType) => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => null },
+				configurable: true,
+			});
+			const requests: RequestInit[] = [];
+			Object.defineProperty(g, "fetch", {
+				configurable: true,
+				value: async (_url: unknown, init: RequestInit) => {
+					requests.push(init);
+					return Response.json({ ok: true });
+				},
+			});
+			const originalXHR = Object.getOwnPropertyDescriptor(globalThis, "XMLHttpRequest");
+			class MediaXHR {
+				status = 200;
+				statusText = "OK";
+				responseText = '{"ok":true}';
+				onload: (() => void) | null = null;
+				open() {}
+				setRequestHeader() {}
+				getAllResponseHeaders() {
+					return "Content-Type: application/json";
+				}
+				send(body: FormData) {
+					requests.push({ method: "POST", body });
+					queueMicrotask(() => this.onload?.());
+				}
+			}
+			Object.defineProperty(globalThis, "XMLHttpRequest", { value: MediaXHR, configurable: true });
+			try {
+				const file = new File(
+					[new Uint8Array([0, 255, 128])],
+					mediaType === "audio/wav" ? "voice.wav" : "clip.mp4",
+					{ type: mediaType },
+				);
+				await api.sendNarratorMessage(
+					"n",
+					"",
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					[file],
+				);
+				for (const keepMediaIds of [undefined, [], ["kept-media"]]) {
+					await api.editAndRegenerate("n", "m", "", { keepMediaIds, newMedia: [file] });
+					await api.updateBufferedMessage("n", "q", "", { keepMediaIds, newMedia: [file] });
+					for (const request of requests.splice(0)) {
+						expect(request.body).toBeInstanceOf(FormData);
+						const form = request.body as FormData;
+						expect(form.getAll("media")).toHaveLength(1);
+						expect(form.getAll("images")).toEqual([]);
+						expect(form.getAll("textFiles")).toEqual([]);
+						expect(new Uint8Array(await (form.get("media") as File).arrayBuffer())).toEqual(
+							new Uint8Array([0, 255, 128]),
+						);
+						if (!form.has("message")) {
+							expect(form.has("keepMediaIds")).toBe(keepMediaIds !== undefined);
+							if (keepMediaIds !== undefined)
+								expect(JSON.parse(String(form.get("keepMediaIds")))).toEqual(keepMediaIds);
+						}
+					}
+				}
+				await api.editAndRegenerate("n", "m", "text only", { keepMediaIds: [] });
+				await api.updateBufferedMessage("n", "q", "text only", { keepMediaIds: [] });
+				for (const request of requests)
+					expect(JSON.parse(String(request.body)).keepMediaIds).toEqual([]);
+			} finally {
+				if (originalXHR) Object.defineProperty(globalThis, "XMLHttpRequest", originalXHR);
+				else Reflect.deleteProperty(globalThis, "XMLHttpRequest");
+			}
+		});
+	});
+
 	describe("interrupt-and-insert request fields", () => {
 		test.each([
 			false,

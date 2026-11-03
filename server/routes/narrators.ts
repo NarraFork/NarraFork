@@ -10,6 +10,11 @@ import {
 	type FileReferenceSnapshot,
 	fileReferenceMessageForDisplay,
 } from "@shared/file-reference";
+import {
+	isMediaContentBlock,
+	MAX_MEDIA_ATTACHMENTS,
+	type MediaRef,
+} from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import {
@@ -50,10 +55,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
-import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
-import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token-timeout";
-import type { ResponseFormat } from "../lib/agent/provider";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
@@ -90,12 +92,19 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
 	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../lib/composer-document";
-import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
+import {
+	AppError,
+	catalogError,
+	NotFoundError,
+	ValidationError,
+	zodValidationError,
+} from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import {
 	parseFileReferenceInput,
@@ -103,6 +112,11 @@ import {
 } from "../lib/file-reference-input";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import {
+	deleteUploadedMedia,
+	saveUploadedMedia,
+	validateUploadedMedia,
+} from "../lib/media-uploads";
 import {
 	getAuthorizedNarrator,
 	narratorPrincipalOf,
@@ -149,23 +163,10 @@ import {
 	resolveSetupAuthorization,
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
-import {
-	getOptimizeOutputSchema,
-	getPromptOptimizeInstruction,
-	OPTIMIZE_OUTPUT_SCHEMA_NAME,
-	OPTIMIZE_SUMMARY_FIELD,
-	type PromptOptimizeStyle,
-	readOptimizeResult,
-} from "../lib/prompts/prompt-optimize";
-import { normalizeOptimizedPrompt } from "../lib/prompts/prompt-optimize-output";
+import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
-import {
-	FOLLOW_DEFAULT_MODEL,
-	getQueueDuringCompaction,
-	resolveEffectiveModel,
-	settings,
-} from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -400,6 +401,7 @@ import {
 	isCompactInProgress,
 	isLoopRunning,
 	isNarratorActive,
+	isOutlineSessionGoal,
 	normalizeRollbackBlockIndexForMessage,
 	persistGoalAddedNotice,
 	readSessionDeliverTo,
@@ -484,6 +486,7 @@ import {
 	resolveSubagentModelInheritance,
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
+import { resolveTaskBackend } from "../services/task-source";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -522,6 +525,7 @@ export async function parseMessageRequest(
 ): Promise<{
 	message: string;
 	images: ImageRef[];
+	media: MediaRef[];
 	textFiles: File[];
 	priority?: boolean;
 	interrupt?: boolean;
@@ -536,13 +540,24 @@ export async function parseMessageRequest(
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
-		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
-		const composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
-		const message = restoreMultipartComposerText(
+		let fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
+		let composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		let message = restoreMultipartComposerText(
 			typeof rawMessage === "string" ? rawMessage : "",
 			composerDocument,
 		);
 		validateComposerProjection(composerDocument, message, fileReferences);
+		const mediaFiles = formData.getAll("media") as File[];
+		if (mediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+			throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+		const mediaMetadata: Array<{ filename: string; size: number; mediaType: string }> = [];
+		for (const file of mediaFiles) {
+			mediaMetadata.push({
+				filename: file.name,
+				size: file.size,
+				mediaType: await validateUploadedMedia(file),
+			});
+		}
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -559,6 +574,7 @@ export async function parseMessageRequest(
 		if (
 			!message.trim() &&
 			imageFiles.length === 0 &&
+			mediaFiles.length === 0 &&
 			textFileEntries.length === 0 &&
 			!fileReferences?.length
 		) {
@@ -572,9 +588,16 @@ export async function parseMessageRequest(
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 		}
-		validateComposerAssets(composerDocument, imageFiles, textFileEntries);
+		({
+			document: composerDocument,
+			text: message,
+			references: fileReferences,
+		} = bindComposerMediaProjection(composerDocument, message, fileReferences, mediaMetadata));
+		validateComposerAssets(composerDocument, imageFiles, textFileEntries, mediaMetadata);
 		const images: ImageRef[] = [];
+		const media: MediaRef[] = [];
 		try {
+			for (const file of mediaFiles) media.push(await saveUploadedMedia(narratorId, file));
 			for (const file of imageFiles) {
 				const image = await saveUploadedImage(narratorId, file);
 				images.push(
@@ -592,12 +615,14 @@ export async function parseMessageRequest(
 					// Best-effort: the original failure is what the caller needs to see.
 				}
 			}
+			for (const item of media) deleteUploadedMedia(narratorId, item.mediaId);
 			throw error;
 		}
 		const priority = formData.get("priority") === "true";
 		return {
 			message,
 			images,
+			media,
 			textFiles: textFileEntries,
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
@@ -618,6 +643,7 @@ export async function parseMessageRequest(
 	return {
 		message: parsed.data.message,
 		images: [],
+		media: [],
 		textFiles: [],
 		priority: parsed.data.priority,
 		interrupt: parsed.data.interrupt,
@@ -1648,6 +1674,15 @@ narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 	return c.json({
 		composerDocument: message.composerDocument ?? undefined,
 		images,
+		media: Array.isArray(blocks)
+			? blocks.filter(isMediaContentBlock).map((media) => ({
+					mediaId: media.mediaId,
+					filename: media.filename,
+					mediaType: media.mediaType,
+					size: media.size,
+					uploadNarratorId: media.uploadNarratorId ?? id,
+				}))
+			: [],
 		textFiles,
 		bodyRevision: message.bodyRevision,
 		text: Array.isArray(blocks)
@@ -1688,6 +1723,7 @@ narratorRoutes.get("/:id/buffer/:mid/composer-document", async (c) => {
 	return c.json({
 		composerDocument: message.composerDocument,
 		images,
+		media: message.media ?? [],
 		textFiles,
 		text: message.text,
 		fileReferences: (message.fileReferences ?? []).map((snapshot) => snapshot.reference),
@@ -1872,15 +1908,7 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	const body = await c.req.json();
 	const { text, style, withContext, messageId } = optimizePromptSchema.parse(body);
 
-	// Get system instruction for the chosen style
 	const locale = await getUserLanguage(userId);
-	let systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
-	// Multi-segment drafts wrap each segment in <<<NF_..._n>>> ... <<<NF_..._n_END>>> markers
-	// that the client uses to put results back; the model must echo them verbatim.
-	if (/<<<NF_[^>\n]+>>>/.test(text)) {
-		systemInstruction +=
-			"\n\nSEGMENT MARKERS: The draft contains several segments delimited by marker lines like <<<NF_xxx_0>>> and <<<NF_xxx_0_END>>>. Optimize each segment's content separately, and output every marker line EXACTLY as given, in the original order, each on its own line, with each segment's result between its start and end markers. Never merge, drop, reorder or alter markers, and add nothing outside them. This overrides the instruction to output only the prompt text.";
-	}
 
 	// Load context if requested
 	let contextText = "";
@@ -1893,76 +1921,15 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 		contextText = formatMessagesAsContext(contextMessages);
 	}
 
-	// Tag the user's text to prevent prompt injection
-	const taggedContent = contextText
-		? `${contextText}\n\n---\n\n<prompt>\n${text}\n</prompt>`
-		: `<prompt>\n${text}\n</prompt>`;
-
-	// Resolve the model (default follows summaryModel via __summary__)
-	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
-
-	// Ask for the optimized text as a schema-constrained object when the resolved
-	// adapter can express one. `responseFormatDegraded` reports adapters that
-	// cannot (they must not silently ignore it), and the text path below is then
-	// the only source of truth.
-	const responseFormat: ResponseFormat = {
-		type: "json_schema",
-		name: OPTIMIZE_OUTPUT_SCHEMA_NAME,
-		schema: getOptimizeOutputSchema(),
-		strict: true,
-		// Lets the provider layer lift the rationale without knowing field names.
-		summaryField: OPTIMIZE_SUMMARY_FIELD,
-	};
-
-	// Follow the configured first-token budget; output clears the timer. Request
-	// cancellation remains connected to the provider throughout generation.
-	const generated = await generateWithFirstTokenTimeout(
-		(options) =>
-			summaryGenerate(
-				taggedContent,
-				systemInstruction,
-				{ narratorId, kind: "optimize" },
-				options.signal,
-				options.onTextDelta,
-				model,
-				undefined,
-				false,
-				options.onReasoningDelta,
-				undefined,
-				undefined,
-				{ responseFormat, onGenerationProgress: options.onGenerationProgress },
-			),
-		settings.agent.firstTokenTimeoutMs,
-		c.req.raw.signal,
-	).catch((err: unknown) => {
-		if (err instanceof Error && err.name === "TimeoutError") {
-			throw new ValidationError(err.message);
-		}
-		throw err;
+	const result = await runPromptOptimize({
+		text,
+		style,
+		locale,
+		contextText,
+		narratorId,
+		signal: c.req.raw.signal,
 	});
-
-	if (generated.responseFormatDegraded) {
-		// Log loss of native schema enforcement; validated fields remain usable.
-		logger.warn("Prompt optimize fell back to text parsing", {
-			narratorId,
-			model,
-			reason: generated.responseFormatDegraded,
-		});
-	}
-
-	const structured = readOptimizeResult(generated.structured);
-	// Failed or incomplete schema output is not prompt text. Keep the draft rather
-	// than leaking the raw JSON envelope (or a partial rewrite) into the composer.
-	if (generated.outputTruncated || (generated.structured !== undefined && !structured)) {
-		return c.json({ text, model });
-	}
-	// The validated field is already the payload; only plaintext fallback needs
-	// wrapper removal. Its examples, headings and literal thinking tags are content.
-	const result = structured?.optimizedPrompt ?? normalizeOptimizedPrompt(generated.text, text);
-	if (!structured && result.startsWith("{")) return c.json({ text, model });
-	const reasoningSummary = structured?.reasoningSummary ?? generated.reasoningSummary;
-
-	return c.json({ text: result, model, ...(reasoningSummary ? { reasoningSummary } : {}) });
+	return c.json(result);
 });
 
 // Get usage stats for this narrator, optionally including direct subagents.
@@ -2178,6 +2145,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const {
 		message,
 		images,
+		media,
 		textFiles,
 		priority: requestedPriority,
 		interrupt: requestedInterrupt,
@@ -2335,6 +2303,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// queue the command and append/start it once the buffer consumer reaches it;
 		// this avoids mutating tasks.json in the middle of the current turn.
 		if (cmdResult.resolved && "specGoal" in cmdResult) {
+			// A session whose tasks live in the outline has no tasks.json to add the goal to; its
+			// `/goal` (a person-created, locked task) arrives with the task board (plan PR 5).
+			// Refused before anything is persisted, so nothing lands where the session cannot see.
+			if ((await resolveTaskBackend(id)) === "outline") {
+				throw catalogError("GOAL_IN_OUTLINE_SESSION");
+			}
 			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
 			// A compacting narrator counts as busy here for the same reason a running one
 			// does: appending the protected task now and starting its Spec turn would run
@@ -2478,16 +2452,21 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			});
 			const locale = await getUserLanguage(userId);
 			const replyInUserLanguage = await getUserReplyInLanguage(userId);
-			if (queuedNewCommand.initialMessage) {
+			if (queuedNewCommand.initialMessage || media.length > 0) {
 				await sendMessage(
 					newNarrator.id,
-					queuedNewCommand.initialMessage,
+					queuedNewCommand.initialMessage ?? "",
 					images,
 					locale,
 					replyInUserLanguage,
 					undefined,
 					userId,
 					textFiles,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					media,
 				);
 				uploadsAccepted = true;
 			}
@@ -2516,6 +2495,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// behind an existing owner/backlog. HTTP status observations never decide admission.
 		const result = await acceptUserMessage(id, finalMessage, {
 			images,
+			media,
 			locale,
 			replyInUserLanguage,
 			commandText,
@@ -2547,6 +2527,16 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		return c.json(fileReferenceMessageForDisplay(result.userMsg), 201);
 	} finally {
 		if (!uploadsAccepted) {
+			for (const item of media) {
+				try {
+					deleteUploadedMedia(id, item.mediaId);
+				} catch (error) {
+					logger.warn("Failed to clean rejected media upload", {
+						mediaId: item.mediaId,
+						error: String(error),
+					});
+				}
+			}
 			for (const image of images) {
 				try {
 					deleteUploadedImage(id, image.imageId);
@@ -2817,10 +2807,12 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	let scope: RevertScope | undefined;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
+	let keepMediaIds: string[] | undefined;
 	// undefined => keep all existing text files (legacy); array => keep only these paths.
 	let keepTextFilePaths: string[] | undefined;
 	// Editing uploads are only parsed/validated here. The service owns every file write.
 	const newImages: File[] = [];
+	const newMedia: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const parseJsonStringArray = (raw: FormDataEntryValue | null, field: string): string[] => {
@@ -2860,6 +2852,8 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 				throw new ValidationError("Invalid confirmed revert plan");
 			}
 		}
+		if (formData.has("keepMediaIds"))
+			keepMediaIds = parseJsonStringArray(formData.get("keepMediaIds"), "keepMediaIds");
 		if (typeof formData.get("keepImageIds") === "string") {
 			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
 		}
@@ -2869,6 +2863,21 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 				"keepTextFilePaths",
 			);
 		}
+		const mediaFiles = formData.getAll("media") as File[];
+		if (mediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+			throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+		const detectedMedia = [];
+		for (const file of mediaFiles)
+			detectedMedia.push({
+				filename: file.name,
+				size: file.size,
+				mediaType: await validateUploadedMedia(file),
+			});
+		({
+			document: composerDocument,
+			text: content,
+			references: fileReferences,
+		} = bindComposerMediaProjection(composerDocument, content, fileReferences, detectedMedia));
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -2887,7 +2896,8 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 			validateTextFile(file);
 			newTextFiles.push(file);
 		}
-		const attachmentBytes = [...imageFiles, ...textFileEntries].reduce(
+		newMedia.push(...mediaFiles);
+		const attachmentBytes = [...imageFiles, ...textFileEntries, ...mediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
@@ -2904,6 +2914,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 		revertPlan = body.revertPlan;
 		scope = body.scope;
 		keepImageIds = body.keepImageIds;
+		keepMediaIds = body.keepMediaIds;
 		keepTextFilePaths = body.keepTextFilePaths;
 	}
 
@@ -2951,6 +2962,8 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 		fileReferences: snapshots,
 		composerDocument,
 		keepImageIds,
+		keepMediaIds,
+		newMedia: newMedia.length ? newMedia : undefined,
 		newImages: newImages.length > 0 ? newImages : undefined,
 		keepTextFilePaths,
 		newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
@@ -3115,8 +3128,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	let fileReferences: FileReference[] | undefined;
 	let composerDocument: ComposerDocument | undefined;
 	let keepImageIds: string[] | undefined;
+	let keepMediaIds: string[] | undefined;
 	let keepTextFiles: Array<{ index: number; filename: string }> | undefined;
 	const newImageFiles: File[] = [];
+	const newMediaFiles: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const contentType = c.req.header("content-type") ?? "";
@@ -3128,6 +3143,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			...(rawText !== undefined ? { text: rawText } : {}),
 			fileReferences: parseFileReferenceInput(formData.get("fileReferences")),
 			composerDocument: parseOptionalComposerDocument(formData.get("composerDocument")),
+			...(formData.has("keepMediaIds")
+				? { keepMediaIds: parseJsonArrayField(formData.get("keepMediaIds"), "keepMediaIds") }
+				: {}),
 			...(formData.has("keepImageIds")
 				? { keepImageIds: parseJsonArrayField(formData.get("keepImageIds"), "keepImageIds") }
 				: {}),
@@ -3137,11 +3155,16 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		});
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 		keepImageIds = parsed.data.keepImageIds;
+		keepMediaIds = parsed.data.keepMediaIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
 		if (rawText !== undefined) rawText = restoreMultipartComposerText(rawText, composerDocument);
 
+		for (const file of formData.getAll("media") as File[]) {
+			await validateUploadedMedia(file);
+			newMediaFiles.push(file);
+		}
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
 			newImageFiles.push(file);
@@ -3150,7 +3173,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			validateTextFile(file);
 			newTextFiles.push(file);
 		}
-		const uploadBytes = [...newImageFiles, ...newTextFiles].reduce(
+		const uploadBytes = [...newImageFiles, ...newTextFiles, ...newMediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
@@ -3162,6 +3185,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 		rawText = parsed.data.text;
 		keepImageIds = parsed.data.keepImageIds;
+		keepMediaIds = parsed.data.keepMediaIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
@@ -3172,7 +3196,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// Omitted text keeps the current wording, so a client that only manages
 	// attachments does not have to echo the message body back.
-	const text = composerDocument
+	let text = composerDocument
 		? (rawText ?? located.message.text)
 		: (rawText ?? located.message.text).trim();
 	const { keptImages, keptTextFileIndexes } = resolveKeptBufferAttachments(
@@ -3181,6 +3205,40 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles,
 	);
 
+	if (
+		keepMediaIds?.some(
+			(mediaId) => !(located.message.media ?? []).some((item) => item.mediaId === mediaId),
+		)
+	) {
+		throw new ValidationError(
+			"Queued attachments changed since this edit started; reload and try again",
+		);
+	}
+	const keptMedia = (located.message.media ?? []).filter(
+		(item) => keepMediaIds === undefined || keepMediaIds.includes(item.mediaId),
+	);
+	const detectedMedia = await Promise.all(
+		newMediaFiles.map(async (file) => ({
+			filename: file.name,
+			size: file.size,
+			mediaType: await validateUploadedMedia(file),
+		})),
+	);
+	const normalized = bindComposerMediaProjection(
+		composerDocument,
+		text,
+		fileReferences ?? located.message.fileReferences?.map((snapshot) => snapshot.reference),
+		[...keptMedia, ...detectedMedia],
+	);
+	composerDocument = normalized.document;
+	text = normalized.text;
+	// Persist the normalized projection even when the client omitted references and
+	// the queue's existing snapshots supplied them. The replacement helper reuses
+	// their captured bytes while updating the projected ranges.
+	if (fileReferences !== undefined || (composerDocument && located.message.fileReferences?.length))
+		fileReferences = normalized.references;
+	if (keptMedia.length + newMediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	if (keptImages.length + newImageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 	}
@@ -3200,6 +3258,18 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	) {
 		throw new ValidationError("File references are not supported by queued /new or /goal commands");
 	}
+	// Nor the outline session's refusal of /goal: an edit must not turn a queued message into one.
+	if (
+		await isOutlineSessionGoal(
+			id,
+			text,
+			located.message.commandText,
+			composerDocument,
+			located.message.executionIntent,
+		)
+	) {
+		throw catalogError("GOAL_IN_OUTLINE_SESSION");
+	}
 	const snapshots = await replaceFileReferenceSnapshots(
 		located.message.fileReferences ?? [],
 		fileReferences,
@@ -3212,7 +3282,13 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
 	const finalTextFileCount = keptTextFileIndexes.length + newTextFiles.length;
-	if (!text && finalImageCount === 0 && finalTextFileCount === 0 && finalReferenceCount === 0) {
+	if (
+		!text &&
+		finalImageCount === 0 &&
+		finalTextFileCount === 0 &&
+		finalReferenceCount === 0 &&
+		keptMedia.length + newMediaFiles.length === 0
+	) {
 		throw new ValidationError("Message cannot be empty");
 	}
 
@@ -3231,6 +3307,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// Everything this request writes to disk, so a failure leaves nothing behind.
 	const createdImageIds: string[] = [];
+	const createdMedia: MediaRef[] = [];
 	let createdSavedFiles: SavedBufferedFile[] = [];
 	let committed = false;
 	try {
@@ -3243,6 +3320,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			);
 		}
 
+		for (const file of newMediaFiles) createdMedia.push(await saveUploadedMedia(id, file));
 		// Both actor types retain the same saved paths; never re-upload kept Files.
 		createdSavedFiles = newTextFiles.length
 			? await persistAdditionalBufferedTextFiles(
@@ -3254,6 +3332,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
 		const ok = await updateBufferedMessage(id, mid, text, {
 			images: [...keptImages, ...newImages],
+			media: [...keptMedia, ...createdMedia],
 			savedFiles,
 			fileReferences: snapshots,
 			composerDocument,
@@ -3262,6 +3341,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		committed = true;
 	} finally {
 		if (!committed) {
+			for (const item of createdMedia) deleteUploadedMedia(id, item.mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(id, imageId);
 			for (const file of createdSavedFiles) deleteBufferedTextFile(file);
 		}
@@ -3272,6 +3352,8 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	for (const image of droppedImages) {
 		deleteUploadedImage(image.uploadNarratorId ?? id, image.imageId);
 	}
+	// A source-owned media reference may also be used by a fork. Removing a ref
+	// never deletes shared bytes; only newly-created uncommitted uploads are rolled back.
 	for (const file of droppedSavedFiles) deleteBufferedTextFile(file);
 
 	await broadcastBufferQueue(id);

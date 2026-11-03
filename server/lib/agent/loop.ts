@@ -2,6 +2,13 @@ import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
 import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
+import {
+	MEDIA_MIME_TO_EXT,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+	type NativeMediaInput,
+} from "@shared/media-attachments";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -60,6 +67,7 @@ import { countInputCharacters } from "./input-characters";
 import { LoopTranscript, type TranscriptImage } from "./loop-transcript";
 import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
 import { rememberModelTraceRequest } from "./modeltrace-request";
+import { assertNativeMediaPayload, splitNativeMediaReferences } from "./native-media";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type DbMessage, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectQuestionModelInput } from "./question-model-input";
@@ -86,6 +94,7 @@ import {
 import {
 	executeTool,
 	freezeToolExecution,
+	getOutlineSpecRejection,
 	getReflectionToolRejection,
 	preAdmitToolExecution,
 	releaseToolAdmissionState,
@@ -2074,8 +2083,15 @@ export async function shouldRunExitPlanModeReflectionLive(
 	});
 }
 
-export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
-	return !config.reflectionLoop;
+/**
+ * taskReflection guards protected tasks in `spec://tasks.json`. It never runs in a reflection
+ * loop, nor in a session whose tasks live in the outline (plan §8 trade-off 3: outline sessions
+ * get no task reflection; their `spec://` is closed anyway).
+ */
+export function shouldRunTaskReflection(
+	config: Pick<AgentConfig, "reflectionLoop" | "taskBackend">,
+): boolean {
+	return !config.reflectionLoop && config.taskBackend !== "outline";
 }
 
 function normalizeEditText(text: string): string {
@@ -2469,6 +2485,13 @@ async function executeToolAfterReflections(
 		releaseToolAdmissionState(admissionState);
 		return reflectionRejection;
 	}
+	// Before admission, permission and the reflections: an outline session has no `spec://`,
+	// so neither a permission prompt nor taskReflection may start for one.
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		releaseToolAdmissionState(admissionState);
+		return outlineSpecRejection;
+	}
 	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
 	let preAdmissionComplete = options.preAdmissionComplete === true;
 	if (!preAdmissionComplete || !admissionState.startGrant) {
@@ -2658,6 +2681,40 @@ async function executeToolAfterReflections(
 	}
 }
 
+/** Create per-execution durable media conversion with identity deduplication. */
+export function createDurableMediaReferences(config: Pick<AgentConfig, "narratorId" | "signal">) {
+	const savedMedia = new WeakMap<NativeMediaInput, Promise<MediaContentBlock>>();
+	return async (
+		inputs: readonly (MediaRef | NativeMediaInput)[] = [],
+	): Promise<MediaContentBlock[]> =>
+		Promise.all(
+			inputs.map(async (item) => {
+				if ("mediaId" in item) return mediaRefToContentBlock(item, config.narratorId);
+				let saved = savedMedia.get(item);
+				if (!saved) {
+					assertNativeMediaPayload(item);
+					config.signal.throwIfAborted();
+					const { saveUploadedMedia, deleteUploadedMedia } = await import("../media-uploads");
+					const filename = item.filename ?? `attachment${MEDIA_MIME_TO_EXT[item.mediaType] ?? ""}`;
+					saved = saveUploadedMedia(
+						config.narratorId,
+						new File([new Uint8Array(Buffer.from(item.base64, "base64"))], filename, {
+							type: item.mediaType,
+						}),
+					).then((ref) => {
+						if (config.signal.aborted) {
+							deleteUploadedMedia(config.narratorId, ref.mediaId);
+							config.signal.throwIfAborted();
+						}
+						return mediaRefToContentBlock(ref, config.narratorId);
+					});
+					savedMedia.set(item, saved);
+				}
+				return saved;
+			}),
+		);
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -2673,6 +2730,7 @@ async function* agentLoopInMetadataSnapshot(
 	userText: string,
 	initialHistory: AgentLoopHistory = { rows: [] },
 	images?: Array<{ format: string; base64: string }>,
+	media?: readonly (MediaRef | NativeMediaInput)[],
 ): AsyncGenerator<AgentEvent> {
 	const guidanceSignal =
 		config.guidanceSignal && config.urgentGuidanceSignal
@@ -2703,16 +2761,28 @@ async function* agentLoopInMetadataSnapshot(
 	);
 	const locale = (config.locale as Locale) ?? "en";
 
+	// Durable refs are the transcript's authority. Direct low-level byte inputs are
+	// validated and persisted once, never copied into rows or diagnostic events.
+	const durableMediaReferences = createDurableMediaReferences(config);
+	async function withDurableToolMedia(result: ToolExecResult): Promise<ToolExecResult> {
+		if (!result.media?.length || result.mediaRefs?.length) return result;
+		return { ...result, mediaRefs: await durableMediaReferences(result.media) };
+	}
+
 	/** The conversation this loop's requests are projected from (`loop-transcript.ts`). */
 	const transcript = new LoopTranscript(initialHistory.rows);
 	/** The turn's input until the model has answered it; then it is a transcript row. */
-	let uncommittedInput: { text: string; images?: readonly TranscriptImage[] } = { text: "" };
+	let uncommittedInput: {
+		text: string;
+		images?: readonly TranscriptImage[];
+		media?: readonly MediaRef[];
+	} = { text: "" };
 	/**
 	 * The rows the current request is projected from: the transcript plus the turn's
 	 * input. A reflection gating one of its calls starts from exactly these.
 	 */
 	const requestRows = (): DbMessage[] =>
-		transcript.withInput(uncommittedInput.text, uncommittedInput.images);
+		transcript.withInput(uncommittedInput.text, uncommittedInput.images, uncommittedInput.media);
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
 	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
@@ -2935,6 +3005,7 @@ async function* agentLoopInMetadataSnapshot(
 			updatedInput: brokenInputOverride ?? result.updatedInput,
 			metadata: overrides.metadata ?? result.metadata,
 			...(!result.broken && result.images?.length ? { images: result.images } : {}),
+			...(!result.broken && result.mediaRefs?.length ? { mediaRefs: result.mediaRefs } : {}),
 		};
 	}
 
@@ -3151,6 +3222,8 @@ async function* agentLoopInMetadataSnapshot(
 					: {}),
 			},
 		);
+		if (built.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: built.mediaFallbackWarnings });
 		return withSystemPrompt(built.history);
 	}
 
@@ -3208,6 +3281,8 @@ async function* agentLoopInMetadataSnapshot(
 		}
 		hostHistory = withSystemPrompt(replacement.history);
 		transcript.replace(replacement.rows);
+		if (replacement.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: replacement.mediaFallbackWarnings });
 		// Only a loading-aware rebuild may replace the request's tool view. Candidates and
 		// loading state move together; even an unchanged layout may carry a new tool/schema.
 		if (!inheritedTools && replacement.toolLoading && replacement.toolCandidates) {
@@ -3394,10 +3469,15 @@ async function* agentLoopInMetadataSnapshot(
 			let content = combinePendingInput(baseContent, currentInputParts);
 			nextTurnContent = ""; // consume once
 			const turnImages = isFirstTurn ? images : undefined;
-			uncommittedInput = { text: content, images: turnImages };
+			const turnMedia = isFirstTurn ? await durableMediaReferences(media) : undefined;
+			uncommittedInput = { text: content, images: turnImages, media: turnMedia };
 			/** The model answered the turn's input: from now on it is part of the conversation. */
 			const commitInput = () => {
-				transcript.appendInput(uncommittedInput.text, uncommittedInput.images);
+				transcript.appendInput(
+					uncommittedInput.text,
+					uncommittedInput.images,
+					uncommittedInput.media,
+				);
 				uncommittedInput = { text: "" };
 			};
 
@@ -3569,7 +3649,9 @@ async function* agentLoopInMetadataSnapshot(
 					},
 				});
 				const execution = settleToolExecutionResult(
-					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale),
+					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale).then(
+						withDurableToolMedia,
+					),
 				);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
@@ -4737,10 +4819,32 @@ async function* agentLoopInMetadataSnapshot(
 					// original fragments, not a previously filtered string, so both newly
 					// replayed and newly lifted-out rows are represented exactly once.
 					content = combinePendingInput(baseContent, currentInputParts);
-					uncommittedInput = { text: content, images: turnImages };
-					// A host-built history carries the rows and the input rides beside it as the
-					// current turn; otherwise the transcript plus the input is the whole request.
-					const requestContent = hostHistory ? content : "";
+					uncommittedInput = { text: content, images: turnImages, media: turnMedia };
+					// A host-built history carries prior rows, so separate current media rides
+					// beside it. Otherwise the single row projection handles all media, including
+					// tool results. Re-split the original refs on EVERY attempt/model switch.
+					let requestContent = hostHistory ? content : "";
+					let requestMedia: NativeMediaInput[] | undefined;
+					if (hostHistory && turnMedia?.length) {
+						const projected = splitNativeMediaReferences(
+							turnMedia,
+							effectiveModel,
+							provider,
+							config.narratorId,
+						);
+						if (projected.warnings.length)
+							config.onEvent?.({ type: "media_fallback", warnings: projected.warnings });
+						if (projected.fallbackText)
+							requestContent = [requestContent, projected.fallbackText]
+								.filter(Boolean)
+								.join("\n\n");
+						if (projected.nativeRefs.length) {
+							const { mediaToBase64 } = await import("../media-uploads");
+							requestMedia = await Promise.all(
+								projected.nativeRefs.map((ref) => mediaToBase64(ref, config.narratorId)),
+							);
+						}
+					}
 					const questionInput = projectQuestionModelInput(
 						hostHistory ?? (await projectRows(requestRows())),
 						requestContent,
@@ -4836,6 +4940,7 @@ async function* agentLoopInMetadataSnapshot(
 							}
 						},
 						...(hostHistory && turnImages?.length ? { images: turnImages } : {}),
+						...(requestMedia?.length ? { media: requestMedia } : {}),
 					};
 					const stream = provider.chat(requestParams);
 
@@ -7494,6 +7599,7 @@ async function* agentLoopInMetadataSnapshot(
 					output: result.output,
 					isError: result.isError,
 					images: result.images,
+					mediaRefs: result.mediaRefs,
 					broken: brokenToolUseIds.has(tu.toolUseId),
 				});
 			}
