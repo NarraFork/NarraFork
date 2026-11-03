@@ -4,7 +4,8 @@
  *
  *   S-R3-1  the behavior page is rendered fairly: every block gets a share of the budget (whole
  *           when shorter), so one long block never hides the rules after it; what the short ones
- *           leave goes to the long ones; a page of more rules than fit shows them whole, in order;
+ *           leave goes to the long ones; a page of more rules than fit shows as many rules' starts
+ *           as it can, in order (round 4 changed this from "typical rules whole", N-R4-1);
  *   S-R3-2  with the outline off, the page in the spec fence has a budget of its own (30k
  *           characters, injected on the spec cadence like the whole old fence was), the same
  *           fairness, and a note that points at nothing the agent cannot read;
@@ -178,7 +179,7 @@ describe("S-R3-1: one long block does not hide the rules after it (probe R3-5)",
 		expect(text).toMatch(/\n‹not all shown: 2 blocks are shortened or left out;/);
 	});
 
-	test("a page of more rules than fit shows them whole, in order, and counts the rest", async () => {
+	test("a page of more rules than fit shows as many starts as it can, and counts the rest", async () => {
 		const id = await session();
 		const pageId = await seedBehaviorPage(id, "Rule zero.");
 		await personAdds(
@@ -192,11 +193,18 @@ describe("S-R3-1: one long block does not hide the rules after it (probe R3-5)",
 		const text = await view(id);
 		expect(text.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.behaviorChars);
 		const shown = text.split("\n").filter((line) => /^ {2}- Rule \d+:/.test(line));
-		expect(shown.length).toBeGreaterThan(30);
-		for (const line of shown) expect(line.endsWith("keep this constraint")).toBe(true);
+		// Rules of about 93 characters: shown with 80 of them (more starts than whole rules would
+		// leave room for), in order.
+		expect(shown.length).toBeGreaterThan(40);
+		shown.forEach((line, n) => {
+			expect(line.startsWith(`  - Rule ${n}: keep this constraint`)).toBe(true);
+			expect(line.endsWith("…")).toBe(true);
+		});
 		const hidden = Number(text.match(/‹… (\d+) more›/)?.[1]);
 		expect(hidden).toBe(300 - shown.length);
-		expect(text).toContain(`‹not all shown: ${hidden} blocks are shortened or left out;`);
+		expect(text).toContain(
+			`‹not all shown: ${hidden + shown.length} blocks are shortened or left out;`,
+		);
 	});
 
 	test("on a page of more rules than fit, a long block costs about what a typical rule does", async () => {

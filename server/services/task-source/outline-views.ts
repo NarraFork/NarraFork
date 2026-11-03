@@ -99,8 +99,8 @@ export const OUTLINE_VIEW_LIMITS = {
 	/**
 	 * Characters a block is shown with at most when not even every block's start fits (a page of
 	 * more rules than the view holds). The share is then the length most of the page's blocks
-	 * have (nine in ten), within the minimum and this: typical rules are shown whole, a long one
-	 * cut to about their length, and the last ones are left out.
+	 * have (nine in ten), within the minimum and this, so typical rules are shown whole and the
+	 * last ones are left out; but the minimum when that shows more top-level rules' starts.
 	 */
 	behaviorBlockMaxShare: 400,
 	/**
@@ -444,13 +444,13 @@ function clipContent(content: string, max: number): string {
 /**
  * The share of characters each block is shown with (a block shorter than it is shown whole): the
  * largest one that lets all of `blocks` fit `room`, at least `min`. When not even `min` lets them
- * all fit, the render leaves out the last ones (breadth first); the share is then the length nine
- * in ten blocks do not exceed, within `min` and `cap`, so typical rules are shown whole rather
- * than every one cut short, and a long block costs about what one of them does instead of
- * taking the place of many.
+ * all fit, the render leaves out the last ones (breadth first). The share is then the length nine
+ * in ten blocks do not exceed (within `min` and `cap`), so typical rules are shown whole rather
+ * than every one cut short, unless that shows fewer top-level blocks' starts than `min` does:
+ * then `min`, since a rule's start matters more than the rest of a few (round 4, N-R4-1).
  */
 function fairShare(
-	blocks: ReadonlyArray<{ length: number; overhead: number }>,
+	blocks: ReadonlyArray<{ length: number; overhead: number; top: boolean }>,
 	room: number,
 	min: number,
 	cap: number,
@@ -466,7 +466,19 @@ function fairShare(
 	if (total(min) > room) {
 		const lengths = blocks.map((block) => block.length).sort((a, b) => a - b);
 		const typical = lengths[Math.floor(0.9 * (lengths.length - 1))] ?? min;
-		return { share: Math.min(Math.max(min, typical), Math.max(min, cap)), all: false };
+		const share = Math.min(Math.max(min, typical), Math.max(min, cap));
+		// Top-level blocks whose start a share shows: blocks go in breadth first while they fit.
+		const starts = (each: number) => {
+			let used = 0;
+			let tops = 0;
+			for (const block of blocks) {
+				used += Math.min(block.length, each) + block.overhead;
+				if (used > room) break;
+				if (block.top) tops++;
+			}
+			return tops;
+		};
+		return { share: share > min && starts(share) < starts(min) ? min : share, all: false };
 	}
 	let fits = min;
 	let over = longest;
@@ -516,8 +528,8 @@ interface BehaviorPageRender {
  * fit, never less than `behaviorBlockMinChars`. So one long block (a paragraph of prose an old
  * fence opened with, a 15 KiB piece of an oversize item) shows its start and the rules after it
  * still show, and what the short ones leave goes to the long ones. Only when not even every
- * block's start fits are the last ones (breadth first) left out, the typical ones still whole
- * (`behaviorBlockMaxShare`). `notInFull` counts what is not shown in full.
+ * block's start fits are the last ones (breadth first) left out, with the share that shows the
+ * most top-level rules' starts (see `fairShare`). `notInFull` counts what is not shown in full.
  */
 async function renderBehaviorPage(
 	pageId: string,
@@ -536,13 +548,17 @@ async function renderBehaviorPage(
 	// What each loaded block costs besides its content: the bullet, the indentation of each of
 	// its lines, the line break and the `…` of a shortened one.
 	const depth = new Map<OutlineNode, number>([[root, 0]]);
-	const blocks: Array<{ length: number; overhead: number }> = [];
+	const blocks: Array<{ length: number; overhead: number; top: boolean }> = [];
 	for (const node of order) {
 		if (node.content === null) break;
 		const level = node.parent ? (depth.get(node.parent) ?? 0) + 1 : 0;
 		depth.set(node, level);
 		const lines = 1 + (node.content.match(/\n/g)?.length ?? 0);
-		blocks.push({ length: node.content.length, overhead: lines * (2 * level + 3) + 1 });
+		blocks.push({
+			length: node.content.length,
+			overhead: lines * (2 * level + 3) + 1,
+			top: level === 1,
+		});
 	}
 
 	const fair = fairShare(blocks, maxChars, min, OUTLINE_VIEW_LIMITS.behaviorBlockMaxShare);
