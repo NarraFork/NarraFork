@@ -28,6 +28,8 @@
  */
 import { X509Certificate } from "node:crypto";
 import {
+	EXECUTOR_PLATFORMS,
+	type ExecutorInstallTarget,
 	type ExecutorPlatform,
 	executorInstalledFilename,
 	executorPublishedFilename,
@@ -187,17 +189,26 @@ export function buildExecutorInstallOneLiner(input: {
 	caCertPem?: string;
 }): string {
 	const ca = normalizeInstallCa(input.caCertPem);
+	if (ca) validateUrl("Install script URL", input.scriptUrl, ["https:"]);
+	const quote = input.shell === "powershell" ? powershellSingleQuote : shellSingleQuote;
+	return buildInstallFetchCommand({ shell: input.shell, caCertPem: ca }, quote(input.scriptUrl));
+}
+
+// Callers normalize the CA and supply a quoted URL or a locally selected, validated URL variable.
+function buildInstallFetchCommand(
+	input: { shell: "sh" | "powershell"; caCertPem?: string; universal?: boolean },
+	url: string,
+): string {
+	const ca = input.caCertPem;
 	if (ca) {
-		validateUrl("Install script URL", input.scriptUrl, ["https:"]);
 		if (input.shell === "powershell") {
-			const q = powershellSingleQuote;
 			return [
 				"& { $ErrorActionPreference = 'Stop'",
 				...WINDOWS_CA_CURL_SETUP,
 				"$nfCa = [System.IO.Path]::GetTempFileName()",
 				"try {",
 				`[System.IO.File]::WriteAllBytes($nfCa, [Convert]::FromBase64String('${Buffer.from(ca).toString("base64")}'))`,
-				`$nfScript = & $nfCurl ${WINDOWS_CA_CURL_FLAGS} --max-filesize 1048576 --cacert $nfCa ${q(input.scriptUrl)}`,
+				`$nfScript = & $nfCurl ${WINDOWS_CA_CURL_FLAGS} --max-filesize 1048576 --cacert $nfCa ${url}`,
 				"if ($LASTEXITCODE -ne 0) { throw 'NarraFork install script download failed; check TLS trust and ticket expiry.' }",
 				"if (-not $nfScript) { throw 'NarraFork returned an empty install script.' }",
 				"& ([scriptblock]::Create(($nfScript -join [Environment]::NewLine)))",
@@ -206,33 +217,109 @@ export function buildExecutorInstallOneLiner(input: {
 				.join("; ")
 				.replace("try {;", "try {");
 		}
+	}
+	if (input.shell === "sh" && (ca || input.universal)) {
 		const q = shellSingleQuote;
+		const flags = ca ? CA_CURL_FLAGS : CA_CURL_FLAGS.replaceAll('"=https"', '"=http,https"');
 		const body = [
 			"set -eu",
-			'command -v curl >/dev/null 2>&1 || { echo "NarraFork custom CA installation requires curl." >&2; exit 1; }',
+			`command -v curl >/dev/null 2>&1 || { echo "NarraFork ${ca ? "custom CA " : ""}installation requires curl." >&2; exit 1; }`,
 			"umask 077",
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: shell expansion
 			'd=$(mktemp -d "${TMPDIR:-/tmp}/narrafork-bootstrap.XXXXXX")',
 			`trap 'rm -rf "$d"' EXIT`,
 			"trap 'exit 130' INT",
 			"trap 'exit 143' TERM",
-			`printf '%b' ${q(ca.replaceAll("\n", "\\n"))} > "$d/ca.pem"`,
-			`curl ${CA_CURL_FLAGS} --max-filesize 1048576 --cacert "$d/ca.pem" ${q(input.scriptUrl)} -o "$d/install.sh" || { ${UNIX_FETCH_FAILURE_FALLBACK}; }`,
+			...(ca ? [`printf '%b' ${q(ca.replaceAll("\n", "\\n"))} > "$d/ca.pem"`] : []),
+			`curl ${flags} --max-filesize 1048576 ${ca ? '--cacert "$d/ca.pem" ' : ""}${url} -o "$d/install.sh" || { ${UNIX_FETCH_FAILURE_FALLBACK}; }`,
 			'[ -s "$d/install.sh" ] || { echo "NarraFork returned an empty install script." >&2; exit 1; }',
 			'sh "$d/install.sh"',
 		].join("; ");
 		return `sh -c ${q(body)}`;
 	}
 	if (input.shell === "powershell") {
-		return `irm ${powershellSingleQuote(input.scriptUrl)} | iex`;
+		if (!input.universal) return `irm ${url} | iex`;
+		return `& { $ErrorActionPreference = 'Stop'; $nfScript = Invoke-RestMethod ${url}; if (-not $nfScript) { throw 'NarraFork returned an empty install script.' }; & ([scriptblock]::Create($nfScript)) }`;
 	}
 	// The inner curl is single-quoted for sh; the outer layer is a double-quoted
 	// command substitution so the fetched text is executed, not word-split. The
 	// fallback is quoted the same way, because it too is text the outer shell runs.
 	return (
-		`sh -c "$(curl -fsSL ${shellSingleQuote(input.scriptUrl)}` +
-		` || echo ${shellSingleQuote(UNIX_FETCH_FAILURE_FALLBACK)})"`
+		`sh -c "$(curl -fsSL ${url}` + ` || echo ${shellSingleQuote(UNIX_FETCH_FAILURE_FALLBACK)})"`
 	);
+}
+
+// Prefer the native architecture over an emulated PowerShell process architecture.
+const WINDOWS_NATIVE_ARCH_SETUP = [
+	"if ($env:OS -ne 'Windows_NT') { throw 'NarraFork Windows installation requires Windows.' }",
+	"$actualArch = $env:PROCESSOR_ARCHITEW6432",
+	"if (-not $actualArch) { try { $actualArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { $actualArch = $env:PROCESSOR_ARCHITECTURE } }",
+	"switch -Regex ($actualArch) { '^(AMD64|x64|x86_64)$' { $actualArch = 'AMD64'; break } '^(ARM64|aarch64)$' { $actualArch = 'ARM64'; break } default { throw \"Unsupported Windows architecture: $actualArch\" } }",
+];
+
+/** Local bootstrap: select a fixed URL before any network request, then fetch once. */
+export function buildUniversalExecutorInstall(input: {
+	target: ExecutorInstallTarget;
+	scriptUrls: Partial<Record<ExecutorPlatform, string>>;
+	caCertPem?: string;
+}): GeneratedExecutorInstallScript & { oneLiner: string } {
+	const ca = normalizeInstallCa(input.caCertPem);
+	const platforms = EXECUTOR_PLATFORMS.filter((platform) =>
+		input.target === "windows" ? platform.startsWith("windows-") : !platform.startsWith("windows-"),
+	);
+	const urls = platforms.flatMap((platform) => {
+		const url = input.scriptUrls[platform];
+		return url === undefined
+			? []
+			: [
+					[
+						platform,
+						validateUrl("Install script URL", url, ca ? ["https:"] : ["https:", "http:"]),
+					] as const,
+				];
+	});
+	const shell = input.target === "windows" ? "powershell" : "sh";
+	const fetch = buildInstallFetchCommand(
+		{ shell, caCertPem: ca, universal: true },
+		shell === "sh" ? '"$NF_INSTALL_SCRIPT_URL"' : "$nfUrl",
+	);
+	if (shell === "powershell") {
+		const body = [
+			"$ErrorActionPreference = 'Stop'",
+			...WINDOWS_NATIVE_ARCH_SETUP,
+			"$nfPlatform = 'windows-' + $actualArch.ToLowerInvariant()",
+			"$nfUrl = $null",
+			...urls.map(
+				([platform, url]) =>
+					`if ($nfPlatform -eq ${powershellSingleQuote(platform)}) { $nfUrl = ${powershellSingleQuote(url)} }`,
+			),
+			'if (-not $nfUrl) { throw "NarraFork executor is not published for $nfPlatform." }',
+			fetch,
+		];
+		return {
+			script: `${body.join("\n")}\n`,
+			filename: "install-narrafork-executor-windows.ps1",
+			shell,
+			oneLiner: `& { ${body.join("; ")} }`,
+		};
+	}
+	const body = [
+		"set -eu",
+		"nf_os=$(uname -s | tr '[:upper:]' '[:lower:]')",
+		'case "$nf_os" in linux|darwin) ;; *) echo "Unsupported operating system: $nf_os" >&2; exit 1 ;; esac',
+		"nf_arch=$(uname -m | tr '[:upper:]' '[:lower:]')",
+		'case "$nf_arch" in x86_64|amd64) nf_arch=amd64 ;; aarch64|arm64) nf_arch=arm64 ;; *) echo "Unsupported architecture: $nf_arch" >&2; exit 1 ;; esac',
+		`case "$nf_os-$nf_arch" in ${urls.map(([platform, url]) => `${platform}) NF_INSTALL_SCRIPT_URL=${shellSingleQuote(url)} ;;`).join(" ")} *) echo "NarraFork executor is not published for $nf_os-$nf_arch." >&2; exit 1 ;; esac`,
+		"export NF_INSTALL_SCRIPT_URL",
+		fetch,
+	];
+	const script = `#!/bin/sh\n${body.join("\n")}\n`;
+	return {
+		script,
+		filename: "install-narrafork-executor-unix.sh",
+		shell,
+		oneLiner: `sh -c ${shellSingleQuote(body.join("; "))}`,
+	};
 }
 
 /**
@@ -887,7 +974,11 @@ function buildUnixScript(input: ResolvedInput): string {
 	const q = shellSingleQuote;
 	const system = input.mode === "system";
 	const sudo = system ? "sudo " : "";
-	const unameArches = info.unameArches.map(q).join(" ");
+	const unameArches = [
+		...new Set([...info.unameArches, ...(info.arch === "arm64" ? ["aarch64", "arm64"] : [])]),
+	]
+		.map(q)
+		.join(" ");
 	const serviceName = "narrafork-executor";
 
 	const systemdSetup = system
@@ -929,7 +1020,8 @@ function buildUnixScript(input: ResolvedInput): string {
 				"WantedBy=multi-user.target",
 				"UNIT",
 				`${sudo}systemctl daemon-reload`,
-				`${sudo}systemctl enable --now ${serviceName}`,
+				`${sudo}systemctl enable ${serviceName}`,
+				`${sudo}systemctl restart ${serviceName}`,
 				`${sudo}systemctl --no-pager status ${serviceName} || true`,
 			]
 		: [
@@ -954,7 +1046,8 @@ function buildUnixScript(input: ResolvedInput): string {
 				"WantedBy=default.target",
 				"UNIT",
 				`systemctl --user daemon-reload`,
-				`systemctl --user enable --now ${serviceName}`,
+				`systemctl --user enable ${serviceName}`,
+				`systemctl --user restart ${serviceName}`,
 				`systemctl --user --no-pager status ${serviceName} || true`,
 			];
 
@@ -1247,7 +1340,7 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"$ErrorActionPreference = 'Stop'",
 		"",
 		`$expectedArch = ${q(info.arch === "amd64" ? "AMD64" : "ARM64")}`,
-		"$actualArch = $env:PROCESSOR_ARCHITECTURE",
+		...WINDOWS_NATIVE_ARCH_SETUP,
 		"if ($actualArch -ne $expectedArch) {",
 		`  Write-Error "This script targets ${input.platform} ($expectedArch), but this machine reports $actualArch."`,
 		"}",
@@ -1299,6 +1392,18 @@ function buildWindowsScript(input: ResolvedInput): string {
 		'    Write-Error "Checksum mismatch! expected $expectedSha256, got $actualSha256"',
 		"  }",
 		"  Write-Host 'Checksum verified.'",
+		// Release the installed executable only after the replacement is verified.
+		...(system
+			? [
+					`  $existing = Get-Service -Name ${q(serviceName)} -ErrorAction SilentlyContinue`,
+					`  if ($existing) { Stop-Service -Name ${q(serviceName)} -Force -ErrorAction Stop }`,
+					`  $staleTask = Get-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction SilentlyContinue`,
+					`  if ($staleTask) { Stop-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction Stop }`,
+				]
+			: [
+					`  $existingTask = Get-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction SilentlyContinue`,
+					`  if ($existingTask) { Stop-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction Stop }`,
+				]),
 		"  Copy-Item -LiteralPath $tempBinary -Destination $binary -Force",
 		"} finally {",
 		"  Remove-Item -LiteralPath $tempBinary -Force -ErrorAction SilentlyContinue",
@@ -1380,18 +1485,14 @@ function buildWindowsScript(input: ResolvedInput): string {
 		...(system
 			? [
 					"# Machine-wide install: a Windows service, started under SYSTEM.",
-					`$existing = Get-Service -Name ${q(serviceName)} -ErrorAction SilentlyContinue`,
 					"if ($existing) {",
-					`  Stop-Service -Name ${q(serviceName)} -Force -ErrorAction SilentlyContinue`,
 					`  sc.exe delete ${serviceName} | Out-Null`,
 					"  Start-Sleep -Seconds 2",
 					"}",
 					// An interim installer version registered a scheduled task for system mode.
 					// Left behind it would run a second executor against the same device.
-					`$staleTask = Get-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction SilentlyContinue`,
 					"if ($staleTask) {",
 					"  Write-Host 'Removing the scheduled task from a previous install…'",
-					`  Stop-ScheduledTask -TaskName ${q(serviceName)} -ErrorAction SilentlyContinue`,
 					`  Unregister-ScheduledTask -TaskName ${q(serviceName)} -Confirm:$false -ErrorAction SilentlyContinue`,
 					"}",
 					"$binPath = '\"' + $binary + '\" --config \"' + $configFile + '\" --token-file \"' + $tokenFile + '\"'",

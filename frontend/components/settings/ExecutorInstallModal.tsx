@@ -15,7 +15,7 @@ import {
 	TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type { ExecutorPlatform } from "@shared/remote-executor";
+import type { ExecutorInstallTarget } from "@shared/remote-executor";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -41,10 +41,8 @@ import {
 /**
  * Installing the remote executor on a target machine.
  *
- * The output is one command to paste. Everything the machine needs — server URL,
- * device slug, platform, expected digest, and the device key itself — is carried by
- * the short-lived ticket inside that command, so there is no separate step where a
- * human copies a key between two dialogs.
+ * The output is one command to paste. Its bootstrap detects the target platform;
+ * automatic enrollment uses a short-lived ticket, without a separate key-copy step.
  *
  * The manual path (operator types the key at a prompt) is still available and is
  * the only option when the key cannot be transported safely, e.g. plaintext http on
@@ -60,7 +58,7 @@ export function ExecutorInstallModal({
 	const { t } = useTranslation("settings");
 	const deviceId = device?.id;
 	const [initializedDevice, setInitializedDevice] = useState<string | undefined>();
-	const [platform, setPlatform] = useState<ExecutorPlatform | null>(null);
+	const [target, setTarget] = useState<ExecutorInstallTarget | null>(null);
 	const [mode, setMode] = useState<"system" | "user">("system");
 	const [disableShell, setDisableShell] = useState(false);
 	const [tokenDelivery, setTokenDelivery] = useState<ExecutorTokenDelivery>("enroll");
@@ -76,7 +74,10 @@ export function ExecutorInstallModal({
 	const [debouncedUrl, setDebouncedUrl] = useState("");
 	const [serverBaseUrl, setServerBaseUrl] = useState("");
 	const [showScript, setShowScript] = useState(false);
-	const [result, setResult] = useState<InstallScriptResult | null>(null);
+	const [generatedResult, setResult] = useState<{
+		key: string;
+		value: InstallScriptResult;
+	} | null>(null);
 	/** Plaintext key for the manual path only, issued on request. Never persisted. */
 	const [revealedToken, setRevealedToken] = useState<string | null>(null);
 
@@ -92,6 +93,14 @@ export function ExecutorInstallModal({
 		return (manifestData?.platforms ?? []).filter((info) => manifest.platforms[info.platform]);
 	}, [manifestData]);
 
+	const availableTargets = useMemo(() => {
+		const targets: ExecutorInstallTarget[] = [];
+		if (publishedPlatforms.some((info) => info.os === "linux" || info.os === "darwin"))
+			targets.push("unix");
+		if (publishedPlatforms.some((info) => info.os === "windows")) targets.push("windows");
+		return targets;
+	}, [publishedPlatforms]);
+
 	// Reset per-device state so a previously generated command (and its ticket)
 	// never leaks into the next device's dialog.
 	useEffect(() => {
@@ -99,7 +108,7 @@ export function ExecutorInstallModal({
 		setResult(null);
 		setInitializedDevice(deviceId);
 		if (!deviceId) return;
-		setPlatform(null);
+		setTarget(null);
 		setMode("system");
 		setDisableShell(false);
 		setTokenDelivery("enroll");
@@ -113,13 +122,10 @@ export function ExecutorInstallModal({
 	}, [deviceId]);
 
 	useEffect(() => {
-		if (platform || publishedPlatforms.length === 0) return;
-		// Preselect the platform the device already reported, when we know it.
-		const reported = publishedPlatforms.find(
-			(info) => info.os === device?.platformOs && info.arch === device?.platformArch,
-		);
-		setPlatform(reported?.platform ?? publishedPlatforms[0].platform);
-	}, [platform, publishedPlatforms, device]);
+		if (target && availableTargets.includes(target)) return;
+		const preferred = device?.platformOs === "windows" ? "windows" : "unix";
+		setTarget(availableTargets.includes(preferred) ? preferred : (availableTargets[0] ?? null));
+	}, [target, availableTargets, device]);
 
 	const trimmedBaseUrl = serverBaseUrl.trim();
 	// Automatic key delivery needs a transport the key can survive. Mirrored from the
@@ -141,6 +147,24 @@ export function ExecutorInstallModal({
 		return () => clearTimeout(timer);
 	}, [trimmedBaseUrl, deviceId]);
 
+	// Bind visible output to the parameters of this render, not a later effect.
+	// This also hides the old copy button immediately when switching devices/URLs.
+	const requestKey = JSON.stringify([
+		deviceId,
+		initializedDevice,
+		target,
+		mode,
+		disableShell,
+		trimmedBaseUrl,
+		effectiveDelivery,
+		manifestData?.manifest?.version,
+		refresh,
+		urlBlocked,
+	]);
+	const activeRequest = useRef(requestKey);
+	activeRequest.current = requestKey;
+	const result = generatedResult?.key === requestKey ? generatedResult.value : null;
+
 	useEffect(() => {
 		// Explicit retry changes the request generation; expiration itself does not.
 		void refresh;
@@ -151,14 +175,15 @@ export function ExecutorInstallModal({
 		if (
 			!device?.id ||
 			initializedDevice !== device.id ||
-			!platform ||
+			!target ||
+			!availableTargets.includes(target) ||
 			!manifestData?.manifest ||
 			urlBlocked ||
 			debouncedUrl !== trimmedBaseUrl
 		)
 			return;
 		const input = {
-			platform,
+			target,
 			mode,
 			disableShell,
 			serverBaseUrl: trimmedBaseUrl,
@@ -170,13 +195,13 @@ export function ExecutorInstallModal({
 			.get(key, () => api.createInstallScript(device.id, input))
 			.then(
 				(generated) => {
-					if (!current) return;
-					setResult(generated);
+					if (!current || activeRequest.current !== requestKey) return;
+					setResult({ key: requestKey, value: generated });
 					setPending(false);
 					rememberInstallServerBaseUrl(trimmedBaseUrl);
 				},
 				(error: unknown) => {
-					if (!current) return;
+					if (!current || activeRequest.current !== requestKey) return;
 					setPending(false);
 					setCommandError(error instanceof Error ? error.message : String(error));
 				},
@@ -186,7 +211,9 @@ export function ExecutorInstallModal({
 		};
 	}, [
 		device?.id,
-		platform,
+		target,
+		availableTargets,
+		requestKey,
 		mode,
 		disableShell,
 		trimmedBaseUrl,
@@ -215,12 +242,12 @@ export function ExecutorInstallModal({
 	});
 	const expired = !!result && installCommandExpired(result, now);
 	const retry = () => {
-		if (device && platform && manifestData?.manifest) {
+		if (device && target && manifestData?.manifest) {
 			cache.current.remove(
 				cache.current.key(
 					device.id,
 					{
-						platform,
+						target,
 						mode,
 						disableShell,
 						serverBaseUrl: trimmedBaseUrl,
@@ -260,7 +287,6 @@ export function ExecutorInstallModal({
 		// Configuration switches never rotate or hide the explicitly issued device key.
 	};
 
-	const selectedInfo = publishedPlatforms.find((info) => info.platform === platform);
 	const manifest = manifestData?.manifest;
 
 	return (
@@ -277,17 +303,21 @@ export function ExecutorInstallModal({
 
 					<SegmentedControl
 						aria-label={t("executorInstallOs", "Operating system")}
-						data={[...new Set(publishedPlatforms.map((info) => info.os))].map((os) => ({
-							value: os,
-							label: os === "darwin" ? "macOS" : os === "windows" ? "Windows" : "Linux",
-						}))}
-						value={selectedInfo?.os}
-						onChange={(os) => {
-							const candidates = publishedPlatforms.filter((info) => info.os === os);
-							setPlatform(
-								(candidates.find((info) => info.arch === selectedInfo?.arch) ?? candidates[0])
-									.platform,
-							);
+						data={[
+							{
+								value: "unix",
+								label: "Linux / macOS",
+								disabled: !availableTargets.includes("unix"),
+							},
+							{
+								value: "windows",
+								label: "Windows",
+								disabled: !availableTargets.includes("windows"),
+							},
+						]}
+						value={target ?? undefined}
+						onChange={(value) => {
+							setTarget(value as ExecutorInstallTarget);
 							invalidate();
 						}}
 					/>
@@ -305,7 +335,10 @@ export function ExecutorInstallModal({
 								<TextInput
 									label={t("executorInstallServerUrl")}
 									value={serverBaseUrl}
-									onChange={(event) => setServerBaseUrl(event.currentTarget.value)}
+									onChange={(event) => {
+										setServerBaseUrl(event.currentTarget.value);
+										invalidate();
+									}}
 								/>
 								{urlProblem === "loopback" && urlBlocked ? (
 									<Button onClick={() => setConfirmedLoopback(trimmedBaseUrl)}>
@@ -347,9 +380,6 @@ export function ExecutorInstallModal({
 									{t("executorInstallRunOneLiner", {
 										shell: result.shell === "sh" ? "sh" : "PowerShell",
 									})}
-								</Text>
-								<Text size="xs" c="dimmed">
-									{selectedInfo?.arch}
 								</Text>
 							</Group>
 							<Code block style={{ overflowWrap: "anywhere" }}>
@@ -458,19 +488,10 @@ export function ExecutorInstallModal({
 					</Button>
 					<Collapse expanded={advanced}>
 						<Stack>
-							<Select
-								label={t("executorInstallArchitecture", "Architecture")}
-								data={publishedPlatforms
-									.filter((info) => info.os === selectedInfo?.os)
-									.map((info) => ({ value: info.platform, label: info.arch }))}
-								value={platform}
-								onChange={(value) => {
-									setPlatform(value as ExecutorPlatform | null);
-									invalidate();
-								}}
-								allowDeselect={false}
-							/>
-							{selectedInfo && !selectedInfo.supportsPty ? (
+							<Text size="sm" c="dimmed">
+								{t("executorInstallAutoDetect")}
+							</Text>
+							{target === "windows" ? (
 								<Alert color="yellow" variant="light">
 									{t("executorInstallNoPty")}
 								</Alert>

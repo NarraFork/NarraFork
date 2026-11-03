@@ -24,6 +24,9 @@ import { buildAppErrorResponse } from "../../lib/app-error-response";
 import { getExecutorManifest, resetExecutorManifestCache } from "../../lib/executor-binaries";
 import { BUILD_EXECUTOR_DISTRIBUTION } from "../../lib/version";
 
+type ExecutorPlatform = (typeof EXECUTOR_PLATFORMS)[number];
+const platformSha256 = (platform: ExecutorPlatform) =>
+	(EXECUTOR_PLATFORMS.indexOf(platform) + 1).toString(16).repeat(64);
 const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 const repository = "fixture/install-script-url";
 const tag = `executor-v${EXECUTOR_VERSION}`;
@@ -45,7 +48,7 @@ function canonicalManifest() {
 					{
 						filename: executorPublishedFilename(EXECUTOR_VERSION, platform),
 						size: 256,
-						sha256: "a".repeat(64),
+						sha256: platformSha256(platform),
 					},
 				]),
 			),
@@ -65,6 +68,7 @@ const originalUpdate = settings.update ?? {
 
 import {
 	countLiveExecutorTickets,
+	redeemExecutorTicket,
 	resetExecutorTickets,
 } from "../../lib/executor-bootstrap-ticket";
 import { generateId } from "../../lib/id";
@@ -156,7 +160,7 @@ async function generate(deviceId: string, options: GenerateOptions = {}) {
 			method: "POST",
 			headers: { "content-type": "application/json", ...(options.headers ?? {}) },
 			body: JSON.stringify({
-				platform: "linux-amd64",
+				target: "unix",
 				mode: "user",
 				...(options.body ?? {}),
 			}),
@@ -165,13 +169,41 @@ async function generate(deviceId: string, options: GenerateOptions = {}) {
 	);
 }
 
+function installUrls(script: string): Map<ExecutorPlatform, string> {
+	const matches = [
+		...script.matchAll(
+			/(https?:\/\/[^\s"'`<>]+\/api\/executor\/install\/(linux-amd64|linux-arm64|darwin-amd64|darwin-arm64|windows-amd64|windows-arm64)\?ticket=[a-f0-9]{16,256})/g,
+		),
+	];
+	expect(matches.length).toBeGreaterThan(0);
+	return new Map(matches.map((match) => [match[2] as ExecutorPlatform, match[1]]));
+}
+
+async function fetchFinalScript(script: string, platform: ExecutorPlatform = "linux-amd64") {
+	const url = installUrls(script).get(platform);
+	expect(url).toBeDefined();
+	if (!url) throw new Error(`Bootstrap is missing ${platform}`);
+	const { executorBootstrapRoutes, resetExecutorBootstrapRateLimit } = await import(
+		"../executor-bootstrap"
+	);
+	resetExecutorBootstrapRateLimit();
+	const bootstrap = new Hono();
+	bootstrap.route("/api/executor", executorBootstrapRoutes);
+	const fetched = await bootstrap.request(url);
+	expect(fetched.status).toBe(200);
+	return fetched.text();
+}
+
 describe("server URL composition", () => {
-	test("an unsupported executor platform stays a client validation error", async () => {
+	test.each([
+		"freebsd",
+		"linux-amd64",
+		"macos",
+	])("unsupported target %s stays a client validation error", async (target) => {
 		const id = await makeDevice();
-		// Canonical executor releases declare all six supported platforms, including Windows ARM64.
-		const response = await generate(id, { body: { platform: "freebsd-amd64" } });
+		const response = await generate(id, { body: { target } });
 		expect(response.status).toBe(400);
-		expect((await response.json()).error).toContain("platform");
+		expect((await response.json()).error).toContain("target");
 		expect(countLiveExecutorTickets()).toBe(0);
 	});
 	test.each([
@@ -215,8 +247,13 @@ describe("server URL composition", () => {
 
 		// The operator's URL wins over the socket origin the request arrived on.
 		expect(result.oneLiner).toContain("https://nf.example.com/api/executor/install/linux-amd64");
-		expect(result.scriptUrl).toStartWith("https://nf.example.com/");
-		expect(result.script).toContain("wss://nf.example.com/ws/device");
+		expect(result).not.toHaveProperty("scriptUrl");
+		for (const url of installUrls(result.script).values()) {
+			expect(url).toStartWith("https://nf.example.com/");
+		}
+		const finalScript = await fetchFinalScript(result.script);
+		expect(finalScript).toContain("wss://nf.example.com/ws/device");
+		expect(finalScript).not.toContain("127.0.0.1");
 		expect(result.script).not.toContain("127.0.0.1");
 		expect(result.oneLiner).not.toContain("localhost");
 	});
@@ -232,8 +269,12 @@ describe("server URL composition", () => {
 		});
 		expect(response.status).toBe(200);
 		const result = await response.json();
-		expect(result.scriptUrl).toStartWith("https://nf.example.com/");
-		expect(result.script).toContain("wss://nf.example.com/ws/device");
+		for (const url of installUrls(result.script).values()) {
+			expect(url).toStartWith("https://nf.example.com/");
+		}
+		const finalScript = await fetchFinalScript(result.script);
+		expect(finalScript).toContain("wss://nf.example.com/ws/device");
+		expect(finalScript).not.toContain("127.0.0.1:7779");
 		expect(result.script).not.toContain("127.0.0.1:7779");
 	});
 
@@ -242,23 +283,28 @@ describe("server URL composition", () => {
 		const result = await (
 			await generate(id, { body: { serverBaseUrl: "https://nf.example.com/" } })
 		).json();
-		expect(result.scriptUrl).not.toContain("//api/executor");
+		for (const url of installUrls(result.script).values()) {
+			expect(url).toStartWith("https://nf.example.com/api/executor/install/");
+			expect(url).not.toContain("//api/executor");
+		}
 	});
 });
 
 describe("the one-liner shape", () => {
-	test("unix commands use command substitution, not a pipe into sh", async () => {
-		/*
-		 * A pipe puts the script on stdin; system-mode installs run sudo, which then
-		 * falls back to /dev/tty and fails wherever there is no controlling terminal.
-		 * Pinned at the endpoint too, since this is the string operators actually copy.
-		 */
+	test("unix commands preserve stdin instead of piping the script into sh", async () => {
+		// The bootstrap downloads a bounded temporary file and executes it by path.
+		// Never occupy stdin: system-mode sudo and manual key entry need it.
 		const id = await makeDevice();
 		const result = await (
 			await generate(id, { body: { serverBaseUrl: "https://nf.example.com", mode: "system" } })
 		).json();
-		expect(result.oneLiner).toStartWith('sh -c "$(curl -fsSL ');
-		expect(result.oneLiner).not.toContain("| sh");
+		expect(result.oneLiner).toStartWith("sh -c ");
+		for (const command of [result.oneLiner, result.script]) {
+			expect(command).toContain('"$NF_INSTALL_SCRIPT_URL" -o "$d/install.sh"');
+			expect(command).toContain('sh "$d/install.sh"');
+			expect(command).not.toContain("| sh");
+			expect(command).not.toContain("|sh");
+		}
 	});
 });
 
@@ -269,7 +315,7 @@ describe("token delivery gating", () => {
 			await generate(id, { body: { serverBaseUrl: "https://nf.example.com" } })
 		).json();
 		expect(result.tokenDelivery).toBe("enroll");
-		expect(result.script).toContain("/api/executor/enroll/");
+		expect(await fetchFinalScript(result.script)).toContain("/api/executor/enroll/");
 	});
 
 	test("enroll over plaintext http on a public host is refused with a remedy", async () => {
@@ -291,8 +337,9 @@ describe("token delivery gating", () => {
 		expect(response.status).toBe(200);
 		const result = await response.json();
 		expect(result.tokenDelivery).toBe("prompt");
-		expect(result.script).not.toContain("/api/executor/enroll/");
-		expect(result.script).toContain("Paste the device registration key");
+		const finalScript = await fetchFinalScript(result.script);
+		expect(finalScript).not.toContain("/api/executor/enroll/");
+		expect(finalScript).toContain("Paste the device registration key");
 	});
 
 	test("enroll over plaintext http on a private network follows the setting", async () => {
@@ -322,23 +369,84 @@ describe("token delivery gating", () => {
 });
 
 describe("the generated command is self-serving", () => {
-	test("the script URL it advertises actually returns the script", async () => {
-		// The endpoint mints a ticket and attaches the rendered body to it. If that
-		// attachment were missed, the command would 403 on the target machine while the
-		// UI looked perfectly fine.
+	test.each([
+		"unix",
+		"windows",
+	] as const)("%s bootstrap serves every matching platform under one ticket", async (target) => {
 		const id = await makeDevice();
-		const result = await (
-			await generate(id, { body: { serverBaseUrl: "https://nf.example.com" } })
-		).json();
-
-		const { executorBootstrapRoutes, resetExecutorBootstrapRateLimit } = await import(
-			"../executor-bootstrap"
+		const response = await generate(id, {
+			body: { target, serverBaseUrl: "https://nf.example.com" },
+		});
+		expect(response.status).toBe(200);
+		const result = await response.json();
+		const expected = EXECUTOR_PLATFORMS.filter(
+			(platform) => platform.startsWith("windows-") === (target === "windows"),
 		);
-		resetExecutorBootstrapRateLimit();
-		const bootstrap = new Hono();
-		bootstrap.route("/api/executor", executorBootstrapRoutes);
-		const fetched = await bootstrap.request(result.scriptUrl);
-		expect(fetched.status).toBe(200);
-		expect(await fetched.text()).toBe(result.script);
+		expect(result.target).toBe(target);
+		expect(result.platforms).toEqual(expected);
+		expect(result.shell).toBe(target === "unix" ? "sh" : "powershell");
+		expect(result.filename).toBe(
+			`install-narrafork-executor-${target}.${target === "unix" ? "sh" : "ps1"}`,
+		);
+		expect(result.executorVersion).toBe(EXECUTOR_VERSION);
+		expect(Date.parse(result.expiresAt)).toBeGreaterThan(Date.now());
+		expect(result).not.toHaveProperty("scriptUrl");
+		const urls = installUrls(result.script);
+		expect([...urls.keys()]).toEqual(expected);
+		expect(
+			new Set([...urls.values()].map((url) => new URL(url).searchParams.get("ticket"))).size,
+		).toBe(1);
+		expect(countLiveExecutorTickets()).toBe(1);
+		for (const platform of expected) {
+			const url = urls.get(platform);
+			expect(url).toStartWith(`https://nf.example.com/api/executor/install/${platform}?ticket=`);
+			expect(result.oneLiner).toContain(url);
+			const finalScript = await fetchFinalScript(result.script, platform);
+			expect(finalScript).not.toBe(result.script);
+			if (!url) throw new Error(`Missing ${platform} URL`);
+			const ticket = new URL(url).searchParams.get("ticket");
+			const binary = redeemExecutorTicket(ticket, platform, "binary");
+			expect(binary.ok).toBe(true);
+			expect(binary.artifact?.filename).toBe(executorPublishedFilename(EXECUTOR_VERSION, platform));
+			expect(binary.artifact?.sha256).toBe(platformSha256(platform));
+			expect(finalScript).toContain(
+				target === "unix"
+					? `EXPECTED_SHA256='${platformSha256(platform)}'`
+					: `$expectedSha256 = '${platformSha256(platform)}'`,
+			);
+			expect(finalScript).toContain(
+				`https://nf.example.com/api/executor/download/${platform}?ticket=${ticket}`,
+			);
+			expect(finalScript).toContain("wss://nf.example.com/ws/device");
+			expect(finalScript).toContain(`/api/executor/enroll/${platform}?ticket=${ticket}`);
+			const outsideGroup = target === "unix" ? "windows-amd64" : "linux-amd64";
+			expect(redeemExecutorTicket(ticket, outsideGroup, "script").ok).toBe(false);
+		}
+	});
+
+	test("regenerating after an address change updates every platform's final configuration", async () => {
+		const id = await makeDevice();
+		for (const target of ["unix", "windows"] as const) {
+			for (const address of ["172.30.8.150", "172.30.23.61"]) {
+				const response = await generate(id, {
+					body: { target, serverBaseUrl: `https://${address}:7779` },
+				});
+				expect(response.status).toBe(200);
+				const result = await response.json();
+				for (const [platform, url] of installUrls(result.script)) {
+					expect(url).toStartWith(`https://${address}:7779/api/executor/install/${platform}`);
+					const finalScript = await fetchFinalScript(result.script, platform);
+					expect(finalScript).toContain(`wss://${address}:7779/ws/device`);
+					expect(finalScript).toContain(
+						`https://${address}:7779/api/executor/download/${platform}`,
+					);
+					if (address === "172.30.23.61") {
+						expect(finalScript).not.toContain("172.30.8.150");
+						expect(result.script).not.toContain("172.30.8.150");
+						expect(result.oneLiner).not.toContain("172.30.8.150");
+					}
+				}
+			}
+		}
 	});
 });
