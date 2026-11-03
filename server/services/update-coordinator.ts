@@ -10,6 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -270,6 +271,20 @@ let backgroundBashDrainWaiters: CoordinationWaiter[] = [];
 let ordinaryDrainWaiters: CoordinationWaiter[] = [];
 let checkpointFenceWaiters: CoordinationWaiter[] = [];
 const gateWaiters = new Map<string, GateWaiter>();
+const lifecycleNotification = hotSafe("updateCoordinator.lifecycleNotification", () => ({
+	timer: undefined as ReturnType<typeof setTimeout> | undefined,
+}));
+
+/** Coalesce maintenance bursts; ordinary idle activity must never wake status clients. */
+function notifyLifecycleChanged(includeIdle = false): void {
+	if ((!includeIdle && state.phase === "idle") || lifecycleNotification.timer) return;
+	lifecycleNotification.timer = setTimeout(() => {
+		lifecycleNotification.timer = undefined;
+		// Do not recheck phase here: the final transition back to idle must be delivered.
+		eventBus.emit({ type: "system:lifecycle_changed" });
+	}, 50);
+	lifecycleNotification.timer.unref();
+}
 
 function generateToken(prefix: string): string {
 	return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -416,6 +431,7 @@ function registerCheckpointActivity(
 ): UpdateCheckpointActivityLease {
 	const token = generateToken(prefix);
 	map.set(token, { ...record, startedAt: Date.now() });
+	notifyLifecycleChanged();
 	let released = false;
 	return {
 		token,
@@ -423,6 +439,7 @@ function registerCheckpointActivity(
 			if (released) return;
 			released = true;
 			map.delete(token);
+			notifyLifecycleChanged();
 			resolveCheckpointFenceWaitersIfReady();
 		},
 	};
@@ -432,6 +449,7 @@ function settleGateWaiter(token: string, action: "resolve" | "abort"): void {
 	const waiter = gateWaiters.get(token);
 	if (!waiter) return;
 	gateWaiters.delete(token);
+	notifyLifecycleChanged();
 	if (waiter.signal && waiter.onAbort) {
 		waiter.signal.removeEventListener("abort", waiter.onAbort);
 	}
@@ -502,6 +520,7 @@ export function cancelScheduledUpdate(reason?: string): boolean {
 	if (state.phase === "idle" || !state.updateEpoch) return false;
 	if (state.cancelRequestedEpoch !== state.updateEpoch) {
 		state.cancelRequestedEpoch = state.updateEpoch;
+		notifyLifecycleChanged();
 		logger.warn("Scheduled update cancellation requested", {
 			updateEpoch: state.updateEpoch,
 			phase: state.phase,
@@ -677,6 +696,7 @@ function registerExecutionLease(
 		narratorId,
 		startedAt: Date.now(),
 	});
+	notifyLifecycleChanged();
 	let released = false;
 
 	return {
@@ -684,12 +704,16 @@ function registerExecutionLease(
 		token,
 		setNarratorId(id: string) {
 			const record = executions.get(token);
-			if (record) record.narratorId = id;
+			if (record && record.narratorId !== id) {
+				record.narratorId = id;
+				notifyLifecycleChanged();
+			}
 		},
 		release() {
 			if (released) return;
 			released = true;
 			executions.delete(token);
+			notifyLifecycleChanged();
 			resolveDrainWaitersIfReady();
 		},
 	};
@@ -731,18 +755,22 @@ export function beginToolStartAdmission(
 
 	const token = generateToken("tool_start");
 	toolStartGrants.set(token, { kind, narratorId, toolUseId, startedAt: Date.now() });
+	notifyLifecycleChanged();
 	let released = false;
 	const grant: UpdateToolStartGrant = {
 		kind,
 		token,
 		setNarratorId(id: string) {
 			const record = toolStartGrants.get(token);
-			if (record) record.narratorId = id;
+			if (record && record.narratorId !== id) {
+				record.narratorId = id;
+				notifyLifecycleChanged();
+			}
 		},
 		release() {
 			if (released) return;
 			released = true;
-			toolStartGrants.delete(token);
+			if (toolStartGrants.delete(token)) notifyLifecycleChanged();
 			resolveCheckpointFenceWaitersIfReady();
 		},
 	};
@@ -878,6 +906,7 @@ export function scheduleUpdate(
 	state.errorKind = undefined;
 	// A cancellation belongs to the epoch that was cancelled; never inherit it.
 	state.cancelRequestedEpoch = undefined;
+	notifyLifecycleChanged();
 	interruptReasoningResponses();
 	logger.info("Update scheduled; draining background Bash executions", {
 		targetVersion,
@@ -903,6 +932,7 @@ export async function waitForBackgroundBashDrain(): Promise<void> {
 export function beginQuiescingTools(): UpdateCoordinationStatus {
 	if (state.phase === "draining_background_bash") {
 		state.phase = "quiescing_tools";
+		notifyLifecycleChanged();
 		interruptReasoningResponses();
 		logger.info("Background Bash drained; closing the checkpoint fence", {
 			updateEpoch: state.updateEpoch,
@@ -951,14 +981,16 @@ export async function waitUntilUpdateGateOpens(signal?: AbortSignal): Promise<vo
 			signal.addEventListener("abort", waiter.onAbort, { once: true });
 		}
 		gateWaiters.set(token, waiter);
+		notifyLifecycleChanged();
 		// Close the race where failure opened the gate between the initial check and registration.
 		if (state.phase === "idle") settleGateWaiter(token, "resolve");
 	});
 }
 
 export function markUpdateRestarting(): UpdateCoordinationStatus {
-	if (state.phase === "idle") return resolveStatus();
+	if (state.phase === "idle" || state.phase === "restarting") return resolveStatus();
 	state.phase = "restarting";
+	notifyLifecycleChanged();
 	return resolveStatus();
 }
 
@@ -986,6 +1018,7 @@ export function failScheduledUpdate(
 	state.cancelRequestedEpoch = undefined;
 	state.error = error;
 	state.errorKind = options.cancelled ? "cancelled" : "failed";
+	notifyLifecycleChanged(true);
 	openUpdateGate();
 	if (options.cancelled) {
 		logger.info("Scheduled update cancelled; paused work resumed", { error });
@@ -1480,6 +1513,8 @@ export function removePlannedUpdateRecoverySnapshot(guard: RecoveryManifestEpoch
 
 /** Test-only reset helper; production code never needs to reset a scheduled update. */
 export function resetUpdateCoordinationForTests(): void {
+	clearTimeout(lifecycleNotification.timer);
+	lifecycleNotification.timer = undefined;
 	resetRecoveryHandoffForTests();
 	scheduledHandoff.current = undefined;
 	executions.clear();

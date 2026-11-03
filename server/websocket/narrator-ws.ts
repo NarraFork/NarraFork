@@ -1780,6 +1780,11 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 		broadcastToNarrator(event.narratorId, event.message);
 	});
 
+	// No coordinator diagnostics cross the global channel; HTTP retains role checks.
+	eventBus.on("system:lifecycle_changed", () => {
+		broadcastToAll({ type: "system_lifecycle_changed" });
+	});
+
 	// Plugin lifecycle is global host state. Broadcast only an invalidation marker;
 	// clients must refetch the authenticated, bounded contribution snapshot instead
 	// of trusting a potentially stale payload carried over WS.
