@@ -9,9 +9,11 @@
  *     only rows that contain the id at all are decoded in JS;
  *   - hard caps on refs examined, wall time and rows decoded deny (fail closed), checked
  *     before every statement;
+ *   - one ref whose stored bytes exceed `maxRefBytes` is denied before it is scanned,
+ *     since a ref is never split across statements;
  *   - a per-user and per-process concurrency gate, served round-robin across users,
- *     denies when its queue is full, and every lookup yields to the event loop at least
- *     once after it gets its slot and between windows.
+ *     denies when its queue is full or a lookup has waited too long, and every lookup
+ *     yields to the event loop at least once after it gets its slot and between windows.
  *
  * Only structurally decoded values count. Drizzle returns JSON columns already decoded
  * (SQLite JSON mode, the PostgreSQL `jsonText` codec), so a string here is genuine string
@@ -43,6 +45,8 @@ interface LookupLimits {
 	maxDecoded: number;
 	/** Stored bytes one candidate-test statement may scan (at least one ref). */
 	windowBytes: number;
+	/** Stored bytes of ONE ref (body, block rows, tool outputs) a lookup will scan; larger denies. */
+	maxRefBytes: number;
 	/** Lookups running at once in this process. */
 	processRunning: number;
 	/** Lookups running at once for one user. */
@@ -51,6 +55,8 @@ interface LookupLimits {
 	userPending: number;
 	/** Lookups running or waiting in this process; more are denied at once. */
 	processPending: number;
+	/** How long a lookup may wait for a slot before it is denied and leaves the queue. */
+	maxQueueWaitMs: number;
 }
 
 const DEFAULT_LIMITS: LookupLimits = {
@@ -58,10 +64,12 @@ const DEFAULT_LIMITS: LookupLimits = {
 	maxMs: 2_000,
 	maxDecoded: 256,
 	windowBytes: 4 * 1024 * 1024,
+	maxRefBytes: 32 * 1024 * 1024,
 	processRunning: 4,
 	userRunning: 2,
 	userPending: 32,
 	processPending: 1_024,
+	maxQueueWaitMs: 12_000,
 };
 let limits = DEFAULT_LIMITS;
 
@@ -230,21 +238,34 @@ async function withLookupSlot(
 	pendingTotal++;
 	if (mayStart(principal)) markRunning(principal);
 	else {
+		let granted: boolean;
 		try {
-			await new Promise<void>((resolve, reject) => {
+			granted = await new Promise<boolean>((resolve, reject) => {
+				const leave = () => {
+					clearTimeout(expiry);
+					signal?.removeEventListener("abort", abort);
+					const queue = waiting.get(principal) ?? [];
+					const index = queue.indexOf(waiter);
+					if (index >= 0) queue.splice(index, 1);
+					if (queue.length === 0) waiting.delete(principal);
+				};
 				const waiter: Waiter = {
 					wake: () => {
+						clearTimeout(expiry);
 						signal?.removeEventListener("abort", abort);
 						markRunning(principal);
-						resolve();
+						resolve(true);
 					},
 				};
 				const abort = () => {
-					const queue = waiting.get(principal) ?? [];
-					queue.splice(queue.indexOf(waiter), 1);
-					if (queue.length === 0) waiting.delete(principal);
+					leave();
 					reject(signal?.reason);
 				};
+				// A bounded wait: the request is answered (denied) instead of held open.
+				const expiry = setTimeout(() => {
+					leave();
+					resolve(false);
+				}, limits.maxQueueWaitMs);
 				const queue = waiting.get(principal);
 				if (queue) queue.push(waiter);
 				else waiting.set(principal, [waiter]);
@@ -254,6 +275,11 @@ async function withLookupSlot(
 			bump(pendingByUser, principal, -1);
 			pendingTotal--;
 			throw error;
+		}
+		if (!granted) {
+			bump(pendingByUser, principal, -1);
+			pendingTotal--;
+			return denied("queue wait");
 		}
 	}
 	try {
@@ -618,6 +644,10 @@ async function lookupReference(
 			bytes += keys[take].bytes;
 			take++;
 		}
+		// One ref is scanned whole (its tool outputs too), so it needs its own bound: an
+		// imported assistant message can carry ~128 MB of tool output under one message id.
+		if (take === 1 && bytes > limits.maxRefBytes)
+			return denied("ref too large", { referencingNarratorId, examined, decoded });
 		const slice = keys.slice(0, take);
 		keys = keys.slice(take);
 		examined += slice.length;

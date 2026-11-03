@@ -742,4 +742,46 @@ describe("bounded reference lookup", () => {
 			warn.mockRestore();
 		}
 	});
+
+	test("one ref over the per-ref byte cap is denied before any candidate statement", async () => {
+		const source = addNarrator(sourceOwner);
+		const context = addNarrator(forkOwner);
+		const image = await saveUploadedImage(source, png());
+		addMessage(context, 0, [
+			{ type: "text", text: "x".repeat(100 * 1024) },
+			imageRefToContentBlock(image),
+		]);
+		setReferenceLookupLimitsForTests({ maxRefBytes: 64 * 1024 });
+		expect(await narratorReferencesImage(context, source, image.imageId)).toBe(false);
+		expect(lastReferenceLookupStatsForTests().statements).toBe(0);
+		setReferenceLookupLimitsForTests({ maxRefBytes: 256 * 1024 });
+		expect(await narratorReferencesImage(context, source, image.imageId)).toBe(true);
+		expect(lastReferenceLookupStatsForTests().statements).toBe(1);
+	});
+
+	test("a lookup that waits too long for a slot is denied and frees its place", async () => {
+		// Many tiny windows, each yielding, keep the only slot busy well past the wait cap.
+		setReferenceLookupLimitsForTests({
+			processRunning: 1,
+			processPending: 2,
+			windowBytes: 1,
+			maxQueueWaitMs: 30,
+		});
+		const { source, context, image } = await longContext(600);
+		const holder = narratorReferencesImage(context, source, image.imageId, { principal: "a" });
+		const started = performance.now();
+		expect(await narratorReferencesImage(context, source, image.imageId, { principal: "b" })).toBe(
+			false,
+		);
+		expect(performance.now() - started).toBeLessThan(1_000);
+		expect(await holder).toBe(true);
+		// Both places were returned: with room for two, two more lookups still get in.
+		setReferenceLookupLimitsForTests({ processRunning: 1, processPending: 2 });
+		expect(
+			await Promise.all([
+				narratorReferencesImage(context, source, image.imageId, { principal: "a" }),
+				narratorReferencesImage(context, source, image.imageId, { principal: "b" }),
+			]),
+		).toEqual([true, true]);
+	});
 });
