@@ -2907,6 +2907,9 @@ async function* agentLoopInMetadataSnapshot(
 	 * the execution-group loop). They could only ever hold the same ids.
 	 */
 	const processedToolUseIds = new Set<string>();
+	// Keep the first planning nudge, without repeating it after every tool/turn in
+	// this run. A new agentLoop invocation (e.g. the next user message) re-arms it.
+	let relaxedPlanReminderQueued = false;
 	const pipelineExitConfirmationAttachedStateIds = new Set<string>();
 	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
 	// across tool outputs). Prefer the session-provided shared set so point A (user message)
@@ -3069,7 +3072,14 @@ async function* agentLoopInMetadataSnapshot(
 		// toward the completed-tool cadence, which measures productive work.
 		if (result.broken || result.fatal) return;
 
-		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
+		if (
+			!relaxedPlanReminderQueued &&
+			(await shouldInjectRelaxedPlanToolReminder(tu, config)) &&
+			!relaxedPlanReminderQueued
+		) {
+			// Re-check after awaiting classification: parallel tool completions may
+			// reach this point together, but must still queue only one reminder.
+			relaxedPlanReminderQueued = true;
 			queueLoopInjection({
 				source: "relaxed_plan",
 				...sideCarBodyWithText(
