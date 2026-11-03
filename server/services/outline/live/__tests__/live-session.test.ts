@@ -14,7 +14,7 @@ import { aclGrants, outlineLiveUpdates, projects, users } from "../../../../db/s
 import { eventBus } from "../../../../lib/event-bus";
 import { generateId } from "../../../../lib/id";
 import { settings } from "../../../../lib/settings";
-import { OutlineConflictError } from "../../errors";
+import { OutlineConflictError, OutlineWriteError } from "../../errors";
 import { lockOutlineTask, unlockOutlineTask } from "../../pending";
 import { ensureProjectSpace } from "../../spaces";
 import { outlineStore } from "../../store";
@@ -28,7 +28,7 @@ import {
 	runInLane,
 } from "../registry";
 import { replayLiveEpoch } from "../replay";
-import { OUTLINE_LIVE_TIMING } from "../session";
+import { isConflict, OUTLINE_LIVE_TIMING } from "../session";
 import { client, kids, settle, struct, TestLink, type, waitFor } from "./harness";
 
 const NOW = "2026-10-27T00:00:00.000Z";
@@ -646,5 +646,15 @@ describe("locks", () => {
 		await settle(60);
 		expect((await outlineStore.getBlock(plan))?.taskJson).toBeNull();
 		expect(m.stats.rejects).toBe(0);
+	});
+
+	test("a move the page's open changes refuse reaches the editor as a conflict, not a failure", () => {
+		for (const code of [
+			"OUTLINE_PENDING_FULL",
+			"OUTLINE_LOCK_DENIED",
+			"OUTLINE_LOCK_HELD",
+		] as const)
+			expect(isConflict(new OutlineWriteError("refused", code))).toBe(true);
+		expect(isConflict(new OutlineWriteError("bad", "OUTLINE_INVALID_OP"))).toBe(false);
 	});
 });

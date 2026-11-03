@@ -264,7 +264,8 @@ function SurfaceBody({
 			});
 		}
 		for (const change of data.pending) {
-			for (const id of change.blockIds) {
+			// The blocks it targets, and those it adds blocks under (a proposed step's parent).
+			for (const id of new Set([...change.blockIds, ...change.addedUnder])) {
 				const mark = out.get(id) ?? {};
 				out.set(id, { ...mark, pending: [...(mark.pending ?? []), change.label] });
 			}

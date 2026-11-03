@@ -562,11 +562,22 @@ async function revertAttempts(
 							? OUTLINE_TEXT.lockKept
 							: OUTLINE_TEXT.taskNotStarted,
 		}));
+		// What was put back is what the commit wrote: a lock left as it was (`lock-kept`) may leave
+		// a block, or the whole revert, with nothing written.
+		let changed = written.commit ? plan.changed : [];
+		if (written.commit && notes.some((note) => note.adjustment.kind === "lock-kept")) {
+			const wrote = new Set(
+				(await store.listCommitVersions(written.commit.id, OUTLINE_LIMITS.maxRowsTouched)).map(
+					(v) => v.blockId,
+				),
+			);
+			changed = changed.filter((id) => wrote.has(id));
+		}
 		return {
 			...base,
 			commit: written.commit,
 			pageIds: written.pageIds,
-			changed: plan.changed.map(address),
+			changed: changed.map(address),
 			notes,
 		};
 	}

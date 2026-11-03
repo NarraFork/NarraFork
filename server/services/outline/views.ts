@@ -243,9 +243,20 @@ export async function readBlockView(
 	const pendingRows = state.current
 		? await store.listOpenPendingByPage(state.pageId, OUTLINE_PENDING_LIMITS.openPerPage)
 		: [];
+	// What waits: the blocks a change targets. What is marked: those, and the blocks a change
+	// adds blocks under (review N-3; a proposed step's parent does not wait, decision 20).
 	const pendingOf = new Map<string, string[]>();
+	const markedOf = new Map<string, string[]>();
+	const mark = (map: Map<string, string[]>, id: string, rowId: string) => {
+		const list = map.get(id) ?? [];
+		if (!list.includes(rowId)) map.set(id, [...list, rowId]);
+	};
 	for (const row of pendingRows) {
-		for (const id of row.blockIdsJson) pendingOf.set(id, [...(pendingOf.get(id) ?? []), row.id]);
+		for (const id of row.blockIdsJson) {
+			mark(pendingOf, id, row.id);
+			mark(markedOf, id, row.id);
+		}
+		for (const add of row.addsJson) if (add.parentId) mark(markedOf, add.parentId, row.id);
 	}
 	const locks = await describeLocks(
 		shown.flatMap((node) => (node.task?.lock ? [{ blockId: node.id, lock: node.task.lock }] : [])),
@@ -297,7 +308,7 @@ export async function readBlockView(
 				}),
 			),
 			lock: locks.get(node.id) ?? null,
-			pending: pendingOf.get(node.id) ?? [],
+			pending: markedOf.get(node.id) ?? [],
 		};
 	});
 	if (view === "facts") {

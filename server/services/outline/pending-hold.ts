@@ -64,48 +64,74 @@ function targetId(op: OutlineOp): string | undefined {
 	return op.op !== "insert" && "id" in op.block ? op.block.id : undefined;
 }
 
+/** The version an operation was computed against, as stored (`write.ts` records it). */
+export function opBase(op: OutlineOp): number | undefined {
+	return op.op === "insert" ? undefined : op.baseVersionSeq;
+}
+
+type UpdateOp = Extract<OutlineOp, { op: "update" }>;
+type SetTaskOp = Extract<OutlineOp, { op: "setTask" }>;
+const UPDATE_FIELDS = ["content", "alias", "tags"] as const;
+
 /**
- * A second proposal merged into an open change, so the change says what the proposer means now:
+ * A second proposal merged into an open change, so the change says what the proposer means now.
+ * Every stored operation keeps the version it was computed against (review N-1), and a field
+ * belongs to the operation that proposed it last:
  *
- *   - a rewrite of a block replaces the earlier one field by field (the later wins);
- *   - task changes of a block merge field by field, but taking the checkbox away, or giving it
- *     back after that, replaces what was proposed for the task before (the later intent wins:
- *     `[setTask null]` then `[setTask {due}]` is a task with that due date, not both);
+ *   - a rewrite of a block computed against the same version as an earlier one is merged into
+ *     it, field by field (the later wins); against another version, it takes the fields it sets
+ *     away from the earlier one (which keeps the rest, and its version);
+ *   - task changes of a block likewise, field by field; but taking the checkbox away, or giving
+ *     it back after that, replaces what was proposed for the task before (the later intent
+ *     wins: `[setTask null]` then `[setTask {due}]` is a task with that due date, not both);
  *   - everything else is appended in order.
- *
- * Returns the merged operations and the blocks whose rewritten text now comes from `incoming`
- * (their base moves to the version that text was computed against).
  */
 export function mergePendingOps(
 	existing: readonly OutlineOp[],
 	incoming: readonly OutlineOp[],
-): { ops: OutlineOp[]; rebased: Set<string> } {
-	const out = [...existing];
-	const rebased = new Set<string>();
+): OutlineOp[] {
+	let out: Array<OutlineOp | null> = [...existing];
 	for (const op of incoming) {
 		const id = targetId(op);
 		if (op.op === "update" && id !== undefined) {
-			const at = out.findIndex((o) => o.op === "update" && targetId(o) === id);
-			if (op.content !== undefined) rebased.add(id);
-			if (at >= 0) {
-				out[at] = { ...(out[at] as OutlineOp & { op: "update" }), ...op };
-				continue;
-			}
+			const sets = UPDATE_FIELDS.filter((f) => op[f] !== undefined);
+			let into = -1;
+			out = out.map((o, k) => {
+				if (o?.op !== "update" || targetId(o) !== id) return o;
+				if (into < 0 && opBase(o) === opBase(op)) {
+					into = k;
+					const next = { ...o, ...op } as UpdateOp;
+					// The text is the later one's: merged over others' changes only if it says so.
+					if (op.content !== undefined && !op.merged) delete next.merged;
+					return next;
+				}
+				const rest: UpdateOp = { ...o };
+				for (const f of sets) delete rest[f];
+				if (rest.content === undefined) delete rest.merged;
+				return UPDATE_FIELDS.some((f) => rest[f] !== undefined) ? rest : null;
+			});
+			if (into < 0) out.push(op);
+			continue;
 		}
 		if (op.op === "setTask" && id !== undefined) {
-			const at = out.findIndex((o) => o.op === "setTask" && targetId(o) === id);
-			if (at >= 0) {
-				const earlier = out[at] as OutlineOp & { op: "setTask" };
-				out[at] =
-					op.task === null || earlier.task === null
-						? op
-						: { ...earlier, task: { ...earlier.task, ...op.task } };
-				continue;
-			}
+			let into = -1;
+			out = out.map((o, k) => {
+				if (o?.op !== "setTask" || targetId(o) !== id) return o;
+				if (op.task === null || o.task === null) return null;
+				if (into < 0 && opBase(o) === opBase(op)) {
+					into = k;
+					return { ...o, task: { ...o.task, ...op.task } } as SetTaskOp;
+				}
+				const task = { ...o.task };
+				for (const f of Object.keys(op.task)) delete task[f as keyof typeof task];
+				return Object.keys(task).length > 0 ? ({ ...o, task } as SetTaskOp) : null;
+			});
+			if (into < 0) out.push(op);
+			continue;
 		}
 		out.push(op);
 	}
-	return { ops: out, rebased };
+	return out.filter((o): o is OutlineOp => o !== null);
 }
 
 function contentBytes(ops: readonly OutlineOp[]): number {
@@ -155,10 +181,7 @@ export async function buildPendingPut(args: {
 		}
 	}
 	const incoming = held.flatMap((h) => h.ops);
-	const merged = existing
-		? mergePendingOps(pendingOps(existing), incoming)
-		: { ops: incoming, rebased: new Set<string>() };
-	const ops = merged.ops;
+	const ops = existing ? mergePendingOps(pendingOps(existing), incoming) : incoming;
 	const opsBytes = Buffer.byteLength(JSON.stringify(ops), "utf8");
 	if (
 		ops.length > OUTLINE_PENDING_LIMITS.maxOps ||
@@ -173,14 +196,14 @@ export async function buildPendingPut(args: {
 			"OUTLINE_PENDING_TOO_LARGE",
 		);
 	}
-	// The version each block's proposed change was computed against: the first proposal's,
-	// unless a later one rewrote the block's text (then that text's, review S-3).
-	const base: Record<string, number> = { ...(existing?.baseJson ?? {}) };
-	for (const h of held) {
-		for (const t of h.touched) {
-			if (base[t.blockId] === undefined || merged.rebased.has(t.blockId))
-				base[t.blockId] = t.versionSeq;
-		}
+	// By block, the oldest version an operation of the change on it was computed against (each
+	// operation keeps its own, `opBase`): a block changed since then is "changed since proposed".
+	const base: Record<string, number> = {};
+	for (const op of ops) {
+		const id = targetId(op);
+		const seq = op.op === "insert" ? undefined : (opBase(op) ?? existing?.baseJson[id ?? ""]);
+		if (id === undefined || seq === undefined) continue;
+		base[id] = Math.min(base[id] ?? seq, seq);
 	}
 	const subtree = { ...(existing?.subtreeJson ?? {}) };
 	for (const h of held) Object.assign(subtree, h.subtree);

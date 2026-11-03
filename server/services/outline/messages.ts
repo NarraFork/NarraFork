@@ -38,9 +38,9 @@ export const OUTLINE_TEXT = {
 	/** A write by no session or person left a task to do instead of in progress. */
 	taskNotStarted:
 		"it would be in progress with nobody doing it (a write by no session), so it was left to do",
-	/** A revert would have taken a lock away its author may not take: the lock stays. */
+	/** A revert (or bringing a task back) would have changed a lock its author may not: as it is. */
 	lockKept:
-		"it is locked, and only the person who locked it, a manager of the space or an admin may unlock it: the lock was kept",
+		"only the person who locked it, a manager of the space or an admin may lock, unlock or change its lock: its lock was left as it is",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
 
@@ -89,9 +89,9 @@ export const OUTLINE_TEXT = {
 	/** Locking a task someone else locked. */
 	lockHeld: (address: string) =>
 		`${address} is locked by someone else; it has to be unlocked first (by them, a manager of the space or an admin) before anyone locks it again`,
-	/** Taking a lock away (unlocking, deleting the task, its checkbox) without the right to. */
+	/** Taking a lock away (unlocking, deleting the task, its checkbox) or changing it without the right to. */
 	unlockDenied: (address: string) =>
-		`${address} is locked; only the person who locked it, a manager of the space or an admin may unlock it, delete it or take its checkbox away`,
+		`${address} is locked (or would be, in someone else's name); only the person who locked it, a manager of the space or an admin may unlock it, change its lock, delete it or take its checkbox away`,
 	severalLockedPlans:
 		"the change touches several locked plans at once; change each plan in a call of its own",
 	pendingTooLarge: (ops: number, bytes: number) =>

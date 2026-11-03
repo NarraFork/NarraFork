@@ -163,7 +163,10 @@ export interface OutlineViewBlock {
 	inProgress: OutlineInProgressItem[];
 	/** The lock, on a locked task. */
 	lock: OutlineLockView | null;
-	/** Open changes (ids) that touch this block: it waits for confirmation. */
+	/**
+	 * Open changes (ids) that target this block (it waits for confirmation) or add blocks under
+	 * it (a mark only).
+	 */
 	pending: string[];
 }
 
@@ -379,8 +382,13 @@ export interface OutlinePendingSummary {
 		by: { kind: OutlineActorKind; id: string; name: string | null };
 		delegate: { narratorId: string; title: string | null } | null;
 	};
-	/** Existing blocks it touches. */
+	/** Existing blocks it targets (rewrites, moves, deletes, changes the task of): they wait. */
 	blockIds: string[];
+	/**
+	 * Existing blocks it adds blocks under (a proposed new step's parent): marked like the
+	 * targets, but they do not wait.
+	 */
+	addedUnder: string[];
 	/** Operations it holds. */
 	ops: number;
 	/** A block it touches changed since it was proposed: confirming merges, or may fail. */

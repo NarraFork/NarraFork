@@ -187,7 +187,8 @@ export function pendingFor(
 		(p) =>
 			p.rootBlockId === view.rootId ||
 			(p.rootBlockId !== null && shown.has(p.rootBlockId)) ||
-			p.blockIds.includes(view.rootId),
+			p.blockIds.includes(view.rootId) ||
+			p.addedUnder.includes(view.rootId),
 	);
 }
 

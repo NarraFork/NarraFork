@@ -30,12 +30,13 @@ import { AppError, NotFoundError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { titleOf } from "@shared/outline";
 import { readDisplayNames } from "./access-reads";
-import { type AgentReplace, mergeAgentReplaces } from "./agent-merge";
+import { type AgentMerge, type AgentReplace, mergeAgentReplaces } from "./agent-merge";
 import { OutlineWriteError } from "./errors";
 import { contentLinks, type ExtractedLink } from "./links";
 import { withOutlineLiveBarrier } from "./live-barrier";
 import { OUTLINE_TEXT, OUTLINE_TOOL_TEXT } from "./messages";
 import {
+	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
 	OUTLINE_PENDING_LIMITS,
 	type OutlinePendingDeciderJson,
@@ -43,7 +44,7 @@ import {
 	type OutlineTaskLockJson,
 	outlinePendingLabel,
 } from "./model";
-import { PENDING_WITHDRAW, pendingOps } from "./pending-hold";
+import { opBase, PENDING_WITHDRAW, pendingOps } from "./pending-hold";
 import { outlineStore } from "./store";
 import {
 	type OutlineBlockMeta,
@@ -52,6 +53,7 @@ import {
 	type OutlinePendingRow,
 	type OutlineSpaceRow,
 	type OutlineStore,
+	type OutlineVersionRow,
 } from "./store/port";
 import type { OutlineTaskSubject } from "./tasks";
 import {
@@ -226,161 +228,278 @@ export type OutlineProposalMerge =
 	/** Changed since, and the proposal no longer applies (why, for the agent and people). */
 	| { state: "conflict"; detail: string };
 
+/** One rewrite of a block a change holds (an update's fields, or a task patch), with its base. */
+interface ProposalUnit {
+	blockId: string;
+	/** The version it was computed against (its own, review N-1). */
+	base: number;
+	op: Extract<OutlineOp, { op: "update" }> | Extract<OutlineOp, { op: "setTask" }>;
+}
+
+/**
+ * Versions of blocks at given seqs, keyed `blockId@seq`: one read per round, a block once in
+ * each (a change may hold a block's rewrites computed against different versions).
+ */
+async function versionsAt(
+	store: OutlineStore,
+	keys: ReadonlyArray<{ blockId: string; seq: number }>,
+): Promise<Map<string, OutlineVersionRow>> {
+	const out = new Map<string, OutlineVersionRow>();
+	let rest = [...new Map(keys.map((k) => [`${k.blockId}@${k.seq}`, k])).values()];
+	while (rest.length > 0) {
+		const round = new Map<string, { blockId: string; seq: number }>();
+		const later: typeof rest = [];
+		for (const key of rest) {
+			if (round.has(key.blockId)) later.push(key);
+			else round.set(key.blockId, key);
+		}
+		for (const v of await store.listVersionsAtSeqs([...round.values()])) {
+			const key = round.get(v.blockId);
+			if (key) out.set(`${v.blockId}@${key.seq}`, v);
+		}
+		rest = later;
+	}
+	return out;
+}
+
+function mergeRefusalText(m: Extract<AgentMerge, { ok: false }>): string {
+	return m.reason === "overlap"
+		? OUTLINE_TOOL_TEXT.edit.overlaps(m.overlaps ?? [])
+		: m.reason === "fields"
+			? OUTLINE_TOOL_TEXT.edit.bothChanged(m.fields ?? [])
+			: m.reason === "deleted"
+				? OUTLINE_TOOL_TEXT.edit.nowDeleted
+				: m.reason === "no-base"
+					? OUTLINE_TOOL_TEXT.edit.noBase
+					: OUTLINE_TOOL_TEXT.edit.mergeUnstable;
+}
+
 /**
  * The blocks a change rewrites (text, fields, checkbox), laid over each block as it is now:
- * unchanged since proposed, merged three ways from the version proposed against (text that does
- * not overlap, fields one by one; `agent-merge.ts`), or in conflict. What a confirmation writes
- * and what the proposer reads (review S-2) both come from here.
+ * unchanged since proposed, merged three ways (text that does not overlap, fields one by one;
+ * `agent-merge.ts`), or in conflict. Each rewrite merges from the version it was itself computed
+ * against (review N-1): a task change proposed before a person's change and a text rewrite
+ * proposed after it each meet that change where they should. What a confirmation writes and what
+ * the proposer reads (review S-2) both come from here.
  */
 export async function mergeProposal(
 	store: OutlineStore,
 	row: Pick<OutlinePendingRow, "spaceId" | "baseJson" | "opsJson">,
 ): Promise<Map<string, OutlineProposalMerge>> {
-	const ops = pendingOps(row);
-	const base = row.baseJson;
-	const rewritten = new Set<string>();
-	for (const op of ops) {
-		if ((op.op === "update" || op.op === "setTask") && "id" in op.block) rewritten.add(op.block.id);
+	const units: ProposalUnit[] = [];
+	for (const op of pendingOps(row)) {
+		if ((op.op !== "update" && op.op !== "setTask") || !("id" in op.block)) continue;
+		const base = opBase(op) ?? row.baseJson[op.block.id];
+		// A block the change adds has no base: it is written as proposed.
+		if (base !== undefined) units.push({ blockId: op.block.id, base, op });
 	}
 	const out = new Map<string, OutlineProposalMerge>();
-	if (rewritten.size === 0) return out;
+	if (units.length === 0) return out;
+	const byBlock = new Map<string, ProposalUnit[]>();
+	for (const u of units) byBlock.set(u.blockId, [...(byBlock.get(u.blockId) ?? []), u]);
 	const metas = new Map(
-		(await store.getBlockMetas(row.spaceId, { ids: [...rewritten] })).map((m) => [m.id, m]),
+		(await store.getBlockMetas(row.spaceId, { ids: [...byBlock.keys()] })).map((m) => [m.id, m]),
 	);
-	const changed: string[] = [];
-	for (const id of rewritten) {
+	const changed: Array<[string, ProposalUnit[]]> = [];
+	for (const [id, list] of byBlock) {
 		const meta = metas.get(id);
-		if (meta !== undefined && base[id] !== undefined && meta.versionSeq !== base[id])
-			changed.push(id);
+		if (meta && list.some((u) => u.base !== meta.versionSeq)) changed.push([id, list]);
 		else out.set(id, { state: "as-proposed" });
 	}
 	if (changed.length === 0) return out;
-	// The proposed text of each changed block (its version as proposed when only its fields were
-	// rewritten), and its task patch.
-	const baseVersions = new Map(
-		(
-			await store.listVersionsAtSeqs(
-				changed.map((id) => ({ blockId: id, seq: base[id] as number })),
-			)
-		).map((v) => [v.blockId, v]),
+	const versions = await versionsAt(
+		store,
+		changed.flatMap(([, list]) => list.map((u) => ({ blockId: u.blockId, seq: u.base }))),
 	);
-	const replaces: AgentReplace[] = [];
-	for (const id of changed) {
-		const update = ops.find(
-			(o): o is Extract<OutlineOp, { op: "update" }> =>
-				o.op === "update" && "id" in o.block && o.block.id === id,
-		);
-		const setTask = ops.find(
-			(o): o is Extract<OutlineOp, { op: "setTask" }> =>
-				o.op === "setTask" && "id" in o.block && o.block.id === id,
-		);
-		if (setTask?.task === null) {
-			// Taking the checkbox away: only while the task is as proposed against.
-			const before = baseVersions.get(id)?.taskJson ?? null;
-			if (JSON.stringify(before) !== JSON.stringify(metas.get(id)?.taskJson ?? null))
-				out.set(id, {
-					state: "conflict",
-					detail: OUTLINE_TOOL_TEXT.edit.bothChanged(["checkbox"]),
-				});
-			else out.set(id, { state: "as-proposed" });
-			continue;
-		}
-		replaces.push({
-			blockId: id,
-			seen: base[id] as number,
-			content: update?.content ?? baseVersions.get(id)?.content ?? "",
-			...(update?.alias !== undefined && update.alias !== null ? { alias: update.alias } : {}),
-			...(update?.tags !== undefined ? { tags: update.tags } : {}),
-			...(setTask?.task ? { task: setTask.task } : {}),
-		});
+	const at = (u: ProposalUnit) => versions.get(`${u.blockId}@${u.base}`);
+	interface Merged {
+		content?: { content: string; links: ExtractedLink[] };
+		current?: { content: string; links: ExtractedLink[] };
+		alias?: string;
+		tags?: string[];
+		task?: OutlineTaskPatch;
+		conflict?: string;
 	}
-	for (const m of await mergeAgentReplaces(store, replaces)) {
-		if (m.ok) {
-			out.set(m.blockId, {
+	const merged = new Map<string, Merged>();
+	const queue = new Map<string, ProposalUnit[]>();
+	for (const [id, list] of changed) {
+		const m: Merged = {};
+		merged.set(id, m);
+		const rest: ProposalUnit[] = [];
+		for (const u of list) {
+			if (u.op.op === "setTask" && u.op.task === null) {
+				// Taking the checkbox away: only while the task is as proposed against.
+				const before = at(u)?.taskJson ?? null;
+				if (JSON.stringify(before) !== JSON.stringify(metas.get(id)?.taskJson ?? null))
+					m.conflict ??= OUTLINE_TOOL_TEXT.edit.bothChanged(["checkbox"]);
+			} else rest.push(u);
+		}
+		queue.set(id, rest);
+	}
+	// Rewrites of one block computed against different versions merge one per round; each owns
+	// different fields (`mergePendingOps`), the text only one of them.
+	for (let round = 0; ; round++) {
+		const replaces: AgentReplace[] = [];
+		const owner = new Map<string, ProposalUnit>();
+		for (const [id, list] of queue) {
+			const u = list[round];
+			if (!u || merged.get(id)?.conflict) continue;
+			const baseText = at(u)?.content ?? "";
+			if (u.op.op === "update") {
+				replaces.push({
+					blockId: id,
+					seen: u.base,
+					content: u.op.content ?? baseText,
+					...(u.op.alias !== undefined && u.op.alias !== null ? { alias: u.op.alias } : {}),
+					...(u.op.tags !== undefined ? { tags: u.op.tags } : {}),
+				});
+			} else if (u.op.task !== null) {
+				replaces.push({ blockId: id, seen: u.base, content: baseText, task: u.op.task });
+			}
+			owner.set(id, u);
+		}
+		if (replaces.length === 0) break;
+		for (const r of await mergeAgentReplaces(store, replaces)) {
+			const m = merged.get(r.blockId) as Merged;
+			const u = owner.get(r.blockId) as ProposalUnit;
+			if (!r.ok) {
+				m.conflict ??= mergeRefusalText(r);
+				continue;
+			}
+			m.current ??= { content: r.content, links: r.links };
+			if (u.op.op === "update") {
+				if (u.op.content !== undefined) m.content = { content: r.content, links: r.links };
+				if (r.alias !== undefined) m.alias = r.alias;
+				if (r.tags !== undefined) m.tags = r.tags;
+			} else if (r.task !== undefined) m.task = { ...(m.task ?? {}), ...r.task };
+		}
+	}
+	for (const [id, m] of merged) {
+		const text = m.content ?? m.current;
+		if (m.conflict) out.set(id, { state: "conflict", detail: m.conflict });
+		else if (!text) out.set(id, { state: "as-proposed" });
+		else
+			out.set(id, {
 				state: "merged",
-				content: m.content,
-				links: m.links,
+				content: text.content,
+				links: text.links,
 				...(m.alias !== undefined ? { alias: m.alias } : {}),
 				...(m.tags !== undefined ? { tags: m.tags } : {}),
 				...(m.task !== undefined ? { task: m.task } : {}),
 			});
-		} else {
-			out.set(m.blockId, {
-				state: "conflict",
-				detail:
-					m.reason === "overlap"
-						? OUTLINE_TOOL_TEXT.edit.overlaps(m.overlaps ?? [])
-						: m.reason === "fields"
-							? OUTLINE_TOOL_TEXT.edit.bothChanged(m.fields ?? [])
-							: m.reason === "deleted"
-								? OUTLINE_TOOL_TEXT.edit.nowDeleted
-								: m.reason === "no-base"
-									? OUTLINE_TOOL_TEXT.edit.noBase
-									: OUTLINE_TOOL_TEXT.edit.mergeUnstable,
-			});
-		}
 	}
 	return out;
 }
 
+/** Rows one request's checks of deleted subtrees read at most, in all (main-thread rule). */
+export interface OutlineSubtreeBudget {
+	left: number;
+}
+
+/** Change flags of anyone's versions a deleted subtree's check leaves out: page changes only. */
+const PAGE_ONLY = OUTLINE_CHANGE.PAGE;
+/** Change flags of the proposer's versions it leaves out: all of them. */
+const ALL_CHANGES = 0x7fffffff;
+
 /**
- * Of the blocks a change deletes, those whose subtree changed since it was proposed: blocks under
- * it added, changed or gone, or the block itself changed (review S-9; the direct delete path
- * refuses the same, design §6.5). By block, how many. Reads each subtree level by level, bounded.
+ * Of the blocks a change deletes, those whose subtree others changed since it was proposed:
+ * blocks under it added, changed or gone, or the block itself changed, by anyone but the
+ * proposer (review S-9, N-2; the direct delete path refuses the same, design §6.5: "changes by
+ * others"). The proposer's own versions (the direct part of the same call, its later writes) and
+ * versions that only moved blocks to another page (the locked task moved) do not count; a block
+ * the proposer brought in that someone else created does (counting what cannot be told apart).
+ * By block, how many.
+ *
+ * Bounded: `only` limits it to some of the deletes (a diff checks the ones it shows), and
+ * `budget` caps the rows read across calls of one request; a subtree past it counts as changed.
  */
 export async function deletedSubtreeChanges(
 	store: OutlineStore,
-	row: Pick<OutlinePendingRow, "spaceId" | "baseJson" | "opsJson" | "subtreeJson">,
+	row: Pick<
+		OutlinePendingRow,
+		"spaceId" | "baseJson" | "opsJson" | "subtreeJson" | "requestedByJson"
+	>,
+	options: { only?: ReadonlySet<string>; budget?: OutlineSubtreeBudget } = {},
 ): Promise<Map<string, number>> {
 	const out = new Map<string, number>();
-	const deleted = pendingOps(row).flatMap((op) =>
-		op.op === "delete" && "id" in op.block ? [op.block.id] : [],
+	const deletes = pendingOps(row).flatMap((op) =>
+		op.op === "delete" &&
+		"id" in op.block &&
+		(options.only === undefined || options.only.has(op.block.id))
+			? [{ id: op.block.id, base: opBase(op) ?? row.baseJson[op.block.id] }]
+			: [],
 	);
-	if (deleted.length === 0) return out;
+	if (deletes.length === 0) return out;
+	const budget = options.budget ?? { left: OUTLINE_LIMITS.maxRowsTouched };
 	const metas = new Map(
-		(await store.getBlockMetas(row.spaceId, { ids: deleted })).map((m) => [m.id, m]),
+		(await store.getBlockMetas(row.spaceId, { ids: deletes.map((d) => d.id) })).map((m) => [
+			m.id,
+			m,
+		]),
 	);
-	const max = OUTLINE_LIMITS.maxRowsTouched;
-	for (const id of deleted) {
-		const recorded = row.subtreeJson[id] ?? {};
-		const meta = metas.get(id);
-		let changed = meta && row.baseJson[id] !== undefined && meta.versionSeq !== row.baseJson[id];
-		let n = changed ? 1 : 0;
+	const keys: Array<{ blockId: string; afterSeq: number; of: string }> = [];
+	const over = new Set<string>();
+	for (const d of deletes) {
+		const recorded = row.subtreeJson[d.id] ?? {};
+		const meta = metas.get(d.id);
+		if (meta && d.base !== undefined && meta.versionSeq !== d.base)
+			keys.push({ blockId: d.id, afterSeq: d.base, of: d.id });
 		const seen = new Set<string>();
-		let frontier = meta && !meta.deleted ? [id] : [];
-		let read = 0;
+		let frontier = meta && !meta.deleted ? [d.id] : [];
 		while (frontier.length > 0) {
-			const kids = await store.listChildMetas(row.spaceId, frontier, max - read + 1);
-			read += kids.length;
-			if (read > max) {
-				n = Math.max(n, 1);
+			const kids = await store.listChildMetas(row.spaceId, frontier, Math.max(budget.left, 0) + 1);
+			budget.left -= kids.length;
+			if (budget.left < 0) {
+				over.add(d.id);
 				break;
 			}
 			for (const kid of kids) {
 				seen.add(kid.id);
-				if (recorded[kid.id] !== kid.versionSeq) n++;
+				const was = recorded[kid.id];
+				// Added since (or brought in): any version by someone else counts.
+				if (was === undefined) keys.push({ blockId: kid.id, afterSeq: 0, of: d.id });
+				else if (was !== kid.versionSeq) keys.push({ blockId: kid.id, afterSeq: was, of: d.id });
 			}
 			frontier = kids.map((k) => k.id);
 		}
-		// Blocks that were under it and are gone (deleted or moved away) count as changes too.
-		for (const was of Object.keys(recorded)) if (!seen.has(was)) n++;
-		changed = n > 0;
-		if (changed) out.set(id, n);
+		// Under it then and not now: deleted or moved away since.
+		for (const [was, seq] of Object.entries(recorded))
+			if (!seen.has(was) && !over.has(d.id)) keys.push({ blockId: was, afterSeq: seq, of: d.id });
 	}
+	budget.left -= keys.length;
+	if (keys.length > 0 && budget.left >= 0) {
+		const of = new Map(keys.map((k) => [k.blockId, k.of]));
+		const writes = await store.findLastWrites(
+			keys.map(({ blockId, afterSeq }) => ({ blockId, afterSeq })),
+			{
+				actorKind: row.requestedByJson.kind,
+				actorId: row.requestedByJson.id,
+				flags: ALL_CHANGES,
+				anyoneFlags: PAGE_ONLY,
+			},
+		);
+		for (const w of writes) {
+			const d = of.get(w.blockId);
+			if (d !== undefined) out.set(d, (out.get(d) ?? 0) + 1);
+		}
+	} else if (keys.length > 0) {
+		for (const k of keys) over.add(k.of);
+	}
+	for (const d of over) out.set(d, Math.max(out.get(d) ?? 0, 1));
 	return out;
 }
 
 /**
  * The stored operations, rebased onto the blocks as they are now (`mergeProposal`); structural
  * operations go as they are (the write path checks the targets exist and nothing lands under
- * itself), except a delete whose subtree changed since it was proposed. Throws
+ * itself), except a delete whose subtree others changed since it was proposed. Throws
  * {@link OutlinePendingError} (`OUTLINE_PENDING_CONFLICT`) naming what no longer applies.
  */
 async function rebase(
 	store: OutlineStore,
 	row: OutlinePendingRow,
 ): Promise<{ ops: OutlineOp[]; canonical: Array<OutlineCanonicalContent | undefined> }> {
-	const ops = pendingOps(row).map((op) => {
+	const ops: Array<OutlineOp | null> = pendingOps(row).map((op) => {
 		const { baseVersionSeq: _base, ...rest } = op as OutlineOp & { baseVersionSeq?: number };
 		return rest as OutlineOp;
 	});
@@ -393,7 +512,9 @@ async function rebase(
 	for (const [id, m] of merges) {
 		if (m.state === "conflict") conflicts.push(`[${sids.get(id) ?? id}] ${m.detail}`);
 	}
-	const subtrees = await deletedSubtreeChanges(store, row);
+	const subtrees = await deletedSubtreeChanges(store, row, {
+		budget: { left: 2 * OUTLINE_LIMITS.maxRowsTouched },
+	});
 	if (subtrees.size > 0) {
 		const deletedSids = new Map(
 			(await store.getBlockMetas(row.spaceId, { ids: [...subtrees.keys()] })).map((m) => [
@@ -411,11 +532,21 @@ async function rebase(
 			conflicts,
 		);
 	}
+	// A merged block's rewrites become one: its first update carries the merged text and fields,
+	// its first task change the merged patch; the others are dropped.
+	const written = new Set<string>();
 	for (let k = 0; k < ops.length; k++) {
 		const op = ops[k] as OutlineOp;
-		if (!("block" in op) || !("id" in op.block)) continue;
+		if ((op.op !== "update" && op.op !== "setTask") || !("id" in op.block)) continue;
 		const m = merges.get(op.block.id);
 		if (m?.state !== "merged") continue;
+		if (op.op === "setTask" && op.task === null) continue;
+		const key = `${op.op}:${op.block.id}`;
+		if (written.has(key)) {
+			ops[k] = null;
+			continue;
+		}
+		written.add(key);
 		if (op.op === "update") {
 			const { alias: _a, tags: _t, ...rest } = op;
 			ops[k] = {
@@ -425,14 +556,16 @@ async function rebase(
 				...(m.tags !== undefined ? { tags: m.tags } : {}),
 				merged: true,
 			};
-		} else if (op.op === "setTask" && op.task !== null) {
+		} else {
 			// Only the fields the proposal changed and nobody else did; none left, no change.
 			ops[k] = { ...op, task: m.task ?? ({} as OutlineTaskPatch) };
 		}
 	}
 	// A task patch the merge emptied changes nothing: drop it.
 	const kept = ops.filter(
-		(op) => !(op.op === "setTask" && op.task !== null && Object.keys(op.task).length === 0),
+		(op): op is OutlineOp =>
+			op !== null &&
+			!(op.op === "setTask" && op.task !== null && Object.keys(op.task).length === 0),
 	);
 	const canonical = kept.map((op) =>
 		(op.op === "insert" || op.op === "update" || op.op === "restore") && op.content !== undefined
@@ -830,13 +963,25 @@ export async function readPendingDiff(
 			ids.add(op.parent.id);
 	}
 	const blocks = new Map((await store.getBlocks([...ids])).map((b) => [b.id, b]));
-	const baseSeqs = Object.entries(row.baseJson).filter(([id]) => ids.has(id));
-	const baseVersions = new Map(
-		(await store.listVersionsAtSeqs(baseSeqs.map(([blockId, seq]) => ({ blockId, seq })))).map(
-			(v) => [v.blockId, v],
-		),
+	// Each entry against the version its operation was computed against (review N-1).
+	const baseOfOp = (op: OutlineOp): number | undefined =>
+		op.op !== "insert" && "id" in op.block ? (opBase(op) ?? row.baseJson[op.block.id]) : undefined;
+	const baseVersions = await versionsAt(
+		store,
+		shown.flatMap((op) => {
+			const seq = baseOfOp(op);
+			return seq !== undefined && op.op !== "insert" && "id" in op.block
+				? [{ blockId: op.block.id, seq }]
+				: [];
+		}),
 	);
-	const subtrees = await deletedSubtreeChanges(store, row);
+	// Only the deletes the diff shows, within one request's budget (main-thread rule).
+	const subtrees = await deletedSubtreeChanges(store, row, {
+		only: new Set(
+			shown.flatMap((op) => (op.op === "delete" && "id" in op.block ? [op.block.id] : [])),
+		),
+		budget: { left: OUTLINE_LIMITS.maxRowsTouched },
+	});
 	const titleOfBlock = (id: string | undefined) => {
 		const b = id ? blocks.get(id) : undefined;
 		return b ? titleOf(b.content).slice(0, 200) : null;
@@ -859,8 +1004,8 @@ export async function readPendingDiff(
 		}
 		const id = "id" in op.block ? op.block.id : "";
 		const now = blocks.get(id);
-		const baseSeq = row.baseJson[id];
-		const base = baseVersions.get(id);
+		const baseSeq = baseOfOp(op);
+		const base = baseSeq === undefined ? undefined : baseVersions.get(`${id}@${baseSeq}`);
 		const changedSince =
 			baseSeq !== undefined && (!now || now.deleted || now.versionSeq !== baseSeq);
 		const nowText = now && !now.deleted ? now.content : null;

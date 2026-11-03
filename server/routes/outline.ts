@@ -594,12 +594,17 @@ async function describePending(
 	rows: readonly OutlinePendingHead[],
 ): Promise<OutlinePendingSummary[]> {
 	if (rows.length === 0) return [];
-	const rootIds = [...new Set(rows.flatMap((r) => (r.rootBlockId ? [r.rootBlockId] : [])))];
+	const rootIds = rows.flatMap((r) => (r.rootBlockId ? [r.rootBlockId] : []));
+	// The parents of the blocks each adds that exist (one added under another is not one).
+	const parentIds = rows.flatMap((r) =>
+		r.addsJson.flatMap((add) => (add.parentId ? [add.parentId] : [])),
+	);
 	const [roots, changed, writes] = await Promise.all([
-		outlineStore.getBlockMetas(space.id, { ids: rootIds }),
+		outlineStore.getBlockMetas(space.id, { ids: [...new Set([...rootIds, ...parentIds])] }),
 		pendingBaseChanged(rows),
 		canWriteSpace(principal, space),
 	]);
+	const live = new Set(roots.flatMap((m) => (m.deleted ? [] : [m.id])));
 	const locks = new Map(
 		roots.flatMap((m) =>
 			!m.deleted && m.taskJson?.lock ? [[m.id, m.taskJson.lock] as const] : [],
@@ -643,6 +648,13 @@ async function describePending(
 					: null,
 			},
 			blockIds: row.blockIdsJson,
+			addedUnder: [
+				...new Set(
+					row.addsJson.flatMap((add) =>
+						add.parentId && live.has(add.parentId) ? [add.parentId] : [],
+					),
+				),
+			],
 			ops: row.opCount,
 			changedSince: changed.has(row.id),
 			canDecide:

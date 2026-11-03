@@ -2691,7 +2691,8 @@ async function claimedWire(error: OutlineTaskClaimedError): Promise<LiveClaimedW
 /**
  * Errors of the write path that mean "the structure moved under this transaction", or someone
  * else got there first (a task another session or person is doing: setting it to in progress
- * is refused).
+ * is refused), or the state of others' work stands in the way (a lock only its locker, a
+ * manager or an admin may change; a page full of changes waiting for confirmation).
  */
 export function isConflict(error: unknown): boolean {
 	return (
@@ -2706,6 +2707,8 @@ export function isConflict(error: unknown): boolean {
 				"OUTLINE_TASK_CLAIMED",
 				"OUTLINE_LOCK_DENIED",
 				"OUTLINE_LOCK_HELD",
+				// A locked task moving to a page with as many open changes as it may hold.
+				"OUTLINE_PENDING_FULL",
 			].includes(error.code))
 	);
 }

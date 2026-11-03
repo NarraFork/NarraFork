@@ -13,6 +13,7 @@ import { OutlineWriteError } from "../errors";
 import { OUTLINE_PENDING_LIMITS, outlinePendingLabel } from "../model";
 import {
 	confirmOutlinePending,
+	deletedSubtreeChanges,
 	findTasksWaitingForConfirmation,
 	lockOutlineTask,
 	mergeProposal,
@@ -426,8 +427,13 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			expect(row.rev).toBe(3);
 			expect(row.baseJson[ids.s1]).toBe(s1Now);
 			expect(pendingOps(row)).toEqual([
-				{ op: "update", block: { id: ids.s1 }, content: "v2" },
-				{ op: "update", block: { id: ids.acc }, content: "Acceptance: v2" },
+				{ op: "update", block: { id: ids.s1 }, baseVersionSeq: s1Now, content: "v2" },
+				{
+					op: "update",
+					block: { id: ids.acc },
+					baseVersionSeq: expect.any(Number),
+					content: "Acceptance: v2",
+				},
 			]);
 			// The subagent proposed under its own narrator; its session is its root's.
 			expect(row.requestedByJson.narratorId).toBe(p.narrators.sub);
@@ -1070,6 +1076,11 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 					{ store: ctx.store },
 				),
 			).toEqual(new Set());
+			// It is marked, though (review N-3): the block view lists the change on the root.
+			const view = await readBlockView({ blockId: ids.root, view: "all", store: ctx.store });
+			expect(view?.blocks.find((b) => b.id === ids.root)?.pending).toEqual([
+				once.pending?.id as string,
+			]);
 			// Splitting a leaf of the plan is direct; so is a task under a task not of the plan (one
 			// another person added after the lock).
 			const split = await write(ctx, space, a, [
@@ -1139,7 +1150,12 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			]);
 			const row = await pendingRow(ctx, first.pending?.id as string);
 			expect(pendingOps(row)).toEqual([
-				{ op: "setTask", block: { id: ids.s2 }, task: { due: "2026-12-01" } },
+				{
+					op: "setTask",
+					block: { id: ids.s2 },
+					baseVersionSeq: expect.any(Number),
+					task: { due: "2026-12-01" },
+				},
 			]);
 			expect(row.opCount).toBe(1);
 		},
@@ -1359,6 +1375,215 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			]);
 			expect(moved.commit).not.toBeNull();
 			expect((await openPending(ctx, otherPage as string)).length).toBe(2);
+		},
+	},
+	{
+		name: "pending: each rewrite merges from the version it was computed against (review N-1): a task change proposed before a person changed it conflicts though the text was proposed again since; untouched, both apply",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const first = await write(ctx, space, a, [
+				{ op: "setTask", block: { id: ids.s1 }, task: { due: "2026-12-01" } },
+			]);
+			await write(ctx, space, p.locker, [
+				{ op: "setTask", block: { id: ids.s1 }, task: { due: "2026-11-15" } },
+			]);
+			await write(ctx, space, a, [
+				{ op: "update", block: { id: ids.s1 }, content: "Parse the header, faster" },
+			]);
+			const row = await pendingRow(ctx, first.pending?.id as string);
+			const [task, text] = pendingOps(row) as Array<OutlineOp & { baseVersionSeq: number }>;
+			expect([task?.op, text?.op]).toEqual(["setTask", "update"]);
+			expect(task?.baseVersionSeq).toBeLessThan(text?.baseVersionSeq as number);
+			expect(row.baseJson[ids.s1]).toBe(task?.baseVersionSeq as number);
+			const refused = await refusedWith(
+				confirmOutlinePending({
+					pendingId: row.id,
+					by: { kind: "human", userId: p.lockerId },
+					store: ctx.store,
+				}),
+				OutlinePendingError,
+			);
+			expect(refused.pendingCode).toBe("OUTLINE_PENDING_CONFLICT");
+			expect(refused.details.join("\n")).toContain("due date");
+			expect((await ctx.store.getBlock(ids.s1))?.taskJson?.due).toBe("2026-11-15");
+			expect(await contentOf(ctx, ids.s1)).toBe("Parse the header");
+			// The person changed the text instead: the due date and the text proposed over it apply.
+			const q = await lockedPlan(ctx);
+			const second = await write(ctx, q.space, q.a, [
+				{ op: "setTask", block: { id: q.ids.s1 }, task: { due: "2026-12-01" } },
+			]);
+			await write(ctx, q.space, q.locker, [
+				{ op: "update", block: { id: q.ids.s1 }, content: "Parse the header carefully" },
+			]);
+			await write(ctx, q.space, q.a, [
+				{ op: "update", block: { id: q.ids.s1 }, content: "Parse the header carefully, fast" },
+			]);
+			await confirmOutlinePending({
+				pendingId: second.pending?.id as string,
+				by: { kind: "human", userId: q.lockerId },
+				store: ctx.store,
+			});
+			const s1 = await ctx.store.getBlock(q.ids.s1);
+			expect(s1?.content).toBe("Parse the header carefully, fast");
+			expect(s1?.taskJson?.due).toBe("2026-12-01");
+			checkSpaceInvariants(await ctx.dump(q.space.id));
+		},
+	},
+	{
+		name: "confirm a delete: the proposer's own changes (the same call's direct part, its later writes) and page moves are not others' (review N-2); the check is bounded",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const call = await write(ctx, space, a, [
+				{ op: "insert", parent: { id: ids.s2 }, content: "why: duplicated by step one" },
+				{ op: "delete", block: { id: ids.s2 } },
+			]);
+			expect(held(call)).toEqual([1]);
+			const why = call.results[0]?.blockId as string;
+			// The proposer starts the step meanwhile (progress is written directly).
+			const started = await write(ctx, space, a, [
+				{ op: "setTask", block: { id: ids.s2 }, task: { status: "doing" } },
+			]);
+			expect(started.pending).toBeUndefined();
+			// The locker moves the plan to another page: what is under it changes page only.
+			await write(ctx, space, p.locker, [
+				{ op: "move", block: { id: ids.root }, parent: { id: ids.other } },
+			]);
+			const row = await pendingRow(ctx, call.pending?.id as string);
+			expect(await deletedSubtreeChanges(ctx.store, row)).toEqual(new Map());
+			// Bounded: what the budget does not reach counts as changed; `only` limits what is read.
+			expect(await deletedSubtreeChanges(ctx.store, row, { budget: { left: 0 } })).toEqual(
+				new Map([[ids.s2, 1]]),
+			);
+			expect(await deletedSubtreeChanges(ctx.store, row, { only: new Set() })).toEqual(new Map());
+			const diff = await readPendingDiff(row, { store: ctx.store });
+			expect(diff.entries.find((e) => e.kind === "delete")?.changedUnder).toBeUndefined();
+			await confirmOutlinePending({
+				pendingId: row.id,
+				by: { kind: "human", userId: p.lockerId },
+				store: ctx.store,
+			});
+			expect((await ctx.store.getBlock(ids.s2))?.deleted).toBe(true);
+			expect((await ctx.store.getBlock(why))?.deleted).toBe(true);
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "locked plan: a task an operation's text splits off adds a step like an inserted one (review N-4): an update's, an insert's; splitting a leaf's text is direct",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const taskKids = async (id: string) =>
+				(await ctx.store.listChildMetas(space.id, [id], 100)).filter(
+					(m) => !m.deleted && m.taskJson,
+				).length;
+			const note = (
+				await write(ctx, space, a, [{ op: "insert", parent: { id: ids.root }, content: "a note" }])
+			).results[0]?.blockId as string;
+			const viaUpdate = await write(ctx, space, a, [
+				{ op: "update", block: { id: note }, content: "a note\n\n- [ ] Deploy to production" },
+			]);
+			expect(held(viaUpdate)).toEqual([0]);
+			expect(viaUpdate.commit).toBeNull();
+			const viaInsert = await write(ctx, space, a, [
+				{ op: "insert", parent: { id: ids.root }, content: "Phase 2\n\n- [ ] Ship to prod" },
+			]);
+			expect(held(viaInsert)).toEqual([0]);
+			const phase = viaInsert.results[0]?.blockId as string;
+			expect(await ctx.store.getBlock(phase)).toBeNull();
+			expect(await taskKids(note)).toBe(0);
+			// A plan leaf's text splitting off a sub-task splits the leaf: direct.
+			const leaf = await write(ctx, space, a, [
+				{ op: "update", block: { id: ids.s2 }, content: "Load the rows\n\n- [ ] in batches" },
+			]);
+			expect(leaf.pending).toBeUndefined();
+			expect(await taskKids(ids.s2)).toBe(1);
+			// Confirmed, the split tasks are where the text put them.
+			await confirmOutlinePending({
+				pendingId: viaUpdate.pending?.id as string,
+				by: { kind: "human", userId: p.lockerId },
+				store: ctx.store,
+			});
+			expect(await taskKids(note)).toBe(1);
+			expect(await taskKids(phase)).toBe(1);
+			expect(await contentOf(ctx, note)).toBe("a note");
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "locks: a revert or a restore by someone who may not change the lock leaves it as it is: no delegate switched back, no lock put back in the locker's name; an agent's lock is its session's",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, ids } = p;
+			const d1 = await ctx.seedNarrator();
+			const d2 = await ctx.seedNarrator();
+			await lockOutlineTask({
+				blockId: ids.root,
+				userId: p.lockerId,
+				delegate: d1,
+				store: ctx.store,
+			});
+			const change = await lockOutlineTask({
+				blockId: ids.root,
+				userId: p.lockerId,
+				delegate: d2,
+				store: ctx.store,
+			});
+			const carol = await ctx.seedUser();
+			const revertAs = (userId: string, commitId: string) =>
+				revertCommit(
+					{ commitId, actor: { kind: "human", id: userId }, responsibleUserId: userId },
+					{ store: ctx.store },
+				);
+			const back = await revertAs(carol, change.commit?.id as string);
+			expect(back.commit).toBeNull();
+			expect(back.changed).toEqual([]);
+			expect(back.notes.map((n) => n.adjustment)).toEqual([
+				{ kind: "lock-kept", blockId: ids.root },
+			]);
+			expect((await ctx.store.getBlock(ids.root))?.taskJson?.lock?.delegate).toBe(d2);
+			// Unlocked by the locker; Carol's revert of that puts no lock back in their name.
+			const unlocked = await unlockOutlineTask({
+				blockId: ids.root,
+				userId: p.lockerId,
+				store: ctx.store,
+			});
+			const relock = await revertAs(carol, unlocked.commit?.id as string);
+			expect(relock.commit).toBeNull();
+			expect((await ctx.store.getBlock(ids.root))?.taskJson?.lock).toBeUndefined();
+			// The locker's own revert does.
+			await revertAs(p.lockerId, unlocked.commit?.id as string);
+			expect((await ctx.store.getBlock(ids.root))?.taskJson?.lock?.by.id).toBe(p.lockerId);
+			// Carol bringing the deleted locked task back brings it back without the lock.
+			await write(ctx, space, p.locker, [{ op: "delete", block: { id: ids.root } }]);
+			const restored = await write(ctx, space, { kind: "human", userId: carol }, [
+				{ op: "restore", block: { id: ids.root } },
+			]);
+			expect(restored.results[0]?.adjustments).toContainEqual({
+				kind: "lock-kept",
+				blockId: ids.root,
+			});
+			const root = await ctx.store.getBlock(ids.root);
+			expect(root?.deleted).toBe(false);
+			expect(root?.taskJson?.lock).toBeUndefined();
+			// A lock an agent holds (agents no longer lock; older data has them): its session's
+			// subagent may take it away, as the locker.
+			const agentPlan = (
+				await write(ctx, space, p.locker, [
+					{ op: "insert", parent: null, content: "Agent's plan", task: { status: "todo" } },
+				])
+			).results[0]?.blockId as string;
+			await write(ctx, space, "system", [
+				{
+					op: "setTask",
+					block: { id: agentPlan },
+					task: { lock: { by: { kind: "agent", id: p.narrators.a } } },
+				},
+			]);
+			await write(ctx, space, p.sub, [{ op: "delete", block: { id: agentPlan } }]);
+			expect((await ctx.store.getBlock(agentPlan))?.deleted).toBe(true);
+			checkSpaceInvariants(await ctx.dump(space.id));
 		},
 	},
 ];

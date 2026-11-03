@@ -9,7 +9,8 @@
  *     the touched block shows "Waiting for confirmation" in the editor, the side panel grows a
  *     "To confirm" tab with the change's diff, and confirming it there writes it (the editor
  *     shows the confirmed text) and the tab goes;
- *   - rejecting one there, with a reason, writes nothing and the marks go;
+ *   - a change rewriting a step and adding one marks the step and the new step's parent;
+ *     rejecting it there, with a reason, writes nothing and the marks go;
  *   - the facts view's "in progress" marker lists the open tasks under a fact and focuses one;
  *     a fact with only done tasks under it shows how many blocks are left out instead.
  */
@@ -246,11 +247,15 @@ function call<T>(page: Page, fn: (f: typeof Fixture, ...args: never[]) => T, ...
 async function until(
 	page: Page,
 	what: string,
-	fn: (f: typeof Fixture) => boolean,
+	fn: (f: typeof Fixture, ...args: never[]) => boolean,
 	timeout = 10_000,
+	...args: unknown[]
 ) {
 	try {
-		await page.waitForFunction(`(${fn.toString()})(window.fixture)`, { timeout, polling: 50 });
+		await page.waitForFunction(`(${fn.toString()})(window.fixture, ...${JSON.stringify(args)})`, {
+			timeout,
+			polling: 50,
+		});
 	} catch (error) {
 		const text = await page
 			.evaluate(() => document.body.innerText.slice(0, 2000))
@@ -390,14 +395,18 @@ test("rejecting an agent's change from the To confirm tab, with a reason, writes
 		await until(page, "locked", (f) => f.count("[data-testid=outline-unlock]") === 1);
 		await subscribed(p.root);
 
+		// A rewrite of a step, and a new step: the step and the new step's parent are marked.
 		const held = await writeOutline({
 			spaceId: space.id,
-			ops: [{ op: "update", block: { id: p.two }, content: "Load the rows twice" }],
+			ops: [
+				{ op: "update", block: { id: p.two }, content: "Load the rows twice" },
+				{ op: "insert", parent: { id: p.root }, content: "Validate", task: { status: "todo" } },
+			],
 			actor: { kind: "agent", id: agent },
 			narratorId: agent,
 			responsibleUserId: owner,
 		});
-		expect(held.pending).toBeDefined();
+		expect(held.pending?.opIndexes).toEqual([0, 1]);
 		await until(
 			page,
 			"the To confirm tab",
@@ -405,14 +414,22 @@ test("rejecting an agent's change from the To confirm tab, with a reason, writes
 		);
 		await until(
 			page,
-			"the step marked",
-			(f) => f.count("[data-testid=outline-pending-badge]") >= 1,
+			"the step and the plan marked",
+			(f, ids: string[]) =>
+				ids.every(
+					(id) =>
+						f.count(
+							`.ob-block[data-id="${id}"] > .ob-marks [data-testid=outline-pending-badge]`,
+						) === 1,
+				),
+			10_000,
+			[p.two, p.root],
 		);
 		await call(page, (f) => f.click("[data-testid=outline-pending-tab]"));
 		await until(
 			page,
 			"the change's diff",
-			(f) => f.count("[data-testid=outline-pending-entry]") === 1,
+			(f) => f.count("[data-testid=outline-pending-entry]") === 2,
 		);
 		await call(page, (f) =>
 			f.type(

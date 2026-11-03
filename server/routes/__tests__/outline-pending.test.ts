@@ -485,9 +485,16 @@ describe("review round 1", () => {
 		const locked = await call<OutlineLockResponse>(alice, lockPath, "POST", {});
 		const commitId = locked.body.commit?.id as string;
 		const proposed = await propose([{ op: "update", block: { id: p.one }, content: "x" }]);
-		const kept = await call<{ adjusted: number }>(writer, `/commits/${commitId}/revert`, "POST");
+		const kept = await call<{ adjusted: number; changed: number; commit: unknown }>(
+			writer,
+			`/commits/${commitId}/revert`,
+			"POST",
+		);
 		expect(kept.status).toBe(200);
 		expect(kept.body.adjusted).toBe(1);
+		// Nothing else to put back: nothing written, nothing reported changed (review round 2).
+		expect(kept.body.commit).toBeNull();
+		expect(kept.body.changed).toBe(0);
 		expect((await outlineStore.getBlock(p.root))?.taskJson?.lock?.by.id).toBe(alice.id);
 		expect((await outlineStore.getPending([proposed.pending?.id as string]))[0]?.status).toBe(
 			"open",
@@ -497,5 +504,30 @@ describe("review round 1", () => {
 		expect((await outlineStore.getPending([proposed.pending?.id as string]))[0]?.status).toBe(
 			"withdrawn",
 		);
+	});
+
+	test("a proposed new step marks its parent in the page summary and the block view, without making it wait (N-3)", async () => {
+		const p = await plan();
+		await call(alice, `/spaces/${space.id}/blocks/${p.root}/lock`, "POST", {});
+		const proposed = await propose([
+			{ op: "insert", parent: { id: p.root }, content: "Step three", task: { status: "todo" } },
+		]);
+		const summary = await call<OutlinePagePendingResponse>(
+			alice,
+			`/spaces/${space.id}/pages/${p.root}/pending`,
+		);
+		expect(summary.body.pending[0]).toMatchObject({
+			id: proposed.pending?.id,
+			blockIds: [],
+			addedUnder: [p.root],
+		});
+		const view = await call<OutlineBlockViewResponse>(
+			alice,
+			`/spaces/${space.id}/blocks/${p.root}?view=all`,
+		);
+		expect(view.body.blocks.find((b) => b.id === p.root)?.pending).toEqual([
+			proposed.pending?.id as string,
+		]);
+		expect(view.body.blocks.find((b) => b.id === p.one)?.pending).toEqual([]);
 	});
 });
