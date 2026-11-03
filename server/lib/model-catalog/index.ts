@@ -59,6 +59,10 @@ export interface ModelCatalogSettings {
 }
 
 export type { CatalogQuery } from "@shared/model-catalog/resolve";
+
+/** Built-in providers whose prefix is also the catalog's channel key. */
+const PUBLIC_PROVIDER_KEYS = ["codex", "anthropic", "openai", "gemini"];
+
 export type { CatalogStatus } from "@shared/model-catalog/schema/api";
 
 // ---------------------------------------------------------------------------
@@ -216,13 +220,22 @@ export function getModelOverride(scope: OverrideScope, key: string): ModelOverri
 let settingsRef: NarraForkSettings | undefined;
 let persistSettings: (() => void) | undefined;
 
+/**
+ * The update preference. It is owned here, not read back from whatever settings object
+ * is saved next: on load and hot reload the document on disk sets it, and only
+ * `setModelCatalogAutoUpdate` changes it at runtime.
+ */
+let preference: boolean | undefined;
+
 export function bindModelCatalogSettings(settings: NarraForkSettings, save: () => void): void {
 	settingsRef = settings;
 	persistSettings = save;
+	const stored = settings.agent.modelCatalog?.autoUpdate;
+	if (typeof stored === "boolean") preference = stored;
 }
 
 function autoUpdate(): boolean {
-	return settingsRef?.agent.modelCatalog?.autoUpdate ?? true;
+	return preference ?? true;
 }
 
 /** Merge imported overrides; per key, the incoming value replaces the stored one. */
@@ -267,9 +280,15 @@ function importLegacyLocal(stored: Record<string, unknown>): void {
 			add(connections, id.slice(WINDOW_BINDING_PREFIX.length), binding.overrides);
 			continue;
 		}
-		const prefix = providers.find((p) => p.id === binding.providerId)?.prefix;
+		// Built-in providers were named by their prefix rather than a connection id.
+		const providerId = String(binding.providerId ?? "");
+		const prefix =
+			providers.find((p) => p.id === providerId)?.prefix ??
+			(PUBLIC_PROVIDER_KEYS.includes(providerId) ? providerId : undefined);
+		// A gateway binding named its channel apart from the bare upstream model.
+		const channel = typeof binding.channelId === "string" ? `${binding.channelId}:` : "";
 		if (prefix && typeof binding.upstreamModelId === "string")
-			add(connections, `${prefix}:${binding.upstreamModelId}`, binding.overrides);
+			add(connections, `${prefix}:${channel}${binding.upstreamModelId}`, binding.overrides);
 	}
 	const dropped = ["models", "variants"].filter(
 		(key) => Array.isArray(local![key]) && (local![key] as unknown[]).length,
@@ -343,12 +362,31 @@ function importPreCatalogSettings(settings: NarraForkSettings): void {
 		);
 		if (id && Object.keys(prices).length) merge(models, id, normalizeOverride({ prices }));
 	}
+	mergeOverrides(models, connections);
+}
+
+/**
+ * The per-model window map older builds kept at `agent.modelContextWindows`, beside or
+ * before the catalog. Where it disagrees with an imported override it is what the
+ * provider page showed, so it wins. Hand-edited numeric strings are accepted.
+ */
+function importWindowMap(settings: NarraForkSettings): void {
 	const windows = (settings.agent as { modelContextWindows?: Record<string, unknown> })
 		.modelContextWindows;
-	for (const [model, window] of Object.entries(windows ?? {}))
-		if (typeof window === "number" && Number.isSafeInteger(window) && window > 0)
-			merge(connections, model.trim(), { contextWindow: window });
-	mergeOverrides(models, connections);
+	const connections = new Map<string, ModelOverride>();
+	for (const [model, raw] of Object.entries(windows ?? {})) {
+		const value = typeof raw === "string" && /^\d+$/.test(raw.trim()) ? Number(raw) : raw;
+		try {
+			const window = normalizeOverride({ contextWindow: value }).contextWindow;
+			const key = model.trim();
+			if (window && key.includes(":"))
+				connections.set(key, { ...getModelOverride("connection", key), contextWindow: window });
+		} catch {
+			/* An unusable entry never stops startup. */
+		}
+	}
+	mergeOverrides(new Map(), connections);
+	delete (settings.agent as { modelContextWindows?: unknown }).modelContextWindows;
 }
 
 /**
@@ -357,17 +395,17 @@ function importPreCatalogSettings(settings: NarraForkSettings): void {
  */
 export function migrateModelCatalogSettings(settings: NarraForkSettings): boolean {
 	const stored = settings.agent.modelCatalog as unknown as Record<string, unknown> | undefined;
-	if (stored && Object.keys(stored).length === 1 && typeof stored.autoUpdate === "boolean")
-		return false;
-	if (stored) importModelCatalogSettings(stored, settings);
-	else importPreCatalogSettings(settings);
+	const hasWindowMap = "modelContextWindows" in settings.agent;
+	const current =
+		stored && Object.keys(stored).length === 1 && typeof stored.autoUpdate === "boolean";
+	if (stored && !current) importModelCatalogSettings(stored, settings);
+	else if (!stored) importPreCatalogSettings(settings);
+	if (hasWindowMap) importWindowMap(settings);
 	// A pinned catalog was a request not to move; anything else takes the new default.
 	const legacyAuto = typeof stored?.autoApply === "boolean" ? !stored.pinnedVersion : undefined;
-	settings.agent.modelCatalog = {
-		autoUpdate: typeof stored?.autoUpdate === "boolean" ? stored.autoUpdate : (legacyAuto ?? true),
-	};
-	delete (settings.agent as { modelContextWindows?: unknown }).modelContextWindows;
-	return true;
+	preference = typeof stored?.autoUpdate === "boolean" ? stored.autoUpdate : (legacyAuto ?? true);
+	settings.agent.modelCatalog = { autoUpdate: preference };
+	return !current || hasWindowMap;
 }
 
 /**
@@ -444,8 +482,6 @@ const listingWindows: ListingWindows[] = [];
 export function registerListingWindows(lookup: ListingWindows): void {
 	listingWindows.push(lookup);
 }
-
-const PUBLIC_PROVIDER_KEYS = ["codex", "anthropic", "openai", "gemini"];
 
 /** The catalog query and any discovered metadata for a full model value. */
 export function queryForModel(model: string): { query: CatalogQuery; discovered?: RawMetadata } {
@@ -806,6 +842,7 @@ export function restoreBuiltinModelCatalog(): CatalogStatus {
 
 export function setModelCatalogAutoUpdate(value: boolean): CatalogStatus {
 	if (typeof value !== "boolean") throw new Error("autoUpdate must be true or false");
+	preference = value;
 	if (settingsRef) {
 		settingsRef.agent.modelCatalog = { autoUpdate: value };
 		persistSettings?.();

@@ -173,7 +173,11 @@ export function overrideToRaw(override: ModelOverride): RawMetadata {
 	if (override.nativeSearch !== undefined) raw.supports_web_search = override.nativeSearch;
 	if (override.reasoningLevels) {
 		raw.reasoning_effort_levels = [...override.reasoningLevels];
-		if (override.reasoningLevels.length) raw.reasoning_mode = "levels";
+		// Listing levels is a claim that the model reasons; an empty list says nothing more.
+		if (override.reasoningLevels.length) {
+			raw.reasoning_mode = "levels";
+			raw.supports_reasoning = true;
+		}
 	}
 	if (override.defaultReasoningLevel !== undefined)
 		raw.default_reasoning_effort = override.defaultReasoningLevel;

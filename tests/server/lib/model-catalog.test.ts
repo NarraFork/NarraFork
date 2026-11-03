@@ -492,7 +492,7 @@ describe("discovered metadata", () => {
 
 describe("catalog updates", () => {
 	test("auto update applies a newer catalog; restore returns to the built-in one", async () => {
-		local.agent.modelCatalog = { autoUpdate: true };
+		setModelCatalogAutoUpdate(true);
 		const version = await mockCatalog("auto", (catalog) => {
 			catalog.models[0]!.notes = "changed";
 		});

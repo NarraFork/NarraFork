@@ -17,6 +17,9 @@ process.env.NARRAFORK_HOME = testHome;
 
 const { sqlite } = await import("../../db");
 const { saveSettings, settings } = await import("../../lib/settings");
+const { getModelOverride, replaceModelOverridesForTests, setModelCatalogAutoUpdate } = await import(
+	"../../lib/model-catalog"
+);
 const {
 	applyImport,
 	clearData,
@@ -452,54 +455,44 @@ describe("逐模型设置随供应商一起导出", () => {
 		}
 	});
 
-	test("模型目录按 id 合并：同 id 以导入为准，本地独有保留", async () => {
+	test("模型覆盖按键合并：同键以导入为准，本地独有保留", async () => {
 		const original = structuredClone(settings);
+		const originalCatalog = settings.agent.modelCatalog;
+		const restores: Array<() => void> = [];
 		try {
-			agent().modelCatalog = {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				autoApply: true,
-				pinnedVersion: null,
-				local: { revision: 3, models: [{ id: "m1", metadata: { max_input_tokens: 1000 } }] },
-			};
+			restores.push(
+				replaceModelOverridesForTests({
+					models: { "gpt-6-astra": { maxOutputTokens: 1000 } },
+					connections: { "remote:m1": { contextWindow: 1000 } },
+				}),
+			);
 
 			const exported = await exportData({ requests: false, sessions: false, providers: true });
 			const zip = await readFile(exported.zipPath);
 			const preview = await previewImport(toArrayBuffer(zip), "catalog.zip");
 
-			agent().modelCatalog = {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				autoApply: false,
-				pinnedVersion: "v-local",
-				local: {
-					revision: 3,
-					models: [
-						{ id: "m1", metadata: { max_input_tokens: 2000 } },
-						{ id: "local-only", metadata: {} },
-					],
-				},
-			};
+			// 本地换一套：一条与导入同键但取值不同，一条本地独有；更新策略也不同。
+			restores.push(
+				replaceModelOverridesForTests({
+					connections: {
+						"remote:m1": { contextWindow: 2000 },
+						"local:only": { contextWindow: 3000 },
+					},
+				}),
+			);
+			setModelCatalogAutoUpdate(false);
 
 			await applyImport(preview.token, { conflictDefault: "skip" });
 
-			const merged = agent().modelCatalog as {
-				autoApply: boolean;
-				pinnedVersion: string | null;
-				local: {
-					revision: number;
-					models: Array<{ id: string; metadata: Record<string, unknown> }>;
-				};
-			};
-			const byId = new Map(merged.local.models.map((model) => [model.id, model]));
-			// 同 id 用导入的那份，本地独有的条目留着。
-			expect(byId.get("m1")?.metadata).toEqual({ max_input_tokens: 1000 });
-			expect(byId.has("local-only")).toBe(true);
-			// 合并算一次本地编辑：revision 前进，实例级策略仍是本地的。
-			expect(merged.local.revision).toBe(4);
-			expect(merged.autoApply).toBe(false);
-			expect(merged.pinnedVersion).toBe("v-local");
+			// 同键用导入的那份，本地独有的条目留着。
+			expect(getModelOverride("connection", "remote:m1")).toEqual({ contextWindow: 1000 });
+			expect(getModelOverride("connection", "local:only")).toEqual({ contextWindow: 3000 });
+			expect(getModelOverride("model", "gpt-6-astra")).toEqual({ maxOutputTokens: 1000 });
+			// 导入搬的是模型数据，不是目录更新策略：本地偏好不变，设置里也不内联覆盖。
+			expect(settings.agent.modelCatalog).toEqual({ autoUpdate: false });
 		} finally {
+			while (restores.length) restores.pop()?.();
+			setModelCatalogAutoUpdate(originalCatalog?.autoUpdate ?? true);
 			saveSettings(original);
 		}
 	});

@@ -196,6 +196,15 @@ export function identifyModel(catalog: RawCatalog, query: CatalogQuery): Catalog
 	return index(query);
 }
 
+/** The one cross-field rule a card must keep: the output fits in a declared total. */
+function outputExceedsTotal(metadata: RawMetadata): boolean {
+	return (
+		typeof metadata.context_window === "number" &&
+		typeof metadata.max_output_tokens === "number" &&
+		metadata.max_output_tokens > metadata.context_window
+	);
+}
+
 export interface ResolveInput {
 	catalog: RawCatalog;
 	query: CatalogQuery;
@@ -266,7 +275,10 @@ export function resolveModelCard(input: ResolveInput): ModelCard {
 		: undefined;
 	if (model) merge(model.metadata, presetSource(model, "preset-model"), true);
 	if (variant) merge(variant.metadata, presetSource(variant, "preset-variant"), true);
-	merge(input.discovered, { layer: "discovered" });
+	// A gateway that contradicts the catalog (an output cap above its total) is ignored as
+	// a whole: half of a contradictory report is not more trustworthy than the other half.
+	if (input.discovered && !outputExceedsTotal({ ...metadata, ...input.discovered }))
+		merge(input.discovered, { layer: "discovered" });
 	// A model-wide decision is about that model; a weak match is only a look-alike.
 	const wide = identity.modelId && !identity.weak && input.modelOverrides?.get(identity.modelId);
 	if (wide)
@@ -277,6 +289,8 @@ export function resolveModelCard(input: ResolveInput): ModelCard {
 			...(input.connection ? { id: input.connection } : {}),
 			explicit: true,
 		});
+	// The user's output cap above a declared total is clamped to it rather than rejected.
+	if (outputExceedsTotal(metadata)) metadata.max_output_tokens = metadata.context_window as number;
 	// A default level the effective level list no longer offers cannot be sent; drop it.
 	if (
 		typeof metadata.default_reasoning_effort === "string" &&

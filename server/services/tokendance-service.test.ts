@@ -17,6 +17,7 @@ mock.module("../lib/settings", () => ({
 	},
 }));
 const service = await import("./tokendance-service");
+const catalog = await import("../lib/model-catalog");
 const originalFetch = globalThis.fetch;
 const originalNow = Date.now;
 let ownerCount = 0;
@@ -1071,19 +1072,6 @@ describe("TokenDance backend", () => {
 				{ modelKey: "tokendance:chat" },
 				{ modelKey: "other:chat", notes: "tokendance: keep this note" },
 			],
-			modelCatalog: {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				local: {
-					revision: 3,
-					connections: {
-						"tokendance:chat": { working_context_tokens: 200000 },
-						"other:chat": { working_context_tokens: 100000 },
-					},
-				},
-				autoApply: false,
-				pinnedVersion: null,
-			},
 			subagentModels: { explore: "tokendance:chat", plan: "other:chat" },
 			subagentAllowedModels: {
 				explore: ["tokendance:chat", "other:chat"],
@@ -1109,7 +1097,22 @@ describe("TokenDance backend", () => {
 			commands: fakeSettings.agent.commandWhitelist,
 			retries: fakeSettings.agent.customRetryRules,
 		});
-		await service.deleteTokenDanceConnection();
+		// Provider entries' own overrides live in the catalog's file, keyed by model value.
+		const restoreOverrides = catalog.replaceModelOverridesForTests({
+			connections: {
+				"tokendance:chat": { contextWindow: 200000 },
+				"other:chat": { contextWindow: 100000 },
+			},
+		});
+		try {
+			await service.deleteTokenDanceConnection();
+			expect(catalog.getModelOverride("connection", "tokendance:chat")).toBeUndefined();
+			expect(catalog.getModelOverride("connection", "other:chat")).toEqual({
+				contextWindow: 100000,
+			});
+		} finally {
+			restoreOverrides();
+		}
 		expect({
 			prompt: fakeSettings.agent.defaultSystemPrompt,
 			commands: fakeSettings.agent.commandWhitelist,
@@ -1123,9 +1126,6 @@ describe("TokenDance backend", () => {
 		expect(fakeSettings.agent.modelCards).toEqual([
 			{ modelKey: "other:chat", notes: "tokendance: keep this note" },
 		]);
-		expect(fakeSettings.agent.modelCatalog?.local.connections).toEqual({
-			"other:chat": { working_context_tokens: 100000 },
-		});
 		expect(fakeSettings.agent.subagentModels).toEqual({ explore: "", plan: "other:chat" });
 		expect(fakeSettings.agent.subagentAllowedModels.explore).toEqual(["other:chat"]);
 		expect(fakeSettings.agent.providerOrder).toEqual(["other"]);

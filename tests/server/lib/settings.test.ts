@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { normalizeAutoContinuationMode } from "../../../server/lib/boolean-override";
+import { getModelOverride, replaceModelOverridesForTests } from "../../../server/lib/model-catalog";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import {
 	deepMerge,
@@ -14,14 +15,15 @@ import {
 	stripObsoleteSettingsKeys,
 } from "../../../server/lib/settings";
 
-const ownWindow = (value: typeof liveSettings, model: string) =>
-	value.agent.modelCatalog?.local.connections?.[model]?.working_context_tokens;
+/** A provider entry's own window, held in the catalog's overrides file. */
+const ownWindow = (model: string) => getModelOverride("connection", model)?.contextWindow;
 
 describe("TokenDance collection persistence", () => {
 	it("initializes legacy connections once and preserves manual choices across save and reload", () => {
 		const path = resolve(getNarraforkHome(), "settings.json");
 		const original = readFileSync(path, "utf8");
 		const snapshot = structuredClone(liveSettings);
+		const restoreOverrides = replaceModelOverridesForTests({});
 		try {
 			const raw = getDefaults();
 			raw.tokendance = { apiKey: "collection-test-key", disabled: false, generation: 4 };
@@ -34,7 +36,8 @@ describe("TokenDance collection persistence", () => {
 			expect(loaded.agent.hiddenModels).toHaveLength(66);
 			expect(loaded.agent.hiddenModels).not.toContain("tokendance:kimi-k3");
 			expect(loaded.agent.hiddenModels).toContain("tokendance:glm-5");
-			expect(ownWindow(loaded, "tokendance:glm-5")).toBe(64000);
+			expect(ownWindow("tokendance:glm-5")).toBe(64000);
+			expect(loaded.agent.modelCatalog).toEqual({ autoUpdate: true });
 			const edited = structuredClone(loaded);
 			edited.agent.hiddenModels = edited.agent.hiddenModels?.filter(
 				(id) => id !== "tokendance:glm-5",
@@ -54,13 +57,14 @@ describe("TokenDance collection persistence", () => {
 			expect(again.agent.hiddenModels).not.toContain("tokendance:glm-5");
 			expect(again.agent.hiddenModels).toContain("tokendance:kimi-k3");
 			expect(again.agent.hiddenModels).not.toContain("tokendance:future-new-model");
-			expect(ownWindow(again, "tokendance:glm-5")).toBe(64000);
+			expect(ownWindow("tokendance:glm-5")).toBe(64000);
 			expect(JSON.parse(readFileSync(path, "utf8")).tokendance.modelCollectionInitialized).toBe(
 				true,
 			);
 		} finally {
 			saveSettings(snapshot);
 			writeFileSync(path, original);
+			restoreOverrides();
 		}
 	});
 
