@@ -1225,6 +1225,10 @@ export interface AgentConfig {
 		options?: PermissionHandlerOptions,
 	) => Promise<PermissionResult>;
 	onEvent?: (event: AgentEvent) => void;
+	/** Awaited before every actual provider request, including retries and auxiliary
+	 * reflections. Unlike history hooks, this survives reflection configuration and
+	 * does not require prefix/tool-loading state. Rejection must prevent dispatch. */
+	beforeProviderRequest?: () => Promise<void>;
 	/**
 	 * Called before each non-first turn in the agent loop.
 	 * If it returns a rebuilt history, the loop replaces its history and transcript —

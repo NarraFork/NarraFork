@@ -23,6 +23,8 @@ export const SNAPSHOT_TABLES = {
 		"narrator_tool_calls",
 		// `body_rows_only = 1` 时正文只在块行里，content_json 是空数组。
 		"narrator_blocks",
+		// Prefix epoch / updates / tools manifests and all their content-addressed children.
+		"narrator_text_snapshots",
 	],
 } as const;
 

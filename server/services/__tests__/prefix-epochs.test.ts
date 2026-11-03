@@ -1,5 +1,9 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { contextUpdateOf, renderContextUpdate } from "@shared/prefix-context";
+import { serializeWorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../db";
@@ -12,7 +16,12 @@ import {
 import { epochRecordOf } from "../../lib/agent/tool-loading";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
+import { safeSpawn } from "../../lib/spawn";
+import { resolveNarratorGitTarget } from "../git-workspace";
+import { enterNarratorPlanMode } from "../narrator-plan-mode";
 import { getPrefixToolDefinitions } from "../narrator-prefix-snapshots";
+import { buildEffectiveSystemPrompt } from "../narrator-prompt";
+import { workspaceContextService } from "../workspace-context-service";
 
 // The normal test preload supplies an isolated on-disk SQLite database. Do not
 // replace the DB module: the history/snapshot workers must see the same database.
@@ -94,6 +103,95 @@ const updates = async (id: string) => {
 };
 
 describe("unified prefix epochs with real SQLite history", () => {
+	test("Git discovery after a worktree switch cannot append workspace again when entering plan mode", async () => {
+		const root = await mkdtemp(join(tmpdir(), "prefix-workspace-"));
+		const checkout = join(root, "checkout");
+		const git = async (...args: string[]) => {
+			const result = await safeSpawn({
+				cmd: [
+					"git",
+					"-c",
+					"user.name=Fixture",
+					"-c",
+					"user.email=fixture@example.invalid",
+					...args,
+				],
+				cwd: root,
+				timeout: 5000,
+				maxOutputBytes: 128 * 1024,
+			});
+			if (result.exitCode) throw new Error(result.stderr);
+		};
+		try {
+			await git("init", "-b", "main");
+			await git("commit", "--allow-empty", "-m", "fixture");
+			await git("worktree", "add", "-b", "context-target", checkout);
+			const { narratorId, input } = await fixture();
+			await db
+				.update(narrators)
+				.set({ cwd: root, permissionMode: "bypassPermissions" })
+				.where(eq(narrators.id, narratorId));
+			const prepare = async () => {
+				const workspace = await workspaceContextService.get(narratorId);
+				const row = await narratorService.getById(narratorId);
+				const planMode = row.traits.includes("plan");
+				const built = await buildEffectiveSystemPrompt({
+					basePrompt: "Workspace regression",
+					cwd: workspace.cwd,
+					locale: "en",
+					planMode,
+					planFileId: row.planFileId ?? undefined,
+					workspaceContext: serializeWorkspaceContext(workspace),
+					modeContext: JSON.stringify({ planMode }),
+				});
+				return reconcileEpoch({
+					...input,
+					prompt: {
+						contract: built.contract,
+						parts: built.parts.filter(({ key }) => key === "workspace" || key === "mode"),
+					},
+				});
+			};
+			const initial = await prepare();
+			const switchTo = async (cwd: string) => {
+				const current = await workspaceContextService.get(narratorId);
+				return workspaceContextService.switch(
+					narratorId,
+					{
+						expectedRevision: current.revision,
+						requestId: generateId(),
+						target: { deviceId: "local", cwd },
+					},
+					{ origin: "http" },
+				);
+			};
+			await switchTo(checkout);
+			await prepare();
+			const moved = await workspaceContextService.get(narratorId);
+			// This is the real Git refresh path used by the workspace UI, including its DB cache write.
+			await resolveNarratorGitTarget(narratorId);
+			expect(await workspaceContextService.get(narratorId)).toEqual(moved);
+			await enterNarratorPlanMode(narratorId);
+			const planned = await prepare();
+			expect(planned.epoch?.markerId).toBe(initial.epoch?.markerId);
+			expect(planned.systemPrompt).toBe(initial.systemPrompt);
+			expect(
+				(await updates(narratorId)).map(({ update }) => update.changes.map(({ key }) => key)),
+			).toEqual([["workspace"], ["mode"]]);
+			await resolveNarratorGitTarget(narratorId);
+			expect((await prepare()).changed).toBe(false);
+			// A real second switch must still notify the model, without opening another epoch.
+			await switchTo(root);
+			const returned = await prepare();
+			expect(returned.epoch?.markerId).toBe(initial.epoch?.markerId);
+			expect(
+				(await updates(narratorId)).map(({ update }) => update.changes.map(({ key }) => key)),
+			).toEqual([["workspace"], ["mode"], ["workspace"]]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 15000);
+
 	test("initial baseline is durable; concurrent changes and retries append only once", async () => {
 		const { narratorId, input } = await fixture();
 		const initial = await reconcileEpoch(input);

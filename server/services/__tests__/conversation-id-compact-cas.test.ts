@@ -1,20 +1,9 @@
 /**
- * conversation-id-compact-cas.test.ts — teardown must not resurrect a conversation
- * id that a compact deliberately cleared.
- *
- * `apiConversationId = null` is how a compact says "the history was replaced; the
- * next request must open a FRESH upstream session". Background compacts are
- * fire-and-forget and routinely settle around a turn boundary, so the dangerous
- * case is a turn that ended completely normally — no overflow, no error:
- *
- *   1. background compact finalizes → column nulled, history replaced
- *   2. the turn tears down → writes the id it held in memory
- *   3. next activation reads a non-null id → skips the upstream session reset and
- *      sends compacted history down a session that still holds the pre-compact
- *      turns, which the provider then answers twice.
- *
- * Step 2 is the only step under our control, so the write is a compare-and-set
- * against the id the session started from. Losing that CAS is correct behaviour.
+ * Compatibility coverage for the legacy explicit conversation-id persistence API
+ * and compact's live transport reset. Runtime requests now use the awaited,
+ * revision-guarded preflight in narrator-conversation-identity.ts, never a teardown
+ * write. Its first-send, null->null ABA and PostgreSQL coverage lives in
+ * conversation-identity.test.ts. An ID-only legacy CAS cannot detect null->null ABA.
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -135,7 +124,7 @@ describe("updateConversationId compare-and-set", () => {
 		expect(await readConversationId()).toBe("fresh-session");
 	});
 
-	test("a session that started with no stored id loses to a compact that nulled it again", async () => {
+	test("a legacy null baseline cannot overwrite another session's non-null id", async () => {
 		// Started fresh (null), generated an id, then a compact cleared the column
 		// after some other write had already put an id there.
 		await seedNarrator("someone-elses-session");

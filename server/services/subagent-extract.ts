@@ -171,6 +171,7 @@ export async function extractSubagentToPrimary(
 			? (await resolveSubagentModelForRun(source, source.ownerUserId)).model
 			: (source.model ?? FOLLOW_DEFAULT_MODEL);
 	const audiences = await resolveExtractAudiences(source);
+	const { ensureReplyContext } = await import("./narrator-reply-context");
 	const now = new Date().toISOString();
 	const id = generateId();
 	const title = opts?.title?.trim() || defaultExtractTitle(source.title, subagentType, locale);
@@ -180,8 +181,10 @@ export async function extractSubagentToPrimary(
 		defaultDeviceId: source.defaultDeviceId ?? null,
 	};
 	const admissionTargets = await narratorCreationWorkspaceTarget(workspace);
-	const newNarrator = await withWorkspaceAdmission(admissionTargets, async () =>
-		withSeqFloorRaiseScope(() =>
+	const newNarrator = await withWorkspaceAdmission(admissionTargets, async () => {
+		// Reject retired/reserved workspaces before legacy reply policy initialization writes.
+		const replyContext = await ensureReplyContext(source.id);
+		return withSeqFloorRaiseScope(() =>
 			db.transaction(
 				(tx) => {
 					const queueMark = syncQueueMark();
@@ -194,6 +197,7 @@ export async function extractSubagentToPrimary(
 							subagentType: null,
 							traits: ["standalone", "extracted-from-subagent"],
 							model: storedModel,
+							replyContext,
 							// Never inherit the subagent system prompt — primary control plane.
 							systemPrompt: null,
 							// Do not inherit explore/plan readOnly lockdown.
@@ -342,8 +346,8 @@ export async function extractSubagentToPrimary(
 				},
 				{ behavior: "immediate" },
 			),
-		),
-	);
+		);
+	});
 
 	queueContextCharacterRefresh(id);
 	// Spec namespace fork is best-effort; extract must not fail on it.

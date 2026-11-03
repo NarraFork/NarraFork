@@ -146,10 +146,10 @@ export function getDynamicSpecSystemReminder(locale: Locale): string {
  * first section" and truncates a half-finished plan. This section states the
  * observed on-disk state and explicitly overrides that step.
  */
-const planFileStateSection: LocalizedValue<(planFile: string, bytes: number) => string> = {
-	en: (planFile, bytes) => `## Designated Plan File — Current State
+const planFileStateSection: LocalizedValue<(planFile: string) => string> = {
+	en: (planFile) => `## Designated Plan File — Current State
 
-\`${planFile}\` already exists and holds ${bytes} bytes of plan content you wrote earlier in this plan cycle. The conversation history may have been compacted since then, so do NOT assume you remember what is in it.
+\`${planFile}\` already exists and holds plan content you wrote earlier in this plan cycle. The conversation history may have been compacted since then, so do NOT assume you remember what is in it.
 
 This OVERRIDES the "use Write for the first section" step above:
 1. Read \`${planFile}\` first to recover what you already planned.
@@ -157,9 +157,9 @@ This OVERRIDES the "use Write for the first section" step above:
 3. Use Write only when you deliberately intend to discard the existing draft and restart the plan from scratch.
 
 It also NARROWS your submission choice: because this file holds plan content, \`mode: "inline"\` is refused and only \`mode: "file"\` is accepted. Submitting inline would show the user a fresh body while the plan recorded here is ignored. If this file is stale or wrong, fix the file and submit it — do not route around it with an inline plan.`,
-	"zh-CN": (planFile, bytes) => `## 指定计划文件 — 当前状态
+	"zh-CN": (planFile) => `## 指定计划文件 — 当前状态
 
-\`${planFile}\` 已存在，其中有 ${bytes} 字节的计划内容，是你在本轮计划周期中先前写入的。此后对话历史可能已被压缩，因此不要假设你还记得里面的内容。
+\`${planFile}\` 已存在，包含你在本轮计划周期中先前写入的计划内容。此后对话历史可能已被压缩，因此不要假设你还记得里面的内容。
 
 这条覆盖上面「用 Write 写首段」的步骤：
 1. 先 Read \`${planFile}\`，恢复你已经写好的计划。
@@ -285,7 +285,8 @@ ${planFileState}
  *   reminder, the write gate and ExitPlanMode resolution must all name the SAME
  *   file, or the model is told to write somewhere the gate will reject.
  * @param planFileBytes  Size of the designated plan file on disk, when it already
- *   has content. Pass `undefined`/0 for a fresh plan cycle so the reminder keeps
+ *   has content. Only its nonempty state is rendered, so edits cannot churn the
+ *   mode context. Pass `undefined`/0 for a fresh plan cycle so the reminder keeps
  *   its original "write the first section" flow.
  */
 export function getPlanModeSystemReminder(
@@ -297,7 +298,7 @@ export function getPlanModeSystemReminder(
 	const planFile = planFilePath?.trim() || buildPlanFileRelPath("unknown");
 	const planFileState =
 		planFileBytes && planFileBytes > 0
-			? `\n${pickLocalizedValue(planFileStateSection, locale)(planFile, planFileBytes)}\n`
+			? `\n${pickLocalizedValue(planFileStateSection, locale)(planFile)}\n`
 			: "";
 	const fn = pickLocalizedValue(planModeSystemReminder, locale);
 	return fn(planFile, allowInline, planFileState);

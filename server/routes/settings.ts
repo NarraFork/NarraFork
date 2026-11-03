@@ -88,6 +88,7 @@ import {
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
+import { mergeSpeechSettingsPatch, redactSpeechSettings } from "../lib/speech-settings";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
@@ -100,6 +101,7 @@ import {
 	defaultNarratorWriteAudienceSchema,
 	diskSafetySettingsSchema,
 } from "../lib/validators/settings";
+import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
@@ -712,6 +714,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		speech: speechSettingsPatchSchema.optional(),
 		search: searchSettingsSchema.optional(),
 		routines: z
 			.object({
@@ -981,6 +984,7 @@ async function buildSettingsResponse(
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
 		vnet: maskVNetSettings(source.vnet),
+		speech: redactSpeechSettings(source.speech),
 		search: maskSearchSettings(source.search),
 		// Executable-plugin providers, grouped per provider prefix. Read straight from
 		// the in-memory registry; no plugin process is started to build this.
@@ -1434,7 +1438,13 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		const lockAcquiredAt = performance.now();
 		const body = normalizeLegacySettingsPatch(await c.req.json());
 		const parsed = updateSettingsSchema.safeParse(body);
-		if (!parsed.success) throw new ValidationError(parsed.error.message);
+		if (!parsed.success) {
+			// Never serialize speech credential-bearing validation paths or rejected input.
+			if (parsed.error.issues.some((issue) => issue.path[0] === "speech")) {
+				throw new ValidationError("Invalid speech settings patch");
+			}
+			throw new ValidationError(parsed.error.message);
+		}
 
 		const current = structuredClone(settings);
 		const { expectedUpdateSettingsKey, ...validated } = parsed.data;
@@ -1695,6 +1705,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				// Array — replace entirely, don't merge
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				(merged as any)[key] = val;
+			} else if (key === "speech") {
+				merged.speech = mergeSpeechSettingsPatch(current.speech, val);
 			} else if (key === "proxy") {
 				// Replace entirely so switching modes drops the stale custom url.
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

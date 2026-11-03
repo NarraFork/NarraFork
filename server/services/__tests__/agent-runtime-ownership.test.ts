@@ -1064,6 +1064,13 @@ describe("epoch CAS and legacy projections", () => {
 
 describe("shared event context", () => {
 	test("a delivering run's pass context carries its placement and pass-local state", async () => {
+		// Run-entry locale is display-only; seed the recipient's adopted model reply policy.
+		await db
+			.update(narrators)
+			.set({
+				replyContext: { locale: "zh-CN", replyInUserLanguage: true },
+			})
+			.where(eq(narrators.id, CHILD));
 		const contexts: Array<import("../narrator-event-handler").EventHandlerContext> = [];
 		spyOn(passExecutor, "executeAgentLoop").mockImplementation(async (options) => {
 			contexts.push(options.eventContext);
