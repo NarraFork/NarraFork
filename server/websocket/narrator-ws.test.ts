@@ -201,6 +201,19 @@ describe("HumanAttention global invalidation", () => {
 		expect(sent.filter((message) => message.type === "human_attention_changed")).toHaveLength(1);
 	});
 
+	it("does not hold a permission request or question back behind an open pending window (review N-c)", async () => {
+		const { sent } = openFakeWs({ userId: "attention-approver" });
+		const count = () => sent.filter((message) => message.type === "human_attention_changed").length;
+		eventBus.emit({ type: "outline:pending", spaceId: "space", pageIds: ["page"] });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		eventBus.emit({ type: "human_attention:changed" });
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		// One wake-up within the short delay, covering the pending change too.
+		expect(count()).toBe(1);
+		await new Promise((resolve) => setTimeout(resolve, 1_100));
+		expect(count()).toBe(1);
+	});
+
 	it("invalidates cascaded question deletion without exposing the private history frame", async () => {
 		const { sent } = openFakeWs();
 		eventBus.emit({

@@ -545,13 +545,19 @@ export interface OutlineAnswerInput {
 	option?: number;
 	text?: string;
 	adopt?: boolean;
-	/** The question's version the person read (`OutlineQuestionView.versionSeq`): checked. */
+	/**
+	 * The question's version the person read (`OutlineQuestionView.versionSeq`): checked.
+	 * Required over HTTP ({@link OutlineAnswerRequest}); the service's own callers may omit it.
+	 */
 	versionSeq?: number;
 }
 
+/** One answer as the API takes it: always with the version read. */
+export type OutlineAnswerHttpInput = OutlineAnswerInput & { versionSeq: number };
+
 /** `POST /questions/answer`: questions of one space answered at once. */
 export interface OutlineAnswerRequest {
-	answers: OutlineAnswerInput[];
+	answers: OutlineAnswerHttpInput[];
 }
 
 export interface OutlineAnswerResponse {

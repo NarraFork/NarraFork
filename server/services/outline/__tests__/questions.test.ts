@@ -20,6 +20,9 @@ import type { ToolContext, ToolResult } from "../../../lib/agent/types";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { listHumanAttentionForPrincipal } from "../../human-attention-service";
+import { deliverInjection } from "../../narrator-injection";
+import { narratorStore } from "../../narrator-store";
+import { endTurn, startTurn } from "../../narrator-turns";
 import { stopEditTextWorker } from "../edit-text-runner";
 import { listOutlineAttention, markOutlineDigestSeen, readOutlineDigest } from "../inbox";
 import { confirmOutlinePending, lockOutlineTask } from "../pending";
@@ -79,41 +82,42 @@ async function ask(c: ToolContext, args: Record<string, unknown>): Promise<ToolR
 	return await askTool.execute(args, c);
 }
 
-let messageClock = 0;
+/**
+ * What the person sends to the session, written as the runtime writes it (a top-level user row
+ * with its ref): by default their own words; `origin` for a routine or an agent's message.
+ */
+async function says(
+	narratorId: string,
+	userId: string,
+	text: string,
+	origin?: { origin: "user" | "system" | "assistant"; originLabel: string },
+): Promise<string> {
+	const written = await narratorStore.appendInput(
+		narratorId,
+		text,
+		undefined,
+		null,
+		userId,
+		origin,
+	);
+	return written.id;
+}
 
 /**
- * A top-level user message of a session: by default the person's own words (`origin` user, no
- * label), at `at` or just after `after` (each later than the last).
+ * One run of the session, as the orchestrator opens and closes it: its trigger is the input that
+ * woke it (the newest envelope, when that is a user input no earlier run took).
  */
-async function message(
-	narratorId: string,
-	m: {
-		createdBy: string;
-		text: string;
-		at?: string;
-		after?: string;
-		origin?: "user" | "system";
-		label?: string;
-		injected?: boolean;
-	},
-): Promise<string> {
-	const id = generateId();
-	const at =
-		m.at ?? new Date(Date.parse(m.after ?? NOW) + 1_000 + ++messageClock * 10).toISOString();
-	await db.insert(narratorMessages).values({
-		id,
-		narratorId,
-		role: "user",
-		contentJson: m.injected
-			? [{ type: "system_injection", source: "outline_answer", text: m.text }]
-			: [{ type: "text", text: m.text }],
-		createdBy: m.createdBy,
-		origin: m.origin ?? "user",
-		originLabel: m.label ?? null,
-		createdAt: at,
-	});
-	return id;
+async function inRun<T>(narratorId: string, work: () => Promise<T>): Promise<T> {
+	const turnId = startTurn(narratorId);
+	try {
+		return await work();
+	} finally {
+		endTurn(narratorId, turnId, { status: "completed", stopReason: "test" });
+	}
 }
+
+/** Let the clock move on, so what is written next is later than what was written before. */
+const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 
 /** Deliveries the answers make, captured instead of written. */ /** Deliveries the answers make, captured instead of written. */
 type Delivered = {
@@ -369,15 +373,17 @@ describe("Ask", () => {
 			questions: [{ question: "Format?", options: ["v1", "v2"], recommend: 2 }],
 		});
 		const [q] = asked.metadata?.blockIds as [string];
-		const askedAt = (await outlineStore.getQuestions([q]))[0]?.createdAt as string;
-		// Alice answers in the conversation: her message starts the turn that relays it.
-		const said = await message(w.a, { createdBy: w.alice, after: askedAt, text: "v1, please" });
-		const relayed = await ask(w.ca, { answered: [{ question: "Q1", option: 1 }] });
+		await tick();
+		// Alice answers in the conversation: her message starts the run that relays it.
+		const said = await says(w.a, w.alice, "v1, please");
+		const relayed = await inRun(w.a, () =>
+			ask(w.ca, { answered: [{ question: "Q1", option: 1 }] }),
+		);
 		expect(relayed.isError).toBeUndefined();
 		expect(relayed.output).toContain("as the person's (relayed");
 		const answer = (await outlineStore.getBlock(q))?.askJson?.answer;
 		expect(answer).toMatchObject({ option: 1, by: { kind: "human", id: w.alice } });
-		// The message it came from is named: hers, in this session, after the question.
+		// The message it came from is named: hers, in this session, the one that started the run.
 		expect(answer?.relayed).toEqual({ narratorId: w.a, messageId: said });
 		expect((await outlineStore.getQuestions([q]))[0]).toMatchObject({ state: "answered" });
 		expect((await outlineStore.getQuestions([q]))[0]?.deliveredAt).not.toBeNull();
@@ -388,54 +394,120 @@ describe("Ask", () => {
 		const other = await ask(w.ca, { questions: [{ question: "Again?", recommend: "no" }] });
 		const [q2] = other.metadata?.blockIds as [string];
 		const sid2 = (await outlineStore.getBlock(q2))?.sid as string;
-		const q2At = (await outlineStore.getQuestions([q2]))[0]?.createdAt as string;
-		await message(w.a, { createdBy: w.alice, after: q2At, text: "no" });
-		const asBob = await ask(ctx(w.a, w.bob), { answered: [{ question: sid2, adopt: true }] });
-		expect(asBob.isError).toBe(true);
-		const fromC = await ask(ctx(w.c, w.alice), { answered: [{ question: sid2, adopt: true }] });
-		expect(fromC.isError).toBe(true);
-		expect(fromC.output).toContain("was not asked by this session");
+		await tick();
+		await says(w.a, w.alice, "no");
+		await inRun(w.a, async () => {
+			const asBob = await ask(ctx(w.a, w.bob), { answered: [{ question: sid2, adopt: true }] });
+			expect(asBob.isError).toBe(true);
+			const fromC = await ask(ctx(w.c, w.alice), { answered: [{ question: sid2, adopt: true }] });
+			expect(fromC.isError).toBe(true);
+			expect(fromC.output).toContain("was not asked by this session");
+		});
 	});
 
-	test("a relay is refused unless the turn was started by the person's own message after the question (review B1)", async () => {
+	test("a relay is accepted only in a run the person's own message started after the question (review B1)", async () => {
 		const w = await world();
-		// Alice said something long before the question existed (probe P1).
-		await message(w.a, { createdBy: w.alice, at: "2026-01-01T00:00:00.000Z", text: "build it" });
-		const asked = await ask(w.ca, {
-			questions: [{ question: "Drop the legacy table?", options: ["no", "yes"], recommend: 2 }],
+		const relay = () => ask(w.ca, { answered: [{ question: "Q1", adopt: true }] });
+		const notTheirs = "was not started by a message from the person asked";
+		// Probe P1: Alice's message started the run, and the question was asked in it afterwards.
+		await says(w.a, w.alice, "build it");
+		const asked = await inRun(w.a, async () => {
+			await tick();
+			const result = await ask(w.ca, {
+				questions: [{ question: "Drop the legacy table?", options: ["no", "yes"], recommend: 2 }],
+			});
+			const before = await relay();
+			expect(before.isError).toBe(true);
+			expect(before.output).toContain("written before the question was asked");
+			return result;
 		});
 		const [q] = asked.metadata?.blockIds as [string];
-		const askedAt = (await outlineStore.getQuestions([q]))[0]?.createdAt as string;
-		const relay = async () => await ask(w.ca, { answered: [{ question: "Q1", adopt: true }] });
-		const before = await relay();
-		expect(before.isError).toBe(true);
-		expect(before.output).toContain("written before the question was asked");
+		// Outside any run, nothing started a turn.
+		expect((await relay()).output).toContain(notTheirs);
 
-		// Turns nobody typed: a continuation, a routine, a wake (an injected message), and another
-		// person's message. Each run as alice, none is her answer.
-		const notHers = [
-			{ createdBy: w.alice, origin: "system" as const, text: "Continue with the plan." },
-			{ createdBy: w.alice, origin: "user" as const, injected: true, text: "Answers came." },
-			{ createdBy: w.alice, origin: "user" as const, label: "scheduledTask:nightly", text: "Run" },
-			{ createdBy: w.alice, origin: "user" as const, label: "agentMessage:planner", text: "Go" },
-			{ createdBy: w.bob, origin: "user" as const, text: "yes, drop it" },
+		// Probe R1: Alice says something else after the question; that run ends without a relay.
+		await tick();
+		await says(w.a, w.alice, "also fix the typo in the README");
+		await inRun(w.a, async () => {});
+		// Runs nobody typed, written as the runtime writes them. Each runs as alice; none is hers.
+		const runs: Array<{ what: string; write: () => Promise<unknown> }> = [
+			{
+				what: "a continuation (a sys row, as narrator-session writes it)",
+				write: () =>
+					deliverInjection(w.a, {
+						content: "Outline task continuation: keep working on the task.",
+						source: "spec_continuation",
+						schedule: "none",
+						originSource: "autoContinuation",
+					}),
+			},
+			{
+				what: "a continuation through persistSystemMessage",
+				write: () =>
+					narratorStore.appendNotice(w.a, "Continue the task.", [
+						{
+							type: "spec_continuation",
+							task: "Ship the importer",
+							protected: false,
+							modelText: "Continue the task.",
+						},
+					]),
+			},
+			{
+				what: "a wake (probe R1b: a sys injection)",
+				write: () =>
+					deliverInjection(w.a, {
+						content: "A background job finished.",
+						source: "outline_answer",
+						schedule: "none",
+					}),
+			},
+			{
+				what: "an injected user turn on alice's behalf (an answer delivered)",
+				write: () =>
+					deliverInjection(w.a, {
+						content: "alice answered your questions in the outline",
+						source: "outline_answer",
+						role: "user",
+						schedule: "none",
+						createdBy: w.alice,
+					}),
+			},
+			{
+				what: "a routine",
+				write: () =>
+					says(w.a, w.alice, "Run the nightly check", {
+						origin: "system",
+						originLabel: "scheduledTask:nightly",
+					}),
+			},
+			{
+				what: "another agent's message",
+				write: () =>
+					says(w.a, w.alice, "Go ahead", {
+						origin: "assistant",
+						originLabel: "agentMessage:planner",
+					}),
+			},
+			{ what: "another person's message", write: () => says(w.a, w.bob, "yes, drop it") },
 		];
-		for (const turn of notHers) {
-			await message(w.a, { ...turn, after: askedAt });
-			const refused = await relay();
-			expect(refused.isError).toBe(true);
-			expect(refused.output).toContain("was not started by a message from the person asked");
+		for (const run of runs) {
+			await run.write();
+			const refused = await inRun(w.a, relay);
+			expect({ what: run.what, refused: refused.isError }).toEqual({
+				what: run.what,
+				refused: true,
+			});
+			expect(refused.output).toContain(notTheirs);
 		}
 		expect((await outlineStore.getQuestions([q]))[0]?.state).toBe("open");
 
-		// Her own words after the question, through a gateway too, are.
-		const said = await message(w.a, {
-			createdBy: w.alice,
-			after: askedAt,
-			label: "gateway:telegram",
-			text: "yes",
+		// Her own words after the question, through a gateway too, start a run that may relay.
+		const said = await says(w.a, w.alice, "yes", {
+			origin: "user",
+			originLabel: "gateway:telegram",
 		});
-		const relayed = await relay();
+		const relayed = await inRun(w.a, relay);
 		expect(relayed.isError).toBeUndefined();
 		expect((await outlineStore.getBlock(q))?.askJson?.answer?.relayed?.messageId).toBe(said);
 	});
@@ -443,9 +515,48 @@ describe("Ask", () => {
 	test("a relay with no message from the person at all is refused (probe P1b)", async () => {
 		const w = await world();
 		await ask(w.ca, { questions: [{ question: "Ship it?", recommend: "yes" }] });
-		const relayed = await ask(w.ca, { answered: [{ question: "Q1", text: "yes" }] });
+		const relayed = await inRun(w.a, () =>
+			ask(w.ca, { answered: [{ question: "Q1", text: "yes" }] }),
+		);
 		expect(relayed.isError).toBe(true);
 		expect(relayed.output).toContain("was not started by a message from the person asked");
+	});
+
+	test("relays work with message bodies kept only in rows, and still refuse injected turns there (review N-d)", async () => {
+		settings.narratorBlocks.compactJson = true;
+		try {
+			const w = await world();
+			await ask(w.ca, {
+				questions: [
+					{ question: "One?", recommend: "yes" },
+					{ question: "Two?", recommend: "no" },
+				],
+			});
+			await tick();
+			await deliverInjection(w.a, {
+				content: "alice answered your questions in the outline",
+				source: "outline_answer",
+				role: "user",
+				schedule: "none",
+				createdBy: w.alice,
+			});
+			const injected = await inRun(w.a, () =>
+				ask(w.ca, { answered: [{ question: "Q1", adopt: true }] }),
+			);
+			expect(injected.isError).toBe(true);
+			const said = await says(w.a, w.alice, "yes to the first");
+			const [row] = await db
+				.select({ rowsOnly: narratorMessages.bodyRowsOnly })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, said));
+			expect(row?.rowsOnly).toBe(1);
+			const relayed = await inRun(w.a, () =>
+				ask(w.ca, { answered: [{ question: "Q1", adopt: true }] }),
+			);
+			expect(relayed.isError).toBeUndefined();
+		} finally {
+			settings.narratorBlocks.compactJson = false;
+		}
 	});
 
 	test("withdraw and archive: withdrawn questions make nothing wait and leave the inbox", async () => {

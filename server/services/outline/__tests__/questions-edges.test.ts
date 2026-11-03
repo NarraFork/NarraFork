@@ -21,6 +21,10 @@ import type { ToolContext, ToolResult } from "../../../lib/agent/types";
 import { eventBus } from "../../../lib/event-bus";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
+import { outlineAnswerBodySchema } from "../../../lib/validators/outline";
+import { setInjectionScheduler } from "../../narrator-injection";
+import { narratorStore } from "../../narrator-store";
+import { endTurn, startTurn } from "../../narrator-turns";
 import { stopEditTextWorker } from "../edit-text-runner";
 import { listOutlineAttention, readOutlineDigest } from "../inbox";
 import { confirmOutlinePending, lockOutlineTask } from "../pending";
@@ -106,22 +110,39 @@ async function regrant(projectId: string, userId: string, capability: "read" | "
 	invalidateSessionReadScopes();
 }
 
-/** A message of the person starting a turn of the session, a second after `after`. */
-async function said(narratorId: string, userId: string, after: string): Promise<string> {
-	const id = generateId();
-	await db.insert(narratorMessages).values({
-		id,
-		narratorId,
-		role: "user",
-		contentJson: [{ type: "text", text: "my answer" }],
-		createdBy: userId,
-		origin: "user",
-		createdAt: new Date(Date.parse(after) + 1_000).toISOString(),
-	});
-	return id;
+/**
+ * The person's message to the session, written as the runtime writes it, then a run it starts
+ * (as the orchestrator opens one) in which `work` happens.
+ */
+async function inRunStartedBy<T>(
+	narratorId: string,
+	userId: string,
+	work: () => Promise<T>,
+): Promise<T> {
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	await narratorStore.appendInput(narratorId, "my answer", undefined, null, userId);
+	const turnId = startTurn(narratorId);
+	try {
+		return await work();
+	} finally {
+		endTurn(narratorId, turnId, { status: "completed", stopReason: "test" });
+	}
 }
 
 let delivered: Array<{ narratorId: string; messageId: string; content: string }> = [];
+
+/** Wakes the real delivery asks for, recorded instead of starting the session. */
+function fakeWakes(started: boolean): Array<{ narratorId: string; userId: string | null }> {
+	const wakes: Array<{ narratorId: string; userId: string | null }> = [];
+	setInjectionScheduler({
+		requestSoftStop: () => false,
+		wakeIfIdle: async (narratorId, _locale, principal) => {
+			wakes.push({ narratorId, userId: principal?.userId ?? null });
+			return { started };
+		},
+	});
+	return wakes;
+}
 
 /** Alice's project with a task session `a` (hers, private, titled "Secret plan") is doing. */
 async function world() {
@@ -183,6 +204,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	setOutlineAnswerDelivery(null);
+	setInjectionScheduler(null);
 	invalidateSessionReadScopes();
 	stopEditTextWorker();
 });
@@ -214,10 +236,13 @@ describe("access", () => {
 			questions: [{ question: "Three?", recommend: "yes" }],
 		});
 		expect(again.isError).toBe(true);
-		// Her own words after the question do not make up for the access she lost.
-		await said(cs, carol.id, (await outlineStore.getQuestions([q1]))[0]?.createdAt as string);
-		const relayed = await ask(ctx(cs, carol.id), { answered: [{ question: "Q1", adopt: true }] });
+		// Her own words after the question, starting the run, do not make up for the access she lost.
+		const relayed = await inRunStartedBy(cs, carol.id, () =>
+			ask(ctx(cs, carol.id), { answered: [{ question: "Q1", adopt: true }] }),
+		);
 		expect(relayed.isError).toBe(true);
+		// Refused for the access, not for the turn: the run is hers.
+		expect(relayed.output).toContain("no-permission");
 		const withdrawn = await ask(ctx(cs, carol.id), { withdraw: ["Q2"] });
 		expect(withdrawn.isError).toBe(true);
 		expect((await outlineStore.getQuestions([q1, q2])).map((r) => r.state)).toEqual([
@@ -419,6 +444,14 @@ describe("answers", () => {
 			answers: [{ blockId: q, option: 1, versionSeq: fresh?.questions[0]?.versionSeq }],
 		});
 		expect((await outlineStore.getBlock(q))?.askJson?.answer?.option).toBe(1);
+		// Over HTTP the version is required, so every caller gets the check (review N-a).
+		expect(
+			outlineAnswerBodySchema.safeParse({ answers: [{ blockId: q, adopt: true }] }).success,
+		).toBe(false);
+		expect(
+			outlineAnswerBodySchema.safeParse({ answers: [{ blockId: q, adopt: true, versionSeq: 4 }] })
+				.success,
+		).toBe(true);
 	});
 
 	test("undoing the delete of an answered question, or a revert of a relayed answer, tells nobody again (N1, probe P6)", async () => {
@@ -447,8 +480,9 @@ describe("answers", () => {
 		// A relayed answer reverted, then the revert reverted.
 		const second = await ask(w.ca, { questions: [{ question: "Again?", recommend: "no" }] });
 		const q2 = await questionOf(second);
-		await said(w.a, w.alice.id, q2.createdAt);
-		const relayed = await ask(w.ca, { answered: [{ question: "Q2", adopt: true }] });
+		const relayed = await inRunStartedBy(w.a, w.alice.id, () =>
+			ask(w.ca, { answered: [{ question: "Q2", adopt: true }] }),
+		);
 		expect(relayed.isError).toBeUndefined();
 		const answerCommit = (await outlineStore.getQuestions([q2.id]))[0]?.answerCommitId as string;
 		const reopened = await revertCommit({
@@ -625,9 +659,15 @@ describe("telling", () => {
 			answers: [{ blockId: q, adopt: true }],
 			deliver: false,
 		});
-		const id = outlineAnswerMessageId(done.commitId as string, w.a, w.alice.id);
-		expect(id).toBe(outlineAnswerMessageId(done.commitId as string, w.a, w.alice.id));
-		expect(id).not.toBe(outlineAnswerMessageId(done.commitId as string, w.a, null));
+		const group = { askerNarratorId: w.a, askerUserId: w.alice.id };
+		const id = outlineAnswerMessageId(done.commitId as string, w.a, group);
+		expect(id).toBe(outlineAnswerMessageId(done.commitId as string, w.a, { ...group }));
+		expect(id).not.toBe(
+			outlineAnswerMessageId(done.commitId as string, w.a, { ...group, askerUserId: null }),
+		);
+		expect(id).not.toBe(
+			outlineAnswerMessageId(done.commitId as string, w.a, { ...group, askerNarratorId: "x" }),
+		);
 		expect(id).toHaveLength(21);
 		// A crash after writing the message, before marking the row: the real delivery finds it.
 		await db.insert(narratorMessages).values({
@@ -638,15 +678,58 @@ describe("telling", () => {
 			createdBy: w.alice.id,
 			createdAt: new Date().toISOString(),
 		});
+		// ...and still owes the wake the crash cut off (review N-b): the idle asker is woken, as the
+		// person its turn ran for.
 		setOutlineAnswerDelivery(null);
+		const wakes = fakeWakes(true);
 		const retried = await deliverOutlineAnswers([q]);
-		expect(retried).toMatchObject({ delivered: 1, told: [w.a], woke: 0 });
+		expect(retried).toMatchObject({ delivered: 1, told: [w.a], woke: 1 });
+		expect(wakes).toEqual([{ narratorId: w.a, userId: w.alice.id }]);
 		const rows = await db
 			.select({ id: narratorMessages.id })
 			.from(narratorMessages)
 			.where(eq(narratorMessages.narratorId, w.a));
 		expect(rows.map((r) => r.id)).toEqual([id]);
 		expect((await outlineStore.getQuestions([q]))[0]?.deliveredAt).not.toBeNull();
+	});
+
+	test("two archived askers told through the task's holder get a message each (review R2)", async () => {
+		const w = await world();
+		const askers = [
+			await narrator(w.alice.id, w.projectId, "asker A"),
+			await narrator(w.alice.id, w.projectId, "asker B"),
+		];
+		const ids: string[] = [];
+		for (const [i, asker] of askers.entries()) {
+			const asked = await ask(ctx(asker, w.alice.id), {
+				under: `${w.space.key}/${w.task.sid}`,
+				questions: [{ question: `From ${"AB"[i]}?`, recommend: "yes" }],
+			});
+			ids.push((await questionOf(asked)).id);
+		}
+		for (const asker of askers)
+			await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, asker));
+		// One answer commit for both; each group falls back to session `a`, which holds the task,
+		// with no person to run as. The real delivery writes the messages.
+		setOutlineAnswerDelivery(null);
+		const wakes = fakeWakes(false);
+		await answerOutlineQuestions({
+			userId: w.alice.id,
+			answers: ids.map((blockId) => ({ blockId, adopt: true })),
+		});
+		const messages = await db
+			.select({ id: narratorMessages.id, text: narratorMessages.contentText })
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, w.a));
+		expect(messages).toHaveLength(2);
+		expect(messages.some((m) => m.text?.includes("From A?"))).toBe(true);
+		expect(messages.some((m) => m.text?.includes("From B?"))).toBe(true);
+		expect(new Set(messages.map((m) => m.id)).size).toBe(2);
+		expect((await outlineStore.getQuestions(ids)).map((r) => r.deliveredAt === null)).toEqual([
+			false,
+			false,
+		]);
+		expect(wakes.map((wake) => wake.narratorId)).toEqual([w.a, w.a]);
 	});
 
 	test("a subagent of an outline session keeps AskUserQuestion's async mode (decision 7, N7)", async () => {

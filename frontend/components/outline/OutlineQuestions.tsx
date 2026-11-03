@@ -27,7 +27,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import type { HumanAttentionItem } from "@shared/human-attention";
 import type {
-	OutlineAnswerInput,
+	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
 	OutlineQuestionView,
 } from "@shared/outline-api";
@@ -269,9 +269,9 @@ export function OutlineQuestionsForm({
 		);
 
 	const send = (adoptAll: boolean) => {
-		const answers = answerable.flatMap((q): OutlineAnswerInput[] => {
+		const answers = answerable.flatMap((q): OutlineAnswerHttpInput[] => {
 			// The version read goes with each answer: a question changed since is refused (S3).
-			const adopt: OutlineAnswerInput[] = hasRecommendation(q)
+			const adopt: OutlineAnswerHttpInput[] = hasRecommendation(q)
 				? [{ blockId: q.blockId, adopt: true, versionSeq: q.versionSeq }]
 				: [];
 			if (adoptAll) return adopt;

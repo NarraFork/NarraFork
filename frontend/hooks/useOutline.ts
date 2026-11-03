@@ -2,7 +2,7 @@
  * Queries and live updates of the read-only outline pages.
  */
 import type {
-	OutlineAnswerInput,
+	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
 	OutlineSpaceSummary,
 	OutlineViewMode,
@@ -310,7 +310,7 @@ export function useOutlineQuestions(blockId: string | null, enabled = true) {
 export function useAnswerOutlineQuestions(spaceId: string | null) {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: (answers: OutlineAnswerInput[]) => api.answerOutlineQuestions({ answers }),
+		mutationFn: (answers: OutlineAnswerHttpInput[]) => api.answerOutlineQuestions({ answers }),
 		onSettled: () => {
 			if (spaceId) invalidateOutlineSpace(queryClient, spaceId);
 			void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
