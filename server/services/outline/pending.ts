@@ -196,8 +196,10 @@ export const OUTLINE_PENDING_TEXT = {
 	conflict: (label: string) =>
 		`${label} no longer applies as proposed: blocks it changes were changed since. Nothing was written; reject it, or let its proposer propose again`,
 	unlocked: (label: string) => `${label}: the plan is no longer locked`,
-	subtreeUnchecked: (sid: string) =>
-		`[${sid}], which it deletes, is too large to check for changes made since it was proposed`,
+	subtreeUnchecked: (sid: string, why: OutlineUncheckedReason) =>
+		why === "writers"
+			? `[${sid}], which it deletes, could not be checked for changes made since it was proposed: too many writers of the proposing session wrote on top of one another to tell whether anyone else did`
+			: `[${sid}], which it deletes, has too many blocks to check for changes made since it was proposed`,
 	subtreeChanged: (sid: string, n: number) =>
 		`[${sid}], which it deletes, changed since it was proposed: ${n === 1 ? "1 block" : `${n} blocks`} in it or under it added, changed or gone`,
 	changed: (label: string) =>
@@ -405,12 +407,19 @@ const ALL_CHANGES = 0x7fffffff;
 /** Narrators of the proposing session one check finds and leaves out at most (rounds of reads). */
 const SESSION_ROUNDS = 8;
 
+/**
+ * Why a deleted subtree was not checked: too many blocks for the request's budget (`size`), or
+ * too many narrators of the proposing session wrote on top of one another to tell them apart
+ * within the rounds (`writers`, review R4-N-1).
+ */
+export type OutlineUncheckedReason = "size" | "writers";
+
 /** What a check of the subtrees a change deletes found. */
 export interface OutlineDeletedSubtrees {
 	/** By deleted block: how many blocks in or under it others changed since the proposal. */
 	changed: Map<string, number>;
-	/** Deleted blocks whose subtree was too large to check within the budget. */
-	unchecked: Set<string>;
+	/** Deleted blocks whose subtree could not be checked (none others are known to have changed). */
+	unchecked: Map<string, OutlineUncheckedReason>;
 }
 
 /**
@@ -425,7 +434,9 @@ export interface OutlineDeletedSubtrees {
  *
  * Bounded: `only` limits it to some of the deletes (a diff checks the ones it shows), and
  * `budget` caps the rows read across calls of one request. A subtree past it is reported
- * unchecked (too large to check), not changed (review R3-N-a).
+ * unchecked (`size`), not changed (review R3-N-a); so is one whose session writers outnumber the
+ * rounds (`writers`). Where someone else's version was found, it is changed, whatever else could
+ * not be checked (review R4-N-1).
  */
 export async function deletedSubtreeChanges(
 	store: OutlineStore,
@@ -435,7 +446,7 @@ export async function deletedSubtreeChanges(
 	>,
 	options: { only?: ReadonlySet<string>; budget?: OutlineSubtreeBudget } = {},
 ): Promise<OutlineDeletedSubtrees> {
-	const out: OutlineDeletedSubtrees = { changed: new Map(), unchecked: new Set() };
+	const out: OutlineDeletedSubtrees = { changed: new Map(), unchecked: new Map() };
 	const deletes = pendingOps(row).flatMap((op) =>
 		op.op === "delete" &&
 		"id" in op.block &&
@@ -463,7 +474,7 @@ export async function deletedSubtreeChanges(
 	let keys: Array<{ blockId: string; afterSeq: number; of: string }> = [];
 	for (const d of deletes) {
 		if (budget.left === 0) {
-			out.unchecked.add(d.id);
+			out.unchecked.set(d.id, "size");
 			continue;
 		}
 		const mine: typeof keys = [];
@@ -493,7 +504,7 @@ export async function deletedSubtreeChanges(
 		for (const [was, seq] of Object.entries(recorded))
 			if (!seen.has(was)) mine.push({ blockId: was, afterSeq: seq, of: d.id });
 		if (fits && take(mine.length)) keys.push(...mine);
-		else out.unchecked.add(d.id);
+		else out.unchecked.set(d.id, "size");
 	}
 	// The latest version of each that counts. A narrator of the proposing session found among the
 	// writers is the proposer too: left out, and its blocks looked at again (a few rounds).
@@ -540,13 +551,18 @@ export async function deletedSubtreeChanges(
 		if (again.size === 0) break;
 		for (const id of siblings) proposer.add(id);
 		const next = keys.filter((k) => again.has(k.blockId));
-		if (round + 1 >= SESSION_ROUNDS || !take(next.length)) {
-			for (const k of next) out.unchecked.add(k.of);
+		if (round + 1 >= SESSION_ROUNDS) {
+			for (const k of next) if (!out.unchecked.has(k.of)) out.unchecked.set(k.of, "writers");
+			break;
+		}
+		if (!take(next.length)) {
+			for (const k of next) out.unchecked.set(k.of, "size");
 			break;
 		}
 		keys = next;
 	}
-	for (const d of out.unchecked) out.changed.delete(d);
+	// Someone else's version found: changed, whatever else was not checked.
+	for (const d of out.changed.keys()) out.unchecked.delete(d);
 	return out;
 }
 
@@ -580,14 +596,14 @@ async function rebase(
 		const deletedSids = new Map(
 			(
 				await store.getBlockMetas(row.spaceId, {
-					ids: [...subtrees.changed.keys(), ...subtrees.unchecked],
+					ids: [...subtrees.changed.keys(), ...subtrees.unchecked.keys()],
 				})
 			).map((m) => [m.id, m.sid]),
 		);
 		for (const [id, n] of subtrees.changed)
 			conflicts.push(OUTLINE_PENDING_TEXT.subtreeChanged(deletedSids.get(id) ?? id, n));
-		for (const id of subtrees.unchecked)
-			conflicts.push(OUTLINE_PENDING_TEXT.subtreeUnchecked(deletedSids.get(id) ?? id));
+		for (const [id, why] of subtrees.unchecked)
+			conflicts.push(OUTLINE_PENDING_TEXT.subtreeUnchecked(deletedSids.get(id) ?? id, why));
 	}
 	if (conflicts.length > 0) {
 		throw new OutlinePendingError(
@@ -1017,8 +1033,11 @@ export interface OutlinePendingDiffEntry {
 	 * proposed (a confirmation refuses then).
 	 */
 	changedUnder?: number;
-	/** For a delete: its subtree is too large to check for that (review R3-N-a). */
-	subtreeUnchecked?: boolean;
+	/**
+	 * For a delete: its subtree could not be checked for that (reviews R3-N-a, R4-N-1): too many
+	 * blocks (`size`), or too many of the session's writers on one block (`writers`).
+	 */
+	subtreeUnchecked?: OutlineUncheckedReason;
 }
 
 /**
@@ -1120,7 +1139,9 @@ export async function readPendingDiff(
 			...(op.op === "delete" && subtrees.changed.has(id)
 				? { changedUnder: subtrees.changed.get(id) }
 				: {}),
-			...(op.op === "delete" && subtrees.unchecked.has(id) ? { subtreeUnchecked: true } : {}),
+			...(op.op === "delete" && subtrees.unchecked.has(id)
+				? { subtreeUnchecked: subtrees.unchecked.get(id) }
+				: {}),
 		});
 	}
 	return { entries, truncated: ops.length > shown.length };

@@ -424,8 +424,11 @@ export interface OutlinePendingDiffEntry {
 	parentTitle?: string | null;
 	/** For a delete: blocks in or under it others added, changed or moved away since it was proposed. */
 	changedUnder?: number;
-	/** For a delete: its subtree is too large to check for changes since it was proposed. */
-	subtreeUnchecked?: boolean;
+	/**
+	 * For a delete: its subtree could not be checked for changes since it was proposed: too many
+	 * blocks (`size`), or too many writers of the proposing session on one block (`writers`).
+	 */
+	subtreeUnchecked?: "size" | "writers";
 }
 
 /** `GET /pending/:id`: a pending change block by block (bounded). */

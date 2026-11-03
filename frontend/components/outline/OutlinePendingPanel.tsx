@@ -372,7 +372,11 @@ export function DiffEntry({ entry }: { entry: OutlinePendingDiffEntry }) {
 			)}
 			{entry.kind === "delete" && entry.subtreeUnchecked && (
 				<Text size="xs" c="dimmed" data-testid="outline-pending-subtree-unchecked">
-					{t("pending.subtreeUnchecked")}
+					{t(
+						entry.subtreeUnchecked === "writers"
+							? "pending.subtreeUncheckedWriters"
+							: "pending.subtreeUnchecked",
+					)}
 				</Text>
 			)}
 			{entry.kind === "task" && (

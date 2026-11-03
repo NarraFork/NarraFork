@@ -18,6 +18,7 @@ import {
 	lockOutlineTask,
 	mergeProposal,
 	OutlinePendingError,
+	type OutlineUncheckedReason,
 	readPendingDiff,
 	rejectOutlinePending,
 	takePendingReports,
@@ -1451,7 +1452,10 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 				{ op: "move", block: { id: ids.root }, parent: { id: ids.other } },
 			]);
 			const row = await pendingRow(ctx, call.pending?.id as string);
-			const none = { changed: new Map<string, number>(), unchecked: new Set<string>() };
+			const none = {
+				changed: new Map<string, number>(),
+				unchecked: new Map<string, OutlineUncheckedReason>(),
+			};
 			expect(await deletedSubtreeChanges(ctx.store, row)).toEqual(none);
 			// Bounded: what the budget does not reach is too large to check, not changed (review
 			// R3-N-a), whether the walk or the blocks to look at run past it; the budget never goes
@@ -1460,7 +1464,7 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 				const budget = { left };
 				expect(await deletedSubtreeChanges(ctx.store, row, { budget })).toEqual({
 					changed: new Map(),
-					unchecked: new Set([ids.s2]),
+					unchecked: new Map([[ids.s2, "size"]]),
 				});
 				expect(budget.left).toBe(0);
 			}
@@ -1472,7 +1476,7 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			try {
 				const small = await readPendingDiff(row, { store: ctx.store });
 				const entry = small.entries.find((e) => e.kind === "delete");
-				expect(entry?.subtreeUnchecked).toBe(true);
+				expect(entry?.subtreeUnchecked).toBe("size");
 				expect(entry?.changedUnder).toBeUndefined();
 			} finally {
 				limits.diffSubtreeRows = rows;
@@ -1672,6 +1676,52 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			);
 			expect(refused.pendingCode).toBe("OUTLINE_PENDING_CONFLICT");
 			checkSpaceInvariants(await ctx.dump(q.space.id));
+		},
+	},
+	{
+		name: "confirm a delete: a stack of the session's writers deeper than the rounds is unchecked for that reason, not for size; someone else's version found is changed, whatever else was not checked (review R4-N-1)",
+		async run(ctx) {
+			const p = await lockedPlan(ctx);
+			const { space, a, ids } = p;
+			const proposal = await write(ctx, space, a, [{ op: "delete", block: { id: ids.s2 } }]);
+			// Nine subagents of the proposing session write a note under s2, one after another.
+			const subs: string[] = [];
+			for (let i = 0; i < 9; i++)
+				subs.push(await ctx.seedNarrator({ parentId: p.narrators.a, rootId: p.narrators.a }));
+			const note = (
+				await write(ctx, space, { kind: "agent", narratorId: subs[0] as string }, [
+					{ op: "insert", parent: { id: ids.s2 }, content: "note 0" },
+				])
+			).results[0]?.blockId as string;
+			for (const [i, sub] of subs.slice(1).entries()) {
+				await write(ctx, space, { kind: "agent", narratorId: sub }, [
+					{ op: "update", block: { id: note }, content: `note ${i + 1}` },
+				]);
+			}
+			const row = await pendingRow(ctx, proposal.pending?.id as string);
+			expect(await deletedSubtreeChanges(ctx.store, row)).toEqual({
+				changed: new Map(),
+				unchecked: new Map([[ids.s2, "writers"]]),
+			});
+			const diff = await readPendingDiff(row, { store: ctx.store });
+			expect(diff.entries.find((e) => e.kind === "delete")?.subtreeUnchecked).toBe("writers");
+			const refused = await refusedWith(
+				confirmOutlinePending({
+					pendingId: row.id,
+					by: { kind: "human", userId: p.lockerId },
+					store: ctx.store,
+				}),
+				OutlinePendingError,
+			);
+			expect(refused.details.join("\n")).toContain("too many writers of the proposing session");
+			// Another session adds a block under s2: changed, though the stack is still unchecked.
+			await write(ctx, space, p.b, [
+				{ op: "insert", parent: { id: ids.s2 }, content: "another session's finding" },
+			]);
+			expect(await deletedSubtreeChanges(ctx.store, row)).toEqual({
+				changed: new Map([[ids.s2, 1]]),
+				unchecked: new Map(),
+			});
 		},
 	},
 ];
