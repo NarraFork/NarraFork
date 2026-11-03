@@ -11,6 +11,7 @@ export interface SystemLifecycleStatus {
 }
 
 export interface SystemLifecycleDependencies {
+	changed?(): void;
 	coordination(): UpdateCoordinationStatus;
 	canShutdown(): boolean;
 	schedule(): UpdateCoordinationStatus;
@@ -31,6 +32,13 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 	let error: string | undefined;
 	let epoch: string | undefined;
 	let preparation: Promise<void> | null = null;
+	let lastChange = JSON.stringify([phase, shutdownRequested, error]);
+	const changed = () => {
+		const next = JSON.stringify([phase, shutdownRequested, error]);
+		if (next === lastChange) return;
+		lastChange = next;
+		deps.changed?.();
+	};
 
 	const status = (): SystemLifecycleStatus => ({
 		phase,
@@ -44,6 +52,7 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 	async function rollback(reason: unknown, ownedEpoch: string) {
 		const cancelled = deps.isCancellation(reason) || deps.coordination().cancelRequested;
 		error = reason instanceof Error ? reason.message : String(reason);
+		changed();
 		try {
 			await deps.cleanup(ownedEpoch, error, cancelled);
 		} catch (cleanupError) {
@@ -52,11 +61,13 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 			// retry; do not report idle or admit another preparation over this one.
 			shutdownRequested = false;
 			phase = "failed";
+			changed();
 			return;
 		}
 		shutdownRequested = false;
 		phase = cancelled ? "idle" : "failed";
 		epoch = undefined;
+		changed();
 	}
 
 	function closePrepared() {
@@ -64,6 +75,7 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 		if (!deps.shutdown()) throw new Error("Server shutdown is unavailable");
 		deps.markClosing();
 		phase = "shutting_down";
+		changed();
 	}
 
 	function prepare(closeAfterPreparation = false) {
@@ -71,6 +83,7 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 		if (!deps.canShutdown()) return failure("Server shutdown is unavailable");
 		if (preparation || phase === "preparing") {
 			shutdownRequested ||= closeAfterPreparation;
+			changed();
 			return success();
 		}
 		if (phase === "prepared" && !closeAfterPreparation) return success();
@@ -89,6 +102,7 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 		phase = "preparing";
 		error = undefined;
 		shutdownRequested = closeAfterPreparation;
+		changed();
 		preparation = (async () => {
 			try {
 				const snapshot = await deps.drain(ownedEpoch);
@@ -100,6 +114,7 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 					handoffMarkerNonce: undefined,
 				});
 				phase = "prepared";
+				changed();
 				if (shutdownRequested) closePrepared();
 			} catch (reason) {
 				await rollback(reason, ownedEpoch);
@@ -116,8 +131,10 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 			return success();
 		deps.cancel();
 		shutdownRequested = false;
+		changed();
 		if (!preparation && epoch) {
 			phase = "preparing";
+			changed();
 			preparation = rollback(new Error("System preparation cancelled"), epoch).finally(() => {
 				preparation = null;
 			});

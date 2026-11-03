@@ -12,6 +12,8 @@ import { logger } from "./logger";
 
 export type NarraForkEvent =
 	| { type: "auth:changed"; userId?: string }
+	// Invalidation only: lifecycle details are fetched through the authorized status API.
+	| { type: "system:lifecycle_changed" }
 	| { type: "git:workspace_invalidated"; queryKey: string }
 	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
 	| {

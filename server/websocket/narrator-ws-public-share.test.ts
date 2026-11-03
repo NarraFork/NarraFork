@@ -22,6 +22,7 @@ const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 afterAll(() => mock.module("../db", () => realDbModule));
 
+const { eventBus } = await import("../lib/event-bus");
 const { generateId } = await import("../lib/id");
 const { ensureNarratorDiscussionRoomForShare } = await import("../services/chat-service");
 const { revokePublicShare, hashPublicShareToken } = await import(
@@ -156,6 +157,16 @@ describe("public-share WebSocket scoping", () => {
 		} as never);
 		broadcastToChatRoom(f.roomId, { type: "chat:message_deleted", roomId: f.roomId } as never);
 		expect(sent).toHaveLength(2);
+	});
+
+	it("lifecycle invalidation sends only a marker and never reaches anonymous shares", async () => {
+		const shared = openShareWs(await shareFixture());
+		const regular = openShareWs();
+		shared.sent.length = 0;
+		regular.sent.length = 0;
+		eventBus.emit({ type: "system:lifecycle_changed" });
+		expect(shared.sent).toEqual([]);
+		expect(regular.sent).toEqual([{ type: "system_lifecycle_changed" }]);
 	});
 
 	it("refuses stats and unrelated workspace subscriptions", async () => {
