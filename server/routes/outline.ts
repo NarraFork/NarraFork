@@ -16,6 +16,14 @@
  *   5. A person's view state of a page (`/view-state/:pageId`: folding and the mind map's
  *      direction) needs only read access: it is their own view, never a commit. A page they
  *      cannot read, a block that is not a page, and a deleted page are 404.
+
+ *   6. Locks and pending changes (design §2.2, §2.6; P2 PR 6): a page's pending changes and a
+ *      change's diff need read access to its space (a change in a space the person cannot read
+ *      is 404). Locking needs write access to the space, and a delegate session the person may
+ *      write (404 when they cannot read it, 403 when they cannot write it); unlocking is for the
+ *      locker, a manager of the space or an admin (403 otherwise); confirming and rejecting are
+ *      for the person who locked the plan (403 otherwise; a session confirms through
+ *      `OutlineEdit`).
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
@@ -27,7 +35,13 @@ import {
 	type OutlineBacklinksResponse,
 	type OutlineBlockHistoryResponse,
 	type OutlineBlockViewResponse,
+	type OutlineLockResponse,
+	type OutlineLockView,
 	type OutlinePageListResponse,
+	type OutlinePagePendingResponse,
+	type OutlinePendingDecisionResponse,
+	type OutlinePendingDetailResponse,
+	type OutlinePendingSummary,
 	type OutlineResolveResponse,
 	type OutlineRevertResponse,
 	type OutlineSearchResponse,
@@ -46,13 +60,16 @@ import {
 	outlineBlockViewQuerySchema,
 	outlineHistoryQuerySchema,
 	outlineIdSchema,
+	outlineLockBodySchema,
 	outlinePageListQuerySchema,
+	outlinePendingRejectBodySchema,
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
 	outlineViewStatePutSchema,
 } from "../lib/validators/outline";
 import {
+	canManageSpace,
 	canReadSpace,
 	canWriteSpace,
 	listReadableSpaces,
@@ -67,7 +84,20 @@ import {
 	readNarrator,
 	readProject,
 } from "../services/outline/access-reads";
+import { OutlineWriteError } from "../services/outline/errors";
 import { isOutlineEnabled } from "../services/outline/feature";
+import { type OutlinePendingDeciderJson, outlinePendingLabel } from "../services/outline/model";
+import {
+	confirmOutlinePending,
+	lockOutlineTask,
+	OutlinePendingError,
+	pendingBaseChanged,
+	pendingNames,
+	readPagePending,
+	readPendingDiff,
+	rejectOutlinePending,
+	unlockOutlineTask,
+} from "../services/outline/pending";
 import { commitSeqAt } from "../services/outline/read";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
@@ -81,9 +111,15 @@ import {
 	findSessionSpace,
 } from "../services/outline/spaces";
 import { outlineStore } from "../services/outline/store";
-import type { OutlineBlockRow, OutlineSpaceRow } from "../services/outline/store/port";
+import type {
+	OutlineBlockRow,
+	OutlinePendingHead,
+	OutlinePendingRow,
+	OutlineSpaceRow,
+} from "../services/outline/store/port";
 import { readViewState, writeViewState } from "../services/outline/view-state";
 import {
+	describeLocks,
 	describeSpaces,
 	listSpacePages,
 	readBlockHistory,
@@ -304,8 +340,14 @@ outlineRoutes.get("/spaces/:spaceId/blocks/:blockId", async (c) => {
 			blocks: query.blocks ?? OUTLINE_VIEW_LIMITS.defaultBlocks,
 			bytes: query.bytes ?? OUTLINE_VIEW_LIMITS.maxBytes,
 		},
+		narratorVisible: narratorVisibility(principal),
 	});
 	if (!view) throw new NotFoundError("Outline block", blockId);
+	const locked = view.blocks.flatMap((b) => (b.lock ? [b.lock] : []));
+	if (locked.length > 0) {
+		const manages = await canManageSpace(principal, space);
+		for (const lock of locked) lock.canUnlock = unlockAllowed(principal, lock, manages);
+	}
 	const body: OutlineBlockViewResponse = {
 		space: {
 			...(await describeOne(principal, space)),
@@ -488,6 +530,8 @@ outlineRoutes.post("/commits/:commitId/revert", async (c) => {
 		commitId,
 		actor: { kind: "human", id: principal.userId },
 		responsibleUserId: principal.userId,
+		// A revert takes someone else's lock away only for who may unlock (review S-4).
+		unlockAuthority: async () => principal.isAdmin || (await canManageSpace(principal, space)),
 	});
 	const body: OutlineRevertResponse = {
 		reverted: result.reverted,
@@ -502,6 +546,328 @@ outlineRoutes.post("/commits/:commitId/revert", async (c) => {
 		})),
 		adjusted: result.notes.length,
 	};
+	return c.json(body);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Locks and pending changes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The locker, a manager of the space, or an admin. */
+function unlockAllowed(
+	principal: OutlinePrincipal,
+	lock: Pick<OutlineLockView, "by">,
+	manages: boolean,
+): boolean {
+	return (
+		principal.isAdmin || manages || (lock.by.kind === "human" && lock.by.id === principal.userId)
+	);
+}
+
+/**
+ * Whether the person may read a session: locks and pending changes name it by title only then
+ * (review S-5). Memoized for one request.
+ */
+function narratorVisibility(principal: OutlinePrincipal): (narratorId: string) => Promise<boolean> {
+	const memo = new Map<string, Promise<boolean>>();
+	return (narratorId) => {
+		let verdict = memo.get(narratorId);
+		if (!verdict) {
+			verdict = (async () => {
+				const narrator = await readNarrator(narratorId);
+				return narrator !== null && (await holds(principal, "read", { narrator }));
+			})();
+			memo.set(narratorId, verdict);
+		}
+		return verdict;
+	};
+}
+
+/**
+ * Pending changes as the person sees them listed (names, whether they decide them), from their
+ * heads (review S-7: the operations are not read). Who decides is the lock on each change's tree
+ * as it is now; deciding needs write access to the space (review B-3).
+ */
+async function describePending(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+	rows: readonly OutlinePendingHead[],
+): Promise<OutlinePendingSummary[]> {
+	if (rows.length === 0) return [];
+	const rootIds = rows.flatMap((r) => (r.rootBlockId ? [r.rootBlockId] : []));
+	// The parents of the blocks each adds that exist (one added under another is not one).
+	const parentIds = rows.flatMap((r) =>
+		r.addsJson.flatMap((add) => (add.parentId ? [add.parentId] : [])),
+	);
+	const [roots, changed, writes] = await Promise.all([
+		outlineStore.getBlockMetas(space.id, { ids: [...new Set([...rootIds, ...parentIds])] }),
+		pendingBaseChanged(rows),
+		canWriteSpace(principal, space),
+	]);
+	const live = new Set(roots.flatMap((m) => (m.deleted ? [] : [m.id])));
+	const locks = new Map(
+		roots.flatMap((m) =>
+			!m.deleted && m.taskJson?.lock ? [[m.id, m.taskJson.lock] as const] : [],
+		),
+	);
+	const deciders = rows.map((row) => {
+		const lock = row.rootBlockId ? locks.get(row.rootBlockId) : undefined;
+		return lock ? { by: lock.by, delegate: lock.delegate ?? null } : row.deciderJson;
+	});
+	const names = await pendingNames(
+		rows.map((row, i) => ({ ...row, deciderJson: deciders[i] as OutlinePendingDeciderJson })),
+	);
+	const visible = narratorVisibility(principal);
+	const title = async (id: string | null): Promise<string | null> =>
+		id !== null && (await visible(id)) ? (names.narrators.get(id) ?? null) : null;
+	const out: OutlinePendingSummary[] = [];
+	for (const [i, row] of rows.entries()) {
+		const lock = row.rootBlockId ? locks.get(row.rootBlockId) : undefined;
+		const decider = deciders[i] as OutlinePendingDeciderJson;
+		out.push({
+			id: row.id,
+			label: outlinePendingLabel(row.id),
+			status: row.status,
+			rootBlockId: row.rootBlockId,
+			pageId: row.pageId,
+			summary: row.summary,
+			createdAt: row.createdAt,
+			updatedAt: row.updatedAt,
+			proposer: { narratorId: row.requesterSession, title: await title(row.requesterSession) },
+			decider: {
+				by: {
+					kind: decider.by.kind,
+					id: decider.by.id,
+					name:
+						decider.by.kind === "human"
+							? (names.users.get(decider.by.id) ?? null)
+							: await title(decider.by.id),
+				},
+				delegate: decider.delegate
+					? { narratorId: decider.delegate, title: await title(decider.delegate) }
+					: null,
+			},
+			blockIds: row.blockIdsJson,
+			addedUnder: [
+				...new Set(
+					row.addsJson.flatMap((add) =>
+						add.parentId && live.has(add.parentId) ? [add.parentId] : [],
+					),
+				),
+			],
+			ops: row.opCount,
+			changedSince: changed.has(row.id),
+			canDecide:
+				row.status === "open" &&
+				writes &&
+				!!lock &&
+				lock.by.kind === "human" &&
+				lock.by.id === principal.userId,
+		});
+	}
+	return out;
+}
+
+/** A pending change in a space the person can read; 404 otherwise, whether or not it exists. */
+async function readablePending(
+	principal: OutlinePrincipal,
+	pendingId: string,
+): Promise<{ row: OutlinePendingRow; space: OutlineSpaceRow }> {
+	const row = (await outlineStore.getPending([pendingId]))[0];
+	const space = row ? await outlineStore.getSpace(row.spaceId) : null;
+	if (!row || !space || !(await canReadSpace(principal, space))) {
+		throw new NotFoundError("Outline pending change", pendingId);
+	}
+	return { row, space };
+}
+
+/** What waits for confirmation on a page, and its locked tasks. */
+outlineRoutes.get("/spaces/:spaceId/pages/:pageId/pending", async (c) => {
+	const principal = principalOf(c);
+	const { space, block } = await readableBlock(
+		principal,
+		idParam(c, "spaceId"),
+		idParam(c, "pageId"),
+	);
+	const { pending, locked } = await readPagePending(block.pageId);
+	const views = await describeLocks(
+		locked.flatMap((m) => (m.taskJson?.lock ? [{ blockId: m.id, lock: m.taskJson.lock }] : [])),
+		{ narratorVisible: narratorVisibility(principal) },
+	);
+	const manages = views.size > 0 ? await canManageSpace(principal, space) : false;
+	for (const lock of views.values()) lock.canUnlock = unlockAllowed(principal, lock, manages);
+	const body: OutlinePagePendingResponse = {
+		pending: await describePending(principal, space, pending),
+		locks: [...views.values()],
+	};
+	return c.json(body);
+});
+
+/** A pending change block by block: as proposed against, as proposed, and as it is now. */
+outlineRoutes.get("/pending/:pendingId", async (c) => {
+	const principal = principalOf(c);
+	const { row, space } = await readablePending(principal, idParam(c, "pendingId"));
+	const diff = await readPendingDiff(row);
+	const body: OutlinePendingDetailResponse = {
+		pending: (await describePending(principal, space, [row]))[0] as OutlinePendingSummary,
+		entries: diff.entries.map(({ task, ...entry }) => ({
+			...entry,
+			...(task !== undefined
+				? {
+						task: task
+							? {
+									...(task.status !== undefined ? { status: task.status } : {}),
+									...(task.assignee !== undefined ? { assignee: task.assignee } : {}),
+									...(task.due !== undefined ? { due: task.due } : {}),
+									...(task.depends !== undefined
+										? { depends: task.depends?.map((d) => d.target) ?? null }
+										: {}),
+								}
+							: null,
+					}
+				: {}),
+		})),
+		truncated: diff.truncated,
+	};
+	return c.json(body);
+});
+
+function pendingFailure(c: Context, error: OutlinePendingError) {
+	return c.json(
+		{ code: error.code, message: error.message, details: error.details },
+		error.statusCode as 403 | 404 | 409,
+	);
+}
+
+/** Confirm a pending change: the person who locked the plan, while they may write the space. */
+outlineRoutes.post("/pending/:pendingId/confirm", async (c) => {
+	const principal = principalOf(c);
+	const { row, space } = await readablePending(principal, idParam(c, "pendingId"));
+	// A confirmation is a commit in the space: write access first (review B-3).
+	if (!(await canWriteSpace(principal, space))) throw new ForbiddenError();
+	try {
+		const done = await confirmOutlinePending({
+			pendingId: row.id,
+			by: { kind: "human", userId: principal.userId },
+		});
+		const body: OutlinePendingDecisionResponse = {
+			pending: (await describePending(principal, space, [done.row]))[0] as OutlinePendingSummary,
+			commit: done.write.commit,
+		};
+		return c.json(body);
+	} catch (error) {
+		if (error instanceof OutlinePendingError) return pendingFailure(c, error);
+		throw error;
+	}
+});
+
+/**
+ * Reject a pending change, with a reason for its proposer: the person who locked the plan, while
+ * they may write the space.
+ */
+outlineRoutes.post("/pending/:pendingId/reject", async (c) => {
+	const principal = principalOf(c);
+	const { row, space } = await readablePending(principal, idParam(c, "pendingId"));
+	// Deciding changes what the space will hold: write access first (review B-3).
+	if (!(await canWriteSpace(principal, space))) throw new ForbiddenError();
+	const input = parse(outlinePendingRejectBodySchema, await c.req.json().catch(() => ({})));
+	try {
+		const done = await rejectOutlinePending({
+			pendingId: row.id,
+			by: { kind: "human", userId: principal.userId },
+			reason: input.reason ?? null,
+		});
+		const body: OutlinePendingDecisionResponse = {
+			pending: (await describePending(principal, space, [done]))[0] as OutlinePendingSummary,
+			commit: null,
+		};
+		return c.json(body);
+	} catch (error) {
+		if (error instanceof OutlinePendingError) return pendingFailure(c, error);
+		throw error;
+	}
+});
+
+/**
+ * Lock a task's tree (owner decision Q5: people lock, from the page), optionally naming a session
+ * that may confirm step changes on the locker's behalf: one the person may write. A task someone
+ * else locked is 409 (`OUTLINE_LOCK_HELD`, review B-2): it is unlocked first, by someone who may;
+ * the locker locking again only names another delegate.
+ */
+outlineRoutes.post("/spaces/:spaceId/blocks/:blockId/lock", async (c) => {
+	const principal = principalOf(c);
+	const { space, block } = await readableBlock(
+		principal,
+		idParam(c, "spaceId"),
+		idParam(c, "blockId"),
+	);
+	if (block.deleted) throw new NotFoundError("Outline block", block.id);
+	if (!(await canWriteSpace(principal, space))) throw new ForbiddenError();
+	if (!block.taskJson) throw new ValidationError("only a task can be locked");
+	const input = parse(outlineLockBodySchema, await c.req.json().catch(() => ({})));
+	const delegate = input.delegate ?? null;
+	if (delegate !== null) {
+		const narrator = await readNarrator(delegate);
+		if (!narrator || !(await holds(principal, "read", { narrator }))) {
+			throw new NotFoundError("Narrator", delegate);
+		}
+		if (!(await holds(principal, "write", { narrator }))) throw new ForbiddenError();
+	}
+	let result: Awaited<ReturnType<typeof lockOutlineTask>>;
+	try {
+		result = await lockOutlineTask({ blockId: block.id, userId: principal.userId, delegate });
+	} catch (error) {
+		if (error instanceof OutlineWriteError && error.code === "OUTLINE_LOCK_HELD")
+			return c.json({ code: error.code, message: error.message }, 409);
+		throw error;
+	}
+	const after = await outlineStore.getBlock(block.id);
+	const lock = after?.taskJson?.lock
+		? (
+				await describeLocks([{ blockId: block.id, lock: after.taskJson.lock }], {
+					narratorVisible: narratorVisibility(principal),
+				})
+			).get(block.id)
+		: undefined;
+	if (lock) lock.canUnlock = true;
+	const body: OutlineLockResponse = { lock: lock ?? null, commit: result.commit };
+	return c.json(body);
+});
+
+/** Unlock a task's tree: the locker, a manager of the space, or an admin. */
+outlineRoutes.delete("/spaces/:spaceId/blocks/:blockId/lock", async (c) => {
+	const principal = principalOf(c);
+	const { space, block } = await readableBlock(
+		principal,
+		idParam(c, "spaceId"),
+		idParam(c, "blockId"),
+	);
+	const lock = block.deleted ? undefined : block.taskJson?.lock;
+	if (!lock) {
+		const body: OutlineLockResponse = { lock: null, commit: null };
+		return c.json(body);
+	}
+	const manages = await canManageSpace(principal, space);
+	const allowed = unlockAllowed(
+		principal,
+		{ by: { kind: lock.by.kind, id: lock.by.id, name: null } },
+		manages,
+	);
+	if (!allowed || !(await canWriteSpace(principal, space))) throw new ForbiddenError();
+	let result: Awaited<ReturnType<typeof unlockOutlineTask>>;
+	try {
+		result = await unlockOutlineTask({
+			blockId: block.id,
+			userId: principal.userId,
+			mayUnlockAnyone: principal.isAdmin || manages,
+		});
+	} catch (error) {
+		// Relocked by someone else meanwhile, whom this person may not unlock.
+		if (error instanceof OutlineWriteError && error.code === "OUTLINE_LOCK_DENIED")
+			throw new ForbiddenError();
+		throw error;
+	}
+	const body: OutlineLockResponse = { lock: null, commit: result.commit };
 	return c.json(body);
 });
 

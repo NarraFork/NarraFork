@@ -10,21 +10,27 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
-import { IconHistory, IconLink } from "@tabler/icons-react";
-import { useMemo, useState } from "react";
+import { IconHistory, IconHourglass, IconLink } from "@tabler/icons-react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useOutlineBacklinks, useOutlineBlockHistory } from "../../hooks/useOutline";
+import {
+	useOutlineBacklinks,
+	useOutlineBlockHistory,
+	useOutlinePagePending,
+} from "../../hooks/useOutline";
 import { formatFullLocaleDateTime, formatSmartTime } from "../../lib/format";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
+import { OutlineLockSection, OutlinePendingList, pendingFor } from "./OutlinePendingPanel";
 import { commitActorLabel } from "./OutlineTimeline";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
-type SideTab = "backlinks" | "history";
+type SideTab = "backlinks" | "history" | "pending";
 
 /**
- * About the focused block, beside the outline: what links to it, and its history. Picking a
- * version shows the page as of it.
+ * About the focused block, beside the outline: its lock (a focused task: lock or unlock it), the
+ * changes to it waiting for confirmation (when there are any), what links to it, and its history.
+ * Picking a version shows the page as of it.
  */
 export function OutlineSidePanel({
 	view,
@@ -45,115 +51,145 @@ export function OutlineSidePanel({
 		() => history.data?.pages.flatMap((page) => page.entries) ?? [],
 		[history.data],
 	);
+	const pagePending = useOutlinePagePending(spaceId, view.pageId, view.current);
+	const pending = useMemo(
+		() => (view.current ? pendingFor(view, pagePending.data?.pending ?? []) : []),
+		[view, pagePending.data],
+	);
+	const hasPending = pending.length > 0;
+	// The tab goes when nothing waits any more.
+	useEffect(() => {
+		if (!hasPending && tab === "pending") setTab("backlinks");
+	}, [hasPending, tab]);
 
 	return (
-		<Tabs value={tab} onChange={(value) => value && setTab(value as SideTab)} keepMounted={false}>
-			<Tabs.List grow>
-				<Tabs.Tab value="backlinks" leftSection={<IconLink size={14} />}>
-					{t("side.backlinks")}
-				</Tabs.Tab>
-				<Tabs.Tab value="history" leftSection={<IconHistory size={14} />}>
-					{t("side.history")}
-				</Tabs.Tab>
-			</Tabs.List>
-			<Tabs.Panel value="backlinks" pt="xs">
-				{backlinks.isLoading && <Loader size="sm" />}
-				{backlinks.isError && (
-					<Alert color="red" variant="light">
-						{t("loadFailed")}
-					</Alert>
-				)}
-				{backlinks.data && backlinks.data.links.length === 0 && (
-					<Text size="sm" c="dimmed">
-						{t("side.noBacklinks")}
-					</Text>
-				)}
-				<Stack gap={2}>
-					{backlinks.data?.links.map((link) => (
-						<OutlineLink
-							key={`${link.blockId}:${link.kind}`}
-							to={outlineBlockTarget(link.spaceId, link.blockId, search.view)}
-							className={classes.listItem}
+		<>
+			<OutlineLockSection view={view} />
+			<Tabs value={tab} onChange={(value) => value && setTab(value as SideTab)} keepMounted={false}>
+				<Tabs.List grow>
+					{hasPending && (
+						<Tabs.Tab
+							value="pending"
+							leftSection={<IconHourglass size={14} />}
+							data-testid="outline-pending-tab"
 						>
-							<Group gap={6} wrap="nowrap">
-								<Badge size="xs" variant="light" color="gray" tt="none">
-									{t(`side.linkKind.${link.kind}`)}
-								</Badge>
-								<Text size="sm" className={classes.ellipsis}>
-									{link.title || link.address}
-								</Text>
-							</Group>
-							<Text size="xs" c="dimmed" className={classes.ellipsis}>
-								{link.address}
-							</Text>
-						</OutlineLink>
-					))}
-				</Stack>
-				{backlinks.data?.truncated && (
-					<Text size="xs" c="dimmed" mt={4}>
-						{t("side.backlinksTruncated", { count: backlinks.data.links.length })}
-					</Text>
+							{t("pending.tab")}
+							<Badge size="xs" ml={4} color="orange" variant="light">
+								{pending.length}
+							</Badge>
+						</Tabs.Tab>
+					)}
+					<Tabs.Tab value="backlinks" leftSection={<IconLink size={14} />}>
+						{t("side.backlinks")}
+					</Tabs.Tab>
+					<Tabs.Tab value="history" leftSection={<IconHistory size={14} />}>
+						{t("side.history")}
+					</Tabs.Tab>
+				</Tabs.List>
+				{hasPending && (
+					<Tabs.Panel value="pending" pt="xs">
+						<OutlinePendingList spaceId={spaceId} pending={pending} />
+					</Tabs.Panel>
 				)}
-			</Tabs.Panel>
-			<Tabs.Panel value="history" pt="xs">
-				{history.isLoading && <Loader size="sm" />}
-				{history.isError && (
-					<Alert color="red" variant="light">
-						{t("loadFailed")}
-					</Alert>
-				)}
-				{history.isSuccess && entries.length === 0 && (
-					<Text size="sm" c="dimmed">
-						{t("side.noHistory")}
-					</Text>
-				)}
-				<Stack gap={2}>
-					{entries.map((entry) => (
-						<UnstyledButton
-							key={entry.seq}
-							className={classes.listItem}
-							data-selected={search.asOf === entry.seq}
-							aria-current={search.asOf === entry.seq ? "true" : undefined}
-							title={entry.commit ? formatFullLocaleDateTime(entry.commit.createdAt) : undefined}
-							aria-label={t("side.viewAt", { seq: entry.seq })}
-							onClick={() => onViewAt(entry.seq)}
-						>
-							<Group gap={4} wrap="wrap">
-								<Text size="xs" fw={500}>
-									{t("timeline.commit", { seq: entry.seq })}
-								</Text>
-								{entry.changes
-									.filter((change) => change !== "page" || entry.changes.length === 1)
-									.map((change) => (
-										<Badge key={change} size="xs" variant="light" tt="none">
-											{t(`side.change.${change}`)}
-										</Badge>
-									))}
-							</Group>
-							{entry.commit && (
+				<Tabs.Panel value="backlinks" pt="xs">
+					{backlinks.isLoading && <Loader size="sm" />}
+					{backlinks.isError && (
+						<Alert color="red" variant="light">
+							{t("loadFailed")}
+						</Alert>
+					)}
+					{backlinks.data && backlinks.data.links.length === 0 && (
+						<Text size="sm" c="dimmed">
+							{t("side.noBacklinks")}
+						</Text>
+					)}
+					<Stack gap={2}>
+						{backlinks.data?.links.map((link) => (
+							<OutlineLink
+								key={`${link.blockId}:${link.kind}`}
+								to={outlineBlockTarget(link.spaceId, link.blockId, search.view)}
+								className={classes.listItem}
+							>
+								<Group gap={6} wrap="nowrap">
+									<Badge size="xs" variant="light" color="gray" tt="none">
+										{t(`side.linkKind.${link.kind}`)}
+									</Badge>
+									<Text size="sm" className={classes.ellipsis}>
+										{link.title || link.address}
+									</Text>
+								</Group>
 								<Text size="xs" c="dimmed" className={classes.ellipsis}>
-									{[
-										commitActorLabel(entry.commit, t),
-										formatSmartTime(entry.commit.createdAt),
-										entry.commit.summary,
-									].join(" · ")}
+									{link.address}
 								</Text>
-							)}
-						</UnstyledButton>
-					))}
-				</Stack>
-				{history.hasNextPage && (
-					<Button
-						variant="subtle"
-						size="compact-xs"
-						mt={4}
-						loading={history.isFetchingNextPage}
-						onClick={() => void history.fetchNextPage()}
-					>
-						{t("loadMore")}
-					</Button>
-				)}
-			</Tabs.Panel>
-		</Tabs>
+							</OutlineLink>
+						))}
+					</Stack>
+					{backlinks.data?.truncated && (
+						<Text size="xs" c="dimmed" mt={4}>
+							{t("side.backlinksTruncated", { count: backlinks.data.links.length })}
+						</Text>
+					)}
+				</Tabs.Panel>
+				<Tabs.Panel value="history" pt="xs">
+					{history.isLoading && <Loader size="sm" />}
+					{history.isError && (
+						<Alert color="red" variant="light">
+							{t("loadFailed")}
+						</Alert>
+					)}
+					{history.isSuccess && entries.length === 0 && (
+						<Text size="sm" c="dimmed">
+							{t("side.noHistory")}
+						</Text>
+					)}
+					<Stack gap={2}>
+						{entries.map((entry) => (
+							<UnstyledButton
+								key={entry.seq}
+								className={classes.listItem}
+								data-selected={search.asOf === entry.seq}
+								aria-current={search.asOf === entry.seq ? "true" : undefined}
+								title={entry.commit ? formatFullLocaleDateTime(entry.commit.createdAt) : undefined}
+								aria-label={t("side.viewAt", { seq: entry.seq })}
+								onClick={() => onViewAt(entry.seq)}
+							>
+								<Group gap={4} wrap="wrap">
+									<Text size="xs" fw={500}>
+										{t("timeline.commit", { seq: entry.seq })}
+									</Text>
+									{entry.changes
+										.filter((change) => change !== "page" || entry.changes.length === 1)
+										.map((change) => (
+											<Badge key={change} size="xs" variant="light" tt="none">
+												{t(`side.change.${change}`)}
+											</Badge>
+										))}
+								</Group>
+								{entry.commit && (
+									<Text size="xs" c="dimmed" className={classes.ellipsis}>
+										{[
+											commitActorLabel(entry.commit, t),
+											formatSmartTime(entry.commit.createdAt),
+											entry.commit.summary,
+										].join(" · ")}
+									</Text>
+								)}
+							</UnstyledButton>
+						))}
+					</Stack>
+					{history.hasNextPage && (
+						<Button
+							variant="subtle"
+							size="compact-xs"
+							mt={4}
+							loading={history.isFetchingNextPage}
+							onClick={() => void history.fetchNextPage()}
+						>
+							{t("loadMore")}
+						</Button>
+					)}
+				</Tabs.Panel>
+			</Tabs>
+		</>
 	);
 }

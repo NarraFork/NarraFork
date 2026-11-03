@@ -48,6 +48,10 @@ mock.module("../../hooks/useOutline", () => ({
 	useOutlineBlockHistory: () => ({ ...idle, hasNextPage: false }),
 	useOutlineTimeline: () => ({ ...idle, hasNextPage: false }),
 	useRevertOutlineCommit: () => ({ mutate: () => {}, isPending: false }),
+	useOutlinePagePending: () => idle,
+	useOutlinePendingDetail: () => idle,
+	useDecideOutlinePending: () => ({ mutate: () => {}, isPending: false }),
+	useOutlineLock: () => ({ mutate: () => {}, isPending: false }),
 }));
 
 const { OutlineSurface } = await import("./OutlineSurface");
@@ -65,6 +69,9 @@ function block(id: string, childIds: string[] = [], extra: Partial<OutlineViewBl
 		hidden: 0,
 		processHidden: 0,
 		openTasks: 0,
+		inProgress: [],
+		lock: null,
+		pending: [],
 		...extra,
 	} satisfies OutlineViewBlock;
 }

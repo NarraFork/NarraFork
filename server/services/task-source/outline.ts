@@ -7,7 +7,8 @@
  * The continuation candidates of `findContinuationCandidates` (`outline/tasks.ts`): the tasks the
  * session holds a claim on and the open tasks of its session space, to do or in progress, that no
  * person is doing and no other session holds. Of those, a task WAITS when a prerequisite is not
- * finished or a question under it is unanswered; waiting is never stored (D27b). Readers see:
+ * finished, a question under it is unanswered or a change to it waits for confirmation (a locked
+ * plan, outline P2 PR 6); waiting is never stored (D27b). Readers see:
  *
  *   - `doing` / `todo`: a candidate in progress / to do;
  *   - `blocked`: a waiting task, whatever its checkbox (it cannot be started or continued);
@@ -133,8 +134,8 @@ export const OUTLINE_TASK_START_ACTOR = "outline-task-start";
 
 /**
  * The revision key of the open tasks: a digest of what each is and waits for. A write to a task
- * moves its `version_seq`; a prerequisite finishing or a question being answered changes its wait
- * (D27b); claims renewing their lease do not count.
+ * moves its `version_seq`; a prerequisite finishing, a question being answered or a change to it
+ * being confirmed or rejected changes its wait (D27b); claims renewing their lease do not count.
  */
 function revisionOf(read: OpenRead): string | null {
 	if (read.entries.length === 0) return null;
@@ -148,6 +149,8 @@ function revisionOf(read: OpenRead): string | null {
 				status,
 				wait ? [...wait.prerequisites].sort() : null,
 				wait?.people ?? false,
+				// A change to it waiting for confirmation (a locked plan, outline P2 PR 6).
+				wait?.confirmation ?? false,
 			]),
 		);
 	}

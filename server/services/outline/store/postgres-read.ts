@@ -278,6 +278,12 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 				[];
 			const own = ~except.flags & 0x7fffffff;
 			const anyone = ~(except.anyoneFlags ?? 0) & 0x7fffffff;
+			const actors = sql.join(
+				[...new Set([except.actorId, ...(except.actorIds ?? [])])].map(
+					(id) => sql`CAST(${id} AS text)`,
+				),
+				sql`, `,
+			);
 			for (const chunk of chunked(keys, LAST_WRITES_CHUNK)) {
 				const after = caseOf(chunk.map((k) => [k.blockId, k.afterSeq]));
 				const newer = sql`v.block_id = outline_blocks.id AND v.from_seq > ${after}`;
@@ -287,7 +293,7 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 					ORDER BY v.from_seq DESC LIMIT 1 OFFSET ${sql.raw(String(OUTLINE_LAST_WRITES_SCAN - 1))}), ${after} + 1)`;
 				const counted = sql`FROM outline_block_versions v JOIN outline_commits c ON c.id = v.commit_id
 					WHERE v.block_id = outline_blocks.id AND v.from_seq >= ${floor}
-						AND NOT ((c.actor_kind = CAST(${except.actorKind} AS text) AND c.actor_id = CAST(${except.actorId} AS text)
+						AND NOT ((c.actor_kind = CAST(${except.actorKind} AS text) AND c.actor_id IN (${actors})
 							AND (v.change_flags & CAST(${own} AS integer)) = 0) OR (v.change_flags & CAST(${anyone} AS integer)) = 0)
 					ORDER BY v.from_seq DESC LIMIT 1`;
 				const rows = await db

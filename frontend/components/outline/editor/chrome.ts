@@ -23,9 +23,27 @@ export const chromeText = {
 	fold: "Collapse / expand",
 	focus: "Focus",
 	task: "Change status",
-	/** The hint on a block whose tasks the facts view leaves out. */
-	hidden: (count: number) => `+${count}`,
+	/** The "in progress" marker on a block whose tasks the facts view leaves out (design §3.1). */
+	hidden: (count: number) => `In progress · ${count}`,
+	/** Its tooltip. */
+	hiddenHint: "Open tasks under this block",
+	/** On a block whose hidden tasks are all done or cancelled: how many blocks are left out. */
+	hiddenUnder: (count: number) => `+${count}`,
+	/** A task in the marker's list waiting for confirmation. */
+	waiting: "waiting for confirmation",
+	/** On a locked task: who locked it. */
+	locked: (name: string) => `Locked · ${name}`,
+	/** On a block a pending change touches. */
+	pending: "Waiting for confirmation",
 };
+
+/** What a block shows besides its content: its lock, changes to it waiting for confirmation. */
+export interface BlockMark {
+	/** Who locked the task (a locked plan's root). */
+	lockedBy?: string;
+	/** Labels of the open changes that touch it. */
+	pending?: string[];
+}
 
 export interface Gutter {
 	el: HTMLElement;

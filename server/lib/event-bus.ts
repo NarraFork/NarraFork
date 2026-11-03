@@ -425,6 +425,16 @@ export type NarraForkEvent =
 			actorKind: "human" | "agent" | "system";
 			actorId: string;
 	  }
+	| {
+			/**
+			 * Pending changes of outline pages changed (one proposed, merged into, decided or
+			 * withdrawn; design §2.6). Ids only: a page subscriber re-reads the page's summary.
+			 * Notifying the people who decide is plan PR 7 (the inbox).
+			 */
+			type: "outline:pending";
+			spaceId: string;
+			pageIds: string[];
+	  }
 	// Human-to-human chat. Ids and scalars only — never message bodies — so a
 	// listener (WS fan-out today, an IM bridge later) can route without holding a
 	// copy of content it has no authorization story for.

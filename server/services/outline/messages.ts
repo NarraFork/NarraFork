@@ -38,6 +38,9 @@ export const OUTLINE_TEXT = {
 	/** A write by no session or person left a task to do instead of in progress. */
 	taskNotStarted:
 		"it would be in progress with nobody doing it (a write by no session), so it was left to do",
+	/** A revert (or bringing a task back) would have changed a lock its author may not: as it is. */
+	lockKept:
+		"only the person who locked it, a manager of the space or an admin may lock, unlock or change its lock: its lock was left as it is",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
 
@@ -85,6 +88,24 @@ export const OUTLINE_TEXT = {
 	/** Summary of the commit that reopens the tasks of a session archived or deleted. */
 	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
 		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
+
+	/** An agent's write tried to lock or unlock (only people lock, through the page). */
+	lockDenied:
+		"only people lock or unlock a task (from the outline page); an agent cannot change a lock",
+	/** Locking a task someone else locked. */
+	lockHeld: (address: string) =>
+		`${address} is locked by someone else; it has to be unlocked first (by them, a manager of the space or an admin) before anyone locks it again`,
+	/** Taking a lock away (unlocking, deleting the task, its checkbox) or changing it without the right to. */
+	unlockDenied: (address: string) =>
+		`${address} is locked (or would be, in someone else's name); only the person who locked it, a manager of the space or an admin may unlock it, change its lock, delete it or take its checkbox away`,
+	severalLockedPlans:
+		"the change touches several locked plans at once; change each plan in a call of its own",
+	pendingTooLarge: (ops: number, bytes: number) =>
+		`the change waiting for confirmation on this plan would grow past ${ops} operations or ${bytes} bytes of text; wait until it is confirmed or rejected`,
+	pendingFull: (max: number) =>
+		`the page already has ${max} changes waiting for confirmation; wait until some are decided`,
+	/** Summary of a commit that confirms a pending change. */
+	confirmSummary: (label: string, summary: string) => `confirm ${label}: ${summary}`,
 
 	/** Why a read or search was refused. */
 	errors: {
@@ -326,5 +347,68 @@ export const OUTLINE_TOOL_TEXT = {
 		set: (sid: string, parts: readonly string[]) => `set [${sid}]: ${parts.join(", ")}`,
 		notesHeader: "Notes:",
 		hintsHeader: "Hints:",
+		/** An edit some of whose operations were held for confirmation. */
+		heldEdit: (n: number, what: string, all: boolean) =>
+			`${n}. ${all ? "held for confirmation" : "held in part for confirmation"}: ${what}`,
+		nothingWrittenDirectly:
+			"Nothing was written directly: the change waits for confirmation (below).",
+		mixedDecisions: "confirm and reject go in a call of their own, without block edits",
+		pendingNewBlock: (ref: string, label: string, decider: string) =>
+			`${ref} is a block ${label} adds; it exists once ${decider} confirms ${label}, so nothing can be written under it or to it before`,
+	},
+
+	/** Changes to locked plans waiting for confirmation (design §2.6). */
+	pending: {
+		/** The decider, as marks and results name them. */
+		deciderPerson: (name: string | null, id: string) => (name ? name : `the person ${id}`),
+		deciderSession: (title: string | null, id: string) =>
+			title ? `the session ${quoted(title)} (${id})` : `the session ${id}`,
+		deciderEither: (person: string, delegate: string) =>
+			`${person} (or ${delegate} on their behalf)`,
+		markOwn: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, not confirmed yet`,
+		markOwnDeleted: (label: string, _decider: string, n: number) =>
+			`pending ${label}: you proposed deleting ${n === 1 ? "1 block" : `${n} blocks`} here, not confirmed yet`,
+		markOther: (label: string, _decider: string) =>
+			`pending ${label}: a change proposed here waits for confirmation`,
+		markOwnMerged: (label: string, _decider: string) =>
+			`pending ${label}: your proposed change, merged over changes made here since you proposed it; not confirmed yet`,
+		markOwnConflict: (label: string, _decider: string, detail: string) =>
+			`pending ${label}: changed since you proposed it, your change no longer applies here (${detail}); shown as it is now`,
+		/** After a read: this session's own open changes on the page. */
+		yours: (label: string, decider: string, since: "none" | "merged" | "conflict") =>
+			since === "conflict"
+				? `${label} is your change to this plan; blocks it changes were changed since you proposed it and part of it no longer applies (marked above, shown as they are now): it cannot be confirmed as it is. Propose those blocks again from the text as it is now (they merge into ${label}), or reject ${label} to withdraw it. It waits for ${decider}`
+				: since === "merged"
+					? `${label} is your change to this plan, shown above merged over changes made since you proposed it (marked); it waits for ${decider} to confirm (blocks it adds exist once confirmed)`
+					: `${label} is your change to this plan, shown above as you proposed it; it waits for ${decider} to confirm (blocks it adds exist once confirmed)`,
+		/** A change its proposer said nothing about, by its size. */
+		summaryOf: (n: number) => (n === 1 ? "1 change" : `${n} changes`),
+		/** After a read: changes waiting for this session's confirmation. */
+		forYou: (label: string, summary: string, by: string) =>
+			`${label} waits for your confirmation: ${summary} (proposed by ${by}); confirm with OutlineEdit { edits: [{ confirm: "${label}" }] }, or reject with { reject: "${label}", reason }`,
+		reportConfirmed: (label: string, by: string, seq: number | null) =>
+			`${label} was confirmed by ${by}${seq === null ? "" : ` (commit #${seq})`}: its changes are in the outline now`,
+		reportRejected: (label: string, by: string, reason: string | null) =>
+			`${label} was rejected by ${by}${reason ? `: ${reason}` : ""}`,
+		reportWithdrawn: (label: string, why: string) => `${label} was withdrawn: ${why}`,
+		whyUnlocked: "the plan was unlocked",
+		whyDeleted: "the locked task was deleted",
+		/** The result of an edit that was held. */
+		held: (label: string, n: number, root: string, decider: string, merged: boolean) =>
+			`Held for confirmation as ${label}: ${n === 1 ? "1 change" : `${n} changes`} to the locked plan ${root}, waiting for ${decider} to confirm${merged ? " (merged into the change this session had already proposed there)" : ""}.`,
+		heldWaiting: (tasks: readonly string[]) =>
+			`Tasks that wait for it: ${list(tasks, 10)}. Do not start them; carry on with work it does not affect.`,
+		heldCarryOn: "Carry on with work it does not affect.",
+		heldRead:
+			"Reading the plan shows your proposed version, marked ‹pending›. Blocks it adds exist once confirmed: write under them after that.",
+		confirmed: (label: string, seq: number | null, by: string) =>
+			seq === null
+				? `Confirmed ${label} (proposed by ${by}); the outline already read as it proposes, so no commit was written.`
+				: `Confirmed ${label} (proposed by ${by}): committed #${seq}.`,
+		rejected: (label: string) => `Rejected ${label}; its proposer is told on its next read.`,
+		withdrew: (label: string) => `Withdrew ${label}, which this session had proposed.`,
+		badLabel: (ref: string) =>
+			`${quoted(ref)} is not a pending change: name it as a read shows it, P and 8 characters (P1a2B3c4D)`,
 	},
 } as const;

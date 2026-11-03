@@ -19,6 +19,7 @@ import {
 	asc,
 	desc,
 	eq,
+	getTableColumns,
 	gt,
 	inArray,
 	isNotNull,
@@ -38,6 +39,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 	outlineLiveUpdates,
+	outlinePending,
 	outlineSpaces,
 	outlineTaskClaims,
 	outlineViewState,
@@ -49,12 +51,15 @@ import type {
 	OutlineActorKind,
 	OutlineCommitKind,
 	OutlineLinkKind,
+	OutlinePendingKind,
+	OutlinePendingStatus,
 	OutlineSpaceKind,
 } from "../model";
 import {
 	chunked,
 	claimsAsExpected,
 	expectedClaimIds,
+	expectedPendingRevs,
 	type NarratorStateRow,
 	narratorSessions,
 	OUTLINE_RENEW_LIMIT,
@@ -66,6 +71,11 @@ import {
 	type OutlineCommitRow,
 	type OutlineLinkRow,
 	type OutlineLiveUpdateRow,
+	type OutlinePendingDecision,
+	type OutlinePendingHead,
+	OutlinePendingMovedError,
+	type OutlinePendingPlan,
+	type OutlinePendingRow,
 	type OutlineSpaceRow,
 	type OutlineSpaceScope,
 	OutlineStaleWriteError,
@@ -74,6 +84,7 @@ import {
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
 	oldestClaimsFirst,
+	pendingAsExpected,
 	writesAsExpected,
 } from "./port";
 import { sqliteOutlineReads } from "./sqlite-read";
@@ -238,12 +249,17 @@ function idList(ids: readonly string[]): SQL {
  * at the plan's seq; returning (rather than throwing) keeps an expected outcome out of the retry
  * wrapper's error log.
  */
-function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): "applied" | "stale" | "claims" {
+function applyCommitSection(
+	tx: Tx,
+	plan: OutlineCommitPlan,
+): "applied" | "stale" | "claims" | "pending" {
 	const { seq } = plan;
 	// The claims the plan read must still be as read (a lease renewed since may have made a
 	// takeover wrong). Nothing writes inside this synchronous section but this section.
 	const expected = expectedClaimIds(plan);
 	if (expected.length > 0 && !claimsAsExpected(plan, readClaims(tx, expected))) return "claims";
+	// So must the pending rows it merges into or decides.
+	if (!pendingAsExpected(plan.pending, readPendingRevs(tx, plan.pending))) return "pending";
 	// The counter and the in-process epoch are claimed together; a commit that cannot keep its
 	// in-process answers marks the space for the rebuild in the same statement.
 	const claimed = tx
@@ -357,6 +373,122 @@ function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): "applied" | "stale
 			.run();
 	}
 	for (const { row } of plan.claims.put) putClaim(tx, row);
+	if (plan.pending) writePending(tx, plan.pending);
+	return "applied";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pending changes
+// ─────────────────────────────────────────────────────────────────────────────
+
+type PendingSelect = typeof outlinePending.$inferSelect;
+
+function toPending(row: PendingSelect): OutlinePendingRow {
+	return {
+		...row,
+		kind: row.kind as OutlinePendingKind,
+		status: row.status as OutlinePendingStatus,
+		decidedByJson: row.decidedByJson ?? null,
+	};
+}
+
+/** Every column but the operations and the deleted subtrees: what lists and summaries read. */
+const pendingHeadColumns = (() => {
+	const { opsJson: _ops, subtreeJson: _subtree, ...columns } = getTableColumns(outlinePending);
+	return columns;
+})();
+
+function toPendingHead(row: Omit<PendingSelect, "opsJson" | "subtreeJson">): OutlinePendingHead {
+	return {
+		...row,
+		kind: row.kind as OutlinePendingKind,
+		status: row.status as OutlinePendingStatus,
+		decidedByJson: row.decidedByJson ?? null,
+	};
+}
+
+/** Status and revision of the rows a pending plan expects, by id. */
+function readPendingRevs(
+	tx: Tx,
+	pending: OutlinePendingPlan | undefined,
+): Map<string, { status: string; rev: number }> {
+	const ids = [...expectedPendingRevs(pending).keys()];
+	const found = new Map<string, { status: string; rev: number }>();
+	if (ids.length === 0) return found;
+	for (const row of tx
+		.select({ id: outlinePending.id, status: outlinePending.status, rev: outlinePending.rev })
+		.from(outlinePending)
+		.where(inArray(outlinePending.id, ids))
+		.all())
+		found.set(row.id, row);
+	return found;
+}
+
+/** A decision's columns. */
+function decisionSet(decision: OutlinePendingDecision) {
+	return {
+		status: decision.status,
+		decidedAt: decision.decidedAt,
+		decidedByJson: decision.decidedBy,
+		decisionCommitId: decision.decisionCommitId,
+		reason: decision.reason,
+		reportedAt: decision.reportedAt,
+		updatedAt: decision.decidedAt,
+	};
+}
+
+/** Withdraw, repage, decide, put, in that order (the plan's expectations were checked already). */
+function writePending(tx: Tx, pending: OutlinePendingPlan): void {
+	const withdraw = pending.withdraw;
+	if (withdraw) {
+		for (const ids of chunked(withdraw.rootBlockIds)) {
+			tx.update(outlinePending)
+				.set({
+					status: "withdrawn",
+					decidedAt: withdraw.decidedAt,
+					decidedByJson: withdraw.decidedBy,
+					reason: withdraw.reason,
+					updatedAt: withdraw.decidedAt,
+				})
+				.where(and(inArray(outlinePending.rootBlockId, ids), sql`"status" = 'open'`))
+				.run();
+		}
+	}
+	for (const move of pending.repage ?? []) {
+		tx.update(outlinePending)
+			.set({ pageId: move.pageId })
+			.where(and(eq(outlinePending.rootBlockId, move.rootBlockId), sql`"status" = 'open'`))
+			.run();
+	}
+	if (pending.decide) {
+		tx.update(outlinePending)
+			.set(decisionSet(pending.decide))
+			.where(eq(outlinePending.id, pending.decide.id))
+			.run();
+	}
+	const put = pending.put;
+	if (put) {
+		if (put.expectRev === null) tx.insert(outlinePending).values(put.row).run();
+		else {
+			const { id, ...columns } = put.row;
+			tx.update(outlinePending).set(columns).where(eq(outlinePending.id, id)).run();
+		}
+	}
+}
+
+/** A plan's pending changes alone, while the space's counter is still `seq`. */
+function applyPendingSection(
+	tx: Tx,
+	plan: { spaceId: string; seq: number; pending: OutlinePendingPlan },
+): "applied" | "stale" | "pending" {
+	if (!pendingAsExpected(plan.pending, readPendingRevs(tx, plan.pending))) return "pending";
+	const space = tx
+		.select({ nextSeq: outlineSpaces.nextSeq })
+		.from(outlineSpaces)
+		.where(eq(outlineSpaces.id, plan.spaceId))
+		.get();
+	if (!space || space.nextSeq !== plan.seq) return "stale";
+	writePending(tx, plan.pending);
 	return "applied";
 }
 
@@ -763,7 +895,7 @@ export const sqliteOutlineStore: OutlineStore = {
 	},
 
 	async applyCommit(plan) {
-		let outcome: "applied" | "stale" | "claims";
+		let outcome: "applied" | "stale" | "claims" | "pending";
 		try {
 			outcome = await withDbRetry(
 				async () => db.transaction((tx) => applyCommitSection(tx, plan)),
@@ -774,6 +906,180 @@ export const sqliteOutlineStore: OutlineStore = {
 		}
 		if (outcome === "stale") throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
 		if (outcome === "claims") throw new OutlineClaimsMovedError(plan.spaceId, plan.seq);
+		if (outcome === "pending") throw new OutlinePendingMovedError(plan.spaceId, plan.seq);
+	},
+
+	async getPending(ids) {
+		const out: OutlinePendingRow[] = [];
+		for (const chunk of chunked(ids)) {
+			for (const row of db
+				.select()
+				.from(outlinePending)
+				.where(inArray(outlinePending.id, chunk))
+				.all())
+				out.push(toPending(row));
+		}
+		return out;
+	},
+
+	async listOpenPendingByPage(pageId, limit) {
+		// `"status" = 'open'` is the partial index's own predicate, word for word.
+		return db
+			.select(pendingHeadColumns)
+			.from(outlinePending)
+			.where(and(eq(outlinePending.pageId, pageId), sql`"status" = 'open'`))
+			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
+			.limit(limit)
+			.all()
+			.map(toPendingHead);
+	},
+
+	async countOpenPendingByPage(pageId, limit) {
+		// A raw `get` returns the row's values in order.
+		const row = db.get<[number]>(sql`
+			SELECT count(*) AS n FROM (
+				SELECT 1 FROM outline_pending WHERE page_id = ${pageId} AND "status" = 'open' LIMIT ${limit}
+			)
+		`);
+		return Number(row?.[0] ?? 0);
+	},
+
+	async listOpenPendingBySpace(spaceId, limit) {
+		return db
+			.select(pendingHeadColumns)
+			.from(outlinePending)
+			.where(and(eq(outlinePending.spaceId, spaceId), sql`"status" = 'open'`))
+			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
+			.limit(limit)
+			.all()
+			.map(toPendingHead);
+	},
+
+	async findOpenPending(requesterSession, rootBlockId) {
+		const row = db
+			.select()
+			.from(outlinePending)
+			.where(
+				and(
+					eq(outlinePending.requesterSession, requesterSession),
+					eq(outlinePending.rootBlockId, rootBlockId),
+					sql`"status" = 'open'`,
+				),
+			)
+			.limit(1)
+			.get();
+		return row ? toPending(row) : null;
+	},
+
+	async listUnreportedPending(requesterSession, pageId, limit) {
+		// The predicate is the unreported index's own, word for word.
+		return db
+			.select(pendingHeadColumns)
+			.from(outlinePending)
+			.where(
+				and(
+					eq(outlinePending.requesterSession, requesterSession),
+					eq(outlinePending.pageId, pageId),
+					sql`"reported_at" IS NULL AND "status" <> 'open'`,
+				),
+			)
+			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
+			.limit(limit)
+			.all()
+			.map(toPendingHead);
+	},
+
+	async markPendingReported(ids, at) {
+		if (ids.length === 0) return;
+		await withDbRetry(
+			async () => {
+				for (const chunk of chunked(ids)) {
+					db.update(outlinePending)
+						.set({ reportedAt: at })
+						.where(
+							and(
+								inArray(outlinePending.id, chunk),
+								ne(outlinePending.status, "open"),
+								isNull(outlinePending.reportedAt),
+							),
+						)
+						.run();
+				}
+			},
+			{ label: "outline.markPendingReported", maxRetries: 3 },
+		);
+	},
+
+	async applyPending(plan) {
+		let outcome: "applied" | "stale" | "pending";
+		try {
+			outcome = await withDbRetry(
+				async () => db.transaction((tx) => applyPendingSection(tx, plan)),
+				{ label: "outline.applyPending", maxRetries: 3 },
+			);
+		} catch (error) {
+			rethrowAsPortError(error);
+		}
+		if (outcome === "stale") throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
+		if (outcome === "pending") throw new OutlinePendingMovedError(plan.spaceId, plan.seq);
+	},
+
+	async decidePending(decision) {
+		return await withDbRetry(
+			async () =>
+				db
+					.update(outlinePending)
+					.set(decisionSet(decision))
+					.where(
+						and(
+							eq(outlinePending.id, decision.id),
+							sql`"status" = 'open'`,
+							eq(outlinePending.rev, decision.expectRev),
+						),
+					)
+					.returning({ id: outlinePending.id })
+					.all().length > 0,
+			{ label: "outline.decidePending", maxRetries: 3 },
+		);
+	},
+
+	async getFirstVersions(blockIds) {
+		const out: Array<{ blockId: string; fromSeq: number; commitId: string }> = [];
+		for (const chunk of chunked(blockIds)) {
+			// One primary-key probe per block: its lowest `from_seq`.
+			const rows = db
+				.select({
+					blockId: outlineBlocks.id,
+					fromSeq: sql<number | null>`(SELECT v.from_seq FROM outline_block_versions v
+						WHERE v.block_id = outline_blocks.id ORDER BY v.from_seq ASC LIMIT 1)`,
+					commitId: sql<string | null>`(SELECT v.commit_id FROM outline_block_versions v
+						WHERE v.block_id = outline_blocks.id ORDER BY v.from_seq ASC LIMIT 1)`,
+				})
+				.from(outlineBlocks)
+				.where(inArray(outlineBlocks.id, chunk))
+				.all();
+			for (const row of rows) {
+				if (row.fromSeq !== null && row.commitId !== null)
+					out.push({ blockId: row.blockId, fromSeq: row.fromSeq, commitId: row.commitId });
+			}
+		}
+		return out;
+	},
+
+	async listLockedBlocks(pageId, limit) {
+		// The predicate is the lock index's own, word for word, so the index serves it.
+		return db
+			.select(metaColumns)
+			.from(outlineBlocks)
+			.where(
+				and(
+					eq(outlineBlocks.pageId, pageId),
+					sql`json_extract("task_json", '$.lock') IS NOT NULL AND "deleted" = 0`,
+				),
+			)
+			.limit(limit)
+			.all()
+			.map(toMeta);
 	},
 
 	async getTaskClaims(blockIds) {
