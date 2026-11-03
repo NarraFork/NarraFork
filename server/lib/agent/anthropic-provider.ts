@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -31,6 +32,7 @@ import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { reportInputCharacters } from "./input-characters";
+import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import { buildOpencodeSessionHeader, isOpencodeEndpoint } from "./opencode-session";
 import {
 	type NeutralTurn,
@@ -1619,6 +1621,13 @@ export class AnthropicProvider implements ProviderAdapter {
 		return rebuildOriginal();
 	}
 
+	supportsNativeMediaInput(
+		_media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		_model: string,
+	): boolean {
+		return false;
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		return tools.map(formatAnthropicTool);
 	}
@@ -1628,6 +1637,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
+		rejectNativeMedia("Anthropic Messages", dbMessages.flatMap(storedMessageMedia));
 		// narratorId is required to resolve history images: an uploaded image is
 		// stored per narrator and the row only carries its id, so without the owner
 		// the bytes cannot be found. It used to be ignored here, which silently
@@ -1669,6 +1679,7 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		rejectNativeMedia("Anthropic Messages", [params.media, params.history, params.toolResults]);
 		const apiKey = this.config.apiKey;
 
 		if (!apiKey) {

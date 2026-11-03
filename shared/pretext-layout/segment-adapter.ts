@@ -146,6 +146,7 @@ export interface AdapterContentBlock {
 	filename?: string | null;
 	mediaType?: string | null;
 	imageId?: string | null;
+	mediaId?: string | null;
 	previewUrl?: string | null;
 	/**
 	 * image_generation: the server-side file the generated image was saved to.
@@ -1164,6 +1165,41 @@ const USER_SYSTEM_CARD_TYPES = new Set([
 	"segment_compact",
 ]);
 
+/** The named context parts of an outline session's built-in views (outline plan PR 4). */
+const OUTLINE_VIEW_LABEL_KEYS: Readonly<Record<string, string>> = {
+	"outline.tasks": "contextViewOutlineTasks",
+	"outline.behavior": "contextViewOutlineBehavior",
+};
+
+/** How the host's `context_update` notice row starts (`narrator-epochs.ts`). */
+const CONTEXT_UPDATE_NOTICE = "Context updated: ";
+
+/**
+ * The line a host `context_update` row reads as when it updates an outline session's views:
+ * "Context updated: Current tasks / Behavior boundary" in the reader's language, other keys as
+ * they are. Null for any other row, which keeps the stored notice text. The stored row is not
+ * changed: its English text names the keys, and the change itself is in its snapshot.
+ */
+function outlineViewUpdateLine(
+	blocks: readonly AdapterContentBlock[],
+	ctx: AdapterContext,
+): string | null {
+	if (!blocks.some((block) => block.type === "context_update")) return null;
+	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
+	if (!notice.startsWith(CONTEXT_UPDATE_NOTICE)) return null;
+	const keys = notice
+		.slice(CONTEXT_UPDATE_NOTICE.length)
+		.split(",")
+		.map((key) => key.trim())
+		.filter(Boolean);
+	if (!keys.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
+	const names = keys.map((key) => {
+		const label = OUTLINE_VIEW_LABEL_KEYS[key];
+		return label ? sysLabel(ctx, label) : key;
+	});
+	return formatSysLabel(ctx, "contextViewsUpdated", { parts: names.join(" / ") });
+}
+
 /** True when a block type is a recognized system-card block (used to locate the
  * meaningful block within a system message, which may not be blocks[0]). */
 function isRecognizedSystemBlockType(type: string): boolean {
@@ -1184,6 +1220,8 @@ export function classifyContentBlock(block: AdapterContentBlock): VListElementKi
 		case "text":
 			return block.text?.trim() ? "markdown" : null;
 		case "image":
+		case "audio":
+		case "video":
 		case "text_file":
 		case "image_generation":
 			return "media";
@@ -1368,7 +1406,7 @@ function webSearchData(block: AdapterContentBlock, ctx: AdapterContext) {
 }
 
 /**
- * Attachment payload for a user bubble's image / text_file block. `type` plus
+ * Attachment payload for a user bubble's image / audio / video / text_file block. `type` plus
  * the image's intrinsic `width`/`height` are height-relevant (known dimensions
  * reserve an aspect-ratio-fitted box; absent ones fall back to the fixed
  * placeholder height); the rest are render-only fields the integration layer
@@ -1385,6 +1423,17 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		});
 	}
 	const uploadNarratorId = readNonEmptyString(block, "uploadNarratorId") ?? msg.narratorId;
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: uploadNarratorId ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1424,6 +1473,17 @@ function imageGenerationStatusText(ctx: AdapterContext, status: string | null | 
 
 function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 	// measureMedia dispatches on `type`.
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: readNonEmptyString(block, "uploadNarratorId") ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1812,6 +1872,8 @@ function adaptMessage(
 			.filter(
 				(b) =>
 					b.type === "image" ||
+					b.type === "audio" ||
+					b.type === "video" ||
 					b.type === "text_file" ||
 					(b.type === "file_reference" && b.reference),
 			)
@@ -1938,7 +2000,19 @@ function adaptMessage(
 		// affordances the reader can use (branch names, a commit sha, badges).
 		const framed = adaptFramedSystemCard(sysBlock, idBase, blockIndex, msg, modelFacingText, ctx);
 		if (framed) return [...specs, framed];
-		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx, blockIndex));
+		// An update of an outline session's views reads in the reader's words, not as the stored
+		// English notice naming internal keys (the row itself is unchanged).
+		const viewUpdate = outlineViewUpdateLine(blocks, ctx);
+		specs.push(
+			adaptSystemBlock(
+				sysBlock.type,
+				viewUpdate === null ? sysBlock : { ...sysBlock, text: viewUpdate },
+				idBase,
+				msg,
+				ctx,
+				blockIndex,
+			),
+		);
 		return specs;
 	}
 
@@ -2310,6 +2384,11 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
+	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
+	// An update of an outline session's views (`context_update` row of `outline.*` parts).
+	contextViewsUpdated: "Context updated: {parts}",
+	contextViewOutlineTasks: "Current tasks",
+	contextViewOutlineBehavior: "Behavior boundary",
 	sidecarSourceTutorialLesson: "Tutorial lesson",
 	sidecarSourceTurnNudge: "Turn budget",
 	sidecarSourceBrokenCall: "Invalid tool call",
@@ -2421,6 +2500,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// An outline session's long turn that left a task in progress it never touched (plan PR 4).
+	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
@@ -3069,13 +3150,14 @@ function adaptSpokenInjection(
 		const tasks = Array.isArray(body.tasks) ? body.tasks : [];
 		// Empty / over-threshold digests have no rows to draw; they carry the same
 		// localized sentence the markdown projection used as its headline.
+		const outline = body.taskBackend === "outline";
 		const emptyLabel =
 			variant === "current" && tasks.length > 0
 				? null
 				: variant === "emptyNever"
-					? sysLabel(ctx, "tasksEmptyNever")
+					? sysLabel(ctx, outline ? "outlineTasksEmptyNever" : "tasksEmptyNever")
 					: variant === "emptyDone"
-						? sysLabel(ctx, "tasksEmptyDone")
+						? sysLabel(ctx, outline ? "outlineTasksEmptyDone" : "tasksEmptyDone")
 						: variant === "tooMany"
 							? // `tasksTooMany` carries an `{n}` placeholder; sysLabel has no
 								// interpolation, so substitute here (same as the markdown path).

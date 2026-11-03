@@ -42,12 +42,18 @@ const DIRECT_WRITERS: Record<string, string> = {
 	"server/services/narrator-block-backfill.ts":
 		"legacy envelope conversion: format, bytes, ledger block",
 	"server/services/narrator-messages.ts": "block deletion, truncation, card dismissal, COW",
+	// ModelTrace 舱的清空重跑：只删这个叙述者自己的 refs 和失去引用的消息行，
+	// 不经过 store（store 是“续写”语义，不是“清空”）。
+	"server/services/modeltrace-store.ts": "trace cabin reset",
 	// Card state and envelope metadata.
 	"server/routes/narrators.ts": "manual plan/compact cards and their state",
 	"server/services/narrator-subagent-recovery.ts": "recovery card state and parent call result",
 	"server/services/narrator-tree-snapshot-hooks.ts": "tree snapshot metadata",
 	"server/lib/usage-tracking.ts": "message usage and cost",
 	"server/services/user-deletion.ts": "author anonymization",
+	// 固定表清单的快照导入必须按列交集直写历史表：它拷的是别人机器上的完整行，没有经过本进程的
+	// store 事务，也不该经过——store 会重写 id、重建 refs，等于把快照改成当前库的内容。
+	"server/services/data-portability.ts": "snapshot import: whole-table copy",
 	// Mailbox receipts and publication on refs and messages.
 	"server/services/agent-message-delivery.ts": "delivery receipt on refs",
 	"server/services/agent-runtime/mailbox.ts": "delivery receipt on refs",

@@ -206,6 +206,83 @@ function checkRevert(
 
 export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 	{
+		name: "narrator writes: a session's own newest ordinary commits in a space and what they opened",
+		async run(ctx) {
+			const narrator = await ctx.seedNarrator();
+			const other = await ctx.seedNarrator();
+			const space = await ctx.store.ensureSpace({ kind: "session", narratorId: narrator }, NOW);
+			const as = (id: string) => ({ actor: { kind: "agent" as const, id }, narratorId: id });
+			const first = await write(
+				ctx,
+				space,
+				[{ op: "insert", parent: null, content: "A" }],
+				as(narrator),
+			);
+			const page = a0(first);
+			await write(
+				ctx,
+				space,
+				[{ op: "insert", parent: { id: page }, content: "Theirs" }],
+				as(other),
+			);
+			const second = await write(
+				ctx,
+				space,
+				[
+					{ op: "insert", parent: { id: page }, content: "B" },
+					{ op: "update", block: { id: page }, content: "A2" },
+				],
+				as(narrator),
+			);
+			// A system commit made for the session (a fork's copy, an import) is not its own.
+			await write(ctx, space, [{ op: "insert", parent: { id: page }, content: "Copied" }], {
+				actor: { kind: "system", id: "outline-behavior-fork" },
+				narratorId: narrator,
+			});
+			// A revert the session makes is not an ordinary commit.
+			await revertCommit(
+				{
+					commitId: second.commit?.id as string,
+					actor: { kind: "agent", id: narrator },
+					responsibleUserId: null,
+					narratorId: narrator,
+				},
+				{ store: ctx.store },
+			);
+			const rows = await ctx.store.listNarratorWrites(space.id, narrator, {
+				commits: 10,
+				limit: 10,
+			});
+			const firstSeq = first.commit?.seq as number;
+			const secondSeq = second.commit?.seq as number;
+			const secondIds = [a0(second), page].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+			expect(rows.map((r) => [r.seq, r.blockId] as [number, string])).toEqual([
+				...secondIds.map((id): [number, string] => [secondSeq, id]),
+				[firstSeq, page],
+			]);
+			const flags = new Map(
+				rows.filter((r) => r.seq === secondSeq).map((r) => [r.blockId, r.changeFlags]),
+			);
+			expect((flags.get(a0(second)) ?? 0) & OUTLINE_CHANGE.CREATE).toBeTruthy();
+			expect((flags.get(page) ?? 0) & OUTLINE_CHANGE.CONTENT).toBeTruthy();
+			expect(rows.every((r) => typeof r.createdAt === "string" && r.createdAt.length > 0)).toBe(
+				true,
+			);
+			// The newest commits only, and at most `limit` versions.
+			const newest = await ctx.store.listNarratorWrites(space.id, narrator, {
+				commits: 1,
+				limit: 10,
+			});
+			expect(newest.map((r) => r.seq)).toEqual(secondIds.map(() => secondSeq));
+			expect(
+				await ctx.store.listNarratorWrites(space.id, narrator, { commits: 10, limit: 1 }),
+			).toHaveLength(1);
+			expect(
+				await ctx.store.listNarratorWrites(space.id, "nobody", { commits: 10, limit: 10 }),
+			).toEqual([]);
+		},
+	},
+	{
 		name: "aliases: a byte-order range of the live aliases of one space",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
@@ -1102,6 +1179,7 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 				status: "todo",
 				assignee: null,
 				depends: [{ target: "Topic", label: null }],
+				manager: { kind: "human", id: ACTOR.id },
 			});
 			const children = await ctx.store.listChildren(space.id, p, 10);
 			expect(children.map((c) => c.content)).toEqual(["squatter", "X", "Y"]);

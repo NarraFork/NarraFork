@@ -1,3 +1,4 @@
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { resolveProxyForUrl } from "../net/proxy";
 import {
 	getNugCachedModelHash,
@@ -9,7 +10,6 @@ import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import { ensureNugRelayClient, getNugRelayChannelId, usesLocalEgress } from "../nug-relay/manager";
 import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
-
 import { AnthropicProvider } from "./anthropic-provider";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 
@@ -357,6 +357,17 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	// === ProviderAdapter interface ===
+
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		const delegate = this.ensureDelegateForModel(model);
+		return (
+			!!this.activeMeta &&
+			delegate.supportsNativeMediaInput?.(media, this.modelForDelegate(this.activeMeta)) === true
+		);
+	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.activeDelegate) {

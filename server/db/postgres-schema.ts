@@ -225,6 +225,8 @@ export const narrators = pgTable(
 		forkMessageId: text("fork_message_id").references((): PgColumn => narratorMessages.id, {}),
 		type: text("type").notNull().default("primary"),
 		subagentType: text("subagent_type"),
+		hiddenFromLists: boolean("hidden_from_lists").notNull().default(false),
+		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
 		inheritMode: text("inherit_mode").notNull().default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {}),
@@ -257,6 +259,7 @@ export const narrators = pgTable(
 		behaviorFenceAttachOverride: text("behavior_fence_attach_override")
 			.notNull()
 			.default("inherit"),
+		taskBackend: text("task_backend").notNull().default("spec"),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: doublePrecision("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
@@ -328,6 +331,7 @@ export const narrators = pgTable(
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
+		uniqueIndex("idx_narrators_modeltrace_key").on(table.modeltraceKey),
 		index("idx_narrators_context_project").on(table.contextProjectId),
 		index("idx_narrators_oauth_owner").on(table.oauthOwnerGrantId),
 		uniqueIndex("idx_narrators_oauth_provision").on(
@@ -2194,6 +2198,7 @@ export const narratorBufferedMessages = pgTable(
 		narratorId: text("narrator_id").notNull(),
 		text: text("text").notNull(),
 		imagesJson: text("images_json"),
+		mediaJson: text("media_json"),
 		commandText: text("command_text"),
 		bashCommand: text("bash_command"),
 		createdBy: text("created_by"),
@@ -3486,9 +3491,14 @@ export const outlineSpaces = pgTable(
 		}),
 		nextSeq: integer("next_seq").notNull().default(1),
 		createdAt: text("created_at").notNull(),
+		inProcessReady: boolean("in_process_ready").notNull().default(false),
+		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		index("idx_outline_spaces_in_process_pending")
+			.on(table.id)
+			.where(sql.raw('"in_process_ready" = FALSE')),
 		uniqueIndex("uq_outline_spaces_project")
 			.on(table.projectId)
 			.where(sql.raw("\"kind\" = 'project'")),
@@ -3523,6 +3533,7 @@ export const outlineBlocks = pgTable(
 		authorId: text("author_id").notNull(),
 		versionSeq: integer("version_seq").notNull(),
 		deleted: boolean("deleted").notNull().default(false),
+		inProcess: boolean("in_process").notNull().default(false),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_blocks_space_sid").on(table.spaceId, table.sid),
@@ -3531,6 +3542,16 @@ export const outlineBlocks = pgTable(
 			.where(sql.raw('"alias" IS NOT NULL AND "deleted" = FALSE')),
 		index("idx_outline_blocks_page").on(table.pageId),
 		index("idx_outline_blocks_children").on(table.spaceId, table.parentId, table.orderKey),
+		index("idx_outline_blocks_open_tasks")
+			.on(table.spaceId)
+			.where(
+				sql.raw(
+					"(\"task_json\"::jsonb #>> '{status}') IN ('todo', 'doing') AND \"deleted\" = FALSE",
+				),
+			),
+		index("idx_outline_blocks_doing_tasks")
+			.on(table.id)
+			.where(sql.raw("(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE")),
 	],
 );
 
@@ -3603,6 +3624,32 @@ export const outlineLinks = pgTable(
 	(table) => [
 		index("idx_outline_links_from").on(table.fromBlockId, table.toSeq),
 		index("idx_outline_links_target").on(table.targetKind, table.targetRef),
+	],
+);
+
+export const outlineTaskClaims = pgTable(
+	"outline_task_claims",
+	{
+		taskBlockId: text("task_block_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		holderNarratorId: text("holder_narrator_id"),
+		holderUserId: text("holder_user_id"),
+		epoch: integer("epoch").notNull(),
+		taskVersionAtClaim: integer("task_version_at_claim").notNull(),
+		claimedAt: text("claimed_at").notNull(),
+		expiresAt: text("expires_at"),
+		lastHolderNarratorId: text("last_holder_narrator_id"),
+		lastHolderUserId: text("last_holder_user_id"),
+	},
+	(table) => [
+		index("idx_outline_task_claims_holder")
+			.on(table.holderNarratorId)
+			.where(sql.raw('"holder_narrator_id" IS NOT NULL')),
+		index("idx_outline_task_claims_expiry")
+			.on(table.expiresAt)
+			.where(sql.raw('"expires_at" IS NOT NULL')),
 	],
 );
 
@@ -4098,8 +4145,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 134,
-  "columnCount": 1762,
+  "tableCount": 135,
+  "columnCount": 1778,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5177,6 +5224,27 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "hiddenFromLists",
+          "name": "hidden_from_lists",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "modeltraceKey",
+          "name": "modeltrace_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "title",
           "name": "title",
           "kind": "text",
@@ -5465,6 +5533,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"inherit\"",
           "defaultExpression": "\"inherit\""
+        },
+        {
+          "property": "taskBackend",
+          "name": "task_backend",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"spec\"",
+          "defaultExpression": "\"spec\""
         },
         {
           "property": "messageCount",
@@ -6016,6 +6095,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_handle_fold",
           "columns": [
             "handleFold"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_narrators_modeltrace_key",
+          "columns": [
+            "modeltraceKey"
           ],
           "unique": true
         },
@@ -16526,6 +16612,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "mediaJson",
+          "name": "media_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "commandText",
           "name": "command_text",
           "kind": "text",
@@ -24234,6 +24329,29 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "inProcessReady",
+          "name": "in_process_ready",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "inProcessEpoch",
+          "name": "in_process_epoch",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         }
       ],
       "indexes": [
@@ -24243,6 +24361,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "key"
           ],
           "unique": true
+        },
+        {
+          "name": "idx_outline_spaces_in_process_pending",
+          "columns": [
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"in_process_ready\" = FALSE"
         },
         {
           "name": "uq_outline_spaces_project",
@@ -24436,6 +24562,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "false",
           "defaultExpression": "false"
+        },
+        {
+          "property": "inProcess",
+          "name": "in_process",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         }
       ],
       "indexes": [
@@ -24471,6 +24609,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "orderKey"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_outline_blocks_open_tasks",
+          "columns": [
+            "spaceId"
+          ],
+          "unique": false,
+          "predicate": "(\"task_json\"::jsonb #>> '{status}') IN ('todo', 'doing') AND \"deleted\" = FALSE"
+        },
+        {
+          "name": "idx_outline_blocks_doing_tasks",
+          "columns": [
+            "id"
+          ],
+          "unique": false,
+          "predicate": "(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE"
         }
       ],
       "checks": [],
@@ -24893,6 +25047,123 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "targetRef"
           ],
           "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineTaskClaims",
+      "name": "outline_task_claims",
+      "columns": [
+        {
+          "property": "taskBlockId",
+          "name": "task_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_task_claims_task_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "holderNarratorId",
+          "name": "holder_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "holderUserId",
+          "name": "holder_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "epoch",
+          "name": "epoch",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "taskVersionAtClaim",
+          "name": "task_version_at_claim",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "claimedAt",
+          "name": "claimed_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "expiresAt",
+          "name": "expires_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastHolderNarratorId",
+          "name": "last_holder_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastHolderUserId",
+          "name": "last_holder_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_task_claims_holder",
+          "columns": [
+            "holderNarratorId"
+          ],
+          "unique": false,
+          "predicate": "\"holder_narrator_id\" IS NOT NULL"
+        },
+        {
+          "name": "idx_outline_task_claims_expiry",
+          "columns": [
+            "expiresAt"
+          ],
+          "unique": false,
+          "predicate": "\"expires_at\" IS NOT NULL"
         }
       ],
       "checks": [],

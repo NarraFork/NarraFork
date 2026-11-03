@@ -1,6 +1,6 @@
 import { stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type { PromptPart } from "../../shared/prefix-context";
+import type { ContextPart, PromptPart } from "../../shared/prefix-context";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
@@ -10,10 +10,28 @@ import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-
 import { IS_WINDOWS } from "../lib/platform";
 import {
 	getDynamicSpecSystemReminder,
+	getOutlineTaskSystemReminder,
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
 	type Locale,
 } from "../lib/prompt-i18n";
+
+/**
+ * Which task instructions the system prompt carries: the Dynamic Spec section (`spec`, every
+ * spec session, subagents included), the outline's three conventions (`outline`, an outline
+ * root session, design §0 and §4.2), or none (`none`, an outline subagent: it has no tasks of
+ * its own and no outline tools by default, D27c, R16).
+ */
+export type PromptTaskSection = "spec" | "outline" | "none";
+
+/** The task section for a narrator of this type in a session with this task backend. */
+export function taskSectionFor(
+	backend: "spec" | "outline",
+	narratorType: string | null | undefined,
+): PromptTaskSection {
+	if (backend === "spec") return "spec";
+	return narratorType === "subagent" ? "none" : "outline";
+}
 
 export interface BuildPromptOptions {
 	/** Base system prompt (narrator's custom prompt or subagent type prompt) */
@@ -64,6 +82,18 @@ export interface BuildPromptOptions {
 	modeContext?: string;
 	/** Current tool availability and ongoing-run hints, not persistent history events. */
 	runtimeHints?: string;
+	/**
+	 * The task instructions to carry (`taskSectionFor`); default `spec`, so a caller that does not
+	 * know the session's task backend builds exactly the prompt it always did.
+	 */
+	taskSection?: PromptTaskSection;
+	/**
+	 * Named dynamic parts the session's task source adds (`NarratorTaskSource.contextParts`: an
+	 * outline session's built-in views), appended in order after `runtime`. Absent or empty adds
+	 * nothing, so a spec session's prompt is exactly what it was. A part marked `unreadable` is
+	 * not appended: its key goes to `keepParts`, and the request keeps its previous value.
+	 */
+	contextParts?: readonly ContextPart[];
 }
 
 export interface BuildPromptResult {
@@ -76,6 +106,11 @@ export interface BuildPromptResult {
 	usedCompactSummary: boolean;
 	/** Exact construction offsets, not a heading/text heuristic. */
 	summaryRange?: { start: number; end: number };
+	/**
+	 * Parts that could not be read for this request (`ContextPart.unreadable`): the prefix keeps
+	 * their previous values instead of removing them. Present only when there are some.
+	 */
+	keepParts?: string[];
 }
 
 /**
@@ -274,8 +309,12 @@ export async function buildEffectiveSystemPrompt(
 		}
 	}
 
-	// 2b. Inject Dynamic Spec usage so models know spec:// exists even before tasks do.
-	appendContract(getDynamicSpecSystemReminder(locale));
+	// 2b. Inject Dynamic Spec usage so models know spec:// exists even before tasks do. An outline
+	// session gets the three outline conventions in the same place instead (design §4.2); both
+	// are fixed text, part of the epoch's contract like the section they replace.
+	const taskSection = options.taskSection ?? "spec";
+	if (taskSection === "spec") appendContract(getDynamicSpecSystemReminder(locale));
+	else if (taskSection === "outline") appendContract(getOutlineTaskSystemReminder(locale));
 
 	// 3. Inject project instructions. AGENTS.override.md is a local-only override
 	// (Codex convention), then the AGENTS.md standard, then legacy fallbacks.
@@ -336,6 +375,11 @@ export async function buildEffectiveSystemPrompt(
 	if (options.skillsContext !== undefined) appendPart("skills", options.skillsContext);
 	if (options.modelsContext !== undefined) appendPart("models", options.modelsContext);
 	if (options.runtimeHints !== undefined) appendPart("runtime", options.runtimeHints);
+	const keepParts: string[] = [];
+	for (const part of options.contextParts ?? []) {
+		if (part.unreadable) keepParts.push(part.key);
+		else appendPart(part.key, part.text);
+	}
 
 	return {
 		prompt,
@@ -343,5 +387,6 @@ export async function buildEffectiveSystemPrompt(
 		parts,
 		usedCompactSummary,
 		...(summaryRange ? { summaryRange } : {}),
+		...(keepParts.length > 0 ? { keepParts } : {}),
 	};
 }

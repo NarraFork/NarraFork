@@ -1,5 +1,6 @@
 import { ActionIcon, Box, Group, Menu, Modal, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import type { FileTarget } from "@shared/file-reference";
 import type { DiffDocument } from "@shared/pretext-layout/diff-core";
 import {
 	IconArrowBackUp,
@@ -37,6 +38,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../../hooks/useSwipeMenu";
 import { copyTextToClipboard } from "../../../lib/clipboard";
+import { fileLinkTargetFromEvent } from "../../../lib/file-link-target";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../../lib/history-state";
 import {
 	SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
@@ -51,6 +53,7 @@ import {
 	type FileReferenceScopeValue,
 } from "../composer/FileReferenceScope";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
+import { FileLinkMenuItems } from "../message/FileLinkMenuItems";
 import { useMessageContextMenu } from "../message/MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
@@ -241,6 +244,8 @@ export const ContentViewer = memo(
 		const [wordWrap, setWordWrap] = useState(defaultWrap);
 		const userToggled = useRef(false);
 		const [showSource, setShowSource] = useState(false);
+		/** File behind the context-menu gesture, when it landed on a file link in this body. */
+		const [fileLinkTarget, setFileLinkTarget] = useState<FileTarget | null>(null);
 		const boxRef = useRef<HTMLDivElement>(null);
 		const actionBarRef = useRef<HTMLDivElement>(null);
 		const modalBodyRef = useRef<HTMLDivElement>(null);
@@ -446,6 +451,9 @@ export const ContentViewer = memo(
 				e.stopPropagation();
 				const x = Math.min(e.clientX, window.innerWidth - 200);
 				const flipY = e.clientY > window.innerHeight - 300;
+				// Which file the gesture pointed at, if it landed on a file link in this body. Only
+				// the context menu can name one, so the swipe reveal never shows these items.
+				setFileLinkTarget(fileLinkTargetFromEvent(e.target));
 				swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
 				swipe.setCtxMenuOpened(true);
 			},
@@ -952,6 +960,12 @@ export const ContentViewer = memo(
 							>
 								{t("copy")}
 							</Menu.Item>
+							{fileLinkTarget?.deviceId === "local" && (
+								<FileLinkMenuItems
+									target={fileLinkTarget}
+									onClose={() => swipe.setCtxMenuOpened(false)}
+								/>
+							)}
 							{(msgCtx.onForkFromMessage ||
 								msgCtx.onAskInPassing ||
 								msgCtx.onCompactBeforeMessage ||

@@ -9,6 +9,7 @@ import {
 	LIVE_FRAME,
 	LIVE_STATUS_OF_TASK,
 	LIVE_TASK_OF_STATUS,
+	type LiveRejectHead,
 	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_MAGIC,
 	OUTLINE_LIVE_MAX_HANDLE,
@@ -94,6 +95,27 @@ describe("live frames", () => {
 		expect(decodeLiveFrame(fromServer)?.head).toEqual(big);
 		// The server reads every frame with the client limit.
 		expect(decodeLiveFrame(fromServer, OUTLINE_LIVE_LIMITS.maxHeadBytes)).toBeNull();
+	});
+
+	test("a refusal can say who is doing the task; a client reading only the code is unaffected", () => {
+		const head: LiveRejectHead = {
+			code: "conflict",
+			claimed: {
+				address: "K1/abc",
+				holder: { kind: "agent", id: "narrator-1", name: "Fix the login" },
+			},
+		};
+		const bytes = encodeLiveFrame({ kind: LIVE_FRAME.reject, handle: 3, n: 7, head });
+		const frame = decodeLiveFrame(bytes);
+		expect(frame?.kind).toBe(LIVE_FRAME.reject);
+		expect(frame?.head).toEqual(head);
+		// What a client of the first version did with it: read `code`, nothing else.
+		expect((frame?.head as { code: string }).code).toBe("conflict");
+		// And a refusal without the field is as before.
+		const plain = decodeLiveFrame(
+			encodeLiveFrame({ kind: LIVE_FRAME.reject, handle: 3, n: 8, head: { code: "failed" } }),
+		);
+		expect(plain?.head).toEqual({ code: "failed" });
 	});
 
 	test("task characters and statuses map both ways", () => {

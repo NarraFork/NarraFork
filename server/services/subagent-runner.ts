@@ -180,10 +180,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	const customDef = BUILTIN_DELEGATION_TEMPLATES.has(subagentType)
 		? null
 		: await customSubagentService.loadByName(subagentType);
-	const templatePolicy = compileDelegationPolicy({
-		template: subagentType,
-		customDefinition: customDef,
-	});
 	const systemPrompt = await buildDelegationBasePrompt(
 		subagentType,
 		locale as Locale,
@@ -203,6 +199,12 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		subagentPref = customDef.defaultModel || undefined;
 	}
 	const parent = await narratorService.getById(parentNarratorId);
+	const templatePolicy = compileDelegationPolicy({
+		template: subagentType,
+		customDefinition: customDef,
+		// An outline session's subagents get no outline tools by default (R16).
+		outlineSession: parent.taskBackend === "outline",
+	});
 	// Model pools are a grant, so layering can only narrow them.
 	const parentTraits = await resolveEffectiveTraits({
 		narratorTraits: parent.traits,

@@ -1,8 +1,11 @@
 import {
 	type ComposerDocument,
+	composerDocumentText,
 	composerDocumentTextCandidates,
+	legacyComposerDocumentText,
 	MAX_COMPOSER_DOCUMENT_BYTES,
 	parseComposerDocument,
+	preMediaComposerDocumentProjection,
 } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { ValidationError } from "./errors";
@@ -40,6 +43,15 @@ export function validateComposerProjection(
 	text: string,
 	references: readonly FileReference[] = [],
 ): void {
+	validateComposerProjectionCandidates(document, text, references, false);
+}
+
+function validateComposerProjectionCandidates(
+	document: ComposerDocument | undefined,
+	text: string,
+	references: readonly FileReference[],
+	persisted: boolean,
+): void {
 	if (!document) return;
 	const canonical = (ref: FileReference) => [
 		ref.id,
@@ -58,9 +70,16 @@ export function validateComposerProjection(
 		ref.expectedHash ?? null,
 	];
 	const expected = JSON.stringify(references.map(canonical));
-	// Stale clients, queued rows and drafts may still carry the legacy quote-prefix projection.
+	// Version 1 did not identify the projection revision. Only stored rows can use the
+	// pre-media candidate, and that revision could not have audio/video assets.
+	const candidates = composerDocumentTextCandidates(document);
 	if (
-		!composerDocumentTextCandidates(document).some(
+		persisted &&
+		document.assets.every((asset) => asset.kind === "image" || asset.kind === "textFile")
+	)
+		candidates.push(preMediaComposerDocumentProjection(document));
+	if (
+		!candidates.some(
 			(projected) =>
 				projected.text === text &&
 				JSON.stringify(projected.fileReferences.map(canonical)) === expected,
@@ -95,18 +114,20 @@ export function bindComposerDocumentReferences(
 export function validatePersistedComposerDocument(value: unknown, blocks: readonly any[]) {
 	const document = parseOptionalComposerDocument(value);
 	if (!document) return undefined;
-	validateComposerProjection(
+	validateComposerProjectionCandidates(
 		document,
 		blocks
 			.filter((block) => block.type === "text")
 			.map((block) => block.text)
 			.join(""),
 		blocks.filter((block) => block.type === "file_reference").map((block) => block.reference),
+		true,
 	);
 	validateComposerAssets(
 		document,
 		blocks.filter((block) => block.type === "image"),
 		blocks.filter((block) => block.type === "text_file"),
+		blocks.filter((block) => block.type === "audio" || block.type === "video"),
 	);
 	return document;
 }
@@ -120,25 +141,100 @@ export interface ComposerAttachmentMetadata {
 	mediaType?: string;
 	sourceMimeType?: string;
 }
+/** Bind only server-detected media; uploads may be the suffix after retained edit attachments. */
+export function bindComposerMedia(
+	document: ComposerDocument | undefined,
+	media: readonly ComposerAttachmentMetadata[],
+): ComposerDocument | undefined {
+	if (!document || !media.length) return document;
+	const assets = document.assets.filter(
+		(asset) => asset.kind === "audio" || asset.kind === "video",
+	);
+	const offset = assets.length - media.length;
+	if (offset < 0) throw new ValidationError("Composer attachment count does not match uploads");
+	const replacements = new Map<string, ComposerDocument["assets"][number]>();
+	media.forEach((file, index) => {
+		const asset = assets[offset + index];
+		const name = file.name ?? file.filename;
+		if (
+			(name !== undefined && asset.name !== name) ||
+			(file.size !== undefined && asset.size !== file.size)
+		)
+			throw new ValidationError("Composer attachment metadata does not match uploads");
+		const mime = file.mediaType;
+		const kind =
+			file.type === "audio" || file.type === "video"
+				? file.type
+				: mime?.startsWith("audio/")
+					? "audio"
+					: mime?.startsWith("video/")
+						? "video"
+						: undefined;
+		if (kind) replacements.set(asset.id, { ...asset, kind, ...(mime ? { mimeType: mime } : {}) });
+	});
+	return {
+		...document,
+		assets: document.assets.map((asset) => replacements.get(asset.id) ?? asset),
+	};
+}
+export function bindComposerMediaProjection(
+	document: ComposerDocument | undefined,
+	text: string,
+	references: FileReference[] | undefined,
+	media: readonly ComposerAttachmentMetadata[],
+) {
+	validateComposerProjection(document, text, references);
+	if (!document) return { document, text, references };
+	const normalized = bindComposerMedia(document, media)!;
+	const current = composerDocumentText(document);
+	const legacy = legacyComposerDocumentText(document);
+	const projection =
+		text !== current.text && text === legacy.text
+			? legacyComposerDocumentText(normalized)
+			: composerDocumentText(normalized);
+	return {
+		document: normalized,
+		text: projection.text,
+		references: references ? projection.fileReferences : references,
+	};
+}
 export function validateComposerAssets(
 	document: ComposerDocument | undefined,
 	images: readonly ComposerAttachmentMetadata[],
 	textFiles: readonly ComposerAttachmentMetadata[],
+	media: readonly ComposerAttachmentMetadata[] = [],
 ): void {
 	if (!document) return;
-	for (const kind of ["image", "textFile"] as const) {
-		const assets = document.assets.filter((asset) => asset.kind === kind);
-		const files = kind === "image" ? images : textFiles;
+	const groups = [
+		{ assets: document.assets.filter((asset) => asset.kind === "image"), files: images },
+		{ assets: document.assets.filter((asset) => asset.kind === "textFile"), files: textFiles },
+		{
+			// Audio and video share the multipart media lane: keep its ordinal identity.
+			assets: document.assets.filter((asset) => asset.kind === "audio" || asset.kind === "video"),
+			files: media,
+		},
+	];
+	for (const { assets, files } of groups) {
 		if (assets.length !== files.length)
 			throw new ValidationError("Composer attachment count does not match uploads");
 		assets.forEach((asset, index) => {
 			const file = files[index];
 			const name = file.name ?? file.filename;
-			// MIME is advisory, not identity: multipart may rewrite aliases/defaults,
-			// and image decoding may detect a different format. Upload validation owns type safety.
+			// MIME aliases remain advisory. A known media modality must still match its chip.
+			// File.type is supplied by the browser and can misclassify container-only audio.
+			const mime = file.mediaType ?? file.mimeType ?? "";
+			const modality =
+				file.type === "audio" || file.type === "video"
+					? file.type
+					: mime.startsWith("audio/")
+						? "audio"
+						: mime.startsWith("video/")
+							? "video"
+							: undefined;
 			if (
 				(name !== undefined && asset.name !== name) ||
-				(file.size !== undefined && asset.size !== file.size)
+				(file.size !== undefined && asset.size !== file.size) ||
+				((asset.kind === "audio" || asset.kind === "video") && modality && asset.kind !== modality)
 			)
 				throw new ValidationError("Composer attachment metadata does not match uploads");
 		});

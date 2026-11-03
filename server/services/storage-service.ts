@@ -1,6 +1,6 @@
 import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
-import { readdir, rm, stat } from "node:fs/promises";
+import { lstat, readdir, rm, rmdir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
 	STORAGE_CATEGORY_KEYS,
@@ -24,7 +24,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "../lib/request-recorder";
 import { safeSpawn } from "../lib/spawn";
-import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
+import { contentJsonHasImageBlocks, getUploadsDir, isWithinDir } from "../lib/uploads";
 import { blockReadsEnabled, imageEnvelopeOwners } from "./narrator-block-scans";
 import {
 	DatabaseStorageScanCancelledError,
@@ -806,11 +806,71 @@ export async function* scanStorage(
 
 // ── Cleanup functions ──────────────────────────────────────────────────────
 
+export async function removeUploadDirectoryWithoutMedia(
+	narratorId: string,
+	measureBytes = true,
+): Promise<{ removed: number; freedBytes: number }> {
+	const root = getUploadsDir();
+	const dirPath = resolve(root, narratorId);
+	if (!isWithinDir(root, dirPath)) return { removed: 0, freedBytes: 0 };
+
+	// Existing media, including a symlink or an empty directory, preserves the
+	// entire owner directory. References can survive in forks and tool results.
+	try {
+		await lstat(resolve(dirPath, "media"));
+		return { removed: 0, freedBytes: 0 };
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+
+	// Never recursively remove the owner root: media can be created at any time.
+	let children: Dirent[];
+	try {
+		children = await readdir(dirPath, { withFileTypes: true });
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, freedBytes: 0 };
+		throw err;
+	}
+	let freedBytes = 0;
+	for (const child of children) {
+		// Case-insensitive filesystems can report an existing MEDIA spelling.
+		if (child.name.toLowerCase() === "media") continue;
+		const childPath = resolve(dirPath, child.name);
+		try {
+			const size = !measureBytes
+				? 0
+				: child.isDirectory()
+					? await dirSize(childPath)
+					: child.isFile()
+						? (await lstat(childPath)).size
+						: 0;
+			await rm(childPath, { recursive: true, force: true });
+			freedBytes += size;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		}
+	}
+	try {
+		await rmdir(dirPath);
+		return { removed: 1, freedBytes };
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code !== "ENOTEMPTY" && code !== "EEXIST" && code !== "ENOENT") throw err;
+		return { removed: 0, freedBytes };
+	}
+}
+
 export async function cleanupOrphanedUploads(): Promise<{ removed: number; freedBytes: number }> {
 	const uploadsDir = getUploadsDir();
 	if (!existsSync(uploadsDir)) return { removed: 0, freedBytes: 0 };
 
-	const entries = await readdir(uploadsDir, { withFileTypes: true });
+	let entries: Dirent[];
+	try {
+		entries = await readdir(uploadsDir, { withFileTypes: true });
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, freedBytes: 0 };
+		throw err;
+	}
 	const narratorIds = db
 		.select({ id: narrators.id })
 		.from(narrators)
@@ -824,12 +884,15 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 	for (const entry of entries) {
 		if (!entry.isDirectory() || entry.name === "avatars") continue;
 		if (!preservedOwnerIds.has(entry.name)) {
-			const dirPath = resolve(uploadsDir, entry.name);
-			const size = await dirSize(dirPath);
-			await rm(dirPath, { recursive: true, force: true });
-			removed++;
-			freedBytes += size;
-			logger.info("Removed orphaned upload dir", { narratorId: entry.name, size });
+			const result = await removeUploadDirectoryWithoutMedia(entry.name);
+			removed += result.removed;
+			freedBytes += result.freedBytes;
+			if (result.removed) {
+				logger.info("Removed orphaned upload dir", {
+					narratorId: entry.name,
+					size: result.freedBytes,
+				});
+			}
 		}
 	}
 

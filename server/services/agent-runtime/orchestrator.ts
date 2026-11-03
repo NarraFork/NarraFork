@@ -4,6 +4,12 @@ import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mo
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import {
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+	type NativeMediaFallbackWarning,
+} from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
@@ -26,6 +32,7 @@ import {
 } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
+import { OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
 import type { ToolDefinition } from "../../lib/agent/types";
@@ -137,6 +144,7 @@ import {
 	exitNarratorPlanMode,
 	prepareNarratorPlanMode,
 } from "../narrator-plan-mode";
+import { taskSectionFor } from "../narrator-prompt";
 import {
 	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
@@ -159,6 +167,8 @@ import {
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
 	consumeQuestionAnswerModelReceipts,
+	decideOutlineTurnEndNote,
+	deliverOutlineTurnEndNote,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
@@ -174,6 +184,7 @@ import {
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
 	persistConversationIdIfUnchanged,
+	prepareOutlineRun,
 	rearmCutInSoftStopBeforeContinuing,
 	resolveRuntimeReasoningEffort,
 	resolveSessionDevices,
@@ -207,9 +218,11 @@ import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
+import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
+import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
@@ -360,9 +373,21 @@ export async function runAgentLoopUnlocked(
 	run?: RunControl,
 	/** An accepted `/bash` pre-command the runtime runs (and owns) before the first pass. */
 	prePromptBashCommand?: string,
+	media?: MediaRef[],
 ): Promise<RuntimeRunOutcome> {
 	const { narratorId, locale } = active;
-	const runState = createRuntimeRunState({ kind: "current", text, images }, prePromptBashCommand);
+	const runState = createRuntimeRunState(
+		{ kind: "current", text, images, media },
+		prePromptBashCommand,
+	);
+	const mediaFallbackWarningKeys = new Set<string>();
+	const newMediaFallbackWarnings = (warnings: NativeMediaFallbackWarning[]) =>
+		warnings.filter((warning) => {
+			const key = JSON.stringify([warning.model, warning.uploadNarratorId, warning.mediaId]);
+			if (mediaFallbackWarningKeys.has(key)) return false;
+			mediaFallbackWarningKeys.add(key);
+			return true;
+		});
 	const continuationState = createSpecContinuationState();
 	let continuationStopNote: string | null = null;
 	let abortedBeforeCleanup: boolean | undefined;
@@ -477,7 +502,9 @@ export async function runAgentLoopUnlocked(
 		});
 		continuationStopNote =
 			deliverTo && continuationState.stop
-				? specContinuationStopNote(continuationState.stop, locale)
+				? specContinuationStopNote(continuationState.stop, locale, {
+						turnBudgetOnly: continuationState.turnBudgetOnly,
+					})
 				: null;
 		return content;
 	};
@@ -569,6 +596,7 @@ export async function runAgentLoopUnlocked(
 			const delivered = await drainAndPersistPendingInjections(active, placement);
 			if (delivered) {
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				return "continue";
@@ -709,7 +737,26 @@ export async function runAgentLoopUnlocked(
 				buffered.executionIntent,
 			);
 			if (goalCommand) {
-				await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
+				const { refused } = await executeQueuedGoalCommand(
+					narratorId,
+					buffered,
+					goalCommand.objective,
+				);
+				if (refused) {
+					// An outline session's queued /goal was dropped unsaved; drain on.
+					pendingBufferedDelivery = undefined;
+					if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
+						runState.wasInterrupted = true;
+					} else {
+						await narratorService.compareAndSetStatus(
+							narratorId,
+							["working", "waiting"],
+							restingStatus(),
+							{ substatus: ["unread"] },
+						);
+					}
+					return "break";
+				}
 				active._continuationSuppressed = false;
 				active._continuationStallCount = 0;
 				active._continuationStallKey = undefined;
@@ -719,6 +766,7 @@ export async function runAgentLoopUnlocked(
 				});
 				if (continuationPrompt) {
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					return "continue";
@@ -747,6 +795,7 @@ export async function runAgentLoopUnlocked(
 			const persistBlocks: Array<
 				| { type: "text"; text: string }
 				| PersistedUserImageBlock
+				| MediaContentBlock
 				| FileReferenceSnapshot
 				| {
 						type: "text_file";
@@ -760,6 +809,8 @@ export async function runAgentLoopUnlocked(
 					persistBlocks.push(imageRefToContentBlock(img));
 				}
 			}
+			for (const ref of buffered.media ?? [])
+				persistBlocks.push(mediaRefToContentBlock(ref, narratorId));
 			if (savedBufferedTextFiles.length > 0) {
 				for (const tf of savedBufferedTextFiles) {
 					persistBlocks.push({
@@ -827,12 +878,14 @@ export async function runAgentLoopUnlocked(
 						signal: urgentActivitySignal(active, active.abortController.signal),
 					},
 				);
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				return "continue";
 			}
 			runState.input.text = projectFileReferenceText(effectiveBufferedText, fileReferences);
 			runState.input.images = buffered.images;
+			runState.input.media = buffered.media;
 			return "continue";
 		}
 		return "none";
@@ -843,8 +896,16 @@ export async function runAgentLoopUnlocked(
 		aborted: true,
 	});
 
+	// Outline tasks this session set in progress stay its own while it runs (renewed at run start,
+	// at each pass and tool boundary, and on a timer through long tool calls).
+	let outlineLeases: OutlineLeaseKeeper | undefined;
 	try {
+		outlineLeases = keepOutlineTaskLeases(narratorId);
+		// An outline session moves its old fence text to its behavior page once, before its first
+		// prompt is built, and the turn-end note measures the run from here (outline plan PR 4).
+		await prepareOutlineRun(active);
 		while (active.alive && owner.isCurrent()) {
+			void outlineLeases.touch();
 			// The run's own cancellation reaches whichever turn controller is current.
 			if (run?.cancel.signal.aborted && !active.abortController.signal.aborted)
 				active.abortController.abort(run.cancel.signal.reason);
@@ -869,6 +930,7 @@ export async function runAgentLoopUnlocked(
 						signal: AbortSignal.any([active.abortController.signal, passUrgentGuidance.signal]),
 					},
 				);
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.firstPass = false;
 				// A stop during the pre-command ends the turn before any model request.
@@ -919,6 +981,20 @@ export async function runAgentLoopUnlocked(
 			);
 			const runtimePolicy = passCapabilities.policy;
 			const profileToolFilter = runtimeToolFilter(runtimePolicy);
+			// Where the session's tasks live, once per pass (one indexed read). An outline root
+			// session has OutlineEdit as a core tool (plan §5): never managed by loading, so it
+			// cannot be unloaded and needs no routine. Subagents get no outline tools by default
+			// (R16): their ceiling decides, as for every built-in.
+			const taskBackend: TaskBackend = await resolveTaskBackend(narratorId).catch(
+				(error: unknown) => {
+					logger.warn("Failed to resolve task backend for pass; using spec", {
+						narratorId,
+						error: String(error),
+					});
+					return "spec" as const;
+				},
+			);
+			const outlineEditCore = taskBackend === "outline" && freshNarrator.type !== "subagent";
 			{
 				if (active._workspaceInstallFailed)
 					throw new Error("Workspace context installation requires session recovery");
@@ -962,6 +1038,7 @@ export async function runAgentLoopUnlocked(
 				managedOptionalTools.clear();
 				if (runtimePolicy.tools.builtin !== "all") return;
 				for (const tool of candidates) {
+					if (outlineEditCore && tool.name === OUTLINE_EDIT_TOOL) continue;
 					if (
 						OPTIONAL_TOOLS.has(tool.name) &&
 						(!tool.isAvailable || tool.isAvailable()) &&
@@ -1044,6 +1121,7 @@ export async function runAgentLoopUnlocked(
 					);
 				}
 				if (runtimePolicy.tools.builtin !== "all") return true;
+				if (outlineEditCore && tool.name === OUTLINE_EDIT_TOOL) return true;
 				if (OPTIONAL_TOOLS.has(tool.name)) return managedOptionalTools.has(tool.name);
 				return active._narratorKind !== "knowledge" || !KNOWLEDGE_KIND_DENY_CORE.has(tool.name);
 			};
@@ -1157,6 +1235,12 @@ export async function runAgentLoopUnlocked(
 					? false
 					: (active._relaxedPlanLive ??
 						resolveEffectiveRelaxedPlan(current.permissionMode, current.relaxedPlan));
+				// An outline session's built-in views (current tasks, behavior boundary) are parts of
+				// the prefix, compared on every request; a spec session adds none (plan PR 4).
+				const contextParts =
+					taskBackend === "outline"
+						? await (await taskSourceForNarrator(narratorId)).contextParts(locale)
+						: undefined;
 				const built = await buildSystemPrompt(
 					{
 						systemPrompt: currentOAuth
@@ -1178,6 +1262,8 @@ export async function runAgentLoopUnlocked(
 					// Legacy resumed plan paths cannot be reconstructed from the identity.
 					active._planFilePath,
 					{
+						taskSection: taskSectionFor(taskBackend, current.type),
+						...(contextParts ? { contextParts } : {}),
 						workspaceContext: JSON.stringify(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
@@ -1246,6 +1332,7 @@ export async function runAgentLoopUnlocked(
 				model: preparedPrefix.model,
 				provider: preparedPrefix.provider,
 				currentInput: runState.input.text,
+				currentMedia: runState.input.media,
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
 				toolLoading: preparedPrefix.toolLoading,
@@ -1602,6 +1689,7 @@ export async function runAgentLoopUnlocked(
 					active._usedCompactSummary = false;
 				},
 				onToolResult: (event) => {
+					void outlineLeases?.touch();
 					if (!event.isError || event.toolName !== SHELL_TOOL_NAME) return;
 					const recovery = getMissingWorkingDirectoryRecovery(event.metadata);
 					if (!recovery) return;
@@ -1768,6 +1856,7 @@ export async function runAgentLoopUnlocked(
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
+				taskBackend,
 				bot: isBotNarrator(freshNarrator.traits),
 				narratorId,
 				conversationId: active.conversationId,
@@ -2155,6 +2244,11 @@ export async function runAgentLoopUnlocked(
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
 				onEvent: (event) => {
+					if (event.type === "media_fallback") {
+						const warnings = newMediaFallbackWarnings(event.warnings);
+						if (!warnings.length) return;
+						event = { ...event, warnings };
+					}
 					processEvent(event, eventContext, hooks).catch((err) => {
 						logger.error("Side-channel event processing error", {
 							narratorId,
@@ -2334,6 +2428,7 @@ export async function runAgentLoopUnlocked(
 					});
 				await narratorService.updateStatus(narratorId, "working");
 				if (keptPartial) {
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 				}
@@ -2382,6 +2477,15 @@ export async function runAgentLoopUnlocked(
 
 			active._tokenUsageBaseline = active._requestTokenTotal ?? 0;
 			active._interruptCleanupDone = false;
+			const fallbackWarnings = newMediaFallbackWarnings(
+				preparedHistory.mediaFallbackWarnings ?? [],
+			);
+			if (fallbackWarnings.length)
+				await processEvent(
+					{ type: "media_fallback", warnings: fallbackWarnings },
+					eventContext,
+					hooks,
+				);
 			let result: ExecuteLoopResult;
 			try {
 				result = await executeAgentLoop({
@@ -2391,6 +2495,7 @@ export async function runAgentLoopUnlocked(
 					history: { rows: preparedHistory.modelMessages, built: preparedHistory.history },
 					startedWithToolResults: preparedHistory.endsWithToolResults,
 					images: loopImages,
+					media: preparedHistory.currentMedia,
 					eventContext,
 					hooks,
 				}).finally(() => {
@@ -2427,6 +2532,7 @@ export async function runAgentLoopUnlocked(
 					...sideCarBodyWithText("workspace_changed", { kind: "notice" }, locale),
 					locale,
 				});
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
@@ -2790,6 +2896,7 @@ export async function runAgentLoopUnlocked(
 				}
 				if (outcome.kind === "replay") {
 					if (outcome.keptPartial) {
+						runState.input.media = undefined;
 						runState.input.text = "";
 						runState.input.images = undefined;
 					}
@@ -2817,6 +2924,7 @@ export async function runAgentLoopUnlocked(
 				const continuationPrompt = await continueForSpec("maxTurns", false);
 				if (continuationPrompt) {
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;
@@ -2923,6 +3031,7 @@ export async function runAgentLoopUnlocked(
 						narratorId,
 						retries: interruptionPlan.retries,
 					});
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;
@@ -2950,6 +3059,7 @@ export async function runAgentLoopUnlocked(
 						data: fileReferenceMessageForDisplay(userMsg),
 					});
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = continueText;
 					runState.input.images = undefined;
 					continue;
@@ -3034,6 +3144,7 @@ export async function runAgentLoopUnlocked(
 					data: fileReferenceMessageForDisplay(userMsg),
 				});
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = promptText;
 				runState.input.images = undefined;
 				continue;
@@ -3083,6 +3194,7 @@ export async function runAgentLoopUnlocked(
 					data: fileReferenceMessageForDisplay(userMsg),
 				});
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
 				// cut-in message queued during the same tool call needs its boundary back.
@@ -3154,6 +3266,7 @@ export async function runAgentLoopUnlocked(
 			const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
 			if (bgCompletionPrompt) {
 				await narratorService.updateStatus(narratorId, "working");
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				// This drain starts a fresh pass before the buffer consumer below is
@@ -3183,6 +3296,7 @@ export async function runAgentLoopUnlocked(
 				if (!runState.hadError && active.alive) {
 					logger.info("Resuming turn after a cancelled cut-in queued message", { narratorId });
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;
@@ -3195,6 +3309,7 @@ export async function runAgentLoopUnlocked(
 				await narratorService.updateStatus(narratorId, "working");
 				// The continuation prompt was persisted as a system message; the next
 				// provider call only needs an empty turn to advance the conversation.
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
@@ -3210,6 +3325,7 @@ export async function runAgentLoopUnlocked(
 					active.abortController.signal.aborted,
 				)
 			) {
+				runState.input.media = undefined;
 				runState.input.text = "";
 				runState.input.images = undefined;
 				continue;
@@ -3228,6 +3344,13 @@ export async function runAgentLoopUnlocked(
 
 			// No buffered messages — now transition to idle/unread (triggers notifications)
 			if (!runState.hadError) {
+				// A long outline turn that left a task in progress without touching any task ends
+				// with one line for the next turn; it starts none (plan PR 4, Q4). Decided here,
+				// before the drain (its reads are awaited), and written only once this run has
+				// settled terminal below, so nothing awaited sits between the drain and the
+				// arbitration. The drain or a hold continuing the run drops it.
+				const turnEndNote = await decideOutlineTurnEndNote(active);
+
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
 				// This closes the window where status is already idle (visible to clients /
 				// route admission) while this loop is still running and about to pick up more
@@ -3237,6 +3360,7 @@ export async function runAgentLoopUnlocked(
 				const bgCompletionAfterIdle = await drainAndPersistPendingInjections(active, placement);
 				if (bgCompletionAfterIdle) {
 					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
 					runState.input.text = "";
 					runState.input.images = undefined;
 					continue;
@@ -3244,8 +3368,10 @@ export async function runAgentLoopUnlocked(
 
 				// Drain awaited above: synchronously arbitrate takeover vs terminal now.
 				// A successful hold must park; once finalizing is claimed new holds fail.
+				let terminal = true;
 				if (run) {
 					if (getRunHold(narratorId) && !getRunHold(narratorId)?.released) {
+						terminal = false;
 						if ((await holdAtBoundary()) === "continue") continue;
 					} else run.finalizing = true;
 				} else {
@@ -3256,6 +3382,9 @@ export async function runAgentLoopUnlocked(
 						{ substatus: ["unread"] },
 					);
 				}
+				// Nothing continues this run any more: the note decided above is written (a plain
+				// row, before the finalizer runs). A run that parked on a hold leaves none.
+				if (turnEndNote && terminal) await deliverOutlineTurnEndNote(active, turnEndNote);
 				// The run finalizer commits its terminal before the public idle write.
 			}
 
@@ -3298,6 +3427,9 @@ export async function runAgentLoopUnlocked(
 		runState.hadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
+		// The run ended: the session's claims go on the idle lease while it waits for its next
+		// turn, a subagent's pass to its root (not waited for).
+		void outlineLeases?.stop();
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;
 		unregisterUpdateLoop();

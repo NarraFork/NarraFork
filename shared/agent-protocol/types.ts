@@ -10,6 +10,7 @@
  * the host's `types.ts`.
  */
 
+import type { NativeMediaFallbackWarning } from "../media-attachments";
 import type { ReferencePricing } from "../model-catalog/profile";
 
 /** Immutable reference-rate snapshot captured when the upstream request starts.
@@ -200,6 +201,8 @@ export interface BuiltHistory {
 	history: unknown[];
 	/** Persisted input rows emitted into history (delivery receipts, de-duplication). */
 	replayedInjectionMessageIds?: readonly string[];
+	/** Request-scoped visible file fallbacks; persisted media references remain unchanged. */
+	mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 }
 
 // === Stream event emitted by provider.chat() ===

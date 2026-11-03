@@ -1,5 +1,6 @@
 import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import {
 	mapGenericReasoningEffort,
@@ -35,6 +36,18 @@ import {
 	markRuntimeSystemMessage,
 	reportInputCharacters,
 } from "./input-characters";
+import {
+	assertNativeMediaPayload,
+	chatAudioMedia,
+	chatNativeMedia,
+	chatVideoMedia,
+	createNativeMediaDumpEncoder,
+	rejectNativeMedia,
+	responsesVideoMedia,
+	storedMessageMedia,
+	supportsNativeMediaProtocolInput,
+	visitNativeMedia,
+} from "./native-media";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import {
 	type NeutralTurn,
@@ -472,7 +485,10 @@ export type OAIContentPart =
 	| { type: "image_url"; image_url: { url: string }; imageRef?: string }
 	| { type: "input_text"; text: string }
 	| { type: "input_image"; image_url: string; imageRef?: string }
-	| { type: "output_text"; text: string };
+	| { type: "output_text"; text: string }
+	| { type: "input_audio"; input_audio: { data: string; format: "wav" | "mp3" } }
+	| { type: "video_url"; video_url: { url: string } }
+	| { type: "input_video"; video_url: string };
 
 interface ResponsesToolImage {
 	format: string;
@@ -484,6 +500,7 @@ interface ResponsesFunctionCallOutputMessage {
 	call_id: string;
 	output: string;
 	_images?: ResponsesToolImage[];
+	_nativeMedia?: readonly NativeMediaInput[];
 }
 
 export interface OAIMessage {
@@ -687,6 +704,34 @@ export class OpenAIProvider implements ProviderAdapter {
 			}),
 		);
 	}
+	private usesQwenOmniChatMedia(model: string): boolean {
+		return (
+			!this.responsesFormat &&
+			/(?:^|:)qwen\d+(?:\.\d+)?-omni(?:[.-]|$)/i.test(parseModelId(model).model)
+		);
+	}
+	private nativeMediaProtocol(model: string): "completions" | "responses" | "unsupported" {
+		if (!this.responsesFormat) return "completions";
+		if (this.apiMode === "codex") return "unsupported";
+		// Ark's input_video is an extension, not a universal OpenAI Responses capability.
+		// Keep relay/channel model identifiers intact while recognizing the Doubao family.
+		if (/(?:^|:)doubao-/i.test(parseModelId(model).model)) return "responses";
+		try {
+			if (/^ark\.[a-z0-9-]+\.volces\.com$/i.test(new URL(this.config.baseUrl || "").hostname))
+				return "responses";
+		} catch {
+			// An invalid/missing endpoint does not advertise Ark's video extension.
+		}
+		return "unsupported";
+	}
+
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		return supportsNativeMediaProtocolInput(this.nativeMediaProtocol(model), media, model);
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.responsesFormat) {
 			// Responses API & Codex: flat format { type: "function", name, description, parameters, strict }
@@ -701,6 +746,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
+		this.assertMediaInput(model, dbMessages.flatMap(storedMessageMedia));
 		// Strictness belongs to the bare model; a provider prefix (`nug:`, a custom one)
 		// must not turn a credential-bound model into a relay.
 		const strict = hasCredentialBoundReasoning(parseModelId(model).model);
@@ -733,7 +779,121 @@ export class OpenAIProvider implements ProviderAdapter {
 		h.unshift(markRuntimeSystemMessage({ role, content }) as unknown as OAIMessage);
 	}
 
+	private assertResponsesMediaInput(model: string, values: unknown): void {
+		assertModelInputModalities(model, values);
+		visitNativeMedia(values, (item, modality) => {
+			if (modality !== "video") {
+				rejectNativeMedia("Ark Responses", item);
+				return;
+			}
+			if (item.type === "input_video") {
+				const url = item.video_url;
+				const prefix = typeof url === "string" && /^data:(video\/mp4);base64,/.exec(url);
+				if (!prefix || typeof url !== "string")
+					throw new Error("Ark Responses input_video requires an MP4 base64 data URL.");
+				responsesVideoMedia({
+					type: "video",
+					mediaType: prefix[1],
+					base64: url.slice(prefix[0].length),
+				});
+			} else if (typeof item.mediaId === "string") {
+				if (
+					!supportsNativeMediaProtocolInput(
+						"responses",
+						{
+							type: "video",
+							mediaType: String(item.mediaType),
+						},
+						model,
+					)
+				)
+					throw new Error(
+						`Ark Responses input_video only supports MP4 video, not ${item.mediaType}.`,
+					);
+			} else {
+				responsesVideoMedia(item as unknown as NativeMediaInput);
+			}
+		});
+	}
+	private assertMediaInput(model: string, values: unknown): void {
+		if (this.nativeMediaProtocol(model) === "responses") {
+			this.assertResponsesMediaInput(model, values);
+			return;
+		}
+		if (this.responsesFormat) {
+			rejectNativeMedia(this.apiMode === "codex" ? "Codex Responses" : "OpenAI Responses", values);
+			return;
+		}
+		assertModelInputModalities(model, values);
+		const qwenOmni = this.usesQwenOmniChatMedia(model);
+		visitNativeMedia(values, (item, modality) => {
+			if (modality === "video") {
+				if (item.type === "video_url") {
+					const url = (item.video_url as { url?: unknown } | undefined)?.url;
+					const prefix =
+						typeof url === "string" &&
+						(qwenOmni
+							? /^data:(video\/(?:mp4|quicktime))?;base64,/
+							: /^data:(video\/(?:mp4|quicktime));base64,/
+						).exec(url);
+					if (!prefix || typeof url !== "string")
+						throw new Error("Chat Completions video_url requires an MP4/MOV base64 data URL.");
+					chatVideoMedia({
+						type: "video",
+						mediaType: prefix[1] || "video/mp4",
+						base64: url.slice(prefix[0].length),
+					});
+				} else if (typeof item.mediaId === "string") {
+					if (
+						!supportsNativeMediaProtocolInput(
+							"completions",
+							{
+								type: "video",
+								mediaType: String(item.mediaType),
+							},
+							model,
+						)
+					)
+						throw new Error(
+							`Chat Completions video_url only supports MP4/MOV video, not ${item.mediaType}.`,
+						);
+				} else {
+					chatVideoMedia(item as unknown as NativeMediaInput);
+				}
+				return;
+			}
+			if (item.type === "input_audio") {
+				const audio = item.input_audio as { data?: string; format?: string } | undefined;
+				if (!audio || !["wav", "mp3"].includes(audio.format ?? ""))
+					throw new Error("OpenAI Chat Completions input_audio only supports WAV/MP3.");
+				let data = audio.data ?? "";
+				if (qwenOmni && typeof data === "string" && data.startsWith("data:")) {
+					const prefix = /^data:(audio\/(?:wav|mp3|mpeg))?;base64,/.exec(data);
+					if (
+						!prefix ||
+						(prefix[1] && (prefix[1] === "audio/wav" ? "wav" : "mp3") !== audio.format)
+					)
+						throw new Error("Qwen Omni input_audio requires a matching WAV/MP3 base64 data URL.");
+					data = data.slice(prefix[0].length);
+				}
+				assertNativeMediaPayload({
+					type: "audio",
+					mediaType: `audio/${audio.format}`,
+					base64: data,
+				});
+			} else if (typeof item.mediaId === "string") {
+				if (!["audio/wav", "audio/mp3", "audio/mpeg"].includes(String(item.mediaType)))
+					throw new Error(
+						`OpenAI Chat Completions input_audio only supports WAV/MP3, not ${item.mediaType}.`,
+					);
+			} else {
+				chatAudioMedia(item as unknown as NativeMediaInput);
+			}
+		});
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		this.assertMediaInput(params.model, [params.media, params.history, params.toolResults]);
 		// Use WebSocket mode for codex if enabled
 		if (this.useWebSocket) {
 			yield* this.chatCodexWebSocket(params);
@@ -762,20 +922,21 @@ export class OpenAIProvider implements ProviderAdapter {
 					outputLength: tr.output?.length,
 					hasImages: Array.isArray(tr._images) && tr._images.length > 0,
 				});
-				messages.push(...expandResponsesToolResultMessage(tr));
 			}
+			messages.push(
+				...expandResponsesToolResults(params.toolResults as ResponsesFunctionCallOutputMessage[]),
+			);
 		} else {
-			for (const tr of params.toolResults as OAIToolResult[]) {
-				messages.push({
-					role: "tool",
-					tool_call_id: tr.tool_call_id,
-					content: tr.content,
-				});
-			}
+			messages.push(...expandChatToolResults(params.toolResults as OAIToolResult[]));
 		}
 
 		// Append current user message (skip "." continuation markers unless images are attached)
-		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
+		const currentUserMessage = buildOAIUserMessage(
+			params.content,
+			params.images,
+			params.media,
+			this.responsesFormat ? responsesNativeMediaParts : chatNativeMediaParts,
+		);
 		if (currentUserMessage) {
 			messages.push(currentUserMessage);
 		} else if (params.toolResults.length === 0 && params.content) {
@@ -891,7 +1052,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			body = {
 				model,
-				messages,
+				messages: this.usesQwenOmniChatMedia(params.model)
+					? qwenOmniChatMessages(messages)
+					: messages,
 				stream: true,
 				stream_options: { include_usage: true },
 			};
@@ -920,6 +1083,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		// before any stream event has been yielded — after that the consumer has
 		// already seen partial output and a silent re-send would duplicate it.
 		const encodeBody = createRequestBodyEncoder();
+		const encodeDump = createNativeMediaDumpEncoder();
 		for (let attempt = 0; ; attempt++) {
 			if (turnState && this.apiMode === "codex") {
 				requestHeaders["x-codex-turn-state"] = turnState;
@@ -931,7 +1095,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				method: "POST",
 				url: endpoint,
 				headers: sanitizeHeaders(requestHeaders),
-				bodyText,
+				bodyText: await encodeDump(body, bodyText, params.signal),
 			});
 
 			params.onRequestStart?.();
@@ -1649,28 +1813,15 @@ export class OpenAIProvider implements ProviderAdapter {
 	private buildCodexWebSocketRequest(params: ChatParams): CodexResponsesRequestBody {
 		const model = parseModelId(params.model).model;
 		const messages: OAIMessage[] = [...(params.history as OAIMessage[])];
-		for (const tr of params.toolResults as Array<{
-			type: string;
-			call_id: string;
-			output: string;
-			_images?: Array<{ format: string; base64: string }>;
-		}>) {
-			messages.push({
-				type: "function_call_output",
-				call_id: tr.call_id,
-				output: tr.output,
-			} as unknown as OAIMessage);
-			if (tr._images?.length) {
-				messages.push({
-					role: "user",
-					content: tr._images.map((img) => ({
-						type: "input_image",
-						image_url: `data:image/${img.format};base64,${img.base64}`,
-					})),
-				} as unknown as OAIMessage);
-			}
-		}
-		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
+		messages.push(
+			...expandResponsesToolResults(params.toolResults as ResponsesFunctionCallOutputMessage[]),
+		);
+		const currentUserMessage = buildOAIUserMessage(
+			params.content,
+			params.images,
+			params.media,
+			(media) => [chatNativeMedia(media)],
+		);
 		if (currentUserMessage) {
 			messages.push(currentUserMessage);
 		} else if (params.toolResults.length === 0 && params.content) {
@@ -1843,6 +1994,21 @@ function extractResponsesText(
 interface OAIToolResult {
 	tool_call_id: string;
 	content: string;
+	_images?: ResponsesToolImage[];
+	_nativeMedia?: NativeMediaInput[];
+}
+
+function expandChatToolResults(results: OAIToolResult[]): OAIMessage[] {
+	const messages: OAIMessage[] = results.map((result) => ({
+		role: "tool",
+		tool_call_id: result.tool_call_id,
+		content: result.content,
+	}));
+	const media = results.flatMap((result) =>
+		(result._nativeMedia ?? []).flatMap((item) => chatNativeMediaParts(item, result.tool_call_id)),
+	);
+	if (media.length) messages.push({ role: "user", content: media });
+	return messages;
 }
 
 // === Helpers ===
@@ -3491,16 +3657,85 @@ function findActiveReasoningAccum(
 
 // === History builder ===
 
+// Qwen Omni's documented local audio/video inputs carry Data URIs, not raw audio Base64.
+// Keep the conversion at the final wire boundary so current, history and Read agree.
+function qwenOmniMediaDataUri(data: string): string {
+	const base64 = data.startsWith("data:") ? data.slice(data.indexOf(",") + 1) : data;
+	return `data:;base64,${base64}`;
+}
+
+function qwenOmniChatMessages(messages: OAIMessage[]): OAIMessage[] {
+	return messages.map((message) => {
+		if (!Array.isArray(message.content)) return message;
+		return {
+			...message,
+			content: message.content.map((part): OAIContentPart => {
+				if (part.type === "input_audio")
+					return {
+						...part,
+						input_audio: { ...part.input_audio, data: qwenOmniMediaDataUri(part.input_audio.data) },
+					};
+				if (part.type === "video_url")
+					return {
+						...part,
+						video_url: { ...part.video_url, url: qwenOmniMediaDataUri(part.video_url.url) },
+					};
+				return part;
+			}),
+		};
+	});
+}
+/** Keep each label and optional tool-call source adjacent to its media bytes. */
+function nativeMediaParts(
+	media: NativeMediaInput,
+	part: OAIContentPart,
+	textType: "text" | "input_text",
+	toolCallId?: string,
+): OAIContentPart[] {
+	const filename =
+		typeof media.filename === "string" && media.filename.length ? media.filename : undefined;
+	if (!filename && !toolCallId) return [part];
+	const metadata = {
+		...(filename ? { filename } : {}),
+		type: media.type,
+		mediaType: media.mediaType,
+		...(toolCallId ? { toolCallId } : {}),
+	};
+	return [
+		{
+			type: textType,
+			text:
+				`Native media attachment metadata: ${JSON.stringify(metadata)}\n` +
+				`The following ${media.type} content is included directly in this message. The filename is an attachment label, not a device file path. Use this attachment for this message; do not substitute a file path from earlier conversation history.`,
+		},
+		part,
+	];
+}
+
+function chatNativeMediaParts(media: NativeMediaInput, toolCallId?: string): OAIContentPart[] {
+	return nativeMediaParts(media, chatNativeMedia(media), "text", toolCallId);
+}
+
+function responsesNativeMediaParts(media: NativeMediaInput, toolCallId?: string): OAIContentPart[] {
+	return nativeMediaParts(media, responsesVideoMedia(media), "input_text", toolCallId);
+}
+
 function buildOAIUserMessage(
 	content: string,
 	images?: Array<{ format: string; base64: string }>,
+	media?: NativeMediaInput[],
+	nativeMediaParts: (media: NativeMediaInput) => OAIContentPart[] = chatNativeMediaParts,
 ): OAIMessage | null {
 	const hasText = !!content && content !== ".";
 	const hasImages = !!images?.length;
-	if (!hasText && !hasImages) return null;
+	if (!hasText && !hasImages && !media?.length) return null;
 
-	if (hasImages) {
-		const parts = orderUserContent(hasText ? content : "[user sent image(s)]", images, "after").map(
+	if (hasImages || media?.length) {
+		const parts = orderUserContent(
+			hasText ? content : hasImages ? "[user sent image(s)]" : "",
+			images ?? [],
+			"after",
+		).map(
 			(part): OAIContentPart =>
 				part.type === "text"
 					? { type: "text", text: part.text }
@@ -3509,6 +3744,7 @@ function buildOAIUserMessage(
 							image_url: { url: `data:image/${part.image.format};base64,${part.image.base64}` },
 						},
 		);
+		parts.push(...(media ?? []).flatMap((item) => nativeMediaParts(item)));
 		return { role: "user", content: parts };
 	}
 
@@ -3519,34 +3755,58 @@ function buildResponsesToolResultMessage(
 	toolUseId: string,
 	output: string,
 	images?: ResponsesToolImage[],
+	media?: readonly NativeMediaInput[],
 ): ResponsesFunctionCallOutputMessage {
 	return {
 		type: "function_call_output",
 		call_id: toolUseId,
 		output,
 		...(images?.length ? { _images: images } : {}),
+		...(media?.length ? { _nativeMedia: media } : {}),
 	};
 }
 
-function expandResponsesToolResultMessage(
-	message: ResponsesFunctionCallOutputMessage,
-): OAIMessage[] {
-	const items: OAIMessage[] = [
-		{
+function expandResponsesToolResults(messages: ResponsesFunctionCallOutputMessage[]): OAIMessage[] {
+	const output = (message: ResponsesFunctionCallOutputMessage) =>
+		({
 			type: "function_call_output",
 			call_id: message.call_id,
 			output: message.output,
-		} as unknown as OAIMessage,
-	];
-	if (message._images?.length) {
-		items.push({
-			role: "user",
-			content: message._images.map((img) => ({
-				type: "input_image",
-				image_url: `data:image/${img.format};base64,${img.base64}`,
-			})),
-		} as unknown as OAIMessage);
-	}
+		}) as unknown as OAIMessage;
+	const images = (message: ResponsesFunctionCallOutputMessage, attributed = false): OAIMessage[] =>
+		message._images?.length
+			? [
+					{
+						role: "user",
+						content: message._images.flatMap((img) => [
+							...(attributed
+								? [
+										{
+											type: "input_text",
+											text: `Tool result image source: ${JSON.stringify({ toolCallId: message.call_id })}`,
+										},
+									]
+								: []),
+							{
+								type: "input_image",
+								image_url: `data:image/${img.format};base64,${img.base64}`,
+							},
+						]),
+					} as unknown as OAIMessage,
+				]
+			: [];
+	if (!messages.some((message) => message._nativeMedia?.length))
+		return messages.flatMap((message) => [output(message), ...images(message)]);
+
+	// Native media follows all parallel outputs; retain image provenance when separated.
+	const items = messages.map(output);
+	for (const message of messages) items.push(...images(message, messages.length > 1));
+	const content = messages.flatMap((message) =>
+		(message._nativeMedia ?? []).flatMap((media) =>
+			responsesNativeMediaParts(media, message.call_id),
+		),
+	);
+	if (content.length) items.push({ role: "user", content });
 	return items;
 }
 /** Legacy unmarked text may be a summary, even on DeepSeek; never infer native bytes. */
@@ -3649,22 +3909,30 @@ function responsesWireHistory(
 					history.push(additionalToolsItem(item.toolChange as ToolLoadingChange));
 				// Runtime context stays a user item: developer items would be hoisted into
 				// `instructions`, which can leave the input empty and changes the prefix.
-				const content = orderUserContent(item.text, item.images, "before").map((part) =>
-					part.type === "text"
-						? { type: "input_text", text: part.text }
-						: { type: "input_image", image_url: dataUrl(part.image) },
+				const content: OAIContentPart[] = orderUserContent(item.text, item.images, "before").map(
+					(part) =>
+						part.type === "text"
+							? { type: "input_text", text: part.text }
+							: { type: "input_image", image_url: dataUrl(part.image) },
 				);
+				content.push(...(item.media ?? []).flatMap((media) => responsesNativeMediaParts(media)));
 				if (content.length) history.push({ role: "user", content } as unknown as OAIMessage);
 			}
 			continue;
 		}
 		if (turn.kind === "tool_results") {
-			for (const result of turn.results)
-				history.push(
-					...expandResponsesToolResultMessage(
-						buildResponsesToolResultMessage(result.wireId, result.text, result.images),
+			history.push(
+				...expandResponsesToolResults(
+					turn.results.map((result) =>
+						buildResponsesToolResultMessage(
+							result.wireId,
+							result.text,
+							result.images,
+							result.media,
+						),
 					),
-				);
+				),
+			);
 			continue;
 		}
 		const texts: string[] = [];
@@ -3808,6 +4076,7 @@ function completionsWireHistory(
 				const message = buildOAIUserMessage(
 					item.text,
 					item.images.flatMap((image) => (image ? [image] : [])),
+					item.media ? [...item.media] : undefined,
 				);
 				if (message) history.push(message);
 			}
@@ -3816,6 +4085,11 @@ function completionsWireHistory(
 		if (turn.kind === "tool_results") {
 			for (const result of turn.results)
 				history.push({ role: "tool", tool_call_id: result.wireId, content: result.text });
+			// All parallel calls must be answered before a media user turn.
+			const media = turn.results.flatMap((result) =>
+				(result.media ?? []).flatMap((item) => chatNativeMediaParts(item, result.wireId)),
+			);
+			if (media.length) history.push({ role: "user", content: media });
 			continue;
 		}
 		const searches = turn.items.filter((item) => item.kind === "web_search");

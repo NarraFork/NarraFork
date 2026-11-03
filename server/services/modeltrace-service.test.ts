@@ -61,6 +61,14 @@ mock.module("@server/db", () => ({
 	},
 }));
 mock.module("./narrator-service", () => ({ narratorService: { forkNarrator: fork } }));
+// 舱的存取（建/复用、清历史、按模型查找）单独成模块，这里只关心探测流程：
+// 用固定 id 的桩替换，断言「同一个模型复用舱、先清历史再跑」在本套件里可见。
+const ensureTrace = mock(async (..._args: unknown[]) => "probe");
+const clearTrace = mock(async (..._args: unknown[]) => {});
+mock.module("./modeltrace-store", () => ({
+	ensureTraceNarrator: ensureTrace,
+	clearTraceHistory: clearTrace,
+}));
 mock.module("./narrator-persistence", () => ({
 	narratorPersistence: {
 		persistUserMessage: persistUser,
@@ -134,6 +142,8 @@ beforeEach(() => {
 		updateSet,
 		updateWhere,
 		fork,
+		ensureTrace,
+		clearTrace,
 		persistUser,
 		persistAssistant,
 		process,
@@ -267,7 +277,7 @@ describe("ModelTrace independent single-request probe", () => {
 		events = [{ text: JSON.stringify(Array(300).fill(17)) }];
 		expect(await retryModelTrace("probe", "retry-operator")).toEqual({ id: "probe" });
 		await woke.promise;
-		expect(fork).toHaveBeenCalledTimes(1);
+		expect(ensureTrace).toHaveBeenCalledTimes(1);
 		expect(chat).toHaveBeenCalledTimes(2);
 		expect(received?.content).toBe(`${source.content}\n\n${buildModelTracePrompt()}`);
 		expect(status).toHaveBeenNthCalledWith(3, "probe", "working", {
@@ -295,8 +305,16 @@ describe("ModelTrace independent single-request probe", () => {
 		const snapshot = getModelTraceRequest("parent");
 		if (snapshot) delete (snapshot as Partial<typeof snapshot>).provider;
 		await expect(startModelTrace("parent", "operator")).rejects.toThrow("源会话");
-		expect(fork).not.toHaveBeenCalled();
+		expect(ensureTrace).not.toHaveBeenCalled();
 		expect(startRequest).not.toHaveBeenCalled();
+	});
+
+	test("a busy cabin is claimed before its history can be cleared", async () => {
+		claimed = true;
+		await expect(startModelTrace("parent", "operator")).rejects.toThrow("active execution");
+		expect(ensureTrace).toHaveBeenCalledTimes(1);
+		expect(clearTrace).not.toHaveBeenCalled();
+		expect(chat).not.toHaveBeenCalled();
 	});
 
 	test("rejects busy retries without another launch or fork", async () => {
@@ -306,7 +324,7 @@ describe("ModelTrace independent single-request probe", () => {
 		claimed = true;
 		await expect(retryModelTrace("probe", "operator")).rejects.toThrow("active execution");
 		claimed = false;
-		expect(fork).toHaveBeenCalledTimes(1);
+		expect(ensureTrace).toHaveBeenCalledTimes(1);
 		expect(chat).toHaveBeenCalledTimes(1);
 		expect(startRequest).toHaveBeenCalledTimes(1);
 	});
@@ -378,14 +396,15 @@ describe("ModelTrace independent single-request probe", () => {
 
 	test("forks at the latest ref, reuses frozen upstream request and saves one raw answer plus local reports", async () => {
 		expect(await complete()).toEqual({ id: "probe" });
-		expect(fork).toHaveBeenCalledWith("parent", null, {
-			title: "ModelTrace",
-			inheritMode: "full",
-			specCarryover: "clear",
-			forkMessageId: "latest-parent-message",
+		expect(ensureTrace).toHaveBeenCalledWith({
+			parentId: "parent",
+			provider: "frozen-provider",
+			title: "ModelTrace: gpt-5.4",
+			model: "gpt-5.4",
 			userId: "operator",
 			locale: "en",
 		});
+		expect(clearTrace).toHaveBeenCalledWith("probe");
 		expect(chat).toHaveBeenCalledTimes(1);
 		expect(received?.content).toBe(`${source.content}\n\n${buildModelTracePrompt()}`);
 		for (const field of ["history", "tools", "toolResults", "images"] as const) {
@@ -425,10 +444,8 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(reportedResult().type).toBe("modeltrace_result");
 		expect(reportedResult().results).toHaveLength(5);
 		expect(reportedResult().error).toBeUndefined();
-		expect(updateSet).toHaveBeenCalledWith({
-			traits: ["standalone", "modeltrace"],
-			parentNarratorId: "parent",
-		});
+		// traits / parentNarratorId / hidden 与绑定键由 modeltrace-store 在创建舱时写入，
+		// 本套件只校验服务把「同一个模型复用同一个舱」这件事交给它，并在跑之前清历史。
 		expect(broadcast).toHaveBeenCalledTimes(1);
 		expect(claim).toHaveBeenCalledWith("probe", "run");
 		expect(status.mock.calls.map((call) => call.slice(0, 2))).toEqual([
@@ -457,7 +474,7 @@ describe("ModelTrace independent single-request probe", () => {
 	test("requires a previous request and does not create an empty fork", async () => {
 		forgetModelTraceRequest("parent");
 		await expect(startModelTrace("parent", "operator")).rejects.toThrow("先发送一条消息");
-		expect(fork).not.toHaveBeenCalled();
+		expect(ensureTrace).not.toHaveBeenCalled();
 		expect(chat).not.toHaveBeenCalled();
 	});
 

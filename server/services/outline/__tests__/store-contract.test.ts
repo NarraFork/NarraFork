@@ -15,6 +15,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 	outlineSpaces,
+	outlineTaskClaims,
 	projects,
 	users,
 } from "../../../db/schema";
@@ -24,6 +25,7 @@ import { MAIN_THREAD_PAGE_ROWS } from "../store/sqlite-read";
 import { sqliteOutlineStore } from "../store/sqlite-store";
 import { OUTLINE_STORE_CONTRACT, type OutlineContractContext } from "./contract";
 import { OUTLINE_READ_CONTRACT } from "./read-contract";
+import { OUTLINE_TASK_CONTRACT } from "./task-contract";
 
 const NOW = "2026-10-26T00:00:00.000Z";
 
@@ -46,10 +48,27 @@ const ctx: OutlineContractContext = {
 		await db.insert(projects).values({ id, name: `outline-${id}`, createdAt: NOW, updatedAt: NOW });
 		return id;
 	},
-	async seedNarrator() {
+	async seedNarrator(related) {
 		const id = generateId();
-		await db.insert(narrators).values({ id, title: "outline", createdAt: NOW, updatedAt: NOW });
+		await db.insert(narrators).values({
+			id,
+			title: "outline",
+			createdAt: NOW,
+			updatedAt: NOW,
+			...(related && "forkOf" in related
+				? { parentNarratorId: related.forkOf }
+				: related
+					? {
+							type: "subagent" as const,
+							parentNarratorId: related.parentId,
+							aclRootNarratorId: related.rootId,
+						}
+					: {}),
+		});
 		return id;
+	},
+	async archiveNarrator(narratorId) {
+		await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, narratorId));
 	},
 	async dump(spaceId) {
 		const space = await sqliteOutlineStore.getSpace(spaceId);
@@ -75,7 +94,23 @@ const ctx: OutlineContractContext = {
 				.from(outlineCommits)
 				.where(eq(outlineCommits.spaceId, spaceId))
 				.orderBy(outlineCommits.seq),
+			claims: await sqliteOutlineStore.getTaskClaims(blocks.map((b) => b.id)),
 		};
+	},
+	async resetInProcess(spaceId) {
+		await db
+			.update(outlineSpaces)
+			.set({ inProcessReady: false })
+			.where(eq(outlineSpaces.id, spaceId));
+		await db
+			.update(outlineBlocks)
+			.set({ inProcess: false })
+			.where(eq(outlineBlocks.spaceId, spaceId));
+	},
+	async forgetClaims(taskBlockIds) {
+		await db
+			.delete(outlineTaskClaims)
+			.where(inArray(outlineTaskClaims.taskBlockId, [...taskBlockIds]));
 	},
 	async searchContent(needle) {
 		const rows = sqlite
@@ -91,6 +126,12 @@ const ctx: OutlineContractContext = {
 
 describe("outline store contract (SQLite)", () => {
 	for (const contractCase of OUTLINE_STORE_CONTRACT) {
+		test(contractCase.name, () => contractCase.run(ctx), 120_000);
+	}
+});
+
+describe("outline task contract (SQLite)", () => {
+	for (const contractCase of OUTLINE_TASK_CONTRACT) {
 		test(contractCase.name, () => contractCase.run(ctx), 120_000);
 	}
 });
@@ -125,6 +166,59 @@ describe("SQLite specifics", () => {
 		expect(
 			plan("SELECT id FROM outline_links WHERE from_block_id IN ('a', 'b') AND to_seq IS NULL"),
 		).toContain("idx_outline_links_from");
+	});
+
+	test("task claims, open tasks and the in-process rebuild use their indexes", () => {
+		const plan = (query: string) =>
+			(sqlite.prepare(`EXPLAIN QUERY PLAN ${query}`).all() as Array<{ detail: string }>)
+				.map((r) => r.detail)
+				.join("\n");
+		// The store's statements, as drizzle renders them.
+		expect(
+			plan(
+				`SELECT "id" FROM "outline_blocks" WHERE ("outline_blocks"."space_id" = 's' AND json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0) LIMIT 5`,
+			),
+		).toContain("idx_outline_blocks_open_tasks");
+		expect(
+			plan(
+				`SELECT c.task_block_id FROM outline_task_claims c JOIN outline_blocks b ON b.id = c.task_block_id WHERE (c.holder_narrator_id = 'n' AND c.holder_narrator_id IS NOT NULL) ORDER BY c.claimed_at LIMIT 5`,
+			),
+		).toContain("idx_outline_task_claims_holder");
+		expect(
+			plan(
+				`SELECT c.task_block_id FROM outline_task_claims c JOIN outline_blocks b ON b.id = c.task_block_id WHERE (c.expires_at IS NOT NULL AND c.expires_at <= 'x' AND c.holder_narrator_id IS NOT NULL) ORDER BY c.expires_at, c.task_block_id LIMIT 5`,
+			),
+		).toContain("idx_outline_task_claims_expiry");
+		expect(
+			plan(
+				`SELECT id FROM outline_spaces WHERE ("in_process_ready" = 0 AND id > 'a') ORDER BY id LIMIT 5`,
+			),
+		).toContain("idx_outline_spaces_in_process_pending");
+		expect(
+			plan(
+				`SELECT "id", "space_id" FROM "outline_blocks" WHERE (json_extract("task_json", '$.status') = 'doing' AND "deleted" = 0 AND "outline_blocks"."id" > 'a') ORDER BY "outline_blocks"."id" ASC LIMIT 5`,
+			),
+		).toContain("idx_outline_blocks_doing_tasks");
+		expect(
+			plan(`SELECT id, type, acl_root_narrator_id FROM narrators WHERE id IN ('a', 'b')`),
+		).toMatch(/PRIMARY KEY|sqlite_autoindex_narrators/);
+		// A session's subagents' claims (archived or deleted): the narrators' root index, then
+		// the holder index, never a scan of either table.
+		const subagents = plan(
+			`SELECT c.task_block_id FROM outline_task_claims c JOIN outline_blocks b ON b.id = c.task_block_id WHERE (c.holder_narrator_id IN (SELECT "id" FROM "narrators" WHERE ("narrators"."acl_root_narrator_id" = 'r' AND "narrators"."type" = 'subagent')) AND c.holder_narrator_id IS NOT NULL) ORDER BY c.claimed_at, c.task_block_id LIMIT 5`,
+		);
+		expect(subagents).toContain("idx_outline_task_claims_holder");
+		expect(subagents).toContain("idx_narrators_acl_root");
+		expect(subagents).not.toMatch(/SCAN (c|narrators|outline_task_claims)\b/);
+		// The lease job's sweep of claim holders: the holder index, in its order, no sort.
+		const holders = plan(
+			`SELECT DISTINCT "holder_narrator_id" FROM "outline_task_claims" WHERE ("outline_task_claims"."holder_narrator_id" IS NOT NULL AND "outline_task_claims"."holder_narrator_id" > 'a') ORDER BY "outline_task_claims"."holder_narrator_id" ASC LIMIT 5`,
+		);
+		expect(holders).toContain("idx_outline_task_claims_holder");
+		expect(holders).not.toContain("TEMP B-TREE");
+		expect(
+			plan(`SELECT id, type, acl_root_narrator_id, status FROM narrators WHERE id IN ('a', 'b')`),
+		).toMatch(/PRIMARY KEY|sqlite_autoindex_narrators/);
 	});
 
 	test("a page past the main-thread size is read on the workers, truncation exact", async () => {

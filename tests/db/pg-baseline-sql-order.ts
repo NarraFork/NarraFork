@@ -722,8 +722,70 @@ function reviewedProcedural(tokens: readonly Token[], sql: string): boolean {
 	return cursor.keyword("create") && cursor.keyword(verb);
 }
 
+// 0047 contains conditional DDL, unlike the layout-neutral procedural allow-list above.
+// Pin each entire DO statement, then model its effect in the fresh-journal baseline only.
+function reviewedNativeMedia(
+	tokens: readonly Token[],
+	order: Map<string, string[]>,
+	sql: string,
+): boolean {
+	if (
+		tokens.length !== 2 ||
+		tokens[0].kind !== "word" ||
+		tokens[0].value !== "do" ||
+		tokens[1].kind !== "literal"
+	)
+		return false;
+	const digest = new Bun.CryptoHasher("sha256").update(statementText(tokens, sql)).digest("hex");
+	if (digest === "36a3c3e0d2507d106d39d5a8b5b2764b3b070a9ee0322636e09b285f7dc43748") {
+		// The successful branch appends the column if absent; otherwise its position survives.
+		alterTable(
+			new Cursor(lex('"narrator_buffered_messages" ADD COLUMN IF NOT EXISTS "media_json" text')),
+			order,
+		);
+		return true;
+	}
+	if (digest === "98f2d53888afee6f78e3bcde908a989422596be1b733ec98aba7a121d1a4720a") {
+		// In a fresh ordered journal, 0046 already ran, so the compensation branch is not
+		// entered. Require its layout effects to exist instead of silently ignoring them.
+		for (const [table, required] of [
+			[
+				"outline_task_claims",
+				[
+					"task_block_id",
+					"holder_narrator_id",
+					"holder_user_id",
+					"epoch",
+					"task_version_at_claim",
+					"claimed_at",
+					"expires_at",
+					"last_holder_narrator_id",
+					"last_holder_user_id",
+				],
+			],
+			["outline_blocks", ["in_process"]],
+			["outline_spaces", ["in_process_ready", "in_process_epoch"]],
+		] as const) {
+			const list = columns(order, table);
+			for (const name of required)
+				if (!list.includes(name))
+					throw new Error(`0047 compensation baseline missing ${table}.${name}`);
+		}
+		return true;
+	}
+	if (digest === "414813a7b4bed0c6f7e194c10befc5738a540dc5aa03860bb05417100eb5863d") {
+		// On the fresh baseline upstream 0047 has already supplied these columns.
+		const list = columns(order, "narrators");
+		for (const name of ["hidden_from_lists", "modeltrace_key"])
+			if (!list.includes(name))
+				throw new Error(`0048 compensation baseline missing narrators.${name}`);
+		return true;
+	}
+	return false;
+}
+
 function replay(tokens: readonly Token[], order: Map<string, string[]>, sql = ""): void {
-	if (sql && reviewedProcedural(tokens, sql)) return;
+	if (sql && (reviewedProcedural(tokens, sql) || reviewedNativeMedia(tokens, order, sql))) return;
 	const cursor = new Cursor(tokens);
 	if (cursor.keyword("create")) {
 		if (cursor.keyword("table")) {

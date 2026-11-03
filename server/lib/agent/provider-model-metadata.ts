@@ -6,6 +6,7 @@ import {
 	type ReasoningEffort,
 } from "@shared/reasoning-effort";
 import { getEffectiveModelCard, getEffectiveModelProfile } from "../model-catalog";
+import { visitNativeMedia } from "./native-media";
 
 export function effectiveModelProfile(model: string): ModelProfile {
 	return getEffectiveModelProfile(model);
@@ -127,6 +128,15 @@ export function resolveMetadataReasoning(
 				? reasoning.defaultLevel
 				: levels?.[0];
 	if (!effort) return undefined;
+	// An explicitly declared empty tier list is a positive claim — "this model has no
+	// selectable thinking intensity" — not missing information. Gateway-discovered
+	// metadata reports exactly this (`effortLevels: []`), and the upstream then rejects
+	// any named tier with `reasoning effort "xhigh" is not supported by model metadata`.
+	// Returning undefined drops the effort from the request instead. An explicit "none"
+	// already returned above, so "turn thinking off" keeps working. `Array.isArray`
+	// keeps the three states apart: [] = no tiers, null = declared unknown, absent =
+	// never declared (both of the latter keep the caller's tier).
+	if (Array.isArray(reasoning?.levels) && reasoning.levels.length === 0) return undefined;
 	if (levels?.length && !levels.includes(effort)) {
 		const known = levels.filter((level): level is ReasoningEffort =>
 			REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
@@ -150,7 +160,7 @@ export function resolveMetadataReasoning(
 	return effort;
 }
 
-/** Validate only actual image inputs, never image-generation outputs or tool schemas. */
+/** Validate actual image/audio/video inputs, never generated output metadata or tool schemas. */
 export function assertModelInputModalities(
 	model: string,
 	values: unknown,
@@ -158,6 +168,12 @@ export function assertModelInputModalities(
 ): void {
 	const inputs = profile.inputModalities;
 	if (!Array.isArray(inputs)) return;
+	visitNativeMedia(values, (_value, modality) => {
+		if (!inputs.includes(modality))
+			throw new Error(
+				`Model ${model} does not support ${modality} input according to its effective metadata.`,
+			);
+	});
 	const visit = (value: unknown): void => {
 		if (!value || typeof value !== "object") return;
 		if (Array.isArray(value)) {

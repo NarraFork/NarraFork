@@ -61,6 +61,8 @@ export interface SideCarTaskEntry {
 	role: "doing" | "next" | "todo" | "blocked";
 	text: string;
 	protected?: boolean;
+	/** The task's address in its backend, when it has one (outline: `key/sid`). */
+	ref?: string;
 }
 
 /** One knowledge-base entry the injection surfaced. */
@@ -190,6 +192,13 @@ export type SideCarBody =
 	| {
 			kind: "tasks";
 			variant: "current" | "emptyNever" | "emptyDone" | "tooMany";
+			/**
+			 * Where the tasks live, when not Dynamic Spec: an outline session's interrupt note (and
+			 * the periodic digest outline sessions had before their built-in views, outline plan
+			 * PR 4) is headed in outline words for the reader. Its model text was written with the
+			 * row; no model template renders it. Absent on every spec digest.
+			 */
+			taskBackend?: "outline";
 			tasks?: SideCarTaskEntry[];
 			/** `tooMany` only: how many tasks tripped the threshold. */
 			taskCount?: number;
@@ -355,6 +364,11 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	tasksEmptyNever: "Dynamic Spec — no tasks created yet",
 	tasksEmptyDone: "Dynamic Spec — all tasks done, time to reorganize",
 	tasksTooMany: "Dynamic Spec — {n} tasks, over the reorganize threshold",
+	// Outline task digests (`taskBackend: "outline"`).
+	outlineTasksCurrent: "Outline tasks — {n} open",
+	outlineTasksEmptyNever: "Outline tasks — none written yet",
+	outlineTasksEmptyDone: "Outline tasks — none open",
+	outlineTaskHumanCreated: "set by a person",
 	taskRoleDoing: "doing",
 	taskRoleNext: "next",
 	taskRoleTodo: "todo",
@@ -551,14 +565,18 @@ function projectSideCarBody(
 
 		case "tasks": {
 			const tasks = body.tasks ?? [];
+			const outline = body.taskBackend === "outline";
 			const headline =
 				body.variant === "current"
-					? labelWith(labels, "tasksCurrent", { n: tasks.length })
+					? labelWith(labels, outline ? "outlineTasksCurrent" : "tasksCurrent", {
+							n: tasks.length,
+						})
 					: body.variant === "emptyNever"
-						? label(labels, "tasksEmptyNever")
+						? label(labels, outline ? "outlineTasksEmptyNever" : "tasksEmptyNever")
 						: body.variant === "emptyDone"
-							? label(labels, "tasksEmptyDone")
+							? label(labels, outline ? "outlineTasksEmptyDone" : "tasksEmptyDone")
 							: labelWith(labels, "tasksTooMany", { n: body.taskCount ?? 0 });
+			const protectedLabel = label(labels, outline ? "outlineTaskHumanCreated" : "taskProtected");
 			// Only the tasks are projected. The digest's other half — "keep tasks.json to
 			// only text/status/protected", "do not add IDs" — is instruction aimed at the
 			// model; showing it to the reader is the noise this redesign removes.
@@ -570,7 +588,7 @@ function projectSideCarBody(
 			const lines: SideCarLine[] = tasks.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((task) => ({
 				kind: "bullet" as const,
 				text: `${label(labels, taskRoleKey(task.role))}: ${task.text}${
-					task.protected ? ` · ${label(labels, "taskProtected")}` : ""
+					task.protected ? ` · ${protectedLabel}` : ""
 				}`,
 			}));
 			return { headline, lines };
