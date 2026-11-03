@@ -259,6 +259,7 @@ export const narrators = pgTable(
 		behaviorFenceAttachOverride: text("behavior_fence_attach_override")
 			.notNull()
 			.default("inherit"),
+		taskBackend: text("task_backend").notNull().default("spec"),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: doublePrecision("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
@@ -4112,7 +4113,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 134,
-  "columnCount": 1760,
+  "columnCount": 1761,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5499,6 +5500,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"inherit\"",
           "defaultExpression": "\"inherit\""
+        },
+        {
+          "property": "taskBackend",
+          "name": "task_backend",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"spec\"",
+          "defaultExpression": "\"spec\""
         },
         {
           "property": "messageCount",

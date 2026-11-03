@@ -22,6 +22,7 @@ import { generateId } from "../lib/id";
 import { resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import { sendMessage } from "../services/narrator-session";
+import { defaultTaskBackendForNewSession } from "../services/task-source";
 
 export const gatewayRoutes = new Hono();
 
@@ -160,6 +161,8 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			isAskInPassing: false,
 			variant: "primary",
 			traits: ["standalone"],
+			// A new root session like any other: the outline's while it is switched on.
+			taskBackend: defaultTaskBackendForNewSession(),
 			messageVersion: 0,
 			// Access control: same reasoning as the IM gateway — the auto-resolved
 			// deployment user owns it, and the session stays readable to the team because

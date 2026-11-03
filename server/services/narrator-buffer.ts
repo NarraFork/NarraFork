@@ -1301,6 +1301,32 @@ export async function releaseBufferedMessage(
 	if (port) await port.mailbox.failClaim(claim, error);
 	else store.failClaim(claim, error);
 }
+/**
+ * Drop a claimed queued message the consumer refuses to deliver, without materializing it: the
+ * row is cancelled through its exact claim (no other owner's claim is touched, nothing is
+ * requeued) and its staged text files go with it. A message that is not claimed is not dropped:
+ * the caller claims the exact row first, so what it drops is what it read. Returns whether a row
+ * was dropped.
+ */
+export async function dropBufferedMessage(
+	narratorId: string,
+	msg: BufferedMessage,
+	reason: string,
+): Promise<boolean> {
+	const claim = msg._mailboxClaim;
+	if (!claim || claim.narratorId !== narratorId) return false;
+	const stagingId = msg._stagingId ?? msg.id;
+	const port = pgQueue();
+	if (port) {
+		if (!(await port.mailbox.cancelClaim(claim, reason))) return false;
+		await cleanupStagingPg(port, stagingId);
+		return true;
+	}
+	if (!store.cancelClaim(claim, reason)) return false;
+	cleanupBufferedTextFiles(stagingId);
+	return true;
+}
+
 export async function restoreBufferedMessage(
 	narratorId: string,
 	msg: BufferedMessage,

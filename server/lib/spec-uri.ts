@@ -78,6 +78,38 @@ export function assertToolSpecPaths(toolName: string, input: Record<string, unkn
 	if (toolName === "Glob") assertSpecPath(input.pattern);
 }
 
+/**
+ * Whether a tool call names a `spec://` path in a path field, the fields `assertToolSpecPaths`
+ * checks: a call that would read or write Dynamic Spec (or be refused for trying).
+ */
+export function toolNamesSpecPath(toolName: string, input: Record<string, unknown>): boolean {
+	const paths: unknown[] = [];
+	if (SPEC_FILE_TOOLS.has(toolName) || toolName === "StructView" || toolName === "StructSed") {
+		paths.push(input.file_path);
+	}
+	if (toolName === "Grep" || toolName === "Glob") paths.push(input.path);
+	if (toolName === "Glob") paths.push(input.pattern);
+	return paths.some(isSpecUri);
+}
+
+/**
+ * Whether a tool call reads or writes exactly `spec://behavior_fence` with `Read`, `Write` or
+ * `Edit`: the one `spec://` route an outline session keeps until its behavior-fence page exists
+ * (outline P2, plan PR 4). Writing it still needs the user-turn grant, as in a spec session.
+ */
+export function isBehaviorFenceToolRoute(
+	toolName: string,
+	input: Record<string, unknown>,
+): boolean {
+	if (toolName !== "Read" && toolName !== "Write" && toolName !== "Edit") return false;
+	if (!isSpecUri(input.file_path)) return false;
+	try {
+		return normalizeSpecPath(input.file_path) === "behavior_fence";
+	} catch {
+		return false;
+	}
+}
+
 export function toolSpecPathError(
 	toolName: string,
 	input: Record<string, unknown>,

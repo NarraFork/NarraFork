@@ -166,6 +166,52 @@ export async function readJudgedNarrator(
 	return await readNarrator(row.aclRootNarratorId);
 }
 
+/** Where a narrator's tasks live, as its session decides it (`services/task-source`). */
+export interface NarratorTaskBackendRow {
+	/**
+	 * `narrators.task_backend` of the session: a subagent's root's (D31), anyone else's own. A
+	 * subagent whose root is not recorded or gone keeps the value it was created with.
+	 */
+	backend: string;
+	subagent: boolean;
+	/** The session: the narrator itself, or a subagent's root; null when that root is not known. */
+	sessionNarratorId: string | null;
+	/** The owner of that session. */
+	sessionOwnerUserId: string | null;
+}
+
+/**
+ * The task backend of a narrator's session: one statement, the narrator and (for a subagent) its
+ * root by primary key. Read on every turn by the task source, so it stays this small.
+ */
+export async function readNarratorTaskBackend(id: string): Promise<NarratorTaskBackendRow | null> {
+	const rows = await all(sql`
+		select n.id, n.type, n.task_backend, n.owner_user_id, r.id as root_id,
+			r.task_backend as root_task_backend, r.owner_user_id as root_owner_user_id
+		from narrators n
+		left join narrators r on n.type = 'subagent' and r.id = n.acl_root_narrator_id
+		where n.id = ${id} limit 1
+	`);
+	const row = rows[0];
+	if (!row) return null;
+	const subagent = text(row, "type") === "subagent";
+	const rootId = textOrNull(row, "root_id");
+	if (!subagent) {
+		return {
+			backend: text(row, "task_backend"),
+			subagent,
+			sessionNarratorId: text(row, "id"),
+			sessionOwnerUserId: textOrNull(row, "owner_user_id"),
+		};
+	}
+	return {
+		backend: rootId ? text(row, "root_task_backend") : text(row, "task_backend"),
+		subagent,
+		sessionNarratorId: rootId,
+		sessionOwnerUserId: rootId ? textOrNull(row, "root_owner_user_id") : null,
+	};
+}
+
 export async function readProject(id: string): Promise<ProjectAccessRow | null> {
 	const rows = await all(sql`
 		select id, owner_user_id, visibility from projects where id = ${id} limit 1

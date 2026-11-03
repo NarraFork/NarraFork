@@ -154,6 +154,8 @@ import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeUploadDirectoryWithoutMedia } from "./storage-service";
+import { defaultTaskBackendForNewSession } from "./task-source";
+import { readTaskBackend } from "./task-source/backend";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 import {
 	assertWorkspaceAdmission,
@@ -403,6 +405,11 @@ export interface CreateNarratorInput {
 	 * to effective visibility; auto uses the widest legal audience for that visibility.
 	 */
 	writeAudience?: "owner" | "project" | "public";
+	/**
+	 * Where the session's tasks live. Omitted: `outline` while the outline is switched on,
+	 * `spec` otherwise (`defaultTaskBackendForNewSession`). Not accepted by the public API.
+	 */
+	taskBackend?: "spec" | "outline";
 }
 
 interface CreateSubagentInput {
@@ -1104,6 +1111,9 @@ async function applySpecForkCarryover(
 	carryover: SpecForkCarryover,
 ): Promise<void> {
 	try {
+		// A fork of an outline session keeps its tasks in the outline: there are no spec tasks to
+		// clear or offer a card for (and clearing them would be refused).
+		if ((await readTaskBackend(childNarratorId)) === "outline") return;
 		if (carryover === "clear") {
 			await specVfsService.clearSpecTasks(childNarratorId);
 			return;
@@ -1356,6 +1366,10 @@ async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect
 		isAskInPassing: parent.isAskInPassing,
 		contextProjectId,
 		oauthPolicySnapshotJson: parent.oauthPolicySnapshotJson,
+		// A fork carries on the parent's work, so it keeps the parent's task backend: a spec
+		// session's fork inherits its spec namespace, an outline session's fork stays in the
+		// outline (its session space is not copied yet).
+		taskBackend: parent.taskBackend,
 	};
 }
 
@@ -1482,6 +1496,8 @@ export async function prepareNarratorCreation(
 			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
 			behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
 			behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
+			// A new root session: the outline's when it is switched on (plan §3).
+			taskBackend: input.taskBackend ?? defaultTaskBackendForNewSession(),
 			cwd: input.cwd ?? null,
 			contextProjectId: input.contextProjectId ?? null,
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
@@ -1708,7 +1724,10 @@ export const narratorService = {
 			// restrictions are not copied but followed live through the registered
 			// policy source, so a later tightening of the parent reaches the child.
 			const runtimePolicy =
-				input.runtimePolicy ?? (await compileDelegationCeiling(input.subagentType));
+				input.runtimePolicy ??
+				(await compileDelegationCeiling(input.subagentType, {
+					outlineSession: parent.taskBackend === "outline",
+				}));
 			const subTraits = withRuntimePolicyTrait(["standalone"], runtimePolicy);
 			// The delegator is the policy/model source and the controller; the model pool
 			// the child follows the source within is fixed now, from the template.
@@ -1748,6 +1767,9 @@ export const narratorService = {
 						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
+						// Its session's (D31): the task source reads the root's anyway; the copy keeps
+						// the row from claiming a backend its session does not have.
+						taskBackend: parent.taskBackend,
 						parentNarratorId: input.parentNarratorId,
 						originToolCallId: input.originToolCallId ?? null,
 						subagentOriginKind:

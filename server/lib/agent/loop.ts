@@ -94,6 +94,7 @@ import {
 import {
 	executeTool,
 	freezeToolExecution,
+	getOutlineSpecRejection,
 	getReflectionToolRejection,
 	preAdmitToolExecution,
 	releaseToolAdmissionState,
@@ -2082,8 +2083,15 @@ export async function shouldRunExitPlanModeReflectionLive(
 	});
 }
 
-export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
-	return !config.reflectionLoop;
+/**
+ * taskReflection guards protected tasks in `spec://tasks.json`. It never runs in a reflection
+ * loop, nor in a session whose tasks live in the outline (plan §8 trade-off 3: outline sessions
+ * get no task reflection; their `spec://` is closed anyway).
+ */
+export function shouldRunTaskReflection(
+	config: Pick<AgentConfig, "reflectionLoop" | "taskBackend">,
+): boolean {
+	return !config.reflectionLoop && config.taskBackend !== "outline";
 }
 
 function normalizeEditText(text: string): string {
@@ -2476,6 +2484,13 @@ async function executeToolAfterReflections(
 	if (reflectionRejection) {
 		releaseToolAdmissionState(admissionState);
 		return reflectionRejection;
+	}
+	// Before admission, permission and the reflections: an outline session has no `spec://`,
+	// so neither a permission prompt nor taskReflection may start for one.
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		releaseToolAdmissionState(admissionState);
+		return outlineSpecRejection;
 	}
 	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
 	let preAdmissionComplete = options.preAdmissionComplete === true;

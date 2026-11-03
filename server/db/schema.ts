@@ -407,6 +407,17 @@ export const narrators = sqliteTable(
 		})
 			.notNull()
 			.default("inherit"),
+		/**
+		 * Where the session's tasks live (outline P2, plan §3): `spec` (`spec://tasks.json`) or
+		 * `outline` (checkbox blocks, claims, derived waiting). Set when a root session is created
+		 * (`outline` while `outline.enabled` is on) and kept for its life; existing sessions stay
+		 * `spec` until the import (plan PR 12) moves them. Meaningful on roots only: a subagent
+		 * follows its root's (D31) — it is written with the root's value, and the task source reads
+		 * the root's (`services/task-source`).
+		 */
+		taskBackend: text("task_backend", { enum: ["spec", "outline"] })
+			.notNull()
+			.default("spec"),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),

@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 134 tables and 1760 columns including the outline storage tables", () => {
+	test("covers 134 tables and 1761 columns including the outline storage tables", () => {
 		expect(target.tables.length).toBe(134);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -546,7 +546,8 @@ describe("real schema parity", () => {
 		// Outline tasks (P2) add outline_task_claims (9), outline_blocks.in_process,
 		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
 		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1760);
+		// The outline task source (P2) adds narrators.task_backend.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1761);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({
