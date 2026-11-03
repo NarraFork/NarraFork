@@ -50,12 +50,6 @@ const MESSAGE_TABLE_KEYS = [
 	"tasksEmptyNeverSkip",
 	"tasksEmptyDoneReorganize",
 	"tasksEmptyDoneContinue",
-	"outlineTasksCurrentHeading",
-	"outlineTasksCurrentUpdateNote",
-	"outlineTaskHumanCreatedMark",
-	"outlineTasksEmptyHeading",
-	"outlineTasksEmptyNeverCreate",
-	"outlineTasksEmptyDoneNext",
 	"tasksTooManyHeading",
 	"tasksTooManyReorganize",
 	// knowledge

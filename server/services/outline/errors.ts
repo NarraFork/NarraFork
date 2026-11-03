@@ -31,7 +31,9 @@ export type OutlineWriteErrorCode =
 	/** A caller-chosen block id is already in use. */
 	| "OUTLINE_ID_TAKEN"
 	/** The task is being done by someone else (a live claim); see `OutlineTaskClaimedError`. */
-	| "OUTLINE_TASK_CLAIMED";
+	| "OUTLINE_TASK_CLAIMED"
+	/** An agent wrote a session's behavior page without the user turn's one-shot grant. */
+	| "OUTLINE_BEHAVIOR_PAGE_READONLY";
 
 /** The transaction is invalid as written. `opIndex` is the offending operation, when one is. */
 export class OutlineWriteError extends ValidationError {

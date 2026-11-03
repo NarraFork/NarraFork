@@ -94,7 +94,14 @@ export const OUTLINE_TEXT = {
 		badTime: "not a valid time",
 		tooManySpaces: (max: number, got: number) =>
 			`a search covers at most ${max} spaces (got ${got})`,
+		/** An agent's write to the session's behavior page without the user turn's grant. */
+		behaviorPageReadonly:
+			"the behavior page of this session (alias behavior) holds the user's standing rules: you may write it only as the first tool call of a user turn in which the user asked you to record a rule",
 	},
+	/** Summary of the commit that imports a session's old behavior fence into its page. */
+	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",
+	/** Summary of the commit that copies the behavior page into a fork. */
+	behaviorForkSummary: (from: string) => `copied the behavior page from session ${from}`,
 } as const;
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;

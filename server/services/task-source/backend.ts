@@ -96,14 +96,19 @@ export async function readTaskBackend(narratorId: string): Promise<TaskBackend> 
 
 /**
  * Refuse a Dynamic Spec write for an outline session: it would land where neither the session
- * nor its continuation look. Only `behavior_fence` stays writable: until the behavior-fence page
- * exists (plan PR 4) it is the fence an outline session gets, written by the person (the Spec
- * panel), by plugins (the team SOP), and by the agent itself once per real user turn when the
- * user asks it to record a rule (the same one-shot grant as in a spec session). `path` is the
- * normalized spec path (`tasks.json`, `index.md`, …; empty for the whole namespace).
+ * nor its continuation look. An outline session's behavior boundary is the behavior page of its
+ * session space (outline plan PR 4), so its old `behavior_fence` takes one writer only: the
+ * plugin-SOP channel (`pluginSop`: a plugin's SOP command, or the import that moved the rest of
+ * the fence into the page), until plugins write blocks (plan PR 12). The person (the Spec panel)
+ * and the agent are refused like any other spec write. `path` is the normalized spec path
+ * (`tasks.json`, `index.md`, …; empty for the whole namespace).
  */
-export async function assertSpecWritable(narratorId: string, path: string): Promise<void> {
-	if (path === "behavior_fence") return;
+export async function assertSpecWritable(
+	narratorId: string,
+	path: string,
+	options: { pluginSop?: boolean } = {},
+): Promise<void> {
+	if (path === "behavior_fence" && options.pluginSop === true) return;
 	await assertSpecTasksUsed(narratorId);
 }
 

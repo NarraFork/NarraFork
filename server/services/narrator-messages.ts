@@ -3384,6 +3384,23 @@ const narratorMessageQueriesUnlocked = {
 		return lastCompactRow[0]?.seq ?? null;
 	},
 
+	/**
+	 * When the narrator's latest compact marker was written (its message's `created_at`), or null
+	 * without one: one indexed read on the refs, one primary-key join.
+	 */
+	async getLatestCompactCreatedAt(narratorId: string): Promise<string | null> {
+		const rows = await db
+			.select({ createdAt: narratorMessages.createdAt })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+		return rows[0]?.createdAt ?? null;
+	},
+
 	async getMessagesSinceLastCompact(narratorId: string) {
 		const compactSeq = await this.getLatestCompactSeq(narratorId);
 

@@ -808,8 +808,10 @@ export const sqliteOutlineStore: OutlineStore = {
 		return rows.map((r) => ({ claim: r.claim, block: toMeta(r.block) }));
 	},
 
-	async listOpenTasks(spaceId, limit) {
-		// The predicate is the open-task index's own, word for word, so the index serves it.
+	async listOpenTasks(spaceId, limit, options) {
+		// The predicate is the open-task index's own, word for word, so the index serves it; the
+		// excluded pages are filtered while it is walked, before the limit.
+		const exclude = options?.excludePageIds ?? [];
 		const rows = db
 			.select(metaColumns)
 			.from(outlineBlocks)
@@ -817,6 +819,7 @@ export const sqliteOutlineStore: OutlineStore = {
 				and(
 					eq(outlineBlocks.spaceId, spaceId),
 					sql`json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0`,
+					exclude.length > 0 ? notInArray(outlineBlocks.pageId, [...exclude]) : undefined,
 				),
 			)
 			.limit(limit)
