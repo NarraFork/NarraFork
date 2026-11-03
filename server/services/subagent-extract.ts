@@ -358,6 +358,11 @@ export async function extractSubagentToPrimary(
 		});
 	}
 
+	// An outline session extracted from a subagent gets its root's behavior page (outline plan
+	// PR 4), as a fork does; never rejects.
+	const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
+	await copyOutlineBehaviorPage(sourceId, id);
+
 	// Keep `narrator:forked` so project-db-sync / WS refresh still fire. The DB
 	// parent is null (independence); `parentNarratorId` on the event is the SOURCE
 	// subagent for provenance, and `extracted: true` marks that distinction.

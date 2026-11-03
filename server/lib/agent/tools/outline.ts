@@ -374,6 +374,7 @@ The result gives each edit's outcome and the ids of new blocks. Read a block (Ou
 		}
 		try {
 			const { outlineEdit } = await import("../../../services/outline/agent-edit");
+			const { consumeBehaviorFenceEditGrant } = await import("./behavior-fence-grant");
 			const scope = await openScope(ctx, true);
 			const provenance = await callProvenance(ctx);
 			return toResult(
@@ -383,7 +384,13 @@ The result gives each edit's outcome and the ids of new blocks. Read a block (Ou
 						edits,
 						...(typeof args.message === "string" ? { message: args.message } : {}),
 					},
-					{ ...provenance, signal: ctx.signal },
+					{
+						...provenance,
+						signal: ctx.signal,
+						// The behavior page takes the same one-shot grant the old fence did: the first
+						// tool call of a real user turn, consumed only by a write that touches the page.
+						behaviorGrant: () => consumeBehaviorFenceEditGrant(ctx.narratorId),
+					},
 				),
 			);
 		} catch (error) {

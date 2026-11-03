@@ -44,7 +44,9 @@ export type OutlineWriteErrorCode =
 	/** The page has as many open pending changes as it may hold. */
 	| "OUTLINE_PENDING_FULL"
 	/** A pending change would grow past its limits. */
-	| "OUTLINE_PENDING_TOO_LARGE";
+	| "OUTLINE_PENDING_TOO_LARGE"
+	/** An agent wrote a session's behavior page without the user turn's one-shot grant. */
+	| "OUTLINE_BEHAVIOR_PAGE_READONLY";
 
 /** The transaction is invalid as written. `opIndex` is the offending operation, when one is. */
 export class OutlineWriteError extends ValidationError {

@@ -1,6 +1,6 @@
 import { stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type { PromptPart } from "../../shared/prefix-context";
+import type { ContextPart, PromptPart } from "../../shared/prefix-context";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
@@ -87,6 +87,13 @@ export interface BuildPromptOptions {
 	 * know the session's task backend builds exactly the prompt it always did.
 	 */
 	taskSection?: PromptTaskSection;
+	/**
+	 * Named dynamic parts the session's task source adds (`NarratorTaskSource.contextParts`: an
+	 * outline session's built-in views), appended in order after `runtime`. Absent or empty adds
+	 * nothing, so a spec session's prompt is exactly what it was. A part marked `unreadable` is
+	 * not appended: its key goes to `keepParts`, and the request keeps its previous value.
+	 */
+	contextParts?: readonly ContextPart[];
 }
 
 export interface BuildPromptResult {
@@ -99,6 +106,11 @@ export interface BuildPromptResult {
 	usedCompactSummary: boolean;
 	/** Exact construction offsets, not a heading/text heuristic. */
 	summaryRange?: { start: number; end: number };
+	/**
+	 * Parts that could not be read for this request (`ContextPart.unreadable`): the prefix keeps
+	 * their previous values instead of removing them. Present only when there are some.
+	 */
+	keepParts?: string[];
 }
 
 /**
@@ -363,6 +375,11 @@ export async function buildEffectiveSystemPrompt(
 	if (options.skillsContext !== undefined) appendPart("skills", options.skillsContext);
 	if (options.modelsContext !== undefined) appendPart("models", options.modelsContext);
 	if (options.runtimeHints !== undefined) appendPart("runtime", options.runtimeHints);
+	const keepParts: string[] = [];
+	for (const part of options.contextParts ?? []) {
+		if (part.unreadable) keepParts.push(part.key);
+		else appendPart(part.key, part.text);
+	}
 
 	return {
 		prompt,
@@ -370,5 +387,6 @@ export async function buildEffectiveSystemPrompt(
 		parts,
 		usedCompactSummary,
 		...(summaryRange ? { summaryRange } : {}),
+		...(keepParts.length > 0 ? { keepParts } : {}),
 	};
 }

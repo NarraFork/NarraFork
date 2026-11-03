@@ -148,6 +148,7 @@ import { type OutlineBlockCreation, planBlockBy, sameLocker, taskChangeHeld } fr
 import { OUTLINE_TEXT } from "./messages";
 import {
 	OUTLINE_ACTOR_KINDS,
+	OUTLINE_BEHAVIOR_ALIAS,
 	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
 	OUTLINE_PENDING_LIMITS,
@@ -479,6 +480,21 @@ export interface OutlineWriteOptions {
 	confirm?: { pendingId: string; expectRev: number; decidedBy: OutlineTaskActorRef };
 	/** With `confirm`: the pages whose pending summaries change (the confirmed change's page). */
 	confirmPageIds?: readonly string[];
+	/**
+	 * Record the commit as an `import` (a system path that brings content from elsewhere as one
+	 * commit: an outline session's old behavior fence, outline plan PR 4). Not with `compensating`.
+	 */
+	kind?: "import";
+	/**
+	 * An agent's commit in a session space that writes the session's behavior page (the page
+	 * holding alias {@link OUTLINE_BEHAVIOR_ALIAS}): creating it, writing, moving or deleting
+	 * anything on it, moving blocks onto or off it, or giving or taking the alias. Such a commit
+	 * goes through only when this returns true, and is refused with
+	 * `OUTLINE_BEHAVIOR_PAGE_READONLY` otherwise (or when it is absent). It is called at most once
+	 * per write, and only for a commit that does write the page: the caller consumes the user
+	 * turn's one-shot grant in it. People and system writes are never asked.
+	 */
+	agentBehaviorGrant?: () => boolean;
 }
 
 /** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
@@ -1039,6 +1055,8 @@ interface PlannerExtra {
 	/** Ids for inserts that name none, by operation index: the same in every pass. */
 	assignedIds?: readonly string[];
 	confirm?: OutlineWriteOptions["confirm"];
+	/** Asked when an agent's commit writes the session's behavior page; see `agentBehaviorGrant`. */
+	behaviorGrant?: () => boolean;
 }
 
 class OutlinePlanner {
@@ -1070,10 +1088,13 @@ class OutlinePlanner {
 	) {
 		this.claimer = claimerOf(input);
 		this.held = extra.held ?? new Set();
+		this.behaviorGrant = extra.behaviorGrant ?? (() => false);
 	}
 
 	/** Operations an earlier pass held for confirmation: this pass skips them. */
 	private readonly held: ReadonlySet<number>;
+	/** See `PlannerExtra.behaviorGrant`. */
+	private readonly behaviorGrant: () => boolean;
 	/** What each operation of this pass did, for the lock rules. */
 	private readonly touches = new Map<number, OpTouch>();
 
@@ -2478,6 +2499,43 @@ class OutlinePlanner {
 
 	// ── the commit ───────────────────────────────────────────────────────────
 
+	/**
+	 * An agent's commit in a session space may write the session's behavior page (the page holding
+	 * alias {@link OUTLINE_BEHAVIOR_ALIAS}, before or after this commit) only under the user turn's
+	 * one-shot grant (`OutlineWriteOptions.agentBehaviorGrant`). Every change counts: a block on
+	 * the page before or after (created, written, moved, deleted, restored, its task or tags), and
+	 * any block whose alias is or was `behavior` (creating or renaming the page). One small indexed
+	 * read (the alias owner) for an agent's commit in a session space; nothing for other writers.
+	 */
+	private async checkBehaviorPage(changed: readonly WorkingBlock[]): Promise<void> {
+		if (this.input.actor.kind !== "agent" || this.space.kind !== "session") return;
+		if (changed.length === 0) return;
+		const pages = new Set<string>();
+		const [owner] = await this.store.findAliasOwners(this.space.id, [OUTLINE_BEHAVIOR_ALIAS]);
+		if (owner) {
+			const before =
+				this.blocks.get(owner.id)?.base ??
+				(await this.store.getBlockMetas(this.space.id, { ids: [owner.id] }))[0];
+			if (before && !before.deleted && before.parentId === null) pages.add(before.id);
+		}
+		for (const block of this.blocks.values()) {
+			if (!block.deleted && block.alias === OUTLINE_BEHAVIOR_ALIAS && block.parentId === null)
+				pages.add(block.id);
+		}
+		const touches = changed.some(
+			(block) =>
+				block.alias === OUTLINE_BEHAVIOR_ALIAS ||
+				block.base?.alias === OUTLINE_BEHAVIOR_ALIAS ||
+				pages.has(block.pageId) ||
+				(block.base !== null && pages.has(block.base.pageId)),
+		);
+		if (!touches || this.behaviorGrant()) return;
+		throw new OutlineWriteError(
+			OUTLINE_TEXT.errors.behaviorPageReadonly,
+			"OUTLINE_BEHAVIOR_PAGE_READONLY",
+		);
+	}
+
 	private async assemble(): Promise<Planned | null> {
 		this.leaveUnclaimedToDo();
 		await this.guardLocks();
@@ -2490,6 +2548,7 @@ class OutlinePlanner {
 
 		const existing = all.filter((b) => b.base !== null);
 		const versioned = existing.filter((b) => b.tags !== undefined || this.baseFlags(b) !== 0);
+		await this.checkBehaviorPage([...created, ...versioned]);
 
 		// Open links of existing blocks whose links may change. Tombstoning a subtree closes all
 		// of its links, so that load is bounded by the row budget; the others by the per-block cap.
@@ -3257,10 +3316,17 @@ async function writePrepared(
 		? "revert"
 		: options.confirm
 			? "confirm"
-			: "edit";
+			: (options.kind ?? "edit");
 	// Ids of inserts that name none, the same in every pass: a held operation may name a block
 	// another operation of the call creates.
 	const assignedIds = input.ops.map((op) => (op.op === "insert" && !op.id ? generateId() : ""));
+	// Asked at most once per write: a retried plan (or another pass of it) reuses the first answer
+	// (the grant it consumes is one-shot).
+	let granted: boolean | undefined;
+	const behaviorGrant = () => {
+		granted ??= options.agentBehaviorGrant?.() === true;
+		return granted;
+	};
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const space = await store.getSpace(input.spaceId);
 		if (!space) throw new NotFoundError("Outline space", input.spaceId);
@@ -3292,7 +3358,7 @@ async function writePrepared(
 				now,
 				commitKind,
 				options.leaseExpiry,
-				{ held: new Set(held.keys()), assignedIds, confirm: options.confirm },
+				{ held: new Set(held.keys()), assignedIds, confirm: options.confirm, behaviorGrant },
 			);
 			let outcome: Planned | Hold | null;
 			try {

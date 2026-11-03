@@ -12,6 +12,7 @@
 import { expect } from "bun:test";
 import { settings } from "../../../lib/settings";
 import { newOutlineSid } from "../../outline/keys";
+import { OUTLINE_BEHAVIOR_ALIAS } from "../../outline/model";
 import { ensureSessionSpace } from "../../outline/spaces";
 import { outlineStore } from "../../outline/store";
 import { type OutlineOp, writeOutline } from "../../outline/write";
@@ -45,7 +46,10 @@ export async function seedOutlineTasks(
 ): Promise<{ spaceKey: string }> {
 	const space = await ensureSessionSpace(narratorId);
 	const pages = await outlineStore.listChildMetas(space.id, [null], 100);
-	const ops: OutlineOp[] = pages.map((page) => ({ op: "delete", block: { id: page.id } }));
+	// The behavior page is not the session's tasks (and the session may not write it).
+	const ops: OutlineOp[] = pages
+		.filter((page) => page.alias !== OUTLINE_BEHAVIOR_ALIAS)
+		.map((page) => ({ op: "delete", block: { id: page.id } }));
 	// A sid is unique in its space for good, deleted blocks included: each seed takes a new one.
 	const prerequisite = newOutlineSid();
 	if (tasks.some((task) => task.status === "blocked")) {
@@ -82,6 +86,33 @@ export async function seedOutlineTasks(
 		responsibleUserId: null,
 	});
 	return { spaceKey: space.key };
+}
+
+/**
+ * Write the session's behavior page as its person would: a page holding alias `behavior` with
+ * `text` as its one block (a page there before is replaced).
+ */
+export async function seedBehaviorPage(narratorId: string, text: string): Promise<string> {
+	const space = await ensureSessionSpace(narratorId);
+	const [owner] = await outlineStore.findAliasOwners(space.id, [OUTLINE_BEHAVIOR_ALIAS]);
+	const ops: OutlineOp[] = owner ? [{ op: "delete", block: { id: owner.id } }] : [];
+	ops.push(
+		{
+			op: "insert",
+			tempId: "page",
+			parent: null,
+			content: "Behavior boundary",
+			alias: OUTLINE_BEHAVIOR_ALIAS,
+		},
+		{ op: "insert", parent: { tempId: "page" }, content: text.trim() },
+	);
+	const result = await writeOutline({
+		spaceId: space.id,
+		ops,
+		actor: { kind: "human", id: "pat" },
+		responsibleUserId: null,
+	});
+	return result.results[owner ? 1 : 0]?.blockId as string;
 }
 
 /** Finish the prerequisite `blocked` seeds wait for, as the person doing it. */
@@ -243,30 +274,68 @@ export const OUTLINE_TASK_SOURCE_SCENARIOS: OutlineScenario[] = [
 			});
 			expect(await source.taskDigest()).toBeNull();
 			expect(await source.compactContext("en")).toBeNull();
+			// No tasks view, and no boundary while the root has none.
+			expect(await source.contextParts("en")).toEqual([]);
 			// Nothing of the root's was started for the subagent.
 			expect((await taskState(root, "Root next")).block.taskJson?.status).toBe("todo");
 		},
 	},
 	{
-		name: "the digest names tasks by address in outline words",
+		name: "the current-tasks view: in progress, waiting with what it waits for, next, by address",
 		async run(ctx) {
 			const id = await ctx.session();
 			const { spaceKey } = await seedOutlineTasks(id, [
 				{ text: "Write the parser", status: "doing", protected: true },
 				{ text: "Waiting on access", status: "blocked" },
 				{ text: "Write the printer", status: "todo" },
+				{ text: "Write the docs", status: "todo" },
 			]);
-			const digest = await (await taskSourceForNarrator(id)).taskDigest();
-			expect(digest?.kind).toBe("tasks");
-			if (digest?.kind !== "tasks") return;
-			expect(digest.variant).toBe("current");
-			expect(digest.tasks?.map((t) => [t.role, t.text, t.protected === true])).toEqual([
-				["doing", "Write the parser", true],
-				["blocked", "Waiting on access", false],
-				["todo", "Write the printer", false],
+			const parser = await taskState(id, "Write the parser");
+			const waiting = await taskState(id, "Waiting on access");
+			const printer = await taskState(id, "Write the printer");
+			const pre = prerequisites.get(id);
+			const source = await taskSourceForNarrator(id);
+			expect(await source.contextParts("en")).toEqual([
+				{
+					key: "outline.tasks",
+					text: [
+						"Current tasks of this session in the outline (kept by the system, updated when they change):",
+						"In progress:",
+						`- [/] \`${parser.address}\` Write the parser [set by a person]`,
+						"Waiting:",
+						`- [/] \`${waiting.address}\` Waiting on access ‹waiting on \`${spaceKey}/${pre}\` Someone else's step›`,
+						"Next:",
+						`- [ ] \`${printer.address}\` Write the printer`,
+						"1 more; read `session/` with OutlineRead.",
+					].join("\n"),
+				},
 			]);
-			for (const task of digest.tasks ?? [])
-				expect(task.ref?.startsWith(`${spaceKey}/`)).toBe(true);
+			const zh = (await source.contextParts("zh-CN"))[0]?.text ?? "";
+			expect(zh).toContain("本会话在大纲里的当前任务");
+			expect(zh).toContain(`- [/] \`${parser.address}\` Write the parser [人建任务]`);
+			expect(zh).toContain(`‹等前置：\`${spaceKey}/${pre}\` Someone else's step›`);
+			expect(zh).toContain("另有 1 条");
+		},
+	},
+	{
+		name: "the behavior view: the session's page with its address; a subagent reads its root's",
+		async run(ctx) {
+			const root = await ctx.session();
+			const pageId = await seedBehaviorPage(root, "Never force-push the main branch.");
+			const page = (await outlineStore.getBlocks([pageId]))[0];
+			const space = await ensureSessionSpace(root);
+			const address = `${space.key}/${page?.sid}`;
+			const expected = [
+				"Behavior boundary (standing constraints the user set; always follow them)",
+				`From this session's behavior page \`${address}\`:`,
+				"- Behavior boundary",
+				"  - Never force-push the main branch.",
+			].join("\n");
+			const rootParts = await (await taskSourceForNarrator(root)).contextParts("en");
+			expect(rootParts).toEqual([{ key: "outline.behavior", text: expected }]);
+			const sub = await ctx.subagent(root);
+			const subParts = await (await taskSourceForNarrator(sub)).contextParts("en");
+			expect(subParts).toEqual([{ key: "outline.behavior", text: expected }]);
 		},
 	},
 ];

@@ -1271,8 +1271,10 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return rows.map((r) => ({ claim: r.claim, block: toMeta(r.block) }));
 		},
 
-		async listOpenTasks(spaceId, limit) {
-			// The predicate is the open-task index's own, so the planner can use the index.
+		async listOpenTasks(spaceId, limit, options) {
+			// The predicate is the open-task index's own, so the planner can use the index; the
+			// excluded pages are filtered before the limit.
+			const exclude = options?.excludePageIds ?? [];
 			const rows = await db
 				.select(metaColumns)
 				.from(outlineBlocks)
@@ -1280,6 +1282,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 					and(
 						eq(outlineBlocks.spaceId, spaceId),
 						sql`("task_json"::jsonb #>> '{status}') IN ('todo', 'doing') AND "deleted" = FALSE`,
+						exclude.length > 0 ? notInArray(outlineBlocks.pageId, [...exclude]) : undefined,
 					),
 				)
 				.limit(limit);

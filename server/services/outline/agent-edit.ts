@@ -167,6 +167,11 @@ export interface OutlineEditProvenance {
 	messageId: string | null;
 	toolCallId: string | null;
 	signal?: AbortSignal;
+	/**
+	 * The user turn's one-shot grant to write the session's behavior page: consumed, and asked only,
+	 * when the edit writes that page (`OutlineWriteOptions.agentBehaviorGrant`). Absent: refused.
+	 */
+	behaviorGrant?: () => boolean;
 }
 
 export const OUTLINE_EDIT_LIMITS = {
@@ -1258,7 +1263,10 @@ export async function outlineEdit(
 						toolCallId: provenance.toolCallId,
 						...(input.message?.trim() ? { summary: input.message.trim() } : {}),
 					},
-					{ canonical },
+					{
+						canonical,
+						...(provenance.behaviorGrant ? { agentBehaviorGrant: provenance.behaviorGrant } : {}),
+					},
 				);
 			} catch (error) {
 				if (error instanceof OutlineConflictError) return { writeConflict: error };

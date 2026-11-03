@@ -75,6 +75,14 @@ export const OUTLINE_ACTOR_KINDS = ["human", "agent", "system"] as const;
 export type OutlineActorKind = (typeof OUTLINE_ACTOR_KINDS)[number];
 
 /**
+ * The alias of a session's behavior page (outline plan PR 4, decision D43): the page of its
+ * session space holding the person's standing rules, which the system keeps in the session's
+ * context. People and plugins write it; an agent only under the one-shot grant of a user turn
+ * (`OutlineWriteOptions.agentBehaviorGrant`). Reserved in session spaces only.
+ */
+export const OUTLINE_BEHAVIOR_ALIAS = "behavior";
+
+/**
  * `edit` is every ordinary write; `revert` and `import` are written by their own paths; `confirm`
  * is a pending change taking effect (`pending.ts`): its actor is the proposer, its responsible
  * person the decider's.

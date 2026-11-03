@@ -30,17 +30,18 @@
  * person (D27b).
  *
  * A subagent has no tasks of its own (D27c): every read is empty, it continues on its turn
- * budget only (`turnBudgetOnly`), it gets no digest, and its fence is its root's.
+ * budget only (`turnBudgetOnly`), and its behavior boundary is its root's.
  *
- * INJECTIONS UNTIL PLAN PR 4
- * --------------------------
- * The digest, the fence and the compact context are minimal until the built-in views replace
- * them (plan PR 4): the digest lists the open tasks with their addresses in outline words (the
- * source marks it `taskBackend: "outline"`, as it marks the interrupt note); the compact context
- * lists the open tasks; the fence is the session's `spec://behavior_fence`, the one `spec://`
- * file an outline session keeps until the behavior-fence page exists. The person writes it in
- * the Spec panel, plugins write their SOP into it, and the agent writes it as in a spec session:
- * once per real user turn, when the user asks it to record a rule (the one-shot grant).
+ * INJECTIONS
+ * ----------
+ * The session's tasks and behavior boundary reach the model as the built-in views
+ * (`contextParts`, `outline-views.ts`): named context parts of the request prefix, in the
+ * baseline of every epoch and updated only when they change (plan PR 4, D27e). The periodic
+ * digest and the injected fence are retired for the outline: `taskDigest` and `behaviorFence`
+ * are always null, so the cadence drain writes neither and reads nothing. The compact context
+ * lists the open tasks with their addresses and waits, and the notes the session recorded since
+ * its last compact (`compactContext`). A long turn that never touched a task still in progress
+ * ends with one line (`turnEndNote`, decision 2026-11-02 Q4).
  *
  * Every read is bounded and indexed: the candidate query's own limits, the session (cached after
  * the first read, `backend.ts`), the session space, and the content of the tasks shown. The
@@ -48,13 +49,16 @@
  */
 import { createHash } from "node:crypto";
 import { blockTitle } from "@shared/outline";
-import type { SideCarBody, SideCarTaskEntry } from "@shared/sidecar-body";
+import type { SideCarBody } from "@shared/sidecar-body";
 import { logger } from "../../lib/logger";
 import {
 	getOutlineBoundedContinuationPrompt,
 	getOutlineCompactContext,
+	getOutlineCompactNoteLine,
+	getOutlineCompactTaskLine,
 	getOutlineContinuationPrompt,
 	getOutlineInterruptNote,
+	getOutlineTurnEndNote,
 	type Locale,
 	type OutlineTaskPromptTask,
 } from "../../lib/prompt-i18n";
@@ -66,17 +70,30 @@ import {
 	OutlineWriteError,
 } from "../outline/errors";
 import { OUTLINE_TEXT } from "../outline/messages";
+import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "../outline/model";
 import { recordOutlineReads, seenOutlineVersion } from "../outline/read-ledger";
+import { resolveNarratorSpaces } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import { OutlineStaleWriteError } from "../outline/store/port";
-import {
-	findContinuationCandidates,
-	type OutlineTaskRef,
-	type OutlineTaskWait,
-} from "../outline/tasks";
 import { writeOutline } from "../outline/write";
-import { buildBehaviorFenceBody } from "../spec-reminder";
 import { readTaskSession } from "./backend";
+import {
+	firstOf,
+	isProtected,
+	type OpenEntry,
+	type OpenRead,
+	OUTLINE_OPEN_TASKS_READ,
+	type OutlineSession,
+	outlineSessionReader,
+	readOpen,
+	titlesOf,
+} from "./outline-read";
+import {
+	outlineContextParts,
+	readPrerequisites,
+	unreadableOutlineContextParts,
+	viewTaskOf,
+} from "./outline-views";
 import type {
 	ContinuationPromptInput,
 	ContinuationTarget,
@@ -91,96 +108,29 @@ import type {
 
 export const OUTLINE_TASK_SOURCE_LIMITS = {
 	/** Candidates, and waiting tasks, one read takes (each). */
-	tasks: 50,
+	tasks: OUTLINE_OPEN_TASKS_READ,
 	/** Open tasks `openTasks()` lists (and reads the titles of); its readers show fewer. */
 	openTasks: 20,
 	/** Open tasks the compact context lists. */
 	compact: 50,
-	/** Tasks the digest names. */
-	digest: 4,
-	/** Waiting tasks the digest names. */
-	digestWaiting: 3,
+	/** Characters of the compact context. */
+	compactChars: 6000,
+	/** Characters of the recorded notes in the compact context. */
+	compactNoteChars: 3000,
+	/** Characters of one note's first line in the compact context. */
+	compactNoteLine: 160,
+	/** Commits of the session in one space the compact context looks at (newest first). */
+	compactCommits: 50,
+	/** Versions those commits opened that it reads at most (per space). */
+	compactVersions: 200,
+	/** Blocks the compact context reads at a time, newest first, until its budget is spent. */
+	compactReadChunk: 10,
 	/** To-dos tried in turn when the write path refuses to start one. */
 	promotionAttempts: 3,
 } as const;
 
 /** The system actor of the commit that starts a session's next task. */
 export const OUTLINE_TASK_START_ACTOR = "outline-task-start";
-
-/** The narrator a source is bound to, and the session its tasks belong to. */
-interface OutlineSession {
-	narratorId: string;
-	/** A subagent: no tasks of its own (D27c). */
-	subagent: boolean;
-	/** The session (the narrator, or a subagent's root); null when a subagent's root is gone. */
-	sessionNarratorId: string | null;
-	/** The session space; null until something was written to it. */
-	spaceId: string | null;
-}
-
-async function readSession(narratorId: string): Promise<OutlineSession> {
-	const row = await readTaskSession(narratorId);
-	const sessionNarratorId = row ? row.sessionNarratorId : narratorId;
-	const space =
-		sessionNarratorId === null
-			? null
-			: await outlineStore.findSpace({ kind: "session", narratorId: sessionNarratorId });
-	return {
-		narratorId,
-		subagent: row?.subagent === true,
-		sessionNarratorId,
-		spaceId: space?.id ?? null,
-	};
-}
-
-/** One open task of the session, before its text is read. */
-interface OpenEntry {
-	ref: OutlineTaskRef;
-	wait: OutlineTaskWait | null;
-	status: OpenTaskStatus;
-}
-
-interface OpenRead {
-	entries: OpenEntry[];
-	truncated: boolean;
-}
-
-async function readOpen(session: OutlineSession): Promise<OpenRead> {
-	if (session.subagent || session.sessionNarratorId === null) {
-		return { entries: [], truncated: false };
-	}
-	const found = await findContinuationCandidates({
-		narratorId: session.sessionNarratorId,
-		sessionSpaceId: session.spaceId,
-		limit: OUTLINE_TASK_SOURCE_LIMITS.tasks,
-	});
-	return {
-		entries: found.ordered.map(({ wait, ...ref }) => ({
-			ref,
-			wait,
-			status: wait ? "blocked" : ref.status,
-		})),
-		truncated: found.truncated,
-	};
-}
-
-function isProtected(entry: OpenEntry): boolean {
-	return entry.ref.taskJson.humanCreated === true;
-}
-
-const firstOf = (read: OpenRead, status: OpenTaskStatus) =>
-	read.entries.find((entry) => entry.status === status) ?? null;
-
-/** The titles of the given tasks, read in one statement. */
-async function titlesOf(entries: readonly OpenEntry[]): Promise<Map<string, string>> {
-	const ids = [...new Set(entries.map((entry) => entry.ref.blockId))];
-	const out = new Map<string, string>();
-	if (ids.length === 0) return out;
-	for (const block of await outlineStore.getBlocks(ids)) {
-		out.set(block.id, blockTitle(block.content) || block.sid);
-	}
-	return out;
-}
 
 /**
  * The revision key of the open tasks: a digest of what each is and waits for. A write to a task
@@ -222,24 +172,7 @@ function isRefusedClaim(error: unknown): boolean {
 
 /** One narrator's outline task source. Reads go to the database each time. */
 export function createOutlineTaskSource(narratorId: string): NarratorTaskSource {
-	let sessionPromise: Promise<OutlineSession> | undefined;
-	const session = async (): Promise<OutlineSession> => {
-		sessionPromise ??= readSession(narratorId);
-		const current = await sessionPromise.catch((error) => {
-			sessionPromise = undefined;
-			throw error;
-		});
-		// A session space appears with the session's first write; a source kept across one
-		// looks again rather than reading an empty session from then on.
-		if (current.spaceId === null && !current.subagent && current.sessionNarratorId !== null) {
-			const space = await outlineStore.findSpace({
-				kind: "session",
-				narratorId: current.sessionNarratorId,
-			});
-			if (space) current.spaceId = space.id;
-		}
-		return current;
-	};
+	const session = outlineSessionReader(narratorId);
 	/** Address and person-created mark of every task this source handed out, by identity. */
 	const known = new WeakMap<object, OutlineTaskPromptTask>();
 
@@ -377,50 +310,99 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		});
 	}
 
-	async function taskDigest(): Promise<SideCarBody | null> {
+	/**
+	 * The notes the session recorded in the outline since `since` (its last compact): blocks it
+	 * created or rewrote in its session space and its main project's space that are not tasks,
+	 * newest first within the budget, listed oldest first. Two indexed reads per space (the
+	 * session's newest commits there and the versions they opened) and one for the blocks.
+	 */
+	async function recordedNotes(sessionNarratorId: string, since: string | null): Promise<string[]> {
+		const spaces = await resolveNarratorSpaces(sessionNarratorId);
+		const sinceMs = since ? Date.parse(since) : Number.NaN;
+		const writes: Array<{ blockId: string; at: number; seq: number; key: string }> = [];
+		for (const space of [spaces?.session, spaces?.project]) {
+			if (!space) continue;
+			const rows = await outlineStore.listNarratorWrites(space.id, sessionNarratorId, {
+				commits: OUTLINE_TASK_SOURCE_LIMITS.compactCommits,
+				limit: OUTLINE_TASK_SOURCE_LIMITS.compactVersions,
+			});
+			for (const row of rows) {
+				const at = Date.parse(row.createdAt);
+				if (!Number.isNaN(sinceMs) && !(at > sinceMs)) continue;
+				if ((row.changeFlags & (OUTLINE_CHANGE.CREATE | OUTLINE_CHANGE.CONTENT)) === 0) continue;
+				writes.push({ blockId: row.blockId, at, seq: row.seq, key: space.key });
+			}
+		}
+		writes.sort((a, b) => b.at - a.at || b.seq - a.seq || (a.blockId < b.blockId ? -1 : 1));
+		const newest = new Map<string, string>();
+		for (const write of writes)
+			if (!newest.has(write.blockId)) newest.set(write.blockId, write.key);
+		const ids = [...newest.keys()].slice(0, OUTLINE_TASK_SOURCE_LIMITS.compactVersions);
+		if (ids.length === 0) return [];
+		// The behavior page holds the person's rules (in the new baseline anyway), not decisions.
+		const behavior = spaces?.session
+			? await outlineStore.findAliasOwners(spaces.session.id, [OUTLINE_BEHAVIOR_ALIAS])
+			: [];
+		const behaviorPages = new Set(behavior.map((owner) => owner.id));
+		// Blocks are read a few at a time, newest first, until the budget is spent: only about what
+		// is shown is read.
+		const lines: string[] = [];
+		let used = 0;
+		reading: for (let i = 0; i < ids.length; i += OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk) {
+			const chunk = ids.slice(i, i + OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk);
+			const blocks = new Map((await outlineStore.getBlocks(chunk)).map((b) => [b.id, b]));
+			for (const id of chunk) {
+				const block = blocks.get(id);
+				if (!block || block.deleted || block.taskJson !== null) continue;
+				if (behaviorPages.has(block.pageId)) continue;
+				const title = blockTitle(block.content).replace(/\s+/g, " ").trim();
+				if (!title) continue;
+				const max = OUTLINE_TASK_SOURCE_LIMITS.compactNoteLine;
+				const text = title.length > max ? `${title.slice(0, max - 1)}…` : title;
+				const line = getOutlineCompactNoteLine({ address: `${newest.get(id)}/${block.sid}`, text });
+				if (used + line.length + 1 > OUTLINE_TASK_SOURCE_LIMITS.compactNoteChars) break reading;
+				lines.push(line);
+				used += line.length + 1;
+			}
+		}
+		return lines.reverse();
+	}
+
+	async function compactContext(
+		locale: Locale,
+		given: string | null | undefined,
+	): Promise<string | null> {
 		const current = await session();
-		if (current.subagent) return null;
+		if (current.subagent || current.sessionNarratorId === null) return null;
+		// The notes are those recorded since the last compact: when its marker was written.
+		const since =
+			given !== undefined
+				? given
+				: await (await import("../narrator-service")).narratorService.getLatestCompactCreatedAt(
+						current.sessionNarratorId,
+					);
 		const read = await readOpen(current);
-		if (read.entries.length === 0) {
-			// Never started anything in its space: nudge to write tasks. Otherwise its tasks are
-			// finished (or it only wrote notes): say there is nothing open.
-			const pages = current.spaceId
-				? await outlineStore.listChildMetas(current.spaceId, [null], 1)
-				: [];
-			return {
-				kind: "tasks",
-				variant: pages.length > 0 ? "emptyDone" : "emptyNever",
-				taskBackend: "outline",
-			};
+		const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.compact);
+		const noteLines = await recordedNotes(current.sessionNarratorId, since);
+		const fixed = getOutlineCompactContext({ taskLines: ["-"], noteLines }, locale).length;
+		// Titles and prerequisites are read a few tasks at a time until the budget is spent.
+		const taskLines: string[] = [];
+		let used = fixed;
+		reading: for (let i = 0; i < listed.length; i += OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk) {
+			const chunk = listed.slice(i, i + OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk);
+			const titles = await titlesOf(chunk);
+			const prerequisites = await readPrerequisites(
+				chunk.filter((entry) => entry.wait),
+				current,
+			);
+			for (const entry of chunk) {
+				const line = getOutlineCompactTaskLine(viewTaskOf(entry, titles, prerequisites), locale);
+				if (used + line.length + 1 > OUTLINE_TASK_SOURCE_LIMITS.compactChars) break reading;
+				taskLines.push(line);
+				used += line.length + 1;
+			}
 		}
-		const picked: Array<{ role: SideCarTaskEntry["role"]; entry: OpenEntry }> = [];
-		const lead = firstOf(read, "doing");
-		const next = firstOf(read, "todo");
-		if (lead) picked.push({ role: "doing", entry: lead });
-		else if (next) picked.push({ role: "next", entry: next });
-		for (const entry of read.entries
-			.filter((e) => e.status === "blocked")
-			.slice(0, OUTLINE_TASK_SOURCE_LIMITS.digestWaiting)) {
-			picked.push({ role: "blocked", entry });
-		}
-		// The next task is listed once: as `next` when nothing is in progress, else as a to-do.
-		const listedNext = lead ? null : next;
-		for (const entry of read.entries.filter((e) => e.status === "todo" && e !== listedNext)) {
-			if (picked.length >= OUTLINE_TASK_SOURCE_LIMITS.digest) break;
-			picked.push({ role: "todo", entry });
-		}
-		const titles = await titlesOf(picked.map((p) => p.entry));
-		return {
-			kind: "tasks",
-			variant: "current",
-			taskBackend: "outline",
-			tasks: picked.map(({ role, entry }) => ({
-				role,
-				text: titles.get(entry.ref.blockId) ?? entry.ref.sid,
-				...(isProtected(entry) ? { protected: true } : {}),
-				ref: entry.ref.address,
-			})),
-		};
+		return getOutlineCompactContext({ taskLines, noteLines }, locale);
 	}
 
 	return {
@@ -445,35 +427,39 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		},
 		prepareContinuation: ({ promoteTodo }) => prepareContinuation(promoteTodo),
 		continuationPrompt,
-		taskDigest: () => taskDigest().catch(() => null),
-		async behaviorFence() {
+		// Retired for the outline: the views carry the tasks and the boundary (plan PR 4).
+		taskDigest: async () => null,
+		behaviorFence: async () => null,
+		async contextParts(locale: Locale) {
+			// A subagent has no tasks of its own (D27c), only its root's boundary (D31). The
+			// session is cached after its first read: a cached view costs no query.
+			let subagent = false;
 			try {
-				const current = await session();
-				return current.sessionNarratorId === null
-					? null
-					: await buildBehaviorFenceBody(current.sessionNarratorId);
-			} catch {
+				subagent = (await readTaskSession(narratorId))?.subagent === true;
+			} catch (error) {
+				logger.warn("Outline views could not resolve the session", {
+					narratorId,
+					error: String(error),
+				});
+				// Not "no views": the request keeps what the model was shown before.
+				return unreadableOutlineContextParts();
+			}
+			return await outlineContextParts(narratorId, locale, { tasks: !subagent });
+		},
+		async compactContext(locale: Locale, options?: { since?: string | null }) {
+			try {
+				return await compactContext(locale, options?.since);
+			} catch (error) {
+				logger.warn("Outline compact context could not be read", {
+					narratorId,
+					error: String(error),
+				});
 				return null;
 			}
 		},
-		async compactContext(locale: Locale) {
-			try {
-				const read = await readOpen(await session());
-				if (read.entries.length === 0) return null;
-				const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.compact);
-				const titles = await titlesOf(listed);
-				return getOutlineCompactContext(
-					listed.map((entry) => ({
-						text: titles.get(entry.ref.blockId) ?? entry.ref.sid,
-						address: entry.ref.address,
-						humanCreated: isProtected(entry),
-						status: entry.status,
-					})),
-					locale,
-				);
-			} catch {
-				return null;
-			}
+		turnEndNote(task: OpenTaskView, locale: Locale): InterruptGuardNote {
+			const content = getOutlineTurnEndNote(promptTask(task), locale);
+			return { content, body: { kind: "prose", text: content } };
 		},
 		interruptGuardNote(tasks: readonly OpenTaskView[], locale: Locale): InterruptGuardNote {
 			const content = getOutlineInterruptNote(

@@ -98,6 +98,15 @@ export interface OutlineLinkTargetRef {
 	spaceId?: string;
 }
 
+/** A version a session's commit opened (`listNarratorWrites`). */
+export interface OutlineNarratorWrite {
+	blockId: string;
+	seq: number;
+	/** The commit's `created_at`. */
+	createdAt: string;
+	changeFlags: number;
+}
+
 export interface OutlineReadPort {
 	/**
 	 * Live blocks of a page as of `asOf` (`null`: current state), unordered and without content.
@@ -181,6 +190,18 @@ export interface OutlineReadPort {
 	getCommitsBySeqs(spaceId: string, seqs: readonly number[]): Promise<OutlineCommitRow[]>;
 	/** Versions a commit opened, at most `limit`. */
 	listCommitVersions(commitId: string, limit: number): Promise<OutlineVersionRow[]>;
+	/**
+	 * What a session wrote lately in a space: the versions opened by its newest `commits` ordinary
+	 * commits there that it wrote itself (`kind` `edit`, actor an agent, written for `narratorId`;
+	 * not system commits made for it, like a fork's copy or an import), newest commit first (block
+	 * id bytewise within one), at most `limit`. The commits come from the space-and-narrator index;
+	 * their versions from the commit index.
+	 */
+	listNarratorWrites(
+		spaceId: string,
+		narratorId: string,
+		options: { commits: number; limit: number },
+	): Promise<OutlineNarratorWrite[]>;
 	/**
 	 * Which of the blocks have a version opened after `seq` whose change flags are anything but
 	 * exactly `ignoreFlags` (a later page change that only followed an ancestor, say).

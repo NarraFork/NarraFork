@@ -1,9 +1,10 @@
 /**
- * What an outline session (task backend `outline`, outline P2 PR 3) gets besides its task
- * source: the system prompt's task section, `spec://` closed to its tools, no taskReflection,
- * Dynamic Spec writes refused from every other path (the Spec panel, `/goal`'s writer, plugins)
- * except the behavior fence, the backend each creation path gives, and no outline tools by
- * default for its subagents (R16). Spec sessions keep what they had.
+ * What an outline session (task backend `outline`, outline P2 PR 3 and PR 4) gets besides its
+ * task source: the system prompt's task section, `spec://` closed to its tools (the behavior
+ * fence included since PR 4: its boundary is the behavior page), no taskReflection, Dynamic Spec
+ * writes refused from every other path (the Spec panel, `/goal`'s writer, plugins) except the
+ * plugins' SOP channel of the fence, the backend each creation path gives, and no outline tools
+ * by default for its subagents (R16). Spec sessions keep what they had.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  * `outline.enabled` is set before each case (the preload restores settings after it).
@@ -97,8 +98,8 @@ describe("system prompt: the task section", () => {
 		expect(outline.contract).toContain(getOutlineTaskSystemReminder("en"));
 		expect(outline.contract).not.toContain("Dynamic Spec");
 		expect(outline.contract).not.toContain("tasks.json");
-		// The one spec:// path it names is the behavior fence (until plan PR 4).
-		expect(outline.contract.match(/spec:\/\/[\w./-]+/g)).toEqual(["spec://behavior_fence"]);
+		// It names no spec:// path at all (plan PR 4: the boundary is the behavior page).
+		expect(outline.contract.match(/spec:\/\/[\w./-]+/g)).toBeNull();
 		// The section takes the same place: everything around it is identical.
 		expect(outline.contract.replace(getOutlineTaskSystemReminder("en"), "")).toBe(
 			plain.contract.replace(getDynamicSpecSystemReminder("en"), ""),
@@ -115,8 +116,11 @@ describe("system prompt: the task section", () => {
 			const text = getOutlineTaskSystemReminder(locale);
 			expect(text).toContain("OutlineEdit");
 			expect(text).toContain("session/");
-			// Where a rule the user asks to record goes, until the behavior-fence page exists.
-			expect(text.match(/spec:\/\/[\w./-]+/g)).toEqual(["spec://behavior_fence"]);
+			// Where a rule the user asks to record goes: the behavior page, never spec://.
+			expect(text.match(/spec:\/\/[\w./-]+/g)).toBeNull();
+			expect(text).toContain("alias:: behavior");
+			expect(text).toContain("outline.tasks");
+			expect(text).toContain("outline.behavior");
 			expect(text).not.toContain("tasks.json");
 		}
 		expect(getOutlineTaskSystemReminder("zh-CN")).toContain("三条约定");
@@ -192,22 +196,21 @@ describe("spec:// in an outline session", () => {
 		expect((await readTasksFileForNarrator(id)).content).toBe(before.content);
 	});
 
-	test("the behavior fence stays reachable; writing it still needs the user-turn grant", async () => {
+	test("the behavior fence is closed too: the boundary is the behavior page", async () => {
 		const outline = { taskBackend: "outline" as const, locale: "en" };
 		for (const tu of [
 			call("Read", { file_path: "spec://behavior_fence" }),
 			call("Write", { file_path: "spec://behavior_fence", content: "x" }),
 			call("Edit", { file_path: "spec://behavior_fence", old_string: "a", new_string: "b" }),
+			call("Grep", { pattern: "x", path: "spec://behavior_fence" }),
 		]) {
-			expect(getOutlineSpecRejection(tu, outline)).toBeUndefined();
+			const refused = getOutlineSpecRejection(tu, outline);
+			expect(refused?.isError).toBe(true);
+			expect(refused?.output).toContain("alias behavior");
+			expect(getOutlineSpecRejection(tu, { taskBackend: "spec" })).toBeUndefined();
 		}
-		expect(
-			getOutlineSpecRejection(
-				call("Grep", { pattern: "x", path: "spec://behavior_fence" }),
-				outline,
-			)?.isError,
-		).toBe(true);
 
+		// Even under the user turn's grant nothing is written to the old fence.
 		const id = await session();
 		const config = {
 			narratorId: id,
@@ -219,21 +222,14 @@ describe("spec:// in an outline session", () => {
 			signal: new AbortController().signal,
 			permissionHandler: async () => ({ behavior: "allow" }),
 		} as unknown as AgentConfig;
-		const write = () =>
-			executeTool(
-				call("Write", { file_path: "spec://behavior_fence", content: "Never force-push main." }),
-				config,
-			);
-		// No grant (not the first tool call of a user turn): the fence's own rule answers.
-		const denied = await write();
-		expect(denied.isError).toBe(true);
-		expect(denied.output).not.toContain("spec:// is not available");
-		expect((await readSpecFile(id, "spec://behavior_fence")).content).not.toContain("force-push");
-		// A real user turn opened the grant: the rule is recorded, as in a spec session.
 		grantBehaviorFenceEdit(id);
-		const recorded = await write();
-		expect(recorded.isError).toBeFalsy();
-		expect((await readSpecFile(id, "spec://behavior_fence")).content).toContain("force-push");
+		const denied = await executeTool(
+			call("Write", { file_path: "spec://behavior_fence", content: "Never force-push main." }),
+			config,
+		);
+		expect(denied.isError).toBe(true);
+		expect(denied.output).toContain("spec:// is not available in this session");
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).not.toContain("force-push");
 	});
 
 	test("taskReflection never runs for an outline session", () => {
@@ -244,7 +240,7 @@ describe("spec:// in an outline session", () => {
 });
 
 describe("Dynamic Spec writes from other paths", () => {
-	test("the Spec panel's writes, clear, reset and /goal's writer are refused; the fence is not", async () => {
+	test("the Spec panel's writes (the fence's too), clear, reset and /goal's writer are refused", async () => {
 		const id = await session();
 		expectRefused(
 			await refusal(
@@ -260,8 +256,17 @@ describe("Dynamic Spec writes from other paths", () => {
 		expectRefused(await refusal(clearSpecTasks(id)));
 		expectRefused(await refusal(resetSpecNamespace(id)));
 		expectRefused(await refusal(appendProtectedSpecTask(id, "Ship it")));
-		await writeSpecFile(id, "spec://behavior_fence", "Never force-push.", { actor: "user" });
-		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe("Never force-push.");
+		// The person writes the boundary in the outline now (plan PR 4).
+		expectRefused(
+			await refusal(
+				writeSpecFile(id, "spec://behavior_fence", "Never force-push.", { actor: "user" }),
+			),
+		);
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe("");
+		// A spec session's panel writes its fence as before.
+		const spec = await session("spec");
+		await writeSpecFile(spec, "spec://behavior_fence", "Never force-push.", { actor: "user" });
+		expect((await readSpecFile(spec, "spec://behavior_fence")).content).toBe("Never force-push.");
 	});
 
 	test("plugin task commands are refused, its fence command works", async () => {

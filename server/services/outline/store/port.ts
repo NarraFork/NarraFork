@@ -650,8 +650,16 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	 * `limit`, oldest claim first.
 	 */
 	listClaimedTasks(narratorId: string, limit: number): Promise<OutlineClaimedTask[]>;
-	/** Live open tasks (to do or in progress) of a space, unordered, at most `limit`. */
-	listOpenTasks(spaceId: string, limit: number): Promise<OutlineBlockMeta[]>;
+	/**
+	 * Live open tasks (to do or in progress) of a space, unordered, at most `limit`, leaving out
+	 * the blocks of `excludePageIds` before the limit applies (a session's behavior page: its
+	 * checkboxes are rules, and must not use up the scan).
+	 */
+	listOpenTasks(
+		spaceId: string,
+		limit: number,
+		options?: { excludePageIds?: readonly string[] },
+	): Promise<OutlineBlockMeta[]>;
 	/**
 	 * Session claims whose lease ended at or before `now`, oldest first, at most `limit`, with the
 	 * space of the task.
