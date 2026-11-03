@@ -212,6 +212,38 @@ export async function canWriteSpace(
 }
 
 /**
+ * Whether the person manages the space (P2 PR 6: may unlock anyone's locked plan there, the
+ * fallback when the locker is away): an admin (not for a personal space, D31), a project's owner
+ * or holder of a `manage` grant, a session's owner (a subagent's root's), a personal space's
+ * owner. Orphaned spaces are frozen: nobody.
+ */
+export async function canManageSpace(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+): Promise<boolean> {
+	const { userId } = principal;
+	if (!userId || isOrphanedSpace(space)) return false;
+	if (space.kind === "personal") return space.ownerUserId === userId;
+	if (principal.isAdmin) return true;
+	if (space.kind === "project" && space.projectId) {
+		const project = await readProject(space.projectId);
+		if (!project) return false;
+		if (project.ownerUserId === userId) return true;
+		const grants = await readScopeGrants({ type: "project", id: project.id }, [userId]);
+		return (
+			holdsAnyCapability(grants.everyUser, ["manage"]) ||
+			holdsAnyCapability(grants.users.get(userId), ["manage"])
+		);
+	}
+	if (space.kind === "session" && space.narratorId) {
+		const narrator = await readNarrator(space.narratorId);
+		const judged = narrator ? await readJudgedNarrator(narrator) : null;
+		return judged?.ownerUserId === userId;
+	}
+	return false;
+}
+
+/**
  * Whether an agent may write the space directly in this turn.
  *
  * Decided by the person the turn runs for (`actingUser`), not by the session's read scope: an

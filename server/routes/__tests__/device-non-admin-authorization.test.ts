@@ -257,14 +257,33 @@ describe("managing one's own device", () => {
 		const res = await appAs(OWNER, "user").request(`/api/devices/${id}/install-script`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ platform: "linux-amd64", mode: "user" }),
+			body: JSON.stringify({ target: "unix", mode: "user" }),
 		});
 		expect(res.status).toBe(200);
 		const result = await res.json();
 		expect(result.executorVersion).toBe(EXECUTOR_VERSION);
-		expect(result.platform).toBe("linux-amd64");
-		expect(result.script).toContain(`EXPECTED_SHA256='${"a".repeat(64)}'`);
-		const ticket = new URL(result.scriptUrl).searchParams.get("ticket");
+		expect(result.target).toBe("unix");
+		expect(result.platforms).toEqual(
+			EXECUTOR_PLATFORMS.filter((platform) => !platform.startsWith("windows-")),
+		);
+		expect(result).not.toHaveProperty("scriptUrl");
+		const scriptUrl = result.script.match(
+			/https?:\/\/[^\s"'`<>]+\/api\/executor\/install\/linux-amd64\?ticket=[a-f0-9]{16,256}/,
+		)?.[0];
+		expect(scriptUrl).toBeDefined();
+		if (!scriptUrl) throw new Error("Bootstrap is missing the Linux AMD64 final script URL");
+		const { executorBootstrapRoutes, resetExecutorBootstrapRateLimit } = await import(
+			"../executor-bootstrap"
+		);
+		resetExecutorBootstrapRateLimit();
+		const bootstrap = new Hono();
+		bootstrap.route("/api/executor", executorBootstrapRoutes);
+		const fetched = await bootstrap.request(scriptUrl);
+		expect(fetched.status).toBe(200);
+		const finalScript = await fetched.text();
+		expect(finalScript).not.toBe(result.script);
+		expect(finalScript).toContain(`EXPECTED_SHA256='${"a".repeat(64)}'`);
+		const ticket = new URL(scriptUrl).searchParams.get("ticket");
 		const redemption = redeemExecutorTicket(ticket, "linux-amd64", "binary");
 		expect(redemption.ok).toBe(true);
 		expect(redemption.deviceId).toBe(id);
@@ -278,7 +297,7 @@ describe("managing one's own device", () => {
 			size: 256,
 			sha256: "a".repeat(64),
 		});
-		expect(redeemExecutorTicket(ticket, "linux-amd64", "script").script?.body).toBe(result.script);
+		expect(redeemExecutorTicket(ticket, "linux-amd64", "script").script?.body).toBe(finalScript);
 		// Generation and ticket redemption fetch only metadata, never the binary
 		// or a mutable /latest release; the installer is not executed by this test.
 		expect(fetchCalls).toEqual([MANIFEST_URL]);

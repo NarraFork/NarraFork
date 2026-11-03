@@ -22,6 +22,9 @@ function block(id: string, childIds: string[] = [], extra: Partial<OutlineViewBl
 		hidden: 0,
 		processHidden: 0,
 		openTasks: 0,
+		inProgress: [],
+		lock: null,
+		pending: [],
 		...extra,
 	} satisfies OutlineViewBlock;
 }

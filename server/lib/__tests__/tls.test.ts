@@ -1,8 +1,10 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createPublicKey, X509Certificate } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as lanAddresses from "../net/lan-addresses";
+import type { TlsConfig } from "../settings/types";
 
 // Redirect the TLS directory before importing the module under test.
 const previousHome = process.env.NARRAFORK_HOME;
@@ -11,6 +13,7 @@ process.env.NARRAFORK_HOME = testHome;
 
 const {
 	ensureCa,
+	generateSelfSignedCert,
 	getAutoSans,
 	getTlsPaths,
 	getTlsStatus,
@@ -18,6 +21,7 @@ const {
 	parseSanEntries,
 	readCustomSans,
 	regenerateCa,
+	reissueBuiltinTlsOnStartup,
 } = await import("../tls");
 
 afterAll(() => {
@@ -197,6 +201,153 @@ describe("getTlsStatus", () => {
 			writeFileSync(keyPath, savedKey, { mode: 0o600 });
 		}
 		expect(getTlsStatus().legacySelfSigned).toBe(false);
+	});
+});
+
+describe("reissueBuiltinTlsOnStartup", () => {
+	let home: string;
+	let savedHome: string | undefined;
+	let lanSpy: ReturnType<typeof spyOn<typeof lanAddresses, "getLanAddresses">>;
+
+	beforeEach(() => {
+		savedHome = process.env.NARRAFORK_HOME;
+		home = mkdtempSync(join(tmpdir(), "narrafork-tls-startup-"));
+		process.env.NARRAFORK_HOME = home;
+		lanSpy = spyOn(lanAddresses, "getLanAddresses").mockReturnValue(["192.168.1.10"]);
+	});
+
+	afterEach(() => {
+		lanSpy.mockRestore();
+		if (savedHome === undefined) delete process.env.NARRAFORK_HOME;
+		else process.env.NARRAFORK_HOME = savedHome;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	function builtinConfig(): TlsConfig {
+		const { certPath, keyPath } = getTlsPaths();
+		return { enabled: true, certFile: certPath, keyFile: keyPath };
+	}
+
+	function snapshotFiles() {
+		const { certPath, keyPath, caCertPath, caKeyPath, sanSidecarPath } = getTlsPaths();
+		return [certPath, keyPath, caCertPath, caKeyPath, sanSidecarPath].map((path) =>
+			readFileSync(path, "utf8"),
+		);
+	}
+
+	test.each([
+		["added", ["192.168.1.10"], ["192.168.1.10", "192.168.1.20"]],
+		["removed", ["192.168.1.10", "192.168.1.20"], ["192.168.1.10"]],
+	])("reissues when a LAN IP is %s, preserving CA and custom SANs", async (_, before, after) => {
+		lanSpy.mockReturnValue(before);
+		await issueServerCert(["nas.local", "10.20.30.40"]);
+		const previous = snapshotFiles();
+		lanSpy.mockReturnValue(after);
+
+		// autoReissue deliberately omitted: existing configurations default to enabled.
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(true);
+		const current = snapshotFiles();
+		expect(current[0]).not.toBe(previous[0]);
+		expect(current[1]).not.toBe(previous[1]);
+		expect(current.slice(2)).toEqual(previous.slice(2));
+		expect(readCustomSans()).toEqual(["nas.local", "10.20.30.40"]);
+		const leaf = new X509Certificate(current[0]);
+		expect(leaf.verify(new X509Certificate(current[2]).publicKey)).toBe(true);
+		expect(leaf.checkHost("nas.local")).toBe("nas.local");
+		expect(leaf.checkIP("10.20.30.40")).toBe("10.20.30.40");
+		for (const ip of after) expect(leaf.checkIP(ip)).toBe(ip);
+		if (!after.includes("192.168.1.20")) {
+			expect(leaf.checkIP("192.168.1.20")).toBeUndefined();
+		}
+		// An immediate second startup must be a no-op.
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(false);
+		expect(snapshotFiles()).toEqual(current);
+	});
+
+	test("ignores SAN order, duplicates and equivalent IPv6 spellings", async () => {
+		lanSpy.mockReturnValue(["192.168.1.10", "192.168.1.20"]);
+		await issueServerCert(["nas.local", "2001:db8::1"]);
+		const before = snapshotFiles();
+		lanSpy.mockReturnValue(["192.168.1.20", "192.168.1.10", "192.168.1.10"]);
+		// OpenSSL exposes expanded IPv6 SANs, while the sidecar uses compressed form.
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(false);
+		expect(snapshotFiles()).toEqual(before);
+	});
+
+	test("does not touch certificates when opted out, disabled, absent or external", async () => {
+		await issueServerCert([]);
+		const before = snapshotFiles();
+		lanSpy.mockReturnValue(["192.168.1.20"]);
+		const config = builtinConfig();
+		const configs: (TlsConfig | undefined)[] = [
+			undefined,
+			{ ...config, enabled: false },
+			{ ...config, autoReissue: false },
+			{ ...config, certFile: join(home, "external-cert.pem") },
+			{ ...config, keyFile: join(home, "external-key.pem") },
+			{ ...config, certFile: "" },
+			{ ...config, keyFile: "" },
+			{ ...config, passphrase: "encrypted-key" },
+		];
+		for (const candidate of configs) {
+			expect(await reissueBuiltinTlsOnStartup(candidate)).toBe(false);
+			expect(snapshotFiles()).toEqual(before);
+		}
+	});
+
+	test("does not replace a leaf signed by a different CA with the same issuer name", async () => {
+		await issueServerCert([]);
+		await regenerateCa();
+		const before = snapshotFiles();
+		lanSpy.mockReturnValue(["192.168.1.20"]);
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(false);
+		expect(snapshotFiles()).toEqual(before);
+	});
+
+	test("does not replace legacy self-signed certificates", async () => {
+		await issueServerCert([]);
+		await generateSelfSignedCert();
+		const before = snapshotFiles();
+		lanSpy.mockReturnValue(["192.168.1.20"]);
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(false);
+		expect(snapshotFiles()).toEqual(before);
+	});
+
+	test.each([
+		"caCertPath",
+		"caKeyPath",
+	] as const)("does not create a missing %s or change the remaining files", async (missing) => {
+		await issueServerCert([]);
+		const paths = getTlsPaths();
+		rmSync(paths[missing]);
+		const remaining = [paths.certPath, paths.keyPath, paths.caCertPath, paths.caKeyPath].filter(
+			(path) => path !== paths[missing],
+		);
+		const before = remaining.map((path) => readFileSync(path, "utf8"));
+		lanSpy.mockReturnValue(["192.168.1.20"]);
+		expect(await reissueBuiltinTlsOnStartup(builtinConfig())).toBe(false);
+		expect(existsSync(paths[missing])).toBe(false);
+		expect(remaining.map((path) => readFileSync(path, "utf8"))).toEqual(before);
+	});
+
+	test("backdates new CA, leaf and legacy certificates by five minutes", async () => {
+		const skew = 5 * 60 * 1000;
+		function expectBackdated(pem: string, started: number, finished: number) {
+			const notBefore = Date.parse(new X509Certificate(pem).validFrom);
+			// X.509 timestamps truncate milliseconds to whole seconds.
+			expect(notBefore).toBeGreaterThanOrEqual(started - skew - 1000);
+			expect(notBefore).toBeLessThanOrEqual(finished - skew);
+		}
+
+		let started = Date.now();
+		const ca = await ensureCa();
+		expectBackdated(ca.caCertPem, started, Date.now());
+		started = Date.now();
+		const leaf = await issueServerCert([]);
+		expectBackdated(readFileSync(leaf.certPath, "utf8"), started, Date.now());
+		started = Date.now();
+		const legacy = await generateSelfSignedCert();
+		expectBackdated(readFileSync(legacy.certPath, "utf8"), started, Date.now());
 	});
 });
 

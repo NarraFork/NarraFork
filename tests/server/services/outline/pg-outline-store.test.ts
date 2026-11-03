@@ -25,6 +25,7 @@ import {
 	type OutlineContractContext,
 	type SpaceDump,
 } from "../../../../server/services/outline/__tests__/contract";
+import { OUTLINE_PENDING_CONTRACT } from "../../../../server/services/outline/__tests__/pending-contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
 import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
@@ -189,6 +190,7 @@ describe("PostgreSQL outline store", () => {
 					for (const contractCase of [
 						...OUTLINE_STORE_CONTRACT,
 						...OUTLINE_TASK_CONTRACT,
+						...OUTLINE_PENDING_CONTRACT,
 						...OUTLINE_READ_CONTRACT,
 					]) {
 						try {
@@ -213,7 +215,10 @@ describe("PostgreSQL outline store", () => {
 			}
 			expect(outcome.problems).toEqual([]);
 			expect(outcome.passed).toHaveLength(
-				OUTLINE_STORE_CONTRACT.length + OUTLINE_TASK_CONTRACT.length + OUTLINE_READ_CONTRACT.length,
+				OUTLINE_STORE_CONTRACT.length +
+					OUTLINE_TASK_CONTRACT.length +
+					OUTLINE_PENDING_CONTRACT.length +
+					OUTLINE_READ_CONTRACT.length,
 			);
 		},
 		RUN_TIMEOUT_MS,

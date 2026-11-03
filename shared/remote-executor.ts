@@ -22,6 +22,10 @@ export const EXECUTOR_PLATFORMS = [
 
 export type ExecutorPlatform = (typeof EXECUTOR_PLATFORMS)[number];
 
+/** Installation commands select the concrete OS and CPU on the target machine. */
+export const EXECUTOR_INSTALL_TARGETS = ["unix", "windows"] as const;
+export type ExecutorInstallTarget = (typeof EXECUTOR_INSTALL_TARGETS)[number];
+
 export type ExecutorOs = "linux" | "darwin" | "windows";
 
 /** Filename of the manifest published next to the binaries in `tools/`. */

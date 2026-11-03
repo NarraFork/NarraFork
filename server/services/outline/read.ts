@@ -24,6 +24,7 @@ import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { blockTitle } from "@shared/outline";
 import { OUTLINE_TEXT } from "./messages";
 import { OUTLINE_LIMITS } from "./model";
+import type { OutlinePendingOverlay } from "./pending-overlay";
 import {
 	clampBudget,
 	type OutlineBudget,
@@ -263,6 +264,11 @@ export interface OutlineReadRequest extends OutlineReadOptions {
 		state: OutlinePageState,
 		nodes: readonly OutlineNode[],
 	) => Promise<OutlineDisplay | undefined>;
+	/**
+	 * Pending changes shown with the read (`pending-overlay.ts`): the reader's own laid over the
+	 * tree (current reads only), the blocks others' touch marked.
+	 */
+	overlay?: OutlinePendingOverlay;
 }
 
 export interface OutlineReadResult extends OutlineRenderResult {
@@ -287,11 +293,14 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 	const subtree = await readSubtree(request.blockId, { asOf: request.asOf, store });
 	if (!subtree) return null;
 	const { state, root, path } = subtree;
+	const overlay = state.current ? request.overlay : undefined;
+	overlay?.prepare(state);
 	const view = effectiveView(root, request.view ?? "facts");
 	const budget = clampBudget(request.budget);
 	const order = breadthFirst(root, view, budget.blocks);
 	await loadBodiesWithin(state, order, budget.bytes, { store });
 	await loadBodies(state, path, { store });
+	overlay?.finish(order);
 	const display = request.display
 		? await request.display(
 				state,
@@ -303,6 +312,7 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 		budget,
 		label: request.label,
 		display,
+		annotate: overlay ? (node) => overlay.annotate(node) : undefined,
 		truncatedRead: state.truncated ? { blocksRead: state.nodes.size } : undefined,
 	});
 	return {

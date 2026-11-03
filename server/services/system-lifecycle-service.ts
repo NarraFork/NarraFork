@@ -1,3 +1,4 @@
+import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { canOperatorShutdown, scheduleOperatorShutdown } from "../lib/server-restart";
 import { createSystemLifecycle } from "../lib/system-lifecycle";
@@ -19,6 +20,7 @@ import { checkpointPreparedUpdateFence, failPreparedUpdateAttempt } from "./upda
 
 export const systemLifecycle = hotSafe("systemLifecycle", () =>
 	createSystemLifecycle({
+		changed: () => eventBus.emit({ type: "system:lifecycle_changed" }),
 		coordination: getUpdateCoordinationStatus,
 		canShutdown: canOperatorShutdown,
 		schedule: () => scheduleUpdate(undefined, "system_shutdown"),

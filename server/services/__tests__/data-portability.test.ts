@@ -44,6 +44,7 @@ const count = (table: string) =>
 
 async function seed(rows = 2) {
 	sqlite.run("DELETE FROM api_requests");
+	sqlite.run("DELETE FROM usage_daily");
 	sqlite.run("DELETE FROM narrator_message_refs");
 	sqlite.run("DELETE FROM narrator_tool_calls");
 	sqlite.run("DELETE FROM narrator_messages");
@@ -311,6 +312,30 @@ describe("data portability · 数据安全", () => {
 		expect(snapshotCounts()).toEqual(afterFirst);
 	});
 
+	test("导入的请求计入用量日账本一次，重复导入不重复计数；清空请求同时清空账本", async () => {
+		const ledger = () =>
+			sqlite
+				.prepare(
+					`SELECT COALESCE(SUM(request_count), 0) AS requests, COALESCE(SUM(input_tokens), 0) AS input
+					 FROM usage_daily`,
+				)
+				.get() as { requests: number; input: number };
+		const zip = await readFile((await exportData()).zipPath);
+		await clearData("all");
+		expect(ledger()).toEqual({ requests: 0, input: 0 });
+
+		const first = await previewImport(toArrayBuffer(zip), "export.zip");
+		await applyImport(first.token, { conflictDefault: "skip" });
+		expect(ledger()).toEqual({ requests: 2, input: 30 });
+
+		const second = await previewImport(toArrayBuffer(zip), "export.zip");
+		await applyImport(second.token, { conflictDefault: "skip" });
+		expect(ledger()).toEqual({ requests: 2, input: 30 });
+
+		await clearData("requests");
+		expect(ledger()).toEqual({ requests: 0, input: 0 });
+	});
+
 	test("清空单类别不影响其它类别", async () => {
 		await clearData("requests");
 		expect(count("api_requests")).toBe(0);
@@ -509,7 +534,11 @@ describe("逐模型设置随供应商一起导出", () => {
 
 	test("前缀冲突时逐模型设置改挂到新前缀，且不误伤更长的前缀", async () => {
 		const original = structuredClone(settings);
+		const restores: Array<() => void> = [];
 		try {
+			restores.push(
+				replaceModelOverridesForTests({ connections: { "openai:ctx": { contextWindow: 5000 } } }),
+			);
 			const exported = structuredClone(settings);
 			exported.customApiProviders = [
 				apiProvider("remote-openai", "openai", "remote-key", "https://remote.example/v1"),
@@ -543,8 +572,11 @@ describe("逐模型设置随供应商一起导出", () => {
 			};
 			(local.agent as unknown as Record<string, unknown>).customModels = [];
 			saveSettings(local);
+			restores.push(replaceModelOverridesForTests({}));
 
 			await applyImport(preview.token, { conflictDefault: "skip" });
+			expect(getModelOverride("connection", "openai-2:ctx")).toEqual({ contextWindow: 5000 });
+			expect(getModelOverride("connection", "openai:ctx")).toBeUndefined();
 
 			expect((settings.customApiProviders ?? []).map((item) => item.prefix).sort()).toEqual([
 				"openai",
@@ -565,6 +597,7 @@ describe("逐模型设置随供应商一起导出", () => {
 				{ value: "openai-2:custom", label: "remote", provider: "openai-2" },
 			]);
 		} finally {
+			while (restores.length) restores.pop()?.();
 			saveSettings(original);
 		}
 	});

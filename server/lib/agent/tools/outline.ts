@@ -261,17 +261,28 @@ const editSchema = z.object({
 		.nullable()
 		.optional()
 		.describe('With set: an alias such as Q17, "Q?" for the next free number, null to clear'),
+	confirm: z
+		.string()
+		.optional()
+		.describe("Confirm this change waiting for your confirmation (P and 8 characters)"),
+	reject: z
+		.string()
+		.optional()
+		.describe("Reject this change waiting for your confirmation, or withdraw your own"),
+	reason: z.string().optional().describe("With reject: why, for its proposer"),
 });
 
 type EditInput = z.infer<typeof editSchema>;
 
-const EDIT_KINDS = ["add", "replace", "move", "delete", "set"] as const;
+const EDIT_KINDS = ["add", "replace", "move", "delete", "set", "confirm", "reject"] as const;
 const EDIT_FIELDS: Record<(typeof EDIT_KINDS)[number], readonly string[]> = {
 	add: ["markdown", "after"],
 	replace: ["text"],
 	move: ["to", "after"],
 	delete: [],
 	set: ["checkbox", "assignee", "alias"],
+	confirm: [],
+	reject: ["reason"],
 };
 
 /** One edit as the service takes it, or what is wrong with it. */
@@ -281,7 +292,7 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 		.map(([key]) => key);
 	const kinds = EDIT_KINDS.filter((kind) => present.includes(kind));
 	if (kinds.length !== 1) {
-		return `edit ${n}: give exactly one of add, replace, move, delete, set (got ${kinds.join(", ") || "none"})`;
+		return `edit ${n}: give exactly one of add, replace, move, delete, set, confirm, reject (got ${kinds.join(", ") || "none"})`;
 	}
 	const kind = kinds[0] as (typeof EDIT_KINDS)[number];
 	const stray = present.filter((key) => key !== kind && !EDIT_FIELDS[kind].includes(key));
@@ -316,6 +327,13 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 				...(edit.assignee !== undefined ? { assignee: edit.assignee } : {}),
 				...(edit.alias !== undefined ? { alias: edit.alias } : {}),
 			};
+		case "confirm":
+			return { confirm: edit.confirm as string };
+		case "reject":
+			return {
+				reject: edit.reject as string,
+				...(edit.reason !== undefined ? { reason: edit.reason } : {}),
+			};
 	}
 }
 
@@ -330,6 +348,7 @@ edits, in order, each one of:
 - { set: <block>, checkbox?, assignee?, alias? }: checkbox " " todo, "/" doing, "x" done, "-" cancelled, "none" makes a task a plain block; assignee agent:name, human:name or null; alias Q17, "Q?" (next free number) or null.
 Markdown outline: every list item is a block, indentation nests; \`- [ ] task @agent:name\` is a task; \`depends:: [[…]]\`, \`due:: 2026-11-01\`, \`alias:: Q?\`, \`tags:: [[…]]\` lines under an item are properties. Link with [[title]], [[alias]] or [[key/id]]; links are stored as addresses, so renaming never breaks them, and blocks added in one call can link to each other by title. Text copied from OutlineRead works as is: the ids after bullets and the ‹…› notes are dropped. Lists or extra paragraphs inside one item become child blocks; the result says what was split.
 <block>, <parent>: an id, key/id, an alias or a title. message: a short summary for the timeline.
+Locked plans: a task tree a person locked takes changes to its plan (its steps, their text and order, its goal and acceptance, cancelling a step, the whole plan done) as proposals waiting for their confirmation; the rest of the call is written. The result names the proposal (P and 8 characters) and the tasks waiting for it: do other work meanwhile; reading the plan shows your proposed version. Progress, findings, ticking steps and splitting a step into sub-steps are written directly. A session the locker named confirms with { confirm: "P…" } or rejects with { reject: "P…", reason }, in a call of their own; never its own proposals (rejecting your own withdraws it).
 The result gives each edit's outcome and the ids of new blocks. Read a block (OutlineRead) before you replace or delete it, unless this session wrote it (blocks another session or a subagent wrote need a read too): what you read is forgotten when the server restarts, and an edit of a block you have not read that someone else wrote writes nothing and shows the block's current text, which then counts as read. If someone else changed a block after you read it, your replace is merged with their change where the two do not overlap, and the result shows the merged text (continue from that text); if they overlap, or the block's edit is a move, delete or set, nothing is written: read it again and redo the edit. A delete also writes nothing when blocks under the block changed (or were added by someone else) since you read them; the result shows them.`,
 	parameters: z.object({
 		edits: z.array(editSchema).min(1).max(200).describe("The edits, applied in order"),

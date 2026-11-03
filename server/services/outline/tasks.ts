@@ -25,7 +25,8 @@
  *     was listening ({@link releaseEndedOutlineSessionClaims}). An archived session holds
  *     nothing: the end of its runs releases too, and nothing is handed back to it.
  *   - WAITING (read time, never stored): a task waits for its prerequisites (`depends::`) until
- *     each is done or cancelled, and for people while a question under it is unanswered.
+ *     each is done or cancelled, for people while a question under it is unanswered, and for
+ *     confirmation while an open pending change touches it (`pending.ts`).
  *   - CONTINUATION CANDIDATES (§4.8): the open tasks a session may continue with.
  *
  * Every read is indexed and bounded; nothing here scans a space.
@@ -44,6 +45,7 @@ import {
 	type OutlineTaskJson,
 	outlineLeaseEnd,
 } from "./model";
+import { findTasksWaitingForConfirmation } from "./pending";
 import { outlineStore } from "./store";
 import {
 	chunked,
@@ -741,16 +743,22 @@ export function watchOutlineSessionEnds(
 // Waiting (derived at read time)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** What an open task waits for. Neither is stored: both are read from the outline. */
+/** What an open task waits for. None is stored: each is read from the outline. */
 export interface OutlineTaskWait {
 	/** Prerequisites (`depends::`) that are tasks not done or cancelled yet, by block id. */
 	prerequisites: string[];
 	/** A question under the task is unanswered (always false until `Ask` exists, plan PR 7). */
 	people: boolean;
+	/**
+	 * A change to it waits for confirmation (a locked plan, design §2.2): an open pending change
+	 * touches the task, or the plan's being done waits for its locker. The agent does something
+	 * else meanwhile; continuation skips it.
+	 */
+	confirmation: boolean;
 }
 
 export function isWaiting(wait: OutlineTaskWait | undefined): boolean {
-	return !!wait && (wait.prerequisites.length > 0 || wait.people);
+	return !!wait && (wait.prerequisites.length > 0 || wait.people || wait.confirmation);
 }
 
 /** A task as the derivations read it. */
@@ -785,7 +793,7 @@ export async function deriveOutlineTaskWaits(
 ): Promise<Map<string, OutlineTaskWait>> {
 	const store = options.store ?? outlineStore;
 	const out = new Map<string, OutlineTaskWait>(
-		tasks.map((t) => [t.id, { prerequisites: [], people: false }]),
+		tasks.map((t) => [t.id, { prerequisites: [], people: false, confirmation: false }]),
 	);
 
 	// The targets, grouped by the space they are looked up in.
@@ -858,6 +866,10 @@ export async function deriveOutlineTaskWaits(
 	for (const id of people) {
 		const wait = out.get(id);
 		if (wait) wait.people = true;
+	}
+	for (const id of await findTasksWaitingForConfirmation(tasks, { store })) {
+		const wait = out.get(id);
+		if (wait) wait.confirmation = true;
 	}
 	return out;
 }

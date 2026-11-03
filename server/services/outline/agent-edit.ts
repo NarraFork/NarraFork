@@ -37,12 +37,24 @@
  * about the space (a page with the same title already exists); merged blocks are shown as they
  * now read, as a read shows them, and the ledger moves to the version written. Everything it
  * shows comes from the space being written, which the session may read.
+ *
+ * LOCKED PLANS (design §2.2, §2.6)
+ * --------------------------------
+ * Edits that change a locked plan are held for confirmation by the write path (`write.ts`); the
+ * rest of the call is written. The result says which edits were held, as which change (`P…`),
+ * who decides it and which tasks wait for it. A block a held edit adds exists only once
+ * confirmed: naming it (or writing under it) before is refused with that reason. A session the
+ * locker named decides with `{ confirm: "P…" }` and `{ reject: "P…", reason }`, in a call of
+ * their own (`pending.ts`); a session never confirms its own change, and rejecting it withdraws
+ * it.
  */
 
 import { NotFoundError } from "@server/lib/errors";
 import {
 	type BodyRef,
+	blockTitle,
 	isAlias,
+	isShortId,
 	type OutlineNote,
 	parseAddress,
 	parseAliasValue,
@@ -57,6 +69,7 @@ import {
 } from "./agent-merge";
 import { blockLinesForAgent, type OutlineToolOutput } from "./agent-read";
 import {
+	bareReference,
 	type OutlineAgentScope,
 	type OutlineSpaceWord,
 	type OutlineWriteRefusal,
@@ -79,7 +92,21 @@ import { newOutlineSid } from "./keys";
 import { linkDisplayTitle } from "./link-display";
 import { withOutlineLiveBarrier } from "./live-barrier";
 import { OUTLINE_TOOL_TEXT } from "./messages";
-import { OUTLINE_CHANGE, OUTLINE_LIMITS } from "./model";
+import {
+	OUTLINE_CHANGE,
+	OUTLINE_LIMITS,
+	OUTLINE_PENDING_LIMITS,
+	outlinePendingIdOf,
+	outlinePendingLabel,
+} from "./model";
+import {
+	confirmOutlinePending,
+	OUTLINE_PENDING_TEXT,
+	OutlinePendingError,
+	pendingNames,
+	rejectOutlinePending,
+	withCurrentDeciders,
+} from "./pending";
 import { forgetOutlineReads, recordOutlineReads, seenOutlineVersion } from "./read-ledger";
 import type { OutlineResolvedBlock } from "./resolve";
 import type {
@@ -94,6 +121,7 @@ import {
 	type OutlineBlockRef,
 	type OutlineCanonicalContent,
 	type OutlineOp,
+	type OutlinePendingOutcome,
 	type OutlinePosition,
 	type OutlineTaskInput,
 	type OutlineTaskPatch,
@@ -118,7 +146,16 @@ export type OutlineEditRequest =
 	| { replace: string; text: string }
 	| { move: string; to: string; after?: string }
 	| { delete: string }
-	| { set: string; checkbox?: OutlineCheckbox; assignee?: string | null; alias?: string | null };
+	| { set: string; checkbox?: OutlineCheckbox; assignee?: string | null; alias?: string | null }
+	| { confirm: string }
+	| { reject: string; reason?: string | null };
+
+/** A decision on a pending change (`confirm`, `reject`), rather than an edit of blocks. */
+type DecisionRequest = Extract<OutlineEditRequest, { confirm: string } | { reject: string }>;
+
+function isDecision(request: OutlineEditRequest): request is DecisionRequest {
+	return "confirm" in request || "reject" in request;
+}
 
 export interface OutlineEditInput {
 	edits: OutlineEditRequest[];
@@ -183,7 +220,9 @@ const STATUS_OF: Record<Exclude<OutlineCheckbox, "none">, OutlineTaskInput["stat
 
 type EditKind = "add" | "replace" | "move" | "delete" | "set";
 
-function kindOf(request: OutlineEditRequest): EditKind {
+type BlockEditRequest = Exclude<OutlineEditRequest, DecisionRequest>;
+
+function kindOf(request: BlockEditRequest): EditKind {
 	if ("add" in request) return "add";
 	if ("replace" in request) return "replace";
 	if ("move" in request) return "move";
@@ -191,7 +230,7 @@ function kindOf(request: OutlineEditRequest): EditKind {
 	return "set";
 }
 
-function targetOf(request: OutlineEditRequest): string {
+function targetOf(request: BlockEditRequest): string {
 	if ("add" in request) return request.add;
 	if ("replace" in request) return request.replace;
 	if ("move" in request) return request.move;
@@ -215,7 +254,7 @@ interface PlannedItem {
 
 interface EditState {
 	index: number;
-	request: OutlineEditRequest;
+	request: BlockEditRequest;
 	kind: EditKind;
 	problems: string[];
 	notes: string[];
@@ -280,7 +319,10 @@ async function locate(
 		return space ? { kind: "root", space } : { problem: OUTLINE_TOOL_TEXT.noSuchSpace(`${root}/`) };
 	}
 	const resolution = await scope.resolve(ref);
-	if (resolution.status === "not_found") return { problem: OUTLINE_TOOL_TEXT.notFound(ref) };
+	if (resolution.status === "not_found") {
+		const held = await pendingNewBlock(scope, ref);
+		return { problem: held ?? OUTLINE_TOOL_TEXT.notFound(ref) };
+	}
 	if (resolution.status === "ambiguous") {
 		return {
 			problem: OUTLINE_TOOL_TEXT.edit.ambiguous(
@@ -381,14 +423,152 @@ function noteLine(edit: EditState, note: OutlineNote): string {
 	return OUTLINE_TOOL_TEXT.edit.parseNote(edit.index + 1, note.line, note.message);
 }
 
+/**
+ * When `ref` names a block an open pending change adds (it does not exist until confirmed): why
+ * nothing can be written to or under it yet. Looks in the space `key/` names, or this session's
+ * own spaces; reads their open changes (bounded).
+ */
+async function pendingNewBlock(scope: OutlineAgentScope, ref: string): Promise<string | null> {
+	const bare = bareReference(ref);
+	const address = parseAddress(bare);
+	const sid = address ? address.sid : isShortId(bare) ? bare : null;
+	if (!sid) return null;
+	const spaces = address
+		? [await scope.spaceByKey(address.space)]
+		: (await scope.ownSpaces()).map((own) => own.space);
+	for (const space of spaces) {
+		if (!space) continue;
+		const rows = await scope.store.listOpenPendingBySpace(
+			space.id,
+			OUTLINE_PENDING_LIMITS.scanPerSpace,
+		);
+		// Heads only: the blocks a change adds are listed by sid (review S-7).
+		const found = rows.find((row) => row.addsJson.some((add) => add.sid === sid));
+		if (found) {
+			// Who decides is the lock as it is now (review S-8).
+			const [row] = await withCurrentDeciders([found], { store: scope.store });
+			if (!row) continue;
+			const names = await pendingNames([row]);
+			const titles = await scope.readableTitles(names.narrators);
+			const by =
+				row.deciderJson.by.kind === "human"
+					? OUTLINE_TOOL_TEXT.pending.deciderPerson(
+							names.users.get(row.deciderJson.by.id) ?? null,
+							row.deciderJson.by.id,
+						)
+					: OUTLINE_TOOL_TEXT.pending.deciderSession(
+							titles.get(row.deciderJson.by.id) ?? null,
+							row.deciderJson.by.id,
+						);
+			const delegate = row.deciderJson.delegate;
+			return OUTLINE_TOOL_TEXT.edit.pendingNewBlock(
+				bare,
+				outlinePendingLabel(row.id),
+				delegate
+					? OUTLINE_TOOL_TEXT.pending.deciderEither(
+							by,
+							OUTLINE_TOOL_TEXT.pending.deciderSession(titles.get(delegate) ?? null, delegate),
+						)
+					: by,
+			);
+		}
+	}
+	return null;
+}
+
+/** `confirm` and `reject` edits: decisions on pending changes, one by one (`pending.ts`). */
+async function decideEdits(
+	scope: OutlineAgentScope,
+	requests: readonly DecisionRequest[],
+): Promise<OutlineToolOutput> {
+	const text = OUTLINE_TOOL_TEXT.pending;
+	const lines: string[] = [];
+	const decided: Array<Record<string, unknown>> = [];
+	let failures = 0;
+	const by = {
+		kind: "agent" as const,
+		narratorId: scope.narratorId,
+		responsibleUserId: scope.ctx.userId,
+	};
+	for (const [i, request] of requests.entries()) {
+		const ref = "confirm" in request ? request.confirm : request.reject;
+		const prefix = `${i + 1}. `;
+		const id = outlinePendingIdOf(ref);
+		const row = id ? (await scope.store.getPending([id]))[0] : undefined;
+		const space = row ? await scope.store.getSpace(row.spaceId) : null;
+		// A change in a space this session may not read is no change at all, as far as it can tell.
+		if (!row || !space || !(await scope.canRead(space))) {
+			failures++;
+			lines.push(`${prefix}${id ? OUTLINE_PENDING_TEXT.notFound(ref.trim()) : text.badLabel(ref)}`);
+			continue;
+		}
+		const label = outlinePendingLabel(row.id);
+		// Deciding (confirming, rejecting, withdrawing) writes the space: it needs write access
+		// (review B-3).
+		const refusal = await scope.writeRefusal(space);
+		if (refusal) {
+			failures++;
+			lines.push(`${prefix}${refusalText(refusal, await scope.describe(space))}`);
+			continue;
+		}
+		try {
+			if ("confirm" in request) {
+				const done = await confirmOutlinePending({ pendingId: row.id, by });
+				const names = await pendingNames([row]);
+				const titles = await scope.readableTitles(names.narrators);
+				const proposer = row.requesterSession
+					? text.deciderSession(titles.get(row.requesterSession) ?? null, row.requesterSession)
+					: OUTLINE_TOOL_TEXT.edit.someone;
+				lines.push(`${prefix}${text.confirmed(label, done.write.commit?.seq ?? null, proposer)}`);
+				decided.push({ confirm: label, commit: done.write.commit });
+			} else {
+				const done = await rejectOutlinePending({
+					pendingId: row.id,
+					by,
+					reason: request.reason ?? null,
+				});
+				lines.push(
+					`${prefix}${done.status === "withdrawn" ? text.withdrew(label) : text.rejected(label)}`,
+				);
+				decided.push({ reject: label, status: done.status });
+			}
+		} catch (error) {
+			if (!(error instanceof OutlinePendingError)) throw error;
+			failures++;
+			lines.push(`${prefix}${error.message}`);
+			for (const detail of error.details.slice(0, 10)) lines.push(`   - ${detail}`);
+		}
+	}
+	return {
+		output: lines.join("\n"),
+		...(failures === requests.length ? { isError: true } : {}),
+		metadata: { tool: "OutlineEdit", decided },
+	};
+}
+
 export async function outlineEdit(
 	scope: OutlineAgentScope,
 	input: OutlineEditInput,
 	provenance: OutlineEditProvenance,
 ): Promise<OutlineToolOutput> {
 	const meta = { tool: "OutlineEdit" } as Record<string, unknown>;
+	const decisions = input.edits.filter(isDecision);
+	if (decisions.length > 0) {
+		if (decisions.length !== input.edits.length) {
+			return {
+				output: [
+					OUTLINE_TOOL_TEXT.edit.nothingWritten,
+					`- ${OUTLINE_TOOL_TEXT.edit.mixedDecisions}`,
+				].join("\n"),
+				isError: true,
+				metadata: { ...meta, commit: null },
+			};
+		}
+		return await decideEdits(scope, decisions);
+	}
 	const globalNotes: string[] = [];
-	const edits: EditState[] = input.edits.map((request, index) => ({
+	const blockEdits = input.edits as BlockEditRequest[];
+	const edits: EditState[] = blockEdits.map((request, index) => ({
 		index,
 		request,
 		kind: kindOf(request),
@@ -1121,7 +1301,8 @@ export async function outlineEdit(
 				const written: Array<readonly [string, number]> = [];
 				const deleted: string[] = [];
 				result.results.forEach((r, i) => {
-					if (!r) return;
+					// A held operation wrote nothing.
+					if (!r || r.pending) return;
 					const op = ops[i];
 					const kind = edits[opEdit[i] as number]?.kind;
 					if (op?.op === "delete") deleted.push(r.blockId);
@@ -1168,7 +1349,14 @@ export async function outlineEdit(
 			edits,
 			outcome.written,
 			await mergedSection(scope, space, outcome.merged, scope.narratorId),
-			{ globalNotes, hints, meta },
+			{
+				globalNotes,
+				hints,
+				meta,
+				held: outcome.written.pending
+					? await heldSection(scope, space, outcome.written.pending)
+					: [],
+			},
 		);
 	}
 	const error = outcome.writeConflict;
@@ -1508,20 +1696,35 @@ function successOutput(
 	edits: readonly EditState[],
 	result: OutlineWriteResult,
 	merged: MergedSection,
-	extra: { globalNotes: string[]; hints: string[]; meta: Record<string, unknown> },
+	extra: {
+		globalNotes: string[];
+		hints: string[];
+		meta: Record<string, unknown>;
+		/** What the result says about operations held for confirmation. */
+		held: string[];
+	},
 ): OutlineToolOutput {
 	const mergedMeta =
 		merged.sids.size > 0 ? { merged: [...merged.sids].map((sid) => `${space.key}/${sid}`) } : {};
-	if (!result.commit) {
+	const pending = result.pending;
+	const pendingMeta = pending ? { pending: outlinePendingLabel(pending.id) } : {};
+	if (!result.commit && !pending) {
 		return {
 			output: [OUTLINE_TOOL_TEXT.edit.noChange, ...merged.lines].join("\n"),
 			metadata: { ...extra.meta, commit: null, ...mergedMeta },
 		};
 	}
-	const lines = [OUTLINE_TOOL_TEXT.edit.committed(result.commit.seq, spaceText, edits.length)];
+	const lines = [
+		result.commit
+			? OUTLINE_TOOL_TEXT.edit.committed(result.commit.seq, spaceText, edits.length)
+			: OUTLINE_TOOL_TEXT.edit.nothingWrittenDirectly,
+	];
+	const heldOps = new Set(pending?.opIndexes ?? []);
 	const summary: Array<Record<string, unknown>> = [];
 	for (const edit of edits) {
 		const n = edit.index + 1;
+		const firstLine = lines.length;
+		const heldHere = edit.opIndexes.filter((i) => heldOps.has(i)).length;
 		const r = edit.request;
 		const firstResult = result.results[edit.opIndexes[0] as number];
 		const where = (l: Located | undefined) =>
@@ -1572,7 +1775,17 @@ function successOutput(
 			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.set(id(sid), parts)}`);
 			summary.push({ op: "set", address: `${space.key}/${sid}` });
 		}
+		if (heldHere > 0) {
+			const said = (lines[firstLine] as string).replace(/^\d+\. /, "");
+			lines[firstLine] = OUTLINE_TOOL_TEXT.edit.heldEdit(
+				n,
+				said,
+				heldHere === edit.opIndexes.length,
+			);
+			(summary.at(-1) as Record<string, unknown>).pending = true;
+		}
 	}
+	lines.push(...extra.held);
 	lines.push(...merged.lines);
 	const notes = [...edits.flatMap((edit) => edit.notes), ...extra.globalNotes];
 	if (notes.length > 0)
@@ -1588,6 +1801,70 @@ function successOutput(
 			edits: summary,
 			notes: notes.length,
 			...mergedMeta,
+			...pendingMeta,
 		},
 	};
+}
+
+/**
+ * What a result says about the operations a call had held for confirmation: as which change,
+ * waiting for whom, which tasks wait for it, and what to do meanwhile.
+ */
+async function heldSection(
+	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
+	pending: OutlinePendingOutcome,
+): Promise<string[]> {
+	const text = OUTLINE_TOOL_TEXT.pending;
+	const id = scope.addressIn(space);
+	const decider = pending.decider;
+	const names = await readDisplayNames({
+		userIds: decider.by.kind === "human" ? [decider.by.id] : [],
+		narratorIds: [
+			...(decider.by.kind !== "human" ? [decider.by.id] : []),
+			...(decider.delegate ? [decider.delegate] : []),
+		],
+	}).catch(() => null);
+	// Sessions by title only when this one may read them (review S-5).
+	const titles = await scope.readableTitles(names?.narrators ?? new Map());
+	const person =
+		decider.by.kind === "human"
+			? text.deciderPerson(names?.users.get(decider.by.id) ?? null, decider.by.id)
+			: text.deciderSession(titles.get(decider.by.id) ?? null, decider.by.id);
+	// A change the delegate's own session proposed goes to the locker alone (it never confirms
+	// its own).
+	const session = scope.rootNarratorId ?? scope.narratorId;
+	const delegate =
+		decider.delegate &&
+		((await scope.store.getNarratorRoots([decider.delegate])).get(decider.delegate)?.root ??
+			decider.delegate) !== session
+			? decider.delegate
+			: null;
+	const who = delegate
+		? text.deciderEither(person, text.deciderSession(titles.get(delegate) ?? null, delegate))
+		: person;
+	const ids = [...new Set([pending.rootBlockId, ...pending.blockIds])].slice(0, 50);
+	const rows = new Map((await scope.store.getBlocks(ids)).map((b) => [b.id, b]));
+	const root = rows.get(pending.rootBlockId);
+	const rootText = root
+		? `[${id(root.sid)}] ${clip(blockTitle(root.content), 60) || OUTLINE_TOOL_TEXT.untitled}`
+		: pending.rootAddress;
+	const lines = [
+		text.held(
+			outlinePendingLabel(pending.id),
+			pending.opIndexes.length,
+			rootText,
+			who,
+			pending.merged,
+		),
+	];
+	const waiting = pending.blockIds.flatMap((blockId) => {
+		const row = rows.get(blockId);
+		if (!row || row.deleted || !row.taskJson || row.taskJson.status === "done") return [];
+		if (row.taskJson.status === "cancelled") return [];
+		return [`[${id(row.sid)}] ${clip(blockTitle(row.content), 40) || OUTLINE_TOOL_TEXT.untitled}`];
+	});
+	lines.push(waiting.length > 0 ? text.heldWaiting(waiting) : text.heldCarryOn);
+	lines.push(text.heldRead);
+	return lines;
 }

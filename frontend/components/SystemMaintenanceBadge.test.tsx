@@ -9,6 +9,23 @@ import {
 	systemLifecycleStatusQueryKey,
 } from "../lib/api/system-lifecycle";
 
+const wsListeners = new Set<(data: Record<string, unknown>) => void>();
+const connections = new Set<(connected: boolean, isReconnect: boolean) => void>();
+mock.module("../lib/narrator-ws-manager", () => ({
+	narratorWSManager: {
+		addListener: (opts: { types: string[] }, callback: (data: Record<string, unknown>) => void) => {
+			expect(opts.types).toEqual(["system_lifecycle_changed"]);
+			wsListeners.add(callback);
+			return callback;
+		},
+		removeListener: (callback: (data: Record<string, unknown>) => void) =>
+			wsListeners.delete(callback),
+		onConnectionChange: (callback: (connected: boolean, isReconnect: boolean) => void) => {
+			connections.add(callback);
+			return () => connections.delete(callback);
+		},
+	},
+}));
 const originalApi = { ...(await import("../lib/api")) };
 const originalAuth = { ...(await import("../hooks/useAuth")) };
 const originalI18n = { ...(await import("react-i18next")) };
@@ -34,6 +51,7 @@ let noticeCalls = 0;
 let cancellations = 0;
 let failure: Error | null = null;
 let noticeFailure: Error | null = null;
+let pendingInitialResponse: Promise<SystemLifecycleStatus> | null = null;
 function detailedStatus(): SystemLifecycleStatus {
 	return {
 		...notice,
@@ -64,12 +82,22 @@ mock.module("../lib/api", () => ({
 			calls++;
 			detailCalls++;
 			if (noticeFailure) throw noticeFailure;
+			if (pendingInitialResponse) {
+				const pending = pendingInitialResponse;
+				pendingInitialResponse = null;
+				return pending;
+			}
 			return detailedStatus();
 		},
 		getSystemLifecycleNotice: async () => {
 			calls++;
 			noticeCalls++;
 			if (noticeFailure) throw noticeFailure;
+			if (pendingInitialResponse) {
+				const pending = pendingInitialResponse;
+				pendingInitialResponse = null;
+				return pending;
+			}
 			return notice;
 		},
 		cancelSystemRecovery: async () => {
@@ -99,6 +127,7 @@ beforeEach(() => {
 	cancellations = 0;
 	failure = null;
 	noticeFailure = null;
+	pendingInitialResponse = null;
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	for (const [key, value] of Object.entries({
 		window,
@@ -129,6 +158,8 @@ beforeEach(() => {
 afterEach(async () => {
 	await act(async () => root?.unmount());
 	root = null;
+	expect(wsListeners.size).toBe(0);
+	expect(connections.size).toBe(0);
 	container.remove();
 	client.clear();
 	for (const [key, descriptor] of globals) {
@@ -159,11 +190,126 @@ async function render(withSettings = false) {
 }
 
 describe("global maintenance indication", () => {
+	test.each([
+		"admin",
+		"user",
+	] as const)("%s does not poll in idle or maintenance", async (userRole) => {
+		role = userRole;
+		notice.phase = "idle";
+		await render();
+		expect(calls).toBe(1);
+		await act(async () => {
+			await Bun.sleep(2_100);
+		});
+		expect(calls).toBe(1);
+		notice = { phase: "preparing", shutdownRequested: false };
+		await act(async () => {
+			for (const listener of wsListeners) listener({ type: "system_lifecycle_changed" });
+			await Bun.sleep(150);
+		});
+		await flush();
+		expect(calls).toBe(2);
+		expect(container.textContent).toContain("systemMaintenancePreparing");
+		await act(async () => {
+			await Bun.sleep(2_100);
+		});
+		expect(calls).toBe(2);
+		expect(userRole === "admin" ? noticeCalls : detailCalls).toBe(0);
+	}, 10_000);
+
+	test.each([
+		"admin",
+		"user",
+	] as const)("%s push supersedes a stale initial HTTP response", async (userRole) => {
+		role = userRole;
+		notice.phase = "idle";
+		const stale = detailedStatus();
+		let resolveInitial!: (status: SystemLifecycleStatus) => void;
+		pendingInitialResponse = new Promise((resolve) => {
+			resolveInitial = resolve;
+		});
+		await render();
+		expect(calls).toBe(1);
+		notice.phase = "prepared";
+		await act(async () => {
+			for (const listener of wsListeners) listener({ type: "system_lifecycle_changed" });
+			await Bun.sleep(150);
+		});
+		await flush();
+		expect(calls).toBe(2);
+		expect(container.textContent).toContain("systemMaintenancePaused");
+		await act(async () => {
+			resolveInitial(stale);
+		});
+		await flush();
+		expect(container.textContent).toContain("systemMaintenancePaused");
+	});
+
+	test("badge and settings share one subscription and coalesce push bursts", async () => {
+		notice.phase = "preparing";
+		await render(true);
+		expect(wsListeners.size).toBe(1);
+		expect(connections.size).toBe(1);
+		const before = detailCalls;
+		notice.phase = "prepared";
+		await act(async () => {
+			for (let i = 0; i < 20; i++) {
+				for (const listener of wsListeners) listener({ type: "system_lifecycle_changed" });
+			}
+			await Bun.sleep(150);
+		});
+		await flush();
+		expect(detailCalls).toBe(before + 1);
+		expect(noticeCalls).toBe(0);
+		expect(container.textContent).toContain("systemRecoveryPrepared");
+		expect(container.textContent).toContain("systemMaintenancePaused");
+	});
+
+	test.each([
+		false,
+		true,
+	])("connection reconciles missed transitions (reconnect=%s)", async (reconnect) => {
+		await render();
+		const before = detailCalls;
+		notice.phase = "idle";
+		await act(async () => {
+			for (const callback of connections) callback(true, reconnect);
+			await Bun.sleep(150);
+		});
+		await flush();
+		expect(detailCalls).toBe(before + 1);
+		expect(container.querySelector("button")).toBeNull();
+	});
+
+	test("reconnection releases the shutdown fetch guard after server restart", async () => {
+		notice = { phase: "shutting_down", shutdownRequested: true };
+		await render();
+		expect(container.textContent).toContain("systemMaintenanceClosing");
+		notice = { phase: "idle", shutdownRequested: false };
+		await act(async () => {
+			for (const callback of connections) callback(true, true);
+			await Bun.sleep(150);
+		});
+		await flush();
+		expect(detailCalls).toBe(2);
+		expect(container.querySelector("button")).toBeNull();
+	});
+
+	test("unmount cancels a queued invalidation", async () => {
+		await render();
+		await act(async () => {
+			for (const listener of wsListeners) listener({ type: "system_lifecycle_changed" });
+			root?.unmount();
+			root = null;
+			await Bun.sleep(150);
+		});
+		expect(calls).toBe(1);
+	});
 	test("header shows prepared as soon as the settings status finishes preparing", async () => {
 		notice.phase = "preparing";
 		await render(true);
 		expect(container.textContent).toContain("systemMaintenancePreparingDescription");
-		// The settings poll has finished, but the independent redacted notice is still stale.
+		// The shared status has finished preparing, but the redacted notice is still stale.
 		await act(async () =>
 			client.setQueryData<SystemLifecycleStatus>(systemLifecycleStatusQueryKey, {
 				...detailedStatus(),

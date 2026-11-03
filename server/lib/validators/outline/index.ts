@@ -1,5 +1,6 @@
 import {
 	OUTLINE_BLOCK_ID_RE,
+	OUTLINE_PENDING_API_LIMITS,
 	OUTLINE_RESOLVE_REQUEST_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
@@ -88,4 +89,14 @@ export const outlineViewStatePutSchema = z.object({
 		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
 		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
 	layout: z.enum(["right", "down"]),
+});
+
+/** Locking a task tree: the session that may confirm step changes on the locker's behalf. */
+export const outlineLockBodySchema = z.object({
+	delegate: outlineIdSchema.nullable().optional(),
+});
+
+/** Rejecting a pending change: why, for its proposer. */
+export const outlinePendingRejectBodySchema = z.object({
+	reason: z.string().trim().max(OUTLINE_PENDING_API_LIMITS.maxReasonChars).nullable().optional(),
 });

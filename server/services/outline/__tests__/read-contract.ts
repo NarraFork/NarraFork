@@ -682,7 +682,7 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "last writes: the latest version that counts, leaving out an actor's own or its moves",
+		name: "last writes: the latest version that counts, leaving out an actor's own (or several actors') or its moves",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
 			const agent = { kind: "agent" as const, id: "agent-last-writes" };
@@ -723,6 +723,15 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 			expect(await last(0, MOVES)).toBe(s4);
 			expect(await last(s4, MOVES)).toBeUndefined();
 			expect(await last(s2, MOVES, "someone-else")).toBe(s5);
+			// Several actors of a kind left out at once (a session's narrators): theirs do not count.
+			const several = await ctx.store.findLastWrites([{ blockId: x, afterSeq: s4 }], {
+				actorKind: "agent",
+				actorId: "someone-else",
+				actorIds: [agent.id, "another"],
+				flags: ALL,
+			});
+			expect(several).toEqual([]);
+			expect(await last(s4, ALL, "someone-else")).toBe(s5);
 			// The agent's own content write counts when only moves are left out.
 			const own = a0(
 				await write(ctx, space, [{ op: "insert", parent: null, content: "by the agent" }], {

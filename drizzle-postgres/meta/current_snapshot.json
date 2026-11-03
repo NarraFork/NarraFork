@@ -1,6 +1,6 @@
 {
-  "id": "4ab2a291-7b25-4df4-895f-c4b59f7e2690",
-  "prevId": "297184e9-2ffa-48e9-b8e6-70237e9adde4",
+  "id": "0d06e5ce-62f3-41cd-966c-5e301124f44e",
+  "prevId": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -17708,6 +17708,22 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_outline_blocks_locked": {
+          "name": "idx_outline_blocks_locked",
+          "columns": [
+            {
+              "expression": "page_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "(\"task_json\"::jsonb #>> '{lock}') IS NOT NULL AND \"deleted\" = FALSE",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -18070,6 +18086,307 @@
           ]
         }
       },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.outline_pending": {
+      "name": "outline_pending",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "space_id": {
+          "name": "space_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "page_id": {
+          "name": "page_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "root_block_id": {
+          "name": "root_block_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ops_json": {
+          "name": "ops_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "base_json": {
+          "name": "base_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "op_count": {
+          "name": "op_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subtree_json": {
+          "name": "subtree_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "block_ids_json": {
+          "name": "block_ids_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "adds_json": {
+          "name": "adds_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requested_by_json": {
+          "name": "requested_by_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requester_session": {
+          "name": "requester_session",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decider_json": {
+          "name": "decider_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "decider_user_id": {
+          "name": "decider_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "rev": {
+          "name": "rev",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "decided_at": {
+          "name": "decided_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decided_by_json": {
+          "name": "decided_by_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decision_commit_id": {
+          "name": "decision_commit_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reported_at": {
+          "name": "reported_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_outline_pending_space": {
+          "name": "idx_outline_pending_space",
+          "columns": [
+            {
+              "expression": "space_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_pending_page_open": {
+          "name": "idx_outline_pending_page_open",
+          "columns": [
+            {
+              "expression": "page_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"status\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_pending_root_open": {
+          "name": "idx_outline_pending_root_open",
+          "columns": [
+            {
+              "expression": "root_block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"status\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "uq_outline_pending_open_proposer": {
+          "name": "uq_outline_pending_open_proposer",
+          "columns": [
+            {
+              "expression": "requester_session",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "root_block_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"status\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_pending_unreported": {
+          "name": "idx_outline_pending_unreported",
+          "columns": [
+            {
+              "expression": "requester_session",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "page_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"reported_at\" IS NULL AND \"status\" <> 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_pending_decider_open": {
+          "name": "idx_outline_pending_decider_open",
+          "columns": [
+            {
+              "expression": "decider_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"status\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "uq_outline_pending_decision_commit": {
+          "name": "uq_outline_pending_decision_commit",
+          "columns": [
+            {
+              "expression": "decision_commit_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "outline_pending_space_id_outline_spaces_id_fk": {
+          "name": "outline_pending_space_id_outline_spaces_id_fk",
+          "tableFrom": "outline_pending",
+          "tableTo": "outline_spaces",
+          "columnsFrom": [
+            "space_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},

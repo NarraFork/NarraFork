@@ -12,6 +12,8 @@ import { logger } from "./logger";
 
 export type NarraForkEvent =
 	| { type: "auth:changed"; userId?: string }
+	// Invalidation only: lifecycle details are fetched through the authorized status API.
+	| { type: "system:lifecycle_changed" }
 	| { type: "git:workspace_invalidated"; queryKey: string }
 	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
 	| {
@@ -424,6 +426,16 @@ export type NarraForkEvent =
 			pageIds: string[];
 			actorKind: "human" | "agent" | "system";
 			actorId: string;
+	  }
+	| {
+			/**
+			 * Pending changes of outline pages changed (one proposed, merged into, decided or
+			 * withdrawn; design §2.6). Ids only: a page subscriber re-reads the page's summary.
+			 * Notifying the people who decide is plan PR 7 (the inbox).
+			 */
+			type: "outline:pending";
+			spaceId: string;
+			pageIds: string[];
 	  }
 	// Human-to-human chat. Ids and scalars only — never message bodies — so a
 	// listener (WS fan-out today, an IM bridge later) can route without holding a

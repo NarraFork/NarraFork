@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
 	EXECUTOR_PLATFORMS,
 	type ExecutorPlatform,
@@ -8,6 +9,7 @@ import { ValidationError } from "../errors";
 import {
 	buildExecutorInstallOneLiner,
 	buildExecutorInstallScript,
+	buildUniversalExecutorInstall,
 	type ExecutorInstallScriptInput,
 	powershellSingleQuote,
 	shellSingleQuote,
@@ -18,6 +20,7 @@ const EXECUTOR_VERSION = BUILD_EXECUTOR_DISTRIBUTION.version;
 
 const SHA256 = "a".repeat(64);
 const TICKET = "b".repeat(64);
+const unixTest = process.platform === "win32" ? test.skip : test;
 
 function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorInstallScriptInput {
 	const platform: ExecutorPlatform = overrides.platform ?? "linux-amd64";
@@ -37,6 +40,80 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 		...overrides,
 	};
 }
+
+// Keep the command line short: the generated installer travels through bounded stdin,
+// not -EncodedCommand (Windows has a 32 KiB command-line limit). No installer is executed.
+function runNativePowerShell(source: string, compileOnly = false) {
+	const harness = [
+		"$ProgressPreference = 'SilentlyContinue'",
+		"$ErrorActionPreference = 'Stop'",
+		"$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))",
+		compileOnly
+			? "[void][scriptblock]::Create($source); Write-Output 'COMPILED'"
+			: "& ([scriptblock]::Create($source))",
+	].join("; ");
+	const result = spawnSync(
+		"powershell.exe",
+		[
+			"-NoProfile",
+			"-NonInteractive",
+			"-EncodedCommand",
+			Buffer.from(harness, "utf16le").toString("base64"),
+		],
+		{
+			input: Buffer.from(source, "utf8").toString("base64"),
+			encoding: "utf8",
+			timeout: 15_000,
+			maxBuffer: 32 * 1024,
+			windowsHide: true,
+		},
+	);
+	expect(result.error).toBeUndefined();
+	expect(result.signal).toBeNull();
+	expect(result.stderr).toBe("");
+	expect(result.status).toBe(0);
+	return result.stdout.trim();
+}
+
+describe("native Windows PowerShell (no network or service operations)", () => {
+	const windowsTest = process.platform === "win32" ? test : test.skip;
+	const urls = {
+		"windows-amd64": "https://bootstrap.invalid/amd64?ticket=fixture",
+		"windows-arm64": "https://bootstrap.invalid/arm64?ticket=fixture",
+	} as const;
+	const universal = buildUniversalExecutorInstall({ target: "windows", scriptUrls: urls });
+	for (const [nativeArch, platform] of [
+		["AMD64", "windows-amd64"],
+		["ARM64", "windows-arm64"],
+	] as const) {
+		windowsTest(
+			`${nativeArch}: the same universal command chooses the native URL`,
+			() => {
+				const source = [
+					"$env:OS = 'Windows_NT'",
+					`$env:PROCESSOR_ARCHITEW6432 = '${nativeArch}'`,
+					// Deliberately conflicting emulated process architecture: it must not win.
+					`$env:PROCESSOR_ARCHITECTURE = '${nativeArch === "AMD64" ? "ARM64" : "AMD64"}'`,
+					// Function precedence intercepts the fetch; its payload only prints the URL.
+					`function Invoke-RestMethod { param([string]$Uri) return "Write-Output 'selected:$Uri'" }`,
+					universal.oneLiner,
+				].join("\n");
+				expect(runNativePowerShell(source)).toBe(`selected:${urls[platform]}`);
+			},
+			20_000,
+		);
+		for (const mode of ["system", "user"] as const) {
+			windowsTest(
+				`${platform} ${mode}: final installer compiles without executing`,
+				() => {
+					const { script } = buildExecutorInstallScript(input({ platform, mode }));
+					expect(runNativePowerShell(script, true)).toBe("COMPILED");
+				},
+				20_000,
+			);
+		}
+	}
+});
 
 describe("token handling", () => {
 	test("no script embeds the registration key or passes it in argv", () => {
@@ -216,7 +293,7 @@ describe("the one-line install command", () => {
 	 * shell exit status and no string assertion can establish it. `false` stands in
 	 * for a failing fetch: same "substitution produced nothing" shape, no network.
 	 */
-	test("the generated command really exits non-zero when the fetch fails", async () => {
+	unixTest("the generated command really exits non-zero when the fetch fails", async () => {
 		const oneLiner = buildExecutorInstallOneLiner({
 			scriptUrl: "https://nf.example.com/api/executor/install/linux-amd64?ticket=abc",
 			shell: "sh",
@@ -325,7 +402,8 @@ describe("install locations and service wiring", () => {
 		const { script } = buildExecutorInstallScript(input({ mode: "user" }));
 		expect(script).toContain("$HOME/.local/bin");
 		expect(script).toContain("$HOME/.config/narrafork");
-		expect(script).toContain("systemctl --user enable --now");
+		expect(script).toContain("systemctl --user enable narrafork-executor");
+		expect(script).toContain("systemctl --user restart narrafork-executor");
 		expect(script).not.toContain("sudo ");
 	});
 });
@@ -605,6 +683,11 @@ describe("install locations, continued", () => {
 		).script;
 		expect(script).toContain("sc.exe delete NarraForkExecutor");
 		expect(script).toContain("Unregister-ScheduledTask");
+		for (const stop of ["Stop-Service", "Stop-ScheduledTask"]) {
+			expect(script.indexOf("Checksum verified.")).toBeLessThan(script.indexOf(stop));
+			expect(script.indexOf(stop)).toBeLessThan(script.indexOf("Copy-Item"));
+			expect(script.split("\n").find((line) => line.includes(stop))).toContain("-ErrorAction Stop");
+		}
 	});
 
 	test("windows user mode uses a scheduled task and needs no admin rights", () => {
@@ -615,6 +698,17 @@ describe("install locations, continued", () => {
 		).script;
 		expect(script).toContain("Register-ScheduledTask");
 		expect(script).toContain("New-ScheduledTaskTrigger -AtLogOn");
+		expect(script).toContain(
+			"if ($existingTask) { Stop-ScheduledTask -TaskName 'NarraForkExecutor' -ErrorAction Stop }",
+		);
+		expect(script.indexOf("Checksum verified.")).toBeLessThan(script.indexOf("Stop-ScheduledTask"));
+		expect(script.indexOf("Stop-ScheduledTask")).toBeLessThan(script.indexOf("Copy-Item"));
+		expect(script.indexOf("Stop-ScheduledTask")).toBeLessThan(
+			script.indexOf("Register-ScheduledTask"),
+		);
+		expect(script.indexOf("Register-ScheduledTask")).toBeLessThan(
+			script.indexOf("Start-ScheduledTask"),
+		);
 		expect(script).not.toContain("New-Service");
 		expect(script).not.toContain("WindowsBuiltInRole]::Administrator");
 	});

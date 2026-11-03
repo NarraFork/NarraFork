@@ -19,6 +19,18 @@ import { formatLocaleDate } from "../../lib/intl-format";
 const SAN_ENTRY_RE =
 	/^(\*\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$|^[0-9a-f:.]+$/;
 
+function normalizeSan(value: string): string {
+	const san = value.trim().toLowerCase();
+	if (san.includes(":")) {
+		try {
+			return new URL(`http://[${san}]`).hostname;
+		} catch {
+			// Invalid input is reported by the editor's validation instead.
+		}
+	}
+	return san;
+}
+
 function formatExpiry(iso: string | null): string | null {
 	if (!iso) return null;
 	// `formatLocaleDate` rather than the Date method with no locale argument: the bare
@@ -151,19 +163,15 @@ export function TlsSection({ onCertIssued }: TlsSectionProps) {
 	};
 
 	const data = status.data;
-	// Saved names the current certificate does not cover yet → re-issue needed.
-	const certSanSet = new Set((data?.certSans ?? []).map((s) => s.toLowerCase()));
-	const pendingSans = data?.certExists
-		? sanInput.filter((s) => !certSanSet.has(s.trim().toLowerCase()))
-		: [];
-	// Custom names the current cert was issued with = its SANs minus the auto set.
-	// Any difference (added OR removed) from the editor means a re-issue is due.
-	const autoSanSet = new Set((data?.autoSans ?? []).map((s) => s.toLowerCase()));
-	const certCustom = [...certSanSet].filter((s) => !autoSanSet.has(s));
-	const editorSans = new Set(sanInput.map((s) => s.trim().toLowerCase()).filter(Boolean));
+	const certSanSet = new Set((data?.certSans ?? []).map(normalizeSan));
+	// Compare the complete desired set, including automatic IPs that may have changed
+	// since issuance. URL canonicalization avoids false mismatches for equivalent IPv6.
+	const desiredSans = new Set(
+		[...(data?.autoSans ?? []), ...sanInput].map(normalizeSan).filter(Boolean),
+	);
 	const sansChanged =
 		!!data?.certExists &&
-		(editorSans.size !== certCustom.length || certCustom.some((s) => !editorSans.has(s)));
+		(desiredSans.size !== certSanSet.size || [...desiredSans].some((s) => !certSanSet.has(s)));
 
 	return (
 		<Stack gap="sm">
@@ -176,9 +184,14 @@ export function TlsSection({ onCertIssued }: TlsSectionProps) {
 							: t("tlsCaStatusMissing")}
 					</Text>
 					{data.certExists && (
-						<Text size="sm" c="dimmed">
-							{t("tlsCertStatusExists", { date: formatExpiry(data.certExpiresAt) })}
-						</Text>
+						<>
+							<Text size="sm" c="dimmed">
+								{t("tlsCertStatusExists", { date: formatExpiry(data.certExpiresAt) })}
+							</Text>
+							<Text size="xs" c="dimmed">
+								{t("tlsCertSans", { sans: data.certSans.join(", ") || "—" })}
+							</Text>
+						</>
 					)}
 				</Stack>
 			)}
@@ -198,9 +211,9 @@ export function TlsSection({ onCertIssued }: TlsSectionProps) {
 				error={sanError}
 				clearable
 			/>
-			{pendingSans.length > 0 && (
+			{sansChanged && (
 				<Text size="xs" c="yellow">
-					{t("tlsSansPendingReissue", { sans: pendingSans.join(", ") })}
+					{t("tlsSansPendingReissue")}
 				</Text>
 			)}
 			{data && data.autoSans.length > 0 && (

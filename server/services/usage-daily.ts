@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import type { db as defaultDb } from "@server/db";
 import { type apiRequests, narrators, usageDaily } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
@@ -95,4 +96,44 @@ export function addUsageDaily(tx: Tx, record: RequestRecord): void {
 			},
 		})
 		.run();
+}
+
+/**
+ * Add requests inserted in bulk (a data import) to the daily ledger, in one SQL
+ * statement. `afterRowid` is the largest `api_requests` rowid before the insert, so
+ * re-importing the same rows (skipped by primary key) never counts them twice. Older
+ * exports carry no billing user or project: the narrator owner, then the initiator,
+ * stands in for the former.
+ */
+export function addImportedRequestsToUsageDaily(sqlite: Database, afterRowid: number): void {
+	const positive = (column: string) => `SUM(MAX(COALESCE(r.${column}, 0), 0))`;
+	sqlite
+		.prepare(
+			`INSERT INTO usage_daily (id, day, billing_user_id, project_id, provider, credential_id, model,
+			request_count, input_tokens, output_tokens, cached_input_tokens, cache_creation_tokens,
+			reasoning_tokens, cost_usd, unpriced_request_count)
+		SELECT lower(hex(randomblob(12))), substr(r.created_at, 1, 10),
+			COALESCE(r.billing_user_id, root.owner_user_id, r.user_id, ''), COALESCE(r.project_id, ''),
+			COALESCE(r.provider, ''), COALESCE(r.credential_id, ''), COALESCE(r.model, ''),
+			COUNT(*), ${positive("input_tokens")}, ${positive("output_tokens")},
+			${positive("cached_input_tokens")}, ${positive("cache_creation_input_tokens")},
+			${positive("reasoning_tokens")}, ${positive("cost_usd")},
+			SUM(CASE WHEN (r.cost_status IS NULL OR r.cost_status = 'complete')
+				AND r.cost_usd IS NOT NULL AND r.cost_usd >= 0 THEN 0 ELSE 1 END)
+		FROM api_requests r
+		LEFT JOIN narrators n ON n.id = r.narrator_id
+		LEFT JOIN narrators root ON root.id = COALESCE(n.acl_root_narrator_id, n.id)
+		WHERE r.rowid > ?
+		GROUP BY 2, 3, 4, 5, 6, 7
+		ON CONFLICT (day, billing_user_id, project_id, provider, credential_id, model) DO UPDATE SET
+			request_count = request_count + excluded.request_count,
+			input_tokens = input_tokens + excluded.input_tokens,
+			output_tokens = output_tokens + excluded.output_tokens,
+			cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+			cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+			reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+			cost_usd = cost_usd + excluded.cost_usd,
+			unpriced_request_count = unpriced_request_count + excluded.unpriced_request_count`,
+		)
+		.run(afterRowid);
 }

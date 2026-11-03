@@ -669,6 +669,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"fts5",
 		"errorCode",
 	],
+	"server/services/narrator-timeline.ts": ["json1"],
 	"server/services/subagent-activity.ts": ["json1"],
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
 	"server/services/token-recalculation-sqlite.ts": ["driver"],

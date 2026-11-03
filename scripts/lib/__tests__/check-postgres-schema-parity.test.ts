@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 135 tables and 1778 columns including the usage ledger", () => {
-		expect(target.tables.length).toBe(135);
+	test("covers 136 tables and 1803 columns including the usage ledger", () => {
+		expect(target.tables.length).toBe(136);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -547,8 +547,9 @@ describe("real schema parity", () => {
 		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
 		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
 		// The outline task source (P2) adds narrators.task_backend.
+		// Locks and pending confirmation (P2) add outline_pending (25).
 		// The usage ledger adds usage_daily (15) and api_requests.billing_user_id/project_id (2).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1778);
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1803);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

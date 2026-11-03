@@ -67,6 +67,11 @@ export interface OutlineRevertInput {
 	toolCallId?: string | null;
 	/** Default: `revert #seq: <the reverted commit's summary>`. */
 	summary?: string;
+	/**
+	 * Whether the actor may take away someone else's lock (a manager of the space, an admin; the
+	 * caller decides). Without it a revert that would unlock keeps the lock (`lock-kept`).
+	 */
+	unlockAuthority?: () => Promise<boolean>;
 }
 
 export interface OutlineRevertSkip extends OutlineBlockAddressed {
@@ -514,6 +519,7 @@ async function revertAttempts(
 					messageId: input.messageId ?? null,
 					toolCallId: input.toolCallId ?? null,
 					summary: input.summary ?? OUTLINE_TEXT.revertSummary(commit.seq, commit.summary),
+					...(input.unlockAuthority ? { unlockAuthority: input.unlockAuthority } : {}),
 				},
 				{
 					store,
@@ -552,13 +558,26 @@ async function revertAttempts(
 						)
 					: adjustment.kind === "order-key-moved"
 						? OUTLINE_TEXT.orderKeyMoved(adjustment.wanted)
-						: OUTLINE_TEXT.taskNotStarted,
+						: adjustment.kind === "lock-kept"
+							? OUTLINE_TEXT.lockKept
+							: OUTLINE_TEXT.taskNotStarted,
 		}));
+		// What was put back is what the commit wrote: a lock left as it was (`lock-kept`) may leave
+		// a block, or the whole revert, with nothing written.
+		let changed = written.commit ? plan.changed : [];
+		if (written.commit && notes.some((note) => note.adjustment.kind === "lock-kept")) {
+			const wrote = new Set(
+				(await store.listCommitVersions(written.commit.id, OUTLINE_LIMITS.maxRowsTouched)).map(
+					(v) => v.blockId,
+				),
+			);
+			changed = changed.filter((id) => wrote.has(id));
+		}
 		return {
 			...base,
 			commit: written.commit,
 			pageIds: written.pageIds,
-			changed: plan.changed.map(address),
+			changed: changed.map(address),
 			notes,
 		};
 	}

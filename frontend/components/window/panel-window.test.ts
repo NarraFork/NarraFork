@@ -48,6 +48,7 @@ describe("buildPanelWindowHref + parsePanelWindowDescriptor", () => {
 			"search",
 			"userchat",
 			"appearance",
+			"timeline",
 			"filetree",
 		] as const) {
 			expect(roundtrip({ panelType, narratorId: "n1" })).toEqual({ panelType, narratorId: "n1" });

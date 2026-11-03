@@ -403,11 +403,19 @@
 		},
 		{
 			"idx": 50,
-			"tag": "0050_usage_daily",
-			"id": "4ab2a291-7b25-4df4-895f-c4b59f7e2690",
+			"tag": "0050_outline_pending",
+			"id": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
 			"prevId": "297184e9-2ffa-48e9-b8e6-70237e9adde4",
 			"version": "7",
-			"snapshotDigest": "bb4e85ebaa756ac43acf141d4b70641cf77b69557a17ebcd47a09419a599a117"
+			"snapshotDigest": "ba7f5a65b94e9ea829eae70e55f875cab653e36e85c66a302d3b9c7f4b3ec002"
+		},
+		{
+			"idx": 51,
+			"tag": "0051_usage_daily",
+			"id": "0d06e5ce-62f3-41cd-966c-5e301124f44e",
+			"prevId": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
+			"version": "7",
+			"snapshotDigest": "813accd43ee579f963a4b0d8467019f1475409ca5420e13115c927af6b5cb29b"
 		}
 	]
 }

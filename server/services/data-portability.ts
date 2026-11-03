@@ -36,6 +36,7 @@ import { logger } from "@server/lib/logger";
 import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
 import { saveSettings, settings } from "@server/lib/settings";
 import type { NarraForkSettings } from "@server/lib/settings/types";
+import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
 import {
 	MAX_IMPORT_BYTES,
 	MAX_IMPORT_LABEL,
@@ -1044,6 +1045,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 
 			// 4) 自检：只处理本次新增行，兜住无法预见的悬空引用（日志会写明表与数量）
 			repairDanglingReferences(baselines);
+			// 本次新增的请求计入用量日账本（按 rowid 基线，重复导入被主键跳过的行不会重复计数）
+			if (include.requests)
+				addImportedRequestsToUsageDaily(sqlite, baselines.get("api_requests") ?? 0);
 
 			// 5) 供应商合并：`saveSettings` 是原子写（临时文件 + rename），放在事务末尾，
 			// 失败时数据整批回滚，不会留下「数据进了、供应商没进」的半成品。
@@ -1191,6 +1195,26 @@ function remapIncomingModelSettings(
 			}
 			return copy;
 		});
+	}
+	// 模型自定义参数里「单个来源」的键是 `前缀:模型`，跟着前缀改名；旧包的内联本地层同理。
+	const catalog = incoming.modelCatalog as Record<string, unknown> | undefined;
+	if (catalog && typeof catalog === "object") {
+		const rekey = (record: unknown) =>
+			record && typeof record === "object" && !Array.isArray(record)
+				? Object.fromEntries(
+						Object.entries(record as Record<string, unknown>).map(([key, value]) => [
+							rewrite(key),
+							value,
+						]),
+					)
+				: record;
+		const copy: Record<string, unknown> = { ...catalog };
+		for (const layer of ["overrides", "local"] as const) {
+			const value = catalog[layer] as Record<string, unknown> | undefined;
+			if (value && typeof value === "object")
+				copy[layer] = { ...value, connections: rekey(value.connections) };
+		}
+		next.modelCatalog = copy;
 	}
 	return next;
 }
@@ -1420,6 +1444,8 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 					n: number;
 				};
 				sqlite.run(`DELETE FROM api_requests`);
+				// 用量日账本是按天汇总的请求历史，随请求历史一起清空。
+				sqlite.run(`DELETE FROM usage_daily`);
 				deleted.requests = Number(before.n);
 			}
 			if (clearSessions) {

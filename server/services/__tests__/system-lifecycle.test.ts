@@ -31,11 +31,13 @@ function harness(
 		failCleanup?: boolean;
 	} = {},
 ) {
+	const changed = mock(() => {});
 	const shutdown = mock(() => !options.failShutdown);
 	const persist = mock((snapshot: ReturnType<typeof capturePlannedUpdateRecoverySnapshot>) => {
 		writePlannedUpdateRecoverySnapshot(snapshot);
 	});
 	const lifecycle = createSystemLifecycle({
+		changed,
 		coordination: getUpdateCoordinationStatus,
 		canShutdown: () => options.available !== false,
 		schedule: () => {
@@ -65,13 +67,55 @@ function harness(
 		},
 		isCancellation: (error) => error instanceof UpdateCancelledError,
 	});
-	return { lifecycle, shutdown, persist };
+	return { lifecycle, shutdown, persist, changed };
 }
 
 beforeEach(resetUpdateCoordinationForTests);
 afterEach(resetUpdateCoordinationForTests);
 
 describe("system shutdown lifecycle", () => {
+	test("notifies effective state changes, including shutdown upgrades and async completion", async () => {
+		const bash = tryAcquireFinalUpdateExecution("background_bash");
+		const { lifecycle, changed } = harness();
+		lifecycle.cancel();
+		expect(changed).not.toHaveBeenCalled();
+		lifecycle.prepare();
+		expect(changed).toHaveBeenCalledTimes(1);
+		lifecycle.prepare();
+		lifecycle.status();
+		expect(changed).toHaveBeenCalledTimes(1);
+		lifecycle.shutdown();
+		expect(changed).toHaveBeenCalledTimes(2);
+		lifecycle.shutdown();
+		expect(changed).toHaveBeenCalledTimes(2);
+		bash?.release();
+		await lifecycle.settled();
+		expect(lifecycle.status().phase).toBe("shutting_down");
+		expect(changed).toHaveBeenCalledTimes(4);
+		lifecycle.shutdown();
+		lifecycle.cancel();
+		expect(changed).toHaveBeenCalledTimes(4);
+	});
+
+	test("notifies prepared completion, cancellation rollback and failures", async () => {
+		const { lifecycle, changed } = harness();
+		lifecycle.prepare();
+		await lifecycle.settled();
+		expect(changed).toHaveBeenCalledTimes(2);
+		lifecycle.cancel();
+		await lifecycle.settled();
+		expect(lifecycle.status().phase).toBe("idle");
+		expect(changed).toHaveBeenCalledTimes(5);
+		lifecycle.cancel();
+		expect(changed).toHaveBeenCalledTimes(5);
+
+		const failed = harness({ failCheckpoint: true, failCleanup: true });
+		failed.lifecycle.shutdown();
+		await failed.lifecycle.settled();
+		expect(failed.lifecycle.status().phase).toBe("failed");
+		expect(failed.changed).toHaveBeenCalledTimes(3);
+	});
+
 	test("preparation uses the same Bash/ordinary gate and does not shut down", async () => {
 		const bash = tryAcquireFinalUpdateExecution("background_bash");
 		const ordinary = tryAcquireFinalUpdateExecution("ordinary");

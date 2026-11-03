@@ -150,7 +150,8 @@ export interface OutlineReadPort {
 	): Promise<OutlineVersionRow[]>;
 	/**
 	 * For each block, its latest version after `afterSeq` that counts, with its change flags.
-	 * Left out: `except.actor`'s versions whose change flags lie within `except.flags` (every
+	 * Left out: `except.actor`'s versions (or those of any of `except.actorIds` too, of the same
+	 * kind) whose change flags lie within `except.flags` (every
 	 * flag: none of the actor's versions count; a move's flags: its moves do not), and anyone's
 	 * whose flags lie within `except.anyoneFlags` (default none). Blocks without one are left out.
 	 * At most {@link OUTLINE_LAST_WRITES_SCAN} of a block's newest versions after `afterSeq` are
@@ -159,7 +160,14 @@ export interface OutlineReadPort {
 	 */
 	findLastWrites(
 		keys: ReadonlyArray<{ blockId: string; afterSeq: number }>,
-		except: { actorKind: OutlineActorKind; actorId: string; flags: number; anyoneFlags?: number },
+		except: {
+			actorKind: OutlineActorKind;
+			actorId: string;
+			/** More actors of that kind treated as `actorId` is (a session's other narrators). */
+			actorIds?: readonly string[];
+			flags: number;
+			anyoneFlags?: number;
+		},
 	): Promise<Array<{ blockId: string; fromSeq: number | null; changeFlags: number | null }>>;
 	/** Links of the given blocks and kinds valid at `seq` (`null`: open links), at most `limit`. */
 	listLinksAt(
