@@ -94,6 +94,14 @@
  * lock, through `lockOutlineTask`. A commit that removes a lock (unlocking, a person relocking,
  * deleting the locked task) withdraws the tree's open changes in the same atomic section.
  *
+ * QUESTIONS
+ * ---------
+ * A block may carry a question put to a person (`ask_json`, `questions.ts`): an insert, an
+ * update or a restore gives it (`ask`), only the question service and reverts do. A block is a
+ * question or a task, never both (refused). A question is process like a task. Its routing row
+ * (`outline_questions`) is derived in the same commit from its state after the commit: open,
+ * answered (the answering commit recorded) or withdrawn (or deleted); see `planQuestions`.
+ *
  * IN PROCESS
  * ----------
  * `outline_blocks.in_process` (a task, under a task, or in a session space) is derived in the
@@ -154,6 +162,7 @@ import {
 	OUTLINE_PENDING_LIMITS,
 	OUTLINE_TASK_IDLE_LEASE_MS,
 	type OutlineActorKind,
+	type OutlineAskJson,
 	type OutlineCommitKind,
 	type OutlineLinkKind,
 	type OutlinePendingDeciderJson,
@@ -180,6 +189,8 @@ import {
 	type OutlinePendingDecision,
 	OutlinePendingMovedError,
 	type OutlinePendingPlan,
+	type OutlineQuestionRow,
+	type OutlineQuestionWrite,
 	type OutlineSpaceRow,
 	OutlineStaleWriteError,
 	type OutlineStore,
@@ -276,6 +287,8 @@ export type OutlineOp =
 			position?: OutlinePosition;
 			content: string;
 			task?: OutlineTaskInput | null;
+			/** A question put to a person (`questions.ts` only). */
+			ask?: OutlineAskJson | null;
 			alias?: string | null;
 			/** Tag targets (a tag is a link to the tag's page), replacing none. */
 			tags?: string[];
@@ -288,6 +301,8 @@ export type OutlineOp =
 			alias?: string | null;
 			/** Replaces the block's tags. */
 			tags?: string[];
+			/** Replaces the block's question (`questions.ts` and reverts only); `null` removes it. */
+			ask?: OutlineAskJson | null;
 			/**
 			 * The update is a three-way merge of the caller's change over changes others made after
 			 * the caller read the block: the version records `OUTLINE_CHANGE.MERGE`.
@@ -324,6 +339,8 @@ export type OutlineOp =
 			content?: string;
 			alias?: string | null;
 			task?: OutlineTaskInput | null;
+			/** Default: the question it had. */
+			ask?: OutlineAskJson | null;
 			/** Default: the tags it had. */
 			tags?: string[];
 	  } & BaseVersioned);
@@ -484,7 +501,18 @@ export interface OutlineWriteOptions {
 	 * Record the commit as an `import` (a system path that brings content from elsewhere as one
 	 * commit: an outline session's old behavior fence, outline plan PR 4). Not with `compensating`.
 	 */
-	kind?: "import";
+	kind?: "import" | "answer";
+	/**
+	 * Internal to `questions.ts`: the asker of the questions this commit creates (their routing
+	 * rows take it; an existing row keeps its own), and `delivered` when the asker needs no telling
+	 * of the answers this commit records (it wrote them itself, relaying the person's words).
+	 */
+	question?: {
+		askerNarratorId: string | null;
+		askerUserId: string | null;
+		askerToolCallId: string | null;
+		delivered?: boolean;
+	};
 	/**
 	 * An agent's commit in a session space that writes the session's behavior page (the page
 	 * holding alias {@link OUTLINE_BEHAVIOR_ALIAS}): creating it, writing, moving or deleting
@@ -732,6 +760,50 @@ function checkTaskFields(task: OutlineTaskPatch, opIndex: number): void {
 	}
 }
 
+const ASK_MAX_OPTIONS = 10;
+const ASK_MAX_TEXT = 4096;
+
+function checkText(value: unknown, what: string, opIndex: number): void {
+	if (value !== undefined && (typeof value !== "string" || value.length > ASK_MAX_TEXT))
+		throw invalid(`question ${what} must be text of at most ${ASK_MAX_TEXT} characters`, opIndex);
+}
+
+/** The shape of a question (`OutlineAskJson`); what it says is the question service's to check. */
+function checkAsk(ask: unknown, opIndex: number): void {
+	if (ask === undefined || ask === null) return;
+	const a = ask as Partial<OutlineAskJson>;
+	if (typeof a !== "object") throw invalid("ask must be an object", opIndex);
+	checkActorRef(a.to, "question to", opIndex);
+	if (a.options !== undefined) {
+		if (!Array.isArray(a.options) || a.options.length > ASK_MAX_OPTIONS)
+			throw invalid(`question options must be a list of at most ${ASK_MAX_OPTIONS}`, opIndex);
+		for (const option of a.options) checkText(option, "option", opIndex);
+	}
+	const rec = a.recommend as OutlineAskJson["recommend"] | undefined;
+	if (!rec || typeof rec !== "object") throw invalid("a question needs a recommendation", opIndex);
+	if (rec.option !== undefined && (!Number.isSafeInteger(rec.option) || rec.option < 1))
+		throw invalid("question recommend.option must be a positive integer", opIndex);
+	checkText(rec.text, "recommendation", opIndex);
+	checkText(rec.reason, "reason", opIndex);
+	if (a.proceed !== undefined && a.proceed !== true)
+		throw invalid("question proceed must be true or absent", opIndex);
+	if (a.answer !== undefined) {
+		const answer = a.answer as OutlineAskJson["answer"];
+		if (!answer || typeof answer !== "object") throw invalid("answer must be an object", opIndex);
+		checkActorRef(answer.by, "answer by", opIndex);
+		if (answer.option !== undefined && (!Number.isSafeInteger(answer.option) || answer.option < 1))
+			throw invalid("answer option must be a positive integer", opIndex);
+		checkText(answer.text, "answer", opIndex);
+		if (typeof answer.at !== "string") throw invalid("answer at must be a time", opIndex);
+	}
+	if (a.withdrawn !== undefined) {
+		const w = a.withdrawn as OutlineAskJson["withdrawn"];
+		if (!w || typeof w !== "object") throw invalid("withdrawn must be an object", opIndex);
+		checkActorRef(w.by, "withdrawn by", opIndex);
+		checkText(w.reason, "withdrawal reason", opIndex);
+	}
+}
+
 function checkTags(tags: unknown, opIndex: number): void {
 	if (!Array.isArray(tags) || tags.some((t) => typeof t !== "string" || !isValidMention(t, null)))
 		throw invalid("tags must be a list of link targets", opIndex);
@@ -813,6 +885,7 @@ function prepareOps(
 					if (op.task.status === undefined) throw invalid("a task needs a status", i);
 					checkTaskFields(op.task, i);
 				}
+				checkAsk(op.ask, i);
 				if (op.id !== undefined && (typeof op.id !== "string" || !CLIENT_ID_RE.test(op.id)))
 					throw invalid("id must be 8-64 characters of [A-Za-z0-9_-]", i);
 				if (op.sid !== undefined) {
@@ -835,6 +908,7 @@ function prepareOps(
 				if (op.tags !== undefined) checkTags(op.tags, i);
 				if (op.merged !== undefined && typeof op.merged !== "boolean")
 					throw invalid("merged must be a boolean", i);
+				checkAsk(op.ask, i);
 				break;
 			case "move":
 				checkRef(op.block, "block", i);
@@ -865,6 +939,7 @@ function prepareOps(
 					if (op.task.status === undefined) throw invalid("a task needs a status", i);
 					checkTaskFields(op.task, i);
 				}
+				checkAsk(op.ask, i);
 				break;
 		}
 	});
@@ -911,6 +986,8 @@ interface WorkingBlock {
 	deleted: boolean;
 	alias: string | null;
 	taskJson: OutlineTaskJson | null;
+	/** Its question (`ask_json`), if it is one. */
+	askJson: OutlineAskJson | null;
 	contentHash: string;
 	/** Set when this transaction wrote the content. */
 	content?: string;
@@ -1057,6 +1134,7 @@ interface PlannerExtra {
 	confirm?: OutlineWriteOptions["confirm"];
 	/** Asked when an agent's commit writes the session's behavior page; see `agentBehaviorGrant`. */
 	behaviorGrant?: () => boolean;
+	question?: OutlineWriteOptions["question"];
 }
 
 class OutlinePlanner {
@@ -1182,6 +1260,7 @@ class OutlinePlanner {
 			deleted: meta.deleted,
 			alias: meta.alias,
 			taskJson: meta.taskJson,
+			askJson: meta.askJson,
 			contentHash: meta.contentHash,
 			inProcess: meta.inProcess,
 		});
@@ -1573,6 +1652,7 @@ class OutlinePlanner {
 		contentHash: string;
 		links: ExtractedLink[];
 		task: OutlineTaskJson | null;
+		ask?: OutlineAskJson | null;
 	}): WorkingBlock {
 		let sid = fields.sid ?? newOutlineSid();
 		if (fields.sid !== undefined && this.bySid.has(sid)) {
@@ -1595,6 +1675,7 @@ class OutlinePlanner {
 			deleted: false,
 			alias: null,
 			taskJson: fields.task,
+			askJson: fields.ask ?? null,
 			contentHash: fields.contentHash,
 			content: fields.content,
 			contentLinks: fields.links,
@@ -1762,6 +1843,7 @@ class OutlinePlanner {
 			contentHash: prep.contentHash,
 			links: prep.links,
 			task: op.task ? this.taskFrom(null, op.task, true, i) : null,
+			ask: op.ask ?? null,
 		});
 		this.noteClaim(block, i);
 		list.splice(index, 0, block.id);
@@ -1795,6 +1877,7 @@ class OutlinePlanner {
 				? await this.setAlias(block, op.alias, i, this.compensating ? "drop" : "reject")
 				: null;
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
+		if (op.ask !== undefined) block.askJson = op.ask;
 		if (op.merged) block.merged = true;
 		this.results[i] = this.result(block, { split, notes }, [aliasDropped]);
 		const base = block.base;
@@ -1927,6 +2010,7 @@ class OutlinePlanner {
 		if (this.input.actor.kind === "agent" && this.commitKind === "edit" && block.taskJson?.lock)
 			block.taskJson = canonicalTaskJson({ ...block.taskJson, lock: null });
 		this.taskOp.set(block.id, i);
+		if (op.ask !== undefined) block.askJson = op.ask;
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
 		else if (block.base?.deleted) {
 			// The tags it had just before it was deleted.
@@ -2537,6 +2621,7 @@ class OutlinePlanner {
 	}
 
 	private async assemble(): Promise<Planned | null> {
+		this.checkQuestionsAreNotTasks();
 		this.leaveUnclaimedToDo();
 		await this.guardLocks();
 		await this.checkRepage();
@@ -2625,8 +2710,14 @@ class OutlinePlanner {
 			(b) => !b.deleted && b.inProcess !== (b.base as OutlineBlockMeta).inProcess,
 		);
 		const claims = await this.planClaims(versionedIds, seq);
+		const commitId = generateId();
+		const questions = await this.planQuestions(versionedIds, commitId);
 		const claimRows =
-			claims.put.length + claims.release.length + claims.expire.length + this.quietClaims.length;
+			claims.put.length +
+			claims.release.length +
+			claims.expire.length +
+			this.quietClaims.length +
+			questions.length;
 
 		const touched = closeVersionIds.length + insertBlocks.length;
 		// A claim taken over without the task changing (it was in progress already) is a commit
@@ -2672,7 +2763,6 @@ class OutlinePlanner {
 		// The writer's own lapsed leases run again in the same atomic section.
 		claims.put.push(...this.quietClaims);
 		this.quietClaims = [];
-		const commitId = generateId();
 		const { pending, pendingPageIds } = this.planPending(commitId);
 		return {
 			pendingPageIds,
@@ -2704,9 +2794,82 @@ class OutlinePlanner {
 				inProcess: [...inProcess].map(([value, ids]) => ({ ids, value })),
 				inProcessStale: this.inProcessStale,
 				claims,
+				...(questions.length > 0 ? { questions } : {}),
 			},
 			pageIds: [...pageIds],
 		};
+	}
+
+	/** A block is a question or a task, never both. */
+	private checkQuestionsAreNotTasks(): void {
+		for (const block of this.blocks.values()) {
+			if (block.deleted || block.taskJson === null || block.askJson === null) continue;
+			throw new OutlineWriteError(
+				OUTLINE_TEXT.questionNotTask(this.address(block.sid)),
+				"OUTLINE_INVALID_OP",
+				this.taskOp.get(block.id) ?? null,
+			);
+		}
+	}
+
+	/**
+	 * The routing rows of the questions this commit asks, changes, answers, withdraws, deletes or
+	 * brings back (see QUESTIONS in the header): their state after the commit, the answering
+	 * commit when it answers one, and for a new row its asker (`OutlineWriteOptions.question`).
+	 * One indexed read of the existing rows.
+	 */
+	private async planQuestions(
+		versioned: ReadonlySet<string>,
+		commitId: string,
+	): Promise<OutlineQuestionWrite[]> {
+		const touched = [...this.blocks.values()].filter(
+			(b) => versioned.has(b.id) && (b.askJson !== null || (b.base?.askJson ?? null) !== null),
+		);
+		if (touched.length === 0) return [];
+		const rows = new Map(
+			(await this.store.getQuestions(touched.map((b) => b.id))).map((r) => [r.blockId, r]),
+		);
+		const asker = this.extra.question;
+		const out: OutlineQuestionWrite[] = [];
+		for (const block of touched) {
+			const ask = block.askJson;
+			const state: OutlineQuestionRow["state"] =
+				block.deleted || ask === null || ask.withdrawn
+					? "withdrawn"
+					: ask.answer
+						? "answered"
+						: "open";
+			const existing = rows.get(block.id) ?? null;
+			const answeredNow = state === "answered" && existing?.state !== "answered";
+			const delivered = answeredNow && asker?.delivered === true ? this.now : null;
+			const row: OutlineQuestionRow = {
+				blockId: block.id,
+				spaceId: this.space.id,
+				state,
+				proceed: ask?.proceed === true,
+				toUserId: ask?.to.kind === "human" ? ask.to.id : null,
+				askerNarratorId: existing ? existing.askerNarratorId : (asker?.askerNarratorId ?? null),
+				askerUserId: existing ? existing.askerUserId : (asker?.askerUserId ?? null),
+				askerToolCallId: existing ? existing.askerToolCallId : (asker?.askerToolCallId ?? null),
+				createdAt: existing?.createdAt ?? this.now,
+				answeredAt:
+					state !== "answered"
+						? null
+						: answeredNow
+							? (ask?.answer?.at ?? this.now)
+							: (existing?.answeredAt ?? this.now),
+				answerCommitId:
+					state !== "answered" ? null : answeredNow ? commitId : (existing?.answerCommitId ?? null),
+				deliveredAt: answeredNow
+					? delivered
+					: state === "answered"
+						? (existing?.deliveredAt ?? null)
+						: null,
+			};
+			// An answer already recorded keeps whatever delivery was marked since it was read.
+			out.push({ row, setDelivered: answeredNow || state !== "answered" });
+		}
+		return out;
 	}
 
 	/**
@@ -2804,14 +2967,15 @@ class OutlinePlanner {
 			for (const block of live) block.inProcess = true;
 			return;
 		}
-		const isTask = (b: WorkingBlock) => b.taskJson !== null;
+		// A question is process like a task (design §2.1).
+		const isTask = (b: WorkingBlock) => b.taskJson !== null || b.askJson !== null;
 		const roots = live.filter(
 			(b) =>
 				b.base === null ||
 				b.restored === true ||
 				b.base.deleted ||
 				b.parentId !== b.base.parentId ||
-				(b.base.taskJson !== null) !== isTask(b),
+				(b.base.taskJson !== null || b.base.askJson !== null) !== isTask(b),
 		);
 		if (roots.length === 0) return;
 		this.readsInProcess = true;
@@ -3199,6 +3363,7 @@ class OutlinePlanner {
 		if (block.deleted && !base.deleted) flags |= OUTLINE_CHANGE.DELETE;
 		if (!block.deleted && base.deleted) flags |= OUTLINE_CHANGE.RESTORE;
 		if (!sameTask(block.taskJson, base.taskJson)) flags |= OUTLINE_CHANGE.TASK;
+		if (JSON.stringify(block.askJson) !== JSON.stringify(base.askJson)) flags |= OUTLINE_CHANGE.ASK;
 		if (block.alias !== base.alias) flags |= OUTLINE_CHANGE.PROPS;
 		return flags;
 	}
@@ -3260,6 +3425,7 @@ class OutlinePlanner {
 		}
 		if (block.alias !== base.alias) patch.alias = block.alias;
 		if (flags & OUTLINE_CHANGE.TASK) patch.taskJson = block.taskJson;
+		if (flags & OUTLINE_CHANGE.ASK) patch.askJson = block.askJson;
 		if (block.deleted !== base.deleted) patch.deleted = block.deleted;
 		return patch;
 	}
@@ -3276,6 +3442,7 @@ class OutlinePlanner {
 			contentHash: block.contentHash,
 			alias: block.alias,
 			taskJson: block.taskJson,
+			askJson: block.askJson,
 			authorKind: this.input.actor.kind,
 			authorId: this.input.actor.id,
 			versionSeq: seq,
@@ -3358,7 +3525,13 @@ async function writePrepared(
 				now,
 				commitKind,
 				options.leaseExpiry,
-				{ held: new Set(held.keys()), assignedIds, confirm: options.confirm, behaviorGrant },
+				{
+					held: new Set(held.keys()),
+					assignedIds,
+					confirm: options.confirm,
+					behaviorGrant,
+					question: options.question,
+				},
 			);
 			let outcome: Planned | Hold | null;
 			try {

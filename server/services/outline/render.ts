@@ -37,7 +37,13 @@
  */
 import { type OutlineItem, type OutlineProps, serializeMarkdownOutline } from "@shared/outline";
 import { OUTLINE_TEXT } from "./messages";
-import { effectiveView, type OutlineNode, type OutlineView, viewChildren } from "./tree";
+import {
+	effectiveView,
+	isProcessNode,
+	type OutlineNode,
+	type OutlineView,
+	viewChildren,
+} from "./tree";
 
 /** Limits of one read. */
 export const OUTLINE_READ_LIMITS = {
@@ -219,7 +225,7 @@ function topOrder(
 	options: { interleave: boolean; forceFirst: boolean },
 ): { tops: OutlineNode[][]; order: Array<{ node: OutlineNode; section: number }> } {
 	const tops = sections.map((section) =>
-		section.roots.filter((root) => options.forceFirst || view === "all" || root.task === null),
+		section.roots.filter((root) => options.forceFirst || view === "all" || !isProcessNode(root)),
 	);
 	const order: Array<{ node: OutlineNode; section: number }> = [];
 	if (options.interleave) {
@@ -342,7 +348,7 @@ function expand(
 		const node = order[i] as OutlineNode;
 		let total = 1;
 		for (const child of node.children) {
-			if (view === "all" || child.task === null) total += size.get(child) ?? 0;
+			if (view === "all" || !isProcessNode(child)) total += size.get(child) ?? 0;
 			else hiddenByView += countSubtree(child);
 		}
 		size.set(node, total);
@@ -360,10 +366,11 @@ function expand(
 			const text = serializeMarkdownOutline([options.display?.(node, item) ?? item], {
 				label: () => label ?? null,
 			});
-			const note = options.annotate?.(node);
-			const own = note
-				? [...text.split("\n"), `${INDENT}‹${note.replace(/\n+/g, " ")}›`]
-				: text.split("\n");
+			const notes = [questionNote(node), options.annotate?.(node)].filter((n): n is string => !!n);
+			const own = [
+				...text.split("\n"),
+				...notes.map((note) => `${INDENT}‹${note.replace(/\n+/g, " ")}›`),
+			];
 			cached = indented(own, depth.get(node) ?? 0);
 			lines.set(node, cached);
 		}
@@ -483,6 +490,43 @@ function countSubtree(root: OutlineNode): number {
 const MORE_LINE = /^ *‹… \d+ more›$/;
 /** A block's own note (`annotate`): a change to it waits for confirmation. */
 const PENDING_LINE = /^ *‹pending [^\n]*›$/;
+/** A question's own note (`questionNote`): who is asked, the choices, the answer. */
+const QUESTION_LINE = /^ *‹question [^\n]*›$/;
+
+const QUESTION_NOTE_CHARS = 600;
+
+/**
+ * The note under a question put to a person (`Ask`): who is asked, the numbered choices, the
+ * recommendation, and the state (the answer, once given). Bounded; output only.
+ */
+export function questionNote(node: OutlineNode): string | null {
+	const ask = node.ask;
+	if (!ask) return null;
+	const clip = (text: string, n: number) => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
+	const parts = [`question for ${ask.to.kind}:${ask.to.id}`];
+	if (ask.options?.length)
+		parts.push(ask.options.map((o, i) => `${i + 1}. ${clip(o, 80)}`).join("  "));
+	const rec = ask.recommend;
+	const recommended =
+		rec.option !== undefined ? `option ${rec.option}` : rec.text ? clip(rec.text, 120) : null;
+	if (recommended)
+		parts.push(`recommended: ${recommended}${rec.reason ? ` (${clip(rec.reason, 120)})` : ""}`);
+	if (ask.proceed) parts.push("went ahead with the recommendation");
+	if (ask.withdrawn) parts.push("withdrawn");
+	else if (ask.answer) {
+		const a = ask.answer;
+		const choice = [
+			a.option !== undefined ? `option ${a.option}` : null,
+			a.text ? `"${clip(a.text, 160)}"` : null,
+		]
+			.filter(Boolean)
+			.join(": ");
+		parts.push(
+			`answered${a.relayed ? " (relayed)" : ""}: ${choice || "the recommendation"}${a.adopted ? " (as recommended)" : ""}`,
+		);
+	} else parts.push("open");
+	return clip(parts.join(" · "), QUESTION_NOTE_CHARS);
+}
 const NOTE_LINE = /^‹[^\n]*›$/;
 /**
  * A code fence opening a line, or right after an item's bullet, its label (`[Ab3dEf9Q]`, when
@@ -492,7 +536,12 @@ const FENCE = /^ *(?:(?:[-*+]|\d{1,9}[.)]) +(?:\[[^\]\n]*\] +)?(?:\[[ xX/-]\] +)
 
 /** Whether a line of a rendered outline is an annotation rather than content. */
 export function isReadAnnotation(line: string): boolean {
-	return NOTE_LINE.test(line) || MORE_LINE.test(line) || PENDING_LINE.test(line);
+	return (
+		NOTE_LINE.test(line) ||
+		MORE_LINE.test(line) ||
+		PENDING_LINE.test(line) ||
+		QUESTION_LINE.test(line)
+	);
 }
 
 /**

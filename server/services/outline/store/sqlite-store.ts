@@ -40,6 +40,7 @@ import {
 	outlineLinks,
 	outlineLiveUpdates,
 	outlinePending,
+	outlineQuestions,
 	outlineSpaces,
 	outlineTaskClaims,
 	outlineViewState,
@@ -76,6 +77,8 @@ import {
 	OutlinePendingMovedError,
 	type OutlinePendingPlan,
 	type OutlinePendingRow,
+	type OutlineQuestionRow,
+	type OutlineQuestionWrite,
 	type OutlineSpaceRow,
 	type OutlineSpaceScope,
 	OutlineStaleWriteError,
@@ -143,12 +146,13 @@ function toBlock(row: BlockSelect): OutlineBlockRow {
 	return {
 		...row,
 		taskJson: row.taskJson ?? null,
+		askJson: row.askJson ?? null,
 		authorKind: row.authorKind as OutlineActorKind,
 	};
 }
 
 function toVersion(row: VersionSelect): OutlineVersionRow {
-	return { ...row, taskJson: row.taskJson ?? null };
+	return { ...row, taskJson: row.taskJson ?? null, askJson: row.askJson ?? null };
 }
 
 function toLink(row: LinkSelect): OutlineLinkRow {
@@ -192,6 +196,7 @@ const metaColumns = {
 	contentHash: outlineBlocks.contentHash,
 	alias: outlineBlocks.alias,
 	taskJson: outlineBlocks.taskJson,
+	askJson: outlineBlocks.askJson,
 	versionSeq: outlineBlocks.versionSeq,
 	deleted: outlineBlocks.deleted,
 	inProcess: outlineBlocks.inProcess,
@@ -207,11 +212,37 @@ function toMeta(row: {
 	contentHash: string;
 	alias: string | null;
 	taskJson: BlockSelect["taskJson"];
+	askJson: BlockSelect["askJson"];
 	versionSeq: number;
 	deleted: boolean;
 	inProcess: boolean;
 }): OutlineBlockMeta {
-	return { ...row, taskJson: row.taskJson ?? null };
+	return { ...row, taskJson: row.taskJson ?? null, askJson: row.askJson ?? null };
+}
+
+type QuestionSelect = typeof outlineQuestions.$inferSelect;
+
+function toQuestion(row: QuestionSelect): OutlineQuestionRow {
+	return { ...row, state: row.state as OutlineQuestionRow["state"] };
+}
+
+/** Insert a question row, or update an existing one but for its asker and creation. */
+function putQuestion(tx: Tx, write: OutlineQuestionWrite): void {
+	const { row } = write;
+	tx.insert(outlineQuestions)
+		.values(row)
+		.onConflictDoUpdate({
+			target: outlineQuestions.blockId,
+			set: {
+				state: row.state,
+				proceed: row.proceed,
+				toUserId: row.toUserId,
+				answeredAt: row.answeredAt,
+				answerCommitId: row.answerCommitId,
+				...(write.setDelivered ? { deliveredAt: row.deliveredAt } : {}),
+			},
+		})
+		.run();
 }
 
 function scopeCondition(scope: OutlineSpaceScope): SQL | undefined {
@@ -327,11 +358,11 @@ function applyCommitSection(
 			tx.run(sql`
 				INSERT INTO outline_block_versions (
 					block_id, from_seq, to_seq, commit_id, page_id, parent_id, order_key, content,
-					task_json, alias, content_hash, change_flags, deleted
+					task_json, ask_json, alias, content_hash, change_flags, deleted
 				)
 				SELECT id, ${seq}, NULL, ${plan.commit.id}, page_id, parent_id, order_key,
 					CASE WHEN deleted = 1 THEN NULL ELSE content END,
-					task_json, alias, content_hash, ${group.flags}, deleted
+					task_json, ask_json, alias, content_hash, ${group.flags}, deleted
 				FROM outline_blocks WHERE id IN (${idList(ids)})
 			`);
 		}
@@ -374,6 +405,7 @@ function applyCommitSection(
 	}
 	for (const { row } of plan.claims.put) putClaim(tx, row);
 	if (plan.pending) writePending(tx, plan.pending);
+	for (const write of plan.questions ?? []) putQuestion(tx, write);
 	return "applied";
 }
 
@@ -955,6 +987,17 @@ export const sqliteOutlineStore: OutlineStore = {
 			.map(toPendingHead);
 	},
 
+	async listOpenPendingForDecider(userId, limit) {
+		return db
+			.select(pendingHeadColumns)
+			.from(outlinePending)
+			.where(and(eq(outlinePending.deciderUserId, userId), sql`"status" = 'open'`))
+			.orderBy(asc(outlinePending.createdAt), asc(outlinePending.id))
+			.limit(limit)
+			.all()
+			.map(toPendingHead);
+	},
+
 	async findOpenPending(requesterSession, rootBlockId) {
 		const row = db
 			.select()
@@ -1064,6 +1107,133 @@ export const sqliteOutlineStore: OutlineStore = {
 			}
 		}
 		return out;
+	},
+
+	async listUnseenDelegateConfirmations(userId, limit) {
+		// The predicate is the digest index's own, word for word.
+		return db
+			.select(pendingHeadColumns)
+			.from(outlinePending)
+			.where(
+				and(
+					eq(outlinePending.deciderUserId, userId),
+					sql`"status" = 'confirmed' AND "digest_seen_at" IS NULL AND json_extract("decided_by_json", '$.kind') = 'agent'`,
+				),
+			)
+			.orderBy(asc(outlinePending.decidedAt), asc(outlinePending.id))
+			.limit(limit)
+			.all()
+			.map(toPendingHead);
+	},
+
+	async markDelegateConfirmationsSeen(userId, ids, at) {
+		if (ids.length === 0) return 0;
+		return await withDbRetry(
+			async () => {
+				let marked = 0;
+				for (const chunk of chunked(ids)) {
+					marked += db
+						.update(outlinePending)
+						.set({ digestSeenAt: at })
+						.where(
+							and(
+								inArray(outlinePending.id, chunk),
+								eq(outlinePending.deciderUserId, userId),
+								eq(outlinePending.status, "confirmed"),
+								isNull(outlinePending.digestSeenAt),
+							),
+						)
+						.returning({ id: outlinePending.id })
+						.all().length;
+				}
+				return marked;
+			},
+			{ label: "outline.markDelegateConfirmationsSeen", maxRetries: 3 },
+		);
+	},
+
+	async getQuestions(blockIds) {
+		const out: OutlineQuestionRow[] = [];
+		for (const ids of chunked(blockIds)) {
+			out.push(
+				...db
+					.select()
+					.from(outlineQuestions)
+					.where(inArray(outlineQuestions.blockId, ids))
+					.all()
+					.map(toQuestion),
+			);
+		}
+		return out;
+	},
+
+	async listOpenQuestionsBySpace(spaceId, limit) {
+		return db
+			.select()
+			.from(outlineQuestions)
+			.where(and(eq(outlineQuestions.spaceId, spaceId), sql`"state" = 'open'`))
+			.orderBy(asc(outlineQuestions.createdAt), asc(outlineQuestions.blockId))
+			.limit(limit)
+			.all()
+			.map(toQuestion);
+	},
+
+	async listOpenQuestionsForUser(userId, limit) {
+		return db
+			.select()
+			.from(outlineQuestions)
+			.where(and(eq(outlineQuestions.toUserId, userId), sql`"state" = 'open'`))
+			.orderBy(asc(outlineQuestions.createdAt), asc(outlineQuestions.blockId))
+			.limit(limit)
+			.all()
+			.map(toQuestion);
+	},
+
+	async listOpenQuestionsByAsker(narratorId, limit) {
+		return db
+			.select()
+			.from(outlineQuestions)
+			.where(and(eq(outlineQuestions.askerNarratorId, narratorId), sql`"state" = 'open'`))
+			.orderBy(asc(outlineQuestions.createdAt), asc(outlineQuestions.blockId))
+			.limit(limit)
+			.all()
+			.map(toQuestion);
+	},
+
+	async listUndeliveredAnswers(limit) {
+		return db
+			.select()
+			.from(outlineQuestions)
+			.where(sql`"state" = 'answered' AND "delivered_at" IS NULL`)
+			.orderBy(asc(outlineQuestions.answeredAt), asc(outlineQuestions.blockId))
+			.limit(limit)
+			.all()
+			.map(toQuestion);
+	},
+
+	async markQuestionsDelivered(blockIds, at) {
+		if (blockIds.length === 0) return 0;
+		return await withDbRetry(
+			async () => {
+				let marked = 0;
+				for (const chunk of chunked(blockIds)) {
+					marked += db
+						.update(outlineQuestions)
+						.set({ deliveredAt: at })
+						.where(
+							and(
+								inArray(outlineQuestions.blockId, chunk),
+								eq(outlineQuestions.state, "answered"),
+								isNull(outlineQuestions.deliveredAt),
+							),
+						)
+						.returning({ blockId: outlineQuestions.blockId })
+						.all().length;
+				}
+				return marked;
+			},
+			{ label: "outline.markQuestionsDelivered", maxRetries: 3 },
+		);
 	},
 
 	async listLockedBlocks(pageId, limit) {

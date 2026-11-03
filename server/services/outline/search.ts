@@ -191,7 +191,8 @@ export async function searchOutline(request: OutlineSearchRequest): Promise<Outl
 				sid: block.sid,
 				parentId: block.parentId,
 				content: block.content,
-				isTask: block.taskJson !== null,
+				// A question is process like a task.
+				isTask: block.taskJson !== null || block.askJson !== null,
 			});
 		}
 		frontier = parents.map((b) => b.parentId);

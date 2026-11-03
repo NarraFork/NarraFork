@@ -46,6 +46,11 @@ import {
 	outlineLeaseEnd,
 } from "./model";
 import { findTasksWaitingForConfirmation } from "./pending";
+import {
+	questionWaits,
+	sweepOutlineAnswerDeliveries,
+	watchArchivedSessionQuestions,
+} from "./questions";
 import { outlineStore } from "./store";
 import {
 	chunked,
@@ -577,10 +582,12 @@ const leaseJob: {
 	timer: ReturnType<typeof setInterval> | null;
 	running: Promise<void> | null;
 	sessionEnds: OutlineSessionEndWatch | null;
+	questionEnds: { stop(): Promise<void> } | null;
 } = {
 	timer: null,
 	running: null,
 	sessionEnds: null,
+	questionEnds: null,
 };
 
 function runLeaseExpiry(): void {
@@ -595,6 +602,9 @@ function runLeaseExpiry(): void {
 		const ended = await releaseEndedOutlineSessionClaims();
 		if (ended.reopened || ended.skipped || ended.failed)
 			logger.info("Outline tasks of sessions archived or deleted earlier reopened", { ...ended });
+		// Answers a crash left undelivered to their askers (outline P2 PR 7).
+		const answers = await sweepOutlineAnswerDeliveries();
+		if (answers) logger.info("Outline answers delivered late", { delivered: answers });
 	};
 	leaseJob.running = run()
 		.catch((error) => logger.warn("Outline lease expiry failed", { error: String(error) }))
@@ -613,6 +623,7 @@ export function startOutlineTaskLeaseJob(): void {
 	leaseJob.timer = setInterval(runLeaseExpiry, EXPIRY_INTERVAL_MS);
 	leaseJob.timer.unref?.();
 	leaseJob.sessionEnds = watchOutlineSessionEnds();
+	leaseJob.questionEnds = watchArchivedSessionQuestions();
 	runLeaseExpiry();
 }
 
@@ -621,8 +632,10 @@ export async function stopOutlineTaskLeaseJob(): Promise<void> {
 	if (leaseJob.timer) clearInterval(leaseJob.timer);
 	leaseJob.timer = null;
 	const sessionEnds = leaseJob.sessionEnds;
+	const questionEnds = leaseJob.questionEnds;
 	leaseJob.sessionEnds = null;
-	await Promise.all([leaseJob.running, sessionEnds?.stop()]);
+	leaseJob.questionEnds = null;
+	await Promise.all([leaseJob.running, sessionEnds?.stop(), questionEnds?.stop()]);
 }
 
 /** Wait before retrying a session's release that failed, once. */
@@ -747,7 +760,10 @@ export function watchOutlineSessionEnds(
 export interface OutlineTaskWait {
 	/** Prerequisites (`depends::`) that are tasks not done or cancelled yet, by block id. */
 	prerequisites: string[];
-	/** A question under the task is unanswered (always false until `Ask` exists, plan PR 7). */
+	/**
+	 * A question under the task is unanswered (`Ask`, plan PR 7): the question's nearest task
+	 * waits, unless its asker went ahead with its recommendation (`proceed`).
+	 */
 	people: boolean;
 	/**
 	 * A change to it waits for confirmation (a locked plan, design §2.2): an open pending change
@@ -769,15 +785,15 @@ export interface OutlineTaskSubject {
 }
 
 /**
- * Of the given tasks, those with an unanswered question under them. Questions are plan PR 7
- * (`Ask`); until they exist, no task waits for people.
+ * Of the given tasks, those an unanswered question waits under (`Ask`, plan PR 7): a question
+ * makes its nearest task above it wait, unless its asker went ahead with its recommendation
+ * (`proceed`). One bounded read of each space's open questions (`questions.ts`).
  */
 export async function findTasksWaitingForPeople(
-	_taskIds: readonly string[],
-	_options: { store?: OutlineStore } = {},
+	tasks: readonly OutlineTaskSubject[],
+	options: { store?: OutlineStore } = {},
 ): Promise<Set<string>> {
-	// TODO(outline P2 PR 7): an `Ask` under a task (or under its steps) that has no answer yet.
-	return new Set();
+	return await questionWaits(tasks, options);
 }
 
 /**
@@ -859,10 +875,7 @@ export async function deriveOutlineTaskWaits(
 		}
 	}
 
-	const people = await findTasksWaitingForPeople(
-		tasks.map((t) => t.id),
-		{ store },
-	);
+	const people = await findTasksWaitingForPeople(tasks, { store });
 	for (const id of people) {
 		const wait = out.get(id);
 		if (wait) wait.people = true;

@@ -403,6 +403,7 @@ export class LivePage {
 				parentId: b.parentId,
 				orderKey: b.orderKey,
 				taskJson: b.taskJson,
+				question: b.askJson !== null,
 				deleted: false,
 				dbContent: b.content,
 			});
@@ -1802,7 +1803,9 @@ export class LivePage {
 					break;
 				}
 				case "k": {
-					if (!alive(op.id) || op.id === this.pageId) return null;
+					// A question is not a task: its checkbox is refused (it is answered in the inbox).
+					if (!alive(op.id) || op.id === this.pageId || this.mirror.get(op.id)?.question)
+						return null;
 					out.push(op);
 					break;
 				}
@@ -1956,6 +1959,8 @@ export class LivePage {
 			if (task !== taskCharOf(m.taskJson)) tasks.push({ t: "k", id: v.blockId, task });
 			if (JSON.stringify(v.taskJson) !== JSON.stringify(m.taskJson))
 				this.mirror.update(v.blockId, { taskJson: v.taskJson });
+			if ((v.askJson !== null) !== (m.question === true))
+				this.mirror.update(v.blockId, { question: v.askJson !== null });
 			if (v.content !== null && v.content !== m.dbContent) {
 				this.mergeText(v.blockId, m.dbContent, v.content);
 				this.setDbContent(v.blockId, v.content);
@@ -1977,6 +1982,7 @@ export class LivePage {
 						parentId: v.parentId,
 						orderKey: v.orderKey,
 						taskJson: v.taskJson,
+						question: v.askJson !== null,
 						deleted: false,
 						dbContent: content,
 					});

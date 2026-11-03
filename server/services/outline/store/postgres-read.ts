@@ -15,7 +15,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 } from "@server/db/postgres-schema";
-import type { OutlineTaskJson } from "@server/db/schema";
+import type { OutlineAskJson, OutlineTaskJson } from "@server/db/schema";
 import {
 	and,
 	desc,
@@ -66,10 +66,15 @@ function taskOf(value: unknown): OutlineTaskJson | null {
 	return (value as OutlineTaskJson | null | undefined) ?? null;
 }
 
+function askOf(value: unknown): OutlineAskJson | null {
+	return (value as OutlineAskJson | null | undefined) ?? null;
+}
+
 function toBlock(row: BlockSelect): OutlineBlockRow {
 	return {
 		...row,
 		taskJson: taskOf(row.taskJson),
+		askJson: askOf(row.askJson),
 		authorKind: row.authorKind as OutlineActorKind,
 	};
 }
@@ -92,7 +97,7 @@ function caseOf(pairs: ReadonlyArray<readonly [string, number]>): SQL {
 }
 
 function toVersion(row: VersionSelect): OutlineVersionRow {
-	return { ...row, taskJson: taskOf(row.taskJson) };
+	return { ...row, taskJson: taskOf(row.taskJson), askJson: askOf(row.askJson) };
 }
 
 function toLink(row: LinkSelect): OutlineLinkRow {
@@ -142,6 +147,7 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 				orderKey: string;
 				alias: string | null;
 				taskJson: unknown;
+				askJson: unknown;
 				versionSeq: number;
 			}>;
 			if (asOf === null) {
@@ -153,6 +159,7 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 						orderKey: outlineBlocks.orderKey,
 						alias: outlineBlocks.alias,
 						taskJson: outlineBlocks.taskJson,
+						askJson: outlineBlocks.askJson,
 						versionSeq: outlineBlocks.versionSeq,
 					})
 					.from(outlineBlocks)
@@ -168,6 +175,7 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 						orderKey: v.orderKey,
 						alias: v.alias,
 						taskJson: v.taskJson,
+						askJson: v.askJson,
 						versionSeq: v.fromSeq,
 					})
 					.from(v)
@@ -176,7 +184,9 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 					.limit(limit + 1);
 			}
 			return {
-				rows: rows.slice(0, limit).map((r) => ({ ...r, taskJson: taskOf(r.taskJson) })),
+				rows: rows
+					.slice(0, limit)
+					.map((r) => ({ ...r, taskJson: taskOf(r.taskJson), askJson: askOf(r.askJson) })),
 				truncated: rows.length > limit,
 			};
 		},
@@ -194,6 +204,7 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 						orderKey: outlineBlocks.orderKey,
 						alias: outlineBlocks.alias,
 						taskJson: outlineBlocks.taskJson,
+						askJson: outlineBlocks.askJson,
 						versionSeq: outlineBlocks.versionSeq,
 						pageId: outlineBlocks.pageId,
 					})
@@ -201,7 +212,8 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 					.where(and(inArray(outlineBlocks.pageId, chunk), eq(outlineBlocks.deleted, false)))
 					.orderBy(outlineBlocks.pageId)
 					.limit(max - out.length + 1);
-				for (const r of rows) out.push({ ...r, taskJson: taskOf(r.taskJson) });
+				for (const r of rows)
+					out.push({ ...r, taskJson: taskOf(r.taskJson), askJson: askOf(r.askJson) });
 				if (out.length > max) return { rows: out.slice(0, max), truncated: true };
 			}
 			return { rows: out, truncated: false };

@@ -38,6 +38,23 @@ export function isWithdrawOnlyAskRequest(input: unknown): boolean {
 	return !hasQuestions && readWithdrawIds(input).length > 0;
 }
 
+/** Why `async: true` is refused in an outline session. */
+export const ASYNC_IN_OUTLINE_SESSION =
+	"AskUserQuestion with async: true is not available in this session. To ask without stopping, use Ask: it records the question under your task (with your recommendation) and the answer comes back as a message. AskUserQuestion without async still asks and waits for the answer.";
+
+/** A root session whose tasks are outline tasks (`task_backend` outline): it has `Ask`. */
+async function isOutlineRootSession(narratorId: string): Promise<boolean> {
+	try {
+		const { isOutlineEnabled } = await import("@server/services/outline/feature");
+		if (!isOutlineEnabled()) return false;
+		const { readNarratorTaskBackend } = await import("@server/services/outline/access-reads");
+		const row = await readNarratorTaskBackend(narratorId);
+		return !!row && !row.subagent && row.backend === "outline";
+	} catch {
+		return false;
+	}
+}
+
 export const askUserQuestionTool: ToolDefinition = {
 	name: "AskUserQuestion",
 	description:
@@ -266,6 +283,14 @@ export const askUserQuestionTool: ToolDefinition = {
 		const questions = Array.isArray(input.questions) ? input.questions : [];
 
 		if (isAsyncAskRequest(input) && questions.length > 0) {
+			// Outline sessions ask without blocking through `Ask` (owner decision Q5, outline P2 PR 7):
+			// the question goes under its task, and its answer is the person's confirmation.
+			if (await isOutlineRootSession(ctx.narratorId)) {
+				return {
+					output: joinSections(withdrawnNote, ASYNC_IN_OUTLINE_SESSION),
+					isError: true,
+				};
+			}
 			try {
 				return { output: joinSections(withdrawnNote, await submitAsyncQuestions(input, ctx)) };
 			} catch (error) {

@@ -1563,6 +1563,8 @@ function scheduleHumanAttentionBroadcast(): void {
 // A separate key also registers the new bridge when an older WS module was hot-loaded.
 if (hotOnce("narrafork.humanAttentionWs.listenersRegistered")) {
 	eventBus.on("human_attention:changed", scheduleHumanAttentionBroadcast);
+	// A change waiting for a locker's confirmation is in their inbox (outline P2 PR 7).
+	eventBus.on("outline:pending", scheduleHumanAttentionBroadcast);
 	// Deleting history can cascade-delete an async question without calling its
 	// decision service. The frame is emitted after the history change commits.
 	eventBus.on("narrator:message_broadcast", ({ message }) => {

@@ -59,6 +59,7 @@ import {
 	KNOWLEDGE_MERGE_ACTION_SET,
 } from "../lib/agent/tools/knowledge-actions";
 import {
+	OUTLINE_ASK_TOOL,
 	OUTLINE_EDIT_TOOL,
 	OUTLINE_READ_TOOL,
 	OUTLINE_SEARCH_TOOL,
@@ -837,6 +838,8 @@ export function resolvePermissionDecision(
 	// person's write permission, and in read-only and strict plan mode only the session's own
 	// space. Under bypassPermissions the danger classification below still applies.
 	if (toolName === OUTLINE_EDIT_TOOL) return "allow";
+	// A question put to a person writes one block under the task (outline P2 PR 7).
+	if (toolName === OUTLINE_ASK_TOOL) return "allow";
 
 	const planFileCandidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {

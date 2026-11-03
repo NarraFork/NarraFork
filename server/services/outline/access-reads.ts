@@ -242,6 +242,14 @@ export async function readUserExists(id: string): Promise<boolean> {
 	return rows.length > 0;
 }
 
+/** The user a name names: their username, or their id; null when nobody (or two) match. */
+export async function readUserIdByName(name: string): Promise<string | null> {
+	const rows = await all(
+		sql`select id from users where username = ${name} or id = ${name} limit 2`,
+	);
+	return rows.length === 1 && rows[0] ? text(rows[0], "id") : null;
+}
+
 /**
  * Which of `ids` are existing users without the admin role. Admins can read everything, so they
  * never narrow what a session may read; an unknown role counts as not admin.

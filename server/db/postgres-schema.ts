@@ -3496,6 +3496,7 @@ export const outlineBlocks = pgTable(
 		contentHash: text("content_hash").notNull(),
 		alias: text("alias"),
 		taskJson: jsonText("task_json"),
+		askJson: jsonText("ask_json"),
 		authorKind: text("author_kind").notNull(),
 		authorId: text("author_id").notNull(),
 		versionSeq: integer("version_seq").notNull(),
@@ -3565,6 +3566,7 @@ export const outlineBlockVersions = pgTable(
 		orderKey: text("order_key").notNull(),
 		content: text("content"),
 		taskJson: jsonText("task_json"),
+		askJson: jsonText("ask_json"),
 		alias: text("alias"),
 		contentHash: text("content_hash").notNull(),
 		changeFlags: integer("change_flags").notNull(),
@@ -3653,6 +3655,7 @@ export const outlinePending = pgTable(
 		decisionCommitId: text("decision_commit_id"),
 		reason: text("reason"),
 		reportedAt: text("reported_at"),
+		digestSeenAt: text("digest_seen_at"),
 	},
 	(table) => [
 		index("idx_outline_pending_space").on(table.spaceId),
@@ -3670,6 +3673,46 @@ export const outlinePending = pgTable(
 			.on(table.deciderUserId)
 			.where(sql.raw("\"status\" = 'open'")),
 		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
+		index("idx_outline_pending_digest")
+			.on(table.deciderUserId)
+			.where(
+				sql.raw(
+					"\"status\" = 'confirmed' AND \"digest_seen_at\" IS NULL AND (\"decided_by_json\"::jsonb #>> '{kind}') = 'agent'",
+				),
+			),
+	],
+);
+
+export const outlineQuestions = pgTable(
+	"outline_questions",
+	{
+		blockId: text("block_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		spaceId: text("space_id").notNull(),
+		state: text("state").notNull(),
+		proceed: boolean("proceed").notNull().default(false),
+		toUserId: text("to_user_id"),
+		askerNarratorId: text("asker_narrator_id"),
+		askerUserId: text("asker_user_id"),
+		askerToolCallId: text("asker_tool_call_id"),
+		createdAt: text("created_at").notNull(),
+		answeredAt: text("answered_at"),
+		answerCommitId: text("answer_commit_id"),
+		deliveredAt: text("delivered_at"),
+	},
+	(table) => [
+		index("idx_outline_questions_to_open").on(table.toUserId).where(sql.raw("\"state\" = 'open'")),
+		index("idx_outline_questions_space_open")
+			.on(table.spaceId)
+			.where(sql.raw("\"state\" = 'open'")),
+		index("idx_outline_questions_asker_open")
+			.on(table.askerNarratorId)
+			.where(sql.raw("\"state\" = 'open'")),
+		index("idx_outline_questions_undelivered")
+			.on(table.answeredAt)
+			.where(sql.raw('"state" = \'answered\' AND "delivered_at" IS NULL')),
 	],
 );
 
@@ -4165,8 +4208,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 135,
-  "columnCount": 1786,
+  "tableCount": 136,
+  "columnCount": 1801,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -24351,6 +24394,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "askJson",
+          "name": "ask_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "authorKind",
           "name": "author_kind",
           "kind": "text",
@@ -24705,6 +24758,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "taskJson",
           "name": "task_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askJson",
+          "name": "ask_json",
           "kind": "text",
           "mode": "json",
           "pgType": "text",
@@ -25251,6 +25314,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "digestSeenAt",
+          "name": "digest_seen_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         }
       ],
       "indexes": [
@@ -25309,6 +25381,177 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "decisionCommitId"
           ],
           "unique": true
+        },
+        {
+          "name": "idx_outline_pending_digest",
+          "columns": [
+            "deciderUserId"
+          ],
+          "unique": false,
+          "predicate": "\"status\" = 'confirmed' AND \"digest_seen_at\" IS NULL AND (\"decided_by_json\"::jsonb #>> '{kind}') = 'agent'"
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineQuestions",
+      "name": "outline_questions",
+      "columns": [
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_questions_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "proceed",
+          "name": "proceed",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "toUserId",
+          "name": "to_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askerNarratorId",
+          "name": "asker_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askerUserId",
+          "name": "asker_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askerToolCallId",
+          "name": "asker_tool_call_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "answeredAt",
+          "name": "answered_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "answerCommitId",
+          "name": "answer_commit_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deliveredAt",
+          "name": "delivered_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_questions_to_open",
+          "columns": [
+            "toUserId"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'open'"
+        },
+        {
+          "name": "idx_outline_questions_space_open",
+          "columns": [
+            "spaceId"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'open'"
+        },
+        {
+          "name": "idx_outline_questions_asker_open",
+          "columns": [
+            "askerNarratorId"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'open'"
+        },
+        {
+          "name": "idx_outline_questions_undelivered",
+          "columns": [
+            "answeredAt"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'answered' AND \"delivered_at\" IS NULL"
         }
       ],
       "checks": [],

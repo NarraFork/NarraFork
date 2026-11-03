@@ -20,6 +20,8 @@ export interface MirrorBlock {
 	parentId: string | null;
 	orderKey: string;
 	taskJson: OutlineTaskJson | null;
+	/** A question put to a person (`Ask`): its checkbox cannot be set in the editor. */
+	question?: boolean;
 	deleted: boolean;
 	/** The block's content as the blocks table holds it now. */
 	dbContent: string;
