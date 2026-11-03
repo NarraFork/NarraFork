@@ -2,7 +2,11 @@ import type {
 	OutlineBacklinksResponse,
 	OutlineBlockHistoryResponse,
 	OutlineBlockViewResponse,
+	OutlineLockResponse,
 	OutlinePageListResponse,
+	OutlinePagePendingResponse,
+	OutlinePendingDecisionResponse,
+	OutlinePendingDetailResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
@@ -93,5 +97,32 @@ export const outlineApi = {
 	revertOutlineCommit: (commitId: string) =>
 		request<OutlineRevertResponse>(`/outline/commits/${enc(commitId)}/revert`, {
 			method: "POST",
+		}),
+	/** What waits for confirmation on a page, and its locked tasks. */
+	getOutlinePagePending: (spaceId: string, pageId: string) =>
+		request<OutlinePagePendingResponse>(
+			`/outline/spaces/${enc(spaceId)}/pages/${enc(pageId)}/pending`,
+		),
+	/** A pending change block by block. */
+	getOutlinePending: (pendingId: string) =>
+		request<OutlinePendingDetailResponse>(`/outline/pending/${enc(pendingId)}`),
+	confirmOutlinePending: (pendingId: string) =>
+		request<OutlinePendingDecisionResponse>(`/outline/pending/${enc(pendingId)}/confirm`, {
+			method: "POST",
+		}),
+	rejectOutlinePending: (pendingId: string, reason: string | null) =>
+		request<OutlinePendingDecisionResponse>(`/outline/pending/${enc(pendingId)}/reject`, {
+			method: "POST",
+			body: JSON.stringify({ reason }),
+		}),
+	/** Lock a task's tree, naming the session that may confirm on the caller's behalf. */
+	lockOutlineBlock: (spaceId: string, blockId: string, delegate: string | null) =>
+		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
+			method: "POST",
+			body: JSON.stringify({ delegate }),
+		}),
+	unlockOutlineBlock: (spaceId: string, blockId: string) =>
+		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
+			method: "DELETE",
 		}),
 };

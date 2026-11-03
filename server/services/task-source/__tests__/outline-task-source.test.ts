@@ -28,6 +28,7 @@ import * as executor from "../../narrator-executor";
 import { narratorService } from "../../narrator-service";
 import { maybeStartContinuation, readSpecContinuationState } from "../../narrator-session";
 import type { ActiveNarrator } from "../../narrator-session-state";
+import { lockOutlineTask, rejectOutlinePending } from "../../outline/pending";
 import { ensureSessionSpace } from "../../outline/spaces";
 import { outlineStore } from "../../outline/store";
 import * as outlineWrite from "../../outline/write";
@@ -335,6 +336,45 @@ describe("outline continuation (D27b: waiting replaces blocked)", () => {
 		const prompt = await maybeStartContinuation(activeOf(id), false);
 		expect(prompt).toContain("Write the notes");
 		expect((await taskState(id, "Write the notes")).claim?.holderNarratorId).toBe(id);
+	});
+
+	test("a task a change waits for confirmation on (a locked plan, PR 6) reads as blocked and is skipped; decided, it is open again", async () => {
+		const owner = await user();
+		const id = await session({ mode: "blockStop", owner });
+		await seedOutlineTasks(id, [
+			{ text: "Parse the header", status: "todo" },
+			{ text: "Load the rows", status: "todo" },
+		]);
+		const parse = await taskState(id, "Parse the header");
+		// The person locks the step; the session's rewrite of it waits for their confirmation.
+		await lockOutlineTask({ blockId: parse.block.id, userId: owner });
+		const held = await outlineWrite.writeOutline({
+			spaceId: parse.block.spaceId,
+			ops: [{ op: "update", block: { id: parse.block.id }, content: "Parse the header fast" }],
+			actor: { kind: "agent", id },
+			narratorId: id,
+			responsibleUserId: owner,
+		});
+		expect(held.pending).toBeDefined();
+		const source = await taskSourceForNarrator(id);
+		const before = await source.openTasks();
+		expect(before.tasks.map((t) => [t.text, t.status])).toEqual([
+			["Parse the header", "blocked"],
+			["Load the rows", "todo"],
+		]);
+		// Continuation skips it: the next task the session can start is started instead.
+		const prompt = await maybeStartContinuation(activeOf(id), false);
+		expect(prompt).toContain("Load the rows");
+		expect((await taskState(id, "Load the rows")).claim?.holderNarratorId).toBe(id);
+		expect((await taskState(id, "Parse the header")).claim?.holderNarratorId ?? null).toBeNull();
+		// Rejected, it waits no more: open again, and the revision moved.
+		await rejectOutlinePending({
+			pendingId: held.pending?.id as string,
+			by: { kind: "human", userId: owner },
+		});
+		const after = await source.openTasks();
+		expect(after.tasks.find((t) => t.text === "Parse the header")?.status).toBe("todo");
+		expect(after.revision).not.toBe(before.revision);
 	});
 
 	test("a claim refused by the write path is not a crash: the tasks are read again", async () => {

@@ -49,7 +49,12 @@
 		"alias": "Alias {{alias}}",
 		"inProgress_one": "In progress · {{count}}",
 		"inProgress_other": "In progress · {{count}}",
-		"inProgressHint": "Open tasks under this block. Switch to All to see them.",
+		"inProgressHint": "Open tasks under this block; pick one to focus on it.",
+		"inProgressMore_one": "{{count}} more: focus on this block to see it",
+		"inProgressMore_other": "{{count}} more: focus on this block to see them",
+		"hiddenUnder_one": "+{{count}} under a task",
+		"hiddenUnder_other": "+{{count}} under tasks",
+		"hiddenUnderHint": "Only done or cancelled tasks are under this block; the facts view leaves them out. Switch to All to see them.",
 		"more_one": "… {{count}} more",
 		"more_other": "… {{count}} more",
 		"moreAtRoot_one": "… {{count}} more block does not fit on this page; focus on a part of it.",
@@ -67,7 +72,8 @@
 		"truncated": "This page is too large to read at once; focus on a part of it.",
 		"processHidden_one": "{{count}} block under tasks is not shown.",
 		"processHidden_other": "{{count}} blocks under tasks are not shown.",
-		"showAll": "Show all"
+		"showAll": "Show all",
+		"waitingConfirmation": "waiting for confirmation"
 	},
 	"side": {
 		"backlinks": "Backlinks",
@@ -106,7 +112,8 @@
 		"kind": {
 			"edit": "Edit",
 			"revert": "Revert",
-			"import": "Import"
+			"import": "Import",
+			"confirm": "Confirm"
 		},
 		"actor": {
 			"unknown": "Someone",
@@ -137,8 +144,6 @@
 	},
 	"editor": {
 		"changeStatus": "Change status",
-		"hiddenUnder_one": "+{{count}} under a task",
-		"hiddenUnder_other": "+{{count}} under tasks",
 		"tooLarge": "A block can hold at most 16 KB. Split it into more blocks.",
 		"rootKept": "The block in focus stays; go up a level to delete it.",
 		"peerEditing": "{{name}} is editing",
@@ -173,7 +178,13 @@
 		"tooLargePage": "This page is too large to edit live (over 2000 blocks or 4 MB). It is shown read only; focus on a part of it or split it.",
 		"unavailable": "Live editing is not available right now; the page is shown read only.",
 		"retry": "Try again",
-		"tabLimit": "Shown read only: this tab already has {{count}} outline pages open for live editing. Close or hide one of them, then try again."
+		"tabLimit": "Shown read only: this tab already has {{count}} outline pages open for live editing. Close or hide one of them, then try again.",
+		"inProgress_one": "In progress · {{count}}",
+		"inProgress_other": "In progress · {{count}}",
+		"inProgressHint": "Open tasks under this block",
+		"hiddenUnder_one": "+{{count}} under a task",
+		"hiddenUnder_other": "+{{count}} under tasks",
+		"waitingConfirmation": "waiting for confirmation"
 	},
 	"map": {
 		"viewLabel": "View",
@@ -223,5 +234,64 @@
 	},
 	"workspace": {
 		"addTitle": "Add an outline page"
+	},
+	"lock": {
+		"badge": "Locked · {{name}}",
+		"someone": "someone",
+		"section": "Lock",
+		"lockedBy": "Locked by {{name}}",
+		"delegate": "{{name}} may confirm on the locker's behalf",
+		"explainLocked": "Agents' changes to this plan (its steps, goal and acceptance) wait for confirmation. People edit it as usual.",
+		"explainUnlocked": "Lock this plan: agents' changes to its steps, goal and acceptance then wait for your confirmation.",
+		"delegateLabel": "Confirming on your behalf (optional)",
+		"delegatePlaceholder": "Nobody: you confirm",
+		"lock": "Lock",
+		"unlock": "Unlock",
+		"lockedNotice": "Plan locked",
+		"unlockedNotice": "Plan unlocked",
+		"failed": "Could not change the lock",
+		"unlockHint": "Unlocking withdraws the changes waiting for confirmation.",
+		"session": "the session {{title}}",
+		"untitledSession": "a session"
+	},
+	"pending": {
+		"badge": "Waiting for confirmation",
+		"tab": "To confirm",
+		"none": "Nothing waits for confirmation here.",
+		"proposedBy": "Proposed by {{name}}",
+		"decider": "For {{name}} to confirm",
+		"deciderWithDelegate": "For {{name}} (or {{delegate}}) to confirm",
+		"changedSince": "Changed since it was proposed: confirming merges the changes, or fails if they overlap.",
+		"changedUnder_one": "Since the deletion was proposed, {{count}} block in or under it was added, changed or moved away: confirming will be refused.",
+		"changedUnder_other": "Since the deletion was proposed, {{count}} blocks in or under it were added, changed or moved away: confirming will be refused.",
+		"subtreeUnchecked": "Too many blocks to check here for changes since the deletion was proposed.",
+		"subtreeUncheckedWriters": "Not checked for changes since the deletion was proposed: too many writers of the proposing session wrote on top of one another to tell whether anyone else did.",
+		"changes_one": "{{count}} change",
+		"changes_other": "{{count}} changes",
+		"confirm": "Confirm",
+		"reject": "Reject",
+		"reasonPlaceholder": "Why (the agent reads this)",
+		"confirmed": "Confirmed {{label}}",
+		"rejected": "Rejected {{label}}",
+		"failed": "Could not decide {{label}}",
+		"notYours": "The person who locked the plan decides, or the session they named.",
+		"kind": {
+			"update": "Rewritten",
+			"insert": "Added",
+			"delete": "Deleted",
+			"move": "Moved",
+			"task": "Task changed",
+			"restore": "Restored"
+		},
+		"base": "Before",
+		"proposed": "Proposed",
+		"now": "Now",
+		"under": "Under {{title}}",
+		"topLevel": "At the top level",
+		"truncated": "The change has more parts than shown here.",
+		"taskStatus": "Checkbox: {{status}}",
+		"taskRemoved": "Checkbox taken away",
+		"taskDue": "Due: {{date}}",
+		"taskAssignee": "Assignee: {{name}}"
 	}
 }

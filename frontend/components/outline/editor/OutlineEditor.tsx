@@ -38,7 +38,7 @@ import { useTranslation } from "react-i18next";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
 import type { OutlineViewState } from "../view-state";
-import { chromeText } from "./chrome";
+import { type BlockMark, chromeText } from "./chrome";
 import type { LiveClient, LiveTransport } from "./live-client";
 import {
 	acquireLiveSession,
@@ -87,6 +87,8 @@ export interface OutlineEditorProps {
 	onUnavailable: (reason: OutlineLiveUnavailable) => void;
 	/** Blocks the facts view leaves out, for the page's hint. */
 	onHiddenChange?: (count: number) => void;
+	/** Locks and pending changes of the page's blocks (the page's pending summary). */
+	marks?: ReadonlyMap<string, BlockMark>;
 	/** The focused block's path and title, whenever they change. */
 	onFocusInfo?: (info: OutlineFocusInfo) => void;
 	/** The editing surface (the quick switcher focuses through it), and null when it goes. */
@@ -202,7 +204,12 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.fold = t("page.collapse");
 	chromeText.focus = t("page.focus");
 	chromeText.task = t("editor.changeStatus");
-	chromeText.hidden = (count) => t("editor.hiddenUnder", { count });
+	chromeText.hidden = (count) => t("editor.inProgress", { count });
+	chromeText.hiddenHint = t("editor.inProgressHint");
+	chromeText.hiddenUnder = (count) => t("editor.hiddenUnder", { count });
+	chromeText.waiting = t("editor.waitingConfirmation");
+	chromeText.locked = (name) => t("lock.badge", { name });
+	chromeText.pending = t("pending.badge");
 	mapText.more = (count) => t("map.more", { count });
 	mapText.stage = t("map.stage");
 
@@ -325,6 +332,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	useEffect(() => {
 		surfaceRef.current?.setLens(lens);
 	}, [lens]);
+	const marks = props.marks;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a new surface takes the marks too
+	useEffect(() => {
+		surfaceRef.current?.setMarks(marks ?? new Map());
+	}, [marks, client, pageId]);
 
 	useEffect(() => {
 		if (!refusal) return;

@@ -73,6 +73,7 @@ import {
 	prefetchOutlineSeed,
 	useOutlineBlock,
 	useOutlinePageLive,
+	useOutlinePagePending,
 	useOutlineSeed,
 	useOutlineViewStateSync,
 } from "../../hooks/useOutline";
@@ -82,6 +83,7 @@ import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { MANTINE_SM_BREAKPOINT_PX, MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
 import type { EditSurface } from "./edit-surface";
+import type { BlockMark } from "./editor/chrome";
 import { liveSessionIfReady } from "./editor/live-sessions";
 import {
 	OutlineEditor,
@@ -248,6 +250,28 @@ function SurfaceBody({
 	useEffect(() => {
 		if (pageId) setFallback(null);
 	}, [pageId]);
+	// Locks and changes waiting for confirmation, shown on the live page's blocks (P2 PR 6).
+	const pagePending = useOutlinePagePending(spaceId, pageId, editing);
+	const lockedLabel = t("lock.someone");
+	const marks = useMemo(() => {
+		const out = new Map<string, BlockMark>();
+		const data = pagePending.data;
+		if (!data) return out;
+		for (const lock of data.locks) {
+			out.set(lock.blockId, {
+				lockedBy:
+					lock.by.kind === "human" ? (lock.by.name ?? lockedLabel) : (lock.by.name ?? lockedLabel),
+			});
+		}
+		for (const change of data.pending) {
+			// The blocks it targets, and those it adds blocks under (a proposed step's parent).
+			for (const id of new Set([...change.blockIds, ...change.addedUnder])) {
+				const mark = out.get(id) ?? {};
+				out.set(id, { ...mark, pending: [...(mark.pending ?? []), change.label] });
+			}
+		}
+		return out;
+	}, [pagePending.data, lockedLabel]);
 
 	// Folding, caret and block selection of each page this surface showed: its own, not shared
 	// with another surface on the same page.
@@ -584,6 +608,7 @@ function SurfaceBody({
 								onFocus={(id) => go({ blockId: id })}
 								onUnavailable={setFallback}
 								onHiddenChange={setHiddenLive}
+								marks={marks}
 								onFocusInfo={setFocusInfo}
 								onSurface={setEditSurface}
 								onOpenSwitcher={openSwitcher}

@@ -32,6 +32,19 @@ export type OutlineWriteErrorCode =
 	| "OUTLINE_ID_TAKEN"
 	/** The task is being done by someone else (a live claim); see `OutlineTaskClaimedError`. */
 	| "OUTLINE_TASK_CLAIMED"
+	/** An agent's write sets or clears a lock: only people lock (`lockOutlineTask`). */
+	| "OUTLINE_LOCK_DENIED"
+	/**
+	 * The task is locked by someone else: locking it again would take their lock over. Unlocking
+	 * comes first, by someone who may (the locker, a manager of the space, an admin).
+	 */
+	| "OUTLINE_LOCK_HELD"
+	/** One write changes several locked plans; one call per plan. */
+	| "OUTLINE_LOCKED_MANY"
+	/** The page has as many open pending changes as it may hold. */
+	| "OUTLINE_PENDING_FULL"
+	/** A pending change would grow past its limits. */
+	| "OUTLINE_PENDING_TOO_LARGE"
 	/** An agent wrote a session's behavior page without the user turn's one-shot grant. */
 	| "OUTLINE_BEHAVIOR_PAGE_READONLY";
 

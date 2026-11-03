@@ -16,6 +16,9 @@
  *     closed so the client reconnects and re-reads instead of missing a change.
  *   - `outline.enabled` off: subscribing answers `unavailable`, and turning it off ends every
  *     subscription.
+ *   - Pending changes of the page changing (`outline:pending`, design §2.6) send an
+ *     `outline_page_pending` frame, coalesced the same way: the page id only, and the client
+ *     re-reads the page's pending summary.
  */
 import {
 	OUTLINE_PAGE_SUBSCRIPTION_LIMITS,
@@ -54,6 +57,8 @@ interface Subscription {
 	/** Newest seq not sent yet; 0 when nothing is pending. */
 	pendingSeq: number;
 	pendingCommits: string[];
+	/** The page's pending changes changed since the last frame. */
+	pendingChanges: boolean;
 }
 
 type ReauthFilter = (sub: Subscription) => boolean;
@@ -139,6 +144,7 @@ async function subscribe(ws: OutlinePageSocket, subscriptionId: string, pageId: 
 		active: true,
 		pendingSeq: 0,
 		pendingCommits: [],
+		pendingChanges: false,
 	};
 	const refuse = (code: OutlinePageErrorCode) =>
 		send(ws, { type: "outline_page_error", subscriptionId, code });
@@ -218,17 +224,39 @@ function flush(): void {
 	const batch = [...state.dirty];
 	state.dirty.clear();
 	for (const sub of batch) {
-		if (!isCurrent(sub) || sub.pendingSeq === 0) continue;
-		const frame: OutlinePageServerMessage = {
-			type: "outline_page_changed",
-			subscriptionId: sub.id,
-			pageId: sub.pageId,
-			seq: sub.pendingSeq,
-			commitIds: sub.pendingCommits,
-		};
-		sub.pendingSeq = 0;
-		sub.pendingCommits = [];
-		send(sub.ws, frame);
+		if (!isCurrent(sub)) continue;
+		if (sub.pendingSeq !== 0) {
+			const frame: OutlinePageServerMessage = {
+				type: "outline_page_changed",
+				subscriptionId: sub.id,
+				pageId: sub.pageId,
+				seq: sub.pendingSeq,
+				commitIds: sub.pendingCommits,
+			};
+			sub.pendingSeq = 0;
+			sub.pendingCommits = [];
+			send(sub.ws, frame);
+		}
+		if (sub.pendingChanges && isCurrent(sub)) {
+			sub.pendingChanges = false;
+			send(sub.ws, { type: "outline_page_pending", subscriptionId: sub.id, pageId: sub.pageId });
+		}
+	}
+}
+
+function onPending(event: Extract<NarraForkEvent, { type: "outline:pending" }>): void {
+	for (const pageId of event.pageIds) {
+		const watchers = state.byPage.get(pageId);
+		if (!watchers) continue;
+		for (const sub of watchers) {
+			if (sub.space?.id !== event.spaceId) continue;
+			sub.pendingChanges = true;
+			state.dirty.add(sub);
+		}
+	}
+	if (state.dirty.size > 0 && !state.flushTimer) {
+		state.flushTimer = setTimeout(flush, OUTLINE_PAGE_COALESCE_MS);
+		state.flushTimer.unref?.();
 	}
 }
 
@@ -326,6 +354,7 @@ export function outlinePageSubscriptionStats(): { sockets: number; pages: number
 
 if (hotOnce("narrafork.outlinePageWs.listenersRegistered")) {
 	eventBus.on("outline:committed", onCommitted);
+	eventBus.on("outline:pending", onPending);
 	eventBus.on("narrator:access_changed", onOutlineAccessEvent);
 	eventBus.on("project:access_changed", onOutlineAccessEvent);
 	eventBus.on("auth:changed", onOutlineAccessEvent);

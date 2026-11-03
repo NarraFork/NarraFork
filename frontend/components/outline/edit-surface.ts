@@ -32,7 +32,7 @@
  */
 import type { OutlineMapLayout } from "@shared/outline-api";
 import type { Command } from "prosemirror-state";
-import type { MentionResolver } from "./editor/chrome";
+import type { BlockMark, MentionResolver } from "./editor/chrome";
 import { mentionLabel } from "./editor/chrome";
 import { caretIn } from "./editor/commands";
 import type { LiveClient, SelInfo } from "./editor/live-client";
@@ -342,6 +342,14 @@ export class EditSurface {
 		return this.deferral.waiting || this.tracker.active;
 	}
 
+	/** Locks and pending changes of the page's blocks (shown on both outline views). */
+	private marks: ReadonlyMap<string, BlockMark> = new Map();
+
+	setMarks(marks: ReadonlyMap<string, BlockMark>): void {
+		this.marks = marks;
+		for (const v of this.outlines()) v.setMarks(marks);
+	}
+
 	setLens(lens: OutlineLens): void {
 		if (this.lens === lens) return;
 		this.lens = lens;
@@ -412,6 +420,7 @@ export class EditSurface {
 			restoreSel: (sel) => this.restoreSel(sel),
 		});
 		v.noScroll = this.state.view === "map";
+		if (this.marks.size > 0) v.setMarks(this.marks);
 		return v;
 	}
 

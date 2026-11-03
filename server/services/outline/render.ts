@@ -29,8 +29,9 @@
  * ---------------------------------------
  * The `‹…›` lines are output only. A note about the whole read is written at column 0, where the
  * outline serializer never writes anything but a top-level item; a `‹… N more›` line is indented
- * like the children it stands for. `stripReadAnnotations` removes both (outside code fences), and
- * whoever parses outline text an agent may have copied from a read applies it first.
+ * like the children it stands for, and so is a block's own note (`annotate`: `‹pending …›`, a
+ * change waiting for confirmation). `stripReadAnnotations` removes them all (outside code
+ * fences), and whoever parses outline text an agent may have copied from a read applies it first.
  *
  * Block labels (an address before each item, say) are a hook: the caller decides their syntax.
  */
@@ -94,6 +95,11 @@ export interface OutlineRenderOptions {
 	 * with the number of blocks that were read.
 	 */
 	truncatedRead?: { blocksRead: number };
+	/**
+	 * A note under a block (its text, written as `‹text›` indented like the block's children;
+	 * it must start with `pending `, the form `stripReadAnnotations` knows).
+	 */
+	annotate?: (node: OutlineNode) => string | null;
 }
 
 export interface OutlineRenderResult {
@@ -164,6 +170,7 @@ export function renderOutline(
 		view: effectiveView(root, options.view ?? "facts"),
 		budget: options.budget,
 		display: options.display,
+		annotate: options.annotate,
 		notes,
 		forceFirst: true,
 		interleave: false,
@@ -286,6 +293,7 @@ function expand(
 		view: OutlineView;
 		budget?: Partial<OutlineBudget>;
 		display?: OutlineDisplay;
+		annotate?: (node: OutlineNode) => string | null;
 		notes: readonly string[];
 		/** The first top-level block is shown whatever the budget (a read's root). */
 		forceFirst: boolean;
@@ -352,7 +360,11 @@ function expand(
 			const text = serializeMarkdownOutline([options.display?.(node, item) ?? item], {
 				label: () => label ?? null,
 			});
-			cached = indented(text.split("\n"), depth.get(node) ?? 0);
+			const note = options.annotate?.(node);
+			const own = note
+				? [...text.split("\n"), `${INDENT}‹${note.replace(/\n+/g, " ")}›`]
+				: text.split("\n");
+			cached = indented(own, depth.get(node) ?? 0);
 			lines.set(node, cached);
 		}
 		return cached;
@@ -469,6 +481,8 @@ function countSubtree(root: OutlineNode): number {
 }
 
 const MORE_LINE = /^ *‹… \d+ more›$/;
+/** A block's own note (`annotate`): a change to it waits for confirmation. */
+const PENDING_LINE = /^ *‹pending [^\n]*›$/;
 const NOTE_LINE = /^‹[^\n]*›$/;
 /**
  * A code fence opening a line, or right after an item's bullet, its label (`[Ab3dEf9Q]`, when
@@ -478,7 +492,7 @@ const FENCE = /^ *(?:(?:[-*+]|\d{1,9}[.)]) +(?:\[[^\]\n]*\] +)?(?:\[[ xX/-]\] +)
 
 /** Whether a line of a rendered outline is an annotation rather than content. */
 export function isReadAnnotation(line: string): boolean {
-	return NOTE_LINE.test(line) || MORE_LINE.test(line);
+	return NOTE_LINE.test(line) || MORE_LINE.test(line) || PENDING_LINE.test(line);
 }
 
 /**
