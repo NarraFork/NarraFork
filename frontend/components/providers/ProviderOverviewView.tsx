@@ -1,5 +1,5 @@
 import { Box, Button, Grid, Group, Paper, Stack, Text, Title } from "@mantine/core";
-import { IconPlus } from "@tabler/icons-react";
+import { IconFileImport, IconPlus } from "@tabler/icons-react";
 import { Link } from "@tanstack/react-router";
 import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -113,6 +113,16 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 							</Text>
 						</Box>
 					</Group>
+					{/* `ml="auto"` keeps it beside the add button inside the space-between row. */}
+					<Button
+						component={Link}
+						to="/settings/providers/import"
+						variant="default"
+						ml="auto"
+						leftSection={<IconFileImport size={16} />}
+					>
+						{t("providerImportButton")}
+					</Button>
 					<Button
 						component={Link}
 						to="/settings/providers/add"

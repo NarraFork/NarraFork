@@ -6,6 +6,7 @@
  */
 
 import { parseModelId } from "@shared/model-id";
+import type { ProviderEndpointPolicy } from "@shared/provider-endpoints";
 import type { ModelProtocol, ProxyOverride } from "../settings/types";
 import type { UserAgentMode } from "../user-agent";
 
@@ -15,6 +16,8 @@ export interface ProtocolConnectionFields {
 	prefix: string;
 	apiKey: string;
 	baseUrl?: string;
+	baseUrls?: string[];
+	endpointPolicy?: ProviderEndpointPolicy;
 	defaultModel?: string;
 	proxy?: ProxyOverride;
 	userAgentMode?: UserAgentMode;
@@ -73,6 +76,8 @@ export function connectionForProtocolSwitch(
 		prefix: source.prefix,
 		apiKey: source.apiKey,
 		baseUrl: source.baseUrl ?? "",
+		baseUrls: source.baseUrls,
+		endpointPolicy: source.endpointPolicy,
 		defaultModel: source.defaultModel?.trim() || bare || "default",
 		proxy: source.proxy,
 		userAgentMode: source.userAgentMode,

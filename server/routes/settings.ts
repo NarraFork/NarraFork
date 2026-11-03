@@ -2,6 +2,11 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
+	ENDPOINT_POLICY_LIMITS,
+	endpointPolicySchema,
+	endpointUrlSchema,
+} from "@shared/provider-endpoints";
+import {
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -17,6 +22,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
+import { endpointPool } from "../lib/agent/endpoint-pool";
 import { listProviderReadiness, resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
@@ -157,6 +163,11 @@ const customApiProtocolSchema = z.enum([
 const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom"]).optional();
 const customUserAgentSchema = z.string().max(500).optional();
 const extraHeadersSchema = z.record(z.string(), z.string().max(2048)).optional();
+const baseUrlsSchema = z
+	.array(endpointUrlSchema)
+	.max(ENDPOINT_POLICY_LIMITS.maxBaseUrls)
+	.optional();
+const providerEndpointPolicySchema = endpointPolicySchema.optional();
 
 const customApiProviderSchema = z.object({
 	id: z.string().min(1),
@@ -164,6 +175,8 @@ const customApiProviderSchema = z.object({
 	prefix: z.string().min(1),
 	apiKey: z.string(),
 	baseUrl: z.string(),
+	baseUrls: baseUrlsSchema,
+	endpointPolicy: providerEndpointPolicySchema,
 	defaultModel: z.string(),
 	protocol: customApiProtocolSchema,
 	geminiTransport: z.enum(["generate-content", "interactions"]).optional(),
@@ -191,6 +204,8 @@ const openaiProviderSchema = z.object({
 	prefix: z.string().min(1),
 	apiKey: z.string(),
 	baseUrl: z.string(),
+	baseUrls: baseUrlsSchema,
+	endpointPolicy: providerEndpointPolicySchema,
 	defaultModel: z.string(),
 	responsesApi: z.boolean().optional(),
 	apiMode: z.enum(["responses", "completions", "codex"]).optional(),
@@ -212,6 +227,8 @@ const anthropicProviderSchema = z.object({
 	prefix: z.string().min(1),
 	apiKey: z.string(),
 	baseUrl: z.string(),
+	baseUrls: baseUrlsSchema,
+	endpointPolicy: providerEndpointPolicySchema,
 	defaultModel: z.string(),
 	defaultReasoningEffort: z
 		.enum(["none", "low", "medium", "high", "xhigh", "max"])
@@ -256,6 +273,8 @@ const geminiProviderSchema = z.object({
 	prefix: z.string().min(1),
 	apiKey: z.string(),
 	baseUrl: z.string(),
+	baseUrls: baseUrlsSchema,
+	endpointPolicy: providerEndpointPolicySchema,
 	defaultModel: z.string(),
 	geminiTransport: z.enum(["generate-content", "interactions"]).optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
@@ -2003,8 +2022,13 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 	}
 	const newBaseUrl = `${normalized}/v1`;
 
+	// Mirrors use the same path layout as the primary, so append the suffix to each one.
+	const nextBaseUrls = target.baseUrls?.map((url) => {
+		const trimmed = url.replace(/\/+$/, "");
+		return !trimmed || /\/v1$/i.test(trimmed) ? url : `${trimmed}/v1`;
+	});
 	const nextCustomApiProviders = customApiProviders.map((p) =>
-		p.id === target.id ? { ...p, baseUrl: newBaseUrl } : p,
+		p.id === target.id ? { ...p, baseUrl: newBaseUrl, baseUrls: nextBaseUrls } : p,
 	);
 
 	const merged: NarraForkSettings = {
@@ -2026,6 +2050,32 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 	});
 
 	return c.json({ ok: true, providerId: target.id, baseUrl: newBaseUrl });
+});
+
+function findCustomApiProvider(id: string) {
+	const providers =
+		settings.customApiProviders ??
+		deriveCustomApiProvidersFromLegacy(
+			settings.openaiProviders,
+			settings.anthropicProviders,
+			settings.geminiProviders,
+		);
+	const provider = providers.find((p) => p.id === id);
+	if (!provider) throw new ValidationError(`Provider "${id}" not found.`);
+	return provider;
+}
+
+/** Live latency and health of a configured custom API provider's endpoints. */
+settingsRoutes.get("/providers/:id/endpoints", requireAdmin, (c) => {
+	const provider = findCustomApiProvider(c.req.param("id") ?? "");
+	return c.json(endpointPool.status(provider));
+});
+
+/** Probe every configured endpoint and return its updated status. */
+settingsRoutes.post("/providers/:id/endpoints/probe", requireAdmin, async (c) => {
+	const provider = findCustomApiProvider(c.req.param("id") ?? "");
+	await endpointPool.probeAll(provider);
+	return c.json(endpointPool.status(provider));
 });
 
 const disableCodexImageGenerationSchema = z.object({

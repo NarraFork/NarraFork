@@ -23,6 +23,7 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { fetchWithEndpointFailover } from "./endpoint-pool";
 import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
 import {
 	classifyInvalidState,
@@ -693,6 +694,14 @@ export class OpenAIProvider implements ProviderAdapter {
 	 * Both paths apply loopback/NO_PROXY exemptions per target URL.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		// Multi-URL providers pick an endpoint and fail over; a single URL goes straight through.
+		return fetchWithEndpointFailover(this.config, input, init, (target, options) =>
+			this.pfetchOnce(target, options),
+		);
+	}
+
+	/** One request against a concrete URL: the provider's single-endpoint transport. */
+	private pfetchOnce(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = this.proxy
 			? applyProxyExemptions(this.proxy, target)

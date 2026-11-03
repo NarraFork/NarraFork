@@ -28,6 +28,7 @@ import {
 	resolveHttpUserAgent,
 } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { fetchWithEndpointFailover } from "./endpoint-pool";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
@@ -1277,6 +1278,14 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * summary/title calls alike.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		// Multi-URL providers pick an endpoint and fail over; a single URL goes straight through.
+		return fetchWithEndpointFailover(this.config, input, init, (target, options) =>
+			this.pfetchOnce(target, options),
+		);
+	}
+
+	/** One request against a concrete URL: the provider's single-endpoint transport. */
+	private pfetchOnce(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
 		return runProviderTransport(this.transport, input, init, (target, options) =>

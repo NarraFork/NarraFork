@@ -149,6 +149,7 @@ const nugSection = await import("./NUGProvidersSection");
 const { api, ApiError } = await import("../../lib/api");
 const { Route: parentFileRoute } = await import("../../routes/settings/providers");
 const { Route: addFileRoute } = await import("../../routes/settings/providers.add");
+const { Route: importFileRoute } = await import("../../routes/settings/providers.import");
 const { Route: callbackFileRoute } = await import(
 	"../../routes/settings/providers.tokendance.callback"
 );
@@ -238,13 +239,20 @@ function makeRouter(href: string) {
 		path: "add",
 		component: addFileRoute.options.component,
 	});
+	const importProvider = createRoute({
+		getParentRoute: () => providers,
+		path: "import",
+		component: importFileRoute.options.component,
+	});
 	const callback = createRoute({
 		getParentRoute: () => providers,
 		path: "tokendance/callback",
 		component: callbackFileRoute.options.component,
 	});
 	return createRouter({
-		routeTree: app.addChildren([settings.addChildren([providers.addChildren([add, callback])])]),
+		routeTree: app.addChildren([
+			settings.addChildren([providers.addChildren([add, importProvider, callback])]),
+		]),
 		history: createMemoryHistory({ initialEntries: [href] }),
 		defaultPendingMinMs: 0,
 	});
@@ -404,6 +412,7 @@ async function type(key: string, value: string) {
 		input.dispatchEvent(new Event("input", { bubbles: true }));
 	});
 }
+
 async function dispatchSubmit(times = 1) {
 	const form = container.querySelector("form");
 	if (!form) throw new Error("Missing add form");
@@ -556,6 +565,26 @@ describe("provider deep link resolution", () => {
 		expect(currentCustomDetail()).toBeUndefined();
 		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
 		expect(container.querySelector('a[href="/settings/providers/add"]')).not.toBeNull();
+	});
+});
+
+describe("gateway provider import nested route", () => {
+	test("overview opens gateway import and returns without saving or removing the add entry", async () => {
+		await mount();
+		const importLink = container.querySelector<HTMLAnchorElement>(
+			'a[href="/settings/providers/import"]',
+		);
+		expect(importLink).not.toBeNull();
+		await click(importLink as HTMLAnchorElement);
+		expect(router.state.location.pathname).toBe("/settings/providers/import");
+		expect(container.querySelector("[data-app-shell]")).not.toBeNull();
+		expect(container.textContent).toContain(text("providerImportTitle"));
+		expectNoSave();
+
+		await click(button("addProviderCancel"));
+		expect(router.state.location.pathname).toBe("/settings/providers");
+		expect(container.querySelector('a[href="/settings/providers/add"]')).not.toBeNull();
+		expectNoSave();
 	});
 });
 

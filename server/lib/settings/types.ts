@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import type { ProviderEndpointPolicy } from "@shared/provider-endpoints";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
@@ -57,6 +58,9 @@ export interface CustomApiProviderConfig {
 	prefix: string;
 	apiKey: string;
 	baseUrl: string;
+	/** Mirror endpoints serving the same API as `baseUrl`. */
+	baseUrls?: string[];
+	endpointPolicy?: ProviderEndpointPolicy;
 	defaultModel: string;
 	/** Canonical custom API protocol used by the UI and settings storage. */
 	protocol: CustomApiProtocol;
@@ -125,6 +129,9 @@ export interface OpenAIProviderConfig {
 	 */
 	authorizationHeader?: string;
 	baseUrl: string;
+	/** Mirror endpoints serving the same API as `baseUrl`. */
+	baseUrls?: string[];
+	endpointPolicy?: ProviderEndpointPolicy;
 	defaultModel: string;
 	/** @deprecated Use `apiMode` instead. Kept for backward compatibility. */
 	responsesApi?: boolean;
@@ -180,6 +187,9 @@ export interface AnthropicProviderConfig {
 	prefix: string;
 	apiKey: string;
 	baseUrl: string;
+	/** Mirror endpoints serving the same API as `baseUrl`. */
+	baseUrls?: string[];
+	endpointPolicy?: ProviderEndpointPolicy;
 	defaultModel: string;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
@@ -288,6 +298,9 @@ export interface GeminiProviderConfig {
 	apiKey: string;
 	/** API base URL, e.g. "https://generativelanguage.googleapis.com/v1beta". */
 	baseUrl: string;
+	/** Mirror endpoints serving the same API as `baseUrl`. */
+	baseUrls?: string[];
+	endpointPolicy?: ProviderEndpointPolicy;
 	/** Default model (bare name without prefix, e.g. "gemini-2.5-flash"). */
 	defaultModel: string;
 	/** Gemini wire transport. Missing defaults to generate-content for legacy configs. */

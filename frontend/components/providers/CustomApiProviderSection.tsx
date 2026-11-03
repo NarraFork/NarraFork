@@ -32,6 +32,7 @@ import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
 import { ProviderBalanceStatus } from "./ProviderBalanceStatus";
+import { ProviderEndpointsFields } from "./ProviderEndpointsFields";
 import type { CustomApiProtocol, CustomApiProviderState, OpenAIProviderState } from "./types";
 import { defaultUserAgentModeForProtocol } from "./types";
 
@@ -456,6 +457,16 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					value={provider.baseUrl}
 					size="xs"
 					onChange={(e) => handleBaseUrlChange(e.currentTarget.value)}
+				/>
+				<ProviderEndpointsFields
+					providerId={provider.id}
+					baseUrls={provider.baseUrls}
+					endpointPolicy={provider.endpointPolicy}
+					disabled={provider.disabled}
+					onBaseUrlsChange={(next) => updateProvider("baseUrls", next)}
+					onPolicyChange={(next) => updateProvider("endpointPolicy", next)}
+					isDirty={isProviderDirty?.(provider.id)}
+					onSaveBeforeProbe={onSaveBeforeRefresh}
 				/>
 
 				<ProviderBalanceStatus
