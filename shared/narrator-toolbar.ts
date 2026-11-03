@@ -46,6 +46,7 @@ export const NARRATOR_TOOLBAR_IDS = [
 	"browser",
 	"userchat",
 	"appearance",
+	"timeline",
 	"lodlevel",
 	"device",
 	"plugins",

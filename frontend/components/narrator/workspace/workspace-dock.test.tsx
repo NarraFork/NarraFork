@@ -1321,6 +1321,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 			TasksDockPanel: ResourceWrapper,
 			TerminalDockPanel: ResourceWrapper,
 			UserChatDockPanel: ResourceWrapper,
+			TimelineDockPanel: ResourceWrapper,
 			SubagentSessionPanelContent: ({ subagentNarratorId }: { subagentNarratorId: string }) => {
 				const panel = requiredPanel(workspaceSubagentPanelId("n0", subagentNarratorId));
 				return <ResourceWrapper api={panel.api} containerApi={api} params={panel.params ?? {}} />;

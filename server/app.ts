@@ -53,6 +53,7 @@ import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { narratorTimelineRoutes } from "./routes/narrator-timeline";
 import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
@@ -425,6 +426,7 @@ app.route(
 app.route("/api/narrators", narratorGitRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);
+app.route("/api/narrators", narratorTimelineRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
 app.route("/api/tokendance", tokendanceRoutes);

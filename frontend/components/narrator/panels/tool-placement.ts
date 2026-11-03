@@ -18,6 +18,19 @@ export function resolveFileBrowserPosition(api: DockviewApi, sourcePanelId?: str
 		: { referencePanel: source.id, direction: "right" as const };
 }
 
+/**
+ * Tool panels whose content is a horizontal strip (a timeline): stacked as a tab in
+ * the ~1/3-wide right column they would be unreadably narrow, so they open as their
+ * own group ABOVE chat instead, where the reader looks first.
+ */
+export const WIDE_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set(["timeline"]);
+
+/** Initial height of a wide panel split above chat. */
+export const WIDE_TOOL_PANEL_HEIGHT = 380;
+
+/** Share of the surface a wide panel may take when the surface is short. */
+export const WIDE_TOOL_PANEL_MAX_SHARE = 0.55;
+
 export interface ToolPlacementInputs {
 	/** Whether a secondary (tool) group already exists in the surface. */
 	hasSecondaryGroup: boolean;
@@ -30,6 +43,7 @@ export interface ToolPlacementInputs {
 export type ToolPlacement =
 	| { mode: "within-secondary" }
 	| { mode: "split-right"; initialWidth: number | undefined }
+	| { mode: "split-above"; initialHeight: number | undefined }
 	| { mode: "standalone" };
 
 /**
@@ -39,7 +53,19 @@ export type ToolPlacement =
  *     to ~1/3 of the surface so main:secondary ≈ 2:1;
  *   - otherwise (no chat, defensive) → add standalone.
  */
-export function resolveToolPlacement(inputs: ToolPlacementInputs): ToolPlacement {
+export function resolveToolPlacement(
+	inputs: ToolPlacementInputs & { wide?: boolean; surfaceHeight?: number },
+): ToolPlacement {
+	if (inputs.wide && inputs.hasChatPanel) {
+		const height = inputs.surfaceHeight ?? 0;
+		return {
+			mode: "split-above",
+			initialHeight:
+				height > 0
+					? Math.min(WIDE_TOOL_PANEL_HEIGHT, Math.round(height * WIDE_TOOL_PANEL_MAX_SHARE))
+					: undefined,
+		};
+	}
 	if (inputs.hasSecondaryGroup) return { mode: "within-secondary" };
 	if (inputs.hasChatPanel) {
 		return {
@@ -48,4 +74,27 @@ export function resolveToolPlacement(inputs: ToolPlacementInputs): ToolPlacement
 		};
 	}
 	return { mode: "standalone" };
+}
+
+/** Smallest height a fitted wide panel shrinks to (keeps the toolbar and one lane). */
+export const WIDE_TOOL_PANEL_MIN_HEIGHT = 140;
+
+/**
+ * Height a wide panel's group should take to show `contentHeight` of content under a
+ * `chromeHeight` header, without passing the surface share used when opening it.
+ */
+export function fitWidePanelHeight(
+	contentHeight: number,
+	chromeHeight: number,
+	surfaceHeight: number,
+): number {
+	const wanted = Math.ceil(contentHeight + chromeHeight);
+	const cap =
+		surfaceHeight > 0
+			? Math.round(surfaceHeight * WIDE_TOOL_PANEL_MAX_SHARE)
+			: WIDE_TOOL_PANEL_HEIGHT;
+	return Math.max(
+		WIDE_TOOL_PANEL_MIN_HEIGHT,
+		Math.min(wanted, Math.max(cap, WIDE_TOOL_PANEL_MIN_HEIGHT)),
+	);
 }
