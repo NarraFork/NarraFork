@@ -281,6 +281,16 @@ export function getOutlineBehaviorViewTruncated(address: string, locale: Locale)
 		: `‹not all shown; read \`${address}\` with OutlineRead for the whole page›`;
 }
 
+/**
+ * The note after a behavior page cut to fit the spec fence while the outline is switched off (no
+ * outline tool is offered then, so it names only where the page is).
+ */
+export function getOutlineBehaviorFenceTruncated(address: string, locale: Locale): string {
+	return locale === "zh-CN"
+		? `‹没有全部列出；其余的在大纲的行为边界页 \`${address}\`›`
+		: `‹not all shown; the rest is on the behavior page \`${address}\` in the outline›`;
+}
+
 /** The line before old fence text that was not moved to the page (its import did not happen). */
 export function getOutlineBehaviorViewFence(locale: Locale): string {
 	return pickLocalizedValue(behaviorViewText.fence, locale);
@@ -289,6 +299,18 @@ export function getOutlineBehaviorViewFence(locale: Locale): string {
 /** The line before the plugin's SOP in the behavior view. */
 export function getOutlineBehaviorViewSop(locale: Locale): string {
 	return pickLocalizedValue(behaviorViewText.sop, locale);
+}
+
+/** The first block of a fork's behavior page when the copy was cut at the commit limit. */
+export function getOutlineBehaviorForkCutNote(
+	copied: number,
+	total: number,
+	address: string,
+	locale: Locale,
+): string {
+	return locale === "zh-CN"
+		? `fork 时只复制了这一页 ${total} 块中的 ${copied} 块；其余的在行为边界页 \`${address}\`。`
+		: `Only ${copied} of the ${total} blocks of this page were copied when the session was forked; the rest are on the behavior page \`${address}\`.`;
 }
 
 /** The title of a behavior page the system creates (the import of an old fence). */

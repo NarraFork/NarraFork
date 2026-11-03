@@ -61,6 +61,11 @@ export interface SpecFilesResponse {
 	files: SpecFileMeta[];
 	/** Present for a session whose tasks live in the outline. */
 	outlineBehavior?: SpecOutlineBehavior;
+	/**
+	 * True for an outline session while the outline is switched off: it runs on Dynamic Spec, and
+	 * the rules on its behavior page are still applied.
+	 */
+	outlineSwitchedOff?: boolean;
 }
 
 export const specApi = {

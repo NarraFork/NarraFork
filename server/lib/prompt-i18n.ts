@@ -24,6 +24,8 @@ export type {
 	OutlineViewTask,
 } from "./prompts/outline-tasks";
 export {
+	getOutlineBehaviorFenceTruncated,
+	getOutlineBehaviorForkCutNote,
 	getOutlineBehaviorPageTitle,
 	getOutlineBehaviorViewFence,
 	getOutlineBehaviorViewHeading,

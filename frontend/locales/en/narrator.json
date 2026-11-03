@@ -2137,6 +2137,7 @@
 		"behaviorFenceEditHint": "Write the constraints that must not be crossed here. The system will automatically remind the narrator. Only the user can edit this.",
 		"outlineFenceHint": "This session's behavior boundary is the behavior page of its outline space. This file only shows the SOP plugins write here, and is read-only.",
 		"outlineFenceOpen": "Open in outline",
+		"outlineFenceSwitchedOff": "The outline is switched off for now. The rules on this session's outline behavior page still apply: they are given to the agent with this file. Don't copy them here, or turning the outline back on imports them to that page a second time.",
 		"fenceIntervalLabel": "Periodic injection interval",
 		"fenceIntervalOn": "Inject the behavior fence every {{count}} tool calls (skipped when the fence is empty)",
 		"fenceIntervalOff": "Periodic injection disabled (-1)",

@@ -16,8 +16,12 @@
  * plain blocks of the page (created if missing, appended to otherwise) in `import` commits (one
  * for an ordinary fence; as many as the write limits need for a large one), and the fence keeps
  * only the SOP. The blocks' short ids follow from the text, so a run cut short resumes where it
- * stopped and nothing is imported twice. Bounded: one parse job (off the main thread when large),
- * commits within the write limits. Asked once per process for each session.
+ * stopped and nothing is imported twice; a block a person deleted since stays deleted, with what
+ * was under it. An item longer than a block may hold becomes several blocks, so no commit is
+ * refused for good. Should a commit fail anyway, the behavior view shows what did not reach the
+ * page ({@link importLeftover}) until a later run moves it. Bounded: one parse job and normalize
+ * jobs for cut items (off the main thread when large), commits within the write limits. Asked
+ * once per process for each session.
  *
  * Should the outline be switched off later, the session runs as a spec session and reads its
  * old fence: the spec fence reader puts the page's text ahead of it then
@@ -33,11 +37,16 @@
 import { createHash } from "node:crypto";
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
-import { getOutlineBehaviorPageTitle, type Locale } from "@server/lib/prompt-i18n";
+import {
+	getOutlineBehaviorForkCutNote,
+	getOutlineBehaviorPageTitle,
+	getUserLanguage,
+	type Locale,
+} from "@server/lib/prompt-i18n";
 import { splitBehaviorFence } from "../behavior-fence-sop";
 import { readNarrator } from "../outline/access-reads";
 import type { EditTextItem } from "../outline/edit-text";
-import { processEditText } from "../outline/edit-text-runner";
+import { OUTLINE_EDIT_TEXT_LIMITS, processEditText } from "../outline/edit-text-runner";
 import { OUTLINE_TEXT } from "../outline/messages";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_LIMITS } from "../outline/model";
 import { loadBodiesWithin, readSubtree } from "../outline/read";
@@ -64,6 +73,8 @@ export const OUTLINE_BEHAVIOR_LIMITS = {
 	importBytes: OUTLINE_LIMITS.maxTransactionBodyBytes - 1024,
 	/** Short ids one lookup of what an earlier run imported already asks for. */
 	sidLookup: 400,
+	/** Bytes of one imported block: a longer item is cut into several (one block holds 16 KiB). */
+	importBlockBytes: OUTLINE_LIMITS.maxBodyBytes - 1024,
 } as const;
 
 /** The system actors of the import and of the fork copy. */
@@ -111,7 +122,7 @@ export type OutlineBehaviorImport =
 	| "nothing"
 	/**
 	 * There was text, but not all of it could be imported (logged). The fence is left as it was,
-	 * and the behavior view shows its text until a later run imports it.
+	 * and the behavior view shows what of it did not reach the page until a later run imports it.
 	 */
 	| "failed";
 
@@ -143,6 +154,9 @@ interface ImportNode {
 	parentSid: string | null;
 	content: string;
 	links: OutlineCanonicalContent["links"];
+	/** The content is a piece of a longer item, cut to fit one block: normalized before writing. */
+	piece: boolean;
+	depth: number;
 }
 
 /**
@@ -156,6 +170,53 @@ function importSids(text: string): { page: string; block: (n: number) => string 
 	return { page: `fp${tag}`, block: (n) => `fi${tag}${n.toString(36)}` };
 }
 
+/**
+ * Text cut into pieces of at most `maxBytes` UTF-8 bytes, at a line break or a space when one is
+ * in the second half of a piece, never inside a character. An item longer than one block may
+ * hold becomes several blocks instead of refusing its commit on every run.
+ */
+export function cutToBlocks(text: string, maxBytes: number): string[] {
+	const out: string[] = [];
+	let rest = text;
+	while (Buffer.byteLength(rest, "utf8") > maxBytes) {
+		let bytes = 0;
+		let end = 0;
+		for (const char of rest) {
+			const size = Buffer.byteLength(char, "utf8");
+			if (bytes + size > maxBytes) break;
+			bytes += size;
+			end += char.length;
+		}
+		const soft = Math.max(rest.lastIndexOf("\n", end), rest.lastIndexOf(" ", end));
+		if (soft > end / 2) end = soft;
+		const piece = rest.slice(0, end).trimEnd();
+		if (piece) out.push(piece);
+		rest = rest.slice(end).trimStart();
+	}
+	if (rest) out.push(rest);
+	return out;
+}
+
+/** Fence text the session's last import in this process could not move, by session. */
+const leftovers = hotSafe(
+	"narrafork.outlineBehavior.leftovers",
+	() => new Map<string, { own: string; text: string }>(),
+);
+
+/**
+ * What of the fence text `own` is not on the behavior page yet, as the session's last import in
+ * this process found it (a markdown outline of the blocks it could not write), or null when it
+ * has not looked at this text: then all of it is still to move. The behavior view shows this
+ * instead of the fence from its top, so the rules that never reached the page are the ones shown.
+ */
+export function importLeftover(narratorId: string, own: string): string | null {
+	const found = leftovers.get(narratorId);
+	return found && found.own === own ? found.text : null;
+}
+
+/** Text squeezed of whitespace: a plugin's SOP update can glue the text around it together. */
+const squeezed = (text: string) => text.replace(/\s+/g, "");
+
 async function runImport(narratorId: string, locale: Locale): Promise<OutlineBehaviorImport> {
 	const session = await readTaskSession(narratorId);
 	if (!session || session.backend !== "outline" || session.subagent) {
@@ -166,6 +227,7 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 	// Asked once per process from here on, whatever happens: a failed import is not retried on
 	// every run (the behavior view shows the fence text that stayed behind instead).
 	nothingToImport.add(narratorId);
+	leftovers.delete(narratorId);
 	if (!fence.own) return "nothing";
 	const [parsed] = await processEditText({
 		kind: "parse",
@@ -174,92 +236,171 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 	});
 	// Rules are not tasks: every item becomes a plain block (a checkbox in the old fence is
 	// dropped, so nothing on the page starts or continues), and the properties (aliases,
-	// prerequisites, dates) are left out so nothing can collide.
+	// prerequisites, dates) are left out so nothing can collide. An item longer than a block may
+	// hold becomes several sibling blocks.
 	const sids = importSids(fence.own);
 	const nodes: ImportNode[] = [];
-	const walk = (items: readonly EditTextItem[], parentSid: string | null) => {
+	const walk = (items: readonly EditTextItem[], parentSid: string | null, depth: number) => {
 		for (const item of items) {
-			const sid = sids.block(nodes.length);
-			nodes.push({ sid, parentSid, content: item.content, links: item.links });
-			walk(item.children, sid);
+			const pieces = cutToBlocks(item.content, OUTLINE_BEHAVIOR_LIMITS.importBlockBytes);
+			let first: string | null = null;
+			for (const piece of pieces.length > 0 ? pieces : [item.content]) {
+				const sid = sids.block(nodes.length);
+				first ??= sid;
+				const whole = pieces.length <= 1;
+				nodes.push({
+					sid,
+					parentSid,
+					content: piece,
+					links: whole ? item.links : [],
+					piece: !whole,
+					depth,
+				});
+			}
+			walk(item.children, first, depth + 1);
 		}
 	};
-	walk(parsed?.items ?? [], null);
+	walk(parsed?.items ?? [], null, 0);
 	if (nodes.length === 0) return "nothing";
+	// Pieces of a cut item are normalized like any content, off the main thread when large, in
+	// jobs the text runner takes. A piece whose cut left structure the dialect splits off (rare:
+	// an item over a block's size with, say, a code fence cut through) goes to the write path as
+	// is, which splits it the same way.
+	const cut = nodes.filter((node) => node.piece);
+	for (let i = 0; i < cut.length; ) {
+		const job: ImportNode[] = [];
+		let bytes = 0;
+		for (; i < cut.length; i++) {
+			const node = cut[i] as ImportNode;
+			const size = Buffer.byteLength(node.content, "utf8");
+			if (job.length > 0 && bytes + size > OUTLINE_EDIT_TEXT_LIMITS.maxBytes / 2) break;
+			job.push(node);
+			bytes += size;
+		}
+		const normalized = await processEditText({
+			kind: "normalize",
+			contents: job.map((node) => node.content),
+		});
+		job.forEach((node, n) => {
+			const entry = normalized[n];
+			if (entry && entry.split.length === 0) {
+				node.content = entry.content;
+				node.links = entry.links;
+				node.piece = false;
+			}
+		});
+	}
 
+	// What is in the space already: written by an earlier run cut short, or deleted since by a
+	// person. A deleted one stands deleted, and so do the blocks under it: they are skipped.
 	const space = await ensureSessionSpace(narratorId);
-	const done = new Set<string>();
-	for (let i = 0; i < nodes.length; i += OUTLINE_BEHAVIOR_LIMITS.sidLookup) {
-		const chunk = nodes.slice(i, i + OUTLINE_BEHAVIOR_LIMITS.sidLookup).map((node) => node.sid);
+	const existing = new Map<string, boolean>();
+	const lookup = [...nodes.map((node) => node.sid), sids.page];
+	for (let i = 0; i < lookup.length; i += OUTLINE_BEHAVIOR_LIMITS.sidLookup) {
+		const chunk = lookup.slice(i, i + OUTLINE_BEHAVIOR_LIMITS.sidLookup);
 		for (const meta of await outlineStore.getBlockMetas(space.id, { sids: chunk })) {
-			done.add(meta.sid);
+			existing.set(meta.sid, meta.deleted);
 		}
 	}
-	const pending = nodes.filter((node) => !done.has(node.sid));
+	const skipped = new Set<string>();
+	const pending: ImportNode[] = [];
+	for (const node of nodes) {
+		if (node.parentSid !== null && skipped.has(node.parentSid)) {
+			skipped.add(node.sid);
+			continue;
+		}
+		const deleted = existing.get(node.sid);
+		if (deleted === true) skipped.add(node.sid);
+		if (deleted !== undefined) continue;
+		pending.push(node);
+	}
 	let pageId = (await findBehaviorPage(space.id))?.id ?? null;
 	const owner = (await readNarrator(narratorId))?.ownerUserId ?? null;
 
-	// As many commits as the write limits need (a small fence is one commit), parents first.
+	// As many commits as the write limits need (a small fence is one commit), parents first. With
+	// nothing left to write (all of it there, or deleted by a person) no page is created.
 	let at = 0;
-	while (at < pending.length || pageId === null) {
-		const ops: OutlineOp[] = [];
-		const canonical: Array<OutlineCanonicalContent | null> = [];
-		const inThisCommit = new Set<string>();
-		let bytes = 0;
-		if (pageId === null) {
-			const title = getOutlineBehaviorPageTitle(locale);
-			ops.push({
-				op: "insert",
-				tempId: "page",
-				sid: sids.page,
-				parent: null,
-				content: title,
-				alias: OUTLINE_BEHAVIOR_ALIAS,
-			});
-			canonical.push(null);
-			bytes += Buffer.byteLength(title, "utf8");
+	let written = 0;
+	try {
+		while (at < pending.length) {
+			const ops: OutlineOp[] = [];
+			const canonical: Array<OutlineCanonicalContent | null> = [];
+			const inThisCommit = new Set<string>();
+			let bytes = 0;
+			if (pageId === null) {
+				const title = getOutlineBehaviorPageTitle(locale);
+				// The page's stable short id, unless a page of an earlier run holds it (a person
+				// deleted that page, or took its alias): then a drawn one.
+				ops.push({
+					op: "insert",
+					tempId: "page",
+					...(existing.has(sids.page) ? {} : { sid: sids.page }),
+					parent: null,
+					content: title,
+					alias: OUTLINE_BEHAVIOR_ALIAS,
+				});
+				canonical.push(null);
+				bytes += Buffer.byteLength(title, "utf8");
+			}
+			for (; at < pending.length; at++) {
+				const node = pending[at] as ImportNode;
+				const size = Buffer.byteLength(node.content, "utf8");
+				if (
+					ops.length >= OUTLINE_BEHAVIOR_LIMITS.importOps ||
+					(ops.length > 0 && bytes + size > OUTLINE_BEHAVIOR_LIMITS.importBytes)
+				)
+					break;
+				const parent =
+					node.parentSid === null
+						? pageId === null
+							? { tempId: "page" }
+							: { id: pageId }
+						: inThisCommit.has(node.parentSid)
+							? { tempId: node.parentSid }
+							: { sid: node.parentSid };
+				ops.push({ op: "insert", tempId: node.sid, sid: node.sid, parent, content: node.content });
+				canonical.push(node.piece ? null : { content: node.content, links: node.links });
+				inThisCommit.add(node.sid);
+				bytes += size;
+			}
+			const result = await writeOutline(
+				{
+					spaceId: space.id,
+					ops,
+					actor: { kind: "system", id: OUTLINE_BEHAVIOR_IMPORT_ACTOR },
+					responsibleUserId: owner,
+					narratorId,
+					summary: OUTLINE_TEXT.behaviorImportSummary,
+				},
+				{ kind: "import", canonical },
+			);
+			if (pageId === null) pageId = result.results[0]?.blockId ?? null;
+			if (pageId === null) throw new Error("the import could not create the behavior page");
+			written = at;
 		}
-		for (; at < pending.length; at++) {
-			const node = pending[at] as ImportNode;
-			const size = Buffer.byteLength(node.content, "utf8");
-			if (
-				ops.length >= OUTLINE_BEHAVIOR_LIMITS.importOps ||
-				(ops.length > 0 && bytes + size > OUTLINE_BEHAVIOR_LIMITS.importBytes)
-			)
-				break;
-			const parent =
-				node.parentSid === null
-					? pageId === null
-						? { tempId: "page" }
-						: { id: pageId }
-					: inThisCommit.has(node.parentSid)
-						? { tempId: node.parentSid }
-						: { sid: node.parentSid };
-			ops.push({ op: "insert", tempId: node.sid, sid: node.sid, parent, content: node.content });
-			canonical.push({ content: node.content, links: node.links });
-			inThisCommit.add(node.sid);
-			bytes += size;
-		}
-		const result = await writeOutline(
-			{
-				spaceId: space.id,
-				ops,
-				actor: { kind: "system", id: OUTLINE_BEHAVIOR_IMPORT_ACTOR },
-				responsibleUserId: owner,
-				narratorId,
-				summary: OUTLINE_TEXT.behaviorImportSummary,
-			},
-			{ kind: "import", canonical },
-		);
-		if (pageId === null) pageId = result.results[0]?.blockId ?? null;
-		if (pageId === null) throw new Error("the import could not create the behavior page");
+	} catch (error) {
+		// What did not reach the page is what the view shows from the fence, until a later run
+		// (a restart) writes it.
+		const lines = pending.slice(written).map((node) => {
+			const pad = "  ".repeat(node.depth);
+			return `${pad}- ${node.content.replace(/\n/g, `\n${pad}  `)}`;
+		});
+		leftovers.set(narratorId, { own: fence.own, text: lines.join("\n") });
+		throw error;
 	}
+	// All of it is on the page: should the fence rewrite below fail or be skipped, the view does
+	// not show the moved text a second time. (The commits marked the cached views stale; when
+	// none landed, nothing reached the page and the leftover is the fence's whole text.)
+	leftovers.set(narratorId, { own: fence.own, text: "" });
 
 	// The page holds the text now; the fence keeps only the plugin's channel. It is read again
-	// right before the write so a plugin SOP update that landed during the import is kept; text of
-	// its own that changed meanwhile is left alone (the view shows it, a later run imports it).
+	// right before the write so a plugin SOP update that landed during the import is kept. The
+	// fence's own text is compared without whitespace: the plugin's update rejoins the text
+	// around an SOP in the middle of the fence without the blank line it had, and that must not
+	// leave the moved text behind to be imported again (glued) after a restart. Own text that
+	// really changed meanwhile is left alone (the view shows it, a later run imports it).
 	const current = await readOldBehaviorFence(narratorId);
-	if (current.own !== fence.own) return "imported";
+	if (squeezed(current.own) !== squeezed(fence.own)) return "imported";
 	await writeSpecFile(narratorId, BEHAVIOR_FENCE_URI, current.sopSections, {
 		actor: "system",
 		createdBy: "system",
@@ -273,8 +414,13 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
  * Without an argument, for every session.
  */
 export function resetOutlineBehaviorImport(narratorId?: string): void {
-	if (narratorId === undefined) nothingToImport.clear();
-	else nothingToImport.delete(narratorId);
+	if (narratorId === undefined) {
+		nothingToImport.clear();
+		leftovers.clear();
+	} else {
+		nothingToImport.delete(narratorId);
+		leftovers.delete(narratorId);
+	}
 }
 
 /**
@@ -333,6 +479,7 @@ export async function copyOutlineBehaviorPage(
 		}
 		const childSpace = await ensureSessionSpace(childNarratorId);
 		if (await findBehaviorPage(childSpace.id)) return false;
+		const owner = (await readNarrator(childNarratorId))?.ownerUserId ?? null;
 		// Stored content is canonical already; the normalizer only confirms it (off the main
 		// thread when large) and reads its links.
 		const normalized = await processEditText({
@@ -360,15 +507,15 @@ export async function copyOutlineBehaviorPage(
 				op: "insert",
 				parent: { tempId: subtree.root.id },
 				position: { first: true },
-				content: OUTLINE_TEXT.behaviorForkCut(
+				content: getOutlineBehaviorForkCutNote(
 					copied.length,
 					total,
 					`${parentSpace.key}/${page.sid}`,
+					owner ? await getUserLanguage(owner) : "en",
 				),
 			});
 			canonical.push(null);
 		}
-		const owner = (await readNarrator(childNarratorId))?.ownerUserId ?? null;
 		await writeOutline(
 			{
 				spaceId: childSpace.id,

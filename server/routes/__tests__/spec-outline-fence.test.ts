@@ -99,6 +99,26 @@ describe("the Spec panel's fence tab", () => {
 		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe("");
 	});
 
+	test("an outline session with the outline off: editable, and the list says its page still applies", async () => {
+		const id = await session("outline");
+		settings.outline.enabled = false;
+		const without = await (await app.request(`/${id}/spec/files`)).json();
+		// No behavior page yet: nothing to say.
+		expect(without).not.toHaveProperty("outlineSwitchedOff");
+		settings.outline.enabled = true;
+		await seedBehaviorPage(id, "Never force-push.");
+		settings.outline.enabled = false;
+		const listed = await (await app.request(`/${id}/spec/files`)).json();
+		expect(listed.outlineSwitchedOff).toBe(true);
+		expect(listed).not.toHaveProperty("outlineBehavior");
+		expect(listed.files.find((f: { path: string }) => f.path === "behavior_fence")).toMatchObject({
+			uiEditable: true,
+		});
+		settings.outline.enabled = true;
+		const on = await (await app.request(`/${id}/spec/files`)).json();
+		expect(on).not.toHaveProperty("outlineSwitchedOff");
+	});
+
 	test("a spec session: editable as before, no outline field, the save lands", async () => {
 		const id = await session("spec");
 		const listed = await (await app.request(`/${id}/spec/files`)).json();
@@ -106,6 +126,11 @@ describe("the Spec panel's fence tab", () => {
 			uiEditable: true,
 		});
 		expect(listed).not.toHaveProperty("outlineBehavior");
+		settings.outline.enabled = false;
+		expect(await (await app.request(`/${id}/spec/files`)).json()).not.toHaveProperty(
+			"outlineSwitchedOff",
+		);
+		settings.outline.enabled = true;
 		const saved = await save(id);
 		expect(saved.status).toBe(200);
 		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe("Never force-push.");

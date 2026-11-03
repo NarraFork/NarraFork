@@ -926,8 +926,11 @@ export async function findContinuationCandidates(options: {
 	const scan = OUTLINE_TASK_LIMITS.candidateScan;
 
 	const claimed = await store.listClaimedTasks(options.narratorId, scan + 1);
+	// Excluded pages are left out inside the scan, so their checkboxes cannot use it up.
 	const own = options.sessionSpaceId
-		? await store.listOpenTasks(options.sessionSpaceId, scan + 1)
+		? await store.listOpenTasks(options.sessionSpaceId, scan + 1, {
+				excludePageIds: options.excludePageIds,
+			})
 		: [];
 	const truncated = claimed.length > scan || own.length > scan;
 	const metas = new Map<string, OutlineBlockMeta>();

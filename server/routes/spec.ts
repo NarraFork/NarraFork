@@ -3,10 +3,11 @@ import { ValidationError } from "../lib/errors";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { specFileQuerySchema, updateSpecFileSchema } from "../lib/validators";
+import { isOutlineEnabled } from "../services/outline/feature";
 import { interjectSpecEditAsUserMessage } from "../services/spec-edit-interject";
 import { compileSpecTasks, parseSpecTasksDocument } from "../services/spec-task-service";
 import { specVfsService } from "../services/spec-vfs-service";
-import { readTaskBackend } from "../services/task-source/backend";
+import { readTaskBackend, readTaskSession } from "../services/task-source/backend";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 export const specRoutes = new Hono();
@@ -26,6 +27,21 @@ async function outlineBehaviorOf(
 	const space = await findSessionSpace(narratorId);
 	const page = space ? await findBehaviorPage(space.id) : null;
 	return { spaceId: space?.id ?? null, pageId: page?.id ?? null };
+}
+
+/**
+ * True for an outline session with a behavior page while the outline is switched off: it runs as
+ * a spec session (its fence editable as before), but the page's rules are still put in front of
+ * the agent with the fence (`spec-reminder.ts`). The panel says so, so nobody copies them into the
+ * fence, from where the import would move them to the page a second time.
+ */
+async function outlineSwitchedOff(narratorId: string): Promise<boolean> {
+	if (isOutlineEnabled()) return false;
+	if ((await readTaskSession(narratorId))?.backend !== "outline") return false;
+	const { findSessionSpace } = await import("../services/outline/spaces");
+	const { findBehaviorPage } = await import("../services/task-source/outline-behavior");
+	const space = await findSessionSpace(narratorId);
+	return space ? (await findBehaviorPage(space.id)) !== null : false;
 }
 
 /** An outline session's old fence is not editable in the panel (see `outlineBehaviorOf`). */
@@ -54,6 +70,7 @@ specRoutes.get("/:id/spec/files", async (c) => {
 	const narratorId = c.req.param("id");
 	const files = await specVfsService.listSpecFiles(narratorId);
 	const outlineBehavior = await outlineBehaviorOf(narratorId);
+	const switchedOff = outlineBehavior ? false : await outlineSwitchedOff(narratorId);
 	return c.json({
 		files: files.map((f) => ({
 			path: f.path,
@@ -64,6 +81,7 @@ specRoutes.get("/:id/spec/files", async (c) => {
 			revisionId: f.revisionId ?? null,
 		})),
 		...(outlineBehavior ? { outlineBehavior } : {}),
+		...(switchedOff ? { outlineSwitchedOff: true } : {}),
 	});
 });
 

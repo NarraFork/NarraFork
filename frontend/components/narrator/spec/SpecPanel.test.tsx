@@ -43,6 +43,8 @@ let server: Map<string, { content: string; revisionId: string }>;
 let revisionCounter = 0;
 /** Set for a session whose tasks live in the outline: its fence is shown read-only. */
 let outlineBehavior: SpecOutlineBehavior | undefined;
+/** Set for an outline session while the outline is switched off (it runs on Dynamic Spec). */
+let outlineSwitchedOff = false;
 const writes: { uri: string; content: string; baseRevisionId?: string | null }[] = [];
 /** Every source editor render: the document it shows and the text it was opened on. */
 const sourceRenders: { documentKey: string; initialValue: string }[] = [];
@@ -152,6 +154,7 @@ beforeEach(async () => {
 	]);
 	revisionCounter = 0;
 	outlineBehavior = undefined;
+	outlineSwitchedOff = false;
 	writes.length = 0;
 	sourceRenders.length = 0;
 
@@ -159,6 +162,7 @@ beforeEach(async () => {
 		spyOn(api, "listSpecFiles").mockImplementation(async () => ({
 			files: [...server.keys()].map(meta),
 			...(outlineBehavior ? { outlineBehavior } : {}),
+			...(outlineSwitchedOff ? { outlineSwitchedOff: true } : {}),
 		})),
 		spyOn(api, "readSpecFile").mockImplementation(async (_narrator, uri) => detail(uri)),
 		spyOn(api, "readSpecTasks").mockImplementation(async () => ({
@@ -319,5 +323,24 @@ test("a spec session's fence tab stays editable, without the outline note", asyn
 	});
 	await open("behavior_fence");
 	expect(host.querySelector('[data-testid="spec-outline-fence-notice"]')).toBeNull();
+	expect(host.querySelector('[data-testid="spec-outline-switched-off-notice"]')).toBeNull();
 	expect(host.textContent).toContain(en.spec.behaviorFenceEditHint);
+});
+
+test("with the outline switched off, an outline session's fence tab is editable and says where its rules are", async () => {
+	outlineSwitchedOff = true;
+	server.set("behavior_fence", { content: "Plugin SOP: report back.", revisionId: "f1" });
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	await open("behavior_fence");
+	const notice = () => host.querySelector('[data-testid="spec-outline-switched-off-notice"]');
+	await waitFor(() => !!notice());
+	expect(notice()?.textContent).toBe(en.spec.outlineFenceSwitchedOff);
+	// Editable as in any spec session; the read-only outline note is not shown.
+	expect(host.textContent).toContain(en.spec.behaviorFenceEditHint);
+	expect(host.querySelector('[data-testid="spec-outline-fence-notice"]')).toBeNull();
+	// Only on the fence tab.
+	await open("design.md");
+	expect(notice()).toBeNull();
 });

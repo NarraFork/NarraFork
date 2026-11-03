@@ -36,6 +36,7 @@ import { eventBus } from "@server/lib/event-bus";
 import { hotOnce, hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import {
+	getOutlineBehaviorFenceTruncated,
 	getOutlineBehaviorViewFence,
 	getOutlineBehaviorViewHeading,
 	getOutlineBehaviorViewPage,
@@ -45,18 +46,20 @@ import {
 	getOutlineTasksViewMore,
 	getOutlineTasksViewSection,
 	getOutlineViewTaskLine,
+	getUserLanguage,
 	type Locale,
 	type OutlineTasksViewSection,
 	type OutlineViewTask,
 } from "@server/lib/prompt-i18n";
 import { blockTitle } from "@shared/outline";
 import type { ContextPart } from "@shared/prefix-context";
+import { readNarrator } from "../outline/access-reads";
 import { loadBodiesWithin, readSubtree } from "../outline/read";
 import { renderOutline } from "../outline/render";
 import { outlineStore } from "../outline/store";
 import { breadthFirst } from "../outline/tree";
 import { readTaskSession } from "./backend";
-import { findBehaviorPage, readOldBehaviorFence } from "./outline-behavior";
+import { findBehaviorPage, importLeftover, readOldBehaviorFence } from "./outline-behavior";
 import {
 	type OpenEntry,
 	type OutlineSession,
@@ -87,6 +90,11 @@ export const OUTLINE_VIEW_LIMITS = {
 	maxAgeMs: 60_000,
 	/** Narrators' views kept, the least recently used dropped first. */
 	cached: 1024,
+	/**
+	 * After a failed read, how long a view shown before is served without reading again, and a
+	 * view never shown is read without logging its failures again.
+	 */
+	failureBackoffMs: 5_000,
 } as const;
 
 /** What a view's text depends on, collected while it is read. */
@@ -115,6 +123,8 @@ interface ReadTracker {
 }
 
 const cache = hotSafe("narrafork.outlineViews.cache", () => new Map<string, CachedView>());
+/** When each view's last read failed: a view that keeps failing is read (and logged) less often. */
+const failures = hotSafe("narrafork.outlineViews.failures", () => new Map<string, number>());
 const reads = hotSafe("narrafork.outlineViews.reads", () => new Set<ReadTracker>());
 const clock = hotSafe("narrafork.outlineViews.clock", () => ({ now: () => Date.now() }));
 
@@ -148,9 +158,21 @@ if (hotOnce("narrafork.outlineViews.listeners")) {
 	});
 }
 
+/**
+ * A view's read failed again within `failureBackoffMs` of a failure that was logged: the caller
+ * marks the part unreadable without logging it again.
+ */
+class OutlineViewBackoffError extends Error {
+	constructor(key: string, error: unknown) {
+		super(`outline view ${key} still fails to read: ${String(error)}`);
+		this.name = "OutlineViewBackoffError";
+	}
+}
+
 /** Forget every cached view (tests); `now` replaces the clock (tests of the age limit). */
 export function resetOutlineViewCache(now?: () => number): void {
 	cache.clear();
+	failures.clear();
 	clock.now = now ?? (() => Date.now());
 }
 
@@ -164,6 +186,13 @@ async function cachedView(
 		cache.set(key, hit);
 		return hit.text;
 	}
+	// Within the backoff of a failed read, what was shown is served without reading again. A
+	// view never shown is read on every request (the part is missing until it is), but its
+	// failures are logged once per backoff.
+	const failedAt = failures.get(key);
+	const backingOff =
+		failedAt !== undefined && clock.now() - failedAt < OUTLINE_VIEW_LIMITS.failureBackoffMs;
+	if (backingOff && hit) return hit.text;
 	const tracker: ReadTracker = { spaces: new Set(), narrators: new Set(), commits: 0 };
 	reads.add(tracker);
 	try {
@@ -173,6 +202,13 @@ async function cachedView(
 		try {
 			text = await read(deps);
 		} catch (error) {
+			if (backingOff) throw new OutlineViewBackoffError(key, error);
+			failures.set(key, clock.now());
+			while (failures.size > OUTLINE_VIEW_LIMITS.cached) {
+				const oldest = failures.keys().next().value;
+				if (oldest === undefined) break;
+				failures.delete(oldest);
+			}
 			// A failing read keeps what was shown, stale or aged (an update that removes the view
 			// and one that brings it back would both be noise); without one, the caller marks the
 			// part unreadable and the request keeps its previous value.
@@ -189,6 +225,7 @@ async function cachedView(
 			(deps.anySpace && tracker.commits > 0) ||
 			[...deps.spaces].some((id) => tracker.spaces.has(id)) ||
 			[...deps.narrators].some((id) => tracker.narrators.has(id));
+		failures.delete(key);
 		// Read while a change it depends on landed: kept (for a failing read) but read again next.
 		cache.delete(key);
 		cache.set(key, { ...deps, text, at: startedAt, stale });
@@ -447,11 +484,14 @@ async function readBehaviorView(
 
 	// 2. Old fence text the import has not moved yet (it runs when the session starts a run and
 	// may fail, page or no page): it still binds the session, so it is shown from where it is.
+	// After an import cut short only what did not reach the page is shown, not the fence from
+	// its top again.
 	const own = await readOldBehaviorFence(narratorId);
 	if (sessionNarratorId) {
 		const fence =
 			sessionNarratorId === narratorId ? own : await readOldBehaviorFence(sessionNarratorId);
-		take(section(getOutlineBehaviorViewFence(locale), fence.own, room - 1));
+		const left = fence.own ? (importLeftover(sessionNarratorId, fence.own) ?? fence.own) : "";
+		take(section(getOutlineBehaviorViewFence(locale), left, room - 1));
 	}
 
 	// 3. The plugin's SOP gets what is left: this narrator's own (a plugin's temporary worker has
@@ -492,7 +532,10 @@ export async function outlineContextParts(
 			const text = await view();
 			if (text) parts.push({ key, text });
 		} catch (error) {
-			logger.warn("Outline view could not be read", { narratorId, key, error: String(error) });
+			// Logged when a read failed, not again for each failure within its backoff.
+			if (!(error instanceof OutlineViewBackoffError)) {
+				logger.warn("Outline view could not be read", { narratorId, key, error: String(error) });
+			}
 			parts.push({ key, text: "", unreadable: true });
 		}
 	};
@@ -525,7 +568,17 @@ export async function behaviorPageForSpecFence(narratorId: string): Promise<stri
 		narratorId: session.sessionNarratorId,
 	});
 	const page = space ? await findBehaviorPage(space.id) : null;
-	if (!page) return null;
-	const rendered = await renderBehaviorPage(page.id, OUTLINE_VIEW_LIMITS.behaviorChars);
-	return rendered?.markdown.trim() ? rendered.markdown : null;
+	if (!space || !page) return null;
+	// Worded in the session owner's language: the spec fence reader knows no locale.
+	const owner = (await readNarrator(session.sessionNarratorId))?.ownerUserId ?? null;
+	const locale: Locale = owner ? await getUserLanguage(owner) : "en";
+	const address = `${space.key}/${page.sid}`;
+	const intro = getOutlineBehaviorViewPage(address, locale);
+	const note = getOutlineBehaviorFenceTruncated(address, locale);
+	const rendered = await renderBehaviorPage(
+		page.id,
+		OUTLINE_VIEW_LIMITS.behaviorChars - intro.length - 1 - note.length - 1,
+	);
+	if (!rendered?.markdown.trim()) return null;
+	return [intro, rendered.markdown, ...(rendered.truncated ? [note] : [])].join("\n");
 }

@@ -57,6 +57,20 @@ export function useSpecOutlineBehavior(narratorId: string) {
 	});
 }
 
+/**
+ * Whether the session is an outline session running on Dynamic Spec while the outline is switched
+ * off (its behavior page's rules still apply): the file list's companion field.
+ */
+export function useSpecOutlineSwitchedOff(narratorId: string) {
+	return useQuery({
+		queryKey: specFilesKey(narratorId),
+		queryFn: () => api.listSpecFiles(narratorId),
+		enabled: !!narratorId,
+		gcTime: SPEC_GC_TIME_MS,
+		select: (data) => data.outlineSwitchedOff === true,
+	});
+}
+
 /** Read a single spec file (with content). */
 export function useSpecFile(narratorId: string, uri: string) {
 	const qc = useQueryClient();

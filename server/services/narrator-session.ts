@@ -208,6 +208,7 @@ import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
 import {
 	type ContinuationTarget,
+	type InterruptGuardNote,
 	type NarratorTaskSource,
 	resolveTaskBackend,
 	taskSourceForNarrator,
@@ -1831,27 +1832,49 @@ export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
  * the session's tasks changed during it (the revision of its open tasks is the one the run started
  * with) and a task is still in progress, one line names that task and asks to tick it done when it
  * is. Persisted as a plain row the next turn reads; it starts no turn. At most once per run.
- * Best-effort: failures are logged. The orchestrator asks only where the run goes idle, after the
- * continuation, compact-restart, hold and pre-idle-drain decisions.
+ * Best-effort: failures are logged.
+ *
+ * Two steps, so the orchestrator keeps the pre-idle drain and its takeover-vs-terminal arbitration
+ * back to back: this one (reads only) runs before that drain, after the continuation, compact
+ * restart and hold decisions; {@link deliverOutlineTurnEndNote} (one row) runs once the run has
+ * settled terminal. A note decided for a run the drain or a hold continues is dropped, and the
+ * run's start stays, so its real end decides again.
  *
  * "Unchanged" compares the revision of the open tasks read (at most the candidate read's limits):
  * a task created and finished within the run, or one beyond those limits, leaves it unchanged.
  */
-export async function maybeDeliverOutlineTurnEndNote(active: ActiveNarrator): Promise<boolean> {
+export async function decideOutlineTurnEndNote(
+	active: ActiveNarrator,
+): Promise<InterruptGuardNote | null> {
 	const start = active._outlineTurnStart;
-	if (!start) return false;
+	if (!start) return null;
 	try {
 		const calls = (active._todoReminderCompletedToolCount ?? 0) - start.toolCount;
-		if (calls < OUTLINE_TURN_END_MIN_TOOL_CALLS) return false;
+		if (calls < OUTLINE_TURN_END_MIN_TOOL_CALLS) return null;
 		const source = await taskSourceForNarrator(active.narratorId);
-		if (!source.turnEndNote) return false;
+		if (!source.turnEndNote) return null;
 		const { tasks, revision } = await source.openTasks();
-		if (revision !== start.revision) return false;
+		if (revision !== start.revision) return null;
 		const doing = tasks.find((task) => task.status === "doing");
-		if (!doing) return false;
-		const note = source.turnEndNote(doing, active.locale);
-		if (!note) return false;
-		active._outlineTurnStart = undefined;
+		if (!doing) return null;
+		return source.turnEndNote(doing, active.locale);
+	} catch (err) {
+		logger.warn("Failed to decide the outline turn-end note", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+		return null;
+	}
+}
+
+/** Persist a note {@link decideOutlineTurnEndNote} decided, once per run. */
+export async function deliverOutlineTurnEndNote(
+	active: ActiveNarrator,
+	note: InterruptGuardNote,
+): Promise<boolean> {
+	if (!active._outlineTurnStart) return false;
+	active._outlineTurnStart = undefined;
+	try {
 		await deliverInjection(active.narratorId, {
 			content: note.content,
 			body: note.body,
@@ -1868,6 +1891,12 @@ export async function maybeDeliverOutlineTurnEndNote(active: ActiveNarrator): Pr
 		});
 		return false;
 	}
+}
+
+/** Both steps at once (tests, and any caller with no arbitration between them). */
+export async function maybeDeliverOutlineTurnEndNote(active: ActiveNarrator): Promise<boolean> {
+	const note = await decideOutlineTurnEndNote(active);
+	return note ? await deliverOutlineTurnEndNote(active, note) : false;
 }
 
 // === Agent loop execution ===

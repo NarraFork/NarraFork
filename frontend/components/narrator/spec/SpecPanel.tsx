@@ -13,7 +13,7 @@ import {
 } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconChecklist, IconLock, IconX } from "@tabler/icons-react";
+import { IconChecklist, IconInfoCircle, IconLock, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -26,6 +26,7 @@ import {
 	useSpecFile,
 	useSpecFiles,
 	useSpecOutlineBehavior,
+	useSpecOutlineSwitchedOff,
 	useSpecTasks,
 	useUpdateSpecFile,
 } from "../../../hooks/useSpec";
@@ -68,6 +69,7 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	const confirm = useConfirmDialog();
 	const { data: files } = useSpecFiles(narratorId);
 	const { data: outlineBehavior } = useSpecOutlineBehavior(narratorId);
+	const { data: outlineSwitchedOff } = useSpecOutlineSwitchedOff(narratorId);
 	const [selectedUri, setSelectedUri] = useState<string>(TASKS_URI);
 	const isTasksFile = selectedUri === TASKS_URI;
 
@@ -363,6 +365,9 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 						{outlineBehavior && selectedMeta?.path === "behavior_fence" && (
 							<OutlineFenceNotice behavior={outlineBehavior} />
 						)}
+						{outlineSwitchedOff && selectedMeta?.path === "behavior_fence" && (
+							<OutlineSwitchedOffNotice />
+						)}
 						<ScrollArea style={{ flex: 1 }} p="sm">
 							<MarkdownContent text={fileData?.content ?? ""} />
 						</ScrollArea>
@@ -413,6 +418,9 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 									{t("spec.behaviorFenceEditHint")}
 								</Text>
 							</Group>
+						)}
+						{outlineSwitchedOff && selectedMeta?.path === "behavior_fence" && (
+							<OutlineSwitchedOffNotice />
 						)}
 						{selectedMeta?.path === "behavior_fence" && (
 							<BehaviorFenceControl narratorId={narratorId} />
@@ -512,6 +520,36 @@ function OutlineFenceNotice({ behavior }: { behavior: SpecOutlineBehavior }) {
 						{t("spec.outlineFenceOpen")}
 					</Anchor>
 				)}
+			</Text>
+		</Group>
+	);
+}
+
+/**
+ * The fence tab of an outline session while the outline is switched off: it runs on Dynamic Spec
+ * and its fence is editable, but the rules on its behavior page still apply (they are shown to
+ * the agent with this file). One line says so, so nobody copies them here, from where turning the
+ * outline back on would import them a second time.
+ */
+function OutlineSwitchedOffNotice() {
+	const { t } = useTranslation("narrator");
+	return (
+		<Group
+			gap={6}
+			px="sm"
+			py={6}
+			wrap="nowrap"
+			align="flex-start"
+			data-testid="spec-outline-switched-off-notice"
+			style={{
+				flexShrink: 0,
+				borderBottom: "1px solid var(--mantine-color-default-border)",
+				background: "var(--mantine-color-default-hover)",
+			}}
+		>
+			<IconInfoCircle size={13} color="var(--mantine-color-dimmed)" style={{ marginTop: 2 }} />
+			<Text size="xs" style={{ flex: 1 }}>
+				{t("spec.outlineFenceSwitchedOff")}
 			</Text>
 		</Group>
 	);

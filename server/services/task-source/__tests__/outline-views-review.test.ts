@@ -11,7 +11,7 @@
  *   N1  reading the views creates no spec namespace;
  *   N2  a plugin SOP written during the import is kept, and the rewrite is the system's;
  *   N3  a cut fork copy says so on the fork's page;
- *   N5  the turn-end note is written only where the run goes idle;
+ *   N5  the turn-end note is decided and written only where the run goes idle;
  *   N7  the compact context reads about what it renders;
  *   N8  no "keep the address of every open task" without tasks.
  *
@@ -183,6 +183,8 @@ describe("B1: the outline switched off after the import", () => {
 
 describe("S1: a view read that fails", () => {
 	test("after an invalidation, the last view is kept (probe B)", async () => {
+		let now = 1_000_000;
+		resetOutlineViewCache(() => now);
 		const id = await session();
 		const pageId = await seedBehaviorPage(id, "Never force-push the main branch.");
 		const first = part(await parts(id), "outline.behavior");
@@ -195,7 +197,8 @@ describe("S1: a view read that fails", () => {
 		restores.push(() => spy.mockRestore());
 		expect(part(await parts(id), "outline.behavior")).toBe(first);
 		spy.mockRestore();
-		// The next read succeeds and shows the new rule.
+		// The next read after the failure backoff (round 2, N-R2-8) succeeds and shows the new rule.
+		now += OUTLINE_VIEW_LIMITS.failureBackoffMs;
 		expect(part(await parts(id), "outline.behavior")).toContain("Ask before deleting files.");
 	});
 
@@ -243,6 +246,8 @@ describe("S1: a view read that fails", () => {
 			},
 		];
 		const { reconcileEpoch, loadContextUpdate } = await import("../../narrator-epochs");
+		let now = 1_000_000;
+		resetOutlineViewCache(() => now);
 		const id = await session();
 		const pageId = await seedBehaviorPage(id, "Never force-push the main branch.");
 		const request = async () => {
@@ -292,6 +297,8 @@ describe("S1: a view read that fails", () => {
 		await request();
 		once.mockRestore();
 		expect(await behaviorUpdates()).toEqual([]);
+		// Read again once the failure backoff (round 2, N-R2-8) is over.
+		now += OUTLINE_VIEW_LIMITS.failureBackoffMs;
 		await request();
 		expect(await behaviorUpdates()).toEqual(["SET"]);
 
@@ -567,22 +574,28 @@ describe("N3: a fork copy cut at the commit limit says so (probe L)", () => {
 });
 
 describe("N5: the turn-end note is written where the run goes idle", () => {
-	test("after the compact restart, the hold and the pre-idle drain have had their say", () => {
+	test("decided after the continuation, compact restart and hold; written after the drain", () => {
 		const source = readFileSync(
 			join(import.meta.dir, "../../agent-runtime/orchestrator.ts"),
 			"utf8",
 		);
-		const note = source.indexOf("await maybeDeliverOutlineTurnEndNote(active)");
-		expect(note).toBeGreaterThan(0);
-		expect(source.indexOf("await maybeDeliverOutlineTurnEndNote(active)", note + 1)).toBe(-1);
+		const decide = source.indexOf("await decideOutlineTurnEndNote(active)");
+		expect(decide).toBeGreaterThan(0);
+		expect(source.indexOf("await decideOutlineTurnEndNote(active)", decide + 1)).toBe(-1);
 		for (const before of [
 			'const continuationPrompt = await continueForSpec("spec", runState.hadError);',
 			"shouldResumeAfterCompact(",
-			"const bgCompletionAfterIdle = await drainAndPersistPendingInjections(",
+			"const next = await holdAtBoundary();",
 		]) {
-			const at = source.lastIndexOf(before, note);
+			const at = source.lastIndexOf(before, decide);
 			expect(at).toBeGreaterThan(0);
 		}
+		// The rest of this ordering (the drain and the arbitration back to back, the note written
+		// after them) is the second round's N-R2-5, `outline-views-review-r2.test.ts`.
+		const deliver = source.indexOf("await deliverOutlineTurnEndNote(active, turnEndNote)");
+		expect(source.lastIndexOf("const bgCompletionAfterIdle = await", deliver)).toBeGreaterThan(
+			decide,
+		);
 	});
 });
 

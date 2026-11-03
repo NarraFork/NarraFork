@@ -161,6 +161,8 @@ import {
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
 	consumeQuestionAnswerModelReceipts,
+	decideOutlineTurnEndNote,
+	deliverOutlineTurnEndNote,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
@@ -172,7 +174,6 @@ import {
 	finalizeOrCleanupPartialMessage,
 	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
-	maybeDeliverOutlineTurnEndNote,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
@@ -3289,6 +3290,13 @@ export async function runAgentLoopUnlocked(
 
 			// No buffered messages — now transition to idle/unread (triggers notifications)
 			if (!runState.hadError) {
+				// A long outline turn that left a task in progress without touching any task ends
+				// with one line for the next turn; it starts none (plan PR 4, Q4). Decided here,
+				// before the drain (its reads are awaited), and written only once this run has
+				// settled terminal below, so nothing awaited sits between the drain and the
+				// arbitration. The drain or a hold continuing the run drops it.
+				const turnEndNote = await decideOutlineTurnEndNote(active);
+
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
 				// This closes the window where status is already idle (visible to clients /
 				// route admission) while this loop is still running and about to pick up more
@@ -3303,15 +3311,12 @@ export async function runAgentLoopUnlocked(
 					continue;
 				}
 
-				// Nothing continues this run any more (no continuation, compact restart, hold or
-				// drained work): a long outline turn that left a task in progress without touching
-				// any task ends with one line for the next turn. It starts none (plan PR 4, Q4).
-				await maybeDeliverOutlineTurnEndNote(active);
-
 				// Drain awaited above: synchronously arbitrate takeover vs terminal now.
 				// A successful hold must park; once finalizing is claimed new holds fail.
+				let terminal = true;
 				if (run) {
 					if (getRunHold(narratorId) && !getRunHold(narratorId)?.released) {
+						terminal = false;
 						if ((await holdAtBoundary()) === "continue") continue;
 					} else run.finalizing = true;
 				} else {
@@ -3322,6 +3327,9 @@ export async function runAgentLoopUnlocked(
 						{ substatus: ["unread"] },
 					);
 				}
+				// Nothing continues this run any more: the note decided above is written (a plain
+				// row, before the finalizer runs). A run that parked on a hold leaves none.
+				if (turnEndNote && terminal) await deliverOutlineTurnEndNote(active, turnEndNote);
 				// The run finalizer commits its terminal before the public idle write.
 			}
 
