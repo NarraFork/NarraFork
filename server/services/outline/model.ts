@@ -177,6 +177,8 @@ export const OUTLINE_PENDING_LIMITS = {
 	/** Blocks a pending change's diff shows, and UTF-8 bytes of each text in it. */
 	diffBlocks: 50,
 	diffTextBytes: 16 * 1024,
+	/** Rows one diff reads checking the subtrees of the deletes it shows (past it: unchecked). */
+	diffSubtreeRows: OUTLINE_LIMITS.maxRowsTouched,
 	/** Unreported decisions one read shows. */
 	reportsPerRead: 10,
 } as const;

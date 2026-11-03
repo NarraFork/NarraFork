@@ -350,6 +350,10 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		const out: Array<{ blockId: string; fromSeq: number | null; changeFlags: number | null }> = [];
 		const own = ~except.flags & 0x7fffffff;
 		const anyone = ~(except.anyoneFlags ?? 0) & 0x7fffffff;
+		const actors = sql.join(
+			[...new Set([except.actorId, ...(except.actorIds ?? [])])].map((id) => sql`${id}`),
+			sql`, `,
+		);
 		for (const chunk of chunked(keys, LAST_WRITES_CHUNK)) {
 			const after = caseOf(chunk.map((k) => [k.blockId, k.afterSeq]));
 			const newer = sql`v.block_id = outline_blocks.id AND v.from_seq > ${after}`;
@@ -359,7 +363,7 @@ export const sqliteOutlineReads: OutlineReadPort = {
 				ORDER BY v.from_seq DESC LIMIT 1 OFFSET ${sql.raw(String(OUTLINE_LAST_WRITES_SCAN - 1))}), ${after} + 1)`;
 			const counted = sql`FROM outline_block_versions v JOIN outline_commits c ON c.id = v.commit_id
 				WHERE v.block_id = outline_blocks.id AND v.from_seq >= ${floor}
-					AND NOT ((c.actor_kind = ${except.actorKind} AND c.actor_id = ${except.actorId}
+					AND NOT ((c.actor_kind = ${except.actorKind} AND c.actor_id IN (${actors})
 						AND (v.change_flags & ${own}) = 0) OR (v.change_flags & ${anyone}) = 0)
 				ORDER BY v.from_seq DESC LIMIT 1`;
 			const rows = db

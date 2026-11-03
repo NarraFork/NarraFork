@@ -264,6 +264,7 @@
 		"changedSince": "提议之后又有人改过：确认时会合并，有重叠就会失败。",
 		"changedUnder_one": "提议删除之后，它下面有 {{count}} 个块被新增、修改或移走：确认会被拒绝。",
 		"changedUnder_other": "提议删除之后，它下面有 {{count}} 个块被新增、修改或移走：确认会被拒绝。",
+		"subtreeUnchecked": "它下面的块太多，这里没法检查提议删除之后有没有改动。",
 		"changes_one": "{{count}} 处改动",
 		"changes_other": "{{count}} 处改动",
 		"confirm": "确认",

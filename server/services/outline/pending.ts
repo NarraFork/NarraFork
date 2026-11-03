@@ -196,6 +196,8 @@ export const OUTLINE_PENDING_TEXT = {
 	conflict: (label: string) =>
 		`${label} no longer applies as proposed: blocks it changes were changed since. Nothing was written; reject it, or let its proposer propose again`,
 	unlocked: (label: string) => `${label}: the plan is no longer locked`,
+	subtreeUnchecked: (sid: string) =>
+		`[${sid}], which it deletes, is too large to check for changes made since it was proposed`,
 	subtreeChanged: (sid: string, n: number) =>
 		`[${sid}], which it deletes, changed since it was proposed: ${n === 1 ? "1 block" : `${n} blocks`} in it or under it added, changed or gone`,
 	changed: (label: string) =>
@@ -400,28 +402,40 @@ export interface OutlineSubtreeBudget {
 const PAGE_ONLY = OUTLINE_CHANGE.PAGE;
 /** Change flags of the proposer's versions it leaves out: all of them. */
 const ALL_CHANGES = 0x7fffffff;
+/** Narrators of the proposing session one check finds and leaves out at most (rounds of reads). */
+const SESSION_ROUNDS = 8;
+
+/** What a check of the subtrees a change deletes found. */
+export interface OutlineDeletedSubtrees {
+	/** By deleted block: how many blocks in or under it others changed since the proposal. */
+	changed: Map<string, number>;
+	/** Deleted blocks whose subtree was too large to check within the budget. */
+	unchecked: Set<string>;
+}
 
 /**
  * Of the blocks a change deletes, those whose subtree others changed since it was proposed:
  * blocks under it added, changed or gone, or the block itself changed, by anyone but the
  * proposer (review S-9, N-2; the direct delete path refuses the same, design §6.5: "changes by
- * others"). The proposer's own versions (the direct part of the same call, its later writes) and
- * versions that only moved blocks to another page (the locked task moved) do not count; a block
- * the proposer brought in that someone else created does (counting what cannot be told apart).
- * By block, how many.
+ * others"). The proposer is the proposing session, its root and its subagents (decision 7,
+ * review R3-1): their versions (the direct part of the same call, its later writes, its
+ * subagents') do not count, nor do versions that only moved blocks to another page (the locked
+ * task moved). A block the session brought in that someone else created does (what cannot be
+ * told apart counts).
  *
  * Bounded: `only` limits it to some of the deletes (a diff checks the ones it shows), and
- * `budget` caps the rows read across calls of one request; a subtree past it counts as changed.
+ * `budget` caps the rows read across calls of one request. A subtree past it is reported
+ * unchecked (too large to check), not changed (review R3-N-a).
  */
 export async function deletedSubtreeChanges(
 	store: OutlineStore,
 	row: Pick<
 		OutlinePendingRow,
-		"spaceId" | "baseJson" | "opsJson" | "subtreeJson" | "requestedByJson"
+		"spaceId" | "baseJson" | "opsJson" | "subtreeJson" | "requestedByJson" | "requesterSession"
 	>,
 	options: { only?: ReadonlySet<string>; budget?: OutlineSubtreeBudget } = {},
-): Promise<Map<string, number>> {
-	const out = new Map<string, number>();
+): Promise<OutlineDeletedSubtrees> {
+	const out: OutlineDeletedSubtrees = { changed: new Map(), unchecked: new Set() };
 	const deletes = pendingOps(row).flatMap((op) =>
 		op.op === "delete" &&
 		"id" in op.block &&
@@ -431,61 +445,108 @@ export async function deletedSubtreeChanges(
 	);
 	if (deletes.length === 0) return out;
 	const budget = options.budget ?? { left: OUTLINE_LIMITS.maxRowsTouched };
+	// Rows within the budget: taken, or none and the budget spent (it never goes below zero).
+	const take = (n: number): boolean => {
+		if (n > budget.left) {
+			budget.left = 0;
+			return false;
+		}
+		budget.left -= n;
+		return true;
+	};
 	const metas = new Map(
 		(await store.getBlockMetas(row.spaceId, { ids: deletes.map((d) => d.id) })).map((m) => [
 			m.id,
 			m,
 		]),
 	);
-	const keys: Array<{ blockId: string; afterSeq: number; of: string }> = [];
-	const over = new Set<string>();
+	let keys: Array<{ blockId: string; afterSeq: number; of: string }> = [];
 	for (const d of deletes) {
+		if (budget.left === 0) {
+			out.unchecked.add(d.id);
+			continue;
+		}
+		const mine: typeof keys = [];
 		const recorded = row.subtreeJson[d.id] ?? {};
 		const meta = metas.get(d.id);
 		if (meta && d.base !== undefined && meta.versionSeq !== d.base)
-			keys.push({ blockId: d.id, afterSeq: d.base, of: d.id });
+			mine.push({ blockId: d.id, afterSeq: d.base, of: d.id });
 		const seen = new Set<string>();
 		let frontier = meta && !meta.deleted ? [d.id] : [];
+		let fits = true;
 		while (frontier.length > 0) {
-			const kids = await store.listChildMetas(row.spaceId, frontier, Math.max(budget.left, 0) + 1);
-			budget.left -= kids.length;
-			if (budget.left < 0) {
-				over.add(d.id);
+			const kids = await store.listChildMetas(row.spaceId, frontier, budget.left + 1);
+			if (!take(kids.length)) {
+				fits = false;
 				break;
 			}
 			for (const kid of kids) {
 				seen.add(kid.id);
 				const was = recorded[kid.id];
 				// Added since (or brought in): any version by someone else counts.
-				if (was === undefined) keys.push({ blockId: kid.id, afterSeq: 0, of: d.id });
-				else if (was !== kid.versionSeq) keys.push({ blockId: kid.id, afterSeq: was, of: d.id });
+				if (was === undefined) mine.push({ blockId: kid.id, afterSeq: 0, of: d.id });
+				else if (was !== kid.versionSeq) mine.push({ blockId: kid.id, afterSeq: was, of: d.id });
 			}
 			frontier = kids.map((k) => k.id);
 		}
 		// Under it then and not now: deleted or moved away since.
 		for (const [was, seq] of Object.entries(recorded))
-			if (!seen.has(was) && !over.has(d.id)) keys.push({ blockId: was, afterSeq: seq, of: d.id });
+			if (!seen.has(was)) mine.push({ blockId: was, afterSeq: seq, of: d.id });
+		if (fits && take(mine.length)) keys.push(...mine);
+		else out.unchecked.add(d.id);
 	}
-	budget.left -= keys.length;
-	if (keys.length > 0 && budget.left >= 0) {
+	// The latest version of each that counts. A narrator of the proposing session found among the
+	// writers is the proposer too: left out, and its blocks looked at again (a few rounds).
+	const by = row.requestedByJson;
+	const session = by.kind === "agent" ? (row.requesterSession ?? by.id) : null;
+	const proposer = new Set<string>([by.id, ...(session ? [session] : [])]);
+	for (let round = 0; keys.length > 0; round++) {
 		const of = new Map(keys.map((k) => [k.blockId, k.of]));
+		const [first, ...more] = [...proposer];
 		const writes = await store.findLastWrites(
 			keys.map(({ blockId, afterSeq }) => ({ blockId, afterSeq })),
 			{
-				actorKind: row.requestedByJson.kind,
-				actorId: row.requestedByJson.id,
+				actorKind: by.kind,
+				actorId: first as string,
+				actorIds: more,
 				flags: ALL_CHANGES,
 				anyoneFlags: PAGE_ONLY,
 			},
 		);
+		const known = writes.filter((w) => w.fromSeq !== null);
+		const commits =
+			session && known.length > 0
+				? await store.getCommitsBySeqs(row.spaceId, [
+						...new Set(known.map((w) => w.fromSeq as number)),
+					])
+				: [];
+		const agents = [
+			...new Set(
+				commits.flatMap((c) =>
+					c.actorKind === "agent" && !proposer.has(c.actorId) ? [c.actorId] : [],
+				),
+			),
+		];
+		const roots = agents.length > 0 ? await store.getNarratorRoots(agents) : new Map();
+		const siblings = new Set(agents.filter((id) => (roots.get(id)?.root ?? id) === session));
+		const writer = new Map(commits.map((c) => [c.seq, c.actorId]));
+		const again = new Set<string>();
 		for (const w of writes) {
 			const d = of.get(w.blockId);
-			if (d !== undefined) out.set(d, (out.get(d) ?? 0) + 1);
+			if (d === undefined) continue;
+			if (w.fromSeq !== null && siblings.has(writer.get(w.fromSeq) ?? "")) again.add(w.blockId);
+			else out.changed.set(d, (out.changed.get(d) ?? 0) + 1);
 		}
-	} else if (keys.length > 0) {
-		for (const k of keys) over.add(k.of);
+		if (again.size === 0) break;
+		for (const id of siblings) proposer.add(id);
+		const next = keys.filter((k) => again.has(k.blockId));
+		if (round + 1 >= SESSION_ROUNDS || !take(next.length)) {
+			for (const k of next) out.unchecked.add(k.of);
+			break;
+		}
+		keys = next;
 	}
-	for (const d of over) out.set(d, Math.max(out.get(d) ?? 0, 1));
+	for (const d of out.unchecked) out.changed.delete(d);
 	return out;
 }
 
@@ -515,15 +576,18 @@ async function rebase(
 	const subtrees = await deletedSubtreeChanges(store, row, {
 		budget: { left: 2 * OUTLINE_LIMITS.maxRowsTouched },
 	});
-	if (subtrees.size > 0) {
+	if (subtrees.changed.size > 0 || subtrees.unchecked.size > 0) {
 		const deletedSids = new Map(
-			(await store.getBlockMetas(row.spaceId, { ids: [...subtrees.keys()] })).map((m) => [
-				m.id,
-				m.sid,
-			]),
+			(
+				await store.getBlockMetas(row.spaceId, {
+					ids: [...subtrees.changed.keys(), ...subtrees.unchecked],
+				})
+			).map((m) => [m.id, m.sid]),
 		);
-		for (const [id, n] of subtrees)
+		for (const [id, n] of subtrees.changed)
 			conflicts.push(OUTLINE_PENDING_TEXT.subtreeChanged(deletedSids.get(id) ?? id, n));
+		for (const id of subtrees.unchecked)
+			conflicts.push(OUTLINE_PENDING_TEXT.subtreeUnchecked(deletedSids.get(id) ?? id));
 	}
 	if (conflicts.length > 0) {
 		throw new OutlinePendingError(
@@ -576,6 +640,19 @@ async function rebase(
 }
 
 /**
+ * Who a change is the proposal of: the root of the session that proposed it (decision 7: a
+ * session and its subagents propose as one), or the actor itself when it is not a session's.
+ */
+export function proposerOf(
+	row: Pick<OutlinePendingRow, "requestedByJson" | "requesterSession">,
+): OutlineTaskActorRef {
+	const by = row.requestedByJson;
+	return by.kind === "agent" && row.requesterSession
+		? { kind: "agent", id: row.requesterSession }
+		: { kind: by.kind, id: by.id };
+}
+
+/**
  * Confirm an open change: one `confirm` commit written as its proposer, the row `confirmed` with
  * it. Throws {@link OutlinePendingError}: not found, decided already, not the actor's to decide,
  * the actor's own session's change, or no longer applying (a conflict; nothing is written and it
@@ -602,17 +679,22 @@ export async function confirmOutlinePending(args: {
 				"OUTLINE_PENDING_NOT_DECIDER",
 			);
 		const { ops, canonical } = await rebase(store, row);
+		// The session proposed it (decision 7), whichever of its narrators proposed last: the
+		// commit is its root's (review R3-N-b), with the message and tool call only when the root
+		// proposed last.
 		const requester = row.requestedByJson;
+		const proposer = proposerOf(row);
+		const rootLast = proposer.id === requester.id;
 		let write: OutlineWriteResult;
 		try {
 			write = await writeOutline(
 				{
 					spaceId: row.spaceId,
 					ops,
-					actor: { kind: requester.kind, id: requester.id },
-					narratorId: requester.narratorId,
-					messageId: requester.messageId,
-					toolCallId: requester.toolCallId,
+					actor: proposer,
+					narratorId: proposer.kind === "agent" ? proposer.id : requester.narratorId,
+					messageId: rootLast ? requester.messageId : null,
+					toolCallId: rootLast ? requester.toolCallId : null,
 					responsibleUserId: args.by.kind === "human" ? args.by.userId : args.by.responsibleUserId,
 					summary: OUTLINE_TEXT.confirmSummary(label, row.summary),
 				},
@@ -931,10 +1013,12 @@ export interface OutlinePendingDiffEntry {
 	/** For a move or an insert: the parent it goes under (title), null for the top level. */
 	parentTitle?: string | null;
 	/**
-	 * For a delete: blocks in or under it added, changed or gone since it was proposed (a
-	 * confirmation refuses then).
+	 * For a delete: blocks in or under it others added, changed or moved away since it was
+	 * proposed (a confirmation refuses then).
 	 */
 	changedUnder?: number;
+	/** For a delete: its subtree is too large to check for that (review R3-N-a). */
+	subtreeUnchecked?: boolean;
 }
 
 /**
@@ -980,7 +1064,7 @@ export async function readPendingDiff(
 		only: new Set(
 			shown.flatMap((op) => (op.op === "delete" && "id" in op.block ? [op.block.id] : [])),
 		),
-		budget: { left: OUTLINE_LIMITS.maxRowsTouched },
+		budget: { left: OUTLINE_PENDING_LIMITS.diffSubtreeRows },
 	});
 	const titleOfBlock = (id: string | undefined) => {
 		const b = id ? blocks.get(id) : undefined;
@@ -1033,7 +1117,10 @@ export async function readPendingDiff(
 			...(op.op === "move"
 				? { parentTitle: op.parent && "id" in op.parent ? titleOfBlock(op.parent.id) : null }
 				: {}),
-			...(op.op === "delete" && subtrees.has(id) ? { changedUnder: subtrees.get(id) } : {}),
+			...(op.op === "delete" && subtrees.changed.has(id)
+				? { changedUnder: subtrees.changed.get(id) }
+				: {}),
+			...(op.op === "delete" && subtrees.unchecked.has(id) ? { subtreeUnchecked: true } : {}),
 		});
 	}
 	return { entries, truncated: ops.length > shown.length };

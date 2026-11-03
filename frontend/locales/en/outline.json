@@ -264,6 +264,7 @@
 		"changedSince": "Changed since it was proposed: confirming merges the changes, or fails if they overlap.",
 		"changedUnder_one": "Since the deletion was proposed, {{count}} block in or under it was added, changed or moved away: confirming will be refused.",
 		"changedUnder_other": "Since the deletion was proposed, {{count}} blocks in or under it were added, changed or moved away: confirming will be refused.",
+		"subtreeUnchecked": "Too large to check here for changes since the deletion was proposed.",
 		"changes_one": "{{count}} change",
 		"changes_other": "{{count}} changes",
 		"confirm": "Confirm",

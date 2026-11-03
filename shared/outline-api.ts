@@ -422,8 +422,10 @@ export interface OutlinePendingDiffEntry {
 	} | null;
 	/** For a move or an insert: the parent's title (null: the top level). */
 	parentTitle?: string | null;
-	/** For a delete: blocks in or under it added, changed or gone since it was proposed. */
+	/** For a delete: blocks in or under it others added, changed or moved away since it was proposed. */
 	changedUnder?: number;
+	/** For a delete: its subtree is too large to check for changes since it was proposed. */
+	subtreeUnchecked?: boolean;
 }
 
 /** `GET /pending/:id`: a pending change block by block (bounded). */

@@ -1451,12 +1451,32 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 				{ op: "move", block: { id: ids.root }, parent: { id: ids.other } },
 			]);
 			const row = await pendingRow(ctx, call.pending?.id as string);
-			expect(await deletedSubtreeChanges(ctx.store, row)).toEqual(new Map());
-			// Bounded: what the budget does not reach counts as changed; `only` limits what is read.
-			expect(await deletedSubtreeChanges(ctx.store, row, { budget: { left: 0 } })).toEqual(
-				new Map([[ids.s2, 1]]),
-			);
-			expect(await deletedSubtreeChanges(ctx.store, row, { only: new Set() })).toEqual(new Map());
+			const none = { changed: new Map<string, number>(), unchecked: new Set<string>() };
+			expect(await deletedSubtreeChanges(ctx.store, row)).toEqual(none);
+			// Bounded: what the budget does not reach is too large to check, not changed (review
+			// R3-N-a), whether the walk or the blocks to look at run past it; the budget never goes
+			// below zero. `only` limits what is read.
+			for (const left of [0, 1, 2]) {
+				const budget = { left };
+				expect(await deletedSubtreeChanges(ctx.store, row, { budget })).toEqual({
+					changed: new Map(),
+					unchecked: new Set([ids.s2]),
+				});
+				expect(budget.left).toBe(0);
+			}
+			expect(await deletedSubtreeChanges(ctx.store, row, { only: new Set() })).toEqual(none);
+			// The diff says so for a delete past its budget.
+			const limits = OUTLINE_PENDING_LIMITS as { diffSubtreeRows: number };
+			const rows = limits.diffSubtreeRows;
+			limits.diffSubtreeRows = 2;
+			try {
+				const small = await readPendingDiff(row, { store: ctx.store });
+				const entry = small.entries.find((e) => e.kind === "delete");
+				expect(entry?.subtreeUnchecked).toBe(true);
+				expect(entry?.changedUnder).toBeUndefined();
+			} finally {
+				limits.diffSubtreeRows = rows;
+			}
 			const diff = await readPendingDiff(row, { store: ctx.store });
 			expect(diff.entries.find((e) => e.kind === "delete")?.changedUnder).toBeUndefined();
 			await confirmOutlinePending({
@@ -1584,6 +1604,74 @@ export const OUTLINE_PENDING_CONTRACT: ContractCase[] = [
 			await write(ctx, space, p.sub, [{ op: "delete", block: { id: agentPlan } }]);
 			expect((await ctx.store.getBlock(agentPlan))?.deleted).toBe(true);
 			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "confirm a delete: the proposing session is the proposer, its root and its subagents alike, whoever merged last (review R3-1); the confirm commit is the root's (R3-N-b)",
+		async run(ctx) {
+			// The root proposes deleting s2; its subagent then writes a note under s2.
+			const p = await lockedPlan(ctx);
+			const first = await write(ctx, p.space, p.a, [{ op: "delete", block: { id: p.ids.s2 } }]);
+			await write(ctx, p.space, p.sub, [
+				{ op: "insert", parent: { id: p.ids.s2 }, content: "subagent: a duplicate indeed" },
+			]);
+			const one = await confirmOutlinePending({
+				pendingId: first.pending?.id as string,
+				by: { kind: "human", userId: p.lockerId },
+				store: ctx.store,
+			});
+			expect((await ctx.store.getBlock(p.ids.s2))?.deleted).toBe(true);
+			expect(one.write.commit).not.toBeNull();
+			// The root writes a note under s2 and proposes deleting it in one call, and proposes a new
+			// step; its subagent later proposes something else, merged into the same change.
+			const q = await lockedPlan(ctx);
+			const call = await write(ctx, q.space, q.a, [
+				{ op: "insert", parent: { id: q.ids.s2 }, content: "why: duplicated" },
+				{ op: "delete", block: { id: q.ids.s2 } },
+				{ op: "insert", parent: { id: q.ids.root }, content: "Validate", task: { status: "todo" } },
+			]);
+			expect(held(call)).toEqual([1, 2]);
+			const step = call.results[2]?.blockId as string;
+			const merged = await write(ctx, q.space, q.sub, [
+				{ op: "update", block: { id: q.ids.acc }, content: "Acceptance: loads fast" },
+			]);
+			expect(merged.pending?.merged).toBe(true);
+			const row = await pendingRow(ctx, call.pending?.id as string);
+			expect(row.requestedByJson.id).toBe(q.narrators.sub);
+			expect((await deletedSubtreeChanges(ctx.store, row)).changed).toEqual(new Map());
+			const two = await confirmOutlinePending({
+				pendingId: row.id,
+				by: { kind: "human", userId: q.lockerId },
+				store: ctx.store,
+			});
+			expect((await ctx.store.getBlock(q.ids.s2))?.deleted).toBe(true);
+			// Written as the session's root, whichever of its narrators proposed last.
+			const commit = await ctx.store.getCommit(two.write.commit?.id as string);
+			expect(commit).toMatchObject({
+				kind: "confirm",
+				actorKind: "agent",
+				actorId: q.narrators.a,
+				narratorId: q.narrators.a,
+				messageId: null,
+				toolCallId: null,
+			});
+			expect((await ctx.store.getBlock(step))?.deleted).toBe(false);
+			// Someone outside the session is still someone else.
+			const r = await lockedPlan(ctx);
+			const third = await write(ctx, r.space, r.a, [{ op: "delete", block: { id: r.ids.s2 } }]);
+			await write(ctx, r.space, r.b, [
+				{ op: "insert", parent: { id: r.ids.s2 }, content: "another session's finding" },
+			]);
+			const refused = await refusedWith(
+				confirmOutlinePending({
+					pendingId: third.pending?.id as string,
+					by: { kind: "human", userId: r.lockerId },
+					store: ctx.store,
+				}),
+				OutlinePendingError,
+			);
+			expect(refused.pendingCode).toBe("OUTLINE_PENDING_CONFLICT");
+			checkSpaceInvariants(await ctx.dump(q.space.id));
 		},
 	},
 ];
