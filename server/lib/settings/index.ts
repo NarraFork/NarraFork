@@ -25,8 +25,8 @@ import { generateShortId } from "../id";
 import { logger } from "../logger";
 import {
 	bindModelCatalogSettings,
-	keepLatestCatalog,
-	normalizeModelCatalogSettings,
+	keepModelCatalogSettings,
+	migrateModelCatalogSettings,
 	rewriteConnectionOverrides,
 	startModelCatalogDailyCheck,
 } from "../model-catalog";
@@ -583,9 +583,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
-	// The model catalog has one stored and in-memory form; both startup and hot reload
-	// pass through this, so no reader can see a document that skipped the import.
-	if (normalizeModelCatalogSettings(merged)) {
+	// Overrides an older file kept inline move to the catalog's own file; startup and hot
+	// reload both pass through this.
+	if (migrateModelCatalogSettings(merged)) {
 		needsSave = true;
 	}
 
@@ -772,8 +772,7 @@ export function purgeStaleAgentModelRefs(
 		settings.agent.hiddenModels = cleanedHidden;
 		dirty = true;
 	}
-	if (rewriteConnectionOverrides(settings, (model) => (isStale(model) ? null : model)))
-		dirty = true;
+	rewriteConnectionOverrides((model) => (isStale(model) ? null : model));
 	const origCustom = settings.agent.customModels ?? [];
 	const cleanedCustom = origCustom.filter((m) => !isStale(m.value));
 	if (cleanedCustom.length !== origCustom.length) {
@@ -927,7 +926,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
 	initializeTokenDanceModelCollection(newSettings);
-	keepLatestCatalog(newSettings);
+	keepModelCatalogSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	withSettingsFileLock(narraforkDir, () => {

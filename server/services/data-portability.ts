@@ -33,6 +33,7 @@ import { createInflateRaw, inflateRawSync } from "node:zlib";
 import { AppError, catalogError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
 import { saveSettings, settings } from "@server/lib/settings";
 import type { NarraForkSettings } from "@server/lib/settings/types";
 import {
@@ -412,6 +413,8 @@ function collectProviders(source: NarraForkSettings): Partial<Record<ProviderKey
 		const value = agent?.[key];
 		if (value !== undefined) (out as Record<string, unknown>)[key] = value;
 	}
+	// Model overrides live beside settings.json, not in it.
+	out.modelCatalog = exportModelCatalogSettings();
 	return out;
 }
 
@@ -1125,63 +1128,6 @@ function uniqueProviderId(taken: Set<string>): string {
  *
  * 实例级策略（`autoApply` / `pinnedVersion`）保留本地——导入搬的是模型数据，不是目录更新策略。
  */
-function mergeModelCatalog(current: unknown, incoming: unknown): unknown {
-	const base = (current ?? {}) as Record<string, unknown>;
-	const patch = incoming as Record<string, unknown>;
-	const baseLocal = (base.local ?? {}) as Record<string, unknown>;
-	const patchLocal = (patch.local ?? {}) as Record<string, unknown>;
-
-	const byId = (before: unknown, after: unknown): unknown => {
-		if (!Array.isArray(after)) return before;
-		const map = new Map<string, unknown>();
-		for (const entry of (Array.isArray(before) ? before : []) as Array<Record<string, unknown>>) {
-			map.set(String(entry.id ?? ""), entry);
-		}
-		for (const entry of after as Array<Record<string, unknown>>) {
-			map.set(String(entry.id ?? ""), entry);
-		}
-		return [...map.values()];
-	};
-	// overrides 没有 id，用 target + targetId 定位同一条。
-	const mergeOverrides = (): unknown => {
-		if (!Array.isArray(patchLocal.overrides)) return baseLocal.overrides;
-		const keyOf = (entry: Record<string, unknown>) => `${entry.target}:${entry.targetId}`;
-		const map = new Map<string, unknown>();
-		for (const entry of (baseLocal.overrides ?? []) as Array<Record<string, unknown>>) {
-			map.set(keyOf(entry), entry);
-		}
-		for (const entry of patchLocal.overrides as Array<Record<string, unknown>>) {
-			map.set(keyOf(entry), entry);
-		}
-		return [...map.values()];
-	};
-	const union = (before: unknown, after: unknown): unknown =>
-		Array.isArray(after)
-			? [...new Set([...(Array.isArray(before) ? before : []), ...after])]
-			: before;
-
-	return {
-		...base,
-		local: {
-			...baseLocal,
-			// 合并算一次本地编辑，revision 必须往前走，否则前端的 baseRevision 校验会拒绝后续保存。
-			revision: Math.max(Number(baseLocal.revision ?? 0), Number(patchLocal.revision ?? 0)) + 1,
-			models: byId(baseLocal.models, patchLocal.models),
-			variants: byId(baseLocal.variants, patchLocal.variants),
-			bindings: byId(baseLocal.bindings, patchLocal.bindings),
-			overrides: mergeOverrides(),
-			connections: {
-				...((baseLocal.connections as Record<string, unknown>) ?? {}),
-				...((patchLocal.connections as Record<string, unknown>) ?? {}),
-			},
-			hiddenModelIds: union(baseLocal.hiddenModelIds, patchLocal.hiddenModelIds),
-			hiddenVariantIds: union(baseLocal.hiddenVariantIds, patchLocal.hiddenVariantIds),
-		},
-		autoApply: base.autoApply,
-		pinnedVersion: base.pinnedVersion,
-	};
-}
-
 /**
  * 按模型键的第一段（`prefix:model`）改写。
  *
@@ -1291,8 +1237,10 @@ function mergeAgentModelSettings(
 		changed = true;
 	}
 
+	// Overrides are merged into the catalog's own file (incoming wins per entry); the
+	// catalog keeps owning `agent.modelCatalog`, so nothing goes into the settings patch.
 	if (incoming.modelCatalog && typeof incoming.modelCatalog === "object") {
-		out.modelCatalog = mergeModelCatalog(agent.modelCatalog, incoming.modelCatalog);
+		importModelCatalogSettings(incoming.modelCatalog);
 		changed = true;
 	}
 

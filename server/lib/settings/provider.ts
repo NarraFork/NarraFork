@@ -1111,11 +1111,7 @@ export function resolveModelContextWindow(
 		)
 			return {
 				contextWindow: user.contextWindow,
-				source:
-					user.contextWindowSource.layer === "local-model" ||
-					user.contextWindowSource.layer === "local-variant"
-						? "card"
-						: "user",
+				source: user.contextWindowSource.layer === "local-model" ? "card" : "user",
 			};
 		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
 		if (catalog && catalog.context_length > 0)
@@ -1133,12 +1129,7 @@ export function resolveModelContextWindow(
 	if (window !== undefined && (layer?.startsWith("local-") || layer === "discovered"))
 		return {
 			contextWindow: window,
-			source:
-				layer === "local-binding" || layer === "local-connection"
-					? "user"
-					: layer === "discovered"
-						? "catalog"
-						: "card",
+			source: layer === "local-connection" ? "user" : layer === "discovered" ? "catalog" : "card",
 		};
 	// A provider's explicit budget outranks presets, but not local model/binding
 	// decisions or the gateway's discovered window.

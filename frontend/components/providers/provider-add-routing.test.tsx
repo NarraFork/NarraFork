@@ -1044,17 +1044,12 @@ describe("provider add nested route", () => {
 			},
 		};
 		queryClient.setQueryData(["admin", "settings"], serverSettings);
-		// Row windows come from the catalog's window endpoint, which reports the platform's value.
-		queryClient.setQueryData(["model-catalog", "window", "tokendance:raw:model"], {
-			revision: 0,
-			info: {
-				model: "tokendance:raw:model",
-				contextWindow: 64000,
-				source: "discovered",
-				inherited: 64000,
-				inheritedSource: "discovered",
-				others: [],
-			},
+		// Row windows come from the catalog's model description, which reports the platform's value.
+		queryClient.setQueryData(["model-catalog", "model", "tokendance:raw:model"], {
+			model: "tokendance:raw:model",
+			matchedVia: "none",
+			modelWideEditable: false,
+			effective: { contextWindow: { value: 64000, origin: "upstream" } },
 		});
 		const complete = spyOn(tokenDanceFlow, "completeTokenDanceCallback").mockResolvedValue(true);
 		restorers.push(() => complete.mockRestore());
