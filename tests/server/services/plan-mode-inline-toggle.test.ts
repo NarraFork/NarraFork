@@ -117,12 +117,18 @@ describe("getPlanModeSystemReminder inline-plan toggle", () => {
 		// The resolution layer refuses inline submission in this state. The model has
 		// to learn that from the prompt, not from a rejected tool call.
 		const en = getPlanModeSystemReminder("en", "abc", true, 1234);
-		expect(en).toContain("1234 bytes");
+		expect(en).toContain("already exists and holds plan content");
+		expect(en).not.toContain("1234 bytes");
+		expect(getPlanModeSystemReminder("en", "abc", true, 1)).toBe(en);
+		expect(getPlanModeSystemReminder("en", "abc", true, 9876)).toBe(en);
 		expect(en).toContain('`mode: "inline"` is refused');
 		expect(en).toContain('only `mode: "file"` is accepted');
 
 		const zh = getPlanModeSystemReminder("zh-CN", "abc", true, 1234);
-		expect(zh).toContain("1234 字节");
+		expect(zh).toContain("已存在，包含你在本轮计划周期中先前写入的计划内容");
+		expect(zh).not.toContain("1234 字节");
+		expect(getPlanModeSystemReminder("zh-CN", "abc", true, 1)).toBe(zh);
+		expect(getPlanModeSystemReminder("zh-CN", "abc", true, 9876)).toBe(zh);
 		expect(zh).toContain('`mode: "inline"` 会被拒绝');
 
 		// A fresh plan cycle must not carry the narrowing.

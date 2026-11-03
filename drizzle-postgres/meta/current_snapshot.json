@@ -1,6 +1,6 @@
 {
-  "id": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
-  "prevId": "297184e9-2ffa-48e9-b8e6-70237e9adde4",
+  "id": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
+  "prevId": "33f7765c-acc7-4cf5-aaf2-adcdfde39182",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -15149,6 +15149,12 @@
         },
         "acl_root_narrator_id": {
           "name": "acl_root_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reply_context": {
+          "name": "reply_context",
           "type": "text",
           "primaryKey": false,
           "notNull": false

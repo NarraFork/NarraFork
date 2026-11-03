@@ -240,6 +240,25 @@ describe("missing checkout durable worktree listing", () => {
 			),
 		).rejects.toThrow();
 	});
+	test("discovery with reordered Git fields does not rewrite the workspace cache", async () => {
+		await workspaceContextService.get(narratorId);
+		const snapshot = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		const context = snapshot?.workspaceContext;
+		if (!snapshot || !context?.git) throw new Error("Fixture workspace absent");
+		const reordered = {
+			...context,
+			git: {
+				rootPath: context.git.rootPath,
+				repositoryPath: context.git.repositoryPath,
+				workspaceKey: context.git.workspaceKey,
+				repositoryKey: context.git.repositoryKey,
+			},
+		};
+		expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(context));
+		expect(await cacheLocalWorkspaceContext(narratorId, snapshot, reordered)).toBe(true);
+		const stored = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		expect(JSON.stringify(stored?.workspaceContext)).toBe(JSON.stringify(context));
+	});
 	test("late discovery CAS cannot overwrite a committed cwd/revision transition", async () => {
 		const snapshot = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
 		if (!snapshot) throw new Error("Fixture narrator absent");

@@ -79,6 +79,40 @@ beforeEach(() => {
 afterAll(() => sqlite.close());
 
 describe("durable mailbox storage against generated migrations", () => {
+	test("human reply policy commits with message/ref/claim and rolls back on the last write", () => {
+		const chinese = { locale: "zh-CN" as const, replyInUserLanguage: true };
+		const english = { locale: "en" as const, replyInUserLanguage: false };
+		db.update(narrators).set({ replyContext: chinese }).where(eq(narrators.id, "recipient")).run();
+		store.enqueue({
+			kind: "user_input",
+			narratorId: "recipient",
+			text: "B",
+			projectedByteSize: 1,
+			metadata: { humanReplyContext: english },
+		});
+		const read = () =>
+			db
+				.select({ replyContext: narrators.replyContext })
+				.from(narrators)
+				.where(eq(narrators.id, "recipient"))
+				.get()?.replyContext;
+		expect(read()).toEqual(chinese);
+		const row = store.claimBatch("recipient", { token: "t", epoch: "e" })[0] as MailboxRow;
+		sqlite.exec(`CREATE TRIGGER fail_reply_consume BEFORE UPDATE OF state ON narrator_buffered_messages
+			WHEN NEW.state = 'materialized' BEGIN SELECT RAISE(ABORT, 'forced claim failure'); END`);
+		try {
+			expect(() => store.materialize(claim(row), persist)).toThrow("forced claim failure");
+		} finally {
+			sqlite.exec("DROP TRIGGER fail_reply_consume");
+		}
+		expect(read()).toEqual(chinese);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
+		expect(store.materialize(claim(row), persist)?.state).toBe("materialized");
+		expect(read()).toEqual(english);
+		store.enqueue(input("nonhuman", { metadata: { humanReplyContext: chinese } }));
+		materializeOne();
+		expect(read()).toEqual(english);
+	});
 	test("atomic head predicate sees the eligible head, never a priority input beyond pending publication", () => {
 		const publisher = createPublicationOutbox(db);
 		for (let i = 0; i < L.noticePending; i++)

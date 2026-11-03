@@ -306,6 +306,7 @@ export const narrators = pgTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "set null",
 		}),
+		replyContext: jsonText("reply_context"),
 		runtimeRegistrationJson: jsonText("runtime_registration_json"),
 		policySourceNarratorId: text("policy_source_narrator_id").references(
 			(): PgColumn => narrators.id,
@@ -4166,7 +4167,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 135,
-  "columnCount": 1786,
+  "columnCount": 1787,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5978,6 +5979,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "narrators_acl_root_narrator_id_narrators_id_fk"
           },
           "emitAsTableConstraint": false
+        },
+        {
+          "property": "replyContext",
+          "name": "reply_context",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "runtimeRegistrationJson",

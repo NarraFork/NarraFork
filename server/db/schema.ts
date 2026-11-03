@@ -622,6 +622,10 @@ export const narrators = sqliteTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): any => narrators.id, {
 			onDelete: "set null",
 		}),
+		/** Durable reply policy; null identifies legacy records awaiting initialization. */
+		replyContext: text("reply_context", { mode: "json" }).$type<
+			import("../../shared/reply-context").ReplyContext
+		>(),
 		/**
 		 * Bounded runtime relationships of this narrator: policy source, controller
 		 * grant and the current run binding (cancel source, result delivery, principal,
