@@ -1645,7 +1645,6 @@ export const narratorService = {
 				throw new ValidationError("Standalone subagents cannot have an Agent tool-call origin");
 			}
 			const parent = await this.getById(input.parentNarratorId);
-			const replyContext = await ensureReplyContext(parent.id);
 
 			const { resolveNarratorRuntimePolicy } = await import("./trait-layer-service");
 			if (!(await resolveNarratorRuntimePolicy(parent.id)).capabilities.spawnAgent) {
@@ -1745,6 +1744,8 @@ export const narratorService = {
 			};
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
 			return withWorkspaceAdmission(creationTarget, async () => {
+				// Legacy initialization is a write: resource admission must accept creation first.
+				const replyContext = await ensureReplyContext(parent.id);
 				const [narrator] = await db
 					.insert(narrators)
 					.values({
@@ -2453,15 +2454,16 @@ export const narratorService = {
 			const executionContext = await resolveForkExecutionContext(parent);
 			const inheritedTraits = await forkTraits(parent);
 			const policySource = forkPolicySource(parent);
-			const replyContext = await ensureReplyContext(parent.id);
 
 			// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
 			// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
 			// initializeRefSeqFloor records into the active raise scope.
 			const creationWorkspace: CreationWorkspace = { ...executionContext };
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
-			const newNarrator = await withWorkspaceAdmission(creationTarget, async () =>
-				withSeqFloorRaiseScope(() =>
+			const newNarrator = await withWorkspaceAdmission(creationTarget, async () => {
+				// Legacy initialization is a write: resource admission must accept creation first.
+				const replyContext = await ensureReplyContext(parent.id);
+				return withSeqFloorRaiseScope(() =>
 					db.transaction((tx) => {
 						// Insert first so this transaction owns SQLite's write lock before it
 						// snapshots the parent's marker state.
@@ -2547,8 +2549,8 @@ export const narratorService = {
 
 						return { ...created, nextSeq };
 					}),
-				),
-			);
+				);
+			});
 
 			await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
 			await applySpecForkCarryover(newNarrator.id, "card");
@@ -2662,14 +2664,15 @@ export const narratorService = {
 
 			const forkTraits2 = await forkTraits(parent);
 			const policySource = forkPolicySource(parent);
-			const replyContext = await ensureReplyContext(parent.id);
 			const executionContext = await resolveForkExecutionContext(parent);
 
 			// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
 			const creationWorkspace: CreationWorkspace = { ...executionContext };
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
-			const newNarrator = await withWorkspaceAdmission(creationTarget, async () =>
-				withSeqFloorRaiseScope(() =>
+			const newNarrator = await withWorkspaceAdmission(creationTarget, async () => {
+				// Legacy initialization is a write: resource admission must accept creation first.
+				const replyContext = await ensureReplyContext(parent.id);
+				return withSeqFloorRaiseScope(() =>
 					db.transaction((tx) => {
 						// Insert before reading parent refs so this transaction acquires the write
 						// lock first; a concurrent finalize then waits and cannot change the state
@@ -2960,8 +2963,8 @@ export const narratorService = {
 						if (!finalNarrator) throw new NotFoundError("Narrator", id);
 						return finalNarrator;
 					}),
-				),
-			);
+				);
+			});
 
 			queueContextCharacterRefresh(id);
 			// fire-and-forget: spec fork 和 carryover 不阻塞 fork 响应

@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 135 tables and 1786 columns including the outline storage tables", () => {
+	test("covers 135 tables and 1787 columns including durable reply context", () => {
 		expect(target.tables.length).toBe(135);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -548,9 +548,16 @@ describe("real schema parity", () => {
 		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
 		// The outline task source (P2) adds narrators.task_backend.
 		// Locks and pending confirmation (P2) add outline_pending (25).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1786);
+		// Durable reply language adds narrators.reply_context without a NOT NULL constraint.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1787);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
+				expect.objectContaining({
+					property: "replyContext",
+					name: "reply_context",
+					pgType: "text",
+					notNull: false,
+				}),
 				expect.objectContaining({
 					property: "hiddenFromLists",
 					name: "hidden_from_lists",
