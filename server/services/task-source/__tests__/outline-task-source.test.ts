@@ -31,7 +31,7 @@ import type { ActiveNarrator } from "../../narrator-session-state";
 import { ensureSessionSpace } from "../../outline/spaces";
 import { outlineStore } from "../../outline/store";
 import * as outlineWrite from "../../outline/write";
-import { specVfsService, writeSpecFile } from "../../spec-vfs-service";
+import { specVfsService } from "../../spec-vfs-service";
 import {
 	createSpecContinuationState,
 	specContinuationStopNote,
@@ -42,6 +42,7 @@ import {
 	finishPrerequisite,
 	OUTLINE_TASK_SOURCE_SCENARIOS,
 	type OutlineScenarioContext,
+	seedBehaviorPage,
 	seedOutlineTasks,
 	taskState,
 } from "./outline-task-source-scenarios";
@@ -132,19 +133,20 @@ afterEach(() => {
 
 describeTaskSourceContract({
 	backend: "outline",
-	digestStamp: { taskBackend: "outline" },
+	// Tasks and the behavior boundary reach the model as the built-in views (plan PR 4).
+	delivery: "views",
 	createNarrator: () => session(),
 	seedTasks: async (narratorId, tasks) => {
 		await seedOutlineTasks(narratorId, tasks);
 	},
-	// Until the behavior-fence page exists (plan PR 4), an outline session's fence is the one the
-	// person and plugins write in its Dynamic Spec namespace.
+	// The behavior boundary is the behavior page of the session space, written by its person.
 	seedBehaviorFence: async (narratorId, text) => {
-		await writeSpecFile(narratorId, "spec://behavior_fence", text, { actor: "user" });
+		await seedBehaviorPage(narratorId, text);
 	},
-	/** Unreadable for one narrator: its claimed tasks and its fence cannot be read. */
+	/** Unreadable for one narrator: its tasks, its session space and its fence cannot be read. */
 	async makeUnreadable(narratorId) {
 		const realClaimed = outlineStore.listClaimedTasks;
+		const realFindSpace = outlineStore.findSpace;
 		const realReadFile = specVfsService.readSpecFile;
 		const claimed = spyOn(outlineStore, "listClaimedTasks").mockImplementation(
 			async (id, limit) => {
@@ -152,12 +154,18 @@ describeTaskSourceContract({
 				return realClaimed.call(outlineStore, id, limit);
 			},
 		);
+		const findSpace = spyOn(outlineStore, "findSpace").mockImplementation(async (scope) => {
+			if (scope.kind === "session" && scope.narratorId === narratorId)
+				throw new Error("outline unreadable");
+			return realFindSpace.call(outlineStore, scope);
+		});
 		const readFile = spyOn(specVfsService, "readSpecFile").mockImplementation(async (id, uri) => {
 			if (id === narratorId) throw new Error("spec file unreadable");
 			return realReadFile(id, uri);
 		});
 		return () => {
 			claimed.mockRestore();
+			findSpace.mockRestore();
 			readFile.mockRestore();
 		};
 	},
@@ -235,7 +243,7 @@ describe("outline task source wording", () => {
 		expect(budget).not.toMatch(SPEC_WORDS);
 	});
 
-	test("interrupt note, compact context and digest text carry addresses, no spec words", async () => {
+	test("interrupt note, compact context and the tasks view carry addresses, no spec words", async () => {
 		const id = await session();
 		await seedOutlineTasks(id, [
 			{ text: "Write the parser", status: "doing" },
@@ -252,28 +260,9 @@ describe("outline task source wording", () => {
 			const compact = await source.compactContext(locale);
 			expect(compact).toContain(address);
 			expect(compact).not.toMatch(SPEC_WORDS);
-		}
-		const { sideCarBodyWithText } = await import("../../../lib/sidecar-templates");
-		const digest = await source.taskDigest();
-		if (digest?.kind !== "tasks") throw new Error("expected a digest");
-		for (const locale of ["en", "zh-CN"] as const) {
-			const text = sideCarBodyWithText(
-				"living_work_spec",
-				{ ...digest, taskBackend: "outline" },
-				locale,
-			).content;
-			expect(text).toContain(address);
-			expect(text).toContain("waiting:");
-			expect(text).not.toMatch(SPEC_WORDS);
-			for (const variant of ["emptyNever", "emptyDone"] as const) {
-				const empty = sideCarBodyWithText(
-					"living_work_spec",
-					{ kind: "tasks", variant, taskBackend: "outline" },
-					locale,
-				).content;
-				expect(empty).toContain("OutlineEdit");
-				expect(empty).not.toMatch(SPEC_WORDS);
-			}
+			const view = (await source.contextParts(locale)).find((p) => p.key === "outline.tasks");
+			expect(view?.text).toContain(`- [/] \`${address}\` Write the parser`);
+			expect(view?.text).not.toMatch(SPEC_WORDS);
 		}
 	});
 });
@@ -452,25 +441,19 @@ describe("what the outline source lists and marks", () => {
 		expect(second.revision).not.toBe(first.revision);
 	});
 
-	test("the source marks its digest outline, empty variants included, as its interrupt note", async () => {
+	test("the digest and the injected fence are retired; the interrupt note stays marked outline", async () => {
 		const empty = await session();
-		expect(await (await taskSourceForNarrator(empty)).taskDigest()).toEqual({
-			kind: "tasks",
-			variant: "emptyNever",
-			taskBackend: "outline",
-		});
+		const emptySource = await taskSourceForNarrator(empty);
+		expect(await emptySource.taskDigest()).toBeNull();
+		expect(await emptySource.behaviorFence()).toBeNull();
 		const id = await session();
 		await seedOutlineTasks(id, [{ text: "Write the parser", status: "doing" }]);
+		await seedBehaviorPage(id, "Never force-push the main branch.");
 		const source = await taskSourceForNarrator(id);
-		expect(await source.taskDigest()).toMatchObject({ variant: "current", taskBackend: "outline" });
+		expect(await source.taskDigest()).toBeNull();
+		expect(await source.behaviorFence()).toBeNull();
 		const { tasks } = await source.openTasks();
 		expect(source.interruptGuardNote(tasks, "en").body).toMatchObject({ taskBackend: "outline" });
-		await seedOutlineTasks(id, [{ text: "Write the parser", status: "done" }]);
-		expect(await source.taskDigest()).toEqual({
-			kind: "tasks",
-			variant: "emptyDone",
-			taskBackend: "outline",
-		});
 	});
 });
 

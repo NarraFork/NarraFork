@@ -1977,6 +1977,11 @@
 		"loadOlder": "加载更早的任务"
 	},
 	"sidecar": {
+		"contextViews": {
+			"updated": "上下文已更新：{{parts}}",
+			"outlineTasks": "当前任务",
+			"outlineBehavior": "行为边界"
+		},
 		"unknownSource": "未知来源",
 		"copy": "复制注入内容",
 		"copied": "已复制",
@@ -2003,6 +2008,7 @@
 			"spec_context_cleared": "上下文已清空",
 			"review_feedback": "代码评审",
 			"interrupt_task_guard": "中断任务提醒",
+			"outline_task_turn_end": "回合末任务提醒",
 			"tutorial_lesson": "教程课程",
 			"turn_nudge": "轮次预算",
 			"broken_call": "无效的工具调用",
@@ -2145,6 +2151,9 @@
 		"tabLayoutSaveError": "标签排序保存失败，请重试。",
 		"readonly": "只读",
 		"behaviorFenceEditHint": "请将不可逾越的约束写在此处。系统将自动提醒叙述者。此处只有用户可以修改。",
+		"outlineFenceHint": "本会话的行为边界在大纲里：会话空间的「行为边界」页。这里只显示插件写入的 SOP，只读。",
+		"outlineFenceOpen": "在大纲里打开",
+		"outlineFenceSwitchedOff": "大纲暂时关闭。本会话大纲「行为边界」页上的规则仍然生效，会随这个文件一起交给 Agent。不要把它们抄到这里，否则大纲重新开启时会再导入那一页一次。",
 		"fenceIntervalLabel": "定期注入间隔",
 		"fenceIntervalOn": "每 {{count}} 次工具调用注入一次行为护栏（护栏为空时不注入）",
 		"fenceIntervalOff": "已关闭定期注入（-1）",

@@ -214,7 +214,16 @@ export interface ReconcileEpochInput {
 	registryRevision?: string;
 	model: string;
 	provider: string;
-	prompt?: { contract: string; parts: readonly PromptPart[]; compactMessageId?: string | null };
+	prompt?: {
+		contract: string;
+		parts: readonly PromptPart[];
+		compactMessageId?: string | null;
+		/**
+		 * Parts the builder could not read this time: within an epoch they keep their previous
+		 * value (no update); a new baseline goes without them until they can be read.
+		 */
+		keepParts?: readonly string[];
+	};
 	refreshTools?: () => Promise<PrefixToolInput>;
 	signal?: AbortSignal;
 	noticeText: (kind: "tool_loaded" | "tool_unloaded", toolName: string) => string;
@@ -267,10 +276,17 @@ function currentPromptParts(
 				]
 			: []),
 	].join("\n");
+	const given = (input.prompt?.parts ?? []).filter(
+		(part) => part.key !== "senders" && part.key !== "tools.availability",
+	);
+	const kept: PromptPart[] = [];
+	for (const key of input.prompt?.keepParts ?? []) {
+		const text = previous?.get(key);
+		if (text !== undefined && !given.some((part) => part.key === key)) kept.push({ key, text });
+	}
 	return [
-		...(input.prompt?.parts ?? []).filter(
-			(part) => part.key !== "senders" && part.key !== "tools.availability",
-		),
+		...given,
+		...kept,
 		{ key: "tools.availability", text: availability },
 		{ key: "senders", text: collectSenderContext(messages, previous?.get("senders")) },
 	];

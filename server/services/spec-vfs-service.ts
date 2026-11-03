@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { specFileRevisions, specNamespaceFiles, type specNamespaces } from "../db/schema";
+import { specFileRevisions, specNamespaceFiles, specNamespaces } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -94,6 +94,13 @@ export interface SpecWriteOptions {
 	 * `"user"` (UI route) is subject to `uiEditable`.
 	 */
 	actor?: SpecWriteActor;
+	/**
+	 * The write is the plugin-SOP channel of `spec://behavior_fence`: a plugin's SOP command, or an
+	 * outline session's import leaving only that SOP in the fence. In a session whose tasks live
+	 * in the outline this is the only write the old fence still takes (its behavior boundary is
+	 * the outline page; outline plan PR 4). Ignored for other paths.
+	 */
+	pluginSop?: boolean;
 }
 
 /**
@@ -104,7 +111,14 @@ export interface SpecWriteOptions {
  * narrator's queue is on the agent side of that line. A plugin therefore writes as
  * `"agent"` — it does not get the user's ability to mint protected tasks for free.
  */
-export type SpecWriteActor = "agent" | "user";
+export type SpecWriteActor =
+	| "agent"
+	| "user"
+	/**
+	 * The system itself, on a path of its own (an outline session's import leaving only the plugin
+	 * SOP in its fence): subject to neither axis, and reported as such on `spec:changed`.
+	 */
+	| "system";
 
 export interface SpecCandidateAnalysis {
 	path: string;
@@ -195,6 +209,28 @@ export async function readSpecFile(narratorId: string, uri: string): Promise<Spe
 	throw new Error(`Spec file not found: ${toSpecUri(path)}`);
 }
 
+/**
+ * A spec file's current content, read without creating anything: null when the narrator has no
+ * namespace (or the file was deleted), a built-in file's default when it was never written. For
+ * readers on a request path that must not write (an outline session's behavior view reading the
+ * plugin SOP of its old fence).
+ */
+export async function readSpecFileContentIfExists(
+	narratorId: string,
+	uri: string,
+): Promise<string | null> {
+	const path = normalizeSpecPath(uri);
+	const namespace = await db.query.specNamespaces.findFirst({
+		where: eq(specNamespaces.narratorId, narratorId),
+	});
+	if (!namespace) return null;
+	const current = await getCurrentFile(namespace.id, path);
+	if (current?.deleted) return null;
+	const revision = await getRevision(current?.revisionId);
+	if (revision) return revision.content;
+	return BUILTIN_FILES[path]?.content ?? null;
+}
+
 export async function analyzeSpecWriteCandidate(
 	narratorId: string,
 	uri: string,
@@ -214,8 +250,8 @@ export async function writeSpecFile(
 	options: SpecWriteOptions = {},
 ): Promise<SpecResolvedFile> {
 	const path = normalizeSpecPath(uri);
-	// An outline session has no Dynamic Spec to write to (its fence excepted).
-	await assertSpecWritable(narratorId, path);
+	// An outline session has no Dynamic Spec to write to (the fence's plugin-SOP channel excepted).
+	await assertSpecWritable(narratorId, path, { pluginSop: options.pluginSop === true });
 	const actor = options.actor ?? "agent";
 	const fenceMutationAllowed = path === "behavior_fence" && options.allowFenceMutation === true;
 	if (actor === "agent" && isAgentReadonly(path) && !fenceMutationAllowed) {
@@ -507,6 +543,7 @@ export const specVfsService = {
 	normalizeSpecPath,
 	ensureNamespace,
 	readSpecFile,
+	readSpecFileContentIfExists,
 	writeSpecFile,
 	deleteSpecFile,
 	listSpecFiles,

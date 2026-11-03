@@ -193,9 +193,10 @@ export type SideCarBody =
 			kind: "tasks";
 			variant: "current" | "emptyNever" | "emptyDone" | "tooMany";
 			/**
-			 * Where the tasks live, when not Dynamic Spec: `outline` digests are worded for the
-			 * outline (checkboxes, OutlineEdit, the person who set a task) on both projections.
-			 * Absent on every spec digest, so those render exactly as before.
+			 * Where the tasks live, when not Dynamic Spec: an outline session's interrupt note (and
+			 * the periodic digest outline sessions had before their built-in views, outline plan
+			 * PR 4) is headed in outline words for the reader. Its model text was written with the
+			 * row; no model template renders it. Absent on every spec digest.
 			 */
 			taskBackend?: "outline";
 			tasks?: SideCarTaskEntry[];
@@ -936,7 +937,6 @@ function renderTasksToText(
 	body: Extract<SideCarBody, { kind: "tasks" }>,
 	templates: SideCarModelTemplates,
 ): string {
-	if (body.taskBackend === "outline") return renderOutlineTasksToText(body, templates);
 	const lines: string[] = [];
 	switch (body.variant) {
 		case "current": {
@@ -968,47 +968,6 @@ function renderTasksToText(
 					threshold: body.threshold ?? 0,
 				}),
 				tpl(templates, "tasksTooManyReorganize"),
-			);
-			break;
-	}
-	return lines.join("\n");
-}
-
-/**
- * An outline task digest (`taskBackend: "outline"`): the same shape in outline words. Each task
- * carries its address (`key/sid`), which is what OutlineRead and OutlineEdit take; a task a
- * person set is marked, since the agent may not drop it on its own. There is no `tooMany`: tasks
- * are blocks, and how many there are is no reason to rewrite them.
- */
-function renderOutlineTasksToText(
-	body: Extract<SideCarBody, { kind: "tasks" }>,
-	templates: SideCarModelTemplates,
-): string {
-	const lines: string[] = [];
-	switch (body.variant) {
-		case "current":
-		case "tooMany": {
-			lines.push(tpl(templates, "outlineTasksCurrentHeading"));
-			for (const task of body.tasks ?? []) {
-				const ref = task.ref ? ` \`${task.ref}\`` : "";
-				const mark = task.protected ? tpl(templates, "outlineTaskHumanCreatedMark") : "";
-				const role = task.role === "blocked" ? "waiting" : task.role;
-				lines.push(`- ${role}:${ref} ${task.text}${mark}`);
-			}
-			lines.push(tpl(templates, "outlineTasksCurrentUpdateNote"));
-			break;
-		}
-		case "emptyNever":
-			lines.push(
-				tpl(templates, "outlineTasksEmptyHeading"),
-				tpl(templates, "outlineTasksEmptyNeverCreate"),
-				tpl(templates, "tasksEmptyNeverSkip"),
-			);
-			break;
-		case "emptyDone":
-			lines.push(
-				tpl(templates, "outlineTasksEmptyHeading"),
-				tpl(templates, "outlineTasksEmptyDoneNext"),
 			);
 			break;
 	}

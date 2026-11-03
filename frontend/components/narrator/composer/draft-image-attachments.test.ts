@@ -292,13 +292,16 @@ describe("switch-interrupted attachment snapshots", () => {
 	test("keeps at most eight snapshots, evicts oldest updates first and ignores reads for recency", async () => {
 		installIndexedDbFacade();
 		const file = new File(["draft"], "draft.log");
+		const replacement = new File(["updated"], "updated.log");
 		for (let index = 0; index < 8; index++) retainForTest("u", `n${index}`, [], [file]);
 		await loadDraftImageAttachments("u", "n1");
-		retainForTest("u", "n0", [], [file]);
+		retainForTest("u", "n0", [], [replacement]);
 		retainForTest("u", "n8", [], [file]);
 		expect((await loadDraftImageAttachments("u", "n1")).textFiles).toEqual([]);
 		for (const index of [0, 2, 3, 4, 5, 6, 7, 8]) {
-			expect((await loadDraftImageAttachments("u", `n${index}`)).textFiles[0]).toBe(file);
+			expect((await loadDraftImageAttachments("u", `n${index}`)).textFiles[0]).toBe(
+				index === 0 ? replacement : file,
+			);
 		}
 	});
 

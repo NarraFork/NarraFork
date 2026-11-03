@@ -167,6 +167,8 @@ import {
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
 	consumeQuestionAnswerModelReceipts,
+	decideOutlineTurnEndNote,
+	deliverOutlineTurnEndNote,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
@@ -182,6 +184,7 @@ import {
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
 	persistConversationIdIfUnchanged,
+	prepareOutlineRun,
 	rearmCutInSoftStopBeforeContinuing,
 	resolveRuntimeReasoningEffort,
 	resolveSessionDevices,
@@ -219,7 +222,7 @@ import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
-import { resolveTaskBackend, type TaskBackend } from "../task-source";
+import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
@@ -898,6 +901,9 @@ export async function runAgentLoopUnlocked(
 	let outlineLeases: OutlineLeaseKeeper | undefined;
 	try {
 		outlineLeases = keepOutlineTaskLeases(narratorId);
+		// An outline session moves its old fence text to its behavior page once, before its first
+		// prompt is built, and the turn-end note measures the run from here (outline plan PR 4).
+		await prepareOutlineRun(active);
 		while (active.alive && owner.isCurrent()) {
 			void outlineLeases.touch();
 			// The run's own cancellation reaches whichever turn controller is current.
@@ -1229,6 +1235,12 @@ export async function runAgentLoopUnlocked(
 					? false
 					: (active._relaxedPlanLive ??
 						resolveEffectiveRelaxedPlan(current.permissionMode, current.relaxedPlan));
+				// An outline session's built-in views (current tasks, behavior boundary) are parts of
+				// the prefix, compared on every request; a spec session adds none (plan PR 4).
+				const contextParts =
+					taskBackend === "outline"
+						? await (await taskSourceForNarrator(narratorId)).contextParts(locale)
+						: undefined;
 				const built = await buildSystemPrompt(
 					{
 						systemPrompt: currentOAuth
@@ -1251,6 +1263,7 @@ export async function runAgentLoopUnlocked(
 					active._planFilePath,
 					{
 						taskSection: taskSectionFor(taskBackend, current.type),
+						...(contextParts ? { contextParts } : {}),
 						workspaceContext: JSON.stringify(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
@@ -3331,6 +3344,13 @@ export async function runAgentLoopUnlocked(
 
 			// No buffered messages — now transition to idle/unread (triggers notifications)
 			if (!runState.hadError) {
+				// A long outline turn that left a task in progress without touching any task ends
+				// with one line for the next turn; it starts none (plan PR 4, Q4). Decided here,
+				// before the drain (its reads are awaited), and written only once this run has
+				// settled terminal below, so nothing awaited sits between the drain and the
+				// arbitration. The drain or a hold continuing the run drops it.
+				const turnEndNote = await decideOutlineTurnEndNote(active);
+
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
 				// This closes the window where status is already idle (visible to clients /
 				// route admission) while this loop is still running and about to pick up more
@@ -3348,8 +3368,10 @@ export async function runAgentLoopUnlocked(
 
 				// Drain awaited above: synchronously arbitrate takeover vs terminal now.
 				// A successful hold must park; once finalizing is claimed new holds fail.
+				let terminal = true;
 				if (run) {
 					if (getRunHold(narratorId) && !getRunHold(narratorId)?.released) {
+						terminal = false;
 						if ((await holdAtBoundary()) === "continue") continue;
 					} else run.finalizing = true;
 				} else {
@@ -3360,6 +3382,9 @@ export async function runAgentLoopUnlocked(
 						{ substatus: ["unread"] },
 					);
 				}
+				// Nothing continues this run any more: the note decided above is written (a plain
+				// row, before the finalizer runs). A run that parked on a hold leaves none.
+				if (turnEndNote && terminal) await deliverOutlineTurnEndNote(active, turnEndNote);
 				// The run finalizer commits its terminal before the public idle write.
 			}
 

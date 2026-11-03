@@ -1767,6 +1767,25 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				now: at(t0, 30),
 			});
 			expect(held.candidates.map((c) => c.blockId).sort()).toEqual([t2, shared].sort());
+			// Pages left out (a session's behavior page holds rules, not tasks) are left out by the
+			// scan itself, before its limit, so their checkboxes cannot use it up.
+			const pageOne = id(1);
+			expect(await ctx.store.listOpenTasks(session.id, 100)).toHaveLength(8);
+			const scanned = await ctx.store.listOpenTasks(session.id, 100, {
+				excludePageIds: [pageOne],
+			});
+			expect(scanned.map((b) => b.id).sort()).toEqual([t2, t7, t8, t9].sort());
+			const two = await ctx.store.listOpenTasks(session.id, 2, { excludePageIds: [pageOne] });
+			expect(two).toHaveLength(2);
+			expect(two.every((b) => b.pageId !== pageOne)).toBe(true);
+			const excluded = await findContinuationCandidates({
+				narratorId: narrator,
+				sessionSpaceId: session.id,
+				excludePageIds: [pageOne],
+				store: ctx.store,
+				now: at(t0, 30),
+			});
+			expect(excluded.candidates.map((c) => c.blockId)).toEqual([t2, t8, shared]);
 		},
 	},
 	{

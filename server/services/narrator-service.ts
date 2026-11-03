@@ -2547,6 +2547,9 @@ export const narratorService = {
 
 			await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
 			await applySpecForkCarryover(newNarrator.id, "card");
+			// An outline fork gets its parent's behavior page (outline plan PR 4); never rejects.
+			const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
+			await copyOutlineBehaviorPage(parentNarratorId, newNarrator.id);
 			return newNarrator;
 		});
 	},
@@ -3007,6 +3010,10 @@ export const narratorService = {
 					}
 				}
 			})();
+			// An outline fork gets its parent's behavior page before its first run can read it
+			// (outline plan PR 4): one bounded commit; never rejects.
+			const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
+			await copyOutlineBehaviorPage(parentNarratorId, id);
 			eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
 			broadcastToNarrator(parentNarratorId, {
 				type: "narrator_forked",
@@ -3150,6 +3157,8 @@ export const narratorService = {
 	getModelHistorySinceLastCompact:
 		narratorMessageQueries.getModelHistorySinceLastCompact.bind(narratorMessageQueries),
 	getLatestCompactSeq: narratorMessageQueries.getLatestCompactSeq.bind(narratorMessageQueries),
+	getLatestCompactCreatedAt:
+		narratorMessageQueries.getLatestCompactCreatedAt.bind(narratorMessageQueries),
 	getMessagesBefore: narratorMessageQueries.getMessagesBefore.bind(narratorMessageQueries),
 	getEarliestMessages: narratorMessageQueries.getEarliestMessages.bind(narratorMessageQueries),
 	_getPostCompactTopLevelRefs:

@@ -1165,6 +1165,41 @@ const USER_SYSTEM_CARD_TYPES = new Set([
 	"segment_compact",
 ]);
 
+/** The named context parts of an outline session's built-in views (outline plan PR 4). */
+const OUTLINE_VIEW_LABEL_KEYS: Readonly<Record<string, string>> = {
+	"outline.tasks": "contextViewOutlineTasks",
+	"outline.behavior": "contextViewOutlineBehavior",
+};
+
+/** How the host's `context_update` notice row starts (`narrator-epochs.ts`). */
+const CONTEXT_UPDATE_NOTICE = "Context updated: ";
+
+/**
+ * The line a host `context_update` row reads as when it updates an outline session's views:
+ * "Context updated: Current tasks / Behavior boundary" in the reader's language, other keys as
+ * they are. Null for any other row, which keeps the stored notice text. The stored row is not
+ * changed: its English text names the keys, and the change itself is in its snapshot.
+ */
+function outlineViewUpdateLine(
+	blocks: readonly AdapterContentBlock[],
+	ctx: AdapterContext,
+): string | null {
+	if (!blocks.some((block) => block.type === "context_update")) return null;
+	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
+	if (!notice.startsWith(CONTEXT_UPDATE_NOTICE)) return null;
+	const keys = notice
+		.slice(CONTEXT_UPDATE_NOTICE.length)
+		.split(",")
+		.map((key) => key.trim())
+		.filter(Boolean);
+	if (!keys.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
+	const names = keys.map((key) => {
+		const label = OUTLINE_VIEW_LABEL_KEYS[key];
+		return label ? sysLabel(ctx, label) : key;
+	});
+	return formatSysLabel(ctx, "contextViewsUpdated", { parts: names.join(" / ") });
+}
+
 /** True when a block type is a recognized system-card block (used to locate the
  * meaningful block within a system message, which may not be blocks[0]). */
 function isRecognizedSystemBlockType(type: string): boolean {
@@ -1965,7 +2000,19 @@ function adaptMessage(
 		// affordances the reader can use (branch names, a commit sha, badges).
 		const framed = adaptFramedSystemCard(sysBlock, idBase, blockIndex, msg, modelFacingText, ctx);
 		if (framed) return [...specs, framed];
-		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx, blockIndex));
+		// An update of an outline session's views reads in the reader's words, not as the stored
+		// English notice naming internal keys (the row itself is unchanged).
+		const viewUpdate = outlineViewUpdateLine(blocks, ctx);
+		specs.push(
+			adaptSystemBlock(
+				sysBlock.type,
+				viewUpdate === null ? sysBlock : { ...sysBlock, text: viewUpdate },
+				idBase,
+				msg,
+				ctx,
+				blockIndex,
+			),
+		);
 		return specs;
 	}
 
@@ -2337,6 +2384,11 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
+	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
+	// An update of an outline session's views (`context_update` row of `outline.*` parts).
+	contextViewsUpdated: "Context updated: {parts}",
+	contextViewOutlineTasks: "Current tasks",
+	contextViewOutlineBehavior: "Behavior boundary",
 	sidecarSourceTutorialLesson: "Tutorial lesson",
 	sidecarSourceTurnNudge: "Turn budget",
 	sidecarSourceBrokenCall: "Invalid tool call",
@@ -2448,6 +2500,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// An outline session's long turn that left a task in progress it never touched (plan PR 4).
+	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
