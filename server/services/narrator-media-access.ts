@@ -349,11 +349,12 @@ export function lastReferenceLookupStatsForTests(): LookupStats {
  * Each window first reads up to WINDOW ref keys with the stored size of what the
  * candidate test would read (`octet_length`, answered without loading the values), then
  * cuts the window at `windowBytes` so one candidate-test statement scans a bounded number
- * of bytes, block-format bodies counted twice because both copies are scanned. Only the
- * candidates are decoded and matched exactly in JS. The text test can only produce false
- * positives (stale `content_json` beside current block rows, the id inside unrelated
- * text), never false negatives, because upload ids need no JSON escaping and every place
- * a reference is read from is tested.
+ * of bytes. The column is read through `contentJsonSql`, so an envelope whose block rows
+ * are current is scanned from its rows only; one still waiting for its sync is scanned
+ * (and counted) in both. Only the candidates are decoded and matched exactly in JS. The
+ * text test can only produce false positives (stale block rows beside a pending column,
+ * the id inside unrelated text), never false negatives, because upload ids need no JSON
+ * escaping and every place a reference is read from is tested.
  */
 async function narratorReferencesUpload(
 	referencingNarratorId: string,
@@ -388,7 +389,7 @@ async function lookupReference(
 					refId: pg.narratorMessageRefs.id,
 					seq: pg.narratorMessageRefs.seq,
 					messageId: pg.narratorMessageRefs.messageId,
-					bytes: sql<number>`(coalesce(octet_length(${pg.narratorMessages.contentJson}), 0)
+					bytes: sql<number>`(coalesce(octet_length(${contentJsonSql(pg.narratorMessages)}), 0)
 						+ coalesce((SELECT sum(octet_length(t.output_json)) FROM narrator_tool_calls t
 							WHERE t.message_id = ${pg.narratorMessages.id}), 0))`.mapWith(Number),
 				})
@@ -420,7 +421,7 @@ async function lookupReference(
 				seq: narratorMessageRefs.seq,
 				messageId: narratorMessageRefs.messageId,
 				// Block rows hold the body of block-format envelopes and are scanned too.
-				bytes: sql<number>`(coalesce(octet_length(${narratorMessages.contentJson}), 0)
+				bytes: sql<number>`(coalesce(octet_length(${contentJsonSql()}), 0)
 					+ coalesce((SELECT sum(octet_length(b.payload)) FROM narrator_blocks b
 						WHERE b.message_id = ${narratorMessages.id}), 0)
 					+ coalesce((SELECT sum(octet_length(t.output_json)) FROM narrator_tool_calls t
@@ -455,7 +456,7 @@ async function lookupReference(
 					.where(
 						and(
 							inArray(pg.narratorMessages.id, ids),
-							sql`(strpos(${pg.narratorMessages.contentJson}, ${uploadId}) > 0
+							sql`(strpos(${contentJsonSql(pg.narratorMessages)}, ${uploadId}) > 0
 								OR EXISTS (SELECT 1 FROM narrator_tool_calls t
 									WHERE t.message_id = ${pg.narratorMessages.id}
 										AND strpos(t.output_json, ${uploadId}) > 0))`,
@@ -467,7 +468,7 @@ async function lookupReference(
 					.where(
 						and(
 							inArray(narratorMessages.id, ids),
-							sql`(instr(${narratorMessages.contentJson}, ${uploadId}) > 0
+							sql`(instr(${contentJsonSql()}, ${uploadId}) > 0
 								OR EXISTS (SELECT 1 FROM narrator_blocks b
 									WHERE b.message_id = ${narratorMessages.id} AND instr(b.payload, ${uploadId}) > 0)
 								OR EXISTS (SELECT 1 FROM narrator_tool_calls t

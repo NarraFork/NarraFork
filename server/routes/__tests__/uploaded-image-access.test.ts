@@ -688,7 +688,7 @@ describe("bounded reference lookup", () => {
 		expect(lastReferenceLookupStatsForTests().statements).toBe(1);
 	});
 
-	test("a block-format body counts both of its stored copies against the byte budget", async () => {
+	test("a block-format body whose rows are current is scanned and counted from its rows only", async () => {
 		const source = addNarrator(sourceOwner);
 		const context = addNarrator(forkOwner);
 		const image = await saveUploadedImage(source, png());
@@ -706,7 +706,10 @@ describe("bounded reference lookup", () => {
 		);
 		addRef(context, id, 0);
 		expect(await narratorReferencesImage(context, source, image.imageId)).toBe(true);
-		expect(lastReferenceLookupStatsForTests().largestStatementBytes).toBeGreaterThan(128 * 1024);
+		// The column beside current rows is not read as the body (`contentJsonSql`).
+		const { largestStatementBytes } = lastReferenceLookupStatsForTests();
+		expect(largestStatementBytes).toBeGreaterThan(64 * 1024);
+		expect(largestStatementBytes).toBeLessThan(96 * 1024);
 	});
 
 	test("waiting lookups are served round-robin across users", async () => {
