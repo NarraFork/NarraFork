@@ -44,6 +44,7 @@ import {
 	preserveExternalManagerFields,
 	readManagerOwnedFields,
 } from "../settings-manager-fields";
+import { loadSpeechSettings } from "../speech-settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
@@ -375,6 +376,8 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	const raw = text === undefined ? {} : JSON.parse(text);
 	lastSettingsText = text;
 	const merged = deepMerge(DEFAULTS, raw);
+	// Do not let the generic defaults merge conceal an invalid partial speech config.
+	merged.speech = loadSpeechSettings(raw.speech);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
 
@@ -931,6 +934,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	withSettingsFileLock(narraforkDir, () => {
+		newSettings.speech = loadSpeechSettings(newSettings.speech);
 		let disk: unknown = {};
 		if (existsSync(settingsPath)) {
 			try {
