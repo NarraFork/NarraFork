@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "e9207fee-25cc-414b-855c-6b14d6bbd674",
+  "id": "3d7609dd-490d-4966-9055-ee05676387ee",
   "prevId": "a74a0f62-3ce0-40fe-a150-dab92b01d6c6",
   "tables": {
     "acl_events": {
@@ -8437,6 +8437,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "media_json": {
+          "name": "media_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "command_text": {
           "name": "command_text",
           "type": "text",
@@ -12315,14 +12322,6 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'inherit'"
-        },
-        "task_backend": {
-          "name": "task_backend",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "'spec'"
         },
         "message_count": {
           "name": "message_count",

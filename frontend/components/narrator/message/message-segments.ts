@@ -64,7 +64,7 @@ export type RenderSegment =
 
 function isVisibleContentBlock(b: ContentBlock): boolean {
 	if (b.type === "text") return !!b.text?.trim();
-	if (b.type === "image") return true;
+	if (b.type === "image" || b.type === "audio" || b.type === "video") return true;
 	if (b.type === "text_file" || b.type === "file_reference") return true;
 	if (b.type === "web_search") return true;
 	if (b.type === "image_generation") return true;

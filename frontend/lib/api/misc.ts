@@ -42,6 +42,8 @@ import type {
 	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
 	OpencodeUsageCache,
+	PromptLibraryEntryData,
+	PromptLibraryInputData,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchRequest,
@@ -327,6 +329,37 @@ export const miscApi = {
 	deleteCustomSubagent: (name: string) =>
 		request<{ ok: boolean }>(`/custom-subagents/${encodeURIComponent(name)}`, {
 			method: "DELETE",
+		}),
+
+	// Prompt library
+	listPromptLibrary: () => request<PromptLibraryEntryData[]>("/prompt-library"),
+	getPromptLibraryEntry: (id: string) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`),
+	createPromptLibraryEntry: (data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>("/prompt-library", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updatePromptLibraryEntry: (id: string, data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
+	deletePromptLibraryEntry: (id: string) =>
+		request<{ ok: boolean }>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "DELETE",
+		}),
+	/**
+	 * One-line description for a prompt body, from the summary model.
+	 *
+	 * Stateless on purpose: the caller may be describing text it has not saved yet,
+	 * which is why the body carries `content` instead of an entry id.
+	 */
+	summarizePromptLibraryContent: (content: string, options?: { signal?: AbortSignal }) =>
+		request<{ summary: string }>("/prompt-library/summarize", {
+			method: "POST",
+			body: JSON.stringify({ content }),
+			signal: options?.signal,
 		}),
 
 	// OpenAI-compatible models
@@ -1035,6 +1068,40 @@ export const miscApi = {
 		request<{
 			candidates: Array<{ path: string; repoCount: number; conventional: boolean }>;
 		}>("/fs/project-dir/candidates"),
+	/**
+	 * The project instruction file (AGENTS.md & friends) for one directory.
+	 *
+	 * `filename` is the file to edit — an existing candidate, or the one a save would
+	 * create; `hash` is the optimistic lock for {@link saveProjectPrompt}.
+	 */
+	getProjectPrompt: (cwd: string) =>
+		request<{
+			cwd: string;
+			filename: string;
+			path: string;
+			exists: boolean;
+			content: string;
+			truncated: boolean;
+			totalBytes: number | null;
+			hash: string | null;
+			candidates: string[];
+		}>(`/fs/project-prompt?cwd=${encodeURIComponent(cwd)}`),
+	/**
+	 * Save the project instruction file.
+	 *
+	 * `baseHash` is the hash of the content that was loaded; the server refuses the save
+	 * with 409 STALE_WRITE when the file moved on, rather than overwriting an agent's edit.
+	 */
+	saveProjectPrompt: (input: {
+		cwd: string;
+		filename: string;
+		content: string;
+		baseHash?: string | null;
+	}) =>
+		request<{ ok: true; path: string; filename: string; hash: string }>("/fs/project-prompt", {
+			method: "PUT",
+			body: JSON.stringify(input),
+		}),
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",
@@ -1149,6 +1216,37 @@ export const miscApi = {
 			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
 		};
 	},
+
+	/**
+	 * Mint a short-lived ticket that lets the BROWSER download `path` itself.
+	 *
+	 * The alternative — `fsDownload` — fetches the bytes into a Blob, which copies the whole
+	 * file into page memory and cannot show progress. The caller opens a tab in the click
+	 * turn, then navigates it to the ticket URL (`navigateDownloadTab`).
+	 *
+	 * The path is validated server-side while the session is present, so a refused path, an
+	 * over-limit file or a vanished file still comes back here as a readable error the caller
+	 * can put in a notification. The ticket — not the path — is the credential, because the
+	 * URL ends up in history and proxy logs.
+	 */
+	fsDownloadTicket: (path: string) =>
+		request<{ ticket: string; expiresInMs: number }>("/fs/download-ticket", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
+
+	/**
+	 * Put a file on the clipboard of the machine running NarraFork.
+	 *
+	 * Not the browser's clipboard: a page cannot place an arbitrary file there, so the server
+	 * does it on its own desktop. Meaningful only from a browser on that machine — the server
+	 * refuses anyone else with 403.
+	 */
+	fsCopyFileToClipboard: (path: string) =>
+		request<{ ok: true }>("/fs/copy-file-to-clipboard", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
 
 	// Routines
 	getRoutines: () =>

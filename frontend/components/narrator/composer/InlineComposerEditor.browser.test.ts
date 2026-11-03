@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ComposerDocument } from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import type * as Fixture from "./InlineComposerEditor.browser-fixture";
@@ -49,7 +50,9 @@ const attached: ComposerDocument = {
 beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
 	const bundle = await Bun.build({
-		entrypoints: [new URL("./InlineComposerEditor.browser-fixture.tsx", import.meta.url).pathname],
+		entrypoints: [
+			fileURLToPath(new URL("./InlineComposerEditor.browser-fixture.tsx", import.meta.url)),
+		],
 		target: "browser",
 		format: "esm",
 		define: { "process.env.NODE_ENV": '"production"' },
@@ -95,7 +98,7 @@ afterAll(async () => {
 	} finally {
 		server?.stop(true);
 	}
-});
+}, 30_000);
 async function settle(page: Page) {
 	await page.evaluate(
 		() =>
@@ -111,6 +114,8 @@ async function open(query = "") {
 	pageErrors.set(page, errors);
 	page.on("pageerror", (error) => errors.push(String(error)));
 	await page.goto(server.url.origin + query);
+	await page.bringToFront();
+	await page.waitForFunction(() => document.hasFocus());
 	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
 	return page;
 }
@@ -127,6 +132,13 @@ async function load(page: Page, document: ComposerDocument) {
 }
 async function snapshot(page: Page) {
 	return page.evaluate(() => (window as unknown as FixtureWindow).fixture.snapshot());
+}
+async function focusedEditor(page: Page) {
+	// Tiptap focuses in a RAF; an updated model is not yet a native keyboard target.
+	await page.waitForFunction(
+		() =>
+			document.hasFocus() && document.activeElement === document.querySelector('[role="textbox"]'),
+	);
 }
 async function chord(page: Page, key: "z" | "Z" | "Enter", ...modifiers: ("Control" | "Shift")[]) {
 	for (const modifier of modifiers) await page.keyboard.down(modifier);
@@ -485,6 +497,18 @@ test("CSS fullscreen retains DOM identity, cursor and undo; quote button portal 
 		const frame = await iframe?.contentFrame();
 		if (!frame) throw new Error("Missing candidate frame");
 		await frame.waitForSelector("[data-quote-candidate]", { visible: true });
+		// frameCandidate creates a range in an inactive Document. Activate its window
+		// before the tested click, preserving that same source range as the precondition.
+		await frame.evaluate(() => {
+			const selection = window.getSelection();
+			if (!selection?.rangeCount) throw new Error("Missing frame source selection");
+			const range = selection.getRangeAt(0).cloneRange();
+			window.focus();
+			selection.removeAllRanges();
+			selection.addRange(range);
+		});
+		await frame.waitForFunction(() => document.hasFocus());
+		expect(await frame.evaluate(() => window.getSelection()?.toString())).toBe("Selected source");
 		await frame.click("[data-quote-candidate] button");
 		expect(await frame.evaluate(() => window.getSelection()?.toString())).toBe("Selected source");
 		expect((await snapshot(page)).accepted).toBe(1);
@@ -565,6 +589,61 @@ test("real File previews decode object URLs, revoke on removal/clear and regener
 	}
 }, 15_000);
 
+for (const kind of ["audio", "video"] as const) {
+	test(`${kind} chips preserve rich asset identity, preview, removal and undo`, async () => {
+		const page = await open();
+		try {
+			const asset = {
+				id: `${kind}-asset`,
+				kind,
+				name: `${kind}.mp4`,
+				size: 1024,
+				mimeType: `${kind}/mp4`,
+			};
+			const node = { type: "attachment", id: `${kind}-node`, assetId: asset.id } as const;
+			await load(page, empty);
+			await page.evaluate(
+				({ asset, node }) => {
+					const fixture = (window as unknown as FixtureWindow).fixture;
+					fixture.resources([[asset.id, `blob:${asset.id}`]]);
+					fixture.insert([node], [asset]);
+				},
+				{ asset, node },
+			);
+			await settle(page);
+			const inserted = (await snapshot(page)).document;
+			expect(inserted?.assets).toEqual([asset]);
+			expect(inserted?.paragraphs[0].children).toEqual([node]);
+			const chip = `[data-composer-asset-id="${asset.id}"]`;
+			expect(await page.$(`${chip}[data-missing]`)).toBeNull();
+			expect(
+				await page.$(`${chip} .tabler-icon-${kind === "audio" ? "music" : "movie"}`),
+			).not.toBeNull();
+			expect(await page.$(`${chip} img`)).toBeNull();
+			await page.click(`${chip} button[aria-label="${asset.name}"]`, { clickCount: 2 });
+			await settle(page);
+			expect((await snapshot(page)).opened).toBe(1);
+			await page.click(`${chip} button[aria-label="Remove attachment"]`);
+			await settle(page);
+			expect((await snapshot(page)).document?.assets).toEqual([]);
+			expect((await snapshot(page)).removed).toEqual([asset.id]);
+			await chord(page, "z", "Control");
+			await settle(page);
+			expect((await snapshot(page)).document).toEqual(inserted);
+			expect(await page.$(`${chip}[data-missing]`)).toBeNull();
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.disable(true));
+			await settle(page);
+			expect(
+				await page.$eval(
+					`${chip} button[aria-label="Remove attachment"]`,
+					(button) => (button as HTMLButtonElement).disabled,
+				),
+			).toBe(true);
+		} finally {
+			await close(page);
+		}
+	}, 15_000);
+}
 test("attachment removal and undo keep resource metadata; disabled editor rejects mutations", async () => {
 	const page = await open();
 	try {
@@ -661,6 +740,7 @@ test("arrow navigation permits typing between adjacent atoms and before first at
 		await load(page, doc);
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(0));
 		await settle(page);
+		await focusedEditor(page);
 		await page.keyboard.press("ArrowLeft");
 		await page.keyboard.press("ArrowLeft");
 		await page.keyboard.type("between");
@@ -668,6 +748,7 @@ test("arrow navigation permits typing between adjacent atoms and before first at
 		expect(
 			(await snapshot(page)).document?.paragraphs[0].children.map((node) => node.type),
 		).toEqual(["quote", "text", "quote"]);
+		await focusedEditor(page);
 		await page.keyboard.press("Home");
 		await page.keyboard.type("before");
 		await settle(page);

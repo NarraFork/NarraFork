@@ -17,6 +17,59 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func TestWindowsConditionalBOOLUsesLow32Bits(t *testing.T) {
+	// Match the upstream golang/go#81249 reproducer: only the low DWORD
+	// belongs to BOOL; the high DWORD can contain arbitrary register residue.
+	high := uint64(0xDEADBEEF) << 32
+	for _, tc := range []struct {
+		name    string
+		result  uintptr
+		lastErr error
+		want    error
+	}{
+		{"failure", 0, windows.ERROR_ALREADY_EXISTS, windows.ERROR_ALREADY_EXISTS},
+		{"failure_dirty_high_bits", uintptr(high), windows.ERROR_ALREADY_EXISTS, windows.ERROR_ALREADY_EXISTS},
+		{"failure_without_last_error", uintptr(high), windows.ERROR_SUCCESS, windows.ERROR_GEN_FAILURE},
+		{"failure_nil_last_error", 0, nil, windows.ERROR_GEN_FAILURE},
+		{"success_stale_last_error", 1, windows.ERROR_ACCESS_DENIED, nil},
+		{"success_dirty_high_bits", uintptr(high) | 1, windows.ERROR_ACCESS_DENIED, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := conditionalWindowsBOOLError(tc.result, tc.lastErr); !errors.Is(got, tc.want) {
+				t.Fatalf("BOOL result %#x, LastError %v: got %v, want %v", tc.result, tc.lastErr, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWindowsConditionalNewFileDirtyBOOLFailureIsConflict(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "new.txt")
+	tmp := filepath.Join(dir, "tmp.txt")
+	for path, content := range map[string]string{target: "external", tmp: "next"} {
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rename := conditionalRenameHandle
+	conditionalRenameHandle = func(*os.File, string) error {
+		// The native call failed without moving anything, but its undefined
+		// high register bits are nonzero. This must not become a false success.
+		high := uint64(0xDEADBEEF) << 32
+		return conditionalWindowsBOOLError(uintptr(high), windows.ERROR_ALREADY_EXISTS)
+	}
+	t.Cleanup(func() { conditionalRenameHandle = rename })
+	if err := commitConditionalReplacement(context.Background(), target, tmp, nil, nil, []byte("next")); !errors.Is(err, errConditionalMetadataChanged) {
+		t.Fatalf("failed no-replace rename must report conflict: %v", err)
+	}
+	for path, want := range map[string]string{target: "external", tmp: "next"} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Fatalf("failed rename changed %q: %q %v", path, got, err)
+		}
+	}
+}
+
 func windowsReplacementFixture(t *testing.T) (string, string, os.FileInfo, conditionalMetadata) {
 	t.Helper()
 	target := filepath.Join(t.TempDir(), "target.txt")
@@ -633,9 +686,64 @@ func TestWindowsConditionalNewFileNoOverwrite(t *testing.T) {
 	if err := commitConditionalReplacement(context.Background(), target, tmp, nil, nil, []byte("next")); !errors.Is(err, errConditionalMetadataChanged) {
 		t.Fatalf("new-file conflict: %v", err)
 	}
-	os.Remove(target)
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
 	if err := commitConditionalReplacement(context.Background(), target, tmp, nil, nil, []byte("next")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWindowsConditionalNewFilePathVerificationFailsClosed(t *testing.T) {
+	for _, replaced := range []bool{false, true} {
+		name := "missing"
+		if replaced {
+			name = "replaced"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			target := filepath.Join(dir, "new.txt")
+			tmp := filepath.Join(dir, "tmp.txt")
+			retained := filepath.Join(dir, "retained.txt")
+			if err := os.WriteFile(tmp, []byte("next"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			rename := conditionalRenameHandle
+			conditionalRenameHandle = func(f *os.File, destination string) error {
+				if err := rename(f, destination); err != nil {
+					return err
+				}
+				// Keep the verified replacement alive, but remove its path binding
+				// before the final check. Equal external bytes must not mask a new ID.
+				if err := rename(f, retained); err != nil {
+					return err
+				}
+				if replaced {
+					return os.WriteFile(destination, []byte("next"), 0600)
+				}
+				return nil
+			}
+			t.Cleanup(func() { conditionalRenameHandle = rename })
+			err := commitConditionalReplacement(context.Background(), target, tmp, nil, nil, []byte("next"))
+			if err == nil || !strings.Contains(err.Error(), "state uncertain") || errors.Is(err, errConditionalMetadataChanged) {
+				t.Fatalf("post-rename path change must fail closed, not become a retry-safe conflict: %v", err)
+			}
+			if replaced {
+				if !strings.Contains(err.Error(), "file identity mismatch") {
+					t.Fatalf("missing identity mismatch diagnostic: %v", err)
+				}
+				got, readErr := os.ReadFile(target)
+				if readErr != nil || string(got) != "next" {
+					t.Fatalf("external target changed: %q %v", got, readErr)
+				}
+			} else if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || !strings.Contains(err.Error(), "open identity path") {
+				t.Fatalf("missing underlying path-open diagnostic: %v", err)
+			}
+			got, readErr := os.ReadFile(retained)
+			if readErr != nil || string(got) != "next" {
+				t.Fatalf("verified replacement changed: %q %v", got, readErr)
+			}
+		})
 	}
 }
 

@@ -245,6 +245,88 @@ function isAlreadyExistsError(err: unknown): boolean {
 	return false;
 }
 
+// These checks apply only to the exact native-media and ModelTrace migration programs.
+// Generic historical duplicate-DDL handling must retain its existing behavior.
+function nativeUpgradeKind(sql: string[]): "media" | "modeltrace" | null {
+	const program = sql.map((s) => s.trim().replace(/\s+/g, " ").toLowerCase()).filter(Boolean);
+	const media = [
+		"pragma foreign_keys=off;",
+		"alter table `narrator_buffered_messages` add `media_json` text;",
+		"pragma foreign_keys=on;",
+	];
+	const modeltrace = [
+		"pragma foreign_keys=off;",
+		"alter table `narrators` add `hidden_from_lists` integer default false not null;",
+		"alter table `narrators` add `modeltrace_key` text;",
+		"create unique index `idx_narrators_modeltrace_key` on `narrators` (`modeltrace_key`);",
+		"pragma foreign_keys=on;",
+	];
+	const matches = (expected: string[]) =>
+		program.length === expected.length && program.every((s, i) => s === expected[i]);
+	return matches(media) ? "media" : matches(modeltrace) ? "modeltrace" : null;
+}
+
+function assertNativeUpgradeInstalled(sqlite: Database, kind: "media" | "modeltrace"): void {
+	const table = kind === "media" ? "narrator_buffered_messages" : "narrators";
+	const columns = sqlite.query(`PRAGMA table_xinfo('${table}')`).all() as Array<{
+		name: string;
+		type: string;
+		notnull: number;
+		dflt_value: string | null;
+		pk: number;
+		hidden: number;
+	}>;
+	const columnMatches = (name: string, type: string, notNull: number, defaults: string[]) => {
+		const c = columns.find((column) => rebuildIdentifierKey(column.name) === name);
+		return (
+			c &&
+			c.type.toLowerCase() === type &&
+			c.notnull === notNull &&
+			c.pk === 0 &&
+			c.hidden === 0 &&
+			(defaults.length === 0
+				? c.dflt_value === null
+				: c.dflt_value !== null &&
+					defaults.includes(c.dflt_value.toLowerCase().replace(/[()\s]/g, "")))
+		);
+	};
+	let valid =
+		kind === "media"
+			? columnMatches("media_json", "text", 0, [])
+			: columnMatches("hidden_from_lists", "integer", 1, ["false", "0"]) &&
+				columnMatches("modeltrace_key", "text", 0, []);
+	if (kind === "modeltrace") {
+		const indexes = sqlite.query("PRAGMA index_list('narrators')").all() as Array<{
+			name: string;
+			unique: number;
+			partial: number;
+			origin: string;
+		}>;
+		const index = indexes.find(
+			(item) => rebuildIdentifierKey(item.name) === "idx_narrators_modeltrace_key",
+		);
+		const keys = sqlite.query("PRAGMA index_xinfo('idx_narrators_modeltrace_key')").all() as Array<{
+			name: string | null;
+			key: number;
+			desc: number;
+			coll: string;
+		}>;
+		const indexed = keys.filter((key) => key.key === 1);
+		valid =
+			valid &&
+			!!index &&
+			index.unique === 1 &&
+			index.partial === 0 &&
+			index.origin === "c" &&
+			indexed.length === 1 &&
+			indexed[0].name !== null &&
+			rebuildIdentifierKey(indexed[0].name) === "modeltrace_key" &&
+			indexed[0].desc === 0 &&
+			indexed[0].coll.toUpperCase() === "BINARY";
+	}
+	if (!valid) throw new Error(`Incompatible SQLite ${kind} migration schema`);
+}
+
 /** Whether a table with the given name currently exists. */
 function tableExists(sqlite: Database, name: string): boolean {
 	return (
@@ -965,7 +1047,14 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	const pending = migrations
 		.map((migration, index) => ({ migration, index }))
 		.filter(({ index }) => !applied[index]);
-	if (pending.length === 0) return;
+	// Recorded hashes do not prove that the corresponding live schema is still intact.
+	const recordedNativeKinds = new Set(
+		migrations.flatMap((migration, index) => {
+			const kind = applied[index] ? nativeUpgradeKind(migration.sql) : null;
+			return kind ? [kind] : [];
+		}),
+	);
+	if (pending.length === 0 && recordedNativeKinds.size === 0) return;
 
 	const foreignKeyState = sqlite.prepare("PRAGMA foreign_keys").get() as {
 		foreign_keys: number | bigint;
@@ -980,6 +1069,7 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	logger.info("Applying pending SQLite migrations", { pending: pending.length });
 	try {
 		const apply = sqlite.transaction(() => {
+			for (const kind of recordedNativeKinds) assertNativeUpgradeInstalled(sqlite, kind);
 			// Source-built databases can have a fully installed v1 contract but no matching
 			// journal hashes. Prove that exact supplied migration in this transaction before
 			// treating preceding destructive migrations as holes. No ledger row is pre-written.
@@ -1098,6 +1188,8 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					}
 				}
 
+				const nativeKind = nativeUpgradeKind(migration.sql);
+				if (nativeKind) assertNativeUpgradeInstalled(sqlite, nativeKind);
 				delete activeMigration.executionStatementIndex;
 				sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
 					recordedHash,

@@ -1,6 +1,11 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import {
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
@@ -98,7 +103,7 @@ import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/se
 import { escapeLikeNeedle } from "../lib/sql-like";
 import {
 	contentJsonHasImageBlocks,
-	deleteNarratorUploads,
+	getUploadsDir,
 	type ImageRef,
 	imageRefToContentBlock,
 	type PersistedUserImageBlock,
@@ -148,6 +153,7 @@ import { narratorStore } from "./narrator-store";
 import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
+import { removeUploadDirectoryWithoutMedia } from "./storage-service";
 import { defaultTaskBackendForNewSession } from "./task-source";
 import { readTaskBackend } from "./task-source/backend";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -279,18 +285,23 @@ function insertRefsBatched(
 	}
 }
 
-function annotateImageBlocksWithUploadOwner(contentJson: unknown, narratorId: string): unknown {
+function annotateUploadBlocksWithOwner(contentJson: unknown, narratorId: string): unknown {
 	if (!Array.isArray(contentJson)) return contentJson;
 
 	let changed = false;
 	const next = contentJson.map((block) => {
 		if (!block || typeof block !== "object") return block;
-		const candidate = block as { type?: unknown; imageId?: unknown; uploadNarratorId?: unknown };
-		if (
-			candidate.type !== "image" ||
-			typeof candidate.imageId !== "string" ||
-			typeof candidate.uploadNarratorId === "string"
-		) {
+		const candidate = block as {
+			type?: unknown;
+			imageId?: unknown;
+			mediaId?: unknown;
+			uploadNarratorId?: unknown;
+		};
+		const isUpload =
+			(candidate.type === "image" && typeof candidate.imageId === "string") ||
+			((candidate.type === "audio" || candidate.type === "video") &&
+				typeof candidate.mediaId === "string");
+		if (!isUpload || typeof candidate.uploadNarratorId === "string") {
 			return block;
 		}
 		changed = true;
@@ -2011,6 +2022,7 @@ export const narratorService = {
 		parentToolUseId: string,
 		options?: {
 			images?: ImageRef[];
+			media?: MediaRef[];
 			textFiles?: TextFileRef[];
 			fileReferences?: import("@shared/file-reference").FileReferenceSnapshot[];
 			composerDocument?: import("@shared/composer-document").ComposerDocument;
@@ -2032,6 +2044,7 @@ export const narratorService = {
 		const contentJson: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| MediaContentBlock
 			| SystemInjectionBlock
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 			| import("@shared/file-reference").FileReferenceSnapshot
@@ -2039,6 +2052,8 @@ export const narratorService = {
 		for (const image of options?.images ?? []) {
 			contentJson.push(imageRefToContentBlock(image));
 		}
+		for (const media of options?.media ?? [])
+			contentJson.push(mediaRefToContentBlock(media, narratorId));
 		for (const file of options?.textFiles ?? []) {
 			contentJson.push({
 				type: "text_file",
@@ -2062,8 +2077,11 @@ export const narratorService = {
 			);
 		}
 		const effectiveText =
-			(!text.trim() && (options?.images?.length ?? 0) > 0 ? "[user sent image(s)]" : text) +
-			buildAttachedFilesHint(options?.textFiles ?? []);
+			(!text.trim() && (options?.media?.length ?? 0) > 0
+				? "[user sent attachment(s)]"
+				: !text.trim() && (options?.images?.length ?? 0) > 0
+					? "[user sent image(s)]"
+					: text) + buildAttachedFilesHint(options?.textFiles ?? []);
 		const msg = await narratorPersistence.persistUserMessage(
 			narratorId,
 			effectiveText,
@@ -2216,7 +2234,13 @@ export const narratorService = {
 		// the delete below, and a dangling pointer would silently hide its history.
 		await materializeChildrenOf(narratorId);
 
-		const preserveUploads = await hasSharedOwnedImageMessages(narratorId);
+		// COW copies and Read tool outputs can refer to an upload without sharing its
+		// original message. Until media has a dedicated reference index, keep media
+		// directories conservatively rather than scan all message/tool JSON or erase
+		// another session's live bytes. Orphan reclamation belongs in a background job.
+		const preserveUploads =
+			existsSync(resolve(getUploadsDir(), narratorId, "media")) ||
+			(await hasSharedOwnedImageMessages(narratorId));
 
 		const bindingTransition = db.transaction((tx) => {
 			if (survivingForks.length)
@@ -2293,7 +2317,7 @@ export const narratorService = {
 			);
 
 			for (const row of sharedRows) {
-				const contentJson = annotateImageBlocksWithUploadOwner(row.contentJson, narratorId);
+				const contentJson = annotateUploadBlocksWithOwner(row.contentJson, narratorId);
 				writeEnvelopeBody(tx, row.id, contentJson, { set: { narratorId: row.newOwnerId } });
 				// Keep the shared card's exact historical tool rows, but do not transfer
 				// execution authority: a retained provenance clone is never resumable.
@@ -2366,11 +2390,11 @@ export const narratorService = {
 		});
 
 		if (preserveUploads) {
-			logger.info("Preserving narrator uploads because shared image messages still exist", {
+			logger.info("Preserving narrator uploads for shared images or retained media", {
 				narratorId,
 			});
 		} else {
-			await deleteNarratorUploads(narratorId);
+			await removeUploadDirectoryWithoutMedia(narratorId, false);
 		}
 
 		// Remove any pack extraction directories this narrator owned. The activation rows +

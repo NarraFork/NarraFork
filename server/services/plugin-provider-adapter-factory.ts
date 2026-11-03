@@ -240,6 +240,8 @@ function descriptorFor(entry: ProviderRegistryEntry): ProviderDescriptor {
 				? {}
 				: { reasoningContinuation: capabilities.reasoningContinuation }),
 			...(capabilities.inputImages === undefined ? {} : { inputImages: capabilities.inputImages }),
+			...(capabilities.inputAudio === undefined ? {} : { inputAudio: capabilities.inputAudio }),
+			...(capabilities.inputVideo === undefined ? {} : { inputVideo: capabilities.inputVideo }),
 			...(capabilities.mayLeakXmlToolCalls === undefined
 				? {}
 				: { mayLeakXmlToolCalls: capabilities.mayLeakXmlToolCalls }),

@@ -13,6 +13,7 @@
  */
 
 import { z } from "zod";
+import { PROJECT_PROMPT_FILENAMES } from "../global-prompt-paths";
 
 /**
  * Cap on the body of one human save, in UTF-16 code units of the JSON string.
@@ -75,3 +76,38 @@ export const fsWriteSchema = z.object({
 });
 
 export type FsWriteInput = z.infer<typeof fsWriteSchema>;
+
+/**
+ * One project instruction filename (`AGENTS.md` & friends).
+ *
+ * Constrained to the known filenames rather than accepting a path: the only thing
+ * this feature is allowed to touch is a file NarraFork itself injects into a system
+ * prompt, and accepting an arbitrary name would turn "edit the project prompt" into
+ * a general-purpose file write that skips the narrator-scoped boundary in
+ * `/api/fs/write`.
+ */
+const projectPromptFilenameSchema = z.enum(PROJECT_PROMPT_FILENAMES);
+
+/** `GET /api/fs/project-prompt?cwd=…` */
+export const projectPromptReadSchema = z.object({
+	cwd: z.string().trim().min(1, "cwd is required").max(4096),
+});
+
+/**
+ * `PUT /api/fs/project-prompt`.
+ *
+ * `baseHash` is the optimistic lock, with the same meaning as in `fsWriteSchema`:
+ * absent means "I believe this file does not exist yet". Required whenever the file
+ * IS on disk, because an agent may have rewritten it between the dialog opening and
+ * the user pressing create, and the alternative to a 409 is silently discarding
+ * that work.
+ */
+export const projectPromptWriteSchema = z.object({
+	cwd: z.string().trim().min(1, "cwd is required").max(4096),
+	filename: projectPromptFilenameSchema,
+	content: z.string().max(MAX_WRITE_CONTENT_LENGTH, "Content exceeds the maximum writable size"),
+	baseHash: z
+		.string()
+		.regex(/^[0-9a-f]{64}$/, "baseHash must be a lowercase hex sha256")
+		.nullish(),
+});

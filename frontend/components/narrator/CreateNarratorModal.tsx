@@ -52,6 +52,7 @@ import {
 	resolveStartInPlanModePrefill,
 	shouldSendStartInPlanMode,
 } from "./composer/create-narrator-plan-mode-prefill";
+import { ProjectPromptModal } from "./ProjectPromptModal";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
@@ -176,6 +177,7 @@ export function CreateNarratorModalBody({
 	// or deleted one would just fail the create.
 	const { usablePath, needsChoice } = useProjectDirStatus();
 	const defaultProjectDir = usablePath ?? "";
+	const [promptEditorOpen, setPromptEditorOpen] = useState(false);
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
@@ -426,6 +428,7 @@ export function CreateNarratorModalBody({
 		setBot(false);
 		setHandle("");
 		setSessionTitle("");
+		setPromptEditorOpen(false);
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
 	}, []);
 
@@ -558,6 +561,17 @@ export function CreateNarratorModalBody({
 		</>
 	);
 
+	const projectPromptSection = (
+		<Stack gap={6}>
+			<Button variant="light" disabled={!cwd.trim()} onClick={() => setPromptEditorOpen(true)}>
+				{t("projectPromptOpen")}
+			</Button>
+			<Text size="xs" c="dimmed">
+				{cwd.trim() ? t("projectPromptOpenHint") : t("projectPromptChooseDirectory")}
+			</Text>
+		</Stack>
+	);
+
 	const optionsSection = (
 		<>
 			<Select
@@ -677,6 +691,8 @@ export function CreateNarratorModalBody({
 					if (e.currentTarget.checked) setKnowledgeSteward(false);
 				}}
 			/>
+
+			{projectPromptSection}
 		</>
 	);
 
@@ -727,7 +743,7 @@ export function CreateNarratorModalBody({
 					{tc("cancel")}
 				</Button>
 				<Button
-					onClick={handleCreate}
+					onClick={() => void handleCreate()}
 					loading={createNarrator.isPending}
 					disabled={
 						directoryRequired ||
@@ -738,6 +754,9 @@ export function CreateNarratorModalBody({
 					{t("createNarrator")}
 				</Button>
 			</Group>
+			{promptEditorOpen && cwd.trim() ? (
+				<ProjectPromptModal cwd={cwd} onClose={() => setPromptEditorOpen(false)} />
+			) : null}
 		</>
 	);
 }

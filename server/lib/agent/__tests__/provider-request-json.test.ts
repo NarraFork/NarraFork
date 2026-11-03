@@ -7,6 +7,7 @@ import { GeminiProvider } from "../gemini-provider";
 import { buildAdapterHistory } from "../history-build";
 import { OpenAIProvider, withCodexNativeTools } from "../openai-provider";
 import type { DbMessage, ProviderAdapter } from "../provider";
+import { ApiRequestDumpCollector } from "../request-dump";
 import type { ResolvedToolDefinition } from "../types";
 
 const CONFIG = {
@@ -49,6 +50,7 @@ async function drain(
 	signal: AbortSignal,
 	model: string,
 	id: string,
+	requestDump?: ApiRequestDumpCollector,
 ) {
 	const { history } = await buildAdapterHistory(provider, ROWS, { provider: "test", model });
 	provider.injectSystemPrompt(history, "frozen baseline", model);
@@ -61,6 +63,7 @@ async function drain(
 		tools,
 		toolResults: [],
 		signal,
+		requestDump,
 		onInputCharacters: () => {},
 	})) {
 		/* mock ends the stream */
@@ -130,6 +133,7 @@ test("Responses strip-and-retry reuses the already serialized large tool fragmen
 	const requests: Array<Record<string, unknown>> = [];
 	let dispatched = false;
 	const provider = new OpenAIProvider({ ...CONFIG, apiMode: "responses" });
+	const dump = new ApiRequestDumpCollector();
 	const tools = [
 		{
 			type: "function",
@@ -165,6 +169,7 @@ test("Responses strip-and-retry reuses the already serialized large tool fragmen
 			toolResults: [],
 			signal: new AbortController().signal,
 			maxOutputTokens: 123,
+			requestDump: dump,
 		})) {
 			/* drain */
 		}
@@ -174,6 +179,7 @@ test("Responses strip-and-retry reuses the already serialized large tool fragmen
 	expect(requests).toHaveLength(2);
 	expect(requests[0].max_output_tokens).toBe(123);
 	expect(requests[1]).not.toHaveProperty("max_output_tokens");
+	expect(dump.lastRequestBody()).toEqual(requests[1]);
 	expect(requests[1].tools).toEqual(requests[0].tools);
 	expect(requests[1].input).toEqual(requests[0].input);
 	expect(requests[1].tools).toMatchObject([
@@ -232,6 +238,7 @@ test("large catalogs reach actual HTTP wire builders concurrently with live sign
 					controllers[i].signal,
 					model,
 					`caller-${i}`,
+					new ApiRequestDumpCollector(),
 				),
 			),
 		);

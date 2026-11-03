@@ -1,4 +1,10 @@
 import { notifications } from "@mantine/notifications";
+import {
+	MAX_MEDIA_ATTACHMENTS,
+	MAX_MEDIA_FILE_SIZE,
+	MEDIA_MIME_TO_EXT,
+	normalizeMediaFile,
+} from "@shared/media-attachments";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { unstable_batchedUpdates } from "react-dom";
@@ -21,6 +27,11 @@ export type AttachmentInsertionOrigin = "picker" | "paste" | "drop" | "direct";
 export interface UseComposerFileIngestOptions {
 	updateAttachedImages: React.Dispatch<React.SetStateAction<File[]>>;
 	updateAttachedTextFiles: React.Dispatch<React.SetStateAction<File[]>>;
+	updateAttachedMedia?: React.Dispatch<React.SetStateAction<File[]>>;
+	/** Editors must explicitly opt in or supply a media state owner before accepting media. */
+	acceptMedia?: boolean;
+	/** Current committed attachments, including edits outside this ingestion hook. */
+	attachedMediaRef?: React.RefObject<readonly File[]>;
 	setIsDragging: (dragging: boolean) => void;
 	dragCounterRef: React.RefObject<number>;
 	t: (key: string, options?: Record<string, unknown>) => string;
@@ -32,7 +43,7 @@ export interface UseComposerFileIngestOptions {
 	/** False rejects the batch; never fall back to the current editor selection. */
 	onAcceptedFiles?: (files: File[], bookmark?: AttachmentInsertionBookmark) => boolean;
 }
-type ClassifiedFile = { file: File; kind: "image" | "textFile" };
+type ClassifiedFile = { file: File; kind: "image" | "textFile" | "media" };
 type IngestBatch = {
 	generation: number;
 	files: ClassifiedFile[];
@@ -76,6 +87,28 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 	const ingestingRef = useRef(false);
 	const sending = !!options.sendingRef?.current;
 	const scopeRef = useRef({ narratorId: options.narratorId, generation: 0, sending });
+	// FIFO batches can commit before React renders their setters. Keep the accepted
+	// count until the externally owned array changes, then honor removals/restores.
+	const mediaCountRef = useRef({
+		narratorId: options.narratorId,
+		files: options.attachedMediaRef?.current,
+		count: options.attachedMediaRef?.current.length ?? 0,
+	});
+	const syncMediaCount = () => {
+		const current = optionsRef.current;
+		const files = current.attachedMediaRef?.current;
+		if (
+			mediaCountRef.current.narratorId !== current.narratorId ||
+			mediaCountRef.current.files !== files
+		) {
+			mediaCountRef.current = {
+				narratorId: current.narratorId,
+				files,
+				count: files?.length ?? 0,
+			};
+		}
+	};
+	syncMediaCount();
 	// Invalidate during render, before effects or an old promise can write to the new owner.
 	if (
 		scopeRef.current.narratorId !== options.narratorId ||
@@ -153,6 +186,25 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 		activeRef.current = batch;
 		const finish = (processed: ClassifiedFile[]) => {
 			let accepted = alive(batch) ? processed : [];
+			syncMediaCount();
+			const mediaCountBefore = mediaCountRef.current.count;
+			let mediaRoom = Math.max(0, MAX_MEDIA_ATTACHMENTS - mediaCountBefore);
+			const excess: string[] = [];
+			accepted = accepted.filter((item) => {
+				if (item.kind !== "media") return true;
+				if (mediaRoom > 0) {
+					mediaRoom--;
+					return true;
+				}
+				excess.push(item.file.name);
+				return false;
+			});
+			if (excess.length)
+				notifications.show({
+					title: optionsRef.current.t("mediaTooMany"),
+					message: excess.join(", "),
+					color: "yellow",
+				});
 			if (accepted.length && optionsRef.current.onAcceptedFiles) {
 				if (
 					!optionsRef.current.onAcceptedFiles(
@@ -166,7 +218,12 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 				const textFiles = accepted
 					.filter((item) => item.kind === "textFile")
 					.map((item) => item.file);
+				const media = accepted.filter((item) => item.kind === "media").map((item) => item.file);
 				unstable_batchedUpdates(() => {
+					if (media.length)
+						optionsRef.current.updateAttachedMedia?.((previous) =>
+							alive(batch) ? [...previous, ...media].slice(0, MAX_MEDIA_ATTACHMENTS) : previous,
+						);
 					if (images.length)
 						optionsRef.current.updateAttachedImages((previous) =>
 							alive(batch) ? [...previous, ...images] : previous,
@@ -177,6 +234,10 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 						);
 				});
 			}
+			mediaCountRef.current.count = Math.max(
+				mediaCountRef.current.count,
+				mediaCountBefore + accepted.filter((item) => item.kind === "media").length,
+			);
 			batch.bookmark?.cancel();
 			batch.resolve(accepted.map((item) => item.file));
 			activeRef.current = null;
@@ -234,27 +295,53 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 		}
 		const accepted: ClassifiedFile[] = [];
 		const unsupported: string[] = [];
-		for (const file of files) {
-			const kind =
-				only === "textFile"
-					? isTextFile(file.name)
-						? "textFile"
-						: null
-					: ACCEPTED_TYPES.includes(file.type)
-						? "image"
-						: only === "image"
-							? null
-							: isTextFile(file.name)
-								? "textFile"
-								: null;
+		for (const original of files) {
+			// Image-specific input must keep the original image classification path.
+			const file =
+				only === "image" || ACCEPTED_TYPES.includes(original.type)
+					? original
+					: normalizeMediaFile(original);
+			if (file !== original) inheritComposerFileOrder(file, original);
+			const mediaCandidate = file.type.startsWith("audio/") || file.type.startsWith("video/");
+			const kind: ClassifiedFile["kind"] | null = mediaCandidate
+				? (!only || only === "media") &&
+					Object.hasOwn(MEDIA_MIME_TO_EXT, file.type) &&
+					(optionsRef.current.acceptMedia ?? !!optionsRef.current.updateAttachedMedia) &&
+					(optionsRef.current.updateAttachedMedia || optionsRef.current.onAcceptedFiles)
+					? "media"
+					: null
+				: only === "media"
+					? null
+					: only === "textFile"
+						? isTextFile(file.name)
+							? "textFile"
+							: null
+						: ACCEPTED_TYPES.includes(file.type)
+							? "image"
+							: only === "image"
+								? null
+								: isTextFile(file.name)
+									? "textFile"
+									: null;
 			if (!kind) {
 				if (only !== "image") unsupported.push(file.name);
 				continue;
 			}
-			const max = kind === "image" ? MAX_IMAGE_SIZE : MAX_TEXT_FILE_SIZE;
-			if (file.size > max) {
+			const max =
+				kind === "media"
+					? MAX_MEDIA_FILE_SIZE
+					: kind === "image"
+						? MAX_IMAGE_SIZE
+						: MAX_TEXT_FILE_SIZE;
+			if (file.size > max || (kind === "media" && !file.size)) {
 				notifications.show({
-					title: optionsRef.current.t(kind === "image" ? "imageTooLarge" : "textFileTooLarge"),
+					title: optionsRef.current.t(
+						kind === "media"
+							? "mediaFileTooLarge"
+							: kind === "image"
+								? "imageTooLarge"
+								: "textFileTooLarge",
+					),
 					message: `${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)`,
 					color: "yellow",
 				});
@@ -297,7 +384,8 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 		(files: File[]) => ingestRef.current(files, "direct", "textFile"),
 		[],
 	);
-	// Legacy name, intentionally accepts both images and text files now.
+	const addMedia = useCallback((files: File[]) => ingestRef.current(files, "direct", "media"), []);
+	// Legacy name, intentionally accepts images, text files and native media.
 	const handleComposerPasteImages = useCallback(
 		(files: File[]) => ingestRef.current(files, "paste"),
 		[],
@@ -319,6 +407,7 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 		ingestFiles,
 		addImages,
 		addTextFiles,
+		addMedia,
 		isIngesting,
 		ingestingRef,
 		handleFileInputChange,

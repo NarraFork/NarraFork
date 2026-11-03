@@ -1,10 +1,11 @@
+import type { MediaRef } from "@shared/media-attachments";
 import type { ApiRequestDiagnostics } from "../../lib/agent/types";
 import type { ImageRef } from "../../lib/uploads";
 import type { ExecuteLoopResult } from "../narrator-executor";
 import { createRuntimeRecoveryState, type RuntimeRecoveryState } from "./transition";
 
 export type RuntimeInput =
-	| { kind: "current"; text: string; images?: ImageRef[] }
+	| { kind: "current"; text: string; images?: ImageRef[]; media?: MediaRef[] }
 	| { kind: "history-replay" }
 	| { kind: "tool-results-replay" }
 	| { kind: "inbox"; deliveryId: string; epoch: string }

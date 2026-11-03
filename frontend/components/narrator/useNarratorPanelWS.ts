@@ -9,7 +9,7 @@ import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
-import { useNarratorWS } from "../../hooks/useNarratorWS";
+import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
@@ -36,6 +36,7 @@ import type {
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
+import { createNarratorWarningHandler, nativeMediaFallbackNotice } from "./narrator-warning";
 import {
 	reconcilePendingPermissions,
 	upsertPendingPermissionMap,
@@ -1495,28 +1496,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					autoClose: 8000,
 				});
 			},
-			onNarratorWarning: (info) => {
-				// Localize via the structured diagnostics so a retry toast explains the
-				// actual cause instead of echoing the provider's raw English text.
-				const localizedWarning =
-					localizeNarratorError(info.message, t, undefined, info.diagnostics) ?? info.message;
-				if (info.retryCount != null && info.maxRetries != null && info.delayMs != null) {
-					const ri = {
-						message: localizedWarning,
-						retryCount: info.retryCount,
-						maxRetries: info.maxRetries,
-						retryAt: Date.now() + info.delayMs,
-					};
-					retryInfoRef.current = ri;
-					setRetryInfo(ri);
-				}
-				notifications.show({
-					title: t("narratorRetrying"),
-					message: localizedWarning,
-					color: "yellow",
-					autoClose: 10000,
-				});
-			},
+			onNarratorWarning: createNarratorWarningHandler({
+				t,
+				localizeWarning: (info) =>
+					localizeNarratorError(info.message, t, undefined, info.diagnostics) ?? info.message,
+				setRetryInfo: (info) => {
+					retryInfoRef.current = info;
+					setRetryInfo(info);
+				},
+				notify: (notice) => notifications.show({ ...notice }),
+			}),
 			onLeakedToolCall: (info) => {
 				if (info.phase === "stream_captured") return;
 				setLeakedToolEvent({
@@ -1558,10 +1547,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 			},
-			onSubagentWarning: (
-				subagentNarratorId: string,
-				info: { message: string; retryCount?: number; maxRetries?: number; delayMs?: number },
-			) => {
+			onSubagentWarning: (subagentNarratorId: string, info: NarratorWarningInfo) => {
+				const fallbackNotice = nativeMediaFallbackNotice(info, t);
+				if (fallbackNotice) {
+					notifications.show({ ...fallbackNotice });
+					return;
+				}
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
 				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
 					old
