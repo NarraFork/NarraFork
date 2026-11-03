@@ -419,19 +419,11 @@
 		},
 		{
 			"idx": 52,
-			"tag": "0052_outline_finished_tasks",
-			"id": "867e706a-c94c-4fcb-9bc7-42c3cb9a12ea",
+			"tag": "0052_outline_task_board",
+			"id": "81304305-168a-41ef-8fc3-187e57817aed",
 			"prevId": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
 			"version": "7",
-			"snapshotDigest": "784831795fe45949e96a096394e4132c815648f6cea4a7410140aea5283414de"
-		},
-		{
-			"idx": 53,
-			"tag": "0053_outline_active_tasks",
-			"id": "1801023f-020a-496f-9811-f04fddff6c0d",
-			"prevId": "867e706a-c94c-4fcb-9bc7-42c3cb9a12ea",
-			"version": "7",
-			"snapshotDigest": "fbac3b4a4f2cdf531cd4106148086fa42702d29150549b70d1d36388d1cbcd24"
+			"snapshotDigest": "6cddaa095cef72401c984bc6a9d1e9f693d00c3bf7d94f54cca5b450de989d18"
 		}
 	]
 }

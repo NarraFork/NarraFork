@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "8ed13333-c0a1-4c30-b550-ff12e3cc6e69",
+  "id": "733d53a7-7aa4-459e-b0f2-04ee1fd93bd4",
   "prevId": "b58ddeb0-149b-4b26-92a5-2183c3628441",
   "tables": {
     "acl_events": {
@@ -14624,6 +14624,14 @@
           ],
           "isUnique": false,
           "where": "json_extract(\"task_json\", '$.lock') IS NOT NULL AND \"deleted\" = 0"
+        },
+        "idx_outline_blocks_active_tasks": {
+          "name": "idx_outline_blocks_active_tasks",
+          "columns": [
+            "space_id"
+          ],
+          "isUnique": false,
+          "where": "\"deleted\" = 0 AND (json_extract(\"task_json\", '$.status') = 'doing' OR (json_extract(\"task_json\", '$.status') = 'todo' AND json_extract(\"task_json\", '$.lock') IS NOT NULL))"
         },
         "idx_outline_blocks_finished_tasks": {
           "name": "idx_outline_blocks_finished_tasks",
