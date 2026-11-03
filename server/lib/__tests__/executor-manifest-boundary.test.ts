@@ -6,6 +6,7 @@ import type { HelperSource } from "../../../shared/helper-distribution";
 import {
 	EXECUTOR_MANIFEST_FILENAME,
 	EXECUTOR_PLATFORMS,
+	type ExecutorPlatform,
 	executorPublishedFilename,
 } from "../../../shared/remote-executor";
 import { db } from "../../db";
@@ -13,12 +14,15 @@ import { remoteDevices } from "../../db/schema";
 import { deviceRoutes } from "../../routes/devices";
 import { buildAppErrorResponse } from "../app-error-response";
 import {
+	type ExecutorArtifactBinding,
 	freezeExecutorArtifact,
 	getExecutorManifest,
 	resetExecutorManifestCache,
 } from "../executor-binaries";
 import {
+	attachExecutorTicketScripts,
 	countLiveExecutorTickets,
+	issueExecutorGroupTicket,
 	issueExecutorTicket,
 	redeemExecutorTicket,
 	resetExecutorTickets,
@@ -155,7 +159,7 @@ function generate(id: string, signal: AbortSignal) {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
-				platform: "linux-amd64",
+				target: "unix",
 				mode: "user",
 				serverBaseUrl: "https://nf.example",
 				tokenDelivery: "prompt",
@@ -186,6 +190,228 @@ afterEach(async () => {
 		await db.delete(remoteDevices).where(inArray(remoteDevices.id, deviceIds.splice(0)));
 	rmSync(HELPER_BIN_DIR, { recursive: true, force: true });
 });
+async function groupBindings(kind: "github" | "update-server" = "github") {
+	const source = sourceA(kind);
+	selectSource(source);
+	offlineFixture(source);
+	const value = await getExecutorManifest();
+	if (!value) throw new Error("Missing fixture manifest");
+	return Object.fromEntries(
+		EXECUTOR_PLATFORMS.map((platform) => [platform, freezeExecutorArtifact(value, platform)]),
+	) as Record<ExecutorPlatform, ExecutorArtifactBinding>;
+}
+
+const LINUX_SCRIPT = { body: "linux body", filename: "linux.sh", shell: "sh" as const };
+const MAC_SCRIPT = { body: "mac body", filename: "mac.sh", shell: "sh" as const };
+
+describe("executor group ticket binding", () => {
+	test("serves only the correct published script and binary for each variant", async () => {
+		const bindings = await groupBindings();
+		const issued = issueExecutorGroupTicket("unix", {
+			"linux-amd64": bindings["linux-amd64"],
+			"darwin-arm64": bindings["darwin-arm64"],
+		});
+		expect(issued).not.toHaveProperty("platform");
+		attachExecutorTicketScripts(issued.ticket, {
+			"linux-amd64": LINUX_SCRIPT,
+			"darwin-arm64": MAC_SCRIPT,
+		});
+		for (const [platform, script] of [
+			["linux-amd64", LINUX_SCRIPT],
+			["darwin-arm64", MAC_SCRIPT],
+		] as const) {
+			expect(redeemExecutorTicket(issued.ticket, platform, "script").script).toEqual(script);
+			expect(redeemExecutorTicket(issued.ticket, platform, "binary").artifact).toEqual(
+				bindings[platform],
+			);
+		}
+	});
+
+	test("cross-group and unpublished platforms reject without consuming shared retry budgets", async () => {
+		const bindings = await groupBindings();
+		const issued = issueExecutorGroupTicket(
+			"unix",
+			{
+				"linux-amd64": bindings["linux-amd64"],
+				"darwin-arm64": bindings["darwin-arm64"],
+			},
+			{ allowTokenDelivery: true },
+		);
+		attachExecutorTicketScripts(issued.ticket, {
+			"linux-amd64": LINUX_SCRIPT,
+			"darwin-arm64": MAC_SCRIPT,
+		});
+		for (let i = 0; i < 6; i++) {
+			for (const platform of ["windows-amd64", "linux-arm64"] as const) {
+				for (const purpose of ["script", "binary", "token"] as const) {
+					expect(redeemExecutorTicket(issued.ticket, platform, purpose).reason).toBe(
+						"platform_mismatch",
+					);
+				}
+			}
+		}
+		for (const purpose of ["script", "binary"] as const) {
+			for (let i = 0; i < 5; i++) {
+				const platform = i % 2 ? "linux-amd64" : "darwin-arm64";
+				expect(redeemExecutorTicket(issued.ticket, platform, purpose).ok).toBe(true);
+			}
+			for (const platform of ["linux-amd64", "darwin-arm64"] as const) {
+				expect(redeemExecutorTicket(issued.ticket, platform, purpose).reason).toBe(
+					"purpose_exhausted",
+				);
+			}
+		}
+		expect(redeemExecutorTicket(issued.ticket, "darwin-arm64", "token").ok).toBe(true);
+		for (const platform of ["linux-amd64", "darwin-arm64"] as const) {
+			for (const purpose of ["script", "binary", "token"] as const) {
+				expect(redeemExecutorTicket(issued.ticket, platform, purpose).reason).toBe("already_used");
+			}
+		}
+	});
+
+	test("windows variants share one credential and cannot attach cross-group scripts", async () => {
+		const bindings = await groupBindings();
+		const issued = issueExecutorGroupTicket(
+			"windows",
+			{
+				"windows-amd64": bindings["windows-amd64"],
+				"windows-arm64": bindings["windows-arm64"],
+			},
+			{ allowTokenDelivery: true },
+		);
+		const script = { body: "windows", filename: "install.ps1", shell: "powershell" as const };
+		expect(() =>
+			attachExecutorTicketScripts(issued.ticket, {
+				"windows-amd64": script,
+				"linux-amd64": LINUX_SCRIPT,
+			}),
+		).toThrow("platform mismatch");
+		expect(redeemExecutorTicket(issued.ticket, "windows-amd64", "script").reason).toBe(
+			"purpose_not_allowed",
+		);
+		attachExecutorTicketScripts(issued.ticket, {
+			"windows-amd64": script,
+			"windows-arm64": script,
+		});
+		expect(redeemExecutorTicket(issued.ticket, "windows-arm64", "script").script).toEqual(script);
+		expect(redeemExecutorTicket(issued.ticket, "windows-arm64", "token").ok).toBe(true);
+		expect(redeemExecutorTicket(issued.ticket, "windows-amd64", "token").reason).toBe(
+			"already_used",
+		);
+	});
+
+	test("copies and freezes artifacts, sources and scripts independent of input or current source", async () => {
+		const bindings = await groupBindings();
+		const binding = { ...bindings["linux-amd64"], source: { ...bindings["linux-amd64"].source } };
+		const expected = structuredClone(binding);
+		const script = { ...LINUX_SCRIPT };
+		const controller = new AbortController();
+		const issued = issueExecutorGroupTicket(
+			"unix",
+			{ "linux-amd64": binding },
+			{
+				signal: controller.signal,
+			},
+		);
+		controller.abort(new Error("issuance completed; redemption remains valid"));
+		attachExecutorTicketScripts(issued.ticket, { "linux-amd64": script });
+		binding.filename = "tampered";
+		binding.sha256 = "b".repeat(64);
+		if (binding.source.source === "github") binding.source.repository = "tampered/repo";
+		script.body = "tampered";
+		selectSource(sourceB("github"));
+		const result = redeemExecutorTicket(issued.ticket, "linux-amd64", "binary");
+		expect(result.artifact).toEqual(expected);
+		expect(Object.isFrozen(result.artifact)).toBe(true);
+		expect(Object.isFrozen(result.artifact?.source)).toBe(true);
+		const redeemedScript = redeemExecutorTicket(issued.ticket, "linux-amd64", "script").script;
+		expect(redeemedScript).toEqual(LINUX_SCRIPT);
+		if (redeemedScript) redeemedScript.body = "mutated response";
+		expect(redeemExecutorTicket(issued.ticket, "linux-amd64", "script").script).toEqual(
+			LINUX_SCRIPT,
+		);
+	});
+
+	test("rejects empty groups, cross-target and key/platform mismatch before ticket registration", async () => {
+		const bindings = await groupBindings();
+		expect(() => issueExecutorGroupTicket("unix", {})).toThrow("requires published artifacts");
+		expect(() =>
+			issueExecutorGroupTicket("unix", { "windows-amd64": bindings["windows-amd64"] }),
+		).toThrow("platform mismatch");
+		expect(() =>
+			issueExecutorGroupTicket("windows", { "linux-amd64": bindings["linux-amd64"] }),
+		).toThrow("platform mismatch");
+		expect(() =>
+			issueExecutorGroupTicket("unix", { "linux-amd64": bindings["linux-arm64"] }),
+		).toThrow("platform mismatch");
+		expect(countLiveExecutorTickets()).toBe(0);
+	});
+
+	for (const field of ["version", "tag", "protocolVersion"] as const) {
+		test(`rejects mixed ${field} before ticket registration`, async () => {
+			const bindings = await groupBindings();
+			const second = { ...bindings["darwin-arm64"] };
+			if (field === "protocolVersion") second.protocolVersion += 1;
+			else second[field] += "-other";
+			expect(() =>
+				issueExecutorGroupTicket("unix", {
+					"linux-amd64": bindings["linux-amd64"],
+					"darwin-arm64": second,
+				}),
+			).toThrow("share source/version/tag/protocol");
+			expect(countLiveExecutorTickets()).toBe(0);
+		});
+	}
+
+	for (const kind of ["github", "update-server"] as const) {
+		for (const transition of ["source change", "cancel"] as const) {
+			test(`${kind}: ${transition} before group mint prevents issuance`, async () => {
+				const bindings = await groupBindings(kind);
+				const controller = new AbortController();
+				if (transition === "source change") selectSource(sourceB(kind));
+				else controller.abort(new Error("group canceled"));
+				expect(() =>
+					issueExecutorGroupTicket(
+						"unix",
+						{
+							"linux-amd64": bindings["linux-amd64"],
+							"darwin-arm64": bindings["darwin-arm64"],
+						},
+						{ signal: controller.signal },
+					),
+				).toThrow();
+				expect(countLiveExecutorTickets()).toBe(0);
+			});
+		}
+	}
+
+	for (const transition of ["source change", "cancel"] as const) {
+		test(`${transition} while copying a later variant prevents partial registration`, async () => {
+			const bindings = await groupBindings();
+			const controller = new AbortController();
+			const second = {
+				...bindings["darwin-arm64"],
+				get filename() {
+					if (transition === "source change") selectSource(sourceB("github"));
+					else controller.abort(new Error("group canceled during copy"));
+					return bindings["darwin-arm64"].filename;
+				},
+			};
+			expect(() =>
+				issueExecutorGroupTicket(
+					"unix",
+					{
+						"linux-amd64": bindings["linux-amd64"],
+						"darwin-arm64": second,
+					},
+					{ signal: controller.signal },
+				),
+			).toThrow();
+			expect(countLiveExecutorTickets()).toBe(0);
+		});
+	}
+});
+
 describe("executor manifest completion and new-ticket boundaries", () => {
 	for (const kind of ["github", "update-server"] as const) {
 		for (const transition of ["source change", "cancel"] as const) {

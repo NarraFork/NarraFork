@@ -479,7 +479,7 @@
 	"executorInstallIntro": "在「{{name}}」上执行命令，安装执行器 v{{version}}。",
 	"executorInstallAdvanced": "高级选项",
 	"executorInstallOs": "操作系统",
-	"executorInstallArchitecture": "架构",
+	"executorInstallAutoDetect": "安装脚本自动识别操作系统和 CPU 架构。",
 	"executorInstallServerUrlInvalid": "请填写目标机器能够访问的 HTTP(S) 地址。",
 	"executorInstallDeviceOnline": "设备已在线，但这不代表本次安装已完成。",
 	"executorInstallPreparing": "正在准备安装命令…",

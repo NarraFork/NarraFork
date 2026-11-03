@@ -3,7 +3,7 @@ import {
 	MAX_EXECUTOR_PATH_LENGTH,
 	MAX_EXECUTOR_PATH_RULES,
 } from "@shared/executor-path-rules";
-import { EXECUTOR_PLATFORMS } from "@shared/remote-executor";
+import { EXECUTOR_INSTALL_TARGETS } from "@shared/remote-executor";
 import { z } from "zod";
 import { isSecureDirectDeviceUrl } from "../device-url";
 
@@ -93,7 +93,7 @@ export const deviceBrowseQuerySchema = z.object({
  * characters that must never reach a generated shell script.
  */
 export const deviceInstallScriptSchema = z.object({
-	platform: z.enum(EXECUTOR_PLATFORMS),
+	target: z.enum(EXECUTOR_INSTALL_TARGETS),
 	mode: z.enum(["system", "user"]).default("system"),
 	disableShell: z.boolean().default(false),
 	/**
