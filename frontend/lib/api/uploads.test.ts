@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { ApiError, getToken, setToken } from "./client";
-import { api } from "./index";
+import { api, getUploadedImageUrl } from "./index";
 
 describe("upload APIs", () => {
 	const g = globalThis as typeof globalThis & {
@@ -97,5 +97,16 @@ describe("upload APIs", () => {
 			expect((err as Error).message).toBe("Notification sound exceeds the allowed size");
 			expect((err as ApiError).data?.code).toBe("UPLOAD_FAILED");
 		}
+	});
+
+	test("uploaded image URLs carry a reference context only for another owner's image", () => {
+		expect(getUploadedImageUrl("owner", "img")).toBe("/api/uploads/owner/img");
+		expect(getUploadedImageUrl("owner", "img", "owner")).toBe("/api/uploads/owner/img");
+		expect(getUploadedImageUrl("source", "img", "fork")).toBe(
+			"/api/uploads/source/img?referencingNarratorId=fork",
+		);
+		expect(getUploadedImageUrl("a/b", "c?d", "e&f")).toBe(
+			"/api/uploads/a%2Fb/c%3Fd?referencingNarratorId=e%26f",
+		);
 	});
 });

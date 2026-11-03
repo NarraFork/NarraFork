@@ -128,6 +128,7 @@ function QueuedAttachmentPreview({
 						imageId={image.imageId}
 						filename={image.filename}
 						uploadNarratorId={image.uploadNarratorId ?? narratorId}
+						contextNarratorId={narratorId}
 						size={24}
 					/>
 				</Box>

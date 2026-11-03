@@ -1,3 +1,4 @@
+import { toolOutputImages } from "@shared/agent-protocol/tool-output";
 import { isMediaContentBlock } from "@shared/media-attachments";
 import { and, eq, gt, inArray, or } from "drizzle-orm";
 import { db, postgresRuntime } from "../db";
@@ -8,49 +9,118 @@ import { contentJsonSql, fillBodies } from "./narrator-body-reads";
 const PAGE_SIZE = 16;
 const MAX_TOOLS_PER_PAGE = 64;
 
-function referencesMedia(
-	json: unknown,
-	owner: string,
-	mediaId: string,
-	fallbackOwner: string,
-	toolOutput = false,
-): boolean {
-	if (!json) return false;
+/**
+ * Whether one stored value references the upload being authorized. `fallbackOwner` is
+ * the row's own narrator: blocks written before `uploadNarratorId` existed belong to it.
+ */
+interface UploadReferenceMatcher {
+	content(blocks: unknown, fallbackOwner: string): boolean;
+	toolOutput(output: unknown, fallbackOwner: string): boolean;
+}
+
+function parseStored(json: unknown): unknown {
+	if (!json) return undefined;
 	try {
-		const value: unknown = typeof json === "string" ? JSON.parse(json) : json;
-		const blocks = toolOutput
-			? value && typeof value === "object" && "_media" in value
-				? value._media
-				: null
-			: value;
-		return (
-			Array.isArray(blocks) &&
-			blocks.some(
-				(block) =>
-					isMediaContentBlock(block) &&
-					block.mediaId === mediaId &&
-					(block.uploadNarratorId || fallbackOwner) === owner,
-			)
-		);
+		return typeof json === "string" ? JSON.parse(json) : json;
 	} catch {
-		return false;
+		return undefined;
 	}
+}
+
+function mediaMatcher(owner: string, mediaId: string): UploadReferenceMatcher {
+	const matches = (blocks: unknown, fallbackOwner: string) =>
+		Array.isArray(blocks) &&
+		blocks.some(
+			(block) =>
+				isMediaContentBlock(block) &&
+				block.mediaId === mediaId &&
+				(block.uploadNarratorId || fallbackOwner) === owner,
+		);
+	return {
+		content: matches,
+		toolOutput: (output, fallbackOwner) =>
+			matches(
+				output && typeof output === "object" && "_media" in output ? output._media : null,
+				fallbackOwner,
+			),
+	};
+}
+
+function imageMatcher(owner: string, imageId: string): UploadReferenceMatcher {
+	return {
+		// Persisted user-message image blocks (`imageRefToContentBlock`).
+		content: (blocks, fallbackOwner) =>
+			Array.isArray(blocks) &&
+			blocks.some((block) => {
+				if (!block || typeof block !== "object") return false;
+				const image = block as { type?: unknown; imageId?: unknown; uploadNarratorId?: unknown };
+				const uploader =
+					typeof image.uploadNarratorId === "string" && image.uploadNarratorId
+						? image.uploadNarratorId
+						: fallbackOwner;
+				return image.type === "image" && image.imageId === imageId && uploader === owner;
+			}),
+		// Images a tool returned (`_images`); stored refs always name their uploader.
+		toolOutput: (output) =>
+			toolOutputImages(output).some(
+				(image) =>
+					image.imageId === imageId &&
+					"uploadNarratorId" in image &&
+					image.uploadNarratorId === owner,
+			),
+	};
+}
+
+/**
+ * Prove an exact owner/id media reference in ONE already-authorized narrator's refs.
+ * See {@link narratorReferencesUpload} for what is and is not searched.
+ */
+export function narratorReferencesMedia(
+	referencingNarratorId: string,
+	uploadNarratorId: string,
+	mediaId: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	return narratorReferencesUpload(
+		referencingNarratorId,
+		mediaMatcher(uploadNarratorId, mediaId),
+		signal,
+	);
+}
+
+/**
+ * Prove an exact owner/id image reference in ONE already-authorized narrator's refs:
+ * a user-message image block or a tool output's `_images`. The image route uses it for
+ * a fork or COW copy whose reader cannot read the session the image was uploaded to.
+ */
+export function narratorReferencesImage(
+	referencingNarratorId: string,
+	uploadNarratorId: string,
+	imageId: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	return narratorReferencesUpload(
+		referencingNarratorId,
+		imageMatcher(uploadNarratorId, imageId),
+		signal,
+	);
 }
 
 /**
  * Prove an exact owner/id reference in ONE already-authorized narrator's refs.
  * COW copies need not retain the original message owner; tool calls are joined
  * by messageId, not narratorId, because forks can share another owner's message.
- * Never searches arbitrary narrators or treats knowledge of a media id as access.
+ * Never searches arbitrary narrators or treats knowledge of an upload id as access.
  *
- * No media-reference index exists yet. Keyset pages and cancellation allow the
- * lookup to yield between batches. A single large JSON value is still read and
- * parsed synchronously; eliminating that cost requires a streaming reader or index.
+ * No upload-reference index covers every message yet (`narrator_block_assets` skips
+ * legacy and queued envelopes and is keyed by id alone, not owner/id). Keyset pages and
+ * cancellation allow the lookup to yield between batches. A single large JSON value is
+ * still read and parsed synchronously; eliminating that cost requires a streaming
+ * reader or index.
  */
-export async function narratorReferencesMedia(
+async function narratorReferencesUpload(
 	referencingNarratorId: string,
-	uploadNarratorId: string,
-	mediaId: string,
+	matcher: UploadReferenceMatcher,
 	signal?: AbortSignal,
 ): Promise<boolean> {
 	let cursor: { seq: number; refId: string } | undefined;
@@ -188,7 +258,7 @@ export async function narratorReferencesMedia(
 		for (const row of rows) {
 			signal?.throwIfAborted();
 			if (
-				referencesMedia(row.contentJson, uploadNarratorId, mediaId, row.owner) &&
+				matcher.content(parseStored(row.contentJson), row.owner) &&
 				(await refStillExists(row.refId, row.id))
 			)
 				return true;
@@ -207,7 +277,7 @@ export async function narratorReferencesMedia(
 				const ref = rows.find((row) => row.id === call.messageId);
 				if (
 					ref &&
-					referencesMedia(call.output, uploadNarratorId, mediaId, call.owner, true) &&
+					matcher.toolOutput(parseStored(call.output), call.owner) &&
 					(await refStillExists(ref.refId, call.messageId))
 				)
 					return true;
