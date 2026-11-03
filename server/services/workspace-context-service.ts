@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, constants, realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import type { SwitchWorkingDirectoryRequest, WorkspaceContext } from "@shared/workspace-context";
+import {
+	type SwitchWorkingDirectoryRequest,
+	serializeWorkspaceContext,
+	type WorkspaceContext,
+} from "@shared/workspace-context";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects } from "../db/schema";
@@ -167,7 +171,11 @@ export async function cacheLocalWorkspaceContext(
 	>,
 	context: WorkspaceContext,
 ): Promise<boolean> {
-	if (JSON.stringify(context) === JSON.stringify(row.workspaceContext)) return true;
+	if (
+		row.workspaceContext &&
+		serializeWorkspaceContext(context) === serializeWorkspaceContext(row.workspaceContext)
+	)
+		return true;
 	const saved = await db
 		.update(narrators)
 		.set({ workspaceContext: context })

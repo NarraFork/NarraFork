@@ -6,6 +6,7 @@ import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@sha
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { serializeWorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
@@ -1178,7 +1179,7 @@ export async function runAgentLoopUnlocked(
 					// Legacy resumed plan paths cannot be reconstructed from the identity.
 					active._planFilePath,
 					{
-						workspaceContext: JSON.stringify(workspace),
+						workspaceContext: serializeWorkspaceContext(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
 							skillRoot: active._skillRoot ?? undefined,
