@@ -2780,7 +2780,8 @@
 		"none": "没有可导出的凭据。",
 		"archived": "已归档",
 		"kinds": {
-			"codex": "Codex"
+			"codex": "Codex",
+			"api-key": "API Key"
 		},
 		"passphrase": "口令",
 		"passphraseHint": "至少 {{min}} 个字符。导入时需要它，遗忘后无法找回。",

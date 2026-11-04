@@ -57,6 +57,7 @@ import {
 	getProviderBalanceGenerations,
 	syncProviderBalanceCache,
 } from "../lib/provider-balance-cache";
+import { getProviderKeyStore } from "../lib/provider-keys";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
@@ -1183,6 +1184,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
 	}
+	// A deleted provider takes all of its keys with it, not just the one settings showed.
+	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	const staleCustomApiQuotaIds = uniqueIds([
 		...removedCustomApiIds,
 		...getCustomApiProviderIdsWithQuotaIdentityChanges(

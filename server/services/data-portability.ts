@@ -34,6 +34,7 @@ import { AppError, catalogError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
+import { getProviderKeyStore } from "@server/lib/provider-keys";
 import { saveSettings, settings } from "@server/lib/settings";
 import type { NarraForkSettings } from "@server/lib/settings/types";
 import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
@@ -1488,7 +1489,10 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 						agent[key] = {};
 					}
 				}
+				const customIds = (settings.customApiProviders ?? []).map((provider) => provider.id);
 				saveSettings(next);
+				// Every key of the cleared providers, not only the first one settings held.
+				for (const id of customIds) getProviderKeyStore().removeProvider(id);
 				deleted.providers = removed;
 			}
 		});

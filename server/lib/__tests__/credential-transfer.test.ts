@@ -127,3 +127,58 @@ describe("codex credential transfer", () => {
 		});
 	});
 });
+
+describe("api key transfer", () => {
+	test("keys travel with their provider config and recreate it where it is missing", async () => {
+		const { KINDS } = await import("../credential-transfer/kinds");
+		const { getProviderKeyStore } = await import("../provider-keys");
+		const { saveSettings, settings } = await import("../settings");
+		const kind = KINDS.find((k) => k.kind === "api-key");
+		if (!kind) throw new Error("api-key kind missing");
+		const saved = structuredClone(settings.customApiProviders);
+		const store = getProviderKeyStore();
+		try {
+			saveSettings({
+				...settings,
+				customApiProviders: [
+					{
+						id: "kimiA",
+						name: "Kimi Code",
+						prefix: "kimi",
+						apiKey: "sk-kimi-first",
+						baseUrl: "https://api.kimi.com/coding/v1",
+						defaultModel: "kimi-for-coding",
+						protocol: "anthropic-messages",
+					},
+				],
+			});
+			store.add("kimiA", { apiKey: "sk-kimi-second", label: "backup" });
+			const exported = kind.export(undefined);
+			expect(exported.map((item) => item.label)).toEqual([
+				"Kimi Code · sk-k…irst",
+				"Kimi Code · backup",
+			]);
+			expect(JSON.stringify(exported)).not.toContain('"apiKey":"sk-kimi-first","baseUrl"');
+
+			// Same instance: both keys are already here.
+			const data = exported.map((item) => item.data);
+			expect(kind.match(data).map((m) => m?.existingId)).toEqual(["kimiA", expect.any(String)]);
+
+			// "Another device": the provider does not exist yet.
+			saveSettings({ ...settings, customApiProviders: [] });
+			store.removeProvider("kimiA");
+			expect(kind.match(data).map((m) => m?.existingId)).toEqual([undefined, undefined]);
+			expect(kind.import(data, () => "add")).toEqual({ added: 2, replaced: 0, skipped: 0 });
+			const recreated = settings.customApiProviders?.find((p) => p.id === "kimiA");
+			expect(recreated?.baseUrl).toBe("https://api.kimi.com/coding/v1");
+			expect(recreated?.apiKey).toBe("sk-kimi-first");
+			expect(store.list("kimiA").map((k) => [k.apiKey, k.label])).toEqual([
+				["sk-kimi-first", undefined],
+				["sk-kimi-second", "backup"],
+			]);
+		} finally {
+			saveSettings({ ...settings, customApiProviders: saved });
+			store.removeProvider("kimiA");
+		}
+	});
+});

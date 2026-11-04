@@ -182,8 +182,8 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 
 凭据走文件，不进数据库（2026-11-03 定）：凭据量小、读多写少，文件不依赖 SQLite / PostgreSQL 两套后端，也不碰主线程 SQLite 规则。
 
-- **凭据文件**：`codex-credentials.json`（已有），以及通用凭据池的 `providers/credentials.json`。每条凭据：id、serviceId、`ownerUserId`（空 = 团队）、标签、登录方式、秘密、状态、优先级、归档时间、网络身份、计费、隐私标志。额度快照只在内存与 `*-stats.json`，不写进凭据文件。
-- **服务配置**（名称、协议、baseUrl、高级项）仍留在 `settings.json`；其中的 API key 迁进凭据文件，`settings.json` 不再含秘密。
+- **凭据文件**：`codex-credentials.json`（已有），以及通用凭据池的 `provider-keys.json`。每条凭据：id、serviceId、`ownerUserId`（空 = 团队）、标签、登录方式、秘密、状态、优先级、归档时间、网络身份、计费、隐私标志。额度快照只在内存与 `*-stats.json`，不写进凭据文件。
+- **服务配置**（名称、协议、baseUrl、高级项）仍留在 `settings.json`。自定义 API 供应商的 Key 已迁进 `provider-keys.json`（`server/lib/provider-keys.ts`），磁盘上的 settings.json 不再写 `apiKey`；内存里 `apiKey` 是该供应商的第一个 Key（`settings/provider-keys-projection.ts`），所以读单个 Key 的旧代码不变，写这个字段就是改第一个 Key。迁移出来的 Key 沿用供应商 id，已记账的用量仍归到它名下。凭据文件读不了时什么都不迁，settings.json 照旧保存 Key。回退到此前的版本会读到空 Key，需要重新填写。NUG、TokenDance、搜索渠道等其余 Key 后续再迁。
 - **加密（默认开，可关）**：`server/lib/secret-store.ts` 用 AES-256-GCM 写信封 `{format:"narrafork.secret.v1", iv, tag, data}`，密钥在 `~/.narrafork/secret.key`（0600，首次写入时生成）。读取同时接受信封和明文 JSON，所以开关切换（`settings.secrets.encrypt`，设置 → 服务器与系统）只是把已登记的文件按新形式重写一遍，不会丢数据。
 - **它防什么**：凭据文件被单独拷走（备份、同步盘、误分享）。密钥和文件在同一目录，能读整个数据目录的人照样能解密；界面说明如实写出这一点。“不计入团队统计”同样是产品承诺，不是密码学保证。
 - **解不开就不写**：文件存在但解密失败（密钥丢失或被换）时，所属管理器只记错误、不加载、不保存，绝不用空列表覆盖唯一一份数据。`secret.key` 与凭据文件一样在 `fs-secret-paths` 拒读名单里。
@@ -191,7 +191,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
   - 导出单个、多个或全部凭据前，先过**二次核验**：账号密码 + 第二因素（验证器动态码、备用码或通行密钥），见 `server/services/step-up-service.ts`。没有登记任何第二因素的账号不能导出。核验成功得到 5 分钟内、仅本会话、仅“凭据导出”这一用途、只能用一次的授权；失败次数与登录 MFA 共用限流。
   - 导出文件用管理员现场设定的口令加密（scrypt N=2¹⁶ + AES-256-GCM，`server/lib/credential-transfer/bundle.ts`），与本机 `secret.key` 无关，所以能在任何拿到口令的实例上打开。文件只带登录、设置与网络身份，不带额度快照、失败计数等运行时状态；手动停用和封禁会随账号带走。
   - 导入先预览：按账号识别“新增 / 本机已有 / 本机不支持”，新增默认勾选，覆盖已有账号需要显式勾选；覆盖时保留本机的 id、优先级和统计。导入只需管理员身份和口令——它能做的事管理员本来就能手动做。
-  - 每类凭据以 `TransferKind` 接入（目前是 Codex；通用凭据池上线后加入）。OAuth 刷新令牌会轮换，两台实例同时使用同一账号会互相顶掉，界面在导出时提示。
+  - 每类凭据以 `TransferKind` 接入：Codex 账号，以及 API Key（随附所属供应商的非机密配置，目标实例没有该供应商时按原配置新建，前缀冲突时加序号）。OAuth 刷新令牌会轮换，两台实例同时使用同一账号会互相顶掉，界面在导出时提示。
 - API 只把凭据的公开投影交给前端，并且只给其所有者。管理员能看到团队凭据，看不到个人凭据的秘密。
 - 文件很小，原子写（临时文件 + rename）；变更后通过事件总线让路由快照失效。
 

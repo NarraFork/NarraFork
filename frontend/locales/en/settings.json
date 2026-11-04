@@ -2780,7 +2780,8 @@
 		"none": "There are no credentials to export.",
 		"archived": "Archived",
 		"kinds": {
-			"codex": "Codex"
+			"codex": "Codex",
+			"api-key": "API key"
 		},
 		"passphrase": "Passphrase",
 		"passphraseHint": "At least {{min}} characters. It is needed to import the file and cannot be recovered.",

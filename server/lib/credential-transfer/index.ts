@@ -6,56 +6,12 @@
  * of them already exist here and then adds or replaces them as the admin decides.
  * Exporting requires a step-up grant (password + second factor), checked by the route.
  */
-import { getCodexManager } from "../codex-manager";
 import { logger } from "../logger";
 import { type BundleItem, openBundle, sealBundle } from "./bundle";
+import { KINDS, type TransferableCredential } from "./kinds";
 
-export interface TransferableCredential {
-	kind: string;
-	id: string;
-	label: string;
-	archived?: boolean;
-}
+export type { TransferableCredential };
 
-type ImportDecision = "add" | "replace" | "skip";
-
-interface TransferKind {
-	kind: string;
-	list(): TransferableCredential[];
-	export(ids: readonly string[] | undefined): BundleItem[];
-	/** Aligned with `data`; null marks an item this instance cannot use. */
-	match(data: readonly unknown[]): Array<{ label: string; existingId?: string } | null>;
-	import(
-		data: readonly unknown[],
-		decide: (index: number, existingId: string | undefined) => ImportDecision,
-	): { added: number; replaced: number; skipped: number };
-}
-
-const codexKind: TransferKind = {
-	kind: "codex",
-	list: () => {
-		const snapshot = getCodexManager().snapshot();
-		return [...snapshot.entries, ...snapshot.archivedEntries].map((entry) => ({
-			kind: "codex",
-			id: entry.id,
-			label: entry.displayName ?? entry.email ?? entry.id,
-			...(entry.archivedAt ? { archived: true } : {}),
-		}));
-	},
-	export: (ids) =>
-		getCodexManager()
-			.exportForTransfer(ids)
-			.map((data) => ({
-				kind: "codex",
-				id: data.id,
-				label: data.displayName ?? data.email ?? data.id,
-				data,
-			})),
-	match: (data) => getCodexManager().matchForTransfer(data),
-	import: (data, decide) => getCodexManager().importFromTransfer(data, decide),
-};
-
-const KINDS: readonly TransferKind[] = [codexKind];
 const kindOf = (kind: string) => KINDS.find((k) => k.kind === kind);
 
 export function listTransferableCredentials(): TransferableCredential[] {

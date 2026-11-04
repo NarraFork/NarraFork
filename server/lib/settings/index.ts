@@ -36,6 +36,7 @@ import {
 	normalizeDefaultNarratorWriteAudience,
 } from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
+import { getProviderKeyStore } from "../provider-keys";
 import { normalizeSearchSettings } from "../search/settings";
 import { changeSecretEncryption, setSecretEncryption } from "../secret-store";
 import { withSettingsFileLock } from "../settings-file-lock";
@@ -48,6 +49,12 @@ import {
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
+import {
+	absorbProviderKeys,
+	hydrateProviderKeys,
+	syncProviderKeys,
+	withoutProviderKeys,
+} from "./provider-keys-projection";
 import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
 import { normalizeUpdateSourceSettings } from "./update-source";
@@ -583,6 +590,12 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (normalizeCustomApiProviderSettings(merged)) {
 		needsSave = true;
 	}
+	// Keys move to provider-keys.json, written in the form `secrets.encrypt` asks for. A hot
+	// reload leaves the switch to the change listener, which also rewrites existing files.
+	if (!_cache.current) setSecretEncryption(merged.secrets?.encrypt !== false);
+	if (absorbProviderKeys(merged)) {
+		needsSave = true;
+	}
 
 	// Overrides an older file kept inline move to the catalog's own file; startup and hot
 	// reload both pass through this.
@@ -923,6 +936,8 @@ export function migrateGlobalProxy(
 export function saveSettings(newSettings: NarraForkSettings): void {
 	stripObsoleteSettingsKeys(newSettings as unknown as Record<string, unknown>);
 	normalizeCustomApiProviderSettings(newSettings);
+	syncProviderKeys(newSettings);
+	hydrateProviderKeys(newSettings);
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
@@ -942,7 +957,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		preserveExternalManagerFields(newSettings, readManagerOwnedFields(disk), lastDiskManagerFields);
 		const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 		try {
-			const text = JSON.stringify(newSettings, null, 2);
+			const text = JSON.stringify(withoutProviderKeys(newSettings), null, 2);
 			writeFileSync(tempPath, text, { mode: 0o600 });
 			renameSync(tempPath, settingsPath);
 			lastSettingsText = text;
@@ -972,8 +987,9 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
 // Credential files follow `secrets.encrypt`; a change rewrites them in the new form.
-setSecretEncryption(settings.secrets?.encrypt !== false);
 settingsChangeListeners.add(() => changeSecretEncryption(settings.secrets?.encrypt !== false));
+// Keys added, removed or reordered outside settings (the key list UI) refresh the projection.
+getProviderKeyStore().onChange(() => hydrateProviderKeys(settings));
 // Bind settings to provider module so it can access the singleton
 _bindSettings(settings);
 bindModelCatalogSettings(settings, () => saveSettings(settings));
