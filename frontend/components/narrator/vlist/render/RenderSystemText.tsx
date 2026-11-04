@@ -17,6 +17,7 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
+import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import {
 	ActionIcon,
 	Badge,
@@ -28,8 +29,17 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
+import type {
+	TaskNoticeChip,
+	TaskNoticeData,
+	TaskNoticeRow,
+	TaskNoticeVariant,
+} from "@shared/pretext-layout/task-notice";
 import {
 	IconAlertTriangle,
+	IconChevronDown,
+	IconChevronRight,
+	IconClockPause,
 	IconDownload,
 	IconEraser,
 	IconFileSearch,
@@ -38,11 +48,13 @@ import {
 	IconLock,
 	IconNetwork,
 	IconPhotoOff,
+	IconPlayerPause,
 	IconRepeat,
 	IconRestore,
 	IconTrash,
+	IconUserEdit,
 } from "@tabler/icons-react";
-import { type ReactNode, useMemo } from "react";
+import { type MouseEvent, type ReactNode, useMemo } from "react";
 import {
 	BUTTON_COMPACT_XS,
 	CARD_PADDING,
@@ -50,10 +62,13 @@ import {
 	ICON_16,
 	ICON_MARGIN_TOP,
 	KIND_CHROME,
+	type MeasuredTaskNotice,
 	ORIGIN_HEADING_GAP,
 	STACK_GAP,
 	type SystemTextData,
 	type SystemTextKind,
+	TASK_NOTICE_ROW_GAP,
+	taskNoticeLineHeight,
 } from "../measure/measure-system-text";
 import type { MeasuredElement, PreparedCodeBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
@@ -155,6 +170,8 @@ interface RenderSystemTextProps {
 	/** origin_notice (interrupt_task_guard only): live dismiss handler. */
 	injectionGuardActions?: InjectionGuardActions;
 	headerAction?: ReactNode;
+	/** tasks_notice: fold / unfold the card (the generic per-key expansion). */
+	onToggle?: () => void;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -177,7 +194,20 @@ export function RenderSystemText({
 	errorActions,
 	injectionGuardActions,
 	headerAction,
+	onToggle,
 }: RenderSystemTextProps) {
+	// A task notice has no wrapping body: its lines are fixed, so it is drawn from its data and
+	// the measured line count alone.
+	if (kind === "tasks_notice") {
+		return (
+			<TaskNoticeCard
+				measured={measured as MeasuredTaskNotice}
+				data={data as unknown as TaskNoticeData & { timeLabel?: string }}
+				guardActions={injectionGuardActions}
+				onToggle={onToggle}
+			/>
+		);
+	}
 	const body = measured.blocks[0] as PreparedCodeBlock | undefined;
 	if (!body || body.kind !== "code") return null;
 	const height = measured.height;
@@ -731,3 +761,388 @@ function SpecCarryoverCard({
 // scroll. See render/RenderReviewCard.tsx.
 
 export const RENDER_SYSTEM_TEXT_CHROME = { CARD_PADDING, GROUP_GAP } as const;
+
+// ── tasks_notice: Stack(heading line + task lines when unfolded) ──────────────
+// Geometry mirrors measureTaskNotice: Paper p="xs", one heading line of
+// `taskNoticeLineHeight()`, then — unfolded — ORIGIN_HEADING_GAP and one line per
+// task with TASK_NOTICE_ROW_GAP between them. Every line is single and truncated
+// (the full title is the link's tooltip), so nothing here can wrap past the box.
+
+const TASK_NOTICE_ICON: Record<TaskNoticeVariant, typeof IconListCheck> = {
+	turnEnd: IconClockPause,
+	edited: IconUserEdit,
+	interrupt: IconPlayerPause,
+	view: IconListCheck,
+};
+
+/** The reader's xs text, at the transcript's live typography (measure uses the same line). */
+function noticeText(): { font: string; lineHeight: string } {
+	return {
+		font: typographyMetrics().font.xs,
+		lineHeight: `${typographyMetrics().line.xs}px`,
+	};
+}
+
+const NOWRAP_ELLIPSIS = {
+	whiteSpace: "nowrap",
+	overflow: "hidden",
+	textOverflow: "ellipsis",
+	minWidth: 0,
+} as const;
+
+/** A click on a link or a button inside the heading does its own thing, not the fold. */
+function fromControl(event: MouseEvent<HTMLElement>): boolean {
+	const target = event.target as HTMLElement | null;
+	return !!target?.closest?.("a,button");
+}
+
+/**
+ * Below this inner width (a phone) the folded line keeps only what names the task: the time label,
+ * the tail ("等 2 项", "还没勾成完成") and a lead beside a task ("2 个未完成：") are left out; the
+ * chevron and the chip say as much.
+ */
+const TASK_NOTICE_NARROW_WIDTH = 420;
+
+/**
+ * Width priorities, narrowest screens first (every line is one line, so none of this moves a
+ * height): a task's title keeps at least about six characters (`taskTitleMinWidth`); on the folded
+ * line the heading gives way before it (it shrinks eight times as fast, and never takes more than
+ * `HEADING_MAX_WIDTH`), and so do the lead and the tail; on a row, the note takes only the width
+ * the title leaves.
+ */
+const HEADING_MAX_WIDTH = "45%";
+
+/**
+ * The title's minimum width: six characters' worth, never more than half the line, and never more
+ * than its own text (a short title must not leave a gap after it). The text's width is estimated
+ * from its characters (CJK as 1em, a space as 0.3em, others as 0.6em): it only bounds a minimum,
+ * nothing measured.
+ */
+function taskTitleMinWidth(title: string): string {
+	let em = 0;
+	for (const char of title) {
+		const code = char.codePointAt(0) ?? 0;
+		em += code >= 0x2e80 ? 1 : char === " " ? 0.3 : 0.6;
+		if (em >= 6) break;
+	}
+	return `min(${Math.min(6, em).toFixed(1)}em, 50%)`;
+}
+
+function TaskNoticeCard({
+	measured,
+	data,
+	guardActions,
+	onToggle,
+}: {
+	measured: MeasuredTaskNotice;
+	data: TaskNoticeData & { timeLabel?: string };
+	guardActions?: InjectionGuardActions;
+	onToggle?: () => void;
+}) {
+	const line = taskNoticeLineHeight();
+	const expanded = measured.expanded === true;
+	const rows = expanded ? (data.rows ?? []).slice(0, measured.rowCount) : [];
+	const toggle = data.expandable === true && onToggle ? onToggle : undefined;
+	const Icon = TASK_NOTICE_ICON[data.variant] ?? IconListCheck;
+	// Height-neutral: the label and the tail sit in the one heading line either way.
+	const narrow = measured.contentWidth < TASK_NOTICE_NARROW_WIDTH;
+	const timeLabel = typeof data.timeLabel === "string" && !narrow ? data.timeLabel : "";
+	const Chevron = expanded ? IconChevronDown : IconChevronRight;
+	return (
+		<Paper
+			p="xs"
+			radius="sm"
+			data-task-notice={data.variant}
+			style={{
+				backgroundColor: SYSTEM_MESSAGE_BG,
+				height: measured.height,
+				boxSizing: "border-box",
+				overflow: "hidden",
+			}}
+		>
+			{/* The whole heading is a pointer shortcut for the chevron button at its end, which is
+			    the keyboard / assistive-technology control (it carries aria-expanded). */}
+			{/* biome-ignore lint/a11y/noStaticElementInteractions: the chevron button is the accessible control */}
+			{/* biome-ignore lint/a11y/useKeyWithClickEvents: the chevron button is the accessible control */}
+			<div
+				data-task-notice-head=""
+				onClick={
+					toggle
+						? (event: MouseEvent<HTMLDivElement>) => {
+								if (!fromControl(event)) toggle();
+							}
+						: undefined
+				}
+				style={{
+					display: "flex",
+					alignItems: "center",
+					gap: GROUP_GAP,
+					height: line,
+					minWidth: 0,
+					cursor: toggle ? "pointer" : undefined,
+				}}
+			>
+				<Icon
+					size={13}
+					stroke={1.6}
+					style={{ flexShrink: 0, color: "var(--mantine-color-dimmed)" }}
+				/>
+				<span
+					data-task-notice-title=""
+					style={{
+						...noticeText(),
+						...NOWRAP_ELLIPSIS,
+						fontWeight: 600,
+						color: "var(--mantine-color-dimmed)",
+						// Folded, the heading yields its width to the task; unfolded, it has the line.
+						flex: expanded ? "0 1 auto" : "0 8 auto",
+						maxWidth: expanded ? undefined : HEADING_MAX_WIDTH,
+					}}
+				>
+					{data.title}
+				</span>
+				<div
+					data-task-notice-summary=""
+					style={{
+						flex: "1 1 0",
+						minWidth: 0,
+						display: "flex",
+						alignItems: "center",
+						gap: GROUP_GAP,
+						overflow: "hidden",
+					}}
+				>
+					{expanded ? null : <TaskNoticeSummaryLine data={data} narrow={narrow} />}
+				</div>
+				{timeLabel ? (
+					<span
+						data-task-notice-time=""
+						style={{
+							...noticeText(),
+							whiteSpace: "nowrap",
+							flexShrink: 0,
+							color: "var(--mantine-color-dimmed)",
+						}}
+					>
+						{timeLabel}
+					</span>
+				) : null}
+				{guardActions ? (
+					<Tooltip label={guardActions.dismissLabel ?? ""} disabled={!guardActions.dismissLabel}>
+						<CloseButton
+							size="xs"
+							variant="subtle"
+							c="dimmed"
+							style={{ flexShrink: 0, height: line, minHeight: line }}
+							aria-label={guardActions.dismissLabel}
+							disabled={!guardActions.onDismiss || guardActions.dismissing === true}
+							onClick={(event) => {
+								event.stopPropagation();
+								guardActions.onDismiss?.();
+							}}
+						/>
+					</Tooltip>
+				) : null}
+				{toggle ? (
+					<ActionIcon
+						size="xs"
+						variant="subtle"
+						color="gray"
+						aria-expanded={expanded}
+						aria-label={data.title}
+						data-task-notice-toggle=""
+						style={{ flexShrink: 0, height: line, minHeight: line }}
+						onClick={(event) => {
+							event.stopPropagation();
+							toggle();
+						}}
+					>
+						<Chevron size={12} />
+					</ActionIcon>
+				) : null}
+			</div>
+			{rows.length > 0 ? (
+				<div
+					data-task-notice-rows=""
+					style={{
+						display: "flex",
+						flexDirection: "column",
+						gap: TASK_NOTICE_ROW_GAP,
+						marginTop: ORIGIN_HEADING_GAP,
+					}}
+				>
+					{rows.map((row, index) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: rows are a stable ordered list
+						<TaskNoticeRowView key={index} row={row} line={line} />
+					))}
+				</div>
+			) : null}
+		</Paper>
+	);
+}
+
+/**
+ * The folded line after the heading: a lead, the first task (its status as it is now, and its
+ * title), a tail. Where it changed from and what changed are the unfolded row's; the heading
+ * already names who changed it.
+ */
+function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow: boolean }) {
+	const { lead, row, tail } = data.summary ?? {};
+	const dim = {
+		...noticeText(),
+		...NOWRAP_ELLIPSIS,
+		flex: "0 4 auto",
+		color: "var(--mantine-color-dimmed)",
+	};
+	return (
+		<>
+			{/* On a phone a lead beside a task ("2 个未完成：") would only be cut to "2…": it is left
+			    out like the tail, the chevron opens the list. A lead that is the whole line stays. */}
+			{lead && !(narrow && row) ? (
+				<span style={dim} data-task-notice-lead="">
+					{lead}
+				</span>
+			) : null}
+			{row ? (
+				<>
+					{row.status ? <StatusChip chip={row.status} /> : null}
+					<TaskNoticeTitle row={row} />
+				</>
+			) : null}
+			{tail && !narrow ? (
+				// Kept readable beside a long title: the title is truncated first.
+				<span style={{ ...dim, minWidth: "3em" }} data-task-notice-tail="">
+					{tail}
+				</span>
+			) : null}
+		</>
+	);
+}
+
+function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) {
+	if (row.dim) {
+		return (
+			<div
+				data-task-notice-row="more"
+				style={{
+					...noticeText(),
+					...NOWRAP_ELLIPSIS,
+					height: line,
+					display: "flex",
+					alignItems: "center",
+					color: "var(--mantine-color-dimmed)",
+				}}
+			>
+				{row.title}
+			</div>
+		);
+	}
+	return (
+		<div
+			data-task-notice-row=""
+			style={{
+				display: "flex",
+				alignItems: "center",
+				gap: GROUP_GAP,
+				height: line,
+				minWidth: 0,
+				overflow: "hidden",
+			}}
+		>
+			{row.statusFrom && row.status ? (
+				<>
+					<StatusChip chip={row.statusFrom} />
+					<span style={{ ...noticeText(), color: "var(--mantine-color-dimmed)", flexShrink: 0 }}>
+						→
+					</span>
+				</>
+			) : null}
+			{row.status ? <StatusChip chip={row.status} /> : null}
+			<TaskNoticeTitle row={row} />
+			{(row.marks ?? []).map((mark) => (
+				<Badge
+					key={mark}
+					size="xs"
+					// Outlined: a light gray chip has the card's own background and vanishes.
+					variant="outline"
+					color="gray"
+					tt="none"
+					style={{ flexShrink: 0 }}
+				>
+					{mark}
+				</Badge>
+			))}
+			{row.note ? (
+				<span
+					data-task-notice-note=""
+					title={row.note}
+					style={{
+						...noticeText(),
+						...NOWRAP_ELLIPSIS,
+						// The title keeps its width before the note does: the note takes what is left.
+						flex: "1 1 0",
+						color: "var(--mantine-color-dimmed)",
+					}}
+				>
+					{row.note}
+				</span>
+			) : null}
+		</div>
+	);
+}
+
+function StatusChip({ chip }: { chip: TaskNoticeChip }) {
+	return (
+		<Badge
+			size="xs"
+			// A gray chip is outlined: a light gray one has the card's own background.
+			variant={chip.color === "gray" ? "outline" : "light"}
+			color={chip.color}
+			tt="none"
+			data-task-notice-status=""
+			style={{ flexShrink: 0 }}
+		>
+			{chip.label}
+		</Badge>
+	);
+}
+
+/**
+ * The task's title: an outline link inside a host that opens outline panels (beside the session,
+ * Ctrl/Cmd for a new panel), plain text anywhere else. Truncated to its line, never below
+ * `taskTitleMinWidth`; the full title and its address are the tooltip.
+ */
+function TaskNoticeTitle({ row }: { row: TaskNoticeRow }) {
+	const link = useOutlineLinkProps(row.href);
+	const tooltip =
+		row.address && row.address !== row.title ? `${row.title}\n${row.address}` : row.title;
+	const style = {
+		...noticeText(),
+		...NOWRAP_ELLIPSIS,
+		flex: "0 1 auto",
+		minWidth: taskTitleMinWidth(row.title),
+	} as const;
+	if (link) {
+		return (
+			<a
+				href={link.href}
+				onClick={link.onClick}
+				data-outline-link=""
+				data-task-notice-task=""
+				title={tooltip}
+				style={{ ...style, color: "var(--mantine-color-teal-text)", textDecoration: "none" }}
+			>
+				{row.title}
+			</a>
+		);
+	}
+	return (
+		<span
+			title={tooltip}
+			data-task-notice-task=""
+			style={{ ...style, color: "var(--mantine-color-text)" }}
+		>
+			{row.title}
+		</span>
+	);
+}

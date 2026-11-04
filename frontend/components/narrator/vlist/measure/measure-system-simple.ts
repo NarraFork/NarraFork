@@ -89,16 +89,16 @@ export const CENTER_ROW_PADDING_Y = 4;
 export const CARD_PADDING = SPACING.xs; // 10
 
 /** xs single-line box height: round(12 × 1.4) = 17. */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 
 /** Center-row icon is 14; the xs line (17) is taller → the row is 17px tall. */
-const CENTER_ROW_CONTENT = Math.max(14, XS_LINE_HEIGHT); // 17 (neutral baseline)
+const CENTER_ROW_CONTENT = Math.max(14, XS_LINE_HEIGHT_BASELINE); // 17 (neutral baseline)
 /** Centre-row lane at the reader's typography: the 14px glyph floors it. */
 function centerRowContent(): number {
 	return Math.max(14, typographyMetrics().line.xs);
 }
 /** Paper-row icon/Badge is 16; the xs line (17) is taller → 17px tall. */
-const CARD_ROW_CONTENT = Math.max(16, XS_LINE_HEIGHT); // 17 (neutral baseline)
+const CARD_ROW_CONTENT = Math.max(16, XS_LINE_HEIGHT_BASELINE); // 17 (neutral baseline)
 /** Card-row lane at the reader's typography: the 16px glyph floors it. */
 function cardRowContent(): number {
 	return Math.max(16, typographyMetrics().line.xs);
@@ -199,7 +199,7 @@ export function measureSystemSimpleCard(
 export const MEASURE_SYSTEM_SIMPLE_CONSTANTS = {
 	CENTER_ROW_PADDING_Y,
 	CARD_PADDING,
-	XS_LINE_HEIGHT,
+	XS_LINE_HEIGHT_BASELINE,
 	CENTER_ROW_CONTENT,
 	CARD_ROW_CONTENT,
 } as const;

@@ -48,37 +48,40 @@ describe("measureAskInPassing — pending (fixed 79px including borders)", () =>
 	});
 });
 
-describe("measureAskInPassing — resolved (57~77px, lineClamp=2)", () => {
-	it("short question fits one line → 57px (min height)", async () => {
+// The exported RESOLVED_MIN/MAX_HEIGHT (57/77) are the bare-Mantine baseline. The
+// default setting measures the question's sm line at 120% of it
+// (LINE_HEIGHT_BASELINE_PERCENT): 24 instead of 20, so one line is 61 and two are 85.
+describe("measureAskInPassing — resolved (61~85px, lineClamp=2)", () => {
+	it("short question fits one line → 61px (min height)", async () => {
 		const { measureAskInPassing, RESOLVED_MIN_HEIGHT } = await import("./measure-ask-in-passing");
 		expect(RESOLVED_MIN_HEIGHT).toBe(57);
 		// "Hi?" at a wide width is a single line.
 		const r = measureAskInPassing("resolved", { question: "Hi?" }, 800);
-		expect(r.height).toBe(57);
+		expect(r.height).toBe(61);
 	});
 
-	it("wrapping question caps at two lines → 77px (max height)", async () => {
+	it("wrapping question caps at two lines → 85px (max height)", async () => {
 		const { measureAskInPassing, RESOLVED_MAX_HEIGHT } = await import("./measure-ask-in-passing");
-		expect(RESOLVED_MAX_HEIGHT).toBe(77);
+		// Resolved from the typography live when the module loads (the default here).
+		expect(RESOLVED_MAX_HEIGHT).toBe(85);
 		// A multi-word question at a narrow width wraps to ≥2 lines.
 		const question = "one two three four five six seven eight nine ten";
 		const r = measureAskInPassing("resolved", { question }, 200);
-		expect(r.height).toBe(77);
+		expect(r.height).toBe(85);
 	});
 
-	it("lineClamp=2 is an upper bound: a huge question at a tiny width is still 77px", async () => {
-		const { measureAskInPassing, RESOLVED_MAX_HEIGHT } = await import("./measure-ask-in-passing");
+	it("lineClamp=2 is an upper bound: a huge question at a tiny width is still 85px", async () => {
+		const { measureAskInPassing } = await import("./measure-ask-in-passing");
 		// Even a very long question that would wrap to many lines is clamped to 2.
 		const question = "word ".repeat(40).trim();
 		const r = measureAskInPassing("resolved", { question }, 100);
-		expect(r.height).toBe(RESOLVED_MAX_HEIGHT);
-		expect(r.height).toBe(77);
+		expect(r.height).toBe(85);
 	});
 
-	it("resolved height always lies within [57, 77]", async () => {
-		const { measureAskInPassing, RESOLVED_MIN_HEIGHT, RESOLVED_MAX_HEIGHT } = await import(
-			"./measure-ask-in-passing"
-		);
+	it("resolved height always lies within [61, 85]", async () => {
+		const { measureAskInPassing } = await import("./measure-ask-in-passing");
+		const RESOLVED_MIN_HEIGHT = 61;
+		const RESOLVED_MAX_HEIGHT = 85;
 		const cases: Array<{ q: string; w: number }> = [
 			{ q: "", w: 800 },
 			{ q: "short", w: 800 },
@@ -114,8 +117,8 @@ describe("measureAskInPassing — resolved (57~77px, lineClamp=2)", () => {
 		const narrow = measureAskInPassing("resolved", { question }, 200);
 		const wide = measureAskInPassing("resolved", { question }, 2000);
 		expect(wide.height).toBeLessThanOrEqual(narrow.height);
-		// At a very wide width this short-ish question collapses to one line (57px).
-		expect(wide.height).toBe(57);
+		// At a very wide width this short-ish question collapses to one line (61px).
+		expect(wide.height).toBe(61);
 	});
 
 	it("height does NOT change across LOD levels", async () => {
@@ -124,7 +127,7 @@ describe("measureAskInPassing — resolved (57~77px, lineClamp=2)", () => {
 			(lod) => measureAskInPassing("resolved", { question: "Hi?" }, 800, lod).height,
 		);
 		expect(new Set(heights).size).toBe(1);
-		expect(heights[0]).toBe(57);
+		expect(heights[0]).toBe(61);
 	});
 
 	it("produces exactly one inline block carrying the question flow", async () => {

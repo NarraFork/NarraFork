@@ -618,7 +618,14 @@ function SurfaceBody({
 							<>
 								{/* Typing of this tab that did not reach the page (the editor shows it live). */}
 								<UnsavedTextsNotice pageId={view.pageId} />
-								<Group gap={6} wrap="nowrap" align="flex-start" mb="xs">
+								{/* The page title: the conversation's h3, as in the live editor. */}
+								<Group
+									gap={6}
+									wrap="nowrap"
+									align="flex-start"
+									mb="xs"
+									className={`nf-type-scope ${classes.titleRow}`}
+								>
 									{root.task && <OutlineTaskIcon status={root.task.status} />}
 									<Title order={3} className={classes.rootTitle}>
 										{rootTitle}

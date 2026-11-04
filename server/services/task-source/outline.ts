@@ -53,6 +53,7 @@
  */
 import { createHash } from "node:crypto";
 import { blockTitle } from "@shared/outline";
+import { boundOutlineTaskNoticeItem } from "@shared/outline-task-notice";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { logger } from "../../lib/logger";
 import {
@@ -553,8 +554,22 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			}
 		},
 		turnEndNote(task: OpenTaskView, locale: Locale): InterruptGuardNote {
-			const content = getOutlineTurnEndNote(promptTask(task), locale);
-			return { content, body: { kind: "prose", text: content } };
+			const named = promptTask(task);
+			const content = getOutlineTurnEndNote(named, locale);
+			// The reader's copy: the task as a titled outline link with its status (the model's
+			// text above is unchanged; the transcript used to show it with its markdown).
+			const item = boundOutlineTaskNoticeItem({
+				address: named.address ?? "",
+				title: task.text,
+				status: "doing",
+				...(named.humanCreated ? { humanCreated: true } : {}),
+			});
+			return {
+				content,
+				body: item
+					? { kind: "outlineTasks", variant: "turnEnd", items: [item] }
+					: { kind: "prose", text: content },
+			};
 		},
 		interruptGuardNote(tasks: readonly OpenTaskView[], locale: Locale): InterruptGuardNote {
 			const content = getOutlineInterruptNote(

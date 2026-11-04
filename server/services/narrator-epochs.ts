@@ -5,6 +5,7 @@
 import type { DbMessage } from "@shared/agent-protocol/types";
 import {
 	contextChanges,
+	contextUpdateDisplay,
 	type PrefixSnapshot,
 	type PromptPart,
 	renderContextUpdate,
@@ -227,6 +228,11 @@ export interface ReconcileEpochInput {
 		 * value (no update); a new baseline goes without them until they can be read.
 		 */
 		keepParts?: readonly string[];
+		/**
+		 * Reader summaries of parts (`ContextPart.display`): stored on a `context_update` row that
+		 * changes those parts, for the transcript. Never part of the prefix or its change key.
+		 */
+		displays?: Readonly<Record<string, unknown>>;
 	};
 	refreshTools?: () => Promise<PrefixToolInput>;
 	signal?: AbortSignal;
@@ -474,6 +480,7 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 	if (changes.length) {
 		const modelText = renderContextUpdate(changes);
 		const snapshotRef = await putPrefixJson({ changes, modelText }, signal);
+		const display = contextUpdateDisplay(changes, input.prompt.displays);
 		const row = await withPrefixSnapshotPublication(
 			[snapshotRef],
 			() =>
@@ -481,7 +488,15 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 					narratorStore.appendNotice(
 						narratorId,
 						`Context updated: ${changes.map((part) => part.key).join(", ")}`,
-						[{ type: "context_update", epochId: epoch.markerId, changes: [], snapshotRef }],
+						[
+							{
+								type: "context_update",
+								epochId: epoch.markerId,
+								changes: [],
+								snapshotRef,
+								...(display ? { display } : {}),
+							},
+						],
 					),
 				),
 			signal,

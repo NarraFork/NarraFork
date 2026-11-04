@@ -59,8 +59,10 @@ describe("measureWebSearch", () => {
 		const { measureWebSearch, MEASURE_WEB_SEARCH_CONSTANTS } = await import("./measure-web-search");
 		const r = measureWebSearch({ query: "cats", status: "completed", label: "Searched" }, 600);
 		const c = MEASURE_WEB_SEARCH_CONSTANTS;
-		// Single line → row height is the icon lane (18) since text line (17) is shorter.
-		expect(r.height).toBe(c.WEB_SEARCH_VERTICAL_CHROME + c.WEB_SEARCH_ICON_SIZE);
+		// Single line → the row is the taller of the icon lane (18) and the text line. At
+		// the default setting the xs line is 20 (120% of the Mantine 17 — see
+		// LINE_HEIGHT_BASELINE_PERCENT), so the text line sets the row.
+		expect(r.height).toBe(c.WEB_SEARCH_VERTICAL_CHROME + 20);
 	});
 
 	it("wraps a long query into more lines as width shrinks", async () => {
@@ -78,9 +80,10 @@ describe("measureWebSearch", () => {
 		const longQuery = "word ".repeat(40).trim();
 		const narrow = measureWebSearch({ query: longQuery, status: "completed" }, 150);
 		const textHeight = narrow.height - c.WEB_SEARCH_VERTICAL_CHROME;
-		// Wrapped text dominates the icon lane → multiple of the line height.
-		expect(textHeight % c.WEB_SEARCH_TEXT_LINE_HEIGHT).toBe(0);
-		expect(textHeight).toBeGreaterThan(c.WEB_SEARCH_TEXT_LINE_HEIGHT);
+		// Wrapped text dominates the icon lane → multiple of the (live, 20px) line height.
+		const line = 20;
+		expect(textHeight % line).toBe(0);
+		expect(textHeight).toBeGreaterThan(line);
 	});
 
 	it("reserves an extra loader lane while searching (narrower text area)", async () => {

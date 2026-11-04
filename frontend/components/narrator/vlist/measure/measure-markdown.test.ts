@@ -7,10 +7,22 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+/**
+ * `MARKDOWN_CONSTANTS` with the line boxes bound to their LIVE values. The exported
+ * ones are the bare-Mantine baseline; the default setting measures lines at 120% of it
+ * (LINE_HEIGHT_BASELINE_PERCENT): body 24 (not 20), code 20 (not 17). Margins stay.
+ */
+async function liveMarkdownConstants() {
+	const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+	const { typographyMetrics } = await import("../pretext-fonts");
+	const line = typographyMetrics().line;
+	return { ...MARKDOWN_CONSTANTS, BODY_LINE_HEIGHT: line.body, CODE_LINE_HEIGHT: line.code };
+}
+
 describe("measureMarkdown", () => {
 	it("measures a single short paragraph as one line (deterministic)", async () => {
 		const { measureMarkdown } = await import("./measure-markdown");
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 		const result = measureMarkdown("Hello world.", 1000);
 		// One paragraph, first block marginTop 0 → height == one body line.
 		expect(result.blocks).toHaveLength(1);
@@ -20,7 +32,7 @@ describe("measureMarkdown", () => {
 
 	it("wraps a long paragraph into multiple lines as width shrinks", async () => {
 		const { measureMarkdown } = await import("./measure-markdown");
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 		const md = "one two three four five six seven eight nine ten eleven twelve";
 		const wide = measureMarkdown(md, 2000);
 		const narrow = measureMarkdown(md, 80);
@@ -32,7 +44,7 @@ describe("measureMarkdown", () => {
 
 	it("adds paragraph margins between blocks (first block has no top margin)", async () => {
 		const { measureMarkdown } = await import("./measure-markdown");
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 		const one = measureMarkdown("First paragraph.", 1000);
 		const two = measureMarkdown("First paragraph.\n\nSecond paragraph.", 1000);
 		const line = MARKDOWN_CONSTANTS.BODY_LINE_HEIGHT;
@@ -43,7 +55,7 @@ describe("measureMarkdown", () => {
 
 	it("measures fenced code with per-line height + vertical padding", async () => {
 		const { measureMarkdown, MEASURE_MARKDOWN_CODE_PADDING } = await import("./measure-markdown");
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 		const md = "```\nline1\nline2\nline3\n```";
 		const result = measureMarkdown(md, 1000);
 		expect(result.blocks[0]!.kind).toBe("code");
@@ -54,7 +66,7 @@ describe("measureMarkdown", () => {
 
 	it("reserves extra top padding for code blocks with a language label", async () => {
 		const { measureMarkdown } = await import("./measure-markdown");
-		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const MARKDOWN_CONSTANTS = await liveMarkdownConstants();
 		const noLang = measureMarkdown("```\nx = 1\n```", 1000);
 		const withLang = measureMarkdown("```js\nx = 1\n```", 1000);
 		expect(withLang.height).toBe(noLang.height + MARKDOWN_CONSTANTS.CODE_LANG_EXTRA_TOP);
@@ -83,8 +95,8 @@ describe("Stage 4 constant corrections (chunk-parity)", () => {
 		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
 		const { lineBoxHeight } = await import("../pretext-fonts");
 		// 11 × 1.55 = 17.05 → 17 (was 12 × 1.55 = 19 before the fix).
-		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT).toBe(lineBoxHeight(11, 1.55));
-		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT).toBe(17);
+		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT_BASELINE).toBe(lineBoxHeight(11, 1.55));
+		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT_BASELINE).toBe(17);
 	});
 
 	it("code box vertical padding folds the 1px border into xs padding (11 per side)", async () => {

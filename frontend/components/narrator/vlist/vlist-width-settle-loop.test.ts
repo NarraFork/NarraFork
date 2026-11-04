@@ -299,7 +299,7 @@ describe("width settle loop — no rebuild during a pointer drag", () => {
  * a scrollbar that appears can never become unnecessary. `measure-media.ts` breaks it
  * by design: `image_generation` reserves its image area by aspect ratio, so the block
  * gets TALLER as the column widens. Driven through the real layout builder, a document
- * of those blocks on a 380x1656 viewport commits 59 times in 60 hops (333 ↔ 348), and
+ * of those blocks on a 380x1672 viewport commits 59 times in 60 hops (333 ↔ 348), and
  * 35317 viewport/message-count combinations in the ordinary 360-560px range do the
  * same. See the "reachable 2-cycle" group below, which drives the real measure stack.
  *
@@ -769,7 +769,7 @@ describe("scrollbar feedback through the real measure stack", () => {
 		const commits = await runRealFeedback({
 			messageCount: 8,
 			viewportWidth: 380,
-			viewportHeight: 1656,
+			viewportHeight: 1672,
 			scrollbarPx: 15,
 			hops: 60,
 			guard: false,
@@ -784,7 +784,7 @@ describe("scrollbar feedback through the real measure stack", () => {
 		const commits = await runRealFeedback({
 			messageCount: 8,
 			viewportWidth: 380,
-			viewportHeight: 1656,
+			viewportHeight: 1672,
 			scrollbarPx: 15,
 			hops: 400,
 			guard: true,

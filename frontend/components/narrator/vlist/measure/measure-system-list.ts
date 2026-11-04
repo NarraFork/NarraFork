@@ -77,17 +77,17 @@ export interface KnowledgeHintData {
 /** Paper p="xs" inner padding (top + bottom each). */
 export const CARD_PADDING = SPACING.xs; // 10
 /** xs single-line box height: round(12 × 1.4) = 17. */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Vertical gap between the heading and each entry row (Stack gap={2}). */
 export const STACK_GAP = 2;
 
 /** Height with zero entries: padding×2 + the lone heading line. ≈37px. */
-export const KNOWLEDGE_HINT_BASE_HEIGHT = CARD_PADDING * 2 + XS_LINE_HEIGHT; // 37 (baseline)
+export const KNOWLEDGE_HINT_BASE_HEIGHT = CARD_PADDING * 2 + XS_LINE_HEIGHT_BASELINE; // 37 (baseline)
 export function knowledgeHintBaseHeight(): number {
 	return CARD_PADDING * 2 + typographyMetrics().line.xs;
 }
 /** Extra height per additional entry row: one xs line + one Stack gap. =19px. */
-export const KNOWLEDGE_HINT_HEIGHT_PER_ENTRY = XS_LINE_HEIGHT + STACK_GAP; // 19 (baseline)
+export const KNOWLEDGE_HINT_HEIGHT_PER_ENTRY = XS_LINE_HEIGHT_BASELINE + STACK_GAP; // 19 (baseline)
 export function knowledgeHintHeightPerEntry(): number {
 	return typographyMetrics().line.xs + STACK_GAP;
 }
@@ -155,7 +155,7 @@ export function measureKnowledgeHint(
 
 export const MEASURE_SYSTEM_LIST_CONSTANTS = {
 	CARD_PADDING,
-	XS_LINE_HEIGHT,
+	XS_LINE_HEIGHT_BASELINE,
 	STACK_GAP,
 	KNOWLEDGE_HINT_BASE_HEIGHT,
 	KNOWLEDGE_HINT_HEIGHT_PER_ENTRY,

@@ -71,9 +71,9 @@ import { pretextLineMetrics } from "./pretext-metrics";
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** sm body line box: round(14 × 1.45) = 20 (Text size="sm" header + Radio/Checkbox label lh). */
-export const SM_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 20
+export const SM_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 20
 /** xs line box: round(12 × 1.4) = 17 (dimmed xs rows, saved custom answer, reason lines). */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /**
  * Checkbox/Radio description line box: 12px × 1.2 → round(14.4) = 14. The
  * InputDescription font-size is sm-2 = 12px and its line-height is a hard-coded
@@ -81,7 +81,7 @@ export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
  * real rendered value (14) is used here for accuracy — the VListHarness
  * calibrates the exact pixels. (Reported to the main agent; no skeleton change.)
  */
-export const OPTION_DESC_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.2);
+export const OPTION_DESC_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, 1.2);
 /** optionDescLineHeight() at the reader's typography (baseline above). */
 export function optionDescLineHeight(): number {
 	return scaledLineBoxHeight(FONT_SIZE.xs, 1.2);
@@ -114,11 +114,11 @@ export const QUESTION_STACK_GAP = SPACING.xs; // 10
 export const OPTIONS_GAP = 4;
 
 /** Header text (Text size="sm" fw={500}). */
-export const HEADER_LINE_HEIGHT = SM_LINE_HEIGHT; // 20
+export const HEADER_LINE_HEIGHT_BASELINE = SM_LINE_HEIGHT_BASELINE; // 20
 export const HEADER_FONT = `${FONT_WEIGHT.medium} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 
 /** Option label (Radio/Checkbox label, size sm, weight 400, lh 20). */
-export const OPTION_LABEL_LINE_HEIGHT = SM_LINE_HEIGHT; // 20
+export const OPTION_LABEL_LINE_HEIGHT_BASELINE = SM_LINE_HEIGHT_BASELINE; // 20
 export const OPTION_LABEL_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 /** Option description font (12px, weight 400). */
 export const OPTION_DESC_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
@@ -133,13 +133,13 @@ export const OPTION_LABEL_OFFSET = SPACING.sm; // 12
 export const OPTION_INDENT = OPTION_CONTROL_SIZE + OPTION_LABEL_OFFSET; // 32
 
 /** Saved custom answer (readOnly): Text size="xs" ff="monospace", lh 17. */
-export const CUSTOM_ANSWER_LINE_HEIGHT = XS_LINE_HEIGHT; // 17
+export const CUSTOM_ANSWER_LINE_HEIGHT_BASELINE = XS_LINE_HEIGHT_BASELINE; // 17
 export const CUSTOM_ANSWER_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO_FAMILY}`;
 
 /** "Answered" Badge size="xs" height. */
 export const BADGE_XS_HEIGHT = 16;
 /** Countdown Group row: max(icon 14, xs text 17) = 17. */
-export const COUNTDOWN_ROW_HEIGHT = Math.max(14, XS_LINE_HEIGHT); // 17
+export const COUNTDOWN_ROW_HEIGHT = Math.max(14, XS_LINE_HEIGHT_BASELINE); // 17
 /** AskUserQuestion action buttons (Button size="xs" = 30). */
 export const ASK_BUTTON_ROW_HEIGHT = 30;
 
@@ -170,7 +170,7 @@ export const TARGET_PADDING = SPACING.xs; // 10
 /** Execution-target Paper border (withBorder = 1px). */
 export const TARGET_BORDER = 1;
 /** Execution-target header row: max(icon-less xs text 17, Badge xs 16) = 17. */
-export const TARGET_HEADER_ROW = XS_LINE_HEIGHT; // 17
+export const TARGET_HEADER_ROW = XS_LINE_HEIGHT_BASELINE; // 17
 /** Header Group mb={4} shown only when a cwd or path line follows. */
 export const TARGET_HEADER_MARGIN = 4;
 /** Execution-target Paper mb="xs"(10). */
@@ -197,7 +197,7 @@ export const PERM_BUTTON_ROW_HEIGHT = 36;
 /** PermButtonBar Group gap="sm"(12) between rows when buttons wrap. */
 export const PERM_BUTTON_GROUP_GAP = SPACING.sm; // 12
 /** readOnly note ("permission actions unavailable") — single xs line. */
-export const READONLY_NOTE_HEIGHT = XS_LINE_HEIGHT; // 17
+export const READONLY_NOTE_HEIGHT = XS_LINE_HEIGHT_BASELINE; // 17
 
 /**
  * StructSed preview loading row: `Group gap="xs" mb="xs"` holding a Loader size xs
@@ -764,9 +764,9 @@ export function prepareInlinePermissionMeasurer(
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const MEASURE_PERMISSION_CONSTANTS = {
-	SM_LINE_HEIGHT,
-	XS_LINE_HEIGHT,
-	OPTION_DESC_LINE_HEIGHT,
+	SM_LINE_HEIGHT_BASELINE,
+	XS_LINE_HEIGHT_BASELINE,
+	OPTION_DESC_LINE_HEIGHT_BASELINE,
 	TEXTAREA_ROW_HEIGHT,
 	ALERT_PADDING,
 	ALERT_BORDER,
@@ -775,13 +775,13 @@ export const MEASURE_PERMISSION_CONSTANTS = {
 	ALERT_STACK_GAP,
 	QUESTION_STACK_GAP,
 	OPTIONS_GAP,
-	HEADER_LINE_HEIGHT,
-	OPTION_LABEL_LINE_HEIGHT,
+	HEADER_LINE_HEIGHT_BASELINE,
+	OPTION_LABEL_LINE_HEIGHT_BASELINE,
 	OPTION_DESC_MARGIN_TOP,
 	OPTION_CONTROL_SIZE,
 	OPTION_LABEL_OFFSET,
 	OPTION_INDENT,
-	CUSTOM_ANSWER_LINE_HEIGHT,
+	CUSTOM_ANSWER_LINE_HEIGHT_BASELINE,
 	BADGE_XS_HEIGHT,
 	COUNTDOWN_ROW_HEIGHT,
 	ASK_BUTTON_ROW_HEIGHT,

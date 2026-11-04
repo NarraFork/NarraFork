@@ -522,3 +522,42 @@ test("a project's board: readable sessions only, grouped by executor, no actions
 		await owner.page.close();
 	}
 }, 90_000);
+
+test("task text uses the conversation's typography and follows the setting", async () => {
+	const id = await session({ title: "Typography" });
+	const space = await ensureSessionSpace(id);
+	await writeOutline({
+		spaceId: space.id,
+		ops: [
+			{ op: "insert", tempId: "p", parent: null, content: "Plan" },
+			{
+				op: "insert",
+				parent: { tempId: "p" },
+				content: "修复：排查中断后无重试按钮 Mixed English",
+				task: { status: "doing" },
+			},
+		],
+		actor: { kind: "agent", id },
+		narratorId: id,
+		responsibleUserId: alice,
+	});
+	const { page, errors } = await openPage(alice);
+	try {
+		await call(page, (f, narratorId: string) => f.openSession(narratorId), id);
+		await until(page, "the board", (f) => f.count("[data-testid=task-row]") === 1);
+		const title = "修复：排查中断后无重试按钮 Mixed English";
+		for (const setting of [
+			{ fontScalePercent: 100, lineHeightScalePercent: 100, letterSpacingPercent: 0 },
+			{ fontScalePercent: 115, lineHeightScalePercent: 110, letterSpacingPercent: 2 },
+		]) {
+			await call(page, (f, s: never) => f.applyTypography(s), setting);
+			const got = await call(page, (f, t: string) => f.rowTypography(t), title);
+			expect(got.title?.size).toBeCloseTo(got.expected.body.size, 2);
+			expect(got.title?.line).toBe(got.expected.body.line);
+			expect(got.address?.size).toBeCloseTo(got.expected.xs.size, 2);
+		}
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);

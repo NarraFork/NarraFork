@@ -91,7 +91,7 @@ export const CARD_PADDING = SPACING.sm; // 12
 /** Paper p="xs" padding used by the resolved variant. */
 export const RESOLVED_PADDING = SPACING.xs; // 10
 /** xs single-line box height: round(12 × 1.4) = 17. */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Outer Stack gap="xs". */
 export const STACK_GAP = SPACING.xs; // 10
 /** Header inner Stack gap={2} between title and description. */
@@ -99,7 +99,7 @@ export const HEADER_INNER_GAP = 2;
 /** Checkbox size="xs" control box; the row never shrinks below it. */
 export const CHECKBOX_CONTROL_SIZE = 20;
 /** One checkbox row: max(control, xs text line). */
-export const ROW_HEIGHT = Math.max(CHECKBOX_CONTROL_SIZE, XS_LINE_HEIGHT); // 20 (baseline)
+export const ROW_HEIGHT = Math.max(CHECKBOX_CONTROL_SIZE, XS_LINE_HEIGHT_BASELINE); // 20 (baseline)
 /** Row lane at the reader's typography; the checkbox control floors it. */
 export function rowHeight(): number {
 	return Math.max(CHECKBOX_CONTROL_SIZE, typographyMetrics().line.xs);
@@ -117,7 +117,7 @@ export const BUTTON_ROW_HEIGHT = 26;
 export const ROWS_MAX = 12;
 
 /** Title + description, two clamped lines with one inner gap. */
-export const HEADER_HEIGHT = XS_LINE_HEIGHT * 2 + HEADER_INNER_GAP; // 36 (baseline)
+export const HEADER_HEIGHT = XS_LINE_HEIGHT_BASELINE * 2 + HEADER_INNER_GAP; // 36 (baseline)
 export function headerHeight(): number {
 	return typographyMetrics().line.xs * 2 + HEADER_INNER_GAP;
 }
@@ -138,7 +138,7 @@ export const PENDING_BASE_HEIGHT = CARD_PADDING * 2 + HEADER_HEIGHT + STACK_GAP 
 export const PENDING_HEIGHT_PER_ROW = ROW_HEIGHT + ROW_GAP; // 24
 
 /** Resolved height: a single dimmed line inside Paper p="xs". */
-export const RESOLVED_HEIGHT = RESOLVED_PADDING * 2 + XS_LINE_HEIGHT; // 37 (baseline)
+export const RESOLVED_HEIGHT = RESOLVED_PADDING * 2 + XS_LINE_HEIGHT_BASELINE; // 37 (baseline)
 export function resolvedHeight(): number {
 	return RESOLVED_PADDING * 2 + typographyMetrics().line.xs;
 }
@@ -226,7 +226,7 @@ export function measureSubagentRecovery(
 export const MEASURE_SUBAGENT_RECOVERY_CONSTANTS = {
 	CARD_PADDING,
 	RESOLVED_PADDING,
-	XS_LINE_HEIGHT,
+	XS_LINE_HEIGHT_BASELINE,
 	STACK_GAP,
 	HEADER_INNER_GAP,
 	CHECKBOX_CONTROL_SIZE,

@@ -52,6 +52,7 @@ import {
 	type OutlineViewTask,
 } from "@server/lib/prompt-i18n";
 import { blockTitle } from "@shared/outline";
+import type { OutlineTasksViewDisplay, OutlineTasksViewTask } from "@shared/outline-task-notice";
 import type { ContextPart } from "@shared/prefix-context";
 import { readNarrator } from "../outline/access-reads";
 import { loadBodies, readSubtree } from "../outline/read";
@@ -131,6 +132,8 @@ interface ViewDeps {
 
 interface CachedView extends ViewDeps {
 	text: string | null;
+	/** The reader's summary of the view (`ContextPart.display`), when the view has one. */
+	display?: OutlineTasksViewDisplay;
 	at: number;
 	/**
 	 * A change it depends on landed: read again before serving it, but keep it to serve should
@@ -200,15 +203,32 @@ export function resetOutlineViewCache(now?: () => number): void {
 	clock.now = now ?? (() => Date.now());
 }
 
+/** A view as read: its text (the change key), and the reader's summary when it has one. */
+interface ViewRead {
+	text: string | null;
+	display?: OutlineTasksViewDisplay;
+}
+
 async function cachedView(
 	key: string,
 	read: (deps: ViewDeps) => Promise<string | null>,
 ): Promise<string | null> {
+	return (await cachedViewRead(key, async (deps) => ({ text: await read(deps) }))).text;
+}
+
+async function cachedViewRead(
+	key: string,
+	read: (deps: ViewDeps) => Promise<ViewRead>,
+): Promise<ViewRead> {
+	const shown = (view: CachedView): ViewRead => ({
+		text: view.text,
+		...(view.display ? { display: view.display } : {}),
+	});
 	const hit = cache.get(key);
 	if (hit && !hit.stale && clock.now() - hit.at < OUTLINE_VIEW_LIMITS.maxAgeMs) {
 		cache.delete(key);
 		cache.set(key, hit);
-		return hit.text;
+		return shown(hit);
 	}
 	// Within the backoff of a failed read, what was shown is served without reading again. A
 	// view never shown is read on every request (the part is missing until it is), but its
@@ -216,15 +236,15 @@ async function cachedView(
 	const failedAt = failures.get(key);
 	const backingOff =
 		failedAt !== undefined && clock.now() - failedAt < OUTLINE_VIEW_LIMITS.failureBackoffMs;
-	if (backingOff && hit) return hit.text;
+	if (backingOff && hit) return shown(hit);
 	const tracker: ReadTracker = { spaces: new Set(), narrators: new Set(), commits: 0 };
 	reads.add(tracker);
 	try {
 		const deps: ViewDeps = { spaces: new Set(), narrators: new Set(), anySpace: false };
 		const startedAt = clock.now();
-		let text: string | null;
+		let fresh: ViewRead;
 		try {
-			text = await read(deps);
+			fresh = await read(deps);
 		} catch (error) {
 			if (backingOff) throw new OutlineViewBackoffError(key, error);
 			failures.set(key, clock.now());
@@ -241,7 +261,7 @@ async function cachedView(
 					key,
 					error: String(error),
 				});
-				return hit.text;
+				return shown(hit);
 			}
 			throw error;
 		}
@@ -252,13 +272,19 @@ async function cachedView(
 		failures.delete(key);
 		// Read while a change it depends on landed: kept (for a failing read) but read again next.
 		cache.delete(key);
-		cache.set(key, { ...deps, text, at: startedAt, stale });
+		cache.set(key, {
+			...deps,
+			text: fresh.text,
+			...(fresh.display ? { display: fresh.display } : {}),
+			at: startedAt,
+			stale,
+		});
 		while (cache.size > OUTLINE_VIEW_LIMITS.cached) {
 			const oldest = cache.keys().next().value;
 			if (oldest === undefined) break;
 			cache.delete(oldest);
 		}
-		return text;
+		return fresh;
 	} finally {
 		reads.delete(tracker);
 	}
@@ -353,15 +379,15 @@ async function readTasksView(
 	narratorId: string,
 	locale: Locale,
 	deps: ViewDeps,
-): Promise<string | null> {
+): Promise<ViewRead> {
 	const session = await readOutlineSession(narratorId);
 	if (session.sessionNarratorId) deps.narrators.add(session.sessionNarratorId);
 	if (session.spaceId) deps.spaces.add(session.spaceId);
 	else deps.anySpace = true;
-	if (session.subagent) return null;
+	if (session.subagent) return { text: null };
 	const read = await readOpen(session);
 	for (const entry of read.entries) deps.spaces.add(entry.ref.spaceId);
-	if (read.entries.length === 0) return null;
+	if (read.entries.length === 0) return { text: null };
 
 	const doing = read.entries
 		.filter((entry) => entry.status === "doing")
@@ -386,6 +412,8 @@ async function readTasksView(
 	let used = heading.length;
 	let shown = 0;
 	const room = OUTLINE_VIEW_LIMITS.tasksChars - getOutlineTasksViewMore(99, locale).length - 1;
+	// The entries whose lines the text holds: the reader's summary names these and no others.
+	const printed = new Set<OpenEntry>();
 	for (const { section, entries } of sections) {
 		if (entries.length === 0) continue;
 		const sectionLine = getOutlineTasksViewSection(section, locale);
@@ -394,17 +422,40 @@ async function readTasksView(
 		if (used + sectionLine.length + first.length + 2 > room) break;
 		lines.push(sectionLine);
 		used += sectionLine.length + 1;
-		for (const line of taskLines) {
+		for (const [index, line] of taskLines.entries()) {
 			if (used + line.length + 1 > room) break;
 			lines.push(line);
 			used += line.length + 1;
 			shown++;
+			printed.add(entries[index] as OpenEntry);
 		}
 	}
 	const hidden = read.entries.length - shown;
 	if (read.truncated) lines.push(getOutlineTasksViewMore(null, locale));
 	else if (hidden > 0) lines.push(getOutlineTasksViewMore(hidden, locale));
-	return lines.join("\n");
+	// The reader's summary of the same read: the tasks the text lists, per section and titled (never
+	// one the budget left out of the text), and how many are open of each kind. Prerequisites are
+	// left out (D9: their space may not be readable by every reader of the session).
+	const viewTask = (entry: OpenEntry): OutlineTasksViewTask => {
+		const named = task(entry);
+		return {
+			address: named.address ?? entry.ref.address,
+			title: named.text,
+			...(named.humanCreated ? { humanCreated: true as const } : {}),
+		};
+	};
+	const counted = (status: OpenEntry["status"]) =>
+		read.entries.filter((entry) => entry.status === status).length;
+	const inText = (entries: readonly OpenEntry[]) =>
+		entries.filter((entry) => printed.has(entry)).map(viewTask);
+	const display: OutlineTasksViewDisplay = {
+		doing: inText(doing),
+		waiting: inText(waiting),
+		next: inText(next ? [next] : []),
+		counts: { doing: counted("doing"), waiting: counted("blocked"), todo: counted("todo") },
+		...(read.truncated ? { more: true as const } : {}),
+	};
+	return { text: lines.join("\n"), display };
 }
 
 /**
@@ -413,7 +464,12 @@ async function readTasksView(
  * has no tasks of its own, D27c), and when the session cannot be read.
  */
 export async function outlineTasksView(narratorId: string, locale: Locale): Promise<string | null> {
-	return await cachedView(`tasks:${narratorId}:${locale}`, (deps) =>
+	return (await outlineTasksViewRead(narratorId, locale)).text;
+}
+
+/** The current-tasks view with its reader summary (`ContextPart.display`). */
+async function outlineTasksViewRead(narratorId: string, locale: Locale): Promise<ViewRead> {
+	return await cachedViewRead(`tasks:${narratorId}:${locale}`, (deps) =>
 		readTasksView(narratorId, locale, deps),
 	);
 }
@@ -706,10 +762,10 @@ export async function outlineContextParts(
 	options: { tasks: boolean },
 ): Promise<ContextPart[]> {
 	const parts: ContextPart[] = [];
-	const add = async (key: string, view: () => Promise<string | null>) => {
+	const add = async (key: string, view: () => Promise<ViewRead>) => {
 		try {
-			const text = await view();
-			if (text) parts.push({ key, text });
+			const { text, display } = await view();
+			if (text) parts.push({ key, text, ...(display ? { display } : {}) });
 		} catch (error) {
 			// Logged when a read failed, not again for each failure within its backoff.
 			if (!(error instanceof OutlineViewBackoffError)) {
@@ -719,9 +775,11 @@ export async function outlineContextParts(
 		}
 	};
 	if (options.tasks) {
-		await add(OUTLINE_VIEW_KEYS.tasks, () => outlineTasksView(narratorId, locale));
+		await add(OUTLINE_VIEW_KEYS.tasks, () => outlineTasksViewRead(narratorId, locale));
 	}
-	await add(OUTLINE_VIEW_KEYS.behavior, () => outlineBehaviorView(narratorId, locale));
+	await add(OUTLINE_VIEW_KEYS.behavior, async () => ({
+		text: await outlineBehaviorView(narratorId, locale),
+	}));
 	return parts;
 }
 

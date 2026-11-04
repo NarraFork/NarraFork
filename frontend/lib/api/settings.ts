@@ -316,7 +316,12 @@ export const settingsApi = {
 			/** Narrator transcript typography, as percentages of the built-in defaults. */
 			narratorFontScalePercent: number;
 			narratorLetterSpacingPercent: number;
-			narratorLineHeightScalePercent: number;
+			/**
+			 * Line height on the current scale (100 = the Mantine ratios × 1.2,
+			 * LINE_HEIGHT_BASELINE_PERCENT). The server also returns the old-scale
+			 * `narratorLineHeightScalePercent` for older clients; this one never reads it.
+			 */
+			narratorLineHeightV2Percent: number;
 			narratorParagraphScalePercent: number;
 			addSubagentToRecentTabs: boolean;
 			recentTabsGroupMode: "flat" | "directory";
@@ -383,7 +388,7 @@ export const settingsApi = {
 		terminalFontSize?: number;
 		narratorFontScalePercent?: number;
 		narratorLetterSpacingPercent?: number;
-		narratorLineHeightScalePercent?: number;
+		narratorLineHeightV2Percent?: number;
 		narratorParagraphScalePercent?: number;
 		addSubagentToRecentTabs?: boolean;
 		recentTabsGroupMode?: "flat" | "directory";

@@ -76,7 +76,7 @@ import {
 	BARE_ROW_ICON,
 	BARE_ROW_PADDING_Y,
 	BARE_ROW_STATUS,
-	BARE_XS_LINE,
+	BARE_XS_LINE_BASELINE,
 	bareRowMetrics,
 } from "@shared/pretext-layout/row-metrics";
 // Type-only: the row identity the adapter attaches and the renderer consumes.
@@ -145,10 +145,10 @@ export const TRACE_CHEVRON = BARE_ROW_CHEVRON;
  * float gives 16.799999…; tests assert with toBeCloseTo. Browsers lay out this
  * fractional line box, so the raw value is the most faithful prediction.
  */
-export const TRACE_XS_LINE = BARE_XS_LINE;
+export const TRACE_XS_LINE_BASELINE = BARE_XS_LINE_BASELINE;
 
 /** Header row content lane: max(icon 16, xs line 16.8) = 16.8. */
-export const TRACE_HEADER_CONTENT = Math.max(TRACE_HEADER_ICON, TRACE_XS_LINE);
+export const TRACE_HEADER_CONTENT = Math.max(TRACE_HEADER_ICON, TRACE_XS_LINE_BASELINE);
 /** Header `<Group>` height: py*2 + content = 4 + 16.8 = 20.8. */
 export const TRACE_HEADER_GROUP_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEADER_CONTENT;
 /** Collapsed (header-only) band height: outer py*2 + header group = 4 + 20.8 = 24.8. */
@@ -227,7 +227,7 @@ export const TRACE_ROW_HEIGHT = BARE_ROW_HEIGHT;
  * Standalone count line (ToolRunCountLine / ReasoningCountLine): a single
  * `<Group py={2}>` with NO outer Box wrapper → 4 + 16.8 = 20.8.
  */
-export const TRACE_COUNT_LINE_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEADER_CONTENT;
+export const TRACE_COUNT_LINE_HEIGHT_BASELINE = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEADER_CONTENT;
 
 // ── Expandable body chrome (ReasoningStepsTrace) ─────────────────────────────
 /** Body `<Box py={2}>`. */
@@ -1146,13 +1146,13 @@ export const MEASURE_TOOL_RUN_CONSTANTS = {
 	TRACE_CHEVRON,
 	TRACE_ROW_STATUS,
 	TRACE_ROW_GAP,
-	TRACE_XS_LINE,
+	TRACE_XS_LINE_BASELINE,
 	TRACE_HEADER_CONTENT,
 	TRACE_HEADER_GROUP_HEIGHT,
 	TRACE_HEADER_BAND_HEIGHT,
 	TRACE_ROW_CONTENT,
 	TRACE_ROW_HEIGHT,
-	TRACE_COUNT_LINE_HEIGHT,
+	TRACE_COUNT_LINE_HEIGHT_BASELINE,
 	TRACE_BODY_PADDING_Y,
 	TRACE_BODY_PADDING_LEFT,
 	TRACE_BODY_BORDER_LEFT,
