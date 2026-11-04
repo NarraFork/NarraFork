@@ -52,6 +52,12 @@ mock.module("../../hooks/useOutline", () => ({
 	useOutlinePendingDetail: () => idle,
 	useDecideOutlinePending: () => ({ mutate: () => {}, isPending: false }),
 	useOutlineLock: () => ({ mutate: () => {}, isPending: false }),
+	// The side panel's questions (P2 PR 7).
+	invalidateOutlineSpace: () => {},
+	useOutlineQuestions: () => idle,
+	useAnswerOutlineQuestions: () => ({ mutate: () => {}, isPending: false }),
+	useOutlineDigest: () => idle,
+	useMarkOutlineDigestSeen: () => ({ mutate: () => {}, isPending: false }),
 }));
 
 const { OutlineSurface } = await import("./OutlineSurface");

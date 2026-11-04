@@ -101,6 +101,7 @@ interface CacheEntry {
 	content: string;
 	body: PMNode;
 	task: LiveTaskChar | null;
+	question: boolean;
 	collapsed: boolean;
 	hidden: number;
 	kids: PMNode[];
@@ -441,7 +442,7 @@ export class OutlineView implements CmdHost, ClientView {
 		if (this.lens !== "facts") return false;
 		const v = this.client.visible;
 		for (let cur: string | null = this.rootId; cur; cur = v.get(cur)?.parentId ?? null) {
-			if (v.get(cur)?.task) return false;
+			if (v.get(cur)?.task || v.get(cur)?.question) return false;
 		}
 		return true;
 	}
@@ -500,7 +501,8 @@ export class OutlineView implements CmdHost, ClientView {
 			const single = depth === 0 && this.surface.kind === "node";
 			if (!single)
 				for (const k of v.children(id)) {
-					if (facts && v.get(k)?.task) {
+					// Tasks and questions put to people are process (design §2.1).
+					if (facts && (v.get(k)?.task || v.get(k)?.question)) {
 						hidden += this.countSubtree(k);
 						continue;
 					}
@@ -509,11 +511,13 @@ export class OutlineView implements CmdHost, ClientView {
 				}
 			hiddenTotal += hidden;
 			const collapsed = depth > 0 && this.collapsed.has(id) && kids.length > 0;
+			const question = rec.question === true;
 			let node: PMNode;
 			if (
 				c &&
 				c.body === body &&
 				c.task === rec.task &&
+				c.question === question &&
 				c.collapsed === collapsed &&
 				c.hidden === hidden &&
 				sameArr(c.kids, kids)
@@ -521,10 +525,10 @@ export class OutlineView implements CmdHost, ClientView {
 				node = c.node;
 			else
 				node = N.block.create(
-					{ id, task: rec.task, collapsed, hidden },
+					{ id, task: rec.task, collapsed, hidden, question },
 					kids.length ? [body, N.children.create(null, kids)] : [body],
 				);
-			staged.set(id, { content, body, task: rec.task, collapsed, hidden, kids, node });
+			staged.set(id, { content, body, task: rec.task, question, collapsed, hidden, kids, node });
 			return node;
 		};
 		const nodes: PMNode[] = [];
@@ -1104,6 +1108,7 @@ export class OutlineView implements CmdHost, ClientView {
 			content,
 			body,
 			task: node.attrs.task ?? null,
+			question: node.attrs.question === true,
 			collapsed: node.attrs.collapsed,
 			hidden: node.attrs.hidden ?? 0,
 			kids,
@@ -1653,6 +1658,7 @@ class BlockView implements NodeView {
 			hasKids: n.childCount > 1,
 			collapsed: !!n.attrs.collapsed,
 			task: n.attrs.task ?? null,
+			question: n.attrs.question === true,
 		});
 		const hidden = (n.attrs.hidden as number) ?? 0;
 		const open = hidden > 0 ? this.owner.hiddenTasks(id).length : 0;

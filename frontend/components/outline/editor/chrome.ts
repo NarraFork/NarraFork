@@ -35,6 +35,8 @@ export const chromeText = {
 	locked: (name: string) => `Locked · ${name}`,
 	/** On a block a pending change touches. */
 	pending: "Waiting for confirmation",
+	/** The mark of a question put to a person (`Ask`), where a task has its checkbox. */
+	question: "A question for a person: answered in the inbox. Deleting it withdraws it.",
 };
 
 /** What a block shows besides its content: its lock, changes to it waiting for confirmation. */
@@ -57,7 +59,12 @@ export interface ChromeState {
 	hasKids: boolean;
 	collapsed: boolean;
 	task: LiveTaskChar | null;
+	/** A question put to a person: marked where a task has its checkbox (it has none). */
+	question?: boolean;
 }
+
+/** The glyph of a question's mark. */
+export const QUESTION_GLYPH = "?";
 
 export function createGutter(): Gutter {
 	const el = document.createElement("div");
@@ -84,6 +91,23 @@ export function applyChrome(container: HTMLElement, g: Gutter, s: ChromeState): 
 	container.classList.toggle("has-kids", s.hasKids);
 	container.classList.toggle("collapsed", s.hasKids && s.collapsed);
 	container.dataset.task = s.task ?? "";
+	const question = !s.task && s.question === true;
+	container.dataset.question = question ? "1" : "";
+	g.check.classList.toggle("is-question", question);
+	if (question) {
+		g.check.textContent = QUESTION_GLYPH;
+		g.check.style.display = "";
+		g.check.setAttribute("role", "img");
+		g.check.removeAttribute("aria-checked");
+		g.check.title = chromeText.question;
+		g.check.setAttribute("aria-label", chromeText.question);
+		g.check.dataset.testid = "outline-question-mark";
+		return;
+	}
+	g.check.setAttribute("role", "checkbox");
+	g.check.title = chromeText.task;
+	g.check.removeAttribute("aria-label");
+	delete g.check.dataset.testid;
 	g.check.textContent = s.task ? TASK_GLYPH[s.task] : "";
 	g.check.style.display = s.task ? "" : "none";
 	g.check.setAttribute(

@@ -104,13 +104,16 @@ export type LiveTaskChar = " " | "/" | "x" | "-";
 /**
  * A structural operation as sent and broadcast. Content is never here: a block's text lives in
  * the Yjs document (a new block's text arrives in the same frame's update).
- *   - `i`: insert, or restore when the id names a deleted block; `p` parent, `k` order key
+ *   - `i`: insert, or restore when the id names a deleted block; `p` parent, `k` order key; `q`
+ *     the block is a question put to a person (`Ask`): set by the server only (a client cannot
+ *     make a question, and the server ignores the field from one), added after the first
+ *     protocol version
  *   - `m`: move under `p` at `k`
- *   - `d`: delete (with its live subtree)
- *   - `k`: set the checkbox (`null` removes the task)
+ *   - `d`: delete (with its live subtree); deleting a question withdraws it
+ *   - `k`: set the checkbox (`null` removes the task); refused on a question
  */
 export type LiveOp =
-	| { t: "i"; id: string; p: string; k: string; task?: LiveTaskChar | null }
+	| { t: "i"; id: string; p: string; k: string; task?: LiveTaskChar | null; q?: true }
 	| { t: "m"; id: string; p: string; k: string }
 	| { t: "d"; id: string }
 	| { t: "k"; id: string; task: LiveTaskChar | null };
@@ -118,7 +121,8 @@ export type LiveOp =
 /**
  * A live block in a structure snapshot, in depth-first order so a parent precedes its
  * children: id, index of the parent in the list (-1 for the page itself), order key, sid,
- * checkbox ("" for none).
+ * checkbox ("" for none), and `1` for a question put to a person (`Ask`; absent otherwise,
+ * added after the first protocol version).
  */
 export type LiveBlockWire = [
 	id: string,
@@ -126,6 +130,7 @@ export type LiveBlockWire = [
 	orderKey: string,
 	sid: string,
 	task: LiveTaskChar | "",
+	question?: 1,
 ];
 
 /** Who made a change: a participant number, or `a` (an agent), `s` (the system), `h` (a person

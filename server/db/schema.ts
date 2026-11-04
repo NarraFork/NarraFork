@@ -3582,6 +3582,8 @@ export const apiRequests = sqliteTable(
 		// 性能指标
 		ttftMs: integer("ttft_ms"), // Time to first token
 		durationMs: integer("duration_ms"), // 总耗时
+		// 首个内容输出 → 请求结束（不含排队与 prefill），用于输出速度；旧记录为 null
+		decodeMs: integer("decode_ms"),
 		// 成本
 		costUsd: real("cost_usd"),
 		/** Null marks an untouched historical record. */
@@ -5498,6 +5500,49 @@ export interface OutlinePendingDeciderJson {
 	delegate: string | null;
 }
 
+/**
+ * The answer of a question (`OutlineAskJson.answer`): the person's decision. A choice
+ * (`option`, 1-based), their own words (`text`), or both; `adopted` when it is the asker's
+ * recommendation. `relayed`: the asking session wrote it down from what the person said in the
+ * conversation (design §3.3), the message it came from when known.
+ */
+export interface OutlineAskAnswerJson {
+	option?: number;
+	text?: string;
+	adopted?: true;
+	/** The person whose decision it is. */
+	by: OutlineTaskActorRef;
+	at: string;
+	/**
+	 * `via`: the origin label of the message it came from when it did not come through NarraFork
+	 * itself (`gateway:<platform handle>`, `oauth:<client>`): who actually typed it.
+	 */
+	relayed?: { narratorId: string; messageId: string | null; via?: string };
+}
+
+/**
+ * A question put to a person (`Ask`, outline P2 PR 7; design §3.3), stored on its block next to
+ * the content (the question itself): who is asked, the choices, the asker's recommendation and
+ * why, and later the answer or the withdrawal. Versioned with the block, so the time machine and
+ * reverts see it. A block is a question or a task, never both. What only routes and delivers it
+ * (who asked, whether the asker was told) is `outline_questions`.
+ */
+export interface OutlineAskJson {
+	/** Who is asked: a person. */
+	to: OutlineTaskActorRef;
+	/** The choices, when there are any. */
+	options?: string[];
+	/** The asker's recommendation: one of the options (1-based), or in words; and why. */
+	recommend: { option?: number; text?: string; reason?: string };
+	/**
+	 * A reversible decision the asker went ahead with (owner decision Q4): its task does not wait,
+	 * and the asker is woken only when the answer differs from the recommendation.
+	 */
+	proceed?: true;
+	answer?: OutlineAskAnswerJson;
+	withdrawn?: { by: OutlineTaskActorRef; at: string; reason?: string };
+}
+
 // === outline_spaces ===
 /**
  * A container of one block forest and its history. Exactly one project space per project, one
@@ -5590,6 +5635,8 @@ export const outlineBlocks = sqliteTable(
 		contentHash: text("content_hash").notNull(),
 		alias: text("alias"),
 		taskJson: text("task_json", { mode: "json" }).$type<OutlineTaskJson>(),
+		/** A question put to a person (`OutlineAskJson`); never set together with `task_json`. */
+		askJson: text("ask_json", { mode: "json" }).$type<OutlineAskJson>(),
 		/** Who last wrote the content (creation included); moves and deletes do not change it. */
 		authorKind: text("author_kind", { enum: ["human", "agent", "system"] }).notNull(),
 		authorId: text("author_id").notNull(),
@@ -5646,8 +5693,11 @@ export const outlineCommits = sqliteTable(
 			.notNull()
 			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
 		seq: integer("seq").notNull(),
-		/** `confirm`: a pending change taking effect (design §2.6), its decider recorded on the row. */
-		kind: text("kind", { enum: ["edit", "revert", "import", "confirm"] }).notNull(),
+		/**
+		 * `confirm`: a pending change taking effect (design §2.6), its decider recorded on the row.
+		 * `answer`: a person's answer to questions (outline P2 PR 7), their confirmation.
+		 */
+		kind: text("kind", { enum: ["edit", "revert", "import", "confirm", "answer"] }).notNull(),
 		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
 		actorId: text("actor_id").notNull(),
 		responsibleUserId: text("responsible_user_id"),
@@ -5689,6 +5739,7 @@ export const outlineBlockVersions = sqliteTable(
 		orderKey: text("order_key").notNull(),
 		content: text("content"),
 		taskJson: text("task_json", { mode: "json" }).$type<OutlineTaskJson>(),
+		askJson: text("ask_json", { mode: "json" }).$type<OutlineAskJson>(),
 		alias: text("alias"),
 		contentHash: text("content_hash").notNull(),
 		changeFlags: integer("change_flags").notNull(),
@@ -5853,6 +5904,11 @@ export const outlinePending = sqliteTable(
 		decisionCommitId: text("decision_commit_id"),
 		reason: text("reason"),
 		reportedAt: text("reported_at"),
+		/**
+		 * When the locker acknowledged a confirmation an agent made on their behalf (their digest,
+		 * outline P2 PR 7); null until then, and for every other row.
+		 */
+		digestSeenAt: text("digest_seen_at"),
 	},
 	(table) => [
 		// FK covering index (a partial index cannot serve the FK action); open rows of a space.
@@ -5868,6 +5924,67 @@ export const outlinePending = sqliteTable(
 			.where(sql`"reported_at" IS NULL AND "status" <> 'open'`),
 		index("idx_outline_pending_decider_open").on(table.deciderUserId).where(sql`"status" = 'open'`),
 		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
+		// Confirmations an agent made on a locker's behalf that the locker has not seen: their digest.
+		index("idx_outline_pending_digest")
+			.on(table.deciderUserId)
+			.where(
+				sql`"status" = 'confirmed' AND "digest_seen_at" IS NULL AND json_extract("decided_by_json", '$.kind') = 'agent'`,
+			),
+	],
+);
+
+// === outline_questions ===
+/**
+ * Routing and delivery of the questions people are asked (`Ask`, outline P2 PR 7; design §3.3):
+ * one row per question block, derived by the write path from the block's `ask_json` in the commit
+ * that changes it (as `outline_task_claims` is to `task_json`), so a revert, a restore or a delete
+ * keeps it in step. Not versioned.
+ *
+ *   - `state`: `open`, `answered` or `withdrawn` (withdrawn, or the block deleted). `proceed`
+ *     copies the block's: such a question makes no task wait.
+ *   - `answered_at`, `answer_commit_id`: the last answer and the commit that recorded it. They
+ *     stay when the question leaves answered, so the same answer coming back (an undo) is not
+ *     delivered again.
+ *   - `to_user_id`: the person asked: their inbox.
+ *   - `asker_*`: the session that asked (its root), the person its turn ran for (the execution
+ *     principal an answer wakes it with; never the person answering) and the tool call. Set when
+ *     the row is created, never after.
+ *   - `delivered_at`: when the answer's message was written to the asker (or there was nobody to
+ *     tell); null while a new answer waits to be delivered (a background sweep retries).
+ *
+ * Ids carry no foreign keys but the block's: a session that is gone simply is not woken.
+ */
+export const outlineQuestions = sqliteTable(
+	"outline_questions",
+	{
+		blockId: text("block_id")
+			.primaryKey()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		spaceId: text("space_id").notNull(),
+		state: text("state", { enum: ["open", "answered", "withdrawn"] }).notNull(),
+		proceed: integer("proceed", { mode: "boolean" }).notNull().default(false),
+		toUserId: text("to_user_id"),
+		askerNarratorId: text("asker_narrator_id"),
+		askerUserId: text("asker_user_id"),
+		askerToolCallId: text("asker_tool_call_id"),
+		createdAt: text("created_at").notNull(),
+		answeredAt: text("answered_at"),
+		answerCommitId: text("answer_commit_id"),
+		deliveredAt: text("delivered_at"),
+	},
+	(table) => [
+		// A person's open questions: their inbox.
+		index("idx_outline_questions_to_open").on(table.toUserId).where(sql`"state" = 'open'`),
+		// Open questions of a space: what makes its tasks wait for people.
+		index("idx_outline_questions_space_open").on(table.spaceId).where(sql`"state" = 'open'`),
+		// A session's open questions: its limit, and what archiving it withdraws.
+		index("idx_outline_questions_asker_open")
+			.on(table.askerNarratorId)
+			.where(sql`"state" = 'open'`),
+		// Answers the asker has not been told of yet: the delivery sweep, oldest first.
+		index("idx_outline_questions_undelivered")
+			.on(table.answeredAt)
+			.where(sql`"state" = 'answered' AND "delivered_at" IS NULL`),
 	],
 );
 

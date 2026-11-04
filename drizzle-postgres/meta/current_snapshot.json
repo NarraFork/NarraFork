@@ -1,6 +1,6 @@
 {
-  "id": "0e4b36cb-13b0-4d8a-88f6-7f4bc8317c12",
-  "prevId": "81304305-168a-41ef-8fc3-187e57817aed",
+  "id": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
+  "prevId": "af2ae099-396f-4399-8676-928a7d7d4a6b",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -601,6 +601,12 @@
         },
         "duration_ms": {
           "name": "duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decode_ms": {
+          "name": "decode_ms",
           "type": "integer",
           "primaryKey": false,
           "notNull": false
@@ -17377,6 +17383,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "ask_json": {
+          "name": "ask_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "alias": {
           "name": "alias",
           "type": "text",
@@ -17548,6 +17560,12 @@
         },
         "task_json": {
           "name": "task_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ask_json": {
+          "name": "ask_json",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -18283,6 +18301,12 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "digest_seen_at": {
+          "name": "digest_seen_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {
@@ -18407,6 +18431,22 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_outline_pending_digest": {
+          "name": "idx_outline_pending_digest",
+          "columns": [
+            {
+              "expression": "decider_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"status\" = 'confirmed' AND \"digest_seen_at\" IS NULL AND (\"decided_by_json\"::jsonb #>> '{kind}') = 'agent'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -18416,6 +18456,171 @@
           "tableTo": "outline_spaces",
           "columnsFrom": [
             "space_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.outline_questions": {
+      "name": "outline_questions",
+      "schema": "",
+      "columns": {
+        "block_id": {
+          "name": "block_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "space_id": {
+          "name": "space_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "proceed": {
+          "name": "proceed",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "to_user_id": {
+          "name": "to_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "asker_narrator_id": {
+          "name": "asker_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "asker_user_id": {
+          "name": "asker_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "asker_tool_call_id": {
+          "name": "asker_tool_call_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "answered_at": {
+          "name": "answered_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "answer_commit_id": {
+          "name": "answer_commit_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "delivered_at": {
+          "name": "delivered_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_outline_questions_to_open": {
+          "name": "idx_outline_questions_to_open",
+          "columns": [
+            {
+              "expression": "to_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"state\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_questions_space_open": {
+          "name": "idx_outline_questions_space_open",
+          "columns": [
+            {
+              "expression": "space_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"state\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_questions_asker_open": {
+          "name": "idx_outline_questions_asker_open",
+          "columns": [
+            {
+              "expression": "asker_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"state\" = 'open'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_questions_undelivered": {
+          "name": "idx_outline_questions_undelivered",
+          "columns": [
+            {
+              "expression": "answered_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"state\" = 'answered' AND \"delivered_at\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "outline_questions_block_id_outline_blocks_id_fk": {
+          "name": "outline_questions_block_id_outline_blocks_id_fk",
+          "tableFrom": "outline_questions",
+          "tableTo": "outline_blocks",
+          "columnsFrom": [
+            "block_id"
           ],
           "columnsTo": [
             "id"

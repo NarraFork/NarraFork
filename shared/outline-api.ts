@@ -13,7 +13,7 @@ export type OutlineViewMode = "facts" | "all";
 
 export type OutlineActorKind = "human" | "agent" | "system";
 
-export type OutlineCommitKind = "edit" | "revert" | "import" | "confirm";
+export type OutlineCommitKind = "edit" | "revert" | "import" | "confirm" | "answer";
 
 export type OutlineTaskStatus = "todo" | "doing" | "done" | "cancelled";
 
@@ -137,6 +137,15 @@ export interface OutlineInProgressItem {
 	assignee: string | null;
 	/** A change to it waits for confirmation. */
 	waiting: boolean;
+	/** It is a question put to a person (`Ask`), not a task. */
+	question?: boolean;
+}
+
+/** A question block as a page shows it (`Ask`, outline P2 PR 7). */
+export interface OutlineQuestionMark {
+	state: "open" | "answered" | "withdrawn";
+	/** A reversible decision the asker went ahead with: nothing waits for it. */
+	proceed: boolean;
 }
 
 export interface OutlineViewBlock {
@@ -146,15 +155,17 @@ export interface OutlineViewBlock {
 	/** Canonical in-block markdown. */
 	content: string;
 	task: OutlineTaskView | null;
+	/** On a question put to a person (`Ask`): its state. */
+	question?: OutlineQuestionMark | null;
 	alias: string | null;
 	tags: string[];
 	/** Children shown in this view, in sibling order. */
 	childIds: string[];
 	/** Blocks of the view under this block that did not fit the budget. */
 	hidden: number;
-	/** Blocks the facts view leaves out under this block (tasks and what is under them). */
+	/** Blocks the facts view leaves out under this block (tasks, questions and what is under them). */
 	processHidden: number;
-	/** Tasks directly under this block that are neither done nor cancelled. */
+	/** Tasks and unanswered questions directly under this block (neither done nor cancelled). */
 	openTasks: number;
 	/**
 	 * Those tasks (at most {@link OUTLINE_PENDING_API_LIMITS.inProgressItems}), for the "in
@@ -463,4 +474,126 @@ export interface OutlineLockRequest {
 export interface OutlineLockResponse {
 	lock: OutlineLockView | null;
 	commit: { id: string; seq: number } | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Questions and the digest (`Ask` and the inbox, outline P2 PR 7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A question put to a person, as the inbox, a page's side panel and the `Ask` card show it. */
+export interface OutlineQuestionView {
+	blockId: string;
+	spaceId: string;
+	sid: string;
+	/** `key/sid`. */
+	address: string;
+	/** Its parent: a question, for a sub-question. */
+	parentId: string | null;
+	/** `Q12`. */
+	alias: string | null;
+	/** The question (canonical in-block markdown). */
+	text: string;
+	options: string[];
+	/** The asker's recommendation: an option (1-based) or in words, and why. */
+	recommend: { option: number | null; text: string | null; reason: string | null };
+	/** The asker went ahead with its recommendation (reversible): nothing waits for it. */
+	proceed: boolean;
+	state: "open" | "answered" | "withdrawn";
+	/** The person asked. */
+	to: { userId: string | null; name: string | null };
+	answer: {
+		option: number | null;
+		text: string | null;
+		/** It is the recommendation. */
+		adopted: boolean;
+		by: { userId: string; name: string | null };
+		at: string;
+		/** Written down by the asking session from the conversation. */
+		relayed: boolean;
+		/** The door the relayed message came through (`gateway:…`, `oauth:…`), when not NarraFork. */
+		relayedVia: string | null;
+	} | null;
+	/**
+	 * The asking session. `hidden`: the viewer may not read it, so neither its id nor its title is
+	 * given (a placeholder is shown).
+	 */
+	askedBy: { narratorId: string | null; title: string | null; hidden: boolean };
+	createdAt: string | null;
+	/** The viewer is the person asked, it is open, and they may write the space. */
+	canAnswer: boolean;
+	/** The block's version: an answer names it, and is refused when it changed since. */
+	versionSeq: number;
+}
+
+/** `GET /blocks/:blockId/questions`: the questions under a block (or a question and its items). */
+export interface OutlineQuestionGroupResponse {
+	group: {
+		blockId: string;
+		spaceId: string;
+		spaceKey: string;
+		pageId: string;
+		title: string;
+		/** The block is itself a question (one asked at the top of a page). */
+		isQuestion: boolean;
+	};
+	questions: OutlineQuestionView[];
+	/** More questions than shown. */
+	truncated: boolean;
+}
+
+/** One answer: a choice, words, both, or the recommendation (`adopt`). */
+export interface OutlineAnswerInput {
+	blockId: string;
+	option?: number;
+	text?: string;
+	adopt?: boolean;
+	/**
+	 * The question's version the person read (`OutlineQuestionView.versionSeq`): checked.
+	 * Required over HTTP ({@link OutlineAnswerRequest}); the service's own callers may omit it.
+	 */
+	versionSeq?: number;
+}
+
+/** One answer as the API takes it: always with the version read. */
+export type OutlineAnswerHttpInput = OutlineAnswerInput & { versionSeq: number };
+
+/** `POST /questions/answer`: questions of one space answered at once. */
+export interface OutlineAnswerRequest {
+	answers: OutlineAnswerHttpInput[];
+}
+
+export interface OutlineAnswerResponse {
+	/** The `answer` commit. */
+	commitId: string | null;
+	answered: string[];
+}
+
+/** A confirmation an agent made on the person's behalf, not acknowledged yet (their digest). */
+export interface OutlineDigestItem {
+	pendingId: string;
+	/** `P` and 8 characters. */
+	label: string;
+	spaceId: string;
+	spaceKey: string;
+	pageId: string;
+	rootBlockId: string | null;
+	summary: string;
+	opCount: number;
+	decidedAt: string | null;
+	/**
+	 * The session that confirmed it. `hidden`: the viewer may not read it, so neither its id nor
+	 * its title is given (a placeholder is shown).
+	 */
+	decidedBy: { narratorId: string | null; title: string | null; hidden: boolean };
+	/** The `confirm` commit: reverting it takes the change back. */
+	commitId: string | null;
+	/** The viewer may write the space, so may revert it (acknowledging needs no access). */
+	canRevert: boolean;
+}
+
+/** `GET /digest`. */
+export interface OutlineDigestResponse {
+	items: OutlineDigestItem[];
+	/** More than shown. */
+	truncated: boolean;
 }

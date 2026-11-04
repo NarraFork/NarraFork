@@ -31,6 +31,7 @@
 import type { WritePortIdentity } from "@server/db/backend/write-port";
 import type {
 	OutlineActorKind,
+	OutlineAskJson,
 	OutlineCommitKind,
 	OutlineLinkKind,
 	OutlineLinkTargetKind,
@@ -77,6 +78,8 @@ export interface OutlineBlockRow {
 	contentHash: string;
 	alias: string | null;
 	taskJson: OutlineTaskJson | null;
+	/** A question put to a person (`Ask`); never set together with `taskJson`. */
+	askJson: OutlineAskJson | null;
 	authorKind: OutlineActorKind;
 	authorId: string;
 	versionSeq: number;
@@ -102,6 +105,7 @@ export interface OutlineVersionRow {
 	/** Null for a tombstone. */
 	content: string | null;
 	taskJson: OutlineTaskJson | null;
+	askJson: OutlineAskJson | null;
 	alias: string | null;
 	contentHash: string;
 	changeFlags: number;
@@ -221,6 +225,11 @@ export interface OutlinePendingRow {
 	reason: string | null;
 	/** When the proposer was shown the decision; null while it has not been. */
 	reportedAt: string | null;
+	/**
+	 * When the locker acknowledged a confirmation an agent made on their behalf (their digest);
+	 * null until then and on every other row.
+	 */
+	digestSeenAt: string | null;
 }
 
 /**
@@ -317,6 +326,7 @@ export type OutlineBlockPatch = Partial<
 		| "contentHash"
 		| "alias"
 		| "taskJson"
+		| "askJson"
 		| "authorKind"
 		| "authorId"
 		| "deleted"
@@ -370,6 +380,8 @@ export interface OutlineClaimPlan {
  *   8. write `claims`;
  *   9. write `pending`: withdraw, repage, then decide (its `decisionCommitId` is the commit's
  *      id), then put (insert, or update the row merged into).
+ *  10. write `questions` (insert, or update all but the asker, creation and, unless
+ *      `setDelivered`, delivery).
  *
  * Step 1 claims `next_seq`, and `in_process_epoch` with it when the plan names one. Before it the
  * section checks that every claim row `claims` expects (`put`, `expire`, `verify`) is still as
@@ -414,6 +426,8 @@ export interface OutlineCommitPlan {
 	 * decision a confirmation makes, the changes an unlock withdraws.
 	 */
 	pending?: OutlinePendingPlan;
+	/** Question rows of the blocks whose question this commit asks, changes or ends (step 10). */
+	questions?: OutlineQuestionWrite[];
 }
 
 /**
@@ -569,6 +583,35 @@ export async function narratorSessions(
 		});
 	}
 	return out;
+}
+
+/**
+ * Routing and delivery of a question (`outline_questions`), derived from its block's `ask_json` by
+ * the write path; see the table.
+ */
+export interface OutlineQuestionRow {
+	blockId: string;
+	spaceId: string;
+	state: "open" | "answered" | "withdrawn";
+	proceed: boolean;
+	toUserId: string | null;
+	askerNarratorId: string | null;
+	askerUserId: string | null;
+	askerToolCallId: string | null;
+	createdAt: string;
+	answeredAt: string | null;
+	answerCommitId: string | null;
+	deliveredAt: string | null;
+}
+
+/**
+ * A question row a commit writes: inserted whole when new; an existing row keeps its asker and
+ * creation and takes the rest, and its `deliveredAt` only with `setDelivered` (the answer is new:
+ * not told yet, or told already), so a delivery marked meanwhile is not undone.
+ */
+export interface OutlineQuestionWrite {
+	row: OutlineQuestionRow;
+	setDelivered: boolean;
 }
 
 /** A task a session holds a claim on, with the task's block. */
@@ -822,6 +865,11 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	listOpenPendingByPage(pageId: string, limit: number): Promise<OutlinePendingHead[]>;
 	/** Open pending changes of a space (heads), oldest first, at most `limit`. */
 	listOpenPendingBySpace(spaceId: string, limit: number): Promise<OutlinePendingHead[]>;
+	/**
+	 * Open pending changes a person decides as their locker (`decider_user_id`; heads), oldest
+	 * first, at most `limit`: their inbox.
+	 */
+	listOpenPendingForDecider(userId: string, limit: number): Promise<OutlinePendingHead[]>;
 	/** Open pending changes (heads) on any of the given lock roots (the open-root index), at most `limit`. */
 	listOpenPendingByRoots(rootIds: readonly string[], limit: number): Promise<OutlinePendingHead[]>;
 	/** How many open pending changes a page has, counting at most `limit`. */
@@ -856,6 +904,48 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	getFirstVersions(blockIds: readonly string[]): Promise<OutlineFirstVersion[]>;
 	/** Live locked blocks of a page (the partial lock index), at most `limit`. */
 	listLockedBlocks(pageId: string, limit: number): Promise<OutlineBlockMeta[]>;
+	/**
+	 * Confirmations an agent made on a locker's behalf that the locker has not acknowledged
+	 * (heads; the digest index), oldest first, at most `limit`.
+	 */
+	listUnseenDelegateConfirmations(userId: string, limit: number): Promise<OutlinePendingHead[]>;
+	/** Mark such confirmations of the locker as seen; returns how many were marked. */
+	markDelegateConfirmationsSeen(
+		userId: string,
+		ids: readonly string[],
+		at: string,
+	): Promise<number>;
+
+	// ── questions (`services/outline/questions.ts`) ─────────────────────────────────────
+	// Written by `applyCommit` (the plan's `questions`); outside a commit only `delivered_at`
+	// (`markQuestionsDelivered`). Every read is one indexed statement with a limit.
+
+	/** Question rows of the given blocks. */
+	getQuestions(blockIds: readonly string[]): Promise<OutlineQuestionRow[]>;
+	/**
+	 * The first `chars` characters of the given blocks' content, by id (live or deleted): what a
+	 * list shows of them, without reading whole bodies.
+	 */
+	getContentHeads(blockIds: readonly string[], chars: number): Promise<Map<string, string>>;
+	/**
+	 * Open questions of each of the given spaces, oldest first, at most `limitPerSpace` of each:
+	 * one read for many spaces (a project board derives the waits of every session on its page).
+	 */
+	listOpenQuestionsBySpaces(
+		spaceIds: readonly string[],
+		limitPerSpace: number,
+	): Promise<OutlineQuestionRow[]>;
+	/** Open questions put to a person, oldest first, at most `limit`. */
+	listOpenQuestionsForUser(userId: string, limit: number): Promise<OutlineQuestionRow[]>;
+	/** Open questions a session asked, oldest first, at most `limit`. */
+	listOpenQuestionsByAsker(narratorId: string, limit: number): Promise<OutlineQuestionRow[]>;
+	/** Answered questions whose asker was not told yet, oldest answer first, at most `limit`. */
+	listUndeliveredAnswers(limit: number): Promise<OutlineQuestionRow[]>;
+	/**
+	 * Mark answers as delivered; only rows still answered and undelivered are marked (a revert
+	 * reopening one meanwhile wins). Returns how many were marked.
+	 */
+	markQuestionsDelivered(blockIds: readonly string[], at: string): Promise<number>;
 
 	// ── live session log (`services/outline/live/`) ─────────────────────────────────────
 	// Not part of a page's history: rows are written while a page is edited live and deleted

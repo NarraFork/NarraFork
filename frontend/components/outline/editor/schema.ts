@@ -14,11 +14,13 @@ export const schema = new Schema({
 		block: {
 			content: "body children?",
 			// `hidden`: blocks under it the view leaves out (tasks in the facts view), for a hint.
+			// `question`: a question put to a person (`Ask`), from the block model; never edited.
 			attrs: {
 				id: { default: null },
 				task: { default: null },
 				collapsed: { default: false },
 				hidden: { default: 0 },
+				question: { default: false },
 			},
 			defining: true,
 			toDOM: (n) => ["div", { class: "ob-block", "data-id": n.attrs.id }, 0],

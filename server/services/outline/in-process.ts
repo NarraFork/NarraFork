@@ -118,7 +118,8 @@ export function inProcessOfPage(
 		let above = current ? (value.get(current.id) ?? false) : false;
 		for (let i = path.length - 1; i >= 0; i--) {
 			const block = path[i] as OutlineStructureRow;
-			above = block.taskJson !== null || above;
+			// A question is process like a task (design §2.1).
+			above = block.taskJson !== null || (block.askJson ?? null) !== null || above;
 			value.set(block.id, above);
 		}
 	}
@@ -486,7 +487,7 @@ export async function readInProcess(
 		let above = current ? (value.get(current.id) ?? false) : false;
 		for (let i = path.length - 1; i >= 0; i--) {
 			const block = path[i] as OutlineBlockMeta;
-			above = block.taskJson !== null || above;
+			above = block.taskJson !== null || block.askJson !== null || above;
 			value.set(block.id, above);
 		}
 		return value.get(meta.id) ?? false;

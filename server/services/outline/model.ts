@@ -24,6 +24,8 @@
  *      writer that planned against an older counter value knows the space changed under it.
  */
 import type {
+	OutlineAskAnswerJson,
+	OutlineAskJson,
 	OutlinePendingDeciderJson,
 	OutlinePendingRequesterJson,
 	OutlineTaskActorRef,
@@ -32,6 +34,8 @@ import type {
 } from "@server/db/schema";
 
 export type {
+	OutlineAskAnswerJson,
+	OutlineAskJson,
 	OutlinePendingDeciderJson,
 	OutlinePendingRequesterJson,
 	OutlineTaskActorRef,
@@ -63,6 +67,8 @@ export const OUTLINE_CHANGE = {
 	 * together with what the write changed.
 	 */
 	MERGE: 256,
+	/** Its question (`ask_json`: asked, answered, withdrawn) changed. */
+	ASK: 512,
 } as const;
 
 export type OutlineChangeFlag = (typeof OUTLINE_CHANGE)[keyof typeof OUTLINE_CHANGE];
@@ -94,9 +100,10 @@ export const OUTLINE_TASKS_PAGE_ALIAS = "tasks";
 /**
  * `edit` is every ordinary write; `revert` and `import` are written by their own paths; `confirm`
  * is a pending change taking effect (`pending.ts`): its actor is the proposer, its responsible
- * person the decider's.
+ * person the decider's; `answer` is a person's answer to questions (`questions.ts`), written as
+ * that person (or relayed by the asking session, the person still responsible).
  */
-export const OUTLINE_COMMIT_KINDS = ["edit", "revert", "import", "confirm"] as const;
+export const OUTLINE_COMMIT_KINDS = ["edit", "revert", "import", "confirm", "answer"] as const;
 export type OutlineCommitKind = (typeof OUTLINE_COMMIT_KINDS)[number];
 
 /**

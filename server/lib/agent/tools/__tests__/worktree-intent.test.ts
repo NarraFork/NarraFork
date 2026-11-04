@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { WorktreeCreateResult, WorktreeListResult } from "@shared/narrator-worktrees";
+import type { SwitchWorkingDirectoryRequest } from "@shared/workspace-context";
 import { AppError } from "../../../errors";
 import {
 	type WorktreeCreateRequest,
@@ -37,6 +38,9 @@ const listed: WorktreeListResult = {
 let requests: WorktreeCreateRequest[];
 let listInputs: unknown[];
 let recoveryIds: string[];
+let switches: SwitchWorkingDirectoryRequest[];
+let switchChanged: boolean;
+let switchFailure: Error | undefined;
 let result: WorktreeCreateResult;
 let failure: Error | undefined;
 let tools: Map<string, ToolDefinition>;
@@ -47,6 +51,9 @@ beforeEach(() => {
 	requests = [];
 	listInputs = [];
 	recoveryIds = [];
+	switches = [];
+	switchChanged = true;
+	switchFailure = undefined;
 	result = created;
 	failure = undefined;
 	ctx = {
@@ -64,6 +71,20 @@ beforeEach(() => {
 			contextKey: "context",
 			git: { workspaceKey: "workspace", repositoryKey: "repo", rootPath: "/repo" },
 			capabilities: { switchDirectory: true },
+		},
+		switchWorkingDirectory: async (request) => {
+			switches.push(request);
+			if (switchFailure) throw switchFailure;
+			return {
+				changed: switchChanged,
+				previous: frozenWorkspace(),
+				current: {
+					...frozenWorkspace(),
+					revision: 5,
+					cwd: request.target.cwd,
+					contextKey: switchChanged ? "switched" : frozenWorkspace().contextKey,
+				},
+			};
 		},
 	};
 	tools = new Map(
@@ -146,6 +167,18 @@ describe("intent-only worktree tools", () => {
 		expect(
 			(schema.properties as Record<string, Record<string, unknown>>).destinationPath.maxLength,
 		).toBe(4096);
+		// Optional, so the two-call flow stays valid; advertised or the model cannot use it.
+		expect(
+			(schema.properties as Record<string, Record<string, unknown>>).switchToWorktree.type,
+		).toBe("boolean");
+		expect(
+			(
+				resolveToolJsonSchema(toolOf("AttachWorktree")).properties as Record<
+					string,
+					Record<string, unknown>
+				>
+			).switchToWorktree.type,
+		).toBe("boolean");
 		expect(resolveToolJsonSchema(toolOf("AttachWorktree")).required).toEqual([
 			"branchName",
 			"destinationPath",
@@ -220,6 +253,96 @@ describe("intent-only worktree tools", () => {
 		expect(requests).toHaveLength(1);
 	});
 
+	test("switchToWorktree switches the working directory in the same call", async () => {
+		const output = await execute("CreateWorktree", { ...intent, switchToWorktree: true });
+		expect(output.isError).toBe(false);
+		expect(switches).toEqual([
+			{
+				expectedRevision: 4,
+				requestId: `switch-${output.data.operationId}`,
+				target: { deviceId: "local", cwd: "/repo/.worktrees/fix" },
+			},
+		]);
+		expect(output.data.switch).toEqual({ switched: true });
+		expect(output.data.nextAction).toBe(
+			"Worktree created and the working directory switched to it. This pass ends; the next pass starts in the new worktree.",
+		);
+	});
+
+	test("the switch intent never changes the durable creation identity", async () => {
+		const plain = await execute("CreateWorktree", intent);
+		const switching = await execute("CreateWorktree", { ...intent, switchToWorktree: true });
+		expect(switching.data.operationId).toBe(plain.data.operationId);
+	});
+
+	test("omitting switchToWorktree leaves the working directory alone", async () => {
+		const output = await execute("CreateWorktree", intent);
+		expect(switches).toHaveLength(0);
+		expect(output.data.switch).toBeUndefined();
+	});
+
+	test("AttachWorktree honors the same switch intent", async () => {
+		const output = await execute("AttachWorktree", { ...intent, switchToWorktree: true });
+		expect(requests[0].branch).toEqual({ kind: "existing", name: "fix" });
+		expect(switches).toHaveLength(1);
+		expect(output.data.switch?.switched).toBe(true);
+	});
+
+	test("a transition that was already at the target still reports a switch", async () => {
+		switchChanged = false;
+		const output = await execute("CreateWorktree", { ...intent, switchToWorktree: true });
+		expect(output.data.switch).toEqual({ switched: true });
+	});
+
+	test("switchToWorktree fails closed before creation when the runtime cannot switch", async () => {
+		const noRuntime = await execute(
+			"CreateWorktree",
+			{ ...intent, switchToWorktree: true },
+			{ ...ctx, switchWorkingDirectory: undefined },
+		);
+		expect(noRuntime.isError).toBe(true);
+		expect(noRuntime.data.error.code).toBe("WORKTREE_SWITCH_UNSUPPORTED");
+		expect(noRuntime.data.dispatched).toBe(false);
+		expect(noRuntime.data.nextAction).toContain("without switchToWorktree");
+		const specialized = await execute(
+			"CreateWorktree",
+			{ ...intent, switchToWorktree: true },
+			{
+				...ctx,
+				workspaceContext: { ...frozenWorkspace(), capabilities: { switchDirectory: false } },
+			},
+		);
+		expect(specialized.data.error.code).toBe("WORKTREE_SWITCH_UNSUPPORTED");
+		expect(specialized.data.dispatched).toBe(false);
+		expect(requests).toHaveLength(0);
+		expect(switches).toHaveLength(0);
+	});
+
+	test("a failed switch never disguises the creation that already happened", async () => {
+		switchFailure = new AppError("Workspace revision changed", 409, "WORKSPACE_CONTEXT_CONFLICT");
+		const output = await execute("CreateWorktree", { ...intent, switchToWorktree: true });
+		expect(output.isError).toBe(false);
+		expect(output.data.worktree).toEqual(created.worktree);
+		expect(output.data.switch).toEqual({
+			switched: false,
+			error: { code: "WORKSPACE_CONTEXT_CONFLICT", message: "Workspace revision changed" },
+		});
+		expect(output.data.nextAction).toContain("switch did not complete");
+		expect(output.data.nextAction).toContain("SwitchWorkingDirectory");
+		expect(requests).toHaveLength(1);
+	});
+
+	test("a creation that was not established attempts no switch", async () => {
+		for (const outcome of ["unknown", "failed"] as const) {
+			result = { ...created, outcome, worktree: null };
+			const output = await execute("CreateWorktree", { ...intent, switchToWorktree: true });
+			expect(output.isError).toBe(true);
+			expect(output.data.switch).toBeUndefined();
+		}
+		expect(switches).toHaveLength(0);
+		expect(requests).toHaveLength(2);
+	});
+
 	test("operation identity is stable across provider call IDs and explicit default HEAD", async () => {
 		const a = await execute("CreateWorktree", intent, { ...ctx, currentToolUseId: "call-a" });
 		const b = await execute(
@@ -272,6 +395,7 @@ describe("intent-only worktree tools", () => {
 			{ ...intent, destinationPath: "a".repeat(4097) },
 			{ ...intent, expectedRevision: 4 },
 			{ ...intent, branch: { kind: "new" } },
+			{ ...intent, switchToWorktree: "yes" },
 		]) {
 			const output = await execute("CreateWorktree", input);
 			expect(output.isError).toBe(true);
