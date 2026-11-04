@@ -1,7 +1,7 @@
 import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
-import { parseModelId, settings } from "../settings";
+import { type ModelProtocol, parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
 import { buildAdapterHistory } from "./history-build";
 import { isRetryableError } from "./loop";
@@ -10,10 +10,13 @@ import {
 	type GenerateOptions,
 	type ProviderResolution,
 	resolveProviderAndModel,
+	switchableModelProtocols,
 } from "./provider";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
 import {
+	protocolsWithToolAppending,
 	resolveAdapterToolLoadingStrategy,
+	resolveTargetToolLoadingStrategy,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 } from "./tool-loading";
@@ -72,13 +75,42 @@ export function resolveHistoryToolLoadingStrategy(
 	return resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
 }
 
-/** Cache age and tool strategy are not model identity and never open an epoch. */
-export function resolveEpochTarget(
-	model: string,
-	provider: string,
-): { fingerprint: string; cacheTtlMs: number | null } {
+/**
+ * What an epoch is frozen for. Cache age is not model identity and never opens an epoch.
+ * The same model on another protocol or loading strategy sends a different array and
+ * history shape, so an epoch records both and a change to either opens a new one.
+ */
+export interface EpochTarget {
+	fingerprint: string;
+	cacheTtlMs: number | null;
+	strategy: ToolLoadingStrategy;
+	protocol?: ModelProtocol;
+}
+
+export function resolveEpochTarget(model: string, provider: string): EpochTarget {
 	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
-	return { fingerprint: `${resolved.provider}:${resolved.model}`, cacheTtlMs: null };
+	const target = resolved.adapter.toolLoadingTarget?.(resolved.model);
+	return {
+		fingerprint: `${resolved.provider}:${resolved.model}`,
+		cacheTtlMs: null,
+		strategy: resolveTargetToolLoadingStrategy(resolved.model, target),
+		...(target ? { protocol: target.protocol } : {}),
+	};
+}
+
+/**
+ * Other protocols this connection can select for `model` on which tools load without
+ * rewriting the declared array. Empty when the current protocol already can, or when
+ * the connection offers no per-model protocol choice.
+ */
+export function suggestToolAppendingProtocols(model: string, provider: string): ModelProtocol[] {
+	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
+	const target = resolved.adapter.toolLoadingTarget?.(resolved.model);
+	if (resolveTargetToolLoadingStrategy(resolved.model, target) !== "replace_tools") return [];
+	const choices = switchableModelProtocols(resolved.provider, resolved.model).filter(
+		(protocol) => protocol !== target?.protocol,
+	);
+	return protocolsWithToolAppending(resolved.model, choices);
 }
 
 /**

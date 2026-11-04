@@ -26,14 +26,25 @@ export interface TokenDanceCatalogModel {
 	supported_protocols: string[];
 }
 
+/** Catalog protocol ids in preference order, with the request protocol each selects. */
+const TOKENDANCE_CATALOG_PROTOCOLS: readonly (readonly [string, TokenDanceProtocol])[] = [
+	["anthropic:messages", "anthropic-messages"],
+	["openai:responses", "openai-responses"],
+	["openai:chat-completions", "completions-compatible"],
+	["gemini:generate-content", "gemini-compatible"],
+];
+
+/** Every request protocol a catalog entry supports, in preference order. */
+export function tokenDanceProtocols(protocols: readonly string[]): TokenDanceProtocol[] {
+	return TOKENDANCE_CATALOG_PROTOCOLS.flatMap(([id, protocol]) =>
+		protocols.includes(id) ? [protocol] : [],
+	);
+}
+
 export function selectTokenDanceProtocol(
 	protocols: readonly string[],
 ): TokenDanceProtocol | undefined {
-	if (protocols.includes("anthropic:messages")) return "anthropic-messages";
-	if (protocols.includes("openai:responses")) return "openai-responses";
-	if (protocols.includes("openai:chat-completions")) return "completions-compatible";
-	if (protocols.includes("gemini:generate-content")) return "gemini-compatible";
-	return undefined;
+	return tokenDanceProtocols(protocols)[0];
 }
 
 /** Never include an API Key in this public connection DTO. */
