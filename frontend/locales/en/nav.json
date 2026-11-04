@@ -26,6 +26,7 @@
 	"undo": "Undo",
 	"undoFailed": "Could not undo — recent tabs changed",
 	"newNarrator": "New narrator",
+	"newSession": "New session",
 	"noRecentTabs": "No recent tabs",
 	"closeTab": "Close tab",
 	"workspaceTreeUpdateFailed": "Failed to update workspace layout",

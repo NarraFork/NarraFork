@@ -6,7 +6,6 @@ import {
 } from "@frontend/hooks/useResizableNav";
 import type { AppShellProps } from "@mantine/core";
 import {
-	ActionIcon,
 	Anchor,
 	AppShell,
 	Badge,
@@ -23,15 +22,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
-import {
-	IconAlertTriangle,
-	IconArrowLeft,
-	IconDashboard,
-	IconMessageChatbot,
-	IconMessageReport,
-	IconPlus,
-	IconSettings,
-} from "@tabler/icons-react";
+import { IconAlertTriangle, IconArrowLeft, IconSettings } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import {
 	Link,
@@ -41,7 +32,7 @@ import {
 	useRouter,
 	useRouterState,
 } from "@tanstack/react-router";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
@@ -53,8 +44,6 @@ import { useMobileViewport } from "../hooks/useMobileViewport";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
-import { addRecentTab } from "../hooks/useRecentTabs";
-import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
 import { api, clearToken } from "../lib/api";
@@ -89,19 +78,13 @@ import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { RoutePendingIndicator } from "./common/RouteChunkErrorBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
-import {
-	CreateNarratorLazyModal,
-	preloadCreateNarratorModal,
-} from "./narrator/CreateNarratorLazyModal";
-import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
-import { HeaderSearchBox } from "./nav/HeaderSearchBox";
 import { NavOverflowMenu } from "./nav/NavOverflowMenu";
+import { NavTopSection } from "./nav/NavTopSection";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 import { useNavBadges } from "./nav/use-nav-badges";
-import { WorkspaceSwitcher } from "./nav/WorkspaceSwitcher";
 import { NotificationBell } from "./notifications/NotificationBell";
 import { PluginPermissionRequestHost } from "./plugins-admin/PluginPermissionRequestHost";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
@@ -227,10 +210,6 @@ export function AuthenticatedLayout() {
 	});
 	const headerRef = useRef<HTMLElement>(null);
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
-	// The search QUERY state lives in HeaderSearchBox (per-keystroke re-renders
-	// must not touch the AppShell). Only the mobile open/closed toggle stays
-	// here because the title below is gated on it.
-	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
 	const { t } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
@@ -346,27 +325,6 @@ export function AuthenticatedLayout() {
 	const [wizardOpen, setWizardOpen] = useState(false);
 	const wizardAutoOpenedRef = useRef(false);
 
-	// --- Create narrator modal (triggered from nav) ---
-	const [createNarratorOpened, setCreateNarratorOpened] = useState(false);
-	const requireSetup = useSetupWizardGuard();
-	const openCreateNarrator = useCallback(() => {
-		preloadCreateNarratorModal();
-		if (!requireSetup()) return;
-		setCreateNarratorOpened(true);
-	}, [requireSetup]);
-	const handleNarratorCreated = useCallback(
-		(data: CreateNarratorResult) => {
-			addRecentTab({
-				type: "narrator",
-				id: data.id,
-				title: data.title,
-				subtitle: data.cwd,
-				status: data.status,
-			});
-			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.id } });
-		},
-		[navigate],
-	);
 	useEffect(() => {
 		if (prefs?.setupWizardCompleted !== false) {
 			wizardAutoOpenedRef.current = false;
@@ -482,63 +440,11 @@ export function AuthenticatedLayout() {
 				>
 					<Group wrap="nowrap" className="nf-header-side">
 						<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-						<Tooltip
-							label={t(navCollapsed ? "expandSidebar" : "collapseSidebar")}
-							position="bottom"
-							openDelay={400}
-							disabled={wizardOpen}
-						>
-							<BrandTitle
-								order={3}
-								visibleFrom="sm"
-								onClick={wizardOpen ? undefined : toggleNavCollapsed}
-								style={{ cursor: wizardOpen ? "default" : "pointer", userSelect: "none" }}
-							/>
-						</Tooltip>
-
-						<SystemMaintenanceBadge />
-						<UpdateBadge />
-						{requestEvidencePinning && (
-							<Tooltip
-								label={t(
-									requestEvidenceAutoPin === "errors"
-										? "requestEvidenceErrorsTooltip"
-										: "requestEvidenceAllTooltip",
-								)}
-								position="bottom"
-								withArrow
-							>
-								<Button
-									variant="light"
-									color="orange"
-									size="xs"
-									leftSection={<IconAlertTriangle size={14} />}
-									onClick={openRequestEvidenceSetting}
-									style={{ flexShrink: 0 }}
-								>
-									{t("requestEvidencePinningBadge")}
-								</Button>
-							</Tooltip>
-						)}
-						{!searchOpen && <BrandTitle order={3} hiddenFrom="sm" />}
+						<BrandTitle order={3} hiddenFrom="sm" />
 					</Group>
-					<Group wrap="nowrap" className="nf-header-side">
-						<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
-						<WorkspaceSwitcher />
+					{/* Phones keep the bell here: the sidebar is a drawer they have to open. */}
+					<Group wrap="nowrap" className="nf-header-side" hiddenFrom="sm">
 						<NotificationBell />
-						<Tooltip label={t("feedback")} position="bottom" withArrow>
-							<ActionIcon
-								variant="subtle"
-								color="gray"
-								component="a"
-								href="https://github.com/NarraFork/NarraFork/issues"
-								target="_blank"
-								rel="noopener noreferrer"
-							>
-								<IconMessageReport size={20} />
-							</ActionIcon>
-						</Tooltip>
-						<HeaderSearchBox searchOpen={searchOpen} onSearchOpenChange={setSearchOpen} />
 					</Group>
 				</Group>
 			</AppShell.Header>
@@ -603,51 +509,40 @@ export function AuthenticatedLayout() {
 								zIndex: 100,
 							}}
 						/>
-						<Box>
-							<Tooltip label={t("dashboard")} position="right" disabled={!navCollapsed}>
-								<NavLink
-									component={Link}
-									to="/"
-									label={navCollapsed ? undefined : t("dashboard")}
-									leftSection={<IconDashboard size={16} />}
-								/>
-							</Tooltip>
-						</Box>
-						<Box>
-							<Tooltip label={t("narrators")} position="right" disabled={!navCollapsed}>
-								<NavLink
-									label={navCollapsed ? undefined : t("narrators")}
-									active={pathname.startsWith("/narrators")}
-									leftSection={<IconMessageChatbot size={16} />}
-									onClick={() => navigate({ to: "/narrators" })}
-									rightSection={
-										navCollapsed ? undefined : (
-											<Group gap={8} wrap="nowrap">
-												<Tooltip label={t("newNarrator")} position="right" withArrow>
-													<ActionIcon
-														size={28}
-														variant="subtle"
-														color="gray"
-														onPointerEnter={preloadCreateNarratorModal}
-														onFocus={preloadCreateNarratorModal}
-														onPointerDown={preloadCreateNarratorModal}
-														onClick={(e: React.MouseEvent) => {
-															e.preventDefault();
-															e.stopPropagation();
-															openCreateNarrator();
-															closeNav();
-														}}
-														aria-label={t("newNarrator")}
-													>
-														<IconPlus size={16} />
-													</ActionIcon>
-												</Tooltip>
-											</Group>
-										)
-									}
-								/>
-							</Tooltip>
-						</Box>
+						<NavTopSection
+							collapsed={navCollapsed}
+							onToggleCollapsed={toggleNavCollapsed}
+							onNavigate={closeNav}
+							statusBadges={
+								<>
+									<SystemMaintenanceBadge />
+									<UpdateBadge />
+									{requestEvidencePinning && (
+										<Tooltip
+											label={t(
+												requestEvidenceAutoPin === "errors"
+													? "requestEvidenceErrorsTooltip"
+													: "requestEvidenceAllTooltip",
+											)}
+											position="right"
+											withArrow
+										>
+											<Button
+												variant="light"
+												color="orange"
+												size="compact-xs"
+												leftSection={<IconAlertTriangle size={12} />}
+												onClick={openRequestEvidenceSetting}
+												style={{ flexShrink: 0 }}
+											>
+												{t("requestEvidencePinningBadge")}
+											</Button>
+										</Tooltip>
+									)}
+									<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
+								</>
+							}
+						/>
 						{!navCollapsed && (
 							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
 								<RecentTabList filter="narrator" />
@@ -796,12 +691,6 @@ export function AuthenticatedLayout() {
 			<TokenDanceRecoveryHost />
 			<BrokenModelMigrationHost />
 			<PluginPermissionRequestHost />
-
-			<CreateNarratorLazyModal
-				opened={createNarratorOpened}
-				onClose={() => setCreateNarratorOpened(false)}
-				onCreated={handleNarratorCreated}
-			/>
 
 			{/*
 			 * The two fixed top banners are rendered LAST on purpose.

@@ -15,3 +15,8 @@
 [data-collapsed] .mantine-NavLink-body {
 	display: none;
 }
+
+/* Sidebar status row (maintenance / update / evidence badges): no gap when empty. */
+.nf-nav-status-row:empty {
+	display: none;
+}
