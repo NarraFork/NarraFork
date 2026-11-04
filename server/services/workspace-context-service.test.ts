@@ -310,6 +310,120 @@ describe("local authoritative workspace context", () => {
 		).rejects.toMatchObject({ statusCode: 409 });
 		expect(row.workspaceRevision).toBe(0);
 	});
+	test.each([
+		null,
+		"",
+	])("unselected legacy cwd (%s) is recovery metadata, never executable", async (cwd) => {
+		row.cwd = cwd;
+		const before = { ...row };
+		await expect(workspaceContextService.get("narrator")).rejects.toMatchObject({
+			code: "WORKSPACE_DIRECTORY_REQUIRED",
+		});
+		const metadata = await workspaceContextService.getForDirectorySwitch("narrator");
+		expect(metadata.cwd).toBe("");
+		expect(metadata.revision).toBe(0);
+		expect(metadata.git).toBeUndefined();
+		expect(metadata.capabilities.switchDirectory).toBe(true);
+		expect(await workspaceContextService.getForDirectorySwitch("narrator")).toEqual(metadata);
+		expect(row).toEqual(before);
+		await expect(workspaceContextService.get("narrator")).rejects.toMatchObject({
+			code: "WORKSPACE_DIRECTORY_REQUIRED",
+		});
+
+		const result = await change();
+		expect(result.previous).toEqual(metadata);
+		expect(result.current.contextKey).not.toBe(metadata.contextKey);
+		expect(result.current.revision).toBe(1);
+		expect(await workspaceContextService.get("narrator")).toEqual(result.current);
+		expect(row.cwd).toBe(join(root, "new"));
+		expect(row.workspaceContext).toEqual(result.current);
+		expect(events).toHaveLength(1);
+		expect(displayMessages).toHaveLength(1);
+	});
+	test.each(["PATCH", "POST"])("HTTP %s repairs an unselected legacy cwd", async (method) => {
+		row.cwd = null;
+		const router = app();
+		const get = await router.request("/api/narrators/narrator/workspace-context");
+		expect(get.status).toBe(200);
+		const previous = (await get.json()) as WorkspaceContext;
+		expect(previous.cwd).toBe("");
+		expect(row.workspaceContext).toBeNull();
+		const response = await router.request(
+			`/api/narrators/narrator/${method === "PATCH" ? "cwd" : "workspace-context/switch"}`,
+			{
+				method,
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(
+					method === "PATCH"
+						? { cwd: join(root, "new") }
+						: {
+								expectedRevision: previous.revision,
+								requestId: "recovery",
+								target: { deviceId: "local", cwd: join(root, "new") },
+							},
+				),
+			},
+		);
+		expect(response.status).toBe(200);
+		expect((await response.json()).changed).toBe(true);
+		expect(row.cwd).toBe(join(root, "new"));
+		expect(row.workspaceRevision).toBe(1);
+		expect(displayMessages).toHaveLength(1);
+	});
+	test("unselected cwd recovery keeps target validation, revision and admission guards", async () => {
+		row.cwd = null;
+		const before = { ...row };
+		await writeFile(join(root, "file"), "not a directory");
+		for (const cwd of [join(root, "missing"), join(root, "file"), "relative"])
+			await expect(change(cwd)).rejects.toThrow();
+		await expect(change(join(root, "new"), 1)).rejects.toMatchObject({
+			code: "WORKSPACE_CONTEXT_CONFLICT",
+		});
+		for (const status of ["working", "waiting"]) {
+			row.status = status;
+			await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_BUSY" });
+		}
+		row.status = "idle";
+		const reservation = reserveNarratorRevertAdmission("narrator");
+		try {
+			await expect(change()).rejects.toMatchObject({ statusCode: 409 });
+		} finally {
+			reservation.release();
+		}
+		policySpy.mockResolvedValue({ evaluatePath: () => ({ decision: "deny" }) } as never);
+		await expect(change()).rejects.toThrow();
+		expect(row).toEqual(before);
+		expect(events).toEqual([]);
+		expect(displayMessages).toEqual([]);
+	});
+	test("unselected cwd does not enable switching specialized or remote narrators", async () => {
+		row.cwd = null;
+		for (const variant of ["subagent:general", "knowledge"]) {
+			row.variant = variant;
+			expect(
+				(await workspaceContextService.getForDirectorySwitch("narrator")).capabilities
+					.switchDirectory,
+			).toBe(false);
+			await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
+		}
+		row.variant = "primary";
+		row.traits = ["background"];
+		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
+		row.traits = [];
+		row.defaultDeviceId = "offline-remote";
+		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
+		expect(row.cwd).toBeNull();
+		expect(row.workspaceRevision).toBe(0);
+		expect(row.workspaceContext).toBeNull();
+	});
+	test("concurrent unselected cwd recovery has a single winner", async () => {
+		row.cwd = null;
+		await mkdir(join(root, "other"));
+		const results = await Promise.allSettled([change(), change(join(root, "other"))]);
+		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+		expect(row.workspaceRevision).toBe(1);
+		expect(events).toHaveLength(1);
+	});
 	test("missing legacy cwd can be read and recovered by an explicit valid switch", async () => {
 		row.cwd = join(root, "removed");
 		const current = await workspaceContextService.get("narrator");
