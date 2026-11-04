@@ -4526,13 +4526,19 @@ const sqliteNarratorPersistence = {
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
 		// The step is complete: items it left incomplete are interrupted, not streaming.
-		db.transaction(
-			(tx) => {
-				const queueMark = syncQueueMark();
-				updateEnvelope(tx, messageId, updates, { mode: "sealed" });
-				flushQueuedSince(queueMark);
-			},
-			{ behavior: "immediate" },
+		// 这一步是 assistant_message 的封口写：一次 BUSY 会把整个 loop 判死，
+		// 与其它写路径一样交给带退避的 withDbRetry。
+		await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						updateEnvelope(tx, messageId, updates, { mode: "sealed" });
+						flushQueuedSince(queueMark);
+					},
+					{ behavior: "immediate" },
+				),
+			{ label: "patchStepMeta", maxRetries: 5 },
 		);
 	},
 
