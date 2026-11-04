@@ -15,18 +15,27 @@ export interface OutlinePlanPromptRoot {
 	version: number;
 }
 
+/**
+ * A plan root as the plan-mode system prompt names it: its address only, which stays the same
+ * while it is planned (review round 1 S4: the prompt is the front of the request prefix, and the
+ * root's text is the agent's to rewrite).
+ */
+export interface OutlinePlanPromptAddress {
+	address: string;
+}
+
 const zh = (locale: Locale) => locale === "zh-CN";
 
 /** The plan-mode section of an outline session's system prompt (replaces the plan-file one). */
 export function getOutlinePlanModeSystemReminder(
 	locale: Locale,
-	root: OutlinePlanPromptRoot | null,
+	root: OutlinePlanPromptAddress | null,
 	relaxed: boolean,
 ): string {
 	const where = root
 		? zh(locale)
-			? `你的计划根是 \`${root.address}\`（「${root.title}」，下一次提交是第 ${root.version} 版）。`
-			: `Your plan root is \`${root.address}\` ("${root.title}"; the next submission is version ${root.version}).`
+			? `你的计划根是 \`${root.address}\`。`
+			: `Your plan root is \`${root.address}\`.`
 		: zh(locale)
 			? "还没有计划根：先调用 EnterPlanMode。"
 			: "There is no plan root yet: call EnterPlanMode first.";
@@ -159,21 +168,42 @@ export function getOutlinePlanReturnedNote(
 /** The tool result of a returned plan in an outline session. */
 export function getOutlinePlanReturnedMessage(
 	locale: Locale,
-	input: { feedback: string | null; noteAddress: string | null; rootAddress: string },
+	input: {
+		feedback: string | null;
+		noteAddress: string | null;
+		rootAddress: string;
+		/** What the person changed in the plan while deciding, as diff lines; empty: nothing. */
+		edits?: string;
+		/** The plan's root was gone when it was returned (deleted, unticked, moved off). */
+		gone?: boolean;
+	},
 ): string {
+	const z = zh(locale);
 	const note = input.noteAddress
-		? zh(locale)
+		? z
 			? `意见已记在计划下：\`${input.noteAddress}\`。`
 			: `It is recorded under the plan: \`${input.noteAddress}\`.`
 		: "";
-	if (zh(locale)) {
-		return `[计划模式] 用户退回了你的计划。你仍处于计划模式。${
-			input.feedback ? `\n\n用户的意见：${input.feedback}\n\n${note}` : ""
-		}\n\n按意见修改 \`${input.rootAddress}\` 下的计划，然后再次调用 ExitPlanMode（mode: "outline"）。不要写代码或做任何修改——必须先退出计划模式。`;
-	}
-	return `[PLAN MODE] The user returned your plan. You are STILL in plan mode.${
-		input.feedback ? `\n\nThe user's feedback: ${input.feedback}\n\n${note}` : ""
-	}\n\nRevise the plan under \`${input.rootAddress}\` accordingly, then call ExitPlanMode again (mode: "outline"). Do NOT write code or make changes — you must exit plan mode first.`;
+	const feedback = input.feedback
+		? z
+			? `\n\n用户的意见：${input.feedback}${note ? `\n\n${note}` : ""}`
+			: `\n\nThe user's feedback: ${input.feedback}${note ? `\n\n${note}` : ""}`
+		: "";
+	const edits = input.edits
+		? z
+			? `\n\n用户在审批时改了计划：\n\n${input.edits}`
+			: `\n\nThe user changed the plan while deciding:\n\n${input.edits}`
+		: "";
+	const next = input.gone
+		? z
+			? `计划 \`${input.rootAddress}\` 已经不在了（被删除、取消勾选或移走）。调用 EnterPlanMode 重新开始规划，然后再次调用 ExitPlanMode（mode: "outline"）。`
+			: `The plan \`${input.rootAddress}\` is gone (deleted, its checkbox taken away, or moved off). Call EnterPlanMode to start planning again, then call ExitPlanMode again (mode: "outline").`
+		: z
+			? `按意见修改 \`${input.rootAddress}\` 下的计划，然后再次调用 ExitPlanMode（mode: "outline"）。`
+			: `Revise the plan under \`${input.rootAddress}\` accordingly, then call ExitPlanMode again (mode: "outline").`;
+	return z
+		? `[计划模式] 用户退回了你的计划。你仍处于计划模式。${feedback}${edits}\n\n${next}不要写代码或做任何修改——必须先退出计划模式。`
+		: `[PLAN MODE] The user returned your plan. You are STILL in plan mode.${feedback}${edits}\n\n${next} Do NOT write code or make changes — you must exit plan mode first.`;
 }
 
 /** The message that starts executing an approved outline plan. */

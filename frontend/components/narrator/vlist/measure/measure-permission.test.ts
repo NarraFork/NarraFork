@@ -420,6 +420,38 @@ describe("measureInlinePermission — an outline plan's approval (outline P2 PR 
 			)?.outlinePlanSummaryRows,
 		).toBeUndefined();
 	});
+
+	it("wraps the three decisions at phone width (review round 1 U1)", async () => {
+		const { predictInlinePermission, estimateButtonRows } = await import(
+			"../vlist-permission-prediction"
+		);
+		const inputJson = {
+			plan: "- [ ] Plan",
+			_planRoot: { blockId: "b", spaceId: "s", pageId: "p", address: "a", title: "P", round: 1 },
+		};
+		const rows = (innerWidth: number, extra: Record<string, unknown> = {}) =>
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{ innerWidth, canDecide: true, ...extra },
+			)?.buttonRows;
+		expect(rows(700)).toBe(1);
+		// Phone widths: the English bar paints over two rows, then three.
+		expect(rows(340)).toBe(2);
+		expect(rows(160)).toBe(3);
+		// Shorter labels (the reader's language) fit where the English ones wrap.
+		expect(rows(340, { planButtonLabels: ["按草稿执行", "锁定后执行…", "退回"] })).toBe(1);
+		// Read-only readers see a note, not the bar.
+		expect(
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{ innerWidth: 160, canDecide: false },
+			)?.buttonRows,
+		).toBe(1);
+		// Larger type wraps sooner.
+		const labels = ["Execute as draft", "Lock and execute…", "Return"];
+		expect(estimateButtonRows(labels, 560, 14)).toBe(1);
+		expect(estimateButtonRows(labels, 560, 24)).toBeGreaterThan(1);
+	});
 });
 
 describe("measureInlinePermission — feedback rows, decision reason, read-only", () => {

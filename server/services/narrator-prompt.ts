@@ -61,7 +61,7 @@ export interface BuildPromptOptions {
 	 * (`root`, null when there is none yet) instead of a plan file.
 	 */
 	outlinePlan?: {
-		root: { address: string; title: string; version: number } | null;
+		root: { address: string } | null;
 		relaxed: boolean;
 	};
 	/** Whether to force language instruction even for English locale */

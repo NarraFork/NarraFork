@@ -283,7 +283,10 @@ export const exitPlanModeTool: ToolDefinition = {
 		kind: "single",
 		resolve(input, config) {
 			// An outline plan reads no file (outline P2 PR 8).
-			if (readDeclaredExitPlanMode(input) === undefined && input.mode === EXIT_PLAN_MODE_OUTLINE)
+			if (
+				typeof input.mode === "string" &&
+				input.mode.trim().toLowerCase() === EXIT_PLAN_MODE_OUTLINE
+			)
 				return {
 					key: "primary",
 					operation: "control",

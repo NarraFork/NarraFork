@@ -145,9 +145,20 @@ export function isPlanningRoot(task: OutlineTaskJson | null): boolean {
 	return task?.plan?.state === "planning";
 }
 
-/** The root of an approved plan (a draft or locked): work the person wants (D48 Q2). */
+/** The root of an approved plan (a draft or locked). */
 export function isApprovedPlanRoot(task: OutlineTaskJson | null): boolean {
 	return task?.plan?.state === "approved";
+}
+
+/**
+ * Work a person wants of `session` (D27a; D48 Q2 and ⑦): a task a person created (`/goal`, the
+ * board), or the root of a plan of this session a person approved (as a draft or locked). A plan
+ * the system approved for them (a plan review) is executed, but is not counted.
+ */
+export function isPersonWork(task: OutlineTaskJson | null, session: string): boolean {
+	if (task?.humanCreated === true) return true;
+	const plan = task?.plan;
+	return plan?.state === "approved" && plan.approvedBy?.kind === "human" && plan.by === session;
 }
 
 /** In the claimable pool. */

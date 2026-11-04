@@ -119,7 +119,9 @@
 			"edit": "编辑",
 			"revert": "撤销",
 			"import": "导入",
-			"confirm": "确认"
+			"confirm": "确认",
+			"plan": "计划决定",
+			"answer": "回答"
 		},
 		"actor": {
 			"unknown": "某人",

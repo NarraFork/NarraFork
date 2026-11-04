@@ -33,7 +33,12 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
-import { getPrompt, getToolMessage, type Locale } from "../prompt-i18n";
+import {
+	getOutlinePlanRelaxedReminder,
+	getPrompt,
+	getToolMessage,
+	type Locale,
+} from "../prompt-i18n";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -3083,26 +3088,34 @@ async function* agentLoopInMetadataSnapshot(
 			// Re-check after awaiting classification: parallel tool completions may
 			// reach this point together, but must still queue only one reminder.
 			relaxedPlanReminderQueued = true;
-			// An outline session's plan goes under its plan root (outline P2 PR 8), not in a file.
-			const planTarget =
+			// An outline session's plan goes under its plan root (outline P2 PR 8), not in a file:
+			// its own wording (review round 1 N4). A plan-file cycle keeps the file's (S7).
+			const outlineView =
 				config.taskBackend === "outline"
-					? ((
-							await (
-								await import("@server/services/outline-plan-mode")
-							).outlinePlanPromptRoot(config.narratorId)
-						)?.address ?? relaxedPlanReminderPlanFile(config))
-					: relaxedPlanReminderPlanFile(config);
+					? await (await import("@server/services/outline-plan-mode")).outlinePlanPromptRoot(
+							config.narratorId,
+						)
+					: null;
 			queueLoopInjection({
 				source: "relaxed_plan",
-				...sideCarBodyWithText(
-					"relaxed_plan",
-					// The reminder now says WHERE the plan goes. Without it the model is told
-					// "keep planning" and left to rediscover the designated path from the
-					// EnterPlanMode result many turns back — which is how a plan ends up
-					// written somewhere ExitPlanMode will not read.
-					{ kind: "notice", params: { planFile: planTarget } },
-					locale,
-				),
+				...(outlineView
+					? sideCarBodyWithText(
+							"relaxed_plan",
+							{
+								kind: "prose",
+								text: getOutlinePlanRelaxedReminder(locale, outlineView.root?.address ?? null),
+							},
+							locale,
+						)
+					: sideCarBodyWithText(
+							"relaxed_plan",
+							// The reminder now says WHERE the plan goes. Without it the model is told
+							// "keep planning" and left to rediscover the designated path from the
+							// EnterPlanMode result many turns back — which is how a plan ends up
+							// written somewhere ExitPlanMode will not read.
+							{ kind: "notice", params: { planFile: relaxedPlanReminderPlanFile(config) } },
+							locale,
+						)),
 				toolUseId: tu.toolUseId,
 			});
 		}

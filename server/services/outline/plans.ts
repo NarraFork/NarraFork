@@ -43,6 +43,7 @@
  * {@link OUTLINE_PLAN_LIMITS.commitScan}).
  */
 import { AppError } from "@server/lib/errors";
+import { hotSafe } from "@server/lib/hot-safe";
 import {
 	getOutlinePlanReturnedNote,
 	getOutlinePlanSubmitProblem,
@@ -52,12 +53,18 @@ import {
 import { blockTitle, isShortId, parseAddress } from "@shared/outline";
 import type { OutlinePlanDiffCounts, OutlinePlanSubmission } from "@shared/outline-api";
 import { withOutlineLiveBarrier } from "./live-barrier";
-import { OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskActorRef, type OutlineTaskJson } from "./model";
+import {
+	OUTLINE_LIMITS,
+	OUTLINE_TASKS_PAGE_ALIAS,
+	type OutlineTaskActorRef,
+	type OutlineTaskJson,
+} from "./model";
 import { OUTLINE_TASKS_PAGE_TITLE } from "./person-tasks";
 import { OUTLINE_PLAN_LIMITS, readPlanDiff } from "./plan-diff";
 import { readOutline, readSubtree } from "./read";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineSpaceRow, OutlineStore } from "./store/port";
+import { isOpenTask, isPlanningRoot } from "./task-json";
 import type { OutlineNode } from "./tree";
 import { type OutlineWriteResult, writeOutline } from "./write";
 
@@ -76,7 +83,11 @@ export type OutlinePlanErrorCode =
 	/** The plan is not waiting for a decision (approved already). */
 	| "OUTLINE_PLAN_DECIDED"
 	/** Someone else changed the plan since the version the person looked at. */
-	| "OUTLINE_PLAN_CHANGED";
+	| "OUTLINE_PLAN_CHANGED"
+	/** The person may not make this decision (lock without writing the space, a delegate). */
+	| "OUTLINE_PLAN_FORBIDDEN"
+	/** The submission is no longer waiting (cancelled or decided meanwhile): nothing was kept. */
+	| "OUTLINE_PLAN_NOT_WAITING";
 
 export class OutlinePlanError extends AppError {
 	constructor(
@@ -85,7 +96,13 @@ export class OutlinePlanError extends AppError {
 	) {
 		super(
 			message,
-			planCode === "OUTLINE_PLAN_NOT_FOUND" ? 404 : planCode === "OUTLINE_PLAN_INVALID" ? 400 : 409,
+			planCode === "OUTLINE_PLAN_NOT_FOUND"
+				? 404
+				: planCode === "OUTLINE_PLAN_INVALID"
+					? 400
+					: planCode === "OUTLINE_PLAN_FORBIDDEN"
+						? 403
+						: 409,
 			planCode,
 		);
 		this.name = "OutlinePlanError";
@@ -134,23 +151,60 @@ async function rootOf(
 }
 
 /**
+ * The root each session was last found planning, by session (review round 1 S4): the plan-mode
+ * prompt asks before every request, so a hit costs one primary-key read (the root, checked to be
+ * still that session's plan being planned) instead of the space's open tasks. At most
+ * {@link PLANNING_ROOT_CACHE} sessions, the oldest dropped first.
+ */
+const planningRoots = hotSafe("narrafork.outlinePlanningRoots", () => new Map<string, string>());
+const PLANNING_ROOT_CACHE = 2048;
+
+function rememberPlanningRoot(session: string, blockId: string | null): void {
+	planningRoots.delete(session);
+	if (blockId === null) return;
+	planningRoots.set(session, blockId);
+	while (planningRoots.size > PLANNING_ROOT_CACHE) {
+		const oldest = planningRoots.keys().next().value;
+		if (oldest === undefined) break;
+		planningRoots.delete(oldest);
+	}
+}
+
+/**
  * The plan `session` is planning: the to-do or in-progress task of its session space whose plan
- * is `planning` and its own, the latest changed when there are several. One indexed read of the
- * space's open tasks.
+ * is `planning` and its own, the latest changed when there are several. The root found last is
+ * checked first (one primary-key read); otherwise one indexed read of the space's open tasks.
  */
 export async function findPlanningRoot(
 	session: string,
 	options: { store?: OutlineStore } = {},
 ): Promise<OutlinePlanRoot | null> {
 	const store = options.store ?? outlineStore;
+	const cached = planningRoots.get(session);
+	if (cached) {
+		const block = await store.getBlock(cached);
+		if (
+			block &&
+			!block.deleted &&
+			isOpenTask(block.taskJson) &&
+			planningBy(block.taskJson, session)
+		) {
+			const space = await store.getSpace(block.spaceId);
+			if (space) return await rootOf(store, space, block, block.content);
+		}
+	}
 	const space = await store.findSpace({ kind: "session", narratorId: session });
-	if (!space) return null;
+	if (!space) {
+		rememberPlanningRoot(session, null);
+		return null;
+	}
 	const open = await store.listOpenTasks(space.id, 500);
 	let best: (typeof open)[number] | null = null;
 	for (const block of open) {
 		if (block.deleted || !planningBy(block.taskJson, session)) continue;
 		if (!best || block.versionSeq > best.versionSeq) best = block;
 	}
+	rememberPlanningRoot(session, best?.id ?? null);
 	return best ? await rootOf(store, space, best) : null;
 }
 
@@ -268,6 +322,7 @@ export async function ensurePlanRoot(args: {
 				options,
 			);
 			const after = await store.getBlock(block.id);
+			rememberPlanningRoot(args.session, block.id);
 			return {
 				root: await rootOf(
 					store,
@@ -288,6 +343,21 @@ export async function ensurePlanRoot(args: {
 					`${args.under} is not a task of this session's space`,
 					"OUTLINE_PLAN_INVALID",
 				);
+			if (!isOpenTask(goal.taskJson))
+				throw new OutlinePlanError(
+					`${space.key}/${goal.sid} is finished; plan under an open task`,
+					"OUTLINE_PLAN_INVALID",
+				);
+			// Not inside a plan that is itself being planned: a plan under it would stay hidden.
+			let above: Pick<OutlineBlockRow, "id" | "parentId" | "taskJson" | "sid"> | null = goal;
+			for (let depth = 0; above && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+				if (isPlanningRoot(above.taskJson))
+					throw new OutlinePlanError(
+						`${space.key}/${above.sid} is a plan not approved yet; plan inside it with OutlineEdit instead`,
+						"OUTLINE_PLAN_INVALID",
+					);
+				above = above.parentId ? await store.getBlock(above.parentId) : null;
+			}
 			parent = { id: goal.id };
 		} else {
 			const [page] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
@@ -325,6 +395,7 @@ export async function ensurePlanRoot(args: {
 		if (!added) throw new Error("the plan root was not written");
 		const block = await store.getBlock(added.blockId);
 		if (!block) throw new Error("the plan root was not written");
+		rememberPlanningRoot(args.session, block.id);
 		return { root: await rootOf(store, space, block, block.content), how: "created" as const };
 	});
 }
@@ -464,31 +535,48 @@ async function planBlockIds(
 }
 
 /**
- * Whether anyone but `decider` changed the plan after `seenSeq`: a commit since then (at most
- * {@link OUTLINE_PLAN_LIMITS.commitScan}; more counts as changed) that wrote a block of the plan.
+ * Whether anyone but `decider` changed the plan after `seenSeq`: a version of the plan's page
+ * recorded since then (one indexed read, at most {@link OUTLINE_PLAN_LIMITS.maxBlocks}; more
+ * counts as changed) of a block of the plan, written by a commit of someone else (the commits
+ * since then read once, at most {@link OUTLINE_PLAN_LIMITS.commitScan}; one past them counts as
+ * changed). A live session's flush with nobody to name (`system:outline-live`) is not counted: it
+ * is most often the person's own typing saved for them (review round 1 N7). A block moved off the
+ * page since then is not seen.
  */
 async function changedByOthersSince(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
-	rootId: string,
+	root: { id: string; pageId: string },
 	seenSeq: number,
 	decider: OutlineTaskActorRef,
 ): Promise<boolean> {
 	if (space.nextSeq - 1 <= seenSeq) return false;
+	const versions = await store.listPageVersions(root.pageId, {
+		afterSeq: seenSeq,
+		limit: OUTLINE_PLAN_LIMITS.maxBlocks + 1,
+	});
+	if (versions.length > OUTLINE_PLAN_LIMITS.maxBlocks) return true;
+	if (versions.length === 0) return false;
+	const ids = await planBlockIds(store, root.id, seenSeq);
+	const touching = new Set(versions.filter((v) => ids.has(v.blockId)).map((v) => v.commitId));
+	if (touching.size === 0) return false;
 	const commits = await store.listCommits(space.id, {
 		afterSeq: seenSeq,
 		limit: OUTLINE_PLAN_LIMITS.commitScan + 1,
 	});
-	if (commits.length > OUTLINE_PLAN_LIMITS.commitScan) return true;
-	const others = commits.filter((c) => !(c.actorKind === decider.kind && c.actorId === decider.id));
-	if (others.length === 0) return false;
-	const ids = await planBlockIds(store, rootId, seenSeq);
-	for (const commit of others) {
-		const versions = await store.listCommitVersions(commit.id, OUTLINE_PLAN_LIMITS.maxBlocks);
-		if (versions.some((v) => ids.has(v.blockId))) return true;
+	const byId = new Map(commits.map((c) => [c.id, c]));
+	for (const commitId of touching) {
+		const commit = byId.get(commitId);
+		if (!commit) return true;
+		if (commit.actorKind === decider.kind && commit.actorId === decider.id) continue;
+		if (commit.actorKind === "system" && commit.actorId === LIVE_FLUSH_ACTOR) continue;
+		return true;
 	}
 	return false;
 }
+
+/** The actor of a live session's flush with nobody to name (`live/session.ts`). */
+const LIVE_FLUSH_ACTOR = "outline-live";
 
 export type OutlinePlanDecider =
 	| { kind: "human"; userId: string }
@@ -503,9 +591,17 @@ export type OutlinePlanDecider =
 export interface OutlinePlanDecision {
 	/** Null when nothing was written (decided already: the same decision again). */
 	result: OutlineWriteResult | null;
-	/** The block the feedback was written as (a return with feedback). */
+	/** The block the feedback was written as (a return with feedback), and its id. */
 	noteAddress: string | null;
+	noteId: string | null;
 	root: OutlinePlanRoot;
+	/**
+	 * What the plan is now (review round 1 S2): `lock` when it ended up locked (asked now, or a
+	 * draft locked by this lock), `draft` when approved unlocked, `return` when returned.
+	 */
+	effective: "return" | "draft" | "lock";
+	/** The root's task before this decision wrote anything: what undoing it puts back. */
+	before: OutlineTaskJson;
 }
 
 /**
@@ -543,14 +639,38 @@ export async function decideOutlinePlan(args: {
 		if (!block || block.deleted || !space || !plan || plan.by !== args.session)
 			throw new OutlinePlanError("the plan was not found", "OUTLINE_PLAN_NOT_FOUND");
 		const root = await rootOf(store, space, block, block.content);
+		const before = block.taskJson as OutlineTaskJson;
+		const none = { result: null, noteAddress: null, noteId: null, root, before };
 		if (plan.state === "approved") {
-			// The same approval again (a retried request): nothing to write.
-			if (args.action !== "return" && plan.round >= args.round)
-				return { result: null, noteAddress: null, root };
-			throw new OutlinePlanError("the plan is approved already", "OUTLINE_PLAN_DECIDED");
+			if (args.action === "return" || plan.round < args.round)
+				throw new OutlinePlanError("the plan is approved already", "OUTLINE_PLAN_DECIDED");
+			// Decided already (a retried request, or one whose resolution was lost, S2): the same
+			// approval again writes nothing; a lock asked of a draft by a person locks it now.
+			if (args.action === "draft" || before.lock)
+				return { ...none, effective: before.lock ? ("lock" as const) : ("draft" as const) };
+			if (args.decider.kind !== "human")
+				throw new OutlinePlanError("only a person locks a plan", "OUTLINE_PLAN_INVALID");
+			const locked = await writeOutline(
+				{
+					spaceId: space.id,
+					ops: [
+						{
+							op: "setTask",
+							block: { id: block.id },
+							task: { lock: { delegate: args.delegate ?? null } },
+						},
+					],
+					actor: { kind: "human", id: args.decider.userId },
+					responsibleUserId: args.decider.userId,
+					narratorId: args.session,
+					summary: `plan ${root.address} locked (version ${plan.round})`,
+				},
+				{ store, kind: "plan", ...(args.now ? { now: args.now } : {}) },
+			);
+			return { ...none, result: locked, effective: "lock" as const };
 		}
 		if (args.action === "return" && plan.round >= args.round)
-			return { result: null, noteAddress: null, root };
+			return { ...none, effective: "return" as const };
 		const deciderRef: OutlineTaskActorRef =
 			args.decider.kind === "human"
 				? { kind: "human", id: args.decider.userId }
@@ -558,7 +678,13 @@ export async function decideOutlinePlan(args: {
 		if (
 			args.decider.kind === "human" &&
 			typeof args.seenSeq === "number" &&
-			(await changedByOthersSince(store, space, block.id, args.seenSeq, deciderRef))
+			(await changedByOthersSince(
+				store,
+				space,
+				{ id: block.id, pageId: block.pageId },
+				args.seenSeq,
+				deciderRef,
+			))
 		) {
 			throw new OutlinePlanError(
 				"the plan changed since you looked at it; look at the changes again",
@@ -610,8 +736,63 @@ export async function decideOutlinePlan(args: {
 			{ store, kind: "plan", ...(args.now ? { now: args.now } : {}) },
 		);
 		const note = args.action === "return" && feedback ? result.results[0] : undefined;
-		return { result, noteAddress: note?.address ?? null, root };
+		return {
+			result,
+			noteAddress: note?.address ?? null,
+			noteId: note?.blockId ?? null,
+			root,
+			effective: args.action,
+			before,
+		};
 	});
+}
+
+/**
+ * Take back a decision whose request was gone by the time it was to be resolved (review round 1
+ * S1: cancelled or decided meanwhile): one system `plan` commit puts the root's plan state back
+ * as it was (round, baseSeq), takes away a lock the decision added, and deletes the feedback it
+ * wrote. A cancelled plan mode then leaves the plan 计划中 (D48 Q3). Changes made since are not
+ * touched; a root gone meanwhile has nothing to undo.
+ */
+export async function undoOutlinePlanDecision(args: {
+	session: string;
+	decision: Pick<OutlinePlanDecision, "root" | "before" | "noteId" | "result">;
+	responsibleUserId: string | null;
+	store?: OutlineStore;
+	now?: () => Date;
+}): Promise<void> {
+	if (!args.decision.result?.commit) return;
+	const store = args.store ?? outlineStore;
+	const rootId = args.decision.root.blockId;
+	const block = await store.getBlock(rootId);
+	if (!block || block.deleted || !block.taskJson) return;
+	const before = args.decision.before;
+	const ops: Parameters<typeof writeOutline>[0]["ops"][number][] = [
+		{
+			op: "setTask",
+			block: { id: rootId },
+			task: {
+				plan: before.plan ?? null,
+				...(before.lock ? {} : { lock: null }),
+			},
+		},
+	];
+	if (args.decision.noteId) {
+		const note = await store.getBlock(args.decision.noteId);
+		if (note && !note.deleted) ops.push({ op: "delete", block: { id: note.id } });
+	}
+	await writeOutline(
+		{
+			spaceId: block.spaceId,
+			ops,
+			actor: { kind: "system", id: OUTLINE_PLAN_ACTOR },
+			responsibleUserId: args.responsibleUserId,
+			narratorId: args.session,
+			summary: `plan ${args.decision.root.address}: a decision taken back (the request was gone)`,
+		},
+		{ store, kind: "plan", ...(args.now ? { now: args.now } : {}) },
+	);
+	if (before.plan?.state === "planning") rememberPlanningRoot(args.session, rootId);
 }
 
 /**

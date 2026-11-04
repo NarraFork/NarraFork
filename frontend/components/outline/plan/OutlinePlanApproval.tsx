@@ -12,6 +12,7 @@
 
 import {
 	Alert,
+	Anchor,
 	Box,
 	Button,
 	Checkbox,
@@ -24,7 +25,7 @@ import {
 } from "@mantine/core";
 import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { useQuery } from "@tanstack/react-query";
-import { useContext, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { useOutlinePlanDiff } from "../../../hooks/useOutline";
@@ -74,13 +75,15 @@ export function OutlinePlanApproval({
 		() => outlinePlanSubmissionOf(permission.inputJson as Record<string, unknown> | undefined),
 		[permission.inputJson],
 	);
-	const { focusIndex, setButtonCount, registerActions, activePermissionId } =
+	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
 	const isActive = permission.id === activePermissionId;
 	const [feedback, setFeedback] = useState("");
 	const [diffOpen, setDiffOpen] = useState(false);
 	const [lockOpen, setLockOpen] = useState(false);
 	const [delegate, setDelegate] = useState<string | null>(null);
+	// "Reset the context" is chosen in a dialog and goes with that dialog's decision only
+	// (review round 1 N10): closing either dialog forgets it.
 	const [compact, setCompact] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -97,13 +100,28 @@ export function OutlinePlanApproval({
 		},
 		diffOpen && !!root,
 	);
+	// Typed feedback makes Enter return the plan, as on every other permission card (review
+	// round 1 S5): the focus moves to the last decision, which is "Return".
+	const hasFeedback = feedback.trim().length > 0;
+	useEffect(() => {
+		if (isActive) setHasFeedback(hasFeedback);
+	}, [hasFeedback, isActive, setHasFeedback]);
 	if (!submission || !root) return null;
 	const counts = submission.counts;
 	const changed = counts.text + counts.task + counts.moved;
 	// The version on screen: the diff's when it was read, else the version submitted.
 	const seenSeq = diff.data?.toSeq ?? submission.seq;
 
-	const decide = async (action: "return" | "draft" | "lock") => {
+	const closeDiff = () => {
+		setDiffOpen(false);
+		setCompact(false);
+	};
+	const closeLock = () => {
+		setLockOpen(false);
+		setCompact(false);
+	};
+
+	const decide = async (action: "return" | "draft" | "lock", withCompact = false) => {
 		if (busy) return;
 		setBusy(true);
 		setError(null);
@@ -113,14 +131,18 @@ export function OutlinePlanApproval({
 				...(feedback.trim() ? { feedback: feedback.trim() } : {}),
 				...(action === "lock" ? { delegate } : {}),
 				seenSeq,
-				...(action !== "return" && compact ? { compactAfter: true } : {}),
+				...(action !== "return" && withCompact ? { compactAfter: true } : {}),
 			});
-			setLockOpen(false);
-			setDiffOpen(false);
+			closeLock();
+			closeDiff();
 		} catch (err) {
-			if (err instanceof ApiError && err.status === 409) {
+			if (
+				err instanceof ApiError &&
+				err.status === 409 &&
+				err.data?.code === "OUTLINE_PLAN_CHANGED"
+			) {
 				setError(t("outlinePlan.changed"));
-				setLockOpen(false);
+				closeLock();
 				setDiffOpen(true);
 				void diff.refetch();
 			} else {
@@ -140,6 +162,7 @@ export function OutlinePlanApproval({
 		);
 	};
 
+	// The three decisions only, "Return" last: the keyboard's default with feedback typed.
 	const buttons: PermButton[] = readOnly
 		? []
 		: [
@@ -155,18 +178,6 @@ export function OutlinePlanApproval({
 					color: "red",
 					variant: "light",
 					onClick: () => void decide("return"),
-				},
-				{
-					label: t("outlinePlan.viewChanges"),
-					color: "gray",
-					variant: "subtle",
-					onClick: () => setDiffOpen(true),
-				},
-				{
-					label: t("outlinePlan.openInOutline"),
-					color: "gray",
-					variant: "subtle",
-					onClick: openInOutline,
 				},
 			];
 
@@ -197,7 +208,7 @@ export function OutlinePlanApproval({
 				size="xs"
 				color="green"
 				loading={busy}
-				onClick={() => void decide("draft")}
+				onClick={() => void decide("draft", compact)}
 				data-testid="outline-plan-draft-modal"
 			>
 				{t("outlinePlan.draft")}
@@ -207,18 +218,47 @@ export function OutlinePlanApproval({
 
 	return (
 		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }} data-testid="outline-plan-approval">
-			<Text size="xs" c="dimmed" mb={4} data-testid="outline-plan-summary" lineClamp={1}>
-				{submission.baseSeq === 0
-					? t("outlinePlan.summaryFirst", { version: root.round, added: counts.added })
-					: t("outlinePlan.summary", {
-							version: root.round,
-							added: counts.added,
-							changed,
-							removed: counts.removed,
-						})}
-			</Text>
+			{/* One xs line: the summary (cut to fit) and the two read-only views, for readers too. */}
+			<Group gap={8} mb={4} wrap="nowrap" align="baseline">
+				<Text
+					size="xs"
+					c="dimmed"
+					truncate="end"
+					style={{ flex: 1, minWidth: 0 }}
+					data-testid="outline-plan-summary"
+				>
+					{submission.baseSeq === 0
+						? t("outlinePlan.summaryFirst", { version: root.round, added: counts.added })
+						: t("outlinePlan.summary", {
+								version: root.round,
+								added: counts.added,
+								changed,
+								removed: counts.removed,
+							})}
+				</Text>
+				<Anchor
+					component="button"
+					type="button"
+					size="xs"
+					onClick={() => setDiffOpen(true)}
+					style={{ flexShrink: 0 }}
+					data-testid="outline-plan-view-changes"
+				>
+					{t("outlinePlan.viewChanges")}
+				</Anchor>
+				<Anchor
+					component="button"
+					type="button"
+					size="xs"
+					onClick={openInOutline}
+					style={{ flexShrink: 0 }}
+					data-testid="outline-plan-open"
+				>
+					{t("outlinePlan.openInOutline")}
+				</Anchor>
+			</Group>
 			{submission.summary && (
-				<Text size="xs" mb={4} lineClamp={1} data-testid="outline-plan-agent-summary">
+				<Text size="xs" mb={4} truncate="end" data-testid="outline-plan-agent-summary">
 					{t("outlinePlan.agentSummary", { summary: submission.summary })}
 				</Text>
 			)}
@@ -253,32 +293,38 @@ export function OutlinePlanApproval({
 			)}
 			<OutlinePlanDiffModal
 				opened={diffOpen}
-				onClose={() => setDiffOpen(false)}
+				onClose={closeDiff}
 				title={root.title}
 				diff={diff.data}
 				loading={diff.isLoading}
 				error={diff.error}
 				footer={
-					readOnly ? null : (
-						<Stack gap="xs">
-							{error && (
-								<Text size="xs" c="orange">
-									{error}
-								</Text>
-							)}
-							<Group justify="space-between" wrap="wrap">
-								<Button size="xs" variant="subtle" color="gray" onClick={openInOutline}>
-									{t("outlinePlan.openInOutline")}
-								</Button>
-								{decisionButtons}
-							</Group>
-						</Stack>
-					)
+					<Stack gap="xs">
+						{error && (
+							<Text size="xs" c="orange">
+								{error}
+							</Text>
+						)}
+						{!readOnly && (
+							<Checkbox
+								size="xs"
+								label={t("outlinePlan.compact")}
+								checked={compact}
+								onChange={(e) => setCompact(e.currentTarget.checked)}
+							/>
+						)}
+						<Group justify="space-between" wrap="wrap">
+							<Button size="xs" variant="subtle" color="gray" onClick={openInOutline}>
+								{t("outlinePlan.openInOutline")}
+							</Button>
+							{readOnly ? null : decisionButtons}
+						</Group>
+					</Stack>
 				}
 			/>
 			<Modal
 				opened={lockOpen}
-				onClose={() => setLockOpen(false)}
+				onClose={closeLock}
 				title={t("outlinePlan.lockTitle")}
 				centered
 				size="sm"
@@ -304,13 +350,13 @@ export function OutlinePlanApproval({
 						onChange={(e) => setCompact(e.currentTarget.checked)}
 					/>
 					<Group justify="flex-end" gap="sm">
-						<Button variant="subtle" color="gray" onClick={() => setLockOpen(false)}>
+						<Button variant="subtle" color="gray" onClick={closeLock}>
 							{t("outlinePlan.cancel")}
 						</Button>
 						<Button
 							color="indigo"
 							loading={busy}
-							onClick={() => void decide("lock")}
+							onClick={() => void decide("lock", compact)}
 							data-testid="outline-plan-lock-confirm"
 						>
 							{t("outlinePlan.confirmLock")}

@@ -3593,7 +3593,7 @@ function isPlanFileReadAuthorized(
 export async function resolveExitPlanModeInputWithBackend(
 	narratorId: string,
 	cwd: string,
-	input: Record<string, unknown>,
+	rawInput: Record<string, unknown>,
 	locale: Locale = "en",
 	isRelaxedPlan = false,
 	backend: ExecutionBackend = localBackend,
@@ -3603,8 +3603,10 @@ export async function resolveExitPlanModeInputWithBackend(
 ): Promise<ExitPlanModeInputResolution> {
 	// An outline session plans in the outline (outline P2 PR 8): the plan is its task tree, read
 	// as of now. A plan-file cycle begun before that keeps this flow (null).
-	const { resolveOutlineExitPlanInput } = await import("./outline-plan-mode");
-	const outline = await resolveOutlineExitPlanInput(narratorId, input, locale);
+	const { resolveOutlineExitPlanInput, withoutOutlinePlanKeys } = await import(
+		"./outline-plan-mode"
+	);
+	const outline = await resolveOutlineExitPlanInput(narratorId, rawInput, locale);
 	if (outline) {
 		return outline.ok
 			? {
@@ -3615,6 +3617,9 @@ export async function resolveExitPlanModeInputWithBackend(
 				}
 			: { ok: false, message: outline.message, input: outline.input, resolvedFromFile: false };
 	}
+	// The keys of an outline submission are the server's own: on any other path they are dropped,
+	// so a model cannot make a spec plan read as an outline one (review round 1 S6).
+	const input = withoutOutlinePlanKeys(rawInput);
 	const active = activeNarrators.get(narratorId);
 	const planFileId = active?._planFileId;
 	const allowInlinePlan = settings.agent.planModeAllowInlinePlan;
@@ -5571,10 +5576,11 @@ export async function handlePermission(
 				? "bypassPermissions"
 				: permMode;
 	// An outline session plans in the outline, without a plan file (outline P2 PR 8).
+	// A plan-file cycle begun before PR 8 keeps writing its file (review round 1 S7).
 	const outlinePlanSession =
 		isPlanMode &&
 		(toolName === "Write" || toolName === "Edit") &&
-		(await (await import("./outline-plan-mode")).isOutlinePlanSession(narratorId));
+		(await (await import("./outline-plan-mode")).outlinePlanCycle(narratorId))?.kind === "outline";
 	let decision =
 		toolName === "Send" &&
 		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))

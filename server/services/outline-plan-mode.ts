@@ -56,8 +56,10 @@ import {
 	findPlanningRoot,
 	OUTLINE_PLAN_ACTOR,
 	OutlinePlanError,
+	type OutlinePlanRoot,
 	planSubmitProblemText,
 	readPlanSubmission,
+	undoOutlinePlanDecision,
 } from "./outline/plans";
 import { outlineStore } from "./outline/store";
 import { readTaskSession } from "./task-source/backend";
@@ -74,21 +76,40 @@ export async function isOutlinePlanSession(narratorId: string): Promise<boolean>
 	);
 }
 
-/** The plan-mode prompt's view of the session's plan: its root and the next version. */
-export async function outlinePlanPromptRoot(
+/**
+ * How a session's plan-mode cycle plans (review round 1 S7): `outline` (its plan root, null until
+ * EnterPlanMode made one), or `legacy` for a plan-file cycle begun before plan PR 8 (plan mode on,
+ * a plan file identity, and no plan being planned), which keeps the plan-file flow until it ends.
+ * Null when the session does not plan in the outline at all (spec, a subagent, outline off).
+ */
+export async function outlinePlanCycle(
 	narratorId: string,
-): Promise<{ address: string; title: string; version: number } | null> {
+): Promise<{ kind: "outline"; root: OutlinePlanRoot | null } | { kind: "legacy" } | null> {
 	if (!(await isOutlinePlanSession(narratorId))) return null;
 	const root = await findPlanningRoot(narratorId).catch((error) => {
-		logger.warn("Outline plan root could not be read for the plan-mode prompt", {
-			narratorId,
-			error: String(error),
-		});
+		logger.warn("Outline plan root could not be read", { narratorId, error: String(error) });
 		return null;
 	});
-	return root
-		? { address: root.address, title: root.title, version: (root.task.plan?.round ?? 0) + 1 }
-		: null;
+	if (root) return { kind: "outline", root };
+	const { narrators } = await import("../db/schema");
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { planFileId: true, planMode: true },
+	});
+	return row?.planMode && row.planFileId ? { kind: "legacy" } : { kind: "outline", root: null };
+}
+
+/**
+ * The plan-mode prompt's view of the session's plan (review round 1 S4): its address only, which
+ * does not change while the plan is planned (its title is the agent's to rewrite, and the prompt
+ * is the front of the request prefix). Null root: none yet. Null: not an outline cycle.
+ */
+export async function outlinePlanPromptRoot(
+	narratorId: string,
+): Promise<{ root: { address: string } | null } | null> {
+	const cycle = await outlinePlanCycle(narratorId);
+	if (cycle?.kind !== "outline") return null;
+	return { root: cycle.root ? { address: cycle.root.address } : null };
 }
 
 /**
@@ -147,10 +168,39 @@ export async function cancelOutlinePlanMode(narratorId: string, userId: string |
 
 export { outlinePlanSubmissionOf };
 
+/** An ExitPlanMode input without the keys only the server writes (review round 1 S6). */
+export function withoutOutlinePlanKeys(input: Record<string, unknown>): Record<string, unknown> {
+	if (!OUTLINE_PLAN_SUBMISSION_KEYS.some((key) => key in input)) return input;
+	const out: Record<string, unknown> = { ...input };
+	for (const key of OUTLINE_PLAN_SUBMISSION_KEYS) delete out[key];
+	return out;
+}
+
+/**
+ * Whether `submission` was decided already by an approval of `narratorId` (review round 1 S2: a
+ * decision written before its resolution was lost): its root is that session's approved plan at
+ * a round at least the submitted one.
+ */
+async function decidedSubmission(
+	narratorId: string,
+	submission: OutlinePlanSubmission | null,
+): Promise<boolean> {
+	if (!submission) return false;
+	const block = await outlineStore.getBlock(submission.root.blockId).catch(() => null);
+	const plan = block && !block.deleted ? block.taskJson?.plan : undefined;
+	return (
+		plan?.state === "approved" && plan.by === narratorId && plan.round >= submission.root.round
+	);
+}
+
 /**
  * Resolve ExitPlanMode for an outline session (see the module header, step 3). Null when the
- * session does not plan in the outline, or when it is a plan-file cycle begun before plan PR 8
- * (no plan being planned, and the call declares `inline` or `file`): the plan-file flow applies.
+ * session does not plan in the outline, or when its cycle is a plan-file one begun before plan PR
+ * 8 (`outlinePlanCycle`, S7) and the call does not declare `outline`: the plan-file flow applies
+ * (the caller strips the `_plan*` keys first, S6).
+ *
+ * A persisted submission whose plan was approved since (its decision written, its resolution lost
+ * to a restart; S2) is kept as it is, so the request is decided as approved.
  */
 export async function resolveOutlineExitPlanInput(
 	narratorId: string,
@@ -161,12 +211,16 @@ export async function resolveOutlineExitPlanInput(
 	| { ok: false; message: string; input: Record<string, unknown> }
 	| null
 > {
-	if (!(await isOutlinePlanSession(narratorId))) return null;
+	const cycle = await outlinePlanCycle(narratorId);
+	if (!cycle) return null;
+	if (await decidedSubmission(narratorId, outlinePlanSubmissionOf(input))) {
+		return { ok: true, input };
+	}
 	const mode = typeof input.mode === "string" ? input.mode.trim().toLowerCase() : "";
 	const rootRef = typeof input.root === "string" && input.root.trim() ? input.root : null;
+	if (cycle.kind === "legacy" && mode !== "outline" && !rootRef) return null;
+	const planning = cycle.kind === "outline" ? cycle.root : null;
 	const legacyMode = mode === "inline" || mode === "file";
-	const planning = rootRef ? null : await findPlanningRoot(narratorId);
-	if (legacyMode && !rootRef && !planning) return null;
 	const {
 		inline_plan: _inline,
 		plan: _plan,
@@ -175,8 +229,7 @@ export async function resolveOutlineExitPlanInput(
 		summary,
 		...rest
 	} = input;
-	const stripped: Record<string, unknown> = { ...rest };
-	for (const key of OUTLINE_PLAN_SUBMISSION_KEYS) delete stripped[key];
+	const stripped = withoutOutlinePlanKeys(rest);
 	if (legacyMode) {
 		return {
 			ok: false,
@@ -250,12 +303,11 @@ export async function decideOutlinePlanRequest(args: {
 	const pending = pendingPermissions.get(args.requestId);
 	const submission =
 		pending?.toolName === "ExitPlanMode" ? outlinePlanSubmissionOf(pending.input) : null;
-	if (!pending || !submission)
+	if (!pending || !submission || !(await isOutlinePlanSession(pending.narratorId)))
 		throw new NotFoundError("Outline plan waiting for a decision", args.requestId);
 	const narratorId = pending.narratorId;
 	const locale = pending.locale ?? "en";
 	const { body, principal } = args;
-	let delegateTitle: string | null = null;
 	if (body.action === "lock") {
 		const space = await outlineStore.getSpace(submission.root.spaceId);
 		if (!space || !(await canWriteSpace(principal, space)))
@@ -271,24 +323,82 @@ export async function decideOutlinePlanRequest(args: {
 				principal.isAdmin ||
 				(await narratorUsersWith(narrator, [principal.userId], "write")).has(principal.userId);
 			if (!writes) throw new OutlinePlanForbidden("You cannot name this session to confirm");
-			delegateTitle = (await narratorTitle(body.delegate)) ?? null;
 		}
 	}
-	const decision = await decideOutlinePlan({
-		session: narratorId,
-		rootId: submission.root.blockId,
-		round: submission.root.round,
-		action: body.action,
-		decider: { kind: "human", userId: principal.userId },
-		feedback: body.feedback ?? null,
-		delegate: body.action === "lock" ? (body.delegate ?? null) : null,
-		seenSeq: body.seenSeq,
-		locale,
-	});
 	const { resolvePermission } = await import("./narrator-permission");
-	if (body.action === "return") {
-		const feedback = body.feedback?.trim() || null;
-		await resolvePermission(args.requestId, "deny", {
+	const feedback = body.feedback?.trim() || null;
+	let decision: Awaited<ReturnType<typeof decideOutlinePlan>>;
+	try {
+		decision = await decideOutlinePlan({
+			session: narratorId,
+			rootId: submission.root.blockId,
+			round: submission.root.round,
+			action: body.action,
+			decider: { kind: "human", userId: principal.userId },
+			feedback,
+			delegate: body.action === "lock" ? (body.delegate ?? null) : null,
+			seenSeq: body.seenSeq,
+			locale,
+		});
+	} catch (error) {
+		// The plan is gone (deleted, its checkbox taken away, moved off; review round 1 N1): a
+		// return still sends it back, with nothing to write.
+		if (
+			body.action === "return" &&
+			error instanceof OutlinePlanError &&
+			error.planCode === "OUTLINE_PLAN_NOT_FOUND"
+		) {
+			const resolved = await resolvePermission(args.requestId, "deny", {
+				userId: principal.userId,
+				decidedBy: "user",
+				...(feedback ? { feedbackText: feedback } : {}),
+				outlinePlanMessage: getOutlinePlanReturnedMessage(locale, {
+					feedback,
+					noteAddress: null,
+					rootAddress: submission.root.address,
+					gone: true,
+					edits: "",
+				}),
+			});
+			if (!resolved) throw notWaiting(args.requestId);
+			return { commit: null };
+		}
+		throw error;
+	}
+	// What the person changed while deciding: the plan as submitted against the plan just before
+	// the decision's own commit (told to the agent on a return too; review round 1 N3).
+	let edits = "";
+	const decidedAt = decision.result?.commit?.seq;
+	if (decision.effective !== "return" || body.action === "return") {
+		const until = decidedAt ? decidedAt - 1 : null;
+		if (until === null || until > submission.seq) {
+			const diff = await readPlanDiff({
+				rootId: submission.root.blockId,
+				fromSeq: submission.seq,
+				toSeq: until,
+			}).catch(() => null);
+			if (diff && !planDiffIsEmpty(diff.counts)) {
+				const key = submission.root.address.split("/")[0] ?? "";
+				edits = planDiffLines(diff, key);
+			}
+		}
+	}
+	const undo = async () => {
+		await undoOutlinePlanDecision({
+			session: narratorId,
+			decision,
+			responsibleUserId: principal.userId,
+		}).catch((error) => {
+			logger.error("A plan decision whose request was gone could not be taken back", {
+				narratorId,
+				root: submission.root.address,
+				error: String(error),
+			});
+		});
+		throw notWaiting(args.requestId);
+	};
+	if (decision.effective === "return") {
+		const resolved = await resolvePermission(args.requestId, "deny", {
 			userId: principal.userId,
 			decidedBy: "user",
 			...(feedback ? { feedbackText: feedback } : {}),
@@ -296,46 +406,47 @@ export async function decideOutlinePlanRequest(args: {
 				feedback,
 				noteAddress: decision.noteAddress,
 				rootAddress: decision.root.address,
+				edits,
 			}),
 		});
+		if (!resolved) await undo();
 		return { commit: decision.result?.commit ?? null };
 	}
-	// What the person changed while deciding: the plan as submitted against the plan just before
-	// the decision's own commit.
-	let edits = "";
-	const decidedAt = decision.result?.commit?.seq;
-	if (decidedAt && decidedAt - 1 > submission.seq) {
-		const diff = await readPlanDiff({
-			rootId: submission.root.blockId,
-			fromSeq: submission.seq,
-			toSeq: decidedAt - 1,
-		}).catch(() => null);
-		if (diff && !planDiffIsEmpty(diff.counts)) {
-			const key = submission.root.address.split("/")[0] ?? "";
-			edits = planDiffLines(diff, key);
-		}
-	}
+	// What the plan is now, not what was asked (S2: a lock asked of a draft written before).
+	const after = await outlineStore.getBlock(submission.root.blockId);
+	const lock = after?.taskJson?.lock ?? null;
 	decisions.set(narratorId, {
 		rootId: submission.root.blockId,
-		action: body.action,
-		delegateTitle,
+		action: lock ? "lock" : "draft",
+		delegateTitle: lock?.delegate ? ((await narratorTitle(lock.delegate)) ?? null) : null,
 		edits,
 	});
 	const resolved = await resolvePermission(args.requestId, "allow", {
 		userId: principal.userId,
 		decidedBy: "user",
 		...(body.compactAfter ? { compactAfter: true } : {}),
-		...(body.feedback?.trim() ? { feedbackText: body.feedback.trim() } : {}),
+		...(feedback ? { feedbackText: feedback } : {}),
 	});
-	if (!resolved) decisions.delete(narratorId);
+	if (!resolved) {
+		// Cancelled or decided meanwhile (review round 1 S1): the plan goes back to what it was.
+		decisions.delete(narratorId);
+		await undo();
+	}
 	return { commit: decision.result?.commit ?? null };
+}
+
+/** 409: the request was not waiting any more when the decision was to be resolved. */
+function notWaiting(requestId: string): OutlinePlanError {
+	return new OutlinePlanError(
+		`The plan is no longer waiting for a decision (${requestId}); nothing was kept`,
+		"OUTLINE_PLAN_NOT_WAITING",
+	);
 }
 
 /** 403 for a decision the person may not make. */
 export class OutlinePlanForbidden extends OutlinePlanError {
 	constructor(message: string) {
-		super(message, "OUTLINE_PLAN_INVALID");
-		this.statusCode = 403;
+		super(message, "OUTLINE_PLAN_FORBIDDEN");
 		this.name = "OutlinePlanForbidden";
 	}
 }
@@ -378,8 +489,17 @@ export async function settleApprovedOutlinePlan(args: {
 	turnUserId: string | null;
 	/** A plan review approved it. */
 	byReview: boolean;
+	/**
+	 * The call's input as just resolved, when the caller has it before it is persisted (a re-run
+	 * of a denied call; review round 1 N2). Default: the persisted input.
+	 */
+	input?: Record<string, unknown> | null;
 }): Promise<ApprovedOutlinePlan | null> {
-	const submission = await submittedPlanOf(args.narratorId, args.toolUseId).catch(() => null);
+	// Only an outline session's call (review round 1 S6): a model cannot divert another's.
+	if (!(await isOutlinePlanSession(args.narratorId))) return null;
+	const submission = args.input
+		? outlinePlanSubmissionOf(args.input)
+		: await submittedPlanOf(args.narratorId, args.toolUseId).catch(() => null);
 	if (!submission) return null;
 	const recorded = decisions.get(args.narratorId);
 	if (recorded && recorded.rootId === submission.root.blockId) {
@@ -393,8 +513,9 @@ export async function settleApprovedOutlinePlan(args: {
 			edits: recorded.edits,
 		};
 	}
+	let approval: ApprovedOutlinePlan["approval"] = { kind: "draft" };
 	try {
-		await decideOutlinePlan({
+		const decision = await decideOutlinePlan({
 			session: args.narratorId,
 			rootId: submission.root.blockId,
 			round: submission.root.round,
@@ -409,6 +530,13 @@ export async function settleApprovedOutlinePlan(args: {
 			},
 			locale: args.locale,
 		});
+		// Decided before (a card decision whose resolution was lost): tell what the plan is.
+		const lock = decision.result ? null : (decision.before.lock ?? null);
+		if (decision.effective === "lock" && lock)
+			approval = {
+				kind: "locked",
+				delegate: lock.delegate ? ((await narratorTitle(lock.delegate)) ?? null) : null,
+			};
 	} catch (error) {
 		logger.warn("Approved outline plan could not be recorded as approved", {
 			narratorId: args.narratorId,
@@ -416,7 +544,7 @@ export async function settleApprovedOutlinePlan(args: {
 			error: String(error),
 		});
 	}
-	return { submission, approval: { kind: "draft" }, edits: "" };
+	return { submission, approval, edits: "" };
 }
 
 /**

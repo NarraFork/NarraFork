@@ -204,7 +204,8 @@ async function completionsAwaited(entries: readonly OpenEntry[]): Promise<Set<st
  * part there, so continuing would only run a pass saying everything waits.
  */
 async function protectedOpen(read: OpenRead): Promise<OpenEntry[]> {
-	const entries = read.entries.filter(isProtected);
+	// Every person's work read, not only the first entries (review round 1 S3).
+	const entries = read.personWork;
 	const awaited = await completionsAwaited(entries);
 	return awaited.size === 0 ? entries : entries.filter((e) => !awaited.has(e.ref.blockId));
 }
@@ -295,24 +296,27 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		const current = await session();
 		if (current.subagent) return { openTask: null, protectedOpenCount: 0, turnBudgetOnly: true };
 		let read = await readOpen(current);
+		// A task a person asked the session to start ("Add and start", "Reopen and start"; review
+		// round 1 S4), or the root of a plan they approved (outline P2 PR 8): read as its own
+		// subtree, so the tasks before it in the session cannot crowd it out (P2 PR 8 review S3).
+		let tree: OpenRead | null = null;
 		if (preferTaskId) {
-			// A task a person asked the session to start ("Add and start", "Reopen and start"; review
-			// round 1 S4), or the root of a plan they approved (outline P2 PR 8): started for the
-			// session through the same system start as a promotion, whatever else is in progress,
-			// and named by the continuation. Nothing else is started or named instead: when it
-			// cannot be started, nothing continues.
-			const wanted = read.entries.find((entry) => entry.ref.blockId === preferTaskId);
+			// Started for the session through the same system start as a promotion, whatever else
+			// is in progress, and named by the continuation. Nothing else is started or named
+			// instead: when it cannot be started, nothing continues.
+			tree = await readOpen(current, { within: preferTaskId });
+			const wanted = tree.entries.find((entry) => entry.ref.blockId === preferTaskId);
 			if (wanted?.status === "todo" && wanted.ref.spaceId === current.spaceId) {
 				if (await claim(current, wanted)) wanted.status = "doing";
-				read = await readOpen(current);
+				tree = await readOpen(current, { within: preferTaskId });
 			}
 			// A tree (a goal with steps, a plan): its first step that can start is started too, and
 			// named (D48 Q2: continue from the first startable task of the tree being worked).
 			if (wanted?.ref.container) {
 				const tried = new Set<string>();
 				for (let attempt = 0; attempt < OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts; attempt++) {
-					if (firstUnder(read, preferTaskId, "doing")) break;
-					const next = read.entries.find(
+					if (firstUnder(tree, preferTaskId, "doing")) break;
+					const next = tree.entries.find(
 						(entry) =>
 							entry.status === "todo" &&
 							!entry.ref.container &&
@@ -326,9 +330,10 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 						next.status = "doing";
 						break;
 					}
-					read = await readOpen(current);
+					tree = await readOpen(current, { within: preferTaskId });
 				}
 			}
+			read = await readOpen(current);
 		} else if (promoteTodo) {
 			// Only a task of the session's own space is started on its behalf: anything else it
 			// may continue it holds already. A refused start moves on to the next to-do (a task
@@ -354,9 +359,10 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 				read = await readOpen(current);
 			}
 		}
-		const chosen = preferTaskId
-			? (firstUnder(read, preferTaskId, "doing") ?? firstUnder(read, preferTaskId, "blocked"))
-			: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
+		const chosen =
+			preferTaskId && tree
+				? (firstUnder(tree, preferTaskId, "doing") ?? firstUnder(tree, preferTaskId, "blocked"))
+				: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
 		const protectedOpenCount = (await protectedOpen(read)).length;
 		if (!chosen) return { openTask: null, protectedOpenCount };
 		const text = (await titlesOf([chosen])).get(chosen.ref.blockId) ?? chosen.ref.sid;

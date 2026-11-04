@@ -1518,11 +1518,12 @@ async function createNarrator(
 			...(isPlanMode
 				? await (async () => {
 						const planMode = await import("./outline-plan-mode");
-						if (!(await planMode.isOutlinePlanSession(narratorId))) return {};
+						const view = await planMode.outlinePlanPromptRoot(narratorId);
+						if (!view) return {};
 						const { resolveEffectiveRelaxedPlan } = await import("../lib/permission-modes");
 						return {
 							outlinePlan: {
-								root: await planMode.outlinePlanPromptRoot(narratorId),
+								root: view.root,
 								relaxed: resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
 							},
 						};
@@ -6413,6 +6414,8 @@ async function reExecuteDeniedToolCallUnlocked(
 							approverUserId: userId ?? null,
 							turnUserId: active._currentUserId ?? null,
 							byReview: false,
+							// The input as just resolved: the row is written after this (review N2).
+							input: (result.updatedInput as Record<string, unknown> | undefined) ?? null,
 						});
 						active._preparedPlanModes?.clear();
 						active._planFileId = undefined;

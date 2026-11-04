@@ -187,6 +187,11 @@ export interface NarratorTaskSource {
 	// ── Continuation ──────────────────────────────────────────────────────────
 
 	/**
+	 * Where a task this source handed out is (`key/sid`), when the backend has addresses (the
+	 * outline); null otherwise. An approved outline plan names its first step by it (P2 PR 8).
+	 */
+	taskAddress?(task: { text: string; protected: boolean }): string | null;
+	/**
 	 * Read the tasks for a continuation decision, writing first when needed.
 	 *
 	 * With `promoteTodo`, nothing in progress and something to do, the first todo becomes
@@ -194,19 +199,16 @@ export interface NarratorTaskSource {
 	 * promotion therefore lands even when no continuation follows. Delegated subagents do
 	 * not promote (`policy.continuation.promoteTodo`).
 	 */
-	/**
-	 * Where a task this source handed out is (`key/sid`), when the backend has addresses (the
-	 * outline); null otherwise. An approved outline plan names its first step by it (P2 PR 8).
-	 */
-	taskAddress?(task: { text: string; protected: boolean }): string | null;
 	prepareContinuation(options: {
 		promoteTodo: boolean;
 		/**
 		 * The task a person just asked the session to start ("Add and start", "Reopen and start";
-		 * outline P2 PR 5): a to-do of the session's own is started for it (the same system start
-		 * as a promotion, even with `promoteTodo` off and something else in progress), and the
-		 * target is this task, or none when it cannot be started. A backend without task ids
-		 * (spec) ignores it.
+		 * outline P2 PR 5), or an approved plan's root (P2 PR 8): a to-do of the session's own is
+		 * started for it (the same system start as a promotion, even with `promoteTodo` off and
+		 * something else in progress). The target is this task; or, when it has unfinished tasks
+		 * under it (a tree), its first step that can start, started too; or none when nothing
+		 * can be started. Read as its own subtree, whatever comes before it. A backend without
+		 * task ids (spec) ignores it.
 		 */
 		preferTaskId?: string;
 	}): Promise<ContinuationTarget>;

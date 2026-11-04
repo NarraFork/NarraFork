@@ -7,7 +7,7 @@
 import { blockTitle } from "@shared/outline";
 import { OUTLINE_BEHAVIOR_ALIAS } from "../outline/model";
 import { outlineStore } from "../outline/store";
-import { isApprovedPlanRoot } from "../outline/task-json";
+import { isPersonWork } from "../outline/task-json";
 import {
 	findContinuationCandidates,
 	type OutlineTaskRef,
@@ -16,7 +16,10 @@ import {
 import { readTaskSession } from "./backend";
 import type { OpenTaskStatus } from "./types";
 
-/** Candidates, and waiting tasks, one read of the session's open tasks takes (each). */
+/**
+ * Candidates, and waiting tasks, one read of the session's open tasks takes (each), besides the
+ * work in progress (the tasks it holds and the trees being worked), which is kept past it.
+ */
 export const OUTLINE_OPEN_TASKS_READ = 50;
 
 /** The narrator a source is bound to, and the session its tasks belong to. */
@@ -74,11 +77,18 @@ export interface OpenEntry {
 	ref: OutlineTaskRef;
 	wait: OutlineTaskWait | null;
 	status: OpenTaskStatus;
+	/** Work a person wants of the session (`isPersonWork`): what `protectedOnly` counts. */
+	personWork: boolean;
 }
 
 export interface OpenRead {
 	entries: OpenEntry[];
 	truncated: boolean;
+	/**
+	 * Every open task that is a person's work, however many tasks come before it (review round 1
+	 * S3; the first {@link OUTLINE_OPEN_TASKS_READ} entries are only what continuation names).
+	 */
+	personWork: OpenEntry[];
 }
 
 /**
@@ -86,36 +96,53 @@ export interface OpenRead {
  * never a task of the session: the agent could not tick it (the page is not its to write), so it
  * is left out of every reader (continuation, the views, the interrupt guard, the turn-end note).
  */
-export async function readOpen(session: OutlineSession): Promise<OpenRead> {
-	if (session.subagent || session.sessionNarratorId === null) {
-		return { entries: [], truncated: false };
+export async function readOpen(
+	session: OutlineSession,
+	options: {
+		/** Only this block's subtree (a tree a person asked to start, an approved plan; S3). */
+		within?: string;
+	} = {},
+): Promise<OpenRead> {
+	const sessionNarratorId = session.sessionNarratorId;
+	if (session.subagent || sessionNarratorId === null) {
+		return { entries: [], truncated: false, personWork: [] };
 	}
 	const behavior = session.spaceId
 		? await outlineStore.findAliasOwners(session.spaceId, [OUTLINE_BEHAVIOR_ALIAS])
 		: [];
 	const found = await findContinuationCandidates({
-		narratorId: session.sessionNarratorId,
+		narratorId: sessionNarratorId,
 		sessionSpaceId: session.spaceId,
 		// A page's blocks carry its id as their page; an alias on a nested block matches none.
 		excludePageIds: behavior.map((owner) => owner.id),
 		limit: OUTLINE_OPEN_TASKS_READ,
+		// The tree being worked is named however many to-dos come before it (P2 PR 8 review S3).
+		keepWorkInProgress: true,
+		...(options.within ? { within: options.within } : {}),
+	});
+	const entry = ({
+		wait,
+		...ref
+	}: OutlineTaskRef & { wait: OutlineTaskWait | null }): OpenEntry => ({
+		ref,
+		wait,
+		status: wait ? "blocked" : ref.status,
+		personWork: isPersonWork(ref.taskJson, sessionNarratorId),
 	});
 	return {
-		entries: found.ordered.map(({ wait, ...ref }) => ({
-			ref,
-			wait,
-			status: wait ? "blocked" : ref.status,
-		})),
+		entries: found.ordered.map(entry),
 		truncated: found.truncated,
+		personWork: found.personWork.map(entry),
 	};
 }
 
 /**
- * Work a person wants done (D27a; D48 Q2): a task they created (`/goal`, the board), or the root
- * of a plan they approved (a draft or locked). `protectedOnly` continues while one is open.
+ * Work a person wants done (D27a; D48 Q2 and ⑦): a task they created (`/goal`, the board), or
+ * the root of a plan of this session a person approved (a draft or locked; a plan the review
+ * approved does not count). `protectedOnly` continues while one is open.
  */
 export function isProtected(entry: OpenEntry): boolean {
-	return entry.ref.taskJson.humanCreated === true || isApprovedPlanRoot(entry.ref.taskJson);
+	return entry.personWork;
 }
 
 /**

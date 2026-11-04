@@ -2,12 +2,14 @@
  * Browser fixture of an outline plan's approval (outline P2 PR 8): the real `InlinePermission`
  * form for a waiting ExitPlanMode of an outline session, which renders `OutlinePlanApproval`,
  * against the test server's outline API, its decision route and the page's change hints over the
- * app's own narrator socket (`outline-plan-approval.browser.test.ts`).
+ * app's own narrator socket (`outline-plan-approval.browser.test.ts`). With `keyboard`, the panel's
+ * keyboard navigation (`usePermissionFocusNav`) hosts it, as in a session's panel.
  */
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
+import { type ReactNode, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
@@ -15,7 +17,10 @@ import commonEn from "../../../locales/en/common.json";
 import narratorEn from "../../../locales/en/narrator.json";
 import outlineEn from "../../../locales/en/outline.json";
 import type { PendingPermission } from "../../../types/narrator";
+import type { NarratorComposerHandle } from "../../narrator/composer/NarratorComposer";
+import { usePermissionFocusNav } from "../../narrator/interaction/use-permission-focus-nav";
 import { InlinePermission } from "../../narrator/permission/InlinePermission";
+import { PermEnterHintCtx } from "../../narrator/tool-call/tool-call-contexts";
 
 const instance = i18next.createInstance();
 await instance.use(initReactI18next).init({
@@ -28,8 +33,28 @@ export function ready(): boolean {
 	return true;
 }
 
-/** Mount the approval form of one waiting plan. */
-export function open(permission: PendingPermission): void {
+/** The panel's keyboard navigation of the waiting request (no composer text). */
+function KeyboardHost({
+	permission,
+	children,
+}: {
+	permission: PendingPermission;
+	children: ReactNode;
+}) {
+	const composerRef = useRef<NarratorComposerHandle | null>(null);
+	const { permEnterHintCtxValue } = usePermissionFocusNav({
+		pendingPermissionId: permission.id,
+		pendingPermissionToolName: permission.toolName,
+		composerSendable: false,
+		composerRef,
+	});
+	return (
+		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>{children}</PermEnterHintCtx.Provider>
+	);
+}
+
+/** Mount the approval form of one waiting plan (under the panel's keyboard navigation). */
+export function open(permission: PendingPermission, options: { keyboard?: boolean } = {}): void {
 	// The diff's page subscription rides the narrator socket, as in the app.
 	narratorWSManager.connect();
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -40,7 +65,13 @@ export function open(permission: PendingPermission): void {
 			<MantineProvider>
 				<QueryClientProvider client={queryClient}>
 					<div style={{ maxWidth: 720, padding: 16, boxSizing: "border-box" }}>
-						<InlinePermission permission={permission} />
+						{options.keyboard ? (
+							<KeyboardHost permission={permission}>
+								<InlinePermission permission={permission} />
+							</KeyboardHost>
+						) : (
+							<InlinePermission permission={permission} />
+						)}
 					</div>
 				</QueryClientProvider>
 			</MantineProvider>
@@ -85,6 +116,19 @@ export function type(selector: string, value: string): void {
 	const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement : HTMLInputElement;
 	Object.getOwnPropertyDescriptor(proto.prototype, "value")?.set?.call(el, value);
 	el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/** The label of the button Enter would press (the one carrying the "⏎" hint). */
+export function enterTarget(): string | null {
+	const button = [...document.querySelectorAll("button")].find((b) =>
+		b.textContent?.trim().endsWith("⏎"),
+	);
+	return button?.textContent?.replace("⏎", "").trim() ?? null;
+}
+
+/** Take the focus out of any field (Enter then reaches the panel's keyboard navigation). */
+export function blur(): void {
+	(document.activeElement as HTMLElement | null)?.blur();
 }
 
 /** The texts of the diff's entries, in order. */

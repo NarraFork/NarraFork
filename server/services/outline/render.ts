@@ -509,10 +509,6 @@ const PLAN_LINE = /^ *‹plan [^\n]*›$/;
 const QUESTION_NOTE_CHARS = 600;
 
 /**
- * The note under a question put to a person (`Ask`): who is asked, the numbered choices, the
- * recommendation, and the state (the answer, once given). Bounded; output only.
- */
-/**
  * A plan root's note (outline P2 PR 8): a plan being planned is not executed until a person
  * approves it; an approved one is the session's work.
  */
@@ -524,6 +520,10 @@ export function planNote(node: OutlineNode): string | null {
 		: "plan approved";
 }
 
+/**
+ * The note under a question put to a person (`Ask`): who is asked, the numbered choices, the
+ * recommendation, and the state (the answer, once given). Bounded; output only.
+ */
 export function questionNote(node: OutlineNode): string | null {
 	const ask = node.ask;
 	if (!ask) return null;

@@ -13,13 +13,18 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, narratorToolCalls, users } from "../../db/schema";
+import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
+import {
+	getOutlinePlanModeSystemReminder,
+	getOutlinePlanRelaxedReminder,
+} from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { narratorService } from "../narrator-service";
 import { pendingPermissions } from "../narrator-session-state";
 import { addPersonTask } from "../outline/person-tasks";
 import { readPlanDiff } from "../outline/plan-diff";
-import { findPlanningRoot } from "../outline/plans";
+import { decideOutlinePlan, findPlanningRoot } from "../outline/plans";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import { type OutlineOp, writeOutline } from "../outline/write";
@@ -27,6 +32,8 @@ import {
 	cancelOutlinePlanMode,
 	decideOutlinePlanRequest,
 	enterOutlinePlanMode,
+	outlinePlanCycle,
+	outlinePlanPromptRoot,
 	resolveOutlineExitPlanInput,
 	settleApprovedOutlinePlan,
 	startApprovedOutlinePlan,
@@ -192,28 +199,72 @@ async function submit(narratorId: string, input: Record<string, unknown> = { mod
 		.update(narratorToolCalls)
 		.set({ inputJson: resolved.input, status: "pending" })
 		.where(eq(narratorToolCalls.id, row.id));
+	return wait(narratorId, { requestId: row.id, toolUseId, input: resolved.input });
+}
+
+/**
+ * The request waiting for a person (again, after a restart: the persisted call re-resolved and
+ * asked anew under the same id), its resolution captured.
+ */
+function wait(
+	narratorId: string,
+	call: { requestId: string; toolUseId: string; input: Record<string, unknown> },
+) {
 	let outcome: { behavior: string; message?: string } | null = null;
-	pendingPermissions.set(row.id, {
+	pendingPermissions.set(call.requestId, {
 		resolve: (result) => {
 			outcome = result as { behavior: string; message?: string };
 		},
 		cleanup: () => {},
-		input: resolved.input,
+		input: call.input,
 		narratorId,
 		toolName: "ExitPlanMode",
-		toolUseId,
+		toolUseId: call.toolUseId,
 		broadcastTargetId: narratorId,
 		cwd: "/",
 		locale: "en",
 		signal: new AbortController().signal,
 	});
-	cleanups.push(() => pendingPermissions.delete(row.id));
+	cleanups.push(() => pendingPermissions.delete(call.requestId));
 	return {
-		requestId: row.id,
-		toolUseId,
-		input: resolved.input,
+		...call,
 		outcome: () => outcome as { behavior: string; message?: string } | null,
 	};
+}
+
+/** The request disappears (cancelled, decided elsewhere) once a person's commit lands in `spaceId`. */
+function dropOnPersonCommit(spaceId: string, requestId: string) {
+	const handler = (event: { spaceId: string; actorKind: string }) => {
+		if (event.spaceId === spaceId && event.actorKind === "human")
+			pendingPermissions.delete(requestId);
+	};
+	eventBus.on("outline:committed", handler);
+	cleanups.push(() => eventBus.off("outline:committed", handler));
+}
+
+/** The approval's first pass, as the orchestrator runs it after an approval. */
+async function approve(
+	narratorId: string,
+	sub: { toolUseId: string },
+	approverUserId: string | null,
+	byReview = false,
+) {
+	const approved = await settleApprovedOutlinePlan({
+		narratorId,
+		toolUseId: sub.toolUseId,
+		locale: "en",
+		approverUserId,
+		turnUserId: approverUserId,
+		byReview,
+	});
+	if (!approved) throw new Error("not an outline plan");
+	const prompt = await startApprovedOutlinePlan({
+		narratorId,
+		approved,
+		locale: "en",
+		compact: false,
+	});
+	return { approved, prompt };
 }
 
 describe("the plan tree", () => {
@@ -343,13 +394,39 @@ describe("submitting a plan", () => {
 		expect((inline as { message: string }).message).toContain('mode: "outline"');
 	});
 
-	test("without a plan root: an error, unless it is a plan-file cycle begun before (null)", async () => {
+	test("without a plan root: an error, and a plan file is refused (no cycle was begun before)", async () => {
 		const owner = await user();
 		const id = await session(owner);
 		const missing = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
 		expect(missing?.ok).toBe(false);
 		expect((missing as { message: string }).message).toContain("EnterPlanMode");
+		const file = await resolveOutlineExitPlanInput(id, { mode: "file" }, "en");
+		expect(file?.ok).toBe(false);
+		expect((file as { message: string }).message).toContain('mode: "outline"');
+	});
+
+	test("a plan-file cycle begun before plan PR 8 keeps the file flow until it ends (review round 1 S7)", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await db
+			.update(narrators)
+			.set({ planMode: true, planFileId: "legacy-plan" })
+			.where(eq(narrators.id, id));
+		expect(await outlinePlanCycle(id)).toEqual({ kind: "legacy" });
+		// Its prompt stays the plan-file one, its ExitPlanMode reads the file.
+		expect(await outlinePlanPromptRoot(id)).toBeNull();
 		expect(await resolveOutlineExitPlanInput(id, { mode: "file" }, "en")).toBeNull();
+		expect(await resolveOutlineExitPlanInput(id, {}, "en")).toBeNull();
+		// Once it plans in the outline (EnterPlanMode made a root), it is an outline cycle.
+		await enter(id, owner);
+		const cycle = await outlinePlanCycle(id);
+		expect(cycle?.kind).toBe("outline");
+		expect(await outlinePlanPromptRoot(id)).toEqual({
+			root: { address: (await findPlanningRoot(id))?.address as string },
+		});
+		// A session with no cycle open is an outline one (nothing to keep).
+		const fresh = await session(owner);
+		expect(await outlinePlanCycle(fresh)).toEqual({ kind: "outline", root: null });
 	});
 
 	test("spec sessions are left as they were", async () => {
@@ -625,6 +702,403 @@ describe("deciding (the card's route)", () => {
 			approvedBy: { kind: "system", id: "plan-review" },
 		});
 		expect((await block(plan.root)).taskJson?.lock).toBeUndefined();
+	});
+});
+
+describe("whose work an approved plan is (D48 ⑦)", () => {
+	test("a plan the review approved is executed, but does not keep protectedOnly going", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		const { prompt } = await approve(id, sub, null, true);
+		// Executed: the first step that can start is started and named.
+		expect(prompt).toContain("Step B");
+		expect((await block(plan.b)).taskJson?.status).toBe("doing");
+		// Not the person's work: nothing protected is open, so protectedOnly stops after the turn.
+		const source = await taskSourceForNarrator(id);
+		const next = await source.prepareContinuation({ promoteTodo: true });
+		expect(next.openTask?.text).toBe("Step B");
+		expect(next.protectedOpenCount).toBe(0);
+		expect(await source.protectedOpenCount()).toBe(0);
+	});
+
+	test("a plan a person approved another way (the plain approve) counts; a plan of another session does not", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		await writePlan(id, owner);
+		const sub = await submit(id);
+		await approve(id, sub, owner);
+		const source = await taskSourceForNarrator(id);
+		expect((await source.prepareContinuation({ promoteTodo: true })).protectedOpenCount).toBe(1);
+
+		// An approved plan root in this space that another session planned (review round 1 N13).
+		const other = await session(owner);
+		const lone = await session(owner);
+		const space = await ensureSessionSpace(lone);
+		await writeOutline(
+			{
+				spaceId: space.id,
+				ops: [
+					{
+						op: "insert",
+						parent: null,
+						content: "Someone else's plan",
+						task: {
+							status: "todo",
+							plan: {
+								state: "approved",
+								by: other,
+								round: 1,
+								approvedBy: { kind: "human", id: owner },
+							},
+						},
+					},
+				],
+				actor: { kind: "system", id: "outline-plan" },
+				responsibleUserId: owner,
+			},
+			{ kind: "plan" },
+		);
+		const loneSource = await taskSourceForNarrator(lone);
+		expect((await loneSource.prepareContinuation({ promoteTodo: false })).protectedOpenCount).toBe(
+			0,
+		);
+	});
+});
+
+describe("review round 1", () => {
+	test("S1: a decision whose request went away meanwhile is taken back (409) and the plan stays 计划中", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const space = await ensureSessionSpace(id);
+		const planBefore = (await block(plan.root)).taskJson?.plan;
+		for (const body of [
+			{ action: "draft" as const },
+			{ action: "lock" as const },
+			{ action: "return" as const, feedback: "Split step C" },
+		]) {
+			const sub = await submit(id);
+			dropOnPersonCommit(space.id, sub.requestId);
+			await expect(
+				decideOutlinePlanRequest({
+					requestId: sub.requestId,
+					principal: { userId: owner, isAdmin: false },
+					body: { ...body, seenSeq: sub.input._planSeq as number },
+				}),
+			).rejects.toMatchObject({ statusCode: 409, code: "OUTLINE_PLAN_NOT_WAITING" });
+			expect(sub.outcome()).toBeNull();
+			const root = await block(plan.root);
+			expect(root.taskJson?.plan).toEqual(planBefore);
+			expect(root.taskJson?.lock).toBeUndefined();
+			expect((await findPlanningRoot(id))?.blockId).toBe(plan.root);
+			for (const cleanup of cleanups.splice(0)) cleanup();
+		}
+		// The feedback the return wrote was taken back too.
+		const children = await outlineStore.listChildren(space.id, plan.root, 50);
+		expect(children.some((c) => c.content.includes("Split step C"))).toBe(false);
+	});
+
+	test("S2: a decision written before a restart keeps its submission, and the restored request settles as decided", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		// The card's draft reached the outline, then the server stopped before the resolution.
+		await decideOutlinePlan({
+			session: id,
+			rootId: plan.root,
+			round: 1,
+			action: "draft",
+			decider: { kind: "human", userId: owner },
+			seenSeq: sub.input._planSeq as number,
+			locale: "en",
+		});
+		pendingPermissions.delete(sub.requestId);
+		// Restored: the persisted call resolves to the same submission (not "no plan").
+		const again = await resolveOutlineExitPlanInput(id, sub.input, "en");
+		expect(again).toEqual({ ok: true, input: sub.input });
+		// Asked anew, the person now locks it: the plan is locked, and the agent hears "locked".
+		const restored = wait(id, { ...sub, input: again?.ok ? again.input : sub.input });
+		await decideOutlinePlanRequest({
+			requestId: restored.requestId,
+			principal: { userId: owner, isAdmin: false },
+			body: { action: "lock", seenSeq: sub.input._planSeq as number },
+		});
+		expect(restored.outcome()?.behavior).toBe("allow");
+		expect((await block(plan.root)).taskJson?.lock).toMatchObject({
+			by: { kind: "human", id: owner },
+		});
+		const { approved, prompt } = await approve(id, sub, owner);
+		expect(approved.approval).toMatchObject({ kind: "locked" });
+		expect(prompt).toContain("locked and approved");
+		// One approval, one lock: nothing written twice.
+		expect((await block(plan.root)).taskJson?.plan?.round).toBe(1);
+	});
+
+	test("S2: a lock written before a restart, then approved with the plain approve: the agent hears locked", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		await decideOutlinePlan({
+			session: id,
+			rootId: plan.root,
+			round: 1,
+			action: "lock",
+			decider: { kind: "human", userId: owner },
+			seenSeq: sub.input._planSeq as number,
+			locale: "en",
+		});
+		pendingPermissions.delete(sub.requestId);
+		const { approved, prompt } = await approve(id, sub, owner);
+		expect(approved.approval).toMatchObject({ kind: "locked" });
+		expect(prompt).toContain("locked and approved");
+		expect((await block(plan.root)).taskJson?.plan?.approvedBy).toEqual({
+			kind: "human",
+			id: owner,
+		});
+		// A return of the restored request is refused: it was decided.
+		const restored = wait(id, sub);
+		await expect(
+			decideOutlinePlanRequest({
+				requestId: restored.requestId,
+				principal: { userId: owner, isAdmin: false },
+				body: { action: "return", seenSeq: sub.input._planSeq as number },
+			}),
+		).rejects.toMatchObject({ statusCode: 409, code: "OUTLINE_PLAN_DECIDED" });
+	});
+
+	test("S3: an approved plan behind 55 older to-dos starts, counts, and continues through its steps", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		const ops: OutlineOp[] = [{ op: "insert", tempId: "p", parent: null, content: "Backlog" }];
+		for (let i = 0; i < 55; i++)
+			ops.push({
+				op: "insert",
+				parent: { tempId: "p" },
+				content: `old to-do ${i}`,
+				task: { status: "todo" },
+			});
+		await agentWrite(id, owner, ops);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		await decideOutlinePlanRequest({
+			requestId: sub.requestId,
+			principal: { userId: owner, isAdmin: false },
+			body: { action: "draft", seenSeq: sub.input._planSeq as number },
+		});
+		const { prompt } = await approve(id, sub, owner);
+		expect(prompt).toContain("Step B");
+		expect((await block(plan.b)).taskJson?.status).toBe("doing");
+		const source = await taskSourceForNarrator(id);
+		const next = await source.prepareContinuation({ promoteTodo: true });
+		expect(next.openTask?.text).toBe("Step B");
+		expect(next.protectedOpenCount).toBe(1);
+		// B done: A (free now, in the tree being worked) before any old to-do.
+		await agentWrite(id, owner, [
+			{ op: "setTask", block: { id: plan.b }, task: { status: "done" } },
+		]);
+		expect((await source.prepareContinuation({ promoteTodo: true })).openTask?.text).toBe("Step A");
+		const space = await ensureSessionSpace(id);
+		const inPlan = new Set(Object.values(plan));
+		const startedElsewhere = (await outlineStore.listOpenTasks(space.id, 500)).filter(
+			(b) => b.taskJson?.status === "doing" && !inPlan.has(b.id),
+		);
+		expect(startedElsewhere).toEqual([]);
+	});
+
+	test("S4: the plan-mode prompt names the root's address only, stable while the plan is rewritten", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner, { plan_name: "First title" });
+		const root = await findPlanningRoot(id);
+		const view = await outlinePlanPromptRoot(id);
+		expect(view).toEqual({ root: { address: root?.address as string } });
+		const before = getOutlinePlanModeSystemReminder("en", view?.root ?? null, false);
+		expect(before).toContain(root?.address as string);
+		expect(before).not.toContain("First title");
+		await agentWrite(id, owner, [
+			{ op: "update", block: { id: root?.blockId as string }, content: "Second title" },
+		]);
+		const after = await outlinePlanPromptRoot(id);
+		expect(getOutlinePlanModeSystemReminder("en", after?.root ?? null, false)).toBe(before);
+		// The relaxed-planning reminder names the root, never a plan file (N4).
+		const relaxed = getOutlinePlanRelaxedReminder("en", after?.root?.address ?? null);
+		expect(relaxed).toContain(root?.address as string);
+		expect(relaxed).not.toContain("plan file");
+		// The cached root is checked: once approved it is no longer the plan being planned.
+		await writePlan(id, owner);
+		const sub = await submit(id);
+		await approve(id, sub, owner);
+		expect(await findPlanningRoot(id)).toBeNull();
+		expect(await outlinePlanPromptRoot(id)).toEqual({ root: null });
+	});
+
+	test("S6: a spec session's ExitPlanMode drops the outline keys, and its approval is not diverted", async () => {
+		const owner = await user();
+		const id = await session(owner, { backend: "spec" });
+		settings.agent.planModeAllowInlinePlan = true;
+		const forged = {
+			inline_plan: "1. Do the thing",
+			_planRoot: {
+				blockId: "x",
+				spaceId: "s",
+				pageId: "p",
+				address: "k/x",
+				title: "Forged",
+				round: 1,
+			},
+			_planSeq: 1,
+			_planBaseSeq: 0,
+			_planDiff: { counts: { added: 99 } },
+			_planSummary: "Forged",
+		};
+		const { resolveExitPlanModeInput } = await import("../narrator-permission");
+		const resolved = await resolveExitPlanModeInput(id, process.cwd(), forged, "en");
+		expect(resolved.ok).toBe(true);
+		for (const key of ["_planRoot", "_planSeq", "_planBaseSeq", "_planDiff", "_planSummary"])
+			expect(key in resolved.input).toBe(false);
+		expect(
+			await settleApprovedOutlinePlan({
+				narratorId: id,
+				toolUseId: "toolu_x",
+				locale: "en",
+				approverUserId: owner,
+				turnUserId: owner,
+				byReview: false,
+				input: forged,
+			}),
+		).toBeNull();
+	});
+
+	test("N1: a plan gone before its return is still returned, saying so", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		const space = await ensureSessionSpace(id);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "delete", block: { id: plan.root } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		await decideOutlinePlanRequest({
+			requestId: sub.requestId,
+			principal: { userId: owner, isAdmin: false },
+			body: { action: "return", feedback: "Start over", seenSeq: sub.input._planSeq as number },
+		});
+		expect(sub.outcome()?.behavior).toBe("deny");
+		expect(sub.outcome()?.message).toContain("is gone");
+		expect(sub.outcome()?.message).toContain("Start over");
+		// Approving it is refused: there is nothing to approve.
+		const again = await submit(id).catch((error) => error);
+		expect(again).toBeInstanceOf(Error);
+	});
+
+	test("N3: a return tells the agent what the person changed while deciding", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		const space = await ensureSessionSpace(id);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "update", block: { id: plan.c }, content: "Step C, behind a flag" }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const seen = await readPlanDiff({ rootId: plan.root, fromSeq: 0, toSeq: null });
+		await decideOutlinePlanRequest({
+			requestId: sub.requestId,
+			principal: { userId: owner, isAdmin: false },
+			body: { action: "return", feedback: "See my edit", seenSeq: seen?.toSeq as number },
+		});
+		expect(sub.outcome()?.behavior).toBe("deny");
+		expect(sub.outcome()?.message).toContain("changed the plan while deciding");
+		expect(sub.outcome()?.message).toContain("Step C, behind a flag");
+	});
+
+	test("N7: a live session's flush with nobody to name does not make the decision 409", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		await enter(id, owner);
+		const plan = await writePlan(id, owner);
+		const sub = await submit(id);
+		const space = await ensureSessionSpace(id);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "update", block: { id: plan.c }, content: "Step C, typed live" }],
+			actor: { kind: "system", id: "outline-live" },
+			responsibleUserId: null,
+		});
+		await decideOutlinePlanRequest({
+			requestId: sub.requestId,
+			principal: { userId: owner, isAdmin: false },
+			body: { action: "draft", seenSeq: sub.input._planSeq as number },
+		});
+		expect(sub.outcome()?.behavior).toBe("allow");
+	});
+
+	test("N12: under: refuses a finished task and a task inside a plan not approved yet", async () => {
+		const owner = await user();
+		const id = await session(owner);
+		const done = await addPersonTask({
+			narratorId: id,
+			userId: owner,
+			text: "Shipped",
+			lock: false,
+		});
+		const space = await ensureSessionSpace(id);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "setTask", block: { id: done.blockId }, task: { status: "done" } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const finished = await enter(id, owner, { under: done.address });
+		expect(finished.isError).toBe(true);
+		expect(finished.output).toContain("is finished");
+
+		// A step of a plan another session is still planning, in this space.
+		const other = await session(owner);
+		const nested = await writeOutline(
+			{
+				spaceId: space.id,
+				ops: [
+					{
+						op: "insert",
+						tempId: "r",
+						parent: null,
+						content: "Their plan",
+						task: { status: "todo", plan: { state: "planning", by: other, round: 0 } },
+					},
+					{
+						op: "insert",
+						parent: { tempId: "r" },
+						content: "Their step",
+						task: { status: "todo" },
+					},
+				],
+				actor: { kind: "system", id: "outline-plan" },
+				responsibleUserId: owner,
+			},
+			{ kind: "plan" },
+		);
+		const refused = await enter(id, owner, { under: nested.results[1]?.address as string });
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("not approved yet");
+		expect(await findPlanningRoot(id)).toBeNull();
 	});
 });
 

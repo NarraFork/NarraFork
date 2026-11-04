@@ -1251,16 +1251,15 @@ export async function runAgentLoopUnlocked(
 						? await (await taskSourceForNarrator(narratorId)).contextParts(locale)
 						: undefined;
 				// An outline root session plans in the outline (outline P2 PR 8): plan mode names its
-				// plan root instead of a plan file.
-				const outlinePlan =
+				// plan root (its address only, review round 1 S4) instead of a plan file. A plan-file
+				// cycle begun before PR 8 keeps the file (S7).
+				const outlinePlanView =
 					planMode && outlineEditCore
-						? {
-								root: await (await import("../outline-plan-mode")).outlinePlanPromptRoot(
-									narratorId,
-								),
-								relaxed: relaxedPlan,
-							}
-						: undefined;
+						? await (await import("../outline-plan-mode")).outlinePlanPromptRoot(narratorId)
+						: null;
+				const outlinePlan = outlinePlanView
+					? { root: outlinePlanView.root, relaxed: relaxedPlan }
+					: undefined;
 				const built = await buildSystemPrompt(
 					{
 						systemPrompt: currentOAuth

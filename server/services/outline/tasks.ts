@@ -51,6 +51,7 @@ import {
 	sweepOutlineAnswerDeliveries,
 	watchArchivedSessionQuestions,
 } from "./questions";
+import { readSubtree } from "./read";
 import { outlineStore } from "./store";
 import {
 	chunked,
@@ -60,7 +61,14 @@ import {
 	type OutlineStore,
 	type OutlineTaskClaimRow,
 } from "./store/port";
-import { hasHumanAssignee, isFinishedTask, isOpenTask, isPlanningRoot } from "./task-json";
+import {
+	hasHumanAssignee,
+	isFinishedTask,
+	isOpenTask,
+	isPersonWork,
+	isPlanningRoot,
+} from "./task-json";
+import type { OutlineNode } from "./tree";
 import { type OutlineOp, writeOutline } from "./write";
 
 export const OUTLINE_TASK_LIMITS = {
@@ -80,6 +88,8 @@ export const OUTLINE_TASK_LIMITS = {
 	unclaimedScan: 200,
 	/** Tasks nobody holds one run reopens. */
 	unclaimedBatch: 50,
+	/** Open tasks of one subtree a `within` read takes (a plan's limit). */
+	withinBlocks: 2000,
 	/** Claims of an archived or deleted session one round reads and releases. */
 	releaseBatch: 100,
 	/** Rounds one archived or deleted session gets; what is left runs out as a lease. */
@@ -931,7 +941,10 @@ export interface OutlineTaskRef {
 }
 
 export interface OutlineContinuationCandidates {
-	/** Tasks the session can continue with, in document order. */
+	/**
+	 * Tasks the session can continue with, in document order: at most `limit` (plus the work in
+	 * progress past it, with `keepWorkInProgress`).
+	 */
 	candidates: OutlineTaskRef[];
 	/** Tasks that would be candidates but wait (for prerequisites or people), in document order. */
 	waiting: Array<OutlineTaskRef & { wait: OutlineTaskWait }>;
@@ -942,6 +955,12 @@ export interface OutlineContinuationCandidates {
 	ordered: Array<OutlineTaskRef & { wait: OutlineTaskWait | null }>;
 	/** More tasks than {@link OUTLINE_TASK_LIMITS.candidateScan} were found; the rest were not read. */
 	truncated: boolean;
+	/**
+	 * Every task read that is work a person wants of the session (`isPersonWork`: their own, or
+	 * the root of a plan they approved), however many come before it (review round 1 S3): what
+	 * `protectedOnly` counts. With its wait.
+	 */
+	personWork: Array<OutlineTaskRef & { wait: OutlineTaskWait | null }>;
 }
 
 /**
@@ -969,6 +988,17 @@ export async function findContinuationCandidates(options: {
 	 * rules, which the agent may not tick (outline plan PR 4).
 	 */
 	excludePageIds?: readonly string[];
+	/**
+	 * Only the tasks of this block's subtree (a tree a person asked to start, an approved plan;
+	 * review round 1 S3): read from its page's structure, so tasks elsewhere neither crowd it out
+	 * nor show. At most {@link OUTLINE_TASK_LIMITS.withinBlocks} of its open tasks.
+	 */
+	within?: string;
+	/**
+	 * Keep the work in progress past `limit` (review round 1 S3): the tasks the session holds and
+	 * the open tasks under a task in progress, so to-dos before them cannot crowd them out.
+	 */
+	keepWorkInProgress?: boolean;
 	store?: OutlineStore;
 	now?: Date;
 	limit?: number;
@@ -977,14 +1007,37 @@ export async function findContinuationCandidates(options: {
 	const now = (options.now ?? new Date()).toISOString();
 	const limit = options.limit ?? OUTLINE_TASK_LIMITS.candidates;
 	const scan = OUTLINE_TASK_LIMITS.candidateScan;
+	const empty = (truncated: boolean): OutlineContinuationCandidates => ({
+		candidates: [],
+		waiting: [],
+		ordered: [],
+		truncated,
+		personWork: [],
+	});
 
-	const claimed = await store.listClaimedTasks(options.narratorId, scan + 1);
+	let subtree: Set<string> | null = null;
+	if (options.within) {
+		const read = await readSubtree(options.within, { store });
+		if (!read) return empty(false);
+		subtree = new Set();
+		const stack = [read.root];
+		while (stack.length > 0 && subtree.size < OUTLINE_TASK_LIMITS.withinBlocks) {
+			const node = stack.pop() as OutlineNode;
+			if (node.task && isOpenTask(node.task)) subtree.add(node.id);
+			for (const child of node.children) stack.push(child);
+		}
+	}
+	const claimedAll = await store.listClaimedTasks(options.narratorId, scan + 1);
+	const inTree = subtree;
+	const claimed = inTree ? claimedAll.filter(({ block }) => inTree.has(block.id)) : claimedAll;
 	// Excluded pages are left out inside the scan, so their checkboxes cannot use it up.
-	const own = options.sessionSpaceId
-		? await store.listOpenTasks(options.sessionSpaceId, scan + 1, {
-				excludePageIds: options.excludePageIds,
-			})
-		: [];
+	const own = inTree
+		? await store.getBlockMetasByIds([...inTree])
+		: options.sessionSpaceId
+			? await store.listOpenTasks(options.sessionSpaceId, scan + 1, {
+					excludePageIds: options.excludePageIds,
+				})
+			: [];
 	const truncated = claimed.length > scan || own.length > scan;
 	const metas = new Map<string, OutlineBlockMeta>();
 	const claims = new Map<string, OutlineTaskClaimRow>();
@@ -1002,7 +1055,7 @@ export async function findContinuationCandidates(options: {
 	const live = [...metas.values()].filter(
 		(block) => !block.deleted && isOpenTask(block.taskJson) && !excluded.has(block.pageId),
 	);
-	if (live.length === 0) return { candidates: [], waiting: [], ordered: [], truncated };
+	if (live.length === 0) return empty(truncated);
 	const ancestors = new Map<string, OutlineBlockMeta>();
 	const inOrder = await inDocumentOrder(store, live, options.sessionSpaceId, { ancestors });
 	const known = new Map<string, OutlineBlockMeta>(ancestors);
@@ -1034,7 +1087,7 @@ export async function findContinuationCandidates(options: {
 		if (!claim || claim.holderNarratorId === options.narratorId) return true;
 		return !isClaimLive(claim, now);
 	});
-	if (open.length === 0) return { candidates: [], waiting: [], ordered: [], truncated };
+	if (open.length === 0) return empty(truncated);
 
 	const waits = await deriveOutlineTaskWaits(open, { store });
 	const ordered = open;
@@ -1060,20 +1113,33 @@ export async function findContinuationCandidates(options: {
 	const candidates: OutlineTaskRef[] = [];
 	const waiting: OutlineContinuationCandidates["waiting"] = [];
 	const all: OutlineContinuationCandidates["ordered"] = [];
+	// With `keepWorkInProgress` the work in progress is not cut by the window (P2 PR 8 review S3):
+	// a task the session holds, and the open tasks of a tree being worked (a goal, an approved
+	// plan), are kept past `limit`, however many to-dos come before them; the scan bounds them.
+	const inProgress = (block: OutlineBlockMeta) =>
+		options.keepWorkInProgress === true &&
+		(claims.get(block.id)?.holderNarratorId === options.narratorId ||
+			(chains.get(block.id) ?? []).some((a) => a.taskJson?.status === "doing"));
 	for (const block of ordered) {
 		const wait = waits.get(block.id);
 		if (isWaiting(wait)) {
-			if (waiting.length >= limit) continue;
+			if (waiting.length >= limit && !inProgress(block)) continue;
 			const entry = { ...ref(block), wait: wait as OutlineTaskWait };
 			waiting.push(entry);
 			all.push(entry);
-		} else if (candidates.length < limit) {
+		} else if (candidates.length < limit || inProgress(block)) {
 			const entry = ref(block);
 			candidates.push(entry);
 			all.push({ ...entry, wait: null });
 		}
 	}
-	return { candidates, waiting, ordered: all, truncated };
+	const personWork = open
+		.filter((block) => isPersonWork(block.taskJson, options.narratorId))
+		.map((block) => ({
+			...ref(block),
+			wait: isWaiting(waits.get(block.id)) ? (waits.get(block.id) as OutlineTaskWait) : null,
+		}));
+	return { candidates, waiting, ordered: all, truncated, personWork };
 }
 
 /**

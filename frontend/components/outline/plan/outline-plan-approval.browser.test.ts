@@ -9,6 +9,7 @@
  *     and the diff as of now is shown; deciding again approves it;
  *   - "Lock and execute…" names a session to confirm on the person's behalf;
  *   - "Return" with feedback sends it back and writes the feedback under the plan;
+ *   - with feedback typed, Enter returns the plan (without, it executes it as a draft);
  *   - at a phone's width nothing scrolls sideways.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
@@ -266,6 +267,7 @@ async function waitingPlan() {
 async function openCard(
 	permission: Record<string, unknown>,
 	viewport = { width: 1000, height: 800 },
+	options: { keyboard?: boolean } = {},
 ): Promise<{ page: Page; errors: string[] }> {
 	const context = await browser.createBrowserContext();
 	const page = await context.newPage();
@@ -276,8 +278,9 @@ async function openCard(
 	await page.evaluate((token) => localStorage.setItem("narrafork_token", token), owner);
 	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
 	await page.evaluate(
-		(p) => (window as unknown as FixtureWindow).fixture.open(p as never),
+		(p, o) => (window as unknown as FixtureWindow).fixture.open(p as never, o),
 		permission,
+		options,
 	);
 	await page.waitForSelector("[data-testid=outline-plan-approval]", { timeout: 15_000 });
 	return { page, errors };
@@ -396,6 +399,23 @@ test("return sends the feedback back and records it under the plan; nothing scro
 	expect(plan.outcome()?.message).toContain("Add a rollback step");
 	const children = await outlineStore.listChildren(plan.space.id, plan.root, 10);
 	expect(children.at(-1)?.content).toBe("Returned (version 1): Add a rollback step");
+	expect((await outlineStore.getBlock(plan.root))?.taskJson?.plan?.state).toBe("planning");
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("with feedback typed, Enter returns the plan (review round 1 S5)", async () => {
+	const plan = await waitingPlan();
+	const { page, errors } = await openCard(plan.permission, undefined, { keyboard: true });
+	// Nothing typed: Enter would execute it as a draft.
+	await until(page, "the keyboard default", (f) => f.enterTarget() === "Execute as draft");
+	await call(page, (f) => f.type("[data-testid=outline-plan-feedback]", "Split step B"));
+	await until(page, "Return as the default", (f) => f.enterTarget() === "Return");
+	await call(page, (f) => f.blur());
+	await page.keyboard.press("Enter");
+	await waitFor("the return", () => plan.outcome());
+	expect(plan.outcome()?.behavior).toBe("deny");
+	expect(plan.outcome()?.message).toContain("Split step B");
 	expect((await outlineStore.getBlock(plan.root))?.taskJson?.plan?.state).toBe("planning");
 	expect(errors).toEqual([]);
 	await page.close();

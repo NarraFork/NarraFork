@@ -29,6 +29,7 @@
  */
 
 import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
+import { typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
 import type { PendingPermission } from "../narrator-panel-types";
 import type { InlinePermissionData } from "./measure/measure-permission";
 
@@ -79,11 +80,64 @@ export function estimateLines(text: string, width: number): number {
 }
 const MAX_SCAN = 4_000;
 
+/** Mantine `Button size="sm"`: 18px side padding plus a 1px border, on each side. */
+const SM_BUTTON_CHROME = (18 + 1) * 2;
+/** PermButtonBar's `Group gap="sm"`. */
+const BUTTON_GAP = 12;
+/** The keyboard default's "⏎" hint (an xs span, 4px margin): one button carries it. */
+const FOCUS_HINT_ALLOWANCE = 16;
+/**
+ * Semibold advance per em, for the estimate: latin ≈ 0.6em; a wide character, and the "…" the
+ * labels end with, ≈ 1em (measured in Chromium: the sm chrome is a constant 38px at every scale).
+ */
+const LATIN_EM = 0.6;
+const ELLIPSIS = 0x2026;
+
+/** The outline plan's decisions, in the bar's order, when the caller passes no labels. */
+export const OUTLINE_PLAN_BUTTON_LABELS = ["Execute as draft", "Lock and execute…", "Return"];
+
+/**
+ * Rows a `PermButtonBar` wraps to at `width`, estimated: each button's label at the sm size
+ * plus its chrome, flowed left to right with the group's gap. The first button carries the
+ * focus hint, so the estimate leans a little wide; the reading makes it exact.
+ */
+export function estimateButtonRows(
+	labels: readonly string[],
+	width: number,
+	fontSize: number,
+): number {
+	let rows = 1;
+	let used = 0;
+	labels.forEach((label, i) => {
+		let em = 0;
+		for (let c = 0; c < label.length; c++) {
+			const code = label.charCodeAt(c);
+			em += isWide(code) || code === ELLIPSIS ? 1 : LATIN_EM;
+		}
+		const button = Math.min(
+			width,
+			Math.ceil(em * fontSize) + SM_BUTTON_CHROME + (i === 0 ? FOCUS_HINT_ALLOWANCE : 0),
+		);
+		if (used > 0 && used + BUTTON_GAP + button > width) {
+			rows += 1;
+			used = button;
+		} else {
+			used += (used > 0 ? BUTTON_GAP : 0) + button;
+		}
+	});
+	return rows;
+}
+
 export interface PermissionPredictionContext {
 	/** The card's inner width (px) — what the form wraps against. */
 	innerWidth: number;
 	/** Whether the reader may decide here (else the form shows a read-only note). */
 	canDecide: boolean;
+	/**
+	 * The outline plan's decision labels as the reader sees them (their language decides the
+	 * bar's wrap at phone width); {@link OUTLINE_PLAN_BUTTON_LABELS} when absent.
+	 */
+	planButtonLabels?: readonly string[];
 }
 
 /**
@@ -96,7 +150,8 @@ export function predictInlinePermission(
 	ctx: PermissionPredictionContext,
 ): InlinePermissionData | null {
 	if (permission.toolName === "AskUserQuestion") return null;
-	// An outline session's plan (outline P2 PR 8): summary lines, the feedback box and the buttons.
+	// An outline session's plan (outline P2 PR 8): summary lines, the feedback box and the
+	// buttons, which wrap at phone width (review round 1 U1).
 	const plan =
 		permission.toolName === "ExitPlanMode"
 			? outlinePlanSubmissionOf(permission.inputJson as Record<string, unknown> | undefined)
@@ -107,7 +162,13 @@ export function predictInlinePermission(
 			isExitPlanMode: true,
 			outlinePlanSummaryRows: plan.summary ? 2 : 1,
 			feedbackRows: 1,
-			buttonRows: 1,
+			buttonRows: ctx.canDecide
+				? estimateButtonRows(
+						ctx.planButtonLabels ?? OUTLINE_PLAN_BUTTON_LABELS,
+						ctx.innerWidth,
+						typographyMetrics().size.sm,
+					)
+				: 1,
 		};
 	}
 	const isExitPlanMode = permission.toolName === "ExitPlanMode";
