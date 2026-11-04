@@ -303,6 +303,8 @@
 	"activeBackgroundTasks": "{{count}} background task(s) running",
 	"activeBackgroundServices": "{{count}} background service(s) running",
 	"viewersWatching": "{{count}} people viewing",
+	"recentTabScheduled": "Started by a scheduled task",
+	"recentTabHasDraft": "Has an unsent draft",
 	"containerRunning": "Container running",
 	"containerPaused": "Container paused",
 	"containerStopped": "Container stopped",

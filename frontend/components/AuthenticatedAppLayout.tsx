@@ -26,7 +26,6 @@ import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import {
 	IconAlertTriangle,
 	IconArrowLeft,
-	IconClearAll,
 	IconDashboard,
 	IconMessageChatbot,
 	IconMessageReport,
@@ -42,7 +41,7 @@ import {
 	useRouter,
 	useRouterState,
 } from "@tanstack/react-router";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
@@ -54,7 +53,7 @@ import { useMobileViewport } from "../hooks/useMobileViewport";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
-import { addRecentTab, useRecentTabs } from "../hooks/useRecentTabs";
+import { addRecentTab } from "../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
@@ -101,9 +100,6 @@ import { NavOverflowMenu } from "./nav/NavOverflowMenu";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
-// `isTabActive` comes from the logic module, not `RecentTabs.tsx`: a non-component export
-// there breaks its Fast Refresh boundary and turns tab-list edits into page reloads.
-import { isTabActive } from "./nav/recent-tabs-logic";
 import { useNavBadges } from "./nav/use-nav-badges";
 import { WorkspaceSwitcher } from "./nav/WorkspaceSwitcher";
 import { NotificationBell } from "./notifications/NotificationBell";
@@ -242,7 +238,6 @@ export function AuthenticatedLayout() {
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
-	const { tabs, clearTabs } = useRecentTabs();
 	useAuthenticatedAppearance(prefs);
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
@@ -406,12 +401,6 @@ export function AuthenticatedLayout() {
 		}
 	}, []);
 
-	// Find the active tab key so clearTabs can preserve it
-	const activeTabKey = useMemo(() => {
-		const active = tabs.find((tab) => isTabActive(tab, pathname));
-		return active ? `${active.type}:${active.id}` : undefined;
-	}, [tabs, pathname]);
-
 	// No token → redirect to login (useCurrentUser is disabled, won't fire)
 	if (!hasToken) {
 		return <Navigate to="/login" search={{ redirect: previewLoginRedirect }} replace />;
@@ -438,12 +427,6 @@ export function AuthenticatedLayout() {
 	const openRequestEvidenceSetting = () => {
 		navigate({ to: "/settings/agent", hash: "request-evidence" });
 	};
-
-	// Only session tabs are projected; persisted project visits are left untouched. The
-	// "Narrators" link squares its bottom corners to join an active FIRST row; a folder
-	// header never joins (`isTabActive` is false for it), so neither does the link.
-	const narratorTabs = tabs.filter((t) => t.type !== "project");
-	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
 
 	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
 	// The Navbar's gutter for the three sides that are not the bottom edge. The bottom
@@ -637,16 +620,6 @@ export function AuthenticatedLayout() {
 									active={pathname.startsWith("/narrators")}
 									leftSection={<IconMessageChatbot size={16} />}
 									onClick={() => navigate({ to: "/narrators" })}
-									styles={
-										firstNarratorTabActive
-											? {
-													root: {
-														borderBottomLeftRadius: 0,
-														borderBottomRightRadius: 0,
-													},
-												}
-											: undefined
-									}
 									rightSection={
 										navCollapsed ? undefined : (
 											<Group gap={8} wrap="nowrap">
@@ -669,33 +642,6 @@ export function AuthenticatedLayout() {
 														<IconPlus size={16} />
 													</ActionIcon>
 												</Tooltip>
-												{/* Shown only when clearing would remove something: folders and
-												    their members are always kept, like pinned tabs. */}
-												{tabs.some(
-													(t) =>
-														t.type !== "project" &&
-														t.type !== "folder" &&
-														!t.folderId &&
-														!t.pinned &&
-														!["working", "waiting"].includes(t.status ?? "") &&
-														!t.substatus?.includes("unread"),
-												) && (
-													<Tooltip label={t("clearNarrators")} position="right" withArrow>
-														<ActionIcon
-															size={28}
-															variant="subtle"
-															color="gray"
-															onClick={(e: React.MouseEvent) => {
-																e.preventDefault();
-																e.stopPropagation();
-																clearTabs("inactive_narrators", activeTabKey);
-															}}
-															aria-label={t("clearNarrators")}
-														>
-															<IconClearAll size={16} />
-														</ActionIcon>
-													</Tooltip>
-												)}
 											</Group>
 										)
 									}
@@ -704,7 +650,7 @@ export function AuthenticatedLayout() {
 						</Box>
 						{!navCollapsed && (
 							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-								<RecentTabList filter="narrator" firstTabConnected />
+								<RecentTabList filter="narrator" />
 							</Box>
 						)}
 						<Box>

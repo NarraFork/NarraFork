@@ -1,10 +1,8 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
-import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
-import { Z } from "@frontend/lib/z-index";
+import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
-	Avatar,
 	Box,
 	Button,
 	Center,
@@ -12,53 +10,21 @@ import {
 	Loader,
 	Modal,
 	NavLink,
-	Paper,
 	Stack,
 	Text,
 	TextInput,
-	Tooltip,
-	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
 	RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
 	type RecentTabsDelta as RecentTabsDeltaFrame,
 } from "@shared/recent-tabs";
-import {
-	IconArchive,
-	IconArrowUp,
-	IconBrain,
-	IconChevronDown,
-	IconChevronRight,
-	IconClock,
-	IconCopy,
-	IconFolder,
-	IconFolderOff,
-	IconFolderPlus,
-	IconPencil,
-	IconPin,
-	IconPinnedOff,
-	IconRobot,
-	IconServer,
-	IconSubtask,
-	IconTerminal2,
-	IconWindowMaximize,
-	IconX,
-} from "@tabler/icons-react";
+import { IconBrain, IconClock, IconFolder, IconPencil, IconRobot } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import React, {
-	useCallback,
-	useContext,
-	useEffect,
-	useLayoutEffect,
-	useMemo,
-	useRef,
-	useState,
-} from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFolderDisplay } from "../../hooks/useFolderDisplay";
-import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
@@ -77,7 +43,6 @@ import {
 	type RecentTab,
 	type RecentTabRuntimeVersions,
 	type RecentTabsInfiniteData,
-	type RecentTabViewer,
 	recentTabsSectionQueryKey,
 	reconcileRecentTabsRuntimePatches,
 	refreshRecentTabsLoadedWindow,
@@ -98,16 +63,12 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
-import { LeftTruncatedPathText } from "../common/TruncatedPath";
-import {
-	CreateNarratorLazyModal,
-	preloadCreateNarratorModal,
-} from "../narrator/CreateNarratorLazyModal";
+import { CreateNarratorLazyModal } from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
-import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
+import { RecentTabDetailCard } from "./RecentTabDetailCard";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import { RecentTabFolderEditModal } from "./RecentTabFolderEditModal";
 import {
@@ -115,12 +76,14 @@ import {
 	type RecentTabFolderHeaderProps,
 	RecentTabFolderStrip,
 } from "./RecentTabFolderRows";
+import { RecentTabPinDivider, TabContextMenu } from "./RecentTabMenu";
 import {
 	createRecentTabDragModel,
 	type FolderViewOptions,
 	planRecentTabDrop,
 } from "./recent-tab-drag-model";
 import type { RecentTabDropSource, RecentTabDropTarget } from "./recent-tab-drop-target";
+import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-tab-hover";
 /*
  * Imported, NOT re-exported.
  *
@@ -132,7 +95,6 @@ import type { RecentTabDropSource, RecentTabDropTarget } from "./recent-tab-drop
  * reload. Importers must reach the logic module directly.
  */
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
-import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
 import { SwipeMenuHint, useRowSwipe } from "./useRowSwipe";
@@ -151,6 +113,12 @@ function getRecentTabNarratorId(tab: RecentTab): string | null {
 const RecentTabsDragContext = React.createContext<
 	Pick<ReturnType<typeof useRecentTabsDrag>, "pending" | "consumeClick">
 >({ pending: false, consumeClick: () => false });
+
+/**
+ * The list's hover-card store; null on touch, where rows report no hover and the
+ * details are shown at the top of the row menu instead.
+ */
+const RecentTabHoverContext = React.createContext<RecentTabHoverStore | null>(null);
 
 function tabSortId(tab: RecentTab) {
 	return `${tab.type}:${tab.id}`;
@@ -479,8 +447,6 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 interface RecentTabListProps {
 	filter: "project" | "narrator";
 	onNavigate?: () => void;
-	/** When true, the first tab (if active) removes its top border-radius */
-	firstTabConnected?: boolean;
 	/** Narrator ID to exclude from active highlighting. */
 	excludeActiveNarratorId?: string;
 }
@@ -492,14 +458,11 @@ interface RecentTabListProps {
  * The narrator section also renders folders: a folder header, its visible members
  * (collapsed = none, preview = first N, expanded = all) and a strip under an open folder.
  */
-export function RecentTabList({
-	filter,
-	onNavigate,
-	firstTabConnected,
-	excludeActiveNarratorId,
-}: RecentTabListProps) {
+export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: RecentTabListProps) {
 	const recentTabs = useRecentTabs();
-	const { removeTab, moveTab, pinTab, updateFolder, dissolveFolder } = recentTabs;
+	const { removeTab, moveTab, pinTab, updateFolder, dissolveFolder, clearTabs } = recentTabs;
+	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
+	const [hoverStore] = useState(createRecentTabHoverStore);
 	const sectionState = filter === "project" ? recentTabs.projects : recentTabs.work;
 	const tabs = sectionState.tabs;
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -618,6 +581,31 @@ export function RecentTabList({
 	// Rendering, hit testing and persistence share the same rows.
 	const { pinnedRows, unpinnedRows, folderViews } = drag.model;
 	const topLevelCount = pinnedRows.length + unpinnedRows.length;
+	// Shown only when clearing would remove something: folders and their members are always
+	// kept, like pinned tabs and sessions that are busy or have news.
+	const hasClearableTabs = tabs.some(
+		(tab) =>
+			tab.type !== "project" &&
+			tab.type !== "folder" &&
+			!tab.folderId &&
+			!tab.pinned &&
+			!["working", "waiting"].includes(tab.status ?? "") &&
+			!tab.substatus?.includes("unread"),
+	);
+	const activeTabKey = useMemo(() => {
+		const active = tabs.find((tab) => isTabActive(tab, pathname));
+		return active ? tabSortId(active) : undefined;
+	}, [tabs, pathname]);
+
+	// The hover card never outlives a drag, a scroll of the list or an open menu.
+	useEffect(() => {
+		if (drag.draggingId || ctxMenu) hoverStore.hide();
+	}, [drag.draggingId, ctxMenu, hoverStore]);
+	useEffect(() => {
+		const hide = () => hoverStore.hide();
+		window.addEventListener("scroll", hide, true);
+		return () => window.removeEventListener("scroll", hide, true);
+	}, [hoverStore]);
 
 	/**
 	 * Remove a tab (a folder takes its members with it) and leave the page if it was the
@@ -943,10 +931,8 @@ export function RecentTabList({
 		[updateFolder],
 	);
 
-	const renderRows = (rows: RecentTabRow[], group: "pinned" | "unpinned") =>
-		rows.map((row, index) => {
-			const connectTop =
-				firstTabConnected && index === 0 && (group === "pinned" || pinnedRows.length === 0);
+	const renderRows = (rows: RecentTabRow[]) =>
+		rows.map((row) => {
 			if (row.kind === "tab") {
 				return (
 					<DraggableTabItem
@@ -958,7 +944,6 @@ export function RecentTabList({
 						onNavigate={onNavigate}
 						onContextMenu={handleContextMenu}
 						onPrefetch={prefetchNarratorTab}
-						connectTop={connectTop}
 					/>
 				);
 			}
@@ -1135,169 +1120,181 @@ export function RecentTabList({
 			})()
 		: [...pinnedRows, ...unpinnedRows].findIndex((row) => tabSortId(row.tab) === ctxUnitKey) === 0;
 	return (
-		<RecentTabsDragContext.Provider value={dragInteraction}>
-			<DndContext
-				sensors={drag.sensors}
-				autoScroll={drag.autoScrollOptions}
-				onDragStart={drag.onDragStart}
-				onDragMove={drag.onDragMove}
-				onDragEnd={drag.onDragEnd}
-				onDragCancel={drag.onDragCancel}
-			>
-				<Box
-					ref={listBoxRef}
-					style={{
-						// `clip`, not `hidden`: `hidden` makes this box a scroll container, which
-						// would trap the folder strip's `position: sticky` inside it instead of
-						// letting it stick to the sidebar's real scroller.
-						overflow: "clip",
-						position: "relative",
-						...(topLevelCount === 0 && filter === "narrator" ? { minHeight: 44 } : {}),
-					}}
+		<RecentTabHoverContext.Provider value={isTouch ? null : hoverStore}>
+			<RecentTabsDragContext.Provider value={dragInteraction}>
+				<DndContext
+					sensors={drag.sensors}
+					autoScroll={drag.autoScrollOptions}
+					onDragStart={drag.onDragStart}
+					onDragMove={drag.onDragMove}
+					onDragEnd={drag.onDragEnd}
+					onDragCancel={drag.onDragCancel}
 				>
-					{indicator && (
-						<RecentTabDropIndicator
-							rows={indicator.rows}
-							target={indicator.target}
-							containerTop={indicator.containerTop}
-						/>
-					)}
-					{topLevelCount === 0 ? (
-						emptyBody
-					) : (
-						<>
-							{renderRows(pinnedRows, "pinned")}
-							{renderRows(unpinnedRows, "unpinned")}
-						</>
-					)}
+					<Box
+						ref={listBoxRef}
+						style={{
+							// `clip`, not `hidden`: `hidden` makes this box a scroll container, which
+							// would trap the folder strip's `position: sticky` inside it instead of
+							// letting it stick to the sidebar's real scroller.
+							overflow: "clip",
+							position: "relative",
+							...(topLevelCount === 0 && filter === "narrator" ? { minHeight: 44 } : {}),
+						}}
+					>
+						{indicator && (
+							<RecentTabDropIndicator
+								rows={indicator.rows}
+								target={indicator.target}
+								containerTop={indicator.containerTop}
+							/>
+						)}
+						{topLevelCount === 0 ? (
+							emptyBody
+						) : (
+							<>
+								{renderRows(pinnedRows)}
+								{filter === "narrator" && (
+									<RecentTabPinDivider
+										clearable={hasClearableTabs}
+										onClear={() => clearTabs("inactive_narrators", activeTabKey)}
+										touch={isTouch}
+										t={t}
+									/>
+								)}
+								{renderRows(unpinnedRows)}
+							</>
+						)}
 
-					{topLevelCount > 0 &&
-						(sectionState.isError ? (
-							<Stack gap={2} py={4} align="center">
-								<Text size="xs" c="red">
-									{t("recentTabsSyncError")}
-								</Text>
-								<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
-									{t("retryRecentTabs")}
+						{topLevelCount > 0 &&
+							(sectionState.isError ? (
+								<Stack gap={2} py={4} align="center">
+									<Text size="xs" c="red">
+										{t("recentTabsSyncError")}
+									</Text>
+									<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
+										{t("retryRecentTabs")}
+									</Button>
+								</Stack>
+							) : sectionState.hasMore ? (
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									fullWidth
+									loading={sectionState.isFetchingNextPage}
+									onClick={sectionState.loadMore}
+								>
+									{t("loadMoreRecentTabs")}
 								</Button>
-							</Stack>
-						) : sectionState.hasMore ? (
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								fullWidth
-								loading={sectionState.isFetchingNextPage}
-								onClick={sectionState.loadMore}
-							>
-								{t("loadMoreRecentTabs")}
-							</Button>
-						) : null)}
+							) : null)}
 
-					{ctxMenu && ctxTab && (
-						<TabContextMenu
-							x={ctxMenu.x}
-							y={ctxMenu.y}
-							onClose={() => setCtxMenu(null)}
-							onMoveToTop={handleMoveToTop}
-							onPin={handlePin}
-							isPinned={!!ctxTab.pinned}
-							pinScope={ctxInFolder ? "folder" : "list"}
-							onRemove={handleCtxClose}
-							onReveal={handleReveal}
-							canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
-							onNewNarratorHere={handleNewNarratorHere}
-							canNewNarratorHere={ctxTab.type === "narrator" || ctxTab.type === "subagent"}
-							onCopyCwd={handleCopyCwd}
-							canCopyCwd={["narrator", "subagent"].includes(ctxTab.type)}
-							onOpenInWindow={handleOpenInWindow}
-							canOpenInWindow={!ctxIsFolder && recentTabWindowHref(ctxTab) !== null}
-							onRename={handleRename}
-							canRename={ctxTab.type === "narrator"}
-							onArchive={handleArchive}
-							canArchive={ctxTab.type === "narrator"}
-							isFirst={ctxIsFirst}
-							folder={
-								ctxIsFolder
-									? {
-											collapsed: (folderDisplays[ctxTab.id] ?? "preview") === "collapsed",
-											onEdit: handleEditFolder,
-											onToggle: handleCtxFolderToggle,
-											onDissolve: handleDissolveFolder,
-										}
-									: null
-							}
-							onLeaveFolder={ctxInFolder ? handleLeaveFolder : null}
-							gitIdentityNarratorId={ctxTab.type === "narrator" ? ctxTab.id : null}
+						{ctxMenu && ctxTab && (
+							<TabContextMenu
+								x={ctxMenu.x}
+								y={ctxMenu.y}
+								onClose={() => setCtxMenu(null)}
+								onMoveToTop={handleMoveToTop}
+								onPin={handlePin}
+								isPinned={!!ctxTab.pinned}
+								pinScope={ctxInFolder ? "folder" : "list"}
+								onRemove={handleCtxClose}
+								onReveal={handleReveal}
+								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
+								onNewNarratorHere={handleNewNarratorHere}
+								canNewNarratorHere={ctxTab.type === "narrator" || ctxTab.type === "subagent"}
+								onCopyCwd={handleCopyCwd}
+								canCopyCwd={["narrator", "subagent"].includes(ctxTab.type)}
+								onOpenInWindow={handleOpenInWindow}
+								canOpenInWindow={!ctxIsFolder && recentTabWindowHref(ctxTab) !== null}
+								onRename={handleRename}
+								canRename={ctxTab.type === "narrator"}
+								onArchive={handleArchive}
+								canArchive={ctxTab.type === "narrator"}
+								isFirst={ctxIsFirst}
+								folder={
+									ctxIsFolder
+										? {
+												collapsed: (folderDisplays[ctxTab.id] ?? "preview") === "collapsed",
+												onEdit: handleEditFolder,
+												onToggle: handleCtxFolderToggle,
+												onDissolve: handleDissolveFolder,
+											}
+										: null
+								}
+								onLeaveFolder={ctxInFolder ? handleLeaveFolder : null}
+								gitIdentityNarratorId={ctxTab.type === "narrator" ? ctxTab.id : null}
+								detailsTab={isTouch && !ctxIsFolder ? ctxTab : null}
+								t={t}
+							/>
+						)}
+						<Modal
+							opened={!!renameTab}
+							onClose={() => setRenameTab(null)}
+							title={t("rename")}
+							centered
+							size="sm"
+						>
+							<TextInput
+								value={renameValue}
+								onChange={(e) => setRenameValue(e.currentTarget.value)}
+								onKeyDown={(e) => {
+									// Enter while an IME candidate is open commits the word, not the rename.
+									if (e.key === "Enter" && !e.nativeEvent.isComposing) void handleRenameSubmit();
+									if (e.key === "Escape") setRenameTab(null);
+								}}
+								data-autofocus
+							/>
+							<Group justify="flex-end" mt="md">
+								<Button variant="default" onClick={() => setRenameTab(null)}>
+									{t("cancel")}
+								</Button>
+								<Button loading={renaming} onClick={() => void handleRenameSubmit()}>
+									{t("rename")}
+								</Button>
+							</Group>
+						</Modal>
+						<Modal
+							opened={!!archiveConfirmTab}
+							onClose={() => setArchiveConfirmTab(null)}
+							title={tn("archiveNarrator")}
+							centered
+							size="sm"
+						>
+							<Text size="sm">{tn("archiveActiveWarning")}</Text>
+							<Group justify="flex-end" mt="md">
+								<Button variant="default" onClick={() => setArchiveConfirmTab(null)}>
+									{t("cancel")}
+								</Button>
+								<Button
+									color="orange"
+									loading={archiveNarrator.isPending}
+									onClick={handleArchiveConfirm}
+								>
+									{tn("confirmArchive")}
+								</Button>
+							</Group>
+						</Modal>
+						<RecentTabFolderEditModal
+							folder={editFolder}
+							onClose={() => setEditFolder(null)}
+							onSave={updateFolder}
 							t={t}
 						/>
-					)}
-					<Modal
-						opened={!!renameTab}
-						onClose={() => setRenameTab(null)}
-						title={t("rename")}
-						centered
-						size="sm"
-					>
-						<TextInput
-							value={renameValue}
-							onChange={(e) => setRenameValue(e.currentTarget.value)}
-							onKeyDown={(e) => {
-								// Enter while an IME candidate is open commits the word, not the rename.
-								if (e.key === "Enter" && !e.nativeEvent.isComposing) void handleRenameSubmit();
-								if (e.key === "Escape") setRenameTab(null);
-							}}
-							data-autofocus
+						<CreateNarratorLazyModal
+							opened={newNarratorTarget !== null}
+							busy={newNarratorTarget?.cwd == null}
+							initialCwd={newNarratorTarget?.cwd}
+							onClose={closeNewNarratorHere}
+							onCreated={handleNewNarratorHereCreated}
 						/>
-						<Group justify="flex-end" mt="md">
-							<Button variant="default" onClick={() => setRenameTab(null)}>
-								{t("cancel")}
-							</Button>
-							<Button loading={renaming} onClick={() => void handleRenameSubmit()}>
-								{t("rename")}
-							</Button>
-						</Group>
-					</Modal>
-					<Modal
-						opened={!!archiveConfirmTab}
-						onClose={() => setArchiveConfirmTab(null)}
-						title={tn("archiveNarrator")}
-						centered
-						size="sm"
-					>
-						<Text size="sm">{tn("archiveActiveWarning")}</Text>
-						<Group justify="flex-end" mt="md">
-							<Button variant="default" onClick={() => setArchiveConfirmTab(null)}>
-								{t("cancel")}
-							</Button>
-							<Button
-								color="orange"
-								loading={archiveNarrator.isPending}
-								onClick={handleArchiveConfirm}
-							>
-								{tn("confirmArchive")}
-							</Button>
-						</Group>
-					</Modal>
-					<RecentTabFolderEditModal
-						folder={editFolder}
-						onClose={() => setEditFolder(null)}
-						onSave={updateFolder}
-						t={t}
-					/>
-					<CreateNarratorLazyModal
-						opened={newNarratorTarget !== null}
-						busy={newNarratorTarget?.cwd == null}
-						initialCwd={newNarratorTarget?.cwd}
-						onClose={closeNewNarratorHere}
-						onCreated={handleNewNarratorHereCreated}
-					/>
-				</Box>
-				{/* Keep preview rows outside the measured source container. */}
-				<DragOverlay dropAnimation={null} style={{ pointerEvents: "none" }}>
-					{overlay}
-				</DragOverlay>
-			</DndContext>
-		</RecentTabsDragContext.Provider>
+					</Box>
+					{/* Keep preview rows outside the measured source container. */}
+					<DragOverlay dropAnimation={null} style={{ pointerEvents: "none" }}>
+						{overlay}
+					</DragOverlay>
+				</DndContext>
+			</RecentTabsDragContext.Provider>
+			{!isTouch && <RecentTabDetailCard store={hoverStore} tabs={tabs} />}
+		</RecentTabHoverContext.Provider>
 	);
 }
 
@@ -1416,50 +1413,40 @@ function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconC
 
 /** Rendered in DragOverlay while a tab is being dragged. */
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
-	const { t } = useTranslation("common");
 	const iconColor = getNarratorStatusIconColor(tab);
-
 	return (
 		<div style={{ overflow: "hidden" }}>
 			<NavLink
 				active={active}
-				label={
-					<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
-						{tab.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
-						<Text size="sm" truncate>
-							{tab.title}
-						</Text>
-					</Group>
-				}
-				description={
-					<>
-						{tab.subtitle &&
-							(hasDirectorySubtitle(tab) ? (
-								// cwd: left-ellipsis + LTR isolation so the leading "/" stays put.
-								<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
-							) : (
-								<Text size="xs" c="dimmed" truncate>
-									{tab.subtitle}
-								</Text>
-							))}
-						{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
-					</>
-				}
+				label={<RecentTabTitle tab={tab} />}
 				leftSection={
-					<span>
+					<span style={{ display: "flex" }}>
 						<TabIcon tab={tab} size={16} iconColor={iconColor} />
 					</span>
 				}
-				styles={{
-					root: {
-						cursor: "grabbing",
-					},
-					label: { overflow: "hidden" },
-				}}
+				styles={ROW_STYLES_GRABBING}
 			/>
 		</div>
 	);
 }
+
+/** A row's only text: its title on one line. Everything else is in the details card. */
+function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	return (
+		<Text size="sm" truncate>
+			{tab.title}
+		</Text>
+	);
+}
+
+const ROW_STYLES = {
+	root: { cursor: "pointer" },
+	label: { overflow: "hidden" },
+} as const;
+const ROW_STYLES_GRABBING = {
+	root: { cursor: "grabbing" },
+	label: { overflow: "hidden" },
+} as const;
 
 interface TabItemBodyProps {
 	tab: RecentTab;
@@ -1473,8 +1460,6 @@ interface TabItemBodyProps {
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	onPrefetch?: (tab: RecentTab) => void;
-	/** When true and active, remove top border-radius to connect with nav above */
-	connectTop?: boolean;
 	/** Folder member: indent the row so it reads as part of the folder above. */
 	indent?: boolean;
 	/** True while dnd-kit is dragging this row — suppresses the swipe-to-close gesture. */
@@ -1503,7 +1488,6 @@ function TabItemBody({
 	onNavigate,
 	onContextMenu,
 	onPrefetch,
-	connectTop,
 	indent,
 	isDragging = false,
 	outerRef,
@@ -1512,19 +1496,39 @@ function TabItemBody({
 }: TabItemBodyProps) {
 	const navigate = useNavigate();
 	const drag = useContext(RecentTabsDragContext);
+	const hover = useContext(RecentTabHoverContext);
 	const { t } = useTranslation("common");
 	const to = tab.type === "project" ? `/projects/${tab.id}` : `/narrators/${tab.id}`;
 	const iconColor = getNarratorStatusIconColor(tab);
+	const rowKey = tabSortId(tab);
 
 	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 
 	// Only this list's synthetic post-drag click is suppressed.
 	const handleClick = useCallback(() => {
 		if (drag.consumeClick()) return;
+		hover?.hide();
 		handlePrefetch();
 		navigate({ to });
 		onNavigate?.();
-	}, [drag.consumeClick, handlePrefetch, navigate, to, onNavigate]);
+	}, [drag.consumeClick, hover, handlePrefetch, navigate, to, onNavigate]);
+
+	// Mouse only: touch has no hover, its details live at the top of the row menu.
+	const handlePointerEnter = useCallback(
+		(e: React.PointerEvent<HTMLElement>) => {
+			handlePrefetch();
+			if (e.pointerType !== "mouse" || !hover) return;
+			const row = e.currentTarget;
+			hover.enter(rowKey, () => row.getBoundingClientRect());
+		},
+		[handlePrefetch, hover, rowKey],
+	);
+	const handlePointerLeave = useCallback(
+		(e: React.PointerEvent<HTMLElement>) => {
+			if (e.pointerType === "mouse") hover?.leave();
+		},
+		[hover],
+	);
 
 	// Middle-click to close — preventDefault on mousedown to suppress autoscroll
 	// when the tab list overflows and has a scrollbar.
@@ -1564,9 +1568,10 @@ function TabItemBody({
 				e.preventDefault();
 				return;
 			}
+			hover?.hide();
 			onContextMenu(e, tab);
 		},
-		[onContextMenu, tab, swipe.touching],
+		[onContextMenu, tab, swipe.touching, hover],
 	);
 
 	// Icon and body use the same sensors and cross-surface drag bridge.
@@ -1589,35 +1594,15 @@ function TabItemBody({
 				<NavLink
 					active={active}
 					onClick={handleClick}
-					onPointerEnter={handlePrefetch}
+					onPointerEnter={handlePointerEnter}
+					onPointerLeave={handlePointerLeave}
 					onFocus={handlePrefetch}
 					onMouseDown={handleMouseDown}
 					onAuxClick={handleAuxClick}
 					onContextMenu={handleContextMenu}
 					{...swipe.handlers}
 					pl={indent ? "lg" : undefined}
-					label={
-						<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
-							{tab.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
-							<Text size="sm" truncate>
-								{tab.title}
-							</Text>
-						</Group>
-					}
-					description={
-						<>
-							{tab.subtitle &&
-								(hasDirectorySubtitle(tab) ? (
-									// cwd: left-ellipsis + LTR isolation so the leading "/" stays put.
-									<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
-								) : (
-									<Text size="xs" c="dimmed" truncate>
-										{tab.subtitle}
-									</Text>
-								))}
-							{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
-						</>
-					}
+					label={<RecentTabTitle tab={tab} />}
 					leftSection={
 						<span
 							style={{
@@ -1631,18 +1616,7 @@ function TabItemBody({
 							<TabIcon tab={tab} size={16} iconColor={iconColor} />
 						</span>
 					}
-					styles={{
-						root: {
-							cursor: "pointer",
-							...(connectTop && active
-								? {
-										borderTopLeftRadius: 0,
-										borderTopRightRadius: 0,
-									}
-								: {}),
-						},
-						label: { overflow: "hidden" },
-					}}
+					styles={ROW_STYLES}
 				/>
 			</div>
 		</div>
@@ -1723,392 +1697,4 @@ function findCachedNarratorSummary(
 		}
 	}
 	return null;
-}
-
-// === Indicator components for extra tab info ===
-
-interface TabIndicatorsProps {
-	tab: RecentTab;
-	t: (key: string, opts?: Record<string, unknown>) => string;
-}
-
-function TabIndicators({ tab, t }: TabIndicatorsProps) {
-	const viewerCount = tab.viewerCount ?? tab.viewers?.length ?? 0;
-	const hasViewers = viewerCount >= 2;
-	const hasTerminals = (tab.activeTerminalCount ?? 0) > 0;
-	const workCount = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
-	const serviceCount = tab.activeBackgroundServiceCount ?? 0;
-	const hasBackgroundTasks = workCount > 0;
-
-	if (!hasViewers && !hasTerminals && !hasBackgroundTasks && !serviceCount) return null;
-
-	return (
-		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-			{hasViewers && (
-				<ViewerAvatars
-					viewers={(tab.viewers ?? []) as RecentTabViewer[]}
-					viewerCount={viewerCount}
-					t={t}
-				/>
-			)}
-			{hasTerminals && (
-				<Tooltip
-					label={t("activeTerminals", { count: tab.activeTerminalCount })}
-					withArrow
-					position="right"
-				>
-					<Group gap={1} wrap="nowrap">
-						<IconTerminal2 size={11} style={{ opacity: 0.6, transform: "translateY(-1px)" }} />
-						<Text size="xs" c="dimmed" lh={1}>
-							{tab.activeTerminalCount}
-						</Text>
-					</Group>
-				</Tooltip>
-			)}
-			{hasBackgroundTasks && (
-				<Tooltip
-					label={t("activeBackgroundTasks", { count: workCount })}
-					withArrow
-					position="right"
-				>
-					<Group gap={1} wrap="nowrap">
-						<IconSubtask size={11} style={{ opacity: 0.6, transform: "translateY(-1px)" }} />
-						<Text size="xs" c="dimmed" lh={1}>
-							{workCount}
-						</Text>
-					</Group>
-				</Tooltip>
-			)}
-			{serviceCount > 0 && (
-				<Tooltip
-					label={t("activeBackgroundServices", { count: serviceCount })}
-					withArrow
-					position="right"
-				>
-					<Group gap={1} wrap="nowrap">
-						<IconServer size={11} style={{ opacity: 0.6 }} />
-						<Text size="xs" c="dimmed" lh={1}>
-							{serviceCount}
-						</Text>
-					</Group>
-				</Tooltip>
-			)}
-		</Group>
-	);
-}
-
-interface ViewerAvatarsProps {
-	viewers: RecentTabViewer[];
-	viewerCount: number;
-	t: (key: string, opts?: Record<string, unknown>) => string;
-}
-
-const MAX_VISIBLE_AVATARS = 3;
-
-function ViewerAvatars({ viewers, viewerCount, t }: ViewerAvatarsProps) {
-	const visible = viewers.slice(0, MAX_VISIBLE_AVATARS);
-	const overflow = Math.max(0, viewerCount - MAX_VISIBLE_AVATARS);
-
-	return (
-		<Tooltip label={t("viewersWatching", { count: viewerCount })} withArrow position="right">
-			<Avatar.Group spacing={4}>
-				{visible.map((v) => (
-					<UserAvatar
-						key={v.userId}
-						username={v.username}
-						avatarColor={v.avatarColor}
-						avatarImageId={v.avatarImageId}
-						userId={v.userId}
-						size={16}
-						radius="xl"
-						showTooltip={false}
-						styles={{
-							root: {
-								border: "1.5px solid var(--mantine-color-dark-7)",
-								fontSize: 8,
-								minWidth: 16,
-								minHeight: 16,
-							},
-						}}
-					/>
-				))}
-				{overflow > 0 && (
-					<Avatar
-						size={16}
-						radius="xl"
-						styles={{
-							root: {
-								border: "1.5px solid var(--mantine-color-dark-7)",
-								fontSize: 8,
-								minWidth: 16,
-								minHeight: 16,
-							},
-						}}
-					>
-						+{overflow}
-					</Avatar>
-				)}
-			</Avatar.Group>
-		</Tooltip>
-	);
-}
-
-// === Tab context menu ===
-
-interface TabContextMenuProps {
-	x: number;
-	y: number;
-	onClose: () => void;
-	onMoveToTop: () => void;
-	onPin: () => void;
-	isPinned: boolean;
-	onRemove: () => void;
-	onReveal: () => void;
-	canReveal: boolean;
-	onNewNarratorHere: () => void;
-	canNewNarratorHere: boolean;
-	onCopyCwd: () => void;
-	canCopyCwd: boolean;
-	onOpenInWindow: () => void;
-	canOpenInWindow: boolean;
-	onRename: () => void;
-	canRename: boolean;
-	onArchive: () => void;
-	canArchive: boolean;
-	isFirst: boolean;
-	/** "folder": pinning a folder member pins it inside its folder. */
-	pinScope: "list" | "folder";
-	/** Folder-only actions; null for any other row. */
-	folder: {
-		collapsed: boolean;
-		onEdit: () => void;
-		onToggle: () => void;
-		onDissolve: () => void;
-	} | null;
-	/** Folder member: take it out of its folder. */
-	onLeaveFolder: (() => void) | null;
-	/** The narrator this tab stands for, when the per-narrator git identity pick applies. */
-	gitIdentityNarratorId: string | null;
-	t: (key: string) => string;
-}
-
-const MENU_EDGE_GAP = 8;
-
-/**
- * Place a menu at the pointer, flipped up and/or left when it would overflow the
- * viewport (a right-click near the bottom, a swipe released near the screen edge).
- */
-function useMenuPosition(x: number, y: number) {
-	const [node, setNode] = useState<HTMLDivElement | null>(null);
-	const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
-	useLayoutEffect(() => {
-		if (!node) return;
-		const { width, height } = node.getBoundingClientRect();
-		const view = node.ownerDocument.defaultView;
-		const maxLeft = (view?.innerWidth ?? x + width) - width - MENU_EDGE_GAP;
-		const maxTop = (view?.innerHeight ?? y + height) - height - MENU_EDGE_GAP;
-		setPosition({
-			left: Math.max(MENU_EDGE_GAP, x <= maxLeft ? x : x - width),
-			top: Math.max(MENU_EDGE_GAP, y <= maxTop ? y : y - height),
-		});
-	}, [node, x, y]);
-	return {
-		ref: setNode,
-		left: position?.left ?? x,
-		top: position?.top ?? y,
-		measured: position !== null,
-	};
-}
-
-function TabContextMenu({
-	x,
-	y,
-	onClose,
-	onMoveToTop,
-	onPin,
-	isPinned,
-	onRemove,
-	onReveal,
-	canReveal,
-	onNewNarratorHere,
-	canNewNarratorHere,
-	onCopyCwd,
-	canCopyCwd,
-	onOpenInWindow,
-	canOpenInWindow,
-	onRename,
-	canRename,
-	onArchive,
-	canArchive,
-	isFirst,
-	pinScope,
-	folder,
-	onLeaveFolder,
-	gitIdentityNarratorId,
-	t,
-}: TabContextMenuProps) {
-	const gitIdentityVisibility = useGitIdentityVisibility();
-	const position = useMenuPosition(x, y);
-	return (
-		<>
-			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
-			<div
-				style={{ position: "fixed", inset: 0, zIndex: Z.contextMenuBackdrop }}
-				onClick={onClose}
-				onContextMenu={(e) => {
-					e.preventDefault();
-					onClose();
-				}}
-				onKeyDown={() => {}}
-				role="presentation"
-			/>
-			<Paper
-				ref={position.ref}
-				shadow="md"
-				p={4}
-				withBorder
-				style={{
-					position: "fixed",
-					left: position.left,
-					top: position.top,
-					zIndex: Z.contextMenu,
-					minWidth: 140,
-					maxHeight: `calc(100dvh - ${2 * MENU_EDGE_GAP}px)`,
-					overflowY: "auto",
-					// Hidden for the one frame before it is measured, so it never flashes off-screen.
-					visibility: position.measured ? "visible" : "hidden",
-				}}
-			>
-				<Stack gap={2}>
-					{folder && (
-						<>
-							<UnstyledButton px="xs" py={4} onClick={folder.onEdit} style={{ borderRadius: 4 }}>
-								<Group gap={8} wrap="nowrap">
-									<IconPencil size={14} />
-									<Text size="sm">{t("editFolder")}</Text>
-								</Group>
-							</UnstyledButton>
-							<UnstyledButton px="xs" py={4} onClick={folder.onToggle} style={{ borderRadius: 4 }}>
-								<Group gap={8} wrap="nowrap">
-									{folder.collapsed ? (
-										<IconChevronDown size={14} />
-									) : (
-										<IconChevronRight size={14} />
-									)}
-									<Text size="sm">
-										{t(folder.collapsed ? "expandFolderMenu" : "collapseFolderMenu")}
-									</Text>
-								</Group>
-							</UnstyledButton>
-						</>
-					)}
-					{!isFirst && !isPinned && (
-						<UnstyledButton px="xs" py={4} onClick={onMoveToTop} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconArrowUp size={14} />
-								<Text size="sm">{t(pinScope === "folder" ? "moveToFolderTop" : "moveToTop")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-					<UnstyledButton px="xs" py={4} onClick={onPin} style={{ borderRadius: 4 }}>
-						<Group gap={8} wrap="nowrap">
-							{isPinned ? <IconPinnedOff size={14} /> : <IconPin size={14} />}
-							<Text size="sm">
-								{t(
-									pinScope === "folder"
-										? isPinned
-											? "unpinInFolder"
-											: "pinInFolder"
-										: isPinned
-											? "unpinTab"
-											: "pinTab",
-								)}
-							</Text>
-						</Group>
-					</UnstyledButton>
-					{onLeaveFolder && (
-						<UnstyledButton px="xs" py={4} onClick={onLeaveFolder} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconFolderOff size={14} />
-								<Text size="sm">{t("leaveFolder")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-					{folder && (
-						<UnstyledButton px="xs" py={4} onClick={folder.onDissolve} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconFolderOff size={14} />
-								<Text size="sm">{t("dissolveFolder")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-					<UnstyledButton px="xs" py={4} onClick={onRemove} style={{ borderRadius: 4 }}>
-						<Group gap={8} wrap="nowrap">
-							<IconX size={14} />
-							<Text size="sm">{t(folder ? "closeFolder" : "closeTab")}</Text>
-						</Group>
-					</UnstyledButton>
-					{canCopyCwd && (
-						<UnstyledButton px="xs" py={4} onClick={onCopyCwd} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconCopy size={14} />
-								<Text size="sm">{t("copyCwd")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-					{canOpenInWindow && (
-						<UnstyledButton px="xs" py={4} onClick={onOpenInWindow} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconWindowMaximize size={14} />
-								<Text size="sm">{t("openInWindow")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-					{canRename && (
-						<UnstyledButton px="xs" py={4} onClick={onRename} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconPencil size={14} />
-								<Text size="sm">{t("rename")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-					{canArchive && (
-						<UnstyledButton px="xs" py={4} onClick={onArchive} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconArchive size={14} />
-								<Text size="sm">{t("archive")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-					{gitIdentityNarratorId && gitIdentityVisibility.contextMenu && (
-						<TabGitIdentityMenu narratorId={gitIdentityNarratorId} onClose={onClose} />
-					)}
-					{canReveal && (
-						<UnstyledButton px="xs" py={4} onClick={onReveal} style={{ borderRadius: 4 }}>
-							<Group gap={8} wrap="nowrap">
-								<IconFolder size={14} />
-								<Text size="sm">{t("revealInExplorer")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}{" "}
-					{canNewNarratorHere && (
-						<UnstyledButton
-							px="xs"
-							py={4}
-							onPointerEnter={preloadCreateNarratorModal}
-							onFocus={preloadCreateNarratorModal}
-							onPointerDown={preloadCreateNarratorModal}
-							onClick={onNewNarratorHere}
-							style={{ borderRadius: 4 }}
-						>
-							<Group gap={8} wrap="nowrap">
-								<IconFolderPlus size={14} />
-								<Text size="sm">{t("newNarratorHere")}</Text>
-							</Group>
-						</UnstyledButton>
-					)}
-				</Stack>
-			</Paper>
-		</>
-	);
 }
