@@ -255,6 +255,12 @@ export interface CardReport {
 	foldedTaskWidth: number;
 	/** The interrupt guard's close button, in its heading. */
 	closeButtons: number;
+	/** The folded line's tail: its width and font size (px); -1 when not drawn. */
+	tailWidth: number;
+	tailFontPx: number;
+	/** The folded line's lead: drawn, and cut short (an ellipsis). */
+	lead: boolean;
+	leadTruncated: boolean;
 }
 
 export function report(): CardReport[] {
@@ -277,6 +283,12 @@ export function report(): CardReport[] {
 		const task = card.querySelector<HTMLElement>(
 			"[data-task-notice-summary] [data-task-notice-task]",
 		);
+		const tail = card.querySelector<HTMLElement>(
+			"[data-task-notice-summary] [data-task-notice-tail]",
+		);
+		const lead = card.querySelector<HTMLElement>(
+			"[data-task-notice-summary] [data-task-notice-lead]",
+		);
 		return {
 			kind: card.dataset.kind ?? "",
 			measured: Number(card.dataset.measured),
@@ -289,6 +301,10 @@ export function report(): CardReport[] {
 			foldedTaskWidth: task ? Math.round(task.getBoundingClientRect().width) : -1,
 			closeButtons: card.querySelectorAll("[data-task-notice-head] button[aria-label='删除此提醒']")
 				.length,
+			tailWidth: tail ? Math.round(tail.getBoundingClientRect().width) : -1,
+			tailFontPx: tail ? Number.parseFloat(getComputedStyle(tail).fontSize) : -1,
+			lead: !!lead,
+			leadTruncated: !!lead && lead.scrollWidth > lead.clientWidth + 0.5,
 		};
 	});
 }

@@ -797,8 +797,9 @@ function fromControl(event: MouseEvent<HTMLElement>): boolean {
 }
 
 /**
- * Below this inner width (a phone) the folded line keeps only what names the task: the time label
- * and the tail ("等 2 项", "还没勾成完成") are left out; the chevron and the chip say as much.
+ * Below this inner width (a phone) the folded line keeps only what names the task: the time label,
+ * the tail ("等 2 项", "还没勾成完成") and a lead beside a task ("2 个未完成：") are left out; the
+ * chevron and the chip say as much.
  */
 const TASK_NOTICE_NARROW_WIDTH = 420;
 
@@ -995,7 +996,9 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 	};
 	return (
 		<>
-			{lead ? (
+			{/* On a phone a lead beside a task ("2 个未完成：") would only be cut to "2…": it is left
+			    out like the tail, the chevron opens the list. A lead that is the whole line stays. */}
+			{lead && !(narrow && row) ? (
 				<span style={dim} data-task-notice-lead="">
 					{lead}
 				</span>
@@ -1007,7 +1010,8 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 				</>
 			) : null}
 			{tail && !narrow ? (
-				<span style={dim} data-task-notice-tail="">
+				// Kept readable beside a long title: the title is truncated first.
+				<span style={{ ...dim, minWidth: "3em" }} data-task-notice-tail="">
 					{tail}
 				</span>
 			) : null}

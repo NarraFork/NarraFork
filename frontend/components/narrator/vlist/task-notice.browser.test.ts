@@ -84,6 +84,26 @@ const CASES: Array<{ name: string; options: Fixture.FixtureOptions }> = [
 			lineHeightScalePercent: 120,
 		},
 	},
+	{
+		name: "folded-328-enlarged",
+		options: {
+			width: 328,
+			expanded: false,
+			scheme: "dark",
+			fontScalePercent: 130,
+			lineHeightScalePercent: 120,
+		},
+	},
+	{
+		name: "folded-720-enlarged",
+		options: {
+			width: 720,
+			expanded: false,
+			scheme: "dark",
+			fontScalePercent: 130,
+			lineHeightScalePercent: 120,
+		},
+	},
 	{ name: "unfolded-720-light", options: { width: 720, expanded: true, scheme: "light" } },
 	{ name: "unfolded-360-dark", options: { width: 360, expanded: true, scheme: "dark" } },
 	{
@@ -144,6 +164,19 @@ for (const { name, options } of CASES) {
 				expect(card.foldedTaskWidth).toBeGreaterThanOrEqual(MIN_TASK_WIDTH);
 			}
 			expect(cards[4]?.foldedTaskWidth).toBe(-1);
+			// No lead is cut to a stub ("2…"): beside a task it is left out on a phone, and shown
+			// whole on a wider line.
+			for (const card of cards) expect(card.leadTruncated).toBe(false);
+			if (options.width >= 420) {
+				expect(cards[2]?.lead).toBe(true);
+				// The turn-end tail ("还没勾成完成") stays readable beside its long title: the title
+				// is truncated first.
+				const turnEnd = cards[0];
+				expect(turnEnd?.tailWidth ?? -1).toBeGreaterThanOrEqual(2 * (turnEnd?.tailFontPx ?? 0));
+			} else {
+				expect(cards[2]?.lead).toBe(false);
+				expect(cards[0]?.tailWidth).toBe(-1);
+			}
 		}
 		if (shots) {
 			mkdirSync(shots, { recursive: true });
