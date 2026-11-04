@@ -223,7 +223,10 @@ export interface KindChrome {
 	leftChrome: number;
 	/** px reserved to the RIGHT of the body (action buttons). */
 	rightChrome: number;
-	/** fixed height ABOVE the body within the card (title row + gap). */
+	/**
+	 * fixed height ABOVE the body within the card (title row + gap). A kind whose title row is a
+	 * text line defines it as a getter, so it follows the reader's typography at measure time.
+	 */
 	preBody: number;
 	/** fixed height BELOW the body within the card (button row + gap). */
 	postBody: number;
@@ -290,7 +293,10 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		whiteSpace: "pre-wrap",
 		leftChrome: SEGMENT_LEFT,
 		rightChrome: SEGMENT_RIGHT,
-		preBody: typographyMetrics().line.xs + SEGMENT_TITLE_GAP, // title line (17) + gap (2) = 19
+		// Title line + gap (2). A getter, like origin_notice's: see the note there.
+		get preBody() {
+			return typographyMetrics().line.xs + SEGMENT_TITLE_GAP;
+		},
 		postBody: 0,
 		sideMin: BUTTON_COMPACT_XS, // 18
 		prefix: "",
@@ -332,7 +338,13 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		// so the body keeps the full card width.
 		leftChrome: 0,
 		rightChrome: 0,
-		preBody: typographyMetrics().line.xs + ORIGIN_HEADING_GAP, // heading (17) + gap (4) = 21
+		// Heading line + gap (4), as a getter so it is read at measure time. The render draws the
+		// heading at the reader's live `line.xs`; a value computed here was frozen at the
+		// typography of module load (the default), so on enlarged type the body was drawn lower
+		// than measured, into the card's bottom padding (11px at 130% type, 120% line height).
+		get preBody() {
+			return typographyMetrics().line.xs + ORIGIN_HEADING_GAP;
+		},
 		postBody: 0,
 		sideMin: 0,
 		prefix: "",

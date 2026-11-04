@@ -245,6 +245,12 @@ export interface CardReport {
 	painted: number;
 	/** Content height inside it: more than `painted` means something spills past the box. */
 	content: number;
+	/**
+	 * How far any element reaches past the card's content box, into its padding or beyond (px).
+	 * `content` only sees what passes the padding too: a body pushed 9px down sits in the 10px
+	 * padding with `content` still equal to `painted`.
+	 */
+	spill: number;
 	/** Widths: the card's content may not be wider than the card. */
 	scrollWidth: number;
 	width: number;
@@ -280,6 +286,22 @@ export function report(): CardReport[] {
 				overflow = Math.max(overflow, box.top - r.top, r.bottom - box.bottom);
 			}
 		}
+		let spill = 0;
+		if (paper) {
+			const box = paper.getBoundingClientRect();
+			const style = getComputedStyle(paper);
+			const top =
+				box.top + Number.parseFloat(style.borderTopWidth) + Number.parseFloat(style.paddingTop);
+			const bottom =
+				box.bottom -
+				Number.parseFloat(style.borderBottomWidth) -
+				Number.parseFloat(style.paddingBottom);
+			for (const child of paper.querySelectorAll<HTMLElement>("*")) {
+				const r = child.getBoundingClientRect();
+				if (r.width === 0 || r.height === 0) continue;
+				spill = Math.max(spill, top - r.top, r.bottom - bottom);
+			}
+		}
 		const task = card.querySelector<HTMLElement>(
 			"[data-task-notice-summary] [data-task-notice-task]",
 		);
@@ -294,6 +316,7 @@ export function report(): CardReport[] {
 			measured: Number(card.dataset.measured),
 			painted: paper ? Math.round(paper.getBoundingClientRect().height) : 0,
 			content: paper ? paper.scrollHeight : 0,
+			spill: Math.round(spill * 10) / 10,
 			scrollWidth: paper ? paper.scrollWidth : 0,
 			width: paper ? paper.clientWidth : 0,
 			text: card.textContent ?? "",

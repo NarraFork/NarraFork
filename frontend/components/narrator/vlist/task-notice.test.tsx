@@ -22,13 +22,25 @@ import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import zhCommon from "../../../locales/zh-CN/common.json";
 import zhNarrator from "../../../locales/zh-CN/narrator.json";
+import {
+	BADGE_XS,
+	CARD_PADDING,
+	ORIGIN_HEADING_GAP,
+	TASK_NOTICE_ROW_GAP,
+} from "./measure/measure-system-text";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { typographyMetrics } from "./pretext-fonts";
 import { VLIST_REGISTRY } from "./registry";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { type AdapterContext, type AdapterSegment, adaptSegment } from "./segment-adapter";
 import { useVListLabels } from "./useVListLabels";
 
 const K = "MTBXwl1Y";
+/**
+ * One line of a task notice, as the measure pass takes it: xs text beside xs badges, so the
+ * taller of the reader's live xs line box and the badge.
+ */
+const line = () => Math.max(typographyMetrics().line.xs, BADGE_XS);
 const href = (sid: string) => `/outline/ref?a=${encodeURIComponent(`${K}/${sid}`)}`;
 let labels: Record<string, string> = {};
 const disposeCanvas = installCanvasStub();
@@ -194,7 +206,7 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		// The inspector still has what the model got.
 		expect(data.modelFacing).toBe(TURN_END_TEXT);
 		const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, 800, 5, spec.opts);
-		expect(measured.height).toBe(10 * 2 + 17);
+		expect(measured.height).toBe(CARD_PADDING * 2 + line());
 	});
 
 	it("people's changes: who changed how many, chips from → to, and each person named", () => {
@@ -223,7 +235,7 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		expect(data.expandable).toBe(true);
 		expect(folded.opts).toEqual({ expanded: false });
 		const foldedHeight = VLIST_REGISTRY[folded.kind].measure(folded.data, 800, 5, folded.opts);
-		expect(foldedHeight.height).toBe(37);
+		expect(foldedHeight.height).toBe(CARD_PADDING * 2 + line());
 		// Unfolded: the heading line, a gap, three lines with two gaps between them.
 		const open = specOf(edited(), true);
 		expect(open.opts).toEqual({ expanded: true });
@@ -235,7 +247,7 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		expect(measured).toMatchObject({
 			expanded: true,
 			rowCount: 3,
-			height: 20 + 17 + 4 + 3 * 17 + 2 * 4,
+			height: CARD_PADDING * 2 + line() + ORIGIN_HEADING_GAP + 3 * line() + 2 * TASK_NOTICE_ROW_GAP,
 		});
 	});
 
