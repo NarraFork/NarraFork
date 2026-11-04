@@ -46,6 +46,7 @@ import {
 	IconGitFork,
 	IconListCheck,
 	IconLock,
+	IconMessageReply,
 	IconNetwork,
 	IconPhotoOff,
 	IconPlayerPause,
@@ -773,6 +774,7 @@ const TASK_NOTICE_ICON: Record<TaskNoticeVariant, typeof IconListCheck> = {
 	edited: IconUserEdit,
 	interrupt: IconPlayerPause,
 	view: IconListCheck,
+	answers: IconMessageReply,
 };
 
 /** The reader's xs text, at the transcript's live typography (measure uses the same line). */

@@ -60,6 +60,15 @@ import {
 	parseAliasValue,
 	TASK_BOX,
 } from "@shared/outline";
+import {
+	boundOutlineEditDisplay,
+	OUTLINE_TOOL_DISPLAY_LIMITS,
+	type OutlineDisplayCreated,
+	type OutlineDisplayRef,
+	type OutlineDisplaySpace,
+	type OutlineDisplayStatus,
+	type OutlineEditDisplayOp,
+} from "@shared/outline-tool-display";
 import { readDisplayNames } from "./access-reads";
 import {
 	type AgentMerge,
@@ -520,7 +529,7 @@ async function decideEdits(
 					? text.deciderSession(titles.get(row.requesterSession) ?? null, row.requesterSession)
 					: OUTLINE_TOOL_TEXT.edit.someone;
 				lines.push(`${prefix}${text.confirmed(label, done.write.commit?.seq ?? null, proposer)}`);
-				decided.push({ confirm: label, commit: done.write.commit });
+				decided.push({ confirm: label, commit: done.write.commit, space: space.key });
 			} else {
 				const done = await rejectOutlinePending({
 					pendingId: row.id,
@@ -530,7 +539,7 @@ async function decideEdits(
 				lines.push(
 					`${prefix}${done.status === "withdrawn" ? text.withdrew(label) : text.rejected(label)}`,
 				);
-				decided.push({ reject: label, status: done.status });
+				decided.push({ reject: label, status: done.status, space: space.key });
 			}
 		} catch (error) {
 			if (!(error instanceof OutlinePendingError)) throw error;
@@ -896,7 +905,7 @@ export async function outlineEdit(
 	let outcome:
 		| { conflicts: ChangedSinceRead[] }
 		| { writeConflict: OutlineConflictError }
-		| { written: OutlineWriteResult; merged: MergedBlock[] }
+		| { written: OutlineWriteResult; merged: MergedBlock[]; before: WrittenBefore }
 		| { output: OutlineToolOutput };
 	try {
 		outcome = await withOutlineLiveBarrier(space.id, async () => {
@@ -1093,6 +1102,15 @@ export async function outlineEdit(
 				if (refused.length > 0) return { conflicts: refused };
 			}
 			const base = (blockId: string) => current.get(blockId)?.versionSeq;
+			// What the reader's card says the call changed (`metadata.display`): a task's checkbox
+			// before the call, and how many blocks a delete took with it.
+			const before: WrittenBefore = { status: new Map(), under: new Map() };
+			for (const m of current.values()) {
+				const box = m.taskJson?.status;
+				before.status.set(m.id, isDisplayStatus(box) ? box : null);
+			}
+			for (const b of under.blocks)
+				before.under.set(b.rootId, (before.under.get(b.rootId) ?? 0) + 1);
 
 			// 5. Operations.
 			const ops: OutlineOp[] = [];
@@ -1332,7 +1350,7 @@ export async function outlineEdit(
 					merged.push({ why, row, tags: tags.get(row.id) ?? [] });
 				}
 			}
-			return { written: result, merged };
+			return { written: result, merged, before };
 		});
 	} catch (error) {
 		// The space's live text could not be committed first: try again shortly.
@@ -1342,6 +1360,9 @@ export async function outlineEdit(
 	if ("output" in outcome) return outcome.output;
 	if ("conflicts" in outcome) return await conflictOutput(scope, space, outcome.conflicts, meta);
 	if ("written" in outcome) {
+		const held = outcome.written.pending
+			? await heldSection(scope, space, outcome.written.pending)
+			: null;
 		return successOutput(
 			space,
 			spaceText,
@@ -1353,9 +1374,12 @@ export async function outlineEdit(
 				globalNotes,
 				hints,
 				meta,
-				held: outcome.written.pending
-					? await heldSection(scope, space, outcome.written.pending)
-					: [],
+				held: held?.lines ?? [],
+				display: {
+					space: await scope.spaceDisplay(space),
+					before: outcome.before,
+					...(held?.decider ? { decider: held.decider } : {}),
+				},
 			},
 		);
 	}
@@ -1387,6 +1411,51 @@ export async function outlineEdit(
 		})),
 		meta,
 	);
+}
+
+/** What the written blocks were before the call, for its `metadata.display`. */
+interface WrittenBefore {
+	/** Each located block's checkbox status (null: none). */
+	status: Map<string, OutlineDisplayStatus | null>;
+	/** Live blocks under each deleted block. */
+	under: Map<string, number>;
+}
+
+function isDisplayStatus(value: unknown): value is OutlineDisplayStatus {
+	return value === "todo" || value === "doing" || value === "done" || value === "cancelled";
+}
+
+/** A located block as the reader's card names it. */
+function displayRef(block: OutlineResolvedBlock, title = block.title): OutlineDisplayRef {
+	return {
+		address: block.address,
+		title: clip(title, OUTLINE_TOOL_DISPLAY_LIMITS.titleChars),
+	};
+}
+
+/** The blocks an add created, depth first, as many as the card lists. */
+function displayCreated(
+	items: readonly PlannedItem[],
+	spaceKey: string,
+): { created: OutlineDisplayCreated[]; more: number } {
+	const created: OutlineDisplayCreated[] = [];
+	let more = 0;
+	const visit = (list: readonly PlannedItem[], depth: number) => {
+		for (const p of list) {
+			if (created.length < OUTLINE_TOOL_DISPLAY_LIMITS.created) {
+				const box = p.item.task?.status;
+				created.push({
+					address: `${spaceKey}/${p.sid}`,
+					title: clip(p.item.title, OUTLINE_TOOL_DISPLAY_LIMITS.titleChars),
+					depth,
+					...(isDisplayStatus(box) ? { status: box } : {}),
+				});
+			} else more++;
+			visit(p.children, depth + 1);
+		}
+	};
+	visit(items, 0);
+	return { created, more };
 }
 
 /** A block someone else changed after the agent read it: who, and what kept it from merging. */
@@ -1703,6 +1772,8 @@ function successOutput(
 		meta: Record<string, unknown>;
 		/** What the result says about operations held for confirmation. */
 		held: string[];
+		/** For the reader's card (`metadata.display`), never the model's text. */
+		display: { space: OutlineDisplaySpace; before: WrittenBefore; decider?: string };
 	},
 ): OutlineToolOutput {
 	const mergedMeta =
@@ -1722,6 +1793,8 @@ function successOutput(
 	];
 	const heldOps = new Set(pending?.opIndexes ?? []);
 	const summary: Array<Record<string, unknown>> = [];
+	const ops: OutlineEditDisplayOp[] = [];
+	const before = extra.display.before;
 	for (const edit of edits) {
 		const n = edit.index + 1;
 		const firstLine = lines.length;
@@ -1736,6 +1809,13 @@ function successOutput(
 			const created: string[] = [];
 			walkPlanned(edit.items ?? [], (p) => created.push(`${space.key}/${p.sid}`));
 			summary.push({ op: "add", created });
+			const shown = displayCreated(edit.items ?? [], space.key);
+			ops.push({
+				op: "add",
+				parent: edit.parent?.kind === "block" ? displayRef(edit.parent.block) : null,
+				created: shown.created,
+				...(shown.more > 0 ? { more: shown.more } : {}),
+			});
 		} else if ("replace" in r) {
 			const sid = firstResult?.sid ?? "";
 			lines.push(
@@ -1750,15 +1830,39 @@ function successOutput(
 			const children = (edit.items?.[0]?.children ?? []) as PlannedItem[];
 			if (children.length > 0) itemLines(children, 1, lines, id);
 			summary.push({ op: "replace", address: `${space.key}/${sid}` });
+			if (edit.located?.kind === "block") {
+				// Named by its text as written now (the replace may have changed its title).
+				const now = edit.items?.[0]?.item.title;
+				ops.push({
+					op: "replace",
+					target: displayRef(edit.located.block, now || edit.located.block.title),
+					...(merged.sids.has(sid) ? { merged: true } : {}),
+				});
+			}
 		} else if ("move" in r) {
 			const sid = firstResult?.sid ?? "";
 			const to = where(edit.parent) ?? OUTLINE_TOOL_TEXT.edit.topLevel;
 			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.moved(id(sid), to)}`);
 			summary.push({ op: "move", address: `${space.key}/${sid}` });
+			if (edit.located?.kind === "block") {
+				ops.push({
+					op: "move",
+					target: displayRef(edit.located.block),
+					to: edit.parent?.kind === "block" ? displayRef(edit.parent.block) : null,
+				});
+			}
 		} else if ("delete" in r) {
 			const sid = firstResult?.sid ?? "";
 			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.deleted(id(sid))}`);
 			summary.push({ op: "delete", address: `${space.key}/${sid}` });
+			if (edit.located?.kind === "block") {
+				const under = before.under.get(edit.located.block.id) ?? 0;
+				ops.push({
+					op: "delete",
+					target: displayRef(edit.located.block),
+					...(under > 0 ? { under } : {}),
+				});
+			}
 		} else {
 			const sid = firstResult?.sid ?? "";
 			const parts: string[] = [];
@@ -1775,6 +1879,24 @@ function successOutput(
 				);
 			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.set(id(sid), parts)}`);
 			summary.push({ op: "set", address: `${space.key}/${sid}` });
+			if (edit.located?.kind === "block") {
+				const block = edit.located.block;
+				ops.push({
+					op: "set",
+					target: displayRef(block),
+					...(r.checkbox !== undefined
+						? {
+								status: {
+									from: before.status.get(block.id) ?? null,
+									to:
+										r.checkbox === "none" ? null : (STATUS_OF[r.checkbox] as OutlineDisplayStatus),
+								},
+							}
+						: {}),
+					...(assignee !== undefined ? { assignee: { to: assignee } } : {}),
+					...(edit.alias !== undefined ? { alias: { to: edit.alias } } : {}),
+				});
+			}
 		}
 		if (heldHere > 0) {
 			const said = (lines[firstLine] as string).replace(/^\d+\. /, "");
@@ -1784,6 +1906,8 @@ function successOutput(
 				heldHere === edit.opIndexes.length,
 			);
 			(summary.at(-1) as Record<string, unknown>).pending = true;
+			const op = ops.at(-1);
+			if (op) op.held = true;
 		}
 	}
 	lines.push(...extra.held);
@@ -1793,6 +1917,19 @@ function successOutput(
 		lines.push(OUTLINE_TOOL_TEXT.edit.notesHeader, ...notes.map((n) => `- ${n}`));
 	if (extra.hints.length > 0)
 		lines.push(OUTLINE_TOOL_TEXT.edit.hintsHeader, ...extra.hints.map((h) => `- ${h}`));
+	const display = boundOutlineEditDisplay({
+		v: 1,
+		space: extra.display.space,
+		ops,
+		...(pending
+			? {
+					pending: {
+						label: outlinePendingLabel(pending.id),
+						...(extra.display.decider ? { decider: extra.display.decider } : {}),
+					},
+				}
+			: {}),
+	});
 	return {
 		output: lines.join("\n"),
 		title: `OutlineEdit: ${edits.length} edit${edits.length === 1 ? "" : "s"}`,
@@ -1803,6 +1940,7 @@ function successOutput(
 			notes: notes.length,
 			...mergedMeta,
 			...pendingMeta,
+			...(display ? { display } : {}),
 		},
 	};
 }
@@ -1815,7 +1953,7 @@ async function heldSection(
 	scope: OutlineAgentScope,
 	space: OutlineSpaceRow,
 	pending: OutlinePendingOutcome,
-): Promise<string[]> {
+): Promise<{ lines: string[]; decider?: string }> {
 	const text = OUTLINE_TOOL_TEXT.pending;
 	const id = scope.addressIn(space);
 	const decider = pending.decider;
@@ -1867,5 +2005,10 @@ async function heldSection(
 	});
 	lines.push(waiting.length > 0 ? text.heldWaiting(waiting) : text.heldCarryOn);
 	lines.push(text.heldRead);
-	return lines;
+	// The reader's card names who decides by their name alone (a session it may read by title).
+	const deciderName =
+		decider.by.kind === "human"
+			? names?.users.get(decider.by.id)
+			: (titles.get(decider.by.id) ?? undefined);
+	return { lines, ...(deciderName ? { decider: deciderName } : {}) };
 }

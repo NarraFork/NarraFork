@@ -156,6 +156,7 @@ import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPer
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
 import { ROW_BUTTON_CLASS, ROW_FLEX_CLASS, rowFlexStyle } from "./row-chrome";
 import { ShareFilePreview } from "./ShareFilePreview";
+import { ToolChangeRows } from "./ToolChangeRows";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1320,6 +1321,7 @@ function StatusGlyph({ status, color }: { status: ToolCallStatus; color: string 
 interface StructBadge {
 	label: string;
 	color?: string;
+	verbatim?: boolean;
 }
 
 /** Read the render-only badge list off a fixed badge-header block. */
@@ -1329,7 +1331,11 @@ function readBadges(data: Record<string, unknown> | undefined): StructBadge[] {
 	for (const b of data.badges as unknown[]) {
 		const o = b as { label?: unknown; color?: unknown };
 		if (typeof o?.label === "string") {
-			out.push({ label: o.label, color: typeof o.color === "string" ? o.color : undefined });
+			out.push({
+				label: o.label,
+				color: typeof o.color === "string" ? o.color : undefined,
+				...((o as { verbatim?: unknown }).verbatim === true ? { verbatim: true } : {}),
+			});
 		}
 	}
 	return out;
@@ -1806,6 +1812,9 @@ function DetailBlocks({
 										size="xs"
 										variant="light"
 										color={b.color ?? "gray"}
+										// A case-sensitive id or alias is painted as written (Mantine
+										// upper-cases badge labels by default).
+										tt={b.verbatim ? "none" : undefined}
 									>
 										{b.label}
 									</Badge>
@@ -1971,6 +1980,7 @@ function DetailRegion({
 	viewTargets,
 	viewControls,
 	specTasksLive,
+	onToggleRaw,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -1981,6 +1991,8 @@ function DetailRegion({
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
+	/** The fold under an outline card's change list (raw input, model result). */
+	onToggleRaw?: () => void;
 }) {
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
@@ -2025,6 +2037,7 @@ function DetailRegion({
 								}
 								viewControls={viewControls}
 								specTasksLive={specTasksLive}
+								onToggleRaw={onToggleRaw}
 							/>
 						</div>
 					</Fragment>
@@ -2043,6 +2056,7 @@ export function RenderToolBody({
 	viewTarget,
 	viewControls,
 	specTasksLive,
+	onToggleRaw,
 }: {
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
@@ -2052,6 +2066,8 @@ export function RenderToolBody({
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
+	/** The fold under an outline card's change list (raw input, model result). */
+	onToggleRaw?: () => void;
 }) {
 	const { model, blocks, frame, contentWidth, height, appliedCap } = measured;
 	// The content-view host can update independently of the body. Keep its
@@ -2088,6 +2104,16 @@ export function RenderToolBody({
 				kit={model.kit}
 				appShownAt={model.appShownAt}
 				height={height}
+			/>
+		);
+	if (model.kind === "change-rows")
+		return (
+			<ToolChangeRows
+				blocks={blocks}
+				frames={frame.blocks}
+				availableWidth={contentWidth}
+				height={height}
+				onToggleRaw={onToggleRaw}
 			/>
 		);
 	if (model.kind === "ask")
@@ -2268,6 +2294,11 @@ export interface RenderToolCallProps {
 	narratorId?: string;
 	/** Toggle expand/collapse (header click). */
 	onToggle?: () => void;
+	/**
+	 * The card's own secondary fold, keyed by the card (the interaction state's `promptOpen`):
+	 * an outline card's raw input and model result under its change list.
+	 */
+	onTogglePrompt?: () => void;
 	/**
 	 * Open the full session of the subagent this call waits on (an Await-agent
 	 * card whose target resolved, or a single-target Send). Same affordance as
@@ -2492,6 +2523,7 @@ export function RenderToolCall({
 	viewTargets,
 	viewControls,
 	specTasksLive,
+	onTogglePrompt,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2607,6 +2639,7 @@ export function RenderToolCall({
 							viewTargets={viewTargets}
 							viewControls={viewControls}
 							specTasksLive={specTasksLive}
+							onToggleRaw={onTogglePrompt}
 						/>
 					</div>
 				</Box>

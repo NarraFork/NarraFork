@@ -10,7 +10,9 @@
  *   - `turnEnd`   — `outline_task_turn_end`: a long turn ended with a task still in progress;
  *   - `edited`    — `outline_task_edit`: people changed tasks of the session;
  *   - `interrupt` — `interrupt_task_guard`: the open tasks after a user interrupt (outline and spec);
- *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`).
+ *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`);
+ *   - `answers`   — `outline_answer`: a person answered questions the session asked (outline P2
+ *                   PR 7), the questions as rows with the answers beside them.
  *
  * Everything here is derived from STRUCTURED data the server stored beside the model-facing text
  * (`SideCarBody` `outlineTasks` / `tasks`, a `context_update` row's `display`); nothing parses the
@@ -28,6 +30,7 @@ import { outlineAddressPath } from "../outline-links";
 import {
 	coerceOutlineTasksViewDisplay,
 	OUTLINE_TASKS_VIEW_KEY,
+	type OutlineAnswerNoticeItem,
 	type OutlineTaskNoticeChange,
 	type OutlineTaskNoticeItem,
 	type OutlineTasksViewDisplay,
@@ -35,7 +38,7 @@ import {
 } from "../outline-task-notice";
 import type { SideCarBody, SideCarTaskEntry } from "../sidecar-body";
 
-export type TaskNoticeVariant = "turnEnd" | "edited" | "interrupt" | "view";
+export type TaskNoticeVariant = "turnEnd" | "edited" | "interrupt" | "view" | "answers";
 
 /** A status chip: its words and its Mantine colour. */
 export interface TaskNoticeChip {
@@ -126,6 +129,13 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeCountWaiting: "{n} waiting",
 	taskNoticeCountTodo: "{n} to do",
 	taskNoticeCountSep: " · ",
+	taskNoticeAnswersTitle: "{who} answered {n} question(s)",
+	taskNoticeAnswersSomeone: "Someone",
+	taskNoticeAnswerOption: "option {n}: {option}",
+	taskNoticeAnswerOptionBare: "option {n}",
+	taskNoticeAnswerText: "\u201c{text}\u201d",
+	taskNoticeAnswerAdopted: "your recommendation",
+	taskNoticeAnswerDiffers: "differs from what you went ahead with",
 };
 
 type Labels = Readonly<Record<string, string>> | undefined;
@@ -330,6 +340,27 @@ export function taskNoticeFromBody(
 			rows,
 		);
 	}
+	if (body.kind === "outlineAnswers") {
+		if (body.items.length === 0) return null;
+		const rows = body.items.map((item) => answerRow(item, labels));
+		if (body.more) rows.push(moreRow(body.more, labels));
+		const n = body.items.length + (body.more ?? 0);
+		const first = rows[0] as TaskNoticeRow;
+		return notice(
+			"answers",
+			label(labels, "taskNoticeAnswersTitle", {
+				who: body.by || label(labels, "taskNoticeAnswersSomeone"),
+				n,
+			}),
+			{
+				// The folded line names the first question; its answer is the tail (the rows, unfolded,
+				// carry each answer as their note).
+				row: { ...first, note: undefined },
+				...(first.note ? { tail: first.note } : {}),
+			},
+			rows,
+		);
+	}
 	if (body.kind === "tasks" && source === "interrupt_task_guard") {
 		const tasks = body.tasks ?? [];
 		if (tasks.length === 0) return null;
@@ -358,6 +389,32 @@ export function taskNoticeFromBody(
 		);
 	}
 	return null;
+}
+
+/** The answer in the reader's words: the option chosen and/or their words, after an arrow. */
+function answerNote(item: OutlineAnswerNoticeItem, labels: Labels): string {
+	const a = item.answer;
+	const parts: string[] = [];
+	if (a.option !== undefined) {
+		parts.push(
+			a.optionText
+				? label(labels, "taskNoticeAnswerOption", { n: a.option, option: a.optionText })
+				: label(labels, "taskNoticeAnswerOptionBare", { n: a.option }),
+		);
+	}
+	if (a.text) parts.push(label(labels, "taskNoticeAnswerText", { text: a.text }));
+	if (a.adopted) parts.push(label(labels, "taskNoticeAnswerAdopted"));
+	return `→ ${parts.join(label(labels, "taskNoticeJoin"))}`;
+}
+
+function answerRow(item: OutlineAnswerNoticeItem, labels: Labels): TaskNoticeRow {
+	return {
+		...named(item.address, item.question),
+		// The question's alias, as written (case-sensitive): the chip before its title.
+		...(item.alias ? { status: { label: item.alias, color: "teal" } } : {}),
+		...(item.differs ? { marks: [label(labels, "taskNoticeAnswerDiffers")] } : {}),
+		note: answerNote(item, labels),
+	};
 }
 
 function interruptRow(task: SideCarTaskEntry, outline: boolean, labels: Labels): TaskNoticeRow {

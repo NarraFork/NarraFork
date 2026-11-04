@@ -787,6 +787,11 @@ export async function outlineRead(
 			hiddenByView: result.hiddenByView,
 			truncated: result.truncated,
 			...(result.current ? {} : { asOf: result.seq }),
+			// For the reader's card, never the model's text: the block by its title, where it sits,
+			// and the space by its name.
+			title: clip(blockTitle(block.title), 80),
+			path: path.slice(-6),
+			display: { v: 1, space: await scope.spaceDisplay(space) },
 		},
 	};
 }

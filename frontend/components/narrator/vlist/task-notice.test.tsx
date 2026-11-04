@@ -398,6 +398,69 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 	});
 });
 
+describe("answers to the session's questions (outline_answer)", () => {
+	/** As the asking session gets it: a user row (the person's turn) carrying the injection. */
+	function answerRow(body?: unknown) {
+		return {
+			kind: "message",
+			msg: rowWithElements(
+				{ id: "m-answer", role: "user", origin: "user", createdAt: "2026-11-03T09:13:00.000Z" },
+				[
+					{
+						type: "system_injection",
+						source: "outline_answer",
+						modelText: `alice answered your questions in the outline:\n- Q3 [${K}/Zx81aaQe] 重试按钮放在哪里？ → option 2 (右上角), your recommendation`,
+						...(body ? { body } : {}),
+					},
+				] as never,
+			),
+		} as AdapterSegment;
+	}
+	const BODY = {
+		kind: "outlineAnswers",
+		by: "alice",
+		items: [
+			{
+				address: `${K}/Zx81aaQe`,
+				alias: "Q3",
+				question: "重试按钮放在哪里？",
+				answer: { option: 2, optionText: "消息气泡右上角", adopted: true },
+			},
+			{
+				address: `${K}/Zx81aaQf`,
+				question: "要不要同时修 Codex 通道？",
+				answer: { text: "先只修 Anthropic" },
+				differs: true,
+			},
+		],
+	};
+
+	it("one line: who answered how many, the first question linked, its answer after it", () => {
+		const spec = specOf(answerRow(BODY));
+		const data = spec.data as TaskNoticeData;
+		expect(data).toMatchObject({ kind: "tasks_notice", variant: "answers", expandable: true });
+		expect(data.title).toBe("alice 回答了 2 个提问");
+		expect(data.summary.row).toMatchObject({
+			title: "重试按钮放在哪里？",
+			href: href("Zx81aaQe"),
+			// The question's alias, as written.
+			status: { label: "Q3", color: "teal" },
+		});
+		expect(data.summary.tail).toBe("→ 选 2. 消息气泡右上角；采纳了你的建议");
+		expect(data.rows[1]).toMatchObject({
+			title: "要不要同时修 Codex 通道？",
+			href: href("Zx81aaQf"),
+			marks: ["与你先做的不同"],
+			note: "→ “先只修 Anthropic”",
+		});
+	});
+
+	it("a delivery written before the body keeps its card, under its own heading", () => {
+		const spec = specOf(answerRow());
+		expect(spec.data).toMatchObject({ kind: "origin_notice", title: "提问的回答" });
+	});
+});
+
 describe("rows written before the structured data keep their card, read as plain text", () => {
 	it("a prose turn-end note: the text once, no heading marks, escapes or code ticks", () => {
 		const data = specOf(
