@@ -35,6 +35,7 @@
 import {
 	getTypographyRevision,
 	letterSpacingPxFor,
+	onTypographyChange,
 	scaleBlockSpacing,
 	scaleFontSize,
 	scaleLineHeightRatio,
@@ -222,6 +223,11 @@ export interface TypographyMetrics {
 
 let metricsCache: TypographyMetrics | null = null;
 let metricsCacheRevision = -1;
+// Keyed on the generation, which only moves forward in the app; `resetTypographyForTest`
+// rewinds it, so a snapshot from a rewound generation must not survive the reset.
+onTypographyChange(() => {
+	metricsCache = null;
+});
 
 /** Heading geometry (size + line box + font string) at the current typography. */
 export interface HeadingMetrics {

@@ -1306,6 +1306,7 @@ export const userPreferences = pgTable("user_preferences", {
 	narratorLineHeightScalePercent: integer("narrator_line_height_scale_percent")
 		.notNull()
 		.default(100),
+	narratorLineHeightV2Percent: integer("narrator_line_height_v2_percent"),
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
 	addSubagentToRecentTabs: boolean("add_subagent_to_recent_tabs").notNull().default(true),
@@ -4231,7 +4232,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 136,
-  "columnCount": 1808,
+  "columnCount": 1809,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11519,6 +11520,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "100",
           "defaultExpression": "100"
+        },
+        {
+          "property": "narratorLineHeightV2Percent",
+          "name": "narrator_line_height_v2_percent",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "narratorParagraphScalePercent",

@@ -2270,18 +2270,34 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * family of roles (body, xs, headings, code) from one factor. Storing an absolute
 	 * size would fix only one role and leave the rest to drift.
 	 *
-	 * Defaults are the neutral setting: 100 / 0 / 100 measures byte-identically to a
-	 * build without this feature, so existing rows and fresh installs are unaffected.
+	 * Font, spacing and block defaults are the neutral setting (100 / 0 / 100). Line
+	 * height moved to a new scale whose 100% is the old 120% (see the two columns below).
 	 * Ranges are enforced in `TYPOGRAPHY_RANGE` and clamped on read as well as write —
 	 * a value outside them makes scaled text collide with unscalable card chrome.
 	 */
 	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
 	/** Letter spacing as a percentage OF the font size (an em fraction ×100). */
 	narratorLetterSpacingPercent: integer("narrator_letter_spacing_percent").notNull().default(0),
-	/** Intra-paragraph line-height (leading) multiplier; distinct from block spacing. */
+	/**
+	 * Intra-paragraph line-height (leading) multiplier on the OLD scale: 100 = the bare
+	 * Mantine ratios (body 1.45). Superseded by `narratorLineHeightV2Percent`; kept, and
+	 * still written (mirrored), so a build from before the rescale reads the same
+	 * effective line height after a downgrade.
+	 */
 	narratorLineHeightScalePercent: integer("narrator_line_height_scale_percent")
 		.notNull()
 		.default(100),
+	/**
+	 * Line-height multiplier on the CURRENT scale: 100 = the Mantine ratios × 1.2
+	 * (`LINE_HEIGHT_BASELINE_PERCENT` — the old 120% became the new 100%).
+	 *
+	 * NULL until the reader saves a line height on this scale; the value is then derived
+	 * from the old column on read (`lineHeightPercentFromLegacy`: old default → new default,
+	 * any other old value keeps its effective height). Deriving on read instead of
+	 * rewriting the old column in place is what makes the rescale happen exactly once:
+	 * the old column is never modified by it, so there is nothing to rescale twice.
+	 */
+	narratorLineHeightV2Percent: integer("narrator_line_height_v2_percent"),
 	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),

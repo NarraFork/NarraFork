@@ -11,6 +11,29 @@ beforeAll(() => {
 // each char = 0.6 × fontSize, so ~8 chars @ 14px ≈ 67px ≪ any test width).
 const SHORT = "OK";
 
+/**
+ * The constants with every line box the measurement reads LIVE replaced by its live
+ * value. The exported ones are the bare-Mantine baseline; the default setting now
+ * measures text lines at 120% of it (`LINE_HEIGHT_BASELINE_PERCENT`). Fixed chrome
+ * rows that the measure layer takes straight from a constant (countdown, read-only
+ * note, target header) keep their constant.
+ */
+async function livePermissionConstants() {
+	const m = await import("./measure-permission");
+	const { typographyMetrics } = await import("../pretext-fonts");
+	const line = typographyMetrics().line;
+	return {
+		...m.MEASURE_PERMISSION_CONSTANTS,
+		SM_LINE_HEIGHT: line.body,
+		HEADER_LINE_HEIGHT: line.body,
+		OPTION_LABEL_LINE_HEIGHT: line.body,
+		XS_LINE_HEIGHT: line.xs,
+		CUSTOM_ANSWER_LINE_HEIGHT: line.xs,
+		TEXTAREA_ROW_HEIGHT: line.xsBase,
+		OPTION_DESC_LINE_HEIGHT: m.optionDescLineHeight(),
+	};
+}
+
 function q(header: string, options: Array<{ header: string; description?: string }> = []) {
 	return { header, options };
 }
@@ -21,10 +44,8 @@ function q(header: string, options: Array<{ header: string; description?: string
 
 describe("measureAskUserQuestion — chrome + linear growth", () => {
 	it("a single question with no options = Alert chrome + header + textarea + buttons", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const r = measureAskUserQuestion({ questions: [q(SHORT)] }, 600);
 		// chrome + header(20) + gap(10)+textarea(30) + gap(16)+buttons(30)
 		const expected =
@@ -50,10 +71,8 @@ describe("measureAskUserQuestion — chrome + linear growth", () => {
 	});
 
 	it("height grows with the number of options (each adds one label line + gap)", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const zero = measureAskUserQuestion({ questions: [q(SHORT)] }, 600);
 		const oneOpt = measureAskUserQuestion({ questions: [q(SHORT, [{ header: SHORT }])] }, 600);
 		const twoOpt = measureAskUserQuestion(
@@ -68,10 +87,8 @@ describe("measureAskUserQuestion — chrome + linear growth", () => {
 	});
 
 	it("an option description adds exactly its line + the description margin", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const noDesc = measureAskUserQuestion({ questions: [q(SHORT, [{ header: SHORT }])] }, 600);
 		const withDesc = measureAskUserQuestion(
 			{ questions: [q(SHORT, [{ header: SHORT, description: SHORT }])] },
@@ -109,10 +126,8 @@ describe("measureAskUserQuestion — wrapping (pretext, zero DOM)", () => {
 	});
 
 	it("a long option label wraps and grows the height in label-line multiples", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const longLabel = "word ".repeat(30).trim();
 		const wide = measureAskUserQuestion({ questions: [q(SHORT, [{ header: longLabel }])] }, 2000);
 		const narrow = measureAskUserQuestion({ questions: [q(SHORT, [{ header: longLabel }])] }, 200);
@@ -123,10 +138,8 @@ describe("measureAskUserQuestion — wrapping (pretext, zero DOM)", () => {
 	});
 
 	it("option label wrap width accounts for the control indent", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		expect(c.OPTION_INDENT).toBe(c.OPTION_CONTROL_SIZE + c.OPTION_LABEL_OFFSET);
 		// The option-label block carries the indent as its contentLeft.
 		const r = measureAskUserQuestion({ questions: [q(SHORT, [{ header: SHORT }])] }, 600);
@@ -137,10 +150,8 @@ describe("measureAskUserQuestion — wrapping (pretext, zero DOM)", () => {
 
 describe("measureAskUserQuestion — Textarea autosize rows", () => {
 	it("the custom-input textarea grows with its autosize row count (clamped 1..3)", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const oneRow = measureAskUserQuestion(
 			{ questions: [{ ...q(SHORT), customInputRows: 1 }] },
 			600,
@@ -187,10 +198,8 @@ describe("measureAskUserQuestion — read-only mode", () => {
 	});
 
 	it("shows the saved custom answer + an answered badge when present", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const bare = measureAskUserQuestion({ questions: [q(SHORT)], readOnly: true }, 600);
 		const answered = measureAskUserQuestion(
 			{
@@ -211,10 +220,8 @@ describe("measureAskUserQuestion — read-only mode", () => {
 
 describe("measureAskUserQuestion — countdown + full-width + reusable measurer", () => {
 	it("adds the countdown row only when armed and interactive", async () => {
-		const { measureAskUserQuestion, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureAskUserQuestion } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const noCd = measureAskUserQuestion({ questions: [q(SHORT)] }, 600);
 		const cd = measureAskUserQuestion({ questions: [q(SHORT)], hasCountdown: true }, 600);
 		expect(cd.metas.map((m) => m.role)).toContain("countdown");
@@ -244,10 +251,8 @@ describe("measureAskUserQuestion — countdown + full-width + reusable measurer"
 
 describe("measureInlinePermission — minimal + button bar", () => {
 	it("minimal interactive form = feedback textarea + button bar (no top margin baked in)", async () => {
-		const { measureInlinePermission, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const r = measureInlinePermission({}, 600);
 		expect(r.metas.map((m) => m.role)).toEqual(["feedback-textarea", "button-bar"]);
 		// feedback(30) + mb(10) + button bar(36).
@@ -262,10 +267,8 @@ describe("measureInlinePermission — minimal + button bar", () => {
 	});
 
 	it("the button bar grows with wrapped button rows", async () => {
-		const { measureInlinePermission, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const oneRow = measureInlinePermission({ buttonCount: 2, buttonRows: 1 }, 600);
 		const twoRows = measureInlinePermission({ buttonCount: 4, buttonRows: 2 }, 600);
 		expect(twoRows.height - oneRow.height).toBe(c.PERM_BUTTON_ROW_HEIGHT + c.PERM_BUTTON_GROUP_GAP);
@@ -274,9 +277,8 @@ describe("measureInlinePermission — minimal + button bar", () => {
 
 describe("measureInlinePermission — execution target", () => {
 	it("adds the execution-target Paper with a cwd line by default", async () => {
-		const { measureInlinePermission, MEASURE_PERMISSION_CONSTANTS, executionTargetHeight } =
-			await import("./measure-permission");
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureInlinePermission, executionTargetHeight } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const none = measureInlinePermission({}, 600);
 		const withTarget = measureInlinePermission({ hasExecutionTarget: true }, 600);
 		expect(withTarget.metas.map((m) => m.role)).toContain("exec-target");
@@ -287,10 +289,8 @@ describe("measureInlinePermission — execution target", () => {
 	});
 
 	it("execution-target height grows with cwd + path lines and drops the header margin when bare", async () => {
-		const { executionTargetHeight, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { executionTargetHeight } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		// No detail lines → no header bottom margin.
 		expect(executionTargetHeight(0, 0)).toBe(
 			c.TARGET_PADDING * 2 + c.TARGET_BORDER * 2 + c.TARGET_HEADER_ROW,
@@ -326,9 +326,8 @@ describe("measureInlinePermission — execution target", () => {
 
 describe("measureInlinePermission — ExitPlanMode editing", () => {
 	it("adds the plan-edit textarea (clamped 8..30 rows) while editing", async () => {
-		const { measureInlinePermission, MEASURE_PERMISSION_CONSTANTS, planTextareaHeight } =
-			await import("./measure-permission");
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureInlinePermission, planTextareaHeight } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const editing8 = measureInlinePermission(
 			{ isExitPlanMode: true, isEditingPlan: true, planEditRows: 8 },
 			600,
@@ -368,10 +367,8 @@ describe("measureInlinePermission — ExitPlanMode editing", () => {
 
 describe("measureInlinePermission — feedback rows, decision reason, read-only", () => {
 	it("the feedback textarea grows with its autosize row count (clamped 1..3)", async () => {
-		const { measureInlinePermission, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const one = measureInlinePermission({ feedbackRows: 1 }, 600);
 		const three = measureInlinePermission({ feedbackRows: 3 }, 600);
 		expect(three.height - one.height).toBe(2 * c.TEXTAREA_ROW_HEIGHT);
@@ -380,10 +377,8 @@ describe("measureInlinePermission — feedback rows, decision reason, read-only"
 	});
 
 	it("adds decision-reason lines above the feedback textarea", async () => {
-		const { measureInlinePermission, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const none = measureInlinePermission({}, 600);
 		const twoLines = measureInlinePermission(
 			{ hasDecisionReason: true, decisionReasonLines: 2 },
@@ -397,10 +392,8 @@ describe("measureInlinePermission — feedback rows, decision reason, read-only"
 	});
 
 	it("read-only mode replaces the button bar with a single unavailable line", async () => {
-		const { measureInlinePermission, MEASURE_PERMISSION_CONSTANTS } = await import(
-			"./measure-permission"
-		);
-		const c = MEASURE_PERMISSION_CONSTANTS;
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
 		const ro = measureInlinePermission({ readOnly: true }, 600);
 		const roles = ro.metas.map((m) => m.role);
 		expect(roles).toContain("readonly-note");
@@ -435,13 +428,21 @@ describe("measure-permission constants", () => {
 	it("match the Mantine ground-truth line boxes", async () => {
 		const { MEASURE_PERMISSION_CONSTANTS } = await import("./measure-permission");
 		const c = MEASURE_PERMISSION_CONSTANTS;
-		expect(c.SM_LINE_HEIGHT).toBe(20); // round(14 × 1.45)
-		expect(c.XS_LINE_HEIGHT).toBe(17); // round(12 × 1.4)
-		expect(c.OPTION_DESC_LINE_HEIGHT).toBe(14); // round(12 × 1.2)
+		expect(c.SM_LINE_HEIGHT_BASELINE).toBe(20); // round(14 × 1.45)
+		expect(c.XS_LINE_HEIGHT_BASELINE).toBe(17); // round(12 × 1.4)
+		expect(c.OPTION_DESC_LINE_HEIGHT_BASELINE).toBe(14); // round(12 × 1.2)
 		expect(c.TEXTAREA_ROW_HEIGHT).toBe(19); // round(12 × 1.55)
 		expect(c.ALERT_VERTICAL_CHROME).toBe(34); // 16×2 + 1×2
 		expect(c.ASK_BUTTON_ROW_HEIGHT).toBe(30); // Button xs
 		expect(c.PERM_BUTTON_ROW_HEIGHT).toBe(36); // Button sm
 		expect(c.OPTION_INDENT).toBe(32); // control 20 + offset 12
+	});
+
+	it("measure text lines at 120% of those boxes at the default setting", async () => {
+		const live = await livePermissionConstants();
+		expect(live.SM_LINE_HEIGHT).toBe(24); // round(14 × 1.45 × 1.2)
+		expect(live.XS_LINE_HEIGHT).toBe(20); // round(12 × 1.4 × 1.2)
+		expect(live.OPTION_DESC_LINE_HEIGHT).toBe(17); // round(12 × 1.2 × 1.2)
+		expect(live.TEXTAREA_ROW_HEIGHT).toBe(22); // round(12 × 1.55 × 1.2)
 	});
 });

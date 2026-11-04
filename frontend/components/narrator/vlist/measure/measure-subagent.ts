@@ -101,7 +101,7 @@ import { pretextLineMetrics } from "./pretext-metrics";
 /** Header / recent-calls / expanded-body Box padding (Box p/px/pb="xs"). */
 export const CARD_PADDING = SPACING.xs; // 10
 /** xs single-line box: round(12 × 1.4) = 17 (CONTRACT §3 ground truth). */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 
 /** Header ThemeIcon size={16}. */
 export const THEME_ICON_SIZE = 16;
@@ -118,7 +118,7 @@ export const STATUS_ICON_SIZE = 12;
 export const BADGE_ROW_HEIGHT = Math.max(
 	THEME_ICON_SIZE,
 	BADGE_XS_HEIGHT,
-	XS_LINE_HEIGHT,
+	XS_LINE_HEIGHT_BASELINE,
 	CHEVRON_SIZE,
 	STATUS_ICON_SIZE,
 ); // 17
@@ -257,7 +257,7 @@ export const SELF_PERMISSION_MARGIN_BOTTOM = SPACING.xs; // 10
 
 // prompt — toggle row + optional ContentViewer (maxHeight:200).
 /** Prompt toggle row = max(chevron12, xs line17) = 17. */
-export const PROMPT_TOGGLE_ROW_HEIGHT = Math.max(CHEVRON_SIZE, XS_LINE_HEIGHT); // 17
+export const PROMPT_TOGGLE_ROW_HEIGHT = Math.max(CHEVRON_SIZE, XS_LINE_HEIGHT_BASELINE); // 17
 /** Box mt={4} between the toggle row and the prompt ContentViewer. */
 export const PROMPT_BODY_MARGIN_TOP = 4;
 /** ContentViewer maxHeight cap for the prompt (🟡). */
@@ -267,7 +267,7 @@ export const PROMPT_FONT_SIZE = 11;
 /** Prompt ContentViewer is a <Code block style={{fontSize:11}}> (monospace). */
 export const PROMPT_FONT = `${FONT_WEIGHT.regular} ${PROMPT_FONT_SIZE}px ${MONO_FAMILY}`;
 /** Prompt line box: round(11 × 1.55) = 17 (Code block base line-height). */
-export const PROMPT_LINE_HEIGHT = lineBoxHeight(PROMPT_FONT_SIZE, LINE_HEIGHT.md);
+export const PROMPT_LINE_HEIGHT_BASELINE = lineBoxHeight(PROMPT_FONT_SIZE, LINE_HEIGHT.md);
 /** promptLineHeight() at the reader's typography (baseline above). */
 export function promptLineHeight(): number {
 	return scaledLineBoxHeight(11, LINE_HEIGHT.md);
@@ -289,7 +289,7 @@ export function promptFontSize(): number {
 
 // pendingPermissions — title + ToolCallCard × N (P10, placeholder).
 /** Title Text xs. */
-export const PENDING_TITLE_ROW_HEIGHT = XS_LINE_HEIGHT; // 17
+export const PENDING_TITLE_ROW_HEIGHT = XS_LINE_HEIGHT_BASELINE; // 17
 /** Title mb={4}. */
 export const PENDING_TITLE_MARGIN_BOTTOM = 4;
 /** Wrapper Box border (1px each side) around each pending ToolCallCard. */

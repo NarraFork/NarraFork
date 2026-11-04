@@ -1671,8 +1671,15 @@
     {
       "idx": 238,
       "version": "6",
-      "when": 1793795131665,
-      "tag": "0238_recent_tab_folders",
+      "when": 1793793846791,
+      "tag": "0238_narrator_line_height_v2",
+      "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "6",
+      "when": 1793797128464,
+      "tag": "0239_recent_tab_folders",
       "breakpoints": true
     }
   ]

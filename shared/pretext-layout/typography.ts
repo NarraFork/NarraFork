@@ -59,7 +59,10 @@ export interface TypographySettings {
 	letterSpacingPercent: number;
 	/**
 	 * Line-height multiplier in percent: the spacing BETWEEN lines inside one
-	 * paragraph. 100 = the Mantine line-height ratios (body 1.45, xs 1.4, base 1.55).
+	 * paragraph. 100 = the Mantine line-height ratios (body 1.45, xs 1.4, base 1.55)
+	 * times {@link LINE_HEIGHT_BASELINE_PERCENT} — so the default body line is
+	 * 1.45 × 1.2 = 1.74, not 1.45. See that constant for why, and for the stored
+	 * preference this value is read from.
 	 *
 	 * Distinct from `paragraphScalePercent`, which spaces whole blocks APART. This one
 	 * is intra-paragraph leading, so a reader can loosen dense wrapped prose without
@@ -100,14 +103,119 @@ export const TYPOGRAPHY_RANGE = {
 	letterSpacingPercent: { min: -5, max: 25, fallback: 0 },
 	// Floored well above zero: the line box must still contain the glyphs it wraps, and
 	// a ratio under ~1 clips ascenders/descenders rather than merely tightening.
-	lineHeightScalePercent: { min: 75, max: 220, fallback: 100 },
+	//
+	// On the 120%-baseline scale (LINE_HEIGHT_BASELINE_PERCENT): 60 ≈ the old floor of
+	// 75 (60 × 1.2 = 72) and 185 ≈ the old ceiling of 220 (185 × 1.2 = 222), so every
+	// value saved on the old scale still has a place on this one (see
+	// lineHeightPercentFromLegacy).
+	lineHeightScalePercent: { min: 60, max: 185, fallback: 100 },
 	paragraphScalePercent: { min: 50, max: 250, fallback: 100 },
 } as const satisfies Record<
 	keyof TypographySettings,
 	{ min: number; max: number; fallback: number }
 >;
 
-/** The neutral setting: every constant in `pretext-fonts.ts` at face value. */
+/**
+ * What the line-height slider's 100% stands for, in percent of the Mantine ratios.
+ *
+ * Owner decision (outline typography, 2026-11): 「将原来的120%作为新的100%」. The Mantine
+ * ratios (body 1.45) read cramped for mixed Chinese/English prose, so what used to be
+ * 120% on the slider is the new 100%: the default body line is 1.45 × 1.2 = 1.74
+ * (14px text on a 24px line instead of 20px). Every line box the slider scales —
+ * body, xs, code, headings — moves together, so the new default is byte-for-byte what
+ * the old 120% setting measured and painted.
+ *
+ * Kept as an integer percent (not 1.2) so that `scaleLineHeightRatio` at the default
+ * computes `ratio * 120 / 100`, exactly the arithmetic the old 120% setting did.
+ *
+ * Changing this constant changes the meaning of every stored line-height preference.
+ * The server keeps the old-scale column next to the new one and converts between them
+ * with {@link lineHeightPercentFromLegacy} / {@link legacyLineHeightPercentFrom}.
+ */
+export const LINE_HEIGHT_BASELINE_PERCENT = 120;
+
+/**
+ * The line-height range of the OLD scale (100 = the bare Mantine ratios), still what a
+ * client built before the rescale sends as `narratorLineHeightScalePercent`.
+ */
+export const LEGACY_LINE_HEIGHT_RANGE = { min: 75, max: 220, fallback: 100 } as const;
+
+/**
+ * A line-height preference saved on the OLD scale, on the new one.
+ *
+ * - 100 (the old default, and what "reset" wrote) means "the default": it maps to the
+ *   new default 100, so readers who never chose a value get the taller default. An
+ *   explicit 100 cannot be told apart from the default in what was stored, and the
+ *   default is what it meant when it was saved.
+ * - Anything else keeps its EFFECTIVE line height: old 120% (1.45 × 1.2) is new 100%,
+ *   old 150% is new 125%, old 75% is new 63%. Rounded to whole percent like every
+ *   stored value (a fraction of a pixel at most).
+ *
+ * Pure and idempotent by construction: it reads the old column and never writes it,
+ * so no value can be rescaled twice (the server stores the result in its own column).
+ */
+export function lineHeightPercentFromLegacy(legacyPercent: number | null | undefined): number {
+	if (legacyPercent == null || !Number.isFinite(legacyPercent)) {
+		return TYPOGRAPHY_RANGE.lineHeightScalePercent.fallback;
+	}
+	const legacy = Math.min(
+		LEGACY_LINE_HEIGHT_RANGE.max,
+		Math.max(LEGACY_LINE_HEIGHT_RANGE.min, Math.round(legacyPercent)),
+	);
+	if (legacy === LEGACY_LINE_HEIGHT_RANGE.fallback) {
+		return TYPOGRAPHY_RANGE.lineHeightScalePercent.fallback;
+	}
+	return clampTypographyValue(
+		"lineHeightScalePercent",
+		(legacy * 100) / LINE_HEIGHT_BASELINE_PERCENT,
+	);
+}
+
+/**
+ * A new-scale line-height value on the OLD scale (clamped to the old range).
+ *
+ * Written next to the new value so that a build from before the rescale (a downgrade,
+ * or a tab still running the previous bundle) shows the same effective line height.
+ *
+ * Not an exact inverse of {@link lineHeightPercentFromLegacy}: 60–62 and 184–185 fall outside
+ * the old range and are clamped (they read back as 63 and 183), and 83 mirrors to 100, which
+ * reads back as the default 100. That only matters if a build from before the rescale echoes
+ * the old field back unchanged — its panels send only the knob that moved.
+ */
+export function legacyLineHeightPercentFrom(percent: number): number {
+	const value = clampTypographyValue("lineHeightScalePercent", percent);
+	return Math.min(
+		LEGACY_LINE_HEIGHT_RANGE.max,
+		Math.max(
+			LEGACY_LINE_HEIGHT_RANGE.min,
+			Math.round((value * LINE_HEIGHT_BASELINE_PERCENT) / 100),
+		),
+	);
+}
+
+/**
+ * The current-scale line height of a stored preference row (both columns). Read-only.
+ *
+ * - `v2` NULL: never saved on the current scale (a row from before the rescale) — derived from
+ *   the old column.
+ * - Otherwise the columns are a pair the current build wrote together: the old one is the new
+ *   one's mirror ({@link legacyLineHeightPercentFrom}), or the new one is the old one's
+ *   conversion ({@link lineHeightPercentFromLegacy}). When they are neither, the old column was
+ *   written AFTER, by a build that does not know the new one (a downgrade, then a change or a
+ *   reset there): that is the newer choice, so it is derived again.
+ */
+export function lineHeightPercentFromStored(v2: number | null | undefined, legacy: number): number {
+	if (v2 == null) return lineHeightPercentFromLegacy(legacy);
+	if (legacy === legacyLineHeightPercentFrom(v2) || v2 === lineHeightPercentFromLegacy(legacy)) {
+		return v2;
+	}
+	return lineHeightPercentFromLegacy(legacy);
+}
+
+/**
+ * The default setting: every size constant in `pretext-fonts.ts` at face value, every
+ * line-height ratio times {@link LINE_HEIGHT_BASELINE_PERCENT}.
+ */
 export const DEFAULT_TYPOGRAPHY: TypographySettings = {
 	fontScalePercent: TYPOGRAPHY_RANGE.fontScalePercent.fallback,
 	letterSpacingPercent: TYPOGRAPHY_RANGE.letterSpacingPercent.fallback,
@@ -285,7 +393,16 @@ export function letterSpacingForFont(font: string): number {
  * combine, exactly as CSS does it.
  */
 export function scaleLineHeightRatio(baseRatio: number): number {
-	return (baseRatio * current.lineHeightScalePercent) / 100;
+	return (baseRatio * effectiveLineHeightPercent()) / 100;
+}
+
+/**
+ * The slider value as a percent of the bare Mantine ratios: the slider times
+ * {@link LINE_HEIGHT_BASELINE_PERCENT}. 120 at the default. Integer arithmetic first,
+ * so the default is exactly 120 rather than 100 × 1.2 in floating point.
+ */
+export function effectiveLineHeightPercent(): number {
+	return (current.lineHeightScalePercent * LINE_HEIGHT_BASELINE_PERCENT) / 100;
 }
 
 /**

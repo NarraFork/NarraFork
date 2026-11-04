@@ -1,6 +1,6 @@
 {
-  "id": "660668bf-e2b2-4e82-ab17-a5c5a2ab9beb",
-  "prevId": "af2ae099-396f-4399-8676-928a7d7d4a6b",
+  "id": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
+  "prevId": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -23800,6 +23800,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": 100
+        },
+        "narrator_line_height_v2_percent": {
+          "name": "narrator_line_height_v2_percent",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
         },
         "narrator_paragraph_scale_percent": {
           "name": "narrator_paragraph_scale_percent",

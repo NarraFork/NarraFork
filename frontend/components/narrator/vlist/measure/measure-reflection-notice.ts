@@ -91,7 +91,7 @@ export const NOTICE_ICON_GAP = SPACING.sm; // 12
 export const NOTICE_TEXT_INDENT = NOTICE_ICON_SIZE + NOTICE_ICON_GAP; // 34
 
 /** Title: Text size="xs" fw={700} lh={1.35} → round(12 × 1.35) = 16. */
-export const NOTICE_TITLE_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.35);
+export const NOTICE_TITLE_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, 1.35);
 /** noticeTitleLineHeight() at the reader's typography (baseline above). */
 export function noticeTitleLineHeight(): number {
 	return scaledLineBoxHeight(FONT_SIZE.xs, 1.35);
@@ -99,7 +99,7 @@ export function noticeTitleLineHeight(): number {
 export const NOTICE_TITLE_FONT = `${FONT_WEIGHT.bold} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 
 /** Summary / nextSteps: Text size="xs" lh={1.45} → round(12 × 1.45) = 17. */
-export const NOTICE_BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.45);
+export const NOTICE_BODY_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, 1.45);
 /** noticeBodyLineHeight() at the reader's typography (baseline above). */
 export function noticeBodyLineHeight(): number {
 	return scaledLineBoxHeight(FONT_SIZE.xs, 1.45);
@@ -293,8 +293,8 @@ export const MEASURE_REFLECTION_CONSTANTS = {
 	NOTICE_ICON_SIZE,
 	NOTICE_ICON_GAP,
 	NOTICE_TEXT_INDENT,
-	NOTICE_TITLE_LINE_HEIGHT,
-	NOTICE_BODY_LINE_HEIGHT,
+	NOTICE_TITLE_LINE_HEIGHT_BASELINE,
+	NOTICE_BODY_LINE_HEIGHT_BASELINE,
 	NOTICE_BODY_MARGIN_TOP,
 	NOTICE_BUTTON_HEIGHT,
 	NOTICE_BUTTON_MARGIN_TOP,

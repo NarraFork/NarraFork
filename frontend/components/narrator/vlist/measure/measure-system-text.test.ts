@@ -11,77 +11,84 @@ beforeAll(() => {
 const SANS =
 	"-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji";
 
+/**
+ * The xs body line the measure layer reads live: 20 at the default setting (the
+ * line-height slider's 100% is 120% of the Mantine ratio — LINE_HEIGHT_BASELINE_PERCENT),
+ * where the exported `BODY_LINE_HEIGHT` is the bare-Mantine 17.
+ */
+const liveXsLine = () => 20;
+
 describe("measureSystemTextCard — per-kind single-line height model", () => {
-	it("info = card padding(10)×2 + one xs body line(17) = 37", async () => {
+	it("info = card padding(10)×2 + one xs body line(20) = 40", async () => {
 		const { measureSystemTextCard, systemTextSingleLineHeight } = await import(
 			"./measure-system-text"
 		);
-		expect(systemTextSingleLineHeight("info")).toBe(37);
+		expect(systemTextSingleLineHeight("info")).toBe(40);
 		const r = measureSystemTextCard("info", { text: "ok" }, 1000);
-		expect(r.height).toBe(37);
+		expect(r.height).toBe(40);
 	});
 
-	it("tool_loaded / tool_unloaded = 37 (same shape as info)", async () => {
+	it("tool_loaded / tool_unloaded = 40 (same shape as info)", async () => {
 		const { measureSystemTextCard } = await import("./measure-system-text");
-		expect(measureSystemTextCard("tool_loaded", { text: "Loaded skill x" }, 1000).height).toBe(37);
+		expect(measureSystemTextCard("tool_loaded", { text: "Loaded skill x" }, 1000).height).toBe(40);
 		expect(measureSystemTextCard("tool_unloaded", { text: "Unloaded skill x" }, 1000).height).toBe(
-			37,
+			40,
 		);
 	});
 
-	it("bash_command = 37 (monospace body, one line)", async () => {
+	it("bash_command = 40 (monospace body, one line)", async () => {
 		const { measureSystemTextCard } = await import("./measure-system-text");
 		const r = measureSystemTextCard("bash_command", { command: "ls -la" }, 1000);
-		expect(r.height).toBe(37);
+		expect(r.height).toBe(40);
 	});
 
-	it("error = 37 (icon-16 row floor equals the one xs line)", async () => {
+	it("error = 40 (the one xs line clears the icon-16 row floor)", async () => {
 		const { measureSystemTextCard, systemTextSingleLineHeight } = await import(
 			"./measure-system-text"
 		);
-		expect(systemTextSingleLineHeight("error")).toBe(37);
+		expect(systemTextSingleLineHeight("error")).toBe(40);
 		const r = measureSystemTextCard("error", { text: "boom" }, 1000);
-		expect(r.height).toBe(37);
+		expect(r.height).toBe(40);
 	});
 
-	it("segment_compact_failed = 56 (title row 19 + one body line 17 + padding)", async () => {
+	it("segment_compact_failed = 62 (title row 22 + one body line 20 + padding)", async () => {
 		const { measureSystemTextCard, systemTextSingleLineHeight } = await import(
 			"./measure-system-text"
 		);
-		expect(systemTextSingleLineHeight("segment_compact_failed")).toBe(56);
+		expect(systemTextSingleLineHeight("segment_compact_failed")).toBe(62);
 		const r = measureSystemTextCard(
 			"segment_compact_failed",
 			{ title: "Compact failed", text: "network error" },
 			1000,
 		);
-		expect(r.height).toBe(56);
+		expect(r.height).toBe(62);
 	});
 
-	it("spec_goal_added = 61 (body line 17 + gap 6 + button 18 + padding)", async () => {
+	it("spec_goal_added = 64 (body line 20 + gap 6 + button 18 + padding)", async () => {
 		const { measureSystemTextCard, systemTextSingleLineHeight } = await import(
 			"./measure-system-text"
 		);
-		expect(systemTextSingleLineHeight("spec_goal_added")).toBe(61);
+		expect(systemTextSingleLineHeight("spec_goal_added")).toBe(64);
 		const r = measureSystemTextCard(
 			"spec_goal_added",
 			{ text: "ship the feature", badges: ["protected", "added"], buttons: ["View tasks"] },
 			1000,
 		);
-		expect(r.height).toBe(61);
+		expect(r.height).toBe(64);
 	});
 
-	it("spec_fork_carryover / spec_context_cleared = 61 (badge row + button row)", async () => {
+	it("spec_fork_carryover / spec_context_cleared = 64 (badge row + button row)", async () => {
 		const { measureSystemTextCard, systemTextSingleLineHeight } = await import(
 			"./measure-system-text"
 		);
-		expect(systemTextSingleLineHeight("spec_fork_carryover")).toBe(61);
-		expect(systemTextSingleLineHeight("spec_context_cleared")).toBe(61);
+		expect(systemTextSingleLineHeight("spec_fork_carryover")).toBe(64);
+		expect(systemTextSingleLineHeight("spec_context_cleared")).toBe(64);
 		expect(
 			measureSystemTextCard("spec_fork_carryover", { text: "carried 3 tasks" }, 1000).height,
-		).toBe(61);
+		).toBe(64);
 		expect(
 			measureSystemTextCard("spec_context_cleared", { text: "kept 3 tasks" }, 1000).height,
-		).toBe(61);
+		).toBe(64);
 	});
 
 	// A `review_feedback` kind briefly lived in this module. Its geometry is pinned in
@@ -97,8 +104,8 @@ describe("measureSystemTextCard — pre-wrap body grows with wrapped line count"
 		const wide = measureSystemTextCard("info", { text }, 2000);
 		const narrow = measureSystemTextCard("info", { text }, 160);
 		expect(narrow.height).toBeGreaterThan(wide.height);
-		// Growth is always a whole number of 17px body lines above the 37px base.
-		expect((narrow.height - wide.height) % 17).toBe(0);
+		// Growth is always a whole number of 20px body lines above the 40px base.
+		expect((narrow.height - wide.height) % 20).toBe(0);
 	});
 
 	it("bash_command wraps long commands (monospace) and grows with narrower width", async () => {
@@ -118,7 +125,7 @@ describe("measureSystemTextCard — pre-wrap preserves hard newlines; normal col
 		const r = measureSystemTextCard("info", { text: "line1\nline2\nline3" }, 4000);
 		const c = MEASURE_SYSTEM_TEXT_CONSTANTS;
 		const bodyHeight = r.height - c.CARD_PADDING * 2;
-		expect(bodyHeight).toBe(c.BODY_LINE_HEIGHT * 3); // 3 preserved lines
+		expect(bodyHeight).toBe(liveXsLine() * 3); // 3 preserved lines
 	});
 
 	it("spec_fork_carryover (normal) collapses newlines into a single line at huge width", async () => {
@@ -204,7 +211,7 @@ describe("measureSystemTextCard — block / frame shape", () => {
 		const c = MEASURE_SYSTEM_TEXT_CONSTANTS;
 		const r = measureSystemTextCard("info", { text: "one line" }, 800);
 		// info has no pre/post chrome and sideMin 0, so total = padding×2 + body.
-		expect(r.frame.contentHeight).toBe(c.BODY_LINE_HEIGHT);
+		expect(r.frame.contentHeight).toBe(liveXsLine());
 		expect(r.height).toBe(c.CARD_PADDING * 2 + r.frame.contentHeight);
 	});
 

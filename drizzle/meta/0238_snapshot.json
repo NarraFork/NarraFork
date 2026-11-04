@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "c1d65df0-5481-4405-a4fd-dd82b19fe09a",
+  "id": "c7fd020c-a865-479b-9735-fbafc4e899ca",
   "prevId": "1da70671-7cd7-4e6a-b933-7b259c9170ef",
   "tables": {
     "acl_events": {
@@ -19757,6 +19757,13 @@
           "autoincrement": false,
           "default": 100
         },
+        "narrator_line_height_v2_percent": {
+          "name": "narrator_line_height_v2_percent",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "narrator_paragraph_scale_percent": {
           "name": "narrator_paragraph_scale_percent",
           "type": "integer",
@@ -20114,34 +20121,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "folder_id": {
-          "name": "folder_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "folder_icon": {
-          "name": "folder_icon",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "folder_color": {
-          "name": "folder_color",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "folder_preview_count": {
-          "name": "folder_preview_count",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "title": {
           "name": "title",
           "type": "text",
@@ -20243,15 +20222,6 @@
           ],
           "isUnique": false
         },
-        "idx_user_recent_tabs_user_folder": {
-          "name": "idx_user_recent_tabs_user_folder",
-          "columns": [
-            "user_id",
-            "folder_id",
-            "sort_order"
-          ],
-          "isUnique": false
-        },
         "idx_user_recent_tabs_narrator": {
           "name": "idx_user_recent_tabs_narrator",
           "columns": [
@@ -20306,14 +20276,6 @@
           "notNull": true,
           "autoincrement": false,
           "default": 0
-        },
-        "folders_migrated": {
-          "name": "folders_migrated",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
         },
         "migrated_at": {
           "name": "migrated_at",

@@ -3,6 +3,10 @@
  * scoped under `.nf-outline-editor`. Mobile first: indentation and the frame shrink when the
  * editor is narrow (a phone, or a dock panel: a container query on the editor's own width), and
  * nothing may widen it past its container.
+ *
+ * Text uses the conversation's typography (外观 · 排版) through the `--nf-type-*` variables
+ * (frontend/lib/typography-css-vars.ts): body, headings, inline code, code blocks and meta
+ * text each take the conversation's value for that role, and move with its sliders.
  */
 .nf-outline-editor {
 	--ob-line: var(--mantine-color-default-border);
@@ -31,7 +35,13 @@
 	word-wrap: break-word;
 	min-height: 40px;
 	padding-left: 18px;
-	line-height: 1.55;
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+}
+
+/* An em fraction of each element's own size, as the conversation applies it per run. */
+:where(.nf-outline-editor .ProseMirror, .nf-outline-editor .ProseMirror *) {
+	letter-spacing: var(--nf-type-letter-spacing);
 }
 
 .nf-outline-editor .ProseMirror[contenteditable="false"] {
@@ -57,7 +67,7 @@
 .nf-outline-editor .ob-content pre,
 .nf-outline-editor .ob-content table {
 	margin: 0;
-	min-height: 1.55em;
+	min-height: 1lh;
 }
 
 /* The frame: folding arrow (left of the bullet), bullet (focus), checkbox. */
@@ -66,10 +76,23 @@
 	left: -16px;
 	top: 0;
 	width: 38px;
-	height: 1.55em;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	user-select: none;
+}
+
+/* A heading block's arrow, bullet and checkbox sit on the heading's own first line. */
+.nf-outline-editor .ob-block:has(> .ob-content > h1:first-child) > .ob-gutter {
+	height: var(--nf-type-h1-line);
+}
+
+.nf-outline-editor .ob-block:has(> .ob-content > h2:first-child) > .ob-gutter {
+	height: var(--nf-type-h2-line);
+}
+
+.nf-outline-editor .ob-block:has(> .ob-content > h3:first-child) > .ob-gutter {
+	height: var(--nf-type-h3-line);
 }
 
 .nf-outline-editor .ob-arrow {
@@ -171,7 +194,8 @@
 	border-radius: 6px;
 	background: var(--mantine-color-body);
 	box-shadow: var(--mantine-shadow-sm);
-	font-size: 12px;
+	font-size: var(--nf-type-xs-size);
+	line-height: var(--nf-type-xs-line);
 	user-select: none;
 }
 
@@ -224,8 +248,10 @@
 	display: none;
 }
 
+/* The page title: the conversation's h3, as the read-only tree's `Title order={3}`. */
 .nf-outline-editor .ProseMirror > .ob-block > .ob-content > :first-child {
-	font-size: 1.5em;
+	font-size: var(--nf-type-h3-size);
+	line-height: var(--nf-type-h3-line);
 	font-weight: 700;
 	margin-bottom: 6px;
 }
@@ -246,15 +272,18 @@
 }
 
 .nf-outline-editor .ob-content h1 {
-	font-size: 1.5em;
+	font-size: var(--nf-type-h1-size);
+	line-height: var(--nf-type-h1-line);
 }
 
 .nf-outline-editor .ob-content h2 {
-	font-size: 1.25em;
+	font-size: var(--nf-type-h2-size);
+	line-height: var(--nf-type-h2-line);
 }
 
 .nf-outline-editor .ob-content h3 {
-	font-size: 1.1em;
+	font-size: var(--nf-type-h3-size);
+	line-height: var(--nf-type-h3-line);
 }
 
 .nf-outline-editor .ob-content blockquote {
@@ -267,7 +296,9 @@
 	background: var(--ob-code-bg);
 	padding: 4px 8px;
 	border-radius: 4px;
-	font: 13px / 1.5 var(--mantine-font-family-monospace);
+	font:
+		var(--nf-type-code-block-size) / var(--nf-type-code-block-line)
+		var(--mantine-font-family-monospace);
 	overflow-x: auto;
 	white-space: pre;
 }
@@ -277,7 +308,12 @@
 	border-radius: 3px;
 	padding: 0 3px;
 	font-family: var(--mantine-font-family-monospace);
-	font-size: 0.9em;
+	font-size: var(--nf-type-code-size);
+	/* No line box of its own: an inherited px line box on a smaller mono font sits lower on
+	   the baseline and grows the line (the mind map measures lines at the body line box), and
+	   even 1 sticks out at the lowest line-height setting. The background still paints the
+	   glyphs' own box. */
+	line-height: 0;
 }
 
 .nf-outline-editor .ob-content pre code {
@@ -321,7 +357,7 @@
 }
 
 .nf-outline-editor .ob-embed-head {
-	font-size: 11px;
+	font-size: var(--nf-type-xs-size);
 	color: var(--ob-muted);
 }
 

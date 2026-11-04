@@ -5,8 +5,9 @@
 	overflow: hidden;
 	padding: var(--mantine-spacing-xs);
 	font-family: var(--mantine-font-family-monospace);
-	font-size: 11px;
-	line-height: 1.55;
+	/* Inside `.nf-type-scope` (the outline) these follow the reader's typography. */
+	font-size: var(--nf-scoped-code-block-size, 11px);
+	line-height: var(--nf-scoped-code-block-line, 1.55);
 	white-space: pre-wrap;
 	word-break: break-word;
 	overflow-wrap: break-word;

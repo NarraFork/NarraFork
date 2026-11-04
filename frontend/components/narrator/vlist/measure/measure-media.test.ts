@@ -8,6 +8,9 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+/** The xs line the measure layer reads live (20 at the default setting). */
+const LIVE_XS_LINE = 20;
+
 describe("media run framing", () => {
 	it("forwards run opts only to generated images and keeps source payload intact", async () => {
 		const { VLIST_REGISTRY } = await import("../registry");
@@ -198,7 +201,9 @@ describe("measureImageGeneration", () => {
 		const innerWidth = 800 - c.IMGGEN_PAPER_PADDING * 2;
 		const displayWidth = Math.min(innerWidth, Math.min(1024, c.IMGGEN_MAX_DISPLAY_WIDTH));
 		const imageHeight = Math.round((displayWidth * 512) / 1024);
-		const headerHeight = c.IMGGEN_ICON_SIZE; // one short status line, icon dominates
+		// One short status line: the taller of the 18px icon and the live xs line (20 at the
+		// default setting, 120% of the Mantine 17 — LINE_HEIGHT_BASELINE_PERCENT).
+		const headerHeight = Math.max(c.IMGGEN_ICON_SIZE, LIVE_XS_LINE);
 		const expected =
 			c.IMGGEN_PAPER_PADDING * 2 +
 			c.IMGGEN_BORDER * 2 +
@@ -239,7 +244,7 @@ describe("measureImageGeneration", () => {
 		const expected =
 			c.IMGGEN_PAPER_PADDING * 2 +
 			c.IMGGEN_BORDER * 2 +
-			c.IMGGEN_ICON_SIZE +
+			Math.max(c.IMGGEN_ICON_SIZE, LIVE_XS_LINE) +
 			c.IMGGEN_IMAGE_GAP +
 			c.IMGGEN_UNKNOWN_IMAGE_HEIGHT;
 		expect(r.height).toBe(expected);
@@ -251,11 +256,9 @@ describe("measureImageGeneration", () => {
 		const r = measureImageGeneration({ status: "generating", statusText: "Generating…" }, 800);
 		expect(r.blocks).toHaveLength(1);
 		expect(r.blocks[0]!.kind).toBe("inline");
-		// Paper chrome + single header line (icon dominates the short text).
+		// Paper chrome + single header line (the taller of icon and live xs line).
 		const expected =
-			c.IMGGEN_PAPER_PADDING * 2 +
-			c.IMGGEN_BORDER * 2 +
-			Math.max(c.IMGGEN_ICON_SIZE, c.IMGGEN_HEADER_LINE_HEIGHT);
+			c.IMGGEN_PAPER_PADDING * 2 + c.IMGGEN_BORDER * 2 + Math.max(c.IMGGEN_ICON_SIZE, LIVE_XS_LINE);
 		expect(r.height).toBe(expected);
 	});
 

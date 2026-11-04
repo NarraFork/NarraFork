@@ -119,19 +119,29 @@ function canvas(id = "inline"): HTMLDivElement {
 	return value;
 }
 
-function focusVisible(id = "inline"): boolean {
+/** The focused row's box in scroll coordinates, from the modeled row heights. */
+function focusBox(id = "inline"): { top: number; height: number } | null {
 	const node = scroller(id);
 	const focus = node.querySelector<HTMLElement>("[data-diff-focus]");
-	if (!focus) return false;
+	if (!focus) return null;
 	const snapshot = controllers.get(id)?.getSnapshot();
-	if (!snapshot) return false;
+	if (!snapshot) return null;
 	let top = snapshot.contentOrigin;
 	for (const sibling of canvas(id).children) {
 		if (sibling === focus) break;
 		top += Number.parseFloat((sibling as HTMLElement).style.height) || 0;
 	}
-	const height = Number.parseFloat(focus.style.height) || 0;
-	return top < snapshot.scrollTop + snapshot.viewportHeight && top + height > snapshot.scrollTop;
+	return { top, height: Number.parseFloat(focus.style.height) || 0 };
+}
+
+function focusVisible(id = "inline"): boolean {
+	const box = focusBox(id);
+	const snapshot = controllers.get(id)?.getSnapshot();
+	if (!box || !snapshot) return false;
+	return (
+		box.top < snapshot.scrollTop + snapshot.viewportHeight &&
+		box.top + box.height > snapshot.scrollTop
+	);
 }
 
 async function settle(count = 90) {
@@ -809,8 +819,19 @@ describe("DiffContent permanent viewport", () => {
 		);
 		await settle();
 		const before = scroller().scrollTop;
+		// The row in the middle of the viewport, from the live row height. Not the next row: the
+		// reveal leaves a 16 px margin below the focus, and a row taller than that (the reader's
+		// line height) ends below the viewport, so moving to it rightly scrolls.
+		const box = focusBox();
+		const snapshot = controllers.get("inline")?.getSnapshot();
+		if (!box || !snapshot) throw new Error("no focus row");
+		const middle = snapshot.scrollTop + snapshot.viewportHeight / 2;
+		const inside = 80 + Math.floor((middle - box.top) / box.height);
+		expect(inside).not.toBe(80);
 		root.render(
-			<Fixture doc={{ ...base, focus: getDiffRowAnchor(base, 81), revision: "focus81" }} />,
+			<Fixture
+				doc={{ ...base, focus: getDiffRowAnchor(base, inside), revision: `focus${inside}` }}
+			/>,
 		);
 		await settle();
 		expect(scroller().scrollTop).toBe(before);

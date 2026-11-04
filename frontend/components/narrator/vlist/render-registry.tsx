@@ -401,6 +401,7 @@ export function renderElement(
 					actions={extra.specCarryoverActions as never}
 					errorActions={extra.errorNoticeActions as never}
 					injectionGuardActions={extra.injectionGuardActions as never}
+					onToggle={extra.onToggle as (() => void) | undefined}
 					headerAction={
 						reference?.narratorId && reference.questionId ? (
 							<QuestionEventAction

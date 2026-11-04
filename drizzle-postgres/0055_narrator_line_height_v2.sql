@@ -1,0 +1,1 @@
+ALTER TABLE "user_preferences" ADD COLUMN "narrator_line_height_v2_percent" integer;

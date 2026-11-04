@@ -64,7 +64,7 @@ export const REASONING_ICON_SIZE = 16;
 /** IconChevronRight / IconChevronDown size={12}. */
 export const REASONING_CHEVRON_SIZE = 12;
 /** xs text line box: round(12 * 1.4) = 17px. */
-export const REASONING_XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+export const REASONING_XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 
 /**
  * Single-row height shared by the streaming / count / collapsed forms and the header
@@ -330,7 +330,7 @@ export const MEASURE_REASONING_CONSTANTS = {
 	REASONING_ROW_PADDING_Y,
 	REASONING_ICON_SIZE,
 	REASONING_CHEVRON_SIZE,
-	REASONING_XS_LINE_HEIGHT,
+	REASONING_XS_LINE_HEIGHT_BASELINE,
 	REASONING_HEADER_ROW_HEIGHT,
 	REASONING_COUNT_LINE_HEIGHT,
 	REASONING_BODY_PADDING_Y,

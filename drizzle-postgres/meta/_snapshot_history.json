@@ -443,11 +443,19 @@
 		},
 		{
 			"idx": 55,
-			"tag": "0055_recent_tab_folders",
-			"id": "660668bf-e2b2-4e82-ab17-a5c5a2ab9beb",
+			"tag": "0055_narrator_line_height_v2",
+			"id": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
 			"prevId": "af2ae099-396f-4399-8676-928a7d7d4a6b",
 			"version": "7",
-			"snapshotDigest": "1997d69952900bdbab4e405aa2b2d6af68c99622570e04c7bd32da7c3a99e433"
+			"snapshotDigest": "f074f16d61810f35a714a5b6959a38c133e6571cce0d2838427076bf7cb4c513"
+		},
+		{
+			"idx": 56,
+			"tag": "0056_recent_tab_folders",
+			"id": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
+			"prevId": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
+			"version": "7",
+			"snapshotDigest": "0f1f2cce34e192cca32077bfa5248d291e67a2807bdfe03dda7d9d6727b87d2f"
 		}
 	]
 }

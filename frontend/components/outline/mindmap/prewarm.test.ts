@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { clearMeasureCache } from "./measure";
+import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
+import { clearMeasureCache, hasMeasured } from "./measure";
 import type { MeasureReply, MeasureRequest } from "./measure.worker";
 import { prewarmBodies, prewarmStats, setMeasureWorkerFactoryForTests } from "./prewarm";
 
@@ -27,6 +28,7 @@ const plain = (ref: string, label: string | null) => label ?? ref;
 afterEach(() => {
 	setMeasureWorkerFactoryForTests(null);
 	clearMeasureCache();
+	resetTypographyForTest();
 });
 
 describe("measuring ahead in a Worker", () => {
@@ -96,5 +98,33 @@ describe("measuring ahead in a Worker", () => {
 		(answer as (() => void) | null)?.();
 		await new Promise((r) => setTimeout(r, 0));
 		expect({ firstDone, secondDone }).toEqual({ firstDone: true, secondDone: true });
+	});
+
+	test("each batch carries the reader's typography; a new setting measures everything again", async () => {
+		const { w, posted } = fakeWorker((req) => ({
+			out: req.items.map((i) => [i.key, 100, 24] as [string, number, number]),
+			failed: [],
+		}));
+		setMeasureWorkerFactoryForTests(() => w);
+		await prewarmBodies([{ content: "正文 body", labelOf: plain }]);
+		expect(posted[0]?.typography).toMatchObject({
+			fontScalePercent: 100,
+			lineHeightScalePercent: 100,
+			letterSpacingPercent: 0,
+		});
+		expect(hasMeasured("正文 body")).toBe(true);
+
+		// The Worker has its own typography module: it is told the setting with every batch,
+		// and the sizes measured under the old setting are not served under the new one.
+		setTypography({ fontScalePercent: 115, lineHeightScalePercent: 110, letterSpacingPercent: 2 });
+		expect(hasMeasured("正文 body")).toBe(false);
+		await prewarmBodies([{ content: "正文 body", labelOf: plain }]);
+		expect(posted).toHaveLength(2);
+		expect(posted[1]?.typography).toMatchObject({
+			fontScalePercent: 115,
+			lineHeightScalePercent: 110,
+			letterSpacingPercent: 2,
+		});
+		expect(posted[1]?.items[0]?.key).not.toBe(posted[0]?.items[0]?.key);
 	});
 });

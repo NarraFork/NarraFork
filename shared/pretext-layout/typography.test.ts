@@ -21,14 +21,20 @@ import {
 	clampTypography,
 	clampTypographyValue,
 	DEFAULT_TYPOGRAPHY,
+	effectiveLineHeightPercent,
 	getTypography,
 	getTypographyRevision,
 	isDefaultTypography,
+	LEGACY_LINE_HEIGHT_RANGE,
+	LINE_HEIGHT_BASELINE_PERCENT,
+	legacyLineHeightPercentFrom,
 	letterSpacingPxFor,
+	lineHeightPercentFromLegacy,
 	onTypographyChange,
 	resetTypographyForTest,
 	scaleBlockSpacing,
 	scaleFontSize,
+	scaleLineHeightRatio,
 	setTypography,
 	TYPOGRAPHY_RANGE,
 } from "./typography";
@@ -44,10 +50,10 @@ beforeEach(() => {
 });
 
 describe("defaults", () => {
-	it("is neutral, so an untouched install measures exactly as before", () => {
-		// The whole point of the neutral setting is that every constant in
-		// pretext-fonts.ts is written against it. A non-neutral default would silently
-		// re-flow every existing narrator.
+	it("is neutral for size, spacing and blocks; line height is the 120% baseline", () => {
+		// Every size constant in pretext-fonts.ts is written against the default. Line
+		// height is the one deliberate exception (LINE_HEIGHT_BASELINE_PERCENT, pinned
+		// below): its 100% is the old 120%.
 		expect(DEFAULT_TYPOGRAPHY).toEqual({
 			fontScalePercent: 100,
 			letterSpacingPercent: 0,
@@ -229,5 +235,81 @@ describe("prepared-cache invalidation", () => {
 		// pre-feature behaviour, including reusing the same cache slot.
 		const omitted = getPreparedTextWithSegments("hello world", font);
 		expect(getPreparedTextWithSegments("hello world", font, undefined, 0)).toBe(omitted);
+	});
+});
+
+describe("line-height baseline: the old 120% is the new 100%", () => {
+	it("measures the default exactly as the old 120% setting did", () => {
+		expect(LINE_HEIGHT_BASELINE_PERCENT).toBe(120);
+		expect(effectiveLineHeightPercent()).toBe(120);
+		// Bit-for-bit the old arithmetic at 120% (`ratio × percent / 100`), for every
+		// ratio the transcript measures with: body, xs, base, headings, notices.
+		for (const ratio of [1.45, 1.4, 1.55, 1.3, 1.35, 1.5, 1.2]) {
+			expect(scaleLineHeightRatio(ratio)).toBe((ratio * 120) / 100);
+		}
+	});
+
+	it("multiplies the slider onto the baseline", () => {
+		setTypography({ lineHeightScalePercent: 110 });
+		expect(effectiveLineHeightPercent()).toBeCloseTo(132, 10);
+		expect(scaleLineHeightRatio(1.45)).toBeCloseTo(1.45 * 1.32, 10);
+		setTypography({ lineHeightScalePercent: TYPOGRAPHY_RANGE.lineHeightScalePercent.min });
+		expect(effectiveLineHeightPercent()).toBe(72);
+	});
+
+	it("maps the old default (and nothing stored) to the new default", () => {
+		// 100 is what every row saved before the rescale carries unless the reader moved
+		// the slider (the INSERT wrote the default), and what "reset" wrote.
+		expect(lineHeightPercentFromLegacy(100)).toBe(100);
+		expect(lineHeightPercentFromLegacy(null)).toBe(100);
+		expect(lineHeightPercentFromLegacy(undefined)).toBe(100);
+		expect(lineHeightPercentFromLegacy(Number.NaN)).toBe(100);
+	});
+
+	it("keeps the effective line height of every value saved on the old scale", () => {
+		expect(lineHeightPercentFromLegacy(120)).toBe(100);
+		expect(lineHeightPercentFromLegacy(150)).toBe(125);
+		expect(lineHeightPercentFromLegacy(110)).toBe(92);
+		for (
+			let legacy: number = LEGACY_LINE_HEIGHT_RANGE.min;
+			legacy <= LEGACY_LINE_HEIGHT_RANGE.max;
+			legacy += 5
+		) {
+			if (legacy === 100) continue;
+			const next = lineHeightPercentFromLegacy(legacy);
+			// Inside the new range (the old floor and ceiling still have a place)…
+			expect(next).toBeGreaterThanOrEqual(TYPOGRAPHY_RANGE.lineHeightScalePercent.min);
+			expect(next).toBeLessThanOrEqual(TYPOGRAPHY_RANGE.lineHeightScalePercent.max);
+			// …and within half a percent of the same effective ratio (whole-percent storage).
+			expect(Math.abs((next * LINE_HEIGHT_BASELINE_PERCENT) / 100 - legacy)).toBeLessThanOrEqual(
+				0.6,
+			);
+		}
+	});
+
+	it("never moves a value twice: converting is a function of the old value only", () => {
+		// The server derives on read and never writes the old column, so the same old value
+		// always yields the same new one — reading it again cannot rescale it again.
+		for (const legacy of [75, 95, 100, 135, 220]) {
+			const once = lineHeightPercentFromLegacy(legacy);
+			expect(lineHeightPercentFromLegacy(legacy)).toBe(once);
+		}
+	});
+
+	it("mirrors a new-scale value onto the old scale for older builds", () => {
+		expect(legacyLineHeightPercentFrom(100)).toBe(120);
+		expect(legacyLineHeightPercentFrom(92)).toBe(110);
+		expect(legacyLineHeightPercentFrom(125)).toBe(150);
+		// The ends of the new range land on the ends of the old one.
+		expect(legacyLineHeightPercentFrom(TYPOGRAPHY_RANGE.lineHeightScalePercent.min)).toBe(
+			LEGACY_LINE_HEIGHT_RANGE.min,
+		);
+		expect(legacyLineHeightPercentFrom(TYPOGRAPHY_RANGE.lineHeightScalePercent.max)).toBe(
+			LEGACY_LINE_HEIGHT_RANGE.max,
+		);
+		// An older build reading the mirror back converts to the same value (round trip).
+		for (const v of [65, 80, 92, 100, 108, 125, 160]) {
+			expect(lineHeightPercentFromLegacy(legacyLineHeightPercentFrom(v))).toBe(v);
+		}
 	});
 });
