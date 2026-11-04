@@ -150,7 +150,10 @@ async function retry<T>(request: PrefixSnapshotRequest, action: () => Promise<T>
 			return await action();
 		} catch (error) {
 			const code = (error as { code?: string }).code;
-			if (code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED" && code !== "55P03") throw error;
+			// BUSY_SNAPSHOT/RECOVERY read the same "database is locked" but carry a suffixed
+			// code. Every statement here is autocommit, so a retry opens a fresh snapshot.
+			if (!code?.startsWith("SQLITE_BUSY") && code !== "SQLITE_LOCKED" && code !== "55P03")
+				throw error;
 			await Bun.sleep(Math.min(250, 10 * 2 ** Math.min(attempts++, 5)));
 		}
 	}
