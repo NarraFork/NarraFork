@@ -220,6 +220,7 @@ const stats: UsageHistoryStats = {
 	totalCost: 0,
 	averageDurationMs: 0,
 	averageTtftMs: 0,
+	outputTokensPerSecond: null,
 };
 
 describe("UsageHistoryChart cache hit rate", () => {

@@ -3566,6 +3566,8 @@ export const apiRequests = sqliteTable(
 		// 性能指标
 		ttftMs: integer("ttft_ms"), // Time to first token
 		durationMs: integer("duration_ms"), // 总耗时
+		// 首个内容输出 → 请求结束（不含排队与 prefill），用于输出速度；旧记录为 null
+		decodeMs: integer("decode_ms"),
 		// 成本
 		costUsd: real("cost_usd"),
 		/** Null marks an untouched historical record. */

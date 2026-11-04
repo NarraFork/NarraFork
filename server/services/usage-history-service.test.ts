@@ -88,6 +88,22 @@ test("reference cost coverage survives detail, totals, series and breakdown with
 	).toMatchObject({ costStatus: "partial", partialRequestCount: 1 });
 });
 
+test("output speed weights tokens over decode time and skips untimed requests", async () => {
+	db.insert(apiRequests)
+		.values([
+			{ id: "fast", createdAt, provider: "speed", outputTokens: 300, decodeMs: 2000 },
+			{ id: "slow", createdAt, provider: "speed", outputTokens: 100, decodeMs: 2000 },
+			// Legacy row: no decode timing, must not dilute the denominator.
+			{ id: "legacy", createdAt, provider: "speed", outputTokens: 5000 },
+			// Timed but empty: no output, must not inflate the denominator.
+			{ id: "empty", createdAt, provider: "speed", outputTokens: 0, decodeMs: 9000 },
+		])
+		.run();
+	// (300 + 100) / 4s, not the mean of the two per-request speeds.
+	expect((await service.getUsageStats({ provider: "speed" })).outputTokensPerSecond).toBe(100);
+	expect((await service.getUsageStats({ provider: "none" })).outputTokensPerSecond).toBeNull();
+});
+
 test("preserves normalized OpenAI input and cache buckets in history and aggregates", async () => {
 	db.insert(apiRequests)
 		.values([

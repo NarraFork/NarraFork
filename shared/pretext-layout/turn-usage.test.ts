@@ -1,9 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
 	formatMeterUsage,
+	formatTokensPerSecond,
+	formatTurnOutputSpeed,
 	formatTurnUsageCost,
 	formatTurnUsageParts,
 	getPromptTokenFootprint,
+	outputTokensPerSecond,
 	type ResponsiveTurnUsageData,
 	reflowTurnUsageData,
 	resolveTurnUsageLines,
@@ -173,6 +176,45 @@ describe("resolveTurnUsageLines", () => {
 		});
 		expect(lines?.leading).toBe("↑ 100");
 		expect(lines?.trailing).toBe("Σ 100 ctx · 100 in · 20 out");
+	});
+});
+
+describe("output speed", () => {
+	it("divides output tokens by the decode window", () => {
+		expect(outputTokensPerSecond(200, 4000)).toBe(50);
+		expect(formatTurnOutputSpeed({ output_tokens: 200, decode_ms: 4000 })).toBe("50 tok/s");
+	});
+
+	it("keeps one decimal below 10 tok/s", () => {
+		expect(formatTokensPerSecond(7.46)).toBe("7.5 tok/s");
+		expect(formatTokensPerSecond(12.6)).toBe("13 tok/s");
+	});
+
+	it("omits the speed when the decode was not timed or no output was reported", () => {
+		expect(formatTurnOutputSpeed({ output_tokens: 200 })).toBeNull();
+		expect(formatTurnOutputSpeed({ output_tokens: 0, decode_ms: 1000 })).toBeNull();
+		expect(formatTurnOutputSpeed({ output_tokens: 10, decode_ms: 0 })).toBeNull();
+	});
+
+	it("appends the speed after the cost on desktop", () => {
+		const lines = resolveTurnUsageLines({
+			role: "assistant",
+			turnUsageJson: { input_tokens: 100, output_tokens: 20, decode_ms: 1000 },
+			costUsd: 0.5,
+		});
+		expect(lines?.trailing).toBe("Σ 100 ctx · 100 in · 20 out · $0.5000 · 20 tok/s");
+	});
+
+	it("moves the speed to the mobile second line", () => {
+		const lines = resolveTurnUsageLines(
+			{
+				role: "assistant",
+				turnUsageJson: { input_tokens: 100, output_tokens: 20, decode_ms: 1000 },
+			},
+			{ mobile: true },
+		);
+		expect(lines?.trailing).toBe("Σ 100 ctx · 100 in · 20 out");
+		expect(lines?.trailingSecondary).toBe("20 tok/s");
 	});
 });
 

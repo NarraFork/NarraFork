@@ -1917,6 +1917,7 @@
 	"details.stats.inputTokens": "Total input",
 	"details.stats.outputTokens": "Total output",
 	"details.stats.cacheReadTokens": "Cache reads",
+	"details.stats.outputSpeed": "Avg output speed",
 	"details.stats.usageHistoryIncludesSubagents": "From usage history · includes subagents",
 	"details.stats.viewers": "Viewers",
 	"details.stats.terminals": "Terminals",
@@ -2640,6 +2641,7 @@
 			"requestKind": "Request kind",
 			"ttft": "Time to first token",
 			"tokens": "Input / output tokens",
+			"outputSpeed": "Output speed",
 			"noItems": "No record covers this span: usually scheduling between model requests, result persistence and context preparation.",
 			"afterTurn": "The turn has ended while a subagent is still running.",
 			"merged": "Merged from {{count}} short segments, coloured by the largest share:"

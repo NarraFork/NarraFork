@@ -310,6 +310,8 @@ export interface TimelineModelItem {
 	model: string | null;
 	ttftMs: number | null;
 	durationMs: number | null;
+	/** First content → end; null on requests recorded before decode timing existed. */
+	decodeMs: number | null;
 	inputTokens: number;
 	outputTokens: number;
 	errorMessage: string | null;

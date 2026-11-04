@@ -1,6 +1,6 @@
 {
-  "id": "81304305-168a-41ef-8fc3-187e57817aed",
-  "prevId": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
+  "id": "44e5308f-2856-4b61-8e5f-51d58efdb21a",
+  "prevId": "81304305-168a-41ef-8fc3-187e57817aed",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -601,6 +601,12 @@
         },
         "duration_ms": {
           "name": "duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decode_ms": {
+          "name": "decode_ms",
           "type": "integer",
           "primaryKey": false,
           "notNull": false

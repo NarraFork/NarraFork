@@ -39,6 +39,7 @@ import {
 	type TimelineTurnSummary,
 	type TurnTimelineResponse,
 } from "@shared/narrator-timeline";
+import { formatTokensPerSecond, outputTokensPerSecond } from "@shared/pretext-layout/turn-usage";
 import {
 	IconChevronLeft,
 	IconChevronRight,
@@ -757,6 +758,12 @@ function DetailRow({ label, value }: { label: string; value: string | number | n
 	);
 }
 
+/** `42 tok/s` over the request's decode window, or null when it was not timed. */
+function formatOutputSpeed(outputTokens: number, decodeMs: number | null): string | null {
+	const speed = outputTokensPerSecond(outputTokens, decodeMs);
+	return speed == null ? null : formatTokensPerSecond(speed);
+}
+
 function ItemDetail({
 	item,
 	onOpenSubagent,
@@ -785,6 +792,10 @@ function ItemDetail({
 							? `${item.inputTokens} / ${item.outputTokens}`
 							: null
 					}
+				/>
+				<DetailRow
+					label={t("timeline.detail.outputSpeed")}
+					value={formatOutputSpeed(item.outputTokens, item.decodeMs)}
 				/>
 				<DetailRow label={t("timeline.detail.error")} value={item.errorMessage} />
 			</Paper>
