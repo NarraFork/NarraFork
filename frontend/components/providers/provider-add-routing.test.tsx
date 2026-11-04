@@ -428,7 +428,7 @@ function persistedProviders(field = "customApiProviders") {
 	return serverSettings[field] as Array<Record<string, unknown>>;
 }
 async function leaveDetail() {
-	const back = container.querySelector<HTMLButtonElement>("button.mantine-ActionIcon-root");
+	const back = container.querySelector<HTMLButtonElement>('[data-testid="provider-config-back"]');
 	if (!back) throw new Error("Missing provider configuration back button");
 	await click(back);
 }
@@ -486,7 +486,8 @@ describe("provider deep link", () => {
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		expect(router.state.location.search).toEqual({});
-		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+		// 概览卡片现在也有 ActionIcon（删除按钮），返回按钮用 testid 认。
+		expect(container.querySelector('[data-testid="provider-config-back"]')).toBeNull();
 	});
 });
 
@@ -554,7 +555,7 @@ describe("provider deep link resolution", () => {
 		};
 		await mount("/settings/providers?provider=xiaomi");
 		expect(currentCustomDetail()).toBeUndefined();
-		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+		expect(container.querySelector('[data-testid="provider-config-back"]')).toBeNull();
 		expect(container.querySelector('a[href="/settings/providers/add"]')).not.toBeNull();
 	});
 });
@@ -1295,5 +1296,42 @@ describe("provider add nested route", () => {
 		// codex + CommandCode + existing：CommandCode 平台卡加入概览后多一张。
 		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
 		expectNoSave();
+	});
+});
+
+describe("卡片删除按钮", () => {
+	const card = () =>
+		[...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("Existing provider"),
+		);
+
+	test("卡片上删除走出草稿，保存前卡片消失，放弃更改后回来", async () => {
+		await mount("/settings/providers");
+		expect(card()).toBeDefined();
+
+		const remove = card()?.querySelector(`[aria-label="${text("providerDelete")}"]`);
+		expect(remove).toBeDefined();
+		await click(remove as Element);
+
+		// 与详情页里的删除同一条路径：只改草稿，卡片立刻从概览消失。
+		expect(card()).toBeUndefined();
+		expect(container.querySelectorAll('[role="button"]')).toHaveLength(2);
+		expectNoSave();
+
+		const discard = [...container.querySelectorAll("button")].find(
+			(node) => node.textContent === text("unsavedDiscard"),
+		);
+		expect(discard).toBeDefined();
+		await click(discard as Element);
+		expect(card()).toBeDefined();
+	});
+
+	test("平台供应商的卡片没有删除按钮", async () => {
+		await mount("/settings/providers");
+		const platform = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes(text("providerTypePlatform")),
+		);
+		expect(platform).toBeDefined();
+		expect(platform?.querySelector(`[aria-label="${text("providerDelete")}"]`)).toBeNull();
 	});
 });

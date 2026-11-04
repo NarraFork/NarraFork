@@ -12,6 +12,8 @@ export interface ProviderOverviewViewProps {
 	hiddenModels: Set<string>;
 	onToggleProviderDisabled: (prefix: string) => void;
 	onOpenProviderConfig: (prefix: string) => void;
+	/** 从草稿里删掉一条 API key 供应商（保存后才落库）；平台/插件供应商不传。 */
+	onDeleteProvider?: (providerId: string) => void;
 	selectedProvider: string | null;
 	pendingProvider?: string;
 }
@@ -21,6 +23,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	hiddenModels,
 	onToggleProviderDisabled,
 	onOpenProviderConfig,
+	onDeleteProvider,
 	selectedProvider,
 	pendingProvider,
 }: ProviderOverviewViewProps) {
@@ -76,6 +79,12 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					controlsDisabled={pendingProvider === group.prefix}
 					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
 					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}
+					// 只有草稿里可增删的供应商才给删除按钮：平台与插件供应商由各自机制管理。
+					onDelete={
+						!group.isPlatform && group.providerId && onDeleteProvider
+							? () => onDeleteProvider(group.providerId as string)
+							: undefined
+					}
 					isSelected={selectedProvider === (group.providerId ?? group.prefix)}
 				/>
 			</Grid.Col>

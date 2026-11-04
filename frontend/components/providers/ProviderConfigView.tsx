@@ -19,7 +19,7 @@ export const ProviderConfigView = React.memo(function ProviderConfigView({
 	return (
 		<Stack gap="md" style={{ height: "100%" }}>
 			<Group gap="xs">
-				<ActionIcon variant="subtle" onClick={onClose}>
+				<ActionIcon variant="subtle" onClick={onClose} data-testid="provider-config-back">
 					<IconArrowLeft size={18} />
 				</ActionIcon>
 				<Title order={3}>{providerLabel}</Title>
