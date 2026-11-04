@@ -338,3 +338,39 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 6. **团队预算**：团队总额、个人、项目三本账，只约束团队来源，见 §5.4。
 7. **凭据存储**：加密文件，不进数据库；允许管理员关闭加密改存明文，见 §7。
 8. **凭据迁移**：管理员经密码 + 第二因素核验后，可导出单个 / 多个 / 全部凭据为口令加密文件，在另一台实例导入，见 §7。
+
+## 14. 交接：现状与下一步（2026-11-04）
+
+本节给接手的人：做到了哪里、代码在哪、下一步按什么顺序做、有哪些已知的坑。设计本身以前文为准。
+
+### 14.1 已完成（分支 `claude/sleepy-wozniak-aousdo`）
+
+| 阶段 | 内容 | 主要位置 |
+|---|---|---|
+| P0 | `api_requests.billingUserId / projectId`；`usage_daily` 日账本（SQLite 0236、PG 0053）；首页“今日开销”只算本人 | `server/services/usage-daily.ts`、`user-usage-totals.ts`、`server/lib/request-source.ts`、`routes/dashboard.ts` |
+| P1 | 模型目录重做：3 层合并、8 类字段、`model-catalog/overrides.json`、精简在线更新、新模型卡界面 | `shared/model-catalog/{override,resolve}.ts`、`server/lib/model-catalog/`、`routes/model-catalog.ts`、`frontend/components/settings/ModelCatalogSection.tsx` 等 |
+| P2 | 逐凭据网络身份（Codex 账号） | `shared/credential-network.ts`、`server/lib/codex-network.ts`、`CredentialNetworkEditor.tsx` |
+| P2 | 凭据文件加密（可关） | `server/lib/secret-store.ts`、设置 → 服务器与系统 |
+| P2 | 凭据迁移：密码 + 第二因素核验、口令加密导出、预览导入 | `server/services/step-up-service.ts`、`server/lib/credential-transfer/`、`routes/credential-transfer.ts`、`CredentialTransferCard.tsx` |
+| P2 | 自定义 API 供应商多 Key 池：Key 迁出 settings.json、会话粘性轮换与故障切换、逐 Key 额度与网络身份、Key 列表界面 | `server/lib/provider-keys.ts`、`settings/provider-keys-projection.ts`、`agent/pooled-provider.ts`、`provider-key-{subjects,quota}.ts`、`routes/provider-keys.ts`、`ProviderKeysPanel.tsx` |
+
+架构说明页（可分享）：设计 https://claude.ai/artifact/19BW1ReTRShtDynQHXJDUE ，现状梳理 https://claude.ai/artifact/HJfhaWMvFtFjxhFDaN8S8E （P2 之后的变化以本文为准）。
+
+### 14.2 下一步，按顺序
+
+1. **P2 收尾**
+   - NUG、TokenDance、Command Code、搜索渠道的 Key 仍在 settings.json，按 `provider-keys-projection.ts` 的同一模式迁出（磁盘不写、内存投影、读不了凭据文件就不迁）。
+   - 把 CodexManager 里与账号无关的池化逻辑（优先级、会话亲和、失败停用、额度跳过）与 `pooled-provider.ts` 合并成一个通用池；Codex 只保留 OAuth / PAT / Agent Identity 登录与 `/wham/usage` 探测。不要一次重写 CodexManager，先抽出纯函数再替换调用点。
+   - 数据管理“导出供应商”仍带第一个 Key 且不要求二次核验，需决定：要么去掉 Key（改走凭据迁移），要么同样要求 step-up。
+2. **P3 路由**（§4）：逻辑模型身份复用 P1 的 `identifyModel`；`resolveRoute(narrator, model)` 在纪元边界（压缩 / 新纪元）才重选来源，纪元内锁定；策略预设先做“个人优先 / 团队优先”和“先用订阅”；模型选择器二级“来源”菜单；把模型聚合 `__agg__:` 迁为逻辑模型 + `auto`（§11）。迁移后台分页执行。
+3. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
+4. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
+
+### 14.3 约定与已知事项
+
+- 仓库规则见 CLAUDE.md：不手改 `drizzle/`；schema 改动后 `bun run db:generate`，PG 走 `bun scripts/generate-postgres-schema.ts` + `bun run db:generate:pg --name <name>`，并同步 `scripts/lib/__tests__/check-postgres-schema-parity.test.ts` 的表 / 列数；schema 变更同步 `data-portability.ts`。与 main 合并撞迁移号时：取 main 的 meta / postgres-schema / parity 测试，删掉本分支的迁移文件后重新生成（本分支已做过两次）。
+- 只跑相关测试（`bun test --isolate <文件>`），全量交给 CI。
+- 回退到 Key 迁出之前的版本会读到空 Key（§7）。
+- 状态栏的 Kimi / OpenCode 额度按供应商显示，取第一个可用 Key，不一定是当前会话正在用的 Key；做 P3 时可改为显示会话实际来源。
+- 冷却状态只在内存；只有 `invalid`（401）会写进 `provider-keys.json`。
+- 隔离开发实例：`NARRAFORK_HOME=<空目录> bun run dev` 与 `bun run dev:frontend`；不要动正在运行的 `bun run start:dev` 进程。
