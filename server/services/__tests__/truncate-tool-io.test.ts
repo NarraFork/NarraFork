@@ -193,6 +193,13 @@ describe("truncateToolIO — skip rules are preserved", () => {
 			expect(out[0].toolCalls[0].outputJson._truncated).toBe(true);
 		}
 	});
+
+	test("GenUI render keeps its markup whole: a truncated source cannot be drawn", () => {
+		const input = { action: "render", title: "Form", source: `<Stack>${LONG}</Stack>` };
+		const out = truncateToolIO(toolMsg("GenUI", input, LONG));
+		expect(out[0].toolCalls[0].inputJson).toEqual(input);
+		expect(out[0].toolCalls[0].outputJson._truncated).toBe(true);
+	});
 });
 
 describe("truncateToolIO — general behavior", () => {
