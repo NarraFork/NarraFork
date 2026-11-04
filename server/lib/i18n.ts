@@ -268,6 +268,11 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 		en: "Your previous response was cut off by the completion token limit. Please continue from where you left off.",
 		"zh-CN": "你上一条回复因 completion token 限制被截断，请从中断处继续。",
 	},
+	"tool.thinkingExhaustedContinue": {
+		en: "Your previous response spent its entire output budget on internal reasoning and produced no visible content. Do not resume or extend that reasoning: state the conclusion you already reached, or take the next concrete action now (answer text, a tool call, or a question).",
+		"zh-CN":
+			"你上一条回复把全部输出预算消耗在内部思考上，没有产生任何可见内容。不要再继续或延长那段思考：直接说出你已得出的结论，或立刻执行下一步具体动作（文本、工具调用或提问）。",
+	},
 	"tool.resumeAfterTransientError": {
 		en: "Your previous response was interrupted by a temporary connection issue. Please continue from where you left off.",
 		"zh-CN": "你上一条回复因临时网络问题被中断，请从中断处继续。",
@@ -853,6 +858,7 @@ export type ToolMessageKey =
 	| "skippedForPassEnd"
 	| "cancelledForInterrupt"
 	| "interruptionContinue"
+	| "thinkingExhaustedContinue"
 	| "resumeAfterTransientError"
 	| "userContinue"
 	| "toolLoaded"

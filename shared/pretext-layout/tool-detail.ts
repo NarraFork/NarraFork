@@ -3841,6 +3841,13 @@ function classifyWorkspace(
 				worktree?.path ?? args?.destinationPath,
 				worktree?.branch ?? args?.branchName ?? workspaceObject(args?.branch)?.name,
 			);
+			const worktreeSwitch = workspaceObject(result?.switch);
+			if (typeof worktreeSwitch?.switched === "boolean") {
+				const switched = worktreeSwitch.switched;
+				rows.push({ text: text(switched ? "workspaceChanged" : "workspaceUnchanged") });
+				const switchMessage = readLeafText(workspaceObject(worktreeSwitch.error)?.message);
+				if (!switched && switchMessage) rows.push({ text: switchMessage });
+			}
 			handled = ["created", "failed", "unknown"].includes(outcome ?? "");
 		}
 	} else if (toolName === "SwitchWorkingDirectory") {

@@ -822,6 +822,8 @@ export type AgentEvent =
 			};
 			ttftMs?: number;
 			durationMs?: number;
+			/** First persistable content → request end; absent when no content arrived. */
+			decodeMs?: number;
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;

@@ -486,6 +486,35 @@ describe("working-directory switch danger reflection", () => {
 		expect(classified.details).toContain("Requested working directory: /workspace/next");
 	});
 
+	test("worktree creation that also switches is classified like a workspace switch", () => {
+		const classified = classifyDanger(
+			"CreateWorktree",
+			{ branchName: "fix", destinationPath: "/workspace/.worktrees/fix", switchToWorktree: true },
+			"/workspace",
+			undefined,
+			[{ path: "/workspace", enabled: true, accessLevel: "full" }],
+			[],
+			true,
+		);
+		if (!classified) throw new Error("A combined create-and-switch must be classified");
+		expect(classified.severity).toBe("high");
+		expect(classified.details).toContain("Requested working directory: /workspace/.worktrees/fix");
+		for (const level of ["light", "standard", "strict"] as const)
+			expect(shouldTriggerDangerReflection(classified, level)).toBe(true);
+		// Creation alone keeps its ordinary classification: only the switch is new risk.
+		expect(
+			classifyDanger(
+				"CreateWorktree",
+				{ branchName: "fix", destinationPath: "/workspace/.worktrees/fix" },
+				"/workspace",
+				undefined,
+				[{ path: "/workspace", enabled: true, accessLevel: "full" }],
+				[],
+				true,
+			),
+		).toBeNull();
+	});
+
 	for (const permissionMode of ["default", "bypassPermissions"] as const) {
 		test.each([
 			"light",
@@ -545,6 +574,81 @@ describe("working-directory switch danger reflection", () => {
 			expect(await result.decision).toMatchObject({ behavior: "allow" });
 		});
 	}
+
+	// Folding the switch into creation must not become a cheaper path past the gates a
+	// separate SwitchWorkingDirectory call goes through.
+	test("a creation that also switches still needs approval, and still reflects in bypass", async () => {
+		const root = mkdtempSync(join(tmpdir(), "narrafork-worktree-switch-gate-"));
+		mkdirSync(join(root, ".worktrees"));
+		const createInput = {
+			branchName: "fix/new",
+			destinationPath: join(root, ".worktrees", "fix"),
+			switchToWorktree: true,
+		};
+		const cases = [
+			{ mode: "default" as const, level: "standard" as const, reflects: false },
+			{ mode: "bypassPermissions" as const, level: "standard" as const, reflects: true },
+			{ mode: "bypassPermissions" as const, level: "off" as const, reflects: false },
+		];
+		for (const [index, scenario] of cases.entries()) {
+			const id = `worktree-switch-gate-${index}`;
+			const callId = `${id}-call`;
+			const useId = `${id}-use`;
+			const target = frozenTarget(localBackend, {
+				cwd: root,
+				path: createInput.destinationPath,
+				selectionSource: "session_default",
+			});
+			await seedPermissionRequest({
+				narratorId: id,
+				messageId: `${id}-message`,
+				toolCallId: callId,
+				toolUseId: useId,
+				toolName: "CreateWorktree",
+				input: createInput,
+				permissionMode: scenario.mode,
+				executionDeviceId: "local",
+				executionCwd: root,
+				resolvedFilePath: createInput.destinationPath,
+				deviceSelectionSource: "session_default",
+			});
+			await db
+				.update(narrators)
+				.set({ dangerReflectionOverride: scenario.level })
+				.where(eq(narrators.id, id));
+			const permissionPromise = handlePermission(
+				id,
+				new AbortController().signal,
+				"CreateWorktree",
+				createInput,
+				useId,
+				root,
+				"en",
+				undefined,
+				{ executionBackend: localBackend, executionTarget: target },
+			);
+			if (scenario.mode === "default") {
+				// Reflection must not replace the human approval this write already needs.
+				await waitFor(() => pendingPermissions.has(callId));
+				expect(pendingDangerReflections.has(callId)).toBe(false);
+				expect(await resolvePermission(callId, "deny")).toBe(true);
+				expect(await permissionPromise).toMatchObject({ behavior: "deny" });
+				continue;
+			}
+			const result = await permissionPromise;
+			if (!scenario.reflects) {
+				expect(result.behavior).toBe("allow");
+				expect(pendingDangerReflections.has(callId)).toBe(false);
+				continue;
+			}
+			expect(result.behavior).toBe("dangerReflection");
+			if (result.behavior !== "dangerReflection") throw new Error("Expected reflection pause");
+			expect(
+				await confirmDangerReflection(callId, "The user asked for a new worktree to work in"),
+			).toBe(true);
+			expect(await result.decision).toMatchObject({ behavior: "allow" });
+		}
+	});
 });
 
 describe(".git internal review routing", () => {
