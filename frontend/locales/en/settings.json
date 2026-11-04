@@ -93,6 +93,7 @@
 		"toolModesHint": "Comma-separated, in priority order: anthropic_tool_addition, anthropic_deferred_tail, openai_additional_tools, kimi_system_tools, custom_injection. Empty disables; unset uses the model-name default.",
 		"priceNote": "USD per million tokens. 0 is free; blank is not zero. Reference estimates are not channel billing prices.",
 		"patchHint": "Only edited fields are saved. Inherit removes this level's override, not values from other levels.",
+		"protocolOnlyHint": "This dialog edits the protocol only; the connection identity and model metadata are no longer editable here.",
 		"protocol": "Protocol",
 		"protocolHint": "Applies to {{model}}; upstream is called with this protocol after saving.",
 		"protocolProviderLayer": "Provider setting",

@@ -243,8 +243,9 @@ export function ModelCatalogEditor({
 	const [modelId, setModelId] = useState(target.modelId ?? target.card?.modelId ?? "");
 	const [variantId, setVariantId] = useState(target.variantId ?? target.card?.variantId ?? "");
 	const [providerKey, setProviderKey] = useState(target.query?.providerKey ?? "");
-	const [providerId, setProviderId] = useState(target.query?.providerId ?? "");
-	const [channelId, setChannelId] = useState(target.query?.channelId ?? "");
+	// 「编辑此连接覆盖」只剩协议：连接范围与上游标识的输入框已注释，这两个 setter 暂时没有入口。
+	const [providerId, _setProviderId] = useState(target.query?.providerId ?? "");
+	const [channelId, _setChannelId] = useState(target.query?.channelId ?? "");
 	const [upstream, setUpstream] = useState(target.query?.upstreamModelId ?? "");
 	const [protocolDraft, setProtocolDraft] = useState<CustomApiProtocol | null>(
 		protocol?.value ?? null,
@@ -277,6 +278,12 @@ export function ModelCatalogEditor({
 		try {
 			// 协议不属于 catalog 快照，先单独落库；它没有 revision 冲突语义。
 			if (protocol && protocolChanged) await protocol.onSave(protocolDraft);
+			// 「编辑此连接覆盖」现在只保留协议：连接标识与模型资料不再从入口编辑，
+			// 也就不再需要 id/upstream 那些校验。
+			if (target.kind === "binding") {
+				onClose();
+				return;
+			}
 			const patch = buildCatalogPatch(edits);
 			if (!target.isNew) {
 				if (!patch) {
@@ -361,7 +368,7 @@ export function ModelCatalogEditor({
 				{target.kind === "model" && !target.isNew && (
 					<Alert>{t("catalog.affects", { count: affected })}</Alert>
 				)}
-				{target.isNew ? (
+				{target.isNew && target.kind !== "binding" ? (
 					<Stack gap="xs">
 						<TextInput
 							label={t("catalog.id")}
@@ -370,14 +377,12 @@ export function ModelCatalogEditor({
 							required
 							disabled={readOnly}
 						/>
-						{target.kind !== "binding" && (
-							<TextInput
-								label={t("catalog.name")}
-								value={name}
-								onChange={(e) => setName(e.currentTarget.value)}
-								disabled={readOnly}
-							/>
-						)}
+						<TextInput
+							label={t("catalog.name")}
+							value={name}
+							onChange={(e) => setName(e.currentTarget.value)}
+							disabled={readOnly}
+						/>
 						{target.kind !== "model" && (
 							<Select
 								label={t("catalog.model")}
@@ -393,6 +398,7 @@ export function ModelCatalogEditor({
 								disabled={readOnly}
 							/>
 						)}
+						{/*
 						{target.kind === "binding" && (
 							<Select
 								label={t("catalog.variant")}
@@ -407,6 +413,7 @@ export function ModelCatalogEditor({
 								disabled={readOnly}
 							/>
 						)}
+						*/}
 						{target.kind === "variant" && (
 							<TextInput
 								label={t("catalog.providerKey")}
@@ -425,6 +432,7 @@ export function ModelCatalogEditor({
 								disabled={readOnly}
 							/>
 						)}
+						{/*
 						{target.kind === "binding" && (
 							<>
 								<TextInput
@@ -441,10 +449,11 @@ export function ModelCatalogEditor({
 								/>
 							</>
 						)}
+						*/}
 					</Stack>
 				) : (
 					<Text size="sm" c="dimmed">
-						{t("catalog.patchHint")}
+						{target.kind === "binding" ? t("catalog.protocolOnlyHint") : t("catalog.patchHint")}
 					</Text>
 				)}
 				{protocol && (

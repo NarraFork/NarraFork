@@ -93,6 +93,7 @@
 		"toolModesHint": "按优先级用逗号分隔：anthropic_tool_addition、anthropic_deferred_tail、openai_additional_tools、kimi_system_tools、custom_injection。留空表示禁用；未设置时按模型名称取默认值。",
 		"priceNote": "美元 / 百万 token。0 表示免费，留空不等于零。参考估算不等于渠道实际计费。",
 		"patchHint": "只保存有操作的字段。恢复继承删除当前层覆盖，不删除其他层的值。",
+		"protocolOnlyHint": "这个入口只编辑协议；连接标识与模型资料不再从这里修改。",
 		"protocol": "协议",
 		"protocolHint": "作用于 {{model}}；保存后按该协议调用上游。",
 		"protocolProviderLayer": "供应商设置",
