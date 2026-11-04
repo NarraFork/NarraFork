@@ -1022,6 +1022,7 @@ function FileEditorDocument({
 		}
 		if (previewText === null) return;
 		let landed = false;
+		let written = Number.NaN;
 		let settleTimer: ReturnType<typeof setTimeout> | undefined;
 		const apply = () => {
 			if (previewJumpRef.current !== jump) return;
@@ -1032,6 +1033,7 @@ function FileEditorDocument({
 					: scrollTopForLine(collectPreviewAnchors(el, lineCount), jump.line);
 			if (top == null) return;
 			el.scrollTop = Math.max(0, top - el.clientHeight * jump.offset);
+			written = el.scrollTop;
 			if (landed) return;
 			landed = true;
 			settleTimer = setTimeout(finish, PREVIEW_JUMP_SETTLE_MS);
@@ -1044,7 +1046,13 @@ function FileEditorDocument({
 		const userIntent = (event: Event) => {
 			if (isScrollIntent(event)) finish();
 		};
+		// Any scroll the jump did not write itself (scrollbar drag, find-in-page,
+		// scripted restore) also hands the position back to whoever moved it.
+		const scrolled = () => {
+			if (landed && Math.abs(el.scrollTop - written) >= 1) finish();
+		};
 		for (const type of SCROLL_INTENT_EVENTS) el.addEventListener(type, userIntent, true);
+		el.addEventListener("scroll", scrolled, { passive: true });
 		// Nothing anchored (oversized or unparsable preview): the reference is only
 		// visible in source.
 		const giveUp = setTimeout(() => {
@@ -1058,9 +1066,15 @@ function FileEditorDocument({
 			clearTimeout(settleTimer);
 			observer.dispose();
 			for (const type of SCROLL_INTENT_EVENTS) el.removeEventListener(type, userIntent, true);
+			el.removeEventListener("scroll", scrolled);
 		};
 		apply();
-		return cleanup;
+		return () => {
+			cleanup();
+			// A landed jump is the reading position now. Hiding the panel or re-rendering
+			// the preview must restore that position, never replay the jump over it.
+			if (landed && previewJumpRef.current === jump) previewJumpRef.current = null;
+		};
 	}, [mode, visible, previewText, previewError, previewJumpRequest, workingCopy]);
 	// Resume the source at the line the previous mode was showing. Applied once now
 	// and again after Monaco's own deferred layout of the newly revealed view.
