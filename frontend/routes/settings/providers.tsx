@@ -928,8 +928,20 @@ function SettingsProvidersPage() {
 		for (const p of state.customApiProviders) ensureEmpty(p.prefix);
 		for (const p of state.nugProviders) ensureEmpty(p.prefix);
 
+		// 草稿里被删掉的供应商：服务端下发的模型分组仍带着它们的 prefix，卡片必须跟着消失，
+		// 否则「删除」在保存前看不到任何变化。放弃更改时 state 恢复，卡片自然回来。
+		const draftPrefixes = new Set(
+			[...state.customApiProviders, ...state.nugProviders].map((p) => p.prefix),
+		);
+		const draftRemoved = new Set(
+			[...savedProviderSnapshot.customApiProviders, ...savedProviderSnapshot.nugProviders]
+				.map((p) => p.prefix)
+				.filter((prefix) => prefix && !draftPrefixes.has(prefix)),
+		);
+
 		return (
 			[...byPrefix]
+				.filter(([prefix]) => !draftRemoved.has(prefix))
 				.map(([prefix, models]) => {
 					const plugin = pluginByPrefix.get(prefix);
 					// Plugin providers sit in the platform column: like the builtins they are single
