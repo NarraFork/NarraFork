@@ -6,32 +6,21 @@ import {
 } from "@frontend/hooks/useResizableNav";
 import type { AppShellProps } from "@mantine/core";
 import {
-	Anchor,
 	AppShell,
-	Badge,
 	Box,
 	Burger,
 	Button,
 	Center,
 	Group,
-	Indicator,
 	Loader,
 	Modal,
-	NavLink,
 	Text,
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
-import { IconAlertTriangle, IconArrowLeft, IconSettings } from "@tabler/icons-react";
+import { IconAlertTriangle, IconArrowLeft } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import {
-	Link,
-	Navigate,
-	Outlet,
-	useNavigate,
-	useRouter,
-	useRouterState,
-} from "@tanstack/react-router";
+import { Navigate, Outlet, useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLogout } from "../hooks/useAuth";
@@ -79,12 +68,9 @@ import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { RoutePendingIndicator } from "./common/RouteChunkErrorBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
-import { NavOverflowMenu } from "./nav/NavOverflowMenu";
+import { NavBottomBar } from "./nav/NavBottomBar";
 import { NavTopSection } from "./nav/NavTopSection";
-import { NavUserMenu } from "./nav/NavUserMenu";
-import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
-import { useNavBadges } from "./nav/use-nav-badges";
 import { NotificationBell } from "./notifications/NotificationBell";
 import { PluginPermissionRequestHost } from "./plugins-admin/PluginPermissionRequestHost";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
@@ -258,9 +244,6 @@ export function AuthenticatedLayout() {
 	// client even for rooms it has not subscribed to, so the count is correct without
 	// polling and without opening the conversation.
 	useChatUnreadLive();
-	// Every nav badge is resolved by one shared hook so a new badge key cannot be
-	// silently ignored by one of the two surfaces that paint the nav.
-	const resolveNavBadge = useNavBadges();
 	const legacyFastModeDefaultMigrationRef = useRef(false);
 
 	useEffect(() => {
@@ -386,7 +369,6 @@ export function AuthenticatedLayout() {
 		navigate({ to: "/settings/agent", hash: "request-evidence" });
 	};
 
-	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
 	// The Navbar's gutter for the three sides that are not the bottom edge. The bottom
 	// edge is owned by the `data-safe-area` spacer, which folds this same value into a
 	// `max()` against the inset instead of adding to it.
@@ -548,89 +530,13 @@ export function AuthenticatedLayout() {
 								<RecentTabList filter="narrator" />
 							</Box>
 						)}
-						<Box>
-							{navVisibleItems.map((item) => {
-								// "projects" is rendered in the top section above; settings is mandatory
-								// and rendered after this list. Skip them here.
-								if (item.id === "projects") return null;
-								const def = secondaryNavDefs.get(item.id);
-								if (!def) return null;
-								const Icon = def.icon;
-								const { count: badgeCount, label: badgeLabel } = resolveNavBadge(def.badge);
-								return (
-									<Tooltip
-										key={item.id}
-										label={t(def.labelKey)}
-										position="right"
-										disabled={!navCollapsed}
-									>
-										<NavLink
-											component={Link}
-											to={def.to}
-											label={navCollapsed ? undefined : t(def.labelKey)}
-											active={def.activePrefix ? pathname.startsWith(def.activePrefix) : undefined}
-											leftSection={
-												badgeCount > 0 && navCollapsed ? (
-													// Collapsed rail has no room for a right section — dot the icon instead.
-													<Indicator size={7} color="indigo" offset={2} withBorder>
-														<Icon size={16} />
-													</Indicator>
-												) : (
-													<Icon size={16} />
-												)
-											}
-											rightSection={
-												badgeCount > 0 && !navCollapsed ? (
-													<Badge size="sm" circle variant="filled" color="indigo">
-														{badgeLabel}
-													</Badge>
-												) : undefined
-											}
-										/>
-									</Tooltip>
-								);
-							})}
-							<Tooltip label={t("settings")} position="right" disabled={!navCollapsed}>
-								<NavLink
-									component={Link}
-									to="/settings"
-									label={navCollapsed ? undefined : t("settings")}
-									leftSection={<IconSettings size={16} />}
-								/>
-							</Tooltip>
-						</Box>
-						{navCollapsed ? (
-							<Group justify="center" mt={4} gap={4}>
-								<NavOverflowMenu
-									entries={navEntries}
-									onSaveLayout={saveNavLayout}
-									navCollapsed={navCollapsed}
-								/>
-								<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
-							</Group>
-						) : (
-							<Group gap={4} mt={4} wrap="nowrap" align="center" px={8} justify="space-between">
-								<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
-								<Text size="xs" c="dimmed" ta="center" style={{ flex: 1, minWidth: 0 }}>
-									v{__APP_VERSION__}
-									<Anchor
-										component={Link}
-										to="/licenses"
-										size="xs"
-										c="dimmed"
-										td="underline"
-										ml={8}
-									>
-										{t("licenses")}
-									</Anchor>
-								</Text>
-								<NavOverflowMenu
-									entries={navEntries}
-									onSaveLayout={saveNavLayout}
-									navCollapsed={navCollapsed}
-								/>
-							</Group>
-						)}
+						<NavBottomBar
+							collapsed={navCollapsed}
+							entries={navEntries}
+							visibleItems={navVisibleItems}
+							onSaveLayout={saveNavLayout}
+							onLogout={openLogout}
+						/>
 					</>
 				)}
 				{/*

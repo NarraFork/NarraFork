@@ -17,11 +17,19 @@ import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import { ActionIcon, Badge, Group, Menu, Text, Tooltip } from "@mantine/core";
 import { IconDots, IconGripVertical } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useMemo, useState } from "react";
+import { type ComponentType, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NAV_DIVIDER_ID, type NavLayoutEntry } from "../../hooks/useNavLayout";
 import { CUSTOMIZABLE_NAV_ITEMS, type NavItemDef } from "./nav-items";
 import { useNavBadges } from "./use-nav-badges";
+
+/** A destination the bottom bar had no room for. */
+export interface NavOverflowLink {
+	id: string;
+	labelKey: string;
+	to: string;
+	icon: ComponentType<{ size?: number | string }>;
+}
 
 interface NavOverflowMenuProps {
 	/** Flat ordered layout including the divider entry. */
@@ -29,6 +37,8 @@ interface NavOverflowMenuProps {
 	onSaveLayout: (entries: NavLayoutEntry[]) => void;
 	/** Whether the sidebar is collapsed (icon-only). */
 	navCollapsed: boolean;
+	/** Bottom-bar icons that did not fit; listed first, as plain links. */
+	overflowLinks?: NavOverflowLink[];
 }
 
 const ITEM_DEF_MAP = new Map<string, NavItemDef>(CUSTOMIZABLE_NAV_ITEMS.map((d) => [d.id, d]));
@@ -131,7 +141,12 @@ function SortableDivider() {
 	);
 }
 
-export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOverflowMenuProps) {
+export function NavOverflowMenu({
+	entries,
+	onSaveLayout,
+	navCollapsed,
+	overflowLinks = [],
+}: NavOverflowMenuProps) {
 	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
 	const [menuOpen, setMenuOpen] = useState(false);
@@ -179,7 +194,7 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 		<Menu
 			opened={menuOpen}
 			onChange={setMenuOpen}
-			position="right-start"
+			position={navCollapsed ? "right-end" : "top-end"}
 			withArrow
 			// The menu itself is the drop target — don't close on item click.
 			closeOnItemClick={false}
@@ -187,7 +202,7 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 			width={220}
 		>
 			<Menu.Target>
-				<Tooltip label={t("more")} position="right" disabled={menuOpen}>
+				<Tooltip label={t("more")} position={navCollapsed ? "right" : "top"} disabled={menuOpen}>
 					<ActionIcon
 						variant="subtle"
 						color="gray"
@@ -200,6 +215,26 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 				</Tooltip>
 			</Menu.Target>
 			<Menu.Dropdown>
+				{overflowLinks.length > 0 && (
+					<>
+						{overflowLinks.map((link) => {
+							const Icon = link.icon;
+							return (
+								<Menu.Item
+									key={link.id}
+									leftSection={<Icon size={14} />}
+									onClick={() => {
+										setMenuOpen(false);
+										navigate({ to: link.to });
+									}}
+								>
+									{t(link.labelKey)}
+								</Menu.Item>
+							);
+						})}
+						<Menu.Divider />
+					</>
+				)}
 				<DndContext
 					sensors={sensors}
 					collisionDetection={closestCenter}
