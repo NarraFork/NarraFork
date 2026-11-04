@@ -123,6 +123,8 @@
 	"folderErrorCount": "{{count}} 个出错",
 	"folderShowMore": "再显示 {{count}} 个",
 	"folderShowAll": "显示全部",
+	"folderMoreCount": "还有 {{count}} 个",
+	"folderShowFewer": "收起",
 	"folderShowLess": "只显示前 {{count}} 个",
 	"folderStripHint": "点击显示全部；上下拖动或用方向键，调整收起时显示的数量",
 	"pinInFolder": "在文件夹内置顶",

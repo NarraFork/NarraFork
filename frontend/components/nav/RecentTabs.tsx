@@ -74,7 +74,9 @@ import { RecentTabFolderEditModal } from "./RecentTabFolderEditModal";
 import {
 	RecentTabFolderHeader,
 	type RecentTabFolderHeaderProps,
+	RecentTabFolderPinDivider,
 	RecentTabFolderStrip,
+	recentTabFolderCardStyle,
 } from "./RecentTabFolderRows";
 import { RecentTabPinDivider, TabContextMenu } from "./RecentTabMenu";
 import {
@@ -954,8 +956,13 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 				previewDrag?.folderId === folder.id
 					? previewDrag.count
 					: (folder.folderPreviewCount ?? RECENT_TAB_FOLDER_DEFAULT_PREVIEW);
+			const firstUnpinned = view.visible.findIndex((member) => !member.pinned);
 			return (
-				<div key={tabSortId(folder)} data-folder-unit={folder.id}>
+				<div
+					key={tabSortId(folder)}
+					data-folder-unit={folder.id}
+					style={recentTabFolderCardStyle(folder.folderColor)}
+				>
 					<DraggableFolderHeader
 						folder={folder}
 						members={row.members}
@@ -967,18 +974,19 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						onSwipeMenu={handleSwipeMenu}
 						t={t}
 					/>
-					{view.visible.map((member) => (
-						<DraggableTabItem
-							key={tabSortId(member)}
-							tab={member}
-							active={isRowActive(member)}
-							onRemove={handleRemove}
-							onSwipeMenu={handleSwipeMenu}
-							onNavigate={onNavigate}
-							onContextMenu={handleContextMenu}
-							onPrefetch={prefetchNarratorTab}
-							indent
-						/>
+					{view.visible.map((member, index) => (
+						<React.Fragment key={tabSortId(member)}>
+							{index > 0 && index === firstUnpinned && <RecentTabFolderPinDivider />}
+							<DraggableTabItem
+								tab={member}
+								active={isRowActive(member)}
+								onRemove={handleRemove}
+								onSwipeMenu={handleSwipeMenu}
+								onNavigate={onNavigate}
+								onContextMenu={handleContextMenu}
+								onPrefetch={prefetchNarratorTab}
+							/>
+						</React.Fragment>
 					))}
 					{view.display !== "collapsed" && row.members.length > 0 && (
 						<RecentTabFolderStrip
@@ -1460,8 +1468,6 @@ interface TabItemBodyProps {
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	onPrefetch?: (tab: RecentTab) => void;
-	/** Folder member: indent the row so it reads as part of the folder above. */
-	indent?: boolean;
 	/** True while dnd-kit is dragging this row — suppresses the swipe-to-close gesture. */
 	isDragging?: boolean;
 	/** Outer wrapper ref (dnd-kit's `setNodeRef`, or nothing in the static case). */
@@ -1488,7 +1494,6 @@ function TabItemBody({
 	onNavigate,
 	onContextMenu,
 	onPrefetch,
-	indent,
 	isDragging = false,
 	outerRef,
 	outerStyle,
@@ -1601,7 +1606,6 @@ function TabItemBody({
 					onAuxClick={handleAuxClick}
 					onContextMenu={handleContextMenu}
 					{...swipe.handlers}
-					pl={indent ? "lg" : undefined}
 					label={<RecentTabTitle tab={tab} />}
 					leftSection={
 						<span
