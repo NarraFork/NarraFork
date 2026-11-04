@@ -525,40 +525,58 @@ function fixedPreview(): RevertScopePreviews {
 	});
 }
 
-describe("fixed plan external-write boundary", () => {
+function hasButton(label: string) {
+	return Array.from(document.body.querySelectorAll("button")).some(
+		(candidate) => candidate.textContent?.trim() === label,
+	);
+}
+
+describe("fixed plan review stays minimal", () => {
 	for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
-		test(`${language}: every available plan review warns about uncoordinated writes, including empty plans`, async () => {
+		test(`${language}: a ready plan shows no alert and no reload`, async () => {
 			await i18n.changeLanguage(language);
-			for (const empty of [false, true]) {
-				const data = fixedPreview();
-				if (empty) {
-					if (data.revertPlan) data.revertPlan.expectedFileCount = 0;
-					data.affectedFiles = [];
-					data.narratorScope = { available: true, files: [], conflicts: [] };
-				}
-				await render({ data, previewKey: "opening-1" });
-				expect(
-					button(empty ? props.confirmNoFilesLabel : props.confirmWithRevertLabel).disabled,
-				).toBe(false);
-				expect(document.body.textContent).toContain(locale.revertPlanExternalWritesWarning);
-			}
+			props.messagesOnlyLabel = locale.rollbackConfirmMessagesOnly;
+			await render({ data: fixedPreview(), previewKey: "opening-1", onReload: () => {} });
+			expect(button(props.confirmWithRevertLabel).disabled).toBe(false);
+			expect(button(props.messagesOnlyLabel).disabled).toBe(false);
+			expect(hasButton(locale.revertPlanReload)).toBe(false);
+			expect(document.body.querySelector(".mantine-Alert-root")).toBeNull();
+			// Local files carry no device badge.
+			expect(document.body.textContent).not.toContain("local");
+		});
+
+		test(`${language}: an empty plan offers only cancel and confirm`, async () => {
+			await i18n.changeLanguage(language);
+			props.messagesOnlyLabel = locale.rollbackConfirmMessagesOnly;
+			const data = fixedPreview();
+			if (data.revertPlan) data.revertPlan.expectedFileCount = 0;
+			data.affectedFiles = [];
+			data.narratorScope = { available: true, files: [], conflicts: [] };
+			await render({ data, previewKey: "opening-1", onReload: () => {} });
+			expect(button(props.confirmNoFilesLabel).disabled).toBe(false);
+			expect(hasButton(props.messagesOnlyLabel)).toBe(false);
+			expect(hasButton(locale.revertPlanReload)).toBe(false);
+			expect(document.body.querySelector(".mantine-Alert-root")).toBeNull();
+			await click(button(props.confirmNoFilesLabel));
+			expect(confirmations).toHaveLength(1);
+			expect(confirmations[0]?.skipRevert).toBe(false);
 		});
 
 		test(`${language}: legacy previews remain read-only`, async () => {
 			await i18n.changeLanguage(language);
 			await render({ data: completePreview({ revertPlan: undefined }) });
-			expect(document.body.textContent).not.toContain(locale.revertPlanExternalWritesWarning);
 			expect(document.body.querySelector("input[type=radio]")).toBeNull();
 		});
 
 		test(`${language}: a prepared partial plan explains that message history is kept`, async () => {
 			await i18n.changeLanguage(language);
+			props.messagesOnlyLabel = locale.rollbackConfirmMessagesOnly;
 			const data = fixedPreview();
 			if (data.revertPlan) data.revertPlan.coverageComplete = false;
 			await render({ data, previewKey: "opening-1" });
 			expect(document.body.textContent).toContain(locale.revertPlanIncompleteWarning);
-			expect(document.body.textContent).toContain(locale.revertPlanExternalWritesWarning);
 			expect(button(locale.revertPartialConfirm).disabled).toBe(false);
+			expect(hasButton(props.messagesOnlyLabel)).toBe(true);
 		});
 	}
 });
@@ -783,14 +801,20 @@ describe("fixed action preview HTTP flow", () => {
 		expect(requestsTo("/files")).toHaveLength(0);
 	});
 
-	test("reload revokes the ready plan before its replacement request returns", async () => {
+	test("a ready plan offers no reload; an unusable one does", async () => {
 		respond = normalResponse;
 		await renderAction();
+		expect(button(en.rollbackConfirmWithRevert).disabled).toBe(false);
+		expect(hasButton(en.revertPlanReload)).toBe(false);
+		respond = () =>
+			reply(preparedActionPreview({ expectedFileCount: FILE_CHANGE_LIMITS.revertFiles + 1 }));
+		pending = { messageId: "message-2", blockIndex: 1, blockId: "block-2" };
+		await renderAction();
+		assertUnavailable();
 		const replacement = deferredResponse();
 		respond = () => replacement.promise;
 		await click(button(en.revertPlanReload));
 		assertUnavailable();
-		expect(requestsTo("/revert-action-preview")).toHaveLength(2);
 		pending = null;
 		await renderAction();
 		expect(requests.at(-1)?.signal?.aborted).toBe(true);
@@ -975,7 +999,7 @@ describe("fixed plan apply and history-only branches", () => {
 			);
 			expect(requestsTo("/apply")[0].body).toEqual({ planHash: "hash-plan-1", action });
 			expect(button(props.messagesOnlyLabel).disabled).toBe(true);
-			expect(button(en.revertPlanReload).disabled).toBe(true);
+			expect(hasButton(en.revertPlanReload)).toBe(false);
 			expect(button(en.cancel).disabled).toBe(true);
 			apply.resolve(normalResponse(requestsTo("/apply")[0]));
 			await flush();
@@ -1280,15 +1304,13 @@ describe("explicit historical snapshot recovery", () => {
 		expect(requestsTo("/apply")[0]?.body?.acceptSnapshotRestore).toBe(true);
 	});
 
-	for (const change of ["target", "reopen", "reload"] as const) {
+	for (const change of ["target", "reopen"] as const) {
 		test(`${change} resets snapshot mode and consent`, async () => {
 			respond = snapshotResponse;
 			await renderAction();
 			await click(button(en.revertSnapshotRequest));
 			await acceptSnapshot();
-			if (change === "reload") {
-				await click(button(en.revertPlanReload));
-			} else if (change === "reopen") {
+			if (change === "reopen") {
 				const original = pending;
 				pending = null;
 				await renderAction();
