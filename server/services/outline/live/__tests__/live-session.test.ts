@@ -618,6 +618,110 @@ describe("task claims", () => {
 	});
 });
 
+describe("questions put to people", () => {
+	/** A page with a fact and a question put to `to` (asked by a session), and the session. */
+	async function questionPage(to: string) {
+		const session = generateId();
+		const r = await writeOutline(
+			{
+				spaceId: space.id,
+				ops: [
+					{ op: "insert", tempId: "p", parent: null, content: "Decisions" },
+					{ op: "insert", parent: { tempId: "p" }, content: "a fact" },
+					{
+						op: "insert",
+						parent: { tempId: "p" },
+						content: "Which format?",
+						ask: {
+							to: { kind: "human", id: to },
+							options: ["v1", "v2"],
+							recommend: { option: 2 },
+						},
+					},
+				],
+				actor: { kind: "agent", id: session },
+				narratorId: session,
+				responsibleUserId: owner,
+			},
+			{ question: { askerNarratorId: session, askerUserId: owner, askerToolCallId: null } },
+		);
+		const [pageId, fact, question] = r.results.map((x) => x.blockId) as [string, string, string];
+		return { pageId, fact, question, session };
+	}
+
+	test("a question is marked in the editor; its checkbox is refused; deleting it withdraws it and says so; undo brings the question back (review S9)", async () => {
+		const { pageId, fact, question } = await questionPage(owner);
+		const a = open(link(owner), pageId);
+		const b = open(link(writer), pageId);
+		await waitFor(() => a.ready && b.ready, 3000, "joined");
+		// The snapshot says which block is a question.
+		expect(kids(a, pageId).map((k) => [k.id, k.question === true])).toEqual([
+			[fact, false],
+			[question, true],
+		]);
+		// A question is answered, not ticked.
+		struct(a, [{ t: "k", id: question, task: " " }]);
+		await waitFor(() => a.stats.rejects === 1, 3000, "refused");
+		await settle();
+		expect((await outlineStore.getBlock(question))?.taskJson).toBeNull();
+		expect(a.visible.get(question)?.task ?? null).toBeNull();
+
+		// Deleting it withdraws it, and the editor is told so (it shows a notice).
+		const events: string[] = [];
+		a.on((event) => events.push(event));
+		struct(a, [{ t: "d", id: question }]);
+		expect(events).toContain("withdrew");
+		expect(a.withdrawnQuestions).toBe(1);
+		await settle(60);
+		expect((await outlineStore.getQuestions([question]))[0]?.state).toBe("withdrawn");
+		expect(b.visible.alive(question)).toBeUndefined();
+
+		// Undone: the question is back, open, still a question to everyone in the page.
+		a.undo();
+		await waitFor(() => b.visible.alive(question) !== undefined, 3000, "restored");
+		await settle(60);
+		expect((await outlineStore.getQuestions([question]))[0]?.state).toBe("open");
+		expect(a.visible.get(question)?.question).toBe(true);
+		expect(b.visible.get(question)?.question).toBe(true);
+		// The page still refuses its checkbox after the restore.
+		struct(b, [{ t: "k", id: question, task: " " }]);
+		await waitFor(() => b.stats.rejects === 1, 3000, "refused after the restore");
+		await settle();
+		expect((await outlineStore.getBlock(question))?.taskJson).toBeNull();
+		// A fact deleted says nothing of questions.
+		events.length = 0;
+		struct(a, [{ t: "d", id: fact }]);
+		expect(events).not.toContain("withdrew");
+	});
+
+	test("a question asked while the page is open arrives marked", async () => {
+		const { pageId } = await questionPage(owner);
+		const a = open(link(owner), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		const session = generateId();
+		const r = await writeOutline(
+			{
+				spaceId: space.id,
+				ops: [
+					{
+						op: "insert",
+						parent: { id: pageId },
+						content: "Ship on Friday?",
+						ask: { to: { kind: "human", id: owner }, recommend: { text: "yes" } },
+					},
+				],
+				actor: { kind: "agent", id: session },
+				narratorId: session,
+				responsibleUserId: owner,
+			},
+			{ question: { askerNarratorId: session, askerUserId: owner, askerToolCallId: null } },
+		);
+		const asked = r.results[0]?.blockId as string;
+		await waitFor(() => a.visible.alive(asked) !== undefined, 3000, "arrived");
+		expect(a.visible.get(asked)?.question).toBe(true);
+	});
+});
+
 describe("locks", () => {
 	test("taking a locked task's checkbox away is refused to a writer who may not unlock; a manager of the space may", async () => {
 		const r = await writeOutline({

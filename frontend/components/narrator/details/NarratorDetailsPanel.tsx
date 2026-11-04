@@ -28,6 +28,7 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { isSubagentModelInheritance } from "@shared/model-inheritance";
+import { formatTokensPerSecond } from "@shared/pretext-layout/turn-usage";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import {
 	IconChevronDown,
@@ -1046,6 +1047,13 @@ function NarratorDetailsContent({
 						{
 							label: t("details.stats.cacheReadTokens"),
 							value: formatStatNumber(usageStats?.totalCacheReadTokens),
+						},
+						{
+							label: t("details.stats.outputSpeed"),
+							value:
+								usageStats?.outputTokensPerSecond != null
+									? formatTokensPerSecond(usageStats.outputTokensPerSecond)
+									: "—",
 						},
 					]}
 				/>

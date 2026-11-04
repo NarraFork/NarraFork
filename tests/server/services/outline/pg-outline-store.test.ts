@@ -26,6 +26,7 @@ import {
 	type SpaceDump,
 } from "../../../../server/services/outline/__tests__/contract";
 import { OUTLINE_PENDING_CONTRACT } from "../../../../server/services/outline/__tests__/pending-contract";
+import { OUTLINE_QUESTION_CONTRACT } from "../../../../server/services/outline/__tests__/question-contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
 import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
@@ -134,6 +135,7 @@ describe("PostgreSQL outline store", () => {
 						).map((b) => ({
 							...b,
 							taskJson: task(b.taskJson),
+							askJson: (b.askJson ?? null) as OutlineVersionRow["askJson"],
 							authorKind: b.authorKind as "human" | "agent" | "system",
 						}));
 						const versions: OutlineVersionRow[] = [];
@@ -142,7 +144,12 @@ describe("PostgreSQL outline store", () => {
 								.select()
 								.from(pgSchema.outlineBlockVersions)
 								.where(inArray(pgSchema.outlineBlockVersions.blockId, ids));
-							for (const v of rows) versions.push({ ...v, taskJson: task(v.taskJson) });
+							for (const v of rows)
+								versions.push({
+									...v,
+									taskJson: task(v.taskJson),
+									askJson: (v.askJson ?? null) as OutlineVersionRow["askJson"],
+								});
 						}
 						const links = (
 							await pgDb
@@ -191,6 +198,7 @@ describe("PostgreSQL outline store", () => {
 						...OUTLINE_STORE_CONTRACT,
 						...OUTLINE_TASK_CONTRACT,
 						...OUTLINE_PENDING_CONTRACT,
+						...OUTLINE_QUESTION_CONTRACT,
 						...OUTLINE_READ_CONTRACT,
 					]) {
 						try {
@@ -218,6 +226,7 @@ describe("PostgreSQL outline store", () => {
 				OUTLINE_STORE_CONTRACT.length +
 					OUTLINE_TASK_CONTRACT.length +
 					OUTLINE_PENDING_CONTRACT.length +
+					OUTLINE_QUESTION_CONTRACT.length +
 					OUTLINE_READ_CONTRACT.length,
 			);
 		},

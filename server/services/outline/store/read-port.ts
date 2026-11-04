@@ -12,6 +12,7 @@
  */
 import type {
 	OutlineActorKind,
+	OutlineAskJson,
 	OutlineLinkKind,
 	OutlineLinkTargetKind,
 	OutlineTaskJson,
@@ -26,6 +27,8 @@ export interface OutlineStructureRow {
 	orderKey: string;
 	alias: string | null;
 	taskJson: OutlineTaskJson | null;
+	/** A question put to a person; process like a task (design §2.1). Absent: none. */
+	askJson?: OutlineAskJson | null;
 	/** `from_seq` of the version this row comes from (the block's `version_seq` when current). */
 	versionSeq: number;
 }

@@ -169,6 +169,33 @@ export async function narratorUsersWith(
 	return out;
 }
 
+/**
+ * Whether the person may read a session, memoized for one request: a session is named by its
+ * title only to people who may read it (P2 PR 6 review S-5, applied everywhere the outline shows a
+ * session title). Admins read every session.
+ */
+export function narratorVisibility(
+	principal: OutlinePrincipal,
+): (narratorId: string) => Promise<boolean> {
+	const memo = new Map<string, Promise<boolean>>();
+	return (narratorId) => {
+		let verdict = memo.get(narratorId);
+		if (!verdict) {
+			verdict = (async () => {
+				if (!narratorId || !principal.userId) return false;
+				if (principal.isAdmin) return true;
+				const narrator = await readNarrator(narratorId);
+				return (
+					narrator !== null &&
+					(await narratorUsersWith(narrator, [principal.userId], "read")).has(principal.userId)
+				);
+			})();
+			memo.set(narratorId, verdict);
+		}
+		return verdict;
+	};
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Per person
 // ─────────────────────────────────────────────────────────────────────────────

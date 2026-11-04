@@ -507,3 +507,16 @@ async function wakeIfIdle(
 		return false;
 	}
 }
+
+/**
+ * Wake an idle narrator for content a producer already delivered: a retry that finds its row
+ * written (a crash came between the write and the wake) still owes the wake. Same gating and
+ * failure handling as `schedule: "wakeIfIdle"`; an already running or busy narrator is left be.
+ */
+export async function wakeIdleAfterDelivery(
+	narratorId: string,
+	locale: Locale,
+	executionPrincipal?: QuestionExecutionPrincipal,
+): Promise<boolean> {
+	return await wakeIfIdle(narratorId, locale, executionPrincipal);
+}

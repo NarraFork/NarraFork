@@ -59,6 +59,7 @@ import {
 	KNOWLEDGE_MERGE_ACTION_SET,
 } from "../lib/agent/tools/knowledge-actions";
 import {
+	OUTLINE_ASK_TOOL,
 	OUTLINE_EDIT_TOOL,
 	OUTLINE_READ_TOOL,
 	OUTLINE_SEARCH_TOOL,
@@ -837,6 +838,8 @@ export function resolvePermissionDecision(
 	// person's write permission, and in read-only and strict plan mode only the session's own
 	// space. Under bypassPermissions the danger classification below still applies.
 	if (toolName === OUTLINE_EDIT_TOOL) return "allow";
+	// A question put to a person writes one block under the task (outline P2 PR 7).
+	if (toolName === OUTLINE_ASK_TOOL) return "allow";
 
 	const planFileCandidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
@@ -2927,6 +2930,30 @@ function classifyToolDanger(
 				`Current working directory: ${cwd}`,
 				`Requested device: ${String(target?.deviceId ?? "unknown")}`,
 				`Requested working directory: ${String(target?.cwd ?? "unknown")}`,
+			],
+			"high",
+		);
+	}
+
+	// Folding the switch into creation must not lose the workspace-change review that
+	// a separate SwitchWorkingDirectory call would have triggered.
+	if (
+		(toolName === "CreateWorktree" || toolName === "AttachWorktree") &&
+		input.switchToWorktree === true
+	) {
+		return danger(
+			"Creating a worktree also switches the narrator's execution workspace.",
+			[
+				"Subsequent tools use the new worktree as working directory, with its own skills and permission context.",
+				"Existing background tools, subagents and terminals keep their original targets after the switch.",
+			],
+			[
+				"Verify the destination worktree matches the user's requested workspace.",
+				"Omit switchToWorktree to create the worktree without changing the working directory.",
+			],
+			[
+				`Current working directory: ${cwd}`,
+				`Requested working directory: ${String(input.destinationPath ?? "unknown")}`,
 			],
 			"high",
 		);

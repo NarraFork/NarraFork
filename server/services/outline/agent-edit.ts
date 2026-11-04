@@ -1473,6 +1473,7 @@ function rowNode(row: OutlineBlockRow, tags: string[]): OutlineNode {
 		orderKey: row.orderKey,
 		alias: row.alias,
 		task: row.taskJson,
+		ask: row.askJson,
 		versionSeq: row.versionSeq,
 		parent: null,
 		children: [],

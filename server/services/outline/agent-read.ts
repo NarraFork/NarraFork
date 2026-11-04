@@ -222,6 +222,7 @@ function pageNode(meta: OutlineBlockMeta): OutlineNode {
 		orderKey: meta.orderKey,
 		alias: meta.alias,
 		task: meta.taskJson,
+		ask: meta.askJson,
 		versionSeq: meta.versionSeq,
 		parent: null,
 		children: [],

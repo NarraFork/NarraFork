@@ -14,6 +14,7 @@ export function seedBlocksOf(read: OutlineBlockViewResponse): SeedBlock[] {
 		sid: b.sid,
 		content: b.content,
 		task: b.task ? LIVE_TASK_OF_STATUS[b.task.status] : null,
+		question: !!b.question,
 		childIds: b.childIds,
 	}));
 }

@@ -33,7 +33,7 @@ import {
 } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
-import { OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
+import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
 import type { ToolDefinition } from "../../lib/agent/types";
@@ -1113,6 +1113,8 @@ export async function runAgentLoopUnlocked(
 				if (tool.name === "SwitchDevice")
 					return turnSessionDevices.some((device) => device.online) || !!active._defaultDeviceId;
 				if (tool.name === "TransferFile") return turnSessionDevices.some((device) => device.online);
+				// Questions live under outline tasks: offered where OutlineEdit is a core tool.
+				if (tool.name === OUTLINE_ASK_TOOL) return outlineEditCore;
 				if (tool.name.startsWith("mcp__")) {
 					const server = settings.mcpServers?.find(
 						(item) => item.id === tool.metadata?.mcpServerId,
