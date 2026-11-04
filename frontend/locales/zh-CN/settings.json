@@ -2769,5 +2769,45 @@
 		}
 	},
 	"encryptSecrets": "加密凭据文件",
-	"encryptSecretsDesc": "订阅登录和密钥文件（如 codex-credentials.json）用 NarraFork 数据目录下 secret.key 中的密钥加密保存。它防的是凭据文件被单独拷走（备份、同步盘、误分享）；能读取整个数据目录的人仍可解密。关闭后文件会改写为明文 JSON。"
+	"encryptSecretsDesc": "订阅登录和密钥文件（如 codex-credentials.json）用 NarraFork 数据目录下 secret.key 中的密钥加密保存。它防的是凭据文件被单独拷走（备份、同步盘、误分享）；能读取整个数据目录的人仍可解密。关闭后文件会改写为明文 JSON。",
+	"credentialTransfer": {
+		"title": "凭据迁移",
+		"desc": "把订阅登录和密钥搬到另一台 NarraFork。导出文件用你设定的口令加密；导出前需要验证密码和两步验证。",
+		"export": "导出凭据…",
+		"import": "导入凭据…",
+		"exportTitle": "导出凭据",
+		"selectAll": "全部凭据（{{count}}）",
+		"none": "没有可导出的凭据。",
+		"archived": "已归档",
+		"kinds": {
+			"codex": "Codex"
+		},
+		"passphrase": "口令",
+		"passphraseHint": "至少 {{min}} 个字符。导入时需要它，遗忘后无法找回。",
+		"passphraseConfirm": "再次输入口令",
+		"passphraseMismatch": "两次输入的口令不一致。",
+		"rotationWarning": "OAuth 登录会轮换刷新令牌。两台服务器同时使用同一账号时，其中一台会被登出——在新服务器导入后，请在这里停用或归档它。",
+		"verify": "验证身份",
+		"password": "账号密码",
+		"methods": {
+			"totp": "验证器动态码",
+			"backup_code": "备用码",
+			"passkey": "通行密钥"
+		},
+		"code": "验证码",
+		"passkeyHint": "导出时浏览器会请求通行密钥。",
+		"exportButton": "验证并导出",
+		"exported": "已导出 {{count}} 个凭据。",
+		"importTitle": "导入凭据",
+		"importPassphrase": "导出时设定的口令",
+		"preview": "打开文件",
+		"exportedAt": "导出于 {{time}}",
+		"statusNew": "新增",
+		"statusExists": "本机已有",
+		"statusUnsupported": "本机不支持",
+		"replace": "覆盖",
+		"importButton": "导入所选（{{count}}）",
+		"imported": "新增 {{added}} 个，覆盖 {{replaced}} 个，跳过 {{skipped}} 个。",
+		"cancel": "取消"
+	}
 }

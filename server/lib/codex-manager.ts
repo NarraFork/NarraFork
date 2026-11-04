@@ -578,6 +578,39 @@ function createAgentIdentityCredentialFromImport(
 	};
 }
 
+/**
+ * A stored or transferred credential, with tokens read from either field spelling and
+ * identity filled in from the access token. Null when it carries nothing usable.
+ */
+function normalizeStoredCredential(c: unknown): CodexCredential | null {
+	if (!c || typeof c !== "object") return null;
+	const credential = c as CodexCredential;
+	credential.refreshToken = getRefreshToken(credential);
+	credential.accessToken = getAccessToken(credential);
+
+	const isAgentIdentity =
+		getCodexAuthMode(credential) === "agent_identity" &&
+		!!normalizeOptionalString(credential.agentRuntimeId) &&
+		!!normalizeOptionalString(credential.agentPrivateKey);
+	// Agent Identity credentials carry no refresh/access token; keep them as-is.
+	if (!isAgentIdentity && !credential.refreshToken && !credential.accessToken) return null;
+	if (
+		!isAgentIdentity &&
+		credential.accessToken &&
+		(!credential.accountId || !credential.sub || !credential.email)
+	) {
+		const info = extractCodexTokenInfo({ accessToken: credential.accessToken });
+		credential.accountId ??= info.accountId;
+		credential.email ??= info.email;
+		credential.sub ??= info.sub;
+	}
+	credential.email ??= extractEmailFromString(credential.displayName);
+	if (isSerializedCodexCredentialLabel(credential.displayName)) {
+		credential.displayName = firstOptionalString(credential.email, credential.accountId);
+	}
+	return credential;
+}
+
 function createCredentialFromImport(
 	input: CodexImportCredentialInput,
 	defaultPriority: number,
@@ -2365,6 +2398,97 @@ export class CodexManager {
 		return { added, duplicates, skipped };
 	}
 
+	// ==================== Transfer ====================
+
+	/** Credentials as they travel in an export bundle: login, settings and identity, no runtime state. */
+	exportForTransfer(ids?: readonly string[]): CodexCredential[] {
+		const wanted = ids ? new Set(ids) : null;
+		return this.entries
+			.filter((entry) => !wanted || wanted.has(entry.id))
+			.map((entry) => {
+				const { usage: _u, usageHistory: _h, quotaResetsAt: _q, ...rest } = structuredClone(entry);
+				// Failure counts and exhausted quota belong to this instance; a manual stop or a
+				// ban is a fact about the account and travels with it.
+				if (rest.disabledReason !== "manual" && rest.disabledReason !== "banned") {
+					rest.disabled = false;
+					delete rest.disabledReason;
+				}
+				return rest;
+			});
+	}
+
+	/** For each incoming credential: its label and the id of the same account here, if any. */
+	matchForTransfer(raw: readonly unknown[]): Array<{ label: string; existingId?: string } | null> {
+		return raw.map((item) => {
+			const credential = normalizeStoredCredential(structuredClone(item));
+			if (!credential) return null;
+			const keys = new Set(getCredentialDedupeKeys(credential));
+			const existing = this.entries.find((entry) =>
+				getCredentialDedupeKeys(entry).some((key) => keys.has(key)),
+			);
+			return {
+				label: credential.displayName ?? credential.email ?? credential.accountId ?? credential.id,
+				existingId: existing?.id,
+			};
+		});
+	}
+
+	/**
+	 * Add or replace credentials from a bundle. `decide` sees each usable item with the id
+	 * of the same account here; a replaced entry keeps its local id, priority and stats.
+	 */
+	importFromTransfer(
+		raw: readonly unknown[],
+		decide: (index: number, existingId: string | undefined) => "add" | "replace" | "skip",
+	): { added: number; replaced: number; skipped: number } {
+		if (this.credentialsUnreadable) {
+			throw new Error("Codex credentials on this server could not be read; nothing was imported");
+		}
+		const result = { added: 0, replaced: 0, skipped: 0 };
+		const touched: string[] = [];
+		raw.forEach((item, index) => {
+			const credential = normalizeStoredCredential(structuredClone(item));
+			if (!credential) {
+				result.skipped++;
+				return;
+			}
+			const keys = new Set(getCredentialDedupeKeys(credential));
+			const existing = this.entries.find((entry) =>
+				getCredentialDedupeKeys(entry).some((key) => keys.has(key)),
+			);
+			const action = decide(index, existing?.id);
+			if (action === "skip" || (action === "add" && existing)) {
+				result.skipped++;
+				return;
+			}
+			if (action === "replace" && existing) {
+				const next = { ...credential, id: existing.id, priority: existing.priority };
+				this.entries[this.entries.indexOf(existing)] = next;
+				touched.push(next.id);
+				result.replaced++;
+				return;
+			}
+			if (!credential.id || this.entries.some((entry) => entry.id === credential.id)) {
+				credential.id = generateShortId();
+			}
+			credential.priority = this.entries.length;
+			credential.disabled ??= false;
+			this.entries.push(credential);
+			this.stats.set(credential.id, { successCount: 0, failureCount: 0 });
+			touched.push(credential.id);
+			result.added++;
+		});
+		if (touched.length === 0) return result;
+		if (!this.entries.some((entry) => entry.id === this.currentId)) {
+			this.currentId = this.entries[0]?.id ?? "";
+		}
+		this.saveCredentials();
+		codexUsageQueue.enqueueMany(touched);
+		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
+		return result;
+	}
+
 	// ==================== Persistence ====================
 
 	private loadCredentials(): void {
@@ -2387,34 +2511,8 @@ export class CodexManager {
 
 			const seen = new Set<string>();
 			for (const c of raw) {
-				if (!c || typeof c !== "object") continue;
-				const credential = c as CodexCredential;
-				credential.refreshToken = getRefreshToken(credential);
-				credential.accessToken = getAccessToken(credential);
-
-				const isAgentIdentity =
-					getCodexAuthMode(credential) === "agent_identity" &&
-					!!normalizeOptionalString(credential.agentRuntimeId) &&
-					!!normalizeOptionalString(credential.agentPrivateKey);
-				if (isAgentIdentity) {
-					// Agent Identity credentials carry no refresh/access token; keep them as-is.
-				} else if (!credential.refreshToken && !credential.accessToken) {
-					continue;
-				}
-				if (
-					!isAgentIdentity &&
-					credential.accessToken &&
-					(!credential.accountId || !credential.sub || !credential.email)
-				) {
-					const info = extractCodexTokenInfo({ accessToken: credential.accessToken });
-					credential.accountId ??= info.accountId;
-					credential.email ??= info.email;
-					credential.sub ??= info.sub;
-				}
-				credential.email ??= extractEmailFromString(credential.displayName);
-				if (isSerializedCodexCredentialLabel(credential.displayName)) {
-					credential.displayName = firstOptionalString(credential.email, credential.accountId);
-				}
+				const credential = normalizeStoredCredential(c);
+				if (!credential) continue;
 
 				const keys = getCredentialDedupeKeys(credential);
 				if (keys.length === 0 || keys.some((key) => seen.has(key))) continue;

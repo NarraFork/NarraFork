@@ -26,6 +26,7 @@ import {
 	passkeyRegisterSchema,
 	passkeyRenameSchema,
 	registerSchema,
+	stepUpSchema,
 	totpActivateSchema,
 	totpDisableSchema,
 	updateGitIdentitySchema,
@@ -43,6 +44,7 @@ import { mfaService } from "../services/mfa-service";
 import { passkeyService } from "../services/passkey-service";
 import { registrationAccountStore } from "../services/registration/store";
 import { ssoService } from "../services/sso-service";
+import { stepUpMethods, stepUpPasskeyOptions, verifyStepUp } from "../services/step-up-service";
 
 export const authRoutes = new Hono();
 
@@ -591,4 +593,32 @@ authRoutes.delete("/me/identities/:id", requireSessionAuth, async (c) => {
 	if (!ok) throw new AppError("Identity not found", 404, "NOT_FOUND");
 	logger.info("SSO identity unlinked", { userId: payload.sub });
 	return c.json({ ok: true });
+});
+
+// === Step-up verification (password + second factor before a high-risk action) ===
+
+/** Second factors the current user can step up with; empty means none is enrolled. */
+authRoutes.get("/step-up/methods", requireSessionAuth, async (c) => {
+	return c.json({ methods: await stepUpMethods(c.get("user").sub) });
+});
+
+authRoutes.post("/step-up/passkey/options", requireSessionAuth, async (c) => {
+	return c.json(await stepUpPasskeyOptions(c.get("user").sub, c.req.header("origin")));
+});
+
+/** Returns a single-use grant for `purpose`, valid for five minutes in this session. */
+authRoutes.post("/step-up", requireSessionAuth, async (c) => {
+	const parsed = stepUpSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	const user = c.get("user");
+	if (!user.sid) throw new AppError("A signed-in session is required", 401, "STEP_UP_REQUIRED");
+	return c.json(
+		await verifyStepUp({
+			...parsed.data,
+			userId: user.sub,
+			sessionId: user.sid,
+			sourceIp: getClientIp(c),
+			originHeader: c.req.header("origin"),
+		}),
+	);
 });

@@ -2769,5 +2769,45 @@
 		}
 	},
 	"encryptSecrets": "Encrypt credential files",
-	"encryptSecretsDesc": "Stores subscription logins and keys (such as codex-credentials.json) encrypted with a key in secret.key in the NarraFork data folder. This protects a credential file that is copied on its own, like a backup or a synced folder; it does not protect against someone who can read the whole data folder. Turning it off rewrites the files as plain JSON."
+	"encryptSecretsDesc": "Stores subscription logins and keys (such as codex-credentials.json) encrypted with a key in secret.key in the NarraFork data folder. This protects a credential file that is copied on its own, like a backup or a synced folder; it does not protect against someone who can read the whole data folder. Turning it off rewrites the files as plain JSON.",
+	"credentialTransfer": {
+		"title": "Credential transfer",
+		"desc": "Move subscription logins and keys to another NarraFork. Exports are sealed with a passphrase you choose; exporting asks for your password and a second factor.",
+		"export": "Export credentials…",
+		"import": "Import credentials…",
+		"exportTitle": "Export credentials",
+		"selectAll": "All credentials ({{count}})",
+		"none": "There are no credentials to export.",
+		"archived": "Archived",
+		"kinds": {
+			"codex": "Codex"
+		},
+		"passphrase": "Passphrase",
+		"passphraseHint": "At least {{min}} characters. It is needed to import the file and cannot be recovered.",
+		"passphraseConfirm": "Repeat passphrase",
+		"passphraseMismatch": "The passphrases do not match.",
+		"rotationWarning": "OAuth logins rotate their refresh token. If both servers keep using the same account, one of them will be signed out — stop or archive it here after importing elsewhere.",
+		"verify": "Confirm it's you",
+		"password": "Account password",
+		"methods": {
+			"totp": "Authenticator code",
+			"backup_code": "Backup code",
+			"passkey": "Passkey"
+		},
+		"code": "Code",
+		"passkeyHint": "Your browser will ask for the passkey when you export.",
+		"exportButton": "Verify and export",
+		"exported": "Exported {{count}} credentials.",
+		"importTitle": "Import credentials",
+		"importPassphrase": "Passphrase used at export",
+		"preview": "Open file",
+		"exportedAt": "Exported {{time}}",
+		"statusNew": "New",
+		"statusExists": "Already here",
+		"statusUnsupported": "Not supported here",
+		"replace": "Replace",
+		"importButton": "Import selected ({{count}})",
+		"imported": "Added {{added}}, replaced {{replaced}}, skipped {{skipped}}.",
+		"cancel": "Cancel"
+	}
 }

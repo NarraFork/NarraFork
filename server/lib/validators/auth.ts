@@ -174,6 +174,15 @@ export const passkeyMfaVerifySchema = z.object({
 	response: webauthnResponseSchema,
 });
 
+/** Re-verify password + a second factor before a high-risk action. */
+export const stepUpSchema = z.object({
+	purpose: z.enum(["credentials.export"]),
+	password: z.string().min(1).max(200),
+	method: z.enum(["totp", "backup_code", "passkey"]),
+	code: z.string().trim().min(1).max(20).optional(),
+	response: webauthnResponseSchema.optional(),
+});
+
 /** Rename a passkey. */
 export const passkeyRenameSchema = z.object({
 	name: z.string().trim().min(1).max(60),
