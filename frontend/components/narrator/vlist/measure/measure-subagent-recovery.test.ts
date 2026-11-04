@@ -204,7 +204,7 @@ describe("measureSubagentRecovery", () => {
 
 describe("chrome constants", () => {
 	it("derive from the shared pretext font metrics", () => {
-		expect(C.XS_LINE_HEIGHT).toBe(17); // round(12 × 1.4)
+		expect(C.XS_LINE_HEIGHT_BASELINE).toBe(17); // round(12 × 1.4)
 		expect(C.CARD_PADDING).toBe(12); // Paper p="sm"
 		expect(C.RESOLVED_PADDING).toBe(10); // Paper p="xs"
 		expect(C.STACK_GAP).toBe(10); // Stack gap="xs"

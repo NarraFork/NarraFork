@@ -95,8 +95,8 @@ describe("Stage 4 constant corrections (chunk-parity)", () => {
 		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
 		const { lineBoxHeight } = await import("../pretext-fonts");
 		// 11 × 1.55 = 17.05 → 17 (was 12 × 1.55 = 19 before the fix).
-		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT).toBe(lineBoxHeight(11, 1.55));
-		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT).toBe(17);
+		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT_BASELINE).toBe(lineBoxHeight(11, 1.55));
+		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT_BASELINE).toBe(17);
 	});
 
 	it("code box vertical padding folds the 1px border into xs padding (11 per side)", async () => {

@@ -156,18 +156,18 @@ import { MEASURE_MARKDOWN_CODE_PADDING } from "./measure-markdown";
 import {
 	ALERT_STACK_GAP,
 	CUSTOM_ANSWER_FONT,
-	CUSTOM_ANSWER_LINE_HEIGHT,
+	CUSTOM_ANSWER_LINE_HEIGHT_BASELINE,
 	HEADER_FONT,
-	HEADER_LINE_HEIGHT,
+	HEADER_LINE_HEIGHT_BASELINE,
 	type InlinePermissionData,
 	type MeasuredInlinePermission,
 	measureInlinePermission,
 	OPTION_DESC_FONT,
-	OPTION_DESC_LINE_HEIGHT,
+	OPTION_DESC_LINE_HEIGHT_BASELINE,
 	OPTION_DESC_MARGIN_TOP,
 	OPTION_INDENT,
 	OPTION_LABEL_FONT,
-	OPTION_LABEL_LINE_HEIGHT,
+	OPTION_LABEL_LINE_HEIGHT_BASELINE,
 	OPTIONS_GAP,
 	QUESTION_STACK_GAP,
 } from "./measure-permission";
@@ -286,7 +286,7 @@ export const CARD_HEADER_INNER_ICON = 9;
  *
  * Baseline only — measurement and paint must call {@link headerRowHeight}.
  */
-export const HEADER_TEXT_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 19
+export const HEADER_TEXT_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 19
 /**
  * Header row height at NEUTRAL typography: the taller of the icon lane (14) vs the text line (19).
  *
@@ -296,7 +296,7 @@ export const HEADER_TEXT_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEI
  * and the drill morph then animated between two geometries that no longer described the
  * same line.
  */
-export const HEADER_ROW_HEIGHT = Math.max(HEADER_CATEGORY_ICON, HEADER_TEXT_LINE_HEIGHT); // 19
+export const HEADER_ROW_HEIGHT = Math.max(HEADER_CATEGORY_ICON, HEADER_TEXT_LINE_HEIGHT_BASELINE); // 19
 
 /**
  * Card-header row height at the reader's current typography.
@@ -324,7 +324,10 @@ export const DETAIL_BODY_FONT_SIZE = 11;
  * wrapped line drifts 0.4px from the box this constant reserved and a 15-line
  * body overflows by 6px — clipped silently, because the box is height-fixed.
  */
-export const DETAIL_CONTENT_LINE_HEIGHT = lineBoxHeight(DETAIL_BODY_FONT_SIZE, LINE_HEIGHT.xs);
+export const DETAIL_CONTENT_LINE_HEIGHT_BASELINE = lineBoxHeight(
+	DETAIL_BODY_FONT_SIZE,
+	LINE_HEIGHT.xs,
+);
 /** detailContentLineHeight() at the reader's typography (baseline above). */
 export function detailContentLineHeight(): number {
 	return scaledLineBoxHeight(DETAIL_BODY_FONT_SIZE, LINE_HEIGHT.xs);
@@ -346,7 +349,7 @@ export function detailBodyFontSize(): number {
 	return scaleFontSize(DETAIL_BODY_FONT_SIZE);
 }
 /** Detail section label ("Input"/"Output", Text size="xs") line box: 12×1.4 = 17. */
-export const DETAIL_LABEL_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const DETAIL_LABEL_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Detail section label `mb={2}`. */
 export const DETAIL_LABEL_MARGIN_BOTTOM = 2;
 /**
@@ -356,7 +359,7 @@ export const DETAIL_LABEL_MARGIN_BOTTOM = 2;
  * which would silently clip (or under-fill) the body the day either part of the
  * label chrome moved.
  */
-export const DETAIL_LABEL_CHROME_Y = DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM; // 19
+export const DETAIL_LABEL_CHROME_Y = DETAIL_LABEL_LINE_HEIGHT_BASELINE + DETAIL_LABEL_MARGIN_BOTTOM; // 19
 /** Generic detail: `mt="xs"` gap before the output section. */
 export const GENERIC_SECTION_GAP = SPACING.xs; // 10
 
@@ -414,7 +417,7 @@ export const DETAIL_MARKDOWN_PREFIX_MAX_CHARS = 32 * 1024;
 export const DETAIL_SOURCE_LINE_MARGIN_BOTTOM = 4;
 
 /** Shared xs text line box (measured detail bodies): 12×1.4 = 17. */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 
 /** SpecTasks: List `size="xs"` icon (ThemeIcon 16) + its label offset. */
 export const SPEC_TASK_ICON = 16;
@@ -446,7 +449,7 @@ export const SPEC_TASK_EMPTY_HEIGHT =
 /** Structured (recall/send/pipeline/web-search) badge header row (Badge xs). */
 export const STRUCT_BADGE_ROW = 16;
 /** Structured body line box (xs text). */
-export const STRUCT_BODY_LINE_HEIGHT = XS_LINE_HEIGHT; // 17
+export const STRUCT_BODY_LINE_HEIGHT_BASELINE = XS_LINE_HEIGHT_BASELINE; // 17
 /** Structured: gap between the badge header and the first body line. */
 export const STRUCT_BADGE_GAP = 4;
 
@@ -494,14 +497,14 @@ export const ENTRY_SNIPPET_MAX_LINES = 3;
 
 // ── Grouped-card chrome ──────────────────────────────────────────────────────
 /** Group header text line box at NEUTRAL typography (Mantine `<Text size="xs">` → xs 1.4 = 17). */
-export const GROUP_HEADER_TEXT_LINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const GROUP_HEADER_TEXT_LINE_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Group header ThemeIcon size={16}. */
 export const GROUP_HEADER_ICON = 16;
 /**
  * Group header row at NEUTRAL typography: max(icon 16, badge 16, xs text 17, chevron 12) = 17.
  * Baseline only — measure/paint read {@link groupHeaderRowHeight}.
  */
-export const GROUP_HEADER_ROW = Math.max(GROUP_HEADER_ICON, GROUP_HEADER_TEXT_LINE); // 17
+export const GROUP_HEADER_ROW = Math.max(GROUP_HEADER_ICON, GROUP_HEADER_TEXT_LINE_BASELINE); // 17
 
 /** Group-header row height at the reader's current typography (xs line scales; icons do not). */
 export function groupHeaderRowHeight(): number {
@@ -1470,7 +1473,7 @@ function metaRowBlocks(row: ToolMetaRow, marginTop: number): PreparedBlock[] {
 			makeInline(
 				row.text,
 				row.mono ? typographyMetrics().font.xsMono : typographyMetrics().font.xs,
-				XS_LINE_HEIGHT,
+				XS_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-meta-row",
@@ -1536,7 +1539,7 @@ function entryBlocks(
 		makeInline(
 			entry.title.length > 0 ? entry.title : " ",
 			DETAIL_TEXT_FONT,
-			XS_LINE_HEIGHT,
+			XS_LINE_HEIGHT_BASELINE,
 			0,
 			nextMargin,
 			"vlist-tc-entry-title",
@@ -1557,7 +1560,7 @@ function entryBlocks(
 			makeInline(
 				entry.meta,
 				DETAIL_MONO_FONT,
-				XS_LINE_HEIGHT,
+				XS_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-entry-meta",
@@ -1609,7 +1612,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.header.length > 0 ? question.header : " ",
 				HEADER_FONT,
-				HEADER_LINE_HEIGHT,
+				HEADER_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-header",
@@ -1624,7 +1627,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.description,
 				OPTION_DESC_FONT,
-				OPTION_DESC_LINE_HEIGHT,
+				OPTION_DESC_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-description",
@@ -1643,7 +1646,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				optionTitle,
 				OPTION_LABEL_FONT,
-				OPTION_LABEL_LINE_HEIGHT,
+				OPTION_LABEL_LINE_HEIGHT_BASELINE,
 				OPTION_INDENT,
 				index === 0 ? nextMargin : OPTIONS_GAP,
 				"vlist-tc-ask-option-label",
@@ -1655,7 +1658,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 				makeInline(
 					option.description,
 					OPTION_DESC_FONT,
-					OPTION_DESC_LINE_HEIGHT,
+					OPTION_DESC_LINE_HEIGHT_BASELINE,
 					OPTION_INDENT,
 					OPTION_DESC_MARGIN_TOP,
 					"vlist-tc-ask-option-desc",
@@ -1673,7 +1676,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.answer,
 				OPTION_LABEL_FONT,
-				OPTION_LABEL_LINE_HEIGHT,
+				OPTION_LABEL_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-answer",
@@ -1687,7 +1690,7 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 			makeInline(
 				question.customAnswer,
 				CUSTOM_ANSWER_FONT,
-				CUSTOM_ANSWER_LINE_HEIGHT,
+				CUSTOM_ANSWER_LINE_HEIGHT_BASELINE,
 				0,
 				nextMargin,
 				"vlist-tc-ask-custom-answer",
@@ -1855,7 +1858,7 @@ export function measureToolBody(
 				return makeInline(
 					task.text.length > 0 ? task.text : "—",
 					DETAIL_TEXT_FONT,
-					XS_LINE_HEIGHT,
+					XS_LINE_HEIGHT_BASELINE,
 					indent,
 					i === 0 ? 0 : SPEC_TASK_GAP,
 					"vlist-tc-spec-task",
@@ -1925,7 +1928,7 @@ export function measureToolBody(
 					makeInline(
 						line.length > 0 ? line : " ",
 						font,
-						STRUCT_BODY_LINE_HEIGHT,
+						STRUCT_BODY_LINE_HEIGHT_BASELINE,
 						0,
 						marginTop,
 						"vlist-tc-struct-line",
@@ -1948,7 +1951,7 @@ export function measureToolBody(
 			const block = makeInline(
 				detail.text.length > 0 ? detail.text : " ",
 				DETAIL_TEXT_FONT,
-				XS_LINE_HEIGHT,
+				XS_LINE_HEIGHT_BASELINE,
 				ERROR_INDENT,
 				0,
 				"vlist-tc-error",

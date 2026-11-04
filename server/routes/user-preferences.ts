@@ -3,6 +3,7 @@ import {
 	LEGACY_LINE_HEIGHT_RANGE,
 	legacyLineHeightPercentFrom,
 	lineHeightPercentFromLegacy,
+	lineHeightPercentFromStored,
 } from "@shared/pretext-layout/typography";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -336,11 +337,10 @@ function serializeUserPreferences(
 ): Record<string, unknown> {
 	return {
 		...pref,
-		// NULL until saved on the current scale: derived from the old column, never written
-		// back (see the column's note in schema.ts).
-		narratorLineHeightV2Percent:
-			pref.narratorLineHeightV2Percent ??
-			lineHeightPercentFromLegacy(pref.narratorLineHeightScalePercent),
+		narratorLineHeightV2Percent: lineHeightPercentFromStored(
+			pref.narratorLineHeightV2Percent,
+			pref.narratorLineHeightScalePercent,
+		),
 		setupWizardCompleted: instanceSetupWizardCompleted(),
 		...(recentTabs === undefined ? {} : { recentTabs }),
 		commands: parseJsonArray(pref.commands),

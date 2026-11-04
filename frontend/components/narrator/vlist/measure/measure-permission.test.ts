@@ -428,9 +428,9 @@ describe("measure-permission constants", () => {
 	it("match the Mantine ground-truth line boxes", async () => {
 		const { MEASURE_PERMISSION_CONSTANTS } = await import("./measure-permission");
 		const c = MEASURE_PERMISSION_CONSTANTS;
-		expect(c.SM_LINE_HEIGHT).toBe(20); // round(14 × 1.45)
-		expect(c.XS_LINE_HEIGHT).toBe(17); // round(12 × 1.4)
-		expect(c.OPTION_DESC_LINE_HEIGHT).toBe(14); // round(12 × 1.2)
+		expect(c.SM_LINE_HEIGHT_BASELINE).toBe(20); // round(14 × 1.45)
+		expect(c.XS_LINE_HEIGHT_BASELINE).toBe(17); // round(12 × 1.4)
+		expect(c.OPTION_DESC_LINE_HEIGHT_BASELINE).toBe(14); // round(12 × 1.2)
 		expect(c.TEXTAREA_ROW_HEIGHT).toBe(19); // round(12 × 1.55)
 		expect(c.ALERT_VERTICAL_CHROME).toBe(34); // 16×2 + 1×2
 		expect(c.ASK_BUTTON_ROW_HEIGHT).toBe(30); // Button xs

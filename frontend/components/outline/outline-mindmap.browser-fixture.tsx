@@ -875,6 +875,12 @@ export function showAsOf(seq: number): void {
 	} as never);
 }
 
+/** The typography setting has settled: the map measures what it kept from earlier settings. */
+export function mapTypographySettled(): void {
+	surface().map.typographySettled();
+	surface().map.flush();
+}
+
 /** Set the reader's typography, as the 外观 panel's sliders do (the variables follow). */
 export function applyTypography(next: Partial<TypographySettings>): void {
 	setTypography(next);

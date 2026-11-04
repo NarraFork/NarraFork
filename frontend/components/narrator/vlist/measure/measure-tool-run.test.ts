@@ -53,10 +53,10 @@ function stepRows(n: number, body?: string) {
 describe("measure-tool-run — fixed chrome constants (CONTRACT §4)", () => {
 	it("header band ≈24.8, row ≈18.8, count line ≈20.8 (unrounded xs 16.8)", async () => {
 		const m = await import("./measure-tool-run");
-		expect(m.TRACE_XS_LINE).toBeCloseTo(16.8, 5);
+		expect(m.TRACE_XS_LINE_BASELINE).toBeCloseTo(16.8, 5);
 		expect(m.TRACE_HEADER_BAND_HEIGHT).toBeCloseTo(24.8, 5);
 		expect(m.TRACE_ROW_HEIGHT).toBeCloseTo(18.8, 5);
-		expect(m.TRACE_COUNT_LINE_HEIGHT).toBeCloseTo(20.8, 5);
+		expect(m.TRACE_COUNT_LINE_HEIGHT_BASELINE).toBeCloseTo(20.8, 5);
 		expect(m.TRACE_HEADER_GROUP_HEIGHT).toBeCloseTo(20.8, 5);
 	});
 
@@ -710,7 +710,7 @@ describe("row status + timing are height-neutral", () => {
 		// The arithmetic reason the assertions above hold: the xs text line dominates
 		// every glyph in the row, so adding a 12px slot cannot raise the max.
 		const m = await liveToolRun();
-		expect(m.TRACE_ROW_STATUS).toBeLessThan(m.TRACE_XS_LINE);
+		expect(m.TRACE_ROW_STATUS).toBeLessThan(m.TRACE_XS_LINE_BASELINE);
 		expect(m.TRACE_ROW_CONTENT).toBeCloseTo(m.TRACE_XS_LINE, 5);
 	});
 });

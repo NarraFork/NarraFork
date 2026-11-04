@@ -297,9 +297,11 @@
 	padding: 0 3px;
 	font-family: var(--mantine-font-family-monospace);
 	font-size: var(--nf-type-code-size);
-	/* Its own box stays inside the body line: an inherited px line box on a smaller mono
-	   font sits lower on the baseline and grows the line (the mind map measures it). */
-	line-height: 1;
+	/* No line box of its own: an inherited px line box on a smaller mono font sits lower on
+	   the baseline and grows the line (the mind map measures lines at the body line box), and
+	   even 1 sticks out at the lowest line-height setting. The background still paints the
+	   glyphs' own box. */
+	line-height: 0;
 }
 
 .nf-outline-editor .ob-content pre code {

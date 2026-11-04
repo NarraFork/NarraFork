@@ -7,9 +7,16 @@
  * render layer paints with ever disagree, rows overlap or clip with nothing logged. This drives
  * real transcript rows — a user message, an assistant markdown answer (heading, mixed
  * Chinese/English paragraph, list with inline code, code block), a Bash card — through the
- * list's own segments → adapter → measure → render chain, each in a box of exactly its measured
- * height, and checks the paint against the measurement. It also lays the same paragraph out with
- * the browser and the `--nf-type-*` variables (how the outline paints): same height.
+ * list's own segments → adapter → measure → render chain, and checks the paint against the
+ * measurement with what the browser decides on its own:
+ *
+ *   - the row box is the measured height by construction (the list positions rows by it), so it
+ *     proves nothing by itself; what does: no glyph is painted below the row or past its right
+ *     edge (the browser needed more room than measured), and no measured line break comes early
+ *     (the browser would have fitted the next word or CJK character on the line) — together the
+ *     measured line count is the browser's natural one;
+ *   - the same paragraph laid out by the browser with the `--nf-type-*` variables (how the
+ *     outline paints), with no height given, is exactly as tall as the transcript measured it.
  *
  * With `NF_TYPOGRAPHY_SHOTS=<dir>` set, the rows are saved as screenshots in both themes.
  *
@@ -131,10 +138,12 @@ for (const [name, setting] of Object.entries(SETTINGS)) {
 				"markdown",
 			]);
 			for (const row of report.rows) {
-				// The box is the measured height (the list positions rows by it)…
+				// The box is the measured height by construction (nothing is proven by that)…
 				expect(row.boxHeight, row.kind).toBeCloseTo(row.measured, 1);
 				// …every measured text line is painted inside it,
 				expect(row.paintedBottom, row.kind).toBeLessThanOrEqual(row.measured + 0.5);
+				// no measured break comes earlier than the browser's own would,
+				expect(row.earlyBreaks, row.kind).toEqual([]);
 				// no glyph of the row (bubble, card or markdown) is painted below it or past
 				// its right edge (the browser wraps nothing the measurement did not),
 				expect(row.textBottom, row.kind).toBeLessThanOrEqual(row.measured + 0.5);
@@ -145,6 +154,8 @@ for (const [name, setting] of Object.entries(SETTINGS)) {
 			for (const row of report.rows.filter((r) => r.kind === "markdown")) {
 				expect(row.bodyLines, "markdown body lines").toBeGreaterThanOrEqual(2);
 			}
+			// The wrap check saw real wraps (a vacuous pass would prove nothing).
+			expect(report.rows.reduce((n, row) => n + row.wrapsChecked, 0)).toBeGreaterThanOrEqual(3);
 
 			// The outline's way (browser layout + `--nf-type-*`): the same paragraph, as tall as
 			// the transcript measured it — the two surfaces agree line for line.

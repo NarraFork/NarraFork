@@ -230,16 +230,22 @@ export class EditSurface {
 		});
 		// The reader changed the typography (外观 · 排版): every node size measured ahead is for
 		// the old setting (`measure.ts` keys sizes by it). Once the setting settles — a slider drag
-		// changes it every frame — the page is measured ahead again in the Worker, so the next
-		// switch to the map does not measure every body on the main thread. A map on screen
-		// re-measures what it shows at once (`MindMapView`).
+		// changes it every frame — the page is measured ahead again in the Worker, and then the
+		// map is told: it measured only the nodes on screen while the setting moved
+		// (`MindMapView.typographySettled`), and the next switch to the map finds the sizes.
 		let typographyTimer: ReturnType<typeof setTimeout> | undefined;
 		const offTypography = onTypographyChange(() => {
 			clearTimeout(typographyTimer);
 			typographyTimer = setTimeout(() => {
+				if (this.destroyed) return;
 				// Not shown yet: the first prewarm is still to come, under the new setting.
-				if (this.destroyed || this.prewarmed === "none") return;
-				void this.prewarm();
+				if (this.prewarmed === "none") return this.map.typographySettled();
+				// Then the map measures what it still holds from the old setting — from the cache
+				// the Worker just filled, rather than body by body on the main thread.
+				this.prewarm().then(
+					() => this.map.typographySettled(),
+					() => this.map.typographySettled(),
+				);
 			}, TYPOGRAPHY_PREWARM_DELAY_MS);
 		});
 		this.offs.push(() => {

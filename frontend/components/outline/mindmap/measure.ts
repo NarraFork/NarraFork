@@ -119,14 +119,17 @@ export function typographySignature(t: TypographySettings = getTypography()): st
 	return `${t.fontScalePercent}.${t.lineHeightScalePercent}.${t.letterSpacingPercent}`;
 }
 
+/** The part of every cache key that names the setting it was measured under. */
+function keyPrefix(): string {
+	return `${typographySignature()}\u0002`;
+}
+
 /**
  * A run for pretext, with the reader's letter spacing.
  *
- * pretext adds spacing BETWEEN graphemes; CSS `letter-spacing` adds it after EVERY grapheme,
- * including the last one of each line fragment (see `fragment-style.ts`). The transcript
- * cancels that trailing unit per fragment with a negative margin, but node text is laid out by
- * the browser, so here the unit is reserved instead (`extraWidth`, which pretext adds once per
- * fragment on a line) — measured and wrapped widths then match what CSS lays out.
+ * pretext counts the spacing after EVERY grapheme of a run, the last one included
+ * (`lineEndFitAdvance` in pretext's layout), which is what CSS `letter-spacing` does too — so
+ * node text, which the browser lays out, measures as it is drawn with no correction here.
  */
 function run(
 	text: string,
@@ -136,8 +139,76 @@ function run(
 ): RichInlineItem {
 	const spacing = letterSpacingForFont(font);
 	return spacing
-		? { ...item, text, font, letterSpacing: spacing, extraWidth: extra + spacing }
+		? { ...item, text, font, letterSpacing: spacing, extraWidth: extra }
 		: { ...item, text, font, extraWidth: extra };
+}
+
+/** Width of a short run (punctuation) in a font, with that font's letter spacing. */
+function runWidth(text: string, font: string): number {
+	const spacing = letterSpacingForFont(font);
+	return measureNaturalWidth(
+		prepareWithSegments(text, font, spacing ? { letterSpacing: spacing } : undefined),
+	);
+}
+
+/** Punctuation a line may not start with (closing classes, UAX #14): it stays with what precedes. */
+const LEADING_CLOSE = /^[，。、；：！？）」』】〉》〕〗〙〛”’…,.;:!?)\]}%]+/u;
+/** Punctuation a line may not end with (opening classes): it stays with what follows. */
+const TRAILING_OPEN = /[（「『【〈《〔〖〘〚“‘([{]+$/u;
+
+/**
+ * CJK closing punctuation right after a non-CJK character (`aborted；`, `continue」`, `abc）`).
+ * pretext keeps such punctuation on its line only after CJK text; after a Latin word it breaks
+ * before it, over a wide range of widths, where the browser never does — the node is then
+ * measured a line short. A WORD JOINER (zero width, no break) between them makes pretext agree.
+ */
+const LATIN_BEFORE_CJK_CLOSE =
+	/([^\s\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef])(?=[，。、；：！？）」』】〉》〕〗〙〛])/gu;
+const WORD_JOINER = "\u2060";
+
+/** A chip (inline code, a mention) that cannot break inside: one word, or never broken. */
+function unbreakable(item: RichInlineItem): boolean {
+	return item.break === "never" || !/\s/.test(item.text.trim());
+}
+
+/**
+ * Keep punctuation on the line the browser keeps it on.
+ *
+ * CSS never starts a line with `，` `。` `)` … nor ends one with `（` `「` …, so `` `aborted`， ``
+ * moves to the next line as one piece. Inside one text run pretext keeps the same rule, but
+ * rich-inline may break at ANY boundary between runs — which is exactly where a chip meets its
+ * punctuation. So the punctuation is moved across the boundary here:
+ *   - next to a text run, it joins that run's text (the same size; only weight or style may
+ *     differ, which barely changes the advance of punctuation);
+ *   - next to a chip (another font and size), its width is added to the chip's reserved width —
+ *     only when the chip cannot break inside, since the reserve is paid on every line a run spans.
+ */
+function keepPunctuationAttached(
+	items: RichInlineItem[],
+	chips: ReadonlySet<RichInlineItem>,
+): void {
+	for (let i = 1; i < items.length; i++) {
+		const prev = items[i - 1] as RichInlineItem;
+		const next = items[i] as RichInlineItem;
+		if (!prev.text || !next.text || /\s$/.test(prev.text) || /^\s/.test(next.text)) continue;
+		const close = chips.has(next) ? null : LEADING_CLOSE.exec(next.text)?.[0];
+		if (close) {
+			if (!chips.has(prev)) prev.text += close;
+			else if (unbreakable(prev))
+				prev.extraWidth = (prev.extraWidth ?? 0) + runWidth(close, next.font);
+			else continue;
+			next.text = next.text.slice(close.length);
+			continue;
+		}
+		const open = chips.has(prev) ? null : TRAILING_OPEN.exec(prev.text)?.[0];
+		if (open) {
+			if (!chips.has(next)) next.text = open + next.text;
+			else if (unbreakable(next))
+				next.extraWidth = (next.extraWidth ?? 0) + runWidth(open, prev.font);
+			else continue;
+			prev.text = prev.text.slice(0, -open.length);
+		}
+	}
 }
 
 function fontOf(marks: readonly { type: { name: string } }[], px: number, bold: boolean): string {
@@ -163,25 +234,26 @@ function inlineGroups(
 	labelOf: LabelOf,
 ): RichInlineItem[][] {
 	const groups: RichInlineItem[][] = [[]];
+	const chips = new Set<RichInlineItem>();
 	body.forEach((n) => {
 		const g = groups[groups.length - 1] as RichInlineItem[];
 		if (n.type.name === "hard_break") groups.push([]);
 		else if (n.type.name === "mention") {
-			g.push(
-				run(
-					labelOf(n.attrs.ref as string, n.attrs.label as string | null),
-					`${px}px ${MAP_FONT_FAMILY}`,
-					6,
-					{
-						break: "never",
-					},
-				),
-			);
+			const label = labelOf(n.attrs.ref as string, n.attrs.label as string | null);
+			const chip = run(label, `${px}px ${MAP_FONT_FAMILY}`, 6, { break: "never" });
+			chips.add(chip);
+			g.push(chip);
 		} else if (n.isText) {
 			const isCode = n.marks.some((m) => m.type.name === "code");
-			g.push(run(n.text ?? "", fontOf(n.marks, px, bold), isCode ? 6 : 0));
+			const item = run(n.text ?? "", fontOf(n.marks, px, bold), isCode ? 6 : 0);
+			if (isCode) chips.add(item);
+			g.push(item);
 		}
 	});
+	for (const g of groups) {
+		keepPunctuationAttached(g, chips);
+		for (const item of g) item.text = item.text.replace(LATIN_BEFORE_CJK_CLOSE, `$1${WORD_JOINER}`);
+	}
 	return groups;
 }
 
@@ -224,15 +296,11 @@ export function measureBody(body: PMNode, maxW = NODE.maxBody, labelOf = plainLa
 		}
 		case "code_block": {
 			const lines = body.textContent.split("\n");
-			const spacing = letterSpacingForFont(t.codeBlockFont);
 			let w = 0;
 			for (const l of lines.slice(0, NODE.codeLines)) {
 				if (!l) continue;
-				const nw = measureNaturalWidth(
-					prepareWithSegments(l, t.codeBlockFont, spacing ? { letterSpacing: spacing } : undefined),
-				);
-				// CSS adds the spacing after the last grapheme too (see `run`).
-				if (nw + spacing > w) w = nw + spacing;
+				const nw = runWidth(l, t.codeBlockFont);
+				if (nw > w) w = nw;
 			}
 			const shown = Math.min(lines.length, NODE.codeLines);
 			return { w: Math.min(maxW, w + 16), h: shown * t.codeBlockLineH + 8 };
@@ -261,7 +329,7 @@ export function measureKey(
 	content: string,
 	labelOf: LabelOf,
 ): { key: string; labels: string[]; node: PMNode } {
-	const sig = `${typographySignature()}\u0002`;
+	const sig = keyPrefix();
 	// Without mentions the key is the text itself: parsed only when it is measured (a cache hit,
 	// or a body sent to the Worker, parses nothing here).
 	if (!content.includes("[[")) {
@@ -307,6 +375,11 @@ export function bodySize(content: string, labelOf: LabelOf = plainLabel): BodySi
 	return r;
 }
 
+/** A body's size if it is cached; never measures. */
+export function cachedBodySize(content: string, labelOf: LabelOf = plainLabel): BodySize | null {
+	return cache.get(measureKey(content, labelOf).key) ?? null;
+}
+
 /** Whether a size is cached under this key (`measureKey`). */
 export function hasMeasuredKey(key: string): boolean {
 	return cache.has(key);
@@ -319,9 +392,12 @@ export function hasMeasured(content: string, labelOf: LabelOf = plainLabel): boo
 
 /** Store sizes measured elsewhere (the Worker). */
 export function storeMeasured(entries: Iterable<[string, number, number]>): number {
+	// A Worker reply measured under a setting the reader has since left would never be hit
+	// (its key carries the old signature): it is not kept.
+	const current = keyPrefix();
 	let n = 0;
 	for (const [key, w, h] of entries) {
-		if (cache.has(key)) continue;
+		if (!key.startsWith(current) || cache.has(key)) continue;
 		if (cache.size > MAX_CACHE) cache.clear();
 		cache.set(key, { w, h });
 		n++;

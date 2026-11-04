@@ -225,3 +225,60 @@ test("a change of setting measures the page ahead again, so the next switch to t
 	await expectMap(e, await expectedOf(e), "after the Worker re-measured");
 	expect(e.errors).toEqual([]);
 }, 90_000);
+
+/**
+ * Texts where the map's measurement and the browser's line breaking can part ways: punctuation
+ * the browser keeps on a chip's line (closing after, opening before), a body that starts with a
+ * chip, bold and italic runs next to punctuation, headings, a code block.
+ */
+const SWEEP_LINES = [
+	"根因：中断后 `status` 停在 `aborted`，重试按钮只在 `failed` 时显示",
+	"`inline code at the start` then 中文混排继续写一段足够长的话，看换行。",
+	"（`status`）在括号里，`aborted`。结尾也有「`failed`」和 `x`, `y`; `z`!",
+	"**加粗**，接着是*斜体*。Mixed, punctuation; after: runs! 还有（括号）与「引号」。",
+	"重试按钮的显示条件改成 failed 或 aborted；aborted 时文案是「继续」。The label reads Continue.",
+	"## 结论与后续",
+	"# 一级标题 with English words that wrap around",
+	"### 三级标题：`code` 在标题里",
+	'```ts\nconst canRetry = status === "failed" || status === "aborted";\nreturn canRetry;\n```',
+	"背景：用户中断回合后，消息气泡上没有「重试」按钮，只能重新输入。Mixed English 与中文混排。",
+];
+
+test("every node is drawn at its measured height across font × letter spacing × line height", async () => {
+	const { pageId } = await seedPage(h, "排版扫描 sweep", SWEEP_LINES);
+	const e = await openHost(h, "page", pageId, { width: 1600, height: 1200 });
+	await e.call((f) => f.setView("map"));
+	await settled(e);
+	const failures: string[] = [];
+	let checked = 0;
+	for (const fontScalePercent of [70, 100, 115, 130, 180]) {
+		for (const letterSpacingPercent of [-5, 0, 2, 10, 25]) {
+			for (const lineHeightScalePercent of [60, 100, 185]) {
+				const setting = { fontScalePercent, letterSpacingPercent, lineHeightScalePercent };
+				await e.call((f, s) => f.applyTypography(s as never), setting);
+				// Skip the settle wait (the Worker round trip): every node is measured now.
+				await e.call((f) => f.mapTypographySettled());
+				await e.call((f) => f.mapFit());
+				await e.call((f) => f.mapFlush());
+				const accuracy = await e.call((f) => f.nodeAccuracy());
+				// At the line-height floor (72% of the Mantine ratios) a heading's line box is smaller
+				// than its font's content box (h1: 1.3 × 0.72 < 1), as the transcript's old floor
+				// allowed too: the content box overhangs the node by a few px there although the
+				// node is exactly its measured height. Horizontal overflow is checked everywhere.
+				const overflow = (await e.call((f) => f.nodeOverflow())).filter(
+					(o) => o.overW > 0 || (lineHeightScalePercent >= 100 && o.overH > 0),
+				);
+				checked += accuracy.checked;
+				if (accuracy.maxDiffH > 1 || accuracy.overH > 0 || overflow.length > 0) {
+					failures.push(
+						`${JSON.stringify(setting)}: maxDiffH ${accuracy.maxDiffH}, ${accuracy.overH} off, overflow ${JSON.stringify(overflow)}`,
+					);
+				}
+			}
+		}
+	}
+	// Every node of every setting was on screen and checked.
+	expect(checked).toBe(75 * (SWEEP_LINES.length + 1));
+	expect(failures).toEqual([]);
+	expect(e.errors).toEqual([]);
+}, 180_000);

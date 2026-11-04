@@ -29,7 +29,7 @@ import {
 	planVisible,
 } from "@shared/outline/layout";
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
-import { onTypographyChange } from "@shared/pretext-layout/typography";
+import { getTypographyRevision, onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
 import { ensureTypographyCssVars } from "../../../lib/typography-css-vars";
 import { pinchStep, wheelZoomFactor, zoomAround } from "../../common/pan-zoom-math";
@@ -57,7 +57,15 @@ import {
 import type { LiveClient, SelInfo } from "../editor/live-client";
 import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "../editor/view";
 import type { OutlineViewState } from "../view-state";
-import { bodySize, MAP_FONT_FAMILY, MAP_MONO_FAMILY, mapType, NODE, nodeSize } from "./measure";
+import {
+	bodySize,
+	cachedBodySize,
+	MAP_FONT_FAMILY,
+	MAP_MONO_FAMILY,
+	mapType,
+	NODE,
+	nodeSize,
+} from "./measure";
 
 /** Most blocks one map lays out and draws (design §7.2: the same cap as an editor view). */
 export /** Nodes laid out (and measured on the main thread) while the Worker measures the page. */
@@ -181,8 +189,21 @@ export class MindMapView {
 	} | null = null;
 	private sizes = new Map<
 		string,
-		{ content: string; task: LiveTaskChar | null; w: number; h: number; bodyW: number }
+		{
+			content: string;
+			task: LiveTaskChar | null;
+			w: number;
+			h: number;
+			bodyW: number;
+			/** The typography generation the size was measured under. */
+			gen: number;
+		}
 	>();
+	/**
+	 * The typography setting is moving (a slider drag in the 外观 panel), until the host calls
+	 * {@link typographySettled}. Meanwhile only nodes on screen are measured again.
+	 */
+	private typographyMoving = false;
 	private dirtyLayout = true;
 	private dirtyRender = true;
 	private raf = 0;
@@ -245,8 +266,14 @@ export class MindMapView {
 		// The reader changed the typography (外观 · 排版): every node's size was measured under
 		// the old one. The measure cache drops its entries itself (`measure.ts`); the per-block
 		// sizes here are keyed by text, so they go too, and the next layout measures again.
+		// The reader changed the typography (外观 · 排版): sizes were measured under the old one.
+		// Re-measuring every node on each slider step costs ~0.3 ms a body on the main thread
+		// (a quarter of a second at 800 nodes, per step), so until the setting settles only the
+		// nodes on screen are measured again; the rest keep their size (or take a cached one)
+		// and are measured once the host says the setting has settled — by then the Worker has
+		// usually measured them ahead (`EditSurface`), so that layout reads the cache.
 		this.offTypography = onTypographyChange(() => {
-			this.sizes.clear();
+			this.typographyMoving = true;
 			this.schedule();
 		});
 		this.stage.addEventListener("keydown", (e) => this.onKey(e));
@@ -349,6 +376,17 @@ export class MindMapView {
 		if (this.dirtyRender) this.render();
 	}
 
+	/**
+	 * The typography setting has settled (the host waits for the slider to rest, and for the
+	 * Worker to measure the page under it): every node still sized under an earlier setting is
+	 * measured now.
+	 */
+	typographySettled(): void {
+		if (!this.typographyMoving) return;
+		this.typographyMoving = false;
+		this.schedule();
+	}
+
 	get layoutDirty(): boolean {
 		return this.dirtyLayout;
 	}
@@ -391,6 +429,7 @@ export class MindMapView {
 		const order: string[] = [];
 		let measureMs = 0;
 		const ed = this.editing;
+		const gen = getTypographyRevision();
 		const make = (id: string, parent: string | null, index: number): LayoutNode => {
 			const content = client.textOf(id);
 			const task = v.get(id)?.task ?? null;
@@ -399,13 +438,20 @@ export class MindMapView {
 			// Sizes cached per block: unchanged text and checkbox skip the measure cache too (a block
 			// with mentions is looked up every time: what its targets show may have changed).
 			let sz = this.sizes.get(id);
-			if (!sz || sz.content !== content || sz.task !== task || content.includes("[[")) {
-				const m0 = performance.now();
-				const ns = nodeSize(bodySize(content, this.labelOf), !!task);
-				measureMs += performance.now() - m0;
-				sz = { content, task, ...ns };
-				this.sizes.set(id, sz);
+			const changed = !sz || sz.content !== content || sz.task !== task || content.includes("[[");
+			if (changed || sz?.gen !== gen) {
+				// A size from an earlier setting, off screen, while the setting still moves:
+				// kept unless the new one is already cached (see the typography note above).
+				const cached = changed ? null : cachedBodySize(content, this.labelOf);
+				if (changed || cached || !this.typographyMoving || this.els.has(id)) {
+					const m0 = performance.now();
+					const ns = nodeSize(cached ?? bodySize(content, this.labelOf), !!task);
+					measureMs += performance.now() - m0;
+					sz = { content, task, ...ns, gen };
+					this.sizes.set(id, sz);
+				}
 			}
+			if (!sz) throw new Error("unreachable: a new block is always measured");
 			const editingSize = ed && ed.id === id ? ed.size : null;
 			const node: LayoutNode = {
 				id,

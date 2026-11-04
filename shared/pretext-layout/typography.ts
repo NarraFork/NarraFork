@@ -176,6 +176,11 @@ export function lineHeightPercentFromLegacy(legacyPercent: number | null | undef
  *
  * Written next to the new value so that a build from before the rescale (a downgrade,
  * or a tab still running the previous bundle) shows the same effective line height.
+ *
+ * Not an exact inverse of {@link lineHeightPercentFromLegacy}: 60–62 and 184–185 fall outside
+ * the old range and are clamped (they read back as 63 and 183), and 83 mirrors to 100, which
+ * reads back as the default 100. That only matters if a build from before the rescale echoes
+ * the old field back unchanged — its panels send only the knob that moved.
  */
 export function legacyLineHeightPercentFrom(percent: number): number {
 	const value = clampTypographyValue("lineHeightScalePercent", percent);
@@ -186,6 +191,25 @@ export function legacyLineHeightPercentFrom(percent: number): number {
 			Math.round((value * LINE_HEIGHT_BASELINE_PERCENT) / 100),
 		),
 	);
+}
+
+/**
+ * The current-scale line height of a stored preference row (both columns). Read-only.
+ *
+ * - `v2` NULL: never saved on the current scale (a row from before the rescale) — derived from
+ *   the old column.
+ * - Otherwise the columns are a pair the current build wrote together: the old one is the new
+ *   one's mirror ({@link legacyLineHeightPercentFrom}), or the new one is the old one's
+ *   conversion ({@link lineHeightPercentFromLegacy}). When they are neither, the old column was
+ *   written AFTER, by a build that does not know the new one (a downgrade, then a change or a
+ *   reset there): that is the newer choice, so it is derived again.
+ */
+export function lineHeightPercentFromStored(v2: number | null | undefined, legacy: number): number {
+	if (v2 == null) return lineHeightPercentFromLegacy(legacy);
+	if (legacy === legacyLineHeightPercentFrom(v2) || v2 === lineHeightPercentFromLegacy(legacy)) {
+		return v2;
+	}
+	return lineHeightPercentFromLegacy(legacy);
 }
 
 /**

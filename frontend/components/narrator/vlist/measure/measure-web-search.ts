@@ -53,7 +53,7 @@ export const WEB_SEARCH_GROUP_GAP = 6;
 export const WEB_SEARCH_QUERY_GAP = 4;
 
 /** xs text line box: round(12 * 1.4) = 17px. */
-export const WEB_SEARCH_TEXT_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+export const WEB_SEARCH_TEXT_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 
 /** Dimmed status-prefix font (xs, weight 400). */
 export const WEB_SEARCH_LABEL_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
@@ -215,6 +215,6 @@ export const MEASURE_WEB_SEARCH_CONSTANTS = {
 	WEB_SEARCH_LOADER_SIZE,
 	WEB_SEARCH_GROUP_GAP,
 	WEB_SEARCH_QUERY_GAP,
-	WEB_SEARCH_TEXT_LINE_HEIGHT,
+	WEB_SEARCH_TEXT_LINE_HEIGHT_BASELINE,
 	WEB_SEARCH_VERTICAL_CHROME,
 } as const;

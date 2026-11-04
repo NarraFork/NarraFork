@@ -123,7 +123,7 @@ describe("RenderWebSearch optical alignment", () => {
 		expect(line).not.toBeNull();
 		if (!line) return;
 		// The live xs line: 120% of the bare-Mantine constant (17) at the default setting.
-		expect(MEASURE_WEB_SEARCH_CONSTANTS.WEB_SEARCH_TEXT_LINE_HEIGHT).toBe(17);
+		expect(MEASURE_WEB_SEARCH_CONSTANTS.WEB_SEARCH_TEXT_LINE_HEIGHT_BASELINE).toBe(17);
 		expect(line.style.height).toBe("20px");
 		// linkedom serializes the numeric `0` as "0"; browsers use "0px". Either
 		// form still kills the inherited body strut.

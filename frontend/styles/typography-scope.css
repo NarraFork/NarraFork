@@ -27,6 +27,9 @@
 	--mantine-h5-line-height: var(--nf-type-h5-line);
 	--mantine-h6-font-size: var(--nf-type-h6-size);
 	--mantine-h6-line-height: var(--nf-type-h6-line);
+	/* Inline code sits in the body line without a line box of its own (as in the editor and
+	   the mind map): a smaller mono font on an inherited line box rides low and grows the line. */
+	--nf-scoped-inline-code-line: 0;
 	/* Fenced code (HighlightedCode reads these, and keeps its own 11px / 1.55 elsewhere). */
 	--nf-scoped-code-block-size: var(--nf-type-code-block-size);
 	--nf-scoped-code-block-line: var(--nf-type-code-block-line);

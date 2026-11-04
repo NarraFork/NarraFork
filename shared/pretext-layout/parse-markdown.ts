@@ -65,9 +65,9 @@ import { letterSpacingForFont, scaleBlockSpacing } from "./typography";
 // reader's font scale and block spacing apply; the constants remain as the
 // reference those scalings are defined against, and as the values the render layer
 // falls back to when it has no block in hand.
-const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 14 * 1.45 ≈ 20px
+const BODY_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 14 * 1.45 ≈ 20px
 // Fenced code renders at 11px / 1.55 (settled Shiki view, HighlightedCode.module.css).
-const CODE_LINE_HEIGHT = lineBoxHeight(CODE_BLOCK_FONT_SIZE, BASE_LINE_HEIGHT); // 11 * 1.55 ≈ 17
+const CODE_LINE_HEIGHT_BASELINE = lineBoxHeight(CODE_BLOCK_FONT_SIZE, BASE_LINE_HEIGHT); // 11 * 1.55 ≈ 17
 const PARAGRAPH_MARGIN_TOP = emToPx(0.35, FONT_SIZE.sm); // 0.35em @14px ≈ 4.9
 const LIST_MARGIN_TOP = emToPx(0.35, FONT_SIZE.sm);
 const HEADING_MARGIN_TOP = 0.4; // em, resolved per-heading font size below
@@ -1592,8 +1592,8 @@ function stripTrailingNewline(text: string): string {
 
 // Exported constants for the measure layer / tests.
 export const MARKDOWN_CONSTANTS = {
-	BODY_LINE_HEIGHT,
-	CODE_LINE_HEIGHT,
+	BODY_LINE_HEIGHT_BASELINE,
+	CODE_LINE_HEIGHT_BASELINE,
 	PARAGRAPH_MARGIN_TOP,
 	LIST_MARGIN_TOP,
 	CODE_MARGIN_TOP,

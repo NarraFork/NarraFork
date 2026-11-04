@@ -432,3 +432,55 @@ for (const host of HOSTS) {
 			);
 	}, 300_000);
 }
+
+test("page: a typography slider drag over an open 800-block map measures only what is on screen", async () => {
+	const { pageId } = await seedPage(h, "Typography drag", bigLines(799, "T"));
+	const a = await openHost(h, "page", pageId, VIEWPORT);
+	await a.call((f) => f.prewarmDone());
+	await a.call((f) => f.setView("map"));
+	await settled(a);
+	await a.call((f) => f.mapFlush());
+	const steps: Array<{ lineHeight: number; measured: number; measureMs: number; inDom: number }> =
+		[];
+	// A drag in the 外观 panel: one setting per frame, the map on screen.
+	for (const lineHeight of [105, 110, 115, 120]) {
+		const before = await a.call((f) => f.mapStats());
+		await a.call((f, x) => f.applyTypography({ lineHeightScalePercent: x as never }), lineHeight);
+		await a.call((f) => f.mapFlush());
+		const after = await a.call((f) => f.mapStats());
+		steps.push({
+			lineHeight,
+			measured: after.measure.misses - before.measure.misses,
+			measureMs: +(after.measureMs[after.measureMs.length - 1] ?? 0).toFixed(1),
+			// The nodes drawn when the step began (what the layout measures) and after it.
+			inDom: Math.max(before.nodesInDom, after.nodesInDom),
+		});
+	}
+	for (const step of steps) {
+		// Only the nodes drawn (on screen, plus the margin) are measured on each step, not 800
+		// (the root, kept for the layout, is one more).
+		expect(step.measured).toBeLessThanOrEqual(step.inDom + 1);
+		expect(step.measured).toBeLessThan(400);
+	}
+	// Once the setting rests, the Worker measures the page, and the map lays out from its sizes.
+	await new Promise((r) => setTimeout(r, 400));
+	await a.call((f) => f.prewarmDone());
+	const settledFrom = (await a.call((f) => f.mapStats())).measure.misses;
+	await a.call((f) => f.mapFlush());
+	const settledStats = await a.call((f) => f.mapStats());
+	const accuracy = await a.call((f) => f.nodeAccuracy());
+	expect(accuracy.maxDiffH).toBeLessThanOrEqual(1);
+	expect(accuracy.overH).toBe(0);
+	expect(a.errors).toEqual([]);
+	if (LOG)
+		console.log(
+			JSON.stringify({
+				item: "typography drag",
+				steps,
+				afterSettle: {
+					measuredOnMain: settledStats.measure.misses - settledFrom,
+					layoutMs: +(settledStats.layouts[settledStats.layouts.length - 1] ?? 0).toFixed(1),
+				},
+			}),
+		);
+}, 120_000);

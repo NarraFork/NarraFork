@@ -71,9 +71,9 @@ export type AskInPassingData = AskInPassingPendingData | AskInPassingResolvedDat
 // ── Shared chrome constants (px) — CONTRACT.md §3/§4 + pretext-fonts.ts ───────
 
 /** xs single-line box height: round(12 × 1.4) = 17. */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** sm body line box height: round(14 × 1.45) = 20. */
-export const SM_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 20
+export const SM_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 20
 
 // ── pending: fixed 79px (including borders) ──────────────────────────────────────────────────────
 
@@ -82,7 +82,7 @@ export const PENDING_PADDING_Y = SPACING.xs; // 10
 /** Box px="md" inner padding (left & right). Render-only (no height impact). */
 export const PENDING_PADDING_X = SPACING.md; // 16
 /** Hint row: max(icon 14, xs line 17) = 17. */
-export const PENDING_HINT_ROW = Math.max(14, XS_LINE_HEIGHT); // 17
+export const PENDING_HINT_ROW = Math.max(14, XS_LINE_HEIGHT_BASELINE); // 17
 /** Hint row bottom margin (Group mb={4}). */
 export const PENDING_HINT_MARGIN = 4;
 /** Input row: TextInput size="sm" + Button size="sm" are all 36px tall. */
@@ -110,9 +110,9 @@ export const RESOLVED_ICON = 14;
 /** Group gap={6} appears twice (icon↔stack, stack↔icon). */
 export const RESOLVED_GROUP_GAP = 6;
 /** Fixed label row (Text size="xs" dimmed, single line). */
-export const RESOLVED_LABEL_HEIGHT = XS_LINE_HEIGHT; // 17
+export const RESOLVED_LABEL_HEIGHT = XS_LINE_HEIGHT_BASELINE; // 17
 /** Quote row (one ellipsized xs line) between the label and the question. */
-export const RESOLVED_QUOTE_ROW = XS_LINE_HEIGHT; // 17
+export const RESOLVED_QUOTE_ROW = XS_LINE_HEIGHT_BASELINE; // 17
 /** Space below the quote row. */
 export const RESOLVED_QUOTE_GAP = 2;
 /** Max rendered question lines (DOM lineClamp={2}). */
@@ -129,7 +129,8 @@ export const RESOLVED_CHROME_X =
 	RESOLVED_PADDING_X * 2 + RESOLVED_BORDER_LEFT + RESOLVED_ICON * 2 + RESOLVED_GROUP_GAP * 2; // 67
 
 /** Resolved minimum height (question fits on one line). ≈57px. */
-export const RESOLVED_MIN_HEIGHT = RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT + SM_LINE_HEIGHT; // 57
+export const RESOLVED_MIN_HEIGHT =
+	RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT + SM_LINE_HEIGHT_BASELINE; // 57
 /** Resolved maximum height (question wraps to two lines). ≈77px. */
 export const RESOLVED_MAX_HEIGHT =
 	RESOLVED_PADDING_Y * 2 +
@@ -265,8 +266,8 @@ function measureResolved(data: AskInPassingResolvedData, contentWidth: number): 
 }
 
 export const MEASURE_ASK_IN_PASSING_CONSTANTS = {
-	XS_LINE_HEIGHT,
-	SM_LINE_HEIGHT,
+	XS_LINE_HEIGHT_BASELINE,
+	SM_LINE_HEIGHT_BASELINE,
 	PENDING_CARD_HEIGHT,
 	RESOLVED_MIN_HEIGHT,
 	RESOLVED_MAX_HEIGHT,

@@ -71,7 +71,7 @@ describe("mind-map node typography", () => {
 		expect(after.h).toBeGreaterThan(before.h);
 	});
 
-	it("reserves the trailing letter spacing CSS adds to every line fragment", async () => {
+	it("counts letter spacing once per grapheme, the last one included, as CSS does", async () => {
 		const { measureRichInlineStats, prepareRichInline } = await import(
 			"@chenglou/pretext/rich-inline"
 		);
@@ -79,14 +79,37 @@ describe("mind-map node typography", () => {
 		setTypography({ letterSpacingPercent: 10 });
 		const font = `${mapType().px}px ${MAP_FONT_FAMILY}`;
 		const spacing = 1.4; // 10% of 14px
-		// pretext spaces BETWEEN graphemes; CSS also after the last one of each line.
-		const pretextOnly = measureRichInlineStats(
+		const spaced = measureRichInlineStats(
 			prepareRichInline([{ text, font, letterSpacing: spacing }]),
 			10_000,
 		).maxLineWidth;
 		const unspaced = measureRichInlineStats(prepareRichInline([{ text, font }]), 10_000);
-		expect(pretextOnly).toBeGreaterThan(unspaced.maxLineWidth);
-		expect(bodySize(text).w).toBeCloseTo(pretextOnly + spacing, 5);
+		// pretext already adds a unit after every grapheme, the last one too (its
+		// `lineEndFitAdvance`): exactly CSS `letter-spacing`…
+		expect(spaced - unspaced.maxLineWidth).toBeCloseTo([...text].length * spacing, 5);
+		// …so a node measures what pretext measures, with nothing added on top (adding the
+		// trailing unit again made nodes taller or shorter than drawn).
+		expect(bodySize(text).w).toBeCloseTo(spaced, 5);
+		setTypography({ letterSpacingPercent: -5 });
+		const tight = measureRichInlineStats(
+			prepareRichInline([{ text, font, letterSpacing: -0.7 }]),
+			10_000,
+		).maxLineWidth;
+		expect(bodySize(text).w).toBeCloseTo(tight, 5);
+	});
+
+	it("measures a code block line with the same spacing arithmetic", async () => {
+		const { measureNaturalWidth, prepareWithSegments } = await import("@chenglou/pretext");
+		setTypography({ letterSpacingPercent: 10 });
+		const line = "const canRetry = true;";
+		const font = mapType().codeBlockFont;
+		const natural = measureNaturalWidth(
+			prepareWithSegments(line, font, { letterSpacing: 1.1 }), // 10% of 11px
+		);
+		expect(bodySize(`\`\`\`\n${line}\n\`\`\``).w).toBeCloseTo(
+			Math.min(NODE.maxBody, natural + 16),
+			5,
+		);
 	});
 
 	it("keys the cache by the setting, and drops it when the setting changes", () => {

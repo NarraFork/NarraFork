@@ -256,10 +256,51 @@ export function report() {
 				textRight = Math.max(textRight, r.right - box.right);
 			}
 		}
+		// Wrapped where the browser would have wrapped: no line could have taken the first unit
+		// of the next one (a word, or one CJK character with the punctuation that cannot start a
+		// line). With overflowRight (no line wider than the row) this pins the measured line
+		// count to the browser's natural one in both directions — the row box cannot, since its
+		// height IS the measurement.
+		const earlyBreaks: string[] = [];
+		let wrapsChecked = 0;
+		const lineEls = [...row.querySelectorAll<HTMLElement>("[data-vlist-line]")];
+		for (let k = 0; k + 1 < lineEls.length; k++) {
+			const cur = lineEls[k] as HTMLElement;
+			const next = lineEls[k + 1] as HTMLElement;
+			if (cur.parentElement !== next.parentElement) continue;
+			const cr = cur.getBoundingClientRect();
+			if (Math.abs(next.getBoundingClientRect().top - cr.bottom) > 0.5) continue;
+			const frags = cur.querySelector<HTMLElement>("[data-vlist-line-frags]");
+			const nextText = next.querySelector<HTMLElement>("[data-vlist-line-frags]");
+			if (!frags || !nextText) continue;
+			const walker = document.createTreeWalker(nextText, NodeFilter.SHOW_TEXT);
+			const node = walker.nextNode();
+			const text = node?.textContent ?? "";
+			const unit =
+				/^(?:[\u3000-\u9fff\uff00-\uffef][，。、；：！？）」』】》]*|[^\s\u3000-\u9fff]+)/u.exec(
+					text,
+				)?.[0];
+			if (!node || !unit) continue;
+			const range = document.createRange();
+			range.setStart(node, 0);
+			range.setEnd(node, unit.length);
+			const unitWidth = range.getBoundingClientRect().width;
+			const avail = (cur.parentElement as HTMLElement).getBoundingClientRect().right - cr.left;
+			const used = frags.getBoundingClientRect().right - cr.left;
+			const spacing = m.letterSpacing.body;
+			wrapsChecked++;
+			if (used + unitWidth + spacing < avail - 1) {
+				earlyBreaks.push(
+					`${(frags.textContent ?? "").slice(-8)} | ${unit} (${used.toFixed(1)}+${unitWidth.toFixed(1)} < ${avail.toFixed(1)})`,
+				);
+			}
+		}
 		return {
 			kind: row.dataset.row ?? "",
 			measured,
 			boxHeight: box.height,
+			earlyBreaks,
+			wrapsChecked,
 			lines: row.querySelectorAll("[data-vlist-line]").length,
 			bodyLines,
 			paintedBottom,

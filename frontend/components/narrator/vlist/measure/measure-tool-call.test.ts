@@ -52,7 +52,7 @@ function specTasks(...texts: string[]): import("./measure-tool-call").SpecTaskLi
 describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () => {
 	it("header text line uses base line-height 1.55 → 19px; header row = 19", async () => {
 		const m = await baselineMod();
-		expect(m.HEADER_TEXT_LINE_HEIGHT).toBe(19);
+		expect(m.HEADER_TEXT_LINE_HEIGHT_BASELINE).toBe(19);
 		// The SAME tile a folded trace row uses (was 16, which resized the chip mid-morph).
 		expect(m.HEADER_CATEGORY_ICON).toBe(BARE_ROW_ICON);
 		expect(m.HEADER_CATEGORY_ICON).toBe(14);
@@ -134,7 +134,7 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 	it("pins the capped-body line box so render cannot drift from measure", async () => {
 		const m = await baselineMod();
 		expect(m.DETAIL_BODY_FONT_SIZE).toBe(11);
-		expect(m.DETAIL_CONTENT_LINE_HEIGHT).toBe(15);
+		expect(m.DETAIL_CONTENT_LINE_HEIGHT_BASELINE).toBe(15);
 		// The measured font string must use the same size the render box declares.
 		expect(m.DETAIL_BODY_FONT).toContain(`${m.DETAIL_BODY_FONT_SIZE}px`);
 
@@ -993,7 +993,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 	});
 
 	it("a source path adds exactly one leading provenance row", async () => {
-		const { measureToolCall, XS_LINE_HEIGHT } = await mod();
+		const { measureToolCall, XS_LINE_HEIGHT_BASELINE: XS_LINE_HEIGHT } = await mod();
 		const without = measureToolCall(planCard(), 600, 5, { viewportHeight: 1000 });
 		const withSource = measureToolCall(planCard({ sourcePath: ".narrafork/plan-abc.md" }), 600, 5, {
 			viewportHeight: 1000,

@@ -793,6 +793,36 @@ describe("narrator line height across the rescale", () => {
 		});
 	});
 
+	it("takes a change made by an older build after a downgrade (the old column is newer)", async () => {
+		// The pair this build wrote: 92 on the new scale, its mirror 110 on the old one.
+		seedPreferences([], { narratorLineHeightScalePercent: 110, narratorLineHeightV2Percent: 92 });
+		expect(await v2Of()).toBe(92);
+		// A build from before the rescale (a downgrade) changes the line height: it writes only
+		// the old column. Back on this build, that newer choice is what the reader sees.
+		db.update(userPreferences).set({ narratorLineHeightScalePercent: 130 }).run();
+		expect(await v2Of()).toBe(108);
+		// A reset there (old 100) reads as the new default.
+		db.update(userPreferences).set({ narratorLineHeightScalePercent: 100 }).run();
+		expect(await v2Of()).toBe(100);
+		// Reading wrote nothing: the stale new-scale value is still stored.
+		expect(db.select().from(userPreferences).all()[0]?.narratorLineHeightV2Percent).toBe(92);
+	});
+
+	it("keeps every pair this build writes, at the edges of both ranges too", async () => {
+		const {
+			legacyLineHeightPercentFrom,
+			lineHeightPercentFromLegacy,
+			lineHeightPercentFromStored: readLineHeightV2,
+		} = await import("@shared/pretext-layout/typography");
+		for (let v2 = 60; v2 <= 185; v2++) {
+			expect(readLineHeightV2(v2, legacyLineHeightPercentFrom(v2))).toBe(v2);
+		}
+		for (let legacy = 75; legacy <= 220; legacy++) {
+			const v2 = lineHeightPercentFromLegacy(legacy);
+			expect(readLineHeightV2(v2, legacy)).toBe(v2);
+		}
+	});
+
 	it("validates each field on its own scale", async () => {
 		seedPreferences([]);
 		for (const payload of [
