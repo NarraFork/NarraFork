@@ -67,6 +67,7 @@ export function measureXxx(
 
 **派生行盒高**（`lineBoxHeight = round(size × lineHeight)`）：
 - body（sm/1.45）≈ **20px**；xs（12/1.4）≈ **17px**；inline code（12/1.55）≈ 19px；code block（12/1.55）≈ **19px**。
+- ⚠️ 以上是 Mantine **基线**。「外观 · 排版」的行距滑杆 100% = 基线 × 1.2（`LINE_HEIGHT_BASELINE_PERCENT`，原来的 120% 即现在的 100%），所以**默认设置下**实测行盒是：body **24px**、xs **20px**、markdown 代码块（11px）**20px**、h1 **53px**。测量必须读 `typographyMetrics()` / `headingMetrics()`，不要用上面的基线数字；大纲（编辑器、历史树、导图、任务看板）经 `--nf-type-*` CSS 变量用同一组数值（`shared/pretext-layout/typography-css.ts`）。
 - Badge size=xs = **16px**；ThemeIcon 16/14；Loader 12；chevron 12；StatusIcon 12。
 - Button：compact-xs=18, xs=30, sm=36, compact-sm=22。
 - `truncate` / `lineClamp={1}` → **强制单行**（xs 单行=17px），高度恒定，无需 pretext。

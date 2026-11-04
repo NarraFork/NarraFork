@@ -1,7 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import {
 	measureSpecTask,
-	SPEC_TASK_LINE_HEIGHT,
 	SPEC_TASK_LOCK,
 	SPEC_TASK_LOCK_GAP,
 	specTaskChromeWidth,
@@ -21,6 +20,13 @@ beforeAll(() => {
  * column made render subtract the chrome twice, so the precomputed height was based
  * on a wider column than the DOM painted and the task text was clipped.
  */
+
+/**
+ * The xs line the measure layer reads live: 20 at the default setting, 120% of the
+ * bare-Mantine 17 the exported `SPEC_TASK_LINE_HEIGHT` records (LINE_HEIGHT_BASELINE_PERCENT).
+ */
+const SPEC_TASK_LINE_HEIGHT = 20;
+
 describe("spec task row fits inside the bubble's inner width", () => {
 	for (const isProtected of [false, true]) {
 		it(`chrome + text column never exceeds the inner width (protected=${isProtected})`, () => {

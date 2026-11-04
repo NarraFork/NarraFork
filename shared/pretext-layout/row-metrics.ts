@@ -39,7 +39,7 @@ import { getTypographyRevision, scaleFontSize, scaleLineHeightRatio } from "./ty
  * This is the BASELINE. Measurement must read {@link bareRowMetrics} so the reader's
  * font scale applies.
  */
-export const BARE_XS_LINE = FONT_SIZE.xs * LINE_HEIGHT.xs;
+export const BARE_XS_LINE_BASELINE = FONT_SIZE.xs * LINE_HEIGHT.xs;
 
 /** A row's `<Group py={1}>` padding (top and bottom each). */
 export const BARE_ROW_PADDING_Y = 1;
@@ -64,7 +64,7 @@ export const BARE_ROW_CONTENT = Math.max(
 	BARE_ROW_ICON,
 	BARE_ROW_CHEVRON,
 	BARE_ROW_STATUS,
-	BARE_XS_LINE,
+	BARE_XS_LINE_BASELINE,
 );
 
 /** Bare row height at NEUTRAL typography: `py*2 + content = 2 + 16.8 = 18.8`. */
@@ -72,7 +72,7 @@ export const BARE_ROW_HEIGHT = BARE_ROW_PADDING_Y * 2 + BARE_ROW_CONTENT;
 
 /** A bare row's geometry at the reader's current typography. */
 export interface BareRowMetrics {
-	/** Scaled xs line box (unrounded, see {@link BARE_XS_LINE}). */
+	/** Scaled xs line box (unrounded, see {@link BARE_XS_LINE_BASELINE}). */
 	xsLine: number;
 	/** `max(glyph slots, xsLine)` — the lane the row's cells share. */
 	content: number;
@@ -96,7 +96,7 @@ let cacheRevision = -1;
 export function bareRowMetrics(): BareRowMetrics {
 	const revision = getTypographyRevision();
 	if (cache && cacheRevision === revision) return cache;
-	// Deliberately UNROUNDED (see BARE_XS_LINE), and scaled on both axes so a bare row
+	// Deliberately UNROUNDED (see BARE_XS_LINE_BASELINE), and scaled on both axes so a bare row
 	// follows the same leading as the prose beside it.
 	const xsLine = scaleFontSize(FONT_SIZE.xs) * scaleLineHeightRatio(LINE_HEIGHT.xs);
 	const content = Math.max(BARE_ROW_ICON, BARE_ROW_CHEVRON, BARE_ROW_STATUS, xsLine);

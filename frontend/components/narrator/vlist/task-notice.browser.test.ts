@@ -139,6 +139,8 @@ for (const { name, options } of CASES) {
 				painted: card.measured,
 			});
 			expect(card.content).toBeLessThanOrEqual(card.painted);
+			// Nor into its padding: the measure pass reserved every line, at this typography.
+			expect(card.spill).toBeLessThanOrEqual(0.5);
 			expect(card.scrollWidth).toBeLessThanOrEqual(card.width);
 			expect(card.lineOverflow).toBeLessThanOrEqual(0.5);
 			// No Markdown reaches the reader.

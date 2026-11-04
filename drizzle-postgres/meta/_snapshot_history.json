@@ -440,6 +440,14 @@
 			"prevId": "44e5308f-2856-4b61-8e5f-51d58efdb21a",
 			"version": "7",
 			"snapshotDigest": "00c42b1563efcad59bf37322bb13e8df905ae5c417f5ca8a967cc70d0e87ae8b"
+		},
+		{
+			"idx": 55,
+			"tag": "0055_narrator_line_height_v2",
+			"id": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
+			"prevId": "af2ae099-396f-4399-8676-928a7d7d4a6b",
+			"version": "7",
+			"snapshotDigest": "f074f16d61810f35a714a5b6959a38c133e6571cce0d2838427076bf7cb4c513"
 		}
 	]
 }

@@ -37,6 +37,12 @@
 	padding: var(--mantine-spacing-xs);
 }
 
+/* The panel's page scrolls; nothing in it shrinks to make room (an Alert, which hides its own
+   overflow, would otherwise be squashed to a sliver once the body outgrows the panel). */
+.surface[data-layout="panel"] > .page > * {
+	flex-shrink: 0;
+}
+
 .toolbar {
 	display: flex;
 	align-items: center;
@@ -111,16 +117,17 @@
 	padding-block: 2px;
 	border-radius: var(--mantine-radius-sm);
 	content-visibility: auto;
-	contain-intrinsic-size: auto 28px;
+	contain-intrinsic-size: auto calc(var(--nf-type-body-line) + 4px);
 }
 
 .indent {
 	flex: 0 0 auto;
 }
 
+/* Toggle, bullet and task icon sit on the first line: the conversation's body line box. */
 .toggle {
 	flex: 0 0 20px;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -128,7 +135,7 @@
 
 .bullet {
 	flex: 0 0 16px;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -150,17 +157,23 @@
 
 .taskIcon {
 	flex: 0 0 auto;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
+}
+
+/* The page title's task icon sits on the title's first line (the conversation's h3). */
+.titleRow > .taskIcon {
+	height: var(--nf-type-h3-line);
 }
 
 .content {
 	flex: 1 1 auto;
 	min-width: 0;
 	overflow-wrap: anywhere;
-	line-height: 24px;
-	font-size: var(--mantine-font-size-sm);
+	/* The conversation's body text; the body inside carries `.nf-type-scope` (OutlineBlockBody). */
+	line-height: var(--nf-type-body-line);
+	font-size: var(--nf-type-body-size);
 }
 
 .content[data-done="true"] {
@@ -168,25 +181,48 @@
 	text-decoration: line-through;
 }
 
-/* Bodies are one block each: no outer margins, no horizontal overflow. */
-.content :global([data-md-body]) > *,
-.content :global(p),
-.content :global(h1),
-.content :global(h2),
-.content :global(h3),
-.content :global(h4),
-.content :global(h5),
-.content :global(h6),
-.content :global(blockquote),
-.content :global(pre),
-.content :global(table) {
-	margin-block: 0;
-}
-
 .content :global(pre),
 .content :global(table) {
 	max-width: 100%;
 	overflow-x: auto;
+}
+
+/*
+ * Bodies are one block each: no outer margins, no horizontal overflow. Two classes deep, so the
+ * reset wins over the markdown renderer's own margins (one class and one element, like a single
+ * `.content` here) whatever order the bundler emits the two stylesheets in.
+ */
+.content :global(.nf-type-scope) :global([data-md-body]) > *,
+.content :global(.nf-type-scope) :global(p),
+.content :global(.nf-type-scope) :global(h1),
+.content :global(.nf-type-scope) :global(h2),
+.content :global(.nf-type-scope) :global(h3),
+.content :global(.nf-type-scope) :global(h4),
+.content :global(.nf-type-scope) :global(h5),
+.content :global(.nf-type-scope) :global(h6),
+.content :global(.nf-type-scope) :global(blockquote),
+.content :global(.nf-type-scope) :global(pre),
+.content :global(.nf-type-scope) :global(table) {
+	margin-block: 0;
+}
+
+/*
+ * A heading block's toggle, bullet and task icon sit on the heading's own first line (the body
+ * is `.content > .nf-type-scope > [markdown root] > h1…h3`), as in the live editor.
+ */
+.row:has(> .content > :global(.nf-type-scope) > * > h1:first-child)
+> :is(.toggle, .bullet, .taskIcon) {
+	height: var(--nf-type-h1-line);
+}
+
+.row:has(> .content > :global(.nf-type-scope) > * > h2:first-child)
+	> :is(.toggle, .bullet, .taskIcon) {
+	height: var(--nf-type-h2-line);
+}
+
+.row:has(> .content > :global(.nf-type-scope) > * > h3:first-child)
+	> :is(.toggle, .bullet, .taskIcon) {
+	height: var(--nf-type-h3-line);
 }
 
 .meta {
@@ -198,7 +234,7 @@
 }
 
 .more {
-	font-size: var(--mantine-font-size-xs);
+	font-size: var(--nf-type-xs-size);
 	color: var(--mantine-color-dimmed);
 	text-decoration: none;
 }

@@ -6,6 +6,8 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import type { OutlineBoardTask } from "@shared/outline-task-board";
+import { typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
+import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { createRoot, type Root } from "react-dom/client";
@@ -103,4 +105,32 @@ export function type(selector: string, text: string): boolean {
 /** Text of the element a test id names (the first), or null. */
 export function textOf(testId: string): string | null {
 	return document.querySelector(`[data-testid=${testId}]`)?.textContent ?? null;
+}
+
+/** Set the reader's typography (外观 · 排版), as the sliders do. */
+export function applyTypography(next: Partial<TypographySettings>): void {
+	setTypography(next);
+}
+
+/**
+ * A task row's title and meta text: computed size and line box (px), with what the
+ * conversation measures the body and xs roles with.
+ */
+export function rowTypography(title: string) {
+	const row = document.querySelector(`[data-testid=task-row][data-title="${title}"]`);
+	const texts = row ? [...row.querySelectorAll("p")] : [];
+	const px = (el: Element | undefined) => {
+		if (!el) return null;
+		const cs = getComputedStyle(el);
+		return { size: Number.parseFloat(cs.fontSize), line: Number.parseFloat(cs.lineHeight) };
+	};
+	const m = typographyMetrics();
+	return {
+		title: px(texts.find((p) => p.textContent === title)),
+		address: px(texts.find((p) => getComputedStyle(p).fontFamily.includes("monospace"))),
+		expected: {
+			body: { size: m.size.sm, line: m.line.body },
+			xs: { size: m.size.xs, line: m.line.xs },
+		},
+	};
 }

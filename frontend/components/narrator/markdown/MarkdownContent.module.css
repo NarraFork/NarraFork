@@ -81,7 +81,8 @@
 :is(.root, .rootNoWrap) code.mdCode {
 	font-family: var(--mantine-font-family-monospace);
 	font-size: var(--mantine-font-size-xs);
-	line-height: var(--mantine-line-height);
+	/* Inside `.nf-type-scope` (the outline) inline code takes no line box of its own. */
+	line-height: var(--nf-scoped-inline-code-line, var(--mantine-line-height));
 	padding: 2px calc(var(--mantine-spacing-xs) / 2);
 	border-radius: var(--mantine-radius-sm);
 	background-color: var(--mantine-color-dark-5);
