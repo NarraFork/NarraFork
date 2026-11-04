@@ -516,13 +516,29 @@ export async function handleLoadToolCommand(
 		return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 	}
 	const alreadyLoaded = status === "already_loaded";
-	const infoText = alreadyLoaded
+	let infoText = alreadyLoaded
 		? locale === "zh-CN"
 			? `🔧 工具已加载：${displayToolName}`
 			: `🔧 Tool already loaded: ${displayToolName}`
 		: locale === "zh-CN"
 			? `🔧 工具加载成功：${displayToolName}`
 			: `🔧 Tool loaded: ${displayToolName}`;
+	if (status === "loaded_new_epoch") {
+		const { suggestProtocolsForToolLoading } = await import("./tool-loading-service");
+		const protocols = await suggestProtocolsForToolLoading(narratorId, locale);
+		infoText +=
+			locale === "zh-CN"
+				? `\n当前协议无法在对话中途追加工具声明，下一次请求会重建提示缓存（对话内容保留）。${
+						protocols.length
+							? `把这个模型的协议切换为 ${protocols.join(" 或 ")} 后，之后加载工具可以保持缓存。`
+							: ""
+					}`
+				: `\nThis protocol cannot add tool declarations mid-conversation, so the next request rebuilds the prompt cache (the conversation is kept).${
+						protocols.length
+							? ` Switching this model's protocol to ${protocols.join(" or ")} would let later tool loads keep the cache.`
+							: ""
+					}`;
+	}
 	await narratorService.persistDisplayMessage(narratorId, infoText);
 
 	return { toolName: displayToolName, loaded: true, alreadyLoaded };

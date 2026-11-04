@@ -26,9 +26,8 @@ export const toolSearchTool: ToolDefinition = {
 		};
 		context.signal.throwIfAborted();
 		await context.recheckAuthorization?.();
-		const { getToolSearchCandidates, changeLoadedToolGroup } = await import(
-			"../../../services/tool-loading-service"
-		);
+		const { getToolSearchCandidates, changeLoadedToolGroup, suggestProtocolsForToolLoading } =
+			await import("../../../services/tool-loading-service");
 		const candidates = await getToolSearchCandidates(context.narratorId, context.userId, context);
 		const documents = candidates.flatMap((group) => {
 			const exactGroup = [group.id, group.id.replace(/^mcp-server:/, "")];
@@ -46,6 +45,7 @@ export const toolSearchTool: ToolDefinition = {
 		});
 		const hits = await searchToolDocuments(documents, query, limit, context.signal);
 		const results: { group: string; status: string; error?: string }[] = [];
+		let rebuiltPrefix = false;
 		for (const hit of hits) {
 			const group = candidates.find((candidate) => candidate.id === hit.id);
 			if (!group) continue;
@@ -58,7 +58,11 @@ export const toolSearchTool: ToolDefinition = {
 					context,
 				);
 				const denied = status.startsWith("denied");
-				results.push({ group: group.id.slice(0, 256), status: denied ? "denied" : status });
+				if (status === "loaded_new_epoch") rebuiltPrefix = true;
+				results.push({
+					group: group.id.slice(0, 256),
+					status: denied ? "denied" : status === "loaded_new_epoch" ? "loaded" : status,
+				});
 			} catch (error) {
 				// Cancellation and the execution deadline are control flow, not per-hit failures.
 				context.signal.throwIfAborted();
@@ -76,9 +80,21 @@ export const toolSearchTool: ToolDefinition = {
 				durationMs: Date.now() - started,
 				groups: candidates.length,
 			});
+		const protocols = rebuiltPrefix
+			? await suggestProtocolsForToolLoading(context.narratorId, "en", context)
+			: [];
 		const output = JSON.stringify({
 			results,
 			...(results.length ? {} : { message: "No matching authorized auto-mode tools found." }),
+			...(rebuiltPrefix
+				? {
+						note:
+							"This model's current protocol cannot add tool declarations mid-conversation, so the next request starts a new prompt-cache baseline that declares the loaded tools. The conversation is kept." +
+							(protocols.length
+								? ` Tell the user that switching this model's protocol to ${protocols.join(" or ")} in the provider settings would let later tool loads keep the prompt cache.`
+								: ""),
+					}
+				: {}),
 		});
 		return { output };
 	},

@@ -1751,6 +1751,8 @@ const sqliteNarratorPersistence = {
 			text: string;
 			definitionSnapshots?: import("../lib/agent/tool-loading").ToolDefinitionSnapshot[];
 			definitionSnapshotRef?: string;
+			/** The epoch's strategy could not append this load; the next request rebaselines. */
+			rebaseline?: true;
 		},
 		/** `system` for a change the runtime reconciled rather than a `/load` someone typed. */
 		origin?: "system",
