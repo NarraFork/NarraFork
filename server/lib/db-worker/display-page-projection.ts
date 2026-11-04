@@ -1,4 +1,5 @@
 import { fileReferenceContentForDisplay } from "../../../shared/file-reference";
+import { GEN_UI_TOOL_NAME } from "../../../shared/gen-ui-tool-policy";
 import { projectToolIO } from "../../../shared/pretext-layout/tool-io-projection";
 import { OUTLINE_EDIT_TOOL } from "../agent/tools/outline-names";
 import { toolCallWithExecutionTargets } from "../tool-execution-target-projection";
@@ -6,7 +7,7 @@ import type { NarratorDisplayMessage, NarratorDisplayToolCall } from "./display-
 
 const PRESERVE_ALL = new Set(["ExitPlanMode"]);
 /** Kept whole like `SKIP_INPUT_TRUNCATE_TOOLS` in `narrator-messages.ts`. */
-const PRESERVE_INPUT = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
+const PRESERVE_INPUT = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL, GEN_UI_TOOL_NAME]);
 
 function preserveInput(toolName: string, input: unknown): boolean {
 	if (PRESERVE_ALL.has(toolName) || PRESERVE_INPUT.has(toolName)) return true;

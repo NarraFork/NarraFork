@@ -1917,6 +1917,7 @@
 	"details.stats.inputTokens": "Total input",
 	"details.stats.outputTokens": "Total output",
 	"details.stats.cacheReadTokens": "Cache reads",
+	"details.stats.outputSpeed": "Avg output speed",
 	"details.stats.usageHistoryIncludesSubagents": "From usage history · includes subagents",
 	"details.stats.viewers": "Viewers",
 	"details.stats.terminals": "Terminals",
@@ -2373,7 +2374,9 @@
 		"blocking_question": "Blocking question",
 		"permission": "Tool permission",
 		"plan_approval": "Plan approval",
-		"reflection": "Reflection · human decision"
+		"reflection": "Reflection · human decision",
+		"outline_decision": "Outline · your decision",
+		"outline_digest": "Outline · confirmed for you"
 	},
 	"optimizePrompt": "Optimize prompt",
 	"optimizeCancel": "Cancel optimization",
@@ -2506,6 +2509,11 @@
 	"dangerCopy_switchCwdC2": "Existing background tools, subagents and terminals remain on their original targets.",
 	"dangerCopy_switchCwdA1": "Verify the target device and directory match the user's requested workspace.",
 	"dangerCopy_switchCwdA2": "Keep the current workspace if switching is not necessary for this task.",
+	"dangerCopy_worktreeSwitchSummary": "Creating a worktree also switches the narrator's execution workspace.",
+	"dangerCopy_worktreeSwitchC1": "Subsequent tools use the new worktree as working directory, with its own skills and permission context.",
+	"dangerCopy_worktreeSwitchC2": "Existing background tools, subagents and terminals keep their original targets after the switch.",
+	"dangerCopy_worktreeSwitchA1": "Verify the destination worktree matches the user's requested workspace.",
+	"dangerCopy_worktreeSwitchA2": "Omit switchToWorktree to create the worktree without changing the working directory.",
 	"dangerCopy_subagentWorkdirSummary": "Write-capable subagent requests a custom working directory.",
 	"dangerCopy_subagentWorkdirC1": "The subagent may operate outside the parent narrator's current workspace.",
 	"dangerCopy_subagentWorkdirC2": "A write-capable subagent can modify files the parent did not inspect.",
@@ -2635,6 +2643,7 @@
 			"requestKind": "Request kind",
 			"ttft": "Time to first token",
 			"tokens": "Input / output tokens",
+			"outputSpeed": "Output speed",
 			"noItems": "No record covers this span: usually scheduling between model requests, result persistence and context preparation.",
 			"afterTurn": "The turn has ended while a subagent is still running.",
 			"merged": "Merged from {{count}} short segments, coloured by the largest share:"
@@ -2651,5 +2660,12 @@
 			"overhead": "Scheduling / idle",
 			"after_turn": "Turn ended"
 		}
+	},
+	"outlineAttention": {
+		"questions": "{{title}} · {{count}} question(s) for you",
+		"pending": "{{summary}} · a change to your locked plan ({{count}} edit(s)) waits for your confirmation",
+		"digest": "{{count}} change(s) an agent confirmed on your behalf",
+		"from": "From: {{narrator}}",
+		"fromHidden": "From a session you cannot open"
 	}
 }

@@ -266,6 +266,27 @@ const EXACT: Map<string, string> = new Map([
 		"Keep the current workspace if switching is not necessary for this task.",
 		"dangerCopy_switchCwdA2",
 	],
+	// ── worktree creation that also switches the workspace ──────────────────
+	[
+		"Creating a worktree also switches the narrator's execution workspace.",
+		"dangerCopy_worktreeSwitchSummary",
+	],
+	[
+		"Subsequent tools use the new worktree as working directory, with its own skills and permission context.",
+		"dangerCopy_worktreeSwitchC1",
+	],
+	[
+		"Existing background tools, subagents and terminals keep their original targets after the switch.",
+		"dangerCopy_worktreeSwitchC2",
+	],
+	[
+		"Verify the destination worktree matches the user's requested workspace.",
+		"dangerCopy_worktreeSwitchA1",
+	],
+	[
+		"Omit switchToWorktree to create the worktree without changing the working directory.",
+		"dangerCopy_worktreeSwitchA2",
+	],
 	[
 		"Write-capable subagent requests a custom working directory.",
 		"dangerCopy_subagentWorkdirSummary",

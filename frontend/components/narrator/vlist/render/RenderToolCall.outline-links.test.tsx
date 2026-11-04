@@ -131,6 +131,41 @@ const edit = toolMessage(
 	},
 );
 
+const asked = toolMessage(
+	"Ask",
+	{
+		questions: [
+			{
+				question: "Which format first?",
+				options: ["v1", "v2"],
+				recommend: 2,
+				items: [{ question: "Keep v1?", recommend: "read-only" }],
+			},
+		],
+	},
+	"Asked Q1 [Qq1Sid00], Q2 [Qq2Sid00] under [Ab3dEf9Q] for alice.",
+	{
+		tool: "Ask",
+		space: { key: "Kx81mPqa", kind: "project" },
+		under: "Kx81mPqa/Ab3dEf9Q",
+		addresses: ["Kx81mPqa/Qq1Sid00", "Kx81mPqa/Qq2Sid00"],
+	},
+);
+
+describe("the Ask card", () => {
+	it("links each question and the block they are under (whose side panel answers them)", () => {
+		mountAt("https://nf.example.com/nf/");
+		const root = renderCard(asked, true);
+		const links = outlineAnchors(root).map((a) => a.href);
+		expect(links).toContain("/nf/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
+		expect(links).toContain("/nf/outline/ref?a=Kx81mPqa%2FQq1Sid00");
+		expect(links).toContain("/nf/outline/ref?a=Kx81mPqa%2FQq2Sid00");
+		expect(root.textContent).toContain("Which format first?");
+		expect(root.textContent).toContain("Keep v1?");
+		expect(root.textContent).toContain("→ v2");
+	});
+});
+
 describe("outline tool cards", () => {
 	it("link the read's address, each hit and the edit's target and commit inside a host", () => {
 		mountAt("https://nf.example.com/nf/");

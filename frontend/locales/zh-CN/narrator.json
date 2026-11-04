@@ -1914,6 +1914,7 @@
 	"details.stats.inputTokens": "总输入",
 	"details.stats.outputTokens": "总输出",
 	"details.stats.cacheReadTokens": "缓存读取",
+	"details.stats.outputSpeed": "平均输出速度",
 	"details.stats.usageHistoryIncludesSubagents": "来自使用历史 · 含子代理",
 	"details.stats.viewers": "查看者",
 	"details.stats.terminals": "终端",
@@ -2370,7 +2371,9 @@
 		"blocking_question": "阻塞问答",
 		"permission": "工具权限",
 		"plan_approval": "计划审批",
-		"reflection": "反思 · 已转人工"
+		"reflection": "反思 · 已转人工",
+		"outline_decision": "大纲 · 待你决定",
+		"outline_digest": "大纲 · 代你确认"
 	},
 	"optimizePrompt": "优化提示词",
 	"optimizeCancel": "取消优化",
@@ -2523,6 +2526,11 @@
 	"dangerCopy_switchCwdC1": "后续工具会使用不同的工作目录、技能与权限上下文。",
 	"dangerCopy_switchCwdC2": "已有后台工具、子代理和终端仍指向原目标。",
 	"dangerCopy_switchCwdSummary": "SwitchWorkingDirectory 会更改叙述者的执行工作区。",
+	"dangerCopy_worktreeSwitchSummary": "创建 worktree 的同时会切换叙述者的执行工作区。",
+	"dangerCopy_worktreeSwitchC1": "后续工具会以新 worktree 作为工作目录，并使用其技能与权限上下文。",
+	"dangerCopy_worktreeSwitchC2": "已有后台工具、子代理和终端在切换后仍指向原目标。",
+	"dangerCopy_worktreeSwitchA1": "核对目标 worktree 是否与用户请求的工作区一致。",
+	"dangerCopy_worktreeSwitchA2": "如不需要切换工作目录，去掉 switchToWorktree 参数即可只创建 worktree。",
 	"dangerCopy_toolExternalPathsA1": "尽可能在 worktree 内操作。",
 	"dangerCopy_toolExternalPathsA2": "对外部文件使用明确的用户批准。",
 	"dangerCopy_toolExternalPathsC1": "操作跨越了 worktree 边界。",
@@ -2632,6 +2640,7 @@
 			"requestKind": "请求类型",
 			"ttft": "首 token 耗时",
 			"tokens": "输入 / 输出 tokens",
+			"outputSpeed": "输出速度",
 			"noItems": "这段时间没有对应的记录：通常是模型请求之间的调度、结果写入与上下文准备。",
 			"afterTurn": "该轮次已结束，子代理仍在运行。",
 			"merged": "由 {{count}} 个短片段合并而成，颜色取占比最大的类别："
@@ -2648,5 +2657,12 @@
 			"overhead": "调度 / 空闲",
 			"after_turn": "轮次已结束"
 		}
+	},
+	"outlineAttention": {
+		"questions": "{{title}} · {{count}} 条问你的提问",
+		"pending": "{{summary}} · 你锁定的计划有改动（{{count}} 处）等你确认",
+		"digest": "agent 代你确认了 {{count}} 处改动",
+		"from": "来自：{{narrator}}",
+		"fromHidden": "来自一个你无权查看的会话"
 	}
 }

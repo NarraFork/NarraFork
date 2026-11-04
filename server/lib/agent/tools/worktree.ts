@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { worktreeListPreview } from "@shared/narrator-worktrees";
+import { type WorktreeCreateResult, worktreeListPreview } from "@shared/narrator-worktrees";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { z } from "zod/v4";
 import type { NarratorPrincipal } from "../../../services/narrator-acl";
 import type { NarratorWorktreeService } from "../../../services/narrator-worktree-service";
@@ -159,6 +160,12 @@ const destinationPath = z
 	.describe(
 		"Absolute normalized destination inside the current repository root. Its non-symlink parent must exist; destination must not exist.",
 	);
+const switchToWorktree = z
+	.boolean()
+	.optional()
+	.describe(
+		"Also make the new worktree this narrator's working directory, instead of a separate SwitchWorkingDirectory call. Requires a switch-capable local primary narrator; a successful switch ends the current pass.",
+	);
 export const createWorktreeParameters = z.strictObject({
 	branchName,
 	destinationPath,
@@ -170,8 +177,13 @@ export const createWorktreeParameters = z.strictObject({
 		.describe(
 			"Starting commit/ref for the new branch. Defaults to HEAD; resolved once and frozen before creation.",
 		),
+	switchToWorktree,
 });
-export const attachWorktreeParameters = z.strictObject({ branchName, destinationPath });
+export const attachWorktreeParameters = z.strictObject({
+	branchName,
+	destinationPath,
+	switchToWorktree,
+});
 export const getWorktreeOperationParameters = z.strictObject({
 	operationId: z
 		.string()
@@ -226,13 +238,13 @@ export function createAgentWorktreeTools<Principal>(
 			name: "CreateWorktree",
 			parameters: createWorktreeParameters,
 			description:
-				"Create a worktree with a NEW explicitly named Git branch. Supply branchName and absolute destinationPath; baseRef defaults to HEAD. Parent directory must exist. Does not switch directories or copy uncommitted changes. The host binds the current workspace and a durable operation ID. If outcome is unknown, call GetWorktreeOperation with the returned operationId; do not create again or delete residuals.",
+				"Create a worktree with a NEW explicitly named Git branch. Supply branchName and absolute destinationPath; baseRef defaults to HEAD. Parent directory must exist. Does not copy uncommitted changes, and does not switch directories unless switchToWorktree is true. The host binds the current workspace and a durable operation ID. If outcome is unknown, call GetWorktreeOperation with the returned operationId; do not create again or delete residuals.",
 		},
 		{
 			name: "AttachWorktree",
 			parameters: attachWorktreeParameters,
 			description:
-				"Create a worktree by checking out an EXISTING local branch that is not already checked out. Supply branchName and absolute destinationPath. Parent directory must exist. Does not create a new branch, switch directories or copy uncommitted changes. If outcome is unknown, call GetWorktreeOperation with the returned operationId; do not create again or delete residuals.",
+				"Create a worktree by checking out an EXISTING local branch that is not already checked out. Supply branchName and absolute destinationPath. Parent directory must exist. Does not create a new branch or copy uncommitted changes; switches directories only when switchToWorktree is true. If outcome is unknown, call GetWorktreeOperation with the returned operationId; do not create again or delete residuals.",
 		},
 		{
 			name: "GetWorktreeOperation",
@@ -314,6 +326,9 @@ export function createAgentWorktreeTools<Principal>(
 							"WORKTREE_ACTOR_REQUIRED",
 						);
 					const intent = input.data as z.infer<typeof createWorktreeParameters>;
+					// Resolved before Git runs: an impossible switch must not leave a worktree behind.
+					const switchDirectory =
+						intent.switchToWorktree === true ? requireSwitchDirectory(ctx, workspace) : undefined;
 					const request = {
 						workspaceKey: workspace.git.workspaceKey,
 						expectedRevision: workspace.revision,
@@ -349,7 +364,13 @@ export function createAgentWorktreeTools<Principal>(
 						{ ...request, requestId: operationId },
 						ctx.signal,
 					);
-					return operationResult(operationId, result);
+					return operationResult(
+						operationId,
+						result,
+						switchDirectory
+							? await switchToCreatedWorktree(switchDirectory, workspace, result, operationId)
+							: undefined,
+					);
 				} catch (cause) {
 					const code = cause instanceof AppError ? cause.code : "WORKTREE_REQUEST_FAILED";
 					return {
@@ -367,9 +388,11 @@ export function createAgentWorktreeTools<Principal>(
 							nextAction:
 								code === "WORKTREE_REQUEST_NOT_FOUND"
 									? "No receipt was found. Verify the original operationId; do not infer that creation never happened."
-									: operationId
-										? "Do not recreate or clean up. Query GetWorktreeOperation with this operationId; restore the original authorized scope if recovery is denied."
-										: "Check arguments, authorization and the current workspace; refresh the session if its context is stale.",
+									: code === "WORKTREE_SWITCH_UNSUPPORTED"
+										? "Nothing was created. Retry without switchToWorktree, or call SwitchWorkingDirectory from a switch-capable primary narrator after creation."
+										: operationId
+											? "Do not recreate or clean up. Query GetWorktreeOperation with this operationId; restore the original authorized scope if recovery is denied."
+											: "Check arguments, authorization and the current workspace; refresh the session if its context is stale.",
 						}),
 					};
 				}
@@ -378,21 +401,91 @@ export function createAgentWorktreeTools<Principal>(
 	);
 }
 
+/** Whether the requested switch happened, and why not when it did not. */
+interface WorktreeSwitchOutcome {
+	switched: boolean;
+	error?: { code: string; message: string };
+}
+
+/**
+ * Resolve the switch port, or refuse before Git runs: creating a worktree this
+ * caller can never work in is a durable side effect nobody asked for.
+ */
+function requireSwitchDirectory(
+	ctx: ToolContext,
+	workspace: WorkspaceContext,
+): NonNullable<ToolContext["switchWorkingDirectory"]> {
+	if (!ctx.switchWorkingDirectory || !workspace.capabilities.switchDirectory)
+		throw new AppError(
+			"This runtime cannot switch the narrator working directory; omit switchToWorktree, or create the worktree here and call SwitchWorkingDirectory from a switch-capable primary narrator.",
+			409,
+			"WORKTREE_SWITCH_UNSUPPORTED",
+		);
+	return ctx.switchWorkingDirectory;
+}
+
+/**
+ * Reuses the ordinary workspace transition — same admission, CAS, publication and
+ * pass-ending behaviour as a separate SwitchWorkingDirectory call, without spending
+ * another tool call. That transition is idempotent by itself (a context already at
+ * the target returns changed:false), so any result that does not throw leaves this
+ * narrator working in the created worktree. A failed switch never disguises the
+ * creation that already succeeded, and is never retried here.
+ */
+async function switchToCreatedWorktree(
+	switchDirectory: NonNullable<ToolContext["switchWorkingDirectory"]>,
+	workspace: WorkspaceContext,
+	result: WorktreeCreateResult,
+	operationId: string,
+): Promise<WorktreeSwitchOutcome | undefined> {
+	// Nothing was created, so there is nothing to switch to: recovery guidance owns this outcome.
+	if (result.outcome !== "created" || !result.worktree) return undefined;
+	try {
+		await switchDirectory({
+			expectedRevision: workspace.revision,
+			// Derived from the creation identity so one intent has one switch id in the logs.
+			requestId: `switch-${operationId}`,
+			target: { deviceId: workspace.deviceId, cwd: result.worktree.path },
+		});
+		return { switched: true };
+	} catch (cause) {
+		return {
+			switched: false,
+			error: {
+				code: cause instanceof AppError ? cause.code : "WORKTREE_SWITCH_FAILED",
+				message: (cause instanceof Error ? cause.message : String(cause)).slice(0, 1024),
+			},
+		};
+	}
+}
+
+function nextActionFor(
+	outcome: WorktreeCreateResult["outcome"],
+	worktreeSwitch?: WorktreeSwitchOutcome,
+): string {
+	if (outcome === "unknown")
+		return "Query GetWorktreeOperation with this operationId. Do not recreate or clean up.";
+	if (outcome !== "created")
+		return "This operation failed. Inspect the error and residuals before making a corrected request; do not blindly retry or clean up.";
+	if (!worktreeSwitch)
+		return "Worktree created; cwd unchanged. SwitchWorkingDirectory if this narrator will work there (visible git stats follow cwd). Pass the path as Agent workdir to assign it to a subagent without switching.";
+	return worktreeSwitch.switched
+		? "Worktree created and the working directory switched to it. This pass ends; the next pass starts in the new worktree."
+		: "Worktree created, but the switch did not complete. Do not recreate it. Check this session's workspace state, then switch to this path with SwitchWorkingDirectory or pass it as Agent workdir.";
+}
+
 function operationResult(
 	operationId: string,
-	result: import("@shared/narrator-worktrees").WorktreeCreateResult,
+	result: WorktreeCreateResult,
+	worktreeSwitch?: WorktreeSwitchOutcome,
 ) {
 	return {
 		isError: result.outcome !== "created",
 		output: JSON.stringify({
 			...result,
 			operationId,
-			nextAction:
-				result.outcome === "unknown"
-					? "Query GetWorktreeOperation with this operationId. Do not recreate or clean up."
-					: result.outcome === "created"
-						? "Worktree created; cwd unchanged. SwitchWorkingDirectory if this narrator will work there (visible git stats follow cwd). Pass the path as Agent workdir to assign it to a subagent without switching."
-						: "This operation failed. Inspect the error and residuals before making a corrected request; do not blindly retry or clean up.",
+			...(worktreeSwitch ? { switch: worktreeSwitch } : {}),
+			nextAction: nextActionFor(result.outcome, worktreeSwitch),
 		}),
 	};
 }

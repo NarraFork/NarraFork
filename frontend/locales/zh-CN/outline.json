@@ -42,6 +42,12 @@
 			"done": "完成",
 			"cancelled": "已取消"
 		},
+		"question": {
+			"open": "问人的提问：等待回答",
+			"openProceeded": "问人的提问：agent 已先按建议做",
+			"answered": "问人的提问：已回答",
+			"withdrawn": "问人的提问：已撤回"
+		},
 		"expand": "展开",
 		"collapse": "折叠",
 		"focus": "聚焦到这个块",
@@ -143,6 +149,9 @@
 		"sessionUnavailable": "你无法打开写入它的会话。"
 	},
 	"editor": {
+		"questionMark": "问人的提问：在收件箱里回答。删除它就是撤回提问。",
+		"questionsWithdrawn_one": "删除撤回了一条问人的提问；撤销即可重新提问。",
+		"questionsWithdrawn_other": "删除撤回了 {{count}} 条问人的提问；撤销即可重新提问。",
 		"changeStatus": "切换状态",
 		"tooLarge": "一个块最多 16 KB，请拆成几个块。",
 		"rootKept": "正在聚焦的块不能在这里删除；退到上一层再删。",
@@ -293,6 +302,47 @@
 		"taskRemoved": "去掉复选框",
 		"taskDue": "截止：{{date}}",
 		"taskAssignee": "指派：{{name}}"
+	},
+	"questions": {
+		"title": "提问",
+		"under": "「{{title}}」下的提问",
+		"single": "一条提问及其细项",
+		"openInOutline": "在大纲中打开",
+		"askedOf": "问 {{name}}",
+		"askedBy": "{{title}} 提问",
+		"askedByHidden": "由一个你无权查看的会话提问",
+		"proceeded": "agent 已先按建议做",
+		"recommended": "建议：{{choice}}",
+		"recommendedWhy": "建议：{{choice}}（{{reason}}）",
+		"recommendedMark": "（建议）",
+		"theRecommendation": "采纳建议",
+		"answeredBy": "{{name}} 已回答：{{choice}}",
+		"answeredRelayed": "{{name}} 在对话里回答：{{choice}}",
+		"answeredRelayedVia": "{{name}} 在对话里回答（经 {{via}}）：{{choice}}",
+		"withdrawn": "已撤回",
+		"waitingFor": "等 {{name}} 回答",
+		"notePlaceholder": "补充说明，或用自己的话回答",
+		"answerPlaceholder": "你的回答",
+		"adoptAll": "全部采纳建议（{{count}}）",
+		"submit": "回答",
+		"nothingToSend": "先选一个选项或写下回答",
+		"answered": "已回答 {{count}} 条提问，已通知 agent",
+		"answerFailed": "回答没有保存",
+		"changedTitle": "提问已改动，请重新阅读",
+		"loadFailed": "提问加载失败",
+		"none": "这里没有提问",
+		"truncated": "提问比显示的多：先回答这些"
+	},
+	"digest": {
+		"intro": "你指定代你确认的会话确认了你锁定计划里的这些改动；不同意的可以撤回。",
+		"empty": "没有代你确认的改动",
+		"changes": "{{count}} 处改动",
+		"confirmedBy": "{{title}} 代确认",
+		"confirmedByHidden": "由一个你无权查看的会话代确认",
+		"revert": "撤回",
+		"reverted": "已撤回",
+		"revertFailed": "撤回失败",
+		"gotIt": "知道了"
 	},
 	"board": {
 		"title": "任务",

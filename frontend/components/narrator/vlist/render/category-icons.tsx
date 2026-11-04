@@ -77,6 +77,8 @@ function outlineIcon(toolName?: string): ComponentType<IconProps> {
 			return IconListSearch;
 		case "OutlineEdit":
 			return IconListDetails;
+		case "Ask":
+			return IconMessageQuestion;
 		default:
 			return IconListTree;
 	}

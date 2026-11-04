@@ -311,6 +311,8 @@ export interface TokenUsageSnapshot {
 	cacheCreation1hTokens?: number;
 	contextWindow?: number;
 	isEstimated?: boolean;
+	/** This request's first-content → end time; set by api_request_end. */
+	decodeMs?: number;
 }
 
 export interface EventHandlerContext {
@@ -2296,6 +2298,7 @@ export async function processEvent(
 						}),
 						...(tokenUsage.contextSnapshot && { context_snapshot: tokenUsage.contextSnapshot }),
 						...(tokenUsage.isEstimated && { is_estimated: true }),
+						...(tokenUsage.decodeMs != null && { decode_ms: tokenUsage.decodeMs }),
 					}
 				: undefined;
 			let savedId: string;
@@ -3510,6 +3513,10 @@ export async function processEvent(
 				ctx.accountRequestTokenUsage?.(event.usage);
 				recordTurnStep(narratorId, ctx.model, event.usage);
 			}
+			// The assistant_message that follows this end stamps it into turnUsageJson.
+			if (requestInfo && event.decodeMs != null) {
+				ctx.setTokenUsage({ ...ctx.getTokenUsage(), decodeMs: event.decodeMs });
+			}
 			const snapshot = boundedContextSnapshot(event.contextSnapshot);
 			if (snapshot) {
 				await storeNarratorContextUsage(narratorId, snapshot);
@@ -3558,6 +3565,7 @@ export async function processEvent(
 					credentialId: event.credentialId,
 					ttftMs: event.ttftMs ?? null,
 					durationMs: event.durationMs ?? null,
+					decodeMs: event.decodeMs ?? null,
 					contextPercent: event.contextPercent ?? null,
 					contextSnapshot: snapshot,
 					meterUsage: event.meterUsage ?? null,

@@ -142,8 +142,8 @@ const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeAdmin",
 ]);
 
-/** The block outline: reads, searches and edits of the team's versioned notes. */
-const OUTLINE_TOOLS = new Set(["OutlineRead", "OutlineSearch", "OutlineEdit"]);
+/** The block outline: reads, searches and edits of the team's versioned notes, and questions. */
+const OUTLINE_TOOLS = new Set(["OutlineRead", "OutlineSearch", "OutlineEdit", "Ask"]);
 
 export function getCategory(name: string, input?: unknown): ToolCategory {
 	// Spec task-queue file operations render as a task list, not a raw file diff.
@@ -510,6 +510,22 @@ export function outlineSummary(
 			const parts = [...kinds].map(([kind, n]) => (n === 1 ? kind : `${kind} ×${n}`));
 			if (typeof seq === "number") parts.push(`#${seq}`);
 			return parts.length > 0 ? parts.join(" · ") : "Edit";
+		}
+		case "Ask": {
+			const obj = input && !isTruncated(input) && typeof input === "object" ? input : {};
+			const record = obj as Record<string, unknown>;
+			if (Array.isArray(record.withdraw)) return `withdraw ×${record.withdraw.length}`;
+			if (Array.isArray(record.answered)) return `answered ×${record.answered.length}`;
+			const questions = Array.isArray(record.questions) ? record.questions : [];
+			const first = questions[0];
+			const text =
+				first && typeof first === "object"
+					? String((first as Record<string, unknown>).question ?? "")
+					: "";
+			if (!text) return "Ask";
+			return questions.length > 1
+				? `${short(text, 48)} · +${questions.length - 1}`
+				: short(text, 60);
 		}
 		default:
 			return toolName;
