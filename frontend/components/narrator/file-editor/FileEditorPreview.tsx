@@ -34,7 +34,7 @@ export function FileEditorPreview({
 	filePath: string;
 	deviceId: string;
 	narratorId?: string;
-	/** Stamp `data-line` anchors so the split view can scroll-sync by source line. */
+	/** Stamp `data-line` anchors: split scroll sync, line jumps and mode-switch positions. */
 	withSourceLines?: boolean;
 }) {
 	const { t } = useTranslation("narrator");

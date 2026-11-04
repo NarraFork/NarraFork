@@ -108,6 +108,58 @@ const FileEditorPreview = lazy(() =>
 );
 const PREVIEW_BYTES = 1024 * 1024;
 // Both conflict inputs are bounded prefixes; even the small diff is computed in a Worker.
+type SourceView = NonNullable<ReturnType<MonacoEditorHandle["getEditor"]>>;
+
+/**
+ * Fractional top line (0-based) of the editor viewport — VS Code's getVisibleLine:
+ * the integer line plus the column's progress through it.
+ */
+function editorTopLine(editor: SourceView): number | null {
+	const model = editor.getModel?.();
+	const start = editor.getVisibleRanges?.()[0];
+	if (!model || !start) return null;
+	return (
+		start.startLineNumber -
+		1 +
+		(start.startColumn - 1) / (model.getLineLength(start.startLineNumber) + 2)
+	);
+}
+
+/** Document-space editor offset for a fractional 0-based source line. */
+function editorScrollTopForLine(editor: SourceView, line: number): number | null {
+	const base = Math.floor(line);
+	const top = editor.getTopForLineNumber?.(base + 1);
+	if (top == null) return null;
+	const next = editor.getTopForLineNumber(base + 2);
+	const lineHeight = next > top ? next - top : 0;
+	return top + (line - base) * lineHeight;
+}
+
+/** Fractional 0-based source line at the top of a rendered preview, by its line anchors. */
+function previewTopLine(previewEl: HTMLElement, lineCount: number): number | null {
+	const anchors = collectPreviewAnchors(previewEl, lineCount);
+	return anchors.length ? lineForScrollTop(anchors, previewEl.scrollTop, lineCount) : null;
+}
+
+/** A modifier or Ctrl/Cmd+F is not the user taking over the scroll position. */
+function isScrollIntent(event: Event): boolean {
+	if (event.type !== "keydown") return true;
+	const key = event as KeyboardEvent;
+	return !(
+		["Control", "Meta", "Alt", "Shift"].includes(key.key) ||
+		((key.ctrlKey || key.metaKey) && key.key.toLowerCase() === "f")
+	);
+}
+
+const SCROLL_INTENT_EVENTS = ["wheel", "pointerdown", "touchstart", "keydown"] as const;
+
+/** Where a jump puts its target line in the rendered preview: a third from the top. */
+const PREVIEW_REVEAL_OFFSET = 1 / 3;
+/** Late layout (highlighting, diagrams, images) may move anchors right after a jump. */
+const PREVIEW_JUMP_SETTLE_MS = 1500;
+/** A first render may still be loading the lazy renderer; only then give up on anchors. */
+const PREVIEW_JUMP_GIVE_UP_MS = 5000;
+
 const CONFLICT_DIFF_CHARS = 32 * 1024;
 
 export interface FileEditorContentProps {
@@ -173,6 +225,7 @@ function FileEditorBinding(props: FileEditorContentProps) {
 	const controllerRef = useRef<AbortController | null>(null);
 	const unregisterRef = useRef<(() => void) | undefined>(undefined);
 	const viewState = useRef<import("monaco-editor").editor.ICodeEditorViewState | null>(null);
+	const handledNavigation = useRef<string | null>(null);
 	useEffect(
 		() => () => {
 			controllerRef.current?.abort();
@@ -351,6 +404,7 @@ function FileEditorBinding(props: FileEditorContentProps) {
 			{...props}
 			workingCopy={copy}
 			viewState={viewState}
+			handledNavigation={handledNavigation}
 			sourceTargetRef={sourceTargetRef}
 		/>
 	);
@@ -367,10 +421,13 @@ function FileEditorDocument({
 	onDirtyChange,
 	workingCopy,
 	viewState,
+	handledNavigation,
 	sourceTargetRef,
 }: FileEditorContentProps & {
 	workingCopy: EditorWorkingCopy;
 	viewState: { current: import("monaco-editor").editor.ICodeEditorViewState | null };
+	/** Survives view remounts, so reattaching never replays an already handled navigation. */
+	handledNavigation: { current: string | null };
 	sourceTargetRef: { current: { deviceId: string; path: string } };
 }) {
 	const { t } = useTranslation("narrator");
@@ -695,18 +752,42 @@ function FileEditorDocument({
 		window.addEventListener("beforeunload", beforeUnload);
 		return () => window.removeEventListener("beforeunload", beforeUnload);
 	}, [session]);
+	// A source line the rendered preview should bring into view once its line
+	// anchors exist: a line reference opened in preview/node mode, or the reading
+	// position carried over from the source by a mode switch. `fallback` returns to
+	// source (where Monaco reveals the pending navigation) when nothing renders anchors.
+	const previewJumpRef = useRef<{ line: number; offset: number; fallback: boolean } | null>(null);
+	const [previewJumpRequest, setPreviewJumpRequest] = useState(0);
+	const requestPreviewJump = useCallback(
+		(jump: { line: number; offset: number; fallback: boolean }) => {
+			previewJumpRef.current = jump;
+			setPreviewJumpRequest((value) => value + 1);
+		},
+		[],
+	);
+	// Reading position the source editor resumes from after a mode switch (0-based line).
+	const pendingEditorLineRef = useRef<number | null>(null);
 	const navigationKey = JSON.stringify([deviceId, filePath, navigationRequestId, selection]);
-	// Only a CHANGE of explicit navigation returns to source — running on mount would
-	// clobber a remembered non-raw default before the user ever sees it.
-	const navigationRef = useRef(navigationKey);
+	// Explicit host navigation wins before the child's passive Monaco reveal; ordinary
+	// reattachment with the same navigation identity is not an intent. Raw and split
+	// show the target through Monaco's own reveal (split's scroll sync follows it);
+	// rendered modes jump the preview instead of forcing the panel back to source.
 	useLayoutEffect(() => {
-		if (navigationRef.current === navigationKey) return;
-		navigationRef.current = navigationKey;
-		// Explicit host navigation wins before the child's passive Monaco reveal;
-		// ordinary reattachment with the same navigation identity is not an intent.
+		if (handledNavigation.current === navigationKey) return;
+		const initial = handledNavigation.current === null;
+		handledNavigation.current = navigationKey;
+		if (initial && !selection) return;
 		endPreviewResume();
-		setMode("raw");
-	}, [navigationKey, endPreviewResume]);
+		pendingEditorLineRef.current = null;
+		if (!selection) return;
+		if (modeRef.current === "preview" || modeRef.current === "node")
+			requestPreviewJump({
+				line: selection.startLineNumber - 1,
+				offset: PREVIEW_REVEAL_OFFSET,
+				fallback: true,
+			});
+		else previewJumpRef.current = null;
+	}, [navigationKey, selection, endPreviewResume, handledNavigation, requestPreviewJump]);
 	useEffect(() => {
 		if (mode === "raw") {
 			previewController.current?.abort();
@@ -810,27 +891,6 @@ function FileEditorDocument({
 				editor.setScrollTop(value);
 			},
 		);
-		// Fractional top line of the editor viewport — VS Code's getVisibleLine:
-		// the integer line plus the column's progress through it.
-		const editorTopLine = (): number | null => {
-			const model = editor.getModel?.();
-			const start = editor.getVisibleRanges?.()[0];
-			if (!model || !start) return null;
-			return (
-				start.startLineNumber -
-				1 +
-				(start.startColumn - 1) / (model.getLineLength(start.startLineNumber) + 2)
-			);
-		};
-		/** Document-space editor offset for a fractional source line. */
-		const editorScrollTopForLine = (line: number): number | null => {
-			const base = Math.floor(line);
-			const top = editor.getTopForLineNumber?.(base + 1);
-			if (top == null) return null;
-			const next = editor.getTopForLineNumber(base + 2);
-			const lineHeight = next > top ? next - top : 0;
-			return top + (line - base) * lineHeight;
-		};
 		// Anchors are layout-derived and scroll-independent, so they are collected
 		// once and invalidated by DOM/layout observers — collecting on every
 		// scroll event (querySelectorAll + getBoundingClientRect per anchor)
@@ -841,7 +901,7 @@ function FileEditorDocument({
 		};
 		const syncPreviewToEditor = () => {
 			const anchors = lineAnchorsRef.current;
-			const line = anchors.length ? editorTopLine() : null;
+			const line = anchors.length ? editorTopLine(editor) : null;
 			const target = line != null ? scrollTopForLine(anchors, line) : null;
 			const nextScrollTop =
 				target ??
@@ -863,6 +923,7 @@ function FileEditorDocument({
 			const anchored =
 				anchors.length && model
 					? editorScrollTopForLine(
+							editor,
 							lineForScrollTop(anchors, previewEl.scrollTop, model.getLineCount()),
 						)
 					: null;
@@ -878,20 +939,12 @@ function FileEditorDocument({
 		};
 		const sourceHost = editor.getDomNode?.();
 		const userIntent = (event: Event) => {
-			if (event.type === "keydown") {
-				const key = event as KeyboardEvent;
-				if (
-					["Control", "Meta", "Alt", "Shift"].includes(key.key) ||
-					((key.ctrlKey || key.metaKey) && key.key.toLowerCase() === "f")
-				)
-					return;
-			}
-			endPreviewResume();
+			if (isScrollIntent(event)) endPreviewResume();
 		};
 		// A recreated source view emits layout/recovery scrolls before its first paint.
 		// Until user intent arrives, resume from the preview's saved reading position,
 		// not a lossy source-line round trip that creeps upward on every tab switch.
-		for (const type of ["wheel", "pointerdown", "keydown"]) {
+		for (const type of SCROLL_INTENT_EVENTS) {
 			sourceHost?.addEventListener(type, userIntent, true);
 			previewEl.addEventListener(type, userIntent, true);
 		}
@@ -924,7 +977,7 @@ function FileEditorDocument({
 		scheduleAnchorRefreshRef.current = anchorObserver.schedule;
 		return () => {
 			subscription.dispose();
-			for (const type of ["wheel", "pointerdown", "keydown"]) {
+			for (const type of SCROLL_INTENT_EVENTS) {
 				sourceHost?.removeEventListener(type, userIntent, true);
 				previewEl.removeEventListener(type, userIntent, true);
 			}
@@ -951,7 +1004,101 @@ function FileEditorDocument({
 		previewLastScrollFraction.current = fraction;
 		el.scrollTop = fraction * (el.scrollHeight - el.clientHeight);
 	}, [visible, previewText]);
+	// Bring a requested source line into the rendered preview. Rendering is lazy and
+	// late layout (highlighting, diagrams, images) moves blocks, so the jump re-applies
+	// on anchor changes for a short settle window, until the user scrolls themselves.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: previewJumpRequest re-arms a newly requested jump
+	useEffect(() => {
+		const jump = previewJumpRef.current;
+		const el = previewScrollRef.current;
+		if (!jump || !visible || (mode !== "preview" && mode !== "node") || !el) return;
+		const fallBackToSource = () => {
+			previewJumpRef.current = null;
+			if (jump.fallback) setMode("raw");
+		};
+		if (previewError) {
+			fallBackToSource();
+			return;
+		}
+		if (previewText === null) return;
+		let landed = false;
+		let settleTimer: ReturnType<typeof setTimeout> | undefined;
+		const apply = () => {
+			if (previewJumpRef.current !== jump) return;
+			const lineCount = workingCopy.model?.getLineCount();
+			const top =
+				lineCount == null
+					? null
+					: scrollTopForLine(collectPreviewAnchors(el, lineCount), jump.line);
+			if (top == null) return;
+			el.scrollTop = Math.max(0, top - el.clientHeight * jump.offset);
+			if (landed) return;
+			landed = true;
+			settleTimer = setTimeout(finish, PREVIEW_JUMP_SETTLE_MS);
+		};
+		const observer = observePreviewAnchorChanges(el, apply);
+		const finish = () => {
+			if (previewJumpRef.current === jump) previewJumpRef.current = null;
+			cleanup();
+		};
+		const userIntent = (event: Event) => {
+			if (isScrollIntent(event)) finish();
+		};
+		for (const type of SCROLL_INTENT_EVENTS) el.addEventListener(type, userIntent, true);
+		// Nothing anchored (oversized or unparsable preview): the reference is only
+		// visible in source.
+		const giveUp = setTimeout(() => {
+			if (!landed && previewJumpRef.current === jump) {
+				cleanup();
+				fallBackToSource();
+			}
+		}, PREVIEW_JUMP_GIVE_UP_MS);
+		const cleanup = () => {
+			clearTimeout(giveUp);
+			clearTimeout(settleTimer);
+			observer.dispose();
+			for (const type of SCROLL_INTENT_EVENTS) el.removeEventListener(type, userIntent, true);
+		};
+		apply();
+		return cleanup;
+	}, [mode, visible, previewText, previewError, previewJumpRequest, workingCopy]);
+	// Resume the source at the line the previous mode was showing. Applied once now
+	// and again after Monaco's own deferred layout of the newly revealed view.
+	useLayoutEffect(() => {
+		const line = pendingEditorLineRef.current;
+		if (line == null || !editor || !visible || (mode !== "raw" && mode !== "split")) return;
+		pendingEditorLineRef.current = null;
+		const apply = () => {
+			const top = editorScrollTopForLine(editor, line);
+			if (top != null) editor.setScrollTop(top);
+		};
+		apply();
+		let frame = requestAnimationFrame(() => {
+			frame = requestAnimationFrame(apply);
+		});
+		return () => cancelAnimationFrame(frame);
+	}, [mode, editor, visible]);
+	/**
+	 * The reading position as the split view's correspondence defines it: the
+	 * (fractional, 0-based) source line at the top of the current view.
+	 */
+	const readingLine = (): number | null => {
+		const view = editorRef.current?.getEditor() ?? null;
+		if (mode === "raw" || mode === "split") return view ? editorTopLine(view) : null;
+		const el = previewScrollRef.current;
+		const lineCount = workingCopy.model?.getLineCount();
+		if (!el || lineCount == null || previewText === null || previewError) return null;
+		return (
+			previewTopLine(el, lineCount) ??
+			// Anchorless content: keep the same proportion of the document.
+			(el.scrollHeight > el.clientHeight
+				? scrollFraction(el.scrollTop, el.scrollHeight, el.clientHeight) * (lineCount - 1)
+				: null)
+		);
+	};
 	const switchMode = (next: EditorMode) => {
+		if (next === mode) return;
+		const line = visible ? readingLine() : null;
 		previewController.current?.abort();
 		setMode(next);
 		setPreviewText(null);
@@ -959,6 +1106,18 @@ function FileEditorDocument({
 		previewScrollFraction.current = null;
 		previewLastScrollFraction.current = null;
 		previewResumeAuthoritative.current = false;
+		previewJumpRef.current = null;
+		pendingEditorLineRef.current = null;
+		if (line != null) {
+			if (next === "preview" || next === "node")
+				requestPreviewJump({ line, offset: 0, fallback: false });
+			else {
+				// What the preview showed (including a jump to a line reference) is the
+				// position now; a reveal still queued in the hidden source must not win.
+				editorRef.current?.cancelReveal?.();
+				pendingEditorLineRef.current = line;
+			}
+		}
 		if (next === "raw") return;
 		setSearchOpen(false);
 		void generatePreview();
@@ -1537,7 +1696,7 @@ function FileEditorDocument({
 										filePath={filePath}
 										deviceId={deviceId}
 										narratorId={narratorId}
-										withSourceLines={split}
+										withSourceLines
 									/>
 								)}
 							</Suspense>
