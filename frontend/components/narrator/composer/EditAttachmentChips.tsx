@@ -12,8 +12,7 @@ import { IconFile } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUploadCapability } from "../../../hooks/usePlatform";
-import { clearTokenOnSessionFailure, getToken } from "../../../lib/api";
-import { apiUrl } from "../../../lib/base-path";
+import { clearTokenOnSessionFailure, getToken, getUploadedImageUrl } from "../../../lib/api";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "./image-clipboard";
 
@@ -30,6 +29,7 @@ function useUploadedImageBlobUrl(
 	uploadNarratorId: string | undefined,
 	imageId: string | undefined,
 	enabled: boolean,
+	contextNarratorId?: string,
 ): string | null {
 	const uploadCapability = useUploadCapability();
 	const supported = uploadCapability.serveNarratorImages.supported;
@@ -42,7 +42,7 @@ function useUploadedImageBlobUrl(
 		if (token) headers.Authorization = `Bearer ${token}`;
 		let cancelled = false;
 		let objectUrl: string | null = null;
-		fetch(apiUrl(`/uploads/${uploadNarratorId}/${imageId}`), { headers })
+		fetch(getUploadedImageUrl(uploadNarratorId, imageId, contextNarratorId), { headers })
 			.then(async (res) => {
 				if (!res.ok) {
 					await clearTokenOnSessionFailure(res);
@@ -61,7 +61,7 @@ function useUploadedImageBlobUrl(
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [uploadNarratorId, imageId, enabled, supported]);
+	}, [uploadNarratorId, imageId, enabled, supported, contextNarratorId]);
 
 	return blobUrl;
 }
@@ -77,15 +77,18 @@ export function QueuedImageThumb({
 	imageId,
 	filename,
 	uploadNarratorId,
+	contextNarratorId,
 	size = 20,
 }: {
 	imageId: string;
 	filename?: string | null;
 	uploadNarratorId?: string;
+	/** The narrator whose queue shows the image; the reference context for a fork's image. */
+	contextNarratorId?: string;
 	size?: number;
 }) {
 	const openImageViewer = useImageViewer();
-	const src = useUploadedImageBlobUrl(uploadNarratorId, imageId, true);
+	const src = useUploadedImageBlobUrl(uploadNarratorId, imageId, true, contextNarratorId);
 	const alt = filename ?? "image";
 
 	if (!src) return <Skeleton h={size} w={size} radius="sm" />;
@@ -128,7 +131,12 @@ export function EditExistingImageThumb({
 	const openImageViewer = useImageViewer();
 	const uploadNarratorId =
 		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
-	const blobUrl = useUploadedImageBlobUrl(uploadNarratorId, block.imageId, !block.previewUrl);
+	const blobUrl = useUploadedImageBlobUrl(
+		uploadNarratorId,
+		block.imageId,
+		!block.previewUrl,
+		imageNarratorId,
+	);
 
 	const src = block.previewUrl ?? blobUrl;
 

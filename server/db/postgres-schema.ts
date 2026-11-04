@@ -306,6 +306,7 @@ export const narrators = pgTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "set null",
 		}),
+		replyContext: jsonText("reply_context"),
 		runtimeRegistrationJson: jsonText("runtime_registration_json"),
 		policySourceNarratorId: text("policy_source_narrator_id").references(
 			(): PgColumn => narrators.id,
@@ -3555,6 +3556,20 @@ export const outlineBlocks = pgTable(
 		index("idx_outline_blocks_locked")
 			.on(table.pageId)
 			.where(sql.raw('("task_json"::jsonb #>> \'{lock}\') IS NOT NULL AND "deleted" = FALSE')),
+		index("idx_outline_blocks_active_tasks")
+			.on(table.spaceId)
+			.where(
+				sql.raw(
+					"\"deleted\" = FALSE AND ((\"task_json\"::jsonb #>> '{status}') = 'doing' OR ((\"task_json\"::jsonb #>> '{status}') = 'todo' AND (\"task_json\"::jsonb #>> '{lock}') IS NOT NULL))",
+				),
+			),
+		index("idx_outline_blocks_finished_tasks")
+			.on(table.spaceId, table.versionSeq, table.id)
+			.where(
+				sql.raw(
+					"(\"task_json\"::jsonb #>> '{status}') IN ('done', 'cancelled') AND \"deleted\" = FALSE",
+				),
+			),
 	],
 );
 
@@ -4199,7 +4214,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 136,
-  "columnCount": 1803,
+  "columnCount": 1804,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6011,6 +6026,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "narrators_acl_root_narrator_id_narrators_id_fk"
           },
           "emitAsTableConstraint": false
+        },
+        {
+          "property": "replyContext",
+          "name": "reply_context",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "runtimeRegistrationJson",
@@ -24686,6 +24711,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "(\"task_json\"::jsonb #>> '{lock}') IS NOT NULL AND \"deleted\" = FALSE"
+        },
+        {
+          "name": "idx_outline_blocks_active_tasks",
+          "columns": [
+            "spaceId"
+          ],
+          "unique": false,
+          "predicate": "\"deleted\" = FALSE AND ((\"task_json\"::jsonb #>> '{status}') = 'doing' OR ((\"task_json\"::jsonb #>> '{status}') = 'todo' AND (\"task_json\"::jsonb #>> '{lock}') IS NOT NULL))"
+        },
+        {
+          "name": "idx_outline_blocks_finished_tasks",
+          "columns": [
+            "spaceId",
+            "versionSeq",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "(\"task_json\"::jsonb #>> '{status}') IN ('done', 'cancelled') AND \"deleted\" = FALSE"
         }
       ],
       "checks": [],

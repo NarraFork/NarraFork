@@ -831,20 +831,33 @@ function admissionWorkFor(narratorId: string): NarratorWorkAdmission[] {
 
 /** Resolve ownership from persisted parent links, never a request's broadcast/cwd hint. */
 export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<string> {
-	const [{ db }, { narrators }, { eq }] = await Promise.all([
+	const [database, { narrators }, { eq }] = await Promise.all([
 		import("../db"),
 		import("../db/schema"),
 		import("drizzle-orm"),
 	]);
+	const { db } = database;
+	let postgresQuery: import("./context-composition-history").ContextQuery | undefined;
+	if (database.activeDatabaseBackend === "postgres") {
+		if (!database.postgresRuntime) throw new AppError("PostgreSQL runtime is not connected", 503);
+		const { postgresContextQuery } = await import("./context-composition-history");
+		postgresQuery = postgresContextQuery(database.postgresRuntime.client.sql);
+	}
 	const seen = new Set<string>();
 	let id = narratorId;
 	while (seen.size < 32 && !seen.has(id)) {
 		seen.add(id);
 		// Admission is a frequent metadata read; never load prompts or compact summaries.
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { id: true, variant: true, parentNarratorId: true },
-		});
+		const narrator = postgresQuery
+			? await postgresQuery.get<{ id: string; variant: string; parentNarratorId: string | null }>(
+					`SELECT id, variant, parent_narrator_id AS "parentNarratorId"
+					 FROM narrators WHERE id = ?`,
+					[id],
+				)
+			: await db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { id: true, variant: true, parentNarratorId: true },
+				});
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (!isSubagentVariant(narrator.variant)) return id;
 		if (!narrator.parentNarratorId) break;

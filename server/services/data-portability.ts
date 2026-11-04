@@ -680,6 +680,7 @@ const IMPORTED_TABLES = [
 	"narrator_message_refs",
 	"narrator_tool_calls",
 	"narrator_blocks",
+	"narrator_text_snapshots",
 	"api_requests",
 ] as const;
 
@@ -1033,6 +1034,22 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				copyTable(attachName, "narrator_blocks", { excludeNarrators: excludedNarrators });
+				if (
+					counts.sessionsInserted + counts.sessionsOverwritten > 0 &&
+					tableColumns(attachName, "narrator_text_snapshots").includes("sha256")
+				) {
+					// Shared content store: copy complete manifests and their children without
+					// parsing potentially large JSON bodies on the application thread.
+					copyTable(attachName, "narrator_text_snapshots");
+					// A collector may already have marked roots before this import. Renew the
+					// publication grace in the SAME transaction, including reused orphan hashes;
+					// INSERT OR IGNORE alone would leave their old timestamps sweepable.
+					sqlite.run(
+						`UPDATE main.narrator_text_snapshots SET created_at = MAX(created_at, ?)
+						 WHERE sha256 IN (SELECT sha256 FROM ${attachName}.narrator_text_snapshots)`,
+						[new Date().toISOString()],
+					);
+				}
 			}
 
 			// 3) 请求历史最后：它同时引用会话与消息，必须在两者就位后插入

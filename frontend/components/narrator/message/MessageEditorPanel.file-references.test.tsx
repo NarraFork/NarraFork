@@ -1355,6 +1355,44 @@ describe("editable native media chip previews", () => {
 			expect(revoke).toHaveBeenCalledWith(`blob:protected-${kind}`);
 		});
 	}
+	test("retained image preview loads a source-owner image in the referencing narrator context", async () => {
+		const image = {
+			imageId: "retained-image",
+			filename: "image.png",
+			mediaType: "image/png",
+			size: 3,
+			uploadNarratorId: "original-owner",
+		};
+		const layout: ComposerDocument = {
+			version: 1,
+			assets: [
+				{ id: "kept-image", kind: "image", name: image.filename, mimeType: "image/png", size: 3 },
+			],
+			paragraphs: [{ children: [{ type: "attachment", id: "kept-node", assetId: "kept-image" }] }],
+		};
+		spyOn(URL, "createObjectURL").mockReturnValue("blob:protected-image");
+		spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+		const fetchImage = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async () => new Response("image", { headers: { "content-type": "image/png" } }),
+				{ preconnect: globalThis.fetch.preconnect },
+			),
+		);
+		await render(
+			editor({
+				narratorId: "fork-context",
+				blocks: [{ type: "image", ...image }],
+				composerDocument: layout,
+			}),
+		);
+		const calls = fetchImage.mock.calls.filter(([url]) => String(url).includes("/uploads/"));
+		expect(calls).toHaveLength(1);
+		const [url, options] = calls[0];
+		expect(String(url)).toEndWith(
+			"/api/uploads/original-owner/retained-image?referencingNarratorId=fork-context",
+		);
+		expect(new Headers(options?.headers).get("Authorization")).toBe("Bearer preview-session");
+	});
 });
 
 describe("visible queued message collaboration details", () => {
@@ -1551,9 +1589,11 @@ describe("queued collaboration gesture and image integration", () => {
 			const requests = fetchImage.mock.calls
 				.map(([url]) => String(url))
 				.filter((url) => url.includes("/uploads/"));
+			// An image owned by another narrator names the queue's narrator as the reference
+			// context, so a fork's reader needs no access to the source session.
 			expect(requests).toEqual([
 				"/api/uploads/queue-owner/legacy",
-				"/api/uploads/upload-owner/modern",
+				"/api/uploads/upload-owner/modern?referencingNarratorId=queue-owner",
 			]);
 			for (const filename of ["legacy.png", "modern.png"]) {
 				const image = document.querySelector(`img[alt="${filename}"]`);

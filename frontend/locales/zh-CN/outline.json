@@ -293,5 +293,84 @@
 		"taskRemoved": "去掉复选框",
 		"taskDue": "截止：{{date}}",
 		"taskAssignee": "指派：{{name}}"
+	},
+	"board": {
+		"title": "任务",
+		"projectTitle": "任务看板",
+		"empty": "还没有任务。",
+		"emptyProject": "这个项目的大纲里还没有任务。",
+		"loadFailed": "任务看板加载失败。",
+		"thisSession": "本会话",
+		"untitledSession": "未命名会话",
+		"nobody": "未指派",
+		"agent": "agent {{name}}",
+		"you": "{{name}}（你）",
+		"status": {
+			"doing": "进行中",
+			"waiting": "等待中",
+			"todo": "待办",
+			"done": "完成",
+			"cancelled": "取消"
+		},
+		"count": "{{count}} 项未完成",
+		"humanCreated": "人建",
+		"locked": "已锁定 · {{name}}",
+		"lockedSomeone": "已锁定",
+		"waitPrerequisites": "等 {{count}} 个前置任务",
+		"waitPeople": "等人回答",
+		"waitConfirmation": "等确认",
+		"openTruncatedIn": "{{label}} 里未完成的任务比这里显示的多，其余的请在大纲里看。",
+		"space": "在 {{label}}",
+		"claimedElsewhere": "在 {{label}} 领取",
+		"moreFinished": "更多已完成的任务",
+		"moreSpaces": "更多会话",
+		"add": {
+			"placeholder": "给本会话加一个任务（Enter 换行，Ctrl+Enter 添加）",
+			"lock": "锁定（改正文和标完成都要你确认）",
+			"add": "添加",
+			"addAndStart": "添加并开始",
+			"added": "已添加任务",
+			"exists": "看板上已有这个任务",
+			"started": "会话已开始处理任务",
+			"failed": "添加任务失败"
+		},
+		"action": {
+			"menu": "任务操作",
+			"done": "标为完成",
+			"cancel": "取消任务",
+			"stop": "退回待办",
+			"reopen": "重开",
+			"reopenAndStart": "重开并开始",
+			"assignMe": "交给我",
+			"assignUser": "交给其他人…",
+			"assignSession": "交回本会话",
+			"usernamePlaceholder": "用户名",
+			"assign": "转交",
+			"open": "在大纲里打开",
+			"failed": "修改任务失败",
+			"conflict": "任务刚被改过，看板已重新加载。",
+			"updated": "任务已更新"
+		},
+		"completion": {
+			"asks": "agent 把它标为{{status}}：等你确认",
+			"asksOther": "agent 把它标为{{status}}：等 {{name}} 确认",
+			"showChange": "查看改动",
+			"hideChange": "收起改动",
+			"confirm": "确认",
+			"reject": "退回",
+			"reasonPlaceholder": "原因（agent 会读到）",
+			"confirmed": "已确认完成",
+			"rejected": "已退回",
+			"failed": "操作失败"
+		},
+		"legacy": {
+			"show": "旧 Spec 文件（只读）",
+			"back": "返回任务看板"
+		},
+		"statusBar": {
+			"awaitingYou": "{{count}} 个目标等你确认",
+			"awaitingFrom": "{{count}} 个目标等 {{names}} 确认",
+			"awaitingOthers": "{{count}} 个目标等人确认"
+		}
 	}
 }

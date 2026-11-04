@@ -1,4 +1,15 @@
-import { Alert, Button, Card, Group, Loader, Skeleton, Stack, Text, Title } from "@mantine/core";
+import {
+	Alert,
+	Button,
+	Card,
+	Group,
+	Loader,
+	SegmentedControl,
+	Skeleton,
+	Stack,
+	Text,
+	Title,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconListTree } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
@@ -10,10 +21,17 @@ import { installProjectAccessListener } from "../../hooks/useProjectAccess";
 import { useProject } from "../../hooks/useProjects";
 import { api } from "../../lib/api";
 import { describeApiError } from "../../lib/api-error";
+import { useOpenOutlinePage } from "../../lib/outline-router";
 
 const CreateNarratorModal = lazy(() =>
 	import("../../components/narrator/CreateNarratorModal").then((m) => ({
 		default: m.CreateNarratorModal,
+	})),
+);
+// The project's task board (outline P2 PR 5): the project space and its sessions' spaces.
+const ProjectTaskBoard = lazy(() =>
+	import("../../components/outline/task-board/TaskBoardViews").then((m) => ({
+		default: m.ProjectTaskBoard,
 	})),
 );
 const ProjectSettingsPanel = lazy(() =>
@@ -49,6 +67,10 @@ function ProjectPage() {
 	const [creating, setCreating] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const outline = useOutlineEnabled();
+	const { t: tOutline } = useTranslation("outline");
+	const [view, setView] = useState<"sessions" | "tasks">("sessions");
+	const showTasks = outline.enabled && view === "tasks";
+	const openOutlinePage = useOpenOutlinePage();
 	const openOutline = useOpenOutlineSpace({
 		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
 		onError: (error) =>
@@ -100,10 +122,43 @@ function ProjectPage() {
 			) : (
 				<Skeleton height={18} width="70%" />
 			)}
-			<Title order={4}>{t("compatibility.sessions")}</Title>
-			{sessions.isLoading && <Loader size="sm" />}
-			{sessions.isError && <Alert color="red">{t("compatibility.sessionsUnavailable")}</Alert>}
-			{!sessions.isError &&
+			{outline.enabled && (
+				<SegmentedControl
+					size="xs"
+					style={{ alignSelf: "flex-start" }}
+					value={view}
+					onChange={(value) => setView(value as "sessions" | "tasks")}
+					data={[
+						{ value: "sessions", label: t("compatibility.sessions") },
+						{ value: "tasks", label: tOutline("board.projectTitle") },
+					]}
+					data-testid="project-view-switch"
+				/>
+			)}
+			{showTasks && (
+				<ProjectToolsBoundary fallback={<Alert color="red">{tOutline("board.loadFailed")}</Alert>}>
+					<Suspense fallback={<Loader size="sm" />}>
+						<ProjectTaskBoard
+							projectId={projectId}
+							onOpenTask={(task) =>
+								openOutlinePage({
+									spaceId: task.spaceId,
+									blockId: task.id,
+									pageId: task.pageId,
+									view: "all",
+								})
+							}
+						/>
+					</Suspense>
+				</ProjectToolsBoundary>
+			)}
+			{!showTasks && <Title order={4}>{t("compatibility.sessions")}</Title>}
+			{!showTasks && sessions.isLoading && <Loader size="sm" />}
+			{!showTasks && sessions.isError && (
+				<Alert color="red">{t("compatibility.sessionsUnavailable")}</Alert>
+			)}
+			{!showTasks &&
+				!sessions.isError &&
 				sessions.data?.pages
 					.flatMap((page) => page.items)
 					.map((session) => (
@@ -127,10 +182,12 @@ function ProjectPage() {
 							</Group>
 						</Card>
 					))}
-			{sessions.isSuccess && sessions.data.pages.every((page) => page.items.length === 0) && (
-				<Text c="dimmed">{t("compatibility.noSessions")}</Text>
-			)}
-			{sessions.hasNextPage && (
+			{!showTasks &&
+				sessions.isSuccess &&
+				sessions.data.pages.every((page) => page.items.length === 0) && (
+					<Text c="dimmed">{t("compatibility.noSessions")}</Text>
+				)}
+			{!showTasks && sessions.hasNextPage && (
 				<Button
 					variant="light"
 					loading={sessions.isFetchingNextPage}

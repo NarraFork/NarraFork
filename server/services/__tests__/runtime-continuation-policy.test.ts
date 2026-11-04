@@ -205,6 +205,43 @@ describe("A3 prompt projections do not classify control grants as roles", () => 
 			controller: { narratorId: "controller", actions: ["steer"] },
 		},
 	};
+	test("runtime hints retain the global default, custom and explicit empty base semantics", async () => {
+		const previous = settings.agent.defaultSystemPrompt;
+		settings.agent.defaultSystemPrompt = "GLOBAL DEFAULT";
+		try {
+			const policy = resolveRuntimePolicy([await compileDelegationCeiling("general")]);
+			for (const systemPrompt of [null, "CUSTOM", ""] as const) {
+				const result = runtimeBasePrompt(
+					{
+						systemPrompt,
+						traits: ["bot"],
+						runtimeRegistrationJson: {
+							version: 1,
+							run: {
+								logicalRunId: "run",
+								deliverTo: { narratorId: "recipient", toolUseId: "tool" },
+							},
+						},
+					},
+					"en",
+					policy,
+				);
+				expect(result).toContain("Await(agent)");
+				expect(result).toContain("recipient");
+				if (systemPrompt === null) expect(result).toStartWith("GLOBAL DEFAULT\n\n");
+				else {
+					expect(result).not.toContain("GLOBAL DEFAULT");
+					if (systemPrompt) expect(result).toStartWith("CUSTOM\n\n");
+				}
+			}
+			expect(runtimeBasePrompt({ systemPrompt: "" }, "en", resolveRuntimePolicy([]))).toBe("");
+			expect(runtimeBasePrompt({ systemPrompt: null }, "en", resolveRuntimePolicy([]))).toBe(
+				"GLOBAL DEFAULT",
+			);
+		} finally {
+			settings.agent.defaultSystemPrompt = previous;
+		}
+	});
 	test("an ordinary control grant adds no reporting role or Await prohibition", () => {
 		const prompt = runtimeBasePrompt(base, "en", resolveRuntimePolicy([]));
 		expect(prompt).toBe("BASE");

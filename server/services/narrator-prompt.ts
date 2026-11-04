@@ -115,7 +115,9 @@ export interface BuildPromptResult {
 
 /**
  * Size of the designated plan file, or undefined when there is nothing to warn
- * about (no plan identity, missing file, empty file, unreadable path).
+ * about (no safe plan identity, missing file, empty file, non-file path).
+ * Other filesystem errors abort prompt preparation rather than falsely removing
+ * the existing plan's Read/Edit reminder.
  *
  * This runs on the system-prompt rebuild path, which happens once per loop
  * iteration, so it stays a single bounded `stat` — never a read. The plan file
@@ -132,9 +134,11 @@ async function statPlanFileBytes(cwd: string, planFilePath?: string): Promise<nu
 		const stats = await stat(resolved);
 		if (!stats.isFile() || stats.size <= 0) return undefined;
 		return stats.size;
-	} catch {
-		// Missing file is the normal case at the start of a plan cycle.
-		return undefined;
+	} catch (error) {
+		// Only a genuinely missing file implies a fresh plan cycle.
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+		throw error;
 	}
 }
 

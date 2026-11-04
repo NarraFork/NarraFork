@@ -38,7 +38,7 @@
 	"DEFAULT_MODEL_NOT_CONFIGURED": "尚未配置默认模型。请在「设置 → 模型」中选择一个后重试。",
 	"PODMAN_NOT_FOUND": "未安装 Podman",
 	"SPEC_IN_OUTLINE_SESSION": "本会话的任务在大纲里，不再使用 Dynamic Spec 的任务和笔记，只有行为护栏仍然生效。",
-	"GOAL_IN_OUTLINE_SESSION": "任务在大纲里的会话暂时不能用 /goal。请让 agent 把目标写成一个任务。",
+	"GOAL_IN_OUTLINE_SESSION": "/goal 会给会话本身添加任务。请在主会话里发送，不要发给子代理。",
 	"GIT_AUTH_REQUIRED": "需要 Git 认证",
 	"AUTH_REQUIRED": "请先登录",
 	"TOKEN_EXPIRED": "登录状态已过期，请重新登录。",

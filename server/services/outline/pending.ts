@@ -180,9 +180,14 @@ function actorRef(actor: OutlinePendingActor): OutlineTaskActorRef {
 		: { kind: "agent", id: actor.narratorId };
 }
 
-function emit(spaceId: string, pageIds: readonly string[]): void {
+function emit(spaceId: string, pageIds: readonly string[], narratorId?: string | null): void {
 	if (pageIds.length > 0)
-		eventBus.emit({ type: "outline:pending", spaceId, pageIds: [...pageIds] });
+		eventBus.emit({
+			type: "outline:pending",
+			spaceId,
+			pageIds: [...pageIds],
+			...(narratorId ? { narratorIds: [narratorId] } : {}),
+		});
 }
 
 /** Agent- and API-facing text of decisions (English, like the rest of the outline's). */
@@ -779,7 +784,13 @@ export async function rejectOutlinePending(args: {
 			reportedAt: withdrawn ? now : null,
 		});
 		if (ok) {
-			emit(row.spaceId, [row.pageId]);
+			emit(row.spaceId, [row.pageId], row.requesterSession);
+			if (!withdrawn)
+				eventBus.emit({
+					type: "outline:pending_rejected",
+					spaceId: row.spaceId,
+					pendingId: row.id,
+				});
 			return (await store.getPending([row.id]))[0] ?? row;
 		}
 		// Merged into or decided meanwhile: look again.
@@ -930,19 +941,73 @@ export async function pendingBaseChanged(
  */
 export async function findTasksWaitingForConfirmation(
 	tasks: readonly OutlineTaskSubject[],
-	options: { store?: OutlineStore } = {},
+	options: {
+		store?: OutlineStore;
+		/** The open changes to look at, already read by the caller; read per space when absent. */
+		openPending?: readonly OutlinePendingHead[];
+	} = {},
 ): Promise<Set<string>> {
 	const store = options.store ?? outlineStore;
 	const out = new Set<string>();
+	const ids = new Set(tasks.map((task) => task.id));
+	if (options.openPending) {
+		for (const row of options.openPending)
+			for (const id of row.blockIdsJson) if (ids.has(id)) out.add(id);
+		return out;
+	}
 	const bySpace = new Map<string, Set<string>>();
 	for (const task of tasks) {
 		const set = bySpace.get(task.spaceId) ?? new Set();
 		set.add(task.id);
 		bySpace.set(task.spaceId, set);
 	}
-	for (const [spaceId, ids] of bySpace) {
+	for (const [spaceId, spaceIds] of bySpace) {
 		const open = await store.listOpenPendingBySpace(spaceId, OUTLINE_PENDING_LIMITS.scanPerSpace);
-		for (const row of open) for (const id of row.blockIdsJson) if (ids.has(id)) out.add(id);
+		for (const row of open) for (const id of row.blockIdsJson) if (spaceIds.has(id)) out.add(id);
+	}
+	return out;
+}
+
+/**
+ * Of the given tasks, the locked roots whose being done or cancelled waits for confirmation
+ * (design §2.2: "整个计划标完成，要锁定人确认"; D26b for `/goal`), with the open change asking
+ * it and what it sets. Read for the task board and the task source (a person-created goal whose
+ * completion only waits for its person no longer drives `protectedOnly`, outline P2 PR 5). One
+ * bounded read of the open changes per space, then the operations of the few rows on these roots.
+ */
+export async function findCompletionsAwaitingConfirmation(
+	tasks: ReadonlyArray<OutlineTaskSubject & { deleted?: boolean }>,
+	options: {
+		store?: OutlineStore;
+		/** The open changes to look at, already read by the caller; read by root when absent. */
+		openPending?: readonly OutlinePendingHead[];
+	} = {},
+): Promise<Map<string, { row: OutlinePendingHead; status: "done" | "cancelled" }>> {
+	const store = options.store ?? outlineStore;
+	const out = new Map<string, { row: OutlinePendingHead; status: "done" | "cancelled" }>();
+	const roots = new Set(
+		tasks.filter((task) => task.taskJson?.lock && !task.deleted).map((task) => task.id),
+	);
+	if (roots.size === 0) return out;
+	// A completion is a change on the locked task's own tree: read by root (the open-root index).
+	const open =
+		options.openPending ??
+		(await store.listOpenPendingByRoots([...roots], OUTLINE_PENDING_LIMITS.scanPerSpace));
+	const candidates = new Map<string, OutlinePendingHead>();
+	for (const row of open) {
+		const root = row.rootBlockId;
+		if (root && roots.has(root) && row.blockIdsJson.includes(root)) candidates.set(row.id, row);
+	}
+	if (candidates.size === 0) return out;
+	for (const row of await store.getPending([...candidates.keys()])) {
+		const root = row.rootBlockId as string;
+		for (const op of pendingOps(row)) {
+			if (op.op !== "setTask" || !("id" in op.block) || op.block.id !== root) continue;
+			const status = op.task?.status;
+			const head = candidates.get(row.id);
+			if (head && (status === "done" || status === "cancelled"))
+				out.set(root, { row: head, status });
+		}
 	}
 	return out;
 }

@@ -1,9 +1,8 @@
 /**
  * The task source: the one way continuation, the periodic task digest, the behavior
  * fence, the request prefix's task views, the interrupt guard, the turn-end note and
- * compact read a narrator's tasks. `currentTask` is the status bar's read; the status bar
- * itself still reads `GET /spec/tasks` until the task board replaces the Spec panel
- * (outline P2, PR 5).
+ * compact read a narrator's tasks. `currentTask` is the status bar's read
+ * (`GET /api/narrators/:id/tasks/current`, outline P2 PR 5).
  *
  * Shaped by what those readers need, not by tasks.json:
  * - Where a reader's own logic does not depend on the backend (the interrupt guard's
@@ -74,6 +73,18 @@ export interface OpenTaskList {
 	 * speak again after the open list's statuses changed.
 	 */
 	revision: string | null;
+}
+
+/** What the status bar shows of a session's tasks (`NarratorTaskSource.statusBar`). */
+export interface StatusBarView {
+	current: (TaskView & { address: string | null }) | null;
+	awaitingConfirmation: {
+		total: number;
+		/** Those the viewer decides: they locked the goal. */
+		mine: number;
+		/** The people who decide the others (their usernames), at most a few. */
+		from: string[];
+	};
 }
 
 /** The one task a continuation names. */
@@ -148,10 +159,7 @@ export interface NarratorTaskSource {
 
 	// ── Task data ─────────────────────────────────────────────────────────────
 
-	/**
-	 * The first task in progress, or null. The status bar shows this task (it still reads
-	 * `GET /spec/tasks` until PR 5 switches it to the task source).
-	 */
+	/** The first task in progress, or null: the task the status bar shows. */
 	currentTask(): Promise<TaskView | null>;
 	/**
 	 * A task not started yet that would be taken up next, or null when none is waiting.
@@ -162,8 +170,19 @@ export interface NarratorTaskSource {
 	nextTask(): Promise<TaskView | null>;
 	/** Unfinished tasks plus the revision key; read by the interrupt guard. */
 	openTasks(): Promise<OpenTaskList>;
-	/** Unfinished protected tasks (outline: unfinished human-created tasks). */
+	/**
+	 * Unfinished protected tasks (outline: unfinished human-created tasks, except those whose
+	 * completion only waits for their person's confirmation).
+	 */
 	protectedOpenCount(): Promise<number>;
+	/**
+	 * The status bar's read, in one read of the tasks: the first task in progress (with its address
+	 * when the backend has one), and the person-created tasks whose completion waits for
+	 * confirmation (outline: a locked goal the agent ticked done, D26b), in all, those
+	 * `viewerUserId` decides (on the board: its locker), and who decides the others. Spec: its
+	 * current task, no address, nothing waits.
+	 */
+	statusBar(viewerUserId: string | null): Promise<StatusBarView>;
 
 	// ── Continuation ──────────────────────────────────────────────────────────
 
@@ -175,7 +194,17 @@ export interface NarratorTaskSource {
 	 * promotion therefore lands even when no continuation follows. Delegated subagents do
 	 * not promote (`policy.continuation.promoteTodo`).
 	 */
-	prepareContinuation(options: { promoteTodo: boolean }): Promise<ContinuationTarget>;
+	prepareContinuation(options: {
+		promoteTodo: boolean;
+		/**
+		 * The task a person just asked the session to start ("Add and start", "Reopen and start";
+		 * outline P2 PR 5): a to-do of the session's own is started for it (the same system start
+		 * as a promotion, even with `promoteTodo` off and something else in progress), and the
+		 * target is this task, or none when it cannot be started. A backend without task ids
+		 * (spec) ignores it.
+		 */
+		preferTaskId?: string;
+	}): Promise<ContinuationTarget>;
 	/** The continuation prompt: names one task, says the system sent it, lists the outcomes. */
 	continuationPrompt(input: ContinuationPromptInput): string;
 

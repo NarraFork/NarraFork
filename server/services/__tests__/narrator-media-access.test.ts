@@ -400,7 +400,7 @@ test("authorizes media in oversized block bodies", async () => {
 	expect(await narratorReferencesMedia(context, `${source}-wrong`, media.mediaId)).toBe(false);
 });
 
-test("elapsed time does not reject an otherwise valid reference", async () => {
+test("elapsed time under the lookup's cap does not reject a valid reference", async () => {
 	const source = addNarrator(sourceOwner);
 	const context = addNarrator(forkOwner);
 	const media = await saveUploadedMedia(source, wavFile());
@@ -454,10 +454,11 @@ test("reference pages preserve refs sharing the same sequence", async () => {
 	const source = addNarrator(sourceOwner);
 	const context = addNarrator(forkOwner);
 	const media = await saveUploadedMedia(source, wavFile());
-	for (let index = 0; index < 20; index++) {
-		const id = addMessage(context, 0, index === 19 ? [mediaRefToContentBlock(media)] : []);
+	// More refs than one lookup window, all at one seq: the keyset must break ties by id.
+	for (let index = 0; index < 300; index++) {
+		const id = addMessage(context, 0, index === 299 ? [mediaRefToContentBlock(media)] : []);
 		db.update(narratorMessageRefs)
-			.set({ id: `ref-${String(index).padStart(2, "0")}` })
+			.set({ id: `ref-${String(index).padStart(3, "0")}` })
 			.where(eq(narratorMessageRefs.messageId, id))
 			.run();
 	}
@@ -479,12 +480,17 @@ test("tool rows are paged before following a later message page", async () => {
 				toolUseId: generateId(),
 				status: "success",
 				createdAt: now,
-				outputJson: index === 64 ? { _media: [mediaRefToContentBlock(media)] } : { _text: "none" },
+				// Decoys mention the id, so they pass the SQL prefilter and fill a tool page.
+				outputJson:
+					index === 64
+						? { _media: [mediaRefToContentBlock(media)] }
+						: { _text: `mentions ${media.mediaId}` },
 			})
 			.run();
-	for (let seq = 1; seq < 16; seq++) addMessage(context, seq, []);
+	// The later reference sits past the first lookup window.
+	for (let seq = 1; seq < 300; seq++) addMessage(context, seq, []);
 	const laterMedia = await saveUploadedMedia(source, wavFile("later.wav"));
-	addMessage(context, 16, [mediaRefToContentBlock(laterMedia)]);
+	addMessage(context, 300, [mediaRefToContentBlock(laterMedia)]);
 	expect(await narratorReferencesMedia(context, source, media.mediaId)).toBe(true);
 	expect(await narratorReferencesMedia(context, source, laterMedia.mediaId)).toBe(true);
 });
@@ -504,7 +510,11 @@ test("revoking a ref during tool pagination prevents stale authorization", async
 				toolUseId: generateId(),
 				status: "success",
 				createdAt: now,
-				outputJson: index === 64 ? { _media: [mediaRefToContentBlock(media)] } : {},
+				// Decoys mention the id so the lookup pages (and yields) through tool rows.
+				outputJson:
+					index === 64
+						? { _media: [mediaRefToContentBlock(media)] }
+						: { _text: `mentions ${media.mediaId}` },
 			})
 			.run();
 	}
@@ -545,10 +555,13 @@ test("lookup observes cancellation between reference pages", async () => {
 	const source = addNarrator(sourceOwner);
 	const context = addNarrator(forkOwner);
 	const media = await saveUploadedMedia(source, wavFile());
-	for (let seq = 0; seq < 16; seq++) addMessage(context, seq, []);
-	addMessage(context, 16, [mediaRefToContentBlock(media)]);
+	// More refs than one lookup window, so the lookup yields before it reaches the match.
+	for (let seq = 0; seq < 300; seq++) addMessage(context, seq, []);
+	addMessage(context, 300, [mediaRefToContentBlock(media)]);
 	const controller = new AbortController();
-	const pending = narratorReferencesMedia(context, source, media.mediaId, controller.signal);
+	const pending = narratorReferencesMedia(context, source, media.mediaId, {
+		signal: controller.signal,
+	});
 	setTimeout(() => controller.abort(), 0);
 	await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 });
@@ -572,6 +585,6 @@ test("oversized legacy JSON authorizes exact references and cancellation fails c
 	const controller = new AbortController();
 	controller.abort();
 	await expect(
-		narratorReferencesMedia(context, source, media.mediaId, controller.signal),
+		narratorReferencesMedia(context, source, media.mediaId, { signal: controller.signal }),
 	).rejects.toMatchObject({ name: "AbortError" });
 });
