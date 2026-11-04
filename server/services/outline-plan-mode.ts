@@ -200,12 +200,21 @@ async function decidedSubmission(
  * (the caller strips the `_plan*` keys first, S6).
  *
  * A persisted submission whose plan was approved since (its decision written, its resolution lost
- * to a restart; S2) is kept as it is, so the request is decided as approved.
+ * to a restart; S2) is kept as it is, so the request is decided as approved: only for a call
+ * restored from what was persisted (`recovered`; review round 2 N3).
  */
 export async function resolveOutlineExitPlanInput(
 	narratorId: string,
 	input: Record<string, unknown>,
 	locale: Locale,
+	options: {
+		/**
+		 * The call is one persisted before (a request restored after a restart, a recovered
+		 * gate): its `_plan*` keys are the server's own resolution. A model's fresh call never is,
+		 * so its keys are dropped and the plan read anew (review round 2 N3).
+		 */
+		recovered?: boolean;
+	} = {},
 ): Promise<
 	| { ok: true; input: Record<string, unknown> }
 	| { ok: false; message: string; input: Record<string, unknown> }
@@ -213,12 +222,15 @@ export async function resolveOutlineExitPlanInput(
 > {
 	const cycle = await outlinePlanCycle(narratorId);
 	if (!cycle) return null;
-	if (await decidedSubmission(narratorId, outlinePlanSubmissionOf(input))) {
-		return { ok: true, input };
-	}
 	const mode = typeof input.mode === "string" ? input.mode.trim().toLowerCase() : "";
 	const rootRef = typeof input.root === "string" && input.root.trim() ? input.root : null;
 	if (cycle.kind === "legacy" && mode !== "outline" && !rootRef) return null;
+	if (
+		options.recovered === true &&
+		(await decidedSubmission(narratorId, outlinePlanSubmissionOf(input)))
+	) {
+		return { ok: true, input };
+	}
 	const planning = cycle.kind === "outline" ? cycle.root : null;
 	const legacyMode = mode === "inline" || mode === "file";
 	const {
@@ -383,7 +395,12 @@ export async function decideOutlinePlanRequest(args: {
 			}
 		}
 	}
+	// The request was gone when this decision was to be resolved (review round 1 S1). The plan is
+	// put back only when the request was not approved meanwhile (review round 2 N2): someone else's
+	// approval a moment earlier means the plan is being executed, and it stays approved.
 	const undo = async () => {
+		const elsewhere = await howDecidedElsewhere(args.requestId);
+		if (elsewhere === "allowed") throw decidedElsewhere(args.requestId);
 		await undoOutlinePlanDecision({
 			session: narratorId,
 			decision,
@@ -415,12 +432,13 @@ export async function decideOutlinePlanRequest(args: {
 	// What the plan is now, not what was asked (S2: a lock asked of a draft written before).
 	const after = await outlineStore.getBlock(submission.root.blockId);
 	const lock = after?.taskJson?.lock ?? null;
-	decisions.set(narratorId, {
+	const record: OutlinePlanDecisionRecord = {
 		rootId: submission.root.blockId,
 		action: lock ? "lock" : "draft",
 		delegateTitle: lock?.delegate ? ((await narratorTitle(lock.delegate)) ?? null) : null,
 		edits,
-	});
+	};
+	decisions.set(narratorId, record);
 	const resolved = await resolvePermission(args.requestId, "allow", {
 		userId: principal.userId,
 		decidedBy: "user",
@@ -428,11 +446,38 @@ export async function decideOutlinePlanRequest(args: {
 		...(feedback ? { feedbackText: feedback } : {}),
 	});
 	if (!resolved) {
-		// Cancelled or decided meanwhile (review round 1 S1): the plan goes back to what it was.
-		decisions.delete(narratorId);
+		// Cancelled, refused or approved meanwhile: this decision's record is not the approval's
+		// (an approval elsewhere reads the plan as it is), and the plan goes back unless approved.
+		if (decisions.get(narratorId) === record) decisions.delete(narratorId);
 		await undo();
 	}
 	return { commit: decision.result?.commit ?? null };
+}
+
+/** How long a request that went away is watched for its decision to be persisted. */
+const DECIDED_ELSEWHERE_WAIT = { attempts: 10, intervalMs: 50 };
+
+/**
+ * How a request that went away was decided, from its tool call (review round 2 N2): `allowed`
+ * once it runs or ran, `refused` when it failed (denied, cancelled, aborted), and `undecided` when
+ * nothing was persisted within a short wait (its session dropped the waiting request; it is not
+ * executed, and a restored request asks again). The decision is persisted right after the
+ * request leaves the waiting set, so a few short waits see it.
+ */
+async function howDecidedElsewhere(
+	requestId: string,
+): Promise<"allowed" | "refused" | "undecided"> {
+	for (let attempt = 0; attempt < DECIDED_ELSEWHERE_WAIT.attempts; attempt++) {
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, requestId),
+			columns: { status: true },
+		});
+		if (!row) return "undecided";
+		if (row.status === "running" || row.status === "success") return "allowed";
+		if (row.status === "fail") return "refused";
+		await new Promise((resolve) => setTimeout(resolve, DECIDED_ELSEWHERE_WAIT.intervalMs));
+	}
+	return "undecided";
 }
 
 /** 409: the request was not waiting any more when the decision was to be resolved. */
@@ -440,6 +485,14 @@ function notWaiting(requestId: string): OutlinePlanError {
 	return new OutlinePlanError(
 		`The plan is no longer waiting for a decision (${requestId}); nothing was kept`,
 		"OUTLINE_PLAN_NOT_WAITING",
+	);
+}
+
+/** 409: the request was approved elsewhere a moment earlier; the plan stays approved. */
+function decidedElsewhere(requestId: string): OutlinePlanError {
+	return new OutlinePlanError(
+		`The plan was approved elsewhere a moment ago (${requestId}); it is being executed`,
+		"OUTLINE_PLAN_DECIDED",
 	);
 }
 
@@ -483,7 +536,7 @@ export async function settleApprovedOutlinePlan(args: {
 	narratorId: string;
 	toolUseId: string;
 	locale: Locale;
-	/** The person who approved, when one did. */
+	/** The person who approved, when one did (ignored when a plan review approved it). */
 	approverUserId: string | null;
 	/** The person the turn runs for (responsible for an approval the system records). */
 	turnUserId: string | null;
@@ -514,6 +567,9 @@ export async function settleApprovedOutlinePlan(args: {
 		};
 	}
 	let approval: ApprovedOutlinePlan["approval"] = { kind: "draft" };
+	// A review's approval is the system's, even with a person's approval left over from an
+	// earlier allow (D48 ⑦: it must not count as the person's work; review round 2 N4).
+	const approver = args.byReview ? null : args.approverUserId;
 	try {
 		const decision = await decideOutlinePlan({
 			session: args.narratorId,
@@ -523,9 +579,9 @@ export async function settleApprovedOutlinePlan(args: {
 			decider: {
 				kind: "system",
 				id: OUTLINE_PLAN_ACTOR,
-				responsibleUserId: args.approverUserId ?? args.turnUserId,
-				approvedBy: args.approverUserId
-					? { kind: "human", id: args.approverUserId }
+				responsibleUserId: approver ?? args.turnUserId,
+				approvedBy: approver
+					? { kind: "human", id: approver }
 					: { kind: "system", id: args.byReview ? "plan-review" : OUTLINE_PLAN_ACTOR },
 			},
 			locale: args.locale,

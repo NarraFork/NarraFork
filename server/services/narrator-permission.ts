@@ -3600,13 +3600,15 @@ export async function resolveExitPlanModeInputWithBackend(
 	executionTarget?: ToolExecutionTarget,
 	designatedPlanPath?: string,
 	planReadPolicy?: PlanFileReadPolicy,
+	/** The call was persisted before (restored after a restart; outline P2 PR 8 review N3). */
+	recovered = false,
 ): Promise<ExitPlanModeInputResolution> {
 	// An outline session plans in the outline (outline P2 PR 8): the plan is its task tree, read
 	// as of now. A plan-file cycle begun before that keeps this flow (null).
 	const { resolveOutlineExitPlanInput, withoutOutlinePlanKeys } = await import(
 		"./outline-plan-mode"
 	);
-	const outline = await resolveOutlineExitPlanInput(narratorId, rawInput, locale);
+	const outline = await resolveOutlineExitPlanInput(narratorId, rawInput, locale, { recovered });
 	if (outline) {
 		return outline.ok
 			? {
@@ -5542,6 +5544,7 @@ export async function handlePermission(
 			executionContext.target as ToolExecutionTarget,
 			activeNarrators.get(narratorId)?._planFilePath,
 			{ narratorId, compiledPolicy },
+			isRecoveredHumanPermission(getPermissionRecovery(options)),
 		);
 		if (
 			isRecoveredHumanPermission(getPermissionRecovery(options)) &&

@@ -749,10 +749,12 @@ export async function decideOutlinePlan(args: {
 
 /**
  * Take back a decision whose request was gone by the time it was to be resolved (review round 1
- * S1: cancelled or decided meanwhile): one system `plan` commit puts the root's plan state back
- * as it was (round, baseSeq), takes away a lock the decision added, and deletes the feedback it
+ * S1: cancelled or refused meanwhile): one system `plan` commit puts the root's plan state back
+ * as it was (round, baseSeq), takes away the lock the decision added, and deletes the feedback it
  * wrote. A cancelled plan mode then leaves the plan 计划中 (D48 Q3). Changes made since are not
- * touched; a root gone meanwhile has nothing to undo.
+ * touched (review round 2 N1): a lock is taken away only while it is still the one this decision
+ * wrote (its `versionSeq` is the decision's commit), and the feedback block only while it is as
+ * written and nothing was written under it. A root gone meanwhile has nothing to undo.
  */
 export async function undoOutlinePlanDecision(args: {
 	session: string;
@@ -761,25 +763,29 @@ export async function undoOutlinePlanDecision(args: {
 	store?: OutlineStore;
 	now?: () => Date;
 }): Promise<void> {
-	if (!args.decision.result?.commit) return;
+	const commit = args.decision.result?.commit;
+	if (!commit) return;
 	const store = args.store ?? outlineStore;
 	const rootId = args.decision.root.blockId;
 	const block = await store.getBlock(rootId);
 	if (!block || block.deleted || !block.taskJson) return;
 	const before = args.decision.before;
+	const ownLock = !before.lock && block.taskJson.lock?.versionSeq === commit.seq;
 	const ops: Parameters<typeof writeOutline>[0]["ops"][number][] = [
 		{
 			op: "setTask",
 			block: { id: rootId },
-			task: {
-				plan: before.plan ?? null,
-				...(before.lock ? {} : { lock: null }),
-			},
+			task: { plan: before.plan ?? null, ...(ownLock ? { lock: null } : {}) },
 		},
 	];
 	if (args.decision.noteId) {
 		const note = await store.getBlock(args.decision.noteId);
-		if (note && !note.deleted) ops.push({ op: "delete", block: { id: note.id } });
+		const untouched =
+			note &&
+			!note.deleted &&
+			note.versionSeq === commit.seq &&
+			(await store.listChildMetas(note.spaceId, [note.id], 1)).length === 0;
+		if (untouched) ops.push({ op: "delete", block: { id: note.id } });
 	}
 	await writeOutline(
 		{

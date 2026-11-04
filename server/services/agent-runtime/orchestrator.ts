@@ -1680,14 +1680,17 @@ export async function runAgentLoopUnlocked(
 					// way the approval came, before the restart starts its first step.
 					{
 						const { settleApprovedOutlinePlan } = await import("../outline-plan-mode");
+						const byReview = pendingPlanApproverSource.get(narratorId) === "reflection";
 						active._outlinePlanApproved =
 							(await settleApprovedOutlinePlan({
 								narratorId,
 								toolUseId,
 								locale: active.locale,
-								approverUserId: pendingPlanApprover.get(narratorId) ?? null,
+								// A review's approval is never a person's, whatever approver is left
+								// over (D48 ⑦, review round 2 N4).
+								approverUserId: byReview ? null : (pendingPlanApprover.get(narratorId) ?? null),
 								turnUserId: active._currentUserId ?? null,
-								byReview: pendingPlanApproverSource.get(narratorId) === "reflection",
+								byReview,
 							})) ?? undefined;
 					}
 					// Plan compact logic — retrieve plan text from the tool call's inputJson

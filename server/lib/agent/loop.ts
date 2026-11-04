@@ -1867,6 +1867,8 @@ export async function resolveExitPlanModeReflection(
 		config.executionTarget,
 		config.planFilePath,
 		planReadPolicy,
+		// A restored gate's input is the one resolved before (an outline plan decided meanwhile).
+		recoveryGate !== undefined,
 	);
 	if (!resolvedInput.ok) {
 		return {

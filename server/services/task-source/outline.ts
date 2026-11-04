@@ -295,7 +295,6 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 	): Promise<ContinuationTarget> {
 		const current = await session();
 		if (current.subagent) return { openTask: null, protectedOpenCount: 0, turnBudgetOnly: true };
-		let read = await readOpen(current);
 		// A task a person asked the session to start ("Add and start", "Reopen and start"; review
 		// round 1 S4), or the root of a plan they approved (outline P2 PR 8): read as its own
 		// subtree, so the tasks before it in the session cannot crowd it out (P2 PR 8 review S3).
@@ -303,38 +302,34 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		if (preferTaskId) {
 			// Started for the session through the same system start as a promotion, whatever else
 			// is in progress, and named by the continuation. Nothing else is started or named
-			// instead: when it cannot be started, nothing continues.
+			// instead: when it cannot be started, nothing continues. The subtree is read once
+			// (P2 PR 8 review round 2 N5): a start only changes the started task's checkbox, kept
+			// in the read as it is; a refused start moves on to the next step.
 			tree = await readOpen(current, { within: preferTaskId });
 			const wanted = tree.entries.find((entry) => entry.ref.blockId === preferTaskId);
 			if (wanted?.status === "todo" && wanted.ref.spaceId === current.spaceId) {
 				if (await claim(current, wanted)) wanted.status = "doing";
-				tree = await readOpen(current, { within: preferTaskId });
 			}
 			// A tree (a goal with steps, a plan): its first step that can start is started too, and
 			// named (D48 Q2: continue from the first startable task of the tree being worked).
-			if (wanted?.ref.container) {
-				const tried = new Set<string>();
-				for (let attempt = 0; attempt < OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts; attempt++) {
-					if (firstUnder(tree, preferTaskId, "doing")) break;
-					const next = tree.entries.find(
-						(entry) =>
-							entry.status === "todo" &&
-							!entry.ref.container &&
-							entry.ref.spaceId === current.spaceId &&
-							entry.ref.taskAncestorIds.includes(preferTaskId) &&
-							!tried.has(`${entry.ref.blockId}@${entry.ref.versionSeq}`),
-					);
-					if (!next) break;
-					tried.add(`${next.ref.blockId}@${next.ref.versionSeq}`);
+			if (wanted?.ref.container && !firstUnder(tree, preferTaskId, "doing")) {
+				const steps = tree.entries.filter(
+					(entry) =>
+						entry.status === "todo" &&
+						!entry.ref.container &&
+						entry.ref.spaceId === current.spaceId &&
+						entry.ref.taskAncestorIds.includes(preferTaskId),
+				);
+				for (const next of steps.slice(0, OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts)) {
 					if (await claim(current, next)) {
 						next.status = "doing";
 						break;
 					}
-					tree = await readOpen(current, { within: preferTaskId });
 				}
 			}
-			read = await readOpen(current);
-		} else if (promoteTodo) {
+		}
+		let read = await readOpen(current);
+		if (!preferTaskId && promoteTodo) {
 			// Only a task of the session's own space is started on its behalf: anything else it
 			// may continue it holds already. A refused start moves on to the next to-do (a task
 			// changed meanwhile may be tried again at its new version), a few times at most.
