@@ -1,3 +1,4 @@
+import { getProviderKeyStore } from "./provider-keys";
 import { settings } from "./settings";
 
 /** Singleton built-in sources: the prefix is the only identity they have. */
@@ -27,10 +28,16 @@ export function defaultRequestSourceId(provider: string | null | undefined): str
 	return apiConnections().find((connection) => connection.prefix === provider)?.id ?? null;
 }
 
-/** Display name of a non-pooled source id, including disabled connections. */
+/**
+ * Display name of a non-Codex source id, including disabled connections. A provider's
+ * extra keys read "Provider · label"; its first key carries the provider's own id.
+ */
 export function requestSourceName(sourceId: string): string | undefined {
-	return (
-		SINGLETON_SOURCES[sourceId] ??
-		apiConnections().find((connection) => connection.id === sourceId)?.name
-	);
+	const named = (id: string) => apiConnections().find((connection) => connection.id === id)?.name;
+	const singleton = SINGLETON_SOURCES[sourceId] ?? named(sourceId);
+	if (singleton) return singleton;
+	const key = getProviderKeyStore().get(sourceId);
+	if (!key) return undefined;
+	const provider = named(key.providerId) ?? key.providerId;
+	return `${provider} · ${key.label ?? `…${key.apiKey.slice(-4)}`}`;
 }
