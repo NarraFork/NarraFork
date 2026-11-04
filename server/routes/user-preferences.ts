@@ -1,4 +1,9 @@
-import { DEFAULT_TYPOGRAPHY } from "@shared/pretext-layout/typography";
+import {
+	DEFAULT_TYPOGRAPHY,
+	LEGACY_LINE_HEIGHT_RANGE,
+	legacyLineHeightPercentFrom,
+	lineHeightPercentFromLegacy,
+} from "@shared/pretext-layout/typography";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
@@ -56,7 +61,9 @@ const DEFAULTS = {
 	// treats as unscaled (see shared/pretext-layout/typography.ts).
 	narratorFontScalePercent: DEFAULT_TYPOGRAPHY.fontScalePercent,
 	narratorLetterSpacingPercent: DEFAULT_TYPOGRAPHY.letterSpacingPercent,
-	narratorLineHeightScalePercent: DEFAULT_TYPOGRAPHY.lineHeightScalePercent,
+	// Line height: the old-scale column's default, and the current-scale value it means.
+	narratorLineHeightScalePercent: LEGACY_LINE_HEIGHT_RANGE.fallback,
+	narratorLineHeightV2Percent: DEFAULT_TYPOGRAPHY.lineHeightScalePercent,
 	narratorParagraphScalePercent: DEFAULT_TYPOGRAPHY.paragraphScalePercent,
 	recentTabs: "[]",
 	addSubagentToRecentTabs: true,
@@ -148,6 +155,7 @@ const INSERT_COLUMNS = [
 	"narrator_letter_spacing_percent",
 	"narrator_paragraph_scale_percent",
 	"narrator_line_height_scale_percent",
+	"narrator_line_height_v2_percent",
 	"add_subagent_to_recent_tabs",
 	"recent_tabs_group_mode",
 	"notify_on_done",
@@ -294,12 +302,45 @@ function instanceSetupWizardCompleted(): boolean {
 	return settings.setupWizardCompleted === true;
 }
 
+/**
+ * The two line-height columns a PATCH writes, from whichever scale the client used.
+ *
+ * Both are always written together so they never disagree: a current client sends the
+ * new-scale value (the old column gets its mirror, for a downgrade); a client built
+ * before the rescale sends the old-scale value (the new column gets its conversion, so a
+ * tab left open across the upgrade cannot store a value that is later read on the wrong
+ * scale). If both arrive, the new-scale one wins.
+ */
+function lineHeightWrite(d: {
+	narratorLineHeightV2Percent?: number;
+	narratorLineHeightScalePercent?: number;
+}): { v2: number | null; legacy: number | null } {
+	if (d.narratorLineHeightV2Percent !== undefined) {
+		return {
+			v2: d.narratorLineHeightV2Percent,
+			legacy: legacyLineHeightPercentFrom(d.narratorLineHeightV2Percent),
+		};
+	}
+	if (d.narratorLineHeightScalePercent !== undefined) {
+		return {
+			v2: lineHeightPercentFromLegacy(d.narratorLineHeightScalePercent),
+			legacy: d.narratorLineHeightScalePercent,
+		};
+	}
+	return { v2: null, legacy: null };
+}
+
 function serializeUserPreferences(
 	pref: typeof userPreferences.$inferSelect,
 	recentTabs?: Record<string, unknown>[],
 ): Record<string, unknown> {
 	return {
 		...pref,
+		// NULL until saved on the current scale: derived from the old column, never written
+		// back (see the column's note in schema.ts).
+		narratorLineHeightV2Percent:
+			pref.narratorLineHeightV2Percent ??
+			lineHeightPercentFromLegacy(pref.narratorLineHeightScalePercent),
 		setupWizardCompleted: instanceSetupWizardCompleted(),
 		...(recentTabs === undefined ? {} : { recentTabs }),
 		commands: parseJsonArray(pref.commands),
@@ -379,6 +420,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		const dingtalkSecret = d.notifyDingtalkSecret ?? null;
 		const feishuWebhook = d.notifyFeishuWebhook ?? null;
 		const feishuSecret = d.notifyFeishuSecret ?? null;
+		const lineHeight = lineHeightWrite(d);
 
 		// Atomic upsert — avoids read-then-write race condition
 		const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
@@ -416,6 +458,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   narrator_letter_spacing_percent = COALESCE(?, narrator_letter_spacing_percent),
 		   narrator_paragraph_scale_percent = COALESCE(?, narrator_paragraph_scale_percent),
 		   narrator_line_height_scale_percent = COALESCE(?, narrator_line_height_scale_percent),
+		   narrator_line_height_v2_percent = COALESCE(?, narrator_line_height_v2_percent),
 		   add_subagent_to_recent_tabs = COALESCE(?, add_subagent_to_recent_tabs),
 		   recent_tabs_group_mode = COALESCE(?, recent_tabs_group_mode),
 		   notify_on_done = COALESCE(?, notify_on_done),
@@ -462,7 +505,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.narratorFontScalePercent ?? DEFAULTS.narratorFontScalePercent,
 				d.narratorLetterSpacingPercent ?? DEFAULTS.narratorLetterSpacingPercent,
 				d.narratorParagraphScalePercent ?? DEFAULTS.narratorParagraphScalePercent,
-				d.narratorLineHeightScalePercent ?? DEFAULTS.narratorLineHeightScalePercent,
+				lineHeight.legacy ?? DEFAULTS.narratorLineHeightScalePercent,
+				lineHeight.v2,
 				(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
 				d.recentTabsGroupMode ?? DEFAULTS.recentTabsGroupMode,
 				(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
@@ -507,7 +551,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.narratorFontScalePercent ?? null,
 				d.narratorLetterSpacingPercent ?? null,
 				d.narratorParagraphScalePercent ?? null,
-				d.narratorLineHeightScalePercent ?? null,
+				lineHeight.legacy,
+				lineHeight.v2,
 				d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
 				d.recentTabsGroupMode ?? null,
 				d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,

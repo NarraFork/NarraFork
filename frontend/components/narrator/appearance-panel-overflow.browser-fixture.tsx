@@ -50,7 +50,7 @@ const queryClient = new QueryClient({
 queryClient.setQueryData(["user-preferences"], {
 	narratorFontScalePercent: 100,
 	narratorLetterSpacingPercent: 0,
-	narratorLineHeightScalePercent: 100,
+	narratorLineHeightV2Percent: 100,
 	narratorParagraphScalePercent: 100,
 });
 

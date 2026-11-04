@@ -3,6 +3,7 @@ import type { MeasuredElement, PreparedFixedBlock } from "../prepared-block";
 import {
 	MEASURE_SUBAGENT_RECOVERY_CONSTANTS as C,
 	measureSubagentRecovery,
+	resolvedHeight,
 	SUBAGENT_RECOVERY_TAG,
 	type SubagentRecoveryData,
 	type SubagentRecoveryRow,
@@ -155,7 +156,10 @@ describe("measureSubagentRecovery", () => {
 			data(5, { kind: "resolved", summary: "Restarted 5 subagent(s)." }),
 			WIDTH,
 		);
-		expect(measured.height).toBe(C.RESOLVED_HEIGHT);
+		// The live height: 10×2 + the xs line at the default setting (20, 120% of the 17
+		// the frozen RESOLVED_HEIGHT records — LINE_HEIGHT_BASELINE_PERCENT).
+		expect(measured.height).toBe(resolvedHeight());
+		expect(measured.height).toBe(40);
 		expect(payloadOf<{ kind: string }>(measured).kind).toBe("resolved");
 	});
 

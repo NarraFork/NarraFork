@@ -7,6 +7,7 @@ import {
 	SYSTEM_SIMPLE_CARD_HEIGHTS,
 	type SystemSimpleData,
 	type SystemSimpleKind,
+	systemSimpleCardHeight,
 } from "./measure-system-simple";
 
 // These cards are all single-line / clamped: every block is a PreparedFixedBlock
@@ -15,23 +16,27 @@ import {
 
 const D = (over: Partial<SystemSimpleData> = {}): SystemSimpleData => ({ text: "x", ...over });
 
+// The exported `*_CARD_HEIGHT` constants are the bare-Mantine baseline (xs line 17).
+// The default setting measures the xs line at 120% of it (LINE_HEIGHT_BASELINE_PERCENT):
+// 20, so a centered row is 4×2 + 20 = 28 and a Paper row 10×2 + 20 = 40.
+
 describe("measureSystemSimpleCard — fixed per-kind heights", () => {
-	it("compact = 25px (centered single line, py=4 + xs line 17)", () => {
+	it("compact = 28px (centered single line, py=4 + xs line 20)", () => {
 		expect(COMPACT_CARD_HEIGHT).toBe(25);
 		const r = measureSystemSimpleCard("compact", D(), 800);
-		expect(r.height).toBe(25);
+		expect(r.height).toBe(28);
 	});
 
-	it("segment_compact = 25px (centered single line)", () => {
+	it("segment_compact = 28px (centered single line)", () => {
 		expect(SEGMENT_COMPACT_CARD_HEIGHT).toBe(25);
 		const r = measureSystemSimpleCard("segment_compact", D(), 800);
-		expect(r.height).toBe(25);
+		expect(r.height).toBe(28);
 	});
 
-	it("merge_summary = 37px (Paper p=xs + lineClamp=1)", () => {
+	it("merge_summary = 40px (Paper p=xs + lineClamp=1)", () => {
 		expect(MERGE_SUMMARY_CARD_HEIGHT).toBe(37);
 		const r = measureSystemSimpleCard("merge_summary", D(), 800);
-		expect(r.height).toBe(37);
+		expect(r.height).toBe(40);
 	});
 
 	// `review_feedback` is deliberately absent: it is a `system-text` card now, because a
@@ -39,11 +44,13 @@ describe("measureSystemSimpleCard — fixed per-kind heights", () => {
 	// module's single clamped line could express neither. Its geometry is pinned in
 	// measure-system-text.test.ts instead.
 
-	it("SYSTEM_SIMPLE_CARD_HEIGHTS lookup matches the measured height for every kind", () => {
+	it("systemSimpleCardHeight matches the measured height for every kind", () => {
 		const kinds: SystemSimpleKind[] = ["compact", "segment_compact", "merge_summary"];
 		for (const kind of kinds) {
 			const r = measureSystemSimpleCard(kind, D(), 640);
-			expect(r.height).toBe(SYSTEM_SIMPLE_CARD_HEIGHTS[kind]);
+			expect(r.height).toBe(systemSimpleCardHeight(kind));
+			// The frozen lookup is the baseline: 3px (one xs line × 0.2, rounded) below.
+			expect(r.height - SYSTEM_SIMPLE_CARD_HEIGHTS[kind]).toBe(3);
 		}
 	});
 });
@@ -63,7 +70,7 @@ describe("measureSystemSimpleCard — height is independent of content", () => {
 		const short = measureSystemSimpleCard("compact", D({ text: "compacted" }), 800);
 		const long = measureSystemSimpleCard("compact", D({ text: "compacting · ".repeat(80) }), 800);
 		expect(long.height).toBe(short.height);
-		expect(long.height).toBe(25);
+		expect(long.height).toBe(28);
 	});
 
 	it("height does NOT change with contentWidth (full-line clamp, width-free)", () => {
@@ -77,7 +84,7 @@ describe("measureSystemSimpleCard — height is independent of content", () => {
 			(lod) => measureSystemSimpleCard("merge_summary", D(), 800, lod).height,
 		);
 		expect(new Set(heights).size).toBe(1);
-		expect(heights[0]).toBe(37);
+		expect(heights[0]).toBe(40);
 	});
 
 	it("optional flags (hasAvatar / status) are height-neutral", () => {
@@ -103,7 +110,7 @@ describe("measureSystemSimpleCard — block/frame shape", () => {
 		expect(block?.kind).toBe("fixed");
 		if (block?.kind === "fixed") {
 			expect(block.tag).toBe("compact");
-			expect(block.height).toBe(25);
+			expect(block.height).toBe(28);
 		}
 	});
 

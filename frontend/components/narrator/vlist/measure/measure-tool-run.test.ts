@@ -11,6 +11,28 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+/**
+ * The module with its geometry names bound to the LIVE metrics.
+ *
+ * The exported `TRACE_*` constants are the bare-Mantine baseline; the default setting
+ * now measures line boxes at 120% of it (`LINE_HEIGHT_BASELINE_PERCENT`), so a
+ * measurement at the default no longer equals the constants. The arithmetic these
+ * tests check is unchanged — only the line box it is built from.
+ */
+async function liveToolRun() {
+	const m = await import("./measure-tool-run");
+	const t = m.traceMetrics();
+	return {
+		...m,
+		TRACE_XS_LINE: t.xsLine,
+		TRACE_ROW_CONTENT: t.rowContent,
+		TRACE_ROW_HEIGHT: t.rowHeight,
+		TRACE_HEADER_GROUP_HEIGHT: t.headerGroupHeight,
+		TRACE_HEADER_BAND_HEIGHT: t.headerBandHeight,
+		TRACE_COUNT_LINE_HEIGHT: t.countLineHeight,
+	};
+}
+
 // ── Shared row builders ──────────────────────────────────────────────────────
 function toolRows(n: number) {
 	return Array.from({ length: n }, (_, i) => ({
@@ -37,13 +59,21 @@ describe("measure-tool-run — fixed chrome constants (CONTRACT §4)", () => {
 		expect(m.TRACE_COUNT_LINE_HEIGHT).toBeCloseTo(20.8, 5);
 		expect(m.TRACE_HEADER_GROUP_HEIGHT).toBeCloseTo(20.8, 5);
 	});
+
+	it("the default setting measures the old 120% line: xs 20.16, row 22.16, band 28.16", async () => {
+		const m = await import("./measure-tool-run");
+		const t = m.traceMetrics();
+		expect(t.xsLine).toBeCloseTo(16.8 * 1.2, 5);
+		expect(t.rowHeight).toBeCloseTo(22.16, 5);
+		expect(t.countLineHeight).toBeCloseTo(24.16, 5);
+		expect(t.headerBandHeight).toBeCloseTo(28.16, 5);
+	});
 });
 
 describe("measureCollapsibleTrace — header + N rows", () => {
 	it("height = header band + N × row height (no fold, no expand)", async () => {
-		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(3), maxVisible: 10 }, 600);
 		expect(r.rows).toHaveLength(3);
 		expect(r.toggle).toBeNull();
@@ -52,9 +82,8 @@ describe("measureCollapsibleTrace — header + N rows", () => {
 	});
 
 	it("rows stack right after the header at the measured tops", async () => {
-		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(2), maxVisible: 10 }, 600);
 		// header sits at the outer top padding; first row begins right after the
 		// header Group (outer top pad + header group = 2 + 20.8 = 22.8).
@@ -66,7 +95,7 @@ describe("measureCollapsibleTrace — header + N rows", () => {
 	});
 
 	it("row height is independent of title length (truncate → single line)", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const short = measureCollapsibleTrace({ items: [{ title: "hi" }], maxVisible: 10 }, 600);
 		const long = measureCollapsibleTrace(
 			{ items: [{ title: "x".repeat(500) }], maxVisible: 10 },
@@ -76,7 +105,7 @@ describe("measureCollapsibleTrace — header + N rows", () => {
 	});
 
 	it("returns null-shaped empty measure for an empty item list", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: [] }, 600);
 		expect(r.itemCount).toBe(0);
 		expect(r.height).toBe(0);
@@ -87,9 +116,8 @@ describe("measureCollapsibleTrace — header + N rows", () => {
 
 describe("measureCollapsibleTrace — maxVisible fold + show-earlier toggle", () => {
 	it("N > maxVisible shows a toggle row + only the last maxVisible rows", async () => {
-		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(15), maxVisible: 10 }, 600);
 		expect(r.rows).toHaveLength(10);
 		expect(r.toggle).not.toBeNull();
@@ -103,9 +131,8 @@ describe("measureCollapsibleTrace — maxVisible fold + show-earlier toggle", ()
 	});
 
 	it("showEarlier reveals all rows (toggle stays, grows taller)", async () => {
-		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const collapsed = measureCollapsibleTrace({ items: toolRows(15), maxVisible: 10 }, 600);
 		const expanded = measureCollapsibleTrace({ items: toolRows(15), maxVisible: 10 }, 600, {
 			showEarlier: true,
@@ -119,7 +146,7 @@ describe("measureCollapsibleTrace — maxVisible fold + show-earlier toggle", ()
 	});
 
 	it("N === maxVisible shows no toggle", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(10), maxVisible: 10 }, 600);
 		expect(r.toggle).toBeNull();
 		expect(r.rows).toHaveLength(10);
@@ -128,9 +155,7 @@ describe("measureCollapsibleTrace — maxVisible fold + show-earlier toggle", ()
 
 describe("measureCollapsibleTrace — collapseItems (folded to header only)", () => {
 	it("collapseItems + not opened → header band only (≈24.8), no rows", async () => {
-		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(8), maxVisible: 10 }, 600, {
 			collapseItems: true,
 		});
@@ -142,9 +167,8 @@ describe("measureCollapsibleTrace — collapseItems (folded to header only)", ()
 	});
 
 	it("collapseItems + opened → rows revealed again", async () => {
-		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(4), maxVisible: 10 }, 600, {
 			collapseItems: true,
 			itemsOpened: true,
@@ -157,21 +181,21 @@ describe("measureCollapsibleTrace — collapseItems (folded to header only)", ()
 });
 
 describe("measureToolRunCountLine (L1/L2) — single fixed row", () => {
-	it("is a single ≈20.8px row regardless of count", async () => {
-		const { measureToolRunCountLine, TRACE_COUNT_LINE_HEIGHT } = await import("./measure-tool-run");
+	it("is a single ≈24.16px row regardless of count", async () => {
+		const { measureToolRunCountLine, TRACE_COUNT_LINE_HEIGHT } = await liveToolRun();
 		const a = measureToolRunCountLine(3, 600);
 		const b = measureToolRunCountLine(999, 600);
 		expect(a.kind).toBe("tool");
 		expect(a.count).toBe(3);
 		expect(a.height).toBeCloseTo(TRACE_COUNT_LINE_HEIGHT, 5);
-		expect(a.height).toBeCloseTo(20.8, 5);
+		expect(a.height).toBeCloseTo(24.16, 5);
 		expect(b.height).toBeCloseTo(a.height, 5);
 		expect(a.blocks).toHaveLength(1);
 		expect(a.blocks[0]?.kind).toBe("fixed");
 	});
 
 	it("width-independent", async () => {
-		const { measureToolRunCountLine } = await import("./measure-tool-run");
+		const { measureToolRunCountLine } = await liveToolRun();
 		const wide = measureToolRunCountLine(5, 2000);
 		const narrow = measureToolRunCountLine(5, 80);
 		expect(narrow.height).toBeCloseTo(wide.height, 5);
@@ -179,15 +203,13 @@ describe("measureToolRunCountLine (L1/L2) — single fixed row", () => {
 });
 
 describe("measureReasoningCountLine (L1/L2) — single fixed row", () => {
-	it("is a single ≈20.8px reasoning row", async () => {
-		const { measureReasoningCountLine, TRACE_COUNT_LINE_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+	it("is a single ≈24.16px reasoning row", async () => {
+		const { measureReasoningCountLine, TRACE_COUNT_LINE_HEIGHT } = await liveToolRun();
 		const r = measureReasoningCountLine(4, 600);
 		expect(r.kind).toBe("reasoning");
 		expect(r.count).toBe(4);
 		expect(r.height).toBeCloseTo(TRACE_COUNT_LINE_HEIGHT, 5);
-		expect(r.height).toBeCloseTo(20.8, 5);
+		expect(r.height).toBeCloseTo(24.16, 5);
 	});
 });
 
@@ -196,9 +218,7 @@ describe("measureActivityTrace (L1/L2)", () => {
 		// The band is dropped once the rows are on screen: "Activity · 0 reasoning · 4
 		// tools" above four rows that each name their own tool is a fixed per-turn cost
 		// buying nothing. Only the outer padding remains above the first row.
-		const { measureActivityTrace, TRACE_OUTER_PADDING_Y, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureActivityTrace, TRACE_OUTER_PADDING_Y, TRACE_ROW_HEIGHT } = await liveToolRun();
 		const r = measureActivityTrace(toolRows(4), 600);
 		expect(r.variant).toBe("activity");
 		expect(r.collapsedToHeader).toBe(false);
@@ -211,7 +231,7 @@ describe("measureActivityTrace (L1/L2)", () => {
 	});
 
 	it("L1 (collapsed) → header band only (≈24.8)", async () => {
-		const { measureActivityTrace, TRACE_HEADER_BAND_HEIGHT } = await import("./measure-tool-run");
+		const { measureActivityTrace, TRACE_HEADER_BAND_HEIGHT } = await liveToolRun();
 		const r = measureActivityTrace(toolRows(9), 600, { collapsed: true });
 		expect(r.collapsedToHeader).toBe(true);
 		expect(r.rows).toHaveLength(0);
@@ -226,9 +246,8 @@ describe("measureActivityTrace (L1/L2)", () => {
 		// `collapseItems && itemsOpened` is the reader's own expansion of an L1 fold.
 		// Dropping the band there would remove the control they just used, so it stays —
 		// unlike the L2 default, which never had a fold to begin with.
-		const { measureActivityTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureActivityTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureActivityTrace(toolRows(3), 600, { collapsed: true, itemsOpened: true });
 		expect(r.header.visible).toBe(true);
 		expect(r.header.opened).toBe(true);
@@ -236,7 +255,7 @@ describe("measureActivityTrace (L1/L2)", () => {
 	});
 
 	it("caps at 10 visible rows with a toggle when N>10", async () => {
-		const { measureActivityTrace } = await import("./measure-tool-run");
+		const { measureActivityTrace } = await liveToolRun();
 		const r = measureActivityTrace(toolRows(14), 600);
 		expect(r.rows).toHaveLength(10);
 		expect(r.toggle?.hiddenCount).toBe(4);
@@ -246,9 +265,7 @@ describe("measureActivityTrace (L1/L2)", () => {
 		// The toggle row follows the header block in the stack, so a zero-height band
 		// must leave it at the outer padding rather than 20.8px down (which would open
 		// a gap the trace's own height never accounted for).
-		const { measureActivityTrace, TRACE_OUTER_PADDING_Y, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureActivityTrace, TRACE_OUTER_PADDING_Y, TRACE_ROW_HEIGHT } = await liveToolRun();
 		const r = measureActivityTrace(toolRows(14), 600);
 		expect(r.toggle?.top).toBeCloseTo(TRACE_OUTER_PADDING_Y, 5);
 		expect(r.height).toBeCloseTo(TRACE_OUTER_PADDING_Y * 2 + 11 * TRACE_ROW_HEIGHT, 5);
@@ -263,18 +280,16 @@ describe("measureActivityTrace (L1/L2)", () => {
  */
 describe("header band visibility is scoped to the activity fold", () => {
 	it("reasoning-steps always keeps its labelled band", async () => {
-		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureReasoningStepsTrace(stepRows(3), 600);
 		expect(r.header.visible).toBe(true);
 		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 3 * TRACE_ROW_HEIGHT, 5);
 	});
 
 	it("the generic collapsible variant keeps its band too", async () => {
-		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(2), maxVisible: 10 }, 600);
 		expect(r.header.visible).toBe(true);
 		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 2 * TRACE_ROW_HEIGHT, 5);
@@ -283,7 +298,7 @@ describe("header band visibility is scoped to the activity fold", () => {
 	it("a hidden band is a zero-height block, still the FIRST block in the stack", async () => {
 		// Kept in the stack rather than removed: it owns the outer top padding, and
 		// `frame.blocks[0]` is read directly as the header.
-		const { measureActivityTrace, TRACE_OUTER_PADDING_Y } = await import("./measure-tool-run");
+		const { measureActivityTrace, TRACE_OUTER_PADDING_Y } = await liveToolRun();
 		const r = measureActivityTrace(toolRows(2), 600);
 		const first = r.blocks[0];
 		expect(first?.kind).toBe("fixed");
@@ -298,9 +313,8 @@ describe("header band visibility is scoped to the activity fold", () => {
 
 describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 	it("a step with no body is a plain, non-expandable title row", async () => {
-		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureReasoningStepsTrace(
 			[
 				{ title: "Step 0", key: "s0" },
@@ -316,9 +330,8 @@ describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 	});
 
 	it("rows are expandable when a body exists, but collapsed adds no height", async () => {
-		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureReasoningStepsTrace(stepRows(3), 600);
 		expect(r.rows.every((row) => row.expandable)).toBe(true);
 		expect(r.rows.every((row) => !row.expanded)).toBe(true);
@@ -326,9 +339,8 @@ describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 	});
 
 	it("expanding a step adds bodyPadding*2 + markdown height under its row", async () => {
-		const { measureReasoningStepsTrace, TRACE_BODY_PADDING_Y, traceBodyInnerWidth } = await import(
-			"./measure-tool-run"
-		);
+		const { measureReasoningStepsTrace, TRACE_BODY_PADDING_Y, traceBodyInnerWidth } =
+			await liveToolRun();
 		const { measureMarkdown } = await import("./measure-markdown");
 
 		const body = "Hello world of reasoning.";
@@ -353,7 +365,7 @@ describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 	});
 
 	it("a taller markdown body makes the expanded step taller", async () => {
-		const { measureReasoningStepsTrace } = await import("./measure-tool-run");
+		const { measureReasoningStepsTrace } = await liveToolRun();
 		const shortBody = [{ title: "S", body: "One line.", key: "s" }];
 		const longBody = [{ title: "S", body: "Para one.\n\nPara two.\n\nPara three.", key: "s" }];
 		const shortR = measureReasoningStepsTrace(shortBody, 600, { expandedIndices: [0] });
@@ -362,7 +374,7 @@ describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 	});
 
 	it("body wraps to more lines as width shrinks (taller)", async () => {
-		const { measureReasoningStepsTrace } = await import("./measure-tool-run");
+		const { measureReasoningStepsTrace } = await liveToolRun();
 		const body = "one two three four five six seven eight nine ten eleven twelve thirteen";
 		const steps = [{ title: "S", body, key: "s" }];
 		const wide = measureReasoningStepsTrace(steps, 2000, { expandedIndices: [0] });
@@ -373,9 +385,8 @@ describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 	it("an expandedIndex on a body-less step still adds no height", async () => {
 		// There is no level that suppresses bodies any more (the old `titlesOnly`), so
 		// the only thing that can keep a row flat is having nothing to reveal.
-		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
-			"./measure-tool-run"
-		);
+		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } =
+			await liveToolRun();
 		const r = measureReasoningStepsTrace(
 			[
 				{ title: "Step 0", key: "s0" },
@@ -391,7 +402,7 @@ describe("measureReasoningStepsTrace — expandable markdown bodies", () => {
 
 describe("block / frame shape", () => {
 	it("produces header + rows + trailing pad fixed blocks with matching frame", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(2), maxVisible: 10 }, 512);
 		// header + 2 rows + pad = 4 blocks (no toggle at N<=maxVisible).
 		expect(r.blocks).toHaveLength(4);
@@ -423,7 +434,7 @@ describe("row identity is height-neutral", () => {
 		}));
 
 	it("does not change the collapsed or expanded trace height", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const plain = toolRows(3);
 		for (const width of [320, 512, 900]) {
 			const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, width);
@@ -436,7 +447,7 @@ describe("row identity is height-neutral", () => {
 	});
 
 	it("does not change height when rows fold behind 'show earlier'", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const plain = toolRows(14);
 		const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, 512);
 		const b = measureCollapsibleTrace({ items: withIdentity(plain), maxVisible: 10 }, 512);
@@ -445,7 +456,7 @@ describe("row identity is height-neutral", () => {
 	});
 
 	it("passes identity through to the measured rows unchanged", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: withIdentity(toolRows(2)), maxVisible: 10 }, 512);
 		expect(r.rows[0]?.identity).toEqual({
 			messageId: "m1",
@@ -457,7 +468,7 @@ describe("row identity is height-neutral", () => {
 	});
 
 	it("leaves identity undefined when the row carries none", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: toolRows(2), maxVisible: 10 }, 512);
 		expect(r.rows[0]?.identity).toBeUndefined();
 	});
@@ -474,7 +485,7 @@ describe("row unitId is height-neutral", () => {
 		rows.map((row, i) => ({ ...row, unitId: `tool-tu-${i}` }));
 
 	it("does not change any measured geometry", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const plain = toolRows(3);
 		for (const width of [320, 512, 900]) {
 			const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, width);
@@ -486,7 +497,7 @@ describe("row unitId is height-neutral", () => {
 	});
 
 	it("reaches the measured rows unchanged, and stays undefined when absent", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const withIds = measureCollapsibleTrace(
 			{ items: withUnitId(toolRows(2)), maxVisible: 10 },
 			512,
@@ -516,7 +527,7 @@ describe("row status + timing are height-neutral", () => {
 		}));
 
 	it("changes no measured geometry, at any width", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const plain = toolRows(3);
 		for (const width of [320, 512, 900]) {
 			const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, width);
@@ -534,7 +545,7 @@ describe("row status + timing are height-neutral", () => {
 		// The real failure mode is temporal: one row walks streaming → running →
 		// success while the reader is looking at it. Every step must land on the same
 		// geometry, not merely "with vs without".
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const heights = new Set<number>();
 		for (const status of ["streaming", "running", "success", "fail", "cancelled", ""]) {
 			const r = measureCollapsibleTrace(
@@ -542,7 +553,7 @@ describe("row status + timing are height-neutral", () => {
 				512,
 			);
 			heights.add(r.height);
-			expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+			expect(r.rows[0]?.blockHeight).toBeCloseTo(22.16, 5);
 		}
 		expect(heights.size).toBe(1);
 	});
@@ -550,7 +561,7 @@ describe("row status + timing are height-neutral", () => {
 	it("a row's reflection status is height-neutral too", async () => {
 		// `reflectionStatus` is a pure renderer passthrough (it picks the shimmer colour
 		// when a gate is deliberating). Like `status` it must never reach the height math.
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const base = toolRows(1)[0];
 		const heights = new Set<number>();
 		for (const reflectionStatus of [undefined, "running", "confirmed", "awaiting_user"]) {
@@ -559,7 +570,7 @@ describe("row status + timing are height-neutral", () => {
 				512,
 			);
 			heights.add(r.height);
-			expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+			expect(r.rows[0]?.blockHeight).toBeCloseTo(22.16, 5);
 		}
 		expect(heights.size).toBe(1);
 		// And it reaches the measured row unchanged, so the renderer can read it.
@@ -574,10 +585,10 @@ describe("row status + timing are height-neutral", () => {
 
 	it("a row's `+N -N` line counts are height-neutral", async () => {
 		// `diffStats` is a pure renderer passthrough in the same lane as `status` and
-		// `timing`: one nowrap span inside the row's fixed 18.8px line. If it ever
+		// `timing`: one nowrap span inside the row's fixed 22.16px line. If it ever
 		// reached the height math, every Write/Edit row in a fold would be a different
 		// height from its neighbours.
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const base = toolRows(1)[0];
 		const heights = new Set<number>();
 		for (const diffStats of [
@@ -589,7 +600,7 @@ describe("row status + timing are height-neutral", () => {
 		]) {
 			const r = measureCollapsibleTrace({ items: [{ ...base, diffStats }], maxVisible: 10 }, 512);
 			heights.add(r.height);
-			expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+			expect(r.rows[0]?.blockHeight).toBeCloseTo(22.16, 5);
 		}
 		expect(heights.size).toBe(1);
 	});
@@ -597,7 +608,7 @@ describe("row status + timing are height-neutral", () => {
 	it("passes `+N -N` through to the measured row, defaulting to null", async () => {
 		// The renderer reads this off the measured payload, so it has to arrive intact.
 		// Null (not `{0,0}`) is the "unknown" encoding — see `resolveFileDiffStats`.
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const base = toolRows(1)[0];
 		const withStats = measureCollapsibleTrace(
 			{ items: [{ ...base, diffStats: { added: 12, removed: 3 } }], maxVisible: 10 },
@@ -610,10 +621,10 @@ describe("row status + timing are height-neutral", () => {
 
 	it("a row's painted duration is height-neutral", async () => {
 		// `displayDurationMs` shares the lane `status` / `timing` / `diffStats` occupy:
-		// one nowrap span inside the fixed 18.8px line. Widths included because the
+		// one nowrap span inside the fixed 22.16px line. Widths included because the
 		// figure it replaces can be SHORTER (`1s` for `20s`) or longer (`1m30s`), and a
 		// row whose height depended on its own text width would betray that here.
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const base = { ...toolRows(1)[0], timing: { createdAt: 0, durationMs: 20_000 } };
 		const heights = new Set<number>();
 		for (const displayDurationMs of [undefined, null, 0, 1_200, 90_000, 3_600_000]) {
@@ -623,7 +634,7 @@ describe("row status + timing are height-neutral", () => {
 					width,
 				);
 				heights.add(Math.round(r.height * 1000));
-				expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+				expect(r.rows[0]?.blockHeight).toBeCloseTo(22.16, 5);
 			}
 		}
 		// Width does not change a single row's height either, so one value for all.
@@ -634,7 +645,7 @@ describe("row status + timing are height-neutral", () => {
 		// The renderer paints `displayDurationMs ?? timing.durationMs`, so a dropped
 		// passthrough would silently fall back to the 20s span this field exists to
 		// replace — a wrong number that still looks like a measurement.
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const base = { ...toolRows(1)[0], timing: { createdAt: 0, durationMs: 20_000 } };
 		const withFigure = measureCollapsibleTrace(
 			{ items: [{ ...base, displayDurationMs: 1_200 }], maxVisible: 10 },
@@ -657,7 +668,7 @@ describe("row status + timing are height-neutral", () => {
 		// This asserts the measure side of that contract: neither input is readable as
 		// geometry. Every combination — including a row carrying both — lands on one
 		// height.
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const base = toolRows(1)[0];
 		const heights = new Set<number>();
 		for (const shimmer of [undefined, false, true]) {
@@ -667,7 +678,7 @@ describe("row status + timing are height-neutral", () => {
 					512,
 				);
 				heights.add(r.height);
-				expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+				expect(r.rows[0]?.blockHeight).toBeCloseTo(22.16, 5);
 			}
 		}
 		expect(heights.size).toBe(1);
@@ -676,7 +687,7 @@ describe("row status + timing are height-neutral", () => {
 	it("normalizes the stamps once, in the measure layer", async () => {
 		// The renderer must never re-parse wire shapes; it indexes `row.timing`
 		// directly. Absent timing stays null so the row draws no slot at all.
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace(
 			{
 				items: [
@@ -698,7 +709,7 @@ describe("row status + timing are height-neutral", () => {
 	it("the status slot fits inside the row's content lane (why it is free)", async () => {
 		// The arithmetic reason the assertions above hold: the xs text line dominates
 		// every glyph in the row, so adding a 12px slot cannot raise the max.
-		const m = await import("./measure-tool-run");
+		const m = await liveToolRun();
 		expect(m.TRACE_ROW_STATUS).toBeLessThan(m.TRACE_XS_LINE);
 		expect(m.TRACE_ROW_CONTENT).toBeCloseTo(m.TRACE_XS_LINE, 5);
 	});
@@ -748,7 +759,7 @@ describe("trace row drill-down", () => {
 	}
 
 	it("canDrillDown makes a row expandable WITHOUT changing its collapsed height", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const plain = measureCollapsibleTrace({ items: toolRows(3), maxVisible: 10 }, 600);
 		const drill = measureCollapsibleTrace({ items: drillRows(3), maxVisible: 10 }, 600);
 		// The chevron replaces the "•" in the same fixed 12px slot → zero cost.
@@ -762,7 +773,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("a drillable row with no card yet stays exactly as tall as a plain row", async () => {
-		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await liveToolRun();
 		// expandedIndices names row 1, but the adapter has not supplied its card
 		// (the state and the payload land on separate renders). The row must not
 		// reserve space for content it does not have.
@@ -774,7 +785,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("expanding a tool row makes the row block exactly the nested card", async () => {
-		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await liveToolRun();
 		const items = drillRows(3, [1]);
 		const collapsed = measureCollapsibleTrace({ items, maxVisible: 10 }, 600);
 		const expanded = measureCollapsibleTrace({ items, maxVisible: 10 }, 600, {
@@ -801,7 +812,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("the nested card fills the full row width (no indented body lane)", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: drillRows(2, [0]), maxVisible: 10 }, 600, {
 			expandedIndices: [0],
 		});
@@ -811,7 +822,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("exposes the card header rect for the drill-down header morph", async () => {
-		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await liveToolRun();
 		const { CARD_BORDER, CARD_PADDING, headerRowHeight } = await import("./measure-tool-call");
 		const r = measureCollapsibleTrace({ items: drillRows(2, [0]), maxVisible: 10 }, 600, {
 			expandedIndices: [0],
@@ -830,7 +841,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("opens at every LOD a fold exists at (L1-L4 collapse a standalone card)", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		// `resolveToolCallOpened` returns false for L1-L4, so without the drill-down's
 		// lodUserOverride the reader's click would open an empty header.
 		for (const lod of [1, 2, 3, 4] as const) {
@@ -847,7 +858,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("a bigger payload makes the drilled-in row taller (up to the cap)", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const small = measureCollapsibleTrace(
 			{ items: [{ title: "t", canDrillDown: true, card: drillCard("a\nb\n") }], maxVisible: 10 },
 			600,
@@ -865,7 +876,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("a card wins over a markdown bodyText (mutually exclusive reveal channels)", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		const r = measureCollapsibleTrace(
 			{
 				items: [
@@ -881,7 +892,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("only the named row opens; its siblings stay at the fixed row height", async () => {
-		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await liveToolRun();
 		const r = measureCollapsibleTrace({ items: drillRows(4, [0, 1, 2, 3]), maxVisible: 10 }, 600, {
 			expandedIndices: [2],
 		});
@@ -892,7 +903,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("indices address the ORIGINAL item list, not the visible slice", async () => {
-		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const { measureCollapsibleTrace } = await liveToolRun();
 		// 14 rows, maxVisible 10 → the first 4 fold away, so visible row 0 is item 4.
 		const r = measureCollapsibleTrace({ items: drillRows(14, [11]), maxVisible: 10 }, 600, {
 			expandedIndices: [11],
@@ -903,7 +914,7 @@ describe("trace row drill-down", () => {
 	});
 
 	it("measureActivityTrace forwards the drill-down", async () => {
-		const { measureActivityTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const { measureActivityTrace, TRACE_ROW_HEIGHT } = await liveToolRun();
 		const rows = [{ title: "Read · a.ts", canDrillDown: true, card: drillCard(), key: "t-0" }];
 		const activity = measureActivityTrace(rows, 600, { expandedIndices: [0] }, {}, 2);
 		expect(activity.rows[0]?.cardMeasured).not.toBeNull();
@@ -914,7 +925,7 @@ describe("trace row drill-down", () => {
 		// The L1/L2 fold's reasoning rows carry `bodyText`; tool rows carry `card`.
 		// Both make a row expandable, through channels that must stay distinct.
 		const { measureActivityTrace, TRACE_BODY_PADDING_Y, traceBodyInnerWidth, TRACE_ROW_HEIGHT } =
-			await import("./measure-tool-run");
+			await liveToolRun();
 		const { measureMarkdown } = await import("./measure-markdown");
 		const body = "Considered the cache key, then the width settle loop.";
 		const rows = [{ title: "Check the cache", bodyText: body, key: "r-run0-0" }];
@@ -971,7 +982,7 @@ describe("trace row drill-down — subagent card", () => {
 	];
 
 	it("measures the SUBAGENT card, not the tool card", async () => {
-		const { measureActivityTrace } = await import("./measure-tool-run");
+		const { measureActivityTrace } = await liveToolRun();
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const r = measureActivityTrace(subRow(), 600, { expandedIndices: [0] }, {}, 2);
 		const row = r.rows[0];
@@ -993,7 +1004,7 @@ describe("trace row drill-down — subagent card", () => {
 	});
 
 	it("the drilled-in row block IS the card (no summary row above it)", async () => {
-		const { measureActivityTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const { measureActivityTrace, TRACE_ROW_HEIGHT } = await liveToolRun();
 		const rows = subRow();
 		const collapsed = measureActivityTrace(rows, 600, {}, {}, 2);
 		const expanded = measureActivityTrace(rows, 600, { expandedIndices: [0] }, {}, 2);
@@ -1012,15 +1023,12 @@ describe("trace row drill-down — subagent card", () => {
 		// The folded row showed `Agent · description`; the line that takes its place in
 		// the card is the description, since the badge row above it carries chips rather
 		// than that text. Pure arithmetic over the subagent card's own chrome.
-		const { measureActivityTrace } = await import("./measure-tool-run");
-		const {
-			badgeRowHeight,
-			CARD_BORDER,
-			CARD_PADDING,
-			DESC_LEFT,
-			DESC_MARGIN_TOP,
-			XS_LINE_HEIGHT,
-		} = await import("./measure-subagent");
+		const { measureActivityTrace } = await liveToolRun();
+		const { badgeRowHeight, CARD_BORDER, CARD_PADDING, DESC_LEFT, DESC_MARGIN_TOP } = await import(
+			"./measure-subagent"
+		);
+		const { typographyMetrics } = await import("../pretext-fonts");
+		const XS_LINE_HEIGHT = typographyMetrics().line.xs;
 		const r = measureActivityTrace(subRow(), 600, { expandedIndices: [0] }, {}, 2);
 		const drill = r.rows[0]?.drillHeader;
 		expect(drill).not.toBeNull();
@@ -1034,7 +1042,7 @@ describe("trace row drill-down — subagent card", () => {
 	});
 
 	it("an absent cardKind still means the TOOL card (every old producer)", async () => {
-		const { measureActivityTrace } = await import("./measure-tool-run");
+		const { measureActivityTrace } = await liveToolRun();
 		const r = measureActivityTrace(
 			[{ title: "Read · a.ts", canDrillDown: true, card: drillCard(), key: "t-0" }],
 			600,
@@ -1049,7 +1057,7 @@ describe("trace row drill-down — subagent card", () => {
 	it("a collapsed subagent row is exactly as tall as any other trace row", async () => {
 		// Height-neutral while folded: the chevron shares the dot's 12px slot, so the
 		// only cost of drill-ability is paid when the reader opens it.
-		const { measureActivityTrace } = await import("./measure-tool-run");
+		const { measureActivityTrace } = await liveToolRun();
 		const plain = measureActivityTrace(
 			[{ title: "Agent · trace the vlist path", hasIcon: true, key: "tool-tu-a" }],
 			600,

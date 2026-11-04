@@ -1,6 +1,6 @@
 import { PERSISTED_NARRATOR_TOOLBAR_IDS } from "@shared/narrator-toolbar";
 import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
-import { TYPOGRAPHY_RANGE } from "@shared/pretext-layout/typography";
+import { LEGACY_LINE_HEIGHT_RANGE, TYPOGRAPHY_RANGE } from "@shared/pretext-layout/typography";
 import { proxyOverrideSchema } from "@shared/proxy-settings";
 import {
 	RECENT_TABS_LIVE_LIMIT,
@@ -143,11 +143,23 @@ export const updateUserPreferencesSchema = z.object({
 		.min(TYPOGRAPHY_RANGE.letterSpacingPercent.min)
 		.max(TYPOGRAPHY_RANGE.letterSpacingPercent.max)
 		.optional(),
-	narratorLineHeightScalePercent: z
+	// Line height on the CURRENT scale (100 = the Mantine ratios × 1.2; see
+	// LINE_HEIGHT_BASELINE_PERCENT). The field name changed with the scale so that a
+	// value can never be read on the wrong one.
+	narratorLineHeightV2Percent: z
 		.number()
 		.int()
 		.min(TYPOGRAPHY_RANGE.lineHeightScalePercent.min)
 		.max(TYPOGRAPHY_RANGE.lineHeightScalePercent.max)
+		.optional(),
+	// Line height on the OLD scale (100 = the bare Mantine ratios), still sent by a client
+	// built before the rescale (a tab left open across an upgrade). Accepted on its own
+	// range and converted by the route; current clients send `narratorLineHeightV2Percent`.
+	narratorLineHeightScalePercent: z
+		.number()
+		.int()
+		.min(LEGACY_LINE_HEIGHT_RANGE.min)
+		.max(LEGACY_LINE_HEIGHT_RANGE.max)
 		.optional(),
 	narratorParagraphScalePercent: z
 		.number()

@@ -195,11 +195,14 @@ describe("interrupt guard card — the close button invokes the injected action"
 
 		// Whitespace-normalized: linkedom omits the space after the colon.
 		const style = (node: Element | null) => (node?.getAttribute("style") ?? "").replace(/\s+/g, "");
-		const lineBox = MEASURE_SYSTEM_TEXT_CONSTANTS.BODY_LINE_HEIGHT;
+		// The live xs line box: 120% of the bare-Mantine constant (17) at the default
+		// setting (LINE_HEIGHT_BASELINE_PERCENT).
+		expect(MEASURE_SYSTEM_TEXT_CONSTANTS.BODY_LINE_HEIGHT).toBe(17);
+		const lineBox = 20;
 		const button = wired.container.querySelector("button");
 		// Both, because either one alone lets the button grow the row: `height` without
 		// `min-height` collapses under flex, and Mantine's own xs size (18px) exceeds
-		// the 17px line box the heading row reserves.
+		// the line box the heading row reserves at a tighter line-height setting.
 		expect(style(button)).toContain(`height:${lineBox}px`);
 		expect(style(button)).toContain(`min-height:${lineBox}px`);
 

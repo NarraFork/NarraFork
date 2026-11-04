@@ -204,7 +204,11 @@ describe("row height accounts for a stacked formula", () => {
 	it("reserves more height for a fraction row than a plain-text row", async () => {
 		// A cell formula taller than the text line box must not be clipped by the row.
 		const plain = await renderMarkdownBody("| a |\n|---|\n| x |");
-		const fraction = await renderMarkdownBody("| a |\n|---|\n| $\\frac{a}{b}$ |");
+		// Nested: a single \frac now fits inside the default body line (24px, 120% of the
+		// Mantine 20 — LINE_HEIGHT_BASELINE_PERCENT); a stacked one is taller than it.
+		const fraction = await renderMarkdownBody(
+			"| a |\n|---|\n| $\\frac{\\frac{a}{b}}{\\frac{c}{d}}$ |",
+		);
 		expect(fraction.measured.height).toBeGreaterThan(plain.measured.height);
 		plain.unmount();
 		fraction.unmount();

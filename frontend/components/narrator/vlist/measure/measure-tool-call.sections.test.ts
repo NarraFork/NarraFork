@@ -10,6 +10,17 @@ async function mod() {
 	return import("./measure-tool-call");
 }
 
+/**
+ * The xs line box the measure layer reads LIVE (section labels, snippets, placeholder
+ * rows). The exported `XS_LINE_HEIGHT` / `SECTION_LABEL_HEIGHT` are the bare-Mantine 17;
+ * the default setting measures 120% of it (LINE_HEIGHT_BASELINE_PERCENT): 20. Rows the
+ * measure layer takes from the constant (an entry's title) stay at 17.
+ */
+async function liveXs(): Promise<number> {
+	const { typographyMetrics } = await import("../pretext-fonts");
+	return typographyMetrics().line.xs;
+}
+
 type Mod = Awaited<ReturnType<typeof mod>>;
 type MetaRow = import("./measure-tool-call").ToolMetaRow;
 type Entry = import("./measure-tool-call").ToolStructuredEntry;
@@ -68,7 +79,7 @@ describe("canonical body measurement", () => {
 		expect(section.measuredBody.model).toBe(model);
 		expect(section.measuredBody.frame.blocks[0]?.top).toBe(0);
 		expect(section.bodyTop).toBe(
-			m.DETAIL_TOP_MARGIN + m.SECTION_LABEL_HEIGHT + m.SECTION_LABEL_MARGIN_BOTTOM,
+			m.DETAIL_TOP_MARGIN + (await liveXs()) + m.SECTION_LABEL_MARGIN_BOTTOM,
 		);
 		expect(result.height).toBe(section.bodyTop + section.measuredBody.height);
 		expect("blocks" in result).toBe(false);
@@ -226,7 +237,8 @@ describe("measureToolDetail — meta-rows", () => {
 	it("an empty row list still yields one placeholder line", async () => {
 		const m = await mod();
 		const d = await measureMeta([]);
-		expect(d.height).toBe(m.XS_LINE_HEIGHT);
+		expect(m.XS_LINE_HEIGHT).toBe(17);
+		expect(d.height).toBe(await liveXs());
 	});
 
 	it("carries href / badges / actions as render-only block data", async () => {
@@ -277,8 +289,9 @@ describe("measureToolDetail — structured entries", () => {
 		const m = await mod();
 		const short = await measureEntries([{ title: "T", snippet: "tiny" }]);
 		const huge = await measureEntries([{ title: "T", snippet: "y".repeat(50_000) }]);
-		expect(short.height).toBe(m.XS_LINE_HEIGHT + m.XS_LINE_HEIGHT);
-		expect(huge.height).toBe(m.XS_LINE_HEIGHT + m.ENTRY_SNIPPET_MAX_LINES * m.XS_LINE_HEIGHT);
+		const xs = await liveXs();
+		expect(short.height).toBe(m.XS_LINE_HEIGHT + xs);
+		expect(huge.height).toBe(m.XS_LINE_HEIGHT + m.ENTRY_SNIPPET_MAX_LINES * xs);
 	});
 
 	it("bounds the entry count at ENTRY_MAX", async () => {
@@ -419,7 +432,8 @@ describe("measureToolDetail — ask replay", () => {
 	it("an entirely empty question still occupies one placeholder row", async () => {
 		const m = await mod();
 		const d = await measureAsk([{ header: "", omitHeader: true, options: [] }]);
-		expect(d.height).toBe(m.XS_LINE_HEIGHT);
+		expect(m.XS_LINE_HEIGHT).toBe(17);
+		expect(d.height).toBe(await liveXs());
 	});
 
 	it("measures as a SECTION body (the denied-question shape)", async () => {
@@ -455,7 +469,7 @@ describe("measureToolDetail — sections", () => {
 			{ key: "section.output", label: "output", body: codeBody("hi") },
 		]);
 		expect(labelled.height - unlabelled.height).toBe(
-			m.SECTION_LABEL_HEIGHT + m.SECTION_LABEL_MARGIN_BOTTOM,
+			(await liveXs()) + m.SECTION_LABEL_MARGIN_BOTTOM,
 		);
 	});
 

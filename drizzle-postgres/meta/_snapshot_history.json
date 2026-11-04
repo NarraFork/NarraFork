@@ -424,6 +424,14 @@
 			"prevId": "1ad16b89-59ad-4231-9d88-4791cccaf16b",
 			"version": "7",
 			"snapshotDigest": "6cddaa095cef72401c984bc6a9d1e9f693d00c3bf7d94f54cca5b450de989d18"
+		},
+		{
+			"idx": 53,
+			"tag": "0053_narrator_line_height_v2",
+			"id": "0e4b36cb-13b0-4d8a-88f6-7f4bc8317c12",
+			"prevId": "81304305-168a-41ef-8fc3-187e57817aed",
+			"version": "7",
+			"snapshotDigest": "74bb0e5c4f8cac8a78a0f6e276c5af43d035e0dc40b1af19d3716c04643c6369"
 		}
 	]
 }

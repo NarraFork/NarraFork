@@ -637,7 +637,7 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 111,
 			narratorLetterSpacingPercent: 7,
 			narratorParagraphScalePercent: 133,
-			narratorLineHeightScalePercent: 144,
+			narratorLineHeightV2Percent: 144,
 		};
 		const patchResult = await requestJson("/", {
 			method: "PATCH",
@@ -645,10 +645,11 @@ describe("narrator typography preferences", () => {
 			body: JSON.stringify(typography),
 		});
 		expect(patchResult.status).toBe(200);
-		expect(patchResult.body).toMatchObject(typography);
+		// The old-scale column carries the mirror (144 × 1.2), not a neighbour's value.
+		expect(patchResult.body).toMatchObject({ ...typography, narratorLineHeightScalePercent: 173 });
 
 		const getResult = await requestJson("/");
-		expect(getResult.body).toMatchObject(typography);
+		expect(getResult.body).toMatchObject({ ...typography, narratorLineHeightScalePercent: 173 });
 	});
 
 	it("creates a row carrying all four values when none exists yet", async () => {
@@ -658,7 +659,7 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 90,
 			narratorLetterSpacingPercent: -3,
 			narratorParagraphScalePercent: 120,
-			narratorLineHeightScalePercent: 80,
+			narratorLineHeightV2Percent: 80,
 		};
 		const patchResult = await requestJson("/", {
 			method: "PATCH",
@@ -674,7 +675,8 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 125,
 			narratorLetterSpacingPercent: 5,
 			narratorParagraphScalePercent: 115,
-			narratorLineHeightScalePercent: 135,
+			narratorLineHeightScalePercent: 162,
+			narratorLineHeightV2Percent: 135,
 		});
 
 		const patchResult = await requestJson("/", {
@@ -688,7 +690,8 @@ describe("narrator typography preferences", () => {
 			narratorFontScalePercent: 125,
 			narratorLetterSpacingPercent: 5,
 			narratorParagraphScalePercent: 115,
-			narratorLineHeightScalePercent: 135,
+			narratorLineHeightScalePercent: 162,
+			narratorLineHeightV2Percent: 135,
 		});
 	});
 
@@ -703,6 +706,122 @@ describe("narrator typography preferences", () => {
 
 		const { body } = await requestJson("/");
 		expect(body).toMatchObject({ narratorFontScalePercent: 100 });
+	});
+});
+
+/**
+ * The line-height rescale (the old 120% is the new 100%, LINE_HEIGHT_BASELINE_PERCENT).
+ *
+ * The old column is never rewritten by the rescale: the new value is derived from it on
+ * read until the reader saves on the new scale. So the rescale cannot run twice, a
+ * downgrade still finds its own column, and a client built before the rescale (still
+ * sending `narratorLineHeightScalePercent`) has its value converted on write.
+ */
+describe("narrator line height across the rescale", () => {
+	const v2Of = async () =>
+		((await requestJson("/")).body as { narratorLineHeightV2Percent: number })
+			.narratorLineHeightV2Percent;
+
+	it("reads the new default for a reader with no preferences row", async () => {
+		seedUser();
+		expect(await requestJson("/")).toMatchObject({
+			status: 200,
+			body: { narratorLineHeightV2Percent: 100, narratorLineHeightScalePercent: 100 },
+		});
+	});
+
+	it("gives a row saved before the rescale at the old default the NEW (taller) default", async () => {
+		// Every pre-rescale row carries 100 in the old column whether or not the reader ever
+		// touched the slider (the INSERT writes the default); 100 is also what reset wrote.
+		seedPreferences([], { narratorLineHeightScalePercent: 100 });
+		expect(await v2Of()).toBe(100);
+	});
+
+	it("keeps the effective line height of every custom value saved on the old scale", async () => {
+		for (const [legacy, expected] of [
+			[120, 100], // the decision's own example: old 120% is the new 100%
+			[150, 125],
+			[110, 92],
+			[75, 63], // the old floor still has a place on the new scale
+			[220, 183], // and so does the old ceiling
+		] as const) {
+			cleanDb(sqlite);
+			seedPreferences([], { narratorLineHeightScalePercent: legacy });
+			expect(await v2Of()).toBe(expected);
+		}
+	});
+
+	it("never rescales twice: reads and unrelated writes leave both columns as they were", async () => {
+		seedPreferences([], { narratorLineHeightScalePercent: 150 });
+		for (let i = 0; i < 3; i++) expect(await v2Of()).toBe(125);
+		await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ terminalFontSize: 16 }),
+		});
+		expect(await v2Of()).toBe(125);
+		const row = db.select().from(userPreferences).all()[0];
+		expect(row?.narratorLineHeightScalePercent).toBe(150);
+		expect(row?.narratorLineHeightV2Percent).toBeNull();
+	});
+
+	it("stores a new-scale value as given, mirrored onto the old column for a downgrade", async () => {
+		seedPreferences([], { narratorLineHeightScalePercent: 150 });
+		const { body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ narratorLineHeightV2Percent: 92 }),
+		});
+		expect(body).toMatchObject({
+			narratorLineHeightV2Percent: 92,
+			narratorLineHeightScalePercent: 110,
+		});
+		// Once saved on the new scale, the old column no longer decides anything.
+		expect(await v2Of()).toBe(92);
+	});
+
+	it("converts an old-scale value from a client built before the rescale", async () => {
+		seedPreferences([], { narratorLineHeightV2Percent: 100 });
+		const { body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ narratorLineHeightScalePercent: 130 }),
+		});
+		expect(body).toMatchObject({
+			narratorLineHeightScalePercent: 130,
+			narratorLineHeightV2Percent: 108,
+		});
+	});
+
+	it("validates each field on its own scale", async () => {
+		seedPreferences([]);
+		for (const payload of [
+			{ narratorLineHeightV2Percent: 59 },
+			{ narratorLineHeightV2Percent: 186 },
+			{ narratorLineHeightScalePercent: 74 },
+			{ narratorLineHeightScalePercent: 221 },
+		]) {
+			const response = await app.request("/", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(payload),
+			});
+			expect(response.status).not.toBe(200);
+		}
+		// 60 / 185 and 75 / 220 are the inclusive bounds.
+		for (const payload of [
+			{ narratorLineHeightV2Percent: 60 },
+			{ narratorLineHeightV2Percent: 185 },
+			{ narratorLineHeightScalePercent: 75 },
+			{ narratorLineHeightScalePercent: 220 },
+		]) {
+			const response = await app.request("/", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(payload),
+			});
+			expect(response.status).toBe(200);
+		}
 	});
 });
 

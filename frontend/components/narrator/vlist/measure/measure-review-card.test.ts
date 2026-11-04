@@ -130,9 +130,15 @@ describe("measureReviewCard — header chrome is height-neutral", () => {
 
 	it("the header row is a constant, so the action row is always reserved", async () => {
 		const { reviewCardHeaderHeight, REVIEW_HEADER_BUTTON } = await import("./measure-review-card");
-		// The button is the tallest element in the row, which is what makes the row constant
-		// whether or not it is currently drawn.
-		expect(reviewCardHeaderHeight()).toBe(REVIEW_HEADER_BUTTON);
+		const { typographyMetrics } = await import("../pretext-fonts");
+		// The row is the tallest of its cells INCLUDING the button, which is what makes it
+		// constant whether or not the button is currently drawn. At the default setting the
+		// xs label line (20, 120% of the Mantine 17) is the tallest; at tighter settings the
+		// 18px button is.
+		expect(reviewCardHeaderHeight()).toBe(
+			Math.max(REVIEW_HEADER_BUTTON, typographyMetrics().line.xs),
+		);
+		expect(reviewCardHeaderHeight()).toBeGreaterThanOrEqual(REVIEW_HEADER_BUTTON);
 	});
 
 	it("height does not depend on LOD", async () => {

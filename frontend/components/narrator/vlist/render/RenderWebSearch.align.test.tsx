@@ -105,7 +105,8 @@ describe("RenderWebSearch optical alignment", () => {
 			expect(container.querySelectorAll(".mantine-Divider-root")).toHaveLength(isLast ? 0 : 1);
 			expect(container.querySelectorAll(".mantine-Loader-root")).toHaveLength(1);
 			const lane = card.firstElementChild as HTMLElement;
-			expect(lane.style.height).toBe("18px");
+			// max(icon 18, xs line 20): the default line is 120% of the Mantine 17.
+			expect(lane.style.height).toBe("20px");
 		});
 	}
 
@@ -116,12 +117,14 @@ describe("RenderWebSearch optical alignment", () => {
 		expect(card.getAttribute("data-with-border")).not.toBeNull();
 		expect(container.querySelectorAll(".mantine-Divider-root")).toHaveLength(0);
 	});
-	it("keeps the reserved 17px line box and centres the 12px glyphs inside it", () => {
+	it("keeps the reserved 20px line box and centres the 12px glyphs inside it", () => {
 		const { container } = renderCard();
 		const line = container.querySelector("[data-vlist-ws-line]") as HTMLElement | null;
 		expect(line).not.toBeNull();
 		if (!line) return;
-		expect(line.style.height).toBe(`${MEASURE_WEB_SEARCH_CONSTANTS.WEB_SEARCH_TEXT_LINE_HEIGHT}px`);
+		// The live xs line: 120% of the bare-Mantine constant (17) at the default setting.
+		expect(MEASURE_WEB_SEARCH_CONSTANTS.WEB_SEARCH_TEXT_LINE_HEIGHT).toBe(17);
+		expect(line.style.height).toBe("20px");
 		// linkedom serializes the numeric `0` as "0"; browsers use "0px". Either
 		// form still kills the inherited body strut.
 		expect(["0", "0px"]).toContain(line.style.fontSize);
