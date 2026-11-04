@@ -16,7 +16,9 @@ beforeAll(() => {
 
 const {
 	bodySize,
+	checkIconPx,
 	clearMeasureCache,
+	frameWidth,
 	hasMeasured,
 	MAP_FONT_FAMILY,
 	mapType,
@@ -58,6 +60,21 @@ describe("mind-map node typography", () => {
 		expect(bodySize("```\na\nb\n```").h).toBe(2 * t.codeBlockLineH + 8);
 		// A node is never shorter than one body line plus its frame.
 		expect(nodeSize({ w: 10, h: 0 }, false).h).toBe(NODE.padY * 2 + t.lineH + NODE.border * 2);
+	});
+
+	it("measures a task's checkbox column as CSS draws it: the icon follows the body size", () => {
+		// `--nf-outline-icon` (outline-icons.css): body + 2, between 12 and 24 (16 by default).
+		expect(checkIconPx()).toBe(16);
+		expect(frameWidth(false)).toBe(NODE.gutter);
+		expect(frameWidth(true)).toBe(NODE.gutter + 16 + NODE.checkGap);
+		const widthOf = (task: boolean) => nodeSize({ w: 100, h: 0 }, task).w;
+		expect(widthOf(true) - widthOf(false)).toBe(16 + NODE.checkGap);
+		setTypography(LARGER);
+		expect(checkIconPx()).toBeCloseTo(mapType().px + 2, 10);
+		setTypography({ fontScalePercent: 180 });
+		expect(checkIconPx()).toBe(24);
+		setTypography({ fontScalePercent: 70 });
+		expect(checkIconPx()).toBe(12);
 	});
 
 	it("follows a change of setting at measure time", () => {

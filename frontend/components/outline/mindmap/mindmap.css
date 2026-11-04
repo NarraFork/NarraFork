@@ -144,8 +144,9 @@
 	height: var(--nf-type-h3-line);
 }
 
+/* `frameWidth(true)` (measure.ts): the arrow and the bullet, then the checkbox's column. */
 .nf-outline-editor .mm-node[data-task]:not([data-task=""]) > .ob-gutter {
-	width: 46px;
+	width: calc(28px + var(--nf-outline-icon) + 4px);
 }
 
 .nf-outline-editor .mm-node .ob-arrow,
@@ -156,6 +157,12 @@
 .nf-outline-editor .mm-node .mm-body {
 	flex: none;
 	min-width: 0;
+}
+
+/* Done or cancelled: struck through and muted, as in the outline (paint only, no size). */
+.nf-outline-editor .mm-node:is([data-task="x"], [data-task="-"]) > .mm-body {
+	color: var(--ob-muted);
+	text-decoration: line-through;
 }
 
 .nf-outline-editor .mm-node .mm-body p,
@@ -229,8 +236,10 @@
 	background: color-mix(in srgb, var(--ob-accent) 8%, var(--mantine-color-body));
 }
 
+/* The focused block: its dot in a ring. */
 .nf-outline-editor .mm-node.is-root > .ob-gutter .ob-bullet::before {
-	content: "◎";
+	outline: 1.5px solid currentColor;
+	outline-offset: 1.5px;
 }
 
 .nf-outline-editor .mm-node.sel {

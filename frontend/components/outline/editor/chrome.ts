@@ -1,15 +1,18 @@
 /**
  * A block's frame (folding arrow, bullet, checkbox, presence marker) and static body rendering,
- * as native DOM (no React root per block, design §6.7). Shared with the mind map later (§6.10):
- * the arrow and bullet glyphs come from `has-kids` / `collapsed` classes on the container.
+ * as native DOM (no React root per block, design §6.7), shared with the mind map (§6.10). The
+ * arrow and the checkbox are the read-only tree's Tabler icons as inline SVG
+ * (`../outline-icons.ts`); the bullet is a dot drawn by CSS from the `has-kids` / `collapsed`
+ * classes on the container.
  */
 import { titleOf } from "@shared/outline";
+import type { OutlineTaskStatus } from "@shared/outline-api";
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
 import { DOMSerializer } from "prosemirror-model";
+import { FOLD_ICONS, QUESTION_ICON, setIcon, taskIconOf } from "../outline-icons";
 import { parseToPM } from "./convert";
 import { schema } from "./schema";
 
-export const TASK_GLYPH: Record<LiveTaskChar, string> = { " ": "☐", "/": "◐", x: "☑", "-": "⊘" };
 /** Clicking a checkbox: todo → doing → done → todo; cancelled → todo. */
 export const TASK_NEXT: Record<LiveTaskChar, LiveTaskChar> = {
 	" ": "/",
@@ -37,6 +40,13 @@ export const chromeText = {
 	pending: "Waiting for confirmation",
 	/** The mark of a question put to a person (`Ask`), where a task has its checkbox. */
 	question: "A question for a person: answered in the inbox. Deleting it withdraws it.",
+	/** A task's status, said by its icon in the "in progress" list. */
+	status: {
+		todo: "To do",
+		doing: "In progress",
+		done: "Done",
+		cancelled: "Cancelled",
+	} satisfies Record<OutlineTaskStatus, string>,
 };
 
 /** What a block shows besides its content: its lock, changes to it waiting for confirmation. */
@@ -63,9 +73,6 @@ export interface ChromeState {
 	question?: boolean;
 }
 
-/** The glyph of a question's mark. */
-export const QUESTION_GLYPH = "?";
-
 export function createGutter(): Gutter {
 	const el = document.createElement("div");
 	el.className = "ob-gutter";
@@ -90,12 +97,13 @@ export function createGutter(): Gutter {
 export function applyChrome(container: HTMLElement, g: Gutter, s: ChromeState): void {
 	container.classList.toggle("has-kids", s.hasKids);
 	container.classList.toggle("collapsed", s.hasKids && s.collapsed);
+	setIcon(g.arrow, s.hasKids ? FOLD_ICONS[s.collapsed ? "collapsed" : "expanded"] : null);
 	container.dataset.task = s.task ?? "";
 	const question = !s.task && s.question === true;
 	container.dataset.question = question ? "1" : "";
 	g.check.classList.toggle("is-question", question);
 	if (question) {
-		g.check.textContent = QUESTION_GLYPH;
+		setIcon(g.check, QUESTION_ICON);
 		g.check.style.display = "";
 		g.check.setAttribute("role", "img");
 		g.check.removeAttribute("aria-checked");
@@ -108,7 +116,7 @@ export function applyChrome(container: HTMLElement, g: Gutter, s: ChromeState): 
 	g.check.title = chromeText.task;
 	g.check.removeAttribute("aria-label");
 	delete g.check.dataset.testid;
-	g.check.textContent = s.task ? TASK_GLYPH[s.task] : "";
+	setIcon(g.check, s.task ? taskIconOf(s.task) : null);
 	g.check.style.display = s.task ? "" : "none";
 	g.check.setAttribute(
 		"aria-checked",

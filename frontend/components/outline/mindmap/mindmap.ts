@@ -60,6 +60,7 @@ import type { OutlineViewState } from "../view-state";
 import {
 	bodySize,
 	cachedBodySize,
+	frameWidth,
 	MAP_FONT_FAMILY,
 	MAP_MONO_FAMILY,
 	mapType,
@@ -560,7 +561,7 @@ export class MindMapView {
 	/** Where a body's top-left corner is inside its node (world units). */
 	bodyOffset(id: string): Pos {
 		const inf = this.info.get(id);
-		const gutter = inf?.more ? 0 : NODE.gutter + (inf?.task ? NODE.check : 0);
+		const gutter = inf?.more ? 0 : frameWidth(!!inf?.task);
 		return { x: NODE.border + NODE.padX + gutter, y: NODE.border + NODE.padY };
 	}
 

@@ -518,11 +518,24 @@ test("a question put to a person: marked, never ticked, deleting it withdraws it
 	const mark = (e: Editor, id: string) =>
 		e.call((f, x) => {
 			const el = f.dom(x as never)?.querySelector("[data-testid=outline-question-mark]");
-			return el ? { text: el.textContent, title: el.getAttribute("title") } : null;
+			return el
+				? {
+						role: el.getAttribute("role"),
+						label: el.getAttribute("aria-label"),
+						title: el.getAttribute("title"),
+						// The tree's icon as inline SVG, not a text glyph.
+						icon: el.querySelector("svg")?.getAttribute("class") ?? null,
+						text: el.textContent,
+					}
+				: null;
 		}, id);
+	const said = "A question for a person: answered in the inbox. Deleting it withdraws it.";
 	expect(await mark(a, question)).toEqual({
-		text: "?",
-		title: "A question for a person: answered in the inbox. Deleting it withdraws it.",
+		role: "img",
+		label: said,
+		title: said,
+		icon: "tabler-icon tabler-icon-help-circle",
+		text: "",
 	});
 	expect(await mark(a, fact)).toBeNull();
 	// The task shortcut does nothing on a question.
@@ -542,6 +555,58 @@ test("a question put to a person: marked, never ticked, deleting it withdraws it
 	expect(await mark(a, question)).not.toBeNull();
 	await flushed(pageId);
 	expect((await outlineStore.getQuestions([question]))[0]?.state).toBe("open");
+	await converged(pageId, a, b);
+	noErrors(a, b);
+}, 30_000);
+
+test("the frame's icons take real clicks: the checkbox cycles the task, the arrow folds, the caret stays out", async () => {
+	const { pageId, ids } = await seedPage(h, "Frame", ["[ ] 任务", "父块", "  子块"]);
+	const [task, parent] = ids as [string, string];
+	const [a, b] = await both(pageId);
+	/** Where an icon of a block's frame is drawn (its middle), and which icon it is. */
+	const icon = (e: Editor, id: string, part: "ob-check" | "ob-arrow") =>
+		e.call(
+			(f, x, p) => {
+				const el = f.dom(x as never)?.querySelector<HTMLElement>(`:scope > .ob-gutter > .${p}`);
+				const r = el?.querySelector("svg")?.getBoundingClientRect();
+				return el && r
+					? {
+							x: r.x + r.width / 2,
+							y: r.y + r.height / 2,
+							icon: el.dataset.icon ?? null,
+							checked: el.getAttribute("aria-checked"),
+							text: el.textContent,
+						}
+					: null;
+			},
+			id,
+			part,
+		);
+	const click = async (id: string, part: "ob-check" | "ob-arrow") => {
+		const at = await icon(a, id, part);
+		if (!at) throw new Error(`no ${part} icon on ${id}`);
+		await a.page.mouse.click(at.x, at.y);
+		await settle(a, b);
+	};
+	expect(await icon(a, task, "ob-check")).toMatchObject({
+		icon: "square",
+		checked: "false",
+		text: "",
+	});
+	await caret(a, task, 1);
+	await click(task, "ob-check");
+	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-half", checked: "mixed" });
+	await click(task, "ob-check");
+	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-check", checked: "true" });
+	expect(serverOutline(pageId)).toBe("- [x] 任务\n- 父块\n  - 子块");
+	// The caret stayed in the text (the frame is not editable and takes no caret).
+	expect(await head(a)).toMatchObject({ blockId: task, offset: 1 });
+	expect(await icon(a, parent, "ob-arrow")).toMatchObject({ icon: "chevron-down" });
+	await click(parent, "ob-arrow");
+	expect(await icon(a, parent, "ob-arrow")).toMatchObject({ icon: "chevron-right" });
+	expect(await a.call((f, x) => f.dom(x as never)?.classList.contains("collapsed"), parent)).toBe(
+		true,
+	);
 	await converged(pageId, a, b);
 	noErrors(a, b);
 }, 30_000);

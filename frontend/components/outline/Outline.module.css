@@ -148,11 +148,23 @@
 	color: var(--mantine-color-indigo-5);
 }
 
+/* The outline's icons (`outline-icons.ts`), sized as the live editor's frame draws them. */
+.toggle svg {
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
+}
+
 .bulletDot {
-	width: 6px;
-	height: 6px;
+	width: var(--nf-outline-dot);
+	height: var(--nf-outline-dot);
 	border-radius: 50%;
 	background: currentColor;
+}
+
+/* Folded with children: the dot keeps a halo, as in the live editor. */
+.bulletDot[data-collapsed="true"] {
+	box-shadow: 0 0 0 min(3px, calc(var(--nf-outline-dot) / 2))
+		color-mix(in srgb, currentColor 30%, transparent);
 }
 
 .taskIcon {
@@ -160,6 +172,11 @@
 	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
+}
+
+.taskIcon svg {
+	width: var(--nf-outline-icon);
+	height: var(--nf-outline-icon);
 }
 
 /* The page title's task icon sits on the title's first line (the conversation's h3). */

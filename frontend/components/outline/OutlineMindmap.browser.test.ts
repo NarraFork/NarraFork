@@ -1265,6 +1265,57 @@ for (const host of HOSTS) {
 	}, 90_000);
 }
 
+test("page: a node's frame icons take real clicks: the checkbox cycles, the arrow folds, the bullet focuses", async () => {
+	const { pageId, ids } = await seedPage(h, "Map frame", ["[ ] 任务", "父块", "  子块"]);
+	const [task, parent] = ids as [string, string];
+	const a = await openHost(h, "page", pageId);
+	await a.call((f) => f.setView("map"));
+	await settled(a);
+	await a.call((f) => f.mapFit());
+	await a.call((f) => f.mapFlush());
+	/** A part of a node's frame: where it is drawn (its icon's middle) and which icon it shows. */
+	const part = (id: string, name: "ob-check" | "ob-arrow" | "ob-bullet") =>
+		a.page.evaluate(
+			(x, p) => {
+				const el = document.querySelector<HTMLElement>(
+					`.mm-node[data-id="${x}"] > .ob-gutter > .${p}`,
+				);
+				const r = (el?.querySelector("svg") ?? el)?.getBoundingClientRect();
+				return el && r
+					? {
+							x: r.x + r.width / 2,
+							y: r.y + r.height / 2,
+							icon: el.dataset.icon ?? null,
+							checked: el.getAttribute("aria-checked"),
+						}
+					: null;
+			},
+			id,
+			name,
+		);
+	const click = async (id: string, name: "ob-check" | "ob-arrow" | "ob-bullet") => {
+		const at = await part(id, name);
+		if (!at) throw new Error(`no ${name} on ${id}`);
+		await a.page.mouse.click(at.x, at.y);
+		await settle(a);
+		await a.call((f) => f.mapFlush());
+	};
+	expect(await part(task, "ob-check")).toMatchObject({ icon: "square", checked: "false" });
+	await click(task, "ob-check");
+	expect(await part(task, "ob-check")).toMatchObject({ icon: "square-half", checked: "mixed" });
+	await click(task, "ob-check");
+	expect(await part(task, "ob-check")).toMatchObject({ icon: "square-check", checked: "true" });
+	expect(serverOutline(pageId)).toBe("- [x] 任务\n- 父块\n  - 子块");
+	expect(await part(parent, "ob-arrow")).toMatchObject({ icon: "chevron-down" });
+	await click(parent, "ob-arrow");
+	expect((await state(a)).collapsed).toContain(parent);
+	expect(await part(parent, "ob-arrow")).toMatchObject({ icon: "chevron-right" });
+	await click(parent, "ob-bullet");
+	await settled(a);
+	expect((await state(a)).focus).toBe(parent);
+	expect(a.errors).toEqual([]);
+}, 60_000);
+
 test("page: read-only first — a block typed in is gone before the snapshot: the text is kept and added back as a new block", async () => {
 	const p1 = await seed("RO deleted start");
 	const p2 = await seedWords("Rk");
