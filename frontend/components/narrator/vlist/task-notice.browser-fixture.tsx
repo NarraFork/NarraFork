@@ -197,6 +197,10 @@ function Cards({ options }: { options: FixtureOptions }) {
 				const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, options.width, 5, spec.opts);
 				const extra = resolveRenderExtra(spec) as Record<string, unknown>;
 				extra.onToggle = () => {};
+				// The interrupt guard's close button, as the shell wires it.
+				if ((spec.data as { originLabel?: string }).originLabel === "interrupt_task_guard") {
+					extra.injectionGuardActions = { onDismiss: () => {}, dismissLabel: "删除此提醒" };
+				}
 				return (
 					<div
 						key={spec.key}
@@ -245,11 +249,34 @@ export interface CardReport {
 	scrollWidth: number;
 	width: number;
 	text: string;
+	/** How far any child of a line reaches past that line's box (px). */
+	lineOverflow: number;
+	/** Width of the task's title on the folded line; -1 when the line names no task. */
+	foldedTaskWidth: number;
+	/** The interrupt guard's close button, in its heading. */
+	closeButtons: number;
 }
 
 export function report(): CardReport[] {
 	return Array.from(document.querySelectorAll<HTMLElement>("[data-card]")).map((card) => {
 		const paper = card.firstElementChild as HTMLElement | null;
+		// Every child of a line (the heading, a task row) inside that line's box: the card's own
+		// height holds by construction, so this is what catches a chip or a button taller than
+		// the line the measure pass reserved.
+		let overflow = 0;
+		for (const line of card.querySelectorAll<HTMLElement>(
+			"[data-task-notice-head], [data-task-notice-row]",
+		)) {
+			const box = line.getBoundingClientRect();
+			for (const child of line.querySelectorAll<HTMLElement>("*")) {
+				const r = child.getBoundingClientRect();
+				if (r.width === 0 || r.height === 0) continue;
+				overflow = Math.max(overflow, box.top - r.top, r.bottom - box.bottom);
+			}
+		}
+		const task = card.querySelector<HTMLElement>(
+			"[data-task-notice-summary] [data-task-notice-task]",
+		);
 		return {
 			kind: card.dataset.kind ?? "",
 			measured: Number(card.dataset.measured),
@@ -258,6 +285,10 @@ export function report(): CardReport[] {
 			scrollWidth: paper ? paper.scrollWidth : 0,
 			width: paper ? paper.clientWidth : 0,
 			text: card.textContent ?? "",
+			lineOverflow: Math.round(overflow * 10) / 10,
+			foldedTaskWidth: task ? Math.round(task.getBoundingClientRect().width) : -1,
+			closeButtons: card.querySelectorAll("[data-task-notice-head] button[aria-label='删除此提醒']")
+				.length,
 		};
 	});
 }

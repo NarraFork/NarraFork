@@ -412,6 +412,8 @@ async function readTasksView(
 	let used = heading.length;
 	let shown = 0;
 	const room = OUTLINE_VIEW_LIMITS.tasksChars - getOutlineTasksViewMore(99, locale).length - 1;
+	// The entries whose lines the text holds: the reader's summary names these and no others.
+	const printed = new Set<OpenEntry>();
 	for (const { section, entries } of sections) {
 		if (entries.length === 0) continue;
 		const sectionLine = getOutlineTasksViewSection(section, locale);
@@ -420,19 +422,20 @@ async function readTasksView(
 		if (used + sectionLine.length + first.length + 2 > room) break;
 		lines.push(sectionLine);
 		used += sectionLine.length + 1;
-		for (const line of taskLines) {
+		for (const [index, line] of taskLines.entries()) {
 			if (used + line.length + 1 > room) break;
 			lines.push(line);
 			used += line.length + 1;
 			shown++;
+			printed.add(entries[index] as OpenEntry);
 		}
 	}
 	const hidden = read.entries.length - shown;
 	if (read.truncated) lines.push(getOutlineTasksViewMore(null, locale));
 	else if (hidden > 0) lines.push(getOutlineTasksViewMore(hidden, locale));
-	// The reader's summary of the same read: the tasks listed per section, titled, and how many
-	// are open. Bounded by the view's own limits; prerequisites are left out (D9: their space may
-	// not be readable by every reader of the session).
+	// The reader's summary of the same read: the tasks the text lists, per section and titled (never
+	// one the budget left out of the text), and how many are open of each kind. Prerequisites are
+	// left out (D9: their space may not be readable by every reader of the session).
 	const viewTask = (entry: OpenEntry): OutlineTasksViewTask => {
 		const named = task(entry);
 		return {
@@ -443,10 +446,12 @@ async function readTasksView(
 	};
 	const counted = (status: OpenEntry["status"]) =>
 		read.entries.filter((entry) => entry.status === status).length;
+	const inText = (entries: readonly OpenEntry[]) =>
+		entries.filter((entry) => printed.has(entry)).map(viewTask);
 	const display: OutlineTasksViewDisplay = {
-		doing: doing.map(viewTask),
-		waiting: waiting.map(viewTask),
-		next: next ? [viewTask(next)] : [],
+		doing: inText(doing),
+		waiting: inText(waiting),
+		next: inText(next ? [next] : []),
 		counts: { doing: counted("doing"), waiting: counted("blocked"), todo: counted("todo") },
 		...(read.truncated ? { more: true as const } : {}),
 	};

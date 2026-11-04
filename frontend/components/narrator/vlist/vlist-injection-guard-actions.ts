@@ -37,7 +37,7 @@ export function isInterruptGuardItem(item: VListItem): boolean {
 	if (item.spec.kind !== "system-text") return false;
 	const data = item.spec.data as { kind?: unknown; originLabel?: unknown } | null;
 	return (
-		(data?.kind === "origin_notice" || data?.kind === "task_notice") &&
+		(data?.kind === "origin_notice" || data?.kind === "tasks_notice") &&
 		data?.originLabel === INTERRUPT_TASK_GUARD_SOURCE
 	);
 }

@@ -170,7 +170,7 @@ interface RenderSystemTextProps {
 	/** origin_notice (interrupt_task_guard only): live dismiss handler. */
 	injectionGuardActions?: InjectionGuardActions;
 	headerAction?: ReactNode;
-	/** task_notice: fold / unfold the card (the generic per-key expansion). */
+	/** tasks_notice: fold / unfold the card (the generic per-key expansion). */
 	onToggle?: () => void;
 }
 
@@ -198,7 +198,7 @@ export function RenderSystemText({
 }: RenderSystemTextProps) {
 	// A task notice has no wrapping body: its lines are fixed, so it is drawn from its data and
 	// the measured line count alone.
-	if (kind === "task_notice") {
+	if (kind === "tasks_notice") {
 		return (
 			<TaskNoticeCard
 				measured={measured as MeasuredTaskNotice}
@@ -762,7 +762,7 @@ function SpecCarryoverCard({
 
 export const RENDER_SYSTEM_TEXT_CHROME = { CARD_PADDING, GROUP_GAP } as const;
 
-// ── task_notice: Stack(heading line + task lines when unfolded) ──────────────
+// ── tasks_notice: Stack(heading line + task lines when unfolded) ──────────────
 // Geometry mirrors measureTaskNotice: Paper p="xs", one heading line of
 // `taskNoticeLineHeight()`, then — unfolded — ORIGIN_HEADING_GAP and one line per
 // task with TASK_NOTICE_ROW_GAP between them. Every line is single and truncated
@@ -796,6 +796,37 @@ function fromControl(event: MouseEvent<HTMLElement>): boolean {
 	return !!target?.closest?.("a,button");
 }
 
+/**
+ * Below this inner width (a phone) the folded line keeps only what names the task: the time label
+ * and the tail ("等 2 项", "还没勾成完成") are left out; the chevron and the chip say as much.
+ */
+const TASK_NOTICE_NARROW_WIDTH = 420;
+
+/**
+ * Width priorities, narrowest screens first (every line is one line, so none of this moves a
+ * height): a task's title keeps at least about six characters (`taskTitleMinWidth`); on the folded
+ * line the heading gives way before it (it shrinks eight times as fast, and never takes more than
+ * `HEADING_MAX_WIDTH`), and so do the lead and the tail; on a row, the note takes only the width
+ * the title leaves.
+ */
+const HEADING_MAX_WIDTH = "45%";
+
+/**
+ * The title's minimum width: six characters' worth, never more than half the line, and never more
+ * than its own text (a short title must not leave a gap after it). The text's width is estimated
+ * from its characters (CJK as 1em, a space as 0.3em, others as 0.6em): it only bounds a minimum,
+ * nothing measured.
+ */
+function taskTitleMinWidth(title: string): string {
+	let em = 0;
+	for (const char of title) {
+		const code = char.codePointAt(0) ?? 0;
+		em += code >= 0x2e80 ? 1 : char === " " ? 0.3 : 0.6;
+		if (em >= 6) break;
+	}
+	return `min(${Math.min(6, em).toFixed(1)}em, 50%)`;
+}
+
 function TaskNoticeCard({
 	measured,
 	data,
@@ -812,7 +843,9 @@ function TaskNoticeCard({
 	const rows = expanded ? (data.rows ?? []).slice(0, measured.rowCount) : [];
 	const toggle = data.expandable === true && onToggle ? onToggle : undefined;
 	const Icon = TASK_NOTICE_ICON[data.variant] ?? IconListCheck;
-	const timeLabel = typeof data.timeLabel === "string" ? data.timeLabel : "";
+	// Height-neutral: the label and the tail sit in the one heading line either way.
+	const narrow = measured.contentWidth < TASK_NOTICE_NARROW_WIDTH;
+	const timeLabel = typeof data.timeLabel === "string" && !narrow ? data.timeLabel : "";
 	const Chevron = expanded ? IconChevronDown : IconChevronRight;
 	return (
 		<Paper
@@ -860,8 +893,9 @@ function TaskNoticeCard({
 						...NOWRAP_ELLIPSIS,
 						fontWeight: 600,
 						color: "var(--mantine-color-dimmed)",
-						flex: "0 1 auto",
-						maxWidth: "60%",
+						// Folded, the heading yields its width to the task; unfolded, it has the line.
+						flex: expanded ? "0 1 auto" : "0 8 auto",
+						maxWidth: expanded ? undefined : HEADING_MAX_WIDTH,
 					}}
 				>
 					{data.title}
@@ -877,10 +911,11 @@ function TaskNoticeCard({
 						overflow: "hidden",
 					}}
 				>
-					{expanded ? null : <TaskNoticeSummaryLine data={data} />}
+					{expanded ? null : <TaskNoticeSummaryLine data={data} narrow={narrow} />}
 				</div>
 				{timeLabel ? (
 					<span
+						data-task-notice-time=""
 						style={{
 							...noticeText(),
 							whiteSpace: "nowrap",
@@ -945,16 +980,34 @@ function TaskNoticeCard({
 	);
 }
 
-/** The folded line after the title: a lead, the first task (chips, title, note), a tail. */
-function TaskNoticeSummaryLine({ data }: { data: TaskNoticeData }) {
+/**
+ * The folded line after the heading: a lead, the first task (its status as it is now, and its
+ * title), a tail. Where it changed from and what changed are the unfolded row's; the heading
+ * already names who changed it.
+ */
+function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow: boolean }) {
 	const { lead, row, tail } = data.summary ?? {};
-	const dim = { ...noticeText(), color: "var(--mantine-color-dimmed)" };
+	const dim = {
+		...noticeText(),
+		...NOWRAP_ELLIPSIS,
+		flex: "0 4 auto",
+		color: "var(--mantine-color-dimmed)",
+	};
 	return (
 		<>
-			{lead ? <span style={{ ...dim, whiteSpace: "nowrap", flexShrink: 0 }}>{lead}</span> : null}
-			{row ? <TaskNoticeInline row={row} /> : null}
-			{tail ? (
-				<span style={{ ...dim, ...NOWRAP_ELLIPSIS, flex: "0 1 auto" }} data-task-notice-tail="">
+			{lead ? (
+				<span style={dim} data-task-notice-lead="">
+					{lead}
+				</span>
+			) : null}
+			{row ? (
+				<>
+					{row.status ? <StatusChip chip={row.status} /> : null}
+					<TaskNoticeTitle row={row} />
+				</>
+			) : null}
+			{tail && !narrow ? (
+				<span style={dim} data-task-notice-tail="">
 					{tail}
 				</span>
 			) : null}
@@ -992,15 +1045,6 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 				overflow: "hidden",
 			}}
 		>
-			<TaskNoticeInline row={row} marks />
-		</div>
-	);
-}
-
-/** One task inline: its status chip(s), its title (an outline link in a host), marks, note. */
-function TaskNoticeInline({ row, marks = false }: { row: TaskNoticeRow; marks?: boolean }) {
-	return (
-		<>
 			{row.statusFrom && row.status ? (
 				<>
 					<StatusChip chip={row.statusFrom} />
@@ -1011,35 +1055,35 @@ function TaskNoticeInline({ row, marks = false }: { row: TaskNoticeRow; marks?: 
 			) : null}
 			{row.status ? <StatusChip chip={row.status} /> : null}
 			<TaskNoticeTitle row={row} />
-			{marks
-				? (row.marks ?? []).map((mark) => (
-						<Badge
-							key={mark}
-							size="xs"
-							// Outlined: a light gray chip has the card's own background and vanishes.
-							variant="outline"
-							color="gray"
-							tt="none"
-							style={{ flexShrink: 0 }}
-						>
-							{mark}
-						</Badge>
-					))
-				: null}
+			{(row.marks ?? []).map((mark) => (
+				<Badge
+					key={mark}
+					size="xs"
+					// Outlined: a light gray chip has the card's own background and vanishes.
+					variant="outline"
+					color="gray"
+					tt="none"
+					style={{ flexShrink: 0 }}
+				>
+					{mark}
+				</Badge>
+			))}
 			{row.note ? (
 				<span
 					data-task-notice-note=""
+					title={row.note}
 					style={{
 						...noticeText(),
 						...NOWRAP_ELLIPSIS,
-						flex: "0 1 auto",
+						// The title keeps its width before the note does: the note takes what is left.
+						flex: "1 1 0",
 						color: "var(--mantine-color-dimmed)",
 					}}
 				>
 					{row.note}
 				</span>
 			) : null}
-		</>
+		</div>
 	);
 }
 
@@ -1061,20 +1105,26 @@ function StatusChip({ chip }: { chip: TaskNoticeChip }) {
 
 /**
  * The task's title: an outline link inside a host that opens outline panels (beside the session,
- * Ctrl/Cmd for a new panel), plain text anywhere else. Truncated to its line; the full title and
- * its address are the tooltip.
+ * Ctrl/Cmd for a new panel), plain text anywhere else. Truncated to its line, never below
+ * `taskTitleMinWidth`; the full title and its address are the tooltip.
  */
 function TaskNoticeTitle({ row }: { row: TaskNoticeRow }) {
 	const link = useOutlineLinkProps(row.href);
 	const tooltip =
 		row.address && row.address !== row.title ? `${row.title}\n${row.address}` : row.title;
-	const style = { ...noticeText(), ...NOWRAP_ELLIPSIS, flex: "0 1 auto" } as const;
+	const style = {
+		...noticeText(),
+		...NOWRAP_ELLIPSIS,
+		flex: "0 1 auto",
+		minWidth: taskTitleMinWidth(row.title),
+	} as const;
 	if (link) {
 		return (
 			<a
 				href={link.href}
 				onClick={link.onClick}
 				data-outline-link=""
+				data-task-notice-task=""
 				title={tooltip}
 				style={{ ...style, color: "var(--mantine-color-teal-text)", textDecoration: "none" }}
 			>
@@ -1083,7 +1133,11 @@ function TaskNoticeTitle({ row }: { row: TaskNoticeRow }) {
 		);
 	}
 	return (
-		<span title={tooltip} style={{ ...style, color: "var(--mantine-color-text)" }}>
+		<span
+			title={tooltip}
+			data-task-notice-task=""
+			style={{ ...style, color: "var(--mantine-color-text)" }}
+		>
 			{row.title}
 		</span>
 	);

@@ -5035,7 +5035,7 @@ export const PretextExactMessageList = memo(
 					// projection, the model got the text.
 					const taskNotice =
 						item.spec.kind === "system-text" &&
-						(item.spec.data as { kind?: unknown } | null)?.kind === "task_notice"
+						(item.spec.data as { kind?: unknown } | null)?.kind === "tasks_notice"
 							? (item.spec.data as { modelFacing?: unknown; title?: unknown })
 							: null;
 					const injectionData =

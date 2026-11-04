@@ -52,7 +52,6 @@ import { blockTitle } from "@shared/outline";
 import { OUTLINE_TASKS_CHANGED_EVENT } from "@shared/outline-task-board";
 import {
 	boundOutlineTaskNoticeItem,
-	type OutlineTaskNoticeChange,
 	type OutlineTaskNoticeItem,
 } from "@shared/outline-task-notice";
 import type { SideCarBody } from "@shared/sidecar-body";
@@ -497,22 +496,35 @@ async function noticeOf(
 	// the transcript shows titled links and status chips (the model's text above is unchanged).
 	const items = [...groups.values()].flatMap((group) =>
 		group.edits.flatMap((edit): OutlineTaskNoticeItem[] => {
-			// The prompt's change type is this one, worded for the model.
-			const changes: OutlineTaskNoticeChange[] = edit.changes;
 			const item = boundOutlineTaskNoticeItem({
 				address: edit.address,
 				title: edit.title,
 				by: group.person,
 				...(edit.humanCreated ? { humanCreated: true } : {}),
 				...(edit.locked ? { locked: true } : {}),
-				changes,
+				changes: edit.changes,
 			});
 			return item ? [item] : [];
 		}),
 	);
+	// Tasks the reader's copy leaves out (the model's `more` counts changes): those only in entries
+	// past the listed ones, plus every change the waiting cap let go (its task is not known).
+	const listed = new Set(shown.map((entry) => entry.taskId));
+	const unlisted = new Set(
+		entries
+			.slice(shown.length)
+			.map((entry) => entry.taskId)
+			.filter((id) => !listed.has(id)),
+	);
+	const moreTasks = unlisted.size + dropped;
 	return {
 		content,
-		body: { kind: "outlineTasks", variant: "edited", items, ...(more > 0 ? { more } : {}) },
+		body: {
+			kind: "outlineTasks",
+			variant: "edited",
+			items,
+			...(moreTasks > 0 ? { more: moreTasks } : {}),
+		},
 	};
 }
 

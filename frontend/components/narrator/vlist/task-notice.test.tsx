@@ -181,7 +181,7 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 	it("the turn-end reminder: the task as a titled link with its status; nothing to unfold", () => {
 		const spec = specOf(turnEnd());
 		const data = spec.data as TaskNoticeData & { modelFacing?: string };
-		expect(data.kind).toBe("task_notice");
+		expect(data.kind).toBe("tasks_notice");
 		expect(data.title).toBe("回合末任务提醒");
 		expect(data.summary.row).toMatchObject({
 			title: "排查中断后无重试按钮（只读，不改代码）",
@@ -267,6 +267,45 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		expect(spec.rows).toEqual([
 			{ title: "补测试", status: { label: "待办", color: "gray" }, marks: ["受保护"] },
 		]);
+		// More open than the guard lists: counted, as a lower bound, and the rest named as such.
+		const many = specOf(
+			injection("m-guard-many", "interrupt_task_guard", "…", {
+				kind: "tasks",
+				variant: "current",
+				taskBackend: "outline",
+				taskCount: 12,
+				tasks: [{ role: "doing", text: "修复重试按钮", ref: `${K}/mSsl3Ccf` }],
+			}),
+		).data as TaskNoticeData;
+		expect(many.summary.lead).toBe("至少 12 个未完成：");
+		expect(many.summary.tail).toBe("等 11 项");
+		expect(many.rows.at(-1)).toEqual({ title: "至少还有 11 项未列出", dim: true });
+	});
+
+	it("people's changes count tasks: two people changing one task is one task", () => {
+		const data = specOf(
+			injection("m-same", "outline_task_edit", "…", {
+				kind: "outlineTasks",
+				variant: "edited",
+				items: [
+					{
+						address: `${K}/mSsl3Ccf`,
+						title: "排查中断后无重试按钮",
+						by: "alice",
+						changes: [{ kind: "locked" }],
+					},
+					{
+						address: `${K}/mSsl3Ccf`,
+						title: "排查中断后无重试按钮",
+						by: "bob",
+						changes: [{ kind: "status", from: "doing", to: "done" }],
+					},
+				],
+			}),
+		).data as TaskNoticeData;
+		expect(data.title).toBe("alice、bob 改了 1 个任务");
+		expect(data.summary.tail).toBeUndefined();
+		expect(data.rows).toHaveLength(2);
 	});
 
 	it("an update of the current-tasks view names the task in progress and what else is open", () => {
@@ -284,6 +323,14 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 			["回归测试：中断后重试", "进行中", undefined],
 			["写 PR 描述", "待办", ["人建"]],
 		]);
+		// A read that stopped early: the rest is a lower bound.
+		const truncated = specOf(
+			contextUpdate("m-view-more", "Context updated: outline.tasks", {
+				"outline.tasks": { ...VIEW, more: true },
+			}),
+		).data as TaskNoticeData;
+		expect(truncated.rows.at(-1)).toEqual({ title: "至少还有 1 项未列出", dim: true });
+		expect(truncated.summary.tail).toBe("待办 1…");
 		// With the behavior boundary changed too, the heading says both.
 		const both = specOf(
 			contextUpdate("m-view-2", "Context updated: outline.behavior, outline.tasks", {
@@ -291,11 +338,11 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 			}),
 		).data as TaskNoticeData;
 		expect(both.title).toBe("上下文已更新：行为边界 / 当前任务");
-		// The view went away: nothing is open.
+		// The view went away (no task open, or the tasks left the outline): a line true of both.
 		const none = specOf(
 			contextUpdate("m-view-3", "Context updated: outline.tasks", { "outline.tasks": null }),
 		).data as TaskNoticeData;
-		expect(none.summary).toEqual({ lead: "没有未完成的任务" });
+		expect(none.summary).toEqual({ lead: "当前任务列表为空" });
 		expect(none.rows).toEqual([]);
 	});
 
@@ -334,7 +381,7 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		}>;
 		const msg = decoded.find((frame) => frame.message)?.message as never;
 		const data = specOf({ kind: "message", msg } as AdapterSegment).data as TaskNoticeData;
-		expect(data.kind).toBe("task_notice");
+		expect(data.kind).toBe("tasks_notice");
 		expect(data.summary.row?.title).toBe("回归测试：中断后重试");
 	});
 });
@@ -406,6 +453,13 @@ describe("measure and render agree; links open the outline only inside a host", 
 		expect(links.map((a) => a.getAttribute("href"))).toEqual([href("mSsl3Ccf")]);
 		expect(view.container.textContent).toContain("alice、bob 改了 3 个任务");
 		expect(view.container.textContent).not.toContain("\\");
+		// The folded line names the task's status now, not where it came from or who changed it
+		// (the heading says who): one chip, no note.
+		const summary = view.container.querySelector("[data-task-notice-summary]");
+		expect(summary?.querySelectorAll("[data-task-notice-status]")).toHaveLength(1);
+		expect(summary?.textContent).toContain("完成");
+		expect(summary?.textContent).not.toContain("进行中");
+		expect(summary?.querySelector("[data-task-notice-note]")).toBeNull();
 		view.unmount();
 	});
 
@@ -419,6 +473,12 @@ describe("measure and render agree; links open the outline only inside a host", 
 			measured.rowCount,
 		);
 		expect(view.container.querySelectorAll("a[data-outline-link]")).toHaveLength(2);
+		// A note may be cut by its line: its full text is the tooltip.
+		const notes = Array.from(view.container.querySelectorAll("[data-task-notice-note]"));
+		expect(notes.map((note) => note.getAttribute("title"))).toEqual(
+			notes.map((note) => note.textContent),
+		);
+		expect(notes.map((note) => note.textContent)).toContain("bob；交给 @agent:review-1");
 		const toggle = view.container.querySelector("[data-task-notice-toggle]") as HTMLButtonElement;
 		expect(toggle.getAttribute("aria-expanded")).toBe("true");
 		act(() => toggle.click());

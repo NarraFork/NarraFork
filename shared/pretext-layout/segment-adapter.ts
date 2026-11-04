@@ -100,11 +100,7 @@ import {
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
-import {
-	type TaskNoticeData,
-	taskNoticeFromBody,
-	taskNoticeFromContextUpdate,
-} from "./task-notice";
+import { contextUpdateKeys, taskNoticeFromBody, taskNoticeFromContextUpdate } from "./task-notice";
 import { TEXT_PREVIEW_MAX_CHARS } from "./text-preview";
 import {
 	type ClassifyToolDetailInput,
@@ -1181,9 +1177,6 @@ const OUTLINE_VIEW_LABEL_KEYS: Readonly<Record<string, string>> = {
 	"outline.behavior": "contextViewOutlineBehavior",
 };
 
-/** How the host's `context_update` notice row starts (`narrator-epochs.ts`). */
-const CONTEXT_UPDATE_NOTICE = "Context updated: ";
-
 /**
  * The line a host `context_update` row reads as when it updates an outline session's views:
  * "Context updated: Current tasks / Behavior boundary" in the reader's language, other keys as
@@ -1194,15 +1187,8 @@ function outlineViewUpdateLine(
 	blocks: readonly AdapterContentBlock[],
 	ctx: AdapterContext,
 ): string | null {
-	if (!blocks.some((block) => block.type === "context_update")) return null;
-	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
-	if (!notice.startsWith(CONTEXT_UPDATE_NOTICE)) return null;
-	const keys = notice
-		.slice(CONTEXT_UPDATE_NOTICE.length)
-		.split(",")
-		.map((key) => key.trim())
-		.filter(Boolean);
-	if (!keys.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
+	const keys = contextUpdateKeys(blocks);
+	if (!keys?.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
 	const names = keys.map((key) => {
 		const label = OUTLINE_VIEW_LABEL_KEYS[key];
 		return label ? sysLabel(ctx, label) : key;
@@ -3386,11 +3372,6 @@ function taskNoticeSpec(
 	};
 }
 
-/** Type guard for the task-notice data the adapter emits (`task-notice.ts`). */
-export function isTaskNoticeData(data: unknown): data is TaskNoticeData {
-	return (data as { kind?: unknown } | null)?.kind === "task_notice";
-}
-
 function adaptSystemBlock(
 	blockType: string,
 	block: AdapterContentBlock,
@@ -3536,7 +3517,7 @@ function adaptSystemBlock(
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
 		const data = adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt);
-		return data.kind === "task_notice"
+		return data.kind === "tasks_notice"
 			? taskNoticeSpec(`${keyBase}-sys`, data, ctx)
 			: { kind: "system-text", key: `${keyBase}-sys`, data };
 	}

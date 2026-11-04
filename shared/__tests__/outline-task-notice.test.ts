@@ -143,21 +143,50 @@ describe("the outlineTasks injection body", () => {
 		expect(renderSideCarBodyToText("outline_task_edit", body, {})).toBe("");
 	});
 
-	it("projects to a headline and one line per task for copy and the Markdown path", () => {
-		const plain = sideCarBodyToPlainText("outline_task_edit", body);
-		expect(plain).toBe(
-			[
-				"3 task change(s) by people",
-				"",
-				"• alice: Fix the retry button — in progress → done",
-				"2 more not listed",
-			].join("\n"),
+	it("projects to its heading and what it left out (the transcript draws the task rows)", () => {
+		expect(sideCarBodyToPlainText("outline_task_edit", body)).toBe(
+			["3 task(s) changed by people", "", "2 more not listed"].join("\n"),
 		);
-		expect(sideCarBodyToMarkdown("outline_task_edit", body)).toContain("###### ");
+		expect(
+			sideCarBodyToPlainText("outline_task_turn_end", {
+				kind: "outlineTasks",
+				variant: "turnEnd",
+				items: [],
+			}),
+		).toBe("Still in progress — tick it done when it is");
 	});
 });
 
 describe("the plain projection (rows without the structured body)", () => {
+	const CODE = [
+		"Approved. Run:",
+		"```ts",
+		// A template literal inside the fence: its backticks are code, not inline-code markers.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: the string is the code under test
+		"const s = `a${b}`;",
+		"  indented();",
+		"```",
+		"Then `bun test`.",
+	].join("\n");
+
+	it("keeps a fenced block exactly as written, and inline code outside the outline notices", () => {
+		expect(sideCarBodyToPlainText("gen_ui_kit", { kind: "prose", text: CODE })).toBe(CODE);
+		expect(
+			sideCarBodyToPlainText("buffered_user", {
+				kind: "messages",
+				items: [
+					{ fromId: "u1", fromTitle: "alice", text: "run `rm -rf dist`\n```sh\necho `date`\n```" },
+				],
+			} as never),
+		).toContain("run `rm -rf dist`\n```sh\necho `date`\n```");
+	});
+
+	it("an outline notice drops the ticks around addresses, never inside a fenced block", () => {
+		expect(sideCarBodyToPlainText("outline_task_edit", { kind: "prose", text: CODE })).toBe(
+			CODE.replace("Then `bun test`.", "Then bun test."),
+		);
+	});
+
 	it("a turn-end note reads once, without heading marks, escapes or code ticks", () => {
 		const plain = sideCarBodyToPlainText("outline_task_turn_end", {
 			kind: "prose",

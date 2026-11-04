@@ -105,6 +105,35 @@ async function updates(id: string) {
 	return rows;
 }
 
+describe("the view's summary names only what its text names", () => {
+	test("tasks the text leaves out for its budget are counted, never named", async () => {
+		const id = await session();
+		const long = (n: number) => `Task ${n} ${"x".repeat(110)}`;
+		await seedOutlineTasks(id, [
+			...Array.from({ length: 5 }, (_, i) => ({ text: long(i), status: "doing" as const })),
+			...Array.from({ length: 5 }, (_, i) => ({ text: long(10 + i), status: "blocked" as const })),
+			{ text: "The next todo", status: "todo" as const },
+		]);
+		const [part] = await (await taskSourceForNarrator(id)).contextParts("en");
+		const text = part?.text ?? "";
+		const display = part?.display as {
+			doing: Array<{ title: string }>;
+			waiting: Array<{ title: string }>;
+			next: Array<{ title: string }>;
+			counts: { doing: number; waiting: number; todo: number };
+		};
+		// The budget cut the text short of some tasks...
+		expect(text).toContain("more; read `session/` with OutlineRead.");
+		const named = [...display.doing, ...display.waiting, ...display.next].map((t) => t.title);
+		expect(named.length).toBeGreaterThan(0);
+		expect(named.length).toBeLessThan(11);
+		// ...and the summary names none of those, while still counting every open task.
+		for (const title of named) expect(text).toContain(title);
+		expect(display.next).toEqual([]);
+		expect(display.counts).toEqual({ doing: 5, waiting: 5, todo: 1 });
+	});
+});
+
 describe("context_update rows of the current-tasks view", () => {
 	test("store the view's summary beside the update; the model's update is unchanged", async () => {
 		const { loadContextUpdate } = await import("../../narrator-epochs");

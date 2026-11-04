@@ -67,8 +67,23 @@ afterAll(async () => {
 	server?.stop(true);
 });
 
+/** The task's title on a folded line keeps at least this much width, at any width tested. */
+const MIN_TASK_WIDTH = 48;
+
 const CASES: Array<{ name: string; options: Fixture.FixtureOptions }> = [
 	{ name: "folded-720-dark", options: { width: 720, expanded: false, scheme: "dark" } },
+	{ name: "folded-360-dark", options: { width: 360, expanded: false, scheme: "dark" } },
+	{ name: "folded-328-light", options: { width: 328, expanded: false, scheme: "light" } },
+	{
+		name: "folded-360-enlarged",
+		options: {
+			width: 360,
+			expanded: false,
+			scheme: "dark",
+			fontScalePercent: 130,
+			lineHeightScalePercent: 120,
+		},
+	},
 	{ name: "unfolded-720-light", options: { width: 720, expanded: true, scheme: "light" } },
 	{ name: "unfolded-360-dark", options: { width: 360, expanded: true, scheme: "dark" } },
 	{
@@ -91,11 +106,11 @@ for (const { name, options } of CASES) {
 		);
 		const cards = await page.evaluate(() => (window as unknown as FixtureWindow).fixture.report());
 		expect(cards.map((card) => card.kind)).toEqual([
-			"task_notice",
-			"task_notice",
-			"task_notice",
-			"task_notice",
-			"task_notice",
+			"tasks_notice",
+			"tasks_notice",
+			"tasks_notice",
+			"tasks_notice",
+			"tasks_notice",
 			"origin_notice",
 		]);
 		for (const card of cards) {
@@ -105,17 +120,30 @@ for (const { name, options } of CASES) {
 			});
 			expect(card.content).toBeLessThanOrEqual(card.painted);
 			expect(card.scrollWidth).toBeLessThanOrEqual(card.width);
+			expect(card.lineOverflow).toBeLessThanOrEqual(0.5);
 			// No Markdown reaches the reader.
 			expect(card.text).not.toContain("######");
 			expect(card.text).not.toContain("\\");
 			expect(card.text).not.toContain("`");
 		}
+		// The interrupt guard keeps its close button in its heading line.
+		expect(cards[2]?.closeButtons).toBe(1);
 		if (options.expanded) {
 			// Unfolded cards are taller than one line; the folded ones are all one line.
 			expect(cards[1]?.measured).toBeGreaterThan(cards[4]?.measured ?? 0);
 		} else {
 			const tallest = Math.max(...cards.slice(0, 5).map((card) => card.measured));
 			expect(tallest).toBe(cards[4]?.measured);
+			// Every folded line that names a task still shows it, at phone width too. (The fifth
+			// card, an empty list, names none.)
+			for (const card of cards.slice(0, 4)) {
+				expect({ text: card.text.slice(0, 24), width: card.foldedTaskWidth }).toEqual({
+					text: card.text.slice(0, 24),
+					width: expect.any(Number),
+				});
+				expect(card.foldedTaskWidth).toBeGreaterThanOrEqual(MIN_TASK_WIDTH);
+			}
+			expect(cards[4]?.foldedTaskWidth).toBe(-1);
 		}
 		if (shots) {
 			mkdirSync(shots, { recursive: true });

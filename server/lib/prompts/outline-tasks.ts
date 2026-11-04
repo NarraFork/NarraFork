@@ -1,4 +1,5 @@
 import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i18n-locales";
+import type { OutlineTaskNoticeChange } from "@shared/outline-task-notice";
 
 // ─── Outline tasks ───
 //
@@ -427,12 +428,7 @@ export function getOutlineSpecUnavailableHint(locale: Locale): string {
 // ─── People's changes to the session's tasks (outline P2 PR 5) ───
 
 /** One change a person made to a task of the session (the board, the outline editor). */
-export type OutlineTaskEditChange =
-	| { kind: "added" | "deleted" | "unchecked" | "moved" | "locked" | "unlocked" | "fields" }
-	| { kind: "status"; from: "todo" | "doing" | "done" | "cancelled" | null; to: string }
-	| { kind: "assigned"; to: string | null }
-	/** The person rejected the agent's marking a locked goal done or cancelled (D26b). */
-	| { kind: "rejected"; status: "done" | "cancelled"; reason: string | null };
+export type OutlineTaskEditChange = OutlineTaskNoticeChange;
 
 export interface OutlineTaskEdit {
 	/** `key/sid`. */

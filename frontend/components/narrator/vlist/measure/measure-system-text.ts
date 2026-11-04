@@ -83,7 +83,7 @@ export type SystemTextKind =
 	 * line (title + the first task inline), and one line per task when unfolded. Every line is
 	 * fixed (truncated, never wrapped), so its height is a count, not a text layout.
 	 */
-	| "task_notice";
+	| "tasks_notice";
 
 /**
  * Render payload carried alongside the MeasuredElement. Only `text`/`command`
@@ -138,15 +138,15 @@ export interface SystemTextData {
 	 * locale/formatting imports. Height-neutral (a fixed single-line row).
 	 */
 	timeLabel?: string;
-	/** task_notice: the task lines an unfolded card lists (only their count is measured). */
+	/** tasks_notice: the task lines an unfolded card lists (only their count is measured). */
 	rows?: readonly unknown[];
-	/** task_notice: unfolding shows more than the folded line. */
+	/** tasks_notice: unfolding shows more than the folded line. */
 	expandable?: boolean;
 }
 
 /** Options the registry forwards (`spec.opts`). */
 export interface SystemTextMeasureOptions {
-	/** task_notice: the card is unfolded (the generic per-key expansion). */
+	/** tasks_notice: the card is unfolded (the generic per-key expansion). */
 	expanded?: boolean;
 }
 
@@ -338,7 +338,7 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		prefix: "",
 	},
 	// Measured by `measureTaskNotice` (fixed lines, no wrapping body); listed for completeness.
-	task_notice: {
+	tasks_notice: {
 		font: FONT_XS,
 		whiteSpace: "normal",
 		leftChrome: 0,
@@ -350,11 +350,11 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 	},
 };
 
-/** task_notice: gap between task lines of an unfolded card. */
+/** tasks_notice: gap between task lines of an unfolded card. */
 export const TASK_NOTICE_ROW_GAP = 4;
 
 /**
- * task_notice: height of one line (the heading or a task line). A line holds xs text and xs
+ * tasks_notice: height of one line (the heading or a task line). A line holds xs text and xs
  * badges side by side, so it is the taller of the two; the text's line box follows the reader's
  * typography (`typographyMetrics`), the badge does not.
  */
@@ -447,7 +447,7 @@ export function measureSystemTextCard(
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
 	opts?: SystemTextMeasureOptions,
 ): MeasuredElement {
-	if (kind === "task_notice") return measureTaskNotice(data, contentWidth, opts);
+	if (kind === "tasks_notice") return measureTaskNotice(data, contentWidth, opts);
 	const chrome = resolveSystemTextChrome(kind, data);
 	const bodyText = resolveBodyText(kind, data);
 

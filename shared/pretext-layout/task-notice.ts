@@ -1,5 +1,5 @@
 /**
- * task-notice.ts — the transcript's task notices, as data for the `task_notice` system card.
+ * task-notice.ts — the transcript's task notices, as data for the `tasks_notice` system card.
  *
  * Four notices about a session's tasks used to reach the reader as the model's own text,
  * projected to Markdown and then painted as plain text (`origin_notice`): a `######` before the
@@ -69,9 +69,9 @@ export interface TaskNoticeSummary {
 	tail?: string;
 }
 
-/** The `system-text` card data of a task notice (`kind: "task_notice"`). */
+/** The `system-text` card data of a task notice (`kind: "tasks_notice"`). */
 export interface TaskNoticeData {
-	kind: "task_notice";
+	kind: "tasks_notice";
 	variant: TaskNoticeVariant;
 	/** The heading: the notice's name ("回合末任务提醒", "alice 改了 2 个任务"). */
 	title: string;
@@ -116,10 +116,12 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeEditedTitle: "{who} changed {n} task(s)",
 	taskNoticeTurnEndTail: "not ticked done yet",
 	taskNoticeOpenLead: "{n} open:",
+	taskNoticeOpenLeadAtLeast: "at least {n} open:",
 	taskNoticeMoreTail: "and {n} more",
 	taskNoticeMoreRow: "{n} more not listed",
+	taskNoticeMoreRowAtLeast: "at least {n} more not listed",
 	taskNoticeViewTitle: "Current tasks updated",
-	taskNoticeViewEmpty: "No open tasks",
+	taskNoticeViewEmpty: "The current task list is empty",
 	taskNoticeCountDoing: "{n} in progress",
 	taskNoticeCountWaiting: "{n} waiting",
 	taskNoticeCountTodo: "{n} to do",
@@ -157,8 +159,11 @@ function chip(status: string | undefined | null, labels: Labels): TaskNoticeChip
 	return key ? { label: label(labels, key), color: STATUS_COLOR[status] ?? "gray" } : undefined;
 }
 
-/** The row's link and title; a task with no address is plain text. */
-function named(address: string | undefined | null, title: string): Partial<TaskNoticeRow> {
+/** The row's title and link; a task with no address is plain text. */
+function named(
+	address: string | undefined | null,
+	title: string,
+): Pick<TaskNoticeRow, "title" | "href" | "address"> {
 	const href = outlineAddressPath(address);
 	return {
 		title: title || address || "",
@@ -219,7 +224,6 @@ function itemRow(item: OutlineTaskNoticeItem, labels: Labels, showBy: boolean): 
 	const from = statusChange ? chip(statusChange.from, labels) : undefined;
 	return {
 		...named(item.address, item.title),
-		title: item.title || item.address,
 		...(status ? { status } : {}),
 		...(from ? { statusFrom: from } : {}),
 		...(marks.length > 0 ? { marks } : {}),
@@ -227,8 +231,12 @@ function itemRow(item: OutlineTaskNoticeItem, labels: Labels, showBy: boolean): 
 	};
 }
 
-function moreRow(n: number, labels: Labels): TaskNoticeRow {
-	return { title: label(labels, "taskNoticeMoreRow", { n }), dim: true };
+/** "N more not listed"; `atLeast` when the count is a lower bound (the read stopped early). */
+function moreRow(n: number, labels: Labels, atLeast = false): TaskNoticeRow {
+	return {
+		title: label(labels, atLeast ? "taskNoticeMoreRowAtLeast" : "taskNoticeMoreRow", { n }),
+		dim: true,
+	};
 }
 
 /** The notice as text: its title, then a line per row (copy, and the card's cache key). */
@@ -263,7 +271,7 @@ function notice(
 ): TaskNoticeData {
 	const listed = rows.slice(0, TASK_NOTICE_MAX_ROWS);
 	return {
-		kind: "task_notice",
+		kind: "tasks_notice",
 		variant,
 		title,
 		summary,
@@ -303,7 +311,9 @@ export function taskNoticeFromBody(
 		const showBy = people.length > 1;
 		const rows = body.items.map((item) => itemRow(item, labels, showBy));
 		if (body.more) rows.push(moreRow(body.more, labels));
-		const n = body.items.length + (body.more ?? 0);
+		// Tasks, not (person, task) entries: two people changing one task is one task. `more`
+		// counts tasks the notice left out (`outline-task-edits.ts`).
+		const n = new Set(body.items.map((item) => item.address || item.title)).size + (body.more ?? 0);
 		const who =
 			people.length === 0
 				? sourceTitle
@@ -325,15 +335,24 @@ export function taskNoticeFromBody(
 		if (tasks.length === 0) return null;
 		const outline = body.taskBackend === "outline";
 		const rows = tasks.map((task) => interruptRow(task, outline, labels));
+		// The guard lists a prefix of the open tasks (at most eight); `taskCount` says how many the
+		// source listed when that was more, itself a prefix of a long list: a lower bound.
+		const counted =
+			typeof body.taskCount === "number" && Number.isFinite(body.taskCount)
+				? Math.floor(body.taskCount)
+				: 0;
+		const total = Math.max(tasks.length, counted);
+		const partial = total > tasks.length;
+		if (partial) rows.push(moreRow(total - tasks.length, labels, true));
 		return notice(
 			"interrupt",
 			sourceTitle,
 			{
-				lead: label(labels, "taskNoticeOpenLead", { n: tasks.length }),
+				lead: label(labels, partial ? "taskNoticeOpenLeadAtLeast" : "taskNoticeOpenLead", {
+					n: total,
+				}),
 				row: rows[0],
-				...(tasks.length > 1
-					? { tail: label(labels, "taskNoticeMoreTail", { n: tasks.length - 1 }) }
-					: {}),
+				...(total > 1 ? { tail: label(labels, "taskNoticeMoreTail", { n: total - 1 }) } : {}),
 			},
 			rows,
 		);
@@ -351,19 +370,34 @@ function interruptRow(task: SideCarTaskEntry, outline: boolean, labels: Labels):
 		: null;
 	return {
 		...named(task.ref, task.text),
-		title: task.text || task.ref || "",
 		...(status ? { status } : {}),
 		...(mark ? { marks: [mark] } : {}),
 	};
 }
 
 /** How the host's `context_update` notice row starts (`narrator-epochs.ts`). */
-const CONTEXT_UPDATE_NOTICE = "Context updated: ";
+export const CONTEXT_UPDATE_NOTICE = "Context updated: ";
 
-interface ContextUpdateBlockLike {
+export interface ContextUpdateBlockLike {
 	type: string;
 	text?: string | null;
 	[key: string]: unknown;
+}
+
+/**
+ * The part keys a host `context_update` row names in its notice text, or null when the row is
+ * not one (no `context_update` block, or a notice that does not start the host's way). The
+ * stored row names the keys in English; the update itself is in its snapshot.
+ */
+export function contextUpdateKeys(blocks: readonly ContextUpdateBlockLike[]): string[] | null {
+	if (!blocks.some((block) => block.type === "context_update")) return null;
+	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
+	if (!notice.startsWith(CONTEXT_UPDATE_NOTICE)) return null;
+	return notice
+		.slice(CONTEXT_UPDATE_NOTICE.length)
+		.split(",")
+		.map((key) => key.trim())
+		.filter(Boolean);
 }
 
 /**
@@ -387,14 +421,7 @@ export function taskNoticeFromContextUpdate(
 		(display as Record<string, unknown>)[OUTLINE_TASKS_VIEW_KEY],
 	);
 	if (view === undefined) return null;
-	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
-	const keys = notice.startsWith(CONTEXT_UPDATE_NOTICE)
-		? notice
-				.slice(CONTEXT_UPDATE_NOTICE.length)
-				.split(",")
-				.map((key) => key.trim())
-				.filter(Boolean)
-		: [OUTLINE_TASKS_VIEW_KEY];
+	const keys = contextUpdateKeys(blocks) ?? [OUTLINE_TASKS_VIEW_KEY];
 	const title =
 		keys.length === 1 && keys[0] === OUTLINE_TASKS_VIEW_KEY
 			? label(labels, "taskNoticeViewTitle")
@@ -407,12 +434,13 @@ function viewNotice(
 	view: OutlineTasksViewDisplay | null,
 	labels: Labels,
 ): TaskNoticeData {
+	// Removed: no task is open, or the session's tasks left the outline (its backend changed).
+	// The row cannot tell which, so it says what is true of both: the list is empty.
 	if (!view) return notice("view", title, { lead: label(labels, "taskNoticeViewEmpty") }, []);
 	const row = (task: OutlineTasksViewTask, status: string): TaskNoticeRow => {
 		const statusChip = chip(status, labels);
 		return {
 			...named(task.address, task.title),
-			title: task.title || task.address,
 			...(statusChip ? { status: statusChip } : {}),
 			...(task.humanCreated ? { marks: [label(labels, "taskNoticeMarkHumanCreated")] } : {}),
 		};
@@ -423,7 +451,9 @@ function viewNotice(
 		...view.next.map((task) => row(task, "todo")),
 	];
 	const total = view.counts.doing + view.counts.waiting + view.counts.todo;
-	if (total > rows.length) rows.push(moreRow(total - rows.length, labels));
+	// A read that stopped early counted only what it read: there are more than `total`.
+	if (view.more) rows.push(moreRow(Math.max(1, total - rows.length), labels, true));
+	else if (total > rows.length) rows.push(moreRow(total - rows.length, labels));
 	if (rows.length === 0 || rows[0]?.dim) {
 		return notice("view", title, { lead: label(labels, "taskNoticeViewEmpty") }, []);
 	}

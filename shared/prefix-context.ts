@@ -1,3 +1,5 @@
+import { OUTLINE_TASKS_VIEW_KEY } from "./outline-task-notice";
+
 /** Model-facing context is an immutable baseline followed by named replacements. */
 export interface PromptPart {
 	key: string;
@@ -45,7 +47,7 @@ export const CONTEXT_UPDATE_DISPLAY_MAX_BYTES = 8192;
  * current-tasks view, which goes away when no task is open. Any other part's removal stores
  * nothing, so rows of sessions without such parts are written exactly as before.
  */
-export const DISPLAYED_CONTEXT_PARTS: ReadonlySet<string> = new Set(["outline.tasks"]);
+export const DISPLAYED_CONTEXT_PARTS: ReadonlySet<string> = new Set([OUTLINE_TASKS_VIEW_KEY]);
 
 /**
  * The `display` a `context_update` row stores for `changes`: the summary each changed part

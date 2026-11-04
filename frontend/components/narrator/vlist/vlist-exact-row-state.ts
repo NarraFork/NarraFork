@@ -219,7 +219,7 @@ export const TOGGLEABLE_CARD_KINDS = new Set([
 	// Slash-command bubbles fold their expanded prompt behind a toggle. Plain user
 	// bubbles carry no `commandText`, so the render layer ignores the callback.
 	"message-bubble",
-	// Task notices (`task_notice`) fold their task lines behind their heading. Every other
+	// Task notices (`tasks_notice`) fold their task lines behind their heading. Every other
 	// system card ignores the callback.
 	"system-text",
 ]);

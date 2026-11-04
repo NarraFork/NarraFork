@@ -104,7 +104,7 @@ function renderGuardCard(actions?: InjectionGuardActions): {
 	if (!spec) throw new Error("no spec produced");
 	expect(spec.kind).toBe("system-text");
 	// A task notice: its one task inline on the heading line (one task, so nothing to unfold).
-	expect((spec.data as { kind?: unknown }).kind).toBe("task_notice");
+	expect((spec.data as { kind?: unknown }).kind).toBe("tasks_notice");
 
 	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 5, spec.opts);
 	const extra = resolveRenderExtra(spec);
