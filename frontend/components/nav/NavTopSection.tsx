@@ -7,14 +7,21 @@
  * global sits here, in the column the reader already scans.
  */
 
-import { Group, Kbd, NavLink, Stack, TextInput, Tooltip } from "@mantine/core";
+import { ActionIcon, Group, Kbd, NavLink, Stack, TextInput, Tooltip } from "@mantine/core";
 import { IconEdit, IconSearch } from "@tabler/icons-react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBranding } from "../../hooks/useBranding";
 import { requestDashboardComposerFocus } from "../../lib/dashboard-composer-focus";
 import { BrandTitle } from "../common/BrandTitle";
 import { NotificationBell } from "../notifications/NotificationBell";
+import {
+	requestNavSearchFocus,
+	subscribeNavSearchFocus,
+	takeNavSearchFocusRequest,
+	useNavRender,
+} from "./nav-render-context";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform ?? "");
@@ -29,19 +36,17 @@ export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
 		select: (state) => state.location.pathname.match(/^\/projects\/([^/]+)/)?.[1],
 	});
 
-	// ⌘K / Ctrl+K from anywhere, editors included: there is no other binding for it.
+	// ⌘K / Ctrl+K (see `useNavSearchShortcut`) and the rail's search icon ask for focus;
+	// the box may mount only after the rail opens, so it also takes a pending request.
 	useEffect(() => {
-		const onKeyDown = (e: KeyboardEvent) => {
-			if (e.key.toLowerCase() !== "k" || e.shiftKey || e.altKey) return;
-			if (!(IS_MAC ? e.metaKey : e.ctrlKey)) return;
+		const take = () => {
 			const input = inputRef.current;
-			if (!input || input.offsetParent === null) return;
-			e.preventDefault();
+			if (!input || !takeNavSearchFocusRequest()) return;
 			input.focus();
 			input.select();
 		};
-		window.addEventListener("keydown", onKeyDown);
-		return () => window.removeEventListener("keydown", onKeyDown);
+		take();
+		return subscribeNavSearchFocus(take);
 	}, []);
 
 	const search = () => {
@@ -103,24 +108,83 @@ export function NewSessionLink({
 	);
 }
 
+/** ⌘K / Ctrl+K from anywhere, editors included: there is no other binding for it. */
+function useNavSearchShortcut(openPanel: () => void) {
+	useEffect(() => {
+		const onKeyDown = (e: KeyboardEvent) => {
+			if (e.key.toLowerCase() !== "k" || e.shiftKey || e.altKey) return;
+			if (!(IS_MAC ? e.metaKey : e.ctrlKey)) return;
+			e.preventDefault();
+			openPanel();
+			requestNavSearchFocus();
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [openPanel]);
+}
+
+/** The brand's first letter, the rail's stand-in for the full name. */
+function BrandMark({ onClick, label }: { onClick: () => void; label: string }) {
+	const branding = useBranding();
+	return (
+		<Tooltip label={label} position="right">
+			<ActionIcon
+				variant="light"
+				size={32}
+				radius="md"
+				onClick={onClick}
+				aria-label={label}
+				className="nf-nav-brand-mark"
+			>
+				<span style={{ fontWeight: 700, fontSize: 15 }}>{branding.name.slice(0, 1)}</span>
+			</ActionIcon>
+		</Tooltip>
+	);
+}
+
 export function NavTopSection({
-	collapsed,
 	onToggleCollapsed,
 	statusBadges,
 	onNavigate,
 }: {
-	collapsed: boolean;
 	onToggleCollapsed: () => void;
 	/** Maintenance / update / evidence / output-speed badges; each renders null when idle. */
 	statusBadges: ReactNode;
 	onNavigate?: () => void;
 }) {
 	const { t } = useTranslation("nav");
+	const { collapsed, storedCollapsed, openPanel } = useNavRender();
+	useNavSearchShortcut(openPanel);
+
+	if (collapsed) {
+		return (
+			<Stack gap={4} mb={6} align="center" className="nf-nav-brand-row">
+				<BrandMark onClick={onToggleCollapsed} label={t("expandSidebar")} />
+				<Tooltip label={t("searchPlaceholder")} position="right">
+					<ActionIcon
+						variant="subtle"
+						color="gray"
+						size={32}
+						onClick={() => {
+							openPanel();
+							requestNavSearchFocus();
+						}}
+						aria-label={t("searchPlaceholder")}
+					>
+						<IconSearch size={18} />
+					</ActionIcon>
+				</Tooltip>
+				<NewSessionLink collapsed onNavigate={onNavigate} />
+				<NotificationBell />
+				<WorkspaceSwitcher />
+			</Stack>
+		);
+	}
 	return (
 		<Stack gap={6} mb={6}>
 			<Group justify="space-between" wrap="nowrap" gap={4} className="nf-nav-brand-row" px={4}>
 				<Tooltip
-					label={t(collapsed ? "expandSidebar" : "collapseSidebar")}
+					label={t(storedCollapsed ? "expandSidebar" : "collapseSidebar")}
 					position="right"
 					openDelay={400}
 				>
@@ -140,7 +204,7 @@ export function NavTopSection({
 				{statusBadges}
 			</Group>
 			<NavSearchBox onSearched={onNavigate} />
-			<NewSessionLink collapsed={collapsed} onNavigate={onNavigate} />
+			<NewSessionLink collapsed={false} onNavigate={onNavigate} />
 		</Stack>
 	);
 }

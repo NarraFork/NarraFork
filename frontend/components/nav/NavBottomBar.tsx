@@ -24,6 +24,7 @@ import {
 	splitNavBottomItems,
 } from "./nav-bottom-bar-logic";
 import { CUSTOMIZABLE_NAV_ITEMS, type NavItemDef } from "./nav-items";
+import { useNavRender } from "./nav-render-context";
 import { useNavBadges } from "./use-nav-badges";
 
 /** Avatar (28) + "⋯" (28) + the gaps around them. */
@@ -71,13 +72,11 @@ function BarIcon({
 }
 
 export function NavBottomBar({
-	collapsed,
 	entries,
 	visibleItems,
 	onSaveLayout,
 	onLogout,
 }: {
-	collapsed: boolean;
 	/** Full persisted layout (with the divider), for the "⋯" customisation. */
 	entries: NavLayoutEntry[];
 	/** Customisable entries the user keeps visible, in order. */
@@ -87,6 +86,7 @@ export function NavBottomBar({
 }) {
 	const { t } = useTranslation("nav");
 	const resolveBadge = useNavBadges();
+	const { collapsed } = useNavRender();
 
 	const items = useMemo<BarItem[]>(() => {
 		const custom: BarItem[] = [];

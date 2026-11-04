@@ -1,9 +1,4 @@
-import {
-	startNavResize,
-	toggleNavCollapsed,
-	useNavCollapsed,
-	useNavWidth,
-} from "@frontend/hooks/useResizableNav";
+import { toggleNavCollapsed, useNavCollapsed, useNavWidth } from "@frontend/hooks/useResizableNav";
 import type { AppShellProps } from "@mantine/core";
 import {
 	AppShell,
@@ -69,6 +64,7 @@ import { RoutePendingIndicator } from "./common/RouteChunkErrorBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
 import { NavBottomBar } from "./nav/NavBottomBar";
+import { NavHoverPanel } from "./nav/NavHoverPanel";
 import { NavTopSection } from "./nav/NavTopSection";
 import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 import { NotificationBell } from "./notifications/NotificationBell";
@@ -448,7 +444,6 @@ export function AuthenticatedLayout() {
 				// keeps one owner per edge instead of relying on `p`/`pb` precedence.
 				px={navbarPadding}
 				pt={navbarPadding}
-				data-collapsed={!wizardOpen && navCollapsed ? true : undefined}
 				style={{
 					display: "flex",
 					flexDirection: "column",
@@ -477,26 +472,12 @@ export function AuthenticatedLayout() {
 						</Suspense>
 					</LazyOverlayBoundary>
 				) : (
-					<>
-						{/* Drag handle for resizing navbar. Pointer events so touch drags work;
-						    `touch-action: none` keeps the browser from claiming the gesture as a
-						    scroll (preventDefault on pointerdown cannot do that). */}
-						<Box
-							visibleFrom="sm"
-							onPointerDown={startNavResize}
-							style={{
-								position: "absolute",
-								top: 0,
-								right: -3,
-								width: 6,
-								height: "100%",
-								cursor: "col-resize",
-								touchAction: "none",
-								zIndex: 100,
-							}}
-						/>
+					<NavHoverPanel
+						collapsed={navCollapsed}
+						expandedPadding="var(--mantine-spacing-md)"
+						expandedBottomGutter={appShellNavbarBottomGutter("var(--mantine-spacing-md)")}
+					>
 						<NavTopSection
-							collapsed={navCollapsed}
 							onToggleCollapsed={toggleNavCollapsed}
 							onNavigate={closeNav}
 							statusBadges={
@@ -529,19 +510,16 @@ export function AuthenticatedLayout() {
 								</>
 							}
 						/>
-						{!navCollapsed && (
-							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-								<RecentTabList filter="narrator" />
-							</Box>
-						)}
+						<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }} className="nf-nav-tabs">
+							<RecentTabList filter="narrator" onNavigate={closeNav} />
+						</Box>
 						<NavBottomBar
-							collapsed={navCollapsed}
 							entries={navEntries}
 							visibleItems={navVisibleItems}
 							onSaveLayout={saveNavLayout}
 							onLogout={openLogout}
 						/>
-					</>
+					</NavHoverPanel>
 				)}
 				{/*
 				 * The Navbar's sole bottom gutter: home-indicator clearance where there is an

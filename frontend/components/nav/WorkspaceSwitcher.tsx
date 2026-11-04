@@ -70,11 +70,11 @@ export function WorkspaceSwitcher() {
 								px={8}
 								leftSection={<IconLayoutColumns size={16} />}
 								styles={{ section: { marginInlineEnd: 0 } }}
-								style={{ maxWidth: 200, flexShrink: 1, minWidth: 0 }}
+								style={{ maxWidth: 140, flexShrink: 1, minWidth: 0 }}
 								aria-label={t("workspaces")}
 							>
-								{/* Phones show the icon only; the header has no room for a title. */}
-								<Text size="xs" truncate visibleFrom="sm" ml={6}>
+								{/* The collapsed rail shows the icon only (nav-collapsed.css). */}
+								<Text size="xs" truncate ml={6} className="nf-workspace-switcher-title">
 									{current.title || t("untitledWorkspace")}
 								</Text>
 							</Button>

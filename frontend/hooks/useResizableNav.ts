@@ -301,6 +301,12 @@ export function startNavResize(event: {
 	document.addEventListener("visibilitychange", onVisibilityChange);
 }
 
+/** The width the sidebar opens to: the last expanded width, or the default. */
+export function getNavExpandedWidth(): number {
+	getWidth();
+	return lastExpandedWidth ?? DEFAULT_WIDTH;
+}
+
 /** Toggle between the collapsed rail and the last expanded width. */
 export function toggleNavCollapsed(): void {
 	if (drag) endDrag();

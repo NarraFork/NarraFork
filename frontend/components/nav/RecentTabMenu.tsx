@@ -205,6 +205,7 @@ export function TabContextMenu({
 				shadow="md"
 				p={4}
 				withBorder
+				data-nav-keep-open
 				style={{
 					position: "fixed",
 					left: position.left,

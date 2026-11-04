@@ -208,6 +208,7 @@ export function RecentTabDetailCard({
 			withBorder
 			onPointerEnter={store.holdOpen}
 			onPointerLeave={store.leave}
+			data-nav-keep-open
 			style={{
 				position: "fixed",
 				left,

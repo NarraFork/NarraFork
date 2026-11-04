@@ -12,7 +12,9 @@
 	margin-inline-end: 0;
 }
 
-[data-collapsed] .mantine-NavLink-body {
+[data-collapsed] .mantine-NavLink-body,
+[data-collapsed] .mantine-NavLink-section[data-position="right"],
+[data-collapsed] .nf-workspace-switcher-title {
 	display: none;
 }
 
