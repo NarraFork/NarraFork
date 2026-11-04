@@ -1,12 +1,16 @@
 import type {
+	OutlineAnswerRequest,
+	OutlineAnswerResponse,
 	OutlineBacklinksResponse,
 	OutlineBlockHistoryResponse,
 	OutlineBlockViewResponse,
+	OutlineDigestResponse,
 	OutlineLockResponse,
 	OutlinePageListResponse,
 	OutlinePagePendingResponse,
 	OutlinePendingDecisionResponse,
 	OutlinePendingDetailResponse,
+	OutlineQuestionGroupResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
@@ -133,6 +137,22 @@ export const outlineApi = {
 	unlockOutlineBlock: (spaceId: string, blockId: string) =>
 		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
 			method: "DELETE",
+		}),
+	/** The questions under a block (or a question and its sub-questions). */
+	getOutlineQuestions: (blockId: string) =>
+		request<OutlineQuestionGroupResponse>(`/outline/blocks/${enc(blockId)}/questions`),
+	/** Answer questions put to the caller, of one space, at once. */
+	answerOutlineQuestions: (body: OutlineAnswerRequest) =>
+		request<OutlineAnswerResponse>("/outline/questions/answer", {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** What agents confirmed on the caller's behalf and they have not acknowledged. */
+	getOutlineDigest: () => request<OutlineDigestResponse>("/outline/digest"),
+	markOutlineDigestSeen: (pendingIds: string[]) =>
+		request<{ marked: number }>("/outline/digest/seen", {
+			method: "POST",
+			body: JSON.stringify({ pendingIds }),
 		}),
 	/** A session's task board (its dock tab). */
 	getSessionTaskBoard: (narratorId: string) =>

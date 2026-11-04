@@ -25,6 +25,7 @@ import { MAIN_THREAD_PAGE_ROWS } from "../store/sqlite-read";
 import { sqliteOutlineStore } from "../store/sqlite-store";
 import { OUTLINE_STORE_CONTRACT, type OutlineContractContext } from "./contract";
 import { OUTLINE_PENDING_CONTRACT } from "./pending-contract";
+import { OUTLINE_QUESTION_CONTRACT } from "./question-contract";
 import { OUTLINE_READ_CONTRACT } from "./read-contract";
 import { OUTLINE_TASK_CONTRACT } from "./task-contract";
 
@@ -139,6 +140,12 @@ describe("outline task contract (SQLite)", () => {
 
 describe("outline pending contract (SQLite)", () => {
 	for (const contractCase of OUTLINE_PENDING_CONTRACT) {
+		test(contractCase.name, () => contractCase.run(ctx), 120_000);
+	}
+});
+
+describe("outline question contract (SQLite)", () => {
+	for (const contractCase of OUTLINE_QUESTION_CONTRACT) {
 		test(contractCase.name, () => contractCase.run(ctx), 120_000);
 	}
 });

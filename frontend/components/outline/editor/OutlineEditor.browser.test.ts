@@ -483,6 +483,69 @@ test("the block someone is in is deleted: they are told who, and can restore it"
 	noErrors(a, b);
 }, 30_000);
 
+test("a question put to a person: marked, never ticked, deleting it withdraws it, undo brings it back", async () => {
+	const { pageId, ids } = await seedPage(h, "Decisions", ["a fact"]);
+	const asked = await writeOutline(
+		{
+			spaceId: h.space.id,
+			ops: [
+				{
+					op: "insert",
+					parent: { id: pageId },
+					content: "Which format?",
+					ask: {
+						to: { kind: "human", id: h.owner },
+						options: ["v1", "v2"],
+						recommend: { option: 2 },
+					},
+				},
+			],
+			actor: { kind: "agent", id: "narrator-asking" },
+			narratorId: "narrator-asking",
+			responsibleUserId: h.owner,
+		},
+		{
+			question: {
+				askerNarratorId: "narrator-asking",
+				askerUserId: h.owner,
+				askerToolCallId: null,
+			},
+		},
+	);
+	const question = asked.results[0]?.blockId as string;
+	const fact = ids[0] as string;
+	const [a, b] = await both(pageId);
+	const mark = (e: Editor, id: string) =>
+		e.call((f, x) => {
+			const el = f.dom(x as never)?.querySelector("[data-testid=outline-question-mark]");
+			return el ? { text: el.textContent, title: el.getAttribute("title") } : null;
+		}, id);
+	expect(await mark(a, question)).toEqual({
+		text: "?",
+		title: "A question for a person: answered in the inbox. Deleting it withdraws it.",
+	});
+	expect(await mark(a, fact)).toBeNull();
+	// The task shortcut does nothing on a question.
+	expect(await a.call((f, x) => f.cmd("task", x as never), question)).toBe(false);
+	// Deleting it withdraws the question, and the editor says so.
+	await a.call((f, x) => f.deleteVia(x as never), question);
+	await until(b, (f, x) => !f.kids(f.client().pageId).includes(x as never), [question]);
+	expect(await a.call((f) => f.client().withdrawnQuestions)).toBe(1);
+	await settle(a, b);
+	await flushed(pageId);
+	expect((await outlineStore.getQuestions([question]))[0]?.state).toBe("withdrawn");
+	// Undone: back for everyone, still marked, open again.
+	expect(await a.call((f) => f.undo())).toBe(true);
+	await until(b, (f, x) => f.kids(f.client().pageId).includes(x as never), [question]);
+	await settle(a, b);
+	expect(await mark(b, question)).not.toBeNull();
+	expect(await mark(a, question)).not.toBeNull();
+	await flushed(pageId);
+	expect((await outlineStore.getQuestions([question]))[0]?.state).toBe("open");
+	await converged(pageId, a, b);
+	noErrors(a, b);
+}, 30_000);
+
 test("presence: who is here, their cursor in the text, their block selection", async () => {
 	const { pageId, ids } = await seedPage(h, "在场", ["第一块", "第二块", "第三块"]);
 	const [b0, b1, b2] = ids as [string, string, string];

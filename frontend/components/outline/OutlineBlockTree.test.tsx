@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { OutlineBlockViewResponse, OutlineViewBlock } from "@shared/outline-api";
+import { parseHTML } from "linkedom";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -45,7 +46,7 @@ mock.module("../narrator/markdown/MarkdownContent", () => ({
 	MarkdownContent: ({ text }: { text: string }) => <div data-markdown="">{text}</div>,
 }));
 
-const { OutlineBlockTree } = await import("./OutlineBlockTree");
+const { InProgressList, OutlineBlockTree } = await import("./OutlineBlockTree");
 const { needsMarkdown } = await import("./OutlineBlockBody");
 const { OutlineNavProvider } = await import("./outline-nav");
 const { outlineRouterLink } = await import("../../lib/outline-router");
@@ -168,6 +169,71 @@ describe("OutlineBlockTree", () => {
 		);
 		expect(html).toContain('href="#outline/space/a"');
 		expect(html).not.toContain('href="/outline/space/a');
+	});
+
+	test("a question put to a person is marked as one, on the page and in the in-progress list (review S9)", () => {
+		const html = render(
+			<OutlineBlockTree
+				view={view(
+					[
+						block("root", ["q", "w", "t"]),
+						block("q", [], { question: { state: "open", proceed: false } }),
+						block("w", [], { question: { state: "withdrawn", proceed: false } }),
+						block("t", [], {
+							task: { status: "todo", assignee: null, due: null, depends: [] },
+						}),
+					],
+					{ view: "all" },
+				)}
+				collapsed={new Set()}
+				search={{ view: "all" }}
+				onToggle={() => {}}
+			/>,
+		);
+		const doc = parseHTML(`<!doctype html><html><body>${html}</body></html>`).document;
+		const mark = (id: string) =>
+			doc.querySelector(`[data-block-id="${id}"] [data-testid="outline-question-mark"]`);
+		expect(mark("q")?.getAttribute("data-state")).toBe("open");
+		expect(mark("q")?.getAttribute("aria-label")).toBe("page.question.open");
+		expect(mark("w")?.getAttribute("data-state")).toBe("withdrawn");
+		expect(mark("t")).toBeNull();
+		expect(doc.querySelector('[data-block-id="t"] [aria-label="page.task.todo"]')).not.toBeNull();
+
+		const list = render(
+			<InProgressList
+				block={block("a", [], {
+					openTasks: 2,
+					inProgress: [
+						{
+							id: "q",
+							sid: "s-q",
+							title: "Which format?",
+							status: "todo",
+							assignee: null,
+							waiting: false,
+							question: true,
+						},
+						{
+							id: "t",
+							sid: "s-t",
+							title: "Ship it",
+							status: "doing",
+							assignee: null,
+							waiting: false,
+						},
+					],
+				})}
+				spaceId="space"
+				search={{}}
+			/>,
+		);
+		const items = parseHTML(`<!doctype html><html><body>${list}</body></html>`).document;
+		const links = [...items.querySelectorAll("a")];
+		expect(links.map((a) => !!a.querySelector('[data-testid="outline-question-mark"]'))).toEqual([
+			true,
+			false,
+		]);
+		expect(links[1]?.querySelector('[aria-label="page.task.doing"]')).not.toBeNull();
 	});
 
 	test("an empty facts view says the process is hidden", () => {

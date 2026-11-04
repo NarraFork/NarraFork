@@ -403,6 +403,7 @@ export class LivePage {
 				parentId: b.parentId,
 				orderKey: b.orderKey,
 				taskJson: b.taskJson,
+				question: b.askJson !== null,
 				deleted: false,
 				dbContent: b.content,
 			});
@@ -1681,16 +1682,20 @@ export class LivePage {
 								: op.task
 									? { status: LIVE_STATUS_OF_TASK[op.task], assignee: null }
 									: null;
+						// A restored question is still one (review S9: undoing its delete brings the
+						// question back, and its checkbox stays refused). A client cannot make one.
+						const question = prior?.question === true;
 						this.mirror.put({
 							id: op.id,
 							sid: r?.sid ?? prior?.sid ?? "",
 							parentId: op.p,
 							orderKey: key,
 							taskJson,
+							question,
 							deleted: false,
 							dbContent: prior?.dbContent ?? "",
 						});
-						canonicalOps.push({ ...op, k: key });
+						canonicalOps.push({ ...op, k: key, ...(question ? { q: true as const } : {}) });
 						break;
 					}
 					case "m":
@@ -1802,7 +1807,9 @@ export class LivePage {
 					break;
 				}
 				case "k": {
-					if (!alive(op.id) || op.id === this.pageId) return null;
+					// A question is not a task: its checkbox is refused (it is answered in the inbox).
+					if (!alive(op.id) || op.id === this.pageId || this.mirror.get(op.id)?.question)
+						return null;
 					out.push(op);
 					break;
 				}
@@ -1956,6 +1963,8 @@ export class LivePage {
 			if (task !== taskCharOf(m.taskJson)) tasks.push({ t: "k", id: v.blockId, task });
 			if (JSON.stringify(v.taskJson) !== JSON.stringify(m.taskJson))
 				this.mirror.update(v.blockId, { taskJson: v.taskJson });
+			if ((v.askJson !== null) !== (m.question === true))
+				this.mirror.update(v.blockId, { question: v.askJson !== null });
 			if (v.content !== null && v.content !== m.dbContent) {
 				this.mergeText(v.blockId, m.dbContent, v.content);
 				this.setDbContent(v.blockId, v.content);
@@ -1977,6 +1986,7 @@ export class LivePage {
 						parentId: v.parentId,
 						orderKey: v.orderKey,
 						taskJson: v.taskJson,
+						question: v.askJson !== null,
 						deleted: false,
 						dbContent: content,
 					});
@@ -2004,6 +2014,7 @@ export class LivePage {
 					p: v.parentId,
 					k: v.orderKey,
 					...(task ? { task } : {}),
+					...(v.askJson !== null ? { q: true as const } : {}),
 				});
 			}
 		}

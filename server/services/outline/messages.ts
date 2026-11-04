@@ -89,6 +89,10 @@ export const OUTLINE_TEXT = {
 	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
 		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
 
+	/** A question block given a checkbox, or a task given a question. */
+	questionNotTask: (address: string) =>
+		`${address} is a question (asked with Ask); it cannot be a task too. Answer it, or withdraw it with Ask`,
+
 	/** An agent's write tried to lock or unlock (only people lock, through the page). */
 	lockDenied:
 		"only people lock or unlock a task (from the outline page); an agent cannot change a lock",

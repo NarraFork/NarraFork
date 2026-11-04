@@ -188,6 +188,7 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 			parentId: open.parentId,
 			orderKey: open.orderKey,
 			taskJson: open.taskJson,
+			askJson: open.askJson ?? null,
 			alias: open.alias,
 			contentHash: open.contentHash,
 			deleted: open.deleted,
@@ -198,6 +199,7 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 			parentId: block.parentId,
 			orderKey: block.orderKey,
 			taskJson: block.taskJson,
+			askJson: block.askJson ?? null,
 			alias: block.alias,
 			contentHash: block.contentHash,
 			deleted: block.deleted,
@@ -290,7 +292,11 @@ export function checkInProcess(dump: SpaceDump): void {
 		if (block.deleted) continue;
 		const parent = block.parentId === null ? null : byId.get(block.parentId);
 		const want =
-			dump.space.kind === "session" || block.taskJson !== null || (parent?.inProcess ?? false);
+			dump.space.kind === "session" ||
+			block.taskJson !== null ||
+			// A question put to a person is process like a task.
+			(block.askJson ?? null) !== null ||
+			(parent?.inProcess ?? false);
 		expect({ block: block.id, inProcess: block.inProcess }).toEqual({
 			block: block.id,
 			inProcess: want,

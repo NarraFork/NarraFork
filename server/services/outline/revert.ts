@@ -417,6 +417,7 @@ class RevertAnalysis {
 						content: before.content ?? "",
 						alias: before.alias,
 						task: before.taskJson ? taskInput(before.taskJson) : null,
+						ask: before.askJson,
 						tags,
 					},
 					t.id,
@@ -450,6 +451,10 @@ class RevertAnalysis {
 					},
 					t.id,
 				);
+			}
+			// A question goes back to what it was: an answer reverted reopens it.
+			if (JSON.stringify(before.askJson) !== JSON.stringify(t.meta.askJson)) {
+				push({ op: "update", block: { id: t.id }, ask: before.askJson }, t.id);
 			}
 		}
 		for (const t of topmost) {

@@ -102,6 +102,30 @@ export const outlinePendingRejectBodySchema = z.object({
 	reason: z.string().trim().max(OUTLINE_PENDING_API_LIMITS.maxReasonChars).nullable().optional(),
 });
 
+/** Answering questions put to the person (`POST /questions/answer`, outline P2 PR 7). */
+export const outlineAnswerBodySchema = z.object({
+	answers: z
+		.array(
+			z
+				.object({
+					blockId: outlineIdSchema,
+					option: z.number().int().min(1).max(100).optional(),
+					text: z.string().max(16_384).optional(),
+					adopt: z.boolean().optional(),
+					// The version the person read: required, so every caller gets the stale check (S3).
+					versionSeq: z.number().int().min(1),
+				})
+				.strict(),
+		)
+		.min(1)
+		.max(50),
+});
+
+/** Acknowledging confirmations agents made on the person's behalf (`POST /digest/seen`). */
+export const outlineDigestSeenBodySchema = z.object({
+	pendingIds: z.array(outlineIdSchema).min(1).max(50),
+});
+
 // ── Task board (outline P2 PR 5) ──────────────────────────────────────────────
 
 /** A project board's next page of spaces. */

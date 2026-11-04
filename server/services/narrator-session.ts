@@ -4731,8 +4731,11 @@ export function isQuestionAnswerWakeEligible(recipient: {
  * tails are not replies: a crash can leave them after the answer without the
  * model having continued, and treating them as delivered would drop the wake
  * forever. Text or a tool call is enough; other non-reasoning bodies count too.
+ *
+ * Exported for the outline's answer delivery, whose retry wakes only a session that has not
+ * replied after the message yet.
  */
-function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
+export function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
 	const substantive = db
 		.select({ id: narratorMessageRefs.id })
 		.from(narratorMessageRefs)
