@@ -390,6 +390,15 @@ function SettingsProvidersPage() {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
 	}, []);
 
+	// 卡片上的删除与详情页里的删除按钮是同一条路径：只从草稿移除，保存条统一提交。
+	const deleteDraftProvider = useCallback(
+		(id: string) => {
+			dispatchers.setCustomApiProviders((prev) => prev.filter((provider) => provider.id !== id));
+			dispatchers.setNugProviders((prev) => prev.filter((provider) => provider.id !== id));
+		},
+		[dispatchers.setCustomApiProviders, dispatchers.setNugProviders],
+	);
+
 	const saveProvidersState = useCallback(
 		async (stateToSave: ProvidersState = state) => {
 			if (!settingsFeatureCapability.patchSupported) {
@@ -928,8 +937,20 @@ function SettingsProvidersPage() {
 		for (const p of state.customApiProviders) ensureEmpty(p.prefix);
 		for (const p of state.nugProviders) ensureEmpty(p.prefix);
 
+		// 草稿里被删掉的供应商：服务端下发的模型分组仍带着它们的 prefix，卡片必须跟着消失，
+		// 否则「删除」在保存前看不到任何变化。放弃更改时 state 恢复，卡片自然回来。
+		const draftPrefixes = new Set(
+			[...state.customApiProviders, ...state.nugProviders].map((p) => p.prefix),
+		);
+		const draftRemoved = new Set(
+			[...savedProviderSnapshot.customApiProviders, ...savedProviderSnapshot.nugProviders]
+				.map((p) => p.prefix)
+				.filter((prefix) => prefix && !draftPrefixes.has(prefix)),
+		);
+
 		return (
 			[...byPrefix]
+				.filter(([prefix]) => !draftRemoved.has(prefix))
 				.map(([prefix, models]) => {
 					const plugin = pluginByPrefix.get(prefix);
 					// Plugin providers sit in the platform column: like the builtins they are single
@@ -1258,6 +1279,7 @@ function SettingsProvidersPage() {
 					dispatchers.toggleProviderDisabled(prefix);
 				}}
 				onOpenProviderConfig={setSelectedProvider}
+				onDeleteProvider={deleteDraftProvider}
 				selectedProvider={selectedProvider}
 			/>
 		);
