@@ -15,50 +15,68 @@ html[data-nf-wco] {
 	--nf-wco-inset-left: env(titlebar-area-x, 0px);
 }
 
-/* Buttons on the right: the header's right edge (search box etc.) moves left. */
-html[data-nf-wco="right"] .nf-app-shell .mantine-AppShell-header {
-	padding-right: var(--nf-wco-inset-right);
-}
-
 /*
- * Buttons on the left: the navbar normally absorbs the traffic lights (it is the
- * full-height column), but collapsed to 60px it is narrower than the ~78px light
- * cluster — shift the header past whatever the navbar did not cover.
+ * Desktop has no header row (everything moved into the sidebar), so the title-bar
+ * strip is ours on both sides of the window and needs its own drag surface.
+ *
+ *   - Over the sidebar: the brand row is the drag surface; its buttons opt out.
+ *   - Over the page: Main starts below a strip of the overlay's height, painted by
+ *     `.nf-wco-main-strip`, so the window buttons never cover route content.
+ *
+ * Phones keep the header row and its own drag rules below.
  */
-html[data-nf-wco="left"] .nf-app-shell .mantine-AppShell-header {
-	padding-left: max(0px, env(titlebar-area-x, 0px) - var(--app-shell-navbar-width, 0px));
-}
-
-/*
- * Window dragging. The header row drags, except its two content clusters — the
- * draggable remainder is exactly the empty gap between them. The wizard's
- * full-width return button is a direct header child and stays clickable.
- */
-html[data-nf-wco] .nf-header-row {
+html[data-nf-wco] .nf-nav-brand-row {
 	-webkit-app-region: drag;
+	min-height: var(--nf-wco-strip-height);
 }
 
-html[data-nf-wco] .nf-header-side,
-html[data-nf-wco] .nf-app-shell .mantine-AppShell-header > button {
+html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mantine-Title-root) {
 	-webkit-app-region: no-drag;
 }
 
+.nf-wco-main-strip {
+	display: none;
+}
+
 /*
- * Narrow windows: the gap between the two header clusters all but disappears,
- * so the clusters themselves become drag surface instead and their interactive
- * children opt out individually. Safe because the mobile BrandTitle is
- * deliberately non-interactive (the click-to-collapse one is desktop-only) —
- * everything actually clickable is a button/a/input and stays no-drag.
- * 48em is Mantine's `sm` breakpoint (MOBILE_VIEWPORT_MEDIA_QUERY in
+ * Phones / narrow windows keep the header row. It drags, except its two content
+ * clusters, whose interactive children opt out individually (the mobile BrandTitle is
+ * non-interactive). The wizard's full-width return button is a direct header child and
+ * stays clickable. 48em is Mantine's `sm` breakpoint (MOBILE_VIEWPORT_MEDIA_QUERY in
  * lib/responsive.ts, the same boundary safe-area.css uses).
  */
 @media not all and (min-width: 48em) {
+	html[data-nf-wco="right"] .nf-app-shell .mantine-AppShell-header {
+		padding-right: var(--nf-wco-inset-right);
+	}
+
+	html[data-nf-wco="left"] .nf-app-shell .mantine-AppShell-header {
+		padding-left: var(--nf-wco-inset-left);
+	}
+
+	html[data-nf-wco] .nf-header-row,
 	html[data-nf-wco] .nf-header-side {
 		-webkit-app-region: drag;
 	}
 
-	html[data-nf-wco] .nf-header-side :is(button, a, input, textarea, select, [role="button"]) {
+	html[data-nf-wco] .nf-header-side :is(button, a, input, textarea, select, [role="button"]),
+	html[data-nf-wco] .nf-app-shell .mantine-AppShell-header > button {
 		-webkit-app-region: no-drag;
+	}
+}
+
+@media (min-width: 48em) {
+	html[data-nf-wco] .nf-wco-main-strip {
+		display: block;
+		position: sticky;
+		top: 0;
+		z-index: 100;
+		height: var(--nf-wco-strip-height);
+		margin-top: calc(var(--mantine-spacing-md) * -1);
+		margin-bottom: var(--mantine-spacing-md);
+		margin-inline: calc(var(--mantine-spacing-md) * -1);
+		background: var(--mantine-color-body);
+		-webkit-app-region: drag;
 	}
 }
 

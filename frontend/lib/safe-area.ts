@@ -72,6 +72,17 @@ export const TOP_BANNER_SAFE_AREA_STYLE = {
  */
 export const APP_SHELL_HEADER_OFFSET = "var(--app-shell-header-offset, 60px)";
 export const APP_SHELL_HEADER_HEIGHT = `calc(60px + ${SAFE_AREA_INSET_TOP})`;
+/**
+ * Desktop has no header row: brand, search and notifications live in the sidebar. The
+ * header element stays (it still owns the top inset, and Main's offset is derived from
+ * it), but at the `sm` breakpoint it is only the inset tall, which is 0 on an ordinary
+ * desktop.
+ */
+export const APP_SHELL_DESKTOP_HEADER_HEIGHT = `calc(0px + ${SAFE_AREA_INSET_TOP})`;
+export const APP_SHELL_HEADER_HEIGHTS = {
+	base: APP_SHELL_HEADER_HEIGHT,
+	sm: APP_SHELL_DESKTOP_HEADER_HEIGHT,
+} as const;
 export const APP_SHELL_MOBILE_NAVBAR_HEIGHT = `calc(${APP_VIEWPORT_BOTTOM} - ${APP_SHELL_HEADER_OFFSET})`;
 export const APP_SHELL_DESKTOP_NAVBAR_HEIGHT = `calc(${APP_VIEWPORT_BOTTOM} - ${SAFE_AREA_INSET_TOP})`;
 

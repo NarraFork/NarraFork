@@ -3,9 +3,11 @@ import { parseHTML } from "linkedom";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "./responsive";
 import {
 	APP_SHELL_CONTENT_HEIGHT,
+	APP_SHELL_DESKTOP_HEADER_HEIGHT,
 	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
 	APP_SHELL_FULL_BLEED_HEIGHT,
 	APP_SHELL_HEADER_HEIGHT,
+	APP_SHELL_HEADER_HEIGHTS,
 	APP_SHELL_HEADER_OFFSET,
 	APP_SHELL_MAIN_PADDING_BOTTOM,
 	APP_SHELL_MOBILE_NAVBAR_HEIGHT,
@@ -184,6 +186,12 @@ function trackerRealm(html = "<!doctype html><html><body><textarea></textarea></
 describe("mobile safe-area layout contract", () => {
 	test("AppShell header and viewport reserve the effective screen insets", () => {
 		expect(APP_SHELL_HEADER_HEIGHT).toContain(SAFE_AREA_INSET_TOP);
+		// Desktop has no header row, but the header still owns the top inset there.
+		expect(APP_SHELL_DESKTOP_HEADER_HEIGHT).toContain(SAFE_AREA_INSET_TOP);
+		expect(APP_SHELL_HEADER_HEIGHTS).toEqual({
+			base: APP_SHELL_HEADER_HEIGHT,
+			sm: APP_SHELL_DESKTOP_HEADER_HEIGHT,
+		});
 		expect(APP_SHELL_SAFE_HEADER_STYLE).toEqual({
 			boxSizing: "border-box",
 			paddingTop: SAFE_AREA_INSET_TOP,
@@ -200,7 +208,7 @@ describe("mobile safe-area layout contract", () => {
 		const appShell = await Bun.file(
 			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
-		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHT }}");
+		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHTS }}");
 		expect(appShell).not.toContain("--app-shell-header-height");
 		expect(appShell).not.toContain("--app-shell-header-offset:");
 	});
@@ -1194,7 +1202,7 @@ describe("mobile safe-area layout contract", () => {
 		expect(appShell).toContain("id={APP_SHELL_MAIN_ID}");
 		expect(appShell).toContain("className={APP_SHELL_MAIN_CLASSNAME}");
 		expect(appShell).not.toContain("data-scroll-restoration-id");
-		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHT }}");
+		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHTS }}");
 		// The Header remains the sole owner of the top inset style; other props on
 		// the same element (a ref for the pull-to-refresh gesture) are free to vary.
 		expect(appShell).toMatch(/<AppShell\.Header[^>]*style=\{APP_SHELL_SAFE_HEADER_STYLE\}>/);

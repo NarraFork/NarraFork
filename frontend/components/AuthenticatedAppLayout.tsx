@@ -47,7 +47,7 @@ import { narratorWSManager } from "../lib/narrator-ws-manager";
 import {
 	APP_SHELL_CLASSNAME,
 	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
-	APP_SHELL_HEADER_HEIGHT,
+	APP_SHELL_HEADER_HEIGHTS,
 	APP_SHELL_HEADER_OFFSET,
 	APP_SHELL_MAIN_CLASSNAME,
 	APP_SHELL_MAIN_ID,
@@ -381,7 +381,7 @@ export function AuthenticatedLayout() {
 		<AppShellWithNavWidth
 			className={APP_SHELL_CLASSNAME}
 			layout="alt"
-			header={{ height: APP_SHELL_HEADER_HEIGHT }}
+			header={{ height: APP_SHELL_HEADER_HEIGHTS }}
 			// Only the wrapper subscribes to settled width and threshold crossings;
 			// ordinary drag frames bypass React (see AppShellWithNavWidth).
 			navbar={{
@@ -412,23 +412,27 @@ export function AuthenticatedLayout() {
 						{ts("wizardReturn")}
 					</Button>
 				)}
-				<Group
-					h="100%"
-					px="md"
-					justify="space-between"
-					wrap="nowrap"
-					className="nf-header-row"
-					visibleFrom={wizardOpen && !opened ? "sm" : undefined}
-				>
-					<Group wrap="nowrap" className="nf-header-side">
-						<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-						<BrandTitle order={3} hiddenFrom="sm" />
+				{/* Phones only: on desktop everything in this row lives in the sidebar. While the
+				    wizard holds the drawer closed, its return button replaces the row. */}
+				{!(wizardOpen && !opened) && (
+					<Group
+						h="100%"
+						px="md"
+						justify="space-between"
+						wrap="nowrap"
+						className="nf-header-row"
+						hiddenFrom="sm"
+					>
+						<Group wrap="nowrap" className="nf-header-side">
+							<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
+							<BrandTitle order={3} hiddenFrom="sm" />
+						</Group>
+						{/* Phones keep the bell here: the sidebar is a drawer they have to open. */}
+						<Group wrap="nowrap" className="nf-header-side">
+							<NotificationBell />
+						</Group>
 					</Group>
-					{/* Phones keep the bell here: the sidebar is a drawer they have to open. */}
-					<Group wrap="nowrap" className="nf-header-side" hiddenFrom="sm">
-						<NotificationBell />
-					</Group>
-				</Group>
+				)}
 			</AppShell.Header>
 
 			<AppShell.Navbar
@@ -560,6 +564,9 @@ export function AuthenticatedLayout() {
 				className={APP_SHELL_MAIN_CLASSNAME}
 				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
 			>
+				{/* WCO on desktop: the title-bar strip over the page, and its drag surface
+				    (there is no header row). display:none everywhere else, see wco.css. */}
+				<Box className="nf-wco-main-strip" aria-hidden />
 				{/*
 				 * No data-directory permission probe here: it ran on every login and turned an
 				 * inconclusive check (slow filesystem, timeout) into a permission warning.
@@ -611,8 +618,9 @@ export function AuthenticatedLayout() {
 			 * after the row's `drag` rect, can cancel it. The header clusters work
 			 * because they are children of the row and so are collected after it;
 			 * these banners are siblings, so their place in the tree is what decides.
-			 * Emitted after the header row *and* the navbar's WCO spacer, they are
-			 * collected last and stay clickable.
+			 * Emitted after every drag surface (the phone header row, the navbar's WCO
+			 * spacer and brand row, the strip above Main), they are collected last and
+			 * stay clickable.
 			 */}
 			<WSConnectionAlert />
 			<VersionUpdateBanner />
