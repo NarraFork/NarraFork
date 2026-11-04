@@ -293,7 +293,7 @@ describe("bulk clear and the storage limit", () => {
 		expect(await layout()).toEqual([`[${folder}:F]`, `a>${folder}`, `b>${folder}`]);
 	});
 
-	it("trimming at the storage limit drops a whole folder, never part of one", async () => {
+	it("trimming at the storage limit takes the folder's oldest member, keeping the folder", async () => {
 		await addNarratorTabs("a", "b");
 		const folder = await makeFolder("a", "b");
 		// Folder at the bottom, then fill the list to the limit with new tabs on top.
@@ -317,7 +317,8 @@ describe("bulk clear and the storage limit", () => {
 		const tabs = await listAllRecentTabs(USER);
 		expect(tabs.length).toBeLessThanOrEqual(RECENT_TABS_STORAGE_LIMIT);
 		const folderRows = tabs.filter((tab) => tab.id === folder || tab.folderId === folder);
-		expect([0, 3]).toContain(folderRows.length);
+		// Both members were visited at the same time; the lower one goes.
+		expect(folderRows.map((tab) => tab.id)).toEqual([folder, "a"]);
 	});
 });
 

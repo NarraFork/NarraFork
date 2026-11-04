@@ -1,4 +1,20 @@
 import {
+	applyRecentTabFolderCreate,
+	applyRecentTabFolderDissolve,
+	applyRecentTabMove,
+	applyRecentTabPin,
+	applyRecentTabRemove,
+	canJoinFolder,
+	extractUnit,
+	folderHeaderIndex,
+	getPinnedSectionEndIndex,
+	isFolderTab,
+	promoteMemberWithinFolder,
+	regroupFolders,
+	tryInsertRelativeToKey,
+	unitRange,
+} from "@shared/recent-tab-layout";
+import {
 	type PersistedRecentTab,
 	RECENT_TAB_FOLDER_COLORS,
 	RECENT_TAB_FOLDER_ICONS,
@@ -169,15 +185,6 @@ function legacyFolderTitle(title: string): string {
 	return folderTitle(title) || "Workspace";
 }
 
-function isFolder(tab: PersistedRecentTab): boolean {
-	return tab.type === "folder";
-}
-
-/** Only work-section, non-container tabs may live inside a folder. */
-function canJoinFolder(tab: PersistedRecentTab): boolean {
-	return tab.type === "narrator" || tab.type === "subagent";
-}
-
 function normalizeTab(tab: PersistedRecentTab): PersistedRecentTab {
 	const normalized: PersistedRecentTab = {
 		type: tab.type,
@@ -194,7 +201,7 @@ function normalizeTab(tab: PersistedRecentTab): PersistedRecentTab {
 	if (tab.status !== undefined) normalized.status = tab.status;
 	if (tab.pinned) normalized.pinned = true;
 	if (tab.isScheduled) normalized.isScheduled = true;
-	if (isFolder(tab)) {
+	if (isFolderTab(tab)) {
 		if (tab.folderIcon && FOLDER_ICON_SET.has(tab.folderIcon)) {
 			normalized.folderIcon = tab.folderIcon;
 		}
@@ -212,50 +219,6 @@ function normalizeTab(tab: PersistedRecentTab): PersistedRecentTab {
 	return normalized;
 }
 
-/**
- * Canonical folder layout:
- *   - every folder is immediately followed by all of its members;
- *   - inside a folder, pinned members come first (stable otherwise);
- *   - a member whose folder does not exist goes back to the top level;
- *   - a folder with no members is removed.
- *
- * Applied on every write (via `deduplicateTabs` / `trimTabsAtomic`), so mutations only
- * have to express membership and rough position — this function owns contiguity.
- */
-function regroupFolders(input: PersistedRecentTab[]): PersistedRecentTab[] {
-	const tabs = input.map(cloneTab);
-	const folderIds = new Set(tabs.filter(isFolder).map((tab) => tab.id));
-	const membersByFolder = new Map<string, PersistedRecentTab[]>();
-	for (const tab of tabs) {
-		if (!tab.folderId) continue;
-		if (!folderIds.has(tab.folderId)) {
-			delete tab.folderId;
-			continue;
-		}
-		const members = membersByFolder.get(tab.folderId);
-		if (members) members.push(tab);
-		else membersByFolder.set(tab.folderId, [tab]);
-	}
-	if (folderIds.size === 0) return tabs;
-
-	const result: PersistedRecentTab[] = [];
-	for (const tab of tabs) {
-		if (tab.folderId) continue;
-		if (!isFolder(tab)) {
-			result.push(tab);
-			continue;
-		}
-		const members = membersByFolder.get(tab.id) ?? [];
-		if (members.length === 0) continue;
-		result.push(
-			tab,
-			...members.filter((member) => member.pinned),
-			...members.filter((member) => !member.pinned),
-		);
-	}
-	return result;
-}
-
 function deduplicateTabs(input: PersistedRecentTab[]): PersistedRecentTab[] {
 	const seen = new Set<string>();
 	const result: PersistedRecentTab[] = [];
@@ -265,65 +228,87 @@ function deduplicateTabs(input: PersistedRecentTab[]): PersistedRecentTab[] {
 		seen.add(key);
 		result.push(normalizeTab(tab));
 	}
-	return regroupFolders(result);
+	return regroupFolders(result, { prune: true });
 }
 
 /**
- * The flat index range of the top-level UNIT containing `index`: a lone tab, or a folder
- * together with its members. Assumes the canonical layout from `regroupFolders`.
+ * Cap the list at `limit` rows, removing one row (or one lone unit) at a time from the
+ * bottom, the least recently placed end.
+ *
+ * A folder is a structure the user built by hand, so it shrinks member by member instead
+ * of disappearing whole: each step drops the folder's least recently visited member, and
+ * the header goes only with its last member. Steps, each taking the bottom-most match:
+ *   1. a loose, non-pinned subagent tab;
+ *   2. a loose, non-pinned tab, or a non-pinned member of a non-pinned folder that keeps
+ *      at least one member;
+ *   3. the same, even a folder's last member;
+ *   4. anything, pinned or not, still a member at a time.
+ * The unit holding `protectedKey` (the tab being written) is never touched.
  */
-function unitRange(tabs: PersistedRecentTab[], index: number): { start: number; end: number } {
-	const tab = tabs[index];
-	if (!tab) return { start: index, end: index };
-	const folderId = isFolder(tab) ? tab.id : tab.folderId;
-	if (!folderId) return { start: index, end: index };
-	const start = tabs.findIndex((candidate) => isFolder(candidate) && candidate.id === folderId);
-	if (start < 0) return { start: index, end: index };
-	let end = start;
-	while (end + 1 < tabs.length && tabs[end + 1]?.folderId === folderId) end++;
-	return { start, end };
-}
-
 function trimTabsAtomic(
 	input: PersistedRecentTab[],
 	limit: number,
 	protectedKey?: string,
 ): { tabs: PersistedRecentTab[]; protectedGroupTooLarge: boolean } {
-	const tabs = regroupFolders(input);
+	// A copy: the shared regroup hands back `input` itself when it is already in shape,
+	// and the loop below splices.
+	const tabs = [...regroupFolders(input, { prune: true })];
 	if (tabs.length <= limit) return { tabs, protectedGroupTooLarge: false };
 
 	const protectedIndex = protectedKey
 		? tabs.findIndex((candidate) => tabKey(candidate) === protectedKey)
 		: -1;
-	const protectedRange = protectedIndex >= 0 ? unitRange(tabs, protectedIndex) : null;
-	if (protectedRange && protectedRange.end - protectedRange.start + 1 > limit) {
-		return { tabs: input, protectedGroupTooLarge: true };
-	}
-
-	const isProtectedIndex = (index: number): boolean =>
-		protectedRange != null && index >= protectedRange.start && index <= protectedRange.end;
-	const findCandidate = (kind: "subagent" | "unpinned" | "any"): number => {
-		for (let index = tabs.length - 1; index >= 0; index--) {
-			if (tabs[index]?.folderId) continue;
-			const range = unitRange(tabs, index);
-			if (isProtectedIndex(range.start)) continue;
-			const header = tabs[range.start];
-			if (kind === "subagent" && (header.type !== "subagent" || header.pinned)) continue;
-			if (kind === "unpinned" && header.pinned) continue;
-			return range.start;
-		}
-		return -1;
-	};
+	// The head (lone tab or folder header) of the protected unit; heads are what the
+	// victim search visits, and object identity survives the splices below.
+	const protectedHead =
+		protectedIndex >= 0 ? tabs[unitRange(tabs, protectedIndex).start] : undefined;
+	const isProtected = (head: PersistedRecentTab): boolean => head === protectedHead;
 
 	while (tabs.length > limit) {
-		let index = findCandidate("subagent");
-		if (index < 0) index = findCandidate("unpinned");
-		if (index < 0) index = findCandidate("any");
-		if (index < 0) return { tabs: input, protectedGroupTooLarge: true };
-		const range = unitRange(tabs, index);
-		tabs.splice(range.start, range.end - range.start + 1);
+		const victim =
+			findEvictionVictim(tabs, 1, isProtected) ??
+			findEvictionVictim(tabs, 2, isProtected) ??
+			findEvictionVictim(tabs, 3, isProtected) ??
+			findEvictionVictim(tabs, 4, isProtected);
+		if (victim == null) return { tabs: input, protectedGroupTooLarge: true };
+		const { folderId } = tabs[victim];
+		tabs.splice(victim, 1);
+		if (folderId && !tabs.some((tab) => tab.folderId === folderId)) {
+			tabs.splice(folderHeaderIndex(tabs, folderId), 1);
+		}
 	}
 	return { tabs, protectedGroupTooLarge: false };
+}
+
+/** Index of the row step `step` of `trimTabsAtomic` would drop, or null. */
+function findEvictionVictim(
+	tabs: PersistedRecentTab[],
+	step: 1 | 2 | 3 | 4,
+	isProtected: (head: PersistedRecentTab) => boolean,
+): number | null {
+	for (let index = tabs.length - 1; index >= 0; index--) {
+		if (tabs[index].folderId) continue;
+		const range = unitRange(tabs, index);
+		const head = tabs[range.start];
+		index = range.start;
+		if (isProtected(head)) continue;
+		if (!isFolderTab(head)) {
+			if (step === 1 && (head.type !== "subagent" || head.pinned)) continue;
+			if ((step === 2 || step === 3) && head.pinned) continue;
+			return range.start;
+		}
+		if (step === 1 || (step !== 4 && head.pinned)) continue;
+		const members = tabs.slice(range.start + 1, range.end + 1);
+		const candidates = members.filter((member) => step === 4 || !member.pinned);
+		if (candidates.length === 0) continue;
+		if (step === 2 && members.length < 2) continue;
+		// Least recently visited; on a tie, the lowest one in the folder.
+		const oldest = candidates.reduce((best, member) =>
+			member.lastVisitedAt <= best.lastVisitedAt ? member : best,
+		);
+		return range.start + 1 + members.indexOf(oldest);
+	}
+	return null;
 }
 
 function normalizeAndLimitTabs(
@@ -917,21 +902,6 @@ async function mutate(
 	});
 }
 
-/** Flat index just past the last pinned top-level unit. */
-function getPinnedSectionEndIndex(tabs: PersistedRecentTab[]): number {
-	let index = 0;
-	while (index < tabs.length) {
-		const tab = tabs[index];
-		if (tab.folderId) {
-			index++;
-			continue;
-		}
-		if (!tab.pinned) break;
-		index = unitRange(tabs, index).end + 1;
-	}
-	return index;
-}
-
 function findRepresentedTabIndex(
 	tabs: PersistedRecentTab[],
 	tab: PersistedRecentTab,
@@ -953,29 +923,6 @@ export type RecentTabUpsertInput = PersistedRecentTab & {
 	beforeKey?: string;
 	afterKey?: string;
 };
-
-/**
- * Place a top-level group at `anchorKey`, reporting whether the anchor existed.
- *
- * Anchoring to a folder member means anchoring to the whole folder: a top-level unit can
- * only land between units. Deliberately NOT `insertRelativeToKey`, which appends when
- * the anchor is missing. That is right for an explicit move (the user asked for a
- * position; the bottom is a position), but wrong for an upsert: a stale anchor there
- * would yank an existing tab to the bottom of the list on what the user experienced as
- * a plain revisit.
- */
-function tryInsertRelativeToKey(
-	tabs: PersistedRecentTab[],
-	group: PersistedRecentTab[],
-	anchorKey: string,
-	position: "before" | "after",
-): boolean {
-	const anchorIndex = tabs.findIndex((tab) => tabKey(tab) === anchorKey);
-	if (anchorIndex < 0) return false;
-	const range = unitRange(tabs, anchorIndex);
-	tabs.splice(position === "before" ? range.start : range.end + 1, 0, ...group);
-	return true;
-}
 
 /**
  * Fields a client may set through the generic upsert. Folder structure (membership, and
@@ -1122,7 +1069,7 @@ export async function upsertRecentTab(
  *
  * Removing a folder removes the folder AND its members (the "close" of a folder unit).
  * Use `dissolveRecentTabFolder` to keep the members. Removing the last member of a folder
- * removes the folder too (`regroupFolders` drops empty folders).
+ * removes the folder too.
  *
  * `storeUndo` is opt-in and must only be set for a user-initiated close (the
  * DELETE route behind swipe / context-menu / middle-click). Cascade cleanups
@@ -1143,71 +1090,11 @@ export async function removeRecentTab(
 		// Snapshot BEFORE the splice — after it the removed tab is gone and the undo
 		// entry would restore an already-empty slot.
 		const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
-		const range = isFolder(tabs[index]) ? unitRange(tabs, index) : { start: index, end: index };
-		const removedCount = range.end - range.start + 1;
-		tabs.splice(range.start, removedCount);
-		return { tabs, options: { removedCount, ...(undoTabs ? { undoTabs } : {}) } };
+		const next = applyRecentTabRemove(tabs, key);
+		// An emptied folder header goes with its last member but is not counted as closed.
+		const removedCount = isFolderTab(tabs[index]) ? tabs.length - next.length : 1;
+		return { tabs: next, options: { removedCount, ...(undoTabs ? { undoTabs } : {}) } };
 	});
-}
-
-/**
- * Move-path insert: falls back to the END of the list when the anchor is gone.
- *
- * That fallback is specific to an explicit move — the user asked for a position, so
- * landing at the bottom is a worse position but still an answer. The upsert path must
- * NOT behave this way (see `tryInsertRelativeToKey`).
- */
-function insertRelativeToKey(
-	tabs: PersistedRecentTab[],
-	group: PersistedRecentTab[],
-	anchorKey: string,
-	position: "before" | "after",
-): void {
-	if (!tryInsertRelativeToKey(tabs, group, anchorKey, position)) tabs.push(...group);
-}
-
-/** Take the unit at `index` out of the list: a lone tab, or a folder with its members. */
-function extractUnit(
-	tabs: PersistedRecentTab[],
-	index: number,
-): { group: PersistedRecentTab[]; originalIndex: number } {
-	const range = isFolder(tabs[index]) ? unitRange(tabs, index) : { start: index, end: index };
-	return {
-		group: tabs.splice(range.start, range.end - range.start + 1),
-		originalIndex: range.start,
-	};
-}
-
-/** Index of the first non-pinned member of a folder, or just past its last member. */
-function folderUnpinnedStart(tabs: PersistedRecentTab[], folderId: string): number {
-	const headerIndex = tabs.findIndex((tab) => isFolder(tab) && tab.id === folderId);
-	if (headerIndex < 0) return -1;
-	let index = headerIndex + 1;
-	while (index < tabs.length && tabs[index].folderId === folderId && tabs[index].pinned) index++;
-	return index;
-}
-
-function folderEnd(tabs: PersistedRecentTab[], folderId: string): number {
-	const headerIndex = tabs.findIndex((tab) => isFolder(tab) && tab.id === folderId);
-	if (headerIndex < 0) return -1;
-	return unitRange(tabs, headerIndex).end + 1;
-}
-
-/**
- * Promote a narrator unit for the `above_idle` rule.
- *
- * A folder member first moves to the head of its folder's non-pinned members (pinned
- * members keep their place), then the whole folder is the unit that moves.
- */
-function promoteMemberWithinFolder(tabs: PersistedRecentTab[], index: number): number {
-	const tab = tabs[index];
-	if (!tab.folderId) return index;
-	const folderId = tab.folderId;
-	if (!tab.pinned) {
-		tabs.splice(index, 1);
-		tabs.splice(folderUnpinnedStart(tabs, folderId), 0, tab);
-	}
-	return tabs.findIndex((candidate) => isFolder(candidate) && candidate.id === folderId);
 }
 
 export interface MoveRecentTabInput {
@@ -1232,34 +1119,20 @@ export async function moveRecentTab(
 	input: MoveRecentTabInput,
 ): Promise<RecentTabsMutationResult> {
 	return mutate(userId, async (tabs) => {
-		let index = tabs.findIndex((tab) => tabKey(tab) === input.key);
+		if (input.position !== "above_idle") {
+			return { tabs: applyRecentTabMove(tabs, input.key, input) };
+		}
+		// `above_idle` needs live narrator status, so it is the one move the shared layout
+		// cannot run. Membership never changes: a member is promoted inside its folder and
+		// the folder is the unit that moves.
+		const found = tabs.findIndex((tab) => tabKey(tab) === input.key);
+		if (found < 0) return { tabs };
+		const index = promoteMemberWithinFolder(tabs, found);
 		if (index < 0) return { tabs };
-		const source = tabs[index];
-
-		if (input.position === "above_idle") {
-			// Membership never changes here: a member is promoted inside its folder and the
-			// folder is the unit that moves.
-			index = promoteMemberWithinFolder(tabs, index);
-			if (index < 0) return { tabs };
-			// A pinned unit already sits where the user put it; only its inside may move.
-			if (tabs[index].pinned) return { tabs };
-		} else if (!isFolder(source) && (input.folderId !== undefined || source.folderId)) {
-			// A folder always moves as a whole unit (below); folders never nest, so a
-			// membership field on a folder move is ignored.
-			return { tabs: moveMember(tabs, index, input) };
-		}
-		const { group, originalIndex } = extractUnit(tabs, index);
-
-		if (input.beforeKey) insertRelativeToKey(tabs, group, input.beforeKey, "before");
-		else if (input.afterKey) insertRelativeToKey(tabs, group, input.afterKey, "after");
-		else if (input.position === "top") tabs.unshift(...group);
-		else if (input.position === "above_idle") {
-			tabs.splice(await firstIdleUnitIndex(tabs), 0, ...group);
-		} else if (input.toIndex != null) {
-			tabs.splice(Math.min(input.toIndex, tabs.length), 0, ...group);
-		} else {
-			tabs.splice(originalIndex, 0, ...group);
-		}
+		// A pinned unit already sits where the user put it; only its inside may move.
+		if (tabs[index].pinned) return { tabs };
+		const { group } = extractUnit(tabs, index);
+		tabs.splice(await firstIdleUnitIndex(tabs), 0, ...group);
 		return { tabs };
 	});
 }
@@ -1297,66 +1170,6 @@ async function firstIdleUnitIndex(tabs: PersistedRecentTab[]): Promise<number> {
 }
 
 /**
- * Moves that involve a folder member, or a tab entering/leaving a folder.
- *
- * Crossing the folder boundary clears `pinned`: top-level pinning and in-folder pinning
- * are separate zones, and carrying one into the other would silently pin the tab
- * somewhere the user never pinned it.
- */
-function moveMember(
-	tabs: PersistedRecentTab[],
-	index: number,
-	input: MoveRecentTabInput,
-): PersistedRecentTab[] {
-	const source = tabs[index];
-	if (!canJoinFolder(source) && input.folderId) return tabs;
-	const targetFolder = input.folderId === undefined ? (source.folderId ?? null) : input.folderId;
-	if (targetFolder && !tabs.some((tab) => isFolder(tab) && tab.id === targetFolder)) return tabs;
-
-	const [moved] = tabs.splice(index, 1);
-	if ((moved.folderId ?? null) !== targetFolder) delete moved.pinned;
-	if (targetFolder) moved.folderId = targetFolder;
-	else delete moved.folderId;
-
-	if (!targetFolder) {
-		// Leaving (or a top-level tab with no folder at all): the regular top-level placement.
-		if (input.beforeKey) insertRelativeToKey(tabs, [moved], input.beforeKey, "before");
-		else if (input.afterKey) insertRelativeToKey(tabs, [moved], input.afterKey, "after");
-		else if (input.position === "top") tabs.unshift(moved);
-		else tabs.splice(getPinnedSectionEndIndex(tabs), 0, moved);
-		return tabs;
-	}
-
-	if (input.position === "top") {
-		// "Move to top" inside a folder: first slot of the member's zone.
-		const headerIndex = tabs.findIndex((tab) => isFolder(tab) && tab.id === targetFolder);
-		tabs.splice(moved.pinned ? headerIndex + 1 : folderUnpinnedStart(tabs, targetFolder), 0, moved);
-		return tabs;
-	}
-
-	const anchorKey = input.beforeKey ?? input.afterKey;
-	const anchorIndex = anchorKey ? tabs.findIndex((tab) => tabKey(tab) === anchorKey) : -1;
-	const anchorInFolder = anchorIndex >= 0 && tabs[anchorIndex].folderId === targetFolder;
-	if (anchorInFolder) {
-		// The in-folder pinned/unpinned split is kept by `regroupFolders`; a drop across it
-		// adopts the anchor's zone so the row lands where it was aimed.
-		if (tabs[anchorIndex].pinned) moved.pinned = true;
-		else delete moved.pinned;
-		tabs.splice(input.beforeKey ? anchorIndex : anchorIndex + 1, 0, moved);
-	} else if (
-		anchorIndex >= 0 &&
-		isFolder(tabs[anchorIndex]) &&
-		tabs[anchorIndex].id === targetFolder
-	) {
-		// Anchored to the folder header itself: "after" means the first slot.
-		tabs.splice(folderUnpinnedStart(tabs, targetFolder), 0, moved);
-	} else {
-		tabs.splice(folderEnd(tabs, targetFolder), 0, moved);
-	}
-	return tabs;
-}
-
-/**
  * Pin or unpin a tab.
  *
  * A top-level tab or folder pins to the top of the list; a folder member pins to the
@@ -1367,26 +1180,7 @@ export async function pinRecentTab(
 	key: string,
 	pinned: boolean,
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => {
-		const index = tabs.findIndex((tab) => tabKey(tab) === key);
-		if (index < 0) return { tabs };
-		const current = tabs[index];
-		if (!!current.pinned === pinned) return { tabs };
-		if (current.folderId) {
-			const folderId = current.folderId;
-			const [member] = tabs.splice(index, 1);
-			if (pinned) member.pinned = true;
-			else delete member.pinned;
-			// Pinning appends to the pinned zone; unpinning lands first among the rest.
-			tabs.splice(folderUnpinnedStart(tabs, folderId), 0, member);
-			return { tabs };
-		}
-		const { group } = extractUnit(tabs, index);
-		if (pinned) group[0].pinned = true;
-		else delete group[0].pinned;
-		tabs.splice(getPinnedSectionEndIndex(tabs), 0, ...group);
-		return { tabs };
-	});
+	return mutate(userId, (tabs) => ({ tabs: applyRecentTabPin(tabs, key, pinned) }));
 }
 
 // ── Folders ──────────────────────────────────────────────────────────────────
@@ -1416,33 +1210,24 @@ export async function createRecentTabFolder(
 	let created = false;
 	const result = await mutate(userId, (tabs) => {
 		if (input.targetKey === input.sourceKey) return { tabs };
-		const targetIndex = tabs.findIndex((tab) => tabKey(tab) === input.targetKey);
-		const sourceIndex = tabs.findIndex((tab) => tabKey(tab) === input.sourceKey);
-		if (targetIndex < 0 || sourceIndex < 0) {
-			throw new ValidationError("Both tabs must exist to create a folder");
-		}
-		const target = tabs[targetIndex];
-		const source = tabs[sourceIndex];
-		if (target.folderId || !canJoinFolder(target) || !canJoinFolder(source)) {
-			throw new ValidationError("A folder is made by dropping a session onto a loose session");
-		}
-		const [sourceTab] = tabs.splice(sourceIndex, 1);
-		const insertAt = tabs.findIndex((tab) => tabKey(tab) === input.targetKey);
-		const [targetTab] = tabs.splice(insertAt, 1);
-		const folder: PersistedRecentTab = {
+		const next = applyRecentTabFolderCreate(tabs, input.targetKey, input.sourceKey, {
 			type: "folder",
 			id: folderId,
 			title,
 			lastVisitedAt: Date.now(),
-			...(targetTab.pinned ? { pinned: true } : {}),
-		};
-		delete targetTab.pinned;
-		delete sourceTab.pinned;
-		targetTab.folderId = folderId;
-		sourceTab.folderId = folderId;
-		tabs.splice(insertAt, 0, folder, targetTab, sourceTab);
+		});
+		if (!next) {
+			const bothExist = [input.targetKey, input.sourceKey].every((key) =>
+				tabs.some((tab) => tabKey(tab) === key),
+			);
+			throw new ValidationError(
+				bothExist
+					? "A folder is made by dropping a session onto a loose session"
+					: "Both tabs must exist to create a folder",
+			);
+		}
 		created = true;
-		return { tabs };
+		return { tabs: next };
 	});
 	return created ? { ...result, folderId } : result;
 }
@@ -1460,7 +1245,7 @@ export async function updateRecentTabFolder(
 	input: UpdateRecentTabFolderInput,
 ): Promise<RecentTabsMutationResult> {
 	return mutate(userId, (tabs) => {
-		const folder = tabs.find((tab) => isFolder(tab) && tab.id === folderId);
+		const folder = tabs.find((tab) => isFolderTab(tab) && tab.id === folderId);
 		if (!folder) throw new AppError("Folder not found", 404, "NOT_FOUND");
 		if (input.title !== undefined) {
 			const title = folderTitle(input.title);
@@ -1488,19 +1273,7 @@ export async function dissolveRecentTabFolder(
 	userId: string,
 	folderId: string,
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => {
-		const index = tabs.findIndex((tab) => isFolder(tab) && tab.id === folderId);
-		if (index < 0) return { tabs };
-		const range = unitRange(tabs, index);
-		const members = tabs.slice(range.start + 1, range.end + 1).map((member) => {
-			const released = cloneTab(member);
-			delete released.folderId;
-			delete released.pinned;
-			return released;
-		});
-		tabs.splice(range.start, range.end - range.start + 1, ...members);
-		return { tabs };
-	});
+	return mutate(userId, (tabs) => ({ tabs: applyRecentTabFolderDissolve(tabs, folderId) }));
 }
 
 function isKeepUnit(tabs: PersistedRecentTab[], index: number, keepTabKey?: string): boolean {
@@ -1548,7 +1321,7 @@ export async function clearRecentTabs(
 			const range = unitRange(before, index);
 			const unit = before.slice(range.start, range.end + 1);
 			let keep =
-				isKeepUnit(before, index, keepTabKey) || unit[0].pinned === true || isFolder(unit[0]);
+				isKeepUnit(before, index, keepTabKey) || unit[0].pinned === true || isFolderTab(unit[0]);
 			if (!keep && scope === "projects") keep = tabSection(unit[0].type) !== "projects";
 			if (!keep && scope === "inactive_narrators") {
 				if (unit[0].type === "project") keep = true;
@@ -1797,7 +1570,7 @@ function promoteTopLevelTab(tabs: PersistedRecentTab[], index: number): Persiste
 	if (index < 0) return tabs;
 	const folderId = tabs[index]?.folderId;
 	if (folderId) {
-		index = tabs.findIndex((tab) => isFolder(tab) && tab.id === folderId);
+		index = folderHeaderIndex(tabs, folderId);
 		if (index < 0) return tabs;
 	}
 	if (tabs[index].pinned) return tabs;

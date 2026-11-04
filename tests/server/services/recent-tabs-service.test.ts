@@ -25,7 +25,7 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 
 const recentTabs = await import("../../../server/services/recent-tabs-service");
 const { reduceRecentTabsOperations } = await import("../../../frontend/hooks/useRecentTabs");
-const { applyRecentTabMove } = await import("../../../frontend/hooks/recent-tab-folders");
+const { applyRecentTabMove } = await import("../../../shared/recent-tab-layout");
 
 const NOW = "2026-07-19T00:00:00.000Z";
 
@@ -493,19 +493,56 @@ describe("recent-tabs pagination and folders", () => {
 		expect(second.items.map((tab) => tab.id)).toEqual(["n-last"]);
 	});
 
-	it("evicts a folder atomically at the 500-row boundary", async () => {
-		const tabs = Array.from({ length: 498 }, (_, index) => makeTab(`n-${index}`));
-		tabs.push(makeTab("ws-old", { type: "folder", title: "Old folder" }));
-		tabs.push(makeTab("ws-child", { folderId: "ws-old" }));
+	it("shrinks a folder at the 500-row boundary instead of dropping it whole", async () => {
+		const tabs = Array.from({ length: 497 }, (_, index) => makeTab(`n-${index}`));
+		tabs.push(makeTab("f", { type: "folder", title: "Old folder" }));
+		tabs.push(makeTab("f-new", { folderId: "f", lastVisitedAt: 50 }));
+		tabs.push(makeTab("f-old", { folderId: "f", lastVisitedAt: 10 }));
 		seedLegacyTabs(tabs);
 		await recentTabs.ensureMigrated("user-1");
 
 		await recentTabs.upsertRecentTab("user-1", makeTab("n-new"));
 		const keys = storedKeys();
-		expect(keys).toHaveLength(RECENT_TABS_STORAGE_LIMIT - 1);
+		expect(keys).toHaveLength(RECENT_TABS_STORAGE_LIMIT);
 		expect(keys).toContain("narrator:n-new");
-		expect(keys).not.toContain("folder:ws-old");
-		expect(keys).not.toContain("narrator:ws-child");
+		expect(keys).toContain("folder:f");
+		expect(keys).toContain("narrator:f-new");
+		expect(keys).not.toContain("narrator:f-old");
+	});
+
+	it("takes a loose tab before a folder's last member, and that member before a pinned one", async () => {
+		const tabs = Array.from({ length: 496 }, (_, index) => makeTab(`n-${index}`));
+		tabs.push(makeTab("solo", { type: "folder", title: "Solo" }));
+		tabs.push(makeTab("solo-only", { folderId: "solo", lastVisitedAt: 1 }));
+		tabs.push(makeTab("kept", { type: "folder", title: "Kept" }));
+		tabs.push(makeTab("kept-pinned", { folderId: "kept", pinned: true, lastVisitedAt: 1 }));
+		seedLegacyTabs(tabs);
+		await recentTabs.ensureMigrated("user-1");
+
+		// One over: the lowest loose tab goes, both folders stay.
+		await recentTabs.upsertRecentTab("user-1", makeTab("over-1"));
+		let keys = storedKeys();
+		expect(keys).not.toContain("narrator:n-495");
+		expect(keys).toContain("narrator:solo-only");
+		expect(keys).toContain("narrator:kept-pinned");
+
+		// Now with every loose tab pinned: the folder's last unpinned member goes, header
+		// and all, and the pinned member of the other folder still stays.
+		cleanDb(sqlite);
+		seedLegacyTabs([
+			...Array.from({ length: 496 }, (_, index) => makeTab(`p-${index}`, { pinned: true })),
+			makeTab("solo", { type: "folder", title: "Solo" }),
+			makeTab("solo-only", { folderId: "solo", lastVisitedAt: 1 }),
+			makeTab("kept", { type: "folder", title: "Kept" }),
+			makeTab("kept-pinned", { folderId: "kept", pinned: true, lastVisitedAt: 1 }),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+		await recentTabs.upsertRecentTab("user-1", makeTab("over-2"));
+		keys = storedKeys();
+		expect(keys).toHaveLength(RECENT_TABS_STORAGE_LIMIT - 1);
+		expect(keys).not.toContain("folder:solo");
+		expect(keys).not.toContain("narrator:solo-only");
+		expect(keys).toContain("narrator:kept-pinned");
 	});
 });
 
