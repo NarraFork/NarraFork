@@ -374,13 +374,14 @@ async function revertNarratorScoped(
 					outcome.files.some((file) => file.status === "applied" || file.status === "unknown")
 				) {
 					for (const path of outcome.worktreePaths ?? []) invalidateWorkspaceTreeCache(path);
-					const reset = new Set([
-						narratorId,
-						...(outcome.historyResult?.affectedNarratorIds ?? []),
-					]);
+					const affected = new Set(outcome.historyResult?.affectedNarratorIds ?? []);
+					const reset = new Set([narratorId, ...affected]);
 					for (const id of reset) {
-						if (outcome.historyCommitted)
-							resetActiveUpstreamSession(id, { persistedIdentityCleared: true });
+						if (outcome.historyCommitted) {
+							// A committed no-op edit still resets transport, but only affected
+							// narrators had their persisted identity cleared by the history commit.
+							resetActiveUpstreamSession(id, { persistedIdentityCleared: affected.has(id) });
+						}
 						broadcastToNarrator(id, { type: "full_reload", narratorId: id });
 					}
 					// Delivery senders only gain a message version; reload them without a reset.
