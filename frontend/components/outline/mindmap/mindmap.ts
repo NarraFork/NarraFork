@@ -29,7 +29,9 @@ import {
 	planVisible,
 } from "@shared/outline/layout";
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
+import { onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
+import { ensureTypographyCssVars } from "../../../lib/typography-css-vars";
 import { pinchStep, wheelZoomFactor, zoomAround } from "../../common/pan-zoom-math";
 import {
 	applyChrome,
@@ -55,7 +57,7 @@ import {
 import type { LiveClient, SelInfo } from "../editor/live-client";
 import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "../editor/view";
 import type { OutlineViewState } from "../view-state";
-import { bodySize, MAP_FONT_FAMILY, MAP_MONO_FAMILY, NODE, nodeSize } from "./measure";
+import { bodySize, MAP_FONT_FAMILY, MAP_MONO_FAMILY, mapType, NODE, nodeSize } from "./measure";
 
 /** Most blocks one map lays out and draws (design §7.2: the same cap as an editor view). */
 export /** Nodes laid out (and measured on the main thread) while the Worker measures the page. */
@@ -190,6 +192,7 @@ export class MindMapView {
 	private edgeKey = "";
 	private layoutSeq = 0;
 	private readonly ro: ResizeObserver;
+	private readonly offTypography: () => void;
 	private destroyed = false;
 	stats = {
 		layouts: [] as number[],
@@ -209,7 +212,9 @@ export class MindMapView {
 		this.stage.setAttribute("role", "tree");
 		this.stage.setAttribute("aria-label", mapText.stage);
 		this.stage.dataset.testid = "outline-map";
-		// The fonts nodes are measured with (`measure.ts`).
+		// The fonts nodes are measured with (`measure.ts`); sizes and line boxes come from the
+		// reader's typography variables, which must be published before a node is drawn.
+		ensureTypographyCssVars();
 		this.stage.style.setProperty("--nf-mm-font", MAP_FONT_FAMILY);
 		this.stage.style.setProperty("--nf-mm-mono", MAP_MONO_FAMILY);
 		this.world = document.createElement("div");
@@ -237,6 +242,13 @@ export class MindMapView {
 			this.schedule(false);
 		});
 		this.ro.observe(this.stage);
+		// The reader changed the typography (外观 · 排版): every node's size was measured under
+		// the old one. The measure cache drops its entries itself (`measure.ts`); the per-block
+		// sizes here are keyed by text, so they go too, and the next layout measures again.
+		this.offTypography = onTypographyChange(() => {
+			this.sizes.clear();
+			this.schedule();
+		});
 		this.stage.addEventListener("keydown", (e) => this.onKey(e));
 		this.stage.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
 		this.stage.addEventListener("pointerdown", (e) => this.onPointerDown(e));
@@ -267,6 +279,7 @@ export class MindMapView {
 		if (this.raf) cancelAnimationFrame(this.raf);
 		this.raf = 0;
 		this.ro.disconnect();
+		this.offTypography();
 		this.stage.remove();
 	}
 
@@ -437,7 +450,7 @@ export class MindMapView {
 				const node: LayoutNode = {
 					id,
 					w: NODE.moreW,
-					h: NODE.padY * 2 + NODE.lineH + NODE.border * 2,
+					h: NODE.padY * 2 + mapType().lineH + NODE.border * 2,
 					kids: [],
 					x: 0,
 					y: 0,
@@ -662,7 +675,9 @@ export class MindMapView {
 			this.world.append(ne.el);
 		}
 		const editing = this.editing?.id === id;
-		const key = `${inf.content}\u0000${inf.task}\u0000${inf.hasKids}\u0000${inf.collapsed}\u0000${inf.hidden}`;
+		// The body width is in the key: a typography change re-measures every node (same text,
+		// new width), and the body must be laid out at the new width it was measured for.
+		const key = `${inf.content}\u0000${inf.task}\u0000${inf.hasKids}\u0000${inf.collapsed}\u0000${inf.hidden}\u0000${inf.bodyW}`;
 		if (ne.key !== key) {
 			ne.key = key;
 			if (inf.more) {

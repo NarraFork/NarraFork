@@ -115,8 +115,9 @@
 	border: 1px solid var(--ob-line);
 	border-radius: 6px;
 	background: var(--mantine-color-body);
-	font-size: 15px;
-	line-height: 1.5;
+	/* The conversation's body text; `measure.ts` measures with the same metrics. */
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
 	font-family: var(--nf-mm-font);
 	white-space: normal;
 	overflow-wrap: break-word;
@@ -127,7 +128,20 @@
 	position: static;
 	flex: none;
 	width: 28px;
-	height: 22.5px;
+	height: var(--nf-type-body-line);
+}
+
+/* A heading node's frame sits on the heading's first line (no effect on the node's size). */
+.nf-outline-editor .mm-node:has(> .mm-body > h1:first-child) > .ob-gutter {
+	height: var(--nf-type-h1-line);
+}
+
+.nf-outline-editor .mm-node:has(> .mm-body > h2:first-child) > .ob-gutter {
+	height: var(--nf-type-h2-line);
+}
+
+.nf-outline-editor .mm-node:has(> .mm-body > h3:first-child) > .ob-gutter {
+	height: var(--nf-type-h3-line);
 }
 
 .nf-outline-editor .mm-node[data-task]:not([data-task=""]) > .ob-gutter {
@@ -156,30 +170,35 @@
 }
 
 .nf-outline-editor .mm-node .mm-body h1 {
-	font-size: 1.5em;
-	line-height: 1.5;
+	font-size: var(--nf-type-h1-size);
+	line-height: var(--nf-type-h1-line);
 }
 
 .nf-outline-editor .mm-node .mm-body h2 {
-	font-size: 1.25em;
-	line-height: 1.5;
+	font-size: var(--nf-type-h2-size);
+	line-height: var(--nf-type-h2-line);
 }
 
 .nf-outline-editor .mm-node .mm-body h3 {
-	font-size: 1.1em;
-	line-height: 1.5;
+	font-size: var(--nf-type-h3-size);
+	line-height: var(--nf-type-h3-line);
 }
 
 .nf-outline-editor .mm-node .mm-body code {
 	font-family: var(--nf-mm-mono);
-	font-size: 13px;
+	font-size: var(--nf-type-code-size);
 }
 
 .nf-outline-editor .mm-node .mm-body pre {
-	font: 13px / 1.5 var(--nf-mm-mono);
+	font: var(--nf-type-code-block-size) / var(--nf-type-code-block-line) var(--nf-mm-mono);
 	white-space: pre;
 	overflow: hidden;
-	max-height: calc(6 * 19.5px + 8px);
+	max-height: calc(6 * var(--nf-type-code-block-line) + 8px);
+}
+
+/* Measured with the same spacing (`measure.ts` → `run`), per element as an em fraction. */
+:where(.nf-outline-editor .mm-node .mm-body, .nf-outline-editor .mm-node .mm-body *) {
+	letter-spacing: var(--nf-type-letter-spacing);
 }
 
 .nf-outline-editor .mm-node .mm-body table {
@@ -239,7 +258,7 @@
 .nf-outline-editor .mm-node.editing .ProseMirror {
 	min-height: 0;
 	padding-left: 0;
-	line-height: 1.5;
+	line-height: var(--nf-type-body-line);
 }
 
 /* A node's editor shows one body: no frame, no title styling. */

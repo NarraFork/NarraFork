@@ -2284,7 +2284,7 @@
 	},
 	"appearance": {
 		"title": "Typography",
-		"intro": "Adjust how this transcript is set. Changes apply as you drag.",
+		"intro": "Adjust how conversations and outlines are set. Changes apply as you drag.",
 		"fontScale": "Font size",
 		"fontScaleDesc": "Scales body text, headings, code and labels together.",
 		"letterSpacing": "Letter spacing",
@@ -2292,7 +2292,7 @@
 		"paragraphScale": "Paragraph spacing",
 		"paragraphScaleDesc": "Gaps between paragraphs, lists, code blocks and messages.",
 		"reset": "Reset to defaults",
-		"scopeNote": "Applies to the conversation text only, on every device you sign in from.",
+		"scopeNote": "Applies to conversation text and outlines (editor, history, mind map, task board), on every device you sign in from.",
 		"lineHeight": "Line spacing",
 		"lineHeightDesc": "Spacing between lines inside a paragraph."
 	},

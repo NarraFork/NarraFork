@@ -31,7 +31,9 @@
  * editors and the map's stage.
  */
 import type { OutlineMapLayout } from "@shared/outline-api";
+import { onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
+import { ensureTypographyCssVars } from "../../lib/typography-css-vars";
 import type { BlockMark, MentionResolver } from "./editor/chrome";
 import { mentionLabel } from "./editor/chrome";
 import { caretIn } from "./editor/commands";
@@ -58,6 +60,8 @@ interface Pos {
 const PREWARM_HOLD_MS = 1500;
 /** Pages smaller than this are measured on the spot (faster than waiting for the Worker). */
 const PREWARM_HOLD_MIN_BLOCKS = 300;
+/** A typography change measures the page ahead again once the setting has been still this long. */
+const TYPOGRAPHY_PREWARM_DELAY_MS = 300;
 /**
  * A cold outline behind the map (see the constructor) is built and laid out once the page is
  * live and nobody touched the surface for this long (in idle time): the switch to the outline is
@@ -140,6 +144,8 @@ export class EditSurface {
 	private readonly offs: Array<() => void> = [];
 
 	constructor(private readonly opts: EditSurfaceOptions) {
+		// The editor and the map paint with the reader's typography variables.
+		ensureTypographyCssVars();
 		this.client = opts.client;
 		this.pageId = opts.pageId;
 		this.state = opts.state;
@@ -221,6 +227,24 @@ export class EditSurface {
 			this.frame.removeEventListener("pointerdown", flush, true);
 			this.frame.removeEventListener("wheel", flush, true);
 			clearTimeout(this.warmTimer);
+		});
+		// The reader changed the typography (外观 · 排版): every node size measured ahead is for
+		// the old setting (`measure.ts` keys sizes by it). Once the setting settles — a slider drag
+		// changes it every frame — the page is measured ahead again in the Worker, so the next
+		// switch to the map does not measure every body on the main thread. A map on screen
+		// re-measures what it shows at once (`MindMapView`).
+		let typographyTimer: ReturnType<typeof setTimeout> | undefined;
+		const offTypography = onTypographyChange(() => {
+			clearTimeout(typographyTimer);
+			typographyTimer = setTimeout(() => {
+				// Not shown yet: the first prewarm is still to come, under the new setting.
+				if (this.destroyed || this.prewarmed === "none") return;
+				void this.prewarm();
+			}, TYPOGRAPHY_PREWARM_DELAY_MS);
+		});
+		this.offs.push(() => {
+			offTypography();
+			clearTimeout(typographyTimer);
 		});
 		if (opts.premeasure !== false && this.shownFrom() !== "none")
 			setTimeout(() => this.prewarm(), 0);

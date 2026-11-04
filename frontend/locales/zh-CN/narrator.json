@@ -2281,7 +2281,7 @@
 	},
 	"appearance": {
 		"title": "排版",
-		"intro": "调整本会话正文的排版，拖动时即时生效。",
+		"intro": "调整会话正文与大纲的排版，拖动时即时生效。",
 		"fontScale": "字体大小",
 		"fontScaleDesc": "同时缩放正文、标题、代码与标签。",
 		"letterSpacing": "字间距",
@@ -2289,7 +2289,7 @@
 		"paragraphScale": "段落间距",
 		"paragraphScaleDesc": "段落、列表、代码块与消息之间的间距。",
 		"reset": "恢复默认值",
-		"scopeNote": "仅作用于会话正文，并在你登录的所有设备上生效。",
+		"scopeNote": "作用于会话正文与大纲（编辑器、历史视图、思维导图、任务看板），并在你登录的所有设备上生效。",
 		"lineHeight": "行间距",
 		"lineHeightDesc": "同一段落内各行之间的间距。"
 	},

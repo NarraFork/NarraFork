@@ -67,7 +67,11 @@ import {
 	useUpdateBoardTask,
 } from "../../../hooks/useTaskBoard";
 import { ApiError, api } from "../../../lib/api";
+import { ensureTypographyCssVars, TYPE_ROLE_STYLE } from "../../../lib/typography-css-vars";
 import { DiffEntry } from "../OutlinePendingPanel";
+
+// Task text paints with the reader's typography variables (TYPE_ROLE_STYLE).
+ensureTypographyCssVars();
 
 type Translate = ReturnType<typeof useTranslation>["t"];
 
@@ -240,7 +244,7 @@ export function TaskBoard({
 		<Stack gap="sm" data-testid="task-board" data-scope={scope?.kind}>
 			{scope?.kind === "session" && first.canAdd && <AddTaskForm narratorId={scope.narratorId} />}
 			{groups.length === 0 && (
-				<Text size="sm" c="dimmed" data-testid="task-board-empty">
+				<Text size="sm" c="dimmed" style={TYPE_ROLE_STYLE.body} data-testid="task-board-empty">
 					{scope?.kind === "project" ? t("board.emptyProject") : t("board.empty")}
 				</Text>
 			)}
@@ -260,6 +264,7 @@ export function TaskBoard({
 					key={section.space.id}
 					size="xs"
 					c="dimmed"
+					style={TYPE_ROLE_STYLE.xs}
 					data-testid="task-board-open-truncated"
 					data-space-id={section.space.id}
 				>
@@ -324,12 +329,12 @@ function ExecutorGroupView({
 			<Group gap={6} mb={4} justify="space-between" wrap="nowrap">
 				<Group gap={6} wrap="nowrap">
 					<IconUser size={14} color="var(--mantine-color-dimmed)" />
-					<Text size="sm" fw={600} truncate>
+					<Text size="sm" fw={600} truncate style={TYPE_ROLE_STYLE.body}>
 						{label}
 					</Text>
 				</Group>
 				{open.length > 0 && (
-					<Text size="xs" c="dimmed">
+					<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
 						{t("board.count", { count: open.length })}
 					</Text>
 				)}
@@ -345,7 +350,7 @@ function ExecutorGroupView({
 							{status === "cancelled" &&
 								(folded ? <IconChevronRight size={12} /> : <IconChevronDown size={12} />)}
 							{STATUS_ICON[status]}
-							<Text size="xs" c="dimmed" fw={500}>
+							<Text size="xs" c="dimmed" fw={500} style={TYPE_ROLE_STYLE.xs}>
 								{t(`board.status.${status}`)} · {tasks.length}
 							</Text>
 						</Group>
@@ -451,7 +456,7 @@ function TaskRow({
 				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
 					<Text
 						size="sm"
-						style={{ wordBreak: "break-word" }}
+						style={{ ...TYPE_ROLE_STYLE.body, wordBreak: "break-word" }}
 						td={task.status === "cancelled" ? "line-through" : undefined}
 					>
 						{task.title}
@@ -491,20 +496,20 @@ function TaskRow({
 							</Badge>
 						)}
 						{task.assignee && (
-							<Text size="xs" c="dimmed">
+							<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
 								@{task.assignee}
 							</Text>
 						)}
-						<Text size="xs" c="dimmed" ff="monospace">
+						<Text size="xs" c="dimmed" ff="monospace" style={TYPE_ROLE_STYLE.code}>
 							{task.address}
 						</Text>
 						{scopeKind === "project" && section && (
-							<Text size="xs" c="dimmed">
+							<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
 								{t("board.space", { label: section.space.label ?? section.space.key })}
 							</Text>
 						)}
 						{scopeKind === "session" && section?.role === "claimed" && (
-							<Text size="xs" c="dimmed">
+							<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
 								{t("board.claimedElsewhere", { label: section.space.label ?? section.space.key })}
 							</Text>
 						)}

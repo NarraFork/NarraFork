@@ -14,6 +14,8 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
+import { headingMetrics, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
+import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -859,6 +861,77 @@ export function liveSessions() {
 
 export function nodeGeometry() {
 	return { ...NODE };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Typography (外观 · 排版): the outline paints with the conversation's values
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Page host: show the page as of a commit (the read-only tree), as the timeline does. */
+export function showAsOf(seq: number): void {
+	void router?.navigate({
+		to: window.location.pathname,
+		search: { view: "all", asOf: seq },
+	} as never);
+}
+
+/** Set the reader's typography, as the 外观 panel's sliders do (the variables follow). */
+export function applyTypography(next: Partial<TypographySettings>): void {
+	setTypography(next);
+}
+
+/** What the conversation measures each role with (the expected computed styles). */
+export function expectedTypography() {
+	const m = typographyMetrics();
+	const h = (level: 1 | 2 | 3) => {
+		const hm = headingMetrics(level);
+		return { size: hm.size, line: hm.lineHeight, spacing: hm.letterSpacing };
+	};
+	return {
+		body: { size: m.size.sm, line: m.line.body, spacing: m.letterSpacing.body },
+		xs: { size: m.size.xs, line: m.line.xs },
+		code: { size: m.size.xs },
+		codeBlock: { size: m.codeSize, line: m.line.code },
+		h1: h(1),
+		h2: h(2),
+		h3: h(3),
+	};
+}
+
+/** Computed font size, line height and letter spacing (px) of the first match. */
+export function computedType(selector: string): {
+	size: number;
+	line: number;
+	spacing: number;
+	height: number;
+} | null {
+	const el = document.querySelector(selector);
+	if (!el) return null;
+	const cs = getComputedStyle(el);
+	const px = (v: string) => (v === "normal" ? 0 : Number.parseFloat(v));
+	return {
+		size: px(cs.fontSize),
+		line: px(cs.lineHeight),
+		spacing: px(cs.letterSpacing),
+		height: el.getBoundingClientRect().height,
+	};
+}
+
+/**
+ * Mind-map nodes whose text does not fit the box measured for it: drawn wider than its body
+ * (a line the browser could not break where pretext did) or taller than measured.
+ */
+export function nodeOverflow(): Array<{ id: string; overW: number; overH: number }> {
+	const m = surface().map;
+	const out: Array<{ id: string; overW: number; overH: number }> = [];
+	for (const [id, ne] of m.els) {
+		if (m.editing?.id === id || id.startsWith("\u0000")) continue;
+		const body = ne.body;
+		const overW = body.scrollWidth - body.clientWidth;
+		const overH = ne.el.scrollHeight - ne.el.clientHeight;
+		if (overW > 0 || overH > 0) out.push({ id, overW, overH });
+	}
+	return out;
 }
 
 export { findBlockPos };

@@ -4,11 +4,18 @@
  * (`measure.ts`). The page sends bodies with the text their mentions show; this answers sizes
  * keyed the way the main thread's cache is.
  */
+import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
 import { parseToPM } from "../editor/convert";
 import { measureBody, NODE } from "./measure";
 
 export interface MeasureRequest {
 	id: number;
+	/**
+	 * The reader's typography on the main thread. The Worker has its own copy of the
+	 * typography module (at the default until told otherwise), so every request carries the
+	 * setting its keys were made under (`measureKey`'s signature) and it is applied first.
+	 */
+	typography: TypographySettings;
 	items: Array<{ key: string; content: string; labels: string[] }>;
 }
 
@@ -27,6 +34,7 @@ const scope = self as unknown as {
 
 scope.onmessage = (e) => {
 	const t0 = performance.now();
+	setTypography(e.data.typography);
 	const out: Array<[string, number, number]> = [];
 	const failed: string[] = [];
 	for (const it of e.data.items) {

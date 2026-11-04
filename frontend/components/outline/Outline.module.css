@@ -111,16 +111,17 @@
 	padding-block: 2px;
 	border-radius: var(--mantine-radius-sm);
 	content-visibility: auto;
-	contain-intrinsic-size: auto 28px;
+	contain-intrinsic-size: auto calc(var(--nf-type-body-line) + 4px);
 }
 
 .indent {
 	flex: 0 0 auto;
 }
 
+/* Toggle, bullet and task icon sit on the first line: the conversation's body line box. */
 .toggle {
 	flex: 0 0 20px;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -128,7 +129,7 @@
 
 .bullet {
 	flex: 0 0 16px;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -150,7 +151,7 @@
 
 .taskIcon {
 	flex: 0 0 auto;
-	height: 24px;
+	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
 }
@@ -159,8 +160,9 @@
 	flex: 1 1 auto;
 	min-width: 0;
 	overflow-wrap: anywhere;
-	line-height: 24px;
-	font-size: var(--mantine-font-size-sm);
+	/* The conversation's body text; the body inside carries `.nf-type-scope` (OutlineBlockBody). */
+	line-height: var(--nf-type-body-line);
+	font-size: var(--nf-type-body-size);
 }
 
 .content[data-done="true"] {
@@ -198,7 +200,7 @@
 }
 
 .more {
-	font-size: var(--mantine-font-size-xs);
+	font-size: var(--nf-type-xs-size);
 	color: var(--mantine-color-dimmed);
 	text-decoration: none;
 }
