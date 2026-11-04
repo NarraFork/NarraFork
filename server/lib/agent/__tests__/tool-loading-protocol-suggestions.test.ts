@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { settings } from "../../settings";
 import { suggestToolAppendingProtocols } from "../index";
-import { switchableModelProtocols } from "../provider";
+import { switchableModelProtocols } from "../switchable-protocols";
 
 const saved = {
 	openaiProviders: settings.openaiProviders,

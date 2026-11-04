@@ -10,9 +10,9 @@ import {
 	type GenerateOptions,
 	type ProviderResolution,
 	resolveProviderAndModel,
-	switchableModelProtocols,
 } from "./provider";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
+import { switchableModelProtocols } from "./switchable-protocols";
 import {
 	protocolsWithToolAppending,
 	resolveAdapterToolLoadingStrategy,
