@@ -20,6 +20,7 @@ import {
 	SecretStoreError,
 	writeSecretJSON,
 } from "./secret-store";
+import type { ProxyOverride } from "./settings/types";
 
 export const PROVIDER_KEYS_FILE = "provider-keys.json";
 
@@ -56,6 +57,30 @@ function normalize(raw: unknown): ProviderKey | null {
 		...(k.disabled && k.disabledReason ? { disabledReason: k.disabledReason } : {}),
 		...(k.network && typeof k.network === "object" ? { network: k.network } : {}),
 		createdAt: Number.isFinite(k.createdAt) ? Number(k.createdAt) : Date.now(),
+	};
+}
+
+/** A connection config that speaks for one key: its secret, and its own network identity. */
+export function withProviderKey<
+	T extends {
+		apiKey: string;
+		proxy?: ProxyOverride;
+		userAgentMode?: string;
+		customUserAgent?: string;
+		extraHeaders?: Record<string, string>;
+	},
+>(config: T, key: { apiKey: string; network?: CredentialNetwork }): T {
+	const network = key.network;
+	return {
+		...config,
+		apiKey: key.apiKey,
+		...(network?.proxy && network.proxy.mode !== "default" ? { proxy: network.proxy } : {}),
+		...(network?.userAgentMode
+			? { userAgentMode: network.userAgentMode, customUserAgent: network.customUserAgent }
+			: {}),
+		...(network?.extraHeaders
+			? { extraHeaders: { ...config.extraHeaders, ...network.extraHeaders } }
+			: {}),
 	};
 }
 

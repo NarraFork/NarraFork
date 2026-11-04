@@ -17,10 +17,12 @@
  * A request moves to the next key only when the key was at fault and nothing has been
  * streamed yet; after output has started, the error goes to the caller as before.
  */
-import type { CredentialNetwork } from "@shared/credential-network";
 import { logger } from "../logger";
+import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import { getProviderKeyStore, type ProviderKey } from "../provider-keys";
-import type { ProxyOverride } from "../settings/types";
+
+export { withProviderKey } from "../provider-keys";
+
 import { shouldTreatCodexStreamEventAsYielded } from "./codex-websocket";
 import { extractErrorMessage, isHardNonRetryableText } from "./error-handling";
 import type {
@@ -48,10 +50,18 @@ const cooldowns = new Map<string, Cooldown>();
 /** `${providerId}\0${session}` → key id. Insertion-ordered, trimmed to STICKY_LIMIT. */
 const sticky = new Map<string, string>();
 
-/** Current cooldown of a key, if any; for the key list. */
+/**
+ * Why a key is resting, if it is: a recent failure, or a usage window the quota cache
+ * has seen used up (until it resets). For selection and the key list.
+ */
 export function keyCooldown(keyId: string, now = Date.now()): Cooldown | undefined {
 	const cooldown = cooldowns.get(keyId);
-	return cooldown && cooldown.until > now ? cooldown : undefined;
+	const failed = cooldown && cooldown.until > now ? cooldown : undefined;
+	const exhausted = keyQuotaBlockedUntil(keyId, now);
+	if (exhausted !== undefined && exhausted > (failed?.until ?? 0)) {
+		return { until: exhausted, reason: "quota" };
+	}
+	return failed;
 }
 
 export function clearKeyCooldown(keyId: string): void {
@@ -80,7 +90,7 @@ export function selectProviderKey(
 		ready.find((key) => key.id === pinned) ??
 		ready[0] ??
 		[...keys].sort(
-			(a, b) => (cooldowns.get(a.id)?.until ?? 0) - (cooldowns.get(b.id)?.until ?? 0),
+			(a, b) => (keyCooldown(a.id, now)?.until ?? 0) - (keyCooldown(b.id, now)?.until ?? 0),
 		)[0];
 	if (stickyKey && chosen) {
 		sticky.delete(stickyKey);
@@ -150,30 +160,6 @@ export function reportKeyFault(key: ProviderKey, err: unknown, now = Date.now())
 		});
 	}
 	return true;
-}
-
-/** A connection config that speaks for one key: its secret, and its own network identity. */
-export function withProviderKey<
-	T extends {
-		apiKey: string;
-		proxy?: ProxyOverride;
-		userAgentMode?: string;
-		customUserAgent?: string;
-		extraHeaders?: Record<string, string>;
-	},
->(config: T, key: { apiKey: string; network?: CredentialNetwork }): T {
-	const network = key.network;
-	return {
-		...config,
-		apiKey: key.apiKey,
-		...(network?.proxy && network.proxy.mode !== "default" ? { proxy: network.proxy } : {}),
-		...(network?.userAgentMode
-			? { userAgentMode: network.userAgentMode, customUserAgent: network.customUserAgent }
-			: {}),
-		...(network?.extraHeaders
-			? { extraHeaders: { ...config.extraHeaders, ...network.extraHeaders } }
-			: {}),
-	};
 }
 
 /**

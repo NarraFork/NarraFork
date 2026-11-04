@@ -5,6 +5,8 @@ import { logger } from "./logger";
 import { getNarraforkHome } from "./narrafork-home";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
+import { registerKeyQuotaProbe } from "./provider-key-quota";
+import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 /**
@@ -377,25 +379,25 @@ function setKimiCachedUsage(providerId: string, cache: KimiUsageCache): void {
 
 // ---------------------------------------------------------------------------
 // Public API
+//
+// Entries are per key (see provider-key-subjects.ts): a provider with several keys has
+// one entry each, and a migrated first key keeps the provider's id, so older cache
+// files still line up. Provider-level reads report the provider's first usable key.
 // ---------------------------------------------------------------------------
 
-/**
- * Refresh a single provider's usage cache. No-op for non-Kimi providers.
- *
- * Concurrent calls for the same provider share ONE upstream request (see
- * `refreshInFlightByProvider`); they all resolve with that request's result.
- */
-export function refreshKimiUsage(providerId: string): Promise<KimiUsageCache | null> {
-	const inFlight = refreshInFlightByProvider.get(providerId);
+const kimiSubjects = () => usageSubjects(isKimiCustomApiProvider);
+
+function refreshSubject(subject: UsageSubject): Promise<KimiUsageCache | null> {
+	const id = subject.id;
+	const inFlight = refreshInFlightByProvider.get(id);
 	if (inFlight) return inFlight;
-	const config = (settings.customApiProviders ?? []).find((p) => p.id === providerId);
-	if (!config || !isKimiCustomApiProvider(config) || !config.apiKey) return Promise.resolve(null);
+	const config = subject.config;
 	const run = (async (): Promise<KimiUsageCache | null> => {
-		const existing = cachedUsageByProvider.get(providerId);
+		const existing = cachedUsageByProvider.get(id);
 		try {
 			const payload = await fetchKimiUsage(config);
 			const cache: KimiUsageCache = { ...payload, fetchedAt: Date.now(), error: null };
-			setKimiCachedUsage(providerId, cache);
+			setKimiCachedUsage(id, cache);
 			return cache;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -404,7 +406,7 @@ export function refreshKimiUsage(providerId: string): Promise<KimiUsageCache | n
 			// `fetchedAt` advances too when there was no previous entry, so a provider
 			// that fails every time is not treated as permanently stale — otherwise the
 			// staleness check would re-fetch it on every single request.
-			setKimiCachedUsage(providerId, {
+			setKimiCachedUsage(id, {
 				fiveHour: existing?.fiveHour ?? null,
 				weekly: existing?.weekly ?? null,
 				monthly: existing?.monthly ?? null,
@@ -413,55 +415,112 @@ export function refreshKimiUsage(providerId: string): Promise<KimiUsageCache | n
 				error: message,
 			});
 			logger.debug("Kimi usage refresh failed", { provider: config.name, error: message });
-			return cachedUsageByProvider.get(providerId) ?? null;
+			return cachedUsageByProvider.get(id) ?? null;
 		} finally {
 			// Cleared in `finally` so a thrown/rejected refresh cannot wedge the slot
 			// shut and block every later attempt.
-			refreshInFlightByProvider.delete(providerId);
+			refreshInFlightByProvider.delete(id);
 		}
 	})();
-	refreshInFlightByProvider.set(providerId, run);
+	refreshInFlightByProvider.set(id, run);
 	return run;
 }
 
-/** Refresh usage for every configured Kimi provider. */
-export async function refreshAllKimiUsages(): Promise<void> {
-	const providers = (settings.customApiProviders ?? []).filter(
-		(p) => isKimiCustomApiProvider(p) && p.apiKey,
-	);
-	await Promise.allSettled(providers.map((p) => refreshKimiUsage(p.id)));
+/**
+ * Refresh the usage a provider reports (its first usable key). No-op for non-Kimi
+ * providers. Concurrent calls for the same key share ONE upstream request.
+ */
+export function refreshKimiUsage(providerId: string): Promise<KimiUsageCache | null> {
+	const subjects = kimiSubjects();
+	const subject = subjects.find((s) => s.id === shownSubjectId(subjects, providerId));
+	return subject ? refreshSubject(subject) : Promise.resolve(null);
 }
 
-/** Refresh providers whose cache is missing or older than maxAgeMs. */
+/** Refresh one key's usage (key list). */
+export function refreshKimiKeyUsage(keyId: string): Promise<KimiUsageCache | null> {
+	const subject = kimiSubjects().find((s) => s.id === keyId);
+	return subject ? refreshSubject(subject) : Promise.resolve(null);
+}
+
+/** Refresh usage for every key of every configured Kimi provider. */
+export async function refreshAllKimiUsages(): Promise<void> {
+	await Promise.allSettled(kimiSubjects().map(refreshSubject));
+}
+
+/** Refresh keys whose cache is missing or older than maxAgeMs. */
 export async function refreshStaleKimiUsages(maxAgeMs: number): Promise<void> {
 	const now = Date.now();
-	const providers = (settings.customApiProviders ?? []).filter(
-		(p) => isKimiCustomApiProvider(p) && p.apiKey,
-	);
 	await Promise.allSettled(
-		providers
-			.filter((p) => now - (cachedUsageByProvider.get(p.id)?.fetchedAt ?? 0) > maxAgeMs)
-			.map((p) => refreshKimiUsage(p.id)),
+		kimiSubjects()
+			.filter((s) => now - (cachedUsageByProvider.get(s.id)?.fetchedAt ?? 0) > maxAgeMs)
+			.map(refreshSubject),
 	);
 }
 
+/** The usage a provider reports: that of its first usable key. */
 export function getKimiCachedUsage(providerId: string): KimiUsageCache | undefined {
-	return cachedUsageByProvider.get(providerId);
+	const id = shownSubjectId(kimiSubjects(), providerId);
+	return id ? cachedUsageByProvider.get(id) : undefined;
 }
 
+/** Provider id → the usage it reports (status bar). */
 export function getAllKimiCachedUsages(): Record<string, KimiUsageCache> {
 	const result: Record<string, KimiUsageCache> = {};
-	for (const [providerId, cache] of cachedUsageByProvider) {
-		result[providerId] = cache;
+	const subjects = kimiSubjects();
+	for (const providerId of new Set(subjects.map((s) => s.providerId))) {
+		const id = shownSubjectId(subjects, providerId);
+		const cache = id ? cachedUsageByProvider.get(id) : undefined;
+		if (cache) result[providerId] = cache;
 	}
 	return result;
 }
 
-/** Drop cached usage for providers that were removed or changed identity. */
-export function purgeKimiUsageCache(removedIds: string[]): void {
+/** Key id → its usage (key list). */
+export function getKimiKeyUsages(): Record<string, KimiUsageCache> {
+	const result: Record<string, KimiUsageCache> = {};
+	for (const subject of kimiSubjects()) {
+		const cache = cachedUsageByProvider.get(subject.id);
+		if (cache) result[subject.id] = cache;
+	}
+	return result;
+}
+
+/**
+ * Drop cached usage of the given providers' keys (removed or changed identity), and
+ * of keys that no longer exist.
+ */
+export function purgeKimiUsageCache(providerIds: string[]): void {
+	const purge = new Set(providerIds);
+	const live = new Map(kimiSubjects().map((s) => [s.id, s.providerId]));
 	let changed = false;
-	for (const id of removedIds) {
-		if (cachedUsageByProvider.delete(id)) changed = true;
+	for (const id of [...cachedUsageByProvider.keys()]) {
+		const providerId = live.get(id);
+		if (providerId === undefined || purge.has(providerId) || purge.has(id)) {
+			cachedUsageByProvider.delete(id);
+			changed = true;
+		}
 	}
 	if (changed) scheduleSaveAllCachedUsages();
 }
+
+function exhaustedUntil(window: KimiUsageWindow | null, now: number): number | undefined {
+	if (!window?.resetTime) return undefined;
+	const usedUp =
+		window.remaining === 0 ||
+		(window.limit != null &&
+			window.used != null &&
+			window.limit > 0 &&
+			window.used >= window.limit);
+	const reset = Date.parse(window.resetTime);
+	return usedUp && Number.isFinite(reset) && reset > now ? reset : undefined;
+}
+
+// The key pool skips a key whose window this cache has seen used up, until it resets.
+registerKeyQuotaProbe((keyId, now) => {
+	const cache = cachedUsageByProvider.get(keyId);
+	if (!cache) return undefined;
+	const until = [cache.fiveHour, cache.weekly, cache.monthly, ...cache.extraWindows]
+		.map((window) => exhaustedUntil(window, now))
+		.filter((value): value is number => value !== undefined);
+	return until.length ? Math.max(...until) : undefined;
+});
