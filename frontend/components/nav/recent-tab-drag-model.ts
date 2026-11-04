@@ -7,15 +7,17 @@
  */
 
 import {
+	applyRecentTabFolderCreate,
 	applyRecentTabMove,
 	canJoinFolder,
-	dropEmptyFolder,
-	type FolderDisplay,
-	groupRecentTabRows,
 	isFolderTab,
-	type RecentTabRow,
 	recentTabKey,
 	regroupFolders,
+} from "@shared/recent-tab-layout";
+import {
+	type FolderDisplay,
+	groupRecentTabRows,
+	type RecentTabRow,
 } from "../../hooks/recent-tab-folders";
 import type { RecentTab } from "../../hooks/recent-tabs-utils";
 import type { RecentTabMoveTarget } from "../../lib/api/settings";
@@ -231,25 +233,12 @@ function applyRecentTabMerge(
 	sourceKey: string,
 	title: string,
 ): RecentTab[] | null {
-	const target = tabs.find((tab) => recentTabKey(tab) === targetKey);
-	const source = tabs.find((tab) => recentTabKey(tab) === sourceKey);
-	if (!target || !source || target.folderId) return null;
-	const remaining = tabs.filter((tab) => tab !== source);
-	const index = remaining.indexOf(target);
-	const folder: RecentTab = {
+	return applyRecentTabFolderCreate(tabs, targetKey, sourceKey, {
 		type: "folder",
 		id: PENDING_FOLDER_ID,
 		title,
 		lastVisitedAt: Date.now(),
-		...(target.pinned ? { pinned: true } : {}),
-	};
-	const member = (tab: RecentTab): RecentTab => ({
-		...tab,
-		folderId: PENDING_FOLDER_ID,
-		pinned: undefined,
 	});
-	remaining.splice(index, 1, folder, member(target), member(source));
-	return dropEmptyFolder(remaining, source.folderId);
 }
 
 function sameOrder(left: RecentTab[], right: RecentTab[]): boolean {

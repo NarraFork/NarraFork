@@ -1,5 +1,14 @@
 import { Button } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import {
+	applyRecentTabFolderDissolve,
+	applyRecentTabMove,
+	applyRecentTabPin,
+	applyRecentTabRemove,
+	isFolderTab,
+	regroupFolders,
+	unitRange,
+} from "@shared/recent-tab-layout";
 import type {
 	PersistedRecentTab,
 	RecentTabsDelta as RecentTabsDeltaFrame,
@@ -24,15 +33,6 @@ import type {
 	RecentTabsPageResponse,
 } from "../lib/api/settings";
 import { queryClient as globalQC } from "../lib/query-client";
-import {
-	applyRecentTabFolderDissolve,
-	applyRecentTabMove,
-	applyRecentTabPin,
-	applyRecentTabRemove,
-	isFolderTab,
-	regroupFolders,
-	unitRange,
-} from "./recent-tab-folders";
 import type { AddRecentTabInput, RecentTab, SubagentRecentTabInput } from "./recent-tabs-utils";
 import {
 	buildRecentTabUpsert,
