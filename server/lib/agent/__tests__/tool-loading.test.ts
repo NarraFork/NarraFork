@@ -13,6 +13,7 @@ import {
 	formatRequestTools,
 	latestToolLoadingEpoch,
 	projectToolLoadingHistory,
+	protocolsWithToolAppending,
 	resolveLoadableToolDefinition,
 	resolveToolLoadingStrategy,
 	selectRequestTools,
@@ -1002,4 +1003,22 @@ test("newly available built-ins append declarations without becoming optional ex
 	);
 	expect(projected[0].contentText).toContain("<tool_definitions>");
 	expect(projected[0].contentText).toContain(TERMINAL.name);
+});
+
+describe("protocolsWithToolAppending", () => {
+	test("DeepSeek keeps the cache only on Anthropic Messages", () => {
+		expect(
+			protocolsWithToolAppending("opencode:deepseek-v4.1-flash", [
+				"anthropic-messages",
+				"openai-responses",
+				"completions-compatible",
+				"gemini-compatible",
+			]),
+		).toEqual(["anthropic-messages"]);
+	});
+	test("a model whose defaults inject on any protocol keeps every candidate", () => {
+		expect(
+			protocolsWithToolAppending("custom:glm-5.1", ["openai-responses", "gemini-compatible"]),
+		).toEqual(["openai-responses", "gemini-compatible"]);
+	});
 });

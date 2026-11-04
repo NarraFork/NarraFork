@@ -19,8 +19,9 @@
  *     for endpoints that do not validate tool names against the declared list.
  *
  * `replace_tools` remains readable for legacy callers; a persisted prefix epoch never
- * rewrites its declared array, including on targets without additive loading. Only
- * compact or a model change folds accumulated declarations into a new baseline.
+ * rewrites its declared array, including on targets without additive loading. Compact,
+ * a model/protocol/strategy change, or an explicit load the strategy cannot append
+ * (its notice carries `rebaseline`) folds accumulated declarations into a new baseline.
  *
  * An epoch that recorded its loaded set (`ToolLoadingEpoch`) fixes the array's share for
  * its whole length; a change that bypassed `/load` is reconciled into the history as a
@@ -40,7 +41,7 @@ import {
 	parseClaudeModel,
 } from "@shared/reasoning-effort-support";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../builtin-routines";
-import type { ModelProtocol } from "../settings/types";
+import { isModelProtocol, type ModelProtocol } from "../settings/types";
 import type { ProviderAdapter } from "./provider";
 import { effectiveModelProfile } from "./provider-model-metadata";
 import { resolveToolJsonSchema, toolRegistry } from "./tool-registry";
@@ -182,12 +183,32 @@ export function resolveAdapterToolLoadingStrategy(
 	adapter: Pick<ProviderAdapter, "toolLoadingTarget">,
 	model: string,
 ): ToolLoadingStrategy {
-	const target = adapter.toolLoadingTarget?.(model);
-	if (!target) return "replace_tools";
+	return resolveTargetToolLoadingStrategy(model, adapter.toolLoadingTarget?.(model));
+}
+
+/** The strategy for `model` (`prefix:id`) on an already resolved wire target. */
+export function resolveTargetToolLoadingStrategy(
+	model: string,
+	target: ToolLoadingTarget | undefined,
+): ToolLoadingStrategy {
 	return resolveToolLoadingStrategy(
 		parseModelId(model).model,
 		target,
 		effectiveModelProfile(model).toolLoadingModes,
+	);
+}
+
+/**
+ * The protocols among `candidates` on which `model` could load tools without rewriting
+ * the declared array, in the given order. Used to suggest a protocol switch when the
+ * current one can only rebuild the prefix.
+ */
+export function protocolsWithToolAppending(
+	model: string,
+	candidates: readonly ModelProtocol[],
+): ModelProtocol[] {
+	return candidates.filter(
+		(protocol) => resolveTargetToolLoadingStrategy(model, { protocol }) !== "replace_tools",
 	);
 }
 
@@ -294,6 +315,8 @@ export interface ToolLoadingEpoch {
 	prefixState?: object;
 	/** The request target the epoch opened for (`resolveEpochTarget`), when recorded. */
 	target?: string;
+	/** The wire protocol the epoch opened on; absent on epochs written before it was recorded. */
+	protocol?: ModelProtocol;
 }
 
 /**
@@ -325,9 +348,13 @@ export class ToolEpochError extends Error {
 }
 /** What an epoch marker records (§7.7); a compact element carries the same as `epoch`. */
 export interface EpochRecord {
-	/** cold/manual remain readable for legacy rows; new boundaries use initial/compact/target. */
-	reason: "initial" | "compact" | "target" | "cold" | "manual";
+	/**
+	 * cold/manual remain readable for legacy rows; new boundaries use initial/compact/target,
+	 * or tools when an explicit load needs a declaration the current strategy cannot append.
+	 */
+	reason: "initial" | "compact" | "target" | "tools" | "cold" | "manual";
 	target?: string;
+	protocol?: ModelProtocol;
 	toolNames: string[];
 	registryRevision?: string;
 	definitionSnapshots?: ToolDefinitionSnapshot[];
@@ -347,6 +374,7 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 	return {
 		reason: (typeof epoch.reason === "string" ? epoch.reason : "manual") as EpochRecord["reason"],
 		...(typeof epoch.target === "string" ? { target: epoch.target } : {}),
+		...(isModelProtocol(epoch.protocol) ? { protocol: epoch.protocol } : {}),
 		toolNames: epoch.toolNames.filter((name): name is string => typeof name === "string"),
 		...(typeof epoch.registryRevision === "string"
 			? { registryRevision: epoch.registryRevision }
@@ -385,6 +413,7 @@ export function latestToolLoadingEpoch(
 				baseToolNames: epoch.baseToolNames,
 				strategy: epoch.strategy,
 				...(epoch.target ? { target: epoch.target } : {}),
+				...(epoch.protocol ? { protocol: epoch.protocol } : {}),
 			};
 	}
 	return undefined;
@@ -422,6 +451,47 @@ function epochRows(messages: readonly DbMessage[], markerId: string | undefined)
 	if (!markerId) return messages;
 	const index = messages.findIndex((message) => message.id === markerId);
 	return index === -1 ? messages : messages.slice(index + 1);
+}
+
+/**
+ * Tools an explicit load (`/load`, ToolSearch) committed inside this epoch that its
+ * strategy could not append. Their notices carry `rebaseline: true`; the next request
+ * opens a new epoch that declares them. Only tools the new baseline would actually
+ * declare are returned, so a tool that cannot be declared never reopens epochs.
+ */
+export function undeclaredExplicitLoads(
+	messages: readonly DbMessage[],
+	managed: ReadonlySet<string>,
+	current: ReadonlySet<string>,
+	epoch: Pick<ToolLoadingEpoch, "markerId" | "baseToolNames" | "toolNames">,
+	candidates: readonly ToolDefinition[],
+): string[] {
+	const declared = new Set(epoch.baseToolNames ?? epoch.toolNames);
+	const declarable = new Set(
+		candidates
+			.filter((tool) => !managed.has(tool.name) || current.has(tool.name))
+			.map((tool) => tool.name),
+	);
+	return [...rebaselineRequests(messages, epoch.markerId)]
+		.filter((name) => !declared.has(name) && declarable.has(name))
+		.sort();
+}
+
+/** Tool names whose load notices inside this epoch asked for a new baseline. */
+export function rebaselineRequests(
+	messages: readonly DbMessage[],
+	markerId: string | undefined,
+): Set<string> {
+	const names = new Set<string>();
+	for (const message of epochRows(messages, markerId)) {
+		if (message.role !== "user" || message.parentToolUseId) continue;
+		const block = Array.isArray(message.contentJson) ? message.contentJson[0] : null;
+		if (!block || typeof block !== "object") continue;
+		const record = block as Record<string, unknown>;
+		if (record.type !== "tool_loaded" || record.rebaseline !== true) continue;
+		for (const name of eventToolNames(record)) names.add(name);
+	}
+	return names;
 }
 
 export function deriveToolLoadingState(
