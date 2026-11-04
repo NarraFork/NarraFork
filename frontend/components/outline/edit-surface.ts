@@ -31,7 +31,7 @@
  * editors and the map's stage.
  */
 import type { OutlineMapLayout } from "@shared/outline-api";
-import { onTypographyChange } from "@shared/pretext-layout/typography";
+import { getTypographyRevision, onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
 import { ensureTypographyCssVars } from "../../lib/typography-css-vars";
 import type { BlockMark, MentionResolver } from "./editor/chrome";
@@ -56,7 +56,10 @@ interface Pos {
 	y: number;
 }
 
-/** The map waits at most this long for the Worker's sizes of a page that just arrived. */
+/**
+ * The map waits at most this long for the Worker's sizes: of a page that just arrived, and after
+ * a change of typography (then it measures what is left itself).
+ */
 const PREWARM_HOLD_MS = 1500;
 /** Pages smaller than this are measured on the spot (faster than waiting for the Worker). */
 const PREWARM_HOLD_MIN_BLOCKS = 300;
@@ -238,14 +241,23 @@ export class EditSurface {
 			clearTimeout(typographyTimer);
 			typographyTimer = setTimeout(() => {
 				if (this.destroyed) return;
+				// Settled for THIS setting only: if it moves again before the Worker answers, the
+				// answer is for an old setting (`storeMeasured` drops it) and the next timer settles.
+				const revision = getTypographyRevision();
+				const settled = () => {
+					if (!this.destroyed && getTypographyRevision() === revision) {
+						this.map.typographySettled();
+					}
+				};
 				// Not shown yet: the first prewarm is still to come, under the new setting.
-				if (this.prewarmed === "none") return this.map.typographySettled();
+				if (this.prewarmed === "none") return settled();
 				// Then the map measures what it still holds from the old setting — from the cache
-				// the Worker just filled, rather than body by body on the main thread.
-				this.prewarm().then(
-					() => this.map.typographySettled(),
-					() => this.map.typographySettled(),
-				);
+				// the Worker just filled, rather than body by body on the main thread. A Worker that
+				// does not answer in time does not leave the map moving: it settles anyway.
+				Promise.race([
+					this.prewarm(),
+					new Promise<void>((resolve) => setTimeout(resolve, PREWARM_HOLD_MS)),
+				]).then(settled, settled);
 			}, TYPOGRAPHY_PREWARM_DELAY_MS);
 		});
 		this.offs.push(() => {

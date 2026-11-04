@@ -157,14 +157,29 @@ const LEADING_CLOSE = /^[，。、；：！？）」』】〉》〕〗〙〛”�
 const TRAILING_OPEN = /[（「『【〈《〔〖〘〚“‘([{]+$/u;
 
 /**
- * CJK closing punctuation right after a non-CJK character (`aborted；`, `continue」`, `abc）`).
- * pretext keeps such punctuation on its line only after CJK text; after a Latin word it breaks
- * before it, over a wide range of widths, where the browser never does — the node is then
- * measured a line short. A WORD JOINER (zero width, no break) between them makes pretext agree.
+ * A word that is not CJK, right before CJK closing punctuation (`aborted；`, `continue」`,
+ * `abc）`), with the CJK opening punctuation right before it (`「continue」`).
+ *
+ * pretext keeps closing punctuation on its line only after CJK text: after such a word it may
+ * break before it, where the browser never does, and the node is measured a line short. So the
+ * word and its punctuation go to pretext as an item of their own that never breaks
+ * ({@link keepWordsWithCjkClose}): nothing is added to the text, so the width is the drawn one
+ * at every letter spacing (a zero-width joiner would be counted as one more spaced grapheme).
+ *
+ * The word starts where a line may break before it, in the browser as in pretext: after a space,
+ * a CJK character, or a hyphen or dash (`fix/retry-after-interrupt）` keeps `interrupt）`).
  */
-const LATIN_BEFORE_CJK_CLOSE =
-	/([^\s\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef])(?=[，。、；：！？）」』】〉》〕〗〙〛])/gu;
-const WORD_JOINER = "\u2060";
+const WORD_BEFORE_CJK_CLOSE =
+	/[（「『【〈《〔〖〘〚]*[^\s\-‐–—\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef]+[，。、；：！？）」』】〉》〕〗〙〛]+/gu;
+/**
+ * The first word of a run, as far as a line may not break inside it: up to a space or a CJK
+ * character, or just past a hyphen or dash. See {@link keepLeadingWordsWhole}.
+ */
+const LEADING_WORD =
+	/^[^\s\-‐–—\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef]+[-‐–—]?/u;
+
+/** A chip's horizontal padding (inline code and mentions: 3 px a side). */
+const CHIP_PADDING = 6;
 
 /** A chip (inline code, a mention) that cannot break inside: one word, or never broken. */
 function unbreakable(item: RichInlineItem): boolean {
@@ -211,6 +226,108 @@ function keepPunctuationAttached(
 	}
 }
 
+/**
+ * Whether a run fits on one line of a node. A bound first (no glyph of a word is wider than
+ * 1.25 em, plus its letter spacing), so most words cost no measuring.
+ */
+function fitsOnALine(text: string, font: string, maxW: number): boolean {
+	const px = Number.parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? "0");
+	const spacing = Math.max(0, letterSpacingForFont(font));
+	if (px > 0 && [...text].length * (px * 1.25 + spacing) <= maxW) return true;
+	return runWidth(text, font) <= maxW;
+}
+
+/** A run cut out of `item` (the same font and spacing), and whether it may break inside. */
+function piece(item: RichInlineItem, text: string, never: boolean, extraWidth = 0): RichInlineItem {
+	const out: RichInlineItem = { ...item, text, extraWidth };
+	if (never) out.break = "never";
+	return out;
+}
+
+/**
+ * Each word before CJK closing punctuation becomes an item that never breaks (see
+ * {@link WORD_BEFORE_CJK_CLOSE}). Text runs only; a word wider than a line is left to wrap.
+ */
+function keepWordsWithCjkClose(
+	items: RichInlineItem[],
+	chips: ReadonlySet<RichInlineItem>,
+	maxW: number,
+): RichInlineItem[] {
+	const out: RichInlineItem[] = [];
+	for (const item of items) {
+		if (chips.has(item) || item.break === "never" || !item.text) {
+			out.push(item);
+			continue;
+		}
+		let from = 0;
+		for (const m of item.text.matchAll(WORD_BEFORE_CJK_CLOSE)) {
+			if (!fitsOnALine(m[0], item.font, maxW)) continue;
+			if (m.index > from) out.push(piece(item, item.text.slice(from, m.index), false));
+			out.push(piece(item, m[0], true));
+			from = m.index + m[0].length;
+		}
+		if (from === 0) out.push(item);
+		else if (from < item.text.length) out.push(piece(item, item.text.slice(from), false));
+	}
+	return out;
+}
+
+/**
+ * A run that starts right after another, with no space between them (`：` then `` `code` ``, a
+ * bold `Bun` after `使用`), keeps its first word whole.
+ *
+ * rich-inline wraps a run that does not fit before it — but only when a space separates the two
+ * runs. Without one it fills the line with the first letters of the word (`c` | `ode`), while
+ * the browser moves the whole word to the next line, and the node is measured a line short. So
+ * that word goes to pretext as an item that never breaks (the rest of the run stays as it was;
+ * a chip's padding goes one side to each, and any punctuation it carries to the rest). A word
+ * wider than a line is left.
+ */
+function keepLeadingWordsWhole(
+	items: RichInlineItem[],
+	chips: Set<RichInlineItem>,
+	maxW: number,
+): RichInlineItem[] {
+	const out: RichInlineItem[] = [];
+	let prev: RichInlineItem | undefined;
+	for (const item of items) {
+		if (!item.text) {
+			out.push(item);
+			continue;
+		}
+		const after = prev;
+		prev = item;
+		const word = LEADING_WORD.exec(item.text)?.[0];
+		if (
+			!after ||
+			/\s$/.test(after.text) ||
+			item.break === "never" ||
+			!word ||
+			[...word].length < 2 ||
+			!fitsOnALine(word, item.font, maxW)
+		) {
+			out.push(item);
+			continue;
+		}
+		if (word.length === item.text.length) {
+			item.break = "never";
+			out.push(item);
+			continue;
+		}
+		const chip = chips.has(item);
+		const extra = item.extraWidth ?? 0;
+		const side = chip ? CHIP_PADDING / 2 : 0;
+		const lead = piece(item, word, true, side);
+		const rest = piece(item, item.text.slice(word.length), false, extra - side);
+		if (chip) {
+			chips.add(lead);
+			chips.add(rest);
+		}
+		out.push(lead, rest);
+	}
+	return out;
+}
+
 function fontOf(marks: readonly { type: { name: string } }[], px: number, bold: boolean): string {
 	let weight = bold ? "700 " : "";
 	let style = "";
@@ -231,6 +348,7 @@ function inlineGroups(
 	body: PMNode,
 	px: number,
 	bold: boolean,
+	maxW: number,
 	labelOf: LabelOf,
 ): RichInlineItem[][] {
 	const groups: RichInlineItem[][] = [[]];
@@ -240,21 +358,20 @@ function inlineGroups(
 		if (n.type.name === "hard_break") groups.push([]);
 		else if (n.type.name === "mention") {
 			const label = labelOf(n.attrs.ref as string, n.attrs.label as string | null);
-			const chip = run(label, `${px}px ${MAP_FONT_FAMILY}`, 6, { break: "never" });
+			const chip = run(label, `${px}px ${MAP_FONT_FAMILY}`, CHIP_PADDING, { break: "never" });
 			chips.add(chip);
 			g.push(chip);
 		} else if (n.isText) {
 			const isCode = n.marks.some((m) => m.type.name === "code");
-			const item = run(n.text ?? "", fontOf(n.marks, px, bold), isCode ? 6 : 0);
+			const item = run(n.text ?? "", fontOf(n.marks, px, bold), isCode ? CHIP_PADDING : 0);
 			if (isCode) chips.add(item);
 			g.push(item);
 		}
 	});
-	for (const g of groups) {
+	return groups.map((g) => {
 		keepPunctuationAttached(g, chips);
-		for (const item of g) item.text = item.text.replace(LATIN_BEFORE_CJK_CLOSE, `$1${WORD_JOINER}`);
-	}
-	return groups;
+		return keepLeadingWordsWhole(keepWordsWithCjkClose(g, chips, maxW), chips, maxW);
+	});
 }
 
 function measureInline(
@@ -267,7 +384,7 @@ function measureInline(
 ): BodySize {
 	let lines = 0;
 	let width = 0;
-	for (const g of inlineGroups(body, px, bold, labelOf)) {
+	for (const g of inlineGroups(body, px, bold, maxW, labelOf)) {
 		const items = g.filter((x) => x.text.length > 0);
 		if (!items.length) {
 			lines += 1;

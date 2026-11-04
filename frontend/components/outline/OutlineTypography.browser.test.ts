@@ -229,7 +229,9 @@ test("a change of setting measures the page ahead again, so the next switch to t
 /**
  * Texts where the map's measurement and the browser's line breaking can part ways: punctuation
  * the browser keeps on a chip's line (closing after, opening before), a body that starts with a
- * chip, bold and italic runs next to punctuation, headings, a code block.
+ * chip, bold and italic runs next to punctuation, CJK closing punctuation right after a Latin
+ * word, a chip or a bold word right after punctuation or CJK with no space (the browser wraps it
+ * whole), headings, a code block.
  */
 const SWEEP_LINES = [
 	"根因：中断后 `status` 停在 `aborted`，重试按钮只在 `failed` 时显示",
@@ -242,7 +244,31 @@ const SWEEP_LINES = [
 	"### 三级标题：`code` 在标题里",
 	'```ts\nconst canRetry = status === "failed" || status === "aborted";\nreturn canRetry;\n```',
 	"背景：用户中断回合后，消息气泡上没有「重试」按钮，只能重新输入。Mixed English 与中文混排。",
+	"拉丁词后接分号 aborted；继续写 continue」再写 abc）以及 done。最后 end，结束。还要更多文字让它换行。",
+	"使用**Bunruntime**运行，见`fix/retry-after-interrupt`）与「continue」以及 v1.2）和 −7）。",
 ];
+
+test("a measuring Worker that never answers does not leave the map moving", async () => {
+	const { pageId } = await seedPage(h, "重试按钮排查", LINES);
+	const e = await openHost(h, "page", pageId, { width: 960, height: 760 });
+	await e.call((f) => f.prewarmDone());
+	// In the outline view the map measures nothing itself: the whole page goes to the Worker.
+	await e.call((f) => f.hangWorker());
+	await e.call((f, s) => f.applyTypography(s as never), { fontScalePercent: 115 });
+	expect(await e.call((f) => f.mapTypographyPending())).toBe(true);
+	// The setting rests (300 ms), the page goes to the Worker, and no answer comes: the map
+	// stops waiting after PREWARM_HOLD_MS (1.5 s), and measures what is left when shown.
+	await new Promise((r) => setTimeout(r, 300 + 1500 + 300));
+	expect(await e.call((f) => f.mapTypographyPending())).toBe(false);
+	await e.call((f) => f.setView("map"));
+	await settled(e);
+	await e.call((f) => f.mapFlush());
+	const acc = await e.call((f) => f.nodeAccuracy());
+	expect(acc.checked).toBeGreaterThan(0);
+	expect(acc.maxDiffH).toBeLessThanOrEqual(1);
+	expect(acc.overH).toBe(0);
+	expect(e.errors).toEqual([]);
+}, 60_000);
 
 test("every node is drawn at its measured height across font × letter spacing × line height", async () => {
 	const { pageId } = await seedPage(h, "排版扫描 sweep", SWEEP_LINES);
@@ -252,7 +278,7 @@ test("every node is drawn at its measured height across font × letter spacing �
 	const failures: string[] = [];
 	let checked = 0;
 	for (const fontScalePercent of [70, 100, 115, 130, 180]) {
-		for (const letterSpacingPercent of [-5, 0, 2, 10, 25]) {
+		for (const letterSpacingPercent of [-5, 0, 2, 5, 10, 15, 25]) {
 			for (const lineHeightScalePercent of [60, 100, 185]) {
 				const setting = { fontScalePercent, letterSpacingPercent, lineHeightScalePercent };
 				await e.call((f, s) => f.applyTypography(s as never), setting);
@@ -278,7 +304,7 @@ test("every node is drawn at its measured height across font × letter spacing �
 		}
 	}
 	// Every node of every setting was on screen and checked.
-	expect(checked).toBe(75 * (SWEEP_LINES.length + 1));
+	expect(checked).toBe(105 * (SWEEP_LINES.length + 1));
 	expect(failures).toEqual([]);
 	expect(e.errors).toEqual([]);
 }, 180_000);

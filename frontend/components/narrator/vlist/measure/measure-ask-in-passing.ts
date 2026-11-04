@@ -128,9 +128,10 @@ export const QUESTION_SLICE_LEN = 60;
 export const RESOLVED_CHROME_X =
 	RESOLVED_PADDING_X * 2 + RESOLVED_BORDER_LEFT + RESOLVED_ICON * 2 + RESOLVED_GROUP_GAP * 2; // 67
 
+/** Padding and label row around the question; keeps the next declaration on one line. */
+const RESOLVED_FRAME_Y = RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT; // 37
 /** Resolved minimum height (question fits on one line). ≈57px. */
-export const RESOLVED_MIN_HEIGHT =
-	RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT + SM_LINE_HEIGHT_BASELINE; // 57
+export const RESOLVED_MIN_HEIGHT = RESOLVED_FRAME_Y + SM_LINE_HEIGHT_BASELINE; // 57
 /** Resolved maximum height (question wraps to two lines). ≈77px. */
 export const RESOLVED_MAX_HEIGHT =
 	RESOLVED_PADDING_Y * 2 +

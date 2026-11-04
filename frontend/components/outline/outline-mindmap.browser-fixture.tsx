@@ -881,6 +881,32 @@ export function mapTypographySettled(): void {
 	surface().map.flush();
 }
 
+/** Whether the map still treats the typography as moving (off-screen sizes kept). */
+export function mapTypographyPending(): boolean {
+	return surface().map.typographyPending;
+}
+
+/** Drawn nodes whose layout slot is not their drawn height (a stale size: overlap or a gap). */
+export function mapSlotMismatches(): number {
+	const m = surface().map;
+	let mismatches = 0;
+	for (const [id, ne] of m.els) {
+		if (m.editing?.id === id || id.startsWith("\u0000")) continue;
+		const inf = m.info.get(id);
+		if (!inf) continue;
+		const drawn = ne.el.getBoundingClientRect().height / m.scale;
+		if (Math.abs(drawn - inf.node.h) > 1) mismatches++;
+	}
+	return mismatches;
+}
+
+/** A measuring Worker that takes requests and never answers (hung, or very slow). */
+export function hangWorker(): void {
+	setMeasureWorkerFactoryForTests(
+		() => ({ postMessage() {}, terminate() {} }) as unknown as Worker,
+	);
+}
+
 /** Set the reader's typography, as the 外观 panel's sliders do (the variables follow). */
 export function applyTypography(next: Partial<TypographySettings>): void {
 	setTypography(next);

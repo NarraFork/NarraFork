@@ -387,6 +387,11 @@ export class MindMapView {
 		this.schedule();
 	}
 
+	/** Whether the setting is still moving: nodes off screen keep sizes from an earlier one. */
+	get typographyPending(): boolean {
+		return this.typographyMoving;
+	}
+
 	get layoutDirty(): boolean {
 		return this.dirtyLayout;
 	}
@@ -705,11 +710,19 @@ export class MindMapView {
 				if (at) presence.set(at.blockId, peer.color);
 			}
 		}
-		for (const id of want) this.updateEl(id, presence.get(id));
+		// A node drawn for the first time while the setting moves (panned into view) may still have
+		// its size from an earlier setting: the next layout measures it, now that it is drawn.
+		const gen = this.typographyMoving ? getTypographyRevision() : -1;
+		let stale = false;
+		for (const id of want) {
+			if (gen >= 0 && !this.els.has(id) && (this.sizes.get(id)?.gen ?? gen) !== gen) stale = true;
+			this.updateEl(id, presence.get(id));
+		}
 		this.renderEdges();
 		this.stats.nodesInDom = this.els.size;
 		this.stats.renders.push(performance.now() - t0);
 		if (this.stats.renders.length > 5000) this.stats.renders.splice(0, 2500);
+		if (stale) this.schedule();
 	}
 
 	private updateEl(id: string, peer: string | undefined): void {

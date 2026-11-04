@@ -462,6 +462,17 @@ test("page: a typography slider drag over an open 800-block map measures only wh
 		expect(step.measured).toBeLessThanOrEqual(step.inDom + 1);
 		expect(step.measured).toBeLessThan(400);
 	}
+	// Panned while the setting still moves: the nodes that come into view have sizes from the
+	// earlier setting, and are measured again on the next frame (not drawn over their neighbours
+	// until the setting settles).
+	expect(await a.call((f) => f.mapTypographyPending())).toBe(true);
+	const stage = await a.page.$("[data-testid=outline-map]");
+	const box = await stage?.boundingBox();
+	if (box) await a.page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+	await a.page.mouse.wheel({ deltaY: 700 });
+	for (let i = 0; i < 3; i++) await a.call((f) => f.mapFlush());
+	expect(await a.call((f) => f.mapTypographyPending())).toBe(true);
+	expect(await a.call((f) => f.mapSlotMismatches())).toBe(0);
 	// Once the setting rests, the Worker measures the page, and the map lays out from its sizes.
 	await new Promise((r) => setTimeout(r, 400));
 	await a.call((f) => f.prewarmDone());
@@ -483,4 +494,39 @@ test("page: a typography slider drag over an open 800-block map measures only wh
 				},
 			}),
 		);
+}, 120_000);
+
+test("page: a setting that moves again while the Worker measures the last one keeps the map moving", async () => {
+	const { pageId } = await seedPage(h, "Typography race", bigLines(799, "R"));
+	const a = await openHost(h, "page", pageId, VIEWPORT);
+	await a.call((f) => f.prewarmDone());
+	await a.call((f) => f.setView("map"));
+	await settled(a);
+	await a.call((f) => f.mapFlush());
+	// A pause long enough for the setting to count as settled: the page goes to the Worker…
+	await a.call((f) => f.applyTypography({ lineHeightScalePercent: 110 }));
+	await a.call((f) => f.mapFlush());
+	await new Promise((r) => setTimeout(r, 340));
+	// …and the reader drags on before it answers.
+	const before = await a.call((f) => f.mapStats());
+	await a.call((f) => f.applyTypography({ lineHeightScalePercent: 115 }));
+	await a.call((f) => f.mapFlush());
+	// The answer is for the earlier setting: the map is not told it settled, so the next layout
+	// still measures only what is drawn, not all 800 nodes on the main thread.
+	await a.call((f) => f.prewarmDone());
+	await a.call((f) => f.mapFlush());
+	const after = await a.call((f) => f.mapStats());
+	const measured = after.measure.misses - before.measure.misses;
+	expect(measured).toBeLessThan(400);
+	// The latest setting settles in turn, from the Worker's sizes for it.
+	await new Promise((r) => setTimeout(r, 400));
+	await a.call((f) => f.prewarmDone());
+	await a.call((f) => f.mapFlush());
+	expect(await a.call((f) => f.mapTypographyPending())).toBe(false);
+	const accuracy = await a.call((f) => f.nodeAccuracy());
+	expect(accuracy.maxDiffH).toBeLessThanOrEqual(1);
+	expect(accuracy.overH).toBe(0);
+	expect(a.errors).toEqual([]);
+	if (LOG)
+		console.log(JSON.stringify({ item: "typography race", measuredAfterStaleAnswer: measured }));
 }, 120_000);

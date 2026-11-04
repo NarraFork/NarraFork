@@ -112,6 +112,49 @@ describe("mind-map node typography", () => {
 		);
 	});
 
+	it("adds nothing to a word kept with its CJK closing punctuation, at any letter spacing", async () => {
+		const { measureRichInlineStats, prepareRichInline } = await import(
+			"@chenglou/pretext/rich-inline"
+		);
+		// Short enough for one line: the node is exactly as wide as the text, with no extra
+		// spaced grapheme (a zero-width joiner before `；` was counted as one).
+		const text = "接 aborted；继续 abc）好";
+		for (const letterSpacingPercent of [-5, 25]) {
+			setTypography({ letterSpacingPercent });
+			const font = `${mapType().px}px ${MAP_FONT_FAMILY}`;
+			const letterSpacing = (mapType().px * letterSpacingPercent) / 100;
+			const plainWidth = measureRichInlineStats(
+				prepareRichInline([{ text, font, letterSpacing }]),
+				10_000,
+			).maxLineWidth;
+			expect(bodySize(text).w).toBeCloseTo(plainWidth, 5);
+		}
+	});
+
+	it("moves a chip right after punctuation to the next line whole, as the browser does", async () => {
+		const { measureRichInlineStats, prepareRichInline } = await import(
+			"@chenglou/pretext/rich-inline"
+		);
+		// The stub gives every character 0.6 em: 8.4 px in the 14 px body, 7.2 px in 12 px code.
+		// 28 characters (235.2 px) leave room for `cod` but not `code` on the first line.
+		const before = `${"中".repeat(27)}：`;
+		const after = ` ${"文".repeat(27)}`;
+		const t = mapType();
+		const sans = `${t.px}px ${MAP_FONT_FAMILY}`;
+		// rich-inline alone fills the first line with `cod`, and the rest fits on a second line…
+		const split = measureRichInlineStats(
+			prepareRichInline([
+				{ text: before, font: sans },
+				{ text: "code", font: t.codeFont, extraWidth: 6 },
+				{ text: after, font: sans },
+			]),
+			NODE.maxBody,
+		);
+		expect(split.lineCount).toBe(2);
+		// …while the browser wraps before `code`: the second line then overflows into a third.
+		expect(bodySize(`${before}\`code\`${after}`).h).toBe(3 * t.lineH);
+	});
+
 	it("keys the cache by the setting, and drops it when the setting changes", () => {
 		const key = measureKey("同一段文字", plain).key;
 		bodySize("同一段文字");
