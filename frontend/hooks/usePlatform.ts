@@ -414,7 +414,7 @@ const NARRATOR_PERMISSIONS_CAPABILITY: {
 	modes: ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"] as string[],
 	approveDeny: true,
 	updatedInput: true,
-	reflections: ["danger", "plan", "goal"] as string[],
+	reflections: ["danger", "plan", "question", "goal"] as string[],
 });
 
 export function useNarratorPermissionsCapability(): typeof NARRATOR_PERMISSIONS_CAPABILITY {

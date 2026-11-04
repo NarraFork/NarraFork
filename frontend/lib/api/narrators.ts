@@ -917,6 +917,7 @@ export const narratorsApi = {
 		relaxedPlan?: boolean;
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+		questionReflectionOverride?: "inherit" | "on" | "off";
 		autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 		behaviorFenceIntervalOverride?: number | null;
 		behaviorFenceAttachOverride?: "inherit" | "on" | "off";
@@ -1674,6 +1675,7 @@ export const narratorsApi = {
 		data: {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 			tasksReminderIntervalOverride?: number | null;
 		},

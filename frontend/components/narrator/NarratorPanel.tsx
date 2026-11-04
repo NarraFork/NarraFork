@@ -452,6 +452,7 @@ function NarratorPanelBody({
 	const permissionReflections = narratorPermissionsCapability.reflections;
 	const planReflectionSupported = permissionReflections.includes("plan");
 	const dangerReflectionSupported = permissionReflections.includes("danger");
+	const questionReflectionSupported = permissionReflections.includes("question");
 	const planModeCapability = useNarratorPlanModeCapability();
 	const planModeSupported = planModeCapability.supported;
 	const planModeUnsupportedReason = planModeSupported
@@ -559,6 +560,7 @@ function NarratorPanelBody({
 	);
 	const dangerReflectionGlobal = dangerReflectionGlobalLevel !== "off";
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
+	const questionReflectionGlobal = settingsData?.agent?.questionReflectionEnabled ?? false;
 	const reflectionSettingsDisabled =
 		!settingsData || updateSettingsMutation.isPending || reflectionOverridesMutation.isPending;
 	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
@@ -3749,11 +3751,14 @@ function NarratorPanelBody({
 							planModeUnsupportedReason,
 							planReflectionSupported,
 							dangerReflectionSupported,
+							questionReflectionSupported,
 							narratorPlanReflectionAutoApproveOverride: narrator.planReflectionAutoApproveOverride,
 							narratorDangerReflectionOverride: narrator.dangerReflectionOverride,
+							narratorQuestionReflectionOverride: narrator.questionReflectionOverride,
 							planReflectionAutoApproveGlobal,
 							dangerReflectionGlobal,
 							dangerReflectionGlobalLevel,
+							questionReflectionGlobal,
 							settingsLoaded: !!settingsData,
 							enterPlanModeMutation,
 							exitPlanModeMutation,
