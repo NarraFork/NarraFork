@@ -50,6 +50,11 @@
  */
 import { blockTitle } from "@shared/outline";
 import { OUTLINE_TASKS_CHANGED_EVENT } from "@shared/outline-task-board";
+import {
+	boundOutlineTaskNoticeItem,
+	type OutlineTaskNoticeChange,
+	type OutlineTaskNoticeItem,
+} from "@shared/outline-task-notice";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
@@ -486,12 +491,29 @@ async function noticeOf(
 		group.edits.push(entry.edit);
 		groups.set(key, group);
 	}
-	const content = getOutlineTaskEditNote(
-		[...groups.values()],
-		entries.length - shown.length + dropped,
-		locale,
+	const more = entries.length - shown.length + dropped;
+	const content = getOutlineTaskEditNote([...groups.values()], more, locale);
+	// The reader's copy of the same changes: each task with who changed it and what changed, so
+	// the transcript shows titled links and status chips (the model's text above is unchanged).
+	const items = [...groups.values()].flatMap((group) =>
+		group.edits.flatMap((edit): OutlineTaskNoticeItem[] => {
+			// The prompt's change type is this one, worded for the model.
+			const changes: OutlineTaskNoticeChange[] = edit.changes;
+			const item = boundOutlineTaskNoticeItem({
+				address: edit.address,
+				title: edit.title,
+				by: group.person,
+				...(edit.humanCreated ? { humanCreated: true } : {}),
+				...(edit.locked ? { locked: true } : {}),
+				changes,
+			});
+			return item ? [item] : [];
+		}),
 	);
-	return { content, body: { kind: "prose", text: content } };
+	return {
+		content,
+		body: { kind: "outlineTasks", variant: "edited", items, ...(more > 0 ? { more } : {}) },
+	};
 }
 
 /** Write the notice as a system row the session's next turn reads (no wake). */

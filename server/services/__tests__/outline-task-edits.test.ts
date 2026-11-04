@@ -246,7 +246,26 @@ describe("a person's changes to a session's tasks", () => {
 		expect(taken?.content).toStartWith("系统通知（不是用户发言）");
 		expect(taken?.content).toContain("Write the docs：改成取消");
 		expect(taken?.content).toContain("Tag the build：删除");
-		expect(taken?.body).toEqual({ kind: "prose", text: taken?.content ?? "" });
+		// The reader's copy of the same changes, structured: each task by address and title, who
+		// changed it and what changed (the transcript draws links and status chips from it).
+		expect(taken?.body).toEqual({
+			kind: "outlineTasks",
+			variant: "edited",
+			items: [
+				{
+					address: `${space.key}/${docs.sid}`,
+					title: "Write the docs",
+					by: expect.any(String),
+					changes: [{ kind: "status", from: "todo", to: "cancelled" }],
+				},
+				{
+					address: `${space.key}/${tag.sid}`,
+					title: "Tag the build",
+					by: expect.any(String),
+					changes: [{ kind: "deleted" }],
+				},
+			],
+		});
 		// Taken once.
 		expect(await takeOutlineTaskEditNotice(id, "en")).toBeNull();
 	});

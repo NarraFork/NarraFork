@@ -39,6 +39,7 @@ import {
 	type SideCarBody,
 	type SideCarInboundMessage,
 	sideCarBodyToMarkdown,
+	sideCarBodyToPlainText,
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
@@ -99,6 +100,11 @@ import {
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
+import {
+	type TaskNoticeData,
+	taskNoticeFromBody,
+	taskNoticeFromContextUpdate,
+} from "./task-notice";
 import { TEXT_PREVIEW_MAX_CHARS } from "./text-preview";
 import {
 	type ClassifyToolDetailInput,
@@ -2007,6 +2013,24 @@ function adaptMessage(
 		// An update of an outline session's views reads in the reader's words, not as the stored
 		// English notice naming internal keys (the row itself is unchanged).
 		const viewUpdate = outlineViewUpdateLine(blocks, ctx);
+		// One that changed the current-tasks view and carries its summary names the tasks: one
+		// line, the tasks as rows when unfolded. Older rows keep the line above.
+		const tasksUpdate = taskNoticeFromContextUpdate(blocks, viewUpdate, ctx.labels);
+		if (tasksUpdate) {
+			specs.push(
+				taskNoticeSpec(
+					`${elementKey(idBase, msg, blockIndex)}-sys`,
+					{
+						...tasksUpdate,
+						timeLabel: formatOriginNoticeTime(msg.createdAt),
+						origin: "system",
+						originLabel: "context_update",
+					},
+					ctx,
+				),
+			);
+			return specs;
+		}
 		specs.push(
 			adaptSystemBlock(
 				sysBlock.type,
@@ -3344,6 +3368,29 @@ function spokenSpeakerLabel(message: SideCarInboundMessage): string {
 	);
 }
 
+/**
+ * The `system-text` spec of a task notice. Its fold is the generic per-key expansion (the
+ * header toggles it): the measure pass reads `opts.expanded`, so the open and folded heights are
+ * separate cache entries. A notice with nothing more to show unfolded carries no opts at all.
+ */
+function taskNoticeSpec(
+	key: string,
+	data: Record<string, unknown>,
+	ctx: AdapterContext,
+): ElementSpec {
+	return {
+		kind: "system-text",
+		key,
+		data,
+		...(data.expandable === true ? { opts: { expanded: ctx.isExpanded?.(key) === true } } : {}),
+	};
+}
+
+/** Type guard for the task-notice data the adapter emits (`task-notice.ts`). */
+export function isTaskNoticeData(data: unknown): data is TaskNoticeData {
+	return (data as { kind?: unknown } | null)?.kind === "task_notice";
+}
+
 function adaptSystemBlock(
 	blockType: string,
 	block: AdapterContentBlock,
@@ -3488,11 +3535,10 @@ function adaptSystemBlock(
 		};
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
-		return {
-			kind: "system-text",
-			key: `${keyBase}-sys`,
-			data: adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt),
-		};
+		const data = adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt);
+		return data.kind === "task_notice"
+			? taskNoticeSpec(`${keyBase}-sys`, data, ctx)
+			: { kind: "system-text", key: `${keyBase}-sys`, data };
 	}
 	// fallback: treat as info text. `message` is checked first because that is
 	// where display notices keep their body (see the `info` case below).
@@ -3627,12 +3673,26 @@ function adaptSystemTextData(
 			// Native self-contained injections keep their model-facing projection on
 			// `modelText`; legacy rows may still provide a sibling `text` block.
 			const modelFacingText = block.modelText ?? block.text ?? contentText;
-			const markdown = body
-				? sideCarBodyToMarkdown(source, body, ctx.labels)
-				: rawSideCarToMarkdown(modelFacingText);
+			// A notice about the session's tasks (turn end, people's changes, the interrupt
+			// guard) is one line naming the tasks, with the tasks as rows when unfolded.
+			const tasks = body
+				? taskNoticeFromBody(source, body, injectionHeadingLabel(ctx, source), ctx.labels)
+				: null;
+			if (tasks) {
+				return {
+					...tasks,
+					timeLabel: formatOriginNoticeTime(createdAt),
+					origin: "system",
+					originLabel: source || null,
+					modelFacing: modelFacingText,
+				};
+			}
+			// The card paints its body as PLAIN text, so it gets the plain projection: the
+			// Markdown one showed its `######` and escapes, and a prose body twice.
+			const plain = body ? sideCarBodyToPlainText(source, body, ctx.labels) : "";
 			return {
 				kind: "origin_notice",
-				text: markdown || rawSideCarToMarkdown(modelFacingText),
+				text: plain || rawSideCarToMarkdown(modelFacingText),
 				title: injectionHeadingLabel(ctx, source),
 				timeLabel: formatOriginNoticeTime(createdAt),
 				origin: "system",
