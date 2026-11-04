@@ -57,6 +57,8 @@ export interface UsageHistoryStats extends ReferenceCostSummary, CacheHitRateSta
 	totalCost: number;
 	averageDurationMs: number;
 	averageTtftMs: number;
+	/** Σ output tokens / Σ decode seconds; null when no request timed its decode. */
+	outputTokensPerSecond: number | null;
 }
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";

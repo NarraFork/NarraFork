@@ -2088,6 +2088,7 @@ export const apiRequests = pgTable(
 		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
 		ttftMs: integer("ttft_ms"),
 		durationMs: integer("duration_ms"),
+		decodeMs: integer("decode_ms"),
 		costUsd: doublePrecision("cost_usd"),
 		costStatus: text("cost_status"),
 		costMissingFields: jsonText("cost_missing_fields"),
@@ -4181,7 +4182,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 135,
-  "columnCount": 1787,
+  "columnCount": 1788,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -15913,6 +15914,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "durationMs",
           "name": "duration_ms",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "decodeMs",
+          "name": "decode_ms",
           "kind": "integer",
           "pgType": "integer",
           "notNull": false,

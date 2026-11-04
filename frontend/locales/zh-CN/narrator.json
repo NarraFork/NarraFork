@@ -1914,6 +1914,7 @@
 	"details.stats.inputTokens": "总输入",
 	"details.stats.outputTokens": "总输出",
 	"details.stats.cacheReadTokens": "缓存读取",
+	"details.stats.outputSpeed": "平均输出速度",
 	"details.stats.usageHistoryIncludesSubagents": "来自使用历史 · 含子代理",
 	"details.stats.viewers": "查看者",
 	"details.stats.terminals": "终端",
@@ -2637,6 +2638,7 @@
 			"requestKind": "请求类型",
 			"ttft": "首 token 耗时",
 			"tokens": "输入 / 输出 tokens",
+			"outputSpeed": "输出速度",
 			"noItems": "这段时间没有对应的记录：通常是模型请求之间的调度、结果写入与上下文准备。",
 			"afterTurn": "该轮次已结束，子代理仍在运行。",
 			"merged": "由 {{count}} 个短片段合并而成，颜色取占比最大的类别："

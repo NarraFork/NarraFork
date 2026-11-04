@@ -1236,6 +1236,7 @@ async function recordReflectionApiRequestEnd(
 			credentialId: event.credentialId,
 			ttftMs: event.ttftMs ?? null,
 			durationMs: event.durationMs ?? null,
+			decodeMs: event.decodeMs ?? null,
 			contextPercent: event.contextPercent ?? null,
 			contextSnapshot: event.contextSnapshot,
 			meterUsage: event.meterUsage ?? null,
@@ -3963,6 +3964,12 @@ async function* agentLoopInMetadataSnapshot(
 			let requestId = "";
 			let requestStartTime = 0;
 			let requestTtftMs: number | undefined;
+			/**
+			 * When this attempt's first persistable content (text / reasoning / named tool
+			 * call / search / image) arrived. Unlike TTFT it ignores queue notices, so
+			 * `now - requestFirstContentAt` is pure decode time for output-speed figures.
+			 */
+			let requestFirstContentAt: number | undefined;
 			let requestUsage:
 				| {
 						promptTokens?: number;
@@ -4181,6 +4188,9 @@ async function* agentLoopInMetadataSnapshot(
 						),
 					ttftMs: requestTtftMs,
 					durationMs: Date.now() - requestStartTime,
+					...(requestFirstContentAt !== undefined
+						? { decodeMs: Math.max(0, Date.now() - requestFirstContentAt) }
+						: {}),
 					contextPercent: requestContextPercent,
 					meterUsage: requestMeterUsage,
 					meterUnit: requestMeterUnit,
@@ -4637,6 +4647,7 @@ async function* agentLoopInMetadataSnapshot(
 				requestFinished = false;
 				requestStartPending = false;
 				requestTtftMs = undefined;
+				requestFirstContentAt = undefined;
 				requestUsage = undefined;
 				inputCharacters = null;
 				inputComposition = null;
@@ -5030,6 +5041,7 @@ async function* agentLoopInMetadataSnapshot(
 						// notice or an id-only toolUseChunk must register as contentless,
 						// otherwise "only bookkeeping arrived" cannot be detected.
 						if (!hasPersistableStreamContent(parsed)) contentlessEventCount++;
+						else requestFirstContentAt ??= Date.now();
 						// `stopReason` is the provider's own completion reason. It was
 						// previously read nowhere in this loop, which is why an empty turn
 						// could not distinguish "model stopped" from "nothing arrived".
