@@ -5031,6 +5031,13 @@ export const PretextExactMessageList = memo(
 					// An injection bubble speaks FOR somebody; its spec carries the verbatim
 					// model-facing copy (`modelFacing`) plus the speaker/source label, which the
 					// inspector shows so the reader can audit what the agent actually received.
+					// A task notice (a system card) carries the same copy: its rows are the reader's
+					// projection, the model got the text.
+					const taskNotice =
+						item.spec.kind === "system-text" &&
+						(item.spec.data as { kind?: unknown } | null)?.kind === "tasks_notice"
+							? (item.spec.data as { modelFacing?: unknown; title?: unknown })
+							: null;
 					const injectionData =
 						item.spec.kind === "injection-bubble"
 							? (item.spec.data as {
@@ -5038,7 +5045,9 @@ export const PretextExactMessageList = memo(
 									speaker?: unknown;
 									source?: unknown;
 								} | null)
-							: null;
+							: taskNotice
+								? { modelFacing: taskNotice.modelFacing, speaker: taskNotice.title }
+								: null;
 					const modelFacing =
 						typeof injectionData?.modelFacing === "string" ? injectionData.modelFacing : "";
 					const inspectContent =

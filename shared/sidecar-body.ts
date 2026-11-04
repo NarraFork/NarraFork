@@ -50,6 +50,7 @@
  */
 
 import { knowledgeExcerpt } from "./knowledge-excerpt";
+import { boundOutlineTaskNoticeItems, type OutlineTaskNoticeItem } from "./outline-task-notice";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Body payloads
@@ -200,7 +201,11 @@ export type SideCarBody =
 			 */
 			taskBackend?: "outline";
 			tasks?: SideCarTaskEntry[];
-			/** `tooMany` only: how many tasks tripped the threshold. */
+			/**
+			 * `tooMany`: how many tasks tripped the threshold. The interrupt guard's `current`: how
+			 * many open tasks its source listed when the guard names only some of them (reader-only;
+			 * a lower bound, the source's list may itself be a prefix).
+			 */
 			taskCount?: number;
 			/** `tooMany` only: the threshold that was exceeded. */
 			threshold?: number;
@@ -237,6 +242,19 @@ export type SideCarBody =
 			supplement?: string;
 			outcome: "answered" | "dismissed";
 			items: SideCarAsyncQuestionAnswer[];
+	  }
+	/**
+	 * A notice about the session's outline tasks, beside its model-facing text (which the producer
+	 * wrote and no template renders): `turnEnd`, a long turn ended with a task still in progress
+	 * (`outline_task_turn_end`); `edited`, people changed tasks of the session
+	 * (`outline_task_edit`). The reader sees the tasks as titled outline links with status chips.
+	 */
+	| {
+			kind: "outlineTasks";
+			variant: "turnEnd" | "edited";
+			items: OutlineTaskNoticeItem[];
+			/** Tasks (or changes) the notice counts without naming. */
+			more?: number;
 	  };
 
 /** Every `kind` value, for runtime validation of persisted JSON. */
@@ -249,6 +267,7 @@ const SIDECAR_BODY_KINDS = new Set([
 	"messages",
 	"specUpdates",
 	"asyncQuestionAnswers",
+	"outlineTasks",
 ]);
 
 /**
@@ -280,6 +299,18 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			return body.tasks === undefined || Array.isArray(body.tasks) ? body : undefined;
 		case "notice":
 			return body;
+		case "outlineTasks": {
+			if (!Array.isArray(body.items)) return undefined;
+			// Read back bounded: a row is rendered from this, so an oversized or malformed
+			// payload must not reach the measure pass.
+			const more = typeof body.more === "number" && body.more > 0 ? Math.floor(body.more) : 0;
+			return {
+				kind: "outlineTasks",
+				variant: body.variant === "edited" ? "edited" : "turnEnd",
+				items: boundOutlineTaskNoticeItems(body.items),
+				...(more > 0 ? { more } : {}),
+			};
+		}
 	}
 }
 
@@ -388,6 +419,10 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	specUpdatesHeading: "{n} spec file(s) updated by you",
 	// Behaviour fence.
 	proseFenceHeading: "Behaviour fence",
+	// Outline task notices (`outlineTasks`).
+	outlineTaskTurnEndHeading: "Still in progress — tick it done when it is",
+	outlineTaskEditedHeading: "{n} task(s) changed by people",
+	outlineTaskMore: "{n} more not listed",
 	// Generic.
 	empty: "(empty)",
 };
@@ -698,6 +733,24 @@ function projectSideCarBody(
 				lines,
 			};
 		}
+
+		case "outlineTasks": {
+			// The transcript draws these bodies as task rows (`pretext-layout/task-notice.ts`), and
+			// their model text is the producer's. What is left for this projection is a body that
+			// names no task: its heading, and how many it left out.
+			const lines: SideCarLine[] = body.more
+				? [{ kind: "meta", text: labelWith(labels, "outlineTaskMore", { n: body.more }) }]
+				: [];
+			return {
+				headline:
+					body.variant === "edited"
+						? labelWith(labels, "outlineTaskEditedHeading", {
+								n: body.items.length + (body.more ?? 0),
+							})
+						: label(labels, "outlineTaskTurnEndHeading"),
+				lines,
+			};
+		}
 	}
 }
 
@@ -881,6 +934,11 @@ export function renderSideCarBodyToText(
 			});
 			return `${tpl(templates, "asyncQuestionAnsweredHeading")}\n\n${blocks.join("\n\n")}`;
 		}
+
+		case "outlineTasks":
+			// Its model-facing text is written by its producer (the outline task prompts) and
+			// stored with the row; no template renders it.
+			return "";
 	}
 }
 
@@ -1004,6 +1062,76 @@ export function sideCarBodyToMarkdown(
 ): string {
 	const presentation = projectSideCarBody(source, body, labels);
 	return presentationToMarkdown(presentation);
+}
+
+/**
+ * Project a body to PLAIN text — the reader-facing form for a card that paints its body as
+ * pre-wrapped text (the `origin_notice` system card), not as Markdown.
+ *
+ * Such a card used to be handed {@link sideCarBodyToMarkdown}'s output, so the reader saw the
+ * Markdown itself: a `######` before the headline, a backslash before every escaped character,
+ * and — for prose, whose headline is a flattening of the same text — the sentence twice. This
+ * projection reads the same body and emits text only:
+ *
+ *   - no headline for prose other than the behaviour fence: it would repeat the body (the card's
+ *     own heading row already names the producer);
+ *   - no escapes and no heading markers; bullets as `• `;
+ *   - for the outline task notices, whose producers put backticks only around task addresses,
+ *     inline code spans without their backticks (an address reads as the address);
+ *   - a fenced block exactly as written: its lines, indentation and backticks untouched.
+ *
+ * Bounded like the Markdown projection (the same {@link SIDECAR_PROJECTION_MAX_LINES} lines).
+ */
+export function sideCarBodyToPlainText(
+	source: string,
+	body: SideCarBody,
+	labels?: SideCarLabels,
+): string {
+	const presentation = projectSideCarBody(source, body, labels);
+	const ticks = PLAIN_TICKLESS_SOURCES.has(source);
+	const out: string[] = [];
+	const headline =
+		body.kind === "prose" && source !== "behavior_fence" ? "" : presentation.headline.trim();
+	if (headline) out.push(headline);
+	let previous: SideCarLineKind | null = headline ? "heading" : null;
+	let fenced = false;
+	for (const line of presentation.lines) {
+		// Inside a fenced block (and on its fence lines) the text is code: kept as written.
+		const fence = line.kind !== "verbatim" && FENCE_LINE.test(line.text);
+		if (fenced || fence) {
+			out.push(line.text);
+			if (fence) fenced = !fenced;
+			previous = "text";
+			continue;
+		}
+		const text = line.kind === "verbatim" ? line.text : line.text.trim();
+		if (!text.trim()) continue;
+		// A headline or a heading stands apart from what follows; consecutive bullets and prose
+		// lines stay together, as the source wrote them.
+		if (previous === "heading" || line.kind === "heading") out.push("");
+		const shown = ticks && line.kind !== "verbatim" ? withoutCodeTicks(text) : text;
+		out.push(line.kind === "bullet" ? `• ${shown}` : shown);
+		previous = line.kind;
+	}
+	return out.join("\n").trim();
+}
+
+/**
+ * Sources whose prose uses inline code only around task addresses (`key/sid`): the outline task
+ * notices. Elsewhere a backtick may be part of what was written, so it is shown.
+ */
+const PLAIN_TICKLESS_SOURCES: ReadonlySet<string> = new Set([
+	"outline_task_turn_end",
+	"outline_task_edit",
+	"interrupt_task_guard",
+]);
+
+/** A line that opens or closes a fenced code block. */
+const FENCE_LINE = /^\s*(```|~~~)/;
+
+/** Inline code spans as their text: `` `key/sid` `` → `key/sid`. */
+function withoutCodeTicks(text: string): string {
+	return text.replace(/`([^`\n]+)`/g, "$1");
 }
 
 /**

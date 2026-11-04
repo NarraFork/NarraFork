@@ -385,4 +385,49 @@ describe("interrupt task guard", () => {
 		expect(await guardNoteCount(narratorId)).toBe(1);
 		closeNarrator(narratorId);
 	});
+
+	test("more open tasks than the note lists: the reader's body counts them, the model text does not change", async () => {
+		const narratorId = "interrupt-guard-many";
+		await insertIdleNarrator(narratorId);
+		const tasks = Array.from({ length: 10 }, (_, i) => ({ text: `Task ${i}`, status: "todo" }));
+		await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			`${JSON.stringify({ tasks }, null, "\t")}\n`,
+			{ actor: "agent", createdBy: "assistant" },
+		);
+		releaseChat = () => {};
+		const sendPromise = sendMessage(narratorId, "hello", undefined, "en", false, null, null);
+		await waitFor(() => providerCalls.length === 1);
+		interruptNarrator(narratorId);
+		releaseChat?.();
+		await sendPromise;
+		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
+
+		const messages = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const block = messages
+			.flatMap(
+				(message) =>
+					(typeof message.contentJson === "string"
+						? JSON.parse(message.contentJson)
+						: message.contentJson) as Array<{
+						type?: string;
+						source?: string;
+						modelText?: string;
+						body?: { tasks?: unknown[]; taskCount?: number };
+					}>,
+			)
+			.find(
+				(entry) => entry.type === "system_injection" && entry.source === "interrupt_task_guard",
+			);
+		expect(block?.body?.tasks).toHaveLength(8);
+		expect(block?.body?.taskCount).toBe(10);
+		// The model is told about the eight it lists, as before.
+		expect(block?.modelText).toContain("Task 7");
+		expect(block?.modelText).not.toContain("Task 8");
+		expect(block?.modelText).not.toContain("taskCount");
+		closeNarrator(narratorId);
+	});
 });
