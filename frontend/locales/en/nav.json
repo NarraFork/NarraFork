@@ -1,8 +1,6 @@
 {
 	"appName": "NarraFork",
-	"dashboard": "Dashboard",
 	"projects": "Projects",
-	"narrators": "Narrators",
 	"settings": "Settings",
 	"admin": "Admin",
 	"messages": "People",
@@ -20,7 +18,7 @@
 	"recentTabs": "Recent",
 	"clearAll": "Clear",
 	"clearProjects": "Clear projects",
-	"clearNarrators": "Clear idle narrators",
+	"clearNarrators": "Clear idle sessions",
 	"tabsCleared": "Cleared {{count}} tab(s)",
 	"tabClosed": "Tab closed",
 	"undo": "Undo",
