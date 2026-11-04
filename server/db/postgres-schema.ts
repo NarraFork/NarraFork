@@ -1451,6 +1451,10 @@ export const userRecentTabs = pgTable(
 		representedNarratorId: text("represented_narrator_id"),
 		parentNarratorId: text("parent_narrator_id"),
 		workspaceId: text("workspace_id"),
+		folderId: text("folder_id"),
+		folderIcon: text("folder_icon"),
+		folderColor: text("folder_color"),
+		folderPreviewCount: integer("folder_preview_count"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -1475,6 +1479,7 @@ export const userRecentTabs = pgTable(
 			table.workspaceId,
 			table.sortOrder,
 		),
+		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
 	],
@@ -1486,6 +1491,7 @@ export const userRecentTabsMeta = pgTable("user_recent_tabs_meta", {
 		.notNull()
 		.references((): PgColumn => users.id, { onDelete: "cascade" }),
 	revision: integer("revision").notNull().default(0),
+	foldersMigrated: boolean("folders_migrated").notNull().default(false),
 	migratedAt: text("migrated_at").notNull(),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
@@ -4225,7 +4231,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 136,
-  "columnCount": 1803,
+  "columnCount": 1808,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -12523,6 +12529,42 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "folderId",
+          "name": "folder_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "folderIcon",
+          "name": "folder_icon",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "folderColor",
+          "name": "folder_color",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "folderPreviewCount",
+          "name": "folder_preview_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "title",
           "name": "title",
           "kind": "text",
@@ -12648,6 +12690,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_user_recent_tabs_user_folder",
+          "columns": [
+            "userId",
+            "folderId",
+            "sortOrder"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_user_recent_tabs_narrator",
           "columns": [
             "representedNarratorId",
@@ -12701,6 +12752,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "foldersMigrated",
+          "name": "folders_migrated",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         },
         {
           "property": "migratedAt",

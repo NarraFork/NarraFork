@@ -1667,6 +1667,13 @@
       "when": 1793792470108,
       "tag": "0237_outline_questions",
       "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "6",
+      "when": 1793795131665,
+      "tag": "0238_recent_tab_folders",
+      "breakpoints": true
     }
   ]
 }

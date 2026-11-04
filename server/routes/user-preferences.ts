@@ -10,19 +10,22 @@ import { saveSettings, settings } from "../lib/settings";
 import {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
+	createRecentTabFolderSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
 	restoreRecentTabsSchema,
-	setRecentTabDirectoryOrderSchema,
 	specTabLayoutPatchSchema,
+	updateRecentTabFolderSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
 import {
 	clearRecentTabs,
+	createRecentTabFolder,
+	dissolveRecentTabFolder,
 	getRuntimePatches,
 	listLegacyTabs,
 	listPage,
@@ -30,7 +33,7 @@ import {
 	pinRecentTab,
 	removeRecentTab,
 	restoreRecentTabs,
-	setRecentTabDirectoryOrder,
+	updateRecentTabFolder,
 	upsertRecentTab,
 	upsertRecentTabsBatch,
 } from "../services/recent-tabs-service";
@@ -576,7 +579,7 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey }));
 });
 
-/** Atomically upsert a workspace header and its children with one revision. */
+/** Atomically upsert several tabs with one revision. */
 userPreferencesRoutes.post("/recent-tabs/batch", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = batchUpsertRecentTabsSchema.safeParse(await c.req.json());
@@ -629,16 +632,30 @@ userPreferencesRoutes.patch("/recent-tabs/pin", async (c) => {
 	return c.json(await pinRecentTab(userId, parsed.data.key, parsed.data.pinned));
 });
 
-/**
- * Member order inside one directory group. Separate from `/recent-tabs/move` because it
- * writes a different column with different semantics: move rewrites the flat recency
- * order (and has to expand workspace groups), this only records a hand-made arrangement.
- */
-userPreferencesRoutes.patch("/recent-tabs/dir-order", async (c) => {
+/** Create a folder from two top-level tabs (drag one onto the other). */
+userPreferencesRoutes.post("/recent-tabs/folders", async (c) => {
 	const userId = c.get("user").sub;
-	const parsed = setRecentTabDirectoryOrderSchema.safeParse(await c.req.json());
+	const parsed = createRecentTabFolderSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await setRecentTabDirectoryOrder(userId, parsed.data.keys));
+	return c.json(await createRecentTabFolder(userId, parsed.data));
+});
+
+/** Rename a folder, or change its icon, colour or preview count. */
+userPreferencesRoutes.patch("/recent-tabs/folders/:id", async (c) => {
+	const userId = c.get("user").sub;
+	const id = c.req.param("id");
+	if (!id || id.length > 50) throw new ValidationError("Invalid folder id");
+	const parsed = updateRecentTabFolderSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await updateRecentTabFolder(userId, id, parsed.data));
+});
+
+/** Remove a folder, keeping its members at its position. */
+userPreferencesRoutes.post("/recent-tabs/folders/:id/dissolve", async (c) => {
+	const userId = c.get("user").sub;
+	const id = c.req.param("id");
+	if (!id || id.length > 50) throw new ValidationError("Invalid folder id");
+	return c.json(await dissolveRecentTabFolder(userId, id));
 });
 
 // --- Graph viewport persistence (per-project) ---

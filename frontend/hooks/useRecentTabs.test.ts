@@ -261,12 +261,11 @@ describe("recent tab payload builders", () => {
 		});
 	});
 
-	test("preserves explicit updateOnly for workspace membership updates", () => {
+	test("preserves explicit updateOnly", () => {
 		const payload = buildRecentTabUpsert({
 			type: "chapter",
 			id: "chapter-1",
 			narratorId: "narrator-1",
-			workspaceId: "workspace-1",
 			title: "Chapter",
 			updateOnly: true,
 		});
@@ -274,7 +273,7 @@ describe("recent tab payload builders", () => {
 		expect(payload.updateOnly).toBeTrue();
 	});
 
-	test("submits workspace header and child bindings in one batch", async () => {
+	test("submits several tabs in one batch", async () => {
 		const original = api.upsertRecentTabsBatch;
 		const calls: Parameters<typeof api.upsertRecentTabsBatch>[0][] = [];
 		api.upsertRecentTabsBatch = async (tabs) => {
@@ -283,21 +282,15 @@ describe("recent tab payload builders", () => {
 		};
 		try {
 			await addRecentTabsBatch([
-				{ type: "workspace", id: "w1", title: "Workspace" },
-				{
-					type: "narrator",
-					id: "n1",
-					title: "",
-					workspaceId: "w1",
-					updateOnly: true,
-				},
+				{ type: "narrator", id: "n0", title: "First" },
+				{ type: "narrator", id: "n1", title: "", updateOnly: true },
 			]);
 		} finally {
 			api.upsertRecentTabsBatch = original;
 		}
 		expect(calls).toHaveLength(1);
 		expect(calls[0]).toHaveLength(2);
-		expect(calls[0][1]).toMatchObject({ workspaceId: "w1", updateOnly: true });
+		expect(calls[0][1]).toMatchObject({ id: "n1", updateOnly: true });
 	});
 });
 
@@ -403,6 +396,44 @@ function pageData(
 }
 
 describe("recent tabs delta reducer", () => {
+	test("a full window never cuts a folder in half", () => {
+		const qc = new QueryClient();
+		// 49 loose tabs, then a folder with two members: 52 rows, a full page plus two.
+		const loose = Array.from({ length: 49 }, (_, index) => ({
+			type: "narrator" as const,
+			id: `n${index}`,
+			title: `n${index}`,
+			lastVisitedAt: 1,
+		}));
+		const folderRows = [
+			{ type: "folder" as const, id: "f", title: "F", lastVisitedAt: 1 },
+			{ type: "narrator" as const, id: "m1", title: "m1", folderId: "f", lastVisitedAt: 1 },
+			{ type: "narrator" as const, id: "m2", title: "m2", folderId: "f", lastVisitedAt: 1 },
+		];
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData([...loose.slice(1), ...folderRows], 1, true),
+		);
+		// A new loose tab at the top pushes everything down by one.
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{
+					type: "upsert",
+					key: "narrator:n0",
+					tab: loose[0],
+					beforeKey: "narrator:n1",
+					afterKey: null,
+				},
+			],
+		});
+		const ids = qc
+			.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
+			?.pages.flatMap((page) => page.items.map((item) => item.id));
+		expect(ids?.slice(-3)).toEqual(["f", "m1", "m2"]);
+	});
+
 	test("applies one revision to loaded pages and ignores duplicate delivery", () => {
 		const qc = new QueryClient();
 		qc.setQueryData(
@@ -576,16 +607,16 @@ describe("recent tabs delta reducer", () => {
 		).toEqual(["c", "d", "a", "b"]);
 	});
 
-	test("does not move a workspace back to the top using its own child as an anchor", () => {
+	test("does not move a folder back to the top using its own member as an anchor", () => {
 		const qc = new QueryClient();
 		qc.setQueryData(
 			recentTabsSectionQueryKey("work"),
 			pageData(
 				[
-					{ type: "workspace", id: "w2", title: "W2", lastVisitedAt: 1 },
-					{ type: "narrator", id: "c2", title: "C2", workspaceId: "w2", lastVisitedAt: 1 },
-					{ type: "workspace", id: "w1", title: "W1", lastVisitedAt: 1 },
-					{ type: "narrator", id: "c1", title: "C1", workspaceId: "w1", lastVisitedAt: 1 },
+					{ type: "folder", id: "w2", title: "W2", lastVisitedAt: 1 },
+					{ type: "narrator", id: "c2", title: "C2", folderId: "w2", lastVisitedAt: 1 },
+					{ type: "folder", id: "w1", title: "W1", lastVisitedAt: 1 },
+					{ type: "narrator", id: "c1", title: "C1", folderId: "w1", lastVisitedAt: 1 },
 				],
 				1,
 			),
@@ -595,10 +626,10 @@ describe("recent tabs delta reducer", () => {
 			baseRevision: 1,
 			revision: 2,
 			operations: [
-				{ type: "move", key: "workspace:w1", beforeKey: "narrator:c1", afterKey: null },
+				{ type: "move", key: "folder:w1", beforeKey: "narrator:c1", afterKey: null },
 				{
 					type: "move",
-					key: "workspace:w2",
+					key: "folder:w2",
 					beforeKey: "narrator:c2",
 					afterKey: "narrator:c1",
 				},
@@ -1469,10 +1500,10 @@ describe("recent tabs optimistic clear", () => {
 		]);
 	});
 
-	test("keeps a pinned workspace group together", () => {
+	test("keeps folders whole, pinned or not", () => {
 		const tabs: RecentTab[] = [
-			tab({ id: "ws-1", type: "workspace", pinned: true }),
-			tab({ id: "child-1", workspaceId: "ws-1" }),
+			tab({ id: "ws-1", type: "folder" }),
+			tab({ id: "child-1", folderId: "ws-1" }),
 			tab({ id: "n-idle" }),
 		];
 

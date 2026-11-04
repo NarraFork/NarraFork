@@ -1,14 +1,9 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
-import {
-	directoryRowId,
-	groupRecentTabsByDirectory,
-	hasDirectorySubtitle,
-	type RecentTabRow,
-} from "@frontend/hooks/recent-tab-directory-groups";
+import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
+import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { Z } from "@frontend/lib/z-index";
 import {
-	ActionIcon,
 	Avatar,
 	Box,
 	Button,
@@ -25,20 +20,24 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type { RecentTabsDelta as RecentTabsDeltaFrame } from "@shared/recent-tabs";
+import {
+	RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
+	type RecentTabsDelta as RecentTabsDeltaFrame,
+} from "@shared/recent-tabs";
 import {
 	IconArchive,
 	IconArrowUp,
 	IconBrain,
+	IconChevronDown,
+	IconChevronRight,
 	IconClock,
-	IconColumns,
 	IconCopy,
 	IconFolder,
+	IconFolderOff,
 	IconFolderPlus,
 	IconPencil,
 	IconPin,
 	IconPinnedOff,
-	IconPlus,
 	IconRobot,
 	IconServer,
 	IconSubtask,
@@ -48,9 +47,17 @@ import {
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+	useCallback,
+	useContext,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
-import { useCollapsedTabDirectories } from "../../hooks/useCollapsedTabDirectories";
+import { useFolderDisplay } from "../../hooks/useFolderDisplay";
 import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
@@ -60,7 +67,6 @@ import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
 	addRecentTabOrThrow,
-	addRecentTabsBatch,
 	applyRecentTabsDeltaAndFollowUp,
 	applyRecentTabsRuntimePatches,
 	bumpRecentTabRuntimeVersions,
@@ -70,7 +76,9 @@ import {
 	pruneRecentTabsRuntimeVersions,
 	type RecentTab,
 	type RecentTabRuntimeVersions,
+	type RecentTabsInfiniteData,
 	type RecentTabViewer,
+	recentTabsSectionQueryKey,
 	reconcileRecentTabsRuntimePatches,
 	refreshRecentTabsLoadedWindow,
 	selectRecentTabsLiveWindow,
@@ -100,9 +108,19 @@ import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
-import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
-import type { RecentTabDropTarget } from "./recent-tab-drop-target";
+import { RecentTabFolderEditModal } from "./RecentTabFolderEditModal";
+import {
+	RecentTabFolderHeader,
+	type RecentTabFolderHeaderProps,
+	RecentTabFolderStrip,
+} from "./RecentTabFolderRows";
+import {
+	createRecentTabDragModel,
+	type FolderViewOptions,
+	planRecentTabDrop,
+} from "./recent-tab-drag-model";
+import type { RecentTabDropSource, RecentTabDropTarget } from "./recent-tab-drop-target";
 /*
  * Imported, NOT re-exported.
  *
@@ -113,16 +131,11 @@ import type { RecentTabDropTarget } from "./recent-tab-drop-target";
  * `invalidate … ("autoScrollAllowedForPointer" export is incompatible)` and a full page
  * reload. Importers must reach the logic module directly.
  */
-import {
-	clampSwipeTravel,
-	classifySwipeRelease,
-	isBackgroundWorkSilencedStatus,
-	isTabActive,
-	SWIPE_THRESHOLD,
-} from "./recent-tabs-logic";
+import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
+import { SwipeMenuHint, useRowSwipe } from "./useRowSwipe";
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 
@@ -380,9 +393,10 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			if (event.type === "status" && event.status === "working") {
 				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
 				if (tab && tab.status !== "working") {
-					const moveKey = tab.workspaceId ? `workspace:${tab.workspaceId}` : tabSortId(tab);
+					// A folder member is promoted inside its folder and the folder moves with it;
+					// the server resolves that from the member key.
 					api
-						.moveRecentTab(moveKey, { position: "above_idle" })
+						.moveRecentTab(tabSortId(tab), { position: "above_idle" })
 						.then((result) => applyRecentTabsDeltaAndFollowUp(qc, result))
 						.catch(() => {});
 				}
@@ -474,6 +488,9 @@ interface RecentTabListProps {
 /**
  * Renders a filtered subset of recent tabs with DnD, clear button, etc.
  * `filter="project"` shows project tabs; `filter="narrator"` shows narrator tabs.
+ *
+ * The narrator section also renders folders: a folder header, its visible members
+ * (collapsed = none, preview = first N, expanded = all) and a strip under an open folder.
  */
 export function RecentTabList({
 	filter,
@@ -482,7 +499,7 @@ export function RecentTabList({
 	excludeActiveNarratorId,
 }: RecentTabListProps) {
 	const recentTabs = useRecentTabs();
-	const { removeTab, moveTab, pinTab } = recentTabs;
+	const { removeTab, moveTab, pinTab, updateFolder, dissolveFolder } = recentTabs;
 	const sectionState = filter === "project" ? recentTabs.projects : recentTabs.work;
 	const tabs = sectionState.tabs;
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -492,12 +509,10 @@ export function RecentTabList({
 	const { t: tn } = useTranslation("narrator");
 	const requireSetup = useSetupWizardGuard();
 	const pendingKey = usePendingTabKey();
-	const { data: userPrefsForGrouping } = useUserPreferences();
-	const { isCollapsed: isDirectoryCollapsed, toggle: toggleDirectory } =
-		useCollapsedTabDirectories();
-	// Only the work section aggregates: project tabs have no working directory at all.
-	const groupingEnabled =
-		filter === "narrator" && userPrefsForGrouping?.recentTabsGroupMode === "directory";
+	const { data: userPrefs } = useUserPreferences();
+	const { displays: folderDisplays, setDisplay: setFolderDisplay } = useFolderDisplay();
+	/** Live preview count while a folder's strip is being dragged. */
+	const [previewDrag, setPreviewDrag] = useState<{ folderId: string; count: number } | null>(null);
 
 	// Stable refs for values used in callbacks — avoids putting `tabs`/`pathname`
 	// in useCallback deps which would invalidate React.memo on every WS update.
@@ -539,9 +554,8 @@ export function RecentTabList({
 	const [renaming, setRenaming] = useState(false);
 	const [archiveConfirmTab, setArchiveConfirmTab] = useState<{ id: string } | null>(null);
 	const archiveNarrator = useArchiveNarrator();
+	const [editFolder, setEditFolder] = useState<RecentTab | null>(null);
 
-	// Workspace "add narrator" modal state
-	const [wsCreateTarget, setWsCreateTarget] = useState<string | null>(null);
 	// Open the shell before resolving cwd; only a resolved target mounts the form body.
 	const [newNarratorTarget, setNewNarratorTarget] = useState<{
 		narratorId: string;
@@ -552,86 +566,74 @@ export function RecentTabList({
 	const newNarratorRequestRef = useRef(0);
 
 	const listBoxRef = useRef<HTMLDivElement | null>(null);
-	// Collapse is a user/view preference, never a temporary drag state.
-	const directoryCollapsedByPath = useMemo(() => {
-		const children = new Map<string, RecentTab[]>();
-		for (const tab of tabs) {
-			if (!tab.workspaceId) continue;
-			const group = children.get(tab.workspaceId) ?? [];
-			group.push(tab);
-			children.set(tab.workspaceId, group);
-		}
-		const rows = groupRecentTabsByDirectory(
-			tabs.filter((tab) => !tab.workspaceId && !tab.pinned),
-			children,
-		);
-		return new Map(
-			rows.flatMap((row) => {
-				if (row.kind !== "directory") return [];
-				const containsActive = row.children.some((child) => isTabActive(child, pathname));
-				const containsPending =
-					!!pendingKey && row.children.some((child) => tabSortId(child) === pendingKey);
-				return [
-					[row.path, isDirectoryCollapsed(row.path, { containsActive, containsPending })] as const,
-				];
-			}),
-		);
-	}, [tabs, pathname, pendingKey, isDirectoryCollapsed]);
 	const onReorderError = useCallback(() => {
 		notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
 	}, [t]);
+
+	/**
+	 * Which members each folder shows. In preview, the open page and the keyboard-nav
+	 * highlight stay visible even past the limit; a collapsed folder instead highlights its
+	 * header. A strip being dragged previews its new count live.
+	 */
+	const folderOptions = useMemo<FolderViewOptions>(
+		() => ({
+			displayOf: (folderId) => folderDisplays[folderId],
+			defaultPreview: RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
+			isForcedVisible: (member) =>
+				isTabActive(member, pathname) || (!!pendingKey && tabSortId(member) === pendingKey),
+		}),
+		[folderDisplays, pathname, pendingKey],
+	);
+	const effectiveFolderOptions = useMemo<FolderViewOptions>(
+		() =>
+			previewDrag
+				? {
+						...folderOptions,
+						displayOf: (folderId) =>
+							folderId === previewDrag.folderId ? "preview" : folderOptions.displayOf(folderId),
+						previewCountOf: (folderId) =>
+							folderId === previewDrag.folderId ? previewDrag.count : undefined,
+						// While resizing, the resized folder shows exactly N so the user sees what
+						// will be saved; other folders keep showing the open page.
+						isForcedVisible: (member) =>
+							member.folderId !== previewDrag.folderId && !!folderOptions.isForcedVisible?.(member),
+					}
+				: folderOptions,
+		[folderOptions, previewDrag],
+	);
+	const newFolderTitle = t("newFolderName");
 	const drag = useRecentTabsDrag({
 		tabs,
-		groupingEnabled,
-		directoryCollapsedByPath,
+		folderOptions: effectiveFolderOptions,
 		containerRef: listBoxRef,
 		qc,
 		onError: onReorderError,
+		newFolderTitle,
 	});
 	const dragInteraction = useMemo(
 		() => ({ pending: drag.pending, consumeClick: drag.consumeClick }),
 		[drag.pending, drag.consumeClick],
 	);
 
-	// Rendering, hit testing and persistence share the same visual units.
-	const { topLevel, childrenByWorkspace, pinnedItems, unpinnedItems, directoryRows } = drag.model;
+	// Rendering, hit testing and persistence share the same rows.
+	const { pinnedRows, unpinnedRows, folderViews } = drag.model;
+	const topLevelCount = pinnedRows.length + unpinnedRows.length;
 
-	/** Release all child tabs from a workspace and delete the workspace entity. */
-	const releaseWorkspace = useCallback(
-		async (wsId: string) => {
-			// Remove query cache first to prevent 404 errors on the workspace page
-			qc.removeQueries({ queryKey: ["workspace", wsId] });
-			const children = childrenByWorkspace.get(wsId) ?? [];
-			if (children.length > 0) {
-				await addRecentTabsBatch(
-					children.map((child) => ({
-						type: child.type,
-						id: child.id,
-						title: child.title,
-						workspaceId: null,
-						updateOnly: true,
-					})),
-				).catch(() => {});
-			}
-			await api.deleteWorkspace(wsId).catch(() => {});
-		},
-		[childrenByWorkspace, qc],
-	);
-
-	/** Remove a tab and navigate to dashboard if it was the active page. */
+	/**
+	 * Remove a tab (a folder takes its members with it) and leave the page if it was the
+	 * one being closed.
+	 */
 	const handleRemove = useCallback(
 		(type: RecentTab["type"], id: string) => {
-			const tab = tabsRef.current.find((t) => t.type === type && t.id === id);
-			if (tab && isTabActive(tab, pathnameRef.current)) {
-				navigate({ to: "/" });
-			}
-			if (type === "workspace") {
-				void releaseWorkspace(id).then(() => removeTab(type, id));
-				return;
-			}
+			const closesActive = tabsRef.current.some(
+				(t) =>
+					((t.type === type && t.id === id) || (type === "folder" && t.folderId === id)) &&
+					isTabActive(t, pathnameRef.current),
+			);
+			if (closesActive) navigate({ to: "/" });
 			removeTab(type, id);
 		},
-		[removeTab, navigate, releaseWorkspace],
+		[removeTab, navigate],
 	);
 
 	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
@@ -640,10 +642,14 @@ export function RecentTabList({
 		setCtxMenu({ x: e.clientX, y: e.clientY, tab });
 	}, []);
 
+	/** Touch: a left swipe opens the same menu at the release point. */
+	const handleSwipeMenu = useCallback((tab: RecentTab, x: number, y: number) => {
+		setCtxMenu({ x, y, tab });
+	}, []);
+
 	const handleMoveToTop = useCallback(() => {
 		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
-		moveTab(tabSortId(tab), { position: "top" });
+		moveTab(tabSortId(ctxMenu.tab), { position: "top" });
 		setCtxMenu(null);
 	}, [ctxMenu, moveTab]);
 
@@ -654,43 +660,61 @@ export function RecentTabList({
 		setCtxMenu(null);
 	}, [ctxMenu, pinTab]);
 
-	/**
-	 * Toggle pinned directly on a tab, for the swipe-left gesture.
-	 *
-	 * Separate from `handlePin` because that one reads the tab out of the context menu
-	 * state, and the swipe path never opens a menu — on touch it cannot: long-press fires
-	 * `contextmenu`, which the row swallows.
-	 *
-	 * Workspace CHILDREN are excluded. Pinning is a top-level ordering concept
-	 * (`pinnedItems` / `unpinnedItems` are top-level splits, and children render under
-	 * their header), so pinning a child would pull it out of its workspace group.
-	 */
-	const handleSwipePin = useCallback(
-		(tab: RecentTab) => {
-			if (tab.workspaceId) return;
-			pinTab(tabSortId(tab), !tab.pinned);
+	const handleLeaveFolder = useCallback(() => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		if (!tab.folderId) return;
+		const folder = tabsRef.current.find(
+			(candidate) => candidate.type === "folder" && candidate.id === tab.folderId,
+		);
+		// Land right after the folder, so the tab stays near where the user was looking —
+		// unless the folder is pinned: an unpinned tab must not sit inside the pinned block,
+		// so it goes to the top of the unpinned tabs instead.
+		moveTab(
+			tabSortId(tab),
+			folder?.pinned ? { folderId: null } : { afterKey: `folder:${tab.folderId}`, folderId: null },
+		);
+	}, [ctxMenu, moveTab]);
+
+	const handleEditFolder = useCallback(() => {
+		if (!ctxMenu) return;
+		setEditFolder(ctxMenu.tab);
+		setCtxMenu(null);
+	}, [ctxMenu]);
+
+	const handleDissolveFolder = useCallback(() => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		setFolderDisplay(tab.id, null);
+		void dissolveFolder(tab.id).catch(() => {});
+	}, [ctxMenu, dissolveFolder, setFolderDisplay]);
+
+	const toggleFolderCollapsed = useCallback(
+		(folder: RecentTab) => {
+			const current = folderDisplays[folder.id] ?? "preview";
+			setFolderDisplay(folder.id, current === "collapsed" ? null : "collapsed");
 		},
-		[pinTab],
+		[folderDisplays, setFolderDisplay],
 	);
+
+	const handleCtxFolderToggle = useCallback(() => {
+		if (!ctxMenu) return;
+		toggleFolderCollapsed(ctxMenu.tab);
+		setCtxMenu(null);
+	}, [ctxMenu, toggleFolderCollapsed]);
 
 	const handleCtxClose = useCallback(() => {
 		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
-		if (isTabActive(tab, pathnameRef.current)) {
-			navigate({ to: "/" });
-		}
-		if (tab.type === "workspace") {
-			void releaseWorkspace(tab.id).then(() => removeTab(tab.type, tab.id));
-		} else {
-			removeTab(tab.type, tab.id);
-		}
+		handleRemove(ctxMenu.tab.type, ctxMenu.tab.id);
 		setCtxMenu(null);
-	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
+	}, [ctxMenu, handleRemove]);
 
 	/**
 	 * Resolve the on-disk directory a tab points at: its narrator's cwd. Returns null
 	 * when the tab has no
-	 * directory (workspace, project) or the lookup fails.
+	 * directory (folder, project) or the lookup fails.
 	 */
 	const resolveTabDirectory = useCallback(
 		async (tabOrNarratorId: RecentTab | string): Promise<string | null> => {
@@ -769,7 +793,7 @@ export function RecentTabList({
 	const fsRevealCapability = useFsRevealCapability();
 	// Reveal runs on the server desktop. Explicit user opt-in also supports a local
 	// browser accessing that server through a domain or LAN IP; react to preference changes.
-	const canRevealFromThisBrowser = canRevealFromBrowser(userPrefsForGrouping?.treatAsLocalAccess);
+	const canRevealFromThisBrowser = canRevealFromBrowser(userPrefs?.treatAsLocalAccess);
 	const revealAvailable = fsRevealCapability.supported && canRevealFromThisBrowser;
 
 	const handleReveal = useCallback(async () => {
@@ -810,7 +834,7 @@ export function RecentTabList({
 		}
 	}, [ctxMenu, resolveTabDirectory, t]);
 
-	/** 在外部窗口打开该标签（叙述者/章节 → chat 面板窗口；workspace → 表面窗口；project → 主应用窗口） */
+	/** 在外部窗口打开该标签（叙述者 → chat 面板窗口；project → 主应用窗口） */
 	const handleOpenInWindow = useCallback(() => {
 		if (!ctxMenu) return;
 		const href = recentTabWindowHref(ctxMenu.tab);
@@ -868,55 +892,16 @@ export function RecentTabList({
 		setArchiveConfirmTab(null);
 	}, [archiveConfirmTab, archiveNarrator]);
 
-	const handleWsAddClick = useCallback(
-		(e: React.MouseEvent, wsId: string) => {
-			e.stopPropagation();
-			e.preventDefault();
-			if (!requireSetup()) return;
-			setWsCreateTarget(wsId);
-		},
-		[requireSetup],
-	);
-
-	const handleWsNarratorCreated = useCallback(
-		async (data: CreateNarratorResult) => {
-			if (!wsCreateTarget) return;
-			const wsId = wsCreateTarget;
-			setWsCreateTarget(null);
-			// Persist MEMBERSHIP first, then navigate.
-			//
-			// This used to write the recent-tab row and queue the panel in memory, which is
-			// how a sidebar child could end up with no panel anywhere: the row survived and
-			// the queued panel did not. The server now writes the panel row and its sidebar
-			// projection in one transaction, so there is no half-applied state to leave
-			// behind — and no need to add the tab from here at all.
-			try {
-				await api.addWorkspacePanel(wsId, { kind: "narrator", narratorId: data.id });
-			} catch {
-				// Nothing was persisted, so nothing has to be undone. Staying put (rather
-				// than opening a workspace that does not contain the narrator) is what keeps
-				// the sidebar and the surface in agreement.
-				notifications.show({ color: "red", message: t("workspaceAddPanelFailed") });
-				return;
-			}
-			void refreshRecentTabsLoadedWindow(qc).catch(() => {});
-			navigate({ to: `/narrators/workspace/${wsId}` });
-			onNavigate?.();
-		},
-		[wsCreateTarget, navigate, onNavigate, qc, t],
-	);
-
 	/**
 	 * The empty-section body, or null when there are tabs to render.
 	 *
 	 * Computed rather than returned early: the external-drop hook below must run on every
 	 * render (rules of hooks), and an EMPTY section is precisely a state that has to accept
 	 * a drop — a fresh install or a just-cleared sidebar is where dragging a narrator in is
-	 * most useful. Returning before the hook would have made those the only cases it never
-	 * armed for.
+	 * most useful.
 	 */
 	const emptyBody =
-		topLevel.length > 0 ? null : sectionState.isLoading ? (
+		topLevelCount > 0 ? null : sectionState.isLoading ? (
 			<Center py="xs">
 				<Loader size="xs" />
 			</Center>
@@ -931,41 +916,7 @@ export function RecentTabList({
 			</Stack>
 		) : null;
 
-	// The tab being dragged (may be a workspace header or a child).
-	const renderTabGroup = (items: RecentTab[], group: "pinned" | "unpinned") =>
-		items.map((tab, index) => {
-			if (tab.workspaceId) {
-				return (
-					<DraggableWorkspaceChildTab
-						key={tabSortId(tab)}
-						tab={tab}
-						active={isRowActive(tab)}
-						onRemove={handleRemove}
-						onNavigate={onNavigate}
-						onContextMenu={handleContextMenu}
-						onPrefetch={prefetchNarratorTab}
-					/>
-				);
-			}
-			return (
-				<DraggableTabItem
-					key={tabSortId(tab)}
-					tab={tab}
-					active={isRowActive(tab)}
-					onRemove={handleRemove}
-					onTogglePin={handleSwipePin}
-					onNavigate={onNavigate}
-					onContextMenu={handleContextMenu}
-					onPrefetch={prefetchNarratorTab}
-					connectTop={
-						firstTabConnected && index === 0 && (group === "pinned" || pinnedItems.length === 0)
-					}
-					onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
-				/>
-			);
-		});
-
-	/** Active/highlight state for a row, shared by both render paths. */
+	/** Active/highlight state for a row. */
 	const isRowActive = (tab: RecentTab) => {
 		const tabKey = `${tab.type}:${tab.id}`;
 		return pendingKey
@@ -975,15 +926,27 @@ export function RecentTabList({
 	};
 
 	/**
-	 * Directory-aggregated renderer for the unpinned group. Every unit is sortable:
-	 * plain tabs and directory members move individually (members only within their own
-	 * group — membership comes from the cwd, not the position), directory headers move
-	 * the whole group, and workspace headers move the whole workspace, whose children
-	 * stay static because a workspace is a structure the user built by hand.
+	 * Save a strip-dragged preview count. The live preview stays until the save settles:
+	 * clearing it first would show the old count for a frame (the optimistic write waits
+	 * on query cancellation), and on failure the rollback restores the old count anyway.
 	 */
-	const renderDirectoryRows = (rows: RecentTabRow[]) =>
+	const commitPreviewCount = useCallback(
+		(folder: RecentTab, count: number) => {
+			if (count === (folder.folderPreviewCount ?? RECENT_TAB_FOLDER_DEFAULT_PREVIEW)) {
+				setPreviewDrag(null);
+				return;
+			}
+			void updateFolder(folder.id, { previewCount: count })
+				.catch(() => {})
+				.finally(() => setPreviewDrag(null));
+		},
+		[updateFolder],
+	);
+
+	const renderRows = (rows: RecentTabRow[], group: "pinned" | "unpinned") =>
 		rows.map((row, index) => {
-			const connectTop = firstTabConnected && pinnedItems.length === 0 && index === 0;
+			const connectTop =
+				firstTabConnected && index === 0 && (group === "pinned" || pinnedRows.length === 0);
 			if (row.kind === "tab") {
 				return (
 					<DraggableTabItem
@@ -991,7 +954,7 @@ export function RecentTabList({
 						tab={row.tab}
 						active={isRowActive(row.tab)}
 						onRemove={handleRemove}
-						onTogglePin={handleSwipePin}
+						onSwipeMenu={handleSwipeMenu}
 						onNavigate={onNavigate}
 						onContextMenu={handleContextMenu}
 						onPrefetch={prefetchNarratorTab}
@@ -999,74 +962,81 @@ export function RecentTabList({
 					/>
 				);
 			}
-			if (row.kind === "workspace") {
-				return (
-					<React.Fragment key={tabSortId(row.tab)}>
+			const folder = row.tab;
+			// The model builds a view for every folder row it returns.
+			const view = folderViews.get(folder.id) as NonNullable<ReturnType<typeof folderViews.get>>;
+			const previewCount =
+				previewDrag?.folderId === folder.id
+					? previewDrag.count
+					: (folder.folderPreviewCount ?? RECENT_TAB_FOLDER_DEFAULT_PREVIEW);
+			return (
+				<div key={tabSortId(folder)} data-folder-unit={folder.id}>
+					<DraggableFolderHeader
+						folder={folder}
+						members={row.members}
+						hidden={view.hidden}
+						display={view.display}
+						active={view.hidden.some(isRowActive)}
+						onToggle={() => toggleFolderCollapsed(folder)}
+						onContextMenu={handleContextMenu}
+						onSwipeMenu={handleSwipeMenu}
+						t={t}
+					/>
+					{view.visible.map((member) => (
 						<DraggableTabItem
-							tab={row.tab}
-							active={isRowActive(row.tab)}
+							key={tabSortId(member)}
+							tab={member}
+							active={isRowActive(member)}
 							onRemove={handleRemove}
-							onTogglePin={handleSwipePin}
+							onSwipeMenu={handleSwipeMenu}
 							onNavigate={onNavigate}
 							onContextMenu={handleContextMenu}
 							onPrefetch={prefetchNarratorTab}
-							connectTop={connectTop}
-							onWsAddClick={handleWsAddClick}
+							indent
 						/>
-						{row.children.map((child) => (
-							<DraggableWorkspaceChildTab
-								key={tabSortId(child)}
-								tab={child}
-								active={isRowActive(child)}
-								onRemove={handleRemove}
-								onNavigate={onNavigate}
-								onContextMenu={handleContextMenu}
-								onPrefetch={prefetchNarratorTab}
-							/>
-						))}
-					</React.Fragment>
-				);
-			}
-			const containsActive = row.children.some((child) => isTabActive(child, pathname));
-			const containsPending =
-				!!pendingKey && row.children.some((child) => tabSortId(child) === pendingKey);
-			const collapsed = directoryCollapsedByPath.get(row.path) ?? true;
-			return (
-				<React.Fragment key={directoryRowId(row.path)}>
-					<DraggableDirectoryRow
-						path={row.path}
-						label={row.label}
-						tabs={row.children}
-						collapsed={collapsed}
-						active={collapsed && row.children.some(isRowActive)}
-						onToggle={(path) => toggleDirectory(path, { containsActive, containsPending })}
-						connectTop={connectTop}
-						t={t}
-					/>
-					{!collapsed &&
-						row.children.map((child) => (
-							<DraggableTabItem
-								key={tabSortId(child)}
-								tab={child}
-								active={isRowActive(child)}
-								onRemove={handleRemove}
-								onTogglePin={handleSwipePin}
-								onNavigate={onNavigate}
-								onContextMenu={handleContextMenu}
-								onPrefetch={prefetchNarratorTab}
-								hideSubtitle
-								indent
-							/>
-						))}
-				</React.Fragment>
+					))}
+					{view.display !== "collapsed" && row.members.length > 0 && (
+						<RecentTabFolderStrip
+							folder={folder}
+							members={row.members}
+							hidden={view.hidden}
+							display={view.display}
+							previewCount={previewCount}
+							onToggleExpanded={() =>
+								setFolderDisplay(folder.id, view.display === "expanded" ? null : "expanded")
+							}
+							onPreviewDrag={(count) =>
+								setPreviewDrag(count === null ? null : { folderId: folder.id, count })
+							}
+							onPreviewCommit={(count) => commitPreviewCount(folder, count)}
+							t={t}
+						/>
+					)}
+				</div>
 			);
 		});
 
 	// ── External drop: a narrator dragged in from the list page ────────────────
 	//
-	// Not part of the DndContexts above: their sortable ids come from the tabs that already
+	// Not part of the DndContext above: its draggable ids come from the tabs that already
 	// exist, so a narrator that is not a tab yet can never be an `active` item there. This
 	// rides the `panel-drag` singleton instead (see `useRecentTabExternalDrop`).
+
+	const externalSourceFor = useCallback(
+		(narratorId: string): RecentTabDropSource => {
+			const existing = drag.model.tabs.find(
+				(tab) => tab.type === "narrator" && tab.id === narratorId,
+			);
+			return {
+				key: `narrator:${narratorId}`,
+				kind: existing?.folderId ? "member" : "tab",
+				pinned: existing && !existing.folderId ? !!existing.pinned : false,
+				...(existing?.folderId ? { folderId: existing.folderId } : {}),
+				canNest: true,
+			};
+		},
+		[drag.model],
+	);
 
 	const handleExternalDrop = useCallback(
 		({
@@ -1078,98 +1048,92 @@ export function RecentTabList({
 			title: string;
 			target: RecentTabDropTarget;
 		}) => {
+			const key = `narrator:${narratorId}`;
 			const cached = findCachedNarratorSummary(qc, narratorId);
 			const tab = {
 				type: "narrator" as const,
 				id: narratorId,
 				title: cached?.title || title || "",
-				// `cwd` becomes the tab's subtitle, which is also what directory grouping keys
-				// on — and it is NOT a runtime field, so nothing backfills it later. A tab
-				// created without it stays subtitle-less (and ungroupable) until the narrator
-				// is visited, which is why the lookup below also reads the paginated cache.
+				// `cwd` becomes the tab's subtitle, which is NOT a runtime field, so nothing
+				// backfills it later; a tab created without it stays subtitle-less until visited.
 				...(cached?.cwd ? { subtitle: cached.cwd } : {}),
 				...(cached?.status ? { status: cached.status } : {}),
 			};
+			const fail = () =>
+				notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+			const existing = drag.model.tabs.some((candidate) => tabSortId(candidate) === key);
+			const anchor =
+				target.kind === "before" || target.kind === "member-before"
+					? { beforeKey: target.key }
+					: target.kind === "after" || target.kind === "member-after"
+						? { afterKey: target.key }
+						: undefined;
 
-			if (target.kind === "workspace") {
-				const workspaceId = target.workspaceId;
-				// A drop onto a workspace is a MEMBERSHIP change, so it goes to the panel
-				// endpoint — which writes the row and the sidebar grouping together. The old
-				// path wrote the tab here and queued the panel in memory, which is how the two
-				// could end up disagreeing for good.
-				void api
-					.addWorkspacePanel(workspaceId, { kind: "narrator", narratorId })
-					.then(() => {
-						// The projection changed server-side; pull the authoritative window so the
-						// tab appears under its new header without a second write from here.
-						void refreshRecentTabsLoadedWindow(qc).catch(() => {});
-						navigate({ to: "/narrators/workspace/$workspaceId", params: { workspaceId } });
-						onNavigate?.();
-					})
-					.catch(() => {
-						notifications.show({ color: "red", message: t("workspaceAddPanelFailed") });
-					});
+			// Plain top-level placement of a narrator: one anchored upsert (creates or moves).
+			if (target.kind === "empty" || target.kind === "before" || target.kind === "after") {
+				void addRecentTabOrThrow(tab, anchor).catch(fail);
 				return;
 			}
-
-			// An empty section has no anchor to name; the default insertion point in an empty
-			// list is the first slot, which is the only position there is.
-			const anchor =
-				target.kind === "empty"
-					? undefined
-					: target.kind === "before"
-						? { beforeKey: target.key }
-						: { afterKey: target.key };
-			void addRecentTabOrThrow(tab, anchor).catch(() => {
-				notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
-			});
+			// Everything else needs the tab to exist first, then the drag plan does the rest.
+			// The plan is computed from the cache, which the upsert's delta has already updated
+			// (the rendered `tabs` may not have caught up yet).
+			void (async () => {
+				if (!existing) await addRecentTabOrThrow(tab);
+				const latest = (
+					qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages ?? []
+				).flatMap((page) => page.items as RecentTab[]);
+				const model = createRecentTabDragModel(latest, effectiveFolderOptions);
+				const plan = planRecentTabDrop(model, key, target, newFolderTitle);
+				if (plan) await drag.submitPlan(plan);
+			})().catch(fail);
 		},
-		[navigate, onNavigate, qc, t],
+		[qc, t, drag.model, drag.submitPlan, effectiveFolderOptions, newFolderTitle],
 	);
 
 	const externalDrop = useRecentTabExternalDrop({
 		containerRef: listBoxRef,
 		// Project tabs are not narrators, so that section has nothing to accept.
 		enabled: filter === "narrator",
-		// An internal reorder is bridged into the same singleton, so without this gate one
+		// An internal drag is bridged into the same singleton, so without this gate one
 		// drop would be handled twice — by @dnd-kit and by this hook.
 		suspended: drag.draggingId !== null,
 		suspendedRef: drag.draggingRef,
 		measureRows: drag.measureRows,
+		sourceFor: externalSourceFor,
 		onDrop: handleExternalDrop,
 	});
 
 	let overlay: React.ReactNode = null;
-	if (drag.draggingDirectory) {
-		const row = drag.draggingDirectory;
-		const collapsed = directoryCollapsedByPath.get(row.path) ?? true;
-		overlay = (
-			<>
-				<RecentTabDirectoryRow
-					path={row.path}
-					label={row.label}
-					tabs={row.children}
-					collapsed={collapsed}
-					active={false}
-					onToggle={() => {}}
-					t={t}
-				/>
-				{!collapsed &&
-					row.children.map((tab) => (
-						<DragOverlayTabItem key={tabSortId(tab)} tab={tab} active={false} />
-					))}
-			</>
-		);
-	} else if (drag.draggingTab) {
+	if (drag.draggingTab) {
 		const tab = drag.draggingTab;
 		overlay =
-			tab.type === "workspace" ? (
-				<DragOverlayWorkspaceItem tab={tab} wsChildren={childrenByWorkspace.get(tab.id) ?? []} />
+			tab.type === "folder" ? (
+				<RecentTabFolderHeader
+					folder={tab}
+					members={tabs.filter((member) => member.folderId === tab.id)}
+					hidden={[]}
+					display="collapsed"
+					active={false}
+					onToggle={() => {}}
+					onContextMenu={() => {}}
+					t={t}
+				/>
 			) : (
 				<DragOverlayTabItem tab={tab} active={isTabActive(tab, pathname)} />
 			);
 	}
 	const indicator = drag.indicator ?? externalDrop;
+	const ctxTab = ctxMenu?.tab;
+	const ctxIsFolder = ctxTab?.type === "folder";
+	const ctxInFolder = !!ctxTab?.folderId;
+	const ctxUnitKey = ctxTab ? (ctxInFolder ? `folder:${ctxTab.folderId}` : tabSortId(ctxTab)) : "";
+	const ctxIsFirst = ctxInFolder
+		? (() => {
+				const members = tabs.filter((member) => member.folderId === ctxTab?.folderId);
+				const zone = members.filter((member) => !!member.pinned === !!ctxTab?.pinned);
+				return zone[0] && tabSortId(zone[0]) === tabSortId(ctxTab as RecentTab);
+			})()
+		: [...pinnedRows, ...unpinnedRows].findIndex((row) => tabSortId(row.tab) === ctxUnitKey) === 0;
 	return (
 		<RecentTabsDragContext.Provider value={dragInteraction}>
 			<DndContext
@@ -1183,9 +1147,12 @@ export function RecentTabList({
 				<Box
 					ref={listBoxRef}
 					style={{
-						overflow: "hidden",
+						// `clip`, not `hidden`: `hidden` makes this box a scroll container, which
+						// would trap the folder strip's `position: sticky` inside it instead of
+						// letting it stick to the sidebar's real scroller.
+						overflow: "clip",
 						position: "relative",
-						...(topLevel.length === 0 && filter === "narrator" ? { minHeight: 44 } : {}),
+						...(topLevelCount === 0 && filter === "narrator" ? { minHeight: 44 } : {}),
 					}}
 				>
 					{indicator && (
@@ -1195,18 +1162,16 @@ export function RecentTabList({
 							containerTop={indicator.containerTop}
 						/>
 					)}
-					{topLevel.length === 0 ? (
+					{topLevelCount === 0 ? (
 						emptyBody
 					) : (
 						<>
-							{renderTabGroup(pinnedItems, "pinned")}
-							{groupingEnabled
-								? renderDirectoryRows(directoryRows)
-								: renderTabGroup(unpinnedItems, "unpinned")}
+							{renderRows(pinnedRows, "pinned")}
+							{renderRows(unpinnedRows, "unpinned")}
 						</>
 					)}
 
-					{topLevel.length > 0 &&
+					{topLevelCount > 0 &&
 						(sectionState.isError ? (
 							<Stack gap={2} py={4} align="center">
 								<Text size="xs" c="red">
@@ -1228,36 +1193,41 @@ export function RecentTabList({
 							</Button>
 						) : null)}
 
-					{ctxMenu && (
+					{ctxMenu && ctxTab && (
 						<TabContextMenu
 							x={ctxMenu.x}
 							y={ctxMenu.y}
 							onClose={() => setCtxMenu(null)}
 							onMoveToTop={handleMoveToTop}
 							onPin={handlePin}
-							isPinned={!!ctxMenu.tab.pinned}
+							isPinned={!!ctxTab.pinned}
+							pinScope={ctxInFolder ? "folder" : "list"}
 							onRemove={handleCtxClose}
 							onReveal={handleReveal}
-							canReveal={revealAvailable && ctxMenu.tab.type !== "project"}
+							canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
 							onNewNarratorHere={handleNewNarratorHere}
-							canNewNarratorHere={
-								ctxMenu.tab.type === "narrator" || ctxMenu.tab.type === "subagent"
-							}
+							canNewNarratorHere={ctxTab.type === "narrator" || ctxTab.type === "subagent"}
 							onCopyCwd={handleCopyCwd}
-							canCopyCwd={["narrator", "subagent"].includes(ctxMenu.tab.type)}
+							canCopyCwd={["narrator", "subagent"].includes(ctxTab.type)}
 							onOpenInWindow={handleOpenInWindow}
-							canOpenInWindow={recentTabWindowHref(ctxMenu.tab) !== null}
+							canOpenInWindow={!ctxIsFolder && recentTabWindowHref(ctxTab) !== null}
 							onRename={handleRename}
-							canRename={ctxMenu.tab.type === "narrator"}
+							canRename={ctxTab.type === "narrator"}
 							onArchive={handleArchive}
-							canArchive={ctxMenu.tab.type === "narrator"}
-							isFirst={
-								topLevel.findIndex(
-									(t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id,
-								) === 0
+							canArchive={ctxTab.type === "narrator"}
+							isFirst={ctxIsFirst}
+							folder={
+								ctxIsFolder
+									? {
+											collapsed: (folderDisplays[ctxTab.id] ?? "preview") === "collapsed",
+											onEdit: handleEditFolder,
+											onToggle: handleCtxFolderToggle,
+											onDissolve: handleDissolveFolder,
+										}
+									: null
 							}
-							isWorkspace={ctxMenu.tab.type === "workspace"}
-							gitIdentityNarratorId={ctxMenu.tab.type === "narrator" ? ctxMenu.tab.id : null}
+							onLeaveFolder={ctxInFolder ? handleLeaveFolder : null}
+							gitIdentityNarratorId={ctxTab.type === "narrator" ? ctxTab.id : null}
 							t={t}
 						/>
 					)}
@@ -1308,10 +1278,11 @@ export function RecentTabList({
 							</Button>
 						</Group>
 					</Modal>
-					<CreateNarratorLazyModal
-						opened={wsCreateTarget !== null}
-						onClose={() => setWsCreateTarget(null)}
-						onCreated={handleWsNarratorCreated}
+					<RecentTabFolderEditModal
+						folder={editFolder}
+						onClose={() => setEditFolder(null)}
+						onSave={updateFolder}
+						t={t}
 					/>
 					<CreateNarratorLazyModal
 						opened={newNarratorTarget !== null}
@@ -1358,7 +1329,6 @@ function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconC
 
 	let icon: React.ReactNode;
 	if (tab.type === "project") icon = <IconFolder size={size} />;
-	else if (tab.type === "workspace") icon = <IconColumns size={size} />;
 	else icon = <IconRobot size={size} color={iconColor} />;
 
 	// Corner markers remain for subagent rows. The centre state SHAPE (tick / shield /
@@ -1444,144 +1414,7 @@ function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconC
 	);
 }
 
-/** Non-sortable child tab rendered indented under a workspace tab. */
-function WorkspaceChildTab({
-	tab,
-	active,
-	onNavigate,
-	onContextMenu,
-}: {
-	tab: RecentTab;
-	active: boolean;
-	onNavigate?: () => void;
-	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
-}) {
-	const navigate = useNavigate();
-	const to = `/narrators/${tab.id}`;
-	const iconColor = getNarratorStatusIconColor(tab);
-
-	return (
-		<NavLink
-			active={active}
-			label={<Text size="xs">{tab.title}</Text>}
-			leftSection={<TabIcon tab={tab} size={14} iconColor={iconColor} />}
-			onClick={() => {
-				onNavigate?.();
-				navigate({ to });
-			}}
-			onContextMenu={(e) => onContextMenu(e, tab)}
-			py={2}
-			pl="lg"
-			styles={{
-				root: { borderRadius: 4, minHeight: 28 },
-				label: { overflow: "hidden" },
-			}}
-		/>
-	);
-}
-
-/** Compact workspace member; remains in normal layout throughout the gesture. */
-const DraggableWorkspaceChildTab = React.memo(function DraggableWorkspaceChildTab({
-	tab,
-	active,
-	onRemove,
-	onNavigate,
-	onContextMenu,
-	onPrefetch,
-}: {
-	tab: RecentTab;
-	active: boolean;
-	onRemove: (type: RecentTab["type"], id: string) => void;
-	onNavigate?: () => void;
-	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
-	onPrefetch?: (tab: RecentTab) => void;
-}) {
-	const navigate = useNavigate();
-	const drag = useContext(RecentTabsDragContext);
-	const { attributes, listeners, setNodeRef } = useDraggable({
-		id: tabSortId(tab),
-		disabled: drag.pending,
-	});
-	const to = `/narrators/${tab.id}`;
-	const prefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
-	return (
-		<div ref={setNodeRef} {...attributes} {...listeners} data-tab-sort-id={tabSortId(tab)}>
-			<NavLink
-				active={active}
-				label={<Text size="xs">{tab.title}</Text>}
-				leftSection={<TabIcon tab={tab} size={14} iconColor={getNarratorStatusIconColor(tab)} />}
-				onClick={() => {
-					if (drag.consumeClick()) return;
-					prefetch();
-					onNavigate?.();
-					navigate({ to });
-				}}
-				onPointerEnter={prefetch}
-				onFocus={prefetch}
-				onMouseDown={(e: React.MouseEvent) => {
-					prefetch();
-					if (e.button === 1) e.preventDefault();
-				}}
-				onAuxClick={(e: React.MouseEvent) => {
-					if (e.button === 1) {
-						e.preventDefault();
-						onRemove(tab.type, tab.id);
-					}
-				}}
-				onContextMenu={(e) => onContextMenu(e, tab)}
-				py={2}
-				pl="lg"
-				styles={{ root: { borderRadius: 4, minHeight: 28 }, label: { overflow: "hidden" } }}
-			/>
-		</div>
-	);
-});
-
-/**
- * Rendered in DragOverlay while a workspace is being dragged.
- * Shows the workspace title + all its child tabs as a single floating preview.
- */
-function DragOverlayWorkspaceItem({
-	tab,
-	wsChildren,
-}: {
-	tab: RecentTab;
-	wsChildren: RecentTab[];
-}) {
-	return (
-		<div style={{ overflow: "hidden" }}>
-			<NavLink
-				active={false}
-				label={
-					<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
-						{tab.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
-						<Text size="sm">{tab.title}</Text>
-					</Group>
-				}
-				leftSection={
-					<span>
-						<IconColumns size={16} />
-					</span>
-				}
-				styles={{
-					root: {
-						cursor: "grabbing",
-					},
-				}}
-			/>
-			{wsChildren.map((child) => (
-				<WorkspaceChildTab
-					key={tabSortId(child)}
-					tab={child}
-					active={false}
-					onContextMenu={() => {}}
-				/>
-			))}
-		</div>
-	);
-}
-
-/** Rendered in DragOverlay while a non-workspace tab is being dragged. */
+/** Rendered in DragOverlay while a tab is being dragged. */
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const { t } = useTranslation("common");
 	const iconColor = getNarratorStatusIconColor(tab);
@@ -1633,24 +1466,16 @@ interface TabItemBodyProps {
 	active: boolean;
 	onRemove: (type: RecentTab["type"], id: string) => void;
 	/**
-	 * Toggle pinned state. Supplied by the list so a LEFT swipe can pin/unpin on touch,
-	 * where the right-click menu (the only other way to pin) is unreachable — long-press
-	 * fires `contextmenu`, which `handleContextMenu` deliberately swallows on touch.
+	 * Open the row's context menu from a LEFT swipe on touch, where right-click does not
+	 * exist — long-press is the drag gesture, and the `contextmenu` it fires is swallowed.
 	 */
-	onTogglePin?: (tab: RecentTab) => void;
+	onSwipeMenu?: (tab: RecentTab, x: number, y: number) => void;
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	onPrefetch?: (tab: RecentTab) => void;
 	/** When true and active, remove top border-radius to connect with nav above */
 	connectTop?: boolean;
-	/** Workspace-only: click handler for the "add narrator" button */
-	onWsAddClick?: (e: React.MouseEvent, wsId: string) => void;
-	/**
-	 * Directory mode: the working directory is printed once on the group header, so the
-	 * member rows must not repeat it. This is the entire space saving of the mode.
-	 */
-	hideSubtitle?: boolean;
-	/** Directory mode: indent the row so it reads as a member of the group above. */
+	/** Folder member: indent the row so it reads as part of the folder above. */
 	indent?: boolean;
 	/** True while dnd-kit is dragging this row — suppresses the swipe-to-close gesture. */
 	isDragging?: boolean;
@@ -1664,8 +1489,8 @@ interface TabItemBodyProps {
 
 /**
  * The visible row and every interaction on it: click-to-navigate, middle-click close,
- * right-click menu, swipe-right-to-close, swipe-left-to-pin, and dragging the icon into
- * a workspace panel.
+ * right-click menu, swipe-right-to-close, swipe-left-for-menu, and dragging the row into
+ * a workspace panel or a folder.
  *
  * The body is independent of drag sensors. All list modes share the same gesture
  * wrapper and cross-surface bridge; previews render without interactive drag sources.
@@ -1674,13 +1499,11 @@ function TabItemBody({
 	tab,
 	active,
 	onRemove,
-	onTogglePin,
+	onSwipeMenu,
 	onNavigate,
 	onContextMenu,
 	onPrefetch,
 	connectTop,
-	onWsAddClick,
-	hideSubtitle,
 	indent,
 	isDragging = false,
 	outerRef,
@@ -1690,12 +1513,7 @@ function TabItemBody({
 	const navigate = useNavigate();
 	const drag = useContext(RecentTabsDragContext);
 	const { t } = useTranslation("common");
-	const to =
-		tab.type === "project"
-			? `/projects/${tab.id}`
-			: tab.type === "workspace"
-				? `/narrators/workspace/${tab.id}`
-				: `/narrators/${tab.id}`;
+	const to = tab.type === "project" ? `/projects/${tab.id}` : `/narrators/${tab.id}`;
 	const iconColor = getNarratorStatusIconColor(tab);
 
 	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
@@ -1729,96 +1547,27 @@ function TabItemBody({
 		[tab.type, tab.id, onRemove],
 	);
 
-	// Right-click context menu — suppress on touch devices (long-press fires contextmenu)
-	const isTouching = useRef(false);
+	// Touch: right swipe closes, left swipe opens the menu (touch has no right-click).
+	const swipe = useRowSwipe({
+		isDragging,
+		onClose: useCallback(() => onRemove(tab.type, tab.id), [onRemove, tab.type, tab.id]),
+		onMenu: useMemo(
+			() => (onSwipeMenu ? (x: number, y: number) => onSwipeMenu(tab, x, y) : undefined),
+			[onSwipeMenu, tab],
+		),
+	});
+
+	// Right-click menu; the long-press `contextmenu` on touch is suppressed (it is a drag).
 	const handleContextMenu = useCallback(
 		(e: React.MouseEvent) => {
-			if (isTouching.current) {
+			if (swipe.touching()) {
 				e.preventDefault();
 				return;
 			}
 			onContextMenu(e, tab);
 		},
-		[onContextMenu, tab],
+		[onContextMenu, tab, swipe.touching],
 	);
-
-	// Horizontal swipe gestures (touch only, and only when dnd-kit is not dragging):
-	// right closes the tab, left toggles pinned.
-	//
-	// Left-swipe exists because pinning had NO touch entry point at all. The only other
-	// way in is the right-click menu, and on touch that menu never opens: long-press
-	// fires `contextmenu`, which `handleContextMenu` suppresses (otherwise every
-	// long-press-to-drag would pop a menu).
-	const touchStartX = useRef(0);
-	const touchStartY = useRef(0);
-	const swiping = useRef(false);
-	const directionLocked = useRef<"horizontal" | "vertical" | null>(null);
-	const [swipeX, setSwipeX] = useState(0);
-	const [exiting, setExiting] = useState(false);
-	const canPin = !!onTogglePin;
-
-	const handleTouchStart = useCallback((e: React.TouchEvent) => {
-		isTouching.current = true;
-		touchStartX.current = e.touches[0].clientX;
-		touchStartY.current = e.touches[0].clientY;
-		directionLocked.current = null;
-		swiping.current = true;
-	}, []);
-
-	const handleTouchMove = useCallback(
-		(e: React.TouchEvent) => {
-			if (!swiping.current || isDragging) return;
-			const dx = e.touches[0].clientX - touchStartX.current;
-			const dy = e.touches[0].clientY - touchStartY.current;
-			// Lock direction on first significant movement
-			if (!directionLocked.current) {
-				if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
-				directionLocked.current = Math.abs(dy) > Math.abs(dx) ? "vertical" : "horizontal";
-			}
-			if (directionLocked.current === "vertical") return;
-			setSwipeX(clampSwipeTravel(dx, canPin));
-		},
-		[isDragging, canPin],
-	);
-
-	const handleTouchEnd = useCallback(() => {
-		// Defer clearing so the contextmenu event (fired after touchend) still sees the flag
-		setTimeout(() => {
-			isTouching.current = false;
-		}, 0);
-		if (!swiping.current || isDragging) {
-			swiping.current = false;
-			return;
-		}
-		swiping.current = false;
-		const release = classifySwipeRelease(swipeX, canPin);
-		if (release === "close") {
-			setExiting(true);
-			setTimeout(() => onRemove(tab.type, tab.id), 200);
-			return;
-		}
-		// Both remaining outcomes snap the row home. Pinning does not fly the row out:
-		// it stays in the list and only moves between the pinned and unpinned groups.
-		setSwipeX(0);
-		if (release === "pin") onTogglePin?.(tab);
-	}, [swipeX, isDragging, tab, onRemove, canPin, onTogglePin]);
-
-	const swipeStyle: React.CSSProperties = exiting
-		? {
-				transform: "translateX(100%)",
-				opacity: 0,
-				transition: "transform 0.2s ease-out, opacity 0.2s ease-out",
-			}
-		: swipeX !== 0
-			? { transform: `translateX(${swipeX}px)`, transition: "none" }
-			: // Animate the snap-back so a released half-swipe glides home instead of
-				// teleporting. Harmless at rest: nothing is moving.
-				{ transform: "translateX(0)", transition: "transform 0.15s ease-out" };
-
-	// Affordance revealed under the row while swiping left. It has to live BEHIND the row
-	// (the row itself is what moves), so it is absolutely positioned in the clipped outer
-	// wrapper and only mounted while the gesture is in progress.
-	const pinHintActive = swipeX < -SWIPE_THRESHOLD;
 
 	// Icon and body use the same sensors and cross-surface drag bridge.
 	const dragNarratorId = getRecentTabNarratorId(tab);
@@ -1830,29 +1579,13 @@ function TabItemBody({
 				...outerStyle,
 				overflow: "hidden",
 				touchAction: "pan-y",
-				// Anchor for the swipe-left pin affordance below.
+				// Anchor for the swipe-left menu hint.
 				position: "relative",
 			}}
 			data-tab-sort-id={tabSortId(tab)}
 		>
-			{swipeX < 0 && (
-				<Group
-					gap={4}
-					wrap="nowrap"
-					justify="flex-end"
-					pr="sm"
-					style={{
-						position: "absolute",
-						inset: 0,
-						pointerEvents: "none",
-						color: pinHintActive ? "var(--mantine-color-indigo-4)" : "var(--mantine-color-dimmed)",
-					}}
-				>
-					{tab.pinned ? <IconPinnedOff size={16} /> : <IconPin size={16} />}
-					<Text size="xs">{t(tab.pinned ? "swipeUnpin" : "swipePin")}</Text>
-				</Group>
-			)}
-			<div style={swipeStyle}>
+			<SwipeMenuHint swipeX={swipe.swipeX} label={t("swipeMenu")} />
+			<div style={swipe.style}>
 				<NavLink
 					active={active}
 					onClick={handleClick}
@@ -1861,9 +1594,7 @@ function TabItemBody({
 					onMouseDown={handleMouseDown}
 					onAuxClick={handleAuxClick}
 					onContextMenu={handleContextMenu}
-					onTouchStart={handleTouchStart}
-					onTouchMove={handleTouchMove}
-					onTouchEnd={handleTouchEnd}
+					{...swipe.handlers}
 					pl={indent ? "lg" : undefined}
 					label={
 						<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
@@ -1876,7 +1607,6 @@ function TabItemBody({
 					description={
 						<>
 							{tab.subtitle &&
-								!hideSubtitle &&
 								(hasDirectorySubtitle(tab) ? (
 									// cwd: left-ellipsis + LTR isolation so the leading "/" stays put.
 									<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
@@ -1900,25 +1630,6 @@ function TabItemBody({
 						>
 							<TabIcon tab={tab} size={16} iconColor={iconColor} />
 						</span>
-					}
-					rightSection={
-						onWsAddClick ? (
-							<Tooltip label={t("addToWorkspace")} position="right">
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									onClick={(e: React.MouseEvent) => onWsAddClick(e, tab.id)}
-									onPointerEnter={preloadCreateNarratorModal}
-									onFocus={preloadCreateNarratorModal}
-									onPointerDown={(e: React.PointerEvent) => {
-										e.stopPropagation();
-										preloadCreateNarratorModal();
-									}}
-								>
-									<IconPlus size={14} />
-								</ActionIcon>
-							</Tooltip>
-						) : undefined
 					}
 					styles={{
 						root: {
@@ -1957,25 +1668,26 @@ const DraggableTabItem = React.memo(function DraggableTabItem(
 	);
 });
 
-function DraggableDirectoryRow(props: RecentTabDirectoryRowProps) {
+/** Folder header as a drag source: dragging it moves the whole folder. */
+function DraggableFolderHeader(
+	props: Omit<RecentTabFolderHeaderProps, "outerRef" | "dragProps" | "isDragging" | "consumeClick">,
+) {
 	const drag = useContext(RecentTabsDragContext);
-	const { attributes, listeners, setNodeRef } = useDraggable({
-		id: directoryRowId(props.path),
+	const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+		id: `folder:${props.folder.id}`,
 		disabled: drag.pending,
 	});
 	return (
-		<div ref={setNodeRef} {...attributes} {...listeners}>
-			<RecentTabDirectoryRow
-				{...props}
-				onToggle={(path) => {
-					if (!drag.consumeClick()) props.onToggle(path);
-				}}
-			/>
-		</div>
+		<RecentTabFolderHeader
+			{...props}
+			isDragging={isDragging}
+			outerRef={setNodeRef}
+			dragProps={{ ...attributes, ...listeners }}
+			consumeClick={drag.consumeClick}
+		/>
 	);
 }
 
-/** Resolve a sortable id to its tab across the aggregated rows (for drag previews). */
 interface CachedNarratorSummary {
 	title?: string | null;
 	cwd?: string | null;
@@ -1990,7 +1702,7 @@ interface CachedNarratorSummary {
  * the detail entry exists just for narrators that have been opened. Reading only the detail
  * key therefore missed exactly the common case, producing a tab with no `cwd`: a permanent
  * gap, because `cwd` is persisted rather than patched in by the runtime endpoint, so the
- * row would stay subtitle-less and invisible to directory grouping until someone opened it.
+ * row would stay subtitle-less until someone opened it.
  *
  * No fetch here on purpose: a drop must commit in the same tick as the release, and the
  * fields are cosmetic — the tab is correct without them and self-corrects on the first visit.
@@ -2164,10 +1876,48 @@ interface TabContextMenuProps {
 	onArchive: () => void;
 	canArchive: boolean;
 	isFirst: boolean;
-	isWorkspace: boolean;
+	/** "folder": pinning a folder member pins it inside its folder. */
+	pinScope: "list" | "folder";
+	/** Folder-only actions; null for any other row. */
+	folder: {
+		collapsed: boolean;
+		onEdit: () => void;
+		onToggle: () => void;
+		onDissolve: () => void;
+	} | null;
+	/** Folder member: take it out of its folder. */
+	onLeaveFolder: (() => void) | null;
 	/** The narrator this tab stands for, when the per-narrator git identity pick applies. */
 	gitIdentityNarratorId: string | null;
 	t: (key: string) => string;
+}
+
+const MENU_EDGE_GAP = 8;
+
+/**
+ * Place a menu at the pointer, flipped up and/or left when it would overflow the
+ * viewport (a right-click near the bottom, a swipe released near the screen edge).
+ */
+function useMenuPosition(x: number, y: number) {
+	const [node, setNode] = useState<HTMLDivElement | null>(null);
+	const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+	useLayoutEffect(() => {
+		if (!node) return;
+		const { width, height } = node.getBoundingClientRect();
+		const view = node.ownerDocument.defaultView;
+		const maxLeft = (view?.innerWidth ?? x + width) - width - MENU_EDGE_GAP;
+		const maxTop = (view?.innerHeight ?? y + height) - height - MENU_EDGE_GAP;
+		setPosition({
+			left: Math.max(MENU_EDGE_GAP, x <= maxLeft ? x : x - width),
+			top: Math.max(MENU_EDGE_GAP, y <= maxTop ? y : y - height),
+		});
+	}, [node, x, y]);
+	return {
+		ref: setNode,
+		left: position?.left ?? x,
+		top: position?.top ?? y,
+		measured: position !== null,
+	};
 }
 
 function TabContextMenu({
@@ -2191,11 +1941,14 @@ function TabContextMenu({
 	onArchive,
 	canArchive,
 	isFirst,
-	isWorkspace,
+	pinScope,
+	folder,
+	onLeaveFolder,
 	gitIdentityNarratorId,
 	t,
 }: TabContextMenuProps) {
 	const gitIdentityVisibility = useGitIdentityVisibility();
+	const position = useMenuPosition(x, y);
 	return (
 		<>
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
@@ -2210,36 +1963,89 @@ function TabContextMenu({
 				role="presentation"
 			/>
 			<Paper
+				ref={position.ref}
 				shadow="md"
 				p={4}
 				withBorder
 				style={{
 					position: "fixed",
-					left: x,
-					top: y,
+					left: position.left,
+					top: position.top,
 					zIndex: Z.contextMenu,
 					minWidth: 140,
+					maxHeight: `calc(100dvh - ${2 * MENU_EDGE_GAP}px)`,
+					overflowY: "auto",
+					// Hidden for the one frame before it is measured, so it never flashes off-screen.
+					visibility: position.measured ? "visible" : "hidden",
 				}}
 			>
 				<Stack gap={2}>
+					{folder && (
+						<>
+							<UnstyledButton px="xs" py={4} onClick={folder.onEdit} style={{ borderRadius: 4 }}>
+								<Group gap={8} wrap="nowrap">
+									<IconPencil size={14} />
+									<Text size="sm">{t("editFolder")}</Text>
+								</Group>
+							</UnstyledButton>
+							<UnstyledButton px="xs" py={4} onClick={folder.onToggle} style={{ borderRadius: 4 }}>
+								<Group gap={8} wrap="nowrap">
+									{folder.collapsed ? (
+										<IconChevronDown size={14} />
+									) : (
+										<IconChevronRight size={14} />
+									)}
+									<Text size="sm">
+										{t(folder.collapsed ? "expandFolderMenu" : "collapseFolderMenu")}
+									</Text>
+								</Group>
+							</UnstyledButton>
+						</>
+					)}
 					{!isFirst && !isPinned && (
 						<UnstyledButton px="xs" py={4} onClick={onMoveToTop} style={{ borderRadius: 4 }}>
 							<Group gap={8} wrap="nowrap">
 								<IconArrowUp size={14} />
-								<Text size="sm">{t("moveToTop")}</Text>
+								<Text size="sm">{t(pinScope === "folder" ? "moveToFolderTop" : "moveToTop")}</Text>
 							</Group>
 						</UnstyledButton>
 					)}
 					<UnstyledButton px="xs" py={4} onClick={onPin} style={{ borderRadius: 4 }}>
 						<Group gap={8} wrap="nowrap">
 							{isPinned ? <IconPinnedOff size={14} /> : <IconPin size={14} />}
-							<Text size="sm">{t(isPinned ? "unpinTab" : "pinTab")}</Text>
+							<Text size="sm">
+								{t(
+									pinScope === "folder"
+										? isPinned
+											? "unpinInFolder"
+											: "pinInFolder"
+										: isPinned
+											? "unpinTab"
+											: "pinTab",
+								)}
+							</Text>
 						</Group>
 					</UnstyledButton>
+					{onLeaveFolder && (
+						<UnstyledButton px="xs" py={4} onClick={onLeaveFolder} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconFolderOff size={14} />
+								<Text size="sm">{t("leaveFolder")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					{folder && (
+						<UnstyledButton px="xs" py={4} onClick={folder.onDissolve} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconFolderOff size={14} />
+								<Text size="sm">{t("dissolveFolder")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
 					<UnstyledButton px="xs" py={4} onClick={onRemove} style={{ borderRadius: 4 }}>
 						<Group gap={8} wrap="nowrap">
 							<IconX size={14} />
-							<Text size="sm">{t(isWorkspace ? "dissolveWorkspace" : "closeTab")}</Text>
+							<Text size="sm">{t(folder ? "closeFolder" : "closeTab")}</Text>
 						</Group>
 					</UnstyledButton>
 					{canCopyCwd && (

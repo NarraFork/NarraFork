@@ -90,11 +90,11 @@ beforeEach(() => {
 	root = createRoot(window.document.getElementById("root") as unknown as HTMLElement);
 	options = {
 		tabs: [tab("a"), tab("b"), tab("c")],
-		groupingEnabled: false,
-		directoryCollapsedByPath: new Map(),
+		folderOptions: { displayOf: () => "expanded", defaultPreview: 3 },
 		containerRef: { current: list },
 		qc: new QueryClient(),
 		onError: () => {},
+		newFolderTitle: "New folder",
 	};
 	render();
 });
@@ -149,7 +149,7 @@ it("awaits a single mutation, clears drag synchronously and gates new drags duri
 	options = {
 		...options,
 		tabs: options.tabs.map((item) =>
-			item.id === "a" ? { ...item, title: "live", status: "running", dirSortOrder: 8 } : item,
+			item.id === "a" ? { ...item, title: "live", status: "running" } : item,
 		),
 	};
 	// Harness identity must be stable across renders.
@@ -157,7 +157,6 @@ it("awaits a single mutation, clears drag synchronously and gates new drags duri
 	expect(result.renderTabs.find((item) => item.id === "a")).toMatchObject({
 		title: "live",
 		status: "running",
-		dirSortOrder: 8,
 	});
 	resolve({ changed: true, baseRevision: 0, revision: 1, operations: [] });
 	await promise;
@@ -211,21 +210,19 @@ it("uses captured release coordinates instead of scroll-adjusted sensor delta", 
 	await end(70);
 	expect(move).not.toHaveBeenCalled();
 });
-it("mode and source membership changes cancel rather than reinterpret a drag", () => {
+it("a source that changes folder mid-drag cancels rather than reinterpreting the drag", () => {
 	start();
-	options = { ...options, groupingEnabled: true };
+	options = {
+		...options,
+		tabs: [
+			tab("F", { type: "folder" }),
+			...options.tabs.map((item) => (item.id === "a" ? { ...item, folderId: "F" } : item)),
+		],
+	};
 	render();
 	expect(result.draggingRef.current).toBe(false);
 	render();
 	expect(result.draggingId).toBeNull();
-	options = { ...options, groupingEnabled: false };
-	render();
-	start();
-	options = {
-		...options,
-		tabs: options.tabs.map((item) => (item.id === "a" ? { ...item, workspaceId: "new" } : item)),
-	};
-	render();
 	expect(getPanelDrag()).toBeNull();
 });
 it("reports mutation failure, refreshes authority and always releases pending", async () => {
@@ -246,53 +243,41 @@ it("reports mutation failure, refreshes authority and always releases pending", 
 	expect(result.pending).toBe(false);
 	expect(result.renderTabs).toBe(options.tabs);
 });
-it("awaits directory member persistence without any flat move", async () => {
-	options = {
-		...options,
-		groupingEnabled: true,
-		tabs: [tab("a", { subtitle: "/repo" }), tab("b", { subtitle: "/repo" }), tab("c")],
-		directoryCollapsedByPath: new Map([["/repo", false]]),
-	};
-	render();
-	const move = spyOn(api, "moveRecentTab");
-	let resolve!: (value: Awaited<ReturnType<typeof api.setRecentTabDirectoryOrder>>) => void;
-	const directory = spyOn(api, "setRecentTabDirectoryOrder").mockImplementation(
+it("dropping onto the middle of a tab creates a folder instead of moving", async () => {
+	let resolve!: (value: Awaited<ReturnType<typeof api.createRecentTabFolder>>) => void;
+	const create = spyOn(api, "createRecentTabFolder").mockImplementation(
 		() =>
 			new Promise((done) => {
 				resolve = done;
 			}),
 	);
-	spies.push(move, directory);
+	const move = spyOn(api, "moveRecentTab");
+	spies.push(create, move);
+	// a starts at y=15; +60 lands on the middle of c (60-90).
 	start();
-	const promise = end(40);
-	expect(directory.mock.calls[0]?.[0]).toEqual(["narrator:b", "narrator:a"]);
-	expect(directory.mock.calls[0]?.[1]).toBeInstanceOf(AbortSignal);
-	expect(result.pending).toBe(true);
-	expect(result.renderTabs[0].dirSortOrder).toBe(1);
+	const promise = end(60);
+	expect(create.mock.calls[0]?.[0]).toEqual({
+		targetKey: "narrator:c",
+		sourceKey: "narrator:a",
+		title: "New folder",
+	});
+	expect(create.mock.calls[0]?.[1]).toBeInstanceOf(AbortSignal);
 	expect(move).not.toHaveBeenCalled();
-	resolve({ changed: true, baseRevision: 0, revision: 1, operations: [] });
+	expect(result.pending).toBe(true);
+	resolve({ changed: true, baseRevision: 0, revision: 1, operations: [], folderId: "F" });
 	await promise;
 	render();
 	expect(result.pending).toBe(false);
 });
-it("serially awaits every flat move in a directory unit replay", async () => {
+
+it("dropping on a folder member's slot sends the membership with the anchor", async () => {
 	options = {
 		...options,
-		groupingEnabled: true,
-		tabs: [
-			tab("a", { subtitle: "/a" }),
-			tab("b", { subtitle: "/a" }),
-			tab("c", { subtitle: "/b" }),
-			tab("d", { subtitle: "/b" }),
-		],
-		directoryCollapsedByPath: new Map([
-			["/a", true],
-			["/b", true],
-		]),
+		tabs: [tab("a"), tab("F", { type: "folder" }), tab("m", { folderId: "F" })],
 	};
 	const list = options.containerRef.current as HTMLElement;
 	list.replaceChildren();
-	for (const [index, key] of ["dir:/a", "dir:/b"].entries()) {
+	for (const [index, key] of ["narrator:a", "folder:F", "narrator:m"].entries()) {
 		const row = document.createElement("div");
 		row.dataset.tabSortId = key;
 		row.getBoundingClientRect = () => ({
@@ -304,24 +289,18 @@ it("serially awaits every flat move in a directory unit replay", async () => {
 		list.append(row);
 	}
 	render();
-	const resolves: ((value: Awaited<ReturnType<typeof api.moveRecentTab>>) => void)[] = [];
-	const move = spyOn(api, "moveRecentTab").mockImplementation(
-		() =>
-			new Promise((done) => {
-				resolves.push(done);
-			}),
-	);
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: true,
+		baseRevision: 0,
+		revision: 1,
+		operations: [],
+	});
 	spies.push(move);
-	start("dir:/a");
-	const promise = end(40);
-	expect(move).toHaveBeenCalledTimes(1);
-	resolves[0]({ changed: true, baseRevision: 0, revision: 1, operations: [] });
-	await Promise.resolve();
-	await Promise.resolve();
-	expect(move).toHaveBeenCalledTimes(2);
-	expect(result.pending).toBe(true);
-	resolves[1]({ changed: true, baseRevision: 1, revision: 2, operations: [] });
-	await promise;
-	render();
-	expect(result.pending).toBe(false);
+	// From y=15 to y=85: the lower half of member m.
+	start();
+	await end(70);
+	expect(move.mock.calls[0]?.slice(0, 2)).toEqual([
+		"narrator:a",
+		{ afterKey: "narrator:m", folderId: "F" },
+	]);
 });

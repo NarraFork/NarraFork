@@ -10,48 +10,60 @@ import {
 import type { QueryClient } from "@tanstack/react-query";
 import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RecentTab } from "../../hooks/recent-tabs-utils";
-import {
-	applyRecentTabsDelta,
-	applyRecentTabsDeltaAndFollowUp,
-	refreshRecentTabsLoadedWindow,
-} from "../../hooks/useRecentTabs";
+import { applyRecentTabsDelta, refreshRecentTabsLoadedWindow } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 import { cancelDrag, endDrag, getPanelDrag, moveDrag, startDragManual } from "../../lib/panel-drag";
 import {
 	createRecentTabDragModel,
-	planRecentTabInternalDrop,
+	type FolderViewOptions,
+	planRecentTabDrop,
 	projectRecentTabDragOrder,
-	recentTabDragIndicatorRows,
+	type RecentTabDragModel,
+	type RecentTabDragPlan,
 	recentTabDragMeasuredRow,
-	resolveRecentTabInternalDrop,
+	recentTabDragSource,
 } from "./recent-tab-drag-model";
-import type { RecentTabDropRow, RecentTabDropTarget } from "./recent-tab-drop-target";
+import {
+	type RecentTabDropRow,
+	type RecentTabDropTarget,
+	resolveRecentTabDropTarget,
+} from "./recent-tab-drop-target";
 import { autoScrollAllowedForPointer } from "./recent-tabs-logic";
 
 export interface UseRecentTabsDragOptions {
 	/** Latest section tabs; project/narrator filtering belongs to the caller. */
 	tabs: RecentTab[];
-	groupingEnabled: boolean;
-	directoryCollapsedByPath: ReadonlyMap<string, boolean>;
+	/** How each folder is shown; decides which members are rows. */
+	folderOptions: FolderViewOptions;
 	containerRef: RefObject<HTMLElement | null>;
 	qc: QueryClient;
 	onError: () => void;
+	/** Title for a folder created by dropping one tab onto another. */
+	newFolderTitle: string;
 }
 
-function sourceIdentity(entry: {
-	unit: string;
-	role: string;
-	pinned: boolean;
-	workspaceId?: string;
-	tab?: RecentTab;
-}) {
-	return JSON.stringify([
-		entry.unit,
-		entry.role,
-		entry.pinned,
-		entry.workspaceId,
-		entry.tab?.narratorId,
-	]);
+/** A drag is cancelled when its source changes shape under it (moved into a folder elsewhere, …). */
+function sourceIdentity(entry: { kind: string; pinned: boolean; folderId?: string }) {
+	return JSON.stringify([entry.kind, entry.pinned, entry.folderId]);
+}
+
+/** Pointer → target for an internal drag, null when outside the list. */
+function resolveInternalDrop(
+	model: RecentTabDragModel,
+	sourceKey: string,
+	rows: RecentTabDropRow[],
+	pointer: { x: number; y: number },
+	container: { left: number; right: number; top: number; bottom: number },
+): RecentTabDropTarget | null {
+	if (
+		pointer.x < container.left ||
+		pointer.x > container.right ||
+		pointer.y < container.top ||
+		pointer.y > container.bottom
+	) {
+		return null;
+	}
+	return resolveRecentTabDropTarget(rows, pointer.y, recentTabDragSource(model, sourceKey));
 }
 
 // A bounded submission includes serial moves and any required cache reconciliation.
@@ -86,7 +98,7 @@ function eventPointer(event: Event): { x: number; y: number } | null {
 }
 
 export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
-	const { tabs, groupingEnabled, directoryCollapsedByPath, containerRef } = options;
+	const { tabs, folderOptions, containerRef } = options;
 	const [draggingId, setDraggingId] = useState<string | null>(null);
 	const [pending, setPending] = useState(false);
 	const [optimistic, setOptimistic] = useState<RecentTab[] | null>(null);
@@ -95,14 +107,10 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		target: RecentTabDropTarget;
 		containerTop: number;
 	} | null>(null);
-	const directoryKeysRef = useRef<ReadonlySet<string>>(new Set());
-	const renderTabs = useMemo(
-		() => projectRecentTabDragOrder(tabs, optimistic, directoryKeysRef.current),
-		[tabs, optimistic],
-	);
+	const renderTabs = useMemo(() => projectRecentTabDragOrder(tabs, optimistic), [tabs, optimistic]);
 	const model = useMemo(
-		() => createRecentTabDragModel(renderTabs, groupingEnabled, directoryCollapsedByPath),
-		[renderTabs, groupingEnabled, directoryCollapsedByPath],
+		() => createRecentTabDragModel(renderTabs, folderOptions),
+		[renderTabs, folderOptions],
 	);
 	const modelRef = useRef(model);
 	modelRef.current = model;
@@ -150,14 +158,14 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		if (!source || !pointer || !el) return;
 		const rect = el.getBoundingClientRect();
 		const rows = measureRows();
-		const target = resolveRecentTabInternalDrop(modelRef.current, source, rows, pointer, rect);
-		const next = target
-			? {
-					rows: recentTabDragIndicatorRows(modelRef.current, source, rows),
-					target,
-					containerTop: rect.top,
-				}
-			: null;
+		const target = resolveInternalDrop(modelRef.current, source, rows, pointer, rect);
+		// Only show what a release would actually do: dropping in place (or into the folder
+		// the tab is already in) plans nothing, so it draws nothing.
+		const next =
+			target &&
+			planRecentTabDrop(modelRef.current, source, target, optionsRef.current.newFolderTitle)
+				? { rows, target, containerTop: rect.top }
+				: null;
 		setIndicator((previous) => {
 			if (!previous || !next) return previous === next ? previous : next;
 			if (
@@ -173,9 +181,8 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 					row.top === other.top &&
 					row.bottom === other.bottom &&
 					row.pinned === other.pinned &&
-					row.workspaceId === other.workspaceId &&
-					row.keyBlock.length === other.keyBlock.length &&
-					row.keyBlock.every((key, keyIndex) => key === other.keyBlock[keyIndex])
+					row.kind === other.kind &&
+					row.folderId === other.folderId
 				);
 			});
 			return unchanged ? previous : next;
@@ -228,12 +235,6 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		if (!entry || sourceIdentity(entry) !== sourceIdentityRef.current) onDragCancel();
 		else scheduleIndicator();
 	}, [model, onDragCancel, scheduleIndicator]);
-	// Mode changes cancel even when the dragged tab survives in the new mode.
-	const modeRef = useRef(groupingEnabled);
-	useEffect(() => {
-		if (modeRef.current !== groupingEnabled) onDragCancel();
-		modeRef.current = groupingEnabled;
-	}, [groupingEnabled, onDragCancel]);
 
 	useEffect(() => {
 		if (!draggingId) return;
@@ -315,6 +316,62 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		},
 		[updatePointer, scheduleIndicator],
 	);
+	/**
+	 * Persist a drop. Also used by external drops (a narrator dragged in from the list
+	 * page), so both paths share the optimistic render, timeout and failure resync.
+	 */
+	const submitPlan = useCallback(async (plan: RecentTabDragPlan): Promise<void> => {
+		if (pendingRef.current) return;
+		pendingRef.current = true;
+		setPending(true);
+		setOptimistic(plan.finalTabs);
+		const { qc, onError, newFolderTitle } = optionsRef.current;
+		const controller = new AbortController();
+		submissionRef.current = controller;
+		const timeout = setTimeout(
+			() => controller.abort(new Error("Recent tab reorder timed out")),
+			SUBMISSION_TIMEOUT_MS,
+		);
+		const { signal } = controller;
+		try {
+			const result = await awaitSubmission(
+				plan.kind === "merge"
+					? api.createRecentTabFolder(
+							{ targetKey: plan.targetKey, sourceKey: plan.sourceKey, title: newFolderTitle },
+							signal,
+						)
+					: api.moveRecentTab(plan.key, plan.target, signal),
+				signal,
+			);
+			const applied = applyRecentTabsDelta(qc, result);
+			if (applied.gaps.length > 0 || applied.backfill.length > 0) {
+				await awaitSubmission(
+					refreshRecentTabsLoadedWindow(qc, {
+						reset: applied.gaps.length > 0,
+						minimumRevision: result.revision,
+					}),
+					signal,
+				);
+			}
+		} catch {
+			try {
+				if (mountedRef.current) onError();
+			} finally {
+				// Resync partial commits, but never keep a cancelled submission locked on a hung refresh.
+				await awaitSubmission(refreshRecentTabsLoadedWindow(qc, { reset: true }), signal).catch(
+					() => {},
+				);
+			}
+		} finally {
+			clearTimeout(timeout);
+			if (submissionRef.current === controller) submissionRef.current = null;
+			pendingRef.current = false;
+			if (mountedRef.current) {
+				setPending(false);
+				setOptimistic(null);
+			}
+		}
+	}, []);
 	const onDragEnd = useCallback(
 		async (event: DragEndEvent) => {
 			const source = activeRef.current;
@@ -324,7 +381,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			const el = optionsRef.current.containerRef.current;
 			const target =
 				pointer && el
-					? resolveRecentTabInternalDrop(
+					? resolveInternalDrop(
 							modelRef.current,
 							source,
 							measureRows(),
@@ -332,7 +389,9 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 							el.getBoundingClientRect(),
 						)
 					: null;
-			const plan = target ? planRecentTabInternalDrop(modelRef.current, source, target) : null;
+			const plan = target
+				? planRecentTabDrop(modelRef.current, source, target, optionsRef.current.newFolderTitle)
+				: null;
 			suppressClick();
 			// A sidebar release belongs only to sorting, even if another surface still
 			// holds an earlier hover target. Keep sidebar subscribers suspended until broadcast ends.
@@ -352,75 +411,11 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			} finally {
 				clear();
 			}
-			if (!plan || (!plan.directoryKeys && !plan.moves.length)) return;
-			pendingRef.current = true;
-			setPending(true);
-			directoryKeysRef.current = new Set(plan.directoryKeys ?? []);
-			setOptimistic(plan.finalTabs);
-			const { qc, onError } = optionsRef.current;
-			const controller = new AbortController();
-			submissionRef.current = controller;
-			const timeout = setTimeout(
-				() => controller.abort(new Error("Recent tab reorder timed out")),
-				SUBMISSION_TIMEOUT_MS,
-			);
-			const { signal } = controller;
-			try {
-				if (plan.directoryKeys) {
-					const result = await awaitSubmission(
-						api.setRecentTabDirectoryOrder(plan.directoryKeys, signal),
-						signal,
-					);
-					await awaitSubmission(applyRecentTabsDeltaAndFollowUp(qc, result), signal);
-				} else {
-					let reset = false;
-					let backfill = false;
-					let revision: number | undefined;
-					for (const move of plan.moves) {
-						signal.throwIfAborted();
-						const result = await awaitSubmission(
-							api.moveRecentTab(
-								move.key,
-								move.beforeKey
-									? { beforeKey: move.beforeKey }
-									: { afterKey: move.afterKey as string },
-								signal,
-							),
-							signal,
-						);
-						const applied = applyRecentTabsDelta(qc, result);
-						reset ||= applied.gaps.length > 0;
-						backfill ||= applied.backfill.length > 0;
-						revision = result.revision;
-					}
-					if (reset || backfill) {
-						await awaitSubmission(
-							refreshRecentTabsLoadedWindow(qc, { reset, minimumRevision: revision }),
-							signal,
-						);
-					}
-				}
-			} catch {
-				try {
-					if (mountedRef.current) onError();
-				} finally {
-					// Resync partial commits, but never keep a cancelled submission locked on a hung refresh.
-					await awaitSubmission(refreshRecentTabsLoadedWindow(qc, { reset: true }), signal).catch(
-						() => {},
-					);
-				}
-			} finally {
-				clearTimeout(timeout);
-				if (submissionRef.current === controller) submissionRef.current = null;
-				pendingRef.current = false;
-				if (mountedRef.current) {
-					setPending(false);
-					setOptimistic(null);
-				}
-			}
+			if (plan) await submitPlan(plan);
 		},
-		[clear, measureRows, suppressClick, updatePointer],
+		[clear, measureRows, submitPlan, suppressClick, updatePointer],
 	);
+
 	const autoScrollOptions = useMemo(
 		() => ({
 			canScroll: (element: Element) => {
@@ -443,16 +438,13 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		return true;
 	}, []);
 	const draggingEntry = draggingId ? model.entries.get(draggingId) : undefined;
-	const draggingDirectory = draggingId
-		? model.rows.find((row) => row.kind === "directory" && `dir:${row.path}` === draggingId)
-		: undefined;
 	return {
 		model,
 		renderTabs,
 		draggingId,
 		draggingTab: draggingEntry?.tab ?? null,
-		draggingDirectory: draggingDirectory?.kind === "directory" ? draggingDirectory : null,
 		draggingRef,
+		submitPlan,
 		pending,
 		sensors,
 		autoScrollOptions,

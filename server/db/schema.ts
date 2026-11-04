@@ -2288,9 +2288,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),
-	// How the sidebar renders the recent-tab work section. "flat" is the historical
-	// behaviour (one row per tab, manually sortable); "directory" merges narrators
-	// that share a working directory into collapsible groups so the path is shown once.
+	// RETIRED: the sidebar's directory-aggregation mode was replaced by user-made folders.
+	// Still accepted and returned for old clients; the sidebar no longer reads it.
 	recentTabsGroupMode: text("recent_tabs_group_mode", { enum: ["flat", "directory"] })
 		.notNull()
 		.default("flat"),
@@ -2555,13 +2554,35 @@ export const userRecentTabs = sqliteTable(
 		tabKey: text("tab_key").notNull(),
 		section: text("section", { enum: ["projects", "work"] }).notNull(),
 		type: text("type", {
-			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group"],
+			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder"],
 		}).notNull(),
 		entityId: text("entity_id").notNull(),
 		narratorId: text("narrator_id"),
 		representedNarratorId: text("represented_narrator_id"),
 		parentNarratorId: text("parent_narrator_id"),
+		/**
+		 * RETIRED. The sidebar used to group a workspace's narrators under a
+		 * `type = "workspace"` header through this column. Those groups were converted to
+		 * folders (`folder_id`) by the one-time per-user migration that sets
+		 * `user_recent_tabs_meta.folders_migrated`. New rows never set it; the only reader
+		 * is `workspace-panel-service`'s one-time backfill, which clears it afterwards.
+		 * Kept because dropping a SQLite column rebuilds the table.
+		 */
 		workspaceId: text("workspace_id"),
+		/**
+		 * The sidebar folder this tab belongs to: the `entity_id` of a `type = "folder"`
+		 * row of the same user. A folder's rows are kept contiguous right after its
+		 * header (see `regroupFolders`). Folders never nest.
+		 */
+		folderId: text("folder_id"),
+		/** Folder rows only: icon key and colour key chosen in the folder editor. */
+		folderIcon: text("folder_icon"),
+		folderColor: text("folder_color"),
+		/**
+		 * Folder rows only: how many members stay visible while the folder is open but
+		 * not fully expanded. NULL means the client default.
+		 */
+		folderPreviewCount: integer("folder_preview_count"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -2570,21 +2591,8 @@ export const userRecentTabs = sqliteTable(
 		isScheduled: integer("is_scheduled", { mode: "boolean" }).notNull().default(false),
 		sortOrder: integer("sort_order").notNull(),
 		/**
-		 * The member position the user arranged by hand inside a directory group
-		 * (sidebar directory-aggregation mode).
-		 *
-		 * MUST stay separate from `sort_order`. That column carries recency and is
-		 * rewritten by the `above_idle` auto-promote every time a narrator starts
-		 * working, so a hand-ordered position stored there is wiped by the next status
-		 * change — that was the actual reason drag-to-reorder never stuck in this mode.
-		 *
-		 * NULL means "never hand-ordered" and sorts BEFORE the ordered members, in
-		 * recency order. A newly visited narrator is the newest thing in the group, so
-		 * burying it under older hand-placed rows would contradict the recency promise
-		 * the rest of the list makes.
-		 *
-		 * Cleared when the tab's cwd changes, otherwise a stale index from the previous
-		 * directory would interleave with the new group's members.
+		 * RETIRED with the sidebar's directory-aggregation mode (replaced by folders).
+		 * Nothing reads or writes it; kept to avoid a table rebuild.
 		 */
 		dirSortOrder: integer("dir_sort_order"),
 		createdAt: text("created_at").notNull(),
@@ -2603,6 +2611,7 @@ export const userRecentTabs = sqliteTable(
 			table.workspaceId,
 			table.sortOrder,
 		),
+		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
 	],
@@ -2615,6 +2624,11 @@ export const userRecentTabsMeta = sqliteTable("user_recent_tabs_meta", {
 		.primaryKey()
 		.references(() => users.id, { onDelete: "cascade" }),
 	revision: integer("revision").notNull().default(0),
+	/**
+	 * True once this user's legacy workspace groups were converted into folders. Set in
+	 * the same transaction as the conversion; see `ensureMigratedLocked`.
+	 */
+	foldersMigrated: integer("folders_migrated", { mode: "boolean" }).notNull().default(false),
 	migratedAt: text("migrated_at").notNull(),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
@@ -3465,13 +3479,9 @@ export const workspaces = sqliteTable(
 // === workspace_panels ===
 // The authoritative membership of a workspace: one row per TOP-LEVEL panel.
 //
-// Rows, not a blob, for two reasons that the previous blob-only design could not
-// satisfy:
-//   - Adding or removing one panel touches one row, so two clients editing
-//     different panels never overwrite each other (a whole-blob write does).
-//   - Membership can be written in the SAME transaction as its
-//     `user_recent_tabs.workspace_id` projection, so a client can no longer end
-//     up with a persisted sidebar tab and a panel that exists nowhere.
+// Rows, not a blob: adding or removing one panel touches one row, so two clients
+// editing different panels never overwrite each other (a whole-blob write does).
+// The sidebar no longer mirrors this membership (its folders are independent).
 //
 // Scope is deliberately limited to panels that can stand on their own and are
 // rendered as top-level cells by BOTH presentation modes — the same set as

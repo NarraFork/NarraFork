@@ -161,16 +161,12 @@ describe("narrator websocket catch-up cursor validation", () => {
 });
 
 /**
- * The recent-tab payload's `dirSortOrder`.
+ * Folder fields on the recent-tab payload.
  *
- * Zod strips unknown keys, so a field the client sends and the service honours is
- * silently discarded unless the schema DECLARES it. That is what happened to the
- * hand-arranged directory position: the undo-restore path dropped it on every
- * request, flattening the groups back to recency order with no error anywhere. The
- * service-level tests cannot see this — they call the service directly, past Zod —
- * so the guarantee has to be asserted at the schema.
+ * Zod strips unknown keys, so folder structure must be DECLARED for the full-list
+ * restore path to carry it back; and only the known icon/colour keys may be stored.
  */
-describe("recentTabSchema — dirSortOrder", () => {
+describe("recentTabSchema — folder fields", () => {
 	const base = {
 		type: "narrator" as const,
 		id: "n-1",
@@ -178,38 +174,39 @@ describe("recentTabSchema — dirSortOrder", () => {
 		lastVisitedAt: 1,
 	};
 
-	it("PRESERVES a hand-arranged position instead of stripping it", () => {
-		const result = recentTabSchema.safeParse({ ...base, dirSortOrder: 3 });
-		expect(result.success).toBe(true);
-		expect(result.success && result.data.dirSortOrder).toBe(3);
-	});
-
-	it("accepts 0 as a real position, not a missing one", () => {
-		// 0 is the first slot in a group; a falsy check anywhere in the path would
-		// silently demote it to "never hand-ordered".
-		const result = recentTabSchema.safeParse({ ...base, dirSortOrder: 0 });
-		expect(result.success && result.data.dirSortOrder).toBe(0);
-	});
-
-	it("leaves it absent when the client never hand-ordered the tab", () => {
-		const result = recentTabSchema.safeParse(base);
-		expect(result.success).toBe(true);
-		expect(result.success && result.data.dirSortOrder).toBeUndefined();
-	});
-
-	it("rejects a negative or non-integer position", () => {
-		expect(recentTabSchema.safeParse({ ...base, dirSortOrder: -1 }).success).toBe(false);
-		expect(recentTabSchema.safeParse({ ...base, dirSortOrder: 1.5 }).success).toBe(false);
-	});
-
-	it("carries the position through the restore payload", () => {
-		// The path that regressed: a full-list restore (the undo fallback when no token
-		// is available).
+	it("carries folder membership and metadata through the restore payload", () => {
 		const result = restoreRecentTabsSchema.safeParse({
-			tabs: [{ ...base, dirSortOrder: 2 }],
+			tabs: [
+				{
+					...base,
+					type: "folder",
+					id: "f-1",
+					folderIcon: "rocket",
+					folderColor: "teal",
+					folderPreviewCount: 0,
+				},
+				{ ...base, folderId: "f-1" },
+			],
 		});
 		expect(result.success).toBe(true);
-		expect(result.success && result.data.tabs?.[0]?.dirSortOrder).toBe(2);
+		expect(result.success && result.data.tabs?.[0]).toMatchObject({
+			folderIcon: "rocket",
+			folderColor: "teal",
+			folderPreviewCount: 0,
+		});
+		expect(result.success && result.data.tabs?.[1]?.folderId).toBe("f-1");
+	});
+
+	it("refuses retired tab types so a restore cannot store them", () => {
+		for (const type of ["workspace", "group", "chapter"]) {
+			expect(recentTabSchema.safeParse({ ...base, type }).success).toBe(false);
+		}
+	});
+
+	it("rejects an unknown icon or colour and a negative preview count", () => {
+		expect(recentTabSchema.safeParse({ ...base, folderIcon: "nope" }).success).toBe(false);
+		expect(recentTabSchema.safeParse({ ...base, folderColor: "nope" }).success).toBe(false);
+		expect(recentTabSchema.safeParse({ ...base, folderPreviewCount: -1 }).success).toBe(false);
 	});
 });
 
