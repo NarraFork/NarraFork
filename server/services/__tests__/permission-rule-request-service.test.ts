@@ -309,12 +309,12 @@ test("real provider formatters preserve flat worktree parameters and required fi
 		{
 			name: "CreateWorktree",
 			required: ["branchName", "destinationPath"],
-			properties: ["branchName", "destinationPath", "baseRef"],
+			properties: ["branchName", "destinationPath", "baseRef", "switchToWorktree"],
 		},
 		{
 			name: "AttachWorktree",
 			required: ["branchName", "destinationPath"],
-			properties: ["branchName", "destinationPath"],
+			properties: ["branchName", "destinationPath", "switchToWorktree"],
 		},
 		{ name: "GetWorktreeOperation", required: ["operationId"], properties: ["operationId"] },
 	];
