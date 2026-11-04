@@ -1864,10 +1864,15 @@ async function maybeDeliverInterruptTaskGuard(
 		if (interruptTaskGuardRevisions.get(narratorId) === revision) return;
 		interruptTaskGuardRevisions.set(narratorId, revision);
 
-		const { content, body } = taskSource.interruptGuardNote(
-			openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS),
-			active.locale,
-		);
+		const listed = openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS);
+		const note = taskSource.interruptGuardNote(listed, active.locale);
+		const content = note.content;
+		// The reader's card counts the open tasks it does not list (the source's own list may be a
+		// prefix of a longer one, so the card reads it as "at least"). The model text is unchanged.
+		const body =
+			note.body.kind === "tasks" && openTasks.length > listed.length
+				? { ...note.body, taskCount: openTasks.length }
+				: note.body;
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
@@ -9535,7 +9540,7 @@ export async function loadOptionalTool(
 		{ id: toolName, description: toolName, toolNames: [toolName] },
 		true,
 	);
-	return result === "loaded"
+	return result === "loaded" || result === "loaded_new_epoch"
 		? "loaded"
 		: result === "already_loaded"
 			? "already_loaded"

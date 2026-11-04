@@ -563,6 +563,80 @@ describe("unified prefix epochs with real SQLite history", () => {
 	});
 });
 
+const epochMarkers = async (id: string) =>
+	(await history(id)).filter(
+		(row) =>
+			row.role === "system" &&
+			Array.isArray(row.contentJson) &&
+			(row.contentJson[0] as { type?: string })?.type === "epoch",
+	);
+
+test("an explicit load the strategy cannot append opens one new epoch that declares it", async () => {
+	const { narratorId, input: original } = await fixture();
+	const input = { ...original, model: "claude-sonnet-4" };
+	const first = await reconcileEpoch(input);
+	expect(first.epoch?.strategy).toBe("replace_tools");
+	expect(first.epoch?.baseToolNames).not.toContain(optionalTool.name);
+	await narratorStore.appendToolChange(
+		narratorId,
+		{
+			type: "tool_loaded",
+			toolName: optionalTool.name,
+			toolNames: [optionalTool.name],
+			text: "loaded",
+			rebaseline: true,
+		},
+		undefined,
+		[optionalTool.name],
+	);
+	const loaded = { ...input, current: [optionalTool.name] };
+	const next = await reconcileEpoch(loaded);
+	expect(next.opened).toBe(true);
+	expect(next.epoch?.markerId).not.toBe(first.epoch?.markerId);
+	expect(next.epoch?.reason).toBe("tools");
+	expect(next.epoch?.baseToolNames).toContain(optionalTool.name);
+	// The new baseline declares the tool, so the notice no longer reopens epochs.
+	const again = await reconcileEpoch(loaded);
+	expect(again.opened).toBe(false);
+	expect(again.epoch?.markerId).toBe(next.epoch?.markerId);
+	expect(await epochMarkers(narratorId)).toHaveLength(2);
+});
+
+test("a protocol change on the same model opens a new epoch with the new strategy", async () => {
+	const { narratorId, input } = await fixture();
+	const first = await reconcileEpoch(input);
+	expect(first.epoch?.protocol).toBe("anthropic-messages");
+	expect(first.epoch?.strategy).toBe("anthropic_tool_addition");
+	const key = `${provider}:${input.model}`;
+	const saved = settings.agent.modelProtocols;
+	settings.agent.modelProtocols = { ...saved, [key]: "completions-compatible" };
+	try {
+		const next = await reconcileEpoch(input);
+		expect(next.opened).toBe(true);
+		expect(next.epoch?.reason).toBe("target");
+		expect(next.epoch?.protocol).toBe("completions-compatible");
+		expect(next.epoch?.strategy).toBe("replace_tools");
+		expect((await reconcileEpoch(input)).opened).toBe(false);
+	} finally {
+		settings.agent.modelProtocols = saved;
+	}
+	expect(await epochMarkers(narratorId)).toHaveLength(2);
+});
+
+test("an epoch without a recorded protocol is kept while its strategy still matches", async () => {
+	const { narratorId, input } = await fixture();
+	await reconcileEpoch(input);
+	const marker = (await epochMarkers(narratorId))[0];
+	const recorded = epochRecordOf((marker?.contentJson as unknown[] | undefined)?.[0]);
+	if (!recorded?.protocol) throw new Error("Missing recorded protocol");
+	// The same baseline as written before `protocol` was recorded.
+	const { protocol: _protocol, ...legacy } = recorded;
+	const legacyMarker = await narratorStore.openEpoch(narratorId, legacy);
+	const next = await reconcileEpoch(input);
+	expect(next.opened).toBe(false);
+	expect(next.epoch?.markerId).toBe(legacyMarker.id);
+});
+
 for (const change of ["device", "resident"] as const) {
 	test(`automatic ${change} changes cannot publish undeclared tools on a replace-only target`, async () => {
 		const { narratorId, input: original } = await fixture();

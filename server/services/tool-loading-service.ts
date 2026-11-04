@@ -3,15 +3,18 @@ import { type RoutineModeConfig, resolveEffectiveToolRoutineMode } from "@shared
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects, users } from "../db/schema";
-import { classifyToolAdditions, type ToolDefinitionSnapshot } from "../lib/agent/tool-loading";
+import {
+	classifyToolAdditions,
+	rebaselineRequests,
+	type ToolDefinitionSnapshot,
+} from "../lib/agent/tool-loading";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import type { ToolContext, ToolDefinition } from "../lib/agent/types";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
-import { ValidationError } from "../lib/errors";
 import { getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { settings } from "../lib/settings";
+import { type ModelProtocol, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorStore } from "./narrator-store";
 import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-policy";
@@ -265,6 +268,8 @@ function localizedGroupDescription(group: LoadableToolGroup, locale: Locale): st
 
 export type ToolGroupChangeStatus =
 	| "loaded"
+	/** Loaded; the next request opens a new epoch to declare it (prompt cache discarded). */
+	| "loaded_new_epoch"
 	| "already_loaded"
 	| "unloaded"
 	| "not_loaded"
@@ -404,7 +409,8 @@ export async function changeLoadedToolGroup(
 					if (exists !== loaded) changed.push(name);
 				}
 			}
-			if (!changed.length) return loaded ? "already_loaded" : "not_loaded";
+			if (!changed.length && !loaded) return "not_loaded";
+			let rebaseline = false;
 
 			// Freeze only the newly authorized definitions, before publishing their notice.
 			// Old load events keep their own snapshot; never rebuild them from the registry.
@@ -418,13 +424,19 @@ export async function changeLoadedToolGroup(
 					{ signal: context?.signal },
 				);
 				const epoch = await toolLoadingEpochOf(narratorId, history);
-				const { blocked } = classifyToolAdditions(epoch, changed);
-				if (blocked.length) {
-					throw new ValidationError(
-						`This model's current prefix epoch cannot append new tool definitions: ${blocked.join(", ")}. ` +
-							"Compact the conversation or switch models before loading these tools. No tools were loaded.",
+				// A tool that is already on (resident, device) may still be undeclared in this
+				// epoch; an explicit load is then what asks for it to be declared, once.
+				if (!changed.length) {
+					const requested = rebaselineRequests(history, epoch?.markerId);
+					changed = classifyToolAdditions(epoch, group.toolNames).blocked.filter(
+						(name) => !requested.has(name),
 					);
 				}
+				if (!changed.length) return "already_loaded";
+				// The epoch's strategy cannot append these declarations. The load still
+				// commits; its notice asks the next request to open a new epoch that declares
+				// them, which discards this prefix's prompt cache once.
+				rebaseline = classifyToolAdditions(epoch, changed).blocked.length > 0;
 				const { putPrefixToolDefinitions } = await import("./narrator-prefix-snapshots");
 				const frozenByName = new Map<string, ToolDefinitionSnapshot>();
 				if (epoch?.prefix) {
@@ -465,6 +477,7 @@ export async function changeLoadedToolGroup(
 				toolName: group.id,
 				toolNames: changed,
 				...(definitionSnapshotRef ? { definitionSnapshotRef } : {}),
+				...(rebaseline ? { rebaseline: true as const } : {}),
 				text: loaded
 					? getToolMessageWithParams("toolLoaded", noticeLocale, {
 							toolName: group.id,
@@ -509,8 +522,50 @@ export async function changeLoadedToolGroup(
 					children: [],
 				},
 			});
-			return loaded ? "loaded" : "unloaded";
+			return loaded ? (rebaseline ? "loaded_new_epoch" : "loaded") : "unloaded";
 		},
 		context?.signal,
 	);
+}
+
+/** The names the provider settings' protocol picker shows (`customApiProtocol*`). */
+const PROTOCOL_LABELS: Record<ModelProtocol, Record<Locale, string>> = {
+	"anthropic-messages": { en: "Anthropic Messages", "zh-CN": "Anthropic Messages" },
+	"openai-responses": { en: "OpenAI Responses", "zh-CN": "OpenAI Responses" },
+	"completions-compatible": { en: "Legacy Completions Compatible", "zh-CN": "Completions老旧兼容" },
+	"gemini-compatible": { en: "Gemini Compatible", "zh-CN": "Gemini 兼容" },
+};
+
+/**
+ * After a `loaded_new_epoch` load: the protocols this connection can select for the
+ * session's model on which later loads would keep the prompt cache, as settings-page
+ * labels. Best effort; an unresolvable model simply yields no suggestion.
+ */
+export async function suggestProtocolsForToolLoading(
+	narratorId: string,
+	locale: Locale,
+	identity?: { model?: string; provider?: string },
+): Promise<string[]> {
+	try {
+		const { activeNarrators } = await import("./narrator-session-state");
+		const active = activeNarrators.get(narratorId);
+		const { resolveProviderAndModel, suggestToolAppendingProtocols } = await import("../lib/agent");
+		let model = identity?.model ?? active?.model;
+		let provider = identity?.provider ?? active?.provider;
+		if (!model || !provider) {
+			// An idle session after a restart: resolve its stored selection.
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { model: true },
+			});
+			const resolved = resolveProviderAndModel(row?.model ?? undefined);
+			model = resolved.model;
+			provider = resolved.provider;
+		}
+		return suggestToolAppendingProtocols(model, provider).map(
+			(protocol) => PROTOCOL_LABELS[protocol][locale],
+		);
+	} catch {
+		return [];
+	}
 }

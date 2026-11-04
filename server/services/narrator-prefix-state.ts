@@ -172,7 +172,9 @@ export function createPrefixStateLoader(
 				contentText: loaded.modelText ?? row.contentText,
 				contentJson: [
 					{ type: "text", text: loaded.modelText },
-					{ ...loaded, modelText: undefined },
+					// The reader's summary (`display`) stays on the stored row: the model's history
+					// carries the update without it.
+					{ ...loaded, modelText: undefined, display: undefined },
 				],
 			};
 			const payload = requestPayloads.get(sourceMessages)?.get(update.snapshotRef);

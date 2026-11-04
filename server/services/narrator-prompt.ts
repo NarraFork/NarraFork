@@ -111,6 +111,11 @@ export interface BuildPromptResult {
 	 * their previous values instead of removing them. Present only when there are some.
 	 */
 	keepParts?: string[];
+	/**
+	 * Reader summaries of the context parts that have one (`ContextPart.display`), by key. The
+	 * prefix never reads them; a `context_update` that changes such a part stores its summary.
+	 */
+	displays?: Record<string, unknown>;
 }
 
 /**
@@ -380,9 +385,13 @@ export async function buildEffectiveSystemPrompt(
 	if (options.modelsContext !== undefined) appendPart("models", options.modelsContext);
 	if (options.runtimeHints !== undefined) appendPart("runtime", options.runtimeHints);
 	const keepParts: string[] = [];
+	const displays: Record<string, unknown> = {};
 	for (const part of options.contextParts ?? []) {
 		if (part.unreadable) keepParts.push(part.key);
-		else appendPart(part.key, part.text);
+		else {
+			appendPart(part.key, part.text);
+			if (part.display !== undefined) displays[part.key] = part.display;
+		}
 	}
 
 	return {
@@ -392,5 +401,6 @@ export async function buildEffectiveSystemPrompt(
 		usedCompactSummary,
 		...(summaryRange ? { summaryRange } : {}),
 		...(keepParts.length > 0 ? { keepParts } : {}),
+		...(Object.keys(displays).length > 0 ? { displays } : {}),
 	};
 }

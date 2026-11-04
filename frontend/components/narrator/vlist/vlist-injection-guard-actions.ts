@@ -29,11 +29,17 @@ export type InjectionGuardActionsResolver = (
 	messageId: string | undefined,
 ) => InjectionGuardActions | undefined;
 
-/** True when this row is the interrupt task-guard reminder card. */
+/**
+ * True when this row is the interrupt task-guard reminder card: a task notice (its tasks as
+ * rows), or the plain origin notice a row without tasks still renders as.
+ */
 export function isInterruptGuardItem(item: VListItem): boolean {
 	if (item.spec.kind !== "system-text") return false;
 	const data = item.spec.data as { kind?: unknown; originLabel?: unknown } | null;
-	return data?.kind === "origin_notice" && data?.originLabel === INTERRUPT_TASK_GUARD_SOURCE;
+	return (
+		(data?.kind === "origin_notice" || data?.kind === "tasks_notice") &&
+		data?.originLabel === INTERRUPT_TASK_GUARD_SOURCE
+	);
 }
 
 /**

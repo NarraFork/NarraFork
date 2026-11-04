@@ -308,6 +308,14 @@ export const OUTLINE_TASK_SOURCE_SCENARIOS: OutlineScenario[] = [
 						`- [ ] \`${printer.address}\` Write the printer`,
 						"1 more; read `session/` with OutlineRead.",
 					].join("\n"),
+					// The reader's summary beside it (a `context_update` row stores it): the tasks
+					// listed, titled, and how many are open of each kind. Prerequisites stay out.
+					display: {
+						doing: [{ address: parser.address, title: "Write the parser", humanCreated: true }],
+						waiting: [{ address: waiting.address, title: "Waiting on access" }],
+						next: [{ address: printer.address, title: "Write the printer" }],
+						counts: { doing: 1, waiting: 1, todo: 2 },
+					},
 				},
 			]);
 			const zh = (await source.contextParts("zh-CN"))[0]?.text ?? "";
