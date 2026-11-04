@@ -15,6 +15,7 @@ import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
 import * as narratorWs from "../websocket/narrator-ws";
 import { getDefaultLocalFileChangeRuntime } from "./file-change-runtime";
+import { ensureConversationIdentityPersisted } from "./narrator-conversation-identity";
 import * as scopedRevert from "./narrator-scoped-revert";
 import {
 	previewNarratorScopedForMessages,
@@ -26,7 +27,11 @@ import {
 import { narratorService } from "./narrator-service";
 import * as session from "./narrator-session";
 import { editAndRegenerate, rollbackToBlock } from "./narrator-session";
-import { hasNarratorAdmissionWork } from "./narrator-session-state";
+import {
+	type ActiveNarrator,
+	activeNarrators,
+	hasNarratorAdmissionWork,
+} from "./narrator-session-state";
 import * as access from "./revert-planner-local-access";
 import type { RevertTransactionOutcome } from "./revert-transaction-service";
 import { emptyRevertResult, SnapshotRevertError } from "./snapshot-revert";
@@ -169,6 +174,83 @@ async function editPreview(
 }
 
 describe("edit regeneration executes only the reviewed plan", () => {
+	for (const scenario of [
+		{ name: "empty plan with persisted identity", persisted: "existing-key", tail: false },
+		{ name: "empty plan before first identity claim", persisted: null, tail: false },
+		{ name: "plan removing later history", persisted: "existing-key", tail: true },
+		{
+			name: "history-only edit preserving identity",
+			persisted: "existing-key",
+			tail: true,
+			skipRevert: true,
+		},
+	]) {
+		test(`${scenario.name} admits the next request with a consistent identity`, async () => {
+			const target = userMessage();
+			const tail = scenario.tail ? message() : null;
+			db.update(schema.narrators)
+				.set({ apiConversationId: scenario.persisted })
+				.where(eq(schema.narrators.id, narratorId))
+				.run();
+			const revertPlan = scenario.skipRevert ? undefined : await editPreview(target);
+			const active = {
+				narratorId,
+				alive: true,
+				abortController: new AbortController(),
+				conversationId: scenario.persisted ?? "first-request-key",
+				_persistedConversationId: scenario.persisted,
+			} as ActiveNarrator;
+			const storedIdentity = () =>
+				db
+					.select({ id: schema.narrators.apiConversationId })
+					.from(schema.narrators)
+					.where(eq(schema.narrators.id, narratorId))
+					.get()?.id;
+			const broadcast = spyOn(narratorWs, "broadcastToNarrator");
+			activeNarrators.set(narratorId, active);
+			try {
+				// Execute the real reviewed plan and edit, but drive the production
+				// request-identity gate ourselves instead of making a provider request.
+				const result = await editAndRegenerate(narratorId, target, "edited prompt", "en", false, {
+					userId,
+					deferContinuation: true,
+					revertPlan,
+					...(scenario.skipRevert ? { revertFiles: false } : {}),
+				});
+				expect(result.ok).toBe(true);
+				expect(content(target)).toEqual([{ type: "text", text: "edited prompt" }]);
+				if (!scenario.skipRevert) {
+					expect(result.revertResult?.historyCommitted).toBe(true);
+					expect(active._resetUpstreamSessionOnNextRequest).toBe(true);
+					expect(broadcast).toHaveBeenCalledWith(narratorId, {
+						type: "full_reload",
+						narratorId,
+					});
+				}
+				const expected = scenario.tail && !scenario.skipRevert ? null : scenario.persisted;
+				expect(storedIdentity()).toBe(expected);
+				// A no-op plan must not claim that SQL cleared the persisted identity.
+				// This production gate used to throw CONVERSATION_IDENTITY_CHANGED here.
+				await expect(ensureConversationIdentityPersisted(narratorId, active)).resolves.toBe(
+					active.conversationId,
+				);
+				expect(active._persistedConversationId).toBe(active.conversationId);
+				expect(storedIdentity()).toBe(active.conversationId);
+				if (tail) {
+					expect(
+						db
+							.select()
+							.from(schema.narratorMessageRefs)
+							.where(eq(schema.narratorMessageRefs.messageId, tail))
+							.all(),
+					).toHaveLength(0);
+				}
+			} finally {
+				activeNarrators.delete(narratorId);
+			}
+		}, 30_000);
+	}
+
 	test("same plan restores the tail and retains the actual new prompt", async () => {
 		const target = userMessage();
 		const call = await write("edit.txt");
