@@ -308,3 +308,42 @@ test("every node is drawn at its measured height across font × letter spacing �
 	expect(failures).toEqual([]);
 	expect(e.errors).toEqual([]);
 }, 180_000);
+
+/**
+ * A URL with a `?` between CJK brackets: Chromium breaks after the `?`, so the never-break word
+ * before `」` starts after it. Exact at these settings. At a few others (115/10, 130/2, 130/25,
+ * 180/10–15) pretext and Chromium still break the URL differently, as they did before the
+ * never-break words (a known limit), so the line is not part of the all-settings sweep.
+ */
+test("a URL with a `?` inside CJK brackets is drawn at its measured height", async () => {
+	const line =
+		"链接「https://example.com/a?b=c&d=e」后面中文，再写一些字让它换行到下一行去看看效果如何。";
+	const { pageId } = await seedPage(h, "链接", [line]);
+	const e = await openHost(h, "page", pageId, { width: 1600, height: 1200 });
+	await e.call((f) => f.setView("map"));
+	await settled(e);
+	const failures: string[] = [];
+	for (const [fontScalePercent, letterSpacingPercent] of [
+		[100, 0],
+		[100, 2],
+		[100, 25],
+		[115, -5],
+		[115, 15],
+	] as const) {
+		const setting = { fontScalePercent, letterSpacingPercent, lineHeightScalePercent: 100 };
+		await e.call((f, s) => f.applyTypography(s as never), setting);
+		await e.call((f) => f.mapTypographySettled());
+		await e.call((f) => f.mapFit());
+		await e.call((f) => f.mapFlush());
+		const accuracy = await e.call((f) => f.nodeAccuracy());
+		const overflow = (await e.call((f) => f.nodeOverflow())).filter(
+			(o) => o.overW > 0 || o.overH > 0,
+		);
+		expect(accuracy.checked).toBe(2);
+		if (accuracy.maxDiffH > 1 || accuracy.overH > 0 || overflow.length > 0) {
+			failures.push(`${JSON.stringify(setting)}: maxDiffH ${accuracy.maxDiffH}`);
+		}
+	}
+	expect(failures).toEqual([]);
+	expect(e.errors).toEqual([]);
+}, 60_000);

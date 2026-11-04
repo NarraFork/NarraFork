@@ -155,6 +155,27 @@ describe("mind-map node typography", () => {
 		expect(bodySize(`${before}\`code\`${after}`).h).toBe(3 * t.lineH);
 	});
 
+	it("leaves the punctuation after a chip wider than a line in the text", async () => {
+		const { measureRichInlineStats, prepareRichInline } = await import(
+			"@chenglou/pretext/rich-inline"
+		);
+		// A chip with no space that is wider than a line wraps anywhere in the browser: its
+		// punctuation is not a width reserved on every line it spans (that cost a line here).
+		const chip = "a".repeat(63);
+		const tail = "，后接中文。";
+		const t = mapType();
+		const sans = `${t.px}px ${MAP_FONT_FAMILY}`;
+		const asText = measureRichInlineStats(
+			prepareRichInline([
+				{ text: chip, font: t.codeFont, extraWidth: 6 },
+				{ text: tail, font: sans },
+			]),
+			NODE.maxBody,
+		);
+		expect(asText.lineCount).toBe(2);
+		expect(bodySize(`\`${chip}\`${tail}`).h).toBe(2 * t.lineH);
+	});
+
 	it("keys the cache by the setting, and drops it when the setting changes", () => {
 		const key = measureKey("同一段文字", plain).key;
 		bodySize("同一段文字");

@@ -167,23 +167,32 @@ const TRAILING_OPEN = /[（「『【〈《〔〖〘〚“‘([{]+$/u;
  * at every letter spacing (a zero-width joiner would be counted as one more spaced grapheme).
  *
  * The word starts where a line may break before it, in the browser as in pretext: after a space,
- * a CJK character, or a hyphen or dash (`fix/retry-after-interrupt）` keeps `interrupt）`).
+ * a CJK character, a hyphen or dash (`fix/retry-after-interrupt）` keeps `interrupt）`), or a `?`
+ * or `!` (`「https://example.com/a?b=c」` keeps `b=c」`: Chromium breaks after `?`). Not after a
+ * `/`: Chromium keeps `src/components/…/measure.ts）` whole.
  */
 const WORD_BEFORE_CJK_CLOSE =
-	/[（「『【〈《〔〖〘〚]*[^\s\-‐–—\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef]+[，。、；：！？）」』】〉》〕〗〙〛]+/gu;
+	/[（「『【〈《〔〖〘〚]*[^\s\-‐–—?!\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef]+[，。、；：！？）」』】〉》〕〗〙〛]+/gu;
 /**
  * The first word of a run, as far as a line may not break inside it: up to a space or a CJK
- * character, or just past a hyphen or dash. See {@link keepLeadingWordsWhole}.
+ * character, or just past a hyphen, a dash, a `?` or a `!`. See {@link keepLeadingWordsWhole}.
  */
 const LEADING_WORD =
-	/^[^\s\-‐–—\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef]+[-‐–—]?/u;
+	/^[^\s\-‐–—?!\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u3000-\u303f\uff00-\uffef]+[-‐–—?!]?/u;
 
 /** A chip's horizontal padding (inline code and mentions: 3 px a side). */
 const CHIP_PADDING = 6;
 
-/** A chip (inline code, a mention) that cannot break inside: one word, or never broken. */
-function unbreakable(item: RichInlineItem): boolean {
-	return item.break === "never" || !/\s/.test(item.text.trim());
+/**
+ * A chip (inline code, a mention) that cannot break inside: never broken, or one word. A word
+ * with no hyphen, dash, `?` or `!` in it that is wider than a line is not: the browser breaks it
+ * anywhere (`overflow-wrap`), filling every line, so nothing may be reserved on each of them.
+ */
+function unbreakable(item: RichInlineItem, maxW: number): boolean {
+	if (item.break === "never") return true;
+	const text = item.text.trim();
+	if (/\s/.test(text)) return false;
+	return /[-‐–—?!]/.test(text) || fitsOnALine(item.text, item.font, maxW);
 }
 
 /**
@@ -201,6 +210,7 @@ function unbreakable(item: RichInlineItem): boolean {
 function keepPunctuationAttached(
 	items: RichInlineItem[],
 	chips: ReadonlySet<RichInlineItem>,
+	maxW: number,
 ): void {
 	for (let i = 1; i < items.length; i++) {
 		const prev = items[i - 1] as RichInlineItem;
@@ -209,7 +219,7 @@ function keepPunctuationAttached(
 		const close = chips.has(next) ? null : LEADING_CLOSE.exec(next.text)?.[0];
 		if (close) {
 			if (!chips.has(prev)) prev.text += close;
-			else if (unbreakable(prev))
+			else if (unbreakable(prev, maxW))
 				prev.extraWidth = (prev.extraWidth ?? 0) + runWidth(close, next.font);
 			else continue;
 			next.text = next.text.slice(close.length);
@@ -218,7 +228,7 @@ function keepPunctuationAttached(
 		const open = chips.has(prev) ? null : TRAILING_OPEN.exec(prev.text)?.[0];
 		if (open) {
 			if (!chips.has(next)) next.text = open + next.text;
-			else if (unbreakable(next))
+			else if (unbreakable(next, maxW))
 				next.extraWidth = (next.extraWidth ?? 0) + runWidth(open, prev.font);
 			else continue;
 			prev.text = prev.text.slice(0, -open.length);
@@ -369,7 +379,7 @@ function inlineGroups(
 		}
 	});
 	return groups.map((g) => {
-		keepPunctuationAttached(g, chips);
+		keepPunctuationAttached(g, chips, maxW);
 		return keepLeadingWordsWhole(keepWordsWithCjkClose(g, chips, maxW), chips, maxW);
 	});
 }
