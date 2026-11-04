@@ -10,8 +10,8 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own users,
  * projects and sessions. The delivery to sessions is replaced through its seam.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
+import { eq, inArray } from "drizzle-orm";
 import { db } from "../../../db";
 import { narratorMessages, narrators, outlineCommits, projects, users } from "../../../db/schema";
 import { askUserQuestionTool } from "../../../lib/agent/tools/ask-user-question";
@@ -578,6 +578,36 @@ describe("Ask", () => {
 					isParent: false,
 				}),
 			);
+			expect((await relay("Q1")).output).toContain(passOver);
+		});
+		// The clock steps back before the continuation is written (review round 4): its time sorts
+		// before Alice's message, but the history's order still puts it after.
+		await tick();
+		const lastWord = await says(w.a, w.alice, "one more thing");
+		await inRun(w.a, async () => {
+			setSystemTime(new Date(Date.now() - 10 * 60_000));
+			let continuation: { id: string };
+			try {
+				continuation = await narratorService.persistSystemMessage(w.a, prompt, [
+					{
+						type: "spec_continuation",
+						task: "Ship the importer",
+						protected: false,
+						modelText: prompt,
+					},
+				]);
+			} finally {
+				setSystemTime();
+			}
+			const times = new Map(
+				(
+					await db
+						.select({ id: narratorMessages.id, createdAt: narratorMessages.createdAt })
+						.from(narratorMessages)
+						.where(inArray(narratorMessages.id, [lastWord, continuation.id]))
+				).map((r) => [r.id, r.createdAt]),
+			);
+			expect((times.get(continuation.id) as string) < (times.get(lastWord) as string)).toBe(true);
 			expect((await relay("Q1")).output).toContain(passOver);
 		});
 		// Alice's own pass relays, her own further words in it included.

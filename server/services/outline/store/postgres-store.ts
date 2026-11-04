@@ -1373,10 +1373,13 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		async listOpenQuestionsBySpaces(spaceIds, limitPerSpace) {
 			const out: OutlineQuestionRow[] = [];
 			for (const chunk of chunked([...new Set(spaceIds)])) {
-				// Ranked within each space over the open-questions index; the oldest `limitPerSpace`.
+				// Ranked within each space over the open-questions index, whole rows (no join back,
+				// which let the planner pick a sequential scan); the oldest `limitPerSpace`. The
+				// ranking sorts all the open questions of the spaces: few (a session has at most 50
+				// open), and no index orders them (a known limit).
 				const ranked = db
 					.select({
-						blockId: outlineQuestions.blockId,
+						...getTableColumns(outlineQuestions),
 						rank: sql<number>`row_number() over (partition by ${outlineQuestions.spaceId} order by ${outlineQuestions.createdAt}, ${outlineQuestions.blockId} COLLATE "C")`.as(
 							"rank",
 						),
@@ -1386,15 +1389,14 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 					.as("ranked");
 				const rows = await db
 					.select()
-					.from(outlineQuestions)
-					.innerJoin(ranked, eq(ranked.blockId, outlineQuestions.blockId))
+					.from(ranked)
 					.where(lte(ranked.rank, limitPerSpace))
 					.orderBy(
-						sql`${outlineQuestions.spaceId} COLLATE "C"`,
-						asc(outlineQuestions.createdAt),
-						sql`${outlineQuestions.blockId} COLLATE "C"`,
+						sql`${ranked.spaceId} COLLATE "C"`,
+						asc(ranked.createdAt),
+						sql`${ranked.blockId} COLLATE "C"`,
 					);
-				out.push(...rows.map((r) => toQuestion(r.outline_questions)));
+				out.push(...rows.map(({ rank: _rank, ...row }) => toQuestion(row)));
 			}
 			return out;
 		},

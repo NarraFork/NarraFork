@@ -58,6 +58,7 @@ import { isOutlineEnabled } from "./feature";
 import { OUTLINE_LIMITS, type OutlineAskAnswerJson, type OutlineAskJson } from "./model";
 import { outlineStore } from "./store";
 import {
+	chunked,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
 	type OutlineQuestionRow,
@@ -817,8 +818,11 @@ async function withdrawQuestions(
 /** Origin labels of messages a person sent through another door (a gateway, an OAuth app). */
 const PERSON_LABEL = /^(gateway|oauth)(:|$)/;
 
-/** Top-level inputs of one run read to see that nothing but the person spoke after its trigger. */
-const RELAY_PASS_SCAN = 200;
+/**
+ * Envelopes of the session after a run's trigger (in history order) read to see that nothing but
+ * the person spoke since; a run longer than that is not checked, and its relays are refused.
+ */
+const RELAY_PASS_SCAN = 2000;
 
 /**
  * The message a relayed answer comes from (review B1), and the door it came through: the message
@@ -832,8 +836,10 @@ const RELAY_PASS_SCAN = 200;
  *     agent label: a gateway or an OAuth client may carry them), written after the question was
  *     asked (`after`).
  *   - Only the pass it started (review S-1, round 3): an outline continuation, a wake, a `Send`
- *     resuming a held run or any input not the person's own, written in the run after the
- *     trigger, ends that pass; a relay after it is refused. Their own further words do not.
+ *     resuming a held run or any input not the person's own, after the trigger in the session's
+ *     history, ends that pass; a relay after it is refused. Their own further words do not.
+ *     "After" is the history's order (`narrator_message_refs.seq`), never the clock (review
+ *     round 4: a clock stepped back must not hide a continuation).
  *
  * `via`: the trigger's origin label (a gateway handle, an OAuth client), so the record shows who
  * actually typed (review N-1). Read on SQLite; refused on PostgreSQL, where runs and the
@@ -851,8 +857,8 @@ async function relayMessageOf(
 	if (!turnId) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
 	const [
 		{ db },
-		{ narratorBlocks, narratorMessages, narratorTurns },
-		{ and, asc, eq, gte, inArray, isNull, ne, sql },
+		{ narratorBlocks, narratorMessageRefs, narratorMessages, narratorTurns },
+		{ and, asc, eq, gt, inArray, isNull, sql },
 	] = await Promise.all([import("@server/db"), import("@server/db/schema"), import("drizzle-orm")]);
 	const turn = db
 		.select({ trigger: narratorTurns.triggerMessageId })
@@ -862,6 +868,7 @@ async function relayMessageOf(
 	if (!turn?.trigger) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
 	const m = narratorMessages;
 	const b = narratorBlocks;
+	const refs = narratorMessageRefs;
 	const columns = {
 		id: m.id,
 		role: m.role,
@@ -878,37 +885,49 @@ async function relayMessageOf(
 		.from(m)
 		.where(and(eq(m.id, turn.trigger), eq(m.narratorId, narratorId)))
 		.get();
-	if (!row) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
-	// The inputs written in this run after its trigger, top level (the toplevel index from the
-	// trigger on, this run's rows only).
-	const later = db
-		.select(columns)
-		.from(m)
-		.where(
-			and(
-				eq(m.narratorId, narratorId),
-				isNull(m.parentToolUseId),
-				gte(m.createdAt, row.createdAt),
-				eq(m.turnId, turnId),
-				ne(m.id, row.id),
-				inArray(m.role, ["user", "sys"]),
-			),
-		)
-		.orderBy(asc(m.createdAt))
+	// Its place in the session's history (the message index, then this session's ref).
+	const at = db
+		.select({ seq: refs.seq })
+		.from(refs)
+		.where(and(eq(refs.messageId, turn.trigger), eq(refs.narratorId, narratorId)))
+		.limit(1)
+		.get();
+	if (!row || !at) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
+	// The envelopes after it in the session's history (the session's seq index, bounded), and of
+	// them the top-level inputs: user and sys rows, in history order.
+	const following = db
+		.select({ messageId: refs.messageId, seq: refs.seq })
+		.from(refs)
+		.where(and(eq(refs.narratorId, narratorId), gt(refs.seq, at.seq)))
+		.orderBy(asc(refs.seq))
 		.limit(RELAY_PASS_SCAN + 1)
 		.all();
-	// ...or, its body kept in rows only (`narratorBlocks.compactJson`), as a context block.
-	const ids = [row.id, ...later.map((r) => r.id)];
-	const injectedRows = new Set(
-		db
-			.select({ messageId: b.messageId })
+	if (following.length > RELAY_PASS_SCAN) return { problem: OUTLINE_QUESTION_TEXT.relayPassOver };
+	const seqOf = new Map(following.map((r) => [r.messageId, r.seq]));
+	const later: Array<typeof row> = [];
+	for (const ids of chunked(following.map((r) => r.messageId)))
+		later.push(
+			...db
+				.select(columns)
+				.from(m)
+				.where(
+					and(inArray(m.id, ids), isNull(m.parentToolUseId), sql`${m.role} in ('user', 'sys')`),
+				)
+				.all(),
+		);
+	later.sort((x, y) => (seqOf.get(x.id) ?? 0) - (seqOf.get(y.id) ?? 0));
+	// ...or, its body kept in rows only (`narratorBlocks.compactJson`), as its one context block.
+	// Looked up by message through the single-block index (the literal predicate is that index's
+	// own; no subtype term, so the instance-wide subtype index is never chosen: review round 4).
+	const injectedRows = new Set<string>();
+	for (const ids of chunked([row.id, ...later.map((r) => r.id)]))
+		for (const block of db
+			.select({ messageId: b.messageId, kind: b.kind, subtype: b.subtype })
 			.from(b)
-			.where(
-				and(inArray(b.messageId, ids), eq(b.kind, "context"), eq(b.subtype, "system_injection")),
-			)
-			.all()
-			.map((r) => r.messageId),
-	);
+			.where(and(inArray(b.messageId, ids), sql`${b.kind} in ('input', 'context')`))
+			.all())
+			if (block.kind === "context" && block.subtype === "system_injection")
+				injectedRows.add(block.messageId);
 	const ownWords = (r: typeof row) =>
 		r.role === "user" &&
 		r.parentToolUseId === null &&
@@ -919,8 +938,7 @@ async function relayMessageOf(
 		!injectedRows.has(r.id);
 	if (!ownWords(row)) return { problem: OUTLINE_QUESTION_TEXT.relayNotTheirTurn };
 	if (row.createdAt <= after) return { problem: OUTLINE_QUESTION_TEXT.relayBeforeQuestion };
-	if (later.length > RELAY_PASS_SCAN || later.some((r) => !ownWords(r)))
-		return { problem: OUTLINE_QUESTION_TEXT.relayPassOver };
+	if (later.some((r) => !ownWords(r))) return { problem: OUTLINE_QUESTION_TEXT.relayPassOver };
 	return { id: row.id, via: row.originLabel };
 }
 

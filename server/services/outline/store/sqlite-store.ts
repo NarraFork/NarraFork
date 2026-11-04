@@ -1223,10 +1223,12 @@ export const sqliteOutlineStore: OutlineStore = {
 	async listOpenQuestionsBySpaces(spaceIds, limitPerSpace) {
 		const out: OutlineQuestionRow[] = [];
 		for (const chunk of chunked([...new Set(spaceIds)])) {
-			// Ranked within each space over the open-questions index; the oldest `limitPerSpace`.
+			// Ranked within each space over the open-questions index, whole rows (no join back);
+			// the oldest `limitPerSpace`. The ranking sorts all the open questions of the spaces:
+			// few (a session has at most 50 open), and no index orders them (a known limit).
 			const ranked = db
 				.select({
-					blockId: outlineQuestions.blockId,
+					...getTableColumns(outlineQuestions),
 					rank: sql<number>`row_number() over (partition by ${outlineQuestions.spaceId} order by ${outlineQuestions.createdAt}, ${outlineQuestions.blockId})`.as(
 						"rank",
 					),
@@ -1236,16 +1238,11 @@ export const sqliteOutlineStore: OutlineStore = {
 				.as("ranked");
 			const rows = db
 				.select()
-				.from(outlineQuestions)
-				.innerJoin(ranked, eq(ranked.blockId, outlineQuestions.blockId))
+				.from(ranked)
 				.where(lte(ranked.rank, limitPerSpace))
-				.orderBy(
-					asc(outlineQuestions.spaceId),
-					asc(outlineQuestions.createdAt),
-					asc(outlineQuestions.blockId),
-				)
+				.orderBy(asc(ranked.spaceId), asc(ranked.createdAt), asc(ranked.blockId))
 				.all();
-			out.push(...rows.map((r) => toQuestion(r.outline_questions)));
+			out.push(...rows.map(({ rank: _rank, ...row }) => toQuestion(row)));
 		}
 		return out;
 	},
