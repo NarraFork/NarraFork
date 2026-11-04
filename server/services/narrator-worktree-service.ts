@@ -950,7 +950,7 @@ export class NarratorWorktreeService<Principal> {
 				prune: false,
 				remote: false,
 				reason:
-					"Create supports only existing, non-symlink parents inside the authorized repository root; switching and cleanup are separate operations",
+					"Create supports only existing, non-symlink parents inside the authorized repository root; cleanup is unsupported",
 			},
 		};
 	}

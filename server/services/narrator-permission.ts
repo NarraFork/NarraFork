@@ -2932,6 +2932,30 @@ function classifyToolDanger(
 		);
 	}
 
+	// Folding the switch into creation must not lose the workspace-change review that
+	// a separate SwitchWorkingDirectory call would have triggered.
+	if (
+		(toolName === "CreateWorktree" || toolName === "AttachWorktree") &&
+		input.switchToWorktree === true
+	) {
+		return danger(
+			"Creating a worktree also switches the narrator's execution workspace.",
+			[
+				"Subsequent tools use the new worktree as working directory, with its own skills and permission context.",
+				"Existing background tools, subagents and terminals keep their original targets after the switch.",
+			],
+			[
+				"Verify the destination worktree matches the user's requested workspace.",
+				"Omit switchToWorktree to create the worktree without changing the working directory.",
+			],
+			[
+				`Current working directory: ${cwd}`,
+				`Requested working directory: ${String(input.destinationPath ?? "unknown")}`,
+			],
+			"high",
+		);
+	}
+
 	if (toolName === "Agent") {
 		if (input.subagent_type === "explore" || input.subagent_type === "plan") return null;
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";
