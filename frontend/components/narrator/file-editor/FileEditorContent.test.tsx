@@ -1780,8 +1780,8 @@ test("split mode keeps the editor interactive beside a live-updating preview", a
 	const previewBox = host.querySelector("[data-file-editor-preview]");
 	expect(previewBox).not.toBeNull();
 	expect(previewBox?.textContent).toContain("Split heading");
-	// Split previews stamp data-line anchors on block elements for line-based
-	// scroll sync (plain preview mode does not).
+	// Previews stamp data-line anchors on block elements for line-based scroll
+	// sync, line-reference jumps and mode-switch reading positions.
 	expect(previewBox?.querySelector("[data-line]")).not.toBeNull();
 	// Split is a live view: edits regenerate the preview after a short debounce.
 	await edit(model, "# Edited live");
@@ -2236,12 +2236,20 @@ test("invalid JSON can be fixed without dropping the model", async () => {
 	expect(create).toHaveBeenCalledTimes(1);
 });
 
-test("line references preserve preview switch and new navigation returns to same model", async () => {
+test("line references keep the rendered preview and new navigation reuses the same model", async () => {
+	read.mockResolvedValue("# One\n\ntwo\n\nthree\n");
 	const model = await mount({ filePath: "/work/a.md", navigationRequestId: "first" });
 	await switchFileMode("preview");
 	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
 	expect(await mount({ filePath: "/work/a.md", navigationRequestId: "second" })).toBe(model);
-	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+	// The jump happens inside the preview instead of forcing the panel back to source.
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	});
+	const preview = host.querySelector("[data-file-editor-preview]");
+	expect(preview).not.toBeNull();
+	expect(preview?.querySelector("[data-line]")).not.toBeNull();
+	expect(model.navigation).toEqual(selection);
 	expect(create).toHaveBeenCalledTimes(1);
 });
 
