@@ -73,6 +73,7 @@ import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
+import { providerKeyRoutes } from "./routes/provider-keys";
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
@@ -461,6 +462,7 @@ app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
 app.route("/api/credential-transfer", credentialTransferRoutes);
+app.route("/api/provider-keys", providerKeyRoutes);
 app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);

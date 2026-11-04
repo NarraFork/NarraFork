@@ -55,6 +55,7 @@ export function CredentialNetworkEditor({
 	title,
 	value,
 	onSave,
+	showDeviceId = true,
 }: {
 	opened: boolean;
 	onClose: () => void;
@@ -62,6 +63,8 @@ export function CredentialNetworkEditor({
 	value: CredentialNetwork | undefined;
 	/** `null` clears every field back to "follow". */
 	onSave: (network: CredentialNetwork | null) => Promise<void>;
+	/** Off for API keys, which have no device identity. */
+	showDeviceId?: boolean;
 }) {
 	const { t } = useTranslation("settings");
 	const [draft, setDraft] = useState<CredentialNetwork>({});
@@ -147,39 +150,41 @@ export function CredentialNetworkEditor({
 						/>
 					)}
 				</Stack>
-				<Stack gap={4}>
-					<Text size="sm" fw={500}>
-						{t("credentialNetwork.deviceId")}
-					</Text>
-					<SegmentedControl
-						size="xs"
-						value={draft.deviceId ? "own" : "follow"}
-						onChange={(choice) =>
-							setDraft((d) => ({
-								...d,
-								deviceId: choice === "own" ? (d.deviceId ?? newDeviceId()) : undefined,
-							}))
-						}
-						data={[
-							{ value: "follow", label: t("credentialNetwork.deviceFollow") },
-							{ value: "own", label: t("credentialNetwork.deviceOwn") },
-						]}
-					/>
-					{draft.deviceId && (
-						<Group gap="xs" wrap="nowrap">
-							<Text size="xs" ff="monospace" style={{ minWidth: 0 }} truncate>
-								{draft.deviceId}
-							</Text>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								onClick={() => setDraft((d) => ({ ...d, deviceId: newDeviceId() }))}
-							>
-								{t("credentialNetwork.regenerate")}
-							</Button>
-						</Group>
-					)}
-				</Stack>
+				{showDeviceId && (
+					<Stack gap={4}>
+						<Text size="sm" fw={500}>
+							{t("credentialNetwork.deviceId")}
+						</Text>
+						<SegmentedControl
+							size="xs"
+							value={draft.deviceId ? "own" : "follow"}
+							onChange={(choice) =>
+								setDraft((d) => ({
+									...d,
+									deviceId: choice === "own" ? (d.deviceId ?? newDeviceId()) : undefined,
+								}))
+							}
+							data={[
+								{ value: "follow", label: t("credentialNetwork.deviceFollow") },
+								{ value: "own", label: t("credentialNetwork.deviceOwn") },
+							]}
+						/>
+						{draft.deviceId && (
+							<Group gap="xs" wrap="nowrap">
+								<Text size="xs" ff="monospace" style={{ minWidth: 0 }} truncate>
+									{draft.deviceId}
+								</Text>
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									onClick={() => setDraft((d) => ({ ...d, deviceId: newDeviceId() }))}
+								>
+									{t("credentialNetwork.regenerate")}
+								</Button>
+							</Group>
+						)}
+					</Stack>
+				)}
 				<Textarea
 					label={t("credentialNetwork.headers")}
 					description={t("credentialNetwork.headersHint")}

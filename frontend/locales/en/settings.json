@@ -2810,5 +2810,38 @@
 		"importButton": "Import selected ({{count}})",
 		"imported": "Added {{added}}, replaced {{replaced}}, skipped {{skipped}}.",
 		"cancel": "Cancel"
+	},
+	"providerKeys": {
+		"title": "Keys ({{count}})",
+		"desc": "Sessions rotate among the usable keys in this order and keep the key they started on. The first key is the API Key above. Changes here apply immediately.",
+		"add": "Add key",
+		"addButton": "Add",
+		"label": "Label",
+		"labelPlaceholder": "e.g. second account",
+		"key": "API key",
+		"first": "API Key above",
+		"ready": "Ready",
+		"off": "Off",
+		"invalid": "Rejected — check the key",
+		"resting": "Resting, back {{time}}",
+		"cooldownReason": {
+			"rate_limited": "Rate limited by the provider",
+			"quota": "Allowance used up until the window resets",
+			"forbidden": "The provider refused this key for now"
+		},
+		"window": {
+			"5h": "5 hours",
+			"weekly": "Weekly",
+			"monthly": "Monthly"
+		},
+		"resets": "Resets {{time}}",
+		"usageUnavailable": "Usage unavailable",
+		"refreshUsage": "Refresh usage",
+		"moveUp": "Move up",
+		"moveDown": "Move down",
+		"enabled": "Use this key",
+		"remove": "Remove key",
+		"networkTitle": "Network identity · {{name}}",
+		"saveFirst": "Save the provider to add more keys."
 	}
 }

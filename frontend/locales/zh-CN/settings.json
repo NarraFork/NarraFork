@@ -2810,5 +2810,38 @@
 		"importButton": "导入所选（{{count}}）",
 		"imported": "新增 {{added}} 个，覆盖 {{replaced}} 个，跳过 {{skipped}} 个。",
 		"cancel": "取消"
+	},
+	"providerKeys": {
+		"title": "Key（{{count}}）",
+		"desc": "会话按此顺序在可用的 Key 之间轮换，并沿用开始时的 Key。第一个 Key 就是上方的 API Key。这里的改动立即生效。",
+		"add": "添加 Key",
+		"addButton": "添加",
+		"label": "名称",
+		"labelPlaceholder": "如：第二个账号",
+		"key": "API Key",
+		"first": "上方的 API Key",
+		"ready": "可用",
+		"off": "已停用",
+		"invalid": "被拒绝，请检查 Key",
+		"resting": "休息中，{{time}}恢复",
+		"cooldownReason": {
+			"rate_limited": "被供应商限流",
+			"quota": "额度用完，窗口重置后恢复",
+			"forbidden": "供应商暂时拒绝了这个 Key"
+		},
+		"window": {
+			"5h": "5 小时",
+			"weekly": "每周",
+			"monthly": "每月"
+		},
+		"resets": "{{time}}重置",
+		"usageUnavailable": "暂时读不到用量",
+		"refreshUsage": "刷新用量",
+		"moveUp": "上移",
+		"moveDown": "下移",
+		"enabled": "使用这个 Key",
+		"remove": "删除 Key",
+		"networkTitle": "网络身份 · {{name}}",
+		"saveFirst": "保存供应商后可以添加更多 Key。"
 	}
 }

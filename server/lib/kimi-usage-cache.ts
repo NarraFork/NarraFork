@@ -7,7 +7,7 @@ import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { registerKeyQuotaProbe } from "./provider-key-quota";
 import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
-import { type CustomApiProviderConfig, settings } from "./settings";
+import type { CustomApiProviderConfig } from "./settings";
 
 /**
  * Kimi (kimi.com / kimi.ai coding plan) usage quota cache.
