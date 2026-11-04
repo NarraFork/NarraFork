@@ -1297,3 +1297,44 @@ describe("provider add nested route", () => {
 		expectNoSave();
 	});
 });
+
+describe("草稿删除供应商", () => {
+	const card = (name: string) =>
+		[...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes(name),
+		);
+
+	test("删除 API key 供应商后卡片立即从概览消失，放弃更改后回来", async () => {
+		await mount("/settings/providers");
+		expect(card("Existing provider")).toBeDefined();
+
+		await act(async () => {
+			await router.navigate({ to: "/settings/providers", search: { provider: "existing" } });
+		});
+		const detail = currentCustomDetail();
+		expect(detail?.provider.id).toBe("existing");
+
+		// 与详情页删除按钮同一条路径：把这条供应商从草稿里去掉。
+		await act(async () => {
+			detail?.onProvidersChange((prev) => prev.filter((provider) => provider.id !== "existing"));
+		});
+
+		// 卡片的数据来自服务端下发的模型分组，草稿删除后必须立刻消失。
+		expect(card("Existing provider")).toBeUndefined();
+		expect(
+			[...container.querySelectorAll('[role="button"]')].map((node) => node.textContent),
+		).toHaveLength(2);
+
+		// 放弃更改：草稿回到快照，URL 仍指向它，于是又落回这条供应商的详情页。
+		const discard = [...container.querySelectorAll("button")].find(
+			(node) => node.textContent === text("unsavedDiscard"),
+		);
+		expect(discard).toBeDefined();
+		await click(discard as Element);
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+
+		// 退回概览，卡片回来。
+		await leaveDetail();
+		expect(card("Existing provider")).toBeDefined();
+	});
+});
