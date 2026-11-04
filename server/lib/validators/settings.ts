@@ -3,6 +3,9 @@ import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
 import { LEGACY_LINE_HEIGHT_RANGE, TYPOGRAPHY_RANGE } from "@shared/pretext-layout/typography";
 import { proxyOverrideSchema } from "@shared/proxy-settings";
 import {
+	RECENT_TAB_FOLDER_COLORS,
+	RECENT_TAB_FOLDER_ICONS,
+	RECENT_TAB_FOLDER_TITLE_MAX_CHARS,
 	RECENT_TABS_LIVE_LIMIT,
 	RECENT_TABS_PAGE_SIZE,
 	RECENT_TABS_STORAGE_LIMIT,
@@ -229,30 +232,26 @@ export const specTabLayoutPatchSchema = z.object({
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 
 export const recentTabSchema = z.object({
-	type: z.enum(["narrator", "project", "workspace", "subagent", "group"]),
+	// Retired types ("workspace", "group", "chapter") are refused: a full-list restore of
+	// one would store a row nothing renders and the one-time folder conversion never revisits.
+	type: z.enum(["narrator", "project", "subagent", "folder"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	parentNarratorId: z.string().min(1).max(50).optional(),
-	workspaceId: z.string().min(1).max(50).nullish(),
+	/**
+	 * Folder structure. Only honoured by the full-list restore path; the upsert path
+	 * strips it (folders change only through the folder endpoints).
+	 */
+	folderId: z.string().min(1).max(50).optional(),
+	folderIcon: z.enum(RECENT_TAB_FOLDER_ICONS).optional(),
+	folderColor: z.enum(RECENT_TAB_FOLDER_COLORS).optional(),
+	folderPreviewCount: z.number().int().min(0).max(RECENT_TABS_STORAGE_LIMIT).optional(),
 	title: z.string().max(RECENT_TAB_TEXT_MAX_CHARS),
 	subtitle: z.string().max(RECENT_TAB_TEXT_MAX_CHARS).optional(),
 	status: z.string().max(50).optional(),
 	lastVisitedAt: z.number(),
 	pinned: z.boolean().optional(),
 	isScheduled: z.boolean().optional(),
-	/**
-	 * Hand-arranged position inside a directory group.
-	 *
-	 * Accepted so an undo-restore can carry it back: the client already sends it
-	 * (`toPersistedRecentTab`) and the service already honours it
-	 * (`dirSortOrderFor`), but Zod strips unknown keys — so the snapshot path
-	 * silently flattened every hand-arranged group back to recency order, which is
-	 * exactly what the client-side comment promised it would not do.
-	 *
-	 * Bounded by the same limit as the reorder endpoint's key list: a position is an
-	 * index into one group's members, which cannot exceed the stored tab count.
-	 */
-	dirSortOrder: z.number().int().min(0).max(RECENT_TABS_STORAGE_LIMIT).optional(),
 });
 
 export const upsertRecentTabSchema = recentTabSchema
@@ -288,7 +287,7 @@ export const batchUpsertRecentTabsSchema = z.object({
 });
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["narrator", "session", "project", "workspace", "subagent", "group"]),
+	type: z.enum(["narrator", "session", "project", "subagent", "folder"]),
 	id: z.string().min(1).max(50),
 	/**
 	 * Entity-teardown cleanup (project deleted, narrator archived). When set, no undo
@@ -312,8 +311,25 @@ export const moveRecentTabSchema = z
 		position: z.enum(["top", "above_idle"]).optional(),
 		beforeKey: z.string().min(1).max(100).optional(),
 		afterKey: z.string().min(1).max(100).optional(),
+		/**
+		 * Folder membership for this move: omitted = unchanged, null = leave the folder,
+		 * an id = join that folder (at the anchor, or at its end without one).
+		 */
+		folderId: z.string().min(1).max(50).nullable().optional(),
 	})
 	.superRefine((value, ctx) => {
+		// A membership change is a complete target on its own; an anchor is optional
+		// (joining without one appends to the folder, leaving without one lands at the
+		// default top-level insertion point).
+		if (value.folderId !== undefined && value.position === undefined) {
+			const anchors = [value.toIndex, value.beforeKey, value.afterKey].filter(
+				(target) => target !== undefined,
+			);
+			if (anchors.length > 1 || value.toIndex !== undefined) {
+				ctx.addIssue({ code: "custom", message: "At most one anchor key is allowed" });
+			}
+			return;
+		}
 		const targets = [value.toIndex, value.position, value.beforeKey, value.afterKey].filter(
 			(target) => target !== undefined,
 		);
@@ -332,17 +348,28 @@ export const pinRecentTabSchema = z.object({
 	pinned: z.boolean(),
 });
 
-/**
- * Member order for ONE directory group in the sidebar's aggregated view.
- *
- * Only `dir_sort_order` is written; the flat order is untouched (see
- * `setRecentTabDirectoryOrder`). Bounded by the storage limit because a group cannot
- * contain more members than the user has tabs.
- */
-export const setRecentTabDirectoryOrderSchema = z.object({
-	/** Tab keys ("type:id") in the desired top-to-bottom order. */
-	keys: z.array(z.string().min(1).max(100)).min(1).max(RECENT_TABS_STORAGE_LIMIT),
-});
+export const createRecentTabFolderSchema = z
+	.object({
+		/** The tab dropped onto; the folder takes its position. */
+		targetKey: z.string().min(1).max(100),
+		/** The tab being dragged; may come from another folder. */
+		sourceKey: z.string().min(1).max(100),
+		title: z.string().trim().min(1).max(RECENT_TAB_FOLDER_TITLE_MAX_CHARS),
+	})
+	.refine((value) => value.sourceKey !== value.targetKey, {
+		message: "A folder needs two different tabs",
+	});
+
+export const updateRecentTabFolderSchema = z
+	.object({
+		title: z.string().trim().min(1).max(RECENT_TAB_FOLDER_TITLE_MAX_CHARS).optional(),
+		icon: z.enum(RECENT_TAB_FOLDER_ICONS).nullable().optional(),
+		color: z.enum(RECENT_TAB_FOLDER_COLORS).nullable().optional(),
+		previewCount: z.number().int().min(0).max(RECENT_TABS_STORAGE_LIMIT).nullable().optional(),
+	})
+	.refine((value) => Object.values(value).some((field) => field !== undefined), {
+		message: "At least one field is required",
+	});
 
 export const clearRecentTabsSchema = z.object({
 	scope: z.enum(["all", "projects", "inactive_narrators"]),

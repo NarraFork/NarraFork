@@ -448,6 +448,14 @@
 			"prevId": "af2ae099-396f-4399-8676-928a7d7d4a6b",
 			"version": "7",
 			"snapshotDigest": "f074f16d61810f35a714a5b6959a38c133e6571cce0d2838427076bf7cb4c513"
+		},
+		{
+			"idx": 56,
+			"tag": "0056_recent_tab_folders",
+			"id": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
+			"prevId": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
+			"version": "7",
+			"snapshotDigest": "0f1f2cce34e192cca32077bfa5248d291e67a2807bdfe03dda7d9d6727b87d2f"
 		}
 	]
 }

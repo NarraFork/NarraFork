@@ -41,7 +41,6 @@ export function usePendingTabKey() {
 
 function tabToUrl(tab: RecentTab): { to: string } {
 	if (tab.type === "project") return { to: `/projects/${tab.id}` };
-	if (tab.type === "workspace") return { to: `/narrators/workspace/${tab.id}` };
 	return { to: `/narrators/${tab.id}` };
 }
 
@@ -75,7 +74,10 @@ export function useRecentTabKeyboardNav() {
 				return;
 			}
 
-			const tabs = queryClient.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			// Folder headers are not pages; skip them (their members are still in order).
+			const tabs = (queryClient.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? []).filter(
+				(tab) => tab.type !== "folder",
+			);
 			if (tabs.length === 0) return;
 
 			// Start from pending tab if active, otherwise from actual page

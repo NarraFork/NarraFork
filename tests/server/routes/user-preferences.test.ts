@@ -877,16 +877,13 @@ describe("recent-tabs route contracts", () => {
 		expect("tabs" in (body as Record<string, unknown>)).toBe(false);
 	});
 
-	it("atomically batch-upserts workspace headers and children", async () => {
+	it("batch-upserts tabs in one revision but never creates folders", async () => {
 		seedPreferences([]);
 		const { status, body } = await requestJson("/recent-tabs/batch", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
-				tabs: [
-					tab("child-1", { workspaceId: "workspace-1" }),
-					tab("workspace-1", { type: "workspace" }),
-				],
+				tabs: [tab("child-1", { folderId: "folder-1" }), tab("folder-1", { type: "folder" })],
 			}),
 		});
 
@@ -894,14 +891,61 @@ describe("recent-tabs route contracts", () => {
 		expect(body).toMatchObject({ changed: true, baseRevision: 0, revision: 1 });
 		expect(
 			db
-				.select({ key: userRecentTabs.tabKey, workspaceId: userRecentTabs.workspaceId })
+				.select({ key: userRecentTabs.tabKey, folderId: userRecentTabs.folderId })
+				.from(userRecentTabs)
+				.orderBy(userRecentTabs.sortOrder)
+				.all(),
+		).toEqual([{ key: "narrator:child-1", folderId: null }]);
+	});
+
+	it("creates, edits and dissolves a folder through its routes", async () => {
+		seedPreferences([tab("a"), tab("b"), tab("c")]);
+		const created = await requestJson("/recent-tabs/folders", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ targetKey: "narrator:a", sourceKey: "narrator:c", title: "Work" }),
+		});
+		expect(created.status).toBe(200);
+		const folderId = (created.body as { folderId: string }).folderId;
+		expect(folderId).toBeString();
+
+		const edited = await requestJson(`/recent-tabs/folders/${folderId}`, {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ icon: "rocket", color: "teal", previewCount: 1 }),
+		});
+		expect(edited.status).toBe(200);
+		const moved = await requestJson("/recent-tabs/move", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ key: "narrator:b", folderId }),
+		});
+		expect(moved.status).toBe(200);
+		expect(
+			db
+				.select({ key: userRecentTabs.tabKey, folderId: userRecentTabs.folderId })
 				.from(userRecentTabs)
 				.orderBy(userRecentTabs.sortOrder)
 				.all(),
 		).toEqual([
-			{ key: "workspace:workspace-1", workspaceId: null },
-			{ key: "narrator:child-1", workspaceId: "workspace-1" },
+			{ key: `folder:${folderId}`, folderId: null },
+			{ key: "narrator:a", folderId },
+			{ key: "narrator:c", folderId },
+			{ key: "narrator:b", folderId },
 		]);
+
+		const dissolved = await requestJson(`/recent-tabs/folders/${folderId}/dissolve`, {
+			method: "POST",
+		});
+		expect(dissolved.status).toBe(200);
+		expect(
+			db
+				.select({ key: userRecentTabs.tabKey })
+				.from(userRecentTabs)
+				.orderBy(userRecentTabs.sortOrder)
+				.all()
+				.map((row) => row.key),
+		).toEqual(["narrator:a", "narrator:c", "narrator:b"]);
 	});
 
 	it("supports section pagination and key-relative moves", async () => {

@@ -2,14 +2,13 @@
  * Horizontal swipe semantics for a recent-tab row.
  *
  * The two directions are NOT symmetric in consequence: right removes the tab, left only
- * moves it between the pinned and unpinned groups. A sign error therefore does not
- * degrade the gesture, it destroys work — which is the whole reason the classifier is a
- * pure function instead of two inline comparisons inside a touch handler.
+ * opens its menu. A sign error therefore does not degrade the gesture, it destroys work —
+ * which is the whole reason the classifier is a pure function instead of two inline
+ * comparisons inside a touch handler.
  *
- * Left-swipe-to-pin exists because pinning had no touch entry point at all: the only
- * other way in is the right-click menu, and on touch that menu never opens (long-press
- * fires `contextmenu`, which the row suppresses so long-press-to-drag does not pop a
- * menu). The `canPin=false` cases below guard the rows that legitimately cannot pin.
+ * Left-swipe-to-menu exists because touch has no right-click: long-press is the drag
+ * gesture, and the `contextmenu` it fires is suppressed by the row. The menu carries
+ * pinning, folder actions and everything else the right-click menu offers.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -22,26 +21,24 @@ describe("classifySwipeRelease", () => {
 		expect(classifySwipeRelease(SWIPE_THRESHOLD - 1, true)).toBe("cancel");
 	});
 
-	it("pins only past the threshold to the left", () => {
-		expect(classifySwipeRelease(-(SWIPE_THRESHOLD + 1), true)).toBe("pin");
+	it("opens the menu only past the threshold to the left", () => {
+		expect(classifySwipeRelease(-(SWIPE_THRESHOLD + 1), true)).toBe("menu");
 		expect(classifySwipeRelease(-SWIPE_THRESHOLD, true)).toBe("cancel");
 		expect(classifySwipeRelease(-(SWIPE_THRESHOLD - 1), true)).toBe("cancel");
 	});
 
 	it("never closes on a leftward swipe, however far it travels", () => {
-		// The asymmetry that matters: closing is destructive, pinning is not. A left
-		// swipe reaching ten times the threshold must still only pin.
-		expect(classifySwipeRelease(-SWIPE_THRESHOLD * 10, true)).toBe("pin");
+		// The asymmetry that matters: closing is destructive, a menu is not. A left
+		// swipe reaching ten times the threshold must still only open the menu.
+		expect(classifySwipeRelease(-SWIPE_THRESHOLD * 10, true)).toBe("menu");
 	});
 
-	it("cancels a leftward swipe when the row cannot be pinned", () => {
+	it("cancels a leftward swipe when the row has no menu", () => {
 		expect(classifySwipeRelease(-(SWIPE_THRESHOLD + 1), false)).toBe("cancel");
 		expect(classifySwipeRelease(-SWIPE_THRESHOLD * 10, false)).toBe("cancel");
 	});
 
-	it("still closes on a rightward swipe when the row cannot be pinned", () => {
-		// Closing is independent of pinning capability; workspace children can be
-		// closed but not pinned.
+	it("still closes on a rightward swipe when the row has no menu", () => {
 		expect(classifySwipeRelease(SWIPE_THRESHOLD + 1, false)).toBe("close");
 	});
 
@@ -52,12 +49,12 @@ describe("classifySwipeRelease", () => {
 });
 
 describe("clampSwipeTravel", () => {
-	it("passes both directions through when the row can pin", () => {
+	it("passes both directions through when the row has a menu", () => {
 		expect(clampSwipeTravel(40, true)).toBe(40);
 		expect(clampSwipeTravel(-40, true)).toBe(-40);
 	});
 
-	it("suppresses left travel when the row cannot pin", () => {
+	it("suppresses left travel when the row has no menu", () => {
 		// A row that slides open, reveals nothing and springs back reads as broken,
 		// so the gesture must not start at all.
 		expect(clampSwipeTravel(-40, false)).toBe(0);

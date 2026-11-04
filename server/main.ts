@@ -1892,17 +1892,9 @@ void startupReadiness.barrier.then((recovery) => {
 	});
 });
 
-// Clean up orphan workspace records not referenced in any user's recentTabs
-import { dissolveOrphanWorkspaces } from "./routes/workspaces";
-
-dissolveOrphanWorkspaces()
-	.then((count) => {
-		if (count > 0) logger.info(`Dissolved ${count} orphan workspace(s)`);
-	})
-	.catch((err) => {
-		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
-	});
-
+// No startup workspace cleanup: workspaces used to be deleted when no sidebar tab
+// referenced them, but the sidebar no longer lists workspaces at all (folders replaced
+// that grouping), so every workspace would look orphaned. They are deleted explicitly.
 // Register knowledge notification bridge (push publish/review state to reviewers + submitters)
 initKnowledgeNotify();
 

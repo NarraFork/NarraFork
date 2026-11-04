@@ -23,14 +23,9 @@ import {
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineEnabled } from "../../../hooks/useOutlineEnabled";
-import {
-	recordRecentTabVisit,
-	refreshRecentTabsLoadedWindow,
-	updateRecentTabLocal,
-} from "../../../hooks/useRecentTabs";
 import {
 	useUpdateWorkspace,
 	useWorkspace,
@@ -112,7 +107,6 @@ export function WorkspacePage({
 		const trimmed = editTitle.trim();
 		if (trimmed && trimmed !== serverTitle) {
 			updateRef.current.mutate({ id: workspaceId, title: trimmed });
-			updateRecentTabLocal("workspace", workspaceId, { title: trimmed });
 		}
 	}, [editTitle, serverTitle, workspaceId]);
 
@@ -187,38 +181,21 @@ export function WorkspacePage({
 		directorControlRef.current?.updatePanelTitle(panelId, title);
 	}, []);
 
-	// ── Record recent tab (app chrome only — a window mirrors the workspace) ──
-	useEffect(() => {
-		if (!workspace || chrome === "window") return;
-		void recordRecentTabVisit({
-			type: "workspace",
-			id: workspaceId,
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-			title: (workspace as any).title || "Workspace",
-		});
-	}, [workspaceId, workspace, chrome]);
-
 	/**
 	 * Re-read membership after the surface changed it (a panel was closed).
 	 *
 	 * Awaited by the caller so the surface is only considered converged once its
-	 * authoritative input reflects the change. Also refreshes the sidebar window,
-	 * because removing a narrator panel releases its tab back to the top level —
-	 * server-side, in the same transaction.
+	 * authoritative input reflects the change. The sidebar is independent of workspace
+	 * membership, so nothing else needs refreshing.
 	 */
 	const handleMembershipChanged = useCallback(async () => {
 		await qc.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId) });
-		void refreshRecentTabsLoadedWindow(qc).catch(() => {});
 	}, [qc, workspaceId]);
 
 	// The sidebar projection is NOT maintained here any more.
 	//
-	// This route used to diff the live narrator-id set against the previous one and
-	// write `workspaceId` onto recent tabs accordingly. Two problems, both structural:
-	// the initial "previous" set was empty, so the diff could only ever ATTACH and
-	// never detach; and it made the client a second writer of membership, racing the
-	// layout save. Both are gone — `workspace-panel-service` now writes the panel row
-	// and its projection in one transaction.
+	// The sidebar no longer mirrors workspace membership at all (folders replaced that
+	// grouping), so this route writes nothing to recent tabs.
 
 	const treeJson = workspace?.layout ?? workspace?.tree;
 	const panels = workspace?.panels ?? EMPTY_PANELS;

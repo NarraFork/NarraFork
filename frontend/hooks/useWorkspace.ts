@@ -88,8 +88,11 @@ export function useCreateWorkspace() {
  * here would silently bypass that lock.
  */
 export function useUpdateWorkspace() {
+	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: ({ id, ...data }: { id: string; title: string }) => api.updateWorkspace(id, data),
+		// The header switcher lists workspaces by title.
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["workspaces"] }),
 	});
 }
 

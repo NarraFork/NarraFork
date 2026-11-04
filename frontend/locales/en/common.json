@@ -303,8 +303,6 @@
 	"activeBackgroundTasks": "{{count}} background task(s) running",
 	"activeBackgroundServices": "{{count}} background service(s) running",
 	"viewersWatching": "{{count}} people viewing",
-	"swipePin": "Pin",
-	"swipeUnpin": "Unpin",
 	"containerRunning": "Container running",
 	"containerPaused": "Container paused",
 	"containerStopped": "Container stopped",
@@ -799,5 +797,6 @@
 	"imageViewer_copyUnavailableDownloaded": "Clipboard is unavailable in this environment; image downloaded instead",
 	"imageViewer_copyFailed": "Failed to copy image",
 	"imageViewer_downloadFailed": "Failed to download image",
-	"botBadge": "Bot"
+	"botBadge": "Bot",
+	"swipeMenu": "Menu"
 }

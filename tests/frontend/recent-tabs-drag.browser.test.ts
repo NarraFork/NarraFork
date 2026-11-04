@@ -47,7 +47,7 @@ async function openFixture() {
 		(window as unknown as FixtureWindow).fixture = await import(url);
 		URL.revokeObjectURL(url);
 	}, source);
-	await page.waitForSelector('[data-tab-sort-id="workspace:w"]');
+	await page.waitForSelector('[data-tab-sort-id="folder:w"]');
 	return page;
 }
 const state = (page: Page) =>
@@ -97,22 +97,23 @@ async function idle(page: Page) {
 }
 const browserTest = test.skipIf(!executablePath);
 browserTest(
-	"directory member drag uses directory-order transport and applies real cache delta",
+	"dropping a tab onto the middle of another creates a folder and applies the real delta",
 	async () => {
 		const page = await openFixture();
 		try {
-			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.directoryFixture());
-			await page.waitForSelector('[data-tab-sort-id="dir:/repo"]');
-			await begin(page, "narrator:a");
-			await moveTo(page, "narrator:b");
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.plainFixture());
+			await page.waitForSelector('[data-unit="a"]');
+			await begin(page, "narrator:c");
+			await moveTo(page, "narrator:a", 0.5);
+			expect((await state(page)).indicator?.target).toEqual({ kind: "merge", key: "narrator:a" });
 			await page.mouse.up();
 			await idle(page);
 			const current = await state(page);
-			expect(current.calls).toEqual([{ method: "directory", keys: ["narrator:b", "narrator:a"] }]);
-			const rendered = await page.$$eval('[data-unit="/repo"] .row', (rows) =>
+			expect(current.calls).toEqual([{ method: "folder", keys: ["narrator:a", "narrator:c"] }]);
+			const rendered = await page.$$eval('[data-unit="nf"] .row', (rows) =>
 				rows.map((row) => row.getAttribute("data-tab-sort-id")),
 			);
-			expect(rendered).toEqual(["dir:/repo", "narrator:b", "narrator:a"]);
+			expect(rendered).toEqual(["folder:nf", "narrator:a", "narrator:c"]);
 		} finally {
 			await page.close();
 		}
@@ -145,7 +146,7 @@ browserTest(
 	20_000,
 );
 browserTest(
-	"workspace drag preserves original header/children DOM and commits the complete group",
+	"folder drag preserves original header/member DOM and commits the complete folder",
 	async () => {
 		const page = await openFixture();
 		try {
@@ -153,8 +154,8 @@ browserTest(
 				for (const element of document.querySelectorAll('[data-unit="w"] .row'))
 					element.setAttribute("data-original", "yes");
 			});
-			await begin(page, "workspace:w");
-			expect((await state(page)).draggingId).toBe("workspace:w");
+			await begin(page, "folder:w");
+			expect((await state(page)).draggingId).toBe("folder:w");
 			await moveTo(page, "narrator:b");
 			const visible = await page.$$eval('[data-unit="w"] .row', (rows) =>
 				rows.map((row) => ({
@@ -175,12 +176,12 @@ browserTest(
 			await idle(page);
 			const current = await state(page);
 			expect(current.calls).toEqual([
-				{ method: "move", key: "workspace:w", target: { afterKey: "narrator:b" } },
+				{ method: "move", key: "folder:w", target: { afterKey: "narrator:b" } },
 			]);
 			expect(current.order.slice(0, 6)).toEqual([
 				"narrator:a",
 				"narrator:b",
-				"workspace:w",
+				"folder:w",
 				"narrator:w1",
 				"narrator:w2",
 				"narrator:c",
@@ -291,8 +292,8 @@ browserTest(
 				element.scrollTop = 200;
 			});
 			await settle(page);
-			await moveTo(page, "narrator:tail4", 0.6);
-			const destination = await point(page, "narrator:tail4", 0.6);
+			await moveTo(page, "narrator:tail4", 0.85);
+			const destination = await point(page, "narrator:tail4", 0.85);
 			const current = await state(page);
 			expect(current.panel?.y).toBeCloseTo(destination.y, 0);
 			expect(current.indicator?.target).toEqual({ kind: "after", key: "narrator:tail4" });

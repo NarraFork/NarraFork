@@ -16,13 +16,11 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const RECENT_TABS = readFileSync(join(import.meta.dir, "RecentTabs.tsx"), "utf8");
-const DIRECTORY_ROW = readFileSync(join(import.meta.dir, "RecentTabDirectoryRow.tsx"), "utf8");
 const PATH_TEXT = readFileSync(join(import.meta.dir, "../common/TruncatedPath.tsx"), "utf8");
 
 describe("recentTabs working-directory subtitles", () => {
 	it("renders cwd through LeftTruncatedPathText (LTR-isolated left-ellipsis)", () => {
 		expect(RECENT_TABS).toContain("<LeftTruncatedPathText path={tab.subtitle}");
-		expect(DIRECTORY_ROW).toContain("<LeftTruncatedPathText path={path}");
 	});
 
 	it("keeps the LTR isolation unit inside the shared path text", () => {
@@ -36,7 +34,6 @@ describe("recentTabs working-directory subtitles", () => {
 		// Non-path subtitles (chapter titles) may still use a plain truncated Text.
 		expect(RECENT_TABS).not.toMatch(/direction:\s*tab\.type === "narrator" \? "rtl" : undefined/);
 		expect(RECENT_TABS).not.toMatch(/direction:\s*"rtl"[\s\S]{0,80}\{tab\.subtitle\}/);
-		expect(DIRECTORY_ROW).not.toMatch(/direction:\s*"rtl"[\s\S]{0,80}\{path\}/);
 	});
 
 	it("still left-truncates non-path subtitles as plain text", () => {
