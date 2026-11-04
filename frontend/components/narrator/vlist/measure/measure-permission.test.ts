@@ -365,6 +365,63 @@ describe("measureInlinePermission — ExitPlanMode editing", () => {
 	});
 });
 
+describe("measureInlinePermission — an outline plan's approval (outline P2 PR 8)", () => {
+	it("adds one xs line (mb 4) per summary row and drops the decision reason", async () => {
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
+		const plain = measureInlinePermission({ isExitPlanMode: true, buttonRows: 1 }, 600);
+		const one = measureInlinePermission(
+			{ isExitPlanMode: true, outlinePlanSummaryRows: 1, buttonRows: 1, hasDecisionReason: true },
+			600,
+		);
+		const two = measureInlinePermission(
+			{ isExitPlanMode: true, outlinePlanSummaryRows: 2, buttonRows: 1 },
+			600,
+		);
+		expect(one.metas.map((m) => m.role)).toEqual([
+			"outline-plan-summary",
+			"feedback-textarea",
+			"button-bar",
+		]);
+		expect(one.height - plain.height).toBe(c.XS_LINE_HEIGHT + 4);
+		expect(two.height - one.height).toBe(c.XS_LINE_HEIGHT + 4);
+	});
+
+	it("is predicted from a waiting ExitPlanMode that carries an outline plan", async () => {
+		const { predictInlinePermission } = await import("../vlist-permission-prediction");
+		const root = {
+			blockId: "b",
+			spaceId: "s",
+			pageId: "p",
+			address: "sess/AbCdEfGh",
+			title: "Plan",
+			round: 1,
+		};
+		const base = {
+			id: "r",
+			toolName: "ExitPlanMode",
+			inputJson: { plan: "- [ ] Plan", _planRoot: root, _planDiff: { counts: { added: 1 } } },
+		};
+		expect(predictInlinePermission(base, { innerWidth: 600, canDecide: true })).toMatchObject({
+			isExitPlanMode: true,
+			outlinePlanSummaryRows: 1,
+		});
+		expect(
+			predictInlinePermission(
+				{ ...base, inputJson: { ...base.inputJson, _planSummary: "Added a step" } },
+				{ innerWidth: 600, canDecide: true },
+			)?.outlinePlanSummaryRows,
+		).toBe(2);
+		// A plan-file plan is predicted as before.
+		expect(
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson: { plan: "x" } },
+				{ innerWidth: 600, canDecide: true },
+			)?.outlinePlanSummaryRows,
+		).toBeUndefined();
+	});
+});
+
 describe("measureInlinePermission — feedback rows, decision reason, read-only", () => {
 	it("the feedback textarea grows with its autosize row count (clamped 1..3)", async () => {
 		const { measureInlinePermission } = await import("./measure-permission");

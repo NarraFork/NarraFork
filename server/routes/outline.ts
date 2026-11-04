@@ -51,6 +51,7 @@ import {
 	type OutlinePendingDecisionResponse,
 	type OutlinePendingDetailResponse,
 	type OutlinePendingSummary,
+	type OutlinePlanDiffResponse,
 	type OutlineQuestionGroupResponse,
 	type OutlineResolveResponse,
 	type OutlineRevertResponse,
@@ -86,6 +87,7 @@ import {
 	outlineLockBodySchema,
 	outlinePageListQuerySchema,
 	outlinePendingRejectBodySchema,
+	outlinePlanDiffQuerySchema,
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
@@ -124,6 +126,7 @@ import {
 	unlockOutlineTask,
 } from "../services/outline/pending";
 import { addPersonTask, changePersonTask } from "../services/outline/person-tasks";
+import { readPlanDiff } from "../services/outline/plan-diff";
 import { commitSeqAt } from "../services/outline/read";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
@@ -438,6 +441,37 @@ outlineRoutes.get("/spaces/:spaceId/pages/:pageId/commits", async (c) => {
 	});
 	if (!timeline) throw new NotFoundError("Outline block", block.id);
 	const body: OutlineTimelineResponse = timeline;
+	return c.json(body);
+});
+
+/**
+ * A plan against the version it is compared with (outline P2 PR 8): `from` (the submission's
+ * `baseSeq`, 0 for nothing) to now, block by block, bounded (`plan-diff.ts`). Read access to the
+ * plan's space.
+ */
+outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
+	const principal = principalOf(c);
+	const { space, block } = await readableBlock(
+		principal,
+		idParam(c, "spaceId"),
+		idParam(c, "blockId"),
+	);
+	const query = parse(outlinePlanDiffQuerySchema, c.req.query());
+	const diff = await readPlanDiff({ rootId: block.id, fromSeq: query.from, toSeq: null });
+	if (!diff) throw new NotFoundError("Outline block", block.id);
+	const body: OutlinePlanDiffResponse = {
+		root: {
+			blockId: block.id,
+			spaceId: space.id,
+			address: `${space.key}/${block.sid}`,
+			title: blockTitle(diff.root.content ?? block.content).slice(0, 200) || block.sid,
+		},
+		fromSeq: diff.fromSeq,
+		toSeq: diff.toSeq,
+		counts: diff.counts,
+		entries: diff.entries,
+		truncated: diff.truncated,
+	};
 	return c.json(body);
 });
 

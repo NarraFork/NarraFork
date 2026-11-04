@@ -60,7 +60,7 @@ import {
 	type OutlineStore,
 	type OutlineTaskClaimRow,
 } from "./store/port";
-import { hasHumanAssignee, isFinishedTask, isOpenTask } from "./task-json";
+import { hasHumanAssignee, isFinishedTask, isOpenTask, isPlanningRoot } from "./task-json";
 import { type OutlineOp, writeOutline } from "./write";
 
 export const OUTLINE_TASK_LIMITS = {
@@ -916,6 +916,18 @@ export interface OutlineTaskRef {
 	taskJson: OutlineTaskJson;
 	/** The task's claim, when it has a row (it may be released or someone's expired lease). */
 	claim: OutlineTaskClaimRow | null;
+	/**
+	 * It has unfinished tasks under it (outline P2 PR 8, D48 Q2): its work is theirs, so it is not
+	 * the one continuation names or starts; it is named again once they are finished.
+	 */
+	container: boolean;
+	/** The tasks it is under, nearest first (within the read). */
+	taskAncestorIds: string[];
+	/**
+	 * A task it is under is in progress: it belongs to the tree being worked, whose steps
+	 * continuation starts before any other to-do (D48 Q2).
+	 */
+	inWorkedTree: boolean;
 }
 
 export interface OutlineContinuationCandidates {
@@ -942,6 +954,11 @@ export interface OutlineContinuationCandidates {
  *
  * Order is document order: the session space first, then other spaces by key; within a space by
  * page, then depth first by sibling order. At most `limit` of each list.
+ *
+ * A task with unfinished tasks under it is a `container`: listed (it is still open, and counts as
+ * the person's work when it is theirs) but never the one continuation names or starts. A plan that
+ * is not approved yet (`task_json.plan.state = planning`) is left out with every task under it: it
+ * is never executed (D48 Q3).
  */
 export async function findContinuationCandidates(options: {
 	narratorId: string;
@@ -980,10 +997,39 @@ export async function findContinuationCandidates(options: {
 	for (const [id, claim] of await getOutlineTaskClaims(unread, { store })) claims.set(id, claim);
 
 	const excluded = new Set(options.excludePageIds ?? []);
-	const open = [...metas.values()].filter((block) => {
-		if (block.deleted || !isOpenTask(block.taskJson) || hasHumanAssignee(block.taskJson))
-			return false;
-		if (excluded.has(block.pageId)) return false;
+	// Every open task read: what makes a task a container (a person's step under it counts too)
+	// and what a plan being planned hides.
+	const live = [...metas.values()].filter(
+		(block) => !block.deleted && isOpenTask(block.taskJson) && !excluded.has(block.pageId),
+	);
+	if (live.length === 0) return { candidates: [], waiting: [], ordered: [], truncated };
+	const ancestors = new Map<string, OutlineBlockMeta>();
+	const inOrder = await inDocumentOrder(store, live, options.sessionSpaceId, { ancestors });
+	const known = new Map<string, OutlineBlockMeta>(ancestors);
+	for (const block of live) known.set(block.id, block);
+	/** Ancestors of a block, nearest first. */
+	const above = (block: OutlineBlockMeta): OutlineBlockMeta[] => {
+		const out: OutlineBlockMeta[] = [];
+		let parent = block.parentId === null ? undefined : known.get(block.parentId);
+		while (parent && out.length <= OUTLINE_LIMITS.maxDepth) {
+			out.push(parent);
+			parent = parent.parentId === null ? undefined : known.get(parent.parentId);
+		}
+		return out;
+	};
+	const chains = new Map(live.map((block) => [block.id, above(block)]));
+	const hidden = (block: OutlineBlockMeta): boolean =>
+		isPlanningRoot(block.taskJson) ||
+		(chains.get(block.id) ?? []).some((a) => isPlanningRoot(a.taskJson));
+	const shown = inOrder.filter((block) => !hidden(block));
+	const containers = new Set<string>();
+	for (const block of shown) {
+		for (const ancestor of chains.get(block.id) ?? []) {
+			if (ancestor.taskJson && isOpenTask(ancestor.taskJson)) containers.add(ancestor.id);
+		}
+	}
+	const open = shown.filter((block) => {
+		if (hasHumanAssignee(block.taskJson)) return false;
 		const claim = claims.get(block.id);
 		if (!claim || claim.holderNarratorId === options.narratorId) return true;
 		return !isClaimLive(claim, now);
@@ -991,7 +1037,7 @@ export async function findContinuationCandidates(options: {
 	if (open.length === 0) return { candidates: [], waiting: [], ordered: [], truncated };
 
 	const waits = await deriveOutlineTaskWaits(open, { store });
-	const ordered = await inDocumentOrder(store, open, options.sessionSpaceId);
+	const ordered = open;
 	const spaces = new Map<string, OutlineSpaceRow>();
 	for (const spaceId of new Set(open.map((b) => b.spaceId))) {
 		const space = await store.getSpace(spaceId);
@@ -1007,6 +1053,9 @@ export async function findContinuationCandidates(options: {
 		versionSeq: block.versionSeq,
 		taskJson: block.taskJson as OutlineTaskJson,
 		claim: claims.get(block.id) ?? null,
+		container: containers.has(block.id),
+		taskAncestorIds: (chains.get(block.id) ?? []).filter((a) => a.taskJson).map((a) => a.id),
+		inWorkedTree: (chains.get(block.id) ?? []).some((a) => a.taskJson?.status === "doing"),
 	});
 	const candidates: OutlineTaskRef[] = [];
 	const waiting: OutlineContinuationCandidates["waiting"] = [];

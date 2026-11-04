@@ -1250,6 +1250,17 @@ export async function runAgentLoopUnlocked(
 					taskBackend === "outline"
 						? await (await taskSourceForNarrator(narratorId)).contextParts(locale)
 						: undefined;
+				// An outline root session plans in the outline (outline P2 PR 8): plan mode names its
+				// plan root instead of a plan file.
+				const outlinePlan =
+					planMode && outlineEditCore
+						? {
+								root: await (await import("../outline-plan-mode")).outlinePlanPromptRoot(
+									narratorId,
+								),
+								relaxed: relaxedPlan,
+							}
+						: undefined;
 				const built = await buildSystemPrompt(
 					{
 						systemPrompt: currentOAuth
@@ -1273,6 +1284,7 @@ export async function runAgentLoopUnlocked(
 					{
 						taskSection: taskSectionFor(taskBackend, current.type),
 						...(contextParts ? { contextParts } : {}),
+						...(outlinePlan ? { outlinePlan } : {}),
 						workspaceContext: serializeWorkspaceContext(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
@@ -1293,8 +1305,12 @@ export async function runAgentLoopUnlocked(
 							JSON.stringify({
 								planMode,
 								relaxedPlan,
-								planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
-								planFilePath: active._planFilePath,
+								...(outlinePlan
+									? { planRoot: outlinePlan.root?.address ?? null }
+									: {
+											planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
+											planFilePath: active._planFilePath,
+										}),
 								permissionMode: currentOAuth?.permissionMode ?? current.permissionMode,
 								readOnly: runtimePolicy.tools.readOnly,
 							}),
@@ -1660,6 +1676,20 @@ export async function runAgentLoopUnlocked(
 							planMode: false,
 							traits: redactDraftTraits(planState.traits),
 						});
+					}
+					// An outline session's plan (outline P2 PR 8): made sure to be approved, whichever
+					// way the approval came, before the restart starts its first step.
+					{
+						const { settleApprovedOutlinePlan } = await import("../outline-plan-mode");
+						active._outlinePlanApproved =
+							(await settleApprovedOutlinePlan({
+								narratorId,
+								toolUseId,
+								locale: active.locale,
+								approverUserId: pendingPlanApprover.get(narratorId) ?? null,
+								turnUserId: active._currentUserId ?? null,
+								byReview: pendingPlanApproverSource.get(narratorId) === "reflection",
+							})) ?? undefined;
 					}
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
 					let approval: "compact" | "continue" | undefined;
@@ -3104,17 +3134,25 @@ export async function runAgentLoopUnlocked(
 					await narratorService.updateStats(narratorId, 0);
 				}
 
-				const continuePrompt = getToolMessage(
-					isCompact ? "planCompactContinue" : "exitPlanModeApproved",
-					locale,
-				);
+				// An outline plan starts from its first step that can start, named in the prompt
+				// (outline P2 PR 8); a plan-file plan gets the prompt it always did.
+				const outlinePlan = active._outlinePlanApproved;
+				active._outlinePlanApproved = undefined;
+				const continuePrompt = outlinePlan
+					? await (await import("../outline-plan-mode")).startApprovedOutlinePlan({
+							narratorId,
+							approved: outlinePlan,
+							locale,
+							compact: isCompact,
+						})
+					: getToolMessage(isCompact ? "planCompactContinue" : "exitPlanModeApproved", locale);
 
 				// If the user edited the plan, append the diff to the prompt
 				// (only for non-compact — compact already has the edited plan in system prompt)
 				const planDiff = pendingPlanDiff.get(narratorId);
 				if (planDiff) pendingPlanDiff.delete(narratorId);
 				const basePrompt =
-					!isCompact && planDiff
+					!isCompact && planDiff && !outlinePlan
 						? getToolMessageWithParams("exitPlanModeApprovedWithDiff", locale, {
 								diff: planDiff,
 							})
@@ -3123,8 +3161,10 @@ export async function runAgentLoopUnlocked(
 				// Check for chained feedback — merge with diff if both exist
 				const fb = pendingFeedback.get(narratorId);
 				if (fb) pendingFeedback.delete(narratorId);
+				// An outline plan's message names the step started for the session: it is kept, the
+				// approver's words follow it.
 				const promptText = fb
-					? basePrompt !== continuePrompt
+					? basePrompt !== continuePrompt || outlinePlan
 						? `${basePrompt}\n\n${fb.feedbackText}`
 						: fb.feedbackText
 					: basePrompt;

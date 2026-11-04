@@ -194,6 +194,11 @@ export interface NarratorTaskSource {
 	 * promotion therefore lands even when no continuation follows. Delegated subagents do
 	 * not promote (`policy.continuation.promoteTodo`).
 	 */
+	/**
+	 * Where a task this source handed out is (`key/sid`), when the backend has addresses (the
+	 * outline); null otherwise. An approved outline plan names its first step by it (P2 PR 8).
+	 */
+	taskAddress?(task: { text: string; protected: boolean }): string | null;
 	prepareContinuation(options: {
 		promoteTodo: boolean;
 		/**

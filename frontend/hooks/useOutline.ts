@@ -288,7 +288,15 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 		// Views as of a commit never change.
 		predicate: (query) => query.queryKey[4] === null,
 	});
-	for (const kind of ["timeline", "history", "backlinks", "pages", "space", "pending"]) {
+	for (const kind of [
+		"timeline",
+		"history",
+		"backlinks",
+		"pages",
+		"space",
+		"pending",
+		"plan-diff",
+	]) {
 		void queryClient.invalidateQueries({ queryKey: ["outline", kind, spaceId] });
 	}
 	void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
@@ -433,6 +441,38 @@ export function useOutlinePageLive(
 			}
 		});
 	}, [spaceId, pageId, queryClient]);
+}
+
+/**
+ * A submitted plan against the version it is compared with (outline P2 PR 8), kept fresh while
+ * shown: its page is subscribed to, and a commit past what is shown reads it again (the person may
+ * be editing the plan in the outline beside the session).
+ */
+export function useOutlinePlanDiff(
+	plan: { spaceId: string; pageId: string; blockId: string; from: number },
+	enabled: boolean,
+) {
+	const queryClient = useQueryClient();
+	const { spaceId, pageId, blockId, from } = plan;
+	const query = useQuery({
+		queryKey: ["outline", "plan-diff", spaceId, blockId, from],
+		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from),
+		enabled,
+		retry: false,
+		staleTime: 5_000,
+	});
+	const shownSeq = useRef(-1);
+	shownSeq.current = query.data?.toSeq ?? -1;
+	useEffect(() => {
+		if (!enabled) return;
+		return pageSubscriptions().subscribe(pageId, (hint) => {
+			if ((hint.kind === "changed" || hint.kind === "subscribed") && hint.seq > shownSeq.current)
+				void queryClient.invalidateQueries({
+					queryKey: ["outline", "plan-diff", spaceId, blockId],
+				});
+		});
+	}, [enabled, pageId, spaceId, blockId, queryClient]);
+	return query;
 }
 
 /**

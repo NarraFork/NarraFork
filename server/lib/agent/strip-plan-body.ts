@@ -1,4 +1,8 @@
-import { buildPlanReference, isModelPlanReference } from "@shared/plan-reference";
+import {
+	buildOutlinePlanReference,
+	buildPlanReference,
+	isModelPlanReference,
+} from "@shared/plan-reference";
 import type { DbMessage, DbToolCall } from "./provider";
 
 // The reference builder + detector live in `shared/` because the render layers
@@ -43,10 +47,26 @@ export function stripPlanBodyForModel(dbMessages: DbMessage[]): DbMessage[] {
 			const input = tc.inputJson;
 			if (!input || typeof input !== "object" || Array.isArray(input)) continue;
 			const record = input as Record<string, unknown>;
-			const planFile = record._planFile;
-			if (typeof planFile !== "string" || !planFile.trim()) continue;
 			const plan = record.plan;
 			if (typeof plan !== "string" || !plan.trim()) continue;
+			// An outline plan (outline P2 PR 8) lives in the outline: its snapshot is replaced by
+			// a reference to its root, which OutlineRead reads as it is now.
+			const outlineRoot = record._planRoot as { address?: unknown; round?: unknown } | undefined;
+			if (outlineRoot && typeof outlineRoot.address === "string") {
+				const reference = buildOutlinePlanReference(
+					outlineRoot.address,
+					typeof outlineRoot.round === "number" ? outlineRoot.round : 1,
+					tc.status,
+				);
+				if (!rewrittenToolCalls) rewrittenToolCalls = msg.toolCalls.slice();
+				const index = msg.toolCalls.indexOf(tc);
+				rewrittenToolCalls[index] = { ...tc, inputJson: { mode: "outline", plan: reference } };
+				if (!references) references = new Map();
+				references.set(tc.toolUseId, reference);
+				continue;
+			}
+			const planFile = record._planFile;
+			if (typeof planFile !== "string" || !planFile.trim()) continue;
 
 			const reference = buildPlanReference(planFile, tc.status);
 			if (!rewrittenToolCalls) rewrittenToolCalls = msg.toolCalls.slice();

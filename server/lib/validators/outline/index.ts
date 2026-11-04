@@ -166,3 +166,19 @@ export const outlineBoardTaskUpdateBodySchema = z
 	.refine((body) => body.status !== undefined || body.assign !== undefined, {
 		message: "nothing to change",
 	});
+
+/** A plan's diff (outline P2 PR 8): compared from `from` (a seq; 0 is nothing) to now. */
+export const outlinePlanDiffQuerySchema = z.object({
+	from: seqSchema,
+});
+
+/** A person's decision on a submitted plan (`POST /narrators/permissions/:id/plan`). */
+export const outlinePlanDecisionSchema = z
+	.object({
+		action: z.enum(["return", "draft", "lock"]),
+		feedback: z.string().max(4000).optional(),
+		delegate: outlineIdSchema.nullable().optional(),
+		seenSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		compactAfter: z.boolean().optional(),
+	})
+	.strict();

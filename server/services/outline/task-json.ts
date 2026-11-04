@@ -8,7 +8,12 @@
  * a person, not locked, not claimable.
  */
 import type { LinkTarget, TaskStatus } from "@shared/outline";
-import type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson } from "./model";
+import type {
+	OutlineTaskActorRef,
+	OutlineTaskJson,
+	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
+} from "./model";
 
 /** Every task field, each optional except the status; `null` and `false` mean the default. */
 export interface OutlineTaskFields {
@@ -20,6 +25,7 @@ export interface OutlineTaskFields {
 	humanCreated?: boolean | null;
 	lock?: OutlineTaskLockJson | null;
 	claimable?: boolean | null;
+	plan?: OutlineTaskPlanJson | null;
 }
 
 /** The stored form: fields in a fixed order, defaults left out, prerequisites deduplicated. */
@@ -45,7 +51,36 @@ export function canonicalTaskJson(task: OutlineTaskFields): OutlineTaskJson {
 		};
 	}
 	if (task.claimable) out.claimable = true;
+	if (task.plan) out.plan = canonicalPlan(task.plan);
 	return out;
+}
+
+/** A plan's state in a fixed field order. */
+function canonicalPlan(plan: OutlineTaskPlanJson): OutlineTaskPlanJson {
+	return {
+		state: plan.state,
+		by: plan.by,
+		round: plan.round,
+		baseSeq: plan.baseSeq,
+		...(plan.approvedBy
+			? { approvedBy: { kind: plan.approvedBy.kind, id: plan.approvedBy.id } }
+			: {}),
+	};
+}
+
+/** Whether two plan states are equal (absent equals absent). */
+export function samePlan(
+	a: OutlineTaskPlanJson | null | undefined,
+	b: OutlineTaskPlanJson | null | undefined,
+): boolean {
+	if (!a || !b) return !a && !b;
+	return (
+		a.state === b.state &&
+		a.by === b.by &&
+		a.round === b.round &&
+		a.baseSeq === b.baseSeq &&
+		sameActor(a.approvedBy, b.approvedBy)
+	);
 }
 
 export function sameActor(
@@ -80,7 +115,8 @@ export function sameTaskJson(a: OutlineTaskJson | null, b: OutlineTaskJson | nul
 		sameActor(a.manager, b.manager) &&
 		(a.humanCreated === true) === (b.humanCreated === true) &&
 		sameTaskLock(a.lock, b.lock) &&
-		(a.claimable === true) === (b.claimable === true)
+		(a.claimable === true) === (b.claimable === true) &&
+		samePlan(a.plan, b.plan)
 	);
 }
 
@@ -97,6 +133,21 @@ export function isHumanCreatedTask(task: OutlineTaskJson | null): boolean {
 /** The lock on the task tree, if any. */
 export function taskLock(task: OutlineTaskJson | null): OutlineTaskLockJson | null {
 	return task?.lock ?? null;
+}
+
+/** The plan whose root the task is (outline P2 PR 8), if any. */
+export function taskPlan(task: OutlineTaskJson | null): OutlineTaskPlanJson | null {
+	return task?.plan ?? null;
+}
+
+/** The root of a plan not approved yet: it and its tasks are never continued. */
+export function isPlanningRoot(task: OutlineTaskJson | null): boolean {
+	return task?.plan?.state === "planning";
+}
+
+/** The root of an approved plan (a draft or locked): work the person wants (D48 Q2). */
+export function isApprovedPlanRoot(task: OutlineTaskJson | null): boolean {
+	return task?.plan?.state === "approved";
 }
 
 /** In the claimable pool. */

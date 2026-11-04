@@ -28,6 +28,7 @@
  * Pure: no DOM, no React.
  */
 
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import type { PendingPermission } from "../narrator-panel-types";
 import type { InlinePermissionData } from "./measure/measure-permission";
 
@@ -95,6 +96,20 @@ export function predictInlinePermission(
 	ctx: PermissionPredictionContext,
 ): InlinePermissionData | null {
 	if (permission.toolName === "AskUserQuestion") return null;
+	// An outline session's plan (outline P2 PR 8): summary lines, the feedback box and the buttons.
+	const plan =
+		permission.toolName === "ExitPlanMode"
+			? outlinePlanSubmissionOf(permission.inputJson as Record<string, unknown> | undefined)
+			: null;
+	if (plan) {
+		return {
+			readOnly: !ctx.canDecide,
+			isExitPlanMode: true,
+			outlinePlanSummaryRows: plan.summary ? 2 : 1,
+			feedbackRows: 1,
+			buttonRows: 1,
+		};
+	}
 	const isExitPlanMode = permission.toolName === "ExitPlanMode";
 	const target = permission.executionTarget ?? permission.executionTargets?.[0];
 	const deviceId = target?.deviceId ?? permission.executionDeviceId;

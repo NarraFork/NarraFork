@@ -1367,6 +1367,7 @@ export async function buildSystemPrompt(
 		| "runtimeHints"
 		| "taskSection"
 		| "contextParts"
+		| "outlinePlan"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1513,6 +1514,20 @@ async function createNarrator(
 				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
 				narrator.type,
 			),
+			// An outline session plans in the outline (outline P2 PR 8).
+			...(isPlanMode
+				? await (async () => {
+						const planMode = await import("./outline-plan-mode");
+						if (!(await planMode.isOutlinePlanSession(narratorId))) return {};
+						const { resolveEffectiveRelaxedPlan } = await import("../lib/permission-modes");
+						return {
+							outlinePlan: {
+								root: await planMode.outlinePlanPromptRoot(narratorId),
+								relaxed: resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
+							},
+						};
+					})()
+				: {}),
 		},
 	);
 
@@ -6389,6 +6404,16 @@ async function reExecuteDeniedToolCallUnlocked(
 					if (!result.isError && toolName === "ExitPlanMode") {
 						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
 						const planState = await exitNarratorPlanMode(narratorId);
+						// An outline session's plan is recorded as approved (a draft: outline P2 PR 8).
+						const { settleApprovedOutlinePlan } = await import("./outline-plan-mode");
+						await settleApprovedOutlinePlan({
+							narratorId,
+							toolUseId,
+							locale: active.locale,
+							approverUserId: userId ?? null,
+							turnUserId: active._currentUserId ?? null,
+							byReview: false,
+						});
 						active._preparedPlanModes?.clear();
 						active._planFileId = undefined;
 						active._planFilePath = undefined;

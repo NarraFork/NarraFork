@@ -7,6 +7,7 @@
 import { blockTitle } from "@shared/outline";
 import { OUTLINE_BEHAVIOR_ALIAS } from "../outline/model";
 import { outlineStore } from "../outline/store";
+import { isApprovedPlanRoot } from "../outline/task-json";
 import {
 	findContinuationCandidates,
 	type OutlineTaskRef,
@@ -109,12 +110,48 @@ export async function readOpen(session: OutlineSession): Promise<OpenRead> {
 	};
 }
 
+/**
+ * Work a person wants done (D27a; D48 Q2): a task they created (`/goal`, the board), or the root
+ * of a plan they approved (a draft or locked). `protectedOnly` continues while one is open.
+ */
 export function isProtected(entry: OpenEntry): boolean {
-	return entry.ref.taskJson.humanCreated === true;
+	return entry.ref.taskJson.humanCreated === true || isApprovedPlanRoot(entry.ref.taskJson);
 }
 
-export const firstOf = (read: OpenRead, status: OpenTaskStatus) =>
-	read.entries.find((entry) => entry.status === status) ?? null;
+/**
+ * The first task of `status` continuation may name (D48 Q2): never a container (a task with
+ * unfinished tasks under it), whose work is theirs; and one of the tree being worked (under a task
+ * in progress) before any other, each in document order.
+ */
+export function firstOf(read: OpenRead, status: OpenTaskStatus): OpenEntry | null {
+	let other: OpenEntry | null = null;
+	for (const entry of read.entries) {
+		if (entry.status !== status || entry.ref.container) continue;
+		if (entry.ref.inWorkedTree) return entry;
+		other ??= entry;
+	}
+	return other;
+}
+
+/**
+ * The first task under `rootId` (or the root itself, when nothing is under it) that continuation
+ * may name with `status`, in the read's order: a step of the tree a person asked to start or
+ * approved (outline P2 PR 8).
+ */
+export function firstUnder(
+	read: OpenRead,
+	rootId: string,
+	status: OpenTaskStatus,
+): OpenEntry | null {
+	return (
+		read.entries.find(
+			(entry) =>
+				entry.status === status &&
+				!entry.ref.container &&
+				(entry.ref.blockId === rootId || entry.ref.taskAncestorIds.includes(rootId)),
+		) ?? null
+	);
+}
 
 /** The titles of the given tasks, read in one statement. */
 export async function titlesOf(entries: readonly OpenEntry[]): Promise<Map<string, string>> {

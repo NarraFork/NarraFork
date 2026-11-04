@@ -363,6 +363,7 @@
 			"cancelled": "Cancelled"
 		},
 		"count": "{{count}} open",
+		"planning": "Planning",
 		"humanCreated": "Set by a person",
 		"locked": "Locked · {{name}}",
 		"lockedSomeone": "Locked",

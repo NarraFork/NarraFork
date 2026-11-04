@@ -270,6 +270,7 @@ async function describe(
 			assignee: task.assignee ?? null,
 			executor: executorOf(meta, task),
 			humanCreated: task.humanCreated === true,
+			plan: task.plan ? { state: task.plan.state, round: task.plan.round } : null,
 			lock: lock ? { by: { kind: lock.by.kind, id: lock.by.id, name: actorName(lock.by) } } : null,
 			completion: completion
 				? {

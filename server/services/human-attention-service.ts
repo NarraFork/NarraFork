@@ -5,6 +5,7 @@ import {
 	type HumanAttentionItem,
 	type HumanAttentionPage,
 } from "@shared/human-attention";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { and, eq, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorQuestions, narrators, narratorToolCalls } from "../db/schema";
@@ -319,6 +320,13 @@ async function permissionItem(requestId: string, context: RequestContext) {
 		.limit(1)
 		.get();
 	if (!row || !stillLive(requestId, live)) return null;
+	// An outline plan (outline P2 PR 8): its title and the version's changes, locale-neutral.
+	const plan = live.kind === "plan_approval" ? outlinePlanSubmissionOf(live.input) : null;
+	const planSummary = plan
+		? `${plan.root.title} · v${plan.root.round} +${plan.counts.added} ~${
+				plan.counts.text + plan.counts.task + plan.counts.moved
+			} −${plan.counts.removed}`.slice(0, SUMMARY_CHARS)
+		: null;
 	const item: HumanAttentionItem = {
 		...baseItem(owner),
 		id: `permission:${requestId}`,
@@ -330,7 +338,7 @@ async function permissionItem(requestId: string, context: RequestContext) {
 		createdAt: row.createdAt,
 		blocking: true,
 		// Only stored context belongs here; generic labels are localized by the client.
-		summary: row.summary ?? "",
+		summary: planSummary ?? row.summary ?? "",
 	};
 	return { item, live, owner };
 }

@@ -363,6 +363,7 @@
 			"cancelled": "取消"
 		},
 		"count": "{{count}} 项未完成",
+		"planning": "计划中",
 		"humanCreated": "人建",
 		"locked": "已锁定 · {{name}}",
 		"lockedSomeone": "已锁定",

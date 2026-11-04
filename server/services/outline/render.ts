@@ -106,6 +106,11 @@ export interface OutlineRenderOptions {
 	 * it must start with `pending `, the form `stripReadAnnotations` knows).
 	 */
 	annotate?: (node: OutlineNode) => string | null;
+	/**
+	 * Note a plan's root with its state (`‹plan …›`, outline P2 PR 8). Default true; the plan
+	 * snapshot an approval shows leaves it out.
+	 */
+	planNotes?: boolean;
 }
 
 export interface OutlineRenderResult {
@@ -177,6 +182,7 @@ export function renderOutline(
 		budget: options.budget,
 		display: options.display,
 		annotate: options.annotate,
+		planNotes: options.planNotes,
 		notes,
 		forceFirst: true,
 		interleave: false,
@@ -300,6 +306,7 @@ function expand(
 		budget?: Partial<OutlineBudget>;
 		display?: OutlineDisplay;
 		annotate?: (node: OutlineNode) => string | null;
+		planNotes?: boolean;
 		notes: readonly string[];
 		/** The first top-level block is shown whatever the budget (a read's root). */
 		forceFirst: boolean;
@@ -366,7 +373,11 @@ function expand(
 			const text = serializeMarkdownOutline([options.display?.(node, item) ?? item], {
 				label: () => label ?? null,
 			});
-			const notes = [questionNote(node), options.annotate?.(node)].filter((n): n is string => !!n);
+			const notes = [
+				questionNote(node),
+				options.planNotes === false ? null : planNote(node),
+				options.annotate?.(node),
+			].filter((n): n is string => !!n);
 			const own = [
 				...text.split("\n"),
 				...notes.map((note) => `${INDENT}‹${note.replace(/\n+/g, " ")}›`),
@@ -492,6 +503,8 @@ const MORE_LINE = /^ *‹… \d+ more›$/;
 const PENDING_LINE = /^ *‹pending [^\n]*›$/;
 /** A question's own note (`questionNote`): who is asked, the choices, the answer. */
 const QUESTION_LINE = /^ *‹question [^\n]*›$/;
+/** A plan root's note (`planNote`): its state. */
+const PLAN_LINE = /^ *‹plan [^\n]*›$/;
 
 const QUESTION_NOTE_CHARS = 600;
 
@@ -499,6 +512,18 @@ const QUESTION_NOTE_CHARS = 600;
  * The note under a question put to a person (`Ask`): who is asked, the numbered choices, the
  * recommendation, and the state (the answer, once given). Bounded; output only.
  */
+/**
+ * A plan root's note (outline P2 PR 8): a plan being planned is not executed until a person
+ * approves it; an approved one is the session's work.
+ */
+export function planNote(node: OutlineNode): string | null {
+	const plan = node.task?.plan;
+	if (!plan) return null;
+	return plan.state === "planning"
+		? `plan being planned (version ${plan.round + 1}): not executed until a person approves it`
+		: "plan approved";
+}
+
 export function questionNote(node: OutlineNode): string | null {
 	const ask = node.ask;
 	if (!ask) return null;
@@ -540,7 +565,8 @@ export function isReadAnnotation(line: string): boolean {
 		NOTE_LINE.test(line) ||
 		MORE_LINE.test(line) ||
 		PENDING_LINE.test(line) ||
-		QUESTION_LINE.test(line)
+		QUESTION_LINE.test(line) ||
+		PLAN_LINE.test(line)
 	);
 }
 

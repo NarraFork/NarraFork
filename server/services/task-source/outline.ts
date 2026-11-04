@@ -85,6 +85,7 @@ import { writeOutline } from "../outline/write";
 import { readTaskSession } from "./backend";
 import {
 	firstOf,
+	firstUnder,
 	isProtected,
 	type OpenEntry,
 	type OpenRead,
@@ -218,7 +219,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		known.set(view, {
 			text: view.text,
 			address: entry.ref.address,
-			humanCreated: isProtected(entry),
+			humanCreated: entry.ref.taskJson.humanCreated === true,
 		});
 		return view;
 	};
@@ -296,13 +297,37 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		let read = await readOpen(current);
 		if (preferTaskId) {
 			// A task a person asked the session to start ("Add and start", "Reopen and start"; review
-			// round 1 S4): started for the session through the same system start as a promotion,
-			// whatever else is in progress, and named by the continuation. Nothing else is started
-			// or named instead: when it cannot be started, nothing continues.
+			// round 1 S4), or the root of a plan they approved (outline P2 PR 8): started for the
+			// session through the same system start as a promotion, whatever else is in progress,
+			// and named by the continuation. Nothing else is started or named instead: when it
+			// cannot be started, nothing continues.
 			const wanted = read.entries.find((entry) => entry.ref.blockId === preferTaskId);
 			if (wanted?.status === "todo" && wanted.ref.spaceId === current.spaceId) {
 				if (await claim(current, wanted)) wanted.status = "doing";
-				else read = await readOpen(current);
+				read = await readOpen(current);
+			}
+			// A tree (a goal with steps, a plan): its first step that can start is started too, and
+			// named (D48 Q2: continue from the first startable task of the tree being worked).
+			if (wanted?.ref.container) {
+				const tried = new Set<string>();
+				for (let attempt = 0; attempt < OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts; attempt++) {
+					if (firstUnder(read, preferTaskId, "doing")) break;
+					const next = read.entries.find(
+						(entry) =>
+							entry.status === "todo" &&
+							!entry.ref.container &&
+							entry.ref.spaceId === current.spaceId &&
+							entry.ref.taskAncestorIds.includes(preferTaskId) &&
+							!tried.has(`${entry.ref.blockId}@${entry.ref.versionSeq}`),
+					);
+					if (!next) break;
+					tried.add(`${next.ref.blockId}@${next.ref.versionSeq}`);
+					if (await claim(current, next)) {
+						next.status = "doing";
+						break;
+					}
+					read = await readOpen(current);
+				}
 			}
 		} else if (promoteTodo) {
 			// Only a task of the session's own space is started on its behalf: anything else it
@@ -311,12 +336,15 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			const tried = new Set<string>();
 			for (let attempt = 0; attempt < OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts; attempt++) {
 				if (firstOf(read, "doing")) break;
-				const next = read.entries.find(
+				// The tree being worked first (D48 Q2), then document order.
+				const startable = read.entries.filter(
 					(entry) =>
 						entry.status === "todo" &&
+						!entry.ref.container &&
 						entry.ref.spaceId === current.spaceId &&
 						!tried.has(`${entry.ref.blockId}@${entry.ref.versionSeq}`),
 				);
+				const next = startable.find((entry) => entry.ref.inWorkedTree) ?? startable[0];
 				if (!next) break;
 				tried.add(`${next.ref.blockId}@${next.ref.versionSeq}`);
 				if (await claim(current, next)) {
@@ -327,11 +355,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			}
 		}
 		const chosen = preferTaskId
-			? (read.entries.find(
-					(entry) =>
-						entry.ref.blockId === preferTaskId &&
-						(entry.status === "doing" || entry.status === "blocked"),
-				) ?? null)
+			? (firstUnder(read, preferTaskId, "doing") ?? firstUnder(read, preferTaskId, "blocked"))
 			: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
 		const protectedOpenCount = (await protectedOpen(read)).length;
 		if (!chosen) return { openTask: null, protectedOpenCount };
@@ -520,6 +544,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			const from = named.map((id) => names?.users.get(id) ?? id);
 			return { current, awaitingConfirmation: { total: found.size, mine, from } };
 		},
+		taskAddress: (task) => known.get(task)?.address ?? null,
 		prepareContinuation: ({ promoteTodo, preferTaskId }) =>
 			prepareContinuation(promoteTodo, preferTaskId),
 		continuationPrompt,
