@@ -65,11 +65,12 @@
 - **指定服务时不跨服务**：只在该服务的凭据之间回落（个人 → 团队）。该服务没有可用凭据时，按现有的额度等待或报错处理，不会换到别的服务。“指定”同样不绕过健康检查与权限。
 - **模型值里不指定单个凭据**：同一服务下用哪个账号 / Key，由计费主体、凭据手动优先级和健康状态决定。确有需要时再加叙述者级的凭据偏好，不改模型值写法。
 - **`auto` 是保留前缀**，与 `codex`、`tokendance` 一样不能用作自定义供应商、NUG 或插件的前缀。`auto:` 后面是目录模型 id（`catalog.models[].id`）；保存时也接受别名，经 `identifyModel` 归一后写入目录 id。目录不认识的 id 拒绝保存；运行时目录已不再包含该 id 时，按“无候选”报错，提示改选模型，不猜测。
+  - 已实现：`normalizeAutoModelValueForSave`（`server/lib/settings/provider.ts`）只对照目录（精确 id 或别名，`canonicalCatalogModelId`），不看此刻有没有服务能提供，因为服务可能临时关闭。入口是创建会话、`PATCH /narrators/:id/model`、设置 PATCH（默认 / 摘要 / 翻译 / 提示优化模型、各类子代理模型与模型池）、Agent 调用的 `model` 参数和子代理换模型。设置 PATCH 只校验与已保存值不同的项，避免目录更新后，已保存的旧值让之后每次保存都失败。
 - **逻辑模型只认强匹配**：渠道的上游模型经 P1 的 `identifyModel` 归一，只有 `exact` 与 `alias` 匹配（含去掉 `vendor/` 后的匹配）进入 `auto` 候选。日期后缀与最长前缀属于弱匹配（`weak`），只借模型参数，不参与归并；确实是同一模型时，由目录把该 id 写进 `matches.ids` 或别名。同一渠道有多个上游 id 归到同一逻辑模型时，优先取精确匹配者，否则按 id 排序取第一个。
 - **目录外的模型**（私有中转模型、目录尚未收录的新模型）没有逻辑模型，只能用 `前缀:模型` 指定，选择器里不出现“自动”。
-- **服务可退出自动**：服务配置里有“参与自动”开关（默认开）。关闭后，该服务只在被指定时使用，用于同名但实际不是同一个模型的中转（如量化版本）。
+- **服务可退出自动**：每个服务的详情页顶部有“用于自动选择来源”开关（默认开，存为 `agent.autoExcludedProviders`）。关闭后，该服务只在被指定时使用，用于同名但实际不是同一个模型的中转（如量化版本）。关闭会让某些 `auto:` 模型没有来源时，开关下方列出这些模型，只提示，不拦截。总览卡片显示“不参与自动”徽章。删除服务时它的前缀从列表中移除，之后同前缀的新服务不会被默认排除。
 - 特殊值 `__default__`、`__summary__`、跟随父叙述者保持不变；`__agg__:` 迁为 `auto:`（§11）。
-- 渠道锁（服务 + 凭据）存在纪元记录里（已持久化在消息中），重启后不丢。
+- **渠道锁只记服务，不记凭据**：锁就是会话最近一条回复所用的服务，从压缩点之后、本会话自己的 assistant 消息的 `provider` 列读出（`server/services/auto-sticky-source.ts`），不加新列，重启或闲置回收后照样能恢复。同一服务下用哪个凭据由该服务自己的池决定（Codex 账号池、Key 池的会话粘性），不进锁。纪元记录里只有服务指纹，没有凭据。
 
 ### 4.2 一次选择的步骤
 
@@ -108,7 +109,13 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 
 5. **纪元锁**：见 4.3。
 
-**P3 第一版已实现（2026-11-05 决定先做这一档）**：`shared/auto-route-strategy.ts` 按“能否服务 → 订阅优先 → 参考价低者优先（未知价排在已知价后）→ 服务顺序”排序；能否服务与是否订阅由 `server/lib/agent/auto-route-signals.ts` 提供（Codex 看启用账号数，自定义供应商看是否还有不在冷却或额度窗口内的 Key，Kimi Code / OpenCode Go 视为订阅）。会话已在用的服务只要还能服务就继续用；不能服务时换到排序第一的来源。全部不可用时仍返回排序第一的来源，让上游错误照常报给用户。个人 / 团队分层随 P4 一起做；拖动排序与稳定性维度以后再做。
+**P3 第一版已实现（2026-11-05 决定先做这一档）**：上面的打分表和预设是目标设计，第一版只做了一个固定排序，没有预设、没有可调维度，也还没有 `resolveRoute` 这个入口（解析仍在 `resolveEffectiveModel` → `resolveAutoModel`）。
+
+- **排序**（`shared/auto-route-strategy.ts`）：能否服务 → 订阅优先 → 参考价低者优先（未知价排在已知价后）→ 服务列表顺序。
+- **能否服务、是否订阅**（`server/lib/agent/auto-route-signals.ts`，全部是内存读）：Codex 看可用账号数（`availableCount`）；自定义供应商看是否还有 Key 不在额度耗尽或 403 冷却里，单次 429 的短冷却仍算能服务；NUG 看该网关模型是否被记为不可用（按网关模型判断，不同渠道互不影响）；Kimi Code / OpenCode Go 算订阅。
+- **能力过滤**（最小版）：同一模型的来源里，声明的输入类型比别的来源少的（如只收文本的中转），排进“不能服务”一组，也不再保持粘性。它不会被丢掉，别的来源都不能服务时仍会用它。没有声明输入类型的来源不算受限。
+- **粘性**：会话已在用的服务只要还能服务就继续用；不能服务时换到排序中第一个能服务的来源；全部都不能服务时留在原来源，不为一个同样会失败的来源丢掉缓存。没有已用服务时（新会话、压缩之后）返回排序第一的来源，全部不可用时让上游错误照常报给用户。
+- 个人 / 团队分层随 P4 一起做；拖动排序、预设与稳定性维度以后再做。
 6. **出站**：渠道的网络身份装配成 `ProviderTransport`（代理、UA、设备 ID、额外请求头），交给协议适配器。
 
 `resolveRoute` 保持同步：读的是内存中按用户分组的渠道快照，凭据变更时通过事件总线失效重建，不在请求路径上查库。
@@ -121,9 +128,14 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 |---|---|
 | **纪元内** | 锁定当前渠道，不因打分变化而切换，保住上游缓存 |
 | **纪元边界**（新会话、压缩成功、用户换模型） | 完整重新选择，切换代价为 0 |
-| **被迫切换**（额度耗尽、鉴权失败、熔断） | 立即排除当前渠道，在模型值允许的候选内重选。若策略是“等待重置”且重置在 N 分钟内（沿用 `provider-quota-wait.ts`），则等待；换到别的服务时按“实际切换模型目标”开新纪元，同服务内换凭据不开 |
+| **被迫切换**（额度耗尽、来源不可用） | 在模型值允许的候选内换到另一个能服务的来源。等待时长在缓存 TTL 量级以内（15 分钟）时仍然等待；更长、未知或会被拒绝的等待则换来源。换到别的服务时按“实际切换模型目标”开新纪元，同服务内换凭据不开 |
 
-订阅额度刷新时，额度探测器发出 `credential.quotaRefreshed` 事件。锁在更贵渠道上的叙述者被标记为“有更优来源”，在下一个纪元边界自动切回，不打断进行中的纪元。
+已实现（P3）：
+- **纪元边界**：压缩成功时 `markActiveHistoryCompactPending` 置一次性标志 `_autoReselectOnNextTurn`，下一轮解析 `auto:` 时不带粘性服务，按当前排序重选。会话激活时（重启、闲置回收后）用 `lastServedProvider` 取粘性服务（§4.1 渠道锁）。
+- **被迫切换**：判定在 `server/services/agent-runtime/auto-forced-switch.ts`（纯函数），orchestrator 有三个接入点：发请求前已知 NUG 模型不可用、模型不可用分支（额度墙，含会被拒绝等待的情形）、普通失败轮（Codex 账号全部用尽、中转的 Key 全部耗尽，这两种 loop 直接报错，不进等待分支）。只有 `auto:` 值会切换；路由仍认为原服务能服务时（例如普通错误）不切换。每次运行最多切换 3 次，防止两个都失败的来源来回交接。
+- 等待阈值不沿用 Kimi 24 小时 / OpenCode 8 天的额度等待上限：那是“值不值得等”的上限，而切换要比较的是缓存还热不热。
+
+不做：额度刷新事件（`credential.quotaRefreshed`）与“有更优来源”标记。压缩时本来就会完整重选，订阅额度恢复后在下一个纪元自然切回，不需要额外的事件和状态。
 
 “缓存已冷”（空闲超过渠道缓存 TTL）时是否允许提前重选，目前收益和各上游的 TTL 都不清楚，**本期不做**，P3 先采集数据。纪元锁的实现要给它留出口：选择时机集中在一个判断函数里，以后加一种时机不需要改路由本身。
 
@@ -134,7 +146,7 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 
 两种方式都不换模型。跨模型回落（如 GPT 额度用完改用 DeepSeek）不在本设计范围内，需要时另行设计“回落模型”。
 
-纪元目标指纹保持解析后的 `服务前缀:上游模型`（`resolveEpochTarget`），`auto:` 值本身不进指纹。同服务内换凭据时指纹不变；换服务时指纹改变并开新纪元，这时上游缓存和推理签名本来就已失效。推理签名来源键（`shared/agent-protocol/reasoning-source.ts`）继续按服务前缀 / NUG 渠道区分，不受影响。渠道锁单独记录在纪元记录中。
+纪元目标指纹保持解析后的 `服务前缀:上游模型`（`resolveEpochTarget`），`auto:` 值本身不进指纹。同服务内换凭据时指纹不变；换服务时指纹改变并开新纪元，这时上游缓存和推理签名本来就已失效。推理签名来源键（`shared/agent-protocol/reasoning-source.ts`）继续按服务前缀 / NUG 渠道区分，不受影响。渠道锁不单独记录，从消息的 `provider` 列读出（§4.1）。
 
 ## 5. 归属与隔离
 
@@ -309,6 +321,13 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
   - 点任一服务即“指定”，保存为 `前缀:上游模型`。同一服务下用哪个账号 / Key 由凭据优先级和计费主体决定。
 - Agent 工具、子代理模型池和各项模型设置用同一套值。Agent 工具描述里的可用模型列表同时列出 `auto:<逻辑模型>` 与 `前缀:模型`，子代理模型池里也可以放 `auto:` 值。
 
+已实现（P3，`ModelMenuItems.tsx`、`model-menu-selection.ts`）：
+
+- 一级：`auto:` 模型按目录的 `family` 分组（GPT、Claude、Gemini……，没有 family 的进“其他模型”），排在固定组之后。目录的 `vendor` 字段目前全为空，所以按 family 分；目前 242 个目录模型里有 160 个没有 family。一个模型只出现一次：服务分组里只留没有 `auto:` 行覆盖的模型（目录外的，或该服务已退出自动），这些只能指定。当前选中的值总会保留它的行。
+- 二级来源：“自动”项下方写出现在用哪个来源和理由（订阅额度内 / 可用来源中参考价最低 / 列表中第一个可用 / 都不可用）。每个服务行显示该服务的额度条（与该服务组标题上的相同）、订阅与不可用徽章、每百万 token 的参考价（目录有价时），以及打开该服务设置的按钮。
+- 搜索也匹配 `auto:` 行的来源服务名。
+- 与上文的差距：来源行没有单独显示“当前会用的账号 / Key”和重置倒计时，额度条的提示里有部分信息；来源标记（个人订阅 / 个人 Key / 团队）随 P4 再做。
+
 ### 10.3 设置页结构
 
 | 位置 | 内容 |
@@ -329,7 +348,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 | `customApiProviders` / `openaiProviders` / `anthropicProviders` / `geminiProviders` / `nugProviders` / `tokendance` / `commandCode` | 团队服务 + 团队凭据 |
 | `codex-credentials.json` | Codex 服务下的团队凭据（保留优先级、归档、用量历史） |
 | `narrators.model = 前缀:模型` | 不变，即“指定服务”。用户可在选择器里改为“自动”，存为 `auto:<逻辑模型>` |
-| 模型聚合 `__agg__:<id>`（自动） | 成员都强匹配到同一个逻辑模型时迁为 `auto:<逻辑模型>`；priority 聚合的成员顺序转为这些服务 / 凭据的手动优先级。成员分属不同模型、或含目录外模型的聚合，迁为第一个可用成员的 `前缀:模型`，并记日志 |
+| 模型聚合 `__agg__:<id>`（自动） | 成员都强匹配到同一个逻辑模型时迁为 `auto:<逻辑模型>`。成员分属不同模型、或含目录外模型的聚合，迁为第一个可用成员的 `前缀:模型`，并记日志。priority 聚合的成员顺序**不迁移**：`auto:` 排序不读服务的手动顺序（服务列表是固定拼接顺序，`providerOrder` 也不影响它），写进去也不会生效；聚合本身保留在设置里（只读），原顺序在那里可查 |
 | 模型聚合 `__agg__:<id>:<前缀:模型>`（聚合内指定） | 直接取后半段的 `前缀:模型` |
 | 已有供应商的前缀恰好是 `auto` | 改为不冲突的前缀（加序号），同步改写引用它的模型值和配置键，并记日志；历史用量记录不改写 |
 | `summaryModel`、`translationModel`、子代理模型池、搜索渠道模型 | 不变；引用了聚合的按上两行迁移。之后也可以填 `auto:` 值 |
@@ -341,6 +360,8 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 - 聚合迁移：`server/services/aggregation-migration-service.ts`，规则在 `shared/aggregation-migration.ts`。启动时在后台执行，作用于 settings.agent 的各模型字段、子代理池与固定档位、搜索渠道模型，以及 `narrators.model` / `pending_model_restore`、`scheduled_tasks.model`、`hooks.model`。先写日志，再在一个事务里逐行比对后改写，最后保存设置；失败时把行改回原值，下次启动重试。规划之后被用户改过的行会跳过。聚合本身保留在设置里（界面只读），引用已删除聚合的值不改，照旧回落到默认模型。
 - `auto` 前缀改名：`migrateReservedAutoPrefixOnStartup`（`provider-prefix-migration-service.ts`），改为第一个空闲的 `auto-N`，复用前缀迁移的日志与回滚。改名之前，`auto:` 值仍按普通前缀解析。
 - 两项迁移目前只在 SQLite 后端执行（叙述者行经 SQLite 句柄改写）。PostgreSQL 后端下聚合值照旧可解析，`auto` 前缀的供应商照旧作为普通前缀使用。
+- 顺序：还有 `auto` 前缀的供应商时（改名失败或尚未执行），聚合迁移推迟到下次启动，否则写出的 `auto:` 值会被当成那个供应商的模型。
+- 数据导入 / 导出（`server/services/data-portability.ts`）：`agent.autoExcludedProviders` 随供应商导出，导入时与本地取并集，并跟随供应商前缀改名；清空供应商时一起清掉。导入的供应商因前缀冲突改名（如 `openai` → `openai-2`）时，本次写入的会话的 `model` / `pending_model_restore` 也改到新前缀（只认完整前缀，含 `__agg__`，`auto:` 值不动）；冲突时被跳过的本地会话不动。
 
 ## 12. 分阶段实施
 
@@ -388,23 +409,28 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 | P3 | 子代理可用模型与模型池接受 `auto:` | `server/lib/agent/tools/task.ts`、`settings/provider.ts` |
 | P3 | 启动迁移（仅 SQLite）：`auto` 前缀的供应商改名为 `auto-N`；聚合值迁为 `auto:` / `前缀:模型` | `services/provider-prefix-migration-service.ts`、`services/aggregation-migration-service.ts`、`shared/aggregation-migration.ts` |
 | P3 | 模型菜单 `auto:` 行与来源子菜单；聚合设置页只读 | `GET /api/model-catalog/auto`（`server/lib/model-sourcing/auto-models.ts`）、`ModelMenuItems.tsx`、`useModels.ts`、`ModelAggregationsSection.tsx` |
+| P3 | 被迫切换（§4.3）；NUG 按网关模型的可用性信号 | `services/agent-runtime/auto-forced-switch.ts`、`orchestrator.ts`、`auto-route-signals.ts` |
+| P3 | 渠道锁：激活时取最近回复的服务、压缩后重选、全部不可用时留在原来源（§4.1、§4.3） | `services/auto-sticky-source.ts`、`narrator-session.ts`、`narrator-session-state.ts`、`settings/provider.ts` |
+| P3 | 能力过滤：输入类型少的来源排后（§4.2） | `settings/provider.ts` 的 `inputLimitedCandidates` |
+| P3 | 保存时校验 `auto:`（§4.1） | `normalizeAutoModelValueForSave`、`routes/narrators.ts`、`routes/settings.ts`、`subagent-runner.ts`、`subagent-model-switch.ts` |
+| P3 | 服务详情页“用于自动选择来源”开关与卡片徽章（§4.1） | `AutoParticipationSwitch.tsx`、`providers-reducer.ts`、`routes/settings/providers.tsx` |
+| P3 | 选择器：来源行额度条 / 参考价 / 设置入口、自动理由、按厂商分组与去重（§10.2） | `ModelMenuItems.tsx`、`model-menu-selection.ts` |
+| P3 | 数据导入 / 导出补 `autoExcludedProviders`、导入会话跟随前缀改名（§11） | `services/data-portability.ts` |
 
 架构说明页（可分享）：设计 https://claude.ai/artifact/19BW1ReTRShtDynQHXJDUE ，现状梳理 https://claude.ai/artifact/HJfhaWMvFtFjxhFDaN8S8E （P2 之后的变化以本文为准）。
 
 ### 14.2 下一步，按顺序
 
-1. **修 `errors-parity` 测试**（阻塞 CI）：凭据迁移（`7b7ec912f`）在 `frontend/locales/*/errors.json` 加了 `STEP_UP_*`、`BUNDLE_*` 共 7 个码，`shared/error-catalog.ts` 没有对应条目。
-2. **P3 收尾**
-   - **被迫切换**（§4.3）：`auto:` 会话遇到额度耗尽或来源不可用时，若有别的来源能服务就换过去，而不是等重置。现在 orchestrator 的模型不可用等待只对 `__default__` 重新解析，`auto:` 会一直等。
-   - **纪元边界重选**（§4.3）：现在的粘性只看会话当前的服务（内存中的 `active.provider`）；压缩成功后应完整重选一次，让“有更优来源”在下个纪元生效。
-   - 服务的“参与自动”开关界面（后端 `agent.autoExcludedProviders` 已支持）。
+1. **P3 剩余**
    - 状态栏的额度显示改为会话实际在用的来源（见 §14.3）。
-3. **P2 收尾**
+   - 选择器来源行补“当前会用的账号 / Key”与重置倒计时（§10.2 差距）。
+   - 两项启动迁移支持 PostgreSQL 后端。
+2. **P2 收尾**
    - 把 CodexManager 里与账号无关的池化逻辑（优先级、会话亲和、失败停用、额度跳过）与 `pooled-provider.ts` 合并成一个通用池；Codex 只保留 OAuth / PAT / Agent Identity 登录与 `/wham/usage` 探测。不要一次重写 CodexManager，先抽出纯函数再替换调用点。
    - NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json。
    - 数据管理“导出供应商”仍带 Key 且不要求二次核验（等待决定：建议导出不带 Key，Key 只走凭据迁移）。
-4. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
-5. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
+3. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
+4. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
 
 ### 14.3 约定与已知事项
 
@@ -418,3 +444,5 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 - 目录的 `referencePricing` 是每百万 token 的十进制字符串，可能为 null。
 - 新建的 worktree 没有 `frontend/routeTree.gen.ts`（开发服务器启动时生成），`tsgo` 会对全部路由文件报 `parameter of type 'undefined'`，属于既有问题。
 - 隔离开发实例：`NARRAFORK_HOME=<空目录> bun run dev` 与 `bun run dev:frontend`；不要动正在运行的 `bun run start:dev` 进程。
+- `frontend/components/providers/provider-presets.test.ts` 的 MIT 许可用例读 `node_modules/normalize-path/LICENSE`；worktree 里没装这个包时会失败，与代码改动无关。
+- `auto:` 被迫切换的阈值（15 分钟）与每次运行的切换上限（3 次）在 `auto-forced-switch.ts`，是按缓存寿命估的经验值，有用量数据后再调。
