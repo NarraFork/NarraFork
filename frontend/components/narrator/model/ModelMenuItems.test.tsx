@@ -482,6 +482,59 @@ describe("aggregation choices inside model menu", () => {
 	});
 });
 
+describe("auto:<model> rows", () => {
+	const autoModels: ModelOption[] = [
+		...models,
+		{
+			value: "auto:gpt-5.5",
+			label: "GPT-5.5",
+			provider: "__auto__",
+			autoSources: [
+				{ value: "codex:gpt-5.5", provider: "codex", available: false, subscription: true },
+				{ value: "a:gpt-5.5", provider: "a", available: true, subscription: false },
+			],
+		},
+	];
+
+	test("name the source auto would use now, skipping one that cannot serve", async () => {
+		await render("a:one", autoModels);
+		expect(host.textContent).toContain(narratorLocale.modelGroupAuto);
+		expect(host.textContent).toContain(
+			narratorLocale.autoCurrentSource.replace("{{provider}}", "Provider A"),
+		);
+		// Sources stay folded until the auto row (or one of its sources) is the selection.
+		expect(buttons().some((item) => item.textContent === narratorLocale.autoSourceAuto)).toBe(
+			false,
+		);
+	});
+
+	test("the selected auto row lists automatic and every source, and picks keep their values", async () => {
+		await render("auto:gpt-5.5", autoModels);
+		const labels = buttons().map((item) => item.textContent ?? "");
+		expect(labels).toContain(narratorLocale.autoSourceAuto);
+		expect(labels.some((text) => text.startsWith("codex"))).toBe(true);
+		expect(host.textContent).toContain(narratorLocale.autoSourceSubscription);
+		await act(async () => {
+			const codex = buttons().find((item) => item.textContent?.startsWith("codex"));
+			codex?.click();
+		});
+		await act(async () => button(narratorLocale.autoSourceAuto).click());
+		expect(selected).toEqual(["codex:gpt-5.5", "auto:gpt-5.5"]);
+	});
+
+	test("a pinned source opens its auto row and is the checked entry", async () => {
+		await render("a:gpt-5.5", autoModels);
+		expect(buttons().map((item) => item.textContent)).toContain(narratorLocale.autoSourceAuto);
+		// The check icon is always rendered and toggled by visibility; only the pin shows it.
+		const checked = buttons().filter((item) =>
+			Array.from(item.querySelectorAll("svg")).some(
+				(icon) => (icon as SVGElement).style.visibility === "visible",
+			),
+		);
+		expect(checked.map((item) => item.textContent)).toEqual(["Provider A"]);
+	});
+});
+
 describe("opening selection positioning", () => {
 	test.each([
 		["a:two", "Two"],

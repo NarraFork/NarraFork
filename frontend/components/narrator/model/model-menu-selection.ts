@@ -5,6 +5,7 @@ import {
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_PARENT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
+	isAutoModelOptionValue,
 	type ModelAggregation,
 	parseAggModelValue,
 } from "../../../lib/constants";
@@ -19,7 +20,7 @@ import {
  * which have no single provider.
  */
 export function modelProviderPrefix(value: string | null | undefined): string | null {
-	if (!value || value.startsWith(AGG_MODEL_PREFIX)) return null;
+	if (!value || value.startsWith(AGG_MODEL_PREFIX) || isAutoModelOptionValue(value)) return null;
 	if (
 		value === FOLLOW_DEFAULT_MODEL ||
 		value === FOLLOW_SUMMARY_MODEL ||
@@ -71,12 +72,17 @@ export function modelMenuSelection(
 
 /**
  * Role groups that stay pinned above the provider groups, in this exact order.
- * Default and Summary are the current selection; Aggregations is a virtual
- * catalog rather than a provider. All three titles are translated, so leaving
- * any of them in the alphabetical pass would move that group when the UI
- * language changes.
+ * Default and Summary are the current selection; Auto (`auto:<model>`) and
+ * Aggregations are virtual catalogs rather than providers. All four titles are
+ * translated, so leaving any of them in the alphabetical pass would move that
+ * group when the UI language changes.
  */
-const FIXED_MODEL_GROUP_ORDER: readonly string[] = ["__default__", "__summary__", "__agg__"];
+const FIXED_MODEL_GROUP_ORDER: readonly string[] = [
+	"__default__",
+	"__summary__",
+	"__auto__",
+	"__agg__",
+];
 
 /**
  * Order model-menu groups: the fixed role groups first (in

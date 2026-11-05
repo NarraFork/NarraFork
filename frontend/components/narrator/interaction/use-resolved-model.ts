@@ -47,9 +47,15 @@ export function useResolvedModel(
 	aggregations: ModelAggregation[] | undefined,
 	allModels: ModelOption[],
 ): UseResolvedModelResult {
+	// `auto:` rows carry their sources, so the same list resolves an auto value for display.
 	const resolvedModel = useMemo(
-		() => resolveDisplayModel(narratorModel, { defaultModelValue, aggregations }),
-		[narratorModel, defaultModelValue, aggregations],
+		() =>
+			resolveDisplayModel(narratorModel, {
+				defaultModelValue,
+				aggregations,
+				autoModels: allModels,
+			}),
+		[narratorModel, defaultModelValue, aggregations, allModels],
 	);
 
 	const { resolvedProvider, resolvedBareModel } = useMemo(() => {

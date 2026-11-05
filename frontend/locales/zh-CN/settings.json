@@ -1358,6 +1358,7 @@
 	"pluginRefreshModels": "刷新模型",
 	"modelAggregationsSection": "模型聚合",
 	"modelAggregationsSectionDesc": "将不同供应商的同一模型聚合为一个虚拟条目，选择时可切换供应商或使用自动路由。",
+	"modelAggregationsRetired": "模型聚合已由“模型 · 自动选来源”取代：在模型菜单里选模型的“自动”，或展开后指定某个来源。用到聚合的设置和会话已在启动时迁移。这里的条目只保留给仍引用它的旧值，不再需要时可以删除。",
 	"modelAggregationsSaveError": "保存模型聚合失败",
 	"aggName": "聚合名称",
 	"aggNamePlaceholder": "例如 Claude Opus 4.6",

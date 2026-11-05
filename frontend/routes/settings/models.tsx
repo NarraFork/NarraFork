@@ -16,16 +16,6 @@ export const Route = createFileRoute("/settings/models")({
 	component: SettingsModelsPage,
 });
 
-let shortIdCounter = 0;
-function generateShortId(): string {
-	const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-	let id = "";
-	for (let i = 0; i < 8; i++) {
-		id += chars[Math.floor(Math.random() * chars.length)];
-	}
-	return id + (shortIdCounter++).toString(36);
-}
-
 function SettingsModelsPage() {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
@@ -134,14 +124,17 @@ function SettingsModelsPage() {
 				catalogMissingModels={catalogMissingModels}
 				navigate={navigate}
 			/>
-			<Divider />
-			<ModelAggregationsSection
-				aggregations={localAggregations}
-				onChange={handleAggregationsChange}
-				allModels={visibleModels}
-				providerLabels={providerLabels}
-				generateId={generateShortId}
-			/>
+			{localAggregations.length > 0 && (
+				<>
+					<Divider />
+					<ModelAggregationsSection
+						aggregations={localAggregations}
+						onChange={handleAggregationsChange}
+						allModels={visibleModels}
+						providerLabels={providerLabels}
+					/>
+				</>
+			)}
 			<Divider />
 			<ModelCatalogSection />
 		</Stack>

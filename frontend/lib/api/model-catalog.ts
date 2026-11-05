@@ -1,3 +1,4 @@
+import type { AutoModelInfo } from "@shared/auto-model";
 import type { ModelCard } from "@shared/model-catalog/card";
 import type { CatalogQuery } from "@shared/model-catalog/resolve";
 import type {
@@ -11,6 +12,8 @@ import { request } from "./client";
 const root = "/model-catalog";
 export const modelCatalogApi = {
 	status: () => request<CatalogStatus>(`${root}/status`),
+	/** Every `auto:<model>` some provider serves, sources in the order routing tries them. */
+	autoModels: () => request<{ models: AutoModelInfo[] }>(`${root}/auto`),
 	/** The card a request for this full model value (`provider:model`) resolves to. */
 	card: (model: string) =>
 		request<ModelCard & { resolvedQuery: CatalogQuery }>(

@@ -27,6 +27,22 @@ export function isAutoModelValue(value: string | null | undefined): boolean {
 	return parseAutoModelValue(value) !== null;
 }
 
+/** One `auto:` model for the picker, sources in the order routing would try them now. */
+export interface AutoModelInfo {
+	/** `auto:<modelId>`. */
+	value: string;
+	modelId: string;
+	/** Catalog display name. */
+	name: string;
+	sources: Array<{
+		/** `<prefix>:<upstream model>`; selecting it pins this provider. */
+		value: string;
+		provider: string;
+		available: boolean;
+		subscription: boolean;
+	}>;
+}
+
 /** How a provider's model matched its catalog entry; only strong matches join `auto`. */
 export type AutoMatch = "exact" | "alias" | "suffix" | "prefix" | "none";
 

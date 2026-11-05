@@ -61,7 +61,26 @@ export type ModelOption = {
 	 * Empty/absent means it is not currently pinned as default or summary.
 	 */
 	pinnedAs?: Array<"default" | "summary">;
+	/**
+	 * `auto:<model>` rows only: the providers that serve it, in the order routing tries
+	 * them now. The first available one is what "auto" uses.
+	 */
+	autoSources?: Array<{
+		value: string;
+		provider: string;
+		available: boolean;
+		subscription: boolean;
+	}>;
 };
+
+/** Value prefix of an automatically sourced model (`auto:<catalog model id>`). */
+export const AUTO_MODEL_VALUE_PREFIX = "auto:";
+
+export function isAutoModelOptionValue(value: string | null | undefined): boolean {
+	return (
+		!!value?.startsWith(AUTO_MODEL_VALUE_PREFIX) && value.length > AUTO_MODEL_VALUE_PREFIX.length
+	);
+}
 
 /** Sentinel value stored in DB to mean "follow the default model from settings". */
 export const FOLLOW_DEFAULT_MODEL = "__default__";
@@ -130,6 +149,8 @@ export function buildAggModelValue(aggId: string, pinnedModel?: string): string 
  *   - aggregation, auto           -> the first member (mirrors backend "priority"
  *                                     routing default; the backend resolves the
  *                                     actual member at request time)
+ *   - `auto:<model>`              -> the first available source the server listed
+ *                                     (`autoModels`), else the value unchanged
  *
  * This intentionally does not honor the "balanced" round-robin order or
  * provider-disabled filtering — it only needs a representative concrete model
@@ -137,7 +158,11 @@ export function buildAggModelValue(aggId: string, pinnedModel?: string): string 
  */
 export function resolveDisplayModel(
 	model: string | null | undefined,
-	options: { defaultModelValue?: string; aggregations?: ModelAggregation[] } = {},
+	options: {
+		defaultModelValue?: string;
+		aggregations?: ModelAggregation[];
+		autoModels?: ModelOption[];
+	} = {},
 ): string {
 	const { defaultModelValue, aggregations } = options;
 	const raw = model?.trim();
@@ -146,6 +171,13 @@ export function resolveDisplayModel(
 		const fallback = defaultModelValue?.trim();
 		if (!fallback || fallback === FOLLOW_DEFAULT_MODEL) return raw ?? "";
 		return resolveDisplayModel(fallback, options);
+	}
+
+	if (isAutoModelOptionValue(raw)) {
+		// Only a hint for display and capability lookups: the server routes the real request.
+		const row = options.autoModels?.find((option) => option.value === raw);
+		const source = row?.autoSources?.find((s) => s.available) ?? row?.autoSources?.[0];
+		return source?.value ?? raw;
 	}
 
 	const agg = parseAggModelValue(raw);

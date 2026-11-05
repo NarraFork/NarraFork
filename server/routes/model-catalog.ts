@@ -6,6 +6,7 @@ import { buildAppErrorResponse } from "../lib/app-error-response";
 import { logger } from "../lib/logger";
 import {
 	applyModelCatalogUpdate,
+	catalogModelName,
 	checkModelCatalogUpdate,
 	getEffectiveModelCard,
 	getModelCatalogStatus,
@@ -15,6 +16,7 @@ import {
 } from "../lib/model-catalog";
 import { describeModel, describeModels, MAX_DESCRIBED_MODELS } from "../lib/model-catalog/describe";
 import { sanitizeCatalogErrorText } from "../lib/model-catalog/error-text";
+import { listAutoModels } from "../lib/model-sourcing/auto-models";
 import { requireAdmin } from "../middleware/auth";
 
 const smallBody = bodyLimit({
@@ -42,6 +44,12 @@ modelCatalogRoutes.onError((error, c) => {
 });
 
 modelCatalogRoutes.get("/status", (c) => c.json(getModelCatalogStatus()));
+
+/**
+ * Every `auto:<model>` some provider serves, with its sources in routing order: the model
+ * picker's first level and its "source" submenu. In-memory reads only; no secrets.
+ */
+modelCatalogRoutes.get("/auto", (c) => c.json({ models: listAutoModels(catalogModelName) }));
 
 /** The resolved card a running narrator uses; read by the model menu and status bar. */
 modelCatalogRoutes.get("/card", (c) => {

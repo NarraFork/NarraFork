@@ -1358,6 +1358,7 @@
 	"pluginRefreshModels": "Refresh Models",
 	"modelAggregationsSection": "Model Aggregations",
 	"modelAggregationsSectionDesc": "Group the same model from different providers into a single virtual entry. Switch providers or use auto-routing when selected.",
+	"modelAggregationsRetired": "Model aggregations are replaced by \"Models · automatic source\": pick a model's Automatic entry in the model menu, or expand it to pin a source. Settings and sessions that used an aggregation were migrated on startup. The entries below stay only for older values that still name them; delete them once nothing does.",
 	"modelAggregationsSaveError": "Failed to save model aggregations",
 	"aggName": "Aggregation Name",
 	"aggNamePlaceholder": "e.g. Claude Opus 4.6",
