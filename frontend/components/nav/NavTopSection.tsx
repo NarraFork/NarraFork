@@ -7,7 +7,7 @@
  * global sits here, in the column the reader already scans.
  */
 
-import { Group, Kbd, NavLink, Stack, Tooltip } from "@mantine/core";
+import { Group, Kbd, NavLink, Stack, Text, Tooltip } from "@mantine/core";
 import { IconEdit, IconSearch } from "@tabler/icons-react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
@@ -51,6 +51,19 @@ function useSearchTarget() {
 }
 
 /**
+ * The label of the two action rows at the top: the same text as a session row's title,
+ * so "Search" and "New session" have the session rows' height and read as the first rows
+ * of the same list rather than as a separate block of bigger buttons.
+ */
+function NavRowLabel({ children }: { children: ReactNode }) {
+	return (
+		<Text size="sm" truncate>
+			{children}
+		</Text>
+	);
+}
+
+/**
  * Goes to the search page and puts the cursor in its box. A row like "New session": the
  * box itself lives on the page, where there is room for it and its filters.
  */
@@ -62,17 +75,22 @@ export function NavSearchLink({ onNavigate }: { onNavigate?: () => void }) {
 	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	return (
 		<NavLink
-			label={t("search")}
+			label={
+				<Group gap={8} wrap="nowrap">
+					<NavRowLabel>{t("search")}</NavRowLabel>
+					{/* Right after the word, on hover only (nav-collapsed.css). A keyboard
+					    hint means nothing without a keyboard, so touch never gets it. */}
+					{!isTouch && (
+						// `lh={1}`: a Kbd at the body line height is taller than the label and
+						// would make this row 2px taller than the session rows.
+						<Kbd size="xs" lh={1} className="nf-nav-search-kbd">
+							{IS_MAC ? "⌘K" : "Ctrl K"}
+						</Kbd>
+					)}
+				</Group>
+			}
 			active={pathname === "/search"}
 			leftSection={<IconSearch size={16} />}
-			// A keyboard hint means nothing without a keyboard.
-			rightSection={
-				isTouch ? undefined : (
-					<Kbd size="xs" style={{ opacity: 0.7 }}>
-						{IS_MAC ? "⌘K" : "Ctrl K"}
-					</Kbd>
-				)
-			}
 			onClick={() => {
 				requestSearchPageFocus();
 				navigate({ to: "/search", search });
@@ -89,6 +107,11 @@ export function NavSearchLink({ onNavigate }: { onNavigate?: () => void }) {
  */
 const NAV_BRAND_ROW_HEIGHT = 32;
 /**
+ * Room between the brand (or the status row) and "Search", on top of the stack's 6px.
+ * Below "New session" nothing is added: the list's own pinned divider is the seam.
+ */
+const NAV_ACTIONS_GAP_ABOVE = 6;
+/**
  * Width the brand shrinks into when collapsed: the 72px column less 8px each side. It
  * sits at x = 20 (16px navbar padding + the row's 4px), so nav-collapsed.css also
  * shifts it 12px left, onto x = 8.
@@ -102,7 +125,7 @@ export function NewSessionLink({ onNavigate }: { onNavigate?: () => void }) {
 	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	return (
 		<NavLink
-			label={t("newSession")}
+			label={<NavRowLabel>{t("newSession")}</NavRowLabel>}
 			active={pathname === "/"}
 			leftSection={<IconEdit size={16} />}
 			onClick={() => {
@@ -163,7 +186,7 @@ export function NavTopSection({
 	// nav-collapsed.css), so the icons stay where they are and the rest appears in place
 	// once it opens.
 	return (
-		<Stack gap={6} mb={6}>
+		<Stack gap={6}>
 			<Group
 				ref={brandRowRef}
 				justify="space-between"
@@ -207,8 +230,11 @@ export function NavTopSection({
 			<Group gap={6} wrap="wrap" px={4} className="nf-nav-status-row">
 				{statusBadges}
 			</Group>
-			<NavSearchLink onNavigate={onNavigate} />
-			<NewSessionLink onNavigate={onNavigate} />
+			{/* Spaced off the brand, then packed like the session rows they lead into. */}
+			<Stack gap={0} mt={NAV_ACTIONS_GAP_ABOVE}>
+				<NavSearchLink onNavigate={onNavigate} />
+				<NewSessionLink onNavigate={onNavigate} />
+			</Stack>
 		</Stack>
 	);
 }
