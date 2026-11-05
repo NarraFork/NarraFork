@@ -368,7 +368,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 8. **凭据迁移**：管理员经密码 + 第二因素核验后，可导出单个 / 多个 / 全部凭据为口令加密文件，在另一台实例导入，见 §7。
 9. **模型值写法**（2026-11-04 改定）：保留 `前缀:模型`，含义改为“指定服务”，凭据在前缀之下选；新增 `auto:<逻辑模型>` 表示自动选来源。不再新增 `narrators.modelSource` 字段，也不把 `narrators.model` 改成不带前缀的逻辑模型。理由：前缀让一个字符串就能确定上游，目录外的模型照样可用，同名而实际不同的上游模型不会被误合并，纪元与推理签名的边界也不用改；而按计费主体选凭据、个人到团队的回落，在前缀之下就能完成。见 §4.1。
 
-## 14. 交接：现状与下一步（2026-11-04）
+## 14. 交接：现状与下一步（2026-11-06 更新）
 
 本节给接手的人：做到了哪里、代码在哪、下一步按什么顺序做、有哪些已知的坑。设计本身以前文为准。
 
@@ -382,23 +382,29 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 | P2 | 凭据文件加密（可关） | `server/lib/secret-store.ts`、设置 → 服务器与系统 |
 | P2 | 凭据迁移：密码 + 第二因素核验、口令加密导出、预览导入 | `server/services/step-up-service.ts`、`server/lib/credential-transfer/`、`routes/credential-transfer.ts`、`CredentialTransferCard.tsx` |
 | P2 | 自定义 API 供应商多 Key 池：Key 迁出 settings.json、会话粘性轮换与故障切换、逐 Key 额度与网络身份、Key 列表界面 | `server/lib/provider-keys.ts`、`settings/provider-keys-projection.ts`、`agent/pooled-provider.ts`、`provider-key-{subjects,quota}.ts`、`routes/provider-keys.ts`、`ProviderKeysPanel.tsx` |
+| P2 | NUG、TokenDance、Command Code、自定义搜索供应商的 `apiKey` 迁出 settings.json（同一投影，归属 id 带命名空间） | `settings/provider-keys-projection.ts` |
+| P3 | 模型值改定为 `前缀:模型` + `auto:<模型>`（§4.1）；`auto` 成为保留前缀；`agent.autoExcludedProviders` | `shared/auto-model.ts`、`server/lib/settings/provider.ts` |
+| P3 | `auto:` 排序：能否服务 → 订阅优先 → 参考价；会话来源仍能服务时不换 | `shared/auto-route-strategy.ts`、`server/lib/agent/auto-route-signals.ts` |
+| P3 | 子代理可用模型与模型池接受 `auto:` | `server/lib/agent/tools/task.ts`、`settings/provider.ts` |
+| P3 | 启动迁移（仅 SQLite）：`auto` 前缀的供应商改名为 `auto-N`；聚合值迁为 `auto:` / `前缀:模型` | `services/provider-prefix-migration-service.ts`、`services/aggregation-migration-service.ts`、`shared/aggregation-migration.ts` |
+| P3 | 模型菜单 `auto:` 行与来源子菜单；聚合设置页只读 | `GET /api/model-catalog/auto`（`server/lib/model-sourcing/auto-models.ts`）、`ModelMenuItems.tsx`、`useModels.ts`、`ModelAggregationsSection.tsx` |
 
 架构说明页（可分享）：设计 https://claude.ai/artifact/19BW1ReTRShtDynQHXJDUE ，现状梳理 https://claude.ai/artifact/HJfhaWMvFtFjxhFDaN8S8E （P2 之后的变化以本文为准）。
 
 ### 14.2 下一步，按顺序
 
-1. **P2 收尾**
-   - ~~NUG、TokenDance、Command Code、搜索渠道的 Key 迁出 settings.json~~（已完成，见 §7）。剩余：NUG OAuth client secret 与搜索供应商敏感请求头。
+1. **修 `errors-parity` 测试**（阻塞 CI）：凭据迁移（`7b7ec912f`）在 `frontend/locales/*/errors.json` 加了 `STEP_UP_*`、`BUNDLE_*` 共 7 个码，`shared/error-catalog.ts` 没有对应条目。
+2. **P3 收尾**
+   - **被迫切换**（§4.3）：`auto:` 会话遇到额度耗尽或来源不可用时，若有别的来源能服务就换过去，而不是等重置。现在 orchestrator 的模型不可用等待只对 `__default__` 重新解析，`auto:` 会一直等。
+   - **纪元边界重选**（§4.3）：现在的粘性只看会话当前的服务（内存中的 `active.provider`）；压缩成功后应完整重选一次，让“有更优来源”在下个纪元生效。
+   - 服务的“参与自动”开关界面（后端 `agent.autoExcludedProviders` 已支持）。
+   - 状态栏的额度显示改为会话实际在用的来源（见 §14.3）。
+3. **P2 收尾**
    - 把 CodexManager 里与账号无关的池化逻辑（优先级、会话亲和、失败停用、额度跳过）与 `pooled-provider.ts` 合并成一个通用池；Codex 只保留 OAuth / PAT / Agent Identity 登录与 `/wham/usage` 探测。不要一次重写 CodexManager，先抽出纯函数再替换调用点。
-   - 数据管理“导出供应商”仍带第一个 Key 且不要求二次核验，需决定：要么去掉 Key（改走凭据迁移），要么同样要求 step-up。
-2. **P3 路由**（§4）：
-   - 模型值按 §4.1：`auto` 加进保留前缀（`server/routes/settings.ts` 的前缀冲突校验、`plugin-provider-registry.ts` 的 `HOST_RESERVED_PREFIXES`）；`resolveEffectiveModel` 识别 `auto:` 并交给 `resolveRoute`，`前缀:模型` 仍走 `resolveProviderAndModel`。
-   - 逻辑模型身份复用 P1 的 `identifyModel`，只认 exact / alias；服务配置加“参与自动”开关。
-   - `resolveRoute` 在纪元边界（压缩 / 新纪元）才重选来源，纪元内锁定；策略预设先做“个人优先 / 团队优先”和“先用订阅”。
-   - 模型选择器二级“来源”菜单；Agent 工具的可用模型列表与子代理模型池接受 `auto:` 值。
-   - 把模型聚合 `__agg__:` 迁为 `auto:` 或 `前缀:模型`（§11），后台分页执行；`前缀:模型` 的值不用迁移。
-3. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
-4. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
+   - NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json。
+   - 数据管理“导出供应商”仍带 Key 且不要求二次核验（等待决定：建议导出不带 Key，Key 只走凭据迁移）。
+4. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
+5. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
 
 ### 14.3 约定与已知事项
 
@@ -407,4 +413,8 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 - 回退到 Key 迁出之前的版本会读到空 Key（§7）。
 - 状态栏的 Kimi / OpenCode 额度按供应商显示，取第一个可用 Key，不一定是当前会话正在用的 Key；做 P3 时可改为显示会话实际来源。
 - 冷却状态只在内存；只有 `invalid`（401）会写进 `provider-keys.json`。
+- `identifyModelValue` / `queryForModel` 只认已配置供应商的前缀和 `codex` / `anthropic` / `openai` / `gemini`；未配置的前缀会把整串当上游 id，匹配结果为 `none`。测试里要先注入 `customApiProviders`。
+- 路由读 Codex 可用性用 `availableCount`，不要用 `hasAvailableCredentials`：后者会恢复账号并重写凭据文件。
+- 目录的 `referencePricing` 是每百万 token 的十进制字符串，可能为 null。
+- 新建的 worktree 没有 `frontend/routeTree.gen.ts`（开发服务器启动时生成），`tsgo` 会对全部路由文件报 `parameter of type 'undefined'`，属于既有问题。
 - 隔离开发实例：`NARRAFORK_HOME=<空目录> bun run dev` 与 `bun run dev:frontend`；不要动正在运行的 `bun run start:dev` 进程。
