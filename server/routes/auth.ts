@@ -4,7 +4,13 @@ import QRCode from "qrcode";
 import { buildSessionResult, loginUser, registerUser, revokeSessionToken } from "../lib/auth";
 import { type AuthAttemptBlocked, authAttemptLimiter } from "../lib/auth-attempt-limiter";
 import { getClientIp } from "../lib/client-ip";
-import { AppError, RateLimitError, ValidationError, zodValidationError } from "../lib/errors";
+import {
+	AppError,
+	catalogError,
+	RateLimitError,
+	ValidationError,
+	zodValidationError,
+} from "../lib/errors";
 import { invalidateGitIdentityCache } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import {
@@ -611,7 +617,7 @@ authRoutes.post("/step-up", requireSessionAuth, async (c) => {
 	const parsed = stepUpSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw zodValidationError(parsed.error);
 	const user = c.get("user");
-	if (!user.sid) throw new AppError("A signed-in session is required", 401, "STEP_UP_REQUIRED");
+	if (!user.sid) throw catalogError("STEP_UP_REQUIRED");
 	return c.json(
 		await verifyStepUp({
 			...parsed.data,

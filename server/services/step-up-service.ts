@@ -11,7 +11,7 @@
  */
 import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
 import { authAttemptLimiter } from "../lib/auth-attempt-limiter";
-import { AppError, RateLimitError } from "../lib/errors";
+import { catalogError, RateLimitError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -92,12 +92,8 @@ export async function verifyStepUp(
 	input: StepUpInput,
 ): Promise<{ token: string; expiresAt: number }> {
 	const methods = await stepUpMethods(input.userId);
-	if (methods.length === 0) {
-		throw new AppError("Set up two-factor authentication first", 403, "STEP_UP_MFA_REQUIRED");
-	}
-	if (!methods.includes(input.method)) {
-		throw new AppError("This verification method is not set up", 400, "STEP_UP_METHOD_UNAVAILABLE");
-	}
+	if (methods.length === 0) throw catalogError("STEP_UP_MFA_REQUIRED");
+	if (!methods.includes(input.method)) throw catalogError("STEP_UP_METHOD_UNAVAILABLE");
 
 	const attempt = authAttemptLimiter.beginMfa(
 		input.userId,
@@ -127,7 +123,7 @@ export async function verifyStepUp(
 				remaining: after.remaining,
 			});
 			if (after.locked) throw new RateLimitError("MFA_THROTTLED", after.retryAfterMs);
-			throw new AppError("Password or verification code is incorrect", 401, "STEP_UP_FAILED");
+			throw catalogError("STEP_UP_FAILED");
 		}
 		attempt.success();
 		settled = true;
@@ -168,7 +164,7 @@ export function consumeStepUp(
 		grant.sessionId !== expected.sessionId ||
 		grant.purpose !== expected.purpose
 	) {
-		throw new AppError("Verify your identity again to continue", 401, "STEP_UP_REQUIRED");
+		throw catalogError("STEP_UP_REQUIRED");
 	}
 	grants.delete(token);
 }

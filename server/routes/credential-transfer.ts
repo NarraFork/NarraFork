@@ -11,7 +11,7 @@ import {
 	MAX_BUNDLE_BYTES,
 	MIN_PASSPHRASE_LENGTH,
 } from "../lib/credential-transfer/bundle";
-import { AppError, zodValidationError } from "../lib/errors";
+import { catalogError, zodValidationError } from "../lib/errors";
 import { requireAdmin } from "../middleware/auth";
 import { consumeStepUp } from "../services/step-up-service";
 
@@ -46,7 +46,7 @@ async function withBundleErrors<T>(run: () => Promise<T>): Promise<T> {
 	try {
 		return await run();
 	} catch (error) {
-		if (error instanceof BundleError) throw new AppError(error.message, 400, error.code);
+		if (error instanceof BundleError) throw catalogError(error.code);
 		throw error;
 	}
 }
