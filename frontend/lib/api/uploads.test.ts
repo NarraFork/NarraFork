@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import i18next from "i18next";
 import {
 	ApiError,
 	getToken,
@@ -140,6 +141,46 @@ describe("attachment staging and upload transport", () => {
 			["/api/narrator-attachments/n/first", "DELETE"],
 		]);
 		expect(xhrRequests).toHaveLength(2);
+	});
+
+	// The send toast prints err.message, so actionable staging refusals must be
+	// mapped to localized messages rather than surfacing the server's English.
+	// i18next is not initialized in this environment (t() returns ""), so the
+	// message text is asserted via the translation call, and the keys separately
+	// against both locale files.
+	test.each([
+		["ATTACHMENT_TOO_LARGE", "narrator:attachmentTooLargeForUpload"],
+		["ATTACHMENT_STAGING_FULL", "narrator:attachmentStagingFull"],
+	])("%s is surfaced as the localized %s message", async (code, key) => {
+		const translate = spyOn(i18next, "t").mockImplementation(
+			((k: string, opts?: { name?: string }) => `${k}|${opts?.name ?? ""}`) as typeof i18next.t,
+		);
+		try {
+			respondXHR = (xhr) => xhr.reply({ error: "server english", code }, 413);
+			const error = await submit("send", [largeFile("big.log")]).catch((err: unknown) => err);
+			expect(error).toBeInstanceOf(ApiError);
+			expect((error as ApiError).message).toBe(`${key}|big.log`);
+			expect((error as ApiError).status).toBe(413);
+			expect((error as ApiError).data?.code).toBe(code);
+		} finally {
+			translate.mockRestore();
+		}
+	});
+
+	test("staging error messages exist in both locales with the name placeholder", async () => {
+		for (const locale of ["en", "zh-CN"]) {
+			const messages = (await Bun.file(
+				new URL(`../../locales/${locale}/narrator.json`, import.meta.url),
+			).json()) as Record<string, string>;
+			for (const key of ["attachmentTooLargeForUpload", "attachmentStagingFull"]) {
+				expect(messages[key]).toContain("{{name}}");
+			}
+		}
+	});
+
+	test("an unrecognized staging error keeps the server message", async () => {
+		respondXHR = (xhr) => xhr.reply({ error: "disk on fire", code: "SOMETHING_ELSE" }, 500);
+		await expect(submit("send", [largeFile("big.log")])).rejects.toThrow("disk on fire");
 	});
 
 	test.each(paths)("%s cleans stages after the final request returns an error", async (path) => {

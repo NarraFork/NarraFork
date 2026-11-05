@@ -335,6 +335,9 @@ function fixture(
 		loadBufferedTextFiles: () => [],
 		deleteBufferedTextFile: () => {},
 		persistAdditionalBufferedTextFiles: persistAdditional,
+		// The route drops staged originals after a successful queue edit; these
+		// fixtures never stage uploads, so a no-op keeps the code path reachable.
+		releaseStagedFiles: () => {},
 		getNarratorDraft: async () => ({
 			text: "",
 			fileReferences: [reference],

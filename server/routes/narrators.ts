@@ -330,6 +330,7 @@ import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-wri
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
+	releaseStagedFiles,
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
@@ -3656,6 +3657,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		});
 		if (!ok) throw new NotFoundError("Buffered message", mid);
 		committed = true;
+		// The queued row now references its own mailbox copies, so the staged
+		// originals can go. Only after the update landed: a refused edit keeps them,
+		// so the composer's retry can still claim the same uploads.
+		releaseStagedFiles(newTextFiles);
 	} finally {
 		if (!committed) {
 			for (const item of createdMedia) deleteUploadedMedia(id, item.mediaId);

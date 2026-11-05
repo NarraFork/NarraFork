@@ -702,9 +702,23 @@ async function stageAttachment(
 	);
 	if (!res.ok) {
 		const error = await readFetchError(res, "Attachment upload failed");
-		throw new ApiError(error.message, res.status, error.data);
+		throw new ApiError(stagingErrorMessage(error.data.code, file, error.message), res.status, {
+			...error.data,
+		});
 	}
 	return (await res.json()) as { uploadId: string };
+}
+
+/**
+ * The send toast prints `err.message`, so the two refusals a user can act on are
+ * localized here, with the file name, instead of surfacing the server's English.
+ */
+function stagingErrorMessage(code: unknown, file: File, fallback: string): string {
+	if (code === "ATTACHMENT_TOO_LARGE")
+		return i18next.t("narrator:attachmentTooLargeForUpload", { name: file.name });
+	if (code === "ATTACHMENT_STAGING_FULL")
+		return i18next.t("narrator:attachmentStagingFull", { name: file.name });
+	return fallback;
 }
 
 /** Never delay cancellation/error recovery for cleanup; TTL reclaims missed deletes. */

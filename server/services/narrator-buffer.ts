@@ -358,6 +358,23 @@ async function writeStagingText(id: string, prefix: string, text: string): Promi
 		throw error;
 	}
 }
+/**
+ * Drop staged upload originals once a committed mailbox row owns its copies.
+ *
+ * Best effort: a failed delete only leaves bytes the TTL sweep reclaims, and must
+ * never turn an accepted message into a reported failure. No-op for multipart
+ * files, which never entered the staging area.
+ */
+export function releaseStagedFiles(files: readonly File[] | undefined): void {
+	for (const file of files ?? []) {
+		try {
+			releaseStagedAttachment(file);
+		} catch (error) {
+			logger.warn("Failed to release staged attachment", { error: String(error) });
+		}
+	}
+}
+
 /** Save attachments once; both primary and subagent producers use this durable representation. */
 export async function persistBufferedTextFiles(
 	id: string,
@@ -391,9 +408,10 @@ export async function persistBufferedTextFiles(
 				sourceMimeType: file.type,
 			});
 			await writeBufferedFile(path, file);
-			// The mailbox copy is durable, so a staged upload may drop its original.
-			// A no-op for multipart files, which never entered the staging area.
-			releaseStagedAttachment(file);
+			// Deliberately NOT releasing the staged original here: this copy only
+			// becomes the message's attachment once the mailbox row commits. Callers
+			// release after their commit (see `releaseStagedFiles`), so a full queue
+			// or a DB error still leaves the upload claimable on retry.
 		}
 		return saved;
 	} catch (error) {
@@ -827,6 +845,8 @@ export async function enqueueBufferedMessage(
 			discardUnownedStaging(stagingId);
 			return { ok: false, bufferedAt: "", id: "", full: true };
 		}
+		// The mailbox row now owns its own copy, so the staged originals can go.
+		releaseStagedFiles(textFiles);
 		return { ok: true, bufferedAt: result.delivery.bufferedAt, id: result.delivery.id };
 	} catch (error) {
 		if (!admissionStarted) {

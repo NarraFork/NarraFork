@@ -7,7 +7,7 @@ import {
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 	MAX_TEXT_FILE_SIZE,
 } from "@shared/text-file-types";
-import { ValidationError } from "./errors";
+import { AppError, ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
@@ -50,6 +50,23 @@ export function setStagedAttachmentLimitsForTests(limits: typeof limitsTestOverr
 
 function maxStagedAttachmentBytes(): number {
 	return perFileCeilingTestOverride ?? MAX_TEXT_FILE_SIZE;
+}
+
+/**
+ * The two refusals a user can act on carry their own 413 codes, so the composer
+ * can say "this file is over 1 GiB" or "send or remove pending attachments"
+ * instead of a generic upload failure. Malformed requests stay ValidationError.
+ */
+function attachmentTooLarge(): AppError {
+	return new AppError(
+		`Attachment exceeds the ${formatLimit(maxStagedAttachmentBytes())} limit`,
+		413,
+		"ATTACHMENT_TOO_LARGE",
+	);
+}
+
+function stagingFull(message: string): AppError {
+	return new AppError(message, 413, "ATTACHMENT_STAGING_FULL");
 }
 
 export function getStagedAttachmentsDir(): string {
@@ -152,11 +169,7 @@ export async function stageAttachment(
 		if (!Number.isSafeInteger(declaredLength) || declaredLength < 0) {
 			throw new ValidationError("Invalid attachment Content-Length");
 		}
-		if (declaredLength > maxStagedAttachmentBytes()) {
-			throw new ValidationError(
-				`Attachment exceeds the ${formatLimit(maxStagedAttachmentBytes())} limit`,
-			);
-		}
+		if (declaredLength > maxStagedAttachmentBytes()) throw attachmentTooLarge();
 	}
 
 	const dir = narratorDir(narratorId);
@@ -164,12 +177,12 @@ export async function stageAttachment(
 	const maxCount = limitsTestOverride.count ?? MAX_PENDING_STAGED_ATTACHMENTS;
 	const maxBytes = limitsTestOverride.bytes ?? MAX_STAGED_ATTACHMENTS_TOTAL_BYTES;
 	if (pending.count >= maxCount) {
-		throw new ValidationError(
+		throw stagingFull(
 			`Too many pending attachments (max ${maxCount}); send or discard the current ones first`,
 		);
 	}
 	if (pending.bytes + (declaredLength ?? 0) > maxBytes) {
-		throw new ValidationError("Pending attachments exceed the staging byte limit");
+		throw stagingFull("Pending attachments exceed the staging byte limit");
 	}
 	const uploadId = generateShortId();
 	const path = dataPath(narratorId, uploadId);
@@ -208,15 +221,11 @@ export async function stageAttachment(
 			controller.signal.throwIfAborted();
 			if (done) break;
 			const nextSize = size + value.byteLength;
-			if (nextSize > maxStagedAttachmentBytes()) {
-				throw new ValidationError(
-					`Attachment exceeds the ${formatLimit(maxStagedAttachmentBytes())} limit`,
-				);
-			}
+			if (nextSize > maxStagedAttachmentBytes()) throw attachmentTooLarge();
 			const reserved = active.get(uploadId) ?? 0;
 			const nextReserved = Math.max(nextSize, reserved);
 			if (pendingStagedUploads(narratorId).bytes - reserved + nextReserved > maxBytes) {
-				throw new ValidationError("Pending attachments exceed the staging byte limit");
+				throw stagingFull("Pending attachments exceed the staging byte limit");
 			}
 			active.set(uploadId, nextReserved);
 			await writeAll(handle, value, size);

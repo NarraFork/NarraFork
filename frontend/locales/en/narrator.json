@@ -801,6 +801,8 @@
 	"unsupportedFormat": "Supported: PNG, JPEG, GIF, WebP",
 	"dropFilesHere": "Drop files here",
 	"textFileTooLarge": "Text file too large (max 1GB)",
+	"attachmentTooLargeForUpload": "{{name}} is larger than the 1 GB attachment limit.",
+	"attachmentStagingFull": "Could not upload {{name}}: too many pending attachments. Send or remove some attachments, then try again.",
 	"unsupportedFileType": "Unsupported file type",
 	"draftAttachmentsRestoreFailedTitle": "Some attachments could not be restored",
 	"draftAttachmentsRestoreFailed": "{{count}} pending attachment(s) were lost and need to be attached again.",

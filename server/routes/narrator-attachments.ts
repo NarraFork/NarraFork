@@ -17,6 +17,23 @@ function requireOctetStream(contentType: string | undefined): void {
 	}
 }
 
+/**
+ * HTTP header values are byte strings, so the client percent-encodes the
+ * filename (`encodeURIComponent`) to carry Chinese or emoji names intact. Decode
+ * it here, before sanitizing; otherwise the stored name, the model hint and the
+ * composer asset comparison would all see `%E5%A4%A7...` instead of the real name.
+ * A malformed escape is kept verbatim rather than rejected: the name is only for
+ * display, and a raw ASCII name from another client has no escapes at all.
+ */
+export function decodeAttachmentFilenameHeader(raw: string | undefined): string | undefined {
+	if (raw === undefined) return undefined;
+	try {
+		return decodeURIComponent(raw);
+	} catch {
+		return raw;
+	}
+}
+
 function parseContentLength(raw: string | undefined): number | undefined {
 	if (raw === undefined) return undefined;
 	if (!/^\d+$/.test(raw)) throw new ValidationError("Invalid Content-Length");
@@ -32,7 +49,7 @@ narratorAttachmentRoutes.post("/:narratorId", async (c) => {
 
 	const staged = await stageAttachment(c.req.raw.body, {
 		narratorId,
-		filename: c.req.header("x-attachment-filename"),
+		filename: decodeAttachmentFilenameHeader(c.req.header("x-attachment-filename")),
 		mediaType: c.req.header("x-attachment-type"),
 		declaredLength: parseContentLength(c.req.header("content-length")),
 		signal: c.req.raw.signal,
