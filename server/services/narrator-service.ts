@@ -362,6 +362,8 @@ export interface CreateNarratorInput {
 	relaxedPlan?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	dangerReflectionOverride?: DangerReflectionOverride;
+	/** AskUserQuestion 自动反思回答的三态覆盖；inherit = 跟随 settings.agent.questionReflectionEnabled。 */
+	questionReflectionOverride?: BooleanOverride;
 	autoContinuationOverride?: AutoContinuationOverride;
 	behaviorFenceIntervalOverride?: number | null;
 	behaviorFenceAttachOverride?: BooleanOverride;
@@ -424,6 +426,7 @@ interface CreateSubagentInput {
 	title?: string;
 	permissionMode?: string;
 	planReflectionAutoApproveOverride?: BooleanOverride;
+	questionReflectionOverride?: BooleanOverride;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
@@ -1510,6 +1513,7 @@ export async function prepareNarratorCreation(
 			}),
 			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
 			dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
+			questionReflectionOverride: input.questionReflectionOverride ?? "inherit",
 			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
 			behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
 			behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
@@ -1784,6 +1788,8 @@ export const narratorService = {
 							parent.planReflectionAutoApproveOverride ??
 							"inherit",
 						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+						questionReflectionOverride:
+							input.questionReflectionOverride ?? parent.questionReflectionOverride ?? "inherit",
 						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
@@ -2510,6 +2516,7 @@ export const narratorService = {
 								planReflectionAutoApproveOverride:
 									parent.planReflectionAutoApproveOverride ?? "inherit",
 								dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+								questionReflectionOverride: parent.questionReflectionOverride ?? "inherit",
 								autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 								behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 								behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
@@ -2717,6 +2724,7 @@ export const narratorService = {
 								planReflectionAutoApproveOverride:
 									parent.planReflectionAutoApproveOverride ?? "inherit",
 								dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+								questionReflectionOverride: parent.questionReflectionOverride ?? "inherit",
 								autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 								behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 								behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",

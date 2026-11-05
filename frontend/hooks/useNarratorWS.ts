@@ -640,6 +640,7 @@ export interface NarratorWSCallbacks {
 	onReflectionOverridesChanged?: (overrides: {
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+		questionReflectionOverride?: "inherit" | "on" | "off";
 	}) => void;
 	onCompacting?: (mode?: "blocking" | "background") => void;
 	onCompactProgress?: (progress: CompactProgressEvent) => void;
@@ -1365,6 +1366,11 @@ export function useNarratorWS(
 								| "light"
 								| "standard"
 								| "strict"
+								| undefined,
+							questionReflectionOverride: data.questionReflectionOverride as
+								| "inherit"
+								| "on"
+								| "off"
 								| undefined,
 						});
 						break;

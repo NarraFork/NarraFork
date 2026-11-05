@@ -744,6 +744,9 @@ export async function executeQueuedNewCommand(
 		dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
 			sourceNarrator.dangerReflectionOverride,
 		),
+		questionReflectionOverride: normalizeOptionalBooleanOverride(
+			sourceNarrator.questionReflectionOverride,
+		),
 		cwd: active.cwd,
 		// The person who queued `/new` owns the session it spawns. Falling back to the
 		// source narrator's owner keeps it out of "ownerless" territory when the
