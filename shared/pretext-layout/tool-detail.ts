@@ -987,6 +987,8 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 							}
 						: {}),
 					...(metadata?.fileChangeHistoryUnavailable === true ? { historyUnavailable: true } : {}),
+					// 应用自己写的草稿按 tool call 存，展开/切会话回来时靠它恢复。
+					...(typeof input.toolUseId === "string" ? { stateKey: input.toolUseId } : {}),
 					...uiKitFields,
 				})
 			: // A kit build the user must confirm is something to act on, not text to read.

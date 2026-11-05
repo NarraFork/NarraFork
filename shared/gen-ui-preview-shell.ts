@@ -29,6 +29,11 @@ export interface PreviewShellOptions {
 	kit?: boolean;
 	/** Offline inspection, including project kits; host actions are disabled. */
 	inspection?: boolean;
+	/**
+	 * 应用上次自己 persist 的值。展开视图、切会话后重新挂载时从宿主回灌，
+	 * 让任意 React 组件的草稿不至于随 iframe 重建而消失。
+	 */
+	restored?: Record<string, unknown> | null;
 }
 
 /** Advisory frame events, never proof that host capture succeeded. */
@@ -82,6 +87,7 @@ export function createPreviewShell(
 		actionProps: UI_ACTION_PROPS,
 		tagProps: UI_TAG_PROPS,
 		forbiddenProps: UI_FORBIDDEN_PROPS,
+		restored: options.restored ?? null,
 	});
 	const base = kit
 		? ":root{color-scheme:light}body{background:#fff;color:#1a1a1a;font-family:system-ui,sans-serif}"
@@ -178,6 +184,9 @@ export function createPreviewShell(
       sendPrompt: (text) => bridge.sendPrompt?.(text),
       submit: (values, message) => bridge.submit?.(values, message),
       openLink: (url) => bridge.openLink?.(url),
+      // 应用自己决定存什么：重新挂载时从 restored 读回，其余由宿主保管。
+      persist: (values) => bridge.persist?.(values),
+      restored: config.restored ?? null,
     });
     if (config.mode === "app") script(config.js);
     // Drop the bootstrap's duplicate source strings once the browser has parsed them.
@@ -261,6 +270,11 @@ export function createPreviewShell(
       act("submit", [value.trim(), ...lines].filter(Boolean).join("\\n"), {fields, message: value.trim()});
     };
     bridge.sendPrompt = (text) => act("sendPrompt", String(text ?? ""));
+    // 值只进宿主，不进对话：这里没有 ask 确认，因为它不是应用在说话。
+    bridge.persist = (values) => {
+      if (!values || typeof values !== "object" || Array.isArray(values)) return;
+      parent.postMessage({type: "narrafork:ui-persist", values}, "*");
+    };
     bridge.openLink = (url) => act("openLink", String(url ?? ""));
     bridge.submit = (values, message) => {
       const fields = {};

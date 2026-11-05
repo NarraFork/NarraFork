@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { PreviewBundle } from "./preview-loader";
 import { createPreviewShell, readPreviewTheme } from "./preview-shell";
+import { readAppState, writeAppState } from "./preview-state";
 
 /** This component's entire lifetime is the open modal's lifetime. */
 export function FilePreview({
@@ -14,11 +15,13 @@ export function FilePreview({
 	file,
 	formToolUseId,
 	onSubmitted,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	formToolUseId?: string;
 	onSubmitted?: () => void;
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -51,6 +54,7 @@ export function FilePreview({
 						height="65dvh"
 						formToolUseId={formToolUseId}
 						onSubmitted={onSubmitted}
+						stateKey={stateKey}
 					/>
 				</>
 			) : (
@@ -73,12 +77,14 @@ export function AppFrame({
 	height,
 	formToolUseId,
 	onSubmitted,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	height: number;
 	formToolUseId?: string;
 	onSubmitted?: () => void;
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -113,6 +119,7 @@ export function AppFrame({
 			height={height}
 			formToolUseId={formToolUseId}
 			onSubmitted={onSubmitted}
+			stateKey={stateKey}
 		/>
 	);
 }
@@ -134,6 +141,7 @@ function PreviewFrame({
 	height,
 	formToolUseId,
 	onSubmitted,
+	stateKey,
 }: {
 	narratorId: string;
 	bundle: PreviewBundle;
@@ -144,6 +152,8 @@ function PreviewFrame({
 	formToolUseId?: string;
 	/** The answer reached the waiting call: the card has nothing left to ask. */
 	onSubmitted?: () => void;
+	/** Tool call this app belongs to; keys the draft it persists across frame rebuilds. */
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	// An app is code the agent wrote, running in the reader's session: nothing it sends
@@ -157,7 +167,11 @@ function PreviewFrame({
 	const [navigated, setNavigated] = useState(false);
 	// Theme changes update only tokens/provider state, never recreate the user's open UI.
 	const [srcDoc] = useState(() =>
-		createPreviewShell(bundle, readPreviewTheme(), failureMessage, { kit: bundle.kitRuntime }),
+		createPreviewShell(bundle, readPreviewTheme(), failureMessage, {
+			kit: bundle.kitRuntime,
+			// 应用上次交出来的草稿；它在挂载时就能读到，晚一步注入就来不及了。
+			restored: stateKey ? readAppState(stateKey) : null,
+		}),
 	);
 	const sendTheme = () =>
 		frame.current?.contentWindow?.postMessage(
@@ -231,6 +245,12 @@ function PreviewFrame({
 					setRequest({ kind: "prompt", text });
 				}
 			}
+			if (data?.type === "narrafork:ui-persist") {
+				const values = (data as { values?: unknown }).values;
+				if (stateKey && values && typeof values === "object" && !Array.isArray(values))
+					writeAppState(stateKey, values as Record<string, unknown>);
+				return;
+			}
 			if (event.data?.type === "narrafork:preview-present" && event.data.id === loads.current)
 				clearTimeout(loadProbe.current);
 		};
@@ -241,7 +261,7 @@ function PreviewFrame({
 			window.removeEventListener("message", onNavigation);
 			unsubscribe();
 		};
-	}, [navigated, formToolUseId, narratorId, onSubmitted]);
+	}, [navigated, formToolUseId, narratorId, onSubmitted, stateKey]);
 	const done = () => {
 		pending.current = false;
 		setRequest(null);

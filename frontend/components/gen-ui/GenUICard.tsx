@@ -83,6 +83,7 @@ export function GenUICard(props: GenUICardProps) {
 				kit={props.kit}
 				height={props.height}
 				formToolUseId={props.inline?.formToolUseId}
+				stateKey={props.inline?.stateKey}
 			/>
 		) : (
 			<PrivateCard
@@ -362,6 +363,7 @@ function AppCard({
 	historyUnavailable,
 	kit,
 	formToolUseId,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
@@ -371,6 +373,8 @@ function AppCard({
 	kit?: GenUiKitNotice;
 	/** Set while a render({path}) call waits for this app's submit. */
 	formToolUseId?: string;
+	/** Keys the draft the app persists across frame rebuilds. */
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const mobile = useMobileViewport();
@@ -416,6 +420,7 @@ function AppCard({
 				file={file}
 				formToolUseId={formToolUseId}
 				onSubmitted={collapseAfterSubmit}
+				stateKey={stateKey}
 			/>
 		</Suspense>
 	) : null;
@@ -458,6 +463,7 @@ function AppCard({
 						height={bodyHeight}
 						formToolUseId={formToolUseId}
 						onSubmitted={collapseAfterSubmit}
+						stateKey={stateKey}
 					/>
 				</Suspense>
 			) : (
