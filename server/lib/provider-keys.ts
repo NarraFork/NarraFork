@@ -1,11 +1,13 @@
 /**
- * API keys of custom API providers (Kimi Code, OpenCode Go, DeepSeek, relays …).
+ * API keys of model and search providers, kept out of settings.json.
  *
- * A provider can hold several keys; they live here, in `provider-keys.json` written
- * through the secret store, and no longer in settings.json. The settings module keeps a
- * projection: in memory, `customApiProviders[i].apiKey` is that provider's first key, so
- * code that reads a single key keeps working, and writing that field edits the first key
- * (see settings/provider-keys-projection.ts). Runtime selection among keys is in
+ * A custom API provider (Kimi Code, OpenCode Go, DeepSeek, relays …) can hold several
+ * keys, filed under its own id. NUG providers, TokenDance, Command Code and custom search
+ * providers hold one key each, filed under a namespaced owner id (`nug:<id>`, …). They live
+ * here, in `provider-keys.json` written through the secret store. The settings module keeps
+ * a projection: in memory each entry's `apiKey` is its first key, so code that reads a
+ * single key keeps working, and writing that field edits the first key (see
+ * settings/provider-keys-projection.ts). Runtime selection among keys is in
  * agent/pooled-provider.ts.
  *
  * Leaf module: it must not import settings, which depends on it.

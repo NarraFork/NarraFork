@@ -53,6 +53,7 @@ import { _bindSettings } from "./provider";
 import {
 	absorbProviderKeys,
 	hydrateProviderKeys,
+	pruneProviderKeys,
 	syncProviderKeys,
 	withoutProviderKeys,
 } from "./provider-keys-projection";
@@ -971,6 +972,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		}
 		lastDiskManagerFields = managerFieldsFromSettings(newSettings);
 	});
+	if (_cache.current) pruneProviderKeys(_cache.current, newSettings);
 	settingsRevision++;
 	if (_cache.current) {
 		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);

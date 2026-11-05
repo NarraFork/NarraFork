@@ -37,7 +37,11 @@ export function requestSourceName(sourceId: string): string | undefined {
 	const singleton = SINGLETON_SOURCES[sourceId] ?? named(sourceId);
 	if (singleton) return singleton;
 	const key = getProviderKeyStore().get(sourceId);
-	if (!key) return undefined;
+	// Only custom API providers hold more than one key; the store's other entries (NUG,
+	// TokenDance, ...) are recorded under their connection id and named above.
+	if (!key || !(settings.customApiProviders ?? []).some((p) => p.id === key.providerId)) {
+		return undefined;
+	}
 	const provider = named(key.providerId) ?? key.providerId;
 	return `${provider} · ${key.label ?? `…${key.apiKey.slice(-4)}`}`;
 }
