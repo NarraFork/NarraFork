@@ -6,6 +6,7 @@ import {
 	getSubagentVisibleModels,
 	listAutoModelCandidates,
 	listAutoModelIds,
+	normalizeAutoModelValueForSave,
 	orderedAutoModelCandidates,
 	registerAutoSourceProbe,
 	resolveAllowedModelCandidateMatch,
@@ -163,6 +164,17 @@ describe("auto model routing", () => {
 		expect(resolveEffectiveModel("auto:claude-opus-4-6")).toBe("provB:claude-opus-4.6");
 		// … but a session already on a source stays there rather than move to one that also fails.
 		expect(resolveEffectiveModel("auto:claude-opus-4-6", "provA")).toBe("provA:claude-opus-4-6");
+	});
+
+	test("saving an auto: value writes the catalog id and refuses ids the catalog lacks", () => {
+		expect(normalizeAutoModelValueForSave("auto:claude-opus-4-6")).toBe("auto:claude-opus-4-6");
+		// An alias is written as the catalog id, so pools and routing compare one spelling.
+		expect(normalizeAutoModelValueForSave("auto:claude-opus-4.6")).toBe("auto:claude-opus-4-6");
+		expect(() => normalizeAutoModelValueForSave("auto:private-model-x")).toThrow(/catalog/);
+		// Only auto: values are checked; a named service may run models the catalog lacks.
+		expect(normalizeAutoModelValueForSave("provE:private-model-x")).toBe("provE:private-model-x");
+		expect(normalizeAutoModelValueForSave("__default__")).toBe("__default__");
+		expect(normalizeAutoModelValueForSave(undefined)).toBeUndefined();
 	});
 
 	test("subagents see auto values, and a pool entry admits the providers that serve it", () => {

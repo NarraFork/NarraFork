@@ -124,6 +124,7 @@ export {
 	type ModelContextWindowResolution,
 	type ModelContextWindowSource,
 	modelProtocolKey,
+	normalizeAutoModelValueForSave,
 	nugProviderPrefix,
 	openaiProviderPrefix,
 	orderedAutoModelCandidates,

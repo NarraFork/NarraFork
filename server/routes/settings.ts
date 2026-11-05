@@ -77,6 +77,7 @@ import {
 	isOpenAICustomApiProtocol,
 	migrateProviderPrefixReferences,
 	type NarraForkSettings,
+	normalizeAutoModelValueForSave,
 	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	purgeStaleAgentModelRefs,
@@ -1437,6 +1438,49 @@ settingsRoutes.get("/search/protocols", (c) => {
 	return c.json(PROTOCOL_REGISTRY);
 });
 
+/**
+ * Check and canonicalize the `auto:` model values a settings patch writes. Only values that
+ * differ from what is saved are checked: the UI sends the whole agent section, and a value
+ * saved before a catalog change must not make every later save fail.
+ */
+function normalizeChangedAutoModelValues(
+	patch: {
+		defaultModel?: string;
+		summaryModel?: string;
+		translationModel?: string;
+		promptOptimizeModel?: string;
+		subagentModels?: Partial<Record<string, string>>;
+		subagentAllowedModels?: Partial<Record<string, string[]>>;
+	},
+	saved: NarraForkSettings["agent"],
+): void {
+	for (const key of [
+		"defaultModel",
+		"summaryModel",
+		"translationModel",
+		"promptOptimizeModel",
+	] as const) {
+		const value = patch[key];
+		if (value !== undefined && value !== saved[key]) {
+			patch[key] = normalizeAutoModelValueForSave(value);
+		}
+	}
+	const savedSubagent = (saved.subagentModels ?? {}) as Partial<Record<string, string>>;
+	for (const [type, value] of Object.entries(patch.subagentModels ?? {})) {
+		if (value !== undefined && value !== savedSubagent[type] && patch.subagentModels) {
+			patch.subagentModels[type] = normalizeAutoModelValueForSave(value);
+		}
+	}
+	const savedPools = (saved.subagentAllowedModels ?? {}) as Partial<Record<string, string[]>>;
+	for (const [type, pool] of Object.entries(patch.subagentAllowedModels ?? {})) {
+		if (!pool || !patch.subagentAllowedModels) continue;
+		const before = new Set(savedPools[type] ?? []);
+		patch.subagentAllowedModels[type] = pool.map((entry) =>
+			before.has(entry) ? entry : normalizeAutoModelValueForSave(entry),
+		);
+	}
+}
+
 settingsRoutes.patch("/", requireAdmin, async (c) => {
 	const requestStartedAt = performance.now();
 	return settingsUpdateLock.acquire("settings", async () => {
@@ -1540,6 +1584,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		if (validated.codex?.defaultReasoningEffort === null) {
 			validated.codex.defaultReasoningEffort = undefined;
 		}
+
+		if (validated.agent) normalizeChangedAutoModelValues(validated.agent, current.agent);
 
 		// An explicit "" from the UI means "auto" — drop the stored tier instead of
 		// persisting an invalid empty value.

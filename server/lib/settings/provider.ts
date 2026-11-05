@@ -21,6 +21,7 @@ import { peekCommandCodeModels } from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
 import {
+	canonicalCatalogModelId,
 	getEffectiveModelProfile,
 	identifyModelValue,
 	resolveEffectiveModelCard,
@@ -464,6 +465,28 @@ export class AutoModelUnavailableError extends AppError {
 		);
 		this.name = "AutoModelUnavailableError";
 	}
+}
+
+/**
+ * Check an `auto:` value being saved, and write it the catalog's way (`auto:<alias>` becomes
+ * `auto:<id>`). Other values come back unchanged. Only the catalog is consulted: whether some
+ * provider serves the model right now is a runtime question, and a saved value must survive a
+ * provider being briefly off. Callers check only values the user is writing or changing, so a
+ * catalog update never makes settings that are already saved unsaveable.
+ */
+export function normalizeAutoModelValueForSave<T extends string | null | undefined>(
+	value: T,
+): T | string {
+	const modelId = autoModelIdOf(value?.trim());
+	if (!modelId) return value;
+	const canonical = canonicalCatalogModelId(modelId);
+	if (!canonical) {
+		throw new ValidationError(
+			`"${modelId}" is not a model in the catalog, so auto cannot route it. ` +
+				"Choose a catalog model, or a provider explicitly.",
+		);
+	}
+	return autoModelValue(canonical);
 }
 
 /** Round-robin counter for balanced aggregation routing. */

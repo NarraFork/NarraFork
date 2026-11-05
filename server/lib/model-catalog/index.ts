@@ -612,6 +612,17 @@ export function identifyModelValue(model: string): CatalogIdentity {
 	return identifyModel(active, queryForModel(model).query);
 }
 
+/**
+ * The catalog model id an `auto:<id>` names, by exact id or alias; null when the catalog
+ * does not know it. Suffix and prefix matches are too loose to name a model on purpose.
+ */
+export function canonicalCatalogModelId(id: string): string | null {
+	const identity = identifyModel(active, { upstreamModelId: id.trim() });
+	return identity.modelId && (identity.matchedVia === "exact" || identity.matchedVia === "alias")
+		? identity.modelId
+		: null;
+}
+
 export function catalogModelName(modelId: string): string | undefined {
 	return active.models.find((entry) => entry.id === modelId)?.name;
 }
