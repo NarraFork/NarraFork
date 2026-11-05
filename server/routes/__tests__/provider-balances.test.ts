@@ -178,3 +178,61 @@ describe("provider balance API and settings integration", () => {
 		expect(outbound.outboundFetch).not.toHaveBeenCalled();
 	});
 });
+
+/**
+ * The bundled `apikey-quota` plugin is the default answerer for every entry point that reads
+ * balance data. These cases pin the entry points themselves, so a change in the engine cannot
+ * make the settings projection and the route disagree about the same provider.
+ */
+describe("apikey-quota answers every entry point consistently", () => {
+	afterEach(async () => {
+		const { resetProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
+		resetProviderBalanceEngine();
+		providerBalanceCache.sync();
+	});
+
+	test("settings generation and the route snapshot are the same key", async () => {
+		await providerBalanceCache.request(config().id);
+		const settingsBody = (await (await appForRole("admin").request("/api/settings")).json()) as {
+			providerBalanceGenerations?: Record<string, unknown>;
+		};
+		const routeBody = (await (
+			await appForRole("user").request("/api/provider-balances")
+		).json()) as Record<string, { generation?: unknown; status?: unknown }>;
+
+		// The badge hook keys its query on the settings generation and treats a mismatch with
+		// the route snapshot as "settings are stale" (see useProviderBalance). Both surfaces
+		// must therefore report the same generation for the same provider.
+		expect(settingsBody.providerBalanceGenerations?.[config().id]).toBe(
+			routeBody[config().id]?.generation,
+		);
+		expect(routeBody[config().id]?.status).toBe("supported");
+	});
+
+	test("a disabled plugin reports plugin_not_enabled instead of answering the route", async () => {
+		const { createApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
+		const { setProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
+		// The plugin owns the capability, so disabling it must be visible on the route the UI
+		// reads — and the bundled transport must not answer the question behind its back.
+		const engine = createApikeyQuotaEngine({
+			tools: {
+				invoke: async () => {
+					throw Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" });
+				},
+			},
+			activator: { activate: async () => undefined },
+		});
+		setProviderBalanceEngine(engine);
+		try {
+			await providerBalanceCache.request(config().id);
+			const response = await appForRole("user").request("/api/provider-balances");
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({
+				[config().id]: { status: "error", error: "plugin_not_enabled", balance: null },
+			});
+			expect(outbound.outboundFetch).not.toHaveBeenCalled();
+		} finally {
+			await engine.dispose();
+		}
+	});
+});

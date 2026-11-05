@@ -20,6 +20,30 @@ function remainingText(amount: ProviderBalanceAmount, t: Translate): string {
 	return amount.window ? `${amount.window}: ${value}` : value;
 }
 
+/**
+ * One fixed label per failure code.
+ *
+ * The server decides these codes from the error type and HTTP status, never from response
+ * text, so a deterministic failure ("your token was rejected") is never described as a
+ * retryable network problem or the other way around.
+ */
+function failureLabel(snapshot: ProviderBalanceSnapshot | undefined, t: Translate): string {
+	switch (snapshot?.error) {
+		case "auth_failed":
+			return t("providerBalance.errorAuth");
+		case "invalid_response":
+			return t("providerBalance.errorInvalidResponse");
+		case "invalid_configuration":
+			return t("providerBalance.errorInvalidConfiguration");
+		case "plugin_not_enabled":
+			return t("providerBalance.errorPluginNotEnabled");
+		case "request_failed":
+			return t("providerBalance.errorRequestFailed");
+		default:
+			return t("providerBalance.failed");
+	}
+}
+
 export function formatProviderBalance(
 	snapshot: ProviderBalanceSnapshot | undefined,
 	t: Translate,
@@ -28,7 +52,10 @@ export function formatProviderBalance(
 ): { quotaBalance: string; detailedQuotaBalance: string } {
 	const balance = snapshot?.balance;
 	if (!balance) {
-		const text = t(`providerBalance.${queryFailed ? "failed" : (snapshot?.status ?? "pending")}`);
+		const text =
+			queryFailed || snapshot?.error
+				? failureLabel(snapshot, t)
+				: t(`providerBalance.${snapshot?.status ?? "pending"}`);
 		return { quotaBalance: text, detailedQuotaBalance: text };
 	}
 	// A wallet needs no scope label; key/subscription allowances still need that distinction.
@@ -40,7 +67,7 @@ export function formatProviderBalance(
 	const failed = queryFailed || snapshot.error != null;
 	const stale = failed || snapshot.fetchedAt === 0 || now - snapshot.fetchedAt > 120_000;
 	const suffix = [
-		failed ? t("providerBalance.failed") : "",
+		failed ? failureLabel(snapshot, t) : "",
 		stale ? t("providerBalance.stale") : "",
 	].filter(Boolean);
 	const summary = `${scope ? `${scope}: ` : ""}${values}${suffix.length ? ` · ${suffix.join(" · ")}` : ""}`;
@@ -60,6 +87,9 @@ export function formatProviderBalance(
 					return details.join(" · ");
 				});
 	if (scope) lines.unshift(scope);
+	// The group a New API site places the account in; optional, and never a substitute for
+	// the reported amounts.
+	if (balance.planName) lines.push(t("providerBalance.group", { name: balance.planName }));
 	if (suffix.length) lines.push(suffix.join(" · "));
 	return { quotaBalance: summary, detailedQuotaBalance: lines.join("\n") };
 }
