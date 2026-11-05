@@ -102,11 +102,30 @@ export const TEXT_FILE_EXTENSIONS = new Set([
 	"diff",
 ]);
 
-/** Max text file upload size in bytes (100 MB). */
-export const MAX_TEXT_FILE_SIZE = 100 * 1024 * 1024;
+/** Single streamed text/code attachment limit (1 GiB); never buffer this much in JS. */
+export const MAX_TEXT_FILE_SIZE = 1024 * 1024 * 1024;
 
-/** Max raw narrator request and combined newly uploaded attachment bytes (128 MiB). */
+/** Legacy multipart/chat file limit (100 MiB), where the body is buffered in memory. */
+export const MAX_BUFFERED_TEXT_FILE_BYTES = 100 * 1024 * 1024;
+
+/** Buffered narrator request budget and default API body limit (128 MiB). */
 export const MAX_NARRATOR_ATTACHMENT_BYTES = 128 * 1024 * 1024;
+
+/** Combined text attachment budget per message and pending staging bytes per narrator (2 GiB). */
+export const MAX_STAGED_ATTACHMENTS_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+
+/** Bounds pending uploads per narrator, including files never attached to a message. */
+export const MAX_PENDING_STAGED_ATTACHMENTS = 32;
+
+/**
+ * The streaming attachment upload, the one narrator path allowed past the 128 MB
+ * ordinary body limit in `server/main.ts`. It writes chunk by chunk and enforces
+ * {@link MAX_TEXT_FILE_SIZE} on the live byte count, so the transport-level cap
+ * would only stop large attachments from ever arriving.
+ */
+export function isStreamingAttachmentUpload(method: string, pathname: string): boolean {
+	return method.toUpperCase() === "POST" && /\/api\/narrator-attachments\/[^/]+$/.test(pathname);
+}
 
 /** Max text files retained on one message. */
 export const MAX_EDIT_TEXT_FILES_PER_MESSAGE = 10;

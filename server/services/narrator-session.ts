@@ -29,6 +29,7 @@ import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -7085,7 +7086,12 @@ async function editAndRegenerateUnlocked(
 	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
 		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	// Two budgets, because the two kinds reach the model differently. Images and
+	// media are base64-inlined into every provider request, so what the message
+	// retains of them stays bounded by the buffered 128 MiB. Text files are only
+	// passed to the model as paths, so they count toward the 2 GiB total alone.
 	let retainedAttachmentBytes = 0;
+	let retainedInlineBytes = 0;
 	const countedMediaIds = new Set<string>();
 	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
 		const owner = item.uploadNarratorId || targetMsg.narratorId;
@@ -7094,7 +7100,9 @@ async function editAndRegenerateUnlocked(
 		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
 		if (!countedMediaIds.has(mediaKey)) {
 			countedMediaIds.add(mediaKey);
-			retainedAttachmentBytes += Bun.file(mediaPath).size;
+			const size = Bun.file(mediaPath).size;
+			retainedAttachmentBytes += size;
+			retainedInlineBytes += size;
 		}
 	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
@@ -7146,13 +7154,20 @@ async function editAndRegenerateUnlocked(
 	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [
-		...(opts?.newImages ?? []),
-		...(opts?.newTextFiles ?? []),
-		...(opts?.newMedia ?? []),
-	].reduce((total, file) => total + file.size, 0);
-	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+	// Images and media are read whole (`arrayBuffer()`) for validation, so they keep
+	// the buffered 128 MiB budget. Text files reach the worktree by streamed copy, so
+	// with them included only the 2 GiB staged ceiling applies.
+	const bufferedUploadBytes = [...(opts?.newImages ?? []), ...(opts?.newMedia ?? [])].reduce(
+		(total, file) => total + file.size,
+		0,
+	);
+	if (bufferedUploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const uploadBytes =
+		bufferedUploadBytes + (opts?.newTextFiles ?? []).reduce((total, file) => total + file.size, 0);
+	if (uploadBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	if (keepImageIds.length + (opts?.newImages?.length ?? 0) > MAX_EDIT_IMAGES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -7202,6 +7217,7 @@ async function editAndRegenerateUnlocked(
 			if (!countedImageIds.has(imageKey)) {
 				countedImageIds.add(imageKey);
 				retainedAttachmentBytes += imageInfo.size;
+				retainedInlineBytes += imageInfo.size;
 			}
 		}
 		if (
@@ -7239,14 +7255,17 @@ async function editAndRegenerateUnlocked(
 			}
 		}
 	}
-	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
-	if (finalAttachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+	if (bufferedUploadBytes + retainedInlineBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
+	if (finalAttachmentBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	const materializedBytes =
 		uploadBytes + [...textFilesToCopy.values()].reduce((total, file) => total + file.size, 0);
-	if (materializedBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
-		throw new ValidationError("Combined materialized attachments exceed the 128 MiB limit");
+	if (materializedBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined materialized attachments exceed the 2 GiB limit");
 	}
 	if (isLoopRunning(narratorId)) {
 		await reconcileRunningStatus(narratorId);

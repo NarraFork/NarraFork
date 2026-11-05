@@ -76,6 +76,11 @@ const { activeNarrators } = await import("../narrator-session-state");
 const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
 	"../../lib/uploads"
 );
+// Staging resolves its root from NARRAFORK_HOME (set to HOME above), so staged
+// uploads in these tests land in the same isolated temp tree.
+const { findStagedAttachment, stageAttachment, stagedAttachmentAsFile } = await import(
+	"../../lib/attachment-staging"
+);
 
 test("composer layout survives cold durable queue projection, summary stays small, and legacy edits clear it", async () => {
 	const document = {
@@ -668,8 +673,11 @@ describe("persistent staging ownership", () => {
 	test("partial File preparation failure rolls back files and never enqueues", async () => {
 		const root = join(HOME, "buffered-files");
 		const before = existsSync(root) ? readdirSync(root).sort() : [];
+		const { MAX_TEXT_FILE_SIZE } = await import("@shared/text-file-types");
+		// Just past the ceiling: the check is on the declared size and runs before
+		// the write, so the payload stays a few bytes of real data.
 		const tooLarge = textFile("too-large.md");
-		Object.defineProperty(tooLarge, "size", { value: 101 * 1024 * 1024 });
+		Object.defineProperty(tooLarge, "size", { value: MAX_TEXT_FILE_SIZE + 1 });
 		await expect(
 			enqueueBufferedMessage(NARRATOR_ID, "failed", undefined, null, null, null, [
 				textFile("first.md"),
@@ -678,6 +686,80 @@ describe("persistent staging ownership", () => {
 		).rejects.toThrow("size limit");
 		expect(getBufferedMessages(NARRATOR_ID)).toEqual([]);
 		expect(readdirSync(root).sort()).toEqual(before);
+	});
+
+	// A staged upload only becomes the message's attachment once the mailbox row
+	// commits. Releasing it at copy time meant a full queue (or a DB error) deleted
+	// the upload the user's retry needed to claim.
+	async function stagedFile(name: string) {
+		const staged = await stageAttachment(new Blob(["staged body"]).stream(), {
+			narratorId: NARRATOR_ID,
+			filename: name,
+		});
+		return { staged, file: stagedAttachmentAsFile(staged) };
+	}
+
+	test("a full queue keeps the staged original for the retry", async () => {
+		const { staged, file } = await stagedFile("big.log");
+		bindRuntimeQueue({
+			backend: "postgres",
+			queue: {
+				mailbox: {
+					admitUserBuffered: async () => ({ status: "full" }),
+					getByStagingId: async () => undefined,
+				},
+			} as unknown as PostgresRuntimeQueue,
+		});
+		const result = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"queued",
+			undefined,
+			null,
+			null,
+			null,
+			[file],
+		);
+		expect(result).toMatchObject({ ok: false, full: true });
+		expect(existsSync(staged.path)).toBe(true);
+		expect(findStagedAttachment(NARRATOR_ID, staged.uploadId)?.size).toBe(staged.size);
+	});
+
+	test("an admission error keeps the staged original for the retry", async () => {
+		const { staged, file } = await stagedFile("big.log");
+		bindRuntimeQueue({
+			backend: "postgres",
+			queue: {
+				mailbox: {
+					admitUserBuffered: async () => {
+						throw new Error("transaction rolled back");
+					},
+					getByStagingId: async () => undefined,
+				},
+			} as unknown as PostgresRuntimeQueue,
+		});
+		await expect(
+			enqueueBufferedMessage(NARRATOR_ID, "queued", undefined, null, null, null, [file]),
+		).rejects.toThrow("transaction rolled back");
+		expect(existsSync(staged.path)).toBe(true);
+	});
+
+	test("an accepted enqueue releases the staged original and keeps the mailbox copy", async () => {
+		const { staged, file } = await stagedFile("big.log");
+		const result = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"queued",
+			undefined,
+			null,
+			null,
+			null,
+			[file],
+		);
+		expect(result.ok).toBe(true);
+		expect(existsSync(staged.path)).toBe(false);
+		const [message] = getBufferedMessages(NARRATOR_ID);
+		const [saved] = message?._savedFiles ?? [];
+		expect(saved?.originalName).toBe("big.log");
+		expect(saved && (await Bun.file(saved.path).text())).toBe("staged body");
 	});
 
 	test("clear cancels only pending user rows and preserves notice and tombstone", async () => {

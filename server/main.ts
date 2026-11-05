@@ -18,6 +18,7 @@ import {
 	MAX_IMPORT_BYTES,
 	MAX_ORDINARY_BODY_BYTES,
 } from "../shared/storage-transfer";
+import { isStreamingAttachmentUpload } from "../shared/text-file-types";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -889,6 +890,9 @@ const BODYLESS_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
  */
 function limitOrdinaryRequestBody(req: Request, url: URL): Request | Response {
 	if (isStorageImportUpload(req.method, url.pathname)) return req;
+	// 附件流式上传逐块落盘，并在 attachment-staging 里按实际字节数执行 1 GiB 上限，
+	// 在这里按 128 MB 截断会让大附件永远传不上去。
+	if (isStreamingAttachmentUpload(req.method, url.pathname)) return req;
 	if (BODYLESS_METHODS.has(req.method.toUpperCase())) return req;
 	if (declaredBodyExceeds(req.headers.get("content-length"), MAX_ORDINARY_BODY_BYTES)) {
 		return new Response("Request body too large", {
@@ -1181,7 +1185,8 @@ function startServer(
 					hostname: host,
 					idleTimeout: 255,
 					// Bun 只能设一个全局请求体上限。导入预览要收最大 4 GB 的包，所以这里取
-					// MAX_IMPORT_BYTES；其它请求在 limitOrdinaryRequestBody 里按 128 MB 拒绝。
+					// MAX_IMPORT_BYTES；其它请求在 limitOrdinaryRequestBody 里按 128 MB 拒绝，
+					// 流式附件上传（≤ 1 GiB）在暂存层按实际字节自行限流。
 					maxRequestBodySize: MAX_IMPORT_BYTES,
 					tls,
 					fetch: fetchRequest,
@@ -1823,6 +1828,25 @@ startChallengeCleanupTimer();
 import { startSessionCleanupTimer } from "./lib/auth";
 
 startSessionCleanupTimer();
+
+// Reclaim abandoned uploads without overlapping sweeps.
+import { sweepStagedAttachments } from "./lib/attachment-staging";
+
+let attachmentSweepRunning = false;
+setInterval(
+	async () => {
+		if (attachmentSweepRunning) return;
+		attachmentSweepRunning = true;
+		try {
+			await sweepStagedAttachments();
+		} catch (error) {
+			logger.warn("Attachment staging sweep failed", { error: String(error) });
+		} finally {
+			attachmentSweepRunning = false;
+		}
+	},
+	30 * 60 * 1000,
+).unref();
 
 // Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
 import {
