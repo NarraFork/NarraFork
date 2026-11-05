@@ -42,7 +42,7 @@
 
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { extname, resolve } from "node:path";
-import { MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
+import { MAX_BUFFERED_TEXT_FILE_BYTES } from "@shared/text-file-types";
 import { ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
@@ -229,10 +229,13 @@ export async function saveChatAttachment(roomId: string, file: File): Promise<Sa
 		// No extension gate: `isTextFile` returns true for everything on purpose (see
 		// the module header), so calling it here would be a check that never fails and
 		// would misleadingly suggest an allowlist is being enforced.
-		if (file.size > MAX_TEXT_FILE_SIZE) {
+		// Bounded by the BUFFERED ceiling: this branch `arrayBuffer()`s the file
+		// below, so its size becomes heap before it becomes a file. The larger
+		// streaming ceiling in `text-file-types.ts` does not apply here.
+		if (file.size > MAX_BUFFERED_TEXT_FILE_BYTES) {
 			throw new ValidationError(
 				`Attachment too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: ${(
-					MAX_TEXT_FILE_SIZE / 1024 / 1024
+					MAX_BUFFERED_TEXT_FILE_BYTES / 1024 / 1024
 				).toFixed(0)}MB`,
 			);
 		}

@@ -709,7 +709,12 @@ export async function imageToBase64(filePath: string): Promise<ImageBase64Result
 
 // === Text file uploads ===
 
-import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
+import {
+	isTextFile,
+	MAX_BUFFERED_TEXT_FILE_BYTES,
+	MAX_TEXT_FILE_SIZE,
+} from "@shared/text-file-types";
+import { releaseStagedAttachment } from "./attachment-staging";
 
 export { MAX_TEXT_FILE_SIZE };
 
@@ -916,6 +921,12 @@ export async function ensureImageWorktreeCopy(
 /**
  * Validate a text file upload (type + size). Does NOT save the file.
  * Saving happens later in feedMessage when the worktree cwd is known.
+ *
+ * Bounded by the BUFFERED ceiling, not the streaming one: this runs on a
+ * `multipart/form-data` upload that Bun has already materialised in full, so the
+ * file's bytes are on the heap before this check is reached. Anything larger has
+ * to arrive through the streaming staging endpoint, which is why the two limits
+ * are separate values rather than one shared constant.
  */
 export function validateTextFile(file: File): void {
 	if (!isTextFile(file.name)) {
@@ -923,9 +934,11 @@ export function validateTextFile(file: File): void {
 			`Unsupported text file type: ${file.name}. Only common text and code files are allowed.`,
 		);
 	}
-	if (file.size > MAX_TEXT_FILE_SIZE) {
+	if (file.size > MAX_BUFFERED_TEXT_FILE_BYTES) {
 		throw new ValidationError(
-			`Text file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 100MB`,
+			`Text file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: ${(
+				MAX_BUFFERED_TEXT_FILE_BYTES / 1024 / 1024
+			).toFixed(0)}MB`,
 		);
 	}
 }
@@ -952,25 +965,40 @@ export function isFileWithinWorktree(cwd: string, filePath: string): boolean {
 /**
  * Save a text file into the worktree's `.narrafork/attached/` directory
  * using the original filename. Returns the absolute path.
+ *
+ * The copy is a STREAM, not `file.arrayBuffer()`: an attachment may be
+ * disk-backed staging rather than memory (see `attachment-staging.ts`), and
+ * `Bun.write(dest, blob)` copies it chunk by chunk either way. Materialising it
+ * here would put the whole file back on the heap at the last step of a path that
+ * was designed end to end to keep it off the heap.
  */
 export async function saveTextFileToWorktree(cwd: string, file: File): Promise<TextFileRef> {
+	// Resolved BEFORE the copy and before any release: a disk-backed File reports
+	// its size from the file's stat, so once the staged original is deleted the
+	// same `file.size` reads 0. Capturing it here keeps the persisted record honest.
+	const size = file.size;
 	const filePath = allocateWorktreeAttachmentPath(cwd, file.name);
 	try {
-		const buffer = await file.arrayBuffer();
-		await Bun.write(filePath, buffer);
+		// `Bun.write` streams a disk-backed staged file and writes an in-memory
+		// multipart Blob directly; neither needs an extra `arrayBuffer()` copy.
+		await Bun.write(filePath, file);
 	} catch (error) {
 		rmSync(filePath, { force: true });
 		throw error;
 	}
+	// Only after the bytes are durable in the worktree. A failed copy keeps the
+	// staging entry so the caller's retry still has something to read. No-op for
+	// multipart files, which never entered the staging area.
+	releaseStagedAttachment(file);
 
 	logger.info("Text file saved to worktree", {
 		cwd,
 		filename: file.name,
 		filePath,
-		size: file.size,
+		size,
 	});
 
-	return { filename: file.name, filePath, size: file.size };
+	return { filename: file.name, filePath, size };
 }
 
 /** Copy a modern text attachment into the active worktree without loading it all into JS memory. */

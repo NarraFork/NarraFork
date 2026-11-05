@@ -860,10 +860,18 @@ class BackgroundTaskService {
 			this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 			if (existing.status === "running") return existing;
 
-			// Restart: get the EXISTING run (getAgentRun reads narrators through
-			// the queue adapter on PG; on SQLite it's a sync read), then CAS the
-			// task row back to "running" via the named restartAgentTask composite.
-			const publicationRun = await pub.getAgentRun(opts.subagentNarratorId, opts.parentNarratorId);
+			// Restart: register the run this task now projects, then CAS the task row
+			// back to "running" for it. A run that still holds its unconsumed terminal
+			// reservation (a run being detached or projected right now) is adopted; an
+			// ended run already spent its terminal slot on its own result, so the task
+			// gets a new run with fresh slots. Reusing the ended run would leave its next
+			// terminal with no reservation to commit into.
+			const { binding: registered } = await pub.startRun({
+				narratorId: opts.subagentNarratorId,
+				binding: opts.binding,
+				adoptRegisteredRun: true,
+			});
+			const publicationRun = { logicalRunId: registered.logicalRunId };
 			const restarted = await pub.restartAgentTask({
 				taskId: opts.id,
 				logicalRunId: publicationRun.logicalRunId,
