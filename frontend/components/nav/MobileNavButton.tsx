@@ -6,7 +6,7 @@
  * Pages that do not (full-bleed docks, nested settings pages) get `MobileNavFallback`, a
  * small floating button in the top-left corner, so the drawer is always reachable.
  *
- * Both render only on phones (the `nf-mobile-only` class, safe-area.css) and only inside
+ * Both render only on phones (the `nf-mobile-only` class, nav-collapsed.css) and only inside
  * the app shell.
  *
  * Plain elements, not Mantine's `Burger`: route pages import this, and several of their

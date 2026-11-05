@@ -153,14 +153,3 @@ html[data-nf-authenticated-app-shell="true"] .mantine-Drawer-inner {
 		--nf-director-keyboard-lift: var(--app-keyboard-occlusion, 0px);
 	}
 }
-
-/*
- * Phone-only elements that cannot use Mantine's `hiddenFrom` (see MobileNavButton).
- * 48em is Mantine's `sm` breakpoint, the same boundary as everywhere else here.
- */
-@media (min-width: 48em) {
-	.nf-mobile-only {
-		/* biome-ignore lint/complexity/noImportantStyles: the elements set an inline display, this must win on desktop */
-		display: none !important;
-	}
-}
