@@ -10,7 +10,6 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_URL,
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
-import { CHROMIUM_PATHS } from "../shared/browser-paths";
 import { urlHost } from "../shared/server-host";
 import {
 	declaredBodyExceeds,
@@ -58,7 +57,8 @@ import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
-import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
+import { openFrontendOnce } from "./lib/open-frontend";
+import { IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import {
 	registerGracefulShutdownHandler,
@@ -69,7 +69,6 @@ import {
 import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
-import { shellExecute } from "./lib/shell-exec";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
@@ -79,6 +78,7 @@ import {
 	shouldServeRequests,
 	shouldStartGatedBackgroundWork,
 } from "./lib/startup-readiness";
+import { closeStartupStatus } from "./lib/startup-status";
 import { reissueBuiltinTlsOnStartup } from "./lib/tls";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
@@ -1239,6 +1239,9 @@ if (!excludedRangeForPort) {
 	tryReclaimPort(port);
 }
 
+// The startup page holds the port until here; from now on the real server answers.
+await closeStartupStatus();
+
 if (portExplicit) {
 	// User explicitly specified a port — fail hard rather than silently moving it.
 	if (excludedRangeForPort) {
@@ -1428,74 +1431,6 @@ startSettingsFileWatcher(() => {
 	reloadSettingsIfChanged();
 });
 
-/** Open a URL in the user's default browser. */
-function openInBrowser(url: string) {
-	// Windows 走 ShellExecuteW：不经 cmd start，避免偶尔闪出的控制台窗口。
-	if (IS_WINDOWS) {
-		if (shellExecute(url)) return;
-	}
-	try {
-		if (IS_MACOS) {
-			Bun.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} else if (!IS_WINDOWS) {
-			Bun.spawn(["xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] });
-		}
-	} catch {
-		// Not critical — user can open manually
-	}
-}
-
-async function openAsApp(url: string) {
-	// Windows 上 Edge/Chrome 不在 PATH 里（Bun.which 找不到），按标准安装路径探测；
-	// 直接 spawn 绝对路径，避免经 cmd start 时参数被重新解析。
-	if (IS_WINDOWS) {
-		const browser = CHROMIUM_PATHS.find((path) => existsSync(path));
-		if (browser) {
-			try {
-				Bun.spawn([browser, `--app=${url}`], {
-					stdio: ["ignore", "ignore", "ignore"],
-					windowsHide: true,
-				});
-				return;
-			} catch {
-				// 落到默认浏览器兜底
-			}
-		}
-		openInBrowser(url);
-		return;
-	}
-
-	const candidates: { program: string; args: string[] }[] = IS_MACOS
-		? [
-				{ program: "open", args: ["-a", "Google Chrome", url, "--args", `--app=${url}`] },
-				{ program: "open", args: ["-a", "Microsoft Edge", url, "--args", `--app=${url}`] },
-				{ program: "open", args: ["-a", "Chromium", url, "--args", `--app=${url}`] },
-			]
-		: [
-				{ program: "google-chrome", args: [`--app=${url}`] },
-				{ program: "google-chrome-stable", args: [`--app=${url}`] },
-				{ program: "chromium", args: [`--app=${url}`] },
-				{ program: "chromium-browser", args: [`--app=${url}`] },
-				{ program: "microsoft-edge", args: [`--app=${url}`] },
-			];
-
-	for (const { program, args } of candidates) {
-		try {
-			const proc = Bun.spawn([program, ...args], {
-				stdio: ["ignore", "ignore", "ignore"],
-				windowsHide: true,
-			});
-			// Give it a moment to fail (e.g. command not found)
-			const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
-			const result = await Promise.race([proc.exited, timeout]);
-			if (result !== null && result !== 0) continue;
-			return;
-		} catch {}
-	}
-	// All --app candidates failed, fall back to default browser
-	openInBrowser(url);
-}
-
 // Print welcome banner to stdout & auto-open browser
 {
 	const { APP_VERSION, GIT_COMMIT } = await import("./lib/version");
@@ -1514,17 +1449,8 @@ async function openAsApp(url: string) {
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
 	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
 	console.log("");
-
-	// 由管理器面板托管的实例：前端窗口交给面板打开 —— 它会先聚焦已有窗口，
-	// 这里再开一次就会重复弹窗（同一份逻辑不该有两份实现）。
-	if (process.env.NARRAFORK_MANAGER_MANAGED !== "1") {
-		const openMode = settings.server.openBrowser;
-		if (openMode === "app") {
-			openAsApp(url);
-		} else if (openMode === "browser") {
-			openInBrowser(url);
-		}
-	}
+	// No-op when the startup page already opened it.
+	openFrontendOnce(url);
 }
 
 // Verify database integrity in the background, now that the port is bound and requests are being

@@ -57,6 +57,7 @@ import {
 import { hotOnce, hotSafe, hotTimer } from "../../lib/hot-safe";
 import { acquireInstanceLock, releaseInstanceLock } from "../../lib/instance-lock";
 import { logger } from "../../lib/logger";
+import { reportStartupStep } from "../../lib/startup-status";
 import { ensureColumns } from "../ensure-columns";
 import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "../fts";
 import {
@@ -255,6 +256,7 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 
 		let migrationSource: string;
 		let migrationFolder: string;
+		reportStartupStep({ key: "database" });
 		try {
 			const migrationResult = await runMigrations(connection());
 			migrationSource = migrationResult.source;
@@ -271,6 +273,8 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 			});
 			throw err;
 		}
+		// Column patches, backfills and an FTS rebuild can still take a while.
+		reportStartupStep({ key: "database" });
 
 		// Patch missing columns for databases created by older versions.
 		ensureColumns(connection());

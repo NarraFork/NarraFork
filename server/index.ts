@@ -63,5 +63,5 @@ async function runServer(): Promise<void> {
 	if (!handoffOk) {
 		process.exit(1);
 	}
-	await import("./main");
+	await import("./serve").then(({ serve }) => serve());
 }
