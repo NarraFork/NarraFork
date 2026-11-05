@@ -27,6 +27,7 @@ import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
 } from "../lib/agent/file-reference-projection";
+import { releaseStagedAttachment } from "../lib/attachment-staging";
 import {
 	parseOptionalComposerDocument,
 	validateComposerAssets,
@@ -226,8 +227,27 @@ async function acquirePreparation(): Promise<() => void> {
 		else activePreparations--;
 	};
 }
+/**
+ * Slowest write throughput the preparation budget will wait for.
+ *
+ * `MAILBOX_LIMITS.prepareTimeoutMs` (30 s) was sized for the inline payloads
+ * this used to carry — the REST text cap is 100k UTF-16 units. Attachments are
+ * now streamed to disk and may be a gigabyte, where a slow-but-healthy disk
+ * legitimately needs longer than 30 s; expiring mid-write deletes the copy and
+ * fails an otherwise valid queued message. The budget therefore scales with the
+ * payload and never drops below the original value.
+ */
+const PREPARE_MIN_THROUGHPUT_BYTES_PER_SEC = 10 * 1024 * 1024;
+
+function preparationTimeoutMs(value: File | string): number {
+	const bytes = typeof value === "string" ? Buffer.byteLength(value) : value.size;
+	const scaled = Math.ceil((bytes / PREPARE_MIN_THROUGHPUT_BYTES_PER_SEC) * 1000);
+	return Math.max(MAILBOX_LIMITS.prepareTimeoutMs, scaled);
+}
+
 async function writeBufferedFile(path: string, value: File | string): Promise<void> {
 	const release = await acquirePreparation();
+	const budgetMs = preparationTimeoutMs(value);
 	const started = Date.now();
 	let expired = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -247,7 +267,7 @@ async function writeBufferedFile(path: string, value: File | string): Promise<vo
 				timer = setTimeout(() => {
 					expired = true;
 					reject(new Error("Buffered file preparation timed out"));
-				}, MAILBOX_LIMITS.prepareTimeoutMs);
+				}, budgetMs);
 			}),
 		]);
 	} finally {
@@ -371,6 +391,9 @@ export async function persistBufferedTextFiles(
 				sourceMimeType: file.type,
 			});
 			await writeBufferedFile(path, file);
+			// The mailbox copy is durable, so a staged upload may drop its original.
+			// A no-op for multipart files, which never entered the staging area.
+			releaseStagedAttachment(file);
 		}
 		return saved;
 	} catch (error) {

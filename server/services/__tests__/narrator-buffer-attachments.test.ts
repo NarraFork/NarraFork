@@ -668,8 +668,11 @@ describe("persistent staging ownership", () => {
 	test("partial File preparation failure rolls back files and never enqueues", async () => {
 		const root = join(HOME, "buffered-files");
 		const before = existsSync(root) ? readdirSync(root).sort() : [];
+		const { MAX_TEXT_FILE_SIZE } = await import("@shared/text-file-types");
+		// Just past the ceiling: the check is on the declared size and runs before
+		// the write, so the payload stays a few bytes of real data.
 		const tooLarge = textFile("too-large.md");
-		Object.defineProperty(tooLarge, "size", { value: 101 * 1024 * 1024 });
+		Object.defineProperty(tooLarge, "size", { value: MAX_TEXT_FILE_SIZE + 1 });
 		await expect(
 			enqueueBufferedMessage(NARRATOR_ID, "failed", undefined, null, null, null, [
 				textFile("first.md"),

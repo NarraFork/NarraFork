@@ -29,6 +29,7 @@ import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -7146,13 +7147,20 @@ async function editAndRegenerateUnlocked(
 	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [
-		...(opts?.newImages ?? []),
-		...(opts?.newTextFiles ?? []),
-		...(opts?.newMedia ?? []),
-	].reduce((total, file) => total + file.size, 0);
-	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+	// Images and media are read whole (`arrayBuffer()`) for validation, so they keep
+	// the buffered 128 MiB budget. Text files reach the worktree by streamed copy, so
+	// with them included only the 2 GiB staged ceiling applies.
+	const bufferedUploadBytes = [...(opts?.newImages ?? []), ...(opts?.newMedia ?? [])].reduce(
+		(total, file) => total + file.size,
+		0,
+	);
+	if (bufferedUploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const uploadBytes =
+		bufferedUploadBytes + (opts?.newTextFiles ?? []).reduce((total, file) => total + file.size, 0);
+	if (uploadBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	if (keepImageIds.length + (opts?.newImages?.length ?? 0) > MAX_EDIT_IMAGES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -7240,13 +7248,13 @@ async function editAndRegenerateUnlocked(
 		}
 	}
 	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
-	if (finalAttachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
-		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	if (finalAttachmentBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	const materializedBytes =
 		uploadBytes + [...textFilesToCopy.values()].reduce((total, file) => total + file.size, 0);
-	if (materializedBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
-		throw new ValidationError("Combined materialized attachments exceed the 128 MiB limit");
+	if (materializedBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined materialized attachments exceed the 2 GiB limit");
 	}
 	if (isLoopRunning(narratorId)) {
 		await reconcileRunningStatus(narratorId);
