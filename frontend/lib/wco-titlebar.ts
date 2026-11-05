@@ -21,9 +21,12 @@
 import { type RefObject, useEffect } from "react";
 import { WCO_ATTRIBUTE } from "./wco";
 
-/** Rows that can sit in the title bar: chat/panel headers and dockview tab strips. */
+/**
+ * Rows that can sit in the title bar: chat/panel headers, dockview tab strips, and any
+ * page row that opts in with `data-nf-titlebar-candidate` (the workspace toolbar).
+ */
 export const WCO_TITLEBAR_ROW_SELECTOR =
-	"[data-narrator-header-layout], .nf-panel-header, .dv-tabs-and-actions-container";
+	"[data-narrator-header-layout], .nf-panel-header, .dv-tabs-and-actions-container, [data-nf-titlebar-candidate]";
 
 const MARKS = ["data-nf-titlebar-row", "data-nf-titlebar-end", "data-nf-titlebar-start"] as const;
 /** Sub-pixel layout tolerance. */

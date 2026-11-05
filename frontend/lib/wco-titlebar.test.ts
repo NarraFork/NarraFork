@@ -28,6 +28,7 @@ describe("WCO title-bar rows", () => {
 			"[data-narrator-header-layout]",
 			".nf-panel-header",
 			".dv-tabs-and-actions-container",
+			"[data-nf-titlebar-candidate]",
 		]) {
 			expect(WCO_TITLEBAR_ROW_SELECTOR).toContain(part);
 		}
@@ -46,5 +47,12 @@ describe("WCO title-bar rows", () => {
 		).text();
 		expect(page).toContain("data-nf-wco-titlebar=");
 		expect(page).toContain("useWcoTitlebarRows(pageBoxRef");
+		// The workspace page: its own toolbar row is the title bar.
+		const workspace = await Bun.file(
+			new URL("../components/narrator/workspace/WorkspacePage.tsx", import.meta.url),
+		).text();
+		expect(workspace).toContain("data-nf-wco-titlebar=");
+		expect(workspace).toContain("data-nf-titlebar-candidate");
+		expect(workspace).toContain("useWcoTitlebarRows(pageRef");
 	});
 });
