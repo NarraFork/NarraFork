@@ -1286,6 +1286,23 @@ async function recordUnfinishedReflectionApiRequests(
  */
 // Wire declarations are independent of execution policy. Capture the actual parent
 // request, including its adapter/model, rather than re-resolving dynamic definitions.
+/**
+ * 适配器把工具格式化成哪种协议形状。
+ *
+ * 同一前缀、同一模型也可能换协议（「编辑此连接覆盖」），而工具与历史都按协议成形，
+ * 所以这种情况必须像切换供应商一样重建它们。
+ */
+export function toolFormatSignature(
+	adapter: { toolLoadingTarget?: (model: string) => unknown },
+	model: string,
+): string {
+	try {
+		return JSON.stringify(adapter.toolLoadingTarget?.(model) ?? null);
+	} catch {
+		return "";
+	}
+}
+
 const requestToolSnapshots = new WeakMap<
 	AgentConfig,
 	{
@@ -3361,7 +3378,9 @@ async function* agentLoopInMetadataSnapshot(
 		// prepared first attempt under a new model or provider.
 		let providerChanged = false;
 		let modelChanged = false;
+		let toolFormatChanged = false;
 		if (newResolved) {
+			const previousToolFormat = toolFormatSignature(provider, effectiveModel);
 			providerChanged = newResolved.provider !== effectiveProvider;
 			modelChanged = newResolved.model !== effectiveModel;
 			provider = newResolved.adapter;
@@ -3369,7 +3388,8 @@ async function* agentLoopInMetadataSnapshot(
 			effectiveProvider = newResolved.provider;
 			config.model = newResolved.model;
 			config.provider = newResolved.provider;
-			if (providerChanged || modelChanged) {
+			toolFormatChanged = toolFormatSignature(provider, effectiveModel) !== previousToolFormat;
+			if (providerChanged || modelChanged || toolFormatChanged) {
 				tools = formatRequestToolsForProvider();
 				await reportToolsCharacters(tools);
 			}
@@ -3377,7 +3397,7 @@ async function* agentLoopInMetadataSnapshot(
 
 		if (hasReasoningOverride) config.reasoningEffort = nextReasoningEffort;
 
-		if (providerChanged || modelChanged) {
+		if (providerChanged || modelChanged || toolFormatChanged) {
 			// Force history/tool-result rebuild even when switching inside a retry loop.
 			const replacement = await config.onBeforeTurn?.(turnIndex, {
 				force: true,
@@ -3395,6 +3415,7 @@ async function* agentLoopInMetadataSnapshot(
 			reasoningEffort: config.reasoningEffort,
 			modelChanged,
 			providerChanged,
+			toolFormatChanged,
 			reasoningChanged,
 		});
 		return {

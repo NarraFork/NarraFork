@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
 import { startApiRequest } from "../../api-request-tracker";
 import { RequestRecorderClient } from "../../request-recorder";
-import { agentLoop } from "../loop";
+import { agentLoop, toolFormatSignature } from "../loop";
 import {
 	type ChatParams,
 	type ParsedStreamEvent,
@@ -344,5 +344,25 @@ describe("asynchronous runtime settings at real provider request boundaries", ()
 		);
 		expect(requests).toHaveLength(1);
 		expect(events.at(-1)?.type).toBe("retryable_error");
+	});
+});
+
+describe("工具格式签名", () => {
+	test("同前缀换协议得到不同签名，缺失或抛错的适配器回落到空签名", () => {
+		const anthropic = { toolLoadingTarget: () => ({ protocol: "anthropic-messages" }) };
+		const completions = { toolLoadingTarget: () => ({ protocol: "completions-compatible" }) };
+		expect(toolFormatSignature(anthropic, A)).not.toBe(toolFormatSignature(completions, A));
+		// 没有协议声明的适配器不参与比较，避免把「不知道」误判成「变了」。
+		expect(toolFormatSignature({}, A)).toBe("null");
+		expect(
+			toolFormatSignature(
+				{
+					toolLoadingTarget: () => {
+						throw new Error("unavailable");
+					},
+				},
+				A,
+			),
+		).toBe("");
 	});
 });
