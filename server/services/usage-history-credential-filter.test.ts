@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { apiRequests } from "@server/db/schema";
 import { cleanDb, getTestDb } from "../../tests/setup";
-import { UsageHistoryService } from "./usage-history-service";
+import { setUsageUtcOffsetMinutes, UsageHistoryService } from "./usage-history-service";
+
+// 分桶按读者日历切日，偏移量默认跟随服务器时区；测试固定为 UTC 才与时区无关。
+setUsageUtcOffsetMinutes(0);
 
 const { db, sqlite } = getTestDb();
 const service = new UsageHistoryService(db);

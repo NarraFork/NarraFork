@@ -232,19 +232,42 @@ function normalizeModelFilter(value: string | undefined): string | undefined {
 	return trimmed.slice(0, MODEL_FILTER_MAX_LENGTH).replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
+/**
+ * 统计按读者日历切日，但 SQLite 的 `localtime` 只认进程时区、测试又需要固定基准，
+ * 所以偏移量做成可注入的量：默认跟随服务器本地时区，测试注入 0 即回到 UTC。
+ */
+let usageUtcOffsetMinutes = -new Date().getTimezoneOffset();
+
+export function setUsageUtcOffsetMinutes(offsetMinutes: number): void {
+	usageUtcOffsetMinutes = Number.isFinite(offsetMinutes) ? offsetMinutes : 0;
+}
+
+export function getUsageUtcOffsetMinutes(): number {
+	return usageUtcOffsetMinutes;
+}
+
+function localDayStart(date: Date): Date {
+	const shifted = date.getTime() + usageUtcOffsetMinutes * 60_000;
+	const dayStart = Math.floor(shifted / 86_400_000) * 86_400_000;
+	return new Date(dayStart - usageUtcOffsetMinutes * 60_000);
+}
+
+function localMonthStart(date: Date): Date {
+	const shifted = new Date(date.getTime() + usageUtcOffsetMinutes * 60_000);
+	return new Date(
+		Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), 1) - usageUtcOffsetMinutes * 60_000,
+	);
+}
+
 function normalizeToBucketStart(date: Date, granularity: UsageHistoryGranularity): Date {
 	const normalized = new Date(date.getTime());
+	// 小时桶按 UTC 截断：整小时偏移的时区下与本地截断等价，SQLite 也没有 start of hour。
 	if (granularity === "hour") {
 		normalized.setUTCMinutes(0, 0, 0);
 		return normalized;
 	}
-	if (granularity === "day") {
-		normalized.setUTCHours(0, 0, 0, 0);
-		return normalized;
-	}
-	normalized.setUTCDate(1);
-	normalized.setUTCHours(0, 0, 0, 0);
-	return normalized;
+	if (granularity === "day") return localDayStart(normalized);
+	return localMonthStart(normalized);
 }
 
 function addBuckets(date: Date, amount: number, granularity: UsageHistoryGranularity): Date {
@@ -329,10 +352,13 @@ function getBucketExpression(granularity: UsageHistoryGranularity) {
 	if (granularity === "hour") {
 		return sql<string>`substr(${apiRequests.createdAt}, 1, 13) || ':00:00.000Z'`;
 	}
-	if (granularity === "day") {
-		return sql<string>`substr(${apiRequests.createdAt}, 1, 10) || 'T00:00:00.000Z'`;
-	}
-	return sql<string>`substr(${apiRequests.createdAt}, 1, 7) || '-01T00:00:00.000Z'`;
+	// 日/月桶先平移到读者本地时间，取本地日初/月初，再平移回去：
+	// 桶 key 仍是绝对时刻，只是按读者日历分组。偏移量随设置注入，测试注入 0 即 UTC。
+	const shift = sql.raw(`'${usageUtcOffsetMinutes} minutes'`);
+	const unshift = sql.raw(`'${-usageUtcOffsetMinutes} minutes'`);
+	return granularity === "day"
+		? sql<string>`strftime('%Y-%m-%dT%H:%M:%S.000Z', ${apiRequests.createdAt}, ${shift}, 'start of day', ${unshift})`
+		: sql<string>`strftime('%Y-%m-%dT%H:%M:%S.000Z', ${apiRequests.createdAt}, ${shift}, 'start of month', ${unshift})`;
 }
 
 function toNumber(value: unknown): number {
