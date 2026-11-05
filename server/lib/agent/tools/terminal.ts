@@ -1,10 +1,21 @@
+import type { IMarker } from "@xterm/headless";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
 import { terminals } from "../../../db/schema";
 import { terminalService } from "../../../services/terminal-service";
+import {
+	DEFAULT_WATCH_TIMEOUT_MS,
+	echoEnd,
+	MAX_WATCH_TIMEOUT_MS,
+	MIN_WATCH_TIMEOUT_MS,
+	normalizeWatchPattern,
+	startTerminalWatch,
+	type WatchStart,
+} from "../../../services/terminal-watch-service";
 import { truncateOutput } from "../truncate";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 /**
  * Per-narrator per-terminal read cursor.
@@ -50,8 +61,10 @@ function stripAnsi(text: string): string {
  * The serialize addon output contains ANSI sequences for styling and cursor
  * positioning. We strip those and collapse blank trailing lines.
  */
-function extractPlainText(serialized: string): string {
-	const plain = stripAnsi(serialized);
+export function extractPlainText(serialized: string): string {
+	// The serialize addon separates rows with CRLF; normalise so the model sees
+	// plain "\n" line breaks and cursor offsets count one char per line break.
+	const plain = stripAnsi(serialized).replace(/\r\n/g, "\n");
 	// Trim trailing blank lines
 	const lines = plain.split("\n");
 	let end = lines.length;
@@ -132,25 +145,30 @@ export const terminalTool: ToolDefinition = {
 		"Use action 'read' to get new terminal output since the last read (incremental). " +
 		"On the first read (or after a buffer reset), the full buffer is returned. " +
 		"Pass 'last_n_lines' to override incremental mode and always get the last N lines. " +
-		"Pass 'wait_for' to block until a specific string appears in new output (useful for waiting on " +
-		"build completion, server ready messages, prompts, etc.; times out after 30s). " +
 		"Use action 'write' to send input to the terminal (keystrokes, commands, Ctrl-C, etc.). " +
+		"To wait for something to appear, do not poll with 'read': " +
+		"pass 'notify_on' with 'write' (wait for the command you are sending), or use action 'watch' " +
+		"(wait for output of something already running, e.g. a server's ready message). " +
+		"Both start a background watch and return at once; end your turn and you will be notified " +
+		"with the matching output when the text appears, or when the watch times out or the " +
+		"terminal exits. Stop({ type: 'bash', id }) cancels a watch. " +
 		"Use action 'list' to list available terminals for the current narrator. " +
 		"The 'terminal_id' parameter accepts either a terminal ID or a terminal name. " +
 		"This tool is for interacting with persistent interactive terminals (e.g. dev servers, REPLs, TUIs), " +
-		"NOT for running one-off commands — use Bash for that.",
+		"NOT for running one-off commands — use Bash for that: it returns when the command exits, " +
+		"with its exit code, and needs no completion marker.",
 	parameters: z.object({
 		action: z
-			.enum(["read", "write", "list", "create", "rename"])
+			.enum(["read", "write", "watch", "list", "create", "rename"])
 			.describe(
-				"The action to perform: 'read' buffer, 'write' input, 'list' terminals, " +
-					"'create' a new terminal, or 'rename' an existing terminal",
+				"The action to perform: 'read' buffer, 'write' input, 'watch' for a pattern, " +
+					"'list' terminals, 'create' a new terminal, or 'rename' an existing terminal",
 			),
 		terminal_id: z
 			.string()
 			.optional()
 			.describe(
-				"Terminal ID or name to interact with. Required for 'read', 'write', and 'rename' actions.",
+				"Terminal ID or name to interact with. Required for 'read', 'write', 'watch' and 'rename'.",
 			),
 		input: z
 			.string()
@@ -173,24 +191,45 @@ export const terminalTool: ToolDefinition = {
 				"For 'read' action: only return the last N lines of the buffer (overrides incremental mode). " +
 					"Must be >= 1. When omitted, read returns only new output since the last read/write call.",
 			),
-		wait_for: z
+		notify_on: z
 			.string()
 			.optional()
 			.describe(
-				"For 'read' action: block until this string appears in new terminal output, or until timeout (30s). " +
-					"Useful for waiting on build completion, server ready messages, prompts, etc. " +
-					"Case-sensitive substring match. Can be combined with last_n_lines.",
+				"For 'write' action: text that marks the command as finished. Matching starts after the " +
+					"echo of the command line you send, so a marker inside the command " +
+					"(`cmd; echo __DONE__`) only matches once the command printed it. If it already " +
+					"appears within the few seconds 'write' waits for output, the result says so and no " +
+					"watch is started. Case-sensitive substring of the rendered screen text.",
 			),
+		pattern: z
+			.string()
+			.optional()
+			.describe(
+				"For 'watch' action: text to wait for. Only output from now on is matched. " +
+					"Case-sensitive substring of the rendered screen text.",
+			),
+		timeout: looseNumber(
+			`For 'watch', and for 'write' with 'notify_on': seconds before the watch gives up and ` +
+				`notifies you (default ${DEFAULT_WATCH_TIMEOUT_MS / 1000}, max ${MAX_WATCH_TIMEOUT_MS / 1000}).`,
+		),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { action, terminal_id, input, name, last_n_lines, wait_for } = args as {
-			action: "read" | "write" | "list" | "create" | "rename";
-			terminal_id?: string;
-			input?: string;
-			name?: string;
-			last_n_lines?: number;
-			wait_for?: string;
-		};
+		const { action, terminal_id, input, name, last_n_lines, notify_on, pattern, timeout } =
+			args as {
+				action: "read" | "write" | "watch" | "list" | "create" | "rename";
+				terminal_id?: string;
+				input?: string;
+				name?: string;
+				last_n_lines?: number;
+				notify_on?: string;
+				pattern?: string;
+				timeout?: number;
+			};
+		const timeoutMs =
+			(normalizeNumber(timeout, {
+				min: MIN_WATCH_TIMEOUT_MS / 1000,
+				max: MAX_WATCH_TIMEOUT_MS / 1000,
+			}) ?? DEFAULT_WATCH_TIMEOUT_MS / 1000) * 1000;
 
 		switch (action) {
 			case "list":
@@ -220,7 +259,7 @@ export const terminalTool: ToolDefinition = {
 				// Treat last_n_lines < 1 as unset (AI models sometimes pass 0 or floats)
 				const effectiveLastN =
 					last_n_lines !== undefined && last_n_lines >= 1 ? Math.round(last_n_lines) : undefined;
-				return await readBuffer(resolved.id, ctx.narratorId, ctx.signal, effectiveLastN, wait_for);
+				return await readBuffer(resolved.id, ctx.narratorId, ctx.signal, effectiveLastN);
 			}
 			case "write": {
 				if (!terminal_id) {
@@ -229,11 +268,27 @@ export const terminalTool: ToolDefinition = {
 				if (input === undefined || input === null) {
 					return { output: "input is required for 'write' action", isError: true };
 				}
+				if (notify_on !== undefined && normalizeWatchPattern(notify_on).trim() === "") {
+					return { output: "notify_on must contain visible text", isError: true };
+				}
 				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId);
 				if ("error" in resolved) {
 					return { output: resolved.error, isError: true };
 				}
-				return await writeInput(resolved.id, ctx.narratorId, ctx.signal, input);
+				return await writeInput(resolved.id, ctx, input, notify_on, timeoutMs);
+			}
+			case "watch": {
+				if (!terminal_id) {
+					return { output: "terminal_id is required for 'watch' action", isError: true };
+				}
+				if (!pattern || normalizeWatchPattern(pattern).trim() === "") {
+					return { output: "pattern is required for 'watch' action", isError: true };
+				}
+				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId);
+				if ("error" in resolved) {
+					return { output: resolved.error, isError: true };
+				}
+				return await watchTerminal(resolved.id, ctx, pattern, timeoutMs);
 			}
 
 			default:
@@ -346,56 +401,12 @@ async function readBuffer(
 	narratorId: string,
 	signal: AbortSignal,
 	lastNLines?: number,
-	waitFor?: string,
 ): Promise<ToolResult> {
 	const access = await assertTerminalAccess(terminalId, narratorId);
 	if (!access.allowed) {
 		return { output: access.error, isError: true };
 	}
 	const { terminal } = access;
-	if (signal.aborted) {
-		return makeAbortedResult(terminal.name ?? terminalId);
-	}
-
-	// --- wait_for polling phase ---
-	let waitTimedOut = false;
-	if (waitFor) {
-		const key = cursorKey(narratorId, terminalId);
-		const initialSnap = await terminalService.getScrollback(terminalId);
-		if (signal.aborted) {
-			return makeAbortedResult(terminal.name ?? terminalId);
-		}
-		const initialText = initialSnap ? extractPlainText(initialSnap.data) : "";
-		const waitStart = readCursors.get(key) ?? initialText.length;
-
-		const deadline = Date.now() + READ_WAIT_FOR_TIMEOUT_MS;
-		let found = false;
-
-		while (Date.now() < deadline) {
-			if (signal.aborted) {
-				return makeAbortedResult(terminal.name ?? terminalId);
-			}
-			const snap = await terminalService.getScrollback(terminalId);
-			if (signal.aborted) {
-				return makeAbortedResult(terminal.name ?? terminalId);
-			}
-			if (snap) {
-				const full = extractPlainText(snap.data);
-				const newContent = full.slice(waitStart);
-				if (newContent.includes(waitFor)) {
-					found = true;
-					break;
-				}
-			}
-			if (!(await abortableSleep(READ_WAIT_FOR_POLL_MS, signal))) {
-				return makeAbortedResult(terminal.name ?? terminalId);
-			}
-		}
-
-		if (!found) waitTimedOut = true;
-	}
-
-	// --- normal read flow ---
 	if (signal.aborted) {
 		return makeAbortedResult(terminal.name ?? terminalId);
 	}
@@ -410,6 +421,7 @@ async function readBuffer(
 		};
 	}
 
+	const key = cursorKey(narratorId, terminalId);
 	const fullText = extractPlainText(scrollback.data);
 	let text: string;
 
@@ -418,7 +430,6 @@ async function readBuffer(
 		text = tailSlice(fullText, lastNLines, WRITE_TAIL_CHARS);
 	} else {
 		// Incremental mode: return only content after the cursor
-		const key = cursorKey(narratorId, terminalId);
 		const cursor = readCursors.get(key);
 
 		if (cursor !== undefined && cursor <= fullText.length) {
@@ -437,27 +448,96 @@ async function readBuffer(
 	}
 
 	// Update cursor to current end regardless of mode
-	readCursors.set(cursorKey(narratorId, terminalId), fullText.length);
+	readCursors.set(key, fullText.length);
 
 	if (!text.trim()) {
 		return {
-			output: waitTimedOut
-				? `(wait_for timed out after ${READ_WAIT_FOR_TIMEOUT_MS / 1000}s — "${waitFor}" not found, no new output)`
-				: "(no new output since last read)",
+			output: "(no new output since last read)",
 			title: terminal.name ?? terminalId,
 		};
 	}
 
-	const header = waitTimedOut
-		? `(wait_for timed out after ${READ_WAIT_FOR_TIMEOUT_MS / 1000}s — "${waitFor}" not found)\n\n`
-		: "";
-
-	const truncated = truncateOutput(header + text);
+	const truncated = truncateOutput(text);
 	return {
 		output: truncated.content,
 		truncated: truncated.truncated,
 		title: terminal.name ?? terminalId,
 	};
+}
+
+/**
+ * Start a watch on `terminalId` and describe it for the model. `marker` is the
+ * row matching starts from; ownership passes to the watch.
+ */
+async function startWatch(
+	terminalId: string,
+	terminalName: string,
+	ctx: ToolContext,
+	pattern: string,
+	timeoutMs: number,
+	marker: IMarker,
+	start: WatchStart,
+): Promise<ToolResult> {
+	const buffer = terminalService.getActiveBuffer(terminalId);
+	if (!buffer) {
+		marker.dispose();
+		return {
+			output: "Terminal is not attached; cannot watch it. Read it to re-attach, then retry.",
+			isError: true,
+		};
+	}
+	const started = await startTerminalWatch({
+		narratorId: ctx.narratorId,
+		terminalId,
+		terminalName,
+		pattern,
+		timeoutMs,
+		buffer,
+		marker,
+		start,
+		toolUseId: ctx.currentToolUseId,
+	});
+	if (started.status === "error") return { output: started.message, isError: true };
+	return {
+		output:
+			`Watching terminal "${terminalName}" for ${JSON.stringify(normalizeWatchPattern(pattern))} ` +
+			`(background task "${started.alias}", times out in ${Math.round(timeoutMs / 1000)}s). ` +
+			"End your turn or continue other work; you will be notified with the matching output, or " +
+			`when the watch times out or the terminal exits. Stop({ type: "bash", id: "${started.alias}" }) cancels it.`,
+		title: terminalName,
+	};
+}
+
+async function watchTerminal(
+	terminalId: string,
+	ctx: ToolContext,
+	pattern: string,
+	timeoutMs: number,
+): Promise<ToolResult> {
+	const access = await assertTerminalAccess(terminalId, ctx.narratorId);
+	if (!access.allowed) return { output: access.error, isError: true };
+	const { terminal } = access;
+	if (terminal.status === "exited") {
+		return { output: "Terminal has exited. Cannot watch it.", isError: true };
+	}
+	if (!terminalService.isAttached(terminalId) && !(await terminalService.reattach(terminalId))) {
+		return { output: "Terminal is not attached (no active PTY connection).", isError: true };
+	}
+	const buffer = terminalService.getActiveBuffer(terminalId);
+	const marker = await buffer?.markCursorRow();
+	if (!buffer || !marker) {
+		return {
+			output:
+				"Cannot watch this terminal right now: a full-screen program (alternate screen) is active.",
+			isError: true,
+		};
+	}
+	// Only output from now on: skip what the cursor row already shows.
+	const { text } = await buffer.readFromMarker(marker);
+	return startWatch(terminalId, terminal.name, ctx, pattern, timeoutMs, marker, {
+		kind: "offset",
+		offset: text.length,
+	});
 }
 
 /** How long to wait for new terminal output after writing (ms) */
@@ -474,10 +554,6 @@ const WRITE_TAIL_CHARS = 20_000;
 const READ_INCREMENTAL_MAX_LINES = 200;
 /** Max characters for incremental read (no last_n_lines) */
 const READ_INCREMENTAL_MAX_CHARS = 40_000;
-/** How long to wait for `wait_for` pattern to appear (ms) */
-const READ_WAIT_FOR_TIMEOUT_MS = 30_000;
-/** Polling interval when waiting for `wait_for` pattern (ms) */
-const READ_WAIT_FOR_POLL_MS = 500;
 
 /**
  * Take the last N lines from text, also capping total character count.
@@ -498,10 +574,12 @@ function tailSlice(text: string, maxLines: number, maxChars: number): string {
 
 async function writeInput(
 	terminalId: string,
-	narratorId: string,
-	signal: AbortSignal,
+	ctx: ToolContext,
 	input: string,
+	notifyOn?: string,
+	timeoutMs = DEFAULT_WATCH_TIMEOUT_MS,
 ): Promise<ToolResult> {
+	const { narratorId, signal } = ctx;
 	const access = await assertTerminalAccess(terminalId, narratorId);
 	if (!access.allowed) {
 		return { output: access.error, isError: true };
@@ -526,82 +604,131 @@ async function writeInput(
 		}
 	}
 
-	// Snapshot buffer length before writing so we can detect new output
-	const beforeSnapshot = await terminalService.getScrollback(terminalId);
-	if (signal.aborted) {
-		return makeAbortedResult(terminal.name ?? terminalId);
-	}
-	const beforeLen = beforeSnapshot ? extractPlainText(beforeSnapshot.data).length : 0;
-
-	// Process escape sequences in the input string
-	const processed = processEscapes(input);
-	terminalService.write(terminalId, processed);
-
-	// Wait for the terminal to produce new output and settle
-	const deadline = Date.now() + WRITE_SETTLE_TIMEOUT_MS;
-	let lastChangeTime = Date.now();
-	let lastLen = beforeLen;
-	let settled = false;
-
-	while (Date.now() < deadline) {
-		if (!(await abortableSleep(WRITE_POLL_INTERVAL_MS, signal))) {
-			return makeAbortedResult(terminal.name ?? terminalId);
+	// With notify_on, mark the row the input is typed on before writing, so the
+	// watch covers all of the command's output however fast it arrives.
+	let marker: IMarker | undefined;
+	if (notifyOn !== undefined) {
+		marker = await terminalService.getActiveBuffer(terminalId)?.markCursorRow();
+		if (!marker) {
+			return {
+				output:
+					"Cannot use notify_on right now: a full-screen program (alternate screen) is active. " +
+					"Nothing was sent.",
+				isError: true,
+			};
 		}
-		const snap = await terminalService.getScrollback(terminalId);
+	}
+	let markerOwned = false;
+	try {
+		// Snapshot buffer length before writing so we can detect new output
+		const beforeSnapshot = await terminalService.getScrollback(terminalId);
 		if (signal.aborted) {
 			return makeAbortedResult(terminal.name ?? terminalId);
 		}
-		const curLen = snap ? extractPlainText(snap.data).length : 0;
+		const beforeLen = beforeSnapshot ? extractPlainText(beforeSnapshot.data).length : 0;
 
-		if (curLen !== lastLen) {
-			// Buffer changed — reset the quiet timer
-			lastLen = curLen;
-			lastChangeTime = Date.now();
-		} else if (curLen > beforeLen && Date.now() - lastChangeTime >= WRITE_SETTLE_QUIET_MS) {
-			// Buffer has new content and has been quiet long enough
-			settled = true;
-			break;
+		// Process escape sequences in the input string
+		const processed = processEscapes(input);
+		terminalService.write(terminalId, processed);
+
+		// Wait for the terminal to produce new output and settle
+		const deadline = Date.now() + WRITE_SETTLE_TIMEOUT_MS;
+		let lastChangeTime = Date.now();
+		let lastLen = beforeLen;
+		let settled = false;
+
+		while (Date.now() < deadline) {
+			if (!(await abortableSleep(WRITE_POLL_INTERVAL_MS, signal))) {
+				return makeAbortedResult(terminal.name ?? terminalId);
+			}
+			const snap = await terminalService.getScrollback(terminalId);
+			if (signal.aborted) {
+				return makeAbortedResult(terminal.name ?? terminalId);
+			}
+			const curLen = snap ? extractPlainText(snap.data).length : 0;
+
+			if (curLen !== lastLen) {
+				// Buffer changed — reset the quiet timer
+				lastLen = curLen;
+				lastChangeTime = Date.now();
+			} else if (curLen > beforeLen && Date.now() - lastChangeTime >= WRITE_SETTLE_QUIET_MS) {
+				// Buffer has new content and has been quiet long enough
+				settled = true;
+				break;
+			}
 		}
-	}
 
-	// Read the final buffer and return the tail
-	if (signal.aborted) {
-		return makeAbortedResult(terminal.name ?? terminalId);
-	}
-	const afterSnapshot = await terminalService.getScrollback(terminalId);
-	if (!afterSnapshot) {
+		// Read the final buffer and return the tail
+		if (signal.aborted) {
+			return makeAbortedResult(terminal.name ?? terminalId);
+		}
+		const afterSnapshot = await terminalService.getScrollback(terminalId);
+		if (!afterSnapshot) {
+			return {
+				output: `Sent ${processed.length} byte(s) to terminal. No buffer available.`,
+				title: terminal.name ?? terminalId,
+			};
+		}
+
+		const fullText = extractPlainText(afterSnapshot.data);
+
+		// Extract only new output generated by this write command (exclude stale content).
+		// If beforeLen > fullText.length, buffer was truncated/reset — fall back to full output.
+		let text = beforeLen < fullText.length ? fullText.slice(beforeLen) : fullText;
+
+		// Update cursor so subsequent reads skip what we already returned
+		readCursors.set(cursorKey(narratorId, terminalId), fullText.length);
+
+		text = tailSlice(text, WRITE_TAIL_LINES, WRITE_TAIL_CHARS);
+		const body = text.trim() ? text : "(no new output)";
+
+		if (notifyOn !== undefined && marker) {
+			const pattern = normalizeWatchPattern(notifyOn);
+			const buffer = terminalService.getActiveBuffer(terminalId);
+			const fromMarker = buffer ? (await buffer.readFromMarker(marker)).text : "";
+			const start = echoEnd(fromMarker, processed);
+			if (start !== undefined && fromMarker.indexOf(pattern, start) !== -1) {
+				const truncated = truncateOutput(
+					`(${JSON.stringify(pattern)} already appeared; no watch was started)\n\n${body}`,
+				);
+				return {
+					output: truncated.content,
+					truncated: truncated.truncated,
+					title: terminal.name ?? terminalId,
+				};
+			}
+			markerOwned = true;
+			const watch = await startWatch(terminalId, terminal.name, ctx, notifyOn, timeoutMs, marker, {
+				kind: "echo",
+				input: processed,
+			});
+			const truncated = truncateOutput(`${watch.output}\n\n${body}`);
+			return {
+				output: truncated.content,
+				truncated: truncated.truncated,
+				isError: watch.isError,
+				title: terminal.name ?? terminalId,
+			};
+		}
+
+		if (!text.trim()) {
+			return {
+				output: `Sent ${processed.length} byte(s) to terminal. (no new output)`,
+				title: terminal.name ?? terminalId,
+			};
+		}
+
+		const header = settled ? "" : "(output may still be in progress)\n\n";
+
+		const truncated = truncateOutput(header + text);
 		return {
-			output: `Sent ${processed.length} byte(s) to terminal. No buffer available.`,
+			output: truncated.content,
+			truncated: truncated.truncated,
 			title: terminal.name ?? terminalId,
 		};
+	} finally {
+		if (!markerOwned) marker?.dispose();
 	}
-
-	const fullText = extractPlainText(afterSnapshot.data);
-
-	// Extract only new output generated by this write command (exclude stale content).
-	// If beforeLen > fullText.length, buffer was truncated/reset — fall back to full output.
-	let text = beforeLen < fullText.length ? fullText.slice(beforeLen) : fullText;
-
-	// Update cursor so subsequent reads skip what we already returned
-	readCursors.set(cursorKey(narratorId, terminalId), fullText.length);
-
-	text = tailSlice(text, WRITE_TAIL_LINES, WRITE_TAIL_CHARS);
-
-	if (!text.trim()) {
-		return {
-			output: `Sent ${processed.length} byte(s) to terminal. (no new output)`,
-			title: terminal.name ?? terminalId,
-		};
-	}
-
-	const header = settled ? "" : "(output may still be in progress)\n\n";
-
-	const truncated = truncateOutput(header + text);
-	return {
-		output: truncated.content,
-		truncated: truncated.truncated,
-		title: terminal.name ?? terminalId,
-	};
 }
 
 /**
