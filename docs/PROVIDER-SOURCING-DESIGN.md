@@ -107,6 +107,8 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 用户可以在高级设置里拖动排序。
 
 5. **纪元锁**：见 4.3。
+
+**P3 第一版已实现（2026-11-05 决定先做这一档）**：`shared/auto-route-strategy.ts` 按“能否服务 → 订阅优先 → 参考价低者优先（未知价排在已知价后）→ 服务顺序”排序；能否服务与是否订阅由 `server/lib/agent/auto-route-signals.ts` 提供（Codex 看启用账号数，自定义供应商看是否还有不在冷却或额度窗口内的 Key，Kimi Code / OpenCode Go 视为订阅）。会话已在用的服务只要还能服务就继续用；不能服务时换到排序第一的来源。全部不可用时仍返回排序第一的来源，让上游错误照常报给用户。个人 / 团队分层随 P4 一起做；拖动排序与稳定性维度以后再做。
 6. **出站**：渠道的网络身份装配成 `ProviderTransport`（代理、UA、设备 ID、额外请求头），交给协议适配器。
 
 `resolveRoute` 保持同步：读的是内存中按用户分组的渠道快照，凭据变更时通过事件总线失效重建，不在请求路径上查库。

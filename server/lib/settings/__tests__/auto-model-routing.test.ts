@@ -5,6 +5,8 @@ import {
 	getSubagentVisibleModels,
 	listAutoModelCandidates,
 	listAutoModelIds,
+	orderedAutoModelCandidates,
+	registerAutoSourceProbe,
 	resolveAllowedModelCandidateMatch,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -69,6 +71,7 @@ describe("auto model routing", () => {
 	});
 
 	afterEach(() => {
+		registerAutoSourceProbe(null);
 		Object.assign(settings.agent, {
 			customModels: saved.customModels,
 			hiddenModels: saved.hiddenModels,
@@ -114,6 +117,29 @@ describe("auto model routing", () => {
 		// An unservable summary model follows the default, like an empty aggregation does.
 		settings.agent.summaryModel = "auto:no-such-model";
 		expect(resolveEffectiveModel("__summary__")).toBe("provA:claude-opus-4-6");
+	});
+
+	test("subscriptions first; a sticky source that cannot serve is left for the next one", () => {
+		const facts: Record<string, { available: boolean; subscription: boolean }> = {
+			provA: { available: true, subscription: false },
+			provB: { available: true, subscription: true },
+		};
+		registerAutoSourceProbe(
+			(provider) => facts[provider] ?? { available: true, subscription: false },
+		);
+		expect(orderedAutoModelCandidates("claude-opus-4-6")).toEqual([
+			"provB:claude-opus-4.6",
+			"provA:claude-opus-4-6",
+		]);
+		expect(resolveEffectiveModel("auto:claude-opus-4-6")).toBe("provB:claude-opus-4.6");
+		// A session on provA stays there while provA can serve (keeps its cache) …
+		expect(resolveEffectiveModel("auto:claude-opus-4-6", "provA")).toBe("provA:claude-opus-4-6");
+		// … and moves once it cannot.
+		facts.provA = { available: false, subscription: false };
+		expect(resolveEffectiveModel("auto:claude-opus-4-6", "provA")).toBe("provB:claude-opus-4.6");
+		// Nothing available: the best one is still returned, so its own error reaches the user.
+		facts.provB = { available: false, subscription: true };
+		expect(resolveEffectiveModel("auto:claude-opus-4-6")).toBe("provB:claude-opus-4.6");
 	});
 
 	test("subagents see auto values, and a pool entry admits the providers that serve it", () => {

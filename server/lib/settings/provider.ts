@@ -8,6 +8,7 @@ import {
 	autoModelValue,
 	parseAutoModelValue,
 } from "@shared/auto-model";
+import { orderAutoCandidates } from "@shared/auto-route-strategy";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import { modelProfile } from "@shared/model-catalog/profile";
@@ -322,6 +323,45 @@ export function listAutoModelCandidates(modelId: string): string[] {
 	return autoCandidates(modelId, inputs).map((candidate) => candidate.value);
 }
 
+/**
+ * Live facts about a source for ordering `auto:` candidates: can it serve now, and is it a
+ * subscription. Registered by agent/auto-route-signals.ts, which may reach the Codex manager,
+ * the key pool and usage caches that this settings module must not import. Without it every
+ * source counts as available and pay-per-use.
+ */
+export type AutoSourceProbe = (provider: string) => { available: boolean; subscription: boolean };
+let autoSourceProbe: AutoSourceProbe | null = null;
+export function registerAutoSourceProbe(probe: AutoSourceProbe | null): void {
+	autoSourceProbe = probe;
+}
+
+/** Reference input + output price per million tokens (the catalog's unit), when known. */
+function referencePricePerMillion(value: string): number | undefined {
+	try {
+		// Decimal strings; missing or null means unknown.
+		const pricing = getEffectiveModelProfile(value).referencePricing;
+		const input = Number(pricing?.input ?? Number.NaN);
+		const output = Number(pricing?.output ?? Number.NaN);
+		return Number.isFinite(input) && Number.isFinite(output) ? input + output : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** `auto:` candidates in routing order (shared/auto-route-strategy.ts). */
+export function orderedAutoModelCandidates(modelId: string): string[] {
+	const candidates = listAutoModelCandidates(modelId);
+	if (candidates.length < 2) return candidates;
+	return orderAutoCandidates(
+		candidates.map((value) => {
+			const provider = parseModelId(value).provider as string;
+			const facts = autoSourceProbe?.(provider) ?? { available: true, subscription: false };
+			const price = referencePricePerMillion(value);
+			return { value, ...facts, ...(price !== undefined ? { referencePrice: price } : {}) };
+		}),
+	);
+}
+
 /** Every catalog model that at least one provider can serve through `auto:`. */
 export function listAutoModelIds(): string[] {
 	const excluded = new Set(s().agent.autoExcludedProviders ?? []);
@@ -356,15 +396,16 @@ function autoModelIdOf(value: string | null | undefined): string | null {
 /**
  * The concrete `<prefix>:<model>` an `auto:` value resolves to now.
  *
- * Until P3's strategy scoring lands this is the first candidate in provider order, kept on
- * the provider a session already uses (`stickyProvider`) so a turn does not hop services
- * and lose its upstream cache. Returns null when no provider serves the model.
+ * A session stays on the provider it already uses (`stickyProvider`) while that provider can
+ * still serve, so a turn keeps its upstream cache (§4.3 "within an epoch"). When it cannot,
+ * the best candidate in routing order takes over (§4.3 "forced switch"). Returns null when no
+ * provider serves the model.
  */
 export function resolveAutoModel(modelId: string, stickyProvider?: string): string | null {
-	const candidates = listAutoModelCandidates(modelId);
+	const candidates = orderedAutoModelCandidates(modelId);
 	if (stickyProvider) {
 		const sticky = candidates.find((value) => parseModelId(value).provider === stickyProvider);
-		if (sticky) return sticky;
+		if (sticky && (autoSourceProbe?.(stickyProvider).available ?? true)) return sticky;
 	}
 	return candidates[0] ?? null;
 }
@@ -1048,7 +1089,7 @@ export function resolveProvider(model?: string): string {
 	// `auto` is not a provider: name the one the value resolves to now, side-effect free.
 	const autoId = autoModelIdOf(model);
 	if (autoId) {
-		const first = listAutoModelCandidates(autoId)[0];
+		const first = orderedAutoModelCandidates(autoId)[0];
 		if (first) return parseModelId(first).provider as string;
 	}
 	const { provider: explicit, model: bare } = parseModelId(model);
@@ -1111,7 +1152,7 @@ function resolveMetaModelForLookup(model: string, seen = new Set<string>()): str
 	}
 
 	const autoId = autoModelIdOf(raw);
-	if (autoId) return listAutoModelCandidates(autoId)[0] ?? raw;
+	if (autoId) return orderedAutoModelCandidates(autoId)[0] ?? raw;
 
 	const agg = parseAggModelValue(raw);
 	if (!agg) return raw;

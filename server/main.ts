@@ -122,6 +122,7 @@ import {
 } from "./services/notification-center-maintenance";
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
+import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
@@ -191,6 +192,8 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
 recoverProviderPrefixMigrationOnStartup();
+// auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
+installAutoRouteSignals();
 // `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
 // logged and leaves it working as an ordinary prefix, so startup never depends on it.
 // SQLite only: narrator rows are rewritten through the SQLite handle, which is a fail-closed
