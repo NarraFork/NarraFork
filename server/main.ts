@@ -123,6 +123,7 @@ import {
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
@@ -192,9 +193,13 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 recoverProviderPrefixMigrationOnStartup();
 // `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
 // logged and leaves it working as an ordinary prefix, so startup never depends on it.
-await migrateReservedAutoPrefixOnStartup().catch((error) => {
-	logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
-});
+// SQLite only: narrator rows are rewritten through the SQLite handle, which is a fail-closed
+// proxy on PostgreSQL. There the provider keeps working as an ordinary prefix.
+if (activeDatabaseBackend === "sqlite") {
+	await migrateReservedAutoPrefixOnStartup().catch((error) => {
+		logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
+	});
+}
 
 // When the PostgreSQL backend is active, inject every PG-capable store from the single
 // composition seam — one runtime, one client, all-or-nothing. `./db` has already finished
@@ -1928,6 +1933,10 @@ if (activeDatabaseBackend === "sqlite") {
 	});
 	// Re-derive which project every session belongs to, in bounded background pages.
 	void scheduleProjectIndexRebuild();
+	// Model aggregations become auto:/provider values; batched, logs and retries on failure.
+	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
+	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
+	void migrateAggregationsOnStartup();
 }
 
 // Establish client-egress relay channels for NUG providers configured with

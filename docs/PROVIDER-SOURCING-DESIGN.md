@@ -335,6 +335,11 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 
 迁移在后台分页执行，单批次有上限并让出事件循环，不在一个同步事务里改写上万行。
 
+已实现（P3）：
+- 聚合迁移：`server/services/aggregation-migration-service.ts`，规则在 `shared/aggregation-migration.ts`。启动时在后台执行，作用于 settings.agent 的各模型字段、子代理池与固定档位、搜索渠道模型，以及 `narrators.model` / `pending_model_restore`、`scheduled_tasks.model`、`hooks.model`。先写日志，再在一个事务里逐行比对后改写，最后保存设置；失败时把行改回原值，下次启动重试。规划之后被用户改过的行会跳过。聚合本身保留在设置里（界面只读），引用已删除聚合的值不改，照旧回落到默认模型。
+- `auto` 前缀改名：`migrateReservedAutoPrefixOnStartup`（`provider-prefix-migration-service.ts`），改为第一个空闲的 `auto-N`，复用前缀迁移的日志与回滚。改名之前，`auto:` 值仍按普通前缀解析。
+- 两项迁移目前只在 SQLite 后端执行（叙述者行经 SQLite 句柄改写）。PostgreSQL 后端下聚合值照旧可解析，`auto` 前缀的供应商照旧作为普通前缀使用。
+
 ## 12. 分阶段实施
 
 每个阶段都能独立发布，不依赖后续阶段。
