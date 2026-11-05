@@ -543,16 +543,10 @@ if (isProd) {
 	}
 }
 
-// ── Windows: forcefully reclaim port from stale TCP connections ──────────────
-// Bun on Windows has known issues where the port isn't released after a crash
-// or unclean shutdown (see oven-sh/bun#12127, #18003, #26049).  Even after the
-// owning process exits, the port can remain in LISTENING state — netstat shows
-// a PID but taskkill says "process not found".  This is the Windows "ghost
-// port" problem: the original process is gone, but a related process (often
-// conhost.exe) still holds the inherited socket handle.
-//
-// Strategy: try to kill the PID from netstat.  If it's already gone, trace the
-// process tree via wmic to find the real handle holder and kill that.
+// ── Windows: own child processes ──────────────────────────────────────────────
+// Children that outlive an unclean exit keep files and ports busy, so the exit path ends the
+// whole tree below this process. Uses wmic, which recent Windows builds no longer ship; there
+// this finds nothing. A Job Object would replace it.
 type WindowsProcessInfo = {
 	pid: number;
 	caption: string;
@@ -576,160 +570,6 @@ function parseWmicProcessCsv(output: string): WindowsProcessInfo[] {
 		});
 	}
 	return processes;
-}
-
-function tryReclaimPort(targetPort: number): void {
-	if (!IS_WINDOWS) return;
-	try {
-		// netstat -ano gives lines like:
-		//   TCP    0.0.0.0:7778           0.0.0.0:0              LISTENING       12345
-		//   TCP    [::]:7778              [::]:0                 LISTENING       12345
-		const result = Bun.spawnSync(["netstat", "-ano"], {
-			stdout: "pipe",
-			stderr: "ignore",
-			windowsHide: true,
-		});
-		if (result.exitCode !== 0) return;
-		const output = new TextDecoder().decode(result.stdout);
-		const listeningPids = new Set<number>();
-		const portPattern = new RegExp(`:${targetPort}\\s`);
-		for (const line of output.split("\n")) {
-			if (!portPattern.test(line)) continue;
-			const parts = line.trim().split(/\s+/);
-			const pid = Number.parseInt(parts[parts.length - 1], 10);
-			const state = parts[3]; // LISTENING, ESTABLISHED, CLOSE_WAIT, FIN_WAIT_2, TIME_WAIT, etc.
-			if (state === "LISTENING" && pid > 0 && pid !== process.pid) {
-				listeningPids.add(pid);
-			}
-		}
-
-		for (const pid of listeningPids) {
-			killPortHolder(pid, targetPort);
-		}
-
-		if (listeningPids.size > 0) {
-			Bun.sleepSync(200);
-		}
-	} catch {
-		// netstat/tasklist not available — skip silently
-	}
-}
-
-/**
- * Try to kill a process holding a LISTENING socket. If the PID from netstat is
- * already gone (taskkill returns "not found"), trace the process tree via wmic
- * to find related processes (parent, siblings, children) that may still hold the
- * inherited socket handle, and kill those.
- *
- * SEE https://serverfault.com/questions/1169871/how-to-allocate-a-tcp-port-orphaned-by-a-non-existent-process-without-restarting
- */
-function killPortHolder(pid: number, port: number): void {
-	// Attempt 1: direct kill.
-	const directKill = Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], {
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-	});
-	const stderr = new TextDecoder().decode(directKill.stderr).toLowerCase();
-	if (directKill.exitCode === 0) {
-		logger.warn(`Killed process (PID ${pid}) holding port ${port}`);
-		Bun.sleepSync(300);
-		return;
-	}
-
-	// If the process exists but we lack permissions, nothing more we can do.
-	if (!stderr.includes("not found")) return;
-
-	// Attempt 2: the PID is gone but the port is still held. Trace the parent
-	// process via wmic and kill related children (the real handle holder, often
-	// conhost.exe or similar).
-	logger.info(`PID ${pid} not found — tracing process tree to find port ${port} holder`);
-	try {
-		const childQuery = Bun.spawnSync(
-			[
-				"wmic",
-				"process",
-				"where",
-				`(ParentProcessId=${pid})`,
-				"get",
-				"Caption,ProcessId",
-				"/FORMAT:CSV",
-			],
-			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
-		);
-		const childOutput = new TextDecoder().decode(childQuery.stdout);
-		for (const line of childOutput.split("\n")) {
-			const cols = line.trim().split(",");
-			// CSV format: Node,Caption,ProcessId
-			if (cols.length < 3) continue;
-			const childPid = Number.parseInt(cols[cols.length - 1] ?? "", 10);
-			if (!childPid || childPid === process.pid) continue;
-			logger.warn(
-				`Killing child process ${cols[1]?.trim()} (PID ${childPid}) — likely holding port ${port}`,
-			);
-			try {
-				Bun.spawnSync(["taskkill", "/F", "/PID", String(childPid)], {
-					stdio: ["ignore", "ignore", "ignore"],
-					// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
-					windowsHide: true,
-				});
-			} catch {
-				// best effort
-			}
-		}
-
-		// Also check: maybe the ghost PID's parent spawned other children that
-		// inherited the handle. Look up the parent first.
-		const parentQuery = Bun.spawnSync(
-			["wmic", "process", "where", `(ProcessId=${pid})`, "get", "ParentProcessId", "/FORMAT:CSV"],
-			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
-		);
-		const parentOutput = new TextDecoder().decode(parentQuery.stdout);
-		for (const line of parentOutput.split("\n")) {
-			const cols = line.trim().split(",");
-			if (cols.length < 2) continue;
-			const parentPid = Number.parseInt(cols[cols.length - 1] ?? "", 10);
-			if (!parentPid || parentPid === process.pid || parentPid === pid) continue;
-
-			// Kill siblings (other children of the same parent).
-			const siblingQuery = Bun.spawnSync(
-				[
-					"wmic",
-					"process",
-					"where",
-					`(ParentProcessId=${parentPid})`,
-					"get",
-					"Caption,ProcessId",
-					"/FORMAT:CSV",
-				],
-				{ stdout: "pipe", stderr: "ignore", windowsHide: true },
-			);
-			const siblingOutput = new TextDecoder().decode(siblingQuery.stdout);
-			for (const sLine of siblingOutput.split("\n")) {
-				const sCols = sLine.trim().split(",");
-				if (sCols.length < 3) continue;
-				const sPid = Number.parseInt(sCols[sCols.length - 1] ?? "", 10);
-				if (!sPid || sPid === process.pid || sPid === pid) continue;
-				const sName = sCols[1]?.trim().toLowerCase() ?? "";
-				// Only kill known "handle holder" processes, not random siblings.
-				if (sName === "conhost.exe" || sName === "cmd.exe") {
-					logger.warn(`Killing sibling ${sName} (PID ${sPid}) — likely holding port ${port}`);
-					try {
-						Bun.spawnSync(["taskkill", "/F", "/PID", String(sPid)], {
-							stdio: ["ignore", "ignore", "ignore"],
-							// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
-							windowsHide: true,
-						});
-					} catch {
-						// best effort
-					}
-				}
-			}
-		}
-		Bun.sleepSync(300);
-	} catch {
-		// wmic not available or failed — skip
-	}
 }
 
 function getWindowsChildProcesses(parentPid: number): WindowsProcessInfo[] {
@@ -1234,11 +1074,6 @@ let _server: ReturnType<typeof startServer>;
 // blocks are ~100 ports wide, so probing consecutive ports can never escape one.
 const excludedPortRanges = readWindowsExcludedPortRanges();
 const excludedRangeForPort = findExcludingRange(port, excludedPortRanges);
-
-// Only meaningful when a real process holds the port; a reserved range has no owner to kill.
-if (!excludedRangeForPort) {
-	tryReclaimPort(port);
-}
 
 // The startup page holds the port until here; from now on the real server answers.
 await closeStartupStatus();

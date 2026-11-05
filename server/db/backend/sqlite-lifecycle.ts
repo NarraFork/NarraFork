@@ -93,6 +93,8 @@ interface SqliteLifecycleState {
 const HOT_STATE_KEY = "narrafork.dbLifecycle";
 const HOT_TIMER_KEY = "narrafork.walCheckpointTimer";
 const HOT_EXIT_HANDLER_KEY = "narrafork.walExitHandler";
+/** Long enough for the server to bind and answer the first page load first. */
+const STARTUP_OPTIMIZE_DELAY_MS = 30_000;
 
 export interface SqliteLifecycleOptions {
 	/**
@@ -297,9 +299,13 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 
 		// Refresh query-planner statistics once on a real startup (skip hot reloads — the stats are
 		// process-independent and this avoids redundant work on every --hot cycle). Bounded by
-		// analysis_limit; actual synchronous duration is logged by optimizeDatabase.
+		// analysis_limit; actual synchronous duration is logged by optimizeDatabase. Deferred past
+		// the port bind: it took ~1s on a 12 GB database, and the statistics it refreshes only
+		// help later queries, so startup should not wait for it.
 		if (!isHotReload) {
-			optimizeDatabase(connection(), { source: "startup" });
+			setTimeout(() => {
+				if (state.sqlite) optimizeDatabase(state.sqlite, { source: "startup" });
+			}, STARTUP_OPTIMIZE_DELAY_MS).unref();
 		}
 
 		// Guarantee the instance lock is released on process exit. Deliberately NOT the clean-shutdown
