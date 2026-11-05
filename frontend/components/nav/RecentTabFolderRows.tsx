@@ -172,7 +172,8 @@ export function recentTabFolderCardStyle(
 	color: RecentTabFolderColor | undefined,
 ): React.CSSProperties {
 	return {
-		borderRadius: "var(--mantine-radius-md)",
+		// The rows inside are NavLinks at the theme's `sm` radius; the card matches them.
+		borderRadius: "var(--mantine-radius-sm)",
 		background: folderCardFill(color),
 		margin: "2px 0",
 	};
@@ -329,8 +330,8 @@ export function RecentTabFolderStrip({
 							// Sticks over other rows while expanded, so it needs an opaque fill: the
 							// card's translucent tint layered on the page colour.
 							background: `linear-gradient(${fill}, ${fill}), var(--mantine-color-body)`,
-							borderBottomLeftRadius: "var(--mantine-radius-md)",
-							borderBottomRightRadius: "var(--mantine-radius-md)",
+							borderBottomLeftRadius: "var(--mantine-radius-sm)",
+							borderBottomRightRadius: "var(--mantine-radius-sm)",
 						}
 					: undefined
 			}
@@ -380,7 +381,7 @@ export function RecentTabFolderStrip({
 						cursor: dragging ? "ns-resize" : "pointer",
 						// Vertical drags resize the preview instead of scrolling (preview only).
 						touchAction: expanded ? "manipulation" : "none",
-						borderRadius: "var(--mantine-radius-md)",
+						borderRadius: "var(--mantine-radius-sm)",
 						color: dragging && color ? color : "var(--mantine-color-dimmed)",
 					}}
 				>
