@@ -1212,7 +1212,10 @@ describe("provider add nested route", () => {
 		if (!card) throw new Error("Missing TokenDance card");
 		await click(card);
 		// 详情页的「启用」开关同样只写草稿，不直接改连接记录。
-		const toggle = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		// The shared "use for auto models" switch sits above it; skip that one.
+		const toggle = container.querySelector<HTMLInputElement>(
+			'input[type="checkbox"]:not([data-auto-participation])',
+		);
 		if (!toggle) throw new Error("Missing detail enable switch");
 		await act(async () => {
 			toggle.dispatchEvent(new Event("click", { bubbles: true }));

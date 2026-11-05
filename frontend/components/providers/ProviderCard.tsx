@@ -25,6 +25,8 @@ export interface ProviderCardProps {
 	hiddenCount: number;
 	previewModels: string[];
 	disabled: boolean;
+	/** Left out of `auto:<model>` routing; models stay usable when named explicitly. */
+	autoExcluded?: boolean;
 	isRefreshing?: boolean;
 	controlsDisabled?: boolean;
 	onToggleDisabled: () => void;
@@ -43,6 +45,7 @@ export const ProviderCard = React.memo(function ProviderCard({
 	hiddenCount,
 	previewModels,
 	disabled,
+	autoExcluded,
 	isRefreshing,
 	controlsDisabled,
 	onToggleDisabled,
@@ -104,6 +107,11 @@ export const ProviderCard = React.memo(function ProviderCard({
 									? t("providerTypePlatform")
 									: (badgeLabel ?? t("providerTypeCustom"))}
 							</Badge>
+							{autoExcluded && !disabled && (
+								<Badge size="xs" variant="outline" color="gray">
+									{t("autoParticipation.excludedBadge")}
+								</Badge>
+							)}
 						</Group>
 					</UnstyledButton>
 					<Box

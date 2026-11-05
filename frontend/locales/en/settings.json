@@ -2243,6 +2243,15 @@
 	"pluginProviderConnectionSection": "Connection",
 	"pluginProviderConnectionDesc": "Advanced non-secret provider settings are stored by NarraFork, separate from the plugin's own account page.",
 	"providerConfigDesc": "Configure API credentials, model list, and advanced options.",
+	"autoParticipation": {
+		"label": "Use for auto models",
+		"desc": "When on, \"auto\" model choices may route to this provider. Choosing one of its models by name still works when off.",
+		"descServing_one": "Currently a source for {{count}} auto model. Choosing its models by name still works when off.",
+		"descServing_other": "Currently a source for {{count}} auto models. Choosing its models by name still works when off.",
+		"stranded_one": "{{models}} has no other source. Sessions and settings using it as an auto model will stop working until another provider serves it.",
+		"stranded_other": "{{count}} auto models have no other source ({{models}}). Sessions and settings using them will stop working until another provider serves them.",
+		"excludedBadge": "Not in auto"
+	},
 	"overviewHiddenCount": "{{count}} hidden",
 	"overviewMoreModels": "more models",
 	"gatewaySection": "IM Gateway",

@@ -2243,6 +2243,15 @@
 	"pluginProviderConnectionSection": "连接设置",
 	"pluginProviderConnectionDesc": "非敏感的高级供应商配置由 NarraFork 保存，与插件自己的账号页面分开管理。",
 	"providerConfigDesc": "配置供应商的 API 凭据、模型列表和高级选项。",
+	"autoParticipation": {
+		"label": "用于自动选择来源",
+		"desc": "打开后，选择「自动」的模型可以路由到这个供应商。关闭后，直接点名它的模型仍然可用。",
+		"descServing_one": "目前是 {{count}} 个自动模型的来源。关闭后，直接点名它的模型仍然可用。",
+		"descServing_other": "目前是 {{count}} 个自动模型的来源。关闭后，直接点名它的模型仍然可用。",
+		"stranded_one": "{{models}} 没有其他来源。把它当自动模型使用的会话和设置会无法运行，直到有别的供应商提供它。",
+		"stranded_other": "有 {{count}} 个自动模型没有其他来源（{{models}}）。使用它们的会话和设置会无法运行，直到有别的供应商提供它们。",
+		"excludedBadge": "不参与自动"
+	},
 	"overviewHiddenCount": "{{count}} 个已隐藏",
 	"overviewMoreModels": "更多模型",
 	"gatewaySection": "IM 网关",
