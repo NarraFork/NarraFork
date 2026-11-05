@@ -16,18 +16,13 @@ import { getNavExpandedWidth, startNavResize } from "@frontend/hooks/useResizabl
 import { Box } from "@mantine/core";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useMobileViewport } from "../../hooks/useMobileViewport";
-import { createNavHoverIntent } from "./nav-hover-expand";
+import {
+	createNavHoverIntent,
+	hasVisibleLayer,
+	isOwnedTarget,
+	OPEN_POPUP_SELECTOR,
+} from "./nav-hover-expand";
 import { NavRenderContext, type NavRenderState } from "./nav-render-context";
-
-/**
- * Something open that the pointer may be on while outside the box: a menu opened from
- * the panel, or any Modal / Drawer / Menu / Popover layer (the theme stamps
- * `nf-overlay-layer` on all of them, see lib/mantine-theme.ts). Closing the panel under
- * one would also remount the bell and the workspace switcher, which own them.
- */
-const OPEN_POPUP_SELECTOR = '[aria-haspopup][aria-expanded="true"]';
-/** Also the sidebar's own floating parts: the row menu and the details card. */
-const OPEN_LAYER_SELECTOR = ".nf-overlay-layer, [data-nav-keep-open]";
 
 export function NavHoverPanel({
 	collapsed,
@@ -58,10 +53,7 @@ export function NavHoverPanel({
 				if (pressedRef.current) return true;
 				const focused = document.activeElement;
 				if (focused instanceof HTMLInputElement && panel.contains(focused)) return true;
-				return (
-					panel.querySelector(OPEN_POPUP_SELECTOR) !== null ||
-					document.querySelector(OPEN_LAYER_SELECTOR) !== null
-				);
+				return panel.querySelector(OPEN_POPUP_SELECTOR) !== null || hasVisibleLayer();
 			},
 		}),
 	);
@@ -70,15 +62,29 @@ export function NavHoverPanel({
 		if (!canHover) intent.reset();
 	}, [canHover, intent]);
 	useEffect(() => () => intent.reset(), [intent]);
+	// Safety net: a click on the page itself always closes the open panel, whatever is
+	// holding it (a layer the visibility check misjudges must never pin it open).
+	useEffect(() => {
+		if (!hoverOpen) return;
+		const onPointerDown = (e: PointerEvent) => {
+			const panel = panelRef.current;
+			if (panel && !isOwnedTarget(panel, e.target)) intent.reset();
+		};
+		window.addEventListener("pointerdown", onPointerDown, true);
+		return () => window.removeEventListener("pointerdown", onPointerDown, true);
+	}, [hoverOpen, intent]);
 	useEffect(() => {
 		const release = () => {
 			pressedRef.current = false;
 		};
+		// A release outside the window delivers no pointerup; blur covers it.
 		window.addEventListener("pointerup", release);
 		window.addEventListener("pointercancel", release);
+		window.addEventListener("blur", release);
 		return () => {
 			window.removeEventListener("pointerup", release);
 			window.removeEventListener("pointercancel", release);
+			window.removeEventListener("blur", release);
 		};
 	}, []);
 

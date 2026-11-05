@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { parseHTML } from "linkedom";
 import {
 	createNavHoverIntent,
+	hasVisibleLayer,
 	NAV_HOVER_COLLAPSE_DELAY_MS,
 	NAV_HOVER_EXPAND_DELAY_MS,
 	NAV_HOVER_HOLD_RECHECK_MS,
@@ -109,5 +111,42 @@ describe("collapsed sidebar hover expansion", () => {
 		intent.reset();
 		clock.advance(NAV_HOVER_EXPAND_DELAY_MS);
 		expect(intent.isExpanded()).toBe(false);
+	});
+});
+
+describe("what holds the open panel", () => {
+	/** linkedom has no layout: give elements the box a browser would. */
+	function doc(html: string, shown: string[]) {
+		const { document } = parseHTML(`<!doctype html><html><body>${html}</body></html>`);
+		for (const el of document.querySelectorAll("*")) {
+			const area = shown.some((selector) => el.matches(selector));
+			(el as unknown as { getBoundingClientRect: () => object }).getBoundingClientRect = () => ({
+				width: area ? 100 : 0,
+				height: area ? 40 : 0,
+			});
+		}
+		return document;
+	}
+
+	test("a closed keepMounted menu or drawer does not hold it (the stuck-open bug)", () => {
+		const document = doc(
+			`<div class="nf-overlay-layer" style="display:none"></div>
+			 <div class="nf-overlay-layer"><div class="mantine-Drawer-content" style="display:none"></div></div>`,
+			[],
+		);
+		expect(hasVisibleLayer(document)).toBe(false);
+	});
+
+	test("an open dropdown, drawer or the row menu does", () => {
+		expect(hasVisibleLayer(doc(`<div class="nf-overlay-layer" id="m"></div>`, ["#m"]))).toBe(true);
+		expect(
+			hasVisibleLayer(
+				doc(
+					`<div class="nf-overlay-layer"><div class="mantine-Drawer-content" id="d"></div></div>`,
+					["#d"],
+				),
+			),
+		).toBe(true);
+		expect(hasVisibleLayer(doc(`<div data-nav-keep-open id="c"></div>`, ["#c"]))).toBe(true);
 	});
 });
