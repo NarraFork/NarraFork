@@ -1139,6 +1139,8 @@
 	"contextMenu_copyFileRemote": "只有在运行 NarraFork 的那台电脑上的浏览器里才能复制文件。",
 	"contextMenu_downloadFile": "下载文件",
 	"contextMenu_downloadPopupBlocked": "浏览器拦截了下载标签页。请允许本站弹出窗口后重试。",
+	"contextMenu_revealFile": "在文件资源管理器中显示",
+	"contextMenu_revealFileFailed": "无法打开资源管理器",
 	"contextMenu_copyImage": "复制图片",
 	"contextMenu_copyImagePath": "复制图片文件位置",
 	"contextMenu_saveImageAs": "另存为图片...",
