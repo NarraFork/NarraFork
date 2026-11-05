@@ -2074,10 +2074,10 @@ export function RenderToolBody({
 				publicSummary={model.publicSummary}
 				historyUnavailable={model.historyUnavailable}
 				inline={
-					model.text === undefined
+					model.text === undefined && model.live !== true
 						? undefined
 						: {
-								source: model.text,
+								...(model.text === undefined ? {} : { source: model.text }),
 								live: model.live === true,
 								title: model.title,
 								runtime: model.runtime,

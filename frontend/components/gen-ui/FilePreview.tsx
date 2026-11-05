@@ -12,9 +12,11 @@ import { createPreviewShell, readPreviewTheme } from "./preview-shell";
 export function FilePreview({
 	narratorId,
 	file,
+	formToolUseId,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
+	formToolUseId?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -45,6 +47,7 @@ export function FilePreview({
 						title={file.title}
 						failureMessage={t("genUi.renderFailed")}
 						height="65dvh"
+						formToolUseId={formToolUseId}
 					/>
 				</>
 			) : (
@@ -65,10 +68,12 @@ export function AppFrame({
 	narratorId,
 	file,
 	height,
+	formToolUseId,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	height: number;
+	formToolUseId?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -101,6 +106,7 @@ export function AppFrame({
 			title={file.title}
 			failureMessage={t("genUi.renderFailed")}
 			height={height}
+			formToolUseId={formToolUseId}
 		/>
 	);
 }
@@ -120,12 +126,15 @@ function PreviewFrame({
 	title,
 	failureMessage,
 	height,
+	formToolUseId,
 }: {
 	narratorId: string;
 	bundle: PreviewBundle;
 	title: string;
 	failureMessage: string;
 	height: number | string;
+	/** Set while a render({path}) call waits for this app's submit as its tool result. */
+	formToolUseId?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	// An app is code the agent wrote, running in the reader's session: nothing it sends
@@ -156,7 +165,13 @@ function PreviewFrame({
 		const onNavigation = (event: MessageEvent) => {
 			if (event.source !== frame.current?.contentWindow) return;
 			if (event.data?.type === "narrafork:preview-left") setNavigated(true);
-			const data = event.data as { type?: unknown; action?: unknown; value?: unknown } | null;
+			const data = event.data as {
+				type?: unknown;
+				action?: unknown;
+				value?: unknown;
+				fields?: unknown;
+				message?: unknown;
+			} | null;
 			if (
 				data?.type === "narrafork:ui-action" &&
 				typeof data.value === "string" &&
@@ -171,6 +186,23 @@ function PreviewFrame({
 					setRequest({ kind: "link", text: url });
 				} else if (data.action === "sendPrompt" || data.action === "submit") {
 					pending.current = true;
+					// A render({path}) call waits for exactly this submit, so it becomes the
+					// tool result. Only a call that already ended falls back to a chat message.
+					if (data.action === "submit" && formToolUseId && data.fields && typeof data.fields === "object") {
+						void (async () => {
+							const client = await import("./kit-client");
+							const delivered = await client.answerGenUiForm(narratorId, formToolUseId, {
+								status: "submitted",
+								message: typeof data.message === "string" ? data.message : text,
+								fields: data.fields as Record<string, unknown>,
+							});
+							if (delivered === "not-waiting") setRequest({ kind: "prompt", text });
+							else pending.current = false;
+						})().catch(() => {
+							pending.current = false;
+						});
+						return;
+					}
 					setRequest({ kind: "prompt", text });
 				}
 			}
@@ -184,7 +216,7 @@ function PreviewFrame({
 			window.removeEventListener("message", onNavigation);
 			unsubscribe();
 		};
-	}, [navigated]);
+	}, [navigated, formToolUseId, narratorId]);
 	const done = () => {
 		pending.current = false;
 		setRequest(null);

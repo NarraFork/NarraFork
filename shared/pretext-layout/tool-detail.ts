@@ -14,7 +14,7 @@
  */
 
 import { toolOutputImages } from "../agent-protocol/tool-output";
-import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
+import { GEN_UI_ENTRY, type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
 import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
@@ -944,20 +944,24 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 	const uiUnusable = isFailStatus(status) || status === "denied" || status === "cancelled";
 	// `render` carries its UI in its own input, so the card exists from the first streamed
 	// chunk.
+	// A render({path}) app draws from the call's own arguments as well: its card has to
+	// exist before the result, because the call is what waits for the reader.
+	const ui = uiInput ?? {};
+	const renderPath = ui.action === "render" && typeof ui.path === "string" ? ui.path : undefined;
 	const uiInline: ToolDetailData | null =
-		typeof uiInput?.source === "string" &&
-		(uiInput.action === undefined || uiInput.action === "render") &&
+		(typeof ui.source === "string" || renderPath !== undefined) &&
+		(ui.action === undefined || ui.action === "render") &&
 		!uiUnusable
 			? single("gen-ui", {
 					kind: "gen-ui",
-					file: null,
-					text: uiInput.source,
-					contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiInput.size)],
-					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
+					file: renderPath ? liveAppFile(renderPath, ui, input) : null,
+					text: typeof ui.source === "string" ? ui.source : undefined,
+					contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(ui.size)],
+					...(typeof ui.title === "string" ? { title: ui.title.slice(0, 80) } : {}),
 					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
 					...uiKitFields,
 					...(typeof input.toolUseId === "string" ? { stateKey: input.toolUseId } : {}),
-					...(uiInput.wait === true &&
+					...(ui.wait === true &&
 					status != null &&
 					!isTerminalToolStatus(status) &&
 					typeof input.toolUseId === "string"
@@ -1005,6 +1009,29 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			...part,
 			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
 		})),
+	};
+}
+
+/**
+ * The card of a render({path}) that has not returned yet. Only the two ids reach the
+ * preview URL; the rest of the reference is resolved server-side from the call itself.
+ */
+function liveAppFile(
+	directory: string,
+	uiInput: Record<string, unknown> | undefined,
+	input: { toolUseId?: unknown; toolCallId?: unknown },
+): GenUiFileReference | null {
+	if (typeof input.toolUseId !== "string") return null;
+	return {
+		version: 1,
+		toolUseId: input.toolUseId,
+		toolCallId: typeof input.toolCallId === "string" ? input.toolCallId : input.toolUseId,
+		deviceId: "",
+		workspaceKey: "",
+		cwd: "",
+		directory,
+		entry: GEN_UI_ENTRY,
+		title: typeof uiInput?.title === "string" ? uiInput.title.slice(0, 80) : "",
 	};
 }
 
