@@ -5,6 +5,7 @@
 import {
 	type AutoCandidateInput,
 	autoCandidates,
+	autoModelValue,
 	parseAutoModelValue,
 } from "@shared/auto-model";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
@@ -571,6 +572,13 @@ function expandModelReferenceForMatching(
 		return values;
 	}
 
+	// auto:<model> stands for every provider model that may serve it.
+	const autoId = autoModelIdOf(normalized);
+	if (autoId) {
+		for (const value of listAutoModelCandidates(autoId)) values.add(value);
+		return values;
+	}
+
 	const agg = parseAggModelValue(normalized);
 	if (!agg) return values;
 
@@ -778,7 +786,7 @@ export function getVisibleModels(): string[] {
  * Unknown cache state remains visible for compatibility with legacy gateways.
  */
 export function getSubagentVisibleModels(): string[] {
-	return getVisibleModels().filter((model) => {
+	const concrete = getVisibleModels().filter((model) => {
 		const colon = model.indexOf(":");
 		if (colon <= 0) return true;
 		const prefix = model.slice(0, colon);
@@ -787,6 +795,9 @@ export function getSubagentVisibleModels(): string[] {
 		const nugModelId = model.slice(colon + 1);
 		return isNugCachedModelAvailable(config.id, nugModelId) !== false;
 	});
+	// Every auto:<model> some provider serves now, so subagents may name it and pools may hold it.
+	const auto = legacyAutoPrefixInUse() ? [] : listAutoModelIds().map(autoModelValue);
+	return [...auto, ...concrete];
 }
 
 // ---------------------------------------------------------------------------

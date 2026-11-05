@@ -805,7 +805,7 @@ describe("TokenDance backend", () => {
 		expect(JSON.stringify(service.getTokenDanceConnection())).not.toContain("secret-never-return");
 		const source = readFileSync(new URL("../routes/settings.ts", import.meta.url), "utf8");
 		expect(source).toContain("tokendance: getTokenDanceConnection()");
-		expect(source).toContain('new Set(["codex", "tokendance"])');
+		expect(source).toContain('new Set(["codex", "tokendance", "auto"])');
 	});
 	test.each([
 		"not-a-url",

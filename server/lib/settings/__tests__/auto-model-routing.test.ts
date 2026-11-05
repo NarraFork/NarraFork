@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	AutoModelUnavailableError,
+	expandAllowedPoolForDisplay,
+	getSubagentVisibleModels,
 	listAutoModelCandidates,
 	listAutoModelIds,
+	resolveAllowedModelCandidateMatch,
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
@@ -111,6 +114,25 @@ describe("auto model routing", () => {
 		// An unservable summary model follows the default, like an empty aggregation does.
 		settings.agent.summaryModel = "auto:no-such-model";
 		expect(resolveEffectiveModel("__summary__")).toBe("provA:claude-opus-4-6");
+	});
+
+	test("subagents see auto values, and a pool entry admits the providers that serve it", () => {
+		const visible = getSubagentVisibleModels();
+		expect(visible).toContain("auto:claude-opus-4-6");
+		expect(visible).toContain("provA:claude-opus-4-6");
+		expect(visible).not.toContain("auto:private-model-x");
+
+		const pool = ["auto:claude-opus-4-6"];
+		expect(resolveAllowedModelCandidateMatch("auto:claude-opus-4-6", pool)?.model).toBe(
+			"auto:claude-opus-4-6",
+		);
+		expect(resolveAllowedModelCandidateMatch("provB:claude-opus-4.6", pool)?.model).toBe(
+			"provB:claude-opus-4.6",
+		);
+		expect(resolveAllowedModelCandidateMatch("provC:claude-opus-4-6-20260101", pool)).toBeNull();
+		expect(expandAllowedPoolForDisplay(pool)).toEqual([
+			"auto:claude-opus-4-6 (currently provA:claude-opus-4-6, provB:claude-opus-4.6)",
+		]);
 	});
 
 	test("an existing provider prefixed `auto` keeps its values until renamed", () => {
