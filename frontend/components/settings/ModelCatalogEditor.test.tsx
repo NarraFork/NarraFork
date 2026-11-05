@@ -293,7 +293,7 @@ describe("real catalog editor form", () => {
 			},
 		});
 	});
-	test("new bindings keep an exact selected variant and opaque connection scope", async () => {
+	test("binding 只保留协议编辑，不再写连接标识与模型资料", async () => {
 		await render(false, {
 			kind: "binding",
 			id: "connection-a",
@@ -305,20 +305,11 @@ describe("real catalog editor form", () => {
 				channelId: "channel-a",
 			},
 		});
+		// 连接标识与资料那六个输入框已经从入口移除，只剩协议与一句说明。
+		expect(document.body.textContent).toContain("edits the protocol only");
 		await click(button("Save"));
 		await waitFor(() => closed === 1);
-		expect(mutations[0]).toEqual({
-			baseRevision: 7,
-			action: "upsert-binding",
-			binding: {
-				id: "connection-a",
-				upstreamModelId: "opaque:model:unchanged",
-				providerId: "provider-a",
-				channelId: "channel-a",
-				variantId: "selected-variant",
-				overrides: {},
-			},
-		});
+		expect(mutations).toEqual([]);
 	});
 	test("blanking a price is invalid, not a free price or an inherited value", async () => {
 		await render();
