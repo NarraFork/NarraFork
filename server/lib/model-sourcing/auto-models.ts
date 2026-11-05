@@ -22,7 +22,7 @@ export function listAutoModels(nameOf: (modelId: string) => string | undefined):
 			name: nameOf(modelId) ?? modelId,
 			sources: orderedAutoModelCandidates(modelId).map((value) => {
 				const provider = parseModelId(value).provider as string;
-				return { value, provider, ...autoSourceFacts(provider, now) };
+				return { value, provider, ...autoSourceFacts(provider, now, value) };
 			}),
 		}))
 		.filter((model) => model.sources.length > 0)

@@ -6,12 +6,14 @@
  * - Custom API providers with keys (Kimi Code, OpenCode Go and other relays): available while
  *   some enabled key is neither out of allowance nor resting after a 403; a short 429 rest does
  *   not count. A subscription when it is a Kimi Code or OpenCode Go plan.
+ * - NUG: unavailable while the gateway model is recorded as down (nug-model-availability).
  * - Everything else: available, pay-per-use. Their own errors still surface on the request.
  *
  * All reads are in memory; nothing here touches the network or the database.
  */
 import { getCodexManager } from "../codex-manager";
 import { isKimiCustomApiProvider } from "../kimi-usage-cache";
+import { resolveKnownUnavailableNugModel } from "../nug-model-availability";
 import { isOpencodeCustomApiProvider } from "../opencode-usage-cache";
 import { getProviderKeyStore } from "../provider-keys";
 import { registerAutoSourceProbe, settings } from "../settings";
@@ -23,10 +25,18 @@ function keyCanServe(keyId: string, now: number): boolean {
 	return reason === undefined || reason === "rate_limited";
 }
 
+/**
+ * @param value The full `<prefix>:<model>` value, when known. NUG availability is per gateway
+ *   model (one channel can be down while another serves), so without it NUG counts as able.
+ */
 export function autoSourceFacts(
 	provider: string,
 	now = Date.now(),
+	value?: string,
 ): { available: boolean; subscription: boolean } {
+	if (value && resolveKnownUnavailableNugModel(value, provider)) {
+		return { available: false, subscription: false };
+	}
 	if (provider === "codex") {
 		// `availableCount` is a pure in-memory read; `hasAvailableCredentials` may revive
 		// accounts and rewrite the credentials file, which must not happen while routing.
@@ -53,5 +63,5 @@ let installed = false;
 export function installAutoRouteSignals(): void {
 	if (installed) return;
 	installed = true;
-	registerAutoSourceProbe((provider) => autoSourceFacts(provider));
+	registerAutoSourceProbe((provider, value) => autoSourceFacts(provider, Date.now(), value));
 }

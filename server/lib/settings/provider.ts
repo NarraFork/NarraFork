@@ -329,7 +329,11 @@ export function listAutoModelCandidates(modelId: string): string[] {
  * the key pool and usage caches that this settings module must not import. Without it every
  * source counts as available and pay-per-use.
  */
-export type AutoSourceProbe = (provider: string) => { available: boolean; subscription: boolean };
+/** `value` is the full `<prefix>:<model>` candidate (NUG availability is per gateway model). */
+export type AutoSourceProbe = (
+	provider: string,
+	value?: string,
+) => { available: boolean; subscription: boolean };
 let autoSourceProbe: AutoSourceProbe | null = null;
 export function registerAutoSourceProbe(probe: AutoSourceProbe | null): void {
 	autoSourceProbe = probe;
@@ -383,7 +387,7 @@ export function orderedAutoModelCandidates(modelId: string): string[] {
 	return orderAutoCandidates(
 		candidates.map((value) => {
 			const provider = parseModelId(value).provider as string;
-			const facts = autoSourceProbe?.(provider) ?? { available: true, subscription: false };
+			const facts = autoSourceProbe?.(provider, value) ?? { available: true, subscription: false };
 			const price = referencePricePerMillion(value);
 			return {
 				value,
@@ -439,7 +443,11 @@ export function resolveAutoModel(modelId: string, stickyProvider?: string): stri
 	if (stickyProvider) {
 		const sticky = candidates.find((value) => parseModelId(value).provider === stickyProvider);
 		const limited = inputLimitedCandidates(candidates);
-		if (sticky && !limited.has(sticky) && (autoSourceProbe?.(stickyProvider).available ?? true)) {
+		if (
+			sticky &&
+			!limited.has(sticky) &&
+			(autoSourceProbe?.(stickyProvider, sticky).available ?? true)
+		) {
 			return sticky;
 		}
 	}
