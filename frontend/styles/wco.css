@@ -81,6 +81,49 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 }
 
 /*
+ * Pages whose top edge is already a row of headers (the session page) are the title bar
+ * themselves instead of sitting under the empty strip: `data-nf-wco-titlebar` on the
+ * page root pulls it up over the strip, and `useWcoTitlebarRows` (lib/wco-titlebar.ts)
+ * marks the headers that touch the top edge. Those headers grow to the overlay height,
+ * drag the window from their blank area, and the one at the right edge stays clear of
+ * the window buttons (the left edge too, for buttons on the left over a collapsed rail).
+ */
+@media (min-width: 48em) {
+	html[data-nf-wco] .nf-app-shell-main:has([data-nf-wco-titlebar]) .nf-wco-main-strip {
+		display: none;
+	}
+
+	html[data-nf-wco] [data-nf-titlebar-row] {
+		-webkit-app-region: drag;
+		min-height: var(--nf-wco-strip-height);
+		height: auto;
+	}
+
+	html[data-nf-wco] .dv-tabs-and-actions-container[data-nf-titlebar-row] {
+		height: var(--nf-wco-strip-height);
+	}
+
+	html[data-nf-wco]
+		[data-nf-titlebar-row]
+		:is(button, a, input, select, textarea, [role="button"], [role="tab"], .dv-tab) {
+		-webkit-app-region: no-drag;
+	}
+
+	/* The headers set their padding inline (narrator header, panel headers), hence the
+	   overrides; only the edge rows under the window buttons are affected. */
+	html[data-nf-wco="right"] [data-nf-titlebar-end] {
+		/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
+		padding-inline-end: calc(var(--nf-wco-inset-right) + 8px) !important;
+	}
+
+	html[data-nf-wco="left"] [data-nf-titlebar-start] {
+		--nf-titlebar-start-pad: calc(var(--nf-wco-inset-left) - var(--app-shell-navbar-width, 0px));
+		/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
+		padding-inline-start: max(8px, calc(var(--nf-titlebar-start-pad) + 8px)) !important;
+	}
+}
+
+/*
  * Buttons on the left: push the navbar content below the traffic lights. The
  * spacer doubles as drag surface, so the strip next to the lights still moves
  * the window. Hidden in every other mode.

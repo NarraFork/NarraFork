@@ -74,6 +74,7 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../lib/safe-area";
+import { useWcoTitlebarRows } from "../../lib/wco-titlebar";
 
 export const Route = createFileRoute("/narrators/$narratorId")({
 	component: NarratorDetailPage,
@@ -485,6 +486,9 @@ function NarratorDetailPage() {
 	const mergedRef = useCallback((el: HTMLDivElement | null) => {
 		pageBoxRef.current = el;
 	}, []);
+	// The page root only mounts once the narrator has loaded (the skeleton is returned
+	// before it), so the title-bar marks start then.
+	useWcoTitlebarRows(pageBoxRef, !isMobile && !narratorLoading && !!narrator);
 
 	if (narratorLoading)
 		return (
@@ -534,6 +538,8 @@ function NarratorDetailPage() {
 		>
 			<Box
 				ref={mergedRef}
+				// Desktop WCO: this page's top row of headers is the window title bar.
+				data-nf-wco-titlebar={!isMobile || undefined}
 				h={APP_SHELL_FULL_BLEED_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"
