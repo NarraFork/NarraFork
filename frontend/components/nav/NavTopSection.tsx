@@ -13,10 +13,12 @@ import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useBranding } from "../../hooks/useBranding";
+import { useMobileViewport } from "../../hooks/useMobileViewport";
 import { requestDashboardComposerFocus } from "../../lib/dashboard-composer-focus";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "../../lib/use-match-media";
 import { BrandTitle } from "../common/BrandTitle";
 import { NotificationBell } from "../notifications/NotificationBell";
+import { HeaderPullToRefresh } from "./HeaderPullToRefresh";
 import {
 	requestNavSearchFocus,
 	subscribeNavSearchFocus,
@@ -172,6 +174,9 @@ export function NavTopSection({
 	const { t } = useTranslation("nav");
 	const { collapsed, storedCollapsed, openPanel } = useNavRender();
 	useNavSearchShortcut(openPanel);
+	const brandRowRef = useRef<HTMLDivElement>(null);
+	const isMobile = useMobileViewport();
+	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 
 	if (collapsed) {
 		return (
@@ -199,7 +204,18 @@ export function NavTopSection({
 	}
 	return (
 		<Stack gap={6} mb={6}>
-			<Group justify="space-between" wrap="nowrap" gap={4} className="nf-nav-brand-row" px={4}>
+			<Group
+				ref={brandRowRef}
+				justify="space-between"
+				wrap="nowrap"
+				gap={4}
+				className="nf-nav-brand-row"
+				px={4}
+				pos="relative"
+			>
+				{/* Phones: pull down here to reload the app (the header row it lived on is
+				    gone; this is the drawer's top edge, which never scrolls). */}
+				<HeaderPullToRefresh targetRef={brandRowRef} enabled={isMobile && isTouch} />
 				<Tooltip
 					label={t(storedCollapsed ? "expandSidebar" : "collapseSidebar")}
 					position="right"

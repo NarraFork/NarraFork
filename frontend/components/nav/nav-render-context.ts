@@ -29,6 +29,22 @@ export function useNavRender(): NavRenderState {
 	return useContext(NavRenderContext);
 }
 
+// ── The phone drawer ───────────────────────────────────────────────────────
+//
+// Phones have no header row, so the menu button lives in each page's own title row
+// (`MobileNavButton`). This context hands it the drawer's toggle.
+
+export interface MobileNavState {
+	opened: boolean;
+	toggle: () => void;
+}
+
+export const MobileNavContext = createContext<MobileNavState | null>(null);
+
+export function useMobileNav(): MobileNavState | null {
+	return useContext(MobileNavContext);
+}
+
 // ── "Focus the sidebar search box" ─────────────────────────────────────────
 //
 // The box may not be mounted yet (the rail is collapsed and is about to open), so the

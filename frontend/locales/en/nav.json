@@ -26,6 +26,7 @@
 	"newNarrator": "New narrator",
 	"newSession": "New session",
 	"allSessions": "All sessions",
+	"openNavigation": "Open navigation",
 	"noRecentTabs": "No recent tabs",
 	"closeTab": "Close tab",
 	"workspaceTreeUpdateFailed": "Failed to update workspace layout",

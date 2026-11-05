@@ -1,3 +1,4 @@
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import {
 	Alert,
 	Button,
@@ -253,7 +254,10 @@ function SearchPage() {
 
 	return (
 		<Stack>
-			<Title order={2}>{t("title")}</Title>
+			<Group gap="xs" wrap="nowrap">
+				<MobileNavButton />
+				<Title order={2}>{t("title")}</Title>
+			</Group>
 			{request.q ? (
 				<Text c="dimmed" size="sm">
 					{t("resultsFor", { query: request.q })}

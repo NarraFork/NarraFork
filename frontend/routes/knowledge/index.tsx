@@ -7,6 +7,8 @@
  * Legacy tab URLs redirect in `beforeLoad` (§4.2): `?tab=review[&submission=<id>]` → inbox /
  * request page, `?tab=mylibrary` → `/knowledge/mine`, `?tab=admin` → `/knowledge/admin`.
  */
+
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import { Badge, Button, Container, Group, Menu, Stack, Text, Title, Tooltip } from "@mantine/core";
 import {
 	IconChevronDown,
@@ -58,7 +60,10 @@ function KnowledgePage() {
 		<Container size="xl" py="lg">
 			<Group justify="space-between" align="flex-start" mb="md" wrap="wrap">
 				<Stack gap={4}>
-					<Title order={2}>{t("title")}</Title>
+					<Group gap="xs" wrap="nowrap">
+						<MobileNavButton />
+						<Title order={2}>{t("title")}</Title>
+					</Group>
 					<Text size="sm" c="dimmed">
 						{t("subtitle")}
 					</Text>

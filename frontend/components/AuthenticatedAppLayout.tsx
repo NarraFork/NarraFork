@@ -1,22 +1,11 @@
 import { toggleNavCollapsed, useNavCollapsed, useNavWidth } from "@frontend/hooks/useResizableNav";
 import type { AppShellProps } from "@mantine/core";
-import {
-	AppShell,
-	Box,
-	Burger,
-	Button,
-	Center,
-	Group,
-	Loader,
-	Modal,
-	Text,
-	Tooltip,
-} from "@mantine/core";
-import { useDisclosure, useMediaQuery } from "@mantine/hooks";
+import { AppShell, Box, Button, Center, Group, Loader, Modal, Text, Tooltip } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowLeft } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { Navigate, Outlet, useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
@@ -49,6 +38,7 @@ import {
 	APP_SHELL_MAIN_PADDING_BOTTOM,
 	APP_SHELL_MOBILE_NAVBAR_HEIGHT,
 	APP_SHELL_SAFE_HEADER_STYLE,
+	APP_SHELL_WIZARD_HEADER_HEIGHTS,
 	APP_VIEWPORT_BOTTOM,
 	appShellNavbarBottomGutter,
 	installAppViewportTracking,
@@ -57,17 +47,16 @@ import {
 } from "../lib/safe-area";
 import { installThemeColorSync } from "../lib/theme-color-sync";
 import { installWcoTracking } from "../lib/wco";
-import { BrandTitle } from "./common/BrandTitle";
 import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { RoutePendingIndicator } from "./common/RouteChunkErrorBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
-import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
+import { MobileNavFallback } from "./nav/MobileNavButton";
 import { NavBottomBar } from "./nav/NavBottomBar";
 import { NavHoverPanel } from "./nav/NavHoverPanel";
 import { NavTopSection } from "./nav/NavTopSection";
+import { MobileNavContext } from "./nav/nav-render-context";
 import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
-import { NotificationBell } from "./notifications/NotificationBell";
 import { PluginPermissionRequestHost } from "./plugins-admin/PluginPermissionRequestHost";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
 import { SystemMaintenanceBadge } from "./SystemMaintenanceBadge";
@@ -185,12 +174,8 @@ function AppShellWithNavWidth({
 
 export function AuthenticatedLayout() {
 	const [opened, { toggle, open: openNav, close: closeNav }] = useDisclosure();
-	// Touch/pen input only: a mouse drag across the header must keep collapsing
-	// the sidebar rather than arming a reload gesture.
-	const isTouchPointer = useMediaQuery("(pointer: coarse)", false, {
-		getInitialValueInEffect: false,
-	});
-	const headerRef = useRef<HTMLElement>(null);
+	// Phones have no header row; each page's title row renders the menu button from this.
+	const mobileNav = useMemo(() => ({ opened, toggle }), [opened, toggle]);
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
 	const navigate = useNavigate();
 	const { t } = useTranslation("nav");
@@ -372,236 +357,225 @@ export function AuthenticatedLayout() {
 	const navbarBottomGutter = appShellNavbarBottomGutter(
 		wizardOpen ? "0px" : navCollapsed ? "4px" : "var(--mantine-spacing-md)",
 	);
+	// Phone only (the bar is `hiddenFrom="sm"`): the wizard's drawer was closed to look at
+	// the page, and the header becomes the bar that brings it back.
+	const wizardReturnBar = wizardOpen && !opened;
 
 	return (
-		<AppShellWithNavWidth
-			className={APP_SHELL_CLASSNAME}
-			layout="alt"
-			header={{ height: APP_SHELL_HEADER_HEIGHTS }}
-			// Only the wrapper subscribes to settled width and threshold crossings;
-			// ordinary drag frames bypass React (see AppShellWithNavWidth).
-			navbar={{
-				breakpoint: "sm",
-				collapsed: { mobile: !opened },
-			}}
-			wizardWidth={wizardOpen ? "min(420px, 100vw)" : undefined}
-			padding="md"
-		>
-			<MobileNavbarEffects
-				wizardOpen={wizardOpen}
-				opened={opened}
-				openNav={openNav}
-				closeNav={closeNav}
-			/>
-			<AppShell.Header ref={headerRef} style={APP_SHELL_SAFE_HEADER_STYLE}>
-				<HeaderPullToRefresh targetRef={headerRef} enabled={isTouchPointer && !wizardOpen} />
-				{wizardOpen && !opened && (
-					<Button
-						hiddenFrom="sm"
-						fullWidth
-						h="100%"
-						radius={0}
-						variant="light"
-						leftSection={<IconArrowLeft size={18} />}
-						onClick={openNav}
-					>
-						{ts("wizardReturn")}
-					</Button>
-				)}
-				{/* Phones only: on desktop everything in this row lives in the sidebar. While the
-				    wizard holds the drawer closed, its return button replaces the row. */}
-				{!(wizardOpen && !opened) && (
-					<Group
-						h="100%"
-						px="md"
-						justify="space-between"
-						wrap="nowrap"
-						className="nf-header-row"
-						hiddenFrom="sm"
-					>
-						<Group wrap="nowrap" className="nf-header-side">
-							<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-							<BrandTitle order={3} hiddenFrom="sm" />
-						</Group>
-						{/* Phones keep the bell here: the sidebar is a drawer they have to open. */}
-						<Group wrap="nowrap" className="nf-header-side">
-							<NotificationBell />
-						</Group>
-					</Group>
-				)}
-			</AppShell.Header>
-
-			<AppShell.Navbar
-				top={{ base: APP_SHELL_HEADER_OFFSET, sm: SAFE_AREA_INSET_TOP }}
-				h={{
-					base: APP_SHELL_MOBILE_NAVBAR_HEIGHT,
-					sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
+		<MobileNavContext.Provider value={mobileNav}>
+			<AppShellWithNavWidth
+				className={APP_SHELL_CLASSNAME}
+				layout="alt"
+				header={{
+					height: wizardReturnBar ? APP_SHELL_WIZARD_HEADER_HEIGHTS : APP_SHELL_HEADER_HEIGHTS,
 				}}
-				// `px`/`pt` rather than `p`: the bottom gutter is the `data-safe-area` spacer
-				// below, and a symmetric `p` here would stack under it — the same
-				// inset-plus-spacing double reservation APP_SHELL_MAIN_PADDING_BOTTOM removed
-				// from Main (measured 50px where 34px was intended). Splitting the sides out
-				// keeps one owner per edge instead of relying on `p`/`pb` precedence.
-				px={navbarPadding}
-				pt={navbarPadding}
-				style={{
-					display: "flex",
-					flexDirection: "column",
-					isolation: "isolate",
-					transition: "padding 150ms ease",
+				// Only the wrapper subscribes to settled width and threshold crossings;
+				// ordinary drag frames bypass React (see AppShellWithNavWidth).
+				navbar={{
+					breakpoint: "sm",
+					collapsed: { mobile: !opened },
 				}}
+				wizardWidth={wizardOpen ? "min(420px, 100vw)" : undefined}
+				padding="md"
 			>
-				<RecentTabsWSProvider />
-				{/* WCO (buttons left, e.g. macOS): pushes nav content below the traffic
+				<MobileNavbarEffects
+					wizardOpen={wizardOpen}
+					opened={opened}
+					openNav={openNav}
+					closeNav={closeNav}
+				/>
+				{/* No header row at any width (see APP_SHELL_HEADER_HEIGHTS): the element only
+			    owns the top inset, plus the wizard's phone return bar. */}
+				<AppShell.Header style={APP_SHELL_SAFE_HEADER_STYLE}>
+					{wizardReturnBar && (
+						<Button
+							hiddenFrom="sm"
+							fullWidth
+							h="100%"
+							radius={0}
+							variant="light"
+							leftSection={<IconArrowLeft size={18} />}
+							onClick={openNav}
+						>
+							{ts("wizardReturn")}
+						</Button>
+					)}
+				</AppShell.Header>
+
+				<AppShell.Navbar
+					top={{ base: APP_SHELL_HEADER_OFFSET, sm: SAFE_AREA_INSET_TOP }}
+					h={{
+						base: APP_SHELL_MOBILE_NAVBAR_HEIGHT,
+						sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
+					}}
+					// `px`/`pt` rather than `p`: the bottom gutter is the `data-safe-area` spacer
+					// below, and a symmetric `p` here would stack under it — the same
+					// inset-plus-spacing double reservation APP_SHELL_MAIN_PADDING_BOTTOM removed
+					// from Main (measured 50px where 34px was intended). Splitting the sides out
+					// keeps one owner per edge instead of relying on `p`/`pb` precedence.
+					px={navbarPadding}
+					pt={navbarPadding}
+					style={{
+						display: "flex",
+						flexDirection: "column",
+						isolation: "isolate",
+						transition: "padding 150ms ease",
+					}}
+				>
+					<RecentTabsWSProvider />
+					{/* WCO (buttons left, e.g. macOS): pushes nav content below the traffic
 				    lights and doubles as drag surface. display:none everywhere else —
 				    see styles/wco.css. */}
-				<Box className="nf-wco-nav-spacer" aria-hidden />
-				{wizardOpen ? (
-					// The wizard replaces the navbar contents, so a failed chunk here used to
-					// take down the shell that hosts it and leave no way to navigate.
-					<LazyOverlayBoundary resetKey={wizardOpen} label={ts("wizardTitle")}>
-						<Suspense fallback={null}>
-							<SetupWizard
-								initialStep={wizardInitialStep}
-								onClose={() => {
-									setWizardOpen(false);
-									setWizardInitialStep(undefined);
-									closeNav();
-								}}
-							/>
-						</Suspense>
-					</LazyOverlayBoundary>
-				) : (
-					<NavHoverPanel
-						collapsed={navCollapsed}
-						expandedPadding="var(--mantine-spacing-md)"
-						expandedBottomGutter={appShellNavbarBottomGutter("var(--mantine-spacing-md)")}
-					>
-						<NavTopSection
-							onToggleCollapsed={toggleNavCollapsed}
-							onNavigate={closeNav}
-							statusBadges={
-								<>
-									<SystemMaintenanceBadge />
-									<UpdateBadge />
-									{requestEvidencePinning && (
-										<Tooltip
-											label={t(
-												requestEvidenceAutoPin === "errors"
-													? "requestEvidenceErrorsTooltip"
-													: "requestEvidenceAllTooltip",
-											)}
-											position="right"
-											withArrow
-										>
-											<Button
-												variant="light"
-												color="orange"
-												size="compact-xs"
-												leftSection={<IconAlertTriangle size={12} />}
-												onClick={openRequestEvidenceSetting}
-												style={{ flexShrink: 0 }}
+					<Box className="nf-wco-nav-spacer" aria-hidden />
+					{wizardOpen ? (
+						// The wizard replaces the navbar contents, so a failed chunk here used to
+						// take down the shell that hosts it and leave no way to navigate.
+						<LazyOverlayBoundary resetKey={wizardOpen} label={ts("wizardTitle")}>
+							<Suspense fallback={null}>
+								<SetupWizard
+									initialStep={wizardInitialStep}
+									onClose={() => {
+										setWizardOpen(false);
+										setWizardInitialStep(undefined);
+										closeNav();
+									}}
+								/>
+							</Suspense>
+						</LazyOverlayBoundary>
+					) : (
+						<NavHoverPanel
+							collapsed={navCollapsed}
+							expandedPadding="var(--mantine-spacing-md)"
+							expandedBottomGutter={appShellNavbarBottomGutter("var(--mantine-spacing-md)")}
+						>
+							<NavTopSection
+								onToggleCollapsed={toggleNavCollapsed}
+								onNavigate={closeNav}
+								statusBadges={
+									<>
+										<SystemMaintenanceBadge />
+										<UpdateBadge />
+										{requestEvidencePinning && (
+											<Tooltip
+												label={t(
+													requestEvidenceAutoPin === "errors"
+														? "requestEvidenceErrorsTooltip"
+														: "requestEvidenceAllTooltip",
+												)}
+												position="right"
+												withArrow
 											>
-												{t("requestEvidencePinningBadge")}
-											</Button>
-										</Tooltip>
-									)}
-									<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
-								</>
-							}
-						/>
-						<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }} className="nf-nav-tabs">
-							<RecentTabList filter="narrator" onNavigate={closeNav} />
-						</Box>
-						<NavBottomBar
-							entries={navEntries}
-							visibleItems={navVisibleItems}
-							onSaveLayout={saveNavLayout}
-							onLogout={openLogout}
-						/>
-					</NavHoverPanel>
-				)}
-				{/*
-				 * The Navbar's sole bottom gutter: home-indicator clearance where there is an
-				 * inset, the state's ordinary padding where there is not. `max()`, not a sum,
-				 * for the reason APP_SHELL_MAIN_PADDING_BOTTOM documents — this box used to be
-				 * the inset alone and sat on top of the Navbar's symmetric `p`, reserving the
-				 * strip twice (measured 50px of gutter for a 34px indicator).
-				 */}
-				<Box
-					aria-hidden
-					data-safe-area="bottom"
-					h={navbarBottomGutter}
-					mih={navbarBottomGutter}
-					style={{ flexShrink: 0, backgroundColor: "var(--mantine-color-body)" }}
-				/>
-			</AppShell.Navbar>
+												<Button
+													variant="light"
+													color="orange"
+													size="compact-xs"
+													leftSection={<IconAlertTriangle size={12} />}
+													onClick={openRequestEvidenceSetting}
+													style={{ flexShrink: 0 }}
+												>
+													{t("requestEvidencePinningBadge")}
+												</Button>
+											</Tooltip>
+										)}
+										<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
+									</>
+								}
+							/>
+							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }} className="nf-nav-tabs">
+								<RecentTabList filter="narrator" onNavigate={closeNav} />
+							</Box>
+							<NavBottomBar
+								entries={navEntries}
+								visibleItems={navVisibleItems}
+								onSaveLayout={saveNavLayout}
+								onLogout={openLogout}
+							/>
+						</NavHoverPanel>
+					)}
+					{/*
+					 * The Navbar's sole bottom gutter: home-indicator clearance where there is an
+					 * inset, the state's ordinary padding where there is not. `max()`, not a sum,
+					 * for the reason APP_SHELL_MAIN_PADDING_BOTTOM documents — this box used to be
+					 * the inset alone and sat on top of the Navbar's symmetric `p`, reserving the
+					 * strip twice (measured 50px of gutter for a 34px indicator).
+					 */}
+					<Box
+						aria-hidden
+						data-safe-area="bottom"
+						h={navbarBottomGutter}
+						mih={navbarBottomGutter}
+						style={{ flexShrink: 0, backgroundColor: "var(--mantine-color-body)" }}
+					/>
+				</AppShell.Navbar>
 
-			<AppShell.Main
-				id={APP_SHELL_MAIN_ID}
-				className={APP_SHELL_MAIN_CLASSNAME}
-				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
-			>
-				{/* WCO on desktop: the title-bar strip over the page, and its drag surface
+				<AppShell.Main
+					id={APP_SHELL_MAIN_ID}
+					className={APP_SHELL_MAIN_CLASSNAME}
+					style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
+				>
+					{/* Phones: the drawer's menu button for pages whose title row has none. */}
+					<MobileNavFallback />
+					{/* WCO on desktop: the title-bar strip over the page, and its drag surface
 				    (there is no header row). display:none everywhere else, see wco.css. */}
-				<Box className="nf-wco-main-strip" aria-hidden />
+					<Box className="nf-wco-main-strip" aria-hidden />
+					{/*
+					 * No data-directory permission probe here: it ran on every login and turned an
+					 * inconclusive check (slow filesystem, timeout) into a permission warning.
+					 * The check lives in Settings > Storage, where an operator asks for it.
+					 */}
+					<GitMissingAlert />
+					<StartupRecoveryAlert />
+					<Suspense fallback={<RoutePendingIndicator />}>
+						<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
+							<Outlet />
+						</I18nNamespaceGate>
+					</Suspense>
+				</AppShell.Main>
+
+				<Modal
+					opened={logoutOpened}
+					onClose={closeLogout}
+					title={t("logoutConfirmTitle")}
+					centered
+					size="sm"
+				>
+					<Text mb="lg">{t("logoutConfirmMessage")}</Text>
+					<Group justify="flex-end">
+						<Button variant="default" onClick={closeLogout}>
+							{t("cancel")}
+						</Button>
+						<Button color="red" onClick={logout}>
+							{t("confirm")}
+						</Button>
+					</Group>
+				</Modal>
+
+				<SummaryModelPickerHost />
+				<ProviderBaseUrlFixHost />
+				<TokenDanceRecoveryHost />
+				<BrokenModelMigrationHost />
+				<PluginPermissionRequestHost />
+
 				{/*
-				 * No data-directory permission probe here: it ran on every login and turned an
-				 * inconclusive check (slow filesystem, timeout) into a permission warning.
-				 * The check lives in Settings > Storage, where an operator asks for it.
+				 * The two fixed top banners are rendered LAST on purpose.
+				 *
+				 * Under WCO the whole title-bar strip is ours and the header row is the
+				 * drag surface (`styles/wco.css`), so the banners paint over a draggable
+				 * rect. `-webkit-app-region` hit-testing is purely geometric, and the
+				 * browser folds the rects the page reported into one region *in list
+				 * order, later rects winning where they overlap* — the list being the
+				 * layout-tree order. A banner emitted before the header row therefore
+				 * loses its clicks to window dragging: only its own `no-drag` rect, seen
+				 * after the row's `drag` rect, can cancel it. The header clusters work
+				 * because they are children of the row and so are collected after it;
+				 * these banners are siblings, so their place in the tree is what decides.
+				 * Emitted after every drag surface (the phone header row, the navbar's WCO
+				 * spacer and brand row, the strip above Main), they are collected last and
+				 * stay clickable.
 				 */}
-				<GitMissingAlert />
-				<StartupRecoveryAlert />
-				<Suspense fallback={<RoutePendingIndicator />}>
-					<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
-						<Outlet />
-					</I18nNamespaceGate>
-				</Suspense>
-			</AppShell.Main>
-
-			<Modal
-				opened={logoutOpened}
-				onClose={closeLogout}
-				title={t("logoutConfirmTitle")}
-				centered
-				size="sm"
-			>
-				<Text mb="lg">{t("logoutConfirmMessage")}</Text>
-				<Group justify="flex-end">
-					<Button variant="default" onClick={closeLogout}>
-						{t("cancel")}
-					</Button>
-					<Button color="red" onClick={logout}>
-						{t("confirm")}
-					</Button>
-				</Group>
-			</Modal>
-
-			<SummaryModelPickerHost />
-			<ProviderBaseUrlFixHost />
-			<TokenDanceRecoveryHost />
-			<BrokenModelMigrationHost />
-			<PluginPermissionRequestHost />
-
-			{/*
-			 * The two fixed top banners are rendered LAST on purpose.
-			 *
-			 * Under WCO the whole title-bar strip is ours and the header row is the
-			 * drag surface (`styles/wco.css`), so the banners paint over a draggable
-			 * rect. `-webkit-app-region` hit-testing is purely geometric, and the
-			 * browser folds the rects the page reported into one region *in list
-			 * order, later rects winning where they overlap* — the list being the
-			 * layout-tree order. A banner emitted before the header row therefore
-			 * loses its clicks to window dragging: only its own `no-drag` rect, seen
-			 * after the row's `drag` rect, can cancel it. The header clusters work
-			 * because they are children of the row and so are collected after it;
-			 * these banners are siblings, so their place in the tree is what decides.
-			 * Emitted after every drag surface (the phone header row, the navbar's WCO
-			 * spacer and brand row, the strip above Main), they are collected last and
-			 * stay clickable.
-			 */}
-			<WSConnectionAlert />
-			<VersionUpdateBanner />
-		</AppShellWithNavWidth>
+				<WSConnectionAlert />
+				<VersionUpdateBanner />
+			</AppShellWithNavWidth>
+		</MobileNavContext.Provider>
 	);
 }
