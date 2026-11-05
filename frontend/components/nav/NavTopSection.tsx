@@ -1,13 +1,13 @@
 /**
  * Top of the sidebar: brand row (collapses the sidebar; notifications and workspaces on
- * the right), a status row that only appears when something needs saying, the search box
- * and "New session". Collapsed shows the left part of the same rows (NavHoverPanel).
+ * the right), a status row that only appears when something needs saying, "Search" and
+ * "New session". Collapsed shows the left part of the same rows (NavHoverPanel).
  *
  * These used to live in the page header. The header is gone on desktop, so everything
  * global sits here, in the column the reader already scans.
  */
 
-import { Group, Kbd, NavLink, Stack, TextInput, Tooltip } from "@mantine/core";
+import { Group, Kbd, NavLink, Stack, Tooltip } from "@mantine/core";
 import { IconEdit, IconSearch } from "@tabler/icons-react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
@@ -21,16 +21,12 @@ import {
 import { useTranslation } from "react-i18next";
 import { useMobileViewport } from "../../hooks/useMobileViewport";
 import { requestDashboardComposerFocus } from "../../lib/dashboard-composer-focus";
+import { requestSearchPageFocus } from "../../lib/search-page-focus";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "../../lib/use-match-media";
 import { BrandTitle } from "../common/BrandTitle";
 import { NotificationBell } from "../notifications/NotificationBell";
 import { HeaderPullToRefresh } from "./HeaderPullToRefresh";
-import {
-	requestNavSearchFocus,
-	subscribeNavSearchFocus,
-	takeNavSearchFocusRequest,
-	useNavRender,
-} from "./nav-render-context";
+import { useNavRender } from "./nav-render-context";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
 /**
@@ -46,64 +42,43 @@ const IS_MAC = (() => {
 	return /mac|iphone|ipad/i.test(platform);
 })();
 
-/** Sidebar search: Enter opens `/search`, scoped to the current project page if any. */
-export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
-	const { t } = useTranslation("nav");
-	const navigate = useNavigate();
-	const [query, setQuery] = useState("");
-	const inputRef = useRef<HTMLInputElement>(null);
-	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
+/** The search page, scoped to the project page the reader is on, if any. */
+function useSearchTarget() {
 	const projectId = useRouterState({
 		select: (state) => state.location.pathname.match(/^\/projects\/([^/]+)/)?.[1],
 	});
+	return projectId ? { project: decodeURIComponent(projectId) } : {};
+}
 
-	// ⌘K / Ctrl+K (see `useNavSearchShortcut`) asks for focus. The request is held, so a
-	// box mounted after the request (the phone drawer) still takes it.
-	useEffect(() => {
-		const take = () => {
-			const input = inputRef.current;
-			if (!input || !takeNavSearchFocusRequest()) return;
-			input.focus();
-			input.select();
-		};
-		take();
-		return subscribeNavSearchFocus(take);
-	}, []);
-
-	const search = () => {
-		const q = query.trim();
-		if (!q) return;
-		navigate({
-			to: "/search",
-			search: { q, ...(projectId ? { project: decodeURIComponent(projectId) } : {}) },
-		});
-		// The search page owns the query from here (it has its own box); leaving it here too
-		// reads as a filter still applied to the sidebar.
-		setQuery("");
-		inputRef.current?.blur();
-		onSearched?.();
-	};
-
+/**
+ * Goes to the search page and puts the cursor in its box. A row like "New session": the
+ * box itself lives on the page, where there is room for it and its filters.
+ */
+export function NavSearchLink({ onNavigate }: { onNavigate?: () => void }) {
+	const { t } = useTranslation("nav");
+	const navigate = useNavigate();
+	const pathname = useRouterState({ select: (state) => state.location.pathname });
+	const search = useSearchTarget();
+	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	return (
-		<TextInput
-			ref={inputRef}
-			size="xs"
-			placeholder={t("searchPlaceholder")}
-			value={query}
-			onChange={(e) => setQuery(e.currentTarget.value)}
-			onKeyDown={(e) => {
-				if (e.key === "Enter" && !e.nativeEvent.isComposing) search();
-				if (e.key === "Escape") e.currentTarget.blur();
-			}}
-			// 40px: the icon's centre on the row icons' column, the text on their titles'.
+		<NavLink
+			label={t("search")}
+			active={pathname === "/search"}
 			leftSection={<IconSearch size={16} />}
-			leftSectionWidth={40}
-			className="nf-nav-search"
 			// A keyboard hint means nothing without a keyboard.
-			rightSection={isTouch ? undefined : <Kbd size="xs">{IS_MAC ? "⌘K" : "Ctrl K"}</Kbd>}
-			rightSectionWidth={isTouch ? undefined : IS_MAC ? 36 : 52}
-			rightSectionPointerEvents="none"
-			aria-label={t("searchPlaceholder")}
+			rightSection={
+				isTouch ? undefined : (
+					<Kbd size="xs" style={{ opacity: 0.7 }}>
+						{IS_MAC ? "⌘K" : "Ctrl K"}
+					</Kbd>
+				)
+			}
+			onClick={() => {
+				requestSearchPageFocus();
+				navigate({ to: "/search", search });
+				onNavigate?.();
+			}}
+			aria-label={t("search")}
 		/>
 	);
 }
@@ -140,19 +115,30 @@ export function NewSessionLink({ onNavigate }: { onNavigate?: () => void }) {
 	);
 }
 
-/** ⌘K / Ctrl+K from anywhere, editors included: there is no other binding for it. */
-function useNavSearchShortcut(openPanel: () => void) {
+/**
+ * ⌘K / Ctrl+K from anywhere, editors included: there is no other binding for it. Goes
+ * to the search page with the cursor in its box (already there: just focuses it).
+ */
+function useSearchShortcut() {
+	const navigate = useNavigate();
+	const search = useSearchTarget();
+	const searchRef = useRef(search);
+	searchRef.current = search;
+	const onSearchPage = useRouterState({
+		select: (state) => state.location.pathname === "/search",
+	});
 	useEffect(() => {
 		const onKeyDown = (e: KeyboardEvent) => {
 			if (e.key.toLowerCase() !== "k" || e.shiftKey || e.altKey) return;
 			if (!(IS_MAC ? e.metaKey : e.ctrlKey)) return;
 			e.preventDefault();
-			openPanel();
-			requestNavSearchFocus();
+			requestSearchPageFocus();
+			// On the page: keep its query and filters, only take the cursor there.
+			if (!onSearchPage) navigate({ to: "/search", search: searchRef.current });
 		};
 		window.addEventListener("keydown", onKeyDown);
 		return () => window.removeEventListener("keydown", onKeyDown);
-	}, [openPanel]);
+	}, [navigate, onSearchPage]);
 }
 
 export function NavTopSection({
@@ -166,14 +152,13 @@ export function NavTopSection({
 	onNavigate?: () => void;
 }) {
 	const { t } = useTranslation("nav");
-	const { storedCollapsed, openPanel } = useNavRender();
-	useNavSearchShortcut(openPanel);
+	const { storedCollapsed } = useNavRender();
+	useSearchShortcut();
 	const brandRowRef = useRef<HTMLDivElement>(null);
 	const brandRef = useRef<HTMLDivElement>(null);
 	const brandScale = useCollapsedBrandScale(brandRef);
 	const isMobile = useMobileViewport();
 	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
-
 	// One layout, collapsed or not: collapsed clips every row to its icon (NavHoverPanel,
 	// nav-collapsed.css), so the icons stay where they are and the rest appears in place
 	// once it opens.
@@ -222,7 +207,7 @@ export function NavTopSection({
 			<Group gap={6} wrap="wrap" px={4} className="nf-nav-status-row">
 				{statusBadges}
 			</Group>
-			<NavSearchBox onSearched={onNavigate} />
+			<NavSearchLink onNavigate={onNavigate} />
 			<NewSessionLink onNavigate={onNavigate} />
 		</Stack>
 	);

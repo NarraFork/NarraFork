@@ -86,10 +86,7 @@ export function NavHoverPanel({
 	}, []);
 
 	const open = canHover && hoverOpen;
-	const state = useMemo<NavRenderState>(
-		() => ({ storedCollapsed: collapsed, openPanel: intent.open }),
-		[collapsed, intent],
-	);
+	const state = useMemo<NavRenderState>(() => ({ storedCollapsed: collapsed }), [collapsed]);
 	const expandedWidth = getNavExpandedWidth();
 
 	return (

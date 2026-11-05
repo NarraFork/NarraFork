@@ -17,17 +17,10 @@
 		.mantine-NavLink-root,
 		[data-folder-unit],
 		[data-recent-tab-pin-divider],
-		.nf-nav-search,
 		.nf-nav-status-row,
 		.nf-nav-bottom-bar
 	) {
 	clip-path: inset(0 calc(100% - 40px) 0 0 round var(--mantine-radius-sm));
-}
-
-/* The search box is only its icon until it opens. */
-[data-nav-hover-panel="closed"] .nf-nav-search input {
-	border-color: transparent;
-	background: transparent;
 }
 
 /*
