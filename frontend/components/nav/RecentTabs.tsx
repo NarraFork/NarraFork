@@ -98,7 +98,6 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  */
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
-import { useRecentTabKeyboardCard } from "./useRecentTabKeyboardCard";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
 import { SwipeMenuHint, useRowSwipe } from "./useRowSwipe";
 
@@ -605,21 +604,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		if (drag.draggingId || ctxMenu) hoverStore.hide();
 	}, [drag.draggingId, ctxMenu, hoverStore]);
 	useEffect(() => {
-		// Except the keyboard's card, which moves with its row instead: the highlight's own
-		// scroll-into-view is what brings that row on screen.
-		const hide = () => {
-			if (hoverStore.followedKey() === null) hoverStore.hide();
-		};
+		const hide = () => hoverStore.hide();
 		window.addEventListener("scroll", hide, true);
 		return () => window.removeEventListener("scroll", hide, true);
 	}, [hoverStore]);
-	// Collapsed, the keyboard highlight shows its row's card too.
-	useRecentTabKeyboardCard({
-		store: isTouch ? null : hoverStore,
-		listRef: listBoxRef,
-		pendingKey,
-		tabs,
-	});
 
 	/**
 	 * Remove a tab (a folder takes its members with it) and leave the page if it was the

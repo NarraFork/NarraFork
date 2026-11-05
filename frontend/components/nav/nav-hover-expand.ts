@@ -9,6 +9,8 @@
  *     A held panel is checked again every {@link NAV_HOVER_HOLD_RECHECK_MS}.
  *   - `keep` cancels a pending close without opening: the pointer reached something the
  *     open panel owns (its menu, the details card) that lies outside its box.
+ *   - `open` / `leaveAfter`: Ctrl+Up / Ctrl+Down opens it at once while the highlight
+ *     moves (NavHoverPanel), and closes it a moment after the switch.
  */
 
 export const NAV_HOVER_EXPAND_DELAY_MS = 250;
@@ -32,7 +34,9 @@ export interface NavHoverIntent {
 	keep(): void;
 	/** The pointer is somewhere else. */
 	leave(): void;
-	/** Open now, no delay (a click on a rail icon, or Cmd/Ctrl+K). */
+	/** Close after `ms` (unless held, or the pointer comes back): a keyboard switch ended. */
+	leaveAfter(ms: number): void;
+	/** Open now, no delay (keyboard focus, or Ctrl+Up / Ctrl+Down switching sessions). */
 	open(): void;
 	/** Close now and forget pending timers (the sidebar was pinned open, or unmounts). */
 	reset(): void;
@@ -86,6 +90,12 @@ export function createNavHoverIntent(options: {
 			cancelOpen();
 			if (!expanded || closeTimer !== null) return;
 			scheduleClose(NAV_HOVER_COLLAPSE_DELAY_MS);
+		},
+		leaveAfter(ms) {
+			cancelOpen();
+			if (!expanded) return;
+			cancelClose();
+			scheduleClose(ms);
 		},
 		open() {
 			cancelOpen();

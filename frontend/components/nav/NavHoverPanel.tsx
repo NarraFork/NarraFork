@@ -8,8 +8,9 @@
  * exactly what it points at once open.
  *
  * Resting the mouse on the collapsed sidebar opens it; moving away closes it again (see
- * `nav-hover-expand.ts` for the timing and what keeps it open). Touch and the phone
- * drawer are not affected: a phone drawer always renders expanded.
+ * `nav-hover-expand.ts` for the timing and what keeps it open). Ctrl+Up / Ctrl+Down opens
+ * it too, for as long as the highlight moves. Touch and the phone drawer are not affected:
+ * a phone drawer always renders expanded.
  *
  * Owning the hover state here, and passing it down by context, keeps a hover from
  * re-rendering the app shell that hosts this box.
@@ -19,6 +20,7 @@ import { getNavExpandedWidth, startNavResize } from "@frontend/hooks/useResizabl
 import { Box } from "@mantine/core";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useMobileViewport } from "../../hooks/useMobileViewport";
+import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	createNavHoverIntent,
 	hasFocusVisibleWithin,
@@ -28,6 +30,9 @@ import {
 	OPEN_POPUP_SELECTOR,
 } from "./nav-hover-expand";
 import { NavRenderContext, type NavRenderState } from "./nav-render-context";
+
+/** After a Ctrl+Up / Ctrl+Down switch: long enough to see which row it landed on. */
+const NAV_SWITCH_LINGER_MS = 600;
 
 export function NavHoverPanel({
 	collapsed,
@@ -49,7 +54,7 @@ export function NavHoverPanel({
 			isHeld: () => {
 				const panel = panelRef.current;
 				if (!panel) return false;
-				if (pressedRef.current) return true;
+				if (pressedRef.current || switchingRef.current) return true;
 				if (hasFocusVisibleWithin(panel)) return true;
 				return panel.querySelector(OPEN_POPUP_SELECTOR) !== null || hasVisibleLayer();
 			},
@@ -59,6 +64,20 @@ export function NavHoverPanel({
 		if (!canHover) intent.reset();
 	}, [canHover, intent]);
 	useEffect(() => () => intent.reset(), [intent]);
+	// Ctrl+Up / Ctrl+Down: open while the highlight moves, so every title it passes is
+	// readable, and close a moment after the switch, unless the pointer is resting here.
+	const switching = usePendingTabKey() !== null;
+	const switchingRef = useRef(false);
+	switchingRef.current = switching;
+	useEffect(() => {
+		if (!canHover) return;
+		if (switching) {
+			intent.open();
+			return;
+		}
+		const panel = panelRef.current;
+		if (intent.isExpanded() && !panel?.matches(":hover")) intent.leaveAfter(NAV_SWITCH_LINGER_MS);
+	}, [switching, canHover, intent]);
 	// Safety net: a click on the page itself always closes the open panel, whatever is
 	// holding it (a layer the visibility check misjudges must never pin it open).
 	useEffect(() => {

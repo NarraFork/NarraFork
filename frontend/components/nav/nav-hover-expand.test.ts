@@ -105,6 +105,28 @@ describe("collapsed sidebar hover expansion", () => {
 		expect(intent.isExpanded()).toBe(false);
 	});
 
+	test("a keyboard switch opens at once and closes a set time after it ends", () => {
+		const { clock, changes, intent } = setup();
+		intent.open();
+		expect(changes).toEqual([true]);
+		intent.leaveAfter(600);
+		clock.advance(599);
+		expect(changes).toEqual([true]);
+		clock.advance(1);
+		expect(changes).toEqual([true, false]);
+		// The pointer coming back in time keeps it open.
+		intent.open();
+		intent.leaveAfter(600);
+		intent.enter();
+		clock.advance(1000);
+		expect(changes).toEqual([true, false, true]);
+		// A closed panel is left alone.
+		intent.reset();
+		intent.leaveAfter(600);
+		clock.advance(1000);
+		expect(changes).toEqual([true, false, true, false]);
+	});
+
 	test("reset closes at once and cancels a pending open", () => {
 		const { clock, intent } = setup();
 		intent.enter();
