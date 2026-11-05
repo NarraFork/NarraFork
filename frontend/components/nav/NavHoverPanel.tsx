@@ -16,7 +16,11 @@
  * re-rendering the app shell that hosts this box.
  */
 
-import { getNavExpandedWidth, startNavResize } from "@frontend/hooks/useResizableNav";
+import {
+	getNavExpandedWidth,
+	NAV_WIDTH_CONSTANTS,
+	startNavResize,
+} from "@frontend/hooks/useResizableNav";
 import { Box } from "@mantine/core";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useMobileViewport } from "../../hooks/useMobileViewport";
@@ -33,6 +37,7 @@ import { NavRenderContext, type NavRenderState } from "./nav-render-context";
 
 /** After a Ctrl+Up / Ctrl+Down switch: long enough to see which row it landed on. */
 const NAV_SWITCH_LINGER_MS = 600;
+const { COLLAPSED_WIDTH } = NAV_WIDTH_CONSTANTS;
 
 export function NavHoverPanel({
 	collapsed,
@@ -112,8 +117,9 @@ export function NavHoverPanel({
 		<NavRenderContext.Provider value={state}>
 			<Box
 				ref={panelRef}
-				// "closed" also makes the navbar clip this box (nav-collapsed.css).
+				// "closed" also clips each row to its icon (nav-collapsed.css).
 				data-nav-hover-panel={open ? "open" : canHover ? "closed" : undefined}
+				className={canHover ? "nf-nav-hover-panel" : undefined}
 				onPointerEnter={(e) => {
 					if (e.pointerType === "mouse" && canHover) intent.enter();
 				}}
@@ -147,11 +153,12 @@ export function NavHoverPanel({
 						: {}),
 				}}
 			>
-				{open && (
-					// What the expanded navbar would paint: the page colour and its edge, over
-					// the full height from the window edge. Behind every row (z-index -1 in the
-					// navbar's isolated stacking context), and part of this box, so the pointer
-					// on its blank strips is still "inside" and a click there is the panel's.
+				{canHover && (
+					// What the expanded navbar paints: the page colour and its edge, over the full
+					// height from the window edge, behind every row (z-index -1 in the navbar's
+					// isolated stacking context). Always there, clipped to the rail while closed,
+					// so opening and closing slide its edge along with the rows' clips. Part of
+					// this box, so the pointer on its blank strips is still "inside".
 					<Box
 						aria-hidden
 						style={{
@@ -163,7 +170,14 @@ export function NavHoverPanel({
 							zIndex: -1,
 							background: "var(--mantine-color-body)",
 							borderInlineEnd: "1px solid var(--mantine-color-default-border)",
-							boxShadow: "var(--mantine-shadow-xl)",
+							boxShadow: open ? "var(--mantine-shadow-xl)" : "none",
+							// The shadow sits outside the box, so the open inset reaches past it.
+							clipPath: open
+								? "inset(0 -32px 0 0)"
+								: `inset(0 ${expandedWidth - COLLAPSED_WIDTH}px 0 0)`,
+							transition:
+								"clip-path var(--nf-nav-open-duration) var(--nf-nav-open-ease), box-shadow var(--nf-nav-open-duration) ease",
+							pointerEvents: open ? undefined : "none",
 						}}
 					/>
 				)}

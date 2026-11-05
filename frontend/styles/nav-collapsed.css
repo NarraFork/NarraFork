@@ -1,15 +1,35 @@
 /*
- * Collapsed sidebar: the expanded content box, laid out at the expanded width and clipped
- * at the navbar's edge (see NavHoverPanel). Every row's icon sits in the first 40px of
- * its row, so clipping each row to that block leaves a column of icons. Open on hover,
- * the clips come off and the box paints over the page at the same position: nothing in
- * it moves, the titles and the controls on the right appear in place.
+ * Collapsed sidebar: the expanded content box, laid out at the expanded width (see
+ * NavHoverPanel). Every row's icon sits in the first 40px of its row, so clipping each
+ * row to that block leaves a column of icons. Open on hover, the clips come off and the
+ * box paints over the page at the same position: nothing in it moves, the titles and the
+ * controls on the right appear in place.
  *
- * Clipping (clip-path, overflow) never changes layout, which is what keeps every row at
- * the same x/y in both states.
+ * Clipping (clip-path) never changes layout, which is what keeps every row at the same
+ * x/y in both states. It also animates: opening and closing are one motion, the rows'
+ * clips and the backdrop's (NavHoverPanel) sliding between the rail's edge and the
+ * expanded width together.
  */
-.mantine-AppShell-navbar:has(> [data-nav-hover-panel="closed"]) {
-	overflow-x: clip;
+.nf-nav-hover-panel {
+	--nf-nav-open-ease: cubic-bezier(0.2, 0, 0, 1);
+	--nf-nav-open-duration: 220ms;
+}
+
+/*
+ * The rows reach past the rail while collapsed; each one is clipped to its icon below, so
+ * the navbar itself never clips (that would cut the opening motion off at its edge).
+ * Anything left unclipped, `nf-nav-expanded-only`, is hidden instead.
+ */
+.nf-nav-hover-panel
+:is(
+	.mantine-NavLink-root,
+	[data-folder-unit],
+	[data-recent-tab-pin-divider],
+	.nf-nav-status-row,
+	.nf-nav-bottom-bar
+) {
+	clip-path: inset(0 0 0 0 round var(--mantine-radius-sm));
+	transition: clip-path var(--nf-nav-open-duration) var(--nf-nav-open-ease);
 }
 
 [data-nav-hover-panel="closed"]
@@ -26,10 +46,21 @@
 /*
  * Controls past the icon column that no clip above covers (the brand row's workspace
  * button and bell; the bottom bar's icons, for keyboard focus). `visibility`, not
- * `display`: they keep their place.
+ * `display`: they keep their place. They fade in once the panel has mostly opened, and
+ * out at once on closing, so they never show over the page past the closing backdrop.
  */
+.nf-nav-hover-panel .nf-nav-expanded-only {
+	transition:
+		opacity 120ms ease 100ms,
+		visibility 0s linear 100ms;
+}
+
 [data-nav-hover-panel="closed"] .nf-nav-expanded-only {
 	visibility: hidden;
+	opacity: 0;
+	transition:
+		opacity 80ms ease,
+		visibility 0s linear 80ms;
 }
 
 /*
@@ -39,11 +70,17 @@
  */
 .nf-nav-brand {
 	transform-origin: left center;
-	transition: transform 150ms ease;
+	transition: transform var(--nf-nav-open-duration, 220ms) var(--nf-nav-open-ease, ease);
 }
 
 [data-nav-hover-panel="closed"] .nf-nav-brand {
 	transform: translateX(-12px) scale(var(--nf-nav-brand-scale, 1));
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.nf-nav-hover-panel {
+		--nf-nav-open-duration: 0ms;
+	}
 }
 
 /* Shortcut hints of Search / New session: right after the word, only while the row is hovered. */
