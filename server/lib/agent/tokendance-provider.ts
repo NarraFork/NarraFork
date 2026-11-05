@@ -24,7 +24,11 @@ import { maskSecretValues } from "./request-dump";
 import { ApiError } from "./types";
 
 /** Redacts before delegates, request dumps, SSE parsing and logging see any upstream bytes. */
-export function tokenDanceTransport(apiKey: string, generation: number): ProviderTransport {
+export function tokenDanceTransport(
+	apiKey: string,
+	generation: number,
+	prefix = "tokendance",
+): ProviderTransport {
 	const patterns = [
 		apiKey,
 		JSON.stringify(apiKey).slice(1, -1),
@@ -40,9 +44,9 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 			headers.set("X-App-URL", TOKENDANCE_APP_URL);
 		},
 		async fetch(input, init, next) {
-			assertTokenDanceConnection(generation);
+			assertTokenDanceConnection(generation, prefix);
 			const controller = new AbortController();
-			const unregister = registerTokenDanceRequest(controller, generation);
+			const unregister = registerTokenDanceRequest(controller, generation, prefix);
 			const signal = init?.signal;
 			const abort = () => controller.abort(signal?.reason);
 			if (signal?.aborted) abort();
@@ -199,26 +203,32 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 	};
 }
 
-/** A singleton platform namespace; delegates never infer protocol from the model's name. */
+/** 一个 TokenDance 实例的命名空间；delegates never infer protocol from the model's name. */
 export class TokenDanceProvider implements ProviderAdapter {
 	private delegate?: ProviderAdapter;
 	private model?: string;
 	private protocol?: string;
-	private readonly config = (() => {
-		const config = getTokenDanceRuntimeConfig();
-		return config ? { ...config } : undefined;
-	})();
+	private readonly prefix: string;
+	private readonly config: { apiKey: string; generation: number; disabled: boolean } | undefined;
+
+	constructor(prefix = "tokendance") {
+		this.prefix = prefix;
+		const config = getTokenDanceRuntimeConfig(prefix);
+		this.config = config ? { ...config } : undefined;
+	}
 
 	prepareForModel(model: string): void {
 		if (!this.config || this.config.disabled)
 			throw new Error("TokenDance connection is not configured or is disabled.");
-		assertTokenDanceConnection(this.config.generation);
+		assertTokenDanceConnection(this.config.generation, this.prefix);
 		const parsed = parseModelId(model);
-		if (parsed.provider && parsed.provider !== "tokendance")
+		if (parsed.provider && parsed.provider !== this.prefix)
 			throw new Error("Invalid TokenDance model namespace.");
-		const catalog = getTokenDanceCatalogModels().find((entry) => entry.id === parsed.model);
+		const catalog = getTokenDanceCatalogModels(this.prefix).find(
+			(entry) => entry.id === parsed.model,
+		);
 		// 设置页为这个模型显式选的协议优先于目录推荐。模型仍必须在目录里，否则没有上下文长度。
-		const override = resolveModelProtocol("tokendance", model);
+		const override = resolveModelProtocol(this.prefix, model);
 		const recommended = catalog && selectTokenDanceProtocol(catalog.supported_protocols);
 		const protocol = override ?? recommended;
 		if (!catalog || !protocol)
@@ -233,16 +243,16 @@ export class TokenDanceProvider implements ProviderAdapter {
 			return;
 		}
 		const config = {
-			id: "tokendance",
+			id: this.prefix,
 			name: "TokenDance",
-			prefix: "tokendance",
+			prefix: this.prefix,
 			apiKey: this.config.apiKey,
 			defaultModel: parsed.model,
 			defaultContextWindow: catalog.context_length,
 			baseUrl: `${TOKENDANCE_ORIGIN}/gateway/v1`,
 		};
-		const transport = tokenDanceTransport(this.config.apiKey, this.config.generation);
-		const source = `tokendance:${protocol}`;
+		const transport = tokenDanceTransport(this.config.apiKey, this.config.generation, this.prefix);
+		const source = `${this.prefix}:${protocol}`;
 		if (protocol === "anthropic-messages") {
 			const delegate = new AnthropicProvider({ ...config, officialApi: false }, transport);
 			delegate.setReasoningSourceOverride(source);

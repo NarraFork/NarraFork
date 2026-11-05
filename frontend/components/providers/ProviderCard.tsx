@@ -10,7 +10,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { IconRefresh } from "@tabler/icons-react";
+import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import React, { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ProviderStatus } from "./ProviderStatusBadge";
@@ -30,6 +30,8 @@ export interface ProviderCardProps {
 	onToggleDisabled: () => void;
 	onRefresh?: () => void;
 	onOpenConfig: () => void;
+	/** 平台实例可以在卡片上直接删除（草稿，保存后才落库）。 */
+	onDelete?: () => void;
 	isSelected?: boolean;
 }
 
@@ -48,6 +50,7 @@ export const ProviderCard = React.memo(function ProviderCard({
 	onToggleDisabled,
 	onRefresh,
 	onOpenConfig,
+	onDelete,
 	isSelected,
 }: ProviderCardProps) {
 	const { t } = useTranslation("settings");
@@ -111,16 +114,35 @@ export const ProviderCard = React.memo(function ProviderCard({
 							event.stopPropagation();
 						}}
 					>
-						<Switch
-							disabled={controlsDisabled}
-							size="xs"
-							checked={!disabled}
-							onChange={(event) => {
-								event.stopPropagation();
-								onToggleDisabled();
-							}}
-							aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
-						/>
+						<Group gap={4} wrap="nowrap">
+							<Switch
+								disabled={controlsDisabled}
+								size="xs"
+								checked={!disabled}
+								onChange={(event) => {
+									event.stopPropagation();
+									onToggleDisabled();
+								}}
+								aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
+							/>
+							{onDelete && (
+								<Tooltip label={t("platformInstanceDelete")}>
+									<ActionIcon
+										size="sm"
+										color="red"
+										variant="subtle"
+										disabled={controlsDisabled}
+										aria-label={t("platformInstanceDelete")}
+										onClick={(event) => {
+											event.stopPropagation();
+											onDelete();
+										}}
+									>
+										<IconTrash size={14} />
+									</ActionIcon>
+								</Tooltip>
+							)}
+						</Group>
 					</Box>
 				</Group>
 

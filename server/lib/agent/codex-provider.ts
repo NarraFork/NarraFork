@@ -20,6 +20,7 @@ import { logger } from "../logger";
 import { resolveOverride } from "../net/proxy";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
+import type { ProxyOverride } from "../settings/types";
 import { getHttpCodexUserAgent, resolveClientFingerprint } from "../user-agent";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
@@ -107,43 +108,26 @@ function classifyCodexError(
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
-/**
- * Resolve the client-fingerprint config for the built-in Codex adapter from
- * `settings.codex`. The adapter always presents itself as the Codex client;
- * users can still override the UA or individual headers via settings.
- */
-function codexFingerprintConfig(): {
-	userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
-	customUserAgent?: string;
-	extraHeaders?: Record<string, string>;
-} {
-	const codex = settings.codex;
-	return {
-		userAgentMode: codex?.userAgentMode ?? "codex",
-		customUserAgent: codex?.customUserAgent,
-		extraHeaders: codex?.extraHeaders,
-	};
-}
-
-function resolveCodexProviderFingerprint(conversationId: string) {
-	const config = codexFingerprintConfig();
-	return resolveClientFingerprint({
-		mode: config.userAgentMode,
-		custom: config.customUserAgent,
-		fallback: getHttpCodexUserAgent(),
-		extraHeaders: config.extraHeaders,
-		installationId: getInstallationId(),
-		conversationId,
-	});
-}
-
 export interface CodexProviderOptions {
+	/** 模型 ID 前缀（平台实例的 prefix）；缺省为内置的 `codex`。 */
+	prefix?: string;
 	/** Use WebSocket instead of HTTP for streaming (experimental) */
 	useWebSocket?: boolean;
 	/** Allow the native web_search tool to be sent to Codex models. */
 	useWebSearch?: boolean;
 	/** Allow the native image_generation tool to be sent to Codex models. */
 	useImageGeneration?: boolean;
+	/**
+	 * 只在这些账号池凭据里选。
+	 *
+	 * 缺省（undefined）表示不限制，沿用整个账号池；空数组表示一个都不用，直接失败。
+	 */
+	credentialIds?: readonly string[];
+	/** 该实例自己的代理与指纹覆盖；缺省时跟随全局设置。 */
+	proxy?: ProxyOverride;
+	userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
 }
 
 /**
@@ -155,9 +139,17 @@ export class CodexProvider implements ProviderAdapter {
 	private manager = getCodexManager();
 	private context: CallContext | null = null;
 	private contextSessionKey: string | undefined;
+	private prefix: string;
 	private useWebSocket: boolean;
 	private useWebSearch: boolean;
 	private useImageGeneration: boolean;
+	private credentialIds: readonly string[] | undefined;
+	private proxy: ProxyOverride | undefined;
+	private fingerprint: {
+		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+		customUserAgent?: string;
+		extraHeaders?: Record<string, string>;
+	};
 
 	constructor(options?: CodexProviderOptions) {
 		const mode = settings.codex?.loadBalancingMode;
@@ -165,9 +157,44 @@ export class CodexProvider implements ProviderAdapter {
 			this.manager.setLoadBalancingMode(mode);
 		}
 		this.manager.setTierOrder(settings.codex?.tierOrder);
+		this.prefix = options?.prefix ?? "codex";
 		this.useWebSocket = options?.useWebSocket ?? true;
 		this.useWebSearch = options?.useWebSearch ?? true;
 		this.useImageGeneration = options?.useImageGeneration ?? true;
+		this.credentialIds = options?.credentialIds;
+		this.proxy = options?.proxy;
+		this.fingerprint = {
+			userAgentMode: options?.userAgentMode,
+			customUserAgent: options?.customUserAgent,
+			extraHeaders: options?.extraHeaders,
+		};
+	}
+
+	/** 该实例的代理覆盖；实例没配就跟随全局策略。 */
+	private resolveProxy(): string | undefined {
+		return resolveOverride(this.proxy ?? settings.codex?.proxy);
+	}
+
+	/** 该实例的指纹覆盖；实例没配就跟随全局设置。 */
+	private fingerprintConfig() {
+		const codex = settings.codex;
+		return {
+			userAgentMode: this.fingerprint.userAgentMode ?? codex?.userAgentMode ?? "codex",
+			customUserAgent: this.fingerprint.customUserAgent ?? codex?.customUserAgent,
+			extraHeaders: this.fingerprint.extraHeaders ?? codex?.extraHeaders,
+		};
+	}
+
+	private resolveFingerprint(conversationId: string) {
+		const config = this.fingerprintConfig();
+		return resolveClientFingerprint({
+			mode: config.userAgentMode,
+			custom: config.customUserAgent,
+			fallback: getHttpCodexUserAgent(),
+			extraHeaders: config.extraHeaders,
+			installationId: getInstallationId(),
+			conversationId,
+		});
 	}
 
 	/** Get or acquire a valid credential context. */
@@ -184,7 +211,9 @@ export class CodexProvider implements ProviderAdapter {
 				}
 			}
 		}
-		this.context = await this.manager.acquireContext(sessionKey);
+		this.context = await this.manager.acquireContext(sessionKey, {
+			credentialIds: this.credentialIds,
+		});
 		this.contextSessionKey = sessionKey;
 		return this.context;
 	}
@@ -204,13 +233,13 @@ export class CodexProvider implements ProviderAdapter {
 		// resolved string is passed to OpenAIProvider so it covers both HTTP
 		// (via pfetch precedence) and the WebSocket path, never falling back to
 		// the global policy and losing codex's override.
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const proxy = this.resolveProxy();
 
 		return new OpenAIProvider(
 			{
-				id: "codex",
-				name: "Codex",
-				prefix: "codex",
+				id: this.prefix,
+				name: this.prefix,
+				prefix: this.prefix,
 				apiKey: ctx.token, // OAuth/PAT access token (empty for agent identity)
 				// Full Authorization header (Bearer or AgentAssertion) resolved by the manager.
 				authorizationHeader: ctx.authorization,
@@ -220,7 +249,7 @@ export class CodexProvider implements ProviderAdapter {
 				codexAccountId: ctx.credential.accountId,
 				codexWebSearch: this.useWebSearch,
 				codexImageGeneration: this.useImageGeneration,
-				...codexFingerprintConfig(),
+				...this.fingerprintConfig(),
 			},
 			proxy,
 		);
@@ -607,7 +636,7 @@ export class CodexProvider implements ProviderAdapter {
 
 			try {
 				const request = this.buildResponsesWebSocketRequest(params);
-				const fingerprint = resolveCodexProviderFingerprint(params.conversationId);
+				const fingerprint = this.resolveFingerprint(params.conversationId);
 
 				await reportInputCharacters(params, request);
 				params.onRequestStart?.({ credentialId: ctx.id });
@@ -616,7 +645,7 @@ export class CodexProvider implements ProviderAdapter {
 					apiKey: ctx.token,
 					authorization: ctx.authorization,
 					accountId: ctx.credential.accountId,
-					proxy: resolveOverride(settings.codex?.proxy),
+					proxy: this.resolveProxy(),
 					sessionKey:
 						params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId,
 					conversationId: params.conversationId,

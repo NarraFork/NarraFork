@@ -676,11 +676,23 @@ function NarratorPanelBody({
 		t,
 	);
 
-	// Command Code 额度：仅在当前模型走 commandcode 前缀时启用，避免无谓的接口调用。
-	const commandCodeEnabled = !!resolvedModel?.startsWith("CommandCode:");
+	// Command Code 额度：当前模型的前缀属于某个 Command Code 实例时启用，按该实例取额度。
+	const commandCodePrefix = (() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const instances =
+			(
+				settingsData?.agent as unknown as
+					| { platformInstances?: Array<{ prefix: string; platform: string }> }
+					| undefined
+			)?.platformInstances ?? [];
+		const instance = instances.find((entry) => entry.prefix === prefix);
+		return instance?.platform === "CommandCode" ? prefix : null;
+	})();
+	const commandCodeEnabled = commandCodePrefix !== null;
 	const commandCodeUsageQuery = useQuery({
-		queryKey: ["commandcode", "usage"],
-		queryFn: () => api.commandCodeUsage(),
+		queryKey: ["commandcode", "usage", commandCodePrefix],
+		queryFn: () => api.commandCodeUsage(commandCodePrefix ?? undefined),
 		enabled: commandCodeEnabled,
 		refetchInterval: commandCodeEnabled ? 60_000 : false,
 	});

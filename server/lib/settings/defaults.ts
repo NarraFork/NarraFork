@@ -562,6 +562,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 		valid: "1-1000, 默认 1000",
 	},
+	"agent.platformInstances": {
+		desc: "「平台集成」的实例清单：同一平台（codex / CommandCode / tokendance）可以有多条实例，靠 prefix 划分模型命名空间（模型 ID 为 prefix:model）。首次启动时按旧的单例字段生成每个平台一条，之后清单就是唯一事实来源。",
+		type: "array",
+		valid: "prefix 全局唯一；suffix 是卡片标记（卡片名 = 平台前缀-suffix）",
+	},
 	"agent.subagentModels.explore": {
 		desc: "explore 子代理的默认模型。空字符串表示使用全局 defaultModel。",
 		type: "string",

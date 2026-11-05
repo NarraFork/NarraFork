@@ -438,6 +438,32 @@ export const updateSettingsSchema = z
 					)
 					.optional(),
 				maxTurns: z.number().int().min(1).max(1000),
+				/**
+				 * 「平台集成」的实例清单：同一平台可以有多条实例，靠 `prefix` 划分模型命名空间
+				 * （模型 ID 为 `<prefix>:<model>`）。`suffix` 只是卡片标记，可任意 UTF-8；
+				 * `prefix` 不能含冒号与空白，否则模型 ID 拆不开。
+				 */
+				platformInstances: z
+					.array(
+						z.object({
+							id: z.string().min(1).max(64),
+							platform: z.enum(["codex", "CommandCode", "tokendance"]),
+							suffix: z.string().max(40),
+							prefix: z
+								.string()
+								.min(1)
+								.max(40)
+								.refine((value) => !/[\s:]/.test(value), "prefix 不能包含冒号或空白"),
+							disabled: z.boolean(),
+							config: z.record(z.string(), z.unknown()),
+						}),
+					)
+					.max(20)
+					.refine(
+						(entries) => new Set(entries.map((entry) => entry.prefix)).size === entries.length,
+						{ message: "平台实例的 prefix 必须唯一" },
+					)
+					.optional(),
 				subagentModels: z
 					.object({
 						explore: z.string(),
@@ -813,6 +839,96 @@ function maskApiKey(key?: string): string {
 	return maskSecret(key);
 }
 
+/**
+ * 平台实例的 config 里只有 apiKey 是密钥。回填规则与 API key 类供应商一致：
+ * GET 只给脱敏值，前端改配置时把脱敏值原样带回来。
+ */
+function maskPlatformInstances(
+	instances: NarraForkSettings["agent"]["platformInstances"],
+): NarraForkSettings["agent"]["platformInstances"] {
+	return instances?.map((instance) => {
+		const apiKey = instance.config?.apiKey;
+		return typeof apiKey === "string" && apiKey
+			? { ...instance, config: { ...instance.config, apiKey: maskApiKey(apiKey) } }
+			: instance;
+	});
+}
+
+/** 脱敏值不能落库：按实例 id 取回原 key；新实例带脱敏值时置空，与其它供应商一致。 */
+function restorePlatformInstanceSecrets(
+	instances: NonNullable<NarraForkSettings["agent"]["platformInstances"]>,
+	current: NarraForkSettings["agent"]["platformInstances"],
+): void {
+	for (const instance of instances) {
+		const apiKey = instance.config?.apiKey;
+		if (typeof apiKey !== "string" || !apiKey.startsWith("*")) continue;
+		const existing = current?.find((entry) => entry.id === instance.id)?.config?.apiKey;
+		instance.config = {
+			...instance.config,
+			apiKey: typeof existing === "string" ? existing : "",
+		};
+	}
+}
+
+/** 实例改过的模型前缀：旧前缀 → 新前缀。 */
+function platformInstancePrefixRenames(
+	next: NonNullable<NarraForkSettings["agent"]["platformInstances"]>,
+	current: NarraForkSettings["agent"]["platformInstances"],
+): Map<string, string> {
+	const before = new Map((current ?? []).map((entry) => [entry.id, entry.prefix]));
+	const renames = new Map<string, string>();
+	for (const instance of next) {
+		const previous = before.get(instance.id);
+		if (previous && previous !== instance.prefix) renames.set(previous, instance.prefix);
+	}
+	return renames;
+}
+
+/** 模型 ID 形如 `<prefix>:<model>`；前缀被改名时一并换掉。 */
+function remapModelId(value: string, renames: Map<string, string>): string {
+	const separator = value.indexOf(":");
+	if (separator <= 0) return value;
+	const next = renames.get(value.slice(0, separator));
+	return next ? `${next}${value.slice(separator)}` : value;
+}
+
+/**
+ * 改名实例时把逐模型设置的键一起搬过去。
+ *
+ * 隐藏模型、逐模型协议都以 `<prefix>:<model>` 为键，不迁移就会在改名那一瞬间全部失效；
+ * 客户端没提交的集合沿用已存的那一份。
+ */
+function applyPlatformInstancePrefixRenames(
+	agent: NonNullable<z.infer<typeof updateSettingsSchema>["agent"]>,
+	current: NarraForkSettings,
+	renames: Map<string, string>,
+): void {
+	const remapRecord = <T>(record: Record<string, T>): Record<string, T> =>
+		Object.fromEntries(
+			Object.entries(record).map(([key, value]) => [remapModelId(key, renames), value]),
+		);
+
+	const hidden = agent.hiddenModels ?? current.agent?.hiddenModels;
+	if (hidden) agent.hiddenModels = hidden.map((value) => remapModelId(value, renames));
+
+	const protocols = agent.modelProtocols ?? current.agent?.modelProtocols;
+	if (protocols) agent.modelProtocols = remapRecord(protocols);
+
+	const overrides = agent.modelProtocolOverrides ?? current.agent?.modelProtocolOverrides;
+	if (overrides) agent.modelProtocolOverrides = remapRecord(overrides);
+
+	const customModels = agent.customModels ?? current.agent?.customModels;
+	if (customModels) {
+		agent.customModels = customModels.map((model) => ({
+			...model,
+			value: remapModelId(model.value, renames),
+			...(model.provider && renames.has(model.provider)
+				? { provider: renames.get(model.provider) }
+				: {}),
+		}));
+	}
+}
+
 function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["vnet"] {
 	if (!vnet) return undefined;
 	return {
@@ -956,6 +1072,11 @@ async function buildSettingsResponse(
 				: undefined,
 		},
 		auth: maskAuthSettings(source.auth),
+		// 平台实例的 key 与 API key 类供应商同样只回传脱敏值。
+		agent: {
+			...safeSource.agent,
+			platformInstances: maskPlatformInstances(safeSource.agent?.platformInstances),
+		},
 		// Multi-provider — mask all keys
 		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
 			...p,
@@ -1469,7 +1590,12 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["codex", "tokendance"]);
+			// 保留前缀属于平台实例本身：删掉实例后，同一个前缀就能给自定义供应商复用。
+			const RESERVED_PREFIXES = new Set(
+				(validated.agent?.platformInstances ?? current.agent?.platformInstances ?? []).map(
+					(instance) => instance.prefix,
+				),
+			);
 			const allPrefixes: Array<{ prefix: string; source: string; legacyTokenDance?: boolean }> = [];
 			const previousCustomProviders = [
 				...(current.customApiProviders ?? []),
@@ -1523,6 +1649,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				}
 				seen.set(prefix, source);
 			}
+			// 反向检查：平台实例的前缀也不能撞上已有供应商。
+			for (const instance of validated.agent?.platformInstances ?? []) {
+				const owner = seen.get(instance.prefix);
+				if (owner) {
+					throw new ValidationError(
+						`Platform instance prefix "${instance.prefix}" conflicts with ${owner}. ` +
+							`Each provider must have a unique prefix.`,
+					);
+				}
+			}
 		}
 
 		const oldHost = current.server.host;
@@ -1554,6 +1690,20 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		// Preserve real VNet relay token when the client sends a masked display value.
 		if (validated.vnet?.relayToken?.startsWith("*")) {
 			validated.vnet.relayToken = current.vnet?.relayToken;
+		}
+
+		// 平台实例的 apiKey 同理：回到设置页看到的是脱敏值，保存时不能把它当新 key。
+		if (validated.agent?.platformInstances) {
+			restorePlatformInstanceSecrets(
+				validated.agent.platformInstances,
+				current.agent?.platformInstances,
+			);
+			// 改前缀等于换模型命名空间，逐模型设置的键要跟着走。
+			const renames = platformInstancePrefixRenames(
+				validated.agent.platformInstances,
+				current.agent?.platformInstances,
+			);
+			if (renames.size > 0) applyPlatformInstancePrefixRenames(validated.agent, current, renames);
 		}
 
 		// A newly chosen default project directory must already exist: nothing creates it,

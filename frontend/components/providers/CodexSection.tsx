@@ -91,6 +91,8 @@ import { ModelList } from "./ModelList";
 import type { CustomApiProtocol } from "./types";
 
 interface CodexSectionProps {
+	/** 这条 Codex 实例的模型前缀；省略时是内置的 `codex`。 */
+	prefix?: string;
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	customModels: CustomModelEntry[];
@@ -398,6 +400,7 @@ function SortableTierChip({ tier, label }: { tier: CodexPlanTier; label: string 
 }
 
 export const CodexSection = React.memo(function CodexSection({
+	prefix = "codex",
 	hiddenModels,
 	onToggleHidden,
 	customModels,
@@ -1890,7 +1893,7 @@ export const CodexSection = React.memo(function CodexSection({
 						</Text>
 						{codexModelIds.length > 0 && (
 							<ModelList
-								models={codexModelIds.map((id) => ({ value: `codex:${id}`, label: id }))}
+								models={codexModelIds.map((id) => ({ value: `${prefix}:${id}`, label: id }))}
 								hiddenModels={hiddenModels}
 								onToggleHidden={onToggleHidden}
 								modelProtocols={modelProtocols}
@@ -1900,7 +1903,7 @@ export const CodexSection = React.memo(function CodexSection({
 							/>
 						)}
 						<InlineCustomModels
-							prefix="codex"
+							prefix={prefix}
 							customModels={customModels}
 							onCustomModelsChange={onCustomModelsChange}
 							hiddenModels={hiddenModels}

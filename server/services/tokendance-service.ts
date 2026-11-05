@@ -15,6 +15,7 @@ import {
 	type TokenDancePublicConnection,
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
+import { PLATFORM_DEFAULTS, type PlatformInstanceRow } from "../../shared/platform-instances";
 import { maskSecretValues } from "../lib/agent/request-dump";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "../lib/cors-origin";
 import { AppError } from "../lib/errors";
@@ -93,6 +94,8 @@ interface Flow {
 	verifier?: string;
 	expiresAt: number;
 	generation: number;
+	/** 这条授权要写回哪个 TokenDance 实例。 */
+	prefix: string;
 	status: TokenDanceDraftRestore["status"];
 	snapshot?: TokenDanceDraftSnapshot;
 	bytes: number;
@@ -100,8 +103,8 @@ interface Flow {
 }
 const flows = new Map<string, Flow>();
 const requests = new Set<AbortController>();
-let models: TokenDanceCatalogModel[] = [];
-let modelsGeneration = -1;
+/** 每个 TokenDance 实例自己的目录缓存，键是实例前缀。 */
+const modelCatalogs = new Map<string, { models: TokenDanceCatalogModel[]; generation: number }>();
 let recoveryAction: TokenDanceRecoveryAction | undefined;
 
 function fail(message: string, status = 400, action?: TokenDanceRecoveryAction): AppError {
@@ -109,7 +112,60 @@ function fail(message: string, status = 400, action?: TokenDanceRecoveryAction):
 		extra: action ? { recoveryAction: action } : undefined,
 	});
 }
-function assertNoPrefixConflict(): void {
+
+/** 清单里的 TokenDance 实例。 */
+function tokenDanceInstances(): PlatformInstanceRow[] {
+	return (settings.agent?.platformInstances ?? []).filter(
+		(entry) => entry.platform === "tokendance",
+	);
+}
+
+/**
+ * 不指定前缀时用哪一条实例：有默认前缀那条就用它，否则用第一条。
+ *
+ * 平台实例都可以删除，所以这里不能硬编码前缀。
+ */
+export function defaultTokenDancePrefix(): string | undefined {
+	const instances = tokenDanceInstances();
+	const preferred = instances.find((entry) => entry.prefix === PLATFORM_DEFAULTS.tokendance.prefix);
+	return (preferred ?? instances[0])?.prefix;
+}
+
+interface TokenDanceInstanceConfig {
+	apiKey?: string;
+	generation?: number;
+	disabled?: boolean;
+	models?: unknown;
+}
+
+function instanceConfig(prefix?: string): TokenDanceInstanceConfig | undefined {
+	const target = prefix ?? defaultTokenDancePrefix();
+	if (!target) return undefined;
+	return tokenDanceInstances().find((entry) => entry.prefix === target)?.config;
+}
+
+function generation(prefix?: string): number {
+	return instanceConfig(prefix)?.generation ?? 0;
+}
+
+/** 把补丁写进某条实例自己的 config：连接、停用、目录缓存都按实例隔离。 */
+function patchInstanceConfig(prefix: string | undefined, patch: Record<string, unknown>): void {
+	const target = prefix ?? defaultTokenDancePrefix();
+	if (!target) throw fail("TokenDance instance is missing", 404);
+	const latest = structuredClone(settings);
+	const instances = latest.agent.platformInstances ?? [];
+	const index = instances.findIndex(
+		(entry) => entry.platform === "tokendance" && entry.prefix === target,
+	);
+	if (index < 0) throw fail("TokenDance instance is missing", 404);
+	instances[index] = {
+		...instances[index],
+		config: { ...instances[index].config, ...patch },
+	};
+	saveSettings(latest);
+}
+
+function assertNoPrefixConflict(prefix: string): void {
 	const providers = [
 		...(settings.customApiProviders ?? []),
 		...(settings.openaiProviders ?? []),
@@ -117,20 +173,20 @@ function assertNoPrefixConflict(): void {
 		...(settings.geminiProviders ?? []),
 		...(settings.nugProviders ?? []),
 	];
-	if (providers.some((provider) => provider.prefix === "tokendance")) {
+	if (providers.some((provider) => provider.prefix === prefix)) {
 		throw new AppError(
-			"Rename the existing custom provider prefix tokendance before connecting TokenDance",
+			`Rename the existing custom provider prefix ${prefix} before connecting TokenDance`,
 			409,
 			"TOKENDANCE_PREFIX_CONFLICT",
 		);
 	}
 }
-function assertGeneration(expected: number): void {
-	if (!settings.tokendance?.apiKey || generation() !== expected) {
+function assertGeneration(expected: number, prefix?: string): void {
+	if (!instanceConfig(prefix)?.apiKey || generation(prefix) !== expected) {
 		throw fail("TokenDance connection changed", 409);
 	}
 }
-function normalizeCatalog(entries: unknown): TokenDanceCatalogModel[] {
+function normalizeCatalog(entries: unknown, secret?: string): TokenDanceCatalogModel[] {
 	if (!Array.isArray(entries)) return [];
 	const next: TokenDanceCatalogModel[] = [];
 	let bytes = 0;
@@ -142,9 +198,9 @@ function normalizeCatalog(entries: unknown): TokenDanceCatalogModel[] {
 			typeof model.id !== "string" ||
 			!/^[!-~]+$/.test(model.id) ||
 			model.id.length > 512 ||
-			(!!settings.tokendance?.apiKey &&
-				model.id.length >= settings.tokendance.apiKey.length &&
-				maskSecretValues(model.id, [settings.tokendance.apiKey]) !== model.id) ||
+			(!!secret &&
+				model.id.length >= secret.length &&
+				maskSecretValues(model.id, [secret]) !== model.id) ||
 			seen.has(model.id) ||
 			!Array.isArray(model.supported_protocols) ||
 			model.supported_protocols.length > 64 ||
@@ -174,7 +230,6 @@ function normalizeCatalog(entries: unknown): TokenDanceCatalogModel[] {
 				),
 			],
 		};
-		const secret = settings.tokendance?.apiKey;
 		if (secret) {
 			if (item.name.length >= secret.length) item.name = maskSecretValues(item.name, [secret]);
 			item.supported_protocols = item.supported_protocols.filter(
@@ -189,9 +244,6 @@ function normalizeCatalog(entries: unknown): TokenDanceCatalogModel[] {
 		next.push(item);
 	}
 	return next;
-}
-function generation(): number {
-	return settings.tokendance?.generation ?? 0;
 }
 function cleanup(): void {
 	for (const [key, entry] of payments) {
@@ -209,42 +261,52 @@ function cleanup(): void {
 const cleanupTimer = setInterval(cleanup, 60_000);
 cleanupTimer.unref();
 
-export function getTokenDanceRuntimeConfig():
-	| { apiKey: string; generation: number; disabled: boolean }
-	| undefined {
-	const config = settings.tokendance;
-	return config?.apiKey
-		? { apiKey: config.apiKey, generation: config.generation, disabled: config.disabled }
-		: undefined;
+export function getTokenDanceRuntimeConfig(
+	prefix?: string,
+): { apiKey: string; generation: number; disabled: boolean } | undefined {
+	const config = instanceConfig(prefix);
+	if (!config?.apiKey) return undefined;
+	return {
+		apiKey: config.apiKey,
+		generation: config.generation ?? 0,
+		disabled: config.disabled === true,
+	};
 }
-export function getTokenDanceCatalogModels(): TokenDanceCatalogModel[] {
-	if (!getTokenDanceRuntimeConfig()) return [];
-	if (modelsGeneration !== generation()) {
-		models = normalizeCatalog(settings.tokendance?.models ?? []);
-		modelsGeneration = generation();
+export function getTokenDanceCatalogModels(prefix?: string): TokenDanceCatalogModel[] {
+	const target = prefix ?? defaultTokenDancePrefix();
+	if (!target || !getTokenDanceRuntimeConfig(target)) return [];
+	const config = instanceConfig(target);
+	const nextGeneration = generation(target);
+	const cached = modelCatalogs.get(target);
+	if (!cached || cached.generation !== nextGeneration) {
+		modelCatalogs.set(target, {
+			models: normalizeCatalog(config?.models ?? [], config?.apiKey),
+			generation: nextGeneration,
+		});
 	}
-	return structuredClone(models);
+	return structuredClone(modelCatalogs.get(target)?.models ?? []);
 }
 export function setTokenDanceRecoveryAction(
 	action: TokenDanceRecoveryAction | undefined,
 	expected: number,
 ): void {
-	if (settings.tokendance?.apiKey && generation() === expected)
+	if (instanceConfig()?.apiKey && generation() === expected)
 		recoveryAction = parseTokenDanceRecoveryAction(action);
 }
-export function getTokenDanceConnection(): TokenDancePublicConnection {
+export function getTokenDanceConnection(prefix?: string): TokenDancePublicConnection {
+	const config = instanceConfig(prefix);
 	return {
-		connected: !!settings.tokendance?.apiKey,
+		connected: !!config?.apiKey,
 		name: "TokenDance",
 		billingInstance,
-		disabled: settings.tokendance?.disabled ?? false,
-		generation: generation(),
-		models: getTokenDanceCatalogModels(),
-		...(recoveryAction && settings.tokendance?.apiKey ? { recoveryAction } : {}),
+		disabled: config?.disabled === true,
+		generation: generation(prefix),
+		models: getTokenDanceCatalogModels(prefix),
+		...(recoveryAction && config?.apiKey ? { recoveryAction } : {}),
 	};
 }
-export function assertTokenDanceConnection(expected: number): void {
-	const config = getTokenDanceRuntimeConfig();
+export function assertTokenDanceConnection(expected: number, prefix?: string): void {
+	const config = getTokenDanceRuntimeConfig(prefix);
 	if (!config || config.disabled || config.generation !== expected) {
 		throw fail("TokenDance connection changed or is disabled", 409);
 	}
@@ -252,8 +314,9 @@ export function assertTokenDanceConnection(expected: number): void {
 export function registerTokenDanceRequest(
 	controller: AbortController,
 	expected: number,
+	prefix?: string,
 ): () => void {
-	assertTokenDanceConnection(expected);
+	assertTokenDanceConnection(expected, prefix);
 	requests.add(controller);
 	return () => requests.delete(controller);
 }
@@ -431,9 +494,12 @@ export function startTokenDanceOAuth(
 	owner: string,
 	callback: URL,
 	draftSnapshot?: unknown,
+	prefix?: string,
 ): TokenDanceOAuthStart {
 	cleanup();
-	assertNoPrefixConflict();
+	const target = prefix ?? defaultTokenDancePrefix();
+	if (!target) throw fail("TokenDance instance is missing", 404);
+	assertNoPrefixConflict(target);
 	const snapshot = validateTokenDanceSnapshot(draftSnapshot);
 	const bytes = snapshot ? Buffer.byteLength(JSON.stringify(snapshot)) : 0;
 	if (
@@ -452,7 +518,8 @@ export function startTokenDanceOAuth(
 		owner,
 		verifier,
 		expiresAt,
-		generation: generation(),
+		generation: generation(target),
+		prefix: target,
 		status: "pending",
 		snapshot,
 		bytes,
@@ -529,21 +596,18 @@ export async function completeTokenDanceOAuth(
 				controller.signal.aborted ||
 				flow.expiresAt <= Date.now() ||
 				flow.status !== "pending" ||
-				flow.generation !== generation()
+				flow.generation !== generation(flow.prefix)
 			) {
 				throw fail("TokenDance connection changed during authorization", 409);
 			}
-			assertNoPrefixConflict();
-			const latest = structuredClone(settings);
-			latest.tokendance = {
-				modelCollectionInitialized: latest.tokendance?.modelCollectionInitialized,
+			assertNoPrefixConflict(flow.prefix);
+			patchInstanceConfig(flow.prefix, {
 				apiKey: key,
 				disabled: false,
-				generation: generation() + 1,
+				generation: generation(flow.prefix) + 1,
 				models: [],
-			};
-			saveSettings(latest);
-			models = [];
+			});
+			modelCatalogs.delete(flow.prefix);
 			recoveryAction = undefined;
 			flow.status = "completed";
 			invalidateRequests();
@@ -570,12 +634,13 @@ export async function completeTokenDanceOAuth(
 }
 export async function refreshTokenDanceModels(
 	signal?: AbortSignal,
+	prefix?: string,
 ): Promise<TokenDanceCatalogModel[]> {
-	const config = getTokenDanceRuntimeConfig();
+	const config = getTokenDanceRuntimeConfig(prefix);
 	if (!config) throw fail("TokenDance is not connected", 409);
 	const controller = new AbortController();
 	// Catalog management remains available while the runtime provider is disabled.
-	assertGeneration(config.generation);
+	assertGeneration(config.generation, prefix);
 	requests.add(controller);
 	const unregister = () => requests.delete(controller);
 	const abort = () => controller.abort();
@@ -590,7 +655,7 @@ export async function refreshTokenDanceModels(
 			8 * 1024 * 1024,
 			controller,
 		);
-		assertGeneration(config.generation);
+		assertGeneration(config.generation, prefix);
 		if (controller.signal.aborted) throw fail("TokenDance request cancelled", 409);
 		const body = record(response.body);
 		if (!response.ok) {
@@ -599,16 +664,16 @@ export async function refreshTokenDanceModels(
 		}
 		const entries = body?.data;
 		if (!Array.isArray(entries)) throw fail("Invalid TokenDance model catalog", 502);
-		const next = normalizeCatalog(entries);
+		const next = normalizeCatalog(entries, config.apiKey);
 		await settingsUpdateLock.acquire("settings", async () => {
-			assertGeneration(config.generation);
+			assertGeneration(config.generation, prefix);
 			if (controller.signal.aborted) throw fail("TokenDance request cancelled", 409);
-			const latest = structuredClone(settings);
-			latest.tokendance = { ...latest.tokendance, ...config, models: next };
-			saveSettings(latest);
+			patchInstanceConfig(prefix, { ...config, models: next });
 		});
-		models = next;
-		modelsGeneration = config.generation;
+		modelCatalogs.set(prefix ?? defaultTokenDancePrefix() ?? "", {
+			models: next,
+			generation: config.generation,
+		});
 		recoveryAction = undefined;
 		return structuredClone(next);
 	} finally {
@@ -628,17 +693,16 @@ function invalidateRequests(): void {
 }
 export async function setTokenDanceDisabled(
 	disabled: boolean,
+	prefix?: string,
 ): Promise<TokenDancePublicConnection> {
 	return settingsUpdateLock.acquire("settings", async () => {
-		if (!settings.tokendance?.apiKey) throw fail("TokenDance is not connected", 409);
-		const cached = getTokenDanceCatalogModels();
-		const latest = structuredClone(settings);
-		latest.tokendance = { ...settings.tokendance, disabled, generation: generation() + 1 };
-		models = cached;
-		saveSettings(latest);
+		if (!getTokenDanceRuntimeConfig(prefix)) throw fail("TokenDance is not connected", 409);
+		const cached = getTokenDanceCatalogModels(prefix);
+		const target = prefix ?? defaultTokenDancePrefix();
+		patchInstanceConfig(prefix, { disabled, generation: generation(prefix) + 1 });
+		modelCatalogs.set(target ?? "", { models: cached, generation: generation(prefix) });
 		invalidateRequests();
-		modelsGeneration = generation();
-		return getTokenDanceConnection();
+		return getTokenDanceConnection(prefix);
 	});
 }
 function invalidateBilling(): void {
@@ -1001,17 +1065,25 @@ export async function getTokenDancePaymentSession(
 	return structuredClone(entry.session);
 }
 
-export async function deleteTokenDanceConnection(): Promise<void> {
+export async function deleteTokenDanceConnection(prefix?: string): Promise<void> {
+	const target = prefix ?? defaultTokenDancePrefix();
 	await settingsUpdateLock.acquire("settings", async () => {
-		const latest = structuredClone(settings);
-		latest.tokendance = { apiKey: "", disabled: false, generation: generation() + 1 };
+		if (!target) return;
+		const wasConnected = !!getTokenDanceRuntimeConfig(target);
+		patchInstanceConfig(target, {
+			apiKey: "",
+			disabled: false,
+			generation: generation(target) + 1,
+			models: [],
+		});
 		// Only model-reference fields belong to this connection. Prompts, permission
 		// patterns and retry keywords may legitimately start with the same text.
 		// Disconnected installations may also have an unrelated legacy manual prefix.
-		if (settings.tokendance?.apiKey) {
+		if (wasConnected) {
+			const latest = structuredClone(settings);
 			const agent = latest.agent;
 			const isReference = (value: unknown) =>
-				typeof value === "string" && (value === "tokendance" || value.startsWith("tokendance:"));
+				typeof value === "string" && (value === target || value.startsWith(`${target}:`));
 			for (const field of [
 				"defaultModel",
 				"summaryModel",
@@ -1052,11 +1124,10 @@ export async function deleteTokenDanceConnection(): Promise<void> {
 						models: aggregation.models.filter((value) => !isReference(value)),
 					}))
 					.filter((aggregation) => aggregation.models.length > 0);
+			saveSettings(latest);
 		}
-		saveSettings(latest);
 		invalidateRequests();
-		models = [];
-		modelsGeneration = -1;
+		modelCatalogs.delete(target);
 		recoveryAction = undefined;
 		persistedBalance.remove("tokendance");
 	});
