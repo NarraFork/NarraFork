@@ -46,13 +46,13 @@
 	transform: translateX(-12px) scale(var(--nf-nav-brand-scale, 1));
 }
 
-/* The sidebar Search row's ⌘K hint: right after the word, only while the row is hovered. */
-.nf-nav-search-kbd {
+/* Shortcut hints of Search / New session: right after the word, only while the row is hovered. */
+.nf-nav-row-kbd {
 	opacity: 0;
 	transition: opacity 120ms ease;
 }
 
-.mantine-NavLink-root:hover .nf-nav-search-kbd {
+.mantine-NavLink-root:hover .nf-nav-row-kbd {
 	opacity: 0.75;
 }
 

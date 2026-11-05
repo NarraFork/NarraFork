@@ -53,15 +53,29 @@ function useSearchTarget() {
 /**
  * The label of the two action rows at the top: the same text as a session row's title,
  * so "Search" and "New session" have the session rows' height and read as the first rows
- * of the same list rather than as a separate block of bigger buttons.
+ * of the same list rather than as a separate block of bigger buttons. The shortcut sits
+ * right after the word and shows on hover only (nav-collapsed.css); touch gets none, a
+ * keyboard hint means nothing without a keyboard.
  */
-function NavRowLabel({ children }: { children: ReactNode }) {
+function NavRowLabelWithHint({ hint, children }: { hint?: string; children: ReactNode }) {
 	return (
-		<Text size="sm" truncate>
-			{children}
-		</Text>
+		<Group gap={8} wrap="nowrap">
+			<Text size="sm" truncate>
+				{children}
+			</Text>
+			{hint && (
+				// `lh={1}`: a Kbd at the body line height is taller than the label and would
+				// make this row 2px taller than the session rows.
+				<Kbd size="xs" lh={1} className="nf-nav-row-kbd">
+					{hint}
+				</Kbd>
+			)}
+		</Group>
 	);
 }
+
+const SEARCH_SHORTCUT_LABEL = IS_MAC ? "⌘K" : "Ctrl K";
+const NEW_SESSION_SHORTCUT_LABEL = IS_MAC ? "⌃`" : "Ctrl `";
 
 /**
  * Goes to the search page and puts the cursor in its box. A row like "New session": the
@@ -76,18 +90,9 @@ export function NavSearchLink({ onNavigate }: { onNavigate?: () => void }) {
 	return (
 		<NavLink
 			label={
-				<Group gap={8} wrap="nowrap">
-					<NavRowLabel>{t("search")}</NavRowLabel>
-					{/* Right after the word, on hover only (nav-collapsed.css). A keyboard
-					    hint means nothing without a keyboard, so touch never gets it. */}
-					{!isTouch && (
-						// `lh={1}`: a Kbd at the body line height is taller than the label and
-						// would make this row 2px taller than the session rows.
-						<Kbd size="xs" lh={1} className="nf-nav-search-kbd">
-							{IS_MAC ? "⌘K" : "Ctrl K"}
-						</Kbd>
-					)}
-				</Group>
+				<NavRowLabelWithHint hint={isTouch ? undefined : SEARCH_SHORTCUT_LABEL}>
+					{t("search")}
+				</NavRowLabelWithHint>
 			}
 			active={pathname === "/search"}
 			leftSection={<IconSearch size={16} />}
@@ -123,9 +128,14 @@ export function NewSessionLink({ onNavigate }: { onNavigate?: () => void }) {
 	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
 	const pathname = useRouterState({ select: (state) => state.location.pathname });
+	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	return (
 		<NavLink
-			label={<NavRowLabel>{t("newSession")}</NavRowLabel>}
+			label={
+				<NavRowLabelWithHint hint={isTouch ? undefined : NEW_SESSION_SHORTCUT_LABEL}>
+					{t("newSession")}
+				</NavRowLabelWithHint>
+			}
 			active={pathname === "/"}
 			leftSection={<IconEdit size={16} />}
 			onClick={() => {
@@ -138,11 +148,23 @@ export function NewSessionLink({ onNavigate }: { onNavigate?: () => void }) {
 	);
 }
 
+/** Cmd/Ctrl+K: the search page, with the cursor in its box (already there: just focuses it). */
+function isSearchShortcut(e: KeyboardEvent): boolean {
+	return (
+		e.key.toLowerCase() === "k" && !e.shiftKey && !e.altKey && (IS_MAC ? e.metaKey : e.ctrlKey)
+	);
+}
+
 /**
- * ⌘K / Ctrl+K from anywhere, editors included: there is no other binding for it. Goes
- * to the search page with the cursor in its box (already there: just focuses it).
+ * Ctrl+` (on Mac too: Cmd+` switches the app's windows): a new session. By physical key,
+ * so layouts where that key types something else still match.
  */
-function useSearchShortcut() {
+function isNewSessionShortcut(e: KeyboardEvent): boolean {
+	return e.code === "Backquote" && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey;
+}
+
+/** From anywhere, editors and the composer included: neither has another use for them. */
+function useNavShortcuts() {
 	const navigate = useNavigate();
 	const search = useSearchTarget();
 	const searchRef = useRef(search);
@@ -152,12 +174,18 @@ function useSearchShortcut() {
 	});
 	useEffect(() => {
 		const onKeyDown = (e: KeyboardEvent) => {
-			if (e.key.toLowerCase() !== "k" || e.shiftKey || e.altKey) return;
-			if (!(IS_MAC ? e.metaKey : e.ctrlKey)) return;
-			e.preventDefault();
-			requestSearchPageFocus();
-			// On the page: keep its query and filters, only take the cursor there.
-			if (!onSearchPage) navigate({ to: "/search", search: searchRef.current });
+			if (isSearchShortcut(e)) {
+				e.preventDefault();
+				requestSearchPageFocus();
+				// On the page: keep its query and filters, only take the cursor there.
+				if (!onSearchPage) navigate({ to: "/search", search: searchRef.current });
+				return;
+			}
+			if (isNewSessionShortcut(e)) {
+				e.preventDefault();
+				requestDashboardComposerFocus();
+				navigate({ to: "/" });
+			}
 		};
 		window.addEventListener("keydown", onKeyDown);
 		return () => window.removeEventListener("keydown", onKeyDown);
@@ -176,7 +204,7 @@ export function NavTopSection({
 }) {
 	const { t } = useTranslation("nav");
 	const { storedCollapsed } = useNavRender();
-	useSearchShortcut();
+	useNavShortcuts();
 	const brandRowRef = useRef<HTMLDivElement>(null);
 	const brandRef = useRef<HTMLDivElement>(null);
 	const brandScale = useCollapsedBrandScale(brandRef);
