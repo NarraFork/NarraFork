@@ -979,6 +979,8 @@ export async function saveTextFileToWorktree(cwd: string, file: File): Promise<T
 	const size = file.size;
 	const filePath = allocateWorktreeAttachmentPath(cwd, file.name);
 	try {
+		// `Bun.write` streams a disk-backed staged file and writes an in-memory
+		// multipart Blob directly; neither needs an extra `arrayBuffer()` copy.
 		await Bun.write(filePath, file);
 	} catch (error) {
 		rmSync(filePath, { force: true });

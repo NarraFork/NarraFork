@@ -7086,7 +7086,12 @@ async function editAndRegenerateUnlocked(
 	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
 		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	// Two budgets, because the two kinds reach the model differently. Images and
+	// media are base64-inlined into every provider request, so what the message
+	// retains of them stays bounded by the buffered 128 MiB. Text files are only
+	// passed to the model as paths, so they count toward the 2 GiB total alone.
 	let retainedAttachmentBytes = 0;
+	let retainedInlineBytes = 0;
 	const countedMediaIds = new Set<string>();
 	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
 		const owner = item.uploadNarratorId || targetMsg.narratorId;
@@ -7095,7 +7100,9 @@ async function editAndRegenerateUnlocked(
 		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
 		if (!countedMediaIds.has(mediaKey)) {
 			countedMediaIds.add(mediaKey);
-			retainedAttachmentBytes += Bun.file(mediaPath).size;
+			const size = Bun.file(mediaPath).size;
+			retainedAttachmentBytes += size;
+			retainedInlineBytes += size;
 		}
 	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
@@ -7210,6 +7217,7 @@ async function editAndRegenerateUnlocked(
 			if (!countedImageIds.has(imageKey)) {
 				countedImageIds.add(imageKey);
 				retainedAttachmentBytes += imageInfo.size;
+				retainedInlineBytes += imageInfo.size;
 			}
 		}
 		if (
@@ -7246,6 +7254,9 @@ async function editAndRegenerateUnlocked(
 				});
 			}
 		}
+	}
+	if (bufferedUploadBytes + retainedInlineBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 	}
 	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
 	if (finalAttachmentBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {

@@ -52,7 +52,9 @@ const {
 	resolveRequestedAttachmentKeys,
 	interruptAndWaitForIdle,
 } = await import("../narrator-session");
-const { setUploadsDirForTests } = await import("../../lib/uploads");
+const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
+	"../../lib/uploads"
+);
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -350,21 +352,76 @@ describe("editAndRegenerate native media history", () => {
 			"Combined attachments exceed the 128 MiB limit",
 		);
 	});
+	test("a large retained text file does not consume the inline media budget", async () => {
+		// Text files reach the model as paths, media as inline base64. A retained
+		// 200 MiB text attachment must not push a small new media file over the
+		// 128 MiB inline budget, though both still count toward the 2 GiB total.
+		const textPath = join(cwd, "big.log");
+		writeFileSync(textPath, "");
+		truncateSync(textPath, 200 * 1024 * 1024);
+		seed(cwd, [
+			{
+				type: "text_file",
+				fileId: "big",
+				filename: "big.log",
+				size: 200 * 1024 * 1024,
+				filePath: textPath,
+			},
+			{ type: "text", text: "before" },
+		]);
+		expect(
+			await editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				keepTextFilePaths: [textPath],
+				newMedia: [wavFile("added.wav")],
+			}),
+		).toMatchObject({ ok: true });
+		expect((await blocks()).filter(isMediaContentBlock)).toMatchObject([{ filename: "added.wav" }]);
+	});
+	test("retained images and media still share the 128 MiB inline budget", async () => {
+		// The counterpart of the test above: splitting the budgets must not let
+		// inline attachments escape the 128 MiB limit. Both are sparse-truncated to
+		// stay cheap; the check reads stat sizes before anything is copied.
+		const media = await saveUploadedMedia("n1", wavFile());
+		const mediaPath = getMediaPath("n1", media.mediaId);
+		if (!mediaPath) throw new Error("Missing media");
+		truncateSync(mediaPath, 70 * 1024 * 1024);
+		const image = await saveUploadedImage("n1", createPngFile("kept.png", 1, 1));
+		const imagePath = getImagePath("n1", image.imageId);
+		if (!imagePath) throw new Error("Missing image");
+		truncateSync(imagePath, 70 * 1024 * 1024);
+		seed(cwd, [
+			{ ...mediaRefToContentBlock(media) },
+			{ type: "image", imageId: image.imageId, filename: "kept.png", mediaType: "image/png" },
+			{ type: "text", text: "before" },
+		]);
+		const before = await blocks();
+		await expect(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).rejects.toThrow(
+			"Combined attachments exceed the 128 MiB limit",
+		);
+		expect(await blocks()).toEqual(before);
+	});
 	test("a later attachment write failure rolls back newly uploaded media and keeps old history", async () => {
 		seed(cwd, [{ type: "text", text: "before" }]);
 		const failing = new File(["text"], "fail.txt", { type: "text/plain" });
-		Object.defineProperty(failing, "arrayBuffer", {
-			value: async () => {
-				throw new Error("media rollback");
-			},
+		// Text attachments are written with `Bun.write(path, file)` (streamed, never
+		// `arrayBuffer()`), so the failure is injected at that write.
+		const realWrite = Bun.write;
+		const write = spyOn(Bun, "write").mockImplementation(async (...args) => {
+			if (args[1] === failing) throw new Error("media rollback");
+			return Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>;
 		});
-		await expect(
-			editAndRegenerate("n1", "m1", "after", "en", false, {
-				...editOptions,
-				newMedia: [wavFile()],
-				newTextFiles: [failing],
-			}),
-		).rejects.toThrow("media rollback");
+		try {
+			await expect(
+				editAndRegenerate("n1", "m1", "after", "en", false, {
+					...editOptions,
+					newMedia: [wavFile()],
+					newTextFiles: [failing],
+				}),
+			).rejects.toThrow("media rollback");
+		} finally {
+			write.mockRestore();
+		}
 		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual([]);
 		expect(await blocks()).toEqual([{ type: "text", text: "before" }]);
 	});
