@@ -74,6 +74,8 @@ const PROVIDER_KEYS = [
 const AGENT_PROVIDER_KEYS = [
 	"platformInstances",
 	"hiddenModels",
+	// Provider prefixes left out of auto:<model> routing; follows prefix renames on import.
+	"autoExcludedProviders",
 	"modelProtocols",
 	"modelProtocolOverrides",
 	"customModels",
@@ -1195,6 +1197,12 @@ function remapIncomingModelSettings(
 	if (Array.isArray(incoming.hiddenModels)) {
 		next.hiddenModels = incoming.hiddenModels.map((item) => rewrite(String(item)));
 	}
+	// A list of bare prefixes, not `前缀:模型` keys.
+	if (Array.isArray(incoming.autoExcludedProviders)) {
+		next.autoExcludedProviders = incoming.autoExcludedProviders.map(
+			(prefix) => remaps.get(String(prefix)) ?? String(prefix),
+		);
+	}
 	for (const key of ["modelProtocols", "modelProtocolOverrides"] as const) {
 		const record = incoming[key];
 		if (!record || typeof record !== "object" || Array.isArray(record)) continue;
@@ -1247,13 +1255,10 @@ function mergeAgentModelSettings(
 	const out = merged as Record<string, unknown>;
 	let changed = false;
 
-	if (Array.isArray(incoming.hiddenModels)) {
-		out.hiddenModels = [
-			...new Set([
-				...((agent.hiddenModels as string[] | undefined) ?? []),
-				...incoming.hiddenModels,
-			]),
-		];
+	for (const key of ["hiddenModels", "autoExcludedProviders"] as const) {
+		const list = incoming[key];
+		if (!Array.isArray(list)) continue;
+		out[key] = [...new Set([...((agent[key] as string[] | undefined) ?? []), ...list])];
 		changed = true;
 	}
 
@@ -1383,7 +1388,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		const agent = (current.agent ?? {}) as unknown as Record<string, unknown>;
 		const currentList = [...((agent.platformInstances ?? []) as Array<Record<string, unknown>>)];
 		const existingIds = new Set(currentList.map((entry) => String(entry.id ?? "")));
-		const existingPrefixes = new Set(currentList.map((entry) => String(entry.prefix ?? "")));
+		// `auto` is reserved for auto:<model> values, like the provider lists above.
+		const existingPrefixes = new Set([
+			"auto",
+			...currentList.map((entry) => String(entry.prefix ?? "")),
+		]);
 		for (const item of incomingInstances as Array<Record<string, unknown>>) {
 			const copy = { ...item };
 			const platform = String(copy.platform ?? "");
@@ -1499,7 +1508,12 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				// 不属于"删掉这个供应商"的范畴。
 				const agent = next.agent as unknown as Record<string, unknown> | undefined;
 				if (agent) {
-					for (const key of ["platformInstances", "hiddenModels", "customModels"] as const) {
+					for (const key of [
+						"platformInstances",
+						"hiddenModels",
+						"customModels",
+						"autoExcludedProviders",
+					] as const) {
 						const value = agent[key];
 						if (Array.isArray(value)) removed += value.length;
 						agent[key] = [];

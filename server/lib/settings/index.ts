@@ -797,6 +797,13 @@ export function purgeStaleAgentModelRefs(
 		dirty = true;
 	}
 	rewriteConnectionOverrides((model) => (isStale(model) ? null : model));
+	// A removed provider's prefix must not keep a future provider of the same prefix out of auto.
+	const origExcluded = settings.agent.autoExcludedProviders ?? [];
+	const cleanedExcluded = origExcluded.filter((prefix) => !isPrefixStale(prefix));
+	if (cleanedExcluded.length !== origExcluded.length) {
+		settings.agent.autoExcludedProviders = cleanedExcluded;
+		dirty = true;
+	}
 	const origCustom = settings.agent.customModels ?? [];
 	const cleanedCustom = origCustom.filter((m) => !isStale(m.value));
 	if (cleanedCustom.length !== origCustom.length) {

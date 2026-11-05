@@ -480,6 +480,28 @@ describe("逐模型设置随供应商一起导出", () => {
 		}
 	});
 
+	test("不参与自动的前缀随导出导入走、取并集，清空供应商时一起清掉", async () => {
+		const original = structuredClone(settings);
+		try {
+			agent().autoExcludedProviders = ["remote-relay"];
+			const exported = await exportData({ requests: false, sessions: false, providers: true });
+			const zip = await readFile(exported.zipPath);
+			const preview = await previewImport(toArrayBuffer(zip), "auto-excluded.zip");
+			expect(preview.providers.autoExcludedProviders).toEqual(["remote-relay"]);
+
+			agent().autoExcludedProviders = ["local-relay"];
+			await applyImport(preview.token, { conflictDefault: "skip" });
+			expect(agent().autoExcludedProviders).toEqual(
+				expect.arrayContaining(["local-relay", "remote-relay"]),
+			);
+
+			await clearData("providers");
+			expect(agent().autoExcludedProviders).toEqual([]);
+		} finally {
+			saveSettings(original);
+		}
+	});
+
 	test("模型覆盖按键合并：同键以导入为准，本地独有保留", async () => {
 		const original = structuredClone(settings);
 		const originalCatalog = settings.agent.modelCatalog;
@@ -555,6 +577,10 @@ describe("逐模型设置随供应商一起导出", () => {
 			(exported.agent as unknown as Record<string, unknown>).customModels = [
 				{ value: "openai:custom", label: "remote", provider: "openai" },
 			];
+			(exported.agent as unknown as Record<string, unknown>).autoExcludedProviders = [
+				"openai",
+				"openai-extra",
+			];
 			saveSettings(exported);
 
 			const zip = await readFile(
@@ -571,6 +597,7 @@ describe("逐模型设置随供应商一起导出", () => {
 				"openai:local": "completions-compatible",
 			};
 			(local.agent as unknown as Record<string, unknown>).customModels = [];
+			(local.agent as unknown as Record<string, unknown>).autoExcludedProviders = [];
 			saveSettings(local);
 			restores.push(replaceModelOverridesForTests({}));
 
@@ -596,6 +623,8 @@ describe("逐模型设置随供应商一起导出", () => {
 			expect(agent().customModels).toEqual([
 				{ value: "openai-2:custom", label: "remote", provider: "openai-2" },
 			]);
+			// Bare prefixes follow the rename too; the local provider stays in auto.
+			expect(agent().autoExcludedProviders).toEqual(["openai-2", "openai-extra"]);
 		} finally {
 			while (restores.length) restores.pop()?.();
 			saveSettings(original);
