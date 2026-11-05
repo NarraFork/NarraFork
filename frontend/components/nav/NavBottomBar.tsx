@@ -6,10 +6,10 @@
  * dot. Icons that do not fit the width go into "⋯", which also holds the entries the user
  * tucked away and the layout customisation. Sessions get all the height this saves.
  *
- * Collapsed (60px) the same entries stack vertically instead.
+ * Collapsed, only the avatar shows; the rest appears, in place, once the sidebar opens.
  */
 
-import { ActionIcon, Group, Indicator, Stack, Tooltip } from "@mantine/core";
+import { ActionIcon, Group, Indicator, Tooltip } from "@mantine/core";
 import { IconListDetails, IconSettings } from "@tabler/icons-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { type ComponentType, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -24,11 +24,12 @@ import {
 	splitNavBottomItems,
 } from "./nav-bottom-bar-logic";
 import { CUSTOMIZABLE_NAV_ITEMS, type NavItemDef } from "./nav-items";
-import { useNavRender } from "./nav-render-context";
 import { useNavBadges } from "./use-nav-badges";
 
 /** Avatar (28) + "⋯" (28) + the gaps around them. */
 const RESERVED_PX = 28 + 28 + 2 * 8;
+/** Fixed, so the session list above ends at the same line collapsed or not. */
+const NAV_BOTTOM_BAR_HEIGHT = 44;
 
 interface BarItem extends NavOverflowLink {
 	icon: ComponentType<{ size?: number | string }>;
@@ -42,18 +43,16 @@ function BarIcon({
 	item,
 	label,
 	badgeCount,
-	tooltipPosition,
 }: {
 	item: BarItem;
 	label: string;
 	badgeCount: number;
-	tooltipPosition: "top" | "right";
 }) {
 	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	const active = pathname.startsWith(item.activePrefix ?? item.to);
 	const Icon = item.icon;
 	return (
-		<Tooltip label={label} position={tooltipPosition} withArrow>
+		<Tooltip label={label} position="top" withArrow>
 			<ActionIcon
 				component={Link}
 				to={item.to}
@@ -86,7 +85,6 @@ export function NavBottomBar({
 }) {
 	const { t } = useTranslation("nav");
 	const resolveBadge = useNavBadges();
-	const { collapsed } = useNavRender();
 
 	const items = useMemo<BarItem[]>(() => {
 		const custom: BarItem[] = [];
@@ -115,72 +113,61 @@ export function NavBottomBar({
 		];
 	}, [visibleItems]);
 
+	// Collapsed, the bar keeps its expanded width (NavHoverPanel), so this is the same
+	// count either way and opening the sidebar never reshuffles the icons.
 	const barRef = useRef<HTMLDivElement>(null);
 	const [width, setWidth] = useState(0);
 	useLayoutEffect(() => {
 		const el = barRef.current;
-		if (!el || collapsed) return;
+		if (!el) return;
 		setWidth(el.clientWidth);
 		if (typeof ResizeObserver === "undefined") return;
 		const observer = new ResizeObserver(() => setWidth(el.clientWidth));
 		observer.observe(el);
 		return () => observer.disconnect();
-	}, [collapsed]);
+	}, []);
 
-	const fit = collapsed
-		? items.length
-		: width > 0
+	const fit =
+		width > 0
 			? navBottomFitCount({ width, reservedPx: RESERVED_PX, itemCount: items.length })
 			: items.length;
 	const { shown, overflow } = splitNavBottomItems(items, fit);
-	const icons = shown.map((item) => (
-		<BarIcon
-			key={item.id}
-			item={item}
-			label={t(item.labelKey)}
-			badgeCount={resolveBadge(item.badge).count}
-			tooltipPosition={collapsed ? "right" : "top"}
-		/>
-	));
-	const more = (
-		<NavOverflowMenu
-			entries={entries}
-			onSaveLayout={onSaveLayout}
-			navCollapsed={collapsed}
-			overflowLinks={overflow}
-		/>
-	);
 
-	if (collapsed) {
-		return (
-			<Stack gap={NAV_BOTTOM_GAP_PX} align="center" mt={4}>
-				{icons}
-				{more}
-				<NavUserMenu onLogout={onLogout} navCollapsed />
-			</Stack>
-		);
-	}
 	return (
 		<Group
 			ref={barRef}
 			gap={8}
 			wrap="nowrap"
 			mt={4}
-			px={4}
+			// 6 puts the 28px avatar's centre on the row icons' column (x = 36).
+			px={6}
+			h={NAV_BOTTOM_BAR_HEIGHT}
 			justify="space-between"
 			data-nav-bottom-bar
-			style={{ borderTop: "1px solid var(--mantine-color-default-border)", paddingTop: 6 }}
+			className="nf-nav-bottom-bar"
+			style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 		>
-			<NavUserMenu onLogout={onLogout} navCollapsed={false} />
+			<NavUserMenu onLogout={onLogout} />
+			{/* Past the collapsed width; shown once the sidebar opens (nav-collapsed.css). */}
 			<Group
 				gap={NAV_BOTTOM_GAP_PX}
 				wrap="nowrap"
 				style={{ flex: 1, minWidth: 0 }}
 				justify="center"
+				className="nf-nav-expanded-only"
 			>
-				{icons}
+				{shown.map((item) => (
+					<BarIcon
+						key={item.id}
+						item={item}
+						label={t(item.labelKey)}
+						badgeCount={resolveBadge(item.badge).count}
+					/>
+				))}
 			</Group>
-			{more}
+			<div className="nf-nav-expanded-only" style={{ display: "flex", flexShrink: 0 }}>
+				<NavOverflowMenu entries={entries} onSaveLayout={onSaveLayout} overflowLinks={overflow} />
+			</div>
 		</Group>
 	);
 }

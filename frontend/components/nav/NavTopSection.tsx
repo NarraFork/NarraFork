@@ -1,18 +1,24 @@
 /**
  * Top of the sidebar: brand row (collapses the sidebar; notifications and workspaces on
  * the right), a status row that only appears when something needs saying, the search box
- * and "New session".
+ * and "New session". Collapsed shows the left part of the same rows (NavHoverPanel).
  *
  * These used to live in the page header. The header is gone on desktop, so everything
  * global sits here, in the column the reader already scans.
  */
 
-import { ActionIcon, Group, Kbd, NavLink, Stack, TextInput, Tooltip } from "@mantine/core";
+import { Group, Kbd, NavLink, Stack, TextInput, Tooltip } from "@mantine/core";
 import { IconEdit, IconSearch } from "@tabler/icons-react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import {
+	type ReactNode,
+	type RefObject,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
-import { useBranding } from "../../hooks/useBranding";
 import { useMobileViewport } from "../../hooks/useMobileViewport";
 import { requestDashboardComposerFocus } from "../../lib/dashboard-composer-focus";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "../../lib/use-match-media";
@@ -51,8 +57,8 @@ export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
 		select: (state) => state.location.pathname.match(/^\/projects\/([^/]+)/)?.[1],
 	});
 
-	// ⌘K / Ctrl+K (see `useNavSearchShortcut`) and the rail's search icon ask for focus;
-	// the box may mount only after the rail opens, so it also takes a pending request.
+	// ⌘K / Ctrl+K (see `useNavSearchShortcut`) asks for focus. The request is held, so a
+	// box mounted after the request (the phone drawer) still takes it.
 	useEffect(() => {
 		const take = () => {
 			const input = inputRef.current;
@@ -89,7 +95,10 @@ export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
 				if (e.key === "Enter" && !e.nativeEvent.isComposing) search();
 				if (e.key === "Escape") e.currentTarget.blur();
 			}}
-			leftSection={<IconSearch size={14} />}
+			// 40px: the icon's centre on the row icons' column, the text on their titles'.
+			leftSection={<IconSearch size={16} />}
+			leftSectionWidth={40}
+			className="nf-nav-search"
 			// A keyboard hint means nothing without a keyboard.
 			rightSection={isTouch ? undefined : <Kbd size="xs">{IS_MAC ? "⌘K" : "Ctrl K"}</Kbd>}
 			rightSectionWidth={isTouch ? undefined : IS_MAC ? 36 : 52}
@@ -99,31 +108,35 @@ export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
 	);
 }
 
+/**
+ * The brand row's fixed height: the badges, the workspace button and the bell all fit
+ * in it, so nothing below moves when one of them appears.
+ */
+const NAV_BRAND_ROW_HEIGHT = 32;
+/**
+ * Width the brand shrinks into when collapsed: the 72px column less 8px each side. It
+ * sits at x = 20 (16px navbar padding + the row's 4px), so nav-collapsed.css also
+ * shifts it 12px left, onto x = 8.
+ */
+const NAV_COLLAPSED_BRAND_ROOM_PX = 56;
+
 /** Goes to the home page and puts the cursor in its composer. */
-export function NewSessionLink({
-	collapsed,
-	onNavigate,
-}: {
-	collapsed: boolean;
-	onNavigate?: () => void;
-}) {
+export function NewSessionLink({ onNavigate }: { onNavigate?: () => void }) {
 	const { t } = useTranslation("nav");
 	const navigate = useNavigate();
 	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	return (
-		<Tooltip label={t("newSession")} position="right" disabled={!collapsed}>
-			<NavLink
-				label={collapsed ? undefined : t("newSession")}
-				active={pathname === "/"}
-				leftSection={<IconEdit size={16} />}
-				onClick={() => {
-					requestDashboardComposerFocus();
-					navigate({ to: "/" });
-					onNavigate?.();
-				}}
-				aria-label={t("newSession")}
-			/>
-		</Tooltip>
+		<NavLink
+			label={t("newSession")}
+			active={pathname === "/"}
+			leftSection={<IconEdit size={16} />}
+			onClick={() => {
+				requestDashboardComposerFocus();
+				navigate({ to: "/" });
+				onNavigate?.();
+			}}
+			aria-label={t("newSession")}
+		/>
 	);
 }
 
@@ -142,66 +155,28 @@ function useNavSearchShortcut(openPanel: () => void) {
 	}, [openPanel]);
 }
 
-/** The brand's first letter, the rail's stand-in for the full name. */
-function BrandMark({ onClick, label }: { onClick: () => void; label: string }) {
-	const branding = useBranding();
-	return (
-		<Tooltip label={label} position="right">
-			<ActionIcon
-				variant="light"
-				size={32}
-				radius="md"
-				onClick={onClick}
-				aria-label={label}
-				className="nf-nav-brand-mark"
-			>
-				<span style={{ fontWeight: 700, fontSize: 15 }}>{branding.name.slice(0, 1)}</span>
-			</ActionIcon>
-		</Tooltip>
-	);
-}
-
 export function NavTopSection({
 	onToggleCollapsed,
 	statusBadges,
 	onNavigate,
 }: {
 	onToggleCollapsed: () => void;
-	/** Maintenance / update / evidence / output-speed badges; each renders null when idle. */
+	/** Maintenance / update / evidence badges; each renders null when idle. */
 	statusBadges: ReactNode;
 	onNavigate?: () => void;
 }) {
 	const { t } = useTranslation("nav");
-	const { collapsed, storedCollapsed, openPanel } = useNavRender();
+	const { storedCollapsed, openPanel } = useNavRender();
 	useNavSearchShortcut(openPanel);
 	const brandRowRef = useRef<HTMLDivElement>(null);
+	const brandRef = useRef<HTMLDivElement>(null);
+	const brandScale = useCollapsedBrandScale(brandRef);
 	const isMobile = useMobileViewport();
 	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 
-	if (collapsed) {
-		return (
-			<Stack gap={4} mb={6} align="center" className="nf-nav-brand-row">
-				<BrandMark onClick={onToggleCollapsed} label={t("expandSidebar")} />
-				<Tooltip label={t("searchPlaceholder")} position="right">
-					<ActionIcon
-						variant="subtle"
-						color="gray"
-						size={32}
-						onClick={() => {
-							openPanel();
-							requestNavSearchFocus();
-						}}
-						aria-label={t("searchPlaceholder")}
-					>
-						<IconSearch size={18} />
-					</ActionIcon>
-				</Tooltip>
-				<NewSessionLink collapsed onNavigate={onNavigate} />
-				<NotificationBell />
-				<WorkspaceSwitcher />
-			</Stack>
-		);
-	}
+	// One layout, collapsed or not: collapsed clips every row to its icon (NavHoverPanel,
+	// nav-collapsed.css), so the icons stay where they are and the rest appears in place
+	// once it opens.
 	return (
 		<Stack gap={6} mb={6}>
 			<Group
@@ -211,6 +186,7 @@ export function NavTopSection({
 				gap={4}
 				className="nf-nav-brand-row"
 				px={4}
+				h={NAV_BRAND_ROW_HEIGHT}
 				pos="relative"
 			>
 				{/* Phones: pull down here to reload the app (the header row it lived on is
@@ -222,12 +198,22 @@ export function NavTopSection({
 					openDelay={400}
 				>
 					<BrandTitle
+						ref={brandRef}
 						order={4}
 						onClick={onToggleCollapsed}
-						style={{ cursor: "pointer", userSelect: "none", minWidth: 0 }}
+						className="nf-nav-brand"
+						style={{
+							cursor: "pointer",
+							userSelect: "none",
+							minWidth: 0,
+							flexShrink: 0,
+							// Collapsed: the name and its attribution line shrink together to fit
+							// the column (nav-collapsed.css). A transform, so the row keeps its height.
+							"--nf-nav-brand-scale": brandScale,
+						}}
 					/>
 				</Tooltip>
-				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }} className="nf-nav-expanded-only">
 					<WorkspaceSwitcher />
 					<NotificationBell />
 				</Group>
@@ -237,7 +223,29 @@ export function NavTopSection({
 				{statusBadges}
 			</Group>
 			<NavSearchBox onSearched={onNavigate} />
-			<NewSessionLink collapsed={false} onNavigate={onNavigate} />
+			<NewSessionLink onNavigate={onNavigate} />
 		</Stack>
 	);
+}
+
+/**
+ * How far the brand shrinks to fit the collapsed column: its natural width against the
+ * room left of the column's right margin. 1 when it already fits.
+ */
+function useCollapsedBrandScale(ref: RefObject<HTMLDivElement | null>): number {
+	const [scale, setScale] = useState(1);
+	useLayoutEffect(() => {
+		const el = ref.current;
+		if (!el) return;
+		const measure = () => {
+			const width = el.offsetWidth;
+			setScale(width > 0 ? Math.min(1, NAV_COLLAPSED_BRAND_ROOM_PX / width) : 1);
+		};
+		measure();
+		if (typeof ResizeObserver === "undefined") return;
+		const observer = new ResizeObserver(measure);
+		observer.observe(el);
+		return () => observer.disconnect();
+	}, [ref]);
+	return scale;
 }

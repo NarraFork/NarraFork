@@ -1,15 +1,18 @@
 /**
- * The sidebar's content box, and the collapsed rail's hover expansion.
+ * The sidebar's content box, and the collapsed sidebar's hover expansion.
  *
- * Collapsed, the sidebar is a 60px column of icons. Resting the mouse on it opens the
- * full sidebar as an overlay at the last expanded width: this box becomes absolutely
- * positioned over the page, so the page itself does not reflow, and the 60px column
- * underneath stays put. Moving away closes it again (see `nav-hover-expand.ts` for the
- * timing and what keeps it open). Touch and the phone drawer are not affected: a phone
- * drawer always renders expanded.
+ * Collapsed and expanded are ONE layout. The content box always lays out at the
+ * expanded width; collapsed, the navbar is narrower and clips the box's right side.
+ * Opening on hover only lifts the clip and paints the box over the page, so no row, icon
+ * or title moves between the two states: where the mouse pointed while collapsed is
+ * exactly what it points at once open.
  *
- * Owning the hover state here, and passing the rendered state down by context, keeps a
- * hover from re-rendering the app shell that hosts this box.
+ * Resting the mouse on the collapsed sidebar opens it; moving away closes it again (see
+ * `nav-hover-expand.ts` for the timing and what keeps it open). Touch and the phone
+ * drawer are not affected: a phone drawer always renders expanded.
+ *
+ * Owning the hover state here, and passing it down by context, keeps a hover from
+ * re-rendering the app shell that hosts this box.
  */
 
 import { getNavExpandedWidth, startNavResize } from "@frontend/hooks/useResizableNav";
@@ -18,24 +21,20 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useMobileViewport } from "../../hooks/useMobileViewport";
 import {
 	createNavHoverIntent,
+	hasFocusVisibleWithin,
 	hasVisibleLayer,
 	isOwnedTarget,
+	matchesFocusVisible,
 	OPEN_POPUP_SELECTOR,
 } from "./nav-hover-expand";
 import { NavRenderContext, type NavRenderState } from "./nav-render-context";
 
 export function NavHoverPanel({
 	collapsed,
-	expandedPadding,
-	expandedBottomGutter,
 	children,
 }: {
-	/** The stored preference: the sidebar is the collapsed rail. */
+	/** The stored preference: the sidebar is collapsed. */
 	collapsed: boolean;
-	/** Padding of the open overlay (the expanded sidebar's own padding). */
-	expandedPadding: string;
-	/** Bottom gutter of the open overlay (home-indicator clearance included). */
-	expandedBottomGutter: string;
 	children: ReactNode;
 }) {
 	const isMobile = useMobileViewport();
@@ -51,13 +50,11 @@ export function NavHoverPanel({
 				const panel = panelRef.current;
 				if (!panel) return false;
 				if (pressedRef.current) return true;
-				const focused = document.activeElement;
-				if (focused instanceof HTMLInputElement && panel.contains(focused)) return true;
+				if (hasFocusVisibleWithin(panel)) return true;
 				return panel.querySelector(OPEN_POPUP_SELECTOR) !== null || hasVisibleLayer();
 			},
 		}),
 	);
-
 	useEffect(() => {
 		if (!canHover) intent.reset();
 	}, [canHover, intent]);
@@ -88,19 +85,19 @@ export function NavHoverPanel({
 		};
 	}, []);
 
-	const overlay = canHover && hoverOpen;
-	const renderCollapsed = canHover && !hoverOpen;
+	const open = canHover && hoverOpen;
 	const state = useMemo<NavRenderState>(
-		() => ({ collapsed: renderCollapsed, storedCollapsed: collapsed, openPanel: intent.open }),
-		[renderCollapsed, collapsed, intent],
+		() => ({ storedCollapsed: collapsed, openPanel: intent.open }),
+		[collapsed, intent],
 	);
+	const expandedWidth = getNavExpandedWidth();
 
 	return (
 		<NavRenderContext.Provider value={state}>
 			<Box
 				ref={panelRef}
-				data-nav-hover-panel={overlay ? "open" : undefined}
-				data-collapsed={renderCollapsed || undefined}
+				// "closed" also makes the navbar clip this box (nav-collapsed.css).
+				data-nav-hover-panel={open ? "open" : canHover ? "closed" : undefined}
 				onPointerEnter={(e) => {
 					if (e.pointerType === "mouse" && canHover) intent.enter();
 				}}
@@ -110,42 +107,54 @@ export function NavHoverPanel({
 				onPointerDown={() => {
 					pressedRef.current = true;
 				}}
-				style={
-					overlay
-						? {
-								position: "absolute",
-								top: 0,
-								left: 0,
-								bottom: 0,
-								zIndex: 1,
-								width: getNavExpandedWidth(),
-								display: "flex",
-								flexDirection: "column",
-								padding: expandedPadding,
-								paddingBottom: expandedBottomGutter,
-								background: "var(--mantine-color-body)",
-								borderInlineEnd: "1px solid var(--mantine-color-default-border)",
-								boxShadow: "var(--mantine-shadow-xl)",
-							}
-						: {
-								flex: 1,
-								minHeight: 0,
-								display: "flex",
-								flexDirection: "column",
-								// A phone drawer always renders expanded, also under a collapsed
-								// preference whose navbar padding is the rail's 4px.
-								...(collapsed && isMobile
-									? { paddingInline: "calc(var(--mantine-spacing-md) - 4px)" }
-									: {}),
-							}
-				}
+				// Tab onto something the collapsed width clips: open, so it is visible.
+				onFocus={(e) => {
+					if (canHover && matchesFocusVisible(e.target)) intent.open();
+				}}
+				onBlur={(e) => {
+					const next = e.relatedTarget;
+					if (!canHover || (next instanceof Node && e.currentTarget.contains(next))) return;
+					// The mouse may still be resting on it; then the pointer decides.
+					if (!e.currentTarget.matches(":hover")) intent.leave();
+				}}
+				style={{
+					flex: 1,
+					minHeight: 0,
+					display: "flex",
+					flexDirection: "column",
+					// Collapsed (desktop): the width this box has in the expanded navbar, i.e.
+					// the expanded width less the navbar's inline padding and its 1px border.
+					// Not positioned, so the backdrop and the resize handle below place
+					// themselves against the navbar.
+					...(canHover
+						? { width: `calc(${expandedWidth}px - 2 * var(--mantine-spacing-md) - 1px)` }
+						: {}),
+				}}
 			>
-				{overlay ? (
-					// The WCO traffic-light spacer, which the overlay covers in the column below.
-					<Box className="nf-wco-nav-spacer" aria-hidden />
-				) : (
-					// Resize handle on the sidebar's edge. Not on the overlay: it measures from the
-					// stored (collapsed) width, so a drag from the overlay's edge would jump.
+				{open && (
+					// What the expanded navbar would paint: the page colour and its edge, over
+					// the full height from the window edge. Behind every row (z-index -1 in the
+					// navbar's isolated stacking context), and part of this box, so the pointer
+					// on its blank strips is still "inside" and a click there is the panel's.
+					<Box
+						aria-hidden
+						style={{
+							position: "absolute",
+							top: 0,
+							bottom: 0,
+							left: 0,
+							width: expandedWidth,
+							zIndex: -1,
+							background: "var(--mantine-color-body)",
+							borderInlineEnd: "1px solid var(--mantine-color-default-border)",
+							boxShadow: "var(--mantine-shadow-xl)",
+						}}
+					/>
+				)}
+				{!open && (
+					// Resize handle on the navbar's edge. Not while open: it measures from the
+					// stored (collapsed) width, so a drag from the open panel's edge would jump.
+					// Collapsed it sits fully inside the edge, which clips anything past it.
 					// Pointer events so touch drags work; `touch-action: none` keeps the browser
 					// from claiming the gesture as a scroll.
 					<Box
@@ -154,7 +163,7 @@ export function NavHoverPanel({
 						style={{
 							position: "absolute",
 							top: 0,
-							right: -3,
+							right: canHover ? 0 : -3,
 							width: 6,
 							height: "100%",
 							cursor: "col-resize",

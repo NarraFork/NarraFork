@@ -73,7 +73,6 @@ export function WorkspaceSwitcher() {
 								style={{ maxWidth: 140, flexShrink: 1, minWidth: 0 }}
 								aria-label={t("workspaces")}
 							>
-								{/* The collapsed rail shows the icon only (nav-collapsed.css). */}
 								<Text size="xs" truncate ml={6} className="nf-workspace-switcher-title">
 									{current.title || t("untitledWorkspace")}
 								</Text>

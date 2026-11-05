@@ -1,21 +1,56 @@
 /*
- * Collapsed navbar: center NavLink icons when label is hidden.
- * Applied via data-collapsed attribute on AppShell.Navbar.
+ * Collapsed sidebar: the expanded content box, laid out at the expanded width and clipped
+ * at the navbar's edge (see NavHoverPanel). Every row's icon sits in the first 40px of
+ * its row, so clipping each row to that block leaves a column of icons. Open on hover,
+ * the clips come off and the box paints over the page at the same position: nothing in
+ * it moves, the titles and the controls on the right appear in place.
+ *
+ * Clipping (clip-path, overflow) never changes layout, which is what keeps every row at
+ * the same x/y in both states.
  */
-
-[data-collapsed] .mantine-NavLink-root {
-	justify-content: center;
-	padding-inline: 0;
+.mantine-AppShell-navbar:has(> [data-nav-hover-panel="closed"]) {
+	overflow-x: clip;
 }
 
-[data-collapsed] .mantine-NavLink-section {
-	margin-inline-end: 0;
+[data-nav-hover-panel="closed"]
+	:is(
+		.mantine-NavLink-root,
+		[data-folder-unit],
+		[data-recent-tab-pin-divider],
+		.nf-nav-search,
+		.nf-nav-status-row,
+		.nf-nav-bottom-bar
+	) {
+	clip-path: inset(0 calc(100% - 40px) 0 0 round var(--mantine-radius-sm));
 }
 
-[data-collapsed] .mantine-NavLink-body,
-[data-collapsed] .mantine-NavLink-section[data-position="right"],
-[data-collapsed] .nf-workspace-switcher-title {
-	display: none;
+/* The search box is only its icon until it opens. */
+[data-nav-hover-panel="closed"] .nf-nav-search input {
+	border-color: transparent;
+	background: transparent;
+}
+
+/*
+ * Controls past the icon column that no clip above covers (the brand row's workspace
+ * button and bell; the bottom bar's icons, for keyboard focus). `visibility`, not
+ * `display`: they keep their place.
+ */
+[data-nav-hover-panel="closed"] .nf-nav-expanded-only {
+	visibility: hidden;
+}
+
+/*
+ * The brand: the name and its attribution line shrink together to fit the column
+ * (NavTopSection measures the scale). A transform, so the row keeps its height; moved
+ * 12px left so it is centred in the column (it starts at x = 20, the column is 0-72).
+ */
+.nf-nav-brand {
+	transform-origin: left center;
+	transition: transform 150ms ease;
+}
+
+[data-nav-hover-panel="closed"] .nf-nav-brand {
+	transform: translateX(-12px) scale(var(--nf-nav-brand-scale, 1));
 }
 
 /* Sidebar status row (maintenance / update / evidence badges): no gap when empty. */

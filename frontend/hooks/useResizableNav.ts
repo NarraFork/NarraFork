@@ -24,8 +24,13 @@ import { useSyncExternalStore } from "react";
 const STORAGE_KEY = "narrafork_nav_width";
 const DEFAULT_WIDTH = 250;
 const EXPANDED_MIN = 180;
-const COLLAPSED_WIDTH = 60;
-const COLLAPSE_THRESHOLD = 72;
+/**
+ * The collapsed sidebar: the expanded one, clipped to a column of its row icons (see
+ * NavHoverPanel). Every row icon sits at x 28–44 (16px navbar padding + 12px NavLink
+ * padding), so 72px inside plus the navbar's 1px border centres them.
+ */
+const COLLAPSED_WIDTH = 73;
+const COLLAPSE_THRESHOLD = 85;
 const MAX_WIDTH = 480;
 
 /**
@@ -43,7 +48,9 @@ function readStoredWidth(): number {
 		const saved = localStorage.getItem(STORAGE_KEY);
 		if (saved) {
 			const n = Number(saved);
-			if (n >= COLLAPSED_WIDTH && n <= MAX_WIDTH) return n;
+			// Below the expanded minimum is collapsed, whatever width an older rail stored.
+			if (n > 0 && n < EXPANDED_MIN) return COLLAPSED_WIDTH;
+			if (n >= EXPANDED_MIN && n <= MAX_WIDTH) return n;
 		}
 	} catch {
 		// Storage unavailable (private mode, quota, blocked): use the default.

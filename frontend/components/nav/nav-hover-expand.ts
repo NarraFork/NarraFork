@@ -138,6 +138,25 @@ export function hasVisibleLayer(root: ParentNode = document): boolean {
 	return false;
 }
 
+/**
+ * Keyboard focus (and any focused text field, which browsers always count as visible).
+ * A mouse-clicked link keeps focus too but does not match, so it never pins the panel.
+ * DOMs without `:focus-visible` support throw on the selector; treat that as "no".
+ */
+export function matchesFocusVisible(el: Element): boolean {
+	try {
+		return el.matches(":focus-visible");
+	} catch {
+		return false;
+	}
+}
+
+/** Does the panel hold keyboard focus (see `matchesFocusVisible`)? */
+export function hasFocusVisibleWithin(panel: Element): boolean {
+	const focused = panel.ownerDocument.activeElement;
+	return !!focused && panel.contains(focused) && matchesFocusVisible(focused);
+}
+
 /** Inside the panel, or inside something it opened. */
 export function isOwnedTarget(panel: HTMLElement, target: EventTarget | null): boolean {
 	if (!(target instanceof Node)) return false;

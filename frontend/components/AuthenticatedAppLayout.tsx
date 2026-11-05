@@ -313,9 +313,11 @@ export function AuthenticatedLayout() {
 	// The Navbar's gutter for the three sides that are not the bottom edge. The bottom
 	// edge is owned by the `data-safe-area` spacer, which folds this same value into a
 	// `max()` against the inset instead of adding to it.
-	const navbarPadding = wizardOpen ? 0 : navCollapsed ? 4 : "md";
+	// The same collapsed or not: collapsed is the expanded sidebar clipped (NavHoverPanel),
+	// so its rows must sit where they would expanded.
+	const navbarPadding = wizardOpen ? 0 : "md";
 	const navbarBottomGutter = appShellNavbarBottomGutter(
-		wizardOpen ? "0px" : navCollapsed ? "4px" : "var(--mantine-spacing-md)",
+		wizardOpen ? "0px" : "var(--mantine-spacing-md)",
 	);
 	// Phone only (the bar is `hiddenFrom="sm"`): the wizard's drawer was closed to look at
 	// the page, and the header becomes the bar that brings it back.
@@ -403,11 +405,7 @@ export function AuthenticatedLayout() {
 							</Suspense>
 						</LazyOverlayBoundary>
 					) : (
-						<NavHoverPanel
-							collapsed={navCollapsed}
-							expandedPadding="var(--mantine-spacing-md)"
-							expandedBottomGutter={appShellNavbarBottomGutter("var(--mantine-spacing-md)")}
-						>
+						<NavHoverPanel collapsed={navCollapsed}>
 							<NavTopSection
 								onToggleCollapsed={toggleNavCollapsed}
 								onNavigate={closeNav}

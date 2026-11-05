@@ -35,8 +35,6 @@ interface NavOverflowMenuProps {
 	/** Flat ordered layout including the divider entry. */
 	entries: NavLayoutEntry[];
 	onSaveLayout: (entries: NavLayoutEntry[]) => void;
-	/** Whether the sidebar is collapsed (icon-only). */
-	navCollapsed: boolean;
 	/** Bottom-bar icons that did not fit; listed first, as plain links. */
 	overflowLinks?: NavOverflowLink[];
 }
@@ -144,7 +142,6 @@ function SortableDivider() {
 export function NavOverflowMenu({
 	entries,
 	onSaveLayout,
-	navCollapsed,
 	overflowLinks = [],
 }: NavOverflowMenuProps) {
 	const { t } = useTranslation("nav");
@@ -194,7 +191,7 @@ export function NavOverflowMenu({
 		<Menu
 			opened={menuOpen}
 			onChange={setMenuOpen}
-			position={navCollapsed ? "right-end" : "top-end"}
+			position="top-end"
 			withArrow
 			// The menu itself is the drop target — don't close on item click.
 			closeOnItemClick={false}
@@ -202,15 +199,15 @@ export function NavOverflowMenu({
 			width={220}
 		>
 			<Menu.Target>
-				<Tooltip label={t("more")} position={navCollapsed ? "right" : "top"} disabled={menuOpen}>
+				<Tooltip label={t("more")} position="top" disabled={menuOpen}>
 					<ActionIcon
 						variant="subtle"
 						color="gray"
-						size={navCollapsed ? "lg" : "md"}
+						size="md"
 						aria-label={t("more")}
 						style={{ flexShrink: 0 }}
 					>
-						<IconDots size={navCollapsed ? 18 : 16} />
+						<IconDots size={16} />
 					</ActionIcon>
 				</Tooltip>
 			</Menu.Target>

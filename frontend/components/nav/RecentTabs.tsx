@@ -68,7 +68,6 @@ import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
-import { useNavRender } from "./nav-render-context";
 import { RecentTabDetailCard } from "./RecentTabDetailCard";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import { RecentTabFolderEditModal } from "./RecentTabFolderEditModal";
@@ -466,8 +465,6 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const { removeTab, moveTab, pinTab, updateFolder, dissolveFolder, clearTabs } = recentTabs;
 	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	const [hoverStore] = useState(createRecentTabHoverStore);
-	// The icon-only rail: rows keep their status bubble, a folder shows only its header.
-	const railCollapsed = useNavRender().collapsed;
 	const sectionState = filter === "project" ? recentTabs.projects : recentTabs.work;
 	const tabs = sectionState.tabs;
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -977,22 +974,21 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						onSwipeMenu={handleSwipeMenu}
 						t={t}
 					/>
-					{!railCollapsed &&
-						view.visible.map((member, index) => (
-							<React.Fragment key={tabSortId(member)}>
-								{index > 0 && index === firstUnpinned && <RecentTabFolderPinDivider />}
-								<DraggableTabItem
-									tab={member}
-									active={isRowActive(member)}
-									onRemove={handleRemove}
-									onSwipeMenu={handleSwipeMenu}
-									onNavigate={onNavigate}
-									onContextMenu={handleContextMenu}
-									onPrefetch={prefetchNarratorTab}
-								/>
-							</React.Fragment>
-						))}
-					{!railCollapsed && view.display !== "collapsed" && row.members.length > 0 && (
+					{view.visible.map((member, index) => (
+						<React.Fragment key={tabSortId(member)}>
+							{index > 0 && index === firstUnpinned && <RecentTabFolderPinDivider />}
+							<DraggableTabItem
+								tab={member}
+								active={isRowActive(member)}
+								onRemove={handleRemove}
+								onSwipeMenu={handleSwipeMenu}
+								onNavigate={onNavigate}
+								onContextMenu={handleContextMenu}
+								onPrefetch={prefetchNarratorTab}
+							/>
+						</React.Fragment>
+					))}
+					{view.display !== "collapsed" && row.members.length > 0 && (
 						<RecentTabFolderStrip
 							folder={folder}
 							members={row.members}
@@ -1167,7 +1163,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								{renderRows(pinnedRows)}
 								{filter === "narrator" && (
 									<RecentTabPinDivider
-										clearable={hasClearableTabs && !railCollapsed}
+										clearable={hasClearableTabs}
 										onClear={() => clearTabs("inactive_narrators", activeTabKey)}
 										touch={isTouch}
 										t={t}

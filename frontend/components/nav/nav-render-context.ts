@@ -2,25 +2,22 @@
  * Shared state between the sidebar shell and its sections, kept out of the component
  * modules so they stay valid Fast Refresh boundaries (see `recent-tabs-logic.ts`).
  *
- * `collapsed` is how the sidebar renders right now, not the stored preference: a
- * collapsed rail that is open on hover renders expanded, and a phone drawer always does.
- * It comes from `NavHoverPanel` through context so that opening on hover re-renders only
- * the sections that read it, not the whole app shell.
+ * The sections render the same tree collapsed or not (`NavHoverPanel` clips it), so
+ * they only need the stored preference, for the brand's tooltip, and a way to open the
+ * collapsed sidebar. It comes from `NavHoverPanel` through context so that opening on
+ * hover re-renders nothing above it.
  */
 
 import { createContext, useContext } from "react";
 
 export interface NavRenderState {
-	/** Render the icon-only rail. */
-	collapsed: boolean;
-	/** The stored preference is the rail (it may be open on hover right now). */
+	/** The stored preference is collapsed (it may be open on hover right now). */
 	storedCollapsed: boolean;
-	/** Open the collapsed rail now (a rail icon that needs the full panel was clicked). */
+	/** Open the collapsed sidebar now (Cmd/Ctrl+K). */
 	openPanel: () => void;
 }
 
 export const NavRenderContext = createContext<NavRenderState>({
-	collapsed: false,
 	storedCollapsed: false,
 	openPanel: () => {},
 });
