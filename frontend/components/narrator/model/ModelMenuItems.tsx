@@ -33,8 +33,10 @@ import {
 } from "../../../lib/constants";
 import { modelInheritanceLabel } from "./model-inheritance-label";
 import {
+	autoChoiceReason,
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
+	formatReferencePrice,
 	modelMenuSelection,
 	modelProviderPrefix,
 	orderModelGroupEntries,
@@ -234,6 +236,11 @@ export function ModelMenuItems({
 							roleTargetValue ?? "",
 							modelProviderPrefix(roleTargetValue) ?? "",
 							m.rateMultiplier != null ? String(m.rateMultiplier) : "",
+							// An auto row is found by the services that serve it, too.
+							...(m.autoSources ?? []).flatMap((source) => [
+								source.value,
+								provLabels[source.provider] ?? source.provider,
+							]),
 						]
 							.join(" ")
 							.toLowerCase();
@@ -496,6 +503,9 @@ export function ModelMenuItems({
 								// What "auto" would use now: the first source that can serve.
 								const autoChoice =
 									m.autoSources?.find((source) => source.available) ?? m.autoSources?.[0];
+								const autoReason = showAutoSources
+									? autoChoiceReason(m.autoSources ?? [], provLabels, t)
+									: null;
 								// Default/Summary rows sit under a role header, not a provider group,
 								// so surface the resolved target's provider prefix as a small line.
 								const roleTargetValue =
@@ -700,12 +710,23 @@ export function ModelMenuItems({
 										)}
 										{showAutoSources &&
 											[
-												{ value: m.value, provider: "", available: true, subscription: false },
+												{
+													value: m.value,
+													provider: "",
+													available: true,
+													subscription: false,
+													referencePrice: undefined,
+												},
 												...(m.autoSources ?? []),
 											].map((source) => {
 												const isAutoEntry = source.value === m.value;
 												const sourceSelected = source.value === selection.value;
 												const providerLabel = provLabels[source.provider] ?? source.provider;
+												// The same allowance bars the provider's own group header shows.
+												const quota = isAutoEntry ? undefined : providerBadges?.[source.provider];
+												const price = isAutoEntry
+													? null
+													: formatReferencePrice(source.referencePrice);
 												return (
 													<Menu.Item
 														key={`auto-source:${source.value}`}
@@ -714,8 +735,30 @@ export function ModelMenuItems({
 														fw={sourceSelected ? 600 : 400}
 														c={!isAutoEntry && !source.available ? "dimmed" : undefined}
 														onClick={() => onSelect(source.value)}
+														data-auto-source={isAutoEntry ? "auto" : source.value}
 														rightSection={
 															<Group gap={4} wrap="nowrap">
+																{quota?.bars && quota.bars.length > 0 && (
+																	<Tooltip
+																		label={quota.tooltip}
+																		disabled={!quota.tooltip}
+																		multiline
+																		withinPortal
+																		style={{ whiteSpace: "pre-line" }}
+																	>
+																		<span
+																			role="img"
+																			aria-label={quota.text}
+																			style={{ display: "inline-flex", flexShrink: 0 }}
+																		>
+																			<QuotaWindowBars
+																				bars={quota.bars}
+																				size="xs"
+																				stale={quota.stale}
+																			/>
+																		</span>
+																	</Tooltip>
+																)}
 																{!isAutoEntry && source.subscription && (
 																	<Badge size="xs" variant="light" color="teal">
 																		{t("autoSourceSubscription")}
@@ -730,6 +773,27 @@ export function ModelMenuItems({
 																	size={14}
 																	style={{ visibility: sourceSelected ? "visible" : "hidden" }}
 																/>
+																{!isAutoEntry && onOpenProviderSettings && (
+																	<ActionIcon
+																		component="div"
+																		role="button"
+																		tabIndex={0}
+																		variant="subtle"
+																		color="gray"
+																		size="sm"
+																		aria-label={t("autoSourceSettings", {
+																			provider: providerLabel,
+																		})}
+																		title={t("autoSourceSettings", { provider: providerLabel })}
+																		onClick={(e) => {
+																			e.stopPropagation();
+																			e.preventDefault();
+																			onOpenProviderSettings(source.provider);
+																		}}
+																	>
+																		<IconDotsVertical size={14} />
+																	</ActionIcon>
+																)}
 															</Group>
 														}
 													>
@@ -739,6 +803,16 @@ export function ModelMenuItems({
 														>
 															{isAutoEntry ? t("autoSourceAuto") : providerLabel}
 														</Text>
+														{isAutoEntry && autoReason && (
+															<Text size="xs" c="dimmed" lh={1.3}>
+																{autoReason}
+															</Text>
+														)}
+														{price && (
+															<Text size="xs" c="dimmed" lh={1.3}>
+																{t("autoSourcePrice", { price })}
+															</Text>
+														)}
 													</Menu.Item>
 												);
 											})}

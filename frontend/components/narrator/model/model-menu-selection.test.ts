@@ -8,8 +8,10 @@ import {
 } from "../../../lib/constants";
 import {
 	applyModelMenuMaxHeight,
+	autoChoiceReason,
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
+	formatReferencePrice,
 	MODEL_MENU_POSITIONING,
 	modelMenuSelection,
 	modelProviderPrefix,
@@ -240,4 +242,51 @@ test("every model dropdown uses the viewport-aware positioning", async () => {
 			source.match(/\{\.\.\.MODEL_MENU_POSITIONING\}/g)?.length,
 		);
 	}
+});
+
+describe("auto source rows", () => {
+	test("reference prices are shown only when the catalog knows them", () => {
+		expect(formatReferencePrice(undefined)).toBeNull();
+		expect(formatReferencePrice(Number.NaN)).toBeNull();
+		expect(formatReferencePrice(0.42)).toBe("$0.42");
+		expect(formatReferencePrice(3.5)).toBe("$3.5");
+		expect(formatReferencePrice(30)).toBe("$30");
+	});
+
+	test("the reason follows routing order: unavailable, subscription, then price", () => {
+		const t = (key: string, options?: Record<string, unknown>) =>
+			`${key}:${String(options?.provider)}`;
+		const labels = { codex: "Codex" };
+		const source = (
+			provider: string,
+			available: boolean,
+			subscription: boolean,
+			referencePrice?: number,
+		) => ({ provider, available, subscription, referencePrice });
+		expect(autoChoiceReason([], labels, t)).toBeNull();
+		expect(
+			autoChoiceReason([source("codex", true, true), source("relay", true, false, 3)], labels, t),
+		).toBe("autoReasonSubscription:Codex");
+		// Cheapest only when compared on price with another priced source.
+		expect(
+			autoChoiceReason(
+				[source("relay", true, false, 3), source("other", true, false, 9)],
+				labels,
+				t,
+			),
+		).toBe("autoReasonCheapest:relay");
+		expect(autoChoiceReason([source("relay", true, false, 3)], labels, t)).toBe(
+			"autoReasonFirst:relay",
+		);
+		expect(autoChoiceReason([source("relay", true, false)], labels, t)).toBe(
+			"autoReasonFirst:relay",
+		);
+		// The first available one is chosen, even if listed after an unavailable one.
+		expect(
+			autoChoiceReason([source("codex", false, true), source("relay", true, false)], labels, t),
+		).toBe("autoReasonFirst:relay");
+		expect(autoChoiceReason([source("codex", false, true)], labels, t)).toBe(
+			"autoReasonNoneAvailable:Codex",
+		);
+	});
 });

@@ -7,7 +7,12 @@
 import type { AutoModelInfo } from "@shared/auto-model";
 import { autoModelValue } from "@shared/auto-model";
 import { autoSourceFacts } from "../agent/auto-route-signals";
-import { listAutoModelIds, orderedAutoModelCandidates, parseModelId } from "../settings";
+import {
+	listAutoModelIds,
+	orderedAutoModelCandidates,
+	parseModelId,
+	referencePricePerMillion,
+} from "../settings";
 
 /** Bounds the response; the picker lists at most this many logical models. */
 const MAX_AUTO_MODELS = 500;
@@ -22,7 +27,13 @@ export function listAutoModels(nameOf: (modelId: string) => string | undefined):
 			name: nameOf(modelId) ?? modelId,
 			sources: orderedAutoModelCandidates(modelId).map((value) => {
 				const provider = parseModelId(value).provider as string;
-				return { value, provider, ...autoSourceFacts(provider, now, value) };
+				const referencePrice = referencePricePerMillion(value);
+				return {
+					value,
+					provider,
+					...autoSourceFacts(provider, now, value),
+					...(referencePrice !== undefined ? { referencePrice } : {}),
+				};
 			}),
 		}))
 		.filter((model) => model.sources.length > 0)

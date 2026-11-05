@@ -130,6 +130,7 @@ export {
 	orderedAutoModelCandidates,
 	parseAggModelValue,
 	parseModelId,
+	referencePricePerMillion,
 	registerAnthropicModelChecker,
 	registerAnthropicModelLister,
 	registerAutoSourceProbe,

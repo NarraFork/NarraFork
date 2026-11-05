@@ -70,6 +70,8 @@ export type ModelOption = {
 		provider: string;
 		available: boolean;
 		subscription: boolean;
+		/** Reference input + output USD per million tokens, when the catalog knows it. */
+		referencePrice?: number;
 	}>;
 };
 

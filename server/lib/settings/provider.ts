@@ -341,7 +341,7 @@ export function registerAutoSourceProbe(probe: AutoSourceProbe | null): void {
 }
 
 /** Reference input + output price per million tokens (the catalog's unit), when known. */
-function referencePricePerMillion(value: string): number | undefined {
+export function referencePricePerMillion(value: string): number | undefined {
 	try {
 		// Decimal strings; missing or null means unknown.
 		const pricing = getEffectiveModelProfile(value).referencePricing;

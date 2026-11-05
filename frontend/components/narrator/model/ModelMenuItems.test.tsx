@@ -168,6 +168,12 @@ function button(text: string) {
 	if (!found) throw new Error(`Missing menu item: ${text}`);
 	return found;
 }
+/** The "automatic" entry of an expanded auto row; its text also carries the reason line. */
+function autoEntry() {
+	const found = host.querySelector<HTMLButtonElement>('[data-auto-source="auto"]');
+	if (!found) throw new Error("Missing automatic source entry");
+	return found;
+}
 function prepareGeometry() {
 	const dropdown = host.querySelector<HTMLElement>("[data-model-menu-scroll]");
 	if (!dropdown) throw new Error("Missing dropdown");
@@ -510,21 +516,24 @@ describe("auto:<model> rows", () => {
 
 	test("the selected auto row lists automatic and every source, and picks keep their values", async () => {
 		await render("auto:gpt-5.5", autoModels);
+		const automatic = autoEntry();
+		// The automatic entry says which source it uses and why.
+		expect(automatic.textContent?.startsWith(narratorLocale.autoSourceAuto)).toBe(true);
+		expect(automatic.textContent).toContain("Provider A");
 		const labels = buttons().map((item) => item.textContent ?? "");
-		expect(labels).toContain(narratorLocale.autoSourceAuto);
 		expect(labels.some((text) => text.startsWith("codex"))).toBe(true);
 		expect(host.textContent).toContain(narratorLocale.autoSourceSubscription);
 		await act(async () => {
 			const codex = buttons().find((item) => item.textContent?.startsWith("codex"));
 			codex?.click();
 		});
-		await act(async () => button(narratorLocale.autoSourceAuto).click());
+		await act(async () => autoEntry().click());
 		expect(selected).toEqual(["codex:gpt-5.5", "auto:gpt-5.5"]);
 	});
 
 	test("a pinned source opens its auto row and is the checked entry", async () => {
 		await render("a:gpt-5.5", autoModels);
-		expect(buttons().map((item) => item.textContent)).toContain(narratorLocale.autoSourceAuto);
+		expect(autoEntry()).toBeTruthy();
 		// The check icon is always rendered and toggled by visibility; only the pin shows it.
 		const checked = buttons().filter((item) =>
 			Array.from(item.querySelectorAll("svg")).some(

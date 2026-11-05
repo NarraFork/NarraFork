@@ -183,3 +183,44 @@ export function centerModelMenuSelection(
 		),
 	);
 }
+
+/**
+ * Reference price of an `auto:` source, as "$X / 1M tokens" text (input + output per million).
+ * Null when the catalog has no price for it; such a source is never shown as free.
+ */
+export function formatReferencePrice(perMillion: number | undefined): string | null {
+	if (perMillion === undefined || !Number.isFinite(perMillion) || perMillion < 0) return null;
+	const digits = perMillion >= 10 ? 0 : perMillion >= 1 ? 1 : 2;
+	return `$${perMillion.toFixed(digits)}`;
+}
+
+/**
+ * Why "auto" uses its current source, in the order routing ranks them: unavailable sources go
+ * last, subscriptions come first, then the lowest reference price.
+ */
+export function autoChoiceReason(
+	sources: ReadonlyArray<{
+		provider: string;
+		available: boolean;
+		subscription: boolean;
+		referencePrice?: number;
+	}>,
+	providerLabels: Record<string, string>,
+	t: (key: string, options?: Record<string, unknown>) => string,
+): string | null {
+	const choice = sources.find((source) => source.available) ?? sources[0];
+	if (!choice) return null;
+	const provider = providerLabels[choice.provider] ?? choice.provider;
+	if (!choice.available) return t("autoReasonNoneAvailable", { provider });
+	if (choice.subscription) return t("autoReasonSubscription", { provider });
+	// "Cheapest" only when it was compared on price with another pay-per-use source.
+	const priced = sources.filter(
+		(source) => source.available && !source.subscription && source.referencePrice !== undefined,
+	);
+	return t(
+		choice.referencePrice !== undefined && priced.length > 1
+			? "autoReasonCheapest"
+			: "autoReasonFirst",
+		{ provider },
+	);
+}
