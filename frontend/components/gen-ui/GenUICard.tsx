@@ -81,6 +81,7 @@ export function GenUICard(props: GenUICardProps) {
 				kit={props.kit}
 				height={props.height}
 				formToolUseId={props.inline?.formToolUseId}
+				autoRun={props.appShownAt !== undefined}
 			/>
 		) : (
 			<PrivateCard
@@ -359,6 +360,7 @@ function AppCard({
 	historyUnavailable,
 	kit,
 	formToolUseId,
+	autoRun,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
@@ -368,6 +370,8 @@ function AppCard({
 	kit?: GenUiKitNotice;
 	/** Set while a render({path}) call waits for this app's submit. */
 	formToolUseId?: string;
+	/** A waiting render keeps its app idle: the reader opens it deliberately. */
+	autoRun?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const mobile = useMobileViewport();
@@ -375,10 +379,10 @@ function AppCard({
 	useEffect(() => {
 		registerShown(narratorId, shownAt);
 		const timer = setTimeout(() => {
-			if (startsByItself(narratorId, shownAt)) setRunning(true);
+			if (autoRun !== false && startsByItself(narratorId, shownAt)) setRunning(true);
 		}, 0);
 		return () => clearTimeout(timer);
-	}, [narratorId, shownAt]);
+	}, [narratorId, shownAt, autoRun]);
 	const [run, setRun] = useState(0);
 	const [expanded, setExpanded] = useState(false);
 	useEffect(() => {

@@ -189,16 +189,26 @@ function PreviewFrame({
 					// A render({path}) call waits for exactly this submit, so it becomes the
 					// tool result. Only a call that already ended falls back to a chat message.
 					if (data.action === "submit" && formToolUseId && data.fields && typeof data.fields === "object") {
-						void (async () => {
+						// An app loads slower than markup, so the call may not be waiting yet:
+						// retry briefly before falling back to an ordinary chat message.
+						const deliver = async (tries: number): Promise<void> => {
 							const client = await import("./kit-client");
 							const delivered = await client.answerGenUiForm(narratorId, formToolUseId, {
 								status: "submitted",
 								message: typeof data.message === "string" ? data.message : text,
 								fields: data.fields as Record<string, unknown>,
 							});
-							if (delivered === "not-waiting") setRequest({ kind: "prompt", text });
-							else pending.current = false;
-						})().catch(() => {
+							if (delivered === "answered") {
+								pending.current = false;
+								return;
+							}
+							if (tries > 0) {
+								await new Promise((resume) => setTimeout(resume, 1000));
+								return deliver(tries - 1);
+							}
+							setRequest({ kind: "prompt", text });
+						};
+						void deliver(5).catch(() => {
 							pending.current = false;
 						});
 						return;
