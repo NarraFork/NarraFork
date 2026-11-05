@@ -482,13 +482,18 @@ function NarratorDetailPage() {
 		};
 	}, [narratorId, navigate]);
 
-	// Ref for drag-to-split drop zone detection
-	const mergedRef = useCallback((el: HTMLDivElement | null) => {
-		pageBoxRef.current = el;
-	}, []);
-	// The page root only mounts once the narrator has loaded (the skeleton is returned
-	// before it), so the title-bar marks start then.
-	useWcoTitlebarRows(pageBoxRef, !isMobile && !narratorLoading && !!narrator);
+	// The page root mounts once the narrator has loaded (the skeleton is returned before
+	// it) and again on every switch to another session, so the title-bar marks follow the
+	// element rather than a ref object.
+	const titlebarRootRef = useWcoTitlebarRows(!isMobile && !narratorLoading && !!narrator);
+	// Ref for drag-to-split drop zone detection, and the title-bar root.
+	const mergedRef = useCallback(
+		(el: HTMLDivElement | null) => {
+			pageBoxRef.current = el;
+			titlebarRootRef(el);
+		},
+		[titlebarRootRef],
+	);
 
 	if (narratorLoading)
 		return (

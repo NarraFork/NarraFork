@@ -50,13 +50,17 @@ describe("WCO title-bar rows", () => {
 			new URL("../routes/narrators/$narratorId.tsx", import.meta.url),
 		).text();
 		expect(page).toContain("data-nf-wco-titlebar=");
-		expect(page).toContain("useWcoTitlebarRows(pageBoxRef");
+		// A ref callback, so the marks follow the root across session switches (the page
+		// remounts its root per session); a ref object kept the detached first root.
+		expect(page).toContain("useWcoTitlebarRows(");
+		expect(page).toContain("titlebarRootRef(el)");
 		// The workspace page: its own toolbar row is the title bar.
 		const workspace = await Bun.file(
 			new URL("../components/narrator/workspace/WorkspacePage.tsx", import.meta.url),
 		).text();
 		expect(workspace).toContain("data-nf-wco-titlebar=");
 		expect(workspace).toContain("data-nf-titlebar-candidate");
-		expect(workspace).toContain("useWcoTitlebarRows(pageRef");
+		expect(workspace).toContain("useWcoTitlebarRows(");
+		expect(workspace).toContain("ref={titlebarRootRef}");
 	});
 });

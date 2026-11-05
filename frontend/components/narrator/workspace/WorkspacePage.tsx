@@ -116,7 +116,6 @@ export function WorkspacePage({
 	// pure overlay rendered here. We drive mutations through an imperative handle
 	// and mirror the persisted director state locally for the overlay + toolbar.
 	const directorControlRef = useRef<DirectorControl | null>(null);
-	const pageRef = useRef<HTMLDivElement>(null);
 	const [directorMode, setDirectorMode] = useState(false);
 	const [directorLeaves, setDirectorLeaves] = useState<DirectorLeaf[]>([]);
 	const [primaryPanelId, setPrimaryPanelId] = useState<string | null>(null);
@@ -214,7 +213,7 @@ export function WorkspacePage({
 					my: "calc(var(--mantine-spacing-md) * -1)",
 				};
 
-	useWcoTitlebarRows(pageRef, chrome !== "window" && !isLoading && !!workspace);
+	const titlebarRootRef = useWcoTitlebarRows(chrome !== "window" && !isLoading && !!workspace);
 
 	if (isLoading || !workspace) {
 		return (
@@ -228,7 +227,7 @@ export function WorkspacePage({
 
 	return (
 		<Box
-			ref={pageRef}
+			ref={titlebarRootRef}
 			{...shellBoxProps}
 			// Desktop WCO: the toolbar row below is the window title bar (lib/wco-titlebar).
 			data-nf-wco-titlebar={chrome !== "window" || undefined}

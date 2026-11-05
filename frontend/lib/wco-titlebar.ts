@@ -18,7 +18,7 @@
  * on layout changes inside the root. Everything is inert without the overlay.
  */
 
-import { type RefObject, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { WCO_ATTRIBUTE } from "./wco";
 
 /**
@@ -70,9 +70,18 @@ function clear(root: HTMLElement): void {
 	}
 }
 
-export function useWcoTitlebarRows(rootRef: RefObject<HTMLElement | null>, enabled: boolean): void {
+/**
+ * Mark `root`'s title-bar rows while `enabled`; returns the ref callback for the root.
+ *
+ * A ref callback, not a ref object: the session page remounts its root on every switch
+ * to another session (its provider is keyed by session), and an effect watching a ref
+ * object's `.current` never sees the new element. It kept observing the detached old
+ * root, so after the first switch no header was in the title bar any more. Tracking the
+ * element in state rebinds to each new root.
+ */
+export function useWcoTitlebarRows(enabled: boolean): (el: HTMLElement | null) => void {
+	const [root, setRoot] = useState<HTMLElement | null>(null);
 	useEffect(() => {
-		const root = rootRef.current;
 		if (!enabled || !root || typeof window === "undefined") return;
 		const html = document.documentElement;
 		let frame: number | null = null;
@@ -103,5 +112,6 @@ export function useWcoTitlebarRows(rootRef: RefObject<HTMLElement | null>, enabl
 			window.removeEventListener("resize", schedule);
 			clear(root);
 		};
-	}, [rootRef, enabled]);
+	}, [root, enabled]);
+	return setRoot;
 }
