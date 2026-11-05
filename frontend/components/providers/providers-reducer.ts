@@ -191,6 +191,8 @@ function normalizeCustomApiProvider(
 		prefix: provider.prefix ?? "openai",
 		apiKey: provider.apiKey ?? "",
 		baseUrl: provider.baseUrl ?? "",
+		baseUrls: provider.baseUrls,
+		endpointPolicy: provider.endpointPolicy,
 		defaultModel: provider.defaultModel ?? "",
 		protocol: provider.protocol ?? "openai-responses",
 		geminiTransport:

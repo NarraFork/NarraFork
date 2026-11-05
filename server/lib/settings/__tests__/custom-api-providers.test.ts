@@ -576,3 +576,49 @@ describe("custom API provider migration", () => {
 		).toThrow("conflicting custom model");
 	});
 });
+
+describe("custom API provider mirror endpoints", () => {
+	test("baseUrls and endpointPolicy survive the split-array round trip for every protocol", () => {
+		const endpointPolicy = { strategy: "ordered" as const, failoverOn: { clientError: true } };
+		for (const protocol of [
+			"anthropic-messages",
+			"openai-responses",
+			"completions-compatible",
+			"gemini-compatible",
+		] as const) {
+			const settings = {
+				...structuredClone(DEFAULTS),
+				customApiProviders: [
+					normalizeCustomApiProvider({
+						id: `p-${protocol}`,
+						name: protocol,
+						prefix: `p-${protocol}`,
+						apiKey: "k",
+						baseUrl: "https://a.example.com/v1",
+						baseUrls: ["https://b.example.com/v1"],
+						endpointPolicy,
+						defaultModel: "m",
+						protocol,
+					}),
+				],
+			} as NarraForkSettings;
+			normalizeCustomApiProviderSettings(settings);
+			const split = [
+				...(settings.openaiProviders ?? []),
+				...(settings.anthropicProviders ?? []),
+				...(settings.geminiProviders ?? []),
+			];
+			expect(split).toHaveLength(1);
+			expect(split[0]?.baseUrls).toEqual(["https://b.example.com/v1"]);
+			expect(split[0]?.endpointPolicy).toEqual(endpointPolicy);
+
+			const derived = deriveCustomApiProvidersFromLegacy(
+				settings.openaiProviders,
+				settings.anthropicProviders,
+				settings.geminiProviders,
+			);
+			expect(derived[0]?.baseUrls).toEqual(["https://b.example.com/v1"]);
+			expect(derived[0]?.endpointPolicy).toEqual(endpointPolicy);
+		}
+	});
+});

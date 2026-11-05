@@ -22,6 +22,7 @@ import {
 	LOCAL_IMPORT_SOURCE_LABELS,
 	LocalProviderImport,
 } from "./LocalProviderImport";
+import { ProviderEndpointsFields } from "./ProviderEndpointsFields";
 import { useProviderImport, useTokenDanceAdd } from "./provider-add-context";
 import {
 	type AddProviderDraft,
@@ -537,6 +538,9 @@ export function AddProviderPage({
 											update({
 												protocol: value as AddProviderType,
 												baseUrl: activePreset.endpoints[value as AddProviderType] ?? "",
+												// Another protocol means another path layout: mirrors no longer match.
+												baseUrls: undefined,
+												endpointPolicy: undefined,
 											});
 									}}
 								/>
@@ -550,6 +554,15 @@ export function AddProviderPage({
 									autoCapitalize="none"
 									spellCheck={false}
 								/>
+								{/* NUG routes through its own gateway; mirrors apply to custom API protocols only. */}
+								{draft.protocol !== "nug" && (
+									<ProviderEndpointsFields
+										baseUrls={draft.baseUrls}
+										endpointPolicy={draft.endpointPolicy}
+										onBaseUrlsChange={(baseUrls) => update({ baseUrls })}
+										onPolicyChange={(endpointPolicy) => update({ endpointPolicy })}
+									/>
+								)}
 								<PasswordInput
 									label={t("addProviderApiKey")}
 									description={

@@ -260,3 +260,54 @@ describe("provider addition draft", () => {
 		expect(provider.defaultModel).toBe("");
 	});
 });
+
+describe("provider addition draft mirrors", () => {
+	test("blank mirror rows are ignored; malformed ones block the draft", () => {
+		expect(isValidProviderDraft({ ...draft, baseUrls: ["", "  "] })).toBe(true);
+		expect(isValidProviderDraft({ ...draft, baseUrls: ["https://mirror.example.com/v1"] })).toBe(
+			true,
+		);
+		for (const mirror of [
+			"mirror.example.com",
+			"ftp://mirror.example.com",
+			"https://u:p@m.example.com",
+		]) {
+			expect(isValidProviderDraft({ ...draft, baseUrls: [mirror] })).toBe(false);
+		}
+	});
+
+	test("changing region, plan or vendor drops mirrors of the previous endpoint", () => {
+		const withMirrors: AddProviderDraft = {
+			...draft,
+			baseUrls: ["https://hk.vendor-a.example/v1"],
+			endpointPolicy: { strategy: "ordered" },
+		};
+		const preset = PROVIDER_PRESETS.find(
+			(candidate) => candidate.category !== "platform-login" && !!candidate.defaultProtocol,
+		);
+		if (!preset) throw new Error("expected a credential preset");
+		const next = updateDraftConnection(withMirrors, preset);
+		expect(next).not.toHaveProperty("baseUrls");
+		expect(next).not.toHaveProperty("endpointPolicy");
+		expect(next.apiKey).toBe(withMirrors.apiKey);
+	});
+
+	test("NUG drafts ignore leftover mirror rows", () => {
+		expect(isValidProviderDraft({ ...draft, protocol: "nug", baseUrls: ["not a url"] })).toBe(true);
+	});
+
+	test("mirrors and policy reach the saved provider; absent ones add no keys", () => {
+		const withMirrors = customProviderFromDraft("id-1", {
+			...draft,
+			protocol: "completions-compatible",
+			baseUrls: [" https://hk.example.com/v1 ", ""],
+			endpointPolicy: { strategy: "ordered" },
+		});
+		expect(withMirrors.baseUrls).toEqual(["https://hk.example.com/v1"]);
+		expect(withMirrors.endpointPolicy).toEqual({ strategy: "ordered" });
+
+		const plain = customProviderFromDraft("id-2", { ...draft, protocol: "completions-compatible" });
+		expect(plain).not.toHaveProperty("baseUrls");
+		expect(plain).not.toHaveProperty("endpointPolicy");
+	});
+});

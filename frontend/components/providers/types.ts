@@ -1,3 +1,4 @@
+import type { ProviderEndpointPolicy } from "@shared/provider-endpoints";
 import type { ProxyOverride } from "../../lib/proxy";
 
 export type CustomApiProtocol =
@@ -35,6 +36,9 @@ export interface CustomApiProviderState {
 	prefix: string;
 	apiKey: string;
 	baseUrl: string;
+	/** Mirror endpoints tried alongside `baseUrl`. */
+	baseUrls?: string[];
+	endpointPolicy?: ProviderEndpointPolicy;
 	defaultModel: string;
 	protocol: CustomApiProtocol;
 	geminiTransport?: "generate-content" | "interactions";

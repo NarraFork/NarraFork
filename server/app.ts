@@ -72,6 +72,7 @@ import { projectRoutes } from "./routes/projects";
 import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
+import { gatewayProviderImportRoutes } from "./routes/provider-gateway-import";
 import { providerImportRoutes } from "./routes/provider-import";
 import {
 	publicNarratorShareManagementRoutes,
@@ -433,6 +434,7 @@ app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
 app.route("/api/tokendance", tokendanceRoutes);
 app.route("/api/settings/tls", tlsRoutes);
+app.route("/api/settings/provider-import", gatewayProviderImportRoutes);
 app.route("/api/learning", learningRoutes);
 app.route("/api/tutorial", tutorialRoutes);
 app.route("/api/admin", adminRoutes);

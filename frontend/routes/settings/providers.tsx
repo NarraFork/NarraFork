@@ -40,6 +40,7 @@ import { PluginProviderSection } from "../../components/providers/PluginProvider
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
+	GatewayProviderImportContext,
 	ProviderAddContext,
 	ProviderImportContext,
 	TokenDanceAddContext,
@@ -105,10 +106,18 @@ function getDirtyProviderIds<T extends { id: string }>(
 	return dirtyIds;
 }
 
+function normalizeMirrorUrls(urls: string[] | undefined): string[] | undefined {
+	const normalized = (urls ?? [])
+		.map((url) => normalizeUrlProtocol(url) ?? "")
+		.filter((url) => url.trim().length > 0);
+	return normalized.length > 0 ? normalized : undefined;
+}
+
 function prepareProviderSettingsSave(state: ProvidersState) {
 	const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
 		...provider,
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
+		baseUrls: normalizeMirrorUrls(provider.baseUrls),
 	}));
 	const normalizedNugProviders = state.nugProviders.map((provider) => ({
 		...provider,
@@ -150,6 +159,10 @@ function SettingsProvidersPage() {
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const isAddingProvider = useRouterState({
 		select: (router) => router.matches.some((match) => match.routeId === "/settings/providers/add"),
+	});
+	const isImportingProvider = useRouterState({
+		select: (router) =>
+			router.matches.some((match) => match.routeId === "/settings/providers/import"),
 	});
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
@@ -595,6 +608,49 @@ function SettingsProvidersPage() {
 			return { refreshFailed: "refreshError" in result };
 		},
 		[createProvider],
+	);
+
+	// Gateway imports use a dedicated endpoint. Adopt confirmed settings while keeping
+	// unrelated local drafts; if the same provider changed on the server, import wins.
+	const handleProvidersImported = useCallback(
+		(response: Record<string, unknown>) => {
+			if (providerPageMountedRef.current) {
+				const fresh = providersStateFromSettings(response);
+				const baselineById = new Map(
+					savedSnapshot.current.customApiProviders.map((provider) => [provider.id, provider]),
+				);
+				const changedById = new Map(
+					fresh.customApiProviders
+						.filter(
+							(provider) =>
+								JSON.stringify(provider) !== JSON.stringify(baselineById.get(provider.id)),
+						)
+						.map((provider) => [provider.id, provider]),
+				);
+				const local = stateRef.current;
+				const localIds = new Set(local.customApiProviders.map((provider) => provider.id));
+				const draftWithImports: ProvidersState = {
+					...local,
+					customApiProviders: [
+						...local.customApiProviders.map((provider) => changedById.get(provider.id) ?? provider),
+						...fresh.customApiProviders.filter(
+							(provider) =>
+								changedById.has(provider.id) &&
+								baselineById.has(provider.id) &&
+								!localIds.has(provider.id),
+						),
+					],
+				};
+				const next = rebaseProviderState(draftWithImports, savedSnapshot.current, response);
+				savedSnapshot.current = createSnapshot(fresh);
+				stateRef.current = next;
+				dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: createSnapshot(next) });
+			}
+			qc.setQueryData(["admin", "settings"], response);
+			qc.setQueryData(["settings"], response);
+			void qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
+		},
+		[qc],
 	);
 
 	// Existence-only probe of other tools' config directories (reads no file),
@@ -1169,6 +1225,14 @@ function SettingsProvidersPage() {
 				<Skeleton height={180} />
 				<Skeleton height={240} />
 			</Stack>
+		);
+	}
+
+	if (isImportingProvider) {
+		return (
+			<GatewayProviderImportContext value={handleProvidersImported}>
+				<Outlet />
+			</GatewayProviderImportContext>
 		);
 	}
 

@@ -1,5 +1,14 @@
 import type { DataDirectorySecurityStatus } from "@shared/data-directory-security";
 import type { Locale } from "@shared/i18n-locales";
+import type { ProviderEndpointsStatus } from "@shared/provider-endpoints";
+import type {
+	ImportCheckResponse,
+	ImportCommitDecision,
+	ImportCommitResponse,
+	ImportFetchResult,
+	ImportPreviewResponse,
+	ProviderImportPayload,
+} from "@shared/provider-import";
 import type { ProviderReadiness } from "@shared/provider-readiness";
 import type {
 	PersistedRecentTab,
@@ -260,6 +269,36 @@ export const settingsApi = {
 		request<{ id: string }>("/settings/retry-rules", {
 			method: "POST",
 			body: JSON.stringify(data),
+		}),
+	getProviderEndpoints: (providerId: string) =>
+		request<ProviderEndpointsStatus>(
+			`/settings/providers/${encodeURIComponent(providerId)}/endpoints`,
+		),
+	probeProviderEndpoints: (providerId: string) =>
+		request<ProviderEndpointsStatus>(
+			`/settings/providers/${encodeURIComponent(providerId)}/endpoints/probe`,
+			{ method: "POST" },
+		),
+	providerImportFetch: (input: string, exact: boolean) =>
+		request<ImportFetchResult>("/settings/provider-import/fetch", {
+			method: "POST",
+			body: JSON.stringify({ input, exact }),
+		}),
+	providerImportPreview: (payload: ProviderImportPayload) =>
+		request<ImportPreviewResponse>("/settings/provider-import/preview", {
+			method: "POST",
+			body: JSON.stringify({ payload }),
+		}),
+	/** List models with each key in the payload before importing (nothing is saved). */
+	providerImportCheck: (payload: ProviderImportPayload) =>
+		request<ImportCheckResponse>("/settings/provider-import/check", {
+			method: "POST",
+			body: JSON.stringify({ payload }),
+		}),
+	providerImportCommit: (payload: ProviderImportPayload, entries: ImportCommitDecision[]) =>
+		request<ImportCommitResponse>("/settings/provider-import/commit", {
+			method: "POST",
+			body: JSON.stringify({ payload, entries }),
 		}),
 	fixProviderBaseUrl: (providerId: string) =>
 		request<{ ok: boolean; providerId: string; baseUrl: string }>(

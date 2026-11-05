@@ -1,3 +1,4 @@
+import { isHttpEndpointUrl, type ProviderEndpointPolicy } from "@shared/provider-endpoints";
 import type { NUGProviderState } from "./NUGProvidersSection";
 import type { AddProviderType, ProviderPreset } from "./provider-presets";
 import type { CustomApiProviderState, UserAgentMode } from "./types";
@@ -9,6 +10,9 @@ export interface AddProviderDraft {
 	apiKey: string;
 	prefix: string;
 	userAgentMode?: UserAgentMode;
+	/** Mirror endpoints for custom API protocols; blank rows are ignored. */
+	baseUrls?: string[];
+	endpointPolicy?: ProviderEndpointPolicy;
 }
 
 /** ASCII colon separates the provider from the model ID and cannot appear in a prefix. */
@@ -58,16 +62,26 @@ export function updateDraftConnection(
 	userAgentMode?: UserAgentMode,
 ): AddProviderDraft {
 	const next = preset ? draftFromPreset(preset) : null;
+	// Mirrors and their policy belong to the endpoint being replaced (another region,
+	// plan or vendor); keeping them would send this provider's key to that host.
+	const { baseUrls: _baseUrls, endpointPolicy: _endpointPolicy, ...kept } = draft;
 	return {
-		...draft,
+		...kept,
 		protocol: next?.protocol ?? draft.protocol,
 		baseUrl: next?.baseUrl ?? "",
 		userAgentMode,
 	};
 }
 
+/** Non-blank mirror rows, trimmed. */
+export function draftMirrorUrls(draft: Pick<AddProviderDraft, "baseUrls">): string[] {
+	return (draft.baseUrls ?? []).map((url) => url.trim()).filter((url) => url.length > 0);
+}
+
 export function isValidProviderDraft(draft: AddProviderDraft): boolean {
 	if (!draft.name.trim()) return false;
+	// NUG hides the mirror fields and never uses them.
+	if (draft.protocol !== "nug" && !draftMirrorUrls(draft).every(isHttpEndpointUrl)) return false;
 	try {
 		const url = new URL(draft.baseUrl.trim());
 		return (
@@ -97,5 +111,7 @@ export function customProviderFromDraft(
 		codexWebSocket: false,
 		tlsRejectUnauthorized: true,
 		...(draft.userAgentMode ? { userAgentMode: draft.userAgentMode } : {}),
+		...(draftMirrorUrls(draft).length > 0 ? { baseUrls: draftMirrorUrls(draft) } : {}),
+		...(draft.endpointPolicy ? { endpointPolicy: draft.endpointPolicy } : {}),
 	};
 }

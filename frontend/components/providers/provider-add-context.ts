@@ -37,3 +37,15 @@ export function useAddProvider() {
 	if (!add) throw new Error("Provider add route requires the providers parent context");
 	return add;
 }
+
+// Gateway imports use their own endpoint. Keep this separate from the local-config
+// ProviderImportContext used by the add page, and adopt confirmed settings in the parent reducer.
+export const GatewayProviderImportContext = createContext<
+	((settings: Record<string, unknown>) => void) | null
+>(null);
+
+export function useGatewayProvidersImported() {
+	const onImported = useContext(GatewayProviderImportContext);
+	if (!onImported) throw new Error("Gateway import route requires the providers parent context");
+	return onImported;
+}
