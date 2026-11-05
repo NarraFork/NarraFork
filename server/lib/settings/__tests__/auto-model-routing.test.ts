@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { replaceModelOverridesForTests } from "../../model-catalog";
 import {
 	AutoModelUnavailableError,
 	expandAllowedPoolForDisplay,
@@ -117,6 +118,26 @@ describe("auto model routing", () => {
 		// An unservable summary model follows the default, like an empty aggregation does.
 		settings.agent.summaryModel = "auto:no-such-model";
 		expect(resolveEffectiveModel("__summary__")).toBe("provA:claude-opus-4-6");
+	});
+
+	test("a source that takes fewer input kinds than another goes after it, never dropped", () => {
+		// provA is listed first, but only takes text while provB also takes images.
+		const restore = replaceModelOverridesForTests({
+			connections: {
+				"provA:claude-opus-4-6": { inputModalities: ["text"] },
+				"provB:claude-opus-4.6": { inputModalities: ["text", "image"] },
+			},
+		});
+		try {
+			expect(orderedAutoModelCandidates("claude-opus-4-6")).toEqual([
+				"provB:claude-opus-4.6",
+				"provA:claude-opus-4-6",
+			]);
+			// A session on the text-only source moves to the one that can read its images.
+			expect(resolveEffectiveModel("auto:claude-opus-4-6", "provA")).toBe("provB:claude-opus-4.6");
+		} finally {
+			restore();
+		}
 	});
 
 	test("subscriptions first; a sticky source that cannot serve is left for the next one", () => {

@@ -348,16 +348,49 @@ function referencePricePerMillion(value: string): number | undefined {
 	}
 }
 
+/** Declared input modalities of one provider value; undefined when nothing is declared. */
+function declaredInputModalities(value: string): ReadonlySet<string> | undefined {
+	try {
+		const inputs = getEffectiveModelProfile(value).inputModalities;
+		return Array.isArray(inputs) ? new Set(inputs) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Candidates that declare fewer input kinds than another candidate of the same model (an image
+ * model behind a text-only relay). Adapters reject media a model does not accept, history
+ * included, so such a source is ordered with the unavailable ones: it is used only when
+ * nothing else can serve. A candidate that declares nothing is not counted as limited.
+ */
+function inputLimitedCandidates(values: readonly string[]): Set<string> {
+	const declared = new Map(values.map((value) => [value, declaredInputModalities(value)]));
+	const widest = new Set<string>();
+	for (const inputs of declared.values()) for (const kind of inputs ?? []) widest.add(kind);
+	const limited = new Set<string>();
+	for (const [value, inputs] of declared) {
+		if (inputs && [...widest].some((kind) => !inputs.has(kind))) limited.add(value);
+	}
+	return limited;
+}
+
 /** `auto:` candidates in routing order (shared/auto-route-strategy.ts). */
 export function orderedAutoModelCandidates(modelId: string): string[] {
 	const candidates = listAutoModelCandidates(modelId);
 	if (candidates.length < 2) return candidates;
+	const limited = inputLimitedCandidates(candidates);
 	return orderAutoCandidates(
 		candidates.map((value) => {
 			const provider = parseModelId(value).provider as string;
 			const facts = autoSourceProbe?.(provider) ?? { available: true, subscription: false };
 			const price = referencePricePerMillion(value);
-			return { value, ...facts, ...(price !== undefined ? { referencePrice: price } : {}) };
+			return {
+				value,
+				...facts,
+				available: facts.available && !limited.has(value),
+				...(price !== undefined ? { referencePrice: price } : {}),
+			};
 		}),
 	);
 }
@@ -405,7 +438,10 @@ export function resolveAutoModel(modelId: string, stickyProvider?: string): stri
 	const candidates = orderedAutoModelCandidates(modelId);
 	if (stickyProvider) {
 		const sticky = candidates.find((value) => parseModelId(value).provider === stickyProvider);
-		if (sticky && (autoSourceProbe?.(stickyProvider).available ?? true)) return sticky;
+		const limited = inputLimitedCandidates(candidates);
+		if (sticky && !limited.has(sticky) && (autoSourceProbe?.(stickyProvider).available ?? true)) {
+			return sticky;
+		}
 	}
 	return candidates[0] ?? null;
 }
