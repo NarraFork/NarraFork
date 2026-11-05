@@ -39,6 +39,10 @@ describe("WCO title-bar rows", () => {
 		expect(css).toMatch(/\[data-nf-titlebar-row\] \{[^}]*-webkit-app-region: drag/);
 		expect(css).toMatch(/\[data-nf-titlebar-row\]\s*:is\([^)]*button[^)]*\) \{[^}]*no-drag/);
 		expect(css).toMatch(/\[data-nf-titlebar-end\] \{[^}]*--nf-wco-inset-right/);
+		// A tab strip's blank area moves the window, not dockview's group drag.
+		const voidRule = css.match(/\[data-nf-titlebar-row\] \.dv-void-container \{[^}]*\}/)?.[0];
+		expect(voidRule).toContain("-webkit-app-region: drag");
+		expect(voidRule).toContain("-webkit-user-drag: none");
 		expect(css).toMatch(
 			/:has\(\[data-nf-wco-titlebar\]\) \.nf-wco-main-strip \{[^}]*display: none/,
 		);

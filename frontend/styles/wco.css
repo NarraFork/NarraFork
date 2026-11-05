@@ -109,6 +109,19 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 		-webkit-app-region: no-drag;
 	}
 
+	/*
+	 * A dockview tab strip's blank area (after the tabs) is the title bar's blank area:
+	 * it moves the window. Dockview makes it an HTML5 drag source (`draggable`, to move
+	 * the whole group), and the row's drag region alone did not cover it: a press there
+	 * started the group drag (its "Multiple Panels" ghost) instead of moving the window.
+	 * So it declares its own region and opts out of the HTML5 drag, in title-bar rows
+	 * only. Tabs still move panels.
+	 */
+	html[data-nf-wco] [data-nf-titlebar-row] .dv-void-container {
+		-webkit-app-region: drag;
+		-webkit-user-drag: none;
+	}
+
 	/* The headers set their padding inline (narrator header, panel headers), hence the
 	   overrides; only the edge rows under the window buttons are affected. */
 	html[data-nf-wco="right"] [data-nf-titlebar-end] {
