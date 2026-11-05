@@ -12,11 +12,15 @@ import { shellExecute } from "./shell-exec";
  * opens as early as there is something to show; the page then reloads itself into the app. The
  * Windows manager opens the browser itself (it focuses an existing window first), so a server it
  * supervises never does.
+ *
+ * `explicit` is for a person asking to open it (starting the app again while it runs): "off" only
+ * stops the automatic open at startup, the same rule the manager follows.
  */
-export function openFrontendOnce(url: string): void {
+export function openFrontendOnce(url: string, options: { explicit?: boolean } = {}): void {
 	if (process.env.NARRAFORK_MANAGER_MANAGED === "1") return;
 	const mode = settings.server.openBrowser;
-	if (mode === "off" || !hotOnce("narrafork.frontendOpened")) return;
+	if (mode === "off" && !options.explicit) return;
+	if (!hotOnce("narrafork.frontendOpened")) return;
 	if (mode === "app") void openAsApp(url);
 	else openInBrowser(url);
 }

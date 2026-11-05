@@ -79,6 +79,7 @@ import {
 	shouldStartGatedBackgroundWork,
 } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
+import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
 import { reissueBuiltinTlsOnStartup } from "./lib/tls";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
@@ -186,7 +187,7 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 });
 
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
-// A mismatched journal intentionally fails startup rather than serving mixed model references.
+// A journal that no longer matches the settings is kept and logged; startup continues.
 recoverProviderPrefixMigrationOnStartup();
 
 // When the PostgreSQL backend is active, inject every PG-capable store from the single
@@ -1248,32 +1249,13 @@ if (portExplicit) {
 		// Bun surfaces this bind failure asynchronously on Windows, where the catch below never
 		// runs and the process dies on an "Is port in use?" uncaught exception that points at the
 		// wrong cause. Report the real reason before touching Bun.serve().
-		const reserved = `${excludedRangeForPort.start}-${excludedRangeForPort.end}`;
-		logger.error(`Port ${port} is inside a Windows reserved TCP port range. Cannot start server.`, {
-			port,
-			reservedRange: reserved,
-			excludedRanges: formatPortRanges(excludedPortRanges),
-		});
-		console.error(
-			`\x1b[31mError: Port ${port} is reserved by Windows (excluded range ${reserved}).\x1b[0m\n` +
-				"No process is using it — the Windows TCP stack has reserved the range, and the reserved\n" +
-				"ranges change on every reboot. Inspect them with:\n" +
-				`  ${NETSH_EXCLUDED_PORT_COMMAND}\n` +
-				"Choose a port outside every listed range with --port=XXXX.",
-		);
-		process.exit(1);
+		throw portUnavailable(port, `${excludedRangeForPort.start}-${excludedRangeForPort.end}`);
 	}
 	try {
 		_server = startServerWithHostFallback(port);
 		actualPort = _server.port ?? port;
 	} catch (err) {
-		if (isListenerPortConflict(err)) {
-			logger.error(`Port ${port} is already in use. Cannot start server.`);
-			console.error(
-				`\x1b[31mError: Port ${port} is already in use.\x1b[0m\nPlease free the port or choose a different one with --port=XXXX.`,
-			);
-			process.exit(1);
-		}
+		if (isListenerPortConflict(err)) throw portUnavailable(port);
 		throw err;
 	}
 } else {
@@ -1315,18 +1297,10 @@ if (portExplicit) {
 		}
 	}
 	if (!started) {
-		const attempted = attemptedPorts.length > 0 ? attemptedPorts.join(", ") : String(port);
-		logger.error(`Could not find an available port (tried ${attempted}).`, {
-			excludedRanges: formatPortRanges(excludedPortRanges),
-		});
-		const reservedHint =
-			excludedPortRanges.length > 0
-				? `\nWindows reserved TCP ranges: ${formatPortRanges(excludedPortRanges)} (list them with ${NETSH_EXCLUDED_PORT_COMMAND}).`
-				: "";
-		console.error(
-			`\x1b[31mError: Could not find an available port (tried ${attempted}).\x1b[0m${reservedHint}\nPlease specify a port with --port=XXXX.`,
+		throw noPortAvailable(
+			attemptedPorts.length > 0 ? attemptedPorts.join(", ") : String(port),
+			excludedPortRanges.length > 0 ? formatPortRanges(excludedPortRanges) : undefined,
 		);
-		process.exit(1);
 	}
 }
 
@@ -1488,12 +1462,16 @@ if (activeDatabaseBackend === "postgres") {
 	await materializeLegacyDelegations().catch((error) =>
 		logger.warn("Legacy delegation materialization failed", { error: String(error) }),
 	);
+	// The server is already serving here, so a failure is logged rather than thrown. It fails
+	// closed: a grant without its authority row is rejected as invalid_grant, and a resource
+	// without its binding is not listed for the client. The next startup retries the backfill.
 	try {
 		await backfillOAuthGrantAuthoritiesOnStartup();
 		await backfillIntegrationResourceBindingsOnStartup();
 	} catch (error) {
-		logger.error("OAuth/integration startup backfill failed", { error: String(error) });
-		throw error;
+		logger.error("OAuth/integration startup backfill failed; affected legacy grants stay denied", {
+			error: String(error),
+		});
 	}
 }
 

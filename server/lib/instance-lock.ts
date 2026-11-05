@@ -25,6 +25,7 @@ import {
 	sameInstanceProcessDomain,
 } from "./instance-process-identity";
 import { logger } from "./logger";
+import { InstanceLockedError } from "./startup-status/startup-problems";
 
 /**
  * Single-instance guard for the NarraFork data directory.
@@ -907,7 +908,7 @@ export function acquireInstanceLock(dbPath: string): void {
 					detail: verdict.detail,
 					...describeHolder(existing),
 				});
-				throw new Error(message);
+				throw new InstanceLockedError(existing.pid, message);
 			}
 		} else if (verdict.kind === "unknown") {
 			// Undecidable. Clearing the lock is the lesser evil: refusing here would make an

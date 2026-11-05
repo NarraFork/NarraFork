@@ -58,6 +58,7 @@ import { hotOnce, hotSafe, hotTimer } from "../../lib/hot-safe";
 import { acquireInstanceLock, releaseInstanceLock } from "../../lib/instance-lock";
 import { logger } from "../../lib/logger";
 import { reportStartupStep } from "../../lib/startup-status";
+import { databaseUpgradeFailed } from "../../lib/startup-status/startup-problems";
 import { ensureColumns } from "../ensure-columns";
 import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "../fts";
 import {
@@ -271,7 +272,7 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 				error: String(err),
 				stack: (err as Error)?.stack,
 			});
-			throw err;
+			throw databaseUpgradeFailed(err);
 		}
 		// Column patches, backfills and an FTS rebuild can still take a while.
 		reportStartupStep({ key: "database" });

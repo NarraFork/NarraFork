@@ -60,8 +60,12 @@ if (parseRevealActivation(process.argv)) {
 
 async function runServer(): Promise<void> {
 	const handoffOk = await waitForPreviousServerShutdown();
+	const { exitWithStartupProblem, serve } = await import("./serve");
 	if (!handoffOk) {
-		process.exit(1);
+		// The old server is still up, or nothing proves it is gone: starting now could run this
+		// version on a fallback port next to it. The reason is already on stderr.
+		const { handoffFailed } = await import("./lib/startup-status/startup-problems");
+		await exitWithStartupProblem(handoffFailed());
 	}
-	await import("./serve").then(({ serve }) => serve());
+	await serve();
 }

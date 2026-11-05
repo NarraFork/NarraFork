@@ -196,8 +196,29 @@ function parseJournal(value: unknown): ProviderPrefixMigrationJournal {
 	return journal as ProviderPrefixMigrationJournal;
 }
 
+/**
+ * Finish or roll back a prefix rename that was interrupted between the narrator update and the
+ * settings save.
+ *
+ * When neither side of the journal matches the current settings (the prefixes were edited again
+ * by hand), it cannot tell which models the narrators should point at. Startup goes on, the
+ * journal is kept, and it is logged: an affected narrator whose model no longer resolves shows
+ * the usual "model unavailable" error and can be switched to another model. Refusing to start
+ * would turn one unresolvable rename into an instance nobody can reach to fix it.
+ */
 export function recoverProviderPrefixMigrationOnStartup(): void {
 	if (!existsSync(JOURNAL_PATH)) return;
+	try {
+		recoverJournal();
+	} catch (error) {
+		logger.error("Interrupted provider prefix migration could not be recovered; journal kept", {
+			error: String(error),
+			journalPath: JOURNAL_PATH,
+		});
+	}
+}
+
+function recoverJournal(): void {
 	const journal = parseJournal(JSON.parse(readFileSync(JOURNAL_PATH, "utf8")));
 	const usesAfter = journal.changes.every(
 		(change) => providerPrefixForId(settings, change.id) === change.to,
