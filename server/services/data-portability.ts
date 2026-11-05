@@ -1073,6 +1073,13 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 			// 失败时数据整批回滚，不会留下「数据进了、供应商没进」的半成品。
 			if (include.providers) {
 				const merge = mergeProviders(preview.providers);
+				// 改名的供应商：本次写入的会话跟着指向新前缀，不留在本地同名的另一个服务上。
+				if (include.sessions) {
+					remapImportedNarratorModels(
+						incomingIds.filter((id) => !excludedNarrators.includes(id)),
+						merge.prefixRemaps,
+					);
+				}
 				if (merge.changed) {
 					const next = structuredClone(settings) as NarraForkSettings;
 					for (const key of PROVIDER_KEYS) {
@@ -1300,6 +1307,8 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	added: number;
 	renamed: number;
 	skipped: number;
+	/** Incoming prefix → the prefix it was imported under, for providers that were renamed. */
+	prefixRemaps: Map<string, string>;
 } {
 	const current = structuredClone(settings) as NarraForkSettings;
 	const merged: Partial<Record<ProviderKey, unknown>> = {};
@@ -1451,7 +1460,42 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		changed = true;
 	}
 
-	return { merged, changed, added, renamed, skipped };
+	return { merged, changed, added, renamed, skipped, prefixRemaps };
+}
+
+/** Session columns that hold a model value (`<prefix>:<model>`, `__agg__:<prefix>:<model>`, …). */
+const NARRATOR_MODEL_COLUMNS = ["model", "pending_model_restore"] as const;
+
+/**
+ * Point imported sessions at the providers' new prefixes.
+ *
+ * A provider that came in renamed (`openai` → `openai-2`) leaves the sessions that used it
+ * naming the local `openai`, which is a different service. Only the rows this import wrote
+ * are touched. Each value is rewritten once with the same rule as the model settings, so a
+ * chain of renames (`a` → `a-2` while `a-2` → `a-3`) cannot apply twice. Reads only the two
+ * short model columns of the imported sessions.
+ */
+function remapImportedNarratorModels(ids: readonly string[], remaps: Map<string, string>): void {
+	if (remaps.size === 0 || ids.length === 0) return;
+	const present = tableColumns("main", "narrators");
+	const columns = NARRATOR_MODEL_COLUMNS.filter((column) => present.includes(column));
+	if (columns.length === 0) return;
+	const select = sqlite.prepare(
+		`SELECT id, ${columns.map((column) => `"${column}"`).join(", ")}
+		 FROM main.narrators WHERE id IN (SELECT value FROM json_each(?))`,
+	);
+	const updates = columns.map((column) =>
+		sqlite.prepare(`UPDATE main.narrators SET "${column}" = ? WHERE id = ?`),
+	);
+	const rows = select.all(JSON.stringify(ids)) as Array<Record<string, string | null>>;
+	for (const row of rows) {
+		columns.forEach((column, index) => {
+			const value = row[column];
+			if (!value) return;
+			const next = rewritePrefixedModelKey(value, remaps);
+			if (next !== value) updates[index]?.run(next, row.id as string);
+		});
+	}
 }
 
 // ── 清空 ─────────────────────────────────────────────────────────────────

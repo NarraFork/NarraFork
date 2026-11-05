@@ -554,6 +554,60 @@ describe("逐模型设置随供应商一起导出", () => {
 		defaultModel: "",
 	});
 
+	test("前缀冲突时导入的会话跟着改到新前缀，跳过的本地会话不动", async () => {
+		const original = structuredClone(settings);
+		try {
+			await seed(1);
+			const insertSession = (id: string, model: string, restore: string | null = null) =>
+				sqlite.run(
+					`INSERT INTO narrators (id, type, model, pending_model_restore, created_at, updated_at)
+					 VALUES (?, 'primary', ?, ?, ?, ?)`,
+					[id, model, restore, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z"],
+				);
+			insertSession("sess-new", "openai:gpt-5.5", "__agg__:openai:gpt-5.5");
+			insertSession("sess-longer", "openai-extra:gpt-5.5");
+			insertSession("sess-auto", "auto:gpt-5.5");
+			insertSession("sess-kept", "openai:gpt-5.5");
+			const exported = structuredClone(settings);
+			exported.customApiProviders = [
+				apiProvider("remote-openai", "openai", "remote-key", "https://remote.example/v1"),
+			];
+			saveSettings(exported);
+			const zip = await readFile(
+				(await exportData({ requests: false, sessions: true, providers: true })).zipPath,
+			);
+			const preview = await previewImport(toArrayBuffer(zip), "sessions-prefix.zip");
+
+			// Locally, a different service took the `openai` prefix; one session already exists.
+			sqlite.run("DELETE FROM narrator_message_refs");
+			sqlite.run("DELETE FROM narrator_tool_calls");
+			sqlite.run("DELETE FROM narrator_messages");
+			sqlite.run("DELETE FROM narrators");
+			insertSession("sess-kept", "openai:local-model");
+			const local = structuredClone(original);
+			local.customApiProviders = [
+				apiProvider("local-openai", "openai", "local-key", "https://local.example/v1"),
+			];
+			saveSettings(local);
+
+			await applyImport(preview.token, { conflictDefault: "skip" });
+			const modelOf = (id: string) =>
+				sqlite
+					.prepare("SELECT model, pending_model_restore AS restore FROM narrators WHERE id = ?")
+					.get(id) as { model: string | null; restore: string | null };
+			expect(modelOf("sess-new")).toEqual({
+				model: "openai-2:gpt-5.5",
+				restore: "__agg__:openai-2:gpt-5.5",
+			});
+			expect(modelOf("sess-longer").model).toBe("openai-extra:gpt-5.5");
+			expect(modelOf("sess-auto").model).toBe("auto:gpt-5.5");
+			// Skipped on conflict: the local row and its local provider stay as they were.
+			expect(modelOf("sess-kept").model).toBe("openai:local-model");
+		} finally {
+			saveSettings(original);
+		}
+	});
+
 	test("前缀冲突时逐模型设置改挂到新前缀，且不误伤更长的前缀", async () => {
 		const original = structuredClone(settings);
 		const restores: Array<() => void> = [];
