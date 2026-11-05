@@ -15,7 +15,6 @@ import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useMobileViewport } from "../hooks/useMobileViewport";
 import { useNavLayout } from "../hooks/useNavLayout";
-import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
@@ -73,45 +72,6 @@ const SetupWizard = lazy(() =>
 		default: m.SetupWizard,
 	})),
 );
-
-/** Format chars/sec as a human-readable rate string. */
-function formatRate(cps: number): string {
-	if (cps >= 1000) return `${(cps / 1000).toFixed(1)}k`;
-	return String(cps);
-}
-
-/** Format total chars with K/M suffix. */
-function formatChars(total: number): string {
-	if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(1)}M`;
-	if (total >= 1_000) return `${(total / 1_000).toFixed(1)}K`;
-	return String(total);
-}
-
-/**
- * The header's AI output-rate badge.
- *
- * The stats stream ticks every second while any narrator produces output. Owning
- * that subscription here — rather than in AuthenticatedLayout — keeps each tick
- * from re-rendering the whole AppShell (navbar NavLinks, tab strip, tooltips),
- * which cost ~140ms of main-thread work per second and dropped frames while
- * scrolling a narrator.
- */
-function OutputStatsBadge({ enabled }: { enabled: boolean }) {
-	const { t } = useTranslation("nav");
-	const stats = useOutputStats(enabled);
-	if (!enabled || stats.charsPerSec <= 0) return null;
-	return (
-		<Tooltip
-			label={`${t("totalOutputChars")}: ${formatChars(stats.totalChars)}`}
-			position="bottom"
-			withArrow
-		>
-			<Text size="sm" c="dimmed" style={{ cursor: "default", fontVariantNumeric: "tabular-nums" }}>
-				{formatRate(stats.charsPerSec)}
-			</Text>
-		</Tooltip>
-	);
-}
 
 /**
  * The mobile breakpoint only affects these two side effects, not shell JSX.
@@ -477,7 +437,9 @@ export function AuthenticatedLayout() {
 												</Button>
 											</Tooltip>
 										)}
-										<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
+										{/* The output-speed readout is off the sidebar until it returns as a
+										    fixed-height stats strip: appearing and disappearing in this row
+										    shifted the whole sidebar. */}
 									</>
 								}
 							/>
