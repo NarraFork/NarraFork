@@ -14,6 +14,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useBranding } from "../../hooks/useBranding";
 import { requestDashboardComposerFocus } from "../../lib/dashboard-composer-focus";
+import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "../../lib/use-match-media";
 import { BrandTitle } from "../common/BrandTitle";
 import { NotificationBell } from "../notifications/NotificationBell";
 import {
@@ -24,7 +25,18 @@ import {
 } from "./nav-render-context";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
-const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform ?? "");
+/**
+ * Apple keyboards say ⌘, everything else Ctrl. `userAgentData.platform` where the browser
+ * has it; `navigator.platform` (deprecated, still everywhere) otherwise.
+ */
+const IS_MAC = (() => {
+	if (typeof navigator === "undefined") return false;
+	const platform =
+		(navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
+		navigator.platform ??
+		"";
+	return /mac|iphone|ipad/i.test(platform);
+})();
 
 /** Sidebar search: Enter opens `/search`, scoped to the current project page if any. */
 export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
@@ -32,6 +44,7 @@ export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
 	const navigate = useNavigate();
 	const [query, setQuery] = useState("");
 	const inputRef = useRef<HTMLInputElement>(null);
+	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	const projectId = useRouterState({
 		select: (state) => state.location.pathname.match(/^\/projects\/([^/]+)/)?.[1],
 	});
@@ -56,6 +69,9 @@ export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
 			to: "/search",
 			search: { q, ...(projectId ? { project: decodeURIComponent(projectId) } : {}) },
 		});
+		// The search page owns the query from here (it has its own box); leaving it here too
+		// reads as a filter still applied to the sidebar.
+		setQuery("");
 		inputRef.current?.blur();
 		onSearched?.();
 	};
@@ -72,8 +88,9 @@ export function NavSearchBox({ onSearched }: { onSearched?: () => void }) {
 				if (e.key === "Escape") e.currentTarget.blur();
 			}}
 			leftSection={<IconSearch size={14} />}
-			rightSection={<Kbd size="xs">{IS_MAC ? "⌘K" : "Ctrl K"}</Kbd>}
-			rightSectionWidth={IS_MAC ? 36 : 52}
+			// A keyboard hint means nothing without a keyboard.
+			rightSection={isTouch ? undefined : <Kbd size="xs">{IS_MAC ? "⌘K" : "Ctrl K"}</Kbd>}
+			rightSectionWidth={isTouch ? undefined : IS_MAC ? 36 : 52}
 			rightSectionPointerEvents="none"
 			aria-label={t("searchPlaceholder")}
 		/>
