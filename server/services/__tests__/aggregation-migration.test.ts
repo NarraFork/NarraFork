@@ -192,6 +192,20 @@ describe("aggregation migration", () => {
 		expect(modelOf(id)?.model).toBe("__agg__:same");
 	});
 
+	test("waits while a provider is still prefixed auto, so auto: values are not written early", async () => {
+		const id = narrator("__agg__:same");
+		saveSettings({
+			...settings,
+			customApiProviders: [...(settings.customApiProviders ?? []), provider("aggMigAuto", "auto")],
+			openaiProviders: undefined,
+			anthropicProviders: undefined,
+			geminiProviders: undefined,
+		});
+		await migrateAggregationsOnStartup();
+		expect(modelOf(id)?.model).toBe("__agg__:same");
+		expect(settings.agent.modelAggregations?.length).toBe(2);
+	});
+
 	test("the startup entry is idempotent and never throws", async () => {
 		const id = narrator("__agg__:same");
 		await migrateAggregationsOnStartup();

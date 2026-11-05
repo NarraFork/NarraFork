@@ -326,8 +326,23 @@ function recoverJournal(): void {
 	});
 }
 
+/**
+ * A provider still prefixed `auto` (its rename failed, or came back with an import) makes every
+ * `auto:` value a plain provider value. Writing `auto:<model>` then would pin that provider,
+ * and its later rename would freeze the value as `auto-N:<model>`.
+ */
+function reservedAutoPrefixInUse(config: NarraForkSettings): boolean {
+	return [...(config.customApiProviders ?? []), ...(config.nugProviders ?? [])].some(
+		(provider) => provider.prefix === "auto",
+	);
+}
+
 /** Startup entry: recover, plan, apply. Never throws; a failure is logged and retried next start. */
 export async function migrateAggregationsOnStartup(): Promise<void> {
+	if (reservedAutoPrefixInUse(settings)) {
+		logger.warn("Model aggregation migration postponed: a provider is still prefixed `auto`");
+		return;
+	}
 	try {
 		recoverJournal();
 		const plan = await planAggregationMigration();
