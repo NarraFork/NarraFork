@@ -4,8 +4,8 @@
  * - Codex: a subscription; available while some enabled account is not resting on a used-up
  *   window.
  * - Custom API providers with keys (Kimi Code, OpenCode Go and other relays): available while
- *   some enabled key is not cooling down after a failure or a used-up window; a subscription
- *   when it is a Kimi Code or OpenCode Go plan.
+ *   some enabled key is neither out of allowance nor resting after a 403; a short 429 rest does
+ *   not count. A subscription when it is a Kimi Code or OpenCode Go plan.
  * - Everything else: available, pay-per-use. Their own errors still surface on the request.
  *
  * All reads are in memory; nothing here touches the network or the database.
@@ -13,8 +13,15 @@
 import { getCodexManager } from "../codex-manager";
 import { isKimiCustomApiProvider } from "../kimi-usage-cache";
 import { isOpencodeCustomApiProvider } from "../opencode-usage-cache";
+import { getProviderKeyStore } from "../provider-keys";
 import { registerAutoSourceProbe, settings } from "../settings";
 import { keyCooldown, usableProviderKeys } from "./pooled-provider";
+
+/** A short rate-limit rest still counts as able to serve; quota and 403 rests do not. */
+function keyCanServe(keyId: string, now: number): boolean {
+	const reason = keyCooldown(keyId, now)?.reason;
+	return reason === undefined || reason === "rate_limited";
+}
 
 export function autoSourceFacts(
 	provider: string,
@@ -28,10 +35,16 @@ export function autoSourceFacts(
 	const config = settings.customApiProviders?.find((p) => p.prefix === provider);
 	if (!config) return { available: true, subscription: false };
 	const subscription = isKimiCustomApiProvider(config) || isOpencodeCustomApiProvider(config);
+	const stored = getProviderKeyStore().list(config.id);
 	const keys = usableProviderKeys(config.id);
-	// No stored keys yet (pre-migration file): the provider's own key is all we know about.
+	// No stored keys at all (unreadable key file): the provider's own key is all we know about.
+	// Stored keys that are all disabled mean it cannot serve, even though settings still shows
+	// the first (rejected) one.
+	// A short rate-limit rest is not "cannot serve": moving a session to another service for a
+	// one-minute 429 would cost its cache and then keep it there. Only a used-up allowance, a
+	// 403 rest, or a key the upstream rejected (disabled, so not in `keys`) count.
 	const available =
-		keys.length === 0 ? !!config.apiKey : keys.some((key) => !keyCooldown(key.id, now));
+		stored.length === 0 ? !!config.apiKey : keys.some((key) => keyCanServe(key.id, now));
 	return { available, subscription };
 }
 

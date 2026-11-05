@@ -40,18 +40,28 @@ describe("auto route signals", () => {
 		expect(autoSourceFacts("sigrelay")).toEqual({ available: true, subscription: false });
 	});
 
-	test("a provider whose every key is cooling down cannot serve until one recovers", () => {
+	test("a short 429 rest does not count; a used-up allowance or a 403 does, until it ends", () => {
 		settings.customApiProviders = [provider("sigRelay", "sigrelay", "https://relay.example/v1")];
 		const [first, second] = [
 			getProviderKeyStore().add("sigRelay", { apiKey: "sk-1" }),
 			getProviderKeyStore().add("sigRelay", { apiKey: "sk-2" }),
 		];
 		const now = Date.now();
-		const rateLimited = new ApiError(429, "Too many requests");
-		reportKeyFault(first, rateLimited, now);
+		// Every key rate limited: still able to serve, so an auto: session keeps its service.
+		reportKeyFault(first, new ApiError(429, "Too many requests"), now);
+		reportKeyFault(second, new ApiError(429, "Too many requests"), now);
 		expect(autoSourceFacts("sigrelay", now).available).toBe(true);
-		reportKeyFault(second, rateLimited, now);
+		// Allowance used up (402) and forbidden (403): cannot serve until the rests end.
+		reportKeyFault(first, new ApiError(402, "Payment required"), now);
+		reportKeyFault(second, new ApiError(403, "Forbidden"), now);
 		expect(autoSourceFacts("sigrelay", now).available).toBe(false);
-		expect(autoSourceFacts("sigrelay", now + 61_000).available).toBe(true);
+		expect(autoSourceFacts("sigrelay", now + 11 * 60_000).available).toBe(true);
+	});
+
+	test("a key the upstream rejected (401) leaves the pool", () => {
+		settings.customApiProviders = [provider("sigRelay", "sigrelay", "https://relay.example/v1")];
+		const only = getProviderKeyStore().add("sigRelay", { apiKey: "sk-only" });
+		reportKeyFault(only, new ApiError(401, "Unauthorized"));
+		expect(autoSourceFacts("sigrelay").available).toBe(false);
 	});
 });
