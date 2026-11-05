@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
+import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
@@ -1161,7 +1162,15 @@ export async function runAgentLoopUnlocked(
 				} else {
 					active._modelRef = modelSelectionRef;
 					active._settingsRevision = getSettingsRevision();
-					active.model = resolveEffectiveModel(modelSelectionRef, active.provider);
+					// Right after a compact an auto: value picks afresh (new epoch, nothing cached
+					// to keep); otherwise it stays on the source it is on.
+					const reselect =
+						active._autoReselectOnNextTurn === true && isAutoModelValue(modelSelectionRef);
+					active._autoReselectOnNextTurn = undefined;
+					active.model = resolveEffectiveModel(
+						modelSelectionRef,
+						reselect ? undefined : active.provider,
+					);
 					active.provider = resolveProvider(active.model);
 					active.reasoningEffort = resolveRuntimeReasoningEffort(
 						active.provider,

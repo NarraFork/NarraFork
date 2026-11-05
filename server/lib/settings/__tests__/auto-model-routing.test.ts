@@ -158,9 +158,11 @@ describe("auto model routing", () => {
 		// … and moves once it cannot.
 		facts.provA = { available: false, subscription: false };
 		expect(resolveEffectiveModel("auto:claude-opus-4-6", "provA")).toBe("provB:claude-opus-4.6");
-		// Nothing available: the best one is still returned, so its own error reaches the user.
+		// Nothing available: the best one is still returned, so its own error reaches the user …
 		facts.provB = { available: false, subscription: true };
 		expect(resolveEffectiveModel("auto:claude-opus-4-6")).toBe("provB:claude-opus-4.6");
+		// … but a session already on a source stays there rather than move to one that also fails.
+		expect(resolveEffectiveModel("auto:claude-opus-4-6", "provA")).toBe("provA:claude-opus-4-6");
 	});
 
 	test("subagents see auto values, and a pool entry admits the providers that serve it", () => {

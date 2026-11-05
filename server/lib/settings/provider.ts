@@ -440,18 +440,17 @@ function autoModelIdOf(value: string | null | undefined): string | null {
  */
 export function resolveAutoModel(modelId: string, stickyProvider?: string): string | null {
 	const candidates = orderedAutoModelCandidates(modelId);
-	if (stickyProvider) {
-		const sticky = candidates.find((value) => parseModelId(value).provider === stickyProvider);
-		const limited = inputLimitedCandidates(candidates);
-		if (
-			sticky &&
-			!limited.has(sticky) &&
-			(autoSourceProbe?.(stickyProvider, sticky).available ?? true)
-		) {
-			return sticky;
-		}
-	}
-	return candidates[0] ?? null;
+	if (!stickyProvider) return candidates[0] ?? null;
+	const sticky = candidates.find((value) => parseModelId(value).provider === stickyProvider);
+	if (!sticky) return candidates[0] ?? null;
+	const limited = inputLimitedCandidates(candidates);
+	const canServe = (value: string) =>
+		!limited.has(value) &&
+		(autoSourceProbe?.(parseModelId(value).provider as string, value).available ?? true);
+	if (canServe(sticky)) return sticky;
+	// Moving only helps when the next source can serve. When none can, the session stays where
+	// it is, so the cache is not given up for a source that would fail the same way.
+	return candidates.find((value) => value !== sticky && canServe(value)) ?? sticky;
 }
 
 /** An `auto:` value names a catalog model no provider serves right now. */

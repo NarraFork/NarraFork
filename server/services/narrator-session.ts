@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import { isAutoModelValue } from "@shared/auto-model";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
@@ -177,6 +178,7 @@ import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
+import { lastServedProvider } from "./auto-sticky-source";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import {
@@ -1545,7 +1547,12 @@ async function createNarrator(
 	const inheritedModel =
 		narrator.model === FOLLOW_PARENT_MODEL ? await resolveSubagentModelForRun(narrator) : null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
-	const narratorModel = inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef);
+	const narratorModel =
+		inheritedModel?.model ??
+		resolveEffectiveModel(
+			narratorModelRef,
+			isAutoModelValue(narratorModelRef) ? lastServedProvider(narratorId) : undefined,
+		);
 	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {
