@@ -54,8 +54,7 @@ export const genUiParameters = z
 				: input.action === "show"
 					? given("path") && only("path", "size")
 					: input.action === "render"
-						? given("source") !== given("path") &&
-							only("source", "path", "title", "size", "wait")
+						? given("source") !== given("path") && only("source", "path", "title", "size", "wait")
 						: input.action === "inspect"
 							? given("toolUseId") &&
 								given("toolCallId") &&
@@ -128,8 +127,7 @@ Never put secrets in UI.`,
 				deviceId: workspace?.deviceId ?? config.defaultDeviceId ?? "local",
 				workdir: cwd,
 				path:
-					(input.action === "show" || input.action === "render") &&
-					typeof input.path === "string"
+					(input.action === "show" || input.action === "render") && typeof input.path === "string"
 						? input.path
 						: paths.resolve(workspace?.git?.rootPath ?? cwd, GEN_UI_DIRECTORY),
 			};

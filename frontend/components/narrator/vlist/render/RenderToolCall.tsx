@@ -2076,9 +2076,7 @@ export function RenderToolBody({
 				inline={
 					// A waiting render({path}) has neither markup nor a live input stream, but
 					// its card still needs the form id: dropping it sends the submit to chat.
-					model.text === undefined &&
-					model.live !== true &&
-					model.formToolUseId === undefined
+					model.text === undefined && model.live !== true && model.formToolUseId === undefined
 						? undefined
 						: {
 								...(model.text === undefined ? {} : { source: model.text }),

@@ -304,8 +304,7 @@ export async function executeGenUiTool(
 	// not from the result, so waiting here never hides the UI the reader has to answer.
 	const waits = appRender && input.wait === true;
 	if (waits) {
-		if (!toolUseId)
-			throw uiError("This call cannot wait for a form; render it without wait", 400);
+		if (!toolUseId) throw uiError("This call cannot wait for a form; render it without wait", 400);
 		assertRuntimeCanAskQuestion(runtimePolicyForContext(ctx));
 	}
 	const outcome = waits

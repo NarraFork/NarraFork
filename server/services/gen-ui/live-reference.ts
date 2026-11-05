@@ -10,7 +10,13 @@
  */
 import { resolveBackend } from "@server/lib/agent/execution/registry";
 import { GEN_UI_DIRECTORY, GEN_UI_ENTRY, type GenUiFileReference } from "@shared/gen-ui-files";
-import { assertReferenceWorkspace, uiError, validateDirectory, workspaceKey, workspaceRoot } from "./files";
+import {
+	assertReferenceWorkspace,
+	uiError,
+	validateDirectory,
+	workspaceKey,
+	workspaceRoot,
+} from "./files";
 
 const TIMEOUT_MS = 10_000;
 
