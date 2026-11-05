@@ -4,7 +4,7 @@ import { onTokenChange } from "@frontend/lib/api/client";
 import { Box, Button, Drawer, Group, Loader, Modal, Text } from "@mantine/core";
 import type { GenUiFileReference } from "@shared/gen-ui-files";
 import type { GenUiKitNotice } from "@shared/gen-ui-kit";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 const FilePreview = lazy(() =>
@@ -55,7 +55,9 @@ export function GenUICard(props: GenUICardProps) {
 	const interactive = useRenderInteractive();
 	const { t } = useTranslation("narrator");
 	// A render({path}) card has no result to time it: mounting is when it was shown.
-	const liveShownAt = useMemo(() => new Date().toISOString(), [props.file?.toolCallId]);
+	const shownAtRef = useRef<string | undefined>(undefined);
+	shownAtRef.current ??= new Date().toISOString();
+	const liveShownAt = shownAtRef.current;
 	const usable = !props.publicSummary && interactive && !!props.narratorId;
 	if (usable && props.narratorId && props.inline?.source !== undefined) {
 		return (

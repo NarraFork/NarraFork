@@ -188,7 +188,12 @@ function PreviewFrame({
 					pending.current = true;
 					// A render({path}) call waits for exactly this submit, so it becomes the
 					// tool result. Only a call that already ended falls back to a chat message.
-					if (data.action === "submit" && formToolUseId && data.fields && typeof data.fields === "object") {
+					if (
+						data.action === "submit" &&
+						formToolUseId &&
+						data.fields &&
+						typeof data.fields === "object"
+					) {
 						// An app loads slower than markup, so the call may not be waiting yet:
 						// retry briefly before falling back to an ordinary chat message.
 						const deliver = async (tries: number): Promise<void> => {
