@@ -164,7 +164,8 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 
 /**
  * The hover card. Placed to the right of the row, flipped to the left when the sidebar
- * sits at the right edge, and kept inside the viewport vertically.
+ * sits at the right edge, and kept inside the viewport vertically. The keyboard
+ * highlight shows it too, on the collapsed rail (`useRecentTabKeyboardCard.ts`).
  */
 export function RecentTabDetailCard({
 	store,
@@ -199,6 +200,11 @@ export function RecentTabDetailCard({
 	const left = fitsRight
 		? anchor.rect.right + CARD_GAP
 		: Math.max(EDGE_GAP, anchor.rect.left - CARD_WIDTH - CARD_GAP);
+	// The keyboard's card (Ctrl+Up / Ctrl+Down on the collapsed rail) lets the pointer
+	// through. It is part of the sidebar's box in the DOM, so a pointer crossing it would
+	// count as resting on the rail and open the sidebar; and it is not the pointer's to
+	// keep open.
+	const keyboard = anchor.source === "keyboard";
 
 	return (
 		<Paper
@@ -206,9 +212,10 @@ export function RecentTabDetailCard({
 			shadow="md"
 			p="sm"
 			withBorder
-			onPointerEnter={store.holdOpen}
-			onPointerLeave={store.leave}
-			data-nav-keep-open
+			onPointerEnter={keyboard ? undefined : store.holdOpen}
+			onPointerLeave={keyboard ? undefined : store.leave}
+			data-nav-keep-open={keyboard ? undefined : true}
+			data-recent-tab-card={anchor.source}
 			style={{
 				position: "fixed",
 				left,
@@ -216,6 +223,7 @@ export function RecentTabDetailCard({
 				width: CARD_WIDTH,
 				zIndex: Z.popover,
 				visibility: top === null ? "hidden" : "visible",
+				pointerEvents: keyboard ? "none" : undefined,
 			}}
 		>
 			<RecentTabDetails tab={tab} />
