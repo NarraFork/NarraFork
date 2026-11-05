@@ -13,10 +13,12 @@ export function FilePreview({
 	narratorId,
 	file,
 	formToolUseId,
+	onSubmitted,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	formToolUseId?: string;
+	onSubmitted?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -48,6 +50,7 @@ export function FilePreview({
 						failureMessage={t("genUi.renderFailed")}
 						height="65dvh"
 						formToolUseId={formToolUseId}
+						onSubmitted={onSubmitted}
 					/>
 				</>
 			) : (
@@ -69,11 +72,13 @@ export function AppFrame({
 	file,
 	height,
 	formToolUseId,
+	onSubmitted,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	height: number;
 	formToolUseId?: string;
+	onSubmitted?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -107,6 +112,7 @@ export function AppFrame({
 			failureMessage={t("genUi.renderFailed")}
 			height={height}
 			formToolUseId={formToolUseId}
+			onSubmitted={onSubmitted}
 		/>
 	);
 }
@@ -127,6 +133,7 @@ function PreviewFrame({
 	failureMessage,
 	height,
 	formToolUseId,
+	onSubmitted,
 }: {
 	narratorId: string;
 	bundle: PreviewBundle;
@@ -135,6 +142,8 @@ function PreviewFrame({
 	height: number | string;
 	/** Set while a render({path}) call waits for this app's submit as its tool result. */
 	formToolUseId?: string;
+	/** The answer reached the waiting call: the card has nothing left to ask. */
+	onSubmitted?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	// An app is code the agent wrote, running in the reader's session: nothing it sends
@@ -205,6 +214,7 @@ function PreviewFrame({
 							});
 							if (delivered === "answered") {
 								pending.current = false;
+								onSubmitted?.();
 								return;
 							}
 							if (tries > 0) {
@@ -231,7 +241,7 @@ function PreviewFrame({
 			window.removeEventListener("message", onNavigation);
 			unsubscribe();
 		};
-	}, [navigated, formToolUseId, narratorId]);
+	}, [navigated, formToolUseId, narratorId, onSubmitted]);
 	const done = () => {
 		pending.current = false;
 		setRequest(null);

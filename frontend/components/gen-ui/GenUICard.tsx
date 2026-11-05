@@ -224,6 +224,7 @@ function InlineCard({
 					runtime={inline.runtime}
 					formToolUseId={form}
 					stateKey={inline.stateKey}
+					onSubmitted={() => setExpanded(false)}
 				/>
 			</Suspense>
 			{expanded &&
@@ -383,6 +384,11 @@ function AppCard({
 	}, [narratorId, shownAt]);
 	const [run, setRun] = useState(0);
 	const [expanded, setExpanded] = useState(false);
+	// 提交已经交回给正在等待的调用，卡片没有别的要问了：停下应用并收起展开视图。
+	const collapseAfterSubmit = () => {
+		setRunning(false);
+		setExpanded(false);
+	};
 	useEffect(() => {
 		if (!running && !expanded) return;
 		const stop = () => {
@@ -405,7 +411,12 @@ function AppCard({
 	const bodyHeight = Math.max(60, height - INLINE_HEADER - notice);
 	const preview = expanded ? (
 		<Suspense fallback={<Loader size="sm" />}>
-			<FilePreview narratorId={narratorId} file={file} formToolUseId={formToolUseId} />
+			<FilePreview
+				narratorId={narratorId}
+				file={file}
+				formToolUseId={formToolUseId}
+				onSubmitted={collapseAfterSubmit}
+			/>
 		</Suspense>
 	) : null;
 	return (
@@ -446,6 +457,7 @@ function AppCard({
 						file={file}
 						height={bodyHeight}
 						formToolUseId={formToolUseId}
+						onSubmitted={collapseAfterSubmit}
 					/>
 				</Suspense>
 			) : (
