@@ -33,10 +33,13 @@ import {
 } from "../../../lib/constants";
 import { modelInheritanceLabel } from "./model-inheritance-label";
 import {
+	AUTO_FAMILY_GROUP_PREFIX,
 	autoChoiceReason,
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
+	familyLabel,
 	formatReferencePrice,
+	groupModelOptions,
 	modelMenuSelection,
 	modelProviderPrefix,
 	orderModelGroupEntries,
@@ -187,12 +190,8 @@ export function ModelMenuItems({
 	useEffect(() => {
 		if (opened) onPickerOpenedRef.current?.();
 	}, [opened]);
-	const groups = new Map<string, ModelOption[]>();
-	for (const m of allModels) {
-		const prov = m.provider ?? "unknown";
-		if (!groups.has(prov)) groups.set(prov, []);
-		groups.get(prov)?.push(m);
-	}
+	// Auto models by vendor family; a service keeps only the models no auto row lists.
+	const groups = groupModelOptions(allModels, currentModel || "");
 	const provLabels: Record<string, string> = {
 		openai: "OpenAI",
 		...providerLabels,
@@ -201,6 +200,13 @@ export function ModelMenuItems({
 		__auto__: t("modelGroupAuto"),
 		__agg__: t("modelGroupAggregations"),
 	};
+	for (const key of groups.keys()) {
+		if (!key.startsWith(AUTO_FAMILY_GROUP_PREFIX)) continue;
+		const family = key.slice(AUTO_FAMILY_GROUP_PREFIX.length);
+		provLabels[key] = family
+			? t("modelGroupFamily", { family: familyLabel(family) })
+			: t("modelGroupFamilyOther");
+	}
 	// The auto row a pinned source belongs to: `codex:gpt-5.5` sits under `auto:gpt-5.5`
 	// when that row lists it, so the picker can show the pin inside its model.
 	const autoRowOfSource = new Map<string, string>();
@@ -324,7 +330,8 @@ export function ModelMenuItems({
 						: isSummaryGroup
 							? onEditSummaryModel
 							: undefined;
-					const isProviderGroup = !META_GROUPS.has(prov);
+					const isProviderGroup =
+						!META_GROUPS.has(prov) && !prov.startsWith(AUTO_FAMILY_GROUP_PREFIX);
 					const actions = isProviderGroup ? providerActions?.[prov] : undefined;
 					const headerIcon = (props: {
 						key: string;

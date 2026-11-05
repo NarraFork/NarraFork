@@ -792,7 +792,13 @@ export function useAllModels() {
 			);
 			if (sources.length === 0) return [];
 			return [
-				{ value: model.value, label: model.name, provider: "__auto__", autoSources: sources },
+				{
+					value: model.value,
+					label: model.name,
+					provider: "__auto__",
+					autoSources: sources,
+					...(model.family ? { family: model.family } : {}),
+				},
 			];
 		});
 

@@ -34,6 +34,8 @@ export interface AutoModelInfo {
 	modelId: string;
 	/** Catalog display name. */
 	name: string;
+	/** Catalog model family (`gpt`, `claude`, …), for grouping by vendor; absent when unknown. */
+	family?: string;
 	sources: Array<{
 		/** `<prefix>:<upstream model>`; selecting it pins this provider. */
 		value: string;

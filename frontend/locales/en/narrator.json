@@ -831,6 +831,8 @@
 	"modelGroupDefault": "Default",
 	"modelGroupSummary": "Summary",
 	"modelGroupAuto": "Models · automatic source",
+	"modelGroupFamily": "{{family}} · automatic source",
+	"modelGroupFamilyOther": "Other models · automatic source",
 	"autoCurrentSource": "Auto · now {{provider}}",
 	"autoSourceAuto": "Automatic",
 	"autoSourceSubscription": "Subscription",

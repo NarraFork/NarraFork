@@ -5,13 +5,16 @@ import {
 	FOLLOW_PARENT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
 	type ModelAggregation,
+	type ModelOption,
 } from "../../../lib/constants";
 import {
 	applyModelMenuMaxHeight,
 	autoChoiceReason,
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
+	familyLabel,
 	formatReferencePrice,
+	groupModelOptions,
 	MODEL_MENU_POSITIONING,
 	modelMenuSelection,
 	modelProviderPrefix,
@@ -242,6 +245,68 @@ test("every model dropdown uses the viewport-aware positioning", async () => {
 			source.match(/\{\.\.\.MODEL_MENU_POSITIONING\}/g)?.length,
 		);
 	}
+});
+
+describe("grouping by vendor and by service", () => {
+	const source = (value: string) => ({
+		value,
+		provider: value.slice(0, value.indexOf(":")),
+		available: true,
+		subscription: false,
+	});
+	const options: ModelOption[] = [
+		{ value: "__default__", label: "Follow default", provider: "__default__" },
+		{
+			value: "auto:gpt-5.5",
+			label: "GPT-5.5",
+			provider: "__auto__",
+			family: "gpt",
+			autoSources: [source("codex:gpt-5.5"), source("relay:gpt-5.5")],
+		},
+		{
+			value: "auto:new-model",
+			label: "New",
+			provider: "__auto__",
+			autoSources: [source("relay:new-model")],
+		},
+		{ value: "codex:gpt-5.5", label: "GPT-5.5", provider: "codex" },
+		{ value: "relay:gpt-5.5", label: "GPT-5.5", provider: "relay" },
+		{ value: "relay:new-model", label: "New", provider: "relay" },
+		{ value: "relay:private-x", label: "Private", provider: "relay" },
+	];
+
+	test("a model shows once under its vendor; services keep only what auto does not list", () => {
+		const groups = groupModelOptions(options, "__default__");
+		expect([...groups.keys()]).toEqual(["__default__", "__auto__:gpt", "__auto__:", "relay"]);
+		expect(groups.get("relay")?.map((m) => m.value)).toEqual(["relay:private-x"]);
+		expect(groups.has("codex")).toBe(false);
+	});
+
+	test("the selected pin keeps its service row", () => {
+		const groups = groupModelOptions(options, "codex:gpt-5.5");
+		expect(groups.get("codex")?.map((m) => m.value)).toEqual(["codex:gpt-5.5"]);
+	});
+
+	test("vendor groups take the auto slot, by label, with other models last", () => {
+		const entries: Array<readonly [string, number]> = [
+			["relay", 1],
+			["__auto__:", 2],
+			["__auto__:gpt", 3],
+			["__auto__:claude", 4],
+			["__default__", 5],
+		];
+		const labels: Record<string, string> = {
+			relay: "Relay",
+			"__auto__:": "Other",
+			"__auto__:gpt": "GPT",
+			"__auto__:claude": "Claude",
+		};
+		expect(
+			orderModelGroupEntries(entries, (key) => labels[key] ?? key).map(([key]) => key),
+		).toEqual(["__default__", "__auto__:claude", "__auto__:gpt", "__auto__:", "relay"]);
+		expect(familyLabel("gpt")).toBe("GPT");
+		expect(familyLabel("qwen")).toBe("Qwen");
+	});
 });
 
 describe("auto source rows", () => {

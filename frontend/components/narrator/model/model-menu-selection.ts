@@ -7,6 +7,7 @@ import {
 	FOLLOW_SUMMARY_MODEL,
 	isAutoModelOptionValue,
 	type ModelAggregation,
+	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
 
@@ -84,6 +85,26 @@ const FIXED_MODEL_GROUP_ORDER: readonly string[] = [
 	"__agg__",
 ];
 
+/** Group key prefix for auto models of one vendor family (`__auto__:claude`). */
+export const AUTO_FAMILY_GROUP_PREFIX = "__auto__:";
+
+/** How the catalog's family ids are written for people; others are title-cased. */
+const FAMILY_LABELS: Record<string, string> = {
+	gpt: "GPT",
+	claude: "Claude",
+	gemini: "Gemini",
+	glm: "GLM",
+	grok: "Grok",
+	deepseek: "DeepSeek",
+	kimi: "Kimi",
+	minimax: "MiniMax",
+	cursor: "Cursor",
+};
+
+export function familyLabel(family: string): string {
+	return FAMILY_LABELS[family] ?? `${family.charAt(0).toUpperCase()}${family.slice(1)}`;
+}
+
 /**
  * Order model-menu groups: the fixed role groups first (in
  * FIXED_MODEL_GROUP_ORDER order), then every remaining group alphabetically by
@@ -97,14 +118,23 @@ export function orderModelGroupEntries<T>(
 	entries: ReadonlyArray<readonly [string, T]>,
 	labelOf: (provider: string) => string,
 ): Array<readonly [string, T]> {
-	const fixedRank = (provider: string) => FIXED_MODEL_GROUP_ORDER.indexOf(provider);
+	// Vendor groups of auto models (`__auto__:<family>`) take the `__auto__` slot.
+	const fixedRank = (provider: string) =>
+		FIXED_MODEL_GROUP_ORDER.indexOf(
+			provider.startsWith(AUTO_FAMILY_GROUP_PREFIX) ? "__auto__" : provider,
+		);
 	return [...entries].sort(([a], [b]) => {
 		const rankA = fixedRank(a);
 		const rankB = fixedRank(b);
 		if (rankA !== -1 || rankB !== -1) {
 			if (rankA === -1) return 1;
 			if (rankB === -1) return -1;
-			return rankA - rankB;
+			if (rankA !== rankB) return rankA - rankB;
+			// Two vendor groups: by label, with "other models" (no family) last.
+			const otherA = a === AUTO_FAMILY_GROUP_PREFIX;
+			const otherB = b === AUTO_FAMILY_GROUP_PREFIX;
+			if (otherA !== otherB) return otherA ? 1 : -1;
+			return labelOf(a).localeCompare(labelOf(b));
 		}
 		return labelOf(a).localeCompare(labelOf(b));
 	});
@@ -223,4 +253,40 @@ export function autoChoiceReason(
 			: "autoReasonFirst",
 		{ provider },
 	);
+}
+
+/**
+ * Group the picker's options: auto models by vendor family, everything else by service.
+ *
+ * A `<prefix>:<model>` that some auto row already lists as a source is left out of its
+ * service group, so a model shows once, under its family, with its services one level
+ * down. Services keep the models no auto row covers (outside the catalog, or excluded
+ * from auto), which can only be chosen by naming the service. The currently selected value
+ * is never dropped, so the selection always has a row to center on.
+ */
+export function groupModelOptions(
+	options: readonly ModelOption[],
+	currentValue: string,
+): Map<string, ModelOption[]> {
+	const coveredByAuto = new Set<string>();
+	for (const option of options) {
+		for (const source of option.autoSources ?? []) coveredByAuto.add(source.value);
+	}
+	const groups = new Map<string, ModelOption[]>();
+	const push = (key: string, option: ModelOption) => {
+		const list = groups.get(key);
+		if (list) list.push(option);
+		else groups.set(key, [option]);
+	};
+	for (const option of options) {
+		if (option.autoSources) {
+			push(`${AUTO_FAMILY_GROUP_PREFIX}${option.family ?? ""}`, option);
+			continue;
+		}
+		const provider = option.provider ?? "unknown";
+		const isService = !provider.startsWith("__");
+		if (isService && coveredByAuto.has(option.value) && option.value !== currentValue) continue;
+		push(provider, option);
+	}
+	return groups;
 }

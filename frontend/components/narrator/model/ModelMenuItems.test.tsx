@@ -504,7 +504,8 @@ describe("auto:<model> rows", () => {
 
 	test("name the source auto would use now, skipping one that cannot serve", async () => {
 		await render("a:one", autoModels);
-		expect(host.textContent).toContain(narratorLocale.modelGroupAuto);
+		// A catalog model without a recorded family sits in the "other models" vendor group.
+		expect(host.textContent).toContain(narratorLocale.modelGroupFamilyOther);
 		expect(host.textContent).toContain(
 			narratorLocale.autoCurrentSource.replace("{{provider}}", "Provider A"),
 		);
@@ -529,6 +530,16 @@ describe("auto:<model> rows", () => {
 		});
 		await act(async () => autoEntry().click());
 		expect(selected).toEqual(["codex:gpt-5.5", "auto:gpt-5.5"]);
+	});
+
+	test("a service does not list again a model its auto row already offers", async () => {
+		const withDuplicate: ModelOption[] = [
+			...autoModels,
+			{ value: "a:gpt-5.5", label: "GPT-5.5 on A", provider: "a" },
+		];
+		await render("a:one", withDuplicate);
+		expect(host.textContent).not.toContain("GPT-5.5 on A");
+		expect(host.textContent).toContain("One");
 	});
 
 	test("a pinned source opens its auto row and is the checked entry", async () => {

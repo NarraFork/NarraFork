@@ -623,6 +623,12 @@ export function canonicalCatalogModelId(id: string): string | null {
 		: null;
 }
 
+/** The catalog family of a model id (`gpt`, `claude`, …), when the catalog records one. */
+export function catalogModelFamily(modelId: string): string | undefined {
+	const family = active.models.find((entry) => entry.id === modelId)?.family;
+	return typeof family === "string" && family ? family : undefined;
+}
+
 export function catalogModelName(modelId: string): string | undefined {
 	return active.models.find((entry) => entry.id === modelId)?.name;
 }

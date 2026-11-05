@@ -73,6 +73,8 @@ export type ModelOption = {
 		/** Reference input + output USD per million tokens, when the catalog knows it. */
 		referencePrice?: number;
 	}>;
+	/** Catalog vendor family of an `auto:` row (`gpt`, `claude`, …), for grouping. */
+	family?: string;
 };
 
 /** Value prefix of an automatically sourced model (`auto:<catalog model id>`). */

@@ -17,7 +17,10 @@ import {
 /** Bounds the response; the picker lists at most this many logical models. */
 const MAX_AUTO_MODELS = 500;
 
-export function listAutoModels(nameOf: (modelId: string) => string | undefined): AutoModelInfo[] {
+export function listAutoModels(
+	nameOf: (modelId: string) => string | undefined,
+	familyOf: (modelId: string) => string | undefined = () => undefined,
+): AutoModelInfo[] {
 	const now = Date.now();
 	return listAutoModelIds()
 		.slice(0, MAX_AUTO_MODELS)
@@ -25,6 +28,7 @@ export function listAutoModels(nameOf: (modelId: string) => string | undefined):
 			value: autoModelValue(modelId),
 			modelId,
 			name: nameOf(modelId) ?? modelId,
+			...(familyOf(modelId) ? { family: familyOf(modelId) } : {}),
 			sources: orderedAutoModelCandidates(modelId).map((value) => {
 				const provider = parseModelId(value).provider as string;
 				const referencePrice = referencePricePerMillion(value);

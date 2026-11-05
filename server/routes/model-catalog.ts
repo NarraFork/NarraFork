@@ -6,6 +6,7 @@ import { buildAppErrorResponse } from "../lib/app-error-response";
 import { logger } from "../lib/logger";
 import {
 	applyModelCatalogUpdate,
+	catalogModelFamily,
 	catalogModelName,
 	checkModelCatalogUpdate,
 	getEffectiveModelCard,
@@ -49,7 +50,9 @@ modelCatalogRoutes.get("/status", (c) => c.json(getModelCatalogStatus()));
  * Every `auto:<model>` some provider serves, with its sources in routing order: the model
  * picker's first level and its "source" submenu. In-memory reads only; no secrets.
  */
-modelCatalogRoutes.get("/auto", (c) => c.json({ models: listAutoModels(catalogModelName) }));
+modelCatalogRoutes.get("/auto", (c) =>
+	c.json({ models: listAutoModels(catalogModelName, catalogModelFamily) }),
+);
 
 /** The resolved card a running narrator uses; read by the model menu and status bar. */
 modelCatalogRoutes.get("/card", (c) => {
