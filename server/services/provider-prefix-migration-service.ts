@@ -4,8 +4,11 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { logger } from "../lib/logger";
 import {
+	getProviderPrefixChanges,
+	migrateProviderPrefixReferences,
 	type NarraForkSettings,
 	narraforkDir,
+	normalizeCustomApiProviderSettings,
 	type ProviderPrefixChange,
 	rewriteModelReference,
 	saveSettings,
@@ -174,6 +177,47 @@ export function commitProviderPrefixMigration(
 		}
 		throw error;
 	}
+}
+
+/**
+ * `auto` became a reserved prefix (`auto:<model>`). A provider created before that keeps
+ * working as an ordinary prefix until renamed; this renames it on startup to the first
+ * free `auto-N`, moving every settings and narrator reference with it (same journal and
+ * rollback as a rename from the settings page). Returns the changes made.
+ */
+export async function migrateReservedAutoPrefixOnStartup(): Promise<ProviderPrefixChange[]> {
+	const custom = settings.customApiProviders ?? [];
+	const nug = settings.nugProviders ?? [];
+	if (![...custom, ...nug].some((provider) => provider.prefix === "auto")) return [];
+
+	const taken = new Set(
+		[...custom, ...nug].map((provider) => provider.prefix).filter((prefix) => !!prefix),
+	);
+	let n = 2;
+	while (taken.has(`auto-${n}`)) n++;
+	const renamed = `auto-${n}`;
+	const rename = <T extends { prefix?: string }>(provider: T): T =>
+		provider.prefix === "auto" ? { ...provider, prefix: renamed } : provider;
+
+	const next = structuredClone(settings) as NarraForkSettings;
+	next.customApiProviders = custom.map(rename);
+	next.nugProviders = nug.map(rename);
+	// Rebuilds the split openai/anthropic/gemini arrays from the renamed customApiProviders.
+	normalizeCustomApiProviderSettings(next);
+
+	const changes = getProviderPrefixChanges(
+		[settings.customApiProviders, settings.nugProviders],
+		[next.customApiProviders, next.nugProviders],
+	);
+	migrateProviderPrefixReferences(next, changes);
+	const plan = await planProviderPrefixNarratorMigration(changes);
+	commitProviderPrefixMigration(settings, next, plan);
+	logger.warn("Renamed a provider prefixed `auto`, which is now reserved for auto:<model>", {
+		to: renamed,
+		changes,
+		narrators: plan.narrators.length,
+	});
+	return changes;
 }
 
 function providerPrefixForId(config: NarraForkSettings, id: string): string | null {

@@ -136,7 +136,10 @@ import {
 	getExternalWebSocketRolloutSettings,
 	isExternalWebSocketOriginAllowed,
 } from "./services/oauth-ws-ticket-service";
-import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
+import {
+	migrateReservedAutoPrefixOnStartup,
+	recoverProviderPrefixMigrationOnStartup,
+} from "./services/provider-prefix-migration-service";
 import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
 import {
 	type VerifiedPublicShare,
@@ -187,6 +190,11 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
 recoverProviderPrefixMigrationOnStartup();
+// `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
+// logged and leaves it working as an ordinary prefix, so startup never depends on it.
+await migrateReservedAutoPrefixOnStartup().catch((error) => {
+	logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
+});
 
 // When the PostgreSQL backend is active, inject every PG-capable store from the single
 // composition seam — one runtime, one client, all-or-nothing. `./db` has already finished
