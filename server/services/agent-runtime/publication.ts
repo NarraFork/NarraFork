@@ -32,6 +32,12 @@ export interface StartRunInput {
 	started?: boolean;
 	/** Task projection of a delivered run; adopts the actor's pre-registered run. */
 	taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
+	/**
+	 * Adopt the actor's pre-registered run (an unconsumed terminal reservation for this
+	 * destination) without inserting a task row; a settled run starts a new one. Implied
+	 * by `taskRow`.
+	 */
+	adoptRegisteredRun?: boolean;
 }
 /** A registered run; `publication` exists exactly when the run delivers a result. */
 export interface StartedRun {
@@ -177,7 +183,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return runAtomicWrite(database, "publication.startRun", (tx) => {
 			const recipientId = input.binding.deliverTo?.narratorId;
 			let resumeRunId = input.resumeRunId;
-			if (input.taskRow && recipientId && resumeRunId === undefined) {
+			if ((input.taskRow || input.adoptRegisteredRun) && recipientId && resumeRunId === undefined) {
 				const actor = tx
 					.select({ logicalRunId: narrators.logicalRunId })
 					.from(narrators)
@@ -1080,14 +1086,14 @@ function createSqliteAsyncPublicationService(
 				.where(eq(backgroundTasks.id, input.taskId))
 				.get();
 			if (!existing) return undefined;
-			const run = legacy.getAgentRun(input.taskId, input.taskId);
 			return Promise.resolve(
 				runAtomicWrite(db, "publication.restartAgentTask", (tx) => {
 					const updated = tx
 						.update(backgroundTasks)
 						.set({
 							status: "running",
-							logicalRunId: run.logicalRunId,
+							// The run the caller registered for this restart (same as PostgreSQL).
+							logicalRunId: input.logicalRunId,
 							command: null,
 							exitCode: null,
 							subagentNarratorId: input.subagentNarratorId,

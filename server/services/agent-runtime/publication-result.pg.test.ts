@@ -334,3 +334,86 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 	},
 	300_000,
 );
+
+(PG_ENABLED ? test : test.skip)(
+	"real PG journal: a task restart adopts an unsettled run and replaces a settled one",
+	async () => {
+		let callbackError: unknown;
+		const result = await withPostgres(async ({ port, credentials }) => {
+			const url = `postgres://${encodeURIComponent(credentials.user)}:${encodeURIComponent(credentials.password)}@127.0.0.1:${port}/nf_harness`;
+			const client = createPostgresClient({ driver: "bun-sql", url });
+			try {
+				const db = client.db;
+				await migrate(db, { migrationsFolder: "drizzle-postgres" } as Parameters<
+					typeof migrate
+				>[1]);
+				const queue = createPostgresRuntimeQueue(db);
+				const engine = createPostgresRuntimePublication(
+					db,
+					queue,
+					{ legacyReaders: new Map() },
+					{ summarize: (text) => text.slice(0, 600), snapshotBytes: 64 * 1024 },
+				);
+				const now = new Date().toISOString();
+				await db.insert(narrators).values([
+					{ id: "parent", createdAt: now, updatedAt: now },
+					{
+						id: "actor",
+						type: "subagent",
+						variant: "subagent:general",
+						parentNarratorId: "parent",
+						status: "idle",
+						createdAt: now,
+						updatedAt: now,
+					},
+				]);
+				const binding = { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } };
+				const restart = async () =>
+					(await engine.startRun({ narratorId: "actor", binding, adoptRegisteredRun: true }))
+						.publication!;
+				const reservedTerminals = async (logicalRunId: string) =>
+					(await db.select().from(outbox).where(eq(outbox.logicalRunId, logicalRunId))).filter(
+						(row) => row.eventKind === "terminal" && row.state === "reserved",
+					);
+				const first = (await engine.startRun({ narratorId: "actor", binding })).publication!;
+				// Unsettled: the restart keeps the run and its single reservation.
+				expect(await restart()).toEqual(first);
+				expect(await reservedTerminals(first.logicalRunId)).toHaveLength(1);
+				// Settled: its terminal spent the slot, so the restart needs a new run.
+				await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "failed",
+					text: "FIRST FAILURE",
+					summary: "failed",
+				});
+				expect(await reservedTerminals(first.logicalRunId)).toHaveLength(0);
+				const second = await restart();
+				expect(second.logicalRunId).not.toBe(first.logicalRunId);
+				expect(await reservedTerminals(second.logicalRunId)).toHaveLength(1);
+				// The new run's terminal commits into its own reservation.
+				expect(
+					(
+						await engine.commitAgentTerminal({
+							run: second,
+							eventKind: "completed",
+							text: "SECOND ANSWER",
+							summary: "done",
+						})
+					).status,
+				).toBe("committed");
+				// No task row is inserted by a restart registration.
+				expect(await db.select().from(backgroundTasks)).toHaveLength(0);
+				return "passed";
+			} catch (error) {
+				callbackError = error;
+				throw error;
+			} finally {
+				await client.close();
+			}
+		});
+		if (callbackError) throw callbackError;
+		if (result !== "passed")
+			throw new Error(`PostgreSQL harness failed: ${JSON.stringify(result)}`);
+	},
+	300_000,
+);
