@@ -592,6 +592,7 @@ export const updateSettingsSchema = z
 					.optional(),
 				providerOrder: z.array(z.string()).max(50).optional(),
 				disabledProviders: z.array(z.string()).max(200).optional(),
+				autoExcludedProviders: z.array(z.string().min(1).max(100)).max(200).optional(),
 			})
 			.partial()
 			.optional(),
@@ -1473,7 +1474,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["codex", "tokendance"]);
+			// `auto` selects a source for `auto:<model>` values (shared/auto-model.ts).
+			const RESERVED_PREFIXES = new Set(["codex", "tokendance", "auto"]);
 			const allPrefixes: Array<{ prefix: string; source: string; legacyTokenDance?: boolean }> = [];
 			const previousCustomProviders = [
 				...(current.customApiProviders ?? []),

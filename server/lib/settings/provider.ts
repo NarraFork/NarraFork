@@ -2,6 +2,11 @@
  * Provider resolution, model parsing, context window management, and model registry.
  * Extracted from the monolithic settings/index.ts.
  */
+import {
+	type AutoCandidateInput,
+	autoCandidates,
+	parseAutoModelValue,
+} from "@shared/auto-model";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import { modelProfile } from "@shared/model-catalog/profile";
@@ -13,7 +18,11 @@ import { resolveCommandCodeToken } from "../commandcode-manager";
 import { peekCommandCodeModels } from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
-import { getEffectiveModelProfile, resolveEffectiveModelCard } from "../model-catalog";
+import {
+	getEffectiveModelProfile,
+	identifyModelValue,
+	resolveEffectiveModelCard,
+} from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
@@ -287,6 +296,91 @@ function isModelProviderDisabled(modelValue: string): boolean {
 	return !!provider && getDisabledProviderPrefixes().has(provider);
 }
 
+// ---------------------------------------------------------------------------
+// auto:<model> (docs/PROVIDER-SOURCING-DESIGN.md §4.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * The provider models that can serve `auto:<modelId>`, in provider order: visible,
+ * enabled, taking part in auto routing, and a strong catalog match for the model.
+ */
+export function listAutoModelCandidates(modelId: string): string[] {
+	const excluded = new Set(s().agent.autoExcludedProviders ?? []);
+	const inputs: AutoCandidateInput[] = [];
+	for (const value of getVisibleModels()) {
+		const { provider } = parseModelId(value);
+		if (!provider || excluded.has(provider) || autoModelIdOf(value) !== null) continue;
+		const identity = identifyModelValue(value);
+		inputs.push({
+			value,
+			provider,
+			...(identity.modelId ? { modelId: identity.modelId } : {}),
+			matchedVia: identity.matchedVia,
+		});
+	}
+	return autoCandidates(modelId, inputs).map((candidate) => candidate.value);
+}
+
+/** Every catalog model that at least one provider can serve through `auto:`. */
+export function listAutoModelIds(): string[] {
+	const excluded = new Set(s().agent.autoExcludedProviders ?? []);
+	const ids = new Set<string>();
+	for (const value of getVisibleModels()) {
+		const { provider } = parseModelId(value);
+		if (!provider || excluded.has(provider)) continue;
+		const identity = identifyModelValue(value);
+		if (identity.modelId && (identity.matchedVia === "exact" || identity.matchedVia === "alias")) {
+			ids.add(identity.modelId);
+		}
+	}
+	return [...ids];
+}
+
+/**
+ * An installation that already had a provider prefixed `auto` keeps its values working
+ * until the provider is renamed; such values are not `auto:` routing.
+ */
+function legacyAutoPrefixInUse(): boolean {
+	return [...(s().customApiProviders ?? []), ...(s().nugProviders ?? [])].some(
+		(provider) => provider.prefix === "auto",
+	);
+}
+
+/** The `auto:` catalog model id, unless `auto` is still a configured provider prefix. */
+function autoModelIdOf(value: string | null | undefined): string | null {
+	const modelId = parseAutoModelValue(value);
+	return modelId && !legacyAutoPrefixInUse() ? modelId : null;
+}
+
+/**
+ * The concrete `<prefix>:<model>` an `auto:` value resolves to now.
+ *
+ * Until P3's strategy scoring lands this is the first candidate in provider order, kept on
+ * the provider a session already uses (`stickyProvider`) so a turn does not hop services
+ * and lose its upstream cache. Returns null when no provider serves the model.
+ */
+export function resolveAutoModel(modelId: string, stickyProvider?: string): string | null {
+	const candidates = listAutoModelCandidates(modelId);
+	if (stickyProvider) {
+		const sticky = candidates.find((value) => parseModelId(value).provider === stickyProvider);
+		if (sticky) return sticky;
+	}
+	return candidates[0] ?? null;
+}
+
+/** An `auto:` value names a catalog model no provider serves right now. */
+export class AutoModelUnavailableError extends AppError {
+	constructor(readonly modelId: string) {
+		super(
+			`No configured provider serves "${modelId}" for auto routing. ` +
+				"Choose another model, or a provider explicitly.",
+			409,
+			"AUTO_MODEL_UNAVAILABLE",
+		);
+		this.name = "AutoModelUnavailableError";
+	}
+}
+
 /** Round-robin counter for balanced aggregation routing. */
 const aggRoundRobin = new Map<string, number>();
 
@@ -388,6 +482,12 @@ function resolveConfiguredDefaultModel(stickyProvider?: string): string {
 		if (!candidate) throw new DefaultModelNotConfiguredError();
 		return candidate;
 	}
+	const autoId = autoModelIdOf(configured);
+	if (autoId) {
+		const candidate = resolveAutoModel(autoId, stickyProvider);
+		if (!candidate) throw new AutoModelUnavailableError(autoId);
+		return candidate;
+	}
 
 	return configured;
 }
@@ -410,6 +510,9 @@ function resolveConfiguredSummaryModel(stickyProvider?: string): string {
 			: sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider));
 		return candidate ?? resolveConfiguredDefaultModel(stickyProvider);
 	}
+	// Same rule for auto: a summary model nobody serves follows the default model.
+	const autoId = autoModelIdOf(configured);
+	if (autoId) return resolveAutoModel(autoId, stickyProvider) ?? resolveConfiguredDefaultModel();
 
 	return configured;
 }
@@ -437,7 +540,8 @@ function isMetaModelReference(model: string): boolean {
 		model === FOLLOW_PARENT_MODEL ||
 		isFollowDefaultModelValue(model) ||
 		isFollowSummaryModelValue(model) ||
-		!!parseAggModelValue(model)
+		!!parseAggModelValue(model) ||
+		autoModelIdOf(model) !== null
 	);
 }
 
@@ -602,6 +706,13 @@ export function resolveEffectiveModel(
 		if (resolved) return resolved;
 		// Fallback to default if aggregation has no members
 		return resolveConfiguredDefaultModel(stickyProvider);
+	}
+	// auto:<model> never falls back to another model: the caller chose this model.
+	const autoId = autoModelIdOf(raw);
+	if (autoId) {
+		const resolved = resolveAutoModel(autoId, stickyProvider);
+		if (!resolved) throw new AutoModelUnavailableError(autoId);
+		return resolved;
 	}
 
 	return raw;
@@ -923,6 +1034,12 @@ function getConfiguredProviderCandidates(): string[] {
 
 /** Resolve provider name for a given model (supports "provider:model" prefix). */
 export function resolveProvider(model?: string): string {
+	// `auto` is not a provider: name the one the value resolves to now, side-effect free.
+	const autoId = autoModelIdOf(model);
+	if (autoId) {
+		const first = listAutoModelCandidates(autoId)[0];
+		if (first) return parseModelId(first).provider as string;
+	}
 	const { provider: explicit, model: bare } = parseModelId(model);
 	if (explicit) return explicit;
 
@@ -981,6 +1098,9 @@ function resolveMetaModelForLookup(model: string, seen = new Set<string>()): str
 		if (!configured || isFollowDefaultModelValue(configured)) return raw;
 		return resolveMetaModelForLookup(configured, seen);
 	}
+
+	const autoId = autoModelIdOf(raw);
+	if (autoId) return listAutoModelCandidates(autoId)[0] ?? raw;
 
 	const agg = parseAggModelValue(raw);
 	if (!agg) return raw;

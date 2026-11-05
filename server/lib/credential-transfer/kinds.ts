@@ -98,6 +98,7 @@ function uniquePrefix(prefix: string): string {
 		"codex",
 		"tokendance",
 		"CommandCode",
+		"auto",
 		...(settings.customApiProviders ?? []).map((p) => p.prefix),
 		...(settings.nugProviders ?? []).map((p) => p.prefix),
 	]);

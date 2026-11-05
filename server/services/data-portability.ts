@@ -1314,7 +1314,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			>),
 		];
 		const existingNames = new Set(currentList.map((item) => String(item.name ?? "")));
-		const existingPrefixes = new Set(currentList.map((item) => String(item.prefix ?? "")));
+		// `auto` is reserved for auto:<model> values; an older export may still use it.
+		const existingPrefixes = new Set([
+			"auto",
+			...currentList.map((item) => String(item.prefix ?? "")),
+		]);
 		const existingIds = new Set(currentList.map((item) => String(item.id ?? "")));
 		for (const item of incomingList as Array<Record<string, unknown>>) {
 			const copy = { ...item };

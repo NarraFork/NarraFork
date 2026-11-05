@@ -523,6 +523,7 @@ export function migrateProviderPrefixReferences(
 		customModels: settings.agent.customModels,
 		providerOrder: settings.agent.providerOrder,
 		disabledProviders: settings.agent.disabledProviders,
+		autoExcludedProviders: settings.agent.autoExcludedProviders,
 		searchChannels: settings.search?.channels,
 	});
 
@@ -569,6 +570,9 @@ export function migrateProviderPrefixReferences(
 	settings.agent.disabledProviders = settings.agent.disabledProviders?.map(
 		(prefix) => prefixMap.get(prefix) ?? prefix,
 	);
+	settings.agent.autoExcludedProviders = settings.agent.autoExcludedProviders?.map(
+		(prefix) => prefixMap.get(prefix) ?? prefix,
+	);
 	if (settings.search?.channels) {
 		settings.search.channels = settings.search.channels.map((channel) => ({
 			...channel,
@@ -589,6 +593,7 @@ export function migrateProviderPrefixReferences(
 		customModels: settings.agent.customModels,
 		providerOrder: settings.agent.providerOrder,
 		disabledProviders: settings.agent.disabledProviders,
+		autoExcludedProviders: settings.agent.autoExcludedProviders,
 		searchChannels: settings.search?.channels,
 	});
 	return connectionsMoved || before !== after;

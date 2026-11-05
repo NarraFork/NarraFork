@@ -861,6 +861,11 @@ export interface NarraForkSettings {
 		 * Multi-instance providers use their own `disabled` field instead.
 		 */
 		disabledProviders?: string[];
+		/**
+		 * Provider prefixes left out of `auto:<model>` routing. They still serve values that
+		 * name them (`<prefix>:<model>`); use it for relays whose same-named models may differ.
+		 */
+		autoExcludedProviders?: string[];
 		/** Browser proxy override for new sessions. Absent/"default" = global policy. */
 		browserProxy?: ProxyOverride;
 		/** Explicit pre-approval for Notification.send; never overrides read-only mode. */
