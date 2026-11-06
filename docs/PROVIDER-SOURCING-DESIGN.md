@@ -360,7 +360,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 已实现（P3）：
 - 聚合迁移：`server/services/aggregation-migration-service.ts`，规则在 `shared/aggregation-migration.ts`。启动时在后台执行，作用于 settings.agent 的各模型字段、子代理池与固定档位、搜索渠道模型，以及 `narrators.model` / `pending_model_restore`、`scheduled_tasks.model`、`hooks.model`。先写日志，再在一个事务里逐行比对后改写，最后保存设置；失败时把行改回原值，下次启动重试。规划之后被用户改过的行会跳过。聚合本身保留在设置里（界面只读），引用已删除聚合的值不改，照旧回落到默认模型。
 - `auto` 前缀改名：`migrateReservedAutoPrefixOnStartup`（`provider-prefix-migration-service.ts`），改为第一个空闲的 `auto-N`，复用前缀迁移的日志与回滚。改名之前，`auto:` 值仍按普通前缀解析。
-- 两项迁移目前只在 SQLite 后端执行（叙述者行经 SQLite 句柄改写）。PostgreSQL 后端下聚合值照旧可解析，`auto` 前缀的供应商照旧作为普通前缀使用。
+- 两项迁移在 SQLite 和 PostgreSQL 后端都会执行。`services/migration-db.ts` 按后端选择句柄：SQLite 走原来的同步句柄，PostgreSQL 用组合根注入的 `postgresRuntime.client.db`（`setMigrationPgHandle`，在 `main.ts` 的前缀迁移之前和 `composePostgresStores` 各注入一次）。扫描是异步分批读取，提交在一个事务里逐行更新（PG 为异步事务）。注意：`selectFrom` 不能是 async——await 一个 Drizzle 构造器会把它执行掉，返回的是行而不是构造器。
 - 顺序：还有 `auto` 前缀的供应商时（改名失败或尚未执行），聚合迁移推迟到下次启动，否则写出的 `auto:` 值会被当成那个供应商的模型。
 - 数据导入 / 导出（`server/services/data-portability.ts`）：`agent.autoExcludedProviders` 随供应商导出，导入时与本地取并集，并跟随供应商前缀改名；清空供应商时一起清掉。导入的供应商因前缀冲突改名（如 `openai` → `openai-2`）时，本次写入的会话的 `model` / `pending_model_restore` 也改到新前缀（只认完整前缀，含 `__agg__`，`auto:` 值不动）；冲突时被跳过的本地会话不动。
 
@@ -373,7 +373,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 | **P0 地基**（已完成） | 所有来源写 `credentialId`；`api_requests` 记录计费主体与项目；`usage_daily`；修复首页汇总越权 | 用量可按来源区分；首页只显示自己的开销 |
 | **P1 目录重做**（已完成） | 按 §8 重做模型目录：3 层合并、8 类字段、独立覆盖文件、精简在线更新、新模型卡界面；删除变体 / 绑定 / 遗留归档 | 模型参数页只剩必要字段，不再报错和卡顿。后续逻辑模型路由依赖这里的模型身份匹配，所以提前 |
 | **P2 存储**（基本完成） | 凭据文件加密（`secret-store.ts` 已完成，Codex 凭据已接入，可在设置中关闭）；凭据迁移（二次核验 + 口令加密导出 / 预览导入，已完成）；API key 迁出 `settings.json`（自定义 API、NUG、TokenDance、Command Code、自定义搜索供应商，已完成）；数据导出带全部 Key，需二次核验并用口令加密（§7，已完成）；自定义 API 供应商的多 Key 池（Key 存储、会话粘性轮换与故障切换、逐 Key 额度与网络身份、Key 列表界面，已完成；Codex 的池化逻辑暂留在 CodexManager，后续与之合并）；逐凭据网络身份（Codex 账号已完成：`shared/credential-network.ts` + `server/lib/codex-network.ts`，请求、令牌刷新、额度查询与 Agent Identity 注册都走账号自己的代理 / UA / 设备 ID / 请求头）。**剩余**：CodexManager 池化合并；NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json | Kimi / OpenCode 等获得 Codex 式详情页 |
-| **P3 路由**（部分完成） | `auto:` 模型值、`resolveRoute`、策略预设、纪元锁、模型选择器二级菜单；把聚合迁为 `auto:`（`前缀:模型` 值无需迁移）。**已完成**：`auto:` 值与保存校验、聚合迁移（仅 SQLite）、固定排序（能否服务 → 订阅 → 参考价）与最小能力过滤、被迫切换、渠道锁（激活恢复、压缩后重选）、“参与自动”开关、选择器来源行与按厂商分组（§4、§10.2、§14.1）。**剩余**：状态栏额度显示会话实际来源、来源行当前账号 / Key 与重置倒计时、启动迁移支持 PostgreSQL；`resolveRoute` 统一入口、策略预设与拖动排序、稳定性维度、路由策略设置页（§4.2、§10.3） | “模型聚合”消失，来源变为二级菜单 |
+| **P3 路由**（部分完成） | `auto:` 模型值、`resolveRoute`、策略预设、纪元锁、模型选择器二级菜单；把聚合迁为 `auto:`（`前缀:模型` 值无需迁移）。**已完成**：`auto:` 值与保存校验、聚合迁移（SQLite 与 PostgreSQL）、固定排序（能否服务 → 订阅 → 参考价）与最小能力过滤、被迫切换、渠道锁（激活恢复、压缩后重选）、“参与自动”开关、选择器来源行与按厂商分组、状态栏额度跟随会话实际来源、来源行当前账号 / Key 与重置倒计时（§4、§10.2、§14.1）。**剩余**：`resolveRoute` 统一入口、策略预设与拖动排序、稳定性维度、路由策略设置页（§4.2、§10.3；本期只做设置页 + “省钱”“用掉订阅”两个预设） | “模型聚合”消失，来源变为二级菜单 |
 | **P4 个人来源** | 个人凭据、计费主体规则、团队回落、团队策略与个人预算 | 非管理员可登录自己的订阅 |
 | **P5 开销与分析** | 计费配置、实际开销、节省量、我的用量 / 团队用量、隐私、项目预算 | 用量页对所有人开放 |
 | 以后 | 缓存冷点重选（先在 P3 采集各渠道的空闲间隔与缓存命中数据再定）；项目所有者再分配预算 | — |
@@ -408,7 +408,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 | P3 | 模型值改定为 `前缀:模型` + `auto:<模型>`（§4.1）；`auto` 成为保留前缀；`agent.autoExcludedProviders` | `shared/auto-model.ts`、`server/lib/settings/provider.ts` |
 | P3 | `auto:` 排序：能否服务 → 订阅优先 → 参考价；会话来源仍能服务时不换 | `shared/auto-route-strategy.ts`、`server/lib/agent/auto-route-signals.ts` |
 | P3 | 子代理可用模型与模型池接受 `auto:` | `server/lib/agent/tools/task.ts`、`settings/provider.ts` |
-| P3 | 启动迁移（仅 SQLite）：`auto` 前缀的供应商改名为 `auto-N`；聚合值迁为 `auto:` / `前缀:模型` | `services/provider-prefix-migration-service.ts`、`services/aggregation-migration-service.ts`、`shared/aggregation-migration.ts` |
+| P3 | 启动迁移（SQLite 与 PostgreSQL）：`auto` 前缀的供应商改名为 `auto-N`；聚合值迁为 `auto:` / `前缀:模型` | `services/provider-prefix-migration-service.ts`、`services/aggregation-migration-service.ts`、`services/migration-db.ts`、`shared/aggregation-migration.ts` |
 | P3 | 模型菜单 `auto:` 行与来源子菜单；聚合设置页只读 | `GET /api/model-catalog/auto`（`server/lib/model-sourcing/auto-models.ts`）、`ModelMenuItems.tsx`、`useModels.ts`、`ModelAggregationsSection.tsx` |
 | P3 | 被迫切换（§4.3）；NUG 按网关模型的可用性信号 | `services/agent-runtime/auto-forced-switch.ts`、`orchestrator.ts`、`auto-route-signals.ts` |
 | P3 | 渠道锁：激活时取最近回复的服务、压缩后重选、全部不可用时留在原来源（§4.1、§4.3） | `services/auto-sticky-source.ts`、`narrator-session.ts`、`narrator-session-state.ts`、`settings/provider.ts` |
@@ -423,9 +423,7 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 ### 14.2 下一步，按顺序
 
 1. **P3 剩余**
-   - 状态栏的额度显示改为会话实际在用的来源（见 §14.3）。
-   - 选择器来源行补“当前会用的账号 / Key”与重置倒计时（§10.2 差距）。
-   - 两项启动迁移支持 PostgreSQL 后端。
+   - 路由策略设置页 + “省钱”“用掉订阅”两个预设（§4.2、§10.3；稳定性、均衡、拖动排序、`resolveRoute` 统一入口等采集到数据后再做）。
 2. **P2 收尾**
    - 把 CodexManager 里与账号无关的池化逻辑（优先级、会话亲和、失败停用、额度跳过）与 `pooled-provider.ts` 合并成一个通用池；Codex 只保留 OAuth / PAT / Agent Identity 登录与 `/wham/usage` 探测。不要一次重写 CodexManager，先抽出纯函数再替换调用点。
    - NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json。

@@ -22,7 +22,6 @@ import {
 } from "@shared/aggregation-migration";
 import { and, eq, gt, like } from "drizzle-orm";
 import type { SQLiteColumn, SQLiteTable } from "drizzle-orm/sqlite-core";
-import { db } from "../db";
 import { hooks, narrators, scheduledTasks } from "../db/schema";
 import { logger } from "../lib/logger";
 import { identifyModelValue } from "../lib/model-catalog";
@@ -33,6 +32,7 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
+import { allRows, applyUpdates, type PlannedUpdate, selectFrom } from "./migration-db";
 
 const JOURNAL_VERSION = 1;
 const JOURNAL_PATH = `${narraforkDir}/aggregation-migration.json`;
@@ -203,17 +203,16 @@ export async function planAggregationMigration(
 	for (const target of TARGETS) {
 		let lastId: string | null = null;
 		for (;;) {
-			const batch = db
-				.select({ id: target.id, value: target.value })
-				.from(target.source)
-				.where(
-					lastId
-						? and(matchesPrefix(target.value), gt(target.id, lastId))
-						: matchesPrefix(target.value),
-				)
-				.orderBy(target.id)
-				.limit(SCAN_BATCH_SIZE)
-				.all() as Array<{ id: string; value: string | null }>;
+			const batch: Array<{ id: string; value: string | null }> = await allRows(
+				selectFrom(target.source, { id: target.id, value: target.value })
+					.where(
+						lastId
+							? and(matchesPrefix(target.value), gt(target.id, lastId))
+							: matchesPrefix(target.value),
+					)
+					.orderBy(target.id)
+					.limit(SCAN_BATCH_SIZE),
+			);
 			if (batch.length === 0) break;
 			for (const row of batch) {
 				if (!row.value?.startsWith(AGGREGATION_VALUE_PREFIX)) continue;
@@ -246,24 +245,21 @@ function targetOf(row: AggregationRowChange): ColumnTarget {
 }
 
 /** Set each row to `after` (or back to `before`); a row someone changed since is skipped. */
-function applyRows(rows: readonly AggregationRowChange[], direction: "after" | "before"): number {
-	if (rows.length === 0) return 0;
-	let applied = 0;
-	db.transaction((tx) => {
-		for (const row of rows) {
-			const target = targetOf(row);
-			const from = direction === "after" ? row.before : row.after;
-			const to = direction === "after" ? row.after : row.before;
-			const updated = tx
-				.update(target.source)
-				.set({ [target.property]: to })
-				.where(and(eq(target.id, row.id), eq(target.value, from)))
-				.returning({ id: target.id })
-				.all();
-			applied += updated.length;
-		}
+async function applyRows(
+	rows: readonly AggregationRowChange[],
+	direction: "after" | "before",
+): Promise<number> {
+	const updates: PlannedUpdate[] = rows.map((row) => {
+		const target = targetOf(row);
+		const from = direction === "after" ? row.before : row.after;
+		const to = direction === "after" ? row.after : row.before;
+		return {
+			table: target.source,
+			set: { [target.property]: to },
+			where: and(eq(target.id, row.id), eq(target.value, from)),
+		};
 	});
-	return applied;
+	return applyUpdates(updates);
 }
 
 function writeJournal(rows: AggregationRowChange[]): void {
@@ -281,20 +277,20 @@ function writeJournal(rows: AggregationRowChange[]): void {
 }
 
 /** Apply a plan: rows, then settings; on failure the rows are put back. */
-export function commitAggregationMigration(plan: AggregationMigrationPlan): number {
+export async function commitAggregationMigration(plan: AggregationMigrationPlan): Promise<number> {
 	if (plan.rows.length === 0) {
 		if (plan.settings) saveSettings(plan.settings);
 		return 0;
 	}
 	writeJournal(plan.rows);
 	try {
-		const applied = applyRows(plan.rows, "after");
+		const applied = await applyRows(plan.rows, "after");
 		if (plan.settings) saveSettings(plan.settings);
 		rmSync(JOURNAL_PATH, { force: true });
 		return applied;
 	} catch (error) {
 		try {
-			applyRows(plan.rows, "before");
+			await applyRows(plan.rows, "before");
 			rmSync(JOURNAL_PATH, { force: true });
 		} catch (rollbackError) {
 			logger.error("Aggregation migration rollback failed; journal retained", {
@@ -311,14 +307,14 @@ export function commitAggregationMigration(plan: AggregationMigrationPlan): numb
  * A journal left by a crash: if settings no longer hold aggregation values the save went
  * through, so the rows are finished; otherwise they are put back and the migration reruns.
  */
-function recoverJournal(): void {
+async function recoverJournal(): Promise<void> {
 	if (!existsSync(JOURNAL_PATH)) return;
 	const journal = JSON.parse(readFileSync(JOURNAL_PATH, "utf8")) as Partial<Journal>;
 	if (journal.version !== JOURNAL_VERSION || !Array.isArray(journal.rows)) {
 		throw new Error("Invalid aggregation migration journal");
 	}
 	const saved = migrateSettings(settings, migrator(settings)).next === null;
-	applyRows(journal.rows, saved ? "after" : "before");
+	await applyRows(journal.rows, saved ? "after" : "before");
 	rmSync(JOURNAL_PATH, { force: true });
 	logger.info("Recovered interrupted aggregation migration", {
 		direction: saved ? "after" : "before",
@@ -344,7 +340,7 @@ export async function migrateAggregationsOnStartup(): Promise<void> {
 		return;
 	}
 	try {
-		recoverJournal();
+		await recoverJournal();
 		const plan = await planAggregationMigration();
 		if (!plan.settings && plan.rows.length === 0) {
 			if (plan.unresolved > 0) {
@@ -354,7 +350,7 @@ export async function migrateAggregationsOnStartup(): Promise<void> {
 			}
 			return;
 		}
-		const applied = commitAggregationMigration(plan);
+		const applied = await commitAggregationMigration(plan);
 		logger.info("Migrated model aggregation values to auto:/provider values", {
 			settingsChanged: !!plan.settings,
 			rows: applied,

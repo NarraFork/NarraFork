@@ -131,6 +131,7 @@ import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
 import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
+import { setMigrationPgHandle } from "./services/migration-db";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -189,20 +190,20 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 		),
 });
 
+// The startup migrations below read and rewrite narrator rows; give them the PG handle
+// before they run (composePostgresStores sets it again, harmlessly).
+if (postgresRuntime) setMigrationPgHandle(postgresRuntime.client.db);
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
-recoverProviderPrefixMigrationOnStartup();
+await recoverProviderPrefixMigrationOnStartup();
 // auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
 installAutoRouteSignals();
 // `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
 // logged and leaves it working as an ordinary prefix, so startup never depends on it.
-// SQLite only: narrator rows are rewritten through the SQLite handle, which is a fail-closed
-// proxy on PostgreSQL. There the provider keeps working as an ordinary prefix.
-if (activeDatabaseBackend === "sqlite") {
-	await migrateReservedAutoPrefixOnStartup().catch((error) => {
-		logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
-	});
-}
+// Runs on both backends (services/migration-db.ts picks the active handle).
+await migrateReservedAutoPrefixOnStartup().catch((error) => {
+	logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
+});
 
 // When the PostgreSQL backend is active, inject every PG-capable store from the single
 // composition seam — one runtime, one client, all-or-nothing. `./db` has already finished

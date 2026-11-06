@@ -115,7 +115,7 @@ describe("aggregation migration", () => {
 		});
 		const plan = await planAggregationMigration();
 		expect(plan.unresolved).toBe(1);
-		commitAggregationMigration(plan);
+		await commitAggregationMigration(plan);
 
 		expect(settings.agent.defaultModel).toBe("auto:claude-opus-4-6");
 		expect(settings.agent.summaryModel).toBe("pa:claude-opus-4-6");
@@ -168,7 +168,7 @@ describe("aggregation migration", () => {
 		const plan = await planAggregationMigration();
 		// A user switches this narrator after the plan was made.
 		db.update(narrators).set({ model: "pb:gpt-5.5-mini" }).where(eq(narrators.id, raced)).run();
-		const applied = commitAggregationMigration(plan);
+		const applied = await commitAggregationMigration(plan);
 		expect(applied).toBe(plan.rows.length - 1);
 
 		expect(modelOf(a)).toEqual({ model: "auto:claude-opus-4-6", pending: "pb:gpt-5.5" });
@@ -188,7 +188,7 @@ describe("aggregation migration", () => {
 		const broken = { ...plan, settings: { ...plan.settings } as NarraForkSettings };
 		// A settings object without `agent` makes the save throw after the rows were written.
 		(broken.settings as { agent?: unknown }).agent = undefined;
-		expect(() => commitAggregationMigration(broken)).toThrow();
+		await expect(commitAggregationMigration(broken)).rejects.toThrow();
 		expect(modelOf(id)?.model).toBe("__agg__:same");
 	});
 

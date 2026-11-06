@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { eq, gt } from "drizzle-orm";
-import { db } from "../db";
+import { and, eq, gt, isNull } from "drizzle-orm";
+import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { narrators } from "../db/schema";
 import { logger } from "../lib/logger";
 import {
@@ -14,6 +14,7 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
+import { allRows, applyUpdates, firstRow, type PlannedUpdate, selectFrom } from "./migration-db";
 
 const JOURNAL_VERSION = 1;
 const JOURNAL_PATH = `${narraforkDir}/provider-prefix-migration.json`;
@@ -52,17 +53,20 @@ export async function planProviderPrefixNarratorMigration(
 	let lastId: string | null = null;
 	let scanned = 0;
 	for (;;) {
-		const rows = db
-			.select({
+		const rows: Array<{
+			id: string;
+			model: string | null;
+			pendingModelRestore: string | null;
+		}> = await allRows(
+			selectFrom(narrators, {
 				id: narrators.id,
 				model: narrators.model,
 				pendingModelRestore: narrators.pendingModelRestore,
 			})
-			.from(narrators)
-			.where(lastId ? gt(narrators.id, lastId) : undefined)
-			.orderBy(narrators.id)
-			.limit(SCAN_BATCH_SIZE)
-			.all();
+				.where(lastId ? gt(narrators.id, lastId) : undefined)
+				.orderBy(narrators.id)
+				.limit(SCAN_BATCH_SIZE),
+		);
 		if (rows.length === 0) break;
 		scanned += rows.length;
 		if (scanned > MAX_SCANNED_NARRATORS) {
@@ -112,58 +116,73 @@ function writeJournal(plan: ProviderPrefixMigrationPlan): void {
 	}
 }
 
-function applyNarratorChanges(
-	rows: ProviderPrefixNarratorChange[],
-	direction: "before" | "after",
-): void {
-	if (rows.length === 0) return;
-	db.transaction((tx) => {
-		for (const row of rows) {
-			const current = tx
-				.select({
-					model: narrators.model,
-					pendingModelRestore: narrators.pendingModelRestore,
-				})
-				.from(narrators)
-				.where(eq(narrators.id, row.id))
-				.get();
-			if (!current) continue;
-			const sourceModel = direction === "after" ? row.beforeModel : row.afterModel;
-			const sourcePending =
-				direction === "after" ? row.beforePendingModelRestore : row.afterPendingModelRestore;
-			const targetModel = direction === "after" ? row.afterModel : row.beforeModel;
-			const targetPending =
-				direction === "after" ? row.afterPendingModelRestore : row.beforePendingModelRestore;
-			if (current.model === targetModel && current.pendingModelRestore === targetPending) continue;
-			if (current.model !== sourceModel || current.pendingModelRestore !== sourcePending) {
-				throw new Error(`Narrator ${row.id} changed while provider prefixes were being migrated`);
-			}
-			tx.update(narrators)
-				.set({ model: targetModel, pendingModelRestore: targetPending })
-				.where(eq(narrators.id, row.id))
-				.run();
-		}
-	});
+/** `= value`, or IS NULL for a nullable model column (null never equals null in SQL). */
+function matches(column: SQLiteColumn, value: string | null) {
+	return value === null ? isNull(column) : eq(column, value);
 }
 
-export function commitProviderPrefixMigration(
+async function applyNarratorChanges(
+	rows: ProviderPrefixNarratorChange[],
+	direction: "before" | "after",
+): Promise<void> {
+	if (rows.length === 0) return;
+	const updates: PlannedUpdate[] = [];
+	for (const row of rows) {
+		const current = await firstRow<{
+			model: string | null;
+			pendingModelRestore: string | null;
+		}>(
+			selectFrom(narrators, {
+				model: narrators.model,
+				pendingModelRestore: narrators.pendingModelRestore,
+			}).where(eq(narrators.id, row.id)),
+		);
+		if (!current) continue;
+		const sourceModel = direction === "after" ? row.beforeModel : row.afterModel;
+		const sourcePending =
+			direction === "after" ? row.beforePendingModelRestore : row.afterPendingModelRestore;
+		const targetModel = direction === "after" ? row.afterModel : row.beforeModel;
+		const targetPending =
+			direction === "after" ? row.afterPendingModelRestore : row.beforePendingModelRestore;
+		if (current.model === targetModel && current.pendingModelRestore === targetPending) continue;
+		if (current.model !== sourceModel || current.pendingModelRestore !== sourcePending) {
+			throw new Error(`Narrator ${row.id} changed while provider prefixes were being migrated`);
+		}
+		updates.push({
+			table: narrators,
+			set: { model: targetModel, pendingModelRestore: targetPending },
+			// The guard is in the UPDATE too, so a row changed after the read is not overwritten.
+			where: and(
+				eq(narrators.id, row.id),
+				matches(narrators.model, sourceModel),
+				matches(narrators.pendingModelRestore, sourcePending),
+			),
+		});
+	}
+	const applied = await applyUpdates(updates);
+	if (applied !== updates.length) {
+		throw new Error("A narrator changed while provider prefixes were being migrated");
+	}
+}
+
+export async function commitProviderPrefixMigration(
 	previousSettings: NarraForkSettings,
 	nextSettings: NarraForkSettings,
 	plan: ProviderPrefixMigrationPlan,
-): ProviderPrefixNarratorChange[] {
+): Promise<ProviderPrefixNarratorChange[]> {
 	if (plan.changes.length === 0 || plan.narrators.length === 0) {
 		saveSettings(nextSettings);
 		return [];
 	}
 	writeJournal(plan);
 	try {
-		applyNarratorChanges(plan.narrators, "after");
+		await applyNarratorChanges(plan.narrators, "after");
 		saveSettings(nextSettings);
 		rmSync(JOURNAL_PATH, { force: true });
 		return plan.narrators;
 	} catch (error) {
 		try {
-			applyNarratorChanges(plan.narrators, "before");
+			await applyNarratorChanges(plan.narrators, "before");
 			// saveSettings is atomic; this is only needed if a future implementation can
 			// fail after replacing the file but before updating the in-memory singleton.
 			if (settings !== previousSettings) saveSettings(previousSettings);
@@ -211,7 +230,7 @@ export async function migrateReservedAutoPrefixOnStartup(): Promise<ProviderPref
 	);
 	migrateProviderPrefixReferences(next, changes);
 	const plan = await planProviderPrefixNarratorMigration(changes);
-	commitProviderPrefixMigration(settings, next, plan);
+	await commitProviderPrefixMigration(settings, next, plan);
 	logger.warn("Renamed a provider prefixed `auto`, which is now reserved for auto:<model>", {
 		to: renamed,
 		changes,
@@ -240,7 +259,7 @@ function parseJournal(value: unknown): ProviderPrefixMigrationJournal {
 	return journal as ProviderPrefixMigrationJournal;
 }
 
-export function recoverProviderPrefixMigrationOnStartup(): void {
+export async function recoverProviderPrefixMigrationOnStartup(): Promise<void> {
 	if (!existsSync(JOURNAL_PATH)) return;
 	const journal = parseJournal(JSON.parse(readFileSync(JOURNAL_PATH, "utf8")));
 	const usesAfter = journal.changes.every(
@@ -250,9 +269,9 @@ export function recoverProviderPrefixMigrationOnStartup(): void {
 		(change) => providerPrefixForId(settings, change.id) === change.from,
 	);
 	if (usesAfter) {
-		applyNarratorChanges(journal.narrators, "after");
+		await applyNarratorChanges(journal.narrators, "after");
 	} else if (usesBefore) {
-		applyNarratorChanges(journal.narrators, "before");
+		await applyNarratorChanges(journal.narrators, "before");
 	} else {
 		throw new Error("Provider prefix migration journal does not match current settings");
 	}

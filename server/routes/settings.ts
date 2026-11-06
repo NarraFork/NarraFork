@@ -1819,7 +1819,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		>["narrators"] = [];
 		const persistStartedAt = performance.now();
 		if (prefixChanges.length > 0) {
-			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
+			migratedNarrators = await commitProviderPrefixMigration(current, merged, prefixPlan);
 		} else {
 			saveSettings(merged);
 		}
