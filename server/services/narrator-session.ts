@@ -439,6 +439,7 @@ import { recoverInterruptedTurns } from "./narrator-turns";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
 import {
 	assertSnapshotRevertComplete,
+	isAvailableFilesRestored,
 	type RevertResult,
 	type RevertScope,
 	type RevertWarning,
@@ -7330,9 +7331,20 @@ async function editAndRegenerateUnlocked(
 				revertPlan: opts?.revertPlan,
 			},
 		);
-		assertSnapshotRevertComplete(revertResult);
-		if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
-		revertWarnings = revertResult.warnings;
+		if (isAvailableFilesRestored(revertResult)) {
+			// A partial-coverage plan was confirmed as "restore available files": they are
+			// restored and the plan deliberately leaves history alone. The edit itself
+			// still has to truncate, so finish it history-only, exactly like keep-files.
+			({ deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
+				preserveConversationId: true,
+				skipRevert: true,
+			}));
+			revertWarnings = revertResult.warnings;
+		} else {
+			assertSnapshotRevertComplete(revertResult);
+			if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
+			revertWarnings = revertResult.warnings;
+		}
 	}
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {

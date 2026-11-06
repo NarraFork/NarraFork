@@ -73,6 +73,21 @@ export class SnapshotRevertError extends AppError {
 	}
 }
 
+/**
+ * A partial-coverage plan the user confirmed as "restore available files": every
+ * file it covers succeeded and history was intentionally left uncommitted.
+ */
+export function isAvailableFilesRestored(result: RevertResult): boolean {
+	return (
+		result.status === "partial" &&
+		result.journalStatus === "partial" &&
+		result.reason === "SELECTED_HISTORY_UNAVAILABLE" &&
+		!result.historyCommitted &&
+		!result.settling &&
+		result.files.every((file) => file.status === "applied" || file.status === "unchanged")
+	);
+}
+
 export function assertSnapshotRevertComplete(result: RevertResult): void {
 	if (
 		result.status !== "committed" ||
