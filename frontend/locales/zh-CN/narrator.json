@@ -796,10 +796,12 @@
 	"attachFile": "附加文件",
 	"removeImage": "移除",
 	"removeFile": "移除",
-	"imageTooLarge": "图片不能超过 100MB",
+	"imageTooLarge": "图片不能超过 20MB",
 	"unsupportedFormat": "支持格式：PNG、JPEG、GIF、WebP",
 	"dropFilesHere": "拖放文件到此处",
-	"textFileTooLarge": "文本文件过大（最大 100MB）",
+	"textFileTooLarge": "文本文件过大（最大 1GB）",
+	"attachmentTooLargeForUpload": "{{name}} 超过 1 GB 的附件上限。",
+	"attachmentStagingFull": "无法上传 {{name}}：待发送的附件过多。请先发送或移除部分附件后重试。",
 	"unsupportedFileType": "不支持的文件类型",
 	"draftAttachmentsRestoreFailedTitle": "部分附件未能恢复",
 	"draftAttachmentsRestoreFailed": "有 {{count}} 个待发附件已丢失，需要重新添加。",
@@ -2702,5 +2704,52 @@
 		"digest": "agent 代你确认了 {{count}} 处改动",
 		"from": "来自：{{narrator}}",
 		"fromHidden": "来自一个你无权查看的会话"
+	},
+	"outlinePlan": {
+		"summary": "第 {{version}} 版 · 新增 {{added}} · 改动 {{changed}} · 删除 {{removed}}",
+		"summaryFirst": "第 {{version}} 版 · 新计划，共 {{added}} 块",
+		"agentSummary": "这一版改了：{{summary}}",
+		"draft": "按草稿执行",
+		"lock": "锁定后执行…",
+		"return": "退回",
+		"viewChanges": "查看改动",
+		"openInOutline": "在大纲中打开",
+		"feedbackPlaceholder": "给 agent 的意见（退回时一并发送）",
+		"lockTitle": "锁定计划后执行",
+		"lockExplain": "之后改步骤（增删、改写、调整顺序、取消步骤、整个计划完成）要等你确认，或者等你指定的会话代你确认。进展和发现照常直写。",
+		"delegateLabel": "代你确认步骤调整的会话（可选）",
+		"delegatePlaceholder": "不指定：我自己确认",
+		"compact": "执行前把上下文重置到计划上",
+		"confirmLock": "锁定并执行",
+		"cancel": "取消",
+		"changed": "你查看之后计划又被改过。请重新查看改动再决定。",
+		"failed": "没能完成这个决定",
+		"diff": {
+			"title": "计划的改动：{{title}}",
+			"firstVersion": "第一版：全部是新增。",
+			"sincePrevious": "和你上次看到的版本相比。",
+			"countAdded": "新增 {{count}}",
+			"countChanged": "改动 {{count}}",
+			"countRemoved": "删除 {{count}}",
+			"nothing": "和上一版相比没有改动。",
+			"truncated": "改动比显示的多：在大纲中打开计划查看全部。",
+			"under": "在「{{title}}」下",
+			"noTask": "不是任务",
+			"due": "截止 {{date}}",
+			"depends": "{{count}} 个前置",
+			"change": {
+				"added": "新增",
+				"removed": "删除",
+				"text": "改写",
+				"task": "任务",
+				"moved": "移动"
+			},
+			"status": {
+				"todo": "待办",
+				"doing": "进行中",
+				"done": "完成",
+				"cancelled": "取消"
+			}
+		}
 	}
 }

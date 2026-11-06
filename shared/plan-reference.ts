@@ -32,10 +32,27 @@ export function buildPlanReference(planFile: string, status: string): string {
 	);
 }
 
-/** Distinctive fragments of the sentence built above. */
+/**
+ * Build the reference that replaces an outline plan's snapshot in model history (outline P2 PR
+ * 8): the plan is the task tree under its root, which OutlineRead reads as it is now.
+ */
+export function buildOutlinePlanReference(
+	address: string,
+	version: number,
+	status: string,
+): string {
+	const prefix = status === "fail" ? "The plan was not approved." : "The plan was approved.";
+	return (
+		`${prefix} It is the task tree under the outline block ${address} (version ${version}). ` +
+		"Read it with OutlineRead if you need the plan details."
+	);
+}
+
+/** Distinctive fragments of the sentences built above. */
 const PLAN_REFERENCE_MARKERS = [
 	"its full content is saved in the plan file",
 	"re-read that file with the read tool",
+	"it is the task tree under the outline block",
 ];
 
 /** How much of a candidate string is scanned for the markers (see below). */

@@ -103,9 +103,12 @@ describe("static built-in tool definitions", () => {
 		const schema = toolRegistry.get("ExitPlanMode")?.rawJsonSchema;
 		expect(schema?.required).toEqual(["mode"]);
 		expect(schema?.properties).toMatchObject({
-			mode: { type: "string", enum: ["inline", "file"] },
+			// `outline`: an outline session's plan is a task tree (outline P2 PR 8).
+			mode: { type: "string", enum: ["inline", "file", "outline"] },
 			inline_plan: { type: "string" },
 			plan_file_path: { type: "string" },
+			summary: { type: "string" },
+			root: { type: "string" },
 		});
 	});
 });

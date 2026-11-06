@@ -28,6 +28,11 @@ import {
 	deviceHasFeature,
 	requireAuthorizedDeviceForProject,
 } from "./device-service";
+import {
+	endWatchesForBuffer,
+	notifyTerminalOutput,
+	suspendTerminalWatchesForShutdown,
+} from "./terminal-watch-service";
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
 
 const DEFAULT_SHELL = detectShell().path;
@@ -177,6 +182,7 @@ function onData(id: string, buffer: BufferManager, data: string | Uint8Array) {
 	if (text) {
 		buffer.append(text);
 		sendToTerminal(id, { type: "output", terminalId: id, data: text });
+		notifyTerminalOutput(id);
 	}
 }
 
@@ -198,12 +204,16 @@ function createBufferManager(
 	rows?: number,
 	getRuntime?: () => TerminalRuntime | undefined,
 ): BufferManager {
-	return new BufferManager(terminalId, cols, rows, {
+	const buffer: BufferManager = new BufferManager(terminalId, cols, rows, {
 		onReply: (data) => {
 			const runtime = getRuntime ? getRuntime() : activeTerminals.get(terminalId)?.runtime;
 			runtime?.write(data);
 		},
+		// Last chance for watches to see the final output while it can still be read.
+		beforeDispose: () =>
+			endWatchesForBuffer(terminalId, buffer, "the terminal exited or was closed"),
 	});
+	return buffer;
 }
 
 /**
@@ -223,6 +233,12 @@ function monitorAttachProcess(
 
 		if (await dtachService.isSocketAlive(terminalId)) {
 			// Detached — save buffer, remove from active. Will re-attach on demand.
+			// A re-attach builds a new buffer, so watches on this one cannot continue.
+			await endWatchesForBuffer(
+				terminalId,
+				active.buffer,
+				"the terminal was detached from the server",
+			);
 			active.buffer.saveToDisk();
 			active.runtime.close();
 			activeTerminals.delete(terminalId);
@@ -708,6 +724,11 @@ export const terminalService = {
 		return null;
 	},
 
+	/** Live buffer of an attached terminal (watches read it); undefined when detached. */
+	getActiveBuffer(terminalId: string): BufferManager | undefined {
+		return activeTerminals.get(terminalId)?.buffer;
+	},
+
 	getBufferState(terminalId: string): { mouseTracking: boolean; cursorVisible: boolean } | null {
 		const active = activeTerminals.get(terminalId);
 		if (!active) return null;
@@ -977,6 +998,9 @@ export const terminalService = {
 	 * and kill direct-mode terminals.
 	 */
 	async shutdownAll() {
+		// Do not publish watch results (and wake sessions) while shutting down:
+		// the rows stay running and restart recovery reports them.
+		suspendTerminalWatchesForShutdown();
 		const promises: Promise<void>[] = [];
 		for (const [id, active] of activeTerminals) {
 			promises.push(
@@ -985,6 +1009,7 @@ export const terminalService = {
 						// dtach mode: save buffer and close the attach process,
 						// but do NOT kill the dtach session — it should survive restart.
 						// DB status stays "running" so recoverOnStartup can find it.
+						// Watches cannot survive the process; restart recovery reports them.
 						await active.buffer.saveToDisk();
 						active.buffer.stopPeriodicFlush();
 						active.runtime.close();

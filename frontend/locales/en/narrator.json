@@ -797,10 +797,12 @@
 	"attachFile": "Attach file",
 	"removeImage": "Remove",
 	"removeFile": "Remove",
-	"imageTooLarge": "Image must be under 100MB",
+	"imageTooLarge": "Image must be under 20MB",
 	"unsupportedFormat": "Supported: PNG, JPEG, GIF, WebP",
 	"dropFilesHere": "Drop files here",
-	"textFileTooLarge": "Text file too large (max 100MB)",
+	"textFileTooLarge": "Text file too large (max 1GB)",
+	"attachmentTooLargeForUpload": "{{name}} is larger than the 1 GB attachment limit.",
+	"attachmentStagingFull": "Could not upload {{name}}: too many pending attachments. Send or remove some attachments, then try again.",
 	"unsupportedFileType": "Unsupported file type",
 	"draftAttachmentsRestoreFailedTitle": "Some attachments could not be restored",
 	"draftAttachmentsRestoreFailed": "{{count}} pending attachment(s) were lost and need to be attached again.",
@@ -2705,5 +2707,52 @@
 		"digest": "{{count}} change(s) an agent confirmed on your behalf",
 		"from": "From: {{narrator}}",
 		"fromHidden": "From a session you cannot open"
+	},
+	"outlinePlan": {
+		"summary": "Version {{version}} · {{added}} added · {{changed}} changed · {{removed}} removed",
+		"summaryFirst": "Version {{version}} · a new plan of {{added}} blocks",
+		"agentSummary": "What changed: {{summary}}",
+		"draft": "Execute as draft",
+		"lock": "Lock and execute…",
+		"return": "Return",
+		"viewChanges": "View changes",
+		"openInOutline": "Open in outline",
+		"feedbackPlaceholder": "Feedback for the agent (sent when you return the plan)",
+		"lockTitle": "Lock the plan and execute",
+		"lockExplain": "Changing the steps (adding, removing, rewriting, reordering, cancelling a step, finishing the plan) will wait for your confirmation, or for that of the session you name. Progress and findings are written as usual.",
+		"delegateLabel": "Session that confirms step changes for you (optional)",
+		"delegatePlaceholder": "Nobody: I confirm them myself",
+		"compact": "Reset the context onto the plan before executing",
+		"confirmLock": "Lock and execute",
+		"cancel": "Cancel",
+		"changed": "The plan changed since you looked at it. Look at the changes again, then decide.",
+		"failed": "The decision could not be made",
+		"diff": {
+			"title": "Changes to the plan: {{title}}",
+			"firstVersion": "The first version: everything is new.",
+			"sincePrevious": "Compared with the version you saw last.",
+			"countAdded": "{{count}} added",
+			"countChanged": "{{count}} changed",
+			"countRemoved": "{{count}} removed",
+			"nothing": "Nothing changed since the previous version.",
+			"truncated": "More changes than shown: open the plan in the outline to see it whole.",
+			"under": "under {{title}}",
+			"noTask": "not a task",
+			"due": "due {{date}}",
+			"depends": "{{count}} prerequisites",
+			"change": {
+				"added": "Added",
+				"removed": "Removed",
+				"text": "Rewritten",
+				"task": "Task",
+				"moved": "Moved"
+			},
+			"status": {
+				"todo": "to do",
+				"doing": "in progress",
+				"done": "done",
+				"cancelled": "cancelled"
+			}
+		}
 	}
 }

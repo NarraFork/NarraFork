@@ -269,6 +269,8 @@ export interface OutlineReadRequest extends OutlineReadOptions {
 	 * tree (current reads only), the blocks others' touch marked.
 	 */
 	overlay?: OutlinePendingOverlay;
+	/** Note plan roots with their state (default true; see `OutlineRenderOptions.planNotes`). */
+	planNotes?: boolean;
 }
 
 export interface OutlineReadResult extends OutlineRenderResult {
@@ -313,6 +315,7 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 		label: request.label,
 		display,
 		annotate: overlay ? (node) => overlay.annotate(node) : undefined,
+		planNotes: request.planNotes,
 		truncatedRead: state.truncated ? { blocksRead: state.nodes.size } : undefined,
 	});
 	return {

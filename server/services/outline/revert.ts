@@ -141,6 +141,7 @@ function taskInput(task: OutlineTaskJson): OutlineTaskInput {
 		humanCreated: task.humanCreated === true,
 		lock: task.lock ?? null,
 		claimable: task.claimable === true,
+		plan: task.plan ?? null,
 	};
 }
 

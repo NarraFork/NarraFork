@@ -49,6 +49,29 @@ function makeExitPlanMessage(
 }
 
 describe("stripPlanBodyForModel", () => {
+	it("replaces an outline plan's snapshot with a reference to its root (outline P2 PR 8)", () => {
+		const msg = makeExitPlanMessage(
+			{
+				mode: "outline",
+				plan: PLAN_BODY,
+				_planRoot: { blockId: "b", spaceId: "s", address: "sess/AbCdEfGh", round: 2 },
+				_planSeq: 9,
+			},
+			{ withContentBlock: true },
+		);
+		const [modelMsg] = stripPlanBodyForModel([msg]);
+		const tcInput = modelMsg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
+		expect(tcInput.mode).toBe("outline");
+		expect(tcInput.plan).toContain("the outline block sess/AbCdEfGh (version 2)");
+		expect(tcInput.plan).not.toContain("Do the thing");
+		expect(tcInput._planRoot).toBeUndefined();
+		expect(isModelPlanReference(tcInput.plan as string)).toBe(true);
+		const block = (modelMsg.contentJson as Array<Record<string, unknown>>)[1];
+		expect((block?.input as Record<string, unknown>).plan).toBe(tcInput.plan);
+		// The persisted row keeps the snapshot for the card.
+		expect((msg.toolCalls?.[0]?.inputJson as Record<string, unknown>).plan).toBe(PLAN_BODY);
+	});
+
 	it("replaces a file-based plan body with a path reference", () => {
 		const msg = makeExitPlanMessage(
 			{ plan: PLAN_BODY, _planFile: PLAN_FILE },
