@@ -636,7 +636,11 @@ function NarratorPanelBody({
 	// status bar (see useStatusBarProps), which is where they are consumed.
 	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
 		useResolvedModel(
-			capabilityModelReference(narrator?.model, narrator?.modelInheritance?.model),
+			capabilityModelReference(
+				narrator?.model,
+				narrator?.modelInheritance?.model,
+				narrator?.runtimeModel,
+			),
 			defaultModelValue,
 			aggregations,
 			allModels,
