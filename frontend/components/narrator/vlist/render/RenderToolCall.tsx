@@ -156,6 +156,7 @@ import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPer
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
 import { ROW_BUTTON_CLASS, ROW_FLEX_CLASS, rowFlexStyle } from "./row-chrome";
 import { ShareFilePreview } from "./ShareFilePreview";
+import { ToolChangeRows } from "./ToolChangeRows";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1320,6 +1321,8 @@ function StatusGlyph({ status, color }: { status: ToolCallStatus; color: string 
 interface StructBadge {
 	label: string;
 	color?: string;
+	verbatim?: boolean;
+	clip?: boolean;
 }
 
 /** Read the render-only badge list off a fixed badge-header block. */
@@ -1329,7 +1332,12 @@ function readBadges(data: Record<string, unknown> | undefined): StructBadge[] {
 	for (const b of data.badges as unknown[]) {
 		const o = b as { label?: unknown; color?: unknown };
 		if (typeof o?.label === "string") {
-			out.push({ label: o.label, color: typeof o.color === "string" ? o.color : undefined });
+			out.push({
+				label: o.label,
+				color: typeof o.color === "string" ? o.color : undefined,
+				...((o as { verbatim?: unknown }).verbatim === true ? { verbatim: true } : {}),
+				...((o as { clip?: unknown }).clip === true ? { clip: true } : {}),
+			});
 		}
 	}
 	return out;
@@ -1798,7 +1806,13 @@ function DetailBlocks({
 							</Group>
 						) : null}
 						{badges.length > 0 ? (
-							<Group gap={4} wrap="wrap" style={{ alignItems: "center" }}>
+							// A row with a chip that gives way (a long space name) stays one line: that chip
+							// shrinks (truncated) instead of pushing the others onto the clipped second line.
+							<Group
+								gap={4}
+								wrap={badges.some((b) => b.clip) ? "nowrap" : "wrap"}
+								style={{ alignItems: "center" }}
+							>
 								{badges.map((b, i) => (
 									<Badge
 										// biome-ignore lint/suspicious/noArrayIndexKey: badges are a stable ordered list
@@ -1806,6 +1820,26 @@ function DetailBlocks({
 										size="xs"
 										variant="light"
 										color={b.color ?? "gray"}
+										// A case-sensitive id or alias is painted as written (Mantine
+										// upper-cases badge labels by default).
+										tt={b.verbatim ? "none" : undefined}
+										{...(b.verbatim ? { "data-verbatim": "" } : {})}
+										title={
+											badges.some((x) => x.clip) && (b.clip || !b.verbatim) ? b.label : undefined
+										}
+										style={
+											badges.some((x) => x.clip)
+												? b.clip
+													? // The long name gives way first, down to a few characters …
+														{ flex: "0 8 auto", minWidth: "3em" }
+													: b.verbatim && Array.from(b.label).length <= 12
+														? // … a short id (the space's key) never: half of one names nothing …
+															{ flexShrink: 0 }
+														: // … the words after it last (truncated, in full on hover), so the
+															// row's one line holds them all.
+															{ flex: "0 1 auto", minWidth: "2.5em" }
+												: undefined
+										}
 									>
 										{b.label}
 									</Badge>
@@ -1971,6 +2005,7 @@ function DetailRegion({
 	viewTargets,
 	viewControls,
 	specTasksLive,
+	onToggleRaw,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -1981,6 +2016,8 @@ function DetailRegion({
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
+	/** The fold under an outline card's change list (raw input, model result). */
+	onToggleRaw?: () => void;
 }) {
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
@@ -2025,6 +2062,7 @@ function DetailRegion({
 								}
 								viewControls={viewControls}
 								specTasksLive={specTasksLive}
+								onToggleRaw={onToggleRaw}
 							/>
 						</div>
 					</Fragment>
@@ -2043,6 +2081,7 @@ export function RenderToolBody({
 	viewTarget,
 	viewControls,
 	specTasksLive,
+	onToggleRaw,
 }: {
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
@@ -2052,6 +2091,8 @@ export function RenderToolBody({
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
+	/** The fold under an outline card's change list (raw input, model result). */
+	onToggleRaw?: () => void;
 }) {
 	const { model, blocks, frame, contentWidth, height, appliedCap } = measured;
 	// The content-view host can update independently of the body. Keep its
@@ -2088,6 +2129,16 @@ export function RenderToolBody({
 				kit={model.kit}
 				appShownAt={model.appShownAt}
 				height={height}
+			/>
+		);
+	if (model.kind === "change-rows")
+		return (
+			<ToolChangeRows
+				blocks={blocks}
+				frames={frame.blocks}
+				availableWidth={contentWidth}
+				height={height}
+				onToggleRaw={onToggleRaw}
 			/>
 		);
 	if (model.kind === "ask")
@@ -2268,6 +2319,11 @@ export interface RenderToolCallProps {
 	narratorId?: string;
 	/** Toggle expand/collapse (header click). */
 	onToggle?: () => void;
+	/**
+	 * The card's own secondary fold, keyed by the card (the interaction state's `promptOpen`):
+	 * an outline card's raw input and model result under its change list.
+	 */
+	onTogglePrompt?: () => void;
 	/**
 	 * Open the full session of the subagent this call waits on (an Await-agent
 	 * card whose target resolved, or a single-target Send). Same affordance as
@@ -2492,6 +2548,7 @@ export function RenderToolCall({
 	viewTargets,
 	viewControls,
 	specTasksLive,
+	onTogglePrompt,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2607,6 +2664,7 @@ export function RenderToolCall({
 							viewTargets={viewTargets}
 							viewControls={viewControls}
 							specTasksLive={specTasksLive}
+							onToggleRaw={onTogglePrompt}
 						/>
 					</div>
 				</Box>

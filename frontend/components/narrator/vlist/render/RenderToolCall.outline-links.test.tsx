@@ -191,6 +191,72 @@ describe("outline tool cards", () => {
 			expect(outlineAnchors(root)).toEqual([]);
 		}
 		expect(renderCard(read, false).textContent).toContain("Kx81mPqa/Ab3dEf9Q");
-		expect(renderCard(edit, false).textContent).toContain("commit #4");
+		expect(renderCard(edit, false).textContent).toContain("Commit #4");
+	});
+});
+
+const display = {
+	v: 1,
+	space: { key: "MTBXwl1Y", kind: "session", own: true },
+	ops: [
+		{
+			op: "set",
+			target: { address: "MTBXwl1Y/LUwB3JZb", title: "Fix the retry button" },
+			status: { from: "doing", to: "done" },
+		},
+		{ op: "set", target: { address: "MTBXwl1Y/LUwB3JZb", title: "Fix" }, alias: { to: "Q7" } },
+	],
+};
+const ticked = toolMessage(
+	"OutlineEdit",
+	{ edits: [{ set: "LUwB3JZb", checkbox: "x", alias: "Q?" }] },
+	"Committed #6",
+	{
+		tool: "OutlineEdit",
+		space: { key: "MTBXwl1Y", kind: "session" },
+		commit: { id: "c6", seq: 6 },
+		edits: [{ op: "set", address: "MTBXwl1Y/LUwB3JZb" }],
+		display,
+	},
+);
+
+describe("the OutlineEdit change list", () => {
+	it("names the task by its title as an outline link, its status change as chips", () => {
+		mountAt("https://nf.example.com/");
+		const root = renderCard(ticked, true);
+		const row = root.querySelector("[data-outline-change-row]");
+		expect(row?.querySelector("[data-outline-link]")?.textContent).toBe("Fix the retry button");
+		expect(row?.querySelector("[data-outline-link]")?.getAttribute("title")).toContain(
+			"MTBXwl1Y/LUwB3JZb",
+		);
+		expect(
+			Array.from(row?.querySelectorAll("[data-change-part='chip']") ?? []).map(
+				(c) => c.textContent,
+			),
+		).toEqual(["In progress", "Done"]);
+		// The raw input and the model's result are folded away; the fold says so.
+		expect(root.querySelector("[data-outline-raw-toggle]")?.textContent).toContain(
+			"Raw input · result the model saw",
+		);
+		expect(root.textContent).not.toContain("Committed #6");
+		// Without a host the title stays, as plain text.
+		const plain = renderCard(ticked, false);
+		expect(plain.querySelector("[data-outline-link]")).toBeNull();
+		expect(plain.querySelector("[data-change-part='link']")?.textContent).toBe(
+			"Fix the retry button",
+		);
+	});
+
+	it("never upper-cases an id or an alias", () => {
+		mountAt("https://nf.example.com/");
+		const root = renderCard(ticked, true);
+		const badges = Array.from(root.querySelectorAll(".mantine-Badge-root"));
+		const key = badges.find((b) => b.textContent === "MTBXwl1Y");
+		const alias = badges.find((b) => b.textContent === "Q7");
+		expect(key).toBeDefined();
+		expect(alias).toBeDefined();
+		// Mantine upper-cases a badge unless it is told not to (`tt="none"` → text-transform).
+		for (const badge of [key, alias])
+			expect(badge?.getAttribute("style") ?? "").toContain("text-transform:none");
 	});
 });

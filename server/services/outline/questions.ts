@@ -44,6 +44,12 @@ import type {
 	OutlineQuestionGroupResponse,
 	OutlineQuestionView,
 } from "@shared/outline-api";
+import {
+	boundOutlineAnswerNoticeItems,
+	OUTLINE_ANSWER_NOTICE_LIMITS,
+} from "@shared/outline-task-notice";
+import { boundOutlineAskDisplay, type OutlineAskDisplay } from "@shared/outline-tool-display";
+import type { SideCarBody } from "@shared/sidecar-body";
 import { canReadSpace, canWriteSpace, narratorVisibility, type OutlinePrincipal } from "./access";
 import {
 	readDisplayNames,
@@ -714,6 +720,17 @@ async function askQuestions(
 			blockIds: result.results.slice(0, ops.length).map((r) => r.blockId),
 			to,
 			proceed,
+			// For the reader's card, never the model's text: the space by its name, and the block the
+			// questions are under by its title.
+			display: boundOutlineAskDisplay({
+				v: 1,
+				space: await scope.spaceDisplay(space),
+				under: {
+					address: `${space.key}/${anchor.block.sid}`,
+					title: blockTitle(anchor.block.content),
+				},
+				questions: [],
+			}),
 		},
 	};
 }
@@ -776,6 +793,22 @@ async function writePerSpace<T extends ResolvedRef>(
 	for (const { space, items: list } of bySpace.values()) await write(space, list);
 }
 
+/**
+ * The questions a withdraw or a relay named, for the reader's card (`metadata.display`): their
+ * addresses, aliases and titles. Never the model's text.
+ */
+function askDisplay(list: readonly ResolvedRef[]): OutlineAskDisplay | null {
+	return boundOutlineAskDisplay({
+		v: 1,
+		questions: list.map((q) => ({
+			// `key/sid` whatever the agent's own label of it (its sid alone in an own space).
+			address: `${q.space.key}/${q.block.sid}`,
+			title: blockTitle(q.block.content),
+			...(q.block.alias ? { alias: q.block.alias } : {}),
+		})),
+	});
+}
+
 async function withdrawQuestions(
 	scope: OutlineAgentScope,
 	refs: readonly string[],
@@ -811,7 +844,11 @@ async function withdrawQuestions(
 	});
 	return {
 		output: `Withdrew ${own.found.map((q) => q.address).join(", ")}; the tasks they held up no longer wait for them.`,
-		metadata: { tool: "Ask", withdrawn: own.found.map((q) => q.block.id) },
+		metadata: {
+			tool: "Ask",
+			withdrawn: own.found.map((q) => q.block.id),
+			display: askDisplay(own.found),
+		},
 	};
 }
 
@@ -1069,7 +1106,11 @@ async function relayAnswers(
 	});
 	return {
 		output: `Wrote down the answer to ${updates.map((q) => q.address).join(", ")} as the person's (relayed from this conversation); the tasks they held up no longer wait for them.`,
-		metadata: { tool: "Ask", relayed: updates.map((q) => q.block.id) },
+		metadata: {
+			tool: "Ask",
+			relayed: updates.map((q) => q.block.id),
+			display: askDisplay(updates),
+		},
 	};
 }
 
@@ -1219,6 +1260,8 @@ export interface OutlineAnswerDelivery {
 		message: {
 			messageId: string;
 			content: string;
+			/** The answers as data for the reader's notice (never the model's text). */
+			body?: SideCarBody;
 			createdBy: string | null;
 			executionUserId: string | null;
 		},
@@ -1324,6 +1367,7 @@ const realDelivery: OutlineAnswerDelivery = {
 		const result = await deliverInjection(narratorId, {
 			...(postgres ? {} : { messageId: message.messageId }),
 			content: message.content,
+			...(message.body ? { body: message.body } : {}),
 			source: "outline_answer",
 			role: "user",
 			schedule: postgres ? "none" : "wakeIfIdle",
@@ -1347,6 +1391,44 @@ function describeAnswer(ask: OutlineAskJson): string {
 	if (answer.text) parts.push(JSON.stringify(answer.text));
 	const choice = parts.join(": ") || "your recommendation";
 	return answer.adopted ? `${choice}, your recommendation` : choice;
+}
+
+/**
+ * The answers as the reader's notice shows them (an `outlineAnswers` body beside the message):
+ * each question by its title and alias, linking to its block, with the answer beside it. Never
+ * the model's text, which {@link answerMessage} writes.
+ */
+function answerBody(
+	entries: ReadonlyArray<{ block: OutlineBlockRow; spaceKey: string; ask: OutlineAskJson }>,
+	who: string | null,
+): SideCarBody {
+	const listed = entries.slice(0, OUTLINE_ANSWER_NOTICE_LIMITS.items);
+	const more = entries.length - listed.length;
+	return {
+		kind: "outlineAnswers",
+		...(who ? { by: who } : {}),
+		items: boundOutlineAnswerNoticeItems(
+			listed.map(({ block, spaceKey, ask }) => {
+				const answer = ask.answer;
+				const option = answer?.option;
+				return {
+					address: `${spaceKey}/${block.sid}`,
+					...(block.alias ? { alias: block.alias } : {}),
+					question: blockTitle(block.content),
+					answer: {
+						...(option !== undefined ? { option } : {}),
+						...(option !== undefined && ask.options?.[option - 1]
+							? { optionText: ask.options[option - 1] }
+							: {}),
+						...(answer?.text ? { text: answer.text } : {}),
+						...(answer?.adopted ? { adopted: true } : {}),
+					},
+					...(ask.proceed && !answer?.adopted ? { differs: true } : {}),
+				};
+			}),
+		),
+		...(more > 0 ? { more } : {}),
+	};
 }
 
 /** The message an asking session reads: its questions and their answers. */
@@ -1437,6 +1519,7 @@ export async function deliverOutlineAnswers(
 						askerUserId: first.askerUserId,
 					}),
 					content: answerMessage(entries, (by && names?.users.get(by)) || "A person"),
+					body: answerBody(entries, (by && names?.users.get(by)) || null),
 					createdBy: by,
 					executionUserId,
 				});

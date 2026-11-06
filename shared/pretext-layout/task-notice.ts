@@ -10,7 +10,9 @@
  *   - `turnEnd`   — `outline_task_turn_end`: a long turn ended with a task still in progress;
  *   - `edited`    — `outline_task_edit`: people changed tasks of the session;
  *   - `interrupt` — `interrupt_task_guard`: the open tasks after a user interrupt (outline and spec);
- *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`).
+ *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`);
+ *   - `answers`   — `outline_answer`: a person answered questions the session asked (outline P2
+ *                   PR 7), the questions as rows with the answers beside them.
  *
  * Everything here is derived from STRUCTURED data the server stored beside the model-facing text
  * (`SideCarBody` `outlineTasks` / `tasks`, a `context_update` row's `display`); nothing parses the
@@ -28,6 +30,7 @@ import { outlineAddressPath } from "../outline-links";
 import {
 	coerceOutlineTasksViewDisplay,
 	OUTLINE_TASKS_VIEW_KEY,
+	type OutlineAnswerNoticeItem,
 	type OutlineTaskNoticeChange,
 	type OutlineTaskNoticeItem,
 	type OutlineTasksViewDisplay,
@@ -35,7 +38,7 @@ import {
 } from "../outline-task-notice";
 import type { SideCarBody, SideCarTaskEntry } from "../sidecar-body";
 
-export type TaskNoticeVariant = "turnEnd" | "edited" | "interrupt" | "view";
+export type TaskNoticeVariant = "turnEnd" | "edited" | "interrupt" | "view" | "answers";
 
 /** A status chip: its words and its Mantine colour. */
 export interface TaskNoticeChip {
@@ -60,6 +63,8 @@ export interface TaskNoticeRow {
 	note?: string;
 	/** A row that names no task ("3 more not listed"): dimmed text only. */
 	dim?: true;
+	/** A row under the one before it (a question's answer): drawn indented, still one line. */
+	indent?: true;
 }
 
 /** The folded line after the notice's title: `lead`, one task row inline, `tail`. */
@@ -67,6 +72,11 @@ export interface TaskNoticeSummary {
 	lead?: string;
 	row?: TaskNoticeRow;
 	tail?: string;
+	/**
+	 * The tail is what the notice is for (a question's answer), so the row's title gives way to it
+	 * rather than the other way round.
+	 */
+	tailFirst?: true;
 }
 
 /** The `system-text` card data of a task notice (`kind: "tasks_notice"`). */
@@ -126,6 +136,13 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeCountWaiting: "{n} waiting",
 	taskNoticeCountTodo: "{n} to do",
 	taskNoticeCountSep: " · ",
+	taskNoticeAnswersTitle: "{who} answered {n} question(s)",
+	taskNoticeAnswersSomeone: "Someone",
+	taskNoticeAnswerOption: "option {n}: {option}",
+	taskNoticeAnswerOptionBare: "option {n}",
+	taskNoticeAnswerText: "\u201c{text}\u201d",
+	taskNoticeAnswerAdopted: "your recommendation",
+	taskNoticeAnswerDiffers: "differs from your pick",
 };
 
 type Labels = Readonly<Record<string, string>> | undefined;
@@ -330,6 +347,31 @@ export function taskNoticeFromBody(
 			rows,
 		);
 	}
+	if (body.kind === "outlineAnswers") {
+		if (body.items.length === 0) return null;
+		// Two rows a question (it, then its answer under it), within the card's rows and a last
+		// row counting the questions left out.
+		const listed = body.items.slice(0, ANSWERS_LISTED);
+		const rows = listed.flatMap((item) => answerRows(item, labels));
+		const left = body.items.length - listed.length + (body.more ?? 0);
+		if (left > 0) rows.push(moreRow(left, labels));
+		const n = body.items.length + (body.more ?? 0);
+		const first = listed[0] as OutlineAnswerNoticeItem;
+		return notice(
+			"answers",
+			label(labels, "taskNoticeAnswersTitle", {
+				who: body.by || label(labels, "taskNoticeAnswersSomeone"),
+				n,
+			}),
+			{
+				// The folded line names the first question and gives its answer the room.
+				row: rows[0] as TaskNoticeRow,
+				tail: answerNote(first, labels),
+				tailFirst: true,
+			},
+			rows,
+		);
+	}
 	if (body.kind === "tasks" && source === "interrupt_task_guard") {
 		const tasks = body.tasks ?? [];
 		if (tasks.length === 0) return null;
@@ -358,6 +400,41 @@ export function taskNoticeFromBody(
 		);
 	}
 	return null;
+}
+
+/** The answer in the reader's words: the option chosen and/or their words, after an arrow. */
+function answerNote(item: OutlineAnswerNoticeItem, labels: Labels): string {
+	const a = item.answer;
+	const parts: string[] = [];
+	if (a.option !== undefined) {
+		parts.push(
+			a.optionText
+				? label(labels, "taskNoticeAnswerOption", { n: a.option, option: a.optionText })
+				: label(labels, "taskNoticeAnswerOptionBare", { n: a.option }),
+		);
+	}
+	if (a.text) parts.push(label(labels, "taskNoticeAnswerText", { text: a.text }));
+	if (a.adopted) parts.push(label(labels, "taskNoticeAnswerAdopted"));
+	return `→ ${parts.join(label(labels, "taskNoticeJoin"))}`;
+}
+
+/** Questions an answer notice lists, two rows each, leaving one row for the rest. */
+const ANSWERS_LISTED = Math.floor((TASK_NOTICE_MAX_ROWS - 1) / 2);
+
+/**
+ * A question (its alias chip, its title as a link) and, on its own indented row under it, the
+ * answer: what the notice is for, so it never shares a line with a long question.
+ */
+function answerRows(item: OutlineAnswerNoticeItem, labels: Labels): TaskNoticeRow[] {
+	return [
+		{
+			...named(item.address, item.question),
+			// The question's alias, as written (case-sensitive): the chip before its title.
+			...(item.alias ? { status: { label: item.alias, color: "teal" } } : {}),
+			...(item.differs ? { marks: [label(labels, "taskNoticeAnswerDiffers")] } : {}),
+		},
+		{ title: answerNote(item, labels), indent: true },
+	];
 }
 
 function interruptRow(task: SideCarTaskEntry, outline: boolean, labels: Labels): TaskNoticeRow {
