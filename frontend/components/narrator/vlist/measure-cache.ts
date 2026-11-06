@@ -502,6 +502,7 @@ const PERMISSION_PREDICTION_KEYS = [
 	"isEditingPlan",
 	"planEditRows",
 	"planEdited",
+	"outlinePlanSummaryRows",
 	"hasDecisionReason",
 	"decisionReasonLines",
 	"hasPreviewLoading",

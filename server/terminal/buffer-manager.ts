@@ -14,7 +14,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { SerializeAddon } from "@xterm/addon-serialize";
-import { Terminal } from "@xterm/headless";
+import { type IBuffer, type IMarker, Terminal } from "@xterm/headless";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 
@@ -66,6 +66,36 @@ export interface BufferManagerOptions {
 	 * queries inside it would inject stray characters into a live shell.
 	 */
 	onReply?: (data: string) => void;
+	/**
+	 * Runs once before the headless terminal is disposed, while its contents can
+	 * still be read. Terminal watches use it for a last match on the final output.
+	 */
+	beforeDispose?: () => Promise<void> | void;
+}
+
+/**
+ * Plain text of the normal buffer from row `start` to the end. Soft-wrapped rows
+ * are joined without a line break, so a long line reads as one line.
+ */
+export function joinBufferLines(buffer: IBuffer, start: number): string {
+	const lines: string[] = [];
+	let current = "";
+	for (let y = Math.max(0, start); y < buffer.length; y++) {
+		const line = buffer.getLine(y);
+		if (!line) break;
+		const continues = buffer.getLine(y + 1)?.isWrapped ?? false;
+		// A row that continues onto the next keeps its trailing spaces: they are content.
+		current += line.translateToString(!continues);
+		if (!continues) {
+			lines.push(current);
+			current = "";
+		}
+	}
+	if (current) lines.push(current);
+	// Rows below the cursor are blank until output reaches them.
+	let end = lines.length;
+	while (end > 0 && lines[end - 1] === "") end--;
+	return lines.slice(0, end).join("\n");
 }
 
 export class BufferManager {
@@ -75,6 +105,7 @@ export class BufferManager {
 	private dirty = false;
 	private flushTimer: ReturnType<typeof setInterval> | null = null;
 	private onReply: ((data: string) => void) | undefined;
+	private beforeDispose: (() => Promise<void> | void) | undefined;
 	/** True while a restored snapshot is being fed to the parser (replies muted). */
 	private replaying = false;
 	/** True once dispose() ran, so late parser replies cannot touch a dead PTY. */
@@ -120,6 +151,7 @@ export class BufferManager {
 	) {
 		this.terminalId = terminalId;
 		this.onReply = options.onReply;
+		this.beforeDispose = options.beforeDispose;
 		this.xterm = new Terminal({
 			cols,
 			rows,
@@ -200,6 +232,33 @@ export class BufferManager {
 		return this.serializeAddon.serialize({
 			scrollback: this.xterm.options.scrollback,
 		});
+	}
+
+	/**
+	 * Mark the cursor row of the normal buffer, after pending output is parsed.
+	 * The marker follows its row as output scrolls and is disposed once the row
+	 * leaves the scrollback. Returns undefined while a full-screen app has the
+	 * alternate buffer active, or after dispose.
+	 */
+	async markCursorRow(): Promise<IMarker | undefined> {
+		await this.writeChain;
+		if (this.disposed || this.xterm.buffer.active.type !== "normal") return undefined;
+		return this.xterm.registerMarker(0);
+	}
+
+	/**
+	 * Plain text of the normal buffer from `marker`'s row to the end, or the whole
+	 * normal buffer when the marker is gone (`markerLost`: everything still in the
+	 * buffer was written after it). Reads only the rows it returns.
+	 */
+	async readFromMarker(marker: IMarker): Promise<{ text: string; markerLost: boolean }> {
+		await this.writeChain;
+		if (this.disposed) return { text: "", markerLost: true };
+		const lost = marker.isDisposed || marker.line < 0;
+		return {
+			text: joinBufferLines(this.xterm.buffer.normal, lost ? 0 : marker.line),
+			markerLost: lost,
+		};
 	}
 
 	/** Get current terminal state for client notification */
@@ -361,6 +420,16 @@ export class BufferManager {
 	/** Cleanup: stop flush timer, save final state, optionally delete */
 	async dispose(deleteBuffer = false): Promise<void> {
 		this.stopPeriodicFlush();
+		const beforeDispose = this.beforeDispose;
+		this.beforeDispose = undefined;
+		try {
+			await beforeDispose?.();
+		} catch (err) {
+			logger.warn("Terminal beforeDispose hook failed", {
+				terminalId: this.terminalId,
+				error: String(err),
+			});
+		}
 		if (deleteBuffer) {
 			await this.deleteFromDisk();
 		} else if (this.dirty) {

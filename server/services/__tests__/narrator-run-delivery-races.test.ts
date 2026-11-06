@@ -640,6 +640,61 @@ describe("C. a new run of an ended background task", () => {
 		expect(recorded).toHaveBeenCalledTimes(1);
 	});
 
+	test("resuming a failed background task runs a new logical run, not the settled one", async () => {
+		seed();
+		scriptPasses([async () => ({ finalText: "first run failed", hasError: true })]);
+		const task = await backgroundTaskService.createAgentTask({
+			id: RUN,
+			subagentNarratorId: RUN,
+			subagentType: "general",
+			alias: "race-alias",
+			binding: binding({ cancelWith: undefined }),
+		});
+		const first = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: task.logicalRunId ?? undefined,
+		});
+		const firstRunId = (await first.terminal).logicalRunId as string;
+		await settle(() => !getExecutionOwner(RUN));
+		expect(taskRow()).toMatchObject({ status: "failed", logicalRunId: firstRunId });
+		// The failed terminal already reached the caller's mailbox.
+		runtimePublication.flushRecipient(CALLER);
+		const noticesBefore = notices().length;
+		expect(notices().map((row) => row.dedupeKey)).toEqual([expect.stringContaining(firstRunId)]);
+
+		mock.restore();
+		scriptPasses([async () => ({ finalText: "resumed answer" })]);
+		// What the recovery card does: restart the task row, then continue its run.
+		const restarted = await backgroundTaskService.createAgentTask({
+			id: RUN,
+			subagentNarratorId: RUN,
+			subagentType: "general",
+			alias: "race-alias",
+			binding: { deliverTo: binding().deliverTo, principal: { userId: null } },
+		});
+		expect(restarted.logicalRunId).not.toBe(firstRunId);
+		expect(taskRow()).toMatchObject({ status: "running", logicalRunId: restarted.logicalRunId });
+		await backgroundTaskService.markNarratorRunning(RUN);
+		const resumed = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: restarted.logicalRunId ?? undefined,
+			recovered: true,
+		});
+		const terminal = await resumed.completion;
+		expect(terminal.hasError).toBe(false);
+		expect(terminal.logicalRunId).toBe(restarted.logicalRunId as string);
+		expect(taskRow()).toMatchObject({ status: "completed", logicalRunId: restarted.logicalRunId });
+		expect(taskRow()?.output).toContain("resumed answer");
+		runtimePublication.flushRecipient(CALLER);
+		const fresh = notices().slice(noticesBefore);
+		expect(fresh).toHaveLength(1);
+		expect(fresh[0].dedupeKey).toContain(restarted.logicalRunId as string);
+	});
+
 	test("retrying a denied tool republishes the task as running, then its new terminal", async () => {
 		const firstRunId = await endedBackgroundTask();
 		// The ended run's last turn is a tool call the user denied.

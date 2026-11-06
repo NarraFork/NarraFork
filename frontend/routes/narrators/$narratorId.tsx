@@ -19,6 +19,7 @@ import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/do
 import { readOpeningLod } from "../../hooks/useNarratorLod";
 import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorLoadingMetrics } from "../../lib/narrator-loading-metrics";
+import { queryClient } from "../../lib/query-client";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
@@ -51,7 +52,6 @@ import { useMobileTerminalDrawerOpen } from "../../hooks/useMobileTerminalDrawer
 import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
-	addRecentTabsBatch,
 	addSubagentRecentTab,
 	recordRecentTabVisit,
 	shouldAddSubagentRecentTab,
@@ -464,29 +464,9 @@ function NarratorDetailPage() {
 
 			api
 				.createWorkspace({ tree: serializeSeedEnvelope(seed) })
-				.then(async (ws) => {
-					await addRecentTabsBatch([
-						{
-							type: "workspace",
-							id: ws.id,
-							// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-							title: (ws as any).title || "Workspace",
-						},
-						{
-							type: "narrator",
-							id: narratorId,
-							title: "",
-							workspaceId: ws.id,
-							updateOnly: true,
-						},
-						{
-							type: "narrator",
-							id: final.id,
-							title: "",
-							workspaceId: ws.id,
-							updateOnly: true,
-						},
-					]).catch(() => {});
+				.then((ws) => {
+					// Workspaces are reached from the header switcher, not the sidebar.
+					void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
 					navigate({
 						to: "/narrators/workspace/$workspaceId",
 						params: { workspaceId: ws.id },

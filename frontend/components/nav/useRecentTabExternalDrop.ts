@@ -7,7 +7,8 @@
  * rides the existing `panel-drag` singleton — the same channel the narrator page's
  * drag-to-split and the workspace/graph docks already listen on.
  *
- * The cost is honest: an external drag gets no row-push animation, only an insertion line.
+ * The cost is honest: an external drag gets no row-push animation, only an insertion line
+ * (or a highlight when it would merge into a new folder or join an existing one).
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -19,6 +20,7 @@ import {
 } from "../../lib/panel-drag";
 import {
 	type RecentTabDropRow,
+	type RecentTabDropSource,
 	type RecentTabDropTarget,
 	resolveRecentTabDropTarget,
 } from "./recent-tab-drop-target";
@@ -56,6 +58,11 @@ export interface UseRecentTabExternalDropOptions {
 	suspendedRef?: React.RefObject<boolean>;
 	/** Measure the currently rendered rows. Called on every drag frame over the sidebar. */
 	measureRows: () => RecentTabDropRow[];
+	/**
+	 * The dragged narrator as a drop source. It may already be a tab (then its own row
+	 * and folder state matter) or not be in the list at all.
+	 */
+	sourceFor: (narratorId: string) => RecentTabDropSource;
 	onDrop: (drop: { narratorId: string; title: string; target: RecentTabDropTarget }) => void;
 }
 
@@ -65,6 +72,7 @@ export function useRecentTabExternalDrop({
 	suspended,
 	suspendedRef,
 	measureRows,
+	sourceFor,
 	onDrop,
 }: UseRecentTabExternalDropOptions): RecentTabExternalDropState | null {
 	const [state, setState] = useState<RecentTabExternalDropState | null>(null);
@@ -84,6 +92,8 @@ export function useRecentTabExternalDrop({
 	measureRef.current = measureRows;
 	const onDropRef = useRef(onDrop);
 	onDropRef.current = onDrop;
+	const sourceForRef = useRef(sourceFor);
+	sourceForRef.current = sourceFor;
 
 	const clear = useCallback(() => {
 		if (!stateRef.current) return;
@@ -105,7 +115,7 @@ export function useRecentTabExternalDrop({
 				drag.x >= rect.left && drag.x <= rect.right && drag.y >= rect.top && drag.y <= rect.bottom;
 			if (!inside) return null;
 			const rows = measureRef.current();
-			const target = resolveRecentTabDropTarget(rows, drag.y);
+			const target = resolveRecentTabDropTarget(rows, drag.y, sourceForRef.current(drag.id));
 			if (!target) return null;
 			return {
 				narratorId: drag.id,

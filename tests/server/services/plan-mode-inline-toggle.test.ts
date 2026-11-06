@@ -38,7 +38,12 @@ describe("ExitPlanMode inline-plan toggle", () => {
 		expect(schema.properties.allowedPrompts).toBeUndefined();
 		// `mode` is the tool's one real required parameter.
 		expect(schema.required).toEqual(["mode"]);
-		expect((schema.properties.mode as { enum?: string[] }).enum).toEqual(["inline", "file"]);
+		// An outline session declares `outline` (outline P2 PR 8): its plan is a task tree.
+		expect((schema.properties.mode as { enum?: string[] }).enum).toEqual([
+			"inline",
+			"file",
+			"outline",
+		]);
 
 		const desc = resolveDescription(config);
 		expect(desc).toContain('`mode: "inline"`');
@@ -57,7 +62,12 @@ describe("ExitPlanMode inline-plan toggle", () => {
 		expect(schema.properties.plan).toBeUndefined();
 		expect(schema.properties.allowedPrompts).toBeUndefined();
 		expect(schema.required).toEqual(["mode"]);
-		expect((schema.properties.mode as { enum?: string[] }).enum).toEqual(["inline", "file"]);
+		// An outline session declares `outline` (outline P2 PR 8): its plan is a task tree.
+		expect((schema.properties.mode as { enum?: string[] }).enum).toEqual([
+			"inline",
+			"file",
+			"outline",
+		]);
 		const desc = resolveDescription(config);
 		expect(desc).toBe(resolveDescription(makeConfig(true)));
 		expect(desc).toContain("runtime validates these restrictions");
