@@ -456,6 +456,14 @@
 			"prevId": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
 			"version": "7",
 			"snapshotDigest": "0f1f2cce34e192cca32077bfa5248d291e67a2807bdfe03dda7d9d6727b87d2f"
+		},
+		{
+			"idx": 57,
+			"tag": "0057_narrator_workspace_directories",
+			"id": "697f31d5-926c-4349-8a26-3d081cf5f56b",
+			"prevId": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
+			"version": "7",
+			"snapshotDigest": "9361d44bd86a247ad0c1ab27b7865c93cbe006cca9719e37ec9009f945c53e37"
 		}
 	]
 }
