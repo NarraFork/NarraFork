@@ -692,6 +692,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
 	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
+	// 用量分桶按读者本地日切分：SQLite 用 strftime 加 'start of day' 修饰符完成，
+	// PostgreSQL 侧需要等价的 date_trunc 改写。
+	"server/services/usage-history-service.ts": ["timeFn"],
 	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
