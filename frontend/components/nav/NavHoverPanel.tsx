@@ -39,6 +39,11 @@ import { NavRenderContext, type NavRenderState } from "./nav-render-context";
 const NAV_SWITCH_LINGER_MS = 600;
 const { COLLAPSED_WIDTH } = NAV_WIDTH_CONSTANTS;
 
+/** Is the pointer on the resize handle (a control, not part of the rail)? */
+function isResizeHandleTarget(target: EventTarget | null): boolean {
+	return target instanceof Element && target.closest("[data-nav-resize-handle]") !== null;
+}
+
 export function NavHoverPanel({
 	collapsed,
 	children,
@@ -121,7 +126,20 @@ export function NavHoverPanel({
 				data-nav-hover-panel={open ? "open" : canHover ? "closed" : undefined}
 				className={canHover ? "nf-nav-hover-panel" : undefined}
 				onPointerEnter={(e) => {
-					if (e.pointerType === "mouse" && canHover) intent.enter();
+					if (e.pointerType !== "mouse" || !canHover) return;
+					// The resize handle is a control, not the rail: resting on it must not open
+					// the sidebar, or reaching for it would move the edge out from under the
+					// pointer.
+					if (isResizeHandleTarget(e.target)) return;
+					intent.enter();
+				}}
+				onPointerMove={(e) => {
+					if (e.pointerType !== "mouse" || !canHover) return;
+					// Moving onto the handle cancels an open already scheduled by the rows
+					// (pointerenter fired before the pointer got here), and moving back off it
+					// arms the rail again.
+					if (isResizeHandleTarget(e.target)) intent.leave();
+					else intent.enter();
 				}}
 				onPointerLeave={(e) => {
 					if (e.pointerType === "mouse") intent.leave();
@@ -193,6 +211,7 @@ export function NavHoverPanel({
 					// from claiming the gesture as a scroll.
 					<Box
 						visibleFrom="sm"
+						data-nav-resize-handle
 						className="nf-nav-resize-handle"
 						onPointerDown={startNavResize}
 						style={{

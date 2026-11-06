@@ -148,3 +148,14 @@
 		display: none !important;
 	}
 }
+
+/*
+ * The sidebar's edge line, in the same 1px and colour as the dividers between dockview
+ * panels, so the rail reads as one more split in the workspace. Mantine's AppShell paints
+ * it with `--app-shell-border-color` (gray-3); dockview's separators use
+ * `--mantine-color-default-border` (see dockview/theme.css), and the two are visibly
+ * different lines side by side.
+ */
+.mantine-AppShell-navbar {
+	border-inline-end-color: var(--mantine-color-default-border);
+}

@@ -107,6 +107,7 @@
 	"notificationPermissionPreview": "{{tool}}：{{summary}}",
 	"newFolderName": "新建文件夹",
 	"folderClosed": "已关闭文件夹",
+	"folderDissolved": "已解散文件夹",
 	"folderActionFailed": "文件夹修改保存失败",
 	"editFolder": "编辑文件夹",
 	"folderName": "名称",

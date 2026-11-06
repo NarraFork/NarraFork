@@ -352,19 +352,28 @@ export function applyRecentTabPin<T extends LayoutTab>(
 	return regroupFolders(next);
 }
 
-/** Remove a folder but keep its members, in order and unpinned, at the folder's position. */
+/**
+ * Remove a folder but keep its members, in order, at the folder's position.
+ *
+ * Released members take the folder's pin, not their own: the pinned block is positional
+ * (`getPinnedSectionEndIndex`), so unpinning them would drop the whole folder's contents
+ * into the unpinned area instead of leaving them where the user was looking. A member's
+ * own `pinned` only orders it inside the folder (pinned members first).
+ */
 export function applyRecentTabFolderDissolve<T extends LayoutTab>(
 	tabs: T[],
 	folderId: string,
 ): T[] {
 	const index = folderHeaderIndex(tabs, folderId);
 	if (index < 0) return tabs;
+	const pinned = tabs[index]?.pinned === true;
 	const range = unitRange(tabs, index);
 	const next = [...tabs];
 	const members = next.slice(range.start + 1, range.end + 1).map((member) => {
 		const released = { ...member };
 		delete released.folderId;
-		delete released.pinned;
+		if (pinned) released.pinned = true;
+		else delete released.pinned;
 		return released;
 	});
 	next.splice(range.start, range.end - range.start + 1, ...members);

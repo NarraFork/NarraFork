@@ -866,7 +866,7 @@ function persistMutationLocked(
 		operations: diffOperations(before, after),
 		removedCount: options.removedCount,
 	};
-	if (options.undoTabs && (options.removedCount ?? 0) > 0) {
+	if (options.undoTabs && options.undoTabs.length > 0) {
 		const token = generateId();
 		storeUndo({
 			token,
@@ -1270,12 +1270,23 @@ export async function updateRecentTabFolder(
 	});
 }
 
-/** Remove a folder but keep its members, in order, at the folder's position. */
+/**
+ * Remove a folder but keep its members, in order, at the folder's position.
+ *
+ * The folder structure is hand-built, so dissolving it is undoable like a close: the
+ * snapshot is taken before the header goes.
+ */
 export async function dissolveRecentTabFolder(
 	userId: string,
 	folderId: string,
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => ({ tabs: applyRecentTabFolderDissolve(tabs, folderId) }));
+	return mutate(userId, (tabs) => {
+		if (folderHeaderIndex(tabs, folderId) < 0) return { tabs };
+		return {
+			tabs: applyRecentTabFolderDissolve(tabs, folderId),
+			options: { undoTabs: tabs.map(cloneTab) },
+		};
+	});
 }
 
 function isKeepUnit(tabs: PersistedRecentTab[], index: number, keepTabKey?: string): boolean {

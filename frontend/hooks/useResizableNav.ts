@@ -30,7 +30,18 @@ const EXPANDED_MIN = 180;
  * padding), so 72px inside plus the navbar's 1px border centres them.
  */
 const COLLAPSED_WIDTH = 73;
-const COLLAPSE_THRESHOLD = 85;
+/**
+ * The one boundary between the two forms, and the expanded sidebar's minimum width.
+ *
+ * There is nothing in between on purpose: the collapsed rendering (rows clipped to their
+ * icons, the backdrop clipped to the rail, the expanded-only controls hidden) is the
+ * EXPANDED sidebar's layout seen through a 73px window, so it only makes sense at that
+ * width. A width between the rail and this minimum would paint that 73px-shaped layout
+ * into a wider box — the brand row overflows and row content is cut by the navbar — and
+ * releasing the drag then jumped to one end anyway. A drag previews what it will keep:
+ * below this, the rail; at or above it, the width itself.
+ */
+const COLLAPSE_THRESHOLD = EXPANDED_MIN;
 const MAX_WIDTH = 480;
 
 /**
@@ -233,7 +244,6 @@ function writeWidth(next: number, notify: boolean): void {
 interface DragState {
 	startX: number;
 	startWidth: number;
-	startedCollapsed: boolean;
 }
 
 let drag: DragState | null = null;
@@ -241,13 +251,15 @@ let drag: DragState | null = null;
 function onPointerMove(event: PointerEvent): void {
 	if (!drag) return;
 	const raw = drag.startWidth + (event.clientX - drag.startX);
+	// Quantised at the boundary rather than clamped into a dead zone: the drag shows
+	// exactly the width the release will keep (see COLLAPSE_THRESHOLD).
+	const width = raw < COLLAPSE_THRESHOLD ? COLLAPSED_WIDTH : Math.min(MAX_WIDTH, raw);
 	// CSS only: React hears nothing until the drag ends.
-	writeWidth(Math.min(MAX_WIDTH, Math.max(COLLAPSED_WIDTH, raw)), false);
+	writeWidth(width, false);
 }
 
 function endDrag(): void {
 	if (!drag) return;
-	const startedCollapsed = drag.startedCollapsed;
 	drag = null;
 	document.body.style.cursor = "";
 	document.body.style.userSelect = "";
@@ -259,16 +271,12 @@ function endDrag(): void {
 	window.removeEventListener("pointercancel", endDrag);
 	document.removeEventListener("visibilitychange", onVisibilityChange);
 
-	// Snap. Which way depends on where the drag STARTED, so a drag out of the
-	// collapsed rail expands and a drag into it collapses.
+	// Snap. The drag already previewed the outcome (see onPointerMove), so this only
+	// has to settle on the same two possibilities it showed: the rail, or the width.
+	// Which way the gesture was going no longer matters — `lastExpandedWidth` holds the
+	// width to come back to.
 	const width = getWidth();
-	const snapped = startedCollapsed
-		? width >= COLLAPSE_THRESHOLD
-			? Math.max(EXPANDED_MIN, width)
-			: COLLAPSED_WIDTH
-		: width < EXPANDED_MIN
-			? COLLAPSED_WIDTH
-			: width;
+	const snapped = width < COLLAPSE_THRESHOLD ? COLLAPSED_WIDTH : width;
 	// `writeWidth` no-ops when the snap lands on the current width, so the handover to
 	// React is done unconditionally here.
 	writeWidth(snapped, true);
@@ -292,11 +300,7 @@ export function startNavResize(event: {
 	// A release frame from the previous gesture must never clear the next one.
 	restoreDragStyles();
 	dragStyles = captureDragStyles(event.currentTarget);
-	drag = {
-		startX: event.clientX,
-		startWidth: getWidth(),
-		startedCollapsed: getCollapsed(),
-	};
+	drag = { startX: event.clientX, startWidth: getWidth() };
 	document.body.style.cursor = "col-resize";
 	document.body.style.userSelect = "none";
 	window.addEventListener("pointermove", onPointerMove);
