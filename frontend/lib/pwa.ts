@@ -1,3 +1,4 @@
+import { STARTUP_STATUS_HEADER } from "@shared/startup-status";
 import { apiUrl } from "./base-path";
 
 interface ServerHealth {
@@ -184,6 +185,31 @@ export async function clearPwaCache(): Promise<void> {
 	}
 }
 
+/** A navigation the service worker passes to the network instead of the cached shell. */
+function networkReloadUrl(): string {
+	const destination = new URL(window.location.href);
+	destination.searchParams.set(
+		"_nf_reload",
+		`${Date.now()}-${Math.random().toString(16).slice(2)}`,
+	);
+	return destination.href;
+}
+
+let leavingForStartupPage = false;
+
+/**
+ * Leave the app for the startup status page when an API answer came from it.
+ *
+ * With a service worker the app shell loads from cache even while the server is still starting,
+ * and every API call then gets the startup page's 503. Reloading through the network lands on
+ * that page instead, which shows progress and reloads into the app once the server is up.
+ */
+export function leaveForStartupPageIfStarting(response: Response): void {
+	if (leavingForStartupPage || !response.headers.has(STARTUP_STATUS_HEADER)) return;
+	leavingForStartupPage = true;
+	window.location.replace(networkReloadUrl());
+}
+
 let reloadPromise: Promise<void> | undefined;
 
 /**
@@ -198,12 +224,7 @@ export function clearPwaCacheAndReload(): Promise<void> {
 	reloadPromise ??= Promise.resolve()
 		.then(async () => {
 			await clearPwaCache();
-			const destination = new URL(window.location.href);
-			destination.searchParams.set(
-				"_nf_reload",
-				`${Date.now()}-${Math.random().toString(16).slice(2)}`,
-			);
-			window.location.replace(destination.href);
+			window.location.replace(networkReloadUrl());
 		})
 		.finally(() => {
 			reloadPromise = undefined;

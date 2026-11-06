@@ -23,7 +23,9 @@ const POLL_INTERVAL_MS = 2000;
 // Load settings for the server port
 let port: number;
 try {
-	const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
+	const raw = Bun.JSONC.parse(readFileSync(settingsPath, "utf-8")) as {
+		server?: { port?: number };
+	};
 	port = (Number(process.env.PORT) || raw.server?.port) ?? 7778;
 } catch {
 	console.error(`Cannot read settings from ${settingsPath}`);

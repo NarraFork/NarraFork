@@ -57,6 +57,8 @@ import {
 import { hotOnce, hotSafe, hotTimer } from "../../lib/hot-safe";
 import { acquireInstanceLock, releaseInstanceLock } from "../../lib/instance-lock";
 import { logger } from "../../lib/logger";
+import { reportStartupStep } from "../../lib/startup-status";
+import { databaseUpgradeFailed } from "../../lib/startup-status/startup-problems";
 import { ensureColumns } from "../ensure-columns";
 import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "../fts";
 import {
@@ -91,6 +93,8 @@ interface SqliteLifecycleState {
 const HOT_STATE_KEY = "narrafork.dbLifecycle";
 const HOT_TIMER_KEY = "narrafork.walCheckpointTimer";
 const HOT_EXIT_HANDLER_KEY = "narrafork.walExitHandler";
+/** Long enough for the server to bind and answer the first page load first. */
+const STARTUP_OPTIMIZE_DELAY_MS = 30_000;
 
 export interface SqliteLifecycleOptions {
 	/**
@@ -255,6 +259,7 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 
 		let migrationSource: string;
 		let migrationFolder: string;
+		reportStartupStep({ key: "database" });
 		try {
 			const migrationResult = await runMigrations(connection());
 			migrationSource = migrationResult.source;
@@ -269,8 +274,10 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 				error: String(err),
 				stack: (err as Error)?.stack,
 			});
-			throw err;
+			throw databaseUpgradeFailed(err);
 		}
+		// Column patches, backfills and an FTS rebuild can still take a while.
+		reportStartupStep({ key: "database" });
 
 		// Patch missing columns for databases created by older versions.
 		ensureColumns(connection());
@@ -292,9 +299,13 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 
 		// Refresh query-planner statistics once on a real startup (skip hot reloads — the stats are
 		// process-independent and this avoids redundant work on every --hot cycle). Bounded by
-		// analysis_limit; actual synchronous duration is logged by optimizeDatabase.
+		// analysis_limit; actual synchronous duration is logged by optimizeDatabase. Deferred past
+		// the port bind: it took ~1s on a 12 GB database, and the statistics it refreshes only
+		// help later queries, so startup should not wait for it.
 		if (!isHotReload) {
-			optimizeDatabase(connection(), { source: "startup" });
+			setTimeout(() => {
+				if (state.sqlite) optimizeDatabase(state.sqlite, { source: "startup" });
+			}, STARTUP_OPTIMIZE_DELAY_MS).unref();
 		}
 
 		// Guarantee the instance lock is released on process exit. Deliberately NOT the clean-shutdown

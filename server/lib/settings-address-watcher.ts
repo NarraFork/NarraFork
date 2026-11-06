@@ -28,7 +28,7 @@ export interface ServerAddressWatcherOptions {
 function readListenAddress(): ListenAddress | undefined {
 	try {
 		const raw = readFileSync(getNarraforkPath("settings.json"), "utf8");
-		const parsed = JSON.parse(raw) as { server?: { host?: unknown; port?: unknown } };
+		const parsed = Bun.JSONC.parse(raw) as { server?: { host?: unknown; port?: unknown } };
 		const host = typeof parsed.server?.host === "string" ? parsed.server.host : undefined;
 		const port = typeof parsed.server?.port === "number" ? parsed.server.port : undefined;
 		if (!host || !port || !Number.isInteger(port) || port <= 0) return undefined;
