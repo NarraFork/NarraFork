@@ -55,6 +55,12 @@ export const OUTLINE_PLAN_LIMITS = {
 	commitScan: 200,
 	/** UTF-8 bytes of the summary the agent gives a submission. */
 	summaryBytes: 2000,
+	/** Comments one plan review may leave (PR 8b). */
+	reviewComments: 20,
+	/** Characters of one review comment. */
+	reviewCommentChars: 1000,
+	/** Review blocks under one plan root looked at (the last ones; one review per submission). */
+	reviewScan: 10,
 } as const;
 
 export interface OutlinePlanDiff {
@@ -96,16 +102,21 @@ function sameTaskView(a: OutlinePlanTaskView | null, b: OutlinePlanTaskView | nu
 	);
 }
 
-/** The subtree of `root` in document order with depths, at most `max` blocks. */
+/**
+ * The subtree of `root` in document order with depths, at most `max` blocks, without the blocks
+ * in `skip` and what is under them.
+ */
 function preorder(
 	root: OutlineNode,
 	max: number,
+	skip?: ReadonlySet<string>,
 ): { nodes: OutlineNode[]; depth: Map<string, number> } {
 	const nodes: OutlineNode[] = [];
 	const depth = new Map<string, number>();
 	const stack: Array<[OutlineNode, number]> = [[root, 0]];
 	while (stack.length > 0 && nodes.length < max) {
 		const [node, d] = stack.pop() as [OutlineNode, number];
+		if (skip?.has(node.id) && node !== root) continue;
 		nodes.push(node);
 		depth.set(node.id, d);
 		for (let i = node.children.length - 1; i >= 0; i--)
@@ -131,12 +142,17 @@ const titleOfNode = (node: OutlineNode | null | undefined): string | null =>
 
 /**
  * The plan rooted at `rootId` as of `toSeq` (null: now) against `fromSeq` (0 or a seq when the
- * root did not exist yet: everything is new). Null when the root is not live at `toSeq`.
+ * root did not exist yet: everything is new). Null when the root is not live at `toSeq`. `skip`:
+ * blocks left out with what is under them, on both sides (a plan review's comments, PR 8b: shown
+ * on their own, not as changes of the plan). `quiet`: blocks not reported themselves (as they
+ * were written by a review), while what is under them still is (review round 3 N9).
  */
 export async function readPlanDiff(args: {
 	rootId: string;
 	fromSeq: number;
 	toSeq: number | null;
+	skip?: ReadonlySet<string>;
+	quiet?: ReadonlySet<string>;
 	store?: OutlineStore;
 }): Promise<OutlinePlanDiff | null> {
 	const store = args.store ?? outlineStore;
@@ -148,8 +164,8 @@ export async function readPlanDiff(args: {
 	const before =
 		args.fromSeq >= 1 ? await readSubtree(args.rootId, { asOf: args.fromSeq, store }) : null;
 	const max = OUTLINE_PLAN_LIMITS.maxBlocks;
-	const now = preorder(after.root, max);
-	const then = before ? preorder(before.root, max) : { nodes: [], depth: new Map() };
+	const now = preorder(after.root, max, args.skip);
+	const then = before ? preorder(before.root, max, args.skip) : { nodes: [], depth: new Map() };
 	let truncated =
 		subtreeLargerThan(after.root, max) || (!!before && subtreeLargerThan(before.root, max));
 	const beforeById = new Map(then.nodes.map((n) => [n.id, n]));
@@ -166,6 +182,7 @@ export async function readPlanDiff(args: {
 	}
 	const pending: Pending[] = [];
 	for (const node of now.nodes) {
+		if (args.quiet?.has(node.id)) continue;
 		const prev = beforeById.get(node.id) ?? null;
 		if (!prev) {
 			pending.push({

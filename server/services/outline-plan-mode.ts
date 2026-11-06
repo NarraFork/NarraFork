@@ -22,13 +22,40 @@
  *      The pass then restarts with {@link startApprovedOutlinePlan}: the root and its first step
  *      that can start are started for the session, and the message names that step.
  *
- * Plan review (plan reflection) is unchanged in this PR: it reviews the rendered plan and, when it
- * confirms, approves it (step 5 records that as a draft on the person's behalf, never a lock);
- * when it asks for a revision the plan goes back to the agent as before. Turning its findings into
- * comments under the plan is plan PR 8b.
+ * PLAN REVIEW (计划反思; PR 8b, D48 Q1)
+ * -----------------------------------
+ * When the session runs plan review (the switch and its conditions are as for a spec session),
+ * the review sees the plan as submitted, each block with its short id, and has one tool,
+ * `PlanReview({ verdict, comments })`:
+ *
+ *   - `ok`: no concerns. The plan is approved as before (step 5 records it as a draft on the
+ *     person's behalf, `approvedBy: system:plan-review`, never locked, not the person's work).
+ *   - `concerns`: {@link reviewOutlinePlan} writes the comments under the root (`plans.ts`), and
+ *     the call waits for a person like any ExitPlanMode: nothing goes back to the agent. The
+ *     submission carries the review (`_planReview`): the card counts it, the diff shows it on its
+ *     own (this version's reviews are not the plan: not in its rendering, budget or changes), and
+ *     the agent is told of it once the person decides.
+ *   - a review that could not finish hands the plan to a person too, without comments.
+ *
+ * The review reaches the call's permission through a server-side channel (by session and tool
+ * use; review round 1 S2), never through keys a model can write; a call restored from what was
+ * persisted names it in its persisted input. Either way it is attached only as the outline proves
+ * it: one of this version's reviews, written by plan-review for this session and this very call.
+ * The version the person decides on stays the one submitted (`_planSeq`; S1): what changed since,
+ * while the review ran too, is told to the agent as the person's changes while deciding.
+ *
+ * The review's block id is derived from the review's request id and the version, so a review
+ * restored after a restart finds the comments it wrote ({@link recoverOutlinePlanReview}) instead
+ * of reviewing again. A taken-over review (`stop-plan-reflection`) is the person's as before, with
+ * any comments written a moment before. A plan restored while a person was asked, and changed
+ * since, is put to them again as it is now, not sent back to the agent.
  */
 
-import type { OutlinePlanDecisionRequest, OutlinePlanSubmission } from "@shared/outline-api";
+import type {
+	OutlinePlanDecisionRequest,
+	OutlinePlanReview,
+	OutlinePlanSubmission,
+} from "@shared/outline-api";
 import {
 	OUTLINE_PLAN_SUBMISSION_KEYS,
 	outlinePlanSubmissionOf,
@@ -43,23 +70,41 @@ import {
 	getOutlinePlanApprovedPrompt,
 	getOutlinePlanEnterOutput,
 	getOutlinePlanReturnedMessage,
+	getOutlinePlanReviewPrompt,
 	type Locale,
 } from "../lib/prompt-i18n";
 import { canWriteSpace, narratorUsersWith, type OutlinePrincipal } from "./outline/access";
 import { readNarrator } from "./outline/access-reads";
 import { isOutlineEnabled } from "./outline/feature";
-import { planDiffIsEmpty, planDiffLines, readPlanDiff } from "./outline/plan-diff";
+import {
+	OUTLINE_PLAN_LIMITS,
+	planDiffIsEmpty,
+	planDiffLines,
+	readPlanDiff,
+} from "./outline/plan-diff";
 import {
 	decideOutlinePlan,
 	discardEmptyPlanRoot,
 	ensurePlanRoot,
 	findPlanningRoot,
 	OUTLINE_PLAN_ACTOR,
+	OUTLINE_PLAN_REVIEW_ACTOR,
 	OutlinePlanError,
+	type OutlinePlanReviewBlock,
+	type OutlinePlanReviewClaim,
+	type OutlinePlanReviewFound,
 	type OutlinePlanRoot,
+	omittableReviews,
+	type PlanReviewCommentInput,
+	planReviewBlockId,
+	planReviewBlocks,
 	planSubmitProblemText,
+	readPlanReview,
 	readPlanSubmission,
+	renderPlanForReview,
+	reviewDiffOptions,
 	undoOutlinePlanDecision,
+	writePlanReview,
 } from "./outline/plans";
 import { outlineStore } from "./outline/store";
 import { readTaskSession } from "./task-source/backend";
@@ -214,6 +259,14 @@ export async function resolveOutlineExitPlanInput(
 		 * so its keys are dropped and the plan read anew (review round 2 N3).
 		 */
 		recovered?: boolean;
+		/**
+		 * This is the call's permission resolving it (`handlePermission`): what the review gate
+		 * handed on for this tool use is taken, once (PR 8b, review rounds 1 S2 and 2 N8): its
+		 * review, never one the input names, and the version it was submitted at.
+		 */
+		toolUseId?: string | null;
+		/** The call's tool call: a review counts only as written for this call. */
+		toolCallId?: string | null;
 	} = {},
 ): Promise<
 	| { ok: true; input: Record<string, unknown> }
@@ -241,6 +294,32 @@ export async function resolveOutlineExitPlanInput(
 		summary,
 		...rest
 	} = input;
+	// The agent's summary of the version, from its argument, or kept from an input resolved before
+	// (a call resolved again: a taken-over or reviewed plan's permission). Display text only.
+	const summaryText =
+		typeof summary === "string"
+			? summary
+			: typeof input._planSummary === "string"
+				? input._planSummary
+				: null;
+	// The review this call has (PR 8b), never from a model's own keys (review round 1 S2): for a
+	// fresh call, the one the review gate handed on for it; for a call restored from what was
+	// persisted, the one its persisted input names. `readPlanSubmission` attaches it only as the
+	// outline proves it: one of this version's reviews, written for this call.
+	const persisted = options.recovered === true ? outlinePlanSubmissionOf(input) : null;
+	const handed =
+		!persisted && options.toolUseId ? takeHandedCall(narratorId, options.toolUseId) : null;
+	const review = persisted
+		? claimOf(persisted, options.toolCallId ?? null)
+		: handed?.blockId
+			? {
+					rootId: handed.rootId,
+					blockId: handed.blockId,
+					round: handed.round,
+					submittedSeq: handed.submittedSeq,
+					toolCallId: handed.toolCallId,
+				}
+			: null;
 	const stripped = withoutOutlinePlanKeys(rest);
 	if (legacyMode) {
 		return {
@@ -255,12 +334,26 @@ export async function resolveOutlineExitPlanInput(
 	const read = await readPlanSubmission({
 		session: narratorId,
 		rootRef,
-		summary: typeof summary === "string" ? summary : null,
+		summary: summaryText,
+		review,
 	});
 	if (!read.ok) {
 		return { ok: false, input: stripped, message: planSubmitProblemText(locale, read.problem) };
 	}
 	const s = read.submission;
+	// The version the person decides on is the one submitted (review round 1 S1): a restored call
+	// keeps the seq it persisted, a call the review gate handed on (with or without comments;
+	// round 2 N7) the one it was submitted at; what changed since is told to the agent as the
+	// person's changes while deciding.
+	const kept =
+		persisted ??
+		(handed
+			? { root: { blockId: handed.rootId, round: handed.round }, seq: handed.submittedSeq }
+			: null);
+	const seq =
+		kept && kept.root.blockId === s.root.blockId && kept.root.round === s.root.round && kept.seq > 0
+			? Math.min(kept.seq, s.seq)
+			: s.seq;
 	return {
 		ok: true,
 		input: {
@@ -268,12 +361,325 @@ export async function resolveOutlineExitPlanInput(
 			mode: "outline",
 			plan: read.markdown,
 			_planRoot: s.root,
-			_planSeq: s.seq,
+			_planSeq: seq,
 			_planBaseSeq: s.baseSeq,
 			_planDiff: { counts: s.counts, truncated: s.truncated },
 			...(s.summary ? { _planSummary: s.summary } : {}),
+			...(s.review ? { _planReview: s.review } : {}),
 		},
 	};
+}
+
+// ─── Plan review (PR 8b) ───
+
+/** The review a persisted submission names, as a claim for this call. */
+function claimOf(
+	submission: OutlinePlanSubmission,
+	toolCallId: string | null,
+): OutlinePlanReviewClaim | null {
+	const review = submission.review;
+	return review
+		? {
+				rootId: submission.root.blockId,
+				blockId: review.blockId,
+				round: review.round,
+				submittedSeq: review.submittedSeq || submission.seq,
+				toolCallId,
+			}
+		: null;
+}
+
+/**
+ * What the review gate hands on to the call's permission (review rounds 1 S2 and 2 N7): the
+ * version submitted, and the review's block when it left comments.
+ */
+interface HandedCall {
+	rootId: string;
+	round: number;
+	submittedSeq: number;
+	toolCallId: string | null;
+	blockId: string | null;
+}
+
+/**
+ * The calls the review gate handed on to a person (review round 1 S2), by session and tool use:
+ * a server-side channel, so a model's call can never name a review. Taken once, by the call's
+ * permission resolving it; a new review of the same tool use starts by forgetting what an earlier
+ * attempt left (review round 2 N8). At most {@link HANDED_CALLS}, the oldest dropped first.
+ */
+const handedCalls = hotSafe(
+	"narrafork.outlinePlanHandedCalls",
+	() => new Map<string, HandedCall>(),
+);
+const HANDED_CALLS = 2048;
+
+function callKey(narratorId: string, toolUseId: string): string {
+	return `${narratorId}\n${toolUseId}`;
+}
+
+function handOn(narratorId: string, toolUseId: string, call: HandedCall): void {
+	const key = callKey(narratorId, toolUseId);
+	handedCalls.delete(key);
+	handedCalls.set(key, call);
+	while (handedCalls.size > HANDED_CALLS) {
+		const oldest = handedCalls.keys().next().value;
+		if (oldest === undefined) break;
+		handedCalls.delete(oldest);
+	}
+}
+
+/** What was handed on for the call, taken (it is in the call's resolved input from then on). */
+function takeHandedCall(narratorId: string, toolUseId: string): HandedCall | null {
+	const key = callKey(narratorId, toolUseId);
+	const call = handedCalls.get(key) ?? null;
+	handedCalls.delete(key);
+	return call;
+}
+
+/**
+ * Forget what was handed on for a call (a new review of it begins, its permission ran, or it was
+ * decided): a later attempt never picks up an earlier one's (review round 2 N8). With `only`, just
+ * that hand-off, if it is still the one there.
+ */
+export function forgetHandedCall(
+	narratorId: string,
+	toolUseId: string | null | undefined,
+	only?: object | null,
+): void {
+	if (!toolUseId) return;
+	const key = callKey(narratorId, toolUseId);
+	if (only === undefined || handedCalls.get(key) === only) handedCalls.delete(key);
+}
+
+/**
+ * A review gate handing an outline plan to a person without comments (the review could not
+ * finish, or was taken over before it wrote any): the version submitted goes on, so what the
+ * person changes from then on is told to the agent (review round 2 N7). Never over what this
+ * attempt's review handed on already (its comments). Returns the hand-off written, for the caller
+ * to take back if its handover does not happen (review round 3); null when nothing was written.
+ */
+export function handOnSubmission(args: {
+	narratorId: string;
+	toolUseId: string;
+	toolCallId?: string | null;
+	input: Record<string, unknown>;
+}): object | null {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission || handedCalls.has(callKey(args.narratorId, args.toolUseId))) return null;
+	const call: HandedCall = {
+		rootId: submission.root.blockId,
+		round: submission.root.round,
+		submittedSeq: submission.seq,
+		toolCallId: args.toolCallId ?? null,
+		blockId: null,
+	};
+	handOn(args.narratorId, args.toolUseId, call);
+	return call;
+}
+
+/** The call was decided: what was handed on for it is in its persisted input from now on. */
+function dropHandedReview(narratorId: string, toolUseId: string | null | undefined): void {
+	forgetHandedCall(narratorId, toolUseId);
+}
+
+export { planReviewBlockId };
+
+/** The submission with its review, handed on to the call's permission. */
+function withReview(
+	narratorId: string,
+	toolUseId: string,
+	submission: OutlinePlanSubmission,
+	input: Record<string, unknown>,
+	block: OutlinePlanReviewBlock,
+	toolCallId: string | null,
+): { review: OutlinePlanReview; input: Record<string, unknown> } {
+	const review: OutlinePlanReview = { ...block, submittedSeq: submission.seq };
+	handOn(narratorId, toolUseId, {
+		rootId: submission.root.blockId,
+		blockId: review.blockId,
+		round: review.round,
+		submittedSeq: review.submittedSeq,
+		toolCallId,
+	});
+	// The plan, its counts and `_planSeq` stay the submission's: the review's comments are not
+	// part of the plan's rendering or its diff (review round 1 N1, N2), and the version the person
+	// decides on is the one submitted (S1).
+	return { review, input: { ...input, _planReview: review } };
+}
+
+export type OutlinePlanReviewResult =
+	| { ok: true; review: OutlinePlanReview; input: Record<string, unknown> }
+	| { ok: false; message: string };
+
+/**
+ * A review's concerns on the outline plan a waiting ExitPlanMode submitted (`input`, as resolved):
+ * written under the plan root (`writePlanReview`), and handed on to the call's permission
+ * (`_planReview`). `ok: false`: refused, the message for the reviewer (out of bounds, a target
+ * outside the plan, the plan decided meanwhile).
+ */
+export async function reviewOutlinePlan(args: {
+	narratorId: string;
+	requestId: string;
+	/** The ExitPlanMode call reviewed: its tool use and tool call. */
+	toolUseId: string;
+	toolCallId?: string | null;
+	input: Record<string, unknown>;
+	comments: readonly PlanReviewCommentInput[];
+	/** The person the turn runs for: the commit's responsible person. */
+	userId: string | null;
+	locale: Locale;
+}): Promise<OutlinePlanReviewResult> {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission || !(await isOutlinePlanSession(args.narratorId)))
+		return {
+			ok: false,
+			message: "This review is not of a plan in the outline; PlanReview does not apply.",
+		};
+	let block: OutlinePlanReviewBlock;
+	try {
+		block = await writePlanReview({
+			session: args.narratorId,
+			rootId: submission.root.blockId,
+			round: submission.root.round,
+			blockId: planReviewBlockId(args.requestId, submission.root.round),
+			comments: args.comments,
+			userId: args.userId,
+			locale: args.locale,
+			toolCallId: args.toolCallId ?? null,
+		});
+	} catch (error) {
+		if (error instanceof OutlinePlanError) return { ok: false, message: error.message };
+		throw error;
+	}
+	return {
+		ok: true,
+		...withReview(
+			args.narratorId,
+			args.toolUseId,
+			submission,
+			args.input,
+			block,
+			args.toolCallId ?? null,
+		),
+	};
+}
+
+/**
+ * A review restored after a restart that had written its comments already (they are under the
+ * plan as the block {@link planReviewBlockId} names, written for this call): the submission with
+ * them, handed on for a person to decide on. Null when it had not (the review runs again).
+ */
+export async function recoverOutlinePlanReview(args: {
+	narratorId: string;
+	requestId: string;
+	toolUseId: string;
+	toolCallId?: string | null;
+	input: Record<string, unknown>;
+	locale: Locale;
+}): Promise<{ review: OutlinePlanReview; input: Record<string, unknown> } | null> {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission) return null;
+	const block = await readPlanReview({
+		session: args.narratorId,
+		rootId: submission.root.blockId,
+		blockId: planReviewBlockId(args.requestId, submission.root.round),
+		round: submission.root.round,
+		toolCallId: args.toolCallId ?? null,
+	}).catch(() => null);
+	if (!block) return null;
+	return withReview(
+		args.narratorId,
+		args.toolUseId,
+		submission,
+		args.input,
+		block,
+		args.toolCallId ?? null,
+	);
+}
+
+/**
+ * The prompt of an outline plan's review: the plan as submitted (as of its seq), each block with
+ * its short id. Null when the input is not an outline submission.
+ */
+export async function outlinePlanReviewPrompt(args: {
+	narratorId: string;
+	requestId: string;
+	input: Record<string, unknown>;
+	locale: Locale;
+}): Promise<string | null> {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission) return null;
+	// Without this version's earlier reviews (a cancelled call's; review round 1 N1), while they
+	// are only what the review wrote (review round 2 S3).
+	const labelled = await planReviewBlocks(
+		outlineStore,
+		args.narratorId,
+		{ id: submission.root.blockId, spaceId: submission.root.spaceId },
+		submission.baseSeq,
+	)
+		.then((reviews) =>
+			renderPlanForReview({
+				rootId: submission.root.blockId,
+				seq: submission.seq,
+				omit: omittableReviews(reviews),
+			}),
+		)
+		.catch((error) => {
+			logger.warn("Outline plan could not be rendered for its review", {
+				root: submission.root.address,
+				error: String(error),
+			});
+			return null;
+		});
+	return getOutlinePlanReviewPrompt(args.locale, {
+		requestId: args.requestId,
+		address: submission.root.address,
+		version: submission.root.round,
+		summary: submission.summary,
+		plan: labelled ?? (typeof args.input.plan === "string" ? args.input.plan : ""),
+		limits: {
+			comments: OUTLINE_PLAN_LIMITS.reviewComments,
+			chars: OUTLINE_PLAN_LIMITS.reviewCommentChars,
+		},
+	});
+}
+
+/**
+ * What the person changed in the plan since the version submitted (`submission.seq`) until
+ * `untilSeq` (null: now), as diff lines for the agent; empty when nothing. The version's reviews
+ * are left out while they are only what the review wrote: the agent is told of them on their own
+ * (review round 1 S1). Anything written into or under one is told as a change (round 2 S3).
+ */
+async function editsSinceSubmitted(
+	narratorId: string,
+	submission: OutlinePlanSubmission,
+	untilSeq: number | null,
+): Promise<string> {
+	if (untilSeq !== null && untilSeq <= submission.seq) return "";
+	const root = submission.root;
+	const reviews = await planReviewBlocks(
+		outlineStore,
+		narratorId,
+		{ id: root.blockId, spaceId: root.spaceId },
+		submission.baseSeq,
+	).catch(() => new Map<string, OutlinePlanReviewFound>());
+	// Only what the person added or changed is told, inside a review too (review round 3 N9).
+	const diff = await readPlanDiff({
+		rootId: root.blockId,
+		fromSeq: submission.seq,
+		toSeq: untilSeq,
+		...reviewDiffOptions(reviews),
+	}).catch(() => null);
+	if (!diff || planDiffIsEmpty(diff.counts)) return "";
+	return planDiffLines(diff, root.address.split("/")[0] ?? "");
+}
+
+/** A review as the agent's prompts name it (count and address), when it left comments. */
+function reviewForPrompt(
+	submission: OutlinePlanSubmission,
+): { count: number; address: string } | null {
+	const review = submission.review;
+	return review && review.count > 0 ? { count: review.count, address: review.address } : null;
 }
 
 /** A person's decision made on the card, kept until the approved pass restarts. */
@@ -379,22 +785,11 @@ export async function decideOutlinePlanRequest(args: {
 	}
 	// What the person changed while deciding: the plan as submitted against the plan just before
 	// the decision's own commit (told to the agent on a return too; review round 1 N3).
+	// Since the version submitted, while a review ran too (review round 1 S1).
 	let edits = "";
 	const decidedAt = decision.result?.commit?.seq;
-	if (decision.effective !== "return" || body.action === "return") {
-		const until = decidedAt ? decidedAt - 1 : null;
-		if (until === null || until > submission.seq) {
-			const diff = await readPlanDiff({
-				rootId: submission.root.blockId,
-				fromSeq: submission.seq,
-				toSeq: until,
-			}).catch(() => null);
-			if (diff && !planDiffIsEmpty(diff.counts)) {
-				const key = submission.root.address.split("/")[0] ?? "";
-				edits = planDiffLines(diff, key);
-			}
-		}
-	}
+	if (decision.effective !== "return" || body.action === "return")
+		edits = await editsSinceSubmitted(narratorId, submission, decidedAt ? decidedAt - 1 : null);
 	// The request was gone when this decision was to be resolved (review round 1 S1). The plan is
 	// put back only when the request was not approved meanwhile (review round 2 N2): someone else's
 	// approval a moment earlier means the plan is being executed, and it stays approved.
@@ -424,9 +819,11 @@ export async function decideOutlinePlanRequest(args: {
 				noteAddress: decision.noteAddress,
 				rootAddress: decision.root.address,
 				edits,
+				review: reviewForPrompt(submission),
 			}),
 		});
 		if (!resolved) await undo();
+		dropHandedReview(narratorId, pending.toolUseId);
 		return { commit: decision.result?.commit ?? null };
 	}
 	// What the plan is now, not what was asked (S2: a lock asked of a draft written before).
@@ -550,10 +947,13 @@ export async function settleApprovedOutlinePlan(args: {
 }): Promise<ApprovedOutlinePlan | null> {
 	// Only an outline session's call (review round 1 S6): a model cannot divert another's.
 	if (!(await isOutlinePlanSession(args.narratorId))) return null;
-	const submission = args.input
+	const submitted = args.input
 		? outlinePlanSubmissionOf(args.input)
 		: await submittedPlanOf(args.narratorId, args.toolUseId).catch(() => null);
-	if (!submission) return null;
+	if (!submitted) return null;
+	dropHandedReview(args.narratorId, args.toolUseId);
+	// A review's own approval found no concerns: there are no comments to tell the agent of.
+	const submission = args.byReview ? { ...submitted, review: null } : submitted;
 	const recorded = decisions.get(args.narratorId);
 	if (recorded && recorded.rootId === submission.root.blockId) {
 		decisions.delete(args.narratorId);
@@ -567,6 +967,7 @@ export async function settleApprovedOutlinePlan(args: {
 		};
 	}
 	let approval: ApprovedOutlinePlan["approval"] = { kind: "draft" };
+	let decidedAt: number | null = null;
 	// A review's approval is the system's, even with a person's approval left over from an
 	// earlier allow (D48 ⑦: it must not count as the person's work; review round 2 N4).
 	const approver = args.byReview ? null : args.approverUserId;
@@ -578,14 +979,15 @@ export async function settleApprovedOutlinePlan(args: {
 			action: "draft",
 			decider: {
 				kind: "system",
-				id: OUTLINE_PLAN_ACTOR,
+				id: args.byReview ? OUTLINE_PLAN_REVIEW_ACTOR : OUTLINE_PLAN_ACTOR,
 				responsibleUserId: approver ?? args.turnUserId,
 				approvedBy: approver
 					? { kind: "human", id: approver }
-					: { kind: "system", id: args.byReview ? "plan-review" : OUTLINE_PLAN_ACTOR },
+					: { kind: "system", id: args.byReview ? OUTLINE_PLAN_REVIEW_ACTOR : OUTLINE_PLAN_ACTOR },
 			},
 			locale: args.locale,
 		});
+		decidedAt = decision.result?.commit?.seq ?? null;
 		// Decided before (a card decision whose resolution was lost): tell what the plan is.
 		const lock = decision.result ? null : (decision.before.lock ?? null);
 		if (decision.effective === "lock" && lock)
@@ -600,7 +1002,14 @@ export async function settleApprovedOutlinePlan(args: {
 			error: String(error),
 		});
 	}
-	return { submission, approval, edits: "" };
+	// What changed since the version submitted (while a review ran, or the person decided another
+	// way) is told too (review round 1 S1).
+	const edits = await editsSinceSubmitted(
+		args.narratorId,
+		submitted,
+		decidedAt !== null ? decidedAt - 1 : null,
+	);
+	return { submission, approval, edits };
 }
 
 /**
@@ -642,5 +1051,6 @@ export async function startApprovedOutlinePlan(args: {
 		task,
 		edits: args.approved.edits,
 		compact: args.compact,
+		review: reviewForPrompt(args.approved.submission),
 	});
 }

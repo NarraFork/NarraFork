@@ -979,7 +979,7 @@
 	"reflectionRetrying": "retry {{attempt}}",
 	"manualTakeoverReflection": "Take over manually",
 	"planReflectionAutoApprove": "Auto-approve plans",
-	"planReflectionAutoApproveDesc": "Run plan reflection and skip manual ExitPlanMode approval after confirmation.",
+	"planReflectionAutoApproveDesc": "Run plan reflection and skip manual ExitPlanMode approval after confirmation. In outline sessions, concerns are left as comments under the plan, and the plan waits for your approval.",
 	"sessionPlanReflectionAutoApprove": "This session auto-approves plans",
 	"sessionPlanReflectionAutoApproveDesc": "Override ExitPlanMode plan-reflection auto-approval for this session.",
 	"dangerReflectionToggle": "Danger reflection",
@@ -2797,7 +2797,17 @@
 	"outlinePlan": {
 		"summary": "Version {{version}} · {{added}} added · {{changed}} changed · {{removed}} removed",
 		"summaryFirst": "Version {{version}} · a new plan of {{added}} blocks",
+		"summaryShort": "v{{version}} · +{{added}} ~{{changed}} −{{removed}}",
+		"summaryFirstShort": "v{{version}} · new · +{{added}}",
 		"agentSummary": "What changed: {{summary}}",
+		"reviewCount_one": "{{count}} review comment",
+		"reviewCount_other": "{{count}} review comments",
+		"review": {
+			"title": "Plan review (version {{version}})",
+			"explain": "The plan review left these comments under the plan. Decide with them in view; once you decide, the agent is told how many there are and where.",
+			"on": "On {{title}}",
+			"open": "Open the comments in the outline"
+		},
 		"draft": "Execute as draft",
 		"lock": "Lock and execute…",
 		"return": "Return",

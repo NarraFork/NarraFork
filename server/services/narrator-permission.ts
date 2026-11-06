@@ -3602,13 +3602,22 @@ export async function resolveExitPlanModeInputWithBackend(
 	planReadPolicy?: PlanFileReadPolicy,
 	/** The call was persisted before (restored after a restart; outline P2 PR 8 review N3). */
 	recovered = false,
+	/**
+	 * The call itself (outline P2 PR 8b): an outline plan's review is the one handed on for this
+	 * tool use, and counts only as written for this tool call.
+	 */
+	call: { toolUseId?: string | null; toolCallId?: string | null } = {},
 ): Promise<ExitPlanModeInputResolution> {
 	// An outline session plans in the outline (outline P2 PR 8): the plan is its task tree, read
 	// as of now. A plan-file cycle begun before that keeps this flow (null).
 	const { resolveOutlineExitPlanInput, withoutOutlinePlanKeys } = await import(
 		"./outline-plan-mode"
 	);
-	const outline = await resolveOutlineExitPlanInput(narratorId, rawInput, locale, { recovered });
+	const outline = await resolveOutlineExitPlanInput(narratorId, rawInput, locale, {
+		recovered,
+		toolUseId: call.toolUseId ?? null,
+		toolCallId: call.toolCallId ?? null,
+	});
 	if (outline) {
 		return outline.ok
 			? {
@@ -5545,11 +5554,16 @@ export async function handlePermission(
 			activeNarrators.get(narratorId)?._planFilePath,
 			{ narratorId, compiledPolicy },
 			isRecoveredHumanPermission(getPermissionRecovery(options)),
+			{ toolUseId, toolCallId: permissionToolCallId || null },
 		);
+		// An outline plan is the outline itself (outline P2 PR 8b, review round 1): one that changed
+		// while it waited is put to the person again as it is now (they see the changes, and the
+		// agent is told of them), never sent back to the agent. A plan file stays refused.
 		if (
 			isRecoveredHumanPermission(getPermissionRecovery(options)) &&
 			typeof input.plan === "string" &&
-			input.plan !== resolved.input.plan
+			input.plan !== resolved.input.plan &&
+			!(resolved.ok && resolved.input._planRoot)
 		) {
 			return { behavior: "deny", message: "Plan changed while its approval was awaiting a user" };
 		}

@@ -141,7 +141,10 @@ export const outlineApi = {
 		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
 			method: "DELETE",
 		}),
-	/** A plan against the version it is compared with (`from`: a seq, 0 for nothing). */
+	/**
+	 * A plan against the version it is compared with (`from`: a seq, 0 for nothing), without the
+	 * plan reviews written since (the server finds them).
+	 */
 	getOutlinePlanDiff: (spaceId: string, blockId: string, from: number) =>
 		request<OutlinePlanDiffResponse>(
 			`/outline/spaces/${enc(spaceId)}/plans/${enc(blockId)}/diff?from=${from}`,

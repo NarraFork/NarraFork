@@ -4,6 +4,7 @@ import {
 	exitPlanConfirmAndCompactTool,
 	exitPlanConfirmTool,
 	exitPlanReviseTool,
+	planReviewTool,
 } from "../exit-plan-reflection";
 import { REFLECTION_ONLY_TOOL_AVAILABILITY } from "../reflection-description";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "../task-reflection";
@@ -14,6 +15,7 @@ const reflectionTools = [
 	exitPlanConfirmTool,
 	exitPlanConfirmAndCompactTool,
 	exitPlanReviseTool,
+	planReviewTool,
 	taskReflectConfirmTool,
 	taskReflectReviseTool,
 ];
@@ -33,6 +35,8 @@ describe("reflection-only tool descriptions", () => {
 		expect(exitPlanConfirmTool.description).toContain("ExitPlanMode");
 		expect(exitPlanConfirmAndCompactTool.description).toContain("ordinary plan-mode turn");
 		expect(exitPlanReviseTool.description).toContain("ordinary plan-mode turn");
+		expect(planReviewTool.description).toContain("ordinary plan-mode turn");
+		expect(planReviewTool.description).toContain("ExitPlanMode");
 	});
 
 	test("distinguish ordinary task and danger turns from their reflection gates", () => {

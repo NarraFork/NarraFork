@@ -978,7 +978,7 @@
 	"reflectionRetrying": "第 {{attempt}} 次重试",
 	"manualTakeoverReflection": "手动接管",
 	"planReflectionAutoApprove": "自动批准计划",
-	"planReflectionAutoApproveDesc": "运行计划反思，确认后跳过 ExitPlanMode 人工审批。",
+	"planReflectionAutoApproveDesc": "运行计划反思，确认后跳过 ExitPlanMode 人工审批。大纲会话里有疑问时，意见留在计划下面，计划改为等你审批。",
 	"sessionPlanReflectionAutoApprove": "本会话自动批准计划",
 	"sessionPlanReflectionAutoApproveDesc": "覆盖本会话的 ExitPlanMode 计划反思自动批准行为。",
 	"dangerReflectionToggle": "危险反思",
@@ -2794,7 +2794,17 @@
 	"outlinePlan": {
 		"summary": "第 {{version}} 版 · 新增 {{added}} · 改动 {{changed}} · 删除 {{removed}}",
 		"summaryFirst": "第 {{version}} 版 · 新计划，共 {{added}} 块",
+		"summaryShort": "第 {{version}} 版 · +{{added}} ~{{changed}} −{{removed}}",
+		"summaryFirstShort": "第 {{version}} 版 · 新 · +{{added}}",
 		"agentSummary": "这一版改了：{{summary}}",
+		"reviewCount_one": "审查意见 {{count}} 条",
+		"reviewCount_other": "审查意见 {{count}} 条",
+		"review": {
+			"title": "计划审查意见（第 {{version}} 版）",
+			"explain": "计划审查在计划下留了这些意见。看过之后再决定；你决定后，agent 会收到意见的条数和位置。",
+			"on": "针对「{{title}}」",
+			"open": "在大纲中打开这些意见"
+		},
 		"draft": "按草稿执行",
 		"lock": "锁定后执行…",
 		"return": "退回",
