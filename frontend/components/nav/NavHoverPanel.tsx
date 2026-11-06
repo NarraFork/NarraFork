@@ -144,6 +144,7 @@ export function NavHoverPanel({
 					minHeight: 0,
 					display: "flex",
 					flexDirection: "column",
+
 					// Collapsed (desktop): the width this box has in the expanded navbar, i.e.
 					// the expanded width less the navbar's inline padding and its 1px border.
 					// Not positioned, so the backdrop and the resize handle below place
@@ -177,7 +178,10 @@ export function NavHoverPanel({
 								: `inset(0 ${expandedWidth - COLLAPSED_WIDTH}px 0 0)`,
 							transition:
 								"clip-path var(--nf-nav-open-duration) var(--nf-nav-open-ease), box-shadow var(--nf-nav-open-duration) ease",
-							pointerEvents: open ? undefined : "none",
+							// Closed, it is the rail itself, out to the window edge through the navbar's
+							// padding: what makes a mouse pushed against the screen edge open it.
+							// Pointer events are clipped with it (clip-path also clips hit testing).
+							pointerEvents: "auto",
 						}}
 					/>
 				)}
@@ -189,6 +193,7 @@ export function NavHoverPanel({
 					// from claiming the gesture as a scroll.
 					<Box
 						visibleFrom="sm"
+						className="nf-nav-resize-handle"
 						onPointerDown={startNavResize}
 						style={{
 							position: "absolute",

@@ -14,7 +14,7 @@
  * No DOM or React here, so the timing is testable with injected timers.
  */
 
-export const RECENT_TAB_HOVER_SHOW_DELAY_MS = 500;
+export const RECENT_TAB_HOVER_SHOW_DELAY_MS = 250;
 export const RECENT_TAB_HOVER_HIDE_DELAY_MS = 150;
 
 export interface RecentTabHoverRect {

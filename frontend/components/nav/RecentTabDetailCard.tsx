@@ -15,8 +15,21 @@ import {
 } from "@frontend/hooks/recent-tabs-utils";
 import { getEffectiveNarratorDisplay, statusRegistry } from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
-import { Avatar, Box, Group, Paper, Stack, Text } from "@mantine/core";
-import { IconClock, IconPencil, IconServer, IconSubtask, IconTerminal2 } from "@tabler/icons-react";
+import { ActionIcon, Avatar, Box, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
+import {
+	IconArchive,
+	IconClock,
+	IconCopy,
+	IconFolderPlus,
+	IconPencil,
+	IconPin,
+	IconPinnedOff,
+	IconServer,
+	IconSubtask,
+	IconTerminal2,
+	IconWindowMaximize,
+	IconX,
+} from "@tabler/icons-react";
 import { useLayoutEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { UserAvatar } from "../UserAvatar";
@@ -169,9 +182,14 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 export function RecentTabDetailCard({
 	store,
 	tabs,
+	actions,
+	t,
 }: {
 	store: RecentTabHoverStore;
 	tabs: RecentTab[];
+	/** Quick actions under the details; omitted, the card only shows details. */
+	actions?: RecentTabCardActions;
+	t?: (key: string) => string;
 }) {
 	const anchor = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 	const tab = anchor
@@ -219,6 +237,141 @@ export function RecentTabDetailCard({
 			}}
 		>
 			<RecentTabDetails tab={tab} />
+			{actions && t && (
+				<CardActions
+					tab={tab}
+					actions={actions}
+					t={t}
+					// An action opens a dialog, a window or a toast: the card has done its job.
+					onDone={store.hide}
+				/>
+			)}
 		</Paper>
+	);
+}
+
+/**
+ * The row menu's everyday actions, as icons under the details, so a mouse user rarely
+ * needs the right-click menu. Everything else (folders, moving, reveal, git identity)
+ * stays in the menu. Sessions only: a folder or project row's card has no actions.
+ */
+export interface RecentTabCardActions {
+	onPin: (tab: RecentTab) => void;
+	onRename: (tab: RecentTab) => void;
+	onCopyCwd: (tab: RecentTab) => void;
+	onOpenInWindow: (tab: RecentTab) => void;
+	canOpenInWindow: (tab: RecentTab) => boolean;
+	onNewNarratorHere: (tab: RecentTab) => void;
+	onArchive: (tab: RecentTab) => void;
+	onClose: (tab: RecentTab) => void;
+}
+
+function CardActions({
+	tab,
+	actions,
+	t,
+	onDone,
+}: {
+	tab: RecentTab;
+	actions: RecentTabCardActions;
+	t: (key: string) => string;
+	onDone: () => void;
+}) {
+	if (tab.type !== "narrator" && tab.type !== "subagent") return null;
+	const isNarrator = tab.type === "narrator";
+	const items: {
+		key: string;
+		label: string;
+		icon: React.ReactNode;
+		run: (tab: RecentTab) => void;
+		color?: string;
+	}[] = [
+		{
+			key: "pin",
+			label: t(
+				tab.folderId
+					? tab.pinned
+						? "unpinInFolder"
+						: "pinInFolder"
+					: tab.pinned
+						? "unpinTab"
+						: "pinTab",
+			),
+			icon: tab.pinned ? <IconPinnedOff size={15} /> : <IconPin size={15} />,
+			run: actions.onPin,
+		},
+		...(isNarrator
+			? [
+					{
+						key: "rename",
+						label: t("rename"),
+						icon: <IconPencil size={15} />,
+						run: actions.onRename,
+					},
+				]
+			: []),
+		{ key: "copyCwd", label: t("copyCwd"), icon: <IconCopy size={15} />, run: actions.onCopyCwd },
+		...(actions.canOpenInWindow(tab)
+			? [
+					{
+						key: "openInWindow",
+						label: t("openInWindow"),
+						icon: <IconWindowMaximize size={15} />,
+						run: actions.onOpenInWindow,
+					},
+				]
+			: []),
+		{
+			key: "newNarratorHere",
+			label: t("newNarratorHere"),
+			icon: <IconFolderPlus size={15} />,
+			run: actions.onNewNarratorHere,
+		},
+		...(isNarrator
+			? [
+					{
+						key: "archive",
+						label: t("archive"),
+						icon: <IconArchive size={15} />,
+						run: actions.onArchive,
+						color: "orange",
+					},
+				]
+			: []),
+		{
+			key: "close",
+			label: t("closeTab"),
+			icon: <IconX size={15} />,
+			run: actions.onClose,
+			color: "red",
+		},
+	];
+	return (
+		<Group
+			gap={2}
+			mt={8}
+			pt={6}
+			wrap="nowrap"
+			data-recent-tab-card-actions
+			style={{ borderTop: "1px solid var(--mantine-color-default-border)" }}
+		>
+			{items.map((item) => (
+				<Tooltip key={item.key} label={item.label} position="bottom" withArrow openDelay={150}>
+					<ActionIcon
+						size={26}
+						variant="subtle"
+						color={item.color ?? "gray"}
+						aria-label={item.label}
+						data-card-action={item.key}
+						onClick={() => {
+							onDone();
+							item.run(tab);
+						}}
+					>
+						{item.icon}
+					</ActionIcon>
+				</Tooltip>
+			))}
+		</Group>
 	);
 }

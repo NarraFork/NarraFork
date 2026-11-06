@@ -45,6 +45,33 @@
 	transition: clip-path var(--nf-nav-open-duration) var(--nf-nav-open-ease);
 }
 
+/*
+ * What takes the pointer while closed: only what is painted. The box and the wrappers
+ * between it and the rows (session list, stacks, groups) still span the expanded width,
+ * over the page; left to take the pointer, they opened the sidebar from the middle of the
+ * page. So the box passes the pointer through and the painted parts take it back: the
+ * clipped rows below (clip-path clips hit testing too), the backdrop (the rail out to the
+ * window edge, NavHoverPanel), and the floating card / menu the sidebar opens.
+ */
+[data-nav-hover-panel="closed"] {
+	pointer-events: none;
+}
+
+[data-nav-hover-panel="closed"]
+	:is(
+		.mantine-NavLink-root,
+		[data-folder-unit],
+		[data-recent-tab-pin-divider],
+		.nf-nav-status-row,
+		.nf-nav-bottom-bar,
+		.nf-nav-brand,
+		[data-nav-keep-open],
+		[data-nav-pointer],
+		.nf-nav-resize-handle
+	) {
+	pointer-events: auto;
+}
+
 [data-nav-hover-panel="closed"]
 	:is(
 		.mantine-NavLink-root,

@@ -68,7 +68,7 @@ import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
-import { RecentTabDetailCard } from "./RecentTabDetailCard";
+import { type RecentTabCardActions, RecentTabDetailCard } from "./RecentTabDetailCard";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import { RecentTabFolderEditModal } from "./RecentTabFolderEditModal";
 import {
@@ -644,12 +644,15 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setCtxMenu(null);
 	}, [ctxMenu, moveTab]);
 
+	const pinTabToggle = useCallback(
+		(tab: RecentTab) => pinTab(tabSortId(tab), !tab.pinned),
+		[pinTab],
+	);
 	const handlePin = useCallback(() => {
 		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
-		pinTab(tabSortId(tab), !tab.pinned);
 		setCtxMenu(null);
-	}, [ctxMenu, pinTab]);
+		pinTabToggle(ctxMenu.tab);
+	}, [ctxMenu, pinTabToggle]);
 
 	const handleLeaveFolder = useCallback(() => {
 		if (!ctxMenu) return;
@@ -696,11 +699,15 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setCtxMenu(null);
 	}, [ctxMenu, toggleFolderCollapsed]);
 
+	const closeTabRow = useCallback(
+		(tab: RecentTab) => handleRemove(tab.type, tab.id),
+		[handleRemove],
+	);
 	const handleCtxClose = useCallback(() => {
 		if (!ctxMenu) return;
-		handleRemove(ctxMenu.tab.type, ctxMenu.tab.id);
 		setCtxMenu(null);
-	}, [ctxMenu, handleRemove]);
+		closeTabRow(ctxMenu.tab);
+	}, [ctxMenu, closeTabRow]);
 
 	/**
 	 * Resolve the on-disk directory a tab points at: its narrator's cwd. Returns null
@@ -737,33 +744,38 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setNewNarratorTarget(null);
 	}, []);
 
-	const handleNewNarratorHere = useCallback(async () => {
+	const newNarratorHereFor = useCallback(
+		async (tab: RecentTab) => {
+			if (!requireSetup()) return;
+			const narratorId = getRecentTabNarratorId(tab);
+			if (!narratorId) {
+				notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+				return;
+			}
+			const request = ++newNarratorRequestRef.current;
+			const target = { narratorId };
+			newNarratorTargetRef.current = target;
+			setNewNarratorTarget(target);
+			const dir = await resolveTabDirectory(narratorId);
+			if (request !== newNarratorRequestRef.current || newNarratorTargetRef.current !== target) {
+				return;
+			}
+			if (!dir) {
+				closeNewNarratorHere();
+				notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+				return;
+			}
+			const resolved = { narratorId, cwd: dir };
+			newNarratorTargetRef.current = resolved;
+			setNewNarratorTarget(resolved);
+		},
+		[requireSetup, resolveTabDirectory, closeNewNarratorHere, t],
+	);
+	const handleNewNarratorHere = useCallback(() => {
 		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
 		setCtxMenu(null);
-		if (!requireSetup()) return;
-		const narratorId = getRecentTabNarratorId(tab);
-		if (!narratorId) {
-			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
-			return;
-		}
-		const request = ++newNarratorRequestRef.current;
-		const target = { narratorId };
-		newNarratorTargetRef.current = target;
-		setNewNarratorTarget(target);
-		const dir = await resolveTabDirectory(narratorId);
-		if (request !== newNarratorRequestRef.current || newNarratorTargetRef.current !== target) {
-			return;
-		}
-		if (!dir) {
-			closeNewNarratorHere();
-			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
-			return;
-		}
-		const resolved = { narratorId, cwd: dir };
-		newNarratorTargetRef.current = resolved;
-		setNewNarratorTarget(resolved);
-	}, [ctxMenu, requireSetup, resolveTabDirectory, closeNewNarratorHere, t]);
+		void newNarratorHereFor(ctxMenu.tab);
+	}, [ctxMenu, newNarratorHereFor]);
 
 	const handleNewNarratorHereCreated = useCallback(
 		(data: CreateNarratorResult) => {
@@ -806,42 +818,52 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [ctxMenu, revealAvailable]);
 
 	/** 复制工作目录到剪贴板（narrator/subagent） */
-	const handleCopyCwd = useCallback(async () => {
+	const copyTabCwd = useCallback(
+		async (tab: RecentTab) => {
+			const dir = await resolveTabDirectory(tab);
+			if (!dir) {
+				notifications.show({ color: "red", message: t("copyCwdNoDir") });
+				return;
+			}
+			try {
+				// 走仓库的剪贴板封装而非直接 navigator.clipboard：私有化部署常以纯 HTTP
+				// 访问，此时 Clipboard API 不存在，封装会回落到临时选中的表单控件。
+				await copyTextToClipboard(dir);
+				notifications.show({ color: "green", message: t("copyCwdSuccess", { path: dir }) });
+			} catch {
+				notifications.show({ color: "red", message: t("copyCwdFailed") });
+			}
+		},
+		[resolveTabDirectory, t],
+	);
+	const handleCopyCwd = useCallback(() => {
 		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
 		setCtxMenu(null);
-		const dir = await resolveTabDirectory(tab);
-		if (!dir) {
-			notifications.show({ color: "red", message: t("copyCwdNoDir") });
-			return;
-		}
-		try {
-			// 走仓库的剪贴板封装而非直接 navigator.clipboard：私有化部署常以纯 HTTP
-			// 访问，此时 Clipboard API 不存在，封装会回落到临时选中的表单控件。
-			await copyTextToClipboard(dir);
-			notifications.show({ color: "green", message: t("copyCwdSuccess", { path: dir }) });
-		} catch {
-			notifications.show({ color: "red", message: t("copyCwdFailed") });
-		}
-	}, [ctxMenu, resolveTabDirectory, t]);
+		void copyTabCwd(ctxMenu.tab);
+	}, [ctxMenu, copyTabCwd]);
 
 	/** 在外部窗口打开该标签（叙述者 → chat 面板窗口；project → 主应用窗口） */
+	const openTabInWindow = useCallback((tab: RecentTab) => {
+		const href = recentTabWindowHref(tab);
+		if (href) window.open(href, "_blank", PANEL_WINDOW_FEATURES);
+	}, []);
 	const handleOpenInWindow = useCallback(() => {
 		if (!ctxMenu) return;
-		const href = recentTabWindowHref(ctxMenu.tab);
 		setCtxMenu(null);
-		if (href) window.open(href, "_blank", PANEL_WINDOW_FEATURES);
-	}, [ctxMenu]);
+		openTabInWindow(ctxMenu.tab);
+	}, [ctxMenu, openTabInWindow]);
 
 	/** 打开重命名对话框 */
-	const handleRename = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
-		setCtxMenu(null);
+	const renameTabRow = useCallback((tab: RecentTab) => {
 		if (tab.type !== "narrator") return; // 仅叙述者会话可重命名
 		setRenameValue(tab.title || "");
 		setRenameTab({ id: tab.id, title: tab.title || "" });
-	}, [ctxMenu]);
+	}, []);
+	const handleRename = useCallback(() => {
+		if (!ctxMenu) return;
+		setCtxMenu(null);
+		renameTabRow(ctxMenu.tab);
+	}, [ctxMenu, renameTabRow]);
 
 	/** 提交重命名 */
 	const handleRenameSubmit = useCallback(async () => {
@@ -868,13 +890,15 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [renameTab, renameValue, qc, tn]);
 
 	/** 打开归档确认 */
-	const handleArchive = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
-		setCtxMenu(null);
+	const archiveTabRow = useCallback((tab: RecentTab) => {
 		if (tab.type !== "narrator") return;
 		setArchiveConfirmTab({ id: tab.id });
-	}, [ctxMenu]);
+	}, []);
+	const handleArchive = useCallback(() => {
+		if (!ctxMenu) return;
+		setCtxMenu(null);
+		archiveTabRow(ctxMenu.tab);
+	}, [ctxMenu, archiveTabRow]);
 
 	/** 执行归档 */
 	const handleArchiveConfirm = useCallback(() => {
@@ -1124,6 +1148,29 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			);
 	}
 	const indicator = drag.indicator ?? externalDrop;
+	// The hover card's quick actions: the everyday part of the row menu, one click away.
+	const cardActions = useMemo<RecentTabCardActions>(
+		() => ({
+			onPin: pinTabToggle,
+			onRename: renameTabRow,
+			onCopyCwd: (tab) => void copyTabCwd(tab),
+			onOpenInWindow: openTabInWindow,
+			canOpenInWindow: (tab) => recentTabWindowHref(tab) !== null,
+			onNewNarratorHere: (tab) => void newNarratorHereFor(tab),
+			onArchive: archiveTabRow,
+			onClose: closeTabRow,
+		}),
+		[
+			pinTabToggle,
+			renameTabRow,
+			copyTabCwd,
+			openTabInWindow,
+			newNarratorHereFor,
+			archiveTabRow,
+			closeTabRow,
+		],
+	);
+
 	const ctxTab = ctxMenu?.tab;
 	const ctxIsFolder = ctxTab?.type === "folder";
 	const ctxInFolder = !!ctxTab?.folderId;
@@ -1311,7 +1358,9 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 					</DragOverlay>
 				</DndContext>
 			</RecentTabsDragContext.Provider>
-			{!isTouch && <RecentTabDetailCard store={hoverStore} tabs={tabs} />}
+			{!isTouch && (
+				<RecentTabDetailCard store={hoverStore} tabs={tabs} actions={cardActions} t={t} />
+			)}
 		</RecentTabHoverContext.Provider>
 	);
 }

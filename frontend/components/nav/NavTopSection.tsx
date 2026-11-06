@@ -9,7 +9,7 @@
 
 import { Group, Kbd, NavLink, Stack, Text, Tooltip } from "@mantine/core";
 import { IconEdit, IconSearch } from "@tabler/icons-react";
-import { useNavigate, useRouterState } from "@tanstack/react-router";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import {
 	type ReactNode,
 	type RefObject,
@@ -249,6 +249,7 @@ export function NavTopSection({
 						}}
 					/>
 				</Tooltip>
+				<NavVersionLink />
 				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }} className="nf-nav-expanded-only">
 					<WorkspaceSwitcher />
 					<NotificationBell />
@@ -264,6 +265,32 @@ export function NavTopSection({
 				<NewSessionLink onNavigate={onNavigate} />
 			</Stack>
 		</Stack>
+	);
+}
+
+/**
+ * The running version, right of the brand: just the release (`v0.9.11`), with the build's
+ * commit in the tooltip. Opens Settings → About. Hidden while collapsed, like the bell.
+ */
+function NavVersionLink() {
+	const { t } = useTranslation("nav");
+	const full = __APP_VERSION__;
+	const release = full.split("+")[0] ?? full;
+	return (
+		<Tooltip label={`${t("version")} v${full}`} position="bottom" openDelay={400}>
+			<Text
+				component={Link}
+				to="/settings/about"
+				size="xs"
+				c="dimmed"
+				truncate
+				className="nf-nav-expanded-only"
+				data-nav-version
+				style={{ flex: 1, minWidth: 0, textDecoration: "none" }}
+			>
+				v{release}
+			</Text>
+		</Tooltip>
 	);
 }
 
