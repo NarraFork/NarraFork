@@ -53,6 +53,7 @@ import { useOutlineOpener } from "../../../lib/outline-opener";
 import type { PendingPermission } from "../../../types/narrator";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../../narrator/message/MessageSelectionCtx";
 import { type PermButton, PermButtonBar } from "../../narrator/permission/PermButtonBar";
+import { usePermissionTextareaStyle } from "../../narrator/permission/permission-textarea-typography";
 import { PermEnterHintCtx } from "../../narrator/tool-call/tool-call-contexts";
 import { OutlinePlanDiffModal } from "./OutlinePlanDiffModal";
 
@@ -103,6 +104,8 @@ export function OutlinePlanApproval({
 	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
 	const isActive = permission.id === activePermissionId;
+	// In the transcript the feedback box paints the rows its height model counts (D49).
+	const textareaStyle = usePermissionTextareaStyle();
 	const [feedback, setFeedback] = useState("");
 	const [diffOpen, setDiffOpen] = useState(false);
 	const [lockOpen, setLockOpen] = useState(false);
@@ -388,6 +391,7 @@ export function OutlinePlanApproval({
 				maxRows={3}
 				mb="xs"
 				disabled={readOnly}
+				styles={textareaStyle ? { input: textareaStyle } : undefined}
 				data-testid="outline-plan-feedback"
 			/>
 			{readOnly ? (

@@ -34,6 +34,7 @@ import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuest
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { type PermButton, PermButtonBar } from "./PermButtonBar";
 import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
+import { usePermissionTextareaStyle } from "./permission-textarea-typography";
 
 const noop = () => {};
 
@@ -197,6 +198,8 @@ export function InlinePermission({
 	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
+	// In the transcript both textareas paint the rows its height model counts (D49).
+	const textareaStyle = usePermissionTextareaStyle();
 	const draftKey = permission.id;
 	const storedDraftRef = useRef<StoredPermissionDraft | null | undefined>(undefined);
 	const getStoredDraft = () => {
@@ -407,7 +410,13 @@ export function InlinePermission({
 					minRows={8}
 					maxRows={30}
 					disabled={effectiveReadOnly || !permissionInputSupported}
-					styles={{ input: { fontFamily: "monospace", fontSize: "var(--mantine-font-size-xs)" } }}
+					styles={{
+						input: {
+							fontFamily: "monospace",
+							fontSize: "var(--mantine-font-size-xs)",
+							...textareaStyle,
+						},
+					}}
 				/>
 			)}
 			{localizedDecisionReason && (
@@ -433,6 +442,7 @@ export function InlinePermission({
 				maxRows={3}
 				mb="xs"
 				disabled={effectiveReadOnly}
+				styles={textareaStyle ? { input: textareaStyle } : undefined}
 			/>
 			{effectiveReadOnly ? (
 				<Text size="xs" c="dimmed">

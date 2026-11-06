@@ -31,6 +31,7 @@ import type {
 	PermissionCallbacks,
 } from "../narrator-panel-types";
 import { InlinePermission } from "../permission/InlinePermission";
+import { TranscriptPermissionTypography } from "../permission/permission-textarea-typography";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import { AsyncQuestionDetail, AsyncQuestionSummary } from "../question/AsyncQuestionDetail";
 import {
@@ -239,11 +240,23 @@ export function usePermissionSlots({
  * No `onReflect` and no `reflectionDeadline`: an async question arms no automatic
  * answer timer, so offering "let the model answer" here would advertise a mechanism
  * that is not running.
+ *
+ * A form is marked as the transcript's (permission-textarea-typography.tsx, D49); a summary
+ * is not. It paints no textarea of its own, and the one in its Details modal is not in the
+ * transcript: the modal portals out of it, but context would follow, and the same form would
+ * look different opened here than from the question inbox (D49 review round 1 S2).
  */
 export function buildAsyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
+	if (slot.question && (slot.summaryOnly || slot.question.status !== "open" || slot.readOnly))
+		return <AsyncQuestionSummary question={slot.question} readOnly={slot.readOnly} />;
+	const node = asyncQuestionForm(slot);
+	return node === null ? null : (
+		<TranscriptPermissionTypography>{node}</TranscriptPermissionTypography>
+	);
+}
+
+function asyncQuestionForm(slot: AsyncQuestionSlot): ReactNode {
 	if (slot.question) {
-		if (slot.summaryOnly || slot.question.status !== "open" || slot.readOnly)
-			return <AsyncQuestionSummary question={slot.question} readOnly={slot.readOnly} />;
 		return <AsyncQuestionDetail narratorId={slot.question.narratorId} questionId={slot.id} />;
 	}
 	if (slot.questions.length === 0) return null;
@@ -293,8 +306,22 @@ interface PermissionNodeHandlers {
  * uses the full question banner; every other tool uses InlinePermission (which
  * itself internally renders the AskUserQuestion banner only when appropriate, but
  * we short-circuit here for parity with the chunked path's card body).
+ *
+ * Every form is marked as the transcript's, so its textareas paint the rows the height
+ * model reserved for them (permission-textarea-typography.tsx, D49).
  */
 export function buildPermissionNode(
+	permission: PendingPermission,
+	handlers: PermissionNodeHandlers,
+): ReactNode {
+	return (
+		<TranscriptPermissionTypography>
+			{permissionNode(permission, handlers)}
+		</TranscriptPermissionTypography>
+	);
+}
+
+function permissionNode(
 	permission: PendingPermission,
 	handlers: PermissionNodeHandlers,
 ): ReactNode {
