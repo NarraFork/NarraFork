@@ -559,16 +559,17 @@ test("a question put to a person: marked, never ticked, deleting it withdraws it
 	noErrors(a, b);
 }, 30_000);
 
-test("the frame's icons take real clicks: the checkbox cycles the task, the arrow folds, the caret stays out", async () => {
+test("the frame's icons take real clicks: the checkbox cycles the task, the arrow folds, the bullet focuses, the caret stays out", async () => {
 	const { pageId, ids } = await seedPage(h, "Frame", ["[ ] 任务", "父块", "  子块"]);
 	const [task, parent] = ids as [string, string];
 	const [a, b] = await both(pageId);
-	/** Where an icon of a block's frame is drawn (its middle), and which icon it is. */
-	const icon = (e: Editor, id: string, part: "ob-check" | "ob-arrow") =>
+	/** Where a part of a block's frame is drawn (its icon's middle), and which icon it shows. */
+	const icon = (e: Editor, id: string, part: "ob-check" | "ob-arrow" | "ob-bullet") =>
 		e.call(
 			(f, x, p) => {
 				const el = f.dom(x as never)?.querySelector<HTMLElement>(`:scope > .ob-gutter > .${p}`);
-				const r = el?.querySelector("svg")?.getBoundingClientRect();
+				// The bullet is a CSS dot, centred in its part.
+				const r = (el?.querySelector("svg") ?? el)?.getBoundingClientRect();
 				return el && r
 					? {
 							x: r.x + r.width / 2,
@@ -582,7 +583,7 @@ test("the frame's icons take real clicks: the checkbox cycles the task, the arro
 			id,
 			part,
 		);
-	const click = async (id: string, part: "ob-check" | "ob-arrow") => {
+	const click = async (id: string, part: "ob-check" | "ob-arrow" | "ob-bullet") => {
 		const at = await icon(a, id, part);
 		if (!at) throw new Error(`no ${part} icon on ${id}`);
 		await a.page.mouse.click(at.x, at.y);
@@ -608,6 +609,12 @@ test("the frame's icons take real clicks: the checkbox cycles the task, the arro
 		true,
 	);
 	await converged(pageId, a, b);
+	// The bullet focuses its block: the host is told, and the view shows what is under it.
+	expect(await a.call((f) => f.events().focused)).toEqual([]);
+	await click(parent, "ob-bullet");
+	await until(a, (f, x) => f.events().focused.at(-1) === x, [parent]);
+	expect(await a.call((f) => f.events().focused)).toEqual([parent]);
+	expect(await a.call((f) => f.viewOutline())).toBe("- 子块");
 	noErrors(a, b);
 }, 30_000);
 

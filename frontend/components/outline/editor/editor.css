@@ -236,7 +236,7 @@
 	cursor: pointer;
 }
 
-/* The task's checkbox, the tree's icon at the list's text size. */
+/* The task's checkbox at the frame's size (`--nf-outline-icon`: body + 2), not the list's xs. */
 .nf-outline-editor .ob-task-icon {
 	flex: none;
 	display: flex;

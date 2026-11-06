@@ -1634,7 +1634,7 @@ class BlockView implements NodeView {
 			icon.className = "ob-task-icon";
 			icon.setAttribute("role", "img");
 			icon.setAttribute("aria-label", chromeText.status[LIVE_STATUS_OF_TASK[task.task]]);
-			icon.append(iconSvg(taskIconOf(task.task)));
+			icon.append(iconSvg(taskIconOf(task.task), icon.ownerDocument));
 			const label = document.createElement("span");
 			label.className = "ob-task-title";
 			label.textContent = `${task.title}${task.waiting ? ` · ${chromeText.waiting}` : ""}`;

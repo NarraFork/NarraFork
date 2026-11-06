@@ -114,7 +114,9 @@
 	padding: 4px 8px;
 	border: 1px solid var(--ob-line);
 	border-radius: 6px;
-	background: var(--mantine-color-body);
+	/* The node's fill, which the focused block's ring (below) also paints its gap with. */
+	--mm-node-fill: var(--mantine-color-body);
+	background: var(--mm-node-fill);
 	/* The conversation's body text; `measure.ts` measures with the same metrics. */
 	font-size: var(--nf-type-body-size);
 	line-height: var(--nf-type-body-line);
@@ -233,13 +235,20 @@
 }
 
 .nf-outline-editor .mm-node.is-root {
-	background: color-mix(in srgb, var(--ob-accent) 8%, var(--mantine-color-body));
+	--mm-node-fill: color-mix(in srgb, var(--ob-accent) 8%, var(--mantine-color-body));
 }
 
-/* The focused block: its dot in a ring. */
+/*
+ * The focused block: its dot in a ring, 1px out and 1px wide (what Chromium drew for the
+ * `outline: 1.5px` this replaces: it snaps outline widths and offsets to whole pixels). Two
+ * shadows, not an outline, which older Safari draws square: the inner one paints the gap in the
+ * node's fill, the outer one the ring. Shadows take no room, so nothing measured or laid out
+ * changes. The root is never folded (`mindmap.ts`), so the folded halo never shows here too.
+ */
 .nf-outline-editor .mm-node.is-root > .ob-gutter .ob-bullet::before {
-	outline: 1.5px solid currentColor;
-	outline-offset: 1.5px;
+	box-shadow:
+		0 0 0 1px var(--mm-node-fill),
+		0 0 0 2px currentColor;
 }
 
 .nf-outline-editor .mm-node.sel {
@@ -248,7 +257,7 @@
 }
 
 .nf-outline-editor .mm-node.msel {
-	background: color-mix(in srgb, var(--ob-accent) 16%, var(--mantine-color-body));
+	--mm-node-fill: color-mix(in srgb, var(--ob-accent) 16%, var(--mantine-color-body));
 }
 
 .nf-outline-editor .mm-node.editing {

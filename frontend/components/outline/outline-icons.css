@@ -1,8 +1,8 @@
 /*
- * Sizes of the outline's icons (`outline-icons.ts`): the read-only tree, the live editor's and
- * the mind map's frames, the "in progress" lists. They follow the reader's body text (外观 · 排版,
- * `--nf-type-body-size`; 14px by default, which gives the tree's 16 / 14 / 6 px). The checkbox
- * column grows with its icon (the mind map measures it with the same formula:
+ * Sizes of the outline's icons (`outline-icons.ts`): the read-only tree's rows, the live editor's
+ * and the mind map's frames, the editor's "in progress" list. They follow the reader's body text
+ * (外观 · 排版, `--nf-type-body-size`; 14px by default, which gives the tree's 16 / 14 / 6 px).
+ * The checkbox column grows with its icon (the mind map measures it with the same formula:
  * `mindmap/measure.ts` → `checkIconPx`); the arrow and the bullet keep columns of 14px or more,
  * so their icons stop growing there.
  */

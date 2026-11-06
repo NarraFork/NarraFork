@@ -174,7 +174,13 @@
 	align-items: center;
 }
 
-.taskIcon svg {
+/*
+ * Beside text that follows the reader's typography (a row's body, the page title), the frame's
+ * size. Elsewhere (the "in progress" popover, the space's page list) the text is Mantine's fixed
+ * 14px, and the icon keeps its fixed 16px (`size={16}`).
+ */
+.row > .taskIcon svg,
+.titleRow > .taskIcon svg {
 	width: var(--nf-outline-icon);
 	height: var(--nf-outline-icon);
 }

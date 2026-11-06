@@ -78,28 +78,35 @@ const OUTLINE_ATTRS: Record<string, string> = {
 	"stroke-linecap": "round",
 	"stroke-linejoin": "round",
 };
-const templates = new Map<string, SVGSVGElement>();
+/** Built icons, by document (a clone belongs to its template's) and then by name. */
+const templates = new WeakMap<Document, Map<string, SVGSVGElement>>();
 
 /**
  * An icon as inline SVG for native DOM: decorative (the element around it carries the role and
- * label), sized by CSS, stroked in `currentColor`. Built once per icon, then cloned.
+ * label), sized by CSS, stroked in `currentColor`. Built once per icon and document (pass the
+ * document of the element it goes into), then cloned.
  */
-export function iconSvg(icon: OutlineIcon): SVGSVGElement {
-	let template = templates.get(icon.name);
+export function iconSvg(icon: OutlineIcon, doc: Document = document): SVGSVGElement {
+	let built = templates.get(doc);
+	if (!built) {
+		built = new Map();
+		templates.set(doc, built);
+	}
+	let template = built.get(icon.name);
 	if (!template) {
-		template = document.createElementNS(SVG_NS, "svg");
+		template = doc.createElementNS(SVG_NS, "svg");
 		for (const [name, value] of Object.entries(OUTLINE_ATTRS)) template.setAttribute(name, value);
 		template.setAttribute("class", `tabler-icon tabler-icon-${icon.name}`);
 		template.setAttribute("aria-hidden", "true");
 		template.setAttribute("focusable", "false");
 		for (const [tag, attrs] of icon.node) {
-			const el = document.createElementNS(SVG_NS, String(tag));
+			const el = doc.createElementNS(SVG_NS, String(tag));
 			for (const [name, value] of Object.entries(attrs)) {
 				if (name !== "key") el.setAttribute(name, String(value));
 			}
 			template.append(el);
 		}
-		templates.set(icon.name, template);
+		built.set(icon.name, template);
 	}
 	return template.cloneNode(true) as SVGSVGElement;
 }
@@ -113,7 +120,7 @@ export function setIcon(el: HTMLElement, icon: OutlineIcon | null): void {
 	if ((el.dataset.icon ?? "") === name && el.childElementCount === (icon ? 1 : 0)) return;
 	if (icon) {
 		el.dataset.icon = name;
-		el.replaceChildren(iconSvg(icon));
+		el.replaceChildren(iconSvg(icon, el.ownerDocument));
 	} else {
 		delete el.dataset.icon;
 		el.replaceChildren();

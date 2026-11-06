@@ -12,6 +12,7 @@ import {
 	iconSvg,
 	type OutlineIcon,
 	QUESTION_ICON,
+	setIcon,
 	TASK_ICONS,
 	taskIconOf,
 } from "./outline-icons";
@@ -130,5 +131,19 @@ describe("outline icons", () => {
 		// The bullet is drawn by CSS: no glyph in the DOM.
 		expect(g.bullet.textContent).toBe("");
 		expect(g.el.textContent).toBe("");
+	});
+
+	test("an icon is built in the document it goes into, not the first one it was built for", () => {
+		const other = parseHTML("<!doctype html><html><body></body></html>")
+			.document as unknown as Document;
+		const here = iconSvg(TASK_ICONS.todo);
+		expect(here.ownerDocument).toBe(document);
+		const there = iconSvg(TASK_ICONS.todo, other);
+		expect(there.ownerDocument).toBe(other);
+		expect(drawing(there)).toEqual(drawing(here));
+		// An element of another document shows that document's icon.
+		const el = other.createElement("span");
+		setIcon(el, TASK_ICONS.todo);
+		expect(el.firstElementChild?.ownerDocument).toBe(other);
 	});
 });
