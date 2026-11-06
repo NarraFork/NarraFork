@@ -25,6 +25,7 @@ import {
 	scanDatabaseObjectStorage,
 	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
+import { instrumentSqliteConnection, runInSqlTraceSpan, startSqlTraceSpan } from "../sql-trace";
 import {
 	runBlockBackfillSlice,
 	runBlockIndexQueueSlice,
@@ -58,7 +59,7 @@ const connections = new Map<string, Database>();
 function getConnection(dbPath: string): Database {
 	const existing = connections.get(dbPath);
 	if (existing) return existing;
-	const db = new Database(dbPath, { readonly: true });
+	const db = instrumentSqliteConnection(new Database(dbPath, { readonly: true }));
 	// Match the main connection's read tuning. No write pragmas: this handle is read-only.
 	try {
 		db.run("PRAGMA cache_size = -16000");
@@ -201,9 +202,15 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	const startedAt = Date.now();
 	const controller = new AbortController();
 	activeTasks.set(message.requestId, controller);
+	const sqlSpan = startSqlTraceSpan(
+		"worker",
+		`db-worker ${message.params.kind}`,
+		undefined,
+		message.traceParent,
+	);
 	try {
 		const params = message.params;
-		const result =
+		const result = await runInSqlTraceSpan(sqlSpan, async () =>
 			params.kind === "storageHistoryRead"
 				? runStorageHistoryRead(getConnection(message.dbPath), params)
 				: params.kind === "storageHistoryBody"
@@ -250,7 +257,8 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 																			message.requestId,
 																			params,
 																			controller.signal,
-																		);
+																		),
+		);
 		post({
 			type: "result",
 			requestId: message.requestId,
@@ -276,6 +284,7 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 					: {}),
 		});
 	} finally {
+		sqlSpan?.end();
 		activeTasks.delete(message.requestId);
 	}
 };

@@ -33,6 +33,7 @@ import {
 	RUNTIME_SOURCE_COLUMNS,
 	runDeliverToOf,
 } from "../../lib/runtime-source";
+import { withSqlTraceSpan } from "../../lib/sql-trace";
 import type { ImageRef } from "../../lib/uploads";
 import {
 	type DelegatedTaskRegistration,
@@ -314,7 +315,12 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 		setRunControl(owner, run);
 		// The model and every preparation step run outside the short start mutex. A
 		// foreground caller not handed back by a detach receives the terminal itself.
-		const completion = withNarratorWorkAdmission(id, () => executeRun(req, owner, run)).then(
+		const completion = withSqlTraceSpan(
+			"agent",
+			"agent run",
+			{ narratorId: id, ...(req.foreground ? { foreground: true } : {}) },
+			() => withNarratorWorkAdmission(id, () => executeRun(req, owner, run)),
+		).then(
 			(result) => {
 				resolveTerminal(result);
 				settleForeground(result);

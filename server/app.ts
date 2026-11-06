@@ -1,6 +1,7 @@
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { matchedRoutes } from "hono/route";
 import type { UnofficialStatusCode } from "hono/utils/http-status";
 import { db } from "./db";
 import { users } from "./db/schema";
@@ -16,6 +17,7 @@ import { getRuntimeEnvironment } from "./lib/platform";
 import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
+import { runInSqlTraceSpan, startSqlTraceSpan } from "./lib/sql-trace";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
 import { requireSessionAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
@@ -236,9 +238,29 @@ app.use(
 app.use("/api/*", async (c, next) => {
 	const startedAt = performance.now();
 	const done = trackInFlight(`${c.req.method} ${c.req.path}`);
+	// SQL tracing (NF_SQL_TRACE): every statement this request runs is attributed to this span.
+	// The label is refined to the matched route pattern once routing has happened.
+	const sqlSpan = startSqlTraceSpan("http", c.req.method, { path: c.req.path });
 	try {
-		await next();
+		await runInSqlTraceSpan(sqlSpan, next);
 	} finally {
+		if (sqlSpan) {
+			// The handler is the last concrete-method route; `ALL` entries are middleware.
+			const handler = matchedRoutes(c).findLast((route) => route.method !== "ALL");
+			// Unmatched paths fall back to the raw path with id-like segments collapsed, so 404s
+			// and wildcard routes do not create one label per resource id.
+			sqlSpan.label = `${c.req.method} ${
+				handler && !handler.path.endsWith("*")
+					? handler.path
+					: c.req.path.replace(/\/(?=[^/]*\d)[A-Za-z0-9_-]{8,}(?=\/|$)/g, "/:id")
+			}`;
+			sqlSpan.end({ status: c.res.status, ...stallTimeBetween(startedAt, performance.now()) });
+			try {
+				c.res.headers.append("Server-Timing", sqlSpan.serverTiming());
+			} catch {
+				// Immutable headers (e.g. a proxied Response): the header is diagnostic only.
+			}
+		}
 		done();
 		const endedAt = performance.now();
 		const durationMs = Math.round((endedAt - startedAt) * 100) / 100;

@@ -274,6 +274,8 @@ export interface DbWorkerRequest {
 	requestId: string;
 	dbPath: string;
 	params: DbReadTaskParams;
+	/** SQL trace span that issued the task; the worker attributes its SQL to a child span. */
+	traceParent?: string;
 }
 
 export interface DbWorkerShutdown {

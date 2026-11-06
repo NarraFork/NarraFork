@@ -29,6 +29,7 @@ import { cpus } from "node:os";
 import { compiledWorkerSpecifiers } from "../compiled-worker";
 import { hotOnce, hotSafe, hotTimerClear } from "../hot-safe";
 import { logger } from "../logger";
+import { currentSqlTraceSpan } from "../sql-trace";
 import {
 	DB_WORKER_PROBE_READY_TIMEOUT_MS,
 	DB_WORKER_READY_TIMEOUT_MS,
@@ -583,6 +584,7 @@ async function dispatch(
 	deadlineAt: number,
 ): Promise<unknown> {
 	const s = state();
+	const traceParent = currentSqlTraceSpan()?.id;
 
 	// Loop rather than recurse: a released waiter may still lose the race for the freed worker, and
 	// retrying must not grow the stack or reset the deadline.
@@ -682,7 +684,7 @@ async function dispatch(
 		}
 
 		try {
-			worker.worker.postMessage({ type: "task", requestId, dbPath, params });
+			worker.worker.postMessage({ type: "task", requestId, dbPath, params, traceParent });
 		} catch (err) {
 			s.pending.delete(requestId);
 			retireWorker(worker, "postMessage failed");
@@ -737,6 +739,7 @@ function runEphemeralOnSpecifier<T>(
 ): Promise<T> {
 	const requestId = `ephemeral-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
+	const traceParent = currentSqlTraceSpan()?.id;
 	return new Promise<T>((resolve, reject) => {
 		const worker = new Worker(specifier);
 		let settled = false;
@@ -785,7 +788,7 @@ function runEphemeralOnSpecifier<T>(
 				}
 				ready = true;
 				try {
-					worker.postMessage({ type: "task", requestId, dbPath, params });
+					worker.postMessage({ type: "task", requestId, dbPath, params, traceParent });
 				} catch (err) {
 					finish(err instanceof Error ? err : new Error(String(err)));
 				}
