@@ -10,6 +10,9 @@ import type {
 	OutlinePagePendingResponse,
 	OutlinePendingDecisionResponse,
 	OutlinePendingDetailResponse,
+	OutlinePlanDecisionRequest,
+	OutlinePlanDecisionResponse,
+	OutlinePlanDiffResponse,
 	OutlineQuestionGroupResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
@@ -137,6 +140,17 @@ export const outlineApi = {
 	unlockOutlineBlock: (spaceId: string, blockId: string) =>
 		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
 			method: "DELETE",
+		}),
+	/** A plan against the version it is compared with (`from`: a seq, 0 for nothing). */
+	getOutlinePlanDiff: (spaceId: string, blockId: string, from: number) =>
+		request<OutlinePlanDiffResponse>(
+			`/outline/spaces/${enc(spaceId)}/plans/${enc(blockId)}/diff?from=${from}`,
+		),
+	/** The caller's decision on a submitted plan (a waiting ExitPlanMode of an outline session). */
+	decideOutlinePlan: (requestId: string, body: OutlinePlanDecisionRequest) =>
+		request<OutlinePlanDecisionResponse>(`/narrators/permissions/${enc(requestId)}/plan`, {
+			method: "POST",
+			body: JSON.stringify(body),
 		}),
 	/** The questions under a block (or a question and its sub-questions). */
 	getOutlineQuestions: (blockId: string) =>

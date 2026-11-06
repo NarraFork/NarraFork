@@ -68,6 +68,11 @@ export interface OutlineBoardTask {
 	/** The lock on the task's tree, when this task is a locked root. */
 	lock: { by: { kind: OutlineActorKind; id: string; name: string | null } } | null;
 	/**
+	 * When this task is a plan's root (outline P2 PR 8): `planning` (not approved yet, never
+	 * executed: "计划中") or `approved`, and the versions decided so far.
+	 */
+	plan: { state: "planning" | "approved"; round: number } | null;
+	/**
 	 * An open change asking to end the task (a locked plan's root done or cancelled, D26b): the
 	 * person who locked it confirms or rejects it on the board.
 	 */

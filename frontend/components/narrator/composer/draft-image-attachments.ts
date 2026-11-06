@@ -44,8 +44,8 @@ const ACCEPTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "i
 /**
  * Largest single file mirrored into IndexedDB.
  *
- * Applies to BOTH kinds, which makes it stricter than the composer for text
- * files (`MAX_TEXT_FILE_SIZE` is 100MB). That is deliberate: a file over this
+ * Applies to BOTH kinds, which makes it far stricter than the composer for text
+ * files (`MAX_TEXT_FILE_SIZE` is 1GB). That is deliberate: a file over this
  * size stays in composer state and still sends normally — it just does not
  * survive a reload. Copying an 80MB log into browser storage to buy one refresh
  * is a bad trade, and the reload path reports what it could not restore

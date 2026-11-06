@@ -119,7 +119,9 @@
 			"edit": "编辑",
 			"revert": "撤销",
 			"import": "导入",
-			"confirm": "确认"
+			"confirm": "确认",
+			"plan": "计划决定",
+			"answer": "回答"
 		},
 		"actor": {
 			"unknown": "某人",
@@ -363,6 +365,7 @@
 			"cancelled": "取消"
 		},
 		"count": "{{count}} 项未完成",
+		"planning": "计划中",
 		"humanCreated": "人建",
 		"locked": "已锁定 · {{name}}",
 		"lockedSomeone": "已锁定",

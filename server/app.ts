@@ -53,6 +53,7 @@ import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { narratorAttachmentRoutes } from "./routes/narrator-attachments";
 import { narratorTimelineRoutes } from "./routes/narrator-timeline";
 import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
@@ -441,6 +442,10 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
 app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
+// Streaming attachment staging. Deliberately outside /api/narrators: the narrator
+// router's body limit and work-admission middleware describe buffered request
+// bodies and narrator work, neither of which an upload is.
+app.route("/api/narrator-attachments", narratorAttachmentRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);
 // Project/user trait layers. Narrator-level traits live under /api/narrators.

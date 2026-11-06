@@ -467,6 +467,11 @@ function TaskRow({
 								{t("board.humanCreated")}
 							</Badge>
 						)}
+						{task.plan?.state === "planning" && (
+							<Badge size="xs" variant="light" color="yellow" data-testid="task-badge-planning">
+								{t("board.planning")}
+							</Badge>
+						)}
 						{task.lock && (
 							<Badge
 								size="xs"

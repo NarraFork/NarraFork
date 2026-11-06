@@ -14,9 +14,8 @@
  * of step. Nothing on the read path could tell that apart from "the user closed
  * that panel", so it could not be reconciled after the fact either.
  *
- * Here, `workspace_panels` rows are the single authority and the sidebar grouping
- * is a projection this service maintains in the SAME transaction. A caller cannot
- * write one half.
+ * Here, `workspace_panels` rows are the single authority. The sidebar no longer
+ * mirrors membership at all: its folders are an independent structure.
  *
  * # Invariants
  *
@@ -45,7 +44,6 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { broadcastToUser } from "../websocket/narrator-ws";
-import { applyWorkspaceMembershipProjection } from "./recent-tabs-service";
 
 type WorkspacePanelRow = typeof workspacePanels.$inferSelect;
 
@@ -289,9 +287,20 @@ function recoverFromSplitTree(node: unknown): RecoveredPanel[] {
 	return [];
 }
 
-/** Narrator ids the sidebar records as belonging to this workspace. */
-function readProjectedNarratorIds(userId: string, workspaceId: string): string[] {
-	const rows = db
+/**
+ * Narrator ids the sidebar USED to record as belonging to this workspace.
+ *
+ * `user_recent_tabs.workspace_id` is a leftover of the time the sidebar mirrored workspace
+ * membership. It is read only by the one-time backfill below, which then clears it, so a
+ * legacy workspace recovers the narrators its old sidebar group listed exactly once.
+ */
+function readProjectedNarratorIds(
+	// biome-ignore lint/suspicious/noExplicitAny: Drizzle transaction type is private to the driver.
+	tx: any,
+	userId: string,
+	workspaceId: string,
+): string[] {
+	const rows: Array<{ narratorId: string | null }> = tx
 		.select({ narratorId: userRecentTabs.representedNarratorId })
 		.from(userRecentTabs)
 		.where(
@@ -312,14 +321,14 @@ function readProjectedNarratorIds(userId: string, workspaceId: string): string[]
 /**
  * Materialise membership rows for a workspace that has none yet.
  *
- * The source is the UNION of the layout blob and the sidebar projection, in that
- * order. The union is the point: it is the only merge that loses nothing, and it
- * is what repairs workspaces already damaged by the two-source design — a
- * narrator the sidebar knows about but the layout never received becomes a real
- * panel here, without this code having to guess whether it was "dropped" or
- * "deliberately closed".
+ * The source is the UNION of the layout blob and the legacy sidebar grouping
+ * (`user_recent_tabs.workspace_id`), in that order. The union is the only merge that
+ * loses nothing: a narrator the old sidebar listed but the layout never received
+ * becomes a real panel here.
  *
- * Runs at most once per workspace: the presence of any row disables it.
+ * The legacy grouping is consumed: it is cleared in the same transaction. Otherwise a
+ * user who later removes every panel would get them all back on the next open, because
+ * an empty workspace re-runs this backfill.
  */
 function backfillPanelsInTransaction(
 	// biome-ignore lint/suspicious/noExplicitAny: Drizzle transaction type is private to the driver.
@@ -342,12 +351,17 @@ function backfillPanelsInTransaction(
 		if (toInsert.length >= WORKSPACE_PANEL_MAX) break;
 	}
 
-	for (const narratorId of readProjectedNarratorIds(userId, workspaceId)) {
+	for (const narratorId of readProjectedNarratorIds(tx, userId, workspaceId)) {
 		if (seenNarratorIds.has(narratorId)) continue;
 		if (toInsert.length >= WORKSPACE_PANEL_MAX) break;
 		seenNarratorIds.add(narratorId);
 		toInsert.push({ kind: "narrator", narratorId, config: null });
 	}
+
+	tx.update(userRecentTabs)
+		.set({ workspaceId: null })
+		.where(and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.workspaceId, workspaceId)))
+		.run();
 
 	if (toInsert.length === 0) return;
 
@@ -366,7 +380,7 @@ function backfillPanelsInTransaction(
 		)
 		.run();
 
-	logger.info("Backfilled workspace panels from layout and sidebar projection", {
+	logger.info("Backfilled workspace panels from layout and legacy sidebar grouping", {
 		workspaceId,
 		recoveredFromLayout: recovered.length,
 		total: toInsert.length,
@@ -412,8 +426,7 @@ export async function listWorkspacePanels(
  *
  * Idempotent for narrator panels because the caller's intent ("this narrator
  * should be in this workspace") is satisfied either way, and a duplicate would
- * be rejected by the unique index anyway. The membership row and its sidebar
- * projection commit together.
+ * be rejected by the unique index anyway.
  */
 export async function addWorkspacePanel(
 	userId: string,
@@ -463,16 +476,7 @@ export async function addWorkspacePanel(
 		updatedAt: now,
 	};
 
-	if (input.kind === "narrator") {
-		// Membership row + sidebar projection in ONE transaction.
-		await applyWorkspaceMembershipProjection(userId, {
-			narratorId: input.narratorId,
-			workspaceId,
-			panelMembership: { action: "insert", row },
-		});
-	} else {
-		db.insert(workspacePanels).values(row).run();
-	}
+	db.insert(workspacePanels).values(row).run();
 
 	broadcastWorkspaceChanged(userId, workspaceId, "membership");
 
@@ -489,10 +493,8 @@ export async function addWorkspacePanel(
 }
 
 /**
- * Remove a panel and release its sidebar tab back to the top level.
- *
- * Releasing rather than deleting the tab: the narrator still exists and the user
- * may well want to keep working with it, just not inside this workspace.
+ * Remove a panel. The sidebar is independent of workspace membership (folders are their
+ * own structure), so nothing else changes.
  */
 export async function removeWorkspacePanel(
 	userId: string,
@@ -507,15 +509,7 @@ export async function removeWorkspacePanel(
 		.get();
 	if (!row) throw new NotFoundError("Workspace panel", panelId);
 
-	if (row.kind === "narrator" && row.narratorId) {
-		await applyWorkspaceMembershipProjection(userId, {
-			narratorId: row.narratorId,
-			workspaceId: null,
-			panelMembership: { action: "remove", panelId: row.id },
-		});
-	} else {
-		db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
-	}
+	db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
 	broadcastWorkspaceChanged(userId, workspaceId, "membership");
 }
 

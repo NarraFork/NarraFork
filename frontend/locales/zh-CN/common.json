@@ -303,8 +303,6 @@
 	"activeBackgroundTasks": "{{count}} 个后台任务正在运行",
 	"activeBackgroundServices": "{{count}} 个后台服务正在运行",
 	"viewersWatching": "{{count}} 人正在查看",
-	"swipePin": "置顶",
-	"swipeUnpin": "取消置顶",
 	"containerRunning": "容器运行中",
 	"containerPaused": "容器已暂停",
 	"containerStopped": "容器已停止",
@@ -799,5 +797,6 @@
 	"imageViewer_copyUnavailableDownloaded": "当前环境无法写入剪贴板，已改为下载图片",
 	"imageViewer_copyFailed": "复制图片失败",
 	"imageViewer_downloadFailed": "下载图片失败",
-	"botBadge": "Bot"
+	"botBadge": "Bot",
+	"swipeMenu": "菜单"
 }

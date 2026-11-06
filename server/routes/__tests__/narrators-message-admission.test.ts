@@ -5,6 +5,7 @@ import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { Hono } from "hono";
 import {
@@ -34,7 +35,9 @@ const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
 		section('narratorRoutes.post("/:id/messages"', "// Retry last user message"),
 	]
 		.join("\n")
-		.replaceAll("export async function", "async function"),
+		.replaceAll("export async function", "async function")
+		.replaceAll("export function", "function")
+		.replaceAll("export interface", "interface"),
 );
 
 function fixture(
@@ -109,6 +112,13 @@ function fixture(
 		MAX_MEDIA_ATTACHMENTS,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+		MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
+		// Staged attachments need a real store; these tests never send any, so the
+		// bindings only have to exist for the helper's code path to be reachable.
+		findStagedAttachment: () => null,
+		stagedAttachmentAsFile: () => {
+			throw new Error("no staged attachments in this fixture");
+		},
 		fileReferenceMessageForDisplay,
 		captureFileReferences: async (_id: string, _userId: string, refs: FileReference[]) =>
 			refs.map((reference) => ({

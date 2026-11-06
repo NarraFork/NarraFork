@@ -2,7 +2,10 @@ import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import { QueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { createRecentTabDragModel } from "../../../frontend/components/nav/recent-tab-drag-model";
+import {
+	createRecentTabDragModel,
+	type FolderViewOptions,
+} from "../../../frontend/components/nav/recent-tab-drag-model";
 import { useRecentTabsDrag } from "../../../frontend/components/nav/useRecentTabsDrag";
 import type { RecentTab } from "../../../frontend/hooks/recent-tabs-utils";
 import {
@@ -18,6 +21,7 @@ import {
 } from "../../../frontend/lib/panel-drag";
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+const folderOptions: FolderViewOptions = { displayOf: () => "expanded", defaultPreview: 3 };
 const key = recentTabsSectionQueryKey("work");
 const calls: { method: string; key?: string; target?: unknown; keys?: string[] }[] = [];
 const ends: (PanelDragState | null)[] = [];
@@ -27,7 +31,6 @@ let release: (() => void) | null = null;
 let revision = 0;
 let latest: ReturnType<typeof useRecentTabsDrag>;
 let errors = 0;
-let updateGrouping: (value: boolean) => void = () => {};
 const tab = (id: string, fields: Partial<RecentTab> = {}): RecentTab => ({
 	type: "narrator",
 	id,
@@ -36,9 +39,9 @@ const tab = (id: string, fields: Partial<RecentTab> = {}): RecentTab => ({
 	...fields,
 });
 const initial = [
-	tab("w", { type: "workspace" }),
-	tab("w1", { workspaceId: "w" }),
-	tab("w2", { workspaceId: "w" }),
+	tab("w", { type: "folder" }),
+	tab("w1", { folderId: "w" }),
+	tab("w2", { folderId: "w" }),
 	tab("a"),
 	tab("b"),
 	tab("c"),
@@ -74,28 +77,50 @@ api.moveRecentTab = async (source, target) => {
 		],
 	};
 };
-api.setRecentTabDirectoryOrder = async (keys) => {
-	calls.push({ method: "directory", keys });
+api.createRecentTabFolder = async (input) => {
+	calls.push({ method: "folder", keys: [input.targetKey, input.sourceKey] });
 	await waitIfHeld();
 	const baseRevision = revision++;
+	const items = qc.getQueryData<RecentTabsInfiniteData>(key)?.pages[0].items ?? [];
+	const find = (item: string) => {
+		const current = items.find((value) => `${value.type}:${value.id}` === item);
+		if (!current) throw new Error(`Missing tab ${item}`);
+		return current;
+	};
+	const target = find(input.targetKey);
+	const sourceTab = find(input.sourceKey);
+	const targetIndex = items.indexOf(target);
+	const before = targetIndex > 0 ? items[targetIndex - 1] : undefined;
+	const beforeKey = before ? `${before.type}:${before.id}` : null;
 	return {
 		changed: true,
 		baseRevision,
 		revision,
-		operations: keys.map((item, index) => {
-			const current = qc
-				.getQueryData<RecentTabsInfiniteData>(key)
-				?.pages[0].items.find((value) => `${value.type}:${value.id}` === item);
-			if (!current) throw new Error(`Missing directory member ${item}`);
-			return {
+		folderId: "nf",
+		operations: [
+			{
 				type: "upsert",
-				key: item,
-				tab: { ...current, dirSortOrder: index },
+				key: "folder:nf",
+				tab: { type: "folder", id: "nf", title: input.title, lastVisitedAt: 1 },
+				beforeKey: input.targetKey,
+				afterKey: beforeKey,
+			},
+			{
+				type: "upsert",
+				key: input.targetKey,
+				tab: { ...target, folderId: "nf" },
+				beforeKey: input.sourceKey,
+				afterKey: "folder:nf",
+			},
+			{
+				type: "upsert",
+				key: input.sourceKey,
+				tab: { ...sourceTab, folderId: "nf" },
 				beforeKey: null,
-				afterKey: null,
-			};
-		}),
-	} satisfies RecentTabsMutationResponse;
+				afterKey: input.targetKey,
+			},
+		],
+	} satisfies RecentTabsMutationResponse & { folderId: string };
 };
 onPanelDragEnd((state) => {
 	ends.push(state ? { ...state } : null);
@@ -113,8 +138,6 @@ function Row({ id, disabled }: { id: string; disabled: boolean }) {
 function Fixture() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const [tabs, setTabs] = useState<RecentTab[]>(initial);
-	const [groupingEnabled, setGroupingEnabled] = useState(false);
-	updateGrouping = setGroupingEnabled;
 	useEffect(
 		() =>
 			qc.getQueryCache().subscribe(() => {
@@ -127,20 +150,16 @@ function Fixture() {
 	);
 	const drag = useRecentTabsDrag({
 		tabs,
-		groupingEnabled,
-		directoryCollapsedByPath: new Map([["/repo", false]]),
+		folderOptions,
 		containerRef,
 		qc,
 		onError: () => {
 			errors++;
 		},
+		newFolderTitle: "New folder",
 	});
 	latest = drag;
-	const model = createRecentTabDragModel(
-		drag.renderTabs,
-		groupingEnabled,
-		new Map([["/repo", false]]),
-	);
+	const model = createRecentTabDragModel(drag.renderTabs, folderOptions);
 	return (
 		<DndContext
 			sensors={drag.sensors}
@@ -153,14 +172,17 @@ function Fixture() {
 			<nav data-auto-scroll-gate>
 				<div id="sidebar" ref={containerRef}>
 					{model.rows.map((row) => {
-						const id =
-							row.kind === "directory" ? `dir:${row.path}` : `${row.tab.type}:${row.tab.id}`;
+						const id = `${row.tab.type}:${row.tab.id}`;
 						return (
-							<div key={id} data-unit={row.kind === "directory" ? row.path : row.tab.id}>
+							<div key={id} data-unit={row.tab.id}>
 								<Row id={id} disabled={drag.pending} />
-								{row.kind !== "tab" &&
-									row.children.map((child) => (
-										<Row key={child.id} id={`${child.type}:${child.id}`} disabled={drag.pending} />
+								{row.kind === "folder" &&
+									row.members.map((member) => (
+										<Row
+											key={member.id}
+											id={`${member.type}:${member.id}`}
+											disabled={drag.pending}
+										/>
 									))}
 							</div>
 						);
@@ -207,8 +229,7 @@ export function setTabs(tabs: RecentTab[]) {
 		pageParams: [undefined],
 	});
 }
-export function directoryFixture() {
-	updateGrouping(true);
-	setTabs([tab("a", { subtitle: "/repo" }), tab("b", { subtitle: "/repo" }), tab("c")]);
+export function plainFixture() {
+	setTabs([tab("a"), tab("b"), tab("c")]);
 }
 createRoot(document.getElementById("root") as HTMLElement).render(<Fixture />);

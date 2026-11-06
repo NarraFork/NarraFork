@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
@@ -52,7 +52,9 @@ const {
 	resolveRequestedAttachmentKeys,
 	interruptAndWaitForIdle,
 } = await import("../narrator-session");
-const { setUploadsDirForTests } = await import("../../lib/uploads");
+const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
+	"../../lib/uploads"
+);
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -350,21 +352,76 @@ describe("editAndRegenerate native media history", () => {
 			"Combined attachments exceed the 128 MiB limit",
 		);
 	});
+	test("a large retained text file does not consume the inline media budget", async () => {
+		// Text files reach the model as paths, media as inline base64. A retained
+		// 200 MiB text attachment must not push a small new media file over the
+		// 128 MiB inline budget, though both still count toward the 2 GiB total.
+		const textPath = join(cwd, "big.log");
+		writeFileSync(textPath, "");
+		truncateSync(textPath, 200 * 1024 * 1024);
+		seed(cwd, [
+			{
+				type: "text_file",
+				fileId: "big",
+				filename: "big.log",
+				size: 200 * 1024 * 1024,
+				filePath: textPath,
+			},
+			{ type: "text", text: "before" },
+		]);
+		expect(
+			await editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				keepTextFilePaths: [textPath],
+				newMedia: [wavFile("added.wav")],
+			}),
+		).toMatchObject({ ok: true });
+		expect((await blocks()).filter(isMediaContentBlock)).toMatchObject([{ filename: "added.wav" }]);
+	});
+	test("retained images and media still share the 128 MiB inline budget", async () => {
+		// The counterpart of the test above: splitting the budgets must not let
+		// inline attachments escape the 128 MiB limit. Both are sparse-truncated to
+		// stay cheap; the check reads stat sizes before anything is copied.
+		const media = await saveUploadedMedia("n1", wavFile());
+		const mediaPath = getMediaPath("n1", media.mediaId);
+		if (!mediaPath) throw new Error("Missing media");
+		truncateSync(mediaPath, 70 * 1024 * 1024);
+		const image = await saveUploadedImage("n1", createPngFile("kept.png", 1, 1));
+		const imagePath = getImagePath("n1", image.imageId);
+		if (!imagePath) throw new Error("Missing image");
+		truncateSync(imagePath, 70 * 1024 * 1024);
+		seed(cwd, [
+			{ ...mediaRefToContentBlock(media) },
+			{ type: "image", imageId: image.imageId, filename: "kept.png", mediaType: "image/png" },
+			{ type: "text", text: "before" },
+		]);
+		const before = await blocks();
+		await expect(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).rejects.toThrow(
+			"Combined attachments exceed the 128 MiB limit",
+		);
+		expect(await blocks()).toEqual(before);
+	});
 	test("a later attachment write failure rolls back newly uploaded media and keeps old history", async () => {
 		seed(cwd, [{ type: "text", text: "before" }]);
 		const failing = new File(["text"], "fail.txt", { type: "text/plain" });
-		Object.defineProperty(failing, "arrayBuffer", {
-			value: async () => {
-				throw new Error("media rollback");
-			},
+		// Text attachments are written with `Bun.write(path, file)` (streamed, never
+		// `arrayBuffer()`), so the failure is injected at that write.
+		const realWrite = Bun.write;
+		const write = spyOn(Bun, "write").mockImplementation(async (...args) => {
+			if (args[1] === failing) throw new Error("media rollback");
+			return Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>;
 		});
-		await expect(
-			editAndRegenerate("n1", "m1", "after", "en", false, {
-				...editOptions,
-				newMedia: [wavFile()],
-				newTextFiles: [failing],
-			}),
-		).rejects.toThrow("media rollback");
+		try {
+			await expect(
+				editAndRegenerate("n1", "m1", "after", "en", false, {
+					...editOptions,
+					newMedia: [wavFile()],
+					newTextFiles: [failing],
+				}),
+			).rejects.toThrow("media rollback");
+		} finally {
+			write.mockRestore();
+		}
 		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual([]);
 		expect(await blocks()).toEqual([{ type: "text", text: "before" }]);
 	});
@@ -506,26 +563,42 @@ describe("editAndRegenerate text_file management", () => {
 		const image = createPngFile("new.png", 1, 1);
 		const firstText = new File(["created"], "created.txt", { type: "text/plain" });
 		const failingText = new File(["fail"], "fail.txt", { type: "text/plain" });
-		Object.defineProperty(failingText, "arrayBuffer", {
-			value: async () => {
+		const realWrite = Bun.write;
+		let earlierWriteCompleted = false;
+		let failingWriteEntered = false;
+		const write = spyOn(Bun, "write").mockImplementation(async (...args) => {
+			if (args[1] === failingText) {
+				failingWriteEntered = true;
+				expect(earlierWriteCompleted).toBe(true);
 				throw new Error("synthetic write failure");
-			},
+			}
+			const result = await (Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>);
+			if (args[1] === firstText) {
+				if (typeof args[0] !== "string") throw new Error("Expected attachment path");
+				expect(readFileSync(args[0], "utf8")).toBe("created");
+				earlierWriteCompleted = true;
+			}
+			return result;
 		});
-
-		await expect(
-			editAndRegenerate("n1", "m1", "new", "en", false, {
-				userId: "attachment-user",
-				revertFiles: false,
-				keepImageIds: [],
-				keepTextFilePaths: [],
-				newImages: [image],
-				newTextFiles: [firstText, failingText],
-			}),
-		).rejects.toThrow("synthetic write failure");
-		const imageDir = join(uploadsRoot, "n1");
-		expect(existsSync(imageDir) ? readdirSync(imageDir) : []).toHaveLength(0);
-		const attachedDir = join(cwd, ".narrafork", "attached");
-		expect(existsSync(attachedDir) ? readdirSync(attachedDir) : []).toHaveLength(0);
+		try {
+			await expect(
+				editAndRegenerate("n1", "m1", "new", "en", false, {
+					userId: "attachment-user",
+					revertFiles: false,
+					keepImageIds: [],
+					keepTextFilePaths: [],
+					newImages: [image],
+					newTextFiles: [firstText, failingText],
+				}),
+			).rejects.toThrow("synthetic write failure");
+			expect(failingWriteEntered).toBe(true);
+			const imageDir = join(uploadsRoot, "n1");
+			expect(existsSync(imageDir) ? readdirSync(imageDir) : []).toHaveLength(0);
+			const attachedDir = join(cwd, ".narrafork", "attached");
+			expect(existsSync(attachedDir) ? readdirSync(attachedDir) : []).toHaveLength(0);
+		} finally {
+			write.mockRestore();
+		}
 	});
 
 	test("serializes concurrent edits before materializing the second upload", async () => {
@@ -543,42 +616,69 @@ describe("editAndRegenerate text_file management", () => {
 			markSecondEntered = resolve;
 		});
 		const firstFile = new File(["first"], "first.txt", { type: "text/plain" });
-		Object.defineProperty(firstFile, "arrayBuffer", {
-			value: async () => {
+		const secondFile = new File(["second"], "second.txt", { type: "text/plain" });
+		const realWrite = Bun.write;
+		const writes: string[] = [];
+		const write = spyOn(Bun, "write").mockImplementation(async (...args) => {
+			if (args[1] === firstFile) {
+				writes.push("first entered");
 				markFirstEntered();
 				await firstGate;
-				return new TextEncoder().encode("first").buffer;
-			},
-		});
-		const secondFile = new File(["second"], "second.txt", { type: "text/plain" });
-		Object.defineProperty(secondFile, "arrayBuffer", {
-			value: async () => {
+			}
+			if (args[1] === secondFile) {
+				writes.push("second entered");
 				markSecondEntered();
-				return new TextEncoder().encode("second").buffer;
-			},
+			}
+			const result = await (Reflect.apply(realWrite, Bun, args) as ReturnType<typeof Bun.write>);
+			if (args[1] === firstFile || args[1] === secondFile) {
+				const text = args[1] === firstFile ? "first" : "second";
+				if (typeof args[0] !== "string") throw new Error("Expected attachment path");
+				expect(readFileSync(args[0], "utf8")).toBe(text);
+				writes.push(`${text} written`);
+			}
+			return result;
 		});
-
-		const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, {
-			userId: "attachment-user",
-			revertFiles: false,
-			keepTextFilePaths: [],
-			newTextFiles: [firstFile],
-		});
-		await firstEntered;
-		const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, {
-			userId: "attachment-user",
-			revertFiles: false,
-			keepTextFilePaths: [],
-			newTextFiles: [secondFile],
-		});
-		const secondStartedBeforeRelease = await Promise.race([
-			secondEntered.then(() => true),
-			new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 30)),
-		]);
-		releaseFirst();
-		await Promise.allSettled([firstEdit, secondEdit]);
-
-		expect(secondStartedBeforeRelease).toBe(false);
+		const pending: Promise<unknown>[] = [];
+		try {
+			// Keep regeneration out of this lock test: a running first turn would
+			// reject the second edit before it ever reaches attachment materialization.
+			const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, {
+				userId: "attachment-user",
+				deferContinuation: true,
+				revertFiles: false,
+				keepTextFilePaths: [],
+				newTextFiles: [firstFile],
+			});
+			pending.push(firstEdit);
+			await firstEntered;
+			const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, {
+				userId: "attachment-user",
+				deferContinuation: true,
+				revertFiles: false,
+				keepTextFilePaths: [],
+				newTextFiles: [secondFile],
+			});
+			pending.push(secondEdit);
+			const secondStartedBeforeRelease = await Promise.race([
+				secondEntered.then(() => true),
+				new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 30)),
+			]);
+			expect(secondStartedBeforeRelease).toBe(false);
+			expect(writes).toEqual(["first entered"]);
+			releaseFirst();
+			const results = await Promise.allSettled(pending);
+			expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+			expect(writes).toEqual([
+				"first entered",
+				"first written",
+				"second entered",
+				"second written",
+			]);
+		} finally {
+			releaseFirst();
+			await Promise.allSettled(pending);
+			write.mockRestore();
+		}
 	});
 
 	test("copies a shared modern text attachment into the editing narrator cwd", async () => {
@@ -625,14 +725,21 @@ describe("editAndRegenerate text_file management", () => {
 		expect(readFileSync(String(copied?.filePath), "utf8")).toBe("shared content");
 	});
 
-	test("counts copied source bytes against the 128 MiB materialization limit", async () => {
+	test("counts copied source bytes against the 2 GiB materialization limit", async () => {
 		const parentCwd = mkdtempSync(join(tmpdir(), "nf-edit-large-parent-"));
 		const childCwd = mkdtempSync(join(tmpdir(), "nf-edit-large-child-"));
 		const sourcePath = join(parentCwd, "large.bin");
 		writeFileSync(sourcePath, "");
-		truncateSync(sourcePath, 129 * 1024 * 1024);
+		// Sparse on purpose: the ceiling is checked from the recorded sizes BEFORE
+		// anything is copied, so the test must not pay 2 GiB of real writes.
+		truncateSync(sourcePath, 2 * 1024 * 1024 * 1024 + 1);
 		seed(childCwd, [
-			{ type: "text_file", filename: "large.bin", size: 1, filePath: sourcePath },
+			{
+				type: "text_file",
+				filename: "large.bin",
+				size: 2 * 1024 * 1024 * 1024 + 1,
+				filePath: sourcePath,
+			},
 			{ type: "text", text: "old" },
 		]);
 		await expect(
@@ -641,7 +748,7 @@ describe("editAndRegenerate text_file management", () => {
 				revertFiles: false,
 				keepTextFilePaths: [sourcePath],
 			}),
-		).rejects.toThrow("attachments exceed the 128 MiB limit");
+		).rejects.toThrow("attachments exceed the 2 GiB limit");
 		expect(existsSync(join(childCwd, ".narrafork"))).toBe(false);
 	});
 });

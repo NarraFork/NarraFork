@@ -29,31 +29,32 @@ import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
 export const SWIPE_THRESHOLD = 80;
 
 /** What releasing a horizontal swipe at `swipeX` should do. */
-export type SwipeRelease = "close" | "pin" | "cancel";
+export type SwipeRelease = "close" | "menu" | "cancel";
 
 /**
  * Decide the outcome of a released horizontal swipe on a tab row.
  *
  * Extracted from the component because the two directions mean very different things —
- * right REMOVES the tab, left only reorders it — and a sign error would silently turn a
- * pin gesture into a close. Both thresholds are symmetric, but the asymmetric
- * consequences are why this is worth a test rather than an inline comparison.
+ * right REMOVES the tab, left only opens its menu — and a sign error would silently turn
+ * a menu gesture into a close.
+ *
+ * Left opens the row's context menu because touch has no right-click: long-press is the
+ * drag gesture, so the platform `contextmenu` it fires is suppressed by the row.
  */
-export function classifySwipeRelease(swipeX: number, canPin: boolean): SwipeRelease {
+export function classifySwipeRelease(swipeX: number, canMenu: boolean): SwipeRelease {
 	if (swipeX > SWIPE_THRESHOLD) return "close";
-	if (canPin && swipeX < -SWIPE_THRESHOLD) return "pin";
+	if (canMenu && swipeX < -SWIPE_THRESHOLD) return "menu";
 	return "cancel";
 }
 
 /**
  * Clamp a swipe's live travel.
  *
- * Left travel is suppressed entirely when the row cannot be pinned: a row that slides
- * open, shows nothing, and springs back reads as a broken gesture rather than an absent
- * one.
+ * Left travel is suppressed entirely when the row has no menu: a row that slides open,
+ * shows nothing, and springs back reads as a broken gesture rather than an absent one.
  */
-export function clampSwipeTravel(dx: number, canPin: boolean): number {
-	return canPin ? dx : Math.max(0, dx);
+export function clampSwipeTravel(dx: number, canMenu: boolean): number {
+	return canMenu ? dx : Math.max(0, dx);
 }
 
 /**
@@ -86,9 +87,8 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "project") {
 		return pathname === `/projects/${tab.id}`;
 	}
-	if (tab.type === "workspace") {
-		return pathname === `/narrators/workspace/${tab.id}`;
-	}
+	// A folder is not a page.
+	if (tab.type === "folder") return false;
 	// narrator and subagent both route to /narrators/:id
 	return pathname === `/narrators/${tab.id}`;
 }

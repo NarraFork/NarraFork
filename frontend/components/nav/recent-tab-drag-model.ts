@@ -1,120 +1,142 @@
-import {
-	applyDirectoryMemberOrder,
-	directoryRowId,
-	directoryRowKeyBlock,
-	groupRecentTabsByDirectory,
-	type RecentTabRow,
-} from "../../hooks/recent-tab-directory-groups";
-import type { RecentTab } from "../../hooks/recent-tabs-utils";
-import {
-	applyRecentTabMove,
-	computeRecentTabOrderMoves,
-	type RecentTabOrderMove,
-} from "../../hooks/useRecentTabs";
-import type { RecentTabDropRow, RecentTabDropTarget } from "./recent-tab-drop-target";
+/**
+ * The sidebar's drag model: which rows exist, what each one is, and what a drop does.
+ *
+ * Built once per source update (never per pointer frame). Rendering, hit testing and the
+ * persisted mutation all read the same model, so what the user sees highlighted is what
+ * the server is asked to do.
+ */
 
-export const recentTabDragKey = (tab: RecentTab) => `${tab.type}:${tab.id}`;
+import {
+	applyRecentTabFolderCreate,
+	applyRecentTabMove,
+	canJoinFolder,
+	isFolderTab,
+	recentTabKey,
+	regroupFolders,
+} from "@shared/recent-tab-layout";
+import {
+	type FolderDisplay,
+	groupRecentTabRows,
+	type RecentTabRow,
+} from "../../hooks/recent-tab-folders";
+import type { RecentTab } from "../../hooks/recent-tabs-utils";
+import type { RecentTabMoveTarget } from "../../lib/api/settings";
+import type {
+	RecentTabDropRow,
+	RecentTabDropSource,
+	RecentTabDropTarget,
+} from "./recent-tab-drop-target";
+
+export type { FolderDisplay } from "../../hooks/recent-tab-folders";
+
+export interface FolderView {
+	display: FolderDisplay;
+	/** Members rendered under the header (pinned first, then the preview window). */
+	visible: RecentTab[];
+	/** Members hidden by the preview limit. */
+	hidden: RecentTab[];
+}
+
 export interface RecentTabDragEntry {
 	key: string;
-	unit: string;
+	kind: "tab" | "folder" | "member";
 	pinned: boolean;
-	workspaceId?: string;
-	role: "unit" | "workspace-member" | "directory-member";
-	keyBlock: string[];
-	tab?: RecentTab;
-}
-export interface RecentTabDragModel {
-	tabs: RecentTab[];
-	groupingEnabled: boolean;
-	rows: RecentTabRow[];
-	entries: Map<string, RecentTabDragEntry>;
-	topLevel: RecentTab[];
-	childrenByWorkspace: Map<string, RecentTab[]>;
-	pinnedItems: RecentTab[];
-	unpinnedItems: RecentTab[];
-	directoryRows: RecentTabRow[];
+	memberPinned?: boolean;
+	folderId?: string;
+	tab: RecentTab;
 }
 
-/** Build once per source update, never once per pointer frame. Pinned directories stay flat. */
+export interface RecentTabDragModel {
+	tabs: RecentTab[];
+	rows: RecentTabRow[];
+	pinnedRows: RecentTabRow[];
+	unpinnedRows: RecentTabRow[];
+	folderViews: Map<string, FolderView>;
+	/** Every RENDERED row by key (hidden folder members are absent). */
+	entries: Map<string, RecentTabDragEntry>;
+}
+
+export interface FolderViewOptions {
+	/** Explicit per-folder display chosen by the user (absent = default). */
+	displayOf: (folderId: string) => FolderDisplay | undefined;
+	/** Preview count when the folder has none of its own. */
+	defaultPreview: number;
+	/** A member that must stay visible even when the preview would hide it (the open page). */
+	isForcedVisible?: (tab: RecentTab) => boolean;
+	/** Overrides the stored preview count (a strip being dragged previews its new count). */
+	previewCountOf?: (folderId: string) => number | undefined;
+}
+
+export function folderView(
+	folder: RecentTab,
+	members: RecentTab[],
+	options: FolderViewOptions,
+): FolderView {
+	const display = options.displayOf(folder.id) ?? "preview";
+	if (display === "collapsed") return { display, visible: [], hidden: members };
+	if (display === "expanded") return { display, visible: members, hidden: [] };
+	const count = Math.max(
+		0,
+		options.previewCountOf?.(folder.id) ?? folder.folderPreviewCount ?? options.defaultPreview,
+	);
+	const visible: RecentTab[] = [];
+	const hidden: RecentTab[] = [];
+	members.forEach((member, index) => {
+		if (index < count || options.isForcedVisible?.(member)) visible.push(member);
+		else hidden.push(member);
+	});
+	return { display, visible, hidden };
+}
+
 export function createRecentTabDragModel(
 	tabs: RecentTab[],
-	groupingEnabled: boolean,
-	directoryCollapsedByPath: ReadonlyMap<string, boolean>,
+	options: FolderViewOptions,
 ): RecentTabDragModel {
-	const children = new Map<string, RecentTab[]>();
-	const top: RecentTab[] = [];
-	for (const tab of tabs) {
-		if (!tab.workspaceId) top.push(tab);
-		else {
-			const members = children.get(tab.workspaceId) ?? [];
-			members.push(tab);
-			children.set(tab.workspaceId, members);
-		}
-	}
-	const plain = (tab: RecentTab): RecentTabRow =>
-		tab.type === "workspace"
-			? { kind: "workspace", tab, children: children.get(tab.id) ?? [] }
-			: { kind: "tab", tab };
-	const pinnedRows = top.filter((tab) => tab.pinned).map(plain);
-	const unpinnedRows = groupingEnabled
-		? groupRecentTabsByDirectory(
-				top.filter((tab) => !tab.pinned),
-				children,
-			)
-		: top.filter((tab) => !tab.pinned).map(plain);
-	const rows = [...pinnedRows, ...unpinnedRows];
+	const rows = groupRecentTabRows(tabs);
+	const folderViews = new Map<string, FolderView>();
 	const entries = new Map<string, RecentTabDragEntry>();
 	for (const row of rows) {
-		const unit = row.kind === "directory" ? directoryRowId(row.path) : recentTabDragKey(row.tab);
-		const block = directoryRowKeyBlock(row);
-		const pinned = row.kind !== "directory" && !!row.tab.pinned;
-		const workspaceId = row.kind === "workspace" ? row.tab.id : undefined;
-		entries.set(unit, {
-			key: unit,
-			unit,
-			pinned,
-			workspaceId,
-			role: "unit",
-			keyBlock: block,
-			tab: row.kind === "directory" ? undefined : row.tab,
-		});
-		if (row.kind === "tab") continue;
-		if (row.kind === "directory" && (directoryCollapsedByPath.get(row.path) ?? true)) continue;
-		for (const tab of row.children) {
-			const key = recentTabDragKey(tab);
-			entries.set(key, {
-				key,
-				unit,
+		const pinned = !!row.tab.pinned;
+		if (row.kind === "tab") {
+			entries.set(recentTabKey(row.tab), {
+				key: recentTabKey(row.tab),
+				kind: "tab",
 				pinned,
-				workspaceId,
-				tab,
-				keyBlock: block,
-				role: row.kind === "directory" ? "directory-member" : "workspace-member",
+				tab: row.tab,
+			});
+			continue;
+		}
+		const view = folderView(row.tab, row.members, options);
+		folderViews.set(row.tab.id, view);
+		entries.set(recentTabKey(row.tab), {
+			key: recentTabKey(row.tab),
+			kind: "folder",
+			pinned,
+			folderId: row.tab.id,
+			tab: row.tab,
+		});
+		for (const member of view.visible) {
+			entries.set(recentTabKey(member), {
+				key: recentTabKey(member),
+				kind: "member",
+				pinned,
+				memberPinned: !!member.pinned,
+				folderId: row.tab.id,
+				tab: member,
 			});
 		}
 	}
-	const flatten = (units: RecentTabRow[]) =>
-		units.flatMap((row) =>
-			row.kind === "tab"
-				? [row.tab]
-				: row.kind === "workspace"
-					? [row.tab, ...row.children]
-					: row.children,
-		);
 	return {
 		tabs,
-		groupingEnabled,
 		rows,
+		pinnedRows: rows.filter((row) => row.tab.pinned),
+		unpinnedRows: rows.filter((row) => !row.tab.pinned),
+		folderViews,
 		entries,
-		topLevel: top,
-		childrenByWorkspace: children,
-		pinnedItems: flatten(pinnedRows),
-		unpinnedItems: flatten(unpinnedRows),
-		directoryRows: unpinnedRows,
 	};
 }
 
-/** The same block metadata supports external drops; member sorting narrows it below. */
+/** Convert a measured element into a hit-test row, or null when it is not a model row. */
 export function recentTabDragMeasuredRow(
 	model: RecentTabDragModel,
 	key: string,
@@ -127,169 +149,137 @@ export function recentTabDragMeasuredRow(
 		key,
 		top,
 		bottom,
+		kind: entry.kind,
 		pinned: entry.pinned,
-		workspaceId: entry.workspaceId,
-		keyBlock: entry.keyBlock,
+		...(entry.memberPinned !== undefined ? { memberPinned: entry.memberPinned } : {}),
+		...(entry.folderId ? { folderId: entry.folderId } : {}),
+		canNest: canJoinFolder(entry.tab),
 	};
 }
 
-export function recentTabDragIndicatorRows(
+export function recentTabDragSource(
 	model: RecentTabDragModel,
-	sourceKey: string,
-	rows: RecentTabDropRow[],
-): RecentTabDropRow[] {
-	const source = model.entries.get(sourceKey);
-	if (!source) return [];
-	return rows.flatMap((row) => {
-		const entry = model.entries.get(row.key);
-		if (!entry || entry.pinned !== source.pinned) return [];
-		if (source.role !== "unit") {
-			if (entry.unit !== source.unit) return [];
-			if (source.role === "directory-member" && entry.role === "unit") {
-				return [{ ...row, keyBlock: [source.keyBlock[0]] }];
-			}
-			if (entry.role !== source.role) return [];
-			if (source.role === "workspace-member" && model.groupingEnabled) return [];
-			return [{ ...row, keyBlock: [row.key] }];
-		}
-		return [row];
-	});
+	key: string,
+): RecentTabDropSource | null {
+	const entry = model.entries.get(key);
+	if (!entry) return null;
+	return {
+		key,
+		kind: entry.kind,
+		pinned: entry.kind === "member" ? false : entry.pinned,
+		...(entry.folderId ? { folderId: entry.folderId } : {}),
+		canNest: canJoinFolder(entry.tab),
+	};
 }
 
-/** Resolve whole units using the centre of their entire visible geometry, not travel direction. */
-export function resolveRecentTabInternalDrop(
-	model: RecentTabDragModel,
-	sourceKey: string,
-	rows: RecentTabDropRow[],
-	pointer: { x: number; y: number },
-	container: { left: number; right: number; top: number; bottom: number },
-): RecentTabDropTarget | null {
-	if (
-		pointer.x < container.left ||
-		pointer.x > container.right ||
-		pointer.y < container.top ||
-		pointer.y > container.bottom
-	)
-		return null;
-	const source = model.entries.get(sourceKey);
-	if (!source) return null;
-	const eligible = recentTabDragIndicatorRows(model, sourceKey, rows);
-	// Do not snap from the opposite pinned region or from empty/outside geometry.
-	const hovered = rows.find((row) => pointer.y >= row.top && pointer.y < row.bottom);
-	if (hovered && !eligible.some((row) => row.key === hovered.key)) return null;
-	if (hovered?.key === source.unit && source.role === "directory-member") {
-		return source.keyBlock[0] === source.key ? null : { kind: "before", key: source.keyBlock[0] };
-	}
-	if (!eligible.length) return null;
-	const units = new Map<string, RecentTabDropRow[]>();
-	for (const row of eligible) {
-		const unit = source.role === "unit" ? (model.entries.get(row.key)?.unit ?? row.key) : row.key;
-		units.set(unit, [...(units.get(unit) ?? []), row]);
-	}
-	for (const [unit, group] of units) {
-		const top = Math.min(...group.map((row) => row.top));
-		const bottom = Math.max(...group.map((row) => row.bottom));
-		if (pointer.y < bottom) {
-			if (unit === (source.role === "unit" ? source.unit : source.key)) return null;
-			const before = pointer.y < (top + bottom) / 2;
-			return {
-				kind: before ? "before" : "after",
-				key: before ? group[0].keyBlock[0] : (group.at(-1)?.keyBlock.at(-1) ?? unit),
-			};
-		}
-	}
-	const last = eligible.at(-1);
-	if (!last || last.keyBlock.includes(sourceKey)) return null;
-	return { kind: "after", key: last.keyBlock.at(-1) ?? last.key };
-}
+/** The server call a drop resolves to, plus the order to show optimistically meanwhile. */
+export type RecentTabDragPlan =
+	| { kind: "move"; key: string; target: RecentTabMoveTarget; finalTabs: RecentTab[] }
+	| { kind: "merge"; targetKey: string; sourceKey: string; finalTabs: RecentTab[] };
 
-export interface RecentTabDragPlan {
-	moves: RecentTabOrderMove[];
-	directoryKeys?: string[];
-	finalTabs: RecentTab[];
-}
+/** Id of the stand-in folder shown while a merge is in flight; never sent to the server. */
+export const PENDING_FOLDER_ID = "__pending__";
 
-export function planRecentTabInternalDrop(
+/** Translate a resolved target into a mutation. Null means the drop changes nothing. */
+export function planRecentTabDrop(
 	model: RecentTabDragModel,
 	sourceKey: string,
 	target: RecentTabDropTarget,
+	newFolderTitle = "",
 ): RecentTabDragPlan | null {
-	if (target.kind !== "before" && target.kind !== "after") return null;
-	const source = model.entries.get(sourceKey);
-	const anchorRow = model.rows.find((row) => directoryRowKeyBlock(row).includes(target.key));
-	const anchor =
-		model.entries.get(target.key) ??
-		(anchorRow
-			? model.entries.get(
-					anchorRow.kind === "directory"
-						? directoryRowId(anchorRow.path)
-						: recentTabDragKey(anchorRow.tab),
-				)
-			: undefined);
-	if (!source || !anchor || sourceKey === target.key || source.pinned !== anchor.pinned)
-		return null;
-	const move = {
-		key: sourceKey,
-		...(target.kind === "before" ? { beforeKey: target.key } : { afterKey: target.key }),
-	};
-	if (source.role !== "unit") {
-		if (source.unit !== anchor.unit || source.role !== anchor.role) return null;
-		if (source.role === "workspace-member") {
-			if (model.groupingEnabled) return null;
-			return { moves: [move], finalTabs: applyRecentTabMove(model.tabs, sourceKey, move) };
-		}
-		const keys = source.keyBlock.filter((key) => key !== sourceKey);
-		const index = keys.indexOf(target.key);
-		if (index < 0) return null;
-		keys.splice(index + (target.kind === "after" ? 1 : 0), 0, sourceKey);
-		return {
-			moves: [],
-			directoryKeys: keys,
-			finalTabs: applyDirectoryMemberOrder(model.tabs, keys),
-		};
+	const source = model.tabs.find((tab) => recentTabKey(tab) === sourceKey);
+	if (!source || target.kind === "empty") return null;
+	if (target.kind === "merge") {
+		if (target.key === sourceKey) return null;
+		const finalTabs = applyRecentTabMerge(model.tabs, target.key, sourceKey, newFolderTitle);
+		return finalTabs ? { kind: "merge", targetKey: target.key, sourceKey, finalTabs } : null;
 	}
-	if (source.unit === anchor.unit) return null;
-	const nextRows = model.rows.filter(
-		(row) =>
-			(row.kind === "directory" ? directoryRowId(row.path) : recentTabDragKey(row.tab)) !==
-			source.unit,
-	);
-	const moved = model.rows.find(
-		(row) =>
-			(row.kind === "directory" ? directoryRowId(row.path) : recentTabDragKey(row.tab)) ===
-			source.unit,
-	);
-	const index = nextRows.findIndex((row) => directoryRowKeyBlock(row).includes(target.key));
-	if (!moved || index < 0) return null;
-	nextRows.splice(index + (target.kind === "after" ? 1 : 0), 0, moved);
-	// Flat mode can move a workspace as one original flat unit (server expands its group).
-	if (!model.groupingEnabled)
-		return { moves: [move], finalTabs: applyRecentTabMove(model.tabs, sourceKey, move) };
-	return computeRecentTabOrderMoves(model.tabs, nextRows.map(directoryRowKeyBlock));
+
+	let moveTarget: RecentTabMoveTarget;
+	switch (target.kind) {
+		case "into-folder":
+			if (source.folderId === target.folderId) return null;
+			moveTarget = { folderId: target.folderId };
+			break;
+		case "member-before":
+			moveTarget = { beforeKey: target.key, folderId: target.folderId };
+			break;
+		case "member-after":
+			moveTarget = { afterKey: target.key, folderId: target.folderId };
+			break;
+		case "before":
+			moveTarget = { beforeKey: target.key, ...(isFolderTab(source) ? {} : { folderId: null }) };
+			break;
+		case "after":
+			moveTarget = { afterKey: target.key, ...(isFolderTab(source) ? {} : { folderId: null }) };
+			break;
+	}
+	// Only send `folderId: null` for a tab that actually leaves a folder; a top-level move
+	// stays the plain before/after primitive.
+	if (moveTarget.folderId === null && !source.folderId) delete moveTarget.folderId;
+	const finalTabs = applyRecentTabMove(model.tabs, sourceKey, moveTarget);
+	if (finalTabs === model.tabs || sameOrder(finalTabs, model.tabs)) return null;
+	return { kind: "move", key: sourceKey, target: moveTarget, finalTabs };
 }
 
-/** Only order and explicitly changed directory positions mask the latest WS data. */
+/**
+ * What the list looks like right after a merge, before the server answers: a stand-in
+ * folder at the target's slot holding [target, source]. Mirrors `createRecentTabFolder`.
+ * The server's delta replaces the stand-in with the real folder when it lands.
+ */
+function applyRecentTabMerge(
+	tabs: RecentTab[],
+	targetKey: string,
+	sourceKey: string,
+	title: string,
+): RecentTab[] | null {
+	return applyRecentTabFolderCreate(tabs, targetKey, sourceKey, {
+		type: "folder",
+		id: PENDING_FOLDER_ID,
+		title,
+		lastVisitedAt: Date.now(),
+	});
+}
+
+function sameOrder(left: RecentTab[], right: RecentTab[]): boolean {
+	return (
+		left.length === right.length &&
+		left.every(
+			(tab, index) =>
+				recentTabKey(tab) === recentTabKey(right[index]) &&
+				tab.folderId === right[index].folderId &&
+				!!tab.pinned === !!right[index].pinned,
+		)
+	);
+}
+
+/**
+ * While a submission is in flight, show the optimistic order but keep the latest
+ * WS-delivered content (status, title) for each tab.
+ */
 export function projectRecentTabDragOrder(
 	latest: RecentTab[],
 	optimistic: RecentTab[] | null,
-	directoryKeys?: ReadonlySet<string>,
 ): RecentTab[] {
 	if (!optimistic) return latest;
-	const positions = new Map(optimistic.map((tab, index) => [recentTabDragKey(tab), index]));
-	const orders = new Map(optimistic.map((tab) => [recentTabDragKey(tab), tab.dirSortOrder]));
-	const existing = latest
-		.filter((tab) => positions.has(recentTabDragKey(tab)))
-		.sort(
-			(a, b) =>
-				(positions.get(recentTabDragKey(a)) ?? 0) - (positions.get(recentTabDragKey(b)) ?? 0),
+	const latestByKey = new Map(latest.map((tab) => [recentTabKey(tab), tab]));
+	const projected: RecentTab[] = [];
+	for (const tab of optimistic) {
+		// The stand-in folder of an in-flight merge exists only locally.
+		if (isFolderTab(tab) && tab.id === PENDING_FOLDER_ID) {
+			projected.push(tab);
+			continue;
+		}
+		const current = latestByKey.get(recentTabKey(tab));
+		if (!current) continue;
+		latestByKey.delete(recentTabKey(tab));
+		projected.push(
+			current.folderId === tab.folderId && !!current.pinned === !!tab.pinned
+				? current
+				: { ...current, folderId: tab.folderId, pinned: tab.pinned },
 		);
-	let index = 0;
-	return latest.map((tab) => {
-		if (!positions.has(recentTabDragKey(tab))) return tab;
-		const current = existing[index++];
-		const key = recentTabDragKey(current);
-		const dirSortOrder =
-			!directoryKeys || directoryKeys.has(key) ? orders.get(key) : current.dirSortOrder;
-		return dirSortOrder === current.dirSortOrder ? current : { ...current, dirSortOrder };
-	});
+	}
+	// Tabs that appeared mid-flight are appended, then pulled under their folder headers.
+	projected.push(...latestByKey.values());
+	return regroupFolders(projected);
 }

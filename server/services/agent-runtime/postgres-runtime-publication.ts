@@ -737,7 +737,11 @@ export function createPostgresRuntimePublication(
 			return runComposite("publication.startRun", async (tx) => {
 				const recipientId = input.binding.deliverTo?.narratorId;
 				let resumeRunId = input.resumeRunId;
-				if (input.taskRow && recipientId && resumeRunId === undefined) {
+				if (
+					(input.taskRow || input.adoptRegisteredRun) &&
+					recipientId &&
+					resumeRunId === undefined
+				) {
 					// Actor first: serialize with explicit run starts before adopting its identity.
 					// Do not use getAgentRun here: a missing id is a new start, not legacy admission.
 					await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);

@@ -17,7 +17,6 @@ import {
 	Group,
 	Indicator,
 	Loader,
-	Menu,
 	Modal,
 	NavLink,
 	Text,
@@ -25,14 +24,10 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import {
-	IconAdjustmentsHorizontal,
 	IconAlertTriangle,
 	IconArrowLeft,
-	IconCheck,
 	IconClearAll,
 	IconDashboard,
-	IconFolders,
-	IconList,
 	IconMessageChatbot,
 	IconMessageReport,
 	IconPlus,
@@ -110,6 +105,7 @@ import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 // there breaks its Fast Refresh boundary and turns tab-list edits into page reloads.
 import { isTabActive } from "./nav/recent-tabs-logic";
 import { useNavBadges } from "./nav/use-nav-badges";
+import { WorkspaceSwitcher } from "./nav/WorkspaceSwitcher";
 import { NotificationBell } from "./notifications/NotificationBell";
 import { PluginPermissionRequestHost } from "./plugins-admin/PluginPermissionRequestHost";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
@@ -246,7 +242,6 @@ export function AuthenticatedLayout() {
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
-	const tabGroupMode = prefs?.recentTabsGroupMode ?? "flat";
 	const { tabs, clearTabs } = useRecentTabs();
 	useAuthenticatedAppearance(prefs);
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
@@ -444,7 +439,9 @@ export function AuthenticatedLayout() {
 		navigate({ to: "/settings/agent", hash: "request-evidence" });
 	};
 
-	// Only session tabs are projected; persisted project visits are left untouched.
+	// Only session tabs are projected; persisted project visits are left untouched. The
+	// "Narrators" link squares its bottom corners to join an active FIRST row; a folder
+	// header never joins (`isTabActive` is false for it), so neither does the link.
 	const narratorTabs = tabs.filter((t) => t.type !== "project");
 	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
 
@@ -544,6 +541,7 @@ export function AuthenticatedLayout() {
 					</Group>
 					<Group wrap="nowrap" className="nf-header-side">
 						<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
+						<WorkspaceSwitcher />
 						<NotificationBell />
 						<Tooltip label={t("feedback")} position="bottom" withArrow>
 							<ActionIcon
@@ -652,56 +650,6 @@ export function AuthenticatedLayout() {
 									rightSection={
 										navCollapsed ? undefined : (
 											<Group gap={8} wrap="nowrap">
-												{/* Display-mode switch for the tab list below. Wrapped in a Box that
-												    swallows the click: this lives INSIDE the NavLink, whose own
-												    onClick navigates to /narrators, and both sibling ActionIcons
-												    below stop propagation for the same reason. */}
-												<Box
-													onClick={(e: React.MouseEvent) => {
-														e.preventDefault();
-														e.stopPropagation();
-													}}
-													onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
-													style={{ display: "flex" }}
-												>
-													<Menu position="right-start" withinPortal shadow="md" width={210}>
-														<Menu.Target>
-															<Tooltip label={t("recentTabsGrouping")} position="right" withArrow>
-																<ActionIcon
-																	size={28}
-																	variant="subtle"
-																	color="gray"
-																	aria-label={t("recentTabsGrouping")}
-																>
-																	<IconAdjustmentsHorizontal size={16} />
-																</ActionIcon>
-															</Tooltip>
-														</Menu.Target>
-														<Menu.Dropdown>
-															<Menu.Label>{t("recentTabsGrouping")}</Menu.Label>
-															<Menu.Item
-																leftSection={<IconList size={14} />}
-																rightSection={
-																	tabGroupMode === "flat" ? <IconCheck size={14} /> : undefined
-																}
-																onClick={() => updatePrefs.mutate({ recentTabsGroupMode: "flat" })}
-															>
-																{t("groupModeFlat")}
-															</Menu.Item>
-															<Menu.Item
-																leftSection={<IconFolders size={14} />}
-																rightSection={
-																	tabGroupMode === "directory" ? <IconCheck size={14} /> : undefined
-																}
-																onClick={() =>
-																	updatePrefs.mutate({ recentTabsGroupMode: "directory" })
-																}
-															>
-																{t("groupModeDirectory")}
-															</Menu.Item>
-														</Menu.Dropdown>
-													</Menu>
-												</Box>
 												<Tooltip label={t("newNarrator")} position="right" withArrow>
 													<ActionIcon
 														size={28}
@@ -721,9 +669,14 @@ export function AuthenticatedLayout() {
 														<IconPlus size={16} />
 													</ActionIcon>
 												</Tooltip>
+												{/* Shown only when clearing would remove something: folders and
+												    their members are always kept, like pinned tabs. */}
 												{tabs.some(
 													(t) =>
 														t.type !== "project" &&
+														t.type !== "folder" &&
+														!t.folderId &&
+														!t.pinned &&
 														!["working", "waiting"].includes(t.status ?? "") &&
 														!t.substatus?.includes("unread"),
 												) && (

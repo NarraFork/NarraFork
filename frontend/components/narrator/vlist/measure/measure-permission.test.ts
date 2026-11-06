@@ -365,6 +365,95 @@ describe("measureInlinePermission — ExitPlanMode editing", () => {
 	});
 });
 
+describe("measureInlinePermission — an outline plan's approval (outline P2 PR 8)", () => {
+	it("adds one xs line (mb 4) per summary row and drops the decision reason", async () => {
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
+		const plain = measureInlinePermission({ isExitPlanMode: true, buttonRows: 1 }, 600);
+		const one = measureInlinePermission(
+			{ isExitPlanMode: true, outlinePlanSummaryRows: 1, buttonRows: 1, hasDecisionReason: true },
+			600,
+		);
+		const two = measureInlinePermission(
+			{ isExitPlanMode: true, outlinePlanSummaryRows: 2, buttonRows: 1 },
+			600,
+		);
+		expect(one.metas.map((m) => m.role)).toEqual([
+			"outline-plan-summary",
+			"feedback-textarea",
+			"button-bar",
+		]);
+		expect(one.height - plain.height).toBe(c.XS_LINE_HEIGHT + 4);
+		expect(two.height - one.height).toBe(c.XS_LINE_HEIGHT + 4);
+	});
+
+	it("is predicted from a waiting ExitPlanMode that carries an outline plan", async () => {
+		const { predictInlinePermission } = await import("../vlist-permission-prediction");
+		const root = {
+			blockId: "b",
+			spaceId: "s",
+			pageId: "p",
+			address: "sess/AbCdEfGh",
+			title: "Plan",
+			round: 1,
+		};
+		const base = {
+			id: "r",
+			toolName: "ExitPlanMode",
+			inputJson: { plan: "- [ ] Plan", _planRoot: root, _planDiff: { counts: { added: 1 } } },
+		};
+		expect(predictInlinePermission(base, { innerWidth: 600, canDecide: true })).toMatchObject({
+			isExitPlanMode: true,
+			outlinePlanSummaryRows: 1,
+		});
+		expect(
+			predictInlinePermission(
+				{ ...base, inputJson: { ...base.inputJson, _planSummary: "Added a step" } },
+				{ innerWidth: 600, canDecide: true },
+			)?.outlinePlanSummaryRows,
+		).toBe(2);
+		// A plan-file plan is predicted as before.
+		expect(
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson: { plan: "x" } },
+				{ innerWidth: 600, canDecide: true },
+			)?.outlinePlanSummaryRows,
+		).toBeUndefined();
+	});
+
+	it("wraps the three decisions at phone width (review round 1 U1)", async () => {
+		const { predictInlinePermission, estimateButtonRows } = await import(
+			"../vlist-permission-prediction"
+		);
+		const inputJson = {
+			plan: "- [ ] Plan",
+			_planRoot: { blockId: "b", spaceId: "s", pageId: "p", address: "a", title: "P", round: 1 },
+		};
+		const rows = (innerWidth: number, extra: Record<string, unknown> = {}) =>
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{ innerWidth, canDecide: true, ...extra },
+			)?.buttonRows;
+		expect(rows(700)).toBe(1);
+		// Phone widths: the English bar paints over two rows, then three.
+		expect(rows(340)).toBe(2);
+		expect(rows(160)).toBe(3);
+		// Shorter labels (the reader's language) fit where the English ones wrap.
+		expect(rows(340, { planButtonLabels: ["按草稿执行", "锁定后执行…", "退回"] })).toBe(1);
+		// Read-only readers see a note, not the bar.
+		expect(
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{ innerWidth: 160, canDecide: false },
+			)?.buttonRows,
+		).toBe(1);
+		// Larger type wraps sooner.
+		const labels = ["Execute as draft", "Lock and execute…", "Return"];
+		expect(estimateButtonRows(labels, 560, 14)).toBe(1);
+		expect(estimateButtonRows(labels, 560, 24)).toBeGreaterThan(1);
+	});
+});
+
 describe("measureInlinePermission — feedback rows, decision reason, read-only", () => {
 	it("the feedback textarea grows with its autosize row count (clamped 1..3)", async () => {
 		const { measureInlinePermission } = await import("./measure-permission");

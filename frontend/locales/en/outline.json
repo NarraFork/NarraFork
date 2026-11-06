@@ -119,7 +119,9 @@
 			"edit": "Edit",
 			"revert": "Revert",
 			"import": "Import",
-			"confirm": "Confirm"
+			"confirm": "Confirm",
+			"plan": "Plan decision",
+			"answer": "Answer"
 		},
 		"actor": {
 			"unknown": "Someone",
@@ -363,6 +365,7 @@
 			"cancelled": "Cancelled"
 		},
 		"count": "{{count}} open",
+		"planning": "Planning",
 		"humanCreated": "Set by a person",
 		"locked": "Locked · {{name}}",
 		"lockedSomeone": "Locked",
