@@ -35,10 +35,15 @@ export interface DashboardSession {
 	decision?: DashboardDecision;
 	/** Set when the session stopped on an error. */
 	errored?: boolean;
+	/** Set when the session finished a turn the user has not read yet. */
+	unread?: boolean;
 }
 
 export interface DashboardSessionGroups {
-	/** Waiting on the user: open decisions first (blocking before not), then errors. */
+	/**
+	 * Waiting on the user: open decisions first (blocking before not), then errors,
+	 * then finished turns not yet read.
+	 */
 	attention: DashboardSession[];
 	/** Working, reflecting, or idle with background work still running. */
 	running: DashboardSession[];
@@ -90,6 +95,10 @@ function toSession(n: DashboardNarrator, live: NarratorActivity | undefined): Da
  * Running also covers an idle narrator whose background work (bash tasks,
  * subagents) is still going — the session is not done, and will wake when the
  * work completes.
+ *
+ * A finished turn the user has not read (`unread`) also needs the user, the same
+ * way the server raises a "done" attention for it. Opening the session clears the
+ * tag, which moves it to Recent.
  */
 export function buildDashboardSessions(input: {
 	attentionItems: readonly HumanAttentionItem[];
@@ -155,6 +164,7 @@ export function buildDashboardSessions(input: {
 		if (session.status === "working" || session.status === "waiting") running.push(session);
 		else if (session.substatus.includes("error")) attention.push({ ...session, errored: true });
 		else if (session.activeBackgroundWorkCount > 0) running.push(session);
+		else if (session.substatus.includes("unread")) attention.push({ ...session, unread: true });
 		else recent.push(session);
 	}
 
@@ -164,6 +174,7 @@ export function buildDashboardSessions(input: {
 		(a, b) =>
 			Number(!!b.decision) - Number(!!a.decision) ||
 			Number(!!b.decision?.blocking) - Number(!!a.decision?.blocking) ||
+			Number(!!b.errored) - Number(!!a.errored) ||
 			byTime(a, b),
 	);
 	running.sort(byTime);

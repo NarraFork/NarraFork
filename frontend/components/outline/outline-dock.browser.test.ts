@@ -157,6 +157,14 @@ beforeAll(async () => {
 	});
 	ids = written.results.map((result) => result.blockId);
 	pageId = ids[0] as string;
+	for (let i = 0; i < 30; i++) {
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "insert", parent: { id: pageId }, content: `Later block ${i}` }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+	}
 	const more = await writeOutline({
 		spaceId: space.id,
 		ops: Array.from({ length: 10 }, (_, i) => ({
@@ -218,6 +226,85 @@ async function quiet(): Promise<void> {
 	const end = Date.now() + 5000;
 	while (Date.now() < end && !outlineLiveQuiet()) await new Promise((r) => setTimeout(r, 20));
 }
+
+test("opening an outline timeline never scrolls the enclosing dock while geometry settles", async () => {
+	const { page, errors } = await openDock();
+	try {
+		const heights = () =>
+			page.evaluate(() => {
+				const host = document.getElementById("dock-host");
+				const surface = host?.querySelector("[data-dockview-surface]");
+				const composer = document.getElementById("composer-panel");
+				if (!host || !surface || !composer) throw new Error("Dock fixture not mounted");
+				return {
+					host: host.getBoundingClientRect().height,
+					top: host.getBoundingClientRect().top,
+					scroll: [
+						...document.querySelectorAll(
+							"html, body, #root, .nf-app-shell, .nf-app-shell-main, [data-dockview-surface], .dv-react, .dv-shell",
+						),
+					].map((el) => ({ class: el.className, scrollTop: el.scrollTop })),
+					surface: surface.getBoundingClientRect().height,
+					composer: composer.getBoundingClientRect().height,
+				};
+			});
+		await page.setViewport({ width: 900, height: 800 });
+		// During a dock resize/restore its last measured height can exceed the shell's new height.
+		await page.evaluate(() => {
+			const host = document.getElementById("dock-host");
+			const main = document.querySelector<HTMLElement>(".nf-app-shell-main");
+			if (!host || !main) throw new Error("Dock host not mounted");
+			host.style.height = "740px";
+			main.style.height = "400px";
+		});
+		const before = await heights();
+		await call(
+			page,
+			(f, s, p) => f.openOutline({ spaceId: s, blockId: p, pageId: p }),
+			space.id,
+			pageId,
+		);
+		await until(page, (f) => f.liveEditors() === 1);
+		await page.waitForSelector("[data-testid=outline-surface] [data-seq]");
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) =>
+					requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+				),
+		);
+		expect(await heights()).toEqual(before);
+		expect(before.surface).toBe(before.host);
+		const tickVisible = () =>
+			page.evaluate(() => {
+				const tick = document.querySelector("[data-testid=outline-surface] [aria-current=true]");
+				const strip = tick?.closest(".mantine-ScrollArea-viewport");
+				if (!tick || !strip) return false;
+				const target = tick.getBoundingClientRect();
+				const bounds = strip.getBoundingClientRect();
+				return target.left >= bounds.left - 1 && target.right <= bounds.right + 1;
+			});
+		expect(await tickVisible()).toBe(true);
+		// Returning to an older commit must scroll left without moving any ancestor either.
+		await call(
+			page,
+			(f, s, p) => f.openOutline({ spaceId: s, blockId: p, pageId: p, asOf: 1 }),
+			space.id,
+			pageId,
+		);
+		await page.waitForSelector("[data-seq='1'][aria-current=true]");
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) =>
+					requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+				),
+		);
+		expect(await tickVisible()).toBe(true);
+		expect(await heights()).toEqual(before);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.browserContext().close();
+	}
+});
 
 test("an outline panel beside the composer navigates in place and keeps the keyboard to itself", async () => {
 	const { page, errors } = await openDock();

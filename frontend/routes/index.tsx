@@ -24,7 +24,7 @@ function DashboardPage() {
 				<DashboardComposer />
 			</Stack>
 
-			{/* 需要用户处理的会话置顶，其次是正在运行的会话 */}
+			{/* 需要用户处理的会话（待决定、出错、已完成未读）置顶，其次是正在运行的会话 */}
 			<DashboardSessions data={sessions} />
 		</Stack>
 	);
