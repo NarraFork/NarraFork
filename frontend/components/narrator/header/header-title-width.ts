@@ -37,6 +37,8 @@ export const HEADER_ROW_GAP_PX = 8;
 /** Tool-row `Group gap="xs"` — `--mantine-spacing-xs`. */
 export const HEADER_TOOLBAR_GAP_PX = 10;
 export const HEADER_BACK_WIDTH_PX = 22;
+/** Phone menu button (`Burger size="sm"`: 18px + xs spacing). */
+export const HEADER_MENU_WIDTH_PX = 28;
 /** Edit + generate (`size="xs"` ≈ 18px) + 4px gaps inside the title slot. */
 export const HEADER_TITLE_ACTIONS_PX = 18 * 2 + 4 * 2;
 export const HEADER_OVERFLOW_WIDTH_PX = 22;
@@ -127,6 +129,8 @@ export interface HeaderAfterTitleInput {
 	/** Complete title text width from {@link headerTitleLayoutWidth}. */
 	titleFullWidth: number;
 	showBack?: boolean;
+	/** Phone menu button before everything else. */
+	showMenu?: boolean;
 	showTitleActions?: boolean;
 	surfacedToolCount: number;
 	showClose?: boolean;
@@ -167,6 +171,7 @@ export function resolveHeaderLayoutAfterTitle(
 		rowWidth,
 		titleFullWidth,
 		showBack = false,
+		showMenu = false,
 		showTitleActions = false,
 		surfacedToolCount,
 		showClose = false,
@@ -188,6 +193,7 @@ export function resolveHeaderLayoutAfterTitle(
 	}
 
 	let chrome = HEADER_ROW_PADDING_PX;
+	if (showMenu) chrome += HEADER_MENU_WIDTH_PX + HEADER_LEADING_GAP_PX;
 	if (showBack) chrome += HEADER_BACK_WIDTH_PX + HEADER_LEADING_GAP_PX;
 	// Actions sit inside the title slot after the fixed text box; their constant
 	// already counts the slot's internal gaps. No extra leading gap here.

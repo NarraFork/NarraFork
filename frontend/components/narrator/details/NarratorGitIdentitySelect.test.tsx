@@ -142,7 +142,7 @@ describe("session details Git identity", () => {
 			'searchableText={[...sessionSearchableText, t("details.gitIdentity")]}',
 		);
 		// 侧边栏标签右键菜单重新提供该入口，但只在"显示设置"打开时才出现。
-		const tabs = readFileSync(new URL("../../nav/RecentTabs.tsx", import.meta.url), "utf8");
+		const tabs = readFileSync(new URL("../../nav/RecentTabMenu.tsx", import.meta.url), "utf8");
 		expect(tabs).toContain("gitIdentityNarratorId && gitIdentityVisibility.contextMenu");
 		// 新建会话弹窗同样只受开关控制。
 		const modal = readFileSync(new URL("../CreateNarratorModal.tsx", import.meta.url), "utf8");

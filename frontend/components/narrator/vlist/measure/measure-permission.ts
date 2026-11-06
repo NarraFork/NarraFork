@@ -12,7 +12,7 @@
  *        │    │    options     Checkbox/Radio Stack gap={4}:                      │
  *        │    │        label   (wraps 🔴, label lh 20) [+ control 20 to the left] │
  *        │    │        [desc]  (wraps 🔴, 12/1.2 → 14, mt 5)                      │
- *        │    │    input       !readOnly → Textarea xs autosize 1..3 (30..68)     │
+ *        │    │    input       !readOnly → Textarea xs autosize 1..3 (33..77)     │
  *        │    │                readOnly  → saved custom answer (xs mono, wraps 🔴)│
  *        │    │    [badge]     readOnly + answered → Badge xs (16)               │
  *        │    ├ [countdown]  !readOnly + armed → Group icon14 + xs text (17)      │
@@ -27,10 +27,15 @@
  *
  *        [exec target Paper p="xs" mb="xs"]  header 17 + (cwd/path lines × 17)
  *        [plan-edited badge mb={4}]          16
- *        [plan Textarea mb="xs"]             editing → autosize 8..30 rows (× 19)
+ *        [plan Textarea mb="xs"]             editing → autosize 8..30 rows (× 22)
  *        [decision reason mb={4}]            reasonLines × 17
- *        feedback Textarea mb="xs"           autosize 1..3 rows (30..68)   [always]
+ *        feedback Textarea mb="xs"           autosize 1..3 rows (33..77)   [always]
  *        readOnly → "unavailable" text 17 | !readOnly → PermButtonBar sm row 36
+ *
+ * A textarea row is `typographyMetrics().line.xsBase`: 22px at the default setting, which the
+ * textarea figures above use (the other line boxes there are the bare-Mantine `*_BASELINE`
+ * values that the setting scales). In the transcript the live textareas paint exactly that row
+ * (D49, see TEXTAREA_ROW_HEIGHT).
  *
  * The wrapping-critical AskUserQuestion header / option label / option
  * description / saved-custom-answer are `PreparedInlineBlock`s measured with
@@ -87,10 +92,16 @@ export function optionDescLineHeight(): number {
 	return scaledLineBoxHeight(FONT_SIZE.xs, 1.2);
 } // 14
 /**
- * Textarea autosize row box: 12px × base line-height (1.55) → round(18.6) = 19.
- * Multiline inputs use `--input-line-height: var(--mantine-line-height)` (1.55),
- * and the xs feedback / xs custom-input / ExitPlanMode edit (font overridden to
- * xs) textareas all render at 12px, so every textarea row is 19px.
+ * Textarea autosize row box, bare-Mantine baseline: 12px × base line-height (1.55) →
+ * round(18.6) = 19. Multiline inputs use `--input-line-height: var(--mantine-line-height)`
+ * (1.55), and the xs feedback / xs custom-input / ExitPlanMode edit (font overridden to xs)
+ * textareas all take the xs size.
+ *
+ * The model counts each row LIVE as `typographyMetrics().line.xsBase` (xs size × 1.55 × the
+ * reader's line-height setting: 22px at the default), and in the transcript the live textareas
+ * paint exactly that row, with no min-height of Mantine's own (D49,
+ * `permission-textarea-typography.tsx`). Only Mantine's own textarea, outside the transcript,
+ * still paints this baseline (18.6px at 12px).
  */
 export const TEXTAREA_ROW_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 19
 
@@ -151,7 +162,7 @@ export const CUSTOM_INPUT_MAX_ROWS = 3;
 
 /**
  * Height of an xs autosize Textarea (custom-input / feedback), clamped to
- * [1, 3] rows. 1 row → 30, 3 rows → 68.
+ * [1, 3] rows. 1 row → 33, 3 rows → 77 at the default setting (22px rows).
  */
 export function xsTextareaHeight(rows: number): number {
 	const r = clamp(rows, CUSTOM_INPUT_MIN_ROWS, CUSTOM_INPUT_MAX_ROWS);

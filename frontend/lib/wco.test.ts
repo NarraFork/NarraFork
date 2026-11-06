@@ -189,6 +189,25 @@ describe("floating overlays above the WCO drag surface", () => {
 		);
 	});
 
+	test("desktop has a drag surface without a header row", async () => {
+		// The desktop header row is gone; the sidebar brand row and a strip above the page
+		// are the drag surfaces, and their controls opt out.
+		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
+		expect(css).toMatch(/html\[data-nf-wco\] \.nf-nav-brand-row \{[^}]*-webkit-app-region: drag/);
+		expect(css).toMatch(
+			/html\[data-nf-wco\] \.nf-nav-brand-row :is\([^)]*button[^)]*\) \{[^}]*-webkit-app-region: no-drag/,
+		);
+		expect(css).toMatch(/html\[data-nf-wco\] \.nf-wco-main-strip \{[^}]*-webkit-app-region: drag/);
+		const layout = await Bun.file(
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
+		).text();
+		expect(layout).toContain('className="nf-wco-main-strip"');
+		const top = await Bun.file(
+			new URL("../components/nav/NavTopSection.tsx", import.meta.url),
+		).text();
+		expect(top).toContain('className="nf-nav-brand-row"');
+	});
+
 	test("the theme stamps nf-overlay-layer on every Mantine floating part", async () => {
 		const theme = await Bun.file(new URL("./mantine-theme.ts", import.meta.url)).text();
 		for (const component of ["Modal", "Drawer", "Menu", "Popover", "HoverCard", "Combobox"]) {
@@ -222,13 +241,16 @@ describe("floating overlays above the WCO drag surface", () => {
 		const after = (marker: string) => layout.lastIndexOf(marker);
 		const headerEnd = layout.indexOf("</AppShell.Header>");
 		const navbarEnd = after("</AppShell.Navbar>");
+		const mainStrip = layout.indexOf('className="nf-wco-main-strip"');
 		expect(headerEnd).toBeGreaterThan(0);
 		expect(navbarEnd).toBeGreaterThan(0);
+		expect(mainStrip).toBeGreaterThan(0);
 
 		for (const banner of ["<WSConnectionAlert />", "<VersionUpdateBanner />"]) {
 			const at = after(banner);
 			expect(at).toBeGreaterThan(headerEnd);
 			expect(at).toBeGreaterThan(navbarEnd);
+			expect(at).toBeGreaterThan(mainStrip);
 		}
 	});
 });

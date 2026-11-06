@@ -1,6 +1,4 @@
-import { spawn } from "node:child_process";
 import { open, readlink } from "node:fs/promises";
-import { win32 } from "node:path";
 
 /** Strict instance provenance for cold continuation recovery, separate from startup's fail-open probe. */
 export const INSTANCE_PROCESS_PROBE_LIMITS = Object.freeze({ timeoutMs: 1_500, bytes: 64 * 1024 });
@@ -17,7 +15,7 @@ export type InstanceProcessIdentity = Readonly<{
 	version: 1;
 	domain: InstanceProcessDomain;
 	pid: number;
-	/** Linux start ticks or Windows CIM CreationDate UTC FILETIME, NEVER JS milliseconds. */
+	/** Linux start ticks or Windows creation time as a UTC FILETIME in µs×10, NEVER JS milliseconds. */
 	birth: string;
 }>;
 export type InstanceProcessObservation =
@@ -135,59 +133,6 @@ async function readBounded(path: string): Promise<string> {
 	}
 }
 
-/** Combined stdout/stderr hard cap. Timeout resolves immediately, not after a child's close. */
-export function runInstanceIdentityCommand(
-	command: string,
-	args: string[],
-	signal: AbortSignal,
-	spawnChild: typeof spawn = spawn,
-): Promise<string | null> {
-	return new Promise((resolve) => {
-		if (signal.aborted) return resolve(null);
-		let child: ReturnType<typeof spawn>;
-		try {
-			child = spawnChild(command, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-		} catch {
-			return resolve(null);
-		}
-		let done = false;
-		let total = 0;
-		const output: Buffer[] = [];
-		const finish = (result: string | null, terminate = false) => {
-			if (done) return;
-			done = true;
-			clearTimeout(timer);
-			signal.removeEventListener("abort", abort);
-			if (terminate) {
-				try {
-					child.kill();
-				} catch {
-					/* Already exited. */
-				}
-				child.stdout?.destroy();
-				child.stderr?.destroy();
-			}
-			resolve(result);
-		};
-		const abort = () => finish(null, true);
-		const timer = setTimeout(abort, INSTANCE_PROCESS_PROBE_LIMITS.timeoutMs);
-		signal.addEventListener("abort", abort, { once: true });
-		const receive = (chunk: Buffer | string, stdout: boolean) => {
-			if (done) return;
-			const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-			total += data.length;
-			if (total > INSTANCE_PROCESS_PROBE_LIMITS.bytes) return finish(null, true);
-			if (stdout) output.push(data);
-		};
-		child.stdout?.on("data", (chunk) => receive(chunk, true));
-		child.stderr?.on("data", (chunk) => receive(chunk, false));
-		child.once("error", () => finish(null, true));
-		child.once("close", (code) =>
-			finish(code === 0 ? Buffer.concat(output).toString("utf8") : null),
-		);
-	});
-}
-
 export interface InstanceProcessProbeDependencies {
 	platform: NodeJS.Platform;
 	selfPid: number;
@@ -195,7 +140,7 @@ export interface InstanceProcessProbeDependencies {
 	readlink(path: string): Promise<string>;
 	/** Only signal 0; EPERM and all failures except ESRCH are unknown. */
 	checkPid(pid: number): "present" | "absent" | "unknown";
-	windowsQuery(pid: number, signal: AbortSignal): Promise<string | null>;
+	windowsQuery(pid: number): Promise<string | null>;
 }
 
 function parseStat(raw: string): { pid: number; birth: string } | null {
@@ -211,17 +156,10 @@ function parseStat(raw: string): { pid: number; birth: string } | null {
 	return { pid: Number(first[1]), birth };
 }
 
-async function windowsQuery(pid: number, signal: AbortSignal): Promise<string | null> {
-	const root = process.env.SystemRoot;
-	if (!root || !win32.isAbsolute(root)) return null;
-	// CreationDate and LastBootUpTime stay exact decimal strings, with no JS floating-point loss.
-	// ErrorAction=Stop distinguishes failed CIM access from a successful empty process result.
-	const script = `$ErrorActionPreference='Stop'; $m=(Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid; $o=Get-CimInstance Win32_OperatingSystem -ErrorAction Stop; $p=@(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop); if($p.Count -gt 1){throw 'ambiguous process'}; $b=$null; if($p.Count -eq 1){if($null -eq $p[0].CreationDate){throw 'missing birth'}; $b=$p[0].CreationDate.ToUniversalTime().ToFileTimeUtc().ToString()}; @{machine=$m; boot=$o.LastBootUpTime.ToUniversalTime().ToFileTimeUtc().ToString(); pid=${pid}; found=($p.Count -eq 1); birth=$b} | ConvertTo-Json -Compress`;
-	return runInstanceIdentityCommand(
-		win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-		["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-		signal,
-	);
+/** Win32 API calls, imported only on Windows (see windows-process-identity.ts). */
+async function windowsQuery(pid: number): Promise<string | null> {
+	const { queryWindowsProcessIdentity } = await import("./windows-process-identity");
+	return queryWindowsProcessIdentity(pid);
 }
 
 const defaults: InstanceProcessProbeDependencies = {
@@ -280,7 +218,7 @@ export function createInstanceProcessProbe(deps: InstanceProcessProbeDependencie
 			return birth === null ? { kind: "absent", domain: before } : { kind: "present", identity };
 		}
 		if (deps.platform === "win32") {
-			const raw = await deps.windowsQuery(pid, signal);
+			const raw = await deps.windowsQuery(pid);
 			if (!raw || Buffer.byteLength(raw) > INSTANCE_PROCESS_PROBE_LIMITS.bytes) return UNKNOWN;
 			const value = JSON.parse(raw);
 			if (value.pid !== pid || typeof value.found !== "boolean") return UNKNOWN;

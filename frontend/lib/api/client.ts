@@ -1,5 +1,6 @@
 import { apiUrl } from "@frontend/lib/base-path";
 import { isSessionInvalidResponse } from "@shared/session-auth";
+import { leaveForStartupPageIfStarting } from "../pwa";
 
 /**
  * The API root, resolved against the app's mount prefix.
@@ -132,7 +133,9 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
 	if (token && !headers.has("Authorization")) {
 		headers.set("Authorization", `Bearer ${token}`);
 	}
-	return fetch(input, { ...init, headers });
+	const response = await fetch(input, { ...init, headers });
+	leaveForStartupPageIfStarting(response);
+	return response;
 }
 
 /**
@@ -346,6 +349,7 @@ export async function request<T>(
 		headers.Authorization = `Bearer ${token}`;
 	}
 	const response = await fetch(apiUrl(path), { ...fetchOptions, headers });
+	leaveForStartupPageIfStarting(response);
 	// Apply the same byte budget before parsing either success or error bodies.
 	const boundedText =
 		maxResponseBytes == null

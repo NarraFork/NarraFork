@@ -316,6 +316,11 @@ export const moveRecentTabSchema = z
 		 * an id = join that folder (at the anchor, or at its end without one).
 		 */
 		folderId: z.string().min(1).max(50).nullable().optional(),
+		/**
+		 * A top-level unit dragged across the pin divider takes this pinned state with it.
+		 * Rides along with a move target; it is not a target of its own.
+		 */
+		pinned: z.boolean().optional(),
 	})
 	.superRefine((value, ctx) => {
 		// A membership change is a complete target on its own; an anchor is optional

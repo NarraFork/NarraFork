@@ -14,7 +14,8 @@
  *   - a plan review's comments (PR 8b) lead the summary line and the diff, which leaves them out
  *     of its changes, at a phone's width too;
  *   - at 328px every region of the card is predicted as painted, and the version and its counts
- *     stay on the summary line (review round 1 U1), in en and zh-CN, at 100% and 130% type.
+ *     stay on the summary line (review round 1 U1), in en and zh-CN, at 100% and 130% type and at
+ *     a 150% line height; the whole card is as tall as measured, its feedback box included (D49).
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -525,20 +526,20 @@ test("at 328px every region is predicted as painted and the version and counts s
 			line,
 			review,
 		) as Promise<Card>;
-	// What is left after the feedback box's row height, which the measure model takes from the
-	// line-height setting and the browser does not, for every permission card alike.
-	const residual = (c: Card) =>
-		(c.measured ?? 0) - c.rendered - c.feedbackRows * (c.modelTextareaRow - c.paintedTextareaRow);
 	for (const lng of ["en", "zh-CN"]) {
 		for (const [font, line] of [
 			[100, 100],
 			[130, 120],
+			[100, 150],
 		] as const) {
 			for (const review of [0, 2]) {
 				const narrow = await measure(lng, 328, font, line, review);
 				const wide = await measure(lng, 688, font, line, review);
-				const what = `${lng} ${font}% review ${review}`;
+				const what = `${lng} ${font}%/${line}% review ${review}`;
 				for (const card of [narrow, wide]) {
+					// The feedback box paints the model's row (D49), so nothing is left over.
+					expect(card.paintedTextareaRow, what).toBe(card.modelTextareaRow);
+					expect(Math.abs((card.measured ?? 0) - card.rendered), what).toBeLessThanOrEqual(1);
 					expect(card.predictedFeedbackRows, what).toBe(card.feedbackRows);
 					expect(card.predictedButtonRows, what).toBe(card.buttonRows);
 					expect(card.summaryLines, what).toBe(1);
@@ -547,7 +548,6 @@ test("at 328px every region is predicted as painted and the version and counts s
 				}
 				expect(narrow.narrow, what).toBe(true);
 				expect(wide.narrow, what).toBe(false);
-				expect(Math.abs(residual(narrow) - residual(wide)), what).toBeLessThanOrEqual(1);
 			}
 		}
 	}

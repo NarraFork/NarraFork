@@ -5,7 +5,7 @@ import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-ef
 import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useCreateNarrator } from "../../hooks/useNarrator";
@@ -17,6 +17,10 @@ import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api, isAbortError } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
+import {
+	subscribeDashboardComposerFocus,
+	takeDashboardComposerFocusRequest,
+} from "../../lib/dashboard-composer-focus";
 import { DirectoryBrowserModal } from "../common/DirectoryPicker";
 import {
 	CreateNarratorLazyModal,
@@ -158,6 +162,14 @@ export function DashboardComposer() {
 	const [hasText, setHasText] = useState(false);
 	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);
 	const composerRef = useRef<NarratorComposerHandle>(null);
+	// The sidebar's "New session" asks for the cursor here, before or after this mounts.
+	useEffect(() => {
+		const take = () => {
+			if (takeDashboardComposerFocusRequest()) composerRef.current?.focus();
+		};
+		take();
+		return subscribeDashboardComposerFocus(take);
+	}, []);
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const sendingRef = useRef(false);
 	const sendAbortRef = useRef<AbortController | null>(null);

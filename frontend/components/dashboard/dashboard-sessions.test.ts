@@ -87,13 +87,36 @@ describe("buildDashboardSessions", () => {
 		});
 	});
 
-	it("orders blocking decisions, then other decisions, then errored sessions", () => {
+	it("orders blocking decisions, then other decisions, then errored, then unread sessions", () => {
 		const groups = build(
-			[narrator("e", { substatus: ["error"] }), narrator("d1"), narrator("d2")],
+			[
+				narrator("u", { substatus: ["unread"], lastMessageAt: "2026-01-03T00:00:00Z" }),
+				narrator("e", { substatus: ["error"], lastMessageAt: "2026-01-02T00:00:00Z" }),
+				narrator("d1"),
+				narrator("d2"),
+			],
 			[decision("d1"), decision("d2", { blocking: true })],
 		);
-		expect(ids(groups.attention)).toEqual(["d2", "d1", "e"]);
+		expect(ids(groups.attention)).toEqual(["d2", "d1", "e", "u"]);
 		expect(groups.attention[2]?.errored).toBe(true);
+		expect(groups.attention[3]?.unread).toBe(true);
+	});
+
+	it("puts a finished unread session under attention until it is read", () => {
+		const narrators = [
+			narrator("u", { substatus: '["unread"]' }),
+			narrator("bg", { substatus: ["unread"], activeBackgroundWorkCount: 1 }),
+			narrator("read"),
+		];
+		const groups = build(narrators);
+		expect(ids(groups.attention)).toEqual(["u"]);
+		expect(ids(groups.running)).toEqual(["bg"]);
+		expect(ids(groups.recent)).toEqual(["read"]);
+
+		const live = new Map([["u", { tools: [], substatus: [] }]]);
+		const afterRead = build(narrators, [], live);
+		expect(afterRead.attention).toEqual([]);
+		expect(ids(afterRead.recent).sort()).toEqual(["read", "u"]);
 	});
 
 	it("lets live activity move a session between groups", () => {

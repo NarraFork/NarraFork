@@ -4,7 +4,8 @@
  * against the test server's outline API, its decision route and the page's change hints over the
  * app's own narrator socket (`outline-plan-approval.browser.test.ts`). With `keyboard`, the panel's
  * keyboard navigation (`usePermissionFocusNav`) hosts it, as in a session's panel. `measureCard`
- * paints a card at a width and type size and reads it against the vlist's prediction.
+ * paints a card at a width and type size, mounted by the vlist's own bridge (`buildPermissionNode`),
+ * and reads it against the vlist's prediction.
  */
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
@@ -31,6 +32,7 @@ import { usePermissionFocusNav } from "../../narrator/interaction/use-permission
 import { InlinePermission } from "../../narrator/permission/InlinePermission";
 import { PermEnterHintCtx } from "../../narrator/tool-call/tool-call-contexts";
 import { measureInlinePermission } from "../../narrator/vlist/measure/measure-permission";
+import { buildPermissionNode } from "../../narrator/vlist/vlist-permission-bridge";
 import { predictInlinePermission } from "../../narrator/vlist/vlist-permission-prediction";
 
 const instance = i18next.createInstance();
@@ -266,7 +268,7 @@ export async function measureCard(
 									activePermissionId: "measure-request",
 								}}
 							>
-								<InlinePermission permission={permission} />
+								{buildPermissionNode(permission, {})}
 							</PermEnterHintCtx.Provider>
 						</div>
 					</QueryClientProvider>
