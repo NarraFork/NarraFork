@@ -43,6 +43,7 @@ import type {
 	OutlineTaskActorRef,
 	OutlineTaskJson,
 } from "../model";
+import type { OutlineDigestPort } from "./digest-port";
 import type { OutlineReadPort } from "./read-port";
 
 export { WriteConflictError } from "@server/db/backend/write-port";
@@ -624,7 +625,7 @@ export interface OutlineClaimedTask {
 // The port
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
+export interface OutlineStore extends WritePortIdentity, OutlineReadPort, OutlineDigestPort {
 	/**
 	 * The space of a project, user or narrator, created on first use. Concurrent callers get
 	 * the same row (one per scope, enforced by a unique index). New spaces start at seq 1.

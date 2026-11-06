@@ -32,6 +32,11 @@ import type {
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import type { NotificationLink } from "@shared/notification-center";
 import type { LinkTarget, TaskStatus } from "@shared/outline";
+import type {
+	OutlineDigestCounts,
+	OutlineDigestRanges,
+	OutlineDigestStored,
+} from "@shared/outline-digest";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { sql } from "drizzle-orm";
 import {
@@ -2405,6 +2410,14 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * for a lesson that no longer exists is simply not shown.
 	 */
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
+	/**
+	 * The outline's daily report (汇报, P2 PR 11, owner decision Q2 = B): the IANA time zone a
+	 * person's day is cut in (midnight to midnight there), and the local time of day (`HH:MM`) the
+	 * report of a day is made on the next day. NULL until the person sets one: the server's time
+	 * zone, and 07:00 (`services/outline/digest-time.ts`).
+	 */
+	outlineDigestTimeZone: text("outline_digest_time_zone"),
+	outlineDigestTime: text("outline_digest_time"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -5617,9 +5630,22 @@ export const outlineSpaces = sqliteTable(
 		 * rebuild has since rewritten is refused as stale and planned again.
 		 */
 		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
+		/**
+		 * `created_at` of the space's latest commit, written by the statement that claims the seq
+		 * (P2 PR 11): which spaces had commits since a time is one range read on its index, not a
+		 * scan of every space. NULL until the space's first commit; spaces committed to before the
+		 * column existed are stamped by the report job from their last commit.
+		 */
+		lastCommitAt: text("last_commit_at"),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		// Spaces with commits since a time, by that time then id (the report job's pages).
+		index("idx_outline_spaces_last_commit").on(table.lastCommitAt, table.id),
+		// Spaces committed to before `last_commit_at` existed: what the report job still stamps.
+		index("idx_outline_spaces_unstamped")
+			.on(table.id)
+			.where(sql`"last_commit_at" IS NULL AND "next_seq" > 1`),
 		// Spaces the in-process rebuild still has to visit; empty once it has run.
 		index("idx_outline_spaces_in_process_pending").on(table.id).where(sql`"in_process_ready" = 0`),
 		uniqueIndex("uq_outline_spaces_project").on(table.projectId).where(sql`"kind" = 'project'`),
@@ -6069,6 +6095,52 @@ export const outlineViewState = sqliteTable(
 	(table) => [
 		primaryKey({ columns: [table.userId, table.pageBlockId] }),
 		index("idx_outline_view_state_page").on(table.pageBlockId),
+	],
+);
+
+// === outline_digests ===
+/**
+ * A person's reports (汇报, outline P2 PR 11; design §3.4): one row per person per day (`daily`,
+ * `period_key` the day in the person's time zone), plus at most one "today so far" preview
+ * (`today`). Derived data, made by the background job (`services/outline/digest-job.ts`) from
+ * commits and versions; it holds ids, seqs, kinds and counts, never block text, so a title is read
+ * when shown and today's read access decides what is shown.
+ *
+ *   - `period_start`, `period_end`: the window the report covers (ISO instants). Consecutive days
+ *     of a person meet exactly: a day starts where the previous report ended, also when the person
+ *     changed their time zone in between.
+ *   - `ranges_json`: per space, the seqs `(from, to]` the window covered; the next day continues
+ *     from them, so no commit is counted twice or skipped.
+ *   - `counts_json`, `item_count`: what lists and the inbox read; `items_json` (at most 64 KiB) only
+ *     the detail reads.
+ *   - `seen_at`: when the person read it; a report with nothing in it is written already seen.
+ */
+export const outlineDigests = sqliteTable(
+	"outline_digests",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["daily", "today"] }).notNull(),
+		/** The day (`YYYY-MM-DD`) in `time_zone`. */
+		periodKey: text("period_key").notNull(),
+		timeZone: text("time_zone").notNull(),
+		periodStart: text("period_start").notNull(),
+		periodEnd: text("period_end").notNull(),
+		countsJson: text("counts_json", { mode: "json" }).$type<OutlineDigestCounts>().notNull(),
+		itemCount: integer("item_count").notNull().default(0),
+		itemsJson: text("items_json", { mode: "json" }).$type<OutlineDigestStored>().notNull(),
+		rangesJson: text("ranges_json", { mode: "json" }).$type<OutlineDigestRanges>().notNull(),
+		truncated: integer("truncated", { mode: "boolean" }).notNull().default(false),
+		createdAt: text("created_at").notNull(),
+		seenAt: text("seen_at"),
+	},
+	(table) => [
+		// One per person, kind and day; also the person's reports by day (and the FK's index).
+		uniqueIndex("uq_outline_digests_user_period").on(table.userId, table.kind, table.periodKey),
+		// A person's unread reports: the inbox row.
+		index("idx_outline_digests_unseen").on(table.userId).where(sql`"seen_at" IS NULL`),
 	],
 );
 

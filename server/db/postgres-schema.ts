@@ -1339,6 +1339,8 @@ export const userPreferences = pgTable("user_preferences", {
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
+	outlineDigestTimeZone: text("outline_digest_time_zone"),
+	outlineDigestTime: text("outline_digest_time"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -3469,9 +3471,14 @@ export const outlineSpaces = pgTable(
 		createdAt: text("created_at").notNull(),
 		inProcessReady: boolean("in_process_ready").notNull().default(false),
 		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
+		lastCommitAt: text("last_commit_at"),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		index("idx_outline_spaces_last_commit").on(table.lastCommitAt, table.id),
+		index("idx_outline_spaces_unstamped")
+			.on(table.id)
+			.where(sql.raw('"last_commit_at" IS NULL AND "next_seq" > 1')),
 		index("idx_outline_spaces_in_process_pending")
 			.on(table.id)
 			.where(sql.raw('"in_process_ready" = FALSE')),
@@ -3771,6 +3778,32 @@ export const outlineViewState = pgTable(
 	(table) => [
 		index("idx_outline_view_state_page").on(table.pageBlockId),
 		primaryKey({ columns: [table.userId, table.pageBlockId] }),
+	],
+);
+
+export const outlineDigests = pgTable(
+	"outline_digests",
+	{
+		id: text("id").primaryKey().notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		periodKey: text("period_key").notNull(),
+		timeZone: text("time_zone").notNull(),
+		periodStart: text("period_start").notNull(),
+		periodEnd: text("period_end").notNull(),
+		countsJson: jsonText("counts_json").notNull(),
+		itemCount: integer("item_count").notNull().default(0),
+		itemsJson: jsonText("items_json").notNull(),
+		rangesJson: jsonText("ranges_json").notNull(),
+		truncated: boolean("truncated").notNull().default(false),
+		createdAt: text("created_at").notNull(),
+		seenAt: text("seen_at"),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_digests_user_period").on(table.userId, table.kind, table.periodKey),
+		index("idx_outline_digests_unseen").on(table.userId).where(sql.raw('"seen_at" IS NULL')),
 	],
 );
 
@@ -4231,8 +4264,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 136,
-  "columnCount": 1809,
+  "tableCount": 137,
+  "columnCount": 1826,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11890,6 +11923,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"{}\"",
           "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "outlineDigestTimeZone",
+          "name": "outline_digest_time_zone",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "outlineDigestTime",
+          "name": "outline_digest_time",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "createdAt",
@@ -24329,6 +24380,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "lastCommitAt",
+          "name": "last_commit_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         }
       ],
       "indexes": [
@@ -24338,6 +24398,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "key"
           ],
           "unique": true
+        },
+        {
+          "name": "idx_outline_spaces_last_commit",
+          "columns": [
+            "lastCommitAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_spaces_unstamped",
+          "columns": [
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"last_commit_at\" IS NULL AND \"next_seq\" > 1"
         },
         {
           "name": "idx_outline_spaces_in_process_pending",
@@ -25866,6 +25942,177 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ]
         }
       ]
+    },
+    {
+      "exportName": "outlineDigests",
+      "name": "outline_digests",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_digests_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "periodKey",
+          "name": "period_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "timeZone",
+          "name": "time_zone",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "periodStart",
+          "name": "period_start",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "periodEnd",
+          "name": "period_end",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "countsJson",
+          "name": "counts_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "itemCount",
+          "name": "item_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "itemsJson",
+          "name": "items_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "rangesJson",
+          "name": "ranges_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "truncated",
+          "name": "truncated",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "seenAt",
+          "name": "seen_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_outline_digests_user_period",
+          "columns": [
+            "userId",
+            "kind",
+            "periodKey"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_outline_digests_unseen",
+          "columns": [
+            "userId"
+          ],
+          "unique": false,
+          "predicate": "\"seen_at\" IS NULL"
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
     },
     {
       "exportName": "scheduledTasks",

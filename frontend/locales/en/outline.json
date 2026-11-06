@@ -346,6 +346,9 @@
 		"revertFailed": "The change could not be reverted",
 		"gotIt": "Got it"
 	},
+	"report": {
+		"unread": "Unread reports: {{count}} ({{items}} item(s) in all)."
+	},
 	"board": {
 		"title": "Tasks",
 		"projectTitle": "Task board",

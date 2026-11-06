@@ -415,7 +415,18 @@ function outlineRowText(
 ) {
 	const ref = item.outline;
 	if (!ref) return item.summary;
-	if (ref.what === "digest") return t("outlineAttention.digest", { count: ref.count });
+	if (ref.what === "digest") {
+		// Unread reports (P2 PR 11) and confirmations made on the person's behalf share the row.
+		const parts = [
+			...(ref.reports
+				? [t("outlineAttention.reports", { count: ref.reports, items: ref.reportItems ?? 0 })]
+				: []),
+			...(ref.count > 0 || !ref.reports
+				? [t("outlineAttention.digest", { count: ref.count })]
+				: []),
+		];
+		return parts.join(" · ");
+	}
 	if (ref.what === "pending")
 		return t("outlineAttention.pending", { summary: item.summary, count: ref.count });
 	return t("outlineAttention.questions", { title: item.summary, count: ref.count });

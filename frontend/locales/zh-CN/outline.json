@@ -346,6 +346,9 @@
 		"revertFailed": "撤回失败",
 		"gotIt": "知道了"
 	},
+	"report": {
+		"unread": "未读汇报 {{count}} 份（共 {{items}} 项）。"
+	},
 	"board": {
 		"title": "任务",
 		"projectTitle": "任务看板",
