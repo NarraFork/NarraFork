@@ -143,6 +143,12 @@ export interface RunSubagentInput {
 	userId?: string | null;
 	/** Existing tool/coordinator lease; tool leases are transferred into the run lifecycle. */
 	updateExecutionLease?: SubagentUpdateExecutionLease;
+	/**
+	 * An outline task to hand to the subagent (`Agent({ task })`, outline P2 PR 9a), checked and
+	 * written into `prompt` already (`prepareOutlineDelegation`). Its claim passes to the subagent
+	 * once it exists, before it runs.
+	 */
+	delegation?: import("./outline/delegation").PreparedOutlineDelegation;
 }
 
 /**
@@ -257,6 +263,11 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			"Subagent execution deferred because a NarraFork update is scheduled.",
 		);
 	}
+	/** The subagent holds its delegated task and has not run yet: a failure gives the task back. */
+	let delegatedBeforeRun: {
+		subagentId: string;
+		delegated: import("./outline/delegation").DelegatedOutlineTask;
+	} | null = null;
 	try {
 		if (input.toolCallBinding) {
 			const { narratorPersistence } = await import("./narrator-persistence");
@@ -295,6 +306,30 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				alias: aliasRegistration.alias,
 				error: err instanceof Error ? err.message : String(err),
 			});
+		}
+
+		// An outline task: the subagent's registration records it and the task's claim passes to
+		// it. Refused (the task changed hands since it was checked): the subagent never ran.
+		let delegationNote = "";
+		if (input.delegation) {
+			try {
+				if (!input.toolCallBinding) throw new ValidationError("Agent call binding missing");
+				const [{ delegateOutlineTask, delegationStartedNote }, { delegationLocale }] =
+					await Promise.all([import("./outline/delegation"), import("./outline/delegation-text")]);
+				const delegated = await delegateOutlineTask({
+					delegation: input.delegation,
+					subagentId,
+					toolCallId: input.toolCallBinding.toolCallId,
+					userId: userId ?? null,
+					locale: delegationLocale(locale),
+				});
+				delegatedBeforeRun = { subagentId, delegated };
+				delegationNote = `\n\n${delegationStartedNote(input.delegation)}`;
+			} catch (error) {
+				const { interruptAndArchiveSubagent } = await import("./subagent-lifecycle");
+				await interruptAndArchiveSubagent(subagentId).catch(() => {});
+				throw error;
+			}
 		}
 
 		// The run's relations to the exact calling attempt.
@@ -377,6 +412,9 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				text: "",
 				resumeRunId: task.logicalRunId ?? undefined,
 			});
+			if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
+			if (delegatedBeforeRun) await delegationRunStarted(subagentId);
+			delegatedBeforeRun = null;
 			void handle.terminal.finally(() => updateLease.release());
 			return (
 				(input.takeoverByUser
@@ -385,6 +423,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 						"turn completion will not notify or wake the parent. " +
 						"The user can continue interacting until they explicitly end takeover. Do not automatically Await this agent."
 					: buildBackgroundAgentStartOutput(aliasRegistration.alias)) +
+				delegationNote +
 				formatSubagentModelFallbackNote(inheritance) +
 				conflictNote
 			);
@@ -399,6 +438,9 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			cancelSignal: input.signal,
 			foreground: true,
 		});
+		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
+		if (delegatedBeforeRun) await delegationRunStarted(subagentId);
+		delegatedBeforeRun = null;
 		void handle.terminal.finally(() => updateLease.release());
 		if (getSearchExecutionScope()) {
 			// A channel failure must reach the search router so the next channel can run.
@@ -411,6 +453,47 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		return result.output + formatSubagentModelFallbackNote(inheritance) + conflictNote;
 	} catch (error) {
 		updateLease.release();
+		if (delegatedBeforeRun && input.delegation)
+			await giveBackDelegatedTask({
+				...delegatedBeforeRun,
+				delegation: input.delegation,
+				userId: userId ?? null,
+			});
 		throw error;
 	}
+}
+
+const NOT_STARTED = "The delegated agent's run did not start; its task was given back";
+
+/** The delegated subagent's run started: it counts as running through its run from now on. */
+async function delegationRunStarted(subagentId: string): Promise<void> {
+	const { delegationStarted } = await import("./outline/delegation");
+	delegationStarted(subagentId);
+}
+
+/**
+ * A subagent that took its delegated task but never ran (its Agent call failed after the
+ * delegation's commit): the delegation is undone (a task that was to do is to do again, otherwise
+ * the session has it back), then the subagent is archived, holding nothing.
+ */
+async function giveBackDelegatedTask(args: {
+	subagentId: string;
+	delegated: import("./outline/delegation").DelegatedOutlineTask;
+	delegation: import("./outline/delegation").PreparedOutlineDelegation;
+	userId: string | null;
+}): Promise<void> {
+	try {
+		const { undoOutlineDelegation } = await import("./outline/delegation");
+		await undoOutlineDelegation(args);
+	} catch (error) {
+		logger.warn("Delegated task could not be given back", {
+			subagentId: args.subagentId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		await delegationRunStarted(args.subagentId).catch(() => {});
+	}
+	// A background task row created for it is settled, so nothing waits on a run that never was.
+	await backgroundTaskService.cancel(args.subagentId).catch(() => false);
+	const { interruptAndArchiveSubagent } = await import("./subagent-lifecycle");
+	await interruptAndArchiveSubagent(args.subagentId).catch(() => {});
 }

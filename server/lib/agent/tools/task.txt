@@ -42,6 +42,11 @@ User takeover at creation:
 - Completing a turn does NOT notify or wake the parent. The subagent remains taken over, waiting for further user interaction, until the user explicitly ends takeover.
 - Do NOT automatically Await a user-taken-over agent or treat its turn completion as a delegated task result.
 
+Delegating an outline task:
+- In a session whose tasks live in the outline, pass `task` (the task's address) to hand that task to the agent. Its instructions are written from the task's tree (its goal, notes, steps, questions and prerequisites), so `prompt` may be left out; what you write in `prompt` is added as further instructions.
+- While it works the task is the agent's. When it finishes, its report is attached under the task and the task comes back to you, still in progress: read the report, note what matters under the task, and tick it done yourself if it meets its acceptance. A result marked late (the task changed hands meanwhile) must not be used to tick it done.
+- Work that should leave a trace in the outline needs a task: create it first (or use a step of an approved plan) and pass it as `task`. A delegation without `task` creates no task and attaches nothing.
+
 Working directory:
 - By default, subagents inherit the parent narrator's working directory
 - Use the `workdir` parameter to run a subagent in a different directory
