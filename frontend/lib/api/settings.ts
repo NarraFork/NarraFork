@@ -76,7 +76,11 @@ export type RecentTabMoveTarget = (
 	| { position: "top" | "above_idle" }
 	| { toIndex: number }
 	| Record<never, never>
-) & { folderId?: string | null };
+) & {
+	folderId?: string | null;
+	/** A top-level unit dragged across the pin divider takes this pinned state. */
+	pinned?: boolean;
+};
 
 export interface RecentTabFolderPatch {
 	title?: string;

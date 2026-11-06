@@ -188,22 +188,76 @@ describe("resolveRecentTabDropTarget", () => {
 		});
 	});
 
-	test("an unpinned unit is clamped below the pinned block, a pinned one above the rest", () => {
+	test("dragging across the pin divider pins or unpins, at the slot aimed at", () => {
+		const rows = [
+			row(0, "narrator:p1", { pinned: true }),
+			row(1, "narrator:p2", { pinned: true }),
+			row(2, "narrator:a"),
+			row(3, "narrator:b"),
+		];
+		// An unpinned tab aimed into the pinned block is pinned there.
+		expect(resolveRecentTabDropTarget(rows, top(0), narratorSource())).toEqual({
+			kind: "before",
+			key: "narrator:p1",
+			pinned: true,
+		});
+		expect(resolveRecentTabDropTarget(rows, top(1), narratorSource())).toEqual({
+			kind: "before",
+			key: "narrator:p2",
+			pinned: true,
+		});
+		// A pinned tab aimed into the unpinned block is unpinned there.
+		const pinned: RecentTabDropSource = { ...narratorSource(), pinned: true };
+		expect(resolveRecentTabDropTarget(rows, bottom(3), pinned)).toEqual({
+			kind: "after",
+			key: "narrator:b",
+			pinned: false,
+		});
+		// Within its own block nothing changes.
+		expect(resolveRecentTabDropTarget(rows, bottom(2), narratorSource())).toEqual({
+			kind: "after",
+			key: "narrator:a",
+		});
+	});
+
+	test("the divider line itself is the unpinned side", () => {
 		const rows = [
 			row(0, "narrator:p1", { pinned: true }),
 			row(1, "narrator:a"),
 			row(2, "narrator:b"),
 		];
-		// Aimed into the pinned block: lands at the first unpinned slot.
-		expect(resolveRecentTabDropTarget(rows, top(0), narratorSource())).toEqual({
+		// Lower half of the last pinned row: the line above the first unpinned one,
+		// written as the slot before it ("after the last pinned" is the same boundary).
+		expect(resolveRecentTabDropTarget(rows, bottom(0), narratorSource())).toEqual({
 			kind: "before",
 			key: "narrator:a",
 		});
-		// A pinned unit aimed below the unpinned rows stays at the end of the pinned block.
-		const pinned: RecentTabDropSource = { ...narratorSource(), pinned: true };
-		expect(resolveRecentTabDropTarget(rows, bottom(2), pinned)).toEqual({
-			kind: "after",
+		const pinned: RecentTabDropSource = { ...narratorSource("narrator:p0"), pinned: true };
+		expect(resolveRecentTabDropTarget(rows, bottom(0), pinned)).toEqual({
+			kind: "before",
+			key: "narrator:a",
+			pinned: false,
+		});
+		// Its upper half is still in the pinned block.
+		expect(resolveRecentTabDropTarget(rows, top(0), narratorSource())).toEqual({
+			kind: "before",
 			key: "narrator:p1",
+			pinned: true,
+		});
+	});
+
+	test("above the measured divider pins even when no pinned unit is rendered yet", () => {
+		const rows = [row(0, "narrator:a"), row(1, "narrator:b")];
+		const divider = { top: -10, bottom: -2 };
+		expect(resolveRecentTabDropTarget(rows, -8, narratorSource(), divider)).toEqual({
+			kind: "before",
+			key: "narrator:a",
+			pinned: true,
+		});
+		// Below the same divider stays unpinned.
+		expect(resolveRecentTabDropTarget(rows, bottom(1), narratorSource(), divider)).toEqual({
+			kind: "after",
+			key: "narrator:b",
 		});
 	});
 

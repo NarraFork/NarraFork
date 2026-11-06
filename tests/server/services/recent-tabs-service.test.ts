@@ -1038,4 +1038,10 @@ describe("recent-tabs optimistic moves match the server", () => {
 		await expectParity("narrator:m3", { beforeKey: "narrator:m2" });
 		await expectParity("narrator:m2", { position: "top" });
 	});
+
+	it("pins and unpins a top-level tab dragged across the divider", async () => {
+		await seedFolder();
+		await expectParity("narrator:y", { beforeKey: "folder:f", pinned: true });
+		await expectParity("narrator:y", { afterKey: "narrator:x", pinned: false });
+	});
 });

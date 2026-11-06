@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	applyRecentTabFolderCreate,
 	applyRecentTabFolderDissolve,
+	applyRecentTabMove,
 	applyRecentTabPin,
 	applyRecentTabRemove,
 	regroupFolders,
@@ -95,5 +96,48 @@ describe("folder operations", () => {
 		applyRecentTabRemove(tabs, "narrator:m1");
 		applyRecentTabFolderCreate(tabs, "narrator:a", "narrator:m2", folder("n"));
 		expect(JSON.stringify(tabs)).toBe(snapshot);
+	});
+});
+
+describe("moves across the pin divider", () => {
+	test("a tab aimed into the pinned block takes that pinned state at its slot", () => {
+		const tabs = [tab("p", { pinned: true }), tab("a"), tab("b")];
+		expect(
+			shape(applyRecentTabMove(tabs, "narrator:b", { beforeKey: "narrator:p", pinned: true })),
+		).toEqual(["*b", "*p", "a"]);
+		// A pinned tab aimed into the unpinned block is unpinned there.
+		expect(
+			shape(applyRecentTabMove(tabs, "narrator:p", { afterKey: "narrator:b", pinned: false })),
+		).toEqual(["a", "b", "p"]);
+		// Inside its own block, `pinned` is simply true again (no surprise unpin).
+		expect(
+			shape(applyRecentTabMove(tabs, "narrator:p", { afterKey: "narrator:a", pinned: false })),
+		).toEqual(["a", "p", "b"]);
+	});
+
+	test("a folder crosses as a unit: its head carries the zone, members keep theirs", () => {
+		const tabs = [
+			tab("a"),
+			folder("f"),
+			tab("m1", { folderId: "f", pinned: true }),
+			tab("m2", { folderId: "f" }),
+			tab("p", { pinned: true }),
+		];
+		expect(
+			shape(applyRecentTabMove(tabs, "folder:f", { beforeKey: "narrator:p", pinned: true })),
+		).toEqual(["a", "*[f]", "*m1>f", "m2>f", "*p"]);
+	});
+
+	test("a member leaving a folder into the pinned block is pinned at the top level", () => {
+		const tabs = [folder("f"), tab("m", { folderId: "f" }), tab("p", { pinned: true })];
+		expect(
+			shape(
+				applyRecentTabMove(tabs, "narrator:m", {
+					beforeKey: "narrator:p",
+					folderId: null,
+					pinned: true,
+				}),
+			),
+		).toEqual(["*m", "*p"]);
 	});
 });

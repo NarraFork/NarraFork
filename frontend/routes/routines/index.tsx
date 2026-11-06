@@ -1,3 +1,4 @@
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import {
 	ActionIcon,
 	Alert,
@@ -184,7 +185,10 @@ function RoutinesPage() {
 	return (
 		<Container size="md" py="lg">
 			<Stack gap="xs" mb="md">
-				<Title order={2}>{t("title")}</Title>
+				<Group gap="xs" wrap="nowrap">
+					<MobileNavButton />
+					<Title order={2}>{t("title")}</Title>
+				</Group>
 				<Text size="sm" c="dimmed">
 					{t("subtitle")}
 				</Text>
