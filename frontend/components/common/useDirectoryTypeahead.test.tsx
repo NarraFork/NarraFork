@@ -60,13 +60,12 @@ const names = ["Documents", "Downloads", "Music", "projects"];
 function Probe({ onActivate }: { onActivate: (index: number) => void }) {
 	const typeahead = useDirectoryTypeahead({ names, onActivate, resetKey: names.join("|") });
 	return (
-		<fieldset
+		<div
 			ref={typeahead.containerRef}
 			onKeyDown={typeahead.onKeyDown}
 			aria-label="directories"
-			// biome-ignore lint/a11y/noNoninteractiveTabindex: the list is the keyboard surface
+			role="listbox"
 			tabIndex={0}
-			style={{ border: 0, margin: 0, padding: 0 }}
 		>
 			<input data-testid="path" />
 			{names.map((name, index) => (
@@ -79,7 +78,7 @@ function Probe({ onActivate }: { onActivate: (index: number) => void }) {
 					{name}
 				</button>
 			))}
-		</fieldset>
+		</div>
 	);
 }
 

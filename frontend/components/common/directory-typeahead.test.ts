@@ -17,8 +17,9 @@ import {
 
 const names = ["Documents", "Downloads", "drafts", "Music", "projects"];
 
-function tag(name: string) {
-	return { tagName: name };
+/** A node stub: the predicate only reads `tagName` / `isContentEditable`. */
+function node(shape: { tagName: string; isContentEditable?: boolean }): EventTarget {
+	return shape as unknown as EventTarget;
 }
 
 describe("which keys belong to the list", () => {
@@ -39,11 +40,11 @@ describe("which keys belong to the list", () => {
 	});
 
 	test("typing inside an editable control is that control's business", () => {
-		expect(isEditableTarget(tag("INPUT"))).toBe(true);
-		expect(isEditableTarget(tag("textarea"))).toBe(true);
-		expect(isEditableTarget(tag("SELECT"))).toBe(true);
-		expect(isEditableTarget({ tagName: "DIV", isContentEditable: true })).toBe(true);
-		expect(isEditableTarget(tag("DIV"))).toBe(false);
+		expect(isEditableTarget(node({ tagName: "INPUT" }))).toBe(true);
+		expect(isEditableTarget(node({ tagName: "textarea" }))).toBe(true);
+		expect(isEditableTarget(node({ tagName: "SELECT" }))).toBe(true);
+		expect(isEditableTarget(node({ tagName: "DIV", isContentEditable: true }))).toBe(true);
+		expect(isEditableTarget(node({ tagName: "DIV" }))).toBe(false);
 		expect(isEditableTarget(null)).toBe(false);
 	});
 });
