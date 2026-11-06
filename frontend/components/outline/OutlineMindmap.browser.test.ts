@@ -943,10 +943,13 @@ for (const host of HOSTS) {
 		const s = await seed(`Touch ${host}`);
 		const a = await openHost(h, host, s.pageId, { width: 900, height: 1000, touch: true });
 		const cdp = await a.page.createCDPSession();
+		// A finger's contact area (12px, not a pen's point): Chromium's touch adjustment then picks
+		// what the finger hits as on a phone, so a frame part that attracts touches next to a small
+		// node's body shows up here (a hover style on the bullet once turned long presses into focus).
 		const touch = (type: string, pts: Array<[number, number]>) =>
 			cdp.send("Input.dispatchTouchEvent", {
 				type: type as "touchStart",
-				touchPoints: pts.map(([x, y], id) => ({ x, y, id, radiusX: 4, radiusY: 4, force: 1 })),
+				touchPoints: pts.map(([x, y], id) => ({ x, y, id, radiusX: 12, radiusY: 12, force: 1 })),
 			});
 		const tap = async (x: number, y: number) => {
 			await touch("touchStart", [[x, y]]);
@@ -1015,55 +1018,17 @@ for (const host of HOSTS) {
 		expect((serverText(s.pageId, t3) ?? "").endsWith("（触屏）")).toBe(true);
 		await tap(...bg);
 		expect((await map(a)).editing).toBe(null);
-		// A long press drags: T9 under T5. Leaving the edit re-measures T3 and can move the layout
-		// after a fit (CI saw T9 drawn 70px off where it was read): fit until T9 stays put, so the
-		// finger lands where it is drawn.
-		await idle(a);
-		await settled(a);
-		const rect9 = () => a.call((f, x) => f.nodeRect(x as never), s.id("T9"));
-		for (let i = 0; i < 20; i++) {
-			await a.call((f) => f.mapFit());
-			const before = JSON.stringify(await rect9());
-			await new Promise((r) => setTimeout(r, 100));
-			if (JSON.stringify(await rect9()) === before) break;
-		}
-		const r9 = await rect9();
-		const p9 = center(r9 as never);
+		// A long press drags: T9 under T5.
+		await a.call((f) => f.mapFit());
+		const p9 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T9"))) as never);
 		const p5 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T5"))) as never);
-		/** Where the map and T9 are drawn (every T9 node, in case of more than one). */
-		const scene = () =>
-			a.page.evaluate(
-				(x: number, y: number, id: string) => {
-					const box = (e: Element | null | undefined) => {
-						const r = e?.getBoundingClientRect();
-						return r ? [r.left, r.top, r.width, r.height].map(Math.round) : null;
-					};
-					const el = document.elementFromPoint(x, y);
-					return {
-						hit: el ? `${el.tagName.toLowerCase()}.${String(el.className)}` : null,
-						nodes: [...document.querySelectorAll(`.mm-node[data-id="${id}"]`)].map((n) => ({
-							box: box(n),
-							cls: String(n.className),
-							hit: !!el && n.contains(el),
-						})),
-						stages: [...document.querySelectorAll(".mm-stage")].map((n) => box(n)),
-					};
-				},
-				p9[0],
-				p9[1],
-				s.id("T9"),
-			);
-		const atPress = { read: r9, at: p9.map(Math.round), map: await map(a), scene: await scene() };
-		const pressedAt = Date.now();
+		const rootBefore = (await map(a)).root;
 		await touch("touchStart", [p9]);
-		// The press turns into a drag once the long-press timer fires (no move in between). Waits
-		// for it rather than a fixed delay; if it never comes, says where everything was.
-		const dragged = await a.page
+		// The press turns into a drag once the long-press timer fires (no move in between): waits
+		// for it rather than a fixed delay, and says if the press focused the node instead.
+		const dragging = await a.page
 			.waitForFunction(
-				(id) =>
-					[...document.querySelectorAll(`.mm-node[data-id="${id}"]`)].some((n) =>
-						n.classList.contains("dragging"),
-					),
+				(id) => document.querySelector(`.mm-node[data-id="${id}"]`)?.classList.contains("dragging"),
 				{ timeout: 3_000, polling: 25 },
 				s.id("T9"),
 			)
@@ -1071,13 +1036,7 @@ for (const host of HOSTS) {
 				() => true,
 				() => false,
 			);
-		const pressMs = Date.now() - pressedAt;
-		const pressed = dragged
-			? "dragging"
-			: { atPress, after: { map: await map(a), scene: await scene() } };
-		if (pressMs > 1_000)
-			console.log(`[${host}] long press: ${JSON.stringify(pressed)} after ${pressMs}ms`);
-		expect(pressed).toBe("dragging");
+		expect({ dragging, root: (await map(a)).root }).toEqual({ dragging: true, root: rootBefore });
 		for (let i = 1; i <= 8; i++)
 			await touch("touchMove", [
 				[p9[0] + ((p5[0] - p9[0]) * i) / 8, p9[1] + ((p5[1] - p9[1]) * i) / 8],

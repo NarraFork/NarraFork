@@ -133,10 +133,6 @@
 	color: var(--ob-muted);
 }
 
-.nf-outline-editor .ob-bullet:hover {
-	color: var(--ob-accent);
-}
-
 .nf-outline-editor .ob-bullet::before {
 	content: "";
 	flex: none;
