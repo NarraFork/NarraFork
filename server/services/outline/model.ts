@@ -31,6 +31,7 @@ import type {
 	OutlineTaskActorRef,
 	OutlineTaskJson,
 	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
 } from "@server/db/schema";
 
 export type {
@@ -41,6 +42,7 @@ export type {
 	OutlineTaskActorRef,
 	OutlineTaskJson,
 	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
 };
 
 /** What a version changed relative to the previous one. A bitmask: several can be set. */
@@ -101,9 +103,18 @@ export const OUTLINE_TASKS_PAGE_ALIAS = "tasks";
  * `edit` is every ordinary write; `revert` and `import` are written by their own paths; `confirm`
  * is a pending change taking effect (`pending.ts`): its actor is the proposer, its responsible
  * person the decider's; `answer` is a person's answer to questions (`questions.ts`), written as
- * that person (or relayed by the asking session, the person still responsible).
+ * that person (or relayed by the asking session, the person still responsible); `plan` is a plan
+ * entering planning, returned or approved (`plans.ts`, outline P2 PR 8): a marker on the
+ * timeline, written like an `edit`.
  */
-export const OUTLINE_COMMIT_KINDS = ["edit", "revert", "import", "confirm", "answer"] as const;
+export const OUTLINE_COMMIT_KINDS = [
+	"edit",
+	"revert",
+	"import",
+	"confirm",
+	"answer",
+	"plan",
+] as const;
 export type OutlineCommitKind = (typeof OUTLINE_COMMIT_KINDS)[number];
 
 /**

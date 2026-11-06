@@ -312,6 +312,12 @@ export interface InlinePermissionData {
 	 * fetched, so its height arrives through the painted-height report.
 	 */
 	hasPreviewLoading?: boolean;
+	/**
+	 * An outline session's plan approval (outline P2 PR 8, `OutlinePlanApproval`): its summary
+	 * lines (the version's changes, and the agent's note when it gave one), each one xs line
+	 * (`lineClamp={1}`) with `mb={4}`. 0 / absent: not an outline plan.
+	 */
+	outlinePlanSummaryRows?: number;
 	/** Whether a decision-reason line block is shown. */
 	hasDecisionReason?: boolean;
 	/** Wrapped line count of the decision reason; default 1. */
@@ -360,6 +366,7 @@ export type PermBlockRole =
 	| "preview-loading"
 	| "plan-edited-badge"
 	| "plan-textarea"
+	| "outline-plan-summary"
 	| "decision-reason"
 	| "feedback-textarea"
 	| "button-bar"
@@ -696,8 +703,18 @@ export function measureInlinePermission(
 		);
 	}
 
+	// An outline plan's summary lines (each mb={4}; the form shows no decision reason).
+	const planRows = Math.max(0, data.outlinePlanSummaryRows ?? 0);
+	for (let row = 0; row < planRows; row++) {
+		push(
+			makeFixed(typographyMetrics().line.xs, "outline-plan-summary", { row }),
+			{ role: "outline-plan-summary", data: { row } },
+			DECISION_REASON_MARGIN_BOTTOM,
+		);
+	}
+
 	// Decision reason (mb={4}).
-	if (data.hasDecisionReason) {
+	if (data.hasDecisionReason && planRows === 0) {
 		const reasonLines = Math.max(1, data.decisionReasonLines ?? 1);
 		push(
 			makeFixed(reasonLines * typographyMetrics().line.xs, "decision-reason", { reasonLines }),

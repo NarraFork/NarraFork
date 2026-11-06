@@ -1737,6 +1737,14 @@ export const PretextExactMessageList = memo(
 			const permissionCapability = useNarratorPermissionsCapability();
 			const canDecidePermissions =
 				permissionCapability.supported && permissionCapability.approveDeny;
+			// The outline plan's decision labels, in the reader's language: they decide where the
+			// card's button bar wraps (outline P2 PR 8, review round 1 U1).
+			const planButtonLabels = useMemo(
+				() => [t("outlinePlan.draft"), t("outlinePlan.lock"), t("outlinePlan.return")],
+				[t],
+			);
+			const planButtonLabelsRef = useRef(planButtonLabels);
+			planButtonLabelsRef.current = planButtonLabels;
 			const permissionPredictionsByToolUseId = useMemo(() => {
 				const map = new Map<string, InlinePermissionData>();
 				const innerWidth = toolCardInnerWidth(contentWidth, false);
@@ -1745,11 +1753,12 @@ export const PretextExactMessageList = memo(
 					const prediction = predictInlinePermission(perm, {
 						innerWidth,
 						canDecide: canDecidePermissions,
+						planButtonLabels,
 					});
 					if (prediction) map.set(perm.toolUseId, prediction);
 				}
 				return map;
-			}, [permCb?.pendingPermissions, contentWidth, canDecidePermissions]);
+			}, [permCb?.pendingPermissions, contentWidth, canDecidePermissions, planButtonLabels]);
 			const resolvePermissionFormPrediction = useCallback(
 				(toolUseId: string | undefined) =>
 					toolUseId ? permissionPredictionsByToolUseId.get(toolUseId) : undefined,
@@ -1783,6 +1792,7 @@ export const PretextExactMessageList = memo(
 						const prediction = predictInlinePermission(perm, {
 							innerWidth: toolCardInnerWidth(width, false),
 							canDecide: canDecidePermissionsRef.current,
+							planButtonLabels: planButtonLabelsRef.current,
 						});
 						if (!prediction) return undefined;
 						const painted = resizeFormHeightsRef.current.get(toolUseId);

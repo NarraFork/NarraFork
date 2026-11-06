@@ -5468,6 +5468,29 @@ export interface OutlineTaskLockJson {
 }
 
 /**
+ * A plan's state on its root task (outline P2 PR 8, D48; design §4.3): written by the system only
+ * (`EnterPlanMode`, the approval), never by an agent's edit. While `planning`, the root and every
+ * task under it are left out of continuation and the "current tasks" view: an unapproved plan is
+ * never executed. `approved` (as a draft or locked) counts as work the person wants
+ * (`protectedOnly`, D48 Q2).
+ */
+export interface OutlineTaskPlanJson {
+	state: "planning" | "approved";
+	/** The session (root narrator id) planning it. */
+	by: string;
+	/** Submissions decided so far (approved or returned). */
+	round: number;
+	/**
+	 * The seq the next submission is compared against ("the diff against the previous version"):
+	 * the commit that began this round of planning or returned the last submission. 0: nothing
+	 * (a plan root created for this planning: its first version is all new).
+	 */
+	baseSeq: number;
+	/** Who approved it: a person, or the system on a person's behalf (plan review). */
+	approvedBy?: OutlineTaskActorRef;
+}
+
+/**
  * Task state of an outline block (`task_json`): checkbox, assignee, prerequisites, due date, and
  * the P2 fields. Rows written before a field existed simply lack it; every optional field reads
  * as its default when absent (no manager known, not human-created, not locked, not claimable),
@@ -5489,6 +5512,8 @@ export interface OutlineTaskJson {
 	lock?: OutlineTaskLockJson;
 	/** In the claimable pool (design §4.5, D38); absent means false. */
 	claimable?: true;
+	/** Present on a plan's root task (outline P2 PR 8). */
+	plan?: OutlineTaskPlanJson;
 }
 
 /** Who proposed a pending change, with the provenance its confirmation commits under. */
@@ -5706,8 +5731,11 @@ export const outlineCommits = sqliteTable(
 		/**
 		 * `confirm`: a pending change taking effect (design §2.6), its decider recorded on the row.
 		 * `answer`: a person's answer to questions (outline P2 PR 7), their confirmation.
+		 * `plan`: a plan entering planning, returned or approved (outline P2 PR 8).
 		 */
-		kind: text("kind", { enum: ["edit", "revert", "import", "confirm", "answer"] }).notNull(),
+		kind: text("kind", {
+			enum: ["edit", "revert", "import", "confirm", "answer", "plan"],
+		}).notNull(),
 		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
 		actorId: text("actor_id").notNull(),
 		responsibleUserId: text("responsible_user_id"),

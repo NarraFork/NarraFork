@@ -170,6 +170,7 @@ import {
 	type OutlineTaskActorRef,
 	type OutlineTaskJson,
 	type OutlineTaskLockJson,
+	type OutlineTaskPlanJson,
 	outlineLeaseEnd,
 } from "./model";
 import {
@@ -247,7 +248,16 @@ interface OutlineTaskExtraInput {
 	lock?: OutlineTaskLockInput | null;
 	/** Put the task in the claimable pool. */
 	claimable?: boolean | null;
+	/**
+	 * A plan's state on its root (`plans.ts`, outline P2 PR 8; `null` clears it). Agents' edits
+	 * may not set it. `baseSeq` left out is stamped with this commit's seq (as a lock's version
+	 * is); a compensating commit restores what it read.
+	 */
+	plan?: OutlineTaskPlanInput | null;
 }
+
+/** A plan's state as a writer gives it; see {@link OutlineTaskExtraInput.plan}. */
+export type OutlineTaskPlanInput = Omit<OutlineTaskPlanJson, "baseSeq"> & { baseSeq?: number };
 
 export interface OutlineTaskInput extends OutlineTaskExtraInput {
 	status: TaskStatus;
@@ -502,7 +512,7 @@ export interface OutlineWriteOptions {
 	 * Record the commit as an `import` (a system path that brings content from elsewhere as one
 	 * commit: an outline session's old behavior fence, outline plan PR 4). Not with `compensating`.
 	 */
-	kind?: "import" | "answer";
+	kind?: "import" | "answer" | "plan";
 	/**
 	 * Internal to `questions.ts`: the asker of the questions this commit creates (their routing
 	 * rows take it; an existing row keeps its own), and `delivered` when the asker needs no telling
@@ -717,11 +727,28 @@ function checkFlag(value: unknown, what: string, opIndex: number): void {
 		throw invalid(`task ${what} must be a boolean`, opIndex);
 }
 
+const PLAN_STATES: ReadonlySet<string> = new Set(["planning", "approved"]);
+
+function checkPlanInput(plan: OutlineTaskPlanInput, opIndex: number): void {
+	const p = plan as Partial<OutlineTaskPlanInput>;
+	if (typeof p !== "object") throw invalid("task plan must be an object", opIndex);
+	if (typeof p.state !== "string" || !PLAN_STATES.has(p.state))
+		throw invalid("task plan.state must be planning or approved", opIndex);
+	if (typeof p.by !== "string" || p.by === "" || p.by.length > MAX_ACTOR_ID)
+		throw invalid("task plan.by must be a narrator id", opIndex);
+	if (!Number.isSafeInteger(p.round) || (p.round as number) < 0)
+		throw invalid("task plan.round must be a non-negative integer", opIndex);
+	if (p.baseSeq !== undefined && (!Number.isSafeInteger(p.baseSeq) || p.baseSeq < 0))
+		throw invalid("task plan.baseSeq must be a non-negative integer", opIndex);
+	if (p.approvedBy !== undefined) checkActorRef(p.approvedBy, "task plan.approvedBy", opIndex);
+}
+
 function checkTaskFields(task: OutlineTaskPatch, opIndex: number): void {
 	if (task.manager !== undefined && task.manager !== null)
 		checkActorRef(task.manager, "task manager", opIndex);
 	checkFlag(task.humanCreated, "humanCreated", opIndex);
 	checkFlag(task.claimable, "claimable", opIndex);
+	if (task.plan !== undefined && task.plan !== null) checkPlanInput(task.plan, opIndex);
 	if (task.lock !== undefined && task.lock !== null) {
 		const lock = task.lock as Partial<OutlineTaskLockInput>;
 		if (typeof lock !== "object") throw invalid("task lock must be an object", opIndex);
@@ -1186,10 +1213,16 @@ class OutlinePlanner {
 		return this.input.actor.kind === "agent" && this.commitKind === "edit" && !this.leaseExpiry;
 	}
 
-	/** An agent may not lock or unlock (Q5): only people lock, through `lockOutlineTask`. */
+	/**
+	 * An agent may not lock or unlock (Q5): only people lock, through `lockOutlineTask`. Nor may it
+	 * set or clear a plan's state: plan mode and the approval keep it (`plans.ts`).
+	 */
 	private checkLockInput(task: OutlineTaskPatch | null | undefined, opIndex: number): void {
-		if (task?.lock !== undefined && this.input.actor.kind === "agent" && this.commitKind === "edit")
+		if (this.input.actor.kind !== "agent" || this.commitKind !== "edit") return;
+		if (task?.lock !== undefined)
 			throw new OutlineWriteError(OUTLINE_TEXT.lockDenied, "OUTLINE_LOCK_DENIED", opIndex);
+		if (task?.plan !== undefined)
+			throw new OutlineWriteError(OUTLINE_TEXT.planStateDenied, "OUTLINE_INVALID_OP", opIndex);
 	}
 
 	private readonly claimer: OutlineClaimer | null;
@@ -1309,7 +1342,20 @@ class OutlinePlanner {
 					? this.lockFrom(given.lock, base?.lock ?? null, opIndex)
 					: (base?.lock ?? null),
 			claimable: pick(given.claimable, base?.claimable ?? null),
+			plan: given.plan !== undefined ? this.planFrom(given.plan) : (base?.plan ?? null),
 		});
+	}
+
+	/** A plan's state as stored: `baseSeq` left out is this commit's seq. */
+	private planFrom(given: OutlineTaskPlanInput | null): OutlineTaskPlanJson | null {
+		if (given === null) return null;
+		return {
+			state: given.state,
+			by: given.by,
+			round: given.round,
+			baseSeq: given.baseSeq ?? this.space.nextSeq,
+			...(given.approvedBy ? { approvedBy: given.approvedBy } : {}),
+		};
 	}
 
 	/**
