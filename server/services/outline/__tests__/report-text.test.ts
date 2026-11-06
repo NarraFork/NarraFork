@@ -104,6 +104,19 @@ describe("report structure", () => {
 		}
 	});
 
+	test("a link in a table cell or a heading stays text too", () => {
+		const r = convert(
+			"# See [[Kx81mPqa/Ab3dEf9Q]]\n| case | where |\n|---|---|\n| race | [[Kx81mPqa/Zz9yXw8V]] |",
+		);
+		expect(shape(r.blocks)).toEqual([
+			{
+				c: "# See \\[[Kx81mPqa/Ab3dEf9Q]]",
+				k: ["| case | where |\n| --- | --- |\n| race | \\[[Kx81mPqa/Zz9yXw8V]] |"],
+			},
+		]);
+		for (const block of all(r.blocks)) expect(contentLinks(block.content)).toEqual([]);
+	});
+
 	test("tables, quotes and code are one block each", () => {
 		const r = convert(
 			"| a | b |\n|---|---|\n| 1 | 2 |\n\n> quoted\n> more\n\n```sh\nls\n# not a heading\n```",

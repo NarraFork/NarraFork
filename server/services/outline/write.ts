@@ -3312,7 +3312,10 @@ class OutlinePlanner {
 			const row = rows.get(id) ?? null;
 			if (delegate?.blockId === id) {
 				// A delegation: the subagent takes it from whoever of its session held it, with the
-				// generation the delegation read plus one.
+				// generation the delegation read plus one. It starts work, never resumes a task that
+				// was finished meanwhile (the caller's base version makes that a conflict first).
+				const before = block.base?.deleted ? null : (block.base?.taskJson?.status ?? null);
+				if (before !== "todo" && before !== "doing") throw new OutlineClaimChangedError(id);
 				if (row && !own(row) && liveClaim(row, this.now)) {
 					throw new OutlineTaskClaimedError(id, this.address(block.sid), holderOf(row), opIndex);
 				}

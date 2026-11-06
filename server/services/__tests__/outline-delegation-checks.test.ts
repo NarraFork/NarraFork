@@ -10,7 +10,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { narrators } from "../../db/schema";
+import { backgroundTasks, narrators, outlineTaskClaims } from "../../db/schema";
 import { askTool } from "../../lib/agent/tools/outline";
 import type { ToolContext } from "../../lib/agent/types";
 import { settings } from "../../lib/settings";
@@ -19,6 +19,7 @@ import {
 	readRuntimeRegistrationColumn,
 	registerRun,
 } from "../../lib/validators/runtime-registration";
+import * as runModule from "../agent-runtime/run";
 import { narratorService } from "../narrator-service";
 import {
 	attachDelegatedReport,
@@ -40,6 +41,7 @@ import { outlineStore } from "../outline/store";
 import type { OutlineStore, OutlineTaskClaimRow } from "../outline/store/port";
 import { findContinuationCandidates, renewOutlineTaskLeases } from "../outline/tasks";
 import { writeOutline } from "../outline/write";
+import { archiveRetiredSubagents, interruptAndArchiveSubagent } from "../subagent-lifecycle";
 import {
 	agent,
 	blockOf,
@@ -384,6 +386,286 @@ describe("a refusal once the agent exists", () => {
 	});
 });
 
+/** Spy on subagent creation to change the outline in the window after the checks. */
+function inTheWindow(
+	change: (input: Parameters<typeof narratorService.createSubagent>[0]) => Promise<void>,
+) {
+	const create = narratorService.createSubagent.bind(narratorService);
+	return spyOn(narratorService, "createSubagent").mockImplementation(async (input) => {
+		const created = await create(input);
+		await change(input);
+		return created;
+	});
+}
+
+async function archived(childId: string | null) {
+	const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId as string) });
+	expect(row?.status).toBe("archived");
+	expect(
+		readRuntimeRegistrationColumn(row?.runtimeRegistrationJson)?.delegatedTask,
+	).toBeUndefined();
+	expect(model.passes).not.toContain(childId);
+}
+
+describe("the window between the checks and the delegation's commit (review S1, N4)", () => {
+	test("a person cancels the task: refused, the cancel stands", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const spy = inTheWindow(async () => {
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "setTask", block: { id: task.blockId }, task: { status: "cancelled" } }],
+				actor: { kind: "human", id: owner },
+				responsibleUserId: owner,
+			});
+		});
+		try {
+			const { result, childId } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("changed while it was being delegated");
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("cancelled");
+			expect(await claimOf(task.blockId)).toBeNull();
+			await archived(childId);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("the session ticks it done from to do: refused, it stays done", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const spy = inTheWindow(async () => {
+			await write(space.id, root, owner, [
+				{ op: "setTask", block: { id: task.blockId }, task: { status: "done" } },
+			]);
+		});
+		try {
+			const { result, childId } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("changed while it was being delegated");
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("done");
+			await archived(childId);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("another Agent call of the session took it first: the refusal says so", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const create = narratorService.createSubagent.bind(narratorService);
+		let sibling: string | null = null;
+		const spy = spyOn(narratorService, "createSubagent").mockImplementation(async (input) => {
+			const created = await create(input);
+			if (!sibling) {
+				sibling = (await create({ ...input, title: "Sibling agent" })).id;
+				await writeOutline(
+					{
+						spaceId: space.id,
+						ops: [{ op: "setTask", block: { id: task.blockId }, task: { status: "doing" } }],
+						actor: { kind: "system", id: "outline-delegate" },
+						responsibleUserId: owner,
+						narratorId: root,
+					},
+					{ delegateClaim: { blockId: task.blockId, holderNarratorId: sibling, epoch: 1 } },
+				);
+			}
+			return created;
+		});
+		try {
+			const { result, childId } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain('was just handed to the session "Sibling agent"');
+			expect(result.output).toContain("by another Agent call of this session");
+			expect(await claimOf(task.blockId)).toMatchObject({ holderNarratorId: sibling, epoch: 1 });
+			await archived(childId);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+});
+
+describe("a failure after the delegation's commit (review N1 M18, N2, N6)", () => {
+	test("a task that was to do is to do again; the agent is archived, never run", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { task } = await seedTask(root, owner);
+		const spy = spyOn(narratorService, "persistSubagentUserMessage").mockRejectedValueOnce(
+			new Error("simulated write failure"),
+		);
+		try {
+			const { result, childId } = await agent(root, owner, {
+				task: task.address,
+				run_in_background: true,
+			});
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("simulated write failure");
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("todo");
+			expect(await claimOf(task.blockId)).toMatchObject({
+				holderNarratorId: null,
+				lastHolderNarratorId: childId,
+				epoch: 1,
+			});
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, childId as string),
+			});
+			expect(row?.status).toBe("archived");
+			expect(model.passes).not.toContain(childId);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("a task the session was doing comes back to it, same generation, on the idle lease", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		await write(space.id, root, owner, [
+			{ op: "setTask", block: { id: task.blockId }, task: { status: "doing" } },
+		]);
+		const spy = spyOn(narratorService, "persistSubagentUserMessage").mockRejectedValueOnce(
+			new Error("simulated write failure"),
+		);
+		try {
+			const { result } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("doing");
+			const claim = (await claimOf(task.blockId)) as OutlineTaskClaimRow;
+			expect(claim).toMatchObject({ holderNarratorId: root, epoch: 2 });
+			expect(Date.parse(claim.expiresAt as string) - Date.now()).toBeGreaterThan(
+				OUTLINE_TASK_IDLE_LEASE_MS - 60_000,
+			);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("a run that never starts gives the task back at once, and its task row is settled", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { task } = await seedTask(root, owner);
+		const idle = Promise.resolve({
+			started: false,
+			output: "",
+			finalText: "",
+			hasError: false,
+			interrupted: false,
+			timedOut: false,
+		});
+		const spy = spyOn(runModule, "startNarratorRun").mockResolvedValueOnce({
+			started: false,
+			foreground: idle,
+			terminal: idle,
+			completion: idle,
+		});
+		try {
+			const { result, childId } = await agent(root, owner, {
+				task: task.address,
+				run_in_background: true,
+			});
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("did not start; its task was given back");
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("todo");
+			expect((await claimOf(task.blockId))?.holderNarratorId).toBeNull();
+			const row = await db.query.backgroundTasks.findFirst({
+				where: eq(backgroundTasks.id, childId as string),
+			});
+			expect(row?.status).not.toBe("running");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("a subagent of the session holding the task without running (it never started): delegating again takes it", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const stale = await narratorService.createSubagent({
+			parentNarratorId: root,
+			subagentType: "general",
+			subagentOriginKind: "standalone",
+			cwd: ".",
+		});
+		await writeOutline(
+			{
+				spaceId: space.id,
+				ops: [{ op: "setTask", block: { id: task.blockId }, task: { status: "doing" } }],
+				actor: { kind: "system", id: "outline-delegate" },
+				responsibleUserId: owner,
+				narratorId: root,
+			},
+			{ delegateClaim: { blockId: task.blockId, holderNarratorId: stale.id, epoch: 1 } },
+		);
+		model.script = [{ text: "picked up" }];
+		const { result, childId } = await agent(root, owner, { task: task.address });
+		expect(result.output).not.toContain("still running");
+		expect(result.output).toContain('status="current"');
+		expect((await claimOf(task.blockId))?.epoch).toBe(2);
+		expect(childId).not.toBe(stale.id);
+	});
+});
+
+describe("archiving a running delegated subagent (review S3)", () => {
+	for (const how of ["archive", "history rollback"] as const) {
+		test(`${how}: the task stays with the session, the report is attached as current`, async () => {
+			const owner = await user();
+			const root = await rootSession(owner);
+			const { space, task } = await seedTask(root, owner);
+			const open = gate();
+			model.script = [{ text: "partial findings", gate: open.promise }];
+			const { childId } = await agent(root, owner, { task: task.address, run_in_background: true });
+			const sub = childId as string;
+			await until(() => model.passes.includes(sub), "the pass");
+			if (how === "archive") expect((await interruptAndArchiveSubagent(sub)).archived).toBe(true);
+			else expect((await archiveRetiredSubagents([sub]))[0]?.archived).toBe(true);
+			open.resolve();
+			await until(() => runEnded(sub), "the run to end");
+			await until(async () => {
+				const under = (await treeUnder(space.id, task.blockId)) as Array<
+					{ content: string } | string
+				>;
+				const last = under.at(-1);
+				return typeof last === "object" && last.content.startsWith("Report");
+			}, "the report");
+			// Still in progress, with the session that sent it: same generation, idle lease.
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("doing");
+			const claim = (await claimOf(task.blockId)) as OutlineTaskClaimRow;
+			expect(claim).toMatchObject({ holderNarratorId: root, epoch: 1 });
+			expect(Date.parse(claim.expiresAt as string) - Date.now()).toBeGreaterThan(
+				OUTLINE_TASK_IDLE_LEASE_MS - 60_000,
+			);
+			// No "the previous executor's session was archived" note: nothing reopened it.
+			const under = await treeUnder(space.id, task.blockId);
+			expect(JSON.stringify(under)).not.toContain("was archived");
+			expect((await db.query.narrators.findFirst({ where: eq(narrators.id, sub) }))?.status).toBe(
+				"archived",
+			);
+		});
+	}
+
+	test("a subagent sent without task keeps the archive's rule: nothing is handed back", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const plain = await narratorService.createSubagent({
+			parentNarratorId: root,
+			subagentType: "general",
+			subagentOriginKind: "standalone",
+			cwd: ".",
+		});
+		await write(space.id, plain.id, owner, [
+			{ op: "setTask", block: { id: task.blockId }, task: { status: "doing" } },
+		]);
+		expect((await claimOf(task.blockId))?.holderNarratorId).toBe(plain.id);
+		await interruptAndArchiveSubagent(plain.id);
+		// Still its own: the archive's release (the session-end watcher) lets go of it, as before.
+		expect((await claimOf(task.blockId))?.holderNarratorId).toBe(plain.id);
+	});
+});
+
 describe("plans", () => {
 	test("a step of an approved plan is delegated; two steps in parallel to two agents", async () => {
 		const owner = await user();
@@ -721,6 +1003,47 @@ describe("the write path's delegation claim", () => {
 		await expect(note(null)).rejects.toBeInstanceOf(OutlineClaimChangedError);
 		expect((await note(row)).commit).not.toBeNull();
 	});
+
+	test("expected claims are checked again when the commit is written (a renewal in between)", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await taskIn(root, owner, "doing");
+		const row = await claimOf(task.blockId);
+		let moved = false;
+		const store = new Proxy(outlineStore, {
+			get(target, prop, receiver) {
+				if (prop === "applyCommit") {
+					return async (plan: Parameters<OutlineStore["applyCommit"]>[0]) => {
+						if (!moved) {
+							moved = true;
+							// The claim moves after the plan was made, before it is written.
+							await db
+								.update(outlineTaskClaims)
+								.set({ expiresAt: "2099-01-01T00:00:00.000Z" })
+								.where(eq(outlineTaskClaims.taskBlockId, task.blockId));
+						}
+						return await target.applyCommit(plan);
+					};
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as OutlineStore;
+		await expect(
+			writeOutline(
+				{
+					spaceId: space.id,
+					ops: [{ op: "insert", parent: { id: task.blockId }, content: "rests on the claim" }],
+					actor: { kind: "system", id: "outline-report" },
+					responsibleUserId: owner,
+					narratorId: root,
+				},
+				{ store, expectClaims: [{ taskBlockId: task.blockId, expect: row }] },
+			),
+		).rejects.toBeInstanceOf(OutlineClaimChangedError);
+		expect(moved).toBe(true);
+		expect(await treeUnder(space.id, task.blockId)).toEqual([]);
+	});
 });
 
 describe("the lease and continuation while a subagent has the task", () => {
@@ -883,6 +1206,7 @@ describe("late results, as a table (design §2.5)", () => {
 		task: { deleted: false, taskJson: { status, assignee: null } },
 		claim,
 		inSession: (id: string) => id === "root" || id === "sub" || id === "sub2",
+		delegatorNarratorId: "root",
 	});
 	test("each row of the table", () => {
 		expect(
@@ -915,6 +1239,26 @@ describe("late results, as a table (design §2.5)", () => {
 			reason: "redelegated",
 			epoch: 4,
 		});
+		expect(classifyDelegatedResult(facts(row({ epoch: 4, lastHolderNarratorId: "sub2" })))).toEqual(
+			{ kind: "late", reason: "redelegated", epoch: 4 },
+		);
+		// The session itself took it up again (after it went back to do): not "delegated again".
+		expect(classifyDelegatedResult(facts(row({ epoch: 4, holderNarratorId: "root" })))).toEqual({
+			kind: "late",
+			reason: "reclaimed",
+			epoch: 4,
+		});
+		// Same generation, yet held outside the session (a row no write path makes): not current.
+		expect(classifyDelegatedResult(facts(row({ holderNarratorId: "b" })))).toMatchObject({
+			kind: "late",
+			reason: "taken_over",
+			holder: { kind: "agent", narratorId: "b" },
+		});
+		expect(classifyDelegatedResult(facts(row({ holderUserId: "u" })))).toMatchObject({
+			kind: "late",
+			reason: "taken_over",
+			holder: { kind: "human", userId: "u" },
+		});
 		expect(
 			classifyDelegatedResult({
 				...facts(row({ lastHolderNarratorId: "sub" }), "done"),
@@ -935,12 +1279,54 @@ describe("late results, as a table (design §2.5)", () => {
 	});
 
 	test("the note is replaced, never added twice", () => {
-		const note = '<outline_report task="k/s" status="current">\nbody\n</outline_report>';
+		const note =
+			'<outline_report task="k/s" report="k/r" generation="1" status="current">\nbody\n</outline_report>';
 		const once = withDelegationNote("result", note);
 		expect(once).toBe(`result\n\n${note}`);
 		expect(withDelegationNote(once, note)).toBe(once);
 		expect(stripDelegationNote(once)).toBe("result");
+		expect(stripDelegationNote(`${once}\n  \n`)).toBe("result");
+		expect(stripDelegationNote(note)).toBe("");
 		expect(withDelegationNote("result", "")).toBe("result");
+	});
+
+	test("a report that quotes a note keeps every line of it", () => {
+		const quoting = [
+			"Findings:",
+			'<outline_report task="x/y" generation="1" status="late" reason="gone">',
+			"quoted example",
+			"</outline_report>",
+			"More findings here.",
+			"Conclusion: fixed.",
+			"</outline_report>",
+		].join("\n");
+		expect(stripDelegationNote(quoting)).toBe(quoting);
+		// A note-looking tail whose head is not the system's exact form stays too.
+		const loose = 'text\n<outline_report task="x">\nbody\n</outline_report>';
+		expect(stripDelegationNote(loose)).toBe(loose);
+		// The real note after it is still found.
+		const note =
+			'<outline_report task="k/s" generation="2" status="late" reason="taken_over">\nLate.\n</outline_report>';
+		expect(withDelegationNote(quoting, note)).toBe(`${quoting}\n\n${note}`);
+		expect(stripDelegationNote(`${quoting}\n\n${note}`)).toBe(quoting);
+	});
+
+	test("stripping is linear: hundreds of KiB of repeated tags take milliseconds", () => {
+		const unit =
+			'<outline_report task="a" generation="1" status="current">\nx\n</outline_report>\n';
+		const huge = unit.repeat(Math.ceil((320 * 1024) / unit.length));
+		const open = "<outline_report \n".repeat(20_000);
+		const started = performance.now();
+		for (let i = 0; i < 5; i++) {
+			stripDelegationNote(huge);
+			withDelegationNote(huge, "");
+			stripDelegationNote(`${open}</outline_report>`);
+		}
+		expect(performance.now() - started).toBeLessThan(250);
+		// Only the last note is the delivery's.
+		expect(stripDelegationNote(huge).length).toBe(
+			huge.trimEnd().length - unit.trimEnd().length - 1,
+		);
 	});
 });
 

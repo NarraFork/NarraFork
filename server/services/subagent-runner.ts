@@ -264,7 +264,10 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		);
 	}
 	/** The subagent holds its delegated task and has not run yet: a failure gives the task back. */
-	let delegatedBeforeRun: string | null = null;
+	let delegatedBeforeRun: {
+		subagentId: string;
+		delegated: import("./outline/delegation").DelegatedOutlineTask;
+	} | null = null;
 	try {
 		if (input.toolCallBinding) {
 			const { narratorPersistence } = await import("./narrator-persistence");
@@ -313,14 +316,14 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				if (!input.toolCallBinding) throw new ValidationError("Agent call binding missing");
 				const [{ delegateOutlineTask, delegationStartedNote }, { delegationLocale }] =
 					await Promise.all([import("./outline/delegation"), import("./outline/delegation-text")]);
-				await delegateOutlineTask({
+				const delegated = await delegateOutlineTask({
 					delegation: input.delegation,
 					subagentId,
 					toolCallId: input.toolCallBinding.toolCallId,
 					userId: userId ?? null,
 					locale: delegationLocale(locale),
 				});
-				delegatedBeforeRun = subagentId;
+				delegatedBeforeRun = { subagentId, delegated };
 				delegationNote = `\n\n${delegationStartedNote(input.delegation)}`;
 			} catch (error) {
 				const { interruptAndArchiveSubagent } = await import("./subagent-lifecycle");
@@ -409,6 +412,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				text: "",
 				resumeRunId: task.logicalRunId ?? undefined,
 			});
+			if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 			delegatedBeforeRun = null;
 			void handle.terminal.finally(() => updateLease.release());
 			return (
@@ -433,6 +437,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			cancelSignal: input.signal,
 			foreground: true,
 		});
+		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 		delegatedBeforeRun = null;
 		void handle.terminal.finally(() => updateLease.release());
 		if (getSearchExecutionScope()) {
@@ -446,25 +451,40 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		return result.output + formatSubagentModelFallbackNote(inheritance) + conflictNote;
 	} catch (error) {
 		updateLease.release();
-		if (delegatedBeforeRun) await giveBackDelegatedTask(delegatedBeforeRun);
+		if (delegatedBeforeRun && input.delegation)
+			await giveBackDelegatedTask({
+				...delegatedBeforeRun,
+				delegation: input.delegation,
+				userId: userId ?? null,
+			});
 		throw error;
 	}
 }
 
+const NOT_STARTED = "The delegated agent's run did not start; its task was given back";
+
 /**
- * A subagent that took its delegated task but never ran: the task goes back to the session (as a
- * run's end hands it back), then the subagent is archived, holding nothing.
+ * A subagent that took its delegated task but never ran (its Agent call failed after the
+ * delegation's commit): the delegation is undone (a task that was to do is to do again, otherwise
+ * the session has it back), then the subagent is archived, holding nothing.
  */
-async function giveBackDelegatedTask(subagentId: string): Promise<void> {
+async function giveBackDelegatedTask(args: {
+	subagentId: string;
+	delegated: import("./outline/delegation").DelegatedOutlineTask;
+	delegation: import("./outline/delegation").PreparedOutlineDelegation;
+	userId: string | null;
+}): Promise<void> {
 	try {
-		const { idleOutlineTaskClaims } = await import("./outline/tasks");
-		await idleOutlineTaskClaims(subagentId);
+		const { undoOutlineDelegation } = await import("./outline/delegation");
+		await undoOutlineDelegation(args);
 	} catch (error) {
 		logger.warn("Delegated task could not be given back", {
-			subagentId,
+			subagentId: args.subagentId,
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
+	// A background task row created for it is settled, so nothing waits on a run that never was.
+	await backgroundTaskService.cancel(args.subagentId).catch(() => false);
 	const { interruptAndArchiveSubagent } = await import("./subagent-lifecycle");
-	await interruptAndArchiveSubagent(subagentId).catch(() => {});
+	await interruptAndArchiveSubagent(args.subagentId).catch(() => {});
 }

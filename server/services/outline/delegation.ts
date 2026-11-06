@@ -26,12 +26,20 @@
  *      block, the claim generation, the delegating session, the Agent call, the language), then one
  *      system commit (`outline-delegate`, for the delegating session, the Agent call's provenance)
  *      sets the task in progress and hands its claim to the subagent with the next generation
- *      (`OutlineWriteOptions.delegateClaim`). A claim that moved meanwhile refuses it; the
- *      subagent, which never ran, is archived by the caller.
+ *      (`OutlineWriteOptions.delegateClaim`), written against the task's version as checked. A
+ *      task changed meanwhile (finished, reopened, edited, claimed) refuses it, and the refusal
+ *      says who has the task now when someone does; the subagent, which never ran, is archived by
+ *      the caller. When the Agent call fails after the commit (or the run never starts),
+ *      `undoOutlineDelegation` sets a task that was to do back to do, or gives it back to the
+ *      session, before the subagent is archived.
  *
  * While it runs the subagent's lease keeper renews that claim; when a run ends the claim passes
- * to the root on the idle lease, generation unchanged (`lease-keeper.ts`). Continuation leaves the
- * task, and the tasks under it, to the subagent meanwhile (`tasks.ts`).
+ * to the root on the idle lease, generation unchanged (`lease-keeper.ts`). Archiving a delegated
+ * subagent (Agent `archive`, a history rollback) gives the task back the same way first
+ * (`subagent-lifecycle.ts`), so the task stays with the session (design §2.9). A subagent of the
+ * session that holds the task but is not running (it never started) does not block delegating it
+ * again. Continuation leaves the task, and the tasks under it, to the subagent meanwhile
+ * (`tasks.ts`).
  *
  * ATTACHING (`attachDelegatedReport`, from the run service when a result is delivered)
  * -----------------------------------------------------------------------------------
@@ -84,6 +92,7 @@ import {
 	OutlineBusyError,
 	OutlineClaimChangedError,
 	type OutlineClaimHolder,
+	OutlineConflictError,
 	OutlineTaskClaimedError,
 	OutlineWriteError,
 } from "./errors";
@@ -96,7 +105,12 @@ import { OUTLINE_REPORT_LIMITS, type ReportBlock, type ReportConversion } from "
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineStore, OutlineTaskClaimRow } from "./store/port";
 import { hasHumanAssignee, isPlanningRoot } from "./task-json";
-import { deriveOutlineTaskWaits, getOutlineTaskClaims, isClaimLive } from "./tasks";
+import {
+	deriveOutlineTaskWaits,
+	getOutlineTaskClaims,
+	idleOutlineTaskClaims,
+	isClaimLive,
+} from "./tasks";
 import type { OutlineNode } from "./tree";
 import { type OutlineOp, writeOutline } from "./write";
 
@@ -410,6 +424,12 @@ export interface PreparedOutlineDelegation {
 	title: string;
 	/** The generation the delegation's claim will have: the claim's as read, plus one. */
 	epoch: number;
+	/**
+	 * The task's `version_seq` and checkbox as checked: the delegation's commit is written against
+	 * that version, so a task finished, reopened or reassigned since is not set in progress again.
+	 */
+	versionSeq: number;
+	status: "todo" | "doing";
 	delegatorNarratorId: string;
 	/** The subagent's first message. */
 	brief: string;
@@ -519,9 +539,13 @@ export async function prepareOutlineDelegation(args: {
 		const holderId = claim.holderNarratorId as string;
 		if (holderId !== args.narratorId) {
 			const roots = await store.getNarratorRoots([holderId]);
-			if (roots.get(holderId)?.root === args.narratorId)
+			if (roots.get(holderId)?.root !== args.narratorId)
+				refuse(text.claimed(address, await holderName(holder)));
+			// A subagent of this session holds it: refused while it runs. One that is not running
+			// (it never started, or the server stopped before it did) holds it for the session:
+			// delegating again takes it over.
+			else if (await isRunning(holderId))
 				refuse(text.runningSubagent(address, await holderName(holder)));
-			refuse(text.claimed(address, await holderName(holder)));
 		}
 	}
 
@@ -535,9 +559,17 @@ export async function prepareOutlineDelegation(args: {
 		address,
 		title: blockTitle(block.content) || address,
 		epoch: (claim?.epoch ?? 0) + 1,
+		versionSeq: block.versionSeq,
+		status: task.status as "todo" | "doing",
 		delegatorNarratorId: args.narratorId,
 		brief,
 	};
+}
+
+/** Whether a narrator has a run in this process (executing, held, or finishing). */
+async function isRunning(narratorId: string): Promise<boolean> {
+	const { getExecutionOwner, getRunControl } = await import("../agent-runtime/ownership");
+	return !!getRunControl(narratorId) || !!getExecutionOwner(narratorId);
 }
 
 /** What the instructions show, read from the task's subtree (bounded; see the limits). */
@@ -613,11 +645,19 @@ async function readBriefInput(
 	};
 }
 
+/** A task handed to a subagent: what the registration records, and the task's version after it. */
+export interface DelegatedOutlineTask {
+	registration: DelegatedTaskRegistration;
+	/** The task's `version_seq` right after the delegation's commit. */
+	versionSeq: number;
+}
+
 /**
  * Hand the task to the subagent just created (module header, step 3): its registration records
- * the delegation, then the delegation's commit claims the task for it. Throws
- * {@link OutlineDelegationError} when the task changed hands since it was checked; the caller
- * archives the subagent, which never ran.
+ * the delegation, then the delegation's commit claims the task for it, written against the version
+ * the checks read. Throws {@link OutlineDelegationError} when the task changed since it was
+ * checked (finished, reopened, edited, claimed meanwhile); the registration is cleared again and
+ * the caller archives the subagent, which never ran.
  */
 export async function delegateOutlineTask(args: {
 	delegation: PreparedOutlineDelegation;
@@ -627,8 +667,9 @@ export async function delegateOutlineTask(args: {
 	userId: string | null;
 	locale: DelegationLocale;
 	store?: OutlineStore;
-}): Promise<DelegatedTaskRegistration> {
+}): Promise<DelegatedOutlineTask> {
 	const { delegation, subagentId } = args;
+	const store = args.store ?? outlineStore;
 	const registered: DelegatedTaskRegistration = {
 		spaceId: delegation.spaceId,
 		blockId: delegation.blockId,
@@ -652,7 +693,14 @@ export async function delegateOutlineTask(args: {
 		await writeOutline(
 			{
 				spaceId: delegation.spaceId,
-				ops: [{ op: "setTask", block: { id: delegation.blockId }, task: { status: "doing" } }],
+				ops: [
+					{
+						op: "setTask",
+						block: { id: delegation.blockId },
+						task: { status: "doing" },
+						baseVersionSeq: delegation.versionSeq,
+					},
+				],
 				actor: { kind: "system", id: OUTLINE_DELEGATION_ACTOR },
 				responsibleUserId: args.userId,
 				narratorId: delegation.delegatorNarratorId,
@@ -665,7 +713,7 @@ export async function delegateOutlineTask(args: {
 				),
 			},
 			{
-				store: args.store,
+				store,
 				delegateClaim: {
 					blockId: delegation.blockId,
 					holderNarratorId: subagentId,
@@ -676,17 +724,96 @@ export async function delegateOutlineTask(args: {
 	} catch (error) {
 		// Not delegated after all: the registration names no task (the subagent never runs).
 		await setRuntimeRegistration(subagentId, current).catch(() => {});
-		if (error instanceof OutlineTaskClaimedError)
-			throw new OutlineDelegationError(
-				DELEGATION_TEXT.claimed(delegation.address, await holderName(error.holder)),
-			);
-		if (error instanceof OutlineClaimChangedError)
-			throw new OutlineDelegationError(DELEGATION_TEXT.changedMeanwhile(delegation.address));
-		if (error instanceof AppError && error.statusCode < 500)
-			throw new OutlineDelegationError(error.message);
-		throw error;
+		throw await delegationRefusal(error, delegation, subagentId, store);
 	}
-	return registered;
+	const block = await store.getBlock(delegation.blockId);
+	return { registration: registered, versionSeq: block?.versionSeq ?? delegation.versionSeq };
+}
+
+/** Why the delegation's commit was refused, as the agent is told. */
+async function delegationRefusal(
+	error: unknown,
+	delegation: PreparedOutlineDelegation,
+	subagentId: string,
+	store: OutlineStore,
+): Promise<unknown> {
+	const text = DELEGATION_TEXT;
+	if (error instanceof OutlineTaskClaimedError)
+		return new OutlineDelegationError(
+			text.claimed(delegation.address, await holderName(error.holder)),
+		);
+	if (error instanceof OutlineClaimChangedError || error instanceof OutlineConflictError) {
+		// The task changed since it was checked: say who has it now, when someone does.
+		const claim = (await store.getTaskClaims([delegation.blockId]).catch(() => []))[0] ?? null;
+		const root = delegation.delegatorNarratorId;
+		if (claim && isClaimLive(claim, new Date().toISOString())) {
+			const holder = claim.holderNarratorId;
+			if (claim.holderUserId !== null)
+				return new OutlineDelegationError(
+					text.claimed(delegation.address, await holderName(holderOf(claim))),
+				);
+			if (holder && holder !== subagentId && holder !== root) {
+				const roots = await store.getNarratorRoots([holder]).catch(() => new Map());
+				const name = await holderName(holderOf(claim));
+				// Another Agent call of this session (in the same message, say) took it first.
+				return new OutlineDelegationError(
+					roots.get(holder)?.root === root
+						? text.takenBySibling(delegation.address, name)
+						: text.claimed(delegation.address, name),
+				);
+			}
+		}
+		return new OutlineDelegationError(text.changedMeanwhile(delegation.address));
+	}
+	if (error instanceof AppError && error.statusCode < 500)
+		return new OutlineDelegationError(error.message);
+	return error;
+}
+
+/**
+ * Undo a delegation whose subagent never ran (its Agent call failed after the delegation's
+ * commit): a task that was to do goes back to do (written against the version the delegation
+ * left, so a change made since stays); otherwise, or when that cannot be written, the task goes
+ * back to the session as a run's end would hand it back. The caller archives the subagent then.
+ */
+export async function undoOutlineDelegation(args: {
+	delegation: PreparedOutlineDelegation;
+	delegated: DelegatedOutlineTask;
+	subagentId: string;
+	userId: string | null;
+	store?: OutlineStore;
+}): Promise<void> {
+	const { delegation } = args;
+	if (delegation.status === "todo") {
+		try {
+			await writeOutline(
+				{
+					spaceId: delegation.spaceId,
+					ops: [
+						{
+							op: "setTask",
+							block: { id: delegation.blockId },
+							task: { status: "todo" },
+							baseVersionSeq: args.delegated.versionSeq,
+						},
+					],
+					actor: { kind: "system", id: OUTLINE_DELEGATION_ACTOR },
+					responsibleUserId: args.userId,
+					narratorId: delegation.delegatorNarratorId,
+					toolCallId: args.delegated.registration.toolCallId,
+					summary: DELEGATION_TEXT.summary.undone(delegation.address, args.subagentId),
+				},
+				{ store: args.store },
+			);
+			return;
+		} catch (error) {
+			logger.warn("Delegated task could not be set back to do", {
+				subagentId: args.subagentId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	await idleOutlineTaskClaims(args.subagentId, args.store ? { store: args.store } : {});
 }
 
 /** The line added after `<background_task_id>` when an agent was sent with a task. */
@@ -709,6 +836,8 @@ export interface DelegatedResultFacts {
 	claim: OutlineTaskClaimRow | null;
 	/** Whether a narrator belongs to the delegating session (it, its subagents). */
 	inSession: (narratorId: string) => boolean;
+	/** The delegating session itself (its root). */
+	delegatorNarratorId: string;
 	/** Who wrote the task's current version (read for a finished task whose claim is released). */
 	finishedBy?: { actorKind: string; actorId: string; narratorId: string | null } | null;
 }
@@ -737,7 +866,10 @@ export function classifyDelegatedResult(facts: DelegatedResultFacts): DelegatedR
 		const session =
 			claim.holderNarratorId ?? (claim.holderUserId === null ? claim.lastHolderNarratorId : null);
 		if (claim.holderUserId === null && session !== null && facts.inSession(session)) {
-			return { kind: "late", reason: "redelegated", epoch: claim.epoch };
+			// Another of its agents has (or had) it: delegated again. The session itself: it took
+			// the task up again (after it went back to do, say), whoever did the work since.
+			const reason = session === facts.delegatorNarratorId ? "reclaimed" : "redelegated";
+			return { kind: "late", reason, epoch: claim.epoch };
 		}
 		const holder =
 			holderOf(claim) ??
@@ -766,11 +898,37 @@ export function classifyDelegatedResult(facts: DelegatedResultFacts): DelegatedR
 // Attaching
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NOTE_RE = /\n*<outline_report [^\n]*>\n[\s\S]*?\n<\/outline_report>\s*$/;
+/** The head line of a note exactly as `noteText` writes it. */
+const NOTE_HEAD_RE =
+	/^<outline_report task="[^"<>&\n]*"(?: report="[^"<>&\n]*")? generation="\d+" status="(?:current|late|not_attached)"(?: reason="[a-z_]+")?>$/;
+const NOTE_CLOSE = "</outline_report>";
+/** The note is at most about a KiB: only this much of a text's end is looked at. */
+const NOTE_WINDOW = 4096;
 
-/** The text without the delegation note a delivery added to it (recovery delivers it again). */
+/**
+ * The text without the delegation note a delivery added at its end (recovery delivers it again).
+ * Only the end is looked at, in one pass over at most {@link NOTE_WINDOW} characters: the note is
+ * exactly three lines (its head as `noteText` writes it, one line of text, the closing tag) and
+ * the last thing in the text. Anything else (a report quoting a note, a tag left open) is left
+ * as it is.
+ */
 export function stripDelegationNote(text: string): string {
-	return text.replace(NOTE_RE, "");
+	let end = text.length;
+	while (end > 0 && /\s/.test(text.charAt(end - 1))) end--;
+	if (end < NOTE_CLOSE.length || text.slice(end - NOTE_CLOSE.length, end) !== NOTE_CLOSE)
+		return text;
+	const lines = text.slice(Math.max(0, end - NOTE_WINDOW), end).split("\n");
+	if (lines.length < 3) return text;
+	const head = lines[lines.length - 3] as string;
+	const body = lines[lines.length - 2] as string;
+	if (!NOTE_HEAD_RE.test(head) || body.includes("<outline_report") || body.includes(NOTE_CLOSE))
+		return text;
+	const start = end - NOTE_CLOSE.length - body.length - head.length - 2;
+	// The head starts a line of the text (not a line the window cut into).
+	if (start > 0 && text.charAt(start - 1) !== "\n") return text;
+	let cut = start;
+	while (cut > 0 && text.charAt(cut - 1) === "\n") cut--;
+	return text.slice(0, cut);
 }
 
 /** `text` with the note at its end, replacing one already there. */
@@ -878,6 +1036,7 @@ export async function attachDelegatedReport(args: {
 				task: block && space ? block : null,
 				claim,
 				inSession: await sessionOf(store, delegated, claim),
+				delegatorNarratorId: delegated.delegatorNarratorId,
 				finishedBy: await finishedBy(store, block, claim),
 			});
 			if (verdict.kind === "late" && verdict.reason === "gone") {
@@ -1057,6 +1216,9 @@ async function noteFor(
 			break;
 		case "redelegated":
 			lead = note.late.redelegated(verdict.epoch ?? 0);
+			break;
+		case "reclaimed":
+			lead = note.late.reclaimed(verdict.epoch ?? 0);
 			break;
 		case "ended": {
 			const by = verdict.finishedBy;

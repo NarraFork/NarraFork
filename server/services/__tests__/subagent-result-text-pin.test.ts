@@ -38,8 +38,8 @@ const originalAllowedModels = settings.agent.subagentAllowedModels;
 const ids: string[] = [];
 const restores: Array<() => void> = [];
 let parentId: string;
-/** Final texts the scripted model passes return, in order. */
-let replies: string[] = [];
+/** What the scripted model passes return, in order (a reply may wait on a gate, or fail). */
+let replies: Array<string | { text: string; hasError?: boolean; gate?: Promise<void> }> = [];
 
 const runEnded = (id: string) => !getExecutionOwner(id) && !getRunControl(id);
 
@@ -91,9 +91,12 @@ beforeEach(async () => {
 	const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async (options) => {
 		const id = options.config.narratorId as string;
 		if (!ids.includes(id)) ids.push(id);
+		const next = replies.shift() ?? "(scripted)";
+		const reply = typeof next === "string" ? { text: next } : next;
+		await reply.gate;
 		return {
-			finalText: replies.shift() ?? "(scripted)",
-			hasError: false,
+			finalText: reply.text,
+			hasError: reply.hasError === true,
 			shouldUpdateTitle: false,
 			completedNaturally: true,
 			completedAssistantTurn: true,
@@ -173,7 +176,7 @@ async function agentCall() {
 	return { toolUseId, binding: { toolCallId: callId, attempt: 1, executionSegmentId: segmentId } };
 }
 
-async function launch(background: boolean) {
+async function launch(background: boolean, signal = new AbortController().signal) {
 	const call = await agentCall();
 	const output = await runSubagent({
 		parentNarratorId: parentId,
@@ -186,12 +189,12 @@ async function launch(background: boolean) {
 		alias: "pin-run",
 		model: MODEL,
 		locale: "en",
-		signal: new AbortController().signal,
+		signal,
 		background,
 		userId: null,
 	});
 	const child = await db.query.narrators.findFirst({
-		where: eq(narrators.parentNarratorId, parentId),
+		where: eq(narrators.originToolCallId, call.binding.toolCallId),
 	});
 	if (!child) throw new Error("no child");
 	if (!ids.includes(child.id)) ids.push(child.id);
@@ -242,6 +245,54 @@ describe("subagent result text without task (pinned)", () => {
 		expect(await toolOutput(call.binding.toolCallId)).toBe(
 			"<subagent_id>pin-run</subagent_id>\n\nsecond answer",
 		);
+	});
+
+	test("a failed run: the foreground tool result, and a background task's failure", async () => {
+		replies = [{ text: "Model refused the request.", hasError: true }];
+		const fg = await launch(false);
+		expect(fg.output).toBe("<subagent_id>pin-run</subagent_id>\n\nModel refused the request.");
+		replies = [{ text: "Provider error: overloaded", hasError: true }];
+		const { childId } = await launch(true);
+		await until(() => runEnded(childId));
+		await until(
+			async () =>
+				(await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, childId) }))
+					?.status === "failed",
+		);
+		const task = await db.query.backgroundTasks.findFirst({
+			where: eq(backgroundTasks.id, childId),
+		});
+		expect(task?.output).toBe("Provider error: overloaded");
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
+		expect(row?.backgroundResult).toBe("Provider error: overloaded");
+	});
+
+	test("a cancelled run: the caller's interrupt in the foreground, a Stop in the background", async () => {
+		const caller = new AbortController();
+		const first = Promise.withResolvers<void>();
+		replies = [{ text: "", gate: first.promise }];
+		const pending = launch(false, caller.signal);
+		await until(async () => ids.length > 1 && !!getRunControl(ids.at(-1) as string));
+		caller.abort("Caller interrupted in test");
+		first.resolve();
+		const fg = await pending;
+		expect(fg.output).toBe(
+			"<subagent_id>pin-run</subagent_id>\n\nInterrupted: Caller interrupted in test",
+		);
+		const second = Promise.withResolvers<void>();
+		replies = [{ text: "", gate: second.promise }];
+		const { childId } = await launch(true);
+		await until(() => !!getRunControl(childId));
+		expect(await controlRun(childId, { kind: "cancel", reason: "Stopped in test" })).toBe(true);
+		second.resolve();
+		await until(() => runEnded(childId));
+		await until(
+			async () =>
+				(await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, childId) }))
+					?.status === "cancelled",
+		);
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
+		expect(row?.backgroundResult).toBe("Interrupted: Stopped in test");
 	});
 
 	test("a held result released with no live run: delivered as the conclusion", async () => {

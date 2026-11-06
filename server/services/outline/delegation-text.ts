@@ -21,7 +21,13 @@ export function delegationLocale(locale: string | null | undefined): DelegationL
 const quoted = (text: string) => JSON.stringify(text);
 
 /** Why a delegated result is late (`classifyDelegatedResult`). */
-export type DelegationLateReason = "taken_over" | "redelegated" | "ended" | "reopened" | "gone";
+export type DelegationLateReason =
+	| "taken_over"
+	| "redelegated"
+	| "reclaimed"
+	| "ended"
+	| "reopened"
+	| "gone";
 
 /** How a run ended, as a report says when it did not finish. */
 export type DelegationRunEnding = "completed" | "failed" | "timed_out" | "cancelled";
@@ -60,7 +66,9 @@ export const DELEGATION_TEXT = {
 	runningSubagent: (address: string, holder: string) =>
 		`${address} is already handed to ${holder}, which is still running; Stop it to hand the task to another agent, or Send it further instructions`,
 	changedMeanwhile: (address: string) =>
-		`${address} changed hands while it was being delegated; read it again and decide again`,
+		`${address} changed while it was being delegated (finished, reopened, edited or claimed meanwhile); read it again and decide again`,
+	takenBySibling: (address: string, holder: string) =>
+		`${address} was just handed to ${holder} by another Agent call of this session; Send it further instructions, or wait for its report`,
 	noBinding: "the Agent call has no recorded tool call to delegate from",
 
 	/** After `<background_task_id>` when a background agent was sent with a task. */
@@ -108,6 +116,8 @@ export const DELEGATION_TEXT = {
 				`Late result: since this agent was sent, the task was taken over by ${holder} (claim generation ${epoch}).`,
 			redelegated: (epoch: number) =>
 				`Late result: since this agent was sent, the task was delegated again (claim generation ${epoch}).`,
+			reclaimed: (epoch: number) =>
+				`Late result: since this agent was sent, this session took the task up again (claim generation ${epoch}); the work since may be its own or another agent's.`,
 			ended: (by: string, status: string) =>
 				`Late result: since this agent was sent, the task was ticked ${status} by ${by}.`,
 			reopened:
@@ -132,6 +142,8 @@ export const DELEGATION_TEXT = {
 	summary: {
 		delegated: (address: string, subagentId: string, epoch: number) =>
 			`delegated ${address} to subagent ${subagentId} (claim generation ${epoch})`,
+		undone: (address: string, subagentId: string) =>
+			`${address} back to do: subagent ${subagentId} it was delegated to never ran`,
 		report: (subagentId: string, late: boolean) =>
 			late
 				? `late report of subagent ${subagentId} attached`
