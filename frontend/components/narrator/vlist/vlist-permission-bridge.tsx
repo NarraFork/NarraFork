@@ -31,6 +31,7 @@ import type {
 	PermissionCallbacks,
 } from "../narrator-panel-types";
 import { InlinePermission } from "../permission/InlinePermission";
+import { TranscriptPermissionTypography } from "../permission/permission-textarea-typography";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import { AsyncQuestionDetail, AsyncQuestionSummary } from "../question/AsyncQuestionDetail";
 import {
@@ -241,6 +242,13 @@ export function usePermissionSlots({
  * that is not running.
  */
 export function buildAsyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
+	const node = asyncQuestionNode(slot);
+	return node === null ? null : (
+		<TranscriptPermissionTypography>{node}</TranscriptPermissionTypography>
+	);
+}
+
+function asyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
 	if (slot.question) {
 		if (slot.summaryOnly || slot.question.status !== "open" || slot.readOnly)
 			return <AsyncQuestionSummary question={slot.question} readOnly={slot.readOnly} />;
@@ -293,8 +301,22 @@ interface PermissionNodeHandlers {
  * uses the full question banner; every other tool uses InlinePermission (which
  * itself internally renders the AskUserQuestion banner only when appropriate, but
  * we short-circuit here for parity with the chunked path's card body).
+ *
+ * Every form is marked as the transcript's, so its textareas paint the rows the height
+ * model reserved for them (permission-textarea-typography.tsx, D49).
  */
 export function buildPermissionNode(
+	permission: PendingPermission,
+	handlers: PermissionNodeHandlers,
+): ReactNode {
+	return (
+		<TranscriptPermissionTypography>
+			{permissionNode(permission, handlers)}
+		</TranscriptPermissionTypography>
+	);
+}
+
+function permissionNode(
 	permission: PendingPermission,
 	handlers: PermissionNodeHandlers,
 ): ReactNode {
