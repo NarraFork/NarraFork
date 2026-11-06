@@ -167,13 +167,9 @@ export const outlineBoardTaskUpdateBodySchema = z
 		message: "nothing to change",
 	});
 
-/**
- * A plan's diff (outline P2 PR 8): compared from `from` (a seq; 0 is nothing) to now. `skip`: a
- * block of the plan left out with what is under it (a plan review's comments, PR 8b).
- */
+/** A plan's diff (outline P2 PR 8): compared from `from` (a seq; 0 is nothing) to now. */
 export const outlinePlanDiffQuerySchema = z.object({
 	from: seqSchema,
-	skip: outlineIdSchema.optional(),
 });
 
 /** A person's decision on a submitted plan (`POST /narrators/permissions/:id/plan`). */

@@ -435,6 +435,31 @@ describe("measureInlinePermission — an outline plan's approval (outline P2 PR 
 		).toEqual(predictInlinePermission(base, { innerWidth: 600, canDecide: true }));
 	});
 
+	it("gives the empty feedback box its placeholder's rows (outline P2 PR 8b review round 1)", async () => {
+		const { predictInlinePermission, OUTLINE_PLAN_FEEDBACK_PLACEHOLDER } = await import(
+			"../vlist-permission-prediction"
+		);
+		const inputJson = {
+			plan: "- [ ] Plan",
+			_planRoot: { blockId: "b", spaceId: "s", pageId: "p", address: "a", title: "P", round: 1 },
+		};
+		const rows = (innerWidth: number, placeholder?: string) =>
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{
+					innerWidth,
+					canDecide: true,
+					...(placeholder ? { planFeedbackPlaceholder: placeholder } : {}),
+				},
+			)?.feedbackRows;
+		// Stub: 0.6 × 12px a character; the box's text area is 22px narrower than the card.
+		const one = Math.ceil(OUTLINE_PLAN_FEEDBACK_PLACEHOLDER.length * 7.2) + 22;
+		expect(rows(one + 40)).toBe(1);
+		expect(rows(one - 40)).toBe(2);
+		expect(rows(60)).toBe(3);
+		expect(rows(328, "短")).toBe(1);
+	});
+
 	it("wraps the three decisions at phone width (review round 1 U1)", async () => {
 		const { predictInlinePermission, estimateButtonRows } = await import(
 			"../vlist-permission-prediction"

@@ -1880,6 +1880,9 @@ export async function resolveExitPlanModeReflection(
 		"@server/services/narrator-permission"
 	);
 	const planReadPolicy = await loadPlanFileReadPolicy(config.narratorId);
+	// The ExitPlanMode call: an outline plan's review is written for it and handed on by it.
+	const toolCallId =
+		recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId ?? null;
 	const resolvedInput = await resolveExitPlanModeInputWithBackend(
 		config.narratorId,
 		config.cwd,
@@ -1892,6 +1895,7 @@ export async function resolveExitPlanModeReflection(
 		planReadPolicy,
 		// A restored gate's input is the one resolved before (an outline plan decided meanwhile).
 		recoveryGate !== undefined,
+		{ toolUseId: toolUse.toolUseId, toolCallId },
 	);
 	if (!resolvedInput.ok) {
 		return {
@@ -1908,7 +1912,13 @@ export async function resolveExitPlanModeReflection(
 		// A taken-over plan gate is no longer AI-owned. The caller must re-register
 		// the real ExitPlanMode permission under the original tool-call identity.
 		// Do not create a synthetic running gate or launch an auxiliary model request.
-		if (typeof toolUse.input.plan === "string" && toolUse.input.plan !== resolvedInput.input.plan) {
+		// An outline plan that changed while it waited is put to the person again as it is now
+		// (outline P2 PR 8b, review round 1); a plan file is still refused.
+		if (
+			typeof toolUse.input.plan === "string" &&
+			toolUse.input.plan !== resolvedInput.input.plan &&
+			!outlinePlanSubmissionOf(resolvedInput.input)
+		) {
 			return {
 				decision: {
 					action: "revise",
@@ -1934,6 +1944,8 @@ export async function resolveExitPlanModeReflection(
 		const recovered = await outlinePlanMode.recoverOutlinePlanReview({
 			narratorId: config.narratorId,
 			requestId,
+			toolUseId: toolUse.toolUseId,
+			toolCallId,
 			input: resolvedInput.input,
 			locale,
 		});
@@ -1945,7 +1957,7 @@ export async function resolveExitPlanModeReflection(
 				toolUseId: toolUse.toolUseId,
 				toolName: toolUse.name,
 				inputJson: recovered.input,
-				toolCallId: recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+				toolCallId: toolCallId ?? undefined,
 				restoredStartedAt: restoredReflection.startedAt,
 			});
 			const reason = `Plan review left ${recovered.review.count} comment(s) under the plan; awaiting user decision`;
@@ -1962,6 +1974,7 @@ export async function resolveExitPlanModeReflection(
 	}
 	const outlinePrompt = outlinePlanMode
 		? await outlinePlanMode.outlinePlanReviewPrompt({
+				narratorId: config.narratorId,
 				requestId,
 				input: resolvedInput.input,
 				locale,
@@ -2065,6 +2078,8 @@ export async function resolveExitPlanModeReflection(
 			.recoverOutlinePlanReview({
 				narratorId: config.narratorId,
 				requestId,
+				toolUseId: toolUse.toolUseId,
+				toolCallId,
 				input: resolvedInput.input,
 				locale,
 			})

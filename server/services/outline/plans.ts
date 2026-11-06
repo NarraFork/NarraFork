@@ -42,14 +42,21 @@
  * -------------------------
  * A plan review (计划反思) with concerns leaves them under the root ({@link writePlanReview}): one
  * block 「审查意见（第 N 版）」 written by the system actor `plan-review`, each comment a child
- * of it, linking the step it is about. Its id is the caller's (derived from the review, so a
- * review restored after a restart finds what it wrote: {@link readPlanReview}). A review with no
- * concerns writes nothing: the approval it leads to is a draft decided on the person's behalf.
+ * of it, linking the step it is about. Its id is derived from the review ({@link planReviewBlockId},
+ * so a review restored after a restart finds what it wrote: {@link readPlanReview}), and its
+ * commit names the ExitPlanMode call it reviewed. A review with no concerns writes nothing: the
+ * approval it leads to is a draft decided on the person's behalf.
+ *
+ * The reviews of the version being planned ({@link planReviewBlocks}: children of the root that
+ * plan-review wrote for the session since the version's base) are not the plan: the submission's
+ * rendering and size budget, its diff, the next reviewer's view, the person's edits told to the
+ * agent and the 409 check all leave them out.
  *
  * Every read is bounded: the session space's open tasks (one indexed read), the plan's page
  * structure (as `OutlineRead`), the commits since the seen version (at most
  * {@link OUTLINE_PLAN_LIMITS.commitScan}).
  */
+import { createHash } from "node:crypto";
 import { AppError } from "@server/lib/errors";
 import { hotSafe } from "@server/lib/hot-safe";
 import {
@@ -448,12 +455,12 @@ export async function readPlanSubmission(args: {
 	rootRef?: string | null;
 	summary?: string | null;
 	/**
-	 * The review a call names for this submission (PR 8b): attached, as the outline has it now,
-	 * when it is a review of this root's version being submitted written by the plan-review actor
-	 * for `session` ({@link verifiedPlanReview}); its comments are then left out of the diff (they
-	 * are shown on their own). Anything else named is ignored.
+	 * The review the call has (PR 8b; the server's, never a model's: see `outline-plan-mode.ts`):
+	 * attached, as the outline has it now, when it is one of this version's reviews
+	 * ({@link planReviewBlocks}) written for that very call (its commit's tool call) and of this
+	 * version. Anything else is ignored.
 	 */
-	review?: OutlinePlanReviewOf | null;
+	review?: OutlinePlanReviewClaim | null;
 	store?: OutlineStore;
 }): Promise<OutlinePlanSubmissionRead> {
 	const store = args.store ?? outlineStore;
@@ -472,11 +479,21 @@ export async function readPlanSubmission(args: {
 	}
 	const found = root;
 	return await withOutlineLiveBarrier(found.spaceId, async () => {
+		const block = await store.getBlock(found.blockId);
+		const plan = block?.taskJson?.plan;
+		if (!block || block.deleted)
+			return { ok: false, problem: { kind: "notFound", address: found.address } };
+		if (!plan || plan.state !== "planning")
+			return { ok: false, problem: { kind: "notPlanning", address: found.address } };
+		// This version's reviews: left out of the rendering, its budget and the diff (N1, N2).
+		const reviews = await planReviewBlocks(store, args.session, block, plan.baseSeq);
+		const omit = new Set(reviews.keys());
 		const read = await readOutline({
 			blockId: found.blockId,
 			view: "all",
 			budget: { blocks: OUTLINE_PLAN_LIMITS.maxBlocks, bytes: OUTLINE_PLAN_LIMITS.renderBytes },
 			planNotes: false,
+			omit,
 			store,
 		});
 		if (!read) return { ok: false, problem: { kind: "notFound", address: found.address } };
@@ -487,23 +504,32 @@ export async function readPlanSubmission(args: {
 					kind: "tooLarge",
 					address: found.address,
 					blocks: OUTLINE_PLAN_LIMITS.maxBlocks,
+					kib: OUTLINE_PLAN_LIMITS.renderBytes / 1024,
 				},
 			};
-		const block = await store.getBlock(found.blockId);
-		const plan = block?.taskJson?.plan;
-		if (!block || block.deleted || !plan || plan.state !== "planning")
-			return { ok: false, problem: { kind: "notPlanning", address: found.address } };
+		const claim = args.review;
+		const written = claim ? reviews.get(claim.blockId) : undefined;
 		const review =
-			args.review &&
-			args.review.rootId === found.blockId &&
-			args.review.review.round === plan.round + 1
-				? await verifiedPlanReview(store, args.session, block, args.review.review)
+			claim &&
+			written &&
+			claim.rootId === found.blockId &&
+			claim.round === plan.round + 1 &&
+			(!claim.toolCallId || written.toolCallId === claim.toolCallId)
+				? {
+						...(await reviewFromBlock(
+							store,
+							read.space,
+							{ id: claim.blockId, sid: written.sid },
+							claim.round,
+						)),
+						submittedSeq: claim.submittedSeq,
+					}
 				: null;
 		const diff = await readPlanDiff({
 			rootId: found.blockId,
 			fromSeq: plan.baseSeq,
 			toSeq: read.seq,
-			...(review ? { skip: new Set([review.blockId]) } : {}),
+			...(omit.size > 0 ? { skip: omit } : {}),
 			store,
 		});
 		const counts: OutlinePlanDiffCounts = diff?.counts ?? {
@@ -572,8 +598,8 @@ async function planBlockIds(
  * counts as changed) of a block of the plan, written by a commit of someone else (the commits
  * since then read once, at most {@link OUTLINE_PLAN_LIMITS.commitScan}; one past them counts as
  * changed). A live session's flush with nobody to name (`system:outline-live`) is not counted: it
- * is most often the person's own typing saved for them (review round 1 N7). A block moved off the
- * page since then is not seen.
+ * is most often the person's own typing saved for them (review round 1 N7), nor are the plan
+ * review's comments for `session` (PR 8b). A block moved off the page since then is not seen.
  */
 async function changedByOthersSince(
 	store: OutlineStore,
@@ -581,6 +607,7 @@ async function changedByOthersSince(
 	root: { id: string; pageId: string },
 	seenSeq: number,
 	decider: OutlineTaskActorRef,
+	session: string,
 ): Promise<boolean> {
 	if (space.nextSeq - 1 <= seenSeq) return false;
 	const versions = await store.listPageVersions(root.pageId, {
@@ -602,6 +629,13 @@ async function changedByOthersSince(
 		if (!commit) return true;
 		if (commit.actorKind === decider.kind && commit.actorId === decider.id) continue;
 		if (commit.actorKind === "system" && commit.actorId === LIVE_FLUSH_ACTOR) continue;
+		// The plan review's comments for this session are not someone changing the plan (PR 8b).
+		if (
+			commit.actorKind === "system" &&
+			commit.actorId === OUTLINE_PLAN_REVIEW_ACTOR &&
+			commit.narratorId === session
+		)
+			continue;
 		return true;
 	}
 	return false;
@@ -716,6 +750,7 @@ export async function decideOutlinePlan(args: {
 				{ id: block.id, pageId: block.pageId },
 				args.seenSeq,
 				deciderRef,
+				args.session,
 			))
 		) {
 			throw new OutlinePlanError(
@@ -886,9 +921,12 @@ export async function discardEmptyPlanRoot(args: {
 export async function renderPlanForReview(args: {
 	rootId: string;
 	seq: number;
+	/** Blocks left out: this version's earlier reviews (review round 1 N1). */
+	omit?: ReadonlySet<string>;
 	store?: OutlineStore;
 }): Promise<string | null> {
 	const read = await readOutline({
+		...(args.omit && args.omit.size > 0 ? { omit: args.omit } : {}),
 		blockId: args.rootId,
 		...(args.seq >= 1 ? { asOf: args.seq } : {}),
 		view: "all",
@@ -900,10 +938,99 @@ export async function renderPlanForReview(args: {
 	return read?.markdown ?? null;
 }
 
-/** A review of a submission: the plan root it is about, and the review. */
-export interface OutlinePlanReviewOf {
+/**
+ * The review a call has, as the server handed it on (PR 8b): the root and version it is about,
+ * its block, the seq of the version it reviewed, and the call (tool call) it was written for.
+ */
+export interface OutlinePlanReviewClaim {
 	rootId: string;
-	review: OutlinePlanReview;
+	blockId: string;
+	round: number;
+	submittedSeq: number;
+	toolCallId?: string | null;
+}
+
+/** The ids a review's block gets ({@link planReviewBlockId}) start with this. */
+export const PLAN_REVIEW_ID_PREFIX = "plrv";
+
+/**
+ * The id of the block a review writes its comments under: derived from the review's request id
+ * (kept across a restart) and the version, so a review restored finds what it wrote.
+ */
+export function planReviewBlockId(requestId: string, round: number): string {
+	return `${PLAN_REVIEW_ID_PREFIX}${createHash("sha256").update(`${requestId}\n${round}`).digest("hex").slice(0, 28)}`;
+}
+
+/**
+ * The reviews of the version being planned: children of the plan root that the plan-review
+ * actor wrote for `session` after `afterSeq` (the version's base), by block id, with the call
+ * each was written for. The agent cannot write as that actor, so it cannot make one up. One
+ * indexed read of the root's children, then for each review block (at most
+ * {@link OUTLINE_PLAN_LIMITS.reviewScan}, the last ones) its first version and that commit.
+ */
+export async function planReviewBlocks(
+	store: OutlineStore,
+	session: string,
+	root: Pick<OutlineBlockRow, "id" | "spaceId">,
+	afterSeq: number,
+): Promise<Map<string, { sid: string; toolCallId: string | null }>> {
+	const out = new Map<string, { sid: string; toolCallId: string | null }>();
+	const children = await store.listChildMetas(
+		root.spaceId,
+		[root.id],
+		OUTLINE_PLAN_LIMITS.maxBlocks,
+	);
+	const candidates = children
+		.filter((child) => child.id.startsWith(PLAN_REVIEW_ID_PREFIX))
+		.slice(-OUTLINE_PLAN_LIMITS.reviewScan);
+	if (candidates.length === 0) return out;
+	const sids = new Map(candidates.map((child) => [child.id, child.sid]));
+	for (const first of await store.getFirstVersions(candidates.map((child) => child.id))) {
+		if (first.fromSeq <= afterSeq) continue;
+		const [commit] = await store.listCommits(root.spaceId, {
+			afterSeq: first.fromSeq - 1,
+			limit: 1,
+		});
+		if (
+			commit &&
+			commit.id === first.commitId &&
+			commit.actorKind === "system" &&
+			commit.actorId === OUTLINE_PLAN_REVIEW_ACTOR &&
+			commit.narratorId === session
+		)
+			out.set(first.blockId, {
+				sid: sids.get(first.blockId) ?? "",
+				toolCallId: commit.toolCallId,
+			});
+	}
+	return out;
+}
+
+/**
+ * The review written as `blockId` under the plan `rootId` of `session` (a review restored after a
+ * restart): one of the version's reviews ({@link planReviewBlocks}) and, when `toolCallId` is
+ * given, written for that call. Null when there is none.
+ */
+export async function readPlanReview(args: {
+	session: string;
+	rootId: string;
+	blockId: string;
+	round: number;
+	toolCallId?: string | null;
+	store?: OutlineStore;
+}): Promise<OutlinePlanReviewBlock | null> {
+	const store = args.store ?? outlineStore;
+	const root = await store.getBlock(args.rootId);
+	const plan = root && !root.deleted ? root.taskJson?.plan : undefined;
+	if (!root || !plan || plan.by !== args.session || plan.round + 1 !== args.round) return null;
+	const written = (await planReviewBlocks(store, args.session, root, plan.baseSeq)).get(
+		args.blockId,
+	);
+	if (!written || (args.toolCallId && written.toolCallId !== args.toolCallId)) return null;
+	const space = await store.getSpace(root.spaceId);
+	return space
+		? await reviewFromBlock(store, space, { id: args.blockId, sid: written.sid }, args.round)
+		: null;
 }
 
 /** A comment a review asks to leave: its text, and the block of the plan it is about. */
@@ -934,24 +1061,32 @@ export function planReviewCommentsProblem(
 	return null;
 }
 
-/** A link at the start of a comment block: the step it is about. */
+/**
+ * A link at the start of a comment block. It is the comment's target (the step it is about, as
+ * {@link writePlanReview} writes one) only when it is an address in the plan's space; any other
+ * link stays in the comment's text (review round 1 N4).
+ */
 const COMMENT_TARGET = /^\[\[([^\]|]+)(?:\|[^\]]*)?\]\]\s*/;
+
+/** A review as its block holds it (the version it reviewed is the caller's to say). */
+export type OutlinePlanReviewBlock = Omit<OutlinePlanReview, "submittedSeq">;
 
 /** The review a review block holds: its comments (its children) and their targets' titles. */
 async function reviewFromBlock(
 	store: OutlineStore,
-	space: OutlineSpaceRow,
+	space: Pick<OutlineSpaceRow, "id" | "key">,
 	block: Pick<OutlineBlockRow, "id" | "sid">,
 	round: number,
-): Promise<OutlinePlanReview> {
+): Promise<OutlinePlanReviewBlock> {
 	const max = OUTLINE_PLAN_LIMITS.reviewComments;
 	const children = await store.listChildren(space.id, block.id, max + 1);
 	const parsed = children.slice(0, max).map((child) => {
 		const match = COMMENT_TARGET.exec(child.content);
 		const address = match ? parseAddress((match[1] ?? "").trim()) : null;
+		const target = match && address && address.space === space.key ? address.sid : null;
 		return {
-			text: (match ? child.content.slice(match[0].length) : child.content).trim(),
-			sid: address && address.space === space.key ? address.sid : null,
+			text: (target && match ? child.content.slice(match[0].length) : child.content).trim(),
+			sid: target,
 		};
 	});
 	const sids = [...new Set(parsed.flatMap((p) => (p.sid ? [p.sid] : [])))];
@@ -984,60 +1119,6 @@ async function reviewFromBlock(
 }
 
 /**
- * A review a call names, as the outline has it now, when it is one: a live child of the plan
- * root created by a commit of the plan-review actor for `session` (no one else writes as that
- * actor, so the agent cannot make one up). Null otherwise. Three indexed reads, then the review's
- * comments and their targets' titles.
- */
-async function verifiedPlanReview(
-	store: OutlineStore,
-	session: string,
-	root: Pick<OutlineBlockRow, "id" | "spaceId">,
-	claimed: Pick<OutlinePlanReview, "blockId" | "round">,
-): Promise<OutlinePlanReview | null> {
-	const block = await store.getBlock(claimed.blockId);
-	if (!block || block.deleted || block.parentId !== root.id || block.spaceId !== root.spaceId)
-		return null;
-	const [created] = await store.getFirstVersions([block.id]);
-	if (!created) return null;
-	const [commit] = await store.listCommits(block.spaceId, {
-		afterSeq: created.fromSeq - 1,
-		limit: 1,
-	});
-	if (
-		!commit ||
-		commit.id !== created.commitId ||
-		commit.actorKind !== "system" ||
-		commit.actorId !== OUTLINE_PLAN_REVIEW_ACTOR ||
-		commit.narratorId !== session
-	)
-		return null;
-	const space = await store.getSpace(block.spaceId);
-	return space ? await reviewFromBlock(store, space, block, claimed.round) : null;
-}
-
-/**
- * The review written as `blockId` under the plan `rootId` of `session` (a review restored after a
- * restart, or asked to write again), or null when there is none. Two indexed reads and the
- * comments' targets' titles.
- */
-export async function readPlanReview(args: {
-	session: string;
-	rootId: string;
-	blockId: string;
-	round: number;
-	store?: OutlineStore;
-}): Promise<OutlinePlanReview | null> {
-	const store = args.store ?? outlineStore;
-	const block = await store.getBlock(args.blockId);
-	if (!block || block.deleted || block.parentId !== args.rootId) return null;
-	const root = await store.getBlock(args.rootId);
-	if (!root || root.deleted || root.taskJson?.plan?.by !== args.session) return null;
-	const space = await store.getSpace(block.spaceId);
-	return space ? await reviewFromBlock(store, space, block, args.round) : null;
-}
-
-/**
  * A review's concerns on version `round` of the plan `rootId` of `session`, written under the
  * root behind the live-session barrier (see the module header): one `plan` commit by the system
  * actor `plan-review`, the turn's person responsible. `blockId` is the review block's id; when
@@ -1057,7 +1138,7 @@ export async function writePlanReview(args: {
 	toolCallId?: string | null;
 	store?: OutlineStore;
 	now?: () => Date;
-}): Promise<OutlinePlanReview> {
+}): Promise<OutlinePlanReviewBlock> {
 	const store = args.store ?? outlineStore;
 	const problem = planReviewCommentsProblem(args.comments);
 	if (problem) throw new OutlinePlanError(problem, "OUTLINE_PLAN_INVALID");

@@ -1076,7 +1076,7 @@
 	"planReflectionAutoApprove": "全局默认自动批准计划",
 	"planReflectionAutoApproveDesc": "所有继承全局的会话，在 ExitPlanMode 计划反思确认后会跳过人工审批。大纲会话里，审查有疑问时把意见留在计划下面，计划改为等人工审批。",
 	"planReflectionAllowAutoCompact": "允许计划反思重置上下文",
-	"planReflectionAllowAutoCompactDesc": "自动批准计划时，允许计划反思选择“批准并重置上下文”，将计划写入 Conversation Context 后再开始执行。默认关闭。",
+	"planReflectionAllowAutoCompactDesc": "自动批准计划时，允许计划反思选择“批准并重置上下文”，将计划写入 Conversation Context 后再开始执行。默认关闭。对大纲会话不起作用：大纲会话的计划审查只会按草稿批准或留下意见。",
 	"questionReflectionEnabled": "全局默认启用问题反思回答",
 	"questionReflectionEnabledDesc": "启用后，全部允许模式下的 AskUserQuestion 若超时未回答，会由 reflection 自动生成并提交答案。",
 	"questionReflectionTimeout": "问题反思回答超时",

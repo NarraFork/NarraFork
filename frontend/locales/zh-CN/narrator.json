@@ -2708,6 +2708,8 @@
 	"outlinePlan": {
 		"summary": "第 {{version}} 版 · 新增 {{added}} · 改动 {{changed}} · 删除 {{removed}}",
 		"summaryFirst": "第 {{version}} 版 · 新计划，共 {{added}} 块",
+		"summaryShort": "第 {{version}} 版 · +{{added}} ~{{changed}} −{{removed}}",
+		"summaryFirstShort": "第 {{version}} 版 · 新 · +{{added}}",
 		"agentSummary": "这一版改了：{{summary}}",
 		"reviewCount_one": "审查意见 {{count}} 条",
 		"reviewCount_other": "审查意见 {{count}} 条",

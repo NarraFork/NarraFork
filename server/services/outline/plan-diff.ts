@@ -59,6 +59,8 @@ export const OUTLINE_PLAN_LIMITS = {
 	reviewComments: 20,
 	/** Characters of one review comment. */
 	reviewCommentChars: 1000,
+	/** Review blocks under one plan root looked at (the last ones; one review per submission). */
+	reviewScan: 10,
 } as const;
 
 export interface OutlinePlanDiff {

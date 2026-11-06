@@ -122,7 +122,8 @@ export type OutlinePlanSubmitProblem =
 	| { kind: "noRoot" }
 	| { kind: "notPlanning"; address: string }
 	| { kind: "notFound"; address: string }
-	| { kind: "tooLarge"; address: string; blocks: number }
+	/** More than `blocks` blocks or `kib` KiB of text (review round 1 N2: either can be what). */
+	| { kind: "tooLarge"; address: string; blocks: number; kib?: number }
 	| { kind: "wrongMode"; address: string };
 
 export function getOutlinePlanSubmitProblem(
@@ -145,8 +146,8 @@ export function getOutlinePlanSubmitProblem(
 				: `\`${problem.address}\` was not found (it may have been deleted). Call EnterPlanMode to start planning again.`;
 		case "tooLarge":
 			return z
-				? `计划 \`${problem.address}\` 超过 ${problem.blocks} 块，一次提交放不下。把它拆成里程碑，先提交第一个。`
-				: `The plan \`${problem.address}\` has more than ${problem.blocks} blocks, more than one submission holds. Split it into milestones and submit the first one.`;
+				? `计划 \`${problem.address}\` 太大，一次提交放不下（最多 ${problem.blocks} 块${problem.kib ? `、${problem.kib} KiB 文字` : ""}）。把它拆成里程碑，先提交第一个。`
+				: `The plan \`${problem.address}\` is larger than one submission holds (at most ${problem.blocks} blocks${problem.kib ? ` and ${problem.kib} KiB of text` : ""}). Split it into milestones and submit the first one.`;
 		case "wrongMode":
 			return z
 				? `本会话的计划在大纲里（\`${problem.address}\`），不用内联正文或计划文件。调用 ExitPlanMode 时传 \`mode: "outline"\`。`

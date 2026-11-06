@@ -23,13 +23,19 @@
  * loading row, the decision reason, the feedback box (one row: the draft restore is
  * sessionStorage-only and invisible here), and the button bar. Wrapped line counts are
  * estimated from character counts against the card's inner width — the prediction
- * only has to be close; the reading makes it exact.
+ * only has to be close; the reading makes it exact. An outline plan's approval is the
+ * exception (outline P2 PR 8b review round 1): its decision labels and its feedback box's
+ * placeholder, a few short strings, are measured with pretext as painted, so the card is
+ * predicted as well at phone width as at any other.
  *
  * Pure: no DOM, no React.
  */
 
+import { measureLineStats, measureNaturalWidth } from "@chenglou/pretext";
 import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
-import { typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
+import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
+import { FONT_WEIGHT, SANS_FAMILY, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
+import { letterSpacingPxFor } from "@shared/pretext-layout/typography";
 import type { PendingPermission } from "../narrator-panel-types";
 import type { InlinePermissionData } from "./measure/measure-permission";
 
@@ -96,10 +102,33 @@ const ELLIPSIS = 0x2026;
 /** The outline plan's decisions, in the bar's order, when the caller passes no labels. */
 export const OUTLINE_PLAN_BUTTON_LABELS = ["Execute as draft", "Lock and execute…", "Return"];
 
+/** The outline plan's feedback placeholder, when the caller passes none (en). */
+export const OUTLINE_PLAN_FEEDBACK_PLACEHOLDER =
+	"Feedback for the agent (sent when you return the plan)";
+
+/** The "⏎" hint's left margin (`ml={4}`). */
+const FOCUS_HINT_MARGIN = 4;
+
 /**
- * Rows a `PermButtonBar` wraps to at `width`, estimated: each button's label at the sm size
- * plus its chrome, flowed left to right with the group's gap. The first button carries the
- * focus hint, so the estimate leans a little wide; the reading makes it exact.
+ * One line of `text` in `font`, measured by pretext (canvas), or null where text cannot be
+ * measured (no canvas: the char-count estimate stands in).
+ */
+function measuredWidth(text: string, font: string, letterSpacing: number): number | null {
+	try {
+		return measureNaturalWidth(
+			getPreparedTextWithSegments(text, font, undefined, letterSpacing || undefined),
+		);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Rows a `PermButtonBar` wraps to at `width`: each button's label at the sm size (semibold, as
+ * Mantine's Button paints it) plus its chrome, flowed left to right with the group's gap. The
+ * labels are measured as painted (outline P2 PR 8b review round 1: a 0.6em-per-letter estimate
+ * put a whole extra row on the English bar at 130%); without a canvas, estimated by character.
+ * The first button carries the focus hint.
  */
 export function estimateButtonRows(
 	labels: readonly string[],
@@ -108,16 +137,24 @@ export function estimateButtonRows(
 ): number {
 	let rows = 1;
 	let used = 0;
+	const font = `${FONT_WEIGHT.medium} ${fontSize}px ${SANS_FAMILY}`;
+	const spacing = letterSpacingPxFor(fontSize);
+	const xs = typographyMetrics();
+	const hint = measuredWidth("⏎", xs.font.xs, xs.letterSpacing.xs);
+	const hintWidth = hint === null ? FOCUS_HINT_ALLOWANCE : Math.ceil(hint) + FOCUS_HINT_MARGIN;
 	labels.forEach((label, i) => {
-		let em = 0;
-		for (let c = 0; c < label.length; c++) {
-			const code = label.charCodeAt(c);
-			em += isWide(code) || code === ELLIPSIS ? 1 : LATIN_EM;
+		const measured = measuredWidth(label, font, spacing);
+		let text: number;
+		if (measured !== null) text = Math.ceil(measured);
+		else {
+			let em = 0;
+			for (let c = 0; c < label.length; c++) {
+				const code = label.charCodeAt(c);
+				em += isWide(code) || code === ELLIPSIS ? 1 : LATIN_EM;
+			}
+			text = Math.ceil(em * fontSize);
 		}
-		const button = Math.min(
-			width,
-			Math.ceil(em * fontSize) + SM_BUTTON_CHROME + (i === 0 ? FOCUS_HINT_ALLOWANCE : 0),
-		);
+		const button = Math.min(width, text + SM_BUTTON_CHROME + (i === 0 ? hintWidth : 0));
 		if (used > 0 && used + BUTTON_GAP + button > width) {
 			rows += 1;
 			used = button;
@@ -126,6 +163,34 @@ export function estimateButtonRows(
 		}
 	});
 	return rows;
+}
+
+/** Mantine `Textarea size="xs"`: 10px padding plus a 1px border, on each side. */
+const XS_TEXTAREA_HORIZONTAL_CHROME = (10 + 1) * 2;
+
+/**
+ * Rows an empty autosized feedback box (1 to 3) paints at `width`: its placeholder wrapped in
+ * the xs font (an empty autosize textarea is as tall as its placeholder; review round 1: the
+ * English one wraps to two rows at phone width). Measured by pretext; estimated without a canvas.
+ */
+export function estimatePlaceholderRows(placeholder: string, width: number): number {
+	const content = Math.max(1, width - XS_TEXTAREA_HORIZONTAL_CHROME);
+	const metrics = typographyMetrics();
+	let lines: number;
+	try {
+		lines = measureLineStats(
+			getPreparedTextWithSegments(
+				placeholder,
+				metrics.font.xs,
+				"pre-wrap",
+				metrics.letterSpacing.xs || undefined,
+			),
+			content,
+		).lineCount;
+	} catch {
+		lines = estimateLines(placeholder, content);
+	}
+	return Math.min(3, Math.max(1, lines));
 }
 
 export interface PermissionPredictionContext {
@@ -138,6 +203,11 @@ export interface PermissionPredictionContext {
 	 * bar's wrap at phone width); {@link OUTLINE_PLAN_BUTTON_LABELS} when absent.
 	 */
 	planButtonLabels?: readonly string[];
+	/**
+	 * The outline plan's feedback placeholder as the reader sees it (it decides the empty box's
+	 * rows); {@link OUTLINE_PLAN_FEEDBACK_PLACEHOLDER} when absent.
+	 */
+	planFeedbackPlaceholder?: string;
 }
 
 /**
@@ -161,7 +231,10 @@ export function predictInlinePermission(
 			readOnly: !ctx.canDecide,
 			isExitPlanMode: true,
 			outlinePlanSummaryRows: plan.summary ? 2 : 1,
-			feedbackRows: 1,
+			feedbackRows: estimatePlaceholderRows(
+				ctx.planFeedbackPlaceholder ?? OUTLINE_PLAN_FEEDBACK_PLACEHOLDER,
+				ctx.innerWidth,
+			),
 			buttonRows: ctx.canDecide
 				? estimateButtonRows(
 						ctx.planButtonLabels ?? OUTLINE_PLAN_BUTTON_LABELS,

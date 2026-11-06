@@ -9,12 +9,15 @@
  * resolves the request: a plan someone else changed since the version on screen is refused (409)
  * and the diff opens again; the request disappears through the usual `permission_resolved`.
  *
- * A plan review's comments (PR 8b, `_planReview`) lead the summary line (「审查意见 N 条」, in
- * the same line: the card's height is unchanged) and the diff, which leaves them out of the
- * changes and shows them above.
+ * A plan review's comments (PR 8b, `_planReview`) lead the summary line as an orange count (its
+ * full 「审查意见 N 条」 in the tooltip; the card's height is unchanged) and the diff, which leaves
+ * them out of the changes and shows them above. On a narrow card (review round 1 U1) the two
+ * views become icons and the counts their short form, so the version and its changes stay on
+ * the one line.
  */
 
 import {
+	ActionIcon,
 	Alert,
 	Anchor,
 	Box,
@@ -26,10 +29,21 @@ import {
 	Stack,
 	Text,
 	Textarea,
+	Tooltip,
 } from "@mantine/core";
+import { useElementSize } from "@mantine/hooks";
 import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
+import { IconExternalLink, IconListDetails, IconMessageCircle } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useContext, useEffect, useMemo, useState } from "react";
+import {
+	useCallback,
+	useContext,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { useOutlinePlanDiff } from "../../../hooks/useOutline";
@@ -43,6 +57,13 @@ import { PermEnterHintCtx } from "../../narrator/tool-call/tool-call-contexts";
 import { OutlinePlanDiffModal } from "./OutlinePlanDiffModal";
 
 const noop = () => {};
+
+/**
+ * Below this width (in ems of the card's text, so it follows the reader's type size) the
+ * summary line shows its short form and icon-only views: the full one no longer fits beside
+ * them (review round 1 U1).
+ */
+const NARROW_SUMMARY_EM = 36;
 
 /** Whether a pending request is an outline plan's approval (rendered by this component). */
 export function isOutlinePlanApproval(permission: PendingPermission): boolean {
@@ -102,7 +123,6 @@ export function OutlinePlanApproval({
 			pageId: root?.pageId ?? "",
 			blockId: root?.blockId ?? "",
 			from: submission?.baseSeq ?? 0,
-			skip: review?.blockId ?? null,
 		},
 		diffOpen && !!root,
 	);
@@ -112,6 +132,25 @@ export function OutlinePlanApproval({
 	useEffect(() => {
 		if (isActive) setHasFeedback(hasFeedback);
 	}, [hasFeedback, isActive, setHasFeedback]);
+	// The summary line's width decides its form (the line stays one xs line either way).
+	const { ref: sizeRef, width: summaryWidth } = useElementSize<HTMLDivElement>();
+	const summaryNode = useRef<HTMLDivElement | null>(null);
+	const summaryRef = useCallback(
+		(node: HTMLDivElement | null) => {
+			summaryNode.current = node;
+			sizeRef(node);
+		},
+		[sizeRef],
+	);
+	const [narrow, setNarrow] = useState(
+		() => typeof window !== "undefined" && window.innerWidth < 520,
+	);
+	useLayoutEffect(() => {
+		const node = summaryNode.current;
+		if (!node || summaryWidth <= 0) return;
+		const em = Number.parseFloat(getComputedStyle(node).fontSize) || 14;
+		setNarrow(summaryWidth < NARROW_SUMMARY_EM * em);
+	}, [summaryWidth]);
 	if (!submission || !root) return null;
 	const counts = submission.counts;
 	const changed = counts.text + counts.task + counts.moved;
@@ -166,6 +205,25 @@ export function OutlinePlanApproval({
 	};
 	const openInOutline = () => openBlock(root.blockId);
 	const reviewCount = review?.count ?? 0;
+	const fullSummary =
+		submission.baseSeq === 0
+			? t("outlinePlan.summaryFirst", { version: root.round, added: counts.added })
+			: t("outlinePlan.summary", {
+					version: root.round,
+					added: counts.added,
+					changed,
+					removed: counts.removed,
+				});
+	const shortSummary =
+		submission.baseSeq === 0
+			? t("outlinePlan.summaryFirstShort", { version: root.round, added: counts.added })
+			: t("outlinePlan.summaryShort", {
+					version: root.round,
+					added: counts.added,
+					changed,
+					removed: counts.removed,
+				});
+	const reviewLabel = t("outlinePlan.reviewCount", { count: reviewCount });
 
 	// The three decisions only, "Return" last: the keyboard's default with feedback typed.
 	const buttons: PermButton[] = readOnly
@@ -223,52 +281,92 @@ export function OutlinePlanApproval({
 
 	return (
 		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }} data-testid="outline-plan-approval">
-			{/* One xs line: the summary (cut to fit) and the two read-only views, for readers too. */}
-			<Group gap={8} mb={4} wrap="nowrap" align="baseline">
+			{/* One xs line: the review's count, the summary (cut to fit) and the two read-only
+			    views, for readers too. Nothing in it is taller than the xs line. */}
+			<Group
+				ref={summaryRef}
+				gap={8}
+				mb={4}
+				wrap="nowrap"
+				align="center"
+				data-testid="outline-plan-summary-row"
+				data-narrow={narrow ? "" : undefined}
+			>
+				{reviewCount > 0 && (
+					<Tooltip label={reviewLabel} withinPortal>
+						<Text
+							span
+							size="xs"
+							c="orange"
+							fw={600}
+							aria-label={reviewLabel}
+							style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 2 }}
+							data-testid="outline-plan-review-count"
+						>
+							<IconMessageCircle size="1.1em" aria-hidden />
+							{reviewCount}
+						</Text>
+					</Tooltip>
+				)}
 				<Text
 					size="xs"
 					c="dimmed"
 					truncate="end"
+					title={fullSummary}
 					style={{ flex: 1, minWidth: 0 }}
 					data-testid="outline-plan-summary"
 				>
-					{reviewCount > 0 && (
-						<>
-							<Text span inherit c="orange" fw={600} data-testid="outline-plan-review-count">
-								{t("outlinePlan.reviewCount", { count: reviewCount })}
-							</Text>
-							{" · "}
-						</>
-					)}
-					{submission.baseSeq === 0
-						? t("outlinePlan.summaryFirst", { version: root.round, added: counts.added })
-						: t("outlinePlan.summary", {
-								version: root.round,
-								added: counts.added,
-								changed,
-								removed: counts.removed,
-							})}
+					{narrow ? shortSummary : fullSummary}
 				</Text>
-				<Anchor
-					component="button"
-					type="button"
-					size="xs"
-					onClick={() => setDiffOpen(true)}
-					style={{ flexShrink: 0 }}
-					data-testid="outline-plan-view-changes"
-				>
-					{t("outlinePlan.viewChanges")}
-				</Anchor>
-				<Anchor
-					component="button"
-					type="button"
-					size="xs"
-					onClick={openInOutline}
-					style={{ flexShrink: 0 }}
-					data-testid="outline-plan-open"
-				>
-					{t("outlinePlan.openInOutline")}
-				</Anchor>
+				{narrow ? (
+					<>
+						<Tooltip label={t("outlinePlan.viewChanges")} withinPortal>
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								aria-label={t("outlinePlan.viewChanges")}
+								onClick={() => setDiffOpen(true)}
+								data-testid="outline-plan-view-changes"
+							>
+								<IconListDetails size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={t("outlinePlan.openInOutline")} withinPortal>
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								aria-label={t("outlinePlan.openInOutline")}
+								onClick={openInOutline}
+								data-testid="outline-plan-open"
+							>
+								<IconExternalLink size={14} />
+							</ActionIcon>
+						</Tooltip>
+					</>
+				) : (
+					<>
+						<Anchor
+							component="button"
+							type="button"
+							size="xs"
+							onClick={() => setDiffOpen(true)}
+							style={{ flexShrink: 0 }}
+							data-testid="outline-plan-view-changes"
+						>
+							{t("outlinePlan.viewChanges")}
+						</Anchor>
+						<Anchor
+							component="button"
+							type="button"
+							size="xs"
+							onClick={openInOutline}
+							style={{ flexShrink: 0 }}
+							data-testid="outline-plan-open"
+						>
+							{t("outlinePlan.openInOutline")}
+						</Anchor>
+					</>
+				)}
 			</Group>
 			{submission.summary && (
 				<Text size="xs" mb={4} truncate="end" data-testid="outline-plan-agent-summary">

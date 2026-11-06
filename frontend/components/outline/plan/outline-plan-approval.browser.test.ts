@@ -12,7 +12,9 @@
  *   - with feedback typed, Enter returns the plan (without, it executes it as a draft);
  *   - at a phone's width nothing scrolls sideways;
  *   - a plan review's comments (PR 8b) lead the summary line and the diff, which leaves them out
- *     of its changes, at a phone's width too.
+ *     of its changes, at a phone's width too;
+ *   - at 328px every region of the card is predicted as painted, and the version and its counts
+ *     stay on the summary line (review round 1 U1), in en and zh-CN, at 100% and 130% type.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -236,6 +238,7 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 	});
 	let resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
 	if (!resolved?.ok) throw new Error("not submitted");
+	const requestId = generateId();
 	if (review) {
 		const sids = await Promise.all(
 			[written.results[1], written.results[2]].map(
@@ -245,6 +248,7 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 		const reviewed = await reviewOutlinePlan({
 			narratorId: id,
 			requestId: `exit_plan_browser_${generateId()}`,
+			toolUseId: `toolu_${requestId}`,
 			input: resolved.input,
 			comments: review.map((c) => ({
 				target: c.step === undefined ? null : (sids[c.step] ?? null),
@@ -256,7 +260,6 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 		if (!reviewed.ok) throw new Error(reviewed.message);
 		resolved = { ok: true, input: reviewed.input };
 	}
-	const requestId = generateId();
 	let outcome: { behavior: string; message?: string } | null = null;
 	pendingPermissions.set(requestId, {
 		resolve: (result) => {
@@ -290,11 +293,7 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 	};
 }
 
-async function openCard(
-	permission: Record<string, unknown>,
-	viewport = { width: 1000, height: 800 },
-	options: { keyboard?: boolean } = {},
-): Promise<{ page: Page; errors: string[] }> {
+async function openPage(viewport: { width: number; height: number }) {
 	const context = await browser.createBrowserContext();
 	const page = await context.newPage();
 	await page.setViewport(viewport);
@@ -303,6 +302,15 @@ async function openCard(
 	await page.goto(server.url.origin);
 	await page.evaluate((token) => localStorage.setItem("narrafork_token", token), owner);
 	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
+	return { page, errors };
+}
+
+async function openCard(
+	permission: Record<string, unknown>,
+	viewport = { width: 1000, height: 800 },
+	options: { keyboard?: boolean } = {},
+): Promise<{ page: Page; errors: string[] }> {
+	const { page, errors } = await openPage(viewport);
 	await page.evaluate(
 		(p, o) => (window as unknown as FixtureWindow).fixture.open(p as never, o),
 		permission,
@@ -455,18 +463,25 @@ test("a plan review's comments lead the summary and the diff, left out of its ch
 		},
 	]);
 	const { page, errors } = await openCard(plan.permission, { width: 375, height: 740 });
-	// The count leads the one summary line (the card's height is unchanged).
+	// The count leads the one summary line (its full label for assistive tech and the tooltip);
+	// at a phone's width the counts take their short form and the views are icons.
+	await until(page, "the narrow summary", (f) =>
+		(f.text("[data-testid=outline-plan-summary]") ?? "").startsWith("v1"),
+	);
 	expect(await call(page, (f) => f.text("[data-testid=outline-plan-summary]"))).toBe(
-		"2 review comments · Version 1 · a new plan of 3 blocks",
+		"v1 · new · +3",
 	);
-	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review-count]"))).toBe(
-		"2 review comments",
-	);
+	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review-count]"))).toBe("2");
+	expect(
+		await page.$eval("[data-testid=outline-plan-review-count]", (e) =>
+			e.getAttribute("aria-label"),
+		),
+	).toBe("2 review comments");
 	// One line at a phone's width, as the vlist measure predicts (`outlinePlanSummaryRows`: 1).
-	expect(await call(page, (f) => f.lines("[data-testid=outline-plan-summary]"))).toBe(1);
+	expect(await call(page, (f) => f.lines("[data-testid=outline-plan-summary-row]"))).toBe(1);
 	expect(await call(page, (f) => f.overflowsX())).toBe(false);
 
-	expect(await call(page, (f) => f.clickButton("View changes"))).toBe(true);
+	expect(await call(page, (f) => f.click("[data-testid=outline-plan-view-changes]"))).toBe(true);
 	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 3);
 	// The comments first, each with the step it is about; the diff's changes are the plan's own.
 	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review]"))).toContain(
@@ -494,3 +509,48 @@ test("a plan review's comments lead the summary and the diff, left out of its ch
 	expect(errors).toEqual([]);
 	await page.close();
 });
+
+test("at 328px every region is predicted as painted and the version and counts stay on the line (review round 1 U1)", async () => {
+	const { page, errors } = await openPage({ width: 1000, height: 900 });
+	type Card = Awaited<ReturnType<typeof Fixture.measureCard>>;
+	const measure = (lng: string, width: number, font: number, line: number, review: number) =>
+		page.evaluate(
+			(...args) =>
+				(window as unknown as FixtureWindow).fixture.measureCard(
+					...(args as [string, number, number, number, number]),
+				),
+			lng,
+			width,
+			font,
+			line,
+			review,
+		) as Promise<Card>;
+	// What is left after the feedback box's row height, which the measure model takes from the
+	// line-height setting and the browser does not, for every permission card alike.
+	const residual = (c: Card) =>
+		(c.measured ?? 0) - c.rendered - c.feedbackRows * (c.modelTextareaRow - c.paintedTextareaRow);
+	for (const lng of ["en", "zh-CN"]) {
+		for (const [font, line] of [
+			[100, 100],
+			[130, 120],
+		] as const) {
+			for (const review of [0, 2]) {
+				const narrow = await measure(lng, 328, font, line, review);
+				const wide = await measure(lng, 688, font, line, review);
+				const what = `${lng} ${font}% review ${review}`;
+				for (const card of [narrow, wide]) {
+					expect(card.predictedFeedbackRows, what).toBe(card.feedbackRows);
+					expect(card.predictedButtonRows, what).toBe(card.buttonRows);
+					expect(card.summaryLines, what).toBe(1);
+					expect(card.summaryClipped, `${what}: ${card.summaryText}`).toBe(false);
+					expect(card.overflowX, what).toBe(false);
+				}
+				expect(narrow.narrow, what).toBe(true);
+				expect(wide.narrow, what).toBe(false);
+				expect(Math.abs(residual(narrow) - residual(wide)), what).toBeLessThanOrEqual(1);
+			}
+		}
+	}
+	expect(errors).toEqual([]);
+	await page.close();
+}, 60_000);

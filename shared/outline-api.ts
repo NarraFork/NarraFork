@@ -675,6 +675,11 @@ export interface OutlinePlanReview {
 	count: number;
 	/** The comments as written, at most `OUTLINE_PLAN_LIMITS.reviewComments`. */
 	comments: OutlinePlanReviewComment[];
+	/**
+	 * The seq of the version the review reviewed (the submission's): what the person changed
+	 * since then is what the agent is told they changed while deciding.
+	 */
+	submittedSeq: number;
 }
 
 /**

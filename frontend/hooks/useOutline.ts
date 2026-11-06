@@ -449,22 +449,14 @@ const PLAN_DIFF_REFRESH_MS = 300;
  * space-wide invalidation leaves this query to its own subscription.
  */
 export function useOutlinePlanDiff(
-	plan: {
-		spaceId: string;
-		pageId: string;
-		blockId: string;
-		from: number;
-		/** A block left out of the diff (a plan review's comments, shown on their own). */
-		skip?: string | null;
-	},
+	plan: { spaceId: string; pageId: string; blockId: string; from: number },
 	enabled: boolean,
 ) {
 	const queryClient = useQueryClient();
 	const { spaceId, pageId, blockId, from } = plan;
-	const skip = plan.skip ?? null;
 	const query = useQuery({
-		queryKey: ["outline", "plan-diff", spaceId, blockId, from, skip],
-		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from, skip),
+		queryKey: ["outline", "plan-diff", spaceId, blockId, from],
+		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from),
 		enabled,
 		retry: false,
 		staleTime: 5_000,

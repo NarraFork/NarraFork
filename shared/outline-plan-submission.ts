@@ -59,6 +59,10 @@ function reviewOf(value: unknown): OutlinePlanReview | null {
 		round: review.round,
 		count: Math.max(0, Math.floor(review.count)),
 		comments,
+		submittedSeq:
+			typeof review.submittedSeq === "number" && Number.isFinite(review.submittedSeq)
+				? review.submittedSeq
+				: 0,
 	};
 }
 

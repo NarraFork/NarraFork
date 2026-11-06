@@ -599,11 +599,12 @@ export const planReviewTool: ToolDefinition = {
 		const reviewed = await reviewOutlinePlan({
 			narratorId: pending.narratorId,
 			requestId,
+			toolUseId: pending.toolUseId,
+			toolCallId: pending.toolCallId ?? null,
 			input: pending.inputJson,
 			comments,
 			userId: ctx.userId ?? null,
 			locale: ctx.locale === "zh-CN" ? "zh-CN" : "en",
-			toolCallId: pending.toolCallId ?? null,
 		});
 		if (!reviewed.ok) return { output: `PlanReview refused: ${reviewed.message}`, isError: true };
 		const ok = await handOverExitPlanReflection(requestId, {

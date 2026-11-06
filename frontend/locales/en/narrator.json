@@ -2711,6 +2711,8 @@
 	"outlinePlan": {
 		"summary": "Version {{version}} · {{added}} added · {{changed}} changed · {{removed}} removed",
 		"summaryFirst": "Version {{version}} · a new plan of {{added}} blocks",
+		"summaryShort": "v{{version}} · +{{added}} ~{{changed}} −{{removed}}",
+		"summaryFirstShort": "v{{version}} · new · +{{added}}",
 		"agentSummary": "What changed: {{summary}}",
 		"reviewCount_one": "{{count}} review comment",
 		"reviewCount_other": "{{count}} review comments",
