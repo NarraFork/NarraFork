@@ -192,6 +192,9 @@ export function TabContextMenu({
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
 			<div
 				style={{ position: "fixed", inset: 0, zIndex: Z.contextMenuBackdrop }}
+				// Must take the click even inside the closed sidebar, which passes the pointer
+				// through everything not marked (nav-collapsed.css).
+				data-nav-pointer
 				onClick={onClose}
 				onContextMenu={(e) => {
 					e.preventDefault();

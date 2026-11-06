@@ -15,7 +15,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import commonEn from "../../locales/en/common.json";
 import navEn from "../../locales/en/nav.json";
+import { type RecentTabCardActions, RecentTabDetailCard } from "./RecentTabDetailCard";
 import { RecentTabPinDivider, TabContextMenu, type TabContextMenuProps } from "./RecentTabMenu";
+import { createRecentTabHoverStore, RECENT_TAB_HOVER_SHOW_DELAY_MS } from "./recent-tab-hover";
 
 const i18n = createInstance();
 await i18n.init({
@@ -182,6 +184,72 @@ describe("touch access to the details a row no longer shows", () => {
 	test("the clear button is always shown on touch", async () => {
 		await render(<RecentTabPinDivider clearable onClear={() => {}} touch t={(key) => key} />);
 		expect(container?.querySelector("[data-recent-tab-clear]")).not.toBeNull();
+	});
+
+	test("the hover card offers the everyday actions, so a mouse user needs no right-click", async () => {
+		const store = createRecentTabHoverStore();
+		const calls: string[] = [];
+		const record = (name: string) => (target: RecentTab) => calls.push(`${name}:${target.id}`);
+		const actions: RecentTabCardActions = {
+			onPin: record("pin"),
+			onRename: record("rename"),
+			onCopyCwd: record("copyCwd"),
+			onOpenInWindow: record("openInWindow"),
+			canOpenInWindow: () => true,
+			onNewNarratorHere: record("newNarratorHere"),
+			onArchive: record("archive"),
+			onClose: record("close"),
+		};
+		await render(<RecentTabDetailCard store={store} tabs={[tab]} actions={actions} t={(k) => k} />);
+		// Show it at once rather than waiting out the hover delay.
+		store.enter("narrator:n1", () => ({ top: 0, bottom: 20, left: 0, right: 200 }));
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, RECENT_TAB_HOVER_SHOW_DELAY_MS + 20));
+		});
+		const doc = container?.ownerDocument;
+		const keys = [...(doc?.querySelectorAll("[data-card-action]") ?? [])].map((el) =>
+			el.getAttribute("data-card-action"),
+		);
+		expect(keys).toEqual([
+			"pin",
+			"rename",
+			"copyCwd",
+			"openInWindow",
+			"newNarratorHere",
+			"archive",
+			"close",
+		]);
+		await act(async () => {
+			(doc?.querySelector('[data-card-action="rename"]') as HTMLElement | null)?.click();
+		});
+		expect(calls).toEqual(["rename:n1"]);
+		// The action took over (a dialog here): the card is gone.
+		expect(store.getSnapshot()).toBeNull();
+	});
+
+	test("a subagent's card leaves out rename and archive, which only sessions have", async () => {
+		const store = createRecentTabHoverStore();
+		const noop = () => {};
+		const actions: RecentTabCardActions = {
+			onPin: noop,
+			onRename: noop,
+			onCopyCwd: noop,
+			onOpenInWindow: noop,
+			canOpenInWindow: () => false,
+			onNewNarratorHere: noop,
+			onArchive: noop,
+			onClose: noop,
+		};
+		const sub: RecentTab = { ...tab, type: "subagent", id: "s1" };
+		await render(<RecentTabDetailCard store={store} tabs={[sub]} actions={actions} t={(k) => k} />);
+		store.enter("subagent:s1", () => ({ top: 0, bottom: 20, left: 0, right: 200 }));
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, RECENT_TAB_HOVER_SHOW_DELAY_MS + 20));
+		});
+		const keys = [...(container?.ownerDocument.querySelectorAll("[data-card-action]") ?? [])].map(
+			(el) => el.getAttribute("data-card-action"),
+		);
+		expect(keys).toEqual(["pin", "copyCwd", "newNarratorHere", "close"]);
 	});
 
 	test("with a mouse, the clear button waits for a hover; nothing to clear shows none", async () => {
