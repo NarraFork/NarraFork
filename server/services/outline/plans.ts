@@ -485,9 +485,10 @@ export async function readPlanSubmission(args: {
 			return { ok: false, problem: { kind: "notFound", address: found.address } };
 		if (!plan || plan.state !== "planning")
 			return { ok: false, problem: { kind: "notPlanning", address: found.address } };
-		// This version's reviews: left out of the rendering, its budget and the diff (N1, N2).
+		// This version's reviews: left out of the rendering, its budget and the diff (N1, N2) while
+		// they are only what the review wrote (review round 2 S3).
 		const reviews = await planReviewBlocks(store, args.session, block, plan.baseSeq);
-		const omit = new Set(reviews.keys());
+		const omit = omittableReviews(reviews);
 		const read = await readOutline({
 			blockId: found.blockId,
 			view: "all",
@@ -961,20 +962,35 @@ export function planReviewBlockId(requestId: string, round: number): string {
 	return `${PLAN_REVIEW_ID_PREFIX}${createHash("sha256").update(`${requestId}\n${round}`).digest("hex").slice(0, 28)}`;
 }
 
+/** One of the version's reviews, as {@link planReviewBlocks} finds it. */
+export interface OutlinePlanReviewFound {
+	sid: string;
+	/** The ExitPlanMode call the review was written for (its commit's tool call). */
+	toolCallId: string | null;
+	/**
+	 * Whether the plan may leave it out (its rendering, budget, diff, the next reviewer's view, the
+	 * edits told to the agent): only while it is exactly what the review's commit wrote, its block
+	 * and its comments unchanged, nothing else under it and no task in it (review round 2 S3).
+	 * Anything written into or under it since is the plan's, shown and counted as such.
+	 */
+	omittable: boolean;
+}
+
 /**
  * The reviews of the version being planned: children of the plan root that the plan-review
  * actor wrote for `session` after `afterSeq` (the version's base), by block id, with the call
- * each was written for. The agent cannot write as that actor, so it cannot make one up. One
- * indexed read of the root's children, then for each review block (at most
- * {@link OUTLINE_PLAN_LIMITS.reviewScan}, the last ones) its first version and that commit.
+ * each was written for and whether it is still only what the review wrote. The agent cannot
+ * write as that actor, so it cannot make one up. One indexed read of the root's children, then
+ * for each review block (at most {@link OUTLINE_PLAN_LIMITS.reviewScan}, the last ones) its first
+ * version and that commit, its comments and what is under them (two child reads, bounded).
  */
 export async function planReviewBlocks(
 	store: OutlineStore,
 	session: string,
 	root: Pick<OutlineBlockRow, "id" | "spaceId">,
 	afterSeq: number,
-): Promise<Map<string, { sid: string; toolCallId: string | null }>> {
-	const out = new Map<string, { sid: string; toolCallId: string | null }>();
+): Promise<Map<string, OutlinePlanReviewFound>> {
+	const out = new Map<string, OutlinePlanReviewFound>();
 	const children = await store.listChildMetas(
 		root.spaceId,
 		[root.id],
@@ -984,7 +1000,7 @@ export async function planReviewBlocks(
 		.filter((child) => child.id.startsWith(PLAN_REVIEW_ID_PREFIX))
 		.slice(-OUTLINE_PLAN_LIMITS.reviewScan);
 	if (candidates.length === 0) return out;
-	const sids = new Map(candidates.map((child) => [child.id, child.sid]));
+	const byId = new Map(candidates.map((child) => [child.id, child]));
 	for (const first of await store.getFirstVersions(candidates.map((child) => child.id))) {
 		if (first.fromSeq <= afterSeq) continue;
 		const [commit] = await store.listCommits(root.spaceId, {
@@ -992,18 +1008,52 @@ export async function planReviewBlocks(
 			limit: 1,
 		});
 		if (
-			commit &&
-			commit.id === first.commitId &&
-			commit.actorKind === "system" &&
-			commit.actorId === OUTLINE_PLAN_REVIEW_ACTOR &&
-			commit.narratorId === session
+			!commit ||
+			commit.id !== first.commitId ||
+			commit.actorKind !== "system" ||
+			commit.actorId !== OUTLINE_PLAN_REVIEW_ACTOR ||
+			commit.narratorId !== session
 		)
-			out.set(first.blockId, {
-				sid: sids.get(first.blockId) ?? "",
-				toolCallId: commit.toolCallId,
-			});
+			continue;
+		const block = byId.get(first.blockId);
+		out.set(first.blockId, {
+			sid: block?.sid ?? "",
+			toolCallId: commit.toolCallId,
+			omittable: block ? await onlyWhatTheReviewWrote(store, block, commit.seq) : false,
+		});
 	}
 	return out;
+}
+
+/**
+ * Whether a review block is exactly what its commit (`seq`) wrote: the block and every comment at
+ * the version that commit made (an edit, a move or a task makes a new one), at most
+ * {@link OUTLINE_PLAN_LIMITS.reviewComments} comments, none a task, nothing under any of them.
+ */
+async function onlyWhatTheReviewWrote(
+	store: OutlineStore,
+	block: Pick<OutlineBlockRow, "id" | "spaceId" | "versionSeq" | "taskJson">,
+	seq: number,
+): Promise<boolean> {
+	if (block.versionSeq !== seq || block.taskJson) return false;
+	const max = OUTLINE_PLAN_LIMITS.reviewComments;
+	const comments = await store.listChildMetas(block.spaceId, [block.id], max + 1);
+	if (comments.length > max) return false;
+	if (comments.some((comment) => comment.versionSeq !== seq || comment.taskJson)) return false;
+	if (comments.length === 0) return true;
+	const below = await store.listChildMetas(
+		block.spaceId,
+		comments.map((comment) => comment.id),
+		1,
+	);
+	return below.length === 0;
+}
+
+/** The ids of the reviews the plan leaves out (see {@link OutlinePlanReviewFound.omittable}). */
+export function omittableReviews(
+	reviews: ReadonlyMap<string, OutlinePlanReviewFound>,
+): Set<string> {
+	return new Set([...reviews].flatMap(([id, found]) => (found.omittable ? [id] : [])));
 }
 
 /**

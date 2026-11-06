@@ -1895,7 +1895,8 @@ export async function resolveExitPlanModeReflection(
 		planReadPolicy,
 		// A restored gate's input is the one resolved before (an outline plan decided meanwhile).
 		recoveryGate !== undefined,
-		{ toolUseId: toolUse.toolUseId, toolCallId },
+		// Not the call's permission: nothing handed on is taken here (review round 2 N8).
+		{ toolCallId },
 	);
 	if (!resolvedInput.ok) {
 		return {
@@ -1939,6 +1940,8 @@ export async function resolveExitPlanModeReflection(
 	// concerns under the plan and hands it to a person; no concerns approves it as before.
 	const outlinePlan = outlinePlanSubmissionOf(resolvedInput.input) !== null;
 	const outlinePlanMode = outlinePlan ? await import("@server/services/outline-plan-mode") : null;
+	// A new review of this call: whatever an earlier attempt handed on is stale (round 2 N8).
+	outlinePlanMode?.forgetHandedCall(config.narratorId, toolUse.toolUseId);
 	if (outlinePlanMode && restoredReflection?.requestId) {
 		// Restored after its comments were written: a person decides on them; no second review.
 		const recovered = await outlinePlanMode.recoverOutlinePlanReview({
@@ -2034,7 +2037,17 @@ export async function resolveExitPlanModeReflection(
 				// a review never holds a plan back.
 				if (outlinePlan) {
 					const reason = `Plan review could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
-					if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+					if (await handOverExitPlanReflection(requestId, { reason })) {
+						// The version submitted goes on with it (review round 2 N7), only when this
+						// handover is the decision: this runs after a review that decided, too.
+						outlinePlanMode?.handOnSubmission({
+							narratorId: config.narratorId,
+							toolUseId: toolUse.toolUseId,
+							toolCallId,
+							input: resolvedInput.input,
+						});
+						return decisionPromise;
+					}
 					const settled = await Promise.race<ExitPlanReflectionDecision | null>([
 						decisionPromise,
 						Promise.resolve(null),
@@ -2085,6 +2098,13 @@ export async function resolveExitPlanModeReflection(
 			})
 			.catch(() => null);
 		if (written) return { decision, input: written.input };
+		// Taken over before it wrote anything: the version submitted goes on (round 2 N7).
+		outlinePlanMode.handOnSubmission({
+			narratorId: config.narratorId,
+			toolUseId: toolUse.toolUseId,
+			toolCallId,
+			input: resolvedInput.input,
+		});
 	}
 	return {
 		decision,
@@ -2682,18 +2702,33 @@ async function executeToolAfterReflections(
 				tu,
 				options.recoveryGate,
 			);
+			// What the review gate handed on for an outline plan is taken by its permission; if the
+			// permission never ran (an abort first), it is forgotten here (review round 2 N8).
+			const forgetHanded = async () => {
+				if (!outlinePlanSubmissionOf(tu.input)) return;
+				const { forgetHandedCall } = await import("@server/services/outline-plan-mode");
+				forgetHandedCall(config.narratorId, tu.toolUseId);
+			};
 			if (reflected.decision.action === "manual") {
 				tu.input = reflected.input;
 				// User manually took over the plan reflection; the loop falls back to the
 				// normal ExitPlanMode approval. They are already driving this, so the
 				// fallback permission request must not raise a user-facing notification.
-				return executeAfterPreAdmission({ suppressAttention: true });
+				try {
+					return await executeAfterPreAdmission({ suppressAttention: true });
+				} finally {
+					await forgetHanded();
+				}
 			}
 			if (reflected.decision.action === "human") {
 				// An outline plan's review left its comments under the plan, or could not finish
 				// (PR 8b): the plan waits for a person like any ExitPlanMode, told as usual.
 				tu.input = reflected.decision.input ?? reflected.input;
-				return executeAfterPreAdmission();
+				try {
+					return await executeAfterPreAdmission();
+				} finally {
+					await forgetHanded();
+				}
 			}
 			if (
 				reflected.decision.action !== "confirm" &&
@@ -2734,6 +2769,12 @@ async function executeToolAfterReflections(
 				pendingPlanApproverSource.delete(config.narratorId);
 			}
 			return result;
+		}
+		if (tu.name === "ExitPlanMode") {
+			// No review this time: nothing an earlier attempt of this call handed on may reach its
+			// permission (outline P2 PR 8b review round 2 N8).
+			const { forgetHandedCall } = await import("@server/services/outline-plan-mode");
+			forgetHandedCall(config.narratorId, tu.toolUseId);
 		}
 		if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
 			const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);

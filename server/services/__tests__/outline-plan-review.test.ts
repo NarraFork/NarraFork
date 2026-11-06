@@ -29,11 +29,17 @@ import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { listHumanAttentionForPrincipal } from "../human-attention-service";
+import { resolvePermission } from "../narrator-permission";
 import { narratorService } from "../narrator-service";
 import { pendingPermissions } from "../narrator-session-state";
 import { addPersonTask } from "../outline/person-tasks";
 import { readPlanDiff } from "../outline/plan-diff";
-import { decideOutlinePlan, findPlanningRoot } from "../outline/plans";
+import {
+	decideOutlinePlan,
+	findPlanningRoot,
+	omittableReviews,
+	planReviewBlocks,
+} from "../outline/plans";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import { type OutlineOp, writeOutline } from "../outline/write";
@@ -311,6 +317,7 @@ function concerns(b: { sid: string }) {
 async function reviewedWithConcerns() {
 	const plan = await planned();
 	const call = await exitPlanCall(plan.id, { mode: "outline", summary: "First version" });
+	requests.length = 0;
 	turns = [async () => [review(concerns(plan.b))]];
 	const result = await resolveExitPlanModeReflection(config(plan.id, plan.owner), [], call.toolUse);
 	if (result.decision.action !== "human")
@@ -452,6 +459,12 @@ describe("concerns: comments under the plan, and a person decides", () => {
 		);
 		// The person's own decision is not "changed by someone else": the review came before it.
 		expect((await block(plan.root)).taskJson?.plan).toMatchObject({ state: "planning", round: 1 });
+		// The next version's plan keeps the earlier version's review as part of the plan (it is
+		// before the new base, like the return note): shown in its text, not a change.
+		const next = await resolveOutlineExitPlanInput(plan.id, { mode: "outline" }, "en");
+		expect(String(next?.input.plan)).toContain("Review (version 1)");
+		expect(String(next?.input.plan)).toContain("Say how an import is rolled back");
+		expect(outlinePlanSubmissionOf(next?.input)?.counts.added).toBe(0);
 	});
 
 	test("an approval's first pass tells the agent how many comments there are and where", async () => {
@@ -527,8 +540,15 @@ describe("a review is the server's, of this version and this call (review round 
 			actor: { kind: "human", id: plan.owner },
 			responsibleUserId: plan.owner,
 		});
-		const again = await permissionInput(plan.id, plan, plan.handed);
-		expect(outlinePlanSubmissionOf(again)?.review?.comments[1]?.text).toBe(
+		// Taken once (review round 2 N8): a second resolution of the same tool use (a re-run)
+		// has none; the call's persisted input reads it as the outline has it now.
+		const rerun = await permissionInput(plan.id, plan, plan.handed);
+		expect(rerun._planReview).toBeUndefined();
+		const again = await resolveOutlineExitPlanInput(plan.id, plan.input, "en", {
+			recovered: true,
+			toolCallId: plan.rowId,
+		});
+		expect(outlinePlanSubmissionOf(again?.input)?.review?.comments[1]?.text).toBe(
 			"Say how an import is rolled back, and test it",
 		);
 		// A later call of the same version (the first cancelled) carries none of its own.
@@ -1091,6 +1111,245 @@ describe("the takeover and a restart while the person is asked (review round 1 N
 		expect(restored.input._planSeq).toBe(row.inputJson._planSeq);
 		expect(outlinePlanSubmissionOf(restored.input)?.review?.count).toBe(2);
 		expect(requests).toHaveLength(1);
+	});
+});
+
+// ── Round 2 ───────────────────────────────────────────────────────────────────────────────
+
+describe("review round 2", () => {
+	test("S3: a task under a cancelled review's comment is the plan's: counted, shown, reviewed", async () => {
+		const plan = await reviewedWithConcerns();
+		const r1 = outlinePlanSubmissionOf(plan.input)?.review;
+		if (!r1) throw new Error("no review");
+		pendingPermissions.delete(plan.rowId);
+		// The agent "addresses" a comment with a task under it.
+		const comments = await outlineStore.listChildren(plan.space.id, r1.blockId, 5);
+		const written = await agentWrite(plan.id, plan.owner, [
+			{
+				op: "insert",
+				parent: { id: comments[0]?.id as string },
+				content: "Step B2: DROP THE PROD TABLE",
+				task: { status: "todo" },
+			},
+		]);
+		const b2 = written.results[0]?.blockId as string;
+		const reviews = await planReviewBlocks(outlineStore, plan.id, await block(plan.root), 0);
+		expect(reviews.get(r1.blockId)?.omittable).toBe(false);
+		expect(omittableReviews(reviews).has(r1.blockId)).toBe(false);
+		// The next submission shows it (counts, plan text) and its reviewer sees it.
+		const call = await exitPlanCall(plan.id, { mode: "outline" });
+		requests.length = 0;
+		turns = [async () => [review({ verdict: "ok" })]];
+		const result = await resolveExitPlanModeReflection(
+			config(plan.id, plan.owner),
+			[],
+			call.toolUse,
+		);
+		expect(requests[0]?.prompt).toContain("Step B2: DROP THE PROD TABLE");
+		const submission = outlinePlanSubmissionOf(result.input);
+		// The plan's 4 blocks, the review block, its 2 comments and the task.
+		expect(submission?.counts.added).toBe(8);
+		expect(String(result.input.plan)).toContain("Step B2: DROP THE PROD TABLE");
+		expect(String(result.input.plan)).toContain("Review (version 1)");
+		// The diff a person opens shows it too (the route leaves out only the omittable ones).
+		const diff = await readPlanDiff({
+			rootId: plan.root,
+			fromSeq: 0,
+			toSeq: null,
+			skip: omittableReviews(reviews),
+		});
+		expect(diff?.entries.some((e) => e.blockId === b2)).toBe(true);
+	});
+
+	test("S3: what a person writes under the current review while deciding is told to the agent", async () => {
+		const plan = await reviewedWithConcerns();
+		const current = outlinePlanSubmissionOf(plan.input)?.review;
+		if (!current) throw new Error("no review");
+		const comments = await outlineStore.listChildren(plan.space.id, current.blockId, 5);
+		await writeOutline({
+			spaceId: plan.space.id,
+			ops: [
+				{
+					op: "insert",
+					parent: { id: comments[1]?.id as string },
+					content: "Step R: write the rollback script",
+					task: { status: "todo" },
+				},
+			],
+			actor: { kind: "human", id: plan.owner },
+			responsibleUserId: plan.owner,
+		});
+		await decideOutlinePlanRequest({
+			requestId: plan.rowId,
+			principal: { userId: plan.owner, isAdmin: false },
+			body: { action: "draft", seenSeq: plan.input._planSeq as number },
+		});
+		expect(plan.outcome()?.behavior).toBe("allow");
+		const prompt = await firstPass(plan, plan.input);
+		expect(prompt).toContain("The user changed the plan while deciding");
+		expect(prompt).toContain("Step R: write the rollback script");
+		// An untouched review stays left out: the other test's comments are not told as changes.
+		const untouched = await reviewedWithConcerns();
+		const reviews = await planReviewBlocks(
+			outlineStore,
+			untouched.id,
+			await block(untouched.root),
+			0,
+		);
+		expect([...reviews.values()].map((r) => r.omittable)).toEqual([true]);
+	});
+
+	/** The review runs while the person edits step B, then `finish` ends it without comments. */
+	async function editWhileReviewing(finish: "failed" | "takeover") {
+		const plan = await planned();
+		const call = await exitPlanCall(plan.id, { mode: "outline" });
+		const edit = () =>
+			writeOutline({
+				spaceId: plan.space.id,
+				ops: [
+					{ op: "update", block: { id: plan.b.id }, content: "Step B: import, NEVER TOUCH PROD" },
+				],
+				actor: { kind: "human", id: plan.owner },
+				responsibleUserId: plan.owner,
+			});
+		turns =
+			finish === "failed"
+				? [
+						async () => {
+							await edit();
+							return [
+								{
+									toolUseId: `toolu_${generateId()}`,
+									name: "ExitPlanRevise",
+									input: { confirm: true, feedback: "x" },
+								},
+							];
+						},
+						async () => [review({ verdict: "concerns", comments: [] })],
+					]
+				: [
+						async (request, signal) => {
+							await edit();
+							const requestId = /Pending review ID: (\S+)/.exec(request.prompt)?.[1] ?? "";
+							expect(await takeOverExitPlanReflection(requestId)).toBe(true);
+							await new Promise<void>((resolve) => {
+								if (signal.aborted) resolve();
+								else signal.addEventListener("abort", () => resolve(), { once: true });
+							});
+							throw new Error("Aborted");
+						},
+					];
+		const result = await resolveExitPlanModeReflection(
+			config(plan.id, plan.owner),
+			[],
+			call.toolUse,
+		);
+		return { plan, call, result };
+	}
+
+	for (const finish of ["failed", "takeover"] as const) {
+		test(`N7: a review that ${finish === "failed" ? "could not finish" : "was taken over before writing"} keeps the version submitted, and the agent hears the edit`, async () => {
+			const { plan, call, result } = await editWhileReviewing(finish);
+			expect(result.decision.action).toBe(finish === "failed" ? "human" : "manual");
+			const handed =
+				result.decision.action === "human" ? (result.decision.input ?? result.input) : result.input;
+			const submittedSeq = outlinePlanSubmissionOf(result.input)?.seq;
+			const input = await permissionInput(plan.id, call, handed);
+			expect(input._planSeq).toBe(submittedSeq);
+			expect(input._planReview).toBeUndefined();
+			const outcome = wait(plan.id, call.rowId, input, call.toolUse.toolUseId);
+			await decideOutlinePlanRequest({
+				requestId: call.rowId,
+				principal: { userId: plan.owner, isAdmin: false },
+				body: { action: "draft", seenSeq: input._planSeq as number },
+			});
+			expect(outcome()?.behavior).toBe("allow");
+			const prompt = await firstPass({ ...plan, toolUse: call.toolUse }, input);
+			expect(prompt).toContain("The user changed the plan while deciding");
+			expect(prompt).toContain("NEVER TOUCH PROD");
+		});
+	}
+
+	test("N8: a re-run of the same tool use never picks up an earlier attempt's hand-off", async () => {
+		// Denied through the plain route after its permission took the review: a re-run has none.
+		const plan = await reviewedWithConcerns();
+		await resolvePermission(plan.rowId, "deny", { userId: plan.owner, decidedBy: "user" });
+		const rerun = await permissionInput(plan.id, plan, plan.handed);
+		expect(rerun._planReview).toBeUndefined();
+
+		// Handed on, then aborted before its permission ran; a new review of the same tool use
+		// could not finish: its permission gets this attempt's version and no earlier review.
+		const other = await planned();
+		const call = await exitPlanCall(other.id, { mode: "outline" });
+		const first = await resolveOutlineExitPlanInput(other.id, { mode: "outline" }, "en");
+		if (!first?.ok) throw new Error("not resolved");
+		const stale = await reviewOutlinePlan({
+			narratorId: other.id,
+			requestId: `exit_plan_stale_${generateId()}`,
+			toolUseId: call.toolUse.toolUseId,
+			toolCallId: call.rowId,
+			input: first.input,
+			comments: [{ text: "From an attempt that was aborted" }],
+			userId: other.owner,
+			locale: "en",
+		});
+		expect(stale.ok).toBe(true);
+		await agentWrite(other.id, other.owner, [
+			{
+				op: "insert",
+				parent: { id: other.root },
+				content: "Step C: report",
+				task: { status: "todo" },
+			},
+		]);
+		requests.length = 0;
+		turns = [
+			async () => [
+				{
+					toolUseId: `toolu_${generateId()}`,
+					name: "ExitPlanRevise",
+					input: { confirm: true, feedback: "x" },
+				},
+			],
+			async () => [review({ verdict: "concerns", comments: [] })],
+		];
+		const result = await resolveExitPlanModeReflection(
+			config(other.id, other.owner),
+			[],
+			call.toolUse,
+		);
+		expect(result.decision.action).toBe("human");
+		const input = await permissionInput(other.id, call, result.input);
+		expect(input._planReview).toBeUndefined();
+		expect(input._planSeq).toBe(outlinePlanSubmissionOf(result.input)?.seq);
+		expect(input._planSeq).toBeGreaterThan(first.input._planSeq as number);
+
+		// Handed on, then a new review of the same tool use approves (no permission step): the
+		// earlier hand-off is gone, so nothing later picks it up.
+		const third = await planned();
+		const call3 = await exitPlanCall(third.id, { mode: "outline" });
+		const resolved3 = await resolveOutlineExitPlanInput(third.id, { mode: "outline" }, "en");
+		if (!resolved3?.ok) throw new Error("not resolved");
+		await reviewOutlinePlan({
+			narratorId: third.id,
+			requestId: `exit_plan_stale_${generateId()}`,
+			toolUseId: call3.toolUse.toolUseId,
+			toolCallId: call3.rowId,
+			input: resolved3.input,
+			comments: [{ text: "From an attempt that was aborted" }],
+			userId: third.owner,
+			locale: "en",
+		});
+		requests.length = 0;
+		turns = [async () => [review({ verdict: "ok" })]];
+		const approved = await resolveExitPlanModeReflection(
+			config(third.id, third.owner),
+			[],
+			call3.toolUse,
+		);
+		expect(approved.decision.action).toBe("confirm");
+		const later = await permissionInput(third.id, call3, approved.input);
+		expect(later._planReview).toBeUndefined();
 	});
 });
 

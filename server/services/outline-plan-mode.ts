@@ -92,7 +92,9 @@ import {
 	OutlinePlanError,
 	type OutlinePlanReviewBlock,
 	type OutlinePlanReviewClaim,
+	type OutlinePlanReviewFound,
 	type OutlinePlanRoot,
+	omittableReviews,
 	type PlanReviewCommentInput,
 	planReviewBlockId,
 	planReviewBlocks,
@@ -257,8 +259,9 @@ export async function resolveOutlineExitPlanInput(
 		 */
 		recovered?: boolean;
 		/**
-		 * The call's tool use: a fresh call's review is the one the review gate handed on for it
-		 * (PR 8b, review round 1 S2), never one its input names.
+		 * This is the call's permission resolving it (`handlePermission`): what the review gate
+		 * handed on for this tool use is taken, once (PR 8b, review rounds 1 S2 and 2 N8): its
+		 * review, never one the input names, and the version it was submitted at.
 		 */
 		toolUseId?: string | null;
 		/** The call's tool call: a review counts only as written for this call. */
@@ -303,10 +306,18 @@ export async function resolveOutlineExitPlanInput(
 	// persisted, the one its persisted input names. `readPlanSubmission` attaches it only as the
 	// outline proves it: one of this version's reviews, written for this call.
 	const persisted = options.recovered === true ? outlinePlanSubmissionOf(input) : null;
+	const handed =
+		!persisted && options.toolUseId ? takeHandedCall(narratorId, options.toolUseId) : null;
 	const review = persisted
 		? claimOf(persisted, options.toolCallId ?? null)
-		: options.toolUseId
-			? (handedReviews.get(callKey(narratorId, options.toolUseId)) ?? null)
+		: handed?.blockId
+			? {
+					rootId: handed.rootId,
+					blockId: handed.blockId,
+					round: handed.round,
+					submittedSeq: handed.submittedSeq,
+					toolCallId: handed.toolCallId,
+				}
 			: null;
 	const stripped = withoutOutlinePlanKeys(rest);
 	if (legacyMode) {
@@ -330,15 +341,18 @@ export async function resolveOutlineExitPlanInput(
 	}
 	const s = read.submission;
 	// The version the person decides on is the one submitted (review round 1 S1): a restored call
-	// keeps the seq it persisted, a reviewed call the one its review reviewed; what changed since
-	// is told to the agent as the person's changes while deciding.
+	// keeps the seq it persisted, a call the review gate handed on (with or without comments;
+	// round 2 N7) the one it was submitted at; what changed since is told to the agent as the
+	// person's changes while deciding.
+	const kept =
+		persisted ??
+		(handed
+			? { root: { blockId: handed.rootId, round: handed.round }, seq: handed.submittedSeq }
+			: null);
 	const seq =
-		persisted &&
-		persisted.root.blockId === s.root.blockId &&
-		persisted.root.round === s.root.round &&
-		persisted.seq > 0
-			? Math.min(persisted.seq, s.seq)
-			: (s.review?.submittedSeq ?? s.seq);
+		kept && kept.root.blockId === s.root.blockId && kept.root.round === s.root.round && kept.seq > 0
+			? Math.min(kept.seq, s.seq)
+			: s.seq;
 	return {
 		ok: true,
 		input: {
@@ -375,34 +389,85 @@ function claimOf(
 }
 
 /**
- * The reviews the review gate handed on to the call's permission (review round 1 S2), by session
- * and tool use: a server-side channel, so a model's call can never name one. At most
- * {@link HANDED_REVIEWS} calls, the oldest dropped first; a decision drops its call's.
+ * What the review gate hands on to the call's permission (review rounds 1 S2 and 2 N7): the
+ * version submitted, and the review's block when it left comments.
  */
-const handedReviews = hotSafe(
-	"narrafork.outlinePlanHandedReviews",
-	() => new Map<string, OutlinePlanReviewClaim>(),
+interface HandedCall {
+	rootId: string;
+	round: number;
+	submittedSeq: number;
+	toolCallId: string | null;
+	blockId: string | null;
+}
+
+/**
+ * The calls the review gate handed on to a person (review round 1 S2), by session and tool use:
+ * a server-side channel, so a model's call can never name a review. Taken once, by the call's
+ * permission resolving it; a new review of the same tool use starts by forgetting what an earlier
+ * attempt left (review round 2 N8). At most {@link HANDED_CALLS}, the oldest dropped first.
+ */
+const handedCalls = hotSafe(
+	"narrafork.outlinePlanHandedCalls",
+	() => new Map<string, HandedCall>(),
 );
-const HANDED_REVIEWS = 2048;
+const HANDED_CALLS = 2048;
 
 function callKey(narratorId: string, toolUseId: string): string {
 	return `${narratorId}\n${toolUseId}`;
 }
 
-function handOn(narratorId: string, toolUseId: string, claim: OutlinePlanReviewClaim): void {
+function handOn(narratorId: string, toolUseId: string, call: HandedCall): void {
 	const key = callKey(narratorId, toolUseId);
-	handedReviews.delete(key);
-	handedReviews.set(key, claim);
-	while (handedReviews.size > HANDED_REVIEWS) {
-		const oldest = handedReviews.keys().next().value;
+	handedCalls.delete(key);
+	handedCalls.set(key, call);
+	while (handedCalls.size > HANDED_CALLS) {
+		const oldest = handedCalls.keys().next().value;
 		if (oldest === undefined) break;
-		handedReviews.delete(oldest);
+		handedCalls.delete(oldest);
 	}
 }
 
-/** The call was decided: its review is in its persisted input from now on. */
+/** What was handed on for the call, taken (it is in the call's resolved input from then on). */
+function takeHandedCall(narratorId: string, toolUseId: string): HandedCall | null {
+	const key = callKey(narratorId, toolUseId);
+	const call = handedCalls.get(key) ?? null;
+	handedCalls.delete(key);
+	return call;
+}
+
+/**
+ * Forget what was handed on for a call (a new review of it begins, its permission ran, or it was
+ * decided): a later attempt never picks up an earlier one's (review round 2 N8).
+ */
+export function forgetHandedCall(narratorId: string, toolUseId: string | null | undefined): void {
+	if (toolUseId) handedCalls.delete(callKey(narratorId, toolUseId));
+}
+
+/**
+ * A review gate handing an outline plan to a person without comments (the review could not
+ * finish, or was taken over before it wrote any): the version submitted goes on, so what the
+ * person changes from then on is told to the agent (review round 2 N7). No-op for any other input.
+ */
+export function handOnSubmission(args: {
+	narratorId: string;
+	toolUseId: string;
+	toolCallId?: string | null;
+	input: Record<string, unknown>;
+}): void {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission) return;
+	handOn(args.narratorId, args.toolUseId, {
+		rootId: submission.root.blockId,
+		round: submission.root.round,
+		submittedSeq: submission.seq,
+		toolCallId: args.toolCallId ?? null,
+		blockId: null,
+	});
+}
+
+/** The call was decided: what was handed on for it is in its persisted input from now on. */
 function dropHandedReview(narratorId: string, toolUseId: string | null | undefined): void {
-	if (toolUseId) handedReviews.delete(callKey(narratorId, toolUseId));
+	forgetHandedCall(narratorId, toolUseId);
 }
 
 export { planReviewBlockId };
@@ -532,7 +597,8 @@ export async function outlinePlanReviewPrompt(args: {
 }): Promise<string | null> {
 	const submission = outlinePlanSubmissionOf(args.input);
 	if (!submission) return null;
-	// Without this version's earlier reviews (a cancelled call's; review round 1 N1).
+	// Without this version's earlier reviews (a cancelled call's; review round 1 N1), while they
+	// are only what the review wrote (review round 2 S3).
 	const labelled = await planReviewBlocks(
 		outlineStore,
 		args.narratorId,
@@ -543,7 +609,7 @@ export async function outlinePlanReviewPrompt(args: {
 			renderPlanForReview({
 				rootId: submission.root.blockId,
 				seq: submission.seq,
-				omit: new Set(reviews.keys()),
+				omit: omittableReviews(reviews),
 			}),
 		)
 		.catch((error) => {
@@ -569,7 +635,8 @@ export async function outlinePlanReviewPrompt(args: {
 /**
  * What the person changed in the plan since the version submitted (`submission.seq`) until
  * `untilSeq` (null: now), as diff lines for the agent; empty when nothing. The version's reviews
- * are left out: the agent is told of them on their own (review round 1 S1).
+ * are left out while they are only what the review wrote: the agent is told of them on their own
+ * (review round 1 S1). Anything written into or under one is told as a change (round 2 S3).
  */
 async function editsSinceSubmitted(
 	narratorId: string,
@@ -583,12 +650,13 @@ async function editsSinceSubmitted(
 		narratorId,
 		{ id: root.blockId, spaceId: root.spaceId },
 		submission.baseSeq,
-	).catch(() => new Map<string, unknown>());
+	).catch(() => new Map<string, OutlinePlanReviewFound>());
+	const skip = omittableReviews(reviews);
 	const diff = await readPlanDiff({
 		rootId: root.blockId,
 		fromSeq: submission.seq,
 		toSeq: untilSeq,
-		...(reviews.size > 0 ? { skip: new Set(reviews.keys()) } : {}),
+		...(skip.size > 0 ? { skip } : {}),
 	}).catch(() => null);
 	if (!diff || planDiffIsEmpty(diff.counts)) return "";
 	return planDiffLines(diff, root.address.split("/")[0] ?? "");

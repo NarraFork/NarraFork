@@ -127,7 +127,7 @@ import {
 } from "../services/outline/pending";
 import { addPersonTask, changePersonTask } from "../services/outline/person-tasks";
 import { readPlanDiff } from "../services/outline/plan-diff";
-import { planReviewBlocks } from "../services/outline/plans";
+import { omittableReviews, planReviewBlocks } from "../services/outline/plans";
 import { commitSeqAt } from "../services/outline/read";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
@@ -460,14 +460,15 @@ outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
 	);
 	const query = parse(outlinePlanDiffQuerySchema, c.req.query());
 	const planner = block.taskJson?.plan?.by;
-	const reviews = planner
-		? await planReviewBlocks(outlineStore, planner, block, query.from)
-		: new Map<string, unknown>();
+	// Left out only while they are what the review wrote (review round 2 S3).
+	const skip = planner
+		? omittableReviews(await planReviewBlocks(outlineStore, planner, block, query.from))
+		: new Set<string>();
 	const diff = await readPlanDiff({
 		rootId: block.id,
 		fromSeq: query.from,
 		toSeq: null,
-		...(reviews.size > 0 ? { skip: new Set(reviews.keys()) } : {}),
+		...(skip.size > 0 ? { skip } : {}),
 	});
 	if (!diff) throw new NotFoundError("Outline block", block.id);
 	const body: OutlinePlanDiffResponse = {
