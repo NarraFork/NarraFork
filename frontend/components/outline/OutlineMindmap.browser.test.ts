@@ -1015,8 +1015,18 @@ for (const host of HOSTS) {
 		expect((serverText(s.pageId, t3) ?? "").endsWith("（触屏）")).toBe(true);
 		await tap(...bg);
 		expect((await map(a)).editing).toBe(null);
-		// A long press drags: T9 under T5.
-		await a.call((f) => f.mapFit());
+		// A long press drags: T9 under T5. Leaving the edit re-measures T3 and can move the layout
+		// after a fit (CI saw T9 drawn 70px off where it was read): fit until T9 stays put, so the
+		// finger lands where it is drawn.
+		await idle(a);
+		await settled(a);
+		const rect9 = () => a.call((f, x) => f.nodeRect(x as never), s.id("T9"));
+		for (let i = 0; i < 20; i++) {
+			await a.call((f) => f.mapFit());
+			const before = JSON.stringify(await rect9());
+			await new Promise((r) => setTimeout(r, 100));
+			if (JSON.stringify(await rect9()) === before) break;
+		}
 		const p9 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T9"))) as never);
 		const p5 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T5"))) as never);
 		const pressedAt = Date.now();
