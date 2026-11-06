@@ -580,6 +580,12 @@ export const ExactRow = memo(
 					// goes (a stored click would outlive it). The L3+ card is the same:
 					// `lodExempt` keeps it open while a request is pending.
 					...(row.pinnedOpen === true ? {} : { onToggle: () => toggleRow(row.itemIndex, row.key) }),
+					// An outline card's fold, keyed by the CARD (its unitId), as the standalone card's is.
+					...(onTogglePromptForKey && row.unitId
+						? {
+								onTogglePrompt: () => onTogglePromptForKey(item.spec.key, row.unitId as string),
+							}
+						: {}),
 				};
 				// The live approve/deny form for this call. The card reserved its box, so the
 				// form's growth is reported by tool-use id rather than by observing the row.
@@ -749,6 +755,9 @@ export const ExactRow = memo(
 				if (target) extra.onViewFull = () => viewControls.openFullscreen(target);
 			}
 		}
+		// An outline card's fold (raw input, model result) rides the prompt-fold channel, keyed by
+		// the card: see `rawOpen` in segment-adapter's buildToolCardData.
+		if (kind === "tool-call") extra.onTogglePrompt = toggles.onTogglePrompt;
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
