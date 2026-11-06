@@ -20,13 +20,15 @@
  *
  * Mirrors the regions `InlinePermission` paints for a NON-AskUserQuestion request, in
  * its order: the execution-target block (not for ExitPlanMode), StructSed's preview
- * loading row, the decision reason, the feedback box (one row: the draft restore is
+ * loading row, the decision reason, the feedback box (empty: the draft restore is
  * sessionStorage-only and invisible here), and the button bar. Wrapped line counts are
  * estimated from character counts against the card's inner width — the prediction
- * only has to be close; the reading makes it exact. An outline plan's approval is the
- * exception (outline P2 PR 8b review round 1): its decision labels and its feedback box's
- * placeholder, a few short strings, are measured with pretext as painted, so the card is
- * predicted as well at phone width as at any other.
+ * only has to be close; the reading makes it exact. A few short strings are measured with
+ * pretext as painted instead, so a card is predicted as well at phone width as at any other:
+ * the feedback box's placeholder, since an empty autosize box is as tall as its placeholder,
+ * which wraps in a narrow card at a large font size (outline P2 PR 8b review round 1; every
+ * card since D49 review round 1, when the box's text began to follow that size); and an
+ * outline plan's decision labels.
  *
  * Pure: no DOM, no React.
  */
@@ -101,6 +103,9 @@ const ELLIPSIS = 0x2026;
 
 /** The outline plan's decisions, in the bar's order, when the caller passes no labels. */
 export const OUTLINE_PLAN_BUTTON_LABELS = ["Execute as draft", "Lock and execute…", "Return"];
+
+/** A plain approval's feedback placeholder, when the caller passes none (en). */
+export const FEEDBACK_PLACEHOLDER = "Feedback to model (optional)";
 
 /** The outline plan's feedback placeholder, when the caller passes none (en). */
 export const OUTLINE_PLAN_FEEDBACK_PLACEHOLDER =
@@ -208,6 +213,11 @@ export interface PermissionPredictionContext {
 	 * rows); {@link OUTLINE_PLAN_FEEDBACK_PLACEHOLDER} when absent.
 	 */
 	planFeedbackPlaceholder?: string;
+	/**
+	 * Every other card's feedback placeholder as the reader sees it (it decides the empty box's
+	 * rows); {@link FEEDBACK_PLACEHOLDER} when absent.
+	 */
+	feedbackPlaceholder?: string;
 }
 
 /**
@@ -268,7 +278,12 @@ export function predictInlinePermission(
 			permission.toolName === "StructSed" && !!(permission.ownerNarratorId && permission.toolUseId),
 		hasDecisionReason: reason.length > 0,
 		decisionReasonLines: estimateLines(reason, ctx.innerWidth),
-		feedbackRows: 1,
+		// In the transcript the box's text follows the reader's font size (D49), so its placeholder
+		// wraps at a large one in a narrow card (D49 review round 1 S1).
+		feedbackRows: estimatePlaceholderRows(
+			ctx.feedbackPlaceholder ?? FEEDBACK_PLACEHOLDER,
+			ctx.innerWidth,
+		),
 		buttonRows: 1,
 	};
 }

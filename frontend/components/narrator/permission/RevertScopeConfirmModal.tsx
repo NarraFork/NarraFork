@@ -287,7 +287,16 @@ export function RevertScopeConfirmModal({
 			size="md"
 		>
 			<Stack gap="md">
-				{isLoading ? (
+				{submitting ? (
+					// The plan is spent the moment it is sent, so the review below would read
+					// as "unavailable" while the request is still running. Show progress instead.
+					<Center py="md">
+						<Stack align="center" gap="xs">
+							<Loader size="sm" />
+							<Text size="xs">{t("revertApplying")}</Text>
+						</Stack>
+					</Center>
+				) : isLoading ? (
 					<Center py="md">
 						<Stack align="center" gap="xs">
 							<Loader size="sm" />
@@ -475,7 +484,7 @@ export function RevertScopeConfirmModal({
 					<Button size="xs" variant="subtle" onClick={onCancel} disabled={submitting}>
 						{t("cancel")}
 					</Button>
-					{!(noFileWork && !revertBlocked) && (
+					{!submitting && !(noFileWork && !revertBlocked) && (
 						<Button
 							size="xs"
 							variant="default"
@@ -514,15 +523,17 @@ export function RevertScopeConfirmModal({
 						}}
 						loading={isLoading || submitting}
 					>
-						{revertBlocked
-							? t("revertScopeUnavailableTitle")
-							: snapshotPlan
-								? t("revertSnapshotConfirm")
-								: plan && !plan.coverageComplete
-									? t("revertPartialConfirm")
-									: activeFiles.length > 0
-										? confirmWithRevertLabel
-										: confirmNoFilesLabel}
+						{submitting
+							? t("revertApplying")
+							: revertBlocked
+								? t("revertScopeUnavailableTitle")
+								: snapshotPlan
+									? t("revertSnapshotConfirm")
+									: plan && !plan.coverageComplete
+										? t("revertPartialConfirm")
+										: activeFiles.length > 0
+											? confirmWithRevertLabel
+											: confirmNoFilesLabel}
 					</Button>
 				</Group>
 			</Stack>

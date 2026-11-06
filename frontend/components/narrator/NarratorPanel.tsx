@@ -116,6 +116,7 @@ import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
 	invalidateRevertQueries,
+	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "../../lib/revert-result";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
@@ -830,8 +831,24 @@ function NarratorPanelBody({
 					...opts,
 					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});
-				if (!result.ok || (result.revertResult && !isRevertHistoryCommitted(result.revertResult))) {
+				// "Restore available files" leaves the plan's history uncommitted on purpose;
+				// the server then finishes the edit history-only.
+				const availableOnly =
+					!!result.revertResult && isAvailableFilesRestored(result.revertResult);
+				if (
+					!result.ok ||
+					(result.revertResult && !availableOnly && !isRevertHistoryCommitted(result.revertResult))
+				) {
 					throw new ApiError(t("editFailed"), 409, { ...result });
+				}
+				if (availableOnly && result.revertResult) {
+					notifications.show({
+						title: t("revertAvailableFilesRestoredTitle"),
+						message: t("revertAvailableFilesRestored", {
+							count: result.revertResult.files.length,
+						}),
+						color: "blue",
+					});
 				}
 				// File writes and the COW history update have independent outcomes.
 				const warningText = [
