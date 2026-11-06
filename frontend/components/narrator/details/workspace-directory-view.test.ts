@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	beginEditingDevice,
 	describeDeviceDirectories,
 	deviceDirectoryCwd,
 	deviceDisplayName,
@@ -62,5 +63,41 @@ describe("per-device directory display", () => {
 		expect(deviceDisplayName(input, "local")).toBe("Local server");
 		expect(deviceDisplayName(input, "win-box")).toBe("windows box");
 		expect(deviceDisplayName(input, "gone-box")).toBe("gone-box");
+	});
+});
+
+describe("selecting a device for editing", () => {
+	const input = {
+		directories: {
+			local: { cwd: "/home/me/work", pathFlavor: "posix" as const },
+			"win-box": { cwd: "C:\\work", pathFlavor: "windows" as const },
+		},
+		currentDeviceId: "local",
+		currentCwd: "/home/me/work",
+		devices,
+		localLabel: "Local server",
+	};
+
+	test("starts from that device's own recorded directory", () => {
+		expect(beginEditingDevice(input, "win-box")).toEqual({
+			editingDeviceId: "win-box",
+			cwd: "C:\\work",
+		});
+	});
+
+	test("a device with no directory starts empty instead of borrowing one", () => {
+		// The panel is about to ask for a directory: prefilling the server's path would
+		// present a path that means nothing on the target machine.
+		expect(beginEditingDevice(input, "mac-box")).toEqual({
+			editingDeviceId: "mac-box",
+			cwd: "",
+		});
+	});
+
+	test("re-selecting the current device is not a pending change", () => {
+		expect(beginEditingDevice(input, "local")).toEqual({
+			editingDeviceId: null,
+			cwd: "/home/me/work",
+		});
 	});
 });

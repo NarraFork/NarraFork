@@ -35,6 +35,25 @@ export function deviceDirectoryCwd(input: DeviceDirectoryInput, deviceId: string
 	return input.currentCwd?.trim() || null;
 }
 
+/**
+ * Selecting a device for editing: the directory its editor starts from.
+ *
+ * Always that device's OWN recorded directory, never the previous device's text — a
+ * Windows path left in the box while the panel switches to the server (or the reverse)
+ * would be saved as if it belonged to the other machine. Re-selecting the device the
+ * session already runs on means "no pending change", so the save button stays disabled
+ * instead of offering a no-op switch.
+ */
+export function beginEditingDevice(
+	input: DeviceDirectoryInput,
+	deviceId: string,
+): { editingDeviceId: string | null; cwd: string } {
+	return {
+		editingDeviceId: deviceId === input.currentDeviceId ? null : deviceId,
+		cwd: deviceDirectoryCwd(input, deviceId) ?? "",
+	};
+}
+
 /** The server first, then every visible device, each with its own directory. */
 export function describeDeviceDirectories(input: DeviceDirectoryInput): DeviceDirectoryRow[] {
 	return [

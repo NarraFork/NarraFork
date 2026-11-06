@@ -132,6 +132,7 @@ import {
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
 import {
+	beginEditingDevice,
 	describeDeviceDirectories,
 	deviceDirectoryCwd,
 	deviceDisplayName,
@@ -693,6 +694,15 @@ function NarratorDetailsContent({
 
 	const usageStatsHint = usageStats ? t("details.stats.usageHistoryIncludesSubagents") : undefined;
 
+	// One entry point for "edit this device's directory": the executor select and the
+	// per-device overview mean the same thing, and both must drop the previous device's
+	// draft — a Windows path left in the box must never be saved as the server's.
+	const selectEditingDevice = (deviceId: string) => {
+		const next = beginEditingDevice(directoryView, deviceId);
+		setEditingDeviceId(next.editingDeviceId);
+		cwdDraft.reset(next.cwd);
+	};
+
 	const handleSaveCwd = async () => {
 		const nextCwd = cwdValue.trim();
 		if (!nextCwd) {
@@ -1146,6 +1156,10 @@ function NarratorDetailsContent({
 						t("details.id"),
 						t("details.type"),
 						t("details.cwd"),
+						t("details.cwdExecutor"),
+						// Searching an executor's name should find where its directory is set,
+						// not only the settings page that registered the device.
+						...deviceRows.map((row) => row.name),
 						t("details.createdAt"),
 						t("details.updatedAt"),
 						t("details.lastMessageAt"),
@@ -1218,6 +1232,34 @@ function NarratorDetailsContent({
 						</Modal>
 					) : null}
 					<Stack gap="xs">
+						{/* Executor first: it decides what the directory below even means. This is
+						    the panel's primary way to switch the session to another machine — the
+						    collapsed overview below is a summary, not the only entry point. */}
+						{deviceRows.length > 1 ? (
+							<Select
+								label={t("details.cwdExecutor")}
+								description={t("details.cwdExecutorHint")}
+								leftSection={
+									isRemoteCwd ? <IconDevices size={16} /> : <IconDeviceDesktop size={16} />
+								}
+								data={[
+									{ value: "local", label: deviceLabel("local") },
+									...(executionDevices?.devices ?? []).map((device) => ({
+										value: device.id,
+										label: device.online
+											? device.name
+											: `${device.name} · ${t("executionDeviceOffline")}`,
+										disabled: !device.online,
+									})),
+								]}
+								value={editDeviceId}
+								onChange={(value) => selectEditingDevice(value ?? "local")}
+								allowDeselect={false}
+								disabled={switchWorkspaceMutation.isPending}
+								// The panel lives in a Drawer / Modal: the option list must cover it.
+								comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
+							/>
+						) : null}
 						<Group justify="space-between" align="center" wrap="nowrap" gap="md">
 							<Text size="sm" c="dimmed">
 								{t("details.cwd")}
@@ -1292,10 +1334,7 @@ function NarratorDetailsContent({
 								disabled={
 									(!cwdDirty && editingDeviceId === null) || switchWorkspaceMutation.isPending
 								}
-								onClick={() => {
-									setEditingDeviceId(null);
-									cwdDraft.reset(String(deviceDirectory(currentDeviceId) ?? ""));
-								}}
+								onClick={() => selectEditingDevice(currentDeviceId)}
 							>
 								{t("cancel")}
 							</Button>
@@ -1330,7 +1369,7 @@ function NarratorDetailsContent({
 											<UnstyledButton
 												key={row.id}
 												p={4}
-												onClick={() => setEditingDeviceId(row.id)}
+												onClick={() => selectEditingDevice(row.id)}
 												style={{
 													borderRadius: 4,
 													background:
