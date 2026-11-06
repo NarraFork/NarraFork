@@ -1302,7 +1302,9 @@ function NarratorDetailsContent({
 							<Button
 								size="xs"
 								loading={switchWorkspaceMutation.isPending}
-								disabled={!cwdDirty || !cwdValue.trim()}
+								// Saving another device's recorded directory without editing it is
+								// still meaningful: it switches the session there.
+								disabled={!cwdValue.trim() || (!cwdDirty && editingDeviceId === null)}
 								onClick={handleSaveCwd}
 							>
 								{tc("save")}
