@@ -2784,6 +2784,9 @@
 		"moreQuestions": "还有 {{n}} 个提问未列出",
 		"confirmFailed": "未能确认 {label}",
 		"rejectFailed": "未能否决 {label}",
-		"untitled": "无标题"
+		"untitled": "无标题",
+		"confirming": "确认 {label}",
+		"rejecting": "否决 {label}",
+		"moreDecisions": "还有 {{n}} 个决定未列出"
 	}
 }

@@ -253,6 +253,75 @@ describe("the header says only what happened", () => {
 		expect(outlineDecisionRows(input, metadata, undefined)[1]?.tone).toBe("red");
 	});
 
+	it("a decision call still waiting or running lists what it asks for, never a failure", () => {
+		const input = { edits: [{ confirm: "P1a2B3c4D" }, { reject: "P9z8Y7x6W" }] };
+		for (const status of ["pending", "running", "initializing"]) {
+			// No `decided` yet: the server has not answered.
+			expect(outlineDecisionRows(input, undefined, undefined).map(line)).toEqual([
+				"pending: Confirm [P1a2B3c4D]",
+				"pending: Reject [P9z8Y7x6W]",
+			]);
+			expect(sum(input, { _toolStatus: status })).toBe(
+				"Writing: Confirmed P1a2B3c4D · Rejected P9z8Y7x6W",
+			);
+			const card = classifyToolDetail({
+				previewId: "p",
+				toolName: "OutlineEdit",
+				category: "outline",
+				inputJson: input,
+				status,
+			});
+			const rows = card?.sections.find((section) => section.key === "output.changes")?.body;
+			expect(rows?.kind === "change-rows" ? rows.rows.map((r) => r.tone ?? "") : null).toEqual([
+				"",
+				"",
+			]);
+		}
+	});
+
+	it("lists past the card's rows the decisions it left out", () => {
+		const edits = Array.from({ length: 30 }, (_, i) => ({
+			confirm: `P${String(i).padStart(8, "0")}`,
+		}));
+		const decided = edits.map((e) => ({ confirm: e.confirm, space: K }));
+		const rows = outlineDecisionRows({ edits }, { decided }, undefined);
+		expect(rows).toHaveLength(24);
+		expect(line(rows.at(-1) as ToolChangeRow)).toBe("more: 7 more decision(s) not listed");
+	});
+
+	it("an older held edit (no display) says it waits for confirmation", () => {
+		expect(
+			sum(
+				{
+					edits: [
+						{ replace: "AEguaeis", text: "x" },
+						{ set: "LUwB3JZb", checkbox: "x" },
+					],
+				},
+				{
+					commit: { id: "c", seq: 7 },
+					pending: "P1a2B3c4D",
+					edits: [
+						{ op: "replace", address: `${K}/AEguaeis` },
+						{ op: "set", address: `${K}/LUwB3JZb`, pending: true },
+					],
+				},
+			),
+		).toBe("Rewrote AEguaeis · Awaiting confirmation: Ticked LUwB3JZb done");
+	});
+
+	it("a forged total past what any call can do is not shown", () => {
+		const display = readOutlineEditDisplay({
+			display: {
+				v: 1,
+				space: { key: K, kind: "project" },
+				ops: [{ op: "set", target: TASK, status: { from: "todo", to: "done" } }],
+				totals: { done: Number.MAX_SAFE_INTEGER, added: 0, removed: 0 },
+			},
+		});
+		expect(display?.totals).toEqual({ done: 1, added: 0, removed: 0 });
+	});
+
 	it("a read still running names the time it asked for", () => {
 		expect(
 			outlineToolSummary(

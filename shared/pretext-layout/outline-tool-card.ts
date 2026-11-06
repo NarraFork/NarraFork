@@ -82,6 +82,9 @@ export const OUTLINE_CARD_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	outlineMoreChanges: "{n} more change(s) not listed",
 	outlineMoreQuestions: "{n} more question(s) not listed",
 	outlineConfirmFailed: "Could not confirm {label}",
+	outlineConfirming: "Confirm {label}",
+	outlineRejecting: "Reject {label}",
+	outlineMoreDecisions: "{n} more decision(s) not listed",
 	outlineRejectFailed: "Could not reject {label}",
 	outlineUntitled: "untitled",
 	// Ask.
@@ -729,6 +732,9 @@ function decisionsOf(
 /**
  * The decisions of a `confirm` / `reject` call: what each confirmed (and the commit it wrote),
  * rejected or withdrew; one that failed in red (its reason is in the call's result).
+ *
+ * A decision fails only once the call has finished: its `decided` list is the server's answer.
+ * Until then (the call waits for approval, or runs) every decision is just what it asks for.
  */
 export function outlineDecisionRows(
 	inputJson: unknown,
@@ -741,10 +747,21 @@ export function outlineDecisionRows(
 		color: "orange",
 		verbatim: true,
 	});
+	const finished = Array.isArray(metadata?.decided);
 	const rows: ToolChangeRow[] = [];
-	for (const d of decisionsOf(inputJson, metadata).slice(0, MAX_ROWS)) {
+	for (const d of decisionsOf(inputJson, metadata)) {
 		const entry = d.decided;
-		if (!entry) {
+		if (!entry && !finished) {
+			rows.push({
+				glyph: "pending",
+				parts: fill(
+					label(labels, d.action === "confirm" ? "outlineConfirming" : "outlineRejecting"),
+					{
+						label: chip(d.label),
+					},
+				),
+			});
+		} else if (!entry) {
 			rows.push({
 				glyph: "failed",
 				tone: "red",
@@ -782,7 +799,14 @@ export function outlineDecisionRows(
 			});
 		}
 	}
-	return rows;
+	// Past the card's rows: the decisions left out are counted, never dropped silently.
+	return capGroups(
+		rows.map((row) => [row]),
+		0,
+		[],
+		labels,
+		"outlineMoreDecisions",
+	);
 }
 
 /** Whether an OutlineEdit call's edits are decisions (`confirm` / `reject`). */
@@ -967,15 +991,33 @@ function editPhrases(display: OutlineEditDisplay, labels: Labels): string[] {
 	return out;
 }
 
-/** The same phrases for an older call, from its input (references as written). */
-function legacyEditPhrases(inputJson: unknown, labels: Labels): string[] {
+/**
+ * The same phrases for an older call, from its input (references as written). An edit its result
+ * says was held for confirmation (`metadata.edits[i].pending`) comes last and says so.
+ */
+function legacyEditPhrases(
+	inputJson: unknown,
+	labels: Labels,
+	metadata?: Record<string, unknown> | null,
+): string[] {
 	const all = isRecord(inputJson) && Array.isArray(inputJson.edits) ? inputJson.edits : [];
-	// A task's new status first, as for a call with its display.
+	const results = Array.isArray(metadata?.edits) ? metadata.edits : [];
+	const held = new Set(
+		all.filter(
+			(_, i) => isRecord(results[i]) && (results[i] as { pending?: unknown }).pending === true,
+		),
+	);
+	// A task's new status first, as for a call with its display; held edits last.
 	const ticks = (e: unknown) => isRecord(e) && "set" in e && "checkbox" in e;
-	const edits = [...all.filter(ticks), ...all.filter((e) => !ticks(e))];
+	const edits = [
+		...all.filter((e) => !held.has(e) && ticks(e)),
+		...all.filter((e) => !held.has(e) && !ticks(e)),
+		...all.filter((e) => held.has(e)),
+	];
 	const out: string[] = [];
 	for (const raw of edits) {
 		if (!isRecord(raw)) continue;
+		const from = out.length;
 		const ref = (key: string) => short(leaf(raw[key]) ?? "");
 		if ("set" in raw) {
 			const box = leaf(raw.checkbox);
@@ -1003,6 +1045,9 @@ function legacyEditPhrases(inputJson: unknown, labels: Labels): string[] {
 			out.push(label(labels, "outlineSumConfirmed", { label: ref("confirm") }));
 		else if ("reject" in raw)
 			out.push(label(labels, "outlineSumRejected", { label: ref("reject") }));
+		if (held.has(raw))
+			for (let i = from; i < out.length; i++)
+				out[i] = label(labels, "outlineSumHeld", { what: out[i] as string });
 	}
 	return out;
 }
@@ -1100,7 +1145,9 @@ export function outlineToolSummary(
 					: said;
 			}
 			const display = phase === "done" ? readOutlineEditDisplay(meta) : null;
-			const phrases = display ? editPhrases(display, labels) : legacyEditPhrases(input, labels);
+			const phrases = display
+				? editPhrases(display, labels)
+				: legacyEditPhrases(input, labels, meta);
 			// Nothing written, nothing held, nothing to say it with: the edits changed nothing.
 			const noChange =
 				!display && "commit" in meta && meta.commit === null && !meta.pending && phase === "done";

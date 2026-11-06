@@ -90,6 +90,53 @@ for (const width of [360, 720]) {
 		options: { scene: "longspace", width, scheme: "light", expanded: true },
 	});
 }
+// A drilled-in card on a phone is narrower than the phone: English words are the longest.
+for (const width of [300, 320]) {
+	CASES.push({
+		name: `longspace-${width}-en`,
+		options: { scene: "longspace", width, scheme: "dark", expanded: true, lang: "en" },
+	});
+}
+// Folded answers at 720: English, enlarged type, an answer longer than the line.
+for (const scene of ["answers", "longanswer"]) {
+	for (const lang of ["en", "zh-CN"] as const) {
+		for (const big of [false, true]) {
+			if (scene === "answers" && lang === "zh-CN" && !big) continue; // `answers-folded-720`
+			CASES.push({
+				name: `${scene}-folded-720-${lang}${big ? "-enlarged" : ""}`,
+				options: {
+					scene,
+					width: 720,
+					scheme: "dark",
+					expanded: false,
+					lang,
+					...(big ? ENLARGED : {}),
+				},
+			});
+		}
+	}
+}
+CASES.push(
+	{
+		name: "pending-360-en-enlarged",
+		options: {
+			scene: "pending",
+			width: 360,
+			scheme: "dark",
+			expanded: true,
+			lang: "en",
+			...ENLARGED,
+		},
+	},
+	{
+		name: "pending-360",
+		options: { scene: "pending", width: 360, scheme: "dark", expanded: true },
+	},
+	{
+		name: "edit-360-en-enlarged",
+		options: { scene: "edit", width: 360, scheme: "dark", expanded: true, lang: "en", ...ENLARGED },
+	},
+);
 CASES.push(
 	{
 		name: "answers-360",
@@ -155,19 +202,26 @@ for (const { name, options } of CASES) {
 			expect({ where, upper: card.upperChips }).toEqual({ where, upper: [] });
 			// No chip is pushed off its row's one line, or cut at its edge.
 			expect({ where, hidden: card.hiddenChips }).toEqual({ where, hidden: [] });
+			// A short id (an alias, a change's label) is never truncated: half of one names nothing.
+			expect({ where, cut: card.cutIds }).toEqual({ where, cut: [] });
 		}
 		if (options.scene === "longspace") {
 			const [read, edit] = cards;
+			const en = options.lang === "en";
 			// A long project name gives way: the past version and the cut read still show.
-			expect(read?.text).toContain("截至 #5");
-			expect(read?.text).toContain("未全部显示");
+			expect(read?.text).toContain(en ? "as of #5" : "截至 #5");
+			expect(read?.text).toContain(en ? "more not shown" : "未全部显示");
 			expect(read?.text).toContain("NarraFork outline display");
 			// An untitled block on the path is named in the reader's language.
-			expect(read?.text).toContain("Design › 无标题 › Retry design notes");
+			expect(read?.text).toContain(
+				en ? "Design › untitled › Retry design notes" : "Design › 无标题 › Retry design notes",
+			);
 			expect(edit?.text).toContain("Prj9Atlas");
 			// A block that was not a task before is "not a task", not "no longer a task".
-			expect(edit?.text).toContain("不是任务");
-			expect(edit?.text).not.toContain("不再是任务");
+			if (!en) {
+				expect(edit?.text).toContain("不是任务");
+				expect(edit?.text).not.toContain("不再是任务");
+			}
 		}
 		if (options.scene === "answers" && options.expanded) {
 			const [notice] = cards;
@@ -178,10 +232,24 @@ for (const { name, options } of CASES) {
 			]);
 			for (const answer of notice?.answers ?? []) expect(answer.width).toBeGreaterThan(100);
 		}
-		if (options.scene === "answers" && !options.expanded) {
+		if ((options.scene === "answers" || options.scene === "longanswer") && !options.expanded) {
 			const [notice] = cards;
-			// Folded: the answer keeps its room beside the long question (all of it, here).
-			expect(notice?.tail?.width).toBe(notice?.tail?.full);
+			const tail = notice?.tail ?? { width: 0, full: 1 };
+			// Folded: the answer has the line's room beside the long question: all of it when it
+			// fits in a little under half the line, and at least that much when it is longer.
+			expect(tail.width).toBeGreaterThanOrEqual(
+				Math.min(tail.full, Math.floor(0.45 * (notice?.width ?? 0))),
+			);
+			if (options.scene === "answers") expect(tail.width).toBe(tail.full);
+		}
+		if (options.scene === "pending") {
+			const [waiting, held] = cards;
+			// A decision still waiting (for its approval, or running) is what it asks for, never a
+			// failure: no red row, the header says it is being written.
+			expect(waiting?.text).not.toMatch(/Could not|未能/);
+			expect(waiting?.text).toMatch(/Writing: |写入中：/);
+			// An older held edit says it waits for confirmation, never that it was done.
+			expect(held?.text).toMatch(/^OutlineEdit(Awaiting confirmation: |待确认：)/);
 		}
 		if (options.scene === "edit" && options.expanded) {
 			const [main] = cards;

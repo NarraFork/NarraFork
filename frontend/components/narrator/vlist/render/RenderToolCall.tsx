@@ -1823,12 +1823,21 @@ function DetailBlocks({
 										// A case-sensitive id or alias is painted as written (Mantine
 										// upper-cases badge labels by default).
 										tt={b.verbatim ? "none" : undefined}
-										title={b.clip ? b.label : undefined}
+										{...(b.verbatim ? { "data-verbatim": "" } : {})}
+										title={
+											badges.some((x) => x.clip) && (b.clip || !b.verbatim) ? b.label : undefined
+										}
 										style={
 											badges.some((x) => x.clip)
 												? b.clip
-													? { flex: "0 1 auto", minWidth: "3em" }
-													: { flexShrink: 0 }
+													? // The long name gives way first, down to a few characters …
+														{ flex: "0 8 auto", minWidth: "3em" }
+													: b.verbatim && Array.from(b.label).length <= 12
+														? // … a short id (the space's key) never: half of one names nothing …
+															{ flexShrink: 0 }
+														: // … the words after it last (truncated, in full on hover), so the
+															// row's one line holds them all.
+															{ flex: "0 1 auto", minWidth: "2.5em" }
 												: undefined
 										}
 									>

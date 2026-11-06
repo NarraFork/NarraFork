@@ -676,6 +676,9 @@ export function useVListLabels(): VListLabels {
 			outlineConfirmFailed: t("outlineCard.confirmFailed"),
 			outlineRejectFailed: t("outlineCard.rejectFailed"),
 			outlineUntitled: t("outlineCard.untitled"),
+			outlineConfirming: t("outlineCard.confirming"),
+			outlineRejecting: t("outlineCard.rejecting"),
+			outlineMoreDecisions: t("outlineCard.moreDecisions", { n: "{n}" }),
 			// ── answers to the session's questions (`task-notice.ts`, `outlineAnswers`) ──
 			taskNoticeAnswersTitle: t("sidecar.taskNotice.answersTitle", { who: "{who}", n: "{n}" }),
 			taskNoticeAnswersSomeone: t("sidecar.taskNotice.answersSomeone"),

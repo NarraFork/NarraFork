@@ -143,6 +143,8 @@ export const OUTLINE_TOOL_DISPLAY_LIMITS = {
 	nameChars: 60,
 	/** Edits counted into the totals at most (a call makes at most 200). */
 	countedOps: 1000,
+	/** A total stored figure at most (beyond what any call can do; a larger one is forged). */
+	maxTotal: 1_000_000,
 	/** Questions listed. */
 	questions: 20,
 	/** UTF-8 bytes of the JSON at most: past it, edits are dropped from the end and counted. */
@@ -351,8 +353,15 @@ export function outlineEditDisplayCounts(display: OutlineEditDisplay): OutlineEd
 
 function boundTotals(raw: unknown): OutlineEditDisplayTotals | null {
 	if (!isRecord(raw)) return null;
+	// No more than a call can have done (200 edits, each touching at most the rows one write
+	// takes): a forged figure falls back to counting the listed edits.
 	const n = (value: unknown) =>
-		typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		value >= 0 &&
+		value <= OUTLINE_TOOL_DISPLAY_LIMITS.maxTotal
+			? value
+			: null;
 	const done = n(raw.done);
 	const added = n(raw.added);
 	const removed = n(raw.removed);

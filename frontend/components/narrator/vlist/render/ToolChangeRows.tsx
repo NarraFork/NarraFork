@@ -139,6 +139,14 @@ function ChangeLink({ part }: { part: Extract<ToolChangePart, { kind: "link" }> 
 	);
 }
 
+/** Ids, aliases and labels at most this long keep their whole width in a row. */
+const SHORT_ID_CHARS = 12;
+
+/** A chip naming something by an id (`Q12`, `P1a2B3c4D`, `@agent:x`), short enough to keep whole. */
+function isShortId(part: Extract<ToolChangePart, { kind: "chip" }>): boolean {
+	return part.verbatim === true && Array.from(part.label).length <= SHORT_ID_CHARS;
+}
+
 function ChangePart({ part }: { part: ToolChangePart }) {
 	if (part.kind === "link") return <ChangeLink part={part} />;
 	if (part.kind === "chip") {
@@ -153,9 +161,16 @@ function ChangePart({ part }: { part: ToolChangePart }) {
 				// other chips are not upper-cased either, to read as the rest of the row does.
 				tt="none"
 				title={part.label}
-				// A chip keeps its words while it can, then gives way after the links and the words
-				// (truncated, in full on hover), so a narrow row never cuts one off at its edge.
-				style={{ flex: "0 1 auto", minWidth: "3em", maxWidth: "40%" }}
+				{...(isShortId(part) ? { "data-short-id": "" } : {})}
+				style={
+					isShortId(part)
+						? // A short id (an alias, a change's label, an assignee's handle) is never cut:
+							// half of one names nothing.
+							{ flexShrink: 0 }
+						: // Words keep their room while they can, then give way after the links
+							// (truncated, in full on hover), so a narrow row never cuts one off at its edge.
+							{ flex: "0 1 auto", minWidth: "3em", maxWidth: "40%" }
+				}
 			>
 				{part.label}
 			</Badge>

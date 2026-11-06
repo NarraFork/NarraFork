@@ -16,6 +16,9 @@ import i18next from "i18next";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { OutlineOpenerProvider } from "../../../lib/outline-opener";
+import enChat from "../../../locales/en/chat.json";
+import enCommon from "../../../locales/en/common.json";
+import enNarrator from "../../../locales/en/narrator.json";
 import zhChat from "../../../locales/zh-CN/chat.json";
 import zhCommon from "../../../locales/zh-CN/common.json";
 import zhNarrator from "../../../locales/zh-CN/narrator.json";
@@ -34,7 +37,10 @@ await i18n.use(initReactI18next).init({
 	fallbackLng: "zh-CN",
 	defaultNS: "narrator",
 	ns: ["narrator", "chat", "common"],
-	resources: { "zh-CN": { narrator: zhNarrator, chat: zhChat, common: zhCommon } },
+	resources: {
+		"zh-CN": { narrator: zhNarrator, chat: zhChat, common: zhCommon },
+		en: { narrator: enNarrator, chat: enChat, common: enCommon },
+	},
 	interpolation: { escapeValue: false },
 	react: { useSuspense: false },
 });
@@ -394,6 +400,21 @@ const LONG_ANSWER_BODY = {
 	],
 };
 
+const LONG_TEXT_ANSWER_BODY = {
+	kind: "outlineAnswers",
+	by: "alice",
+	items: [
+		{
+			address: `${K}/Zx81aaQe`,
+			alias: "Q3",
+			question: LONG_QUESTION,
+			answer: {
+				text: "放在消息气泡右上角，和复制按钮并排；手机上把两个按钮合成一个更多菜单，长按也能打开，Codex 通道下周再说，先把 Anthropic 的回归测试补齐",
+			},
+		},
+	],
+};
+
 export const SCENES: Record<string, () => NarratorMsg[]> = {
 	edit: () => [
 		tool("OutlineEdit", EDIT_INPUT, EDIT_TEXT, EDIT_META),
@@ -435,10 +456,36 @@ export const SCENES: Record<string, () => NarratorMsg[]> = {
 		),
 	],
 	answers: () => [userInjection("outline_answer", ANSWER_TEXT, LONG_ANSWER_BODY)],
+	longanswer: () => [userInjection("outline_answer", ANSWER_TEXT, LONG_TEXT_ANSWER_BODY)],
+	pending: () => [
+		// A confirmation waiting for its approval (or running): what it asks for, never a failure.
+		tool(
+			"OutlineEdit",
+			{ edits: [{ confirm: "P1a2B3c4D" }, { reject: "P9z8Y7x6W" }] },
+			"",
+			undefined,
+			"pending",
+		),
+		// A held change written before the display existed: its tick waits for confirmation.
+		tool(
+			"OutlineEdit",
+			{ edits: [{ set: TASK, checkbox: "x", alias: "Q12" }] },
+			"Nothing was written directly: the change waits for confirmation (below).",
+			{
+				tool: "OutlineEdit",
+				space: SPACE,
+				commit: null,
+				pending: "P1a2B3c4D",
+				edits: [{ op: "set", address: `${K}/${TASK}`, pending: true }],
+			},
+		),
+	],
 };
 
 export interface FixtureOptions {
 	scene: string;
+	/** The reader's language (default zh-CN). */
+	lang?: "zh-CN" | "en";
 	width: number;
 	scheme: "light" | "dark";
 	/** Tool cards open (their detail shown). */
@@ -524,6 +571,7 @@ function Scene({ options }: { options: FixtureOptions }) {
 
 /** Render a scene at these options; resolves once painted. */
 export async function render(options: FixtureOptions): Promise<void> {
+	await i18n.changeLanguage(options.lang ?? "zh-CN");
 	setTypography({
 		fontScalePercent: options.fontScalePercent ?? 100,
 		lineHeightScalePercent: options.lineHeightScalePercent ?? 100,
@@ -565,10 +613,12 @@ export interface CardReport {
 	/** Change rows drawn, and their link texts. */
 	rows: number;
 	links: string[];
-	/** Chips whose text the browser upper-cased. */
+	/** Chips meant to be painted as written (ids, aliases, names) that the browser upper-cased. */
 	upperChips: string[];
 	/** Chips not fully visible: clipped by their row (pushed onto a hidden line, or cut). */
 	hiddenChips: string[];
+	/** Short id chips (an alias, a change's label) whose text is truncated. */
+	cutIds: string[];
 	/** Answer rows (a question's answer, under it): their text and visible width (px). */
 	answers: Array<{ text: string; width: number }>;
 	/** The folded line's tail (an answer): its visible width and its text's full width (px). */
@@ -654,8 +704,18 @@ export function report(): CardReport[] {
 					full: Math.round(tailNode.scrollWidth),
 				}
 			: null;
+		const cutIds = Array.from(card.querySelectorAll<HTMLElement>("[data-short-id]"))
+			.filter((chip) => {
+				const text = chip.querySelector<HTMLElement>(".mantine-Badge-label") ?? chip;
+				return text.scrollWidth > text.clientWidth + 0.5;
+			})
+			.map((chip) => chip.textContent ?? "");
 		const upperChips: string[] = [];
-		for (const badge of card.querySelectorAll<HTMLElement>(".mantine-Badge-root")) {
+		// Chips painted as written: ids, aliases, names (a localized word chip may be upper-cased,
+		// as every Mantine badge is).
+		for (const badge of card.querySelectorAll<HTMLElement>(
+			".mantine-Badge-root[data-verbatim], .mantine-Badge-root[data-change-part]",
+		)) {
 			const label = badge.textContent ?? "";
 			if (/[a-z]/.test(label) && getComputedStyle(badge).textTransform === "uppercase")
 				upperChips.push(label);
@@ -677,6 +737,7 @@ export function report(): CardReport[] {
 			),
 			upperChips,
 			hiddenChips,
+			cutIds,
 			answers,
 			tail,
 		};

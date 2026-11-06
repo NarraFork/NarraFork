@@ -851,6 +851,7 @@ function TaskNoticeCard({
 }) {
 	const line = taskNoticeLineHeight();
 	const expanded = measured.expanded === true;
+	const answerFirst = !expanded && data.summary?.tailFirst === true;
 	const rows = expanded ? (data.rows ?? []).slice(0, measured.rowCount) : [];
 	const toggle = data.expandable === true && onToggle ? onToggle : undefined;
 	const Icon = TASK_NOTICE_ICON[data.variant] ?? IconListCheck;
@@ -907,6 +908,8 @@ function TaskNoticeCard({
 						// Folded, the heading yields its width to the task; unfolded, it has the line.
 						flex: expanded ? "0 1 auto" : "0 8 auto",
 						maxWidth: expanded ? undefined : HEADING_MAX_WIDTH,
+						// Beside an answer it keeps who answered and how many, and gives the rest up.
+						...(answerFirst ? { minWidth: "min(7em, 30%)" } : {}),
 					}}
 				>
 					{data.title}
@@ -914,7 +917,9 @@ function TaskNoticeCard({
 				<div
 					data-task-notice-summary=""
 					style={{
-						flex: "1 1 0",
+						// The folded line's tail is what the notice is for (an answer): the summary
+						// claims the line's room from the heading, not only what the heading leaves.
+						flex: answerFirst ? "1 1 auto" : "1 1 0",
 						minWidth: 0,
 						display: "flex",
 						alignItems: "center",
@@ -1027,10 +1032,11 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 						tailFirst
 							? {
 									...dim,
-									// All of it, up to most of the line (then truncated, in full on hover):
-									// the question beside it gives way instead.
+									// All of it, up to the whole summary but a question's chip and a few
+									// characters of it (then truncated, in full on hover): the question
+									// gives way instead.
 									flex: "0 0 auto",
-									maxWidth: "60%",
+									maxWidth: `calc(100% - ${row?.status ? 5 : 2.5}em)`,
 									color: "var(--mantine-color-text)",
 								}
 							: { ...dim, minWidth: "3em" }
@@ -1149,7 +1155,7 @@ function TaskNoticeTitle({ row, yieldTo = false }: { row: TaskNoticeRow; yieldTo
 		...NOWRAP_ELLIPSIS,
 		// Beside a tail that matters more (an answer), the title gives way first.
 		flex: yieldTo ? "0 8 auto" : "0 1 auto",
-		minWidth: yieldTo ? "min(3em, 25%)" : taskTitleMinWidth(row.title),
+		minWidth: yieldTo ? "min(1.5em, 10%)" : taskTitleMinWidth(row.title),
 	} as const;
 	if (link) {
 		return (

@@ -2787,6 +2787,9 @@
 		"moreQuestions": "{{n}} more question(s) not listed",
 		"confirmFailed": "Could not confirm {label}",
 		"rejectFailed": "Could not reject {label}",
-		"untitled": "untitled"
+		"untitled": "untitled",
+		"confirming": "Confirm {label}",
+		"rejecting": "Reject {label}",
+		"moreDecisions": "{{n}} more decision(s) not listed"
 	}
 }
