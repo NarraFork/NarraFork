@@ -1691,6 +1691,7 @@
 	"fileEditor.unsaved": "Unsaved",
 	"fileEditor.unsavedBlockExit": "Unsaved changes. Save them, or use \"Reload from disk\" to discard them, before leaving the editor.",
 	"fileEditor.binaryNotEditable": "This file is binary, so it cannot be edited as text.",
+	"fileEditor.encodingUnreadable": "This file's text encoding could not be recognized, so it cannot be opened in the editor.",
 	"fileEditor.tooLargeToEdit": "This file is too large to edit here. Editing it would risk truncating it.",
 	"fileEditor.conflictTitle": "This file changed while you were editing",
 	"fileEditor.conflictBody": "Someone else — possibly an agent — wrote to this file after you opened it. Compare the two versions before choosing.",

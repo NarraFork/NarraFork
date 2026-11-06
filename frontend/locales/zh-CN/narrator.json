@@ -1690,6 +1690,7 @@
 	"fileEditor.unsaved": "未保存",
 	"fileEditor.unsavedBlockExit": "有未保存的修改。请先保存，或用「从磁盘重新加载」放弃修改，再退出编辑。",
 	"fileEditor.binaryNotEditable": "这是二进制文件，无法作为文本编辑。",
+	"fileEditor.encodingUnreadable": "无法识别此文件的文本编码，无法在编辑器中打开。",
 	"fileEditor.tooLargeToEdit": "文件过大，无法在此编辑——编辑会有截断文件的风险。",
 	"fileEditor.conflictTitle": "文件在你编辑期间已被改动",
 	"fileEditor.conflictBody": "在你打开之后，有其他人（可能是某个叙述者）写入了这个文件。请先比较两个版本再做选择。",
