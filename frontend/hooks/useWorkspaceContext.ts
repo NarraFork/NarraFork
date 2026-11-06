@@ -153,3 +153,22 @@ export function useSwitchWorkspaceContext(narratorId: string) {
 		},
 	});
 }
+
+export const workspaceDevicesKey = (projectId?: string | null) =>
+	["workspaceDevices", projectId ?? null] as const;
+
+/**
+ * Devices a session can be created on.
+ *
+ * Separate from the per-narrator list because creation needs it before the narrator
+ * exists; the server authorizes it against the caller's own device visibility.
+ */
+export function useWorkspaceDevices(projectId?: string | null, enabled = true) {
+	return useQuery({
+		queryKey: workspaceDevicesKey(projectId),
+		queryFn: () => api.getWorkspaceDevices(projectId),
+		enabled,
+		// Device connectivity changes slowly; the picker is opened on demand.
+		staleTime: 15_000,
+	});
+}
