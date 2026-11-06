@@ -19,7 +19,11 @@ import { authSessionStore } from "./auth/store";
 import { mfaService } from "./mfa-service";
 import { passkeyService } from "./passkey-service";
 
-export const STEP_UP_PURPOSES = ["credentials.export"] as const;
+/**
+ * `storage.export.providers`: a data export that includes providers carries every provider
+ * key (sealed with a passphrase), so it needs the same check as a credential export.
+ */
+export const STEP_UP_PURPOSES = ["credentials.export", "storage.export.providers"] as const;
 export type StepUpPurpose = (typeof STEP_UP_PURPOSES)[number];
 export type StepUpMethod = "totp" | "backup_code" | "passkey";
 

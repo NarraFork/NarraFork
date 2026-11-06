@@ -174,9 +174,13 @@ export const passkeyMfaVerifySchema = z.object({
 	response: webauthnResponseSchema,
 });
 
-/** Re-verify password + a second factor before a high-risk action. */
+/**
+ * Re-verify password + a second factor before a high-risk action. The purposes mirror
+ * STEP_UP_PURPOSES in services/step-up-service.ts (a test checks they match); listing them
+ * here keeps the validator free of the MFA and passkey services.
+ */
 export const stepUpSchema = z.object({
-	purpose: z.enum(["credentials.export"]),
+	purpose: z.enum(["credentials.export", "storage.export.providers"]),
 	password: z.string().min(1).max(200),
 	method: z.enum(["totp", "backup_code", "passkey"]),
 	code: z.string().trim().min(1).max(20).optional(),

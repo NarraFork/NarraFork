@@ -68,6 +68,7 @@
 	"IMPORT_PARAMS_INVALID": "导入参数不合法",
 	"IMPORT_PREVIEW_EXPIRED": "导入预览已过期，请重新选择文件",
 	"IMPORT_SNAPSHOT_EXPIRED": "导入快照已失效，请重新选择文件",
+	"IMPORT_PASSPHRASE_REQUIRED": "请输入导出供应商 Key 时设置的口令",
 	"CLEAR_PARAMS_INVALID": "清空参数不合法",
 	"CLEAR_USER_UNKNOWN": "无法确认当前用户",
 	"CLEAR_PASSWORD_NOT_SET": "当前账号未设置密码，无法执行清空操作",

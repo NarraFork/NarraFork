@@ -68,6 +68,7 @@
 	"IMPORT_PARAMS_INVALID": "The import request is invalid",
 	"IMPORT_PREVIEW_EXPIRED": "The import preview expired. Choose the file again",
 	"IMPORT_SNAPSHOT_EXPIRED": "The import snapshot is no longer available. Choose the file again",
+	"IMPORT_PASSPHRASE_REQUIRED": "Enter the passphrase the provider keys were exported with",
 	"CLEAR_PARAMS_INVALID": "The clear request is invalid",
 	"CLEAR_USER_UNKNOWN": "Cannot identify the current user",
 	"CLEAR_PASSWORD_NOT_SET": "This account has no password, so data cannot be cleared",

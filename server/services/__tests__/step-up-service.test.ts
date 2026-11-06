@@ -13,9 +13,9 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
 const { mfaService } = await import("../mfa-service");
-const { consumeStepUp, resetStepUpForTests, stepUpMethods, verifyStepUp } = await import(
-	"../step-up-service"
-);
+const { consumeStepUp, resetStepUpForTests, STEP_UP_PURPOSES, stepUpMethods, verifyStepUp } =
+	await import("../step-up-service");
+const { stepUpSchema } = await import("../../lib/validators/auth");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -88,9 +88,17 @@ describe("step-up verification", () => {
 		const { token } = await verifyStepUp({ ...base(), method: "totp", code: code() });
 		expect(() => consumeStepUp(token, { ...expected, sessionId: "other" })).toThrow();
 		expect(() => consumeStepUp(token, { ...expected, userId: "someone-else" })).toThrow();
+		// A credential export grant does not unlock a data export with provider keys.
+		expect(() =>
+			consumeStepUp(token, { ...expected, purpose: "storage.export.providers" }),
+		).toThrow();
 		// A mismatched attempt does not burn the grant; the right one does.
 		consumeStepUp(token, expected);
 		expect(() => consumeStepUp(token, expected)).toThrow();
 		expect(() => consumeStepUp(undefined, expected)).toThrow();
+	});
+
+	test("the route accepts exactly the purposes the service grants", () => {
+		expect([...stepUpSchema.shape.purpose.options].sort()).toEqual([...STEP_UP_PURPOSES].sort());
 	});
 });

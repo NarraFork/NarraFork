@@ -21,7 +21,8 @@ export interface MfaChallenge {
 export type LoginResult = LoginSession | MfaChallenge;
 
 export type StepUpMethod = "totp" | "backup_code" | "passkey";
-export type StepUpPurpose = "credentials.export";
+/** Mirrors STEP_UP_PURPOSES in server/services/step-up-service.ts. */
+export type StepUpPurpose = "credentials.export" | "storage.export.providers";
 
 export function isMfaChallenge(r: LoginResult): r is MfaChallenge {
 	return "mfaRequired" in r && r.mfaRequired === true;

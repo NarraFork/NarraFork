@@ -257,6 +257,12 @@ export const ERROR_CATALOG = {
 		code: "IMPORT_SNAPSHOT_EXPIRED",
 		en: "The import snapshot is no longer available. Choose the file again",
 	},
+	/** The archive carries sealed provider keys and providers were selected. */
+	IMPORT_PASSPHRASE_REQUIRED: {
+		status: 400,
+		code: "IMPORT_PASSPHRASE_REQUIRED",
+		en: "Enter the passphrase the provider keys were exported with",
+	},
 	CLEAR_PARAMS_INVALID: {
 		status: 400,
 		code: "VALIDATION_ERROR",

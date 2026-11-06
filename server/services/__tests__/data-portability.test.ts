@@ -695,8 +695,11 @@ describe("逐模型设置随供应商一起导出", () => {
 			(exported.agent as unknown as Record<string, unknown>).hiddenModels = ["remote:hidden"];
 			saveSettings(exported);
 
+			// The same-endpoint check compares keys, which travel sealed.
+			const passphrase = "same-endpoint-pass";
 			const zip = await readFile(
-				(await exportData({ requests: false, sessions: false, providers: true })).zipPath,
+				(await exportData({ requests: false, sessions: false, providers: true }, { passphrase }))
+					.zipPath,
 			);
 			const preview = await previewImport(toArrayBuffer(zip), "same-endpoint.zip");
 
@@ -707,7 +710,7 @@ describe("逐模型设置随供应商一起导出", () => {
 			(local.agent as unknown as Record<string, unknown>).hiddenModels = ["local:keep"];
 			saveSettings(local);
 
-			const result = await applyImport(preview.token, { conflictDefault: "skip" });
+			const result = await applyImport(preview.token, { conflictDefault: "skip", passphrase });
 			expect(result.providersAdded).toBe(0);
 			expect(settings.customApiProviders ?? []).toHaveLength(1);
 			expect(settings.customApiProviders?.[0]?.prefix).toBe("local");
