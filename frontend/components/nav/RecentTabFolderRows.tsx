@@ -365,6 +365,9 @@ export function RecentTabFolderStrip({
 					onPointerCancel={(e) => endDrag(e, false)}
 					onKeyDown={(e) => {
 						if (expanded || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+						// Plain arrows only: Ctrl+Up / Ctrl+Down is the sidebar's switch, and this row
+						// keeps focus after a click, so it would resize the folder on every switch.
+						if (e.ctrlKey || e.metaKey || e.altKey) return;
 						e.preventDefault();
 						const next = Math.max(
 							0,
