@@ -1019,14 +1019,46 @@ for (const host of HOSTS) {
 		await a.call((f) => f.mapFit());
 		const p9 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T9"))) as never);
 		const p5 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T5"))) as never);
+		const pressedAt = Date.now();
 		await touch("touchStart", [p9]);
-		await new Promise((r) => setTimeout(r, 600));
-		expect(
-			await a.page.evaluate(
+		// The press turns into a drag once the long-press timer fires (no move in between). Waits
+		// for it rather than a fixed delay; if it never comes, says what the finger landed on.
+		const dragged = await a.page
+			.waitForFunction(
 				(id) => document.querySelector(`.mm-node[data-id="${id}"]`)?.classList.contains("dragging"),
+				{ timeout: 3_000, polling: 25 },
 				s.id("T9"),
-			),
-		).toBe(true);
+			)
+			.then(
+				() => true,
+				() => false,
+			);
+		const pressMs = Date.now() - pressedAt;
+		const pressed = dragged
+			? "dragging"
+			: await a.page.evaluate(
+					(x: number, y: number, id: string) => {
+						const el = document.elementFromPoint(x, y);
+						const node = document.querySelector(`.mm-node[data-id="${id}"]`);
+						const box = (e: Element | null | undefined) => {
+							const r = e?.getBoundingClientRect();
+							return r ? [r.left, r.top, r.width, r.height].map(Math.round) : null;
+						};
+						return {
+							hit: el ? `${el.tagName.toLowerCase()}.${String(el.className)}` : null,
+							inNode: !!(el && node?.contains(el)),
+							at: [Math.round(x), Math.round(y)],
+							node: box(node),
+							stage: box(document.querySelector(".mm-stage")),
+						};
+					},
+					p9[0],
+					p9[1],
+					s.id("T9"),
+				);
+		if (pressMs > 1_000)
+			console.log(`[${host}] long press: ${JSON.stringify(pressed)} after ${pressMs}ms`);
+		expect(pressed).toBe("dragging");
 		for (let i = 1; i <= 8; i++)
 			await touch("touchMove", [
 				[p9[0] + ((p5[0] - p9[0]) * i) / 8, p9[1] + ((p5[1] - p9[1]) * i) / 8],
