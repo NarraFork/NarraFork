@@ -5,7 +5,7 @@
  */
 import type { OutlineDigestHead } from "@shared/outline-digest";
 import { useTranslation } from "react-i18next";
-import { formatLocaleDate, formatLocaleDateTime } from "../../../lib/intl-format";
+import { formatLocaleDate, formatLocaleDateTime, formatLocaleTime } from "../../../lib/intl-format";
 import { DIGEST_TODAY, type DigestDayEntry, isTodayIn } from "./digest-model";
 
 /** A date, `2026-11-05` → "Thu, Nov 5" / "11月5日周四". */
@@ -17,16 +17,21 @@ export function useDigestDayLabel(): (key: string) => string {
 
 /**
  * A day to browse to: its date, or for the "so far" report "Today so far" while it is today in
- * its zone, and "Thu, Nov 5 so far" once that day is over (before the day's report replaces it).
+ * its zone, and "Thu, Nov 5 (up to 3:00 PM)" once that day is over (before the day's report
+ * replaces it): the time it was made up to, in its zone.
  */
 export function useDigestEntryLabel(): (entry: DigestDayEntry) => string {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const dayLabel = useDigestDayLabel();
 	return (entry) => {
 		if (entry.key !== DIGEST_TODAY) return dayLabel(entry.key);
-		return isTodayIn(entry.head.periodKey, entry.head.timeZone)
-			? t("report.today")
-			: t("report.soFar", { day: dayLabel(entry.head.periodKey) });
+		if (isTodayIn(entry.head.periodKey, entry.head.timeZone)) return t("report.today");
+		const time = formatLocaleTime(
+			entry.head.periodEnd,
+			{ hour: "numeric", minute: "2-digit", timeZone: entry.head.timeZone },
+			i18n.language,
+		);
+		return t("report.upTo", { day: dayLabel(entry.head.periodKey), time });
 	};
 }
 

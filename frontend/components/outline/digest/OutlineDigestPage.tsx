@@ -78,7 +78,10 @@ export function OutlineDigestPage({
 	const entryLabel = useDigestEntryLabel();
 	const period = useDigestPeriod();
 	const spaceLabel = useDigestSpaceLabel();
-	const [awaiting, setAwaiting] = useState<{ since: string | null } | null>(null);
+	// While "today so far" is being made: the preview head it replaces, and when it was asked for.
+	const [awaiting, setAwaiting] = useState<{ since: string | null; startedAt: number } | null>(
+		null,
+	);
 	// A notice is about the day it was given on; it goes when the reader moves to another day.
 	const [notice, setNotice] = useState<{ kind: Notice; day: string | undefined } | null>(null);
 	const list = useOutlineReportList({ poll: awaiting !== null });
@@ -102,6 +105,8 @@ export function OutlineDigestPage({
 	// Moving away from the day a notice was about clears it (a notice may be given for the day
 	// being opened, before the address has changed to it).
 	const shownDay = useRef(day);
+	const dayNow = useRef(day);
+	dayNow.current = day;
 	useEffect(() => {
 		if (shownDay.current === day) return;
 		const left = shownDay.current;
@@ -125,12 +130,16 @@ export function OutlineDigestPage({
 	}, [awaiting, preview, onSelect, space]);
 	useEffect(() => {
 		if (!awaiting) return;
-		const timer = setTimeout(() => {
-			setAwaiting(null);
-			setNotice({ kind: "notReadyYet", day });
-		}, AWAIT_MS);
+		// At most a minute from when it was asked for, whatever days are opened meanwhile.
+		const timer = setTimeout(
+			() => {
+				setAwaiting(null);
+				setNotice({ kind: "notReadyYet", day: dayNow.current });
+			},
+			Math.max(0, awaiting.startedAt + AWAIT_MS - Date.now()),
+		);
 		return () => clearTimeout(timer);
-	}, [awaiting, day]);
+	}, [awaiting]);
 
 	const askNow = () => {
 		setNotice(null);
@@ -138,7 +147,7 @@ export function OutlineDigestPage({
 		makeNow.mutate(undefined, {
 			onSuccess: (result) => {
 				if (result.queued) {
-					setAwaiting({ since });
+					setAwaiting({ since, startedAt: Date.now() });
 					return;
 				}
 				// Not made again: say why, and open the one there is.

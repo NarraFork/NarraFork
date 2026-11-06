@@ -35,6 +35,7 @@ import narratorZh from "../../../locales/zh-CN/narrator.json";
 import navZh from "../../../locales/zh-CN/nav.json";
 import outlineZh from "../../../locales/zh-CN/outline.json";
 import { NotificationCenterDrawer } from "../../notifications/NotificationCenterDrawer";
+import { setOutlineDigestRowImporterForTests } from "../OutlineDigestRow";
 import { OutlineNavProvider } from "../outline-nav";
 import { OutlineDigestPage } from "./OutlineDigestPage";
 import { OutlineReportEntry } from "./OutlineReportEntry";
@@ -195,9 +196,48 @@ export function focused(): string | null {
 	return element.closest("[data-testid]")?.getAttribute("data-testid") ?? element.tagName;
 }
 
-/** Whether some text is on the page (a toast, say). */
+/** Whether some text is on the page. */
 export function shows(text: string): boolean {
 	return document.body.innerText.includes(text);
+}
+
+/** The texts of the toasts shown now. */
+export function toasts(): string[] {
+	return [...document.querySelectorAll<HTMLElement>(".mantine-Notification-root")].map(
+		(e) => e.innerText,
+	);
+}
+
+/** Move focus to an element (as a reader tabbing elsewhere would). */
+export function focus(selector: string): boolean {
+	const element = document.querySelector<HTMLElement>(selector);
+	element?.focus();
+	return document.activeElement === element;
+}
+
+/** The text of a hidden live region (what a screen reader is told). */
+export function liveText(selector: string): string {
+	return document.querySelector(selector)?.textContent ?? "";
+}
+
+let rowImports = 0;
+/**
+ * Make the digest row's chunk fail to load `times` times (as a dropped network would), then load;
+ * the number of attempts so far is `rowImportAttempts()`.
+ */
+export function failDigestRowImports(times: number): void {
+	let left = times;
+	rowImports = 0;
+	setOutlineDigestRowImporterForTests((load) => () => {
+		rowImports++;
+		if (left-- > 0)
+			return Promise.reject(new TypeError("Failed to fetch dynamically imported module: row"));
+		return load();
+	});
+}
+
+export function rowImportAttempts(): number {
+	return rowImports;
 }
 
 /** A Select's options once it is open (Mantine renders them in a portal). */

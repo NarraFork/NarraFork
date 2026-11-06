@@ -14,6 +14,7 @@ import {
 	DIGEST_COMPACT_ITEMS,
 	DIGEST_TODAY,
 	dayEntries,
+	dayIn,
 	dayNeighbors,
 	digestModel,
 	isTodayIn,
@@ -317,6 +318,10 @@ describe("browsing by day", () => {
 		expect(isTodayIn("2026-11-05", "America/New_York", now)).toBe(true);
 		expect(isTodayIn("2026-11-06", "America/New_York", now)).toBe(false);
 		expect(isTodayIn("2026-11-06", "Asia/Shanghai", now)).toBe(true);
+		// The calendar day, from the date's parts, in the zone; an unknown zone reads UTC.
+		expect(dayIn(new Date("2026-01-01T03:00:00.000Z"), "America/Los_Angeles")).toBe("2025-12-31");
+		expect(dayIn(new Date("2026-03-09T23:30:00.000Z"), "Asia/Tokyo")).toBe("2026-03-10");
+		expect(dayIn(new Date("2026-03-09T23:30:00.000Z"), "No/Such_Zone")).toBe("2026-03-09");
 	});
 
 	test("neighbors: earlier and later among those loaded, or on the next page", () => {

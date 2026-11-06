@@ -736,8 +736,11 @@ describe("the inbox's digest row", () => {
 			(await store.getPending([liveConfirm.pendingId]))[0]?.blockIdsJson[0] as string,
 		);
 		expect(undoneStep?.content).toBe("Copy the rows");
-		// Undone, so acknowledged: it stays shown here as undone.
+		// Undone, so acknowledged: it stays shown here as undone, and a toast tells it (its list
+		// may drop it).
 		expect((await store.getPending([liveConfirm.pendingId]))[0]?.digestSeenAt).not.toBeNull();
+		await until(page, "the toast", (f) => f.toasts().some((text) => text.includes("Undone")));
+		expect((await call(page, (f) => f.toasts())).join("\n")).toContain("Confirmed for you");
 		await new Promise((resolve) => setTimeout(resolve, 500));
 		expect(
 			await call(
@@ -756,6 +759,29 @@ describe("the inbox's digest row", () => {
 		expect(errors).toEqual([]);
 		await page.close();
 	}, 90_000);
+
+	test("the row's view failing to load is said in the row, and Try again loads it", async () => {
+		const { page, errors } = await open("/");
+		// The first import and lazyWithRetry's retry both fail; the next one loads.
+		await call(page, (f) => f.failDigestRowImports(2));
+		await until(page, "the digest row", has, ROW);
+		await call(
+			page,
+			(f, s) => f.click(s as never),
+			`${ROW} [data-testid=outline-attention-review]`,
+		);
+		await until(page, "the failure in the row", has, `${ROW} [data-testid=outline-digest-failed]`);
+		expect(await call(page, (f) => f.rowImportAttempts())).toBe(2);
+		// The rest of the drawer is still there.
+		expect(
+			await call(page, (f, s) => f.exists(s as never), "[data-attention-kind=outline_decision]"),
+		).toBe(true);
+		await call(page, (f, s) => f.click(s as never), "[data-testid=outline-digest-retry]");
+		await until(page, "the row's view", has, `${ROW} [data-testid=outline-digest]`);
+		expect(await call(page, (f) => f.rowImportAttempts())).toBe(3);
+		expect(errors).toEqual([]);
+		await page.close();
+	}, 60_000);
 
 	test("at 360 px, in Chinese and dark: no horizontal scroll", async () => {
 		for (const scheme of ["light", "dark"] as const) {
@@ -1044,8 +1070,13 @@ describe("the reports page", () => {
 		await until(en.page, "the decision", has, `${item} [data-testid=outline-report-undo]`);
 		await call(en.page, (f, s) => f.click(s as never), `${item} [data-testid=outline-report-undo]`);
 		await until(en.page, "asked first", has, `${item} [data-testid=outline-report-undo-confirm]`);
-		// Focus follows: to the confirm button, back to Undo on Cancel, and to it again.
-		await until(en.page, "focus on confirm", (f) => f.focused() === "outline-report-undo-yes");
+		// Focus follows: to the explanation (not the destructive button), back to Undo on Cancel,
+		// and to the explanation again.
+		await until(
+			en.page,
+			"focus on the explanation",
+			(f) => f.focused() === "outline-report-undo-explain",
+		);
 		await call(
 			en.page,
 			(f, s) => f.click(s as never),
@@ -1055,8 +1086,8 @@ describe("the reports page", () => {
 		await call(en.page, (f, s) => f.click(s as never), `${item} [data-testid=outline-report-undo]`);
 		await until(
 			en.page,
-			"focus on confirm again",
-			(f) => f.focused() === "outline-report-undo-yes",
+			"focus on the explanation again",
+			(f) => f.focused() === "outline-report-undo-explain",
 		);
 		expect(
 			await call(
@@ -1073,20 +1104,22 @@ describe("the reports page", () => {
 		);
 		await until(en.page, "undone", has, `${item} [data-testid=outline-report-undone]`);
 		expect((await store.getQuestions([relayed1.question]))[0]?.state).toBe("open");
-		// Said in a live region, where focus now is, and in a toast (the row it was in may go).
-		expect(
-			await call(
-				en.page,
-				(f, s) => f.exists(s as never),
-				`${item} [role=status][aria-live=polite] [data-testid=outline-report-undone]`,
-			),
-		).toBe(true);
+		// Told once: focus moves to the outcome (focus was in the control); no toast, nothing in the
+		// live region, no alert role.
 		await until(
 			en.page,
 			"focus on the outcome",
 			(f) => f.focused() === "outline-report-undo-outcome",
 		);
-		await until(en.page, "the toast", (f, s) => f.shows(s as never), "Your answer, relayed");
+		expect(await call(en.page, (f) => f.toasts())).toEqual([]);
+		expect(
+			await call(
+				en.page,
+				(f, s) => f.liveText(s as never),
+				`${item} [data-testid=outline-report-undo-live]`,
+			),
+		).toBe("");
+		expect(await call(en.page, (f, s) => f.count(s as never), `${item} [role=alert]`)).toBe(0);
 		expect(en.errors).toEqual([]);
 		await en.page.close();
 		// Read again on a page of its own: it no longer stands, so no undo is offered for it.
@@ -1153,6 +1186,12 @@ describe("the reports page", () => {
 				`${two} [data-testid=outline-report-undo-refused]`,
 			),
 		).toContain("撤不回了：它已经被撤回过，或者之后又被改过。");
+		await until(
+			zh.page,
+			"focus on the refusal",
+			(f) => f.focused() === "outline-report-undo-outcome",
+		);
+		expect(await call(zh.page, (f, s) => f.count(s as never), `${two} [role=alert]`)).toBe(0);
 		// Alice may only read carol's project now: 403.
 		await db.delete(aclGrants).where(eq(aclGrants.id, aliceOnR));
 		await db.insert(aclGrants).values({
@@ -1170,6 +1209,10 @@ describe("the reports page", () => {
 			`${three} [data-testid=outline-report-undo]`,
 		);
 		await until(zh.page, "asked", has, `${three} [data-testid=outline-report-undo-yes]`);
+		// The reader has moved on (to the space filter) when the answer comes back.
+		expect(
+			await call(zh.page, (f, s) => f.focus(s as never), "[data-testid=outline-report-space]"),
+		).toBe(true);
 		await call(
 			zh.page,
 			(f, s) => f.click(s as never),
@@ -1186,6 +1229,15 @@ describe("the reports page", () => {
 				zh.page,
 				(f, s) => f.textOf(s as never),
 				`${three} [data-testid=outline-report-undo-refused]`,
+			),
+		).toContain("你现在不能写这个空间，所以撤不回。");
+		// Focus stays where the reader put it; the polite live region tells it instead.
+		expect(await call(zh.page, (f) => f.focused())).toBe("outline-report-space");
+		expect(
+			await call(
+				zh.page,
+				(f, s) => f.liveText(s as never),
+				`${three} [data-testid=outline-report-undo-live]`,
 			),
 		).toContain("你现在不能写这个空间，所以撤不回。");
 		expect((await store.getQuestions([relayed3.question]))[0]?.state).toBe("answered");
@@ -1260,14 +1312,14 @@ describe("the reports page", () => {
 		await dated.page.close();
 	}, 90_000);
 
-	test("a so-far report of a day that is over says which day, not today", async () => {
+	test("a so-far report of a day that is over says which day and up to when, not today", async () => {
 		const [current] = await store.listDigestHeads(alice, { kind: "today", limit: 1 });
 		const row = await store.getDigest(current?.id as string);
 		expect(row).not.toBeNull();
 		// Between midnight and the report time: yesterday's "so far" is still the preview.
 		await db
 			.update(outlineDigests)
-			.set({ periodKey: D2 })
+			.set({ periodKey: D2, periodEnd: at(-1, "15:00") })
 			.where(and(eq(outlineDigests.userId, alice), eq(outlineDigests.kind, "today")));
 		try {
 			const { page, errors } = await open("/outline/digest?d=today");
@@ -1282,14 +1334,30 @@ describe("the reports page", () => {
 				(f, s) => f.textOf(s as never),
 				"[data-testid=outline-report-day-view] h3",
 			);
-			expect(title).toEndWith("so far");
-			expect(title).not.toBe("Today so far");
+			// The day and the time it was made up to, in its zone (UTC here).
+			expect(title).toEndWith("(up to 3:00 PM)");
+			expect(title).not.toContain("Today");
 			expect(errors).toEqual([]);
 			await page.close();
+			const zh = await open("/outline/digest?d=today", { lang: "zh-CN" });
+			await until(
+				zh.page,
+				"the preview",
+				has,
+				"[data-testid=outline-report-day-view][data-day=today]",
+			);
+			expect(
+				await call(
+					zh.page,
+					(f, s) => f.textOf(s as never),
+					"[data-testid=outline-report-day-view] h3",
+				),
+			).toEndWith("（截至 15:00）");
+			await zh.page.close();
 		} finally {
 			await db
 				.update(outlineDigests)
-				.set({ periodKey: row?.periodKey as string })
+				.set({ periodKey: row?.periodKey as string, periodEnd: row?.periodEnd as string })
 				.where(and(eq(outlineDigests.userId, alice), eq(outlineDigests.kind, "today")));
 		}
 	}, 60_000);

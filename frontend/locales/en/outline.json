@@ -503,14 +503,14 @@
 			},
 			"systemOther": "the system ({{name}})"
 		},
-		"soFar": "{{day}} so far",
 		"noPreview": "No report of today so far has been made yet.",
 		"olderFailed": "Earlier reports could not be loaded.",
 		"retry": "Try again",
 		"dayWithItems": "{{day}} ({{items}})",
 		"moreOnPage_one": "{{count}} more on the reports page",
 		"moreOnPage_other": "{{count}} more on the reports page",
-		"inboxFailed": "The report could not be shown."
+		"inboxFailed": "The report could not be shown.",
+		"upTo": "{{day}} (up to {{time}})"
 	},
 	"board": {
 		"title": "Tasks",

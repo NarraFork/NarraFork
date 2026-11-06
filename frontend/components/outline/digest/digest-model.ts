@@ -235,12 +235,25 @@ export function pickDay(
 
 /** Whether a day (`YYYY-MM-DD`) is today in `timeZone`. */
 export function isTodayIn(periodKey: string, timeZone: string, now: Date = new Date()): boolean {
+	return dayIn(now, timeZone) === periodKey;
+}
+
+/** The calendar day (`YYYY-MM-DD`) of an instant in `timeZone` (UTC when the zone is unknown). */
+export function dayIn(at: Date, timeZone: string): string {
+	let parts: Intl.DateTimeFormatPart[];
 	try {
-		// `en-CA` writes dates as YYYY-MM-DD.
-		return new Intl.DateTimeFormat("en-CA", { timeZone }).format(now) === periodKey;
+		parts = new Intl.DateTimeFormat("en-US", {
+			timeZone,
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+		}).formatToParts(at);
 	} catch {
-		return now.toISOString().slice(0, 10) === periodKey;
+		return at.toISOString().slice(0, 10);
 	}
+	const part = (type: Intl.DateTimeFormatPartTypes) =>
+		parts.find((p) => p.type === type)?.value ?? "";
+	return `${part("year").padStart(4, "0")}-${part("month").padStart(2, "0")}-${part("day").padStart(2, "0")}`;
 }
 
 /**

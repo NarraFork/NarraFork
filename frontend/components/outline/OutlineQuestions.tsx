@@ -32,7 +32,7 @@ import type {
 	OutlineBlockViewResponse,
 	OutlineQuestionView,
 } from "@shared/outline-api";
-import { Component, type ReactNode, Suspense, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useAnswerOutlineQuestions,
@@ -41,67 +41,9 @@ import {
 } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import { formatSmartTime } from "../../lib/format";
-import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { OpenInOutline } from "./OpenInOutline";
+import { OutlineDigestRow } from "./OutlineDigestRow";
 import { PendingDetail } from "./OutlinePendingPanel";
-
-/**
- * The digest row's report view (P2 PR 11), loaded when a digest row is expanded: the reports'
- * modules stay out of the outline surface, which shows this file's questions form. A transient
- * fetch failure is retried; a lasting one is shown in the row (`DigestRowBoundary`), not across
- * the whole drawer, and "Try again" loads it afresh.
- */
-function loadDigestInbox() {
-	return lazyWithRetry(() =>
-		import("./digest/OutlineDigestInbox").then((module) => ({
-			default: module.OutlineDigestInbox,
-		})),
-	);
-}
-let OutlineDigestInbox = loadDigestInbox();
-
-class DigestRowBoundary extends Component<
-	{ children: ReactNode; failed: ReactNode },
-	{ error: boolean }
-> {
-	state = { error: false };
-
-	static getDerivedStateFromError(): { error: boolean } {
-		return { error: true };
-	}
-
-	retry = () => {
-		// `lazy` keeps a rejection: a new one imports again.
-		OutlineDigestInbox = loadDigestInbox();
-		this.setState({ error: false });
-	};
-
-	render() {
-		if (!this.state.error) return this.props.children;
-		return (
-			<Group gap="xs" wrap="wrap" data-testid="outline-digest-failed">
-				{this.props.failed}
-				<Button size="compact-xs" variant="light" onClick={this.retry}>
-					<RetryLabel />
-				</Button>
-			</Group>
-		);
-	}
-}
-
-function RetryLabel() {
-	const { t } = useTranslation("outline");
-	return <>{t("report.retry")}</>;
-}
-
-function DigestRowFailed() {
-	const { t } = useTranslation("outline");
-	return (
-		<Text size="xs" c="red">
-			{t("report.inboxFailed")}
-		</Text>
-	);
-}
 
 type Translate = ReturnType<typeof useTranslation>["t"];
 
@@ -477,12 +419,6 @@ export function OutlineAttentionDetail({
 			/>
 		);
 	if (ref.what === "digest")
-		return (
-			<DigestRowBoundary failed={<DigestRowFailed />}>
-				<Suspense fallback={<Loader size="xs" />}>
-					<OutlineDigestInbox reportIds={ref.reportIds ?? []} onOpen={onOpen} />
-				</Suspense>
-			</DigestRowBoundary>
-		);
+		return <OutlineDigestRow reportIds={ref.reportIds ?? []} onOpen={onOpen} />;
 	return null;
 }

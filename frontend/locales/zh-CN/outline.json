@@ -503,14 +503,14 @@
 			},
 			"systemOther": "系统（{{name}}）"
 		},
-		"soFar": "{{day}}到现在",
 		"noPreview": "还没有生成今天到现在的汇报。",
 		"olderFailed": "更早的汇报没能读取。",
 		"retry": "重试",
 		"dayWithItems": "{{day}}（{{items}}）",
 		"moreOnPage_one": "还有 {{count}} 份在汇报页上",
 		"moreOnPage_other": "还有 {{count}} 份在汇报页上",
-		"inboxFailed": "汇报没能显示出来。"
+		"inboxFailed": "汇报没能显示出来。",
+		"upTo": "{{day}}（截至 {{time}}）"
 	},
 	"board": {
 		"title": "任务",

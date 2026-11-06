@@ -8,7 +8,17 @@
  * reference route) and to a session are app paths the host opens (`OutlineHrefLink`). `onOpen`
  * runs on any link, so a drawer can close.
  */
-import { Alert, Anchor, Badge, Button, Group, Paper, Stack, Text } from "@mantine/core";
+import {
+	Alert,
+	Anchor,
+	Badge,
+	Button,
+	Group,
+	Paper,
+	Stack,
+	Text,
+	VisuallyHidden,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type {
 	OutlineDelegatedKind,
@@ -234,18 +244,26 @@ function Tag({ color, children }: { color: string; children: ReactNode }) {
 // Undo (Q5)
 // ─────────────────────────────────────────────────────────────────────────────
 
-type UndoOutcome =
+/**
+ * How an outcome is told, exactly once: by moving focus to it (the reader is in this control), in
+ * a hidden polite live region (their focus is elsewhere), or by a toast (the drawer's list it is
+ * in may go once it is undone).
+ */
+type Announce = "focus" | "live" | "toast";
+
+type UndoOutcome = (
 	| { kind: "undone"; skipped: number }
-	| { kind: "refused"; reason: DigestUndoRefusal };
+	| { kind: "refused"; reason: DigestUndoRefusal }
+) & { announce: Announce };
 
 /**
  * Undo of a decision made in the reader's name: offered only while the API says it can be (it
  * still stands and the reader may write); asks before it undoes; says why the server refused, in
- * the reader's language. The outcome stays shown while the report is read again around it, in a
- * live region; a toast says it too, as the inbox row it was in may go once it is undone.
+ * the reader's language. The outcome stays shown while the report is read again around it.
  *
- * Focus: opening the question moves to its confirm button, Cancel back to Undo, the outcome to
- * the outcome.
+ * Focus: opening the question moves to its explanation (never to the destructive button, so a
+ * repeated Enter cannot confirm), Cancel back to Undo. The outcome is told once (`Announce`);
+ * focus moves to it only while focus is in this control or nowhere.
  */
 export function DecisionUndo({
 	commitId,
@@ -260,45 +278,60 @@ export function DecisionUndo({
 	kind: OutlineDelegatedKind;
 	stands: boolean;
 	canUndo: boolean;
-	/** It was undone here. */
+	/** It was undone here (the drawer's list it is in may drop it: a toast tells it). */
 	onUndone?: () => void;
 }) {
 	const { t } = useTranslation("outline");
 	const undo = useUndoOutlineDecision();
 	const [confirming, setConfirming] = useState(false);
 	const [outcome, setOutcome] = useState<UndoOutcome | null>(() =>
-		wasUndoneHere(commitId) ? { kind: "undone", skipped: 0 } : null,
+		wasUndoneHere(commitId) ? { kind: "undone", skipped: 0, announce: "focus" } : null,
 	);
+	const root = useRef<HTMLDivElement>(null);
 	const undoButton = useRef<HTMLButtonElement>(null);
-	const confirmButton = useRef<HTMLButtonElement>(null);
-	const statusBox = useRef<HTMLDivElement>(null);
+	const explanation = useRef<HTMLParagraphElement>(null);
+	const outcomeBox = useRef<HTMLDivElement>(null);
 	// Where focus goes once the next render is on screen.
-	const focusNext = useRef<"confirm" | "undo" | "status" | null>(null);
+	const focusNext = useRef<"explanation" | "undo" | "outcome" | null>(null);
 	useEffect(() => {
 		const next = focusNext.current;
 		if (!next) return;
 		focusNext.current = null;
-		const target = next === "confirm" ? confirmButton : next === "undo" ? undoButton : statusBox;
+		const target = next === "explanation" ? explanation : next === "undo" ? undoButton : outcomeBox;
 		target.current?.focus();
 	});
+	/** Focus is in this control, or nowhere: moving it to the outcome takes it from no one. */
+	const holdsFocus = () => {
+		const active = document.activeElement;
+		return !active || active === document.body || (root.current?.contains(active) ?? false);
+	};
+	const outcomeText = (o: UndoOutcome) =>
+		o.kind === "undone"
+			? o.skipped > 0
+				? t("report.undo.doneSkipped", { count: o.skipped })
+				: t("report.undo.done")
+			: `${t("report.undo.refused")}: ${t(`report.undo.${o.reason}`)}`;
 	const run = () => {
 		if (!commitId) return;
 		undo.mutate(
 			{ commitId, spaceId },
 			{
 				onSuccess: (result) => {
-					setOutcome({ kind: "undone", skipped: result.skipped });
-					focusNext.current = "status";
-					notifications.show({
-						color: "teal",
-						title: t("report.undo.done"),
-						message: t(`report.kind.${kind}`),
-					});
+					const announce: Announce = onUndone ? "toast" : holdsFocus() ? "focus" : "live";
+					setOutcome({ kind: "undone", skipped: result.skipped, announce });
+					if (announce === "focus") focusNext.current = "outcome";
+					if (announce === "toast")
+						notifications.show({
+							color: "teal",
+							title: t("report.undo.done"),
+							message: t(`report.kind.${kind}`),
+						});
 					onUndone?.();
 				},
 				onError: (error) => {
-					setOutcome({ kind: "refused", reason: undoRefusalOf(error) });
-					focusNext.current = "status";
+					const announce: Announce = holdsFocus() ? "focus" : "live";
+					setOutcome({ kind: "refused", reason: undoRefusalOf(error), announce });
+					if (announce === "focus") focusNext.current = "outcome";
 				},
 				onSettled: () => setConfirming(false),
 			},
@@ -308,7 +341,7 @@ export function DecisionUndo({
 	const refused = outcome?.kind === "refused" ? outcome : null;
 	const offered = !undone && stands && canUndo && commitId !== null;
 	return (
-		<Stack gap={4}>
+		<Stack ref={root} gap={4}>
 			{!undone && !stands && (
 				<Group>
 					<Badge
@@ -330,12 +363,18 @@ export function DecisionUndo({
 			{offered &&
 				(confirming ? (
 					<Paper withBorder p="xs" radius="sm" data-testid="outline-report-undo-confirm">
-						<Text size="xs" style={wrap} id={`undo-explain-${commitId}`}>
+						<Text
+							ref={explanation}
+							tabIndex={-1}
+							size="xs"
+							style={{ ...wrap, outline: "none" }}
+							id={`undo-explain-${commitId}`}
+							data-testid="outline-report-undo-explain"
+						>
 							{t(`report.undo.explain.${kind}`)}
 						</Text>
 						<Group gap="xs" mt={6} wrap="wrap">
 							<Button
-								ref={confirmButton}
 								size="compact-xs"
 								color="red"
 								loading={undo.isPending}
@@ -369,7 +408,7 @@ export function DecisionUndo({
 							color="red"
 							onClick={() => {
 								setOutcome(null);
-								focusNext.current = "confirm";
+								focusNext.current = "explanation";
 								setConfirming(true);
 							}}
 							data-testid="outline-report-undo"
@@ -378,29 +417,27 @@ export function DecisionUndo({
 						</Button>
 					</Group>
 				))}
+			{/* What is shown; told by focus or a toast, never by a live role of its own. */}
 			<div
-				ref={statusBox}
+				ref={outcomeBox}
 				tabIndex={-1}
 				style={{ outline: "none" }}
 				data-testid="outline-report-undo-outcome"
 			>
-				<div role="status" aria-live="polite" data-testid="outline-report-undo-status">
-					{undone && (
-						<Badge
-							size="sm"
-							variant="light"
-							color="teal"
-							tt="none"
-							data-testid="outline-report-undone"
-						>
-							{undone.skipped > 0
-								? t("report.undo.doneSkipped", { count: undone.skipped })
-								: t("report.undo.done")}
-						</Badge>
-					)}
-				</div>
+				{undone && (
+					<Badge
+						size="sm"
+						variant="light"
+						color="teal"
+						tt="none"
+						data-testid="outline-report-undone"
+					>
+						{outcomeText(undone)}
+					</Badge>
+				)}
 				{refused && (
 					<Alert
+						role="none"
 						color="red"
 						variant="light"
 						p="xs"
@@ -412,6 +449,10 @@ export function DecisionUndo({
 					</Alert>
 				)}
 			</div>
+			{/* Told here only while the reader's focus is elsewhere. */}
+			<VisuallyHidden aria-live="polite" data-testid="outline-report-undo-live">
+				{outcome?.announce === "live" ? outcomeText(outcome) : ""}
+			</VisuallyHidden>
 		</Stack>
 	);
 }
