@@ -137,8 +137,18 @@ export function OutlineTimeline({
 	// Keep the picked commit in view (the newest one when showing the current state).
 	useEffect(() => {
 		if (selectedSeq === undefined) return;
-		const tick = viewport.current?.querySelector<HTMLElement>(`[data-seq="${selectedSeq}"]`);
-		tick?.scrollIntoView({ block: "nearest", inline: "nearest" });
+		const strip = viewport.current;
+		const tick = strip?.querySelector<HTMLElement>(`[data-seq="${selectedSeq}"]`);
+		if (!strip || !tick) return;
+		// scrollIntoView also scrolls ancestors, including the shell and Dockview's hidden
+		// overflow containers. While dock geometry settles that can shift the entire page
+		// upward and leave an empty band below it. Only move this strip, horizontally.
+		const bounds = strip.getBoundingClientRect();
+		const target = tick.getBoundingClientRect();
+		const left = bounds.left + strip.clientLeft;
+		const right = left + strip.clientWidth;
+		if (target.left < left) strip.scrollLeft += target.left - left;
+		else if (target.right > right) strip.scrollLeft += target.right - right;
 	}, [selectedSeq]);
 
 	const confirmRevert = (commit: OutlineCommitSummary) => {
