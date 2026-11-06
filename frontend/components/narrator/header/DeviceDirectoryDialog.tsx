@@ -15,14 +15,14 @@ import { Alert, Button, Group, Loader, Modal, Stack, Text } from "@mantine/core"
 import { IconAlertTriangle, IconFolder } from "@tabler/icons-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../hooks/useWorkspaceContext";
-import { api } from "../../lib/api";
-import { Z } from "../../lib/z-index";
-import { DirectoryPicker } from "../common/DirectoryPicker";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../common/directory-browser-modal";
+import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
+import { api } from "../../../lib/api";
+import { Z } from "../../../lib/z-index";
+import { DirectoryPicker } from "../../common/DirectoryPicker";
+import { DIRECTORY_BROWSER_MODAL_STYLES } from "../../common/directory-browser-modal";
 
 const RemoteDirectoryBrowser = lazy(() =>
-	import("../permissions/RemoteDirectoryBrowser").then((module) => ({
+	import("../../permissions/RemoteDirectoryBrowser").then((module) => ({
 		default: module.RemoteDirectoryBrowser,
 	})),
 );
