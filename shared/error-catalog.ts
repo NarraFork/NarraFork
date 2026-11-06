@@ -360,6 +360,8 @@ export interface ErrorResponsePayload {
 	code: string;
 	messageCode?: ErrorMessageCode;
 	messageParams?: ErrorMessageParams;
+	/** Machine-readable extras for errors the client must act on, not merely display. */
+	details?: Record<string, unknown>;
 }
 
 /**

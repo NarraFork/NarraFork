@@ -112,7 +112,7 @@ export function readDeviceDirectory(
 	deviceId: string,
 ): WorkspaceDirectoryEntry | null {
 	const entry = map?.[deviceId];
-	if (!entry || !entry.cwd) return null;
+	if (!entry?.cwd) return null;
 	return { cwd: entry.cwd, pathFlavor: normalizeWorkspacePathFlavor(entry.pathFlavor) };
 }
 
