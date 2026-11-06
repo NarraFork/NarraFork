@@ -613,7 +613,7 @@ export interface CardReport {
 	/** Change rows drawn, and their link texts. */
 	rows: number;
 	links: string[];
-	/** Chips meant to be painted as written (ids, aliases, names) that the browser upper-cased. */
+	/** Chips the browser upper-cased (their text as written). */
 	upperChips: string[];
 	/** Chips not fully visible: clipped by their row (pushed onto a hidden line, or cut). */
 	hiddenChips: string[];
@@ -621,6 +621,11 @@ export interface CardReport {
 	cutIds: string[];
 	/** Answer rows (a question's answer, under it): their text and visible width (px). */
 	answers: Array<{ text: string; width: number }>;
+	/**
+	 * A task notice's heading up to its first number ("alice answered 2"): whether that much of it
+	 * shows. Null when the card has no such heading.
+	 */
+	headingCount: boolean | null;
 	/** The folded line's tail (an answer): its visible width and its text's full width (px). */
 	tail: { width: number; full: number } | null;
 }
@@ -697,6 +702,16 @@ export function report(): CardReport[] {
 					width: text ? Math.round(text.getBoundingClientRect().width) : 0,
 				};
 			});
+		const heading = card.querySelector<HTMLElement>("[data-task-notice-title]");
+		let headingCount: boolean | null = null;
+		const textNode = heading?.firstChild;
+		const digit = heading?.textContent?.search(/\d/) ?? -1;
+		if (heading && textNode && textNode.nodeType === Node.TEXT_NODE && digit >= 0) {
+			const range = document.createRange();
+			range.setStart(textNode, 0);
+			range.setEnd(textNode, digit + 1);
+			headingCount = range.getBoundingClientRect().width <= heading.clientWidth + 0.5;
+		}
 		const tailNode = card.querySelector<HTMLElement>("[data-task-notice-tail]");
 		const tail = tailNode
 			? {
@@ -711,11 +726,9 @@ export function report(): CardReport[] {
 			})
 			.map((chip) => chip.textContent ?? "");
 		const upperChips: string[] = [];
-		// Chips painted as written: ids, aliases, names (a localized word chip may be upper-cased,
-		// as every Mantine badge is).
-		for (const badge of card.querySelectorAll<HTMLElement>(
-			".mantine-Badge-root[data-verbatim], .mantine-Badge-root[data-change-part]",
-		)) {
+		// Every chip the browser upper-cased (the test allows only the localized word labels: an
+		// id, an alias or a name must never be).
+		for (const badge of card.querySelectorAll<HTMLElement>(".mantine-Badge-root")) {
 			const label = badge.textContent ?? "";
 			if (/[a-z]/.test(label) && getComputedStyle(badge).textTransform === "uppercase")
 				upperChips.push(label);
@@ -738,6 +751,7 @@ export function report(): CardReport[] {
 			upperChips,
 			hiddenChips,
 			cutIds,
+			headingCount,
 			answers,
 			tail,
 		};

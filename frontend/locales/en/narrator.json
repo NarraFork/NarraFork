@@ -2036,7 +2036,7 @@
 			"answerOptionBare": "option {{n}}",
 			"answerText": "“{{text}}”",
 			"answerAdopted": "your recommendation",
-			"answerDiffers": "differs from what you went ahead with",
+			"answerDiffers": "differs from your pick",
 			"answersHeading": "{{who}} answered {{n}} question(s)"
 		},
 		"unknownSource": "unknown",

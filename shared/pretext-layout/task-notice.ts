@@ -142,7 +142,7 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeAnswerOptionBare: "option {n}",
 	taskNoticeAnswerText: "\u201c{text}\u201d",
 	taskNoticeAnswerAdopted: "your recommendation",
-	taskNoticeAnswerDiffers: "differs from what you went ahead with",
+	taskNoticeAnswerDiffers: "differs from your pick",
 };
 
 type Labels = Readonly<Record<string, string>> | undefined;

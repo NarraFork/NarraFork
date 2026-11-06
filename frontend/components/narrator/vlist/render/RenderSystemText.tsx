@@ -851,12 +851,14 @@ function TaskNoticeCard({
 }) {
 	const line = taskNoticeLineHeight();
 	const expanded = measured.expanded === true;
-	const answerFirst = !expanded && data.summary?.tailFirst === true;
 	const rows = expanded ? (data.rows ?? []).slice(0, measured.rowCount) : [];
 	const toggle = data.expandable === true && onToggle ? onToggle : undefined;
 	const Icon = TASK_NOTICE_ICON[data.variant] ?? IconListCheck;
 	// Height-neutral: the label and the tail sit in the one heading line either way.
 	const narrow = measured.contentWidth < TASK_NOTICE_NARROW_WIDTH;
+	// The answer takes the folded line's room only where it is drawn: on a phone the tail is left
+	// out (#332's narrow rule), so the heading keeps who answered and how many.
+	const answerFirst = !expanded && !narrow && data.summary?.tailFirst === true;
 	const timeLabel = typeof data.timeLabel === "string" && !narrow ? data.timeLabel : "";
 	const Chevron = expanded ? IconChevronDown : IconChevronRight;
 	return (
@@ -1101,7 +1103,10 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 					variant="outline"
 					color="gray"
 					tt="none"
-					style={{ flexShrink: 0 }}
+					title={mark}
+					// Whole while the row has room; on a narrow row it gives way after the title has
+					// (truncated, in full on hover) rather than being cut at the row's edge.
+					style={{ flex: "0 1 auto", minWidth: "3em" }}
 				>
 					{mark}
 				</Badge>

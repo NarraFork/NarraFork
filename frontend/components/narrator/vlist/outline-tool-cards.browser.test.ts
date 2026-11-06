@@ -11,6 +11,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import en from "../../../locales/en/narrator.json";
 import type * as Fixture from "./outline-tool-cards.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -67,6 +68,28 @@ afterAll(async () => {
 	server?.stop(true);
 });
 
+/**
+ * The chips a Mantine badge may upper-case: the localized word labels of the outline cards (in
+ * English; the Chinese ones have no case). Anything else upper-cased is an id, an alias or a name
+ * that lost its `verbatim` flag.
+ */
+const WORD_CHIP_KEYS = [
+	"sumBlocks",
+	"sumAsOf",
+	"sumAsOfTime",
+	"sumMoreTruncated",
+	"sumResults",
+	"searchProcess",
+	"askWentAhead",
+] as const;
+const WORD_CHIPS = WORD_CHIP_KEYS.map(
+	(key) =>
+		new RegExp(
+			`^${en.outlineCard[key].replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\{\{\w+\}\}/g, ".+")}$`,
+		),
+);
+const isWordChip = (label: string) => WORD_CHIPS.some((re) => re.test(label));
+
 const ENLARGED = { fontScalePercent: 130, lineHeightScalePercent: 120 };
 
 const CASES: Array<{ name: string; options: Fixture.FixtureOptions }> = [];
@@ -116,6 +139,31 @@ for (const scene of ["answers", "longanswer"]) {
 		}
 	}
 }
+// Phone widths for the answer notice: folded (the heading keeps who answered and how many), and
+// unfolded in English, whose "differs" mark is the longest chip of a row (#332's own 328px).
+for (const lang of ["en", "zh-CN"] as const) {
+	CASES.push({
+		name: `answers-folded-360-${lang}`,
+		options: { scene: "answers", width: 360, scheme: "dark", expanded: false, lang },
+	});
+}
+CASES.push(
+	{
+		name: "answers-328-en-enlarged",
+		options: {
+			scene: "answers",
+			width: 328,
+			scheme: "dark",
+			expanded: true,
+			lang: "en",
+			...ENLARGED,
+		},
+	},
+	{
+		name: "answers-300-en",
+		options: { scene: "answers", width: 300, scheme: "dark", expanded: true, lang: "en" },
+	},
+);
 CASES.push(
 	{
 		name: "pending-360-en-enlarged",
@@ -198,8 +246,12 @@ for (const { name, options } of CASES) {
 			expect({ where, spill: card.spill }).toEqual({ where, spill: 0 });
 			expect({ where, rowOverflow: card.rowOverflow }).toEqual({ where, rowOverflow: 0 });
 			expect(card.scrollWidth).toBeLessThanOrEqual(card.width);
-			// A case-sensitive id or alias is never upper-cased.
-			expect({ where, upper: card.upperChips }).toEqual({ where, upper: [] });
+			// A case-sensitive id or alias, a project's name, is never upper-cased: only the localized
+			// word labels may be.
+			expect({ where, upper: card.upperChips.filter((label) => !isWordChip(label)) }).toEqual({
+				where,
+				upper: [],
+			});
 			// No chip is pushed off its row's one line, or cut at its edge.
 			expect({ where, hidden: card.hiddenChips }).toEqual({ where, hidden: [] });
 			// A short id (an alias, a change's label) is never truncated: half of one names nothing.
@@ -223,16 +275,25 @@ for (const { name, options } of CASES) {
 				expect(edit?.text).not.toContain("不再是任务");
 			}
 		}
+		if ((options.scene === "answers" || options.scene === "longanswer") && options.width < 420) {
+			// On a phone the folded tail is left out (#332), so the heading keeps how many answered.
+			if (!options.expanded) expect(cards[0]?.headingCount).toBe(true);
+		}
 		if (options.scene === "answers" && options.expanded) {
 			const [notice] = cards;
 			// Each answer has its own row, readable beside nothing else.
-			expect(notice?.answers.map((a) => a.text)).toEqual([
-				"→ 选 2. 消息气泡右上角；采纳了你的建议",
-				"→ “先只修 Anthropic，Codex 下周”",
-			]);
+			expect(notice?.answers.map((a) => a.text)).toEqual(
+				options.lang === "en"
+					? ["→ option 2: 消息气泡右上角; your recommendation", "→ “先只修 Anthropic，Codex 下周”"]
+					: ["→ 选 2. 消息气泡右上角；采纳了你的建议", "→ “先只修 Anthropic，Codex 下周”"],
+			);
 			for (const answer of notice?.answers ?? []) expect(answer.width).toBeGreaterThan(100);
 		}
-		if ((options.scene === "answers" || options.scene === "longanswer") && !options.expanded) {
+		if (
+			(options.scene === "answers" || options.scene === "longanswer") &&
+			!options.expanded &&
+			options.width >= 420
+		) {
 			const [notice] = cards;
 			const tail = notice?.tail ?? { width: 0, full: 1 };
 			// Folded: the answer has the line's room beside the long question: all of it when it
