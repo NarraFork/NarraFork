@@ -93,6 +93,7 @@ export function GenUICard(props: GenUICardProps) {
 				historyUnavailable={props.historyUnavailable}
 				kit={props.kit}
 				height={props.height}
+				stateKey={props.inline?.stateKey}
 			/>
 		);
 	}
@@ -254,12 +255,15 @@ function PrivateCard({
 	height,
 	historyUnavailable,
 	kit,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	height: number;
 	historyUnavailable?: boolean;
 	kit?: GenUiKitNotice;
+	/** Keys the draft the app persists across frame rebuilds. */
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const mobile = useMobileViewport();
@@ -280,7 +284,7 @@ function PrivateCard({
 	const path = `${file.directory.replace(/[\\/]$/, "")}/${file.entry}`;
 	const preview = opened ? (
 		<Suspense fallback={<Loader size="sm" />}>
-			<FilePreview narratorId={narratorId} file={file} />
+			<FilePreview narratorId={narratorId} file={file} stateKey={stateKey} />
 		</Suspense>
 	) : null;
 	return (
