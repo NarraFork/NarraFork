@@ -189,6 +189,14 @@ export interface VListRenderLabels {
 		backgroundBadge: string;
 		/** "Taken over by user" badge on a card whose child the user is driving. */
 		takenOverBadge: string;
+		/** The row naming the outline task the agent was sent with (P2 PR 9b): `{title}`. */
+		delegatedTask: string;
+		/** A late result's badge, and its tooltip by reason. */
+		lateBadge: string;
+		lateReasons: Record<
+			"taken_over" | "redelegated" | "reclaimed" | "ended" | "reopened" | "gone" | "late",
+			string
+		>;
 		/** Live output counter badge: `{count}` chars written so far. */
 		liveOutputChars: string;
 		followParent: string;
@@ -560,6 +568,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
 			sidecarSourceOutlineTurnEnd: t("sidecar.sources.outline_task_turn_end"),
 			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
+			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
 			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
 			// ── task notices (`shared/pretext-layout/task-notice.ts`) ────────────────
 			taskNoticeStatusTodo: t("sidecar.taskNotice.statusTodo"),
@@ -567,6 +576,7 @@ export function useVListLabels(): VListLabels {
 			taskNoticeStatusDone: t("sidecar.taskNotice.statusDone"),
 			taskNoticeStatusCancelled: t("sidecar.taskNotice.statusCancelled"),
 			taskNoticeStatusWaiting: t("sidecar.taskNotice.statusWaiting"),
+			taskNoticeStatusDelegated: t("sidecar.taskNotice.statusDelegated"),
 			taskNoticeMarkHumanCreated: t("sidecar.taskNotice.markHumanCreated"),
 			taskNoticeMarkLocked: t("sidecar.taskNotice.markLocked"),
 			taskNoticeMarkProtected: t("sidecar.taskNotice.markProtected"),
@@ -587,6 +597,7 @@ export function useVListLabels(): VListLabels {
 			taskNoticeJoin: t("sidecar.taskNotice.join"),
 			taskNoticeWhoJoin: t("sidecar.taskNotice.whoJoin"),
 			taskNoticeEditedTitle: t("sidecar.taskNotice.editedTitle", { who: "{who}", n: "{n}" }),
+			taskNoticeFinishedTitle: t("sidecar.taskNotice.finishedTitle", { who: "{who}", n: "{n}" }),
 			taskNoticeTurnEndTail: t("sidecar.taskNotice.turnEndTail"),
 			taskNoticeOpenLead: t("sidecar.taskNotice.openLead", { n: "{n}" }),
 			taskNoticeOpenLeadAtLeast: t("sidecar.taskNotice.openLeadAtLeast", { n: "{n}" }),
@@ -597,11 +608,13 @@ export function useVListLabels(): VListLabels {
 			taskNoticeViewEmpty: t("sidecar.taskNotice.viewEmpty"),
 			taskNoticeCountDoing: t("sidecar.taskNotice.countDoing", { n: "{n}" }),
 			taskNoticeCountWaiting: t("sidecar.taskNotice.countWaiting", { n: "{n}" }),
+			taskNoticeCountDelegated: t("sidecar.taskNotice.countDelegated", { n: "{n}" }),
 			taskNoticeCountTodo: t("sidecar.taskNotice.countTodo", { n: "{n}" }),
 			taskNoticeCountSep: t("sidecar.taskNotice.countSep"),
 			// The plain projection of an `outlineTasks` body (copy / legacy cards).
 			outlineTaskTurnEndHeading: t("sidecar.taskNotice.turnEndHeading"),
 			outlineTaskEditedHeading: t("sidecar.taskNotice.editedHeading", { n: "{n}" }),
+			outlineTaskFinishedHeading: t("sidecar.taskNotice.finishedHeading", { n: "{n}" }),
 			outlineTaskMore: t("sidecar.taskNotice.moreRow", { n: "{n}" }),
 			// ── outline tool cards (`shared/pretext-layout/outline-tool-card.ts`) ─────────
 			outlineSpaceOwnSession: t("outlineCard.spaceOwnSession"),
@@ -857,6 +870,17 @@ export function useVListLabels(): VListLabels {
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
 				takenOverBadge: t("subagentTakenOver"),
+				delegatedTask: t("subagentDelegatedTask", { title: "{title}" }),
+				lateBadge: t("subagentLateBadge"),
+				lateReasons: {
+					taken_over: t("subagentLateReason.taken_over"),
+					redelegated: t("subagentLateReason.redelegated"),
+					reclaimed: t("subagentLateReason.reclaimed"),
+					ended: t("subagentLateReason.ended"),
+					reopened: t("subagentLateReason.reopened"),
+					gone: t("subagentLateReason.gone"),
+					late: t("subagentLateReason.late"),
+				},
 				// Same wording as the adapter-level live counter; one locale key serves
 				// both the header badge and the folded-row summary.
 				liveOutputChars: t("liveOutputChars", { count: "{count}" }),

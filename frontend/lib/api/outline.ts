@@ -37,6 +37,8 @@ import type {
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardSeenRequest,
+	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
 	OutlineBoardTaskUpdateResponse,
 	OutlineTaskBoardResponse,
@@ -227,6 +229,12 @@ export const outlineApi = {
 	updateBoardTask: (blockId: string, body: OutlineBoardTaskUpdateRequest) =>
 		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
 			method: "PATCH",
+			body: JSON.stringify(body),
+		}),
+	/** The person saw these tasks marked 「新完成」 on a board (outline P2 PR 9b). */
+	markBoardTasksSeen: (body: OutlineBoardSeenRequest) =>
+		request<OutlineBoardSeenResponse>("/outline/tasks/seen", {
+			method: "POST",
 			body: JSON.stringify(body),
 		}),
 	/** The status bar's current task, from the session's task source (either backend). */

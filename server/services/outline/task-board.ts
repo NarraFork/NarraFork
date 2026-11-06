@@ -20,6 +20,18 @@
  * name; else, for an open task of a session space, that session (it will take it up: continuation
  * starts the first to-do, §4.8); else nobody. A finished task: whoever last held it, when known.
  *
+ * NEWLY DONE FOR YOU (「新完成」, D50 ④; outline P2 PR 9b)
+ * -----------------------------------------------------
+ * A finished task the reader manages (`task_json.manager` is them) that an agent finished is
+ * `newlyDone` until they have seen it on a board: the commit of its current version is an
+ * agent's (or a system commit for a session: a confirmation), or another person's while a
+ * session was doing it (as the report counts it); never one the reader wrote. Only tasks finished
+ * within {@link OUTLINE_BOARD_NEW_DONE.windowDays} days. "Seen" is a row of `outline_task_seen`
+ * at the task's version or later, written when the board showed it to them
+ * ({@link markOutlineTasksSeen}); a task finished again later is new again. Cost: nothing more
+ * for a board without such a task; otherwise one commit read per space (by `(space_id, seq)`) and
+ * one read of the reader's rows (primary key), bounded by the finished tasks shown.
+ *
  * COMPLETION (D26b)
  * -----------------
  * A locked task whose being done or cancelled waits for confirmation carries `completion`: the
@@ -33,10 +45,13 @@
  * every space in one compound statement each (a bounded seek per space), ancestors one level at a
  * time for all of them, titles as the head of each block's content only, claims, names and the
  * open changes (by the tasks' lock roots) in one read each, and whether the person may write each
- * session space from the sessions' write facts and one grant read (`writableSpaces`).
+ * session space from the sessions' write facts and one grant read (`writableSpaces`). The one
+ * exception is 「新完成」: the commits of the reader's own finished tasks are read per space that
+ * has one (at most the page's spaces), and not at all when none does.
  */
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import { blockTitle } from "@shared/outline";
+import type { OutlineBoardSeenRequest } from "@shared/outline-task-board";
 import {
 	OUTLINE_TASK_BOARD_LIMITS,
 	type OutlineBoardExecutor,
@@ -64,6 +79,7 @@ import { isOrphanedSpace, resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
 import type {
 	OutlineBlockMeta,
+	OutlineCommitRow,
 	OutlinePendingHead,
 	OutlineSpaceRow,
 	OutlineStore,
@@ -108,6 +124,120 @@ function decodeSpaceCursor(cursor: string): string {
 	const id = Buffer.from(cursor, "base64url").toString("utf8");
 	if (!CURSOR_ID.test(id)) throw new ValidationError("Invalid cursor");
 	return id;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Newly done for the reader (「新完成」)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const OUTLINE_BOARD_NEW_DONE = {
+	/** Tasks finished longer ago than this are never marked. */
+	windowDays: 14,
+	/** A person's seen rows older than this are pruned when they write more. */
+	keepSeenDays: 30,
+} as const;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Whether the commit that wrote a task's current version finished it as an agent's work. */
+function finishedByAgent(
+	commit: OutlineCommitRow,
+	claim: OutlineTaskClaimRow | undefined,
+	readerId: string,
+): boolean {
+	if (commit.actorKind === "agent") return true;
+	if (commit.actorKind === "system") return commit.narratorId !== null;
+	// A person's commit: the reader's own never is; another person's when a session was doing it.
+	if (commit.actorId === readerId) return false;
+	return !!(claim?.holderNarratorId ?? claim?.lastHolderNarratorId);
+}
+
+/**
+ * Of the given finished tasks, those newly done for the reader (see the module header): read only
+ * when one of them is done and theirs.
+ */
+async function newlyDoneFor(
+	ctx: Context,
+	metas: readonly OutlineBlockMeta[],
+	claims: ReadonlyMap<string, OutlineTaskClaimRow>,
+	now: Date,
+): Promise<Set<string>> {
+	const readerId = ctx.principal.userId;
+	const candidates = metas.filter(
+		(m) =>
+			!m.deleted &&
+			m.taskJson?.status === "done" &&
+			m.taskJson.manager?.kind === "human" &&
+			m.taskJson.manager.id === readerId,
+	);
+	const out = new Set<string>();
+	if (candidates.length === 0) return out;
+	const { store } = ctx;
+	const seqsBySpace = new Map<string, number[]>();
+	for (const m of candidates)
+		seqsBySpace.set(m.spaceId, [...(seqsBySpace.get(m.spaceId) ?? []), m.versionSeq]);
+	const commits = new Map<string, OutlineCommitRow>();
+	for (const [spaceId, seqs] of seqsBySpace)
+		for (const commit of await store.getCommitsBySeqs(spaceId, [...new Set(seqs)]))
+			commits.set(`${spaceId}:${commit.seq}`, commit);
+	const seen = new Map(
+		(
+			await store.getTaskSeen(
+				readerId,
+				candidates.map((m) => m.id),
+			)
+		).map((row) => [row.taskBlockId, row.seenSeq]),
+	);
+	const since = new Date(now.getTime() - OUTLINE_BOARD_NEW_DONE.windowDays * DAY_MS).toISOString();
+	for (const m of candidates) {
+		const commit = commits.get(`${m.spaceId}:${m.versionSeq}`);
+		if (!commit || commit.createdAt < since) continue;
+		if ((seen.get(m.id) ?? -1) >= m.versionSeq) continue;
+		if (finishedByAgent(commit, claims.get(m.id), readerId)) out.add(m.id);
+	}
+	return out;
+}
+
+/**
+ * The reader saw these tasks on a board (「新完成」 shown to them): one row each, at the version
+ * the board showed. Only tasks that are done and theirs (they manage them), in a space they may
+ * read, are recorded; the rest are ignored (nothing is said about them). Returns how many were
+ * recorded.
+ */
+export async function markOutlineTasksSeen(
+	principal: OutlinePrincipal,
+	request: OutlineBoardSeenRequest,
+	options: { store?: OutlineStore; now?: Date } = {},
+): Promise<number> {
+	const store = options.store ?? outlineStore;
+	const wanted = new Map<string, number>();
+	for (const task of request.tasks.slice(0, OUTLINE_TASK_BOARD_LIMITS.seenPerRequest))
+		wanted.set(task.id, Math.max(wanted.get(task.id) ?? 0, task.versionSeq));
+	if (wanted.size === 0) return 0;
+	const metas = await store.getBlockMetasByIds([...wanted.keys()]);
+	const readable = new Map<string, boolean>();
+	const rows: Array<{ taskBlockId: string; seenSeq: number }> = [];
+	for (const m of metas) {
+		const manager = m.taskJson?.manager;
+		if (m.deleted || m.taskJson?.status !== "done") continue;
+		if (manager?.kind !== "human" || manager.id !== principal.userId) continue;
+		if (!readable.has(m.spaceId)) {
+			const space = await store.getSpace(m.spaceId);
+			readable.set(m.spaceId, !!space && (await canReadSpace(principal, space)));
+		}
+		if (!readable.get(m.spaceId)) continue;
+		// Never past the task's version now: a version the board could not have shown.
+		const seenSeq = Math.min(wanted.get(m.id) ?? 0, m.versionSeq);
+		rows.push({ taskBlockId: m.id, seenSeq });
+	}
+	const now = options.now ?? new Date();
+	await store.putTaskSeen(
+		principal.userId,
+		rows,
+		now.toISOString(),
+		new Date(now.getTime() - OUTLINE_BOARD_NEW_DONE.keepSeenDays * DAY_MS).toISOString(),
+	);
+	return rows.length;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -167,7 +297,8 @@ async function describe(
 		? await inDocumentOrder(store, metas, options.first ?? null, { keys, ancestors: known })
 		: [...metas];
 	const ids = ordered.map((m) => m.id);
-	const now = new Date().toISOString();
+	const nowDate = new Date();
+	const now = nowDate.toISOString();
 	const openPending = options.open ? await openPendingOf(store, ordered, known) : [];
 	const [heads, claimRows, waits, completions] = await Promise.all([
 		store.getBlockHeads(ids),
@@ -181,6 +312,9 @@ async function describe(
 	]);
 	const titles = new Map(heads.map((h) => [h.id, blockTitle(h.contentHead)]));
 	const claims = new Map<string, OutlineTaskClaimRow>(claimRows.map((c) => [c.taskBlockId, c]));
+	const newlyDone = options.open
+		? new Set<string>()
+		: await newlyDoneFor(ctx, ordered, claims, nowDate);
 
 	// Holders as sessions (a subagent's claim is its root's work), and the names to show.
 	const holderNarrators = new Set<string>();
@@ -285,6 +419,7 @@ async function describe(
 					}
 				: null,
 			versionSeq: meta.versionSeq,
+			...(newlyDone.has(meta.id) ? { newlyDone: true as const } : {}),
 		});
 	}
 	return out;

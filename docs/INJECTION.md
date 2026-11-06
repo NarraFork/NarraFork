@@ -216,6 +216,11 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 
 看板的「添加并开始」「重新打开并开始」在启动会话前先 `flushOutlineTaskEdits`，让这一回合读到通知。`/goal` 自己的提交不发通知（它的消息已经说了）。行为边界页上的复选框是规则不是任务，不发通知。
 
+**本会话建的任务在别处结束（`outline_task_finished`，`server/services/outline/task-finished.ts`，outline P2 PR 9b）**：监听 `outline:committed`，读这次提交写的版本（不读正文，最多 200 条）。任务在这次提交前是待办或进行中、提交后是完成或取消，且 `task_json.manager` 是一个会话（agent）时，告诉那个会话（子代理建的任务告诉它的根会话）；不告诉的情况：结束它的就是这个会话或它的子代理（子代理的结果本身就是通知）、会话不存在或已归档、会话的任务不在大纲、人的提交而 PR 5（`outline_task_edit`）已经会告诉这个会话。管理者是人时这里不发（进汇报，看板标「新完成」）。
+- 一律 `role: sys`、不带 `createdBy`；body 是 `outlineTasks`，variant `finished`，每个任务带结束者和状态变化，读者看到「X 结束了本会话建的 N 个任务」。
+- 每个提交、每个会话一条；整次提交最多列 20 个任务，其余在各自会话那条里计数。文字按会话所有者的语言（en、zh-CN）。
+- SQLite：消息 id 由（空间、提交 seq、会话、任务）推出，`schedule: wakeIfIdle`；同一提交再送一次时发现那一行已在，不再写也不再唤醒。PostgreSQL：不指定 id，`schedule: none`（同 PR 7 的回答送达）。没有补发队列：提交和送达之间进程停了，这条就丢了（PR 10 并进 runtime inbox 的 `team` 通道）。
+
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
 loop 自己抬起的提醒进 `pendingLoopInjections` 队列，在 turn 边界由 `flushLoopInjections()` 经宿主的 `deliverInjectionRow` 钩子落库：
@@ -320,7 +325,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 `silent_progress`、`todo_reminder`（`living_work_spec` 映射到它）、`relaxed_plan`、`knowledge_base_hint`、`bg_agent`、`bg_bash`、`team_message`、`buffered_user`、`subagent_message`、`spec_update`、`behavior_fence`、`pipeline_exit_confirmation`。
 
-之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的两个：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）和 `outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）。
+之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）、`outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）和 `outline_task_finished`（P2 PR 9b，会话建的任务在别处结束了，标签「Your tasks finished elsewhere / 你建的任务在别处结束了」）。
 
 ---
 

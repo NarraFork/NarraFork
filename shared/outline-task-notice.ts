@@ -265,8 +265,16 @@ export interface OutlineTasksViewDisplay {
 	doing: OutlineTasksViewTask[];
 	waiting: OutlineTasksViewTask[];
 	next: OutlineTasksViewTask[];
-	/** Open tasks by section, counted over everything the view read (not only those listed). */
-	counts: { doing: number; waiting: number; todo: number };
+	/**
+	 * Tasks handed to the session's subagents that are still running with them (outline P2 PR 9b);
+	 * absent when there are none (and on rows written before the section existed).
+	 */
+	delegated?: OutlineTasksViewTask[];
+	/**
+	 * Open tasks by section, counted over everything the view read (not only those listed);
+	 * `delegated` only when there are some.
+	 */
+	counts: { doing: number; waiting: number; todo: number; delegated?: number };
 	/** The view read only a leading part of the open tasks: there are more than counted. */
 	more?: true;
 }
@@ -301,14 +309,18 @@ export function coerceOutlineTasksViewDisplay(
 	if (value === null) return null;
 	if (!isRecord(value)) return undefined;
 	const counts = isRecord(value.counts) ? value.counts : {};
+	const delegated = viewTasks(value.delegated);
+	const delegatedCount = Math.max(count(counts.delegated), delegated.length);
 	return {
 		doing: viewTasks(value.doing),
 		waiting: viewTasks(value.waiting),
 		next: viewTasks(value.next),
+		...(delegated.length > 0 ? { delegated } : {}),
 		counts: {
 			doing: count(counts.doing),
 			waiting: count(counts.waiting),
 			todo: count(counts.todo),
+			...(delegatedCount > 0 ? { delegated: delegatedCount } : {}),
 		},
 		...(value.more === true ? { more: true as const } : {}),
 	};

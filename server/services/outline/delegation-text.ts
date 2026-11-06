@@ -7,7 +7,8 @@
  *     session's language, like the plan review's block (outline P2 PR 8b).
  *
  * The note added to a result starts with one fixed line, `<outline_report … status="…">`, which
- * the tool card reads (outline P2 PR 9b): change it only together with its reader. A reader takes
+ * the tool card reads (outline P2 PR 9b; its form is `@shared/outline-report-note`'s
+ * `OUTLINE_REPORT_NOTE_HEAD_RE`): change it only together with its reader. A reader takes
  * the LAST such head line of the result and nothing before it: the note is always the last three
  * lines, and a report may quote a note of the same form in its text (left there as it is).
  *

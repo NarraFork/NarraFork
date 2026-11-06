@@ -25,6 +25,7 @@
  */
 
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
+import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import {
 	Badge,
 	Box,
@@ -37,6 +38,8 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
+import { outlineAddressPath } from "@shared/outline-links";
+import type { OutlineReportLateReason, SubagentDelegation } from "@shared/outline-report-note";
 // The row height comes from the shared row metrics, resolved at RENDER time, so it
 // tracks the reader's typography exactly as the measure side does.
 import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
@@ -56,6 +59,7 @@ import {
 	badgeRowHeight,
 	CARD_PADDING,
 	CHEVRON_SIZE,
+	DELEGATION_ROW_MARGIN_TOP,
 	DESC_LEFT,
 	DESC_MARGIN_TOP,
 	FILE_CHANGE_MAX_ROWS,
@@ -128,6 +132,12 @@ export interface SubagentLabels {
 	backgroundBadge?: string;
 	/** "Taken over by user" badge label. */
 	takenOverBadge?: string;
+	/** The row naming the outline task the agent was sent with: `{title}` is the task's link. */
+	delegatedTask?: string;
+	/** The badge of a late result ("Late"): the task changed after the agent was sent. */
+	lateBadge?: string;
+	/** Its tooltip, by why the result is late; `late` when the note gives no reason. */
+	lateReasons?: Partial<Record<OutlineReportLateReason | "late", string>>;
 	/** Live output counter badge: `{count}` chars written so far. */
 	liveOutputChars?: string;
 	/** The model follows the parent's live selection, not a concrete snapshot. */
@@ -178,6 +188,21 @@ export interface SubagentLabels {
 	statusMark?: Partial<Record<ToolRowStatusMark, string>>;
 }
 
+const DEFAULT_LATE_REASONS: Record<OutlineReportLateReason | "late", string> = {
+	taken_over:
+		"Late: the task changed hands after this agent was sent. The report is attached under the task, marked late.",
+	redelegated:
+		"Late: the task was delegated again after this agent was sent. The report is attached under the task, marked late.",
+	reclaimed:
+		"Late: the task was claimed again in this session after this agent was sent. The report is attached under the task, marked late.",
+	ended:
+		"Late: the task was ended after this agent was sent. The report is attached under the task, marked late.",
+	reopened:
+		"Late: the task went back to do after this agent was sent. The report is attached under the task, marked late.",
+	gone: "Late: the task was deleted after this agent was sent. The report was not attached.",
+	late: "Late: the task changed after this agent was sent. The report is attached under the task, marked late.",
+};
+
 const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = {
 	recentCalls: "Recent calls",
 	openSession: "Open full session",
@@ -187,6 +212,9 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
 	takenOverBadge: "Taken over by user",
+	delegatedTask: "Task: {title}",
+	lateBadge: "Late",
+	lateReasons: DEFAULT_LATE_REASONS,
 	liveOutputChars: "{count} chars",
 	followParent: "Follow parent",
 	followTooltip: "Following the parent model",
@@ -274,6 +302,12 @@ interface RenderSubagentProps {
 	 * on — so the badge is what says the session is waiting on a PERSON.
 	 */
 	isTakenOver?: boolean;
+	/**
+	 * The outline task the agent was sent with (outline P2 PR 9b): a "Task: <title>" row under the
+	 * description (its height is `measured.delegationRowHeight`), linking the task where an outline
+	 * panel can open it; a late result adds a badge to the fixed badge row.
+	 */
+	delegation?: SubagentDelegation;
 	/** The child's live reply char count — a badge on the fixed header row. */
 	liveOutputChars?: number;
 	/** Extra model badge. */
@@ -559,12 +593,79 @@ export function RenderSubagent(props: RenderSubagentProps) {
 	);
 }
 
+/**
+ * "Task: <title>" under the description: the title links the task (`/outline/ref`, resolved by
+ * the server with the reader's permissions) where an outline panel can open it, and is plain text
+ * elsewhere. One truncating line (`measured.delegationRowHeight`).
+ */
+function DelegationRow({
+	delegation,
+	labels,
+}: {
+	delegation: SubagentDelegation;
+	labels: ResolvedSubagentLabels;
+}) {
+	const href = outlineAddressPath(delegation.address);
+	const link = useOutlineLinkProps(href);
+	const [before = "", after = ""] = labels.delegatedTask.split("{title}");
+	return (
+		<p
+			className={ROW_TEXT_CLASS}
+			data-truncate="end"
+			data-testid="subagent-task"
+			style={{
+				color: DIMMED,
+				marginTop: rowSpacing(DELEGATION_ROW_MARGIN_TOP),
+				marginLeft: rowSpacing(DESC_LEFT),
+			}}
+		>
+			{before}
+			{link ? (
+				<a
+					href={link.href}
+					onClick={link.onClick}
+					data-outline-link=""
+					data-testid="subagent-task-link"
+					title={delegation.address ?? undefined}
+					style={{ color: "var(--mantine-color-anchor)", textDecoration: "none" }}
+				>
+					{delegation.title}
+				</a>
+			) : (
+				<span data-testid="subagent-task-title">{delegation.title}</span>
+			)}
+			{after}
+		</p>
+	);
+}
+
+/** The badge of a late result, its reason in the tooltip (height-neutral: the badge row). */
+function LateBadge({ late, labels }: { late: string; labels: ResolvedSubagentLabels }) {
+	const reasons = { ...DEFAULT_LATE_REASONS, ...labels.lateReasons };
+	const tooltip = reasons[late as OutlineReportLateReason] ?? reasons.late;
+	return (
+		<Tooltip label={tooltip} withinPortal multiline maw={320}>
+			<Badge
+				data-testid="subagent-late"
+				data-reason={late}
+				size="xs"
+				variant="light"
+				color="orange"
+				aria-label={tooltip}
+			>
+				{labels.lateBadge}
+			</Badge>
+		</Tooltip>
+	);
+}
+
 function SubagentInner({
 	measured,
 	description,
 	agentType = "agent",
 	isBackground,
 	isTakenOver,
+	delegation,
 	liveOutputChars,
 	model,
 	modelInheritance,
@@ -632,6 +733,7 @@ function SubagentInner({
 						{labels.takenOverBadge}
 					</Badge>
 				) : null}
+				{delegation?.late ? <LateBadge late={delegation.late} labels={labels} /> : null}
 				{model ? (
 					<SubagentModelBadge model={model} inheritance={modelInheritance} labels={labels} />
 				) : null}
@@ -686,6 +788,10 @@ function SubagentInner({
 					</p>
 				)}
 			</div>
+
+			{measured.delegationRowHeight > 0 && delegation ? (
+				<DelegationRow delegation={delegation} labels={labels} />
+			) : null}
 
 			{measured.hasResultPreview ? (
 				<p

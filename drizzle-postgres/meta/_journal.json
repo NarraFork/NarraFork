@@ -407,6 +407,13 @@
 			"when": 1793966431473,
 			"tag": "0057_outline_digests",
 			"breakpoints": true
+		},
+		{
+			"idx": 58,
+			"version": "7",
+			"when": 1793990635878,
+			"tag": "0058_outline_task_seen",
+			"breakpoints": true
 		}
   ]
 }

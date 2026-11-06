@@ -79,6 +79,10 @@ import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import type { DelegatedTaskRegistration } from "@server/lib/validators/runtime-registration";
 import { blockTitle, parseAddress, TASK_BOX, type TaskStatus } from "@shared/outline";
+import {
+	OUTLINE_REPORT_NOTE_HEAD_RE,
+	OUTLINE_REPORT_NOTE_WINDOW,
+} from "@shared/outline-report-note";
 import { eq } from "drizzle-orm";
 import { readDisplayNames } from "./access-reads";
 import { OutlineAgentScope, type OutlineWriteRefusal } from "./agent-scope";
@@ -964,12 +968,14 @@ export function classifyDelegatedResult(facts: DelegatedResultFacts): DelegatedR
 // Attaching
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The head line of a note exactly as `noteText` writes it. */
-const NOTE_HEAD_RE =
-	/^<outline_report task="[^"<>&\n]*"(?: report="[^"<>&\n]*")? generation="\d+" status="(?:current|late|not_attached)"(?: reason="[a-z_]+")?>$/;
+/**
+ * The head line of a note exactly as `noteText` writes it: defined once, beside its reader (the
+ * Agent tool card, `@shared/outline-report-note`).
+ */
+const NOTE_HEAD_RE = OUTLINE_REPORT_NOTE_HEAD_RE;
 const NOTE_CLOSE = "</outline_report>";
 /** The note is at most about a KiB: only this much of a text's end is looked at. */
-const NOTE_WINDOW = 4096;
+const NOTE_WINDOW = OUTLINE_REPORT_NOTE_WINDOW;
 
 /**
  * The text without the delegation note a delivery added at its end (recovery delivers it again).

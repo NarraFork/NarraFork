@@ -67,6 +67,7 @@ import {
 import type {
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
@@ -80,6 +81,7 @@ import {
 	outlineBacklinksQuerySchema,
 	outlineBlockViewQuerySchema,
 	outlineBoardAddBodySchema,
+	outlineBoardSeenBodySchema,
 	outlineBoardTaskUpdateBodySchema,
 	outlineDigestSeenBodySchema,
 	outlineFinishedTasksQuerySchema,
@@ -153,6 +155,7 @@ import type {
 	OutlineSpaceRow,
 } from "../services/outline/store/port";
 import {
+	markOutlineTasksSeen,
 	readFinishedTasks,
 	readProjectTaskBoard,
 	readSessionTaskBoard,
@@ -1056,6 +1059,19 @@ outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 102
 		started,
 	};
 	return c.json(body, task.added ? 201 : 200);
+});
+
+/**
+ * The person saw tasks marked 「新完成」 on a board (outline P2 PR 9b): each is recorded at the
+ * version shown, so the mark is gone the next time the board is read. Only tasks that are done and
+ * theirs, in spaces they may read, are recorded; the rest are ignored alike (nothing is said about
+ * a task the person may not see).
+ */
+outlineRoutes.post("/tasks/seen", bodyLimit({ maxSize: 16 * 1024 }), async (c) => {
+	const principal = principalOf(c);
+	const input = parse(outlineBoardSeenBodySchema, await c.req.json().catch(() => ({})));
+	const body: OutlineBoardSeenResponse = { marked: await markOutlineTasksSeen(principal, input) };
+	return c.json(body);
 });
 
 /**

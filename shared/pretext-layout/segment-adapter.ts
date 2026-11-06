@@ -29,6 +29,7 @@ import {
 	injectionBlockViews,
 	isNativeModelContextBlock,
 } from "../native-injection";
+import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
@@ -2526,6 +2527,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
 	// People's changes to the session's outline tasks, told to it as a system notice (PR 5).
 	outline_task_edit: "sidecarSourceOutlineTaskEdit",
+	// Tasks the session created were finished by another session or a person (P2 PR 9b).
+	outline_task_finished: "sidecarSourceOutlineTaskFinished",
 	outline_answer: "sidecarSourceOutlineAnswer",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
@@ -4239,6 +4242,11 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? undefined
 			: makeBody("output.main", resultContent, hasTruncatedLeaf(outputJson));
 	const isBackground = input.background === true || input.run_in_background === true;
+	// An agent sent with an outline task (`task`, outline P2 PR 9): the card names the task under
+	// its description and marks a late result, both read from the result's note (or the line a
+	// background launch names the task in). A result cut to a preview keeps neither; the shell
+	// fetches the full one for an open card.
+	const delegation = readSubagentDelegation(readLeafText(input.task), resultContent);
 	const agentType = readNonEmptyString(input, "subagent_type") ?? item.tc.toolName;
 	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
 	// narrator query (which the adapter has no access to): the activity summary
@@ -4277,6 +4285,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		// Still a preview → the shell may fetch the real body while it is open.
 		...(promptTruncated ? { promptTruncated: true } : {}),
 		isBackground,
+		...(delegation ? { delegation } : {}),
 		// Files the child wrote. Absent when it changed nothing, so a card with no
 		// file list keeps the payload (and the height) it had before.
 		...(activity?.fileChanges ? { fileChanges: activity.fileChanges } : {}),

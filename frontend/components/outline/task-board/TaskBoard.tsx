@@ -11,6 +11,10 @@
  *     cancelling it from the menu is not offered meanwhile, so no waiting change is left behind.
  *   - Cancelled tasks are folded under their count until opened.
  *   - Every task opens in the outline.
+ *   - A task the reader manages that an agent finished is marked 「新完成」 (D50 ④, outline P2
+ *     PR 9b) until they have seen it: once its row has been on screen, the board tells the server
+ *     (`useNewlyDoneMarks`); the mark stays for as long as this board is open, and is gone the
+ *     next time the board is read.
  *
  * Changes are the person's writes; the board re-reads after each, and when the session's tasks
  * change (`outline_tasks_changed`).
@@ -34,12 +38,13 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type {
-	OutlineBoardAssignTarget,
-	OutlineBoardExecutor,
-	OutlineBoardSection,
-	OutlineBoardTask,
-	OutlineTaskBoardResponse,
+import {
+	OUTLINE_TASK_BOARD_LIMITS,
+	type OutlineBoardAssignTarget,
+	type OutlineBoardExecutor,
+	type OutlineBoardSection,
+	type OutlineBoardTask,
+	type OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import {
 	IconArrowBackUp,
@@ -58,11 +63,12 @@ import {
 	IconUserShare,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlinePendingDetail } from "../../../hooks/useOutline";
 import {
 	invalidateTaskBoards,
+	taskBoardKeys,
 	useAddBoardTask,
 	useUpdateBoardTask,
 } from "../../../hooks/useTaskBoard";
@@ -160,6 +166,140 @@ const STATUS_ICON: Record<StatusGroup, ReactNode> = {
 	cancelled: <IconCircleX size={14} color="var(--mantine-color-gray-6)" />,
 };
 
+/** A 「新完成」 mark: the task at the version it was shown finished. */
+const markKey = (task: Pick<OutlineBoardTask, "id" | "versionSeq">) =>
+	`${task.id}:${task.versionSeq}`;
+
+/** How long the board gathers marks seen before it tells the server, in one request. */
+export const NEWLY_DONE_SEEN_FLUSH_MS = 600;
+
+/** A board read with the given tasks' 「新完成」 dropped (the reader has seen them). */
+export function withoutNewlyDone(
+	board: OutlineTaskBoardResponse,
+	ids: ReadonlySet<string>,
+): OutlineTaskBoardResponse {
+	const strip = (task: OutlineBoardTask): OutlineBoardTask => {
+		if (!task.newlyDone || !ids.has(task.id)) return task;
+		const { newlyDone: _seen, ...rest } = task;
+		return rest;
+	};
+	return {
+		...board,
+		sections: board.sections.map((section) => ({
+			...section,
+			open: section.open.map(strip),
+			finished: section.finished.map(strip),
+		})),
+	};
+}
+
+/**
+ * The board's 「新完成」 marks: shown for the tasks the server marks, and kept for as long as the
+ * board stays mounted (a read after the reader saw them no longer marks them); `seen` gathers the
+ * marks that were on screen and tells the server in one request (again on unmount), then drops
+ * them from the cached reads so a board opened again does not show them.
+ */
+function useNewlyDoneMarks(tasks: readonly OutlineBoardTask[]) {
+	const queryClient = useQueryClient();
+	const [shown, setShown] = useState<ReadonlySet<string>>(() => new Set());
+	useEffect(() => {
+		const marked = tasks.filter((task) => task.newlyDone).map(markKey);
+		if (marked.some((key) => !shown.has(key))) setShown((prev) => new Set([...prev, ...marked]));
+	}, [tasks, shown]);
+	const pending = useRef(new Map<string, number>());
+	const told = useRef(new Set<string>());
+	const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const flush = useCallback(() => {
+		if (timer.current) clearTimeout(timer.current);
+		timer.current = null;
+		const all = [...pending.current].map(([id, versionSeq]) => ({ id, versionSeq }));
+		pending.current.clear();
+		// A request names at most so many; a board seldom shows more at once.
+		const size = OUTLINE_TASK_BOARD_LIMITS.seenPerRequest;
+		for (let start = 0; start < all.length; start += size) {
+			const batch = all.slice(start, start + size);
+			const ids = new Set(batch.map((task) => task.id));
+			api
+				.markBoardTasksSeen({ tasks: batch })
+				.then(() =>
+					queryClient.setQueriesData<OutlineTaskBoardResponse>(
+						{ queryKey: taskBoardKeys.all },
+						(board) => (board?.sections ? withoutNewlyDone(board, ids) : board),
+					),
+				)
+				.catch(() => {
+					// Not recorded: told again the next time they are seen.
+					for (const task of batch) told.current.delete(markKey(task));
+				});
+		}
+	}, [queryClient]);
+	const seen = useCallback(
+		(task: OutlineBoardTask) => {
+			const key = markKey(task);
+			if (told.current.has(key)) return;
+			told.current.add(key);
+			pending.current.set(task.id, task.versionSeq);
+			timer.current ??= setTimeout(flush, NEWLY_DONE_SEEN_FLUSH_MS);
+		},
+		[flush],
+	);
+	useEffect(() => () => flush(), [flush]);
+	const isNew = useCallback(
+		(task: OutlineBoardTask) =>
+			task.status === "done" && (task.newlyDone === true || shown.has(markKey(task))),
+		[shown],
+	);
+	return { isNew, seen };
+}
+
+type NewlyDoneMarks = ReturnType<typeof useNewlyDoneMarks>;
+
+/**
+ * 「新完成」 on a task's row: reported seen once the row is on screen and a frame of the page has
+ * been shown (without IntersectionObserver, once it is drawn).
+ */
+function NewlyDoneBadge({
+	task,
+	onSeen,
+}: {
+	task: OutlineBoardTask;
+	onSeen: (task: OutlineBoardTask) => void;
+}) {
+	const { t } = useTranslation("outline");
+	const ref = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		const element = ref.current;
+		if (!element) return;
+		if (typeof IntersectionObserver === "undefined") {
+			onSeen(task);
+			return;
+		}
+		let visible = false;
+		let frame = 0;
+		const observer = new IntersectionObserver((entries) => {
+			visible = entries.some((entry) => entry.isIntersecting);
+			cancelAnimationFrame(frame);
+			// A frame runs only while the page is shown: a board opened in a hidden tab waits for it.
+			if (visible)
+				frame = requestAnimationFrame(() => {
+					if (visible) onSeen(task);
+				});
+		});
+		observer.observe(element);
+		return () => {
+			cancelAnimationFrame(frame);
+			observer.disconnect();
+		};
+	}, [task, onSeen]);
+	return (
+		<Tooltip label={t("board.newlyDoneHint")} withinPortal openDelay={300} multiline maw={260}>
+			<Badge ref={ref} size="xs" variant="light" color="green" data-testid="task-badge-newly-done">
+				{t("board.newlyDone")}
+			</Badge>
+		</Tooltip>
+	);
+}
+
 export interface TaskBoardProps {
 	/** One board response, or the pages of a project board. */
 	pages: readonly OutlineTaskBoardResponse[];
@@ -215,6 +355,7 @@ export function TaskBoard({
 		return out;
 	}, [sections, extra]);
 	const groups = useMemo(() => groupTasks(tasks, ownSession, me), [tasks, ownSession, me]);
+	const newly = useNewlyDoneMarks(tasks);
 
 	const loadFinished = useMutation({
 		mutationFn: async (spaceId: string) => {
@@ -256,6 +397,7 @@ export function TaskBoard({
 					sectionOf={sectionOf}
 					scopeKind={scope?.kind ?? "session"}
 					me={me}
+					newly={newly}
 					onOpenTask={onOpenTask}
 				/>
 			))}
@@ -307,6 +449,7 @@ function ExecutorGroupView({
 	sectionOf,
 	scopeKind,
 	me,
+	newly,
 	onOpenTask,
 }: {
 	group: ExecutorGroup;
@@ -314,6 +457,7 @@ function ExecutorGroupView({
 	sectionOf: Map<string, OutlineBoardSection>;
 	scopeKind: "session" | "project";
 	me: string;
+	newly: NewlyDoneMarks;
 	onOpenTask?: (task: OutlineBoardTask) => void;
 }) {
 	const { t } = useTranslation("outline");
@@ -382,6 +526,7 @@ function ExecutorGroupView({
 										section={sectionOf.get(task.spaceId)}
 										scopeKind={scopeKind}
 										me={me}
+										newly={newly}
 										onOpenTask={onOpenTask}
 									/>
 								))}
@@ -398,12 +543,14 @@ function TaskRow({
 	section,
 	scopeKind,
 	me,
+	newly,
 	onOpenTask,
 }: {
 	task: OutlineBoardTask;
 	section: OutlineBoardSection | undefined;
 	scopeKind: "session" | "project";
 	me: string;
+	newly: NewlyDoneMarks;
 	onOpenTask?: (task: OutlineBoardTask) => void;
 }) {
 	const { t } = useTranslation("outline");
@@ -451,6 +598,7 @@ function TaskRow({
 			data-task-id={task.id}
 			data-status={task.status}
 			data-title={task.title}
+			data-newly-done={newly.isNew(task) ? "true" : undefined}
 		>
 			<Group gap={6} wrap="nowrap" align="flex-start">
 				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
@@ -462,6 +610,7 @@ function TaskRow({
 						{task.title}
 					</Text>
 					<Group gap={4}>
+						{newly.isNew(task) && <NewlyDoneBadge task={task} onSeen={newly.seen} />}
 						{task.humanCreated && (
 							<Badge size="xs" variant="light" color="indigo" data-testid="task-badge-human">
 								{t("board.humanCreated")}
@@ -622,7 +771,11 @@ function TaskRow({
 									{onOpenTask && (
 										<Menu.Item
 											leftSection={<IconExternalLink size={14} />}
-											onClick={() => onOpenTask(task)}
+											onClick={() => {
+												// Opening it is seeing it.
+												if (newly.isNew(task)) newly.seen(task);
+												onOpenTask(task);
+											}}
 											data-testid="task-action-open"
 										>
 											{t("board.action.open")}

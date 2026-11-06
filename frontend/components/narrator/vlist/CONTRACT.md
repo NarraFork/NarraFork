@@ -228,7 +228,10 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 - **ReasoningStepsTrace**（L3–L5）：表头 + min(N,5)×18.8 + 展开 step markdown🔴。**不读 LOD**：不存在"标题可见但正文打不开"的档位（旧 `titlesOnly` 已下线），L3/L4/L5 形态一致，只有读者展开了哪些步骤不同。
 
 ### SubagentCard（唯一直接读 useRenderLod）
-- Header：p=xs(20) + 徽标行 16.8 + description(折叠 truncate🟢 / 展开换行🔴) + 可选结果预览行。折叠≈55-75px。
+- Header：p=xs(20) + 徽标行 16.8 + description(折叠 truncate🟢 / 展开换行🔴) + 可选任务行 + 可选结果预览行。折叠≈55-75px（带任务行再 +19）。
+  - **任务行**（outline P2 PR 9b）：`Agent` 带 `task` 派出时，description 下面一行「任务：标题」🟢，mt2 + 一行 xs（`DELEGATION_ROW_MARGIN_TOP + line.xs`），**不论展开折叠都在**，高度只由它在不在决定（`delegationRowHeight`）。标题和地址由 adapter 从结果末尾的附注（`<outline_report …>` 头一行，`@shared/outline-report-note`）或后台派出那行「Delegated [[key/sid|标题]]」读出，读不到时用调用写的 `task`；地址能解析时标题是大纲链接（`useOutlineLinkProps`，会话宿主里开大纲面板，服务端按读者权限解析，宿主外是纯文字）。
+  - **迟到徽标**：附注说迟到时，徽标行加一个「迟到」徽标（橙色，tooltip 写原因），和 `isTakenOver` 一样在固定的徽标行里，高度不变。
+  - 三者（标题、地址、迟到原因）都从缓存的 payload 画出来，且结论 patch 会单独带来它们（附注随结果到达），所以都进 `subagentRevision`（`gtk:` / `gta:` / `gtl:`）。结果被截成预览时末尾的附注不在预览里，要等 shell 为展开的卡片取回全文才显示；折叠的卡片在那之前只显示调用写的 `task`。
 - Recent Calls：≤3 行 × **18.8px（= `TRACE_ROW_HEIGHT`）🟢，行间无缝**（`RECENT_STACK_GAP = 0`）。这些行就是 trace 行：dot + 14px 类别 chip + 单行 `Tool · summary` + 状态槽 + 耗时，高度直接引用 `measure-tool-run` 而不是自己再算一遍；成功不画勾与"耗时紧贴标题"的规则同上，两条渲染路径的一致性由 `RenderSubagent.traceparity.test.tsx` 逐项比对守住。
   `recentCallSummaries` / `recentCallCategories` 是 render-only（切到 `recentRowCount`），summary 由 shell 注入的 `resolveSubagentRecentSummary` 从 header 的 `inputSummary` 得出；两者都进 `subagentRevision`（`gs:` / `gc:`），因为流式补全 `inputSummary` 时行数/名字/状态都不动，它们是唯一增量。
 - 展开体：prompt ContentViewer **maxHeight:200🟡**、result ContentViewer **maxHeight:300🟡**、permission 子块。

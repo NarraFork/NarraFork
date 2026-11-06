@@ -45,19 +45,24 @@ import {
 	getOutlineTasksViewHeading,
 	getOutlineTasksViewMore,
 	getOutlineTasksViewSection,
+	getOutlineViewDelegatedLine,
 	getOutlineViewTaskLine,
 	getUserLanguage,
 	type Locale,
+	type OutlineTaskPromptTask,
 	type OutlineTasksViewSection,
+	type OutlineViewAgent,
 	type OutlineViewTask,
 } from "@server/lib/prompt-i18n";
 import { blockTitle } from "@shared/outline";
 import type { OutlineTasksViewDisplay, OutlineTasksViewTask } from "@shared/outline-task-notice";
 import type { ContextPart } from "@shared/prefix-context";
-import { readNarrator } from "../outline/access-reads";
+import { readDisplayNames, readNarrator } from "../outline/access-reads";
 import { loadBodies, readSubtree } from "../outline/read";
 import { renderOutline } from "../outline/render";
 import { outlineStore } from "../outline/store";
+import { isOpenTask } from "../outline/task-json";
+import { isClaimLive } from "../outline/tasks";
 import { breadthFirst, type OutlineNode } from "../outline/tree";
 import { readTaskSession } from "./backend";
 import {
@@ -82,6 +87,10 @@ export const OUTLINE_VIEW_KEYS = {
 export const OUTLINE_VIEW_LIMITS = {
 	/** Tasks in progress the current-tasks view lists. */
 	doing: 5,
+	/** Tasks the session's subagents are doing (outline P2 PR 9b) the view lists. */
+	delegated: 10,
+	/** Claims of the session's subagents read for that section (one more tells there are more). */
+	delegatedRead: 20,
 	/** Waiting tasks it lists. */
 	waiting: 5,
 	/** Characters of the current-tasks view. */
@@ -183,6 +192,14 @@ if (hotOnce("narrafork.outlineViews.listeners")) {
 	eventBus.on("narrator:deleted", (event) => {
 		for (const key of cache.keys()) if (key.includes(`:${event.narratorId}:`)) cache.delete(key);
 	});
+}
+
+// A subagent starting or ending changes what the session has delegated (outline P2 PR 9b; its
+// claim passes to the session when a run ends, which is no commit): the session's views read
+// again.
+if (hotOnce("narrafork.outlineViews.subagentListeners")) {
+	eventBus.on("narrator:subagent_started", (event) => dropWhere(null, event.parentNarratorId));
+	eventBus.on("narrator:subagent_completed", (event) => dropWhere(null, event.parentNarratorId));
 }
 
 /**
@@ -375,6 +392,77 @@ export function viewTaskOf(
 	};
 }
 
+/** A task one of the session's subagents is doing (a delegation, outline P2 PR 9b). */
+interface DelegatedEntry {
+	task: OutlineTaskPromptTask & { address: string };
+	agent: OutlineViewAgent;
+}
+
+/**
+ * The open tasks the session's subagents hold with a live lease (a delegation: a subagent's claim
+ * lives while it runs, and passes to the session when the run ends), oldest claim first: at most
+ * {@link OUTLINE_VIEW_LIMITS.delegatedRead} claims through the narrators' root index and the
+ * holder index, their blocks by id, their titles as the head of their content, the subagents'
+ * titles in one read. Their spaces and the subagents become dependencies of the view.
+ */
+export async function readDelegated(
+	session: OutlineSession,
+	deps: ViewDeps = { spaces: new Set(), narrators: new Set(), anySpace: false },
+): Promise<{ entries: DelegatedEntry[]; more: boolean }> {
+	const root = session.sessionNarratorId;
+	if (session.subagent || root === null) return { entries: [], more: false };
+	const limit = OUTLINE_VIEW_LIMITS.delegatedRead;
+	const rows = await outlineStore.listSessionTaskClaims(root, limit + 1, { subagentsOnly: true });
+	const now = new Date().toISOString();
+	const held = rows
+		.slice(0, limit)
+		.filter(
+			({ claim }) =>
+				claim.holderNarratorId !== null &&
+				claim.holderNarratorId !== root &&
+				isClaimLive(claim, now),
+		);
+	if (held.length === 0) return { entries: [], more: false };
+	const ids = held.map(({ claim }) => claim.taskBlockId);
+	const [metas, heads] = await Promise.all([
+		outlineStore.getBlockMetasByIds(ids),
+		outlineStore.getBlockHeads(ids),
+	]);
+	const open = new Map(
+		metas.filter((m) => !m.deleted && isOpenTask(m.taskJson)).map((m) => [m.id, m]),
+	);
+	const titles = new Map(heads.map((h) => [h.id, blockTitle(h.contentHead)]));
+	const keys = new Map<string, string>();
+	for (const spaceId of new Set([...open.values()].map((m) => m.spaceId))) {
+		deps.spaces.add(spaceId);
+		const space = await outlineStore.getSpace(spaceId);
+		if (space) keys.set(spaceId, space.key);
+	}
+	const agents = [...new Set(held.map(({ claim }) => claim.holderNarratorId as string))];
+	for (const id of agents) deps.narrators.add(id);
+	const names = await readDisplayNames({ narratorIds: agents });
+	const entries: DelegatedEntry[] = [];
+	for (const { claim } of held) {
+		const meta = open.get(claim.taskBlockId);
+		const key = meta ? keys.get(meta.spaceId) : undefined;
+		if (!meta || !key) continue;
+		const agentId = claim.holderNarratorId as string;
+		const title = names.narrators.get(agentId);
+		entries.push({
+			task: {
+				text: clip(titles.get(meta.id) || meta.sid, OUTLINE_VIEW_LIMITS.titleChars),
+				address: `${key}/${meta.sid}`,
+				humanCreated: meta.taskJson?.humanCreated === true,
+			},
+			agent: {
+				id: agentId,
+				title: title ? clip(title, OUTLINE_VIEW_LIMITS.titleChars) : null,
+			},
+		});
+	}
+	return { entries, more: rows.length > limit };
+}
+
 async function readTasksView(
 	narratorId: string,
 	locale: Locale,
@@ -385,9 +473,9 @@ async function readTasksView(
 	if (session.spaceId) deps.spaces.add(session.spaceId);
 	else deps.anySpace = true;
 	if (session.subagent) return { text: null };
-	const read = await readOpen(session);
+	const [read, delegated] = await Promise.all([readOpen(session), readDelegated(session, deps)]);
 	for (const entry of read.entries) deps.spaces.add(entry.ref.spaceId);
-	if (read.entries.length === 0) return { text: null };
+	if (read.entries.length === 0 && delegated.entries.length === 0) return { text: null };
 
 	const doing = read.entries
 		.filter((entry) => entry.status === "doing")
@@ -405,6 +493,7 @@ async function readTasksView(
 	const titles = await titlesOf(listed);
 	const prerequisites = await readPrerequisites(waiting, session, deps);
 	const task = (entry: OpenEntry) => viewTaskOf(entry, titles, prerequisites);
+	const handedOut = delegated.entries.slice(0, OUTLINE_VIEW_LIMITS.delegated);
 
 	// Sections in order; lines that do not fit the budget are counted in the last line instead.
 	const heading = getOutlineTasksViewHeading(locale);
@@ -414,7 +503,25 @@ async function readTasksView(
 	const room = OUTLINE_VIEW_LIMITS.tasksChars - getOutlineTasksViewMore(99, locale).length - 1;
 	// The entries whose lines the text holds: the reader's summary names these and no others.
 	const printed = new Set<OpenEntry>();
+	const printedDelegated: DelegatedEntry[] = [];
 	for (const { section, entries } of sections) {
+		// What the session's subagents are doing comes right after its own work in progress.
+		if (section === "waiting" && handedOut.length > 0) {
+			const sectionLine = getOutlineTasksViewSection("delegated", locale);
+			const delegatedLines = handedOut.map((entry) =>
+				getOutlineViewDelegatedLine(entry.task, entry.agent, locale),
+			);
+			if (used + sectionLine.length + (delegatedLines[0] as string).length + 2 <= room) {
+				lines.push(sectionLine);
+				used += sectionLine.length + 1;
+				for (const [index, line] of delegatedLines.entries()) {
+					if (used + line.length + 1 > room) break;
+					lines.push(line);
+					used += line.length + 1;
+					printedDelegated.push(handedOut[index] as DelegatedEntry);
+				}
+			}
+		}
 		if (entries.length === 0) continue;
 		const sectionLine = getOutlineTasksViewSection(section, locale);
 		const taskLines = entries.map((entry) => getOutlineViewTaskLine(task(entry), locale));
@@ -430,8 +537,8 @@ async function readTasksView(
 			printed.add(entries[index] as OpenEntry);
 		}
 	}
-	const hidden = read.entries.length - shown;
-	if (read.truncated) lines.push(getOutlineTasksViewMore(null, locale));
+	const hidden = read.entries.length - shown + delegated.entries.length - printedDelegated.length;
+	if (read.truncated || delegated.more) lines.push(getOutlineTasksViewMore(null, locale));
 	else if (hidden > 0) lines.push(getOutlineTasksViewMore(hidden, locale));
 	// The reader's summary of the same read: the tasks the text lists, per section and titled (never
 	// one the budget left out of the text), and how many are open of each kind. Prerequisites are
@@ -452,8 +559,22 @@ async function readTasksView(
 		doing: inText(doing),
 		waiting: inText(waiting),
 		next: inText(next ? [next] : []),
-		counts: { doing: counted("doing"), waiting: counted("blocked"), todo: counted("todo") },
-		...(read.truncated ? { more: true as const } : {}),
+		...(printedDelegated.length > 0
+			? {
+					delegated: printedDelegated.map((entry) => ({
+						address: entry.task.address,
+						title: entry.task.text,
+						...(entry.task.humanCreated ? { humanCreated: true as const } : {}),
+					})),
+				}
+			: {}),
+		counts: {
+			doing: counted("doing"),
+			waiting: counted("blocked"),
+			todo: counted("todo"),
+			...(delegated.entries.length > 0 ? { delegated: delegated.entries.length } : {}),
+		},
+		...(read.truncated || delegated.more ? { more: true as const } : {}),
 	};
 	return { text: lines.join("\n"), display };
 }

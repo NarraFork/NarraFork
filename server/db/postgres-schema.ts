@@ -3781,6 +3781,25 @@ export const outlineViewState = pgTable(
 	],
 );
 
+export const outlineTaskSeen = pgTable(
+	"outline_task_seen",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		taskBlockId: text("task_block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		seenSeq: integer("seen_seq").notNull(),
+		seenAt: text("seen_at").notNull(),
+	},
+	(table) => [
+		index("idx_outline_task_seen_block").on(table.taskBlockId),
+		index("idx_outline_task_seen_user_at").on(table.userId, table.seenAt),
+		primaryKey({ columns: [table.userId, table.taskBlockId] }),
+	],
+);
+
 export const outlineDigests = pgTable(
 	"outline_digests",
 	{
@@ -4264,8 +4283,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 137,
-  "columnCount": 1826,
+  "tableCount": 138,
+  "columnCount": 1830,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -25939,6 +25958,91 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "userId",
             "pageBlockId"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineTaskSeen",
+      "name": "outline_task_seen",
+      "columns": [
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_task_seen_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "taskBlockId",
+          "name": "task_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_task_seen_task_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "seenSeq",
+          "name": "seen_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "seenAt",
+          "name": "seen_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_task_seen_block",
+          "columns": [
+            "taskBlockId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_task_seen_user_at",
+          "columns": [
+            "userId",
+            "seenAt"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "userId",
+            "taskBlockId"
           ]
         }
       ]
