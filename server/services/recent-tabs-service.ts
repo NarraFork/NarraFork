@@ -1112,6 +1112,8 @@ export interface MoveRecentTabInput {
 	 *     it) or at its end when no anchor is given.
 	 */
 	folderId?: string | null;
+	/** A top-level unit dragged across the pin divider takes this pinned state. */
+	pinned?: boolean;
 }
 
 export async function moveRecentTab(
