@@ -2082,7 +2082,7 @@
 			"interrupt_task_guard": "中断任务提醒",
 			"outline_task_turn_end": "回合末任务提醒",
 			"outline_task_edit": "有人改了任务",
-			"outline_task_finished": "你建的任务在别处结束了",
+			"outline_task_finished": "本会话建的任务在别处结束了",
 			"tutorial_lesson": "教程课程",
 			"turn_nudge": "轮次预算",
 			"broken_call": "无效的工具调用",

@@ -19,16 +19,20 @@
  *
  * HOW
  * ---
- * One message per session told and commit, naming at most
- * {@link OUTLINE_TASK_FINISHED_LIMITS.listedPerCommit} tasks across the commit (the rest are
- * counted in the message of the session they belong to), in the session's language (its owner's).
+ * One message per session told and commit, at most
+ * {@link OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit} sessions (the rest are logged). The
+ * commit names at most {@link OUTLINE_TASK_FINISHED_LIMITS.listedPerCommit} tasks, shared out in
+ * turn so every session told has at least one named; the rest are counted in their session's
+ * message. In the session's language (its owner's); the reader's card names who finished them
+ * without words of either language (a session's title, a person's username).
  * Delivered like PR 7's answers (`questions.ts`): `deliverInjection` as a system row (`sys`,
- * `outline_task_finished`), waking the session when it is idle (`wakeIfIdle`); on PostgreSQL the
- * row is written and nothing is woken (the session runtime does not run there yet), and the chosen
- * id is not used. The row's id follows from (commit, session, tasks): delivering the same commit
- * again finds it and writes nothing. There is no retry queue: a process that stops between the
- * commit and the delivery loses the message (PR 10 folds this into the runtime inbox's `team`
- * channel, with persistence).
+ * `outline_task_finished`), waking the session when it is idle (`wakeIfIdle`), except for a
+ * person's commit, whose message waits for the session's next turn (PR 5's rule: a person tidying
+ * up must not cost a request). On PostgreSQL the row is written and nothing is woken (the session
+ * runtime does not run there yet), and the chosen id is not used. The row's id follows from
+ * (commit, session, tasks): delivering the same commit again finds it and writes nothing. There is
+ * no retry queue: a process that stops between the commit and the delivery loses the message
+ * (PR 10 folds this into the runtime inbox's `team` channel, with persistence).
  *
  * Every read is indexed and bounded: the commit's versions by `(space_id, seq)`, the versions just
  * before by primary key, the commit row, the tasks' heads and claims, the sessions' roots; the
@@ -61,8 +65,13 @@ import { isFinishedTask, isOpenTask } from "./task-json";
 export const OUTLINE_TASK_FINISHED_LIMITS = {
 	/** Versions of one commit read back (a commit holds at most 200 operations). */
 	versionsPerCommit: 200,
-	/** Tasks named across one commit's messages; the rest are counted. */
+	/**
+	 * Tasks named across one commit's messages, shared out in turn so every session told has at
+	 * least one named; the rest are counted in their session's message.
+	 */
 	listedPerCommit: 20,
+	/** Sessions one commit tells at most; the rest are logged and not told. */
+	sessionsPerCommit: 20,
 	/** Characters of a title or a name. */
 	titleChars: OUTLINE_TASK_NOTICE_LIMITS.titleChars,
 } as const;
@@ -88,6 +97,11 @@ export interface OutlineTaskFinishedMessage {
 	body: SideCarBody;
 	/** The tasks it is about (block ids), named or counted. */
 	taskIds: string[];
+	/**
+	 * Wake the session when idle. Not for a person's commit (a person tidying up must not cost a
+	 * request, PR 5's rule): the row waits for the session's next turn.
+	 */
+	wake: boolean;
 }
 
 /** What delivering needs from the session layer: a seam tests replace. */
@@ -130,7 +144,10 @@ export function outlineTaskFinishedMessageId(
 		.slice(0, 21);
 }
 
-/** The injection a message is written as: on PostgreSQL no chosen id and no wake (PR 7, S6). */
+/**
+ * The injection a message is written as: on PostgreSQL no chosen id and no wake (PR 7, S6); a
+ * message that does not wake (a person's commit) is written for the next turn.
+ */
 export function outlineTaskFinishedInjection(
 	message: OutlineTaskFinishedMessage,
 	postgres: boolean,
@@ -141,9 +158,29 @@ export function outlineTaskFinishedInjection(
 		body: message.body,
 		source: OUTLINE_TASK_FINISHED_SOURCE,
 		role: "sys" as const,
-		schedule: postgres ? ("none" as const) : ("wakeIfIdle" as const),
+		schedule: postgres || !message.wake ? ("none" as const) : ("wakeIfIdle" as const),
 		locale: message.locale,
 	};
+}
+
+/**
+ * The tasks each session's message names: `limit` shared out in turn, one per session per round,
+ * in the order given, so every session gets at least one while there are no more sessions than
+ * names. Returns how many of each session's tasks are named.
+ */
+export function shareOutNames(counts: readonly number[], limit: number): number[] {
+	const named = counts.map(() => 0);
+	let left = limit;
+	for (let progress = true; left > 0 && progress; ) {
+		progress = false;
+		for (let i = 0; i < counts.length && left > 0; i++) {
+			if ((named[i] as number) >= (counts[i] as number)) continue;
+			named[i] = (named[i] as number) + 1;
+			left--;
+			progress = true;
+		}
+	}
+	return named;
 }
 
 /**
@@ -300,6 +337,7 @@ export async function readOutlineTaskFinishedMessages(
 	const byManager = new Map<string, Finished[]>();
 	const backends = new Map<string, boolean>();
 	const { readTaskBackend } = await import("../task-source/backend");
+	let dropped = 0;
 	for (const task of finished) {
 		// The manager may be a subagent of the session (it wrote the task): its session is told.
 		const session = sessions.get(task.manager);
@@ -309,10 +347,33 @@ export async function readOutlineTaskFinishedMessages(
 		if (finisherRoot !== null && root === finisherRoot) continue;
 		// A person's change PR 5 already tells this session of.
 		if (told.get(task.blockId) === root) continue;
-		if (!backends.has(root)) backends.set(root, (await readTaskBackend(root)) === "outline");
+		if (!backends.has(root)) {
+			// One session that cannot be read does not keep the others from being told.
+			const outline = await readTaskBackend(root)
+				.then((backend) => backend === "outline")
+				.catch((error) => {
+					logger.warn("Could not read a session told of finished tasks", {
+						narratorId: root,
+						error: String(error),
+					});
+					return false;
+				});
+			backends.set(root, outline);
+		}
 		if (!backends.get(root)) continue;
-		byManager.set(root, [...(byManager.get(root) ?? []), task]);
+		const list = byManager.get(root);
+		if (list) list.push(task);
+		else if (byManager.size < OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit)
+			byManager.set(root, [task]);
+		else dropped++;
 	}
+	if (dropped > 0)
+		logger.warn("A commit finished tasks of more sessions than it tells", {
+			spaceId: event.spaceId,
+			seq: event.seq,
+			told: byManager.size,
+			tasksNotTold: dropped,
+		});
 	if (byManager.size === 0) return [];
 
 	const all = [...byManager.values()].flat();
@@ -328,24 +389,35 @@ export async function readOutlineTaskFinishedMessages(
 			: { narratorIds: finisherRoot ? [finisherRoot] : [] },
 	).catch(() => null);
 
-	let listed = 0;
+	const sessionsTold = [...byManager];
+	const named = shareOutNames(
+		sessionsTold.map(([, tasks]) => tasks.length),
+		OUTLINE_TASK_FINISHED_LIMITS.listedPerCommit,
+	);
+	// Who finished them, as the reader's card names them (a name, in no language) and as the
+	// model's text does (in the session's language).
+	const sessionName = finisherRoot
+		? clip(names?.narrators.get(finisherRoot) ?? finisherRoot)
+		: null;
+	const person = commit.actorKind === "human";
+	const neutralBy = person ? (names?.users.get(commit.actorId) ?? commit.actorId) : sessionName;
 	const out: OutlineTaskFinishedMessage[] = [];
-	for (const [root, tasks] of byManager) {
-		const owner = (await readNarrator(root))?.ownerUserId ?? null;
+	for (const [index, [root, tasks]] of sessionsTold.entries()) {
+		const owner = await readNarrator(root)
+			.then((row) => row?.ownerUserId ?? null)
+			.catch(() => null);
 		const locale: Locale = owner ? await getUserLanguage(owner).catch(() => "en" as const) : "en";
 		const by =
-			commit.actorKind === "human"
-				? (names?.users.get(commit.actorId) ?? commit.actorId)
-				: finisherRoot
+			person && neutralBy
+				? neutralBy
+				: sessionName
 					? locale === "zh-CN"
-						? `会话「${clip(names?.narrators.get(finisherRoot) ?? finisherRoot)}」`
-						: `session "${clip(names?.narrators.get(finisherRoot) ?? finisherRoot)}"`
+						? `会话「${sessionName}」`
+						: `session "${sessionName}"`
 					: locale === "zh-CN"
 						? "系统"
 						: "the system";
-		const room = Math.max(0, OUTLINE_TASK_FINISHED_LIMITS.listedPerCommit - listed);
-		const shown = tasks.slice(0, room);
-		listed += shown.length;
+		const shown = tasks.slice(0, named[index] ?? 0);
 		const more = tasks.length - shown.length;
 		const entries: OutlineTaskFinishedEntry[] = shown.map((task) => ({
 			address: `${space.key}/${sids.get(task.blockId) ?? "?"}`,
@@ -358,7 +430,7 @@ export async function readOutlineTaskFinishedMessages(
 			const item = boundOutlineTaskNoticeItem({
 				address: entry.address,
 				title: entry.title,
-				by,
+				...(neutralBy ? { by: neutralBy } : {}),
 				...(task.humanCreated ? { humanCreated: true } : {}),
 				changes: [{ kind: "status", from: task.from, to: task.status }],
 			});
@@ -377,6 +449,8 @@ export async function readOutlineTaskFinishedMessages(
 				...(more > 0 ? { more } : {}),
 			},
 			taskIds,
+			// A message that names nothing never wakes; a person's commit never does (PR 5's rule).
+			wake: !person && items.length > 0,
 		});
 	}
 	return out;

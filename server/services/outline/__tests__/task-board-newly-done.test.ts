@@ -7,7 +7,7 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own people,
  * projects and sessions. `outline.enabled` is switched on before each case.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { OutlineBoardTask, OutlineTaskBoardResponse } from "@shared/outline-task-board";
 import { Hono } from "hono";
 import { db } from "../../../db";
@@ -218,6 +218,69 @@ describe("who sees the mark", () => {
 	});
 });
 
+describe("the finish, not the latest version", () => {
+	const reword = (id: string, text: string): OutlineOp => ({
+		op: "update",
+		block: { id },
+		content: text,
+	});
+	const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
+
+	test("finished by the manager long ago, reworded by an agent today: not marked", async () => {
+		const w = await world();
+		const task = await w.add("Old chore");
+		await write(
+			w.space.id,
+			{ kind: "human", id: w.manager },
+			[setStatus(task, "done")],
+			daysAgo(60),
+		);
+		await write(w.space.id, { kind: "agent", id: w.worker }, [reword(task, "Old chore (tidied)")]);
+		expect(await marks(w.manager, w.worker)).toEqual({ "Old chore (tidied)": false });
+	});
+
+	test("finished by an agent, reworded by agents since: marked once; seen, it stays seen", async () => {
+		const w = await world();
+		const task = await w.add("Ship it");
+		const agent = { kind: "agent" as const, id: w.worker };
+		await write(w.space.id, agent, [setStatus(task, "done")]);
+		await write(w.space.id, agent, [reword(task, "Ship it (v2)")]);
+		expect(await marks(w.manager, w.worker)).toEqual({ "Ship it (v2)": true });
+		const version = (await outlineStore.getBlock(task))?.versionSeq as number;
+		await markOutlineTasksSeen(principal(w.manager), {
+			tasks: [{ id: task, versionSeq: version }],
+		});
+		await write(w.space.id, agent, [reword(task, "Ship it (v3)")]);
+		expect(await marks(w.manager, w.worker)).toEqual({ "Ship it (v3)": false });
+	});
+
+	test("the window runs from the finish: finished 15 days ago, reworded today, not marked", async () => {
+		const w = await world();
+		const task = await w.add("Stale");
+		const agent = { kind: "agent" as const, id: w.worker };
+		await write(w.space.id, agent, [setStatus(task, "done")], daysAgo(15));
+		await write(w.space.id, agent, [reword(task, "Stale (reworded)")]);
+		expect(await marks(w.manager, w.worker)).toEqual({ "Stale (reworded)": false });
+	});
+
+	test(`edited more than ${OUTLINE_BOARD_NEW_DONE.versionsBack - 1} times since the finish: not marked`, async () => {
+		const w = await world();
+		const near = await w.add("Near");
+		const far = await w.add("Far");
+		const agent = { kind: "agent" as const, id: w.worker };
+		await write(w.space.id, agent, [setStatus(near, "done"), setStatus(far, "done")]);
+		for (let i = 1; i <= OUTLINE_BOARD_NEW_DONE.versionsBack - 1; i++) {
+			const ops = [reword(far, `Far ${i}`)];
+			if (i < OUTLINE_BOARD_NEW_DONE.versionsBack - 1) ops.push(reword(near, `Near ${i}`));
+			await write(w.space.id, agent, ops);
+		}
+		expect(await marks(w.manager, w.worker)).toEqual({
+			[`Near ${OUTLINE_BOARD_NEW_DONE.versionsBack - 2}`]: true,
+			[`Far ${OUTLINE_BOARD_NEW_DONE.versionsBack - 1}`]: false,
+		});
+	});
+});
+
 describe("recording that a person saw a mark", () => {
 	test("only done tasks they manage, in spaces they may read; never past the task's version", async () => {
 		const w = await world();
@@ -226,25 +289,32 @@ describe("recording that a person saw a mark", () => {
 		const agent = { kind: "agent" as const, id: w.worker };
 		await write(w.space.id, agent, [setStatus(done as string, "done")]);
 		const version = (await outlineStore.getBlock(done as string))?.versionSeq as number;
-		// Not theirs (the reader manages nothing here), not readable, not done: nothing recorded.
-		expect(
-			await markOutlineTasksSeen(principal(w.reader), {
-				tasks: [{ id: done as string, versionSeq: version }],
-			}),
-		).toBe(0);
-		expect(
-			await markOutlineTasksSeen(principal(outsider), {
-				tasks: [{ id: done as string, versionSeq: version }],
-			}),
-		).toBe(0);
-		expect(
-			await markOutlineTasksSeen(principal(w.manager), {
-				tasks: [
-					{ id: open as string, versionSeq: 1 },
-					{ id: "no-such-block", versionSeq: 1 },
-				],
-			}),
-		).toBe(0);
+		// Not theirs (the reader manages nothing here), not readable, not done: nothing recorded,
+		// and nothing written (no transaction, no prune).
+		const put = spyOn(outlineStore, "putTaskSeen");
+		try {
+			expect(
+				await markOutlineTasksSeen(principal(w.reader), {
+					tasks: [{ id: done as string, versionSeq: version }],
+				}),
+			).toBe(0);
+			expect(
+				await markOutlineTasksSeen(principal(outsider), {
+					tasks: [{ id: done as string, versionSeq: version }],
+				}),
+			).toBe(0);
+			expect(
+				await markOutlineTasksSeen(principal(w.manager), {
+					tasks: [
+						{ id: open as string, versionSeq: 1 },
+						{ id: "no-such-block", versionSeq: 1 },
+					],
+				}),
+			).toBe(0);
+			expect(put).not.toHaveBeenCalled();
+		} finally {
+			put.mockRestore();
+		}
 		// A version from the future is recorded as the task's own.
 		expect(
 			await markOutlineTasksSeen(principal(w.manager), {
@@ -300,7 +370,7 @@ describe("cost", () => {
 		await write(w.space.id, { kind: "human", id: w.manager }, [setStatus(done, "done")]);
 		const calls: string[] = [];
 		const restores: Array<() => void> = [];
-		for (const key of ["getCommitsBySeqs", "getTaskSeen"] as const) {
+		for (const key of ["listVersionMetasAt", "getCommitsBySeqs", "getTaskSeen"] as const) {
 			const original = outlineStore[key];
 			(outlineStore as unknown as Record<string, unknown>)[key] = (...args: unknown[]) => {
 				calls.push(key);
@@ -315,7 +385,7 @@ describe("cost", () => {
 			await readSessionTaskBoard(principal(w.reader), w.worker);
 			expect(calls).toEqual([]);
 			await readSessionTaskBoard(principal(w.manager), w.worker);
-			expect(calls).toEqual(["getCommitsBySeqs", "getTaskSeen"]);
+			expect(calls).toEqual(["listVersionMetasAt", "getCommitsBySeqs", "getTaskSeen"]);
 		} finally {
 			for (const restore of restores) restore();
 		}

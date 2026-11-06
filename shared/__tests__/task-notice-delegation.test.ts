@@ -87,7 +87,8 @@ describe("tasks the session created, finished elsewhere", () => {
 			{
 				address: "K/a",
 				title: "Ship it",
-				by: 'session "Worker"',
+				// Who finished them, as a name: a person's, or a session's title.
+				by: "Worker",
 				changes: [{ kind: "status" as const, from: "doing" as const, to: "done" }],
 			},
 		],
@@ -96,7 +97,7 @@ describe("tasks the session created, finished elsewhere", () => {
 
 	test("titled by who finished them, each row its status change; the rest counted", () => {
 		const notice = taskNoticeFromBody("outline_task_finished", body, "Your tasks", undefined);
-		expect(notice?.title).toBe('session "Worker" finished 3 task(s) this session created');
+		expect(notice?.title).toBe("Worker finished 3 task(s) this session created");
 		expect(notice?.rows[0]).toMatchObject({
 			title: "Ship it",
 			statusFrom: { label: "In progress" },

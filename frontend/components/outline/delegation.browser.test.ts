@@ -10,7 +10,9 @@
  *   - the task board's 「新完成」: a task the reader manages that an agent finished is marked for
  *     them, not for another reader; once it has been on screen the board records it (the mark
  *     stays while the board is open, even after a read), and the next board no longer marks it;
- *     another person's mark is untouched.
+ *     another person's mark is untouched; a board mounted but hidden (a dock tab behind another,
+ *     the panel saying it is hidden while still painted, or a host's `visibility: hidden`)
+ *     records nothing until it is shown.
  * Nothing scrolls sideways.
  *
  * NF_9B_SHOTS=<dir> also writes a screenshot of each view there.
@@ -246,12 +248,43 @@ test("the Agent card: the task row links the task, a late result is marked; 360 
 				late: labels.subagentLateBadge,
 				lateReason: labels.subagentLateReason.taken_over,
 			});
-			// The extra row is measured exactly as Chromium paints it.
-			for (const card of [current, late])
+			// The extra row is measured exactly as Chromium paints it: the card's height, and the
+			// row's own box inside the header (whose height is fixed, so the card alone would not
+			// show a row spilling past it).
+			for (const card of [current, late]) {
 				expect(Math.abs((card?.painted ?? 0) - (card?.measured ?? 0))).toBeLessThanOrEqual(0.5);
+				expect(card?.rowInHeader).toBe(true);
+				expect(Math.abs((card?.rowHeight ?? 0) - (card?.lineXs ?? 0))).toBeLessThanOrEqual(0.05);
+			}
 			expect(await call(page, (f) => f.horizontalOverflow())).toBeLessThanOrEqual(0);
 			await shoot(page, `card-${viewName(view)}`);
 		}
+		// At a typography the reader changed (smaller text, tighter lines, then larger and looser),
+		// the row still takes the line the measure counts.
+		for (const typography of [
+			{ fontScalePercent: 70, lineHeightScalePercent: 60 },
+			{ fontScalePercent: 130, lineHeightScalePercent: 140 },
+		]) {
+			await call(
+				page,
+				(f, address: string, v: Fixture.View, t: never) => f.renderCards(address, v, t),
+				task.address,
+				VIEWS[0],
+				typography,
+			);
+			await until(page, "the cards", (f) => f.cards().filter((c) => c.row !== null).length === 2);
+			for (const card of await call(page, (f) => f.cards())) {
+				expect(Math.abs(card.painted - card.measured)).toBeLessThanOrEqual(0.5);
+				expect(card.rowInHeader).toBe(true);
+				expect(Math.abs((card.rowHeight ?? 0) - card.lineXs)).toBeLessThanOrEqual(0.05);
+			}
+		}
+		await call(
+			page,
+			(f, address: string, v: Fixture.View) => f.renderCards(address, v),
+			task.address,
+			VIEWS[0],
+		);
 		// The title opens the task: the server resolved it for this reader.
 		const resolved = page.waitForResponse((r) => r.url().includes("/api/outline/resolve"));
 		expect(await call(page, (f) => f.clickTaskLink(0))).toBe(true);
@@ -384,3 +417,61 @@ test("the board's 「新完成」: the person who manages it until they have see
 		}
 	}
 }, 180_000);
+
+test("the board's 「新完成」 is seen once shown: hidden in a dock tab or by its host, nothing is recorded", async () => {
+	for (const hidden of ["dock", "panel", "css"] as const) {
+		const id = await session(`Hidden board ${hidden}`);
+		const space = await ensureSessionSpace(id);
+		const task = await addPersonTask({
+			narratorId: id,
+			userId: alice,
+			text: "Ship the importer",
+			lock: false,
+		});
+		for (const status of ["doing", "done"] as const)
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "setTask", block: { id: task.blockId }, task: { status } }],
+				actor: { kind: "agent", id },
+				narratorId: id,
+				responsibleUserId: alice,
+			});
+		const seen = async () => (await outlineStore.getTaskSeen(alice, [task.blockId])).length;
+		const { page, errors } = await openPage(alice);
+		try {
+			const open = async () => {
+				await call(
+					page,
+					(f, narratorId: string, v: Fixture.View, h: Fixture.HiddenHost) =>
+						f.openBoard(narratorId, v, h),
+					id,
+					VIEWS[0],
+					hidden,
+				);
+				await until(
+					page,
+					`the board hidden (${hidden})`,
+					(f) => f.boardRows().length === 1 && f.boardRows()[0]?.mark !== null,
+				);
+				// In the viewport all along: the observer and the frame after it have had their turn.
+				await call(page, (f) => f.frames(10));
+			};
+			await open();
+			// Unmounted, the board tells the server whatever it saw: nothing.
+			await call(page, (f) => f.close());
+			await page.waitForNetworkIdle({ idleTime: 200, timeout: 5_000 });
+			expect(await seen()).toBe(0);
+			// Hidden again, then shown: now it is seen.
+			await open();
+			expect(await seen()).toBe(0);
+			await call(page, (f) => f.showBoard());
+			await serverUntil(
+				`the mark to be recorded once shown (${hidden})`,
+				async () => (await seen()) === 1,
+			);
+			expect(errors).toEqual([]);
+		} finally {
+			await page.browserContext().close();
+		}
+	}
+}, 120_000);

@@ -817,7 +817,7 @@ async function finishRun(
 				: "completed";
 	// What reaches the destination: a session sent with an outline task attaches its result under
 	// the task first, and the destination gets the result with a note saying where and how.
-	const delivered =
+	const delegatedResult =
 		deliverTo && publicationRun && req.deliver !== false && outcome.delegated
 			? await delegatedDelivery(id, outcome.delegated, publicationRun.logicalRunId, {
 					delivered: finalText,
@@ -825,12 +825,17 @@ async function finishRun(
 					ending: eventKind,
 					principal: run.principal ?? null,
 				})
-			: finalText;
+			: null;
+	const delivered = delegatedResult?.text ?? finalText;
 	const output =
 		deliverTo && publicationRun
 			? await renderResult(id, deliverTo, publicationRun, delivered)
 			: finalText;
-	const result: RunResult = { ...base, output };
+	const result: RunResult = {
+		...base,
+		output,
+		...(delegatedResult?.note ? { outlineReport: delegatedResult.note } : {}),
+	};
 	try {
 		if (deliverTo && publicationRun && req.deliver !== false) {
 			if (foregroundCaller) {
@@ -934,13 +939,13 @@ async function delegatedDelivery(
 		ending: TerminalEvent;
 		principal: string | null;
 	},
-): Promise<string> {
+): Promise<{ text: string; note: import("@shared/outline-report-note").OutlineReportNote | null }> {
 	try {
 		const { deliverDelegatedResult } = await import("../outline/delegation");
 		return await deliverDelegatedResult({ subagentId: id, delegated, logicalRunId, ...result });
 	} catch (error) {
 		logger.warn("Delegated result delivered without its report", { id, error: String(error) });
-		return result.delivered;
+		return { text: result.delivered, note: null };
 	}
 }
 
@@ -1499,12 +1504,14 @@ async function deliverHeldResult(
 		await deliverDetachedResult(narratorId, deliverTo, prepared.publicationRun, {
 			eventKind,
 			finalText: delegated
-				? await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
-						delivered: finalText,
-						report: finalText,
-						ending: eventKind,
-						principal,
-					})
+				? (
+						await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
+							delivered: finalText,
+							report: finalText,
+							ending: eventKind,
+							principal,
+						})
+					).text
 				: finalText,
 			hasError,
 			principal,

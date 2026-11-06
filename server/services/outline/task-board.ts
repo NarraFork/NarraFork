@@ -22,15 +22,19 @@
  *
  * NEWLY DONE FOR YOU (「新完成」, D50 ④; outline P2 PR 9b)
  * -----------------------------------------------------
- * A finished task the reader manages (`task_json.manager` is them) that an agent finished is
- * `newlyDone` until they have seen it on a board: the commit of its current version is an
- * agent's (or a system commit for a session: a confirmation), or another person's while a
- * session was doing it (as the report counts it); never one the reader wrote. Only tasks finished
- * within {@link OUTLINE_BOARD_NEW_DONE.windowDays} days. "Seen" is a row of `outline_task_seen`
- * at the task's version or later, written when the board showed it to them
- * ({@link markOutlineTasksSeen}); a task finished again later is new again. Cost: nothing more
- * for a board without such a task; otherwise one commit read per space (by `(space_id, seq)`) and
- * one read of the reader's rows (primary key), bounded by the finished tasks shown.
+ * A done task the reader manages (`task_json.manager` is them) that an agent finished is
+ * `newlyDone` until they have seen it. The finish is the version that made it done (walked back
+ * from the current one, at most {@link OUTLINE_BOARD_NEW_DONE.versionsBack} versions: later
+ * edits of a done task leave it found; one edited more often since is not marked). Its commit is
+ * an agent's (or a system commit for a session: a confirmation), or another person's while a
+ * session was doing it (as the report counts it), never one the reader wrote; and it is within
+ * {@link OUTLINE_BOARD_NEW_DONE.windowDays} days. A later version the reader wrote means they
+ * have seen it. "Seen" is otherwise a row of `outline_task_seen` at the finish's version or later,
+ * written when a board showed it to them ({@link markOutlineTasksSeen}); a task finished again
+ * later is new again, an agent rewording it is not. Cost: nothing more for a board without such
+ * a task; otherwise at most `versionsBack - 1` batched version reads (primary-key seeks, without
+ * content), one commit read per space (by `(space_id, seq)`) and one read of the reader's rows
+ * (primary key), all bounded by the finished tasks shown.
  *
  * COMPLETION (D26b)
  * -----------------
@@ -77,6 +81,7 @@ import {
 import { findCompletionsAwaitingConfirmation, pendingRightOf } from "./pending";
 import { isOrphanedSpace, resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
+import type { OutlineVersionMeta } from "./store/digest-port";
 import type {
 	OutlineBlockMeta,
 	OutlineCommitRow,
@@ -133,6 +138,8 @@ function decodeSpaceCursor(cursor: string): string {
 export const OUTLINE_BOARD_NEW_DONE = {
 	/** Tasks finished longer ago than this are never marked. */
 	windowDays: 14,
+	/** Versions of a done task looked at, newest first, to find the one that finished it. */
+	versionsBack: 4,
 	/** A person's seen rows older than this are pruned when they write more. */
 	keepSeenDays: 30,
 } as const;
@@ -150,6 +157,58 @@ function finishedByAgent(
 	// A person's commit: the reader's own never is; another person's when a session was doing it.
 	if (commit.actorId === readerId) return false;
 	return !!(claim?.holderNarratorId ?? claim?.lastHolderNarratorId);
+}
+
+/**
+ * The versions of each task, newest first, back to the one that made it done (or
+ * {@link OUTLINE_BOARD_NEW_DONE.versionsBack} of them): one batched read per step back, only for
+ * the tasks still looking.
+ */
+async function finishingChains(
+	store: OutlineStore,
+	tasks: readonly OutlineBlockMeta[],
+): Promise<Map<string, OutlineVersionMeta[]>> {
+	const chains = new Map<string, OutlineVersionMeta[]>(tasks.map((m) => [m.id, []]));
+	const found = (chain: readonly OutlineVersionMeta[]) => {
+		const last = chain.at(-1);
+		const before = chain.at(-2);
+		return !!before && isFinishVersion(before) && !!last && !isFinishVersion(last);
+	};
+	// First the current version and the one before it, then one more each step.
+	let keys = tasks.flatMap((m) =>
+		m.versionSeq > 1
+			? [
+					{ blockId: m.id, seq: m.versionSeq },
+					{ blockId: m.id, seq: m.versionSeq - 1 },
+				]
+			: [{ blockId: m.id, seq: m.versionSeq }],
+	);
+	for (let step = 0; keys.length > 0 && step < OUTLINE_BOARD_NEW_DONE.versionsBack; step++) {
+		const grew = new Set<string>();
+		for (const version of await store.listVersionMetasAt(keys)) {
+			const chain = chains.get(version.blockId);
+			if (!chain || chain.some((v) => v.fromSeq === version.fromSeq)) continue;
+			chain.push(version);
+			grew.add(version.blockId);
+		}
+		for (const chain of chains.values()) chain.sort((a, b) => b.fromSeq - a.fromSeq);
+		keys = [];
+		for (const [blockId, chain] of chains) {
+			// Nothing older was found: the start of the block's history.
+			if (!grew.has(blockId)) continue;
+			const last = chain.at(-1);
+			// Stop at the finish, at the start of the block's history, or at the bound.
+			if (!last || found(chain) || chain.length >= OUTLINE_BOARD_NEW_DONE.versionsBack) continue;
+			if (last.fromSeq <= 1 || last.deleted || last.taskJson?.status !== "done") continue;
+			keys.push({ blockId, seq: last.fromSeq - 1 });
+		}
+	}
+	return chains;
+}
+
+/** A version whose task is done (a finish, when the version before it is not). */
+function isFinishVersion(version: OutlineVersionMeta): boolean {
+	return !version.deleted && version.taskJson?.status === "done";
 }
 
 /**
@@ -173,26 +232,51 @@ async function newlyDoneFor(
 	const out = new Set<string>();
 	if (candidates.length === 0) return out;
 	const { store } = ctx;
-	const seqsBySpace = new Map<string, number[]>();
-	for (const m of candidates)
-		seqsBySpace.set(m.spaceId, [...(seqsBySpace.get(m.spaceId) ?? []), m.versionSeq]);
+	const chains = await finishingChains(store, candidates);
+	// Each task's finish, and the versions written after it.
+	const finishes = new Map<string, { finish: OutlineVersionMeta; after: OutlineVersionMeta[] }>();
+	for (const m of candidates) {
+		const chain = chains.get(m.id) ?? [];
+		for (let i = 0; i + 1 < chain.length; i++) {
+			const version = chain[i] as OutlineVersionMeta;
+			if (!isFinishVersion(version)) break;
+			if (isFinishVersion(chain[i + 1] as OutlineVersionMeta)) continue;
+			// The one before was not done (to do, in progress, cancelled; not deleted): the finish.
+			if (!(chain[i + 1] as OutlineVersionMeta).deleted)
+				finishes.set(m.id, { finish: version, after: chain.slice(0, i) });
+			break;
+		}
+	}
+	if (finishes.size === 0) return out;
+	const seqsBySpace = new Map<string, Set<number>>();
+	for (const m of candidates) {
+		const found = finishes.get(m.id);
+		if (!found) continue;
+		const seqs = seqsBySpace.get(m.spaceId) ?? new Set<number>();
+		for (const version of [found.finish, ...found.after]) seqs.add(version.fromSeq);
+		seqsBySpace.set(m.spaceId, seqs);
+	}
 	const commits = new Map<string, OutlineCommitRow>();
 	for (const [spaceId, seqs] of seqsBySpace)
-		for (const commit of await store.getCommitsBySeqs(spaceId, [...new Set(seqs)]))
+		for (const commit of await store.getCommitsBySeqs(spaceId, [...seqs]))
 			commits.set(`${spaceId}:${commit.seq}`, commit);
 	const seen = new Map(
-		(
-			await store.getTaskSeen(
-				readerId,
-				candidates.map((m) => m.id),
-			)
-		).map((row) => [row.taskBlockId, row.seenSeq]),
+		(await store.getTaskSeen(readerId, [...finishes.keys()])).map((row) => [
+			row.taskBlockId,
+			row.seenSeq,
+		]),
 	);
 	const since = new Date(now.getTime() - OUTLINE_BOARD_NEW_DONE.windowDays * DAY_MS).toISOString();
+	const byReader = (commit: OutlineCommitRow | undefined) =>
+		commit?.actorKind === "human" && commit.actorId === readerId;
 	for (const m of candidates) {
-		const commit = commits.get(`${m.spaceId}:${m.versionSeq}`);
+		const found = finishes.get(m.id);
+		if (!found) continue;
+		const commit = commits.get(`${m.spaceId}:${found.finish.fromSeq}`);
 		if (!commit || commit.createdAt < since) continue;
-		if ((seen.get(m.id) ?? -1) >= m.versionSeq) continue;
+		if ((seen.get(m.id) ?? -1) >= found.finish.fromSeq) continue;
+		// The reader wrote it since: they have seen it.
+		if (found.after.some((v) => byReader(commits.get(`${m.spaceId}:${v.fromSeq}`)))) continue;
 		if (finishedByAgent(commit, claims.get(m.id), readerId)) out.add(m.id);
 	}
 	return out;
@@ -230,6 +314,8 @@ export async function markOutlineTasksSeen(
 		const seenSeq = Math.min(wanted.get(m.id) ?? 0, m.versionSeq);
 		rows.push({ taskBlockId: m.id, seenSeq });
 	}
+	// Nothing to record: no write, no prune.
+	if (rows.length === 0) return 0;
 	const now = options.now ?? new Date();
 	await store.putTaskSeen(
 		principal.userId,

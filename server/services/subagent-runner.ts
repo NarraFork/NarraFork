@@ -149,6 +149,13 @@ export interface RunSubagentInput {
 	 * once it exists, before it runs.
 	 */
 	delegation?: import("./outline/delegation").PreparedOutlineDelegation;
+	/**
+	 * Told the head of the note a foreground delegated result was delivered with (null: none), so
+	 * the Agent call can carry it as data for its card (outline P2 PR 9b).
+	 */
+	onDelegatedResult?: (
+		note: import("@shared/outline-report-note").OutlineReportNote | null,
+	) => void;
 }
 
 /**
@@ -450,6 +457,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			return terminal.output;
 		}
 		const result = await handle.foreground;
+		input.onDelegatedResult?.(result.outlineReport ?? null);
 		return result.output + formatSubagentModelFallbackNote(inheritance) + conflictNote;
 	} catch (error) {
 		updateLease.release();

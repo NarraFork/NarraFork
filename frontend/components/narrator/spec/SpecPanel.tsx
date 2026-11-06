@@ -38,6 +38,7 @@ import { outlineTargetHref } from "../../../lib/outline-href";
 import { isOpenClick, useOutlineOpener, wantsNewPanel } from "../../../lib/outline-opener";
 import { SessionTaskBoard } from "../../outline/task-board/TaskBoardViews";
 import { MarkdownContent } from "../markdown/MarkdownContent";
+import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecTaskBoard } from "./SpecTaskBoard";
 import type { SpecEditorMode } from "./spec-editor-mode";
@@ -63,6 +64,11 @@ interface SpecPanelProps {
 	 * ToolPanelShell provides the single header. The file-tabs row stays as the content top row.
 	 */
 	chromeless?: boolean;
+	/**
+	 * Whether the panel is shown (a dock tab behind another stays mounted). Given to the outline
+	 * task board only, which marks as seen what was on screen (outline P2 PR 9b); default shown.
+	 */
+	visible?: boolean;
 }
 
 const TASKS_URI = "spec://tasks.json";
@@ -96,6 +102,7 @@ function OutlineTasksPanel({
 	narratorId,
 	onClose,
 	chromeless = false,
+	visible = true,
 	onShowLegacy,
 }: SpecPanelProps & { onShowLegacy: () => void }) {
 	const { t } = useTranslation("outline");
@@ -142,7 +149,9 @@ function OutlineTasksPanel({
 			<ScrollArea style={{ flex: 1 }}>
 				<AutoContinuationControl narratorId={narratorId} />
 				<Box px="xs" pb="xs">
-					<SessionTaskBoard narratorId={narratorId} onOpenTask={openTask} />
+					<NarratorPanelVisibilityProvider value={visible}>
+						<SessionTaskBoard narratorId={narratorId} onOpenTask={openTask} />
+					</NarratorPanelVisibilityProvider>
 					<Anchor
 						component="button"
 						type="button"

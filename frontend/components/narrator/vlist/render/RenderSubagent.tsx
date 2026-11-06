@@ -596,7 +596,7 @@ export function RenderSubagent(props: RenderSubagentProps) {
 /**
  * "Task: <title>" under the description: the title links the task (`/outline/ref`, resolved by
  * the server with the reader's permissions) where an outline panel can open it, and is plain text
- * elsewhere. One truncating line (`measured.delegationRowHeight`).
+ * elsewhere. One truncating line of `line.xs` (`measured.delegationRowHeight` adds its margin).
  */
 function DelegationRow({
 	delegation,
@@ -608,6 +608,8 @@ function DelegationRow({
 	const href = outlineAddressPath(delegation.address);
 	const link = useOutlineLinkProps(href);
 	const [before = "", after = ""] = labels.delegatedTask.split("{title}");
+	// Exactly the line the measure counts (`line.xs`), whatever the reader's typography.
+	const line = typographyMetrics().line.xs;
 	return (
 		<p
 			className={ROW_TEXT_CLASS}
@@ -615,6 +617,8 @@ function DelegationRow({
 			data-testid="subagent-task"
 			style={{
 				color: DIMMED,
+				height: line,
+				lineHeight: `${line}px`,
 				marginTop: rowSpacing(DELEGATION_ROW_MARGIN_TOP),
 				marginLeft: rowSpacing(DESC_LEFT),
 			}}

@@ -8,8 +8,11 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
+import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
+import { type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { taskBoardKeys } from "../../hooks/useTaskBoard";
@@ -26,6 +29,7 @@ import zhOutline from "../../locales/zh-CN/outline.json";
 import { ImageViewerProvider } from "../common/ImageViewerProvider";
 import { segmentMessages } from "../narrator/message/message-segments";
 import type { NarratorMsg } from "../narrator/narrator-panel-types";
+import { NarratorPanelVisibilityProvider } from "../narrator/narrator-panel-visibility";
 import { getCategory, getCategoryColor, getSummary } from "../narrator/tool-call/tool-display";
 import { VLIST_REGISTRY } from "../narrator/vlist/registry";
 import { renderElement, resolveRenderExtra } from "../narrator/vlist/render-registry";
@@ -204,24 +208,47 @@ function Cards({ task, view }: { task: string; view: View }) {
 	);
 }
 
-/** Two Agent cards sent with the task at `task` (`key/sid`): a current result and a late one. */
-export async function renderCards(task: string, view: View): Promise<void> {
+/**
+ * Two Agent cards sent with the task at `task` (`key/sid`): a current result and a late one, at
+ * the reader's typography (外观 · 排版; default unless given).
+ */
+export async function renderCards(
+	task: string,
+	view: View,
+	typography: Partial<TypographySettings> = {},
+): Promise<void> {
 	opened.length = 0;
+	setTypography({ fontScalePercent: 100, lineHeightScalePercent: 100, ...typography });
 	await mount(view, <Cards task={task} view={view} />);
 }
 
-/** Each card: its measured and painted heights, its task row, link and late badge. */
+/**
+ * Each card: its measured and painted heights, its task row, link and late badge. The row's own
+ * box against the header it sits in (whose height is measured): `rowInHeader` when its bottom is
+ * inside the header's content box, so nothing it paints reaches the next region; `rowHeight` to
+ * compare with `lineXs`, the line the measure counts.
+ */
 export function cards() {
+	const lineXs = typographyMetrics().line.xs;
 	return [...document.querySelectorAll<HTMLElement>("[data-card]")].map((card) => {
 		const paper = card.firstElementChild as HTMLElement | null;
 		const row = card.querySelector<HTMLElement>("[data-testid=subagent-task]");
 		const late = card.querySelector<HTMLElement>("[data-testid=subagent-late]");
+		const header = row?.parentElement ?? null;
+		const headerBottom = header
+			? header.getBoundingClientRect().bottom -
+				Number.parseFloat(getComputedStyle(header).paddingBottom)
+			: 0;
+		const rowBox = row?.getBoundingClientRect();
 		return {
 			kind: card.dataset.kind ?? "",
 			measured: Number(card.dataset.measured),
 			painted: paper ? Math.round(paper.getBoundingClientRect().height * 10) / 10 : 0,
 			row: row?.textContent ?? null,
 			rowFits: row ? row.scrollHeight <= row.clientHeight + 1 : null,
+			rowInHeader: rowBox ? rowBox.bottom <= headerBottom + 0.5 : null,
+			rowHeight: rowBox?.height ?? null,
+			lineXs,
 			link:
 				card.querySelector<HTMLAnchorElement>("[data-testid=subagent-task-link]")?.textContent ??
 				null,
@@ -247,9 +274,61 @@ export function openedPlaces(): Array<{ spaceId?: string; blockId?: string }> {
 
 // ── The task board ──────────────────────────────────────────────────────────
 
-/** Mount a session's board. */
-export async function openBoard(narratorId: string, view: View): Promise<void> {
-	await mount(view, <SessionTaskBoard narratorId={narratorId} />);
+/**
+ * How a board's host hides it: `dock`, as a dock tab behind another (kept mounted under
+ * `visibility: hidden`, and the panel says it is not shown); `panel`, the panel says it is not
+ * shown while it is still painted (dockview tells it before the style changes); `css`, under
+ * `visibility: hidden` only, the host saying nothing.
+ */
+export type HiddenHost = "dock" | "panel" | "css";
+
+let showHost: (() => void) | null = null;
+
+function BoardHost({ hidden, children }: { hidden?: HiddenHost; children: ReactNode }) {
+	const [shown, setShown] = useState(!hidden);
+	showHost = () => setShown(true);
+	const styleHidden = !shown && hidden !== "panel";
+	return (
+		<NarratorPanelVisibilityProvider value={shown || hidden === "css"}>
+			<div data-testid="board-host" style={{ visibility: styleHidden ? "hidden" : undefined }}>
+				{children}
+			</div>
+		</NarratorPanelVisibilityProvider>
+	);
+}
+
+/** Mount a session's board, shown or in a host that hides it. */
+export async function openBoard(
+	narratorId: string,
+	view: View,
+	hidden?: HiddenHost,
+): Promise<void> {
+	await mount(
+		view,
+		<BoardHost hidden={hidden}>
+			<SessionTaskBoard narratorId={narratorId} />
+		</BoardHost>,
+	);
+}
+
+/** The host shows the board it hid. */
+export function showBoard(): void {
+	showHost?.();
+}
+
+/** Unmount whatever is mounted (a board tells the server what it saw on unmount). */
+export function close(): void {
+	root?.unmount();
+	root = null;
+}
+
+/** Resolve after `count` frames: whatever waits for a frame has had its chance. */
+export function frames(count: number): Promise<void> {
+	return new Promise((resolve) => {
+		const step = (left: number) =>
+			left <= 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+		step(count);
+	});
 }
 
 /** Read the board again (its query), as a later change or a refresh would. */

@@ -199,7 +199,10 @@ function toViewState(row: ViewStateSelect): OutlineViewStateRow {
 	};
 }
 
-/** Write a person's view state of a page and drop their oldest pages beyond the cap. */
+/**
+ * Record the finished tasks a person has seen (each at the latest version seen) and drop their
+ * marks seen before `pruneBefore`.
+ */
 async function putTaskSeenSection(
 	tx: PgTransaction,
 	userId: string,
@@ -224,6 +227,7 @@ async function putTaskSeenSection(
 		.where(and(eq(outlineTaskSeen.userId, userId), lt(outlineTaskSeen.seenAt, pruneBefore)));
 }
 
+/** Write a person's view state of a page and drop their oldest pages beyond the cap. */
 async function putViewStateSection(
 	tx: PgTransaction,
 	row: OutlineViewStateRow,

@@ -36,6 +36,7 @@ import {
 	readOutlineTaskFinishedMessages,
 	setOutlineTaskFinishedDelivery,
 	settleOutlineTaskFinishedForTests,
+	shareOutNames,
 	startOutlineTaskFinishedNotices,
 } from "../task-finished";
 import { type OutlineOp, type OutlineWriteResult, writeOutline } from "../write";
@@ -249,7 +250,8 @@ describe("who is told", () => {
 				{
 					address: task.address,
 					title: "Fix the refresh race",
-					by: 'session "Worker"',
+					// The reader's card names the session by its title, in no language.
+					by: "Worker",
 					changes: [{ kind: "status", from: "todo", to: "done" }],
 				},
 			],
@@ -426,6 +428,26 @@ describe("a person's commit", () => {
 				{ by: usernames.get(owner), changes: [{ kind: "status", from: "doing", to: "done" }] },
 			],
 		});
+		// A person tidying up never costs a request: written for the next turn, not woken.
+		expect(sent[0]?.wake).toBe(false);
+	});
+
+	test("the real delivery of a person's commit writes the row and wakes nobody", async () => {
+		const owner = await person();
+		const creator = await session(owner, { title: "Planner" });
+		const holder = await session(owner, { title: "Worker" });
+		const space = await ensureProjectSpace(await project(owner));
+		const [task] = await tasks(space.id, asAgent(creator, owner), ["Ship it"]);
+		if (!task) throw new Error("seed");
+		await write(space.id, asAgent(holder, owner), [
+			{ op: "setTask", block: { id: task.blockId }, task: { status: "doing" } },
+		]);
+		const result = await deliverOutlineTaskFinished(
+			eventOf(await write(space.id, asPerson(owner), finish([task.blockId]))),
+		);
+		expect(result).toEqual({ told: [creator], woke: 0 });
+		expect(await notices(creator)).toHaveLength(1);
+		expect(wakes).toEqual([]);
 	});
 });
 
@@ -467,11 +489,85 @@ describe("limits", () => {
 		expect(more(a) + more(b)).toBe(5);
 		expect(a?.taskIds).toHaveLength(15);
 		expect(b?.taskIds).toHaveLength(10);
-		const counted = more(a) > 0 ? a : b;
-		expect(counted?.content).toContain(
-			"more tasks this session created were finished in the same change (not listed).",
+		// Shared out in turn: the second session's ten are all named, the first's other five are
+		// counted in its own message.
+		expect([items(a), more(a), items(b), more(b)]).toEqual([10, 5, 10, 0]);
+		expect(a?.content).toContain(
+			"- 5 more tasks this session created were finished in the same change (not listed).",
 		);
 		expect(a?.messageId).not.toBe(b?.messageId);
+	});
+
+	test("every session told has a task named and is woken, however many another has", async () => {
+		const owner = await person();
+		const big = await session(owner, { title: "Big" });
+		const small = await session(owner, { title: "Small" });
+		const doer = await session(owner, { title: "Worker" });
+		const space = await ensureSessionSpace(doer);
+		const many = await tasks(
+			space.id,
+			asAgent(big, owner),
+			Array.from({ length: 25 }, (_, i) => `Big ${i + 1}`),
+		);
+		const few = await tasks(space.id, asAgent(small, owner), ["Small 1", "Small 2"]);
+		const sent = capture();
+		await deliverOutlineTaskFinished(
+			eventOf(
+				await write(
+					space.id,
+					asAgent(doer, owner),
+					finish([...many, ...few].map((t) => t.blockId)),
+				),
+			),
+		);
+		const named = (id: string) => {
+			const body = sent.find((m) => m.narratorId === id)?.body;
+			return body?.kind === "outlineTasks" ? [body.items.length, body.more ?? 0] : null;
+		};
+		expect(named(big)).toEqual([18, 7]);
+		expect(named(small)).toEqual([2, 0]);
+		expect(sent.every((m) => m.wake)).toBe(true);
+	});
+
+	test(`at most ${OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit} sessions told per commit; each names a task`, async () => {
+		const owner = await person();
+		const doer = await session(owner, { title: "Worker" });
+		const space = await ensureSessionSpace(doer);
+		const creators: string[] = [];
+		const ids: string[] = [];
+		for (let i = 0; i < OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit + 1; i++) {
+			const creator = await session(owner, { title: `Creator ${i}` });
+			creators.push(creator);
+			const [task] = await tasks(space.id, asAgent(creator, owner), [`Task ${i}`]);
+			ids.push((task as { blockId: string }).blockId);
+		}
+		const sent = capture();
+		await deliverOutlineTaskFinished(
+			eventOf(await write(space.id, asAgent(doer, owner), finish(ids))),
+		);
+		expect(sent).toHaveLength(OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit);
+		for (const message of sent)
+			expect(message.body.kind === "outlineTasks" && message.body.items.length).toBe(1);
+	});
+
+	test("every session told has a task named, so none is woken for nothing", () => {
+		// Names are shared out in turn and no more sessions are told than there are names: a
+		// message that names nothing (and the guard that keeps it from waking) cannot happen.
+		expect(OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit).toBeLessThanOrEqual(
+			OUTLINE_TASK_FINISHED_LIMITS.listedPerCommit,
+		);
+		const counts = Array.from({ length: OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit }, () => 9);
+		expect(
+			shareOutNames(counts, OUTLINE_TASK_FINISHED_LIMITS.listedPerCommit).every((n) => n > 0),
+		).toBe(true);
+	});
+
+	test("shareOutNames: in turn, at least one each while names last", () => {
+		expect(shareOutNames([25, 2], 20)).toEqual([18, 2]);
+		expect(shareOutNames([15, 10], 20)).toEqual([10, 10]);
+		expect(shareOutNames([1, 1, 1], 2)).toEqual([1, 1, 0]);
+		expect(shareOutNames([3], 20)).toEqual([3]);
+		expect(shareOutNames([], 20)).toEqual([]);
 	});
 });
 
@@ -484,6 +580,7 @@ describe("delivery", () => {
 			content: "System notice",
 			body: { kind: "outlineTasks", variant: "finished", items: [] },
 			taskIds: ["t1"],
+			wake: true,
 		};
 		expect(outlineTaskFinishedInjection(message, true)).toEqual({
 			content: "System notice",
@@ -497,6 +594,11 @@ describe("delivery", () => {
 			messageId: "m1",
 			role: "sys",
 			schedule: "wakeIfIdle",
+		});
+		// A message that does not wake (a person's commit) is written for the next turn.
+		expect(outlineTaskFinishedInjection({ ...message, wake: false }, false)).toMatchObject({
+			messageId: "m1",
+			schedule: "none",
 		});
 	});
 

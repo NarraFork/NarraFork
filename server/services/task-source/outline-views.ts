@@ -153,6 +153,8 @@ interface CachedView extends ViewDeps {
 
 /** Changes seen while a view was being read: one that hits its dependencies makes it stale. */
 interface ReadTracker {
+	/** The view being read (a change can name the kind of view it concerns by key prefix). */
+	key: string;
 	spaces: Set<string>;
 	narrators: Set<string>;
 	commits: number;
@@ -171,9 +173,12 @@ function hits(view: ViewDeps, spaceId: string | null, narratorId: string | null)
 	);
 }
 
-function dropWhere(spaceId: string | null, narratorId: string | null): void {
-	for (const view of cache.values()) if (hits(view, spaceId, narratorId)) view.stale = true;
+/** The views (only those whose key starts with `only`) a change hits read again. */
+function dropWhere(spaceId: string | null, narratorId: string | null, only = ""): void {
+	for (const [key, view] of cache)
+		if (key.startsWith(only) && hits(view, spaceId, narratorId)) view.stale = true;
 	for (const tracker of reads) {
+		if (!tracker.key.startsWith(only)) continue;
 		if (spaceId !== null) {
 			tracker.spaces.add(spaceId);
 			tracker.commits++;
@@ -195,11 +200,16 @@ if (hotOnce("narrafork.outlineViews.listeners")) {
 }
 
 // A subagent starting or ending changes what the session has delegated (outline P2 PR 9b; its
-// claim passes to the session when a run ends, which is no commit): the session's views read
-// again.
+// claim passes to its parent when a run ends, which is no commit): the current-tasks views that
+// depend on the parent (the session's own: `tasks:<root>:*`) or list the subagent read again, in
+// every language. Behavior views do not depend on it and stay.
 if (hotOnce("narrafork.outlineViews.subagentListeners")) {
-	eventBus.on("narrator:subagent_started", (event) => dropWhere(null, event.parentNarratorId));
-	eventBus.on("narrator:subagent_completed", (event) => dropWhere(null, event.parentNarratorId));
+	const dropTasks = (event: { narratorId: string; parentNarratorId: string }) => {
+		dropWhere(null, event.parentNarratorId, "tasks:");
+		dropWhere(null, event.narratorId, "tasks:");
+	};
+	eventBus.on("narrator:subagent_started", dropTasks);
+	eventBus.on("narrator:subagent_completed", dropTasks);
 }
 
 /**
@@ -254,7 +264,7 @@ async function cachedViewRead(
 	const backingOff =
 		failedAt !== undefined && clock.now() - failedAt < OUTLINE_VIEW_LIMITS.failureBackoffMs;
 	if (backingOff && hit) return shown(hit);
-	const tracker: ReadTracker = { spaces: new Set(), narrators: new Set(), commits: 0 };
+	const tracker: ReadTracker = { key, spaces: new Set(), narrators: new Set(), commits: 0 };
 	reads.add(tracker);
 	try {
 		const deps: ViewDeps = { spaces: new Set(), narrators: new Set(), anySpace: false };

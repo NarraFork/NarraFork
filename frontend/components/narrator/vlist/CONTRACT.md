@@ -228,10 +228,10 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 - **ReasoningStepsTrace**（L3–L5）：表头 + min(N,5)×18.8 + 展开 step markdown🔴。**不读 LOD**：不存在"标题可见但正文打不开"的档位（旧 `titlesOnly` 已下线），L3/L4/L5 形态一致，只有读者展开了哪些步骤不同。
 
 ### SubagentCard（唯一直接读 useRenderLod）
-- Header：p=xs(20) + 徽标行 16.8 + description(折叠 truncate🟢 / 展开换行🔴) + 可选任务行 + 可选结果预览行。折叠≈55-75px（带任务行再 +19）。
-  - **任务行**（outline P2 PR 9b）：`Agent` 带 `task` 派出时，description 下面一行「任务：标题」🟢，mt2 + 一行 xs（`DELEGATION_ROW_MARGIN_TOP + line.xs`），**不论展开折叠都在**，高度只由它在不在决定（`delegationRowHeight`）。标题和地址由 adapter 从结果末尾的附注（`<outline_report …>` 头一行，`@shared/outline-report-note`）或后台派出那行「Delegated [[key/sid|标题]]」读出，读不到时用调用写的 `task`；地址能解析时标题是大纲链接（`useOutlineLinkProps`，会话宿主里开大纲面板，服务端按读者权限解析，宿主外是纯文字）。
-  - **迟到徽标**：附注说迟到时，徽标行加一个「迟到」徽标（橙色，tooltip 写原因），和 `isTakenOver` 一样在固定的徽标行里，高度不变。
-  - 三者（标题、地址、迟到原因）都从缓存的 payload 画出来，且结论 patch 会单独带来它们（附注随结果到达），所以都进 `subagentRevision`（`gtk:` / `gta:` / `gtl:`）。结果被截成预览时末尾的附注不在预览里，要等 shell 为展开的卡片取回全文才显示；折叠的卡片在那之前只显示调用写的 `task`。
+- Header：p=xs(20) + 徽标行 16.8 + description(折叠 truncate🟢 / 展开换行🔴) + 可选任务行 + 可选结果预览行。折叠≈55.6px（无结果预览）～74.4px（有结果预览），带任务行再 +(2 + line.xs)（默认排版 18.8）。
+  - **任务行**（outline P2 PR 9b）：`Agent` 带 `task` 派出时，description 下面一行「任务：标题」🟢，mt2 + 一行 xs（`DELEGATION_ROW_MARGIN_TOP + line.xs`），**不论展开折叠都在**，高度只由它在不在决定（`delegationRowHeight`）；渲染层把这一行的 `height` / `lineHeight` 钉在 `line.xs`，任何排版设置下画出来都正好是测量的那一行。标题和地址先读调用结果的 metadata（`_metadata.outlineDelegation`：Agent 工具写入任务地址、标题、认领代数，前台结果交付后再带附注头的 status/reason），它不受任何投影截断；没有 metadata（旧调用）才退回读文本：结果末尾的附注（`<outline_report …>` 头、正文、闭合 `</outline_report>` 三行，先去掉 run service 追加在附注后的 `<subagent_file_changes>` 块）或文本开头 `<background_task_id>` 之后那行「Delegated [[key/sid|标题]]」，都读不到时用调用写的 `task`；地址能解析时标题是大纲链接（`useOutlineLinkProps`，会话宿主里开大纲面板，服务端按读者权限解析，宿主外是纯文字）。
+  - **迟到徽标**：metadata（或退回时的附注）说迟到时，徽标行加一个「迟到」徽标（橙色，tooltip 写原因），和 `isTakenOver` 一样在固定的徽标行里，高度不变。后台派出的卡只有派出时的 metadata（任务、标题、代数），结果晚到时调用输出不改写，迟到经完成通知 / Await 文本告诉会话，卡上没有迟到徽标。
+  - 三者（标题、地址、迟到原因）都从缓存的 payload 画出来，且结论 patch 会单独带来它们（metadata 和附注随结果到达，`tool_completed` patch 带 `_metadata`），所以都进 `subagentRevision`（`gtk:` / `gta:` / `gtl:`）。metadata 随实时帧（文本截到 2000 字）和分页投影（8K）都完整到达，所以截断的结果照样有任务链接和迟到徽标。只有退回读文本时截断才有影响：附注被截掉就只显示调用写的 `task`、没有迟到徽标，直到 shell 取回全文——**展开卡片不会取全文**，只有全屏打开结果、或在内联查看器里读过一半时才取（`useVListContentView.ts` 的 `requestFullPayload`）。
 - Recent Calls：≤3 行 × **18.8px（= `TRACE_ROW_HEIGHT`）🟢，行间无缝**（`RECENT_STACK_GAP = 0`）。这些行就是 trace 行：dot + 14px 类别 chip + 单行 `Tool · summary` + 状态槽 + 耗时，高度直接引用 `measure-tool-run` 而不是自己再算一遍；成功不画勾与"耗时紧贴标题"的规则同上，两条渲染路径的一致性由 `RenderSubagent.traceparity.test.tsx` 逐项比对守住。
   `recentCallSummaries` / `recentCallCategories` 是 render-only（切到 `recentRowCount`），summary 由 shell 注入的 `resolveSubagentRecentSummary` 从 header 的 `inputSummary` 得出；两者都进 `subagentRevision`（`gs:` / `gc:`），因为流式补全 `inputSummary` 时行数/名字/状态都不动，它们是唯一增量。
 - 展开体：prompt ContentViewer **maxHeight:200🟡**、result ContentViewer **maxHeight:300🟡**、permission 子块。

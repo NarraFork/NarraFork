@@ -2407,6 +2407,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
 	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
 	sidecarSourceOutlineTaskEdit: "Task changes by people",
+	sidecarSourceOutlineTaskFinished: "Tasks this session created were finished elsewhere",
 	sidecarSourceOutlineAnswer: "Answers to your questions",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
@@ -4243,10 +4244,10 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			: makeBody("output.main", resultContent, hasTruncatedLeaf(outputJson));
 	const isBackground = input.background === true || input.run_in_background === true;
 	// An agent sent with an outline task (`task`, outline P2 PR 9): the card names the task under
-	// its description and marks a late result, both read from the result's note (or the line a
-	// background launch names the task in). A result cut to a preview keeps neither; the shell
-	// fetches the full one for an open card.
-	const delegation = readSubagentDelegation(readLeafText(input.task), resultContent);
+	// its description and marks a late result, from the call's metadata (the server writes it;
+	// no projection of the text cuts it), else from the result's note or the line a background
+	// launch names the task in (calls from before the metadata).
+	const delegation = readSubagentDelegation(readLeafText(input.task), resultContent, metadata);
 	const agentType = readNonEmptyString(input, "subagent_type") ?? item.tc.toolName;
 	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
 	// narrator query (which the adapter has no access to): the activity summary

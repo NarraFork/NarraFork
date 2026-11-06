@@ -55,8 +55,17 @@ const note = (status: string, reason?: string) =>
 		"</outline_report>",
 	].join("\n");
 
-function agentMessage(input: Record<string, unknown>, output: string | null): NarratorMsg {
-	const outputJson = output === null ? undefined : { _text: output, _metadata: {} };
+function agentMessage(
+	input: Record<string, unknown>,
+	output: string | null | Record<string, unknown>,
+	extra: Record<string, unknown> = {},
+): NarratorMsg {
+	const outputJson =
+		output === null
+			? undefined
+			: typeof output === "string"
+				? { _text: output, _metadata: {} }
+				: output;
 	const status = output === null ? "running" : "completed";
 	return rowWithElements(
 		{
@@ -66,7 +75,14 @@ function agentMessage(input: Record<string, unknown>, output: string | null): Na
 			role: "assistant",
 			contentText: null,
 			toolCalls: [
-				{ toolUseId: "tu-agent", toolName: "Agent", inputJson: input, outputJson, status },
+				{
+					toolUseId: "tu-agent",
+					toolName: "Agent",
+					inputJson: input,
+					outputJson,
+					status,
+					...extra,
+				},
 			],
 			createdAt: "2026-11-06T00:00:00Z",
 		},
@@ -79,10 +95,21 @@ function agentMessage(input: Record<string, unknown>, output: string | null): Na
 				inputJson: input,
 				outputJson,
 				status,
+				...extra,
 			},
 		],
 	) as unknown as NarratorMsg;
 }
+
+/** The metadata the Agent tool writes for a call sent with a task (outline P2 PR 9b review F2). */
+const delegationMeta = (extra: Record<string, unknown> = {}) => ({
+	outlineDelegation: {
+		task: "Kx81mPqa/Ab3dEf9Q",
+		title: "Fix the refresh race",
+		generation: 1,
+		...extra,
+	},
+});
 
 function specOf(message: NarratorMsg) {
 	const segments = segmentMessages([message]) as unknown as AdapterSegment[];
@@ -225,6 +252,64 @@ describe("the late badge", () => {
 			narratorZh.subagentLateReason.taken_over,
 		);
 		expect(byId(zh, "subagent-task")?.textContent).toBe("任务：Fix the refresh race");
+	});
+
+	it("a 3,000-character report cut to the live 2K projection: the badge from the call's metadata", () => {
+		const full = `${"x".repeat(3000)}\n\n${note("late", "taken_over")}`;
+		// As the live `tool_completed` frame leaves it: the output a 2000-character leaf, the
+		// metadata beside it on the call.
+		const cut = { _truncated: true, preview: full.slice(0, 2000), fullLength: full.length };
+		const root = render(
+			agentMessage({ task: "Ab3dEf9Q" }, cut, {
+				_metadata: delegationMeta({ status: "late", reason: "taken_over" }),
+			}),
+			{ withOpener: true },
+		);
+		expect(byId(root, "subagent-late")?.getAttribute("data-reason")).toBe("taken_over");
+		expect(byId(root, "subagent-task-link")?.textContent).toBe("Fix the refresh race");
+		// The page's 8K projection keeps the metadata inside the output.
+		const page = render(
+			agentMessage(
+				{ task: "Ab3dEf9Q" },
+				{
+					_text: { _truncated: true, preview: full.slice(0, 2000), fullLength: full.length },
+					_metadata: delegationMeta({ status: "late", reason: "ended" }),
+				},
+			),
+			{ withOpener: true },
+		);
+		expect(byId(page, "subagent-late")?.getAttribute("data-reason")).toBe("ended");
+	});
+
+	it("many file changes after the note: still late", () => {
+		const files = Array.from(
+			{ length: 20 },
+			(_, i) => `- ${"/srv/app/packages/".repeat(10)}module-${i}.ts +4 -1`,
+		).join("\n");
+		const text = `${REPORT}\n\n${note("late", "taken_over")}\n\n<subagent_file_changes>\n${files}\n</subagent_file_changes>`;
+		// From the metadata, and (a call from before it) from the text all the same.
+		const withMeta = render(
+			agentMessage(
+				{ task: "Ab3dEf9Q" },
+				{ _text: text, _metadata: delegationMeta({ status: "late", reason: "taken_over" }) },
+			),
+			{ withOpener: true },
+		);
+		expect(byId(withMeta, "subagent-late")).not.toBeNull();
+		const textOnly = render(agentMessage({ task: "Ab3dEf9Q" }, text), { withOpener: true });
+		expect(byId(textOnly, "subagent-late")).not.toBeNull();
+	});
+
+	it("the writer's note missing, a note quoted at the report's end: the metadata says not late", () => {
+		const root = render(
+			agentMessage(
+				{ task: "Ab3dEf9Q" },
+				{ _text: `${REPORT}\n\n${note("late", "taken_over")}`, _metadata: delegationMeta() },
+			),
+			{ withOpener: true },
+		);
+		expect(byId(root, "subagent-late")).toBeNull();
+		expect(byId(root, "subagent-task-link")?.textContent).toBe("Fix the refresh race");
 	});
 
 	it("a note quoted in the report is not the result's note", () => {

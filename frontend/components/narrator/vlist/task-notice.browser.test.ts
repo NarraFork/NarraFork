@@ -132,6 +132,8 @@ for (const { name, options } of CASES) {
 			"tasks_notice",
 			"tasks_notice",
 			"origin_notice",
+			"tasks_notice",
+			"tasks_notice",
 		]);
 		for (const card of cards) {
 			expect({ kind: card.kind, painted: card.painted }).toEqual({
@@ -150,6 +152,20 @@ for (const { name, options } of CASES) {
 		}
 		// The interrupt guard keeps its close button in its heading line.
 		expect(cards[2]?.closeButtons).toBe(1);
+		// Outline P2 PR 9b. The view with tasks the session's subagents are doing: unfolded, each
+		// of them carries the 「委派中」 chip, after the work in progress; folded, the line counts
+		// them where it has room for its tail. The notice of tasks finished elsewhere is titled by
+		// who finished them, each row its status change.
+		const [delegated, finished] = [cards[6], cards[7]];
+		expect(finished?.title).toBe("发布准备 结束了本会话建的 3 个任务");
+		if (options.expanded) {
+			expect(delegated?.statuses).toEqual(["进行中", "委派中", "委派中", "等待中", "待办"]);
+			expect(delegated?.text).toContain("修复刷新令牌的竞态");
+			expect(delegated?.text).toContain("给重试按钮补端到端用例");
+			expect(finished?.statuses).toEqual(["进行中", "完成"]);
+		} else if (options.width >= 420) {
+			expect(delegated?.text).toContain("委派中 2");
+		}
 		if (options.expanded) {
 			// Unfolded cards are taller than one line; the folded ones are all one line.
 			expect(cards[1]?.measured).toBeGreaterThan(cards[4]?.measured ?? 0);

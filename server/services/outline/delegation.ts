@@ -82,6 +82,8 @@ import { blockTitle, parseAddress, TASK_BOX, type TaskStatus } from "@shared/out
 import {
 	OUTLINE_REPORT_NOTE_HEAD_RE,
 	OUTLINE_REPORT_NOTE_WINDOW,
+	type OutlineReportNote,
+	readOutlineReportNote,
 } from "@shared/outline-report-note";
 import { eq } from "drizzle-orm";
 import { readDisplayNames } from "./access-reads";
@@ -1327,7 +1329,9 @@ async function noteFor(
 
 /**
  * What a delivery of a delegated subagent's result hands on: the result with the note at its end
- * (one already there replaced). The run service calls this where it delivers (`run.ts`).
+ * (one already there replaced), and the note's head as data (null when no note was written) for
+ * the Agent call's card (outline P2 PR 9b). The run service calls this where it delivers
+ * (`run.ts`).
  */
 export async function deliverDelegatedResult(args: {
 	subagentId: string;
@@ -1339,7 +1343,7 @@ export async function deliverDelegatedResult(args: {
 	report: string;
 	ending: DelegationRunEnding;
 	principal: string | null;
-}): Promise<string> {
+}): Promise<{ text: string; note: OutlineReportNote | null }> {
 	const note = await attachDelegatedReport({
 		subagentId: args.subagentId,
 		delegated: args.delegated,
@@ -1354,5 +1358,5 @@ export async function deliverDelegatedResult(args: {
 		});
 		return "";
 	});
-	return withDelegationNote(args.delivered, note);
+	return { text: withDelegationNote(args.delivered, note), note: readOutlineReportNote(note) };
 }

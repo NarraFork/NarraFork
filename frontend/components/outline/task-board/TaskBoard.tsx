@@ -73,7 +73,9 @@ import {
 	useUpdateBoardTask,
 } from "../../../hooks/useTaskBoard";
 import { ApiError, api } from "../../../lib/api";
+import { observePageLifecycle } from "../../../lib/page-lifecycle";
 import { ensureTypographyCssVars, TYPE_ROLE_STYLE } from "../../../lib/typography-css-vars";
+import { useEditorPanelVisible } from "../../narrator/narrator-panel-visibility";
 import { DiffEntry } from "../OutlinePendingPanel";
 
 // Task text paints with the reader's typography variables (TYPE_ROLE_STYLE).
@@ -173,13 +175,19 @@ const markKey = (task: Pick<OutlineBoardTask, "id" | "versionSeq">) =>
 /** How long the board gathers marks seen before it tells the server, in one request. */
 export const NEWLY_DONE_SEEN_FLUSH_MS = 600;
 
-/** A board read with the given tasks' 「新完成」 dropped (the reader has seen them). */
+/** How often a mark in view but hidden by its host (nothing said so) is looked at again. */
+const NEWLY_DONE_RECHECK_MS = 1000;
+
+/**
+ * A board read with 「新完成」 dropped from the tasks the reader saw, each at the version seen
+ * (`markKey`): a version read since is left as the server marked it.
+ */
 export function withoutNewlyDone(
 	board: OutlineTaskBoardResponse,
-	ids: ReadonlySet<string>,
+	seen: ReadonlySet<string>,
 ): OutlineTaskBoardResponse {
 	const strip = (task: OutlineBoardTask): OutlineBoardTask => {
-		if (!task.newlyDone || !ids.has(task.id)) return task;
+		if (!task.newlyDone || !seen.has(markKey(task))) return task;
 		const { newlyDone: _seen, ...rest } = task;
 		return rest;
 	};
@@ -201,6 +209,8 @@ export function withoutNewlyDone(
  */
 function useNewlyDoneMarks(tasks: readonly OutlineBoardTask[]) {
 	const queryClient = useQueryClient();
+	// The board is on screen: its dock tab is the shown one and the page is in the foreground.
+	const visible = useEditorPanelVisible();
 	const [shown, setShown] = useState<ReadonlySet<string>>(() => new Set());
 	useEffect(() => {
 		const marked = tasks.filter((task) => task.newlyDone).map(markKey);
@@ -209,88 +219,111 @@ function useNewlyDoneMarks(tasks: readonly OutlineBoardTask[]) {
 	const pending = useRef(new Map<string, number>());
 	const told = useRef(new Set<string>());
 	const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const flush = useCallback(() => {
-		if (timer.current) clearTimeout(timer.current);
-		timer.current = null;
-		const all = [...pending.current].map(([id, versionSeq]) => ({ id, versionSeq }));
-		pending.current.clear();
-		// A request names at most so many; a board seldom shows more at once.
-		const size = OUTLINE_TASK_BOARD_LIMITS.seenPerRequest;
-		for (let start = 0; start < all.length; start += size) {
-			const batch = all.slice(start, start + size);
-			const ids = new Set(batch.map((task) => task.id));
-			api
-				.markBoardTasksSeen({ tasks: batch })
-				.then(() =>
-					queryClient.setQueriesData<OutlineTaskBoardResponse>(
-						{ queryKey: taskBoardKeys.all },
-						(board) => (board?.sections ? withoutNewlyDone(board, ids) : board),
-					),
-				)
-				.catch(() => {
-					// Not recorded: told again the next time they are seen.
-					for (const task of batch) told.current.delete(markKey(task));
-				});
-		}
-	}, [queryClient]);
+	const flush = useCallback(
+		(options: { keepalive?: boolean } = {}) => {
+			if (timer.current) clearTimeout(timer.current);
+			timer.current = null;
+			const all = [...pending.current].map(([id, versionSeq]) => ({ id, versionSeq }));
+			pending.current.clear();
+			// A request names at most so many; a board seldom shows more at once.
+			const size = OUTLINE_TASK_BOARD_LIMITS.seenPerRequest;
+			for (let start = 0; start < all.length; start += size) {
+				const batch = all.slice(start, start + size);
+				const keys = new Set(batch.map(markKey));
+				api
+					.markBoardTasksSeen({ tasks: batch }, options)
+					.then(() =>
+						queryClient.setQueriesData<OutlineTaskBoardResponse>(
+							{ queryKey: taskBoardKeys.all },
+							(board) => (board?.sections ? withoutNewlyDone(board, keys) : board),
+						),
+					)
+					.catch(() => {
+						// Not recorded: told again the next time they are seen.
+						for (const task of batch) told.current.delete(markKey(task));
+					});
+			}
+		},
+		[queryClient],
+	);
 	const seen = useCallback(
 		(task: OutlineBoardTask) => {
 			const key = markKey(task);
 			if (told.current.has(key)) return;
 			told.current.add(key);
 			pending.current.set(task.id, task.versionSeq);
-			timer.current ??= setTimeout(flush, NEWLY_DONE_SEEN_FLUSH_MS);
+			timer.current ??= setTimeout(() => flush(), NEWLY_DONE_SEEN_FLUSH_MS);
 		},
 		[flush],
 	);
 	useEffect(() => () => flush(), [flush]);
+	// A page closed or sent to the background right after a mark was seen still records it.
+	useEffect(() => observePageLifecycle({ onHidden: () => flush({ keepalive: true }) }), [flush]);
 	const isNew = useCallback(
 		(task: OutlineBoardTask) =>
 			task.status === "done" && (task.newlyDone === true || shown.has(markKey(task))),
 		[shown],
 	);
-	return { isNew, seen };
+	return { isNew, seen, visible };
 }
 
 type NewlyDoneMarks = ReturnType<typeof useNewlyDoneMarks>;
 
 /**
- * 「新完成」 on a task's row: reported seen once the row is on screen and a frame of the page has
- * been shown (without IntersectionObserver, once it is drawn).
+ * 「新完成」 on a task's row: reported seen once it is on screen. That is: the board is shown (its
+ * dock tab is the visible one, the page in the foreground: `visible`; a board in a tab behind
+ * another stays mounted, hidden), the row intersects the viewport, and in the frame after that
+ * the page is visible and nothing hides the row (`checkVisibility`; a host that hides it without
+ * saying so is looked at again every second while the row stays in view). The board shown again
+ * looks again at once. Without IntersectionObserver, once it is drawn while shown.
  */
 function NewlyDoneBadge({
 	task,
+	visible,
 	onSeen,
 }: {
 	task: OutlineBoardTask;
+	visible: boolean;
 	onSeen: (task: OutlineBoardTask) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const ref = useRef<HTMLDivElement>(null);
 	useEffect(() => {
 		const element = ref.current;
-		if (!element) return;
+		if (!element || !visible) return;
+		const shown = () =>
+			document.visibilityState === "visible" &&
+			element.checkVisibility?.({ visibilityProperty: true, opacityProperty: true }) !== false;
 		if (typeof IntersectionObserver === "undefined") {
-			onSeen(task);
+			if (shown()) onSeen(task);
 			return;
 		}
-		let visible = false;
+		let intersecting = false;
 		let frame = 0;
-		const observer = new IntersectionObserver((entries) => {
-			visible = entries.some((entry) => entry.isIntersecting);
+		let retry: ReturnType<typeof setTimeout> | undefined;
+		const check = () => {
 			cancelAnimationFrame(frame);
+			clearTimeout(retry);
+			if (!intersecting) return;
 			// A frame runs only while the page is shown: a board opened in a hidden tab waits for it.
-			if (visible)
-				frame = requestAnimationFrame(() => {
-					if (visible) onSeen(task);
-				});
+			frame = requestAnimationFrame(() => {
+				if (!intersecting) return;
+				if (shown()) onSeen(task);
+				// Hidden by a host that does not say so (its `visibility: hidden`): look again later.
+				else retry = setTimeout(check, NEWLY_DONE_RECHECK_MS);
+			});
+		};
+		const observer = new IntersectionObserver((entries) => {
+			intersecting = entries.some((entry) => entry.isIntersecting);
+			check();
 		});
 		observer.observe(element);
 		return () => {
 			cancelAnimationFrame(frame);
+			clearTimeout(retry);
 			observer.disconnect();
 		};
-	}, [task, onSeen]);
+	}, [task, visible, onSeen]);
 	return (
 		<Tooltip label={t("board.newlyDoneHint")} withinPortal openDelay={300} multiline maw={260}>
 			<Badge ref={ref} size="xs" variant="light" color="green" data-testid="task-badge-newly-done">
@@ -610,7 +643,9 @@ function TaskRow({
 						{task.title}
 					</Text>
 					<Group gap={4}>
-						{newly.isNew(task) && <NewlyDoneBadge task={task} onSeen={newly.seen} />}
+						{newly.isNew(task) && (
+							<NewlyDoneBadge task={task} visible={newly.visible} onSeen={newly.seen} />
+						)}
 						{task.humanCreated && (
 							<Badge size="xs" variant="light" color="indigo" data-testid="task-badge-human">
 								{t("board.humanCreated")}

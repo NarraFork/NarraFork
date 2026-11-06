@@ -2085,7 +2085,7 @@
 			"interrupt_task_guard": "Interrupted-task reminder",
 			"outline_task_turn_end": "Task reminder at turn end",
 			"outline_task_edit": "Task changes by people",
-			"outline_task_finished": "Your tasks finished elsewhere",
+			"outline_task_finished": "Tasks this session created were finished elsewhere",
 			"tutorial_lesson": "Tutorial lesson",
 			"turn_nudge": "Turn budget",
 			"broken_call": "Invalid tool call",

@@ -9,6 +9,7 @@ import {
 	noteLinkTitle,
 	OUTLINE_REPORT_NOTE_WINDOW,
 	readDelegationStarted,
+	readOutlineDelegationMetadata,
 	readOutlineReportNote,
 	readSubagentDelegation,
 } from "../outline-report-note";
@@ -82,6 +83,22 @@ describe("readOutlineReportNote", () => {
 		expect(readOutlineReportNote(text)?.status).toBe("current");
 		// The last head line is malformed: no note, even though a valid one is quoted before it.
 		expect(readOutlineReportNote(`${CURRENT}\n\n<outline_report task="a/b">`)).toBeNull();
+		// A head line quoted at the end, without the note's closing line: not a note.
+		expect(readOutlineReportNote(`Report.\n${LATE.split("\n")[0]}\nmore text`)).toBeNull();
+		// A note quoted mid-report, the text going on after it: not the result's note.
+		expect(readOutlineReportNote(`The tool said:\n${LATE}\nand then I fixed it.`)).toBeNull();
+	});
+
+	test("the run service's file-change block after the note does not hide it", () => {
+		const files = Array.from(
+			{ length: 60 },
+			(_, i) => `- ${"/very/long/path/to/".repeat(4)}file-${i}.ts +12 -3`,
+		).join("\n");
+		const text = `Report.\n\n${LATE}\n\n<subagent_file_changes>\n${files}\n</subagent_file_changes>`;
+		expect(text.length - text.indexOf("<outline_report")).toBeGreaterThan(
+			OUTLINE_REPORT_NOTE_WINDOW,
+		);
+		expect(readOutlineReportNote(text)?.reason).toBe("taken_over");
 	});
 
 	test("only the text's end is read, however long the report", () => {
@@ -114,14 +131,65 @@ describe("the task a call was sent with", () => {
 			title: "Fix the refresh race",
 		});
 		expect(
-			readDelegationStarted("Delegated [[Kx81mPqa/Ab3dEf9Q]] to this agent (claim generation 1)"),
+			readDelegationStarted(
+				"<background_task_id>bg1</background_task_id>\nDelegated [[Kx81mPqa/Ab3dEf9Q]] to this agent (claim generation 1)",
+			),
 		).toEqual({ address: "Kx81mPqa/Ab3dEf9Q", title: null });
-		expect(readDelegationStarted("Delegated nothing")).toBeNull();
+		expect(
+			readDelegationStarted("<background_task_id>bg1</background_task_id>\nNo line"),
+		).toBeNull();
+		// Only in a background launch: a report quoting the line names nothing.
+		expect(
+			readDelegationStarted(
+				"Report.\nDelegated [[Kx81mPqa/Ab3dEf9Q|Quoted]] to this agent (claim generation 1)",
+			),
+		).toBeNull();
 	});
 
 	test("a link's title in the note", () => {
 		expect(noteLinkTitle(CURRENT, "Kx81mPqa/Ab3dEf9Q")).toBe("Fix the refresh race");
 		expect(noteLinkTitle(LATE, "Kx81mPqa/Ab3dEf9Q")).toBeNull();
+	});
+
+	test("the call's metadata first: whatever cut the text, and a quoted note never counts", () => {
+		const meta = (extra: Record<string, unknown> = {}) => ({
+			outlineDelegation: {
+				task: "Kx81mPqa/Ab3dEf9Q",
+				title: "Fix the refresh race",
+				generation: 1,
+				...extra,
+			},
+		});
+		// A live projection cut the text to 2000 characters: the note is gone, the metadata is not.
+		const cut = { _truncated: true, preview: "x".repeat(2000) };
+		expect(
+			readSubagentDelegation(
+				"Ab3dEf9Q",
+				JSON.stringify(cut),
+				meta({ status: "late", reason: "ended" }),
+			),
+		).toEqual({ title: "Fix the refresh race", address: "Kx81mPqa/Ab3dEf9Q", late: "ended" });
+		// The writer's note is missing (the attachment failed): a note the report quotes at its end
+		// is not read when the metadata says there was none.
+		expect(readSubagentDelegation("Ab3dEf9Q", `Report.\n\n${LATE}`, meta())?.late).toBeNull();
+		// Without metadata (a call from before it), the text is all there is.
+		expect(readSubagentDelegation("Ab3dEf9Q", `Report.\n\n${LATE}`)?.late).toBe("taken_over");
+		// A gone task is late; a failure to attach is not.
+		expect(readSubagentDelegation("x", "", meta({ status: "late", reason: "gone" }))?.late).toBe(
+			"gone",
+		);
+		expect(readSubagentDelegation("x", "", meta({ status: "not_attached" }))?.late).toBeNull();
+		// Malformed metadata is ignored.
+		expect(readOutlineDelegationMetadata({ outlineDelegation: { title: "no task" } })).toBeNull();
+		expect(readOutlineDelegationMetadata(null)).toBeNull();
+		expect(
+			readOutlineDelegationMetadata(meta({ status: "maybe", reason: "because", generation: "2" })),
+		).toEqual({ task: "Kx81mPqa/Ab3dEf9Q", title: "Fix the refresh race", generation: 0 });
+	});
+
+	test("a quoted launch line in a foreground report does not rename the task", () => {
+		const report = `Report.\nDelegated [[Kx81mPqa/Ab3dEf9Q|Wrong title]] to this agent (claim generation 1)\n\n${CURRENT}`;
+		expect(readSubagentDelegation("Ab3dEf9Q", report)?.title).toBe("Fix the refresh race");
 	});
 
 	test("what the card shows: from the note, from the launch line, else what the call wrote", () => {

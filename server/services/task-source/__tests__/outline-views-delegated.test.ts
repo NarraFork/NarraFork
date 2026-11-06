@@ -4,11 +4,12 @@
  * each with the subagent doing it; at most ten lines, the rest counted; the view is there even
  * when everything open is delegated; a lapsed lease or a claim handed back is not listed; another
  * session's subagent is not this session's; the reader's summary carries the section; and a
- * subagent ending (its claim handed back, which is no commit) makes the cached view read again.
+ * subagent ending (its claim handed back, which is no commit) makes the cached view read again,
+ * that view only (the behavior view and another session's views stay cached).
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../../db";
 import { narrators, outlineTaskClaims } from "../../../db/schema";
@@ -19,7 +20,12 @@ import { ensureSessionSpace } from "../../outline/spaces";
 import { outlineStore } from "../../outline/store";
 import { type OutlineOp, writeOutline } from "../../outline/write";
 import { invalidateTaskBackend, taskSourceForNarrator } from "../index";
-import { OUTLINE_VIEW_LIMITS, outlineTasksView, resetOutlineViewCache } from "../outline-views";
+import {
+	OUTLINE_VIEW_LIMITS,
+	outlineBehaviorView,
+	outlineTasksView,
+	resetOutlineViewCache,
+} from "../outline-views";
 
 const NOW = "2026-11-06T00:00:00.000Z";
 
@@ -212,6 +218,50 @@ describe("the delegated section", () => {
 		const after = (await outlineTasksView(root, "en")) ?? "";
 		expect(after).not.toContain(DELEGATED_HEADING);
 		expect(after).toContain(`\`${back.address}\` Handed back`);
+	});
+
+	test("a subagent starting or ending reads again the session's current-tasks views only", async () => {
+		const root = await session();
+		const other = await session("Other");
+		const helper = await subagentOf(root);
+		await seed(root, ["Delegated"]);
+		await seed(other, ["Elsewhere"]);
+		for (const id of [root, other]) {
+			await outlineTasksView(id, "en");
+			await outlineTasksView(id, "zh-CN");
+			await outlineBehaviorView(id, "en");
+		}
+		const claims = spyOn(outlineStore, "listSessionTaskClaims");
+		const aliases = spyOn(outlineStore, "findAliasOwners");
+		try {
+			for (const type of ["narrator:subagent_started", "narrator:subagent_completed"] as const) {
+				claims.mockClear();
+				aliases.mockClear();
+				eventBus.emit(
+					type === "narrator:subagent_started"
+						? {
+								type,
+								narratorId: helper,
+								parentNarratorId: root,
+								toolUseId: "tu-1",
+								subagentType: "general",
+							}
+						: { type, narratorId: helper, parentNarratorId: root, toolUseId: "tu-1" },
+				);
+				for (const id of [root, other]) {
+					await outlineTasksView(id, "en");
+					await outlineTasksView(id, "zh-CN");
+					await outlineBehaviorView(id, "en");
+				}
+				// The session's view, in both languages; not the other session's, nor a behavior view
+				// (each view read looks up the behavior page once: the two current-tasks views only).
+				expect(claims.mock.calls.map(([id]) => id)).toEqual([root, root]);
+				expect(aliases).toHaveBeenCalledTimes(2);
+			}
+		} finally {
+			claims.mockRestore();
+			aliases.mockRestore();
+		}
 	});
 
 	test("a subagent has no view of its own", async () => {
