@@ -240,18 +240,23 @@ export function usePermissionSlots({
  * No `onReflect` and no `reflectionDeadline`: an async question arms no automatic
  * answer timer, so offering "let the model answer" here would advertise a mechanism
  * that is not running.
+ *
+ * A form is marked as the transcript's (permission-textarea-typography.tsx, D49); a summary
+ * is not. It paints no textarea of its own, and the one in its Details modal is not in the
+ * transcript: the modal portals out of it, but context would follow, and the same form would
+ * look different opened here than from the question inbox (D49 review round 1 S2).
  */
 export function buildAsyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
-	const node = asyncQuestionNode(slot);
+	if (slot.question && (slot.summaryOnly || slot.question.status !== "open" || slot.readOnly))
+		return <AsyncQuestionSummary question={slot.question} readOnly={slot.readOnly} />;
+	const node = asyncQuestionForm(slot);
 	return node === null ? null : (
 		<TranscriptPermissionTypography>{node}</TranscriptPermissionTypography>
 	);
 }
 
-function asyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
+function asyncQuestionForm(slot: AsyncQuestionSlot): ReactNode {
 	if (slot.question) {
-		if (slot.summaryOnly || slot.question.status !== "open" || slot.readOnly)
-			return <AsyncQuestionSummary question={slot.question} readOnly={slot.readOnly} />;
 		return <AsyncQuestionDetail narratorId={slot.question.narratorId} questionId={slot.id} />;
 	}
 	if (slot.questions.length === 0) return null;

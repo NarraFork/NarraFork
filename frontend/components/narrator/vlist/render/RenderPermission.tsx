@@ -51,11 +51,12 @@ import type { PreparedInlineBlock } from "../prepared-block";
 import { FragmentGap, LineFragments } from "./line-fragments";
 
 /**
- * The text of the faux textareas below: the live textarea's size and row in the transcript
- * (`TYPE_ROLE_STYLE.textarea`, D49) — the box's height is the measured one either way — with
- * Mantine's own where the `--nf-type-*` variables are not published.
+ * The text of the faux textareas below: the live textarea's size, row and letter spacing in the
+ * transcript (`TYPE_ROLE_STYLE.textarea`, D49) — the box's height is the measured one either
+ * way — with Mantine's own where the `--nf-type-*` variables are not published.
  */
 const TEXTAREA_TEXT = `var(${TYPOGRAPHY_CSS_VARS.xsSize}, var(--mantine-font-size-xs))/var(${TYPOGRAPHY_CSS_VARS.xsBaseLine}, 1.55)`;
+const TEXTAREA_LETTER_SPACING = `var(${TYPOGRAPHY_CSS_VARS.letterSpacing}, normal)`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared inline-line materialization (mirrors RenderMarkdown InlineBlockView).
@@ -330,6 +331,7 @@ function AskFixedRow({
 							boxSizing: "border-box",
 							padding: "4.5px 8px",
 							font: `${TEXTAREA_TEXT} var(--mantine-font-family)`,
+							letterSpacing: TEXTAREA_LETTER_SPACING,
 							color: "var(--mantine-color-placeholder)",
 							overflow: "hidden",
 						}}
@@ -518,6 +520,7 @@ function PermFixedRow({
 							boxSizing: "border-box",
 							padding: "5.5px 12px",
 							font: `${TEXTAREA_TEXT} monospace`,
+							letterSpacing: TEXTAREA_LETTER_SPACING,
 							color: "var(--mantine-color-text)",
 							overflow: "hidden",
 						}}
@@ -543,6 +546,7 @@ function PermFixedRow({
 							boxSizing: "border-box",
 							padding: "4.5px 8px",
 							font: `${TEXTAREA_TEXT} var(--mantine-font-family)`,
+							letterSpacing: TEXTAREA_LETTER_SPACING,
 							color: "var(--mantine-color-placeholder)",
 							overflow: "hidden",
 						}}

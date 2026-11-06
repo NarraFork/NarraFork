@@ -1,8 +1,8 @@
 /**
  * A permission card's textareas paint the rows the transcript's height model counts (D49), in
  * Chromium, for every card that has one: a plain approval (Bash), the plan-file approval while
- * its plan is edited, an outline plan's approval and an AskUserQuestion — at 328, 360 and 720px,
- * in en and zh-CN, at 100% and 130% type and at the default and a 150% line height.
+ * its plan is edited, an outline plan's approval and an AskUserQuestion — at 288, 328, 360 and
+ * 720px, in en and zh-CN, at 100%, 130% and 180% type and at the default and a 150% line height.
  *
  * The model counts each textarea row as `typographyMetrics().line.xsBase` (22px at the default)
  * and the vlist reserves that before the card paints. Mantine's textarea used to paint 1.55 × its
@@ -11,13 +11,20 @@
  *
  *   - every textarea is exactly the model's height for the rows it shows, on the model's line
  *     box and font size — also at the smallest line height, below Mantine's own min-height;
+ *   - the empty feedback box shows the rows the vlist predicted for it: its text follows the
+ *     reader's font size, so its placeholder wraps at a large size in a narrow card, and the
+ *     prediction must count that row (review round 1 S1: a plain approval's prediction kept one
+ *     row, and the card grew by a row after it painted);
  *   - the plain approval and the plan editor, whose other regions are fixed rows, are exactly as
  *     tall as measured, mounted as the transcript mounts them; the outline plan's approval is too,
  *     inside `.nf-type-scope` as its own suite paints it (its summary line is Mantine text, which
  *     only that scope maps onto the reader's typography);
  *   - moving the typography under a mounted card resizes its textarea (a slider drag changes only
  *     the CSS variables, which by themselves re-render nothing);
- *   - the same card outside the transcript (the question inbox) keeps Mantine's textarea.
+ *   - the same card outside the transcript (the question inbox) keeps Mantine's textarea, and so
+ *     does an async question's form in the Details modal its transcript summary opens (review
+ *     round 1 S2: the modal portals out of the transcript, but context followed it);
+ *   - the zero-DOM copies' stand-in boxes paint the live textarea's text, letter spacing included.
  *
  * The AskUserQuestion card is checked by its textarea only: the vlist reserves nothing for it
  * (its height stays on the dynamic path), and its header, options and buttons are Mantine's own.
@@ -133,7 +140,37 @@ function retype(kind: Kind, lng: string, width: number, font: number, line: numb
 	);
 }
 
-/** Every textarea of the card: the model's height for its rows, on the model's line box. */
+function asyncQuestion(view: "form" | "summary", font: number, line: number) {
+	if (!page) throw new Error("no page");
+	return page.evaluate(
+		(...args) =>
+			(window as unknown as FixtureWindow).fixture.asyncQuestion(
+				...(args as Parameters<typeof Fixture.asyncQuestion>),
+			),
+		view,
+		font,
+		line,
+	);
+}
+
+function purePath(font: number, line: number, letterSpacing: number) {
+	if (!page) throw new Error("no page");
+	return page.evaluate(
+		(...args) =>
+			(window as unknown as FixtureWindow).fixture.purePath(
+				...(args as Parameters<typeof Fixture.purePath>),
+			),
+		font,
+		line,
+		letterSpacing,
+	);
+}
+
+/**
+ * Every textarea of the card: the model's height for its rows, on the model's line box; and the
+ * feedback box's rows as the vlist predicted them (the per-textarea check takes its rows from the
+ * paint, so only this one catches a wrong row count).
+ */
 function expectTextareasAsModelled(card: Reading, what: string, count: number): void {
 	expect(card.textareas.length, what).toBe(count);
 	for (const [i, textarea] of card.textareas.entries()) {
@@ -141,6 +178,10 @@ function expectTextareasAsModelled(card: Reading, what: string, count: number): 
 		expect(textarea.line, which).toBe(card.modelLine);
 		expect(textarea.fontSize, which).toBeCloseTo(card.modelFontSize, 5);
 		expect(Math.abs(textarea.painted - textarea.model), which).toBeLessThanOrEqual(0.5);
+		expect(textarea.minHeight, which).toBe(0);
+	}
+	if (card.feedback) {
+		expect(card.feedback.predicted, `${what} feedback rows`).toBe(card.feedback.painted);
 	}
 }
 
@@ -150,7 +191,8 @@ const KINDS: ReadonlyArray<readonly [Kind, number]> = [
 	["outline-plan", 1],
 	["ask", 1],
 ];
-const WIDTHS = [328, 360, 720];
+/** 288 and 180%: the plain approval's placeholder wraps to two rows there (review round 1 S1). */
+const WIDTHS = [288, 328, 360, 720];
 const LANGUAGES = ["en", "zh-CN"];
 /** [font scale, line height] in percent. */
 const TYPOGRAPHY = [
@@ -158,6 +200,7 @@ const TYPOGRAPHY = [
 	[130, 100],
 	[100, 150],
 	[130, 150],
+	[180, 100],
 ] as const;
 
 for (const [kind, count] of KINDS) {
@@ -221,6 +264,38 @@ test("outside the transcript the same card keeps Mantine's textarea", async () =
 			// 12px × Mantine's 1.55, not the reader's 33px row.
 			expect(textarea.line, kind).toBeCloseTo(18.6, 5);
 		}
+	}
+	expect(errors).toEqual([]);
+}, 60_000);
+
+test("an async question's form follows the transcript; its summary's Details modal keeps Mantine's", async () => {
+	// The form, inline in the transcript: the reader's row (33px at a 150% line height).
+	const form = await asyncQuestion("form", 100, 150);
+	expect(form.inModal).toBe(false);
+	expect(form.textareas.length).toBe(1);
+	expect(form.textareas[0]?.line).toBe(form.modelLine);
+	expect(form.modelLine).toBe(33);
+	expect(form.textareas[0]?.minHeight).toBe(0);
+	// The same form opened from the transcript's summary, in its modal: Mantine's own textarea,
+	// as the question inbox opens it.
+	const modal = await asyncQuestion("summary", 100, 150);
+	expect(modal.inModal).toBe(true);
+	expect(modal.textareas.length).toBe(1);
+	expect(modal.textareas[0]?.line).toBeCloseTo(18.6, 5);
+	expect(modal.textareas[0]?.minHeight).toBe(30);
+	expect(modal.textareas[0]?.painted).toBe(30);
+	expect(errors).toEqual([]);
+}, 60_000);
+
+test("the zero-DOM copies' stand-in textareas paint the live textarea's text", async () => {
+	const { standIns, live } = await purePath(130, 150, 25);
+	// The plan editor, the feedback box and the custom answer.
+	expect(standIns.length).toBe(3);
+	expect(live.letterSpacing).toBeGreaterThan(0);
+	for (const [i, standIn] of standIns.entries()) {
+		expect(standIn.fontSize, `stand-in ${i}`).toBeCloseTo(live.fontSize, 5);
+		expect(standIn.line, `stand-in ${i}`).toBe(live.line);
+		expect(standIn.letterSpacing, `stand-in ${i}`).toBeCloseTo(live.letterSpacing, 5);
 	}
 	expect(errors).toEqual([]);
 }, 60_000);

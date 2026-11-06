@@ -504,6 +504,29 @@ describe("measureInlinePermission — feedback rows, decision reason, read-only"
 		expect(five.height).toBe(three.height);
 	});
 
+	it("predicts a plain approval's empty feedback box at its placeholder's rows (D49 review round 1)", async () => {
+		const { predictInlinePermission, FEEDBACK_PLACEHOLDER } = await import(
+			"../vlist-permission-prediction"
+		);
+		const rows = (toolName: string, innerWidth: number, placeholder?: string) =>
+			predictInlinePermission(
+				{ id: "r", toolName, inputJson: { command: "ls", plan: "x" } },
+				{
+					innerWidth,
+					canDecide: true,
+					...(placeholder ? { feedbackPlaceholder: placeholder } : {}),
+				},
+			)?.feedbackRows;
+		// Stub: 0.6 × 12px a character; the box's text area is 22px narrower than the card.
+		const one = Math.ceil(FEEDBACK_PLACEHOLDER.length * 7.2) + 22;
+		for (const toolName of ["Bash", "ExitPlanMode"]) {
+			expect(rows(toolName, one + 40), toolName).toBe(1);
+			expect(rows(toolName, one - 40), toolName).toBe(2);
+			expect(rows(toolName, 60), toolName).toBe(3);
+			expect(rows(toolName, one - 40, "短"), toolName).toBe(1);
+		}
+	});
+
 	it("adds decision-reason lines above the feedback textarea", async () => {
 		const { measureInlinePermission } = await import("./measure-permission");
 		const c = await livePermissionConstants();
