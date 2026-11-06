@@ -399,7 +399,8 @@ async function main(): Promise<void> {
 	);
 	p();
 	p("Kinds: http = API request, ws = WebSocket message, agent = narrator run, tool = tool call,");
-	p("worker = db-worker task, bg = no request context (label is the calling code location).");
+	p("worker = db-worker task, bg = no request context. Its label is the calling code location,");
+	p("or `async <table>` when the query ran in a continuation whose stack has no app frame left.");
 	p("Span SQL time excludes child spans (tool calls inside an agent run are counted separately).");
 	p();
 	p("## By kind");

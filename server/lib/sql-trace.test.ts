@@ -117,6 +117,16 @@ describe("instrumentSqliteConnection", () => {
 		expect(String(bg?.label)).toContain("sql-trace.test.ts");
 	});
 
+	test("falls back to the target table when the app frame is lost in a continuation", async () => {
+		const db = openDb();
+		const t = sqliteTable("t", { id: integer("id").primaryKey(), name: text("name") });
+		const orm = drizzle({ client: db });
+		// Awaiting an ORM query runs it in a promise continuation whose stack has no app frame.
+		await orm.select().from(t);
+		const bg = readRecords().filter((r) => r.t === "span" && r.kind === "bg");
+		expect(bg.map((r) => r.label)).toContain("async t");
+	});
+
 	test("records slow statements individually and full mode records every call", () => {
 		configureSqlTraceForTest({ mode: "full", dir });
 		const db = openDb();

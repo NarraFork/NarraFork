@@ -12,6 +12,9 @@
  * Record types (one JSON object per line, `t` is the discriminator):
  * - `meta`  process/thread start: mode, pid, threadId.
  * - `stmt`  fingerprint catalog: `h` (hash) → normalised `sql`. Emitted once per process per day.
+ * Background SQL (no active span) is grouped by its calling code location, or by `async <table>`
+ * when the statement ran in a promise continuation and no application frame survives.
+ *
  * - `span`  aggregate for one span (or a time window of a long/background span):
  *           id, parent, kind, label, ts, ms (wall, on end), n (calls), sqlMs, maxMs, txN, txMs,
  *           a (attrs), stmts [{h,n,ms,max,rows}]. A span may be emitted several times
@@ -399,14 +402,24 @@ function captureCallsite(): string {
 		const rel = idx >= 0 ? file.slice(idx + 1) : (file.split("/").slice(-2).join("/") ?? file);
 		return `${match[1] ? `${match[1]}@` : ""}${rel}:${match[3]}`;
 	}
-	return "unknown";
+	return "";
 }
 
-function backgroundSpanFor(key: string): SqlTraceSpan {
+/**
+ * Fallback label for statements whose application frame is gone from the stack: a query that
+ * only runs inside a promise continuation (typical for `await db.select()…`) has nothing but
+ * ORM frames left, so the SQL's target table is the best available attribution.
+ */
+function tableHintFor(sql: string): string {
+	const match = /\b(?:from|into|update|join)\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/i.exec(sql);
+	return match?.[1] ? `async ${match[1]}` : "async unknown";
+}
+
+function backgroundSpanFor(key: string, sqlText?: string): SqlTraceSpan {
 	const s = state();
 	let cached = s.callsites.get(key);
 	if (!cached || cached.seen % CALLSITE_RESAMPLE_EVERY === 0) {
-		const site = captureCallsite();
+		const site = captureCallsite() || tableHintFor(sqlText ?? "");
 		if (!cached) {
 			if (s.callsites.size >= MAX_FINGERPRINT_CACHE) s.callsites.clear();
 			cached = { site, seen: 0 };
@@ -430,7 +443,7 @@ function record(sql: string, ms: number, rows: number, op: string): void {
 	if (typeof sql !== "string") return;
 	ensureStarted();
 	const fp = fingerprint(sql);
-	const span = s.als.getStore() ?? backgroundSpanFor(fp.h);
+	const span = s.als.getStore() ?? backgroundSpanFor(fp.h, fp.text);
 	span.add(fp.h, ms, rows);
 	if (s.mode === "full" || ms >= s.slowMs) {
 		push({ t: "sql", at: Date.now(), span: span.id, h: fp.h, op, ms: round(ms), rows });
@@ -444,7 +457,7 @@ function recordTx(ms: number): void {
 	// Transactions are far rarer than statements, so resolving the call site here is affordable
 	// whenever it is actually needed (background attribution or a slow-transaction record).
 	const site = slow || !current ? captureCallsite() : "";
-	const span = current ?? backgroundSpanFor(`tx:${site}`);
+	const span = current ?? backgroundSpanFor(`tx:${site || "async tx"}`);
 	span.addTx(ms);
 	if (slow) push({ t: "tx", at: Date.now(), span: span.id, ms: round(ms), site });
 }
