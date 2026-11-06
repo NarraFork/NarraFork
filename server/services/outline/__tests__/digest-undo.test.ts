@@ -5,9 +5,9 @@
  *
  * What must hold:
  *   - only the person the decision was made for may undo it: anyone else who can read the space
- *     gets 403, anyone who cannot gets 404 (as for an unknown commit);
- *   - an ordinary commit is not a decision made in anyone's name (403);
- *   - the person needs write access to the space (403 without);
+ *     gets 403 (`…_NOT_YOURS`), anyone who cannot gets 404 (as for an unknown commit);
+ *   - an ordinary commit is not a decision made in anyone's name (403 `…_NOT_YOURS`);
+ *   - the person needs write access to the space (403 `…_READ_ONLY` without);
  *   - a decision already undone, or changed since so that reverting would not take it back, is
  *     refused (409) and nothing is written;
  *   - undoing puts the decision back: the plan is being planned again, the question is open
@@ -208,7 +208,8 @@ describe("undoing a decision made in the person's name", () => {
 			blockIds: [question],
 			round: null,
 		});
-		expect((await undo(bob, commit.id)).status).toBe(403);
+		const notHis = await undo(bob, commit.id);
+		expect([notHis.status, notHis.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_NOT_YOURS"]);
 		expect((await undo(carol, commit.id)).status).toBe(404);
 		expect((await undo(alice, "no-such-commit")).status).toBe(404);
 		const done = await undo(alice, commit.id);
@@ -248,8 +249,10 @@ describe("undoing a decision made in the person's name", () => {
 		const reader = await user("reader");
 		await grant("project", projectId, reader, "read");
 		const { commit } = await relayedAnswer(reader);
-		expect((await undo(reader, commit.id)).status).toBe(403);
-		expect((await undo(alice, commit.id)).status).toBe(403);
+		const readOnly = await undo(reader, commit.id);
+		expect([readOnly.status, readOnly.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_READ_ONLY"]);
+		const notHers = await undo(alice, commit.id);
+		expect([notHers.status, notHers.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_NOT_YOURS"]);
 	});
 
 	test("an ordinary commit is no decision made in anyone's name", async () => {
@@ -262,7 +265,8 @@ describe("undoing a decision made in the person's name", () => {
 				(await store.getCommit(edit.commit?.id as string)) as OutlineCommitRow,
 			),
 		).toBeNull();
-		expect((await undo(alice, edit.commit?.id as string)).status).toBe(403);
+		const ordinary = await undo(alice, edit.commit?.id as string);
+		expect([ordinary.status, ordinary.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_NOT_YOURS"]);
 	});
 
 	test("the plan review's draft approval: the plan is being planned again; not once changed since", async () => {
@@ -354,9 +358,12 @@ describe("undoing a decision made in the person's name", () => {
 				?.kind,
 		).toBe("confirmation");
 		expect((await undo(bob, commitId)).status).toBe(403);
+		expect(pending?.digestSeenAt).toBeNull();
 		const done = await undo(alice, commitId);
 		expect(done.status).toBe(200);
 		expect((await store.getBlock(step))?.content).toBe("Step");
+		// Taken back, so seen: it leaves the confirmations still to acknowledge.
+		expect((await store.getPending([pending?.id as string]))[0]?.digestSeenAt).not.toBeNull();
 		expect((await undo(alice, commitId)).status).toBe(409);
 	});
 });

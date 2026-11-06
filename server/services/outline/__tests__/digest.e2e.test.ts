@@ -525,6 +525,10 @@ describe("reports: the acceptance", () => {
 		);
 		// Other: bob's revert.
 		expect(a.other.map((o) => [o.event, o.actor.id])).toEqual([["revert", bob.id]]);
+		// The people and sessions the items name: usernames, and her own session's title.
+		expect(a.names.users[bob.id]).toBe(bob.username);
+		expect(a.names.users[alice.id]).toBe(alice.username);
+		expect(a.names.sessions[agent]).toBe(`Session ${agent.slice(0, 5)}`);
 		await expectLinksResolve(alice.id, a);
 		// Nothing of the next day, nothing of text in the stored items.
 		const stored = JSON.stringify(aliceDay.items);
@@ -541,6 +545,9 @@ describe("reports: the acceptance", () => {
 		expect(b4.tasks.map((t) => [t.event, t.forYou, t.newlyDoneForYou])).toEqual([
 			["done", false, false],
 		]);
+		// Alice's session did it; bob may not read it, so it stays unnamed for him.
+		expect(b4.tasks[0]?.executor?.id).toBe(agent);
+		expect(b4.names.sessions).toEqual({});
 		await expectLinksResolve(bob.id, b4);
 
 		// 11-06T12:00Z: 07:00 in New York, bob's 11-05 is due (and dave's in UTC); alice has
@@ -1630,6 +1637,10 @@ describe("reports: the job's bounds", () => {
 		// Two commits read; one page listed per section, the other counted.
 		expect(day.items.knowledge).toHaveLength(1);
 		expect(day.counts.knowledge).toBe(2);
+		// The detail says per space what was counted but not listed (the page's space filter).
+		const shown = await detail(jon.id, day.id);
+		expect(shown.spaces.map((s) => [s.id, s.more])).toEqual([[p.space.id, { knowledge: 1 }]]);
+		expect(shown.more.knowledge).toBe(1);
 		// The range still covers the whole day: the next day continues after it.
 		expect(day.ranges[p.space.id]).toEqual([0, 5]);
 	}, 60_000);

@@ -33,6 +33,8 @@ export interface OutlineViewProps {
 	actions?: ReactNode;
 	/** The host's own back and forward (a dock panel's history; see `OutlineSurface`). */
 	history?: OutlineSurfaceHistory;
+	/** Shown at the top of the home (the outline route's entry to the reports). */
+	homeHeader?: ReactNode;
 }
 
 export function OutlineView({
@@ -46,6 +48,7 @@ export function OutlineView({
 	onMissing,
 	actions,
 	history,
+	homeHeader,
 }: OutlineViewProps) {
 	if (target.kind === "block") {
 		return (
@@ -74,7 +77,7 @@ export function OutlineView({
 				actions={actions}
 			/>
 		) : (
-			<OutlineHome />
+			<OutlineHome header={homeHeader} />
 		);
 	return (
 		<OutlineNavProvider onNavigate={onNavigate} renderLink={renderLink}>

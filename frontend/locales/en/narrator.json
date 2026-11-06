@@ -2428,7 +2428,7 @@
 		"plan_approval": "Plan approval",
 		"reflection": "Reflection · human decision",
 		"outline_decision": "Outline · your decision",
-		"outline_digest": "Outline · confirmed for you"
+		"outline_digest": "Outline · report"
 	},
 	"optimizePrompt": "Optimize prompt",
 	"optimizeCancel": "Cancel optimization",
