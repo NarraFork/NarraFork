@@ -4022,6 +4022,8 @@ const sqliteNarratorPersistence = {
 			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
 			onPersist?: (tx: DbTx) => void;
+			/** Recovery explanations may update only an active row, never a terminal result. */
+			onlyIfActive?: boolean;
 		},
 		messageId?: string,
 		toolCallId?: string,
@@ -4053,6 +4055,11 @@ const sqliteNarratorPersistence = {
 			);
 			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		}
+		if (result.onlyIfActive)
+			conditions.push(
+				ne(narratorToolCalls.status, "success"),
+				ne(narratorToolCalls.status, "fail"),
+			);
 		const affectedToolCalls = db.transaction(
 			(tx) => {
 				const queueMark = syncQueueMark();
@@ -4092,6 +4099,9 @@ const sqliteNarratorPersistence = {
 						executionDeviceId: narratorToolCalls.executionDeviceId,
 					})
 					.all();
+				// Another writer already settled or retired this receipt. A recovery
+				// explanation must not replace it or trigger another publication commit.
+				if (result.onlyIfActive && updated.length === 0) return [];
 				if (expected && updated.length !== 1) {
 					throw new ValidationError(
 						"Tool execution binding is stale or belongs to another narrator",
