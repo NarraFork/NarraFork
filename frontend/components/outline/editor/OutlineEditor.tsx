@@ -211,6 +211,12 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.locked = (name) => t("lock.badge", { name });
 	chromeText.pending = t("pending.badge");
 	chromeText.question = t("editor.questionMark");
+	chromeText.status = {
+		todo: t("page.task.todo"),
+		doing: t("page.task.doing"),
+		done: t("page.task.done"),
+		cancelled: t("page.task.cancelled"),
+	};
 	mapText.more = (count) => t("map.more", { count });
 	mapText.stage = t("map.stage");
 
