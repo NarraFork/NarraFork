@@ -14,6 +14,7 @@
  */
 import { AppError, ForbiddenError, NotFoundError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
+import { logger } from "@server/lib/logger";
 import { titleOf } from "@shared/outline";
 import {
 	OUTLINE_DIGEST_SECTIONS,
@@ -157,12 +158,16 @@ export async function requestOutlineDigestNow(
 	options: { store?: OutlineStore; now?: number; kick?: boolean } = {},
 ): Promise<OutlineDigestNowResponse> {
 	const store = options.store ?? outlineStore;
-	const { queued } = requestOutlineDigestPreview(principal.userId, {
+	const asked = requestOutlineDigestPreview(principal.userId, {
 		...(options.now !== undefined ? { now: options.now } : {}),
 		...(options.kick !== undefined ? { kick: options.kick } : {}),
 	});
 	const [preview] = await store.listDigestHeads(principal.userId, { kind: "today", limit: 1 });
-	return { queued, previewId: preview?.id ?? null };
+	return {
+		queued: asked.queued,
+		reason: asked.queued ? null : asked.reason,
+		previewId: preview?.id ?? null,
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -252,6 +257,9 @@ export async function readOutlineDigestDetail(
 	for (const narratorId of new Set(narratorIds))
 		if (await visible(narratorId)) shownNarrators.add(narratorId);
 	const names = await readDisplayNames({ narratorIds: [...shownNarrators] });
+	// Gone since (an admin is told every session is readable without one being read): not named.
+	for (const narratorId of [...shownNarrators])
+		if (!names.narrators.has(narratorId)) shownNarrators.delete(narratorId);
 	const session = (narratorId: string | null): OutlineDigestSession =>
 		narratorId && shownNarrators.has(narratorId)
 			? { narratorId, title: names.narrators.get(narratorId) ?? null, hidden: false }
@@ -375,8 +383,11 @@ export async function readOutlineDigestDetail(
 	});
 	const actorNamesView: OutlineDigestNames = {
 		users: Object.fromEntries(actorNames.users),
+		// Only sessions that are still there.
 		sessions: Object.fromEntries(
-			readableSessions.map((id) => [id, actorNames.narrators.get(id) ?? null]),
+			readableSessions
+				.filter((id) => actorNames.narrators.has(id))
+				.map((id) => [id, actorNames.narrators.get(id) ?? null]),
 		),
 	};
 
@@ -650,14 +661,22 @@ export async function undoOutlineDelegatedDecision(
 		throw new OutlineDigestUndoError("This decision can no longer be undone: it was changed since");
 	// A confirmation taken back is one the person has seen: it leaves the unacknowledged ones (its
 	// pending row keeps reading as confirmed, so it would otherwise be offered again).
+	// Best effort: the undo is done either way.
 	if (decision.kind === "confirmation") {
-		const [pending] = await store.getPendingByDecisionCommits([commitId]);
-		if (pending)
-			await store.markDelegateConfirmationsSeen(
-				principal.userId,
-				[pending.id],
-				(options.now?.() ?? new Date()).toISOString(),
-			);
+		try {
+			const [pending] = await store.getPendingByDecisionCommits([commitId]);
+			if (pending)
+				await store.markDelegateConfirmationsSeen(
+					principal.userId,
+					[pending.id],
+					(options.now?.() ?? new Date()).toISOString(),
+				);
+		} catch (error) {
+			logger.warn("Outline report: an undone confirmation could not be marked seen", {
+				commitId,
+				error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+			});
+		}
 	}
 	eventBus.emit({ type: "human_attention:changed", userIds: [principal.userId] });
 	return { kind: decision.kind, commit: result.commit, skipped: result.skipped.length };

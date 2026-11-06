@@ -15,13 +15,14 @@
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { OutlineDigestUndoResponse } from "@shared/outline-digest";
 import { Hono } from "hono";
 import { db } from "../../../db";
 import { aclGrants, narrators, projects, users } from "../../../db/schema";
 import { AppError } from "../../../lib/errors";
 import { generateId } from "../../../lib/id";
+import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
 import { outlineRoutes } from "../../../routes/outline";
 import {
@@ -365,5 +366,56 @@ describe("undoing a decision made in the person's name", () => {
 		// Taken back, so seen: it leaves the confirmations still to acknowledge.
 		expect((await store.getPending([pending?.id as string]))[0]?.digestSeenAt).not.toBeNull();
 		expect((await undo(alice, commitId)).status).toBe(409);
+	});
+
+	test("a confirmation is undone even when marking it seen fails (best effort, logged)", async () => {
+		const delegate = await narrator(alice);
+		const made = await write(projectSpace, { kind: "human", id: alice }, alice, [
+			{ op: "insert", tempId: "t", parent: null, content: "Locked", task: { status: "todo" } },
+			{
+				op: "insert",
+				tempId: "s",
+				parent: { tempId: "t" },
+				content: "Step",
+				task: { status: "todo" },
+			},
+		]);
+		const [root, step] = made.results.map((r) => r.blockId) as [string, string];
+		await lockOutlineTask({
+			blockId: root,
+			userId: alice,
+			delegate,
+			store,
+			now: () => new Date(NOW),
+		});
+		const proposed = await write(projectSpace, { kind: "agent", id: agent }, alice, [
+			{ op: "update", block: { id: step }, content: "Step, again" },
+		]);
+		const pendingId = proposed.pending?.id as string;
+		await confirmOutlinePending({
+			pendingId,
+			by: { kind: "agent", narratorId: delegate, responsibleUserId: alice },
+			store,
+			now: () => new Date(NOW),
+		});
+		const commitId = (await store.getPending([pendingId]))[0]?.decisionCommitId as string;
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const failing = {
+				...store,
+				markDelegateConfirmationsSeen: () => Promise.reject(new Error("disk full")),
+			};
+			const done = await undoOutlineDelegatedDecision({ userId: alice, isAdmin: false }, commitId, {
+				store: failing,
+			});
+			expect(done.kind).toBe("confirmation");
+			expect((await store.getBlock(step))?.content).toBe("Step");
+			expect((await store.getPending([pendingId]))[0]?.digestSeenAt).toBeNull();
+			expect(warn.mock.calls.map((c) => c[0])).toContain(
+				"Outline report: an undone confirmation could not be marked seen",
+			);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });

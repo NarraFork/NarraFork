@@ -3,12 +3,14 @@
  * day, newest first ("today so far" on top), filter by space, and make "today so far" on demand.
  *
  *   - The list is heads only, a page of days at a time (cursor); going past the oldest loaded day,
- *     or opening a day by its address, reads the next page.
+ *     or opening a day by its address, reads the next page. A page that fails is not asked for
+ *     again until the reader retries.
  *   - A report's detail is read when it is opened, and opening it marks it read.
  *   - "Make today so far" asks the server (it is made in the background) and reads the list again
  *     every 1.5 s (`OUTLINE_REPORT_POLL_MS`) until the preview's head changes (or a minute passes;
  *     `human_attention_changed` re-reads it too), then opens it.
- *   - What waits for the person now is counted from the inbox list the app has already loaded.
+ *   - What waits for the person now is counted from the inbox list the app has already loaded; the
+ *     host opens the inbox (`onOpenInbox`), so this file stays free of the app's routes.
  *
  * The address holds the day (`d`, a date or `today`) and the space (`space`); the host turns
  * `onSelect` into a navigation.
@@ -24,10 +26,9 @@ import {
 	useOutlineReportList,
 	useRequestOutlineReportNow,
 } from "../../../hooks/useOutlineReports";
-import { NotificationCenterLazyDrawer } from "../../notifications/NotificationCenterLazyDrawer";
 import { DIGEST_TODAY, dayEntries, dayNeighbors, pickDay } from "./digest-model";
 import { OutlineDigestView, useDigestSpaceLabel } from "./OutlineDigestView";
-import { useDigestDayLabel, useDigestPeriod } from "./report-format";
+import { useDigestEntryLabel, useDigestPeriod } from "./report-format";
 
 /** How long the page waits for "today so far" before it says it is not ready yet. */
 const AWAIT_MS = 60_000;
@@ -35,11 +36,13 @@ const ALL_SPACES = "__all__";
 
 type Notice = "madeRecently" | "queueFull" | "notReadyYet" | "makeFailed";
 
-/** What waits for the person now (design §5.2: counted from the inbox list already loaded). */
-function WaitingForYou() {
+/**
+ * What waits for the person's decision now (design §5.2): the outline's rows (questions and changes
+ * to confirm) and plans to approve, counted from the inbox list already loaded.
+ */
+function WaitingForYou({ onOpenInbox }: { onOpenInbox?: () => void }) {
 	const { t } = useTranslation("outline");
 	const attention = useHumanAttention();
-	const [opened, setOpened] = useState(false);
 	const items = loadedHumanAttentionItems(attention.data?.pages);
 	const waiting = items.filter(
 		(item) => item.kind === "outline_decision" || item.kind === "plan_approval",
@@ -48,14 +51,11 @@ function WaitingForYou() {
 	return (
 		<Group gap="xs" wrap="wrap" data-testid="outline-report-waiting">
 			<Text size="sm">{t("report.waiting", { count: waiting })}</Text>
-			<Button size="compact-sm" variant="subtle" onClick={() => setOpened(true)}>
-				{t("report.openInbox")}
-			</Button>
-			<NotificationCenterLazyDrawer
-				opened={opened}
-				onClose={() => setOpened(false)}
-				initialTab="attention"
-			/>
+			{onOpenInbox && (
+				<Button size="compact-sm" variant="subtle" onClick={onOpenInbox}>
+					{t("report.openInbox")}
+				</Button>
+			)}
 		</Group>
 	);
 }
@@ -64,24 +64,28 @@ export function OutlineDigestPage({
 	day,
 	space,
 	onSelect,
+	onOpenInbox,
 }: {
 	/** `YYYY-MM-DD`, or `today`; none: the latest day. */
 	day?: string;
 	/** Only this space's items. */
 	space?: string;
 	onSelect: (next: { d?: string; space?: string }) => void;
+	/** Open the inbox ("needs you"); without it the count is shown alone. */
+	onOpenInbox?: () => void;
 }) {
 	const { t } = useTranslation("outline");
-	const dayLabel = useDigestDayLabel();
+	const entryLabel = useDigestEntryLabel();
 	const period = useDigestPeriod();
 	const spaceLabel = useDigestSpaceLabel();
 	const [awaiting, setAwaiting] = useState<{ since: string | null } | null>(null);
-	const [notice, setNotice] = useState<Notice | null>(null);
+	// A notice is about the day it was given on; it goes when the reader moves to another day.
+	const [notice, setNotice] = useState<{ kind: Notice; day: string | undefined } | null>(null);
 	const list = useOutlineReportList({ poll: awaiting !== null });
 	const pages = list.data?.pages;
 	const entries = useMemo(() => dayEntries(pages), [pages]);
 	const more = !!list.hasNextPage;
-	const picked = pickDay(entries, day, more);
+	const picked = pickDay(entries, day, { more, loaded: list.data !== undefined });
 	const head = picked.entry?.head ?? null;
 	const detail = useOutlineReport(head);
 	const markRead = useMarkOutlineReportRead();
@@ -89,11 +93,21 @@ export function OutlineDigestPage({
 	const marked = useRef(new Set<string>());
 	const preview = pages?.[0]?.preview ?? null;
 
-	// A day by its address may be on a later page of the list.
-	const { fetchNextPage, isFetchingNextPage } = list;
+	// A day by its address may be on a later page of the list. A page that failed is not asked for
+	// again until the reader retries (it would fail the same way, as fast as it can).
+	const { fetchNextPage, isFetchingNextPage, isFetchNextPageError } = list;
 	useEffect(() => {
-		if (picked.searching && !isFetchingNextPage) void fetchNextPage();
-	}, [picked.searching, isFetchingNextPage, fetchNextPage]);
+		if (picked.searching && !isFetchingNextPage && !isFetchNextPageError) void fetchNextPage();
+	}, [picked.searching, isFetchingNextPage, isFetchNextPageError, fetchNextPage]);
+	// Moving away from the day a notice was about clears it (a notice may be given for the day
+	// being opened, before the address has changed to it).
+	const shownDay = useRef(day);
+	useEffect(() => {
+		if (shownDay.current === day) return;
+		const left = shownDay.current;
+		setNotice((current) => (current && current.day === left ? null : current));
+		shownDay.current = day;
+	}, [day]);
 
 	// Opening a report marks it read.
 	const { mutate: markReadMutate } = markRead;
@@ -113,23 +127,28 @@ export function OutlineDigestPage({
 		if (!awaiting) return;
 		const timer = setTimeout(() => {
 			setAwaiting(null);
-			setNotice("notReadyYet");
+			setNotice({ kind: "notReadyYet", day });
 		}, AWAIT_MS);
 		return () => clearTimeout(timer);
-	}, [awaiting]);
+	}, [awaiting, day]);
 
 	const askNow = () => {
 		setNotice(null);
 		const since = preview?.createdAt ?? null;
 		makeNow.mutate(undefined, {
 			onSuccess: (result) => {
-				if (result.queued) setAwaiting({ since });
-				else if (result.previewId) {
-					setNotice("madeRecently");
+				if (result.queued) {
+					setAwaiting({ since });
+					return;
+				}
+				// Not made again: say why, and open the one there is.
+				const kind = result.reason === "queue_full" ? "queueFull" : "madeRecently";
+				if (result.previewId) {
+					setNotice({ kind, day: DIGEST_TODAY });
 					onSelect({ d: DIGEST_TODAY, space });
-				} else setNotice("queueFull");
+				} else setNotice({ kind, day });
 			},
-			onError: () => setNotice("makeFailed"),
+			onError: () => setNotice({ kind: "makeFailed", day }),
 		});
 	};
 
@@ -142,6 +161,7 @@ export function OutlineDigestPage({
 		if (neighbors.older) return go(neighbors.older);
 		if (!neighbors.olderOnNextPage) return;
 		const next = await fetchNextPage();
+		if (next.isError) return;
 		const loaded = dayEntries(next.data?.pages);
 		go(dayNeighbors(loaded, picked.entry.key, false).older);
 	};
@@ -149,7 +169,7 @@ export function OutlineDigestPage({
 	const dayOptions = entries.map((entry) => ({
 		value: entry.key,
 		label: [
-			dayLabel(entry.key),
+			entryLabel(entry),
 			t("report.items", { count: entry.head.itemCount }),
 			entry.head.seenAt ? null : t("report.unread"),
 		]
@@ -185,23 +205,28 @@ export function OutlineDigestPage({
 					{t("report.makeNow")}
 				</Button>
 			</Group>
-			{notice && (
+			{notice && notice.day === day && (
 				<Alert
-					color={notice === "makeFailed" ? "red" : "gray"}
+					color={notice.kind === "makeFailed" ? "red" : "gray"}
 					variant="light"
 					withCloseButton
 					onClose={() => setNotice(null)}
 					data-testid="outline-report-notice"
-					data-notice={notice}
+					data-notice={notice.kind}
 				>
-					<Text size="sm">{t(`report.${notice}`)}</Text>
+					<Text size="sm">{t(`report.${notice.kind}`)}</Text>
 				</Alert>
 			)}
-			<WaitingForYou />
+			<WaitingForYou onOpenInbox={onOpenInbox} />
 			{list.isLoading && <Loader size="sm" />}
-			{list.isError && (
-				<Alert color="red" variant="light">
-					{t("report.loadFailed")}
+			{list.isError && !list.data && (
+				<Alert color="red" variant="light" data-testid="outline-report-list-failed">
+					<Group gap="xs" wrap="wrap">
+						<Text size="sm">{t("report.loadFailed")}</Text>
+						<Button size="compact-xs" variant="light" onClick={() => void list.refetch()}>
+							{t("report.retry")}
+						</Button>
+					</Group>
 				</Alert>
 			)}
 			{list.isSuccess && entries.length === 0 && (
@@ -270,7 +295,38 @@ export function OutlineDigestPage({
 					{t("report.dayMissing")}
 				</Alert>
 			)}
-			{picked.searching && <Loader size="sm" />}
+			{isFetchNextPageError && (
+				<Alert color="red" variant="light" data-testid="outline-report-older-failed">
+					<Group gap="xs" wrap="wrap">
+						<Text size="sm">{t("report.olderFailed")}</Text>
+						<Button
+							size="compact-xs"
+							variant="light"
+							loading={isFetchingNextPage}
+							onClick={() => void fetchNextPage()}
+							data-testid="outline-report-older-retry"
+						>
+							{t("report.retry")}
+						</Button>
+					</Group>
+				</Alert>
+			)}
+			{picked.searching && !isFetchNextPageError && <Loader size="sm" />}
+			{picked.noPreview && (
+				<Stack gap="xs" align="flex-start" data-testid="outline-report-no-preview">
+					<Text size="sm" c="dimmed">
+						{t("report.noPreview")}
+					</Text>
+					<Button
+						variant="light"
+						size="compact-sm"
+						loading={makeNow.isPending || awaiting !== null}
+						onClick={askNow}
+					>
+						{t("report.makeNow")}
+					</Button>
+				</Stack>
+			)}
 			{head && picked.entry && (
 				<Stack
 					gap="sm"
@@ -282,8 +338,8 @@ export function OutlineDigestPage({
 						<Group gap="xs" wrap="wrap">
 							<Title order={3}>
 								{picked.entry.key === DIGEST_TODAY
-									? t("report.today")
-									: t("report.dayOf", { day: dayLabel(picked.entry.key) })}
+									? entryLabel(picked.entry)
+									: t("report.dayOf", { day: entryLabel(picked.entry) })}
 							</Title>
 							<Badge variant="light" color="gray" tt="none">
 								{t("report.items", { count: detail.data?.digest.itemCount ?? head.itemCount })}

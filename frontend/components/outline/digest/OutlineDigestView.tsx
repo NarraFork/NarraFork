@@ -9,6 +9,7 @@
  * runs on any link, so a drawer can close.
  */
 import { Alert, Anchor, Badge, Button, Group, Paper, Stack, Text } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import type {
 	OutlineDelegatedKind,
 	OutlineDigestActor,
@@ -23,7 +24,7 @@ import type {
 	OutlineDigestSpaceView,
 	OutlineDigestTaskView,
 } from "@shared/outline-digest";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import { useUndoOutlineDecision, wasUndoneHere } from "../../../hooks/useOutlineReports";
@@ -85,7 +86,7 @@ function actorSession(ctx: ItemContext, actor: OutlineDigestActor | null): strin
 function timeOf(ctx: ItemContext, at: string): string {
 	return formatLocaleTime(
 		at,
-		{ hour: "2-digit", minute: "2-digit", timeZone: ctx.timeZone },
+		{ hour: "numeric", minute: "2-digit", timeZone: ctx.timeZone },
 		ctx.lang,
 	);
 }
@@ -240,7 +241,11 @@ type UndoOutcome =
 /**
  * Undo of a decision made in the reader's name: offered only while the API says it can be (it
  * still stands and the reader may write); asks before it undoes; says why the server refused, in
- * the reader's language. The outcome stays shown while the report is read again around it.
+ * the reader's language. The outcome stays shown while the report is read again around it, in a
+ * live region; a toast says it too, as the inbox row it was in may go once it is undone.
+ *
+ * Focus: opening the question moves to its confirm button, Cancel back to Undo, the outcome to
+ * the outcome.
  */
 export function DecisionUndo({
 	commitId,
@@ -264,6 +269,18 @@ export function DecisionUndo({
 	const [outcome, setOutcome] = useState<UndoOutcome | null>(() =>
 		wasUndoneHere(commitId) ? { kind: "undone", skipped: 0 } : null,
 	);
+	const undoButton = useRef<HTMLButtonElement>(null);
+	const confirmButton = useRef<HTMLButtonElement>(null);
+	const statusBox = useRef<HTMLDivElement>(null);
+	// Where focus goes once the next render is on screen.
+	const focusNext = useRef<"confirm" | "undo" | "status" | null>(null);
+	useEffect(() => {
+		const next = focusNext.current;
+		if (!next) return;
+		focusNext.current = null;
+		const target = next === "confirm" ? confirmButton : next === "undo" ? undoButton : statusBox;
+		target.current?.focus();
+	});
 	const run = () => {
 		if (!commitId) return;
 		undo.mutate(
@@ -271,39 +288,28 @@ export function DecisionUndo({
 			{
 				onSuccess: (result) => {
 					setOutcome({ kind: "undone", skipped: result.skipped });
+					focusNext.current = "status";
+					notifications.show({
+						color: "teal",
+						title: t("report.undo.done"),
+						message: t(`report.kind.${kind}`),
+					});
 					onUndone?.();
 				},
-				onError: (error) => setOutcome({ kind: "refused", reason: undoRefusalOf(error) }),
+				onError: (error) => {
+					setOutcome({ kind: "refused", reason: undoRefusalOf(error) });
+					focusNext.current = "status";
+				},
 				onSettled: () => setConfirming(false),
 			},
 		);
 	};
-	if (outcome?.kind === "undone")
-		return (
-			<Group>
-				<Badge size="sm" variant="light" color="teal" tt="none" data-testid="outline-report-undone">
-					{outcome.skipped > 0
-						? t("report.undo.doneSkipped", { count: outcome.skipped })
-						: t("report.undo.done")}
-				</Badge>
-			</Group>
-		);
-	const refused =
-		outcome?.kind === "refused" ? (
-			<Alert
-				color="red"
-				variant="light"
-				p="xs"
-				title={t("report.undo.refused")}
-				data-testid="outline-report-undo-refused"
-				data-reason={outcome.reason}
-			>
-				<Text size="xs">{t(`report.undo.${outcome.reason}`)}</Text>
-			</Alert>
-		) : null;
-	if (!stands)
-		return (
-			<Stack gap={4}>
+	const undone = outcome?.kind === "undone" ? outcome : null;
+	const refused = outcome?.kind === "refused" ? outcome : null;
+	const offered = !undone && stands && canUndo && commitId !== null;
+	return (
+		<Stack gap={4}>
+			{!undone && !stands && (
 				<Group>
 					<Badge
 						size="sm"
@@ -315,62 +321,97 @@ export function DecisionUndo({
 						{t("report.notStanding")}
 					</Badge>
 				</Group>
-				{refused}
-			</Stack>
-		);
-	if (!canUndo || !commitId)
-		return (
-			refused ?? (
+			)}
+			{!undone && stands && !offered && !refused && (
 				<Text size="xs" c="dimmed" data-testid="outline-report-read-only">
 					{t("report.undo.readOnlyHint")}
 				</Text>
-			)
-		);
-	return (
-		<Stack gap={4}>
-			{confirming ? (
-				<Paper withBorder p="xs" radius="sm" data-testid="outline-report-undo-confirm">
-					<Text size="xs" style={wrap}>
-						{t(`report.undo.explain.${kind}`)}
-					</Text>
-					<Group gap="xs" mt={6} wrap="wrap">
+			)}
+			{offered &&
+				(confirming ? (
+					<Paper withBorder p="xs" radius="sm" data-testid="outline-report-undo-confirm">
+						<Text size="xs" style={wrap} id={`undo-explain-${commitId}`}>
+							{t(`report.undo.explain.${kind}`)}
+						</Text>
+						<Group gap="xs" mt={6} wrap="wrap">
+							<Button
+								ref={confirmButton}
+								size="compact-xs"
+								color="red"
+								loading={undo.isPending}
+								onClick={run}
+								aria-describedby={`undo-explain-${commitId}`}
+								data-testid="outline-report-undo-yes"
+							>
+								{t("report.undo.confirm")}
+							</Button>
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								color="gray"
+								disabled={undo.isPending}
+								onClick={() => {
+									focusNext.current = "undo";
+									setConfirming(false);
+								}}
+								data-testid="outline-report-undo-cancel"
+							>
+								{t("report.undo.cancel")}
+							</Button>
+						</Group>
+					</Paper>
+				) : (
+					<Group>
 						<Button
+							ref={undoButton}
 							size="compact-xs"
+							variant="light"
 							color="red"
-							loading={undo.isPending}
-							onClick={run}
-							data-testid="outline-report-undo-yes"
+							onClick={() => {
+								setOutcome(null);
+								focusNext.current = "confirm";
+								setConfirming(true);
+							}}
+							data-testid="outline-report-undo"
 						>
-							{t("report.undo.confirm")}
-						</Button>
-						<Button
-							size="compact-xs"
-							variant="subtle"
-							color="gray"
-							disabled={undo.isPending}
-							onClick={() => setConfirming(false)}
-						>
-							{t("report.undo.cancel")}
+							{t("report.undo.button")}
 						</Button>
 					</Group>
-				</Paper>
-			) : (
-				<Group>
-					<Button
-						size="compact-xs"
-						variant="light"
+				))}
+			<div
+				ref={statusBox}
+				tabIndex={-1}
+				style={{ outline: "none" }}
+				data-testid="outline-report-undo-outcome"
+			>
+				<div role="status" aria-live="polite" data-testid="outline-report-undo-status">
+					{undone && (
+						<Badge
+							size="sm"
+							variant="light"
+							color="teal"
+							tt="none"
+							data-testid="outline-report-undone"
+						>
+							{undone.skipped > 0
+								? t("report.undo.doneSkipped", { count: undone.skipped })
+								: t("report.undo.done")}
+						</Badge>
+					)}
+				</div>
+				{refused && (
+					<Alert
 						color="red"
-						onClick={() => {
-							setOutcome(null);
-							setConfirming(true);
-						}}
-						data-testid="outline-report-undo"
+						variant="light"
+						p="xs"
+						title={t("report.undo.refused")}
+						data-testid="outline-report-undo-refused"
+						data-reason={refused.reason}
 					>
-						{t("report.undo.button")}
-					</Button>
-				</Group>
-			)}
-			{refused}
+						<Text size="xs">{t(`report.undo.${refused.reason}`)}</Text>
+					</Alert>
+				)}
+			</div>
 		</Stack>
 	);
 }
@@ -449,16 +490,22 @@ function KnowledgeItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestKno
 							const target = itemLinks(block.link, { deleted: block.deleted }).block;
 							return (
 								<Group key={block.link.blockId} gap={6} wrap="wrap" style={{ minWidth: 0 }}>
-									<Anchor
-										component={OutlineLink}
-										to={target as OutlineTarget}
-										size="xs"
-										style={wrap}
-										onClick={() => ctx.onOpen?.()}
-										data-testid="outline-report-block-link"
-									>
-										{block.title || t("report.untitled")}
-									</Anchor>
+									{target ? (
+										<Anchor
+											component={OutlineLink}
+											to={target}
+											size="xs"
+											style={wrap}
+											onClick={() => ctx.onOpen?.()}
+											data-testid="outline-report-block-link"
+										>
+											{block.title || t("report.untitled")}
+										</Anchor>
+									) : (
+										<Text size="xs" style={wrap}>
+											{block.title || t("report.untitled")}
+										</Text>
+									)}
 									{block.deleted && (
 										<Badge size="xs" variant="outline" color="gray" tt="none">
 											{t("report.deleted")}

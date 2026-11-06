@@ -188,6 +188,18 @@ export function attrs(selector: string, name: string): string[] {
 	return [...document.querySelectorAll(selector)].map((e) => e.getAttribute(name) ?? "");
 }
 
+/** The test id of what has focus (or of its nearest element that has one). */
+export function focused(): string | null {
+	const element = document.activeElement;
+	if (!element || element === document.body) return null;
+	return element.closest("[data-testid]")?.getAttribute("data-testid") ?? element.tagName;
+}
+
+/** Whether some text is on the page (a toast, say). */
+export function shows(text: string): boolean {
+	return document.body.innerText.includes(text);
+}
+
 /** A Select's options once it is open (Mantine renders them in a portal). */
 export function options(): string[] {
 	return [...document.querySelectorAll<HTMLElement>("[role=option]")].map((e) => e.innerText);

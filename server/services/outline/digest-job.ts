@@ -704,18 +704,20 @@ export async function runOutlineDigestSlice(
 /**
  * Ask for the person's "today so far": queued for the job (one entry per person, at most
  * {@link OUTLINE_DIGEST_JOB.previewQueue}), at most once per {@link OUTLINE_DIGEST_JOB.previewEveryMs}.
- * `queued` false: asked too recently, or the queue is full; the current preview stands.
+ * `queued` false: asked too recently (`recent`), or the queue is full (`queue_full`); the current
+ * preview stands.
  */
 export function requestOutlineDigestPreview(
 	userId: string,
 	options: { now?: number; kick?: boolean } = {},
-): { queued: boolean } {
+): { queued: true } | { queued: false; reason: "recent" | "queue_full" } {
 	const now = options.now ?? Date.now();
 	if (state.previewQueue.includes(userId)) return { queued: true };
 	const last = state.previewAt.get(userId);
 	if (last !== undefined && now - last < OUTLINE_DIGEST_JOB.previewEveryMs)
-		return { queued: false };
-	if (state.previewQueue.length >= OUTLINE_DIGEST_JOB.previewQueue) return { queued: false };
+		return { queued: false, reason: "recent" };
+	if (state.previewQueue.length >= OUTLINE_DIGEST_JOB.previewQueue)
+		return { queued: false, reason: "queue_full" };
 	if (state.previewAt.size > 10_000) {
 		for (const [id, at] of state.previewAt)
 			if (now - at >= OUTLINE_DIGEST_JOB.previewEveryMs) state.previewAt.delete(id);

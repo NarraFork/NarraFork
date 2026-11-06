@@ -16,6 +16,7 @@ import {
 	dayEntries,
 	dayNeighbors,
 	digestModel,
+	isTodayIn,
 	itemLinks,
 	pickDay,
 	reportPath,
@@ -268,22 +269,54 @@ describe("browsing by day", () => {
 		const entries = dayEntries([
 			page(["2026-11-05", "2026-11-04"], "2026-11-04", head("2026-11-06", { kind: "today" })),
 		]);
-		expect(pickDay(entries, undefined, true).entry?.key).toBe("2026-11-05");
-		expect(pickDay(entries, DIGEST_TODAY, true).entry?.key).toBe(DIGEST_TODAY);
-		expect(pickDay(entries, "2026-11-01", true)).toEqual({
+		const loaded = (more: boolean) => ({ more, loaded: true });
+		expect(pickDay(entries, undefined, loaded(true)).entry?.key).toBe("2026-11-05");
+		expect(pickDay(entries, DIGEST_TODAY, loaded(true)).entry?.key).toBe(DIGEST_TODAY);
+		// Today's date, before today's report exists: the preview.
+		expect(pickDay(entries, "2026-11-06", loaded(true)).entry?.key).toBe(DIGEST_TODAY);
+		expect(pickDay(entries, "2026-11-01", loaded(true))).toEqual({
 			entry: null,
 			missing: false,
 			searching: true,
+			noPreview: false,
 		});
-		expect(pickDay(entries, "2026-11-01", false)).toEqual({
+		expect(pickDay(entries, "2026-11-01", loaded(false))).toEqual({
 			entry: null,
 			missing: true,
 			searching: false,
+			noPreview: false,
 		});
 		// No daily report yet: today so far.
 		const onlyToday = dayEntries([page([], null, head("2026-11-06", { kind: "today" }))]);
-		expect(pickDay(onlyToday, undefined, false).entry?.key).toBe(DIGEST_TODAY);
-		expect(pickDay([], undefined, false).entry).toBeNull();
+		expect(pickDay(onlyToday, undefined, loaded(false)).entry?.key).toBe(DIGEST_TODAY);
+		expect(pickDay([], undefined, loaded(false)).entry).toBeNull();
+		// Today so far asked for by address, and none made: said so, not "missing".
+		const noPreview = dayEntries([page(["2026-11-05"], null)]);
+		expect(pickDay(noPreview, DIGEST_TODAY, loaded(false))).toEqual({
+			entry: null,
+			missing: false,
+			searching: false,
+			noPreview: true,
+		});
+	});
+
+	test("nothing is missing (nor picked) before the list has loaded", () => {
+		expect(pickDay([], "2026-11-05", { more: false, loaded: false })).toEqual({
+			entry: null,
+			missing: false,
+			searching: false,
+			noPreview: false,
+		});
+		expect(pickDay([], DIGEST_TODAY, { more: false, loaded: false }).noPreview).toBe(false);
+	});
+
+	test("today in the report's zone", () => {
+		const now = new Date("2026-11-06T02:00:00.000Z");
+		expect(isTodayIn("2026-11-06", "UTC", now)).toBe(true);
+		// Still the 5th in New York; already the 6th in Shanghai.
+		expect(isTodayIn("2026-11-05", "America/New_York", now)).toBe(true);
+		expect(isTodayIn("2026-11-06", "America/New_York", now)).toBe(false);
+		expect(isTodayIn("2026-11-06", "Asia/Shanghai", now)).toBe(true);
 	});
 
 	test("neighbors: earlier and later among those loaded, or on the next page", () => {

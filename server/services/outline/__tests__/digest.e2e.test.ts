@@ -23,6 +23,8 @@ import type {
 	OutlineDigestDetailResponse,
 	OutlineDigestLink,
 	OutlineDigestListResponse,
+	OutlineDigestNowResponse,
+	OutlineDigestStored,
 } from "@shared/outline-digest";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
@@ -629,7 +631,7 @@ describe("reports: the acceptance", () => {
 				now: Date.parse("2026-11-06T03:00:20.000Z"),
 				kick: false,
 			}),
-		).toEqual({ queued: false });
+		).toEqual({ queued: false, reason: "recent" });
 		// Asked again later: the preview is made again under the same id, which a client may hold.
 		await write(p.space, A, alice.id, "2026-11-06T03:01:00.000Z", [
 			{ op: "insert", parent: { id: page as string }, content: "A minute later" },
@@ -1643,6 +1645,125 @@ describe("reports: the job's bounds", () => {
 		expect(shown.more.knowledge).toBe(1);
 		// The range still covers the whole day: the next day continues after it.
 		expect(day.ranges[p.space.id]).toEqual([0, 5]);
+	}, 60_000);
+});
+
+describe("reports: asking for today so far", () => {
+	test("not queued says why: asked within the minute, or too many asking", async () => {
+		const amy = await person("amy", { timeZone: "UTC" });
+		expect(requestOutlineDigestPreview(amy.id, { kick: false })).toEqual({ queued: true });
+		// Still waiting in the queue: asking again is the same request.
+		expect(requestOutlineDigestPreview(amy.id, { kick: false })).toEqual({ queued: true });
+		await runJob(new Date().toISOString());
+		const recent = await call<OutlineDigestNowResponse>(amy.id, "/digests/now", { method: "POST" });
+		expect(recent.status).toBe(202);
+		expect(recent.body).toMatchObject({ queued: false, reason: "recent" });
+		expect(recent.body.previewId).not.toBeNull();
+		// Somebody else's queue is full.
+		resetOutlineDigestJobForTests();
+		for (let i = 0; i < OUTLINE_DIGEST_JOB.previewQueue; i++)
+			expect(requestOutlineDigestPreview(`queued-${i}`, { kick: false }).queued).toBe(true);
+		const full = await call<OutlineDigestNowResponse>(amy.id, "/digests/now", { method: "POST" });
+		expect([full.status, full.body]).toEqual([
+			202,
+			{ queued: false, reason: "queue_full", previewId: recent.body.previewId },
+		]);
+	}, 60_000);
+});
+
+describe("reports: names", () => {
+	test("a session that is gone is not named, nor linked, even for an admin", async () => {
+		const root = await person("root");
+		await db.update(users).set({ role: "admin" }).where(eq(users.id, root.id));
+		const p = await project(root.id);
+		const kept = await narrator(root.id);
+		const gone = await narrator(root.id);
+		const at = "2026-11-20T10:00:00.000Z";
+		const made = await write(p.space, { kind: "agent", id: kept }, root.id, at, [
+			{ op: "insert", parent: null, content: "Plan the move", task: { status: "todo" } },
+		]);
+		const block = made.results[0]?.blockId as string;
+		const commit = made.commit as { id: string; seq: number };
+		await db.delete(narrators).where(eq(narrators.id, gone));
+		const none = { delegated: 0, knowledge: 0, tasks: 0, plans: 0, questions: 0, other: 0 };
+		const items: OutlineDigestStored = {
+			v: 1,
+			spaces: [
+				{
+					id: p.space.id,
+					kind: "project",
+					from: 0,
+					to: commit.seq,
+					commits: 1,
+					truncated: false,
+					deletedFacts: 0,
+					ownEdits: 0,
+					tasksCreated: 0,
+					tasksStarted: 0,
+					leaseReturned: 0,
+					reviewComments: 0,
+				},
+			],
+			moreSpaces: 0,
+			delegated: [],
+			knowledge: [],
+			tasks: [
+				{
+					space: p.space.id,
+					commitId: commit.id,
+					seq: commit.seq,
+					at,
+					event: "done",
+					blockId: block,
+					pageId: block,
+					by: { kind: "agent", id: gone },
+					executor: { kind: "agent", id: kept },
+					manager: null,
+					goal: false,
+					forYou: false,
+				},
+			],
+			plans: [
+				{
+					space: p.space.id,
+					commitId: commit.id,
+					seq: commit.seq,
+					at,
+					event: "planning",
+					blockId: block,
+					pageId: block,
+					round: 0,
+					narratorId: gone,
+					approvedBy: null,
+				},
+			],
+			questions: [],
+			other: [],
+			more: none,
+		};
+		const id = generateId();
+		await store.insertDigest({
+			id,
+			userId: root.id,
+			kind: "daily",
+			periodKey: "2026-11-20",
+			timeZone: "UTC",
+			periodStart: "2026-11-20T00:00:00.000Z",
+			periodEnd: "2026-11-21T00:00:00.000Z",
+			counts: { ...none, tasks: 1, plans: 1, spaces: 1, ownEdits: 0 },
+			itemCount: 2,
+			items,
+			ranges: { [p.space.id]: [0, commit.seq] },
+			truncated: false,
+			createdAt: "2026-11-21T07:00:00.000Z",
+			seenAt: null,
+		});
+		const res = await appAs(root.id, "admin").request(`http://localhost/outline/digests/${id}`);
+		expect(res.status).toBe(200);
+		const d = (await res.json()) as OutlineDigestDetailResponse;
+		expect(Object.keys(d.names.sessions)).toEqual([kept]);
+		expect(d.plans[0]?.session).toEqual({ narratorId: null, title: null, hidden: true });
+		expect(d.plans[0]?.link.narratorId).toBeNull();
 	}, 60_000);
 });
 

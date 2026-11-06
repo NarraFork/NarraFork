@@ -23,13 +23,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { OutlineDigestDetailResponse, OutlineDigestStored } from "@shared/outline-digest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { db } from "../../../../server/db";
 import {
 	aclGrants,
 	narrators,
+	outlineDigests,
 	outlinePending,
 	projects,
 	userPreferences,
@@ -47,6 +48,7 @@ import {
 	resetOutlineDigestJobForTests,
 	runOutlineDigestSlice,
 	startOutlineDigestSweepForTests,
+	stopOutlineDigestJob,
 } from "../../../../server/services/outline/digest-job";
 import { readOutlineDigestDetail } from "../../../../server/services/outline/digest-view";
 import type { OutlineAskJson } from "../../../../server/services/outline/model";
@@ -81,7 +83,6 @@ function dayKey(days: number): string {
 function at(days: number, time: string): string {
 	return `${dayKey(days)}T${time}:00.000Z`;
 }
-const TODAY = dayKey(0);
 const D2 = dayKey(-1);
 const D1 = dayKey(-2);
 /** The older, empty days stored before the job runs: 3 to 18 days ago. */
@@ -90,6 +91,8 @@ const OLDEST = -18;
 let browser: Browser;
 let server: ReturnType<typeof Bun.serve>;
 const listRequests: string[] = [];
+/** Answer the list's later pages (`before=`) with 500, as a broken server would. */
+let failOlderPages = false;
 
 let alice: string;
 let agent: string;
@@ -139,7 +142,10 @@ function api() {
 		c.json(await getHumanAttentionForPrincipal(principal(c.get("user").sub), c.req.param("id"))),
 	);
 	app.use("/api/outline/digests", async (c, next) => {
-		if (c.req.method === "GET") listRequests.push(new URL(c.req.url).search);
+		const search = new URL(c.req.url).search;
+		if (c.req.method === "GET") listRequests.push(search);
+		if (failOlderPages && c.req.method === "GET" && search.includes("before="))
+			return c.json({ error: "broken" }, 500);
 		await next();
 	});
 	app.route("/api/outline", outlineRoutes);
@@ -528,6 +534,9 @@ beforeEach(() => {
 });
 
 afterAll(async () => {
+	// "Make today so far" started the report job in this process.
+	await stopOutlineDigestJob();
+	resetOutlineDigestJobForTests();
 	await browser?.close();
 	server?.stop(true);
 });
@@ -874,9 +883,7 @@ describe("the reports page", () => {
 			),
 		).toEqual([`/narrators/${agent}`]);
 		// The question asked of her on day one waits for her now.
-		expect(
-			await call(page, (f, s) => f.exists(s as never), "[data-testid=outline-report-waiting]"),
-		).toBe(true);
+		await until(page, "what waits for her", has, "[data-testid=outline-report-waiting]");
 		// Opened, so read: in the store, and the badge goes.
 		await until(
 			page,
@@ -1037,6 +1044,20 @@ describe("the reports page", () => {
 		await until(en.page, "the decision", has, `${item} [data-testid=outline-report-undo]`);
 		await call(en.page, (f, s) => f.click(s as never), `${item} [data-testid=outline-report-undo]`);
 		await until(en.page, "asked first", has, `${item} [data-testid=outline-report-undo-confirm]`);
+		// Focus follows: to the confirm button, back to Undo on Cancel, and to it again.
+		await until(en.page, "focus on confirm", (f) => f.focused() === "outline-report-undo-yes");
+		await call(
+			en.page,
+			(f, s) => f.click(s as never),
+			`${item} [data-testid=outline-report-undo-cancel]`,
+		);
+		await until(en.page, "focus back on undo", (f) => f.focused() === "outline-report-undo");
+		await call(en.page, (f, s) => f.click(s as never), `${item} [data-testid=outline-report-undo]`);
+		await until(
+			en.page,
+			"focus on confirm again",
+			(f) => f.focused() === "outline-report-undo-yes",
+		);
 		expect(
 			await call(
 				en.page,
@@ -1052,20 +1073,43 @@ describe("the reports page", () => {
 		);
 		await until(en.page, "undone", has, `${item} [data-testid=outline-report-undone]`);
 		expect((await store.getQuestions([relayed1.question]))[0]?.state).toBe("open");
-		// Read again: it no longer stands, so no undo is offered for it.
+		// Said in a live region, where focus now is, and in a toast (the row it was in may go).
+		expect(
+			await call(
+				en.page,
+				(f, s) => f.exists(s as never),
+				`${item} [role=status][aria-live=polite] [data-testid=outline-report-undone]`,
+			),
+		).toBe(true);
+		await until(
+			en.page,
+			"focus on the outcome",
+			(f) => f.focused() === "outline-report-undo-outcome",
+		);
+		await until(en.page, "the toast", (f, s) => f.shows(s as never), "Your answer, relayed");
+		expect(en.errors).toEqual([]);
+		await en.page.close();
+		// Read again on a page of its own: it no longer stands, so no undo is offered for it.
 		const after = await detailOf(d2Id);
 		expect(after.delegated.find((d) => d.link.commitId === relayed1.commit)).toMatchObject({
 			stands: false,
 			canUndo: false,
 		});
+		const reread = await open(`/outline/digest?d=${D2}`);
 		await until(
-			en.page,
-			"no undo offered",
-			(f, s) => !f.exists(s as never),
-			`${item} [data-testid=outline-report-undo]`,
+			reread.page,
+			"read again",
+			has,
+			`${item} [data-testid=outline-report-not-standing]`,
 		);
-		expect(en.errors).toEqual([]);
-		await en.page.close();
+		expect(
+			await call(
+				reread.page,
+				(f, s) => f.exists(s as never),
+				`${item} [data-testid=outline-report-undo]`,
+			),
+		).toBe(false);
+		await reread.page.close();
 
 		const zh = await open(`/outline/digest?d=${D2}`, { lang: "zh-CN" });
 		const two = `[data-testid=outline-report-delegated-${relayed2.commit}]`;
@@ -1150,6 +1194,13 @@ describe("the reports page", () => {
 	}, 90_000);
 
 	test("make today so far: the job makes it and the page opens it", async () => {
+		// None made yet: the address says so, and offers to make one.
+		const none = await open("/outline/digest?d=today");
+		await until(none.page, "no today so far yet", has, "[data-testid=outline-report-no-preview]");
+		expect(
+			await call(none.page, (f, s) => f.exists(s as never), "[data-testid=outline-report-missing]"),
+		).toBe(false);
+		await none.page.close();
 		await writeOutline(
 			{
 				spaceId: p.id,
@@ -1172,8 +1223,13 @@ describe("the reports page", () => {
 		);
 		expect((await call(page, (f) => f.location())).href).toBe(`/outline/digest?d=today`);
 		const [preview] = await store.listDigestHeads(alice, { kind: "today", limit: 1 });
-		expect(preview?.periodKey).toBe(TODAY);
-		expect(preview?.periodStart).toBe(at(0, "00:00"));
+		// Today as it is now (a run may cross midnight after the setup).
+		const today = new Date().toISOString().slice(0, 10);
+		expect(preview?.periodKey).toBe(today);
+		expect(preview?.periodStart).toBe(`${today}T00:00:00.000Z`);
+		expect(
+			await call(page, (f, s) => f.textOf(s as never), "[data-testid=outline-report-day-view] h3"),
+		).toBe("Today so far");
 		// Asked again within the minute: the one there is stands, and the page says so.
 		await call(page, (f, s) => f.click(s as never), "[data-testid=outline-report-now]");
 		await until(
@@ -1182,9 +1238,82 @@ describe("the reports page", () => {
 			has,
 			"[data-testid=outline-report-notice][data-notice=madeRecently]",
 		);
+		// Moving to another day clears it.
+		await call(page, (f, s) => f.click(s as never), "[data-testid=outline-report-older]");
+		await until(page, "another day", (f) => f.location().href !== "/outline/digest?d=today");
+		await until(
+			page,
+			"no notice",
+			(f, s) => !f.exists(s as never),
+			"[data-testid=outline-report-notice]",
+		);
 		expect(errors).toEqual([]);
 		await page.close();
+		// Today's date opens today so far, while there is no report of today.
+		const dated = await open(`/outline/digest?d=${today}`);
+		await until(
+			dated.page,
+			"today so far by date",
+			has,
+			"[data-testid=outline-report-day-view][data-day=today]",
+		);
+		await dated.page.close();
 	}, 90_000);
+
+	test("a so-far report of a day that is over says which day, not today", async () => {
+		const [current] = await store.listDigestHeads(alice, { kind: "today", limit: 1 });
+		const row = await store.getDigest(current?.id as string);
+		expect(row).not.toBeNull();
+		// Between midnight and the report time: yesterday's "so far" is still the preview.
+		await db
+			.update(outlineDigests)
+			.set({ periodKey: D2 })
+			.where(and(eq(outlineDigests.userId, alice), eq(outlineDigests.kind, "today")));
+		try {
+			const { page, errors } = await open("/outline/digest?d=today");
+			await until(
+				page,
+				"the preview",
+				has,
+				"[data-testid=outline-report-day-view][data-day=today]",
+			);
+			const title = await call(
+				page,
+				(f, s) => f.textOf(s as never),
+				"[data-testid=outline-report-day-view] h3",
+			);
+			expect(title).toEndWith("so far");
+			expect(title).not.toBe("Today so far");
+			expect(errors).toEqual([]);
+			await page.close();
+		} finally {
+			await db
+				.update(outlineDigests)
+				.set({ periodKey: row?.periodKey as string })
+				.where(and(eq(outlineDigests.userId, alice), eq(outlineDigests.kind, "today")));
+		}
+	}, 60_000);
+
+	test("a later page of the list that fails is asked for once, until the reader retries", async () => {
+		listRequests.length = 0;
+		failOlderPages = true;
+		const { page } = await open(`/outline/digest?d=${dayKey(OLDEST)}`);
+		await until(page, "the failure", has, "[data-testid=outline-report-older-failed]");
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+		expect(listRequests.filter((q) => q.includes("before=")).length).toBe(1);
+		failOlderPages = false;
+		await call(page, (f, s) => f.click(s as never), "[data-testid=outline-report-older-retry]");
+		await until(
+			page,
+			"the oldest day",
+			has,
+			`[data-testid=outline-report-day-view][data-day="${dayKey(OLDEST)}"]`,
+		);
+		expect(
+			await call(page, (f, s) => f.exists(s as never), "[data-testid=outline-report-older-failed]"),
+		).toBe(false);
+		await page.close();
+	}, 60_000);
 
 	test("at 360 px and on a wide screen, light and dark, English and Chinese: no horizontal scroll", async () => {
 		for (const [lang, width, scheme] of [

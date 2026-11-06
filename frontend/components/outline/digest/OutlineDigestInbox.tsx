@@ -120,6 +120,7 @@ export function OutlineDigestInbox({
 		...undone.filter((u) => !current.some((item) => item.pendingId === u.pendingId)),
 	].filter((item) => !item.commitId || !listed.has(item.commitId));
 	const others = reportIds.slice(1).map((id) => ({ id, entry: byId.get(id) ?? null }));
+	const unlisted = others.filter((other) => !other.entry).length;
 	const gotIt = () => {
 		const pendingIds = (confirmations.data?.items ?? []).map((i) => i.pendingId);
 		if (pendingIds.length > 0) seen.mutate(pendingIds);
@@ -150,8 +151,8 @@ export function OutlineDigestInbox({
 							</Text>
 						)}
 					</Group>
-					{detail.isError && (
-						<Text size="xs" c="red">
+					{(detail.isError || list.isError) && (
+						<Text size="xs" c="red" data-testid="outline-report-inbox-failed">
 							{t("report.loadFailed")}
 						</Text>
 					)}
@@ -170,9 +171,24 @@ export function OutlineDigestInbox({
 								size="xs"
 								onClick={() => onOpen?.()}
 							>
-								{dayLabel(entry.key)} ({t("report.items", { count: entry.head.itemCount })})
+								{t("report.dayWithItems", {
+									day: dayLabel(entry.key),
+									items: t("report.items", { count: entry.head.itemCount }),
+								})}
 							</Anchor>
 						) : null,
+					)}
+					{/* Older than the list's first page: on the reports page. */}
+					{unlisted > 0 && (
+						<Anchor
+							component={OutlineHrefLink}
+							path={reportPath()}
+							size="xs"
+							onClick={() => onOpen?.()}
+							data-testid="outline-report-other-unread-page"
+						>
+							{t("report.moreOnPage", { count: unlisted })}
+						</Anchor>
 					)}
 				</Group>
 			)}

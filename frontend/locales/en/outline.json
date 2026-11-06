@@ -336,7 +336,7 @@
 		"truncated": "More questions than shown: answer these first"
 	},
 	"digest": {
-		"intro": "Sessions you named to confirm on your behalf confirmed these changes to your locked plans. Revert any you disagree with.",
+		"intro": "Sessions you named to confirm on your behalf confirmed these changes to your locked plans. Undo any you disagree with.",
 		"empty": "Nothing was confirmed on your behalf",
 		"changes": "{{count}} change(s)",
 		"confirmedBy": "confirmed by {{title}}",
@@ -358,7 +358,7 @@
 		"madeRecently": "Made a moment ago: you can make it again in a minute.",
 		"queueFull": "Too many reports are being made right now. Try again shortly.",
 		"notReadyYet": "Not ready yet: it will show up here once it is made.",
-		"makeFailed": "Today so far could not be asked for",
+		"makeFailed": "Could not start making today so far. Try again.",
 		"older": "Earlier",
 		"newer": "Later",
 		"day": "Day",
@@ -384,8 +384,8 @@
 		"otherUnread_one": "{{count}} more unread report:",
 		"otherUnread_other": "{{count}} more unread reports:",
 		"unacknowledged": "Confirmed for you, not yet acknowledged",
-		"waiting_one": "{{count}} thing waits for you now (questions, confirmations, plans to approve)",
-		"waiting_other": "{{count}} things wait for you now (questions, confirmations, plans to approve)",
+		"waiting_one": "{{count}} thing waits for your decision: outline questions and changes to confirm, plans to approve",
+		"waiting_other": "{{count}} things wait for your decision: outline questions and changes to confirm, plans to approve",
 		"openInbox": "Open the inbox",
 		"entryNone": "Every morning a report of the day before: what changed and what was decided in your name.",
 		"untitled": "(untitled)",
@@ -467,7 +467,7 @@
 			"notAdopted": "differs from the recommendation"
 		},
 		"other": {
-			"revert": "Undo",
+			"revert": "Reverted",
 			"import": "Import",
 			"confirm": "Confirmed",
 			"delegation": "Handed to a subagent",
@@ -502,7 +502,15 @@
 				"outline-report": "a subagent's report"
 			},
 			"systemOther": "the system ({{name}})"
-		}
+		},
+		"soFar": "{{day}} so far",
+		"noPreview": "No report of today so far has been made yet.",
+		"olderFailed": "Earlier reports could not be loaded.",
+		"retry": "Try again",
+		"dayWithItems": "{{day}} ({{items}})",
+		"moreOnPage_one": "{{count}} more on the reports page",
+		"moreOnPage_other": "{{count}} more on the reports page",
+		"inboxFailed": "The report could not be shown."
 	},
 	"board": {
 		"title": "Tasks",

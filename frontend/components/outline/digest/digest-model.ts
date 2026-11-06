@@ -196,24 +196,51 @@ export function dayEntries(
 	return entries;
 }
 
+/** What the address's day (`d`) opens. */
+export interface DigestDayPick {
+	entry: DigestDayEntry | null;
+	/** A day the list does not have (nor any page after it). */
+	missing: boolean;
+	/** The day may be on a page of the list not read yet. */
+	searching: boolean;
+	/** `d=today` and no "so far" report has been made. */
+	noPreview: boolean;
+}
+
 /**
- * The day the address names (`d`), or the latest day when it names none. `missing`: it names a
- * day that is not among those loaded, and the list has no more pages to look in.
+ * The day the address names (`d`), or the latest day when it names none. A date that is the
+ * preview's own day (today, before that day's report exists) opens the preview. Nothing is said
+ * to be missing until the list has loaded (`loaded`).
  */
 export function pickDay(
 	entries: readonly DigestDayEntry[],
 	d: string | undefined,
-	more: boolean,
-): { entry: DigestDayEntry | null; missing: boolean; searching: boolean } {
+	options: { more: boolean; loaded: boolean },
+): DigestDayPick {
+	const none = { entry: null, missing: false, searching: false, noPreview: false };
+	if (!options.loaded) return none;
 	if (!d) {
 		const entry = entries.find((e) => e.key !== DIGEST_TODAY) ?? entries[0] ?? null;
-		return { entry, missing: false, searching: false };
+		return { ...none, entry };
 	}
-	const entry = entries.find((e) => e.key === d) ?? null;
-	if (entry) return { entry, missing: false, searching: false };
-	// "Today so far" is never on a later page; an older day may be.
-	const searching = d !== DIGEST_TODAY && more;
-	return { entry: null, missing: !searching, searching };
+	const entry =
+		entries.find((e) => e.key === d) ??
+		entries.find((e) => e.key === DIGEST_TODAY && e.head.periodKey === d) ??
+		null;
+	if (entry) return { ...none, entry };
+	if (d === DIGEST_TODAY) return { ...none, noPreview: true };
+	// An older day may be on a later page.
+	return options.more ? { ...none, searching: true } : { ...none, missing: true };
+}
+
+/** Whether a day (`YYYY-MM-DD`) is today in `timeZone`. */
+export function isTodayIn(periodKey: string, timeZone: string, now: Date = new Date()): boolean {
+	try {
+		// `en-CA` writes dates as YYYY-MM-DD.
+		return new Intl.DateTimeFormat("en-CA", { timeZone }).format(now) === periodKey;
+	} catch {
+		return now.toISOString().slice(0, 10) === periodKey;
+	}
 }
 
 /**

@@ -1,11 +1,13 @@
 /**
  * `/outline/digest?d=<YYYY-MM-DD|today>&space=<spaceId>`: the person's reports (汇报, P2 PR 11),
- * browsed by day and filtered by space (`components/outline/digest/OutlineDigestPage.tsx`). The
- * static `digest` segment wins over `$spaceId`, as `ref` does.
+ * browsed by day and filtered by space (`components/outline/digest/OutlineDigestPage.tsx`), with the
+ * inbox it opens for what waits for the person. The static `digest` segment wins over `$spaceId`,
+ * as `ref` does.
  */
 import { Container } from "@mantine/core";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
+import { NotificationCenterLazyDrawer } from "../../components/notifications/NotificationCenterLazyDrawer";
 import { OutlineDigestPage } from "../../components/outline/digest/OutlineDigestPage";
 import { OutlineGate } from "../../components/outline/OutlineGate";
 import { OutlineNavProvider } from "../../components/outline/outline-nav";
@@ -31,6 +33,8 @@ function OutlineDigestRoute() {
 	const navigate = useNavigate();
 	const navigateOutline = useOutlineRouterNavigate();
 	const navigateHref = useOutlineRouterHrefNavigate();
+	const [inboxOpened, setInboxOpened] = useState(false);
+	const openInbox = useCallback(() => setInboxOpened(true), []);
 	const select = useCallback(
 		(next: { d?: string; space?: string }) =>
 			void navigate({ to: "/outline/digest", search: { d: next.d, space: next.space } }),
@@ -44,9 +48,19 @@ function OutlineDigestRoute() {
 					renderLink={outlineRouterLink}
 					onNavigateHref={navigateHref}
 				>
-					<OutlineDigestPage day={search.d} space={search.space} onSelect={select} />
+					<OutlineDigestPage
+						day={search.d}
+						space={search.space}
+						onSelect={select}
+						onOpenInbox={openInbox}
+					/>
 				</OutlineNavProvider>
 			</OutlineGate>
+			<NotificationCenterLazyDrawer
+				opened={inboxOpened}
+				onClose={() => setInboxOpened(false)}
+				initialTab="attention"
+			/>
 		</Container>
 	);
 }

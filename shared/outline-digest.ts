@@ -364,6 +364,8 @@ export interface OutlineDigestDetailResponse {
 /** `POST /digests/now`: a "today so far" preview is being made (or one was made a moment ago). */
 export interface OutlineDigestNowResponse {
 	queued: boolean;
+	/** Not queued: asked again within the minute (`recent`), or too many asked (`queue_full`). */
+	reason: "recent" | "queue_full" | null;
 	/** The preview there is now (being replaced when `queued`). */
 	previewId: string | null;
 }
