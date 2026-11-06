@@ -1,4 +1,4 @@
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useRef, useSyncExternalStore } from "react";
 // The logic module, not `RecentTabs.tsx`: importing from the component file would create
 // a cycle (RecentTabs imports this hook) AND keep a non-component export there, which
@@ -65,12 +65,35 @@ function isTyping(target: EventTarget | null): boolean {
  * further presses, so passing over rows costs nothing. A folder header or a folder's
  * "N more" row is a stop of its own that opens nothing: Enter (or Ctrl+Enter) opens it,
  * collapsed ↔ shown and "N more" ↔ all, and the highlight stays there so the next press
- * walks into what appeared. Enter on a session opens it now. Escape drops the highlight.
+ * walks into what appeared. On "N more", the plain arrows resize the preview, as with
+ * the row focused. Enter on a session opens it now. Escape, a pointer press or any page
+ * change drops the highlight.
  */
 export function useRecentTabKeyboardNav() {
 	const navigate = useNavigate();
 	const navigateRef = useRef(navigate);
 	navigateRef.current = navigate;
+	const pathname = useRouterState({ select: (s) => s.location.pathname });
+
+	// Any page change ends the switch: the keys' own, or a click elsewhere while the
+	// highlight rested on a folder row (it opens nothing, so it would otherwise stay, and
+	// every row's active state would keep following it instead of the open page).
+	// biome-ignore lint/correctness/useExhaustiveDependencies: re-run on page change only
+	useEffect(() => {
+		cancelDebounce();
+		setPendingKey(null);
+	}, [pathname]);
+
+	// A pointer press anywhere ends it too: the pointer is choosing now, not the keys.
+	useEffect(() => {
+		const end = () => {
+			if (pendingKey === null) return;
+			cancelDebounce();
+			setPendingKey(null);
+		};
+		window.addEventListener("pointerdown", end, true);
+		return () => window.removeEventListener("pointerdown", end, true);
+	}, []);
 
 	useEffect(() => {
 		const list = () => document.querySelector(LIST_SELECTOR);
@@ -83,8 +106,23 @@ export function useRecentTabKeyboardNav() {
 		};
 
 		const onKeyDown = (e: KeyboardEvent) => {
-			// Enter / Escape act on the highlight only while there is one.
+			// Enter / Escape / plain arrows act on the highlight only while there is one.
 			if (pendingKey !== null && !e.altKey && !e.shiftKey && !e.metaKey) {
+				// On a folder's "N more" row the plain arrows resize the preview, as they do
+				// with the row focused; the row's own handler does it (and persists it).
+				if (
+					!e.ctrlKey &&
+					(e.key === "ArrowUp" || e.key === "ArrowDown") &&
+					pendingKey.startsWith("strip:") &&
+					!isTyping(e.target)
+				) {
+					const el = list() && navRowElement(list() as Element, pendingKey);
+					if (el instanceof HTMLElement && el !== e.target) {
+						e.preventDefault();
+						el.dispatchEvent(new KeyboardEvent("keydown", { key: e.key, bubbles: true }));
+					}
+					return;
+				}
 				if (e.key === "Escape") {
 					cancelDebounce();
 					setPendingKey(null);
