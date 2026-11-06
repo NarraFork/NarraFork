@@ -74,6 +74,7 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../lib/safe-area";
+import { useWcoTitlebarRows } from "../../lib/wco-titlebar";
 
 export const Route = createFileRoute("/narrators/$narratorId")({
 	component: NarratorDetailPage,
@@ -481,10 +482,18 @@ function NarratorDetailPage() {
 		};
 	}, [narratorId, navigate]);
 
-	// Ref for drag-to-split drop zone detection
-	const mergedRef = useCallback((el: HTMLDivElement | null) => {
-		pageBoxRef.current = el;
-	}, []);
+	// The page root mounts once the narrator has loaded (the skeleton is returned before
+	// it) and again on every switch to another session, so the title-bar marks follow the
+	// element rather than a ref object.
+	const titlebarRootRef = useWcoTitlebarRows(!isMobile && !narratorLoading && !!narrator);
+	// Ref for drag-to-split drop zone detection, and the title-bar root.
+	const mergedRef = useCallback(
+		(el: HTMLDivElement | null) => {
+			pageBoxRef.current = el;
+			titlebarRootRef(el);
+		},
+		[titlebarRootRef],
+	);
 
 	if (narratorLoading)
 		return (
@@ -534,6 +543,8 @@ function NarratorDetailPage() {
 		>
 			<Box
 				ref={mergedRef}
+				// Desktop WCO: this page's top row of headers is the window title bar.
+				data-nf-wco-titlebar={!isMobile || undefined}
 				h={APP_SHELL_FULL_BLEED_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"

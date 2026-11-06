@@ -1,3 +1,4 @@
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import { Button, Group, Loader, Modal, Stack, Text, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { useQueryClient } from "@tanstack/react-query";
@@ -206,7 +207,10 @@ function NarratorsPage() {
 			{/* Mobile header */}
 			<Stack gap="xs" hiddenFrom="sm">
 				<Group justify="space-between">
-					<Title order={3}>{t("title")}</Title>
+					<Group gap="xs" wrap="nowrap">
+						<MobileNavButton />
+						<Title order={3}>{t("title")}</Title>
+					</Group>
 					<Group gap="xs">
 						<NarratorListExtraFiltersButton state={listState} onChange={setSearch} />
 						<Button

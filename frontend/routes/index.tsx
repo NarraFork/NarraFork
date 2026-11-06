@@ -1,4 +1,5 @@
-import { Stack, Title } from "@mantine/core";
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
+import { Group, Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { DashboardComposer } from "../components/dashboard/DashboardComposer";
@@ -15,7 +16,10 @@ function DashboardPage() {
 	return (
 		<Stack gap="xl" maw={1100} w="100%" mx="auto">
 			<Stack gap="sm" pt={{ base: 0, sm: "md" }}>
-				<Title order={2}>{t("heading")}</Title>
+				<Group gap="xs" wrap="nowrap">
+					<MobileNavButton />
+					<Title order={2}>{t("heading")}</Title>
+				</Group>
 				{/* 输入即开始：选目录/模型，发送时创建独立会话并发出首条消息 */}
 				<DashboardComposer />
 			</Stack>

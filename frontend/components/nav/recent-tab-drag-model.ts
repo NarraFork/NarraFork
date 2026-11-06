@@ -214,6 +214,10 @@ export function planRecentTabDrop(
 			moveTarget = { afterKey: target.key, ...(isFolderTab(source) ? {} : { folderId: null }) };
 			break;
 	}
+	// Across the pin divider: the drop pins or unpins the unit (`zoneTarget`).
+	if ((target.kind === "before" || target.kind === "after") && target.pinned !== undefined) {
+		moveTarget.pinned = target.pinned;
+	}
 	// Only send `folderId: null` for a tab that actually leaves a folder; a top-level move
 	// stays the plain before/after primitive.
 	if (moveTarget.folderId === null && !source.folderId) delete moveTarget.folderId;

@@ -54,6 +54,7 @@ function resolveInternalDrop(
 	rows: RecentTabDropRow[],
 	pointer: { x: number; y: number },
 	container: { left: number; right: number; top: number; bottom: number },
+	pinDivider?: { top: number; bottom: number } | null,
 ): RecentTabDropTarget | null {
 	if (
 		pointer.x < container.left ||
@@ -63,7 +64,12 @@ function resolveInternalDrop(
 	) {
 		return null;
 	}
-	return resolveRecentTabDropTarget(rows, pointer.y, recentTabDragSource(model, sourceKey));
+	return resolveRecentTabDropTarget(
+		rows,
+		pointer.y,
+		recentTabDragSource(model, sourceKey),
+		pinDivider,
+	);
 }
 
 // A bounded submission includes serial moves and any required cache reconciliation.
@@ -158,7 +164,15 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 		if (!source || !pointer || !el) return;
 		const rect = el.getBoundingClientRect();
 		const rows = measureRows();
-		const target = resolveInternalDrop(modelRef.current, source, rows, pointer, rect);
+		const target = resolveInternalDrop(
+			modelRef.current,
+			source,
+			rows,
+			pointer,
+			rect,
+			// The divider is not a sortable row; measure it separately for the pin zone.
+			el.querySelector("[data-recent-tab-pin-divider]")?.getBoundingClientRect() ?? null,
+		);
 		// Only show what a release would actually do: dropping in place (or into the folder
 		// the tab is already in) plans nothing, so it draws nothing.
 		const next =
@@ -387,6 +401,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 							measureRows(),
 							pointer,
 							el.getBoundingClientRect(),
+							el.querySelector("[data-recent-tab-pin-divider]")?.getBoundingClientRect() ?? null,
 						)
 					: null;
 			const plan = target

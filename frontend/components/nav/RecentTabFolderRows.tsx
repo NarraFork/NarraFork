@@ -1,8 +1,8 @@
 /**
- * Sidebar folder rows: the header (icon, name, collapse chevron, status summary) and the
- * narrow strip under an open folder.
+ * Sidebar folder rows: the header (icon, name, member count, collapse chevron), the
+ * card behind a whole folder, and the "N more" control under an open folder.
  *
- * The strip has two jobs:
+ * The "N more" control (the strip) has two jobs:
  *   - click toggles between "preview" (first N members) and "expanded" (all members);
  *   - dragging it vertically changes N, in whole member rows, saved on release.
  * While expanded it is `position: sticky; bottom: 0`, so a folder longer than the list
@@ -13,13 +13,8 @@
 
 import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
 import { Badge, Box, Group, NavLink, Text, Tooltip, UnstyledButton } from "@mantine/core";
-import {
-	IconChevronDown,
-	IconChevronRight,
-	IconChevronsDown,
-	IconChevronsUp,
-	IconPin,
-} from "@tabler/icons-react";
+import type { RecentTabFolderColor } from "@shared/recent-tabs";
+import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { summarizeFolderMembers } from "../../hooks/recent-tab-folders";
 import type { FolderDisplay } from "./recent-tab-drag-model";
@@ -93,7 +88,6 @@ export function RecentTabFolderHeader({
 	t,
 }: RecentTabFolderHeaderProps) {
 	const collapsed = display === "collapsed";
-	const Chevron = collapsed ? IconChevronRight : IconChevronDown;
 	const FolderIcon = folderIconComponent(folder.folderIcon);
 	const color = folderColorVar(folder.folderColor);
 	// Left swipe opens the menu, like a tab row. No close-by-swipe: closing a folder also
@@ -131,21 +125,17 @@ export function RecentTabFolderHeader({
 					aria-expanded={!collapsed}
 					aria-label={t(collapsed ? "expandFolder" : "collapseFolder", { name: folder.title })}
 					label={
-						<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
-							{folder.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
-							<Text size="sm" fw={500} truncate>
-								{folder.title}
-							</Text>
-						</Group>
+						<Text size="sm" fw={500} truncate>
+							{folder.title}
+						</Text>
 					}
 					leftSection={
-						<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
-							<Chevron size={12} style={{ opacity: 0.6 }} />
+						<span style={{ display: "flex" }}>
 							<FolderIcon size={16} color={color} />
-						</Group>
+						</span>
 					}
 					rightSection={
-						<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+						<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
 							{collapsed && <HiddenStatus members={hidden} t={t} />}
 							<Tooltip
 								label={t("folderMemberCount", { count: members.length })}
@@ -156,20 +146,69 @@ export function RecentTabFolderHeader({
 									{members.length}
 								</Text>
 							</Tooltip>
+							<IconChevronDown
+								size={14}
+								style={{
+									opacity: 0.5,
+									transition: "transform 120ms ease",
+									transform: collapsed ? "rotate(-90deg)" : undefined,
+								}}
+							/>
 						</Group>
 					}
-					styles={{
-						root: {
-							cursor: "pointer",
-							...(color ? { boxShadow: `inset 3px 0 0 ${color}` } : {}),
-						},
-						label: { overflow: "hidden" },
-					}}
+					styles={{ root: { cursor: "pointer" }, label: { overflow: "hidden" } }}
 				/>
 			</div>
 		</div>
 	);
 }
+
+/**
+ * Background of a whole folder (header, members, "N more"): one rounded card, tinted by
+ * the folder's colour when it has one. This is what tells a folder's rows apart from the
+ * loose rows above and below it.
+ */
+export function recentTabFolderCardStyle(
+	color: RecentTabFolderColor | undefined,
+): React.CSSProperties {
+	return {
+		// The rows inside are NavLinks at the theme's `sm` radius; the card matches them.
+		borderRadius: "var(--mantine-radius-sm)",
+		background: folderCardFill(color),
+		margin: "2px 0",
+	};
+}
+
+function folderCardFill(color: RecentTabFolderColor | undefined): string {
+	return color ? `var(--mantine-color-${color}-light)` : "var(--mantine-color-default-hover)";
+}
+
+/**
+ * Thin line between a folder's pinned and unpinned members.
+ *
+ * Zero height on purpose: drop targeting reads a gap between rows as "between top-level
+ * units", so any space here would turn a drop aimed between two members into a drop
+ * after the whole folder. The line is painted over the seam instead.
+ */
+export function RecentTabFolderPinDivider() {
+	return (
+		<Box aria-hidden data-folder-pin-divider style={{ position: "relative", height: 0 }}>
+			<Box
+				style={{
+					position: "absolute",
+					top: 0,
+					left: TITLE_COLUMN_PX,
+					right: 12,
+					height: 1,
+					background: "var(--mantine-color-default-border)",
+				}}
+			/>
+		</Box>
+	);
+}
+
+/** Where every sidebar row's title starts: NavLink padding + 16px icon + icon gap. */
+const TITLE_COLUMN_PX = 40;
 
 /** Height of one member row, used to turn strip drag distance into a preview count. */
 const MEMBER_ROW_FALLBACK_PX = 44;
@@ -189,6 +228,8 @@ export interface RecentTabFolderStripProps {
 	onPreviewDrag: (count: number | null) => void;
 	/** Release after a drag, or an arrow key: persist this count. */
 	onPreviewCommit: (count: number) => void;
+	/** The Ctrl+Up / Ctrl+Down highlight is on this row (Enter toggles it). */
+	highlighted?: boolean;
 	t: T;
 }
 
@@ -210,9 +251,9 @@ export function RecentTabFolderStrip({
 	onToggleExpanded,
 	onPreviewDrag,
 	onPreviewCommit,
+	highlighted = false,
 	t,
 }: RecentTabFolderStripProps) {
-	const color = folderColorVar(folder.folderColor) ?? "var(--mantine-color-dimmed)";
 	const gesture = useRef<{ startY: number; base: number; rowPx: number; last: number } | null>(
 		null,
 	);
@@ -268,27 +309,33 @@ export function RecentTabFolderStrip({
 		[dragging, onPreviewCommit, onPreviewDrag],
 	);
 
+	// Visible text stays short; the aria-label says exactly what a click does.
+	const text = expanded
+		? t("folderShowFewer")
+		: hidden.length > 0
+			? t("folderMoreCount", { count: hidden.length })
+			: t("folderShowAll");
 	const label = expanded
 		? t("folderShowLess", { count: shown })
 		: hidden.length > 0
 			? t("folderShowMore", { count: hidden.length })
 			: t("folderShowAll");
-	const line = (
-		<Box
-			style={{
-				flex: 1,
-				height: 3,
-				borderRadius: 2,
-				background: color,
-				opacity: dragging ? 0.9 : 0.35,
-			}}
-		/>
-	);
+	const color = folderColorVar(folder.folderColor);
+	const fill = folderCardFill(folder.folderColor);
 	return (
 		<Box
 			style={
 				expanded
-					? { position: "sticky", bottom: 0, zIndex: 1, background: "var(--mantine-color-body)" }
+					? {
+							position: "sticky",
+							bottom: 0,
+							zIndex: 1,
+							// Sticks over other rows while expanded, so it needs an opaque fill: the
+							// card's translucent tint layered on the page colour.
+							background: `linear-gradient(${fill}, ${fill}), var(--mantine-color-body)`,
+							borderBottomLeftRadius: "var(--mantine-radius-sm)",
+							borderBottomRightRadius: "var(--mantine-radius-sm)",
+						}
 					: undefined
 			}
 		>
@@ -302,6 +349,7 @@ export function RecentTabFolderStrip({
 				<UnstyledButton
 					type="button"
 					data-folder-strip={folder.id}
+					data-active={highlighted || undefined}
 					aria-label={label}
 					aria-expanded={expanded}
 					onClick={() => {
@@ -317,6 +365,9 @@ export function RecentTabFolderStrip({
 					onPointerCancel={(e) => endDrag(e, false)}
 					onKeyDown={(e) => {
 						if (expanded || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+						// Plain arrows only: Ctrl+Up / Ctrl+Down is the sidebar's switch, and this row
+						// keeps focus after a click, so it would resize the folder on every switch.
+						if (e.ctrlKey || e.metaKey || e.altKey) return;
 						e.preventDefault();
 						const next = Math.max(
 							0,
@@ -328,33 +379,34 @@ export function RecentTabFolderStrip({
 						display: "flex",
 						alignItems: "center",
 						gap: 6,
-						width: "calc(100% - 20px)",
-						marginLeft: 20,
-						// A 3px line is the visual; the hit area is a comfortable finger height.
-						height: 24,
+						width: "100%",
+						// Lines the text up with every row title: NavLink padding (12) + icon (16) +
+						// icon gap (12).
+						paddingLeft: TITLE_COLUMN_PX,
+						paddingRight: 12,
+						height: 28,
 						cursor: dragging ? "ns-resize" : "pointer",
 						// Vertical drags resize the preview instead of scrolling (preview only).
 						touchAction: expanded ? "manipulation" : "none",
-						borderRadius: 4,
+						borderRadius: "var(--mantine-radius-sm)",
+						// The keyboard highlight, the same fill an active row has.
+						background: highlighted ? "var(--mantine-primary-color-light)" : undefined,
+						color: highlighted
+							? "var(--mantine-primary-color-light-color)"
+							: dragging && color
+								? color
+								: "var(--mantine-color-dimmed)",
 					}}
 				>
-					{line}
-					<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-						{!expanded && hidden.length > 0 && (
-							<>
-								<HiddenStatus members={hidden} t={t} />
-								<Text size="10px" c="dimmed" lh={1}>
-									+{hidden.length}
-								</Text>
-							</>
-						)}
-						{expanded ? (
-							<IconChevronsUp size={12} style={{ opacity: 0.6 }} />
-						) : (
-							<IconChevronsDown size={12} style={{ opacity: 0.6 }} />
-						)}
-					</Group>
-					{line}
+					<Text size="xs" inherit lh={1}>
+						{text}
+					</Text>
+					{expanded ? <IconChevronUp size={12} /> : <IconChevronDown size={12} />}
+					{!expanded && hidden.length > 0 && (
+						<Group gap={4} wrap="nowrap" ml="auto" style={{ flexShrink: 0 }}>
+							<HiddenStatus members={hidden} t={t} />
+						</Group>
+					)}
 				</UnstyledButton>
 			</Tooltip>
 		</Box>
