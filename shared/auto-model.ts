@@ -44,6 +44,10 @@ export interface AutoModelInfo {
 		subscription: boolean;
 		/** Reference input + output USD per million tokens, when the catalog knows it. */
 		referencePrice?: number;
+		/** Label of the credential a new request would use (key label, account name/email). */
+		credentialLabel?: string;
+		/** Epoch ms when this source can serve again, if it currently cannot. */
+		resetsAt?: number;
 	}>;
 }
 

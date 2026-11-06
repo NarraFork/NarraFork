@@ -6,7 +6,7 @@
  */
 import type { AutoModelInfo } from "@shared/auto-model";
 import { autoModelValue } from "@shared/auto-model";
-import { autoSourceFacts } from "../agent/auto-route-signals";
+import { autoSourceFacts, autoSourcePreview } from "../agent/auto-route-signals";
 import {
 	listAutoModelIds,
 	orderedAutoModelCandidates,
@@ -32,11 +32,14 @@ export function listAutoModels(
 			sources: orderedAutoModelCandidates(modelId).map((value) => {
 				const provider = parseModelId(value).provider as string;
 				const referencePrice = referencePricePerMillion(value);
+				const preview = autoSourcePreview(provider);
 				return {
 					value,
 					provider,
 					...autoSourceFacts(provider, now, value),
 					...(referencePrice !== undefined ? { referencePrice } : {}),
+					...(preview?.label ? { credentialLabel: preview.label } : {}),
+					...(preview?.resetsAt ? { resetsAt: preview.resetsAt } : {}),
 				};
 			}),
 		}))

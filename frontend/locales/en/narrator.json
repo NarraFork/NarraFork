@@ -841,6 +841,8 @@
 	"autoReasonSubscription": "Using {{provider}} now: within a subscription allowance",
 	"autoReasonCheapest": "Using {{provider}} now: lowest reference price among available sources",
 	"autoReasonFirst": "Using {{provider}} now: first available source in the list",
+	"autoSourceCredential": "Uses {{label}}",
+	"autoSourceResetsIn": "Available again in {{time}}",
 	"autoReasonNoneAvailable": "No source can serve now; {{provider}} is tried first",
 	"modelGroupAggregations": "Aggregations",
 	"editDefaultModel": "Change default model",

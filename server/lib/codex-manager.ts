@@ -2602,6 +2602,36 @@ export class CodexManager {
 		return this.poolEntries.filter((e) => !e.disabled).length;
 	}
 
+	/**
+	 * Read-only "which account would a new request use" for routing/selector display.
+	 * No revive, no quota application, no file write: unlike snapshot()/hasAvailableCredentials
+	 * this is safe to call while routing. Priority mode's first available account; balanced
+	 * modes rotate, so the label is only the highest-priority one, marked by the caller.
+	 * When none can serve, the earliest quota reset among the resting accounts is reported.
+	 */
+	get routingPreview(): { label?: string; resetsAt?: number; rotating: boolean } {
+		const available = this.poolEntries.filter((e) => !e.disabled);
+		const chosen = available.reduce<CodexCredential | undefined>(
+			(best, e) => (!best || e.priority < best.priority ? e : best),
+			undefined,
+		);
+		const rotating = this.loadBalancingMode !== "priority";
+		if (chosen) {
+			return {
+				...(chosen.displayName || chosen.email || chosen.accountId
+					? { label: chosen.displayName || chosen.email || chosen.accountId || "" }
+					: {}),
+				...(chosen.quotaResetsAt ? { resetsAt: chosen.quotaResetsAt } : {}),
+				rotating,
+			};
+		}
+		const resets = this.poolEntries
+			.map((e) => e.quotaResetsAt)
+			.filter((t): t is number => typeof t === "number" && t > Date.now())
+			.sort((a, b) => a - b)[0];
+		return { ...(resets ? { resetsAt: resets } : {}), rotating };
+	}
+
 	/** Number of retired credentials whose data is retained. */
 	get archivedCount(): number {
 		return this.entries.filter(isArchivedCodexCredential).length;

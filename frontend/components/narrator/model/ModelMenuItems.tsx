@@ -31,6 +31,7 @@ import {
 	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
+import { formatCountdown } from "../../../lib/relative-time";
 import { modelInheritanceLabel } from "./model-inheritance-label";
 import {
 	AUTO_FAMILY_GROUP_PREFIX,
@@ -734,6 +735,10 @@ export function ModelMenuItems({
 												const price = isAutoEntry
 													? null
 													: formatReferencePrice(source.referencePrice);
+												const resetIn =
+													!isAutoEntry && !source.available && source.resetsAt
+														? formatCountdown(source.resetsAt)
+														: undefined;
 												return (
 													<Menu.Item
 														key={`auto-source:${source.value}`}
@@ -818,6 +823,16 @@ export function ModelMenuItems({
 														{price && (
 															<Text size="xs" c="dimmed" lh={1.3}>
 																{t("autoSourcePrice", { price })}
+															</Text>
+														)}
+														{!isAutoEntry && source.credentialLabel && (
+															<Text size="xs" c="dimmed" lh={1.3} truncate>
+																{t("autoSourceCredential", { label: source.credentialLabel })}
+															</Text>
+														)}
+														{resetIn && (
+															<Text size="xs" c="dimmed" lh={1.3}>
+																{t("autoSourceResetsIn", { time: resetIn })}
 															</Text>
 														)}
 													</Menu.Item>

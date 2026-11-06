@@ -17,7 +17,7 @@ import { resolveKnownUnavailableNugModel } from "../nug-model-availability";
 import { isOpencodeCustomApiProvider } from "../opencode-usage-cache";
 import { getProviderKeyStore } from "../provider-keys";
 import { registerAutoSourceProbe, settings } from "../settings";
-import { keyCooldown, usableProviderKeys } from "./pooled-provider";
+import { keyCooldown, selectProviderKey, usableProviderKeys } from "./pooled-provider";
 
 /** A short rate-limit rest still counts as able to serve; quota and 403 rests do not. */
 function keyCanServe(keyId: string, now: number): boolean {
@@ -56,6 +56,29 @@ export function autoSourceFacts(
 	const available =
 		stored.length === 0 ? !!config.apiKey : keys.some((key) => keyCanServe(key.id, now));
 	return { available, subscription };
+}
+
+/**
+ * What the picker's source rows show: the credential a new request would use, and when this
+ * source comes back if it cannot serve now. Global, not per session: the source menu is not
+ * tied to one conversation, so the pool's session-affinity choice is not represented here.
+ * In-memory reads only.
+ */
+export function autoSourcePreview(
+	provider: string,
+): { label?: string; resetsAt?: number; rotating?: boolean } | null {
+	if (provider === "codex") return getCodexManager().routingPreview;
+	const config = settings.customApiProviders?.find((p) => p.prefix === provider);
+	if (!config) return null;
+	const chosen = selectProviderKey(config.id);
+	const blocked = usableProviderKeys(config.id)
+		.map((key) => keyCooldown(key.id)?.until)
+		.filter((t): t is number => typeof t === "number" && t > Date.now())
+		.sort((a, b) => a - b)[0];
+	return {
+		...(chosen?.label ? { label: chosen.label } : {}),
+		...(!chosen && blocked ? { resetsAt: blocked } : {}),
+	};
 }
 
 let installed = false;

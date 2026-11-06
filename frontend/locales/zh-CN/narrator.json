@@ -840,6 +840,8 @@
 	"autoReasonSubscription": "现在用 {{provider}}：订阅额度内",
 	"autoReasonCheapest": "现在用 {{provider}}：可用来源中参考价最低",
 	"autoReasonFirst": "现在用 {{provider}}：列表中第一个可用的来源",
+	"autoSourceCredential": "当前使用 {{label}}",
+	"autoSourceResetsIn": "{{time}}后可恢复",
 	"autoReasonNoneAvailable": "没有可用的来源，会先试 {{provider}}",
 	"modelGroupAggregations": "聚合",
 	"editDefaultModel": "修改默认模型",
