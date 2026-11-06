@@ -16,6 +16,19 @@
 }
 
 /*
+ * The session list's scrollbar sits at the expanded right edge, past the rail and out
+ * over the page while collapsed: hidden there, back once it opens. Wheel and keyboard
+ * scrolling still work.
+ */
+[data-nav-hover-panel="closed"] .nf-nav-tabs {
+	scrollbar-width: none;
+}
+
+[data-nav-hover-panel="closed"] .nf-nav-tabs::-webkit-scrollbar {
+	display: none;
+}
+
+/*
  * The rows reach past the rail while collapsed; each one is clipped to its icon below, so
  * the navbar itself never clips (that would cut the opening motion off at its edge).
  * Anything left unclipped, `nf-nav-expanded-only`, is hidden instead.
