@@ -9,6 +9,7 @@ import {
 	publicCredentialNetwork,
 	restoreMaskedProxy,
 } from "@shared/credential-network";
+import { SessionAffinity } from "./agent/session-affinity";
 import {
 	type AgentIdentityKey,
 	buildAgentAssertion,
@@ -354,11 +355,6 @@ interface PendingDeviceFlow {
 	abortController: AbortController;
 	resolve: (tokens: CodexTokens) => void;
 	reject: (error: Error) => void;
-}
-
-interface SessionAffinityEntry {
-	credentialId: string;
-	lastUsedAt: number;
 }
 
 // === File paths ===
@@ -738,7 +734,10 @@ export class CodexManager {
 	private agentTaskPromises = new Map<string, Promise<void>>();
 	private pendingDeviceFlow: PendingDeviceFlow | undefined;
 	private usageRefreshPromises = new Map<string, Promise<CodexUsageResult>>();
-	private sessionAffinity = new Map<string, SessionAffinityEntry>();
+	private sessionAffinity = new SessionAffinity<string>({
+		maxEntries: MAX_SESSION_AFFINITY_ENTRIES,
+		ttlMs: SESSION_AFFINITY_TTL_MS,
+	});
 	private readonly beforeExitHandler: () => void;
 	/** Exposed via snapshot so the frontend can show browser-auth errors. */
 	private _lastBrowserAuthError?: string;
@@ -806,9 +805,9 @@ export class CodexManager {
 			!!sessionKey;
 
 		if (stickyEnabled && sessionKey) {
-			const sticky = this.sessionAffinity.get(sessionKey);
-			if (sticky) {
-				const stickyEntry = this.entries.find((e) => e.id === sticky.credentialId);
+			const stickyCredentialId = this.sessionAffinity.get(sessionKey);
+			if (stickyCredentialId) {
+				const stickyEntry = this.entries.find((e) => e.id === stickyCredentialId);
 				if (!stickyEntry || stickyEntry.disabled || isArchivedCodexCredential(stickyEntry)) {
 					this.unbindSession(sessionKey);
 				} else {
@@ -1100,8 +1099,7 @@ export class CodexManager {
 	}
 
 	private bindSession(sessionKey: string, credentialId: string): void {
-		this.sessionAffinity.set(sessionKey, { credentialId, lastUsedAt: Date.now() });
-		this.pruneSessionAffinity();
+		this.sessionAffinity.set(sessionKey, credentialId);
 	}
 
 	private unbindSession(sessionKey: string): void {
@@ -1109,28 +1107,11 @@ export class CodexManager {
 	}
 
 	private evictSessionsByCredential(credentialId: string): void {
-		for (const [sessionKey, binding] of this.sessionAffinity) {
-			if (binding.credentialId === credentialId) {
-				this.sessionAffinity.delete(sessionKey);
-			}
-		}
+		this.sessionAffinity.evictValue(credentialId);
 	}
 
 	private pruneSessionAffinity(now = Date.now()): void {
-		for (const [sessionKey, binding] of this.sessionAffinity) {
-			if (now - binding.lastUsedAt > SESSION_AFFINITY_TTL_MS) {
-				this.sessionAffinity.delete(sessionKey);
-			}
-		}
-		if (this.sessionAffinity.size <= MAX_SESSION_AFFINITY_ENTRIES) return;
-		const sorted = [...this.sessionAffinity.entries()].sort(
-			(a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
-		);
-		const overflow = this.sessionAffinity.size - MAX_SESSION_AFFINITY_ENTRIES;
-		for (let i = 0; i < overflow; i++) {
-			const item = sorted[i];
-			if (item) this.sessionAffinity.delete(item[0]);
-		}
+		this.sessionAffinity.prune(now);
 	}
 
 	// ==================== Reporting ====================

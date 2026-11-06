@@ -20,6 +20,7 @@
 import { logger } from "../logger";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import { getProviderKeyStore, type ProviderKey } from "../provider-keys";
+import { SessionAffinity } from "./session-affinity";
 
 export { withProviderKey } from "../provider-keys";
 
@@ -47,8 +48,8 @@ interface Cooldown {
 }
 
 const cooldowns = new Map<string, Cooldown>();
-/** `${providerId}\0${session}` → key id. Insertion-ordered, trimmed to STICKY_LIMIT. */
-const sticky = new Map<string, string>();
+/** `${providerId}\0${session}` → key id; the key this session last used (no expiry). */
+const sticky = new SessionAffinity<string>({ maxEntries: STICKY_LIMIT });
 
 /**
  * Why a key is resting, if it is: a recent failure, or a usage window the quota cache
@@ -85,7 +86,7 @@ export function selectProviderKey(
 	if (keys.length === 0) return undefined;
 	const ready = keys.filter((key) => !keyCooldown(key.id, now));
 	const stickyKey = session ? `${providerId}\0${session}` : undefined;
-	const pinned = stickyKey ? sticky.get(stickyKey) : undefined;
+	const pinned = stickyKey ? sticky.get(stickyKey, now) : undefined;
 	const chosen =
 		ready.find((key) => key.id === pinned) ??
 		ready[0] ??
@@ -93,9 +94,8 @@ export function selectProviderKey(
 			(a, b) => (keyCooldown(a.id, now)?.until ?? 0) - (keyCooldown(b.id, now)?.until ?? 0),
 		)[0];
 	if (stickyKey && chosen) {
-		sticky.delete(stickyKey);
-		sticky.set(stickyKey, chosen.id);
-		if (sticky.size > STICKY_LIMIT) sticky.delete(sticky.keys().next().value as string);
+		// set() refreshes the binding and prunes past the cap.
+		sticky.set(stickyKey, chosen.id, now);
 	}
 	return chosen;
 }
