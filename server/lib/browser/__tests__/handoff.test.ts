@@ -62,6 +62,31 @@ describe("browser handoff persistence", () => {
 		expect(consumed?.sessions[1]?.interruptedProfileId).toBe("safe_ID-1");
 	});
 
+	test("keeps recorded viewports, accepts legacy sessions without one, drops malformed ones", () => {
+		writeBrowserHandoff({
+			wsEndpoints: {},
+			sessions: [
+				sampleSession({ sessionId: "legacy" }),
+				sampleSession({
+					sessionId: "mobile",
+					viewport: { width: 390, height: 844, deviceScaleFactor: 3, isMobile: true },
+				}),
+				sampleSession({
+					sessionId: "broken",
+					viewport: { width: "wide" } as unknown as BrowserSessionHandoff["viewport"],
+				}),
+			],
+		});
+		const consumed = consumeBrowserHandoff();
+		expect(consumed?.sessions.map((session) => session.sessionId)).toEqual(["legacy", "mobile"]);
+		expect(consumed?.sessions[1]?.viewport).toEqual({
+			width: 390,
+			height: 844,
+			deviceScaleFactor: 3,
+			isMobile: true,
+		});
+	});
+
 	test("writes CDP endpoints with private filesystem permissions", () => {
 		writeBrowserHandoff({
 			wsEndpoints: { headless: "ws://127.0.0.1:1234/devtools/browser/private" },
