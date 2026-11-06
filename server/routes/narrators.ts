@@ -25,6 +25,7 @@ import {
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
+import { isAbsoluteForFlavor, normalizeWorkspacePathFlavor } from "@shared/workspace-directories";
 import {
 	and,
 	asc,
@@ -58,6 +59,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
+import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
@@ -419,8 +421,10 @@ import {
 	reExecuteDeniedToolCall,
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
+	resolveNarratorDefaultDeviceRequest,
 	resolveOptionalToolState,
 	resolvePermissionOrDangerReflection,
+	resolveSessionDevices,
 	restoreAssistantMessage,
 	restoreOutputBlock,
 	retryFailedCompact,
@@ -918,6 +922,11 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"blacklist-dirs",
 	"cmd-whitelist",
 	"cmd-blacklist",
+	// Creating a session needs a device list and a directory browser BEFORE the
+	// narrator exists, so these cannot be keyed on a narrator id. Both authorize
+	// against the caller's own device visibility instead (`assertWorkspaceDeviceVisible`).
+	"workspace-devices",
+	"workspace-directory-browse",
 ]);
 
 /**
@@ -1413,6 +1422,161 @@ function standaloneNarratorCwd(
 	return decision.kind === "cwd" ? decision.cwd : undefined;
 }
 
+/**
+ * Which device a new session starts on.
+ *
+ * Only devices this caller can already see through the project axis (plus the OAuth
+ * allowlist) — the same list its tools are authorized against — and a remote one has to
+ * be online: creating a session on a device that cannot run anything would leave it
+ * stuck from its first tool call.
+ */
+async function resolveCreationDevice(
+	userId: string,
+	projectId: string | null | undefined,
+	requested: string,
+): Promise<string> {
+	const devices = (await resolveSessionDevices(projectId ?? null, userId)) ?? [];
+	const resolved = resolveNarratorDefaultDeviceRequest(requested, devices, { allowLocal: true });
+	return resolved ?? "local";
+}
+
+/**
+ * Validate a creation directory on a remote device.
+ *
+ * The path belongs to that machine, so it is checked in that machine's grammar and by
+ * that machine's own filesystem call — resolving it here would both misjudge a Windows
+ * path as relative and silently accept a directory that only exists on the server.
+ * There is deliberately no fallback to the device default directory: the session would
+ * then start somewhere the user did not pick.
+ */
+async function resolveRemoteCreationCwd(
+	deviceId: string,
+	requestedCwd: string | undefined,
+): Promise<string> {
+	let backend: ReturnType<typeof resolveBackend>;
+	try {
+		backend = resolveBackend({ requested: deviceId });
+	} catch {
+		throw new ValidationError(`Device is offline: ${deviceId}`);
+	}
+	const flavor = normalizeWorkspacePathFlavor(backend.pathFlavor);
+	const requested = requestedCwd?.trim();
+	if (!requested)
+		throw new ValidationError("Choose a working directory for the selected execution device");
+	if (!isAbsoluteForFlavor(requested, flavor))
+		throw new ValidationError("Working directory must be an absolute path on that device");
+	const normalized = backend.paths.normalize(requested);
+	let isDirectory = false;
+	let resolvedPath: string | undefined;
+	try {
+		const stat = await backend.statFile(normalized);
+		isDirectory = stat?.isDirectory === true;
+		resolvedPath = stat?.resolvedPath;
+	} catch (err) {
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
+	if (!isDirectory)
+		throw new ValidationError("Working directory does not exist or is not accessible");
+	return resolvedPath ?? normalized;
+}
+
+/**
+ * The caller must be able to see the device at all.
+ *
+ * An unknown id gets the same answer as an unauthorized one, so this cannot be used to
+ * enumerate device ids. Visibility is the same project-axis list (`getSessionDevices`,
+ * which already filters by project membership and private ownership) that authorizes
+ * the caller's own tool routing.
+ */
+async function assertWorkspaceDeviceVisible(
+	deviceId: string,
+	projectId: string | null,
+	userId: string,
+): Promise<NonNullable<Awaited<ReturnType<typeof resolveSessionDevices>>>[number]> {
+	const devices = (await resolveSessionDevices(projectId, userId)) ?? [];
+	const device = devices.find((entry) => entry.id === deviceId || entry.slug === deviceId);
+	if (!device) throw new ValidationError(`Unknown or unauthorized device: ${deviceId}`);
+	return device;
+}
+
+/**
+ * Devices this caller may start a session on.
+ *
+ * The creation dialog needs this list BEFORE a narrator exists, so it cannot be the
+ * per-narrator endpoint. Authorization is the caller's own device visibility; nothing
+ * here reveals a device the caller could not otherwise route tools to.
+ */
+narratorRoutes.get("/workspace-devices", async (c) => {
+	const projectId = c.req.query("projectId")?.trim() || null;
+	const devices = (await resolveSessionDevices(projectId, c.get("user").sub)) ?? [];
+	return c.json({
+		devices: devices.map((device) => ({
+			id: device.id,
+			name: device.name,
+			online: device.online,
+			platform: device.platform ? { os: device.platform.os } : undefined,
+			defaultCwd: device.defaultCwd ?? null,
+			ownedByActingUser: device.ownedByActingUser ?? false,
+			scope: device.scope,
+		})),
+	});
+});
+
+/**
+ * Browse one level of a device filesystem before the session exists.
+ *
+ * Deliberately narrower than `/:id/device-browse`: there is no narrator whose rules
+ * could anchor a non-admin caller, and `/api/devices` (arbitrary device browse) is
+ * admin-only because `allowRoots` defaults to empty. So a non-admin may only walk the
+ * subtree of the device's own declared workspace root (`defaultCwd`) — a path the
+ * creation dialog is handed anyway as `defaultCwd`, so listing inside it reveals
+ * nothing the caller could not already see. Widening that means changing the device's
+ * `defaultCwd` (or making the caller an administrator); there is intentionally no
+ * "browse anywhere" for non-admins.
+ */
+narratorRoutes.get("/workspace-directory-browse", async (c) => {
+	const deviceId = c.req.query("deviceId")?.trim();
+	if (!deviceId) throw new ValidationError("deviceId is required");
+	const parsed = deviceBrowseQuerySchema.safeParse({
+		path: c.req.query("path") || undefined,
+		showHidden: c.req.query("showHidden") === "1",
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const device = await assertWorkspaceDeviceVisible(
+		deviceId,
+		c.req.query("projectId")?.trim() || null,
+		c.get("user").sub,
+	);
+	// Admins already hold the unrestricted /api/devices browse capability, so deriving a
+	// narrower scope for them would only break the admin picker.
+	if (c.get("user").role !== "admin") {
+		// Resolve the target the way the listing itself will, then decide: a refused path
+		// never reaches the device.
+		let target: ReturnType<typeof resolveRemoteBrowseTarget>;
+		try {
+			target = resolveRemoteBrowseTarget(device.id, parsed.data.path);
+		} catch (err) {
+			throw new ValidationError(err instanceof Error ? err.message : String(err));
+		}
+		const allowed = isDeviceBrowsePathWithinNarratorScope({
+			requestedPath: target.path,
+			pathFlavor: target.pathFlavor,
+			defaultCwd: device.defaultCwd ?? null,
+			rules: [],
+		});
+		if (!allowed) throw new AppError(DEVICE_BROWSE_FORBIDDEN_MESSAGE, 403, "FORBIDDEN");
+	}
+	try {
+		return c.json(
+			await browseRemoteDirectory(device.id, parsed.data.path, {
+				showHidden: parsed.data.showHidden,
+			}),
+		);
+	} catch (err) {
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
+});
+
 // Create narrator
 narratorRoutes.post("/", async (c) => {
 	const body = await c.req.json();
@@ -1441,7 +1605,16 @@ narratorRoutes.post("/", async (c) => {
 		});
 		projectDir = project?.gitPath ?? undefined;
 	}
-	const resolvedCwd = standaloneNarratorCwd(input, projectDir);
+	// The device comes first: it decides what the directory even means.
+	const deviceId = await resolveCreationDevice(
+		ownerUserId,
+		input.contextProjectId,
+		input.deviceId?.trim() || "local",
+	);
+	const resolvedCwd =
+		deviceId === "local"
+			? standaloneNarratorCwd(input, projectDir)
+			: await resolveRemoteCreationCwd(deviceId, input.cwd);
 	// Only ordinary HTTP project sessions adopt the legacy project defaults. External
 	// provisioning still uses the service's private default and frozen OAuth policy.
 	const audiences = input.contextProjectId
@@ -1461,6 +1634,7 @@ narratorRoutes.post("/", async (c) => {
 			...input,
 			...audiences,
 			cwd: resolvedCwd,
+			defaultDeviceId: deviceId === "local" ? null : deviceId,
 			ownerUserId,
 			creatorIsAdmin: user.role === "admin",
 			locale,
@@ -1472,6 +1646,7 @@ narratorRoutes.post("/", async (c) => {
 		...input,
 		...audiences,
 		cwd: resolvedCwd,
+		defaultDeviceId: deviceId === "local" ? null : deviceId,
 		ownerUserId,
 	});
 	return c.json(publicNarratorResponse(narrator), 201);

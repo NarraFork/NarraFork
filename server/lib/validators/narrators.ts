@@ -79,6 +79,12 @@ export const createNarratorSchema = z.object({
 	permissionMode: permissionModeSchema.optional(),
 	startInPlanMode: z.boolean().optional(),
 	cwd: z.string().min(1).max(4096).optional(),
+	/**
+	 * Execution device the session starts on. Null/"local" (and omission) mean the
+	 * NarraFork server; a remote id must be one the caller can see and that is online,
+	 * and `cwd` is then an absolute path on that device, in its own grammar.
+	 */
+	deviceId: z.string().trim().min(1).max(128).nullish(),
 	reasoningEffort: reasoningEffortSchema.nullable().optional(),
 	/** @deprecated Use fastModeOverride. Kept so older clients keep working. */
 	fastMode: z.boolean().optional(),

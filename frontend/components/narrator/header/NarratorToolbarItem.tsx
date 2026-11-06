@@ -16,6 +16,7 @@ export type ToolbarInlineControls = Pick<
 	UseHeaderToolbarOptions,
 	| "executionDevicesQuery"
 	| "updateExecutionDeviceMutation"
+	| "onRequireDeviceDirectory"
 	| "renderLod"
 	| "renderLodIsDefault"
 	| "handleSelectLod"
@@ -79,9 +80,12 @@ export function NarratorToolbarItem({
 				label={t("executionDeviceSelector")}
 				localLabel={t("executionTargetLocal")}
 				offlineLabel={t("executionDeviceOffline")}
+				noDirectoryLabel={t("executionDeviceNoDirectory")}
+				directories={inlineControls.executionDevicesQuery.data?.directories}
 				devices={inlineControls.executionDevicesQuery.data?.devices ?? []}
 				currentDeviceId={inlineControls.executionDevicesQuery.data?.defaultDeviceId ?? "local"}
 				pending={inlineControls.updateExecutionDeviceMutation.isPending}
+				onRequireDirectory={inlineControls.onRequireDeviceDirectory}
 				onSelect={(deviceId) => inlineControls.updateExecutionDeviceMutation.mutate(deviceId)}
 			/>
 		);

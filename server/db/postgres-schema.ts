@@ -270,6 +270,9 @@ export const narrators = pgTable(
 		cwd: text("cwd"),
 		workspaceRevision: integer("workspace_revision").notNull().default(0),
 		workspaceContext: jsonText("workspace_context"),
+		workspaceDirectories: jsonText("workspace_directories")
+			.notNull()
+			.default(sql.raw("'{}'::text")),
 		errorMessage: text("error_message"),
 		errorRetryable: boolean("error_retryable"),
 		refsInheritedFrom: text("refs_inherited_from").references((): PgColumn => narrators.id, {}),
@@ -4232,7 +4235,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 136,
-  "columnCount": 1809,
+  "columnCount": 1810,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5734,6 +5737,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "workspaceDirectories",
+          "name": "workspace_directories",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "{}",
+          "defaultExpression": "sql.raw(\"'{}'::text\")"
         },
         {
           "property": "errorMessage",
