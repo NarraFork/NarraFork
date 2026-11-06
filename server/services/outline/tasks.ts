@@ -977,7 +977,9 @@ export interface OutlineContinuationCandidates {
  * A task with unfinished tasks under it is a `container`: listed (it is still open, and counts as
  * the person's work when it is theirs) but never the one continuation names or starts. A plan that
  * is not approved yet (`task_json.plan.state = planning`) is left out with every task under it: it
- * is never executed (D48 Q3).
+ * is never executed (D48 Q3). So is every task under a task a subagent of this session is doing
+ * (a delegation, outline P2 PR 9a): that tree is the subagent's while it runs, and comes back
+ * when its claim does.
  */
 export async function findContinuationCandidates(options: {
 	narratorId: string;
@@ -1071,9 +1073,10 @@ export async function findContinuationCandidates(options: {
 		return out;
 	};
 	const chains = new Map(live.map((block) => [block.id, above(block)]));
+	const delegated = await delegatedTasksAbove(store, chains, claims, options.narratorId, now);
 	const hidden = (block: OutlineBlockMeta): boolean =>
 		isPlanningRoot(block.taskJson) ||
-		(chains.get(block.id) ?? []).some((a) => isPlanningRoot(a.taskJson));
+		(chains.get(block.id) ?? []).some((a) => isPlanningRoot(a.taskJson) || delegated.has(a.id));
 	const shown = inOrder.filter((block) => !hidden(block));
 	const containers = new Set<string>();
 	for (const block of shown) {
@@ -1140,6 +1143,42 @@ export async function findContinuationCandidates(options: {
 			wait: isWaiting(waits.get(block.id)) ? (waits.get(block.id) as OutlineTaskWait) : null,
 		}));
 	return { candidates, waiting, ordered: all, truncated, personWork };
+}
+
+/**
+ * Of the open tasks above the blocks read, those a subagent of `narratorId`'s session is doing
+ * (its lease running): what is under them is the subagent's work while it runs. Their claims are
+ * read in one indexed batch (those not read already), and the holders' sessions in one more; at
+ * most {@link OUTLINE_TASK_LIMITS.candidateScan} tasks are considered.
+ */
+async function delegatedTasksAbove(
+	store: OutlineStore,
+	chains: ReadonlyMap<string, readonly OutlineBlockMeta[]>,
+	claims: Map<string, OutlineTaskClaimRow>,
+	narratorId: string,
+	now: string,
+): Promise<Set<string>> {
+	const ids = new Set<string>();
+	for (const chain of chains.values()) {
+		for (const a of chain) {
+			if (ids.size >= OUTLINE_TASK_LIMITS.candidateScan) break;
+			if (a.taskJson && isOpenTask(a.taskJson)) ids.add(a.id);
+		}
+	}
+	if (ids.size === 0) return new Set();
+	const unread = [...ids].filter((id) => !claims.has(id));
+	for (const [id, claim] of await getOutlineTaskClaims(unread, { store })) claims.set(id, claim);
+	const held = new Map<string, string>();
+	for (const id of ids) {
+		const claim = claims.get(id);
+		const holder = claim?.holderNarratorId;
+		if (holder && holder !== narratorId && isClaimLive(claim, now)) held.set(id, holder);
+	}
+	if (held.size === 0) return new Set();
+	const roots = await store.getNarratorRoots([...new Set(held.values())]);
+	const out = new Set<string>();
+	for (const [id, holder] of held) if (roots.get(holder)?.root === narratorId) out.add(id);
+	return out;
 }
 
 /**
