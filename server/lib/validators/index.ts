@@ -97,6 +97,7 @@ export {
 	listKnowledgeEntriesQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
+	markSubmissionOutcomesReadSchema,
 	rebaseKnowledgeDraftQuerySchema,
 	resolveKnowledgeConflictSchema,
 	resubmitKnowledgeSubmissionSchema,

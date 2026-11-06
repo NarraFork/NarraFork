@@ -19,6 +19,7 @@ import {
 	listKnowledgeEntriesQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
+	markSubmissionOutcomesReadSchema,
 	rebaseKnowledgeDraftQuerySchema,
 	resolveKnowledgeConflictSchema,
 	resubmitKnowledgeSubmissionSchema,
@@ -658,6 +659,20 @@ knowledgeRoutes.get("/my-submission-outcomes", async (c) => {
 	const parsed = listDraftSubmissionsQuerySchema.safeParse({ limit: c.req.query("limit") });
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await knowledgeBranchService.listMySubmissionOutcomes(principalOf(c), parsed.data));
+});
+
+// Unread half of the same list, for the bell badge. Split from the list call so the badge
+// stays one bounded query even when the panel is closed.
+knowledgeRoutes.get("/my-submission-outcomes/unread-count", async (c) =>
+	c.json(await knowledgeBranchService.countUnreadSubmissionOutcomes(principalOf(c))),
+);
+
+// The author acknowledging a verdict they just opened. Server scopes the update to the
+// caller's own submissions; ids belonging to anyone else are ignored, not rejected.
+knowledgeRoutes.post("/my-submission-outcomes/read", async (c) => {
+	const parsed = markSubmissionOutcomesReadSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeBranchService.markSubmissionOutcomesRead(principalOf(c), parsed.data));
 });
 
 // ─── Bulk grants + collection ACL readback (admin only) ─────────────────

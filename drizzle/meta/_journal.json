@@ -1681,6 +1681,13 @@
       "when": 1793797128464,
       "tag": "0239_recent_tab_folders",
       "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "6",
+      "when": 1793985128589,
+      "tag": "0240_aromatic_rockslide",
+      "breakpoints": true
     }
   ]
 }

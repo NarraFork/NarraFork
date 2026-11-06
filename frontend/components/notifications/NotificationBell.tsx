@@ -3,7 +3,7 @@ import { IconBell } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
-import { useMyKnowledgeSubmissionOutcomes, useReviewInboxCount } from "../../hooks/useKnowledge";
+import { useUnreadSubmissionOutcomeCount, useReviewInboxCount } from "../../hooks/useKnowledge";
 import {
 	NotificationCenterLazyDrawer,
 	preloadNotificationCenterDrawer,
@@ -18,7 +18,7 @@ export function NotificationBell() {
 	const counts = useNotificationUnreadCounts();
 	const attention = useHumanAttention();
 	const reviewInbox = useReviewInboxCount();
-	const reviewOutcomes = useMyKnowledgeSubmissionOutcomes();
+	const reviewUnread = useUnreadSubmissionOutcomeCount();
 	const items = loadedHumanAttentionItems(attention.data?.pages);
 	const hasAttention = items.length > 0 || attention.hasNextPage;
 	const unknown = attention.isError || counts.isError;
@@ -26,8 +26,13 @@ export function NotificationBell() {
 	const conversationLabel = attentionPending
 		? null
 		: formatUnreadBadge(counts.data?.unreadConversations, counts.data?.conversationsLowerBound);
-	const reviewCount = (reviewInbox.data?.count ?? 0) + (reviewOutcomes.data?.length ?? 0);
-	const reviewLabel = formatUnreadBadge(reviewCount, reviewInbox.data?.capped === true);
+	// Only UNREAD verdicts count: a verdict the author has opened keeps its row in the
+	// panel but must not hold the badge up.
+	const reviewCount = (reviewInbox.data?.count ?? 0) + (reviewUnread.data?.count ?? 0);
+	const reviewLabel = formatUnreadBadge(
+		reviewCount,
+		reviewInbox.data?.capped === true || reviewUnread.data?.capped === true,
+	);
 	// Attention and unread conversations keep the badge they had. Knowledge review
 	// fills it only when those are idle and empty, so a pending inbox is not silent.
 	const label = hasAttention
