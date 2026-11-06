@@ -57,12 +57,12 @@ export function isAbsoluteForFlavor(cwd: string, flavor: WorkspacePathFlavor): b
 }
 
 /**
- * Best-effort guess for legacy entries that predate `pathFlavor`.
+ * Best-effort guess for data that predates `pathFlavor`.
  *
  * A leading `/` is *not* evidence of Windows: it is a rooted Windows path but
  * also the only POSIX absolute form. Only a drive letter or a backslash is.
  */
-function inferFlavorFromPath(cwd: string): WorkspacePathFlavor {
+export function inferWorkspacePathFlavor(cwd: string): WorkspacePathFlavor {
 	return /^[a-zA-Z]:[\\/]/.test(cwd) || cwd.includes("\\") ? "windows" : "posix";
 }
 
@@ -74,7 +74,7 @@ function parseEntry(raw: unknown): WorkspaceDirectoryEntry | null {
 	const flavor =
 		record.pathFlavor === "windows" || record.pathFlavor === "posix"
 			? record.pathFlavor
-			: inferFlavorFromPath(cwd);
+			: inferWorkspacePathFlavor(cwd);
 	return { cwd, pathFlavor: flavor };
 }
 
