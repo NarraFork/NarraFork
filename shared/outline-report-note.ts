@@ -71,15 +71,39 @@ function withoutFileChanges(text: string): string {
 }
 
 /**
+ * What the subagent runner appends after a foreground result (`subagent-runner.ts`), the last one
+ * first: the note that the alias asked for was taken (`aliasConflictNote`), and the note that the
+ * parent's model is not in the subagent pool (`formatSubagentModelFallbackNote`). Each is one
+ * line; `outline-report-note-trailers.test.ts` holds these to the writers.
+ */
+const RUNNER_TRAILERS = [
+	/\n\nNote: The requested alias "[^\n]*" was already taken\. This agent was assigned "[^\n]*" instead\.(?: Use this alias with Await or Send to reference this agent\.)?$/,
+	/\n\nNote: the parent model "[^\n]*" is not in the allowed "[^\n]*" subagent model pool, so this subagent ran on "[^\n]*" instead\.$/,
+];
+/** The runner's notes are short: only this much of the end is looked at for them. */
+const RUNNER_TRAILER_WINDOW = 2048;
+
+/** The text without what the runner and the run service append after the note. */
+function withoutTrailers(text: string): string {
+	let body = text.trimEnd();
+	for (const trailer of RUNNER_TRAILERS) {
+		const from = Math.max(0, body.length - RUNNER_TRAILER_WINDOW);
+		const match = trailer.exec(body.slice(from));
+		if (match) body = body.slice(0, from + match.index).trimEnd();
+	}
+	return withoutFileChanges(body);
+}
+
+/**
  * The note at the end of a delegated result, or null when the text has none. The note is the
  * writer's three lines (its head line in the exact form, one line of text, the closing tag), the
- * last thing in the text but for the run service's file-change block; only the last
- * {@link OUTLINE_REPORT_NOTE_WINDOW} characters before that block are looked at. A head line a
- * report quotes anywhere else is the report's text.
+ * last thing in the text but for the run service's file-change block and the runner's notes after
+ * it; only the last {@link OUTLINE_REPORT_NOTE_WINDOW} characters before those are looked at. A
+ * head line a report quotes anywhere else is the report's text.
  */
 export function readOutlineReportNote(text: string | null | undefined): OutlineReportNote | null {
 	if (!text) return null;
-	const body = withoutFileChanges(text).trimEnd();
+	const body = withoutTrailers(text).trimEnd();
 	if (!body.endsWith(CLOSE)) return null;
 	const lines = body.slice(Math.max(0, body.length - OUTLINE_REPORT_NOTE_WINDOW)).split("\n");
 	if (lines.length < 3) return null;
@@ -127,7 +151,7 @@ export function readDelegationStarted(
  */
 export function noteLinkTitle(text: string | null | undefined, address: string): string | null {
 	if (!text || !address || !readOutlineReportNote(text)) return null;
-	const body = withoutFileChanges(text).trimEnd();
+	const body = withoutTrailers(text).trimEnd();
 	const tail = body.slice(body.lastIndexOf("\n", body.length - CLOSE.length - 2) + 1);
 	const needle = `[[${address}|`;
 	const at = tail.lastIndexOf(needle);

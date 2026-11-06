@@ -138,8 +138,12 @@ function decodeSpaceCursor(cursor: string): string {
 export const OUTLINE_BOARD_NEW_DONE = {
 	/** Tasks finished longer ago than this are never marked. */
 	windowDays: 14,
-	/** Versions of a done task looked at, newest first, to find the one that finished it. */
-	versionsBack: 4,
+	/**
+	 * Versions of a done task looked at, newest first, to find the one that finished it. Each
+	 * step back past the first two is one batched keyed read, only for the tasks still looking
+	 * (at most the finished tasks a board shows).
+	 */
+	versionsBack: 8,
 	/** A person's seen rows older than this are pruned when they write more. */
 	keepSeenDays: 30,
 } as const;

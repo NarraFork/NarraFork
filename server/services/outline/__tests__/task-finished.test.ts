@@ -24,6 +24,7 @@ import * as injection from "../../narrator-injection";
 import { type InjectionScheduler, setInjectionScheduler } from "../../narrator-injection";
 import * as refsStore from "../../narrator-refs/store";
 import { invalidateTaskBackend } from "../../task-source";
+import * as backendModule from "../../task-source/backend";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import {
 	deliverOutlineTaskFinished,
@@ -542,9 +543,15 @@ describe("limits", () => {
 			ids.push((task as { blockId: string }).blockId);
 		}
 		const sent = capture();
-		await deliverOutlineTaskFinished(
-			eventOf(await write(space.id, asAgent(doer, owner), finish(ids))),
-		);
+		const event = eventOf(await write(space.id, asAgent(doer, owner), finish(ids)));
+		const reads = spyOn(backendModule, "readTaskBackend");
+		try {
+			await deliverOutlineTaskFinished(event);
+			// The session past the cap is not even read.
+			expect(reads).toHaveBeenCalledTimes(OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit);
+		} finally {
+			reads.mockRestore();
+		}
 		expect(sent).toHaveLength(OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit);
 		for (const message of sent)
 			expect(message.body.kind === "outlineTasks" && message.body.items.length).toBe(1);

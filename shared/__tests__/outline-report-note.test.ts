@@ -101,6 +101,28 @@ describe("readOutlineReportNote", () => {
 		expect(readOutlineReportNote(text)?.reason).toBe("taken_over");
 	});
 
+	test("the runner's notes after it (model fallback, alias taken) do not hide it", () => {
+		const files = "\n\n<subagent_file_changes>\n- src/auth.ts +12 -3\n</subagent_file_changes>";
+		const fallback =
+			'\n\nNote: the parent model "big-model" is not in the allowed "general" subagent model pool, so this subagent ran on "small-model" instead.';
+		const alias = (background: boolean) =>
+			`\n\nNote: The requested alias "fixer" was already taken. This agent was assigned "fixer-2" instead.${background ? "" : " Use this alias with Await or Send to reference this agent."}`;
+		for (const after of [
+			fallback,
+			alias(false),
+			alias(true),
+			`${fallback}${alias(false)}`,
+			`${files}${fallback}${alias(false)}`,
+		])
+			expect(readOutlineReportNote(`Report.\n\n${LATE}${after}`)?.reason).toBe("taken_over");
+		expect(
+			readSubagentDelegation("Kx81mPqa/Ab3dEf9Q", `Report.\n\n${CURRENT}${files}${fallback}`),
+		).toEqual({ title: "Fix the refresh race", address: "Kx81mPqa/Ab3dEf9Q", late: null });
+		// Anything else after the note is the report's: the note is not the result's.
+		expect(readOutlineReportNote(`Report.\n\n${LATE}\n\nNote: something else.`)).toBeNull();
+		expect(readOutlineReportNote(`Report.\n\n${LATE}${alias(false)}\n\nMore.`)).toBeNull();
+	});
+
 	test("only the text's end is read, however long the report", () => {
 		const long = "x".repeat(200_000);
 		expect(readOutlineReportNote(`${long}\n\n${LATE}`)?.reason).toBe("taken_over");

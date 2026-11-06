@@ -347,6 +347,11 @@ export async function readOutlineTaskFinishedMessages(
 		if (finisherRoot !== null && root === finisherRoot) continue;
 		// A person's change PR 5 already tells this session of.
 		if (told.get(task.blockId) === root) continue;
+		// As many sessions as one commit tells are found: another is not even read.
+		if (!byManager.has(root) && byManager.size >= OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit) {
+			dropped++;
+			continue;
+		}
 		if (!backends.has(root)) {
 			// One session that cannot be read does not keep the others from being told.
 			const outline = await readTaskBackend(root)
@@ -363,9 +368,7 @@ export async function readOutlineTaskFinishedMessages(
 		if (!backends.get(root)) continue;
 		const list = byManager.get(root);
 		if (list) list.push(task);
-		else if (byManager.size < OUTLINE_TASK_FINISHED_LIMITS.sessionsPerCommit)
-			byManager.set(root, [task]);
-		else dropped++;
+		else byManager.set(root, [task]);
 	}
 	if (dropped > 0)
 		logger.warn("A commit finished tasks of more sessions than it tells", {

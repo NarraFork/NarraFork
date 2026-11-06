@@ -364,9 +364,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		// The tool card is announced by the run itself, with the model each run uses.
 
 		const conflictNote = aliasRegistration.conflicted
-			? `\n\nNote: The requested alias "${alias || title || subagentId}" was already taken. ` +
-				`This agent was assigned "${aliasRegistration.alias}" instead.` +
-				(background ? "" : " Use this alias with Await or Send to reference this agent.")
+			? aliasConflictNote(alias || title || subagentId, aliasRegistration.alias, background)
 			: "";
 
 		if (background) {
@@ -469,6 +467,22 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			});
 		throw error;
 	}
+}
+
+/**
+ * The note after a result whose alias was taken (the card's text reader strips it before it reads
+ * the outline note: `@shared/outline-report-note`).
+ */
+export function aliasConflictNote(
+	requested: string,
+	assigned: string,
+	background: boolean,
+): string {
+	return (
+		`\n\nNote: The requested alias "${requested}" was already taken. ` +
+		`This agent was assigned "${assigned}" instead.` +
+		(background ? "" : " Use this alias with Await or Send to reference this agent.")
+	);
 }
 
 const NOT_STARTED = "The delegated agent's run did not start; its task was given back";
