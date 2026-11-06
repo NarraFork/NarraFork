@@ -7,7 +7,13 @@
  *     session's language, like the plan review's block (outline P2 PR 8b).
  *
  * The note added to a result starts with one fixed line, `<outline_report … status="…">`, which
- * the tool card reads (outline P2 PR 9b): change it only together with its reader.
+ * the tool card reads (outline P2 PR 9b): change it only together with its reader. A reader takes
+ * the LAST such head line of the result and nothing before it: the note is always the last three
+ * lines, and a report may quote a note of the same form in its text (left there as it is).
+ *
+ * `reason="reclaimed"` means the delegating session holds the task again at a later generation:
+ * it took the task up itself (after it went back to do, say), or another of its agents was sent
+ * with it since and has handed it back. The claim cannot tell which; a label must not claim one.
  */
 
 /** Language of the blocks written under a task. */
@@ -117,7 +123,7 @@ export const DELEGATION_TEXT = {
 			redelegated: (epoch: number) =>
 				`Late result: since this agent was sent, the task was delegated again (claim generation ${epoch}).`,
 			reclaimed: (epoch: number) =>
-				`Late result: since this agent was sent, this session took the task up again (claim generation ${epoch}); the work since may be its own or another agent's.`,
+				`Late result: since this agent was sent, the task was claimed again in this session (claim generation ${epoch}): this session took it up itself, or another of its agents was sent with it and has handed it back.`,
 			ended: (by: string, status: string) =>
 				`Late result: since this agent was sent, the task was ticked ${status} by ${by}.`,
 			reopened:

@@ -37,8 +37,9 @@
  * to the root on the idle lease, generation unchanged (`lease-keeper.ts`). Archiving a delegated
  * subagent (Agent `archive`, a history rollback) gives the task back the same way first
  * (`subagent-lifecycle.ts`), so the task stays with the session (design §2.9). A subagent of the
- * session that holds the task but is not running (it never started) does not block delegating it
- * again. Continuation leaves the task, and the tasks under it, to the subagent meanwhile
+ * session that holds the task but is not running (a server stopped before it started) does not
+ * block delegating it again; one whose delegation is between its commit and the start of its run
+ * counts as running (`startingDelegations`), so two agents never get the same task. Continuation leaves the task, and the tasks under it, to the subagent meanwhile
  * (`tasks.ts`).
  *
  * ATTACHING (`attachDelegatedReport`, from the run service when a result is delivered)
@@ -73,6 +74,7 @@ import { createHash } from "node:crypto";
 import { db } from "@server/db";
 import { narrators, narratorToolCalls } from "@server/db/schema";
 import { AppError, ValidationError } from "@server/lib/errors";
+import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import type { DelegatedTaskRegistration } from "@server/lib/validators/runtime-registration";
@@ -566,8 +568,28 @@ export async function prepareOutlineDelegation(args: {
 	};
 }
 
-/** Whether a narrator has a run in this process (executing, held, or finishing). */
+/**
+ * Subagents a delegation of this process handed a task to whose run has not started yet: from
+ * just before the delegation's commit until their run starts, or the delegation is undone. A
+ * sibling `Agent({ task })` checking in that window must see them as running.
+ */
+const startingDelegations = hotSafe(
+	"narrafork.outline.startingDelegations",
+	() => new Set<string>(),
+);
+
+/** The subagent's run has started (or its delegation was undone): it is running, or nothing. */
+export function delegationStarted(subagentId: string): void {
+	startingDelegations.delete(subagentId);
+}
+
+/**
+ * Whether a narrator is running in this process (executing, held, finishing, or a delegation
+ * about to start it). A subagent holding a task without any of these was left by a server that
+ * stopped before it ran: it does not block delegating the task again.
+ */
 async function isRunning(narratorId: string): Promise<boolean> {
+	if (startingDelegations.has(narratorId)) return true;
 	const { getExecutionOwner, getRunControl } = await import("../agent-runtime/ownership");
 	return !!getRunControl(narratorId) || !!getExecutionOwner(narratorId);
 }
@@ -689,8 +711,12 @@ export async function delegateOutlineTask(args: {
 	const call = await db.query.narratorToolCalls
 		.findFirst({ where: eq(narratorToolCalls.id, args.toolCallId), columns: { messageId: true } })
 		.catch(() => undefined);
+	// Running, as far as a sibling delegation can tell, from before the commit lands until the
+	// caller has started its run (`delegationStarted`).
+	startingDelegations.add(subagentId);
+	let written: Awaited<ReturnType<typeof writeOutline>>;
 	try {
-		await writeOutline(
+		written = await writeOutline(
 			{
 				spaceId: delegation.spaceId,
 				ops: [
@@ -723,11 +749,15 @@ export async function delegateOutlineTask(args: {
 		);
 	} catch (error) {
 		// Not delegated after all: the registration names no task (the subagent never runs).
+		startingDelegations.delete(subagentId);
 		await setRuntimeRegistration(subagentId, current).catch(() => {});
 		throw await delegationRefusal(error, delegation, subagentId, store);
 	}
-	const block = await store.getBlock(delegation.blockId);
-	return { registration: registered, versionSeq: block?.versionSeq ?? delegation.versionSeq };
+	// The version the delegation itself left: a task to do was versioned by its commit; one in
+	// progress already kept the version it was checked at (only its claim changed).
+	const versionSeq =
+		delegation.status === "todo" && written.commit ? written.commit.seq : delegation.versionSeq;
+	return { registration: registered, versionSeq };
 }
 
 /** Why the delegation's commit was refused, as the agent is told. */
@@ -772,8 +802,11 @@ async function delegationRefusal(
 
 /**
  * Undo a delegation whose subagent never ran (its Agent call failed after the delegation's
- * commit): a task that was to do goes back to do (written against the version the delegation
- * left, so a change made since stays); otherwise, or when that cannot be written, the task goes
+ * commit): a task that was to do goes back to do, written against the version the delegation's
+ * commit left. Changed since, it goes back to do all the same while it is still exactly the
+ * delegation's (in progress, held by the subagent at its generation: its text was edited, say);
+ * finished, reset or taken by someone since, it is theirs and left alone. Otherwise (a task that
+ * was in progress already, or one that cannot be written) whatever the subagent still holds goes
  * back to the session as a run's end would hand it back. The caller archives the subagent then.
  */
 export async function undoOutlineDelegation(args: {
@@ -784,36 +817,64 @@ export async function undoOutlineDelegation(args: {
 	store?: OutlineStore;
 }): Promise<void> {
 	const { delegation } = args;
-	if (delegation.status === "todo") {
-		try {
-			await writeOutline(
-				{
-					spaceId: delegation.spaceId,
-					ops: [
-						{
-							op: "setTask",
-							block: { id: delegation.blockId },
-							task: { status: "todo" },
-							baseVersionSeq: args.delegated.versionSeq,
-						},
-					],
-					actor: { kind: "system", id: OUTLINE_DELEGATION_ACTOR },
-					responsibleUserId: args.userId,
-					narratorId: delegation.delegatorNarratorId,
-					toolCallId: args.delegated.registration.toolCallId,
-					summary: DELEGATION_TEXT.summary.undone(delegation.address, args.subagentId),
-				},
-				{ store: args.store },
-			);
-			return;
-		} catch (error) {
-			logger.warn("Delegated task could not be set back to do", {
-				subagentId: args.subagentId,
-				error: error instanceof Error ? error.message : String(error),
-			});
+	const store = args.store ?? outlineStore;
+	try {
+		if (delegation.status === "todo") {
+			const back = (versionSeq: number) =>
+				writeOutline(
+					{
+						spaceId: delegation.spaceId,
+						ops: [
+							{
+								op: "setTask",
+								block: { id: delegation.blockId },
+								task: { status: "todo" },
+								baseVersionSeq: versionSeq,
+							},
+						],
+						actor: { kind: "system", id: OUTLINE_DELEGATION_ACTOR },
+						responsibleUserId: args.userId,
+						narratorId: delegation.delegatorNarratorId,
+						toolCallId: args.delegated.registration.toolCallId,
+						summary: DELEGATION_TEXT.summary.undone(delegation.address, args.subagentId),
+					},
+					{ store },
+				);
+			try {
+				await back(args.delegated.versionSeq);
+				return;
+			} catch (error) {
+				if (!(error instanceof OutlineConflictError)) throw error;
+				// Changed since the delegation (its text, say): set back to do all the same, once,
+				// while it is still exactly the delegation's (in progress, the subagent's claim of that
+				// generation). Finished, reset or taken by someone since: theirs, left alone.
+				const [block, claim] = await Promise.all([
+					store.getBlock(delegation.blockId),
+					store.getTaskClaims([delegation.blockId]).then((rows) => rows[0] ?? null),
+				]);
+				if (
+					block &&
+					!block.deleted &&
+					block.taskJson?.status === "doing" &&
+					claim?.holderNarratorId === args.subagentId &&
+					claim.epoch === delegation.epoch
+				) {
+					await back(block.versionSeq);
+					return;
+				}
+			}
 		}
+	} catch (error) {
+		logger.warn("Delegated task could not be set back to do", {
+			subagentId: args.subagentId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	} finally {
+		delegationStarted(args.subagentId);
 	}
-	await idleOutlineTaskClaims(args.subagentId, args.store ? { store: args.store } : {});
+	// Whatever the subagent still holds goes back to the session (nothing, when someone else has
+	// the task now).
+	await idleOutlineTaskClaims(args.subagentId, { store });
 }
 
 /** The line added after `<background_task_id>` when an agent was sent with a task. */

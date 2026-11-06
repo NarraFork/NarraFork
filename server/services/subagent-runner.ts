@@ -413,6 +413,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				resumeRunId: task.logicalRunId ?? undefined,
 			});
 			if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
+			if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 			delegatedBeforeRun = null;
 			void handle.terminal.finally(() => updateLease.release());
 			return (
@@ -438,6 +439,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			foreground: true,
 		});
 		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
+		if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 		delegatedBeforeRun = null;
 		void handle.terminal.finally(() => updateLease.release());
 		if (getSearchExecutionScope()) {
@@ -463,6 +465,12 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 const NOT_STARTED = "The delegated agent's run did not start; its task was given back";
 
+/** The delegated subagent's run started: it counts as running through its run from now on. */
+async function delegationRunStarted(subagentId: string): Promise<void> {
+	const { delegationStarted } = await import("./outline/delegation");
+	delegationStarted(subagentId);
+}
+
 /**
  * A subagent that took its delegated task but never ran (its Agent call failed after the
  * delegation's commit): the delegation is undone (a task that was to do is to do again, otherwise
@@ -482,6 +490,7 @@ async function giveBackDelegatedTask(args: {
 			subagentId: args.subagentId,
 			error: error instanceof Error ? error.message : String(error),
 		});
+		await delegationRunStarted(args.subagentId).catch(() => {});
 	}
 	// A background task row created for it is settled, so nothing waits on a run that never was.
 	await backgroundTaskService.cancel(args.subagentId).catch(() => false);

@@ -40,6 +40,7 @@ import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import type { OutlineStore, OutlineTaskClaimRow } from "../outline/store/port";
 import { findContinuationCandidates, renewOutlineTaskLeases } from "../outline/tasks";
+import * as writeModule from "../outline/write";
 import { writeOutline } from "../outline/write";
 import { archiveRetiredSubagents, interruptAndArchiveSubagent } from "../subagent-lifecycle";
 import {
@@ -452,6 +453,69 @@ describe("the window between the checks and the delegation's commit (review S1, 
 		}
 	});
 
+	test("a person reassigns it to someone: refused, the assignment stands", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const spy = inTheWindow(async () => {
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "setTask", block: { id: task.blockId }, task: { assignee: "human:x" } }],
+				actor: { kind: "human", id: owner },
+				responsibleUserId: owner,
+			});
+		});
+		try {
+			const { result, childId } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("changed while it was being delegated");
+			const block = await blockOf(task.blockId);
+			expect(block.taskJson).toMatchObject({ status: "todo", assignee: "human:x" });
+			expect(await claimOf(task.blockId)).toBeNull();
+			await archived(childId);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("a sibling Agent call checking after the commit, before the first run starts: refused (review S4)", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { task } = await seedTask(root, owner);
+		const persist = narratorService.persistSubagentUserMessage.bind(narratorService);
+		let sibling: Awaited<ReturnType<typeof agent>> | null = null;
+		const spy = spyOn(narratorService, "persistSubagentUserMessage").mockImplementation(
+			async (...args) => {
+				// The first delegation has committed and not started its run yet.
+				if (!sibling)
+					sibling = await agent(root, owner, { task: task.address, run_in_background: true });
+				return await persist(...args);
+			},
+		);
+		const open = gate();
+		model.script = [{ text: "the only report", gate: open.promise }];
+		try {
+			const first = await agent(root, owner, { task: task.address, run_in_background: true });
+			expect(first.result.isError).toBeFalsy();
+			const second = sibling as unknown as Awaited<ReturnType<typeof agent>>;
+			expect(second.result.isError).toBe(true);
+			expect(second.result.output).toContain("which is still running");
+			expect(second.childId).toBeNull();
+			expect(await claimOf(task.blockId)).toMatchObject({
+				holderNarratorId: first.childId,
+				epoch: 1,
+			});
+			const sub = first.childId as string;
+			await until(() => model.passes.includes(sub), "the first agent's pass");
+			open.resolve();
+			expect(await taskResult(sub)).toContain('status="current"');
+			expect(model.passes.filter((id) => id !== sub)).toEqual([]);
+		} finally {
+			open.resolve();
+			spy.mockRestore();
+		}
+	});
+
 	test("another Agent call of the session took it first: the refusal says so", async () => {
 		const owner = await user();
 		const root = await rootSession(owner);
@@ -514,6 +578,98 @@ describe("a failure after the delegation's commit (review N1 M18, N2, N6)", () =
 			});
 			expect(row?.status).toBe("archived");
 			expect(model.passes).not.toContain(childId);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	/** Fail the Agent call after the delegation's commit, once `change` ran in that window. */
+	function failAfterCommit(change: () => Promise<void>) {
+		return spyOn(narratorService, "persistSubagentUserMessage").mockImplementationOnce(async () => {
+			await change();
+			throw new Error("simulated write failure");
+		});
+	}
+	const asPerson = (
+		spaceId: string,
+		owner: string,
+		blockId: string,
+		ops: "todo" | "doing" | "done",
+	) =>
+		writeOutline({
+			spaceId,
+			ops: [{ op: "setTask", block: { id: blockId }, task: { status: ops } }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+
+	test("a person ticks it done right after the commit: the undo leaves it done (review round 2, nit 1)", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		// The person's tick lands as soon as the delegation's commit is written, before anything
+		// else of the delegation runs; then the Agent call fails.
+		const write = writeModule.writeOutline;
+		const commits = spyOn(writeModule, "writeOutline").mockImplementation(
+			async (input, options) => {
+				const written = await write(input, options);
+				if (options?.delegateClaim) await asPerson(space.id, owner, task.blockId, "done");
+				return written;
+			},
+		);
+		const spy = failAfterCommit(async () => {});
+		try {
+			const { result } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("done");
+		} finally {
+			spy.mockRestore();
+			commits.mockRestore();
+		}
+	});
+
+	test("a person resets it and starts it themselves meanwhile: they keep it (review round 2, nit 2)", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const spy = failAfterCommit(async () => {
+			await asPerson(space.id, owner, task.blockId, "todo");
+			await asPerson(space.id, owner, task.blockId, "doing");
+		});
+		try {
+			const { result } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			expect((await blockOf(task.blockId)).taskJson?.status).toBe("doing");
+			expect(await claimOf(task.blockId)).toMatchObject({ holderUserId: owner, epoch: 2 });
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("its text edited meanwhile: back to do all the same, the edit kept (review round 2, nit 4)", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		const { space, task } = await seedTask(root, owner);
+		const spy = failAfterCommit(async () => {
+			await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{ op: "update", block: { id: task.blockId }, content: "Fix the refresh race (edited)" },
+				],
+				actor: { kind: "human", id: owner },
+				responsibleUserId: owner,
+			});
+		});
+		try {
+			const { result, childId } = await agent(root, owner, { task: task.address });
+			expect(result.isError).toBe(true);
+			const block = await blockOf(task.blockId);
+			expect(block.taskJson?.status).toBe("todo");
+			expect(block.content).toBe("Fix the refresh race (edited)");
+			expect(await claimOf(task.blockId)).toMatchObject({
+				holderNarratorId: null,
+				lastHolderNarratorId: childId,
+			});
 		} finally {
 			spy.mockRestore();
 		}
@@ -1304,6 +1460,16 @@ describe("late results, as a table (design §2.5)", () => {
 		// A note-looking tail whose head is not the system's exact form stays too.
 		const loose = 'text\n<outline_report task="x">\nbody\n</outline_report>';
 		expect(stripDelegationNote(loose)).toBe(loose);
+		// The exact head, but not at the start of a line (the window starts right at it).
+		const head = '<outline_report task="k/s" generation="1" status="current">';
+		const body = "b".repeat(4096 - head.length - "</outline_report>".length - 2);
+		const glued = `prefix ${head}\n${body}\n</outline_report>`;
+		expect(stripDelegationNote(glued)).toBe(glued);
+		// The exact head, but the line under it holds a tag of its own.
+		const tagged = `text\n${head}\nquote </outline_report> more\n</outline_report>`;
+		expect(stripDelegationNote(tagged)).toBe(tagged);
+		const opened = `text\n${head}\n<outline_report x\n</outline_report>`;
+		expect(stripDelegationNote(opened)).toBe(opened);
 		// The real note after it is still found.
 		const note =
 			'<outline_report task="k/s" generation="2" status="late" reason="taken_over">\nLate.\n</outline_report>';
