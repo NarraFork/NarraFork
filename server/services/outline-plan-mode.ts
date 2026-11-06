@@ -102,6 +102,7 @@ import {
 	readPlanReview,
 	readPlanSubmission,
 	renderPlanForReview,
+	reviewDiffOptions,
 	undoOutlinePlanDecision,
 	writePlanReview,
 } from "./outline/plans";
@@ -437,32 +438,43 @@ function takeHandedCall(narratorId: string, toolUseId: string): HandedCall | nul
 
 /**
  * Forget what was handed on for a call (a new review of it begins, its permission ran, or it was
- * decided): a later attempt never picks up an earlier one's (review round 2 N8).
+ * decided): a later attempt never picks up an earlier one's (review round 2 N8). With `only`, just
+ * that hand-off, if it is still the one there.
  */
-export function forgetHandedCall(narratorId: string, toolUseId: string | null | undefined): void {
-	if (toolUseId) handedCalls.delete(callKey(narratorId, toolUseId));
+export function forgetHandedCall(
+	narratorId: string,
+	toolUseId: string | null | undefined,
+	only?: object | null,
+): void {
+	if (!toolUseId) return;
+	const key = callKey(narratorId, toolUseId);
+	if (only === undefined || handedCalls.get(key) === only) handedCalls.delete(key);
 }
 
 /**
  * A review gate handing an outline plan to a person without comments (the review could not
  * finish, or was taken over before it wrote any): the version submitted goes on, so what the
- * person changes from then on is told to the agent (review round 2 N7). No-op for any other input.
+ * person changes from then on is told to the agent (review round 2 N7). Never over what this
+ * attempt's review handed on already (its comments). Returns the hand-off written, for the caller
+ * to take back if its handover does not happen (review round 3); null when nothing was written.
  */
 export function handOnSubmission(args: {
 	narratorId: string;
 	toolUseId: string;
 	toolCallId?: string | null;
 	input: Record<string, unknown>;
-}): void {
+}): object | null {
 	const submission = outlinePlanSubmissionOf(args.input);
-	if (!submission) return;
-	handOn(args.narratorId, args.toolUseId, {
+	if (!submission || handedCalls.has(callKey(args.narratorId, args.toolUseId))) return null;
+	const call: HandedCall = {
 		rootId: submission.root.blockId,
 		round: submission.root.round,
 		submittedSeq: submission.seq,
 		toolCallId: args.toolCallId ?? null,
 		blockId: null,
-	});
+	};
+	handOn(args.narratorId, args.toolUseId, call);
+	return call;
 }
 
 /** The call was decided: what was handed on for it is in its persisted input from now on. */
@@ -651,12 +663,12 @@ async function editsSinceSubmitted(
 		{ id: root.blockId, spaceId: root.spaceId },
 		submission.baseSeq,
 	).catch(() => new Map<string, OutlinePlanReviewFound>());
-	const skip = omittableReviews(reviews);
+	// Only what the person added or changed is told, inside a review too (review round 3 N9).
 	const diff = await readPlanDiff({
 		rootId: root.blockId,
 		fromSeq: submission.seq,
 		toSeq: untilSeq,
-		...(skip.size > 0 ? { skip } : {}),
+		...reviewDiffOptions(reviews),
 	}).catch(() => null);
 	if (!diff || planDiffIsEmpty(diff.counts)) return "";
 	return planDiffLines(diff, root.address.split("/")[0] ?? "");

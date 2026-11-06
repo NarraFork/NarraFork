@@ -144,13 +144,15 @@ const titleOfNode = (node: OutlineNode | null | undefined): string | null =>
  * The plan rooted at `rootId` as of `toSeq` (null: now) against `fromSeq` (0 or a seq when the
  * root did not exist yet: everything is new). Null when the root is not live at `toSeq`. `skip`:
  * blocks left out with what is under them, on both sides (a plan review's comments, PR 8b: shown
- * on their own, not as changes of the plan).
+ * on their own, not as changes of the plan). `quiet`: blocks not reported themselves (as they
+ * were written by a review), while what is under them still is (review round 3 N9).
  */
 export async function readPlanDiff(args: {
 	rootId: string;
 	fromSeq: number;
 	toSeq: number | null;
 	skip?: ReadonlySet<string>;
+	quiet?: ReadonlySet<string>;
 	store?: OutlineStore;
 }): Promise<OutlinePlanDiff | null> {
 	const store = args.store ?? outlineStore;
@@ -180,6 +182,7 @@ export async function readPlanDiff(args: {
 	}
 	const pending: Pending[] = [];
 	for (const node of now.nodes) {
+		if (args.quiet?.has(node.id)) continue;
 		const prev = beforeById.get(node.id) ?? null;
 		if (!prev) {
 			pending.push({

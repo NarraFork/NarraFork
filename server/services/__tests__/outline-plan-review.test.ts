@@ -39,6 +39,7 @@ import {
 	findPlanningRoot,
 	omittableReviews,
 	planReviewBlocks,
+	reviewDiffOptions,
 } from "../outline/plans";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
@@ -46,6 +47,8 @@ import { type OutlineOp, writeOutline } from "../outline/write";
 import {
 	decideOutlinePlanRequest,
 	enterOutlinePlanMode,
+	forgetHandedCall,
+	handOnSubmission,
 	planReviewBlockId,
 	resolveOutlineExitPlanInput,
 	reviewOutlinePlan,
@@ -1147,8 +1150,9 @@ describe("review round 2", () => {
 		);
 		expect(requests[0]?.prompt).toContain("Step B2: DROP THE PROD TABLE");
 		const submission = outlinePlanSubmissionOf(result.input);
-		// The plan's 4 blocks, the review block, its 2 comments and the task.
-		expect(submission?.counts.added).toBe(8);
+		// The plan's 4 blocks and the task: the review's own blocks, as it wrote them, are passed
+		// over (review round 3 N9), what was added under them is not.
+		expect(submission?.counts.added).toBe(5);
 		expect(String(result.input.plan)).toContain("Step B2: DROP THE PROD TABLE");
 		expect(String(result.input.plan)).toContain("Review (version 1)");
 		// The diff a person opens shows it too (the route leaves out only the omittable ones).
@@ -1156,9 +1160,10 @@ describe("review round 2", () => {
 			rootId: plan.root,
 			fromSeq: 0,
 			toSeq: null,
-			skip: omittableReviews(reviews),
+			...reviewDiffOptions(reviews),
 		});
 		expect(diff?.entries.some((e) => e.blockId === b2)).toBe(true);
+		expect(diff?.entries.find((e) => e.blockId === b2)?.changes).toEqual(["added"]);
 	});
 
 	test("S3: what a person writes under the current review while deciding is told to the agent", async () => {
@@ -1197,6 +1202,90 @@ describe("review round 2", () => {
 			0,
 		);
 		expect([...reviews.values()].map((r) => r.omittable)).toEqual([true]);
+	});
+
+	for (const kind of ["reply", "edit"] as const) {
+		test(`round 3 N9: a person's ${kind} in the current review is told and counted alone (probe R3-S3b)`, async () => {
+			const plan = await reviewedWithConcerns();
+			const current = outlinePlanSubmissionOf(plan.input)?.review;
+			if (!current) throw new Error("no review");
+			const comments = await outlineStore.listChildren(plan.space.id, current.blockId, 5);
+			const text =
+				kind === "reply" ? "Agreed, add it" : "Say how an import is rolled back (person)";
+			await writeOutline({
+				spaceId: plan.space.id,
+				ops:
+					kind === "reply"
+						? [{ op: "insert", parent: { id: comments[0]?.id as string }, content: text }]
+						: [{ op: "update", block: { id: comments[1]?.id as string }, content: text }],
+				actor: { kind: "human", id: plan.owner },
+				responsibleUserId: plan.owner,
+			});
+			// The diff a person opens: the plan's 4 blocks and the person's one, not the review's.
+			const reviews = await planReviewBlocks(outlineStore, plan.id, await block(plan.root), 0);
+			expect(reviews.get(current.blockId)?.omittable).toBe(false);
+			const diff = await readPlanDiff({
+				rootId: plan.root,
+				fromSeq: 0,
+				toSeq: null,
+				...reviewDiffOptions(reviews),
+			});
+			expect(diff?.counts.added).toBe(5);
+			expect(diff?.entries.filter((e) => e.after?.includes(text))).toHaveLength(1);
+			// The agent is told the person's line only.
+			await decideOutlinePlanRequest({
+				requestId: plan.rowId,
+				principal: { userId: plan.owner, isAdmin: false },
+				body: { action: "draft", seenSeq: plan.input._planSeq as number },
+			});
+			const prompt = await firstPass(plan, plan.input);
+			const told = prompt.split("\n").filter((line) => /^[+~-] \[/.test(line));
+			expect(told).toHaveLength(1);
+			expect(told[0]).toContain(text);
+			expect(prompt).not.toContain("] Review (version 1)");
+		});
+	}
+
+	test("round 3: a hand-on without comments never replaces a review's, and takes back only its own", async () => {
+		const plan = await planned();
+		const call = await exitPlanCall(plan.id, { mode: "outline" });
+		const resolved = await resolveOutlineExitPlanInput(plan.id, { mode: "outline" }, "en");
+		if (!resolved?.ok) throw new Error("not resolved");
+		const reviewed = await reviewOutlinePlan({
+			narratorId: plan.id,
+			requestId: `exit_plan_r3_${generateId()}`,
+			toolUseId: call.toolUse.toolUseId,
+			toolCallId: call.rowId,
+			input: resolved.input,
+			comments: [{ text: "Keep me" }],
+			userId: plan.owner,
+			locale: "en",
+		});
+		if (!reviewed.ok) throw new Error(reviewed.message);
+		// The review loop's cleanup after the review decided: writes nothing over it.
+		const late = handOnSubmission({
+			narratorId: plan.id,
+			toolUseId: call.toolUse.toolUseId,
+			toolCallId: call.rowId,
+			input: resolved.input,
+		});
+		expect(late).toBeNull();
+		forgetHandedCall(plan.id, call.toolUse.toolUseId, late);
+		const input = await permissionInput(plan.id, call, reviewed.input);
+		expect(outlinePlanSubmissionOf(input)?.review?.comments.map((c) => c.text)).toEqual([
+			"Keep me",
+		]);
+		// With nothing there, it hands on; a failed handover takes back that one only.
+		const own = handOnSubmission({
+			narratorId: plan.id,
+			toolUseId: call.toolUse.toolUseId,
+			input: resolved.input,
+		});
+		expect(own).not.toBeNull();
+		forgetHandedCall(plan.id, call.toolUse.toolUseId, {});
+		forgetHandedCall(plan.id, call.toolUse.toolUseId, own);
+		const after = await permissionInput(plan.id, call, resolved.input);
+		expect(after._planReview).toBeUndefined();
 	});
 
 	/** The review runs while the person edits step B, then `finish` ends it without comments. */

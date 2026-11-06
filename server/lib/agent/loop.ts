@@ -2037,17 +2037,19 @@ export async function resolveExitPlanModeReflection(
 				// a review never holds a plan back.
 				if (outlinePlan) {
 					const reason = `Plan review could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
-					if (await handOverExitPlanReflection(requestId, { reason })) {
-						// The version submitted goes on with it (review round 2 N7), only when this
-						// handover is the decision: this runs after a review that decided, too.
-						outlinePlanMode?.handOnSubmission({
-							narratorId: config.narratorId,
-							toolUseId: toolUse.toolUseId,
-							toolCallId,
-							input: resolvedInput.input,
-						});
-						return decisionPromise;
-					}
+					// The version submitted goes on with it (review round 2 N7), handed on before
+					// the handover so the permission always finds it (round 3). This runs after a
+					// review that decided too: then it writes nothing over that review's hand-off,
+					// and takes back only its own when its handover does not happen.
+					const handed = outlinePlanMode?.handOnSubmission({
+						narratorId: config.narratorId,
+						toolUseId: toolUse.toolUseId,
+						toolCallId,
+						input: resolvedInput.input,
+					});
+					if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+					if (handed)
+						outlinePlanMode?.forgetHandedCall(config.narratorId, toolUse.toolUseId, handed);
 					const settled = await Promise.race<ExitPlanReflectionDecision | null>([
 						decisionPromise,
 						Promise.resolve(null),

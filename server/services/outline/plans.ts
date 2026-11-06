@@ -530,7 +530,7 @@ export async function readPlanSubmission(args: {
 			rootId: found.blockId,
 			fromSeq: plan.baseSeq,
 			toSeq: read.seq,
-			...(omit.size > 0 ? { skip: omit } : {}),
+			...reviewDiffOptions(reviews),
 			store,
 		});
 		const counts: OutlinePlanDiffCounts = diff?.counts ?? {
@@ -974,6 +974,12 @@ export interface OutlinePlanReviewFound {
 	 * Anything written into or under it since is the plan's, shown and counted as such.
 	 */
 	omittable: boolean;
+	/**
+	 * Its blocks still exactly as the review's commit wrote them (the block, its comments): what a
+	 * diff passes over in a review that is not left out, so only what was added or changed in it
+	 * is counted, listed and told (review round 3 N9).
+	 */
+	quiet: string[];
 }
 
 /**
@@ -1016,37 +1022,65 @@ export async function planReviewBlocks(
 		)
 			continue;
 		const block = byId.get(first.blockId);
+		const written = block
+			? await whatTheReviewWrote(store, block, commit.seq)
+			: { omittable: false, quiet: [] };
 		out.set(first.blockId, {
 			sid: block?.sid ?? "",
 			toolCallId: commit.toolCallId,
-			omittable: block ? await onlyWhatTheReviewWrote(store, block, commit.seq) : false,
+			...written,
 		});
 	}
 	return out;
 }
 
 /**
- * Whether a review block is exactly what its commit (`seq`) wrote: the block and every comment at
- * the version that commit made (an edit, a move or a task makes a new one), at most
- * {@link OUTLINE_PLAN_LIMITS.reviewComments} comments, none a task, nothing under any of them.
+ * What of a review block is still exactly what its commit (`seq`) wrote: its blocks at the version
+ * that commit made (the commit only creates them, so an edit, a move or a task makes a new one),
+ * none a task (`quiet`), and whether that is all of it: the block and every comment, at most
+ * {@link OUTLINE_PLAN_LIMITS.reviewComments}, nothing under any of them (`omittable`).
  */
-async function onlyWhatTheReviewWrote(
+async function whatTheReviewWrote(
 	store: OutlineStore,
 	block: Pick<OutlineBlockRow, "id" | "spaceId" | "versionSeq" | "taskJson">,
 	seq: number,
-): Promise<boolean> {
-	if (block.versionSeq !== seq || block.taskJson) return false;
+): Promise<{ omittable: boolean; quiet: string[] }> {
+	const asWritten = (b: { versionSeq: number; taskJson: unknown }) =>
+		b.versionSeq === seq && !b.taskJson;
+	const quiet = asWritten(block) ? [block.id] : [];
 	const max = OUTLINE_PLAN_LIMITS.reviewComments;
 	const comments = await store.listChildMetas(block.spaceId, [block.id], max + 1);
-	if (comments.length > max) return false;
-	if (comments.some((comment) => comment.versionSeq !== seq || comment.taskJson)) return false;
-	if (comments.length === 0) return true;
-	const below = await store.listChildMetas(
-		block.spaceId,
-		comments.map((comment) => comment.id),
-		1,
+	for (const comment of comments.slice(0, max)) if (asWritten(comment)) quiet.push(comment.id);
+	if (comments.length > max || quiet.length !== comments.length + 1)
+		return { omittable: false, quiet };
+	const below =
+		comments.length > 0
+			? await store.listChildMetas(
+					block.spaceId,
+					comments.map((comment) => comment.id),
+					1,
+				)
+			: [];
+	return { omittable: below.length === 0, quiet };
+}
+
+/**
+ * How a diff of the plan passes over this version's reviews: `skip` leaves out the reviews that
+ * are only what the review wrote, with what is under them; `quiet` passes over the blocks still as
+ * written in the others, so only what was added or changed in them shows (review round 3 N9).
+ */
+export function reviewDiffOptions(reviews: ReadonlyMap<string, OutlinePlanReviewFound>): {
+	skip?: Set<string>;
+	quiet?: Set<string>;
+} {
+	const skip = omittableReviews(reviews);
+	const quiet = new Set(
+		[...reviews.values()].flatMap((found) => (found.omittable ? [] : found.quiet)),
 	);
-	return below.length === 0;
+	return {
+		...(skip.size > 0 ? { skip } : {}),
+		...(quiet.size > 0 ? { quiet } : {}),
+	};
 }
 
 /** The ids of the reviews the plan leaves out (see {@link OutlinePlanReviewFound.omittable}). */

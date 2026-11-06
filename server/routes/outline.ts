@@ -127,7 +127,11 @@ import {
 } from "../services/outline/pending";
 import { addPersonTask, changePersonTask } from "../services/outline/person-tasks";
 import { readPlanDiff } from "../services/outline/plan-diff";
-import { omittableReviews, planReviewBlocks } from "../services/outline/plans";
+import {
+	type OutlinePlanReviewFound,
+	planReviewBlocks,
+	reviewDiffOptions,
+} from "../services/outline/plans";
 import { commitSeqAt } from "../services/outline/read";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
@@ -460,15 +464,16 @@ outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
 	);
 	const query = parse(outlinePlanDiffQuerySchema, c.req.query());
 	const planner = block.taskJson?.plan?.by;
-	// Left out only while they are what the review wrote (review round 2 S3).
-	const skip = planner
-		? omittableReviews(await planReviewBlocks(outlineStore, planner, block, query.from))
-		: new Set<string>();
+	// Left out only while they are what the review wrote (review round 2 S3); in a review that is
+	// not, only what was added or changed shows (round 3 N9).
+	const reviews = planner
+		? await planReviewBlocks(outlineStore, planner, block, query.from)
+		: new Map<string, OutlinePlanReviewFound>();
 	const diff = await readPlanDiff({
 		rootId: block.id,
 		fromSeq: query.from,
 		toSeq: null,
-		...(skip.size > 0 ? { skip } : {}),
+		...reviewDiffOptions(reviews),
 	});
 	if (!diff) throw new NotFoundError("Outline block", block.id);
 	const body: OutlinePlanDiffResponse = {
