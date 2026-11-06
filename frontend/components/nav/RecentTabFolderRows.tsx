@@ -228,6 +228,8 @@ export interface RecentTabFolderStripProps {
 	onPreviewDrag: (count: number | null) => void;
 	/** Release after a drag, or an arrow key: persist this count. */
 	onPreviewCommit: (count: number) => void;
+	/** The Ctrl+Up / Ctrl+Down highlight is on this row (Enter toggles it). */
+	highlighted?: boolean;
 	t: T;
 }
 
@@ -249,6 +251,7 @@ export function RecentTabFolderStrip({
 	onToggleExpanded,
 	onPreviewDrag,
 	onPreviewCommit,
+	highlighted = false,
 	t,
 }: RecentTabFolderStripProps) {
 	const gesture = useRef<{ startY: number; base: number; rowPx: number; last: number } | null>(
@@ -346,6 +349,7 @@ export function RecentTabFolderStrip({
 				<UnstyledButton
 					type="button"
 					data-folder-strip={folder.id}
+					data-active={highlighted || undefined}
 					aria-label={label}
 					aria-expanded={expanded}
 					onClick={() => {
@@ -382,7 +386,13 @@ export function RecentTabFolderStrip({
 						// Vertical drags resize the preview instead of scrolling (preview only).
 						touchAction: expanded ? "manipulation" : "none",
 						borderRadius: "var(--mantine-radius-sm)",
-						color: dragging && color ? color : "var(--mantine-color-dimmed)",
+						// The keyboard highlight, the same fill an active row has.
+						background: highlighted ? "var(--mantine-primary-color-light)" : undefined,
+						color: highlighted
+							? "var(--mantine-primary-color-light-color)"
+							: dragging && color
+								? color
+								: "var(--mantine-color-dimmed)",
 					}}
 				>
 					<Text size="xs" inherit lh={1}>

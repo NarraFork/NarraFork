@@ -96,6 +96,7 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * `invalidate … ("autoScrollAllowedForPointer" export is incompatible)` and a full page
  * reload. Importers must reach the logic module directly.
  */
+import { stripKey } from "./recent-tab-keyboard-nav";
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
@@ -536,18 +537,18 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [t]);
 
 	/**
-	 * Which members each folder shows. In preview, the open page and the keyboard-nav
-	 * highlight stay visible even past the limit; a collapsed folder instead highlights its
-	 * header. A strip being dragged previews its new count live.
+	 * Which members each folder shows. In preview, the open page stays visible even past
+	 * the limit; a collapsed folder instead highlights its header. The keyboard walks only
+	 * what is shown (Enter opens a folder or its "N more" row), so it forces nothing. A
+	 * strip being dragged previews its new count live.
 	 */
 	const folderOptions = useMemo<FolderViewOptions>(
 		() => ({
 			displayOf: (folderId) => folderDisplays[folderId],
 			defaultPreview: RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
-			isForcedVisible: (member) =>
-				isTabActive(member, pathname) || (!!pendingKey && tabSortId(member) === pendingKey),
+			isForcedVisible: (member) => isTabActive(member, pathname),
 		}),
-		[folderDisplays, pathname, pendingKey],
+		[folderDisplays, pathname],
 	);
 	const effectiveFolderOptions = useMemo<FolderViewOptions>(
 		() =>
@@ -906,7 +907,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			</Stack>
 		) : null;
 
-	/** Active/highlight state for a row. */
+	/**
+	 * Active/highlight state for a row. While Ctrl+Up / Ctrl+Down moves, only the row the
+	 * highlight is on reads as active (a folder header and its "N more" row included).
+	 */
 	const isRowActive = (tab: RecentTab) => {
 		const tabKey = `${tab.type}:${tab.id}`;
 		return pendingKey
@@ -914,6 +918,9 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			: isTabActive(tab, pathname) &&
 					!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId);
 	};
+	/** A folder header: its own highlight, else a hidden member open (or highlighted). */
+	const isFolderHeaderActive = (folder: RecentTab, hidden: RecentTab[]) =>
+		pendingKey ? pendingKey === tabSortId(folder) : hidden.some(isRowActive);
 
 	/**
 	 * Save a strip-dragged preview count. The live preview stays until the save settles:
@@ -968,7 +975,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						members={row.members}
 						hidden={view.hidden}
 						display={view.display}
-						active={view.hidden.some(isRowActive)}
+						active={isFolderHeaderActive(folder, view.hidden)}
 						onToggle={() => toggleFolderCollapsed(folder)}
 						onContextMenu={handleContextMenu}
 						onSwipeMenu={handleSwipeMenu}
@@ -1002,6 +1009,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								setPreviewDrag(count === null ? null : { folderId: folder.id, count })
 							}
 							onPreviewCommit={(count) => commitPreviewCount(folder, count)}
+							highlighted={pendingKey === stripKey(folder.id)}
 							t={t}
 						/>
 					)}
@@ -1140,6 +1148,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 				>
 					<Box
 						ref={listBoxRef}
+						// Where Ctrl+Up / Ctrl+Down reads the rows it walks (useRecentTabKeyboardNav).
+						data-recent-tab-list={filter === "narrator" ? "" : undefined}
 						style={{
 							// `clip`, not `hidden`: `hidden` makes this box a scroll container, which
 							// would trap the folder strip's `position: sticky` inside it instead of
