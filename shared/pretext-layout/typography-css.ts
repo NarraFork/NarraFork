@@ -51,6 +51,12 @@ export const TYPOGRAPHY_CSS_VARS = {
 	/** Small / meta text: the conversation's xs role (12px). */
 	xsSize: "--nf-type-xs-size",
 	xsLine: "--nf-type-xs-line",
+	/**
+	 * The xs size on the BASE line box (1.55, not xs's own 1.4): what a multiline field paints
+	 * its rows with. The transcript's permission cards measure each textarea row as this
+	 * (`typographyMetrics().line.xsBase`), so their live textareas paint with it too (D49).
+	 */
+	xsBaseLine: "--nf-type-xs-base-line",
 	/** Inline code: the conversation's inline code (xs, monospace). */
 	codeSize: "--nf-type-code-size",
 	/** Fenced code: the conversation's code blocks (11px, base line box). */
@@ -88,6 +94,7 @@ export function typographyCssVariables(): Record<string, string> {
 		[v.bodyLine]: `${m.line.body}px`,
 		[v.xsSize]: `${m.size.xs}px`,
 		[v.xsLine]: `${m.line.xs}px`,
+		[v.xsBaseLine]: `${m.line.xsBase}px`,
 		[v.codeSize]: `${m.size.xs}px`,
 		[v.codeBlockSize]: `${m.codeSize}px`,
 		[v.codeBlockLine]: `${m.line.code}px`,
