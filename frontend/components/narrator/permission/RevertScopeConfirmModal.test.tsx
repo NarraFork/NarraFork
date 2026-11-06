@@ -362,12 +362,15 @@ describe("RevertScopeConfirmModal evidence gating", () => {
 		});
 	}
 
-	test("submitting disables both destructive and history-only confirmation", async () => {
+	test("submitting shows progress, not the spent plan, and offers no confirmation", async () => {
 		await render({ data: completePreview(), submitting: true });
-		expect(button(props.confirmWithRevertLabel).disabled).toBe(true);
-		expect(button(props.messagesOnlyLabel).disabled).toBe(true);
-		await click(button(props.confirmWithRevertLabel));
-		await click(button(props.messagesOnlyLabel));
+		expect(document.body.textContent).toContain(en.revertApplying);
+		expect(document.body.textContent).not.toContain(en.revertPlanReloadRequired);
+		expect(document.body.textContent).not.toContain(en.revertScopeRecordedFiles);
+		expect(document.body.querySelector(".mantine-Alert-root")).toBeNull();
+		expect(hasButton(props.messagesOnlyLabel)).toBe(false);
+		expect(button(en.cancel).disabled).toBe(true);
+		await click(button(en.revertApplying));
 		expect(confirmations).toEqual([]);
 	});
 });
@@ -998,7 +1001,11 @@ describe("fixed plan apply and history-only branches", () => {
 				"/api/narrators/narrator-test/revert-plans/plan-1/apply",
 			);
 			expect(requestsTo("/apply")[0].body).toEqual({ planHash: "hash-plan-1", action });
-			expect(button(props.messagesOnlyLabel).disabled).toBe(true);
+			// While the request runs the dialog shows progress, not a revoked review.
+			expect(document.body.textContent).toContain(en.revertApplying);
+			expect(document.body.textContent).not.toContain(en.revertPlanReloadRequired);
+			expect(document.body.querySelector(".mantine-Alert-root")).toBeNull();
+			expect(hasButton(props.messagesOnlyLabel)).toBe(false);
 			expect(hasButton(en.revertPlanReload)).toBe(false);
 			expect(button(en.cancel).disabled).toBe(true);
 			apply.resolve(normalResponse(requestsTo("/apply")[0]));
@@ -1143,6 +1150,49 @@ describe("fixed plan apply and history-only branches", () => {
 				"fixture journal reason",
 			);
 			assertUnavailable();
+		});
+	}
+
+	for (const files of [
+		[{ deviceId: "local", filePath: "done.txt", status: "applied" }],
+		[{ deviceId: "local", filePath: "done.txt", status: "failed", reason: "EACCES" }],
+	]) {
+		const allRestored = files.every((file) => file.status === "applied");
+		test(`a partial-coverage plan that ${allRestored ? "restored every file reports success" : "failed a file still reports failure"}`, async () => {
+			execute = true;
+			respond = (request) =>
+				request.url.pathname.endsWith("/apply")
+					? reply(
+							{
+								planId: "plan-1",
+								status: "partial",
+								journalStatus: "partial",
+								settling: false,
+								historyCommitted: false,
+								historyStatus: "complete",
+								files,
+								reason: "SELECTED_HISTORY_UNAVAILABLE",
+								code: "REVERT_APPLY_NOT_COMMITTED",
+								error: "SELECTED_HISTORY_UNAVAILABLE",
+							},
+							409,
+						)
+					: request.url.pathname.endsWith("/revert-action-preview")
+						? reply(preparedActionPreview({ coverageComplete: false }))
+						: normalResponse(request);
+			await renderAction();
+			await click(button(en.revertPartialConfirm));
+			await flush();
+			const last = notificationsStore.getState().notifications.at(-1);
+			if (allRestored) {
+				expect(applyErrors).toEqual([]);
+				expect(last?.title).toBe(en.revertAvailableFilesRestoredTitle);
+				expect(last?.color).toBe("blue");
+			} else {
+				expect(applyErrors).toHaveLength(1);
+				expect(last?.title).toBe(en.rollbackFailed);
+			}
+			expect(requestsTo("/apply")).toHaveLength(1);
 		});
 	}
 });

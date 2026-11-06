@@ -58,7 +58,25 @@ const runBindingSchema = z.strictObject({
 	historyStartSeq: z.number().int().nonnegative().optional(),
 });
 
-export const runtimeRegistrationSchema = z.strictObject({
+/**
+ * The outline task a subagent was sent to do (`Agent` with `task`, outline P2 PR 9a): set once
+ * when it is created, kept across its runs (Send continuations, recovery). Each run's result is
+ * attached under the task as a report, and the claim generation tells a late result.
+ */
+const delegatedTaskSchema = z.strictObject({
+	spaceId: recordId,
+	blockId: recordId,
+	/** Claim generation the delegation's commit wrote. */
+	epoch: z.number().int().positive(),
+	/** The session that sent it (its root). */
+	delegatorNarratorId: narratorId,
+	/** The Agent call that sent it (its tool-call row). */
+	toolCallId: recordId,
+	/** Language of the report blocks written under the task. */
+	locale: z.enum(["en", "zh-CN"]),
+});
+
+const registrationShape = {
 	version: z.literal(1),
 	/**
 	 * Model pool (key of `custom-subagent-models` / `subagentAllowedModels`) applied when
@@ -76,9 +94,21 @@ export const runtimeRegistrationSchema = z.strictObject({
 	/** Transcript placement is durable history, not a live result-delivery relationship. */
 	historyPlacement: z.strictObject({ toolUseId: recordId }).optional(),
 	run: runBindingSchema.optional(),
-});
+	delegatedTask: delegatedTaskSchema.optional(),
+};
+
+export const runtimeRegistrationSchema = z.strictObject(registrationShape);
+
+/**
+ * What a stored registration is read with: the same fields, but a top-level field this version
+ * does not know is dropped instead of failing every read of the narrator. A version rolled back
+ * to keeps working with registrations a later version wrote (and drops what it does not know at
+ * its next write); everything it does know is checked as strictly as on write.
+ */
+const storedRegistrationSchema = z.object(registrationShape);
 
 export type RuntimeRegistration = z.infer<typeof runtimeRegistrationSchema>;
+export type DelegatedTaskRegistration = z.infer<typeof delegatedTaskSchema>;
 export type RuntimeRunBinding = z.infer<typeof runBindingSchema>;
 /** Absolute deadline for a run started now with an optional timeout (0/undefined = none). */
 export function runDeadlineAt(timeoutMs: number | null | undefined, now = Date.now()) {
@@ -144,9 +174,10 @@ export function registerRun(
 }
 
 /**
- * Read the stored column: null means nothing registered; anything invalid throws. The
- * size ceiling is enforced on write (`parseRuntimeRegistration`), not on every read.
+ * Read the stored column: null means nothing registered; anything invalid throws (an unknown
+ * top-level field is dropped, see `storedRegistrationSchema`). The size ceiling is enforced on
+ * write (`parseRuntimeRegistration`), not on every read.
  */
 export function readRuntimeRegistrationColumn(value: unknown): RuntimeRegistration | null {
-	return value === null || value === undefined ? null : runtimeRegistrationSchema.parse(value);
+	return value === null || value === undefined ? null : storedRegistrationSchema.parse(value);
 }

@@ -35,6 +35,7 @@ import {
 } from "../../lib/runtime-source";
 import type { ImageRef } from "../../lib/uploads";
 import {
+	type DelegatedTaskRegistration,
 	type RunBindingInput,
 	type RunDeliverTo,
 	type RuntimeRunBinding,
@@ -362,6 +363,8 @@ async function executeRun(
 	/** False until `prepareLogicalRun` has returned the destination, including "none". */
 	let deliverToResolved = false;
 	let publicationRun: PublicationRun | undefined;
+	/** The outline task the session was sent to do: its results are attached under it. */
+	let delegated: DelegatedTaskRegistration | undefined;
 	let finished = false;
 	try {
 		// Notification locale is display-only. A trusted recovery snapshot may seed a legacy row.
@@ -381,6 +384,7 @@ async function executeRun(
 		syncActiveReplyContext(id, replyContext);
 		const session = active;
 		const source = await readRunSource(id);
+		delegated = readRuntimeRegistrationColumn(source.runtimeRegistrationJson)?.delegatedTask;
 		// Only human input or this session's own registration establishes identity.
 		// An explicitly anonymous binding must not fall through to an old session user.
 		const principal =
@@ -521,6 +525,7 @@ async function executeRun(
 					deliverTo,
 					publicationRun,
 					{
+						delegated,
 						finalText: saved.output,
 						committedEvent: saved.eventKind,
 						...(pending && checkpoint
@@ -596,7 +601,7 @@ async function executeRun(
 		}
 		allowInboxWake = outcome.allowInboxWake === true;
 		finished = true;
-		return await finishRun(id, run, deliverTo, publicationRun, outcome, req);
+		return await finishRun(id, run, deliverTo, publicationRun, { ...outcome, delegated }, req);
 	} catch (error) {
 		// Infrastructure failure is not a successful turn boundary. In particular,
 		// do not auto-start queued work over a retained same-run terminal checkpoint.
@@ -611,7 +616,7 @@ async function executeRun(
 				run,
 				deliverTo,
 				publicationRun,
-				{ hasError: true, finalText: failureText },
+				{ hasError: true, finalText: failureText, delegated },
 				req,
 			).catch((finalizeError) =>
 				logger.warn("Run finalization after failure failed", {
@@ -705,6 +710,8 @@ interface RunOutcome {
 	freshInput?: boolean;
 	/** Immutable classification when recovery observes an already committed terminal. */
 	committedEvent?: "completed" | "failed" | "timed_out" | "cancelled";
+	/** The outline task the session was sent to do (outline P2 PR 9a): see `delegatedDelivery`. */
+	delegated?: DelegatedTaskRegistration;
 }
 
 /**
@@ -768,11 +775,6 @@ async function finishRun(
 	};
 	// Keep the exact answer for a release retry even when rendering/commit fails.
 	if (hold) hold.result = base;
-	const output =
-		deliverTo && publicationRun
-			? await renderResult(id, deliverTo, publicationRun, finalText)
-			: finalText;
-	const result: RunResult = { ...base, output };
 	const eventKind = timedOut
 		? "timed_out"
 		: hasError
@@ -780,6 +782,22 @@ async function finishRun(
 			: interrupted
 				? "cancelled"
 				: "completed";
+	// What reaches the destination: a session sent with an outline task attaches its result under
+	// the task first, and the destination gets the result with a note saying where and how.
+	const delivered =
+		deliverTo && publicationRun && req.deliver !== false && outcome.delegated
+			? await delegatedDelivery(id, outcome.delegated, publicationRun.logicalRunId, {
+					delivered: finalText,
+					report: outcome.finalText ?? "",
+					ending: eventKind,
+					principal: run.principal ?? null,
+				})
+			: finalText;
+	const output =
+		deliverTo && publicationRun
+			? await renderResult(id, deliverTo, publicationRun, delivered)
+			: finalText;
+	const result: RunResult = { ...base, output };
 	try {
 		if (deliverTo && publicationRun && req.deliver !== false) {
 			if (foregroundCaller) {
@@ -788,7 +806,7 @@ async function finishRun(
 				await getRuntimePublicationService().commitAgentTerminal({
 					run: publicationRun,
 					eventKind,
-					text: finalText,
+					text: delivered,
 					summary: "Foreground agent result delivered",
 					delivery: "foreground",
 				});
@@ -797,7 +815,7 @@ async function finishRun(
 				const deliver = () =>
 					deliverDetachedResult(id, deliverTo, publicationRun, {
 						eventKind,
-						finalText,
+						finalText: delivered,
 						hasError,
 						principal: run.principal ?? null,
 					});
@@ -860,6 +878,31 @@ async function finishRun(
 		terminalStatus: outcome.terminalStatus,
 	});
 	return result;
+}
+
+/**
+ * A delegated session's result as it is delivered (outline P2 PR 9a): attached under its outline
+ * task first (`outline/delegation.ts`, idempotent per logical run), then handed on with the note
+ * saying where and whether it is late. Never throws: the result is delivered either way.
+ */
+async function delegatedDelivery(
+	id: string,
+	delegated: DelegatedTaskRegistration,
+	logicalRunId: string,
+	result: {
+		delivered: string;
+		report: string;
+		ending: TerminalEvent;
+		principal: string | null;
+	},
+): Promise<string> {
+	try {
+		const { deliverDelegatedResult } = await import("../outline/delegation");
+		return await deliverDelegatedResult({ subagentId: id, delegated, logicalRunId, ...result });
+	} catch (error) {
+		logger.warn("Delegated result delivered without its report", { id, error: String(error) });
+		return result.delivered;
+	}
 }
 
 async function clearDeliveredHold(id: string, hold: RunHold | undefined): Promise<void> {
@@ -1391,17 +1434,27 @@ async function deliverHeldResult(
 	const hasError = hold.result?.hasError ?? parseSubstatus(current?.substatus).includes("error");
 	const deliverTo = prepared.binding.deliverTo;
 	if (deliverTo && prepared.publicationRun) {
+		const eventKind: TerminalEvent = hold.result?.timedOut
+			? "timed_out"
+			: hold.result?.interrupted
+				? "cancelled"
+				: hasError
+					? "failed"
+					: "completed";
+		const principal = prepared.binding.principal?.userId ?? null;
+		const delegated = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.delegatedTask;
 		await deliverDetachedResult(narratorId, deliverTo, prepared.publicationRun, {
-			eventKind: hold.result?.timedOut
-				? "timed_out"
-				: hold.result?.interrupted
-					? "cancelled"
-					: hasError
-						? "failed"
-						: "completed",
-			finalText,
+			eventKind,
+			finalText: delegated
+				? await delegatedDelivery(narratorId, delegated, prepared.publicationRun.logicalRunId, {
+						delivered: finalText,
+						report: finalText,
+						ending: eventKind,
+						principal,
+					})
+				: finalText,
 			hasError,
-			principal: prepared.binding.principal?.userId ?? null,
+			principal,
 		});
 		await getRuntimePublicationService().releaseUnusedRunSlots(prepared.publicationRun);
 	}

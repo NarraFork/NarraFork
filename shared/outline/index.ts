@@ -5,5 +5,6 @@
 export * from "./address";
 export * from "./dialect";
 export * from "./md-outline";
+export * from "./md-sections";
 export * from "./order-key";
 export * from "./text-merge";
