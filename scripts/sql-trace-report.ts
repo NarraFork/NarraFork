@@ -7,12 +7,21 @@
  *   bun run sql:report 2025-06-01            # one day
  *   bun run sql:report 2025-06-01 2025-06-07 # inclusive range
  *   bun run sql:report --top 30 --json       # machine-readable
+ *   bun run sql:report --latest              # only the most recently started server process
+ *   bun run sql:report --pid 1075652         # one process (and its db-worker threads)
  *   bun run sql:report --span <id>           # every record of one span and its children
  *
  * Streams the NDJSON files line by line; memory stays bounded by the number of distinct
  * span labels and statement fingerprints, not by file size.
  */
-import { createReadStream, existsSync, readdirSync } from "node:fs";
+import {
+	closeSync,
+	createReadStream,
+	existsSync,
+	openSync,
+	readSync,
+	readdirSync,
+} from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { getNarraforkPath } from "../server/lib/narrafork-home";
@@ -70,22 +79,26 @@ function parseArgs(argv: string[]) {
 	let top = 20;
 	let json = false;
 	let span: string | null = null;
+	let pid: string | null = null;
+	let latest = false;
 	let dir = process.env.NF_SQL_TRACE_DIR ?? getNarraforkPath("sql-trace");
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i] as string;
 		if (arg === "--top") top = Number(argv[++i]) || top;
 		else if (arg === "--json") json = true;
 		else if (arg === "--span") span = argv[++i] ?? null;
+		else if (arg === "--pid") pid = argv[++i] ?? null;
+		else if (arg === "--latest") latest = true;
 		else if (arg === "--dir") dir = argv[++i] ?? dir;
 		else if (/^\d{4}-\d{2}-\d{2}$/.test(arg)) days.push(arg);
 		else if (arg === "-h" || arg === "--help") {
 			console.log(
-				"usage: bun run sql:report [from [to]] [--top N] [--json] [--span ID] [--dir PATH]",
+				"usage: bun run sql:report [from [to]] [--top N] [--json] [--span ID] [--dir PATH] [--pid N|--latest]",
 			);
 			process.exit(0);
 		}
 	}
-	return { days, top, json, span, dir };
+	return { days, top, json, span, dir, pid, latest };
 }
 
 function today(): string {
@@ -93,7 +106,29 @@ function today(): string {
 	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-function selectFiles(dir: string, days: string[]): string[] {
+/** Newest server process in the directory, by its first record's timestamp. */
+function latestPid(dir: string): string | null {
+	let best: { pid: string; at: number } | null = null;
+	for (const name of readdirSync(dir)) {
+		const match = /^\d{4}-\d{2}-\d{2}-p(\d+)\.ndjson$/.exec(name);
+		if (!match) continue;
+		try {
+			// Only the first line is needed; some of these files grow to tens of MB.
+			const fd = openSync(join(dir, name), "r");
+			const head = Buffer.alloc(4096);
+			const bytes = readSync(fd, head, 0, head.length, 0);
+			closeSync(fd);
+			const first = head.toString("utf8", 0, bytes).split("\n", 1)[0] ?? "";
+			const at = Number((JSON.parse(first) as { at?: number }).at) || 0;
+			if (!best || at > best.at) best = { pid: match[1] as string, at };
+		} catch {
+			// unreadable file: not a candidate
+		}
+	}
+	return best?.pid ?? null;
+}
+
+function selectFiles(dir: string, days: string[], pid: string | null): string[] {
 	if (!existsSync(dir)) return [];
 	const from = days[0] ?? today();
 	const to = days[1] ?? from;
@@ -103,6 +138,7 @@ function selectFiles(dir: string, days: string[]): string[] {
 			const day = name.slice(0, 10);
 			return day >= from && day <= to;
 		})
+		.filter((name) => !pid || name.includes(`-p${pid}.`) || name.includes(`-p${pid}-`))
 		.sort()
 		.map((name) => join(dir, name));
 }
@@ -172,8 +208,10 @@ async function spanDetail(files: string[], target: string, json: boolean): Promi
 }
 
 async function main(): Promise<void> {
-	const { days, top, json, span, dir } = parseArgs(process.argv.slice(2));
-	const files = selectFiles(dir, days);
+	const args = parseArgs(process.argv.slice(2));
+	const { days, top, json, span, dir } = args;
+	const pid = args.latest ? latestPid(dir) : args.pid;
+	const files = selectFiles(dir, days, pid);
 	if (files.length === 0) {
 		console.error(`No trace files in ${dir} for ${days.join("..") || today()}.`);
 		console.error("Start the server with NF_SQL_TRACE=summary (bun run start:dev enables it).");
@@ -345,7 +383,7 @@ async function main(): Promise<void> {
 	slowSpans.sort((a, b) => b.sqlMs - a.sqlMs);
 
 	const report = {
-		window: { from: firstTs, to: lastTs, files: files.map((f) => f.split("/").pop()) },
+		window: { from: firstTs, to: lastTs, files: files.map((f) => f.split("/").pop()), pid },
 		totals: {
 			sqlCalls: totalN,
 			sqlMs: r1(totalMs),
