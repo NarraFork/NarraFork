@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 136 tables and 1809 columns including the outline tables and reply context", () => {
-		expect(target.tables.length).toBe(136);
+	test("covers 137 tables and 1826 columns including the outline tables and reply context", () => {
+		expect(target.tables.length).toBe(137);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -554,7 +554,9 @@ describe("real schema parity", () => {
 		// Output-speed timing adds api_requests.decode_ms (1).
 		// The line-height rescale adds user_preferences.narrator_line_height_v2_percent (nullable).
 		// Sidebar folders add four user_recent_tabs columns and user_recent_tabs_meta.folders_migrated.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1809);
+		// Reports (outline P2 PR 11) add outline_digests (14), outline_spaces.last_commit_at and the
+		// two user_preferences report settings (time zone and time, both nullable).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1826);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

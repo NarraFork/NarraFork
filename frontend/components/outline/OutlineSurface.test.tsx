@@ -58,6 +58,7 @@ mock.module("../../hooks/useOutline", () => ({
 	useAnswerOutlineQuestions: () => ({ mutate: () => {}, isPending: false }),
 	useOutlineDigest: () => idle,
 	useMarkOutlineDigestSeen: () => ({ mutate: () => {}, isPending: false }),
+	useMarkOutlineReportsSeen: () => ({ mutate: () => {}, isPending: false }),
 }));
 
 const { OutlineSurface } = await import("./OutlineSurface");

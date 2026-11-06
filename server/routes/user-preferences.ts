@@ -28,6 +28,7 @@ import {
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
+import { serverTimeZone } from "../services/outline/digest-time";
 import {
 	clearRecentTabs,
 	createRecentTabFolder,
@@ -101,6 +102,9 @@ const DEFAULTS = {
 	// Git 提交身份入口的显示位置（跟账号走）
 	gitIdentityContextMenu: false,
 	gitIdentityCreateModal: false,
+	// The outline's daily report (P2 PR 11): null is the server's time zone and 07:00.
+	outlineDigestTimeZone: null as string | null,
+	outlineDigestTime: null as string | null,
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -186,6 +190,8 @@ const INSERT_COLUMNS = [
 	"narrator_toolbar_layout",
 	"git_identity_context_menu",
 	"git_identity_create_modal",
+	"outline_digest_time_zone",
+	"outline_digest_time",
 	"created_at",
 	"updated_at",
 ] as const;
@@ -345,6 +351,7 @@ function serializeUserPreferences(
 			pref.narratorLineHeightScalePercent,
 		),
 		setupWizardCompleted: instanceSetupWizardCompleted(),
+		outlineDigestServerTimeZone: serverTimeZone(),
 		...(recentTabs === undefined ? {} : { recentTabs }),
 		commands: parseJsonArray(pref.commands),
 		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
@@ -372,6 +379,7 @@ userPreferencesRoutes.get("/", async (c) => {
 		return c.json({
 			...DEFAULTS,
 			setupWizardCompleted: instanceSetupWizardCompleted(),
+			outlineDigestServerTimeZone: serverTimeZone(),
 			recentTabs,
 			commands: [],
 			gatewayConfig: {},
@@ -488,6 +496,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   narrator_toolbar_layout = COALESCE(?, narrator_toolbar_layout),
 		   git_identity_context_menu = COALESCE(?, git_identity_context_menu),
 		   git_identity_create_modal = COALESCE(?, git_identity_create_modal),
+		   outline_digest_time_zone = CASE WHEN ? THEN ? ELSE outline_digest_time_zone END,
+		   outline_digest_time = CASE WHEN ? THEN ? ELSE outline_digest_time END,
 		   updated_at = ?`,
 			[
 				// INSERT values
@@ -536,6 +546,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 				narratorToolbarLayoutJson ?? DEFAULTS.narratorToolbarLayout,
 				(d.gitIdentityContextMenu ?? DEFAULTS.gitIdentityContextMenu) ? 1 : 0,
 				(d.gitIdentityCreateModal ?? DEFAULTS.gitIdentityCreateModal) ? 1 : 0,
+				d.outlineDigestTimeZone ?? DEFAULTS.outlineDigestTimeZone,
+				d.outlineDigestTime ?? DEFAULTS.outlineDigestTime,
 				now,
 				now,
 				// ON CONFLICT UPDATE values (null = keep existing)
@@ -582,6 +594,11 @@ userPreferencesRoutes.patch("/", async (c) => {
 				narratorToolbarLayoutJson,
 				d.gitIdentityContextMenu != null ? (d.gitIdentityContextMenu ? 1 : 0) : null,
 				d.gitIdentityCreateModal != null ? (d.gitIdentityCreateModal ? 1 : 0) : null,
+				// Unlike the columns above, null is a value here (back to the default): absent keeps.
+				d.outlineDigestTimeZone !== undefined ? 1 : 0,
+				d.outlineDigestTimeZone ?? null,
+				d.outlineDigestTime !== undefined ? 1 : 0,
+				d.outlineDigestTime ?? null,
 				now,
 			],
 		);

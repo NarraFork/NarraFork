@@ -456,6 +456,14 @@
 			"prevId": "0e463874-4bfd-4fde-bc1b-4963af4f0a03",
 			"version": "7",
 			"snapshotDigest": "0f1f2cce34e192cca32077bfa5248d291e67a2807bdfe03dda7d9d6727b87d2f"
+		},
+		{
+			"idx": 57,
+			"tag": "0057_outline_digests",
+			"id": "c8e93667-215c-4bc9-b8ec-84ecf074ef84",
+			"prevId": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
+			"version": "7",
+			"snapshotDigest": "fa50fc938d78a7f87584db4f4387ad57634c3269d42074070a53b08a9b6bc63e"
 		}
 	]
 }

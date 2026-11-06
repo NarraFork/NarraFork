@@ -14,6 +14,7 @@ import {
 import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema, localeSchema } from "./common";
+import { outlineDigestTimeSchema, outlineDigestTimeZoneSchema } from "./outline/digest";
 
 /** Repair only the configured directory, after explicit administrator confirmation. */
 export const dataDirectoryRepairSchema = z.object({ confirmed: z.literal(true) }).strict();
@@ -171,6 +172,10 @@ export const updateUserPreferencesSchema = z.object({
 		.max(TYPOGRAPHY_RANGE.paragraphScalePercent.max)
 		.optional(),
 	treatAsLocalAccess: z.boolean().optional(),
+	// The outline's daily report (P2 PR 11): null goes back to the default (the server's zone,
+	// 07:00); absent leaves the setting as it is.
+	outlineDigestTimeZone: outlineDigestTimeZoneSchema.optional(),
+	outlineDigestTime: outlineDigestTimeSchema.optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
 	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
 	// Notification preferences

@@ -51,6 +51,12 @@ export function useOutlineRouterNavigate(): (to: OutlineTarget) => void {
 	);
 }
 
+/** `onNavigateHref` for routed hosts: an app path (with its query) is a history entry. */
+export function useOutlineRouterHrefNavigate(): (path: string) => void {
+	const navigate = useNavigate();
+	return useCallback((path: string) => void navigate({ href: path }), [navigate]);
+}
+
 /** Leave for the outline page of a panel's state ("open in outline page"). */
 export function useOpenOutlinePage(): (state: OutlinePanelState) => void {
 	const navigate = useOutlineRouterNavigate();
