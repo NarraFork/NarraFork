@@ -174,10 +174,23 @@ export const OUTLINE_DIGEST_CONTRACT: Array<{
 			await write(ctx, old, at(41), [{ op: "insert", parent: null, content: "y" }]);
 			await write(ctx, raced, at(42), [{ op: "insert", parent: null, content: "z" }]);
 			await ctx.setLastCommitAt(old.id, null);
-			// Stamped meanwhile by a commit: left as it is.
-			await ctx.setLastCommitAt(raced.id, at(99));
-			for (let i = 0; i < 100 && (await ctx.store.stampUnstampedSpaces(2)) > 0; i++);
-			expect(await ctx.store.stampUnstampedSpaces(2)).toBe(0);
+			await ctx.setLastCommitAt(raced.id, null);
+			const listed = await ctx.store.listUnstampedSpaces(10_000);
+			expect(listed).toContain(old.id);
+			expect(listed).toContain(raced.id);
+			// A space nobody committed to has nothing to stamp.
+			expect(listed).not.toContain(empty.id);
+			// A commit lands on `raced` between the listing and the stamp: it wrote the right time
+			// itself, and the stamp leaves it.
+			await write(ctx, raced, at(99), [{ op: "insert", parent: null, content: "z2" }]);
+			expect(await ctx.store.stampSpaces([old.id, raced.id])).toBe(1);
+			expect(await ctx.store.stampSpaces([old.id])).toBe(0);
+			for (let i = 0; i < 100; i++) {
+				const ids = await ctx.store.listUnstampedSpaces(2);
+				if (ids.length === 0) break;
+				await ctx.store.stampSpaces(ids);
+			}
+			expect(await ctx.store.listUnstampedSpaces(2)).toEqual([]);
 			const stamped = new Map(
 				(await ctx.store.listSpacesCommittedSince(at(40), { limit: 1000 })).map((s) => [
 					s.id,
@@ -255,6 +268,14 @@ export const OUTLINE_DIGEST_CONTRACT: Array<{
 			expect(bySeq(1)[0]?.contentHash).not.toBe(bySeq(2)[0]?.contentHash);
 			expect(metas.find((m) => m.blockId === task)?.taskJson?.status).toBe("todo");
 			for (const meta of metas) expect("content" in meta).toBe(false);
+			// `ask_json` only when asked for.
+			const question = all[3]?.blockId as string;
+			const [bare] = await ctx.store.listVersionMetasAt([{ blockId: question, seq: 3 }]);
+			const [full] = await ctx.store.listVersionMetasAt([{ blockId: question, seq: 3 }], {
+				withAsk: true,
+			});
+			expect(bare?.askJson).toBeNull();
+			expect(full?.askJson?.recommend).toEqual({ text: "this" });
 		},
 	},
 	{
@@ -399,15 +420,17 @@ export const OUTLINE_DIGEST_CONTRACT: Array<{
 			).toBe("2091-03-01");
 			expect(await ctx.store.getLatestDigestCursor(u, "today")).toBeNull();
 
-			// A preview is replaced in place, and the others of the person go.
+			// A preview is replaced in place, keeping its id; the others of the person go.
 			const p1 = digestRow(u, "2091-03-05", { kind: "today", itemCount: 1 });
-			await ctx.store.replaceDigest(p1);
+			expect(await ctx.store.replaceDigest(p1)).toBe(p1.id);
 			const p2 = digestRow(u, "2091-03-05", { kind: "today", itemCount: 4 });
-			await ctx.store.replaceDigest(p2);
+			expect(await ctx.store.replaceDigest(p2)).toBe(p1.id);
 			const previews = await ctx.store.listDigestHeads(u, { kind: "today", limit: 10 });
-			expect(previews.map((p) => [p.id, p.itemCount])).toEqual([[p2.id, 4]]);
+			expect(previews.map((p) => [p.id, p.itemCount])).toEqual([[p1.id, 4]]);
+			expect((await ctx.store.getDigest(p1.id))?.itemCount).toBe(4);
+			expect(await ctx.store.getDigest(p2.id)).toBeNull();
 			await ctx.store.replaceDigest(digestRow(u, "2091-03-06", { kind: "today" }));
-			expect(await ctx.store.deleteDigests(u, "today", { exceptId: p2.id })).toBe(1);
+			expect(await ctx.store.deleteDigests(u, "today", { exceptId: p1.id })).toBe(1);
 			expect(await ctx.store.deleteDigests(u, "today", { atMostKey: "2091-03-05" })).toBe(1);
 			expect(await ctx.store.listDigestHeads(u, { kind: "today", limit: 10 })).toEqual([]);
 

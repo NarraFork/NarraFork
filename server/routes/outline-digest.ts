@@ -7,7 +7,7 @@
  *     "today so far" preview: heads only, never the items.
  *   - `GET /:id`: one report as the person may see it now (`services/outline/digest-view.ts`).
  *   - `POST /now`: ask for "today so far" (queued for the background job; 202).
- *   - `POST /seen`: the person read these reports.
+ *   - `POST /seen`: the person read these reports (`ids`), or all their unread ones (`all`).
  *   - `POST /undo`: take back a decision made in the person's name, by reverting its commit
  *     (only the person it was made for, only while they may write the space and while it can
  *     still be taken back).
@@ -66,7 +66,7 @@ outlineDigestRoutes.post("/now", async (c) => {
 
 outlineDigestRoutes.post("/seen", async (c) => {
 	const input = parse(outlineDigestsSeenBodySchema, await c.req.json().catch(() => ({})));
-	const marked = await markOutlineDigestsSeen(principalOf(c), input.ids);
+	const marked = await markOutlineDigestsSeen(principalOf(c), "all" in input ? "all" : input.ids);
 	return c.json({ marked });
 });
 

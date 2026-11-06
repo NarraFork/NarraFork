@@ -97,11 +97,16 @@ export interface OutlineDigestPort {
 		options: { after?: { lastCommitAt: string; id: string } | null; limit: number },
 	): Promise<OutlineSpaceActivity[]>;
 	/**
-	 * Stamp `last_commit_at` on at most `limit` spaces committed to before the column existed,
-	 * from their latest commit (only where it is still null: a commit landing meanwhile wins).
-	 * Returns how many were stamped; 0 once none are left.
+	 * Ids of at most `limit` spaces committed to before `last_commit_at` existed (still null, with
+	 * commits), by id: what is left to stamp. Empty once none are left.
 	 */
-	stampUnstampedSpaces(limit: number): Promise<number>;
+	listUnstampedSpaces(limit: number): Promise<string[]>;
+	/**
+	 * Stamp `last_commit_at` on the given spaces from their latest commit, only where it is still
+	 * null: a commit that landed since the listing wrote the right value already. Returns how many
+	 * were stamped.
+	 */
+	stampSpaces(spaceIds: readonly string[]): Promise<number>;
 	/**
 	 * The versions the commits of a space with `afterSeq < seq <= toSeq` wrote, without content,
 	 * by seq then block id, at most `limit`.
@@ -114,18 +119,23 @@ export interface OutlineDigestPort {
 	): Promise<OutlineRangeChange[]>;
 	/**
 	 * The version of each block valid at its seq (`from_seq <= seq < to_seq`, or open), without its
-	 * content. Blocks with no version then are left out. One backward seek per key.
+	 * content, and without its `ask_json` (null) unless `withAsk`. Blocks with no version then are
+	 * left out. One backward seek per key.
 	 */
 	listVersionMetasAt(
 		keys: ReadonlyArray<{ blockId: string; seq: number }>,
+		options?: { withAsk?: boolean },
 	): Promise<OutlineVersionMeta[]>;
 	/** Pending changes (heads) confirmed by the given commits (`uq_outline_pending_decision_commit`). */
 	getPendingByDecisionCommits(commitIds: readonly string[]): Promise<OutlinePendingHead[]>;
 
 	/** Insert a report; false, writing nothing, when the person has one for that kind and day. */
 	insertDigest(row: OutlineDigestRow): Promise<boolean>;
-	/** Insert a report, or replace the one the person has for that kind and day (a preview). */
-	replaceDigest(row: OutlineDigestRow): Promise<void>;
+	/**
+	 * Insert a report, or replace the one the person has for that kind and day (a preview), which
+	 * keeps its id: a client holding it still finds it. Returns the id of the row stored.
+	 */
+	replaceDigest(row: OutlineDigestRow): Promise<string>;
 	getDigest(id: string): Promise<OutlineDigestRow | null>;
 	/** A person's reports of a kind, latest day first, days before `before` when given. */
 	listDigestHeads(

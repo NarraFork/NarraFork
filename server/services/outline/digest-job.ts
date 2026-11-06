@@ -27,14 +27,33 @@
  *
  * SLICES
  * ------
- * A sweep (every {@link OUTLINE_DIGEST_JOB.wakeEveryMs}) goes through people a page at a time and
- * gathers those with days due into a batch (at most `personDaysPerBatch` person-days). A batch then
- * visits every space committed to since the earliest of its windows (the `last_commit_at` index,
- * a page at a time, at most `spacesPerBatch`), each once, summarizes the window of each person it
- * concerns (bounded reads, `digest.ts`) and keeps their part; then writes the batch's reports. A
- * slice works at most {@link OUTLINE_DIGEST_JOB.sliceBudgetMs}, yielding to the event loop after
- * every space, and the next slice carries on where it stopped. A restart starts over; reports
+ * Before any report is made, every space committed to before `last_commit_at` existed is stamped
+ * (once per process, in batches): an unstamped space would be invisible to the index below, and
+ * its days lost. Then a sweep (every {@link OUTLINE_DIGEST_JOB.wakeEveryMs}) goes through people a
+ * page at a time and gathers those with days due into a batch (at most `personDaysPerBatch`
+ * person-days). A batch visits every space committed to since the earliest of its windows (the
+ * `last_commit_at` index, a page at a time, each space once, however many there are),
+ * summarizes the window of each person it concerns (bounded reads, `digest.ts`) and keeps their
+ * part; then writes the batch's reports, person by person. A slice works at most
+ * {@link OUTLINE_DIGEST_JOB.sliceBudgetMs}, yielding to the event loop after every space and every
+ * person written, and the next slice carries on where it stopped. A restart starts over; reports
  * already written are not made again.
+ *
+ * FAILURES
+ * --------
+ * A space whose window cannot be read is tried once more, then left out of the batch's reports,
+ * which are marked truncated (and it is logged). A person whose reports cannot be written (they
+ * were deleted meanwhile, say) is logged and skipped; their later days of the batch are not
+ * written either, so the next sweep makes them again from the last one that was. A batch is done
+ * once every person was attempted, so one failure never stops the job for everyone.
+ *
+ * SCALE
+ * -----
+ * Each batch (up to 200 people) reads every space active since its earliest window: whom a space
+ * concerns is only known from its commits (acting in a public project counts). So the work grows
+ * with people ÷ 200 × spaces active per day. That is fine for a team instance; for large ones,
+ * working out once per sweep whom each active space concerns (or an index of who acted where)
+ * would bound it, and is left for later.
  */
 import { eventBus } from "@server/lib/event-bus";
 import { generateId } from "@server/lib/id";
@@ -58,6 +77,7 @@ import {
 	type OutlineSpaceSummary,
 	readWindowCommits,
 	selectForPerson,
+	spaceWeight,
 	summarizeSpaceWindow,
 } from "./digest";
 import {
@@ -89,9 +109,8 @@ export const OUTLINE_DIGEST_JOB = {
 	peoplePerPage: 200,
 	/** Person-days one batch makes at most (a person's days are never split). */
 	personDaysPerBatch: 200,
-	/** Spaces read per page, and visited per batch at most. */
+	/** Spaces read per page (a batch visits every page). */
 	spacesPerPage: 200,
-	spacesPerBatch: 5000,
 	/** People a project space concerns through grants, at most. */
 	peoplePerSpace: 200,
 	/** Spaces stamped with `last_commit_at` per slice until none are left. */
@@ -116,6 +135,8 @@ interface PersonDay {
 	parts: OutlinePersonContribution[];
 	/** Spaces left out early, being among the least busy (counted as spaces with changes). */
 	dropped: number;
+	/** Spaces whose window could not be read: the report says it is partial. */
+	failed: number;
 	ranges: OutlineDigestRanges;
 }
 
@@ -132,6 +153,10 @@ interface Batch {
 	after: { lastCommitAt: string; id: string } | null;
 	visited: Set<string>;
 	exhausted: boolean;
+	/** Chains attempted so far when writing (the next slice goes on from there). */
+	written: number;
+	/** People whose inbox the batch changed. */
+	attention: Set<string>;
 }
 
 interface JobState {
@@ -241,6 +266,7 @@ function chainOf(
 			end,
 			parts: [],
 			dropped: 0,
+			failed: 0,
 			ranges: {},
 		});
 	}
@@ -292,6 +318,8 @@ async function nextBatch(
 		after: null,
 		visited: new Set(),
 		exhausted: false,
+		written: 0,
+		attention: new Set(),
 	};
 }
 
@@ -354,28 +382,29 @@ export async function seqBefore(
 /** Keep a person-day's parts bounded: the least busy go first, counted (assembly keeps the busiest). */
 function compactParts(day: PersonDay, limits: OutlineDigestLimits): void {
 	if (day.parts.length <= limits.spacesPerDigest * 2) return;
-	const weight = (p: OutlinePersonContribution) =>
-		p.delegated.length +
-		p.knowledge.length +
-		p.tasks.length +
-		p.plans.length +
-		p.questions.length +
-		p.other.length;
-	day.parts.sort((a, b) => weight(b) - weight(a));
+	day.parts.sort((a, b) => spaceWeight(b) - spaceWeight(a));
 	day.dropped += day.parts.length - limits.spacesPerDigest;
 	day.parts.length = limits.spacesPerDigest;
 }
 
-/** One space of a batch: the window of every person-day it concerns. */
+/** What visiting a space does to a batch, applied only once the whole visit succeeded. */
+interface VisitEffect {
+	chain: PersonChain;
+	day: PersonDay;
+	to: number;
+	range: [number, number] | null;
+	part: OutlinePersonContribution | null;
+}
+
+/** One space of a batch: the window of every person-day it concerns. Reads only. */
 async function visitSpace(
 	store: OutlineStore,
 	space: OutlineSpaceActivity,
-	batch: Batch,
+	wanted: readonly PersonChain[],
 	limits: OutlineDigestLimits,
-): Promise<void> {
+): Promise<VisitEffect[]> {
 	const lastCommit = Date.parse(space.lastCommitAt);
-	const wanted = batch.chains.filter((chain) => chain.days.some((d) => lastCommit >= d.start));
-	if (wanted.length === 0) return;
+	const effects: VisitEffect[] = [];
 	const related = await relatedPeople(space);
 	const bounds = new Map<number, Promise<number>>();
 	const boundary = (t: number) => {
@@ -391,9 +420,11 @@ async function visitSpace(
 	for (const chain of wanted) {
 		const { person } = chain;
 		let readable: boolean | undefined;
+		// Where this space stands for the person, day after day of the chain.
+		let lastTo = chain.lastTo.get(space.id);
 		for (const day of chain.days) {
 			if (lastCommit < day.start) continue;
-			const from = chain.lastTo.get(space.id) ?? (await boundary(day.start));
+			const from = lastTo ?? (await boundary(day.start));
 			const to = Math.max(from, await boundary(day.end));
 			if (to <= from) continue;
 			const key = `${from}:${to}`;
@@ -405,7 +436,7 @@ async function visitSpace(
 			const read = await window;
 			// The space moves on for the person whether this day concerns them or not: a later day
 			// of the batch starts after this one, never again from an earlier day's end.
-			chain.lastTo.set(space.id, to);
+			lastTo = to;
 			const concerned =
 				related.has(person.id) ||
 				read.commits.some(
@@ -413,91 +444,144 @@ async function visitSpace(
 						c.responsibleUserId === person.id ||
 						(c.actorKind === "human" && c.actorId === person.id),
 				);
-			if (!concerned) continue;
+			if (!concerned) {
+				effects.push({ chain, day, to, range: null, part: null });
+				continue;
+			}
 			if (readable === undefined)
 				readable = await canReadSpace({ userId: person.id, isAdmin: person.isAdmin }, space);
 			if (!readable) break;
-			if (Object.keys(day.ranges).length < limits.rangesPerDigest)
-				day.ranges[space.id] = [from, to];
 			let summary = summaries.get(key);
 			if (!summary) {
 				summary = summarizeSpaceWindow(store, space, from, to, limits, read);
 				summaries.set(key, summary);
 			}
-			day.parts.push(
-				selectForPerson(await summary, { userId: person.id, username: person.username }, limits),
+			const part = selectForPerson(
+				await summary,
+				{ userId: person.id, username: person.username },
+				limits,
 			);
+			// A part with nothing in it is no space with changes.
+			effects.push({
+				chain,
+				day,
+				to,
+				range: [from, to],
+				part: spaceWeight(part) > 0 ? part : null,
+			});
+		}
+	}
+	return effects;
+}
+
+function applyVisit(spaceId: string, effects: readonly VisitEffect[], limits: OutlineDigestLimits) {
+	for (const { chain, day, to, range, part } of effects) {
+		chain.lastTo.set(spaceId, to);
+		if (range && Object.keys(day.ranges).length < limits.rangesPerDigest)
+			day.ranges[spaceId] = range;
+		if (part) {
+			day.parts.push(part);
 			compactParts(day, limits);
 		}
 	}
 }
 
-/** Write a batch's reports; returns how many rows were written. */
-async function finishBatch(
+/** Write one person's reports of the batch, oldest first; how many rows were written. */
+async function writeChain(
+	store: OutlineStore,
+	chain: PersonChain,
+	nowIso: string,
+	limits: OutlineDigestLimits,
+	attention: Set<string>,
+): Promise<number> {
+	let written = 0;
+	const userId = chain.person.id;
+	for (const day of chain.days) {
+		const assembled = assembleDigest(day.parts, limits);
+		if (day.dropped > 0) {
+			assembled.counts.spaces += day.dropped;
+			assembled.items.moreSpaces += day.dropped;
+			assembled.truncated = true;
+		}
+		if (day.failed > 0) assembled.truncated = true;
+		const row = {
+			id: generateId(),
+			userId,
+			kind: day.kind,
+			periodKey: day.periodKey,
+			timeZone: day.timeZone,
+			periodStart: new Date(day.start).toISOString(),
+			periodEnd: new Date(day.end).toISOString(),
+			counts: assembled.counts,
+			itemCount: assembled.itemCount,
+			items: assembled.items,
+			ranges: day.ranges,
+			truncated: assembled.truncated,
+			createdAt: nowIso,
+			// Nothing to read, or a preview the person asked for (they are looking at it): written
+			// as read, so it never shows as unread in the inbox.
+			seenAt: assembled.itemCount === 0 || day.kind === "today" ? nowIso : null,
+		};
+		if (day.kind === "daily") {
+			if (await store.insertDigest(row)) {
+				written++;
+				if (row.itemCount > 0) attention.add(userId);
+				// The day's report replaces its preview; only the latest days are kept.
+				if ((await store.deleteDigests(userId, "today", { atMostKey: day.periodKey })) > 0)
+					attention.add(userId);
+				await store.pruneDigests(userId, "daily", OUTLINE_DIGEST_JOB.keepDaily);
+			}
+			const known = state.doneThrough.get(userId);
+			if (known === undefined || known < day.periodKey)
+				state.doneThrough.set(userId, day.periodKey);
+		} else {
+			// The preview keeps its id (a client may hold it); any other the person had goes.
+			const id = await store.replaceDigest(row);
+			await store.deleteDigests(userId, "today", { exceptId: id });
+			written++;
+			attention.add(userId);
+		}
+	}
+	return written;
+}
+
+/**
+ * Write the batch's reports person by person until the budget is spent. A person whose reports
+ * fail is logged and skipped. `done` once every person was attempted.
+ */
+async function writeBatch(
 	store: OutlineStore,
 	batch: Batch,
 	nowIso: string,
 	limits: OutlineDigestLimits,
-): Promise<number> {
+	over: () => boolean,
+): Promise<{ done: boolean; written: number }> {
 	let written = 0;
-	let changed = false;
-	for (const chain of batch.chains) {
-		const userId = chain.person.id;
-		for (const day of chain.days) {
-			const assembled = assembleDigest(day.parts, limits);
-			if (day.dropped > 0) {
-				assembled.counts.spaces += day.dropped;
-				assembled.items.moreSpaces += day.dropped;
-				assembled.truncated = true;
-			}
-			const row = {
-				id: generateId(),
-				userId,
-				kind: day.kind,
-				periodKey: day.periodKey,
-				timeZone: day.timeZone,
-				periodStart: new Date(day.start).toISOString(),
-				periodEnd: new Date(day.end).toISOString(),
-				counts: assembled.counts,
-				itemCount: assembled.itemCount,
-				items: assembled.items,
-				ranges: day.ranges,
-				truncated: assembled.truncated,
-				createdAt: nowIso,
-				// Nothing to read, or a preview the person asked for (they are looking at it): written
-				// as read, so it never shows as unread in the inbox.
-				seenAt: assembled.itemCount === 0 || day.kind === "today" ? nowIso : null,
-			};
-			if (day.kind === "daily") {
-				if (await store.insertDigest(row)) {
-					written++;
-					if (row.itemCount > 0) changed = true;
-					// The day's report replaces its preview; only the latest days are kept.
-					if ((await store.deleteDigests(userId, "today", { atMostKey: day.periodKey })) > 0)
-						changed = true;
-					await store.pruneDigests(userId, "daily", OUTLINE_DIGEST_JOB.keepDaily);
-				}
-				const known = state.doneThrough.get(userId);
-				if (known === undefined || known < day.periodKey)
-					state.doneThrough.set(userId, day.periodKey);
-			} else {
-				await store.replaceDigest(row);
-				await store.deleteDigests(userId, "today", { exceptId: row.id });
-				written++;
-				changed = true;
-			}
+	while (batch.written < batch.chains.length) {
+		if (over()) return { done: false, written };
+		const chain = batch.chains[batch.written] as PersonChain;
+		batch.written++;
+		try {
+			written += await writeChain(store, chain, nowIso, limits, batch.attention);
+		} catch (error) {
+			logger.warn("Outline report could not be written; the next sweep tries again", {
+				userId: chain.person.id,
+				error: String(error),
+			});
 		}
+		await yieldToLoop();
 	}
-	if (changed) eventBus.emit({ type: "human_attention:changed" });
-	return written;
+	if (batch.attention.size > 0)
+		eventBus.emit({ type: "human_attention:changed", userIds: [...batch.attention] });
+	return { done: true, written };
 }
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 /**
- * One slice of the job: stamp spaces written before `last_commit_at` existed, then gather or
- * carry on a batch, visiting spaces until the budget is spent, and write the batch once every
- * space was visited. `more`: there is work left (call again).
+ * One slice of the job: stamp spaces written before `last_commit_at` existed (no report is made
+ * until none are left), then gather or carry on a batch, visiting spaces and then writing its
+ * reports until the budget is spent. `more`: there is work left (call again).
  */
 export async function runOutlineDigestSlice(
 	options: OutlineDigestJobOptions = {},
@@ -511,9 +595,14 @@ export async function runOutlineDigestSlice(
 	const started = clock();
 	const over = () => clock() - started >= budget;
 
-	if (!state.stamped) {
-		const stamped = await store.stampUnstampedSpaces(OUTLINE_DIGEST_JOB.stampBatch);
-		if (stamped < OUTLINE_DIGEST_JOB.stampBatch) state.stamped = true;
+	while (!state.stamped) {
+		const ids = await store.listUnstampedSpaces(OUTLINE_DIGEST_JOB.stampBatch);
+		if (ids.length === 0) {
+			state.stamped = true;
+			break;
+		}
+		await store.stampSpaces(ids);
+		await yieldToLoop();
 		if (over()) return { more: true, written: 0 };
 	}
 	if (!state.batch) {
@@ -534,22 +623,43 @@ export async function runOutlineDigestSlice(
 			// A space committed to again moves along the index: it is visited once.
 			if (batch.visited.has(space.id)) continue;
 			batch.visited.add(space.id);
+			const lastCommit = Date.parse(space.lastCommitAt);
+			const wanted = batch.chains.filter((chain) => chain.days.some((d) => lastCommit >= d.start));
+			if (wanted.length === 0) continue;
 			const began = clock();
-			await visitSpace(store, space, batch, limits);
+			let effects: VisitEffect[] | null = null;
+			for (let attempt = 0; attempt < 2 && effects === null; attempt++) {
+				try {
+					effects = await visitSpace(store, space, wanted, limits);
+				} catch (error) {
+					if (attempt === 1)
+						logger.warn("Outline report: a space could not be read; reports left partial", {
+							spaceId: space.id,
+							error: String(error),
+						});
+				}
+			}
+			if (effects) applyVisit(space.id, effects, limits);
+			else
+				for (const chain of wanted)
+					for (const day of chain.days) if (lastCommit >= day.start) day.failed++;
 			const took = clock() - began;
 			if (took > OUTLINE_DIGEST_JOB.slowSpaceMs)
 				logger.info("Outline report: slow space", { spaceId: space.id, ms: Math.round(took) });
-			if (batch.visited.size >= OUTLINE_DIGEST_JOB.spacesPerBatch) {
-				batch.exhausted = true;
-				break;
-			}
 			await yieldToLoop();
 			if (over()) return { more: true, written: 0 };
 		}
 	}
-	const written = await finishBatch(store, batch, now().toISOString(), limits);
-	state.batch = null;
-	return { more: true, written };
+	let outcome: { done: boolean; written: number };
+	try {
+		outcome = await writeBatch(store, batch, now().toISOString(), limits, over);
+	} catch (error) {
+		// Never left half written for the next slice to fail on again.
+		state.batch = null;
+		throw error;
+	}
+	if (outcome.done) state.batch = null;
+	return { more: true, written: outcome.written };
 }
 
 /**

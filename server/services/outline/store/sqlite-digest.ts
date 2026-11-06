@@ -135,9 +135,9 @@ export const sqliteOutlineDigests: OutlineDigestPort = {
 			.map(toActivity);
 	},
 
-	async stampUnstampedSpaces(limit) {
+	async listUnstampedSpaces(limit) {
 		// The predicate is the partial index's own, word for word.
-		const ids = db
+		return db
 			.select({ id: outlineSpaces.id })
 			.from(outlineSpaces)
 			.where(sql`"last_commit_at" IS NULL AND "next_seq" > 1`)
@@ -145,23 +145,31 @@ export const sqliteOutlineDigests: OutlineDigestPort = {
 			.limit(limit)
 			.all()
 			.map((r) => r.id);
-		if (ids.length === 0) return 0;
-		await withDbRetry(
+	},
+
+	async stampSpaces(spaceIds) {
+		if (spaceIds.length === 0) return 0;
+		return await withDbRetry(
 			async () => {
-				db.update(outlineSpaces)
-					.set({
-						// The space's latest commit; its creation should that ever be missing, so a space
-						// is never left to be visited again.
-						lastCommitAt: sql`COALESCE((SELECT c.created_at FROM outline_commits c
-							WHERE c.space_id = outline_spaces.id AND c.seq = outline_spaces.next_seq - 1),
-							outline_spaces.created_at)`,
-					})
-					.where(and(inArray(outlineSpaces.id, ids), isNull(outlineSpaces.lastCommitAt)))
-					.run();
+				let stamped = 0;
+				for (const ids of chunked([...new Set(spaceIds)])) {
+					stamped += db
+						.update(outlineSpaces)
+						.set({
+							// The space's latest commit; its creation should that ever be missing, so a
+							// space is never left to be visited again.
+							lastCommitAt: sql`COALESCE((SELECT c.created_at FROM outline_commits c
+								WHERE c.space_id = outline_spaces.id AND c.seq = outline_spaces.next_seq - 1),
+								outline_spaces.created_at)`,
+						})
+						.where(and(inArray(outlineSpaces.id, ids), isNull(outlineSpaces.lastCommitAt)))
+						.returning({ id: outlineSpaces.id })
+						.all().length;
+				}
+				return stamped;
 			},
-			{ label: "outline.stampUnstampedSpaces", maxRetries: 3 },
+			{ label: "outline.stampSpaces", maxRetries: 3 },
 		);
-		return ids.length;
 	},
 
 	async listCommitRangeChanges(spaceId, afterSeq, toSeq, limit) {
@@ -194,9 +202,21 @@ export const sqliteOutlineDigests: OutlineDigestPort = {
 		}));
 	},
 
-	async listVersionMetasAt(keys) {
+	async listVersionMetasAt(keys, options = {}) {
 		const out: OutlineVersionMeta[] = [];
 		const v = outlineBlockVersions;
+		const columns = {
+			blockId: v.blockId,
+			fromSeq: v.fromSeq,
+			toSeq: v.toSeq,
+			commitId: v.commitId,
+			pageId: v.pageId,
+			parentId: v.parentId,
+			contentHash: v.contentHash,
+			taskJson: v.taskJson,
+			changeFlags: v.changeFlags,
+			deleted: v.deleted,
+		};
 		for (const layer of keyLayers(keys)) {
 			for (const chunk of chunked(layer, KEYED_CHUNK)) {
 				const seqOf = new Map(chunk.map((k) => [k.blockId, k.seq]));
@@ -218,23 +238,20 @@ export const sqliteOutlineDigests: OutlineDigestPort = {
 					found.map((k) => sql`(${k.blockId}, ${k.fromSeq})`),
 					sql`, `,
 				);
-				const rows = db
-					.select({
-						blockId: v.blockId,
-						fromSeq: v.fromSeq,
-						toSeq: v.toSeq,
-						commitId: v.commitId,
-						pageId: v.pageId,
-						parentId: v.parentId,
-						contentHash: v.contentHash,
-						taskJson: v.taskJson,
-						askJson: v.askJson,
-						changeFlags: v.changeFlags,
-						deleted: v.deleted,
-					})
-					.from(v)
-					.where(sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`)
-					.all();
+				// `ask_json` (up to kilobytes) only for the reads that use it.
+				const where = sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`;
+				const rows = options.withAsk
+					? db
+							.select({ ...columns, askJson: v.askJson })
+							.from(v)
+							.where(where)
+							.all()
+					: db
+							.select(columns)
+							.from(v)
+							.where(where)
+							.all()
+							.map((row) => ({ ...row, askJson: null }));
 				for (const row of rows) {
 					const seq = seqOf.get(row.blockId) as number;
 					if (row.toSeq === null || row.toSeq > seq)
@@ -276,16 +293,20 @@ export const sqliteOutlineDigests: OutlineDigestPort = {
 
 	async replaceDigest(row) {
 		const values = toValues(row);
-		const { userId: _user, kind: _kind, periodKey: _key, ...set } = values;
-		await withDbRetry(
+		// The row keeps its id: a client that was handed it still finds the replacement.
+		const { id: _id, userId: _user, kind: _kind, periodKey: _key, ...set } = values;
+		return await withDbRetry(
 			async () => {
-				db.insert(outlineDigests)
+				const stored = db
+					.insert(outlineDigests)
 					.values(values)
 					.onConflictDoUpdate({
 						target: [outlineDigests.userId, outlineDigests.kind, outlineDigests.periodKey],
 						set,
 					})
-					.run();
+					.returning({ id: outlineDigests.id })
+					.get();
+				return stored?.id ?? row.id;
 			},
 			{ label: "outline.replaceDigest", maxRetries: 3 },
 		);

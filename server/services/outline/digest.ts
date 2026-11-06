@@ -517,7 +517,7 @@ export async function summarizeSpaceWindow(
 	const metas = new Map<string, OutlineVersionMeta>();
 	if (metaKeys.length > 0) {
 		const wanted = new Set(metaKeys.map((k) => versionKey(k.blockId, k.seq)));
-		const keyed = await store.listVersionMetasAt(metaKeys);
+		const keyed = await store.listVersionMetasAt(metaKeys, { withAsk: true });
 		// A meta answers each wanted seq it is valid at.
 		for (const meta of keyed) {
 			for (const k of metaKeys) {
@@ -824,7 +824,8 @@ function emptyMore(): Record<OutlineDigestSection, number> {
 	return { delegated: 0, knowledge: 0, tasks: 0, plans: 0, questions: 0, other: 0 };
 }
 
-function spaceWeight(c: OutlinePersonContribution): number {
+/** How much a person's part of a space holds: its items, those past the caps, and the counts. */
+export function spaceWeight(c: OutlinePersonContribution): number {
 	return (
 		OUTLINE_DIGEST_SECTIONS.reduce((n, s) => n + c.more[s], 0) +
 		c.delegated.length +
@@ -925,8 +926,17 @@ export function assembleDigest(
 	};
 	let fits = true;
 	while (fits && listed() > limits.itemsPerDigest) fits = dropOne();
-	fits = true;
-	while (fits && Buffer.byteLength(JSON.stringify(items)) > limits.itemsBytes) fits = dropOne();
+	// The byte limit: each item dropped takes its own size off (no re-serializing the whole report
+	// per item), measured again once the estimate fits (the counts it adds take a few bytes).
+	let size = Buffer.byteLength(JSON.stringify(items));
+	while (size > limits.itemsBytes) {
+		const section = largest();
+		const item = sections[section].pop();
+		if (!item) break;
+		size -= Buffer.byteLength(JSON.stringify(item)) + 1;
+		cut(section, item);
+		if (size <= limits.itemsBytes) size = Buffer.byteLength(JSON.stringify(items));
+	}
 	for (const space of spaces)
 		for (const section of OUTLINE_DIGEST_SECTIONS)
 			items.more[section] += space.more?.[section] ?? 0;

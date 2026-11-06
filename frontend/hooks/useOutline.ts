@@ -341,11 +341,11 @@ export function useMarkOutlineDigestSeen() {
 	});
 }
 
-/** Mark reports read (P2 PR 11): the inbox row's "Got it". */
+/** Mark all unread reports read (P2 PR 11): the inbox row's "Got it". */
 export function useMarkOutlineReportsSeen() {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: (ids: string[]) => api.markOutlineReportsSeen(ids),
+		mutationFn: () => api.markOutlineReportsSeen(),
 		onSettled: () => {
 			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
 		},

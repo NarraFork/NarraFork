@@ -428,7 +428,8 @@ function OutlineDigestList({
 	const items = digest.data?.items ?? [];
 	const gotIt = () => {
 		if (items.length > 0) seen.mutate(items.map((i) => i.pendingId));
-		if (reportIds.length > 0) reportsSeen.mutate(reportIds);
+		// Every unread report, not only those the row names.
+		if (reportIds.length > 0) reportsSeen.mutate();
 	};
 	const reports =
 		reportIds.length > 0 ? (

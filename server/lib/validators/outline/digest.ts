@@ -15,10 +15,11 @@ export const outlineDigestListQuerySchema = z.object({
 	limit: z.coerce.number().int().min(1).max(50).optional(),
 });
 
-/** `POST /digests/seen`: reports the person has read. */
-export const outlineDigestsSeenBodySchema = z.object({
-	ids: z.array(outlineIdSchema).min(1).max(50),
-});
+/** `POST /digests/seen`: reports the person has read, named, or all their unread ones. */
+export const outlineDigestsSeenBodySchema = z.union([
+	z.object({ ids: z.array(outlineIdSchema).min(1).max(50) }).strict(),
+	z.object({ all: z.literal(true) }).strict(),
+]);
 
 /** `POST /digests/undo`: the commit of a decision made in the person's name. */
 export const outlineDigestUndoBodySchema = z.object({

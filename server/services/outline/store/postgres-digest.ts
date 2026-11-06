@@ -150,8 +150,8 @@ export function createPostgresOutlineDigests(db: BunSQLDatabase): OutlineDigestP
 			return rows.map(toActivity);
 		},
 
-		async stampUnstampedSpaces(limit) {
-			const ids = (
+		async listUnstampedSpaces(limit) {
+			return (
 				await db
 					.select({ id: outlineSpaces.id })
 					.from(outlineSpaces)
@@ -159,20 +159,27 @@ export function createPostgresOutlineDigests(db: BunSQLDatabase): OutlineDigestP
 					.orderBy(asc(outlineSpaces.id))
 					.limit(limit)
 			).map((r) => r.id);
-			if (ids.length === 0) return 0;
-			await withPgRetry(
-				() =>
-					db
-						.update(outlineSpaces)
-						.set({
-							lastCommitAt: sql`COALESCE((SELECT c.created_at FROM outline_commits c
-								WHERE c.space_id = outline_spaces.id AND c.seq = outline_spaces.next_seq - 1),
-								outline_spaces.created_at)`,
-						})
-						.where(and(inArray(outlineSpaces.id, ids), isNull(outlineSpaces.lastCommitAt))),
-				{ label: "outline.stampUnstampedSpaces" },
-			);
-			return ids.length;
+		},
+
+		async stampSpaces(spaceIds) {
+			let stamped = 0;
+			for (const ids of chunked([...new Set(spaceIds)])) {
+				const rows = await withPgRetry(
+					() =>
+						db
+							.update(outlineSpaces)
+							.set({
+								lastCommitAt: sql`COALESCE((SELECT c.created_at FROM outline_commits c
+									WHERE c.space_id = outline_spaces.id AND c.seq = outline_spaces.next_seq - 1),
+									outline_spaces.created_at)`,
+							})
+							.where(and(inArray(outlineSpaces.id, ids), isNull(outlineSpaces.lastCommitAt)))
+							.returning({ id: outlineSpaces.id }),
+					{ label: "outline.stampSpaces" },
+				);
+				stamped += rows.length;
+			}
+			return stamped;
 		},
 
 		async listCommitRangeChanges(spaceId, afterSeq, toSeq, limit) {
@@ -210,9 +217,21 @@ export function createPostgresOutlineDigests(db: BunSQLDatabase): OutlineDigestP
 			}));
 		},
 
-		async listVersionMetasAt(keys) {
+		async listVersionMetasAt(keys, options = {}) {
 			const out: OutlineVersionMeta[] = [];
 			const v = outlineBlockVersions;
+			const columns = {
+				blockId: v.blockId,
+				fromSeq: v.fromSeq,
+				toSeq: v.toSeq,
+				commitId: v.commitId,
+				pageId: v.pageId,
+				parentId: v.parentId,
+				contentHash: v.contentHash,
+				taskJson: v.taskJson,
+				changeFlags: v.changeFlags,
+				deleted: v.deleted,
+			};
 			for (const layer of keyLayers(keys)) {
 				for (const chunk of chunked(layer, KEYED_CHUNK)) {
 					const seqOf = new Map(chunk.map((k) => [k.blockId, k.seq]));
@@ -235,22 +254,17 @@ export function createPostgresOutlineDigests(db: BunSQLDatabase): OutlineDigestP
 						),
 						sql`, `,
 					);
-					const rows = await db
-						.select({
-							blockId: v.blockId,
-							fromSeq: v.fromSeq,
-							toSeq: v.toSeq,
-							commitId: v.commitId,
-							pageId: v.pageId,
-							parentId: v.parentId,
-							contentHash: v.contentHash,
-							taskJson: v.taskJson,
-							askJson: v.askJson,
-							changeFlags: v.changeFlags,
-							deleted: v.deleted,
-						})
-						.from(v)
-						.where(sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`);
+					// `ask_json` (up to kilobytes) only for the reads that use it.
+					const where = sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`;
+					const rows = options.withAsk
+						? await db
+								.select({ ...columns, askJson: v.askJson })
+								.from(v)
+								.where(where)
+						: (await db.select(columns).from(v).where(where)).map((row) => ({
+								...row,
+								askJson: null as unknown,
+							}));
 					for (const row of rows) {
 						const seq = seqOf.get(row.blockId) as number;
 						if (row.toSeq === null || row.toSeq > seq)
@@ -295,8 +309,9 @@ export function createPostgresOutlineDigests(db: BunSQLDatabase): OutlineDigestP
 
 		async replaceDigest(row) {
 			const values = toValues(row);
-			const { userId: _user, kind: _kind, periodKey: _key, ...set } = values;
-			await withPgRetry(
+			// The row keeps its id: a client that was handed it still finds the replacement.
+			const { id: _id, userId: _user, kind: _kind, periodKey: _key, ...set } = values;
+			const rows = await withPgRetry(
 				() =>
 					db
 						.insert(outlineDigests)
@@ -304,9 +319,11 @@ export function createPostgresOutlineDigests(db: BunSQLDatabase): OutlineDigestP
 						.onConflictDoUpdate({
 							target: [outlineDigests.userId, outlineDigests.kind, outlineDigests.periodKey],
 							set,
-						}),
+						})
+						.returning({ id: outlineDigests.id }),
 				{ label: "outline.replaceDigest" },
 			);
+			return rows[0]?.id ?? row.id;
 		},
 
 		async getDigest(id) {

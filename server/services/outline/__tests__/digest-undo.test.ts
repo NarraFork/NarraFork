@@ -24,7 +24,11 @@ import { AppError } from "../../../lib/errors";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { outlineRoutes } from "../../../routes/outline";
-import { classifyDelegatedCommit } from "../digest-view";
+import {
+	classifyDelegatedCommit,
+	OutlineDigestUndoError,
+	undoOutlineDelegatedDecision,
+} from "../digest-view";
 import type { OutlineAskJson } from "../model";
 import { confirmOutlinePending, lockOutlineTask } from "../pending";
 import { decideOutlinePlan, ensurePlanRoot, OUTLINE_PLAN_REVIEW_ACTOR } from "../plans";
@@ -218,6 +222,24 @@ describe("undoing a decision made in the person's name", () => {
 		const seq = (await store.getSpace(projectSpace.id))?.nextSeq;
 		const again = await undo(alice, commit.id);
 		expect([again.status, again.body.code]).toEqual([409, "OUTLINE_DIGEST_UNDO_GONE"]);
+		expect((await store.getSpace(projectSpace.id))?.nextSeq).toBe(seq as number);
+	});
+
+	test("changed between the check and the revert, so nothing is put back: 409, nothing written", async () => {
+		const { commit } = await relayedAnswer(alice);
+		// The check sees the commit's versions; the revert, a moment later, finds nothing to put
+		// back (as when a write lands in between).
+		let reads = 0;
+		const raced = {
+			...store,
+			listCommitVersions: (commitId: string, limit: number) =>
+				reads++ === 0 ? store.listCommitVersions(commitId, limit) : Promise.resolve([]),
+		};
+		const seq = (await store.getSpace(projectSpace.id))?.nextSeq;
+		await expect(
+			undoOutlineDelegatedDecision({ userId: alice, isAdmin: false }, commit.id, { store: raced }),
+		).rejects.toBeInstanceOf(OutlineDigestUndoError);
+		expect(reads).toBe(2);
 		expect((await store.getSpace(projectSpace.id))?.nextSeq).toBe(seq as number);
 	});
 

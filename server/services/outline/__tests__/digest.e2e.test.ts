@@ -24,16 +24,25 @@ import type {
 	OutlineDigestLink,
 	OutlineDigestListResponse,
 } from "@shared/outline-digest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../../db";
-import { aclGrants, narrators, projects, userPreferences, users } from "../../../db/schema";
+import {
+	aclGrants,
+	narrators,
+	outlineSpaces,
+	projects,
+	userPreferences,
+	users,
+} from "../../../db/schema";
 import { AppError } from "../../../lib/errors";
+import { eventBus } from "../../../lib/event-bus";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { outlineRoutes } from "../../../routes/outline";
 import { OUTLINE_DIGEST_LIMITS } from "../digest";
 import {
+	OUTLINE_DIGEST_JOB,
 	requestOutlineDigestPreview,
 	resetOutlineDigestJobForTests,
 	runOutlineDigestSlice,
@@ -512,27 +521,6 @@ describe("reports: the acceptance", () => {
 		// Other: bob's revert.
 		expect(a.other.map((o) => [o.event, o.actor.id])).toEqual([["revert", bob.id]]);
 		await expectLinksResolve(alice.id, a);
-		// Undone in one click from the report: then it no longer stands, and cannot be undone again.
-		const undone = await call<{ kind: string }>(alice.id, "/digests/undo", {
-			method: "POST",
-			body: { commitId: relay.commit?.id as string },
-		});
-		expect([undone.status, undone.body.kind]).toEqual([200, "relayed_answer"]);
-		const after = await detail(alice.id, aliceDay.id);
-		expect(after.delegated.map((d) => [d.kind, d.stands, d.canUndo]).sort()).toEqual([
-			["confirmation", true, true],
-			["plan_review_approval", true, true],
-			["relayed_answer", false, false],
-		]);
-		// Bob may write the project, but the answer was relayed in alice's name.
-		expect(
-			(
-				await call(bob.id, "/digests/undo", {
-					method: "POST",
-					body: { commitId: confirmedCommit as string },
-				})
-			).status,
-		).toBe(403);
 		// Nothing of the next day, nothing of text in the stored items.
 		const stored = JSON.stringify(aliceDay.items);
 		for (const text of ["Shanghai's midnight", "BOM", "Formats we read", "Which format"])
@@ -630,6 +618,24 @@ describe("reports: the acceptance", () => {
 				kick: false,
 			}),
 		).toEqual({ queued: false });
+		// Asked again later: the preview is made again under the same id, which a client may hold.
+		await write(p.space, A, alice.id, "2026-11-06T03:01:00.000Z", [
+			{ op: "insert", parent: { id: page as string }, content: "A minute later" },
+		]);
+		expect(
+			requestOutlineDigestPreview(alice.id, {
+				now: Date.parse("2026-11-06T03:02:00.000Z"),
+				kick: false,
+			}),
+		).toEqual({ queued: true });
+		await runJob("2026-11-06T03:02:00.000Z");
+		const previews = await store.listDigestHeads(alice.id, { kind: "today", limit: 5 });
+		expect(previews.map((x) => x.id)).toEqual([previewRow.id]);
+		expect(
+			(await detail(alice.id, previewRow.id)).knowledge.flatMap((k) =>
+				k.blocks.map((b) => b.title),
+			),
+		).toEqual(["Written after Shanghai's midnight", "A minute later"]);
 
 		// Bob loses the project: its items and counts go from his reports, titles included.
 		await db.delete(aclGrants).where(eq(aclGrants.id, bobGrant));
@@ -638,7 +644,53 @@ describe("reports: the acceptance", () => {
 		expect(gone.knowledge).toEqual([]);
 		expect(gone.questions).toEqual([]);
 		expect(gone.digest.itemCount).toBe(0);
+		expect(b5row.counts.knowledge).toBeGreaterThan(0);
+		expect(gone.digest.counts).toEqual({
+			delegated: 0,
+			knowledge: 0,
+			tasks: 0,
+			plans: 0,
+			questions: 0,
+			other: 0,
+			spaces: 0,
+			ownEdits: 0,
+		});
 		expect(JSON.stringify(gone)).not.toContain("alice wrote herself");
+
+		// 11-06T23:30Z, 07:30 on 11-07 in Shanghai: alice's 11-06 replaces its preview.
+		await runJob("2026-11-06T23:30:00.000Z");
+		const day6 = (await dailies(alice.id)).find((d) => d.periodKey === "2026-11-06");
+		expect(day6?.periodStart).toBe(aliceDay.periodEnd);
+		expect(await store.listDigestHeads(alice.id, { kind: "today", limit: 5 })).toEqual([]);
+		expect((await call(alice.id, `/digests/${previewRow.id}`)).status).toBe(404);
+		expect(
+			(await detail(alice.id, day6?.id as string)).knowledge.flatMap((k) =>
+				k.blocks.map((b) => b.title),
+			),
+		).toEqual(["Written after Shanghai's midnight", "A minute later"]);
+
+		// Undone in one click from the report (last: the API reverts at the real time): then it no
+		// longer stands, and cannot be undone again.
+		const undone = await call<{ kind: string }>(alice.id, "/digests/undo", {
+			method: "POST",
+			body: { commitId: relay.commit?.id as string },
+		});
+		expect([undone.status, undone.body.kind]).toEqual([200, "relayed_answer"]);
+		const after = await detail(alice.id, aliceDay.id);
+		expect(after.delegated.map((d) => [d.kind, d.stands, d.canUndo]).sort()).toEqual([
+			["confirmation", true, true],
+			["plan_review_approval", true, true],
+			["relayed_answer", false, false],
+		]);
+		// Bob no longer reads the project: alice's confirmation is not his to see (404, not 403).
+		expect(
+			(
+				await call(bob.id, "/digests/undo", {
+					method: "POST",
+					body: { commitId: confirmedCommit as string },
+				})
+			).status,
+		).toBe(404);
 	}, 120_000);
 
 	test("unread reports join the inbox's digest row, counted until read", async () => {
@@ -677,6 +729,35 @@ describe("reports: the acceptance", () => {
 				})
 			).body.marked,
 		).toBe(0);
+		// Two more unread days; "Got it" marks every unread one, and tells only erin's clients.
+		for (const day of ["11", "12"])
+			await write(p.space, { kind: "agent", id: agent }, erin.id, `2026-11-${day}T09:00:00.000Z`, [
+				{ op: "insert", parent: null, content: `Fact of 11-${day}` },
+			]);
+		await runJob("2026-11-13T08:00:00.000Z");
+		expect(
+			(await listOutlineAttention(principal)).find((i) => i.kind === "outline_digest")?.outline
+				?.reports,
+		).toBe(2);
+		const events: Array<{ userIds?: string[] }> = [];
+		const listen = (event: { userIds?: string[] }) => events.push(event);
+		eventBus.on("human_attention:changed", listen);
+		try {
+			const all = await call<{ marked: number }>(erin.id, "/digests/seen", {
+				method: "POST",
+				body: { all: true },
+			});
+			expect(all.body.marked).toBe(2);
+		} finally {
+			eventBus.off("human_attention:changed", listen);
+		}
+		expect(events.map((e) => e.userIds)).toEqual([[erin.id]]);
+		expect((await listOutlineAttention(principal)).some((i) => i.kind === "outline_digest")).toBe(
+			false,
+		);
+		expect(
+			(await call(erin.id, "/digests/seen", { method: "POST", body: { all: false } })).status,
+		).toBe(400);
 	}, 60_000);
 });
 
@@ -897,6 +978,259 @@ describe("reports: delegation (outline P2 PR 9)", () => {
 		// The report's blocks sit under a task: process, not knowledge.
 		expect(d.knowledge.flatMap((k) => k.blocks.map((b) => b.title))).toEqual([]);
 		await expectLinksResolve(mia.id, d);
+	}, 60_000);
+});
+
+const JOB = OUTLINE_DIGEST_JOB as unknown as Record<string, number>;
+
+describe("reports: the job when it is large, interrupted or fails", () => {
+	test("every space is visited, however many: a page of one, one space a slice", async () => {
+		const amy = await person("amy", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(amy.id) };
+		const spaces = [await project(amy.id), await project(amy.id), await project(amy.id)];
+		for (const [i, s] of spaces.entries())
+			await write(s.space, A, amy.id, `2026-12-10T1${i}:00:00.000Z`, [
+				{ op: "insert", parent: null, content: `fact ${i}` },
+			]);
+		const saved = JOB.spacesPerPage as number;
+		JOB.spacesPerPage = 1;
+		try {
+			let t = 0;
+			await runJob("2026-12-11T08:00:00.000Z", { clock: () => (t += 1000), budgetMs: 1500 });
+		} finally {
+			JOB.spacesPerPage = saved;
+		}
+		await runJob("2026-12-12T08:00:00.000Z");
+		const days = await dailies(amy.id);
+		const d10 = days.find((d) => d.periodKey === "2026-12-10") as OutlineDigestRow;
+		expect(Object.keys(d10.ranges).sort()).toEqual(spaces.map((s) => s.space.id).sort());
+		expect(d10.truncated).toBe(false);
+		expect((await detail(amy.id, d10.id)).knowledge.map((k) => k.title).sort()).toEqual([
+			"fact 0",
+			"fact 1",
+			"fact 2",
+		]);
+	}, 60_000);
+
+	test("no report is made before every space from before the upgrade is stamped", async () => {
+		const bo = await person("bo", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(bo.id) };
+		const p1 = await project(bo.id);
+		const p2 = await project(bo.id);
+		await write(p1.space, A, bo.id, "2026-12-20T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "p1 old" },
+		]);
+		await write(p2.space, A, bo.id, "2026-12-20T11:00:00.000Z", [
+			{ op: "insert", parent: null, content: "p2 old" },
+		]);
+		// As the migration leaves them: committed to, not stamped.
+		await db
+			.update(outlineSpaces)
+			.set({ lastCommitAt: null })
+			.where(inArray(outlineSpaces.id, [p1.space.id, p2.space.id]));
+		resetOutlineDigestJobForTests();
+		const saved = JOB.stampBatch as number;
+		JOB.stampBatch = 1;
+		try {
+			// One space stamped per batch of the stamp: a report made after the first one would see
+			// p1 only, and p2's day would be lost for good.
+			await runJob("2026-12-21T08:00:00.000Z");
+		} finally {
+			JOB.stampBatch = saved;
+		}
+		const d20 = (await dailies(bo.id)).find(
+			(d) => d.periodKey === "2026-12-20",
+		) as OutlineDigestRow;
+		expect((await detail(bo.id, d20.id)).knowledge.map((k) => k.title).sort()).toEqual([
+			"p1 old",
+			"p2 old",
+		]);
+	}, 60_000);
+
+	test("a person deleted while their batch is in flight is skipped; the others' are written", async () => {
+		const dee = await person("dee", { timeZone: "UTC" });
+		const eve = await person("eve", { timeZone: "UTC" });
+		const agent = await narrator(eve.id);
+		const spaces = [await project(eve.id), await project(eve.id), await project(eve.id)];
+		await grant(spaces[0]?.id as string, dee.id, "read");
+		for (const [i, s] of spaces.entries())
+			await write(s.space, { kind: "agent", id: agent }, null, `2027-02-10T1${i}:00:00.000Z`, [
+				{ op: "insert", parent: null, content: `space ${i}` },
+			]);
+		startOutlineDigestSweepForTests();
+		let calls = 0;
+		const options = {
+			store,
+			now: () => new Date("2027-02-11T08:00:00.000Z"),
+			serverTimeZone: "UTC",
+			// The budget lasts until the batch is formed and one space visited.
+			clock: () => (++calls <= 5 ? 0 : 10_000 * calls),
+			budgetMs: 1500,
+		};
+		expect((await runOutlineDigestSlice(options)).written).toBe(0);
+		await db.delete(users).where(eq(users.id, dee.id));
+		let t = 0;
+		options.clock = () => (t += 1);
+		let slices = 0;
+		for (; slices < 50; slices++) if (!(await runOutlineDigestSlice(options)).more) break;
+		expect(slices).toBeLessThan(50);
+		const days = await dailies(eve.id);
+		expect(days.map((d) => d.periodKey)).toEqual(["2027-02-08", "2027-02-09", "2027-02-10"]);
+		expect((await detail(eve.id, (days[2] as OutlineDigestRow).id)).knowledge).toHaveLength(3);
+		// The job goes on: the next day is made as usual.
+		await write(
+			spaces[1]?.space as OutlineSpaceRow,
+			{ kind: "agent", id: agent },
+			null,
+			"2027-02-11T10:00:00.000Z",
+			[{ op: "insert", parent: null, content: "next day" }],
+		);
+		await runJob("2027-02-12T08:00:00.000Z");
+		expect((await dailies(eve.id)).at(-1)?.periodKey).toBe("2027-02-11");
+	}, 60_000);
+
+	test("a space with commits but nothing in it for the person is no space with changes", async () => {
+		const gil = await person("gil", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(gil.id) };
+		const busy = await project(gil.id);
+		await write(busy.space, A, gil.id, "2027-03-02T09:00:00.000Z", [
+			{ op: "insert", parent: null, content: "a fact" },
+		]);
+		// Two spaces where only a block moves: commits, nothing to report.
+		for (const _ of [0, 1]) {
+			const quiet = await project(gil.id);
+			const made = await write(
+				quiet.space,
+				{ kind: "human", id: gil.id },
+				gil.id,
+				"2027-03-01T09:00:00.000Z",
+				[
+					{ op: "insert", tempId: "a", parent: null, content: "page a" },
+					{ op: "insert", tempId: "b", parent: null, content: "page b" },
+					{ op: "insert", tempId: "c", parent: { tempId: "a" }, content: "moved" },
+				],
+			);
+			await write(quiet.space, A, gil.id, "2027-03-02T10:00:00.000Z", [
+				{
+					op: "move",
+					block: { id: made.results[2]?.blockId as string },
+					parent: { id: made.results[1]?.blockId as string },
+				},
+			]);
+		}
+		await runJob("2027-03-03T08:00:00.000Z", {
+			limits: { ...OUTLINE_DIGEST_LIMITS, spacesPerDigest: 1 },
+		});
+		const d2 = (await dailies(gil.id)).find(
+			(d) => d.periodKey === "2027-03-02",
+		) as OutlineDigestRow;
+		expect(d2.counts.spaces).toBe(1);
+		expect(d2.items.moreSpaces).toBe(0);
+		expect(d2.truncated).toBe(false);
+		expect(Object.keys(d2.ranges)).toHaveLength(3);
+	}, 60_000);
+
+	test("only the latest 30 daily reports are kept", async () => {
+		const hy = await person("hy", { timeZone: "UTC" });
+		for (let day = 1; day <= 30; day++) {
+			const key = `2027-04-${String(day).padStart(2, "0")}`;
+			await store.insertDigest({
+				id: generateId(),
+				userId: hy.id,
+				kind: "daily",
+				periodKey: key,
+				timeZone: "UTC",
+				periodStart: `${key}T00:00:00.000Z`,
+				periodEnd: `${key}T00:00:00.000Z`,
+				counts: {
+					delegated: 0,
+					knowledge: 0,
+					tasks: 0,
+					plans: 0,
+					questions: 0,
+					other: 0,
+					spaces: 0,
+					ownEdits: 0,
+				},
+				itemCount: 0,
+				items: {
+					v: 1,
+					spaces: [],
+					moreSpaces: 0,
+					delegated: [],
+					knowledge: [],
+					tasks: [],
+					plans: [],
+					questions: [],
+					other: [],
+					more: { delegated: 0, knowledge: 0, tasks: 0, plans: 0, questions: 0, other: 0 },
+				},
+				ranges: {},
+				truncated: false,
+				createdAt: `${key}T07:00:00.000Z`,
+				seenAt: `${key}T07:00:00.000Z`,
+			});
+		}
+		// 04-30's end is not 05-01's start here, but the job only needs the latest to continue.
+		await runJob("2027-05-02T08:00:00.000Z");
+		const keys = (await dailies(hy.id)).map((d) => d.periodKey);
+		expect(keys).toHaveLength(30);
+		expect(keys[0]).toBe("2027-04-02");
+		expect(keys.at(-1)).toBe("2027-05-01");
+	}, 60_000);
+
+	test("an answer relayed in the name of someone who only reads stands, and cannot be undone", async () => {
+		const ian = await person("ian", { timeZone: "UTC" });
+		const owner = await person("owner2");
+		const p = await project(owner.id);
+		await grant(p.id, ian.id, "read");
+		const agent = await narrator(owner.id);
+		const asked = await write(
+			p.space,
+			{ kind: "agent", id: agent },
+			ian.id,
+			"2027-05-10T09:00:00.000Z",
+			[{ op: "insert", parent: null, content: "Which?", ask: ask(ian.id) }],
+			{ question: { askerNarratorId: agent, askerUserId: ian.id, askerToolCallId: "c" } },
+		);
+		await write(
+			p.space,
+			{ kind: "agent", id: agent },
+			ian.id,
+			"2027-05-10T10:00:00.000Z",
+			[
+				{
+					op: "update",
+					block: { id: asked.results[0]?.blockId as string },
+					ask: {
+						...ask(ian.id),
+						answer: {
+							option: 1,
+							by: { kind: "human", id: ian.id },
+							at: "2027-05-10T10:00:00.000Z",
+							relayed: { narratorId: agent, messageId: null },
+						},
+					},
+				},
+			],
+			{
+				kind: "answer",
+				question: {
+					askerNarratorId: null,
+					askerUserId: null,
+					askerToolCallId: null,
+					delivered: true,
+				},
+			},
+		);
+		await runJob("2027-05-11T08:00:00.000Z");
+		const day = (await dailies(ian.id)).find(
+			(d) => d.periodKey === "2027-05-10",
+		) as OutlineDigestRow;
+		const d = await detail(ian.id, day.id);
+		expect(d.delegated.map((x) => [x.kind, x.stands, x.canUndo])).toEqual([
+			["relayed_answer", true, false],
+		]);
 	}, 60_000);
 });
 

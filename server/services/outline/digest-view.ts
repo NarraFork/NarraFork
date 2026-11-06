@@ -65,6 +65,8 @@ export const OUTLINE_DIGEST_VIEW = {
 	titleChars: 200,
 	/** Versions of a decision's commit read to tell what it decided. */
 	decisionVersions: 2000,
+	/** Unread reports one "mark all read" marks at most. */
+	markAll: 100,
 } as const;
 
 function toHead(row: OutlineDigestHeadRow): OutlineDigestHead {
@@ -118,19 +120,29 @@ export async function listUnreadOutlineDigests(
 	return rows.filter((r) => r.itemCount > 0).map(toHead);
 }
 
-/** Mark the person's reports read; returns how many were unread. */
+/**
+ * Mark the person's reports read: those named, or (`"all"`) every unread one, at most
+ * {@link OUTLINE_DIGEST_VIEW.markAll} (retention keeps a person far below it). Returns how many
+ * were unread.
+ */
 export async function markOutlineDigestsSeen(
 	principal: OutlinePrincipal,
-	ids: readonly string[],
+	ids: readonly string[] | "all",
 	options: { store?: OutlineStore; now?: () => Date } = {},
 ): Promise<number> {
 	const store = options.store ?? outlineStore;
+	const which =
+		ids === "all"
+			? (await store.listUnseenDigestHeads(principal.userId, OUTLINE_DIGEST_VIEW.markAll)).map(
+					(r) => r.id,
+				)
+			: ids.slice(0, OUTLINE_DIGEST_VIEW.pageMax);
 	const marked = await store.markDigestsSeen(
 		principal.userId,
-		ids.slice(0, OUTLINE_DIGEST_VIEW.pageMax),
+		which,
 		(options.now?.() ?? new Date()).toISOString(),
 	);
-	if (marked > 0) eventBus.emit({ type: "human_attention:changed" });
+	if (marked > 0) eventBus.emit({ type: "human_attention:changed", userIds: [principal.userId] });
 	return marked;
 }
 
@@ -495,6 +507,7 @@ export async function classifyDelegatedCommit(
 	if (asked.length === 0) return null;
 	const metas = await store.listVersionMetasAt(
 		asked.map((v) => ({ blockId: v.blockId, seq: commit.seq })),
+		{ withAsk: true },
 	);
 	let person: string | null = null;
 	const blockIds: string[] = [];
@@ -577,6 +590,9 @@ export async function undoOutlineDelegatedDecision(
 		},
 		{ store, ...(options.now ? { now: options.now } : {}) },
 	);
-	eventBus.emit({ type: "human_attention:changed" });
+	// Changed between the check and the revert, so that nothing was put back after all.
+	if (!result.commit)
+		throw new OutlineDigestUndoError("This decision can no longer be undone: it was changed since");
+	eventBus.emit({ type: "human_attention:changed", userIds: [principal.userId] });
 	return { kind: decision.kind, commit: result.commit, skipped: result.skipped.length };
 }
