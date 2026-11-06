@@ -77,11 +77,10 @@ describe("withDeviceDirectory / withoutDeviceDirectory", () => {
 	});
 
 	test("replaces an existing entry without dropping the others", () => {
-		const after = withDeviceDirectory(
-			{ "dev-1": { cwd: "/old", pathFlavor: "posix" } },
-			"dev-1",
-			{ cwd: "/new", pathFlavor: "posix" },
-		);
+		const after = withDeviceDirectory({ "dev-1": { cwd: "/old", pathFlavor: "posix" } }, "dev-1", {
+			cwd: "/new",
+			pathFlavor: "posix",
+		});
 		expect(after).toEqual({ "dev-1": { cwd: "/new", pathFlavor: "posix" } });
 	});
 

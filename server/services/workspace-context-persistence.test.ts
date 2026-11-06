@@ -28,7 +28,7 @@ import { executionPolicyEngine } from "./execution-policy/engine";
 import { applySessionDefaultDevice } from "./narrator-session";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
 import { permissionPolicyChanges } from "./permission-rule-service";
-import { workspaceContextService, getWorkspaceDirectories } from "./workspace-context-service";
+import { getWorkspaceDirectories, workspaceContextService } from "./workspace-context-service";
 
 // Test preload gives this real SQLite DB a temporary, process-isolated home.
 const { db } = await import("../db");
