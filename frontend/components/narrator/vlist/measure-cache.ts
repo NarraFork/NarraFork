@@ -459,9 +459,14 @@ export function extractDataRevision(data: unknown): string | undefined {
  */
 function diffStatsRevision(value: unknown): string {
 	if (value == null || typeof value !== "object") return "";
-	const stats = value as { added?: unknown; removed?: unknown };
+	const stats = value as { added?: unknown; removed?: unknown; done?: unknown; commit?: unknown };
 	if (typeof stats.added !== "number" || typeof stats.removed !== "number") return "";
-	return `|df:${stats.added}/${stats.removed}`;
+	// An outline edit's own figures (tasks ticked done, its commit) are painted the same way.
+	const extra =
+		typeof stats.done === "number" || typeof stats.commit === "number"
+			? `/${String(stats.done ?? "")}/${String(stats.commit ?? "")}`
+			: "";
+	return `|df:${stats.added}/${stats.removed}${extra}`;
 }
 
 /**
@@ -973,6 +978,15 @@ function leafTextRevision(d: Record<string, unknown>): string {
 				}`;
 			})
 			.join(";")}`;
+	}
+	// A change list (outline cards): one fixed line per row, so the row count above sets the
+	// height, but the rows' words, links and chips are painted from the cached payload and can
+	// change at the same count (a display landing on a live patch). Bounded: at most 24 short rows.
+	if (d.kind === "change-rows") {
+		rev += `|chg:${textSignature(JSON.stringify(d.rows ?? []))}`;
+		const toggle = d.toggle as { open?: unknown; label?: unknown } | undefined;
+		if (toggle)
+			rev += `|tgl:${toggle.open === true ? 1 : 0}:${textSignature(String(toggle.label ?? ""))}`;
 	}
 	for (const key of [
 		"id",
