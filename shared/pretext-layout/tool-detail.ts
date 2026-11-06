@@ -299,6 +299,11 @@ export interface ToolStructuredBadge {
 	 * case-sensitive id or alias (`MTBXwl1Y`) into a different one (`MTBXWL1Y`).
 	 */
 	verbatim?: boolean;
+	/**
+	 * A long label (a project's name) that gives way on a narrow row: truncated, its full text on
+	 * hover, so the chips after it stay on the row's one reserved line. Height-neutral.
+	 */
+	clip?: boolean;
 }
 
 /** A glyph that leads a change row (render-only, a fixed slot). */
@@ -318,6 +323,7 @@ export type ToolChangeGlyph =
 	| "question"
 	| "withdraw"
 	| "answer"
+	| "failed"
 	| "more";
 
 /** One piece of a change row: words, a link, or a chip. All of it is height-neutral. */
@@ -3538,10 +3544,17 @@ function classifyOutline(
 		const addressHref = outlineAddressPath(address);
 		const header = metaRows([
 			// The block by its title (its address on hover is the link's target), where it sits.
-			pathRow(title ? [...path, title].join(" › ") : address, {
-				...(addressHref ? { href: addressHref } : {}),
-				...(title ? { mono: false } : {}),
-			}),
+			pathRow(
+				title
+					? [...path, title]
+							.map((part) => part || outlineLabel(labels, "outlineUntitled"))
+							.join(" › ")
+					: address,
+				{
+					...(addressHref ? { href: addressHref } : {}),
+					...(title ? { mono: false } : {}),
+				},
+			),
 			badgeRow(
 				chips([
 					...spaceChips,

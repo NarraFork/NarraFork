@@ -340,6 +340,60 @@ const ANSWER_BODY = {
 	],
 };
 
+// ── A project space with a long Latin name (its chip must not upper-case or crowd out the rest) ──
+const PRJ = "Prj9Atlas";
+const LONG_NAME = "NarraFork outline display polish and the long-named project space";
+const LONG_READ_META = {
+	tool: "OutlineRead",
+	address: `${PRJ}/Ab3dEf9Q`,
+	space: { key: PRJ, kind: "project" },
+	blocks: 4,
+	asOf: 5,
+	truncated: true,
+	title: "Retry design notes",
+	path: ["Design", ""],
+	display: { v: 1, space: { key: PRJ, kind: "project", name: LONG_NAME } },
+};
+const LONG_EDIT_META = {
+	tool: "OutlineEdit",
+	space: { key: PRJ, kind: "project" },
+	commit: { id: "c3", seq: 3 },
+	edits: [{ op: "set", address: `${PRJ}/Ab3dEf9Q` }],
+	display: {
+		v: 1,
+		space: { key: PRJ, kind: "project", name: LONG_NAME },
+		ops: [
+			{
+				op: "set",
+				target: { address: `${PRJ}/Ab3dEf9Q`, title: "Retry design notes" },
+				status: { from: null, to: "done" },
+			},
+		],
+	},
+};
+
+// ── Answers to long questions (the answer must stay visible) ──
+const LONG_QUESTION =
+	"重试按钮放在哪里？如果放在消息气泡右上角，会不会和复制按钮挤在一起，手机上是否还点得到";
+const LONG_ANSWER_BODY = {
+	kind: "outlineAnswers",
+	by: "alice",
+	items: [
+		{
+			address: `${K}/Zx81aaQe`,
+			alias: "Q3",
+			question: LONG_QUESTION,
+			answer: { option: 2, optionText: "消息气泡右上角", adopted: true },
+			differs: true,
+		},
+		{
+			address: `${K}/Zx81aaQf`,
+			question: LONG_QUESTION,
+			answer: { text: "先只修 Anthropic，Codex 下周" },
+		},
+	],
+};
+
 export const SCENES: Record<string, () => NarratorMsg[]> = {
 	edit: () => [
 		tool("OutlineEdit", EDIT_INPUT, EDIT_TEXT, EDIT_META),
@@ -371,6 +425,16 @@ export const SCENES: Record<string, () => NarratorMsg[]> = {
 		),
 		userInjection("outline_answer", ANSWER_TEXT, ANSWER_BODY),
 	],
+	longspace: () => [
+		tool("OutlineRead", { address: "Ab3dEf9Q", asOf: 5 }, READ_TEXT, LONG_READ_META),
+		tool(
+			"OutlineEdit",
+			{ edits: [{ set: "Ab3dEf9Q", checkbox: "x" }] },
+			"Committed #3",
+			LONG_EDIT_META,
+		),
+	],
+	answers: () => [userInjection("outline_answer", ANSWER_TEXT, LONG_ANSWER_BODY)],
 };
 
 export interface FixtureOptions {
@@ -398,10 +462,21 @@ function Scene({ options }: { options: FixtureOptions }) {
 		resolveToolCategory: getCategory,
 		resolveToolColor: (n: string, i?: unknown) => getCategoryColor(getCategory(n, i)),
 		resolveToolSummary: (tc) => {
-			const call = tc as { toolName: string; inputJson?: unknown; outputJson?: unknown };
+			const call = tc as {
+				toolName: string;
+				inputJson?: unknown;
+				outputJson?: unknown;
+				status?: string;
+			};
 			const meta = (call.outputJson as { _metadata?: Record<string, unknown> } | undefined)
 				?._metadata;
-			return getSummary(call.toolName, call.inputJson, meta, adapterLabels);
+			// As the shell's resolver does for outline calls: their status rides along.
+			return getSummary(
+				call.toolName,
+				call.inputJson,
+				{ ...meta, _toolStatus: call.status },
+				adapterLabels,
+			);
 		},
 		isExpanded: () => options.expanded,
 		isPromptOpen: () => options.rawOpen === true,
@@ -492,6 +567,12 @@ export interface CardReport {
 	links: string[];
 	/** Chips whose text the browser upper-cased. */
 	upperChips: string[];
+	/** Chips not fully visible: clipped by their row (pushed onto a hidden line, or cut). */
+	hiddenChips: string[];
+	/** Answer rows (a question's answer, under it): their text and visible width (px). */
+	answers: Array<{ text: string; width: number }>;
+	/** The folded line's tail (an answer): its visible width and its text's full width (px). */
+	tail: { width: number; full: number } | null;
 }
 
 export function report(): CardReport[] {
@@ -534,6 +615,45 @@ export function report(): CardReport[] {
 				rowOverflow = Math.max(rowOverflow, box.top - r.top, r.bottom - box.bottom);
 			}
 		}
+		const hiddenChips: string[] = [];
+		for (const badge of card.querySelectorAll<HTMLElement>(".mantine-Badge-root")) {
+			const r = badge.getBoundingClientRect();
+			if (r.width === 0 || r.height === 0) continue;
+			let left = r.left;
+			let right = r.right;
+			let top = r.top;
+			let bottom = r.bottom;
+			for (let up = badge.parentElement; up && up !== card; up = up.parentElement) {
+				const style = getComputedStyle(up);
+				if (style.overflowX === "visible" && style.overflowY === "visible") continue;
+				const clip = up.getBoundingClientRect();
+				left = Math.max(left, clip.left);
+				right = Math.min(right, clip.right);
+				top = Math.max(top, clip.top);
+				bottom = Math.min(bottom, clip.bottom);
+			}
+			const label = badge.textContent ?? "";
+			// Visible: its whole height, and its width (a chip that gives way is truncated by
+			// design, so it only has to keep a few characters).
+			const keeps = badge.title ? Math.min(r.width, 30) : r.width - 0.5;
+			if (bottom - top < r.height - 0.5 || right - left < keeps) hiddenChips.push(label);
+		}
+		const answers = Array.from(card.querySelectorAll<HTMLElement>("[data-task-notice-row]"))
+			.filter((row) => Number.parseFloat(getComputedStyle(row).paddingLeft) > 0)
+			.map((row) => {
+				const text = row.querySelector<HTMLElement>("[data-task-notice-task]");
+				return {
+					text: row.textContent ?? "",
+					width: text ? Math.round(text.getBoundingClientRect().width) : 0,
+				};
+			});
+		const tailNode = card.querySelector<HTMLElement>("[data-task-notice-tail]");
+		const tail = tailNode
+			? {
+					width: Math.round(tailNode.getBoundingClientRect().width),
+					full: Math.round(tailNode.scrollWidth),
+				}
+			: null;
 		const upperChips: string[] = [];
 		for (const badge of card.querySelectorAll<HTMLElement>(".mantine-Badge-root")) {
 			const label = badge.textContent ?? "";
@@ -556,6 +676,9 @@ export function report(): CardReport[] {
 				(a) => a.textContent ?? "",
 			),
 			upperChips,
+			hiddenChips,
+			answers,
+			tail,
 		};
 	});
 }

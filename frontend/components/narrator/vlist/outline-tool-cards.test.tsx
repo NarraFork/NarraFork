@@ -102,22 +102,29 @@ beforeAll(async () => {
 });
 afterAll(() => disposeCanvas());
 
-function tool(name: string, input: unknown, text: string, metadata: unknown): NarratorMsg {
+function tool(
+	name: string,
+	input: unknown,
+	text: string,
+	metadata: unknown,
+	status = "completed",
+	id = name,
+): NarratorMsg {
 	const outputJson = { _text: text, _metadata: metadata };
 	return rowWithElements(
 		{
-			id: `a-${name}`,
+			id: `a-${id}`,
 			narratorId: "n1",
 			parentToolUseId: null,
 			role: "assistant",
 			contentText: null,
 			toolCalls: [
 				{
-					toolUseId: `tu-${name}`,
+					toolUseId: `tu-${id}`,
 					toolName: name,
 					inputJson: input,
 					outputJson,
-					status: "completed",
+					status,
 				},
 			],
 			createdAt: "2026-11-03T09:10:00.000Z",
@@ -125,12 +132,12 @@ function tool(name: string, input: unknown, text: string, metadata: unknown): Na
 		[
 			{
 				type: "tool_use",
-				id: `tu-${name}`,
+				id: `tu-${id}`,
 				name,
 				input,
 				inputJson: input,
 				outputJson,
-				status: "completed",
+				status,
 			},
 		],
 	) as unknown as NarratorMsg;
@@ -174,10 +181,21 @@ function ctx(options: { rawOpen?: boolean; lod?: 4 | 5 } = {}): AdapterContext {
 		lod: options.lod ?? 5,
 		labels,
 		resolveToolCategory: getCategory,
+		// As the shell's resolver does: an outline call's status rides along.
 		resolveToolSummary: (tc) => {
-			const call = tc as { toolName: string; inputJson?: unknown; outputJson?: unknown };
+			const call = tc as {
+				toolName: string;
+				inputJson?: unknown;
+				outputJson?: unknown;
+				status?: string;
+			};
 			const meta = (call.outputJson as { _metadata?: Record<string, unknown> })?._metadata;
-			return getSummary(call.toolName, call.inputJson, meta, labels);
+			return getSummary(
+				call.toolName,
+				call.inputJson,
+				{ ...meta, _toolStatus: call.status },
+				labels,
+			);
 		},
 		isExpanded: () => true,
 		isPromptOpen: () => options.rawOpen === true,
@@ -313,5 +331,89 @@ describe("an OutlineEdit card", () => {
 			"确认了P1a2B3c4D→提交 #9",
 		);
 		decided.unmount();
+	});
+});
+
+describe("an OutlineEdit card that did not write what it asked", () => {
+	it("says so in its header (the status rides into the summary)", () => {
+		const failed = cardOf(
+			tool("OutlineEdit", EDIT_INPUT, "Nothing was written.", { commit: null }, "error"),
+		);
+		expect((failed.data as { summary: string }).summary).toBe(
+			"未写入：勾成完成 LUwB3JZb · 记下 3 条",
+		);
+		const running = cardOf(tool("OutlineEdit", EDIT_INPUT, "", undefined, "running"));
+		expect((running.data as { summary: string }).summary).toBe(
+			"写入中：勾成完成 LUwB3JZb · 记下 3 条",
+		);
+	});
+});
+
+describe("a card opened from a folded row", () => {
+	it("opens its fold through the same card key, and the trace is measured anew", async () => {
+		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
+		const user = rowWithElements(
+			{
+				id: "u1",
+				narratorId: "n1",
+				role: "user",
+				contentText: "go",
+				createdAt: "2026-11-03T09:09:00.000Z",
+			},
+			[{ type: "text", text: "go" }],
+		) as unknown as NarratorMsg;
+		const reply = rowWithElements(
+			{
+				id: "a-reply",
+				narratorId: "n1",
+				role: "assistant",
+				contentText: "done",
+				createdAt: "2026-11-03T09:11:00.000Z",
+			},
+			[{ type: "text", text: "done" }],
+		) as unknown as NarratorMsg;
+		const first = tool("OutlineEdit", EDIT_INPUT, EDIT_TEXT, EDIT_META, "completed", "one");
+		const second = tool("OutlineEdit", EDIT_INPUT, EDIT_TEXT, EDIT_META, "completed", "two");
+		const build = (open: boolean) =>
+			buildPretextDocumentLayout([user, first, second, reply] as never[], {
+				layoutRevision: "r1",
+				documentRevision: "v1",
+				lod: 2,
+				widthBucket: 700,
+				contentWidth: 700,
+				viewportHeight: 900,
+				labels,
+				resolveToolCategory: getCategory,
+				// The reader drilled into the second call's row …
+				isRowExpanded: (_trace: string, row: string) => row === "tool-tu-two",
+				// … and opened its fold, which is keyed by the CARD (`toolItemKey`), as a standalone
+				// card's is (ExactRow binds `onTogglePromptForKey(trace key, row.unitId)`).
+				isPromptOpen: (key: string) => open && key === "tool-tu-two",
+			});
+		const traceOf = (open: boolean) => {
+			const trace = build(open).items.find((item) => item.spec.kind === "activity-trace");
+			if (!trace) throw new Error("no activity trace");
+			return trace;
+		};
+		const folded = traceOf(false);
+		const opened = traceOf(true);
+		const card = (trace: typeof folded) =>
+			(
+				trace.spec.data as {
+					items: Array<{ key?: string; card?: { detail?: { sections: Array<{ key: string }> } } }>;
+				}
+			).items.find((item) => item.key === "tool-tu-two")?.card;
+		expect(card(folded)?.detail?.sections.map((s) => s.key)).toEqual([
+			"meta.edit",
+			"output.changes",
+		]);
+		expect(card(opened)?.detail?.sections.map((s) => s.key)).toEqual([
+			"meta.edit",
+			"output.changes",
+			"input.edits",
+			"output.main",
+		]);
+		expect(extractDataRevision(opened.spec.data)).not.toBe(extractDataRevision(folded.spec.data));
+		expect(opened.measured.height).toBeGreaterThan(folded.measured.height);
 	});
 });

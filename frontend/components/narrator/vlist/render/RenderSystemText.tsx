@@ -769,6 +769,9 @@ export const RENDER_SYSTEM_TEXT_CHROME = { CARD_PADDING, GROUP_GAP } as const;
 // task with TASK_NOTICE_ROW_GAP between them. Every line is single and truncated
 // (the full title is the link's tooltip), so nothing here can wrap past the box.
 
+/** The indent of a row under the one before it (a question's answer). */
+const TASK_NOTICE_INDENT = 16;
+
 const TASK_NOTICE_ICON: Record<TaskNoticeVariant, typeof IconListCheck> = {
 	turnEnd: IconClockPause,
 	edited: IconUserEdit,
@@ -821,13 +824,18 @@ const HEADING_MAX_WIDTH = "45%";
  * nothing measured.
  */
 function taskTitleMinWidth(title: string): string {
+	return `min(${emEstimate(title, 6).toFixed(1)}em, 50%)`;
+}
+
+/** A rough width for `text` in em, up to `cap`: CJK 1em, a space 0.3em, anything else 0.6em. */
+function emEstimate(text: string, cap: number): number {
 	let em = 0;
-	for (const char of title) {
+	for (const char of text) {
 		const code = char.codePointAt(0) ?? 0;
 		em += code >= 0x2e80 ? 1 : char === " " ? 0.3 : 0.6;
-		if (em >= 6) break;
+		if (em >= cap) break;
 	}
-	return `min(${Math.min(6, em).toFixed(1)}em, 50%)`;
+	return Math.min(cap, em);
 }
 
 function TaskNoticeCard({
@@ -989,7 +997,7 @@ function TaskNoticeCard({
  * already names who changed it.
  */
 function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow: boolean }) {
-	const { lead, row, tail } = data.summary ?? {};
+	const { lead, row, tail, tailFirst } = data.summary ?? {};
 	const dim = {
 		...noticeText(),
 		...NOWRAP_ELLIPSIS,
@@ -1008,12 +1016,28 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 			{row ? (
 				<>
 					{row.status ? <StatusChip chip={row.status} /> : null}
-					<TaskNoticeTitle row={row} />
+					<TaskNoticeTitle row={row} yieldTo={tailFirst === true && !!tail && !narrow} />
 				</>
 			) : null}
 			{tail && !narrow ? (
-				// Kept readable beside a long title: the title is truncated first.
-				<span style={{ ...dim, minWidth: "3em" }} data-task-notice-tail="">
+				// Kept readable beside a long title: the title is truncated first. A tail that is
+				// what the notice is for (an answer) keeps most of the line.
+				<span
+					style={
+						tailFirst
+							? {
+									...dim,
+									// All of it, up to most of the line (then truncated, in full on hover):
+									// the question beside it gives way instead.
+									flex: "0 0 auto",
+									maxWidth: "60%",
+									color: "var(--mantine-color-text)",
+								}
+							: { ...dim, minWidth: "3em" }
+					}
+					title={tailFirst ? tail : undefined}
+					data-task-notice-tail=""
+				>
 					{tail}
 				</span>
 			) : null}
@@ -1049,6 +1073,8 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 				height: line,
 				minWidth: 0,
 				overflow: "hidden",
+				// Under the row before it (a question's answer), still one line.
+				...(row.indent ? { paddingLeft: TASK_NOTICE_INDENT } : {}),
 			}}
 		>
 			{row.statusFrom && row.status ? (
@@ -1114,15 +1140,16 @@ function StatusChip({ chip }: { chip: TaskNoticeChip }) {
  * Ctrl/Cmd for a new panel), plain text anywhere else. Truncated to its line, never below
  * `taskTitleMinWidth`; the full title and its address are the tooltip.
  */
-function TaskNoticeTitle({ row }: { row: TaskNoticeRow }) {
+function TaskNoticeTitle({ row, yieldTo = false }: { row: TaskNoticeRow; yieldTo?: boolean }) {
 	const link = useOutlineLinkProps(row.href);
 	const tooltip =
 		row.address && row.address !== row.title ? `${row.title}\n${row.address}` : row.title;
 	const style = {
 		...noticeText(),
 		...NOWRAP_ELLIPSIS,
-		flex: "0 1 auto",
-		minWidth: taskTitleMinWidth(row.title),
+		// Beside a tail that matters more (an answer), the title gives way first.
+		flex: yieldTo ? "0 8 auto" : "0 1 auto",
+		minWidth: yieldTo ? "min(3em, 25%)" : taskTitleMinWidth(row.title),
 	} as const;
 	if (link) {
 		return (

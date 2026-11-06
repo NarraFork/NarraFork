@@ -435,7 +435,7 @@ describe("answers to the session's questions (outline_answer)", () => {
 		],
 	};
 
-	it("one line: who answered how many, the first question linked, its answer after it", () => {
+	it("one line: who answered how many, the first question, its answer given the room", () => {
 		const spec = specOf(answerRow(BODY));
 		const data = spec.data as TaskNoticeData;
 		expect(data).toMatchObject({ kind: "tasks_notice", variant: "answers", expandable: true });
@@ -447,12 +447,28 @@ describe("answers to the session's questions (outline_answer)", () => {
 			status: { label: "Q3", color: "teal" },
 		});
 		expect(data.summary.tail).toBe("→ 选 2. 消息气泡右上角；采纳了你的建议");
-		expect(data.rows[1]).toMatchObject({
-			title: "要不要同时修 Codex 通道？",
-			href: href("Zx81aaQf"),
-			marks: ["与你先做的不同"],
-			note: "→ “先只修 Anthropic”",
-		});
+		// The answer is what the notice is for: the question gives way to it on the folded line.
+		expect(data.summary.tailFirst).toBe(true);
+	});
+
+	it("unfolded, each answer has its own row under its question", () => {
+		const data = specOf(answerRow(BODY), true).data as TaskNoticeData;
+		expect(data.rows).toEqual([
+			{
+				title: "重试按钮放在哪里？",
+				href: href("Zx81aaQe"),
+				address: `${K}/Zx81aaQe`,
+				status: { label: "Q3", color: "teal" },
+			},
+			{ title: "→ 选 2. 消息气泡右上角；采纳了你的建议", indent: true },
+			{
+				title: "要不要同时修 Codex 通道？",
+				href: href("Zx81aaQf"),
+				address: `${K}/Zx81aaQf`,
+				marks: ["与你先做的不同"],
+			},
+			{ title: "→ “先只修 Anthropic”", indent: true },
+		]);
 	});
 
 	it("a delivery written before the body keeps its card, under its own heading", () => {

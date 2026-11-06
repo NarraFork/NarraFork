@@ -790,7 +790,9 @@ export async function outlineRead(
 			// For the reader's card, never the model's text: the block by its title, where it sits,
 			// and the space by its name.
 			title: clip(blockTitle(block.title), 80),
-			path: path.slice(-6),
+			// The titles as they are (an untitled block's is empty: the card words it in the
+			// reader's language, not the model's "(untitled)").
+			path: result.path.slice(-6).map((p) => clip(p.title, 40)),
 			display: { v: 1, space: await scope.spaceDisplay(space) },
 		},
 	};

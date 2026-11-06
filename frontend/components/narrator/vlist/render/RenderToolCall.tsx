@@ -1322,6 +1322,7 @@ interface StructBadge {
 	label: string;
 	color?: string;
 	verbatim?: boolean;
+	clip?: boolean;
 }
 
 /** Read the render-only badge list off a fixed badge-header block. */
@@ -1335,6 +1336,7 @@ function readBadges(data: Record<string, unknown> | undefined): StructBadge[] {
 				label: o.label,
 				color: typeof o.color === "string" ? o.color : undefined,
 				...((o as { verbatim?: unknown }).verbatim === true ? { verbatim: true } : {}),
+				...((o as { clip?: unknown }).clip === true ? { clip: true } : {}),
 			});
 		}
 	}
@@ -1804,7 +1806,13 @@ function DetailBlocks({
 							</Group>
 						) : null}
 						{badges.length > 0 ? (
-							<Group gap={4} wrap="wrap" style={{ alignItems: "center" }}>
+							// A row with a chip that gives way (a long space name) stays one line: that chip
+							// shrinks (truncated) instead of pushing the others onto the clipped second line.
+							<Group
+								gap={4}
+								wrap={badges.some((b) => b.clip) ? "nowrap" : "wrap"}
+								style={{ alignItems: "center" }}
+							>
 								{badges.map((b, i) => (
 									<Badge
 										// biome-ignore lint/suspicious/noArrayIndexKey: badges are a stable ordered list
@@ -1815,6 +1823,14 @@ function DetailBlocks({
 										// A case-sensitive id or alias is painted as written (Mantine
 										// upper-cases badge labels by default).
 										tt={b.verbatim ? "none" : undefined}
+										title={b.clip ? b.label : undefined}
+										style={
+											badges.some((x) => x.clip)
+												? b.clip
+													? { flex: "0 1 auto", minWidth: "3em" }
+													: { flexShrink: 0 }
+												: undefined
+										}
 									>
 										{b.label}
 									</Badge>

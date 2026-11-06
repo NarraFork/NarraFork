@@ -84,7 +84,25 @@ for (const scene of ["edit", "legacy", "reads", "ask"]) {
 		options: { scene, width: 720, scheme: "dark", expanded: true, ...ENLARGED },
 	});
 }
+for (const width of [360, 720]) {
+	CASES.push({
+		name: `longspace-${width}`,
+		options: { scene: "longspace", width, scheme: "light", expanded: true },
+	});
+}
 CASES.push(
+	{
+		name: "answers-360",
+		options: { scene: "answers", width: 360, scheme: "dark", expanded: true },
+	},
+	{
+		name: "answers-360-enlarged",
+		options: { scene: "answers", width: 360, scheme: "dark", expanded: true, ...ENLARGED },
+	},
+	{
+		name: "answers-folded-720",
+		options: { scene: "answers", width: 720, scheme: "dark", expanded: false },
+	},
 	{
 		name: "edit-folded-720",
 		options: { scene: "edit", width: 720, scheme: "dark", expanded: false },
@@ -135,6 +153,35 @@ for (const { name, options } of CASES) {
 			expect(card.scrollWidth).toBeLessThanOrEqual(card.width);
 			// A case-sensitive id or alias is never upper-cased.
 			expect({ where, upper: card.upperChips }).toEqual({ where, upper: [] });
+			// No chip is pushed off its row's one line, or cut at its edge.
+			expect({ where, hidden: card.hiddenChips }).toEqual({ where, hidden: [] });
+		}
+		if (options.scene === "longspace") {
+			const [read, edit] = cards;
+			// A long project name gives way: the past version and the cut read still show.
+			expect(read?.text).toContain("截至 #5");
+			expect(read?.text).toContain("未全部显示");
+			expect(read?.text).toContain("NarraFork outline display");
+			// An untitled block on the path is named in the reader's language.
+			expect(read?.text).toContain("Design › 无标题 › Retry design notes");
+			expect(edit?.text).toContain("Prj9Atlas");
+			// A block that was not a task before is "not a task", not "no longer a task".
+			expect(edit?.text).toContain("不是任务");
+			expect(edit?.text).not.toContain("不再是任务");
+		}
+		if (options.scene === "answers" && options.expanded) {
+			const [notice] = cards;
+			// Each answer has its own row, readable beside nothing else.
+			expect(notice?.answers.map((a) => a.text)).toEqual([
+				"→ 选 2. 消息气泡右上角；采纳了你的建议",
+				"→ “先只修 Anthropic，Codex 下周”",
+			]);
+			for (const answer of notice?.answers ?? []) expect(answer.width).toBeGreaterThan(100);
+		}
+		if (options.scene === "answers" && !options.expanded) {
+			const [notice] = cards;
+			// Folded: the answer keeps its room beside the long question (all of it, here).
+			expect(notice?.tail?.width).toBe(notice?.tail?.full);
 		}
 		if (options.scene === "edit" && options.expanded) {
 			const [main] = cards;

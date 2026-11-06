@@ -2777,6 +2777,16 @@
 		"sumRelayed": "wrote down {{n}} answer(s)",
 		"sumMoreTruncated": "more not shown",
 		"sumAsk": "Ask",
-		"sumEdit": "Edit"
+		"sumEdit": "Edit",
+		"sumNoChange": "No change: {{what}}",
+		"sumRunning": "Writing: {{what}}",
+		"sumFailed": "Not written: {{what}}",
+		"sumHeld": "Awaiting confirmation: {{what}}",
+		"sumDecisionsFailed": "{{n}} failed",
+		"sumAsOfTime": "as of {{time}}",
+		"moreQuestions": "{{n}} more question(s) not listed",
+		"confirmFailed": "Could not confirm {label}",
+		"rejectFailed": "Could not reject {label}",
+		"untitled": "untitled"
 	}
 }

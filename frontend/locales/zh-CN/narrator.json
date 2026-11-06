@@ -2721,7 +2721,7 @@
 		"commitLink": "提交 #{{seq}} · 在时间线中查看 / 撤销",
 		"commitShort": "提交 #{{seq}}",
 		"rawFold": "原始输入 · 模型看到的结果",
-		"noCheckbox": "不再是任务",
+		"noCheckbox": "不是任务",
 		"addedUnder": "在 {link} 下新增 {{n}} 块",
 		"addedPages": "新增 {{n}} 个页面",
 		"addedMore": "还有 {{n}} 块",
@@ -2774,6 +2774,16 @@
 		"sumRelayed": "记下 {{n}} 个回答",
 		"sumMoreTruncated": "未全部显示",
 		"sumAsk": "提问",
-		"sumEdit": "编辑"
+		"sumEdit": "编辑",
+		"sumNoChange": "无改动：{{what}}",
+		"sumRunning": "写入中：{{what}}",
+		"sumFailed": "未写入：{{what}}",
+		"sumHeld": "待确认：{{what}}",
+		"sumDecisionsFailed": "{{n}} 个未成功",
+		"sumAsOfTime": "截至 {{time}}",
+		"moreQuestions": "还有 {{n}} 个提问未列出",
+		"confirmFailed": "未能确认 {label}",
+		"rejectFailed": "未能否决 {label}",
+		"untitled": "无标题"
 	}
 }

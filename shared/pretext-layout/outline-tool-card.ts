@@ -80,6 +80,10 @@ export const OUTLINE_CARD_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	outlineRejected: "Rejected {label}",
 	outlineWithdrew: "Withdrew {label}",
 	outlineMoreChanges: "{n} more change(s) not listed",
+	outlineMoreQuestions: "{n} more question(s) not listed",
+	outlineConfirmFailed: "Could not confirm {label}",
+	outlineRejectFailed: "Could not reject {label}",
+	outlineUntitled: "untitled",
 	// Ask.
 	outlineAskRecommend: "→ {option}",
 	outlineAskWentAhead: "went ahead",
@@ -102,7 +106,12 @@ export const OUTLINE_CARD_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	outlineSumConfirmed: "Confirmed {label}",
 	outlineSumRejected: "Rejected {label}",
 	outlineSumWithdrewChange: "Withdrew {label}",
-	outlineSumNoChange: "no change",
+	outlineSumNoChange: "No change: {what}",
+	outlineSumRunning: "Writing: {what}",
+	outlineSumFailed: "Not written: {what}",
+	outlineSumHeld: "Awaiting confirmation: {what}",
+	outlineSumDecisionsFailed: "{n} failed",
+	outlineSumAsOfTime: "as of {time}",
 	outlineSumBlocks: "{n} blocks",
 	outlineSumAsOf: "as of #{n}",
 	outlineSumSpaces: "spaces",
@@ -112,7 +121,6 @@ export const OUTLINE_CARD_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	outlineSumSearch: "Search",
 	outlineSumWithdraw: "withdrew {n} question(s)",
 	outlineSumRelayed: "wrote down {n} answer(s)",
-	outlineSumQuestions: "{n} questions",
 	outlineSumMoreTruncated: "more not shown",
 	outlineSumAsk: "Ask",
 	outlineSumEdit: "Edit",
@@ -272,6 +280,10 @@ export function outlineSpaceChips(
 					{
 						label: outlineSpaceName(display ?? { kind }, labels),
 						color: "teal",
+						// A project's name or a session's title, as written; it gives way (truncated, in
+						// full on hover) so the chips after it stay on the row's one line.
+						verbatim: true,
+						clip: true,
 					},
 				]
 			: []),
@@ -305,8 +317,11 @@ const HELD_CHIP = (labels: Labels): ToolChangePart => ({
 
 /** The change list of an edit call that stored its display. */
 export function outlineEditRows(display: OutlineEditDisplay, labels: Labels): ToolChangeRow[] {
-	const rows: ToolChangeRow[] = [];
+	// One group of rows per edit: a list too long for the card drops whole edits, and counts them.
+	const groups: ToolChangeRow[][] = [];
 	for (const op of display.ops) {
+		const rows: ToolChangeRow[] = [];
+		groups.push(rows);
 		const held = op.held ? [HELD_CHIP(labels)] : [];
 		switch (op.op) {
 			case "set": {
@@ -435,17 +450,19 @@ export function outlineEditRows(display: OutlineEditDisplay, labels: Labels): To
 				break;
 		}
 	}
-	if (display.more) rows.push(moreRow(display.more, labels));
-	if (display.pending)
-		rows.push(pendingRow(display.pending.label, display.pending.decider, labels));
-	return capRows(rows, labels);
+	return capGroups(
+		groups,
+		display.more ?? 0,
+		display.pending ? [pendingRow(display.pending.label, display.pending.decider, labels)] : [],
+		labels,
+	);
 }
 
-function moreRow(n: number, labels: Labels): ToolChangeRow {
+function moreRow(n: number, labels: Labels, key = "outlineMoreChanges"): ToolChangeRow {
 	return {
 		glyph: "more",
 		tone: "dim",
-		parts: [{ kind: "text", text: label(labels, "outlineMoreChanges", { n }) }],
+		parts: [{ kind: "text", text: label(labels, key, { n }) }],
 	};
 }
 
@@ -459,11 +476,40 @@ function pendingRow(pending: string, decider: string | undefined, labels: Labels
 	};
 }
 
-/** At most `CHANGE_ROWS_MAX` rows: the rest are counted in a last row. */
-function capRows(rows: ToolChangeRow[], labels: Labels, max = 24): ToolChangeRow[] {
-	if (rows.length <= max) return rows;
-	const kept = rows.slice(0, max - 1);
-	return [...kept, moreRow(rows.length - kept.length, labels)];
+/** Rows a change list draws at most (`CHANGE_ROWS_MAX`). */
+const MAX_ROWS = 24;
+
+/**
+ * The rows of a change list, at most {@link MAX_ROWS}: whole groups (one change, or one question,
+ * each with its rows) while they fit, then a row counting the changes left out (`hidden` more
+ * that were never listed), then `tail` (the change held for confirmation), which is always kept.
+ */
+function capGroups(
+	groups: readonly ToolChangeRow[][],
+	hidden: number,
+	tail: readonly ToolChangeRow[],
+	labels: Labels,
+	moreKey = "outlineMoreChanges",
+): ToolChangeRow[] {
+	const listed = groups.filter((group) => group.length > 0);
+	const rows = listed.reduce((n, group) => n + group.length, 0);
+	if (rows + tail.length + (hidden > 0 ? 1 : 0) <= MAX_ROWS) {
+		return [...listed.flat(), ...(hidden > 0 ? [moreRow(hidden, labels, moreKey)] : []), ...tail];
+	}
+	const budget = MAX_ROWS - tail.length - 1;
+	const out: ToolChangeRow[] = [];
+	let shown = 0;
+	for (const group of listed) {
+		if (out.length + group.length > budget) {
+			// A first group longer than the whole list (never, at the producers' bounds) still shows.
+			if (shown === 0) out.push(...group.slice(0, budget));
+			if (shown === 0) shown = 1;
+			break;
+		}
+		out.push(...group);
+		shown++;
+	}
+	return [...out, moreRow(hidden + listed.length - shown, labels, moreKey), ...tail];
 }
 
 /** Top-level items of a markdown outline (`- …` at the shallowest indent). */
@@ -498,9 +544,11 @@ export function outlineLegacyEditRows(
 			: space && /^[A-Za-z0-9][A-Za-z0-9_-]{5,31}$/.test(ref)
 				? `${space}/${ref}`
 				: undefined;
-	const rows: ToolChangeRow[] = [];
+	const groups: ToolChangeRow[][] = [];
 	edits.forEach((raw, index) => {
 		if (!isRecord(raw)) return;
+		const rows: ToolChangeRow[] = [];
+		groups.push(rows);
 		const result = isRecord(done[index]) ? done[index] : null;
 		const held = result?.pending === true ? [HELD_CHIP(labels)] : [];
 		const at = (key: string) => leaf(raw[key]) ?? "";
@@ -617,78 +665,122 @@ export function outlineLegacyEditRows(
 		}
 	});
 	const pending = leaf(metadata?.pending);
-	if (pending) rows.push(pendingRow(pending, undefined, labels));
-	return capRows(rows, labels);
+	return capGroups(groups, 0, pending ? [pendingRow(pending, undefined, labels)] : [], labels);
 }
 
-/** The decisions of a `confirm` / `reject` call. */
+/** One decision as a call wrote it, and what came of it. */
+interface Decision {
+	action: "confirm" | "reject";
+	label: string;
+	/** Its `decided` entry; none when it failed (the result says why). */
+	decided?: Record<string, unknown>;
+}
+
+/**
+ * The decisions of a `confirm` / `reject` call, in the call's order, each matched with what
+ * came of it. A decision that failed has no `decided` entry (the server lists only the ones it
+ * made, and errs the call only when all of them fail), so it is one of the input's decisions
+ * left over once the decided ones are matched.
+ */
+function decisionsOf(
+	inputJson: unknown,
+	metadata: Record<string, unknown> | null | undefined,
+): Decision[] {
+	const decided = (Array.isArray(metadata?.decided) ? metadata.decided : []).filter(isRecord);
+	const used = new Set<number>();
+	const take = (action: Decision["action"], ref: string) => {
+		const want = ref.trim();
+		for (const exact of [true, false]) {
+			const i = decided.findIndex((entry, k) => {
+				const got = leaf(entry[action]);
+				return (
+					!used.has(k) &&
+					got !== undefined &&
+					(exact ? got === want : got.toLowerCase() === want.toLowerCase())
+				);
+			});
+			if (i >= 0) {
+				used.add(i);
+				return decided[i];
+			}
+		}
+		return undefined;
+	};
+	const input = isRecord(inputJson) ? inputJson : null;
+	const out: Decision[] = [];
+	for (const raw of Array.isArray(input?.edits) ? input.edits : []) {
+		if (!isRecord(raw)) continue;
+		const action = "confirm" in raw ? "confirm" : "reject" in raw ? "reject" : null;
+		const ref = action ? leaf(raw[action]) : undefined;
+		if (!action || ref === undefined) continue;
+		const entry = take(action, ref);
+		out.push({ action, label: entry ? (leaf(entry[action]) ?? ref) : ref.trim(), decided: entry });
+	}
+	// Entries no input names (an input cut short): shown as they are.
+	decided.forEach((entry, k) => {
+		if (used.has(k)) return;
+		const action = "confirm" in entry ? "confirm" : "reject";
+		const ref = leaf(entry[action]);
+		if (ref) out.push({ action, label: ref, decided: entry });
+	});
+	return out;
+}
+
+/**
+ * The decisions of a `confirm` / `reject` call: what each confirmed (and the commit it wrote),
+ * rejected or withdrew; one that failed in red (its reason is in the call's result).
+ */
 export function outlineDecisionRows(
 	inputJson: unknown,
 	metadata: Record<string, unknown> | null | undefined,
 	labels: Labels,
 ): ToolChangeRow[] {
-	const decided = Array.isArray(metadata?.decided) ? metadata.decided : null;
-	const rows: ToolChangeRow[] = [];
 	const chip = (text: string): ToolChangePart => ({
 		kind: "chip",
 		label: text,
 		color: "orange",
 		verbatim: true,
 	});
-	if (decided) {
-		for (const raw of decided.slice(0, 24)) {
-			if (!isRecord(raw)) continue;
-			const confirmed = leaf(raw.confirm);
-			const rejected = leaf(raw.reject);
-			if (confirmed) {
-				const commit = isRecord(raw.commit) ? raw.commit : null;
-				const seq = typeof commit?.seq === "number" ? commit.seq : undefined;
-				const space = leaf(raw.space);
-				const href = space && seq !== undefined ? outlineCommitPath(space, seq) : null;
-				rows.push({
-					glyph: "confirm",
-					parts:
-						seq !== undefined
-							? fill(label(labels, "outlineConfirmed"), {
-									label: chip(confirmed),
-									commit: {
-										kind: "link",
-										text: label(labels, "outlineCommitShort", { seq }),
-										...(href ? { href } : {}),
-									},
-								})
-							: fill(label(labels, "outlineConfirmedNoCommit"), { label: chip(confirmed) }),
-				});
-			} else if (rejected) {
-				rows.push({
-					glyph: raw.status === "withdrawn" ? "withdraw" : "reject",
-					parts: fill(
-						label(labels, raw.status === "withdrawn" ? "outlineWithdrew" : "outlineRejected"),
-						{
-							label: chip(rejected),
-						},
-					),
-				});
-			}
-		}
-		return rows;
-	}
-	// A failed decision call has no `decided`: its input says what it tried.
-	const input = isRecord(inputJson) ? inputJson : null;
-	for (const raw of Array.isArray(input?.edits) ? input.edits.slice(0, 24) : []) {
-		if (!isRecord(raw)) continue;
-		const c = leaf(raw.confirm);
-		const r = leaf(raw.reject);
-		if (c)
+	const rows: ToolChangeRow[] = [];
+	for (const d of decisionsOf(inputJson, metadata).slice(0, MAX_ROWS)) {
+		const entry = d.decided;
+		if (!entry) {
+			rows.push({
+				glyph: "failed",
+				tone: "red",
+				parts: fill(
+					label(labels, d.action === "confirm" ? "outlineConfirmFailed" : "outlineRejectFailed"),
+					{ label: chip(d.label) },
+				),
+			});
+		} else if (d.action === "confirm") {
+			const commit = isRecord(entry.commit) ? entry.commit : null;
+			const seq = typeof commit?.seq === "number" ? commit.seq : undefined;
+			const space = leaf(entry.space);
+			const href = space && seq !== undefined ? outlineCommitPath(space, seq) : null;
 			rows.push({
 				glyph: "confirm",
-				parts: fill(label(labels, "outlineConfirmedNoCommit"), { label: chip(c) }),
+				parts:
+					seq !== undefined
+						? fill(label(labels, "outlineConfirmed"), {
+								label: chip(d.label),
+								commit: {
+									kind: "link",
+									text: label(labels, "outlineCommitShort", { seq }),
+									...(href ? { href } : {}),
+								},
+							})
+						: fill(label(labels, "outlineConfirmedNoCommit"), { label: chip(d.label) }),
 			});
-		else if (r)
+		} else {
+			const withdrawn = entry.status === "withdrawn";
 			rows.push({
-				glyph: "reject",
-				parts: fill(label(labels, "outlineRejected"), { label: chip(r) }),
+				glyph: withdrawn ? "withdraw" : "reject",
+				parts: fill(label(labels, withdrawn ? "outlineWithdrew" : "outlineRejected"), {
+					label: chip(d.label),
+				}),
 			});
+		}
 	}
 	return rows;
 }
@@ -713,6 +805,7 @@ export function outlineEditHeaderStats(
 	const commit = isRecord(metadata?.commit) ? metadata.commit : null;
 	const seq = typeof commit?.seq === "number" && commit.seq >= 0 ? commit.seq : undefined;
 	const display = readOutlineEditDisplay(metadata);
+	// The call's totals, counted before the display left any edit out.
 	const counts = display ? outlineEditDisplayCounts(display) : { done: 0, added: 0, removed: 0 };
 	if (!display && seq === undefined) return undefined;
 	return {
@@ -794,12 +887,16 @@ export function outlineAskRows(
 			],
 		});
 	};
+	// One group per question, with its sub-questions: a list too long drops whole questions.
+	const groups: ToolChangeRow[][] = [];
 	for (const raw of questions.slice(0, 10)) {
+		const from = rows.length;
 		push(raw, false);
 		const items = isRecord(raw) ? raw.items : undefined;
 		if (Array.isArray(items)) for (const item of items.slice(0, 10)) push(item, true);
+		groups.push(rows.slice(from));
 	}
-	return capRows(rows, labels);
+	return capGroups(groups, Math.max(0, questions.length - 10), [], labels, "outlineMoreQuestions");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -825,39 +922,47 @@ const STATUS_SUMMARY: Record<string, string> = {
 
 /**
  * One phrase per change: what the header line says. A task's new status comes first (it is what
- * the reader looks for: "勾成完成 X · 记下 3 条"); the rest keep the call's order.
+ * the reader looks for: "勾成完成 X · 记下 3 条"), then the rest in the call's order; an edit
+ * held for confirmation wrote nothing yet, so it comes last and says so ("待确认：…").
  */
 function editPhrases(display: OutlineEditDisplay, labels: Labels): string[] {
 	const out: string[] = [];
-	const first = display.ops.filter((op) => op.op === "set" && op.status);
-	const rest = display.ops.filter((op) => !(op.op === "set" && op.status));
-	for (const op of [...first, ...rest]) {
+	const ticks = (op: OutlineEditDisplay["ops"][number]) => op.op === "set" && !!op.status;
+	const order = [
+		...display.ops.filter((op) => !op.held && ticks(op)),
+		...display.ops.filter((op) => !op.held && !ticks(op)),
+		...display.ops.filter((op) => op.held),
+	];
+	for (const op of order) {
+		const said: string[] = [];
 		switch (op.op) {
 			case "set": {
 				const title = short(op.target.title || op.target.address);
 				if (op.status)
-					out.push(label(labels, STATUS_SUMMARY[op.status.to ?? "none"] as string, { title }));
-				if (op.assignee) out.push(label(labels, "outlineSumAssigned", { title }));
-				if (op.alias) out.push(label(labels, "outlineSumAliased", { title }));
+					said.push(label(labels, STATUS_SUMMARY[op.status.to ?? "none"] as string, { title }));
+				if (op.assignee) said.push(label(labels, "outlineSumAssigned", { title }));
+				if (op.alias) said.push(label(labels, "outlineSumAliased", { title }));
 				break;
 			}
 			case "add":
-				out.push(
+				said.push(
 					label(labels, op.parent ? "outlineSumAdded" : "outlineSumPages", {
 						n: op.created.length + (op.more ?? 0),
 					}),
 				);
 				break;
 			case "replace":
-				out.push(label(labels, "outlineSumReplaced", { title: short(op.target.title) }));
+				said.push(label(labels, "outlineSumReplaced", { title: short(op.target.title) }));
 				break;
 			case "move":
-				out.push(label(labels, "outlineSumMoved", { title: short(op.target.title) }));
+				said.push(label(labels, "outlineSumMoved", { title: short(op.target.title) }));
 				break;
 			case "delete":
-				out.push(label(labels, "outlineSumDeleted", { title: short(op.target.title) }));
+				said.push(label(labels, "outlineSumDeleted", { title: short(op.target.title) }));
 				break;
 		}
+		for (const phrase of said)
+			out.push(op.held ? label(labels, "outlineSumHeld", { what: phrase }) : phrase);
 	}
 	return out;
 }
@@ -902,15 +1007,56 @@ function legacyEditPhrases(inputJson: unknown, labels: Labels): string[] {
 	return out;
 }
 
-/** At most two phrases, then how many more. */
-function joinPhrases(phrases: string[], labels: Labels): string {
-	if (phrases.length <= 2) return phrases.join(" · ");
-	return `${phrases.slice(0, 2).join(" · ")} · ${label(labels, "outlineSumMore", { n: phrases.length - 2 })}`;
+/** At most two phrases, then how many more (`hidden`: changes the phrases do not name at all). */
+function joinPhrases(phrases: string[], labels: Labels, hidden = 0): string {
+	const shown = phrases.slice(0, 2);
+	const more = phrases.length - shown.length + hidden;
+	return [...shown, ...(more > 0 ? [label(labels, "outlineSumMore", { n: more })] : [])].join(
+		" · ",
+	);
+}
+
+/** Where a call is: still running, failed (or refused, or stopped), or done. */
+function callPhase(status: string | undefined): "running" | "failed" | "done" {
+	switch (status) {
+		case "running":
+		case "pending":
+		case "initializing":
+		case "streaming":
+		case "queued":
+			return "running";
+		case "fail":
+		case "error":
+		case "denied":
+		case "cancelled":
+			return "failed";
+		default:
+			return "done";
+	}
+}
+
+/** What a call that has not written what it says is, in front of what it says. */
+function phased(
+	what: string,
+	phase: "running" | "failed" | "done",
+	noChange: boolean,
+	labels: Labels,
+): string {
+	if (!what) return what;
+	if (phase === "running") return label(labels, "outlineSumRunning", { what });
+	if (phase === "failed") return label(labels, "outlineSumFailed", { what });
+	if (noChange) return label(labels, "outlineSumNoChange", { what });
+	return what;
 }
 
 /**
  * The header line of an outline tool's card (and of its folded row): what the call did, in the
  * reader's words. The figures (`✓1 +3 #6`) are drawn beside it (`outlineEditHeaderStats`).
+ *
+ * Only a call that wrote something says it as done. One still running, one that failed, one
+ * that changed nothing and an edit held for confirmation say so first ("写入中：", "未写入：",
+ * "无改动：", "待确认："). The call's status rides in `metadata._toolStatus` (the shell's summary
+ * resolver adds it, as it adds a Send's).
  */
 export function outlineToolSummary(
 	toolName: string,
@@ -920,51 +1066,64 @@ export function outlineToolSummary(
 ): string {
 	const meta = metadata ?? {};
 	const input = isRecord(inputJson) && !("_truncated" in inputJson) ? inputJson : {};
+	const phase = callPhase(leaf(meta._toolStatus));
 	switch (toolName) {
 		case "OutlineEdit": {
-			if (Array.isArray(meta.decided)) {
-				const phrases = (meta.decided as unknown[]).flatMap((raw) => {
-					if (!isRecord(raw)) return [];
-					const c = leaf(raw.confirm);
-					const r = leaf(raw.reject);
-					if (c) {
+			if (isOutlineDecisionCall(input, meta)) {
+				const decisions = decisionsOf(input, meta);
+				const made = decisions.filter((d) => d.decided);
+				const failed = decisions.length - made.length;
+				const phrases = made.map((d) => {
+					const entry = d.decided as Record<string, unknown>;
+					if (d.action === "confirm") {
 						const seq =
-							isRecord(raw.commit) && typeof raw.commit.seq === "number"
-								? raw.commit.seq
+							isRecord(entry.commit) && typeof entry.commit.seq === "number"
+								? entry.commit.seq
 								: undefined;
-						return [
-							`${label(labels, "outlineSumConfirmed", { label: c })}${seq !== undefined ? ` → #${seq}` : ""}`,
-						];
+						return `${label(labels, "outlineSumConfirmed", { label: d.label })}${seq !== undefined ? ` → #${seq}` : ""}`;
 					}
-					if (r)
-						return [
-							label(
-								labels,
-								raw.status === "withdrawn" ? "outlineSumWithdrewChange" : "outlineSumRejected",
-								{
-									label: r,
-								},
-							),
-						];
-					return [];
+					return label(
+						labels,
+						entry.status === "withdrawn" ? "outlineSumWithdrewChange" : "outlineSumRejected",
+						{ label: d.label },
+					);
 				});
-				return joinPhrases(phrases, labels) || label(labels, "outlineSumEdit");
+				// Before the result (running), or none made (failed): what the call tried.
+				if (made.length === 0)
+					return (
+						phased(joinPhrases(legacyEditPhrases(input, labels), labels), phase, false, labels) ||
+						label(labels, "outlineSumEdit")
+					);
+				const said = joinPhrases(phrases, labels);
+				return failed > 0
+					? `${said} · ${label(labels, "outlineSumDecisionsFailed", { n: failed })}`
+					: said;
 			}
-			const display = readOutlineEditDisplay(meta);
+			const display = phase === "done" ? readOutlineEditDisplay(meta) : null;
 			const phrases = display ? editPhrases(display, labels) : legacyEditPhrases(input, labels);
-			if (display?.more) phrases.push(label(labels, "outlineSumMore", { n: display.more }));
-			return joinPhrases(phrases, labels) || label(labels, "outlineSumEdit");
+			// Nothing written, nothing held, nothing to say it with: the edits changed nothing.
+			const noChange =
+				!display && "commit" in meta && meta.commit === null && !meta.pending && phase === "done";
+			return (
+				phased(joinPhrases(phrases, labels, display?.more ?? 0), phase, noChange, labels) ||
+				label(labels, "outlineSumEdit")
+			);
 		}
 		case "OutlineRead": {
 			const title = leaf(meta.title);
 			const address = leaf(input.address) ?? leaf(meta.address) ?? "";
 			const blocks = typeof meta.blocks === "number" ? meta.blocks : undefined;
+			// The commit it read as of; while running (or failed), what the call asked for, which may
+			// be a time.
+			const asked = input.asOf;
 			const asOf =
 				typeof meta.asOf === "number"
-					? meta.asOf
-					: typeof input.asOf === "number"
-						? input.asOf
-						: undefined;
+					? label(labels, "outlineSumAsOf", { n: meta.asOf })
+					: typeof asked === "number"
+						? label(labels, "outlineSumAsOf", { n: asked })
+						: typeof asked === "string" && asked.trim()
+							? label(labels, "outlineSumAsOfTime", { time: short(asked, 24) })
+							: undefined;
 			const head = title
 				? short(title, 48)
 				: address === "*"
@@ -974,7 +1133,7 @@ export function outlineToolSummary(
 						: label(labels, "outlineSumSpaces");
 			return [
 				head,
-				...(asOf !== undefined ? [label(labels, "outlineSumAsOf", { n: asOf })] : []),
+				...(asOf ? [asOf] : []),
 				...(blocks !== undefined ? [label(labels, "outlineSumBlocks", { n: blocks })] : []),
 			].join(" · ");
 		}
@@ -983,13 +1142,25 @@ export function outlineToolSummary(
 			const n = typeof meta.resultCount === "number" ? meta.resultCount : undefined;
 			const count = n !== undefined ? label(labels, "outlineSumResults", { n }) : null;
 			if (!query) return count ?? label(labels, "outlineSumSearch");
-			return [`“${short(query, 48)}”`, ...(count ? [count] : [])].join(" · ");
+			return [`\u201c${short(query, 48)}\u201d`, ...(count ? [count] : [])].join(" · ");
 		}
 		case "Ask": {
+			// Asking is the call itself: only a failed one says it did not happen.
+			const askPhase = phase === "failed" ? phase : "done";
 			if (Array.isArray(input.withdraw))
-				return label(labels, "outlineSumWithdraw", { n: input.withdraw.length });
+				return phased(
+					label(labels, "outlineSumWithdraw", { n: input.withdraw.length }),
+					askPhase,
+					false,
+					labels,
+				);
 			if (Array.isArray(input.answered))
-				return label(labels, "outlineSumRelayed", { n: input.answered.length });
+				return phased(
+					label(labels, "outlineSumRelayed", { n: input.answered.length }),
+					askPhase,
+					false,
+					labels,
+				);
 			const questions = Array.isArray(input.questions) ? input.questions : [];
 			const first = isRecord(questions[0]) ? leaf(questions[0].question) : undefined;
 			if (!first) return label(labels, "outlineSumAsk");
@@ -998,9 +1169,14 @@ export function outlineToolSummary(
 				total++;
 				if (isRecord(q) && Array.isArray(q.items)) total += q.items.length;
 			}
-			return total > 1
-				? `${short(first, 48)} · ${label(labels, "outlineSumMore", { n: total - 1 })}`
-				: short(first, 60);
+			return phased(
+				total > 1
+					? `${short(first, 48)} · ${label(labels, "outlineSumMore", { n: total - 1 })}`
+					: short(first, 60),
+				askPhase,
+				false,
+				labels,
+			);
 		}
 		default:
 			return toolName;

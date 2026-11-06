@@ -174,6 +174,8 @@ describe("OutlineEdit's display", () => {
 				{ op: "move", target: ref(cause, "Root cause"), to: ref(archive, "Archive") },
 				{ op: "delete", target: ref(old, "Old plan"), under: 2 },
 			],
+			// The header's figures: one task done, two blocks added, the plan and its two steps.
+			totals: { done: 1, added: 2, removed: 3 },
 		});
 		// The model's result never carries the display's words it did not already have.
 		expect(result.output).not.toContain('"op"');

@@ -6,7 +6,7 @@
  * `changeRowHeight()` (the reader's live xs line, at least a badge) with `CHANGE_ROW_GAP` between
  * rows, and the fold row under them after `CHANGE_TOGGLE_GAP`. Nothing here can wrap: a row too
  * long for its card gives way from its links first (truncated, the full title and the address on
- * hover), then its words; chips keep their size.
+ * hover), then its words and chips (each down to about three characters).
  *
  * Links go through `useOutlineLinkProps`: inside a session they open the outline panel, outside
  * one (nothing can open them) they are plain text.
@@ -15,6 +15,7 @@
 import { Badge } from "@mantine/core";
 import type { ToolChangePart, ToolChangeRow } from "@shared/pretext-layout/tool-detail";
 import {
+	IconAlertCircle,
 	IconArrowBackUp,
 	IconArrowForward,
 	IconAt,
@@ -56,6 +57,7 @@ const GLYPHS: Record<NonNullable<ToolChangeRow["glyph"]>, ComponentType<IconProp
 	question: IconHelpCircle,
 	withdraw: IconArrowBackUp,
 	answer: IconMessageReply,
+	failed: IconAlertCircle,
 	more: IconDots,
 };
 
@@ -66,6 +68,7 @@ const GLYPH_COLOR: Partial<Record<NonNullable<ToolChangeRow["glyph"]>, string>> 
 	pending: "var(--mantine-color-orange-text)",
 	confirm: "var(--mantine-color-green-text)",
 	reject: "var(--mantine-color-red-text)",
+	failed: "var(--mantine-color-red-text)",
 };
 
 /** The glyph lane, and the indent of a row under another (what an add created). */
@@ -149,7 +152,10 @@ function ChangePart({ part }: { part: ToolChangePart }) {
 				// An id or an alias is case-sensitive: never upper-cased. The localized words of the
 				// other chips are not upper-cased either, to read as the rest of the row does.
 				tt="none"
-				style={{ flexShrink: 0, maxWidth: "40%" }}
+				title={part.label}
+				// A chip keeps its words while it can, then gives way after the links and the words
+				// (truncated, in full on hover), so a narrow row never cuts one off at its edge.
+				style={{ flex: "0 1 auto", minWidth: "3em", maxWidth: "40%" }}
 			>
 				{part.label}
 			</Badge>

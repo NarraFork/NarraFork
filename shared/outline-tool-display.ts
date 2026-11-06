@@ -92,8 +92,20 @@ export interface OutlineEditDisplay {
 	ops: OutlineEditDisplayOp[];
 	/** Edits not listed. */
 	more?: number;
+	/**
+	 * What the whole call did, counted before any edit was left out of `ops` (held edits not
+	 * counted: they wrote nothing yet): the figures of the card's header.
+	 */
+	totals: OutlineEditDisplayTotals;
 	/** The change the call's held edits wait in, and who decides it. */
 	pending?: { label: string; decider?: string };
+}
+
+/** Tasks ticked done, blocks added, blocks deleted (with what was under them). */
+export interface OutlineEditDisplayTotals {
+	done: number;
+	added: number;
+	removed: number;
 }
 
 /** OutlineRead's `metadata.display`. */
@@ -129,6 +141,8 @@ export const OUTLINE_TOOL_DISPLAY_LIMITS = {
 	titleChars: 80,
 	/** Characters of a name, an assignee or an alias. */
 	nameChars: 60,
+	/** Edits counted into the totals at most (a call makes at most 200). */
+	countedOps: 1000,
 	/** Questions listed. */
 	questions: 20,
 	/** UTF-8 bytes of the JSON at most: past it, edits are dropped from the end and counted. */
@@ -249,12 +263,18 @@ export function boundOutlineEditDisplay(raw: unknown): OutlineEditDisplay | null
 	const space = boundSpace(raw.space);
 	if (!space || !Array.isArray(raw.ops)) return null;
 	const ops: OutlineEditDisplayOp[] = [];
+	const all: OutlineEditDisplayOp[] = [];
 	let dropped = 0;
-	for (const item of raw.ops) {
-		const op = ops.length < OUTLINE_TOOL_DISPLAY_LIMITS.ops ? boundOp(item) : null;
-		if (op) ops.push(op);
+	for (const item of raw.ops.slice(0, OUTLINE_TOOL_DISPLAY_LIMITS.countedOps)) {
+		const op = boundOp(item);
+		if (op) all.push(op);
+		if (op && ops.length < OUTLINE_TOOL_DISPLAY_LIMITS.ops) ops.push(op);
 		else dropped++;
 	}
+	dropped += Math.max(0, raw.ops.length - OUTLINE_TOOL_DISPLAY_LIMITS.countedOps);
+	// Counted over every edit the call made (the writer passes them all), before any is left
+	// out; a stored display carries its totals and keeps them.
+	const totals = boundTotals(raw.totals) ?? countOps(all);
 	const pending = isRecord(raw.pending) ? str(raw.pending.label, 40) : undefined;
 	const decider = isRecord(raw.pending)
 		? str(raw.pending.decider, OUTLINE_TOOL_DISPLAY_LIMITS.nameChars)
@@ -263,6 +283,7 @@ export function boundOutlineEditDisplay(raw: unknown): OutlineEditDisplay | null
 		v: 1,
 		space,
 		ops,
+		totals,
 		...(pending ? { pending: { label: pending, ...(decider ? { decider } : {}) } } : {}),
 	};
 	let more = (count(raw.more) ?? 0) + dropped;
@@ -324,15 +345,25 @@ export function readOutlineDisplaySpace(
 }
 
 /** The figures a header shows for an edit: tasks ticked done, blocks added and deleted. */
-export function outlineEditDisplayCounts(display: OutlineEditDisplay): {
-	done: number;
-	added: number;
-	removed: number;
-} {
+export function outlineEditDisplayCounts(display: OutlineEditDisplay): OutlineEditDisplayTotals {
+	return display.totals;
+}
+
+function boundTotals(raw: unknown): OutlineEditDisplayTotals | null {
+	if (!isRecord(raw)) return null;
+	const n = (value: unknown) =>
+		typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+	const done = n(raw.done);
+	const added = n(raw.added);
+	const removed = n(raw.removed);
+	return done === null || added === null || removed === null ? null : { done, added, removed };
+}
+
+function countOps(ops: readonly OutlineEditDisplayOp[]): OutlineEditDisplayTotals {
 	let done = 0;
 	let added = 0;
 	let removed = 0;
-	for (const op of display.ops) {
+	for (const op of ops) {
 		// A held edit wrote nothing yet: it waits for a person's confirmation.
 		if (op.held) continue;
 		if (op.op === "set" && op.status?.to === "done" && op.status.from !== "done") done++;

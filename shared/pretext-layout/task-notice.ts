@@ -63,6 +63,8 @@ export interface TaskNoticeRow {
 	note?: string;
 	/** A row that names no task ("3 more not listed"): dimmed text only. */
 	dim?: true;
+	/** A row under the one before it (a question's answer): drawn indented, still one line. */
+	indent?: true;
 }
 
 /** The folded line after the notice's title: `lead`, one task row inline, `tail`. */
@@ -70,6 +72,11 @@ export interface TaskNoticeSummary {
 	lead?: string;
 	row?: TaskNoticeRow;
 	tail?: string;
+	/**
+	 * The tail is what the notice is for (a question's answer), so the row's title gives way to it
+	 * rather than the other way round.
+	 */
+	tailFirst?: true;
 }
 
 /** The `system-text` card data of a task notice (`kind: "tasks_notice"`). */
@@ -342,10 +349,14 @@ export function taskNoticeFromBody(
 	}
 	if (body.kind === "outlineAnswers") {
 		if (body.items.length === 0) return null;
-		const rows = body.items.map((item) => answerRow(item, labels));
-		if (body.more) rows.push(moreRow(body.more, labels));
+		// Two rows a question (it, then its answer under it), within the card's rows and a last
+		// row counting the questions left out.
+		const listed = body.items.slice(0, ANSWERS_LISTED);
+		const rows = listed.flatMap((item) => answerRows(item, labels));
+		const left = body.items.length - listed.length + (body.more ?? 0);
+		if (left > 0) rows.push(moreRow(left, labels));
 		const n = body.items.length + (body.more ?? 0);
-		const first = rows[0] as TaskNoticeRow;
+		const first = listed[0] as OutlineAnswerNoticeItem;
 		return notice(
 			"answers",
 			label(labels, "taskNoticeAnswersTitle", {
@@ -353,10 +364,10 @@ export function taskNoticeFromBody(
 				n,
 			}),
 			{
-				// The folded line names the first question; its answer is the tail (the rows, unfolded,
-				// carry each answer as their note).
-				row: { ...first, note: undefined },
-				...(first.note ? { tail: first.note } : {}),
+				// The folded line names the first question and gives its answer the room.
+				row: rows[0] as TaskNoticeRow,
+				tail: answerNote(first, labels),
+				tailFirst: true,
 			},
 			rows,
 		);
@@ -407,14 +418,23 @@ function answerNote(item: OutlineAnswerNoticeItem, labels: Labels): string {
 	return `→ ${parts.join(label(labels, "taskNoticeJoin"))}`;
 }
 
-function answerRow(item: OutlineAnswerNoticeItem, labels: Labels): TaskNoticeRow {
-	return {
-		...named(item.address, item.question),
-		// The question's alias, as written (case-sensitive): the chip before its title.
-		...(item.alias ? { status: { label: item.alias, color: "teal" } } : {}),
-		...(item.differs ? { marks: [label(labels, "taskNoticeAnswerDiffers")] } : {}),
-		note: answerNote(item, labels),
-	};
+/** Questions an answer notice lists, two rows each, leaving one row for the rest. */
+const ANSWERS_LISTED = Math.floor((TASK_NOTICE_MAX_ROWS - 1) / 2);
+
+/**
+ * A question (its alias chip, its title as a link) and, on its own indented row under it, the
+ * answer: what the notice is for, so it never shares a line with a long question.
+ */
+function answerRows(item: OutlineAnswerNoticeItem, labels: Labels): TaskNoticeRow[] {
+	return [
+		{
+			...named(item.address, item.question),
+			// The question's alias, as written (case-sensitive): the chip before its title.
+			...(item.alias ? { status: { label: item.alias, color: "teal" } } : {}),
+			...(item.differs ? { marks: [label(labels, "taskNoticeAnswerDiffers")] } : {}),
+		},
+		{ title: answerNote(item, labels), indent: true },
+	];
 }
 
 function interruptRow(task: SideCarTaskEntry, outline: boolean, labels: Labels): TaskNoticeRow {

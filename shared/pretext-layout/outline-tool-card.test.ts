@@ -18,6 +18,7 @@ import {
 	outlineEditRows,
 	outlineLegacyEditRows,
 	outlineSpaceChips,
+	outlineToolSummary,
 } from "./outline-tool-card";
 import { classifyToolDetail, type ToolChangeRow } from "./tool-detail";
 
@@ -43,7 +44,7 @@ const ZH = {
 };
 
 describe("an edit's change list, from its display", () => {
-	const display: OutlineEditDisplay = {
+	const display = boundOutlineEditDisplay({
 		v: 1,
 		space: { key: K, kind: "session", own: true },
 		ops: [
@@ -71,7 +72,7 @@ describe("an edit's change list, from its display", () => {
 			},
 		],
 		pending: { label: "P1a2B3c4D", decider: "alice" },
-	};
+	}) as OutlineEditDisplay;
 
 	it("says each change in a line: titled links, chips, the held change and who decides it", () => {
 		expect(outlineEditRows(display, undefined).map(line)).toEqual([
@@ -129,12 +130,12 @@ describe("an edit's change list, from its display", () => {
 
 	it("names the space by its name, then its key as written", () => {
 		expect(outlineSpaceChips({ display, space: { key: K, kind: "session" } }, undefined)).toEqual([
-			{ label: "This session's notes", color: "teal" },
+			{ label: "This session's notes", color: "teal", verbatim: true, clip: true },
 			{ label: K, color: "gray", verbatim: true },
 		]);
 		// An older call knows the kind only.
 		expect(outlineSpaceChips({ space: { key: K, kind: "project" } }, undefined)).toEqual([
-			{ label: "Project", color: "teal" },
+			{ label: "Project", color: "teal", verbatim: true, clip: true },
 			{ label: K, color: "gray", verbatim: true },
 		]);
 		expect(
@@ -142,7 +143,125 @@ describe("an edit's change list, from its display", () => {
 				{ display: { v: 1, space: { key: K, kind: "project", name: "NarraFork" }, ops: [] } },
 				undefined,
 			)[0],
-		).toEqual({ label: "NarraFork", color: "teal" });
+		).toEqual({ label: "NarraFork", color: "teal", verbatim: true, clip: true });
+	});
+
+	it("keeps the held change's row however long the list, and counts the changes left out", () => {
+		const block = (i: number, j: number) => ({
+			address: `${K}/B${String(i * 100 + j).padStart(7, "0")}`,
+			title: `Step ${j}`,
+			depth: 0,
+		});
+		const long = boundOutlineEditDisplay({
+			v: 1,
+			space: { key: K, kind: "project" },
+			ops: [0, 1, 2].map((i) => ({
+				op: "add",
+				parent: { address: `${K}/P${String(i).padStart(7, "0")}`, title: `Plan ${i}` },
+				created: Array.from({ length: 12 }, (_, j) => block(i, j)),
+				held: true,
+			})),
+			more: 5,
+			pending: { label: "P1a2B3c4D", decider: "alice" },
+		}) as OutlineEditDisplay;
+		const rows = outlineEditRows(long, undefined);
+		expect(rows.length).toBeLessThanOrEqual(24);
+		// One add (13 rows) fits beside the last two rows; the other two adds and the 5 never
+		// listed are 7 changes.
+		expect(rows.slice(-2).map(line)).toEqual([
+			"more: 7 more change(s) not listed",
+			"pending: Waiting for alice to confirm [P1a2B3c4D]",
+		]);
+	});
+});
+
+describe("the header says only what happened", () => {
+	const tick = { edits: [{ set: "LUwB3JZb", checkbox: "x" }] };
+	const sum = (input: unknown, metadata: Record<string, unknown>) =>
+		outlineToolSummary("OutlineEdit", input, metadata, undefined);
+
+	it("a call that failed, is still running or changed nothing does not claim the change", () => {
+		expect(sum(tick, { commit: null, _toolStatus: "error" })).toBe(
+			"Not written: Ticked LUwB3JZb done",
+		);
+		expect(sum(tick, { _toolStatus: "running" })).toBe("Writing: Ticked LUwB3JZb done");
+		expect(sum(tick, { space: { key: K }, commit: null, _toolStatus: "completed" })).toBe(
+			"No change: Ticked LUwB3JZb done",
+		);
+		// Written: said as done.
+		expect(
+			sum(tick, {
+				commit: { id: "c", seq: 6 },
+				_toolStatus: "completed",
+				display: {
+					v: 1,
+					space: { key: K, kind: "session" },
+					ops: [{ op: "set", target: TASK, status: { from: "doing", to: "done" } }],
+				},
+			}),
+		).toBe("Ticked Fix the retry button done");
+	});
+
+	it("an edit held for confirmation says so, after what was written", () => {
+		const metadata = {
+			commit: { id: "c", seq: 7 },
+			pending: "P1a2B3c4D",
+			display: {
+				v: 1,
+				space: { key: K, kind: "project" },
+				ops: [
+					{ op: "set", target: TASK, status: { from: "todo", to: "done" }, held: true },
+					{ op: "replace", target: { address: `${K}/AEguaeis`, title: "Root cause" } },
+				],
+				pending: { label: "P1a2B3c4D" },
+			},
+		};
+		expect(sum({}, metadata)).toBe(
+			"Rewrote Root cause · Awaiting confirmation: Ticked Fix the retry button done",
+		);
+		// Nothing written directly: no figure claims the tick.
+		expect(outlineEditHeaderStats(metadata)).toEqual({ added: 0, removed: 0, commit: 7 });
+	});
+
+	it("counts the call's totals, not only the edits its display lists", () => {
+		const ops = Array.from({ length: 60 }, (_, i) => ({
+			op: "set",
+			target: { address: `${K}/T${String(i).padStart(7, "0")}`, title: `Task ${i}` },
+			status: { from: "doing", to: "done" },
+		}));
+		const display = boundOutlineEditDisplay({ v: 1, space: { key: K, kind: "project" }, ops });
+		expect(display?.ops).toHaveLength(OUTLINE_TOOL_DISPLAY_LIMITS.ops);
+		expect(outlineEditHeaderStats({ display, commit: { id: "c", seq: 1 } })).toMatchObject({
+			done: 60,
+		});
+		// The header's "+N" counts the edits it does not name, listed or not.
+		expect(sum({}, { display, commit: { id: "c", seq: 1 } })).toBe(
+			"Ticked Task 0 done · Ticked Task 1 done · +58",
+		);
+	});
+
+	it("a decision call where some decisions failed says how many", () => {
+		const input = { edits: [{ confirm: "P1a2B3c4D" }, { confirm: "P9z8Y7x6W" }] };
+		const metadata = {
+			decided: [{ confirm: "P1a2B3c4D", commit: { id: "c", seq: 9 }, space: K }],
+		};
+		expect(sum(input, metadata)).toBe("Confirmed P1a2B3c4D → #9 · 1 failed");
+		expect(outlineDecisionRows(input, metadata, undefined).map(line)).toEqual([
+			"confirm: Confirmed [P1a2B3c4D] → <commit #9>",
+			"failed: Could not confirm [P9z8Y7x6W]",
+		]);
+		expect(outlineDecisionRows(input, metadata, undefined)[1]?.tone).toBe("red");
+	});
+
+	it("a read still running names the time it asked for", () => {
+		expect(
+			outlineToolSummary(
+				"OutlineRead",
+				{ address: "LUwB3JZb", asOf: "2026-11-01T09:00" },
+				{ _toolStatus: "running" },
+				undefined,
+			),
+		).toBe("LUwB3JZb · as of 2026-11-01T09:00");
 	});
 });
 

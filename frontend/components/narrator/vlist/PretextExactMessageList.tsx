@@ -1057,7 +1057,11 @@ export const PretextExactMessageList = memo(
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: summaryInputMetadata;
+							: getCategory(call.toolName) === "outline"
+								? // An outline call says a change happened only once it did (still running,
+									// failed: `outlineToolSummary` words it so).
+									{ ...summaryInputMetadata, _toolStatus: call.status }
+								: summaryInputMetadata;
 					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
 				[vlistLabels],
