@@ -427,7 +427,14 @@ export async function editorCacheBrowserAcceptance(
 	// Line references keep split mode: Monaco reveals the line, the preview follows.
 	await page.evaluate(() => window.__editorCache.navigate("file-16", 550));
 	await wait(() => window.__editorCache.snapshot().panes[0]?.position?.lineNumber === 550);
-	await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 500)));
+	// The preview eases toward its target frame by frame; on a busy CI runner a fixed 500 ms
+	// caught it part-way (0.69-0.79 of the way down). Wait for it to arrive instead.
+	await wait(() => {
+		const preview = document.querySelector<HTMLElement>(
+			'[data-cache-pane="file-16"] [data-file-editor-preview]',
+		);
+		return !!preview && preview.scrollTop / (preview.scrollHeight - preview.clientHeight) > 0.8;
+	});
 	expect((await state()).panes[0]?.scroll).toBeGreaterThan(8000);
 	expect(await page.$(previewSelector)).not.toBeNull();
 	expect((await previewPosition()).fraction).toBeGreaterThan(0.8);
