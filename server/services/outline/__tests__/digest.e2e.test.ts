@@ -38,11 +38,13 @@ import {
 import { AppError } from "../../../lib/errors";
 import { eventBus } from "../../../lib/event-bus";
 import { generateId } from "../../../lib/id";
+import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
 import { outlineRoutes } from "../../../routes/outline";
 import { OUTLINE_DIGEST_LIMITS } from "../digest";
 import {
 	OUTLINE_DIGEST_JOB,
+	outlineDigestBatchSizesForTests,
 	requestOutlineDigestPreview,
 	resetOutlineDigestJobForTests,
 	runOutlineDigestSlice,
@@ -101,8 +103,11 @@ async function call<T>(
 	return { status: response.status, body: body as T };
 }
 
-async function person(label: string, prefs?: { timeZone?: string | null; time?: string | null }) {
-	const id = generateId();
+async function person(
+	label: string,
+	prefs?: { timeZone?: string | null; time?: string | null },
+	id = generateId(),
+) {
 	const username = `${label}-${id.slice(0, 6)}`;
 	await db
 		.insert(users)
@@ -704,7 +709,22 @@ describe("reports: the acceptance", () => {
 		expect((await listOutlineAttention(principal)).some((i) => i.kind === "outline_digest")).toBe(
 			false,
 		);
-		await runJob("2026-11-11T08:00:00.000Z");
+		// Somebody with nothing that day: their (empty) report changes no inbox.
+		const quiet = await person("quiet", { timeZone: "UTC" });
+		const jobEvents: Array<{ userIds?: string[] }> = [];
+		const onJob = (event: { userIds?: string[] }) => jobEvents.push(event);
+		eventBus.on("human_attention:changed", onJob);
+		try {
+			await runJob("2026-11-11T08:00:00.000Z");
+		} finally {
+			eventBus.off("human_attention:changed", onJob);
+		}
+		// The job tells only the people whose inbox changed.
+		expect(jobEvents.length).toBeGreaterThan(0);
+		expect(jobEvents.every((e) => Array.isArray(e.userIds))).toBe(true);
+		const told = jobEvents.flatMap((e) => e.userIds ?? []);
+		expect(told).toContain(erin.id);
+		expect(told).not.toContain(quiet.id);
 		const row = (await listOutlineAttention(principal)).find((i) => i.kind === "outline_digest");
 		expect(row?.id).toBe("outline:d:digest");
 		expect(row?.outline).toMatchObject({ what: "digest", count: 0, reports: 1, reportItems: 1 });
@@ -983,6 +1003,32 @@ describe("reports: delegation (outline P2 PR 9)", () => {
 
 const JOB = OUTLINE_DIGEST_JOB as unknown as Record<string, number>;
 
+/** The store with some methods replaced (a failing disk, a write that never goes through). */
+function wrapStore(overrides: Partial<Record<keyof typeof store, unknown>>): typeof store {
+	return new Proxy(store, {
+		get(target, prop, receiver) {
+			if (prop in overrides) return (overrides as Record<string | symbol, unknown>)[prop];
+			const value = Reflect.get(target, prop, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as typeof store;
+}
+
+/** What the job logs as warnings while `run` runs. */
+async function warningsDuring(run: () => Promise<unknown>) {
+	const warnings: Array<{ msg: string; data?: Record<string, unknown> }> = [];
+	const original = logger.warn;
+	logger.warn = (msg, data) => {
+		warnings.push({ msg, ...(data ? { data } : {}) });
+	};
+	try {
+		await run();
+	} finally {
+		logger.warn = original;
+	}
+	return warnings;
+}
+
 describe("reports: the job when it is large, interrupted or fails", () => {
 	test("every space is visited, however many: a page of one, one space a slice", async () => {
 		const amy = await person("amy", { timeZone: "UTC" });
@@ -1129,6 +1175,223 @@ describe("reports: the job when it is large, interrupted or fails", () => {
 		expect(d2.truncated).toBe(false);
 		expect(Object.keys(d2.ranges)).toHaveLength(3);
 	}, 60_000);
+
+	test("a batch's state does not grow with the spaces it visits", async () => {
+		const zo = await person("zo", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(zo.id) };
+		for (let i = 0; i < 8; i++) {
+			const s = await project(zo.id);
+			await write(s.space, A, zo.id, `2027-06-10T1${i}:00:00.000Z`, [
+				{ op: "insert", parent: null, content: `zo ${i}` },
+			]);
+		}
+		startOutlineDigestSweepForTests();
+		let t = 0;
+		let first: number | null = null;
+		let most = 0;
+		let slices = 0;
+		for (; slices < 500; slices++) {
+			const slice = await runOutlineDigestSlice({
+				store,
+				now: () => new Date("2027-06-11T08:00:00.000Z"),
+				serverTimeZone: "UTC",
+				clock: () => (t += 1000),
+				budgetMs: 1500,
+			});
+			const sizes = outlineDigestBatchSizesForTests();
+			if (sizes) {
+				first ??= sizes.lastTo;
+				most = Math.max(most, sizes.lastTo);
+			}
+			if (!slice.more) break;
+		}
+		// What the people's last reports said (the positions a batch starts from), and no more.
+		expect(first).not.toBeNull();
+		expect(most).toBe(first as number);
+		const day = (await dailies(zo.id)).find(
+			(d) => d.periodKey === "2027-06-10",
+		) as OutlineDigestRow;
+		expect(Object.keys(day.ranges)).toHaveLength(8);
+	}, 60_000);
+
+	test("a space that fails once is read again; one that keeps failing leaves the report partial", async () => {
+		const fy = await person("fy", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(fy.id) };
+		const bad = await project(fy.id);
+		const good = await project(fy.id);
+		await write(bad.space, A, fy.id, "2027-07-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "bad 07-10" },
+		]);
+		await write(good.space, A, fy.id, "2027-07-10T11:00:00.000Z", [
+			{ op: "insert", parent: null, content: "good 07-10" },
+		]);
+		let attempts = 0;
+		let failFirst = 1;
+		const flaky = wrapStore({
+			async listCommitRangeChanges(
+				spaceId: string,
+				afterSeq: number,
+				toSeq: number,
+				limit: number,
+			) {
+				if (spaceId === bad.space.id) {
+					attempts++;
+					if (failFirst > 0) {
+						failFirst--;
+						throw new Error("disk hiccup");
+					}
+				}
+				return await store.listCommitRangeChanges(spaceId, afterSeq, toSeq, limit);
+			},
+		});
+		// Failing once: read again, nothing lost.
+		await runJob("2027-07-11T08:00:00.000Z", { store: flaky });
+		expect(attempts).toBe(2);
+		const d10 = (await dailies(fy.id)).find(
+			(d) => d.periodKey === "2027-07-10",
+		) as OutlineDigestRow;
+		expect(d10.truncated).toBe(false);
+		expect((await detail(fy.id, d10.id)).knowledge.map((k) => k.title).sort()).toEqual([
+			"bad 07-10",
+			"good 07-10",
+		]);
+		// Failing every time: tried twice, left out, the report says it is partial.
+		await write(bad.space, A, fy.id, "2027-07-11T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "bad 07-11" },
+		]);
+		await write(good.space, A, fy.id, "2027-07-11T11:00:00.000Z", [
+			{ op: "insert", parent: null, content: "good 07-11" },
+		]);
+		attempts = 0;
+		failFirst = Number.POSITIVE_INFINITY;
+		const warnings = await warningsDuring(() =>
+			runJob("2027-07-12T08:00:00.000Z", { store: flaky }),
+		);
+		expect(attempts).toBe(2);
+		expect(warnings.map((w) => w.msg)).toContain(
+			"Outline report: a space could not be read; reports left partial",
+		);
+		const d11 = (await dailies(fy.id)).find(
+			(d) => d.periodKey === "2027-07-11",
+		) as OutlineDigestRow;
+		expect(d11.truncated).toBe(true);
+		expect(Object.keys(d11.ranges)).toEqual([good.space.id]);
+		expect((await detail(fy.id, d11.id)).knowledge.map((k) => k.title)).toEqual(["good 07-11"]);
+		// Mended: the next day goes on as usual.
+		await write(bad.space, A, fy.id, "2027-07-12T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "bad 07-12" },
+		]);
+		await runJob("2027-07-13T08:00:00.000Z");
+		const d12 = (await dailies(fy.id)).find(
+			(d) => d.periodKey === "2027-07-12",
+		) as OutlineDigestRow;
+		expect(d12.truncated).toBe(false);
+		expect((await detail(fy.id, d12.id)).knowledge.map((k) => k.title)).toEqual(["bad 07-12"]);
+	}, 60_000);
+
+	test("a person whose reports cannot be written is left alone for a while, longer each time", async () => {
+		const gu = await person("gu", { timeZone: "UTC" });
+		const ok = await person("ok", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(ok.id) };
+		const p = await project(ok.id);
+		await grant(p.id, gu.id, "read");
+		await write(p.space, A, ok.id, "2027-08-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "shared" },
+		]);
+		let tries = 0;
+		const failing = wrapStore({
+			async insertDigest(row: OutlineDigestRow) {
+				if (row.userId === gu.id) {
+					tries++;
+					// What a failed statement looks like: the whole query and its parameters, and
+					// the driver's reason underneath.
+					throw new Error(
+						`Failed query: insert into "outline_digests" params: ${"x".repeat(70_000)}`,
+						{
+							cause: new Error("FOREIGN KEY constraint failed"),
+						},
+					);
+				}
+				return await store.insertDigest(row);
+			},
+		});
+		const at = (minutes: number) =>
+			new Date(Date.parse("2027-08-11T08:00:00.000Z") + minutes * 60_000).toISOString();
+		const warnings = await warningsDuring(() => runJob(at(0), { store: failing }));
+		expect(tries).toBe(1);
+		expect((await dailies(ok.id)).some((d) => d.periodKey === "2027-08-10")).toBe(true);
+		const logged = warnings.find((w) => w.msg.startsWith("Outline report could not be written"));
+		expect(logged?.data?.error).toBe("Error: FOREIGN KEY constraint failed");
+		expect(JSON.stringify(warnings)).not.toContain("xxxxxxxxxx");
+		// Within five minutes: left out, nothing read for them, nothing logged.
+		expect(await warningsDuring(() => runJob(at(4), { store: failing }))).toEqual([]);
+		expect(tries).toBe(1);
+		// After five: tried again, fails, now left for ten.
+		await runJob(at(6), { store: failing });
+		expect(tries).toBe(2);
+		await runJob(at(15), { store: failing });
+		expect(tries).toBe(2);
+		// Mended: written at the next try.
+		await runJob(at(17));
+		expect((await dailies(gu.id)).some((d) => d.periodKey === "2027-08-10")).toBe(true);
+	}, 60_000);
+
+	test("one person whose due days cannot be worked out does not hold up the people after them", async () => {
+		// Their id sorts before everyone's: the sweep meets them first.
+		const first = await person("first", { timeZone: "UTC" }, `--${generateId().slice(2)}`);
+		const later = await person("later", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(later.id) };
+		const p = await project(later.id);
+		await write(p.space, A, later.id, "2027-09-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "later's fact" },
+		]);
+		const broken = wrapStore({
+			async getLatestDigestCursor(userId: string, ...rest: [never, never]) {
+				if (userId === first.id) throw new Error("corrupt ranges_json");
+				return await store.getLatestDigestCursor(userId, ...rest);
+			},
+		});
+		const warnings = await warningsDuring(() =>
+			runJob("2027-09-11T08:00:00.000Z", { store: broken }),
+		);
+		expect(warnings.map((w) => [w.msg, w.data?.userId])).toContainEqual([
+			"Outline report: the days due could not be worked out; left for later",
+			first.id,
+		]);
+		const day = (await dailies(later.id)).find(
+			(d) => d.periodKey === "2027-09-10",
+		) as OutlineDigestRow;
+		expect((await detail(later.id, day.id)).knowledge.map((k) => k.title)).toEqual([
+			"later's fact",
+		]);
+		expect(await dailies(first.id)).toEqual([]);
+	}, 60_000);
+
+	test("writing reports keeps to the slice's budget", async () => {
+		const ru = await person("ru", { timeZone: "UTC" });
+		const A = { kind: "agent" as const, id: await narrator(ru.id) };
+		const p = await project(ru.id);
+		await write(p.space, A, ru.id, "2027-10-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "ru's fact" },
+		]);
+		startOutlineDigestSweepForTests();
+		let t = 0;
+		const perSlice: number[] = [];
+		for (let i = 0; i < 2000; i++) {
+			const slice = await runOutlineDigestSlice({
+				store,
+				now: () => new Date("2027-10-11T08:00:00.000Z"),
+				serverTimeZone: "UTC",
+				clock: () => (t += 1000),
+				budgetMs: 1500,
+			});
+			perSlice.push(slice.written);
+			if (!slice.more) break;
+		}
+		// Everyone in the database has days due: many people, at most one person (three days) a slice.
+		expect(perSlice.reduce((a, b) => a + b, 0)).toBeGreaterThan(3);
+		expect(Math.max(...perSlice)).toBeLessThanOrEqual(3);
+	}, 120_000);
 
 	test("only the latest 30 daily reports are kept", async () => {
 		const hy = await person("hy", { timeZone: "UTC" });

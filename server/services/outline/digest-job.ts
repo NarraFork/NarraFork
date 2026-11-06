@@ -42,10 +42,13 @@
  * FAILURES
  * --------
  * A space whose window cannot be read is tried once more, then left out of the batch's reports,
- * which are marked truncated (and it is logged). A person whose reports cannot be written (they
- * were deleted meanwhile, say) is logged and skipped; their later days of the batch are not
- * written either, so the next sweep makes them again from the last one that was. A batch is done
- * once every person was attempted, so one failure never stops the job for everyone.
+ * which are marked truncated (and it is logged). A person whose due days cannot be worked out, or
+ * whose reports cannot be written (they were deleted meanwhile, say), is logged and skipped; their
+ * later days of the batch are not written either, so a later sweep makes them again from the last
+ * one that was. Such a person is left out of sweeps for a while, 5 minutes doubling up to 6 hours
+ * (in memory: a restart tries again). A batch is done once every person was attempted, so one
+ * failure never stops the job for anyone else. Logged errors are the driver's message, cut short,
+ * never a whole failed statement with its parameters.
  *
  * SCALE
  * -----
@@ -123,6 +126,9 @@ export const OUTLINE_DIGEST_JOB = {
 	previewsPerBatch: 20,
 	/** Commits one probe of the seq search reads. */
 	seqProbes: 16,
+	/** A person whose reports failed is left out of the sweep this long, doubling, up to the max. */
+	retryFirstMs: 5 * 60_000,
+	retryMaxMs: 6 * 60 * 60_000,
 } as const;
 
 /** One person's report of one day (or today so far), while the batch is gathered. */
@@ -167,6 +173,12 @@ interface JobState {
 	previewQueue: string[];
 	previewAt: Map<string, number>;
 	stamped: boolean;
+	/**
+	 * People whose reports could not be made or written lately, and until when the sweep leaves
+	 * them out (doubling from {@link OUTLINE_DIGEST_JOB.retryFirstMs} up to `retryMaxMs`).
+	 * In memory: a restart tries everyone again.
+	 */
+	retryAfter: Map<string, { failures: number; until: number }>;
 }
 
 function freshState(): JobState {
@@ -177,7 +189,34 @@ function freshState(): JobState {
 		previewQueue: [],
 		previewAt: new Map(),
 		stamped: false,
+		retryAfter: new Map(),
 	};
+}
+
+/** A person's reports failed: leave them out of sweeps for a while, longer each time. */
+function failedFor(userId: string, now: number): void {
+	const failures = (state.retryAfter.get(userId)?.failures ?? 0) + 1;
+	const wait = Math.min(
+		OUTLINE_DIGEST_JOB.retryMaxMs,
+		OUTLINE_DIGEST_JOB.retryFirstMs * 2 ** Math.min(failures - 1, 20),
+	);
+	state.retryAfter.set(userId, { failures, until: now + wait });
+}
+
+/** Whether the sweep leaves the person out for now. */
+function waitingFor(userId: string, now: number): boolean {
+	const retry = state.retryAfter.get(userId);
+	return retry !== undefined && retry.until > now;
+}
+
+/**
+ * An error as a log line: the driver's own message (a failed statement's error carries the whole
+ * query and its parameters, up to the size of a report), cut short.
+ */
+function errorText(error: unknown): string {
+	const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+	const text = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+	return text.length > 300 ? `${text.slice(0, 299)}…` : text;
 }
 
 let state = freshState();
@@ -295,8 +334,19 @@ async function nextBatch(
 			);
 			if (people.length < OUTLINE_DIGEST_JOB.peoplePerPage) state.sweep.done = true;
 			for (const person of people) {
-				const chain = await dailyChain(store, person, now, fallbackZone);
 				state.sweep.after = person.id;
+				if (waitingFor(person.id, now)) continue;
+				// One person's trouble never holds up the people after them.
+				let chain: PersonChain | null = null;
+				try {
+					chain = await dailyChain(store, person, now, fallbackZone);
+				} catch (error) {
+					failedFor(person.id, now);
+					logger.warn("Outline report: the days due could not be worked out; left for later", {
+						userId: person.id,
+						error: errorText(error),
+					});
+				}
 				if (chain && chain.days.length > 0) {
 					chains.push(chain);
 					days += chain.days.length;
@@ -389,9 +439,7 @@ function compactParts(day: PersonDay, limits: OutlineDigestLimits): void {
 
 /** What visiting a space does to a batch, applied only once the whole visit succeeded. */
 interface VisitEffect {
-	chain: PersonChain;
 	day: PersonDay;
-	to: number;
 	range: [number, number] | null;
 	part: OutlinePersonContribution | null;
 }
@@ -444,10 +492,7 @@ async function visitSpace(
 						c.responsibleUserId === person.id ||
 						(c.actorKind === "human" && c.actorId === person.id),
 				);
-			if (!concerned) {
-				effects.push({ chain, day, to, range: null, part: null });
-				continue;
-			}
+			if (!concerned) continue;
 			if (readable === undefined)
 				readable = await canReadSpace({ userId: person.id, isAdmin: person.isAdmin }, space);
 			if (!readable) break;
@@ -462,21 +507,17 @@ async function visitSpace(
 				limits,
 			);
 			// A part with nothing in it is no space with changes.
-			effects.push({
-				chain,
-				day,
-				to,
-				range: [from, to],
-				part: spaceWeight(part) > 0 ? part : null,
-			});
+			effects.push({ day, range: [from, to], part: spaceWeight(part) > 0 ? part : null });
 		}
 	}
 	return effects;
 }
 
 function applyVisit(spaceId: string, effects: readonly VisitEffect[], limits: OutlineDigestLimits) {
-	for (const { chain, day, to, range, part } of effects) {
-		chain.lastTo.set(spaceId, to);
+	// `chain.lastTo` is not written here: it is read only when a space's visit starts, a batch
+	// visits each space once, and the visit threads it from day to day itself. Writing it would only
+	// grow the batch's state with people × spaces.
+	for (const { day, range, part } of effects) {
 		if (range && Object.keys(day.ranges).length < limits.rangesPerDigest)
 			day.ranges[spaceId] = range;
 		if (part) {
@@ -552,21 +593,24 @@ async function writeChain(
 async function writeBatch(
 	store: OutlineStore,
 	batch: Batch,
-	nowIso: string,
+	now: number,
 	limits: OutlineDigestLimits,
 	over: () => boolean,
 ): Promise<{ done: boolean; written: number }> {
 	let written = 0;
+	const nowIso = new Date(now).toISOString();
 	while (batch.written < batch.chains.length) {
 		if (over()) return { done: false, written };
 		const chain = batch.chains[batch.written] as PersonChain;
 		batch.written++;
 		try {
 			written += await writeChain(store, chain, nowIso, limits, batch.attention);
+			state.retryAfter.delete(chain.person.id);
 		} catch (error) {
-			logger.warn("Outline report could not be written; the next sweep tries again", {
+			failedFor(chain.person.id, now);
+			logger.warn("Outline report could not be written; tried again later", {
 				userId: chain.person.id,
-				error: String(error),
+				error: errorText(error),
 			});
 		}
 		await yieldToLoop();
@@ -635,7 +679,7 @@ export async function runOutlineDigestSlice(
 					if (attempt === 1)
 						logger.warn("Outline report: a space could not be read; reports left partial", {
 							spaceId: space.id,
-							error: String(error),
+							error: errorText(error),
 						});
 				}
 			}
@@ -652,7 +696,7 @@ export async function runOutlineDigestSlice(
 	}
 	let outcome: { done: boolean; written: number };
 	try {
-		outcome = await writeBatch(store, batch, now().toISOString(), limits, over);
+		outcome = await writeBatch(store, batch, now().getTime(), limits, over);
 	} catch (error) {
 		// Never left half written for the next slice to fail on again.
 		state.batch = null;
@@ -758,6 +802,19 @@ export async function stopOutlineDigestJob(): Promise<void> {
 	job.wake?.();
 	await job.running;
 	job.stopping = false;
+}
+
+/**
+ * Sizes of the batch in progress (tests): its people, and the entries of their space positions
+ * (`lastTo`), which must not grow with the spaces visited.
+ */
+export function outlineDigestBatchSizesForTests(): { chains: number; lastTo: number } | null {
+	const batch = state.batch;
+	if (!batch) return null;
+	return {
+		chains: batch.chains.length,
+		lastTo: batch.chains.reduce((n, chain) => n + chain.lastTo.size, 0),
+	};
 }
 
 /** Forget everything the job holds in memory (tests). */

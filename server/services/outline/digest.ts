@@ -900,6 +900,10 @@ export function assembleDigest(
 		more: emptyMore(),
 	};
 	const sections = items as unknown as Record<OutlineDigestSection, Array<{ space: string }>>;
+	// The totals are kept current as items are cut, so what is measured is what is stored.
+	for (const space of spaces)
+		for (const section of OUTLINE_DIGEST_SECTIONS)
+			items.more[section] += space.more?.[section] ?? 0;
 	// An item cut is counted against its own space, so a reader who can no longer read that space
 	// is not told about it either.
 	const cut = (section: OutlineDigestSection, item: { space: string } | undefined) => {
@@ -909,6 +913,7 @@ export function assembleDigest(
 			space.more = space.more ?? {};
 			space.more[section] = (space.more[section] ?? 0) + 1;
 		}
+		items.more[section]++;
 		truncated = true;
 	};
 	for (const section of OUTLINE_DIGEST_SECTIONS) {
@@ -937,9 +942,6 @@ export function assembleDigest(
 		cut(section, item);
 		if (size <= limits.itemsBytes) size = Buffer.byteLength(JSON.stringify(items));
 	}
-	for (const space of spaces)
-		for (const section of OUTLINE_DIGEST_SECTIONS)
-			items.more[section] += space.more?.[section] ?? 0;
 	const counts: OutlineDigestCounts = {
 		delegated: items.delegated.length + items.more.delegated,
 		knowledge: items.knowledge.length + items.more.knowledge,
