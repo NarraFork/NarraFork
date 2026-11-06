@@ -16,16 +16,13 @@ import {
 	Modal,
 	PasswordInput,
 	ScrollArea,
-	SegmentedControl,
 	Stack,
 	Text,
-	TextInput,
 	Title,
 } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { authApi, type StepUpMethod } from "../../lib/api/auth";
 import {
 	type CredentialImportPreviewItem,
 	type CredentialImportResult,
@@ -34,8 +31,8 @@ import {
 } from "../../lib/api/credential-transfer";
 import { describeApiError } from "../../lib/api-error";
 import { saveBlobAsFile } from "../../lib/file-download";
+import { StepUpFields, useStepUpFields } from "./StepUpFields";
 
-const MIN_PASSPHRASE = 10;
 const keyOf = (c: { kind: string; id: string }) => `${c.kind}:${c.id}`;
 
 export function CredentialTransferCard() {
@@ -100,59 +97,29 @@ function ExportModal({
 		queryFn: () => credentialTransferApi.list(),
 		enabled: opened,
 	});
-	const methods = useQuery({
-		queryKey: ["auth", "step-up-methods"],
-		queryFn: () => authApi.stepUpMethods(),
-		enabled: opened,
-	});
 	const list = useMemo(() => credentials.data?.credentials ?? [], [credentials.data]);
-	const available = useMemo(() => methods.data?.methods ?? [], [methods.data]);
+	const fields = useStepUpFields(opened);
 
 	const [selected, setSelected] = useState<Set<string>>(new Set());
-	const [passphrase, setPassphrase] = useState("");
-	const [confirmation, setConfirmation] = useState("");
-	const [password, setPassword] = useState("");
-	const [method, setMethod] = useState<StepUpMethod>("totp");
-	const [code, setCode] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 
 	useEffect(() => {
-		if (!opened) return;
-		setPassphrase("");
-		setConfirmation("");
-		setPassword("");
-		setCode("");
-		setError(null);
+		if (opened) setError(null);
 	}, [opened]);
 	useEffect(() => setSelected(new Set(list.map(keyOf))), [list]);
-	useEffect(() => {
-		if (available.length && !available.includes(method)) setMethod(available[0] as StepUpMethod);
-	}, [available, method]);
 
-	const mismatch = confirmation.length > 0 && confirmation !== passphrase;
-	const ready =
-		selected.size > 0 &&
-		passphrase.length >= MIN_PASSPHRASE &&
-		confirmation === passphrase &&
-		password.length > 0 &&
-		available.length > 0 &&
-		(method === "passkey" || code.trim().length > 0);
+	const ready = selected.size > 0 && fields.ready;
 
 	const submit = async () => {
 		setBusy(true);
 		setError(null);
 		try {
-			const grant = await authApi.stepUp({
-				purpose: "credentials.export",
-				password,
-				method,
-				...(method === "passkey" ? {} : { code: code.trim() }),
-			});
+			const grant = await fields.verify("credentials.export");
 			const all = selected.size === list.length;
 			const { blob, filename } = await credentialTransferApi.export({
 				stepUpToken: grant.token,
-				passphrase,
+				passphrase: fields.state.passphrase,
 				...(all ? {} : { selection: list.filter((c) => selected.has(keyOf(c))) }),
 			});
 			saveBlobAsFile(blob, filename);
@@ -160,7 +127,7 @@ function ExportModal({
 			onClose();
 		} catch (err) {
 			setError(describeApiError(err, t).message);
-			setCode("");
+			fields.clearCode();
 		} finally {
 			setBusy(false);
 		}
@@ -185,57 +152,7 @@ function ExportModal({
 				<Alert color="yellow" variant="light">
 					<Text size="xs">{t("credentialTransfer.rotationWarning")}</Text>
 				</Alert>
-				<PasswordInput
-					label={t("credentialTransfer.passphrase")}
-					description={t("credentialTransfer.passphraseHint", { min: MIN_PASSPHRASE })}
-					value={passphrase}
-					onChange={(e) => setPassphrase(e.currentTarget.value)}
-					autoComplete="new-password"
-				/>
-				<PasswordInput
-					label={t("credentialTransfer.passphraseConfirm")}
-					value={confirmation}
-					error={mismatch ? t("credentialTransfer.passphraseMismatch") : undefined}
-					onChange={(e) => setConfirmation(e.currentTarget.value)}
-					autoComplete="new-password"
-				/>
-				<Title order={6}>{t("credentialTransfer.verify")}</Title>
-				{methods.isSuccess && available.length === 0 ? (
-					<Alert color="orange">{t("errors:STEP_UP_MFA_REQUIRED")}</Alert>
-				) : (
-					<>
-						<PasswordInput
-							label={t("credentialTransfer.password")}
-							value={password}
-							onChange={(e) => setPassword(e.currentTarget.value)}
-							autoComplete="current-password"
-						/>
-						{available.length > 1 && (
-							<SegmentedControl
-								size="xs"
-								value={method}
-								onChange={(value) => setMethod(value as StepUpMethod)}
-								data={available.map((m) => ({
-									value: m,
-									label: t(`credentialTransfer.methods.${m}`),
-								}))}
-							/>
-						)}
-						{method === "passkey" ? (
-							<Text size="xs" c="dimmed">
-								{t("credentialTransfer.passkeyHint")}
-							</Text>
-						) : (
-							<TextInput
-								label={t("credentialTransfer.code")}
-								value={code}
-								onChange={(e) => setCode(e.currentTarget.value)}
-								autoComplete="one-time-code"
-								inputMode={method === "totp" ? "numeric" : "text"}
-							/>
-						)}
-					</>
-				)}
+				<StepUpFields fields={fields} />
 				{error && <Alert color="red">{error}</Alert>}
 				<Group justify="flex-end">
 					<Button variant="default" onClick={onClose}>
