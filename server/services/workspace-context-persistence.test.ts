@@ -558,7 +558,10 @@ describe("real SQLite workspace CAS", () => {
 				local: { cwd: join(root, "old"), pathFlavor: "posix" },
 				"remote-fixture": { cwd: "/remote/work", pathFlavor: "posix" },
 			});
-			expect(await getWorkspaceDirectories(id)).toEqual(row?.workspaceDirectories);
+			expect(await getWorkspaceDirectories(id)).toEqual({
+				local: { cwd: join(root, "old"), pathFlavor: "posix" },
+				"remote-fixture": { cwd: "/remote/work", pathFlavor: "posix" },
+			});
 			// A stale CAS must not touch either half of the pair.
 			await expect(
 				workspaceContextService.switch(

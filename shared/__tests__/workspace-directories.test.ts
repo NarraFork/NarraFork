@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { WorkspaceDirectoryMap } from "../workspace-directories";
 import {
 	isAbsoluteForFlavor,
 	normalizeWorkspacePathFlavor,
@@ -18,7 +19,7 @@ describe("parseWorkspaceDirectoryMap", () => {
 	});
 
 	test("accepts both a JSON string and an already-parsed object", () => {
-		const raw = { local: { cwd: "/work", pathFlavor: "posix" } };
+		const raw: WorkspaceDirectoryMap = { local: { cwd: "/work", pathFlavor: "posix" } };
 		expect(parseWorkspaceDirectoryMap(JSON.stringify(raw))).toEqual(raw);
 		expect(parseWorkspaceDirectoryMap(raw)).toEqual(raw);
 	});

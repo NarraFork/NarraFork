@@ -51,7 +51,7 @@ export class AppError extends Error {
 		 * verbatim by `toErrorPayload`; keep it free of paths or secrets that the
 		 * caller is not already allowed to see.
 		 */
-		public readonly details?: Record<string, unknown>,
+		public readonly details?: unknown,
 	) {
 		super(message);
 		this.messageCode = localization?.messageCode;

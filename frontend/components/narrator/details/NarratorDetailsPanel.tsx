@@ -1324,7 +1324,7 @@ function NarratorDetailsContent({
 										</Text>
 									</Group>
 								</UnstyledButton>
-								<Collapse in={deviceListOpen}>
+								<Collapse expanded={deviceListOpen}>
 									<Stack gap={2}>
 										{deviceRows.map((row) => (
 											<UnstyledButton
