@@ -127,6 +127,11 @@ import {
 } from "../services/outline/pending";
 import { addPersonTask, changePersonTask } from "../services/outline/person-tasks";
 import { readPlanDiff } from "../services/outline/plan-diff";
+import {
+	type OutlinePlanReviewFound,
+	planReviewBlocks,
+	reviewDiffOptions,
+} from "../services/outline/plans";
 import { commitSeqAt } from "../services/outline/read";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
@@ -446,8 +451,9 @@ outlineRoutes.get("/spaces/:spaceId/pages/:pageId/commits", async (c) => {
 
 /**
  * A plan against the version it is compared with (outline P2 PR 8): `from` (the submission's
- * `baseSeq`, 0 for nothing) to now, block by block, bounded (`plan-diff.ts`). Read access to the
- * plan's space.
+ * `baseSeq`, 0 for nothing) to now, block by block, bounded (`plan-diff.ts`), without the plan
+ * reviews written since `from` (shown on their own; PR 8b, found by the server: review round 1
+ * N3). Read access to the plan's space.
  */
 outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
 	const principal = principalOf(c);
@@ -457,7 +463,18 @@ outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
 		idParam(c, "blockId"),
 	);
 	const query = parse(outlinePlanDiffQuerySchema, c.req.query());
-	const diff = await readPlanDiff({ rootId: block.id, fromSeq: query.from, toSeq: null });
+	const planner = block.taskJson?.plan?.by;
+	// Left out only while they are what the review wrote (review round 2 S3); in a review that is
+	// not, only what was added or changed shows (round 3 N9).
+	const reviews = planner
+		? await planReviewBlocks(outlineStore, planner, block, query.from)
+		: new Map<string, OutlinePlanReviewFound>();
+	const diff = await readPlanDiff({
+		rootId: block.id,
+		fromSeq: query.from,
+		toSeq: null,
+		...reviewDiffOptions(reviews),
+	});
 	if (!diff) throw new NotFoundError("Outline block", block.id);
 	const body: OutlinePlanDiffResponse = {
 		root: {

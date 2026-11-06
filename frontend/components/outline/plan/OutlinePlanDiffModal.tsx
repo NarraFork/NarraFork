@@ -3,13 +3,27 @@
  * that changed, in tree order, each with what changed and its text before and after. Fetched when
  * opened and again whenever the plan's page changes (`useOutlinePlanDiff`: the person may be
  * editing it in the outline beside the session), so the version a decision names (`seenSeq`) is
- * the one on screen.
+ * the one on screen. A plan review's comments (PR 8b) come first, as the submission carries them;
+ * the diff leaves them out.
  */
 
-import { Alert, Badge, Group, Loader, Modal, Paper, ScrollArea, Stack, Text } from "@mantine/core";
+import {
+	Alert,
+	Anchor,
+	Badge,
+	Box,
+	Group,
+	Loader,
+	Modal,
+	Paper,
+	ScrollArea,
+	Stack,
+	Text,
+} from "@mantine/core";
 import type {
 	OutlinePlanDiffEntry,
 	OutlinePlanDiffResponse,
+	OutlinePlanReview,
 	OutlinePlanTaskView,
 } from "@shared/outline-api";
 import type { ReactNode } from "react";
@@ -86,6 +100,62 @@ function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
 	);
 }
 
+/** A plan review's comments, above the diff: each with the step it is about. */
+export function OutlinePlanReviewComments({
+	review,
+	onOpen,
+}: {
+	review: OutlinePlanReview;
+	onOpen?: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	return (
+		<Paper
+			withBorder
+			p={8}
+			radius="sm"
+			mb="sm"
+			style={{ borderColor: "var(--mantine-color-orange-light-color)" }}
+			data-testid="outline-plan-review"
+		>
+			<Group justify="space-between" gap={6} wrap="wrap" mb={4}>
+				<Text size="sm" fw={600} c="orange">
+					{t("outlinePlan.review.title", { version: review.round })}
+				</Text>
+				{onOpen && (
+					<Anchor component="button" type="button" size="xs" onClick={onOpen}>
+						{t("outlinePlan.review.open")}
+					</Anchor>
+				)}
+			</Group>
+			<Text size="xs" c="dimmed" mb={6}>
+				{t("outlinePlan.review.explain")}
+			</Text>
+			<Stack gap={6}>
+				{review.comments.map((comment, index) => (
+					<Box
+						// The comments are a fixed list written once; their order is their identity.
+						// biome-ignore lint/suspicious/noArrayIndexKey: a static list
+						key={index}
+						pl={8}
+						style={{ borderLeft: "2px solid var(--mantine-color-orange-light-color)" }}
+						data-testid="outline-plan-review-comment"
+					>
+						{comment.target && (
+							<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+								{t("outlinePlan.review.on", { title: comment.target.title })}
+							</Text>
+						)}
+						<Text size="xs" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+							{comment.text}
+						</Text>
+					</Box>
+				))}
+			</Stack>
+		</Paper>
+	);
+}
+
 /** The diff's body: counts, then the changed blocks. */
 export function OutlinePlanDiffBody({
 	diff,
@@ -151,6 +221,8 @@ export function OutlinePlanDiffModal({
 	diff,
 	loading,
 	error,
+	review,
+	onOpenReview,
 	footer,
 }: {
 	opened: boolean;
@@ -159,6 +231,9 @@ export function OutlinePlanDiffModal({
 	diff: OutlinePlanDiffResponse | undefined;
 	loading: boolean;
 	error: unknown;
+	/** The plan review's comments on this version (PR 8b), shown first. */
+	review?: OutlinePlanReview | null;
+	onOpenReview?: () => void;
 	footer: ReactNode;
 }) {
 	const { t } = useTranslation("narrator");
@@ -172,6 +247,9 @@ export function OutlinePlanDiffModal({
 			data-testid="outline-plan-diff-modal"
 		>
 			<ScrollArea.Autosize mah="60vh" type="auto">
+				{review && review.comments.length > 0 && (
+					<OutlinePlanReviewComments review={review} onOpen={onOpenReview} />
+				)}
 				<OutlinePlanDiffBody diff={diff} loading={loading} error={error} />
 			</ScrollArea.Autosize>
 			<div style={{ marginTop: "var(--mantine-spacing-sm)" }}>{footer}</div>

@@ -17,6 +17,7 @@ export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
 export type {
+	OutlinePlanPromptReview,
 	OutlinePlanPromptRoot,
 	OutlinePlanSubmitProblem,
 } from "./prompts/outline-plan";
@@ -27,6 +28,8 @@ export {
 	getOutlinePlanRelaxedReminder,
 	getOutlinePlanReturnedMessage,
 	getOutlinePlanReturnedNote,
+	getOutlinePlanReviewPrompt,
+	getOutlinePlanReviewTitle,
 	getOutlinePlanSubmitProblem,
 } from "./prompts/outline-plan";
 export type {
