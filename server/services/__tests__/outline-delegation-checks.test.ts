@@ -26,6 +26,7 @@ import {
 	classifyDelegatedResult,
 	OUTLINE_DELEGATION_LIMITS,
 	renderDelegationBrief,
+	startingDelegationCount,
 	stripDelegationNote,
 	withDelegationNote,
 } from "../outline/delegation";
@@ -548,6 +549,80 @@ describe("the window between the checks and the delegation's commit (review S1, 
 			await archived(childId);
 		} finally {
 			spy.mockRestore();
+		}
+	});
+});
+
+describe("the in-flight mark (review round 3)", () => {
+	test("set from the commit until the run starts, and cleared on every way out: refused, undone, background start, foreground start", async () => {
+		const owner = await user();
+		const root = await rootSession(owner);
+		expect(startingDelegationCount()).toBe(0);
+
+		// Refused commit: the task was taken in the window.
+		const other = await rootSession(owner, { title: "Other" });
+		const refusedTask = await seedTask(root, owner, "Refused task");
+		const create = inTheWindow(async () => {
+			await write(refusedTask.space.id, other, owner, [
+				{ op: "setTask", block: { id: refusedTask.task.blockId }, task: { status: "doing" } },
+			]);
+		});
+		try {
+			expect((await agent(root, owner, { task: refusedTask.task.address })).result.isError).toBe(
+				true,
+			);
+		} finally {
+			create.mockRestore();
+		}
+		expect(startingDelegationCount()).toBe(0);
+
+		// Undone: the Agent call failed after the commit.
+		const undoneTask = await seedTask(root, owner, "Undone task");
+		const failing = spyOn(narratorService, "persistSubagentUserMessage").mockRejectedValueOnce(
+			new Error("simulated write failure"),
+		);
+		try {
+			expect((await agent(root, owner, { task: undoneTask.task.address })).result.isError).toBe(
+				true,
+			);
+		} finally {
+			failing.mockRestore();
+		}
+		expect(startingDelegationCount()).toBe(0);
+
+		// Background start: marked in the window, cleared once its run started (it still runs).
+		const bgTask = await seedTask(root, owner, "Background task");
+		const persist = narratorService.persistSubagentUserMessage.bind(narratorService);
+		let inWindow = -1;
+		const watching = spyOn(narratorService, "persistSubagentUserMessage").mockImplementation(
+			async (...args) => {
+				inWindow = startingDelegationCount();
+				return await persist(...args);
+			},
+		);
+		const open = gate();
+		model.script = [{ text: "background report", gate: open.promise }];
+		try {
+			const bg = await agent(root, owner, { task: bgTask.task.address, run_in_background: true });
+			expect(inWindow).toBe(1);
+			expect(startingDelegationCount()).toBe(0);
+			const sub = bg.childId as string;
+			await until(() => model.passes.includes(sub), "the background pass");
+			expect(runEnded(sub)).toBe(false);
+			open.resolve();
+			await taskResult(sub);
+
+			// Foreground start: marked in the window, cleared once its run started.
+			inWindow = -1;
+			const fgTask = await seedTask(root, owner, "Foreground task");
+			model.script = [{ text: "foreground report" }];
+			const fg = await agent(root, owner, { task: fgTask.task.address });
+			expect(fg.result.output).toContain('status="current"');
+			expect(inWindow).toBe(1);
+			expect(startingDelegationCount()).toBe(0);
+		} finally {
+			open.resolve();
+			watching.mockRestore();
 		}
 	});
 });

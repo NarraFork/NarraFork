@@ -14,9 +14,9 @@
  *   1. Checks, all before anything is created (the first that fails is the answer): a root outline
  *      session not in plan mode; not with `takeover_by_user`; the task found among what the
  *      session may read, a live task to do or in progress; its space writable by this turn; not in
- *      a plan that is not approved yet; not waiting (prerequisites, an unanswered question, a change
- *      waiting for confirmation); not assigned to a person; nobody else doing it (another session
- *      or a person) and no subagent of this session still running with it.
+ *      a plan that is not approved yet; not waiting (prerequisites, an unanswered question, a
+ *      change waiting for confirmation); not assigned to a person; nobody else doing it (another
+ *      session or a person) and no subagent of this session still running with it.
  *   2. The instructions (`renderDelegationBrief`): plain markdown, no addresses and no outline
  *      syntax, within {@link OUTLINE_DELEGATION_LIMITS.briefBytes}: the task, the goals above it,
  *      the notes, steps and questions under it (breadth first, within the budget; an earlier
@@ -39,8 +39,8 @@
  * (`subagent-lifecycle.ts`), so the task stays with the session (design §2.9). A subagent of the
  * session that holds the task but is not running (a server stopped before it started) does not
  * block delegating it again; one whose delegation is between its commit and the start of its run
- * counts as running (`startingDelegations`), so two agents never get the same task. Continuation leaves the task, and the tasks under it, to the subagent meanwhile
- * (`tasks.ts`).
+ * counts as running (`startingDelegations`), so two agents never get the same task.
+ * Continuation leaves the task, and the tasks under it, to the subagent meanwhile (`tasks.ts`).
  *
  * ATTACHING (`attachDelegatedReport`, from the run service when a result is delivered)
  * -----------------------------------------------------------------------------------
@@ -581,6 +581,11 @@ const startingDelegations = hotSafe(
 /** The subagent's run has started (or its delegation was undone): it is running, or nothing. */
 export function delegationStarted(subagentId: string): void {
 	startingDelegations.delete(subagentId);
+}
+
+/** How many delegations are between their commit and the start of their run (tests). */
+export function startingDelegationCount(): number {
+	return startingDelegations.size;
 }
 
 /**
@@ -1210,7 +1215,10 @@ async function reportSize(store: OutlineStore, spaceId: string, id: string): Pro
 	return Math.min(count, max);
 }
 
-/** Whether a narrator belongs to the delegating session: one indexed read of the ones the claim names. */
+/**
+ * Whether a narrator belongs to the delegating session: one indexed read of the ones the claim
+ * names.
+ */
 async function sessionOf(
 	store: OutlineStore,
 	delegated: DelegatedTaskRegistration,
