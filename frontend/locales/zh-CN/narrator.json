@@ -2425,7 +2425,7 @@
 		"plan_approval": "计划审批",
 		"reflection": "反思 · 已转人工",
 		"outline_decision": "大纲 · 待你决定",
-		"outline_digest": "大纲 · 代你确认"
+		"outline_digest": "大纲 · 汇报"
 	},
 	"optimizePrompt": "优化提示词",
 	"optimizeCancel": "取消优化",

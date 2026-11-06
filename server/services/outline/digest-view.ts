@@ -14,14 +14,18 @@
  */
 import { AppError, ForbiddenError, NotFoundError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
+import { logger } from "@server/lib/logger";
 import { titleOf } from "@shared/outline";
 import {
 	OUTLINE_DIGEST_SECTIONS,
+	OUTLINE_DIGEST_UNDO_CODES,
 	type OutlineDelegatedKind,
+	type OutlineDigestActor,
 	type OutlineDigestDetailResponse,
 	type OutlineDigestHead,
 	type OutlineDigestLink,
 	type OutlineDigestListResponse,
+	type OutlineDigestNames,
 	type OutlineDigestNowResponse,
 	type OutlineDigestSection,
 	type OutlineDigestSession,
@@ -67,6 +71,8 @@ export const OUTLINE_DIGEST_VIEW = {
 	decisionVersions: 2000,
 	/** Unread reports one "mark all read" marks at most. */
 	markAll: 100,
+	/** Sessions named as actors whose visibility a detail checks (the rest stay unnamed). */
+	actorSessions: 100,
 } as const;
 
 function toHead(row: OutlineDigestHeadRow): OutlineDigestHead {
@@ -152,12 +158,16 @@ export async function requestOutlineDigestNow(
 	options: { store?: OutlineStore; now?: number; kick?: boolean } = {},
 ): Promise<OutlineDigestNowResponse> {
 	const store = options.store ?? outlineStore;
-	const { queued } = requestOutlineDigestPreview(principal.userId, {
+	const asked = requestOutlineDigestPreview(principal.userId, {
 		...(options.now !== undefined ? { now: options.now } : {}),
 		...(options.kick !== undefined ? { kick: options.kick } : {}),
 	});
 	const [preview] = await store.listDigestHeads(principal.userId, { kind: "today", limit: 1 });
-	return { queued, previewId: preview?.id ?? null };
+	return {
+		queued: asked.queued,
+		reason: asked.queued ? null : asked.reason,
+		previewId: preview?.id ?? null,
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -247,6 +257,9 @@ export async function readOutlineDigestDetail(
 	for (const narratorId of new Set(narratorIds))
 		if (await visible(narratorId)) shownNarrators.add(narratorId);
 	const names = await readDisplayNames({ narratorIds: [...shownNarrators] });
+	// Gone since (an admin is told every session is readable without one being read): not named.
+	for (const narratorId of [...shownNarrators])
+		if (!names.narrators.has(narratorId)) shownNarrators.delete(narratorId);
 	const session = (narratorId: string | null): OutlineDigestSession =>
 		narratorId && shownNarrators.has(narratorId)
 			? { narratorId, title: names.narrators.get(narratorId) ?? null, hidden: false }
@@ -342,6 +355,42 @@ export async function readOutlineDigestDetail(
 		).flat(),
 	});
 
+	// People and sessions the items name: usernames, and titles of the sessions the reader may
+	// read (at most `actorSessions` of them are checked).
+	const actorUsers = new Set<string>();
+	const actorSessions = new Set<string>();
+	const named = (actor: OutlineDigestActor | null) => {
+		if (actor?.kind === "human") actorUsers.add(actor.id);
+		else if (actor?.kind === "agent") actorSessions.add(actor.id);
+	};
+	for (const t of tasks) {
+		named(t.by);
+		named(t.executor);
+		named(t.manager);
+	}
+	for (const p of plans) named(p.approvedBy);
+	for (const q of questions) {
+		named(q.by);
+		if (q.to) actorUsers.add(q.to);
+	}
+	for (const o of other) named(o.actor);
+	const readableSessions: string[] = [];
+	for (const narratorId of [...actorSessions].slice(0, OUTLINE_DIGEST_VIEW.actorSessions))
+		if (await visible(narratorId)) readableSessions.push(narratorId);
+	const actorNames = await readDisplayNames({
+		userIds: [...actorUsers],
+		narratorIds: readableSessions,
+	});
+	const actorNamesView: OutlineDigestNames = {
+		users: Object.fromEntries(actorNames.users),
+		// Only sessions that are still there.
+		sessions: Object.fromEntries(
+			readableSessions
+				.filter((id) => actorNames.narrators.has(id))
+				.map((id) => [id, actorNames.narrators.get(id) ?? null]),
+		),
+	};
+
 	return {
 		digest: {
 			...toHead(row),
@@ -370,6 +419,7 @@ export async function readOutlineDigestDetail(
 				tasksStarted: s.tasksStarted,
 				leaseReturned: s.leaseReturned,
 				reviewComments: s.reviewComments,
+				more: s.more ?? {},
 			};
 		}),
 		moreSpaces: stored.moreSpaces,
@@ -430,6 +480,7 @@ export async function readOutlineDigestDetail(
 			blocks: o.blocks,
 		})),
 		more,
+		names: actorNamesView,
 	};
 }
 
@@ -543,17 +594,25 @@ async function decisionStands(
 
 export class OutlineDigestUndoError extends AppError {
 	constructor(message: string) {
-		super(message, 409, "OUTLINE_DIGEST_UNDO_GONE");
+		super(message, 409, OUTLINE_DIGEST_UNDO_CODES.gone);
 		this.name = "OutlineDigestUndoError";
+	}
+}
+
+/** 403 with a code that says why, so a client can say it in the reader's language. */
+class OutlineDigestUndoForbiddenError extends ForbiddenError {
+	constructor(message: string, code: string) {
+		super(message);
+		this.code = code;
 	}
 }
 
 /**
  * Take back a decision made in the person's name by reverting its commit (the outline's own
- * revert, as the person). Only the person it was made for may (403 for anyone else who can read
- * the space; 404 when they cannot, or the commit is unknown), only while they may write the space
- * (403), and only while it can still be taken back: it still stands, and reverting would put back
- * what it decided (409 otherwise, nothing written).
+ * revert, as the person). Only the person it was made for may (403 `…_NOT_YOURS` for anyone else
+ * who can read the space; 404 when they cannot, or the commit is unknown), only while they may
+ * write the space (403 `…_READ_ONLY`), and only while it can still be taken back: it still
+ * stands, and reverting would put back what it decided (409 `…_GONE` otherwise, nothing written).
  */
 export async function undoOutlineDelegatedDecision(
 	principal: OutlinePrincipal,
@@ -567,8 +626,15 @@ export async function undoOutlineDelegatedDecision(
 		throw new NotFoundError("Outline commit", commitId);
 	const decision = await classifyDelegatedCommit(store, commit);
 	if (!decision || decision.person !== principal.userId)
-		throw new ForbiddenError("Only the person this decision was made for can undo it");
-	if (!(await canWriteSpace(principal, space))) throw new ForbiddenError();
+		throw new OutlineDigestUndoForbiddenError(
+			"Only the person this decision was made for can undo it",
+			OUTLINE_DIGEST_UNDO_CODES.notYours,
+		);
+	if (!(await canWriteSpace(principal, space)))
+		throw new OutlineDigestUndoForbiddenError(
+			"You may not write where this decision was made",
+			OUTLINE_DIGEST_UNDO_CODES.readOnly,
+		);
 	if (!(await decisionStands(store, commit, decision)))
 		throw new OutlineDigestUndoError("This decision was already undone or changed since");
 	const preview = await previewRevert(commitId, { store });
@@ -593,6 +659,25 @@ export async function undoOutlineDelegatedDecision(
 	// Changed between the check and the revert, so that nothing was put back after all.
 	if (!result.commit)
 		throw new OutlineDigestUndoError("This decision can no longer be undone: it was changed since");
+	// A confirmation taken back is one the person has seen: it leaves the unacknowledged ones (its
+	// pending row keeps reading as confirmed, so it would otherwise be offered again).
+	// Best effort: the undo is done either way.
+	if (decision.kind === "confirmation") {
+		try {
+			const [pending] = await store.getPendingByDecisionCommits([commitId]);
+			if (pending)
+				await store.markDelegateConfirmationsSeen(
+					principal.userId,
+					[pending.id],
+					(options.now?.() ?? new Date()).toISOString(),
+				);
+		} catch (error) {
+			logger.warn("Outline report: an undone confirmation could not be marked seen", {
+				commitId,
+				error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+			});
+		}
+	}
 	eventBus.emit({ type: "human_attention:changed", userIds: [principal.userId] });
 	return { kind: decision.kind, commit: result.commit, skipped: result.skipped.length };
 }

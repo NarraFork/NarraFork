@@ -5,9 +5,9 @@
  *
  * What must hold:
  *   - only the person the decision was made for may undo it: anyone else who can read the space
- *     gets 403, anyone who cannot gets 404 (as for an unknown commit);
- *   - an ordinary commit is not a decision made in anyone's name (403);
- *   - the person needs write access to the space (403 without);
+ *     gets 403 (`…_NOT_YOURS`), anyone who cannot gets 404 (as for an unknown commit);
+ *   - an ordinary commit is not a decision made in anyone's name (403 `…_NOT_YOURS`);
+ *   - the person needs write access to the space (403 `…_READ_ONLY` without);
  *   - a decision already undone, or changed since so that reverting would not take it back, is
  *     refused (409) and nothing is written;
  *   - undoing puts the decision back: the plan is being planned again, the question is open
@@ -15,13 +15,14 @@
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { OutlineDigestUndoResponse } from "@shared/outline-digest";
 import { Hono } from "hono";
 import { db } from "../../../db";
 import { aclGrants, narrators, projects, users } from "../../../db/schema";
 import { AppError } from "../../../lib/errors";
 import { generateId } from "../../../lib/id";
+import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
 import { outlineRoutes } from "../../../routes/outline";
 import {
@@ -208,7 +209,8 @@ describe("undoing a decision made in the person's name", () => {
 			blockIds: [question],
 			round: null,
 		});
-		expect((await undo(bob, commit.id)).status).toBe(403);
+		const notHis = await undo(bob, commit.id);
+		expect([notHis.status, notHis.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_NOT_YOURS"]);
 		expect((await undo(carol, commit.id)).status).toBe(404);
 		expect((await undo(alice, "no-such-commit")).status).toBe(404);
 		const done = await undo(alice, commit.id);
@@ -248,8 +250,10 @@ describe("undoing a decision made in the person's name", () => {
 		const reader = await user("reader");
 		await grant("project", projectId, reader, "read");
 		const { commit } = await relayedAnswer(reader);
-		expect((await undo(reader, commit.id)).status).toBe(403);
-		expect((await undo(alice, commit.id)).status).toBe(403);
+		const readOnly = await undo(reader, commit.id);
+		expect([readOnly.status, readOnly.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_READ_ONLY"]);
+		const notHers = await undo(alice, commit.id);
+		expect([notHers.status, notHers.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_NOT_YOURS"]);
 	});
 
 	test("an ordinary commit is no decision made in anyone's name", async () => {
@@ -262,7 +266,8 @@ describe("undoing a decision made in the person's name", () => {
 				(await store.getCommit(edit.commit?.id as string)) as OutlineCommitRow,
 			),
 		).toBeNull();
-		expect((await undo(alice, edit.commit?.id as string)).status).toBe(403);
+		const ordinary = await undo(alice, edit.commit?.id as string);
+		expect([ordinary.status, ordinary.body.code]).toEqual([403, "OUTLINE_DIGEST_UNDO_NOT_YOURS"]);
 	});
 
 	test("the plan review's draft approval: the plan is being planned again; not once changed since", async () => {
@@ -354,9 +359,63 @@ describe("undoing a decision made in the person's name", () => {
 				?.kind,
 		).toBe("confirmation");
 		expect((await undo(bob, commitId)).status).toBe(403);
+		expect(pending?.digestSeenAt).toBeNull();
 		const done = await undo(alice, commitId);
 		expect(done.status).toBe(200);
 		expect((await store.getBlock(step))?.content).toBe("Step");
+		// Taken back, so seen: it leaves the confirmations still to acknowledge.
+		expect((await store.getPending([pending?.id as string]))[0]?.digestSeenAt).not.toBeNull();
 		expect((await undo(alice, commitId)).status).toBe(409);
+	});
+
+	test("a confirmation is undone even when marking it seen fails (best effort, logged)", async () => {
+		const delegate = await narrator(alice);
+		const made = await write(projectSpace, { kind: "human", id: alice }, alice, [
+			{ op: "insert", tempId: "t", parent: null, content: "Locked", task: { status: "todo" } },
+			{
+				op: "insert",
+				tempId: "s",
+				parent: { tempId: "t" },
+				content: "Step",
+				task: { status: "todo" },
+			},
+		]);
+		const [root, step] = made.results.map((r) => r.blockId) as [string, string];
+		await lockOutlineTask({
+			blockId: root,
+			userId: alice,
+			delegate,
+			store,
+			now: () => new Date(NOW),
+		});
+		const proposed = await write(projectSpace, { kind: "agent", id: agent }, alice, [
+			{ op: "update", block: { id: step }, content: "Step, again" },
+		]);
+		const pendingId = proposed.pending?.id as string;
+		await confirmOutlinePending({
+			pendingId,
+			by: { kind: "agent", narratorId: delegate, responsibleUserId: alice },
+			store,
+			now: () => new Date(NOW),
+		});
+		const commitId = (await store.getPending([pendingId]))[0]?.decisionCommitId as string;
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const failing = {
+				...store,
+				markDelegateConfirmationsSeen: () => Promise.reject(new Error("disk full")),
+			};
+			const done = await undoOutlineDelegatedDecision({ userId: alice, isAdmin: false }, commitId, {
+				store: failing,
+			});
+			expect(done.kind).toBe("confirmation");
+			expect((await store.getBlock(step))?.content).toBe("Step");
+			expect((await store.getPending([pendingId]))[0]?.digestSeenAt).toBeNull();
+			expect(warn.mock.calls.map((c) => c[0])).toContain(
+				"Outline report: an undone confirmation could not be marked seen",
+			);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });

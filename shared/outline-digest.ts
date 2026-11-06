@@ -331,6 +331,18 @@ export interface OutlineDigestSpaceView {
 	tasksStarted: number;
 	leaseReturned: number;
 	reviewComments: number;
+	/** This space's items past the caps, per section (absent: none). */
+	more: Partial<Record<OutlineDigestSection, number>>;
+}
+
+/**
+ * Names of the people and sessions the items name (actors, executors, managers, who was asked):
+ * usernames by user id, and titles by session id of only the sessions the reader may read (a
+ * session absent here is shown as one the reader cannot open).
+ */
+export interface OutlineDigestNames {
+	users: Record<string, string>;
+	sessions: Record<string, string | null>;
 }
 
 /** `GET /digests/:id`: a report as the reader may see it now. */
@@ -346,14 +358,27 @@ export interface OutlineDigestDetailResponse {
 	questions: OutlineDigestQuestionView[];
 	other: OutlineDigestOtherView[];
 	more: Record<OutlineDigestSection, number>;
+	names: OutlineDigestNames;
 }
 
 /** `POST /digests/now`: a "today so far" preview is being made (or one was made a moment ago). */
 export interface OutlineDigestNowResponse {
 	queued: boolean;
+	/** Not queued: asked again within the minute (`recent`), or too many asked (`queue_full`). */
+	reason: "recent" | "queue_full" | null;
 	/** The preview there is now (being replaced when `queued`). */
 	previewId: string | null;
 }
+
+/**
+ * Why `POST /digests/undo` refused (the response's `code`): 403 when the decision was not made in
+ * the caller's name, or they may not write its space; 409 when it was undone or changed since.
+ */
+export const OUTLINE_DIGEST_UNDO_CODES = {
+	notYours: "OUTLINE_DIGEST_UNDO_NOT_YOURS",
+	readOnly: "OUTLINE_DIGEST_UNDO_READ_ONLY",
+	gone: "OUTLINE_DIGEST_UNDO_GONE",
+} as const;
 
 /** `POST /digests/undo`: a decision made in the person's name, taken back by reverting it. */
 export interface OutlineDigestUndoResponse {
