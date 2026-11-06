@@ -36,11 +36,11 @@ function normalizeVersion(version: string | undefined): string | undefined {
  *   - `failed` means some narrator could not be restored (typically pinned to a provider prefix
  *     that no longer exists in settings).
  *
- * Neither makes the HTTP surface unusable. The server is explicit about this: `shouldServeRequests`
- * is unconditionally true so the frontend, auth and settings routes stay reachable, precisely
- * because those are what repair the state that made recovery fail. Blocking the reload here
- * inverted that policy — the new server was already up and serving while the user stayed pinned
- * to the old bundle by the very error the new UI is needed to fix.
+ * Neither makes the HTTP surface unusable: `/api/health` answers 200 even after a failed
+ * recovery, and the frontend, auth and settings routes stay reachable, precisely because those
+ * are what repair the state that made recovery fail. Blocking the reload here inverted that
+ * policy — the new server was already up and serving while the user stayed pinned to the old
+ * bundle by the very error the new UI is needed to fix.
  */
 export function isUpdatedServerReadyForReload(
 	health: ServerHealth | null,

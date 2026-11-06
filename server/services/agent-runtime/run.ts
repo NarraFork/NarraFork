@@ -90,6 +90,8 @@ export interface StartNarratorRunRequest {
 	resumeRunId?: string;
 	/** Recovery of a run that already executed: its attribution window is kept. */
 	recovered?: boolean;
+	/** A recovery explanation may settle active projections, never overwrite terminal ones. */
+	convergeOnlyActiveProjections?: boolean;
 	/** Recovery that must not deliver into a call that already has its result. */
 	deliver?: boolean;
 	/** The caller's own cancellation (the caller attempt of a foreground delegation). */
@@ -187,7 +189,7 @@ async function prepareLogicalRun(
 	// result delivers through a task row instead of rewriting that result.
 	const inherited = !(req.binding || req.resumeRunId || req.recovered);
 	if (!req.foreground && (deliverTo.viaTask || (inherited && (await settled(deliverTo)))))
-		await projectRunAsTask(narratorId, row, deliverTo, publicationRun, binding);
+		await projectRunAsTask(narratorId, row, deliverTo, publicationRun, binding, req.recovered);
 	return { binding: registered, publicationRun };
 }
 
@@ -212,6 +214,7 @@ async function projectRunAsTask(
 	deliverTo: RunDeliverTo,
 	publicationRun: PublicationRun,
 	binding: RunBindingInput,
+	recovered?: boolean,
 ): Promise<void> {
 	const [{ backgroundTaskService }, { registerAndPersistSubagentAlias }] = await Promise.all([
 		import("../background-task-service"),
@@ -219,6 +222,10 @@ async function projectRunAsTask(
 	]);
 	const task = await backgroundTaskService.getById(narratorId).catch(() => null);
 	if (task?.status === "running" && task.logicalRunId === publicationRun.logicalRunId) return;
+	// Recovery continues THIS run. Restarting its settled task row here would mint a
+	// new logical run before the recovered-run check, leaving the old result undelivered
+	// and the new row running forever. The terminal row already describes this run.
+	if (recovered && task && task.logicalRunId === publicationRun.logicalRunId) return;
 	// The id belongs to another caller's task: deliver to the tool call instead.
 	if (task && (task.type !== "agent" || task.parentNarratorId !== deliverTo.narratorId)) return;
 	const alias =
@@ -484,11 +491,17 @@ async function executeRun(
 				backgroundTaskService.registerAbortController(id, run.cancel);
 		}
 		if (req.recovered && publicationRun) {
-			const committed = await getRuntimePublicationService().readAgentTerminalResult(
-				publicationRun,
-				{ includeEventKind: true },
-			);
-			const checkpoint = !committed
+			// The publication slots, not the readability of the result, decide whether this
+			// run may execute again. A settled run NEVER runs the model a second time.
+			const publicationState =
+				await getRuntimePublicationService().readRunPublicationState(publicationRun);
+			const settled = publicationState.state === "settled";
+			const committed = settled
+				? await getRuntimePublicationService().readAgentTerminalResult(publicationRun, {
+						includeEventKind: true,
+					})
+				: null;
+			const checkpoint = !settled
 				? await db.query.narrators.findFirst({
 						where: and(eq(narrators.id, id), eq(narrators.logicalRunId, binding.logicalRunId)),
 						columns: {
@@ -539,7 +552,27 @@ async function executeRun(
 								}
 							: {}),
 					},
-					req,
+					settled ? { ...req, convergeOnlyActiveProjections: true } : req,
+				);
+			}
+			if (settled) {
+				// The terminal was already published but its snapshot is unreadable. Reuse the
+				// normal delivery path so task/narrator projections, legacy targets and PG
+				// composites all converge, but only projections that are still ACTIVE may be
+				// written; an existing terminal result is never replaced by this explanation.
+				finished = true;
+				allowInboxWake = true;
+				return await finishRun(
+					id,
+					run,
+					deliverTo,
+					publicationRun,
+					{
+						finalText:
+							"Recovered after restart: this run had already published its terminal result, but the stored result is no longer readable. The run was not executed again.",
+						committedEvent: publicationState.eventKind ?? "failed",
+					},
+					{ ...req, convergeOnlyActiveProjections: true },
 				);
 			}
 		}
@@ -813,12 +846,18 @@ async function finishRun(
 				await bindResultMessage(id, deliverTo);
 			} else {
 				const deliver = () =>
-					deliverDetachedResult(id, deliverTo, publicationRun, {
-						eventKind,
-						finalText: delivered,
-						hasError,
-						principal: run.principal ?? null,
-					});
+					deliverDetachedResult(
+						id,
+						deliverTo,
+						publicationRun,
+						{
+							eventKind,
+							finalText: delivered,
+							hasError,
+							principal: run.principal ?? null,
+						},
+						req.convergeOnlyActiveProjections,
+					);
 				// No caller can retry a background/detached source transaction. Retry
 				// transient locks here; a hold keeps its explicit release-retry contract.
 				if (hold) await deliver();
@@ -946,7 +985,6 @@ async function renderResult(
 	);
 }
 
-/** Terminal status of a run that delivers to a tool call, and its display frames. */
 async function settleStatus(
 	id: string,
 	deliverTo: RunDeliverTo | undefined,
@@ -1070,6 +1108,7 @@ async function deliverDetachedResult(
 		/** Execution principal the notice is attributed to. */
 		principal: string | null;
 	},
+	onlyIfActive = false,
 ): Promise<void> {
 	const { eventKind, finalText, hasError } = terminal;
 	const { recordTaskNoticeUser } = await import("../parent-injection-queue");
@@ -1095,62 +1134,76 @@ async function deliverDetachedResult(
 			return;
 		}
 	}
-	const { getSubagentResultMessageId, updateToolCallConclusion } = await session();
-	const reference = await resolveDeliveryTarget(id, deliverTo);
-	const summary = `[System] Agent ${id} ${publicationEvent(eventKind)}. Its run has ended.`;
-	const sqlite = getRuntimePublicationService().backend === "sqlite";
-	if (!sqlite) {
-		const output = await renderResult(id, deliverTo, publicationRun, finalText);
-		await getRuntimePublicationService().commitAgentTerminal({
-			run: publicationRun,
-			eventKind,
-			text: finalText,
-			summary,
-			toolConclusion: {
-				...reference,
-				toolUseId: deliverTo.toolUseId,
-				attempt: deliverTo.attempt,
-				output,
-				status: hasError ? "fail" : "success",
-				resultMessageId: await getSubagentResultMessageId(id),
-			},
-		});
-		broadcastToNarrator(deliverTo.narratorId, {
-			type: "subagent_conclusion_updated",
-			narratorId: deliverTo.narratorId,
-			subagentNarratorId: id,
+	try {
+		const { getSubagentResultMessageId, updateToolCallConclusion } = await session();
+		const reference = await resolveDeliveryTarget(id, deliverTo);
+		const summary = `[System] Agent ${id} ${publicationEvent(eventKind)}. Its run has ended.`;
+		const sqlite = getRuntimePublicationService().backend === "sqlite";
+		if (!sqlite) {
+			const output = await renderResult(id, deliverTo, publicationRun, finalText);
+			const committed = await getRuntimePublicationService().commitAgentTerminal({
+				run: publicationRun,
+				eventKind,
+				text: finalText,
+				summary,
+				toolConclusion: {
+					...reference,
+					toolUseId: deliverTo.toolUseId,
+					attempt: deliverTo.attempt,
+					output,
+					status: hasError ? "fail" : "success",
+					resultMessageId: await getSubagentResultMessageId(id),
+					onlyIfActive,
+				},
+			});
+			if (committed.toolConclusionApplied !== false)
+				broadcastToNarrator(deliverTo.narratorId, {
+					type: "subagent_conclusion_updated",
+					narratorId: deliverTo.narratorId,
+					subagentNarratorId: id,
+					toolUseId: deliverTo.toolUseId,
+					output,
+					hasError,
+				});
+			await backgroundTaskService.announcePersistedAgentTerminal(id, publicationRun.logicalRunId);
+			getRuntimePublicationService().schedule();
+			return;
+		}
+		await updateToolCallConclusion({
+			subagentId: id,
+			parentNarratorId: deliverTo.narratorId,
 			toolUseId: deliverTo.toolUseId,
-			output,
+			toolCallId: reference.toolCallId,
+			messageId: reference.messageId,
+			finalText,
 			hasError,
+			resultMessageId: await getSubagentResultMessageId(id),
+			refreshTiming: true,
+			onlyIfActive,
+			onPersist: (tx) => {
+				runtimePublication.commit(
+					{
+						...publicationRun,
+						eventKind,
+						resultRef: runtimePublication.persistResult(publicationRun, finalText, tx, eventKind),
+						summary,
+					},
+					tx,
+				);
+			},
 		});
 		await backgroundTaskService.announcePersistedAgentTerminal(id, publicationRun.logicalRunId);
 		getRuntimePublicationService().schedule();
-		return;
+	} catch (error) {
+		// A recovery explanation is best-effort for a receipt that may already be gone.
+		const validation =
+			error instanceof Error && "code" in error && error.code === "VALIDATION_ERROR";
+		if (onlyIfActive && validation) {
+			getRuntimePublicationService().schedule();
+			return;
+		}
+		throw error;
 	}
-	await updateToolCallConclusion({
-		subagentId: id,
-		parentNarratorId: deliverTo.narratorId,
-		toolUseId: deliverTo.toolUseId,
-		toolCallId: reference.toolCallId,
-		messageId: reference.messageId,
-		finalText,
-		hasError,
-		resultMessageId: await getSubagentResultMessageId(id),
-		refreshTiming: true,
-		onPersist: (tx) => {
-			runtimePublication.commit(
-				{
-					...publicationRun,
-					eventKind,
-					resultRef: runtimePublication.persistResult(publicationRun, finalText, tx, eventKind),
-					summary,
-				},
-				tx,
-			);
-		},
-	});
-	await backgroundTaskService.announcePersistedAgentTerminal(id, publicationRun.logicalRunId);
-	getRuntimePublicationService().schedule();
 }
 
 // === Control ===

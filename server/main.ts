@@ -71,13 +71,7 @@ import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
-import {
-	buildHealthPayload,
-	createStartupReadinessGate,
-	healthStatusCode,
-	shouldServeRequests,
-	shouldStartGatedBackgroundWork,
-} from "./lib/startup-readiness";
+import { buildHealthPayload, createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
 import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
 import { reissueBuiltinTlsOnStartup } from "./lib/tls";
@@ -814,7 +808,7 @@ function startServer(
 						database: { backend: activeDatabaseBackend },
 					}),
 					{
-						status: healthStatusCode(startupReadiness.state, healthResponse.status),
+						status: healthResponse.status,
 						headers,
 					},
 				);
@@ -827,16 +821,9 @@ function startServer(
 			if (narratorWsRefusal) return narratorWsRefusal;
 
 			// Wait for recovery to reach a terminal outcome so restored narrators observe a
-			// consistent state, but never turn a recovery failure into a dead server: the
-			// frontend, auth and settings routes are what the user needs to repair whatever
-			// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
+			// consistent state. A recovery failure is scoped to its narrator and never
+			// closes the HTTP surface: the UI is what repairs that narrator's state.
 			await startupReadiness.barrier;
-			if (!shouldServeRequests(startupReadiness.state)) {
-				return new Response("Startup narrator recovery failed", {
-					status: 503,
-					headers: { "Retry-After": "5" },
-				});
-			}
 
 			if (url.pathname === "/ws/external/v1/narrators") {
 				const rollout = getExternalWebSocketRolloutSettings();
@@ -1471,6 +1458,8 @@ withBackgroundOccupancyInitialization(
 				})
 				.catch(async (err) => {
 					const error = err instanceof Error ? err.message : String(err);
+					// The pass did not fully converge. Keep the diagnostic, but /api/health
+					// still answers 200 so this never disables unrelated UI features.
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
 					await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
@@ -1606,7 +1595,6 @@ void startupReadiness.barrier.then((recovery) => {
 			error: recovery.error,
 		});
 	}
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	startScheduledTaskScheduler();
 	// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
 	// must not keep update checkpoint scans or UI recovery cards looking "busy".
@@ -1624,7 +1612,6 @@ void startupReadiness.barrier.then((recovery) => {
 
 // Outline pages edited live when the previous process ended: commit what their logs hold.
 void startupReadiness.barrier.then((recovery) => {
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	import("./services/outline/live/registry")
 		.then(({ startLiveReplay }) => startLiveReplay())
 		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
@@ -1654,7 +1641,6 @@ void startupReadiness.barrier.then((recovery) => {
 			error: recovery.error,
 		});
 	}
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	gateway.start().catch((err) => {
 		logger.error("IM Gateway startup failed", { error: String(err) });
 	});
