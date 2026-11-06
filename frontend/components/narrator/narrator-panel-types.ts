@@ -255,9 +255,8 @@ export function resizeImageIfNeeded(file: File, maxEdge: number): Promise<File> 
 	});
 }
 
-export const MAX_TEXT_FILE_SIZE = 100 * 1024 * 1024; // 100MB
-
-export { formatFileSize, isTextFile } from "@shared/text-file-types";
+// Keep composer validation aligned with the server's attachment limit.
+export { formatFileSize, isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 
 export const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
 

@@ -1,5 +1,14 @@
 import { describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getFileReferenceSnapshots } from "@server/lib/agent/file-reference-projection";
+import {
+	findStagedAttachment,
+	setStagedAttachmentsDirForTests,
+	stageAttachment,
+	stagedAttachmentAsFile,
+} from "@server/lib/attachment-staging";
 import {
 	bindComposerDocumentReferences,
 	bindComposerMediaProjection,
@@ -32,6 +41,7 @@ import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { type Context, Hono } from "hono";
 
@@ -60,7 +70,9 @@ const routeCode = [
 	section("interface LocatedBufferedMessage", "/** Called under start admission"),
 ]
 	.join("\n")
-	.replaceAll("export async function", "async function");
+	.replaceAll("export async function", "async function")
+	.replaceAll("export function", "function")
+	.replaceAll("export interface", "interface");
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(routeCode);
 
 const reference: FileReference = {
@@ -141,6 +153,7 @@ function fixture(
 		userMessage: { id: "edited", contentJson: state.existing },
 	};
 	const edit = mock(async (..._args: unknown[]) => editResult);
+	const persistAdditional = mock(async (_mid: string, _files: File[], _reserved: string[]) => []);
 	const capture = async (
 		narratorId: string,
 		userId: string,
@@ -234,6 +247,9 @@ function fixture(
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 		MAX_MEDIA_ATTACHMENTS,
+		MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
+		findStagedAttachment,
+		stagedAttachmentAsFile,
 		MAX_NARRATOR_ATTACHMENT_BYTES: 128 * 1024 * 1024,
 		validateTextFile: () => {},
 		validateUploadedImage: () => {},
@@ -318,7 +334,10 @@ function fixture(
 		and: (...args: unknown[]) => args,
 		loadBufferedTextFiles: () => [],
 		deleteBufferedTextFile: () => {},
-		persistAdditionalBufferedTextFiles: async () => [],
+		persistAdditionalBufferedTextFiles: persistAdditional,
+		// The route drops staged originals after a successful queue edit; these
+		// fixtures never stage uploads, so a no-op keeps the code path reachable.
+		releaseStagedFiles: () => {},
 		getNarratorDraft: async () => ({
 			text: "",
 			fileReferences: [reference],
@@ -362,6 +381,7 @@ function fixture(
 		events,
 		send,
 		edit,
+		persistAdditional,
 		push,
 		update,
 		draftUpdate,
@@ -603,6 +623,49 @@ describe("HTTP file reference display boundaries", () => {
 		expect(await response.json()).toEqual({ ok: true });
 		expect(f.editResult.userMessage.contentJson).toEqual([snapshot()]);
 	});
+});
+
+describe("staged attachment edit ordering", () => {
+	for (const queued of [false, true]) {
+		test.each([
+			[0, "large body", "x", "large.log", "small.log"],
+			[1, "large body", "x", "large.log", "small.log"],
+			[0, "AAAA", "BBBB", "same.log", "same.log"],
+			[1, "AAAA", "BBBB", "same.log", "same.log"],
+		] as const)(`keeps original new-file index %s in ${queued ? "queue" : "history"} edits`, async (index, stagedBody, inlineBody, stagedName, inlineName) => {
+			const root = mkdtempSync(join(tmpdir(), "nf-route-stage-"));
+			setStagedAttachmentsDirForTests(root);
+			try {
+				const staged = await stageAttachment(new Blob([stagedBody]).stream(), {
+					narratorId: "session",
+					filename: stagedName,
+				});
+				const f = fixture();
+				if (queued) f.queue.push({ id: "queued", text: "before", fileReferences: [] });
+				const form = new FormData();
+				form.set(queued ? "text" : "content", "after");
+				form.set("skipRevert", "true");
+				form.set("fileReferences", "[]");
+				form.append("textFiles", new File([inlineBody], inlineName));
+				form.set("stagedAttachments", JSON.stringify([{ uploadId: staged.uploadId, index }]));
+				const response = await f.request(
+					queued ? "buffer/queued" : "edit-and-regenerate/message",
+					form,
+					queued ? "PATCH" : "POST",
+				);
+				expect(response.status).toBe(200);
+				const files = queued
+					? f.persistAdditional.mock.calls[0][1]
+					: (f.edit.mock.calls[0][5] as { newTextFiles: File[] }).newTextFiles;
+				expect(await Promise.all(files.map((file) => file.text()))).toEqual(
+					index === 0 ? [stagedBody, inlineBody] : [inlineBody, stagedBody],
+				);
+			} finally {
+				setStagedAttachmentsDirForTests(null);
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
 });
 
 describe("file reference edits", () => {

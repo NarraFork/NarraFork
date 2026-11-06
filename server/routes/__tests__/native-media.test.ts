@@ -14,6 +14,11 @@ import {
 } from "../../../frontend/components/narrator/interaction/queued-attachment-edit";
 import { AUDIO_MP4, wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
 import {
+	findStagedAttachment,
+	releaseStagedAttachment,
+	stagedAttachmentAsFile,
+} from "../../lib/attachment-staging";
+import {
 	bindComposerDocumentReferences,
 	bindComposerMediaProjection,
 	parseOptionalComposerDocument,
@@ -77,6 +82,12 @@ const common = {
 	MAX_EDIT_IMAGES_PER_MESSAGE: 20,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE: 20,
 	MAX_NARRATOR_ATTACHMENT_BYTES: 128 * 1024 * 1024,
+	// The sliced routes also merge streamed (staged) text files into the multipart
+	// set. These tests never stage uploads, but the merge still runs, so the real
+	// helpers (compiled from the same source below) are bound rather than stubs.
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES: 2 * 1024 * 1024 * 1024,
+	releaseStagedAttachment,
+	releaseStagedFiles: () => {},
 	parseFileReferenceInput,
 	bufferQueueModeSchema,
 	sendMessageSchema,
@@ -88,6 +99,29 @@ const common = {
 		throw new Error("unexpected text file");
 	},
 };
+// The staged-attachment helpers live in the same route file as the handlers
+// under test. Compile them from source the same way, rather than importing the
+// whole route module (which would initialize the database and services).
+const stagedHelpers = execute(
+	`${section(
+		source,
+		"export interface StagedAttachmentInput",
+		"/** Parse message request supporting",
+	)
+		.replaceAll("export function", "function")
+		.replaceAll("export interface", "interface")}
+return { parseStagedAttachmentInput, resolveStagedAttachments, attachmentBytesOf };`,
+	{
+		ValidationError,
+		MAX_EDIT_TEXT_FILES_PER_MESSAGE: common.MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+		findStagedAttachment,
+		stagedAttachmentAsFile,
+	},
+) as Record<
+	"parseStagedAttachmentInput" | "resolveStagedAttachments" | "attachmentBytesOf",
+	unknown
+>;
+Object.assign(common, stagedHelpers);
 function errors(app: Hono) {
 	app.onError((error, c) =>
 		c.json({ error: error.message }, error instanceof AppError ? (error.statusCode as 400) : 500),
