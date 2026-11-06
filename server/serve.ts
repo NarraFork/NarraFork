@@ -26,6 +26,7 @@ import type { StatusListenTarget } from "./lib/startup-status/protocol";
 import { formatStartupProblem, toStartupProblem } from "./lib/startup-status/startup-error";
 import { InstanceLockedError } from "./lib/startup-status/startup-problems";
 import { APP_VERSION } from "./lib/version";
+import { initWindowsChildJob } from "./lib/windows-child-job";
 
 type Settings = typeof import("./lib/settings").settings;
 
@@ -37,6 +38,9 @@ export async function serve(): Promise<void> {
 	let settings: Settings | undefined;
 	let statusPageListening = false;
 	try {
+		// Before anything below spawns a child: membership is inherited at CreateProcess time, so
+		// every child and grandchild born after this lands in the job (see windows-child-job).
+		initWindowsChildJob();
 		({ settings } = await import("./lib/settings"));
 		if (firstStart) statusPageListening = await showStatusPage(settings);
 		await import("./main");

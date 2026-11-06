@@ -84,6 +84,7 @@ import { reissueBuiltinTlsOnStartup } from "./lib/tls";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
+import { terminateWindowsChildren } from "./lib/windows-child-job";
 import {
 	findExcludingRange,
 	formatPortRanges,
@@ -621,6 +622,10 @@ function collectWindowsDescendantPids(rootPid: number): WindowsProcessInfo[] {
 
 function killOwnWindowsChildProcesses(): void {
 	if (!IS_WINDOWS) return;
+	// Job Object + taskkill on the tracked roots needs no wmic (absent on recent Windows) and
+	// covers grandchildren. The wmic walk stays as a backstop for anything never tracked; on
+	// machines without wmic it simply finds nothing.
+	terminateWindowsChildren();
 	const descendants = collectWindowsDescendantPids(process.pid).sort(
 		(a, b) => (b.depth ?? 0) - (a.depth ?? 0),
 	);
