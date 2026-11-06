@@ -492,6 +492,9 @@ export const agentTool: ToolDefinition = {
 			};
 		}
 
+		// What the call carries for its card (outline P2 PR 9b): the task, and the head of the note
+		// its result was delivered with, as data no projection of the text can cut.
+		let delivered: import("@shared/outline-report-note").OutlineReportNote | null = null;
 		try {
 			const result = await runSubagent({
 				parentNarratorId: ctx.narratorId,
@@ -513,13 +516,29 @@ export const agentTool: ToolDefinition = {
 				// The subagent acts on behalf of whoever triggered this parent turn:
 				// knowledge ACL and fast-mode "inherit" both resolve against them.
 				userId: ctx.userId ?? null,
-				...(delegation ? { delegation } : {}),
+				...(delegation
+					? {
+							delegation,
+							onDelegatedResult: (note) => {
+								delivered = note;
+							},
+						}
+					: {}),
 			});
 
 			// The runner already writes the alias into the `<subagent_id>` /
 			// `<background_task_id>` tag and registers it, so no string surgery is
 			// needed here. Conflicts are reported by the runner too.
-			return { output: result };
+			if (!delegation) return { output: result };
+			const { OUTLINE_DELEGATION_METADATA_KEY, outlineDelegationMetadata } = await import(
+				"@shared/outline-report-note"
+			);
+			return {
+				output: result,
+				metadata: {
+					[OUTLINE_DELEGATION_METADATA_KEY]: outlineDelegationMetadata(delegation, delivered),
+				},
+			};
 		} catch (err) {
 			// A delegation refused once the agent existed (the task changed hands) says so itself.
 			if (delegation && err instanceof Error && err.name === "OutlineDelegationError")

@@ -6098,6 +6098,35 @@ export const outlineViewState = sqliteTable(
 	],
 );
 
+// === outline_task_seen ===
+/**
+ * When a person saw, on the task board, a task they manage that an agent finished (outline P2
+ * PR 9b, owner decision D50 ④): the board marks such a task 「新完成」 until they have seen it.
+ * One row per person and task: `seen_seq` is the task's `version_seq` they saw finished (a later
+ * finish of it is new again). Personal UI state, never a commit; rows older than the board's
+ * window are pruned when the person's rows are written (`idx_outline_task_seen_user_at`).
+ */
+export const outlineTaskSeen = sqliteTable(
+	"outline_task_seen",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		taskBlockId: text("task_block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		seenSeq: integer("seen_seq").notNull(),
+		seenAt: text("seen_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.userId, table.taskBlockId] }),
+		// The FK's index: deleting a block (a purge) finds its rows.
+		index("idx_outline_task_seen_block").on(table.taskBlockId),
+		// A person's oldest rows first: the prune.
+		index("idx_outline_task_seen_user_at").on(table.userId, table.seenAt),
+	],
+);
+
 // === outline_digests ===
 /**
  * A person's reports (汇报, outline P2 PR 11; design §3.4): one row per person per day (`daily`,
