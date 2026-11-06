@@ -1027,15 +1027,43 @@ for (const host of HOSTS) {
 			await new Promise((r) => setTimeout(r, 100));
 			if (JSON.stringify(await rect9()) === before) break;
 		}
-		const p9 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T9"))) as never);
+		const r9 = await rect9();
+		const p9 = center(r9 as never);
 		const p5 = center((await a.call((f, x) => f.nodeRect(x as never), s.id("T5"))) as never);
+		/** Where the map and T9 are drawn (every T9 node, in case of more than one). */
+		const scene = () =>
+			a.page.evaluate(
+				(x: number, y: number, id: string) => {
+					const box = (e: Element | null | undefined) => {
+						const r = e?.getBoundingClientRect();
+						return r ? [r.left, r.top, r.width, r.height].map(Math.round) : null;
+					};
+					const el = document.elementFromPoint(x, y);
+					return {
+						hit: el ? `${el.tagName.toLowerCase()}.${String(el.className)}` : null,
+						nodes: [...document.querySelectorAll(`.mm-node[data-id="${id}"]`)].map((n) => ({
+							box: box(n),
+							cls: String(n.className),
+							hit: !!el && n.contains(el),
+						})),
+						stages: [...document.querySelectorAll(".mm-stage")].map((n) => box(n)),
+					};
+				},
+				p9[0],
+				p9[1],
+				s.id("T9"),
+			);
+		const atPress = { read: r9, at: p9.map(Math.round), map: await map(a), scene: await scene() };
 		const pressedAt = Date.now();
 		await touch("touchStart", [p9]);
 		// The press turns into a drag once the long-press timer fires (no move in between). Waits
-		// for it rather than a fixed delay; if it never comes, says what the finger landed on.
+		// for it rather than a fixed delay; if it never comes, says where everything was.
 		const dragged = await a.page
 			.waitForFunction(
-				(id) => document.querySelector(`.mm-node[data-id="${id}"]`)?.classList.contains("dragging"),
+				(id) =>
+					[...document.querySelectorAll(`.mm-node[data-id="${id}"]`)].some((n) =>
+						n.classList.contains("dragging"),
+					),
 				{ timeout: 3_000, polling: 25 },
 				s.id("T9"),
 			)
@@ -1046,26 +1074,7 @@ for (const host of HOSTS) {
 		const pressMs = Date.now() - pressedAt;
 		const pressed = dragged
 			? "dragging"
-			: await a.page.evaluate(
-					(x: number, y: number, id: string) => {
-						const el = document.elementFromPoint(x, y);
-						const node = document.querySelector(`.mm-node[data-id="${id}"]`);
-						const box = (e: Element | null | undefined) => {
-							const r = e?.getBoundingClientRect();
-							return r ? [r.left, r.top, r.width, r.height].map(Math.round) : null;
-						};
-						return {
-							hit: el ? `${el.tagName.toLowerCase()}.${String(el.className)}` : null,
-							inNode: !!(el && node?.contains(el)),
-							at: [Math.round(x), Math.round(y)],
-							node: box(node),
-							stage: box(document.querySelector(".mm-stage")),
-						};
-					},
-					p9[0],
-					p9[1],
-					s.id("T9"),
-				);
+			: { atPress, after: { map: await map(a), scene: await scene() } };
 		if (pressMs > 1_000)
 			console.log(`[${host}] long press: ${JSON.stringify(pressed)} after ${pressMs}ms`);
 		expect(pressed).toBe("dragging");
