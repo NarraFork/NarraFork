@@ -3,7 +3,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition } from "../types";
-import { describeReflectionOnlyTool } from "./reflection-description";
+import { describeReflectionOnlyTool, PLAN_REVIEW_TOOL_NAME } from "./reflection-description";
 
 export const EXIT_PLAN_CONFIRM_TOOL_NAME = "ExitPlanConfirm";
 export const EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME = "ExitPlanConfirmAndCompact";
@@ -12,6 +12,11 @@ export const EXIT_PLAN_REFLECTION_TOOLS = new Set([
 	EXIT_PLAN_CONFIRM_TOOL_NAME,
 	EXIT_PLAN_REVISE_TOOL_NAME,
 ]);
+/**
+ * The one tool of an outline plan's review (outline P2 PR 8b, D48 Q1): it leaves comments under
+ * the plan instead of sending it back. Spec sessions keep the three tools above.
+ */
+export { PLAN_REVIEW_TOOL_NAME };
 export const PLAN_REFLECTION_TYPE = "plan_reflection";
 
 export type PlanReflectionStatus =
@@ -25,7 +30,13 @@ export type PlanReflectionStatus =
 export type ExitPlanReflectionDecision =
 	| { action: "confirm"; reflection?: string }
 	| { action: "confirm_compact"; reflection?: string }
-	| { action: "revise"; feedback: string };
+	| { action: "revise"; feedback: string }
+	/**
+	 * An outline plan's review handed it to a person (PR 8b): it left comments (`input`: the
+	 * submission with them), or it could not finish. The call waits for a person like any
+	 * ExitPlanMode; nothing goes back to the agent.
+	 */
+	| { action: "human"; reason: string; input?: Record<string, unknown> };
 
 interface ExitPlanReflectionMeta {
 	narratorId: string;
@@ -340,6 +351,29 @@ export async function cancelExitPlanReflection(
 	);
 }
 
+/**
+ * Hand an outline plan's review over to a person (PR 8b; see {@link ExitPlanReflectionDecision}):
+ * persisted as waiting for the user (with `input`, the submission as it now is, when given), so a
+ * restart asks the person, not the reviewer. False when the gate was decided or taken over.
+ */
+export async function handOverExitPlanReflection(
+	requestId: string,
+	handover: { reason: string; input?: Record<string, unknown> },
+): Promise<boolean> {
+	const pending = pendingExitPlanReflections.get(requestId);
+	if (!pending || pending.resolved || pending.reflectionStoppedByUser) return false;
+	pending.resolved = true;
+	if (handover.input) pending.inputJson = handover.input;
+	await markExitPlanReflectionStatus(pending, "awaiting_user", handover.reason);
+	if (pendingExitPlanReflections.delete(requestId)) notifyHumanAttentionChanged();
+	pending.resolve({
+		action: "human",
+		reason: handover.reason,
+		...(handover.input ? { input: handover.input } : {}),
+	});
+	return true;
+}
+
 export async function takeOverExitPlanReflection(
 	requestId: string,
 	reason?: string,
@@ -488,6 +522,98 @@ export const exitPlanReviseTool: ToolDefinition = {
 			output: ok
 				? "ExitPlanMode reflection requested revision. The current plan will not be submitted yet."
 				: "The ExitPlanMode reflection was already resolved by another decision path.",
+			isError: !ok,
+		};
+	},
+};
+
+export const planReviewTool: ToolDefinition = {
+	name: PLAN_REVIEW_TOOL_NAME,
+	reflectionOnly: true,
+	description: describeReflectionOnlyTool(
+		"Give the verdict of a plan review of a plan in the outline (the plan an outline session's " +
+			"ExitPlanMode submitted). This is only for an active plan review, not the ordinary plan-mode " +
+			"turn: in the ordinary plan-mode turn, call ExitPlanMode to submit the plan; do not call this " +
+			'review tool. verdict "ok" with no comments: you have no concerns, and the plan is approved as ' +
+			'a draft on the user\'s behalf. verdict "concerns" with 1 to 20 comments: they are written under ' +
+			"the plan and the user decides with them in view; the plan is not sent back to the planner.",
+	),
+	parameters: z.object({
+		verdict: z
+			.enum(["ok", "concerns"])
+			.describe('"ok": no concerns (no comments). "concerns": 1 to 20 comments for the user.'),
+		comments: z
+			.array(
+				z.object({
+					target: z
+						.string()
+						.optional()
+						.describe(
+							"The short id of the block of the plan the comment is about (the root or a block under it); omit when it is about the plan as a whole.",
+						),
+					text: z.string().describe("One concern, short and concrete (at most 1000 characters)."),
+				}),
+			)
+			.optional()
+			.describe('The concerns, one per comment; none with verdict "ok".'),
+	}),
+	execute: async (args, ctx) => {
+		const requestId = getActiveExitPlanReflectionRequestId(ctx);
+		const pending = requestId ? pendingExitPlanReflections.get(requestId) : undefined;
+		if (!requestId || !pending) {
+			return { output: "No plan review is active for this reflection loop.", isError: true };
+		}
+		if (pending.resolved || pending.reflectionStoppedByUser) {
+			return {
+				output: "The plan review was already resolved by another decision path.",
+				isError: true,
+			};
+		}
+		const comments = Array.isArray(args.comments)
+			? (args.comments as Array<{ target?: unknown; text?: unknown }>).map((comment) => ({
+					target: typeof comment?.target === "string" ? comment.target : null,
+					text: typeof comment?.text === "string" ? comment.text : "",
+				}))
+			: [];
+		if (args.verdict === "ok") {
+			if (comments.length > 0) {
+				return {
+					output:
+						'verdict "ok" takes no comments. If any comment should reach the user, use verdict "concerns"; otherwise call PlanReview again with verdict "ok" and no comments.',
+					isError: true,
+				};
+			}
+			// No reason of its own: the notice's localized "confirmed" title says it all.
+			const ok = await confirmExitPlanReflection(requestId);
+			return {
+				output: ok
+					? "Plan review: no concerns. The plan is approved as a draft on the user's behalf."
+					: "The plan review was already resolved by another decision path.",
+				isError: !ok,
+			};
+		}
+		if (args.verdict !== "concerns") {
+			return { output: 'verdict must be "ok" or "concerns".', isError: true };
+		}
+		const { reviewOutlinePlan } = await import("@server/services/outline-plan-mode");
+		const reviewed = await reviewOutlinePlan({
+			narratorId: pending.narratorId,
+			requestId,
+			input: pending.inputJson,
+			comments,
+			userId: ctx.userId ?? null,
+			locale: ctx.locale === "zh-CN" ? "zh-CN" : "en",
+			toolCallId: pending.toolCallId ?? null,
+		});
+		if (!reviewed.ok) return { output: `PlanReview refused: ${reviewed.message}`, isError: true };
+		const ok = await handOverExitPlanReflection(requestId, {
+			reason: `Plan review left ${reviewed.review.count} comment(s) under the plan; awaiting user decision`,
+			input: reviewed.input,
+		});
+		return {
+			output: ok
+				? `Plan review: ${reviewed.review.count} comment(s) written under the plan (${reviewed.review.address}). The user decides with them in view.`
+				: "The plan review was already resolved by another decision path.",
 			isError: !ok,
 		};
 	},

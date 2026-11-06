@@ -9,6 +9,7 @@ import {
 	mediaRefToContentBlock,
 	type NativeMediaInput,
 } from "@shared/media-attachments";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -128,10 +129,13 @@ import {
 	EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
+	handOverExitPlanReflection,
 	isExitPlanReflectionWaitingForUser,
 	markExitPlanReflectionStarted,
+	PLAN_REVIEW_TOOL_NAME,
 } from "./tools/exit-plan-reflection";
 import { isOutlineTool } from "./tools/outline-names";
+import { isPlanReviewLoop } from "./tools/reflection-description";
 import {
 	broadcastTaskReflectionProgress,
 	cleanupTaskReflection,
@@ -989,9 +993,16 @@ export function shouldAllowExitPlanReflectionAutoCompact(
 	return config.planReflectionAllowAutoCompact ?? settings.agent.planReflectionAllowAutoCompact;
 }
 
+/**
+ * The decision tools of a plan reflection. An outline plan's review has one, PlanReview (outline
+ * P2 PR 8b): it leaves comments under the plan instead of sending it back, and never resets the
+ * context. A spec session's keep the three ExitPlan* tools.
+ */
 export function getExitPlanReflectionAllowedTools(
 	config: Partial<ExitPlanReflectionAutoCompactConfig> = {},
+	outline = false,
 ): string[] {
+	if (outline) return [PLAN_REVIEW_TOOL_NAME];
 	const allowedTools = [...EXIT_PLAN_REFLECTION_TOOLS];
 	if (shouldAllowExitPlanReflectionAutoCompact(config)) {
 		allowedTools.push(EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME);
@@ -1306,6 +1317,12 @@ const requestToolSnapshots = new WeakMap<
 
 function buildReflectionCorrectionPrompt(config: AgentConfig): string {
 	const tools = config.reflectionLoop?.allowedTools.join(", ") ?? "";
+	// An outline plan's review (PR 8b): its comments go to the user, nothing back to the planner.
+	if (isPlanReviewLoop(config.reflectionLoop?.allowedTools ?? [])) {
+		return config.locale === "zh-CN"
+			? "审查还没有形成有效结论。你最多有两轮；如仍有下一轮，请根据工具结果改正参数，再调用一次 PlanReview。不要执行原操作，也不要直接修改文件或大纲。"
+			: "The review has not produced a valid verdict. You have at most two responses; if another remains, correct the arguments using the tool result and call PlanReview once. Do not execute the original operation or edit files or the outline.";
+	}
 	const strict = config.reflectionLoop?.context.purpose === "permissionRuleRequest";
 	const budget = strict ? "一轮" : "两轮";
 	return config.locale === "zh-CN"
@@ -1580,15 +1597,17 @@ async function runExitPlanModeReflectionLoop(
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
 	reflectionAbort: AbortController,
+	/** An outline plan's review prompt (PR 8b): its tool is PlanReview. */
+	outlinePrompt: string | null = null,
 ): Promise<ReflectionLoopObservation> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
 	return runReflectionLoop({
 		parentConfig,
 		rows,
-		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
+		prompt: outlinePrompt ?? buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
 		onProgress: (snapshot) => void broadcastPlanReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
-			allowedTools: getExitPlanReflectionAllowedTools(parentConfig),
+			allowedTools: getExitPlanReflectionAllowedTools(parentConfig, outlinePrompt !== null),
 			context: {
 				kind: "exitPlanMode",
 				requestId,
@@ -1842,6 +1861,10 @@ export async function resolveDangerReflectionDecision(
 
 interface ExitPlanReflectionGateResult {
 	checkFailed?: boolean;
+	/**
+	 * `human` (an outline plan's review, PR 8b): the plan goes to a person, as with `manual`, but
+	 * with the person told as for any plan waiting for them (they are not already watching).
+	 */
 	decision: ExitPlanReflectionDecision | { action: "manual"; reason?: string };
 	input: Record<string, unknown>;
 }
@@ -1902,6 +1925,48 @@ export async function resolveExitPlanModeReflection(
 	const requestId =
 		restoredReflection?.requestId ??
 		`exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	// An outline plan (outline P2 PR 8b, D48 Q1) is reviewed, not revised: PlanReview leaves its
+	// concerns under the plan and hands it to a person; no concerns approves it as before.
+	const outlinePlan = outlinePlanSubmissionOf(resolvedInput.input) !== null;
+	const outlinePlanMode = outlinePlan ? await import("@server/services/outline-plan-mode") : null;
+	if (outlinePlanMode && restoredReflection?.requestId) {
+		// Restored after its comments were written: a person decides on them; no second review.
+		const recovered = await outlinePlanMode.recoverOutlinePlanReview({
+			narratorId: config.narratorId,
+			requestId,
+			input: resolvedInput.input,
+			locale,
+		});
+		if (recovered) {
+			const restoredGate = createExitPlanReflectionDecision(requestId, {
+				narratorId: config.narratorId,
+				broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+				parentToolUseId: config.parentToolUseId,
+				toolUseId: toolUse.toolUseId,
+				toolName: toolUse.name,
+				inputJson: recovered.input,
+				toolCallId: recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+				restoredStartedAt: restoredReflection.startedAt,
+			});
+			const reason = `Plan review left ${recovered.review.count} comment(s) under the plan; awaiting user decision`;
+			const handed = await handOverExitPlanReflection(requestId, {
+				reason,
+				input: recovered.input,
+			});
+			const decision = handed
+				? await restoredGate
+				: { action: "human" as const, reason, input: recovered.input };
+			cleanupExitPlanReflection(requestId);
+			return { decision, input: recovered.input };
+		}
+	}
+	const outlinePrompt = outlinePlanMode
+		? await outlinePlanMode.outlinePlanReviewPrompt({
+				requestId,
+				input: resolvedInput.input,
+				locale,
+			})
+		: null;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -1930,6 +1995,7 @@ export async function resolveExitPlanModeReflection(
 		toolUse,
 		resolvedInput.input,
 		reflectionAbort,
+		outlinePrompt,
 	).finally(() => {
 		reflectionDone = true;
 	});
@@ -1951,6 +2017,17 @@ export async function resolveExitPlanModeReflection(
 					typeof outcome === "string"
 						? `the reflection loop crashed before producing a decision: ${outcome}`
 						: outcome.failureSummary;
+				// An outline plan's review that could not finish hands the plan to a person (PR 8b):
+				// a review never holds a plan back.
+				if (outlinePlan) {
+					const reason = `Plan review could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
+					if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+					const settled = await Promise.race<ExitPlanReflectionDecision | null>([
+						decisionPromise,
+						Promise.resolve(null),
+					]);
+					return settled ?? { action: "human" as const, reason };
+				}
 				const fallbackMessage = buildReflectionFallbackMessage(
 					"ExitPlanMode reflection",
 					failureSummary,
@@ -1982,6 +2059,18 @@ export async function resolveExitPlanModeReflection(
 	}
 	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupExitPlanReflection(requestId);
+	if (outlinePlanMode && decision.action === "manual") {
+		// Taken over just as the review wrote its comments: the person decides with them.
+		const written = await outlinePlanMode
+			.recoverOutlinePlanReview({
+				narratorId: config.narratorId,
+				requestId,
+				input: resolvedInput.input,
+				locale,
+			})
+			.catch(() => null);
+		if (written) return { decision, input: written.input };
+	}
 	return {
 		decision,
 		input: resolvedInput.input,
@@ -2584,6 +2673,12 @@ async function executeToolAfterReflections(
 				// normal ExitPlanMode approval. They are already driving this, so the
 				// fallback permission request must not raise a user-facing notification.
 				return executeAfterPreAdmission({ suppressAttention: true });
+			}
+			if (reflected.decision.action === "human") {
+				// An outline plan's review left its comments under the plan, or could not finish
+				// (PR 8b): the plan waits for a person like any ExitPlanMode, told as usual.
+				tu.input = reflected.decision.input ?? reflected.input;
+				return executeAfterPreAdmission();
 			}
 			if (
 				reflected.decision.action !== "confirm" &&

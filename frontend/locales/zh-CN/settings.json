@@ -1074,7 +1074,7 @@
 	"planModeAllowInlinePlan": "允许内联计划",
 	"planModeAllowInlinePlanDesc": "允许计划模式通过 ExitPlanMode 的 plan 参数内联提交计划。关闭后仅支持 plan 文件形式：ExitPlanMode 的工具 schema、描述与计划模式系统提示会同步移除内联选项，计划内容只从指定的 plan 文件读取。",
 	"planReflectionAutoApprove": "全局默认自动批准计划",
-	"planReflectionAutoApproveDesc": "所有继承全局的会话，在 ExitPlanMode 计划反思确认后会跳过人工审批。",
+	"planReflectionAutoApproveDesc": "所有继承全局的会话，在 ExitPlanMode 计划反思确认后会跳过人工审批。大纲会话里，审查有疑问时把意见留在计划下面，计划改为等人工审批。",
 	"planReflectionAllowAutoCompact": "允许计划反思重置上下文",
 	"planReflectionAllowAutoCompactDesc": "自动批准计划时，允许计划反思选择“批准并重置上下文”，将计划写入 Conversation Context 后再开始执行。默认关闭。",
 	"questionReflectionEnabled": "全局默认启用问题反思回答",

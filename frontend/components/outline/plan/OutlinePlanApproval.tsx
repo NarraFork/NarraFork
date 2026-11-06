@@ -8,6 +8,10 @@
  * Decisions go to `POST /narrators/permissions/:id/plan`, which writes the outline before it
  * resolves the request: a plan someone else changed since the version on screen is refused (409)
  * and the diff opens again; the request disappears through the usual `permission_resolved`.
+ *
+ * A plan review's comments (PR 8b, `_planReview`) lead the summary line (「审查意见 N 条」, in
+ * the same line: the card's height is unchanged) and the diff, which leaves them out of the
+ * changes and shows them above.
  */
 
 import {
@@ -91,12 +95,14 @@ export function OutlinePlanApproval({
 	const narratorId = permission.ownerNarratorId ?? "";
 	const delegates = useDelegateOptions(narratorId, lockOpen && !readOnly);
 	const root = submission?.root;
+	const review = submission?.review ?? null;
 	const diff = useOutlinePlanDiff(
 		{
 			spaceId: root?.spaceId ?? "",
 			pageId: root?.pageId ?? "",
 			blockId: root?.blockId ?? "",
 			from: submission?.baseSeq ?? 0,
+			skip: review?.blockId ?? null,
 		},
 		diffOpen && !!root,
 	);
@@ -153,14 +159,13 @@ export function OutlinePlanApproval({
 		}
 	};
 
-	const openInOutline = () => {
-		const target = { spaceId: root.spaceId, blockId: root.blockId, pageId: root.pageId };
+	const openBlock = (blockId: string) => {
+		const target = { spaceId: root.spaceId, blockId, pageId: root.pageId };
 		if (opener?.open(target, { newPanel: false })) return;
-		window.open(
-			outlineTargetHref({ kind: "block", spaceId: root.spaceId, blockId: root.blockId }),
-			"_blank",
-		);
+		window.open(outlineTargetHref({ kind: "block", spaceId: root.spaceId, blockId }), "_blank");
 	};
+	const openInOutline = () => openBlock(root.blockId);
+	const reviewCount = review?.count ?? 0;
 
 	// The three decisions only, "Return" last: the keyboard's default with feedback typed.
 	const buttons: PermButton[] = readOnly
@@ -227,6 +232,14 @@ export function OutlinePlanApproval({
 					style={{ flex: 1, minWidth: 0 }}
 					data-testid="outline-plan-summary"
 				>
+					{reviewCount > 0 && (
+						<>
+							<Text span inherit c="orange" fw={600} data-testid="outline-plan-review-count">
+								{t("outlinePlan.reviewCount", { count: reviewCount })}
+							</Text>
+							{" · "}
+						</>
+					)}
 					{submission.baseSeq === 0
 						? t("outlinePlan.summaryFirst", { version: root.round, added: counts.added })
 						: t("outlinePlan.summary", {
@@ -298,6 +311,8 @@ export function OutlinePlanApproval({
 				diff={diff.data}
 				loading={diff.isLoading}
 				error={diff.error}
+				review={review}
+				onOpenReview={review ? () => openBlock(review.blockId) : undefined}
 				footer={
 					<Stack gap="xs">
 						{error && (

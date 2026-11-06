@@ -419,6 +419,20 @@ describe("measureInlinePermission — an outline plan's approval (outline P2 PR 
 				{ innerWidth: 600, canDecide: true },
 			)?.outlinePlanSummaryRows,
 		).toBeUndefined();
+		// A plan review's comments (PR 8b) lead the first summary line: no row is added.
+		const review = {
+			blockId: "rv",
+			address: "sess/RvRvRvRv",
+			round: 1,
+			count: 2,
+			comments: [{ text: "A concern", target: null }],
+		};
+		expect(
+			predictInlinePermission(
+				{ ...base, inputJson: { ...base.inputJson, _planReview: review } },
+				{ innerWidth: 600, canDecide: true },
+			),
+		).toEqual(predictInlinePermission(base, { innerWidth: 600, canDecide: true }));
 	});
 
 	it("wraps the three decisions at phone width (review round 1 U1)", async () => {

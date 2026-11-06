@@ -1,9 +1,14 @@
 /**
  * Reading the outline plan an ExitPlanMode input carries (outline P2 PR 8): the server writes
- * `_planRoot`, `_planSeq`, `_planBaseSeq`, `_planDiff` and `_planSummary` when it resolves the
- * call of an outline session; the approval card and the inbox read them back. Pure.
+ * `_planRoot`, `_planSeq`, `_planBaseSeq`, `_planDiff`, `_planSummary` and, when a plan review
+ * left comments (PR 8b), `_planReview` when it resolves the call of an outline session; the
+ * approval card and the inbox read them back. Pure.
  */
-import type { OutlinePlanSubmission } from "./outline-api";
+import type {
+	OutlinePlanReview,
+	OutlinePlanReviewComment,
+	OutlinePlanSubmission,
+} from "./outline-api";
 
 /** Keys an outline submission adds to the ExitPlanMode input. */
 export const OUTLINE_PLAN_SUBMISSION_KEYS = [
@@ -12,7 +17,50 @@ export const OUTLINE_PLAN_SUBMISSION_KEYS = [
 	"_planBaseSeq",
 	"_planDiff",
 	"_planSummary",
+	"_planReview",
 ] as const;
+
+/** Comments of a review an input may carry (the server writes at most this many). */
+const MAX_REVIEW_COMMENTS = 50;
+
+/** The review an ExitPlanMode input carries (`_planReview`), if a well-formed one. */
+function reviewOf(value: unknown): OutlinePlanReview | null {
+	const review = value as Partial<OutlinePlanReview> | null | undefined;
+	if (
+		!review ||
+		typeof review !== "object" ||
+		typeof review.blockId !== "string" ||
+		typeof review.address !== "string" ||
+		typeof review.round !== "number" ||
+		typeof review.count !== "number" ||
+		!Number.isFinite(review.count)
+	)
+		return null;
+	const comments: OutlinePlanReviewComment[] = [];
+	for (const entry of Array.isArray(review.comments) ? review.comments : []) {
+		if (comments.length >= MAX_REVIEW_COMMENTS) break;
+		const comment = entry as Partial<OutlinePlanReviewComment> | null;
+		if (!comment || typeof comment.text !== "string") continue;
+		const target = comment.target as Partial<NonNullable<OutlinePlanReviewComment["target"]>>;
+		comments.push({
+			text: comment.text,
+			target:
+				target && typeof target.address === "string"
+					? {
+							address: target.address,
+							title: typeof target.title === "string" ? target.title : target.address,
+						}
+					: null,
+		});
+	}
+	return {
+		blockId: review.blockId,
+		address: review.address,
+		round: review.round,
+		count: Math.max(0, Math.floor(review.count)),
+		comments,
+	};
+}
 
 /** The submission an ExitPlanMode input carries, if it is an outline plan's. */
 export function outlinePlanSubmissionOf(
@@ -55,5 +103,6 @@ export function outlinePlanSubmissionOf(
 		},
 		truncated: diff.truncated === true,
 		summary: typeof input?._planSummary === "string" ? input._planSummary : null,
+		review: reviewOf(input?._planReview),
 	};
 }

@@ -652,10 +652,35 @@ export interface OutlinePlanDiffResponse {
 	truncated: boolean;
 }
 
+/** One comment of a plan review (outline P2 PR 8b): a child block of the review's block. */
+export interface OutlinePlanReviewComment {
+	/** The comment's text, without the link to its target. */
+	text: string;
+	/** The block of the plan it is about, when it names one. */
+	target: { address: string; title: string } | null;
+}
+
+/**
+ * A plan review's comments (outline P2 PR 8b, D48 Q1): one block 「审查意见（第 N 版）」 under the
+ * plan root, each comment a child of it. The person decides with them in view; nothing goes back
+ * to the planning agent until they decide.
+ */
+export interface OutlinePlanReview {
+	/** The review's block under the plan root, and its address. */
+	blockId: string;
+	address: string;
+	/** The version reviewed. */
+	round: number;
+	/** How many comments it holds (as written). */
+	count: number;
+	/** The comments as written, at most `OUTLINE_PLAN_LIMITS.reviewComments`. */
+	comments: OutlinePlanReviewComment[];
+}
+
 /**
  * What a pending ExitPlanMode of an outline session carries in its input (`_planRoot`,
- * `_planSeq`, `_planBaseSeq`, `_planDiff`): enough for the approval card to show its summary and
- * fetch the diff.
+ * `_planSeq`, `_planBaseSeq`, `_planDiff`, `_planReview`): enough for the approval card to show
+ * its summary and fetch the diff.
  */
 export interface OutlinePlanSubmission {
 	root: {
@@ -675,6 +700,8 @@ export interface OutlinePlanSubmission {
 	truncated: boolean;
 	/** What the agent said changed in this version. */
 	summary: string | null;
+	/** The plan review's comments on this version, when a review left any (PR 8b). */
+	review: OutlinePlanReview | null;
 }
 
 /** `POST /narrators/permissions/:requestId/plan`: the person's decision on a submitted plan. */

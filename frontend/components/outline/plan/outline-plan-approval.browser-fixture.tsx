@@ -131,6 +131,20 @@ export function blur(): void {
 	(document.activeElement as HTMLElement | null)?.blur();
 }
 
+/** How many lines the element paints (its height over its line height). */
+export function lines(selector: string): number {
+	const el = q(selector);
+	if (!el) return 0;
+	return Math.round(
+		el.getBoundingClientRect().height / Number.parseFloat(getComputedStyle(el).lineHeight),
+	);
+}
+
+/** The texts of every element `selector` matches, in order. */
+export function texts(selector: string): string[] {
+	return [...document.querySelectorAll(selector)].map((e) => e.textContent ?? "");
+}
+
 /** The texts of the diff's entries, in order. */
 export function entries(): string[] {
 	return [...document.querySelectorAll("[data-testid=outline-plan-diff-entry]")].map(

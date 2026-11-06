@@ -22,13 +22,33 @@
  *      The pass then restarts with {@link startApprovedOutlinePlan}: the root and its first step
  *      that can start are started for the session, and the message names that step.
  *
- * Plan review (plan reflection) is unchanged in this PR: it reviews the rendered plan and, when it
- * confirms, approves it (step 5 records that as a draft on the person's behalf, never a lock);
- * when it asks for a revision the plan goes back to the agent as before. Turning its findings into
- * comments under the plan is plan PR 8b.
+ * PLAN REVIEW (计划反思; PR 8b, D48 Q1)
+ * -----------------------------------
+ * When the session runs plan review (the switch and its conditions are as for a spec session),
+ * the review sees the plan as submitted, each block with its short id, and has one tool,
+ * `PlanReview({ verdict, comments })`:
+ *
+ *   - `ok`: no concerns. The plan is approved as before (step 5 records it as a draft on the
+ *     person's behalf, `approvedBy: system:plan-review`, never locked, not the person's work).
+ *   - `concerns`: {@link reviewOutlinePlan} writes the comments under the root (`plans.ts`), and
+ *     the call waits for a person like any ExitPlanMode: nothing goes back to the agent. The
+ *     submission carries the review (`_planReview`, taken only as the outline proves it: a block
+ *     the plan-review actor wrote under the root for this session and version): the card counts
+ *     it, the diff shows it on its own (left out of the changes), and the agent is told of it
+ *     once the person decides.
+ *   - a review that could not finish hands the plan to a person too, without comments.
+ *
+ * The review's block id is derived from the review's request id and the version, so a review
+ * restored after a restart finds the comments it wrote ({@link recoverOutlinePlanReview}) instead
+ * of reviewing again. A taken-over review (`stop-plan-reflection`) is the person's as before.
  */
 
-import type { OutlinePlanDecisionRequest, OutlinePlanSubmission } from "@shared/outline-api";
+import { createHash } from "node:crypto";
+import type {
+	OutlinePlanDecisionRequest,
+	OutlinePlanReview,
+	OutlinePlanSubmission,
+} from "@shared/outline-api";
 import {
 	OUTLINE_PLAN_SUBMISSION_KEYS,
 	outlinePlanSubmissionOf,
@@ -43,23 +63,35 @@ import {
 	getOutlinePlanApprovedPrompt,
 	getOutlinePlanEnterOutput,
 	getOutlinePlanReturnedMessage,
+	getOutlinePlanReviewPrompt,
 	type Locale,
 } from "../lib/prompt-i18n";
 import { canWriteSpace, narratorUsersWith, type OutlinePrincipal } from "./outline/access";
 import { readNarrator } from "./outline/access-reads";
 import { isOutlineEnabled } from "./outline/feature";
-import { planDiffIsEmpty, planDiffLines, readPlanDiff } from "./outline/plan-diff";
+import {
+	OUTLINE_PLAN_LIMITS,
+	planDiffIsEmpty,
+	planDiffLines,
+	readPlanDiff,
+} from "./outline/plan-diff";
 import {
 	decideOutlinePlan,
 	discardEmptyPlanRoot,
 	ensurePlanRoot,
 	findPlanningRoot,
 	OUTLINE_PLAN_ACTOR,
+	OUTLINE_PLAN_REVIEW_ACTOR,
 	OutlinePlanError,
+	type OutlinePlanReviewOf,
 	type OutlinePlanRoot,
+	type PlanReviewCommentInput,
 	planSubmitProblemText,
+	readPlanReview,
 	readPlanSubmission,
+	renderPlanForReview,
 	undoOutlinePlanDecision,
+	writePlanReview,
 } from "./outline/plans";
 import { outlineStore } from "./outline/store";
 import { readTaskSession } from "./task-source/backend";
@@ -241,6 +273,18 @@ export async function resolveOutlineExitPlanInput(
 		summary,
 		...rest
 	} = input;
+	// The agent's summary of the version, from its argument, or kept from an input resolved before
+	// (a call resolved again: a taken-over or reviewed plan's permission). Display text only.
+	const summaryText =
+		typeof summary === "string"
+			? summary
+			: typeof input._planSummary === "string"
+				? input._planSummary
+				: null;
+	// The review the call names (PR 8b): taken only as the outline proves it (`readPlanSubmission`
+	// checks it is the plan-review actor's, for this session and version), so a model's own keys
+	// cannot make one up.
+	const review = reviewOfInput(input);
 	const stripped = withoutOutlinePlanKeys(rest);
 	if (legacyMode) {
 		return {
@@ -255,7 +299,8 @@ export async function resolveOutlineExitPlanInput(
 	const read = await readPlanSubmission({
 		session: narratorId,
 		rootRef,
-		summary: typeof summary === "string" ? summary : null,
+		summary: summaryText,
+		review,
 	});
 	if (!read.ok) {
 		return { ok: false, input: stripped, message: planSubmitProblemText(locale, read.problem) };
@@ -272,8 +317,154 @@ export async function resolveOutlineExitPlanInput(
 			_planBaseSeq: s.baseSeq,
 			_planDiff: { counts: s.counts, truncated: s.truncated },
 			...(s.summary ? { _planSummary: s.summary } : {}),
+			...(s.review ? { _planReview: s.review } : {}),
 		},
 	};
+}
+
+// ─── Plan review (PR 8b) ───
+
+/** The review an input names, with the root it is about (not yet checked against the outline). */
+function reviewOfInput(input: Record<string, unknown>): OutlinePlanReviewOf | null {
+	const submission = outlinePlanSubmissionOf(input);
+	return submission?.review ? { rootId: submission.root.blockId, review: submission.review } : null;
+}
+
+/**
+ * The id of the block a review writes its comments under: derived from the review's request id
+ * (kept across a restart) and the version, so a review restored finds what it wrote.
+ */
+export function planReviewBlockId(requestId: string, round: number): string {
+	return `plrv${createHash("sha256").update(`${requestId}\n${round}`).digest("hex").slice(0, 28)}`;
+}
+
+/**
+ * The submission resolved again with its review attached (the plan as it is now, the comments
+ * under it and left out of the diff), as every later resolution of the call will see it.
+ */
+async function withReview(
+	narratorId: string,
+	input: Record<string, unknown>,
+	locale: Locale,
+	review: OutlinePlanReview,
+): Promise<Record<string, unknown>> {
+	const named = { ...input, _planReview: review };
+	const again = await resolveOutlineExitPlanInput(narratorId, named, locale).catch(() => null);
+	return again?.ok ? again.input : named;
+}
+
+export type OutlinePlanReviewResult =
+	| { ok: true; review: OutlinePlanReview; input: Record<string, unknown> }
+	| { ok: false; message: string };
+
+/**
+ * A review's concerns on the outline plan a waiting ExitPlanMode submitted (`input`, as resolved):
+ * written under the plan root (`writePlanReview`), and the submission resolved again with them
+ * (`_planReview`; the plan as it is now, its comments under it). `ok: false`: refused, the message
+ * for the reviewer (out of bounds, a target outside the plan, the plan decided meanwhile).
+ */
+export async function reviewOutlinePlan(args: {
+	narratorId: string;
+	requestId: string;
+	input: Record<string, unknown>;
+	comments: readonly PlanReviewCommentInput[];
+	/** The person the turn runs for: the commit's responsible person. */
+	userId: string | null;
+	locale: Locale;
+	toolCallId?: string | null;
+}): Promise<OutlinePlanReviewResult> {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission || !(await isOutlinePlanSession(args.narratorId)))
+		return {
+			ok: false,
+			message: "This review is not of a plan in the outline; PlanReview does not apply.",
+		};
+	let review: OutlinePlanReview;
+	try {
+		review = await writePlanReview({
+			session: args.narratorId,
+			rootId: submission.root.blockId,
+			round: submission.root.round,
+			blockId: planReviewBlockId(args.requestId, submission.root.round),
+			comments: args.comments,
+			userId: args.userId,
+			locale: args.locale,
+			toolCallId: args.toolCallId ?? null,
+		});
+	} catch (error) {
+		if (error instanceof OutlinePlanError) return { ok: false, message: error.message };
+		throw error;
+	}
+	return {
+		ok: true,
+		review,
+		input: await withReview(args.narratorId, args.input, args.locale, review),
+	};
+}
+
+/**
+ * A review restored after a restart that had written its comments already (they are under the
+ * plan as the block {@link planReviewBlockId} names): the submission with them, for a person to
+ * decide on. Null when it had not (the review runs again).
+ */
+export async function recoverOutlinePlanReview(args: {
+	narratorId: string;
+	requestId: string;
+	input: Record<string, unknown>;
+	locale: Locale;
+}): Promise<{ review: OutlinePlanReview; input: Record<string, unknown> } | null> {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission) return null;
+	const review = await readPlanReview({
+		session: args.narratorId,
+		rootId: submission.root.blockId,
+		blockId: planReviewBlockId(args.requestId, submission.root.round),
+		round: submission.root.round,
+	}).catch(() => null);
+	if (!review) return null;
+	return { review, input: await withReview(args.narratorId, args.input, args.locale, review) };
+}
+
+/**
+ * The prompt of an outline plan's review: the plan as submitted (as of its seq), each block with
+ * its short id. Null when the input is not an outline submission.
+ */
+export async function outlinePlanReviewPrompt(args: {
+	requestId: string;
+	input: Record<string, unknown>;
+	locale: Locale;
+}): Promise<string | null> {
+	const submission = outlinePlanSubmissionOf(args.input);
+	if (!submission) return null;
+	const labelled = await renderPlanForReview({
+		rootId: submission.root.blockId,
+		seq: submission.seq,
+	}).catch((error) => {
+		logger.warn("Outline plan could not be rendered for its review", {
+			root: submission.root.address,
+			error: String(error),
+		});
+		return null;
+	});
+	return getOutlinePlanReviewPrompt(args.locale, {
+		requestId: args.requestId,
+		address: submission.root.address,
+		version: submission.root.round,
+		summary: submission.summary,
+		plan: labelled ?? (typeof args.input.plan === "string" ? args.input.plan : ""),
+		limits: {
+			comments: OUTLINE_PLAN_LIMITS.reviewComments,
+			chars: OUTLINE_PLAN_LIMITS.reviewCommentChars,
+		},
+	});
+}
+
+/** A review as the agent's prompts name it (count and address), when it left comments. */
+function reviewForPrompt(
+	submission: OutlinePlanSubmission,
+): { count: number; address: string } | null {
+	const review = submission.review;
+	return review && review.count > 0 ? { count: review.count, address: review.address } : null;
 }
 
 /** A person's decision made on the card, kept until the approved pass restarts. */
@@ -424,6 +615,7 @@ export async function decideOutlinePlanRequest(args: {
 				noteAddress: decision.noteAddress,
 				rootAddress: decision.root.address,
 				edits,
+				review: reviewForPrompt(submission),
 			}),
 		});
 		if (!resolved) await undo();
@@ -550,10 +742,12 @@ export async function settleApprovedOutlinePlan(args: {
 }): Promise<ApprovedOutlinePlan | null> {
 	// Only an outline session's call (review round 1 S6): a model cannot divert another's.
 	if (!(await isOutlinePlanSession(args.narratorId))) return null;
-	const submission = args.input
+	const submitted = args.input
 		? outlinePlanSubmissionOf(args.input)
 		: await submittedPlanOf(args.narratorId, args.toolUseId).catch(() => null);
-	if (!submission) return null;
+	if (!submitted) return null;
+	// A review's own approval found no concerns: there are no comments to tell the agent of.
+	const submission = args.byReview ? { ...submitted, review: null } : submitted;
 	const recorded = decisions.get(args.narratorId);
 	if (recorded && recorded.rootId === submission.root.blockId) {
 		decisions.delete(args.narratorId);
@@ -578,11 +772,11 @@ export async function settleApprovedOutlinePlan(args: {
 			action: "draft",
 			decider: {
 				kind: "system",
-				id: OUTLINE_PLAN_ACTOR,
+				id: args.byReview ? OUTLINE_PLAN_REVIEW_ACTOR : OUTLINE_PLAN_ACTOR,
 				responsibleUserId: approver ?? args.turnUserId,
 				approvedBy: approver
 					? { kind: "human", id: approver }
-					: { kind: "system", id: args.byReview ? "plan-review" : OUTLINE_PLAN_ACTOR },
+					: { kind: "system", id: args.byReview ? OUTLINE_PLAN_REVIEW_ACTOR : OUTLINE_PLAN_ACTOR },
 			},
 			locale: args.locale,
 		});
@@ -642,5 +836,6 @@ export async function startApprovedOutlinePlan(args: {
 		task,
 		edits: args.approved.edits,
 		compact: args.compact,
+		review: reviewForPrompt(args.approved.submission),
 	});
 }

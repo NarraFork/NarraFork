@@ -141,10 +141,13 @@ export const outlineApi = {
 		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
 			method: "DELETE",
 		}),
-	/** A plan against the version it is compared with (`from`: a seq, 0 for nothing). */
-	getOutlinePlanDiff: (spaceId: string, blockId: string, from: number) =>
+	/**
+	 * A plan against the version it is compared with (`from`: a seq, 0 for nothing), without
+	 * `skip` (a block left out with what is under it: a plan review's comments).
+	 */
+	getOutlinePlanDiff: (spaceId: string, blockId: string, from: number, skip?: string | null) =>
 		request<OutlinePlanDiffResponse>(
-			`/outline/spaces/${enc(spaceId)}/plans/${enc(blockId)}/diff?from=${from}`,
+			`/outline/spaces/${enc(spaceId)}/plans/${enc(blockId)}/diff?from=${from}${skip ? `&skip=${enc(skip)}` : ""}`,
 		),
 	/** The caller's decision on a submitted plan (a waiting ExitPlanMode of an outline session). */
 	decideOutlinePlan: (requestId: string, body: OutlinePlanDecisionRequest) =>

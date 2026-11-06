@@ -10,7 +10,9 @@
  *   - "Lock and execute…" names a session to confirm on the person's behalf;
  *   - "Return" with feedback sends it back and writes the feedback under the plan;
  *   - with feedback typed, Enter returns the plan (without, it executes it as a draft);
- *   - at a phone's width nothing scrolls sideways.
+ *   - at a phone's width nothing scrolls sideways;
+ *   - a plan review's comments (PR 8b) lead the summary line and the diff, which leaves them out
+ *     of its changes, at a phone's width too.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -32,6 +34,7 @@ import {
 	decideOutlinePlanRequest,
 	enterOutlinePlanMode,
 	resolveOutlineExitPlanInput,
+	reviewOutlinePlan,
 } from "../../../../server/services/outline-plan-mode";
 import {
 	handleOutlinePageMessage,
@@ -199,8 +202,11 @@ async function newSession(title: string): Promise<string> {
 	return id;
 }
 
-/** A session with a submitted plan waiting for a decision; its outcome is captured. */
-async function waitingPlan() {
+/**
+ * A session with a submitted plan waiting for a decision; its outcome is captured. `review`: a
+ * plan review's comments on it (by step index, or the plan as a whole), as PlanReview leaves them.
+ */
+async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 	// The test preload restores settings after every test.
 	settings.outline.enabled = true;
 	const id = await newSession("Planner");
@@ -228,8 +234,28 @@ async function waitingPlan() {
 		responsibleUserId: owner,
 		narratorId: id,
 	});
-	const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
+	let resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
 	if (!resolved?.ok) throw new Error("not submitted");
+	if (review) {
+		const sids = await Promise.all(
+			[written.results[1], written.results[2]].map(
+				async (r) => (await outlineStore.getBlock(r?.blockId as string))?.sid as string,
+			),
+		);
+		const reviewed = await reviewOutlinePlan({
+			narratorId: id,
+			requestId: `exit_plan_browser_${generateId()}`,
+			input: resolved.input,
+			comments: review.map((c) => ({
+				target: c.step === undefined ? null : (sids[c.step] ?? null),
+				text: c.text,
+			})),
+			userId: owner,
+			locale: "en",
+		});
+		if (!reviewed.ok) throw new Error(reviewed.message);
+		resolved = { ok: true, input: reviewed.input };
+	}
 	const requestId = generateId();
 	let outcome: { behavior: string; message?: string } | null = null;
 	pendingPermissions.set(requestId, {
@@ -417,6 +443,54 @@ test("with feedback typed, Enter returns the plan (review round 1 S5)", async ()
 	expect(plan.outcome()?.behavior).toBe("deny");
 	expect(plan.outcome()?.message).toContain("Split step B");
 	expect((await outlineStore.getBlock(plan.root))?.taskJson?.plan?.state).toBe("planning");
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("a plan review's comments lead the summary and the diff, left out of its changes; nothing scrolls sideways on a phone", async () => {
+	const plan = await waitingPlan([
+		{ step: 0, text: "Step A has no test for a malformed row" },
+		{
+			text: "Say how an import is rolled back: https://example.com/a-very-long-link-without-any-break-in-it-at-all-to-wrap-0123456789abcdef",
+		},
+	]);
+	const { page, errors } = await openCard(plan.permission, { width: 375, height: 740 });
+	// The count leads the one summary line (the card's height is unchanged).
+	expect(await call(page, (f) => f.text("[data-testid=outline-plan-summary]"))).toBe(
+		"2 review comments · Version 1 · a new plan of 3 blocks",
+	);
+	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review-count]"))).toBe(
+		"2 review comments",
+	);
+	// One line at a phone's width, as the vlist measure predicts (`outlinePlanSummaryRows`: 1).
+	expect(await call(page, (f) => f.lines("[data-testid=outline-plan-summary]"))).toBe(1);
+	expect(await call(page, (f) => f.overflowsX())).toBe(false);
+
+	expect(await call(page, (f) => f.clickButton("View changes"))).toBe(true);
+	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 3);
+	// The comments first, each with the step it is about; the diff's changes are the plan's own.
+	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review]"))).toContain(
+		"Plan review (version 1)",
+	);
+	const comments = await call(page, (f) => f.texts("[data-testid=outline-plan-review-comment]"));
+	expect(comments).toHaveLength(2);
+	expect(comments[0]).toBe("On Step AStep A has no test for a malformed row");
+	expect(comments[1]).toContain("Say how an import is rolled back");
+	const shown = await call(page, (f) => f.entries());
+	expect(shown.some((e) => e.includes("Review (version 1)"))).toBe(false);
+	expect(shown.some((e) => e.includes("rolled back"))).toBe(false);
+	const above = await page.evaluate(() => {
+		const review = document.querySelector("[data-testid=outline-plan-review]");
+		const diff = document.querySelector("[data-testid=outline-plan-diff]");
+		return !!review && !!diff && !!(review.compareDocumentPosition(diff) & 4);
+	});
+	expect(above).toBe(true);
+	expect(await call(page, (f) => f.overflowsX())).toBe(false);
+
+	await call(page, (f) => f.click("[data-testid=outline-plan-draft-modal]"));
+	await waitFor("the approval", () => plan.outcome());
+	expect(plan.outcome()?.behavior).toBe("allow");
+	expect((await outlineStore.getBlock(plan.root))?.taskJson?.plan?.state).toBe("approved");
 	expect(errors).toEqual([]);
 	await page.close();
 });

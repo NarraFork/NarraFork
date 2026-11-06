@@ -176,9 +176,16 @@ export function getOutlinePlanReturnedMessage(
 		edits?: string;
 		/** The plan's root was gone when it was returned (deleted, unticked, moved off). */
 		gone?: boolean;
+		/** The plan review's comments on the version returned (PR 8b), if it left any. */
+		review?: OutlinePlanPromptReview | null;
 	},
 ): string {
 	const z = zh(locale);
+	const review = input.review
+		? z
+			? `\n\n计划审查${input.feedback ? "也" : ""}留了 ${input.review.count} 条意见，记在 \`${input.review.address}\`：下一版${input.feedback ? "和用户的意见一并" : "里"}处理。`
+			: `\n\nThe plan review ${input.feedback ? "also " : ""}left ${input.review.count} comment(s), under \`${input.review.address}\`: address them in the next version${input.feedback ? " along with the user's feedback" : ""}.`
+		: "";
 	const note = input.noteAddress
 		? z
 			? `意见已记在计划下：\`${input.noteAddress}\`。`
@@ -202,8 +209,8 @@ export function getOutlinePlanReturnedMessage(
 			? `按意见修改 \`${input.rootAddress}\` 下的计划，然后再次调用 ExitPlanMode（mode: "outline"）。`
 			: `Revise the plan under \`${input.rootAddress}\` accordingly, then call ExitPlanMode again (mode: "outline").`;
 	return z
-		? `[计划模式] 用户退回了你的计划。你仍处于计划模式。${feedback}${edits}\n\n${next}不要写代码或做任何修改——必须先退出计划模式。`
-		: `[PLAN MODE] The user returned your plan. You are STILL in plan mode.${feedback}${edits}\n\n${next} Do NOT write code or make changes — you must exit plan mode first.`;
+		? `[计划模式] 用户退回了你的计划。你仍处于计划模式。${feedback}${review}${edits}\n\n${next}不要写代码或做任何修改——必须先退出计划模式。`
+		: `[PLAN MODE] The user returned your plan. You are STILL in plan mode.${feedback}${review}${edits}\n\n${next} Do NOT write code or make changes — you must exit plan mode first.`;
 }
 
 /** The message that starts executing an approved outline plan. */
@@ -218,6 +225,8 @@ export function getOutlinePlanApprovedPrompt(input: {
 	edits: string;
 	/** The context was reset onto the plan before this message. */
 	compact: boolean;
+	/** The plan review's comments on the version approved (PR 8b), if it left any. */
+	review?: OutlinePlanPromptReview | null;
 }): string {
 	const z = zh(input.locale);
 	const how =
@@ -256,5 +265,82 @@ export function getOutlinePlanApprovedPrompt(input: {
 		: z
 			? "计划里没有能开始的步骤：读一下计划，按实际情况继续。"
 			: "No step of the plan can be started: read the plan and continue as the situation requires.";
-	return [lead, context, edits, task].filter(Boolean).join("\n\n");
+	const review = input.review
+		? z
+			? `计划审查留了 ${input.review.count} 条意见，记在 \`${input.review.address}\`，用户看过后批准了计划。执行时逐条考虑：采纳的照着做，不采纳的在那条意见下写一句理由。`
+			: `The plan review left ${input.review.count} comment(s), under \`${input.review.address}\`; the user saw them and approved the plan. Take each into account as you execute: follow the ones you adopt, and under any you do not, write one line saying why.`
+		: "";
+	return [lead, context, edits, review, task].filter(Boolean).join("\n\n");
+}
+
+// ─── Plan review (outline P2 PR 8b, D48 Q1) ───
+//
+// The plan review (计划反思) of an outline plan leaves comments under the plan instead of sending
+// it back: no concerns, and the plan is executed as a draft on the person's behalf (never
+// locked); concerns, and they are written as one block under the root, and the person decides
+// with them in view.
+
+/** A plan review as the agent's prompts name it: how many comments, and where. */
+export interface OutlinePlanPromptReview {
+	count: number;
+	/** The review's block (`key/sid`). */
+	address: string;
+}
+
+/** The block a plan review's comments are written under (a child of the plan root). */
+export function getOutlinePlanReviewTitle(locale: Locale, version: number): string {
+	return zh(locale) ? `审查意见（第 ${version} 版）` : `Review (version ${version})`;
+}
+
+/** The prompt of a plan review: the plan as submitted, each block with its short id. */
+export function getOutlinePlanReviewPrompt(
+	locale: Locale,
+	input: {
+		requestId: string;
+		/** The plan root (`key/sid`). */
+		address: string;
+		version: number;
+		/** What the agent said changed in this version. */
+		summary: string | null;
+		/** The plan as an outline, each block labelled with `[sid]`. */
+		plan: string;
+		limits: { comments: number; chars: number };
+	},
+): string {
+	const summary = input.summary
+		? zh(locale)
+			? `规划者说这一版改了：${input.summary}\n`
+			: `What the planner says changed in this version: ${input.summary}\n`
+		: "";
+	return zh(locale)
+		? `计划审查：大纲里的一份计划即将交给用户审批。你来审查它；批准或退回由用户决定，不由你决定。
+
+待审查 ID：${input.requestId}
+计划根：\`${input.address}\`（第 ${input.version} 版）
+${summary}
+提交的计划（每块前面是它的短 id）：
+${input.plan}
+
+检查：计划是否具体、可执行；是否符合用户的请求、范围合适；步骤的顺序是否可行、前置是否写明；是否还有本该先问用户的选择没定。
+
+只调用一次 PlanReview 给出结论：
+- \`verdict: "ok"\`，不带意见：你没有疑问。计划会替用户按草稿批准并开始执行。
+- \`verdict: "concerns"\`，1 到 ${input.limits.comments} 条意见：每条只说一个问题，简短具体（不超过 ${input.limits.chars} 字）；针对计划里某一块时，用 \`target\` 写它的短 id（如上面方括号里的）。意见会写在计划下的「${getOutlinePlanReviewTitle(locale, input.version)}」块里，用户看着这些意见做决定；计划不会退回给规划者。
+
+你最多有两轮。只调用 PlanReview，不调用其他工具。第一次调用被拒绝时，按工具结果在第二轮改正。不要调用 ExitPlanMode 或 OutlineEdit，也不要自己把意见写到别处。`
+		: `Plan review: a plan in the outline is about to go to the user for approval. You review it; the user, not you, approves or returns it.
+
+Pending review ID: ${input.requestId}
+Plan root: \`${input.address}\` (version ${input.version})
+${summary}
+The plan as submitted (each block after its short id):
+${input.plan}
+
+Check that the plan is specific and actionable; that it matches what the user asked for, in scope; that its steps are in a workable order with their prerequisites stated; and that no choice is left open the user should have made first.
+
+Give your verdict with one call of PlanReview:
+- \`verdict: "ok"\` with no comments: you have no concerns. The plan is then approved as a draft on the user's behalf and executed.
+- \`verdict: "concerns"\` with 1 to ${input.limits.comments} comments: one concern each, short and concrete (at most ${input.limits.chars} characters); when one is about a block of the plan, give its short id (as in the brackets above) as \`target\`. The comments are written under the plan as "${getOutlinePlanReviewTitle(locale, input.version)}", and the user decides with them in view; the plan is not sent back to the planner.
+
+You have at most two rounds. Call only PlanReview, no other tool. If the first call is refused, correct it in the second round from the tool result. Do not call ExitPlanMode or OutlineEdit, and do not write the comments anywhere yourself.`;
 }

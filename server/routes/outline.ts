@@ -446,8 +446,8 @@ outlineRoutes.get("/spaces/:spaceId/pages/:pageId/commits", async (c) => {
 
 /**
  * A plan against the version it is compared with (outline P2 PR 8): `from` (the submission's
- * `baseSeq`, 0 for nothing) to now, block by block, bounded (`plan-diff.ts`). Read access to the
- * plan's space.
+ * `baseSeq`, 0 for nothing) to now, block by block, bounded (`plan-diff.ts`), without `skip` (a
+ * plan review's comments, shown on their own; PR 8b). Read access to the plan's space.
  */
 outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
 	const principal = principalOf(c);
@@ -457,7 +457,12 @@ outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
 		idParam(c, "blockId"),
 	);
 	const query = parse(outlinePlanDiffQuerySchema, c.req.query());
-	const diff = await readPlanDiff({ rootId: block.id, fromSeq: query.from, toSeq: null });
+	const diff = await readPlanDiff({
+		rootId: block.id,
+		fromSeq: query.from,
+		toSeq: null,
+		...(query.skip ? { skip: new Set([query.skip]) } : {}),
+	});
 	if (!diff) throw new NotFoundError("Outline block", block.id);
 	const body: OutlinePlanDiffResponse = {
 		root: {
