@@ -12,6 +12,7 @@ import {
 	Drawer,
 	FileButton,
 	Group,
+	Modal,
 	MultiSelect,
 	Paper,
 	ScrollArea,
@@ -33,16 +34,19 @@ import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import {
 	IconChevronDown,
 	IconChevronRight,
+	IconDeviceDesktop,
+	IconDevices,
 	IconDownload,
+	IconFolderOpen,
 	IconInfoCircle,
 	IconRefresh,
 	IconSearch,
 	IconTrash,
 	IconUpload,
 } from "@tabler/icons-react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import React, { createContext, useContext, useMemo, useState } from "react";
+import React, { createContext, lazy, Suspense, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
@@ -61,7 +65,6 @@ import {
 	useNarratorUsageStats,
 	useRefreshNarratorSkills,
 	useUpdateBlockedSkills,
-	useUpdateCwd,
 	useUpdateDisabledTools,
 	useUpdateReflectionOverrides,
 	useUpdateSubagentModelRestriction,
@@ -75,6 +78,7 @@ import {
 } from "../../../hooks/usePlatform";
 import { useNarratorTerminals } from "../../../hooks/useTerminals";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
+import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import type {
 	ApiEntity,
 	BlacklistCmd,
@@ -94,7 +98,9 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../../lib/safe-area";
+import { Z } from "../../../lib/z-index";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
+import { DIRECTORY_BROWSER_MODAL_STYLES } from "../../common/directory-browser-modal";
 import { UserAvatar } from "../../UserAvatar";
 import {
 	DetailsPanelContentLifetime,
@@ -125,6 +131,11 @@ import {
 } from "./details-panel-sections";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
+import {
+	describeDeviceDirectories,
+	deviceDirectoryCwd,
+	deviceDisplayName,
+} from "./workspace-directory-view";
 
 export interface NarratorDetailsPanelProps {
 	opened: boolean;
@@ -377,6 +388,12 @@ function RuleList({
 	return <Stack gap="xs">{items.map((item, index) => renderItem(item, index))}</Stack>;
 }
 
+const RemoteDirectoryBrowser = lazy(() =>
+	import("../../permissions/RemoteDirectoryBrowser").then((module) => ({
+		default: module.RemoteDirectoryBrowser,
+	})),
+);
+
 const EMPTY_POOLS: SubagentModelPools = {};
 const EMPTY_SELECTION: string[] = [];
 
@@ -475,8 +492,36 @@ function NarratorDetailsContent({
 		dangerReflectionOverride,
 		resolvedDangerReflectionGlobalLevel,
 	);
-	const cwdDraft = useDetailsDraft(String(narrator?.cwd ?? ""));
+	// Working directories are per execution device: display and edit the one that
+	// belongs to the device being shown, never a path borrowed from another machine.
+	const { data: workspace } = useWorkspaceContext(narratorId);
+	const { data: executionDevices } = useQuery({
+		queryKey: ["narratorExecutionDevices", narratorId],
+		queryFn: () => api.getNarratorExecutionDevices(narratorId),
+		enabled: opened,
+		staleTime: 30_000,
+	});
+	const currentDeviceId = workspace?.deviceId ?? narrator?.defaultDeviceId ?? "local";
+	const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
+	const editDeviceId = editingDeviceId ?? currentDeviceId;
+	// Which device shows which directory is a rule worth testing on its own; see
+	// `workspace-directory-view`.
+	const directoryView = {
+		directories: executionDevices?.directories,
+		currentDeviceId,
+		currentCwd: workspace?.cwd ?? narrator?.cwd ?? null,
+		devices: executionDevices?.devices ?? [],
+		localLabel: t("details.cwdDeviceLocal"),
+	};
+	const deviceDirectory = (deviceId: string) => deviceDirectoryCwd(directoryView, deviceId);
+	const deviceLabel = (deviceId: string) => deviceDisplayName(directoryView, deviceId);
+	const cwdDraft = useDetailsDraft(String(deviceDirectory(editDeviceId) ?? ""));
 	const { value: cwdValue, setValue: setCwdValue, dirty: cwdDirty } = cwdDraft;
+	const isRemoteCwd = editDeviceId !== "local";
+	const [remoteCwdOpened, setRemoteCwdOpened] = useState(false);
+	const [deviceListOpen, setDeviceListOpen] = useState(false);
+	const effectiveCwd = workspace?.cwd ?? narrator?.cwd ?? null;
+	const deviceRows = describeDeviceDirectories(directoryView);
 	const { data: customTraits } = useNarratorCustomTraits(narratorId, opened);
 	const modelPoolDraft = useDetailsDraft(
 		customTraits?.subagentModelRestriction?.pools ?? EMPTY_POOLS,
@@ -516,7 +561,9 @@ function NarratorDetailsContent({
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
 	});
-	const updateCwdMutation = useUpdateCwd();
+	// An explicit device target, so a save can never retarget the session to whatever
+	// device happened to be current when the request was built.
+	const switchWorkspaceMutation = useSwitchWorkspaceContext(narratorId);
 	const extractPrimaryMutation = useExtractSubagentToPrimary();
 	const disabledToolsDraft = useDetailsDraft(customTraits?.disabledTools?.tools ?? EMPTY_SELECTION);
 	const { value: disabledToolSelection, setValue: setDisabledToolSelection } = disabledToolsDraft;
@@ -656,9 +703,27 @@ function NarratorDetailsContent({
 			});
 			return;
 		}
+		if (workspace?.revision === undefined) {
+			notifications.show({
+				title: t("details.cwdUpdateErrorTitle"),
+				message: t("details.cwdUnavailable"),
+				color: "red",
+			});
+			return;
+		}
 		try {
-			const result = await updateCwdMutation.mutateAsync({ id: narratorId, cwd: nextCwd });
-			cwdDraft.reset(nextCwd);
+			// Saving the directory of another device IS switching to that device, which is
+			// what the per-device model means; the same request also records it in the map.
+			const result = await switchWorkspaceMutation.mutateAsync({
+				expectedRevision: workspace.revision,
+				requestId: crypto.randomUUID(),
+				target: { deviceId: editDeviceId, cwd: nextCwd },
+			});
+			cwdDraft.reset(result.current.cwd);
+			setEditingDeviceId(null);
+			void qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			void qc.invalidateQueries({ queryKey: ["narrator-skills", narratorId] });
+			void qc.invalidateQueries({ queryKey: ["narrator-commands", narratorId] });
 			notifications.show({
 				title: t("details.cwdUpdatedTitle"),
 				message: result.changed ? t("details.cwdUpdated") : t("details.cwdUnchanged"),
@@ -1122,47 +1187,176 @@ function NarratorDetailsContent({
 							value={<Badge variant="outline">{String(narrator.subagentType)}</Badge>}
 						/>
 					) : null}
+					{isRemoteCwd ? (
+						<Modal
+							opened={remoteCwdOpened}
+							onClose={() => setRemoteCwdOpened(false)}
+							title={t("details.cwdBrowseRemoteTitle", { device: deviceLabel(editDeviceId) })}
+							size="md"
+							zIndex={Z.modal}
+							styles={DIRECTORY_BROWSER_MODAL_STYLES}
+						>
+							{remoteCwdOpened ? (
+								<Suspense fallback={null}>
+									<RemoteDirectoryBrowser
+										deviceLabel={deviceLabel(editDeviceId)}
+										initialPath={cwdValue.trim() || undefined}
+										listDirectory={(path, opts) =>
+											api.browseNarratorDevice(narratorId, editDeviceId, path, {
+												showHidden: opts.showHidden,
+											})
+										}
+										queryKey={["narratorDeviceBrowse", narratorId, editDeviceId]}
+										onSelect={(path) => {
+											setCwdValue(path);
+											setRemoteCwdOpened(false);
+										}}
+										onCancel={() => setRemoteCwdOpened(false)}
+									/>
+								</Suspense>
+							) : null}
+						</Modal>
+					) : null}
 					<Stack gap="xs">
 						<Group justify="space-between" align="center" wrap="nowrap" gap="md">
 							<Text size="sm" c="dimmed">
 								{t("details.cwd")}
 							</Text>
-							{narrator?.cwd ? (
-								<Tooltip label={String(narrator.cwd)} multiline>
-									<Text size="xs" ff="monospace" c="dimmed" truncate maw={260}>
-										{String(narrator.cwd)}
-									</Text>
-								</Tooltip>
-							) : null}
+							<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+								<Badge
+									size="sm"
+									variant="light"
+									color={currentDeviceId === "local" ? "gray" : "indigo"}
+									leftSection={
+										currentDeviceId === "local" ? (
+											<IconDeviceDesktop size={11} />
+										) : (
+											<IconDevices size={11} />
+										)
+									}
+								>
+									{deviceLabel(currentDeviceId)}
+								</Badge>
+								{effectiveCwd ? (
+									<Tooltip label={effectiveCwd} multiline>
+										<Text size="xs" ff="monospace" c="dimmed" truncate maw={200}>
+											{effectiveCwd}
+										</Text>
+									</Tooltip>
+								) : null}
+							</Group>
 						</Group>
-						<DirectoryPicker
-							value={cwdValue}
-							onChange={setCwdValue}
-							placeholder={t("details.cwdPlaceholder")}
-							description={t("details.cwdDescription")}
-							dropdownPosition="top"
-							disabled={updateCwdMutation.isPending}
-						/>
+						{editDeviceId !== currentDeviceId ? (
+							<Text size="xs" c="dimmed">
+								{t("details.cwdEditingDevice", { device: deviceLabel(editDeviceId) })}
+							</Text>
+						) : null}
+						{isRemoteCwd ? (
+							// A remote device's filesystem is not this one: plain absolute path +
+							// that device's own browser, never the local picker.
+							<Group gap="xs" wrap="nowrap" align="flex-end">
+								<TextInput
+									style={{ flex: 1 }}
+									value={cwdValue}
+									onChange={(event) => setCwdValue(event.currentTarget.value)}
+									placeholder={t("details.cwdRemotePlaceholder")}
+									description={t("details.cwdRemoteDescription", {
+										device: deviceLabel(editDeviceId),
+									})}
+									disabled={switchWorkspaceMutation.isPending}
+								/>
+								<Button
+									variant="default"
+									size="sm"
+									leftSection={<IconFolderOpen size={14} />}
+									onClick={() => setRemoteCwdOpened(true)}
+									disabled={switchWorkspaceMutation.isPending}
+								>
+									{t("details.cwdBrowseRemote")}
+								</Button>
+							</Group>
+						) : (
+							<DirectoryPicker
+								value={cwdValue}
+								onChange={setCwdValue}
+								placeholder={t("details.cwdPlaceholder")}
+								description={t("details.cwdDescription")}
+								dropdownPosition="top"
+								disabled={switchWorkspaceMutation.isPending}
+							/>
+						)}
 						<Group justify="flex-end" gap="xs">
 							<Button
 								variant="default"
 								size="xs"
-								disabled={!cwdDirty || updateCwdMutation.isPending}
+								disabled={
+									(!cwdDirty && editingDeviceId === null) || switchWorkspaceMutation.isPending
+								}
 								onClick={() => {
-									cwdDraft.reset(String(narrator?.cwd ?? ""));
+									setEditingDeviceId(null);
+									cwdDraft.reset(String(deviceDirectory(currentDeviceId) ?? ""));
 								}}
 							>
 								{t("cancel")}
 							</Button>
 							<Button
 								size="xs"
-								loading={updateCwdMutation.isPending}
-								disabled={!cwdDirty}
+								loading={switchWorkspaceMutation.isPending}
+								disabled={!cwdDirty || !cwdValue.trim()}
 								onClick={handleSaveCwd}
 							>
 								{tc("save")}
 							</Button>
 						</Group>
+						{deviceRows.length > 1 ? (
+							<Stack gap={2}>
+								<UnstyledButton onClick={() => setDeviceListOpen((open) => !open)}>
+									<Group gap={4} wrap="nowrap">
+										{deviceListOpen ? (
+											<IconChevronDown size={12} />
+										) : (
+											<IconChevronRight size={12} />
+										)}
+										<Text size="xs" c="dimmed">
+											{t("details.cwdDeviceList")}
+										</Text>
+									</Group>
+								</UnstyledButton>
+								<Collapse in={deviceListOpen}>
+									<Stack gap={2}>
+										{deviceRows.map((row) => (
+											<UnstyledButton
+												key={row.id}
+												p={4}
+												onClick={() => setEditingDeviceId(row.id)}
+												style={{
+													borderRadius: 4,
+													background:
+														row.id === editDeviceId
+															? "var(--mantine-color-default-hover)"
+															: undefined,
+												}}
+											>
+												<Group gap={6} wrap="nowrap" justify="space-between">
+													<Text size="xs" truncate>
+														{row.name}
+													</Text>
+													<Text
+														size="xs"
+														ff="monospace"
+														c={row.cwd ? "dimmed" : "orange"}
+														truncate
+														maw={150}
+													>
+														{row.cwd ?? t("details.cwdDeviceUnset")}
+													</Text>
+												</Group>
+											</UnstyledButton>
+										))}
+									</Stack>
+								</Collapse>
+							</Stack>
+						) : null}
 					</Stack>
 					<DetailRow
 						label={t("details.createdAt")}
