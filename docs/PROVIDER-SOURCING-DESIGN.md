@@ -372,8 +372,8 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 |---|---|---|
 | **P0 地基**（已完成） | 所有来源写 `credentialId`；`api_requests` 记录计费主体与项目；`usage_daily`；修复首页汇总越权 | 用量可按来源区分；首页只显示自己的开销 |
 | **P1 目录重做**（已完成） | 按 §8 重做模型目录：3 层合并、8 类字段、独立覆盖文件、精简在线更新、新模型卡界面；删除变体 / 绑定 / 遗留归档 | 模型参数页只剩必要字段，不再报错和卡顿。后续逻辑模型路由依赖这里的模型身份匹配，所以提前 |
-| **P2 存储**（基本完成） | 凭据文件加密（`secret-store.ts` 已完成，Codex 凭据已接入，可在设置中关闭）；凭据迁移（二次核验 + 口令加密导出 / 预览导入，已完成）；API key 迁出 `settings.json`；自定义 API 供应商的多 Key 池（Key 存储、会话粘性轮换与故障切换、逐 Key 额度与网络身份、Key 列表界面，已完成；Codex 的池化逻辑暂留在 CodexManager，后续与之合并）；逐凭据网络身份（Codex 账号已完成：`shared/credential-network.ts` + `server/lib/codex-network.ts`，请求、令牌刷新、额度查询与 Agent Identity 注册都走账号自己的代理 / UA / 设备 ID / 请求头） | Kimi / OpenCode 等获得 Codex 式详情页 |
-| **P3 路由** | `auto:` 模型值、`resolveRoute`、策略预设、纪元锁、模型选择器二级菜单；把聚合迁为 `auto:`（`前缀:模型` 值无需迁移） | “模型聚合”消失，来源变为二级菜单 |
+| **P2 存储**（基本完成） | 凭据文件加密（`secret-store.ts` 已完成，Codex 凭据已接入，可在设置中关闭）；凭据迁移（二次核验 + 口令加密导出 / 预览导入，已完成）；API key 迁出 `settings.json`（自定义 API、NUG、TokenDance、Command Code、自定义搜索供应商，已完成）；数据导出带全部 Key，需二次核验并用口令加密（§7，已完成）；自定义 API 供应商的多 Key 池（Key 存储、会话粘性轮换与故障切换、逐 Key 额度与网络身份、Key 列表界面，已完成；Codex 的池化逻辑暂留在 CodexManager，后续与之合并）；逐凭据网络身份（Codex 账号已完成：`shared/credential-network.ts` + `server/lib/codex-network.ts`，请求、令牌刷新、额度查询与 Agent Identity 注册都走账号自己的代理 / UA / 设备 ID / 请求头）。**剩余**：CodexManager 池化合并；NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json | Kimi / OpenCode 等获得 Codex 式详情页 |
+| **P3 路由**（部分完成） | `auto:` 模型值、`resolveRoute`、策略预设、纪元锁、模型选择器二级菜单；把聚合迁为 `auto:`（`前缀:模型` 值无需迁移）。**已完成**：`auto:` 值与保存校验、聚合迁移（仅 SQLite）、固定排序（能否服务 → 订阅 → 参考价）与最小能力过滤、被迫切换、渠道锁（激活恢复、压缩后重选）、“参与自动”开关、选择器来源行与按厂商分组（§4、§10.2、§14.1）。**剩余**：状态栏额度显示会话实际来源、来源行当前账号 / Key 与重置倒计时、启动迁移支持 PostgreSQL；`resolveRoute` 统一入口、策略预设与拖动排序、稳定性维度、路由策略设置页（§4.2、§10.3） | “模型聚合”消失，来源变为二级菜单 |
 | **P4 个人来源** | 个人凭据、计费主体规则、团队回落、团队策略与个人预算 | 非管理员可登录自己的订阅 |
 | **P5 开销与分析** | 计费配置、实际开销、节省量、我的用量 / 团队用量、隐私、项目预算 | 用量页对所有人开放 |
 | 以后 | 缓存冷点重选（先在 P3 采集各渠道的空闲间隔与缓存命中数据再定）；项目所有者再分配预算 | — |
@@ -429,7 +429,6 @@ Codex 现有的能力（优先级、档位排序、会话亲和、连续失败�
 2. **P2 收尾**
    - 把 CodexManager 里与账号无关的池化逻辑（优先级、会话亲和、失败停用、额度跳过）与 `pooled-provider.ts` 合并成一个通用池；Codex 只保留 OAuth / PAT / Agent Identity 登录与 `/wham/usage` 探测。不要一次重写 CodexManager，先抽出纯函数再替换调用点。
    - NUG OAuth client secret 与搜索供应商敏感请求头迁出 settings.json。
-   - 数据管理“导出供应商”仍带 Key 且不要求二次核验（等待决定：建议导出不带 Key，Key 只走凭据迁移）。
 3. **P4 个人来源**（§5）：Key / 账号加 `ownerUserId`（`ProviderKey` 与 `CodexCredential` 都要加，导出包与 `credential-transfer/kinds.ts` 一并带上）；计费主体 = 根叙述者所有者，`usage_daily.billing_user_id` 已在记；团队回落与个人预算。
 4. **P5 开销与分析**（§9）：订阅月费 / 折扣配置、实际开销与节省量、我的用量 / 团队用量页、“不计入团队统计”、项目预算。数据源是 `usage_daily`，不要在请求路径上做聚合。
 
