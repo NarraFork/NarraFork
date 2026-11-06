@@ -16,6 +16,8 @@ import { dlopen, FFIType, type Pointer } from "bun:ffi";
 import { win32 } from "node:path";
 
 const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+/** GetExitCodeProcess's value for a process that has not exited. */
+const STILL_ACTIVE = 259;
 /** 1970-01-01 as a FILETIME (100 ns intervals since 1601-01-01). */
 const FILETIME_UNIX_EPOCH = 116_444_736_000_000_000n;
 const MAX_IMAGE_PATH_CHARS = 32_768;
@@ -32,6 +34,7 @@ const SYSTEM_TIME_OF_DAY_BYTES = 48;
 function load() {
 	const kernel32 = dlopen("kernel32.dll", {
 		OpenProcess: { args: [FFIType.u32, FFIType.i32, FFIType.u32], returns: FFIType.ptr },
+		GetExitCodeProcess: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 		GetProcessTimes: {
 			args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr],
 			returns: FFIType.i32,
@@ -105,21 +108,34 @@ function readBootTime(native: ReturnType<typeof load>): string | null {
 	return status === 0 ? toCimFileTime(info[0] ?? 0n) : null;
 }
 
+/** What Windows says about a pid, or `null` when it cannot be read (access denied, any failure). */
+type ProcessRecord =
+	| { state: "live"; created: bigint; imageName: string | null }
+	| { state: "gone" }
+	| null;
+
 /**
- * `found: false` only when Windows says the pid names no process. Access denied and every other
- * failure throw, so a live process the caller may not open is never reported as gone.
+ * Open the pid and read its creation time and exit status.
+ *
+ * "gone" is reported only on positive evidence: OpenProcess says the pid names no process, or the
+ * process has an exit code. The second matters because an exited process stays openable for as
+ * long as anyone holds a handle to it (its parent, an antivirus scanner), with its old creation
+ * time intact; tasklist and the signal probe already treat it as gone. Access denied and every
+ * other failure is `null`, so a live process the caller may not open is never reported as gone.
  */
-function readBirth(
+function readProcess(
 	native: ReturnType<typeof load>,
 	pid: number,
-): { found: true; birth: string } | { found: false } {
+	withImage: boolean,
+): ProcessRecord {
 	const handle = native.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
 	if (!handle) {
-		const error = native.kernel32.GetLastError();
-		if (error === ERROR_INVALID_PARAMETER) return { found: false };
-		throw new Error(`OpenProcess failed with ${error}`);
+		return native.kernel32.GetLastError() === ERROR_INVALID_PARAMETER ? { state: "gone" } : null;
 	}
 	try {
+		const exitCode = new Uint32Array(1);
+		if (!native.kernel32.GetExitCodeProcess(handle as Pointer, exitCode)) return null;
+		if (exitCode[0] !== STILL_ACTIVE) return { state: "gone" };
 		const times = new BigUint64Array(4);
 		const ok = native.kernel32.GetProcessTimes(
 			handle as Pointer,
@@ -128,10 +144,17 @@ function readBirth(
 			times.subarray(2, 3),
 			times.subarray(3, 4),
 		);
-		if (!ok) throw new Error(`GetProcessTimes failed with ${native.kernel32.GetLastError()}`);
-		const birth = toCimFileTime(times[0] ?? 0n);
-		if (!birth) throw new Error("missing birth");
-		return { found: true, birth };
+		const created = times[0] ?? 0n;
+		if (!ok || created <= FILETIME_UNIX_EPOCH) return null;
+		let imageName: string | null = null;
+		if (withImage) {
+			const path = Buffer.alloc(MAX_IMAGE_PATH_CHARS * 2);
+			const size = new Uint32Array([MAX_IMAGE_PATH_CHARS]);
+			if (native.kernel32.QueryFullProcessImageNameW(handle as Pointer, 0, path, size)) {
+				imageName = win32.basename(path.toString("utf16le", 0, (size[0] ?? 0) * 2)) || null;
+			}
+		}
+		return { state: "live", created, imageName };
 	} finally {
 		native.kernel32.CloseHandle(handle as Pointer);
 	}
@@ -139,7 +162,7 @@ function readBirth(
 
 /**
  * Start time and image name of a pid, for classifying an existing instance lock. `"absent"` when
- * the pid names no process, `null` when it cannot be read (the caller falls back to tasklist).
+ * the process is gone, `null` when it cannot be read (the caller falls back to tasklist).
  */
 export function observeWindowsProcess(
 	pid: number,
@@ -147,32 +170,13 @@ export function observeWindowsProcess(
 	if (process.platform !== "win32") return null;
 	try {
 		api ??= load();
-		const handle = api.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-		if (!handle) {
-			return api.kernel32.GetLastError() === ERROR_INVALID_PARAMETER ? "absent" : null;
-		}
-		try {
-			const times = new BigUint64Array(4);
-			const ok = api.kernel32.GetProcessTimes(
-				handle as Pointer,
-				times.subarray(0, 1),
-				times.subarray(1, 2),
-				times.subarray(2, 3),
-				times.subarray(3, 4),
-			);
-			const created = times[0] ?? 0n;
-			if (!ok || created <= FILETIME_UNIX_EPOCH) return null;
-			const path = Buffer.alloc(MAX_IMAGE_PATH_CHARS * 2);
-			const size = new Uint32Array([MAX_IMAGE_PATH_CHARS]);
-			const named = api.kernel32.QueryFullProcessImageNameW(handle as Pointer, 0, path, size);
-			const image = named ? path.toString("utf16le", 0, (size[0] ?? 0) * 2) : "";
-			return {
-				startedAtMs: Number((created - FILETIME_UNIX_EPOCH) / 10_000n),
-				imageName: image ? win32.basename(image) : null,
-			};
-		} finally {
-			api.kernel32.CloseHandle(handle as Pointer);
-		}
+		const record = readProcess(api, pid, true);
+		if (!record) return null;
+		if (record.state === "gone") return "absent";
+		return {
+			startedAtMs: Number((record.created - FILETIME_UNIX_EPOCH) / 10_000n),
+			imageName: record.imageName,
+		};
 	} catch {
 		return null;
 	}
@@ -189,14 +193,10 @@ export function queryWindowsProcessIdentity(pid: number): string | null {
 		const machine = readMachineGuid(api);
 		const boot = readBootTime(api);
 		if (!machine || !boot) return null;
-		const process = readBirth(api, pid);
-		return JSON.stringify({
-			machine,
-			boot,
-			pid,
-			found: process.found,
-			birth: process.found ? process.birth : null,
-		});
+		const record = readProcess(api, pid, false);
+		if (!record) return null;
+		const birth = record.state === "live" ? toCimFileTime(record.created) : null;
+		return JSON.stringify({ machine, boot, pid, found: birth !== null, birth });
 	} catch {
 		return null;
 	}

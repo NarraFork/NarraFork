@@ -211,9 +211,19 @@ export function recoverProviderPrefixMigrationOnStartup(): void {
 	try {
 		recoverJournal();
 	} catch (error) {
+		// Moved aside: it is the only record of which narrators the rename touched, and left in
+		// place the next rename would overwrite it (and every startup would report it again).
+		const keptPath = `${narraforkDir}/provider-prefix-migration.unresolved-${Date.now()}.json`;
+		try {
+			renameSync(JOURNAL_PATH, keptPath);
+		} catch (renameError) {
+			logger.warn("Could not set the unresolved provider prefix journal aside", {
+				error: String(renameError),
+			});
+		}
 		logger.error("Interrupted provider prefix migration could not be recovered; journal kept", {
 			error: String(error),
-			journalPath: JOURNAL_PATH,
+			journalPath: existsSync(keptPath) ? keptPath : JOURNAL_PATH,
 		});
 	}
 }

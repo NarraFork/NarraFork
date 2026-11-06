@@ -35,14 +35,10 @@ export interface StatusListenTarget {
 }
 
 export type ToStatusWorker =
-	| {
-			type: "listen";
-			target: StatusListenTarget;
-			snapshot: StartupSnapshot;
-			/** A browser is being opened on the page, so a failure is worth waiting to show. */
-			viewerExpected: boolean;
-	  }
-	| { type: "update"; snapshot: StartupSnapshot };
+	| { type: "listen"; target: StatusListenTarget; snapshot: StartupSnapshot; brandName: string }
+	| { type: "update"; snapshot: StartupSnapshot }
+	/** A browser is being opened on the page, so a failure is worth waiting to show. */
+	| { type: "expect-viewer" };
 
 export type FromStatusWorker =
 	| { type: "listening" }
@@ -59,6 +55,15 @@ export function snapshotForViewer(snapshot: StartupSnapshot, local: boolean): St
 	return { ...snapshot, problem: { message: snapshot.problem.message } };
 }
 
-export function isLoopbackAddress(address: string | undefined): boolean {
-	return !!address && /^(?:127\.|::1$|::ffff:127\.)/.test(address);
+const FORWARDING_HEADERS = ["forwarded", "x-forwarded-for", "x-real-ip"];
+
+/**
+ * Whether the browser runs on the server itself. A reverse proxy or code-server on the same
+ * machine also connects from loopback, so a request that carries a forwarding header counts as
+ * remote: it came from wherever the proxy's client is. The startup page has no settings to say
+ * which proxies to trust, and the main server only trusts loopback by default anyway.
+ */
+export function isLocalViewer(peerAddress: string | undefined, headers: Headers): boolean {
+	if (!peerAddress || !/^(?:127\.|::1$|::ffff:127\.)/.test(peerAddress)) return false;
+	return !FORWARDING_HEADERS.some((name) => headers.has(name));
 }

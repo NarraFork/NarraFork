@@ -7,10 +7,10 @@
 import { parentPort } from "node:worker_threads";
 import { STARTUP_STATUS_HEADER } from "../../../shared/startup-status";
 import { injectSpaBaseHref } from "../spa-base-href";
-import { STARTUP_PAGE_HTML } from "./page";
+import { startupPageHtml } from "./page";
 import {
 	type FromStatusWorker,
-	isLoopbackAddress,
+	isLocalViewer,
 	type StartupSnapshot,
 	snapshotForViewer,
 	type ToStatusWorker,
@@ -20,6 +20,7 @@ const port = parentPort;
 if (!port) throw new Error("startup status worker must run as a worker thread");
 
 let snapshot: StartupSnapshot | undefined;
+let pageHtml = startupPageHtml("NarraFork");
 let viewerExpected = false;
 let polled = false;
 /** A problem was posted and no page has read it yet. */
@@ -37,7 +38,7 @@ function respond(request: Request, server: Bun.Server<undefined>): Response {
 			// Leave the response time to reach the browser before the process exits.
 			setTimeout(() => send({ type: "problem-shown" }), 500);
 		}
-		const local = isLoopbackAddress(server.requestIP(request)?.address);
+		const local = isLocalViewer(server.requestIP(request)?.address, request.headers);
 		return Response.json({ ...snapshotForViewer(snapshot, local), now: Date.now() }, { headers });
 	}
 	if (pathname === "/api/health") {
@@ -51,14 +52,14 @@ function respond(request: Request, server: Bun.Server<undefined>): Response {
 	if (!isPage || pathname.startsWith("/api/") || pathname.startsWith("/ws/")) {
 		return new Response("NarraFork is starting", { status: 503, headers });
 	}
-	return new Response(injectSpaBaseHref(STARTUP_PAGE_HTML, pathname), {
+	return new Response(injectSpaBaseHref(pageHtml, pathname), {
 		status: 503,
 		headers: { ...headers, "content-type": "text/html; charset=utf-8" },
 	});
 }
 
 function listen(message: Extract<ToStatusWorker, { type: "listen" }>): void {
-	viewerExpected = message.viewerExpected;
+	pageHtml = startupPageHtml(message.brandName);
 	const { hostname, port: listenPort, tls } = message.target;
 	try {
 		Bun.serve({
@@ -82,6 +83,10 @@ port.on("message", (message: ToStatusWorker | { action: "ping" }) => {
 	// `connectCompiledWorker` asks every worker whether it loaded.
 	if ("action" in message) {
 		port.postMessage({ ready: true });
+		return;
+	}
+	if (message.type === "expect-viewer") {
+		viewerExpected = true;
 		return;
 	}
 	const hadProblem = !!snapshot?.problem;

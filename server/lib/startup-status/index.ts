@@ -44,10 +44,10 @@ function next(worker: Worker, accept: (message: FromStatusWorker) => boolean) {
 /** Listen on `target` and answer with the status page. Resolves to whether it is listening. */
 export async function startStartupStatus(
 	target: StatusListenTarget,
-	options: { version: string; viewerExpected: boolean },
+	{ version, brandName }: { version: string; brandName: string },
 ): Promise<boolean> {
 	const initial: StartupSnapshot = {
-		version: options.version,
+		version,
 		step: { key: "starting" },
 		stepStartedAt: Date.now(),
 	};
@@ -61,7 +61,7 @@ export async function startStartupStatus(
 			type: "listen",
 			target,
 			snapshot: initial,
-			viewerExpected: options.viewerExpected,
+			brandName,
 		} satisfies ToStatusWorker);
 		const result = await Promise.race([
 			reply,
@@ -70,7 +70,18 @@ export async function startStartupStatus(
 		if (result.type === "unavailable") throw new Error(result.error);
 		// The page is a convenience; it must never keep a finished process alive.
 		started.unref();
-		worker = started;
+		// Windows can report a bind failure after `listen` returned. Without a listener that error
+		// would be rethrown on this thread and end startup; with it, startup just loses the page.
+		const current = started;
+		const drop = (reason: string) => {
+			if (worker !== current) return;
+			logger.warn("Startup status page stopped; continuing without it", { reason });
+			worker = undefined;
+			snapshot = undefined;
+		};
+		current.on("error", (error) => drop(String(error)));
+		current.on("exit", (code) => drop(`worker exited with ${code}`));
+		worker = current;
 		snapshot = initial;
 		return true;
 	} catch (error) {
@@ -81,6 +92,14 @@ export async function startStartupStatus(
 		await started?.terminate();
 		return false;
 	}
+}
+
+/**
+ * A browser is being opened on the page. A failure is then worth waiting for, so the person who
+ * started NarraFork sees why; on a headless server nobody would, and exiting at once is better.
+ */
+export function expectStartupViewer(): void {
+	worker?.postMessage({ type: "expect-viewer" } satisfies ToStatusWorker);
 }
 
 function update(next: StartupSnapshot): void {

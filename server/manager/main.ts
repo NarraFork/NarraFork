@@ -177,9 +177,8 @@ type Supervision = "none" | "reconnecting" | "adopted";
 /** 只读品牌色与实例显示名；监听地址由 manager-config 负责（同一份文件还要写入与回显）。 */
 async function loadBranding(): Promise<{ color: string; name: string }> {
 	try {
-		const raw = (await Bun.file(join(resolveNarraforkHome(), "settings.json")).json()) as {
-			branding?: { iconColor?: string; name?: string };
-		};
+		const text = await Bun.file(join(resolveNarraforkHome(), "settings.json")).text();
+		const raw = Bun.JSONC.parse(text) as { branding?: { iconColor?: string; name?: string } };
 		const name =
 			typeof raw.branding?.name === "string" && raw.branding.name.trim()
 				? raw.branding.name.trim()

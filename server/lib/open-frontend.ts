@@ -1,28 +1,36 @@
 import { existsSync } from "node:fs";
 import { CHROMIUM_PATHS } from "../../shared/browser-paths";
-import { hotOnce } from "./hot-safe";
 import { IS_MACOS, IS_WINDOWS } from "./platform";
 import { settings } from "./settings";
 import { shellExecute } from "./shell-exec";
 
+const OPENED_URL = Symbol.for("narrafork.frontendOpenedUrl");
+const opened = globalThis as { [OPENED_URL]?: string };
+
 /**
- * Open NarraFork the way `server.openBrowser` asks, once per process.
+ * Open NarraFork the way `server.openBrowser` asks, once per process and address.
  *
  * Called when the startup page starts listening and again once the server is up, so the browser
- * opens as early as there is something to show; the page then reloads itself into the app. The
- * Windows manager opens the browser itself (it focuses an existing window first), so a server it
- * supervises never does.
+ * opens as early as there is something to show; the page then reloads itself into the app. When
+ * the server ends up elsewhere (the port was taken, or the LAN host fell back to localhost) the
+ * first page has nothing left to talk to, so the new address is opened too. The Windows manager
+ * opens the browser itself (it focuses an existing window first), so a server it supervises
+ * never does.
  *
  * `explicit` is for a person asking to open it (starting the app again while it runs): "off" only
  * stops the automatic open at startup, the same rule the manager follows.
+ *
+ * Returns whether a browser is being opened.
  */
-export function openFrontendOnce(url: string, options: { explicit?: boolean } = {}): void {
-	if (process.env.NARRAFORK_MANAGER_MANAGED === "1") return;
+export function openFrontendOnce(url: string, options: { explicit?: boolean } = {}): boolean {
+	if (process.env.NARRAFORK_MANAGER_MANAGED === "1") return false;
 	const mode = settings.server.openBrowser;
-	if (mode === "off" && !options.explicit) return;
-	if (!hotOnce("narrafork.frontendOpened")) return;
+	if (mode === "off" && !options.explicit) return false;
+	if (opened[OPENED_URL] === url) return false;
+	opened[OPENED_URL] = url;
 	if (mode === "app") void openAsApp(url);
 	else openInBrowser(url);
+	return true;
 }
 
 /** Open a URL in the user's default browser. */

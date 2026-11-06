@@ -9,13 +9,23 @@
 
 import { STARTUP_STATUS_HEADER } from "../../../shared/startup-status";
 
-export const STARTUP_PAGE_HTML = `<!doctype html>
+function escapeHtml(text: string): string {
+	return text.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
+}
+
+/**
+ * The page, titled with the instance's display name: the Windows manager finds an open window by
+ * that title, so a page titled "NarraFork" would get a second window opened next to it.
+ */
+export function startupPageHtml(brandName: string): string {
+	const title = escapeHtml(brandName);
+	return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>NarraFork</title>
+<title>${title}</title>
 <style>
 :root { color-scheme: light dark; --fg: #1f2330; --muted: #6b7080; --card: #fff; --bg: #f4f5f9;
 	--accent: #5c6ac4; --danger: #c92a2a; --code: #eef0f6; }
@@ -44,7 +54,7 @@ details { margin-top: 16px; }
 </head>
 <body>
 <main>
-	<h1>NarraFork</h1>
+	<h1>${title}</h1>
 	<div class="muted" id="version"></div>
 	<div id="progress">
 		<div class="step">
@@ -74,6 +84,8 @@ details { margin-top: 16px; }
 			migrating: (c, t) => "正在升级数据库（" + c + "/" + t + "）…",
 			hint: "数据库较大时可能需要几分钟，请不要关闭 NarraFork。",
 			stopped: "NarraFork 已停止。处理完成后重新启动即可。",
+			gone: "NarraFork 没有响应。",
+			goneHint: "它可能已经退出。重新启动后，本页会自动进入 NarraFork。",
 			copy: "复制命令", copied: "已复制", details: "详细信息",
 		}
 		: {
@@ -82,6 +94,8 @@ details { margin-top: 16px; }
 			migrating: (c, t) => "Upgrading the database (" + c + "/" + t + ")…",
 			hint: "A large database can take a few minutes. Please keep NarraFork running.",
 			stopped: "NarraFork has stopped. Start it again once this is resolved.",
+			gone: "NarraFork is not responding.",
+			goneHint: "It may have exited. Once it is started again, this page opens it.",
 			copy: "Copy command", copied: "Copied", details: "Details",
 		};
 	const $ = (id) => document.getElementById(id);
@@ -92,6 +106,8 @@ details { margin-top: 16px; }
 	$("details").textContent = text.details;
 	let state;
 	let clockOffset = 0;
+	let unreachableSince = 0;
+	const UNREACHABLE_MS = 15000;
 	const tick = () => {
 		if (!state || state.problem) return;
 		const seconds = Math.round((Date.now() + clockOffset - state.stepStartedAt) / 1000);
@@ -127,14 +143,25 @@ details { margin-top: 16px; }
 	const poll = async () => {
 		try {
 			const response = await fetch("api/startup", { cache: "no-store" });
-			// Anything but the startup page answering means NarraFork is up.
-			if (!response.headers.has("${STARTUP_STATUS_HEADER}")) return location.reload();
+			// NarraFork itself answering means it is up. A proxy's own 502/504 during the takeover
+			// lacks the header too, and reloading onto it would strand the page there.
+			if (!response.headers.has("${STARTUP_STATUS_HEADER}")) {
+				if (response.status < 500) return location.reload();
+				throw new Error("proxy error");
+			}
 			const next = await response.json();
 			clockOffset = next.now - Date.now();
+			unreachableSince = 0;
 			render(next);
 			if (next.problem) return;
 		} catch {
-			// The port is briefly closed while the server takes it over from this page.
+			// The port is closed for a moment while the server takes it over from this page. Much
+			// longer means the process is gone (killed, crashed, failed after the takeover).
+			unreachableSince ||= Date.now();
+			if (Date.now() - unreachableSince > UNREACHABLE_MS) {
+				render({ ...state, problem: { message: { en: text.gone, zh: text.gone } } });
+				$("stopped").textContent = text.goneHint;
+			}
 		}
 		setTimeout(poll, 1000);
 	};
@@ -145,3 +172,4 @@ details { margin-top: 16px; }
 </body>
 </html>
 `;
+}
