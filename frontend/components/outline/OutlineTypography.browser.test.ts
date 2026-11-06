@@ -9,9 +9,12 @@
  *     letter spacing the transcript measures that role with (`typographyMetrics()` /
  *     `headingMetrics()`, read in the page);
  *   - the mind map, which measures its nodes with pretext before drawing them, draws every node
- *     at the height it measured (`nodeAccuracy`) and no node's text overflows its box — including
- *     after the setting changed while the page was open (cache keys, Worker requests and the
- *     line box all follow the setting).
+ *     at the height it measured (`nodeAccuracy`), its frame (arrow, bullet, checkbox) at the width
+ *     it measured, and no node's text overflows its box — including after the setting changed
+ *     while the page was open (cache keys, Worker requests and the line box all follow the
+ *     setting);
+ *   - the frame's icons (inline SVG, `outline-icons.ts`) sit on the middle of their block's first
+ *     line, a heading's included, in the editor and in the map.
  *
  * Mixed Chinese/English text throughout. With `NF_TYPOGRAPHY_SHOTS=<dir>` set, the editor, the
  * map and the tree are also saved as screenshots in both themes.
@@ -59,6 +62,7 @@ const LINES = [
 	"[x] 复现：Anthropic 通道中断后刷新页面",
 	'```ts\nconst canRetry = status === "failed" || status === "aborted";\n```',
 	"重试按钮的显示条件改成 failed 或 aborted；aborted 时文案是「继续」。The label reads Continue.",
+	"[ ] ## 补一条回归测试",
 ];
 
 const SETTINGS = {
@@ -74,6 +78,22 @@ async function expectedOf(e: MapEditor) {
 
 async function frames(e: MapEditor, n = 3): Promise<void> {
 	for (let i = 0; i < n; i++) await e.call((f) => f.afterPaint());
+}
+
+/** The frame's icons sit on the middle of their block's first line (body and heading lines). */
+async function expectFrameIcons(e: MapEditor, where: "outline" | "map", label: string) {
+	const offsets = await e.call((f, w) => f.frameOffsets(w as never), where);
+	// The checkboxes of the body tasks and of the heading task, and the arrow of a parent.
+	expect(offsets.filter((o) => o.part === "ob-check" && o.heading).length, label).toBe(1);
+	expect(offsets.filter((o) => o.part === "ob-check").length, label).toBeGreaterThanOrEqual(3);
+	expect(
+		offsets.some((o) => o.part === "ob-arrow"),
+		label,
+	).toBe(true);
+	expect(
+		offsets.filter((o) => Math.abs(o.off) > 0.5),
+		`${label}: icons off their first line`,
+	).toEqual([]);
 }
 
 /** The computed style of `selector` is the role's: size, px line box and letter spacing. */
@@ -116,6 +136,7 @@ async function expectEditor(e: MapEditor, x: Expected): Promise<void> {
 	await expectRole(e, `${pm} .ob-content h2`, x.h2, "heading");
 	await expectRole(e, `${pm} .ob-content p code`, x.code, "inline code");
 	await expectRole(e, `${pm} .ob-content pre`, x.codeBlock, "code block");
+	await expectFrameIcons(e, "outline", "editor");
 }
 
 async function expectMap(e: MapEditor, x: Expected, label: string): Promise<void> {
@@ -131,7 +152,11 @@ async function expectMap(e: MapEditor, x: Expected, label: string): Promise<void
 	// Measured with pretext, drawn by CSS: the same height, to the pixel.
 	expect(accuracy.maxDiffH, `${label} measured vs drawn node height`).toBeLessThanOrEqual(1);
 	expect(accuracy.overH, label).toBe(0);
+	// The frame (arrow, bullet, a task's checkbox) is drawn at the width measured for it.
+	expect(accuracy.maxDiffFrame, `${label} measured vs drawn frame width`).toBeLessThanOrEqual(0.5);
+	expect(accuracy.overFrame, label).toBe(0);
 	expect(await e.call((f) => f.nodeOverflow()), `${label} node text overflow`).toEqual([]);
+	await expectFrameIcons(e, "map", `${label} map`);
 }
 
 async function seqOf(spaceId: string): Promise<number> {
@@ -246,6 +271,8 @@ const SWEEP_LINES = [
 	"背景：用户中断回合后，消息气泡上没有「重试」按钮，只能重新输入。Mixed English 与中文混排。",
 	"拉丁词后接分号 aborted；继续写 continue」再写 abc）以及 done。最后 end，结束。还要更多文字让它换行。",
 	"使用**Bunruntime**运行，见`fix/retry-after-interrupt`）与「continue」以及 v1.2）和 −7）。",
+	"[ ] 重试按钮的显示条件改成 failed 或 aborted；aborted 时文案是「继续」。",
+	"[x] ## 结论与后续",
 ];
 
 test("a measuring Worker that never answers does not leave the map moving", async () => {
@@ -295,9 +322,15 @@ test("every node is drawn at its measured height across font × letter spacing �
 					(o) => o.overW > 0 || (lineHeightScalePercent >= 100 && o.overH > 0),
 				);
 				checked += accuracy.checked;
-				if (accuracy.maxDiffH > 1 || accuracy.overH > 0 || overflow.length > 0) {
+				if (
+					accuracy.maxDiffH > 1 ||
+					accuracy.overH > 0 ||
+					accuracy.maxDiffFrame > 0.5 ||
+					accuracy.overFrame > 0 ||
+					overflow.length > 0
+				) {
 					failures.push(
-						`${JSON.stringify(setting)}: maxDiffH ${accuracy.maxDiffH}, ${accuracy.overH} off, overflow ${JSON.stringify(overflow)}`,
+						`${JSON.stringify(setting)}: maxDiffH ${accuracy.maxDiffH}, ${accuracy.overH} off, frame ${accuracy.maxDiffFrame} / ${accuracy.overFrame}, overflow ${JSON.stringify(overflow)}`,
 					);
 				}
 			}

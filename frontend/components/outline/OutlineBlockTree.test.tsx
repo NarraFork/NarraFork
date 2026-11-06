@@ -155,6 +155,13 @@ describe("OutlineBlockTree", () => {
 		expect(html).not.toContain("Block b");
 		expect(html).not.toContain("page.more");
 		expect(html).toContain('aria-expanded="false"');
+		// Folded: the arrow points right and the bullet keeps its halo, as in the live editor.
+		const doc = parseHTML(`<!doctype html><html><body>${html}</body></html>`).document;
+		const row = doc.querySelector('[data-block-id="a"]');
+		expect(row?.querySelector("svg")?.getAttribute("class")?.split(" ")).toContain(
+			"tabler-icon-chevron-right",
+		);
+		expect(row?.querySelector('[data-collapsed="true"]')).not.toBeNull();
 	});
 
 	test("without a link renderer (a dock panel), focus links are plain anchors", () => {
@@ -198,6 +205,14 @@ describe("OutlineBlockTree", () => {
 		expect(mark("w")?.getAttribute("data-state")).toBe("withdrawn");
 		expect(mark("t")).toBeNull();
 		expect(doc.querySelector('[data-block-id="t"] [aria-label="page.task.todo"]')).not.toBeNull();
+		// The icons the live editor's frame draws too (`outline-icons.ts`).
+		const iconOf = (id: string) =>
+			doc
+				.querySelector(`[data-block-id="${id}"] [role="img"] svg`)
+				?.getAttribute("class")
+				?.split(" ");
+		expect(iconOf("t")).toContain("tabler-icon-square");
+		expect(iconOf("q")).toContain("tabler-icon-help-circle");
 
 		const list = render(
 			<InProgressList

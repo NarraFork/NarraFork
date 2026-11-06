@@ -34,7 +34,7 @@ import {
 	srcToPm,
 	titleOf,
 } from "@shared/outline";
-import type { LiveTaskChar } from "@shared/outline-live-protocol";
+import { LIVE_STATUS_OF_TASK, type LiveTaskChar } from "@shared/outline-live-protocol";
 import { baseKeymap, toggleMark } from "prosemirror-commands";
 import { keymap } from "prosemirror-keymap";
 import { Fragment, type Node as PMNode, Slice } from "prosemirror-model";
@@ -49,6 +49,7 @@ import {
 } from "prosemirror-state";
 import { ReplaceStep } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView, type NodeView } from "prosemirror-view";
+import { iconSvg, taskIconOf } from "../outline-icons";
 import {
 	applyChrome,
 	type BlockMark,
@@ -57,7 +58,6 @@ import {
 	type Gutter,
 	type MentionResolver,
 	mentionLabel,
-	TASK_GLYPH,
 	TASK_NEXT,
 } from "./chrome";
 import {
@@ -1629,7 +1629,16 @@ class BlockView implements NodeView {
 			item.className = "ob-task-item";
 			item.setAttribute("role", "button");
 			item.dataset.taskId = task.id;
-			item.textContent = `${TASK_GLYPH[task.task]} ${task.title}${task.waiting ? ` · ${chromeText.waiting}` : ""}`;
+			// The task's checkbox, as the tree's list shows it, then its title.
+			const icon = document.createElement("span");
+			icon.className = "ob-task-icon";
+			icon.setAttribute("role", "img");
+			icon.setAttribute("aria-label", chromeText.status[LIVE_STATUS_OF_TASK[task.task]]);
+			icon.append(iconSvg(taskIconOf(task.task), icon.ownerDocument));
+			const label = document.createElement("span");
+			label.className = "ob-task-title";
+			label.textContent = `${task.title}${task.waiting ? ` · ${chromeText.waiting}` : ""}`;
+			item.append(icon, label);
 			item.addEventListener("mousedown", (e) => {
 				e.preventDefault();
 				this.taskList?.remove();

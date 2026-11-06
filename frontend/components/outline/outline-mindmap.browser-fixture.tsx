@@ -50,7 +50,14 @@ import { liveSessionsOn } from "./editor/live-sessions";
 import { OutlineEditor } from "./editor/OutlineEditor";
 import { overrideLiveTransportForTests } from "./editor/transport";
 import { findBlockPos, type OutlineView } from "./editor/view";
-import { bodySize, clearMeasureCache, measureStats, NODE, nodeSize } from "./mindmap/measure";
+import {
+	bodySize,
+	clearMeasureCache,
+	frameWidth,
+	measureStats,
+	NODE,
+	nodeSize,
+} from "./mindmap/measure";
 import { prewarmStats, setMeasureWorkerFactoryForTests } from "./mindmap/prewarm";
 import { OutlineSurface } from "./OutlineSurface";
 import { quickSwitcherIndexOf } from "./QuickSwitcher";
@@ -811,23 +818,81 @@ export function mapStats() {
 }
 
 /** How far measured node heights are from the DOM's (pretext vs. layout). */
-export function nodeAccuracy(): { checked: number; maxDiffH: number; overH: number } {
+export function nodeAccuracy(): {
+	checked: number;
+	maxDiffH: number;
+	overH: number;
+	/** Most a node's frame (arrow, bullet, checkbox) is drawn off the width measured for it. */
+	maxDiffFrame: number;
+	/** Nodes whose body the frame pushed past the node's padding (more than half a pixel). */
+	overFrame: number;
+} {
 	const m = surface().map;
 	let checked = 0;
 	let maxDiffH = 0;
 	let overH = 0;
+	let maxDiffFrame = 0;
+	let overFrame = 0;
 	for (const [id, ne] of m.els) {
 		if (m.editing?.id === id || id.startsWith("\u0000")) continue;
 		const inf = m.info.get(id);
 		if (!inf) continue;
 		const predicted = nodeSize(bodySize(inf.content), !!inf.task).h;
-		const actual = ne.el.getBoundingClientRect().height / m.scale;
+		const box = ne.el.getBoundingClientRect();
+		const actual = box.height / m.scale;
 		const d = Math.abs(predicted - actual);
 		checked++;
 		if (d > maxDiffH) maxDiffH = d;
 		if (d > 1) overH++;
+		const frame = ne.g.el.getBoundingClientRect().width / m.scale;
+		const dFrame = Math.abs(frame - frameWidth(!!inf.task));
+		if (dFrame > maxDiffFrame) maxDiffFrame = dFrame;
+		const right = (box.right - ne.body.getBoundingClientRect().right) / m.scale;
+		if (right < NODE.padX + NODE.border - 0.5) overFrame++;
 	}
-	return { checked, maxDiffH: +maxDiffH.toFixed(2), overH };
+	return {
+		checked,
+		maxDiffH: +maxDiffH.toFixed(2),
+		overH,
+		maxDiffFrame: +maxDiffFrame.toFixed(2),
+		overFrame,
+	};
+}
+
+/**
+ * How far each frame icon (the checkbox, a question's mark, the folding arrow: inline SVG) sits
+ * off the middle of its block's first line box, in the outline or in the map's nodes, in CSS px:
+ * the icons are centred on the first line, a heading's included.
+ */
+export function frameOffsets(
+	where: "outline" | "map",
+): Array<{ id: string; part: string; heading: boolean; off: number }> {
+	const map = where === "map" ? surface().map : null;
+	const scale = map?.scale ?? 1;
+	const blocks = map
+		? [...document.querySelectorAll<HTMLElement>(".mm-node:not(.mm-more-node)")]
+		: [...document.querySelectorAll<HTMLElement>(".nf-outline-scroller .ob-block")];
+	const out: Array<{ id: string; part: string; heading: boolean; off: number }> = [];
+	for (const block of blocks) {
+		const first = block.querySelector<HTMLElement>(
+			map ? ":scope > .mm-body > :first-child" : ":scope > .ob-content > :first-child",
+		);
+		const gutter = block.querySelector<HTMLElement>(":scope > .ob-gutter");
+		if (!first || !gutter || getComputedStyle(gutter).display === "none") continue;
+		const top = first.getBoundingClientRect().top;
+		const line = Number.parseFloat(getComputedStyle(first).lineHeight);
+		for (const svg of gutter.querySelectorAll("svg")) {
+			const r = svg.getBoundingClientRect();
+			if (!r.height) continue;
+			out.push({
+				id: block.dataset.id ?? "",
+				part: svg.parentElement?.className ?? "",
+				heading: /^H\d$/.test(first.tagName),
+				off: +((r.top + r.height / 2 - top) / scale - line / 2).toFixed(2),
+			});
+		}
+	}
+	return out;
 }
 
 export function prewarmDone(): Promise<{ posted: number; done: number; wallMs: number }> {

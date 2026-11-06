@@ -5,38 +5,24 @@ import type {
 	OutlineTaskStatus,
 	OutlineViewBlock,
 } from "@shared/outline-api";
-import {
-	IconChevronDown,
-	IconChevronRight,
-	IconHelpCircle,
-	IconLock,
-	IconSquare,
-	IconSquareCheck,
-	IconSquareHalf,
-	IconSquareX,
-} from "@tabler/icons-react";
+import { IconLock } from "@tabler/icons-react";
 import { memo, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { visibleRows } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
+import { FOLD_ICONS, QUESTION_ICON, TASK_ICONS } from "./outline-icons";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 /** Indentation stops growing past this depth so deep outlines stay inside a phone's width. */
 const MAX_INDENT_DEPTH = 8;
 const INDENT_PX = 18;
 
-const TASK_ICONS: Record<OutlineTaskStatus, typeof IconSquare> = {
-	todo: IconSquare,
-	doing: IconSquareHalf,
-	done: IconSquareCheck,
-	cancelled: IconSquareX,
-};
-
+/** A task's checkbox: the same icon the live editor's frame draws (`outline-icons.ts`). */
 export function OutlineTaskIcon({ status }: { status: OutlineTaskStatus }) {
 	const { t } = useTranslation("outline");
-	const Icon = TASK_ICONS[status];
+	const { Icon } = TASK_ICONS[status];
 	return (
 		<Tooltip label={t(`page.task.${status}`)} openDelay={400}>
 			<span className={classes.taskIcon} role="img" aria-label={t(`page.task.${status}`)}>
@@ -65,6 +51,7 @@ export function OutlineQuestionIcon({
 }) {
 	const { t } = useTranslation("outline");
 	const label = t(`page.question.${state}${state === "open" && proceed ? "Proceeded" : ""}`);
+	const { Icon } = QUESTION_ICON;
 	return (
 		<Tooltip label={label} openDelay={400}>
 			<span
@@ -75,10 +62,15 @@ export function OutlineQuestionIcon({
 				data-state={state}
 				style={{ color: QUESTION_COLORS[state] }}
 			>
-				<IconHelpCircle size={16} />
+				<Icon size={16} />
 			</span>
 		</Tooltip>
 	);
+}
+
+function FoldIcon({ collapsed }: { collapsed: boolean }) {
+	const { Icon } = FOLD_ICONS[collapsed ? "collapsed" : "expanded"];
+	return <Icon size={14} />;
 }
 
 interface RowProps {
@@ -129,11 +121,15 @@ const OutlineRow = memo(function OutlineRow({
 						aria-expanded={!collapsed}
 						onClick={() => onToggle(block.id)}
 					>
-						{collapsed ? <IconChevronRight size={14} /> : <IconChevronDown size={14} />}
+						<FoldIcon collapsed={collapsed} />
 					</ActionIcon>
 				)}
 			</span>
-			{focusLink(<span className={classes.bulletDot} />, classes.bullet, t("page.focus"))}
+			{focusLink(
+				<span className={classes.bulletDot} data-collapsed={hasChildren && collapsed} />,
+				classes.bullet,
+				t("page.focus"),
+			)}
 			{block.task && <OutlineTaskIcon status={block.task.status} />}
 			{!block.task && block.question && (
 				<OutlineQuestionIcon state={block.question.state} proceed={block.question.proceed} />
