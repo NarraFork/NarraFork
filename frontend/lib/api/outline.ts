@@ -37,6 +37,8 @@ import type {
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardSeenRequest,
+	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
 	OutlineBoardTaskUpdateResponse,
 	OutlineTaskBoardResponse,
@@ -228,6 +230,16 @@ export const outlineApi = {
 		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
 			method: "PATCH",
 			body: JSON.stringify(body),
+		}),
+	/**
+	 * The person saw these tasks marked 「新完成」 on a board (outline P2 PR 9b); `keepalive` when
+	 * the page is going away.
+	 */
+	markBoardTasksSeen: (body: OutlineBoardSeenRequest, options: { keepalive?: boolean } = {}) =>
+		request<OutlineBoardSeenResponse>("/outline/tasks/seen", {
+			method: "POST",
+			body: JSON.stringify(body),
+			...(options.keepalive ? { keepalive: true } : {}),
 		}),
 	/** The status bar's current task, from the session's task source (either backend). */
 	getNarratorCurrentTask: (narratorId: string) =>

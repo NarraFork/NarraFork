@@ -29,6 +29,7 @@ import {
 	outlineQuestions,
 	outlineSpaces,
 	outlineTaskClaims,
+	outlineTaskSeen,
 	outlineViewState,
 } from "@server/db/postgres-schema";
 import type { OutlineAskJson, OutlineTaskJson } from "@server/db/schema";
@@ -43,6 +44,7 @@ import {
 	inArray,
 	isNotNull,
 	isNull,
+	lt,
 	lte,
 	ne,
 	notInArray,
@@ -94,6 +96,7 @@ import {
 	OutlineStaleWriteError,
 	type OutlineStore,
 	type OutlineTaskClaimRow,
+	type OutlineTaskSeenRow,
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
 	oldestClaimsFirst,
@@ -194,6 +197,34 @@ function toViewState(row: ViewStateSelect): OutlineViewStateRow {
 		layout: row.layout === "down" ? "down" : "right",
 		updatedAt: row.updatedAt,
 	};
+}
+
+/**
+ * Record the finished tasks a person has seen (each at the latest version seen) and drop their
+ * marks seen before `pruneBefore`.
+ */
+async function putTaskSeenSection(
+	tx: PgTransaction,
+	userId: string,
+	rows: readonly OutlineTaskSeenRow[],
+	at: string,
+	pruneBefore: string,
+): Promise<void> {
+	for (const chunk of chunked(rows)) {
+		await tx
+			.insert(outlineTaskSeen)
+			.values(chunk.map((row) => ({ userId, ...row, seenAt: at })))
+			.onConflictDoUpdate({
+				target: [outlineTaskSeen.userId, outlineTaskSeen.taskBlockId],
+				set: {
+					seenSeq: sql`greatest(excluded.seen_seq, ${outlineTaskSeen.seenSeq})`,
+					seenAt: at,
+				},
+			});
+	}
+	await tx
+		.delete(outlineTaskSeen)
+		.where(and(eq(outlineTaskSeen.userId, userId), lt(outlineTaskSeen.seenAt, pruneBefore)));
 }
 
 /** Write a person's view state of a page and drop their oldest pages beyond the cap. */
@@ -1130,6 +1161,31 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			});
 		},
 
+		async getTaskSeen(userId, taskBlockIds) {
+			const out: OutlineTaskSeenRow[] = [];
+			for (const chunk of chunked([...new Set(taskBlockIds)])) {
+				out.push(
+					...(await db
+						.select({
+							taskBlockId: outlineTaskSeen.taskBlockId,
+							seenSeq: outlineTaskSeen.seenSeq,
+						})
+						.from(outlineTaskSeen)
+						.where(
+							and(eq(outlineTaskSeen.userId, userId), inArray(outlineTaskSeen.taskBlockId, chunk)),
+						)),
+				);
+			}
+			return out;
+		},
+
+		async putTaskSeen(userId, rows, at, pruneBefore) {
+			await withPgRetry(
+				() => db.transaction((tx) => putTaskSeenSection(tx, userId, rows, at, pruneBefore)),
+				{ label: "outline.putTaskSeen" },
+			);
+		},
+
 		async applyCommit(plan) {
 			let outcome: "applied" | "stale" | "claims" | "pending";
 			try {
@@ -1640,7 +1696,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				.limit(limit);
 		},
 
-		async listSessionTaskClaims(narratorId, limit) {
+		async listSessionTaskClaims(narratorId, limit, options) {
 			const held = (holder: SQL) =>
 				db
 					.select({ claim: outlineTaskClaims, spaceId: outlineBlocks.spaceId })
@@ -1653,7 +1709,9 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 						sql`${outlineTaskClaims.taskBlockId} COLLATE "C"`,
 					)
 					.limit(limit);
-			const own = await held(eq(outlineTaskClaims.holderNarratorId, narratorId));
+			const own = options?.subagentsOnly
+				? []
+				: await held(eq(outlineTaskClaims.holderNarratorId, narratorId));
 			const subagents = await held(
 				inArray(
 					outlineTaskClaims.holderNarratorId,

@@ -884,6 +884,12 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				(await ctx.store.listSessionTaskClaims(root, 100)).map((x) => x.claim.taskBlockId).sort(),
 			).toEqual([a, b, c, f].sort());
 			expect((await ctx.store.listSessionTaskClaims(root, 2)).length).toBe(2);
+			// Only its subagents' (the current-tasks view's "delegated" section, P2 PR 9b).
+			expect(
+				(await ctx.store.listSessionTaskClaims(root, 100, { subagentsOnly: true }))
+					.map((x) => x.claim.taskBlockId)
+					.sort(),
+			).toEqual([b, c, f].sort());
 			expect(
 				(await ctx.store.listSessionTaskClaims(sub, 100)).map((x) => x.claim.taskBlockId).sort(),
 			).toEqual([b, f].sort());

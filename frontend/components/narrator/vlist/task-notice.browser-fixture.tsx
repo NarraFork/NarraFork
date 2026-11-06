@@ -1,6 +1,7 @@
 /**
  * Browser fixture for the transcript's task notices (`task-notice.browser.test.ts`): the turn-end
- * reminder, people's task changes, the interrupt guard and current-tasks updates, through the real
+ * reminder, people's task changes, the interrupt guard, current-tasks updates (one with tasks
+ * delegated to subagents) and tasks finished elsewhere, through the real
  * adapter → measure → render chain with the shell's zh-CN labels, laid out by Chromium. It reports
  * each card's measured height beside the height the browser actually gave it, so the test can
  * hold the measure pass to what is painted (at any typography the reader chose).
@@ -162,6 +163,47 @@ function notices(): AdapterSegment[] {
 				},
 			},
 		]),
+		// Outline P2 PR 9b: the view with what the session's subagents are doing (「委派中」), and
+		// the notice of tasks the session created that were finished elsewhere.
+		row([
+			{ type: "text", text: "Context updated: outline.tasks" },
+			{
+				type: "context_update",
+				epochId: "e",
+				changes: [],
+				snapshotRef: "r",
+				display: {
+					"outline.tasks": {
+						...VIEW,
+						delegated: [
+							{ address: `${K}/De1eGa7e`, title: "修复刷新令牌的竞态" },
+							{ address: `${K}/De2eGa7e`, title: "给重试按钮补端到端用例" },
+						],
+						counts: { ...VIEW.counts, delegated: 2 },
+					},
+				},
+			},
+		]),
+		row([
+			{
+				type: "system_injection",
+				source: "outline_task_finished",
+				modelText: "系统通知（不是用户发言）：…",
+				body: {
+					kind: "outlineTasks",
+					variant: "finished",
+					items: [
+						{
+							address: `${K}/mSsl3Ccf`,
+							title: "排查中断后无重试按钮",
+							by: "发布准备",
+							changes: [{ kind: "status", from: "doing", to: "done" }],
+						},
+					],
+					more: 2,
+				},
+			},
+		]),
 	];
 }
 
@@ -267,6 +309,9 @@ export interface CardReport {
 	/** The folded line's lead: drawn, and cut short (an ellipsis). */
 	lead: boolean;
 	leadTruncated: boolean;
+	/** The card's heading, and the status chips drawn (their text, in order). */
+	title: string;
+	statuses: string[];
 }
 
 export function report(): CardReport[] {
@@ -328,6 +373,10 @@ export function report(): CardReport[] {
 			tailFontPx: tail ? Number.parseFloat(getComputedStyle(tail).fontSize) : -1,
 			lead: !!lead,
 			leadTruncated: !!lead && lead.scrollWidth > lead.clientWidth + 0.5,
+			title: card.querySelector("[data-task-notice-title]")?.textContent ?? "",
+			statuses: [...card.querySelectorAll("[data-task-notice-status]")].map(
+				(chip) => chip.textContent ?? "",
+			),
 		};
 	});
 }

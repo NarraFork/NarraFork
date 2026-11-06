@@ -1629,6 +1629,12 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/digest-job")
 		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
 		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
+	// Outline tasks a session created and someone else finished: that session is told.
+	import("./services/outline/task-finished")
+		.then(({ startOutlineTaskFinishedNotices }) => startOutlineTaskFinishedNotices())
+		.catch((err) =>
+			logger.warn("Outline task-finished notices failed to start", { error: String(err) }),
+		);
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this

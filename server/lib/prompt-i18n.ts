@@ -37,9 +37,11 @@ export type {
 	OutlineTaskEdit,
 	OutlineTaskEditChange,
 	OutlineTaskEditGroup,
+	OutlineTaskFinishedEntry,
 	OutlineTaskPromptTask,
 	OutlineTasksViewSection,
 	OutlineTaskWaitText,
+	OutlineViewAgent,
 	OutlineViewTask,
 } from "./prompts/outline-tasks";
 export {
@@ -59,11 +61,13 @@ export {
 	getOutlineInterruptNote,
 	getOutlineSpecUnavailableHint,
 	getOutlineTaskEditNote,
+	getOutlineTaskFinishedNote,
 	getOutlineTaskSystemReminder,
 	getOutlineTasksViewHeading,
 	getOutlineTasksViewMore,
 	getOutlineTasksViewSection,
 	getOutlineTurnEndNote,
+	getOutlineViewDelegatedLine,
 	getOutlineViewTaskLine,
 } from "./prompts/outline-tasks";
 export type {

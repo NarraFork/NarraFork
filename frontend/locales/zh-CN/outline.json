@@ -533,6 +533,8 @@
 		"count": "{{count}} 项未完成",
 		"planning": "计划中",
 		"humanCreated": "人建",
+		"newlyDone": "新完成",
+		"newlyDoneHint": "agent 做完了你建的任务。你看过之后，这个标记就会消失。",
 		"locked": "已锁定 · {{name}}",
 		"lockedSomeone": "已锁定",
 		"waitPrerequisites": "等 {{count}} 个前置任务",

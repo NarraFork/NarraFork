@@ -253,11 +253,13 @@ export type SideCarBody =
 	 * A notice about the session's outline tasks, beside its model-facing text (which the producer
 	 * wrote and no template renders): `turnEnd`, a long turn ended with a task still in progress
 	 * (`outline_task_turn_end`); `edited`, people changed tasks of the session
-	 * (`outline_task_edit`). The reader sees the tasks as titled outline links with status chips.
+	 * (`outline_task_edit`); `finished`, tasks the session created were finished by another
+	 * session or a person (`outline_task_finished`, outline P2 PR 9b). The reader sees the tasks as
+	 * titled outline links with status chips.
 	 */
 	| {
 			kind: "outlineTasks";
-			variant: "turnEnd" | "edited";
+			variant: "turnEnd" | "edited" | "finished";
 			items: OutlineTaskNoticeItem[];
 			/** Tasks (or changes) the notice counts without naming. */
 			more?: number;
@@ -326,7 +328,8 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			const more = typeof body.more === "number" && body.more > 0 ? Math.floor(body.more) : 0;
 			return {
 				kind: "outlineTasks",
-				variant: body.variant === "edited" ? "edited" : "turnEnd",
+				variant:
+					body.variant === "edited" || body.variant === "finished" ? body.variant : "turnEnd",
 				items: boundOutlineTaskNoticeItems(body.items),
 				...(more > 0 ? { more } : {}),
 			};
@@ -456,6 +459,7 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	// Outline task notices (`outlineTasks`).
 	outlineTaskTurnEndHeading: "Still in progress — tick it done when it is",
 	outlineTaskEditedHeading: "{n} task(s) changed by people",
+	outlineTaskFinishedHeading: "{n} task(s) this session created were finished elsewhere",
 	outlineTaskMore: "{n} more not listed",
 	outlineAnswersHeading: "{who} answered {n} question(s)",
 	outlineAnswersSomeone: "Someone",
@@ -783,7 +787,11 @@ function projectSideCarBody(
 						? labelWith(labels, "outlineTaskEditedHeading", {
 								n: body.items.length + (body.more ?? 0),
 							})
-						: label(labels, "outlineTaskTurnEndHeading"),
+						: body.variant === "finished"
+							? labelWith(labels, "outlineTaskFinishedHeading", {
+									n: body.items.length + (body.more ?? 0),
+								})
+							: label(labels, "outlineTaskTurnEndHeading"),
 				lines,
 			};
 		}
@@ -1175,6 +1183,7 @@ export function sideCarBodyToPlainText(
 const PLAIN_TICKLESS_SOURCES: ReadonlySet<string> = new Set([
 	"outline_task_turn_end",
 	"outline_task_edit",
+	"outline_task_finished",
 	"interrupt_task_guard",
 ]);
 

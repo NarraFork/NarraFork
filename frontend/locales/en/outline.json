@@ -533,6 +533,8 @@
 		"count": "{{count}} open",
 		"planning": "Planning",
 		"humanCreated": "Set by a person",
+		"newlyDone": "Newly done",
+		"newlyDoneHint": "An agent finished this task you created. The mark goes once you have seen it.",
 		"locked": "Locked · {{name}}",
 		"lockedSomeone": "Locked",
 		"waitPrerequisites": "Waits for {{count}} prerequisite(s)",

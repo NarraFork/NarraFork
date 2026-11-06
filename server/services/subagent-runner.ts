@@ -149,6 +149,13 @@ export interface RunSubagentInput {
 	 * once it exists, before it runs.
 	 */
 	delegation?: import("./outline/delegation").PreparedOutlineDelegation;
+	/**
+	 * Told the head of the note a foreground delegated result was delivered with (null: none), so
+	 * the Agent call can carry it as data for its card (outline P2 PR 9b).
+	 */
+	onDelegatedResult?: (
+		note: import("@shared/outline-report-note").OutlineReportNote | null,
+	) => void;
 }
 
 /**
@@ -357,9 +364,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		// The tool card is announced by the run itself, with the model each run uses.
 
 		const conflictNote = aliasRegistration.conflicted
-			? `\n\nNote: The requested alias "${alias || title || subagentId}" was already taken. ` +
-				`This agent was assigned "${aliasRegistration.alias}" instead.` +
-				(background ? "" : " Use this alias with Await or Send to reference this agent.")
+			? aliasConflictNote(alias || title || subagentId, aliasRegistration.alias, background)
 			: "";
 
 		if (background) {
@@ -450,6 +455,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			return terminal.output;
 		}
 		const result = await handle.foreground;
+		input.onDelegatedResult?.(result.outlineReport ?? null);
 		return result.output + formatSubagentModelFallbackNote(inheritance) + conflictNote;
 	} catch (error) {
 		updateLease.release();
@@ -461,6 +467,22 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			});
 		throw error;
 	}
+}
+
+/**
+ * The note after a result whose alias was taken (the card's text reader strips it before it reads
+ * the outline note: `@shared/outline-report-note`).
+ */
+export function aliasConflictNote(
+	requested: string,
+	assigned: string,
+	background: boolean,
+): string {
+	return (
+		`\n\nNote: The requested alias "${requested}" was already taken. ` +
+		`This agent was assigned "${assigned}" instead.` +
+		(background ? "" : " Use this alias with Await or Send to reference this agent.")
+	);
 }
 
 const NOT_STARTED = "The delegated agent's run did not start; its task was given back";
