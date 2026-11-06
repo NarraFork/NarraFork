@@ -391,6 +391,11 @@ export const settingsApi = {
 			/** 提交身份入口的显示位置：会话右键菜单 / 新建会话弹窗（跟账号走）。 */
 			gitIdentityContextMenu: boolean;
 			gitIdentityCreateModal: boolean;
+			/** The outline's daily report (P2 PR 11): IANA zone and `HH:MM`; null is the default. */
+			outlineDigestTimeZone: string | null;
+			outlineDigestTime: string | null;
+			/** What the report uses while the zone is null. */
+			outlineDigestServerTimeZone: string;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -460,6 +465,9 @@ export const settingsApi = {
 		};
 		gitIdentityContextMenu?: boolean;
 		gitIdentityCreateModal?: boolean;
+		/** Null goes back to the default (the server's zone, 07:00). */
+		outlineDigestTimeZone?: string | null;
+		outlineDigestTime?: string | null;
 	}) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",

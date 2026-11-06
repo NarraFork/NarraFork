@@ -22,9 +22,12 @@ import * as pgSchema from "../../../../server/db/postgres-schema";
 import { generateId } from "../../../../server/lib/id";
 import {
 	OUTLINE_STORE_CONTRACT,
-	type OutlineContractContext,
 	type SpaceDump,
 } from "../../../../server/services/outline/__tests__/contract";
+import {
+	OUTLINE_DIGEST_CONTRACT,
+	type OutlineDigestContractContext,
+} from "../../../../server/services/outline/__tests__/digest-contract";
 import { OUTLINE_PENDING_CONTRACT } from "../../../../server/services/outline/__tests__/pending-contract";
 import { OUTLINE_QUESTION_CONTRACT } from "../../../../server/services/outline/__tests__/question-contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
@@ -78,7 +81,7 @@ describe("PostgreSQL outline store", () => {
 				const pgDb: BunSQLDatabase = client.db;
 				await ensurePgFts(client.sql);
 				const store = createPostgresOutlineStore(pgDb);
-				const ctx: OutlineContractContext = {
+				const ctx: OutlineDigestContractContext = {
 					store,
 					randomTransactions: 40,
 					async seedUser() {
@@ -182,6 +185,12 @@ describe("PostgreSQL outline store", () => {
 							.delete(pgSchema.outlineTaskClaims)
 							.where(inArray(pgSchema.outlineTaskClaims.taskBlockId, [...taskBlockIds]));
 					},
+					async setLastCommitAt(spaceId, value) {
+						await pgDb
+							.update(pgSchema.outlineSpaces)
+							.set({ lastCommitAt: value })
+							.where(eq(pgSchema.outlineSpaces.id, spaceId));
+					},
 					async searchContent(needle) {
 						const rows = await client.sql.unsafe(
 							"SELECT id FROM search_outline_blocks WHERE content ILIKE $1",
@@ -200,6 +209,7 @@ describe("PostgreSQL outline store", () => {
 						...OUTLINE_PENDING_CONTRACT,
 						...OUTLINE_QUESTION_CONTRACT,
 						...OUTLINE_READ_CONTRACT,
+						...OUTLINE_DIGEST_CONTRACT,
 					]) {
 						try {
 							await contractCase.run(ctx);
@@ -227,7 +237,8 @@ describe("PostgreSQL outline store", () => {
 					OUTLINE_TASK_CONTRACT.length +
 					OUTLINE_PENDING_CONTRACT.length +
 					OUTLINE_QUESTION_CONTRACT.length +
-					OUTLINE_READ_CONTRACT.length,
+					OUTLINE_READ_CONTRACT.length +
+					OUTLINE_DIGEST_CONTRACT.length,
 			);
 		},
 		RUN_TIMEOUT_MS,

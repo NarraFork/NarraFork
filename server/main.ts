@@ -1624,6 +1624,11 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/in-process")
 		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
 		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
+	// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
+	// in bounded slices), and "today so far" when asked.
+	import("./services/outline/digest-job")
+		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
+		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
@@ -1824,9 +1829,11 @@ async function performGracefulShutdown(
 			async () => {
 				const tasks = await import("./services/outline/tasks");
 				const inProcess = await import("./services/outline/in-process");
+				const digests = await import("./services/outline/digest-job");
 				await Promise.all([
 					inProcess.stopOutlineInProcessRebuild(),
 					tasks.stopOutlineTaskLeaseJob(),
+					digests.stopOutlineDigestJob(),
 				]);
 			},
 			5_000,

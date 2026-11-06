@@ -171,6 +171,12 @@ export const outlineApi = {
 			method: "POST",
 			body: JSON.stringify({ pendingIds }),
 		}),
+	/** Mark all the caller's unread reports read (P2 PR 11). */
+	markOutlineReportsSeen: () =>
+		request<{ marked: number }>("/outline/digests/seen", {
+			method: "POST",
+			body: JSON.stringify({ all: true }),
+		}),
 	/** A session's task board (its dock tab). */
 	getSessionTaskBoard: (narratorId: string) =>
 		request<OutlineTaskBoardResponse>(`/outline/narrators/${enc(narratorId)}/tasks`),

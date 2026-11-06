@@ -39,6 +39,7 @@ import {
 	invalidateOutlineSpace,
 	useAnswerOutlineQuestions,
 	useMarkOutlineDigestSeen,
+	useMarkOutlineReportsSeen,
 	useOutlineDigest,
 	useOutlinePendingDetail,
 	useOutlineQuestions,
@@ -403,21 +404,61 @@ export function OutlineQuestionsSection({ view }: { view: OutlineBlockViewRespon
 	);
 }
 
-/** What agents confirmed on the person's behalf: each revertable; "Got it" acknowledges them. */
-function OutlineDigestList({ onOpen }: { onOpen?: () => void }) {
+/**
+ * What agents confirmed on the person's behalf: each revertable; "Got it" acknowledges them, and
+ * the unread reports of the row (P2 PR 11; their own view comes with the report page).
+ */
+function OutlineDigestList({
+	onOpen,
+	reportIds = [],
+	reportItems = 0,
+}: {
+	onOpen?: () => void;
+	reportIds?: string[];
+	reportItems?: number;
+}) {
 	const { t } = useTranslation("outline");
 	const queryClient = useQueryClient();
 	const digest = useOutlineDigest();
 	const seen = useMarkOutlineDigestSeen();
+	const reportsSeen = useMarkOutlineReportsSeen();
 	const [reverting, setReverting] = useState<string | null>(null);
 	const [reverted, setReverted] = useState<Set<string>>(new Set());
 	if (digest.isLoading) return <Loader size="xs" />;
 	const items = digest.data?.items ?? [];
-	if (items.length === 0)
+	const gotIt = () => {
+		if (items.length > 0) seen.mutate(items.map((i) => i.pendingId));
+		// Every unread report, not only those the row names.
+		if (reportIds.length > 0) reportsSeen.mutate();
+	};
+	const reports =
+		reportIds.length > 0 ? (
+			<Text size="xs" data-testid="outline-digest-reports">
+				{t("report.unread", { count: reportIds.length, items: reportItems })}
+			</Text>
+		) : null;
+	if (items.length === 0 && !reports)
 		return (
 			<Text size="xs" c="dimmed">
 				{t("digest.empty")}
 			</Text>
+		);
+	if (items.length === 0)
+		return (
+			<Stack gap="xs" data-testid="outline-digest">
+				{reports}
+				<Group>
+					<Button
+						size="compact-sm"
+						variant="light"
+						loading={reportsSeen.isPending}
+						onClick={gotIt}
+						data-testid="outline-digest-seen"
+					>
+						{t("digest.gotIt")}
+					</Button>
+				</Group>
+			</Stack>
 		);
 	const revert = async (pendingId: string, spaceId: string, commitId: string) => {
 		setReverting(pendingId);
@@ -437,6 +478,7 @@ function OutlineDigestList({ onOpen }: { onOpen?: () => void }) {
 	};
 	return (
 		<Stack gap="xs" data-testid="outline-digest">
+			{reports}
 			<Text size="xs" c="dimmed">
 				{t("digest.intro")}
 			</Text>
@@ -499,8 +541,8 @@ function OutlineDigestList({ onOpen }: { onOpen?: () => void }) {
 				<Button
 					size="compact-sm"
 					variant="light"
-					loading={seen.isPending}
-					onClick={() => seen.mutate(items.map((i) => i.pendingId))}
+					loading={seen.isPending || reportsSeen.isPending}
+					onClick={gotIt}
 					data-testid="outline-digest-seen"
 				>
 					{t("digest.gotIt")}
@@ -554,6 +596,13 @@ export function OutlineAttentionDetail({
 				onOpen={onOpen}
 			/>
 		);
-	if (ref.what === "digest") return <OutlineDigestList onOpen={onOpen} />;
+	if (ref.what === "digest")
+		return (
+			<OutlineDigestList
+				onOpen={onOpen}
+				reportIds={ref.reportIds ?? []}
+				reportItems={ref.reportItems ?? 0}
+			/>
+		);
 	return null;
 }

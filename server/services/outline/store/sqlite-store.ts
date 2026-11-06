@@ -92,6 +92,7 @@ import {
 	pendingAsExpected,
 	writesAsExpected,
 } from "./port";
+import { sqliteOutlineDigests } from "./sqlite-digest";
 import { sqliteOutlineReads } from "./sqlite-read";
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -139,8 +140,9 @@ type CommitSelect = typeof outlineCommits.$inferSelect;
 type LiveUpdateSelect = typeof outlineLiveUpdates.$inferSelect;
 
 function toSpace(row: SpaceSelect): OutlineSpaceRow {
-	// `in_process_ready` is bookkeeping of the in-process rebuild, not part of a space's row.
-	const { inProcessReady: _ready, ...space } = row;
+	// `in_process_ready` is bookkeeping of the in-process rebuild, and `last_commit_at` the
+	// reports' (read through `listSpacesCommittedSince`): neither is part of a space's row.
+	const { inProcessReady: _ready, lastCommitAt: _last, ...space } = row;
 	return { ...space, kind: row.kind as OutlineSpaceKind };
 }
 
@@ -299,6 +301,8 @@ function applyCommitSection(
 		.update(outlineSpaces)
 		.set({
 			nextSeq: sql`${outlineSpaces.nextSeq} + 1`,
+			// Which spaces had commits when (the reports, P2 PR 11): no extra statement.
+			lastCommitAt: plan.commit.createdAt,
 			...(plan.inProcessStale
 				? { inProcessReady: false, inProcessEpoch: sql`${outlineSpaces.inProcessEpoch} + 1` }
 				: {}),
@@ -574,6 +578,7 @@ function updateClaimsSection(tx: Tx, writes: readonly OutlineClaimWrite[]): bool
 export const sqliteOutlineStore: OutlineStore = {
 	backendId: "sqlite",
 	...sqliteOutlineReads,
+	...sqliteOutlineDigests,
 
 	async ensureSpace(scope, now) {
 		for (let attempt = 0; attempt < SPACE_KEY_ATTEMPTS; attempt++) {

@@ -31,6 +31,7 @@
  *      hand over) write access to its space (404 when it cannot be read, 403 otherwise).
  *   8. Questions and the digest (P2 PR 7): the questions under a block, answering those put to
  *      the person (one `answer` commit), and acknowledging what agents confirmed on their behalf.
+ *   9. Reports (P2 PR 11, `/digests`): only the person's own; see `routes/outline-digest.ts`.
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
@@ -167,6 +168,7 @@ import {
 } from "../services/outline/views";
 import { flushOutlineTaskEdits } from "../services/outline-task-edits";
 import { resolveTaskBackend } from "../services/task-source";
+import { outlineDigestRoutes } from "./outline-digest";
 
 export const outlineRoutes = new Hono();
 
@@ -174,6 +176,9 @@ outlineRoutes.use("*", async (c, next) => {
 	if (!isOutlineEnabled()) return c.notFound();
 	await next();
 });
+
+/** The person's reports (P2 PR 11): `routes/outline-digest.ts`, behind the same gate. */
+outlineRoutes.route("/digests", outlineDigestRoutes);
 
 function principalOf(c: Context): OutlinePrincipal {
 	const user = c.get("user");

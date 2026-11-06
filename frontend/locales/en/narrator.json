@@ -2717,6 +2717,7 @@
 		"questions": "{{title}} · {{count}} question(s) for you",
 		"pending": "{{summary}} · a change to your locked plan ({{count}} edit(s)) waits for your confirmation",
 		"digest": "{{count}} change(s) an agent confirmed on your behalf",
+		"reports": "{{count}} report(s) to read ({{items}} item(s))",
 		"from": "From: {{narrator}}",
 		"fromHidden": "From a session you cannot open"
 	},
