@@ -870,7 +870,13 @@ export interface AssembledDigest {
 export function assembleDigest(
 	parts: readonly OutlinePersonContribution[],
 	limits: OutlineDigestLimits = OUTLINE_DIGEST_LIMITS,
+	/**
+	 * Spaces with changes already left out before assembly (the job keeps a day's parts bounded):
+	 * counted with the others, so nothing changes the report after it was measured.
+	 */
+	options: { dropped?: number } = {},
 ): AssembledDigest {
+	const dropped = Math.max(0, options.dropped ?? 0);
 	const active = parts.filter((p) => spaceWeight(p) > 0);
 	active.sort((a, b) => spaceWeight(b) - spaceWeight(a) || (a.space.id < b.space.id ? -1 : 1));
 	const shown = active.slice(0, limits.spacesPerDigest);
@@ -882,11 +888,13 @@ export function assembleDigest(
 	});
 	const spaceOf = new Map(spaces.map((s) => [s.id, s]));
 	let truncated =
-		spaces.some((s) => s.truncated || s.more !== undefined) || active.length > shown.length;
+		spaces.some((s) => s.truncated || s.more !== undefined) ||
+		active.length > shown.length ||
+		dropped > 0;
 	const items: OutlineDigestStored = {
 		v: 1,
 		spaces,
-		moreSpaces: active.length - shown.length,
+		moreSpaces: active.length - shown.length + dropped,
 		delegated: shown.flatMap((p) => p.delegated).sort(byTime),
 		knowledge: shown.flatMap((p) => p.knowledge).sort(byTime),
 		tasks: shown
@@ -949,7 +957,7 @@ export function assembleDigest(
 		plans: items.plans.length + items.more.plans,
 		questions: items.questions.length + items.more.questions,
 		other: items.other.length + items.more.other,
-		spaces: active.length,
+		spaces: active.length + dropped,
 		ownEdits: shown.reduce((n, p) => n + p.space.ownEdits, 0),
 	};
 	const itemCount = OUTLINE_DIGEST_SECTIONS.reduce((n, s) => n + counts[s], 0);

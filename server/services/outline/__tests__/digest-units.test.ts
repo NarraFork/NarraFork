@@ -12,6 +12,7 @@ import {
 	isPlanReviewApproval,
 	newlyDoneForReader,
 	OUTLINE_DIGEST_LIMITS,
+	type OutlineDigestLimits,
 	type OutlinePersonContribution,
 	type OutlineSpaceSummary,
 	planEvent,
@@ -487,24 +488,35 @@ describe("one report within its limits", () => {
 		expect(tiny.items.spaces[0]?.more?.other).toBe(40 - tiny.items.other.length);
 	});
 
-	test("the byte limit holds exactly, counts of the items cut included", () => {
-		// Many spaces of one item each: every cut adds a `more` count to a space, which the
-		// estimate of what was cut does not include; the report is measured again before it is
-		// taken.
-		const parts = Array.from({ length: 30 }, (_, i) =>
-			part(`space-${String(i).padStart(2, "0")}`, 1),
-		);
-		const whole = Buffer.byteLength(JSON.stringify(assembleDigest(parts).items));
-		// Every item cut: the spaces and their counts alone (the least any limit can get to).
-		const bare = Buffer.byteLength(
-			JSON.stringify(assembleDigest(parts, { ...OUTLINE_DIGEST_LIMITS, itemsPerDigest: 0 }).items),
-		);
-		expect(bare).toBeLessThan(whole);
-		for (let limit = bare; limit < whole; limit += 7) {
-			const done = assembleDigest(parts, { ...OUTLINE_DIGEST_LIMITS, itemsBytes: limit });
-			expect(Buffer.byteLength(JSON.stringify(done.items))).toBeLessThanOrEqual(limit);
-			expect(done.counts.other).toBe(30);
+	test("the byte limit holds exactly, counts of the items cut and of spaces left out included", () => {
+		// Every cut adds a `more` count to a space, which the estimate of what was cut does not
+		// include; spaces the job left out early (`dropped`) are counted before the measuring. The
+		// report is measured again before it is taken, and nothing changes it afterwards.
+		const compositions = [
+			Array.from({ length: 30 }, (_, i) => part(`space-${String(i).padStart(2, "0")}`, 1)),
+			[part("s".repeat(21), 40)],
+		];
+		let checked = 0;
+		for (const parts of compositions) {
+			for (const dropped of [0, 9, 10, 150]) {
+				const assemble = (limits: Partial<OutlineDigestLimits>) =>
+					assembleDigest(parts, { ...OUTLINE_DIGEST_LIMITS, ...limits }, { dropped });
+				const whole = Buffer.byteLength(JSON.stringify(assemble({}).items));
+				// Every item cut: the spaces and their counts alone (the least any limit can get to).
+				const bare = Buffer.byteLength(JSON.stringify(assemble({ itemsPerDigest: 0 }).items));
+				expect(bare).toBeLessThan(whole);
+				for (let limit = bare; limit < whole; limit++) {
+					const done = assemble({ itemsBytes: limit });
+					expect(Buffer.byteLength(JSON.stringify(done.items))).toBeLessThanOrEqual(limit);
+					expect(done.counts.other).toBe(parts.reduce((n, p) => n + p.other.length, 0));
+					expect(done.counts.spaces).toBe(parts.length + dropped);
+					expect(done.items.moreSpaces).toBe(dropped);
+					expect(done.truncated).toBe(true);
+					checked++;
+				}
+			}
 		}
+		expect(checked).toBeGreaterThan(1000);
 	});
 
 	test("a part's own overflow is carried into the report and its space", () => {

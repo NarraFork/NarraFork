@@ -538,12 +538,7 @@ async function writeChain(
 	let written = 0;
 	const userId = chain.person.id;
 	for (const day of chain.days) {
-		const assembled = assembleDigest(day.parts, limits);
-		if (day.dropped > 0) {
-			assembled.counts.spaces += day.dropped;
-			assembled.items.moreSpaces += day.dropped;
-			assembled.truncated = true;
-		}
+		const assembled = assembleDigest(day.parts, limits, { dropped: day.dropped });
 		if (day.failed > 0) assembled.truncated = true;
 		const row = {
 			id: generateId(),

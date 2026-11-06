@@ -1336,6 +1336,80 @@ describe("reports: the job when it is large, interrupted or fails", () => {
 		expect((await dailies(gu.id)).some((d) => d.periodKey === "2027-08-10")).toBe(true);
 	}, 60_000);
 
+	test("a success clears the wait: a later failure waits five minutes again, not ten", async () => {
+		const u = await person("uu", { timeZone: "UTC" });
+		const p = await project(u.id);
+		const A = { kind: "agent" as const, id: await narrator(u.id) };
+		await write(p.space, A, u.id, "2027-11-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "d10" },
+		]);
+		let failNext = 1;
+		const flaky = wrapStore({
+			async insertDigest(row: OutlineDigestRow) {
+				if (row.userId === u.id && failNext > 0) {
+					failNext--;
+					throw new Error("busy");
+				}
+				return await store.insertDigest(row);
+			},
+		});
+		const keys = async () => (await dailies(u.id)).map((d) => d.periodKey);
+		await runJob("2027-11-11T08:00:00.000Z", { store: flaky });
+		expect(await keys()).toEqual([]);
+		await runJob("2027-11-11T08:04:00.000Z", { store: flaky });
+		expect(await keys()).toEqual([]);
+		// Five minutes on: written; the failure is forgotten.
+		await runJob("2027-11-11T08:05:30.000Z", { store: flaky });
+		expect(await keys()).toEqual(["2027-11-08", "2027-11-09", "2027-11-10"]);
+		// The next day fails once more: tried again after five minutes, as the first time.
+		failNext = 1;
+		await write(p.space, A, u.id, "2027-11-11T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "d11" },
+		]);
+		await runJob("2027-11-12T08:00:00.000Z", { store: flaky });
+		expect((await keys()).at(-1)).toBe("2027-11-10");
+		await runJob("2027-11-12T08:05:30.000Z", { store: flaky });
+		expect((await keys()).at(-1)).toBe("2027-11-11");
+	}, 60_000);
+
+	test("the wait doubles up to six hours, and a restart tries again at once", async () => {
+		const v = await person("vv", { timeZone: "UTC" });
+		const p = await project(v.id);
+		const A = { kind: "agent" as const, id: await narrator(v.id) };
+		await write(p.space, A, v.id, "2027-12-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "d10" },
+		]);
+		let attempts = 0;
+		let fail = true;
+		const broken = wrapStore({
+			async insertDigest(row: OutlineDigestRow) {
+				if (row.userId === v.id) {
+					attempts++;
+					if (fail) throw new Error("cannot write");
+				}
+				return await store.insertDigest(row);
+			},
+		});
+		const start = Date.parse("2027-12-11T08:00:00.000Z");
+		const tried = async (minutes: number) => {
+			const before = attempts;
+			await runJob(new Date(start + minutes * 60_000).toISOString(), { store: broken });
+			return attempts > before;
+		};
+		// Failing at 0: waits 5, 10, 20, 40, 80, 160 and 320 minutes, then 6 hours: after the
+		// failure at 635 the doubled wait would be 640 minutes, and it stops at 360.
+		expect(await tried(0)).toBe(true);
+		for (const at of [5, 15, 35, 75, 155, 315, 635, 995, 1355]) {
+			expect(await tried(at - 1)).toBe(false);
+			expect(await tried(at)).toBe(true);
+		}
+		// A restart forgets the waits; the store works again: written at once.
+		resetOutlineDigestJobForTests();
+		fail = false;
+		expect(await tried(1356)).toBe(true);
+		expect((await dailies(v.id)).map((d) => d.periodKey)).toContain("2027-12-10");
+	}, 300_000);
+
 	test("one person whose due days cannot be worked out does not hold up the people after them", async () => {
 		// Their id sorts before everyone's: the sweep meets them first.
 		const first = await person("first", { timeZone: "UTC" }, `--${generateId().slice(2)}`);
