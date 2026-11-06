@@ -2,7 +2,7 @@
  * The outline routes as a host of the outline surface: outline targets become URLs. Only the
  * routes use this; the surface itself stays router-free (`components/outline/outline-nav.tsx`).
  */
-import { Link, useNavigate, useRouter } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { useCallback } from "react";
 import type { OutlineLinkProps, OutlineTarget } from "../components/outline/outline-nav";
 import { type OutlinePanelState, outlinePanelTarget } from "./outline-panel";
@@ -53,8 +53,8 @@ export function useOutlineRouterNavigate(): (to: OutlineTarget) => void {
 
 /** `onNavigateHref` for routed hosts: an app path (with its query) is a history entry. */
 export function useOutlineRouterHrefNavigate(): (path: string) => void {
-	const router = useRouter();
-	return useCallback((path: string) => void router.navigate({ href: path }), [router]);
+	const navigate = useNavigate();
+	return useCallback((path: string) => void navigate({ href: path }), [navigate]);
 }
 
 /** Leave for the outline page of a panel's state ("open in outline page"). */
