@@ -16,12 +16,15 @@ const {
 	selectOpencodeUsageResetTarget,
 } = await import("../opencode-quota-wait");
 const { resolveProviderQuotaWait } = await import("../provider-quota-wait");
-const { syncOpencodeUsageCache } = await import("../opencode-usage-cache");
+const { syncOpencodeUsageCache, refreshOpencodeUsage } = await import("../opencode-usage-cache");
 
 // Monday 2026-10-19 12:00 UTC.
 const NOW = Date.parse("2026-10-19T12:00:00.000Z");
 
 /** The weekly-wall body observed from the gateway (OpenAI-family envelope). */
+const CAPACITY_MESSAGE =
+	"Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 30 s)";
+
 const WEEKLY_MESSAGE =
 	"Weekly usage limit reached. Resets in 4 days. To continue using this model now, enable usage from your available balance: https://opencode.ai/workspace/wrk_01M/go";
 
@@ -80,6 +83,20 @@ describe("classifyOpencodeRefusal", () => {
 		expect(classifyOpencodeRefusal("Too many requests", bare({ statusCode: 429 }))).toBe(
 			"rate_limit",
 		);
+	});
+
+	test("capacity refusals are neither plan quota nor ordinary throttling", () => {
+		expect(
+			classifyOpencodeRefusal(CAPACITY_MESSAGE, bare({ statusCode: 429, reason: "server_error" })),
+		).toBe("capacity");
+		expect(
+			classifyOpencodeRefusal(
+				"request failed",
+				bare({ statusCode: 429, responseSnippet: CAPACITY_MESSAGE }),
+			),
+		).toBe("capacity");
+		// A typed allowance refusal remains authoritative even when prose mentions capacity.
+		expect(classifyOpencodeRefusal(CAPACITY_MESSAGE, diag())).toBe("quota");
 	});
 
 	test("billing walls are not waited on", () => {
@@ -251,6 +268,72 @@ describe("resolveOpencodeQuotaTarget / resolveProviderQuotaWait", () => {
 		expect(usageCalls).toBe(0);
 	});
 
+	test.each([
+		["capacity", CAPACITY_MESSAGE, "capacity"],
+		["rate_limit", "Too many requests", "rateLimit"],
+	] as const)("%s honors the 30-second Retry-After without fetching usage", async (waitKind, message, bucket) => {
+		usageBody = {
+			usage: {
+				rolling: { status: "ok", percent: 2 },
+				weekly: { status: "ok", percent: 3 },
+				monthly: { status: "ok", percent: 4 },
+			},
+		};
+		const healthy = await refreshOpencodeUsage("ocg");
+		expect([healthy?.rolling?.status, healthy?.weekly?.status, healthy?.monthly?.status]).toEqual([
+			"ok",
+			"ok",
+			"ok",
+		]);
+		usageCalls = 0;
+		const decision = await resolveProviderQuotaWait(
+			"ocg",
+			message,
+			bare({
+				statusCode: 429,
+				reason: "server_error",
+				responseHeaders: { "retry-after": "30", "retry-after-ms": "30000" },
+			}),
+			NOW,
+		);
+		expect(decision).toMatchObject({
+			kind: "wait",
+			wait: {
+				waitKind,
+				bucket,
+				resetAt: NOW + 30_000,
+				resumeAt: NOW + 35_000,
+			},
+		});
+		expect(usageCalls).toBe(0);
+		const far = await resolveProviderQuotaWait(
+			"ocg",
+			message,
+			bare({
+				statusCode: 429,
+				responseHeaders: { "retry-after": String(OPENCODE_QUOTA_MAX_WAIT_MS / 1000 + 1) },
+			}),
+			NOW,
+		);
+		expect(far).toMatchObject({ kind: "refuse", refusal: { waitKind, bucket } });
+		expect(far).not.toHaveProperty("wait");
+		expect(usageCalls).toBe(0);
+	});
+
+	test("capacity with short or absent hints stays in transient retry without fetching usage", async () => {
+		for (const responseHeaders of [undefined, { "retry-after": "5" }]) {
+			expect(
+				await resolveProviderQuotaWait(
+					"ocg",
+					CAPACITY_MESSAGE,
+					bare({ statusCode: 429, responseHeaders }),
+					NOW,
+				),
+			).toEqual({ kind: "none" });
+		}
+		expect(usageCalls).toBe(0);
+	});
+
 	test("falls back to one usage refresh when the free sources are silent", async () => {
 		usageBody = {
 			usage: {
@@ -302,6 +385,7 @@ describe("resolveOpencodeQuotaTarget / resolveProviderQuotaWait", () => {
 				quotaProvider: "opencode",
 				providerId: "ocg",
 				providerPrefix: "ocg",
+				waitKind: "quota",
 				bucket: "weekly",
 				resetAt: NOW + 374_160_000,
 				resumeAt: NOW + 374_160_000 + OPENCODE_QUOTA_RESET_SKEW_MS,

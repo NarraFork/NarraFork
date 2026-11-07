@@ -59,7 +59,7 @@ export interface ExecuteLoopResult {
 		providerId?: string;
 		providerPrefix?: string;
 		nugModelId?: string;
-		waitKind?: "credentials" | "quota";
+		waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 		quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
 		quotaBucket?: string;
