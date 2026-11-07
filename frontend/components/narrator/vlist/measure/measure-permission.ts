@@ -12,7 +12,7 @@
  *        │    │    options     Checkbox/Radio Stack gap={4}:                      │
  *        │    │        label   (wraps 🔴, label lh 20) [+ control 20 to the left] │
  *        │    │        [desc]  (wraps 🔴, 12/1.2 → 14, mt 5)                      │
- *        │    │    input       !readOnly → Textarea xs autosize 1..3 (30..68)     │
+ *        │    │    input       !readOnly → Textarea xs autosize 1..3 (33..77)     │
  *        │    │                readOnly  → saved custom answer (xs mono, wraps 🔴)│
  *        │    │    [badge]     readOnly + answered → Badge xs (16)               │
  *        │    ├ [countdown]  !readOnly + armed → Group icon14 + xs text (17)      │
@@ -27,10 +27,15 @@
  *
  *        [exec target Paper p="xs" mb="xs"]  header 17 + (cwd/path lines × 17)
  *        [plan-edited badge mb={4}]          16
- *        [plan Textarea mb="xs"]             editing → autosize 8..30 rows (× 19)
+ *        [plan Textarea mb="xs"]             editing → autosize 8..30 rows (× 22)
  *        [decision reason mb={4}]            reasonLines × 17
- *        feedback Textarea mb="xs"           autosize 1..3 rows (30..68)   [always]
+ *        feedback Textarea mb="xs"           autosize 1..3 rows (33..77)   [always]
  *        readOnly → "unavailable" text 17 | !readOnly → PermButtonBar sm row 36
+ *
+ * A textarea row is `typographyMetrics().line.xsBase`: 22px at the default setting, which the
+ * textarea figures above use (the other line boxes there are the bare-Mantine `*_BASELINE`
+ * values that the setting scales). In the transcript the live textareas paint exactly that row
+ * (D49, see TEXTAREA_ROW_HEIGHT).
  *
  * The wrapping-critical AskUserQuestion header / option label / option
  * description / saved-custom-answer are `PreparedInlineBlock`s measured with
@@ -71,9 +76,9 @@ import { pretextLineMetrics } from "./pretext-metrics";
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** sm body line box: round(14 × 1.45) = 20 (Text size="sm" header + Radio/Checkbox label lh). */
-export const SM_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 20
+export const SM_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 20
 /** xs line box: round(12 × 1.4) = 17 (dimmed xs rows, saved custom answer, reason lines). */
-export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const XS_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /**
  * Checkbox/Radio description line box: 12px × 1.2 → round(14.4) = 14. The
  * InputDescription font-size is sm-2 = 12px and its line-height is a hard-coded
@@ -81,16 +86,22 @@ export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
  * real rendered value (14) is used here for accuracy — the VListHarness
  * calibrates the exact pixels. (Reported to the main agent; no skeleton change.)
  */
-export const OPTION_DESC_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, 1.2);
+export const OPTION_DESC_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, 1.2);
 /** optionDescLineHeight() at the reader's typography (baseline above). */
 export function optionDescLineHeight(): number {
 	return scaledLineBoxHeight(FONT_SIZE.xs, 1.2);
 } // 14
 /**
- * Textarea autosize row box: 12px × base line-height (1.55) → round(18.6) = 19.
- * Multiline inputs use `--input-line-height: var(--mantine-line-height)` (1.55),
- * and the xs feedback / xs custom-input / ExitPlanMode edit (font overridden to
- * xs) textareas all render at 12px, so every textarea row is 19px.
+ * Textarea autosize row box, bare-Mantine baseline: 12px × base line-height (1.55) →
+ * round(18.6) = 19. Multiline inputs use `--input-line-height: var(--mantine-line-height)`
+ * (1.55), and the xs feedback / xs custom-input / ExitPlanMode edit (font overridden to xs)
+ * textareas all take the xs size.
+ *
+ * The model counts each row LIVE as `typographyMetrics().line.xsBase` (xs size × 1.55 × the
+ * reader's line-height setting: 22px at the default), and in the transcript the live textareas
+ * paint exactly that row, with no min-height of Mantine's own (D49,
+ * `permission-textarea-typography.tsx`). Only Mantine's own textarea, outside the transcript,
+ * still paints this baseline (18.6px at 12px).
  */
 export const TEXTAREA_ROW_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 19
 
@@ -114,11 +125,11 @@ export const QUESTION_STACK_GAP = SPACING.xs; // 10
 export const OPTIONS_GAP = 4;
 
 /** Header text (Text size="sm" fw={500}). */
-export const HEADER_LINE_HEIGHT = SM_LINE_HEIGHT; // 20
+export const HEADER_LINE_HEIGHT_BASELINE = SM_LINE_HEIGHT_BASELINE; // 20
 export const HEADER_FONT = `${FONT_WEIGHT.medium} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 
 /** Option label (Radio/Checkbox label, size sm, weight 400, lh 20). */
-export const OPTION_LABEL_LINE_HEIGHT = SM_LINE_HEIGHT; // 20
+export const OPTION_LABEL_LINE_HEIGHT_BASELINE = SM_LINE_HEIGHT_BASELINE; // 20
 export const OPTION_LABEL_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 /** Option description font (12px, weight 400). */
 export const OPTION_DESC_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
@@ -133,13 +144,13 @@ export const OPTION_LABEL_OFFSET = SPACING.sm; // 12
 export const OPTION_INDENT = OPTION_CONTROL_SIZE + OPTION_LABEL_OFFSET; // 32
 
 /** Saved custom answer (readOnly): Text size="xs" ff="monospace", lh 17. */
-export const CUSTOM_ANSWER_LINE_HEIGHT = XS_LINE_HEIGHT; // 17
+export const CUSTOM_ANSWER_LINE_HEIGHT_BASELINE = XS_LINE_HEIGHT_BASELINE; // 17
 export const CUSTOM_ANSWER_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO_FAMILY}`;
 
 /** "Answered" Badge size="xs" height. */
 export const BADGE_XS_HEIGHT = 16;
 /** Countdown Group row: max(icon 14, xs text 17) = 17. */
-export const COUNTDOWN_ROW_HEIGHT = Math.max(14, XS_LINE_HEIGHT); // 17
+export const COUNTDOWN_ROW_HEIGHT = Math.max(14, XS_LINE_HEIGHT_BASELINE); // 17
 /** AskUserQuestion action buttons (Button size="xs" = 30). */
 export const ASK_BUTTON_ROW_HEIGHT = 30;
 
@@ -151,7 +162,7 @@ export const CUSTOM_INPUT_MAX_ROWS = 3;
 
 /**
  * Height of an xs autosize Textarea (custom-input / feedback), clamped to
- * [1, 3] rows. 1 row → 30, 3 rows → 68.
+ * [1, 3] rows. 1 row → 33, 3 rows → 77 at the default setting (22px rows).
  */
 export function xsTextareaHeight(rows: number): number {
 	const r = clamp(rows, CUSTOM_INPUT_MIN_ROWS, CUSTOM_INPUT_MAX_ROWS);
@@ -170,7 +181,7 @@ export const TARGET_PADDING = SPACING.xs; // 10
 /** Execution-target Paper border (withBorder = 1px). */
 export const TARGET_BORDER = 1;
 /** Execution-target header row: max(icon-less xs text 17, Badge xs 16) = 17. */
-export const TARGET_HEADER_ROW = XS_LINE_HEIGHT; // 17
+export const TARGET_HEADER_ROW = XS_LINE_HEIGHT_BASELINE; // 17
 /** Header Group mb={4} shown only when a cwd or path line follows. */
 export const TARGET_HEADER_MARGIN = 4;
 /** Execution-target Paper mb="xs"(10). */
@@ -197,7 +208,7 @@ export const PERM_BUTTON_ROW_HEIGHT = 36;
 /** PermButtonBar Group gap="sm"(12) between rows when buttons wrap. */
 export const PERM_BUTTON_GROUP_GAP = SPACING.sm; // 12
 /** readOnly note ("permission actions unavailable") — single xs line. */
-export const READONLY_NOTE_HEIGHT = XS_LINE_HEIGHT; // 17
+export const READONLY_NOTE_HEIGHT = XS_LINE_HEIGHT_BASELINE; // 17
 
 /**
  * StructSed preview loading row: `Group gap="xs" mb="xs"` holding a Loader size xs
@@ -312,6 +323,12 @@ export interface InlinePermissionData {
 	 * fetched, so its height arrives through the painted-height report.
 	 */
 	hasPreviewLoading?: boolean;
+	/**
+	 * An outline session's plan approval (outline P2 PR 8, `OutlinePlanApproval`): its summary
+	 * lines (the version's changes, and the agent's note when it gave one), each one xs line
+	 * (`lineClamp={1}`) with `mb={4}`. 0 / absent: not an outline plan.
+	 */
+	outlinePlanSummaryRows?: number;
 	/** Whether a decision-reason line block is shown. */
 	hasDecisionReason?: boolean;
 	/** Wrapped line count of the decision reason; default 1. */
@@ -360,6 +377,7 @@ export type PermBlockRole =
 	| "preview-loading"
 	| "plan-edited-badge"
 	| "plan-textarea"
+	| "outline-plan-summary"
 	| "decision-reason"
 	| "feedback-textarea"
 	| "button-bar"
@@ -696,8 +714,18 @@ export function measureInlinePermission(
 		);
 	}
 
+	// An outline plan's summary lines (each mb={4}; the form shows no decision reason).
+	const planRows = Math.max(0, data.outlinePlanSummaryRows ?? 0);
+	for (let row = 0; row < planRows; row++) {
+		push(
+			makeFixed(typographyMetrics().line.xs, "outline-plan-summary", { row }),
+			{ role: "outline-plan-summary", data: { row } },
+			DECISION_REASON_MARGIN_BOTTOM,
+		);
+	}
+
 	// Decision reason (mb={4}).
-	if (data.hasDecisionReason) {
+	if (data.hasDecisionReason && planRows === 0) {
 		const reasonLines = Math.max(1, data.decisionReasonLines ?? 1);
 		push(
 			makeFixed(reasonLines * typographyMetrics().line.xs, "decision-reason", { reasonLines }),
@@ -764,9 +792,9 @@ export function prepareInlinePermissionMeasurer(
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const MEASURE_PERMISSION_CONSTANTS = {
-	SM_LINE_HEIGHT,
-	XS_LINE_HEIGHT,
-	OPTION_DESC_LINE_HEIGHT,
+	SM_LINE_HEIGHT_BASELINE,
+	XS_LINE_HEIGHT_BASELINE,
+	OPTION_DESC_LINE_HEIGHT_BASELINE,
 	TEXTAREA_ROW_HEIGHT,
 	ALERT_PADDING,
 	ALERT_BORDER,
@@ -775,13 +803,13 @@ export const MEASURE_PERMISSION_CONSTANTS = {
 	ALERT_STACK_GAP,
 	QUESTION_STACK_GAP,
 	OPTIONS_GAP,
-	HEADER_LINE_HEIGHT,
-	OPTION_LABEL_LINE_HEIGHT,
+	HEADER_LINE_HEIGHT_BASELINE,
+	OPTION_LABEL_LINE_HEIGHT_BASELINE,
 	OPTION_DESC_MARGIN_TOP,
 	OPTION_CONTROL_SIZE,
 	OPTION_LABEL_OFFSET,
 	OPTION_INDENT,
-	CUSTOM_ANSWER_LINE_HEIGHT,
+	CUSTOM_ANSWER_LINE_HEIGHT_BASELINE,
 	BADGE_XS_HEIGHT,
 	COUNTDOWN_ROW_HEIGHT,
 	ASK_BUTTON_ROW_HEIGHT,

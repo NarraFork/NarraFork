@@ -1,6 +1,7 @@
 /**
  * The outline tools: `OutlineRead` and `OutlineSearch` (core, read-only, across every space the
- * session may read) and `OutlineEdit` (optional, loaded with its routine). The work lives in
+ * session may read), `OutlineEdit` (optional, loaded with its routine; core in outline sessions)
+ * and `Ask` (questions put to people, outline P2 PR 7: outline root sessions only). The work lives in
  * `server/services/outline/agent-*.ts`, loaded on first use; this module holds the schemas, the
  * descriptions and what only a tool call knows: the turn's person, the session's permission
  * mode and the call's provenance.
@@ -13,7 +14,12 @@ import { settings } from "../../settings";
 import { MAX_BYTES, MAX_LINES } from "../truncate";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber } from "./number-param";
-import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOL, OUTLINE_SEARCH_TOOL } from "./outline-names";
+import {
+	OUTLINE_ASK_TOOL,
+	OUTLINE_EDIT_TOOL,
+	OUTLINE_READ_TOOL,
+	OUTLINE_SEARCH_TOOL,
+} from "./outline-names";
 
 type ToolOutput = import("../../../services/outline/agent-read").OutlineToolOutput;
 type Scope = import("../../../services/outline/agent-scope").OutlineAgentScope;
@@ -395,6 +401,138 @@ The result gives each edit's outcome and the ids of new blocks. Read a block (Ou
 			);
 		} catch (error) {
 			return await failure(error, OUTLINE_EDIT_TOOL);
+		}
+	},
+};
+
+// ─── Ask ───
+
+const askItemSchema = z.object({
+	question: z.string().describe("The question, on its own (the person reads it out of context)"),
+	options: z.array(z.string()).optional().describe("The choices, when there are any (at most 6)"),
+	recommend: z
+		.union([z.number(), z.string()])
+		.optional()
+		.describe("Your recommendation: an option's number, or what you would do"),
+	reason: z.string().optional().describe("Why you recommend it"),
+});
+
+const askQuestionSchema = askItemSchema.extend({
+	items: z
+		.array(askItemSchema)
+		.optional()
+		.describe("Sub-questions of this question: decided together with it"),
+});
+
+function askNumber(value: unknown): number | undefined {
+	if (typeof value === "number") return value;
+	if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value.trim());
+	return undefined;
+}
+
+function askRecommend(value: unknown): number | string | undefined {
+	const n = askNumber(value);
+	if (n !== undefined) return n;
+	return typeof value === "string" ? value : undefined;
+}
+
+type AskRequest = import("../../../services/outline/questions").OutlineAskRequest;
+type AskQuestion = import("../../../services/outline/questions").OutlineAskQuestionInput;
+
+function askQuestionOf(raw: unknown, nested: boolean): AskQuestion {
+	const q = (raw ?? {}) as Record<string, unknown>;
+	const recommend = askRecommend(q.recommend);
+	return {
+		question: typeof q.question === "string" ? q.question : "",
+		...(Array.isArray(q.options) ? { options: q.options.map((o) => String(o)) } : {}),
+		...(recommend !== undefined ? { recommend } : {}),
+		...(typeof q.reason === "string" ? { reason: q.reason } : {}),
+		...(!nested && Array.isArray(q.items)
+			? { items: q.items.map((item) => askQuestionOf(item, true)) }
+			: nested && Array.isArray(q.items)
+				? { items: [] as AskQuestion[] }
+				: {}),
+	};
+}
+
+export const askTool: ToolDefinition = {
+	name: OUTLINE_ASK_TOOL,
+	description: `Ask a person to decide something. The question is recorded in the outline under the block it is about: your task in progress by default (under: another block). Give each question its options if any, your recommendation (an option's number, or what you would do) and why.
+Asking never blocks. The task the question is under waits for the answer and continuation skips it: do the work it does not affect meanwhile. For a reversible decision, go ahead with your recommendation and set proceed: then nothing waits, and you hear back only if the answer differs. Decide yourself what has a reasonable, reversible default; ask about what is irreversible or a matter of the person's preference.
+Questions about one thing go in one call (they are answered together); a question's sub-questions go in its items. The answer comes back as a message from the person: it wakes this session when it is idle (on a PostgreSQL server the session reads it on its next turn).
+- to: who is asked (human:name). By default the person who manages the task, else the person you work for.
+- withdraw: questions you asked that no longer matter (Q12, or an address).
+- answered: when the person asked answers in this conversation instead, write their answer down here (option, text, or adopt for your recommendation).
+Give exactly one of questions, withdraw or answered.`,
+	parameters: z.object({
+		questions: z.array(askQuestionSchema).optional().describe("The questions (at most 10)"),
+		under: z
+			.string()
+			.optional()
+			.describe(
+				"The block they are about (id, key/id, alias or title); default: your task in progress",
+			),
+		to: z.string().optional().describe("Who is asked: human:name"),
+		proceed: z
+			.boolean()
+			.optional()
+			.describe("You went ahead with your recommendations (reversible decisions): nothing waits"),
+		withdraw: z
+			.array(z.string())
+			.optional()
+			.describe("Your questions to withdraw (Q12 or addresses)"),
+		answered: z
+			.array(
+				z.object({
+					question: z.string().describe("The question (Q12 or an address)"),
+					option: z.union([z.number(), z.string()]).optional().describe("The option they chose"),
+					text: z.string().optional().describe("Their answer in their words"),
+					adopt: z.boolean().optional().describe("They took your recommendation"),
+				}),
+			)
+			.optional()
+			.describe("Answers the person asked gave in this conversation"),
+	}),
+	isAvailable: outlineEnabled,
+	async execute(args, ctx): Promise<ToolResult> {
+		if (!outlineEnabled()) return { output: await disabledText(), isError: true };
+		const request: AskRequest = {
+			...(Array.isArray(args.questions)
+				? { questions: args.questions.map((q: unknown) => askQuestionOf(q, false)) }
+				: {}),
+			...(typeof args.under === "string" ? { under: args.under } : {}),
+			...(typeof args.to === "string" ? { to: args.to } : {}),
+			...(args.proceed === true ? { proceed: true } : {}),
+			...(Array.isArray(args.withdraw)
+				? { withdraw: args.withdraw.filter((w: unknown): w is string => typeof w === "string") }
+				: {}),
+			...(Array.isArray(args.answered)
+				? {
+						answered: args.answered.map((raw: unknown) => {
+							const a = (raw ?? {}) as Record<string, unknown>;
+							const option = askNumber(a.option);
+							return {
+								question: typeof a.question === "string" ? a.question : "",
+								...(option !== undefined ? { option } : {}),
+								...(typeof a.text === "string" ? { text: a.text } : {}),
+								...(a.adopt === true ? { adopt: true } : {}),
+							};
+						}),
+					}
+				: {}),
+		};
+		try {
+			const { outlineAsk } = await import("../../../services/outline/questions");
+			const scope = await openScope(ctx, false);
+			const provenance = await callProvenance(ctx);
+			const out = await outlineAsk(scope, request, provenance);
+			return {
+				output: out.output,
+				...(out.isError ? { isError: true } : {}),
+				metadata: out.metadata,
+			};
+		} catch (error) {
+			return await failure(error, OUTLINE_ASK_TOOL);
 		}
 	},
 };

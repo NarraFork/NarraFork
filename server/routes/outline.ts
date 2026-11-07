@@ -29,6 +29,9 @@
  *      board read access to the project, and lists only the session spaces the person may read.
  *      Adding a task needs write access to the session; changing one (finish, cancel, reopen,
  *      hand over) write access to its space (404 when it cannot be read, 403 otherwise).
+ *   8. Questions and the digest (P2 PR 7): the questions under a block, answering those put to
+ *      the person (one `answer` commit), and acknowledging what agents confirmed on their behalf.
+ *   9. Reports (P2 PR 11, `/digests`): only the person's own; see `routes/outline-digest.ts`.
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
@@ -37,9 +40,11 @@ import { blockTitle, isSpaceKey } from "@shared/outline";
 import {
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
+	type OutlineAnswerResponse,
 	type OutlineBacklinksResponse,
 	type OutlineBlockHistoryResponse,
 	type OutlineBlockViewResponse,
+	type OutlineDigestResponse,
 	type OutlineLockResponse,
 	type OutlineLockView,
 	type OutlinePageListResponse,
@@ -47,6 +52,8 @@ import {
 	type OutlinePendingDecisionResponse,
 	type OutlinePendingDetailResponse,
 	type OutlinePendingSummary,
+	type OutlinePlanDiffResponse,
+	type OutlineQuestionGroupResponse,
 	type OutlineResolveResponse,
 	type OutlineRevertResponse,
 	type OutlineSearchResponse,
@@ -60,24 +67,30 @@ import {
 import type {
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { getUserLanguage, getUserReplyInLanguage } from "../lib/i18n";
 import {
+	outlineAnswerBodySchema,
 	outlineBacklinksQuerySchema,
 	outlineBlockViewQuerySchema,
 	outlineBoardAddBodySchema,
+	outlineBoardSeenBodySchema,
 	outlineBoardTaskUpdateBodySchema,
+	outlineDigestSeenBodySchema,
 	outlineFinishedTasksQuerySchema,
 	outlineHistoryQuerySchema,
 	outlineIdSchema,
 	outlineLockBodySchema,
 	outlinePageListQuerySchema,
 	outlinePendingRejectBodySchema,
+	outlinePlanDiffQuerySchema,
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
@@ -90,6 +103,7 @@ import {
 	canWriteSpace,
 	listReadableSpaces,
 	narratorUsersWith,
+	narratorVisibility,
 	type OutlineAccessNeed,
 	type OutlinePrincipal,
 	projectUsersWith,
@@ -115,6 +129,12 @@ import {
 	unlockOutlineTask,
 } from "../services/outline/pending";
 import { addPersonTask, changePersonTask } from "../services/outline/person-tasks";
+import { readPlanDiff } from "../services/outline/plan-diff";
+import {
+	type OutlinePlanReviewFound,
+	planReviewBlocks,
+	reviewDiffOptions,
+} from "../services/outline/plans";
 import { commitSeqAt } from "../services/outline/read";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
@@ -135,6 +155,7 @@ import type {
 	OutlineSpaceRow,
 } from "../services/outline/store/port";
 import {
+	markOutlineTasksSeen,
 	readFinishedTasks,
 	readProjectTaskBoard,
 	readSessionTaskBoard,
@@ -150,6 +171,7 @@ import {
 } from "../services/outline/views";
 import { flushOutlineTaskEdits } from "../services/outline-task-edits";
 import { resolveTaskBackend } from "../services/task-source";
+import { outlineDigestRoutes } from "./outline-digest";
 
 export const outlineRoutes = new Hono();
 
@@ -157,6 +179,9 @@ outlineRoutes.use("*", async (c, next) => {
 	if (!isOutlineEnabled()) return c.notFound();
 	await next();
 });
+
+/** The person's reports (P2 PR 11): `routes/outline-digest.ts`, behind the same gate. */
+outlineRoutes.route("/digests", outlineDigestRoutes);
 
 function principalOf(c: Context): OutlinePrincipal {
 	const user = c.get("user");
@@ -432,6 +457,49 @@ outlineRoutes.get("/spaces/:spaceId/pages/:pageId/commits", async (c) => {
 	return c.json(body);
 });
 
+/**
+ * A plan against the version it is compared with (outline P2 PR 8): `from` (the submission's
+ * `baseSeq`, 0 for nothing) to now, block by block, bounded (`plan-diff.ts`), without the plan
+ * reviews written since `from` (shown on their own; PR 8b, found by the server: review round 1
+ * N3). Read access to the plan's space.
+ */
+outlineRoutes.get("/spaces/:spaceId/plans/:blockId/diff", async (c) => {
+	const principal = principalOf(c);
+	const { space, block } = await readableBlock(
+		principal,
+		idParam(c, "spaceId"),
+		idParam(c, "blockId"),
+	);
+	const query = parse(outlinePlanDiffQuerySchema, c.req.query());
+	const planner = block.taskJson?.plan?.by;
+	// Left out only while they are what the review wrote (review round 2 S3); in a review that is
+	// not, only what was added or changed shows (round 3 N9).
+	const reviews = planner
+		? await planReviewBlocks(outlineStore, planner, block, query.from)
+		: new Map<string, OutlinePlanReviewFound>();
+	const diff = await readPlanDiff({
+		rootId: block.id,
+		fromSeq: query.from,
+		toSeq: null,
+		...reviewDiffOptions(reviews),
+	});
+	if (!diff) throw new NotFoundError("Outline block", block.id);
+	const body: OutlinePlanDiffResponse = {
+		root: {
+			blockId: block.id,
+			spaceId: space.id,
+			address: `${space.key}/${block.sid}`,
+			title: blockTitle(diff.root.content ?? block.content).slice(0, 200) || block.sid,
+		},
+		fromSeq: diff.fromSeq,
+		toSeq: diff.toSeq,
+		counts: diff.counts,
+		entries: diff.entries,
+		truncated: diff.truncated,
+	};
+	return c.json(body);
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Search and revert
 // ─────────────────────────────────────────────────────────────────────────────
@@ -586,25 +654,6 @@ function unlockAllowed(
 	return (
 		principal.isAdmin || manages || (lock.by.kind === "human" && lock.by.id === principal.userId)
 	);
-}
-
-/**
- * Whether the person may read a session: locks and pending changes name it by title only then
- * (review S-5). Memoized for one request.
- */
-function narratorVisibility(principal: OutlinePrincipal): (narratorId: string) => Promise<boolean> {
-	const memo = new Map<string, Promise<boolean>>();
-	return (narratorId) => {
-		let verdict = memo.get(narratorId);
-		if (!verdict) {
-			verdict = (async () => {
-				const narrator = await readNarrator(narratorId);
-				return narrator !== null && (await holds(principal, "read", { narrator }));
-			})();
-			memo.set(narratorId, verdict);
-		}
-		return verdict;
-	};
 }
 
 /**
@@ -1013,6 +1062,19 @@ outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 102
 });
 
 /**
+ * The person saw tasks marked 「新完成」 on a board (outline P2 PR 9b): each is recorded at the
+ * version shown, so the mark is gone the next time the board is read. Only tasks that are done and
+ * theirs, in spaces they may read, are recorded; the rest are ignored alike (nothing is said about
+ * a task the person may not see).
+ */
+outlineRoutes.post("/tasks/seen", bodyLimit({ maxSize: 16 * 1024 }), async (c) => {
+	const principal = principalOf(c);
+	const input = parse(outlineBoardSeenBodySchema, await c.req.json().catch(() => ({})));
+	const body: OutlineBoardSeenResponse = { marked: await markOutlineTasksSeen(principal, input) };
+	return c.json(body);
+});
+
+/**
  * A person changes one task on the board: finish, cancel or reopen it, hand it to someone or
  * back to the session; with `start`, the session whose space holds it starts on it when idle,
  * which takes write access to that session (403 otherwise, before anything changes). Write
@@ -1092,3 +1154,56 @@ outlineRoutes.put(
 		return c.json(body);
 	},
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Questions and the digest (outline P2 PR 7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The questions under a block (or a question and its sub-questions), with who may answer which:
+ * the inbox's form, the page's side panel and the `Ask` card read this.
+ */
+outlineRoutes.get("/blocks/:blockId/questions", async (c) => {
+	const principal = principalOf(c);
+	const blockId = idParam(c, "blockId");
+	const block = await outlineStore.getBlock(blockId);
+	if (!block) throw new NotFoundError("Outline block", blockId);
+	await readableSpace(principal, block.spaceId);
+	const { readQuestionsUnder } = await import("../services/outline/questions");
+	const body: OutlineQuestionGroupResponse | null = await readQuestionsUnder(blockId, principal);
+	if (!body) throw new NotFoundError("Outline block", blockId);
+	return c.json(body);
+});
+
+/** Answer questions put to the person, all of one space at once: one `answer` commit. */
+outlineRoutes.post("/questions/answer", bodyLimit({ maxSize: 256 * 1024 }), async (c) => {
+	const principal = principalOf(c);
+	const input = parse(outlineAnswerBodySchema, await c.req.json().catch(() => ({})));
+	const { answerOutlineQuestions } = await import("../services/outline/questions");
+	// The askers are told in the background; the delivery sweep catches up on failures.
+	const done = await answerOutlineQuestions({
+		userId: principal.userId,
+		answers: input.answers,
+		deliver: "background",
+	});
+	const body: OutlineAnswerResponse = { commitId: done.commitId, answered: done.answered };
+	return c.json(body);
+});
+
+/** What agents confirmed on the person's behalf and they have not acknowledged. */
+outlineRoutes.get("/digest", async (c) => {
+	const principal = principalOf(c);
+	const { readOutlineDigest } = await import("../services/outline/inbox");
+	const body: OutlineDigestResponse = await readOutlineDigest(principal);
+	return c.json(body);
+});
+
+/** The person acknowledges confirmations in their digest. */
+outlineRoutes.post("/digest/seen", async (c) => {
+	const principal = principalOf(c);
+	const input = parse(outlineDigestSeenBodySchema, await c.req.json().catch(() => ({})));
+	const { markOutlineDigestSeen } = await import("../services/outline/inbox");
+	const marked = await markOutlineDigestSeen(principal, input.pendingIds);
+	eventBus.emit({ type: "human_attention:changed" });
+	return c.json({ marked });
+});

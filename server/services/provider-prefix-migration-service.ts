@@ -259,8 +259,39 @@ function parseJournal(value: unknown): ProviderPrefixMigrationJournal {
 	return journal as ProviderPrefixMigrationJournal;
 }
 
+/**
+ * Finish or roll back a prefix rename that was interrupted between the narrator update and the
+ * settings save.
+ *
+ * When neither side of the journal matches the current settings (the prefixes were edited again
+ * by hand), it cannot tell which models the narrators should point at. Startup goes on, the
+ * journal is kept, and it is logged: an affected narrator whose model no longer resolves shows
+ * the usual "model unavailable" error and can be switched to another model. Refusing to start
+ * would turn one unresolvable rename into an instance nobody can reach to fix it.
+ */
 export async function recoverProviderPrefixMigrationOnStartup(): Promise<void> {
 	if (!existsSync(JOURNAL_PATH)) return;
+	try {
+		await recoverJournal();
+	} catch (error) {
+		// Moved aside: it is the only record of which narrators the rename touched, and left in
+		// place the next rename would overwrite it (and every startup would report it again).
+		const keptPath = `${narraforkDir}/provider-prefix-migration.unresolved-${Date.now()}.json`;
+		try {
+			renameSync(JOURNAL_PATH, keptPath);
+		} catch (renameError) {
+			logger.warn("Could not set the unresolved provider prefix journal aside", {
+				error: String(renameError),
+			});
+		}
+		logger.error("Interrupted provider prefix migration could not be recovered; journal kept", {
+			error: String(error),
+			journalPath: existsSync(keptPath) ? keptPath : JOURNAL_PATH,
+		});
+	}
+}
+
+async function recoverJournal(): Promise<void> {
 	const journal = parseJournal(JSON.parse(readFileSync(JOURNAL_PATH, "utf8")));
 	const usesAfter = journal.changes.every(
 		(change) => providerPrefixForId(settings, change.id) === change.to,

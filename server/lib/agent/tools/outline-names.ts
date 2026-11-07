@@ -9,11 +9,13 @@
 export const OUTLINE_READ_TOOL = "OutlineRead";
 export const OUTLINE_SEARCH_TOOL = "OutlineSearch";
 export const OUTLINE_EDIT_TOOL = "OutlineEdit";
+/** Questions put to people (outline P2 PR 7): offered in outline root sessions only. */
+export const OUTLINE_ASK_TOOL = "Ask";
 
 /** The tools that only read the outline. */
 export const OUTLINE_READ_TOOLS = [OUTLINE_READ_TOOL, OUTLINE_SEARCH_TOOL] as const;
 
-export const OUTLINE_TOOLS = [...OUTLINE_READ_TOOLS, OUTLINE_EDIT_TOOL] as const;
+export const OUTLINE_TOOLS = [...OUTLINE_READ_TOOLS, OUTLINE_EDIT_TOOL, OUTLINE_ASK_TOOL] as const;
 
 /** Whether a tool reads or writes the outline. */
 export function isOutlineTool(name: string): boolean {

@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
+import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
@@ -34,7 +34,7 @@ import {
 } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
-import { OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
+import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
 import type { ToolDefinition } from "../../lib/agent/types";
@@ -1115,6 +1115,8 @@ export async function runAgentLoopUnlocked(
 				if (tool.name === "SwitchDevice")
 					return turnSessionDevices.some((device) => device.online) || !!active._defaultDeviceId;
 				if (tool.name === "TransferFile") return turnSessionDevices.some((device) => device.online);
+				// Questions live under outline tasks: offered where OutlineEdit is a core tool.
+				if (tool.name === OUTLINE_ASK_TOOL) return outlineEditCore;
 				if (tool.name.startsWith("mcp__")) {
 					const server = settings.mcpServers?.find(
 						(item) => item.id === tool.metadata?.mcpServerId,
@@ -1258,6 +1260,16 @@ export async function runAgentLoopUnlocked(
 					taskBackend === "outline"
 						? await (await taskSourceForNarrator(narratorId)).contextParts(locale)
 						: undefined;
+				// An outline root session plans in the outline (outline P2 PR 8): plan mode names its
+				// plan root (its address only, review round 1 S4) instead of a plan file. A plan-file
+				// cycle begun before PR 8 keeps the file (S7).
+				const outlinePlanView =
+					planMode && outlineEditCore
+						? await (await import("../outline-plan-mode")).outlinePlanPromptRoot(narratorId)
+						: null;
+				const outlinePlan = outlinePlanView
+					? { root: outlinePlanView.root, relaxed: relaxedPlan }
+					: undefined;
 				const built = await buildSystemPrompt(
 					{
 						systemPrompt: currentOAuth
@@ -1281,6 +1293,7 @@ export async function runAgentLoopUnlocked(
 					{
 						taskSection: taskSectionFor(taskBackend, current.type),
 						...(contextParts ? { contextParts } : {}),
+						...(outlinePlan ? { outlinePlan } : {}),
 						workspaceContext: serializeWorkspaceContext(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
@@ -1301,8 +1314,12 @@ export async function runAgentLoopUnlocked(
 							JSON.stringify({
 								planMode,
 								relaxedPlan,
-								planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
-								planFilePath: active._planFilePath,
+								...(outlinePlan
+									? { planRoot: outlinePlan.root?.address ?? null }
+									: {
+											planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
+											planFilePath: active._planFilePath,
+										}),
 								permissionMode: currentOAuth?.permissionMode ?? current.permissionMode,
 								readOnly: runtimePolicy.tools.readOnly,
 							}),
@@ -1668,6 +1685,23 @@ export async function runAgentLoopUnlocked(
 							planMode: false,
 							traits: redactDraftTraits(planState.traits),
 						});
+					}
+					// An outline session's plan (outline P2 PR 8): made sure to be approved, whichever
+					// way the approval came, before the restart starts its first step.
+					{
+						const { settleApprovedOutlinePlan } = await import("../outline-plan-mode");
+						const byReview = pendingPlanApproverSource.get(narratorId) === "reflection";
+						active._outlinePlanApproved =
+							(await settleApprovedOutlinePlan({
+								narratorId,
+								toolUseId,
+								locale: active.locale,
+								// A review's approval is never a person's, whatever approver is left
+								// over (D48 ⑦, review round 2 N4).
+								approverUserId: byReview ? null : (pendingPlanApprover.get(narratorId) ?? null),
+								turnUserId: active._currentUserId ?? null,
+								byReview,
+							})) ?? undefined;
 					}
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
 					let approval: "compact" | "continue" | undefined;
@@ -2380,8 +2414,8 @@ export async function runAgentLoopUnlocked(
 			 *  - `credentials` (NUG): the credential pool comes back at an unknown time,
 			 *    so the shared availability poller checks the lightweight `/v1/models`
 			 *    list until the model reports available.
-			 *  - `quota` (Kimi): the reset instant is published (`resumeAt`), so this
-			 *    sleeps to it. No polling and no request during the wait.
+			 *  - `quota`, `capacity`, `rate_limit`: upstream publishes `resumeAt`, so
+			 *    this sleeps to it. No polling and no request during the timed wait.
 			 *
 			 * @returns true when recovery happened and the caller should `continue`
 			 * to rebuild history from the DB; false when the caller must `break`
@@ -2403,12 +2437,15 @@ export async function runAgentLoopUnlocked(
 				// The reset clock is what this wait is about, so the status carries the
 				// instant the user is waiting for as well as the tag that says why.
 				const quotaResumeAt =
-					mu.waitKind === "quota" && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
-				const waitingSubstatus = quotaResumeAt ? "quota_exhausted" : "model_unavailable";
+					providerWaitKind(mu) !== "credentials" && typeof mu.resumeAt === "number"
+						? mu.resumeAt
+						: undefined;
+				const waitingSubstatus =
+					providerWaitKind(mu) === "quota" ? "quota_exhausted" : "model_unavailable";
 				await narratorService.updateStatus(narratorId, "waiting", {
 					substatus: [waitingSubstatus],
 					errorMessage: JSON.stringify({
-						type: quotaResumeAt ? "quota_exhausted" : "model_unavailable",
+						type: waitingSubstatus,
 						...mu,
 					}),
 				});
@@ -2777,7 +2814,7 @@ export async function runAgentLoopUnlocked(
 
 			// --- Blocked, but recoverable: suspend and wait for recovery ---
 			// Either a NUG model whose credential pool is disabled, or an exhausted
-			// Kimi coding-plan allowance. Instead of replaying the full request
+			// Kimi/OpenCode allowance or a timed upstream capacity/rate limit. Instead of replaying the full request
 			// (re-uploading the entire history) over and over, suspend the narrator and
 			// wait on whatever tells us recovery happened — the availability poller for
 			// credentials, the published reset instant for quota. Then resume by
@@ -2785,10 +2822,12 @@ export async function runAgentLoopUnlocked(
 			// [continuation-source: model-unavailable]
 			if (recovery.kind === "model-unavailable" && result.modelUnavailable && active.alive) {
 				const mu = result.modelUnavailable;
-				const isQuota = mu.waitKind === "quota";
+				const waitKind = providerWaitKind(mu);
+				const isTimedWait = waitKind !== "credentials";
 				const quotaResetAt =
-					isQuota && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
-				const quotaResumeAt = isQuota && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
+					isTimedWait && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
+				const quotaResumeAt =
+					isTimedWait && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
 				/**
 				 * Why this quota wall is being reported instead of parked on.
 				 *
@@ -2802,7 +2841,7 @@ export async function runAgentLoopUnlocked(
 				 * only by the reason code — a divergence here would mean one of them silently
 				 * loses the reset instant that makes the error actionable.
 				 */
-				const quotaRefusalReason = !isQuota
+				const quotaRefusalReason = !isTimedWait
 					? undefined
 					: quotaResumeAt === undefined
 						? quotaResetAt === undefined
@@ -2825,12 +2864,15 @@ export async function runAgentLoopUnlocked(
 					// distinguishable in logs without changing what the user is told.
 					// `type` names the plan (KIMI_QUOTA_EXHAUSTED / OPENCODE_QUOTA_EXHAUSTED)
 					// so the message says whose allowance is spent.
-					const quotaCode = quotaExhaustedCode(mu.quotaProvider);
+					const quotaCode =
+						waitKind === "quota" ? quotaExhaustedCode(mu.quotaProvider) : "provider_wait_exhausted";
 					terminalStatus = {
 						substatus: ["error"],
 						errorCode: quotaCode,
 						errorMessage: JSON.stringify({
 							type: quotaCode,
+							waitKind,
+							quotaProvider: mu.quotaProvider,
 							reason: quotaRefusalReason,
 							model: mu.model,
 							provider: mu.provider,
@@ -2851,7 +2893,8 @@ export async function runAgentLoopUnlocked(
 					// the client the block cleared and it is resuming, which is false here and
 					// would flash a green "quota restored" notice over the error. The client
 					// drops its waiting notice from the status change this write produces.
-					logger.warn("Quota wall reported instead of waited on", {
+					logger.warn("Timed provider refusal reported instead of waited on", {
+						waitKind,
 						narratorId,
 						quotaProvider: mu.quotaProvider ?? "kimi",
 						providerId: mu.providerId,
@@ -3174,17 +3217,25 @@ export async function runAgentLoopUnlocked(
 					await narratorService.updateStats(narratorId, 0);
 				}
 
-				const continuePrompt = getToolMessage(
-					isCompact ? "planCompactContinue" : "exitPlanModeApproved",
-					locale,
-				);
+				// An outline plan starts from its first step that can start, named in the prompt
+				// (outline P2 PR 8); a plan-file plan gets the prompt it always did.
+				const outlinePlan = active._outlinePlanApproved;
+				active._outlinePlanApproved = undefined;
+				const continuePrompt = outlinePlan
+					? await (await import("../outline-plan-mode")).startApprovedOutlinePlan({
+							narratorId,
+							approved: outlinePlan,
+							locale,
+							compact: isCompact,
+						})
+					: getToolMessage(isCompact ? "planCompactContinue" : "exitPlanModeApproved", locale);
 
 				// If the user edited the plan, append the diff to the prompt
 				// (only for non-compact — compact already has the edited plan in system prompt)
 				const planDiff = pendingPlanDiff.get(narratorId);
 				if (planDiff) pendingPlanDiff.delete(narratorId);
 				const basePrompt =
-					!isCompact && planDiff
+					!isCompact && planDiff && !outlinePlan
 						? getToolMessageWithParams("exitPlanModeApprovedWithDiff", locale, {
 								diff: planDiff,
 							})
@@ -3193,8 +3244,10 @@ export async function runAgentLoopUnlocked(
 				// Check for chained feedback — merge with diff if both exist
 				const fb = pendingFeedback.get(narratorId);
 				if (fb) pendingFeedback.delete(narratorId);
+				// An outline plan's message names the step started for the session: it is kept, the
+				// approver's words follow it.
 				const promptText = fb
-					? basePrompt !== continuePrompt
+					? basePrompt !== continuePrompt || outlinePlan
 						? `${basePrompt}\n\n${fb.feedbackText}`
 						: fb.feedbackText
 					: basePrompt;

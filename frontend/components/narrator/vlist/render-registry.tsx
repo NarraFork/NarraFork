@@ -15,6 +15,7 @@
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import type { SubagentDelegation } from "@shared/outline-report-note";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
@@ -207,6 +208,9 @@ export function resolveRenderExtra(spec: {
 			// The takeover badge is height-neutral but PAINTED, so it must reach the
 			// renderer explicitly — the measure layer keeps only the geometry it needs.
 			if ("isTakenOver" in data) extra.isTakenOver = data.isTakenOver;
+			// The outline task the agent was sent with (P2 PR 9b): its row and the late badge are
+			// painted from here; the measure layer keeps only the row's height.
+			if ("delegation" in data) extra.delegation = data.delegation;
 			// Same paint-only forwarding for the live output counter badge.
 			if ("liveOutputChars" in data) extra.liveOutputChars = data.liveOutputChars;
 			if ("resultPreview" in data) extra.resultPreview = data.resultPreview;
@@ -401,6 +405,7 @@ export function renderElement(
 					actions={extra.specCarryoverActions as never}
 					errorActions={extra.errorNoticeActions as never}
 					injectionGuardActions={extra.injectionGuardActions as never}
+					onToggle={extra.onToggle as (() => void) | undefined}
 					headerAction={
 						reference?.narratorId && reference.questionId ? (
 							<QuestionEventAction
@@ -463,6 +468,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
@@ -550,6 +556,7 @@ export function renderElement(
 					agentType={extra.agentType as string | undefined}
 					isBackground={extra.isBackground as boolean | undefined}
 					isTakenOver={extra.isTakenOver as boolean | undefined}
+					delegation={extra.delegation as SubagentDelegation | undefined}
 					liveOutputChars={extra.liveOutputChars as number | undefined}
 					model={extra.model as string | undefined}
 					modelInheritance={extra.modelInheritance as SubagentModelInheritance | undefined}

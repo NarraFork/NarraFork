@@ -22,6 +22,7 @@ import { formatFullLocaleDateTime, formatSmartTime } from "../../lib/format";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { OutlineLockSection, OutlinePendingList, pendingFor } from "./OutlinePendingPanel";
+import { OutlineQuestionsSection } from "./OutlineQuestions";
 import { commitActorLabel } from "./OutlineTimeline";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
@@ -65,6 +66,7 @@ export function OutlineSidePanel({
 	return (
 		<>
 			<OutlineLockSection view={view} />
+			<OutlineQuestionsSection view={view} />
 			<Tabs value={tab} onChange={(value) => value && setTab(value as SideTab)} keepMounted={false}>
 				<Tabs.List grow>
 					{hasPending && (

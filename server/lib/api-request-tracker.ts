@@ -62,6 +62,8 @@ export interface ApiRequestFinishOptions {
 	usage?: UsageData | null;
 	ttftMs?: number | null;
 	durationMs?: number | null;
+	/** First content → end; only meaningful alongside reported output tokens. */
+	decodeMs?: number | null;
 	contextPercent?: number | null;
 	meterUsage?: number | null;
 	meterUnit?: string | null;
@@ -139,6 +141,7 @@ export async function finishApiRequest(
 		reasoningTokens: usage?.reasoningTokens ?? 0,
 		ttftMs: options.ttftMs ?? null,
 		durationMs: options.durationMs ?? Date.now() - handle.startTime,
+		decodeMs: options.decodeMs ?? null,
 		costUsd: cost && cost.status !== "unknown" ? cost.knownCost : null,
 		costStatus: cost?.status ?? "unknown",
 		costMissingFields: cost?.missingFields ?? [],

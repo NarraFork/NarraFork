@@ -114,9 +114,12 @@
 	padding: 4px 8px;
 	border: 1px solid var(--ob-line);
 	border-radius: 6px;
-	background: var(--mantine-color-body);
-	font-size: 15px;
-	line-height: 1.5;
+	/* The node's fill, which the focused block's ring (below) also paints its gap with. */
+	--mm-node-fill: var(--mantine-color-body);
+	background: var(--mm-node-fill);
+	/* The conversation's body text; `measure.ts` measures with the same metrics. */
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
 	font-family: var(--nf-mm-font);
 	white-space: normal;
 	overflow-wrap: break-word;
@@ -127,11 +130,25 @@
 	position: static;
 	flex: none;
 	width: 28px;
-	height: 22.5px;
+	height: var(--nf-type-body-line);
 }
 
+/* A heading node's frame sits on the heading's first line (no effect on the node's size). */
+.nf-outline-editor .mm-node:has(> .mm-body > h1:first-child) > .ob-gutter {
+	height: var(--nf-type-h1-line);
+}
+
+.nf-outline-editor .mm-node:has(> .mm-body > h2:first-child) > .ob-gutter {
+	height: var(--nf-type-h2-line);
+}
+
+.nf-outline-editor .mm-node:has(> .mm-body > h3:first-child) > .ob-gutter {
+	height: var(--nf-type-h3-line);
+}
+
+/* `frameWidth(true)` (measure.ts): the arrow and the bullet, then the checkbox's column. */
 .nf-outline-editor .mm-node[data-task]:not([data-task=""]) > .ob-gutter {
-	width: 46px;
+	width: calc(28px + var(--nf-outline-icon) + 4px);
 }
 
 .nf-outline-editor .mm-node .ob-arrow,
@@ -142,6 +159,12 @@
 .nf-outline-editor .mm-node .mm-body {
 	flex: none;
 	min-width: 0;
+}
+
+/* Done or cancelled: struck through and muted, as in the outline (paint only, no size). */
+.nf-outline-editor .mm-node:is([data-task="x"], [data-task="-"]) > .mm-body {
+	color: var(--ob-muted);
+	text-decoration: line-through;
 }
 
 .nf-outline-editor .mm-node .mm-body p,
@@ -156,30 +179,35 @@
 }
 
 .nf-outline-editor .mm-node .mm-body h1 {
-	font-size: 1.5em;
-	line-height: 1.5;
+	font-size: var(--nf-type-h1-size);
+	line-height: var(--nf-type-h1-line);
 }
 
 .nf-outline-editor .mm-node .mm-body h2 {
-	font-size: 1.25em;
-	line-height: 1.5;
+	font-size: var(--nf-type-h2-size);
+	line-height: var(--nf-type-h2-line);
 }
 
 .nf-outline-editor .mm-node .mm-body h3 {
-	font-size: 1.1em;
-	line-height: 1.5;
+	font-size: var(--nf-type-h3-size);
+	line-height: var(--nf-type-h3-line);
 }
 
 .nf-outline-editor .mm-node .mm-body code {
 	font-family: var(--nf-mm-mono);
-	font-size: 13px;
+	font-size: var(--nf-type-code-size);
 }
 
 .nf-outline-editor .mm-node .mm-body pre {
-	font: 13px / 1.5 var(--nf-mm-mono);
+	font: var(--nf-type-code-block-size) / var(--nf-type-code-block-line) var(--nf-mm-mono);
 	white-space: pre;
 	overflow: hidden;
-	max-height: calc(6 * 19.5px + 8px);
+	max-height: calc(6 * var(--nf-type-code-block-line) + 8px);
+}
+
+/* Measured with the same spacing (`measure.ts` → `run`), per element as an em fraction. */
+:where(.nf-outline-editor .mm-node .mm-body, .nf-outline-editor .mm-node .mm-body *) {
+	letter-spacing: var(--nf-type-letter-spacing);
 }
 
 .nf-outline-editor .mm-node .mm-body table {
@@ -207,11 +235,20 @@
 }
 
 .nf-outline-editor .mm-node.is-root {
-	background: color-mix(in srgb, var(--ob-accent) 8%, var(--mantine-color-body));
+	--mm-node-fill: color-mix(in srgb, var(--ob-accent) 8%, var(--mantine-color-body));
 }
 
+/*
+ * The focused block: its dot in a ring, 1px out and 1px wide (what Chromium drew for the
+ * `outline: 1.5px` this replaces: it snaps outline widths and offsets to whole pixels). Two
+ * shadows, not an outline, which older Safari draws square: the inner one paints the gap in the
+ * node's fill, the outer one the ring. Shadows take no room, so nothing measured or laid out
+ * changes. The root is never folded (`mindmap.ts`), so the folded halo never shows here too.
+ */
 .nf-outline-editor .mm-node.is-root > .ob-gutter .ob-bullet::before {
-	content: "◎";
+	box-shadow:
+		0 0 0 1px var(--mm-node-fill),
+		0 0 0 2px currentColor;
 }
 
 .nf-outline-editor .mm-node.sel {
@@ -220,7 +257,7 @@
 }
 
 .nf-outline-editor .mm-node.msel {
-	background: color-mix(in srgb, var(--ob-accent) 16%, var(--mantine-color-body));
+	--mm-node-fill: color-mix(in srgb, var(--ob-accent) 16%, var(--mantine-color-body));
 }
 
 .nf-outline-editor .mm-node.editing {
@@ -239,7 +276,7 @@
 .nf-outline-editor .mm-node.editing .ProseMirror {
 	min-height: 0;
 	padding-left: 0;
-	line-height: 1.5;
+	line-height: var(--nf-type-body-line);
 }
 
 /* A node's editor shows one body: no frame, no title styling. */

@@ -88,6 +88,11 @@ export interface ActiveNarrator {
 	 *  "continue" = no compact; "compact" = compact was performed, needs fresh context. */
 	_planApprovedContinue?: "continue" | "compact";
 	/**
+	 * The outline plan the approved ExitPlanMode submitted (outline P2 PR 8), settled as approved
+	 * by `onExitPlanMode`: the restart starts its first step and names it.
+	 */
+	_outlinePlanApproved?: import("./outline-plan-mode").ApprovedOutlinePlan;
+	/**
 	 * Plan approval that landed while the approving response was still streaming. The
 	 * restart (plan compact + pass abort) runs once that assistant message is finalized,
 	 * so the response is recorded and persisted whole before the pass ends.

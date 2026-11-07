@@ -1,3 +1,4 @@
+import { STARTUP_STATUS_HEADER } from "@shared/startup-status";
 import { apiUrl } from "./base-path";
 
 interface ServerHealth {
@@ -35,11 +36,11 @@ function normalizeVersion(version: string | undefined): string | undefined {
  *   - `failed` means some narrator could not be restored (typically pinned to a provider prefix
  *     that no longer exists in settings).
  *
- * Neither makes the HTTP surface unusable. The server is explicit about this: `shouldServeRequests`
- * is unconditionally true so the frontend, auth and settings routes stay reachable, precisely
- * because those are what repair the state that made recovery fail. Blocking the reload here
- * inverted that policy — the new server was already up and serving while the user stayed pinned
- * to the old bundle by the very error the new UI is needed to fix.
+ * Neither makes the HTTP surface unusable: `/api/health` answers 200 even after a failed
+ * recovery, and the frontend, auth and settings routes stay reachable, precisely because those
+ * are what repair the state that made recovery fail. Blocking the reload here inverted that
+ * policy — the new server was already up and serving while the user stayed pinned to the old
+ * bundle by the very error the new UI is needed to fix.
  */
 export function isUpdatedServerReadyForReload(
 	health: ServerHealth | null,
@@ -184,6 +185,31 @@ export async function clearPwaCache(): Promise<void> {
 	}
 }
 
+/** A navigation the service worker passes to the network instead of the cached shell. */
+function networkReloadUrl(): string {
+	const destination = new URL(window.location.href);
+	destination.searchParams.set(
+		"_nf_reload",
+		`${Date.now()}-${Math.random().toString(16).slice(2)}`,
+	);
+	return destination.href;
+}
+
+let leavingForStartupPage = false;
+
+/**
+ * Leave the app for the startup status page when an API answer came from it.
+ *
+ * With a service worker the app shell loads from cache even while the server is still starting,
+ * and every API call then gets the startup page's 503. Reloading through the network lands on
+ * that page instead, which shows progress and reloads into the app once the server is up.
+ */
+export function leaveForStartupPageIfStarting(response: Response): void {
+	if (leavingForStartupPage || !response.headers.has(STARTUP_STATUS_HEADER)) return;
+	leavingForStartupPage = true;
+	window.location.replace(networkReloadUrl());
+}
+
 let reloadPromise: Promise<void> | undefined;
 
 /**
@@ -198,12 +224,7 @@ export function clearPwaCacheAndReload(): Promise<void> {
 	reloadPromise ??= Promise.resolve()
 		.then(async () => {
 			await clearPwaCache();
-			const destination = new URL(window.location.href);
-			destination.searchParams.set(
-				"_nf_reload",
-				`${Date.now()}-${Math.random().toString(16).slice(2)}`,
-			);
-			window.location.replace(destination.href);
+			window.location.replace(networkReloadUrl());
 		})
 		.finally(() => {
 			reloadPromise = undefined;

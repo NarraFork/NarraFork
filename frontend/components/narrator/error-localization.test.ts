@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { catalogError } from "@server/lib/errors";
 import { parseErrorDiagnostics } from "@shared/agent-protocol/error-diagnostics";
+import { parseProviderWaitInfo, providerWaitKind } from "@shared/agent-protocol/quota-exhausted";
 import { ERROR_CATALOG, serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { createInstance, type TFunction } from "i18next";
 import enErrors from "../../locales/en/errors.json";
+import enNarrator from "../../locales/en/narrator.json";
 import zhErrors from "../../locales/zh-CN/errors.json";
+import zhNarrator from "../../locales/zh-CN/narrator.json";
 import { localizeNarratorError } from "./error-localization";
 
 /**
@@ -312,6 +315,86 @@ describe("localizeNarratorError Kimi 额度墙", () => {
 		const upstream =
 			"Anthropic API error 403: You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.";
 		expect(localizeNarratorError(upstream, t)).toBe(upstream);
+	});
+});
+
+describe("容量与限流等待刷新兼容", () => {
+	test.each(["capacity", "rate_limit"] as const)("%s 的实时与持久化终止原因一致", (waitKind) => {
+		const payload = JSON.stringify({
+			type: "provider_wait_exhausted",
+			waitKind,
+			reason: "wait-budget-spent",
+			quotaResetAt: Date.UTC(2026, 10, 15),
+		});
+		const prefix = waitKind === "capacity" ? "capacity" : "rateLimit";
+		expect(localizeNarratorError(payload, t)).toStartWith(`${prefix}WaitNotPossible(resetAt=`);
+		expect(localizeNarratorError(payload, t, "provider_wait_exhausted")).toBe(
+			localizeNarratorError(payload, t),
+		);
+		expect(
+			localizeNarratorError(JSON.stringify({ type: "provider_wait_exhausted", waitKind }), t),
+		).toBe(`${prefix}WaitNotPossibleNoReset`);
+		const waiting = {
+			type: "model_unavailable",
+			waitKind,
+			resumeAt: 123456,
+			quotaProvider: "opencode",
+		};
+		expect(parseProviderWaitInfo(JSON.stringify(waiting))).toEqual({
+			waitKind,
+			resumeAt: 123456,
+			quotaProvider: "opencode",
+		});
+	});
+
+	test("兼容旧 quota/rateLimit 等待与终止 payload，不误称额度耗尽", () => {
+		expect(providerWaitKind({ waitKind: "quota", quotaBucket: "rateLimit" })).toBe("rate_limit");
+		expect(
+			parseProviderWaitInfo(
+				JSON.stringify({
+					waitKind: "quota",
+					quotaBucket: "rateLimit",
+					message: "[prefill_cap_refused] the cell is at capacity",
+					resumeAt: 123,
+				}),
+			),
+		).toMatchObject({ waitKind: "capacity", resumeAt: 123 });
+		expect(
+			localizeNarratorError(
+				JSON.stringify({ type: "opencode_quota_exhausted", quotaBucket: "rateLimit" }),
+				t,
+			),
+		).toBe("rateLimitWaitNotPossibleNoReset");
+		expect(
+			parseProviderWaitInfo(
+				JSON.stringify({ waitKind: "quota", quotaBucket: "weekly", resumeAt: 456 }),
+			),
+		).toMatchObject({ waitKind: "quota", resumeAt: 456 });
+		for (const value of [
+			null,
+			"broken",
+			"null",
+			"[]",
+			"{}",
+			JSON.stringify({ waitKind: "credentials" }),
+		])
+			expect(parseProviderWaitInfo(value)).toBeNull();
+	});
+
+	test.each([
+		["en", enNarrator],
+		["zh-CN", zhNarrator],
+	] as const)("%s 容量与限流终止文案不声称额度耗尽或凭据不可用", async (lng, narrator) => {
+		const instance = createInstance();
+		await instance.init({ lng, resources: { [lng]: { narrator } }, defaultNS: "narrator" });
+		for (const waitKind of ["capacity", "rate_limit"]) {
+			const text = localizeNarratorError(
+				JSON.stringify({ type: "provider_wait_exhausted", waitKind }),
+				instance.t,
+			);
+			expect(text).not.toMatch(/quota|allowance|credentials|额度|凭据/i);
+			expect(text).toMatch(lng === "en" ? /budget/ : /预算/);
+		}
 	});
 });
 

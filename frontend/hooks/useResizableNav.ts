@@ -24,8 +24,24 @@ import { useSyncExternalStore } from "react";
 const STORAGE_KEY = "narrafork_nav_width";
 const DEFAULT_WIDTH = 250;
 const EXPANDED_MIN = 180;
-const COLLAPSED_WIDTH = 60;
-const COLLAPSE_THRESHOLD = 72;
+/**
+ * The collapsed sidebar: the expanded one, clipped to a column of its row icons (see
+ * NavHoverPanel). Every row icon sits at x 28–44 (16px navbar padding + 12px NavLink
+ * padding), so 72px inside plus the navbar's 1px border centres them.
+ */
+const COLLAPSED_WIDTH = 73;
+/**
+ * The one boundary between the two forms, and the expanded sidebar's minimum width.
+ *
+ * There is nothing in between on purpose: the collapsed rendering (rows clipped to their
+ * icons, the backdrop clipped to the rail, the expanded-only controls hidden) is the
+ * EXPANDED sidebar's layout seen through a 73px window, so it only makes sense at that
+ * width. A width between the rail and this minimum would paint that 73px-shaped layout
+ * into a wider box — the brand row overflows and row content is cut by the navbar — and
+ * releasing the drag then jumped to one end anyway. A drag previews what it will keep:
+ * below this, the rail; at or above it, the width itself.
+ */
+const COLLAPSE_THRESHOLD = EXPANDED_MIN;
 const MAX_WIDTH = 480;
 
 /**
@@ -43,7 +59,9 @@ function readStoredWidth(): number {
 		const saved = localStorage.getItem(STORAGE_KEY);
 		if (saved) {
 			const n = Number(saved);
-			if (n >= COLLAPSED_WIDTH && n <= MAX_WIDTH) return n;
+			// Below the expanded minimum is collapsed, whatever width an older rail stored.
+			if (n > 0 && n < EXPANDED_MIN) return COLLAPSED_WIDTH;
+			if (n >= EXPANDED_MIN && n <= MAX_WIDTH) return n;
 		}
 	} catch {
 		// Storage unavailable (private mode, quota, blocked): use the default.
@@ -226,7 +244,6 @@ function writeWidth(next: number, notify: boolean): void {
 interface DragState {
 	startX: number;
 	startWidth: number;
-	startedCollapsed: boolean;
 }
 
 let drag: DragState | null = null;
@@ -234,13 +251,15 @@ let drag: DragState | null = null;
 function onPointerMove(event: PointerEvent): void {
 	if (!drag) return;
 	const raw = drag.startWidth + (event.clientX - drag.startX);
+	// Quantised at the boundary rather than clamped into a dead zone: the drag shows
+	// exactly the width the release will keep (see COLLAPSE_THRESHOLD).
+	const width = raw < COLLAPSE_THRESHOLD ? COLLAPSED_WIDTH : Math.min(MAX_WIDTH, raw);
 	// CSS only: React hears nothing until the drag ends.
-	writeWidth(Math.min(MAX_WIDTH, Math.max(COLLAPSED_WIDTH, raw)), false);
+	writeWidth(width, false);
 }
 
 function endDrag(): void {
 	if (!drag) return;
-	const startedCollapsed = drag.startedCollapsed;
 	drag = null;
 	document.body.style.cursor = "";
 	document.body.style.userSelect = "";
@@ -252,16 +271,12 @@ function endDrag(): void {
 	window.removeEventListener("pointercancel", endDrag);
 	document.removeEventListener("visibilitychange", onVisibilityChange);
 
-	// Snap. Which way depends on where the drag STARTED, so a drag out of the
-	// collapsed rail expands and a drag into it collapses.
+	// Snap. The drag already previewed the outcome (see onPointerMove), so this only
+	// has to settle on the same two possibilities it showed: the rail, or the width.
+	// Which way the gesture was going no longer matters — `lastExpandedWidth` holds the
+	// width to come back to.
 	const width = getWidth();
-	const snapped = startedCollapsed
-		? width >= COLLAPSE_THRESHOLD
-			? Math.max(EXPANDED_MIN, width)
-			: COLLAPSED_WIDTH
-		: width < EXPANDED_MIN
-			? COLLAPSED_WIDTH
-			: width;
+	const snapped = width < COLLAPSE_THRESHOLD ? COLLAPSED_WIDTH : width;
 	// `writeWidth` no-ops when the snap lands on the current width, so the handover to
 	// React is done unconditionally here.
 	writeWidth(snapped, true);
@@ -285,11 +300,7 @@ export function startNavResize(event: {
 	// A release frame from the previous gesture must never clear the next one.
 	restoreDragStyles();
 	dragStyles = captureDragStyles(event.currentTarget);
-	drag = {
-		startX: event.clientX,
-		startWidth: getWidth(),
-		startedCollapsed: getCollapsed(),
-	};
+	drag = { startX: event.clientX, startWidth: getWidth() };
 	document.body.style.cursor = "col-resize";
 	document.body.style.userSelect = "none";
 	window.addEventListener("pointermove", onPointerMove);
@@ -299,6 +310,12 @@ export function startNavResize(event: {
 	window.addEventListener("blur", endDrag);
 	window.addEventListener("pointercancel", endDrag);
 	document.addEventListener("visibilitychange", onVisibilityChange);
+}
+
+/** The width the sidebar opens to: the last expanded width, or the default. */
+export function getNavExpandedWidth(): number {
+	getWidth();
+	return lastExpandedWidth ?? DEFAULT_WIDTH;
 }
 
 /** Toggle between the collapsed rail and the last expanded width. */

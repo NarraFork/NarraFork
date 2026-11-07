@@ -34,7 +34,11 @@ export type NarraForkEvent =
 			change: "revoked" | "restricted";
 			reasonCode: string;
 	  }
-	| { type: "human_attention:changed" }
+	/**
+	 * Decisions waiting for people changed. Data-free: inboxes read again. With `userIds`, only
+	 * those people's inboxes are concerned (an outline question's recipients).
+	 */
+	| { type: "human_attention:changed"; userIds?: string[] }
 	/**
 	 * Who may read or drive a narrator changed: its audiences, its grants, its owner, or a
 	 * public share link. Ids only. Server-side holders of access decisions about the narrator

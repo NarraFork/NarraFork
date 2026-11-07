@@ -512,11 +512,17 @@ export interface OidcProviderConfig {
 }
 
 /** 逐模型可选的协议；`agent.modelProtocols` 与 `agent.modelProtocolOverrides` 的值域。 */
-export type ModelProtocol =
-	| "anthropic-messages"
-	| "openai-responses"
-	| "completions-compatible"
-	| "gemini-compatible";
+export const MODEL_PROTOCOLS = [
+	"anthropic-messages",
+	"openai-responses",
+	"completions-compatible",
+	"gemini-compatible",
+] as const;
+export type ModelProtocol = (typeof MODEL_PROTOCOLS)[number];
+
+export function isModelProtocol(value: unknown): value is ModelProtocol {
+	return typeof value === "string" && (MODEL_PROTOCOLS as readonly string[]).includes(value);
+}
 
 export interface TokenDanceSettings {
 	apiKey: string;

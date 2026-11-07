@@ -4,13 +4,13 @@
  *
  * FACTS AND PROCESS
  * -----------------
- * A task (a block with a checkbox, whatever its state) and everything under it is process;
- * every other block is a fact. Nothing is stored for it: it follows from the tree. Content of a
+ * A task (a block with a checkbox, whatever its state) and everything under it is process, and
+ * so is a question put to a person (`Ask`) and what is under it; every other block is a fact. Nothing is stored for it: it follows from the tree. Content of a
  * session space is process too when it is read from another space (`isProcessBlock`). The
  * facts view of a tree leaves process out: it never descends into a task.
  */
 import { compareOrderKeys } from "@shared/outline";
-import type { OutlineTaskJson } from "./model";
+import type { OutlineAskJson, OutlineTaskJson } from "./model";
 import type { OutlineStructureRow } from "./store/read-port";
 
 export interface OutlineNode {
@@ -20,6 +20,8 @@ export interface OutlineNode {
 	orderKey: string;
 	alias: string | null;
 	task: OutlineTaskJson | null;
+	/** A question put to a person (`Ask`): process like a task. Absent: none. */
+	ask?: OutlineAskJson | null;
 	/** Seq of the commit that produced this state of the block. */
 	versionSeq: number;
 	parent: OutlineNode | null;
@@ -52,6 +54,7 @@ export function buildTree(rows: readonly OutlineStructureRow[]): Map<string, Out
 			orderKey: row.orderKey,
 			alias: row.alias,
 			task: row.taskJson,
+			ask: row.askJson ?? null,
 			versionSeq: row.versionSeq,
 			parent: null,
 			children: [],
@@ -78,10 +81,15 @@ export function ancestorsOf(node: OutlineNode): OutlineNode[] {
 	return out.reverse();
 }
 
-/** Whether the node is a task or under one. */
+/** Whether the node is process: a task or a question, or under one. */
 export function isUnderTask(node: OutlineNode): boolean {
-	for (let n: OutlineNode | null = node; n; n = n.parent) if (n.task) return true;
+	for (let n: OutlineNode | null = node; n; n = n.parent) if (n.task || n.ask) return true;
 	return false;
+}
+
+/** Whether the node is process on its own: a task or a question. */
+export function isProcessNode(node: OutlineNode): boolean {
+	return node.task !== null || !!node.ask;
 }
 
 /**
@@ -109,7 +117,7 @@ export function effectiveView(root: OutlineNode, view: OutlineView): OutlineView
 
 /** Children shown in a view: the facts view leaves tasks out, and with them their subtrees. */
 export function viewChildren(node: OutlineNode, view: OutlineView): OutlineNode[] {
-	return view === "all" ? node.children : node.children.filter((c) => c.task === null);
+	return view === "all" ? node.children : node.children.filter((c) => !isProcessNode(c));
 }
 
 /** Every node of the subtree, root first, breadth first. */

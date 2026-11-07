@@ -41,7 +41,7 @@ export const SPEC_TASK_LOCK = 11;
 export const SPEC_TASK_LOCK_GAP = 4;
 
 /** xs single-line box: round(12 × 1.4) = 17 (CONTRACT §3 ground truth). */
-export const SPEC_TASK_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const SPEC_TASK_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Task text font (Text size="xs"). */
 export const SPEC_TASK_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 

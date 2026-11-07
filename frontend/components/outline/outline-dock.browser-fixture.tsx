@@ -6,6 +6,7 @@
  * test server's (`outline-dock.browser.test.ts`); live frames go over a plain WebSocket.
  */
 import "@mantine/core/styles.css";
+import "../../styles/safe-area.css";
 import { MantineProvider } from "@mantine/core";
 import type { ComposerDocument } from "@shared/composer-document";
 import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
@@ -138,24 +139,37 @@ function Surface() {
 	const dock = useNarratorDockContext();
 	opener = useOutlineOpener();
 	return (
-		<div style={{ height: 760, width: 1200 }}>
-			<DockviewSurface
-				apiRef={dock?.apiRef}
-				components={{
-					chat: ComposerPanel as React.FunctionComponent<IDockviewPanelProps>,
-					outline: OutlineDockPanel as React.FunctionComponent<IDockviewPanelProps>,
-				}}
-				onReady={(api) => {
-					dockApi = api;
-					api.addPanel({
-						id: dockPanelId("chat"),
-						component: "chat",
-						title: "Session",
-						params: { panelType: "chat", narratorId: "n-fixture" },
-					});
-				}}
-				defaultRenderer="always"
-			/>
+		<div className="nf-app-shell">
+			<main className="nf-app-shell-main" style={{ padding: "76px 16px 16px" }}>
+				<div
+					id="dock-host"
+					style={{
+						height: "calc(100% + 32px)",
+						margin: -16,
+						display: "flex",
+						flexDirection: "column",
+						overflow: "hidden",
+					}}
+				>
+					<DockviewSurface
+						apiRef={dock?.apiRef}
+						components={{
+							chat: ComposerPanel as React.FunctionComponent<IDockviewPanelProps>,
+							outline: OutlineDockPanel as React.FunctionComponent<IDockviewPanelProps>,
+						}}
+						onReady={(api) => {
+							dockApi = api;
+							api.addPanel({
+								id: dockPanelId("chat"),
+								component: "chat",
+								title: "Session",
+								params: { panelType: "chat", narratorId: "n-fixture" },
+							});
+						}}
+						defaultRenderer="always"
+					/>
+				</div>
+			</main>
 		</div>
 	);
 }
@@ -166,6 +180,7 @@ export function ready(): boolean {
 
 /** Mount the dock (composer only) with the outline API and live frames of the test server. */
 export function open(options: { wsUrl: string }): void {
+	document.documentElement.setAttribute("data-nf-authenticated-app-shell", "true");
 	transport = new SocketTransport(options.wsUrl);
 	overrideLiveTransportForTests(transport);
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

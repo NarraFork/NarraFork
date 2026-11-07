@@ -88,6 +88,8 @@ export interface BrowserSession {
 	inUserBrowser: boolean;
 	/** Whether network request capture is currently enabled for this session. */
 	networkCaptureEnabled: boolean;
+	/** Viewport currently emulated on the session page. */
+	viewport: BrowserViewport;
 	/** Recent console output and page errors captured from the page. */
 	consoleMessages: BrowserConsoleMessage[];
 	/** Monotonic counter for console messages, independent of the capped buffer size. */
@@ -129,6 +131,67 @@ export interface BrowserSessionHandoff {
 	headless: boolean;
 	ttlMs: number;
 	networkCaptureEnabled: boolean;
+	/** Emulated viewport; absent in handoff files written before viewport support. */
+	viewport?: BrowserViewport;
+}
+
+/** Viewport emulated on a session page (CSS pixels). */
+export interface BrowserViewport {
+	width: number;
+	height: number;
+	deviceScaleFactor?: number;
+	isMobile?: boolean;
+}
+
+export const MIN_VIEWPORT_SIZE = 100;
+export const MAX_VIEWPORT_SIZE = 4096;
+export const MIN_DEVICE_SCALE_FACTOR = 0.5;
+export const MAX_DEVICE_SCALE_FACTOR = 4;
+
+/** Validate a viewport, throwing a readable error for out-of-range values. */
+export function normalizeViewport(viewport: BrowserViewport): BrowserViewport {
+	const dimension = (name: string, value: number) => {
+		if (!Number.isFinite(value) || value < MIN_VIEWPORT_SIZE || value > MAX_VIEWPORT_SIZE) {
+			throw new Error(
+				`Viewport ${name} must be between ${MIN_VIEWPORT_SIZE} and ${MAX_VIEWPORT_SIZE} pixels`,
+			);
+		}
+		return Math.round(value);
+	};
+	const result: BrowserViewport = {
+		width: dimension("width", viewport.width),
+		height: dimension("height", viewport.height),
+	};
+	if (viewport.deviceScaleFactor !== undefined) {
+		const dsf = viewport.deviceScaleFactor;
+		if (!Number.isFinite(dsf) || dsf < MIN_DEVICE_SCALE_FACTOR || dsf > MAX_DEVICE_SCALE_FACTOR) {
+			throw new Error(
+				`Device scale factor must be between ${MIN_DEVICE_SCALE_FACTOR} and ${MAX_DEVICE_SCALE_FACTOR}`,
+			);
+		}
+		result.deviceScaleFactor = dsf;
+	}
+	if (viewport.isMobile !== undefined) result.isMobile = viewport.isMobile;
+	return result;
+}
+
+/** Drop undefined fields so a partial viewport spread does not erase existing values. */
+function definedOnly(viewport: Partial<BrowserViewport> | undefined): Partial<BrowserViewport> {
+	if (!viewport) return {};
+	return Object.fromEntries(
+		Object.entries(viewport).filter(([, value]) => value !== undefined),
+	) as Partial<BrowserViewport>;
+}
+
+/** Puppeteer viewport including the touch flag that matches mobile emulation. */
+function toPuppeteerViewport(viewport: BrowserViewport) {
+	return {
+		width: viewport.width,
+		height: viewport.height,
+		deviceScaleFactor: viewport.deviceScaleFactor ?? 1,
+		isMobile: viewport.isMobile ?? false,
+		hasTouch: viewport.isMobile ?? false,
+	};
 }
 
 export function normalizeSessionTtlMs(ttlMs: number | undefined): number {
@@ -425,8 +488,10 @@ export async function createSession(
 	headless = true,
 	ttlMs?: number,
 	captureNetwork = false,
+	viewport?: Partial<BrowserViewport>,
 ): Promise<BrowserSession> {
 	const normalizedTtlMs = normalizeSessionTtlMs(ttlMs);
+	const normalizedViewport = normalizeViewport({ ...DEFAULT_VIEWPORT, ...definedOnly(viewport) });
 	const { context, page, inUserBrowser } = await openTab(headless);
 	const sessionId = generateShortId();
 	const session: BrowserSession = {
@@ -440,6 +505,7 @@ export async function createSession(
 		headless,
 		inUserBrowser,
 		networkCaptureEnabled: captureNetwork,
+		viewport: normalizedViewport,
 		consoleMessages: [],
 		consoleMessageSeq: 0,
 		pendingConsoleCaptures: new Set(),
@@ -452,7 +518,7 @@ export async function createSession(
 	try {
 		// Puppeteer doesn't support viewport/userAgent at context level (unlike Playwright),
 		// so we set them per-page to match fetchPage() defaults.
-		await page.setViewport(DEFAULT_VIEWPORT);
+		await page.setViewport(toPuppeteerViewport(normalizedViewport));
 		// 用户的浏览器带着真实登录态，伪造的 UA 容易触发站点的异常登录风控
 		if (!inUserBrowser) await page.setUserAgent(USER_AGENT);
 		await installDialogProtection(
@@ -488,8 +554,30 @@ export async function createSession(
 		inUserBrowser,
 		ttlMs: normalizedTtlMs,
 		networkCaptureEnabled: captureNetwork,
+		viewport: normalizedViewport,
 	});
 	eventBus.emit({ type: "browser:session_created", sessionId, narratorId, url });
+	return session;
+}
+
+/**
+ * Change the emulated viewport of a live session. Omitted fields keep their current value.
+ * Mobile emulation changes require a reload for the page to pick up the new UA metrics,
+ * which Puppeteer performs automatically.
+ */
+export async function setSessionViewport(
+	narratorId: string,
+	sessionId: string,
+	viewport: Partial<BrowserViewport>,
+): Promise<BrowserSession | undefined> {
+	const session = getSession(narratorId, sessionId);
+	if (!session) return undefined;
+	const next = normalizeViewport({ ...session.viewport, ...definedOnly(viewport) });
+	await session.page.setViewport(toPuppeteerViewport(next));
+	session.viewport = next;
+	touchSession(session);
+	logger.info("Browser session viewport updated", { narratorId, sessionId, viewport: next });
+	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
 
@@ -627,6 +715,7 @@ export function listSessions(narratorId: string): Array<{
 	ttlMs: number;
 	expiresAt: number;
 	headless: boolean;
+	viewport: BrowserViewport;
 	tracing: { active: boolean; startedAt: number } | null;
 	memoryProfile: {
 		profileId?: string;
@@ -653,6 +742,7 @@ export function listSessions(narratorId: string): Array<{
 		ttlMs: s.ttlMs,
 		expiresAt: s.lastActivity + s.ttlMs,
 		headless: s.headless,
+		viewport: s.viewport,
 		tracing: s.tracing ? { active: s.tracing.active, startedAt: s.tracing.startedAt } : null,
 		memoryProfile: s.memoryProfile
 			? {
@@ -768,6 +858,7 @@ export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
 				headless: session.headless,
 				ttlMs: session.ttlMs,
 				networkCaptureEnabled: session.networkCaptureEnabled,
+				viewport: session.viewport,
 			});
 		}
 	}
@@ -821,6 +912,7 @@ export async function restoreSessionFromHandoff(
 		// 交接只保留我们启动的浏览器
 		inUserBrowser: false,
 		networkCaptureEnabled: handoff.networkCaptureEnabled,
+		viewport: restoredViewport(handoff.viewport),
 		consoleMessages: [],
 		consoleMessageSeq: 0,
 		pendingConsoleCaptures: new Set(),
@@ -848,6 +940,18 @@ export async function restoreSessionFromHandoff(
 	);
 	attachConsoleListeners(page, session);
 	attachNetworkListeners(page, session);
+	// Reconnecting re-applies connect()'s defaultViewport, so restore a customized size.
+	// Skip the CDP round-trip for default sessions to keep restore unchanged for them.
+	if (!isDefaultViewport(session.viewport)) {
+		try {
+			await page.setViewport(toPuppeteerViewport(session.viewport));
+		} catch (error) {
+			logger.warn("Failed to restore browser session viewport after update", {
+				sessionId: handoff.sessionId,
+				error: String(error),
+			});
+		}
+	}
 
 	let map = sessions.get(handoff.narratorId);
 	if (!map) {
@@ -869,6 +973,25 @@ export async function restoreSessionFromHandoff(
 		url: page.url(),
 	});
 	return { ok: true };
+}
+
+function isDefaultViewport(viewport: BrowserViewport): boolean {
+	return (
+		viewport.width === DEFAULT_VIEWPORT.width &&
+		viewport.height === DEFAULT_VIEWPORT.height &&
+		(viewport.deviceScaleFactor ?? 1) === 1 &&
+		!viewport.isMobile
+	);
+}
+
+/** Viewport recorded in a handoff; invalid or missing (older handoff files) → default. */
+function restoredViewport(viewport: BrowserViewport | undefined): BrowserViewport {
+	if (!viewport) return { ...DEFAULT_VIEWPORT };
+	try {
+		return normalizeViewport(viewport);
+	} catch {
+		return { ...DEFAULT_VIEWPORT };
+	}
 }
 
 /** Prefer a page matching the captured URL; otherwise take the first available page. */

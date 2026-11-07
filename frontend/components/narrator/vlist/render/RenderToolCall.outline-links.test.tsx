@@ -131,6 +131,41 @@ const edit = toolMessage(
 	},
 );
 
+const asked = toolMessage(
+	"Ask",
+	{
+		questions: [
+			{
+				question: "Which format first?",
+				options: ["v1", "v2"],
+				recommend: 2,
+				items: [{ question: "Keep v1?", recommend: "read-only" }],
+			},
+		],
+	},
+	"Asked Q1 [Qq1Sid00], Q2 [Qq2Sid00] under [Ab3dEf9Q] for alice.",
+	{
+		tool: "Ask",
+		space: { key: "Kx81mPqa", kind: "project" },
+		under: "Kx81mPqa/Ab3dEf9Q",
+		addresses: ["Kx81mPqa/Qq1Sid00", "Kx81mPqa/Qq2Sid00"],
+	},
+);
+
+describe("the Ask card", () => {
+	it("links each question and the block they are under (whose side panel answers them)", () => {
+		mountAt("https://nf.example.com/nf/");
+		const root = renderCard(asked, true);
+		const links = outlineAnchors(root).map((a) => a.href);
+		expect(links).toContain("/nf/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
+		expect(links).toContain("/nf/outline/ref?a=Kx81mPqa%2FQq1Sid00");
+		expect(links).toContain("/nf/outline/ref?a=Kx81mPqa%2FQq2Sid00");
+		expect(root.textContent).toContain("Which format first?");
+		expect(root.textContent).toContain("Keep v1?");
+		expect(root.textContent).toContain("→ v2");
+	});
+});
+
 describe("outline tool cards", () => {
 	it("link the read's address, each hit and the edit's target and commit inside a host", () => {
 		mountAt("https://nf.example.com/nf/");
@@ -156,6 +191,72 @@ describe("outline tool cards", () => {
 			expect(outlineAnchors(root)).toEqual([]);
 		}
 		expect(renderCard(read, false).textContent).toContain("Kx81mPqa/Ab3dEf9Q");
-		expect(renderCard(edit, false).textContent).toContain("commit #4");
+		expect(renderCard(edit, false).textContent).toContain("Commit #4");
+	});
+});
+
+const display = {
+	v: 1,
+	space: { key: "MTBXwl1Y", kind: "session", own: true },
+	ops: [
+		{
+			op: "set",
+			target: { address: "MTBXwl1Y/LUwB3JZb", title: "Fix the retry button" },
+			status: { from: "doing", to: "done" },
+		},
+		{ op: "set", target: { address: "MTBXwl1Y/LUwB3JZb", title: "Fix" }, alias: { to: "Q7" } },
+	],
+};
+const ticked = toolMessage(
+	"OutlineEdit",
+	{ edits: [{ set: "LUwB3JZb", checkbox: "x", alias: "Q?" }] },
+	"Committed #6",
+	{
+		tool: "OutlineEdit",
+		space: { key: "MTBXwl1Y", kind: "session" },
+		commit: { id: "c6", seq: 6 },
+		edits: [{ op: "set", address: "MTBXwl1Y/LUwB3JZb" }],
+		display,
+	},
+);
+
+describe("the OutlineEdit change list", () => {
+	it("names the task by its title as an outline link, its status change as chips", () => {
+		mountAt("https://nf.example.com/");
+		const root = renderCard(ticked, true);
+		const row = root.querySelector("[data-outline-change-row]");
+		expect(row?.querySelector("[data-outline-link]")?.textContent).toBe("Fix the retry button");
+		expect(row?.querySelector("[data-outline-link]")?.getAttribute("title")).toContain(
+			"MTBXwl1Y/LUwB3JZb",
+		);
+		expect(
+			Array.from(row?.querySelectorAll("[data-change-part='chip']") ?? []).map(
+				(c) => c.textContent,
+			),
+		).toEqual(["In progress", "Done"]);
+		// The raw input and the model's result are folded away; the fold says so.
+		expect(root.querySelector("[data-outline-raw-toggle]")?.textContent).toContain(
+			"Raw input · result the model saw",
+		);
+		expect(root.textContent).not.toContain("Committed #6");
+		// Without a host the title stays, as plain text.
+		const plain = renderCard(ticked, false);
+		expect(plain.querySelector("[data-outline-link]")).toBeNull();
+		expect(plain.querySelector("[data-change-part='link']")?.textContent).toBe(
+			"Fix the retry button",
+		);
+	});
+
+	it("never upper-cases an id or an alias", () => {
+		mountAt("https://nf.example.com/");
+		const root = renderCard(ticked, true);
+		const badges = Array.from(root.querySelectorAll(".mantine-Badge-root"));
+		const key = badges.find((b) => b.textContent === "MTBXwl1Y");
+		const alias = badges.find((b) => b.textContent === "Q7");
+		expect(key).toBeDefined();
+		expect(alias).toBeDefined();
+		// Mantine upper-cases a badge unless it is told not to (`tt="none"` → text-transform).
+		for (const badge of [key, alias])
+			expect(badge?.getAttribute("style") ?? "").toContain("text-transform:none");
 	});
 });

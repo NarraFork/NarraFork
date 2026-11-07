@@ -29,7 +29,7 @@ const { measureRichInlineStats } = await import("@chenglou/pretext/rich-inline")
 const { parseMarkdownToPreparedBlocks, KATEX_PLACEHOLDER_HEIGHT } = await import(
 	"./parse-markdown"
 );
-const { MARKDOWN_CONSTANTS } = await import("./parse-markdown");
+const { typographyMetrics } = await import("./pretext-fonts");
 
 type AnyBlock = ReturnType<typeof parseMarkdownToPreparedBlocks>[number];
 type InlineBlock = Extract<AnyBlock, { kind: "inline" }>;
@@ -71,7 +71,7 @@ describe("display math", () => {
 		expect(block?.placeholderHeight).toBeGreaterThan(0);
 		expect(block?.placeholderHeight).not.toBe(KATEX_PLACEHOLDER_HEIGHT);
 		// A stacked fraction is taller than a plain text line.
-		expect(block?.placeholderHeight).toBeGreaterThan(MARKDOWN_CONSTANTS.BODY_LINE_HEIGHT);
+		expect(block?.placeholderHeight).toBeGreaterThan(typographyMetrics().line.body);
 	});
 
 	it("records the formula's own width so shrink-wrap containers do not clip it", () => {
@@ -147,10 +147,12 @@ describe("inline math atoms", () => {
 
 	it("raises the block line height for a tall formula", () => {
 		const plain = parse("just prose").filter((b): b is InlineBlock => b.kind === "inline")[0];
-		const withMath = parse("a fraction $\\frac{a}{b}$ inline").filter(
+		// A nested fraction: a single \frac now fits inside the default body line (24px,
+		// 120% of the Mantine 20 — LINE_HEIGHT_BASELINE_PERCENT), a stacked one does not.
+		const withMath = parse("a fraction $\\frac{\\frac{a}{b}}{\\frac{c}{d}}$ inline").filter(
 			(b): b is InlineBlock => b.kind === "inline",
 		)[0];
-		expect(plain?.lineHeight).toBe(MARKDOWN_CONSTANTS.BODY_LINE_HEIGHT);
+		expect(plain?.lineHeight).toBe(typographyMetrics().line.body);
 		expect(withMath?.lineHeight).toBeGreaterThan(plain?.lineHeight ?? 0);
 	});
 

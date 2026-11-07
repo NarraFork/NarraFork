@@ -10,10 +10,12 @@ import {
 	settings as liveSettings,
 	type McpServerConfig,
 	normalizeMcpServerIds,
+	parseSettingsText,
 	reloadSettings,
 	saveSettings,
 	stripObsoleteSettingsKeys,
 } from "../../../server/lib/settings";
+import { StartupError } from "../../../server/lib/startup-status/startup-error";
 
 /** A provider entry's own window, held in the catalog's overrides file. */
 const ownWindow = (model: string) => getModelOverride("connection", model)?.contextWindow;
@@ -269,5 +271,32 @@ describe("stripObsoleteSettingsKeys", () => {
 
 		expect(stripObsoleteSettingsKeys(value)).toBe(false);
 		expect(value).toEqual({ customApiProviders: [] });
+	});
+});
+
+describe("parseSettingsText", () => {
+	it("accepts the comments and trailing commas of a hand-edited file", () => {
+		const text = '{\n\t// moved to 7780\n\t"server": { "port": 7780, },\n\t/* old */\n}';
+		expect(parseSettingsText(text)).toEqual({ server: { port: 7780 } });
+	});
+
+	it("names the file and the reason when it cannot be read", () => {
+		let error: unknown;
+		try {
+			parseSettingsText('{ "server": { "port": 7780 ');
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(StartupError);
+		const { message, command } = (error as StartupError).problem;
+		expect(message.en).toContain("settings.json is not valid JSON");
+		expect(message.en).not.toContain("JSONC Parse error");
+		expect(command).toContain("settings.json");
+	});
+
+	it("rejects a file whose top level is not an object", () => {
+		for (const text of ["[]", "null", "42"]) {
+			expect(() => parseSettingsText(text)).toThrow(/top level must be an object/);
+		}
 	});
 });

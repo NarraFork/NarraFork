@@ -1,0 +1,47 @@
+/*
+ * The reader's typography (外观 · 排版) for text the browser lays out: the outline's read-only
+ * tree and anything else that renders Mantine text or the shared markdown renderer.
+ *
+ * The `--nf-type-*` values are published on <html> by frontend/lib/typography-css-vars.ts
+ * from the metrics the transcript measures with. This class maps Mantine's own size tokens
+ * onto them, so `Text size="sm"`, `Title order={3}` and MarkdownContent (which size
+ * themselves through those tokens) follow the setting without per-element overrides — and
+ * with the conversation's own role for each: body, xs, h1–h6.
+ *
+ * Put it on TEXT containers only: a Mantine button or input inside would scale with it.
+ */
+.nf-type-scope {
+	--mantine-font-size-sm: var(--nf-type-body-size);
+	--mantine-line-height-sm: var(--nf-type-body-line);
+	--mantine-font-size-xs: var(--nf-type-xs-size);
+	--mantine-line-height-xs: var(--nf-type-xs-line);
+	--mantine-h1-font-size: var(--nf-type-h1-size);
+	--mantine-h1-line-height: var(--nf-type-h1-line);
+	--mantine-h2-font-size: var(--nf-type-h2-size);
+	--mantine-h2-line-height: var(--nf-type-h2-line);
+	--mantine-h3-font-size: var(--nf-type-h3-size);
+	--mantine-h3-line-height: var(--nf-type-h3-line);
+	--mantine-h4-font-size: var(--nf-type-h4-size);
+	--mantine-h4-line-height: var(--nf-type-h4-line);
+	--mantine-h5-font-size: var(--nf-type-h5-size);
+	--mantine-h5-line-height: var(--nf-type-h5-line);
+	--mantine-h6-font-size: var(--nf-type-h6-size);
+	--mantine-h6-line-height: var(--nf-type-h6-line);
+	/* Inline code sits in the body line without a line box of its own (as in the editor and
+	   the mind map): a smaller mono font on an inherited line box rides low and grows the line. */
+	--nf-scoped-inline-code-line: 0;
+	/* Fenced code (HighlightedCode reads these, and keeps its own 11px / 1.55 elsewhere). */
+	--nf-scoped-code-block-size: var(--nf-type-code-block-size);
+	--nf-scoped-code-block-line: var(--nf-type-code-block-line);
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+}
+
+/*
+ * Letter spacing is an em fraction of EACH element's own size, as the transcript applies it
+ * per run. Declared on every element because an inherited `letter-spacing` is the parent's
+ * computed px; :where() keeps it at zero specificity so a component's own value still wins.
+ */
+:where(.nf-type-scope, .nf-type-scope *) {
+	letter-spacing: var(--nf-type-letter-spacing);
+}

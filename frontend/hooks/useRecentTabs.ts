@@ -1,5 +1,14 @@
 import { Button } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import {
+	applyRecentTabFolderDissolve,
+	applyRecentTabMove,
+	applyRecentTabPin,
+	applyRecentTabRemove,
+	isFolderTab,
+	regroupFolders,
+	unitRange,
+} from "@shared/recent-tab-layout";
 import type {
 	PersistedRecentTab,
 	RecentTabsDelta as RecentTabsDeltaFrame,
@@ -18,7 +27,8 @@ import { type ComponentType, createElement, useCallback, useEffect, useMemo } fr
 import { useTranslation } from "react-i18next";
 import { ApiError, api } from "../lib/api";
 import type {
-	RecentTabMoveTarget as ApiRecentTabMoveTarget,
+	RecentTabFolderPatch,
+	RecentTabMoveTarget,
 	RecentTabsMutationResponse,
 	RecentTabsPageResponse,
 } from "../lib/api/settings";
@@ -79,11 +89,6 @@ const UNDO_NOTIFICATION_ID = "recent-tabs-undo";
 const UNDO_AUTO_CLOSE_MS = 6_000;
 
 export type RecentTabsInfiniteData = InfiniteData<RecentTabsPageResponse>;
-export type RecentTabApiMoveTarget = ApiRecentTabMoveTarget;
-export type RecentTabMoveTarget =
-	| RecentTabApiMoveTarget
-	| { afterKey: string }
-	| { beforeKey: string };
 
 export interface RecentTabsDelta {
 	baseRevision?: number;
@@ -241,10 +246,15 @@ function replaceLoadedTabs(
 	const previousCount = data.pages.reduce((count, page) => count + page.items.length, 0);
 	const lastPage = data.pages.at(-1);
 	const capacity = data.pages.length * RECENT_TABS_PAGE_SIZE;
-	const visibleCount = Math.min(
+	let visibleCount = Math.min(
 		tabs.length,
 		Math.max(previousCount, Math.min(tabs.length, capacity)),
 	);
+	// Never cut a folder in half: the server pages by top-level unit, so a folder's members
+	// always travel with it. Keep the rest of a folder the cut would have split.
+	if (visibleCount > 0 && visibleCount < tabs.length) {
+		visibleCount = unitRange(tabs, visibleCount - 1).end + 1;
+	}
 	const visible = tabs.slice(0, visibleCount);
 	let offset = 0;
 	const pages = data.pages.map((page, pageIndex) => {
@@ -311,175 +321,12 @@ function syncCompatibilityCache(qc: QueryClient): void {
 	});
 }
 
-/** Enforce workspace grouping: each header is immediately followed by its loaded children. */
-function regroupTabs(tabs: RecentTab[]): void {
-	const childrenByWorkspace = new Map<string, RecentTab[]>();
-	for (const tab of tabs) {
-		if (!tab.workspaceId) continue;
-		const children = childrenByWorkspace.get(tab.workspaceId);
-		if (children) children.push(tab);
-		else childrenByWorkspace.set(tab.workspaceId, [tab]);
-	}
-	if (childrenByWorkspace.size === 0) return;
-
-	for (let index = tabs.length - 1; index >= 0; index--) {
-		if (tabs[index].workspaceId) tabs.splice(index, 1);
-	}
-	const headerIds = new Set<string>();
-	for (let index = 0; index < tabs.length; index++) {
-		const tab = tabs[index];
-		if (tab.type !== "workspace") continue;
-		headerIds.add(tab.id);
-		const children = childrenByWorkspace.get(tab.id);
-		if (children?.length) {
-			tabs.splice(index + 1, 0, ...children);
-			index += children.length;
-		}
-	}
-	for (const [workspaceId, children] of childrenByWorkspace) {
-		if (headerIds.has(workspaceId)) continue;
-		tabs.push(...children.map((child) => ({ ...child, workspaceId: undefined })));
-	}
-}
-
-function getPinnedSectionEndIndex(tabs: RecentTab[]): number {
-	let index = 0;
-	while (index < tabs.length) {
-		const tab = tabs[index];
-		if (tab.workspaceId) {
-			index++;
-			continue;
-		}
-		if (!tab.pinned) break;
-		index++;
-		if (tab.type === "workspace") {
-			while (index < tabs.length && tabs[index]?.workspaceId === tab.id) index++;
-		}
-	}
-	return index;
-}
-
-export function applyRecentTabMove(
-	tabs: RecentTab[],
-	key: string,
-	target: RecentTabMoveTarget,
-): RecentTab[] {
-	const index = tabs.findIndex((tab) => tabKey(tab) === key);
-	if (index === -1) return tabs;
-	const next = [...tabs];
-	const tab = next[index];
-	let movedGroup: RecentTab[];
-	if (tab.type === "workspace") {
-		let end = index + 1;
-		while (end < next.length && next[end].workspaceId === tab.id) end++;
-		movedGroup = next.splice(index, end - index);
-	} else {
-		movedGroup = next.splice(index, 1);
-	}
-
-	if ("afterKey" in target) {
-		const anchor = next.findIndex((item) => tabKey(item) === target.afterKey);
-		next.splice(anchor === -1 ? next.length : anchor + 1, 0, ...movedGroup);
-	} else if ("beforeKey" in target) {
-		const anchor = next.findIndex((item) => tabKey(item) === target.beforeKey);
-		next.splice(anchor === -1 ? 0 : anchor, 0, ...movedGroup);
-	} else if ("toIndex" in target) {
-		next.splice(Math.min(target.toIndex, next.length), 0, ...movedGroup);
-	} else {
-		next.unshift(...movedGroup);
-	}
-	regroupTabs(next);
-	return next;
-}
-
-/**
- * A before/after move on the flat order — the only reorder primitive the server has.
- */
-export interface RecentTabOrderMove {
-	key: string;
-	beforeKey?: string;
-	afterKey?: string;
-}
-
-export interface RecentTabOrderMoveResult {
-	moves: RecentTabOrderMove[];
-	/** The order the cache converges to after applying every move in sequence. */
-	finalTabs: RecentTab[];
-}
-
-/**
- * Translate a desired unit order into flat before/after moves.
- *
- * The sidebar's derived views (directory aggregation) reorder UNITS — blocks of one or
- * more tab keys — while the server only reorders single keys. This walks the desired
- * movable order and, whenever the next key is not already at its slot, emits ONE move
- * placing it before the key that currently occupies the slot. Keys absent from
- * `orderedBlocks` are fixed and never emitted or displaced relative to one another.
- *
- * Two properties are load-bearing and both are covered by tests:
- *
- *  - `beforeKey` is used throughout, never `afterKey`: the server expands an anchor
- *    inside a workspace to the whole group boundary, so "after a workspace header" means
- *    after its LAST CHILD there but right after the header in the client simulation —
- *    "before an occupant" cannot diverge that way (an occupant is always a top-level
- *    key: a workspace child only becomes the current slot after its own header was
- *    placed, and by then it sits exactly where the walk expects it).
- *  - Every move is simulated through {@link applyRecentTabMove}, the same function the
- *    mutation cache path and the WS delta path use, so `finalTabs` is exactly what the
- *    cache holds after the sequence is replayed — that is what lets the caller render
- *    `finalTabs` optimistically without the order snapping back mid-flight.
- */
-export function computeRecentTabOrderMoves(
-	tabs: RecentTab[],
-	orderedBlocks: string[][],
-): RecentTabOrderMoveResult {
-	const movable = new Set(orderedBlocks.flat());
-	let work = [...tabs];
-	const moves: RecentTabOrderMove[] = [];
-	let placedCount = 0;
-
-	for (const block of orderedBlocks) {
-		for (const key of block) {
-			// Defensive: a block naming a tab that is gone is skipped entirely — emitting
-			// a move for it would push a key the server does not have and corrupt the
-			// placed-slot bookkeeping for every key after it.
-			if (!work.some((tab) => tabKey(tab) === key)) continue;
-			// The slot this key must occupy: the first movable position not yet placed.
-			let seen = 0;
-			let targetIdx = -1;
-			for (let i = 0; i < work.length; i++) {
-				if (!movable.has(tabKey(work[i]))) continue;
-				if (seen === placedCount) {
-					targetIdx = i;
-					break;
-				}
-				seen++;
-			}
-			if (targetIdx < 0) continue; // defensive: no unplaced slot left
-			if (tabKey(work[targetIdx]) === key) {
-				placedCount++;
-				continue;
-			}
-			const beforeKey = tabKey(work[targetIdx]);
-			const move: RecentTabOrderMove = { key, beforeKey };
-			work = applyRecentTabMove(work, key, { beforeKey });
-			moves.push(move);
-			placedCount++;
-		}
-	}
-
-	return { moves, finalTabs: work };
-}
-
 function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): RecentTab[] {
 	if (operation.type === "remove") {
-		const removed = tabs.find((tab) => tabKey(tab) === operation.key);
-		if (!removed) return tabs;
-		if (removed.type === "workspace") {
-			return tabs
-				.filter((tab) => tabKey(tab) !== operation.key)
-				.map((tab) => (tab.workspaceId === removed.id ? { ...tab, workspaceId: undefined } : tab));
-		}
+		// Header only, even for a folder: the server lists every removed member as its own
+		// operation, and a dissolved folder's members arrive as upserts right after this.
+		// Taking the members out here would make those upserts lose their anchors.
+		if (!tabs.some((tab) => tabKey(tab) === operation.key)) return tabs;
 		return tabs.filter((tab) => tabKey(tab) !== operation.key);
 	}
 
@@ -489,11 +336,11 @@ function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): Rece
 			(tab) =>
 				tabKey(tab) === key &&
 				tabKey(tab) !== operation.key &&
-				!(previous?.type === "workspace" && tab.workspaceId === previous.id),
+				!(previous && isFolderTab(previous) && tab.folderId === previous.id),
 		);
 	// The server emits operations in final order and detects moves by predecessor.
 	// Prefer that already-positioned predecessor: the successor may not have moved
-	// yet, may be outside the loaded window, or may belong to the moved workspace.
+	// yet, may be outside the loaded window, or may belong to the moved folder.
 	let target: RecentTabMoveTarget | null = null;
 	if (operation.afterKey === null) target = { toIndex: 0 };
 	else if (hasAnchor(operation.afterKey)) target = { afterKey: operation.afterKey };
@@ -507,13 +354,10 @@ function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): Rece
 		if (!previous) return tabs;
 		return tabs.filter(
 			(tab) =>
-				tabKey(tab) !== operation.key &&
-				!(previous.type === "workspace" && tab.workspaceId === previous.id),
+				tabKey(tab) !== operation.key && !(isFolderTab(previous) && tab.folderId === previous.id),
 		);
 	}
-	if (operation.type === "move") {
-		return applyRecentTabMove(tabs, operation.key, target);
-	}
+	if (operation.type === "move") return replayMove(tabs, operation.key, target);
 
 	// Deltas only carry persisted columns, so an upsert for an already-rendered tab must
 	// keep its live runtime fields (status colour, terminal count, viewers, container badge).
@@ -527,8 +371,31 @@ function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): Rece
 		insertAt = withoutCurrent.findIndex((tab) => tabKey(tab) === target.beforeKey);
 	}
 	withoutCurrent.splice(insertAt, 0, nextTab);
-	regroupTabs(withoutCurrent);
-	return withoutCurrent;
+	return regroupFolders(withoutCurrent);
+}
+
+/**
+ * Replay a server `move` exactly: the server already resolved membership and the
+ * canonical layout, so the tab lands right next to its anchor (a folder moves with its
+ * members) and `regroupFolders` only restores contiguity.
+ */
+function replayMove(tabs: RecentTab[], key: string, target: RecentTabMoveTarget): RecentTab[] {
+	const index = tabs.findIndex((tab) => tabKey(tab) === key);
+	if (index < 0) return tabs;
+	const next = [...tabs];
+	const range = isFolderTab(next[index]) ? unitRange(next, index) : { start: index, end: index };
+	const group = next.splice(range.start, range.end - range.start + 1);
+	let insertAt = 0;
+	if ("afterKey" in target) {
+		insertAt = next.findIndex((tab) => tabKey(tab) === target.afterKey) + 1;
+	} else if ("beforeKey" in target) {
+		insertAt = Math.max(
+			0,
+			next.findIndex((tab) => tabKey(tab) === target.beforeKey),
+		);
+	}
+	next.splice(insertAt, 0, ...group);
+	return regroupFolders(next);
 }
 
 function operationSection(operation: RecentTabsOperation): RecentTabsSection {
@@ -659,6 +526,20 @@ export function applyRecentTabsRuntimePatches(
 	syncCompatibilityCache(qc);
 }
 
+function applyFolderPatch(
+	tab: RecentTab,
+	folderId: string,
+	patch: RecentTabFolderPatch,
+): RecentTab {
+	if (!isFolderTab(tab) || tab.id !== folderId) return tab;
+	const next: RecentTab = { ...tab };
+	if (patch.title !== undefined) next.title = patch.title.trim();
+	if (patch.icon !== undefined) next.folderIcon = patch.icon ?? undefined;
+	if (patch.color !== undefined) next.folderColor = patch.color ?? undefined;
+	if (patch.previewCount !== undefined) next.folderPreviewCount = patch.previewCount ?? undefined;
+	return next;
+}
+
 function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	const persisted: PersistedRecentTab = {
 		type: tab.type,
@@ -668,14 +549,15 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	};
 	if (tab.narratorId !== undefined) persisted.narratorId = tab.narratorId;
 	if (tab.parentNarratorId !== undefined) persisted.parentNarratorId = tab.parentNarratorId;
-	if (tab.workspaceId !== undefined) persisted.workspaceId = tab.workspaceId;
+	if (tab.folderId !== undefined) persisted.folderId = tab.folderId;
 	if (tab.subtitle !== undefined) persisted.subtitle = tab.subtitle;
 	if (tab.status !== undefined) persisted.status = tab.status;
 	if (tab.pinned !== undefined) persisted.pinned = tab.pinned;
 	if (tab.isScheduled !== undefined) persisted.isScheduled = tab.isScheduled;
-	// Carried so an undo-restore does not silently flatten hand-arranged directory
-	// groups back to recency order.
-	if (tab.dirSortOrder !== undefined) persisted.dirSortOrder = tab.dirSortOrder;
+	// Carried so an undo-restore brings folders back with their look and preview size.
+	if (tab.folderIcon !== undefined) persisted.folderIcon = tab.folderIcon;
+	if (tab.folderColor !== undefined) persisted.folderColor = tab.folderColor;
+	if (tab.folderPreviewCount !== undefined) persisted.folderPreviewCount = tab.folderPreviewCount;
 	return persisted;
 }
 
@@ -697,37 +579,16 @@ export function clearLoadedTabs(
 	scope: "all" | "projects" | "inactive_narrators",
 	keepTabKey?: string,
 ): RecentTab[] {
-	// Pinning is an explicit user intent to keep a tab; no clear scope may drop it.
-	// Any tab type can be pinned; a pinned WORKSPACE header additionally keeps its
-	// children, so the group stays together (mirrors the server's unit-header rule).
-	const pinnedWorkspaces = new Set(
-		tabs.filter((tab) => tab.type === "workspace" && tab.pinned).map((tab) => tab.id),
-	);
+	// Mirrors the server: pinned tabs, folders (whole, with their members) and the kept
+	// tab survive every scope. A folder is a structure the user built by hand.
 	const isKept = (tab: RecentTab) =>
 		(keepTabKey ? tabKey(tab) === keepTabKey : false) ||
 		tab.pinned === true ||
-		(!!tab.workspaceId && pinnedWorkspaces.has(tab.workspaceId));
+		isFolderTab(tab) ||
+		!!tab.folderId;
 	if (scope === "all") return tabs.filter(isKept);
 	if (scope === "projects") return tabs.filter((tab) => tab.type !== "project" || isKept(tab));
-
-	const childrenByWorkspace = new Map<string, RecentTab[]>();
-	for (const tab of tabs) {
-		if (!tab.workspaceId) continue;
-		const children = childrenByWorkspace.get(tab.workspaceId);
-		if (children) children.push(tab);
-		else childrenByWorkspace.set(tab.workspaceId, [tab]);
-	}
-	const activeWorkspaces = new Set<string>();
-	for (const tab of tabs) {
-		if (tab.type !== "workspace") continue;
-		if ((childrenByWorkspace.get(tab.id) ?? []).some(isAttentionTab)) activeWorkspaces.add(tab.id);
-	}
-	return tabs.filter((tab) => {
-		if (isKept(tab) || tab.type === "project") return true;
-		if (tab.type === "workspace") return activeWorkspaces.has(tab.id);
-		if (tab.workspaceId) return activeWorkspaces.has(tab.workspaceId);
-		return isAttentionTab(tab);
-	});
+	return tabs.filter((tab) => isKept(tab) || tab.type === "project" || isAttentionTab(tab));
 }
 
 function snapshotSections(
@@ -1116,9 +977,7 @@ export function useRecentTabs() {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const snapshots = snapshotSections(qc);
 			const section = type === "project" ? "projects" : "work";
-			updateSectionData(qc, section, (current) =>
-				applyOperation(current, { type: "remove", key: `${type}:${id}` }),
-			);
+			updateSectionData(qc, section, (current) => applyRecentTabRemove(current, `${type}:${id}`));
 			syncCompatibilityCache(qc);
 			return { snapshots };
 		},
@@ -1127,20 +986,18 @@ export function useRecentTabs() {
 		},
 		onSuccess: (result, variables) => {
 			applyAuthoritativeResult(result);
-			// Single-tab close via swipe / context menu / middle-click — same undo affordance
-			// as one-click clear. Workspace dissolve is excluded: it also tears down the
-			// workspace entity and its panels, which a tab-list restore cannot bring back.
-			// Token-only: a loaded-window snapshot would wipe unloaded pages if used as a
-			// full-list restore fallback.
-			if (variables.type === "workspace" || result.removedCount !== 1 || !result.undoToken) {
-				return;
-			}
-			showUndoNotification(t("tabClosed"), { undoToken: result.undoToken });
+			// Single-tab (or whole-folder) close via swipe / context menu / middle-click — same
+			// undo affordance as one-click clear. Token-only: a loaded-window snapshot would
+			// wipe unloaded pages if used as a full-list restore fallback.
+			if (!result.removedCount || !result.undoToken) return;
+			showUndoNotification(t(variables.type === "folder" ? "folderClosed" : "tabClosed"), {
+				undoToken: result.undoToken,
+			});
 		},
 	});
 
 	const moveMutation = useMutation({
-		mutationFn: ({ key, target }: { key: string; target: RecentTabApiMoveTarget }) =>
+		mutationFn: ({ key, target }: { key: string; target: RecentTabMoveTarget }) =>
 			api.moveRecentTab(key, target),
 		onMutate: async ({ key, target }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
@@ -1163,16 +1020,9 @@ export function useRecentTabs() {
 		onMutate: async ({ key, pinned }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const snapshots = snapshotSections(qc);
-			updateSectionData(qc, sectionFromKey(key), (current) => {
-				const index = current.findIndex((tab) => tabKey(tab) === key);
-				if (index === -1) return current;
-				const next = [...current];
-				const tab = { ...next[index], pinned: pinned || undefined };
-				next.splice(index, 1);
-				next.splice(getPinnedSectionEndIndex(next), 0, tab);
-				regroupTabs(next);
-				return next;
-			});
+			updateSectionData(qc, sectionFromKey(key), (current) =>
+				applyRecentTabPin(current, key, pinned),
+			);
 			syncCompatibilityCache(qc);
 			return { snapshots };
 		},
@@ -1181,6 +1031,31 @@ export function useRecentTabs() {
 		},
 		onSuccess: applyAuthoritativeResult,
 	});
+
+	/** Optimistic local edit + server call for the folder endpoints. */
+	const runFolderMutation = useCallback(
+		async (
+			request: () => Promise<RecentTabsMutationResponse>,
+			optimistic?: (tabs: RecentTab[]) => RecentTab[],
+		): Promise<RecentTabsMutationResponse> => {
+			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
+			const snapshots = snapshotSections(qc);
+			if (optimistic) {
+				updateSectionData(qc, "work", optimistic);
+				syncCompatibilityCache(qc);
+			}
+			try {
+				const result = await request();
+				applyAuthoritativeResult(result);
+				return result;
+			} catch (error) {
+				restoreSectionSnapshots(qc, snapshots);
+				notifications.show({ color: "red", message: t("folderActionFailed") });
+				throw error;
+			}
+		},
+		[qc, applyAuthoritativeResult, t],
+	);
 
 	const clearMutation = useMutation({
 		mutationFn: ({
@@ -1259,12 +1134,33 @@ export function useRecentTabs() {
 			[removeMutation],
 		),
 		moveTab: useCallback(
-			(key: string, target: RecentTabApiMoveTarget) => moveMutation.mutate({ key, target }),
+			(key: string, target: RecentTabMoveTarget) => moveMutation.mutate({ key, target }),
 			[moveMutation],
 		),
 		pinTab: useCallback(
 			(key: string, pinned: boolean) => pinMutation.mutate({ key, pinned }),
 			[pinMutation],
+		),
+		updateFolder: useCallback(
+			(folderId: string, patch: RecentTabFolderPatch) =>
+				runFolderMutation(
+					() => api.updateRecentTabFolder(folderId, patch),
+					(current) => current.map((tab) => applyFolderPatch(tab, folderId, patch)),
+				).then(() => undefined),
+			[runFolderMutation],
+		),
+		dissolveFolder: useCallback(
+			async (folderId: string) => {
+				const result = await runFolderMutation(
+					() => api.dissolveRecentTabFolder(folderId),
+					(current) => applyRecentTabFolderDissolve(current, folderId),
+				);
+				// The folder layout is hand-built work; dissolving it is undoable like a close.
+				if (result.undoToken) {
+					showUndoNotification(t("folderDissolved"), { undoToken: result.undoToken });
+				}
+			},
+			[runFolderMutation, showUndoNotification, t],
 		),
 		clearTabs: useCallback(
 			(scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>

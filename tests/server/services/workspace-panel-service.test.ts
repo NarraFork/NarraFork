@@ -192,10 +192,11 @@ afterAll(() => {
 	mock.restore();
 });
 
-describe("membership and its sidebar projection commit together", () => {
-	it("adding a narrator panel writes the row and attaches the tab in one revision", async () => {
+// The sidebar no longer mirrors membership (folders replaced the workspace grouping), so
+// membership writes must leave the sidebar rows and their revision alone.
+describe("membership is independent of the sidebar", () => {
+	it("adding a narrator panel writes the row without touching the sidebar", async () => {
 		seedWorkspace("ws");
-		seedWorkspaceTab("ws");
 		seedNarrator("n1");
 		seedNarratorTab("n1", undefined, 1);
 		const before = tabRevision();
@@ -208,23 +209,22 @@ describe("membership and its sidebar projection commit together", () => {
 		expect(created).toBe(true);
 		expect(panel.kind).toBe("narrator");
 		expect(panelRows("ws").map((row) => row.narratorId)).toEqual(["n1"]);
-		expect(tabWorkspaceId("n1")).toBe("ws");
-		// One revision, not two: the row and the projection are the same write.
-		expect(tabRevision()).toBe((before ?? 0) + 1);
+		expect(tabWorkspaceId("n1")).toBe(null);
+		expect(tabRevision()).toBe(before);
 	});
 
-	it("removing a narrator panel releases the tab back to the top level", async () => {
+	it("removing a narrator panel leaves the sidebar tab as it was", async () => {
 		seedWorkspace("ws");
-		seedWorkspaceTab("ws");
 		seedNarrator("n1");
-		seedNarratorTab("n1", "ws", 1);
+		seedNarratorTab("n1", undefined, 1);
 		const { panel } = await addWorkspacePanel(USER, "ws", { kind: "narrator", narratorId: "n1" });
+		const before = tabRevision();
 
 		await removeWorkspacePanel(USER, "ws", panel.id);
 
 		expect(panelRows("ws")).toHaveLength(0);
-		// Released, not deleted: the narrator still exists and stays reachable.
 		expect(tabWorkspaceId("n1")).toBe(null);
+		expect(tabRevision()).toBe(before);
 	});
 
 	// The behaviour that made the reported bug possible was a client-side

@@ -10,6 +10,17 @@ async function mod() {
 	return import("./measure-tool-call");
 }
 
+/**
+ * The xs line box the measure layer reads LIVE (section labels, snippets, placeholder
+ * rows). The exported `XS_LINE_HEIGHT_BASELINE` / `SECTION_LABEL_HEIGHT` are the bare-Mantine 17;
+ * the default setting measures 120% of it (LINE_HEIGHT_BASELINE_PERCENT): 20. Rows the
+ * measure layer takes from the constant (an entry's title) stay at 17.
+ */
+async function liveXs(): Promise<number> {
+	const { typographyMetrics } = await import("../pretext-fonts");
+	return typographyMetrics().line.xs;
+}
+
 type Mod = Awaited<ReturnType<typeof mod>>;
 type MetaRow = import("./measure-tool-call").ToolMetaRow;
 type Entry = import("./measure-tool-call").ToolStructuredEntry;
@@ -68,7 +79,7 @@ describe("canonical body measurement", () => {
 		expect(section.measuredBody.model).toBe(model);
 		expect(section.measuredBody.frame.blocks[0]?.top).toBe(0);
 		expect(section.bodyTop).toBe(
-			m.DETAIL_TOP_MARGIN + m.SECTION_LABEL_HEIGHT + m.SECTION_LABEL_MARGIN_BOTTOM,
+			m.DETAIL_TOP_MARGIN + (await liveXs()) + m.SECTION_LABEL_MARGIN_BOTTOM,
 		);
 		expect(result.height).toBe(section.bodyTop + section.measuredBody.height);
 		expect("blocks" in result).toBe(false);
@@ -153,7 +164,7 @@ describe("measureToolDetail — meta-rows", () => {
 		const m = await mod();
 		const d = await measureMeta([{ text: "/src/app.ts", mono: true }]);
 		expect(d.kind).toBe("meta-rows");
-		expect(d.height).toBe(m.XS_LINE_HEIGHT);
+		expect(d.height).toBe(m.XS_LINE_HEIGHT_BASELINE);
 		expect(d.appliedCap).toBeNull();
 	});
 
@@ -161,7 +172,7 @@ describe("measureToolDetail — meta-rows", () => {
 		const m = await mod();
 		const one = await measureMeta([{ text: "a" }]);
 		const two = await measureMeta([{ text: "a" }, { text: "b" }]);
-		expect(two.height - one.height).toBe(m.META_ROW_GAP + m.XS_LINE_HEIGHT);
+		expect(two.height - one.height).toBe(m.META_ROW_GAP + m.XS_LINE_HEIGHT_BASELINE);
 	});
 
 	it("reserves a fixed badge row and a fixed action row", async () => {
@@ -226,7 +237,8 @@ describe("measureToolDetail — meta-rows", () => {
 	it("an empty row list still yields one placeholder line", async () => {
 		const m = await mod();
 		const d = await measureMeta([]);
-		expect(d.height).toBe(m.XS_LINE_HEIGHT);
+		expect(m.XS_LINE_HEIGHT_BASELINE).toBe(17);
+		expect(d.height).toBe(await liveXs());
 	});
 
 	it("carries href / badges / actions as render-only block data", async () => {
@@ -252,7 +264,7 @@ describe("measureToolDetail — structured entries", () => {
 	it("a title-only entry = top margin + one xs line", async () => {
 		const m = await mod();
 		const d = await measureEntries([{ title: "Entry One" }]);
-		expect(d.height).toBe(m.XS_LINE_HEIGHT);
+		expect(d.height).toBe(m.XS_LINE_HEIGHT_BASELINE);
 	});
 
 	it("meta and badge rows each add their own fixed row", async () => {
@@ -262,7 +274,7 @@ describe("measureToolDetail — structured entries", () => {
 		const withBoth = await measureEntries([
 			{ title: "T", meta: "a.com", badges: [{ label: "user" }] },
 		]);
-		expect(withMeta.height - bare.height).toBe(m.XS_LINE_HEIGHT);
+		expect(withMeta.height - bare.height).toBe(m.XS_LINE_HEIGHT_BASELINE);
 		expect(withBoth.height - withMeta.height).toBe(m.META_BADGE_ROW);
 	});
 
@@ -270,15 +282,16 @@ describe("measureToolDetail — structured entries", () => {
 		const m = await mod();
 		const one = await measureEntries([{ title: "A" }]);
 		const two = await measureEntries([{ title: "A" }, { title: "B" }]);
-		expect(two.height - one.height).toBe(m.SECTION_GAP + m.XS_LINE_HEIGHT);
+		expect(two.height - one.height).toBe(m.SECTION_GAP + m.XS_LINE_HEIGHT_BASELINE);
 	});
 
 	it("clamps a snippet to ENTRY_SNIPPET_MAX_LINES no matter how long it is", async () => {
 		const m = await mod();
 		const short = await measureEntries([{ title: "T", snippet: "tiny" }]);
 		const huge = await measureEntries([{ title: "T", snippet: "y".repeat(50_000) }]);
-		expect(short.height).toBe(m.XS_LINE_HEIGHT + m.XS_LINE_HEIGHT);
-		expect(huge.height).toBe(m.XS_LINE_HEIGHT + m.ENTRY_SNIPPET_MAX_LINES * m.XS_LINE_HEIGHT);
+		const xs = await liveXs();
+		expect(short.height).toBe(m.XS_LINE_HEIGHT_BASELINE + xs);
+		expect(huge.height).toBe(m.XS_LINE_HEIGHT_BASELINE + m.ENTRY_SNIPPET_MAX_LINES * xs);
 	});
 
 	it("bounds the entry count at ENTRY_MAX", async () => {
@@ -307,13 +320,15 @@ describe("measureToolDetail — structured entries", () => {
 			},
 			WIDTH,
 		);
-		expect(d.height).toBe(m.XS_LINE_HEIGHT);
+		expect(d.height).toBe(m.XS_LINE_HEIGHT_BASELINE);
 	});
 
 	it("still supports the legacy bodyLines shape (no entries)", async () => {
 		const m = await mod();
 		const d = m.measureToolBody({ kind: "structured", badgeRows: 0, bodyLines: ["a", "b"] }, WIDTH);
-		expect(d.height).toBe(m.XS_LINE_HEIGHT + m.STRUCT_BADGE_GAP + m.XS_LINE_HEIGHT);
+		expect(d.height).toBe(
+			m.XS_LINE_HEIGHT_BASELINE + m.STRUCT_BADGE_GAP + m.XS_LINE_HEIGHT_BASELINE,
+		);
 	});
 });
 
@@ -327,7 +342,7 @@ describe("measureToolDetail — ask replay", () => {
 		const d = await measureAsk([{ header: "Pick one", options: [] }]);
 		expect(d.kind).toBe("ask");
 		expect(d.appliedCap).toBeNull();
-		expect(d.height).toBe(p.HEADER_LINE_HEIGHT);
+		expect(d.height).toBe(p.HEADER_LINE_HEIGHT_BASELINE);
 	});
 
 	it("omitHeader drops exactly the header row", async () => {
@@ -337,7 +352,9 @@ describe("measureToolDetail — ask replay", () => {
 			{ header: "Pick one", omitHeader: true, options: [{ header: "Alpha" }] },
 		]);
 		// The header row plus the gap that separated it from the first option.
-		expect(withHeader.height - without.height).toBe(p.HEADER_LINE_HEIGHT + p.QUESTION_STACK_GAP);
+		expect(withHeader.height - without.height).toBe(
+			p.HEADER_LINE_HEIGHT_BASELINE + p.QUESTION_STACK_GAP,
+		);
 	});
 
 	it("each option adds a label row, and a description its own smaller row", async () => {
@@ -349,7 +366,7 @@ describe("measureToolDetail — ask replay", () => {
 			{ header: "H", options: [{ header: "Alpha" }, { header: "Beta", description: "second" }] },
 		]);
 		expect(withDesc.height - bare.height).toBe(
-			p.OPTION_DESC_MARGIN_TOP + p.OPTION_DESC_LINE_HEIGHT,
+			p.OPTION_DESC_MARGIN_TOP + p.OPTION_DESC_LINE_HEIGHT_BASELINE,
 		);
 	});
 
@@ -359,7 +376,7 @@ describe("measureToolDetail — ask replay", () => {
 		const two = await measureAsk([
 			{ header: "H", options: [{ header: "Alpha" }, { header: "Beta" }] },
 		]);
-		expect(two.height - one.height).toBe(p.OPTIONS_GAP + p.OPTION_LABEL_LINE_HEIGHT);
+		expect(two.height - one.height).toBe(p.OPTIONS_GAP + p.OPTION_LABEL_LINE_HEIGHT_BASELINE);
 	});
 
 	it("the answer row adds one sm line, the custom answer one xs mono line", async () => {
@@ -371,8 +388,12 @@ describe("measureToolDetail — ask replay", () => {
 		const custom = await measureAsk([
 			{ header: "H", options: [{ header: "Alpha" }], customAnswer: "Custom answer: other" },
 		]);
-		expect(answered.height - base.height).toBe(p.QUESTION_STACK_GAP + p.OPTION_LABEL_LINE_HEIGHT);
-		expect(custom.height - base.height).toBe(p.QUESTION_STACK_GAP + p.CUSTOM_ANSWER_LINE_HEIGHT);
+		expect(answered.height - base.height).toBe(
+			p.QUESTION_STACK_GAP + p.OPTION_LABEL_LINE_HEIGHT_BASELINE,
+		);
+		expect(custom.height - base.height).toBe(
+			p.QUESTION_STACK_GAP + p.CUSTOM_ANSWER_LINE_HEIGHT_BASELINE,
+		);
 	});
 
 	it("questions stack with the banner's outer stack gap", async () => {
@@ -382,7 +403,7 @@ describe("measureToolDetail — ask replay", () => {
 			{ header: "First", options: [] },
 			{ header: "Second", options: [] },
 		]);
-		expect(two.height - one.height).toBe(p.ALERT_STACK_GAP + p.HEADER_LINE_HEIGHT);
+		expect(two.height - one.height).toBe(p.ALERT_STACK_GAP + p.HEADER_LINE_HEIGHT_BASELINE);
 	});
 
 	it("selection is height-neutral (render-only)", async () => {
@@ -419,7 +440,8 @@ describe("measureToolDetail — ask replay", () => {
 	it("an entirely empty question still occupies one placeholder row", async () => {
 		const m = await mod();
 		const d = await measureAsk([{ header: "", omitHeader: true, options: [] }]);
-		expect(d.height).toBe(m.XS_LINE_HEIGHT);
+		expect(m.XS_LINE_HEIGHT_BASELINE).toBe(17);
+		expect(d.height).toBe(await liveXs());
 	});
 
 	it("measures as a SECTION body (the denied-question shape)", async () => {
@@ -455,7 +477,7 @@ describe("measureToolDetail — sections", () => {
 			{ key: "section.output", label: "output", body: codeBody("hi") },
 		]);
 		expect(labelled.height - unlabelled.height).toBe(
-			m.SECTION_LABEL_HEIGHT + m.SECTION_LABEL_MARGIN_BOTTOM,
+			(await liveXs()) + m.SECTION_LABEL_MARGIN_BOTTOM,
 		);
 	});
 

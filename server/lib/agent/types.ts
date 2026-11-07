@@ -16,7 +16,7 @@ import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
-import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
+import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
 
 // === API error and bounded diagnostics ===
 
@@ -710,7 +710,7 @@ export type AgentEvent =
 			/** `channel:bareModel` id used to match this model in `/v1/models`. */
 			nugModelId?: string;
 			/** How recovery is awaited; `credentials` when omitted. */
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted (older events). */
 			quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
 			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
@@ -822,6 +822,8 @@ export type AgentEvent =
 			};
 			ttftMs?: number;
 			durationMs?: number;
+			/** First persistable content → request end; absent when no content arrived. */
+			decodeMs?: number;
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
@@ -929,6 +931,8 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	...OUTLINE_READ_TOOLS,
 	// Planning writes the outline: OutlineEdit then writes only the session's own space.
 	OUTLINE_EDIT_TOOL,
+	// A question for a person is no change to the plan (outline P2 PR 7).
+	OUTLINE_ASK_TOOL,
 ]);
 
 // === Agent config ===

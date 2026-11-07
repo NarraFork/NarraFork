@@ -101,6 +101,29 @@ test("distinct views of one source are zero-IO; appended source only replays new
 	expect(reads).toEqual([]);
 });
 
+test("the model's history carries an update without the row's reader summary", async () => {
+	const db = fixture();
+	add(db, "u1", 1, {
+		...update("one"),
+		display: { "outline.tasks": { doing: [{ address: "K/a", title: "Secret-ish title" }] } },
+	});
+	const { loader, payloads } = harness();
+	payloads.set("one", {
+		changes: [{ key: "outline.tasks", value: "view" }],
+		modelText: "one-text",
+	});
+	const { messages } = await read(db);
+	const [row] = await loader.hydrateContextUpdates(
+		messages.map((message) => ({ ...message })),
+		undefined,
+		messages,
+	);
+	expect(row?.contentText).toBe("one-text");
+	expect(JSON.stringify(row?.contentJson)).not.toContain("Secret-ish title");
+	// The stored row keeps it, for the transcript.
+	expect(JSON.stringify(messages[0]?.contentJson)).toContain("Secret-ish title");
+});
+
 test("real body_revision changes and rollback rebuild the merged state", async () => {
 	const db = fixture();
 	add(db, "u1", 1, update("one"));

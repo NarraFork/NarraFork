@@ -4,14 +4,46 @@ export type HumanAttentionKind =
 	| "blocking_question"
 	| "permission"
 	| "plan_approval"
-	| "reflection";
+	| "reflection"
+	/** Outline (P2 PR 7): questions put to you under one block, or a change for you to confirm. */
+	| "outline_decision"
+	/**
+	 * Outline: what agents confirmed on your behalf, to acknowledge, and your unread reports
+	 * (P2 PR 11): one row.
+	 */
+	| "outline_digest";
+
+/** What an outline item is about; ids only (the client reads the rest from the outline API). */
+export interface HumanAttentionOutlineRef {
+	what: "questions" | "pending" | "digest";
+	spaceId: string | null;
+	pageId: string | null;
+	/** The block the questions are under; a pending change's locked task. */
+	blockId: string | null;
+	/** A pending change's id. */
+	pendingId: string | null;
+	/** Questions in the group, operations of the change, confirmations in the digest. */
+	count: number;
+	/**
+	 * The digest row only (P2 PR 11): unread reports with something in them (at most 8), their
+	 * items in all, and their ids (to open or mark read). Absent on other rows.
+	 */
+	reports?: number;
+	reportItems?: number;
+	reportIds?: string[];
+	/**
+	 * The asking or proposing session is one the person may not read: the row names neither its
+	 * id nor its title, and the client shows a placeholder.
+	 */
+	sessionHidden: boolean;
+}
 
 /** List rows never carry full tool inputs, plans, or question forms. */
 export interface HumanAttentionItem {
 	/** Source-prefixed identity, so a question and a permission cannot collide. */
 	id: string;
 	kind: HumanAttentionKind;
-	source: "question" | "permission";
+	source: "question" | "permission" | "outline";
 	/** Actual answer/decision endpoint identity; reflection IDs can be synthetic. */
 	requestId: string;
 	toolCallId: string;
@@ -27,6 +59,8 @@ export interface HumanAttentionItem {
 	/** Read visibility does not imply permission to answer or approve. */
 	canAct: boolean;
 	summary: string;
+	/** Outline items only. */
+	outline?: HumanAttentionOutlineRef;
 }
 
 /** Counts are derived from loaded pages; nextCursor means the count is a lower bound. */

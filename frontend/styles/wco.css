@@ -15,50 +15,155 @@ html[data-nf-wco] {
 	--nf-wco-inset-left: env(titlebar-area-x, 0px);
 }
 
-/* Buttons on the right: the header's right edge (search box etc.) moves left. */
-html[data-nf-wco="right"] .nf-app-shell .mantine-AppShell-header {
-	padding-right: var(--nf-wco-inset-right);
-}
-
 /*
- * Buttons on the left: the navbar normally absorbs the traffic lights (it is the
- * full-height column), but collapsed to 60px it is narrower than the ~78px light
- * cluster — shift the header past whatever the navbar did not cover.
+ * Desktop has no header row (everything moved into the sidebar), so the title-bar
+ * strip is ours on both sides of the window and needs its own drag surface.
+ *
+ *   - Over the sidebar: the brand row is the drag surface; its buttons opt out.
+ *   - Over the page: Main starts below a strip of the overlay's height, painted by
+ *     `.nf-wco-main-strip`, so the window buttons never cover route content.
+ *
+ * Phones keep the header row and its own drag rules below.
  */
-html[data-nf-wco="left"] .nf-app-shell .mantine-AppShell-header {
-	padding-left: max(0px, env(titlebar-area-x, 0px) - var(--app-shell-navbar-width, 0px));
-}
-
-/*
- * Window dragging. The header row drags, except its two content clusters — the
- * draggable remainder is exactly the empty gap between them. The wizard's
- * full-width return button is a direct header child and stays clickable.
- */
-html[data-nf-wco] .nf-header-row {
+html[data-nf-wco] .nf-nav-brand-row {
 	-webkit-app-region: drag;
+	min-height: var(--nf-wco-strip-height);
 }
 
-html[data-nf-wco] .nf-header-side,
-html[data-nf-wco] .nf-app-shell .mantine-AppShell-header > button {
+html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mantine-Title-root) {
 	-webkit-app-region: no-drag;
 }
 
+.nf-wco-main-strip {
+	display: none;
+}
+
 /*
- * Narrow windows: the gap between the two header clusters all but disappears,
- * so the clusters themselves become drag surface instead and their interactive
- * children opt out individually. Safe because the mobile BrandTitle is
- * deliberately non-interactive (the click-to-collapse one is desktop-only) —
- * everything actually clickable is a button/a/input and stays no-drag.
- * 48em is Mantine's `sm` breakpoint (MOBILE_VIEWPORT_MEDIA_QUERY in
+ * Phones / narrow windows keep the header row. It drags, except its two content
+ * clusters, whose interactive children opt out individually (the mobile BrandTitle is
+ * non-interactive). The wizard's full-width return button is a direct header child and
+ * stays clickable. 48em is Mantine's `sm` breakpoint (MOBILE_VIEWPORT_MEDIA_QUERY in
  * lib/responsive.ts, the same boundary safe-area.css uses).
  */
 @media not all and (min-width: 48em) {
+	html[data-nf-wco="right"] .nf-app-shell .mantine-AppShell-header {
+		padding-right: var(--nf-wco-inset-right);
+	}
+
+	html[data-nf-wco="left"] .nf-app-shell .mantine-AppShell-header {
+		padding-left: var(--nf-wco-inset-left);
+	}
+
+	html[data-nf-wco] .nf-header-row,
 	html[data-nf-wco] .nf-header-side {
 		-webkit-app-region: drag;
 	}
 
-	html[data-nf-wco] .nf-header-side :is(button, a, input, textarea, select, [role="button"]) {
+	html[data-nf-wco] .nf-header-side :is(button, a, input, textarea, select, [role="button"]),
+	html[data-nf-wco] .nf-app-shell .mantine-AppShell-header > button {
 		-webkit-app-region: no-drag;
+	}
+}
+
+@media (min-width: 48em) {
+	/*
+	 * The shell's top spacing belongs to the title bar, not above it. `padding="md"` puts
+	 * 16px of padding on both containers — inline on the navbar — and that band is at y=0,
+	 * the first place a reader grabs, where nothing is a drag surface: the brand row starts
+	 * below it and the strip's negative margin does not pull it up (sticky ignores it).
+	 * Zeroing the padding here makes the brand row and the strip start at the window's top
+	 * edge, and the strip carries the spacing itself so the content below keeps its distance.
+	 */
+	html[data-nf-wco] .nf-app-shell .mantine-AppShell-navbar,
+	html[data-nf-wco] .nf-app-shell .mantine-AppShell-main {
+		/* biome-ignore lint/complexity/noImportantStyles: the padding is Mantine's inline style from AppShell's padding prop */
+		padding-top: 0 !important;
+	}
+
+	/*
+	 * The brand row bleeds into the navbar's inline padding: that padding belongs to the
+	 * navbar (whose own region is none), so the window's left edge — and the matching strip
+	 * on the right — would stay dead exactly where a reader grabs for the title bar. The
+	 * row's padding compensates, so nothing inside it moves.
+	 */
+	html[data-nf-wco] .nf-nav-brand-row {
+		/* biome-ignore lint/complexity/noImportantStyles: beats the row's inline px and the navbar's inline padding */
+		margin-inline: calc(var(--mantine-spacing-md) * -1) !important;
+		/* biome-ignore lint/complexity/noImportantStyles: keeps the controls at the same x while the row widens */
+		padding-inline: calc(var(--mantine-spacing-md) + 4px) !important;
+	}
+
+	html[data-nf-wco] .nf-wco-main-strip {
+		display: block;
+		position: sticky;
+		top: 0;
+		z-index: 100;
+		/*
+		 * The whole blank band above the page, not just the overlay's height: the gap
+		 * below it looks identical, so a press there must move the window too. The band
+		 * carries that spacing because the shell's own top padding is gone (above).
+		 */
+		height: calc(var(--nf-wco-strip-height) + var(--mantine-spacing-md));
+		margin-block: 0;
+		margin-inline: calc(var(--mantine-spacing-md) * -1);
+		background: var(--mantine-color-body);
+		-webkit-app-region: drag;
+	}
+}
+
+/*
+ * Pages whose top edge is already a row of headers (the session page) are the title bar
+ * themselves instead of sitting under the empty strip: `data-nf-wco-titlebar` on the
+ * page root pulls it up over the strip, and `useWcoTitlebarRows` (lib/wco-titlebar.ts)
+ * marks the headers that touch the top edge. Those headers grow to the overlay height,
+ * drag the window from their blank area, and the one at the right edge stays clear of
+ * the window buttons (the left edge too, for buttons on the left over a collapsed rail).
+ */
+@media (min-width: 48em) {
+	html[data-nf-wco] .nf-app-shell-main:has([data-nf-wco-titlebar]) .nf-wco-main-strip {
+		display: none;
+	}
+
+	html[data-nf-wco] [data-nf-titlebar-row] {
+		-webkit-app-region: drag;
+		min-height: var(--nf-wco-strip-height);
+		height: auto;
+	}
+
+	html[data-nf-wco] .dv-tabs-and-actions-container[data-nf-titlebar-row] {
+		height: var(--nf-wco-strip-height);
+	}
+
+	html[data-nf-wco]
+		[data-nf-titlebar-row]
+		:is(button, a, input, select, textarea, [role="button"], [role="tab"], .dv-tab) {
+		-webkit-app-region: no-drag;
+	}
+
+	/*
+	 * A dockview tab strip's blank area (after the tabs) is the title bar's blank area:
+	 * it moves the window. Dockview makes it an HTML5 drag source (`draggable`, to move
+	 * the whole group), and the row's drag region alone did not cover it: a press there
+	 * started the group drag (its "Multiple Panels" ghost) instead of moving the window.
+	 * So it declares its own region and opts out of the HTML5 drag, in title-bar rows
+	 * only. Tabs still move panels.
+	 */
+	html[data-nf-wco] [data-nf-titlebar-row] .dv-void-container {
+		-webkit-app-region: drag;
+		-webkit-user-drag: none;
+	}
+
+	/* The headers set their padding inline (narrator header, panel headers), hence the
+	   overrides; only the edge rows under the window buttons are affected. */
+	html[data-nf-wco="right"] [data-nf-titlebar-end] {
+		/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
+		padding-inline-end: calc(var(--nf-wco-inset-right) + 8px) !important;
+	}
+
+	html[data-nf-wco="left"] [data-nf-titlebar-start] {
+		--nf-titlebar-start-pad: calc(var(--nf-wco-inset-left) - var(--app-shell-navbar-width, 0px));
+		/* biome-ignore lint/complexity/noImportantStyles: beats the headers' inline padding, only under the WCO window buttons */
+		padding-inline-start: max(8px, calc(var(--nf-titlebar-start-pad) + 8px)) !important;
 	}
 }
 

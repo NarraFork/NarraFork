@@ -20,11 +20,26 @@ const RESOLVED = {
 	status: "confirmed" as const,
 };
 
+/**
+ * The constants with the two text line boxes bound to their LIVE values. The exported
+ * `NOTICE_*_LINE_HEIGHT` are the bare-Mantine baseline (16 / 17); the default setting
+ * measures 120% of them (LINE_HEIGHT_BASELINE_PERCENT): 19 / 21. Chrome stays as exported.
+ */
+async function liveReflection() {
+	const m = await import("./measure-reflection-notice");
+	return {
+		...m,
+		MEASURE_REFLECTION_CONSTANTS: {
+			...m.MEASURE_REFLECTION_CONSTANTS,
+			NOTICE_TITLE_LINE_HEIGHT: m.noticeTitleLineHeight(),
+			NOTICE_BODY_LINE_HEIGHT: m.noticeBodyLineHeight(),
+		},
+	};
+}
+
 describe("measureReflectionNotice", () => {
 	it("measures a title-only notice as chrome + the icon column floor", async () => {
-		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await import(
-			"./measure-reflection-notice"
-		);
+		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await liveReflection();
 		const result = measureReflectionNotice(RESOLVED, 800);
 		// A one-line xs title (16px) is shorter than the 22+1 icon column, so the
 		// content box is floored by the icon rather than the text.
@@ -34,9 +49,7 @@ describe("measureReflectionNotice", () => {
 	});
 
 	it("reserves the takeover button row for a running gate", async () => {
-		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await import(
-			"./measure-reflection-notice"
-		);
+		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await liveReflection();
 		const running = measureReflectionNotice(RUNNING, 800);
 		expect(running.hasTakeOver).toBe(true);
 		expect(running.metas.map((m) => m.role)).toEqual(["title", "take-over"]);
@@ -59,9 +72,7 @@ describe("measureReflectionNotice", () => {
 	});
 
 	it("adds the summary and nextSteps rows with their mt=3 margins", async () => {
-		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await import(
-			"./measure-reflection-notice"
-		);
+		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await liveReflection();
 		const bare = measureReflectionNotice(RESOLVED, 800);
 		const withSummary = measureReflectionNotice({ ...RESOLVED, summary: "short reason" }, 800);
 		const withBoth = measureReflectionNotice(
@@ -78,9 +89,7 @@ describe("measureReflectionNotice", () => {
 	});
 
 	it("wraps long text as the width shrinks (pretext arithmetic, zero DOM)", async () => {
-		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await import(
-			"./measure-reflection-notice"
-		);
+		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await liveReflection();
 		const summary =
 			"a considerably longer reason that has to wrap onto several lines when the card is narrow";
 		const wide = measureReflectionNotice({ ...RESOLVED, summary }, 1200);
@@ -99,9 +108,7 @@ describe("measureReflectionNotice", () => {
 	});
 
 	it("wraps the title too when the card is very narrow", async () => {
-		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await import(
-			"./measure-reflection-notice"
-		);
+		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await liveReflection();
 		const wide = measureReflectionNotice(RESOLVED, 1200);
 		const narrow = measureReflectionNotice(RESOLVED, 260);
 		expect(wide.frame.blocks[0]!.height).toBe(C.NOTICE_TITLE_LINE_HEIGHT);
@@ -109,9 +116,7 @@ describe("measureReflectionNotice", () => {
 	});
 
 	it("reserves the icon column so text never wraps under the icon", async () => {
-		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await import(
-			"./measure-reflection-notice"
-		);
+		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await liveReflection();
 		const result = measureReflectionNotice(RESOLVED, 800);
 		// Wrap width excludes the padding/border AND the icon lane.
 		expect(result.contentWidth).toBe(800 - C.NOTICE_HORIZONTAL_CHROME - C.NOTICE_TEXT_INDENT);
@@ -121,9 +126,7 @@ describe("measureReflectionNotice", () => {
 	});
 
 	it("keeps the external top margin out of the element height", async () => {
-		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await import(
-			"./measure-reflection-notice"
-		);
+		const { measureReflectionNotice, MEASURE_REFLECTION_CONSTANTS: C } = await liveReflection();
 		const result = measureReflectionNotice(RESOLVED, 800);
 		// The owner (tool card) adds this above the region; it is not baked in.
 		expect(result.topMargin).toBe(C.NOTICE_TOP_MARGIN);

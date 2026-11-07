@@ -53,6 +53,7 @@
  */
 import { createHash } from "node:crypto";
 import { blockTitle } from "@shared/outline";
+import { boundOutlineTaskNoticeItem } from "@shared/outline-task-notice";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { logger } from "../../lib/logger";
 import {
@@ -84,6 +85,7 @@ import { writeOutline } from "../outline/write";
 import { readTaskSession } from "./backend";
 import {
 	firstOf,
+	firstUnder,
 	isProtected,
 	type OpenEntry,
 	type OpenRead,
@@ -202,7 +204,8 @@ async function completionsAwaited(entries: readonly OpenEntry[]): Promise<Set<st
  * part there, so continuing would only run a pass saying everything waits.
  */
 async function protectedOpen(read: OpenRead): Promise<OpenEntry[]> {
-	const entries = read.entries.filter(isProtected);
+	// Every person's work read, not only the first entries (review round 1 S3).
+	const entries = read.personWork;
 	const awaited = await completionsAwaited(entries);
 	return awaited.size === 0 ? entries : entries.filter((e) => !awaited.has(e.ref.blockId));
 }
@@ -217,7 +220,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		known.set(view, {
 			text: view.text,
 			address: entry.ref.address,
-			humanCreated: isProtected(entry),
+			humanCreated: entry.ref.taskJson.humanCreated === true,
 		});
 		return view;
 	};
@@ -292,30 +295,56 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 	): Promise<ContinuationTarget> {
 		const current = await session();
 		if (current.subagent) return { openTask: null, protectedOpenCount: 0, turnBudgetOnly: true };
-		let read = await readOpen(current);
+		// A task a person asked the session to start ("Add and start", "Reopen and start"; review
+		// round 1 S4), or the root of a plan they approved (outline P2 PR 8): read as its own
+		// subtree, so the tasks before it in the session cannot crowd it out (P2 PR 8 review S3).
+		let tree: OpenRead | null = null;
 		if (preferTaskId) {
-			// A task a person asked the session to start ("Add and start", "Reopen and start"; review
-			// round 1 S4): started for the session through the same system start as a promotion,
-			// whatever else is in progress, and named by the continuation. Nothing else is started
-			// or named instead: when it cannot be started, nothing continues.
-			const wanted = read.entries.find((entry) => entry.ref.blockId === preferTaskId);
+			// Started for the session through the same system start as a promotion, whatever else
+			// is in progress, and named by the continuation. Nothing else is started or named
+			// instead: when it cannot be started, nothing continues. The subtree is read once
+			// (P2 PR 8 review round 2 N5): a start only changes the started task's checkbox, kept
+			// in the read as it is; a refused start moves on to the next step.
+			tree = await readOpen(current, { within: preferTaskId });
+			const wanted = tree.entries.find((entry) => entry.ref.blockId === preferTaskId);
 			if (wanted?.status === "todo" && wanted.ref.spaceId === current.spaceId) {
 				if (await claim(current, wanted)) wanted.status = "doing";
-				else read = await readOpen(current);
 			}
-		} else if (promoteTodo) {
+			// A tree (a goal with steps, a plan): its first step that can start is started too, and
+			// named (D48 Q2: continue from the first startable task of the tree being worked).
+			if (wanted?.ref.container && !firstUnder(tree, preferTaskId, "doing")) {
+				const steps = tree.entries.filter(
+					(entry) =>
+						entry.status === "todo" &&
+						!entry.ref.container &&
+						entry.ref.spaceId === current.spaceId &&
+						entry.ref.taskAncestorIds.includes(preferTaskId),
+				);
+				for (const next of steps.slice(0, OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts)) {
+					if (await claim(current, next)) {
+						next.status = "doing";
+						break;
+					}
+				}
+			}
+		}
+		let read = await readOpen(current);
+		if (!preferTaskId && promoteTodo) {
 			// Only a task of the session's own space is started on its behalf: anything else it
 			// may continue it holds already. A refused start moves on to the next to-do (a task
 			// changed meanwhile may be tried again at its new version), a few times at most.
 			const tried = new Set<string>();
 			for (let attempt = 0; attempt < OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts; attempt++) {
 				if (firstOf(read, "doing")) break;
-				const next = read.entries.find(
+				// The tree being worked first (D48 Q2), then document order.
+				const startable = read.entries.filter(
 					(entry) =>
 						entry.status === "todo" &&
+						!entry.ref.container &&
 						entry.ref.spaceId === current.spaceId &&
 						!tried.has(`${entry.ref.blockId}@${entry.ref.versionSeq}`),
 				);
+				const next = startable.find((entry) => entry.ref.inWorkedTree) ?? startable[0];
 				if (!next) break;
 				tried.add(`${next.ref.blockId}@${next.ref.versionSeq}`);
 				if (await claim(current, next)) {
@@ -325,13 +354,10 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 				read = await readOpen(current);
 			}
 		}
-		const chosen = preferTaskId
-			? (read.entries.find(
-					(entry) =>
-						entry.ref.blockId === preferTaskId &&
-						(entry.status === "doing" || entry.status === "blocked"),
-				) ?? null)
-			: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
+		const chosen =
+			preferTaskId && tree
+				? (firstUnder(tree, preferTaskId, "doing") ?? firstUnder(tree, preferTaskId, "blocked"))
+				: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
 		const protectedOpenCount = (await protectedOpen(read)).length;
 		if (!chosen) return { openTask: null, protectedOpenCount };
 		const text = (await titlesOf([chosen])).get(chosen.ref.blockId) ?? chosen.ref.sid;
@@ -519,6 +545,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			const from = named.map((id) => names?.users.get(id) ?? id);
 			return { current, awaitingConfirmation: { total: found.size, mine, from } };
 		},
+		taskAddress: (task) => known.get(task)?.address ?? null,
 		prepareContinuation: ({ promoteTodo, preferTaskId }) =>
 			prepareContinuation(promoteTodo, preferTaskId),
 		continuationPrompt,
@@ -553,8 +580,22 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			}
 		},
 		turnEndNote(task: OpenTaskView, locale: Locale): InterruptGuardNote {
-			const content = getOutlineTurnEndNote(promptTask(task), locale);
-			return { content, body: { kind: "prose", text: content } };
+			const named = promptTask(task);
+			const content = getOutlineTurnEndNote(named, locale);
+			// The reader's copy: the task as a titled outline link with its status (the model's
+			// text above is unchanged; the transcript used to show it with its markdown).
+			const item = boundOutlineTaskNoticeItem({
+				address: named.address ?? "",
+				title: task.text,
+				status: "doing",
+				...(named.humanCreated ? { humanCreated: true } : {}),
+			});
+			return {
+				content,
+				body: item
+					? { kind: "outlineTasks", variant: "turnEnd", items: [item] }
+					: { kind: "prose", text: content },
+			};
 		},
 		interruptGuardNote(tasks: readonly OpenTaskView[], locale: Locale): InterruptGuardNote {
 			const content = getOutlineInterruptNote(

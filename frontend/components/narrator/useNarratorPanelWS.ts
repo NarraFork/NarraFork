@@ -1,5 +1,5 @@
 import { notifications } from "@mantine/notifications";
-import { quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
+import { providerWaitKind, quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
@@ -96,16 +96,15 @@ export interface RetryInfo {
 }
 
 /**
- * A narrator parked on an exhausted Kimi quota window.
- *
- * Only the reset instant is needed: the label is `status_quota_exhausted` and the
- * reset time is appended to it. Null when the server knew the wall but not the
- * clock, so the label stays generic rather than inventing a time.
+ * Live details for a timed provider wait: allowance reset, capacity or rate limit.
+ * The persisted waiting payload supplies the same details after a page reload.
+ * Older quota events omit waitKind and retain their original quota semantics.
  */
 export interface QuotaWaitInfo {
 	resumeAt: number | null;
 	/** Which plan the wait belongs to; absent from older servers (always Kimi). */
 	quotaProvider?: "kimi" | "opencode";
+	waitKind?: "quota" | "capacity" | "rate_limit";
 }
 
 export interface PaymentRequiredInfo {
@@ -1343,33 +1342,59 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// pool coming back, or a Kimi / OpenCode Go quota window resetting. Reflect the
 				// waiting status locally and surface a dismissible notice that says
 				// which of the two it is.
-				const isQuota = info.waitKind === "quota";
+				const waitKind = providerWaitKind(info);
+				const isQuota = waitKind === "quota";
+				const transientPrefix =
+					waitKind === "capacity" ? "capacity" : waitKind === "rate_limit" ? "rateLimit" : null;
 				const substatus = isQuota ? "quota_exhausted" : "model_unavailable";
 				applyQuotaWaitInfo(
-					isQuota ? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider } : null,
+					waitKind !== "credentials"
+						? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider, waitKind }
+						: null,
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
 					id: `model-unavailable-${narratorId}`,
-					title: t(isQuota ? "quotaExhaustedWaitingTitle" : "modelUnavailableWaitingTitle", {
-						provider: quotaProviderLabel(info.quotaProvider),
-					}),
-					message: isQuota
-						? t("quotaExhaustedWaitingDesc", {
+					title: t(
+						transientPrefix
+							? `${transientPrefix}WaitingTitle`
+							: isQuota
+								? "quotaExhaustedWaitingTitle"
+								: "modelUnavailableWaitingTitle",
+						{
+							provider: quotaProviderLabel(info.quotaProvider),
+						},
+					),
+					message: transientPrefix
+						? t(`${transientPrefix}WaitingDesc`, {
 								model: info.model,
-								provider: quotaProviderLabel(info.quotaProvider),
 								resetAt: info.resumeAt
 									? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
-									: t("quotaExhaustedResetUnknown"),
+									: t("providerRetryTimeUnknown"),
 							})
-						: t("modelUnavailableWaitingDesc", { model: info.model }),
+						: isQuota
+							? t("quotaExhaustedWaitingDesc", {
+									model: info.model,
+									provider: quotaProviderLabel(info.quotaProvider),
+									resetAt: info.resumeAt
+										? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
+										: t("quotaExhaustedResetUnknown"),
+								})
+							: t("modelUnavailableWaitingDesc", { model: info.model }),
 					// Blue-toned neutral, not yellow: nothing here is actionable.
 					color: statusRegistry.accentColor(statusRegistry.narratorSubstatus(substatus)),
 					autoClose: false,
 				});
 			},
 			onModelUnavailableRecovered: (info) => {
-				const isQuota = info.waitKind === "quota";
+				// Older recovery events omit the bucket; retain the reason from their waiting event.
+				const waitKind =
+					info.waitKind === "quota" && quotaWaitInfoRef.current?.waitKind
+						? quotaWaitInfoRef.current.waitKind
+						: providerWaitKind(info);
+				const isQuota = waitKind === "quota";
+				const transientPrefix =
+					waitKind === "capacity" ? "capacity" : waitKind === "rate_limit" ? "rateLimit" : null;
 				notifications.hide(`model-unavailable-${narratorId}`);
 				clearQuotaWaitIfActive();
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -1377,10 +1402,23 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
-					title: t(isQuota ? "quotaExhaustedRecoveredTitle" : "modelUnavailableRecoveredTitle"),
-					message: t(isQuota ? "quotaExhaustedRecoveredDesc" : "modelUnavailableRecoveredDesc", {
-						model: info.model,
-					}),
+					title: t(
+						transientPrefix
+							? `${transientPrefix}RecoveredTitle`
+							: isQuota
+								? "quotaExhaustedRecoveredTitle"
+								: "modelUnavailableRecoveredTitle",
+					),
+					message: t(
+						transientPrefix
+							? `${transientPrefix}RecoveredDesc`
+							: isQuota
+								? "quotaExhaustedRecoveredDesc"
+								: "modelUnavailableRecoveredDesc",
+						{
+							model: info.model,
+						},
+					),
 					color: "green",
 					autoClose: 4000,
 				});

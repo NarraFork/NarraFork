@@ -16,6 +16,20 @@ afterEach(() => {
 
 // ── Shared builders ──────────────────────────────────────────────────────────
 async function mod() {
+	const m = await import("./measure-tool-call");
+	const { typographyMetrics } = await import("../pretext-fonts");
+	// Line boxes the measure layer reads LIVE, bound to their live values: the exported
+	// constants are the bare-Mantine baseline, and the default setting measures text
+	// lines at 120% of it (`LINE_HEIGHT_BASELINE_PERCENT`). Chrome stays as exported.
+	return {
+		...m,
+		DETAIL_CONTENT_LINE_HEIGHT: m.detailContentLineHeight(),
+		DETAIL_LABEL_LINE_HEIGHT: typographyMetrics().line.xs,
+	};
+}
+
+/** The module as exported (the bare-Mantine baseline constants). */
+async function baselineMod() {
 	return import("./measure-tool-call");
 }
 
@@ -37,8 +51,8 @@ function specTasks(...texts: string[]): import("./measure-tool-call").SpecTaskLi
 // ── Fixed chrome constants ────────────────────────────────────────────────────
 describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () => {
 	it("header text line uses base line-height 1.55 → 19px; header row = 19", async () => {
-		const m = await mod();
-		expect(m.HEADER_TEXT_LINE_HEIGHT).toBe(19);
+		const m = await baselineMod();
+		expect(m.HEADER_TEXT_LINE_HEIGHT_BASELINE).toBe(19);
 		// The SAME tile a folded trace row uses (was 16, which resized the chip mid-morph).
 		expect(m.HEADER_CATEGORY_ICON).toBe(BARE_ROW_ICON);
 		expect(m.HEADER_CATEGORY_ICON).toBe(14);
@@ -46,9 +60,10 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 		// at both sizes. This is what let the icon be unified without touching any
 		// measured height.
 		expect(m.HEADER_ROW_HEIGHT).toBe(19);
-		// The LIVE accessor must agree at neutral typography, and must be what
-		// `measureToolCall` actually reserves (frozen constants are documentation).
-		expect(m.headerRowHeight()).toBe(m.HEADER_ROW_HEIGHT);
+		// The LIVE accessor is what `measureToolCall` actually reserves (frozen constants
+		// are documentation): at the default setting the line-height slider's 100% is
+		// 120% of the Mantine ratio, so round(12 × 1.55 × 1.2) = 22.
+		expect(m.headerRowHeight()).toBe(22);
 	});
 
 	/**
@@ -74,17 +89,21 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 			m.CARD_BORDER + m.CARD_PADDING + m.HEADER_CATEGORY_ICON + m.HEADER_CELL_GAP;
 		const iconShift = BARE_ROW_CHEVRON + BARE_ROW_GAP - (m.CARD_BORDER + m.CARD_PADDING);
 		expect(rowTextLeft - cardTextLeft).toBe(iconShift);
-		// The 19px text line is taller than the 14px icon lane at neutral typography.
-		expect(m.headerRowHeight()).toBe(19);
+		// The 22px text line is taller than the 14px icon lane at the default setting.
+		expect(m.headerRowHeight()).toBe(22);
 	});
 
-	it("standalone collapsed card ≈ 41px (10*2 padding + 1*2 border + 19 header)", async () => {
+	it("standalone collapsed card = 44px (10*2 padding + 1*2 border + 22 header)", async () => {
 		const m = await mod();
 		const expected = m.CARD_PADDING * 2 + m.CARD_BORDER * 2 + m.headerRowHeight();
-		expect(expected).toBe(41);
-		// Within the 40-42px target from CONTRACT §4.
-		expect(expected).toBeGreaterThanOrEqual(40);
-		expect(expected).toBeLessThanOrEqual(42);
+		// CONTRACT §4 targeted 40-42px at the bare Mantine line (19px header). The default
+		// line is now 120% of that, which is what the old 120% setting measured: 44px.
+		expect(expected).toBe(44);
+		setTypography({ lineHeightScalePercent: 83 });
+		// ≈ the old 100% (83 × 1.2 = 99.6%): back inside the original target.
+		const bare = m.CARD_PADDING * 2 + m.CARD_BORDER * 2 + m.headerRowHeight();
+		expect(bare).toBeGreaterThanOrEqual(40);
+		expect(bare).toBeLessThanOrEqual(42);
 	});
 
 	it("header / group-header geometry scales with the reader's typography", async () => {
@@ -93,11 +112,11 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 		const neutralCard = m.measureToolCall(baseCard(), 600, 4, { opened: false });
 		const neutralGroup = m.measureToolCallGroup([baseCard()], 600, 4, { expanded: false });
 		expect(neutralCard.headerHeight).toBeCloseTo(m.headerRowHeight(), 5);
-		expect(m.headerRowHeight()).toBe(19);
+		expect(m.headerRowHeight()).toBe(22);
 		expect(neutralGroup.headerHeight).toBeCloseTo(m.groupHeaderRowHeight(), 5);
 
 		setTypography({ fontScalePercent: 150, lineHeightScalePercent: 150 });
-		// xs × base line-height at 150% font and 150% leading: clearly above the frozen 19.
+		// xs × base line-height at 150% font and 150% leading: clearly above the default 22.
 		expect(m.headerRowHeight()).toBeGreaterThan(m.HEADER_ROW_HEIGHT);
 		expect(m.groupHeaderRowHeight()).toBeGreaterThan(m.GROUP_HEADER_ROW);
 		const scaledCard = m.measureToolCall(baseCard(), 600, 4, { opened: false });
@@ -113,9 +132,9 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 	// browser 15.4px per line: every wrapped line drifts 0.4px and a 15-line body
 	// overflows its height-fixed box by 6px, clipped without a scrollbar.
 	it("pins the capped-body line box so render cannot drift from measure", async () => {
-		const m = await mod();
+		const m = await baselineMod();
 		expect(m.DETAIL_BODY_FONT_SIZE).toBe(11);
-		expect(m.DETAIL_CONTENT_LINE_HEIGHT).toBe(15);
+		expect(m.DETAIL_CONTENT_LINE_HEIGHT_BASELINE).toBe(15);
 		// The measured font string must use the same size the render box declares.
 		expect(m.DETAIL_BODY_FONT).toContain(`${m.DETAIL_BODY_FONT_SIZE}px`);
 
@@ -131,8 +150,9 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 		).text();
 		expect(source).not.toMatch(/lineHeight:\s*1\.4\b/);
 		expect(source).toContain("lineHeight: `${detailContentLineHeight()}px`");
-		// And the accessor must agree with the pinned baseline at neutral typography.
-		expect(m.detailContentLineHeight()).toBe(m.DETAIL_CONTENT_LINE_HEIGHT);
+		// And the accessor is the pinned baseline's line box at 120% at the default
+		// setting (LINE_HEIGHT_BASELINE_PERCENT): round(11 × 1.4 × 1.2) = 18.
+		expect(m.detailContentLineHeight()).toBe(18);
 	});
 
 	it("exposes the maxHeight cap table (code/term/diff=200, bash=60, media=400, streaming-bash=120)", async () => {
@@ -973,7 +993,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 	});
 
 	it("a source path adds exactly one leading provenance row", async () => {
-		const { measureToolCall, XS_LINE_HEIGHT } = await mod();
+		const { measureToolCall, XS_LINE_HEIGHT_BASELINE: XS_LINE_HEIGHT } = await mod();
 		const without = measureToolCall(planCard(), 600, 5, { viewportHeight: 1000 });
 		const withSource = measureToolCall(planCard({ sourcePath: ".narrafork/plan-abc.md" }), 600, 5, {
 			viewportHeight: 1000,

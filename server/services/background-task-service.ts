@@ -59,6 +59,10 @@ import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
+import { TERMINAL_WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
+
+const TERMINAL_WATCH_RESTART_NOTICE =
+	"Terminal watch ended because the server restarted; it is not resumed. Check the terminal before continuing.";
 
 // === Types ===
 
@@ -860,10 +864,18 @@ class BackgroundTaskService {
 			this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 			if (existing.status === "running") return existing;
 
-			// Restart: get the EXISTING run (getAgentRun reads narrators through
-			// the queue adapter on PG; on SQLite it's a sync read), then CAS the
-			// task row back to "running" via the named restartAgentTask composite.
-			const publicationRun = await pub.getAgentRun(opts.subagentNarratorId, opts.parentNarratorId);
+			// Restart: register the run this task now projects, then CAS the task row
+			// back to "running" for it. A run that still holds its unconsumed terminal
+			// reservation (a run being detached or projected right now) is adopted; an
+			// ended run already spent its terminal slot on its own result, so the task
+			// gets a new run with fresh slots. Reusing the ended run would leave its next
+			// terminal with no reservation to commit into.
+			const { binding: registered } = await pub.startRun({
+				narratorId: opts.subagentNarratorId,
+				binding: opts.binding,
+				adoptRegisteredRun: true,
+			});
+			const publicationRun = { logicalRunId: registered.logicalRunId };
 			const restarted = await pub.restartAgentTask({
 				taskId: opts.id,
 				logicalRunId: publicationRun.logicalRunId,
@@ -3425,6 +3437,7 @@ class BackgroundTaskService {
 							logicalRunId: backgroundTasks.logicalRunId,
 							toolCallId: backgroundTasks.toolCallId,
 							executionAttempt: backgroundTasks.executionAttempt,
+							command: backgroundTasks.command,
 						})
 						.from(backgroundTasks)
 						.where(
@@ -3517,7 +3530,11 @@ class BackgroundTaskService {
 				if (task.type === "transfer") continue;
 				const text =
 					task.type === "bash"
-						? "Execution outcome unknown after restart; the command was not rerun."
+						? "command" in task &&
+							typeof task.command === "string" &&
+							task.command.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)
+							? TERMINAL_WATCH_RESTART_NOTICE
+							: "Execution outcome unknown after restart; the command was not rerun."
 						: "Background task was interrupted by a server restart.";
 				const eventKind = (task.type === "bash" ? "failed" : "cancelled") as "failed" | "cancelled";
 
@@ -3885,6 +3902,12 @@ class BackgroundTaskService {
 			.all();
 
 		for (const task of running) {
+			// A terminal watch has no process to kill. Leave its row running so restart
+			// recovery tells the session the watch ended, instead of cancelling it silently.
+			if (task.type === "bash" && task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)) {
+				this.cleanupRuntime(task.id);
+				continue;
+			}
 			const ctrl = this.abortControllers.get(task.id);
 			if (ctrl) {
 				try {

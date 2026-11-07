@@ -1,5 +1,6 @@
 /**
- * AppearancePanel — live typography controls for the narrator transcript.
+ * AppearancePanel — live typography controls for the narrator transcript and the outline
+ * (editor, history tree, mind map, task board), which use the same values.
  *
  * ## Why this lives beside the transcript
  *
@@ -34,6 +35,10 @@ import {
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	typographyFromPreferences,
+	typographyPreferencePatch,
+} from "../../lib/typography-preferences";
 
 /**
  * The live typography, as React state.
@@ -126,12 +131,7 @@ export function AppearancePanel() {
 	useEffect(() => {
 		if (!prefs) return;
 		return () => {
-			setTypography({
-				fontScalePercent: prefs.narratorFontScalePercent,
-				letterSpacingPercent: prefs.narratorLetterSpacingPercent,
-				lineHeightScalePercent: prefs.narratorLineHeightScalePercent,
-				paragraphScalePercent: prefs.narratorParagraphScalePercent,
-			});
+			setTypography(typographyFromPreferences(prefs));
 		};
 	}, [prefs]);
 
@@ -140,20 +140,7 @@ export function AppearancePanel() {
 			setTypography(patch);
 			// Persist under the server's field names. Only the changed knob is sent, so
 			// two panels adjusting different knobs cannot overwrite each other.
-			const body: Record<string, number> = {};
-			if (patch.fontScalePercent !== undefined) {
-				body.narratorFontScalePercent = patch.fontScalePercent;
-			}
-			if (patch.letterSpacingPercent !== undefined) {
-				body.narratorLetterSpacingPercent = patch.letterSpacingPercent;
-			}
-			if (patch.lineHeightScalePercent !== undefined) {
-				body.narratorLineHeightScalePercent = patch.lineHeightScalePercent;
-			}
-			if (patch.paragraphScalePercent !== undefined) {
-				body.narratorParagraphScalePercent = patch.paragraphScalePercent;
-			}
-			updatePrefs.mutate(body);
+			updatePrefs.mutate(typographyPreferencePatch(patch));
 		},
 		[updatePrefs],
 	);
@@ -211,9 +198,15 @@ export function AppearancePanel() {
 					max={TYPOGRAPHY_RANGE.lineHeightScalePercent.max}
 					step={5}
 					marks={[
-						{ value: 75, label: "75%" },
+						{
+							value: TYPOGRAPHY_RANGE.lineHeightScalePercent.min,
+							label: `${TYPOGRAPHY_RANGE.lineHeightScalePercent.min}%`,
+						},
 						{ value: 100, label: "100%" },
-						{ value: 220, label: "220%" },
+						{
+							value: TYPOGRAPHY_RANGE.lineHeightScalePercent.max,
+							label: `${TYPOGRAPHY_RANGE.lineHeightScalePercent.max}%`,
+						},
 					]}
 					onPreview={(v) => setTypography({ lineHeightScalePercent: v })}
 					onCommit={(v) => commit({ lineHeightScalePercent: v })}

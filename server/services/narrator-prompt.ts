@@ -10,6 +10,7 @@ import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-
 import { IS_WINDOWS } from "../lib/platform";
 import {
 	getDynamicSpecSystemReminder,
+	getOutlinePlanModeSystemReminder,
 	getOutlineTaskSystemReminder,
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
@@ -55,6 +56,14 @@ export interface BuildPromptOptions {
 	planFilePath?: string;
 	/** Whether plan mode accepts inline plans. When false, only the file-based flow is shown. */
 	planAllowInlinePlan?: boolean;
+	/**
+	 * The session plans in the outline (outline P2 PR 8): plan mode's section names its plan root
+	 * (`root`, null when there is none yet) instead of a plan file.
+	 */
+	outlinePlan?: {
+		root: { address: string } | null;
+		relaxed: boolean;
+	};
 	/** Whether to force language instruction even for English locale */
 	replyInUserLanguage?: boolean;
 	/** Global default system prompt (used when basePrompt is null) */
@@ -111,6 +120,11 @@ export interface BuildPromptResult {
 	 * their previous values instead of removing them. Present only when there are some.
 	 */
 	keepParts?: string[];
+	/**
+	 * Reader summaries of the context parts that have one (`ContextPart.display`), by key. The
+	 * prefix never reads them; a `context_update` that changes such a part stores its summary.
+	 */
+	displays?: Record<string, unknown>;
 }
 
 /**
@@ -356,7 +370,15 @@ export async function buildEffectiveSystemPrompt(
 
 	// 5. Inject plan mode system reminder and any other active mode constraints.
 	const modeSections: string[] = [];
-	if (planMode) {
+	if (planMode && options.outlinePlan) {
+		modeSections.push(
+			getOutlinePlanModeSystemReminder(
+				locale,
+				options.outlinePlan.root,
+				options.outlinePlan.relaxed,
+			),
+		);
+	} else if (planMode) {
 		// The plan file's path always survives a compact (it is rebuilt from
 		// planFileId every turn), but the record of having written to it does not.
 		// Stat the file so the reminder can tell the model to Read + Edit instead
@@ -380,9 +402,13 @@ export async function buildEffectiveSystemPrompt(
 	if (options.modelsContext !== undefined) appendPart("models", options.modelsContext);
 	if (options.runtimeHints !== undefined) appendPart("runtime", options.runtimeHints);
 	const keepParts: string[] = [];
+	const displays: Record<string, unknown> = {};
 	for (const part of options.contextParts ?? []) {
 		if (part.unreadable) keepParts.push(part.key);
-		else appendPart(part.key, part.text);
+		else {
+			appendPart(part.key, part.text);
+			if (part.display !== undefined) displays[part.key] = part.display;
+		}
 	}
 
 	return {
@@ -392,5 +418,6 @@ export async function buildEffectiveSystemPrompt(
 		usedCompactSummary,
 		...(summaryRange ? { summaryRange } : {}),
 		...(keepParts.length > 0 ? { keepParts } : {}),
+		...(Object.keys(displays).length > 0 ? { displays } : {}),
 	};
 }

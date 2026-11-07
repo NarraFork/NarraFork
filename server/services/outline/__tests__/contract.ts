@@ -188,6 +188,7 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 			parentId: open.parentId,
 			orderKey: open.orderKey,
 			taskJson: open.taskJson,
+			askJson: open.askJson ?? null,
 			alias: open.alias,
 			contentHash: open.contentHash,
 			deleted: open.deleted,
@@ -198,6 +199,7 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 			parentId: block.parentId,
 			orderKey: block.orderKey,
 			taskJson: block.taskJson,
+			askJson: block.askJson ?? null,
 			alias: block.alias,
 			contentHash: block.contentHash,
 			deleted: block.deleted,
@@ -290,7 +292,11 @@ export function checkInProcess(dump: SpaceDump): void {
 		if (block.deleted) continue;
 		const parent = block.parentId === null ? null : byId.get(block.parentId);
 		const want =
-			dump.space.kind === "session" || block.taskJson !== null || (parent?.inProcess ?? false);
+			dump.space.kind === "session" ||
+			block.taskJson !== null ||
+			// A question put to a person is process like a task.
+			(block.askJson ?? null) !== null ||
+			(parent?.inProcess ?? false);
 		expect({ block: block.id, inProcess: block.inProcess }).toEqual({
 			block: block.id,
 			inProcess: want,
@@ -1925,6 +1931,86 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 			expect(await ctx.store.getViewState(me, one)).not.toBeNull();
 			expect(await ctx.store.getViewState(me, two)).not.toBeNull();
 			expect(await ctx.store.getViewState(me, four)).not.toBeNull();
+		},
+	},
+	{
+		name: "tasks seen finished: per person and task, the higher version kept, old rows pruned",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "seen one", task: { status: "done" } },
+				{ op: "insert", parent: null, content: "seen two", task: { status: "done" } },
+				{ op: "insert", parent: null, content: "seen three", task: { status: "done" } },
+			]);
+			const [one, two, three] = r.results.map((x) => x.blockId) as [string, string, string];
+			const me = await ctx.seedUser();
+			const other = await ctx.seedUser();
+			const sorted = (rows: Array<{ taskBlockId: string; seenSeq: number }>) =>
+				[...rows].sort((a, b) => (a.taskBlockId < b.taskBlockId ? -1 : 1));
+			expect(await ctx.store.getTaskSeen(me, [one, two])).toEqual([]);
+			await ctx.store.putTaskSeen(
+				me,
+				[
+					{ taskBlockId: one, seenSeq: 4 },
+					{ taskBlockId: two, seenSeq: 5 },
+				],
+				"2026-10-20T00:00:00.000Z",
+				"2026-10-01T00:00:00.000Z",
+			);
+			expect(sorted(await ctx.store.getTaskSeen(me, [one, two, three]))).toEqual(
+				sorted([
+					{ taskBlockId: one, seenSeq: 4 },
+					{ taskBlockId: two, seenSeq: 5 },
+				]),
+			);
+			// Per person.
+			expect(await ctx.store.getTaskSeen(other, [one, two])).toEqual([]);
+			// A later version raises the row; an older one (a board read before) never lowers it.
+			await ctx.store.putTaskSeen(
+				me,
+				[
+					{ taskBlockId: one, seenSeq: 9 },
+					{ taskBlockId: two, seenSeq: 3 },
+				],
+				"2026-10-21T00:00:00.000Z",
+				"2026-10-01T00:00:00.000Z",
+			);
+			expect(sorted(await ctx.store.getTaskSeen(me, [one, two]))).toEqual(
+				sorted([
+					{ taskBlockId: one, seenSeq: 9 },
+					{ taskBlockId: two, seenSeq: 5 },
+				]),
+			);
+			// Rows seen before the prune time go with the next write (both rows were seen again at
+			// the 21st: kept); another person's stay.
+			await ctx.store.putTaskSeen(
+				other,
+				[{ taskBlockId: one, seenSeq: 1 }],
+				"2026-10-02T00:00:00.000Z",
+				"2026-10-01T00:00:00.000Z",
+			);
+			await ctx.store.putTaskSeen(
+				me,
+				[{ taskBlockId: three, seenSeq: 7 }],
+				"2026-11-30T00:00:00.000Z",
+				"2026-10-21T00:00:00.000Z",
+			);
+			expect(sorted(await ctx.store.getTaskSeen(me, [one, two, three]))).toEqual(
+				sorted([
+					{ taskBlockId: one, seenSeq: 9 },
+					{ taskBlockId: two, seenSeq: 5 },
+					{ taskBlockId: three, seenSeq: 7 },
+				]),
+			);
+			expect(await ctx.store.getTaskSeen(other, [one])).toEqual([{ taskBlockId: one, seenSeq: 1 }]);
+			// Nothing to write still prunes; an empty read reads nothing.
+			await ctx.store.putTaskSeen(me, [], "2026-12-01T00:00:00.000Z", "2026-11-01T00:00:00.000Z");
+			expect(await ctx.store.getTaskSeen(me, [one, two, three])).toEqual([
+				{ taskBlockId: three, seenSeq: 7 },
+			]);
+			// Pruning is per person: the other person's row waits for their own next write.
+			expect(await ctx.store.getTaskSeen(other, [one])).toHaveLength(1);
+			expect(await ctx.store.getTaskSeen(me, [])).toEqual([]);
 		},
 	},
 	{

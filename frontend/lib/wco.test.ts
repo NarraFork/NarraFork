@@ -189,6 +189,45 @@ describe("floating overlays above the WCO drag surface", () => {
 		);
 	});
 
+	test("desktop has a drag surface without a header row", async () => {
+		// The desktop header row is gone; the sidebar brand row and a strip above the page
+		// are the drag surfaces, and their controls opt out.
+		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
+		expect(css).toMatch(/html\[data-nf-wco\] \.nf-nav-brand-row \{[^}]*-webkit-app-region: drag/);
+		expect(css).toMatch(
+			/html\[data-nf-wco\] \.nf-nav-brand-row :is\([^)]*button[^)]*\) \{[^}]*-webkit-app-region: no-drag/,
+		);
+		expect(css).toMatch(/html\[data-nf-wco\] \.nf-wco-main-strip \{[^}]*-webkit-app-region: drag/);
+		const layout = await Bun.file(
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
+		).text();
+		expect(layout).toContain('className="nf-wco-main-strip"');
+		const top = await Bun.file(
+			new URL("../components/nav/NavTopSection.tsx", import.meta.url),
+		).text();
+		expect(top).toContain('className="nf-nav-brand-row"');
+	});
+
+	test("nothing dead sits at the top edge or the sidebar's sides", async () => {
+		// The shell's padding put 16px of non-draggable band above both drag surfaces, and
+		// the navbar's inline padding left a dead column down the window's left edge — the
+		// two places a reader grabs first. Both belong to the title bar now.
+		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
+		const desktop = css.slice(css.indexOf("@media (min-width: 48em)"));
+		expect(desktop).toMatch(
+			/html\[data-nf-wco\] \.nf-app-shell \.mantine-AppShell-navbar,\s*\n?\s*html\[data-nf-wco\] \.nf-app-shell \.mantine-AppShell-main \{\s*\/\*[^*]*\*\/\s*padding-top: 0 !important/,
+		);
+		// The strip carries the spacing the shell no longer has, so the band above the page
+		// is one drag surface instead of a draggable top and an inert gap below it.
+		expect(desktop).toMatch(
+			/\.nf-wco-main-strip \{[^}]*height: calc\(var\(--nf-wco-strip-height\) \+ var\(--mantine-spacing-md\)\)/,
+		);
+		// The brand row bleeds over the navbar's inline padding, keeping its content in place.
+		expect(desktop).toMatch(
+			/\.nf-nav-brand-row \{\s*\/\*[^*]*\*\/\s*margin-inline: calc\(var\(--mantine-spacing-md\) \* -1\) !important/,
+		);
+	});
+
 	test("the theme stamps nf-overlay-layer on every Mantine floating part", async () => {
 		const theme = await Bun.file(new URL("./mantine-theme.ts", import.meta.url)).text();
 		for (const component of ["Modal", "Drawer", "Menu", "Popover", "HoverCard", "Combobox"]) {
@@ -222,13 +261,16 @@ describe("floating overlays above the WCO drag surface", () => {
 		const after = (marker: string) => layout.lastIndexOf(marker);
 		const headerEnd = layout.indexOf("</AppShell.Header>");
 		const navbarEnd = after("</AppShell.Navbar>");
+		const mainStrip = layout.indexOf('className="nf-wco-main-strip"');
 		expect(headerEnd).toBeGreaterThan(0);
 		expect(navbarEnd).toBeGreaterThan(0);
+		expect(mainStrip).toBeGreaterThan(0);
 
 		for (const banner of ["<WSConnectionAlert />", "<VersionUpdateBanner />"]) {
 			const at = after(banner);
 			expect(at).toBeGreaterThan(headerEnd);
 			expect(at).toBeGreaterThan(navbarEnd);
+			expect(at).toBeGreaterThan(mainStrip);
 		}
 	});
 });

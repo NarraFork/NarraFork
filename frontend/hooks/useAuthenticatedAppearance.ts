@@ -4,6 +4,8 @@ import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
+import { ensureTypographyCssVars } from "../lib/typography-css-vars";
+import { typographyFromPreferences } from "../lib/typography-preferences";
 import { useLocalNumberPref, useLocalPref } from "./useLocalPref";
 import type { useUserPreferences } from "./useUserPreferences";
 
@@ -38,19 +40,22 @@ export function useAuthenticatedAppearance(prefs: ReturnType<typeof useUserPrefe
 	// layout with an anchor) — so nothing else is needed here. Values are only applied
 	// once prefs have loaded; `undefined` would clamp to the defaults and cause a
 	// visible reflow on every page load for anyone who changed a setting.
+	//
+	// The same values are published as `--nf-type-*` CSS variables on <html> (the outline
+	// editor, tree, mind map and task board paint with them), kept current by a typography
+	// subscription so a slider drag previews there too. Installed once; idempotent.
+	//
+	// Line height is read from `narratorLineHeightV2Percent`, the current scale (100 = the old
+	// 120%); the server derives it from the old-scale column for rows saved before the rescale.
 	useEffect(() => {
+		ensureTypographyCssVars();
 		if (!prefs) return;
-		setTypography({
-			fontScalePercent: prefs.narratorFontScalePercent,
-			letterSpacingPercent: prefs.narratorLetterSpacingPercent,
-			lineHeightScalePercent: prefs.narratorLineHeightScalePercent,
-			paragraphScalePercent: prefs.narratorParagraphScalePercent,
-		});
+		setTypography(typographyFromPreferences(prefs));
 	}, [
 		prefs,
 		prefs?.narratorFontScalePercent,
 		prefs?.narratorLetterSpacingPercent,
-		prefs?.narratorLineHeightScalePercent,
+		prefs?.narratorLineHeightV2Percent,
 		prefs?.narratorParagraphScalePercent,
 	]);
 

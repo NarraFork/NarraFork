@@ -216,7 +216,7 @@ describe("outline task source wording", () => {
 		}
 		// The four outcomes of an ordinary session's prompt.
 		const en = source.continuationPrompt({ form: "open", task: openTask, locale: "en" });
-		for (const outcome of ["Already done", "keep working", "AskUserQuestion", "No longer matches"])
+		for (const outcome of ["Already done", "keep working", "using Ask", "No longer matches"])
 			expect(en).toContain(outcome);
 	});
 

@@ -47,6 +47,7 @@ import {
 	readManagerOwnedFields,
 } from "../settings-manager-fields";
 import { loadSpeechSettings } from "../speech-settings";
+import { settingsUnreadable } from "../startup-status/startup-problems";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
@@ -372,6 +373,26 @@ export function reloadSettings(): NarraForkSettings {
 	return _cache.current!;
 }
 
+/**
+ * Hand-edited settings often carry a comment or a trailing comma; both are accepted. The file is
+ * rewritten as plain JSON on the next save. Anything else unreadable stops startup with a
+ * message naming the file.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure, validated by the merge below
+export function parseSettingsText(text: string): any {
+	let raw: unknown;
+	try {
+		raw = Bun.JSONC.parse(text);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message.replace(/^JSONC Parse error: /, "") : "";
+		throw settingsUnreadable(settingsPath, reason || String(error));
+	}
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+		throw settingsUnreadable(settingsPath, "the top level must be an object");
+	}
+	return raw;
+}
+
 function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
@@ -390,7 +411,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		writeFileSync(settingsPath, JSON.stringify(initial, null, 2), { mode: 0o600 });
 	}
 	const text = existsSync(settingsPath) ? readFileSync(settingsPath, "utf-8") : undefined;
-	const raw = text === undefined ? {} : JSON.parse(text);
+	const raw = text === undefined ? {} : parseSettingsText(text);
 	lastSettingsText = text;
 	const merged = deepMerge(DEFAULTS, raw);
 	// Do not let the generic defaults merge conceal an invalid partial speech config.
@@ -969,7 +990,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		let disk: unknown = {};
 		if (existsSync(settingsPath)) {
 			try {
-				disk = JSON.parse(readFileSync(settingsPath, "utf-8"));
+				disk = Bun.JSONC.parse(readFileSync(settingsPath, "utf-8"));
 			} catch {
 				disk = {};
 			}

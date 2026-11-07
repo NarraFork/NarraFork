@@ -25,7 +25,10 @@ beforeAll(() => {
 });
 
 async function mod() {
-	return import("./measure-tool-call");
+	const m = await import("./measure-tool-call");
+	// The diff body is measured with the LIVE line box: at the default setting it is 120%
+	// of the exported bare-Mantine `DETAIL_CONTENT_LINE_HEIGHT` (LINE_HEIGHT_BASELINE_PERCENT).
+	return { ...m, DETAIL_CONTENT_LINE_HEIGHT: m.detailContentLineHeight() };
 }
 
 type Row = { content: string };
@@ -134,10 +137,13 @@ describe("measureDiffContentHeight", () => {
 		const short = rows(...Array.from({ length: 5_000 }, () => "x"));
 		const useful = m.cappedUsefulLines(200);
 		expect(m.measureDiffContentHeight(short, 0, 200, 4_000)).toBe(200);
-		// A diff SHORTER than the budget is measured exactly (no clamping).
-		const few = rows(...Array.from({ length: useful - 2 }, () => "x"));
+		// A diff SHORTER than the budget, and short enough to fit under the cap, is
+		// measured exactly (no clamping).
+		const fit = Math.floor((200 - m.DETAIL_BOX_CHROME_Y) / m.DETAIL_CONTENT_LINE_HEIGHT);
+		expect(fit).toBeLessThan(useful);
+		const few = rows(...Array.from({ length: fit }, () => "x"));
 		expect(m.measureDiffContentHeight(few, 0, 200, 4_000)).toBe(
-			(useful - 2) * m.DETAIL_CONTENT_LINE_HEIGHT + m.DETAIL_BOX_CHROME_Y,
+			fit * m.DETAIL_CONTENT_LINE_HEIGHT + m.DETAIL_BOX_CHROME_Y,
 		);
 	});
 

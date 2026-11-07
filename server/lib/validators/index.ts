@@ -218,6 +218,7 @@ export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
+	createRecentTabFolderSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabSchema,
@@ -226,9 +227,9 @@ export {
 	removeRecentTabSchema,
 	reorderFavoriteDirectoriesSchema,
 	restoreRecentTabsSchema,
-	setRecentTabDirectoryOrderSchema,
 	specTabLayoutPatchSchema,
 	updateFavoriteDirectorySchema,
+	updateRecentTabFolderSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "./settings";

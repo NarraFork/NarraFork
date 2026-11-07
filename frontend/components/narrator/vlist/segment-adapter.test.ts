@@ -4826,7 +4826,8 @@ describe("adaptSegment — a concluded review", () => {
 				},
 			});
 			const measured = VLIST_REGISTRY[specs[0].kind].measure(specs[0].data, 320, lod);
-			expect(measured.height).toBe(25);
+			// py 4×2 + one xs line (20 at the default setting: 120% of the Mantine 17).
+			expect(measured.height).toBe(28);
 		});
 		it.each(["sys", "system", "assistant"])("does not collapse %s messages", (role) => {
 			const specs = adaptSegment(
