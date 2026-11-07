@@ -174,7 +174,12 @@ import {
 import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	getQueueDuringCompaction,
+	normalizeAutoModelValueForSave,
+	settings,
+} from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -1423,7 +1428,7 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	const input = parsed.data;
+	const input = { ...parsed.data, model: normalizeAutoModelValueForSave(parsed.data.model) };
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -5132,8 +5137,9 @@ narratorRoutes.patch("/:id/model", async (c) => {
 			c.get("user").sub,
 		);
 	}
-	await narratorService.updateModel(id, parsed.data.model);
-	await updateNarratorModel(id, parsed.data.model);
+	const model = normalizeAutoModelValueForSave(parsed.data.model);
+	await narratorService.updateModel(id, model);
+	await updateNarratorModel(id, model);
 	return c.json({ ok: true });
 });
 

@@ -23,7 +23,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { useMutation } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type {
@@ -37,6 +37,7 @@ import type {
 import { ALL_DATA_KINDS } from "../../lib/api/storage-transfer";
 import { describeApiError } from "../../lib/api-error";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
+import { StepUpFields, useStepUpFields } from "./StepUpFields";
 
 const CLEAR_TARGETS: ClearTarget[] = ["requests", "sessions", "providers", "all"];
 
@@ -76,6 +77,13 @@ export function DataPortabilityCard() {
 	const [exportError, setExportError] = useState<string | null>(null);
 	const [exportOpen, setExportOpen] = useState(false);
 	const [exportSelection, setExportSelection] = useState<TransferSelection>(ALL_DATA_KINDS);
+	// Exporting providers carries every key: same identity check and passphrase as credentials.
+	const stepUp = useStepUpFields(exportOpen);
+	// Without a second factor this account cannot export providers; requests and sessions still go.
+	useEffect(() => {
+		if (stepUp.noSecondFactor) setExportSelection((prev) => ({ ...prev, providers: false }));
+	}, [stepUp.noSecondFactor]);
+	const [importPassphrase, setImportPassphrase] = useState("");
 
 	const [preview, setPreview] = useState<ImportPreviewResult | null>(null);
 	const [importResult, setImportResult] = useState<ImportResult | null>(null);
@@ -83,6 +91,8 @@ export function DataPortabilityCard() {
 	const [includeSelection, setIncludeSelection] = useState<TransferSelection>(ALL_DATA_KINDS);
 	const [conflictDefault, setConflictDefault] = useState<ConflictDecision>("skip");
 	const [conflictById, setConflictById] = useState<Record<string, ConflictDecision>>({});
+	/** The archive has sealed keys and providers are being imported. */
+	const needsImportPassphrase = !!preview?.providerKeys?.sealed && includeSelection.providers;
 
 	const [clearTarget, setClearTarget] = useState<ClearTarget | null>(null);
 	const [password, setPassword] = useState("");
@@ -94,6 +104,7 @@ export function DataPortabilityCard() {
 			setPreview(result);
 			setImportResult(null);
 			setImportError(null);
+			setImportPassphrase("");
 			setIncludeSelection(ALL_DATA_KINDS);
 			setConflictDefault("skip");
 			setConflictById(
@@ -113,6 +124,7 @@ export function DataPortabilityCard() {
 				conflictDefault,
 				preview && preview.conflicts.length > 0 ? conflictById : undefined,
 				includeSelection,
+				needsImportPassphrase ? importPassphrase : undefined,
 			),
 		onSuccess: (result) => {
 			setImportResult(result);
@@ -136,10 +148,18 @@ export function DataPortabilityCard() {
 		setExporting(true);
 		setExportError(null);
 		try {
-			const result = await api.saveExport(exportSelection);
+			// The save dialog opens first (the browser requires it to be the click's first await);
+			// step-up then runs before the request, and a failure drops the chosen file.
+			const result = await api.saveExport(exportSelection, {
+				authorize: async () => {
+					const grant = await stepUp.verify("storage.export.providers");
+					return { stepUpToken: grant.token, passphrase: stepUp.state.passphrase };
+				},
+			});
 			if (result === "saved") setExportOpen(false);
 		} catch (error) {
 			setExportError(describeApiError(error, t).message);
+			if (exportSelection.providers) stepUp.clearCode();
 		} finally {
 			setExporting(false);
 		}
@@ -192,8 +212,7 @@ export function DataPortabilityCard() {
 						)}
 					</FileButton>
 				</Group>
-				{exportError && <Alert color="red">{exportError}</Alert>}
-				{importError && <Alert color="red">{importError}</Alert>}
+				{importError && !preview && <Alert color="red">{importError}</Alert>}
 				{importResult && (
 					<Alert color="green" title={t("dataImportDoneTitle")}>
 						<Text size="sm">
@@ -209,6 +228,16 @@ export function DataPortabilityCard() {
 						{importResult.sessionsRejected > 0 && (
 							<Text size="sm" c="orange.6" mt={4}>
 								{t("dataImportRejected", { count: importResult.sessionsRejected })}
+							</Text>
+						)}
+						{(importResult.keysImported ?? 0) > 0 && (
+							<Text size="sm" mt={4}>
+								{t("dataImportKeys", { count: importResult.keysImported })}
+							</Text>
+						)}
+						{(importResult.keysFailed ?? 0) > 0 && (
+							<Text size="sm" c="orange.6" mt={4}>
+								{t("dataImportKeysFailed", { count: importResult.keysFailed })}
 							</Text>
 						)}
 					</Alert>
@@ -271,6 +300,19 @@ export function DataPortabilityCard() {
 							</Stack>
 						</Checkbox.Group>
 
+						{needsImportPassphrase && (
+							<PasswordInput
+								label={t("dataImportPassphraseLabel")}
+								description={t("dataImportPassphraseDesc", {
+									count: preview.providerKeys?.count ?? 0,
+								})}
+								value={importPassphrase}
+								onChange={(event) => setImportPassphrase(event.currentTarget.value)}
+								autoComplete="off"
+								data-import-passphrase
+							/>
+						)}
+
 						{preview.conflicts.length === 0 ? (
 							<Text size="sm" c="dimmed">
 								{t("dataImportNoConflicts")}
@@ -331,11 +373,16 @@ export function DataPortabilityCard() {
 							</Stack>
 						)}
 
+						{importError && <Alert color="red">{importError}</Alert>}
 						<Group justify="flex-end">
 							<Button variant="subtle" onClick={() => setPreview(null)}>
 								{t("dataImportCancel")}
 							</Button>
-							<Button loading={applyMutation.isPending} onClick={() => applyMutation.mutate()}>
+							<Button
+								disabled={needsImportPassphrase && !importPassphrase}
+								loading={applyMutation.isPending}
+								onClick={() => applyMutation.mutate()}
+							>
 								{t("dataImportConfirm")}
 							</Button>
 						</Group>
@@ -394,15 +441,37 @@ export function DataPortabilityCard() {
 						<Stack gap={4}>
 							<Checkbox value="requests" label={t("dataKindRequests")} />
 							<Checkbox value="sessions" label={t("dataKindSessions")} />
-							<Checkbox value="providers" label={t("dataKindProviders")} />
+							<Checkbox
+								value="providers"
+								label={t("dataKindProviders")}
+								disabled={stepUp.noSecondFactor}
+								data-export-providers
+							/>
 						</Stack>
 					</Checkbox.Group>
+					{stepUp.noSecondFactor && (
+						<Alert color="orange" variant="light">
+							<Text size="xs">{t("dataExportProvidersNeedMfa")}</Text>
+						</Alert>
+					)}
+					{exportSelection.providers && !stepUp.noSecondFactor && (
+						<Stack gap="sm">
+							<Alert color="blue" variant="light">
+								<Text size="xs">{t("dataExportProvidersSealed")}</Text>
+							</Alert>
+							<StepUpFields fields={stepUp} />
+						</Stack>
+					)}
+					{exportError && <Alert color="red">{exportError}</Alert>}
 					<Group justify="flex-end">
 						<Button variant="subtle" onClick={() => setExportOpen(false)}>
 							{t("dataImportCancel")}
 						</Button>
 						<Button
-							disabled={selectedKinds(exportSelection).length === 0}
+							disabled={
+								selectedKinds(exportSelection).length === 0 ||
+								(exportSelection.providers && !stepUp.ready)
+							}
 							loading={exporting}
 							onClick={() => void handleExport()}
 						>

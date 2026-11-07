@@ -32,7 +32,10 @@ function installMapLocalStorage(): void {
 	});
 }
 
-const selection: TransferSelection = { requests: true, sessions: false, providers: true };
+/** Without providers: no step-up, plain GET / ticket as before. */
+const selection: TransferSelection = { requests: true, sessions: false, providers: false };
+const withProviders: TransferSelection = { requests: true, sessions: false, providers: true };
+const auth = { stepUpToken: "nfsu_grant", passphrase: "long enough passphrase" };
 
 function zipStream(text: string): ReadableStream<Uint8Array> {
 	return new ReadableStream({
@@ -86,7 +89,7 @@ describe("saveExport", () => {
 
 		expect(result).toBe("saved");
 		expect(order).toEqual(["picker", "writable", "fetch"]);
-		expect(exportUrl).toBe("/api/storage/export?requests=1&sessions=0&providers=1");
+		expect(exportUrl).toBe("/api/storage/export?requests=1&sessions=0&providers=0");
 		expect(authorization).toBe("Bearer nfs_export");
 		expect(new TextDecoder().decode(chunks[0])).toBe("zip-bytes");
 		expect(aborted).toBe(false);
@@ -176,5 +179,78 @@ describe("saveExport", () => {
 		});
 		expect(result).toBe("saved");
 		expect(opened).toBe("/api/storage/export/download?ticket=abc");
+	});
+
+	test("with providers: picker, then step-up, then a POST whose body carries grant and passphrase", async () => {
+		const order: string[] = [];
+		// Assigned in a callback; held in an object so TypeScript does not narrow it to null.
+		const sent: { request?: { url: string; method?: string; body?: unknown } } = {};
+		const result = await saveExport(withProviders, {
+			authorize: async () => {
+				order.push("step-up");
+				return auth;
+			},
+			showSaveFilePicker: async () => {
+				order.push("picker");
+				return { createWritable: async () => new WritableStream<Uint8Array>() };
+			},
+			fetch: async (input, init) => {
+				order.push("fetch");
+				sent.request = { url: String(input), method: init?.method, body: init?.body };
+				return new Response(zipStream("zip-bytes"));
+			},
+		});
+		expect(result).toBe("saved");
+		expect(order).toEqual(["picker", "step-up", "fetch"]);
+		expect(sent.request).toEqual({
+			url: "/api/storage/export",
+			method: "POST",
+			body: JSON.stringify({ selection: withProviders, ...auth }),
+		});
+	});
+
+	test("with providers: a failed step-up drops the chosen file and sends nothing", async () => {
+		let aborted = false;
+		let fetched = false;
+		const error = await saveExport(withProviders, {
+			authorize: async () => {
+				throw new ApiError("Password or verification code is incorrect", 401);
+			},
+			showSaveFilePicker: async () => ({
+				createWritable: async () =>
+					new WritableStream<Uint8Array>({
+						abort() {
+							aborted = true;
+						},
+					}),
+			}),
+			fetch: async () => {
+				fetched = true;
+				return new Response(null);
+			},
+		}).then(
+			() => null,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(ApiError);
+		expect(aborted).toBe(true);
+		expect(fetched).toBe(false);
+	});
+
+	test("with providers and no file picker: the ticket request carries grant and passphrase", async () => {
+		let body: unknown;
+		await saveExport(withProviders, {
+			authorize: async () => auth,
+			showSaveFilePicker: null,
+			fetch: async (_input, init) => {
+				body = init?.body;
+				return new Response(JSON.stringify({ ticket: "t" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			},
+			openDownload: () => {},
+		});
+		expect(body).toBe(JSON.stringify({ ...withProviders, ...auth }));
 	});
 });

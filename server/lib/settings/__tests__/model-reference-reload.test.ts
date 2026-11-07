@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getModelCatalogRevision, setModelWindow } from "../../model-catalog";
+import { getModelOverride, setModelOverride } from "../../model-catalog";
 import { narraforkDir, reloadSettings, saveSettings, settings } from "../index";
 
 const path = join(narraforkDir, "settings.json");
 let original: string;
+let overridden: string | undefined;
 
 beforeEach(() => {
 	original = readFileSync(path, "utf8");
@@ -13,6 +14,8 @@ beforeEach(() => {
 afterEach(() => {
 	writeFileSync(path, original);
 	reloadSettings();
+	if (overridden) setModelOverride("connection", overridden, null);
+	overridden = undefined;
 });
 
 describe("model references survive settings reload", () => {
@@ -31,12 +34,9 @@ describe("model references survive settings reload", () => {
 			draft.agent.subagentModels.explore = model;
 			draft.agent.hiddenModels = [model];
 			saveSettings(draft);
-			setModelWindow({
-				baseRevision: getModelCatalogRevision(),
-				scope: "connection",
-				target: model,
-				contextWindow: 128000,
-			});
+			// The entry's own override must survive the stale-reference cleanup on load.
+			overridden = model;
+			setModelOverride("connection", model, { contextWindow: 128000 });
 
 			// Force a migration write on the first load, so both returned settings
 			// and the re-persisted JSON must retain the operator's references.
@@ -51,9 +51,7 @@ describe("model references survive settings reload", () => {
 				expect(loaded.agent.promptOptimizeModel).toBe(model);
 				expect(loaded.agent.subagentModels.explore).toBe(model);
 				expect(loaded.agent.hiddenModels).toContain(model);
-				expect(loaded.agent.modelCatalog?.local.connections?.[model]?.working_context_tokens).toBe(
-					128000,
-				);
+				expect(getModelOverride("connection", model)?.contextWindow).toBe(128000);
 				expect(JSON.parse(readFileSync(path, "utf8")).agent.summaryModel).toBe(model);
 			}
 		});

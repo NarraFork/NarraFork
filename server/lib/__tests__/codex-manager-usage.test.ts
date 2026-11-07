@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexManager } from "../codex-manager";
 import { type CodexUsageResult, isUnauthorizedCodexUsageError } from "../codex-usage";
+import { readSecretJSON } from "../secret-store";
+
+/** Credential files are encrypted at rest; tests compare their decrypted JSON. */
+const secretText = (path: string) => JSON.stringify(readSecretJSON(path));
 
 function createManagerWithOneCredential(
 	id: string,
@@ -226,9 +230,7 @@ describe("CodexManager credit quota", () => {
 			displayName: "Renamed",
 			priority: 5,
 		});
-		const saved = JSON.parse(
-			readFileSync(join(tmpHome, ".narrafork", "codex-credentials.json"), "utf-8"),
-		);
+		const saved = JSON.parse(secretText(join(tmpHome, ".narrafork", "codex-credentials.json")));
 		expect(saved[0].useCreditQuota).toBe(true);
 		const reloaded = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
 		expect(reloaded.snapshot().entries[0]?.useCreditQuota).toBe(true);
@@ -525,7 +527,7 @@ describe("CodexManager usage quota state", () => {
 		expect(snapshot.entries.map((entry) => entry.id)).toEqual(["ok", "manual", "quota"]);
 		expect(snapshot.unhealthyTotal).toBe(0);
 		const persistedCredentials = JSON.parse(
-			readFileSync(join(narraforkDir, "codex-credentials.json"), "utf-8"),
+			secretText(join(narraforkDir, "codex-credentials.json")),
 		) as Array<{ id: string }>;
 		expect(persistedCredentials.map((entry) => entry.id)).toEqual(["ok", "manual", "quota"]);
 		const persistedStats = JSON.parse(
@@ -603,9 +605,7 @@ describe("CodexManager usage quota state", () => {
 			},
 		]);
 		const entry = manager.snapshot().entries[0];
-		const stored = JSON.parse(
-			readFileSync(join(tmpHome, ".narrafork", "codex-credentials.json"), "utf8"),
-		)[0];
+		const stored = JSON.parse(secretText(join(tmpHome, ".narrafork", "codex-credentials.json")))[0];
 
 		expect(result).toEqual({ added: 1, duplicates: 0, skipped: 0 });
 		expect(entry).toMatchObject({
@@ -730,7 +730,7 @@ describe("CodexManager usage quota state", () => {
 
 		await manager.getUsage("cred-history");
 		const saved = JSON.parse(
-			readFileSync(join(tmpHome, ".narrafork", "codex-credentials.json"), "utf-8"),
+			secretText(join(tmpHome, ".narrafork", "codex-credentials.json")),
 		) as Array<{
 			id: string;
 			usageHistory?: Array<{ timestamp: number; remainingPercent: number }>;

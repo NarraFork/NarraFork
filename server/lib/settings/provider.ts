@@ -2,6 +2,13 @@
  * Provider resolution, model parsing, context window management, and model registry.
  * Extracted from the monolithic settings/index.ts.
  */
+import {
+	type AutoCandidateInput,
+	autoCandidates,
+	autoModelValue,
+	parseAutoModelValue,
+} from "@shared/auto-model";
+import { orderAutoCandidates } from "@shared/auto-route-strategy";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import { modelProfile } from "@shared/model-catalog/profile";
@@ -13,7 +20,12 @@ import { resolveCommandCodeToken } from "../commandcode-manager";
 import { peekCommandCodeModels } from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
-import { getEffectiveModelProfile, resolveEffectiveModelCard } from "../model-catalog";
+import {
+	canonicalCatalogModelId,
+	getEffectiveModelProfile,
+	identifyModelValue,
+	resolveEffectiveModelCard,
+} from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
@@ -287,6 +299,196 @@ function isModelProviderDisabled(modelValue: string): boolean {
 	return !!provider && getDisabledProviderPrefixes().has(provider);
 }
 
+// ---------------------------------------------------------------------------
+// auto:<model> (docs/PROVIDER-SOURCING-DESIGN.md §4.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * The provider models that can serve `auto:<modelId>`, in provider order: visible,
+ * enabled, taking part in auto routing, and a strong catalog match for the model.
+ */
+export function listAutoModelCandidates(modelId: string): string[] {
+	const excluded = new Set(s().agent.autoExcludedProviders ?? []);
+	const inputs: AutoCandidateInput[] = [];
+	for (const value of getVisibleModels()) {
+		const { provider } = parseModelId(value);
+		if (!provider || excluded.has(provider) || autoModelIdOf(value) !== null) continue;
+		const identity = identifyModelValue(value);
+		inputs.push({
+			value,
+			provider,
+			...(identity.modelId ? { modelId: identity.modelId } : {}),
+			matchedVia: identity.matchedVia,
+		});
+	}
+	return autoCandidates(modelId, inputs).map((candidate) => candidate.value);
+}
+
+/**
+ * Live facts about a source for ordering `auto:` candidates: can it serve now, and is it a
+ * subscription. Registered by agent/auto-route-signals.ts, which may reach the Codex manager,
+ * the key pool and usage caches that this settings module must not import. Without it every
+ * source counts as available and pay-per-use.
+ */
+/** `value` is the full `<prefix>:<model>` candidate (NUG availability is per gateway model). */
+export type AutoSourceProbe = (
+	provider: string,
+	value?: string,
+) => { available: boolean; subscription: boolean };
+let autoSourceProbe: AutoSourceProbe | null = null;
+export function registerAutoSourceProbe(probe: AutoSourceProbe | null): void {
+	autoSourceProbe = probe;
+}
+
+/** Reference input + output price per million tokens (the catalog's unit), when known. */
+export function referencePricePerMillion(value: string): number | undefined {
+	try {
+		// Decimal strings; missing or null means unknown.
+		const pricing = getEffectiveModelProfile(value).referencePricing;
+		const input = Number(pricing?.input ?? Number.NaN);
+		const output = Number(pricing?.output ?? Number.NaN);
+		return Number.isFinite(input) && Number.isFinite(output) ? input + output : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Declared input modalities of one provider value; undefined when nothing is declared. */
+function declaredInputModalities(value: string): ReadonlySet<string> | undefined {
+	try {
+		const inputs = getEffectiveModelProfile(value).inputModalities;
+		return Array.isArray(inputs) ? new Set(inputs) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Candidates that declare fewer input kinds than another candidate of the same model (an image
+ * model behind a text-only relay). Adapters reject media a model does not accept, history
+ * included, so such a source is ordered with the unavailable ones: it is used only when
+ * nothing else can serve. A candidate that declares nothing is not counted as limited.
+ */
+function inputLimitedCandidates(values: readonly string[]): Set<string> {
+	const declared = new Map(values.map((value) => [value, declaredInputModalities(value)]));
+	const widest = new Set<string>();
+	for (const inputs of declared.values()) for (const kind of inputs ?? []) widest.add(kind);
+	const limited = new Set<string>();
+	for (const [value, inputs] of declared) {
+		if (inputs && [...widest].some((kind) => !inputs.has(kind))) limited.add(value);
+	}
+	return limited;
+}
+
+/** `auto:` candidates in routing order (shared/auto-route-strategy.ts). */
+export function orderedAutoModelCandidates(modelId: string): string[] {
+	const candidates = listAutoModelCandidates(modelId);
+	if (candidates.length < 2) return candidates;
+	const limited = inputLimitedCandidates(candidates);
+	return orderAutoCandidates(
+		candidates.map((value) => {
+			const provider = parseModelId(value).provider as string;
+			const facts = autoSourceProbe?.(provider, value) ?? { available: true, subscription: false };
+			const price = referencePricePerMillion(value);
+			return {
+				value,
+				...facts,
+				available: facts.available && !limited.has(value),
+				...(price !== undefined ? { referencePrice: price } : {}),
+			};
+		}),
+	);
+}
+
+/** Every catalog model that at least one provider can serve through `auto:`. */
+export function listAutoModelIds(): string[] {
+	const excluded = new Set(s().agent.autoExcludedProviders ?? []);
+	const ids = new Set<string>();
+	for (const value of getVisibleModels()) {
+		const { provider } = parseModelId(value);
+		if (!provider || excluded.has(provider)) continue;
+		const identity = identifyModelValue(value);
+		if (identity.modelId && (identity.matchedVia === "exact" || identity.matchedVia === "alias")) {
+			ids.add(identity.modelId);
+		}
+	}
+	return [...ids];
+}
+
+/**
+ * An installation that already had a provider prefixed `auto` keeps its values working
+ * until the provider is renamed; such values are not `auto:` routing.
+ */
+function legacyAutoPrefixInUse(): boolean {
+	return [...(s().customApiProviders ?? []), ...(s().nugProviders ?? [])].some(
+		(provider) => provider.prefix === "auto",
+	);
+}
+
+/** The `auto:` catalog model id, unless `auto` is still a configured provider prefix. */
+function autoModelIdOf(value: string | null | undefined): string | null {
+	const modelId = parseAutoModelValue(value);
+	return modelId && !legacyAutoPrefixInUse() ? modelId : null;
+}
+
+/**
+ * The concrete `<prefix>:<model>` an `auto:` value resolves to now.
+ *
+ * A session stays on the provider it already uses (`stickyProvider`) while that provider can
+ * still serve, so a turn keeps its upstream cache (§4.3 "within an epoch"). When it cannot,
+ * the best candidate in routing order takes over (§4.3 "forced switch"). Returns null when no
+ * provider serves the model.
+ */
+export function resolveAutoModel(modelId: string, stickyProvider?: string): string | null {
+	const candidates = orderedAutoModelCandidates(modelId);
+	if (!stickyProvider) return candidates[0] ?? null;
+	const sticky = candidates.find((value) => parseModelId(value).provider === stickyProvider);
+	if (!sticky) return candidates[0] ?? null;
+	const limited = inputLimitedCandidates(candidates);
+	const canServe = (value: string) =>
+		!limited.has(value) &&
+		(autoSourceProbe?.(parseModelId(value).provider as string, value).available ?? true);
+	if (canServe(sticky)) return sticky;
+	// Moving only helps when the next source can serve. When none can, the session stays where
+	// it is, so the cache is not given up for a source that would fail the same way.
+	return candidates.find((value) => value !== sticky && canServe(value)) ?? sticky;
+}
+
+/** An `auto:` value names a catalog model no provider serves right now. */
+export class AutoModelUnavailableError extends AppError {
+	constructor(readonly modelId: string) {
+		super(
+			`No configured provider serves "${modelId}" for auto routing. ` +
+				"Choose another model, or a provider explicitly.",
+			409,
+			"AUTO_MODEL_UNAVAILABLE",
+		);
+		this.name = "AutoModelUnavailableError";
+	}
+}
+
+/**
+ * Check an `auto:` value being saved, and write it the catalog's way (`auto:<alias>` becomes
+ * `auto:<id>`). Other values come back unchanged. Only the catalog is consulted: whether some
+ * provider serves the model right now is a runtime question, and a saved value must survive a
+ * provider being briefly off. Callers check only values the user is writing or changing, so a
+ * catalog update never makes settings that are already saved unsaveable.
+ */
+export function normalizeAutoModelValueForSave<T extends string | null | undefined>(
+	value: T,
+): T | string {
+	const modelId = autoModelIdOf(value?.trim());
+	if (!modelId) return value;
+	const canonical = canonicalCatalogModelId(modelId);
+	if (!canonical) {
+		throw new ValidationError(
+			`"${modelId}" is not a model in the catalog, so auto cannot route it. ` +
+				"Choose a catalog model, or a provider explicitly.",
+		);
+	}
+	return autoModelValue(canonical);
+}
+
 /** Round-robin counter for balanced aggregation routing. */
 const aggRoundRobin = new Map<string, number>();
 
@@ -388,6 +590,12 @@ function resolveConfiguredDefaultModel(stickyProvider?: string): string {
 		if (!candidate) throw new DefaultModelNotConfiguredError();
 		return candidate;
 	}
+	const autoId = autoModelIdOf(configured);
+	if (autoId) {
+		const candidate = resolveAutoModel(autoId, stickyProvider);
+		if (!candidate) throw new AutoModelUnavailableError(autoId);
+		return candidate;
+	}
 
 	return configured;
 }
@@ -410,6 +618,9 @@ function resolveConfiguredSummaryModel(stickyProvider?: string): string {
 			: sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider));
 		return candidate ?? resolveConfiguredDefaultModel(stickyProvider);
 	}
+	// Same rule for auto: a summary model nobody serves follows the default model.
+	const autoId = autoModelIdOf(configured);
+	if (autoId) return resolveAutoModel(autoId, stickyProvider) ?? resolveConfiguredDefaultModel();
 
 	return configured;
 }
@@ -437,7 +648,8 @@ function isMetaModelReference(model: string): boolean {
 		model === FOLLOW_PARENT_MODEL ||
 		isFollowDefaultModelValue(model) ||
 		isFollowSummaryModelValue(model) ||
-		!!parseAggModelValue(model)
+		!!parseAggModelValue(model) ||
+		autoModelIdOf(model) !== null
 	);
 }
 
@@ -464,6 +676,13 @@ function expandModelReferenceForMatching(
 		for (const value of expandModelReferenceForMatching(s().agent.summaryModel, seen)) {
 			values.add(value);
 		}
+		return values;
+	}
+
+	// auto:<model> stands for every provider model that may serve it.
+	const autoId = autoModelIdOf(normalized);
+	if (autoId) {
+		for (const value of listAutoModelCandidates(autoId)) values.add(value);
 		return values;
 	}
 
@@ -603,6 +822,13 @@ export function resolveEffectiveModel(
 		// Fallback to default if aggregation has no members
 		return resolveConfiguredDefaultModel(stickyProvider);
 	}
+	// auto:<model> never falls back to another model: the caller chose this model.
+	const autoId = autoModelIdOf(raw);
+	if (autoId) {
+		const resolved = resolveAutoModel(autoId, stickyProvider);
+		if (!resolved) throw new AutoModelUnavailableError(autoId);
+		return resolved;
+	}
 
 	return raw;
 }
@@ -667,7 +893,7 @@ export function getVisibleModels(): string[] {
  * Unknown cache state remains visible for compatibility with legacy gateways.
  */
 export function getSubagentVisibleModels(): string[] {
-	return getVisibleModels().filter((model) => {
+	const concrete = getVisibleModels().filter((model) => {
 		const colon = model.indexOf(":");
 		if (colon <= 0) return true;
 		const prefix = model.slice(0, colon);
@@ -676,6 +902,9 @@ export function getSubagentVisibleModels(): string[] {
 		const nugModelId = model.slice(colon + 1);
 		return isNugCachedModelAvailable(config.id, nugModelId) !== false;
 	});
+	// Every auto:<model> some provider serves now, so subagents may name it and pools may hold it.
+	const auto = legacyAutoPrefixInUse() ? [] : listAutoModelIds().map(autoModelValue);
+	return [...auto, ...concrete];
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +1152,12 @@ function getConfiguredProviderCandidates(): string[] {
 
 /** Resolve provider name for a given model (supports "provider:model" prefix). */
 export function resolveProvider(model?: string): string {
+	// `auto` is not a provider: name the one the value resolves to now, side-effect free.
+	const autoId = autoModelIdOf(model);
+	if (autoId) {
+		const first = orderedAutoModelCandidates(autoId)[0];
+		if (first) return parseModelId(first).provider as string;
+	}
 	const { provider: explicit, model: bare } = parseModelId(model);
 	if (explicit) return explicit;
 
@@ -981,6 +1216,9 @@ function resolveMetaModelForLookup(model: string, seen = new Set<string>()): str
 		if (!configured || isFollowDefaultModelValue(configured)) return raw;
 		return resolveMetaModelForLookup(configured, seen);
 	}
+
+	const autoId = autoModelIdOf(raw);
+	if (autoId) return orderedAutoModelCandidates(autoId)[0] ?? raw;
 
 	const agg = parseAggModelValue(raw);
 	if (!agg) return raw;
@@ -1111,11 +1349,7 @@ export function resolveModelContextWindow(
 		)
 			return {
 				contextWindow: user.contextWindow,
-				source:
-					user.contextWindowSource.layer === "local-model" ||
-					user.contextWindowSource.layer === "local-variant"
-						? "card"
-						: "user",
+				source: user.contextWindowSource.layer === "local-model" ? "card" : "user",
 			};
 		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
 		if (catalog && catalog.context_length > 0)
@@ -1133,12 +1367,7 @@ export function resolveModelContextWindow(
 	if (window !== undefined && (layer?.startsWith("local-") || layer === "discovered"))
 		return {
 			contextWindow: window,
-			source:
-				layer === "local-binding" || layer === "local-connection"
-					? "user"
-					: layer === "discovered"
-						? "catalog"
-						: "card",
+			source: layer === "local-connection" ? "user" : layer === "discovered" ? "catalog" : "card",
 		};
 	// A provider's explicit budget outranks presets, but not local model/binding
 	// decisions or the gateway's discovered window.

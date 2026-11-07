@@ -73,6 +73,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					hiddenCount={hiddenCount}
 					previewModels={previewModels}
 					disabled={group.disabled}
+					autoExcluded={group.autoExcluded}
 					controlsDisabled={pendingProvider === group.prefix}
 					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
 					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}

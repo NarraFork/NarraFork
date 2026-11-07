@@ -6,10 +6,11 @@ import {
 	parseCatalogRevision,
 } from "../../../server/lib/model-catalog/source";
 import {
-	createModelCardResolver,
+	type CatalogQuery,
 	modelProfile,
 	type RawMetadata,
 	rawCatalogFromModelFiles,
+	resolveModelCard,
 } from "../../../shared/model-catalog";
 
 const date = "2026-01-01T00:00:00Z";
@@ -47,10 +48,8 @@ function model() {
 function read(value: unknown, filename = "m.json") {
 	return rawCatalogFromModelFiles(new Map([[filename, JSON.stringify(value)]]), version, date);
 }
-const resolveProfile = (
-	catalog: ReturnType<typeof read>,
-	query: Parameters<ReturnType<typeof createModelCardResolver>>[0],
-) => modelProfile(createModelCardResolver(catalog)(query));
+const resolveProfile = (catalog: ReturnType<typeof read>, query: CatalogQuery) =>
+	modelProfile(resolveModelCard({ catalog, query }));
 
 describe("data-only model directory adapter", () => {
 	test("nested variants inherit defaults and retain explicit zero, null, false and empty arrays", () => {
@@ -144,30 +143,20 @@ describe("data-only model directory adapter", () => {
 	});
 });
 
-test("batch resolution validates once and owns immutable catalog/local snapshots", () => {
+test("resolution applies a model-wide override and hands out cards callers may mutate", () => {
 	const catalog = read(model());
-	const local = {
-		revision: 1,
-		overrides: [
-			{
-				target: "model" as const,
-				targetId: "m",
-				metadata: { max_input_tokens: 3000 } as RawMetadata,
-			},
-		],
-	};
-	const resolve = createModelCardResolver(catalog, local);
-	const query = { upstreamModelId: "m", modelId: "m" };
-	catalog.models[0]!.metadata.max_input_tokens = 0;
-	local.overrides[0]!.metadata.max_input_tokens = 0;
-	const first = resolve(query);
-	expect(first.metadata.max_input_tokens).toBe(3000);
+	const modelOverrides = new Map([["m", { contextWindow: 3000 }]]);
+	const query = { upstreamModelId: "m" };
+	const first = resolveModelCard({ catalog, query, modelOverrides });
+	expect(first.metadata.working_context_tokens).toBe(3000);
+	expect(first.provenance.working_context_tokens).toMatchObject({ layer: "local-model", id: "m" });
+	expect(modelProfile(first).contextWindow).toBe(3000);
 	(first.metadata.supported_modalities as string[]).push("audio");
-	expect(resolve(query).metadata.supported_modalities).toEqual(["text", "image"]);
-	expect(() => createModelCardResolver(catalog, local)).toThrow();
-	expect(() => resolve({ upstreamModelId: "" })).toThrow();
-	expect(() => resolve(query, { max_input_tokens: 0 })).toThrow();
-	expect(() => resolve(query, null as never)).toThrow();
+	const second = resolveModelCard({ catalog, query, modelOverrides });
+	expect(second.metadata.supported_modalities).toEqual(["text", "image"]);
+	expect(catalog.models[0]?.metadata.supported_modalities).toEqual(["text", "image"]);
+	// Without the override the catalog value is what remains.
+	expect(modelProfile(resolveModelCard({ catalog, query })).contextWindow).toBe(2000);
 });
 
 describe("sub2api source rows", () => {

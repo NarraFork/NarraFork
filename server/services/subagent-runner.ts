@@ -18,7 +18,12 @@ import {
 } from "../lib/narrator-custom-traits";
 import type { Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { expandAllowedPoolForDisplay, FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
+import {
+	expandAllowedPoolForDisplay,
+	FOLLOW_DEFAULT_MODEL,
+	normalizeAutoModelValueForSave,
+	settings,
+} from "../lib/settings";
 import { type RunBindingInput, runDeadlineAt } from "../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
@@ -176,11 +181,13 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		cwd,
 		title,
 		locale,
-		model: explicitModel,
 		reasoningEffort,
 		alias,
 		userId,
 	} = input;
+	// The child stores this value; `auto:<alias>` is written the catalog's way, and an `auto:`
+	// id the catalog does not know fails here instead of at the child's first request.
+	const explicitModel = input.model ? normalizeAutoModelValueForSave(input.model) : input.model;
 	const background = input.background === true || input.takeoverByUser === true;
 	const timeoutMs = background
 		? resolveOptionalExecutionTimeout(input.timeoutMs, BACKGROUND_TASK_TIMEOUT_MS)

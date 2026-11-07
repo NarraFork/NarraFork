@@ -28,6 +28,7 @@ import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
 import { commandCodeRoutes } from "./routes/commandcode";
 import { containerRoutes } from "./routes/containers";
+import { credentialTransferRoutes } from "./routes/credential-transfer";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
 import { deepseekRoutes } from "./routes/deepseek";
@@ -73,6 +74,7 @@ import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
+import { providerKeyRoutes } from "./routes/provider-keys";
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
@@ -466,6 +468,8 @@ app.route("/api/provider-import", providerImportRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/credential-transfer", credentialTransferRoutes);
+app.route("/api/provider-keys", providerKeyRoutes);
 app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);

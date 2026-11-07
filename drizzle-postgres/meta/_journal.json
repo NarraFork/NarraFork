@@ -414,6 +414,13 @@
 			"when": 1793990635878,
 			"tag": "0058_outline_task_seen",
 			"breakpoints": true
+		},
+		{
+			"idx": 59,
+			"version": "7",
+			"when": 1794043084247,
+			"tag": "0059_usage_daily",
+			"breakpoints": true
 		}
   ]
 }

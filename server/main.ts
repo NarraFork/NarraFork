@@ -119,13 +119,16 @@ import {
 } from "./services/notification-center-maintenance";
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
+import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
 import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
+import { setMigrationPgHandle } from "./services/migration-db";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -133,7 +136,10 @@ import {
 	getExternalWebSocketRolloutSettings,
 	isExternalWebSocketOriginAllowed,
 } from "./services/oauth-ws-ticket-service";
-import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
+import {
+	migrateReservedAutoPrefixOnStartup,
+	recoverProviderPrefixMigrationOnStartup,
+} from "./services/provider-prefix-migration-service";
 import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
 import {
 	type VerifiedPublicShare,
@@ -181,9 +187,24 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 		),
 });
 
+// The startup migrations below read and rewrite narrator rows; give them the PG handle
+// before they run (composePostgresStores sets it again, harmlessly).
+if (postgresRuntime) setMigrationPgHandle(postgresRuntime.client.db);
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A journal that no longer matches the settings is kept and logged; startup continues.
-recoverProviderPrefixMigrationOnStartup();
+await recoverProviderPrefixMigrationOnStartup().catch((error) => {
+	logger.error("Could not recover an interrupted provider prefix migration", {
+		error: String(error),
+	});
+});
+// auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
+installAutoRouteSignals();
+// `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
+// logged and leaves it working as an ordinary prefix, so startup never depends on it.
+// Runs on both backends (services/migration-db.ts picks the active handle).
+await migrateReservedAutoPrefixOnStartup().catch((error) => {
+	logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
+});
 
 // When the PostgreSQL backend is active, inject every PG-capable store from the single
 // composition seam — one runtime, one client, all-or-nothing. `./db` has already finished
@@ -1677,6 +1698,10 @@ if (activeDatabaseBackend === "sqlite") {
 	});
 	// Re-derive which project every session belongs to, in bounded background pages.
 	void scheduleProjectIndexRebuild();
+	// Model aggregations become auto:/provider values; batched, logs and retries on failure.
+	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
+	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
+	void migrateAggregationsOnStartup();
 }
 
 // Establish client-egress relay channels for NUG providers configured with
