@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
+import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
@@ -2360,8 +2360,8 @@ export async function runAgentLoopUnlocked(
 			 *  - `credentials` (NUG): the credential pool comes back at an unknown time,
 			 *    so the shared availability poller checks the lightweight `/v1/models`
 			 *    list until the model reports available.
-			 *  - `quota` (Kimi): the reset instant is published (`resumeAt`), so this
-			 *    sleeps to it. No polling and no request during the wait.
+			 *  - `quota`, `capacity`, `rate_limit`: upstream publishes `resumeAt`, so
+			 *    this sleeps to it. No polling and no request during the timed wait.
 			 *
 			 * @returns true when recovery happened and the caller should `continue`
 			 * to rebuild history from the DB; false when the caller must `break`
@@ -2383,12 +2383,15 @@ export async function runAgentLoopUnlocked(
 				// The reset clock is what this wait is about, so the status carries the
 				// instant the user is waiting for as well as the tag that says why.
 				const quotaResumeAt =
-					mu.waitKind === "quota" && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
-				const waitingSubstatus = quotaResumeAt ? "quota_exhausted" : "model_unavailable";
+					providerWaitKind(mu) !== "credentials" && typeof mu.resumeAt === "number"
+						? mu.resumeAt
+						: undefined;
+				const waitingSubstatus =
+					providerWaitKind(mu) === "quota" ? "quota_exhausted" : "model_unavailable";
 				await narratorService.updateStatus(narratorId, "waiting", {
 					substatus: [waitingSubstatus],
 					errorMessage: JSON.stringify({
-						type: quotaResumeAt ? "quota_exhausted" : "model_unavailable",
+						type: waitingSubstatus,
 						...mu,
 					}),
 				});
@@ -2755,7 +2758,7 @@ export async function runAgentLoopUnlocked(
 
 			// --- Blocked, but recoverable: suspend and wait for recovery ---
 			// Either a NUG model whose credential pool is disabled, or an exhausted
-			// Kimi coding-plan allowance. Instead of replaying the full request
+			// Kimi/OpenCode allowance or a timed upstream capacity/rate limit. Instead of replaying the full request
 			// (re-uploading the entire history) over and over, suspend the narrator and
 			// wait on whatever tells us recovery happened — the availability poller for
 			// credentials, the published reset instant for quota. Then resume by
@@ -2763,10 +2766,12 @@ export async function runAgentLoopUnlocked(
 			// [continuation-source: model-unavailable]
 			if (recovery.kind === "model-unavailable" && result.modelUnavailable && active.alive) {
 				const mu = result.modelUnavailable;
-				const isQuota = mu.waitKind === "quota";
+				const waitKind = providerWaitKind(mu);
+				const isTimedWait = waitKind !== "credentials";
 				const quotaResetAt =
-					isQuota && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
-				const quotaResumeAt = isQuota && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
+					isTimedWait && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
+				const quotaResumeAt =
+					isTimedWait && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
 				/**
 				 * Why this quota wall is being reported instead of parked on.
 				 *
@@ -2780,7 +2785,7 @@ export async function runAgentLoopUnlocked(
 				 * only by the reason code — a divergence here would mean one of them silently
 				 * loses the reset instant that makes the error actionable.
 				 */
-				const quotaRefusalReason = !isQuota
+				const quotaRefusalReason = !isTimedWait
 					? undefined
 					: quotaResumeAt === undefined
 						? quotaResetAt === undefined
@@ -2798,12 +2803,15 @@ export async function runAgentLoopUnlocked(
 					// distinguishable in logs without changing what the user is told.
 					// `type` names the plan (KIMI_QUOTA_EXHAUSTED / OPENCODE_QUOTA_EXHAUSTED)
 					// so the message says whose allowance is spent.
-					const quotaCode = quotaExhaustedCode(mu.quotaProvider);
+					const quotaCode =
+						waitKind === "quota" ? quotaExhaustedCode(mu.quotaProvider) : "provider_wait_exhausted";
 					terminalStatus = {
 						substatus: ["error"],
 						errorCode: quotaCode,
 						errorMessage: JSON.stringify({
 							type: quotaCode,
+							waitKind,
+							quotaProvider: mu.quotaProvider,
 							reason: quotaRefusalReason,
 							model: mu.model,
 							provider: mu.provider,
@@ -2824,7 +2832,8 @@ export async function runAgentLoopUnlocked(
 					// the client the block cleared and it is resuming, which is false here and
 					// would flash a green "quota restored" notice over the error. The client
 					// drops its waiting notice from the status change this write produces.
-					logger.warn("Quota wall reported instead of waited on", {
+					logger.warn("Timed provider refusal reported instead of waited on", {
+						waitKind,
 						narratorId,
 						quotaProvider: mu.quotaProvider ?? "kimi",
 						providerId: mu.providerId,

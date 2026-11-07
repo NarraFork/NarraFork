@@ -19,6 +19,7 @@ export interface ProviderQuotaWait {
 	quotaProvider: QuotaProviderKind;
 	providerId: string;
 	providerPrefix: string;
+	waitKind?: "quota" | "capacity" | "rate_limit";
 	bucket: string;
 	/** The reset instant as published upstream (no skew applied). */
 	resetAt: number;
@@ -30,6 +31,7 @@ export interface ProviderQuotaRefusal {
 	quotaProvider: QuotaProviderKind;
 	providerId: string;
 	providerPrefix: string;
+	waitKind?: "quota" | "capacity" | "rate_limit";
 	bucket: string;
 	resetAt?: number;
 }
@@ -53,6 +55,12 @@ export async function resolveProviderQuotaWait(
 			quotaProvider: "opencode" as const,
 			providerId: opencode.id,
 			providerPrefix: opencode.prefix,
+			waitKind:
+				target.bucket === "capacity"
+					? ("capacity" as const)
+					: target.bucket === "rateLimit"
+						? ("rate_limit" as const)
+						: ("quota" as const),
 		};
 		if ("resumeAt" in target) {
 			return {

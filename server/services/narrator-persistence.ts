@@ -3011,7 +3011,14 @@ const sqliteNarratorPersistence = {
 		const requestedSubstatus =
 			options?.substatus ?? (status === "working" || status === "waiting" ? [] : undefined);
 		const isError = requestedSubstatus?.includes("error");
-		const keepsErrorMessage = isError || requestedSubstatus?.includes("payment_required");
+		// Timed-wait details share this existing column with errors. They must survive
+		// reloads while parked, but disappear on recovery/interruption like other waits.
+		const keepsWaitMessage =
+			status === "waiting" &&
+			(requestedSubstatus?.includes("quota_exhausted") ||
+				requestedSubstatus?.includes("model_unavailable"));
+		const keepsErrorMessage =
+			isError || requestedSubstatus?.includes("payment_required") || keepsWaitMessage;
 		const now = new Date().toISOString();
 		const nowMs = new Date(now).getTime();
 		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
