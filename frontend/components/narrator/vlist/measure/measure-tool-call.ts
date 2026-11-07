@@ -1817,14 +1817,15 @@ export function measureToolBody(
 		}
 
 		case "plan-tree": {
-			// An outline plan's tree (plan readability): the toolbar line when something is folded or
-			// opened, then the rows in the plan's capped box (scrolls past 0.85 × viewport, as the
+			// An outline plan's tree (plan readability): the toolbar line when something is folded,
+			// clamped or opened, then the rows in the plan's capped box (scrolls past 0.85 × viewport, as the
 			// markdown plan did). Rows are laid out by `measure-plan-tree`.
 			const cap = resolveDetailCap("plan", viewportHeight);
 			const layout = layoutPlanTree(
 				detail.tree,
 				detail.view,
 				Math.max(1, innerWidth - PLAN_TREE_PAD_X * 2),
+				detail.labels,
 			);
 			const blocks: PreparedBlock[] = [];
 			if (layout.toolbar)

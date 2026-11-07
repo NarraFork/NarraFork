@@ -366,10 +366,11 @@ export interface ToolChangeRowsDetail {
 }
 
 /**
- * 🔴 An outline plan as an outline (plan readability): the root and two levels under it, deeper
- * levels folded with their child count, long text clamped, each opened by the reader
- * (`outline-plan-tree.ts`; `view` is their choice, resolved during adaptation like every fold).
- * Measured row by row (`measure-plan-tree.ts`) inside the plan's capped box.
+ * 🔴 An outline plan as an outline (plan readability): the title, the background paragraph whole,
+ * the big and small points, each small point's implementation details behind one preview line,
+ * the notable points whole, each opened by the reader (`outline-plan-tree.ts`; `view` is their
+ * choice, resolved during adaptation like every fold). Measured row by row
+ * (`measure-plan-tree.ts`) inside the plan's capped box.
  *
  * `markdown` is the same plan as the capped markdown body a plan file gets: what the fullscreen
  * viewer opens and what a copy takes. It is never drawn inline.
@@ -379,7 +380,16 @@ export interface ToolPlanTreeDetail {
 	tree: PlanTree;
 	view: PlanTreeView;
 	markdown: ToolCappedDetail;
+	/**
+	 * The preview line's labels (measured: they share its line): `more` with `{n}` for the
+	 * children past the first (「还有 {n} 条 ▸」), `one` for a lone first child longer than its
+	 * line (「展开 ▸」). From the adapter's labels, English when absent.
+	 */
+	labels: { more: string; one: string };
 }
+
+/** The preview labels when the adapter injects none (tests, the purity-guarded default). */
+const PLAN_TREE_LABEL_FALLBACKS = { more: "{n} more ▸", one: "Expand ▸" } as const;
 
 /**
  * Defensive ceilings on a read-only AskUserQuestion replay. The tool schema
@@ -965,9 +975,11 @@ interface ClassifyToolDetailFields {
 	hasPendingPermission?: boolean;
 	/**
 	 * Injected chrome labels (the adapter forwards `ctx.labels`). Only the strings
-	 * that participate in MEASUREMENT belong here — currently the ask replay's
+	 * that participate in MEASUREMENT belong here — e.g. the ask replay's
 	 * "Answer:" / "Custom answer:" prefixes, which wrap with their answer text and
-	 * therefore cannot be substituted by the render layer.
+	 * therefore cannot be substituted by the render layer, and an outline plan's
+	 * preview labels (`planTreeDetailsMore` / `planTreeDetailsOne`), which share
+	 * the preview's line.
 	 */
 	labels?: Record<string, string>;
 	/**
@@ -1282,6 +1294,7 @@ function classifyByCategory(
 				metadata,
 				isFailStatus(status) ? nonEmptyTrimmedText(input.denyMessage) : undefined,
 				input.planView,
+				input.labels,
 			);
 		case "pipeline":
 			return classifyPipeline(toolName, inputJson, outputJson, metadata);
@@ -2768,6 +2781,7 @@ function classifyPlan(
 	metadata: Record<string, unknown> | null,
 	denyMessage?: string,
 	planView?: PlanTreeView,
+	labels?: Record<string, string>,
 ): ToolDetailData | null {
 	const planText = extractField(inputJson, "plan") || String(asObject(inputJson)?.plan ?? "");
 	// `hasUsablePlanBody` rejects our own model-facing plan reference. It reaches
@@ -2800,7 +2814,16 @@ function classifyPlan(
 			? parsePlanTree(planText)
 			: null;
 	const body: ToolSectionBody = tree
-		? { kind: "plan-tree", tree, view: planView ?? DEFAULT_PLAN_TREE_VIEW, markdown }
+		? {
+				kind: "plan-tree",
+				tree,
+				view: planView ?? DEFAULT_PLAN_TREE_VIEW,
+				markdown,
+				labels: {
+					more: labels?.planTreeDetailsMore ?? PLAN_TREE_LABEL_FALLBACKS.more,
+					one: labels?.planTreeDetailsOne ?? PLAN_TREE_LABEL_FALLBACKS.one,
+				},
+			}
 		: markdown;
 	// A DENIED plan carries the reviewer's feedback above the body.
 	//

@@ -2,7 +2,8 @@
  * plan-tree.css — an outline plan's tree in its ExitPlanMode card (PlanTreeBody.tsx). Colours
  * and alignment only: every box is sized by the measure (measure-plan-tree.ts), so nothing
  * here may add padding, borders or line boxes that the measure does not count. No hover
- * styles on the tree's arrows, checkboxes or bullets (the outline's frame parts have none).
+ * styles on the tree's arrows, checkboxes, bullets, quick controls or preview lines (the
+ * outline's frame parts have none; the controls are always drawn, for touch too).
  */
 
 .vlist-plan-box {
@@ -36,7 +37,7 @@
 
 .vlist-plan-toggle,
 .vlist-plan-marker,
-.vlist-plan-badge {
+.vlist-plan-subtree {
 	display: flex;
 	align-items: center;
 	box-sizing: border-box;
@@ -51,6 +52,10 @@
 
 .vlist-plan-marker {
 	color: var(--mantine-color-dimmed);
+}
+
+.vlist-plan-row[data-plan-role="notable"] .vlist-plan-marker {
+	color: var(--mantine-color-orange-6);
 }
 
 .vlist-plan-row[data-task-status="doing"] .vlist-plan-marker {
@@ -90,19 +95,29 @@
 	color: var(--vlist-inline-code-fg);
 }
 
-.vlist-plan-badge {
+.vlist-plan-subtree {
 	justify-content: center;
 	cursor: pointer;
+	color: var(--mantine-color-dimmed);
 	user-select: none;
 }
 
-.vlist-plan-badge-chip {
-	width: 100%;
-	text-align: center;
-	line-height: var(--nf-type-xs-line, 17px);
-	border-radius: 9999px;
-	color: var(--mantine-color-gray-light-color);
-	background: var(--mantine-color-gray-light);
+/* The background: the title's paragraph, quieter than the points under it. */
+.vlist-plan-background {
+	color: var(--mantine-color-dimmed);
+}
+
+/* A closed row's preview line: its first child's first line, then 「还有 N 条 ▸」. */
+.vlist-plan-preview {
+	cursor: pointer;
+	color: var(--mantine-color-dimmed);
+	user-select: none;
+	border-radius: var(--mantine-radius-sm);
+}
+
+.vlist-plan-preview-label {
+	color: var(--mantine-color-anchor);
+	white-space: nowrap;
 }
 
 .vlist-plan-more {

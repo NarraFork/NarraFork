@@ -995,13 +995,17 @@ function leafTextRevision(d: Record<string, unknown>): string {
 	// height, but the rows' words, links and chips are painted from the cached payload and can
 	// change at the same count (a display landing on a live patch). Bounded: at most 24 short rows.
 	// An outline plan's tree (plan readability): its rows follow the plan's text (the markdown
-	// it was parsed from) and the reader's view of it (which nodes and texts are open). O(1) in
-	// the plan: the text is sampled, the view is what the reader clicked.
+	// it was parsed from), the reader's view of it (which nodes, subtrees and texts are open) and
+	// the preview labels. O(1) in the plan: the text is sampled, the view is what the reader
+	// clicked.
 	if (d.kind === "plan-tree") {
 		const markdown = d.markdown as { text?: unknown } | undefined;
 		rev += `|ptx:${textSignature(String(markdown?.text ?? ""))}`;
 		const view = d.view as PlanTreeView | undefined;
 		if (view) rev += `|ptv:${planTreeViewSignature(view)}`;
+		// The preview's labels share its line: a different language lays it out again.
+		const labels = d.labels as { more?: unknown; one?: unknown } | undefined;
+		if (labels) rev += `|ptl:${String(labels.more)}|${String(labels.one)}`;
 	}
 	if (d.kind === "change-rows") {
 		rev += `|chg:${textSignature(JSON.stringify(d.rows ?? []))}`;

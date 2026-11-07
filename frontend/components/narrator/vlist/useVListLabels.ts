@@ -151,8 +151,9 @@ export interface VListRenderLabels {
 			outputChars: (chars: number) => string;
 		};
 		/**
-		 * An outline plan's tree (ExitPlanMode of an outline session): its toolbar line, folds
-		 * and clamped texts. Render-only: each sits in a fixed line or a tooltip.
+		 * An outline plan's tree (ExitPlanMode of an outline session): its toolbar line, folds,
+		 * quick controls and clamped texts. Render-only: each sits in a fixed line or a tooltip
+		 * (the preview's measured labels are the adapter's `planTreeDetails*`).
 		 */
 		planTree: PlanTreeLabels;
 	};
@@ -433,6 +434,9 @@ export function useVListLabels(): VListLabels {
 			liveOutputChars: t("liveOutputChars", { count: COUNT_PLACEHOLDER }),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
+			// An outline plan's preview line (「还有 N 条 ▸」): measured, it shares the line.
+			planTreeDetailsMore: t("outlinePlan.tree.detailsMore", { n: "{n}" }),
+			planTreeDetailsOne: t("outlinePlan.tree.detailsOne"),
 			specProtectedBadge: t("specProtectedBadge"),
 			specGoalAddedBadge: t("specGoalAddedBadge"),
 			specGoalExistsBadge: t("specGoalExistsBadge"),
@@ -842,7 +846,10 @@ export function useVListLabels(): VListLabels {
 					collapseAll: t("outlinePlan.tree.collapseAll"),
 					expand: t("outlinePlan.tree.expand"),
 					collapse: t("outlinePlan.tree.collapse"),
-					hidden: (count: number) => t("outlinePlan.tree.hidden", { count }),
+					altHint: t("outlinePlan.tree.altHint"),
+					subtreeExpand: t("outlinePlan.tree.subtreeExpand"),
+					subtreeCollapse: t("outlinePlan.tree.subtreeCollapse"),
+					showDetails: t("outlinePlan.tree.showDetails"),
 					showWhole: t("outlinePlan.tree.showWhole"),
 					showLess: t("outlinePlan.tree.showLess"),
 					more: (count: number) => t("outlinePlan.tree.more", { count }),

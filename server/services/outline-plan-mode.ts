@@ -13,8 +13,9 @@
  *      rendering goes into `input.plan` (the card shows it as before), the submission (root, seq,
  *      the version compared with, the diff's counts) into `_planRoot`, `_planSeq`, `_planBaseSeq`,
  *      `_planDiff`. It then waits for a person as every ExitPlanMode does. A model's fresh call
- *      whose plan is not laid out in levels (plan readability: the root a title, every block one
- *      short point) is refused first, naming the blocks to fix: nothing waits, nothing is written.
+ *      whose plan is not in the plan format (plan readability: a title, a background paragraph,
+ *      points with their details, the notable points last) is refused first, naming the blocks
+ *      to fix: nothing waits, nothing is written.
  *   4. The person decides on the card through `POST /narrators/permissions/:id/plan`
  *      ({@link decideOutlinePlanRequest}): the outline is written first (`decideOutlinePlan`),
  *      then the request is resolved. A refused write (409, 403) leaves the request waiting.
@@ -338,7 +339,7 @@ export async function resolveOutlineExitPlanInput(
 		rootRef,
 		summary: summaryText,
 		review,
-		// Only a model's fresh call is held to the plan's layout (plan readability): a call restored
+		// Only a model's fresh call is held to the plan format (plan readability): a call restored
 		// from what was persisted, or one the review gate handed on, is in front of a person already.
 		checkStructure: !persisted && !handed,
 	});

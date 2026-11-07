@@ -1,19 +1,28 @@
 /**
- * ExitPlanMode refuses an outline plan that is not laid out in levels (plan readability): the
- * refusal names the blocks to fix and how, in the session's language; nothing waits for a person
- * and nothing is written (the root's plan state, version and the space's commits stay as they
- * were); a fixed plan then submits. A call restored from what was persisted is not refused (a
- * person has it in front of them), the notes written for the agent under the root do not count,
- * and the root EnterPlanMode makes is a title the check accepts.
+ * ExitPlanMode refuses an outline plan that is not in the plan format (plan readability: a
+ * one-line title, a background paragraph as the root's first block, big and small points one
+ * idea each with their implementation details under them, the notable points last): the refusal
+ * names the blocks to fix and how, in the session's language; nothing waits for a person and
+ * nothing is written (the root's plan state, version and the space's commits stay as they were);
+ * a fixed plan then submits. A call restored from what was persisted is not refused (a person
+ * has it in front of them), the notes written for the agent under the root do not count, and the
+ * root EnterPlanMode makes is a title the check accepts.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { OUTLINE_PLAN_STRUCTURE } from "@shared/outline-plan-structure";
+import { NOTABLE_POINTS_TITLE, OUTLINE_PLAN_STRUCTURE } from "@shared/outline-plan-structure";
 import { db } from "../../db";
 import { narrators, users } from "../../db/schema";
+import { enterPlanModeTool, exitPlanModeTool } from "../../lib/agent/tools/plan-mode";
 import { generateId } from "../../lib/id";
-import { getOutlinePlanReturnedNote, getOutlinePlanReviewTitle } from "../../lib/prompt-i18n";
+import {
+	getOutlinePlanEnterOutput,
+	getOutlinePlanModeSystemReminder,
+	getOutlinePlanReturnedNote,
+	getOutlinePlanReviewPrompt,
+	getOutlinePlanReviewTitle,
+} from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { resolveExitPlanModeInput } from "../narrator-permission";
 import { pendingPermissions } from "../narrator-session-state";
@@ -24,7 +33,7 @@ import { type OutlineOp, writeOutline } from "../outline/write";
 import { enterOutlinePlanMode, resolveOutlineExitPlanInput } from "../outline-plan-mode";
 
 const NOW = "2026-11-07T00:00:00.000Z";
-const { rootChars, blockChars, maxChildren } = OUTLINE_PLAN_STRUCTURE;
+const { rootChars, backgroundChars, pointChars, detailChars, maxChildren } = OUTLINE_PLAN_STRUCTURE;
 
 beforeEach(() => {
 	settings.outline.enabled = true;
@@ -98,6 +107,19 @@ async function snapshot(spaceId: string, rootId: string) {
 	};
 }
 
+const BACKGROUND =
+	"模型历史、工具结果回放和会话恢复读历史超过 10 秒就直接拒绝，慢磁盘上的会话会莫名失败。这次把固定时间拒绝改成告警，读取照常完成。";
+
+/** The background paragraph, first under the root. */
+function backgroundOp(rootId: string): OutlineOp {
+	return {
+		op: "insert",
+		parent: { id: rootId },
+		position: { first: true },
+		content: BACKGROUND,
+	};
+}
+
 /** The plan from the owner's screenshot: the goal and the acceptance in the root, long bullets. */
 async function writeWallOfText(id: string, owner: string, rootId: string) {
 	const long = `把历史读取的十秒固定拒绝改成告警，${"涉及模型历史链路、工具结果回放和压缩恢复，".repeat(14)}`;
@@ -119,7 +141,7 @@ async function writeWallOfText(id: string, owner: string, rootId: string) {
 	]);
 }
 
-describe("a plan not laid out in levels is refused", () => {
+describe("a plan not in the format is refused", () => {
 	test("the refusal names each block and how to fix it; nothing waits and nothing is written", async () => {
 		const { id, owner, root, space } = await planning();
 		await writeWallOfText(id, owner, root.blockId);
@@ -128,13 +150,19 @@ describe("a plan not laid out in levels is refused", () => {
 		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
 		expect(resolved?.ok).toBe(false);
 		const message = resolved && !resolved.ok ? resolved.message : "";
-		expect(message).toContain(`计划 \`${root.address}\` 的层次还不清楚，这次没有提交给用户`);
+		expect(message).toContain(`计划 \`${root.address}\` 还不符合计划格式，这次没有提交给用户`);
 		expect(message).toContain(`\`${root.address}\`（计划根）有 `);
 		expect(message).toContain("、3 行：根只写一行短标题（不超过 80 字）");
+		expect(message).toContain(
+			`\`${space.key}/BoundsAa\` 是根下第一块，但它下面挂着子块：背景只是一段话，不挂子块`,
+		);
 		expect(message).toContain(`\`${space.key}/LongTxt1\` 有 311 字`);
-		expect(message).toContain("一块只写一个要点（不超过 300 字），把说明拆成它下面的子块");
+		expect(message).toContain(
+			"大点、小点各只写一个要点（不超过 120 字），说明写成它下面的实施细节",
+		);
+		expect(message).toContain("计划格式：根是一行标题；根下第一块是背景（一段话）");
+		expect(message).toContain(`最后一块是「${NOTABLE_POINTS_TITLE["zh-CN"]}」`);
 		expect(message).toContain("用 OutlineEdit 改好后再调用 ExitPlanMode");
-		expect(message).toContain("阶段 → 任务 → 细节");
 		// The input keeps no submission: no `_plan*` keys, no rendering.
 		expect(resolved?.input).not.toHaveProperty("_planRoot");
 		expect(resolved?.input).not.toHaveProperty("plan");
@@ -151,34 +179,96 @@ describe("a plan not laid out in levels is refused", () => {
 		expect(resolved.ok).toBe(false);
 		if (resolved.ok) return;
 		expect(resolved.message).toContain(
-			`The plan \`${root.address}\` is not laid out in levels yet; nothing was submitted to the user`,
+			`The plan \`${root.address}\` does not follow the plan format yet; nothing was submitted to the user`,
 		);
 		expect(resolved.message).toContain(
 			`\`${root.address}\` (the plan root) has 36 characters on 3 lines`,
 		);
+		expect(resolved.message).toContain(
+			`\`${space.key}/BoundsAa\` is the root's first block but has blocks under it`,
+		);
 		expect(resolved.message).toContain(`\`${space.key}/LongTxt1\` has `);
-		expect(resolved.message).toContain(`at most ${blockChars} characters`);
+		expect(resolved.message).toContain(`a big or small point is one idea (at most ${pointChars}`);
 		expect(resolved.message).toContain("call ExitPlanMode again");
 		expect(await snapshot(space.id, root.blockId)).toEqual(before);
 	});
 
-	test("a flat level is refused by its block; fixed, the same plan submits", async () => {
+	test("a plan with no background is refused by its root; with one, it submits", async () => {
+		const { id, owner, root } = await planning();
+		await agentWrite(id, owner, [
+			{ op: "insert", parent: { id: root.blockId }, content: "阶段 1", task: { status: "todo" } },
+		]);
+		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		expect(refused && !refused.ok && refused.message).toContain(
+			"是根下第一块，但它是任务：根下第一块必须是背景",
+		);
+		await agentWrite(id, owner, [backgroundOp(root.blockId)]);
+		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		expect(resolved?.ok).toBe(true);
+	});
+
+	test("a background longer than its limit is refused as one", async () => {
 		const { id, owner, root, space } = await planning();
+		await agentWrite(id, owner, [
+			{
+				op: "insert",
+				sid: "BackGrnd",
+				parent: { id: root.blockId },
+				content: "景".repeat(backgroundChars + 5),
+			},
+		]);
+		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
+		expect(refused && !refused.ok && refused.message).toContain(
+			`\`${space.key}/BackGrnd\` (the background) has ${backgroundChars + 5} characters: keep it one concise paragraph (at most ${backgroundChars} characters)`,
+		);
+	});
+
+	test("the notable points must come last; moved there, the plan submits", async () => {
+		const { id, owner, root, space } = await planning();
+		const written = await agentWrite(id, owner, [
+			backgroundOp(root.blockId),
+			{
+				op: "insert",
+				tempId: "n",
+				sid: "Notable1",
+				parent: { id: root.blockId },
+				content: NOTABLE_POINTS_TITLE["zh-CN"],
+			},
+			{ op: "insert", parent: { tempId: "n" }, content: "错误码保留一个版本" },
+			{ op: "insert", parent: { id: root.blockId }, content: "阶段 1", task: { status: "todo" } },
+		]);
+		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		expect(refused && !refused.ok && refused.message).toContain(
+			`\`${space.key}/Notable1\`（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）不是根下最后一块：把它移到最后`,
+		);
+		await agentWrite(id, owner, [
+			{
+				op: "move",
+				block: { id: written.results[1]?.blockId as string },
+				parent: { id: root.blockId },
+			},
+		]);
+		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		expect(resolved?.ok).toBe(true);
+	});
+
+	test("a flat level is refused by its block; grouped, the same plan submits", async () => {
+		const { id, owner, root } = await planning();
 		const steps: OutlineOp[] = Array.from({ length: maxChildren + 2 }, (_, i) => ({
 			op: "insert",
 			parent: { id: root.blockId },
 			content: `步骤 ${i + 1}`,
 			task: { status: "todo" },
 		}));
-		const written = await agentWrite(id, owner, steps);
+		const written = await agentWrite(id, owner, [backgroundOp(root.blockId), ...steps]);
 		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
 		expect(refused?.ok).toBe(false);
 		expect(refused && !refused.ok && refused.message).toContain(
-			`\`${root.address}\` 下面直接有 ${maxChildren + 2} 块：按阶段或主题分组，一层不超过 ${maxChildren} 块`,
+			`\`${root.address}\` 下面直接有 ${maxChildren + 3} 块：按阶段或主题分组，一层不超过 ${maxChildren} 块`,
 		);
 
 		// Grouped into two phases: accepted, and the submission is the plan as of now.
-		const ids = written.results.map((r) => r.blockId);
+		const ids = written.results.slice(1).map((r) => r.blockId);
 		await agentWrite(id, owner, [
 			{ op: "insert", tempId: "p1", parent: { id: root.blockId }, content: "阶段 1" },
 			{ op: "insert", tempId: "p2", parent: { id: root.blockId }, content: "阶段 2" },
@@ -196,36 +286,68 @@ describe("a plan not laid out in levels is refused", () => {
 			mode: "outline",
 			_planRoot: { address: root.address },
 		});
-		expect(space.key).toBeTruthy();
 	});
 
 	test("more problems than listed are counted", async () => {
 		const { id, owner, root } = await planning();
-		await agentWrite(
-			id,
-			owner,
-			Array.from(
+		await agentWrite(id, owner, [
+			backgroundOp(root.blockId),
+			...Array.from(
 				{ length: 11 },
 				(): OutlineOp => ({
 					op: "insert",
 					parent: { id: root.blockId },
-					content: "x".repeat(blockChars + 1),
+					content: "x".repeat(pointChars + 1),
 				}),
 			),
-		);
+		]);
 		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
 		const message = refused && !refused.ok ? refused.message : "";
-		expect(message.match(/has 301 characters/g)?.length).toBe(8);
+		expect(message.match(new RegExp(`has ${pointChars + 1} characters`, "g"))?.length).toBe(8);
 		expect(message).toContain("- 3 more like these.");
 	});
 });
 
+describe("a plan in the format", () => {
+	test("title, background, points, long details, notable points: submits", async () => {
+		const { id, owner, root } = await planning();
+		await agentWrite(id, owner, [
+			backgroundOp(root.blockId),
+			{
+				op: "insert",
+				tempId: "p1",
+				parent: { id: root.blockId },
+				content: "阶段 1：去掉固定时间拒绝",
+				task: { status: "todo" },
+			},
+			{
+				op: "insert",
+				tempId: "s1",
+				parent: { tempId: "p1" },
+				content: "清除模型历史链路的固定时间拒绝",
+				task: { status: "todo" },
+			},
+			// A detail may be longer than a point: it is folded behind one line.
+			{ op: "insert", parent: { tempId: "s1" }, content: "细".repeat(detailChars) },
+			{
+				op: "insert",
+				tempId: "n",
+				parent: { id: root.blockId },
+				content: NOTABLE_POINTS_TITLE["zh-CN"],
+			},
+			{ op: "insert", parent: { tempId: "n" }, content: "错误码保留一个版本" },
+		]);
+		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		expect(resolved?.ok).toBe(true);
+	});
+});
+
 describe("what is not refused", () => {
-	test("a call restored from what was persisted is not held to the layout", async () => {
+	test("a call restored from what was persisted is not held to the format", async () => {
 		const { id, owner, root } = await planning();
 		// A plan submitted before the rule existed, waiting for a person since.
 		await agentWrite(id, owner, [
-			{ op: "insert", parent: { id: root.blockId }, content: "说".repeat(blockChars + 10) },
+			{ op: "insert", parent: { id: root.blockId }, content: "说".repeat(backgroundChars + 10) },
 		]);
 		const fresh = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
 		expect(fresh?.ok).toBe(false);
@@ -252,6 +374,16 @@ describe("what is not refused", () => {
 		const { id, owner, root } = await planning();
 		const feedback = "请把阶段拆细。".repeat(80);
 		await agentWrite(id, owner, [
+			backgroundOp(root.blockId),
+			...Array.from(
+				{ length: maxChildren - 1 },
+				(_, i): OutlineOp => ({
+					op: "insert",
+					parent: { id: root.blockId },
+					content: `Step ${i}`,
+					task: { status: "todo" },
+				}),
+			),
 			{
 				op: "insert",
 				parent: { id: root.blockId },
@@ -264,22 +396,15 @@ describe("what is not refused", () => {
 				content: getOutlinePlanReviewTitle("en", 1),
 			},
 			{ op: "insert", parent: { tempId: "rv" }, content: "c".repeat(900) },
-			...Array.from(
-				{ length: maxChildren },
-				(_, i): OutlineOp => ({
-					op: "insert",
-					parent: { id: root.blockId },
-					content: `Step ${i}`,
-				}),
-			),
 		]);
 		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "en");
 		expect(resolved?.ok).toBe(true);
 	});
 
-	test("the root EnterPlanMode makes from a long plan_name is a title the layout accepts", async () => {
-		const { id, root } = await planning(`${"很长的计划名".repeat(30)}`);
+	test("the root EnterPlanMode makes from a long plan_name is a title the format accepts", async () => {
+		const { id, owner, root } = await planning(`${"很长的计划名".repeat(30)}`);
 		expect(Array.from(root.title).length).toBe(rootChars);
+		await agentWrite(id, owner, [backgroundOp(root.blockId)]);
 		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
 		expect(resolved?.ok).toBe(true);
 	});
@@ -294,5 +419,65 @@ describe("notes for the agent", () => {
 		expect(isPlanNoteBlock({ content: "Returned the parcel" })).toBe(false);
 		expect(isPlanNoteBlock({ content: "阶段 1：退回意见（第 1 版）" })).toBe(false);
 		expect(isPlanNoteBlock({ content: null })).toBe(false);
+	});
+});
+
+describe("the prompts state the format with the check's numbers", () => {
+	test("the plan-mode system prompt, in both languages, with an example; constant text", () => {
+		const zh = getOutlinePlanModeSystemReminder("zh-CN", { address: "k/AbCdEfGh" }, false);
+		for (const part of [
+			`计划根：一行短标题（不超过 ${rootChars} 字）`,
+			`根下第一块：背景。一段话（不超过 ${backgroundChars} 字），不是任务，下面不挂子块`,
+			"审批人同时跟着很多任务，对这个项目只是大概了解",
+			`大点、小点各只写一个要点（不超过 ${pointChars} 字）`,
+			`每条一个子块（不超过 ${detailChars} 字）`,
+			`根下最后一块：「${NOTABLE_POINTS_TITLE["zh-CN"]}」`,
+			`     - ${NOTABLE_POINTS_TITLE["zh-CN"]}\n`,
+			"不符合格式的计划，ExitPlanMode 会拒收",
+		])
+			expect([part, zh.includes(part)]).toEqual([part, true]);
+		const en = getOutlinePlanModeSystemReminder("en", { address: "k/AbCdEfGh" }, false);
+		for (const part of [
+			`a short one-line title (at most ${rootChars} characters)`,
+			`The root's first block: the background. One paragraph (at most ${backgroundChars} characters), not a task, with nothing under it.`,
+			"The approver tracks many tasks at once and knows this project only roughly",
+			`A big or small point is one idea (at most ${pointChars} characters)`,
+			`one child block each (at most ${detailChars} characters)`,
+			`The root's last block: "${NOTABLE_POINTS_TITLE.en}"`,
+			`     - ${NOTABLE_POINTS_TITLE.en}\n`,
+		])
+			expect([part, en.includes(part)]).toEqual([part, true]);
+		// The v1 sections are gone; the text does not change between turns.
+		expect(zh).not.toContain("边界与取舍");
+		expect(en).not.toContain("Boundaries and trade-offs");
+		expect(getOutlinePlanModeSystemReminder("zh-CN", { address: "k/AbCdEfGh" }, false)).toBe(zh);
+	});
+
+	test("the tools' text and EnterPlanMode's answer", () => {
+		const exit = exitPlanModeTool.description;
+		expect(exit).toContain(
+			`The root's first block is the background: one concise paragraph (at most ${backgroundChars} characters`,
+		);
+		expect(exit).toContain(
+			`"${NOTABLE_POINTS_TITLE.en}" (「${NOTABLE_POINTS_TITLE["zh-CN"]}」 in Chinese)`,
+		);
+		expect(exit).toContain(`at most ${pointChars} characters); a detail at most ${detailChars}`);
+		expect(enterPlanModeTool.description).toContain(
+			"the background paragraph goes in the first block under it",
+		);
+		const root = { address: "k/AbCdEfGh", title: "导入器", version: 1 };
+		expect(getOutlinePlanEnterOutput("zh-CN", root, "created")).toContain("第一块是背景（一段话）");
+		expect(getOutlinePlanEnterOutput("en", root, "created")).toContain(
+			"the background paragraph first",
+		);
+		const review = getOutlinePlanReviewPrompt("zh-CN", {
+			requestId: "r1",
+			address: "k/AbCdEfGh",
+			version: 1,
+			summary: null,
+			plan: "- [ ] 导入器",
+			limits: { comments: 5, chars: 300 },
+		});
+		expect(review).toContain(`风险和不可逆的步骤是否写进了「${NOTABLE_POINTS_TITLE["zh-CN"]}」`);
 	});
 });

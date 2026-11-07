@@ -279,7 +279,7 @@ export interface OutlineReadRequest extends OutlineReadOptions {
 	/**
 	 * Also return the tree read (`tree`): its blocks with their content, as far as the budget
 	 * loaded them (all of them when the read is not `truncated`). The plan submission checks the
-	 * plan's layout on it (plan readability).
+	 * plan's format on it (plan readability).
 	 */
 	withTree?: boolean;
 }

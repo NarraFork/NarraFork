@@ -232,6 +232,13 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 				content: "Step B",
 				task: { status: "todo" },
 			},
+			// The plan format's background, first under the root (plan readability).
+			{
+				op: "insert",
+				parent: { id: root?.blockId as string },
+				position: { first: true },
+				content: "The importer fails every night and is rerun by hand.",
+			},
 		],
 		actor: { kind: "agent", id },
 		responsibleUserId: owner,
@@ -362,13 +369,14 @@ test("the card's summary and diff; an edit by the person shows live; a change by
 	const plan = await waitingPlan();
 	const { page, errors } = await openCard(plan.permission);
 	expect(await call(page, (f) => f.text("[data-testid=outline-plan-summary]"))).toBe(
-		"Version 1 · a new plan of 3 blocks",
+		"Version 1 · a new plan of 4 blocks",
 	);
 	expect(await call(page, (f) => f.clickButton("View changes"))).toBe(true);
-	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 3);
+	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 4);
 	const shown = await call(page, (f) => f.entries());
 	expect(shown[0]).toContain("Ship the importer");
-	expect(shown[1]).toContain("Step A");
+	expect(shown[1]).toContain("rerun by hand");
+	expect(shown[2]).toContain("Step A");
 	await waitFor("the page subscription", () => subscribedPages.has(plan.pageId));
 
 	// The person rewrites a step in the outline beside the session: the open diff follows.
@@ -470,7 +478,7 @@ test("a plan review's comments lead the summary and the diff, left out of its ch
 		(f.text("[data-testid=outline-plan-summary]") ?? "").startsWith("v1"),
 	);
 	expect(await call(page, (f) => f.text("[data-testid=outline-plan-summary]"))).toBe(
-		"v1 · new · +3",
+		"v1 · new · +4",
 	);
 	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review-count]"))).toBe("2");
 	expect(
@@ -483,7 +491,7 @@ test("a plan review's comments lead the summary and the diff, left out of its ch
 	expect(await call(page, (f) => f.overflowsX())).toBe(false);
 
 	expect(await call(page, (f) => f.click("[data-testid=outline-plan-view-changes]"))).toBe(true);
-	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 3);
+	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 4);
 	// The comments first, each with the step it is about; the diff's changes are the plan's own.
 	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review]"))).toContain(
 		"Plan review (version 1)",

@@ -2159,7 +2159,6 @@ export function RenderToolBody({
 				frames={frame.blocks}
 				availableWidth={contentWidth}
 				height={height}
-				all={model.view.all}
 				labels={labels.planTree}
 				onPlanTree={onPlanTree}
 			/>

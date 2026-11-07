@@ -1,31 +1,49 @@
 /**
  * PlanTreeBody.tsx — paints an outline plan's tree in its ExitPlanMode card (plan readability),
- * at the geometry `measure-plan-tree.ts` laid out: the toolbar line (what the overview shows,
- * 「全部展开」/「全部收起」), then the rows in the plan's box. Every row sits where the measure
- * put it; its text is laid out again from the same prepared flows at the same width, line by
- * line, and only as many lines as were measured are drawn (a clamped text's last line narrower,
- * by the ellipsis's width, so the ellipsis fits on it). Nothing here changes a height.
+ * at the geometry `measure-plan-tree.ts` laid out: the toolbar line (the plan's size,
+ * 「全部展开」/「全部收起」), then the rows in the plan's box — the title, the background paragraph
+ * under it, the points, each closed row's preview line (its first child's first line and
+ * 「还有 N 条 ▸」). Every row sits where the measure put it; its text is laid out again from the
+ * same prepared flows at the same width, line by line, and only as many lines as were measured
+ * are drawn (a clamped text's last line, and a preview's line, narrower by the ellipsis and the
+ * label, so they fit on it). Nothing here changes a height.
  *
- * The fold arrow, the child-count badge and a clamped text are the controls; each calls
- * `onPlanTree`, which flips the reader's view in the list's interaction state (the card is then
- * measured again). They are plain elements with `role="button"` (a native button's chrome is
- * not in the measure), and none of them has a hover style.
+ * The controls, each calling `onPlanTree` (the list's interaction state flips, the card is
+ * measured again):
+ *   - the fold arrow opens or closes the node; Alt+click (Alt+Enter / Alt+Space) on it expands or
+ *     collapses everything inside it, as outliners do;
+ *   - the quick control at the right of a row with something folded inside does the same as
+ *     Alt+click, for touch and for a reader who does not know the gesture;
+ *   - a preview line opens everything inside its node (the small point's details, each whole);
+ *   - a clamped text shows whole, and clamps again.
+ * The arrow and the quick control are native buttons sized by the measure's slots; the preview
+ * and the text are `role="button"` boxes (a native button's chrome is not in the measure). None
+ * has a hover style: they are always drawn, and focus shows them as every button in the list.
  */
 import {
 	layoutNextRichInlineLineRange,
 	materializeRichInlineLineRange,
+	type PreparedRichInline,
 	type RichInlineCursor,
 } from "@chenglou/pretext/rich-inline";
 import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
+import { IconFoldDown, IconFoldUp } from "@tabler/icons-react";
+import type React from "react";
 import { Fragment, useMemo } from "react";
 import { FOLD_ICONS, TASK_ICONS } from "../../../outline/outline-icons";
-import type { PlanTreeLayout, PlanTreeRowLayout } from "../measure/measure-plan-tree";
+import type {
+	PlanTreeLayout,
+	PlanTreePreparedLine,
+	PlanTreeRowLayout,
+} from "../measure/measure-plan-tree";
 import {
 	PLAN_TREE_ELLIPSIS,
 	PLAN_TREE_MARKER_GAP,
 	PLAN_TREE_PAD_X,
 	PLAN_TREE_PAD_Y,
+	PLAN_TREE_PREVIEW_LABEL_GAP,
+	PLAN_TREE_SUBTREE_SLOT,
 	PLAN_TREE_TOGGLE_SLOT,
 	planTreeIconPx,
 } from "../measure/measure-plan-tree";
@@ -44,29 +62,65 @@ export interface PlanTreeLabels {
 	collapseAll: string;
 	expand: string;
 	collapse: string;
-	hidden: (count: number) => string;
+	/** What Alt+click on the arrow does (the arrow's tooltip). */
+	altHint: string;
+	/** The quick control: everything inside this node. */
+	subtreeExpand: string;
+	subtreeCollapse: string;
+	/** A preview line's name for assistive technology. */
+	showDetails: string;
 	showWhole: string;
 	showLess: string;
 	more: (count: number) => string;
 }
 
 export const DEFAULT_PLAN_TREE_LABELS: PlanTreeLabels = {
-	overview: (count) => `Outline · two levels by default · ${count} blocks`,
+	overview: (count) => `Outline · ${count} blocks`,
 	overviewAll: (count) => `Outline · all ${count} blocks shown`,
 	expandAll: "Expand all",
 	collapseAll: "Collapse all",
 	expand: "Expand",
 	collapse: "Collapse",
-	hidden: (count) => `${count} items inside`,
+	altHint: "Alt+click: everything inside",
+	subtreeExpand: "Expand everything inside",
+	subtreeCollapse: "Collapse everything inside",
+	showDetails: "Show the details",
 	showWhole: "Show the whole text",
 	showLess: "Show less",
 	more: (count) => `${count} more blocks: open the plan in the outline to see them`,
 };
 
+interface PaintedFragment {
+	text: string;
+	font: string;
+	className: string;
+	gapBefore: number;
+}
+
 interface PaintedLine {
 	top: number;
-	fragments: Array<{ text: string; font: string; className: string; gapBefore: number }>;
+	fragments: PaintedFragment[];
 	ellipsis: boolean;
+}
+
+/** One visual line of a prepared flow at `width`, from `cursor`. */
+function nextLine(
+	line: PlanTreePreparedLine & { flow: PreparedRichInline },
+	width: number,
+	cursor: RichInlineCursor | undefined,
+): { fragments: PaintedFragment[]; end: RichInlineCursor } | null {
+	const range = layoutNextRichInlineLineRange(line.flow, Math.max(1, width), cursor);
+	if (!range) return null;
+	const materialized = materializeRichInlineLineRange(line.flow, range);
+	return {
+		end: range.end,
+		fragments: materialized.fragments.map((f) => ({
+			text: f.text,
+			font: line.fonts[f.itemIndex] ?? "",
+			className: line.classNames[f.itemIndex] ?? "",
+			gapBefore: f.gapBefore,
+		})),
+	};
 }
 
 /** The visual lines a row draws: as many as measured, the clamped last one narrower. */
@@ -79,31 +133,67 @@ function paintRow(row: PlanTreeRowLayout, lineHeight: number, ellipsisWidth: num
 		for (let k = 0; k < shown; k++) {
 			const top = entry.top + k * lineHeight;
 			const ellipsis = row.clamped && lastEntry && k === shown - 1;
-			if (!line.flow) {
+			const flow = line.flow;
+			const next = flow
+				? nextLine({ ...line, flow }, row.textWidth - (ellipsis ? ellipsisWidth : 0), cursor)
+				: null;
+			if (!next) {
 				out.push({ top, fragments: [], ellipsis });
 				continue;
 			}
-			const width = Math.max(1, row.textWidth - (ellipsis ? ellipsisWidth : 0));
-			const range = layoutNextRichInlineLineRange(line.flow, width, cursor);
-			if (!range) {
-				out.push({ top, fragments: [], ellipsis });
-				continue;
-			}
-			cursor = range.end;
-			const materialized = materializeRichInlineLineRange(line.flow, range);
-			out.push({
-				top,
-				ellipsis,
-				fragments: materialized.fragments.map((f) => ({
-					text: f.text,
-					font: line.fonts[f.itemIndex] ?? "",
-					className: line.classNames[f.itemIndex] ?? "",
-					gapBefore: f.gapBefore,
-				})),
-			});
+			cursor = next.end;
+			out.push({ top, ellipsis, fragments: next.fragments });
 		}
 	});
 	return out;
+}
+
+function Fragments({ fragments }: { fragments: readonly PaintedFragment[] }) {
+	return (
+		<>
+			{fragments.map((frag, fi) => (
+				<Fragment
+					// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+					key={fi}
+				>
+					<FragmentGap gapBefore={frag.gapBefore} />
+					<span
+						className={frag.className}
+						style={fragmentTextStyle({
+							font: frag.font,
+							gapBefore: frag.gapBefore,
+							letterSpacing: letterSpacingForFont(frag.font),
+						})}
+					>
+						{frag.text}
+					</span>
+				</Fragment>
+			))}
+		</>
+	);
+}
+
+function Ellipsis() {
+	const font = typographyMetrics().font.body;
+	return (
+		<span
+			className="vlist-frag vlist-plan-dim"
+			data-plan-ellipsis=""
+			style={fragmentTextStyle({ font, letterSpacing: letterSpacingForFont(font) })}
+		>
+			{PLAN_TREE_ELLIPSIS}
+		</span>
+	);
+}
+
+/** Alt+Enter / Alt+Space on the arrow: everything inside, as Alt+click. */
+function onArrowKey(subtree: () => void) {
+	return (e: React.KeyboardEvent) => {
+		if (!e.altKey || (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar")) return;
+		e.preventDefault();
+		e.stopPropagation();
+		subtree();
+	};
 }
 
 function PlanTreeRow({
@@ -121,9 +211,16 @@ function PlanTreeRow({
 		() => paintRow(row, layout.lineHeight, layout.ellipsisWidth),
 		[row, layout.lineHeight, layout.ellipsisWidth],
 	);
+	const preview = useMemo(() => {
+		const p = row.preview;
+		if (!p?.line.flow) return [];
+		return nextLine({ ...p.line, flow: p.line.flow }, p.width, undefined)?.fragments ?? [];
+	}, [row.preview]);
 	const lineHeight = layout.lineHeight;
 	const icon = planTreeIconPx();
+	const background = row.role === "background";
 	const toggleNode = () => onPlanTree?.({ kind: "node", key: row.key });
+	const toggleSubtree = () => onPlanTree?.({ kind: "subtree", key: row.key });
 	const toggleText = () => {
 		// A drag that selected text is a selection, not a click on the text.
 		if (typeof window !== "undefined" && window.getSelection()?.toString()) return;
@@ -131,10 +228,15 @@ function PlanTreeRow({
 	};
 	const Fold = FOLD_ICONS[row.open ? "expanded" : "collapsed"].Icon;
 	const Task = row.task ? TASK_ICONS[row.task].Icon : null;
+	const arrowLabel = row.open ? labels.collapse : labels.expand;
+	const subtreeLabel = row.subtree === "collapse" ? labels.subtreeCollapse : labels.subtreeExpand;
+	const SubtreeIcon = row.subtree === "collapse" ? IconFoldUp : IconFoldDown;
+	const smallIcon = Math.min(14, Math.max(10, Math.round(typographyMetrics().size.sm)));
 	return (
 		<div
 			data-plan-row={row.key}
 			data-plan-depth={row.depth}
+			data-plan-role={row.role}
 			data-plan-open={row.hasChildren ? (row.open ? "1" : "0") : undefined}
 			data-task-status={row.task ?? undefined}
 			className="vlist-plan-row"
@@ -146,15 +248,16 @@ function PlanTreeRow({
 				height: row.height,
 			}}
 		>
-			{row.hasChildren ? (
+			{row.hasChildren && !background ? (
 				<button
 					type="button"
 					aria-expanded={row.open}
-					aria-label={row.open ? labels.collapse : labels.expand}
-					title={row.open ? labels.collapse : labels.expand}
+					aria-label={arrowLabel}
+					title={`${arrowLabel} · ${labels.altHint}`}
 					data-plan-toggle=""
 					className={`${ROW_BUTTON_CLASS} vlist-plan-toggle`}
-					onClick={toggleNode}
+					onClick={(e) => (e.altKey ? toggleSubtree() : toggleNode())}
+					onKeyDown={onArrowKey(toggleSubtree)}
 					style={{
 						position: "absolute",
 						left: row.left,
@@ -163,22 +266,24 @@ function PlanTreeRow({
 						height: lineHeight,
 					}}
 				>
-					<Fold size={Math.min(14, Math.max(10, Math.round(typographyMetrics().size.sm)))} />
+					<Fold size={smallIcon} />
 				</button>
 			) : null}
-			<span
-				aria-hidden
-				className="vlist-plan-marker"
-				style={{
-					position: "absolute",
-					left: row.left + PLAN_TREE_TOGGLE_SLOT,
-					top: 0,
-					width: icon + PLAN_TREE_MARKER_GAP,
-					height: lineHeight,
-				}}
-			>
-				{Task ? <Task size={icon} /> : <span className="vlist-plan-dot" />}
-			</span>
+			{background ? null : (
+				<span
+					aria-hidden
+					className="vlist-plan-marker"
+					style={{
+						position: "absolute",
+						left: row.left + PLAN_TREE_TOGGLE_SLOT,
+						top: 0,
+						width: icon + PLAN_TREE_MARKER_GAP,
+						height: lineHeight,
+					}}
+				>
+					{Task ? <Task size={icon} /> : <span className="vlist-plan-dot" />}
+				</span>
+			)}
 			<div
 				data-plan-text=""
 				{...(row.textToggles
@@ -191,13 +296,19 @@ function PlanTreeRow({
 							onKeyDown: activateOnKey(toggleText),
 						}
 					: {})}
-				className={row.textToggles ? "vlist-plan-text vlist-plan-text--toggles" : "vlist-plan-text"}
+				className={
+					background
+						? "vlist-plan-text vlist-plan-background"
+						: row.textToggles
+							? "vlist-plan-text vlist-plan-text--toggles mantine-focus-auto"
+							: "vlist-plan-text"
+				}
 				style={{
 					position: "absolute",
 					left: row.textLeft,
 					top: 0,
 					width: row.textWidth,
-					height: row.height,
+					height: row.textHeight,
 				}}
 			>
 				{lines.map((line) => (
@@ -214,60 +325,91 @@ function PlanTreeRow({
 						}}
 					>
 						<LineFragments>
-							{line.fragments.map((frag, fi) => (
-								<Fragment
-									// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-									key={fi}
-								>
-									<FragmentGap gapBefore={frag.gapBefore} />
-									<span
-										className={frag.className}
-										style={fragmentTextStyle({
-											font: frag.font,
-											gapBefore: frag.gapBefore,
-											letterSpacing: letterSpacingForFont(frag.font),
-										})}
-									>
-										{frag.text}
-									</span>
-								</Fragment>
-							))}
-							{line.ellipsis ? (
-								<span
-									className="vlist-frag vlist-plan-dim"
-									data-plan-ellipsis=""
-									style={fragmentTextStyle({
-										font: typographyMetrics().font.body,
-										letterSpacing: letterSpacingForFont(typographyMetrics().font.body),
-									})}
-								>
-									{PLAN_TREE_ELLIPSIS}
-								</span>
-							) : null}
+							<Fragments fragments={line.fragments} />
+							{line.ellipsis ? <Ellipsis /> : null}
 						</LineFragments>
 					</div>
 				))}
 			</div>
-			{row.badge ? (
+			{row.subtree ? (
 				<button
 					type="button"
-					aria-label={`${labels.expand}: ${labels.hidden(row.badge.count)}`}
-					title={labels.hidden(row.badge.count)}
-					data-plan-badge=""
-					className={`${ROW_BUTTON_CLASS} vlist-plan-badge`}
-					onClick={toggleNode}
+					aria-expanded={row.subtree === "collapse"}
+					aria-label={subtreeLabel}
+					title={subtreeLabel}
+					data-plan-subtree={row.subtree}
+					className={`${ROW_BUTTON_CLASS} vlist-plan-subtree`}
+					onClick={toggleSubtree}
 					style={{
 						position: "absolute",
 						right: 0,
 						top: 0,
-						width: row.badge.width,
+						width: PLAN_TREE_SUBTREE_SLOT,
 						height: lineHeight,
-						font: typographyMetrics().font.xs,
-						letterSpacing: letterSpacingForFont(typographyMetrics().font.xs) || undefined,
 					}}
 				>
-					<span className="vlist-plan-badge-chip">{row.badge.text}</span>
+					<SubtreeIcon size={smallIcon} />
 				</button>
+			) : null}
+			{row.preview ? (
+				// biome-ignore lint/a11y/useSemanticElements: a <button> would bring UA button box styles into a measured, fixed-height line
+				<div
+					role="button"
+					tabIndex={0}
+					aria-expanded={false}
+					aria-label={
+						row.preview.label ? `${labels.showDetails}: ${row.preview.label}` : labels.showDetails
+					}
+					data-plan-preview=""
+					className="vlist-plan-preview mantine-focus-auto"
+					onClick={toggleSubtree}
+					onKeyDown={activateOnKey(toggleSubtree)}
+					style={{
+						position: "absolute",
+						left: row.preview.left,
+						top: row.preview.top,
+						right: 0,
+						height: lineHeight,
+						display: "flex",
+						alignItems: "center",
+						overflow: "hidden",
+						whiteSpace: "nowrap",
+					}}
+				>
+					<span
+						data-plan-preview-text=""
+						className="vlist-plan-preview-text"
+						style={{
+							display: "flex",
+							alignItems: "center",
+							maxWidth: row.preview.width,
+							height: lineHeight,
+							overflow: "hidden",
+							flex: "0 1 auto",
+						}}
+					>
+						<LineFragments>
+							<Fragments fragments={preview} />
+						</LineFragments>
+					</span>
+					{row.preview.ellipsis ? <Ellipsis /> : null}
+					{row.preview.label ? (
+						<span
+							data-plan-preview-label=""
+							className="vlist-plan-preview-label"
+							style={{
+								marginLeft: PLAN_TREE_PREVIEW_LABEL_GAP,
+								width: row.preview.labelWidth,
+								flex: "0 0 auto",
+								font: typographyMetrics().font.body,
+								letterSpacing: letterSpacingForFont(typographyMetrics().font.body) || undefined,
+								lineHeight: `${lineHeight}px`,
+							}}
+						>
+							{row.preview.label}
+						</span>
+					) : null}
+				</div>
 			) : null}
 		</div>
 	);
@@ -279,7 +421,6 @@ export function PlanTreeBody({
 	frames,
 	availableWidth,
 	height,
-	all,
 	labels = DEFAULT_PLAN_TREE_LABELS,
 	onPlanTree,
 }: {
@@ -287,8 +428,6 @@ export function PlanTreeBody({
 	frames: readonly BlockFrame[];
 	availableWidth: number;
 	height: number;
-	/** The reader turned everything open (「全部收起」 returns to the overview). */
-	all: boolean;
 	labels?: PlanTreeLabels;
 	onPlanTree?: (action: PlanTreeAction) => void;
 }) {
@@ -301,6 +440,7 @@ export function PlanTreeBody({
 	const toolbarFrame = toolbarIndex >= 0 ? frames[toolbarIndex] : undefined;
 	if (!tree || tree.kind !== "fixed" || !treeFrame) return null;
 	const layout = (tree.data as { layout: PlanTreeLayout }).layout;
+	const all = layout.allOpen;
 	const toggleAll = () => onPlanTree?.({ kind: "all" });
 	const xs = typographyMetrics().line.xs;
 	return (

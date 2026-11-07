@@ -1,4 +1,4 @@
-import { OUTLINE_PLAN_STRUCTURE } from "@shared/outline-plan-structure";
+import { NOTABLE_POINTS_TITLE, OUTLINE_PLAN_STRUCTURE } from "@shared/outline-plan-structure";
 import { z } from "zod/v4";
 import { PLAN_DIR_REL } from "../../plan-file-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
@@ -83,7 +83,7 @@ export const enterPlanModeTool: ToolDefinition = {
 		"- Research task, not implementation planning\n\n" +
 		"## Outline Sessions\n\n" +
 		"When this session keeps its tasks in the outline, the plan is a task tree there, not a file: entering plan mode creates (or resumes) a plan root in the session space and names it. " +
-		"Pass `under` with a task's address to plan beneath it (a goal you are planning for), or `root` to plan an existing task tree again; `plan_name` becomes the root's title (keep it a short one-line title).\n\n" +
+		"Pass `under` with a task's address to plan beneath it (a goal you are planning for), or `root` to plan an existing task tree again; `plan_name` becomes the root's title (keep it a short one-line title; the background paragraph goes in the first block under it).\n\n" +
 		"## Important Notes\n\n" +
 		"- If the user explicitly requires human approval of the plan, set `disableReflectionReview: true`.\n" +
 		"- This tool REQUIRES user approval - they must consent to entering plan mode\n" +
@@ -232,17 +232,18 @@ const EXIT_PLAN_SUMMARY_DESCRIPTION =
 const EXIT_PLAN_ROOT_DESCRIPTION =
 	'With mode "outline": the plan root\'s address, when it is not the one the plan-mode context names.';
 
-/** The layout an outline plan is held to (the numbers ExitPlanMode refuses a plan by). */
+/** The format an outline plan is held to (the numbers ExitPlanMode refuses a plan by). */
 function outlinePlanLayoutRules(): string {
-	const { rootChars, blockChars, maxChildren } = OUTLINE_PLAN_STRUCTURE;
+	const { rootChars, backgroundChars, pointChars, detailChars, maxChildren } =
+		OUTLINE_PLAN_STRUCTURE;
 	return (
-		"An outline plan must read as an outline: the person first sees the root and the two levels under it. " +
-		`The root is a short one-line title (at most ${rootChars} characters), never the goal or the acceptance; ` +
-		"write the goal, the acceptance and the boundaries as blocks under it, one point per child block; " +
-		"put the steps in levels (phases → tasks → details). " +
-		`Each block is one short point (at most ${blockChars} characters): split a longer explanation into child blocks, ` +
-		`and group a level that would have more than ${maxChildren} blocks. ` +
-		"A plan that breaks these is refused with the blocks to fix; fix them with OutlineEdit and call ExitPlanMode again.\n\n"
+		"An outline plan follows one format, read top-down by an approver who tracks many tasks and knows the project only roughly. " +
+		`The root is a short one-line title (at most ${rootChars} characters). ` +
+		`The root's first block is the background: one concise paragraph (at most ${backgroundChars} characters; not a task, nothing under it) that brings back what this work is and why, and leads into the plan. ` +
+		"Then the big points (phases or workstreams), each with its small points (tasks), each small point with its implementation details as child blocks (the person sees one line of them until they open them). " +
+		`A big or small point is one idea (at most ${pointChars} characters); a detail at most ${detailChars} characters; at most ${maxChildren} blocks on one level. ` +
+		`The root's last block is "${NOTABLE_POINTS_TITLE.en}" (「${NOTABLE_POINTS_TITLE["zh-CN"]}」 in Chinese), with risks, irreversible steps and what the approver must look at as its children; leave it out only when there is truly nothing. ` +
+		"A plan that breaks the format is refused with the blocks to fix; fix them with OutlineEdit and call ExitPlanMode again.\n\n"
 	);
 }
 

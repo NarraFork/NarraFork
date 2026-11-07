@@ -1,24 +1,28 @@
 /**
  * measure-plan-tree.ts — an outline plan's tree in its ExitPlanMode card (plan readability).
  *
- *   ┌ toolbar (one xs line, only when something is folded or the reader opened something) ─┐
- *   │ 「两层大纲 · 共 38 块」                                         「全部展开」/「全部收起」 │
- *   ├ box (min(rows + padding, cap), scrolls past the cap) ─────────────────────────────────┤
- *   │ ▾ ☐ Root title (bold)                                                                │
- *   │   ▾ • Phase (medium)                                                                 │
- *   │       ▸ ☐ Task, its text clamped to two lines when longer…                    [+3]  │
- *   │       • Detail                                                                       │
- *   └──────────────────────────────────────────────────────────────────────────────────────┘
+ *   ┌ toolbar (one xs line, only when something is folded or clamped, or the reader changed it) ┐
+ *   │ 「大纲 · 共 38 块」                                              「全部展开」/「全部收起」 │
+ *   ├ box (min(rows + padding, cap), scrolls past the cap) ──────────────────────────────────────┤
+ *   │     ☐ Title (bold)                                                                       │
+ *   │       The background paragraph, dimmed, whole                                            │
+ *   │   ▾ ☐ A big point (medium)                                                       [⇊]    │
+ *   │     ▸ ☐ A small point, clamped to three lines when longer…                       [⇊]    │
+ *   │           The first line of its first detail, cut to one line…  3 more ▸                │
+ *   └────────────────────────────────────────────────────────────────────────────────────────────┘
  *
- * Which rows show and which texts are whole is `outline-plan-tree.ts`'s (the reader's view is
- * part of the data, so a fold re-measures). Every row is laid out here, by arithmetic only:
- * its indent (depth × {@link PLAN_TREE_INDENT}, deeper than {@link PLAN_TREE_MAX_INDENT_DEPTH}
- * levels stops growing), the fold arrow's and the checkbox's slots, the child-count badge's
- * width on a folded row (its text measured with the badge font), then the block's text: one
- * rich-inline flow per hard line, wrapped at the room left, clamped to
- * {@link PLAN_TREE_CLAMP_LINES} lines unless whole. A clamped text ends in an ellipsis drawn in
- * room the last line leaves for it (the render lays that line out narrower), so the clamp never
- * changes a row's height.
+ * Which rows show, which texts are whole and which rows end in a preview line is
+ * `outline-plan-tree.ts`'s (the reader's view is part of the data, so a fold re-measures). Every
+ * row is laid out here, by arithmetic only: its indent (depth × {@link PLAN_TREE_INDENT}, deeper
+ * than {@link PLAN_TREE_MAX_INDENT_DEPTH} levels stops growing), the fold arrow's and the
+ * checkbox's slots, the quick control's slot on a row with something folded inside, then the
+ * block's text: one rich-inline flow per hard line, wrapped at the room left, clamped to
+ * {@link PLAN_TREE_CLAMP_LINES} lines unless whole. The background sits under the title's text
+ * with no arrow or marker, whole. A closed row with children adds one preview line: its first
+ * child's first hard line, cut to one visual line at the room its label (「还有 N 条 ▸」,
+ * measured in the body font) and an ellipsis leave. A clamped text and a preview end in an
+ * ellipsis drawn in room their last line leaves for it (the render lays that line out narrower),
+ * so neither changes a row's height.
  *
  * Zero DOM. The prepared flows of a node are kept per node object (the parsed tree is cached by
  * text) and typography generation, so a fold re-measures without re-preparing.
@@ -31,12 +35,16 @@ import {
 	type RichInlineItem,
 } from "@chenglou/pretext/rich-inline";
 import {
+	isDefaultPlanTreeView,
+	isPlanTreeAllExpanded,
 	PLAN_TREE_CLAMP_LINES,
 	type PlanTree,
 	type PlanTreeLine,
 	type PlanTreeNode,
+	type PlanTreeRole,
 	type PlanTreeRun,
 	type PlanTreeView,
+	planTextClamps,
 	visiblePlanRows,
 } from "@shared/outline-plan-tree";
 import { letterSpacingForFont } from "@shared/pretext-layout/typography";
@@ -50,20 +58,39 @@ export const PLAN_TREE_MAX_INDENT_DEPTH = 6;
 export const PLAN_TREE_TOGGLE_SLOT = 18;
 /** Gap after the checkbox / bullet (px). */
 export const PLAN_TREE_MARKER_GAP = 6;
-/** Gap between rows (px). */
+/** Gap between rows, and between a row's text and its preview line (px). */
 export const PLAN_TREE_ROW_GAP = 2;
+/** Extra room under the background paragraph, before the first point (px). */
+export const PLAN_TREE_BACKGROUND_GAP = 4;
 /** The box's padding (px). */
 export const PLAN_TREE_PAD_X = 6;
 export const PLAN_TREE_PAD_Y = 4;
 /** Gap between the toolbar line and the box (px). */
 export const PLAN_TREE_TOOLBAR_GAP = 4;
-/** The child-count badge: horizontal padding inside it, and its gap before the text's room. */
-export const PLAN_TREE_BADGE_PAD_X = 6;
-export const PLAN_TREE_BADGE_GAP = 6;
+/** The quick control (everything inside this node) at the right of a row's first line (px). */
+export const PLAN_TREE_SUBTREE_SLOT = 20;
+/** Gap between a row's text and its quick control (px). */
+export const PLAN_TREE_SUBTREE_GAP = 4;
+/** Gap between a preview's ellipsis and its label (px). */
+export const PLAN_TREE_PREVIEW_LABEL_GAP = 8;
 /** Inline code runs carry the markdown path's chip padding (`INLINE_CODE_EXTRA_WIDTH`). */
 const INLINE_CODE_EXTRA_WIDTH = 10;
-/** The ellipsis a clamped text ends with. */
+/** The ellipsis a clamped text or a preview ends with. */
 export const PLAN_TREE_ELLIPSIS = "…";
+
+/**
+ * The preview's labels (measured: they share its line). `more` with `{n}` for the children past
+ * the first; `one` when there is only the first child, longer than its line.
+ */
+export interface PlanTreeMeasureLabels {
+	more: string;
+	one: string;
+}
+
+export const DEFAULT_PLAN_TREE_MEASURE_LABELS: PlanTreeMeasureLabels = {
+	more: "{n} more ▸",
+	one: "Expand ▸",
+};
 
 /** Class names of a run (the markdown path's fragment classes, plus the line's tone). */
 export const PLAN_TREE_FRAG = "vlist-frag vlist-frag--body";
@@ -86,10 +113,28 @@ export interface PlanTreePreparedLine {
 	tone?: "dim" | "code";
 }
 
+/** The line a closed row with children shows in their place (row-local coordinates). */
+export interface PlanTreePreviewLayout {
+	top: number;
+	/** Left of the preview's text (where a child's text would start). */
+	left: number;
+	/** The room its text is laid out in (before the ellipsis and the label). */
+	width: number;
+	/** The first child's first hard line. */
+	line: PlanTreePreparedLine;
+	/** There is more than the line shows: it ends in an ellipsis and the label. */
+	ellipsis: boolean;
+	label: string | null;
+	labelWidth: number;
+	/** Children after the first. */
+	rest: number;
+}
+
 /** One row, laid out (box-local coordinates, inside the padding). */
 export interface PlanTreeRowLayout {
 	key: string;
 	depth: number;
+	role: PlanTreeRole;
 	top: number;
 	height: number;
 	/** Left of the fold arrow's slot. */
@@ -97,12 +142,14 @@ export interface PlanTreeRowLayout {
 	/** Left and width of the text's room. */
 	textLeft: number;
 	textWidth: number;
+	/** Height of the text (the preview line, when there is one, sits under it). */
+	textHeight: number;
 	hasChildren: boolean;
 	open: boolean;
 	task: PlanTreeNode["task"];
 	heading: boolean;
-	/** The badge a folded row with children draws at the right of its first line. */
-	badge: { text: string; width: number; count: number } | null;
+	/** The quick control for everything inside it, at the right of its first line. */
+	subtree: "expand" | "collapse" | null;
 	/** Each hard line and how many of its visual lines show. */
 	lines: Array<{ line: PlanTreePreparedLine; top: number; shown: number }>;
 	/** The text is cut: the last shown line ends in an ellipsis. */
@@ -111,6 +158,7 @@ export interface PlanTreeRowLayout {
 	textToggles: boolean;
 	whole: boolean;
 	plain: string;
+	preview: PlanTreePreviewLayout | null;
 }
 
 export interface PlanTreeLayout {
@@ -124,8 +172,10 @@ export interface PlanTreeLayout {
 	innerWidth: number;
 	/** The ellipsis's width in the body font (the room a clamped last line leaves for it). */
 	ellipsisWidth: number;
-	/** Something is folded or clamped, or the reader opened something: the toolbar shows. */
+	/** Something is folded or clamped, or the reader changed the view: the toolbar shows. */
 	toolbar: boolean;
+	/** Everything is expanded (the toolbar offers 「全部收起」). */
+	allOpen: boolean;
 	/** Nodes in the plan. */
 	size: number;
 }
@@ -133,6 +183,7 @@ export interface PlanTreeLayout {
 // ─── Fonts ───
 
 function baseFont(node: PlanTreeNode): "bold" | "medium" | "regular" {
+	if (node.role === "background") return "regular";
 	if (node.depth === 0 || node.heading) return "bold";
 	return node.depth === 1 ? "medium" : "regular";
 }
@@ -204,15 +255,22 @@ function textWidth(text: string, font: string): number {
 	return measureLineStats(handle, 1e6).maxLineWidth;
 }
 
-/** The child-count badge's text: `+N`, N the children a folded row hides. */
-export function planTreeBadgeText(count: number): string {
-	return `+${count}`;
-}
-
 /** Visual lines of one prepared hard line at `width`. */
 function lineCount(line: PlanTreePreparedLine, width: number): number {
 	if (!line.flow) return 1;
 	return Math.max(1, measureRichInlineStats(line.flow, Math.max(1, width)).lineCount);
+}
+
+/** Left of the text of a row at `depth` (after its indent, arrow slot and marker slot). */
+function textLeftAt(depth: number, marker: number): number {
+	return (
+		Math.min(depth, PLAN_TREE_MAX_INDENT_DEPTH) * PLAN_TREE_INDENT + PLAN_TREE_TOGGLE_SLOT + marker
+	);
+}
+
+/** The preview's label for `rest` more children (`{n}` filled in). */
+export function planTreePreviewLabel(labels: PlanTreeMeasureLabels, rest: number): string {
+	return rest > 0 ? labels.more.replaceAll("{n}", String(rest)) : labels.one;
 }
 
 /** Lay out the rows `view` shows of `tree`, in a box `innerWidth` wide (inside its padding). */
@@ -220,41 +278,39 @@ export function layoutPlanTree(
 	tree: PlanTree,
 	view: PlanTreeView,
 	innerWidth: number,
+	labels: PlanTreeMeasureLabels = DEFAULT_PLAN_TREE_MEASURE_LABELS,
 ): PlanTreeLayout {
 	const { rows: visible, cut } = visiblePlanRows(tree, view);
-	const lineHeight = typographyMetrics().line.body;
+	const metrics = typographyMetrics();
+	const lineHeight = metrics.line.body;
 	const marker = planTreeMarkerSlot();
-	const badgeFont = typographyMetrics().font.xs;
-	const ellipsisWidth = Math.ceil(textWidth(PLAN_TREE_ELLIPSIS, typographyMetrics().font.body));
+	const bodyFont = metrics.font.body;
+	const ellipsisWidth = Math.ceil(textWidth(PLAN_TREE_ELLIPSIS, bodyFont));
 	const rows: PlanTreeRowLayout[] = [];
 	let y = 0;
 	let anyClamp = false;
-	for (const { node, open, whole } of visible) {
-		if (rows.length > 0) y += PLAN_TREE_ROW_GAP;
-		const left = Math.min(node.depth, PLAN_TREE_MAX_INDENT_DEPTH) * PLAN_TREE_INDENT;
-		const textLeft = left + PLAN_TREE_TOGGLE_SLOT + marker;
-		const hasChildren = node.children.length > 0;
-		const badge =
-			hasChildren && !open
-				? (() => {
-						const text = planTreeBadgeText(node.children.length);
-						return {
-							text,
-							count: node.children.length,
-							width: Math.ceil(textWidth(text, badgeFont)) + PLAN_TREE_BADGE_PAD_X * 2,
-						};
-					})()
-				: null;
+	for (const { node, open, whole, preview, subtree } of visible) {
+		const previous = rows[rows.length - 1];
+		if (previous) {
+			y += PLAN_TREE_ROW_GAP;
+			if (previous.role === "background") y += PLAN_TREE_BACKGROUND_GAP;
+		}
+		const background = node.role === "background";
+		// The background reads as the title's paragraph: under the title's text, no arrow, no marker.
+		const left = background
+			? 0
+			: Math.min(node.depth, PLAN_TREE_MAX_INDENT_DEPTH) * PLAN_TREE_INDENT;
+		const textLeft = background ? textLeftAt(0, marker) : textLeftAt(node.depth, marker);
 		const room = Math.max(
 			24,
-			innerWidth - textLeft - (badge ? badge.width + PLAN_TREE_BADGE_GAP : 0),
+			innerWidth - textLeft - (subtree ? PLAN_TREE_SUBTREE_SLOT + PLAN_TREE_SUBTREE_GAP : 0),
 		);
 		const preparedLines = preparePlanTreeLines(node);
 		const counts = preparedLines.map((line) => lineCount(line, room));
 		const total = counts.reduce((sum, n) => sum + n, 0);
-		const longer = total > PLAN_TREE_CLAMP_LINES;
+		const longer = planTextClamps(node) && total > PLAN_TREE_CLAMP_LINES;
 		const clamp = !whole && longer;
-		if (longer) anyClamp = true;
+		if (clamp) anyClamp = true;
 		let remaining = clamp ? PLAN_TREE_CLAMP_LINES : total;
 		let lineTop = 0;
 		const lines: PlanTreeRowLayout["lines"] = [];
@@ -264,30 +320,58 @@ export function layoutPlanTree(
 			lineTop += shown * lineHeight;
 			remaining -= shown;
 		}
-		const height = lineTop;
+		const textHeight = lineTop;
+		let height = textHeight;
+		let previewLayout: PlanTreePreviewLayout | null = null;
+		if (preview) {
+			const previewLeft = textLeftAt(node.depth + 1, marker);
+			const previewRoom = Math.max(24, innerWidth - previewLeft);
+			const line = preparePlanTreeLines(preview.first)[0] as PlanTreePreparedLine;
+			// The label shows when there is more than the line: other children, other lines, or a
+			// first line longer than the room.
+			const more = preview.more || lineCount(line, previewRoom) > 1;
+			const label = more ? planTreePreviewLabel(labels, preview.rest) : null;
+			const labelWidth = label ? Math.ceil(textWidth(label, bodyFont)) : 0;
+			const top = textHeight + PLAN_TREE_ROW_GAP;
+			previewLayout = {
+				top,
+				left: previewLeft,
+				width: label
+					? Math.max(0, previewRoom - labelWidth - PLAN_TREE_PREVIEW_LABEL_GAP - ellipsisWidth)
+					: previewRoom,
+				line,
+				ellipsis: more,
+				label,
+				labelWidth,
+				rest: preview.rest,
+			};
+			height = top + lineHeight;
+		}
 		rows.push({
 			key: node.key,
 			depth: node.depth,
+			role: node.role,
 			top: y,
 			height,
 			left,
 			textLeft,
 			textWidth: room,
-			hasChildren,
+			textHeight,
+			hasChildren: node.children.length > 0,
 			open,
 			task: node.task,
 			heading: node.heading === true,
-			badge,
+			subtree,
 			lines,
 			clamped: clamp,
 			textToggles: longer,
 			whole,
 			plain: node.plain,
+			preview: previewLayout,
 		});
 		y += height;
 	}
-	if (cut > 0) y += PLAN_TREE_ROW_GAP + typographyMetrics().line.xs;
-	const flipped = view.all || view.nodes.size > 0 || view.texts.size > 0;
+	if (cut > 0) y += PLAN_TREE_ROW_GAP + metrics.line.xs;
 	return {
 		rows,
 		cut,
@@ -295,7 +379,8 @@ export function layoutPlanTree(
 		lineHeight,
 		innerWidth,
 		ellipsisWidth,
-		toolbar: tree.folds || anyClamp || flipped,
+		toolbar: tree.folds || anyClamp || !isDefaultPlanTreeView(view),
+		allOpen: isPlanTreeAllExpanded(view),
 		size: tree.size,
 	};
 }

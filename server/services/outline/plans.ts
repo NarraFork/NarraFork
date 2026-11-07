@@ -22,11 +22,13 @@
  * committed first): its rendering (the snapshot the approval shows) and its diff against the
  * version it is compared with (`plan.baseSeq`, `plan-diff.ts`). Nothing is written.
  *
- * A model's fresh submission is also held to the plan's layout (`checkStructure`, plan
- * readability; `@shared/outline-plan-structure`): the root a one-line title, every block one
- * short point, no flat list of many blocks. A plan that breaks them is refused with the blocks
- * to fix, before anything waits for a person. The notes for the agent under the root (returned
- * feedback, earlier reviews: {@link isPlanNoteBlock}) are not the agent's text and are left out.
+ * A model's fresh submission is also held to the plan format (`checkStructure`, plan
+ * readability; `@shared/outline-plan-structure`): the root a one-line title, its first block a
+ * background paragraph, big and small points one idea each with their implementation details
+ * under them, the notable points last, no flat list of many blocks. A plan that breaks it is
+ * refused with the blocks to fix, before anything waits for a person. The notes for the agent
+ * under the root (returned feedback, earlier reviews: {@link isPlanNoteBlock}) are not the
+ * agent's text and are left out.
  *
  * DECIDING ({@link decideOutlinePlan}): one `plan` commit, behind the barrier.
  *
@@ -409,7 +411,7 @@ export async function ensurePlanRoot(args: {
 			}
 		}
 		const fallback = args.locale === "zh-CN" ? "计划" : "Plan";
-		// A title the plan's layout accepts as its root (plan readability): one line, at most
+		// A title the plan format accepts as its root (plan readability): one line, at most
 		// `rootChars` characters, so the root plan mode makes is never the first thing refused.
 		const title =
 			Array.from((args.title ?? "").replace(/\s+/g, " ").trim())
@@ -503,7 +505,7 @@ export async function readPlanSubmission(args: {
 	 */
 	review?: OutlinePlanReviewClaim | null;
 	/**
-	 * Hold the plan to its layout (a model's fresh submission; not a call restored or handed on,
+	 * Hold the plan to its format (a model's fresh submission; not a call restored or handed on,
 	 * which a person already has in front of them): refused as `structure` when it breaks it.
 	 */
 	checkStructure?: boolean;

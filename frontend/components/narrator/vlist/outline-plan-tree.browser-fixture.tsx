@@ -1,25 +1,27 @@
 /**
  * Browser fixture for an outline plan's ExitPlanMode card (`outline-plan-tree.browser.test.ts`,
- * plan readability): the plan from the owner's screenshot (the goal and the acceptance in one
- * root paragraph, long bullets four levels deep) and the same plan laid out as the rules now
- * ask, through the real segment → adapter → measure → render chain with the shell's labels,
- * and the reader's folds held in the list's own interaction state (`applyVListPlanTreeAction`),
- * so a click re-adapts and re-measures the card exactly as the session list does. With
- * `approval`, the plan waits for a decision: the card hosts the real approval form
- * (`OutlinePlanApproval`, mounted by the vlist's permission bridge), its height first predicted
- * and then reported by the form.
+ * plan readability): a realistic plan in the owner's format (`outline-plan-tree.browser-plans`,
+ * in the reader's language) and the plan of the owner's first screenshot, written before the
+ * format, through the real segment → adapter → measure → render chain with the shell's labels
+ * (the preview's measured labels among them), and the reader's view held in the list's own
+ * interaction state (`applyVListPlanTreeAction`), so a click re-adapts and re-measures the card
+ * exactly as the session list does. With `approval`, the plan waits for a decision: the card
+ * hosts the real approval form (`OutlinePlanApproval`, mounted by the vlist's permission bridge),
+ * its height first predicted and then reported by the form.
  *
- * `scene: "before"` is the same plan as the card drew it before (a plan-file style markdown
- * body, everything expanded): only for the before/after screenshots.
+ * `scene: "inbox"` draws the same plan with the inbox's DOM tree (`OutlinePlanTree`), and
+ * `scene: "before"` the old card (a plan-file style markdown body, everything expanded): only
+ * for the screenshots.
  */
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
-import { type OutlineItem, serializeMarkdownOutline } from "@shared/outline";
+import { serializeMarkdownOutline } from "@shared/outline";
+import { parsePlanTree } from "@shared/outline-plan-tree";
 import { setTypography } from "@shared/pretext-layout/typography";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
-import { useLayoutEffect, useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { OutlineOpenerProvider } from "../../../lib/outline-opener";
@@ -34,10 +36,12 @@ import zhNarrator from "../../../locales/zh-CN/narrator.json";
 import zhOutline from "../../../locales/zh-CN/outline.json";
 import type { PendingPermission } from "../../../types/narrator";
 import { ImageViewerProvider } from "../../common/ImageViewerProvider";
+import { OutlinePlanTree } from "../../outline/plan/OutlinePlanTree";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { getCategory, getCategoryColor, getSummary } from "../tool-call/tool-display";
 import { toolCardInnerWidth } from "./measure/measure-tool-call";
+import { FORMAT_EN, FORMAT_ZH, LEGACY } from "./outline-plan-tree.browser-plans";
 import { VLIST_REGISTRY } from "./registry";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { type AdapterContext, type AdapterSegment, adaptSegments } from "./segment-adapter";
@@ -70,118 +74,18 @@ export function ready(): boolean {
 
 // ── The plans ──
 
-const item = (content: string, children: OutlineItem[] = [], task = false): OutlineItem => ({
-	content,
-	task: task ? { status: "todo", assignee: null } : null,
-	props: {},
-	children,
-});
-const step = (content: string, children: OutlineItem[] = []) => item(content, children, true);
-
-/** The plan of the owner's screenshot: the goal and the acceptance in the root, long bullets. */
-const LEGACY: OutlineItem = step(
-	[
-		"历史读取10秒改告警",
-		"目标：把模型历史链路、工具结果回放和会话恢复里“读取历史超过 10 秒就拒绝”的固定时间限制全部改成告警，读取照常完成；慢的时候在日志和界面上提示，用户能看到原因，不再看到莫名其妙的失败。",
-		"验收：1）人为注入 15 秒延迟的慢读取照常返回，不再报 HISTORY_READ_TIMEOUT；2）日志里有一条 warn，带会话 id、链路名和耗时；3）界面提示在读取完成后消失；4）现有历史读取测试全部通过，新增的告警测试覆盖三条链路。",
-	].join("\n"),
-	[
-		item("已确定的边界与取舍", [
-			item(
-				"只改“超时即拒绝”的行为，不改读取本身：分页、游标和每页上限都保持不变，避免同时改两件事时无法判断回归来自哪里。",
-			),
-			item(
-				"告警阈值沿用 10 秒，但做成常量放在 history-limits.ts 里，后面要调只改一处；不做成用户设置，因为没有人需要按会话调它。",
-			),
-			item(
-				"不在主线程上做任何新的同步等待：告警通过已有的慢操作日志通道发出，界面提示走现有的会话状态事件，不新增 WebSocket 消息类型。",
-			),
-			item(
-				"压缩恢复链路这次不动：它的超时是保护磁盘的，不是保护用户体验的，和这次的问题无关，单独评估后再决定要不要放宽。",
-			),
-			item(
-				"旧客户端看不到新提示也没关系：它们收到的仍然是照常完成的读取结果，只是少一条提示，不会出错。",
-			),
-			item(
-				"测试只在受影响的三个目录里跑，不跑全量；慢读取用注入延迟模拟，不依赖真实的慢磁盘，保证 CI 上结果稳定。",
-			),
-		]),
-		step("阶段1：历史读取10秒改告警——先去掉模型历史链路里的固定时间拒绝，再处理工具结果回放", [
-			step("清除模型历史链路的固定时间拒绝", [
-				item(
-					"history-build.ts 里 readHistoryPage 的 10 秒 Promise.race 去掉，改成读取完成后比较耗时，超过阈值时调用 logSlowOperation，并把耗时带进返回值。",
-				),
-				item(
-					"loop.ts 里捕获 HISTORY_READ_TIMEOUT 的分支一起删掉，这个错误码不再产生；保留错误码定义一个版本，避免旧日志解析报错。",
-				),
-				item(
-					"调用方 buildModelHistory 不需要改签名：耗时是可选字段，旧调用方忽略即可，新调用方用它决定要不要发界面提示。",
-				),
-			]),
-			step("工具结果回放改为告警", [
-				item("replayToolResults 同样去掉 race，耗时超过阈值时只告警，结果照常回放。"),
-				item("回放的告警带工具调用 id，方便在日志里对上是哪一次调用读得慢。"),
-			]),
-			step("会话恢复路径同样改成告警", [
-				item("restoreSession 读历史的超时拒绝改成告警，恢复流程不中断。"),
-			]),
-		]),
-		step("阶段2：界面提示", [
-			step("读取慢时在会话头部显示提示", [
-				item("复用现有的会话状态事件，加一个 slowHistory 字段，读取完成后清掉。"),
-			]),
-			step("提示文案进 en / zh-CN 两套语言文件"),
-		]),
-		step("阶段3：测试与回归", [
-			step("三条链路各加一个注入延迟的测试"),
-			step("跑受影响目录的现有测试，确认没有回归"),
-		]),
-		item("开放问题", [item("告警是否需要按会话限频？目前倾向不限，因为慢读取本身就很少。")]),
-	],
-);
-
-/** The same plan as the rules now ask: a title root, every block one short point, in levels. */
-const STRUCTURED: OutlineItem = step("历史读取10秒改告警", [
-	item("目标", [
-		item("读历史超过 10 秒只告警，读取照常完成"),
-		item("慢的时候在日志和界面上提示原因"),
-	]),
-	item("验收", [
-		item("注入 15 秒延迟的读取照常返回，不再报 HISTORY_READ_TIMEOUT"),
-		item("日志里有 warn，带会话 id、链路名和耗时"),
-		item("界面提示在读取完成后消失"),
-		item("新增告警测试覆盖三条链路"),
-	]),
-	item("边界与取舍", [
-		item("只改超时即拒绝，不改分页和游标"),
-		item("阈值 10 秒做成常量，放在 history-limits.ts"),
-		item("不在主线程上新增同步等待"),
-		item("压缩恢复链路这次不动"),
-	]),
-	step("阶段1：去掉固定时间拒绝", [
-		step("清除模型历史链路的固定时间拒绝", [
-			item("history-build.ts：去掉 10 秒 Promise.race"),
-			item("超过阈值调用 logSlowOperation"),
-			item("loop.ts：删掉 HISTORY_READ_TIMEOUT 分支"),
-		]),
-		step("工具结果回放改为告警", [item("告警带工具调用 id")]),
-		step("会话恢复路径改为告警"),
-	]),
-	step("阶段2：界面提示", [
-		step("读取慢时在会话头部显示提示", [item("会话状态事件加 slowHistory 字段")]),
-		step("提示文案进 en / zh-CN"),
-	]),
-	step("阶段3：测试与回归", [step("三条链路各加注入延迟的测试"), step("跑受影响目录的现有测试")]),
-]);
-
 export const PLANS = {
+	formatZh: serializeMarkdownOutline([FORMAT_ZH]),
+	formatEn: serializeMarkdownOutline([FORMAT_EN]),
 	legacy: serializeMarkdownOutline([LEGACY]),
-	structured: serializeMarkdownOutline([STRUCTURED]),
 };
 
 export interface FixtureOptions {
-	/** `legacy` / `structured`: the card as it is now; `before`: the old markdown body. */
-	scene: "legacy" | "structured" | "before";
+	/**
+	 * `format` (the owner's format, in `lang`) / `legacy`: the card as it is now; `inbox`: the
+	 * format plan in the inbox's DOM tree; `before`: the old markdown body.
+	 */
+	scene: "format" | "legacy" | "inbox" | "before";
 	lang?: "zh-CN" | "en";
 	width: number;
 	scheme: "light" | "dark";
@@ -194,9 +98,14 @@ export interface FixtureOptions {
 
 const TOOL_USE = "toolu_plan_readability";
 
-function planInput(scene: FixtureOptions["scene"]) {
-	const plan = scene === "structured" ? PLANS.structured : PLANS.legacy;
-	if (scene === "before") return { plan };
+function planText(options: FixtureOptions): string {
+	if (options.scene === "legacy" || options.scene === "before") return PLANS.legacy;
+	return options.lang === "en" ? PLANS.formatEn : PLANS.formatZh;
+}
+
+function planInput(options: FixtureOptions) {
+	const plan = planText(options);
+	if (options.scene === "before") return { plan };
 	return {
 		mode: "outline",
 		plan,
@@ -215,7 +124,7 @@ function planInput(scene: FixtureOptions["scene"]) {
 }
 
 function messages(options: FixtureOptions): NarratorMsg[] {
-	const input = planInput(options.scene);
+	const input = planInput(options);
 	const status = options.approval ? "pending" : "completed";
 	const outputJson = options.approval ? null : { _text: "User has approved your plan." };
 	return [
@@ -252,7 +161,7 @@ function permissionOf(options: FixtureOptions): PendingPermission {
 		toolName: "ExitPlanMode",
 		toolUseId: TOOL_USE,
 		ownerNarratorId: "n1",
-		inputJson: planInput(options.scene),
+		inputJson: planInput(options),
 	} as unknown as PendingPermission;
 }
 
@@ -261,6 +170,40 @@ queryClient.setQueryData(["settings"], { outline: { enabled: true } });
 let root: Root | null = null;
 /** Commits of the scene (a click is answered once this moves and the frame is painted). */
 let commits = 0;
+
+/** The inbox's DOM tree of the same plan (its view is the component's own state). */
+function InboxScene({ options }: { options: FixtureOptions }) {
+	const tree = parsePlanTree(planText(options));
+	const host = useRef<HTMLDivElement>(null);
+	useLayoutEffect(() => {
+		commits++;
+	});
+	// The tree re-renders on its own (local state): a change to its DOM is a commit here.
+	useLayoutEffect(() => {
+		const el = host.current;
+		if (!el) return;
+		const observer = new MutationObserver(() => {
+			commits++;
+		});
+		observer.observe(el, { subtree: true, childList: true, attributes: true, characterData: true });
+		return () => observer.disconnect();
+	}, []);
+	return (
+		<div
+			ref={host}
+			id="shot"
+			data-inbox=""
+			style={{
+				width: options.width,
+				boxSizing: "content-box",
+				padding: 16,
+				background: "var(--mantine-color-body)",
+			}}
+		>
+			{tree ? <OutlinePlanTree tree={tree} /> : null}
+		</div>
+	);
+}
 
 function Scene({ options }: { options: FixtureOptions }) {
 	const { adapterLabels, renderLabels } = useVListLabels();
@@ -370,7 +313,11 @@ export async function render(options: FixtureOptions): Promise<void> {
 				<MantineProvider forceColorScheme={options.scheme}>
 					<ImageViewerProvider>
 						<OutlineOpenerProvider value={{ open: () => true }}>
-							<Scene options={options} />
+							{options.scene === "inbox" ? (
+								<InboxScene options={options} />
+							) : (
+								<Scene options={options} />
+							)}
 						</OutlineOpenerProvider>
 					</ImageViewerProvider>
 				</MantineProvider>
@@ -391,14 +338,36 @@ export function commitCount(): number {
 	return commits;
 }
 
-/** Click the element `selector` matches (inside the plan's card); resolves once re-rendered. */
-export async function click(selector: string): Promise<boolean> {
-	const el = document.querySelector<HTMLElement>(`[data-card] ${selector}`);
+/** The element `selector` matches inside the plan's card (or the inbox's tree). */
+function find(selector: string): HTMLElement | null {
+	return document.querySelector<HTMLElement>(`[data-card] ${selector}, [data-inbox] ${selector}`);
+}
+
+/**
+ * Click the element `selector` matches (Alt held with `alt`, as Alt+click); resolves once
+ * re-rendered.
+ */
+export async function click(selector: string, alt = false): Promise<boolean> {
+	const el = find(selector);
 	if (!el) return false;
 	const before = commits;
-	el.click();
+	el.dispatchEvent(
+		new MouseEvent("click", { bubbles: true, cancelable: true, altKey: alt, view: window }),
+	);
 	await settled(before);
 	return true;
+}
+
+/** Focus the element `selector` matches (the test then types with the real keyboard). */
+export function focus(selector: string): boolean {
+	const el = find(selector);
+	el?.focus();
+	return !!el && document.activeElement === el;
+}
+
+/** Resolves once a commit after `before` is painted. */
+export async function afterCommit(before: number): Promise<void> {
+	await settled(before);
 }
 
 /** Wait until the card's measured height has stopped moving (a reported form height). */
@@ -420,11 +389,19 @@ export async function steady(): Promise<void> {
 export interface PlanRowReport {
 	key: string;
 	depth: number;
-	/** "1" open, "0" folded, undefined: no children. */
+	role: string;
+	/** "1" open, "0" closed, undefined: no children. */
 	open?: string;
-	badge: string | null;
+	/** It has a fold arrow / a checkbox or bullet. */
+	arrow: boolean;
+	marker: boolean;
+	/** Its quick control's state (`expand` / `collapse`), null when it has none. */
+	subtree: string | null;
+	/** Its text ends in an ellipsis (clamped). */
 	ellipsis: boolean;
 	text: string;
+	/** The preview line under it: its text, its label, whether it ends in an ellipsis. */
+	preview: { text: string; label: string | null; ellipsis: boolean } | null;
 	/** The row's painted height and what its lines take. */
 	height: number;
 	lines: number;
@@ -445,7 +422,73 @@ export interface CardReport {
 	rowSpill: number;
 	/** How far the toolbar line's words reach into the rows' box below it (px). */
 	toolbarOverlap: number;
+	/** How far a preview line's words reach past its row (below it, or past the box's right). */
+	previewSpill: number;
 	markdownBlocks: number;
+}
+
+function rowReport(row: HTMLElement): PlanRowReport {
+	const rect = row.getBoundingClientRect();
+	const text =
+		row.querySelector<HTMLElement>("[data-plan-text]") ??
+		(row.matches("[data-plan-text]") ? row : null);
+	const preview =
+		row.querySelector<HTMLElement>("[data-plan-preview]") ??
+		(row.nextElementSibling?.matches("[data-plan-preview]")
+			? (row.nextElementSibling as HTMLElement)
+			: null);
+	return {
+		key: row.dataset.planRow ?? "",
+		depth: Number(row.dataset.planDepth),
+		role: row.dataset.planRole ?? "",
+		open: row.dataset.planOpen,
+		arrow: !!row.querySelector("[data-plan-toggle]"),
+		marker: !!row.querySelector(".vlist-plan-marker"),
+		subtree: row.querySelector<HTMLElement>("[data-plan-subtree]")?.dataset.planSubtree ?? null,
+		ellipsis: !!text?.querySelector("[data-plan-ellipsis]"),
+		text: text?.textContent ?? "",
+		preview: preview
+			? {
+					text: preview.querySelector("[data-plan-preview-text]")?.textContent ?? "",
+					label: preview.querySelector("[data-plan-preview-label]")?.textContent ?? null,
+					ellipsis:
+						!!preview.querySelector(":scope > [data-plan-ellipsis]") ||
+						(preview.querySelector("[data-plan-preview-text]")?.textContent ?? "").endsWith("…"),
+				}
+			: null,
+		height: Math.round(rect.height * 10) / 10,
+		lines: text ? text.children.length : 0,
+	};
+}
+
+export interface InboxReport {
+	rows: PlanRowReport[];
+	toolbar: string | null;
+	allLabel: string | null;
+	overflowX: boolean;
+	/** How far a preview's words reach past the tree's right edge (px). */
+	previewSpill: number;
+}
+
+/** The inbox's tree as drawn. */
+export function inboxReport(): InboxReport {
+	const tree = document.querySelector<HTMLElement>("[data-inbox] [data-testid=outline-plan-tree]");
+	if (!tree) throw new Error("no inbox tree");
+	const right = tree.getBoundingClientRect().right;
+	let previewSpill = 0;
+	// The preview's text and label boxes (the runs inside the text are clipped by it).
+	for (const el of tree.querySelectorAll<HTMLElement>("[data-plan-preview] > *")) {
+		const r = el.getBoundingClientRect();
+		if (r.width > 0) previewSpill = Math.max(previewSpill, r.right - right);
+	}
+	const summary = tree.firstElementChild;
+	return {
+		rows: [...tree.querySelectorAll<HTMLElement>("[data-plan-row]")].map(rowReport),
+		toolbar: summary?.querySelector("p")?.textContent ?? null,
+		allLabel: tree.querySelector("[data-testid=outline-plan-tree-all]")?.textContent ?? null,
+		overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+		previewSpill: Math.round(previewSpill * 10) / 10,
+	};
 }
 
 export function report(): CardReport {
@@ -476,25 +519,26 @@ export function report(): CardReport {
 		spill = Math.max(spill, top - visibleTop, visibleBottom - bottom);
 	}
 	let rowSpill = 0;
-	const rows = [...card.querySelectorAll<HTMLElement>("[data-plan-row]")].map((row) => {
+	let previewSpill = 0;
+	const boxRight = card
+		.querySelector<HTMLElement>("[data-plan-box]")
+		?.getBoundingClientRect().right;
+	const rowEls = [...card.querySelectorAll<HTMLElement>("[data-plan-row]")];
+	for (const row of rowEls) {
 		const rect = row.getBoundingClientRect();
-		const text = row.querySelector<HTMLElement>("[data-plan-text]");
 		for (const frag of row.querySelectorAll<HTMLElement>("[data-plan-text] *")) {
 			const r = frag.getBoundingClientRect();
 			if (r.width === 0 || r.height === 0) continue;
 			rowSpill = Math.max(rowSpill, r.bottom - rect.bottom, rect.top - r.top);
 		}
-		return {
-			key: row.dataset.planRow ?? "",
-			depth: Number(row.dataset.planDepth),
-			open: row.dataset.planOpen,
-			badge: row.querySelector("[data-plan-badge]")?.textContent ?? null,
-			ellipsis: !!row.querySelector("[data-plan-ellipsis]"),
-			text: text?.textContent ?? "",
-			height: Math.round(rect.height * 10) / 10,
-			lines: text ? text.children.length : 0,
-		};
-	});
+		for (const el of row.querySelectorAll<HTMLElement>("[data-plan-preview] *")) {
+			const r = el.getBoundingClientRect();
+			if (r.width === 0 || r.height === 0) continue;
+			previewSpill = Math.max(previewSpill, r.bottom - rect.bottom);
+			if (boxRight !== undefined) previewSpill = Math.max(previewSpill, r.right - boxRight);
+		}
+	}
+	const rows = rowEls.map(rowReport);
 	const planBox = card.querySelector<HTMLElement>("[data-plan-box]");
 	let toolbarOverlap = 0;
 	const boxTop = planBox?.getBoundingClientRect().top;
@@ -520,6 +564,7 @@ export function report(): CardReport {
 		overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
 		rowSpill: Math.round(rowSpill * 10) / 10,
 		toolbarOverlap: Math.round(toolbarOverlap * 10) / 10,
+		previewSpill: Math.round(previewSpill * 10) / 10,
 		markdownBlocks: card.querySelectorAll("[data-tool-markdown]").length,
 	};
 }
