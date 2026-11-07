@@ -208,6 +208,26 @@ describe("floating overlays above the WCO drag surface", () => {
 		expect(top).toContain('className="nf-nav-brand-row"');
 	});
 
+	test("nothing dead sits at the top edge or the sidebar's sides", async () => {
+		// The shell's padding put 16px of non-draggable band above both drag surfaces, and
+		// the navbar's inline padding left a dead column down the window's left edge — the
+		// two places a reader grabs first. Both belong to the title bar now.
+		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
+		const desktop = css.slice(css.indexOf("@media (min-width: 48em)"));
+		expect(desktop).toMatch(
+			/html\[data-nf-wco\] \.nf-app-shell \.mantine-AppShell-navbar,\s*\n?\s*html\[data-nf-wco\] \.nf-app-shell \.mantine-AppShell-main \{\s*\/\*[^*]*\*\/\s*padding-top: 0 !important/,
+		);
+		// The strip carries the spacing the shell no longer has, so the band above the page
+		// is one drag surface instead of a draggable top and an inert gap below it.
+		expect(desktop).toMatch(
+			/\.nf-wco-main-strip \{[^}]*height: calc\(var\(--nf-wco-strip-height\) \+ var\(--mantine-spacing-md\)\)/,
+		);
+		// The brand row bleeds over the navbar's inline padding, keeping its content in place.
+		expect(desktop).toMatch(
+			/\.nf-nav-brand-row \{\s*\/\*[^*]*\*\/\s*margin-inline: calc\(var\(--mantine-spacing-md\) \* -1\) !important/,
+		);
+	});
+
 	test("the theme stamps nf-overlay-layer on every Mantine floating part", async () => {
 		const theme = await Bun.file(new URL("./mantine-theme.ts", import.meta.url)).text();
 		for (const component of ["Modal", "Drawer", "Menu", "Popover", "HoverCard", "Combobox"]) {

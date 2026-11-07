@@ -66,14 +66,45 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 }
 
 @media (min-width: 48em) {
+	/*
+	 * The shell's top spacing belongs to the title bar, not above it. `padding="md"` puts
+	 * 16px of padding on both containers — inline on the navbar — and that band is at y=0,
+	 * the first place a reader grabs, where nothing is a drag surface: the brand row starts
+	 * below it and the strip's negative margin does not pull it up (sticky ignores it).
+	 * Zeroing the padding here makes the brand row and the strip start at the window's top
+	 * edge, and the strip carries the spacing itself so the content below keeps its distance.
+	 */
+	html[data-nf-wco] .nf-app-shell .mantine-AppShell-navbar,
+	html[data-nf-wco] .nf-app-shell .mantine-AppShell-main {
+		/* biome-ignore lint/complexity/noImportantStyles: the padding is Mantine's inline style from AppShell's padding prop */
+		padding-top: 0 !important;
+	}
+
+	/*
+	 * The brand row bleeds into the navbar's inline padding: that padding belongs to the
+	 * navbar (whose own region is none), so the window's left edge — and the matching strip
+	 * on the right — would stay dead exactly where a reader grabs for the title bar. The
+	 * row's padding compensates, so nothing inside it moves.
+	 */
+	html[data-nf-wco] .nf-nav-brand-row {
+		/* biome-ignore lint/complexity/noImportantStyles: beats the row's inline px and the navbar's inline padding */
+		margin-inline: calc(var(--mantine-spacing-md) * -1) !important;
+		/* biome-ignore lint/complexity/noImportantStyles: keeps the controls at the same x while the row widens */
+		padding-inline: calc(var(--mantine-spacing-md) + 4px) !important;
+	}
+
 	html[data-nf-wco] .nf-wco-main-strip {
 		display: block;
 		position: sticky;
 		top: 0;
 		z-index: 100;
-		height: var(--nf-wco-strip-height);
-		margin-top: calc(var(--mantine-spacing-md) * -1);
-		margin-bottom: var(--mantine-spacing-md);
+		/*
+		 * The whole blank band above the page, not just the overlay's height: the gap
+		 * below it looks identical, so a press there must move the window too. The band
+		 * carries that spacing because the shell's own top padding is gone (above).
+		 */
+		height: calc(var(--nf-wco-strip-height) + var(--mantine-spacing-md));
+		margin-block: 0;
 		margin-inline: calc(var(--mantine-spacing-md) * -1);
 		background: var(--mantine-color-body);
 		-webkit-app-region: drag;
