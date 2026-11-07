@@ -20,6 +20,8 @@ import {
 	Text,
 } from "@mantine/core";
 import type { HumanAttentionItem } from "@shared/human-attention";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
+import { parsePlanTree } from "@shared/outline-plan-tree";
 import {
 	getReflectionSuggestion,
 	type ReflectionKind,
@@ -38,6 +40,7 @@ import {
 	useCallback,
 	useContext,
 	useEffect,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
@@ -62,6 +65,7 @@ import {
 import { readSession, writeSession } from "../../../lib/session-store";
 import { OutlineAttentionDetail } from "../../outline/OutlineQuestions";
 import { OutlineNavProvider } from "../../outline/outline-nav";
+import { OutlinePlanTree } from "../../outline/plan/OutlinePlanTree";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { InlinePermission } from "../permission/InlinePermission";
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
@@ -580,6 +584,15 @@ function PermissionReviewContext({
 			: null;
 	const plan =
 		permission.toolName === "ExitPlanMode" && typeof record?.plan === "string" ? record.plan : null;
+	// An outline session's plan (its submission, or its declared mode) is a task tree.
+	const planTree = useMemo(
+		() =>
+			plan !== null &&
+			(outlinePlanSubmissionOf(record ?? undefined) !== null || record?.mode === "outline")
+				? parsePlanTree(previewPlan ?? plan)
+				: null,
+		[plan, previewPlan, record],
+	);
 	// The question banner below IS this tool's input; listing it again is pure noise.
 	const inputOwnedByForm = permission.toolName === "AskUserQuestion";
 	// Commands and file content need literal line breaks, not JSON's escaped strings.
@@ -606,9 +619,16 @@ function PermissionReviewContext({
 	const targets = showExecutionTarget ? reviewTargets(permission) : [];
 	return (
 		<Stack gap="xs">
-			{plan !== null && (
-				<ReviewMarkdown label={t("humanAttentionPlan")} value={previewPlan ?? plan} />
-			)}
+			{plan !== null &&
+				(planTree ? (
+					// An outline plan reads as its outline (plan readability): the root and two
+					// levels, deeper ones folded, as on its card in the session.
+					<ReviewBlock label={t("humanAttentionPlan")}>
+						<OutlinePlanTree tree={planTree} />
+					</ReviewBlock>
+				) : (
+					<ReviewMarkdown label={t("humanAttentionPlan")} value={previewPlan ?? plan} />
+				))}
 			{fields.map(([key, label]) => (
 				<ReviewText key={key} label={t(label)} value={String(record?.[key])} />
 			))}

@@ -31,6 +31,7 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import { type PlanTreeView, planTreeViewSignature } from "@shared/outline-plan-tree";
 import type { MeasuredElement } from "./prepared-block";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -993,6 +994,15 @@ function leafTextRevision(d: Record<string, unknown>): string {
 	// A change list (outline cards): one fixed line per row, so the row count above sets the
 	// height, but the rows' words, links and chips are painted from the cached payload and can
 	// change at the same count (a display landing on a live patch). Bounded: at most 24 short rows.
+	// An outline plan's tree (plan readability): its rows follow the plan's text (the markdown
+	// it was parsed from) and the reader's view of it (which nodes and texts are open). O(1) in
+	// the plan: the text is sampled, the view is what the reader clicked.
+	if (d.kind === "plan-tree") {
+		const markdown = d.markdown as { text?: unknown } | undefined;
+		rev += `|ptx:${textSignature(String(markdown?.text ?? ""))}`;
+		const view = d.view as PlanTreeView | undefined;
+		if (view) rev += `|ptv:${planTreeViewSignature(view)}`;
+	}
 	if (d.kind === "change-rows") {
 		rev += `|chg:${textSignature(JSON.stringify(d.rows ?? []))}`;
 		const toggle = d.toggle as { open?: unknown; label?: unknown } | undefined;

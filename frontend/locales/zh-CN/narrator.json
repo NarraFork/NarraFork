@@ -2817,6 +2817,19 @@
 		"summaryShort": "第 {{version}} 版 · +{{added}} ~{{changed}} −{{removed}}",
 		"summaryFirstShort": "第 {{version}} 版 · 新 · +{{added}}",
 		"agentSummary": "这一版改了：{{summary}}",
+		"tree": {
+			"overview": "大纲 · 默认显示两层 · 共 {{count}} 块",
+			"overviewAll": "大纲 · 已全部展开 · 共 {{count}} 块",
+			"expandAll": "全部展开",
+			"collapseAll": "全部收起",
+			"expand": "展开",
+			"collapse": "收起",
+			"hidden_one": "里面还有 {{count}} 项",
+			"hidden_other": "里面还有 {{count}} 项",
+			"showWhole": "显示全文",
+			"showLess": "收起全文",
+			"more": "还有 {{count}} 块：在大纲中打开计划查看"
+		},
 		"reviewCount_one": "审查意见 {{count}} 条",
 		"reviewCount_other": "审查意见 {{count}} 条",
 		"review": {
@@ -2865,7 +2878,9 @@
 				"doing": "进行中",
 				"done": "完成",
 				"cancelled": "取消"
-			}
+			},
+			"showWhole": "显示全文",
+			"showLess": "收起"
 		}
 	}
 }

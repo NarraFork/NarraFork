@@ -1,4 +1,5 @@
 import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
+import type { PlanTreeView } from "@shared/outline-plan-tree";
 import type { PretextLayoutIndex, PretextLayoutManifest } from "@shared/pretext-layout";
 import type { MeasureElement } from "@shared/pretext-layout/layout-pipeline";
 import {
@@ -52,6 +53,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	isPromptOpen?: (key: string) => boolean;
 	/** Reader expanded a subagent card's file-change list (its own fold). */
 	isFileChangesOpen?: (key: string) => boolean;
+	/** The reader's view of an outline plan card's tree (undefined: the overview). */
+	planTreeView?: (key: string) => PlanTreeView | undefined;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;

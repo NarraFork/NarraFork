@@ -1,3 +1,4 @@
+import { OUTLINE_PLAN_STRUCTURE } from "@shared/outline-plan-structure";
 import { z } from "zod/v4";
 import { PLAN_DIR_REL } from "../../plan-file-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
@@ -82,7 +83,7 @@ export const enterPlanModeTool: ToolDefinition = {
 		"- Research task, not implementation planning\n\n" +
 		"## Outline Sessions\n\n" +
 		"When this session keeps its tasks in the outline, the plan is a task tree there, not a file: entering plan mode creates (or resumes) a plan root in the session space and names it. " +
-		"Pass `under` with a task's address to plan beneath it (a goal you are planning for), or `root` to plan an existing task tree again; `plan_name` becomes the root's title.\n\n" +
+		"Pass `under` with a task's address to plan beneath it (a goal you are planning for), or `root` to plan an existing task tree again; `plan_name` becomes the root's title (keep it a short one-line title).\n\n" +
 		"## Important Notes\n\n" +
 		"- If the user explicitly requires human approval of the plan, set `disableReflectionReview: true`.\n" +
 		"- This tool REQUIRES user approval - they must consent to entering plan mode\n" +
@@ -231,6 +232,20 @@ const EXIT_PLAN_SUMMARY_DESCRIPTION =
 const EXIT_PLAN_ROOT_DESCRIPTION =
 	'With mode "outline": the plan root\'s address, when it is not the one the plan-mode context names.';
 
+/** The layout an outline plan is held to (the numbers ExitPlanMode refuses a plan by). */
+function outlinePlanLayoutRules(): string {
+	const { rootChars, blockChars, maxChildren } = OUTLINE_PLAN_STRUCTURE;
+	return (
+		"An outline plan must read as an outline: the person first sees the root and the two levels under it. " +
+		`The root is a short one-line title (at most ${rootChars} characters), never the goal or the acceptance; ` +
+		"write the goal, the acceptance and the boundaries as blocks under it, one point per child block; " +
+		"put the steps in levels (phases → tasks → details). " +
+		`Each block is one short point (at most ${blockChars} characters): split a longer explanation into child blocks, ` +
+		`and group a level that would have more than ${maxChildren} blocks. ` +
+		"A plan that breaks these is refused with the blocks to fix; fix them with OutlineEdit and call ExitPlanMode again.\n\n"
+	);
+}
+
 function buildExitPlanModeDescription(): string {
 	const header =
 		"Use this tool when you are in plan mode and have finished designing your implementation plan and are ready for user approval.\n\n";
@@ -239,6 +254,7 @@ function buildExitPlanModeDescription(): string {
 		"## How This Tool Works\n\n" +
 		"Consult the current plan-mode context for the designated plan path, whether inline plans are allowed, and whether relaxed planning is enabled. The runtime validates these restrictions independently of this schema.\n\n" +
 		'In an outline session the plan-mode context names a plan root instead: declare `mode: "outline"`. The person sees the plan against its previous version and returns it, executes it as a draft, or locks it and executes it.\n\n' +
+		outlinePlanLayoutRules() +
 		'The required `mode` declares the plan source. With `mode: "inline"`, supply the complete actual plan body in `inline_plan`, never a path or reference. Missing plan text is an error, not a fallback to a file.\n\n' +
 		'With `mode: "file"`, write the complete plan to the designated file first; `inline_plan` is ignored. Only in relaxed plan mode may `plan_file_path` select another file. ' +
 		`Custom plan paths must still resolve inside \`${PLAN_DIR_REL}/\` of the working directory, including after symlink resolution.\n\n`;

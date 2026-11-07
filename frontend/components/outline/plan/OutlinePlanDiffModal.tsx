@@ -5,6 +5,11 @@
  * editing it in the outline beside the session), so the version a decision names (`seenSeq`) is
  * the one on screen. A plan review's comments (PR 8b) come first, as the submission carries them;
  * the diff leaves them out.
+ *
+ * Nothing in the diff is folded (plan readability): it lists only the blocks that changed, each
+ * at its depth under the root, so a change shows however deep it sits — unlike the plan's own
+ * overview, which folds what is under its second level. A long text before or after is clamped
+ * to {@link DIFF_TEXT_LINES} lines, and opens whole on a click.
  */
 
 import {
@@ -26,7 +31,7 @@ import type {
 	OutlinePlanReview,
 	OutlinePlanTaskView,
 } from "@shared/outline-api";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 function taskLine(
@@ -52,10 +57,24 @@ const CHANGE_COLOR: Record<string, string> = {
 	moved: "gray",
 };
 
+/** Lines a changed block's text shows before it is clamped (a click shows it whole). */
+const DIFF_TEXT_LINES = 3;
+/** A text this long, or of more lines than the clamp, gets the "show all" toggle. */
+const DIFF_TEXT_LONG = 160;
+
+function isLongText(text: string | null): boolean {
+	return !!text && (text.length > DIFF_TEXT_LONG || text.split("\n").length > DIFF_TEXT_LINES);
+}
+
 function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
 	const { t } = useTranslation("narrator");
+	const [whole, setWhole] = useState(false);
 	const added = entry.changes.includes("added");
 	const removed = entry.changes.includes("removed");
+	const clamp = whole ? undefined : DIFF_TEXT_LINES;
+	const long =
+		isLongText(entry.after) ||
+		(entry.changes.includes("text") || removed ? isLongText(entry.before) : false);
 	return (
 		<Paper
 			withBorder
@@ -78,18 +97,47 @@ function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
 				)}
 			</Group>
 			{entry.changes.includes("text") && entry.before !== null && (
-				<Text size="xs" c="dimmed" td="line-through" style={{ whiteSpace: "pre-wrap" }}>
+				<Text
+					size="xs"
+					c="dimmed"
+					td="line-through"
+					lineClamp={clamp}
+					style={{ whiteSpace: "pre-wrap" }}
+				>
 					{entry.before}
 				</Text>
 			)}
 			{removed ? (
-				<Text size="xs" c="red" td="line-through" style={{ whiteSpace: "pre-wrap" }}>
+				<Text
+					size="xs"
+					c="red"
+					td="line-through"
+					lineClamp={clamp}
+					style={{ whiteSpace: "pre-wrap" }}
+				>
 					{entry.before}
 				</Text>
 			) : (
-				<Text size="xs" c={added ? "green" : undefined} style={{ whiteSpace: "pre-wrap" }}>
+				<Text
+					size="xs"
+					c={added ? "green" : undefined}
+					lineClamp={clamp}
+					style={{ whiteSpace: "pre-wrap" }}
+					data-testid="outline-plan-diff-after"
+				>
 					{entry.after}
 				</Text>
+			)}
+			{long && (
+				<Anchor
+					component="button"
+					type="button"
+					size="xs"
+					onClick={() => setWhole((value) => !value)}
+					data-testid="outline-plan-diff-whole"
+				>
+					{whole ? t("outlinePlan.diff.showLess") : t("outlinePlan.diff.showWhole")}
+				</Anchor>
 			)}
 			{entry.changes.includes("task") && (
 				<Text size="xs" c="grape">

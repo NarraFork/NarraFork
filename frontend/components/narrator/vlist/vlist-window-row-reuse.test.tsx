@@ -41,6 +41,7 @@ function row(key: string): ExactRowProps {
 			onToggleTranslation: noop,
 			onTogglePrompt: noop,
 			onToggleFileChanges: noop,
+			onPlanTree: noop,
 		},
 		renderLabels: {} as ExactRowProps["renderLabels"],
 		narratorId: "n1",

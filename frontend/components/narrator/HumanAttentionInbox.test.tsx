@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrator";
 import { MantineProvider } from "@mantine/core";
 import type { HumanAttentionItem, HumanAttentionPage } from "@shared/human-attention";
+import { type OutlineItem, serializeMarkdownOutline } from "@shared/outline";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -802,6 +803,57 @@ describe("human attention decisions", () => {
 		expect(fileLink).toBeUndefined();
 		expect(row(command.id).querySelector("[data-md-body]")).toBeNull();
 		expect(row(command.id).textContent).toContain("rm -rf **/*.tmp # cleanup");
+	});
+
+	test("an outline plan reads as its outline: the root and two levels, deeper ones folded", async () => {
+		const plan = item("outline-plan", { toolName: "ExitPlanMode", kind: "plan_approval" });
+		const node = (content: string, children: OutlineItem[] = []): OutlineItem => ({
+			content,
+			task: { status: "todo", assignee: null },
+			props: {},
+			children,
+		});
+		addPermission(plan, {
+			mode: "outline",
+			plan: serializeMarkdownOutline([
+				node("Ship the importer", [
+					node("Phase 1", [node("Parse", [node("Detail A"), node("Detail B")])]),
+					node("Phase 2"),
+				]),
+			]),
+			_planRoot: {
+				blockId: "b",
+				spaceId: "s",
+				pageId: "p",
+				address: "k/AbCdEfGh",
+				title: "Ship the importer",
+				round: 1,
+			},
+			_planSeq: 3,
+			_planBaseSeq: 0,
+			_planDiff: { counts: { added: 6, removed: 0, text: 0, task: 0, moved: 0 } },
+		});
+		await openDrawer();
+		await click("Review decision", row(plan.id));
+		const tree = row(plan.id).querySelector("[data-testid=outline-plan-tree]");
+		expect(tree).not.toBeNull();
+		expect(row(plan.id).querySelector("[data-md-body]")).toBeNull();
+		const rows = () =>
+			[...(tree?.querySelectorAll("[data-plan-row]") ?? [])].map((r) =>
+				r.getAttribute("data-plan-row"),
+			);
+		expect(rows()).toEqual(["r", "r.0", "r.0.0", "r.1"]);
+		const parse = tree?.querySelector('[data-plan-row="r.0.0"]');
+		expect(parse?.getAttribute("data-plan-open")).toBe("0");
+		expect(parse?.querySelector("[data-plan-badge]")?.textContent).toBe("+2");
+		await act(async () =>
+			(parse?.querySelector("[data-plan-toggle]") as HTMLButtonElement | null)?.click(),
+		);
+		expect(rows()).toEqual(["r", "r.0", "r.0.0", "r.0.0.0", "r.0.0.1", "r.1"]);
+		await click("Expand all", tree as ParentNode);
+		expect(rows()).toHaveLength(6);
+		await click("Collapse all", tree as ParentNode);
+		expect(rows()).toEqual(["r", "r.0", "r.0.0", "r.1"]);
 	});
 
 	test("each item stays independently busy and denial preserves feedback and frozen remote target", async () => {

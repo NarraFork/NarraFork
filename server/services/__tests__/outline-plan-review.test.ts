@@ -774,17 +774,36 @@ describe("this version's reviews are not the plan (review round 1 N1, N2, N4)", 
 	test("a plan near the size limit is not sent back once its comments are written; the limit names bytes", async () => {
 		const plan = await planned();
 		const filler = "x".repeat(1000);
-		// About 245 KB of plan (one transaction holds at most 200 operations).
-		for (const batch of [0, 1])
-			await agentWrite(
-				plan.id,
-				plan.owner,
-				Array.from({ length: 120 }, (_, i) => ({
-					op: "insert" as const,
+		// About 245 KB of plan, laid out as a plan has to be (plan readability: short points in
+		// levels, at most 15 on one): 12 phases of 15 tasks of 5 details. Two phases a transaction
+		// (one holds at most 200 operations).
+		for (let pair = 0; pair < 6; pair++) {
+			const ops: OutlineOp[] = [];
+			for (const p of [pair * 2, pair * 2 + 1]) {
+				ops.push({
+					op: "insert",
+					tempId: `p${p}`,
 					parent: { id: plan.root },
-					content: `Detail ${batch}-${i}: ${filler}`,
-				})),
-			);
+					content: `Phase ${p}`,
+				});
+				for (let t = 0; t < 15; t++) {
+					ops.push({
+						op: "insert",
+						tempId: `t${p}-${t}`,
+						parent: { tempId: `p${p}` },
+						content: `Task ${p}-${t}`,
+						task: { status: "todo" },
+					});
+					for (let d = 0; d < 5; d++)
+						ops.push({
+							op: "insert",
+							parent: { tempId: `t${p}-${t}` },
+							content: `Detail ${p}-${t}-${d}: ${filler.slice(0, 245)}`,
+						});
+				}
+			}
+			await agentWrite(plan.id, plan.owner, ops);
+		}
 		const call = await exitPlanCall(plan.id, { mode: "outline" });
 		turns = [
 			async () => [

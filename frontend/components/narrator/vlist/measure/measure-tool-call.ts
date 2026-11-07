@@ -176,6 +176,13 @@ import {
 	QUESTION_STACK_GAP,
 } from "./measure-permission";
 import {
+	layoutPlanTree,
+	PLAN_TREE_PAD_X,
+	PLAN_TREE_PAD_Y,
+	PLAN_TREE_TOOLBAR_GAP,
+	planTreeToolbarHeight,
+} from "./measure-plan-tree";
+import {
 	type MeasuredReflectionNotice,
 	measureReflectionNotice,
 } from "./measure-reflection-notice";
@@ -1807,6 +1814,29 @@ export function measureToolBody(
 			}
 			if (blocks.length === 0) blocks.push(makeFixed(line, "detail-change-empty", 0));
 			return finishRegion(detail, blocks, innerWidth, null);
+		}
+
+		case "plan-tree": {
+			// An outline plan's tree (plan readability): the toolbar line when something is folded or
+			// opened, then the rows in the plan's capped box (scrolls past 0.85 × viewport, as the
+			// markdown plan did). Rows are laid out by `measure-plan-tree`.
+			const cap = resolveDetailCap("plan", viewportHeight);
+			const layout = layoutPlanTree(
+				detail.tree,
+				detail.view,
+				Math.max(1, innerWidth - PLAN_TREE_PAD_X * 2),
+			);
+			const blocks: PreparedBlock[] = [];
+			if (layout.toolbar)
+				blocks.push(makeFixed(planTreeToolbarHeight(), "detail-plan-toolbar", 0, { layout }));
+			const box = Math.min(layout.contentHeight + PLAN_TREE_PAD_Y * 2, cap);
+			blocks.push(
+				makeFixed(box, "detail-plan-tree", layout.toolbar ? PLAN_TREE_TOOLBAR_GAP : 0, {
+					layout,
+					cap,
+				}),
+			);
+			return finishRegion(detail, blocks, innerWidth, cap);
 		}
 
 		case "meta-rows": {

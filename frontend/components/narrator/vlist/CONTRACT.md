@@ -198,6 +198,10 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
   - **media 详情（截图/图片）带 `media.width/height` 时按宽高比预留**（`fitImageBox` 进 可用宽×cap，纯算术，见 measure-tool-call 的 `mediaContentPx`）：截图 metadata 自带宽高，无尺寸时回落固定 200px。
   - **需测量🔴**：SpecTasks 列表(任务数×行高)、Recall/Send/Pipeline/WebSearch 结构化列表段、各 badge 头部行、error 文本、AskUserQuestionBanner、ReflectionNotice、InlinePermission 的 Textarea(1-3/8-30 行)+动态按钮行。
   - isPlan 的 `vpHeight`=0.85×视口高 → **用视口高公式替代，不测 DOM**。plan 正文按 **markdown** 测量/渲染（与 chunked 路径的 `ContentViewer markdown` 对齐），并可前置一行 `_planFile` 来源提示；正文解析同样走有界前缀（块边界截断）。plan 详情**不向上转发 `onUnknownHeight`** —— 外框高度由 cap 决定，转发会让虚拟列表与滚动框互相打架。
+  - **大纲计划画成大纲（`plan-tree`，计划可读性）**：大纲会话的 ExitPlanMode（输入声明 `mode: "outline"` 或带服务端写的 `_planRoot`）、计划文本完整（不是服务端前缀）且能解析成一棵树（`@shared/outline-plan-tree`）时，正文不是 markdown 而是 `ToolPlanTreeDetail`：默认显示根和它下面两层（深度 0/1 的节点展开，深度 2 起折叠，折叠且有子块的行右侧画 `+N` 子块数），每块文字在概览里最多两行、超出加省略号，点箭头/`+N` 开合节点、点文字看全文，工具行「全部展开 / 全部收起」。
+    - **读者的开合是交互状态，不是渲染态**：`VListInteractionState.planTrees`（按卡片 key，`applyVListPlanTreeAction`），经 `ctx.planTreeView` 在适配时进 `classifyToolDetail` 的 `planView`，所以开合一次就重新测量；`extractDataRevision` 的 `|ptv:`（视图签名）和 `|ptx:`（计划文本签名）进缓存键，`rowInteractionSig` 也带上它；换 LOD 保留。
+    - **高度纯算术**（`measure/measure-plan-tree.ts`）：工具行（一行 xs，只在有折叠/截断或读者开合过时出现）+ 间距 + 盒子 `min(行高之和 + 上下内边距, 0.85×视口)`；每行 = 显示的视觉行数 × `line.body`，行间 2px。文字按硬换行一段一个 rich-inline flow，宽度 = 盒内宽 − 缩进（深度 × 16，超过 6 层不再缩进）− 箭头槽 − 复选框槽 − 折叠行的 `+N` 宽（xs 字体量出）。截断行在渲染层把最后一行按「宽度 − 省略号宽」重新排，**高度不变**。
+    - 全屏查看仍是计划的 markdown（`ToolPlanTreeDetail.markdown`，同一个 body id），但这张卡不画源码视图，所以不声明 `sourceInline`。被截断成前缀的计划、计划文件、不是一棵树的文本都照旧走 markdown。
 - **服务端截断的正文（`textTruncated`）预留整个 cap，且不占任何额外行**：
   - 无论普通 capped 正文（`cappedBodyHeight`）还是 markdown 正文（`measureMarkdownDetail`），只要正文是服务端前缀就把盒高钉在 `cap`，**不测前缀**。测前缀会让高度取决于服务端预算切在哪里（更宽的布局把前缀折成更少行 → 盒子变矮，剩余可滚内容无处安放）；cap 永不裁切，因为盒子本身 `overflow:auto`。
   - **没有"内容已截断"提示行**：完整 payload 由读者在正文盒内滚过一半时自动取（`VListContentViewHost` 的 capture 阶段 scroll 监听），或打开全屏查看器时取。两条路都经同一个 `fullPayloadRequested` 门控，所以仍是用户动作；又因为盒高已钉在 cap，落地的完整正文测得 `min(exact, cap)` —— 对任何溢出盒子的正文（每个服务端前缀都溢出）逐像素相同。

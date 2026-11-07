@@ -19,6 +19,12 @@ import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
 import { outlineAddressPath } from "../outline-links";
+import {
+	DEFAULT_PLAN_TREE_VIEW,
+	type PlanTree,
+	type PlanTreeView,
+	parsePlanTree,
+} from "../outline-plan-tree";
 import { readOutlineAskDisplay, readOutlineEditDisplay } from "../outline-tool-display";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
@@ -360,6 +366,22 @@ export interface ToolChangeRowsDetail {
 }
 
 /**
+ * 🔴 An outline plan as an outline (plan readability): the root and two levels under it, deeper
+ * levels folded with their child count, long text clamped, each opened by the reader
+ * (`outline-plan-tree.ts`; `view` is their choice, resolved during adaptation like every fold).
+ * Measured row by row (`measure-plan-tree.ts`) inside the plan's capped box.
+ *
+ * `markdown` is the same plan as the capped markdown body a plan file gets: what the fullscreen
+ * viewer opens and what a copy takes. It is never drawn inline.
+ */
+export interface ToolPlanTreeDetail {
+	kind: "plan-tree";
+	tree: PlanTree;
+	view: PlanTreeView;
+	markdown: ToolCappedDetail;
+}
+
+/**
  * Defensive ceilings on a read-only AskUserQuestion replay. The tool schema
  * already bounds these (1-4 questions, 2-4 options), but a malformed provider
  * payload must never turn into unbounded measurement work — same rationale as
@@ -619,7 +641,8 @@ export type ToolSectionBody =
 	| ToolMetaRowsDetail
 	| ToolAskDetail
 	| ToolGenUiDetail
-	| ToolChangeRowsDetail;
+	| ToolChangeRowsDetail
+	| ToolPlanTreeDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -952,6 +975,11 @@ interface ClassifyToolDetailFields {
 	 * result the model saw (`ToolChangeRowsDetail.toggle`). Folded by default.
 	 */
 	rawOpen?: boolean;
+	/**
+	 * The reader's view of an outline plan's tree (which nodes and texts they opened), keyed by
+	 * the card. Absent: the overview (the root and two levels under it).
+	 */
+	planView?: PlanTreeView;
 }
 
 /** Trim a possibly-null string; undefined when absent or blank. */
@@ -1083,7 +1111,13 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 		kind: "sections",
 		sections: base.sections.map((part) => ({
 			...part,
-			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
+			body:
+				part.body.kind === "capped"
+					? describeToolBody(part.body, input)
+					: // An outline plan's tree keeps its markdown for the viewer: the same identity.
+						part.body.kind === "plan-tree"
+						? { ...part.body, markdown: describeToolBody(part.body.markdown, input) }
+						: part.body,
 		})),
 	};
 }
@@ -1247,6 +1281,7 @@ function classifyByCategory(
 				inputJson,
 				metadata,
 				isFailStatus(status) ? nonEmptyTrimmedText(input.denyMessage) : undefined,
+				input.planView,
 			);
 		case "pipeline":
 			return classifyPipeline(toolName, inputJson, outputJson, metadata);
@@ -2716,10 +2751,23 @@ export function isServerAuthoredDenyMessage(text: string): boolean {
 	return text === PLACEHOLDER_DENY_MESSAGE || text.startsWith(REPROCESSING_FAILURE_DENY_PREFIX);
 }
 
+/**
+ * Whether an ExitPlanMode input is an outline plan's (outline P2 PR 8): the model declares
+ * `mode: "outline"`, and the server's resolution writes `_planRoot`. A plan file's input has
+ * neither.
+ */
+function isOutlinePlanInput(inputJson: unknown): boolean {
+	const input = asObject(inputJson);
+	if (!input) return false;
+	if (asObject(input._planRoot)) return true;
+	return typeof input.mode === "string" && input.mode.trim().toLowerCase() === "outline";
+}
+
 function classifyPlan(
 	inputJson: unknown,
 	metadata: Record<string, unknown> | null,
 	denyMessage?: string,
+	planView?: PlanTreeView,
 ): ToolDetailData | null {
 	const planText = extractField(inputJson, "plan") || String(asObject(inputJson)?.plan ?? "");
 	// `hasUsablePlanBody` rejects our own model-facing plan reference. It reaches
@@ -2737,13 +2785,23 @@ function classifyPlan(
 	// degrade them to monospace plain text. `_planFile` marks a file-based plan;
 	// pass the raw path through and let the render layer localize it.
 	const planFile = extractField(inputJson, "_planFile");
-	const body = capped("input.plan", "plan", {
+	const markdown = capped("input.plan", "plan", {
 		contentLines: countLines(planText),
 		text: planText,
 		...truncatedFlag(inputJson),
 		format: "markdown",
 		...(planFile ? { sourcePath: planFile } : {}),
 	});
+	// An outline plan reads as its outline (plan readability): folded to the root and two levels.
+	// Only a whole one: a server-side prefix is a cut tree, so it stays the capped markdown body
+	// (which fetches the rest as it is read), as does anything that is not one outline tree.
+	const tree =
+		markdown.textTruncated !== true && isOutlinePlanInput(inputJson)
+			? parsePlanTree(planText)
+			: null;
+	const body: ToolSectionBody = tree
+		? { kind: "plan-tree", tree, view: planView ?? DEFAULT_PLAN_TREE_VIEW, markdown }
+		: markdown;
 	// A DENIED plan carries the reviewer's feedback above the body.
 	//
 	// `permissionDenyMessage` is a TOP-LEVEL tool-call column, not part of

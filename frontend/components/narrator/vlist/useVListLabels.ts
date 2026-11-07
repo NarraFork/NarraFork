@@ -31,6 +31,7 @@ import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import type { PlanTreeLabels } from "./render/PlanTreeBody";
 
 /**
  * Literal placeholder passed as i18next's `count` so plural selection resolves
@@ -149,6 +150,11 @@ export interface VListRenderLabels {
 			thinkingChars: (chars: number) => string;
 			outputChars: (chars: number) => string;
 		};
+		/**
+		 * An outline plan's tree (ExitPlanMode of an outline session): its toolbar line, folds
+		 * and clamped texts. Render-only: each sits in a fixed line or a tooltip.
+		 */
+		planTree: PlanTreeLabels;
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
@@ -828,6 +834,18 @@ export function useVListLabels(): VListLabels {
 					thinking: t("reflectionThinking"),
 					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
 					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
+				},
+				planTree: {
+					overview: (count: number) => t("outlinePlan.tree.overview", { count }),
+					overviewAll: (count: number) => t("outlinePlan.tree.overviewAll", { count }),
+					expandAll: t("outlinePlan.tree.expandAll"),
+					collapseAll: t("outlinePlan.tree.collapseAll"),
+					expand: t("outlinePlan.tree.expand"),
+					collapse: t("outlinePlan.tree.collapse"),
+					hidden: (count: number) => t("outlinePlan.tree.hidden", { count }),
+					showWhole: t("outlinePlan.tree.showWhole"),
+					showLess: t("outlinePlan.tree.showLess"),
+					more: (count: number) => t("outlinePlan.tree.more", { count }),
 				},
 			},
 			toolCallGroup: {
