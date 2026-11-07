@@ -30,7 +30,7 @@ import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
-import { BundleError } from "@server/lib/credential-transfer/bundle";
+import { BundleError, bundleCatalogError } from "@server/lib/credential-transfer/bundle";
 import { AppError, catalogError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
@@ -1019,7 +1019,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		try {
 			sealedKeys = await openProviderKeys(preview.sealedKeys, options.passphrase);
 		} catch (error) {
-			if (error instanceof BundleError) throw catalogError(error.code);
+			if (error instanceof BundleError) bundleCatalogError(error);
 			throw error;
 		}
 	}

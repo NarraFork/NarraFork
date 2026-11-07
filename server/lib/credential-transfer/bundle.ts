@@ -7,6 +7,7 @@
  * on the libuv thread pool, so sealing and opening do not block the event loop.
  */
 import { createCipheriv, createDecipheriv, randomBytes, scrypt } from "node:crypto";
+import { catalogError } from "../errors";
 
 export const BUNDLE_FORMAT = "narrafork.credentials.v1";
 export const MIN_PASSPHRASE_LENGTH = 10;
@@ -38,6 +39,16 @@ interface SealedBundle {
 	iv: string;
 	tag: string;
 	data: string;
+}
+
+/**
+ * Map a BundleError to its catalog error. The codes are spelled out rather than passed through
+ * as `error.code` so the error-catalog reachability guard sees each one being thrown.
+ */
+export function bundleCatalogError(error: BundleError): never {
+	if (error.code === "BUNDLE_PASSPHRASE") throw catalogError("BUNDLE_PASSPHRASE");
+	if (error.code === "BUNDLE_TOO_LARGE") throw catalogError("BUNDLE_TOO_LARGE");
+	throw catalogError("BUNDLE_INVALID");
 }
 
 export class BundleError extends Error {

@@ -8,10 +8,11 @@ import {
 } from "../lib/credential-transfer";
 import {
 	BundleError,
+	bundleCatalogError,
 	MAX_BUNDLE_BYTES,
 	MIN_PASSPHRASE_LENGTH,
 } from "../lib/credential-transfer/bundle";
-import { catalogError, zodValidationError } from "../lib/errors";
+import { zodValidationError } from "../lib/errors";
 import { requireAdmin } from "../middleware/auth";
 import { consumeStepUp } from "../services/step-up-service";
 
@@ -46,7 +47,7 @@ async function withBundleErrors<T>(run: () => Promise<T>): Promise<T> {
 	try {
 		return await run();
 	} catch (error) {
-		if (error instanceof BundleError) throw catalogError(error.code);
+		if (error instanceof BundleError) bundleCatalogError(error);
 		throw error;
 	}
 }
