@@ -81,8 +81,17 @@ describe("folder operations", () => {
 		]);
 	});
 
-	test("dissolve keeps members in place, unpinned; remove takes a folder's members along", () => {
-		expect(shape(applyRecentTabFolderDissolve(base(), "f"))).toEqual(["a", "m1", "m2", "*b"]);
+	test("dissolve keeps members in place, in the folder's own section", () => {
+		// The folder is pinned: its members stay pinned, where the user was looking, instead
+		// of dropping into the unpinned area below.
+		expect(shape(applyRecentTabFolderDissolve(base(), "f"))).toEqual(["a", "*m1", "*m2", "*b"]);
+		const unpinnedFolder = [
+			tab("a", { pinned: true }),
+			folder("f"),
+			tab("m1", { folderId: "f", pinned: true }),
+			tab("m2", { folderId: "f" }),
+		];
+		expect(shape(applyRecentTabFolderDissolve(unpinnedFolder, "f"))).toEqual(["*a", "m1", "m2"]);
 		expect(shape(applyRecentTabRemove(base(), "folder:f"))).toEqual(["a", "*b"]);
 		const single = applyRecentTabRemove(base(), "narrator:m1");
 		expect(shape(applyRecentTabRemove(single, "narrator:m2"))).toEqual(["a", "*b"]);

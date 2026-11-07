@@ -925,6 +925,46 @@ describe("recent-tabs folder deltas replay on the client", () => {
 		expect(reduceRecentTabsOperations(before, "work", result.operations)).toEqual(persisted);
 	}
 
+	it("dissolving a pinned folder keeps its members pinned, and undo brings the folder back", async () => {
+		seedLegacyTabs(["a", "b", "c"].map((id) => makeTab(id)));
+		await recentTabs.ensureMigrated("user-1");
+		const created = await recentTabs.createRecentTabFolder("user-1", {
+			targetKey: "narrator:b",
+			sourceKey: "narrator:c",
+			title: "F",
+		});
+		const folderId = created.folderId ?? "";
+		// The folder into the pinned block: its members go with it.
+		await recentTabs.pinRecentTab("user-1", `folder:${folderId}`, true);
+		const before = await recentTabs.listAllRecentTabs("user-1");
+		expect(before.filter((tab) => tab.type === "folder").map((tab) => tab.pinned)).toEqual([true]);
+
+		const dissolved = await recentTabs.dissolveRecentTabFolder("user-1", folderId);
+		expect(dissolved.changed).toBe(true);
+		expect(dissolved.undoToken).toBeString();
+
+		const after = await recentTabs.listAllRecentTabs("user-1");
+		expect(after.some((tab) => tab.type === "folder")).toBe(false);
+		// The members stayed in the pinned block they were released from.
+		expect(
+			after.filter((tab) => tab.id === "b" || tab.id === "c").map((tab) => !!tab.pinned),
+		).toEqual([true, true]);
+
+		const restored = await recentTabs.restoreRecentTabs("user-1", {
+			token: dissolved.undoToken,
+		});
+		expect(restored.changed).toBe(true);
+		const restoredTabs = await recentTabs.listAllRecentTabs("user-1");
+		const folder = restoredTabs.find((tab) => tab.type === "folder");
+		expect(folder?.pinned).toBe(true);
+		expect(
+			restoredTabs
+				.filter((tab) => tab.folderId === folderId)
+				.map((tab) => tab.id)
+				.sort(),
+		).toEqual(["b", "c"]);
+	});
+
 	it("create, join, reorder, pin, leave, dissolve and close", async () => {
 		seedLegacyTabs(["a", "b", "c", "d", "e"].map((id) => makeTab(id)));
 		await recentTabs.ensureMigrated("user-1");
