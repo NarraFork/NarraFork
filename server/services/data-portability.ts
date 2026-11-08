@@ -1233,7 +1233,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				break;
 			} catch (error) {
 				const code = (error as { code?: string } | null)?.code;
-				const busy = code === "SQLITE_BUSY" || code === "SQLITE_LOCKED";
+				// The transaction is deferred, so a concurrent commit surfaces as
+				// SQLITE_BUSY_SNAPSHOT: same "database is locked", suffixed code.
+				const busy = !!code?.startsWith("SQLITE_BUSY") || code === "SQLITE_LOCKED";
 				if (!busy || attempt >= 3) throw error;
 				await Bun.sleep(250 * attempt);
 			}
