@@ -269,8 +269,20 @@ async function withAncestors(
  * or null when no task is above it (or the chain is not known).
  */
 function treeOf(blockId: string, metas: Map<string, OutlineBlockMeta>): string | null {
-	let top: string | null = null;
-	let current = metas.get(blockId);
+	const meta = metas.get(blockId);
+	return meta
+		? treeFrom({ id: meta.id, parentId: meta.parentId, task: meta.taskJson !== null }, metas)
+		: null;
+}
+
+/** {@link treeOf} of a block known by its parent (a version): only its ancestors are read. */
+function treeFrom(
+	block: { id: string; parentId: string | null; task: boolean },
+	metas: Map<string, OutlineBlockMeta>,
+): string | null {
+	if (block.parentId === null) return null;
+	let top: string | null = block.task ? block.id : null;
+	let current = metas.get(block.parentId);
 	for (let i = 0; current && i <= OUTLINE_TEAM_ACTIVITY_LIMITS.depth; i++) {
 		if (current.parentId === null) return top;
 		if (current.taskJson) top = current.id;
@@ -442,15 +454,18 @@ async function lookAtSpace(
 	if (look.taskPageId && OUTLINE_TEAM_ACTIVITY_SCOPE.taskPage.lines > 0) pages.add(look.taskPageId);
 	const onPages = others.filter((c) => pages.has(c.pageId));
 	if (onPages.length === 0) return look;
+	// A changed block is placed by the parent its version had: only parents and their ancestors
+	// are read (a commit of 400 notes under one task reads that task's chain once).
 	await withAncestors(
 		store,
-		onPages.map((c) => c.blockId),
+		onPages.flatMap((c) => (c.parentId ? [c.parentId] : [])),
 		look.metas,
 	);
 	const treeOfChange = (c: OutlineRangeChange): string | null => {
-		const meta = look.metas.get(c.blockId);
-		// A block deleted since is placed by the parent its version had.
-		const t = meta ? treeOf(c.blockId, look.metas) : null;
+		const t = treeFrom(
+			{ id: c.blockId, parentId: c.parentId, task: !c.deleted && c.taskJson !== null },
+			look.metas,
+		);
 		return t !== null && trees.has(t) ? t : null;
 	};
 	const onTaskPage = (c: OutlineRangeChange) =>

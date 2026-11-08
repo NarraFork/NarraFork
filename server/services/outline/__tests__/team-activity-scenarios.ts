@@ -554,6 +554,32 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 		},
 	},
 	{
+		name: "a commit a read stops inside is read whole, once, by the next read",
+		async run(ctx) {
+			resetOutlineTeamActivityForTests();
+			const p = await project(ctx);
+			// B writes 200 notes under A's tree, twice: the first read stops inside the second commit.
+			for (let k = 0; k < 2; k++)
+				await write(
+					p.space.id,
+					agent(p.b, p.alice.id),
+					Array.from(
+						{ length: 200 },
+						(_, i): OutlineOp => ({
+							op: "insert",
+							parent: { id: p.root.blockId },
+							content: `note ${k}-${i}`,
+						}),
+					),
+					p.t.next(),
+				);
+			const look = await readOutlineTeamActivity(p.a, { locale: "en", now: p.t.look });
+			expect(look?.content.split("\n").slice(1)).toEqual([
+				`- Under ${link(p.root, "auth 模块稳定")}: session "B" added 400 notes`,
+			]);
+		},
+	},
+	{
 		name: "a person's commit made for the session is the person's, and told",
 		async run(ctx) {
 			resetOutlineTeamActivityForTests();
