@@ -2085,6 +2085,8 @@ export const workspaces = pgTable(
 			.notNull()
 			.references((): PgColumn => users.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
+		titleSource: text("title_source").notNull().default("manual"),
+		titleRevision: integer("title_revision").notNull().default(0),
 		tree: text("tree").notNull(),
 		layoutRevision: integer("layout_revision").notNull().default(0),
 		createdAt: bigint("created_at", { mode: "number" }).notNull(),
@@ -2113,6 +2115,7 @@ export const workspacePanels = pgTable(
 		index("idx_workspace_panels_workspace").on(table.workspaceId, table.sortOrder),
 		uniqueIndex("idx_workspace_panels_narrator").on(table.workspaceId, table.narratorId),
 		index("idx_workspace_panels_narrator_lookup").on(table.narratorId),
+		index("idx_workspace_panels_kind_workspace").on(table.kind, table.workspaceId, table.id),
 	],
 );
 
@@ -4364,7 +4367,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 141,
-  "columnCount": 1861,
+  "columnCount": 1863,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -16004,6 +16007,28 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "titleSource",
+          "name": "title_source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"manual\"",
+          "defaultExpression": "\"manual\""
+        },
+        {
+          "property": "titleRevision",
+          "name": "title_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "tree",
           "name": "tree",
           "kind": "text",
@@ -16173,6 +16198,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_workspace_panels_narrator_lookup",
           "columns": [
             "narratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_workspace_panels_kind_workspace",
+          "columns": [
+            "kind",
+            "workspaceId",
+            "id"
           ],
           "unique": false
         }

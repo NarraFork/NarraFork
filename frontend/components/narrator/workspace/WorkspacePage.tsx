@@ -22,6 +22,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import type { WorkspacePanel } from "@shared/workspace-panels";
 import {
 	IconArrowLeft,
@@ -50,6 +51,7 @@ import { type DirectorControl, DockviewWorkspace } from "./DockviewWorkspace";
 import { DEFAULT_DIRECTOR_PRIMARY_RATIO, type DirectorLeaf } from "./director-constants";
 import type { WorkspaceDirectorState } from "./dockview-layout";
 import type { WorkspacePanelParams } from "./panel-types";
+import { WorkspaceTitleGenerator } from "./WorkspaceTitleGenerator";
 
 const AddOutlinePanelModal = lazy(() =>
 	import("./AddOutlinePanelModal").then((m) => ({ default: m.AddOutlinePanelModal })),
@@ -103,23 +105,30 @@ export function WorkspacePage({
 	useWorkspaceChangeSync(workspaceId, handleWorkspaceDeleted);
 
 	// ── Editable title ──
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-	const serverTitle = (workspace as any)?.title as string | undefined;
+	const serverTitle = workspace?.title;
 	const [editing, setEditing] = useState(false);
 	const [editTitle, setEditTitle] = useState("");
+	const editRevision = useRef<number | null>(null);
 
 	const startEditing = useCallback(() => {
 		setEditTitle(serverTitle || "");
+		editRevision.current = workspace?.titleRevision ?? 0;
 		setEditing(true);
-	}, [serverTitle]);
+	}, [serverTitle, workspace?.titleRevision]);
 
 	const commitTitle = useCallback(() => {
+		const revision = editRevision.current;
+		editRevision.current = null;
 		setEditing(false);
 		const trimmed = editTitle.trim();
-		if (trimmed && trimmed !== serverTitle) {
-			updateRef.current.mutate({ id: workspaceId, title: trimmed });
+		// A same-title save still marks the title as explicitly user-owned.
+		if (trimmed && revision !== null) {
+			updateRef.current.mutate(
+				{ id: workspaceId, title: trimmed, expectedTitleRevision: revision },
+				{ onError: (error) => notifications.show({ color: "red", message: error.message }) },
+			);
 		}
-	}, [editTitle, serverTitle, workspaceId]);
+	}, [editTitle, workspaceId]);
 
 	// ── Director mode ──
 	// DockviewWorkspace owns the dockview api + persistence; director mode is a
@@ -265,7 +274,10 @@ export function WorkspacePage({
 						onBlur={commitTitle}
 						onKeyDown={(e) => {
 							if (e.key === "Enter") commitTitle();
-							if (e.key === "Escape") setEditing(false);
+							if (e.key === "Escape") {
+								editRevision.current = null;
+								setEditing(false);
+							}
 						}}
 						autoFocus
 						styles={{ input: { minWidth: 120 } }}
@@ -287,6 +299,13 @@ export function WorkspacePage({
 						</Group>
 					</UnstyledButton>
 				)}
+				<WorkspaceTitleGenerator
+					key={workspaceId}
+					workspaceId={workspaceId}
+					titleSource={workspace.titleSource}
+					titleRevision={workspace.titleRevision}
+					editing={editing}
+				/>
 				<Box style={{ flex: 1 }} />
 				<Group gap={4}>
 					{outlineEnabled && (

@@ -520,6 +520,22 @@
 			"prevId": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
 			"version": "7",
 			"snapshotDigest": "35afd24fe71da1b35c8fc9fb75d252f93560e1549c4e18f1bd2594d3057d6f26"
+		},
+		{
+			"idx": 65,
+			"tag": "0065_workspace-auto-title",
+			"id": "0880024e-08f7-4aff-8440-7060586a6aaf",
+			"prevId": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
+			"version": "7",
+			"snapshotDigest": "c487631ef1a8e05d2fabc5fef7a0e002a7c403bd6c2348d764e00df4df886753"
+		},
+		{
+			"idx": 66,
+			"tag": "0066_workspace-outline-title-invalidation",
+			"id": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
+			"prevId": "0880024e-08f7-4aff-8440-7060586a6aaf",
+			"version": "7",
+			"snapshotDigest": "ce03b5a8956b6c97e9d06ed31669097c7b9164e809a6b08f9d1ffa7d21ab8967"
 		}
 	]
 }
