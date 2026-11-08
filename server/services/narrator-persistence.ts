@@ -2959,6 +2959,7 @@ const sqliteNarratorPersistence = {
 		updates: {
 			planReflectionAutoApproveOverride?: BooleanOverride;
 			dangerReflectionOverride?: DangerReflectionOverride;
+			questionReflectionOverride?: BooleanOverride;
 			autoContinuationOverride?: AutoContinuationOverride;
 			tasksReminderIntervalOverride?: number | null;
 		},
