@@ -340,11 +340,27 @@ export async function setNarratorGitIdentityPick(
 	invalidateNarratorGitIdentityPickCache(narratorId, userId);
 }
 
+async function assertFolderOwned(userId: string, folderId: string): Promise<void> {
+	const folder = await db
+		.select({ id: userRecentTabs.id })
+		.from(userRecentTabs)
+		.where(
+			and(
+				eq(userRecentTabs.userId, userId),
+				eq(userRecentTabs.type, "folder"),
+				eq(userRecentTabs.entityId, folderId),
+			),
+		)
+		.limit(1);
+	if (folder.length === 0) throw new NotFoundError("Sidebar folder", folderId);
+}
+
 /** Which of this user's identities commits inside one sidebar folder use, or null for none. */
 export async function getFolderGitIdentityPick(
 	userId: string,
 	folderId: string,
 ): Promise<string | null> {
+	await assertFolderOwned(userId, folderId);
 	const row = await db
 		.select({ identityId: folderGitIdentityBindings.identityId })
 		.from(folderGitIdentityBindings)
@@ -369,18 +385,7 @@ export async function setFolderGitIdentityPick(
 	folderId: string,
 	identityId: string | null,
 ): Promise<void> {
-	const folder = await db
-		.select({ id: userRecentTabs.id })
-		.from(userRecentTabs)
-		.where(
-			and(
-				eq(userRecentTabs.userId, userId),
-				eq(userRecentTabs.type, "folder"),
-				eq(userRecentTabs.entityId, folderId),
-			),
-		)
-		.limit(1);
-	if (folder.length === 0) throw new NotFoundError("Sidebar folder", folderId);
+	await assertFolderOwned(userId, folderId);
 	if (identityId === null) {
 		await db
 			.delete(folderGitIdentityBindings)

@@ -9,13 +9,16 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators, userGitIdentities, userRecentTabs, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 
 const { db, sqlite } = getTestDb();
 mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../websocket/narrator-ws", () => ({
+	broadcastToUser: () => {},
+	getNarratorPresenceBatch: () => new Map(),
+}));
 
 const {
 	createUserGitIdentity,
@@ -30,6 +33,7 @@ const {
 const { invalidateGitIdentityCache, resolveGitIdentityForTurn, resolveGitIdentityForUser } =
 	await import("../../lib/git-identity");
 const { sqliteAuthSessionStore: profileStore } = await import("../auth/sqlite-session-store");
+const { dissolveRecentTabFolder, moveRecentTab } = await import("../recent-tabs-service");
 const { updateProfileSchema } = await import("../../lib/validators/auth");
 
 // The actual PATCH parser, store and identity resolver, without opening the server database.
@@ -518,12 +522,13 @@ async function putNarratorInFolder(
 	folderId: string,
 	narrator: string,
 	order = 1,
+	canonicalKey = false,
 ): Promise<void> {
 	const now = new Date().toISOString();
 	await db.insert(userRecentTabs).values({
 		id: generateId(),
 		userId,
-		tabKey: `narrator:${narrator}:${folderId}`,
+		tabKey: canonicalKey ? `narrator:${narrator}` : `narrator:${narrator}:${folderId}`,
 		section: "work",
 		type: "narrator",
 		entityId: narrator,
@@ -549,6 +554,23 @@ describe("folder inheritance", () => {
 		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
 			name: "Alice (work)",
 			email: "aw@e.com",
+		});
+	});
+
+	test("editing an identity evicts an already cached folder resolution", async () => {
+		const work = await createUserGitIdentity(alice, { name: "Alice", email: "a@e.com" });
+		const folderId = await makeFolder(alice);
+		await putNarratorInFolder(alice, folderId, narratorId);
+		await setFolderGitIdentityPick(alice, folderId, work.id);
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice",
+			email: "a@e.com",
+		});
+
+		await updateUserGitIdentity(alice, work.id, { name: "Alice (new)", email: "new@e.com" });
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice (new)",
+			email: "new@e.com",
 		});
 	});
 
@@ -605,7 +627,7 @@ describe("folder inheritance", () => {
 		await updateUserGitIdentity(alice, identity.id, { isDefault: true });
 		const first = await makeFolder(alice, 0);
 		const second = await makeFolder(alice, 2);
-		await putNarratorInFolder(alice, first, narratorId, 1);
+		await putNarratorInFolder(alice, first, narratorId, 1, true);
 		await setFolderGitIdentityPick(alice, first, work.id);
 		await setFolderGitIdentityPick(alice, second, oss.id);
 		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
@@ -613,12 +635,8 @@ describe("folder inheritance", () => {
 			email: "aw@e.com",
 		});
 
-		// Move the session into the second folder and drop the layout memo.
-		await db
-			.delete(userRecentTabs)
-			.where(eq(userRecentTabs.tabKey, `narrator:${narratorId}:${first}`));
-		await putNarratorInFolder(alice, second, narratorId, 3);
-		invalidateGitIdentityCache(alice);
+		// The real sidebar mutation must evict the cached first-folder lookup itself.
+		await moveRecentTab(alice, { key: `narrator:${narratorId}`, folderId: second });
 
 		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
 			name: "Alice (oss)",
@@ -626,12 +644,31 @@ describe("folder inheritance", () => {
 		});
 	});
 
+	test("dissolving a folder evicts its cached inheritance", async () => {
+		const identity = await createUserGitIdentity(alice, { name: "Alice", email: "a@e.com" });
+		const work = await createUserGitIdentity(alice, { name: "Alice (work)", email: "aw@e.com" });
+		const folderId = await makeFolder(alice);
+		await putNarratorInFolder(alice, folderId, narratorId);
+		await setFolderGitIdentityPick(alice, folderId, work.id);
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice (work)",
+			email: "aw@e.com",
+		});
+
+		await dissolveRecentTabFolder(alice, folderId);
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice",
+			email: "a@e.com",
+		});
+		expect((await listUserGitIdentities(alice)).map((row) => row.id)).toContain(identity.id);
+	});
+
 	test("another user's folder cannot be bound or read", async () => {
 		const bobs = await createUserGitIdentity(bob, { name: "Bob", email: "b@e.com" });
 		const bobsFolder = await makeFolder(bob);
 
 		await expect(setFolderGitIdentityPick(alice, bobsFolder, bobs.id)).rejects.toThrow();
-		expect(await getFolderGitIdentityPick(alice, bobsFolder)).toBeNull();
+		await expect(getFolderGitIdentityPick(alice, bobsFolder)).rejects.toThrow();
 	});
 
 	test("another user's identity cannot be bound to my folder", async () => {

@@ -188,7 +188,9 @@ describe("folder git identity endpoints", () => {
 		await putFolderPick(folderId, identityId);
 
 		actingUserId = "user-b";
-		expect((await getFolderPick(folderId)).selectedId).toBeNull();
+		expect((await app.request(`/user-preferences/git-identity/folders/${folderId}`)).status).toBe(
+			404,
+		);
 		expect((await putFolderPick(folderId, identityId)).status).toBe(404);
 	});
 

@@ -156,9 +156,9 @@ function loadIdentityQueryDependencies() {
  * enough that a stale entry is never surprising; edits evict their own entries
  * immediately (see {@link invalidateGitIdentityCache}).
  *
- * Two kinds of entries share the map: `user:<id>` for the user's default
- * identity and `pick:<narratorId>:<userId>` for one user's choice of identity
- * for one narrator. `null` is cached in both: "nothing configured" and "no
+ * Three kinds of entries share the map: `user:<id>` for the user's default,
+ * `pick:<narratorId>:<userId>` for a narrator pick, and `folder:<folderId>:<userId>`
+ * for a folder pick. `null` is cached in all of them: "nothing configured" and "no
  * pick" are common cases and must not re-query on every command.
  */
 const IDENTITY_CACHE_TTL_MS = 30_000;
@@ -188,8 +188,16 @@ export function invalidateGitIdentityCache(userId?: string | null): void {
 	identityCache.delete(userCacheKey(userId));
 	const suffix = `:${userId}`;
 	for (const key of identityCache.keys()) {
-		if (key.startsWith("pick:") && key.endsWith(suffix)) identityCache.delete(key);
+		if ((key.startsWith("pick:") || key.startsWith("folder:")) && key.endsWith(suffix)) {
+			identityCache.delete(key);
+		}
 	}
+	invalidateNarratorFolderCache(userId);
+}
+
+/** Drop cached narrator→folder lookups after any sidebar layout mutation for this user. */
+export function invalidateNarratorFolderCache(userId: string): void {
+	const suffix = `:${userId}`;
 	for (const key of folderOfCache.keys()) {
 		if (key.endsWith(suffix)) folderOfCache.delete(key);
 	}
@@ -341,7 +349,13 @@ async function fetchFolderPick(folderId: string, userId: string): Promise<GitIde
 	const rows = await db
 		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
 		.from(folderGitIdentityBindings)
-		.innerJoin(userGitIdentities, eq(userGitIdentities.id, folderGitIdentityBindings.identityId))
+		.innerJoin(
+			userGitIdentities,
+			and(
+				eq(userGitIdentities.id, folderGitIdentityBindings.identityId),
+				eq(userGitIdentities.userId, userId),
+			),
+		)
 		.where(
 			and(
 				eq(folderGitIdentityBindings.folderId, folderId),
