@@ -488,6 +488,14 @@
 			"prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
 			"version": "7",
 			"snapshotDigest": "c72a83d718b1d4f06ffe3b3030fdc15a18f7d57aa67657a136f95ec545ff8b1e"
+		},
+		{
+			"idx": 61,
+			"tag": "0061_submission_author_read",
+			"id": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
+			"prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
+			"version": "7",
+			"snapshotDigest": "6ee0ea437708c2e7d7d59873f16084fed98d57e61226cc6433dbc6a6f6892f3a"
 		}
 	]
 }

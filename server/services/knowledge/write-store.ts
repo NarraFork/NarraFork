@@ -363,6 +363,16 @@ export interface MarkSubmissionConflictWrite {
 	now: string;
 }
 
+/**
+ * The author acknowledging a verdict. Scoped to `authorUserId` on purpose: the row is only
+ * theirs, so a caller cannot mark somebody else's verdict read even with a valid id.
+ */
+export interface MarkSubmissionAuthorReadWrite {
+	submissionIds: string[];
+	authorUserId: string;
+	now: string;
+}
+
 export interface ApproveStandalonePublishWrite {
 	submissionId: string;
 	draftId: string;
@@ -635,6 +645,12 @@ export interface KnowledgeWriteStore {
 	 * claimable; rejects with `ValidationError` when another reviewer already closed it.
 	 */
 	markSubmissionConflict(input: MarkSubmissionConflictWrite): Promise<void>;
+	/**
+	 * Stamp `author_read_at` on the caller's OWN verdicts. Idempotent and already-read rows
+	 * are left untouched, so a repeated open does not rewrite the timestamp. Returns the
+	 * number of rows actually stamped.
+	 */
+	markSubmissionAuthorRead(input: MarkSubmissionAuthorReadWrite): Promise<number>;
 	/**
 	 * Approve a STANDALONE publish: create the global entry + first revision (resolving
 	 * a unique slug inside the section), link + archive the personal entry, and mark the

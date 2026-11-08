@@ -442,7 +442,15 @@ export interface KnowledgeSubmissionOutcome {
 	verdict: KnowledgeVerdict | null;
 	findingsJson: KnowledgeFinding[] | null;
 	reviewedAt: string | null;
+	/** When the author opened this verdict. Null = still unread (counted by the bell). */
+	authorReadAt: string | null;
 	createdAt: string;
+}
+
+/** Unread verdicts on the caller's own submissions, for the bell badge. */
+export interface KnowledgeSubmissionOutcomeUnreadCount {
+	count: number;
+	capped: boolean;
 }
 
 export interface KnowledgeDraftDiff {
