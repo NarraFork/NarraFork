@@ -600,6 +600,7 @@ export function useVListLabels(): VListLabels {
 			taskNoticeChangeAnswers: t("sidecar.taskNotice.changeAnswers", { n: "{n}" }),
 			taskNoticeChangeClaimable: t("sidecar.taskNotice.changeClaimable"),
 			taskNoticeChangeOverlap: t("sidecar.taskNotice.changeOverlap", { path: "{path}" }),
+			taskNoticeChangeOverlapHidden: t("sidecar.taskNotice.changeOverlapHidden"),
 			taskNoticeActivityTitle: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
 			taskNoticeJoin: t("sidecar.taskNotice.join"),
 			taskNoticeWhoJoin: t("sidecar.taskNotice.whoJoin"),

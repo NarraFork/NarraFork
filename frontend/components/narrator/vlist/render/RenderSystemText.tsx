@@ -1085,6 +1085,22 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 				...(row.indent ? { paddingLeft: TASK_NOTICE_INDENT } : {}),
 			}}
 		>
+			{row.lead ? (
+				<span
+					data-task-notice-by=""
+					title={row.lead}
+					style={{
+						...noticeText(),
+						...NOWRAP_ELLIPSIS,
+						// Whole up to a third of the row: a short name never gives way to the title.
+						flex: "0 0 auto",
+						maxWidth: "33%",
+						color: "var(--mantine-color-dimmed)",
+					}}
+				>
+					{row.lead}
+				</span>
+			) : null}
 			{row.statusFrom && row.status ? (
 				<>
 					<StatusChip chip={row.statusFrom} />

@@ -500,6 +500,82 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 		},
 	},
 	{
+		name: "big commits early in the window: what comes after them is still told, in this look or the next",
+		async run(ctx) {
+			resetOutlineTeamActivityForTests();
+			const p = await project(ctx);
+			/** A person pastes a page of notes: one commit of 181 blocks, on a page of its own. */
+			const paste = async (k: number) =>
+				await write(
+					p.space.id,
+					human(p.alice.id),
+					[
+						{ op: "insert", tempId: "p", parent: null, content: `Notes ${k}` },
+						...Array.from(
+							{ length: 180 },
+							(_, i): OutlineOp => ({
+								op: "insert",
+								parent: { tempId: "p" },
+								content: `line ${k}-${i}`,
+							}),
+						),
+					],
+					p.t.next(),
+				);
+			const tick = async (status: "done" | "todo") =>
+				await write(
+					p.space.id,
+					agent(p.b, p.alice.id),
+					[{ op: "setTask", block: { id: p.refresh.blockId }, task: { status } }],
+					p.t.next(),
+				);
+			// Two of them, then B ticks A's task: the look reads on past them.
+			await paste(0);
+			await paste(1);
+			await tick("done");
+			const first = await readOutlineTeamActivity(p.a, { locale: "en", now: p.t.look });
+			expect(first?.content.split("\n").slice(1)).toEqual([
+				`- Under ${link(p.root, "auth 模块稳定")}: session "B" ticked ${link(p.refresh, "改刷新逻辑")} done`,
+			]);
+			// Five more, then B reopens it: this look runs out of reads first and says nothing yet;
+			// the next one goes on where it stopped, and tells it. Nothing is counted as left out.
+			for (let k = 2; k < 7; k++) await paste(k);
+			await tick("todo");
+			expect(
+				await readOutlineTeamActivity(p.a, { locale: "en", now: p.t.look + 60_000 }),
+			).toBeNull();
+			const next = await readOutlineTeamActivity(p.a, { locale: "en", now: p.t.look + 120_000 });
+			expect(next?.content.split("\n").slice(1)).toEqual([
+				`- Under ${link(p.root, "auth 模块稳定")}: session "B" reopened ${link(p.refresh, "改刷新逻辑")}`,
+			]);
+			expect(
+				await readOutlineTeamActivity(p.a, { locale: "en", now: p.t.look + 180_000 }),
+			).toBeNull();
+		},
+	},
+	{
+		name: "a person's commit made for the session is the person's, and told",
+		async run(ctx) {
+			resetOutlineTeamActivityForTests();
+			const p = await project(ctx);
+			// A person ticks a task of A's tree in a commit made for A (as locking a plan for it is).
+			await writeOutline(
+				{
+					spaceId: p.space.id,
+					ops: [{ op: "setTask", block: { id: p.refresh.blockId }, task: { status: "done" } }],
+					actor: { kind: "human", id: p.alice.id },
+					narratorId: p.a,
+					responsibleUserId: p.alice.id,
+				},
+				{ now: () => p.t.next() },
+			);
+			const look = await readOutlineTeamActivity(p.a, { locale: "en", now: p.t.look });
+			expect(look?.content.split("\n").slice(1)).toEqual([
+				`- Under ${link(p.root, "auth 模块稳定")}: ${p.alice.username} ticked ${link(p.refresh, "改刷新逻辑")} done`,
+			]);
+		},
+	},
+	{
 		name: "nothing for a spec session, a subagent, or a session without anything around it",
 		async run(ctx) {
 			resetOutlineTeamActivityForTests();

@@ -2075,6 +2075,7 @@
 			"changeAnswers": "{{n}} question(s) answered",
 			"changeClaimable": "put in the claim pool",
 			"changeOverlap": "also changing {{path}}",
+			"changeOverlapHidden": "another session's task is also changing it",
 			"activityTitle": "Team activity: {{n}} change(s)",
 			"join": "; ",
 			"whoJoin": ", ",

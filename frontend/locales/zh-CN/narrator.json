@@ -2072,6 +2072,7 @@
 			"changeAnswers": "回答了 {{n}} 个提问",
 			"changeClaimable": "放进可领取池",
 			"changeOverlap": "也在改 {{path}}",
+			"changeOverlapHidden": "另一个会话的任务也在改它",
 			"activityTitle": "团队动态：{{n}} 处变化",
 			"join": "；",
 			"whoJoin": "、",

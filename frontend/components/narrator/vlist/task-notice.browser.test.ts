@@ -134,6 +134,7 @@ for (const { name, options } of CASES) {
 			"origin_notice",
 			"tasks_notice",
 			"tasks_notice",
+			"tasks_notice",
 		]);
 		for (const card of cards) {
 			expect({ kind: card.kind, painted: card.painted }).toEqual({
@@ -165,6 +166,21 @@ for (const { name, options } of CASES) {
 			expect(finished?.statuses).toEqual(["进行中", "完成"]);
 		} else if (options.width >= 420) {
 			expect(delegated?.text).toContain("委派中 2");
+		}
+		// Outline P2 PR 10b. Team activity: who made each change leads its row and stays readable
+		// beside a long title, even at phone width; a file whose task cannot be named is said once.
+		const activity = cards[8];
+		expect(activity?.title).toBe("团队动态：6 处变化");
+		if (options.expanded) {
+			// Short names whole; a long one cut, but a good part of it still there.
+			expect(activity?.by.map((by) => [by.text, by.truncated])).toEqual([
+				["一个名字非常长的会话标题用来测试这一行会不会被截断", true],
+				["alice", false],
+				["B", false],
+			]);
+			expect(activity?.by[0]?.width ?? 0).toBeGreaterThanOrEqual(60);
+			expect(activity?.text.split("agent-presence.ts").length).toBe(2);
+			expect(activity?.text).toContain("另一个会话的任务也在改它");
 		}
 		if (options.expanded) {
 			// Unfolded cards are taller than one line; the folded ones are all one line.

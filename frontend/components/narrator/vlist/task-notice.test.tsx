@@ -279,19 +279,28 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 					title: "T12 改登录页",
 					changes: [{ kind: "overlap", path: "auth/refresh.ts" }],
 				},
+				{
+					// A task the session may not name: the row is the path, not said twice.
+					address: "",
+					title: "src/shared.ts",
+					by: "D",
+					changes: [{ kind: "overlap", path: "src/shared.ts" }],
+				},
 			],
 			more: 3,
 		});
 		const folded = specOf(segment);
 		const data = folded.data as TaskNoticeData;
-		expect(data.title).toBe("团队动态：7 处变化");
-		expect(data.summary.tail).toBe("等 6 项");
-		expect(data.rows.map((row) => row.note ?? null)).toEqual([
-			"B",
-			"alice；加了 2 条笔记",
-			"C；新加；放进可领取池",
-			"也在改 auth/refresh.ts",
-			null,
+		expect(data.title).toBe("团队动态：8 处变化");
+		expect(data.summary.tail).toBe("等 7 项");
+		// Who first (a long title cannot push it out), then what changed.
+		expect(data.rows.map((row) => [row.lead ?? null, row.note ?? null])).toEqual([
+			["B", null],
+			["alice", "加了 2 条笔记"],
+			["C", "新加；放进可领取池"],
+			[null, "也在改 auth/refresh.ts"],
+			["D", "另一个会话的任务也在改它"],
+			[null, null],
 		]);
 		expect(data.rows[0]).toMatchObject({
 			status: { label: "完成", color: "green" },
@@ -302,7 +311,7 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		const measured = VLIST_REGISTRY[open.kind].measure(open.data, 800, 5, open.opts) as never as {
 			rowCount: number;
 		};
-		expect(measured.rowCount).toBe(5);
+		expect(measured.rowCount).toBe(6);
 	});
 
 	it("the interrupt guard: how many are open, outline tasks linked, spec tasks plain", () => {

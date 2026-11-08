@@ -46,13 +46,18 @@
  * when the session may read them.
  *
  * READS (bounded, indexed, SQLite and PostgreSQL alike): per space (at most
- * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.spaces}) the versions of at most
- * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace} commits without content (at most
- * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerSpace}), those commits, the versions before them
- * by primary key, the related tasks (claims by holder, open tasks, the session's recent writes),
- * ancestors by primary key, claims of changed tasks, at most
- * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.heads} titles. The session runtime runs on SQLite only, so
- * rows are written there; the reads are shared with PostgreSQL and tested on both.
+ * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.spaces}) the newest
+ * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace} commits of the window at most, their
+ * versions without content oldest first, {@link OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerRead} a read
+ * and {@link OUTLINE_TEAM_ACTIVITY_LIMITS.readsPerSpace} reads at most (a read stops before a commit
+ * it cannot take whole, so the next one starts there; one commit larger than a read is taken up to
+ * the limit); when the reads run out first, the space's cursor stays after the last commit read
+ * whole and the next look goes on from there. Then those commits, the related tasks (claims by
+ * holder, open tasks, the session's recent writes), only the versions on the pages of the related
+ * trees and the task page, the versions before them by primary key, ancestors by primary key,
+ * claims of changed tasks, at most {@link OUTLINE_TEAM_ACTIVITY_LIMITS.heads} titles. Older commits
+ * of a busy window are passed over, uncounted. The session runtime runs on SQLite only, so rows
+ * are written there; the reads are shared with PostgreSQL and tested on both.
  */
 import { hotSafe } from "@server/lib/hot-safe";
 import type { Locale } from "@server/lib/i18n";
@@ -134,8 +139,9 @@ export const OUTLINE_TEAM_ACTIVITY_LIMITS = {
 	spaces: 3,
 	/** Newest commits of a space read per look; older ones are counted. */
 	commitsPerSpace: 50,
-	/** Versions those commits wrote, read without content. */
-	versionsPerSpace: 300,
+	/** Versions of those commits one read takes (without content), and reads a space gets a look. */
+	versionsPerRead: 300,
+	readsPerSpace: 3,
 	/** Titles read per look. */
 	heads: 30,
 	/** Trees per space. */
@@ -221,8 +227,8 @@ type ActorKey = string;
 
 interface SpaceLook {
 	drafts: Draft[];
-	/** Changes left out of the lines for the limits (counted). */
-	more: number;
+	/** The last seq read whole: where the space's cursor goes. */
+	readThrough: number;
 	/** Blocks of this space that drafts name, with their metas. */
 	metas: Map<string, OutlineBlockMeta>;
 	/** The task page, for "read on". */
@@ -281,8 +287,12 @@ async function rootsOf(store: OutlineStore, ids: Iterable<string>): Promise<Map<
 	return new Map(unique.map((id) => [id, sessions.get(id)?.root ?? id]));
 }
 
-/** Who made a commit: the session it was written for, a person, or the system. */
+/**
+ * The session a commit is the work of: an agent's, or a system write made for a session. A
+ * person's commit is the person's, even made for a session (a plan locked for it).
+ */
 function writerOf(commit: OutlineCommitRow): string | null {
+	if (commit.actorKind === "human") return null;
 	return commit.narratorId ?? (commit.actorKind === "agent" ? commit.actorId : null);
 }
 
@@ -339,26 +349,51 @@ function chainOf(
 	return out;
 }
 
+/**
+ * The versions of the commits `(from, to]` of a space, oldest first, in reads of at most
+ * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerRead}, at most
+ * {@link OUTLINE_TEAM_ACTIVITY_LIMITS.readsPerSpace} reads; and the last seq read whole.
+ */
+async function readWindow(
+	store: OutlineStore,
+	spaceId: string,
+	from: number,
+	to: number,
+): Promise<{ rows: OutlineRangeChange[]; readThrough: number }> {
+	const per = OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerRead;
+	const rows: OutlineRangeChange[] = [];
+	let after = from;
+	for (let n = 0; n < OUTLINE_TEAM_ACTIVITY_LIMITS.readsPerSpace; n++) {
+		const read = await store.listCommitRangeChanges(spaceId, after, to, per + 1);
+		if (read.length <= per) {
+			rows.push(...read);
+			return { rows, readThrough: to };
+		}
+		// The read stopped inside the commit of its last row: take the commits before it whole and
+		// start the next read at it. One commit larger than a read is taken up to the limit.
+		const cut = (read[per] as OutlineRangeChange).seq;
+		const whole = read.filter((r) => r.seq < cut);
+		if (whole.length === 0) {
+			rows.push(...read.slice(0, per));
+			after = cut;
+		} else {
+			rows.push(...whole);
+			after = cut - 1;
+		}
+	}
+	return { rows, readThrough: after };
+}
+
 /** What one space's window says, for the session (see the module header). */
 async function lookAtSpace(
 	ctx: LookContext,
 	space: OutlineSpaceRow,
 	from: number,
 	to: number,
-	skipped: number,
 ): Promise<SpaceLook> {
 	const { store, root } = ctx;
-	// Older commits than those read, and versions past the read's limit, are counted, not looked
-	// at (a line saying so only goes out with something to say).
-	const look: SpaceLook = { drafts: [], more: skipped, metas: new Map(), taskPageId: null };
-	const read = await store.listCommitRangeChanges(
-		space.id,
-		from,
-		to,
-		OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerSpace + 1,
-	);
-	const changes = read.slice(0, OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerSpace);
-	if (read.length > changes.length) look.more++;
+	const { rows: changes, readThrough } = await readWindow(store, space.id, from, to);
+	const look: SpaceLook = { drafts: [], readThrough, metas: new Map(), taskPageId: null };
 	if (changes.length === 0) return look;
 	const commits = new Map(
 		(await store.getCommitsBySeqs(space.id, [...new Set(changes.map((c) => c.seq))])).map((c) => [
@@ -391,13 +426,27 @@ async function lookAtSpace(
 	const [taskPage] = await store.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
 	look.taskPageId = taskPage?.id ?? null;
 	const related = await relatedTasks(ctx, space);
-	await withAncestors(store, [...related, ...others.map((c) => c.blockId)], look.metas);
+	await withAncestors(store, related, look.metas);
 	const trees = new Set<string>();
 	for (const id of related) {
 		if (trees.size >= OUTLINE_TEAM_ACTIVITY_LIMITS.trees) break;
 		const tree = treeOf(id, look.metas);
 		if (tree) trees.add(tree);
 	}
+	// Only the pages of those trees and the task page can say anything: the rest are not read on.
+	const pages = new Set<string>();
+	for (const tree of trees) {
+		const page = look.metas.get(tree)?.pageId;
+		if (page) pages.add(page);
+	}
+	if (look.taskPageId && OUTLINE_TEAM_ACTIVITY_SCOPE.taskPage.lines > 0) pages.add(look.taskPageId);
+	const onPages = others.filter((c) => pages.has(c.pageId));
+	if (onPages.length === 0) return look;
+	await withAncestors(
+		store,
+		onPages.map((c) => c.blockId),
+		look.metas,
+	);
 	const treeOfChange = (c: OutlineRangeChange): string | null => {
 		const meta = look.metas.get(c.blockId);
 		// A block deleted since is placed by the parent its version had.
@@ -408,7 +457,7 @@ async function lookAtSpace(
 		OUTLINE_TEAM_ACTIVITY_SCOPE.taskPage.lines > 0 &&
 		look.taskPageId !== null &&
 		c.pageId === look.taskPageId;
-	const wanted = others.filter((c) => treeOfChange(c) !== null || onTaskPage(c));
+	const wanted = onPages.filter((c) => treeOfChange(c) !== null || onTaskPage(c));
 	if (wanted.length === 0) return look;
 
 	// Every version of the blocks wanted, in order, and the version before the window.
@@ -607,14 +656,17 @@ export async function readOutlineTeamActivity(
 			cursor && now - cursor.at <= OUTLINE_TEAM_ACTIVITY_LIMITS.lookbackMs
 				? cursor.seq
 				: await seqBefore(store, space, since);
-		current.cursors.set(space.id, { seq: Math.max(from, latest), at: now });
-		if (latest <= from) continue;
-		let skipped = 0;
-		if (latest - from > OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace) {
-			skipped = latest - from - OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace;
-			from = latest - OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace;
+		if (latest <= from) {
+			current.cursors.set(space.id, { seq: Math.max(from, latest), at: now });
+			continue;
 		}
-		looks.push({ space, look: await lookAtSpace(ctx, space, from, latest, skipped) });
+		// A busy window: its newest commits only; the older ones are passed over, uncounted.
+		if (latest - from > OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace)
+			from = latest - OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace;
+		const look = await lookAtSpace(ctx, space, from, latest);
+		// Up to what was read whole: a look cut short goes on from there next time.
+		current.cursors.set(space.id, { seq: look.readThrough, at: now });
+		looks.push({ space, look });
 	}
 	// Files, from the time of the last look on.
 	const fileLines = OUTLINE_TEAM_ACTIVITY_SCOPE.files.lines;
@@ -633,8 +685,8 @@ export async function readOutlineTeamActivity(
 	// A file's line names its task through `overlap.ts`, which reads the task's space itself.
 	const drafts: Array<{ space: OutlineSpaceRow | null; draft: Draft }> = [];
 	let more = 0;
+	// Counted: changes read and found to concern the session that the limits leave out.
 	for (const { space, look } of looks) {
-		more += look.more;
 		// Trees first, a tree at most `linesPerTree`; then the task page, at most its lines.
 		const perTree = new Map<string, number>();
 		let page = 0;
