@@ -36,6 +36,7 @@ import {
 import { useLayoutEffect, useState } from "react";
 import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { preloadCreateNarratorModal } from "../narrator/CreateNarratorLazyModal";
+import { FolderGitIdentityMenu } from "./FolderGitIdentityMenu";
 import { RecentTabDetails } from "./RecentTabDetailCard";
 import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 
@@ -121,6 +122,8 @@ export interface TabContextMenuProps {
 	onLeaveFolder: (() => void) | null;
 	/** The narrator this tab stands for, when the per-narrator git identity pick applies. */
 	gitIdentityNarratorId: string | null;
+	/** The folder this row is, when the per-folder git identity pick applies. */
+	gitIdentityFolderId: string | null;
 	/**
 	 * Touch only: the row's details, shown above the actions. Touch has no hover card, and
 	 * the menu (opened with a left swipe) is where a touch user can reach them.
@@ -182,6 +185,7 @@ export function TabContextMenu({
 	folder,
 	onLeaveFolder,
 	gitIdentityNarratorId,
+	gitIdentityFolderId,
 	detailsTab,
 	t,
 }: TabContextMenuProps) {
@@ -332,6 +336,9 @@ export function TabContextMenu({
 					)}
 					{gitIdentityNarratorId && gitIdentityVisibility.contextMenu && (
 						<TabGitIdentityMenu narratorId={gitIdentityNarratorId} onClose={onClose} />
+					)}
+					{gitIdentityFolderId && gitIdentityVisibility.folderContextMenu && (
+						<FolderGitIdentityMenu folderId={gitIdentityFolderId} onClose={onClose} />
 					)}
 					{canReveal && (
 						<UnstyledButton px="xs" py={4} onClick={onReveal} style={{ borderRadius: 4 }}>

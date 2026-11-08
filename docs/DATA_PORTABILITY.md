@@ -20,7 +20,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`、`narrator_text_snapshots`。**新增的表不会自动包含** |
+| `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`、`narrator_text_snapshots`、`folder_git_identity_bindings`。**新增的表不会自动包含** |
 | `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`autoExcludedProviders`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`。**不含 Key**：所有 `apiKey` 都是空的 |
 | `provider-keys.sealed.json` | 只在导出供应商时出现。导出的每个供应商的**全部** Key（自定义 API 的多 Key 连同标签、开关、网络身份；NUG、TokenDance、Command Code 各一个），按导出方的归属 id 分组，用导出时设置的口令封装（与凭据迁移同一格式：scrypt + AES-256-GCM，口令至少 10 个字符），见 `server/services/data-portability-keys.ts` |
 | `manifest.json` | `{ version, exportedAt, counts }`。有 `provider-keys.sealed.json` 时 `version` 是 2，否则是 1；导入时校验 `version <= 2` |
@@ -42,6 +42,7 @@
 | 引用 / 工具调用 | `INSERT OR IGNORE` |
 | 消息块 `narrator_blocks` | `INSERT OR IGNORE`。`body_rows_only = 1` 时正文只在块行里，旧包没有这张表时跳过 |
 | 文本快照 `narrator_text_snapshots` | 会话导出携带完整共享内容库（含 prefix contract、parts、context updates、tools manifest 及其 children）。至少一个会话新增或覆盖时，按 hash `INSERT OR IGNORE` 合并**整包**内容，不按单个会话精确过滤；全跳过或只导入请求时不搬运。旧包缺表时跳过。引用与内容同事务导入，并刷新包内 hash 的 GC 宽限时间（含已有 hash 复用），防止并发 mark/sweep 删掉刚导入的引用 |
+| 文件夹 Git 身份绑定 `folder_git_identity_bindings` | 随会话数据按主键 `INSERT OR IGNORE` 合并；旧包缺表时跳过。目标库必须已有对应用户和身份，缺失引用的入站绑定会被跳过；身份的 `user_id` 还必须与绑定一致，避免跨用户串联。用户与身份本体不在快照里 |
 | 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则跳过 |
 | 供应商 Key | 包里有密文且勾选了供应商时必须给口令，否则报 `IMPORT_PASSPHRASE_REQUIRED`；只导请求或会话时不需要。① 在导入事务**之前**解密（scrypt 是异步的，事务是同步的），口令错误报 `BUNDLE_PASSPHRASE`，什么都不写。② 把每个供应商的第一个 Key 放回导入的配置里，所以"同 apiKey + 同 baseUrl 视为同一供应商"的去重照常成立，保存设置时第一个 Key 经投影写进 Key 存储。③ 事务**提交成功之后**，给新加入的自定义 API 供应商写入其余的 Key（按导入后的本地 id，前缀改名后同样正确），并补上第一个 Key 的标签、开关和网络身份。与本地供应商合并的、被跳过的保留本地 Key，不覆盖。Key 存储是事务之外的文件，单个 Key 写入失败只记日志，结果里 `keysFailed` 计数，其余照常写入 |
 | 旧版包（`version: 1`） | `providers.json` 里的明文 Key 照旧导入，不要求口令 |
@@ -60,7 +61,7 @@
 
 - 分项：`requests`（删 `api_requests` 与按天汇总它的 `usage_daily`）、`sessions`（删会话及其消息/引用/工具调用，
   消息块随消息级联删除；并把 `terminals` / `benchmark_task_results` 的 `narrator_id` 置空，
-  保留这些数据本体）、
+  保留这些数据本体，同时清空不随会话外键级联的 `folder_git_identity_bindings`）、
   `providers`（清空全部供应商配置：含平台实例、隐藏模型、逐模型协议与自定义模型；
   **不清模型自定义参数**（`overrides.json`），那里是用户手写的数据）。
 - 全量：以上全部。

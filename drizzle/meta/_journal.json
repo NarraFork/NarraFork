@@ -1723,6 +1723,13 @@
       "when": 1794136137719,
       "tag": "0245_narrator_workspace_directories",
       "breakpoints": true
+    },
+    {
+      "idx": 246,
+      "version": "6",
+      "when": 1794137353073,
+      "tag": "0246_folder-git-identity-bindings",
+      "breakpoints": true
     }
   ]
 }

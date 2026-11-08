@@ -48,6 +48,7 @@ import {
 } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { AppError, ValidationError } from "../lib/errors";
+import { invalidateNarratorFolderCache } from "../lib/git-identity";
 import { generateId } from "../lib/id";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser } from "../websocket/narrator-ws";
@@ -878,6 +879,9 @@ function persistMutationLocked(
 		operations: diffOperations(before, after),
 		removedCount: options.removedCount,
 	};
+	// Moves, folder removal/dissolve and reordering can all change which folder's identity
+	// a narrator inherits. Invalidate centrally so every layout mutation is covered.
+	invalidateNarratorFolderCache(userId);
 	if (options.undoTabs && options.undoTabs.length > 0) {
 		const token = generateId();
 		storeUndo({
