@@ -9,8 +9,10 @@ import type { ToolContext } from "../types";
  *
  * - Team tracking: no-op unless the narrator is a subagent (parentNarratorId).
  * - Overlap (outline P2 PR 10b, `services/outline/overlap.ts`): which session's task in progress
- *   changed the file. Resolves to the one line the tool's result ends with when another session's
- *   task in progress changed the same file (never for Bash), else null.
+ *   changed the file. With `options.hint` (a tool that puts the line in its result: Write, Edit,
+ *   StructSed) resolves to the one line the result ends with when another session's task in
+ *   progress changed the same file, else null; without it the change is only recorded, so a pair
+ *   is not marked told for a line nobody shows.
  * - Attribution: records who/which tool changed the file, keyed by workspace
  *   path. Fully fault-tolerant; never throws.
  *
@@ -28,7 +30,7 @@ export async function trackFileChange(
 	action: "write" | "edit" | "bash" = "edit",
 	backend: ExecutionBackend = localBackend,
 	lineStats?: { added: number; removed: number } | null,
-	options?: { evidenceRecorded: boolean; toolName?: "StructSed" },
+	options?: { evidenceRecorded: boolean; toolName?: "StructSed"; hint?: boolean },
 ): Promise<string | null> {
 	// Team file-change tracking (subagents only). A UI projection failure cannot
 	// turn a durably settled mutation into a failed execution.
@@ -49,7 +51,7 @@ export async function trackFileChange(
 	} catch {
 		// Rebuildable team display, not mutation evidence.
 	}
-	const hint = await outlineOverlap(ctx, filePath, action, backend);
+	const hint = await outlineOverlap(ctx, filePath, options?.hint === true, backend);
 	// The local v2 runtime already persisted exactly one effect projection. Never
 	// add a legacy row for it or write a decoded first-touch baseline again.
 	if (options?.evidenceRecorded) return hint;
@@ -91,7 +93,7 @@ export async function trackFileChange(
 async function outlineOverlap(
 	ctx: ToolContext,
 	filePath: string,
-	action: "write" | "edit" | "bash",
+	hint: boolean,
 	backend: ExecutionBackend,
 ): Promise<string | null> {
 	try {
@@ -108,7 +110,7 @@ async function outlineOverlap(
 			filePaths: [filePath],
 			backend,
 			locale: ctx.locale,
-			hint: action !== "bash",
+			hint,
 		});
 	} catch {
 		return null;

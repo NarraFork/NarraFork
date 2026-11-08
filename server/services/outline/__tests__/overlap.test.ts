@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { db } from "../../../db";
 import { narrators, projects, users } from "../../../db/schema";
 import { localBackend } from "../../../lib/agent/execution/local-backend";
-import { withOverlapHint } from "../../../lib/agent/tools/track-file-change";
+import { trackFileChange, withOverlapHint } from "../../../lib/agent/tools/track-file-change";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { invalidateTaskBackend } from "../../task-source";
@@ -133,12 +133,19 @@ async function startTask(spaceId: string, narratorId: string, owner: string, tit
 	return task;
 }
 
-/** A repository directory (`.git` a directory) or a linked worktree (`.git` a file). */
-function repo(kind: "checkout" | "worktree" = "checkout"): string {
+/**
+ * A repository directory (`.git` a directory), or a linked worktree of `of` (`.git` a file naming
+ * a git directory under `of`'s `.git/worktrees/`).
+ */
+function repo(kind: "checkout" | "worktree" = "checkout", of?: string): string {
 	const dir = mkdtempSync(join(tmpdir(), "nf-overlap-"));
 	dirs.push(dir);
 	if (kind === "checkout") mkdirSync(join(dir, ".git"));
-	else writeFileSync(join(dir, ".git"), "gitdir: /elsewhere/.git/worktrees/x\n");
+	else {
+		const gitdir = join(of ?? "/elsewhere", ".git", "worktrees", "x");
+		mkdirSync(gitdir, { recursive: true });
+		writeFileSync(join(dir, ".git"), `gitdir: ${gitdir}\n`);
+	}
 	mkdirSync(join(dir, "src"), { recursive: true });
 	return dir;
 }
@@ -210,7 +217,7 @@ describe("the hint", () => {
 	test("the same repository-relative path in two worktrees is one key; another path or project is not", async () => {
 		const t = await team();
 		const main = repo("checkout");
-		const worktree = repo("worktree");
+		const worktree = repo("worktree", main);
 		await noteOutlineFileChange(change(t.a, t.projectId, main, "src/auth.ts"));
 		// A subdirectory as the working directory: the path is still the repository's.
 		mkdirSync(join(worktree, "src", "deep"), { recursive: true });
@@ -224,6 +231,55 @@ describe("the hint", () => {
 		).toBeNull();
 		const elsewhere = await project(t.owner);
 		expect(await noteOutlineFileChange(change(t.b, elsewhere, worktree, "src/auth.ts"))).toBeNull();
+	});
+
+	test("a submodule and a repository nested inside are repositories of their own", async () => {
+		const t = await team();
+		const outer = repo("checkout");
+		await noteOutlineFileChange(change(t.a, t.projectId, outer, "src/auth.ts"));
+		// A repository of its own inside the outer one: the same relative path is another file.
+		const nested = join(outer, "vendor", "lib");
+		mkdirSync(join(nested, ".git"), { recursive: true });
+		mkdirSync(join(nested, "src"), { recursive: true });
+		expect(
+			await noteOutlineFileChange(change(t.b, t.projectId, nested, "src/auth.ts", { now: T0 + 1 })),
+		).toBeNull();
+		// A submodule (its git directory under the outer one's `.git/modules/`): another one too.
+		const sub = join(outer, "vendor", "sub");
+		mkdirSync(join(outer, ".git", "modules", "vendor", "sub"), { recursive: true });
+		mkdirSync(join(sub, "src"), { recursive: true });
+		writeFileSync(join(sub, ".git"), "gitdir: ../../.git/modules/vendor/sub\n");
+		expect(
+			await noteOutlineFileChange(change(t.b, t.projectId, sub, "src/auth.ts", { now: T0 + 2 })),
+		).toBeNull();
+		// The outer repository's own file still is the same file.
+		expect(
+			await noteOutlineFileChange(change(t.b, t.projectId, outer, "src/auth.ts", { now: T0 + 3 })),
+		).toContain(t.taskA.address);
+	});
+
+	test("a tool that does not show the line only records: the pair is not marked told", async () => {
+		const t = await team();
+		const dir = repo();
+		await noteOutlineFileChange(change(t.a, t.projectId, dir, "src/auth.ts"));
+		const ctx = {
+			narratorId: t.b,
+			projectId: t.projectId,
+			cwd: dir,
+			locale: "en",
+		} as unknown as Parameters<typeof trackFileChange>[0];
+		const file = join(dir, "src/auth.ts");
+		// As the browser's download and the generated UI call it: no hint asked, none given.
+		expect(
+			await trackFileChange(ctx, file, "write", localBackend, null, { evidenceRecorded: true }),
+		).toBeNull();
+		// Write and Edit ask for it: the line comes, not taken by the call before.
+		expect(
+			await trackFileChange(ctx, file, "edit", localBackend, null, {
+				evidenceRecorded: true,
+				hint: true,
+			}),
+		).toContain(t.taskA.address);
 	});
 
 	test("one session's tree: its subagent hears nothing of its root, nor the root of its subagent", async () => {

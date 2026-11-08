@@ -890,7 +890,7 @@ export const structSedTool: ToolDefinition = {
 					typeof linesAdded === "number" && typeof linesRemoved === "number"
 						? { added: linesAdded, removed: linesRemoved }
 						: null,
-					{ evidenceRecorded: false, toolName: "StructSed" },
+					{ evidenceRecorded: false, toolName: "StructSed", hint: true },
 				);
 				return withOverlapHint(result, hint);
 			}

@@ -5,9 +5,11 @@
  *
  * THE INDEX (memory only)
  * -----------------------
- * Keyed by (project id, repository-relative path): the path is taken relative to the git top level
- * of the session's working directory, so the same file in two worktrees of one repository is one
- * key. A remote workspace has no local top level: its key is the device and the execution
+ * Keyed by (project id, repository, repository-relative path): the path is taken relative to the
+ * git top level of the session's working directory, and the repository is its common git
+ * directory, so the same file in two worktrees of one repository is one key while a submodule or
+ * a repository nested inside another is a repository of its own (its `src/a.ts` is not the outer
+ * one's). A remote workspace has no local top level: its key is the device and the execution
  * backend's identity of the absolute path. A session without a main project is not recorded (team
  * tasks live in the project's space anyway).
  *
@@ -40,7 +42,7 @@
  * Every read is bounded and indexed: a session's claims (holder index), the tasks by primary key,
  * the claims and roots of the tasks to name, a space and a title or two.
  */
-import { stat } from "node:fs/promises";
+import { open, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { eventBus } from "@server/lib/event-bus";
 import { hotOnce, hotSafe } from "@server/lib/hot-safe";
@@ -105,20 +107,20 @@ const state = hotSafe("narrafork.outlineOverlap", () => ({
 	told: new Map<string, Map<string, number>>(),
 	/** Root session → its tasks in progress, as last read. */
 	doing: new Map<string, { at: number; tasks: Promise<OutlineSessionTask[]> }>(),
-	/** Working directory → its git top level (null: none). */
-	tops: new Map<string, { at: number; top: Promise<string | null> }>(),
+	/** Working directory → its git top level and repository (null: none). */
+	tops: new Map<string, { at: number; top: Promise<OutlineRepoRoot | null> }>(),
 	/** Root session → its main project, as last read. */
 	projects: new Map<string, { at: number; projectId: Promise<string | null> }>(),
 }));
 
 const SEP = "\u0000";
 
-function keyOf(projectId: string, path: string): string {
-	return `${projectId}${SEP}${path}`;
+function keyOf(projectId: string, where: OutlineOverlapPlace): string {
+	return `${projectId}${SEP}${where.repo}${SEP}${where.path}`;
 }
 
 function pathOf(key: string): string {
-	return key.slice(key.indexOf(SEP) + 1);
+	return key.slice(key.lastIndexOf(SEP) + 1);
 }
 
 /** Forget everything (tests; a new process starts this way). */
@@ -140,15 +142,50 @@ export function outlineOverlapStats(): { keys: number; sessions: number } {
 // Where a file is: (project, repository-relative path)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function findTopLevel(dir: string): Promise<string | null> {
+/** A checkout's top level, and the repository it is a checkout of (its common git directory). */
+interface OutlineRepoRoot {
+	top: string;
+	repo: string;
+}
+
+async function realOr(path: string): Promise<string> {
+	return await realpath(path).catch(() => path);
+}
+
+/** The first `bytes` of a file as text ("" when it cannot be read). */
+async function readHead(path: string, bytes: number): Promise<string> {
+	const handle = await open(path, "r").catch(() => null);
+	if (!handle) return "";
+	try {
+		const { bytesRead, buffer } = await handle.read(Buffer.alloc(bytes), 0, bytes, 0);
+		return buffer.subarray(0, bytesRead).toString("utf8");
+	} catch {
+		return "";
+	} finally {
+		await handle.close().catch(() => {});
+	}
+}
+
+/**
+ * The nearest ancestor holding `.git`, and its repository: a `.git` directory is its own; a
+ * `.git` file names its git directory (`gitdir: …`): a linked worktree's lies under the main
+ * repository's `worktrees/`, whose parent is the repository; anything else (a submodule's
+ * `modules/…`, a separate git directory) is a repository of its own.
+ */
+async function findRepoRoot(dir: string): Promise<OutlineRepoRoot | null> {
 	let current = resolve(dir);
 	for (let depth = 0; depth < 64; depth++) {
-		// A checkout has `.git` as a directory, a linked worktree as a file: either marks its top.
-		const found = await stat(join(current, ".git")).then(
-			() => true,
-			() => false,
-		);
-		if (found) return current;
+		const marker = join(current, ".git");
+		const info = await stat(marker).catch(() => null);
+		if (info?.isDirectory()) return { top: current, repo: await realOr(marker) };
+		if (info) {
+			const text = await readHead(marker, 4096);
+			const named = /^gitdir:\s*(.+)$/m.exec(text.slice(0, 4096))?.[1]?.trim();
+			if (!named) return { top: current, repo: await realOr(marker) };
+			const gitdir = toForwardSlash(resolve(current, named)).replace(/\/+$/, "");
+			const worktree = /^(.+)\/worktrees\/[^/]+$/.exec(gitdir);
+			return { top: current, repo: await realOr(worktree?.[1] ?? gitdir) };
+		}
 		const parent = dirname(current);
 		if (parent === current) return null;
 		current = parent;
@@ -156,11 +193,11 @@ async function findTopLevel(dir: string): Promise<string | null> {
 	return null;
 }
 
-/** The git top level of a local directory (the nearest ancestor holding `.git`), cached. */
-function topLevelOf(dir: string, now: number): Promise<string | null> {
+/** The git top level and repository of a local directory, cached. */
+function repoRootOf(dir: string, now: number): Promise<OutlineRepoRoot | null> {
 	const hit = state.tops.get(dir);
 	if (hit && now - hit.at < OUTLINE_OVERLAP_LIMITS.topLevelMs) return hit.top;
-	const top = findTopLevel(dir).catch(() => null);
+	const top = findRepoRoot(dir).catch(() => null);
 	state.tops.delete(dir);
 	state.tops.set(dir, { at: now, top });
 	while (state.tops.size > OUTLINE_OVERLAP_LIMITS.topLevels) {
@@ -178,25 +215,32 @@ export interface OutlineOverlapBackend {
 	paths: { identityKey(path: string): string };
 }
 
+/** Where a file is, as a key names it: a repository and a path in it. */
+export interface OutlineOverlapPlace {
+	repo: string;
+	path: string;
+}
+
 /**
- * The path a key names: repository-relative for a local file under the working directory's top
- * level; the device and the backend's identity of the path for a remote one; null otherwise.
+ * Where a file is: its repository and its path relative to the working directory's top level, for
+ * a local file under it; the device and the backend's identity of the path for a remote one; null
+ * otherwise.
  */
-export async function outlineOverlapPath(
+export async function outlineOverlapPlace(
 	backend: OutlineOverlapBackend,
 	cwd: string,
 	filePath: string,
 	now = Date.now(),
-): Promise<string | null> {
+): Promise<OutlineOverlapPlace | null> {
 	if (backend.kind !== "local") {
 		const identity = backend.paths.identityKey(filePath);
-		return identity ? `@${backend.deviceId}:${identity}` : null;
+		return identity ? { repo: `@${backend.deviceId}`, path: identity } : null;
 	}
-	const top = await topLevelOf(cwd, now);
-	if (!top) return null;
-	const rel = toForwardSlash(relative(top, resolve(cwd, filePath)));
+	const root = await repoRootOf(cwd, now);
+	if (!root) return null;
+	const rel = toForwardSlash(relative(root.top, resolve(cwd, filePath)));
 	if (!rel || rel === ".." || rel.startsWith("../") || isAbsolute(rel)) return null;
-	return rel;
+	return { repo: root.repo, path: rel };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -485,8 +529,8 @@ export async function noteOutlineFileChange(change: OutlineFileChange): Promise<
 		if (!projectId) return null;
 		const keys: string[] = [];
 		for (const filePath of change.filePaths.slice(0, OUTLINE_OVERLAP_LIMITS.filesPerCall)) {
-			const path = await outlineOverlapPath(change.backend, change.cwd, filePath, now);
-			if (path) keys.push(keyOf(projectId, path));
+			const place = await outlineOverlapPlace(change.backend, change.cwd, filePath, now);
+			if (place) keys.push(keyOf(projectId, place));
 		}
 		if (keys.length === 0) return null;
 		const doing = await outlineSessionDoing(root, now, store);
@@ -505,14 +549,15 @@ export async function noteOutlineFileChange(change: OutlineFileChange): Promise<
 		const verified = await verify(store, fresh);
 		if (verified.length === 0) return null;
 		const key = keys[0] as string;
+		const first = verified[0] as OutlineOverlap;
+		const named = (await describeOutlineOverlaps(root, [first], store)).get(
+			`${first.other}${SEP}${first.taskId}`,
+		);
+		// Told only once the line could be worded: a failure on the way tells it next time.
 		markTold(
 			root,
 			verified.map((o) => `${key}${SEP}${o.taskId}`),
 			now,
-		);
-		const first = verified[0] as OutlineOverlap;
-		const named = (await describeOutlineOverlaps(root, [first], store)).get(
-			`${first.other}${SEP}${first.taskId}`,
 		);
 		const locale: Locale = change.locale === "zh-CN" ? "zh-CN" : "en";
 		return getOutlineOverlapHint(

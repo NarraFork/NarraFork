@@ -198,6 +198,7 @@ export const writeTool: ToolDefinition = {
 			if (recorded) {
 				const hint = await trackFileChange(ctx, ioPath, "write", backend, null, {
 					evidenceRecorded: true,
+					hint: true,
 				});
 				return withOverlapHint(recorded, hint);
 			}
@@ -297,6 +298,7 @@ export const writeTool: ToolDefinition = {
 					typeof linesAdded === "number" && typeof linesRemoved === "number"
 						? { added: linesAdded, removed: linesRemoved }
 						: null,
+					{ evidenceRecorded: false, hint: true },
 				);
 				return withOverlapHint(result, hint);
 			});
