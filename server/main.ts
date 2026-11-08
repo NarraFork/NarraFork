@@ -122,7 +122,6 @@ import "./services/attention-hook-bridge"; // Bridge attention events into the h
 import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
-import { builtinApikeyQuotaEngine } from "./services/apikey-quota-plugin-engine";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
@@ -1880,11 +1879,9 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
-		// The built-in apikey-quota plugin runs detached on non-Windows, so it would outlive
-		// the server unless it is stopped here.
-		await shutdownStep(tracker, "apikeyQuotaPlugin.shutdown", () =>
-			builtinApikeyQuotaEngine.dispose(),
-		);
+		// The built-in apikey-quota plugin's process is owned by the shared plugin runtime
+		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
+		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}
