@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { BUILTIN_PLUGIN_ROOTS } from "@server/builtin-plugins/registry";
+import { BUILTIN_PLUGIN_ROOTS, resolveBuiltinPluginRoots } from "@server/builtin-plugins/registry";
 import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
@@ -495,7 +495,12 @@ export class PluginManager {
 	readonly root: string;
 	readonly disabled: boolean;
 	readonly packageStore: PluginPackageStoreLike;
-	readonly catalog: PluginCatalogLike;
+	/**
+	 * Not readonly: a compiled binary only knows where the builtin packages live after the
+	 * embedded copies are written out, which is async and therefore happens at the start of
+	 * `initializeInternal` rather than in the constructor.
+	 */
+	catalog: PluginCatalogLike;
 	readonly stateStore: PluginStateStore;
 	readonly healthRegistry: PluginHealthRegistry;
 	readonly permissionStore: PluginPermissionStore;
@@ -524,6 +529,8 @@ export class PluginManager {
 	private initializePromise?: Promise<PluginManagerStatus[]>;
 	private initialized = false;
 	private shuttingDown = false;
+	/** True when the caller supplied its own catalog, so builtin roots must not be re-resolved. */
+	private readonly catalogInjected: boolean;
 
 	constructor(options: PluginManagerOptions = {}) {
 		const root = resolve(options.root ?? options.packageStore?.root ?? getNarraforkPath("plugins"));
@@ -532,6 +539,7 @@ export class PluginManager {
 		this.packageStore = options.packageStore ?? new PluginPackageStore(root);
 		this.catalog =
 			options.catalog ?? new PluginCatalog({ root, builtinRoots: BUILTIN_PLUGIN_ROOTS });
+		this.catalogInjected = options.catalog !== undefined;
 		this.healthRegistry = options.healthRegistry ?? pluginHealthRegistry;
 		this.stateStore = options.stateStore ?? new PluginStateStore(root);
 		this.permissionStore =
@@ -1476,6 +1484,16 @@ export class PluginManager {
 	}
 
 	private async initializeInternal(): Promise<PluginManagerStatus[]> {
+		// In a compiled binary the builtin packages have no directory on disk until the embedded
+		// copies are written out. Constructing the catalog needs those paths, but the constructor
+		// is synchronous, so the swap happens here — before anything reads the catalog. An
+		// injected catalog (tests, tests-only wiring) is left alone.
+		if (!this.catalogInjected) {
+			const builtinRoots = await resolveBuiltinPluginRoots();
+			if (builtinRoots !== BUILTIN_PLUGIN_ROOTS) {
+				this.catalog = new PluginCatalog({ root: this.root, builtinRoots });
+			}
+		}
 		const snapshot = await this.stateStore.initialize();
 		await this.permissionStore.initialize();
 		if (this.packageStore.cleanupStaging) {

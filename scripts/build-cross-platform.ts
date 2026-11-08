@@ -286,6 +286,11 @@ console.log(
 	`✓ Generated ${relative(ROOT, GENERATED_MIGRATIONS_DATA_FILE)} (${sqlFiles.length} migrations)`,
 );
 
+// Step 4a-bis: builtin plugin packages. A compiled binary has no server/builtin-plugins/
+// directory, so the packages are embedded and materialized onto disk at startup
+// (see server/builtin-plugins/materialize.ts).
+await import("./generate-builtin-plugins");
+
 // Step 4b: PostgreSQL has its own generated journal and SQL bundle. Never merge
 // this into the legacy SQLite exports above. Missing PG inputs block the build.
 {

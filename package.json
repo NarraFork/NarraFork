@@ -157,7 +157,8 @@
 		"smoke:dock:visual": "bun scripts/visualize-dock-drag.ts",
 		"benchmark:narrator-history": "bun server/scripts/benchmark-narrator-history.ts",
 		"typecheck": "tsgo --noEmit",
-		"test:watch": "bun test --isolate --watch"
+		"test:watch": "bun test --isolate --watch",
+		"build:builtin-plugins": "bun scripts/generate-builtin-plugins.ts"
 	},
 	"trustedDependencies": [
 		"@parcel/watcher",

@@ -1,4 +1,6 @@
 import { join } from "node:path";
+import { isCompiledRuntime } from "../lib/runtime-target";
+import { materializeBuiltinPlugins } from "./materialize";
 
 /**
  * Plugins that ship inside the application bundle.
@@ -15,3 +17,17 @@ import { join } from "node:path";
  * malformed installed one instead of silently degrading.
  */
 export const BUILTIN_PLUGIN_ROOTS: readonly string[] = [join(import.meta.dir, "apikey-quota")];
+
+/**
+ * The roots to read in *this* process.
+ *
+ * From source, the checked-out packages are already on disk and are used directly. In a
+ * compiled single-file binary `import.meta.dir` points inside `$bunfs`, so the source path
+ * names nothing that exists; the packages were embedded at build time and have to be written
+ * back out first (see `materialize.ts`). Resolving this once here keeps the catalog's contract
+ * unchanged — it still receives plain directories and reads them through the ordinary package
+ * reader.
+ */
+export function resolveBuiltinPluginRoots(): Promise<readonly string[]> {
+	return isCompiledRuntime() ? materializeBuiltinPlugins() : Promise.resolve(BUILTIN_PLUGIN_ROOTS);
+}

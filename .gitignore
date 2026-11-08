@@ -127,6 +127,9 @@ drizzle-postgres/meta/_generation.lock/
 drizzle-postgres/meta/_generation_pending.json
 # Canonical SQLite schema generation must be reproducible in fresh clones.
 !scripts/generate-sqlite-migrations.ts
+# The builtin plugin embedding is produced by this script at build time, so a fresh clone
+# (and the cross-platform build that calls it) must have it.
+!scripts/generate-builtin-plugins.ts
 !scripts/check-sqlite-migration-assets.ts
 !scripts/finalize-sqlite-resource-migration.ts
 !scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts

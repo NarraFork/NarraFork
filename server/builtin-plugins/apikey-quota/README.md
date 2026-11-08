@@ -86,6 +86,7 @@
 | 包签名校验 | 无 | 包与应用同一信任根（同一份构建产物、同一份发布签名）。签名解决的是「第三方包来源不可信」，内置包不存在这个边界。 |
 | SBOM / 许可页单独登记 | 随应用 | 已并入应用的 SBOM 与许可清单，单独登记会产生重复条目。 |
 | 包目录布局 | 自身即 manifest 根（`<root>/manifest.json`），无 `<id>/<version>/<hash>` 层级 | 分发形态决定的物理布局差异；读取路径仍复用同一套包读取与校验函数，非另一套解析。 |
+| 单文件可执行文件中的来源 | 包内容在构建期被嵌入（`server/generated/embedded-builtin-plugins.ts`），启动时物化到 `~/.narrafork/builtin-plugins/<name>/<version>/`，再交给同一个包读取器 | 编译产物没有 `server/builtin-plugins/` 目录，`import.meta.dir` 指向 `$bunfs`。物化而不是新增一条内存读取路径，是为了让两种分发共用同一份校验；写入应用自己的 home 而非临时目录，避免被同机其他用户预置。 |
 
 其余全部一致，且由测试守护：
 
