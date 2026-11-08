@@ -307,6 +307,138 @@ describe("names and limits", () => {
 		expect(agents(theirs)[0]?.agent?.narratorId).toBe(worker);
 	});
 
+	test("read access revoked while the agent is shown: the person's view drops its name", async () => {
+		const worker = await session("Shared then private");
+		const grantId = generateId();
+		await db.insert(aclGrants).values({
+			id: grantId,
+			scopeType: "narrator",
+			scopeId: worker,
+			principalType: "user",
+			principalId: member,
+			capability: "read",
+			createdAt: NOW,
+		});
+		const { pageId } = await page(["Notes"]);
+		await run(worker, true);
+		await agentWrites(worker, pageId, "Working on it", true);
+		const theirs = open(member, pageId);
+		await waitFor(() => agents(theirs)[0]?.name === "Shared then private", 3000, "the name");
+		await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+		eventBus.emit({ type: "narrator:access_changed", narratorId: worker, reason: "grant_changed" });
+		await waitFor(() => agents(theirs)[0]?.name === "", 3000, "the name gone");
+		expect(agents(theirs)[0]?.agent).toEqual({ narratorId: null, session: null });
+	});
+
+	test("read access revoked while no agent is shown: someone joining later is not named it", async () => {
+		const worker = await session("Secret title");
+		const grantId = generateId();
+		await db.insert(aclGrants).values({
+			id: grantId,
+			scopeType: "narrator",
+			scopeId: worker,
+			principalType: "user",
+			principalId: member,
+			capability: "read",
+			createdAt: NOW,
+		});
+		const { pageId } = await page(["Notes"]);
+		await run(worker, true);
+		await agentWrites(worker, pageId, "Working on it", true);
+		const mine = open(owner, pageId);
+		const theirs = open(member, pageId);
+		await waitFor(() => agents(theirs)[0]?.name === "Secret title", 3000, "named");
+		// The member leaves; the owner keeps the page live; the run ends.
+		theirs.dispose();
+		links[1]?.disconnect();
+		await run(worker, false);
+		await waitFor(() => agents(mine).length === 0, 3000, "the agent gone");
+		// Revoked while nobody is shown, then the agent is back and the member rejoins.
+		await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+		eventBus.emit({ type: "narrator:access_changed", narratorId: worker, reason: "grant_changed" });
+		await run(worker, true);
+		await waitFor(() => agents(mine).length === 1, 3000, "the agent back");
+		const again = open(member, pageId);
+		await waitFor(() => again.ready && agents(again).length === 1, 3000, "rejoined");
+		expect(agents(again)[0]?.name).toBe("");
+		expect(agents(again)[0]?.agent?.narratorId).toBeNull();
+	});
+
+	test("revoked while shown and the person away: on their return the page names it to them nowhere, not even at join", async () => {
+		const worker = await session("Away title");
+		const grantId = generateId();
+		await db.insert(aclGrants).values({
+			id: grantId,
+			scopeType: "narrator",
+			scopeId: worker,
+			principalType: "user",
+			principalId: member,
+			capability: "read",
+			createdAt: NOW,
+		});
+		const { pageId } = await page(["Notes"]);
+		await run(worker, true);
+		await agentWrites(worker, pageId, "Working on it", true);
+		const mine = open(owner, pageId);
+		const theirs = open(member, pageId);
+		await waitFor(() => agents(theirs)[0]?.name === "Away title", 3000, "named");
+		theirs.dispose();
+		links[1]?.disconnect();
+		await waitFor(() => (liveSessionOf(pageId)?.participants.size ?? 0) === 1, 3000, "left");
+		const looks = spyOn(agentPresence, "readLiveAgents");
+		try {
+			await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+			eventBus.emit({
+				type: "narrator:access_changed",
+				narratorId: worker,
+				reason: "grant_changed",
+			});
+			await waitFor(() => looks.mock.calls.length > 0, 3000, "asked again");
+			await waitFor(() => agents(mine).length === 1, 3000, "still shown");
+		} finally {
+			looks.mockRestore();
+		}
+		const again = open(member, pageId);
+		// The join's own answer already leaves the name out.
+		await waitFor(() => again.ready && agents(again).length === 1, 3000, "rejoined");
+		expect(agents(again)[0]?.name).toBe("");
+	});
+
+	test("a person's commit made for a session is not the session's write", async () => {
+		const worker = await session("Lock owner");
+		const { pageId } = await page(["Notes"]);
+		await run(worker, true);
+		const task = await agentWrites(worker, pageId, "Held task", true);
+		const c = open(owner, pageId);
+		await waitFor(() => agents(c).length === 1, 3000, "the agent");
+		const seen: string[][] = [];
+		const original = agentPresence.readLiveAgents;
+		const looks = spyOn(agentPresence, "readLiveAgents").mockImplementation(async (input) => {
+			seen.push([...input.writes.keys()]);
+			return await original(input);
+		});
+		try {
+			// The task was started before anyone had the page open: no write of the session's is known.
+			// A person writes on the page for the session (as locking a plan for it does).
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "insert", parent: { id: pageId }, content: "The person's note" }],
+				actor: { kind: "human", id: owner },
+				narratorId: worker,
+				responsibleUserId: owner,
+			});
+			await waitFor(() => c.outline(pageId).includes("The person's note"), 3000, "applied");
+			seen.length = 0;
+			// A look for another reason: no write of the session's is in it.
+			await run(worker, true);
+			await waitFor(() => seen.length > 0, 3000, "a look");
+			expect(seen.every((writes) => writes.length === 0)).toBe(true);
+			expect(agents(c)[0]?.sel).toEqual({ b: [task] });
+		} finally {
+			looks.mockRestore();
+		}
+	});
+
 	test("at most eight agents a page; the rest are counted", async () => {
 		const { pageId } = await page(["Notes"]);
 		const n = OUTLINE_LIVE_LIMITS.agentsPerPage + 1;
@@ -354,5 +486,24 @@ describe("names and limits", () => {
 		} finally {
 			looks.mockRestore();
 		}
+	});
+});
+
+describe("which agents a page shows", () => {
+	test("a write's cursor lasts its while; holders past the writers are still found running", async () => {
+		const recent = await session("Recent writer");
+		const old = await session("Old writer");
+		await run(recent, true);
+		await run(old, true);
+		const now = Date.now();
+		const read = await agentPresence.readLiveAgents({
+			doing: [],
+			writes: new Map([
+				[old, { blocks: ["b-old"], at: now - OUTLINE_LIVE_AGENT_BOUNDS.writeMs - 1 }],
+				[recent, { blocks: ["b-new"], at: now - 1 }],
+			]),
+			now,
+		});
+		expect(read.agents.map((a) => [a.narratorId, a.blocks])).toEqual([[recent, ["b-new"]]]);
 	});
 });

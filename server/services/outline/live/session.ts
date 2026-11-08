@@ -330,6 +330,8 @@ export class LivePage {
 	private agentsMore = 0;
 	/** An agent keeps its participant number for the session's life. */
 	private readonly agentPnos = new Map<string, number>();
+	/** Agents' numbers count up from the base and are never given twice in a session. */
+	private nextAgentPno = OUTLINE_LIVE_AGENT_PNO_BASE;
 	private readonly agentPeersChanged = new Set<number>();
 	private readonly agentGone = new Set<number>();
 	private readonly agentCursors = new Set<number>();
@@ -616,6 +618,13 @@ export class LivePage {
 		dur?: number,
 	): Participant | Refusal {
 		if (this.closed || this.restartRequested) return { refused: "ended" };
+		// People are numbered below the agents' numbers: a session that has seen that many joins
+		// starts afresh (everyone rejoins a new one), as one whose document grew too large does.
+		if (this.nextPno >= OUTLINE_LIVE_AGENT_PNO_BASE) {
+			this.restartRequested = true;
+			this.onEnd(this, "ended", false);
+			return { refused: "ended" };
+		}
 		if (
 			canWrite
 				? this.editors >= OUTLINE_LIVE_LIMITS.editorsPerPage
@@ -1134,7 +1143,12 @@ export class LivePage {
 
 	/** Access changed somewhere: who may name which agent is asked again. */
 	agentAccessChanged(): void {
-		if (this.agents.size === 0) return;
+		// Nobody shown: forget every verdict, so an agent that shows later (or a person joining
+		// then) is judged afresh rather than from before the change.
+		if (this.agents.size === 0) {
+			this.agentReaders.clear();
+			return;
+		}
 		this.agentReadersStale = true;
 		this.requestAgents();
 	}
@@ -1175,13 +1189,17 @@ export class LivePage {
 		}
 	}
 
-	/** Learn who of these people may name these agents; tell those who now may. */
+	/**
+	 * Learn who of these people may name these agents. Everyone whose verdict changed (may now, or
+	 * may no longer) gets the whole picture again; a verdict learnt for the first time that says
+	 * "may not" changes nothing (an unnamed agent is what they were sent).
+	 */
 	private async learnAgentReaders(
 		people: readonly Participant[],
 		narratorIds: readonly string[],
 	): Promise<void> {
 		const persons = people.map((p) => ({ userId: p.userId, isAdmin: p.socket.isAdmin }));
-		const allowed = new Set<string>();
+		const changed = new Set<string>();
 		for (const narratorId of narratorIds) {
 			const readers = await readLiveAgentReaders(narratorId, persons).catch(
 				() => new Set<string>(),
@@ -1193,24 +1211,30 @@ export class LivePage {
 					this.agentReaders.set(person.userId, verdicts);
 				}
 				const may = readers.has(person.userId);
-				if (may && verdicts.get(narratorId) !== true) allowed.add(person.userId);
+				const prior = verdicts.get(narratorId);
+				if (may ? prior !== true : prior === true) changed.add(person.userId);
 				verdicts.set(narratorId, may);
 			}
 		}
-		if (this.closed || allowed.size === 0) return;
-		// Those who may now name an agent get the whole picture again.
+		if (this.closed || changed.size === 0) return;
 		for (const p of this.participants.values())
-			if (allowed.has(p.userId)) this.presenceBehind.add(p.pno);
+			if (changed.has(p.userId)) this.presenceBehind.add(p.pno);
 		this.schedulePresence();
 	}
 
 	private agentPnoOf(narratorId: string): number {
 		let pno = this.agentPnos.get(narratorId);
 		if (pno === undefined) {
-			if (this.agentPnos.size >= 4096) this.agentPnos.clear();
-			pno = OUTLINE_LIVE_AGENT_PNO_BASE + this.agentPnos.size;
-			while ([...this.agents.values()].some((a) => a.pno === pno)) pno++;
+			pno = this.nextAgentPno++;
 			this.agentPnos.set(narratorId, pno);
+			// Forget the oldest numbers of agents not shown; a number is never handed out again.
+			if (this.agentPnos.size > 4096) {
+				const shown = new Set([...this.agents.keys()]);
+				for (const id of this.agentPnos.keys()) {
+					if (this.agentPnos.size <= 2048) break;
+					if (!shown.has(id) && id !== narratorId) this.agentPnos.delete(id);
+				}
+			}
 		}
 		return pno;
 	}
@@ -1235,9 +1259,13 @@ export class LivePage {
 		// access change.
 		const people = [...this.participants.values()];
 		if (this.agentReadersStale) {
+			// Asked again with the verdicts as they were, so whoever gained or lost a name is told
+			// (`learnAgentReaders`); the verdicts of people not here are dropped, to be asked when
+			// they come back.
 			this.agentReadersStale = false;
-			this.agentReaders.clear();
-			for (const p of people) this.presenceBehind.add(p.pno);
+			const here = new Set(people.map((p) => p.userId));
+			for (const userId of [...this.agentReaders.keys()])
+				if (!here.has(userId)) this.agentReaders.delete(userId);
 			if (people.length > 0)
 				await this.learnAgentReaders(
 					people,
@@ -2265,7 +2293,9 @@ export class LivePage {
 			await this.applyVersions(versions, actorOf(commit));
 			// An agent wrote here (or the system for one): its cursor is on what it wrote. Any other
 			// commit that changed tasks may have ended or handed over one an agent holds.
-			if (commit.narratorId) {
+			// A person's commit made for a session (a plan locked for it) is the person's, not the
+			// session's work here.
+			if (commit.narratorId && commit.actorKind !== "human") {
 				this.noteAgentWrite(commit.narratorId, versions);
 				this.requestAgents();
 			} else if (

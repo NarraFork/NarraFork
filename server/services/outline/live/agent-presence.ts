@@ -37,7 +37,7 @@ export const OUTLINE_LIVE_AGENT_BOUNDS = {
 	writeMs: 60_000,
 	/** Blocks of an agent's latest write kept as its cursor. */
 	writtenBlocks: 3,
-	/** Narrators (holders and writers) read per refresh. */
+	/** Writers a page keeps (the most recent); holders are bounded by `doingRead`. */
 	narrators: 64,
 };
 
@@ -85,11 +85,15 @@ export async function readLiveAgents(input: {
 	const writes = [...input.writes]
 		.filter(([, w]) => input.now - w.at < OUTLINE_LIVE_AGENT_BOUNDS.writeMs)
 		.sort((a, b) => b[1].at - a[1].at);
-	// The most recent writers first, then holders in a stable order.
-	const candidates = [...new Set([...writes.map(([id]) => id), ...[...held.keys()].sort()])].slice(
-		0,
-		OUTLINE_LIVE_AGENT_BOUNDS.narrators,
-	);
+	// The most recent writers first, then holders in a stable order. Every one is read (at most
+	// the holders of the tasks read and the writers kept), so the running ones are found before the
+	// page's limit cuts the list.
+	const candidates = [
+		...new Set([
+			...writes.slice(0, OUTLINE_LIVE_AGENT_BOUNDS.narrators).map(([id]) => id),
+			...[...held.keys()].sort(),
+		]),
+	];
 	const interest = new Set(candidates);
 	if (candidates.length === 0) return { agents: [], more: 0, interest };
 	const facts = await readNarratorPresence(candidates);
