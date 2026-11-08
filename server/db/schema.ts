@@ -3545,6 +3545,12 @@ export const workspaces = sqliteTable(
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
+		// Conservative migration/import default: existing names must never be auto-renamed.
+		titleSource: text("title_source", { enum: ["default", "auto", "manual"] })
+			.notNull()
+			.default("manual"),
+		// Also invalidated when title inputs change, so generated candidates cannot become stale.
+		titleRevision: integer("title_revision").notNull().default(0),
 		/**
 		 * Serialized dockview layout — ARRANGEMENT ONLY.
 		 *
@@ -3645,6 +3651,8 @@ export const workspacePanels = sqliteTable(
 		 */
 		uniqueIndex("idx_workspace_panels_narrator").on(table.workspaceId, table.narratorId),
 		index("idx_workspace_panels_narrator_lookup").on(table.narratorId),
+		// Cursor-paged outline invalidation never scans layouts or non-outline memberships.
+		index("idx_workspace_panels_kind_workspace").on(table.kind, table.workspaceId, table.id),
 	],
 );
 

@@ -64,6 +64,8 @@ import type {
  */
 export interface WorkspaceDetail extends ApiEntity {
 	title?: string;
+	titleSource: "default" | "auto" | "manual";
+	titleRevision: number;
 	layout: string;
 	tree: string;
 	layoutRevision: number;
@@ -1452,8 +1454,13 @@ export const miscApi = {
 	createWorkspace: (data: { title?: string; tree: string }) =>
 		request<ApiEntity>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
 	/** Rename only. The layout goes through `saveWorkspaceLayout` (revision-guarded). */
-	updateWorkspace: (id: string, data: { title: string }) =>
+	updateWorkspace: (id: string, data: { title: string; expectedTitleRevision?: number }) =>
 		request<ApiEntity>(`/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	generateWorkspaceTitle: (id: string) =>
+		request<{ title: string; expectedTitleRevision: number }>(`/workspaces/${id}/generate-title`, {
+			method: "POST",
+			body: JSON.stringify({}),
+		}),
 	deleteWorkspace: (id: string) =>
 		request<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
 

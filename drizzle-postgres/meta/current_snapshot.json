@@ -1,6 +1,6 @@
 {
-  "id": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
-  "prevId": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+  "id": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
+  "prevId": "0880024e-08f7-4aff-8440-7060586a6aaf",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -25969,6 +25969,33 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_workspace_panels_kind_workspace": {
+          "name": "idx_workspace_panels_kind_workspace",
+          "columns": [
+            {
+              "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "workspace_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -26259,6 +26286,20 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "title_source": {
+          "name": "title_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'manual'"
+        },
+        "title_revision": {
+          "name": "title_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "tree": {
           "name": "tree",

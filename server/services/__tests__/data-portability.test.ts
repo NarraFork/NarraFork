@@ -129,6 +129,45 @@ beforeEach(async () => {
 });
 
 describe("data portability · 全链路", () => {
+	test("会话导入覆盖与清空只使本地 workspace 候选失效，不改已有名字", async () => {
+		sqlite.run(
+			"INSERT INTO users (id, username, password_hash, created_at) VALUES ('workspace-owner', 'workspace-owner', 'x', '2026-10-01T00:00:00Z')",
+		);
+		// Omit new columns, as an old importer would. The conservative defaults preserve names.
+		sqlite.run(
+			"INSERT INTO workspaces (id, user_id, title, tree, created_at, updated_at) VALUES ('local-workspace', 'workspace-owner', 'Keep my name', '{}', 0, 0)",
+		);
+		sqlite.run(
+			"INSERT INTO workspace_panels (id, workspace_id, kind, narrator_id, sort_order, created_at, updated_at) VALUES ('local-panel', 'local-workspace', 'narrator', 'sess-1', 0, 0, 0)",
+		);
+		const titleState = () =>
+			sqlite
+				.query(
+					"SELECT title, title_source, title_revision FROM workspaces WHERE id = 'local-workspace'",
+				)
+				.get();
+		expect(titleState()).toEqual({
+			title: "Keep my name",
+			title_source: "manual",
+			title_revision: 0,
+		});
+		expect(SNAPSHOT_TABLES.sessions as readonly string[]).not.toContain("workspaces");
+		const zip = await readFile((await exportData()).zipPath);
+		const preview = await previewImport(toArrayBuffer(zip), "workspace-compatible.zip");
+		await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect(titleState()).toEqual({
+			title: "Keep my name",
+			title_source: "manual",
+			title_revision: 1,
+		});
+		await clearData("sessions");
+		expect(titleState()).toEqual({
+			title: "Keep my name",
+			title_source: "manual",
+			title_revision: 2,
+		});
+		expect(count("workspace_panels")).toBe(0);
+	});
 	test("导出 → 预览 → 导入（跳过与覆盖）→ 清空", async () => {
 		const exported = await exportData();
 		expect(exported.counts).toEqual({ requests: 2, sessions: 1, providers: 1 });
