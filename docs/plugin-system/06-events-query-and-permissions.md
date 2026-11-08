@@ -171,6 +171,8 @@ type PublicEvent = {
 | `narrafork.narrator.attention` | `narratorId`, `reason`, `detail?`, `backgroundWorkActive?` | `narrator:attention`/resolved；`backgroundWorkActive=true` 表示 done 时仍有完成即唤醒的后台任务（后台 bash/子代理，不含传输与服务）在跑，通知渠道自行抑制，插件自行决定 | user-scoped |
 | `narrafork.narrator.message.changed` | `narratorId`, `messageId`, `role`, `createdAt`, `messageVersion` | 只给元数据，不给正文 | user-scoped |
 | `narrafork.narrator.tool.changed` | `narratorId`, `toolUseId`, `toolName`, `status`, `durationMs`, `outputBytes?` | 不给 input/output JSON | user-scoped |
+| `narrafork.narrator.spec.changed` | `narratorId`, `path`, `uri`, `revisionId?`, `updatedBy` | `spec:changed`（Dynamic Spec 文件写入）；大纲会话的任务提交后也照发 `path: "tasks.json"`、`revisionId: outline:<空间 key>:<seq>`，到旧 spec 命令下线为止（见 6.4） | user-scoped |
+| `narrafork.narrator.tasks.changed` | `narratorId`, `seq`, `revisionId`, `updatedBy`, `changes[{blockId,status}]`（≤50）, `truncated` | `outline:session_tasks_changed`：大纲根会话的会话空间里一次提交改了任务（行为边界页除外）；不给正文 | user-scoped |
 | `narrafork.narrator.permission.changed` | `narratorId`, `requestId`, `state`, `toolName?`, `decision?` | 不给完整请求参数 | user-scoped |
 | `narrafork.background-task.changed` | `taskId`, `parentNarratorId`, `taskType`, `status`, `outputBytes` | 不给累计 output | user-scoped |
 | `narrafork.terminal.changed` | `terminalId`, `narratorId?`, `chapterId?`, `status`, `exitCode?` | 不给 PTY 输出 | user-scoped |
@@ -444,6 +446,24 @@ type CommandResult<T> =
 - **[设计建议]** 只读 Query 可由调用方重试；幂等 Command 可使用相同 idempotency key 重试；未知副作用 Command 默认不自动重放。
 - **[设计建议]** 插件崩溃后，未产生副作用的 accepted 前调用可失败重试；已经暴露 tool/提交/写入语义的调用进入 `unknown` 或由核心服务恢复，不由 Plugin Manager 猜测。
 
+### 6.4 大纲会话的任务命令（outline P2 PR 12a）
+
+会话的任务改记在大纲里以后（`narrators.task_backend = 'outline'`），插件用按块的命令；旧的四个 Dynamic Spec 命令在大纲会话里照常工作，返回形状不变。
+
+| 命令 | 输入 | 返回 |
+|---|---|---|
+| `narrafork.narrator.tasks_read` | `narratorId`、可选 `cursor`、`limit ≤ 100` | 会话空间里的任务，文档顺序（行为边界页除外）：`blockId`、`address`、`text`（≤1000 字）、`status`（todo/doing/done/cancelled）、`waiting`、`humanCreated`、`parentBlockId`、`depth`、`versionSeq`，外加 `backend`、`spaceKey`、`seq`、`nextCursor` |
+| `narrafork.narrator.task_add` | `narratorId`、`text`（≤1000）、可选 `parentBlockId`、`start`、`protected` | `blockId`、`address`、`added`（同样正文已在就是 false）、`status`、`started` |
+| `narrafork.narrator.task_set_status` | `narratorId`、`blockId`、`status`、可选 `baseVersionSeq` | `blockId`、`address`、`status`、`versionSeq`、`changed` |
+| `narrafork.narrator.behavior_rules_set` | `narratorId`、`mode: upsert/clear`、`text`（≤2000） | 插件规程块的 `blockId`（清掉后为 null） |
+
+- 只对大纲根会话；Dynamic Spec 会话和子代理返回 `CONFLICT`（子代理没有自己的任务）。
+- 写入是会话的 system 提交，actor `plugin:<pluginId>`，责任人是会话负责人；加的任务管理者是插件。`protected: true` 记为人建任务（驱动 `protectedOnly` 续跑），不锁定（只有人锁定，D52）。
+- 插件不能把人建任务勾完成、取消或去掉人建标记（`CONFLICT`）；别人在做、版本对不上照写入路径的规则拒绝（`CONFLICT`）。
+- 规程块：行为边界页上每个插件一个块，短 id 由插件 id 推出；被人删了下次 upsert 恢复。
+- 旧命令在大纲会话里的转换：`spec_tasks_get` 读会话空间的顶层任务（等待中的读成 `blocked`，取消的不列，`protected` = 人建，`revisionId` 是 `outline:<空间 key>:<seq>`）；`spec_task_add` 等于 `task_add`；`spec_write tasks.json` 按正文比对转成一个提交（只取消任务页的直接子块，`blocked` 写成进行中加一条说明，不建提问；改人建的未完成任务整次拒绝，错误同 spec 会话）；`spec_write index.md` 整页替换会话空间的 `index.md` 页；`spec_behavior_fence_update` 写插件规程块（子代理仍写它自己的旧 fence）。
+- 每次转换在审计记录里加 `compat: "outline"`，并按（插件、命令）每小时最多记一条警告日志。旧命令在 outline plan PR 13 之后一个版本下线。
+
 ## 7. 权限模型
 
 ### 7.1 Capability 命名
@@ -470,6 +490,10 @@ event.subscribe.narrator
  event.subscribe.provider
  command.narrator.send_message
  command.narrator.interrupt
+ command.narrator.tasks_read
+ command.narrator.task_add
+ command.narrator.task_set_status
+ command.narrator.behavior_rules_set
  command.permission.decide
  command.chapter.write
  command.chapter.merge

@@ -5,11 +5,12 @@
  * HTML comment markers, so the person's own constraints around it survive its updates. Three
  * readers need the same split:
  *
- *   - the plugin command itself (`setSpecBehaviorFenceForPlugin`), which replaces its section;
- *   - an outline session's import (`outline/behavior-page.ts`), which moves everything but the
- *     SOP into the behavior page and leaves only the SOP in the old fence (the plugin's channel
- *     until its block commands exist, outline plan PR 12);
- *   - the outline behavior view, which shows the SOP after the page.
+ *   - the plugin command itself (`setSpecBehaviorFenceForPlugin`), which replaces its section (in
+ *     a spec session, or a subagent's own fence);
+ *   - an outline session's import (`task-source/outline-behavior.ts`), which moves everything but
+ *     the SOP into the behavior page and leaves only the SOP in the old fence; since outline P2
+ *     PR 12a the SOP moves on to the plugin's block on the page (`outline-plugin-rules.ts`);
+ *   - the outline behavior view, which shows an SOP still in a fence after the page.
  */
 
 /** The plugin the markers name: whose SOP an outline session's old fence holds (PR 12a moves it). */

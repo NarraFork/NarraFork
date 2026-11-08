@@ -1918,9 +1918,10 @@ export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
 
 /**
  * At the start of a run of an outline session: move the old behavior fence's text to the
- * session's behavior page (once; `importOutlineBehaviorFence`), then note where the run starts
- * for the turn-end note (the completed tool count and the revision of the open tasks). Spec
- * sessions only resolve their (cached) backend. Never rejects.
+ * session's behavior page (once; `importOutlineBehaviorFence`) and a plugin's SOP left in it to the
+ * plugin's block there (once; `moveOutlineFenceSop`, outline P2 PR 12a), then note where the run
+ * starts for the turn-end note (the completed tool count and the revision of the open tasks).
+ * Spec sessions only resolve their (cached) backend. Never rejects.
  */
 export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 	active._outlineTurnStart = undefined;
@@ -4455,8 +4456,9 @@ export async function createNarratorForPlugin(
 		permissionMode: input.permissionMode,
 		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 		// The recruiting plugin drives its members through the Dynamic Spec commands (dispatch,
-		// read, write), which an outline session refuses; members stay spec until the block-based
-		// commands exist (plan PR 12, D27d), as OAuth-provisioned sessions do.
+		// read, write); members stay spec (D27d), as OAuth-provisioned sessions do. Since outline P2
+		// PR 12a those commands work on outline sessions too (converted), so whether new members
+		// start in the outline is left to the import (plan PR 12b).
 		taskBackend: "spec",
 	});
 	return {

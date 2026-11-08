@@ -6,8 +6,10 @@
  * One page per root session, in its session space, holding the alias `behavior`
  * (`OUTLINE_BEHAVIOR_ALIAS`). People write it in the outline; the agent only under the one-shot
  * grant of a user turn (the write path refuses it otherwise, `write.ts`); subagents read their
- * root's (D31). Plugins still write their SOP into the old `spec://behavior_fence`, which in an
- * outline session is nothing but that channel until plugins write blocks (plan PR 12).
+ * root's (D31). Since outline P2 PR 12a a plugin writes its rules as its own block on the page
+ * (`outline-plugin-rules.ts`); the old `spec://behavior_fence` of an outline session keeps only an
+ * SOP written before that, which moves to the page when the session next runs, and a subagent's
+ * own SOP (a plugin's temporary worker).
  *
  * THE IMPORT
  * ----------
