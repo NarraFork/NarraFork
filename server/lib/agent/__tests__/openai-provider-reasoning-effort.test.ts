@@ -2,8 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	bindModelCatalogSettings,
 	getEffectiveModelProfile,
-	getModelCardSnapshot,
-	mutateModelCard,
+	replaceModelOverridesForTests,
 } from "../../model-catalog";
 import { type OpenAIProviderConfig, saveSettings, settings } from "../../settings";
 import type { NarraForkSettings } from "../../settings/types";
@@ -75,39 +74,35 @@ async function sendAndCaptureBody(
 afterEach(() => {
 	globalThis.fetch = originalFetch;
 	capturedBody = null;
+	restoreOverrides?.();
+	restoreOverrides = undefined;
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 });
 
-function installReasoningLevels(): void {
+let restoreOverrides: (() => void) | undefined;
+function bindP1(): void {
 	bindModelCatalogSettings(
 		{
 			openaiProviders: [config({})],
-			agent: {
-				modelCatalog: {
-					schemaVersion: 2,
-					migrationVersion: 2,
-					local: { revision: 0 },
-					autoApply: false,
-					pinnedVersion: null,
-				},
-			},
+			agent: { modelCatalog: { autoUpdate: false } },
 		} as NarraForkSettings,
 		() => {},
 	);
-	mutateModelCard({
-		baseRevision: getModelCardSnapshot().local.revision,
-		action: "upsert-model",
-		model: {
-			id: "glm-5.1",
-			matches: { aliases: ["responses:glm-5.1", "openai:glm-5.1"] },
-			metadata: {
-				supports_reasoning: true,
-				reasoning_effort_levels: ["low", "medium", "high", "max"],
-				can_disable_reasoning: true,
-			},
-		},
+}
+
+/** The provider entries' own overrides declaring a four-tier table. */
+function installReasoningLevels(): void {
+	bindP1();
+	const override = {
+		reasoningLevels: ["low", "medium", "high", "max"],
+		canDisableReasoning: true,
+	};
+	const models = ["p1:glm-5.1", "p1:responses:glm-5.1"];
+	restoreOverrides?.();
+	restoreOverrides = replaceModelOverridesForTests({
+		connections: Object.fromEntries(models.map((model) => [model, override])),
 	});
-	for (const model of ["p1:glm-5.1", "p1:responses:glm-5.1"]) {
+	for (const model of models) {
 		expect(getEffectiveModelProfile(model).reasoning.levels).toEqual([
 			"low",
 			"medium",
@@ -178,23 +173,7 @@ describe("OpenAIProvider completions-compatible reasoning effort", () => {
 });
 
 describe("DeepSeek metadata reaches every OpenAI request path", () => {
-	beforeEach(() => {
-		bindModelCatalogSettings(
-			{
-				openaiProviders: [config({})],
-				agent: {
-					modelCatalog: {
-						schemaVersion: 2,
-						migrationVersion: 2,
-						local: { revision: 0 },
-						autoApply: false,
-						pinnedVersion: null,
-					},
-				},
-			} as NarraForkSettings,
-			() => {},
-		);
-	});
+	beforeEach(bindP1);
 	for (const apiMode of ["completions", "responses"] as const) {
 		for (const path of ["chat", "generate", "history"] as const) {
 			test.each([

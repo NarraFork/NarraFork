@@ -34,29 +34,42 @@ export interface ModelHistorySignature {
 	catalogIdentity?: string;
 }
 
-/** A tiny, persisted signature on EVERY hit; never use a process-local epoch or WS version. */
+// SQLite invalidates compiled schema metadata when schema_version changes, including on
+// other connections. A warm read still fetches the persisted narrator revision every time.
+const sqliteContracts = new WeakMap<Database, { catalogIdentity: number; trusted: boolean }>();
+
 export function readSqliteModelHistorySignature(
 	sqlite: Database,
 	narratorId: string,
 ): ModelHistorySignature {
 	try {
 		const row = sqlite
-			.query<
-				{ revision: number; contract: string | null; triggers: number; catalogIdentity: number },
-				[string]
-			>(`
+			.query<{ revision: number; catalogIdentity: number }, [string]>(`
 			SELECT n.model_history_revision AS revision,
-			 (SELECT schema_version FROM pragma_schema_version) AS "catalogIdentity",
-			 (SELECT installed_version FROM model_history_revision_contracts WHERE id = 'model-history') AS contract,
-			 (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND (${sqliteTriggerPredicate})) AS triggers
+			 (SELECT schema_version FROM pragma_schema_version) AS "catalogIdentity"
 			 FROM narrators n WHERE n.id = ? LIMIT 1`)
 			.get(narratorId);
+		if (!row) return { revision: "-1", trusted: false };
+		let contract = sqliteContracts.get(sqlite);
+		if (!contract || contract.catalogIdentity !== row.catalogIdentity) {
+			const qualification = sqlite
+				.query<{ contract: string | null; triggers: number }, []>(`
+				SELECT
+				 (SELECT installed_version FROM model_history_revision_contracts WHERE id = 'model-history') AS contract,
+				 (SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND (${sqliteTriggerPredicate})) AS triggers`)
+				.get();
+			contract = {
+				catalogIdentity: row.catalogIdentity,
+				trusted:
+					qualification?.contract === MODEL_HISTORY_REVISION_CONTRACT &&
+					qualification.triggers === MODEL_HISTORY_SQLITE_TRIGGERS.length,
+			};
+			sqliteContracts.set(sqlite, contract);
+		}
 		return {
-			revision: String(row?.revision ?? -1),
-			catalogIdentity: String(row?.catalogIdentity ?? -1),
-			trusted:
-				row?.contract === MODEL_HISTORY_REVISION_CONTRACT &&
-				row.triggers === MODEL_HISTORY_SQLITE_TRIGGERS.length,
+			revision: String(row.revision),
+			catalogIdentity: String(row.catalogIdentity),
+			trusted: contract.trusted,
 		};
 	} catch (error) {
 		// An old schema is still readable, but cannot ever admit cached source rows.
@@ -68,9 +81,8 @@ export function readSqliteModelHistorySignature(
 export async function readPostgresModelHistorySignature(
 	sql: Pick<SQL, "unsafe">,
 	narratorId: string,
-	options: { signal?: AbortSignal; deadline?: number } = {},
+	options: { signal?: AbortSignal } = {},
 ): Promise<ModelHistorySignature> {
-	const deadline = Math.min(options.deadline ?? Number.POSITIVE_INFINITY, Date.now() + 10_000);
 	options.signal?.throwIfAborted();
 	try {
 		const pending = sql.unsafe(
@@ -83,26 +95,18 @@ export async function readPostgresModelHistorySignature(
 			[narratorId],
 		);
 		let abort: () => void = () => {};
-		let timer: ReturnType<typeof setTimeout> | undefined;
 		const stopped = new Promise<never>((_, reject) => {
 			abort = () => {
 				pending.cancel();
 				reject(new Error("Model history preparation cancelled"));
 			};
-			timer = setTimeout(
-				() => {
-					pending.cancel();
-					reject(new Error("Model history preparation exceeded 10s budget"));
-				},
-				Math.max(1, deadline - Date.now()),
-			);
 			options.signal?.addEventListener("abort", abort, { once: true });
+			if (options.signal?.aborted) abort();
 		});
 		let rows: Awaited<typeof pending>;
 		try {
 			rows = await Promise.race([pending, stopped]);
 		} finally {
-			clearTimeout(timer);
 			options.signal?.removeEventListener("abort", abort);
 		}
 		const row = rows[0];

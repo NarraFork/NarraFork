@@ -17,10 +17,21 @@ export interface RuntimeRecoveryState {
 	 * (or being reset by) the transient-retry budget.
 	 */
 	quotaWaits: number;
+	/**
+	 * `auto:` source switches made in this run (agent-runtime/auto-forced-switch.ts). Bounded
+	 * so two sources that each fail cannot hand a turn back and forth forever.
+	 */
+	autoSwitches: number;
 }
 
 export function createRuntimeRecoveryState(): RuntimeRecoveryState {
-	return { overflowRetries: 0, transientRetries: 0, interruptionRetries: 0, quotaWaits: 0 };
+	return {
+		overflowRetries: 0,
+		transientRetries: 0,
+		interruptionRetries: 0,
+		quotaWaits: 0,
+		autoSwitches: 0,
+	};
 }
 
 export interface RecoveryObservation {

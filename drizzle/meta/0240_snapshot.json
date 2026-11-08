@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "2409f253-a7f6-4b4f-9456-838bc3213406",
+  "id": "d1506f1a-cd4e-4dec-b6c9-a1525e1c58e3",
   "prevId": "fc056968-9497-4ed5-addc-041a963472da",
   "tables": {
     "acl_events": {
@@ -12414,14 +12414,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "workspace_directories": {
-          "name": "workspace_directories",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "'{}'"
-        },
         "error_message": {
           "name": "error_message",
           "type": "text",
@@ -14818,6 +14810,148 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
+    "outline_digests": {
+      "name": "outline_digests",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "period_key": {
+          "name": "period_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "time_zone": {
+          "name": "time_zone",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "period_start": {
+          "name": "period_start",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "period_end": {
+          "name": "period_end",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "counts_json": {
+          "name": "counts_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "item_count": {
+          "name": "item_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "items_json": {
+          "name": "items_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "ranges_json": {
+          "name": "ranges_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "truncated": {
+          "name": "truncated",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "seen_at": {
+          "name": "seen_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "uq_outline_digests_user_period": {
+          "name": "uq_outline_digests_user_period",
+          "columns": [
+            "user_id",
+            "kind",
+            "period_key"
+          ],
+          "isUnique": true
+        },
+        "idx_outline_digests_unseen": {
+          "name": "idx_outline_digests_unseen",
+          "columns": [
+            "user_id"
+          ],
+          "isUnique": false,
+          "where": "\"seen_at\" IS NULL"
+        }
+      },
+      "foreignKeys": {
+        "outline_digests_user_id_users_id_fk": {
+          "name": "outline_digests_user_id_users_id_fk",
+          "tableFrom": "outline_digests",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "outline_links": {
       "name": "outline_links",
       "columns": {
@@ -15486,6 +15620,13 @@
           "notNull": true,
           "autoincrement": false,
           "default": 0
+        },
+        "last_commit_at": {
+          "name": "last_commit_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -15495,6 +15636,22 @@
             "key"
           ],
           "isUnique": true
+        },
+        "idx_outline_spaces_last_commit": {
+          "name": "idx_outline_spaces_last_commit",
+          "columns": [
+            "last_commit_at",
+            "id"
+          ],
+          "isUnique": false
+        },
+        "idx_outline_spaces_unstamped": {
+          "name": "idx_outline_spaces_unstamped",
+          "columns": [
+            "id"
+          ],
+          "isUnique": false,
+          "where": "\"last_commit_at\" IS NULL AND \"next_seq\" > 1"
         },
         "idx_outline_spaces_in_process_pending": {
           "name": "idx_outline_spaces_in_process_pending",
@@ -20026,6 +20183,20 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'{}'"
+        },
+        "outline_digest_time_zone": {
+          "name": "outline_digest_time_zone",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "outline_digest_time": {
+          "name": "outline_digest_time",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         },
         "created_at": {
           "name": "created_at",

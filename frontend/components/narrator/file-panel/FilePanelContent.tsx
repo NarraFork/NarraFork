@@ -4,6 +4,7 @@ import { lazy, Suspense, useEffect, useRef } from "react";
 import { EditorRecoveryBoundary } from "../file-editor/EditorRecoveryBoundary";
 import { editorDocumentRegistry } from "../file-editor/editor-document-registry";
 import type { FileEditorContentProps } from "../file-editor/FileEditorContent";
+import { isArchiveViewable } from "../file-viewer/archive-viewable";
 import {
 	NarratorPanelVisibilityProvider,
 	useEditorPanelVisible,
@@ -16,6 +17,11 @@ const FileEditorContent = lazy(() =>
 );
 const FileViewerContent = lazy(() =>
 	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),
+);
+const ArchiveViewerContent = lazy(() =>
+	import("../file-viewer/ArchiveViewerContent").then((m) => ({
+		default: m.ArchiveViewerContent,
+	})),
 );
 
 export interface FilePanelContentProps {
@@ -75,6 +81,29 @@ function FilePanelBody({
 	// Navigation updates the current document without discarding its unsaved draft.
 	const identity = JSON.stringify([narratorId, deviceId ?? "local", filePath]);
 	const isText = getFilePreviewType(filePath) === "text";
+	// Zip-family archives get their own read-only browser on the LOCAL device. Files opened
+	// from a chat link carry referenceOrigin; the server then applies the same reference read
+	// policy as the text editor would for that link. Remote devices keep their scoped readers
+	// (nothing falls back to a local read), and a line selection keeps the text editor.
+	const archive =
+		!!narratorId && (deviceId ?? "local") === "local" && !selection && isArchiveViewable(filePath);
+	if (archive)
+		return (
+			<Suspense
+				fallback={
+					<Center h="100%">
+						<Loader size="sm" />
+					</Center>
+				}
+			>
+				<ArchiveViewerContent
+					key={identity}
+					filePath={filePath}
+					narratorId={narratorId}
+					referenceOrigin={!!referenceOrigin}
+				/>
+			</Suspense>
+		);
 	const content = (
 		<Suspense
 			fallback={

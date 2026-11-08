@@ -18,7 +18,7 @@ import {
 	type WorkspacePathFlavor,
 	withDeviceDirectory,
 } from "@shared/workspace-directories";
-import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	aclGrants,
@@ -372,6 +372,8 @@ export interface CreateNarratorInput {
 	relaxedPlan?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	dangerReflectionOverride?: DangerReflectionOverride;
+	/** AskUserQuestion 自动反思回答的三态覆盖；inherit = 跟随 settings.agent.questionReflectionEnabled。 */
+	questionReflectionOverride?: BooleanOverride;
 	autoContinuationOverride?: AutoContinuationOverride;
 	behaviorFenceIntervalOverride?: number | null;
 	behaviorFenceAttachOverride?: BooleanOverride;
@@ -434,6 +436,7 @@ interface CreateSubagentInput {
 	title?: string;
 	permissionMode?: string;
 	planReflectionAutoApproveOverride?: BooleanOverride;
+	questionReflectionOverride?: BooleanOverride;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
@@ -1523,6 +1526,7 @@ export async function prepareNarratorCreation(
 			}),
 			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
 			dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
+			questionReflectionOverride: input.questionReflectionOverride ?? "inherit",
 			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
 			behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
 			behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
@@ -1843,6 +1847,8 @@ export const narratorService = {
 							parent.planReflectionAutoApproveOverride ??
 							"inherit",
 						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+						questionReflectionOverride:
+							input.questionReflectionOverride ?? parent.questionReflectionOverride ?? "inherit",
 						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
@@ -2242,7 +2248,9 @@ export const narratorService = {
 	async listNamed() {
 		const rows = await db.query.narrators.findMany({
 			columns: { runtimeRegistrationJson: false },
-			where: and(eq(narrators.type, "primary"), isNotNull(narrators.handle)),
+			// Valid handles are non-empty. The range predicate uses idx_narrators_handle;
+			// IS NOT NULL made SQLite scan every narrator before sorting this small result.
+			where: and(eq(narrators.type, "primary"), gt(narrators.handle, "")),
 			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
 		});
 		// Defensive: only return those actually flagged as named.
@@ -2569,6 +2577,7 @@ export const narratorService = {
 								planReflectionAutoApproveOverride:
 									parent.planReflectionAutoApproveOverride ?? "inherit",
 								dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+								questionReflectionOverride: parent.questionReflectionOverride ?? "inherit",
 								autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 								behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 								behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
@@ -2776,6 +2785,7 @@ export const narratorService = {
 								planReflectionAutoApproveOverride:
 									parent.planReflectionAutoApproveOverride ?? "inherit",
 								dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+								questionReflectionOverride: parent.questionReflectionOverride ?? "inherit",
 								autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 								behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 								behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",

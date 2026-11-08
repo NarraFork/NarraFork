@@ -9,6 +9,7 @@ const MAX_VALIDATION_ISSUES = 20;
 const LOCAL_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 const HOST_RESERVED_PREFIXES = new Set([
 	"__agg__",
+	"auto",
 	"__default__",
 	"__summary__",
 	"default",

@@ -30,11 +30,12 @@ for (const [lng, resource] of [
 		interpolation: { escapeValue: false },
 	});
 	const t = (key: string, options?: Record<string, unknown>) => String(i18n.t(key, options));
-	test(`${lng}: zero quota preserves scope, window and real unit with used/total details`, () => {
+	test(`${lng}: zero quota preserves window and real unit, scope lives in the tooltip`, () => {
 		const result = formatProviderBalance(snapshot(), t, false, 1000);
-		expect(result.quotaBalance).toContain(t("providerBalance.key"));
+		expect(result.quotaBalance).not.toContain(t("providerBalance.key"));
 		expect(result.quotaBalance).toContain(`5h: 0 ${t("providerBalance.quotaUnit")}`);
 		expect(result.quotaBalance).not.toContain("USD");
+		expect(result.detailedQuotaBalance).toContain(t("providerBalance.key"));
 		expect(result.detailedQuotaBalance).toContain(
 			t("providerBalance.used", { amount: `2 ${t("providerBalance.quotaUnit")}` }),
 		);
@@ -57,7 +58,7 @@ for (const [lng, resource] of [
 		value.balance.scope = "subscription";
 		value.balance.amounts = [{ unit: "TOKENS", remaining: null }];
 		const result = formatProviderBalance(value, t, false, 1000);
-		expect(result.quotaBalance).toContain(t("providerBalance.subscription"));
+		expect(result.detailedQuotaBalance).toContain(t("providerBalance.subscription"));
 		expect(result.quotaBalance).toContain(t("providerBalance.unknown"));
 		value.balance.amounts[0].remaining = -1;
 		expect(formatProviderBalance(value, t, false, 1000).quotaBalance).toContain(

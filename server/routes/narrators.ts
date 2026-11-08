@@ -176,7 +176,12 @@ import {
 import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	getQueueDuringCompaction,
+	normalizeAutoModelValueForSave,
+	settings,
+} from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -287,6 +292,7 @@ import {
 import { dependencyService } from "../services/dependency-service";
 import {
 	browseRemoteDirectory,
+	resolveRemoteBrowsePath,
 	resolveRemoteBrowseTarget,
 } from "../services/device-transfer-service";
 import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/execution-policy";
@@ -1558,9 +1564,9 @@ narratorRoutes.get("/workspace-directory-browse", async (c) => {
 		} catch (err) {
 			throw new ValidationError(err instanceof Error ? err.message : String(err));
 		}
-		const allowed = isDeviceBrowsePathWithinNarratorScope({
-			requestedPath: target.path,
-			pathFlavor: target.pathFlavor,
+		const allowed = await isRemoteDeviceBrowsePathWithinNarratorScope({
+			deviceId: device.id,
+			target,
 			defaultCwd: device.defaultCwd ?? null,
 			rules: [],
 		});
@@ -1587,7 +1593,7 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	const input = parsed.data;
+	const input = { ...parsed.data, model: normalizeAutoModelValueForSave(parsed.data.model) };
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -2880,6 +2886,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				dangerReflectionOverride: normalizeDangerReflectionOverride(
 					narrator.dangerReflectionOverride,
 				),
+				questionReflectionOverride: normalizeBooleanOverride(narrator.questionReflectionOverride),
 				autoContinuationOverride: normalizeAutoContinuationOverride(
 					narrator.autoContinuationOverride,
 				),
@@ -5196,6 +5203,65 @@ export function isDeviceBrowsePathWithinNarratorScope(input: {
 	});
 }
 
+/**
+ * Canonical counterpart to the cheap lexical preflight above. Both are required:
+ * lexical containment rejects obvious escapes without any device RPC, while the
+ * device-resolved paths catch symlinks and Windows junctions before `fs.list`.
+ * Missing canonical support, malformed responses and unreadable roots fail closed.
+ */
+export async function isRemoteDeviceBrowsePathWithinNarratorScope(
+	input: {
+		deviceId: string;
+		target: ReturnType<typeof resolveRemoteBrowseTarget>;
+		defaultCwd: string | null;
+		rules: readonly { path: string; pathFlavor: PathFlavor; enabled: boolean }[];
+	},
+	resolvePath: (deviceId: string, path: string) => Promise<string> = resolveRemoteBrowsePath,
+): Promise<boolean> {
+	if (
+		!isDeviceBrowsePathWithinNarratorScope({
+			requestedPath: input.target.path,
+			pathFlavor: input.target.pathFlavor,
+			defaultCwd: input.defaultCwd,
+			rules: input.rules,
+		})
+	) {
+		return false;
+	}
+
+	let resolvedTarget: string;
+	try {
+		resolvedTarget = await resolvePath(input.deviceId, input.target.path);
+	} catch {
+		return false;
+	}
+	const anchors = [
+		...(input.defaultCwd?.trim() ? [input.defaultCwd.trim()] : []),
+		...input.rules
+			.filter((rule) => rule.enabled && rule.pathFlavor === input.target.pathFlavor)
+			.map((rule) => rule.path),
+	];
+	for (const anchor of anchors) {
+		try {
+			const resolvedAnchor = await resolvePath(input.deviceId, anchor);
+			if (
+				isDeviceBrowsePathWithinNarratorScope({
+					requestedPath: resolvedTarget,
+					pathFlavor: input.target.pathFlavor,
+					defaultCwd: resolvedAnchor,
+					rules: [],
+				})
+			) {
+				return true;
+			}
+		} catch {
+			// One malformed or disappearing rule must not authorize the target, but it
+			// also need not disable another independent valid root.
+		}
+	}
+	return false;
+}
+
 narratorRoutes.get("/:id/device-browse", async (c) => {
 	const narratorId = c.req.param("id");
 	const deviceId = c.req.query("deviceId");
@@ -5227,9 +5293,9 @@ narratorRoutes.get("/:id/device-browse", async (c) => {
 		const deviceRules = [...rules.directoryWhitelist, ...rules.directoryBlacklist].filter(
 			(rule) => rule.selector.kind === "device" && rule.selector.deviceId === deviceId,
 		);
-		const allowed = isDeviceBrowsePathWithinNarratorScope({
-			requestedPath: target.path,
-			pathFlavor: target.pathFlavor,
+		const allowed = await isRemoteDeviceBrowsePathWithinNarratorScope({
+			deviceId,
+			target,
 			defaultCwd: target.defaultCwd,
 			rules: deviceRules,
 		});
@@ -5307,8 +5373,9 @@ narratorRoutes.patch("/:id/model", async (c) => {
 			c.get("user").sub,
 		);
 	}
-	await narratorService.updateModel(id, parsed.data.model);
-	await updateNarratorModel(id, parsed.data.model);
+	const model = normalizeAutoModelValueForSave(parsed.data.model);
+	await narratorService.updateModel(id, model);
+	await updateNarratorModel(id, model);
 	return c.json({ ok: true });
 });
 
@@ -5613,6 +5680,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	const updates: {
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		dangerReflectionOverride?: DangerReflectionOverride;
+		questionReflectionOverride?: BooleanOverride;
 		autoContinuationOverride?: AutoContinuationOverride;
 		tasksReminderIntervalOverride?: number | null;
 	} = {};
@@ -5620,6 +5688,12 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
 			input.planReflectionAutoApproveOverride,
 			"planReflectionAutoApproveOverride",
+		);
+	}
+	if (Object.hasOwn(input, "questionReflectionOverride")) {
+		updates.questionReflectionOverride = parseBooleanOverride(
+			input.questionReflectionOverride,
+			"questionReflectionOverride",
 		);
 	}
 	if (Object.hasOwn(input, "dangerReflectionOverride")) {
@@ -5654,6 +5728,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	}
 	if (
 		!updates.planReflectionAutoApproveOverride &&
+		!updates.questionReflectionOverride &&
 		!updates.dangerReflectionOverride &&
 		!updates.autoContinuationOverride &&
 		!Object.hasOwn(updates, "tasksReminderIntervalOverride")

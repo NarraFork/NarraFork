@@ -62,6 +62,7 @@ export async function interruptAndArchiveSubagent(
 		if (narrator.status === "archived") {
 			return { ...base, ok: true, alreadyArchived: true, interrupted };
 		}
+		await giveBackDelegatedTask(narrator);
 		await narratorService.updateStatus(narrator.id, "archived");
 		return { ok: true, alreadyArchived: false, archived: true, interrupted, id: narrator.id };
 	} catch (err) {
@@ -73,6 +74,32 @@ export async function interruptAndArchiveSubagent(
 			...base,
 			error: err instanceof Error ? err.message : String(err),
 		};
+	}
+}
+
+/**
+ * A subagent sent with an outline task (`Agent({ task })`, outline P2 PR 9a) gives the task back
+ * to the session that sent it before it is archived, as the end of its run would (generation
+ * unchanged, on the idle lease): archiving lets go of whatever an archived narrator still holds,
+ * which would reopen the task, and the cancelled run ends only after this returns. Other
+ * subagents keep the archive's rule (what they hold is let go).
+ */
+async function giveBackDelegatedTask(narrator: {
+	id: string;
+	runtimeRegistrationJson?: unknown;
+}): Promise<void> {
+	try {
+		const { readRuntimeRegistrationColumn } = await import(
+			"../lib/validators/runtime-registration"
+		);
+		if (!readRuntimeRegistrationColumn(narrator.runtimeRegistrationJson)?.delegatedTask) return;
+		const { idleOutlineTaskClaims } = await import("./outline/tasks");
+		await idleOutlineTaskClaims(narrator.id);
+	} catch (error) {
+		logger.warn("Delegated task could not be given back before archiving", {
+			subagentId: narrator.id,
+			error: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 

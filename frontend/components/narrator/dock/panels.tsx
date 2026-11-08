@@ -50,7 +50,10 @@ import {
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
-import { DockviewNarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
+import {
+	DockviewNarratorPanelVisibilityProvider,
+	useDockviewPanelVisible,
+} from "../narrator-panel-visibility";
 import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
@@ -602,6 +605,9 @@ export function SpecDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParam
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
 	const close = useCallback(() => props.api.close(), [props.api]);
+	// Panels stay mounted while another tab is shown (`defaultRenderer="always"`): the task board
+	// must know, so what it marks as seen was really on screen (outline P2 PR 9b).
+	const visible = useDockviewPanelVisible(props.api);
 	// A session whose tasks live in the outline shows its task board here (outline P2 PR 5).
 	const backend = useNarratorCurrentTask(narratorId).data?.backend;
 	const panelTitle = backend === "outline" ? tOutline("board.title") : t("spec.title");
@@ -622,7 +628,7 @@ export function SpecDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParam
 			detachKind="spec"
 		>
 			<LazyPanelBoundary>
-				<SpecPanel narratorId={narratorId} onClose={close} chromeless />
+				<SpecPanel narratorId={narratorId} onClose={close} chromeless visible={visible} />
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);

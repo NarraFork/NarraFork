@@ -4,12 +4,16 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Worker } from "node:worker_threads";
+import { Worker } from "node:worker_threads";
 import { SQL } from "bun";
 import { withPostgres } from "../../tests/db/pg-test-harness";
 import type { ToolDefinitionSnapshot } from "../lib/agent/tool-loading";
 import * as compiledWorker from "../lib/compiled-worker";
-import { PREFIX_TOOLS_FORMAT, type PrefixToolsManifest } from "./narrator-prefix-snapshot-values";
+import {
+	PREFIX_TOOLS_FORMAT,
+	type PrefixToolsManifest,
+	prefixValueBytes,
+} from "./narrator-prefix-snapshot-values";
 import {
 	createPrefixSnapshotMaintenance,
 	createPrefixSnapshotStore,
@@ -48,7 +52,7 @@ const definition = (name: string, description = name): ToolDefinitionSnapshot =>
 	parameters: { type: "object", properties: { text: { type: "string" } } },
 });
 
-test("different arrays and real signals reuse static units, immutable values and legacy arrays", async () => {
+test("different arrays and real signals deduplicate CAS content, immutable values and legacy arrays", async () => {
 	const { db, store } = await fixture({ cacheBytes: 1 });
 	const one = definition("one");
 	const two = definition("two");
@@ -79,7 +83,27 @@ test("different arrays and real signals reuse static units, immutable values and
 	expect(await store.getPrefixToolDefinitions(legacy)).toEqual([one]);
 });
 
-test("one cancelled subscriber does not abort other callers' shared put/read", async () => {
+test("decoded tools consume the same LRU budget as text while raw JSON remains the manifest", async () => {
+	const { store } = await fixture({ cacheBytes: 700 });
+	const hash = await store.putPrefixToolDefinitions([]);
+	const manifest = await store.getPrefixJson<PrefixToolsManifest>(hash);
+	const text = "a".repeat(100);
+	const textHash = await store.putPrefixText(text);
+	await store.getPrefixText(textHash);
+	const post = spyOn(Worker.prototype, "postMessage");
+	try {
+		// The caller-held manifest is weakly reused, so only the decoded tools enter the LRU.
+		expect(await store.getPrefixToolDefinitions(hash)).toEqual([]);
+		expect(await store.getPrefixText(textHash)).toBe(text);
+		expect(post.mock.calls.filter(([request]) => request.operation === "getText")).toHaveLength(1);
+		expect(await store.getPrefixJson(hash)).toBe(manifest);
+		expect(manifest.format).toBe(PREFIX_TOOLS_FORMAT);
+	} finally {
+		post.mockRestore();
+	}
+});
+
+test("one cancelled caller does not abort independent writes or other callers' shared reads", async () => {
 	const { store } = await fixture();
 	const values = Array.from({ length: 200 }, (_, index) => definition(`tool${index}`));
 	const a = new AbortController();
@@ -97,7 +121,7 @@ test("one cancelled subscriber does not abort other callers' shared put/read", a
 	expect(await liveRead).toEqual(values);
 });
 
-test("all cancelled put subscribers discard undispatched batches and later retry can rebuild aliases", async () => {
+test("cancelled writes discard undispatched batches and the next independent write succeeds", async () => {
 	const { store, db } = await fixture();
 	await store.putPrefixText("warmup");
 	db.run("BEGIN IMMEDIATE");
@@ -136,7 +160,6 @@ test("all cancelled read subscribers stop before dispatching the next body batch
 	const tools = createPrefixToolSnapshots({
 		putBatch: async () => [],
 		putJson: async () => "unused",
-		touch: async (items) => items,
 		readJson: async <T>() => ({ format: PREFIX_TOOLS_FORMAT, definitions: hashes }) as T,
 		peek: () => undefined,
 		remember: async () => {},
@@ -160,6 +183,100 @@ test("all cancelled read subscribers stop before dispatching the next body batch
 	expect(batches).toBe(1);
 	expect((await tools.getPrefixToolDefinitions("root")).length).toBe(200);
 });
+
+test("real tools API transfers bounded batches, deduplicates directories and keeps the heartbeat", async () => {
+	const { store, db } = await fixture({ cacheBytes: 1024 * 1024 });
+	const values = Array.from({ length: 1200 }, (_, index) =>
+		definition(`batch${index}`, `${index}:${"x".repeat(2048)}`),
+	);
+	values.splice(600, 0, definition("oversized", "z".repeat(300 * 1024)));
+	const post = spyOn(Worker.prototype, "postMessage");
+	const initialRss = process.memoryUsage().rss;
+	let peakRss = initialRss;
+	let beats = 0;
+	let maxGapMs = 0;
+	let last = performance.now();
+	const heartbeat = setInterval(() => {
+		const now = performance.now();
+		maxGapMs = Math.max(maxGapMs, now - last);
+		last = now;
+		peakRss = Math.max(peakRss, process.memoryUsage().rss);
+		beats++;
+	}, 5);
+	try {
+		const started = performance.now();
+		const hash = await store.putPrefixToolDefinitions(values);
+		const writes = post.mock.calls
+			.map(([request]) => request as PrefixSnapshotRequest)
+			.filter((request) => request.operation === "putJsonBatch");
+		expect(writes.length).toBeGreaterThan(1);
+		expect(writes.flatMap((request) => request.value)).toEqual(values);
+		for (const request of writes) {
+			const batch = request.value as ToolDefinitionSnapshot[];
+			expect(batch.length).toBeLessThanOrEqual(64);
+			if (batch.length > 1)
+				expect(batch.reduce((sum, value) => sum + prefixValueBytes(value), 0)).toBeLessThanOrEqual(
+					512 * 1024,
+				);
+		}
+		expect(
+			writes.some(
+				(request) =>
+					(request.value as ToolDefinitionSnapshot[])[0].name === "oversized" &&
+					(request.value as unknown[]).length === 1,
+			),
+		).toBe(true);
+		const restored = await store.getPrefixToolDefinitions(hash);
+		expect(restored).toEqual(values);
+		const reads = post.mock.calls
+			.map(([request]) => request as PrefixSnapshotRequest)
+			.filter((request) => request.operation === "getJsonBatch");
+		expect(reads.length).toBeGreaterThan(1);
+		for (const request of reads) expect((request.value as string[]).length).toBeLessThanOrEqual(64);
+		expect(await store.getPrefixToolDefinitions(hash)).toBe(restored);
+		const raw = await store.getPrefixJson<PrefixToolsManifest>(hash);
+		expect(raw.format).toBe(PREFIX_TOOLS_FORMAT);
+		expect(raw.definitions).toHaveLength(values.length);
+		expect(await store.putPrefixToolDefinitions(values)).toBe(hash);
+		await store.putPrefixToolDefinitions(values.slice(0, 100));
+		expect(db.query("SELECT count(*) AS n FROM narrator_text_snapshots").get()).toEqual({
+			n: values.length + 2,
+		});
+		expect(beats).toBeGreaterThan(2);
+		console.info("PREFIX_TOOLS_BATCHES", {
+			tools: values.length,
+			writeBatches: writes.length,
+			readBatches: reads.length,
+			casRows: values.length + 2,
+			elapsedMs: performance.now() - started,
+			beats,
+			maxGapMs,
+			peakRssDelta: peakRss - initialRss,
+		});
+	} finally {
+		clearInterval(heartbeat);
+		post.mockRestore();
+	}
+}, 20000);
+
+for (const damage of ["missing", "corrupt"] as const) {
+	test(`a ${damage} manifest child fails explicitly without registry recovery`, async () => {
+		const { store, db } = await fixture();
+		const root = await store.putPrefixToolDefinitions([definition("damaged")]);
+		const manifest = await store.getPrefixJson<PrefixToolsManifest>(root);
+		if (damage === "missing")
+			db.query("DELETE FROM narrator_text_snapshots WHERE sha256 = ?").run(manifest.definitions[0]);
+		else
+			db.query("UPDATE narrator_text_snapshots SET text = '{}' WHERE sha256 = ?").run(
+				manifest.definitions[0],
+			);
+		const error = await store.getPrefixToolDefinitions(root).catch((error: Error) => error);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain(
+			damage === "missing" ? "not found" : "integrity mismatch",
+		);
+	});
+}
 
 // Test the real store scheduler independently of worker startup/SQLite wall time.
 // The other fixtures in this file retain real workers and file-backed SQLite.
@@ -247,6 +364,62 @@ function controlledQueue() {
 			}),
 	};
 }
+
+test("cancelling a queued text read never dispatches it", async () => {
+	const { store, nextDispatch } = controlledQueue();
+	const blocking = store.putPrefixText("hold queue");
+	const first = await nextDispatch();
+	const controller = new AbortController();
+	const pending = store.getPrefixText("a".repeat(64), controller.signal).catch((error) => error);
+	const reason = new Error("cancel queued text read");
+	controller.abort(reason);
+	expect(await pending).toBe(reason);
+	first.worker.emit("message", { value: "b".repeat(64) });
+	await blocking;
+	const barrier = store.putPrefixText("after cancelled read").catch((error) => error);
+	const next = await nextDispatch();
+	expect(next.request.operation).toBe("putText");
+	expect(next.request.value).toBe("after cancelled read");
+	next.worker.emit("message", { value: "c".repeat(64) });
+	expect(await barrier).toBe("c".repeat(64));
+});
+
+test("cancelling an active text read releases its worker and the queue", async () => {
+	const { store, nextDispatch } = controlledQueue();
+	const controller = new AbortController();
+	const pending = store.getPrefixText("a".repeat(64), controller.signal).catch((error) => error);
+	const first = await nextDispatch();
+	expect(first.request.operation).toBe("getText");
+	const reason = new Error("cancel active text read");
+	controller.abort(reason);
+	expect(await pending).toBe(reason);
+	expect(first.worker.terminated).toBe(true);
+	const barrier = store.putPrefixText("after cancelled read").catch((error) => error);
+	const next = await nextDispatch();
+	expect(next.request.operation).toBe("putText");
+	next.worker.emit("message", { value: "b".repeat(64) });
+	expect(await barrier).toBe("b".repeat(64));
+});
+
+test("cancelling an active tools batch dispatches no later batch or manifest", async () => {
+	const { store, nextDispatch } = controlledQueue();
+	const controller = new AbortController();
+	const values = Array.from({ length: 200 }, (_, index) => definition(`cancel${index}`));
+	const pending = store
+		.putPrefixToolDefinitions(values, controller.signal)
+		.catch((error: Error) => error);
+	const first = await nextDispatch();
+	expect(first.request.operation).toBe("putJsonBatch");
+	expect((first.request.value as unknown[]).length).toBe(64);
+	controller.abort(new Error("cancel tools batch"));
+	expect(((await pending) as Error).message).toBe("cancel tools batch");
+	const barrier = store.putPrefixText("after cancelled tools");
+	const next = await nextDispatch();
+	expect(next.request.operation).toBe("putText");
+	expect(first.worker.terminated).toBe(true);
+	next.worker.emit("message", { value: "a".repeat(64) });
+	await barrier;
+});
 
 test("queue execution timeout starts when work starts, not while waiting behind another task", async () => {
 	const { store, timeoutMs, timers, advance, nextDispatch } = controlledQueue();
@@ -450,7 +623,7 @@ test("an unreadable legacy source prevents sweeping rather than treating its ref
 	expect(await cycle(store)).toBe(1);
 });
 
-test("after GC deletes a catalog and its units, a put recreates them despite immutable identity caches", async () => {
+test("after GC deletes an orphan manifest and children, the same immutable input writes them anew", async () => {
 	const { store, db } = await fixture();
 	const definitions = [definition("recreate")];
 	const hash = await store.putPrefixToolDefinitions(definitions);

@@ -1,6 +1,7 @@
 import type { Worker } from "node:worker_threads";
 import type { ToolDefinitionSnapshot } from "../lib/agent/tool-loading";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
+import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import type {
 	PrefixSnapshotGcOptions,
@@ -47,11 +48,11 @@ export function createPrefixSnapshotStore(
 	options: { cacheBytes?: number; timeoutMs?: number; idleMs?: number } = {},
 ): PrefixSnapshotStore {
 	const cacheBytes = Math.max(0, options.cacheBytes ?? 128 * 1024 * 1024);
-	const jsonCache = new Map<string, { value: unknown; bytes: number }>();
+	const cache = new Map<string, { value: unknown; bytes: number }>();
 	const pendingReads = new Map<string, Promise<unknown>>();
 	const weakValues = new Map<string, WeakRef<object>>();
 	const activeLeases = new Map<string, number>();
-	let retainedJsonBytes = 0;
+	let retainedBytes = 0;
 	const timeoutMs = options.timeoutMs ?? 120_000;
 	let worker: Worker | undefined;
 	let receive: ((message: { error?: string; value?: unknown }) => void) | undefined;
@@ -105,7 +106,7 @@ export function createPrefixSnapshotStore(
 				if (finished) return;
 				started = Date.now();
 				timer = setTimeout(
-					() => finish(new Error("Prefix snapshot operation timed out")),
+					() => finish(new AppError("Prefix snapshot operation timed out")),
 					timeoutMs,
 				);
 				active = true;
@@ -147,9 +148,9 @@ export function createPrefixSnapshotStore(
 						receive = (message) =>
 							finish(
 								Date.now() >= started + timeoutMs
-									? new Error("Prefix snapshot operation timed out")
+									? new AppError("Prefix snapshot operation timed out")
 									: message.error
-										? new Error(message.error)
+										? new AppError(message.error)
 										: undefined,
 								message.value as T,
 							);
@@ -164,7 +165,6 @@ export function createPrefixSnapshotStore(
 								backend,
 								operation,
 								value,
-								cacheBytes: Math.min(cacheBytes, 16 * 1024 * 1024),
 								deadline: started + timeoutMs,
 							} satisfies PrefixSnapshotRequest);
 						} catch {
@@ -194,39 +194,48 @@ export function createPrefixSnapshotStore(
 	const check = () => {
 		if (closed) throw new Error("Prefix snapshot store is closed");
 	};
-	function peek(hash: string): unknown {
-		const entry = jsonCache.get(hash);
+	type CacheKind = "text" | "json" | "tools";
+	function peek(hash: string, kind: CacheKind = "json"): unknown {
+		const key = `${kind}:${hash}`;
+		const entry = cache.get(key);
 		if (entry) {
-			jsonCache.delete(hash);
-			jsonCache.set(hash, entry);
+			cache.delete(key);
+			cache.set(key, entry);
 			return entry.value;
 		}
-		return weakValues.get(hash)?.deref();
+		return weakValues.get(key)?.deref();
 	}
-	async function remember(hash: string, value: unknown, byteSize: number): Promise<void> {
+	async function remember(
+		hash: string,
+		value: unknown,
+		byteSize: number,
+		kind: CacheKind = "json",
+	): Promise<void> {
+		const key = `${kind}:${hash}`;
 		const deadline = Date.now() + timeoutMs;
 		const heapBytes = await freezePrefixValue(value, () => {
 			check();
 			if (Date.now() >= deadline) throw new Error("Prefix snapshot preparation timed out");
 		});
-		const bytes = Math.max(byteSize * 3, heapBytes) + 256;
+		const bytes =
+			Math.max(byteSize * 3, heapBytes, typeof value === "string" ? value.length * 2 : 0) + 256;
 		if (bytes <= cacheBytes) {
-			const previous = jsonCache.get(hash);
+			const previous = cache.get(key);
 			if (previous) {
-				jsonCache.delete(hash);
-				retainedJsonBytes -= previous.bytes;
+				cache.delete(key);
+				retainedBytes -= previous.bytes;
 			}
-			while (retainedJsonBytes + bytes > cacheBytes) {
-				const oldest = jsonCache.entries().next().value;
+			while (retainedBytes + bytes > cacheBytes) {
+				const oldest = cache.entries().next().value;
 				if (!oldest) break;
-				jsonCache.delete(oldest[0]);
-				retainedJsonBytes -= oldest[1].bytes;
+				cache.delete(oldest[0]);
+				retainedBytes -= oldest[1].bytes;
 			}
-			jsonCache.set(hash, { value, bytes });
-			retainedJsonBytes += bytes;
+			cache.set(key, { value, bytes });
+			retainedBytes += bytes;
 		}
 		if (value && typeof value === "object") {
-			weakValues.set(hash, new WeakRef(value));
+			weakValues.set(key, new WeakRef(value));
 			// Metadata-only budget; values themselves are retained solely by callers/strong LRU.
 			while (weakValues.size > 32768) {
 				const oldest = weakValues.keys().next().value;
@@ -243,8 +252,30 @@ export function createPrefixSnapshotStore(
 		await remember(hash, result.json, result.byteSize);
 		return result.json;
 	}
-	const touch = async (hashes: string[]) =>
-		(await run<Array<{ sha256: string }>>("touch", hashes)).map((row) => row.sha256);
+	async function readText(hash: string, signal?: AbortSignal): Promise<string> {
+		check();
+		signal?.throwIfAborted();
+		const cached = peek(hash, "text");
+		if (cached !== undefined) return cached as string;
+		const text = await run<string>("getText", hash, signal);
+		await remember(hash, text, 0, "text");
+		return text;
+	}
+	function sharedRead<T>(
+		kind: CacheKind,
+		hash: string,
+		read: () => Promise<T>,
+		signal?: AbortSignal,
+	) {
+		if (signal?.aborted) return Promise.reject<T>(signal.reason);
+		const key = `${kind}:${hash}`;
+		let pending = pendingReads.get(key);
+		if (!pending) {
+			pending = read().finally(() => pendingReads.delete(key));
+			pendingReads.set(key, pending);
+		}
+		return waitForPrefix(pending as Promise<T>, signal);
+	}
 	const protect = (hash: string) => {
 		activeLeases.set(hash, (activeLeases.get(hash) ?? 0) + 1);
 		return () => {
@@ -254,20 +285,20 @@ export function createPrefixSnapshotStore(
 		};
 	};
 	const toolSnapshots = createPrefixToolSnapshots({
-		putBatch: (values) => run("putJsonBatch", values),
+		putBatch: (values, signal) => run("putJsonBatch", values, signal),
 		getBatch: (hashes) => run("getJsonBatch", hashes),
-		putJson: (value) => run("putJson", value),
+		putJson: (value, signal) => run("putJson", value, signal),
 		readJson,
 		peek,
 		remember,
-		touch,
 		protect,
 		check,
 	});
 
 	return {
 		putPrefixText: (text, signal) => run<string>("putText", text, signal),
-		getPrefixText: (hash, signal) => run<string>("getText", hash, signal),
+		// Keep text reads independently cancellable down to the worker; the LRU remains shared.
+		getPrefixText: readText,
 		putPrefixJson(value, signal) {
 			// Only coalesce in-flight object identities, never memoize mutable objects after a put.
 			// Signalled requests keep independent cancellation. All other puts remain serialized.
@@ -280,13 +311,7 @@ export function createPrefixSnapshotStore(
 			return result;
 		},
 		getPrefixJson<T>(hash: string, signal?: AbortSignal): Promise<T> {
-			if (signal?.aborted) return Promise.reject(signal.reason);
-			let pending = pendingReads.get(hash);
-			if (!pending) {
-				pending = readJson<T>(hash).finally(() => pendingReads.delete(hash));
-				pendingReads.set(hash, pending);
-			}
-			return waitForPrefix(pending as Promise<T>, signal);
+			return sharedRead("json", hash, () => readJson<T>(hash), signal);
 		},
 		...toolSnapshots,
 		async withPrefixSnapshotPublication<T>(
@@ -334,10 +359,9 @@ export function createPrefixSnapshotStore(
 					signal,
 				);
 				if (result.deleted) {
-					jsonCache.clear();
+					cache.clear();
 					weakValues.clear();
-					retainedJsonBytes = 0;
-					toolSnapshots.invalidate();
+					retainedBytes = 0;
 				}
 				return result;
 			} catch (error) {
@@ -348,9 +372,9 @@ export function createPrefixSnapshotStore(
 		},
 		async close() {
 			closed = true;
-			jsonCache.clear();
+			cache.clear();
 			weakValues.clear();
-			retainedJsonBytes = 0;
+			retainedBytes = 0;
 			clearTimeout(idle);
 			for (const abort of aborters) abort();
 			retire();

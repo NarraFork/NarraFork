@@ -5,7 +5,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ModelAggregationsSection } from "../../components/settings/ModelAggregationsSection";
-import { ModelCardsSection } from "../../components/settings/ModelCardsSection";
+import { ModelCatalogSection } from "../../components/settings/ModelCatalogSection";
 import { ModelsSection } from "../../components/settings/ModelsSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 import { useAllModels } from "../../hooks/useModels";
@@ -15,16 +15,6 @@ import type { ModelAggregation } from "../../lib/constants";
 export const Route = createFileRoute("/settings/models")({
 	component: SettingsModelsPage,
 });
-
-let shortIdCounter = 0;
-function generateShortId(): string {
-	const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-	let id = "";
-	for (let i = 0; i < 8; i++) {
-		id += chars[Math.floor(Math.random() * chars.length)];
-	}
-	return id + (shortIdCounter++).toString(36);
-}
 
 function SettingsModelsPage() {
 	const { t } = useTranslation("settings");
@@ -134,16 +124,19 @@ function SettingsModelsPage() {
 				catalogMissingModels={catalogMissingModels}
 				navigate={navigate}
 			/>
+			{localAggregations.length > 0 && (
+				<>
+					<Divider />
+					<ModelAggregationsSection
+						aggregations={localAggregations}
+						onChange={handleAggregationsChange}
+						allModels={visibleModels}
+						providerLabels={providerLabels}
+					/>
+				</>
+			)}
 			<Divider />
-			<ModelAggregationsSection
-				aggregations={localAggregations}
-				onChange={handleAggregationsChange}
-				allModels={visibleModels}
-				providerLabels={providerLabels}
-				generateId={generateShortId}
-			/>
-			<Divider />
-			<ModelCardsSection />
+			<ModelCatalogSection />
 		</Stack>
 	);
 }

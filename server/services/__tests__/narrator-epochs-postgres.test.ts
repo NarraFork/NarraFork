@@ -126,7 +126,9 @@ describe("PostgreSQL MCP epochs", () => {
 		const history = markerRows();
 		const switched = { ...input(history), model: "new-model" };
 		failWrite = true;
-		await expect(reconcileEpoch(switched)).rejects.toThrow("Could not save the tool epoch");
+		await expect(reconcileEpoch(switched)).rejects.toThrow(
+			"Could not prepare tool and context state",
+		);
 		expect(markers).toHaveLength(1);
 		failWrite = false;
 		expect(await changed(switched)).toBe(true);

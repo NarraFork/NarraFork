@@ -31,6 +31,7 @@
  *      hand over) write access to its space (404 when it cannot be read, 403 otherwise).
  *   8. Questions and the digest (P2 PR 7): the questions under a block, answering those put to
  *      the person (one `answer` commit), and acknowledging what agents confirmed on their behalf.
+ *   9. Reports (P2 PR 11, `/digests`): only the person's own; see `routes/outline-digest.ts`.
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
@@ -66,6 +67,7 @@ import {
 import type {
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
@@ -79,6 +81,7 @@ import {
 	outlineBacklinksQuerySchema,
 	outlineBlockViewQuerySchema,
 	outlineBoardAddBodySchema,
+	outlineBoardSeenBodySchema,
 	outlineBoardTaskUpdateBodySchema,
 	outlineDigestSeenBodySchema,
 	outlineFinishedTasksQuerySchema,
@@ -152,6 +155,7 @@ import type {
 	OutlineSpaceRow,
 } from "../services/outline/store/port";
 import {
+	markOutlineTasksSeen,
 	readFinishedTasks,
 	readProjectTaskBoard,
 	readSessionTaskBoard,
@@ -167,6 +171,7 @@ import {
 } from "../services/outline/views";
 import { flushOutlineTaskEdits } from "../services/outline-task-edits";
 import { resolveTaskBackend } from "../services/task-source";
+import { outlineDigestRoutes } from "./outline-digest";
 
 export const outlineRoutes = new Hono();
 
@@ -174,6 +179,9 @@ outlineRoutes.use("*", async (c, next) => {
 	if (!isOutlineEnabled()) return c.notFound();
 	await next();
 });
+
+/** The person's reports (P2 PR 11): `routes/outline-digest.ts`, behind the same gate. */
+outlineRoutes.route("/digests", outlineDigestRoutes);
 
 function principalOf(c: Context): OutlinePrincipal {
 	const user = c.get("user");
@@ -1051,6 +1059,19 @@ outlineRoutes.post("/narrators/:narratorId/tasks", bodyLimit({ maxSize: 64 * 102
 		started,
 	};
 	return c.json(body, task.added ? 201 : 200);
+});
+
+/**
+ * The person saw tasks marked 「新完成」 on a board (outline P2 PR 9b): each is recorded at the
+ * version shown, so the mark is gone the next time the board is read. Only tasks that are done and
+ * theirs, in spaces they may read, are recorded; the rest are ignored alike (nothing is said about
+ * a task the person may not see).
+ */
+outlineRoutes.post("/tasks/seen", bodyLimit({ maxSize: 16 * 1024 }), async (c) => {
+	const principal = principalOf(c);
+	const input = parse(outlineBoardSeenBodySchema, await c.req.json().catch(() => ({})));
+	const body: OutlineBoardSeenResponse = { marked: await markOutlineTasksSeen(principal, input) };
+	return c.json(body);
 });
 
 /**

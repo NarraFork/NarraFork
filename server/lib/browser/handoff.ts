@@ -55,7 +55,19 @@ function isHandoffSession(value: unknown): value is BrowserSessionHandoff {
 				/^[A-Za-z0-9_-]{1,64}$/.test(v.interruptedProfileId))) &&
 		typeof v.headless === "boolean" &&
 		typeof v.ttlMs === "number" &&
-		typeof v.networkCaptureEnabled === "boolean"
+		typeof v.networkCaptureEnabled === "boolean" &&
+		(v.viewport === undefined || isViewport(v.viewport))
+	);
+}
+
+function isViewport(value: unknown): boolean {
+	if (!value || typeof value !== "object") return false;
+	const v = value as Record<string, unknown>;
+	return (
+		typeof v.width === "number" &&
+		typeof v.height === "number" &&
+		(v.deviceScaleFactor === undefined || typeof v.deviceScaleFactor === "number") &&
+		(v.isMobile === undefined || typeof v.isMobile === "boolean")
 	);
 }
 

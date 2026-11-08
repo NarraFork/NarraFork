@@ -10,6 +10,7 @@ import {
 	Group,
 	Loader,
 	SegmentedControl,
+	Stack,
 	Text,
 	Tooltip,
 } from "@mantine/core";
@@ -55,6 +56,7 @@ import { getShikiLang } from "../../../lib/shiki-lang";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import { savedSelectionReference } from "../composer/file-reference-input";
 import type { DiffLine } from "../diff/DiffView";
+import { LargeFileLocationActions } from "../file-panel/LargeFileGate";
 import { availableModes } from "../file-viewer/file-viewer-modes";
 import { useEditorPanelVisible, useRetainedEditorView } from "../narrator-panel-visibility";
 import { filePanelBaseName } from "../panels/panel-kind";
@@ -161,6 +163,17 @@ const PREVIEW_JUMP_SETTLE_MS = 1500;
 const PREVIEW_JUMP_GIVE_UP_MS = 5000;
 
 const CONFLICT_DIFF_CHARS = 32 * 1024;
+
+/**
+ * The codec reports why bytes are not text with a machine code (see shared/editor-stream-codec.ts).
+ * The server relays that code as the error text, so show the localized sentence instead of the
+ * code; every other failure keeps the server's own wording.
+ */
+export function fileEditorOpenErrorKey(message: string): string | null {
+	if (message === "EDITOR_BINARY") return "fileEditor.binaryNotEditable";
+	if (message === "EDITOR_ENCODING_INVALID") return "fileEditor.encodingUnreadable";
+	return null;
+}
 
 export interface FileEditorContentProps {
 	filePath: string;
@@ -370,7 +383,20 @@ function FileEditorBinding(props: FileEditorContentProps) {
 		rawV2,
 		props.rawEncoding,
 	]);
-	if (error)
+	if (error) {
+		const reason = fileEditorOpenErrorKey(error);
+		// A binary or undecodable file fails the same way on every retry; offer a way out instead.
+		if (reason)
+			return (
+				<Center h="100%">
+					<Stack align="center" p="xl" maw="100%">
+						<Text size="sm" ta="center">
+							{t(reason)}
+						</Text>
+						<LargeFileLocationActions filePath={filePath} deviceId={deviceId} />
+					</Stack>
+				</Center>
+			);
 		return (
 			<Center h="100%">
 				<Group gap="xs">
@@ -393,6 +419,7 @@ function FileEditorBinding(props: FileEditorContentProps) {
 				</Group>
 			</Center>
 		);
+	}
 	if (!copy)
 		return (
 			<Center h="100%">
@@ -1190,10 +1217,18 @@ function FileEditorDocument({
 		}
 	};
 
-	if (!state?.loaded)
+	if (!state?.loaded) {
+		const reason = state?.error ? fileEditorOpenErrorKey(state.error) : null;
 		return (
 			<Center h="100%" p="md">
-				{state?.error ? (
+				{reason ? (
+					<Stack align="center" maw="100%">
+						<Text size="sm" ta="center">
+							{t(reason)}
+						</Text>
+						<LargeFileLocationActions filePath={filePath} deviceId={deviceId} />
+					</Stack>
+				) : state?.error ? (
 					<Group gap="xs">
 						<Text size="sm" c="red">
 							{state.error}
@@ -1207,6 +1242,7 @@ function FileEditorDocument({
 				)}
 			</Center>
 		);
+	}
 	if (state.paged && workingCopy.pagedDocument)
 		return (
 			<EditorPagedView

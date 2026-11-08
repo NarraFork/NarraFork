@@ -100,7 +100,6 @@ async function recover() {
 		narratorId: "owner",
 		versioned: true,
 		bodiesFromBlocks: true,
-		deadline: Date.now() + 10_000,
 	});
 	const messages = source.messages.map((row) => ({ ...row }));
 	attachPrefixHistorySource(messages, source);
@@ -248,6 +247,13 @@ function replyContext(id = "owner") {
 	return row.reply_context === null ? null : JSON.parse(row.reply_context);
 }
 
+function workspaceDirectories(id = "owner") {
+	const row = sqlite.query("SELECT workspace_directories FROM narrators WHERE id = ?").get(id) as {
+		workspace_directories: string;
+	};
+	return JSON.parse(row.workspace_directories) as Record<string, unknown>;
+}
+
 test("reply context survives new package insert/overwrite while skip preserves local values", async () => {
 	narrator();
 	const bytes = await archive();
@@ -265,7 +271,7 @@ test("reply context survives new package insert/overwrite while skip preserves l
 	expect(replyContext()).toEqual({ locale: "zh-CN", replyInUserLanguage: true });
 });
 
-test("old packages without snapshots/reply_context import null and preserve absent columns on overwrite", async () => {
+test("old packages without snapshots/new narrator columns use defaults and preserve local values", async () => {
 	narrator();
 	const bytes = await archive();
 	await clearData("sessions");
@@ -274,15 +280,23 @@ test("old packages without snapshots/reply_context import null and preserve abse
 		const incoming = new Database(preview.snapshotPath);
 		incoming.run("DROP TABLE narrator_text_snapshots");
 		incoming.run("ALTER TABLE narrators DROP COLUMN reply_context");
+		incoming.run("ALTER TABLE narrators DROP COLUMN workspace_directories");
 		incoming.close();
 		await applyImport(preview.token, { include: selection, conflictDefault });
 		if (conflictDefault === "skip") {
 			expect(replyContext()).toBeNull();
-			sqlite.run("UPDATE narrators SET reply_context = ?", [
+			// The old snapshot has no value to copy, so the new NOT NULL column must
+			// be populated by its schema default rather than making the import fail.
+			expect(workspaceDirectories()).toEqual({});
+			sqlite.run("UPDATE narrators SET reply_context = ?, workspace_directories = ?", [
 				JSON.stringify({ locale: "en", replyInUserLanguage: false }),
+				JSON.stringify({ device: { cwd: "/local", pathFlavor: "posix" } }),
 			]);
 		} else {
 			expect(replyContext()).toEqual({ locale: "en", replyInUserLanguage: false });
+			expect(workspaceDirectories()).toEqual({
+				device: { cwd: "/local", pathFlavor: "posix" },
+			});
 		}
 	}
 });

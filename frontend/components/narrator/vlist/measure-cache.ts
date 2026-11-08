@@ -704,6 +704,17 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// but the takeover patch writes it ALONE (the card stays `running` throughout),
 	// which makes this the only key component that can move.
 	if (d.isTakenOver === true) rev += "|gw:1";
+	// The outline task the agent was sent with (P2 PR 9b): the task row is height-bearing by its
+	// presence, and its title, link and the late badge are painted from the cached payload. The
+	// conclusion patch can bring all three alone (the note arrives with the result).
+	const delegation = d.delegation as
+		| { title?: unknown; address?: unknown; late?: unknown }
+		| undefined;
+	if (delegation && typeof delegation === "object") {
+		rev += `|gtk:${typeof delegation.title === "string" ? textSignature(delegation.title) : ""}`;
+		rev += `|gta:${typeof delegation.address === "string" ? delegation.address : ""}`;
+		rev += `|gtl:${typeof delegation.late === "string" ? delegation.late : ""}`;
+	}
 	// Measured bodies: the description wraps when expanded, the prompt and result
 	// are measured up to their caps.
 	if (typeof d.description === "string") rev += `|gd:${textSignature(d.description)}`;

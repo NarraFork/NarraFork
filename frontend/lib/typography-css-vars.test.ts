@@ -57,5 +57,8 @@ describe("typography CSS variables on <html>", () => {
 			for (const value of Object.values(style)) expect(value).toMatch(/^var\(--nf-type-/);
 		}
 		expect(TYPE_ROLE_STYLE.body.lineHeight).toBe(`var(${TYPOGRAPHY_CSS_VARS.bodyLine})`);
+		// A permission card's textarea: xs text on the row the height model counts (D49).
+		expect(TYPE_ROLE_STYLE.textarea.lineHeight).toBe(`var(${TYPOGRAPHY_CSS_VARS.xsBaseLine})`);
+		expect(TYPE_ROLE_STYLE.textarea.fontSize).toBe(`var(${TYPOGRAPHY_CSS_VARS.xsSize})`);
 	});
 });

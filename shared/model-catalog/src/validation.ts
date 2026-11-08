@@ -1,5 +1,5 @@
 import { validateRawMetadata } from "../card";
-import type { RawCatalog, RawLocalState, RawMetadata, RawModel } from "../schema/catalog";
+import type { RawCatalog, RawMetadata, RawModel } from "../schema/catalog";
 import schema from "../schema/catalog.schema.json";
 
 type Schema = {
@@ -106,7 +106,7 @@ export function validateShape(value: unknown, name: string): void {
 /**
  * Field groups that `matches.fields` and `sources[].fields` may name. This is the
  * public catalog's grouping vocabulary, not a metadata shape: `fieldAllowed` in
- * card-resolver.ts maps each group onto the raw keys it covers.
+ * resolve.ts maps each group onto the raw keys it covers.
  */
 export const MATCH_FIELD_GROUPS: ReadonlySet<string> = new Set([
 	"limits",
@@ -221,18 +221,4 @@ export function validateRawCatalog(value: unknown): RawCatalog {
 		fail("Invalid model count");
 	validateEntries(catalog.models, catalog.variants);
 	return structuredClone(catalog);
-}
-
-/**
- * The local layer composed over a catalog: local definitions replace catalog entries
- * of the same id, and the result must still be an unambiguous identity set.
- */
-export function validateComposedEntries(catalog: RawCatalog, local: RawLocalState): void {
-	validateShape(local, "RawLocalState");
-	const localModels = new Set((local.models ?? []).map((m) => m.id));
-	const localVariants = new Set((local.variants ?? []).map((v) => v.id));
-	validateEntries(
-		[...catalog.models.filter((m) => !localModels.has(m.id)), ...(local.models ?? [])],
-		[...catalog.variants.filter((v) => !localVariants.has(v.id)), ...(local.variants ?? [])],
-	);
 }

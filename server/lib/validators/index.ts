@@ -18,6 +18,7 @@ export {
 	passkeyRegisterSchema,
 	passkeyRenameSchema,
 	registerSchema,
+	stepUpSchema,
 	totpActivateSchema,
 	totpDisableSchema,
 	updateGitIdentitySchema,

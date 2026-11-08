@@ -15,6 +15,8 @@ import {
 	serializeDiagnostics,
 	startApiRequest,
 } from "../api-request-tracker";
+import { resolveCredentialDisplayName } from "../credential-display-name";
+import { settings } from "../settings";
 
 afterEach(() => {
 	cleanDb(sqlite);
@@ -270,6 +272,43 @@ describe("request user attribution", () => {
 			cacheCreationTokens: 50,
 		});
 	});
+	test("an API connection without a reported credential is attributed to the connection", async () => {
+		const saved = settings.anthropicProviders;
+		settings.anthropicProviders = [
+			{
+				id: "conn1234",
+				name: "Team relay",
+				prefix: "relay",
+				apiKey: "k",
+				baseUrl: "",
+				defaultModel: "",
+			},
+		];
+		try {
+			const handle = startApiRequest({ provider: "relay", model: "claude-x", userId: "u" });
+			await finishApiRequest(handle, { usage: { inputTokens: 10, outputTokens: 5 } });
+			expect(
+				db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get(),
+			).toMatchObject({ credentialId: "conn1234" });
+			expect(
+				db
+					.select()
+					.from(credentialUsageTotals)
+					.where(eq(credentialUsageTotals.credentialId, "conn1234"))
+					.get(),
+			).toMatchObject({ provider: "relay", requestCount: 1 });
+			expect(resolveCredentialDisplayName("relay", "conn1234")).toBe("Team relay");
+			// Unknown prefixes stay unattributed instead of being guessed.
+			const unknown = startApiRequest({ provider: "nowhere", model: "m", userId: "u" });
+			await finishApiRequest(unknown, { usage: { inputTokens: 1, outputTokens: 1 } });
+			expect(
+				db.select().from(apiRequests).where(eq(apiRequests.id, unknown.id)).get()?.credentialId,
+			).toBeNull();
+		} finally {
+			settings.anthropicProviders = saved;
+		}
+	});
+
 	test("completion persists frozen user and rolls up once, including unknown-cost failures", async () => {
 		const userId = "tracker-user-rollup-test";
 		const handle = startApiRequest({ provider: "test", model: "unknown", userId });

@@ -1749,10 +1749,14 @@ export const PretextExactMessageList = memo(
 			);
 			const planButtonLabelsRef = useRef(planButtonLabels);
 			planButtonLabelsRef.current = planButtonLabels;
-			// Its empty feedback box is as tall as its placeholder (outline P2 PR 8b review round 1).
+			// Its empty feedback box is as tall as its placeholder (outline P2 PR 8b review round 1),
+			// and so is every other card's (D49 review round 1 S1).
 			const planFeedbackPlaceholder = t("outlinePlan.feedbackPlaceholder");
 			const planFeedbackPlaceholderRef = useRef(planFeedbackPlaceholder);
 			planFeedbackPlaceholderRef.current = planFeedbackPlaceholder;
+			const feedbackPlaceholder = t("feedbackPlaceholder");
+			const feedbackPlaceholderRef = useRef(feedbackPlaceholder);
+			feedbackPlaceholderRef.current = feedbackPlaceholder;
 			const permissionPredictionsByToolUseId = useMemo(() => {
 				const map = new Map<string, InlinePermissionData>();
 				const innerWidth = toolCardInnerWidth(contentWidth, false);
@@ -1763,6 +1767,7 @@ export const PretextExactMessageList = memo(
 						canDecide: canDecidePermissions,
 						planButtonLabels,
 						planFeedbackPlaceholder,
+						feedbackPlaceholder,
 					});
 					if (prediction) map.set(perm.toolUseId, prediction);
 				}
@@ -1773,6 +1778,7 @@ export const PretextExactMessageList = memo(
 				canDecidePermissions,
 				planButtonLabels,
 				planFeedbackPlaceholder,
+				feedbackPlaceholder,
 			]);
 			const resolvePermissionFormPrediction = useCallback(
 				(toolUseId: string | undefined) =>
@@ -1809,6 +1815,7 @@ export const PretextExactMessageList = memo(
 							canDecide: canDecidePermissionsRef.current,
 							planButtonLabels: planButtonLabelsRef.current,
 							planFeedbackPlaceholder: planFeedbackPlaceholderRef.current,
+							feedbackPlaceholder: feedbackPlaceholderRef.current,
 						});
 						if (!prediction) return undefined;
 						const painted = resizeFormHeightsRef.current.get(toolUseId);

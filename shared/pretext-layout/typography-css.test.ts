@@ -24,6 +24,7 @@ function expectMatchesMetrics(vars: Record<string, string>): void {
 	expect(vars[V.bodyLine]).toBe(`${m.line.body}px`);
 	expect(vars[V.xsSize]).toBe(`${m.size.xs}px`);
 	expect(vars[V.xsLine]).toBe(`${m.line.xs}px`);
+	expect(vars[V.xsBaseLine]).toBe(`${m.line.xsBase}px`);
 	expect(vars[V.codeSize]).toBe(`${m.size.xs}px`);
 	expect(vars[V.codeBlockSize]).toBe(`${m.codeSize}px`);
 	expect(vars[V.codeBlockLine]).toBe(`${m.line.code}px`);
@@ -52,6 +53,7 @@ describe("typography CSS variables", () => {
 			[V.bodyLine]: "24px", // round(14 × 1.45 × 1.2); was 20
 			[V.xsSize]: "12px",
 			[V.xsLine]: "20px", // round(12 × 1.4 × 1.2); was 17
+			[V.xsBaseLine]: "22px", // round(12 × 1.55 × 1.2): a permission card's textarea row; was 19
 			[V.codeBlockSize]: "11px",
 			[V.codeBlockLine]: "20px", // round(11 × 1.55 × 1.2); was 17
 			[headingCssVar(1, "size")]: "34px",

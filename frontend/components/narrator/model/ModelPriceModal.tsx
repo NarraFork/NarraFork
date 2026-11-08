@@ -16,15 +16,17 @@ import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
-import { useActualResolvedModelCard, useModelCatalog } from "../../../hooks/useModelCatalog";
+import { useActualResolvedModelCard } from "../../../hooks/useModelCatalog";
 import { api } from "../../../lib/api";
 import type { ModelOption } from "../../../lib/constants";
 import { formatLocaleNumber } from "../../../lib/intl-format";
-import { resolveCatalogEntry } from "../../../lib/model-catalog-view";
 import { Z } from "../../../lib/z-index";
+import {
+	COMMAND_CODE_PROTOCOL_OPTIONS,
+	ModelProtocolSelect,
+} from "../../providers/ModelProtocolSelect";
 import type { CustomApiProtocol } from "../../providers/types";
-import { ModelCardDetails } from "../../settings/ModelCardDetails";
-import { type CatalogEditorTarget, ModelCatalogEditor } from "../../settings/ModelCatalogEditor";
+import { ModelOverrideEditor } from "../../settings/ModelOverrideEditor";
 
 /** Format a per-1M-token RMB price, trimming trailing zeros (max 6 decimals). */
 function fmtPrice(value: number | string | undefined, unit: string): string {
@@ -74,7 +76,6 @@ export function ModelPriceModal({
 	const { t: ts } = useTranslation("settings");
 	const { data: user } = useCurrentUser();
 	const qc = useQueryClient();
-	const catalog = useModelCatalog(opened);
 	const actual = useActualResolvedModelCard(opened ? model?.value : undefined);
 	// 每个模型一个 ModelTrace 舱（隐藏叙述者）；这个查询决定“历史”按钮可不可点。
 	const navigate = useNavigate();
@@ -87,7 +88,7 @@ export function ModelPriceModal({
 	});
 	const traceNarratorId = traceTarget?.narratorId ?? null;
 	const reference = actual.data ? modelProfile(actual.data).referencePricing : undefined;
-	const [editor, setEditor] = useState<CatalogEditorTarget | null>(null);
+	const [editorOpen, setEditorOpen] = useState(false);
 	const readOnly = user?.role !== "admin";
 	// 协议分两层，都与 catalog 快照无关，因此在这里读写：
 	// provider 层（设置页模型行写的 modelProtocols）与本地覆盖层（本对话框单独保存的
@@ -152,7 +153,7 @@ export function ModelPriceModal({
 		<Modal
 			opened={opened}
 			onClose={() => {
-				setEditor(null);
+				setEditorOpen(false);
 				onClose();
 			}}
 			title={model?.label ?? t("modelPrice.title")}
@@ -186,62 +187,39 @@ export function ModelPriceModal({
 				{actual.error && <Alert color="red">{actual.error.message}</Alert>}
 				{actual.data && (
 					<>
-						<Text size="xs" c="dimmed">
-							{ts("catalog.resolvedVia", {
-								via: actual.data.matchedVia,
-								version: actual.data.catalogVersion,
-								revision: actual.data.localRevision,
-							})}
+						<Text size="sm">
+							{actual.data.modelId
+								? ts("catalog.matched", { name: actual.data.modelId })
+								: ts("catalog.unmatched")}
 						</Text>
-						{actual.data.matchedVia === "none" && <Text size="sm">{ts("catalog.noMatch")}</Text>}
 						<Text size="sm">
 							{ts("catalog.reference")}: {referencePrice(reference?.input)} /{" "}
 							{referencePrice(reference?.output)}
 						</Text>
-						<ModelCardDetails card={actual.data} />
+						{modelValue && !readOnly && (
+							<Group gap="xs" align="center">
+								<Text size="sm">{ts("catalog.protocol")}</Text>
+								<ModelProtocolSelect
+									value={localProtocols[modelValue] ?? null}
+									onChange={(protocol) => void saveModelProtocol(protocol)}
+									dropdownZIndex={Z.modal + 1}
+									protocols={
+										modelValue.startsWith("CommandCode:")
+											? COMMAND_CODE_PROTOCOL_OPTIONS
+											: undefined
+									}
+								/>
+								{providerProtocols[modelValue] && localProtocols[modelValue] === undefined && (
+									<Text size="xs" c="dimmed">
+										{ts("catalog.protocolProviderLayer")}
+									</Text>
+								)}
+							</Group>
+						)}
 						<Group>
-							<Button
-								size="xs"
-								variant="light"
-								disabled={!catalog.data}
-								onClick={() => {
-									const resolved = actual.data;
-									if (!resolved) return;
-									setEditor({
-										kind: "binding",
-										id: resolved.bindingId ?? "",
-										isNew: !resolved.bindingId,
-										card: resolved,
-										query: resolved.resolvedQuery,
-									});
-								}}
-							>
-								{ts("catalog.editBinding")}
+							<Button size="xs" variant="light" onClick={() => setEditorOpen(true)}>
+								{ts("catalog.editParameters")}
 							</Button>
-							{actual.data.variantId && (
-								<Button
-									size="xs"
-									variant="subtle"
-									disabled={!catalog.data}
-									onClick={() => {
-										const resolved = actual.data;
-										const snapshot = catalog.data;
-										const variant = [
-											...(snapshot?.local.variants ?? []),
-											...(snapshot?.catalog.variants ?? []),
-										].find((entry) => entry.id === resolved?.variantId);
-										if (snapshot && variant)
-											setEditor({
-												kind: "variant",
-												id: variant.id,
-												modelId: variant.modelId,
-												card: resolveCatalogEntry(snapshot, variant),
-											});
-									}}
-								>
-									{ts("catalog.editVariant")}
-								</Button>
-							)}
 						</Group>
 					</>
 				)}
@@ -316,23 +294,11 @@ export function ModelPriceModal({
 					</Text>
 				</Stack>
 			)}
-			{editor && catalog.data && (
-				<ModelCatalogEditor
-					key={`${editor.kind}:${editor.id}`}
-					target={editor}
-					snapshot={catalog.data}
-					readOnly={readOnly}
-					onClose={() => setEditor(null)}
-					protocol={
-						modelValue
-							? {
-									modelValue,
-									value: localProtocols[modelValue] ?? null,
-									inheritedValue: providerProtocols[modelValue] ?? null,
-									onSave: saveModelProtocol,
-								}
-							: undefined
-					}
+			{editorOpen && (
+				<ModelOverrideEditor
+					model={modelValue}
+					opened={editorOpen}
+					onClose={() => setEditorOpen(false)}
 				/>
 			)}
 		</Modal>

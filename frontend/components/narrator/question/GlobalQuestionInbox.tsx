@@ -54,7 +54,11 @@ import {
 } from "../../../hooks/useHumanAttention";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { api } from "../../../lib/api";
-import { outlineRouterLink, useOutlineRouterNavigate } from "../../../lib/outline-router";
+import {
+	outlineRouterLink,
+	useOutlineRouterHrefNavigate,
+	useOutlineRouterNavigate,
+} from "../../../lib/outline-router";
 import { readSession, writeSession } from "../../../lib/session-store";
 import { OutlineAttentionDetail } from "../../outline/OutlineQuestions";
 import { OutlineNavProvider } from "../../outline/outline-nav";
@@ -415,7 +419,18 @@ function outlineRowText(
 ) {
 	const ref = item.outline;
 	if (!ref) return item.summary;
-	if (ref.what === "digest") return t("outlineAttention.digest", { count: ref.count });
+	if (ref.what === "digest") {
+		// Unread reports (P2 PR 11) and confirmations made on the person's behalf share the row.
+		const parts = [
+			...(ref.reports
+				? [t("outlineAttention.reports", { count: ref.reports, items: ref.reportItems ?? 0 })]
+				: []),
+			...(ref.count > 0 || !ref.reports
+				? [t("outlineAttention.digest", { count: ref.count })]
+				: []),
+		];
+		return parts.join(" · ");
+	}
 	if (ref.what === "pending")
 		return t("outlineAttention.pending", { summary: item.summary, count: ref.count });
 	return t("outlineAttention.questions", { title: item.summary, count: ref.count });
@@ -427,6 +442,7 @@ function HumanAttentionRow({ item }: { item: HumanAttentionItem }) {
 	const onClose = useContext(CloseAttentionContext);
 	// Links of an outline row go through the app's routes (the outline's components are router-free).
 	const navigateOutline = useOutlineRouterNavigate();
+	const navigateHref = useOutlineRouterHrefNavigate();
 	if (item.source === "outline") {
 		return (
 			<Paper withBorder p="sm" data-attention-id={item.id} data-attention-kind={item.kind}>
@@ -468,7 +484,11 @@ function HumanAttentionRow({ item }: { item: HumanAttentionItem }) {
 						{item.narratorId && <OwnerLink item={item} />}
 					</Group>
 					{expanded && (
-						<OutlineNavProvider onNavigate={navigateOutline} renderLink={outlineRouterLink}>
+						<OutlineNavProvider
+							onNavigate={navigateOutline}
+							renderLink={outlineRouterLink}
+							onNavigateHref={navigateHref}
+						>
 							<OutlineAttentionDetail item={item} onOpen={onClose} />
 						</OutlineNavProvider>
 					)}

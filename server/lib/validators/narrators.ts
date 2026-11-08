@@ -92,6 +92,7 @@ export const createNarratorSchema = z.object({
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
+	questionReflectionOverride: booleanOverrideSchema.optional(),
 	autoContinuationOverride: autoContinuationOverrideSchema.optional(),
 	behaviorFenceIntervalOverride: z
 		.number()
@@ -151,6 +152,8 @@ export const codexUpdateCredentialSchema = z.object({
 	displayName: z.string().optional(),
 	priority: z.number().optional(),
 	useCreditQuota: z.boolean().optional(),
+	/** Network identity; validated by `normalizeCredentialNetwork`. `null` clears it. */
+	network: z.unknown().optional(),
 });
 
 export const codexUseWebSocketSchema = z.object({

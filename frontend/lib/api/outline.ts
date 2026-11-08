@@ -27,10 +27,18 @@ import type {
 	OutlineViewStateResponse,
 } from "@shared/outline-api";
 import type {
+	OutlineDigestDetailResponse,
+	OutlineDigestListResponse,
+	OutlineDigestNowResponse,
+	OutlineDigestUndoResponse,
+} from "@shared/outline-digest";
+import type {
 	NarratorCurrentTaskResponse,
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardSeenRequest,
+	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
 	OutlineBoardTaskUpdateResponse,
 	OutlineTaskBoardResponse,
@@ -171,6 +179,33 @@ export const outlineApi = {
 			method: "POST",
 			body: JSON.stringify({ pendingIds }),
 		}),
+	/** Mark all the caller's unread reports read (P2 PR 11). */
+	markOutlineReportsSeen: () =>
+		request<{ marked: number }>("/outline/digests/seen", {
+			method: "POST",
+			body: JSON.stringify({ all: true }),
+		}),
+	/** The caller's daily reports, latest day first (heads only), and the current preview. */
+	listOutlineReports: (params: { before?: string | null; limit?: number }) =>
+		request<OutlineDigestListResponse>(`/outline/digests${query(params)}`),
+	/** One report as the caller may see it now. */
+	getOutlineReport: (id: string) =>
+		request<OutlineDigestDetailResponse>(`/outline/digests/${enc(id)}`),
+	/** Mark these reports read. */
+	markOutlineReportRead: (ids: string[]) =>
+		request<{ marked: number }>("/outline/digests/seen", {
+			method: "POST",
+			body: JSON.stringify({ ids }),
+		}),
+	/** Ask for "today so far" (made in the background; answers at once). */
+	requestOutlineReportNow: () =>
+		request<OutlineDigestNowResponse>("/outline/digests/now", { method: "POST" }),
+	/** Take back a decision made in the caller's name, by reverting its commit. */
+	undoOutlineDecision: (commitId: string) =>
+		request<OutlineDigestUndoResponse>("/outline/digests/undo", {
+			method: "POST",
+			body: JSON.stringify({ commitId }),
+		}),
 	/** A session's task board (its dock tab). */
 	getSessionTaskBoard: (narratorId: string) =>
 		request<OutlineTaskBoardResponse>(`/outline/narrators/${enc(narratorId)}/tasks`),
@@ -195,6 +230,16 @@ export const outlineApi = {
 		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
 			method: "PATCH",
 			body: JSON.stringify(body),
+		}),
+	/**
+	 * The person saw these tasks marked 「新完成」 on a board (outline P2 PR 9b); `keepalive` when
+	 * the page is going away.
+	 */
+	markBoardTasksSeen: (body: OutlineBoardSeenRequest, options: { keepalive?: boolean } = {}) =>
+		request<OutlineBoardSeenResponse>("/outline/tasks/seen", {
+			method: "POST",
+			body: JSON.stringify(body),
+			...(options.keepalive ? { keepalive: true } : {}),
 		}),
 	/** The status bar's current task, from the session's task source (either backend). */
 	getNarratorCurrentTask: (narratorId: string) =>

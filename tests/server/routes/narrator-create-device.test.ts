@@ -38,9 +38,11 @@ const resolveRemoteBrowseTarget = mock((_deviceId: string, path?: string) => ({
 	pathFlavor: "windows" as const,
 	sep: "\\",
 }));
+const resolveRemoteBrowsePath = mock(async (_deviceId: string, path: string) => path);
 mock.module("@server/services/device-transfer-service", () => ({
 	...realTransferService,
 	browseRemoteDirectory,
+	resolveRemoteBrowsePath,
 	resolveRemoteBrowseTarget,
 }));
 
@@ -79,6 +81,8 @@ let projectId: string;
 const restorers: (() => void)[] = [];
 
 beforeEach(async () => {
+	resolveRemoteBrowsePath.mockClear();
+	resolveRemoteBrowsePath.mockImplementation(async (_deviceId, path) => path);
 	root = await mkdtemp(join(tmpdir(), "narrator-create-device-"));
 	await mkdir(join(root, "work"));
 	owner = generateId();
@@ -247,6 +251,37 @@ describe("devices and directories before the session exists", () => {
 		);
 		expect(outside.status).toBe(403);
 		// A refused path must never reach the device.
+		expect(browseRemoteDirectory).toHaveBeenCalledTimes(1);
+	});
+
+	test("a Windows junction cannot expose entries outside the declared root", async () => {
+		stubDevices([windowsDevice]);
+		browseRemoteDirectory.mockClear();
+		browseRemoteDirectory.mockResolvedValue({
+			path: "C:\\Windows",
+			entries: [{ name: "outside-secret", isDirectory: true }],
+		} as never);
+		resolveRemoteBrowsePath.mockImplementation(async (_deviceId, path) =>
+			path === "C:\\device-default\\junction" ? "C:\\Windows" : path,
+		);
+
+		const response = await app(owner).request(
+			`/api/narrators/workspace-directory-browse?deviceId=${WINDOWS_DEVICE}&path=${encodeURIComponent("C:\\device-default\\junction")}`,
+		);
+		expect(response.status).toBe(403);
+		expect(await response.text()).not.toContain("outside-secret");
+		// The lexical path looks like a child, but canonical containment fails before fs.list.
+		expect(resolveRemoteBrowsePath).toHaveBeenCalledWith(
+			WINDOWS_DEVICE,
+			"C:\\device-default\\junction",
+		);
+		expect(browseRemoteDirectory).not.toHaveBeenCalled();
+
+		resolveRemoteBrowsePath.mockImplementation(async (_deviceId, path) => path);
+		const child = await app(owner).request(
+			`/api/narrators/workspace-directory-browse?deviceId=${WINDOWS_DEVICE}&path=${encodeURIComponent("C:\\device-default\\src")}`,
+		);
+		expect(child.status, await child.clone().text()).toBe(200);
 		expect(browseRemoteDirectory).toHaveBeenCalledTimes(1);
 	});
 });

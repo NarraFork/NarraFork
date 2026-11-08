@@ -917,11 +917,13 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	 */
 	const emptyBody =
 		topLevelCount > 0 ? null : sectionState.isLoading ? (
-			<Center py="xs">
+			// Collapsed, the rail shows icons only: these are not rows, so nothing clips them
+			// to it, and they would paint at the list's full width over the page.
+			<Center py="xs" className="nf-nav-expanded-only">
 				<Loader size="xs" />
 			</Center>
 		) : sectionState.isError ? (
-			<Stack gap={2} py={4} align="center">
+			<Stack gap={2} py={4} align="center" className="nf-nav-expanded-only">
 				<Text size="xs" c="red">
 					{t("recentTabsSyncError")}
 				</Text>
@@ -1232,7 +1234,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 
 						{topLevelCount > 0 &&
 							(sectionState.isError ? (
-								<Stack gap={2} py={4} align="center">
+								<Stack gap={2} py={4} align="center" className="nf-nav-expanded-only">
 									<Text size="xs" c="red">
 										{t("recentTabsSyncError")}
 									</Text>
@@ -1241,7 +1243,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 									</Button>
 								</Stack>
 							) : sectionState.hasMore ? (
+								// Not a row, so nothing clips it to the rail: collapsed, it would be
+								// painted at the list's full width over the page.
 								<Button
+									className="nf-nav-expanded-only"
 									size="compact-xs"
 									variant="subtle"
 									fullWidth

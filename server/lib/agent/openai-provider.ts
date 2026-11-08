@@ -680,6 +680,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		return this.config.codexWebSearch ?? true;
 	}
 
+	/** The installation id Codex-mode requests send: the credential's own, else the instance's. */
+	private codexInstallationId(): string {
+		return this.config.codexInstallationId ?? getInstallationId();
+	}
+
 	private get codexImageGenerationEnabled(): boolean {
 		return this.config.codexImageGeneration ?? true;
 	}
@@ -742,11 +747,21 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	async buildHistory(
-		dbMessages: DbMessage[],
+		dbMessages: readonly DbMessage[],
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
-		this.assertMediaInput(model, dbMessages.flatMap(storedMessageMedia));
+		const media = dbMessages.flatMap(storedMessageMedia);
+		// Stored user content includes text as well as media. Bound each validation
+		// pass over wide rows without changing the capability/payload checks.
+		let lastMediaYield = performance.now();
+		for (let offset = 0; offset < Math.max(media.length, 1); offset += 1024) {
+			this.assertMediaInput(model, media.slice(offset, offset + 1024));
+			if (performance.now() - lastMediaYield >= 8) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				lastMediaYield = performance.now();
+			}
+		}
 		// Strictness belongs to the bare model; a provider prefix (`nug:`, a custom one)
 		// must not turn a credential-bound model into a relay.
 		const strict = hasCredentialBoundReasoning(parseModelId(model).model);
@@ -1018,7 +1033,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					: params.reasoningEffort;
 			if (this.apiMode === "codex") {
 				applyCodexStableRequestFields(body, {
-					identity: createCodexRequestIdentity(params.conversationId),
+					identity: createCodexRequestIdentity(params.conversationId, this.codexInstallationId()),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
 			} else {
@@ -1324,7 +1339,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				input: [{ role: "user", content: text }],
 				store: false,
 			};
-			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
+			const codexIdentity =
+				this.apiMode === "codex"
+					? createCodexRequestIdentity(undefined, this.codexInstallationId())
+					: undefined;
 			if (instruction) {
 				body.instructions = instruction;
 			} else if (this.apiMode === "codex") {
@@ -1436,7 +1454,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				input: [{ role: "user", content: `${reminder}\n\n${content}` }],
 				store: false,
 			};
-			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
+			const codexIdentity =
+				this.apiMode === "codex"
+					? createCodexRequestIdentity(undefined, this.codexInstallationId())
+					: undefined;
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
 			if (codexIdentity) {
@@ -1696,7 +1717,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			// protocols present as NarraFork unless the operator chose otherwise.
 			fallback: this.apiMode === "codex" ? getHttpCodexUserAgent() : getHttpUserAgent(),
 			extraHeaders: this.config.extraHeaders,
-			installationId: this.apiMode === "codex" ? getInstallationId() : undefined,
+			installationId: this.apiMode === "codex" ? this.codexInstallationId() : undefined,
 			conversationId,
 		});
 	}
@@ -1871,7 +1892,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
-			identity: createCodexRequestIdentity(params.conversationId),
+			identity: createCodexRequestIdentity(params.conversationId, this.codexInstallationId()),
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		if (params.serviceTier) {

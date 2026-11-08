@@ -341,6 +341,17 @@ export function useMarkOutlineDigestSeen() {
 	});
 }
 
+/** Mark all unread reports read (P2 PR 11): the inbox row's "Got it". */
+export function useMarkOutlineReportsSeen() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.markOutlineReportsSeen(),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
+}
+
 /** What waits for confirmation on a page, and its locked tasks (design §2.2, §2.6). */
 export function useOutlinePagePending(spaceId: string, pageId: string | undefined, enabled = true) {
 	return useQuery({

@@ -212,6 +212,15 @@ export interface NarratorInteractionStatusBarProps {
 			onFollowDefault: () => void;
 			onSetAsDefault: () => void;
 		};
+		questionReflection: {
+			supported: boolean;
+			override: BooleanOverride;
+			effective: boolean;
+			global: boolean;
+			onChange: (value: BooleanOverride) => void;
+			onFollowDefault: () => void;
+			onSetAsDefault: () => void;
+		};
 		reflectionSettingsDisabled: boolean;
 	};
 
@@ -396,7 +405,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 			case "blocking_compact":
 				return `${t("compacting")} · ${workIndicator.compactProgressFragment}`;
 			case "model_unavailable":
-				return t("status_model_unavailable");
+				return workIndicator.quotaWaitText;
 			case "quota_exhausted":
 				return workIndicator.quotaWaitText;
 			case "spec_task":
@@ -910,6 +919,25 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																	onSetPlanReflectionAsDefault={
 																		permission.planReflection.onSetAsDefault
 																	}
+																	showQuestionReflectionToggle={
+																		permission.questionReflection.supported
+																	}
+																	questionReflectionOverride={
+																		permission.questionReflection.override
+																	}
+																	questionReflectionEffective={
+																		permission.questionReflection.effective
+																	}
+																	questionReflectionGlobal={permission.questionReflection.global}
+																	onQuestionReflectionChange={
+																		permission.questionReflection.onChange
+																	}
+																	onFollowDefaultQuestionReflection={
+																		permission.questionReflection.onFollowDefault
+																	}
+																	onSetQuestionReflectionAsDefault={
+																		permission.questionReflection.onSetAsDefault
+																	}
 																	showDangerReflectionToggle={permission.dangerReflection.supported}
 																	dangerReflectionOverride={permission.dangerReflection.override}
 																	dangerReflectionEffectiveLevel={
@@ -1180,6 +1208,21 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																}
 																onSetPlanReflectionAsDefault={
 																	permission.planReflection.onSetAsDefault
+																}
+																showQuestionReflectionToggle={
+																	permission.questionReflection.supported
+																}
+																questionReflectionOverride={permission.questionReflection.override}
+																questionReflectionEffective={
+																	permission.questionReflection.effective
+																}
+																questionReflectionGlobal={permission.questionReflection.global}
+																onQuestionReflectionChange={permission.questionReflection.onChange}
+																onFollowDefaultQuestionReflection={
+																	permission.questionReflection.onFollowDefault
+																}
+																onSetQuestionReflectionAsDefault={
+																	permission.questionReflection.onSetAsDefault
 																}
 																showDangerReflectionToggle={permission.dangerReflection.supported}
 																dangerReflectionOverride={permission.dangerReflection.override}

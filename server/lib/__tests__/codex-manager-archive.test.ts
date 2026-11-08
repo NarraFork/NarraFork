@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,6 +9,10 @@ import {
 } from "@server/services/credential-usage-totals";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { CodexManager, isArchivedCodexCredential } from "../codex-manager";
+import { readSecretJSON } from "../secret-store";
+
+/** Credential files are encrypted at rest; tests compare their decrypted JSON. */
+const secretText = (path: string) => JSON.stringify(readSecretJSON(path));
 
 interface SeedCredential {
 	id: string;
@@ -60,7 +64,7 @@ function createManager(creds: SeedCredential[]): { manager: CodexManager; tmpHom
 }
 
 function readCredentialsFile(tmpHome: string): Array<Record<string, unknown>> {
-	const raw = readFileSync(join(tmpHome, ".narrafork", "codex-credentials.json"), "utf8");
+	const raw = secretText(join(tmpHome, ".narrafork", "codex-credentials.json"));
 	return JSON.parse(raw) as Array<Record<string, unknown>>;
 }
 

@@ -823,13 +823,14 @@ describe("native media provider wire contracts", () => {
 			cache.deleteNugCachedModels(config.id);
 		}
 	});
-	test("a text-only local metadata binding overrides a Doubao model name for native video", async () => {
-		const [{ settings }, { OpenAIProvider }, { buildAdapterHistory }] = await Promise.all([
+	test("a text-only provider entry override wins over a Doubao model name for native video", async () => {
+		const [{ settings }, { OpenAIProvider }, { buildAdapterHistory }, catalog] = await Promise.all([
 			import("../../settings"),
 			import("../openai-provider"),
 			import("../history-build"),
+			import("../../model-catalog"),
 		]);
-		const oldCatalog = settings.agent.modelCatalog;
+		let restoreOverrides = () => {};
 		const oldProviders = settings.openaiProviders;
 		const config = {
 			id: "doubao-metadata",
@@ -843,25 +844,9 @@ describe("native media provider wire contracts", () => {
 		const fullModel = `${config.prefix}:${config.defaultModel}`;
 		try {
 			settings.openaiProviders = [...(oldProviders ?? []), config];
-			settings.agent.modelCatalog = {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				autoApply: false,
-				pinnedVersion: null,
-				local: {
-					revision: 101,
-					models: [{ id: "doubao-text-only-card", metadata: {} }],
-					bindings: [
-						{
-							id: "doubao-text-only-binding",
-							providerId: config.id,
-							upstreamModelId: config.defaultModel,
-							modelId: "doubao-text-only-card",
-							overrides: { supported_modalities: ["text"] },
-						},
-					],
-				},
-			};
+			restoreOverrides = catalog.replaceModelOverridesForTests({
+				connections: { [fullModel]: { inputModalities: ["text"] } },
+			});
 			const provider = new OpenAIProvider(config);
 			expect(provider.supportsNativeMediaInput(video, fullModel)).toBe(false);
 			const requests = capture("chat");
@@ -890,7 +875,7 @@ describe("native media provider wire contracts", () => {
 			expect(JSON.stringify(requests[0])).toContain("当前模型未读取");
 			expect(rows[0].contentJson).toEqual([block]);
 		} finally {
-			settings.agent.modelCatalog = oldCatalog;
+			restoreOverrides();
 			settings.openaiProviders = oldProviders;
 		}
 	});
@@ -2008,12 +1993,13 @@ describe("Doubao Responses native video", () => {
 		await expect(drain(codex, { model: doubaoResponsesModel, media: [video] })).rejects.toThrow();
 		expect(requests).toHaveLength(0);
 	});
-	test("an explicit text-only metadata binding rejects Responses video and leaves a visible file fallback", async () => {
-		const [{ settings }, { buildAdapterHistory }] = await Promise.all([
+	test("an explicit text-only provider entry override rejects Responses video and leaves a visible file fallback", async () => {
+		const [{ settings }, { buildAdapterHistory }, catalog] = await Promise.all([
 			import("../../settings"),
 			import("../history-build"),
+			import("../../model-catalog"),
 		]);
-		const oldCatalog = settings.agent.modelCatalog;
+		let restoreOverrides = () => {};
 		const oldProviders = settings.openaiProviders;
 		try {
 			settings.openaiProviders = [
@@ -2028,25 +2014,9 @@ describe("Doubao Responses native video", () => {
 					apiMode: "responses",
 				},
 			];
-			settings.agent.modelCatalog = {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				autoApply: false,
-				pinnedVersion: null,
-				local: {
-					revision: 102,
-					models: [{ id: "responses-text-only", metadata: {} }],
-					bindings: [
-						{
-							id: "responses-text-only-binding",
-							providerId: "media-test",
-							upstreamModelId: "doubao-seed-2-1-lite-260915",
-							modelId: "responses-text-only",
-							overrides: { supported_modalities: ["text"] },
-						},
-					],
-				},
-			};
+			restoreOverrides = catalog.replaceModelOverridesForTests({
+				connections: { [doubaoResponsesModel]: { inputModalities: ["text"] } },
+			});
 			const provider = await createResponsesProvider();
 			expect(provider.supportsNativeMediaInput(video, doubaoResponsesModel)).toBe(false);
 			const requests = capture("responses");
@@ -2074,7 +2044,7 @@ describe("Doubao Responses native video", () => {
 			expect(JSON.stringify(requests[0])).toContain("当前模型未读取");
 			expect(rows[0].contentJson).toEqual([block]);
 		} finally {
-			settings.agent.modelCatalog = oldCatalog;
+			restoreOverrides();
 			settings.openaiProviders = oldProviders;
 		}
 	});

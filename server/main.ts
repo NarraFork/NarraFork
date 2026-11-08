@@ -52,7 +52,7 @@ import {
 } from "./lib/manager-control-server";
 import { readManagerToken } from "./lib/manager-token";
 import { mcpManager } from "./lib/mcp/manager";
-import { syncMcpTools } from "./lib/mcp/tool-bridge";
+import { prepareMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
@@ -71,13 +71,7 @@ import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
-import {
-	buildHealthPayload,
-	createStartupReadinessGate,
-	healthStatusCode,
-	shouldServeRequests,
-	shouldStartGatedBackgroundWork,
-} from "./lib/startup-readiness";
+import { buildHealthPayload, createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
 import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
 import { reissueBuiltinTlsOnStartup } from "./lib/tls";
@@ -125,13 +119,16 @@ import {
 } from "./services/notification-center-maintenance";
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
+import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
 import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
+import { setMigrationPgHandle } from "./services/migration-db";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -139,7 +136,10 @@ import {
 	getExternalWebSocketRolloutSettings,
 	isExternalWebSocketOriginAllowed,
 } from "./services/oauth-ws-ticket-service";
-import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
+import {
+	migrateReservedAutoPrefixOnStartup,
+	recoverProviderPrefixMigrationOnStartup,
+} from "./services/provider-prefix-migration-service";
 import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
 import {
 	type VerifiedPublicShare,
@@ -187,9 +187,24 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver({
 		),
 });
 
+// The startup migrations below read and rewrite narrator rows; give them the PG handle
+// before they run (composePostgresStores sets it again, harmlessly).
+if (postgresRuntime) setMigrationPgHandle(postgresRuntime.client.db);
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A journal that no longer matches the settings is kept and logged; startup continues.
-recoverProviderPrefixMigrationOnStartup();
+await recoverProviderPrefixMigrationOnStartup().catch((error) => {
+	logger.error("Could not recover an interrupted provider prefix migration", {
+		error: String(error),
+	});
+});
+// auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
+installAutoRouteSignals();
+// `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
+// logged and leaves it working as an ordinary prefix, so startup never depends on it.
+// Runs on both backends (services/migration-db.ts picks the active handle).
+await migrateReservedAutoPrefixOnStartup().catch((error) => {
+	logger.error("Could not rename the provider prefixed `auto`", { error: String(error) });
+});
 
 // When the PostgreSQL backend is active, inject every PG-capable store from the single
 // composition seam — one runtime, one client, all-or-nothing. `./db` has already finished
@@ -814,7 +829,7 @@ function startServer(
 						database: { backend: activeDatabaseBackend },
 					}),
 					{
-						status: healthStatusCode(startupReadiness.state, healthResponse.status),
+						status: healthResponse.status,
 						headers,
 					},
 				);
@@ -827,16 +842,9 @@ function startServer(
 			if (narratorWsRefusal) return narratorWsRefusal;
 
 			// Wait for recovery to reach a terminal outcome so restored narrators observe a
-			// consistent state, but never turn a recovery failure into a dead server: the
-			// frontend, auth and settings routes are what the user needs to repair whatever
-			// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
+			// consistent state. A recovery failure is scoped to its narrator and never
+			// closes the HTTP surface: the UI is what repairs that narrator's state.
 			await startupReadiness.barrier;
-			if (!shouldServeRequests(startupReadiness.state)) {
-				return new Response("Startup narrator recovery failed", {
-					status: 503,
-					headers: { "Retry-After": "5" },
-				});
-			}
 
 			if (url.pathname === "/ws/external/v1/narrators") {
 				const rollout = getExternalWebSocketRolloutSettings();
@@ -1358,15 +1366,10 @@ terminalService.recoverOnStartup().catch((err) => {
 });
 
 // Initialize external MCP servers
-mcpManager.onToolsChanged = () => syncMcpTools();
-mcpManager
-	.initialize()
-	.then(() => {
-		syncMcpTools();
-	})
-	.catch((err) => {
-		logger.error("MCP server initialization failed", { error: String(err) });
-	});
+mcpManager.prepareTools = prepareMcpTools;
+mcpManager.initialize().catch((err) => {
+	logger.error("MCP server initialization failed", { error: String(err) });
+});
 
 // Initialize the plugin control plane after core services are available. Plugin
 // activation is feature-flagged and must never prevent the core server from starting.
@@ -1471,6 +1474,8 @@ withBackgroundOccupancyInitialization(
 				})
 				.catch(async (err) => {
 					const error = err instanceof Error ? err.message : String(err);
+					// The pass did not fully converge. Keep the diagnostic, but /api/health
+					// still answers 200 so this never disables unrelated UI features.
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
 					await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
@@ -1606,7 +1611,6 @@ void startupReadiness.barrier.then((recovery) => {
 			error: recovery.error,
 		});
 	}
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	startScheduledTaskScheduler();
 	// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
 	// must not keep update checkpoint scans or UI recovery cards looking "busy".
@@ -1624,7 +1628,6 @@ void startupReadiness.barrier.then((recovery) => {
 
 // Outline pages edited live when the previous process ended: commit what their logs hold.
 void startupReadiness.barrier.then((recovery) => {
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	import("./services/outline/live/registry")
 		.then(({ startLiveReplay }) => startLiveReplay())
 		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
@@ -1637,6 +1640,17 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/in-process")
 		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
 		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
+	// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
+	// in bounded slices), and "today so far" when asked.
+	import("./services/outline/digest-job")
+		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
+		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
+	// Outline tasks a session created and someone else finished: that session is told.
+	import("./services/outline/task-finished")
+		.then(({ startOutlineTaskFinishedNotices }) => startOutlineTaskFinishedNotices())
+		.catch((err) =>
+			logger.warn("Outline task-finished notices failed to start", { error: String(err) }),
+		);
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
@@ -1654,7 +1668,6 @@ void startupReadiness.barrier.then((recovery) => {
 			error: recovery.error,
 		});
 	}
-	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	gateway.start().catch((err) => {
 		logger.error("IM Gateway startup failed", { error: String(err) });
 	});
@@ -1680,6 +1693,10 @@ if (activeDatabaseBackend === "sqlite") {
 	});
 	// Re-derive which project every session belongs to, in bounded background pages.
 	void scheduleProjectIndexRebuild();
+	// Model aggregations become auto:/provider values; batched, logs and retries on failure.
+	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
+	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
+	void migrateAggregationsOnStartup();
 }
 
 // Establish client-egress relay channels for NUG providers configured with
@@ -1838,9 +1855,11 @@ async function performGracefulShutdown(
 			async () => {
 				const tasks = await import("./services/outline/tasks");
 				const inProcess = await import("./services/outline/in-process");
+				const digests = await import("./services/outline/digest-job");
 				await Promise.all([
 					inProcess.stopOutlineInProcessRebuild(),
 					tasks.stopOutlineTaskLeaseJob(),
+					digests.stopOutlineDigestJob(),
 				]);
 			},
 			5_000,

@@ -12,7 +12,9 @@
  * without booting Bun.serve():
  *   - `recovering` → recovery is still mounting continuations
  *   - `ready`      → recovery admitted every continuation
- *   - `failed`     → recovery threw; the reason is surfaced, but requests keep flowing
+ *   - `failed`     → the recovery pass itself threw; the reason is surfaced in the health
+ *     payload, but `/api/health` still answers 200 and requests keep flowing. Individual
+ *     continuation failures are settled on their own tool calls, not here.
  */
 
 export type StartupRecoveryStatus = "recovering" | "ready" | "failed";
@@ -23,29 +25,6 @@ export type StartupRecoveryState =
 	| { status: "failed"; error: string };
 
 export type StartupRecoveryResult = { ok: true } | { ok: false; error: string };
-
-/**
- * Whether ordinary (non-health) requests may be served in this state.
- *
- * Always true. A blocked HTTP surface is never the right answer to a recovery failure: the
- * frontend, auth and settings routes are exactly what the user needs to repair the state that
- * made recovery fail. Recovery failures are reported through `/api/health` and per-narrator
- * diagnostics instead.
- */
-export function shouldServeRequests(_state: StartupRecoveryState): boolean {
-	return true;
-}
-
-/**
- * Whether startup-gated background work (scheduled tasks, IM gateway) may start.
- *
- * A failed recovery pass does not imply the scheduler or gateway are unsafe: they operate on
- * their own persisted records and skip narrators they cannot start. Permanently disabling them
- * until the next restart turns one broken narrator into a silently degraded server.
- */
-export function shouldStartGatedBackgroundWork(_result: StartupRecoveryResult): boolean {
-	return true;
-}
 
 /** Merge the recovery state into the `/api/health` payload the app router produced. */
 export function buildHealthPayload(
@@ -58,22 +37,6 @@ export function buildHealthPayload(
 		readiness: state.status,
 		...(state.status === "failed" ? { recoveryError: state.error } : {}),
 	};
-}
-
-/**
- * HTTP status for `/api/health`.
- *
- * A failed recovery still reports 503 so external monitors can distinguish "this build came up
- * healthy" from "this build came up with broken narrator state". Only health is degraded; other
- * routes answer normally.
- *
- * This status is NOT a signal to withhold the new build from the user. Update polling reloads on
- * version identity alone and merely reports the reason afterwards (see
- * `isUpdatedServerReadyForReload`), because treating 503 as "do not reload" stranded the user on
- * the old bundle — the one build without the UI that repairs the broken narrator state.
- */
-export function healthStatusCode(state: StartupRecoveryState, baseStatus: number): number {
-	return state.status === "failed" ? 503 : baseStatus;
 }
 
 export interface StartupReadinessGate {

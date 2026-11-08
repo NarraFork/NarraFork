@@ -32,6 +32,7 @@ import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
 import { ProviderBalanceStatus } from "./ProviderBalanceStatus";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 import type { CustomApiProtocol, CustomApiProviderState, OpenAIProviderState } from "./types";
 import { defaultUserAgentModeForProtocol } from "./types";
 
@@ -450,6 +451,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					autoComplete="off"
 					onChange={(e) => updateProvider("apiKey", e.currentTarget.value)}
 				/>
+				<ProviderKeysPanel providerId={provider.id} />
 				<TextInput
 					label={t("customApiBaseUrl")}
 					placeholder={t("customApiBaseUrlPlaceholder")}

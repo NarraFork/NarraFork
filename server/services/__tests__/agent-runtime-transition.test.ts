@@ -51,6 +51,7 @@ describe("shared runtime transition decisions", () => {
 			transientRetries: 1,
 			interruptionRetries: 2,
 			quotaWaits: 0,
+			autoSwitches: 0,
 		};
 		expect(
 			selectRuntimeRecovery(state, {

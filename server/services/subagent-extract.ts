@@ -213,6 +213,7 @@ export async function extractSubagentToPrimary(
 							planReflectionAutoApproveOverride:
 								source.planReflectionAutoApproveOverride ?? "inherit",
 							dangerReflectionOverride: source.dangerReflectionOverride ?? "inherit",
+							questionReflectionOverride: source.questionReflectionOverride ?? "inherit",
 							autoContinuationOverride: source.autoContinuationOverride ?? "inherit",
 							behaviorFenceIntervalOverride: source.behaviorFenceIntervalOverride ?? null,
 							behaviorFenceAttachOverride: source.behaviorFenceAttachOverride ?? "inherit",

@@ -28,6 +28,8 @@ export const OUTLINE_TASK_BOARD_LIMITS = {
 	maxTaskChars: 4000,
 	/** Characters of a username an assignment names. */
 	maxUsernameChars: 128,
+	/** Tasks one "seen" request (「新完成」, outline P2 PR 9b) names at most. */
+	seenPerRequest: 100,
 } as const;
 
 /**
@@ -85,6 +87,11 @@ export interface OutlineBoardTask {
 	} | null;
 	/** The task's `version_seq` as read: a change names it as its base. */
 	versionSeq: number;
+	/**
+	 * 「新完成」 (outline P2 PR 9b, D50 ④): a task the reader manages that an agent finished, and the
+	 * reader has not seen on a board since (`POST /outline/tasks/seen`). Absent otherwise.
+	 */
+	newlyDone?: true;
 }
 
 export interface OutlineBoardSpace {
@@ -183,6 +190,20 @@ export interface OutlineBoardTaskUpdateResponse {
 	/** The task's new `version_seq`, or null when nothing changed. */
 	versionSeq: number | null;
 	started: boolean;
+}
+
+/**
+ * The reader saw these tasks marked 「新完成」 on a board, each at the version shown (outline P2
+ * PR 9b). At most {@link OUTLINE_TASK_BOARD_LIMITS.seenPerRequest}; tasks that are not done, not
+ * theirs or not readable are ignored.
+ */
+export interface OutlineBoardSeenRequest {
+	tasks: Array<{ id: string; versionSeq: number }>;
+}
+
+export interface OutlineBoardSeenResponse {
+	/** How many were recorded. */
+	marked: number;
 }
 
 /** The status bar's read (any task backend). */

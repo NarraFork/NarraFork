@@ -202,11 +202,15 @@ const tasksViewText = {
 		"zh-CN": "本会话在大纲里的当前任务（由系统维护，有变化时更新）：",
 	},
 	doing: { en: "In progress:", "zh-CN": "进行中：" },
+	delegated: {
+		en: "Delegated to subagents (do not work on these yourself; each report comes back to you):",
+		"zh-CN": "已交给子代理（不要自己再做；报告会交回给你）：",
+	},
 	waiting: { en: "Waiting:", "zh-CN": "等待中：" },
 	next: { en: "Next:", "zh-CN": "下一个：" },
 } satisfies Record<string, LocalizedValue<string>>;
 
-export type OutlineTasksViewSection = "doing" | "waiting" | "next";
+export type OutlineTasksViewSection = "doing" | "delegated" | "waiting" | "next";
 
 /** The first line of the current-tasks view. */
 export function getOutlineTasksViewHeading(locale: Locale): string {
@@ -237,6 +241,34 @@ function waitNote(wait: OutlineTaskWaitText, locale: Locale): string {
 export function getOutlineViewTaskLine(task: OutlineViewTask, locale: Locale): string {
 	const box = task.checkbox === "doing" ? "[/]" : "[ ]";
 	return `- ${box} ${taskLabel(task, locale)}${task.wait ? waitNote(task.wait, locale) : ""}`;
+}
+
+/** The subagent a delegated task was handed to (outline P2 PR 9b), as the view names it. */
+export interface OutlineViewAgent {
+	/** Its narrator id: what Send, Stop and Await take. */
+	id: string;
+	/** Its title (the Agent call's description), when it has one. */
+	title: string | null;
+}
+
+/**
+ * One line of the view's "delegated" section: the task, then the subagent doing it, running (its
+ * lease is live). `- [/] \`key/sid\` title — subagent "X" (\`id\`), running`.
+ */
+export function getOutlineViewDelegatedLine(
+	task: OutlineTaskPromptTask,
+	agent: OutlineViewAgent,
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const name = agent.title
+		? zh
+			? `子代理「${agent.title}」（\`${agent.id}\`）`
+			: `subagent "${agent.title}" (\`${agent.id}\`)`
+		: zh
+			? `子代理 \`${agent.id}\``
+			: `subagent \`${agent.id}\``;
+	return `- [/] ${taskLabel(task, locale)} — ${name}${zh ? "，运行中" : ", running"}`;
 }
 
 /** The last line of a current-tasks view that could not list everything. */
@@ -532,4 +564,50 @@ export function getOutlineTaskEditNote(
 	return zh
 		? `系统通知（不是用户发言）：有人在界面上改了本会话的任务。\n\n${blocks.join("\n\n")}\n\n请据此调整你的工作；要确认细节就用 OutlineRead 读这些任务。`
 		: `System notice (not the user speaking): people changed tasks of this session in the interface.\n\n${blocks.join("\n\n")}\n\nAdjust your work to these changes; read the tasks with OutlineRead if you need the details.`;
+}
+
+// ─── Tasks this session created, finished elsewhere (outline P2 PR 9b) ───
+
+/** One task a session created that someone else finished, as the notice names it. */
+export interface OutlineTaskFinishedEntry {
+	/** `key/sid`. */
+	address: string;
+	title: string;
+	status: "done" | "cancelled";
+	/** Created by a person (`/goal`, the board). */
+	humanCreated: boolean;
+}
+
+/**
+ * The notice a session gets when tasks it created are ticked done or cancelled by another
+ * session or a person (design §2.7): a system notice (not the user speaking), one line per task
+ * with its address, who finished it, where the result is and that it may be reopened. Only what
+ * the outline holds. `by` is the finisher as the caller names it (a session, a person, the
+ * system); `more` counts tasks of the same commit not listed.
+ */
+export function getOutlineTaskFinishedNote(
+	input: { by: string; entries: readonly OutlineTaskFinishedEntry[]; more: number },
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const lines = input.entries.map((entry) => {
+		const mark = entry.humanCreated ? (zh ? "（人建）" : " (set by a person)") : "";
+		const what = zh
+			? entry.status === "done"
+				? `已被${input.by}勾成完成`
+				: `已被${input.by}取消`
+			: entry.status === "done"
+				? `ticked done by ${input.by}`
+				: `cancelled by ${input.by}`;
+		return `- \`${entry.address}\` ${entry.title}${mark}${zh ? "：" : ": "}${what}`;
+	});
+	if (input.more > 0)
+		lines.push(
+			zh
+				? `- 同一次改动还结束了你建的 ${input.more} 个任务，未列出。`
+				: `- ${input.more} more tasks this session created were finished in the same change (not listed).`,
+		);
+	return zh
+		? `系统通知（不是用户发言）：本会话在大纲里建的任务在别处结束了。\n\n${lines.join("\n")}\n\n结果和报告在各自的任务下面，用 OutlineRead 读；不满意可以重开（设回待办）。`
+		: `System notice (not the user speaking): tasks this session created in the outline were finished elsewhere.\n\n${lines.join("\n")}\n\nThe results and any reports are under each task; read them with OutlineRead. If one does not meet what you wanted, reopen it (set it to do).`;
 }

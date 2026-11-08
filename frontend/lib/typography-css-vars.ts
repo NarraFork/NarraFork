@@ -58,4 +58,14 @@ export const TYPE_ROLE_STYLE = {
 		lineHeight: cssVar(V.xsLine),
 		letterSpacing: cssVar(V.letterSpacing),
 	},
+	/**
+	 * A small multiline field (a permission card's textarea): xs text on the BASE line box (the
+	 * 1.55 Mantine gives multiline inputs) under the reader's line-height setting, which is how
+	 * the transcript's height model counts each of its rows.
+	 */
+	textarea: {
+		fontSize: cssVar(V.xsSize),
+		lineHeight: cssVar(V.xsBaseLine),
+		letterSpacing: cssVar(V.letterSpacing),
+	},
 } as const;

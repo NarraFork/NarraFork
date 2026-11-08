@@ -99,9 +99,9 @@ describe("isUpdatedServerReadyForReload", () => {
 
 	test("reloads into the new build even when startup recovery failed", () => {
 		// A failed recovery does NOT make the replacement unusable: the server keeps serving every
-		// route (`shouldServeRequests` is unconditionally true) precisely so the settings UI can
-		// repair whatever broke it. Blocking here pinned the user to the old bundle, which is the
-		// one place that repair UI does not exist.
+		// route (and /api/health still answers 200) precisely so the settings UI can repair
+		// whatever broke it. Blocking here pinned the user to the old bundle, which is the one
+		// place that repair UI does not exist.
 		expect(
 			isUpdatedServerReadyForReload(
 				{ status: "failed", version: "0.2.0", readiness: "failed" },

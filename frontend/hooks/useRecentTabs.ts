@@ -1150,12 +1150,17 @@ export function useRecentTabs() {
 			[runFolderMutation],
 		),
 		dissolveFolder: useCallback(
-			(folderId: string) =>
-				runFolderMutation(
+			async (folderId: string) => {
+				const result = await runFolderMutation(
 					() => api.dissolveRecentTabFolder(folderId),
 					(current) => applyRecentTabFolderDissolve(current, folderId),
-				).then(() => undefined),
-			[runFolderMutation],
+				);
+				// The folder layout is hand-built work; dissolving it is undoable like a close.
+				if (result.undoToken) {
+					showUndoNotification(t("folderDissolved"), { undoToken: result.undoToken });
+				}
+			},
+			[runFolderMutation, showUndoNotification, t],
 		),
 		clearTabs: useCallback(
 			(scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>

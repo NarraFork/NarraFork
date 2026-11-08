@@ -8,8 +8,10 @@
  *   - `outline_decision`, pending: the open changes to plans they locked (P2 PR 6), with the diff
  *     and confirm or reject on the page's pending API.
  *   - `outline_digest`: the confirmations an agent made on their behalf (a session they named to
- *     confirm for a locked plan) that they have not acknowledged: one row, each confirmation
- *     revertable. Reports join it in plan PR 11.
+ *     confirm for a locked plan) that they have not acknowledged, and their unread reports
+ *     (P2 PR 11, owner decision Q4 = A): one row, shown while either is there, counted in the
+ *     inbox like any row. `count` stays the confirmations (what older clients show); `reports`,
+ *     `reportItems` and `reportIds` are the unread reports (one indexed read of their heads).
  *
  * A row is shown only while the person may read its space, and offers acting only while they may
  * write it. A session is named (id and title) only to people who may read it (P2 PR 6's rule);
@@ -19,6 +21,7 @@ import type { HumanAttentionItem } from "@shared/human-attention";
 import type { OutlineDigestItem, OutlineDigestResponse } from "@shared/outline-api";
 import { canReadSpace, canWriteSpace, narratorVisibility, type OutlinePrincipal } from "./access";
 import { readDisplayNames } from "./access-reads";
+import { listUnreadOutlineDigests } from "./digest-view";
 import { isOutlineEnabled } from "./feature";
 import { outlinePendingLabel } from "./model";
 import { withCurrentDeciders } from "./pending";
@@ -150,8 +153,13 @@ export async function listOutlineAttention(
 	}
 
 	const digest = await readOutlineDigest(principal, { store });
-	if (digest.items.length > 0) {
-		const first = digest.items[0] as OutlineDigestItem;
+	const reports = await listUnreadOutlineDigests(principal, { store });
+	if (digest.items.length > 0 || reports.length > 0) {
+		const first = digest.items[0] as OutlineDigestItem | undefined;
+		const times = [
+			...(first?.decidedAt ? [first.decidedAt] : []),
+			...reports.map((r) => r.createdAt),
+		].sort();
 		items.push({
 			...base,
 			id: OUTLINE_DIGEST_ATTENTION_ID,
@@ -160,7 +168,7 @@ export async function listOutlineAttention(
 			toolName: "OutlineEdit",
 			narratorId: "",
 			narratorTitle: null,
-			createdAt: first.decidedAt ?? new Date(0).toISOString(),
+			createdAt: times[times.length - 1] ?? new Date(0).toISOString(),
 			canAct: true,
 			// Localized by the client from the count.
 			summary: "",
@@ -172,6 +180,9 @@ export async function listOutlineAttention(
 				pendingId: null,
 				count: digest.items.length,
 				sessionHidden: false,
+				reports: reports.length,
+				reportItems: reports.reduce((n, r) => n + r.itemCount, 0),
+				reportIds: reports.map((r) => r.id),
 			},
 		});
 	}
