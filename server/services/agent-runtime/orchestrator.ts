@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
-import { quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
+import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
+import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
@@ -236,6 +237,7 @@ import {
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
 import { registerNarratorLoop } from "../update-coordinator";
+import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
@@ -1162,7 +1164,15 @@ export async function runAgentLoopUnlocked(
 				} else {
 					active._modelRef = modelSelectionRef;
 					active._settingsRevision = getSettingsRevision();
-					active.model = resolveEffectiveModel(modelSelectionRef, active.provider);
+					// Right after a compact an auto: value picks afresh (new epoch, nothing cached
+					// to keep); otherwise it stays on the source it is on.
+					const reselect =
+						active._autoReselectOnNextTurn === true && isAutoModelValue(modelSelectionRef);
+					active._autoReselectOnNextTurn = undefined;
+					active.model = resolveEffectiveModel(
+						modelSelectionRef,
+						reselect ? undefined : active.provider,
+					);
 					active.provider = resolveProvider(active.model);
 					active.reasoningEffort = resolveRuntimeReasoningEffort(
 						active.provider,
@@ -1436,7 +1446,7 @@ export async function runAgentLoopUnlocked(
 					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
 						narratorId,
 						undefined,
-						{ signal: active.abortController.signal, deadline: Date.now() + 10_000 },
+						{ signal: active.abortController.signal },
 					),
 				});
 			}
@@ -2346,6 +2356,50 @@ export async function runAgentLoopUnlocked(
 			}
 
 			/**
+			 * `auto:` forced switch (agent-runtime/auto-forced-switch.ts): when the source this
+			 * turn used cannot serve for longer than a cache lifetime, move the session to
+			 * another source of the same model instead of waiting or failing. Returns true when
+			 * it moved; the caller then `continue`s and the loop top resolves the new source,
+			 * since the narrator's provider is what `auto:` resolution stays on.
+			 */
+			const switchAutoSource = async (
+				resumeAt?: number,
+				failedProvider: string = resolved.provider,
+			): Promise<boolean> => {
+				if (!active.alive || runState.recovery.autoSwitches >= MAX_AUTO_SWITCHES_PER_RUN) {
+					return false;
+				}
+				const target = autoForcedSwitchTarget({
+					modelRef: turnModelRef,
+					provider: failedProvider,
+					resumeAt,
+				});
+				if (!target) return false;
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				const keptPartial = partialId
+					? await finalizeOrCleanupPartialMessage(partialId, narratorId)
+					: false;
+				if (keptPartial) {
+					runState.input.media = undefined;
+					runState.input.text = "";
+					runState.input.images = undefined;
+				}
+				runState.recovery.autoSwitches += 1;
+				runState.recovery.transientRetries = 0;
+				logger.info("auto: moved to another source", {
+					narratorId,
+					modelRef: turnModelRef,
+					from: resolved.model,
+					to: target,
+					resumeAt,
+				});
+				active.model = target;
+				active.provider = resolveProvider(target);
+				return true;
+			};
+
+			/**
 			 * Suspend this turn until the blocking condition clears, then report
 			 * whether the loop may continue.
 			 *
@@ -2360,8 +2414,8 @@ export async function runAgentLoopUnlocked(
 			 *  - `credentials` (NUG): the credential pool comes back at an unknown time,
 			 *    so the shared availability poller checks the lightweight `/v1/models`
 			 *    list until the model reports available.
-			 *  - `quota` (Kimi): the reset instant is published (`resumeAt`), so this
-			 *    sleeps to it. No polling and no request during the wait.
+			 *  - `quota`, `capacity`, `rate_limit`: upstream publishes `resumeAt`, so
+			 *    this sleeps to it. No polling and no request during the timed wait.
 			 *
 			 * @returns true when recovery happened and the caller should `continue`
 			 * to rebuild history from the DB; false when the caller must `break`
@@ -2383,12 +2437,15 @@ export async function runAgentLoopUnlocked(
 				// The reset clock is what this wait is about, so the status carries the
 				// instant the user is waiting for as well as the tag that says why.
 				const quotaResumeAt =
-					mu.waitKind === "quota" && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
-				const waitingSubstatus = quotaResumeAt ? "quota_exhausted" : "model_unavailable";
+					providerWaitKind(mu) !== "credentials" && typeof mu.resumeAt === "number"
+						? mu.resumeAt
+						: undefined;
+				const waitingSubstatus =
+					providerWaitKind(mu) === "quota" ? "quota_exhausted" : "model_unavailable";
 				await narratorService.updateStatus(narratorId, "waiting", {
 					substatus: [waitingSubstatus],
 					errorMessage: JSON.stringify({
-						type: quotaResumeAt ? "quota_exhausted" : "model_unavailable",
+						type: waitingSubstatus,
 						...mu,
 					}),
 				});
@@ -2502,6 +2559,8 @@ export async function runAgentLoopUnlocked(
 			// unknown is treated as usable, so this never blocks a working model.
 			{
 				const known = resolveKnownUnavailableNugModel(resolved.model, resolved.provider);
+				// A NUG outage has no known end, so an auto: session moves rather than waits.
+				if (known && (await switchAutoSource())) continue;
 				if (known && active.alive) {
 					const resumed = await suspendUntilModelRecovered({
 						message: `Model ${known.model} is recorded as temporarily unavailable; waiting for it to recover before sending the request.`,
@@ -2755,7 +2814,7 @@ export async function runAgentLoopUnlocked(
 
 			// --- Blocked, but recoverable: suspend and wait for recovery ---
 			// Either a NUG model whose credential pool is disabled, or an exhausted
-			// Kimi coding-plan allowance. Instead of replaying the full request
+			// Kimi/OpenCode allowance or a timed upstream capacity/rate limit. Instead of replaying the full request
 			// (re-uploading the entire history) over and over, suspend the narrator and
 			// wait on whatever tells us recovery happened — the availability poller for
 			// credentials, the published reset instant for quota. Then resume by
@@ -2763,10 +2822,12 @@ export async function runAgentLoopUnlocked(
 			// [continuation-source: model-unavailable]
 			if (recovery.kind === "model-unavailable" && result.modelUnavailable && active.alive) {
 				const mu = result.modelUnavailable;
-				const isQuota = mu.waitKind === "quota";
+				const waitKind = providerWaitKind(mu);
+				const isTimedWait = waitKind !== "credentials";
 				const quotaResetAt =
-					isQuota && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
-				const quotaResumeAt = isQuota && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
+					isTimedWait && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
+				const quotaResumeAt =
+					isTimedWait && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
 				/**
 				 * Why this quota wall is being reported instead of parked on.
 				 *
@@ -2780,7 +2841,7 @@ export async function runAgentLoopUnlocked(
 				 * only by the reason code — a divergence here would mean one of them silently
 				 * loses the reset instant that makes the error actionable.
 				 */
-				const quotaRefusalReason = !isQuota
+				const quotaRefusalReason = !isTimedWait
 					? undefined
 					: quotaResumeAt === undefined
 						? quotaResetAt === undefined
@@ -2789,6 +2850,11 @@ export async function runAgentLoopUnlocked(
 						: runState.recovery.quotaWaits >= MAX_QUOTA_WAITS_PER_RUN
 							? "wait-budget-spent"
 							: undefined;
+				// An auto: session moves to another source instead of reporting the wall or
+				// waiting past a cache lifetime. A wait it would refuse counts as unbounded.
+				if (await switchAutoSource(quotaRefusalReason ? undefined : quotaResumeAt, mu.provider)) {
+					continue;
+				}
 				if (quotaRefusalReason) {
 					// Serialized as a payload rather than left as the raw upstream text, on
 					// the `payment_required` pattern: `errorMessage` is the only failure
@@ -2798,12 +2864,15 @@ export async function runAgentLoopUnlocked(
 					// distinguishable in logs without changing what the user is told.
 					// `type` names the plan (KIMI_QUOTA_EXHAUSTED / OPENCODE_QUOTA_EXHAUSTED)
 					// so the message says whose allowance is spent.
-					const quotaCode = quotaExhaustedCode(mu.quotaProvider);
+					const quotaCode =
+						waitKind === "quota" ? quotaExhaustedCode(mu.quotaProvider) : "provider_wait_exhausted";
 					terminalStatus = {
 						substatus: ["error"],
 						errorCode: quotaCode,
 						errorMessage: JSON.stringify({
 							type: quotaCode,
+							waitKind,
+							quotaProvider: mu.quotaProvider,
 							reason: quotaRefusalReason,
 							model: mu.model,
 							provider: mu.provider,
@@ -2824,7 +2893,8 @@ export async function runAgentLoopUnlocked(
 					// the client the block cleared and it is resuming, which is false here and
 					// would flash a green "quota restored" notice over the error. The client
 					// drops its waiting notice from the status change this write produces.
-					logger.warn("Quota wall reported instead of waited on", {
+					logger.warn("Timed provider refusal reported instead of waited on", {
+						waitKind,
 						narratorId,
 						quotaProvider: mu.quotaProvider ?? "kimi",
 						providerId: mu.providerId,
@@ -2982,6 +3052,17 @@ export async function runAgentLoopUnlocked(
 				}
 			}
 
+			// A failed turn whose source can no longer serve (every Codex account used up, every
+			// key of a relay out of allowance): an auto: session moves on. Routing keeps the same
+			// source while it still counts as able, so an ordinary error does not switch.
+			if (
+				result.hasError &&
+				!result.maxTurnsExceeded &&
+				!runState.hadError &&
+				(await switchAutoSource())
+			) {
+				continue;
+			}
 			if (result.hasError && active.alive && !runState.hadError) {
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;

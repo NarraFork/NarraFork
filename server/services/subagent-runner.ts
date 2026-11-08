@@ -18,7 +18,12 @@ import {
 } from "../lib/narrator-custom-traits";
 import type { Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { expandAllowedPoolForDisplay, FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
+import {
+	expandAllowedPoolForDisplay,
+	FOLLOW_DEFAULT_MODEL,
+	normalizeAutoModelValueForSave,
+	settings,
+} from "../lib/settings";
 import { type RunBindingInput, runDeadlineAt } from "../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
@@ -149,6 +154,13 @@ export interface RunSubagentInput {
 	 * once it exists, before it runs.
 	 */
 	delegation?: import("./outline/delegation").PreparedOutlineDelegation;
+	/**
+	 * Told the head of the note a foreground delegated result was delivered with (null: none), so
+	 * the Agent call can carry it as data for its card (outline P2 PR 9b).
+	 */
+	onDelegatedResult?: (
+		note: import("@shared/outline-report-note").OutlineReportNote | null,
+	) => void;
 }
 
 /**
@@ -169,11 +181,13 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		cwd,
 		title,
 		locale,
-		model: explicitModel,
 		reasoningEffort,
 		alias,
 		userId,
 	} = input;
+	// The child stores this value; `auto:<alias>` is written the catalog's way, and an `auto:`
+	// id the catalog does not know fails here instead of at the child's first request.
+	const explicitModel = input.model ? normalizeAutoModelValueForSave(input.model) : input.model;
 	const background = input.background === true || input.takeoverByUser === true;
 	const timeoutMs = background
 		? resolveOptionalExecutionTimeout(input.timeoutMs, BACKGROUND_TASK_TIMEOUT_MS)
@@ -357,9 +371,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		// The tool card is announced by the run itself, with the model each run uses.
 
 		const conflictNote = aliasRegistration.conflicted
-			? `\n\nNote: The requested alias "${alias || title || subagentId}" was already taken. ` +
-				`This agent was assigned "${aliasRegistration.alias}" instead.` +
-				(background ? "" : " Use this alias with Await or Send to reference this agent.")
+			? aliasConflictNote(alias || title || subagentId, aliasRegistration.alias, background)
 			: "";
 
 		if (background) {
@@ -450,6 +462,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			return terminal.output;
 		}
 		const result = await handle.foreground;
+		input.onDelegatedResult?.(result.outlineReport ?? null);
 		return result.output + formatSubagentModelFallbackNote(inheritance) + conflictNote;
 	} catch (error) {
 		updateLease.release();
@@ -461,6 +474,22 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			});
 		throw error;
 	}
+}
+
+/**
+ * The note after a result whose alias was taken (the card's text reader strips it before it reads
+ * the outline note: `@shared/outline-report-note`).
+ */
+export function aliasConflictNote(
+	requested: string,
+	assigned: string,
+	background: boolean,
+): string {
+	return (
+		`\n\nNote: The requested alias "${requested}" was already taken. ` +
+		`This agent was assigned "${assigned}" instead.` +
+		(background ? "" : " Use this alias with Await or Send to reference this agent.")
+	);
 }
 
 const NOT_STARTED = "The delegated agent's run did not start; its task was given back";

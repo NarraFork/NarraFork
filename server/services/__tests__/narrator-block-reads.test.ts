@@ -49,7 +49,6 @@ async function conversation(): Promise<string[]> {
 async function modelBodies(fromBlocks: boolean): Promise<Map<string, unknown>> {
 	const source = await queryModelHistory(sqliteHistoryQuery(sqlite), {
 		narratorId: "n1",
-		deadline: Date.now() + 10_000,
 		versioned: true,
 		bodiesFromBlocks: fromBlocks,
 	});
@@ -62,7 +61,6 @@ async function deltaBodies(fromBlocks: boolean): Promise<Map<string, unknown>> {
 		sqliteHistoryQuery(sqlite),
 		{
 			narratorId: "n1",
-			deadline: Date.now() + 10_000,
 			versioned: true,
 			bodiesFromBlocks: fromBlocks,
 		},

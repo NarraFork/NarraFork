@@ -7,8 +7,8 @@ import { __setCodexManagerForTests, CodexManager } from "../../../server/lib/cod
 import { AppError } from "../../../server/lib/errors";
 import {
 	bindModelCatalogSettings,
-	getModelCatalogRevision,
-	setModelWindow,
+	replaceModelOverridesForTests,
+	setModelOverride,
 } from "../../../server/lib/model-catalog";
 import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/nug-model-cache";
 import { isProviderUnavailableError } from "../../../server/lib/provider-availability-error";
@@ -27,13 +27,11 @@ import {
 const settingsKeys = Object.keys(settings) as Array<keyof typeof settings>;
 const tempDirs: string[] = [];
 
+/** Overrides a test saved; undone with the settings snapshot. */
+let restoreOverrides: (() => void) | undefined;
 function setOwnWindow(model: string, contextWindow: number | null): void {
-	setModelWindow({
-		baseRevision: getModelCatalogRevision(),
-		scope: "connection",
-		target: model,
-		contextWindow,
-	});
+	restoreOverrides ??= replaceModelOverridesForTests({});
+	setModelOverride("connection", model, contextWindow === null ? null : { contextWindow });
 }
 
 function cloneSettingsSnapshot() {
@@ -45,6 +43,8 @@ function restoreFromSnapshot(snapshot: ReturnType<typeof cloneSettingsSnapshot>)
 		// biome-ignore lint/suspicious/noExplicitAny: generic key/value restoration in test helper
 		(settings as any)[key] = snapshot[key];
 	}
+	restoreOverrides?.();
+	restoreOverrides = undefined;
 }
 
 function resetProviders(): void {
@@ -489,13 +489,7 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 			},
 		]);
 		delete settings.customApiProviders;
-		settings.agent.modelCatalog = {
-			schemaVersion: 2,
-			migrationVersion: 2,
-			local: { revision: 0 },
-			autoApply: false,
-			pinnedVersion: null,
-		};
+		settings.agent.modelCatalog = { autoUpdate: false };
 		bindModelCatalogSettings(settings, () => saveSettings(settings));
 		__setCodexManagerForTests(undefined);
 	});

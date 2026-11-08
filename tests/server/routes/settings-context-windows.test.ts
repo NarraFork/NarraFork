@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { normalizeModelContextWindowOverrides } from "@shared/model-context-window";
 import { Hono } from "hono";
+import { getModelOverride, replaceModelOverridesForTests } from "../../../server/lib/model-catalog";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import { getDefaults, reloadSettings, saveSettings, settings } from "../../../server/lib/settings";
 import { settingsRoutes, updateSettingsSchema } from "../../../server/routes/settings";
@@ -16,6 +17,7 @@ const ADMIN_SUB = "context-window-test-admin";
 const snapshot = structuredClone(settings);
 const settingsPath = resolve(getNarraforkHome(), "settings.json");
 const original = readFileSync(settingsPath, "utf8");
+let restoreOverrides: () => void = () => {};
 
 // `assertAdmin` authorizes against the live store role, not the token claim, so the
 // acting administrator must be reported as an admin by the session store.
@@ -29,8 +31,10 @@ beforeEach(() => {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
+	restoreOverrides = replaceModelOverridesForTests({});
 });
 afterEach(() => {
+	restoreOverrides();
 	setAuthStores(undefined);
 	saveSettings(structuredClone(snapshot));
 	writeFileSync(settingsPath, original);
@@ -43,21 +47,30 @@ app.use("*", async (c, next) => {
 });
 app.onError((error, c) => c.json({ error: error.message }, 400));
 app.route("/settings", settingsRoutes);
-/** Provider entries' own working windows in a catalog local layer. */
-function ownWindows(local: { connections?: Record<string, Record<string, unknown>> }) {
+/** Provider entries' own windows in an overrides document (`connections` scope). */
+function ownWindows(connections: Record<string, { contextWindow?: number }> | undefined) {
 	return Object.fromEntries(
-		Object.entries(local.connections ?? {}).flatMap(([model, metadata]) =>
-			typeof metadata.working_context_tokens === "number"
-				? [[model, metadata.working_context_tokens]]
-				: [],
+		Object.entries(connections ?? {}).flatMap(([model, override]) =>
+			typeof override.contextWindow === "number" ? [[model, override.contextWindow]] : [],
 		),
 	);
 }
-/** The windows settings.json holds: in the catalog, never as a separate map. */
-function diskWindows() {
-	const disk = JSON.parse(readFileSync(settingsPath, "utf8"));
+const liveWindows = (models: string[]) =>
+	Object.fromEntries(
+		models.flatMap((model) => {
+			const window = getModelOverride("connection", model)?.contextWindow;
+			return window === undefined ? [] : [[model, window]];
+		}),
+	);
+/** The windows on disk: in the catalog's overrides file, never in settings.json. */
+function diskWindows(home = getNarraforkHome()) {
+	const disk = JSON.parse(readFileSync(resolve(home, "settings.json"), "utf8"));
 	expect(disk.agent.modelContextWindows).toBeUndefined();
-	return ownWindows(disk.agent.modelCatalog.local);
+	expect(Object.keys(disk.agent.modelCatalog)).toEqual(["autoUpdate"]);
+	const overrides = JSON.parse(
+		readFileSync(resolve(home, "model-catalog", "overrides.json"), "utf8"),
+	);
+	return ownWindows(overrides.connections);
 }
 function patch(windows: unknown) {
 	return app.request("/settings", {
@@ -69,17 +82,22 @@ function patch(windows: unknown) {
 
 async function coldStartContextWindows(home: string, models: string[]) {
 	const settingsModule = pathToFileURL(resolve("server/lib/settings/index.ts")).href;
+	const catalogModule = pathToFileURL(resolve("server/lib/model-catalog/index.ts")).href;
 	const budgetsModule = pathToFileURL(resolve("server/lib/agent/provider-model-metadata.ts")).href;
 	const child = Bun.spawn(
 		[
 			process.execPath,
 			"--eval",
 			`const { settings } = await import(${JSON.stringify(settingsModule)});
+			const { getModelOverride } = await import(${JSON.stringify(catalogModule)});
 			const { modelTokenBudgets } = await import(${JSON.stringify(budgetsModule)});
 			console.log("COLD_START_RESULT=" + JSON.stringify({
 				map: settings.agent.modelContextWindows ?? null,
-				connections: settings.agent.modelCatalog.local.connections ?? {},
-				bindings: (settings.agent.modelCatalog.local.bindings ?? []).map((b) => b.id),
+				catalog: settings.agent.modelCatalog,
+				connections: Object.fromEntries(${JSON.stringify(models)}.flatMap(model => {
+					const override = getModelOverride("connection", model);
+					return override ? [[model, override]] : [];
+				})),
 				budgets: Object.fromEntries(${JSON.stringify(models)}.map(model => [model, modelTokenBudgets(model)])),
 			}));`,
 		],
@@ -198,30 +216,28 @@ describe("context-window cold-start import", () => {
 				// Old window bindings become provider entries' own windows. Where the stored
 				// map and a binding disagree, the map is what the provider page showed (older
 				// builds dropped page edits after a hot reload), so it is applied once. A key
-				// the map lacks is not a deletion: its binding's value stays.
+				// the map lacks is not a deletion: its binding's value stays. Values are kept
+				// as entered when they are valid overrides (1 to 100M tokens).
 				expect(first.map).toBeNull();
-				expect(first.bindings).toEqual([]);
-				expect(ownWindows(first)).toEqual({
-					"openai:cold-large": 10_000_000,
-					"openai:cold-small": 256,
+				expect(first.catalog).toEqual({ autoUpdate: true });
+				expect(ownWindows(first.connections)).toEqual({
+					"openai:cold-large": 20_000_000,
+					"openai:cold-small": 12,
 					"openai:cold-invalid": 64_000,
 					"openai:cold-edited": 128_000,
 					"openai:cold-reset": 128_000,
 				});
 				expect(first.budgets).toEqual({
-					"openai:cold-large": { workingContextTokens: 10_000_000 },
-					"openai:cold-small": { workingContextTokens: 256 },
+					"openai:cold-large": { workingContextTokens: 20_000_000 },
+					"openai:cold-small": { workingContextTokens: 12 },
 					"openai:cold-invalid": { workingContextTokens: 64_000 },
 					"openai:cold-edited": { workingContextTokens: 128_000 },
 					"openai:cold-reset": { workingContextTokens: 128_000 },
 				});
 				const persisted = readFileSync(path, "utf8");
-				const disk = JSON.parse(persisted);
-				expect(disk.agent.modelContextWindows).toBeUndefined();
-				expect(ownWindows(disk.agent.modelCatalog.local)).toEqual(ownWindows(first));
-				expect(JSON.stringify(disk.agent.modelCatalog)).not.toContain("legacy-window:");
-				expect(disk.agent.modelCatalog.schemaVersion).toBe(2);
-				expect(JSON.stringify(disk.agent.modelCatalog)).not.toContain("limits.contextWindow");
+				expect(diskWindows(home)).toEqual(ownWindows(first.connections));
+				expect(persisted).not.toContain("legacy-window:");
+				expect(persisted).not.toContain("limits.contextWindow");
 				const second = await coldStartContextWindows(home, Object.keys(windows));
 				expect(second).toEqual(first);
 				expect(readFileSync(path, "utf8")).toBe(persisted);
@@ -276,20 +292,22 @@ describe("context-window automatic normalization", () => {
 		};
 		writeFileSync(settingsPath, JSON.stringify(raw));
 		const loaded = reloadSettings();
-		const result = { "retired:large": 10_000_000, "offline:valid": 128_000 };
+		const result = { "retired:large": 20_000_000, "offline:valid": 128_000 };
 		expect(loaded.agent).not.toHaveProperty("modelContextWindows");
-		expect(ownWindows(loaded.agent.modelCatalog!.local)).toEqual(result);
+		expect(loaded.agent.modelCatalog).toEqual({ autoUpdate: true });
+		expect(liveWindows(Object.keys(result))).toEqual(result);
 		expect(diskWindows()).toEqual(result);
 	});
 
 	it("a settings PATCH from a page loaded before the upgrade is rejected, not dropped", async () => {
-		const before = ownWindows(settings.agent.modelCatalog!.local);
+		const models = Object.keys(input);
+		const before = liveWindows(models);
 		const order = structuredClone(settings.agent.providerOrder);
 		const response = await patch(input);
 		expect(response.status).toBe(400);
 		expect((await response.json()).error).toContain("reload the page");
 		expect(settings.agent.providerOrder).toEqual(order);
-		expect(ownWindows(settings.agent.modelCatalog!.local)).toEqual(before);
+		expect(liveWindows(models)).toEqual(before);
 		const ok = await app.request("/settings", {
 			method: "PATCH",
 			headers: { "Content-Type": "application/json" },

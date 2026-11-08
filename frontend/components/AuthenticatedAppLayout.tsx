@@ -475,8 +475,11 @@ export function AuthenticatedLayout() {
 				>
 					{/* Phones: the drawer's menu button for pages whose title row has none. */}
 					<MobileNavFallback />
-					{/* WCO on desktop: the title-bar strip over the page, and its drag surface
-				    (there is no header row). display:none everywhere else, see wco.css. */}
+					{/* WCO on desktop: the shell's top padding is a drag surface of its own, so a
+					    grab at the window's very top edge moves the window (there is no header
+					    row). display:none everywhere else, see wco.css. */}
+					<Box className="nf-wco-top-gap" aria-hidden />
+					{/* WCO on desktop: the title-bar strip over the page, and its drag surface. */}
 					<Box className="nf-wco-main-strip" aria-hidden />
 					{/*
 					 * No data-directory permission probe here: it ran on every login and turned an

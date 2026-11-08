@@ -467,6 +467,24 @@ class RevertAnalysis {
 }
 
 /**
+ * What reverting a commit would put back now, without writing anything: the blocks it would
+ * change and those it would leave alone. The reports' undo (P2 PR 11) asks this before reverting
+ * a decision, so a decision that can no longer be taken back is refused rather than half undone.
+ */
+export async function previewRevert(
+	commitId: string,
+	options: { store?: OutlineStore } = {},
+): Promise<{ changed: string[]; skipped: string[] }> {
+	const store = options.store ?? outlineStore;
+	const commit = await store.getCommit(commitId);
+	if (!commit) throw new NotFoundError("Outline commit", commitId);
+	const space = await store.getSpace(commit.spaceId);
+	if (!space) throw new NotFoundError("Outline space", commit.spaceId);
+	const plan = await new RevertAnalysis(store, space, commit).run();
+	return { changed: plan.ops.length > 0 ? plan.changed : [], skipped: [...plan.skipped.keys()] };
+}
+
+/**
  * Revert a commit with a compensating commit. Blocks changed since, or that cannot go back, are
  * left alone and listed; the rest is written as one `revert` commit. Throws `NotFoundError` for
  * an unknown commit and `OutlineBusyError` when the space keeps changing during the analysis.

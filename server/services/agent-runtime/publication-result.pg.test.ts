@@ -10,6 +10,7 @@ import {
 	narrators,
 	runtimePublicationOutbox as outbox,
 	narratorMessageRefs as refs,
+	narratorToolCalls as toolCalls,
 } from "../../db/postgres-schema";
 import { createPostgresRuntimePublication } from "./postgres-runtime-publication";
 import { createPostgresRuntimeQueue } from "./postgres-runtime-queue";
@@ -93,6 +94,15 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 				await message("old-history", "OLD HISTORY RESULT");
 				await message("old-compact", "OLD COMPACT SUMMARY", "system");
 				const first = await start();
+				expect(await engine.readRunPublicationState(first)).toEqual({ state: "reserved" });
+				expect(
+					await engine.readRunPublicationState({
+						producerKind: "agent",
+						taskId: "actor",
+						logicalRunId: "never-registered",
+						recipientId: "parent",
+					}),
+				).toEqual({ state: "none" });
 				expect(await engine.readAgentTerminalResult(first)).toBeNull();
 				expect(
 					await engine.readAgentTerminalResult(first, { settledRunId: first.logicalRunId }),
@@ -140,6 +150,75 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 					text: "FIRST FINAL",
 					summary: "done",
 				});
+				expect(await engine.readRunPublicationState(first)).toEqual({
+					state: "settled",
+					eventKind: "completed",
+				});
+				// An active parent projection is settled by the composite, while the already
+				// published same-kind terminal remains a duplicate.
+				await db.insert(messages).values({
+					id: "parent-tool-message",
+					narratorId: "parent",
+					role: "assistant",
+					contentJson: [],
+					createdAt: now,
+				});
+				await db.insert(toolCalls).values({
+					id: "parent-tool-call",
+					narratorId: "parent",
+					messageId: "parent-tool-message",
+					toolUseId: "test-tool-use",
+					toolName: "Agent",
+					inputJson: {},
+					status: "running",
+					executionAttempt: 1,
+					createdAt: now,
+				});
+				const repeated = await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "completed",
+					text: "FIRST FINAL",
+					summary: "done",
+					toolConclusion: {
+						toolCallId: "parent-tool-call",
+						messageId: "parent-tool-message",
+						toolUseId: "test-tool-use",
+						attempt: 1,
+						output: "RECOVERED PARENT RESULT",
+						status: "success",
+					},
+				});
+				expect(repeated.status).toBe("duplicate");
+				expect((await db.select().from(toolCalls))[0]).toMatchObject({
+					status: "success",
+					outputJson: "RECOVERED PARENT RESULT",
+				});
+				const terminalConclusion = {
+					toolCallId: "parent-tool-call",
+					messageId: "parent-tool-message",
+					toolUseId: "test-tool-use",
+					attempt: 1,
+					output: "MUST NOT REPLACE TERMINAL RESULT",
+					status: "success" as const,
+					onlyIfActive: true,
+				};
+				await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "completed",
+					text: "FIRST FINAL",
+					summary: "done",
+					toolConclusion: terminalConclusion,
+				});
+				expect((await db.select().from(toolCalls))[0]?.outputJson).toBe("RECOVERED PARENT RESULT");
+				await db.delete(toolCalls);
+				const missingParent = await engine.commitAgentTerminal({
+					run: first,
+					eventKind: "completed",
+					text: "FIRST FINAL",
+					summary: "done",
+					toolConclusion: terminalConclusion,
+				});
+				expect(missingParent.status).toBe("duplicate");
 				expect(await engine.readAgentTerminalResult(first)).toEqual({
 					output: "FIRST FINAL",
 					sourceResultRef: "message:first-output",
@@ -154,6 +233,7 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 				});
 				await queue.outbox.consumeAwaitedTerminal(first);
 				await db.delete(mailbox);
+				expect(await engine.readRunPublicationState(first)).toEqual({ state: "settled" });
 				expect(await engine.readAgentTerminalResult(first)).toEqual({
 					output: "FIRST FINAL",
 					sourceResultRef: "message:first-output",
@@ -209,6 +289,10 @@ const PG_ENABLED = process.env.PG_INTEGRATION === "1";
 					eventKind: "failed",
 					text: "EARLY FAILURE",
 					summary: "failed",
+				});
+				expect(await engine.readRunPublicationState(third)).toEqual({
+					state: "settled",
+					eventKind: "failed",
 				});
 				expect(await engine.readAgentTerminalResult(third)).toEqual({ output: "EARLY FAILURE" });
 				await queue.outbox.consumeAwaitedTerminal(third);

@@ -233,23 +233,25 @@ export function NavTopSection({
 					position="right"
 					openDelay={400}
 				>
-					<BrandTitle
-						ref={brandRef}
-						order={4}
-						onClick={onToggleCollapsed}
-						className="nf-nav-brand"
-						style={{
-							cursor: "pointer",
-							userSelect: "none",
-							minWidth: 0,
-							flexShrink: 0,
-							// Collapsed: the name and its attribution line shrink together to fit
-							// the column (nav-collapsed.css). A transform, so the row keeps its height.
-							"--nf-nav-brand-scale": brandScale,
-						}}
-					/>
+					<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
+						<BrandTitle
+							ref={brandRef}
+							order={4}
+							onClick={onToggleCollapsed}
+							className="nf-nav-brand"
+							style={{
+								cursor: "pointer",
+								userSelect: "none",
+								minWidth: 0,
+								flexShrink: 0,
+								// Collapsed: the name and its attribution line shrink together to fit
+								// the column (nav-collapsed.css). A transform, so the row keeps its height.
+								"--nf-nav-brand-scale": brandScale,
+							}}
+						/>
+						<NavVersionLink />
+					</Group>
 				</Tooltip>
-				<NavVersionLink />
 				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }} className="nf-nav-expanded-only">
 					<WorkspaceSwitcher />
 					<NotificationBell />
@@ -286,7 +288,10 @@ function NavVersionLink() {
 				truncate
 				className="nf-nav-expanded-only"
 				data-nav-version
-				style={{ flex: 1, minWidth: 0, textDecoration: "none" }}
+				// Never stretch: the blank space between the brand and the icons has to stay
+				// draggable (a link is `no-drag` in the WCO title bar). It may still shrink, so
+				// a narrow sidebar truncates it instead of pushing the icons out.
+				style={{ flexShrink: 1, minWidth: 0, textDecoration: "none" }}
 			>
 				v{release}
 			</Text>

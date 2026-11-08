@@ -23,7 +23,7 @@ describe("collapsed capability constants", () => {
 			"readOnly",
 			"dontAsk",
 		]);
-		expect(permissions.reflections).toEqual(["danger", "plan", "goal"]);
+		expect(permissions.reflections).toEqual(["danger", "plan", "question", "goal"]);
 		expect(permissions.approveDeny).toBe(true);
 		expect(permissions.updatedInput).toBe(true);
 	});

@@ -778,6 +778,7 @@ export function useCreateNarrator() {
 			relaxedPlan?: boolean;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			cwd?: string;
 			title?: string;
 			makeNamed?: boolean;
@@ -1148,6 +1149,7 @@ export function useUpdateReflectionOverrides() {
 			id: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 			tasksReminderIntervalOverride?: number | null;
 		}) => api.updateNarratorReflectionOverrides(id, data),

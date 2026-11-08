@@ -103,11 +103,10 @@ const queue = (messageId: string) =>
 async function modelBodies(fromBlocks: boolean) {
 	const source = await queryModelHistory(sqliteHistoryQuery(sqlite), {
 		narratorId: "n1",
-		deadline: Date.now() + 10_000,
 		versioned: true,
 		bodiesFromBlocks: fromBlocks,
 	});
-	return new Map(source.messages.map((row) => [row.id, row.contentJson]));
+	return new Map<string, unknown>(source.messages.map((row) => [row.id, row.contentJson]));
 }
 
 describe("rows-only envelopes", () => {
@@ -192,7 +191,7 @@ describe("rows-only envelopes", () => {
 		expect(bodies.readEnvelopeBody(db, stepId)).toEqual(body);
 		// Readers that decide for themselves (model history, export) follow the same rule.
 		const source = await loadModelHistorySource({ backend: "sqlite", sqlite }, "n1");
-		expect(source.messages.find((m) => m.id === stepId)?.contentJson).toEqual(body);
+		expect<unknown>(source.messages.find((m) => m.id === stepId)?.contentJson).toEqual(body);
 		expect(exportBodiesFromBlocks()).toBe(true);
 		// Once none is rows-only, the switch takes effect again.
 		sqlite.run("UPDATE narrator_messages SET content_json = ?, body_rows_only = 0 WHERE id = ?", [

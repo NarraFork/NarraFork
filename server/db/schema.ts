@@ -32,6 +32,11 @@ import type {
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import type { NotificationLink } from "@shared/notification-center";
 import type { LinkTarget, TaskStatus } from "@shared/outline";
+import type {
+	OutlineDigestCounts,
+	OutlineDigestRanges,
+	OutlineDigestStored,
+} from "@shared/outline-digest";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { sql } from "drizzle-orm";
 import {
@@ -387,6 +392,13 @@ export const narrators = sqliteTable(
 			.default("inherit"),
 		dangerReflectionOverride: text("danger_reflection_override", {
 			enum: ["inherit", "on", "off", "light", "standard", "strict"],
+		})
+			.notNull()
+			.default("inherit"),
+		/** AskUserQuestion 自动反思回答的三态覆盖：inherit = 跟随 settings.agent.questionReflectionEnabled，
+		 *  on/off = 本会话显式覆盖。 */
+		questionReflectionOverride: text("question_reflection_override", {
+			enum: ["inherit", "on", "off"],
 		})
 			.notNull()
 			.default("inherit"),
@@ -2405,6 +2417,14 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * for a lesson that no longer exists is simply not shown.
 	 */
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
+	/**
+	 * The outline's daily report (汇报, P2 PR 11, owner decision Q2 = B): the IANA time zone a
+	 * person's day is cut in (midnight to midnight there), and the local time of day (`HH:MM`) the
+	 * report of a day is made on the next day. NULL until the person sets one: the server's time
+	 * zone, and 07:00 (`services/outline/digest-time.ts`).
+	 */
+	outlineDigestTimeZone: text("outline_digest_time_zone"),
+	outlineDigestTime: text("outline_digest_time"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -3568,6 +3588,11 @@ export const apiRequests = sqliteTable(
 		/** Request initiator, frozen at start; null for unknown legacy/system usage.
 		 * No FK: removing a user must not rewrite the accounting identity. */
 		userId: text("user_id"),
+		/** Who pays: the owner of the (root) narrator, else the initiator. Frozen at write.
+		 * Differs from userId when a collaborator drives someone else's narrator. No FK. */
+		billingUserId: text("billing_user_id"),
+		/** The narrator's primary project at request time; never rewritten. No FK. */
+		projectId: text("project_id"),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		// 外部 Agent 写入时可自带的叙述者文本（无 narrator 关联时用于占位显示）
 		agentLabel: text("agent_label"),
@@ -3653,6 +3678,45 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 	lastUsedAt: text("last_used_at").notNull(),
 });
 
+// === usage_daily ===
+// Durable per-day usage ledger: one row per (UTC day, billing user, project, provider,
+// credential, model), upserted in the same transaction as the api_requests detail row and
+// never touched by narrator cleanup. Backs usage analysis and budgets without scanning
+// api_requests. Key columns store "" for "none" so the unique index always matches.
+// Costs are reference-price USD (server/lib/model-pricing.ts).
+export const usageDaily = sqliteTable(
+	"usage_daily",
+	{
+		id: text("id").primaryKey(),
+		/** UTC calendar day, YYYY-MM-DD. */
+		day: text("day").notNull(),
+		billingUserId: text("billing_user_id").notNull(),
+		projectId: text("project_id").notNull(),
+		provider: text("provider").notNull(),
+		credentialId: text("credential_id").notNull(),
+		model: text("model").notNull(),
+		requestCount: integer("request_count").notNull().default(0),
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+		cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		costUsd: real("cost_usd").notNull().default(0),
+		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	},
+	(table) => [
+		// Natural key; leading `day` also serves every date-range read.
+		uniqueIndex("idx_usage_daily_key").on(
+			table.day,
+			table.billingUserId,
+			table.projectId,
+			table.provider,
+			table.credentialId,
+			table.model,
+		),
+	],
+);
+
 // === credential_usage_totals ===
 // Lifetime token/cost rollup per (provider, credential, model).
 //
@@ -3667,15 +3731,11 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 // server/lib/model-pricing.ts). For subscription-based access that is an
 // equivalent-consumption figure, not an amount actually billed.
 //
-// SCOPE — this is NOT a full ledger of the deployment's spend. Rows only exist
-// for providers that have credential management (codex). Anthropic and
-// OpenAI direct connections carry credentialId = null (see
-// usage-history-service.getCredentialName) and are deliberately not rolled up
-// here: a synthetic bucket would give every unrelated keyless provider one
-// shared row, and the natural key would stop meaning "one credential".
-// "How much has this deployment spent in total" is answered from `api_requests`
-// for as long as those rows live. Do not read a sum over this table as the
-// deployment total.
+// SCOPE — rows exist for every source that can be identified: pooled credentials
+// (codex accounts, plugins) and API connections (keyed by their stable connection
+// id, see lib/request-source.ts). Requests from an unidentifiable source are not
+// rolled up here, and neither are failed requests, so a sum over this table is not
+// a deployment total; use usage_daily for that.
 export const credentialUsageTotals = sqliteTable(
 	"credential_usage_totals",
 	{
@@ -5624,9 +5684,22 @@ export const outlineSpaces = sqliteTable(
 		 * rebuild has since rewritten is refused as stale and planned again.
 		 */
 		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
+		/**
+		 * `created_at` of the space's latest commit, written by the statement that claims the seq
+		 * (P2 PR 11): which spaces had commits since a time is one range read on its index, not a
+		 * scan of every space. NULL until the space's first commit; spaces committed to before the
+		 * column existed are stamped by the report job from their last commit.
+		 */
+		lastCommitAt: text("last_commit_at"),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		// Spaces with commits since a time, by that time then id (the report job's pages).
+		index("idx_outline_spaces_last_commit").on(table.lastCommitAt, table.id),
+		// Spaces committed to before `last_commit_at` existed: what the report job still stamps.
+		index("idx_outline_spaces_unstamped")
+			.on(table.id)
+			.where(sql`"last_commit_at" IS NULL AND "next_seq" > 1`),
 		// Spaces the in-process rebuild still has to visit; empty once it has run.
 		index("idx_outline_spaces_in_process_pending").on(table.id).where(sql`"in_process_ready" = 0`),
 		uniqueIndex("uq_outline_spaces_project").on(table.projectId).where(sql`"kind" = 'project'`),
@@ -6076,6 +6149,81 @@ export const outlineViewState = sqliteTable(
 	(table) => [
 		primaryKey({ columns: [table.userId, table.pageBlockId] }),
 		index("idx_outline_view_state_page").on(table.pageBlockId),
+	],
+);
+
+// === outline_task_seen ===
+/**
+ * When a person saw, on the task board, a task they manage that an agent finished (outline P2
+ * PR 9b, owner decision D50 ④): the board marks such a task 「新完成」 until they have seen it.
+ * One row per person and task: `seen_seq` is the task's `version_seq` they saw finished (a later
+ * finish of it is new again). Personal UI state, never a commit; rows older than the board's
+ * window are pruned when the person's rows are written (`idx_outline_task_seen_user_at`).
+ */
+export const outlineTaskSeen = sqliteTable(
+	"outline_task_seen",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		taskBlockId: text("task_block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		seenSeq: integer("seen_seq").notNull(),
+		seenAt: text("seen_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.userId, table.taskBlockId] }),
+		// The FK's index: deleting a block (a purge) finds its rows.
+		index("idx_outline_task_seen_block").on(table.taskBlockId),
+		// A person's oldest rows first: the prune.
+		index("idx_outline_task_seen_user_at").on(table.userId, table.seenAt),
+	],
+);
+
+// === outline_digests ===
+/**
+ * A person's reports (汇报, outline P2 PR 11; design §3.4): one row per person per day (`daily`,
+ * `period_key` the day in the person's time zone), plus at most one "today so far" preview
+ * (`today`). Derived data, made by the background job (`services/outline/digest-job.ts`) from
+ * commits and versions; it holds ids, seqs, kinds and counts, never block text, so a title is read
+ * when shown and today's read access decides what is shown.
+ *
+ *   - `period_start`, `period_end`: the window the report covers (ISO instants). Consecutive days
+ *     of a person meet exactly: a day starts where the previous report ended, also when the person
+ *     changed their time zone in between.
+ *   - `ranges_json`: per space, the seqs `(from, to]` the window covered; the next day continues
+ *     from them, so no commit is counted twice or skipped.
+ *   - `counts_json`, `item_count`: what lists and the inbox read; `items_json` (at most 64 KiB) only
+ *     the detail reads.
+ *   - `seen_at`: when the person read it; a report with nothing in it is written already seen.
+ */
+export const outlineDigests = sqliteTable(
+	"outline_digests",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["daily", "today"] }).notNull(),
+		/** The day (`YYYY-MM-DD`) in `time_zone`. */
+		periodKey: text("period_key").notNull(),
+		timeZone: text("time_zone").notNull(),
+		periodStart: text("period_start").notNull(),
+		periodEnd: text("period_end").notNull(),
+		countsJson: text("counts_json", { mode: "json" }).$type<OutlineDigestCounts>().notNull(),
+		itemCount: integer("item_count").notNull().default(0),
+		itemsJson: text("items_json", { mode: "json" }).$type<OutlineDigestStored>().notNull(),
+		rangesJson: text("ranges_json", { mode: "json" }).$type<OutlineDigestRanges>().notNull(),
+		truncated: integer("truncated", { mode: "boolean" }).notNull().default(false),
+		createdAt: text("created_at").notNull(),
+		seenAt: text("seen_at"),
+	},
+	(table) => [
+		// One per person, kind and day; also the person's reports by day (and the FK's index).
+		uniqueIndex("uq_outline_digests_user_period").on(table.userId, table.kind, table.periodKey),
+		// A person's unread reports: the inbox row.
+		index("idx_outline_digests_unseen").on(table.userId).where(sql`"seen_at" IS NULL`),
 	],
 );
 

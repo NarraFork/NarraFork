@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import { isAutoModelValue } from "@shared/auto-model";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
@@ -178,6 +179,7 @@ import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
+import { lastServedProvider } from "./auto-sticky-source";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import {
@@ -744,6 +746,9 @@ export async function executeQueuedNewCommand(
 		),
 		dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
 			sourceNarrator.dangerReflectionOverride,
+		),
+		questionReflectionOverride: normalizeOptionalBooleanOverride(
+			sourceNarrator.questionReflectionOverride,
 		),
 		cwd: active.cwd,
 		// The person who queued `/new` owns the session it spawns. Falling back to the
@@ -1563,7 +1568,12 @@ async function createNarrator(
 	const inheritedModel =
 		narrator.model === FOLLOW_PARENT_MODEL ? await resolveSubagentModelForRun(narrator) : null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
-	const narratorModel = inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef);
+	const narratorModel =
+		inheritedModel?.model ??
+		resolveEffectiveModel(
+			narratorModelRef,
+			isAutoModelValue(narratorModelRef) ? lastServedProvider(narratorId) : undefined,
+		);
 	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {
@@ -2955,7 +2965,7 @@ interface ContinuableTopLevelMessage {
 	parentToolUseId?: string | null;
 	contentJson?: unknown;
 	contentText?: unknown;
-	toolCalls?: Array<{ toolUseId?: string | null; toolName?: string | null }>;
+	toolCalls?: ReadonlyArray<{ toolUseId?: string | null; toolName?: string | null }>;
 }
 
 /**
@@ -2973,7 +2983,7 @@ interface ContinuableTopLevelMessage {
  * so nothing is lost by continuing from the turn underneath.
  */
 export function resolveContinuationTail<T extends ContinuableTopLevelMessage>(
-	messages: T[],
+	messages: readonly T[],
 ): { tail: T | undefined; danglingReasoningIds: string[] } {
 	const danglingReasoningIds: string[] = [];
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -3015,7 +3025,7 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
  * injection from the trailing position, and the model reads it as background while
  * being asked to continue something unnamed.
  */
-export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
+export function hasTrailingInjectionRow(messages: readonly ContinuableTopLevelMessage[]): boolean {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (!msg || msg.parentToolUseId) continue;
@@ -3954,6 +3964,8 @@ async function updateToolCallConclusionUnlocked(opts: {
 	 * manual/third-party conclusion text updates preserve the original execution timing.
 	 */
 	refreshTiming?: boolean;
+	/** Recovery explanations may update only an active row, never a terminal result. */
+	onlyIfActive?: boolean;
 	onPersist?: (tx: import("./agent-runtime/mailbox-types").RuntimeTx) => void;
 }): Promise<void> {
 	const {
@@ -4000,15 +4012,19 @@ async function updateToolCallConclusionUnlocked(opts: {
 			streamStartedAt: true,
 			permissionStartedAt: true,
 			executionStartedAt: true,
+			status: true,
 		},
 		limit: 2,
 	});
-	if (resultRows.length !== 1)
+	if (resultRows.length !== 1) {
+		if (opts.onlyIfActive) return;
 		throw new ValidationError("Subagent conclusion requires an exact parent tool-call row");
+	}
 	const resultRow = resultRows[0];
+	if (opts.onlyIfActive && (resultRow.status === "success" || resultRow.status === "fail")) return;
 	const timing = refreshTiming ? resolveToolCallConclusionTiming(resultRow) : undefined;
 
-	await narratorStore.settleTool(
+	const settled = await narratorStore.settleTool(
 		toolUseId,
 		{
 			output,
@@ -4016,11 +4032,15 @@ async function updateToolCallConclusionUnlocked(opts: {
 			errorMessage: hasError ? finalText : undefined,
 			resultMessageId,
 			onPersist: opts.onPersist,
+			onlyIfActive: opts.onlyIfActive,
 			...(timing ?? { preserveTiming: true }),
 		},
 		messageId,
 		resultRow.id,
 	);
+	// A competing writer settled the row between our read and the active-only CAS.
+	// Do not broadcast a conclusion that was never actually written.
+	if (opts.onlyIfActive && !settled) return;
 	// Broadcast to parent narrator so the frontend can update the SubagentCard
 	broadcastToNarrator(parentNarratorId, {
 		type: "subagent_conclusion_updated",

@@ -57,6 +57,8 @@ export interface ServerSystemSectionProps {
 	setTlsEnabled: (v: boolean) => void;
 	tlsAutoReissue: boolean;
 	setTlsAutoReissue: (v: boolean) => void;
+	encryptSecrets: boolean;
+	setEncryptSecrets: (v: boolean) => void;
 	tlsCertFile: string;
 	setTlsCertFile: (v: string) => void;
 	tlsKeyFile: string;
@@ -99,6 +101,8 @@ export function ServerSystemSection({
 	setTlsEnabled,
 	tlsAutoReissue,
 	setTlsAutoReissue,
+	encryptSecrets,
+	setEncryptSecrets,
 	tlsCertFile,
 	setTlsCertFile,
 	tlsKeyFile,
@@ -172,6 +176,12 @@ export function ServerSystemSection({
 					{t("settingsSecretMaskingUnsupportedDesc")}
 				</Alert>
 			)}
+			<Switch
+				label={t("encryptSecrets")}
+				description={t("encryptSecretsDesc")}
+				checked={encryptSecrets}
+				onChange={(e) => setEncryptSecrets(e.currentTarget.checked)}
+			/>
 			<NumberInput
 				label={t("serverPort")}
 				value={port}

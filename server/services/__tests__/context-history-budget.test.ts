@@ -203,11 +203,9 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 
 	test("forwards active cancellation to the source loader and does not build after abort", async () => {
 		const controller = new AbortController();
-		let passedDeadline: number | undefined;
 		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
 			async (_id, _limit, options) => {
-				expect(options?.signal).toBe(controller.signal);
-				passedDeadline = options?.deadline;
+				expect(options).toEqual({ signal: controller.signal });
 				return new Promise((_, reject) =>
 					controller.signal.addEventListener("abort", () => reject(new Error("source cancelled")), {
 						once: true,
@@ -222,30 +220,29 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 			const rebuilding = hooks(controller.signal).onBeforeTurn(1, { force: true });
 			controller.abort();
 			await expect(rebuilding).rejects.toThrow("source cancelled");
-			expect(passedDeadline).toBeGreaterThan(Date.now());
+			expect(load).toHaveBeenCalledTimes(1);
 			expect(build).not.toHaveBeenCalled();
 		} finally {
 			load.mockRestore();
 			build.mockRestore();
 		}
 	});
-	test("a short source read deadline does not become a total request-preparation limit", async () => {
+	test("source reads and total request preparation may both exceed ten seconds", async () => {
 		const controller = new AbortController();
 		let now = 100_000;
-		let sharedDeadline: number | undefined;
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
 		const load = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
 			async (_id, _limit, options) => {
-				sharedDeadline = options?.deadline;
-				now += 8000;
+				expect(options).toEqual({ signal: controller.signal });
+				now += 11_000;
 				return [];
 			},
 		);
 		const build = spyOn(runtimeHistory, "buildRuntimeHistory").mockImplementation(
 			async (options) => {
-				expect(options.deadline).toBeUndefined();
+				expect(options).not.toHaveProperty("deadline");
 				expect(options.attachmentSignal).toBe(controller.signal);
-				expect((sharedDeadline ?? 0) - Date.now()).toBe(2000);
+				expect(now).toBe(111_000);
 				now += 3000;
 				return prepared();
 			},
@@ -253,7 +250,7 @@ describe("compact/plan-toggle/forced context rebuild budget", () => {
 		try {
 			const result = await hooks(controller.signal).onBeforeTurn(1, { force: true });
 			expect(result?.systemPrompt).toBe("system");
-			expect(now).toBe(111_000);
+			expect(now).toBe(114_000);
 		} finally {
 			load.mockRestore();
 			build.mockRestore();

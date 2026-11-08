@@ -9,11 +9,11 @@
  *     are under it (an `Ask` card's link opens the block there).
  *   - `OutlineAttentionDetail`: an inbox row of the outline expanded: the questions form, a
  *     change waiting for the person's confirmation (the diff and confirm or reject, from the
- *     pending panel), or the digest of what agents confirmed on their behalf (each revertable).
+ *     pending panel), or the digest row: the latest unread report in short and what agents
+ *     confirmed on the person's behalf, each decision undoable (`digest/OutlineDigestInbox.tsx`).
  */
 import {
 	Alert,
-	Anchor,
 	Badge,
 	Button,
 	Group,
@@ -32,21 +32,18 @@ import type {
 	OutlineBlockViewResponse,
 	OutlineQuestionView,
 } from "@shared/outline-api";
-import { useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-	invalidateOutlineSpace,
 	useAnswerOutlineQuestions,
-	useMarkOutlineDigestSeen,
-	useOutlineDigest,
 	useOutlinePendingDetail,
 	useOutlineQuestions,
 } from "../../hooks/useOutline";
-import { ApiError, api } from "../../lib/api";
+import { ApiError } from "../../lib/api";
 import { formatSmartTime } from "../../lib/format";
+import { OpenInOutline } from "./OpenInOutline";
+import { OutlineDigestRow } from "./OutlineDigestRow";
 import { PendingDetail } from "./OutlinePendingPanel";
-import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 type Translate = ReturnType<typeof useTranslation>["t"];
 
@@ -93,32 +90,6 @@ function answerText(t: Translate, q: OutlineQuestionView): string {
 				: "questions.answeredRelayed"
 			: "questions.answeredBy",
 		{ choice: choice || t("questions.theRecommendation"), name: by, via: door },
-	);
-}
-
-/**
- * A link that opens a block in the outline, closing the inbox first. Router-free like the rest of
- * the outline's components: the host (the inbox) says what a link is (`OutlineNavProvider`).
- */
-function OpenInOutline({
-	spaceId,
-	blockId,
-	onOpen,
-}: {
-	spaceId: string;
-	blockId: string;
-	onOpen?: () => void;
-}) {
-	const { t } = useTranslation("outline");
-	return (
-		<Anchor
-			size="xs"
-			component={OutlineLink}
-			to={outlineBlockTarget(spaceId, blockId, "all")}
-			onClick={() => onOpen?.()}
-		>
-			{t("questions.openInOutline")}
-		</Anchor>
 	);
 }
 
@@ -403,113 +374,6 @@ export function OutlineQuestionsSection({ view }: { view: OutlineBlockViewRespon
 	);
 }
 
-/** What agents confirmed on the person's behalf: each revertable; "Got it" acknowledges them. */
-function OutlineDigestList({ onOpen }: { onOpen?: () => void }) {
-	const { t } = useTranslation("outline");
-	const queryClient = useQueryClient();
-	const digest = useOutlineDigest();
-	const seen = useMarkOutlineDigestSeen();
-	const [reverting, setReverting] = useState<string | null>(null);
-	const [reverted, setReverted] = useState<Set<string>>(new Set());
-	if (digest.isLoading) return <Loader size="xs" />;
-	const items = digest.data?.items ?? [];
-	if (items.length === 0)
-		return (
-			<Text size="xs" c="dimmed">
-				{t("digest.empty")}
-			</Text>
-		);
-	const revert = async (pendingId: string, spaceId: string, commitId: string) => {
-		setReverting(pendingId);
-		try {
-			await api.revertOutlineCommit(commitId);
-			setReverted((all) => new Set([...all, pendingId]));
-			invalidateOutlineSpace(queryClient, spaceId);
-		} catch (error) {
-			notifications.show({
-				color: "red",
-				title: t("digest.revertFailed"),
-				message: errorText(error),
-			});
-		} finally {
-			setReverting(null);
-		}
-	};
-	return (
-		<Stack gap="xs" data-testid="outline-digest">
-			<Text size="xs" c="dimmed">
-				{t("digest.intro")}
-			</Text>
-			{items.map((item) => (
-				<Paper
-					key={item.pendingId}
-					withBorder
-					p="xs"
-					data-testid={`outline-digest-${item.pendingId}`}
-				>
-					<Stack gap={4}>
-						<Group gap={6} wrap="nowrap">
-							<Badge size="xs" variant="light" color="orange">
-								{item.label}
-							</Badge>
-							<Text size="sm" style={{ overflowWrap: "anywhere" }}>
-								{item.summary || t("digest.changes", { count: item.opCount })}
-							</Text>
-						</Group>
-						<Text size="xs" c="dimmed">
-							{[
-								item.decidedBy.hidden
-									? t("digest.confirmedByHidden")
-									: t("digest.confirmedBy", {
-											title: item.decidedBy.title ?? item.decidedBy.narratorId ?? "?",
-										}),
-								item.decidedAt ? formatSmartTime(item.decidedAt) : null,
-							]
-								.filter(Boolean)
-								.join(" · ")}
-						</Text>
-						<Group gap="xs">
-							{item.rootBlockId && (
-								<OpenInOutline spaceId={item.spaceId} blockId={item.rootBlockId} onOpen={onOpen} />
-							)}
-							{item.commitId &&
-								item.canRevert &&
-								(reverted.has(item.pendingId) ? (
-									<Text size="xs" c="dimmed">
-										{t("digest.reverted")}
-									</Text>
-								) : (
-									<Button
-										size="compact-xs"
-										variant="subtle"
-										color="red"
-										loading={reverting === item.pendingId}
-										onClick={() =>
-											void revert(item.pendingId, item.spaceId, item.commitId as string)
-										}
-									>
-										{t("digest.revert")}
-									</Button>
-								))}
-						</Group>
-					</Stack>
-				</Paper>
-			))}
-			<Group>
-				<Button
-					size="compact-sm"
-					variant="light"
-					loading={seen.isPending}
-					onClick={() => seen.mutate(items.map((i) => i.pendingId))}
-					data-testid="outline-digest-seen"
-				>
-					{t("digest.gotIt")}
-				</Button>
-			</Group>
-		</Stack>
-	);
-}
-
 /** A change waiting for the person's confirmation: its diff, confirm and reject. */
 function OutlinePendingAttention({
 	spaceId,
@@ -554,6 +418,7 @@ export function OutlineAttentionDetail({
 				onOpen={onOpen}
 			/>
 		);
-	if (ref.what === "digest") return <OutlineDigestList onOpen={onOpen} />;
+	if (ref.what === "digest")
+		return <OutlineDigestRow reportIds={ref.reportIds ?? []} onOpen={onOpen} />;
 	return null;
 }

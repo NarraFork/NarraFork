@@ -3,7 +3,7 @@ import { IconBell } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
-import { useUnreadSubmissionOutcomeCount, useReviewInboxCount } from "../../hooks/useKnowledge";
+import { useReviewInboxCount, useUnreadSubmissionOutcomeCount } from "../../hooks/useKnowledge";
 import {
 	NotificationCenterLazyDrawer,
 	preloadNotificationCenterDrawer,

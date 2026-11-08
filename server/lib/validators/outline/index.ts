@@ -167,6 +167,19 @@ export const outlineBoardTaskUpdateBodySchema = z
 		message: "nothing to change",
 	});
 
+/** The reader saw these tasks marked 「新完成」 on a board (outline P2 PR 9b). */
+export const outlineBoardSeenBodySchema = z.object({
+	tasks: z
+		.array(
+			z.object({
+				id: outlineIdSchema,
+				versionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+			}),
+		)
+		.min(1)
+		.max(OUTLINE_TASK_BOARD_LIMITS.seenPerRequest),
+});
+
 /** A plan's diff (outline P2 PR 8): compared from `from` (a seq; 0 is nothing) to now. */
 export const outlinePlanDiffQuerySchema = z.object({
 	from: seqSchema,

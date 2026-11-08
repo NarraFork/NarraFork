@@ -2959,6 +2959,7 @@ const sqliteNarratorPersistence = {
 		updates: {
 			planReflectionAutoApproveOverride?: BooleanOverride;
 			dangerReflectionOverride?: DangerReflectionOverride;
+			questionReflectionOverride?: BooleanOverride;
 			autoContinuationOverride?: AutoContinuationOverride;
 			tasksReminderIntervalOverride?: number | null;
 		},
@@ -3011,7 +3012,14 @@ const sqliteNarratorPersistence = {
 		const requestedSubstatus =
 			options?.substatus ?? (status === "working" || status === "waiting" ? [] : undefined);
 		const isError = requestedSubstatus?.includes("error");
-		const keepsErrorMessage = isError || requestedSubstatus?.includes("payment_required");
+		// Timed-wait details share this existing column with errors. They must survive
+		// reloads while parked, but disappear on recovery/interruption like other waits.
+		const keepsWaitMessage =
+			status === "waiting" &&
+			(requestedSubstatus?.includes("quota_exhausted") ||
+				requestedSubstatus?.includes("model_unavailable"));
+		const keepsErrorMessage =
+			isError || requestedSubstatus?.includes("payment_required") || keepsWaitMessage;
 		const now = new Date().toISOString();
 		const nowMs = new Date(now).getTime();
 		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
@@ -4022,6 +4030,8 @@ const sqliteNarratorPersistence = {
 			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
 			onPersist?: (tx: DbTx) => void;
+			/** Recovery explanations may update only an active row, never a terminal result. */
+			onlyIfActive?: boolean;
 		},
 		messageId?: string,
 		toolCallId?: string,
@@ -4053,6 +4063,11 @@ const sqliteNarratorPersistence = {
 			);
 			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		}
+		if (result.onlyIfActive)
+			conditions.push(
+				ne(narratorToolCalls.status, "success"),
+				ne(narratorToolCalls.status, "fail"),
+			);
 		const affectedToolCalls = db.transaction(
 			(tx) => {
 				const queueMark = syncQueueMark();
@@ -4092,6 +4107,9 @@ const sqliteNarratorPersistence = {
 						executionDeviceId: narratorToolCalls.executionDeviceId,
 					})
 					.all();
+				// Another writer already settled or retired this receipt. A recovery
+				// explanation must not replace it or trigger another publication commit.
+				if (result.onlyIfActive && updated.length === 0) return [];
 				if (expected && updated.length !== 1) {
 					throw new ValidationError(
 						"Tool execution binding is stale or belongs to another narrator",

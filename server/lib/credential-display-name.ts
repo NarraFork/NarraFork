@@ -1,4 +1,5 @@
 import { getCodexManager } from "@server/lib/codex-manager";
+import { requestSourceName } from "@server/lib/request-source";
 
 /**
  * Human-readable name for a credential id, or the id itself when no better name exists.
@@ -23,7 +24,8 @@ export function resolveCredentialDisplayName(
 			const cred = snapshot.entries.find((c) => c.id === credentialId);
 			return cred?.displayName || cred?.email || cred?.accountId || credentialId;
 		}
-		// Anthropic and OpenAI direct connections have no credential management.
+		const name = requestSourceName(credentialId);
+		if (name) return name;
 	} catch {
 		// Ignore snapshot failures (e.g. plugin not loaded).
 	}

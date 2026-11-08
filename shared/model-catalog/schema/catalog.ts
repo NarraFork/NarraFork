@@ -54,60 +54,21 @@ export interface RawCatalog {
 	models: RawModel[];
 	variants: RawVariant[];
 }
-export interface RawBinding {
-	id: string;
-	providerId?: string;
-	channelId?: string;
-	upstreamModelId: string;
-	modelId?: string;
-	variantId?: string;
-	overrides?: RawMetadata;
-}
-export interface RawOverride {
-	target: "model" | "variant" | "binding";
-	targetId: string;
-	metadata: RawMetadata;
-	source?: "user" | "legacy-local";
-}
-export interface RawLocalState {
-	revision: number;
-	/** Read-only migration provenance, keyed by target:id; edits clear only their own paths. */
-	legacyFields?: Record<string, string[]>;
-	models?: RawModel[];
-	variants?: RawVariant[];
-	bindings?: RawBinding[];
-	overrides?: RawOverride[];
-	/**
-	 * Overrides for one provider's entry, keyed by the full model value a provider list
-	 * shows (`provider:model`). They apply by that name, never assert an identity, and sit
-	 * above every other local layer: a per-provider decision beats a model-wide one.
-	 */
-	connections?: Record<string, RawMetadata>;
-	hiddenModelIds?: string[];
-	hiddenVariantIds?: string[];
-}
-export interface ModelQuery {
-	upstreamModelId: string;
-	providerKey?: string;
-	providerId?: string;
-	channelId?: string;
-	modelId?: string;
-	variantId?: string;
-}
 export type MetadataLayer =
 	| "default"
 	| "preset-model"
 	| "preset-variant"
 	| "discovered"
+	/** The user's model-wide override. */
 	| "local-model"
-	| "local-variant"
-	| "local-binding"
+	/** The user's override for one provider entry. */
 	| "local-connection";
 export interface FieldSource {
 	layer: MetadataLayer;
 	id?: string;
 	catalogVersion?: string;
 	explicit?: boolean;
+	/** From a catalog entry not yet verified against its vendor's documentation. */
 	legacy?: boolean;
 }
-export type MatchedVia = "binding" | "exact" | "alias" | "suffix" | "prefix" | "none";
+export type MatchedVia = "exact" | "alias" | "suffix" | "prefix" | "none";

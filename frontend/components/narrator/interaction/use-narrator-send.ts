@@ -97,6 +97,7 @@ interface NarratorLike {
 	relaxedPlan?: unknown;
 	planReflectionAutoApproveOverride?: unknown;
 	dangerReflectionOverride?: unknown;
+	questionReflectionOverride?: unknown;
 }
 
 export interface UseNarratorSendOptions {
@@ -887,6 +888,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					),
 					dangerReflectionOverride: normalizeDangerReflectionOverride(
 						fetchedNarrator?.dangerReflectionOverride ?? narrator?.dangerReflectionOverride,
+					),
+					questionReflectionOverride: normalizeBooleanOverride(
+						fetchedNarrator?.questionReflectionOverride ?? narrator?.questionReflectionOverride,
 					),
 					cwd: currentCwd,
 				});

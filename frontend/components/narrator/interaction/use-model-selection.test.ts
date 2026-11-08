@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { createModelCardResolver } from "@shared/model-catalog/card-resolver";
 import bundledCatalog from "@shared/model-catalog/dist/catalog.json";
-import type { RawCatalog } from "@shared/model-catalog/schema/catalog";
+import { type CatalogQuery, resolveModelCard } from "@shared/model-catalog/resolve";
+import type { RawCatalog, RawMetadata } from "@shared/model-catalog/schema/catalog";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { ModelOption } from "../../../lib/constants";
@@ -11,7 +11,9 @@ import {
 	useModelSelection,
 } from "./use-model-selection";
 
-const resolveCard = createModelCardResolver(bundledCatalog as RawCatalog);
+const catalog = bundledCatalog as RawCatalog;
+const resolveCard = (query: CatalogQuery, discovered?: RawMetadata) =>
+	resolveModelCard({ catalog, query, discovered });
 
 function select(
 	model = "deepseek-v4-pro",
@@ -129,16 +131,11 @@ describe("model-card reasoning selection", () => {
 		const query = { upstreamModelId: "deepseek-v4-pro" };
 		const modelId = resolveCard(query).modelId;
 		if (!modelId) throw new Error("Missing preset model");
-		const resolveLocal = createModelCardResolver(bundledCatalog as RawCatalog, {
-			revision: 1,
-			overrides: [
-				{
-					target: "model",
-					targetId: modelId,
-					metadata: { reasoning_effort_levels: ["low", "high", "max"] },
-				},
-			],
-		});
+		const modelOverrides = new Map([
+			[modelId, { reasoningLevels: ["low" as const, "high" as const, "max" as const] }],
+		]);
+		const resolveLocal = (q: CatalogQuery) =>
+			resolveModelCard({ catalog, query: q, modelOverrides });
 		expect(
 			select(undefined, {
 				modelCard: resolveLocal(query),

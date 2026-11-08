@@ -449,7 +449,9 @@ export const knowledgeApi = {
 	// ─── Author verdicts (notification bell) ───
 	/** Unread half of `/my-submission-outcomes`, so the badge needs one bounded query. */
 	getKnowledgeSubmissionOutcomesUnreadCount: () =>
-		request<KnowledgeSubmissionOutcomeUnreadCount>("/knowledge/my-submission-outcomes/unread-count"),
+		request<KnowledgeSubmissionOutcomeUnreadCount>(
+			"/knowledge/my-submission-outcomes/unread-count",
+		),
 	/** Acknowledge verdicts the author just opened. Server scopes to the caller's own rows. */
 	markKnowledgeSubmissionOutcomesRead: (ids: string[]) =>
 		request<{ updated: number }>("/knowledge/my-submission-outcomes/read", {

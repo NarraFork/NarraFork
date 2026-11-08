@@ -2,6 +2,8 @@ import { isOpencodeGoBaseUrl, parseOpencodeGoBaseUrl } from "@shared/opencode-go
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { createPersistedCredentialCache } from "./persisted-credential-cache";
+import { registerKeyQuotaProbe } from "./provider-key-quota";
+import { shownSubjectId, usageSubjects } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 /**
@@ -191,11 +193,9 @@ function identity(config: CustomApiProviderConfig): string {
 /** Reconcile on every read/refresh as well as settings writes. Old requests lose
  * their entry token, so even an abort-ignoring transport cannot publish a result. */
 export function syncOpencodeUsageCache(): void {
-	const providers = new Map(
-		(settings.customApiProviders ?? [])
-			.filter((p) => isOpencodeCustomApiProvider(p) && p.apiKey)
-			.map((p) => [p.id, p]),
-	);
+	// One entry per key (provider-key-subjects.ts); the identity below covers each key's
+	// own secret and proxy, so editing a key drops its numbers.
+	const providers = new Map(opencodeSubjects().map((s) => [s.id, s.config]));
 	for (const [id, entry] of entries) {
 		const config = providers.get(id);
 		if (!config || identity(config) !== entry.identity) {
@@ -382,10 +382,24 @@ async function fetchUsage(
 	}
 }
 
+const opencodeSubjects = () => usageSubjects(isOpencodeCustomApiProvider);
+
+/** The entry a provider-level view reports: its first usable key's. */
+function shownEntryId(providerId: string): string | undefined {
+	return shownSubjectId(opencodeSubjects(), providerId);
+}
+
+/** Refresh the usage a provider reports (its first usable key). */
 export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageCache | null> {
+	const id = shownEntryId(providerId);
+	return id ? refreshOpencodeKeyUsage(id) : Promise.resolve(null);
+}
+
+/** Refresh one key's usage. */
+export function refreshOpencodeKeyUsage(keyId: string): Promise<OpencodeUsageCache | null> {
 	syncOpencodeUsageCache();
-	const entry = entries.get(providerId);
-	const config = settings.customApiProviders?.find((p) => p.id === providerId);
+	const entry = entries.get(keyId);
+	const config = opencodeSubjects().find((s) => s.id === keyId)?.config;
 	if (!entry || !config) return Promise.resolve(null);
 	if (entry.inFlight) return entry.inFlight;
 	const snapshot = structuredClone(config);
@@ -402,7 +416,7 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 		try {
 			const payload = await Promise.race([fetchUsage(snapshot, controller), cancelled]);
 			syncOpencodeUsageCache();
-			if (entries.get(providerId) !== entry) return null;
+			if (entries.get(keyId) !== entry) return null;
 			entry.cache = {
 				...payload,
 				generation: entry.cache.generation,
@@ -410,10 +424,10 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 				error: null,
 			};
 			entry.failures = 0;
-			persistEntry(providerId, entry);
+			persistEntry(keyId, entry);
 		} catch {
 			syncOpencodeUsageCache();
-			if (entries.get(providerId) !== entry) return null;
+			if (entries.get(keyId) !== entry) return null;
 			// Never copy transport exceptions, response text, or credentials to logs/API.
 			// The last good numbers stay so the UI can show them as stale.
 			entry.cache = {
@@ -422,7 +436,7 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 				error: "OpenCode usage request failed",
 			};
 			entry.failures += 1;
-			persistEntry(providerId, entry);
+			persistEntry(keyId, entry);
 		} finally {
 			clearTimeout(timer);
 			entry.inFlight = undefined;
@@ -433,26 +447,44 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 	return entry.inFlight;
 }
 
-/** The cached allowance for one provider, or null when it is not a Go provider. */
+/** The allowance a provider reports (its first usable key), or null when it is not a Go provider. */
 export function getOpencodeCachedUsage(providerId: string): OpencodeUsageCache | null {
 	syncOpencodeUsageCache();
-	return entries.get(providerId)?.cache ?? null;
+	const id = shownEntryId(providerId);
+	return (id && entries.get(id)?.cache) || null;
 }
 
+/** Provider id → `pick(entry)` of the key it reports. */
+function byProvider<T>(pick: (entry: Entry) => T): Record<string, T> {
+	syncOpencodeUsageCache();
+	const result: Record<string, T> = {};
+	const subjects = opencodeSubjects();
+	for (const providerId of new Set(subjects.map((s) => s.providerId))) {
+		const entry = entries.get(shownSubjectId(subjects, providerId) ?? "");
+		if (entry) result[providerId] = pick(entry);
+	}
+	return result;
+}
+
+/** Provider id → the allowance it reports (status bar). */
 export function getAllOpencodeCachedUsages(): Record<string, OpencodeUsageCache> {
+	return byProvider((entry) => entry.cache);
+}
+
+/** Key id → its allowance (key list). */
+export function getOpencodeKeyUsages(): Record<string, OpencodeUsageCache> {
 	syncOpencodeUsageCache();
 	return Object.fromEntries([...entries].map(([id, entry]) => [id, entry.cache]));
 }
 
 /** Opaque, random runtime tokens only; never expose or derive them from credentials. */
 export function getOpencodeUsageGenerations(): Record<string, string> {
-	syncOpencodeUsageCache();
-	return Object.fromEntries([...entries].map(([id, entry]) => [id, entry.cache.generation]));
+	return byProvider((entry) => entry.cache.generation);
 }
 
 export async function refreshAllOpencodeUsages(): Promise<void> {
 	syncOpencodeUsageCache();
-	await Promise.allSettled([...entries.keys()].map(refreshOpencodeUsage));
+	await Promise.allSettled([...entries.keys()].map(refreshOpencodeKeyUsage));
 }
 
 /**
@@ -494,7 +526,7 @@ export async function refreshStaleOpencodeUsages(
 	await Promise.allSettled(
 		[...entries]
 			.filter(([, entry]) => isOpencodeUsageDue(entry, now, maxAgeMs))
-			.map(([id]) => refreshOpencodeUsage(id)),
+			.map(([id]) => refreshOpencodeKeyUsage(id)),
 	);
 }
 
@@ -515,20 +547,39 @@ export function noteOpencodeUsageActivity(providerRef: string): void {
 		);
 		if (!config || !isOpencodeCustomApiProvider(config) || !config.apiKey) return;
 		syncOpencodeUsageCache();
-		const entry = entries.get(config.id);
-		if (!entry || entry.activityTimer || entry.inFlight) return;
-		const elapsed = Date.now() - entry.cache.fetchedAt;
-		const delay = Math.max(0, OPENCODE_ACTIVITY_REFRESH_MIN_MS - elapsed);
-		const timer = setTimeout(() => {
-			if (entry.activityTimer === timer) entry.activityTimer = undefined;
-			if (entries.get(config.id) !== entry) return;
-			if (entry.failures > 0 && !isOpencodeUsageDue(entry, Date.now())) return;
-			void refreshOpencodeUsage(config.id).catch(() => {});
-		}, delay);
-		// Never keep the process alive for a cosmetic refresh.
-		(timer as { unref?: () => void }).unref?.();
-		entry.activityTimer = timer;
+		// The request may have gone out on any of the provider's keys.
+		for (const subject of opencodeSubjects()) {
+			if (subject.providerId !== config.id) continue;
+			const id = subject.id;
+			const entry = entries.get(id);
+			if (!entry || entry.activityTimer || entry.inFlight) continue;
+			const elapsed = Date.now() - entry.cache.fetchedAt;
+			const delay = Math.max(0, OPENCODE_ACTIVITY_REFRESH_MIN_MS - elapsed);
+			const timer = setTimeout(() => {
+				if (entry.activityTimer === timer) entry.activityTimer = undefined;
+				if (entries.get(id) !== entry) return;
+				if (entry.failures > 0 && !isOpencodeUsageDue(entry, Date.now())) return;
+				void refreshOpencodeKeyUsage(id).catch(() => {});
+			}, delay);
+			// Never keep the process alive for a cosmetic refresh.
+			(timer as { unref?: () => void }).unref?.();
+			entry.activityTimer = timer;
+		}
 	} catch {
 		// Display-only bookkeeping; the request that triggered it must not care.
 	}
 }
+
+// The key pool skips a key whose window this cache has seen used up, until it resets.
+registerKeyQuotaProbe((keyId, now) => {
+	const cache = entries.get(keyId)?.cache;
+	if (!cache) return undefined;
+	const until = [cache.rolling, cache.weekly, cache.monthly]
+		.map((window) => {
+			const usedUp = window?.status === "rate-limited" || (window?.percent ?? 0) >= 100;
+			const reset = window?.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
+			return usedUp && Number.isFinite(reset) && reset > now ? reset : undefined;
+		})
+		.filter((value): value is number => value !== undefined);
+	return until.length ? Math.max(...until) : undefined;
+});

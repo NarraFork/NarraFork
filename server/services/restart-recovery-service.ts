@@ -405,38 +405,51 @@ export async function prepareOrdinaryRestartRecovery(
 	const publication = getRuntimePublicationService();
 	const rows: typeof candidates = [];
 	for (const row of candidates) {
-		const result =
+		const run =
 			row.logicalRunId && row.deliverTo
-				? await publication.readAgentTerminalResult(
-						{
-							producerKind: "agent",
-							taskId: row.id,
-							logicalRunId: row.logicalRunId,
-							recipientId: row.deliverTo.narratorId,
-						},
-						{ includeEventKind: true },
-					)
+				? {
+						producerKind: "agent" as const,
+						taskId: row.id,
+						logicalRunId: row.logicalRunId,
+						recipientId: row.deliverTo.narratorId,
+					}
 				: null;
-		if (!result) {
+		const publicationState = run
+			? await publication.readRunPublicationState(run)
+			: { state: "none" as const };
+		if (publicationState.state !== "settled") {
 			// Idle rows entered this set only through the verified retained manifest.
 			if (restartEligible(row) || row.status === "idle") rows.push(row);
 			continue;
 		}
+		const result = run
+			? await publication.readAgentTerminalResult(run, { includeEventKind: true })
+			: null;
 		// A crash after the terminal transaction but before idle needs delivery only.
-		// The durable snapshot/intent is authoritative; never execute the model again.
+		// The durable terminal evidence is authoritative; never execute the model again,
+		// even when the result snapshot itself can no longer be read.
+		const eventKind = result?.eventKind ?? publicationState.eventKind;
 		await db
 			.update(narrators)
 			.set({
 				status: "idle",
 				substatus: JSON.stringify([
-					result.eventKind === "failed"
-						? "error"
-						: result.eventKind === "timed_out"
-							? "timeout"
-							: result.eventKind === "cancelled"
-								? "interrupted"
-								: "unread",
+					!eventKind
+						? "interrupted"
+						: eventKind === "failed"
+							? "error"
+							: eventKind === "timed_out"
+								? "timeout"
+								: eventKind === "cancelled"
+									? "interrupted"
+									: "unread",
 				]),
+				...(!result
+					? {
+							errorMessage:
+								"Run had already published its terminal result before restart; the stored result is no longer readable, so it was not rerun.",
+						}
+					: {}),
 			})
 			.where(and(eq(narrators.id, row.id), eq(narrators.logicalRunId, row.logicalRunId as string)));
 		publication.schedule();

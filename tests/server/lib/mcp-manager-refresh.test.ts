@@ -1,5 +1,6 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { eventBus } from "../../../server/lib/event-bus";
 
 /**
  * Unit tests for McpManager.refresh — the manual tool-list re-fetch that covers
@@ -12,6 +13,8 @@ type FakePage = { tools: FakeTool[]; nextCursor?: string };
 
 const state = {
 	beforeListTools: null as null | (() => Promise<void>),
+	beforeClose: null as null | (() => Promise<void>),
+	clients: [] as FakeClient[],
 	listToolsCalls: 0,
 	listToolsResult: { tools: [{ name: "tool-a" }] } as FakePage,
 	pages: null as Map<string | undefined, FakePage | Error> | null,
@@ -24,26 +27,26 @@ const state = {
 };
 
 class FakeClient {
+	onclose: (() => void) | undefined;
 	async connect(_transport: unknown): Promise<void> {
+		state.clients.push(this);
 		state.connectCalls++;
 	}
 	setNotificationHandler(_schema: unknown, handler: () => Promise<void>): void {
 		state.onToolsChanged = handler;
 	}
-	async listTools(params?: { cursor?: string }): Promise<FakePage> {
+	async request(request: { method: string; params?: { cursor?: string } }): Promise<FakePage> {
+		if (request.method !== "tools/list") throw new Error(`Unexpected request: ${request.method}`);
 		state.listToolsCalls++;
-		state.cursors.push(params?.cursor);
+		state.cursors.push(request.params?.cursor);
 		await state.beforeListTools?.();
 		if (state.listToolsFailuresRemaining > 0) {
 			state.listToolsFailuresRemaining--;
 			throw new Error(state.listToolsErrorMessage);
 		}
-		const page = state.pages?.get(params?.cursor) ?? state.listToolsResult;
+		const page = state.pages?.get(request.params?.cursor) ?? state.listToolsResult;
 		if (page instanceof Error) throw page;
 		return page;
-	}
-	async callTool(): Promise<{ content: [] }> {
-		return { content: [] };
 	}
 }
 
@@ -56,6 +59,7 @@ const settingsState: {
 		url?: string;
 		mode?: "disabled" | "auto" | "resident";
 		enabled: boolean;
+		defaultBehavior?: "ask" | "deny";
 	}>;
 } = {
 	mcpServers: [],
@@ -74,7 +78,9 @@ mock.module("../../../server/lib/mcp/transports", () => ({
 	...actualTransportsModule,
 	createTransport: () => ({
 		onclose: null as (() => void) | null,
-		close: async () => {},
+		close: async () => {
+			await state.beforeClose?.();
+		},
 	}),
 }));
 mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
@@ -93,6 +99,8 @@ const serverConfig = {
 
 beforeEach(() => {
 	state.beforeListTools = null;
+	state.beforeClose = null;
+	state.clients = [];
 	state.pages = null;
 	state.cursors = [];
 	state.onToolsChanged = null;
@@ -102,7 +110,7 @@ beforeEach(() => {
 	state.listToolsErrorMessage = "stale connection";
 	state.connectCalls = 0;
 	settingsState.mcpServers = [{ ...serverConfig }];
-	mcpManager.onToolsChanged = null;
+	mcpManager.prepareTools = null;
 });
 
 afterEach(async () => {
@@ -115,7 +123,365 @@ afterAll(() => {
 	mock.restore();
 });
 
+function deferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
 describe("McpManager.refresh", () => {
+	it("publishes all execution metadata before synchronous connected observers run", async () => {
+		settingsState.mcpServers.push({ ...serverConfig, id: "srv2", name: "other" });
+		const observed: string[][] = [];
+		const listener = () => {
+			observed.push(mcpManager.getAvailableTools().map((t) => t.serverId));
+		};
+		eventBus.on("mcp:server_connected", listener);
+		try {
+			await mcpManager.initialize();
+			expect(observed).toEqual([
+				["srv1", "srv2"],
+				["srv1", "srv2"],
+			]);
+		} finally {
+			eventBus.off("mcp:server_connected", listener);
+		}
+	});
+
+	it("does not drop a disconnect reentered from a synchronous connected observer", async () => {
+		settingsState.mcpServers.push({ ...serverConfig, id: "srv2", name: "other" });
+		const committed: string[][] = [];
+		mcpManager.prepareTools = async (tools) => () => {
+			committed.push(tools.map((t) => t.serverId));
+			return true;
+		};
+		let disconnecting: Promise<void> | undefined;
+		const listener = () => {
+			disconnecting ??= mcpManager.disconnect("srv2");
+		};
+		eventBus.on("mcp:server_connected", listener);
+		try {
+			await mcpManager.initialize();
+			await disconnecting;
+			expect(committed).toEqual([["srv1", "srv2"], ["srv1"]]);
+			expect(mcpManager.getAvailableTools().map((t) => t.serverId)).toEqual(["srv1"]);
+		} finally {
+			eventBus.off("mcp:server_connected", listener);
+			mcpManager.prepareTools = null;
+		}
+	});
+
+	it("installs the replacement lifecycle before awaiting the old transport close", async () => {
+		await mcpManager.connect(serverConfig);
+		const gate = deferred();
+		const ready = deferred();
+		state.beforeClose = async () => {
+			ready.resolve();
+			await gate.promise;
+		};
+		const replacing = mcpManager.connect(serverConfig);
+		expect(mcpManager.getServerStatuses()[0].status).toBe("connecting");
+		await ready.promise;
+		const disconnecting = mcpManager.disconnect("srv1");
+		gate.resolve();
+		await Promise.all([replacing, disconnecting]);
+		expect(state.connectCalls).toBe(1);
+		expect(mcpManager.isServerConnected("srv1")).toBe(false);
+	});
+
+	it("invalidates a pending publication immediately when the SDK client closes", async () => {
+		await mcpManager.connect(serverConfig);
+		const gate = deferred();
+		const ready = deferred();
+		let preparations = 0;
+		const committed: string[][] = [];
+		mcpManager.prepareTools = async (tools) => {
+			if (++preparations === 1) {
+				ready.resolve();
+				await gate.promise;
+			}
+			return () => {
+				committed.push(tools.map((t) => t.tool.name));
+				return true;
+			};
+		};
+		state.listToolsResult = { tools: [{ name: "stale" }] };
+		const work = mcpManager.refresh("srv1");
+		await ready.promise;
+		state.clients[0].onclose?.();
+		expect(mcpManager.isServerConnected("srv1")).toBe(false);
+		await expect(mcpManager.callTool("srv1", "tool-a", {})).rejects.toThrow("not connected");
+		gate.resolve();
+		expect((await work).ok).toBe(false);
+		expect(committed).toEqual([[]]);
+		mcpManager.prepareTools = null;
+	});
+
+	it("permission-only reload reprepares but does not reconnect or repeat discovery", async () => {
+		await mcpManager.connect(serverConfig);
+		const gate = deferred();
+		const ready = deferred();
+		let preparations = 0;
+		const committed: Array<string | undefined> = [];
+		mcpManager.prepareTools = async () => {
+			const permission = settingsState.mcpServers[0].defaultBehavior;
+			if (++preparations === 1) {
+				ready.resolve();
+				await gate.promise;
+			}
+			return () => {
+				committed.push(permission);
+				return true;
+			};
+		};
+		const refreshing = mcpManager.refresh("srv1");
+		await ready.promise;
+		settingsState.mcpServers[0].defaultBehavior = "deny";
+		const reloading = mcpManager.reload();
+		await new Promise((resolve) => setImmediate(resolve));
+		gate.resolve();
+		await Promise.all([refreshing, reloading]);
+		expect(committed).toEqual(["deny"]);
+		expect(preparations).toBe(2);
+		expect(state.connectCalls).toBe(1);
+		expect(state.listToolsCalls).toBe(2);
+		mcpManager.prepareTools = null;
+	});
+
+	it("retains reconnect backoff and stops after three failed retries", async () => {
+		const scheduled: Array<{ delay: number; run: () => Promise<void> }> = [];
+		const realSetTimeout = globalThis.setTimeout;
+		const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => Promise<void>,
+			delay: number,
+		) => {
+			if ([5000, 10000, 15000].includes(delay)) {
+				const timer = realSetTimeout(() => {}, 60000);
+				scheduled.push({
+					delay,
+					run: async () => {
+						clearTimeout(timer);
+						await fn();
+					},
+				});
+				return timer;
+			}
+			return realSetTimeout(fn, delay);
+		}) as typeof setTimeout);
+		try {
+			state.listToolsFailuresRemaining = 4;
+			await mcpManager.initialize();
+			for (let i = 0; i < 3; i++) {
+				expect(scheduled[i]?.delay).toBe((i + 1) * 5000);
+				await scheduled[i].run();
+			}
+			expect(scheduled).toHaveLength(3);
+			expect(state.connectCalls).toBe(4);
+			expect(mcpManager.getServerStatuses()[0].status).toBe("error");
+		} finally {
+			timerSpy.mockRestore();
+		}
+	});
+
+	it("shares concurrent manual discovery and publication, including async preparation", async () => {
+		await mcpManager.connect(serverConfig);
+		const gate = deferred();
+		const ready = deferred();
+		let preparations = 0;
+		let commits = 0;
+		mcpManager.prepareTools = async () => {
+			preparations++;
+			ready.resolve();
+			await gate.promise;
+			return () => {
+				commits++;
+				return true;
+			};
+		};
+		state.listToolsResult = { tools: [{ name: "new" }] };
+		const first = mcpManager.refresh("srv1");
+		await ready.promise;
+		const second = mcpManager.refresh("srv1");
+		expect(mcpManager.getAvailableTools().map((t) => t.tool.name)).toEqual(["tool-a"]);
+		gate.resolve();
+		expect((await Promise.all([first, second])).every((r) => r.ok)).toBe(true);
+		expect(state.listToolsCalls).toBe(2);
+		expect(preparations).toBe(1);
+		expect(commits).toBe(1);
+		expect(mcpManager.getAvailableTools().map((t) => t.tool.name)).toEqual(["new"]);
+	});
+
+	it("preserves old metadata when preparation fails and permits another refresh", async () => {
+		await mcpManager.connect(serverConfig);
+		state.listToolsResult = { tools: [{ name: "new" }] };
+		mcpManager.prepareTools = async () => {
+			throw new Error("prepare failed");
+		};
+		expect(await mcpManager.refresh("srv1")).toEqual({
+			ok: false,
+			toolCount: 1,
+			error: "prepare failed",
+		});
+		expect(mcpManager.getAvailableTools().map((t) => t.tool.name)).toEqual(["tool-a"]);
+		mcpManager.prepareTools = null;
+		expect((await mcpManager.refresh("srv1")).ok).toBe(true);
+	});
+
+	it("initializes and refreshes multiple servers with one preparation and commit each", async () => {
+		settingsState.mcpServers.push({ ...serverConfig, id: "srv2", name: "other" });
+		let preparations = 0;
+		let commits = 0;
+		mcpManager.prepareTools = async (tools) => {
+			preparations++;
+			expect(tools.map((t) => t.serverId)).toEqual(["srv1", "srv2"]);
+			return () => {
+				commits++;
+				return true;
+			};
+		};
+		await mcpManager.initialize();
+		expect(preparations).toBe(1);
+		expect(commits).toBe(1);
+		expect((await mcpManager.refreshAll()).every((r) => r.ok)).toBe(true);
+		expect(preparations).toBe(2);
+		expect(commits).toBe(2);
+		mcpManager.prepareTools = null;
+	});
+
+	it("coalesces notification bursts and retains notifications during the follow-up", async () => {
+		await mcpManager.connect(serverConfig);
+		const first = deferred();
+		const firstReady = deferred();
+		const second = deferred();
+		const secondReady = deferred();
+		let passes = 0;
+		state.beforeListTools = async () => {
+			passes++;
+			if (passes === 1) {
+				firstReady.resolve();
+				await first.promise;
+			}
+			if (passes === 2) {
+				secondReady.resolve();
+				await second.promise;
+			}
+		};
+		const work = state.onToolsChanged?.();
+		await firstReady.promise;
+		const burst = Array.from({ length: 20 }, () => state.onToolsChanged?.());
+		first.resolve();
+		await secondReady.promise;
+		const late = state.onToolsChanged?.();
+		second.resolve();
+		await Promise.all([work, late, ...burst]);
+		expect(passes).toBe(3);
+	});
+
+	it("a notification during a manual discovery forces exactly one follow-up", async () => {
+		await mcpManager.connect(serverConfig);
+		const gate = deferred();
+		const ready = deferred();
+		state.beforeListTools = async () => {
+			ready.resolve();
+			await gate.promise;
+		};
+		const refresh = mcpManager.refresh("srv1");
+		await ready.promise;
+		const notifications = Array.from({ length: 10 }, () => state.onToolsChanged?.());
+		gate.resolve();
+		await Promise.all([refresh, ...notifications]);
+		expect(state.listToolsCalls).toBe(3);
+	});
+
+	it("merges another server's candidate arriving during preparation without losing either", async () => {
+		const other = { ...serverConfig, id: "srv2", name: "other" };
+		settingsState.mcpServers.push(other);
+		await mcpManager.initialize();
+		const gate = deferred();
+		const ready = deferred();
+		const discovered = deferred();
+		const committed: string[][] = [];
+		let preparations = 0;
+		mcpManager.prepareTools = async (tools) => {
+			if (++preparations === 1) {
+				ready.resolve();
+				await gate.promise;
+			}
+			return () => {
+				committed.push(tools.map((t) => `${t.serverId}:${t.tool.name}`));
+				return true;
+			};
+		};
+		state.listToolsResult = { tools: [{ name: "first" }] };
+		const first = mcpManager.refresh("srv1");
+		await ready.promise;
+		state.listToolsResult = { tools: [{ name: "second" }] };
+		state.beforeListTools = async () => {
+			discovered.resolve();
+		};
+		const second = mcpManager.refresh("srv2");
+		await discovered.promise;
+		// Let discovery hand its candidate to the publication coordinator.
+		await new Promise((resolve) => setImmediate(resolve));
+		gate.resolve();
+		await Promise.all([first, second]);
+		expect(committed).toEqual([["srv1:first", "srv2:second"]]);
+		expect(preparations).toBe(2);
+		mcpManager.prepareTools = null;
+	});
+
+	for (const change of ["disconnect", "disable", "delete", "rename"] as const) {
+		it(`rejects stale preparation after ${change} and never commits its old candidate`, async () => {
+			await mcpManager.connect(serverConfig);
+			const gate = deferred();
+			const ready = deferred();
+			let preparations = 0;
+			const committed: string[][] = [];
+			mcpManager.prepareTools = async (tools) => {
+				if (++preparations === 1) {
+					ready.resolve();
+					await gate.promise;
+				}
+				return () => {
+					committed.push(tools.map((t) => `${t.serverName}:${t.tool.name}`));
+					return true;
+				};
+			};
+			state.listToolsResult = { tools: [{ name: "stale" }] };
+			const work = mcpManager.refresh("srv1");
+			await ready.promise;
+			if (change === "disable") settingsState.mcpServers[0].enabled = false;
+			if (change === "delete") settingsState.mcpServers = [];
+			if (change === "rename") settingsState.mcpServers[0].name = "renamed";
+			const updating =
+				change === "disconnect" ? mcpManager.disconnect("srv1") : mcpManager.reload();
+			expect(mcpManager.isServerConnected("srv1")).toBe(false);
+			if (change === "rename") await new Promise((resolve) => setImmediate(resolve));
+			gate.resolve();
+			expect((await work).ok).toBe(false);
+			await updating;
+			expect(committed.flat()).not.toContain("jetbrains:stale");
+			if (change === "rename") expect(committed.at(-1)).toEqual(["renamed:stale"]);
+			else expect(committed.at(-1)).toEqual([]);
+			mcpManager.prepareTools = null;
+		});
+	}
+
+	it("reprepares on registry conflict without repeating discovery", async () => {
+		await mcpManager.connect(serverConfig);
+		let attempts = 0;
+		mcpManager.prepareTools = async () => {
+			const attempt = ++attempts;
+			return () => attempt > 1;
+		};
+		expect((await mcpManager.refresh("srv1")).ok).toBe(true);
+		expect(attempts).toBe(2);
+		expect(state.listToolsCalls).toBe(2);
+		mcpManager.prepareTools = null;
+	});
+
 	it("initializes auto/resident and skips disabled even with stale legacy flags", async () => {
 		settingsState.mcpServers = [
 			{ ...serverConfig, id: "auto", mode: "auto", enabled: false },
@@ -145,8 +511,9 @@ describe("McpManager.refresh", () => {
 		// Upstream swaps the tool set without emitting tools/list_changed.
 		state.listToolsResult = { tools: [{ name: "tool-b" }, { name: "tool-c" }] };
 		let toolsChanged = 0;
-		mcpManager.onToolsChanged = () => {
+		mcpManager.prepareTools = async () => () => {
 			toolsChanged++;
+			return true;
 		};
 
 		const result = await mcpManager.refresh("srv1");
@@ -209,8 +576,9 @@ describe("McpManager.refresh", () => {
 			"third",
 		]);
 		let updates = 0;
-		mcpManager.onToolsChanged = () => {
+		mcpManager.prepareTools = async () => () => {
 			updates++;
+			return true;
 		};
 		state.pages.set("third", { tools: [{ name: "replacement" }] });
 		await state.onToolsChanged?.();

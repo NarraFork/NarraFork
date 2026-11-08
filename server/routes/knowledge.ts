@@ -672,7 +672,9 @@ knowledgeRoutes.get("/my-submission-outcomes/unread-count", async (c) =>
 knowledgeRoutes.post("/my-submission-outcomes/read", async (c) => {
 	const parsed = markSubmissionOutcomesReadSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeBranchService.markSubmissionOutcomesRead(principalOf(c), parsed.data));
+	return c.json(
+		await knowledgeBranchService.markSubmissionOutcomesRead(principalOf(c), parsed.data),
+	);
 });
 
 // ─── Bulk grants + collection ACL readback (admin only) ─────────────────

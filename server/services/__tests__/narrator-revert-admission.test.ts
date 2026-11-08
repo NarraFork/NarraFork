@@ -548,19 +548,25 @@ for (const recovery of [false, true])
 				const call = history
 					.flatMap((message) => message.toolCalls ?? [])
 					.find((item) => item.toolUseId === row.toolUseId);
-				expect(call?.outputJson).toMatchObject({
-					_text: "recovered audio",
-					_metadata: { source: "recovery-test" },
-					_media: [
-						ref ??
-							expect.objectContaining({
-								type: "audio",
-								mediaType: "audio/wav",
-								filename: "recovered.wav",
-								uploadNarratorId: ROOT,
-							}),
-					],
-				});
+				// Bun's toMatchObject rewrites nested arrays containing asymmetric matchers.
+				// History output belongs to the source cache; assertions must not mutate it.
+				const outputBeforeAssertion = JSON.stringify(call?.outputJson);
+				expect(call?.outputJson).toEqual(
+					expect.objectContaining({
+						_text: "recovered audio",
+						_metadata: { source: "recovery-test" },
+						_media: [
+							ref ??
+								expect.objectContaining({
+									type: "audio",
+									mediaType: "audio/wav",
+									filename: "recovered.wav",
+									uploadNarratorId: ROOT,
+								}),
+						],
+					}),
+				);
+				expect(JSON.stringify(call?.outputJson)).toBe(outputBeforeAssertion);
 				expect(await resolveNativeMediaBlocks(toolMediaBlocks(call?.outputJson), ROOT)).toEqual([
 					expect.objectContaining({
 						type: "audio",

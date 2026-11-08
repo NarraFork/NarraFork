@@ -38,13 +38,16 @@ export async function runRevealProtocolClient(argv: string[]): Promise<void> {
 		},
 	);
 	if (!response.ok) throw new Error(`Reveal token rejected (${response.status})`);
-	const { path } = (await response.json()) as { path: string };
+	const { path, selectFile } = (await response.json()) as { path: string; selectFile: boolean };
 
 	// Launched by the foreground browser, this process may set the foreground — but the Explorer
 	// window is created by the shell's own process, so pass the right on before launching it.
 	win32.AllowSetForegroundWindow(ASFW_ANY);
 	await new Promise<void>((resolve, reject) => {
-		const child = spawn("explorer", [path], { detached: true, stdio: "ignore" });
+		const child = spawn("explorer", selectFile ? ["/select,", path] : [path], {
+			detached: true,
+			stdio: "ignore",
+		});
 		child.once("error", reject);
 		child.once("spawn", () => {
 			child.unref();
