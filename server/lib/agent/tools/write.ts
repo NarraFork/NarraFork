@@ -32,7 +32,7 @@ import {
 } from "./encoding";
 import { lineStatsMetadata, wholeFileLineStats } from "./file-diff-stats";
 import { consumeTaskReflectionGrant } from "./task-reflection";
-import { trackFileChange } from "./track-file-change";
+import { trackFileChange, withOverlapHint } from "./track-file-change";
 
 /**
  * A spec file's current content, or null when it does not exist yet.
@@ -196,8 +196,10 @@ export const writeTool: ToolDefinition = {
 				},
 			});
 			if (recorded) {
-				await trackFileChange(ctx, ioPath, "write", backend, null, { evidenceRecorded: true });
-				return recorded;
+				const hint = await trackFileChange(ctx, ioPath, "write", backend, null, {
+					evidenceRecorded: true,
+				});
+				return withOverlapHint(recorded, hint);
 			}
 			flow.declined();
 			const queuePath = canonicalPath ?? (await backend.resolvePathIdentity(ioPath)).canonicalPath;
@@ -287,7 +289,7 @@ export const writeTool: ToolDefinition = {
 				{ signal: ctx.signal },
 			).then(async (result) => {
 				const { linesAdded, linesRemoved } = result.metadata ?? {};
-				await trackFileChange(
+				const hint = await trackFileChange(
 					ctx,
 					ioPath,
 					"write",
@@ -296,7 +298,7 @@ export const writeTool: ToolDefinition = {
 						? { added: linesAdded, removed: linesRemoved }
 						: null,
 				);
-				return result;
+				return withOverlapHint(result, hint);
 			});
 		} catch (err) {
 			if (err instanceof FileNoDispatchEvidenceError) throw err;
