@@ -666,6 +666,7 @@
 	"outlineDigestTimeDefault": "Empty: {{time}}",
 	"gitIdentitiesDisplayContextMenu": "When right-clicking a session",
 	"gitIdentitiesDisplayCreateModal": "When creating a session",
+	"gitIdentitiesDisplayFolderContextMenu": "When right-clicking a folder",
 	"gitIdentityAdd": "Add identity",
 	"gitIdentityDefaultBadge": "Default",
 	"gitIdentitySetDefault": "Set as default",

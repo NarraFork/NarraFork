@@ -14,9 +14,16 @@
  */
 
 import { db } from "@server/db";
-import { narratorGitIdentityBindings, userGitIdentities, users } from "@server/db/schema";
+import {
+	folderGitIdentityBindings,
+	narratorGitIdentityBindings,
+	userGitIdentities,
+	userRecentTabs,
+	users,
+} from "@server/db/schema";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import {
+	invalidateFolderGitIdentityPickCache,
 	invalidateGitIdentityCache,
 	invalidateNarratorGitIdentityPickCache,
 	normalizeGitIdentPart,
@@ -331,4 +338,74 @@ export async function setNarratorGitIdentityPick(
 			set: { identityId, updatedAt },
 		});
 	invalidateNarratorGitIdentityPickCache(narratorId, userId);
+}
+
+/** Which of this user's identities commits inside one sidebar folder use, or null for none. */
+export async function getFolderGitIdentityPick(
+	userId: string,
+	folderId: string,
+): Promise<string | null> {
+	const row = await db
+		.select({ identityId: folderGitIdentityBindings.identityId })
+		.from(folderGitIdentityBindings)
+		.where(
+			and(
+				eq(folderGitIdentityBindings.folderId, folderId),
+				eq(folderGitIdentityBindings.userId, userId),
+			),
+		)
+		.limit(1);
+	return row[0]?.identityId ?? null;
+}
+
+/**
+ * Set (or clear, with null) this user's pick for one of their sidebar folders.
+ *
+ * Only the caller's own folders and identities are accepted: a folder id is looked up in
+ * their own `user_recent_tabs`, so another user's layout cannot be bound or probed.
+ */
+export async function setFolderGitIdentityPick(
+	userId: string,
+	folderId: string,
+	identityId: string | null,
+): Promise<void> {
+	const folder = await db
+		.select({ id: userRecentTabs.id })
+		.from(userRecentTabs)
+		.where(
+			and(
+				eq(userRecentTabs.userId, userId),
+				eq(userRecentTabs.type, "folder"),
+				eq(userRecentTabs.entityId, folderId),
+			),
+		)
+		.limit(1);
+	if (folder.length === 0) throw new NotFoundError("Sidebar folder", folderId);
+	if (identityId === null) {
+		await db
+			.delete(folderGitIdentityBindings)
+			.where(
+				and(
+					eq(folderGitIdentityBindings.folderId, folderId),
+					eq(folderGitIdentityBindings.userId, userId),
+				),
+			);
+		invalidateFolderGitIdentityPickCache(folderId, userId);
+		return;
+	}
+	const owned = await db
+		.select({ id: userGitIdentities.id })
+		.from(userGitIdentities)
+		.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
+		.limit(1);
+	if (owned.length === 0) throw new NotFoundError("Git identity", identityId);
+	const updatedAt = nowIso();
+	await db
+		.insert(folderGitIdentityBindings)
+		.values({ id: generateId(), folderId, userId, identityId, updatedAt })
+		.onConflictDoUpdate({
+			target: [folderGitIdentityBindings.folderId, folderGitIdentityBindings.userId],
+			set: { identityId, updatedAt },
+		});
+	invalidateFolderGitIdentityPickCache(folderId, userId);
 }

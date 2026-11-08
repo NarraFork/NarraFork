@@ -10,6 +10,7 @@ import type {
 	RecentTabsRuntimeResult,
 	RecentTabsSection,
 } from "@shared/recent-tabs";
+import type { GitIdentity } from "./auth";
 import {
 	ApiError,
 	apiBase,
@@ -391,6 +392,8 @@ export const settingsApi = {
 			/** 提交身份入口的显示位置：会话右键菜单 / 新建会话弹窗（跟账号走）。 */
 			gitIdentityContextMenu: boolean;
 			gitIdentityCreateModal: boolean;
+			/** 侧栏文件夹右键菜单里的身份入口。 */
+			gitIdentityFolderContextMenu: boolean;
 			/** The outline's daily report (P2 PR 11): IANA zone and `HH:MM`; null is the default. */
 			outlineDigestTimeZone: string | null;
 			outlineDigestTime: string | null;
@@ -465,6 +468,7 @@ export const settingsApi = {
 		};
 		gitIdentityContextMenu?: boolean;
 		gitIdentityCreateModal?: boolean;
+		gitIdentityFolderContextMenu?: boolean;
 		/** Null goes back to the default (the server's zone, 07:00). */
 		outlineDigestTimeZone?: string | null;
 		outlineDigestTime?: string | null;
@@ -473,6 +477,19 @@ export const settingsApi = {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
+
+	// === Sidebar folder git identity pick ===
+	// Which of MY identities commits inside one of MY sidebar folders. The server looks the
+	// folder up in the caller's own recent tabs, so this cannot reach another user's layout.
+	getFolderGitIdentity: (folderId: string) =>
+		request<{ identities: GitIdentity[]; selectedId: string | null }>(
+			`/user-preferences/git-identity/folders/${encodeURIComponent(folderId)}`,
+		),
+	setFolderGitIdentity: (folderId: string, identityId: string | null) =>
+		request<{ ok: boolean }>(
+			`/user-preferences/git-identity/folders/${encodeURIComponent(folderId)}`,
+			{ method: "PUT", body: JSON.stringify({ identityId }) },
+		),
 
 	// Recent Tabs
 	getRecentTabsPage: async (

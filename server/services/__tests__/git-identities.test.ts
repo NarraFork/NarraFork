@@ -9,8 +9,9 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narrators, userGitIdentities, users } from "../../db/schema";
+import { narrators, userGitIdentities, userRecentTabs, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 
 const { db, sqlite } = getTestDb();
@@ -19,8 +20,10 @@ mock.module("../../db", () => ({ db, sqlite }));
 const {
 	createUserGitIdentity,
 	deleteUserGitIdentity,
+	getFolderGitIdentityPick,
 	getNarratorGitIdentityPick,
 	listUserGitIdentities,
+	setFolderGitIdentityPick,
 	setNarratorGitIdentityPick,
 	updateUserGitIdentity,
 } = await import("../git-identities");
@@ -487,5 +490,155 @@ describe("resolution order", () => {
 			name: "Alice",
 			email: "a@e.com",
 		});
+	});
+});
+
+/** A sidebar folder row: `entityId` is what members point at through `folderId`. */
+async function makeFolder(userId: string, order = 0): Promise<string> {
+	const folderId = generateId();
+	const now = new Date().toISOString();
+	await db.insert(userRecentTabs).values({
+		id: generateId(),
+		userId,
+		tabKey: `folder:${folderId}`,
+		section: "work",
+		type: "folder",
+		entityId: folderId,
+		title: "Work",
+		lastVisitedAt: Date.now(),
+		sortOrder: order,
+		createdAt: now,
+		updatedAt: now,
+	});
+	return folderId;
+}
+
+async function putNarratorInFolder(
+	userId: string,
+	folderId: string,
+	narrator: string,
+	order = 1,
+): Promise<void> {
+	const now = new Date().toISOString();
+	await db.insert(userRecentTabs).values({
+		id: generateId(),
+		userId,
+		tabKey: `narrator:${narrator}:${folderId}`,
+		section: "work",
+		type: "narrator",
+		entityId: narrator,
+		representedNarratorId: narrator,
+		folderId,
+		title: "Session",
+		lastVisitedAt: Date.now(),
+		sortOrder: order,
+		createdAt: now,
+		updatedAt: now,
+	});
+}
+
+describe("folder inheritance", () => {
+	test("a session with no pick of its own inherits its folder's pick", async () => {
+		const identity = await createUserGitIdentity(alice, { name: "Alice", email: "a@e.com" });
+		const work = await createUserGitIdentity(alice, { name: "Alice (work)", email: "aw@e.com" });
+		await updateUserGitIdentity(alice, identity.id, { isDefault: true });
+		const folderId = await makeFolder(alice);
+		await putNarratorInFolder(alice, folderId, narratorId);
+		await setFolderGitIdentityPick(alice, folderId, work.id);
+
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice (work)",
+			email: "aw@e.com",
+		});
+	});
+
+	test("the session's own pick still wins over its folder", async () => {
+		const main = await createUserGitIdentity(alice, { name: "Alice", email: "a@e.com" });
+		const work = await createUserGitIdentity(alice, { name: "Alice (work)", email: "aw@e.com" });
+		const own = await createUserGitIdentity(alice, { name: "Alice (oss)", email: "ao@e.com" });
+		await updateUserGitIdentity(alice, main.id, { isDefault: true });
+		const folderId = await makeFolder(alice);
+		await putNarratorInFolder(alice, folderId, narratorId);
+		await setFolderGitIdentityPick(alice, folderId, work.id);
+		await setNarratorGitIdentityPick(alice, narratorId, own.id);
+
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice (oss)",
+			email: "ao@e.com",
+		});
+	});
+
+	test("a session outside any folder falls straight back to the default", async () => {
+		const identity = await createUserGitIdentity(alice, { name: "Alice", email: "a@e.com" });
+		await updateUserGitIdentity(alice, identity.id, { isDefault: true });
+		// A folder pick exists for a folder this session is not in.
+		const folderId = await makeFolder(alice);
+		const work = await createUserGitIdentity(alice, { name: "Alice (work)", email: "aw@e.com" });
+		await setFolderGitIdentityPick(alice, folderId, work.id);
+
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice",
+			email: "a@e.com",
+		});
+	});
+
+	test("clearing the folder pick falls back to the default", async () => {
+		const identity = await createUserGitIdentity(alice, { name: "Alice", email: "a@e.com" });
+		const work = await createUserGitIdentity(alice, { name: "Alice (work)", email: "aw@e.com" });
+		await updateUserGitIdentity(alice, identity.id, { isDefault: true });
+		const folderId = await makeFolder(alice);
+		await putNarratorInFolder(alice, folderId, narratorId);
+		await setFolderGitIdentityPick(alice, folderId, work.id);
+		await setFolderGitIdentityPick(alice, folderId, null);
+
+		expect(await getFolderGitIdentityPick(alice, folderId)).toBeNull();
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice",
+			email: "a@e.com",
+		});
+	});
+
+	test("moving the session to another folder takes the other folder's pick", async () => {
+		const identity = await createUserGitIdentity(alice, { name: "Alice", email: "a@e.com" });
+		const work = await createUserGitIdentity(alice, { name: "Alice (work)", email: "aw@e.com" });
+		const oss = await createUserGitIdentity(alice, { name: "Alice (oss)", email: "ao@e.com" });
+		await updateUserGitIdentity(alice, identity.id, { isDefault: true });
+		const first = await makeFolder(alice, 0);
+		const second = await makeFolder(alice, 2);
+		await putNarratorInFolder(alice, first, narratorId, 1);
+		await setFolderGitIdentityPick(alice, first, work.id);
+		await setFolderGitIdentityPick(alice, second, oss.id);
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice (work)",
+			email: "aw@e.com",
+		});
+
+		// Move the session into the second folder and drop the layout memo.
+		await db
+			.delete(userRecentTabs)
+			.where(eq(userRecentTabs.tabKey, `narrator:${narratorId}:${first}`));
+		await putNarratorInFolder(alice, second, narratorId, 3);
+		invalidateGitIdentityCache(alice);
+
+		expect(await resolveGitIdentityForTurn(narratorId, alice)).toEqual({
+			name: "Alice (oss)",
+			email: "ao@e.com",
+		});
+	});
+
+	test("another user's folder cannot be bound or read", async () => {
+		const bobs = await createUserGitIdentity(bob, { name: "Bob", email: "b@e.com" });
+		const bobsFolder = await makeFolder(bob);
+
+		await expect(setFolderGitIdentityPick(alice, bobsFolder, bobs.id)).rejects.toThrow();
+		expect(await getFolderGitIdentityPick(alice, bobsFolder)).toBeNull();
+	});
+
+	test("another user's identity cannot be bound to my folder", async () => {
+		const bobs = await createUserGitIdentity(bob, { name: "Bob", email: "b@e.com" });
+		const myFolder = await makeFolder(alice);
+
+		await expect(setFolderGitIdentityPick(alice, myFolder, bobs.id)).rejects.toThrow();
+		expect(await getFolderGitIdentityPick(alice, myFolder)).toBeNull();
 	});
 });

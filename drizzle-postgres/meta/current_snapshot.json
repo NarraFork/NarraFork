@@ -1,6 +1,6 @@
 {
-  "id": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
-  "prevId": "1a1b92df-c79f-493f-972f-b5da55789ccd",
+  "id": "e18da153-05a6-4a89-9257-feb31c3df896",
+  "prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -5447,6 +5447,113 @@
       },
       "indexes": {},
       "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.folder_git_identity_bindings": {
+      "name": "folder_git_identity_bindings",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "folder_id": {
+          "name": "folder_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "identity_id": {
+          "name": "identity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_folder_git_identity_unique": {
+          "name": "idx_folder_git_identity_unique",
+          "columns": [
+            {
+              "expression": "folder_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_folder_git_identity_user": {
+          "name": "idx_folder_git_identity_user",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "folder_git_identity_bindings_user_id_users_id_fk": {
+          "name": "folder_git_identity_bindings_user_id_users_id_fk",
+          "tableFrom": "folder_git_identity_bindings",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk": {
+          "name": "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk",
+          "tableFrom": "folder_git_identity_bindings",
+          "tableTo": "user_git_identities",
+          "columnsFrom": [
+            "identity_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
@@ -24482,6 +24589,13 @@
         },
         "git_identity_create_modal": {
           "name": "git_identity_create_modal",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "git_identity_folder_context_menu": {
+          "name": "git_identity_folder_context_menu",
           "type": "boolean",
           "primaryKey": false,
           "notNull": true,

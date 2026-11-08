@@ -2383,6 +2383,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	gitIdentityCreateModal: integer("git_identity_create_modal", { mode: "boolean" })
 		.notNull()
 		.default(false),
+	/** 侧栏文件夹右键菜单里的身份入口；与上面两个开关互相独立。 */
+	gitIdentityFolderContextMenu: integer("git_identity_folder_context_menu", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	/**
 	 * 大纲标签排布，按叙述者记录：`{ [narratorId]: { order: string[], pinned: string[] } }`。
 	 * order = 普通文档的展示序，pinned = 置顶文档的展示序；内置的
@@ -2643,6 +2647,35 @@ export const userRecentTabs = sqliteTable(
 		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
+	],
+);
+
+// === folder_git_identity_bindings ===
+// Per (user × sidebar folder) choice of identity. A narrator with no pick of its own
+// inherits the folder it sits in before falling back to the user's default, so organising
+// sessions into folders is also how a person says "work commits as X".
+//
+// `folderId` is the folder's `user_recent_tabs.entity_id` (see `folder_id` above), not that
+// row's primary key, so it carries no foreign key: the sidebar service validates ownership
+// and a binding whose folder no longer exists is simply ignored. Deleting a folder is a
+// layout change and must not silently rewrite anyone's commit identity.
+export const folderGitIdentityBindings = sqliteTable(
+	"folder_git_identity_bindings",
+	{
+		id: text("id").primaryKey(),
+		folderId: text("folder_id").notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** The picked identity, which must belong to the same `userId` (enforced by the service). */
+		identityId: text("identity_id")
+			.notNull()
+			.references(() => userGitIdentities.id, { onDelete: "cascade" }),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_folder_git_identity_unique").on(table.folderId, table.userId),
+		index("idx_folder_git_identity_user").on(table.userId),
 	],
 );
 

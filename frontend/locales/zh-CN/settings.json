@@ -666,6 +666,7 @@
 	"outlineDigestTimeDefault": "留空为 {{time}}",
 	"gitIdentitiesDisplayContextMenu": "右键会话时",
 	"gitIdentitiesDisplayCreateModal": "新建会话时",
+	"gitIdentitiesDisplayFolderContextMenu": "右键文件夹时",
 	"gitIdentityAdd": "添加身份",
 	"gitIdentityDefaultBadge": "默认",
 	"gitIdentitySetDefault": "设为默认",

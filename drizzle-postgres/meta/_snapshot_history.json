@@ -480,6 +480,14 @@
 			"prevId": "1a1b92df-c79f-493f-972f-b5da55789ccd",
 			"version": "7",
 			"snapshotDigest": "e2635f635c17f1f6f6742876063b58c9ac3734a9d0a99cf5a6437896cc49e6be"
+		},
+		{
+			"idx": 60,
+			"tag": "0060_folder-git-identity-bindings",
+			"id": "e18da153-05a6-4a89-9257-feb31c3df896",
+			"prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
+			"version": "7",
+			"snapshotDigest": "8813a1cfc361a01bf853590f5297773095251f5e02c444c457ae2d43f8343b5c"
 		}
 	]
 }

@@ -157,6 +157,7 @@ function menuProps(overrides: Partial<TabContextMenuProps> = {}): TabContextMenu
 		folder: null,
 		onLeaveFolder: null,
 		gitIdentityNarratorId: null,
+		gitIdentityFolderId: null,
 		t: (key: string) => key,
 		...overrides,
 	};

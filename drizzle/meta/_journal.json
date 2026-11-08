@@ -1702,6 +1702,13 @@
       "when": 1794042972342,
       "tag": "0242_flimsy_terrax",
       "breakpoints": true
+    },
+    {
+      "idx": 243,
+      "version": "6",
+      "when": 1794123820924,
+      "tag": "0243_curious_silver_fox",
+      "breakpoints": true
     }
   ]
 }
