@@ -357,13 +357,13 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 			await ctx.finishedRun(p.a, p.t.iso(10 * 60_000));
 			await write(
 				p.space.id,
-				agent(p.b, p.alice.id),
-				[{ op: "setTask", block: { id: p.refresh.blockId }, task: { status: "todo" } }],
+				agent(p.c, p.alice.id),
+				[{ op: "insert", parent: { id: p.root.blockId }, content: "C 的笔记" }],
 				new Date(p.t.base + 20 * 60_000),
 			);
 			const look = await readOutlineTeamActivity(p.a, { locale: "en", now: p.t.look });
 			expect(look?.content.split("\n").slice(1)).toEqual([
-				`- Under ${link(p.root, "auth 模块稳定")}: session "B" reopened ${link(p.refresh, "改刷新逻辑")}`,
+				`- Under ${link(p.root, "auth 模块稳定")}: session "C" added 1 note`,
 			]);
 			// A session that never ran looks back two hours at most: the seed (90 minutes before the
 			// base, two and a half hours before the look) is not in it, and neither is anything else.
