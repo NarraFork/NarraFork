@@ -61,6 +61,7 @@ import {
 	DIRECTORY_BROWSER_ROOT_STYLE,
 } from "./directory-browser-modal";
 import { PathInput } from "./PathInput";
+import { useDirectoryTypeahead } from "./useDirectoryTypeahead";
 
 const MAX_DIRECTORY_ENTRIES = 1_000;
 const FS_SHORTCUTS_QUERY_GC_TIME_MS = 60_000;
@@ -560,8 +561,28 @@ export function DirectoryBrowser({
 		[onSelect, mode, navigateTo],
 	);
 
+	// Rows are plain buttons, so the browser itself is the keyboard surface: arrows
+	// move the highlight and typing jumps it to the first directory starting with what
+	// was typed. Enter means the same thing as a double click on that row.
+	const typeahead = useDirectoryTypeahead({
+		names: displayedEntries.map((entry) => entry.name),
+		onActivate: (index) => {
+			const entry = displayedEntries[index];
+			if (entry) handleEntryDoubleClick(entry.path);
+		},
+		resetKey: data?.path,
+	});
+
 	return (
-		<Stack gap={0} style={DIRECTORY_BROWSER_ROOT_STYLE}>
+		<Stack
+			gap={0}
+			style={DIRECTORY_BROWSER_ROOT_STYLE}
+			ref={typeahead.containerRef}
+			onKeyDown={typeahead.onKeyDown}
+			role="group"
+			aria-label={t("directoryList")}
+			tabIndex={0}
+		>
 			{/* ── Toolbar ── */}
 			<Group gap={4} px="sm" py={6} wrap="nowrap">
 				<Tooltip label={t("homeDirectory")} openDelay={400}>
@@ -803,11 +824,12 @@ export function DirectoryBrowser({
 									</>
 								)}
 								{/* Subdirectories */}
-								{displayedEntries.map((entry) => {
+								{displayedEntries.map((entry, index) => {
 									// Symlinked directories are navigable like any other, but the
 									// distinction matters when picking a path to persist: the link
 									// can later be repointed or removed.
 									const EntryIcon = entry.isSymlink ? IconFolderSymlink : IconFolder;
+									const active = index === typeahead.cursorIndex;
 									return (
 										<UnstyledButton
 											key={entry.path}
@@ -816,7 +838,12 @@ export function DirectoryBrowser({
 											px="sm"
 											py={5}
 											className="dir-entry"
-											style={{ borderRadius: 0 }}
+											data-dir-index={index}
+											data-cursor={active ? "true" : undefined}
+											style={{
+												borderRadius: 0,
+												background: active ? "var(--mantine-color-default-hover)" : undefined,
+											}}
 											title={entry.isSymlink ? t("symlinkDirectory") : undefined}
 										>
 											<Group gap="xs" wrap="nowrap">

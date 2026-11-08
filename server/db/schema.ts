@@ -449,6 +449,19 @@ export const narrators = sqliteTable(
 		workspaceContext: text("workspace_context", { mode: "json" }).$type<
 			import("@shared/workspace-context").WorkspaceContext
 		>(),
+		/**
+		 * Per-execution-device working directories (`deviceId → { cwd, pathFlavor }`).
+		 *
+		 * `cwd` and `defaultDeviceId` above keep meaning "the currently effective
+		 * directory / device". This map is what a device switch restores from, and
+		 * the only thing the UI consults to decide whether a device still needs its
+		 * directory entered. Existing rows start empty and are backfilled lazily the
+		 * first time the current device's directory is written — no data migration.
+		 */
+		workspaceDirectories: text("workspace_directories", { mode: "json" })
+			.$type<import("@shared/workspace-directories").WorkspaceDirectoryMap>()
+			.notNull()
+			.default({}),
 		errorMessage: text("error_message"),
 		/**
 		 * Whether the last failure is worth retrying, when the provider diagnostics said so.

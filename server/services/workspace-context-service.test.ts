@@ -57,6 +57,8 @@ mock.module("../lib/i18n", () => ({
 	getUserLanguage: async () => "en",
 }));
 const { executionPolicyEngine } = await import("./execution-policy/engine");
+const { localBackend, setRemoteBackendResolver } = await import("../lib/agent/execution/registry");
+const { windowsPathSemantics } = await import("../lib/agent/execution/path-semantics");
 const { activeNarrators, pendingPermissions, reserveNarratorRevertAdmission } = await import(
 	"./narrator-session-state"
 );
@@ -396,7 +398,7 @@ describe("local authoritative workspace context", () => {
 		expect(events).toEqual([]);
 		expect(displayMessages).toEqual([]);
 	});
-	test("unselected cwd does not enable switching specialized or remote narrators", async () => {
+	test("unselected cwd does not enable switching specialized narrators or unreachable devices", async () => {
 		row.cwd = null;
 		for (const variant of ["subagent:general", "knowledge"]) {
 			row.variant = variant;
@@ -411,10 +413,32 @@ describe("local authoritative workspace context", () => {
 		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
 		row.traits = [];
 		row.defaultDeviceId = "offline-remote";
-		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
+		// A device that cannot be resolved is never a switch target: only the device
+		// itself can validate the path, so nothing may be committed for it.
+		await expect(
+			workspaceContextService.switch(
+				"narrator",
+				{
+					expectedRevision: 0,
+					requestId: "offline",
+					target: { deviceId: "offline-remote", cwd: "/remote" },
+				},
+				{ origin: "http" },
+			),
+		).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
 		expect(row.cwd).toBeNull();
 		expect(row.workspaceRevision).toBe(0);
 		expect(row.workspaceContext).toBeNull();
+		// …but a session parked on an unreachable device can always come back to local.
+		const recovered = await change();
+		expect(recovered.changed).toBe(true);
+		expect(recovered.current.deviceId).toBe("local");
+		expect(recovered.current.cwd).toBe(join(root, "new"));
+		expect(row.cwd).toBe(join(root, "new"));
+		expect(row.defaultDeviceId).toBeNull();
+		expect(row.workspaceDirectories).toEqual({
+			local: { cwd: join(root, "new"), pathFlavor: "posix" },
+		});
 	});
 	test("concurrent unselected cwd recovery has a single winner", async () => {
 		row.cwd = null;
@@ -508,5 +532,149 @@ describe("local authoritative workspace context", () => {
 		expect(context.revision).toBe(3);
 		expect(context.git).toBeUndefined();
 		expect(context.contextKey.length).toBe(64);
+	});
+});
+
+describe("per-device workspace directories", () => {
+	const remote = "remote-win";
+	const remoteBackend = () =>
+		Object.assign(Object.create(localBackend), {
+			kind: "remote" as const,
+			deviceId: remote,
+			defaultCwd: "C:\\device-default",
+			pathFlavor: "windows" as const,
+			paths: windowsPathSemantics,
+			statFile: async (path: string) => {
+				const isDirectory = path === "C:\\work" || path === "C:\\other";
+				return { isDirectory, isFile: !isDirectory, size: 0 };
+			},
+		});
+	beforeEach(() => {
+		setRemoteBackendResolver((deviceId) => (deviceId === remote ? remoteBackend() : null));
+	});
+	afterEach(() => setRemoteBackendResolver(null));
+
+	test("a device switch uses the device's recorded directory, not its default", async () => {
+		row.workspaceDirectories = { [remote]: { cwd: "C:\\work", pathFlavor: "windows" } };
+		const result = await workspaceContextService.switchDevice("narrator", remote, {
+			origin: "http",
+		});
+		expect(result.current).toMatchObject({
+			deviceId: remote,
+			cwd: "C:\\work",
+			pathFlavor: "windows",
+			capabilities: { switchDirectory: true },
+		});
+		expect(row.cwd).toBe("C:\\work");
+		expect(row.defaultDeviceId).toBe(remote);
+		// The directory the session leaves is backfilled, so the switch is reversible
+		// even though this row never recorded a `local` entry.
+		expect(row.workspaceDirectories).toEqual({
+			local: { cwd: join(root, "old"), pathFlavor: "posix" },
+			[remote]: { cwd: "C:\\work", pathFlavor: "windows" },
+		});
+		expect(await workspaceContextService.get("narrator")).toMatchObject({
+			deviceId: remote,
+			cwd: "C:\\work",
+		});
+	});
+
+	test("a device with no recorded directory is refused without committing anything", async () => {
+		await expect(
+			workspaceContextService.switchDevice("narrator", remote, { origin: "http" }),
+		).rejects.toMatchObject({
+			statusCode: 409,
+			code: "WORKSPACE_DIRECTORY_REQUIRED",
+			details: { deviceId: remote },
+		});
+		expect(row.workspaceRevision).toBe(0);
+		expect(row.defaultDeviceId).toBeNull();
+		expect(row.cwd).toBe(join(root, "old"));
+		expect(events).toEqual([]);
+	});
+
+	test("switching a directory inside one device records it and keeps the other devices", async () => {
+		row.workspaceDirectories = {
+			local: { cwd: join(root, "old"), pathFlavor: "posix" },
+			[remote]: { cwd: "C:\\work", pathFlavor: "windows" },
+		};
+		const first = await workspaceContextService.switch(
+			"narrator",
+			{ expectedRevision: 0, requestId: "one", target: { deviceId: remote, cwd: "C:\\work" } },
+			{ origin: "http" },
+		);
+		expect(first.current).toMatchObject({ deviceId: remote, cwd: "C:\\work" });
+		expect(row.defaultDeviceId).toBe(remote);
+		const moved = await workspaceContextService.switch(
+			"narrator",
+			{ expectedRevision: 1, requestId: "two", target: { deviceId: remote, cwd: "C:\\other" } },
+			{ origin: "http" },
+		);
+		expect(moved.current.cwd).toBe("C:\\other");
+		expect(row.cwd).toBe("C:\\other");
+		expect(row.workspaceDirectories).toEqual({
+			local: { cwd: join(root, "old"), pathFlavor: "posix" },
+			[remote]: { cwd: "C:\\other", pathFlavor: "windows" },
+		});
+	});
+
+	test("a remote Windows path is validated with Windows rules, never as a relative POSIX path", async () => {
+		const relative = await workspaceContextService
+			.switch(
+				"narrator",
+				{ expectedRevision: 0, requestId: "rel", target: { deviceId: remote, cwd: "work" } },
+				{ origin: "http" },
+			)
+			.catch((error: unknown) => error);
+		expect(relative).toMatchObject({ statusCode: 400 });
+		const missing = await workspaceContextService
+			.switch(
+				"narrator",
+				{
+					expectedRevision: 0,
+					requestId: "missing",
+					target: { deviceId: remote, cwd: "C:\\nope" },
+				},
+				{ origin: "http" },
+			)
+			.catch((error: unknown) => error);
+		expect(missing).toMatchObject({ statusCode: 400 });
+		expect(row.workspaceRevision).toBe(0);
+	});
+
+	test("local and remote round trips restore each device's own directory", async () => {
+		row.workspaceDirectories = {
+			local: { cwd: join(root, "new"), pathFlavor: "posix" },
+			[remote]: { cwd: "C:\\work", pathFlavor: "windows" },
+		};
+		const there = await workspaceContextService.switchDevice("narrator", remote, {
+			origin: "http",
+		});
+		expect(there.current).toMatchObject({ deviceId: remote, cwd: "C:\\work" });
+		const back = await workspaceContextService.switchDevice("narrator", null, { origin: "http" });
+		expect(back.current).toMatchObject({ deviceId: "local", cwd: join(root, "new") });
+		expect(row.defaultDeviceId).toBeNull();
+		expect(row.workspaceDirectories).toEqual({
+			local: { cwd: join(root, "new"), pathFlavor: "posix" },
+			[remote]: { cwd: "C:\\work", pathFlavor: "windows" },
+		});
+	});
+
+	test("an unreachable device fails closed and never falls back to the local directory", async () => {
+		row.workspaceDirectories = { offline: { cwd: "C:\\work", pathFlavor: "windows" } };
+		row.defaultDeviceId = "offline";
+		const context = await workspaceContextService.getForDirectorySwitch("narrator");
+		expect(context).toMatchObject({
+			deviceId: "offline",
+			cwd: "C:\\work",
+			pathFlavor: "windows",
+			capabilities: { switchDirectory: false },
+		});
+		await expect(
+			workspaceContextService.switchDevice("narrator", "offline", { origin: "http" }),
+		).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
+		expect(row.cwd).toBe(join(root, "old"));
+		expect(row.defaultDeviceId).toBe("offline");
+		expect(row.workspaceRevision).toBe(0);
 	});
 });

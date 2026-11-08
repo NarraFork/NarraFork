@@ -42,6 +42,7 @@ const {
 	useWorkspaceContext,
 	workspaceContextKey,
 	useUpdateExecutionDevice,
+	workspaceDirectoryRequiredDeviceId,
 	workspaceFileTarget,
 } = await import("./useWorkspaceContext");
 const { FileTreePanel } = await import("../components/narrator/file-tree/FileTreePanel");
@@ -127,6 +128,26 @@ afterAll(() => {
 		if (value) Object.defineProperty(globalThis, key, value);
 		else Reflect.deleteProperty(globalThis, key);
 	}
+});
+test("a refused switch reports which device still needs a directory", () => {
+	// What the device picker needs to turn the server's 409 into the directory dialog
+	// instead of a red toast — and to know WHICH device to ask about.
+	expect(
+		workspaceDirectoryRequiredDeviceId({
+			data: { code: "WORKSPACE_DIRECTORY_REQUIRED", details: { deviceId: "box-a" } },
+		}),
+	).toBe("box-a");
+	// Unrelated failures and payloads from older servers must not open a dialog.
+	expect(
+		workspaceDirectoryRequiredDeviceId({ data: { code: "WORKSPACE_CONTEXT_BUSY" } }),
+	).toBeNull();
+	expect(
+		workspaceDirectoryRequiredDeviceId({
+			data: { code: "WORKSPACE_DIRECTORY_REQUIRED" },
+		}),
+	).toBeNull();
+	expect(workspaceDirectoryRequiredDeviceId(new Error("boom"))).toBeNull();
+	expect(workspaceDirectoryRequiredDeviceId(null)).toBeNull();
 });
 test("an older revision can never undo a completed switch", () => {
 	expect(latestWorkspaceContext(next, old)).toBe(next);

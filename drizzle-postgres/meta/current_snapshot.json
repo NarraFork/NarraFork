@@ -1,6 +1,6 @@
 {
-  "id": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
-  "prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
+  "id": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+  "prevId": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -15027,6 +15027,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "workspace_directories": {
+          "name": "workspace_directories",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::text"
         },
         "error_message": {
           "name": "error_message",

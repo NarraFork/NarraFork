@@ -117,6 +117,8 @@ mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) 
 mock.module("@tanstack/react-query", () => ({
 	useQuery: () => ({ data: { paths: { defaultProjectDir: "/instance" }, agent: {} } }),
 	useQueryClient: () => ({ invalidateQueries }),
+	// The dialog's device list lives next to the workspace-context mutations.
+	useMutation: () => ({ mutate: mock(() => {}), reset: mock(() => {}), isPending: false }),
 }));
 mock.module("../../hooks/useModels", () => ({ useAllModels: () => ({ groupedModels: [] }) }));
 mock.module("../../hooks/useProjectDirStatus", () => ({
@@ -163,6 +165,9 @@ mock.module("../../hooks/useGitIdentities", () => ({
 }));
 mock.module("../../lib/api", () => ({
 	api: { getSettings: mock(() => {}), setNarratorGitIdentity },
+	// The modal reads the device list through the workspace-context hook, which pulls in
+	// the narrator socket manager; that module needs the session accessor at import time.
+	getToken: () => null,
 }));
 mock.module("../common/DirectoryPicker", () => ({ DirectoryPicker: box }));
 

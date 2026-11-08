@@ -50,6 +50,7 @@ function options(): UseHeaderToolbarOptions {
 		toggleTerminalTool: mock(() => {}),
 		toggleSpecTool: mock(() => {}),
 		updateExecutionDeviceMutation: { mutate: mock(() => {}) },
+		onRequireDeviceDirectory: () => {},
 		renderLod: 4,
 		renderLodIsDefault: true,
 		handleSelectLod: mock(() => {}),
