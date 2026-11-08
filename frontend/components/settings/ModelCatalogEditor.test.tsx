@@ -244,7 +244,12 @@ async function render(
 			</I18nextProvider>,
 		);
 	});
-	await waitFor(() => !!document.querySelector('[data-catalog-field="working_context_tokens"]'));
+	await waitFor(
+		() =>
+			!!document.querySelector(
+				'[data-catalog-field="working_context_tokens"], [data-catalog-field="protocol"]',
+			),
+	);
 }
 
 describe("real catalog editor form", () => {
@@ -293,7 +298,7 @@ describe("real catalog editor form", () => {
 			},
 		});
 	});
-	test("binding 只保留协议编辑，不再写连接标识与模型资料", async () => {
+	test("new bindings keep an exact selected variant and opaque connection scope", async () => {
 		await render(false, {
 			kind: "binding",
 			id: "connection-a",
@@ -305,10 +310,49 @@ describe("real catalog editor form", () => {
 				channelId: "channel-a",
 			},
 		});
-		// 连接标识与资料那六个输入框已经从入口移除，只剩协议与一句说明。
-		expect(document.body.textContent).toContain("edits the protocol only");
 		await click(button("Save"));
 		await waitFor(() => closed === 1);
+		expect(mutations[0]).toEqual({
+			baseRevision: 7,
+			action: "upsert-binding",
+			binding: {
+				id: "connection-a",
+				upstreamModelId: "opaque:model:unchanged",
+				providerId: "provider-a",
+				channelId: "channel-a",
+				variantId: "selected-variant",
+				overrides: {},
+			},
+		});
+	});
+	test("new protocol-only bindings save only the protocol without discarded metadata controls", async () => {
+		const saved: Array<CustomApiProtocol | null> = [];
+		await render(
+			false,
+			{
+				kind: "binding",
+				id: "",
+				isNew: true,
+				card: resolved,
+				query: { upstreamModelId: "opaque:model:unchanged", providerId: "provider-a" },
+			},
+			{
+				modelValue: "CommandCode:demo-model",
+				value: "completions-compatible",
+				inheritedValue: "openai-responses",
+				onSave: async (protocol) => {
+					saved.push(protocol);
+				},
+			},
+		);
+		expect(document.body.textContent).toContain("edits the protocol only");
+		expect(document.body.textContent).not.toContain("Stable ID");
+		expect(document.body.textContent).not.toContain("Local provider ID");
+		expect(document.querySelector('[data-catalog-field="working_context_tokens"]')).toBeNull();
+		await click(button("Inherit"));
+		await click(button("Save"));
+		await waitFor(() => closed === 1);
+		expect(saved).toEqual([null]);
 		expect(mutations).toEqual([]);
 	});
 	test("blanking a price is invalid, not a free price or an inherited value", async () => {
@@ -416,6 +460,8 @@ describe("real catalog editor form", () => {
 		);
 		const text = () => document.body.textContent ?? "";
 		expect(text()).toContain("Protocol");
+		expect(text()).toContain("Only edited fields are saved");
+		expect(text()).not.toContain("edits the protocol only");
 		expect(text()).toContain("CommandCode:demo-model");
 		// 本层有覆盖：有效值取本层，来源标为 Override（与「能力」字段同一套说法）。
 		expect(text()).toContain("Legacy Completions Compatible");
@@ -428,7 +474,8 @@ describe("real catalog editor form", () => {
 		// 渲染本身不落库：协议只在点「保存」时经调用方写出。
 		expect(saved).toEqual([]);
 
-		// 「恢复继承」清掉本层覆盖 → 有效值回到 provider 层写的协议，保存时写出 null。
+		// 已有 binding 同时保存元数据补丁与协议，不因协议入口而丢弃 catalog 编辑。
+		await click(button("Unknown", field("working_context_tokens")));
 		await click(button("Inherit"));
 		expect(text()).toContain("OpenAI Responses");
 		expect(text()).toContain("Provider setting");
@@ -436,8 +483,17 @@ describe("real catalog editor form", () => {
 			(document.querySelector('input[aria-label="Model protocol"]') as HTMLInputElement).value,
 		).toBe("Use default");
 		await click(button("Save"));
-		await waitFor(() => saved.length === 1);
-		expect(saved[0]).toBeNull();
+		await waitFor(() => closed === 1);
+		expect(saved).toEqual([null]);
+		expect(mutations).toEqual([
+			{
+				baseRevision: 7,
+				action: "patch",
+				target: "binding",
+				targetId: "binding-1",
+				patch: { set: { working_context_tokens: null } },
+			},
+		]);
 	});
 
 	test("omits the protocol field when the caller does not provide one", async () => {

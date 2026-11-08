@@ -243,14 +243,14 @@ export function ModelCatalogEditor({
 	const [modelId, setModelId] = useState(target.modelId ?? target.card?.modelId ?? "");
 	const [variantId, setVariantId] = useState(target.variantId ?? target.card?.variantId ?? "");
 	const [providerKey, setProviderKey] = useState(target.query?.providerKey ?? "");
-	// 「编辑此连接覆盖」只剩协议：连接范围与上游标识的输入框已注释，这两个 setter 暂时没有入口。
-	const [providerId, _setProviderId] = useState(target.query?.providerId ?? "");
-	const [channelId, _setChannelId] = useState(target.query?.channelId ?? "");
+	const [providerId, setProviderId] = useState(target.query?.providerId ?? "");
+	const [channelId, setChannelId] = useState(target.query?.channelId ?? "");
 	const [upstream, setUpstream] = useState(target.query?.upstreamModelId ?? "");
 	const [protocolDraft, setProtocolDraft] = useState<CustomApiProtocol | null>(
 		protocol?.value ?? null,
 	);
 	const protocolChanged = !!protocol && protocolDraft !== (protocol.value ?? null);
+	const protocolOnly = target.kind === "binding" && target.isNew === true && !!protocol;
 	/** 最终生效的协议：本层覆盖优先，其次继承 provider 层。 */
 	const effectiveProtocol = protocolDraft ?? protocol?.inheritedValue ?? null;
 	const [validationError, setValidationError] = useState("");
@@ -278,9 +278,7 @@ export function ModelCatalogEditor({
 		try {
 			// 协议不属于 catalog 快照，先单独落库；它没有 revision 冲突语义。
 			if (protocol && protocolChanged) await protocol.onSave(protocolDraft);
-			// 「编辑此连接覆盖」现在只保留协议：连接标识与模型资料不再从入口编辑，
-			// 也就不再需要 id/upstream 那些校验。
-			if (target.kind === "binding") {
+			if (protocolOnly) {
 				onClose();
 				return;
 			}
@@ -368,7 +366,7 @@ export function ModelCatalogEditor({
 				{target.kind === "model" && !target.isNew && (
 					<Alert>{t("catalog.affects", { count: affected })}</Alert>
 				)}
-				{target.isNew && target.kind !== "binding" ? (
+				{target.isNew && !protocolOnly ? (
 					<Stack gap="xs">
 						<TextInput
 							label={t("catalog.id")}
@@ -377,12 +375,14 @@ export function ModelCatalogEditor({
 							required
 							disabled={readOnly}
 						/>
-						<TextInput
-							label={t("catalog.name")}
-							value={name}
-							onChange={(e) => setName(e.currentTarget.value)}
-							disabled={readOnly}
-						/>
+						{target.kind !== "binding" && (
+							<TextInput
+								label={t("catalog.name")}
+								value={name}
+								onChange={(e) => setName(e.currentTarget.value)}
+								disabled={readOnly}
+							/>
+						)}
 						{target.kind !== "model" && (
 							<Select
 								label={t("catalog.model")}
@@ -398,7 +398,6 @@ export function ModelCatalogEditor({
 								disabled={readOnly}
 							/>
 						)}
-						{/*
 						{target.kind === "binding" && (
 							<Select
 								label={t("catalog.variant")}
@@ -413,7 +412,6 @@ export function ModelCatalogEditor({
 								disabled={readOnly}
 							/>
 						)}
-						*/}
 						{target.kind === "variant" && (
 							<TextInput
 								label={t("catalog.providerKey")}
@@ -432,7 +430,6 @@ export function ModelCatalogEditor({
 								disabled={readOnly}
 							/>
 						)}
-						{/*
 						{target.kind === "binding" && (
 							<>
 								<TextInput
@@ -449,11 +446,10 @@ export function ModelCatalogEditor({
 								/>
 							</>
 						)}
-						*/}
 					</Stack>
 				) : (
 					<Text size="sm" c="dimmed">
-						{target.kind === "binding" ? t("catalog.protocolOnlyHint") : t("catalog.patchHint")}
+						{protocolOnly ? t("catalog.protocolOnlyHint") : t("catalog.patchHint")}
 					</Text>
 				)}
 				{protocol && (
@@ -516,12 +512,14 @@ export function ModelCatalogEditor({
 				{target.kind === "model" && !target.isNew && (
 					<ProviderWindowOverrides modelId={target.id} />
 				)}
-				<CatalogMetadataFields
-					card={target.card}
-					edits={edits}
-					onChange={setEdits}
-					readOnly={readOnly || mutation.isPending || conflict}
-				/>
+				{!protocolOnly && (
+					<CatalogMetadataFields
+						card={target.card}
+						edits={edits}
+						onChange={setEdits}
+						readOnly={readOnly || mutation.isPending || conflict}
+					/>
+				)}
 				{/* Read-only complete card next to the editable fields: attributes without a
 				    control stay visible but cannot be edited here. */}
 				{card.data && (
