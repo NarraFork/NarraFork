@@ -26,7 +26,7 @@ import {
 	type ToolSectionBody,
 } from "@shared/pretext-layout/tool-detail";
 import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
-import { buildCacheKey, extractDataRevision } from "../measure-cache";
+import { buildCacheKey, extractDataRevision, retainedBodySourceChars } from "../measure-cache";
 import { typographyMetrics } from "../pretext-fonts";
 import { rowInteractionSig } from "../vlist-exact-row-state";
 import {
@@ -285,6 +285,38 @@ describe("opening", () => {
 		expect(all.toolbar).toBe(true);
 	});
 
+	test("a text flip that no longer clamps (a wider card) does not keep the toolbar", () => {
+		const md = serializeMarkdownOutline([
+			step("Title", [item("Background."), step(`Phase ${"长".repeat(110)}`)]),
+		]);
+		const t = parsePlanTree(md) as PlanTree;
+		const flipped = view({ kind: "text", key: "r.1" });
+		// Narrow: the point clamps, the toolbar shows; whole after the flip, 「全部收起」 is offered.
+		const narrow = layoutPlanTree(t, flipped, 200);
+		expect(narrow.rows[2]?.textToggles).toBe(true);
+		expect([narrow.toolbar, narrow.allOpen]).toEqual([true, true]);
+		// Wide: nothing clamps any more; the flip alone keeps no toolbar.
+		const wide = layoutPlanTree(t, flipped, 4000);
+		expect(wide.rows[2]?.textToggles).toBe(false);
+		expect(wide.toolbar).toBe(false);
+	});
+
+	test("everything opened one by one: nothing hidden, so the toolbar offers 「全部收起」", () => {
+		const opened = view(
+			{ kind: "text", key: "r" },
+			{ kind: "subtree", key: "r.1.0", open: true },
+			{ kind: "subtree", key: "r.1.1", open: true },
+			{ kind: "subtree", key: "r.2.0", open: true },
+		);
+		const layout = layoutPlanTree(planTree(), opened, 600);
+		expect(layout.rows.some((r) => r.preview || r.clamped)).toBe(false);
+		expect(layout.allOpen).toBe(true);
+		// What it then does: the default view (the action says which way).
+		expect(applyPlanTreeAction(opened, { kind: "all", open: false })).toEqual(
+			DEFAULT_PLAN_TREE_VIEW,
+		);
+	});
+
 	test("nothing folded or clamped and nothing opened: no toolbar", () => {
 		const flat = parsePlanTree(
 			serializeMarkdownOutline([
@@ -334,6 +366,10 @@ describe("in the card", () => {
 		expect(all.height).toBe(
 			planTreeToolbarHeight() + PLAN_TREE_TOOLBAR_GAP + resolveDetailCap("plan", 200),
 		);
+	});
+
+	test("the measured body counts the plan's text against the cache's source budget", () => {
+		expect(retainedBodySourceChars(measureToolBody(body(), 612, 900))).toBe(PLAN.length);
 	});
 
 	test("the detail's labels are the preview's", () => {

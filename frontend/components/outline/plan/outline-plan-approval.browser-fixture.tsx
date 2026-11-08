@@ -49,7 +49,11 @@ export function ready(): boolean {
 	return true;
 }
 
-/** The panel's keyboard navigation of the waiting request (no composer text). */
+/**
+ * The panel's keyboard navigation of the waiting request (no composer text), and a stand-in for
+ * the composer: an empty textarea whose Enter it hands over as the real one does (its own
+ * handler prevents the newline; the panel's shortcut then decides).
+ */
 function KeyboardHost({
 	permission,
 	children,
@@ -57,7 +61,11 @@ function KeyboardHost({
 	permission: PendingPermission;
 	children: ReactNode;
 }) {
-	const composerRef = useRef<NarratorComposerHandle | null>(null);
+	const textarea = useRef<HTMLTextAreaElement | null>(null);
+	const composerRef = useRef<NarratorComposerHandle | null>({
+		ownsTextarea: (el: unknown) => el === textarea.current,
+		isTextEmpty: () => !textarea.current?.value,
+	} as unknown as NarratorComposerHandle);
 	const { permEnterHintCtxValue } = usePermissionFocusNav({
 		pendingPermissionId: permission.id,
 		pendingPermissionToolName: permission.toolName,
@@ -65,7 +73,17 @@ function KeyboardHost({
 		composerRef,
 	});
 	return (
-		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>{children}</PermEnterHintCtx.Provider>
+		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
+			{children}
+			<textarea
+				ref={textarea}
+				data-testid="composer"
+				aria-label="composer"
+				onKeyDown={(e) => {
+					if (e.key === "Enter" && !e.shiftKey && !e.currentTarget.value) e.preventDefault();
+				}}
+			/>
+		</PermEnterHintCtx.Provider>
 	);
 }
 

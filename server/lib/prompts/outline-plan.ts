@@ -46,7 +46,7 @@ function structureRules(locale: Locale): string {
 	return zh(locale)
 		? `计划按固定格式写。审批人同时跟着很多任务，对这个项目只是大概了解：列表里只看到标题，打开后先读背景，再顺着大点往下看；实施细节默认只显示一行，要看才展开。
    - 计划根：一行短标题（不超过 ${rootChars} 字），说清是哪件事。
-   - 根下第一块：背景。一段话（不超过 ${backgroundChars} 字），不是任务，下面不挂子块。让审批人想起这是在做什么、为什么做、做到哪一步，并能顺着它读懂后面的计划；简明精准，不写实施细节。
+   - 根下第一块：背景。一段话（不超过 ${backgroundChars} 字），不是任务，下面不挂子块（根下已有块时，用 OutlineEdit add 的 before 插到最前面）。让审批人想起这是在做什么、为什么做、做到哪一步，并能顺着它读懂后面的计划；简明精准，不写实施细节。
    - 接着是大点（阶段或工作方向），每个大点下面是小点（具体任务），都写成复选框任务（\`[ ]\`），前置用 \`depends::\`。大点、小点各只写一个要点（不超过 ${pointChars} 字）。验收可以作为一个大点，也可以写进背景。
    - 小点下面是实施细节：改哪里、怎么改、怎么验证，每条一个子块（不超过 ${detailChars} 字），更细的挂在它下面。
    - 根下最后一块：「${NOTABLE_POINTS_TITLE["zh-CN"]}」，下面每条一个子块：风险、不可逆的操作、需要审批人特别看一眼的地方。确实没有才省略这一块。
@@ -67,7 +67,7 @@ function structureRules(locale: Locale): string {
    不符合格式的计划，ExitPlanMode 会拒收并指出要改的块。`
 		: `Write the plan in a fixed format. The approver tracks many tasks at once and knows this project only roughly: a list shows them the title, the plan opens on the background, and they follow the big points down from there; implementation details show one line until opened.
    - The plan root: a short one-line title (at most ${rootChars} characters) naming the work.
-   - The root's first block: the background. One paragraph (at most ${backgroundChars} characters), not a task, with nothing under it. It brings back what this work is, why, and where it stands, so the approver can follow it into the plan; concise and precise, no implementation details.
+   - The root's first block: the background. One paragraph (at most ${backgroundChars} characters), not a task, with nothing under it (when the root has blocks already, OutlineEdit add with before puts it first). It brings back what this work is, why, and where it stands, so the approver can follow it into the plan; concise and precise, no implementation details.
    - Then the big points (phases or workstreams), each with its small points (concrete tasks) under it, as checkbox tasks (\`[ ]\`) with \`depends::\` for prerequisites. A big or small point is one idea (at most ${pointChars} characters). The acceptance can be a big point of its own or part of the background.
    - Under a small point, its implementation details: where, how, how it is checked, one child block each (at most ${detailChars} characters), finer ones under them.
    - The root's last block: "${NOTABLE_POINTS_TITLE.en}", one child block per item: risks, irreversible steps, what the approver should look at. Leave it out only when there is truly nothing.
@@ -160,7 +160,7 @@ export function getOutlinePlanEnterOutput(
 				: how === "resumed"
 					? "已进入计划模式，接着改本会话还没批准的计划"
 					: "已进入计划模式，重新规划这棵任务树";
-		return `${lead}：\`${root.address}\`（「${root.title}」）。根只写一行标题；用 OutlineEdit 在它下面按计划格式写：第一块是背景（一段话），然后是大点、小点（复选框任务）和小点下的实施细节，最后一块是「${NOTABLE_POINTS_TITLE["zh-CN"]}」。写完调用 ExitPlanMode，\`mode: "outline"\`。`;
+		return `${lead}：\`${root.address}\`（「${root.title}」）。根只写一行标题；用 OutlineEdit 在它下面按计划格式写：第一块是背景（一段话；根下已有块时用 add 的 before 插到最前面），然后是大点、小点（复选框任务）和小点下的实施细节，最后一块是「${NOTABLE_POINTS_TITLE["zh-CN"]}」。写完调用 ExitPlanMode，\`mode: "outline"\`。`;
 	}
 	const lead =
 		how === "created"
@@ -168,7 +168,7 @@ export function getOutlinePlanEnterOutput(
 			: how === "resumed"
 				? "Entered plan mode; continuing this session's plan that is not approved yet"
 				: "Entered plan mode; re-planning this task tree";
-	return `${lead}: \`${root.address}\` ("${root.title}"). Keep the root a one-line title; under it, write the plan in its format with OutlineEdit: the background paragraph first, then the big and small points (checkbox tasks) with the implementation details under the small points, and "${NOTABLE_POINTS_TITLE.en}" last. Then call ExitPlanMode with \`mode: "outline"\`.`;
+	return `${lead}: \`${root.address}\` ("${root.title}"). Keep the root a one-line title; under it, write the plan in its format with OutlineEdit: the background paragraph first (add with before when the root has blocks already), then the big and small points (checkbox tasks) with the implementation details under the small points, and "${NOTABLE_POINTS_TITLE.en}" last. Then call ExitPlanMode with \`mode: "outline"\`.`;
 }
 
 /** The reminder a tool call in relaxed planning gets: where the plan goes. */
@@ -199,7 +199,9 @@ export type OutlinePlanStructureProblem =
 	| { kind: "background"; address: string; problem: PlanBackgroundProblem }
 	| { kind: "long"; address: string; chars: number; role: PlanBlockRole }
 	| { kind: "flat"; address: string; children: number }
-	| { kind: "notable"; address: string };
+	| { kind: "notable"; address: string }
+	| { kind: "notableEmpty"; address: string }
+	| { kind: "noPoints"; address: string };
 
 function structureProblemLine(locale: Locale, problem: OutlinePlanStructureProblem): string {
 	const { rootChars, backgroundChars, pointChars, detailChars, maxChildren } =
@@ -212,17 +214,17 @@ function structureProblemLine(locale: Locale, problem: OutlinePlanStructureProbl
 			case "background":
 				switch (problem.problem) {
 					case "none":
-						return `- ${at}（计划根）下面还没有背景：在根下最前面插入一块，用一段话（不超过 ${backgroundChars} 字）交代背景。`;
+						return `- ${at}（计划根）下面还没有背景：用 OutlineEdit 在根下加一块（add 指向计划根），用一段话（不超过 ${backgroundChars} 字）交代背景。`;
 					case "task":
-						return `- ${at} 是根下第一块，但它是任务：根下第一块必须是背景——一段不带复选框的话（不超过 ${backgroundChars} 字）。在它前面插入背景。`;
+						return `- ${at} 是根下第一块，但它是任务：根下第一块必须是背景——一段不带复选框的话（不超过 ${backgroundChars} 字）。在它前面插入背景：OutlineEdit 的 add 指向计划根，带 before: "${problem.address}"。`;
 					case "heading":
 						return `- ${at} 是根下第一块，但它是标题：背景直接写成一段话（不超过 ${backgroundChars} 字），不用标题。`;
 					case "notProse":
-						return `- ${at} 是根下第一块，但它是代码块、表格或嵌入：背景要写成一段话（不超过 ${backgroundChars} 字）。在它前面插入背景。`;
+						return `- ${at} 是根下第一块，但它是代码块、表格或嵌入：背景要写成一段话（不超过 ${backgroundChars} 字）。在它前面插入背景：OutlineEdit 的 add 指向计划根，带 before: "${problem.address}"。`;
 					case "empty":
 						return `- ${at} 是根下第一块，但它是空的：在里面用一段话（不超过 ${backgroundChars} 字）写背景。`;
 					case "children":
-						return `- ${at} 是根下第一块，但它下面挂着子块：背景只是一段话，不挂子块。在它前面插入背景，或把背景写成一段话、子块移到后面的大点里。`;
+						return `- ${at} 是根下第一块，但它下面挂着子块：背景只是一段话，不挂子块。在它前面插入背景（OutlineEdit 的 add 指向计划根，带 before: "${problem.address}"），或把它的子块移到后面的大点里。`;
 				}
 				break;
 			case "long":
@@ -238,7 +240,11 @@ function structureProblemLine(locale: Locale, problem: OutlinePlanStructureProbl
 			case "flat":
 				return `- ${at} 下面直接有 ${problem.children} 块：按阶段或主题分组，一层不超过 ${maxChildren} 块。`;
 			case "notable":
-				return `- ${at}（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）不是根下最后一块：把它移到最后（只留一块），值得注意的点都写在它下面。`;
+				return `- ${at}（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）不是根下最后一块：用 OutlineEdit 把它 move 到计划根（不带 after、before 就放在最后），只留一块，值得注意的点都写在它下面。`;
+			case "notableEmpty":
+				return `- ${at}（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）下面还没有条目：每一点写成它下面的一个子块；确实没有就删掉这一块。`;
+			case "noPoints":
+				return `- ${at}（计划根）下面除了背景还没有大点：把计划写成根下的大点（阶段或工作方向），小点和实施细节写在它们下面。`;
 		}
 	}
 	switch (problem.kind) {
@@ -247,17 +253,17 @@ function structureProblemLine(locale: Locale, problem: OutlinePlanStructureProbl
 		case "background":
 			switch (problem.problem) {
 				case "none":
-					return `- ${at} (the plan root) has no background under it: insert a block first under the root with one paragraph of background (at most ${backgroundChars} characters).`;
+					return `- ${at} (the plan root) has no background under it: add a block under the root with OutlineEdit (add: the plan root) holding one paragraph of background (at most ${backgroundChars} characters).`;
 				case "task":
-					return `- ${at} is the root's first block but a task: the first block must be the background, one paragraph without a checkbox (at most ${backgroundChars} characters). Insert it before this block.`;
+					return `- ${at} is the root's first block but a task: the first block must be the background, one paragraph without a checkbox (at most ${backgroundChars} characters). Insert it before this block: OutlineEdit add under the plan root with before: "${problem.address}".`;
 				case "heading":
 					return `- ${at} is the root's first block but a heading: write the background itself as one paragraph (at most ${backgroundChars} characters), not a heading.`;
 				case "notProse":
-					return `- ${at} is the root's first block but a code block, a table or an embed: the background is one paragraph (at most ${backgroundChars} characters). Insert it before this block.`;
+					return `- ${at} is the root's first block but a code block, a table or an embed: the background is one paragraph (at most ${backgroundChars} characters). Insert it before this block: OutlineEdit add under the plan root with before: "${problem.address}".`;
 				case "empty":
 					return `- ${at} is the root's first block but empty: write the background in it as one paragraph (at most ${backgroundChars} characters).`;
 				case "children":
-					return `- ${at} is the root's first block but has blocks under it: the background is one paragraph with nothing under it. Insert it before this block, or make this block the paragraph and move its children into the big points.`;
+					return `- ${at} is the root's first block but has blocks under it: the background is one paragraph with nothing under it. Insert it before this block (OutlineEdit add under the plan root with before: "${problem.address}"), or move its children into the big points.`;
 			}
 			break;
 		case "long":
@@ -273,7 +279,11 @@ function structureProblemLine(locale: Locale, problem: OutlinePlanStructureProbl
 		case "flat":
 			return `- ${at} has ${problem.children} blocks directly under it: group them by phase or topic, at most ${maxChildren} on one level.`;
 		case "notable":
-			return `- ${at} ("${NOTABLE_POINTS_TITLE.en}") is not the root's last block: move it to the end (one such block), with every notable point under it.`;
+			return `- ${at} ("${NOTABLE_POINTS_TITLE.en}") is not the root's last block: OutlineEdit move it to the plan root with no after or before (that puts it last); keep one such block, with every notable point under it.`;
+		case "notableEmpty":
+			return `- ${at} ("${NOTABLE_POINTS_TITLE.en}") has nothing under it: write each point as a child block under it, or delete it when there is truly nothing.`;
+		case "noPoints":
+			return `- ${at} (the plan root) has no big point besides the background: write the plan as big points under the root (phases or workstreams), with the small points and details under them.`;
 	}
 	return `- ${at}`;
 }

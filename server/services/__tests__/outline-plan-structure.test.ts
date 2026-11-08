@@ -11,10 +11,20 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { NOTABLE_POINTS_TITLE, OUTLINE_PLAN_STRUCTURE } from "@shared/outline-plan-structure";
+import { randomUUID } from "node:crypto";
+import {
+	isPlanNoteContent,
+	NOTABLE_POINTS_TITLE,
+	OUTLINE_PLAN_STRUCTURE,
+} from "@shared/outline-plan-structure";
+import { parsePlanTree } from "@shared/outline-plan-tree";
+import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
-import { narrators, users } from "../../db/schema";
+import { narrators, narratorToolCalls, users } from "../../db/schema";
+import { localBackend } from "../../lib/agent/execution/registry";
+import { askTool, outlineEditTool } from "../../lib/agent/tools/outline";
 import { enterPlanModeTool, exitPlanModeTool } from "../../lib/agent/tools/plan-mode";
+import type { ToolContext } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
 import {
 	getOutlinePlanEnterOutput,
@@ -24,7 +34,8 @@ import {
 	getOutlinePlanReviewTitle,
 } from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
-import { resolveExitPlanModeInput } from "../narrator-permission";
+import { handlePermission, resolveExitPlanModeInput } from "../narrator-permission";
+import { narratorService } from "../narrator-service";
 import { pendingPermissions } from "../narrator-session-state";
 import { findPlanningRoot, isPlanNoteBlock } from "../outline/plans";
 import { ensureSessionSpace } from "../outline/spaces";
@@ -94,6 +105,14 @@ async function planning(planName = "历史读取改告警") {
 	return { owner, id, root, space };
 }
 
+/** The live blocks directly under a block, in order. */
+async function findChildren(blockId: string) {
+	const block = await outlineStore.getBlock(blockId);
+	if (!block) return [];
+	const children = await outlineStore.listChildren(block.spaceId, blockId, 100);
+	return children.filter((b) => !b.deleted);
+}
+
 /** What a refusal must leave as it was: the root (state, version) and the space's commits. */
 async function snapshot(spaceId: string, rootId: string) {
 	const block = await outlineStore.getBlock(rootId);
@@ -109,6 +128,17 @@ async function snapshot(spaceId: string, rootId: string) {
 
 const BACKGROUND =
 	"模型历史、工具结果回放和会话恢复读历史超过 10 秒就直接拒绝，慢磁盘上的会话会莫名失败。这次把固定时间拒绝改成告警，读取照常完成。";
+
+function toolCtx(narratorId: string, userId: string): ToolContext {
+	return {
+		narratorId,
+		cwd: "/",
+		signal: new AbortController().signal,
+		locale: "zh-CN",
+		userId,
+		requestPermission: async () => ({ behavior: "allow" }),
+	} as unknown as ToolContext;
+}
 
 /** The background paragraph, first under the root. */
 function backgroundOp(rootId: string): OutlineOp {
@@ -194,13 +224,19 @@ describe("a plan not in the format is refused", () => {
 	});
 
 	test("a plan with no background is refused by its root; with one, it submits", async () => {
-		const { id, owner, root } = await planning();
+		const { id, owner, root, space } = await planning();
 		await agentWrite(id, owner, [
-			{ op: "insert", parent: { id: root.blockId }, content: "阶段 1", task: { status: "todo" } },
+			{
+				op: "insert",
+				sid: "PhaseOne",
+				parent: { id: root.blockId },
+				content: "阶段 1",
+				task: { status: "todo" },
+			},
 		]);
 		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
 		expect(refused && !refused.ok && refused.message).toContain(
-			"是根下第一块，但它是任务：根下第一块必须是背景",
+			`\`${space.key}/PhaseOne\` 是根下第一块，但它是任务：根下第一块必须是背景——一段不带复选框的话（不超过 ${backgroundChars} 字）。在它前面插入背景：OutlineEdit 的 add 指向计划根，带 before: "${space.key}/PhaseOne"。`,
 		);
 		await agentWrite(id, owner, [backgroundOp(root.blockId)]);
 		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
@@ -239,7 +275,7 @@ describe("a plan not in the format is refused", () => {
 		]);
 		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
 		expect(refused && !refused.ok && refused.message).toContain(
-			`\`${space.key}/Notable1\`（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）不是根下最后一块：把它移到最后`,
+			`\`${space.key}/Notable1\`（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）不是根下最后一块：用 OutlineEdit 把它 move 到计划根`,
 		);
 		await agentWrite(id, owner, [
 			{
@@ -342,6 +378,194 @@ describe("a plan in the format", () => {
 	});
 });
 
+describe("following a refusal with the agent's own tools", () => {
+	test("a background inserted with OutlineEdit's before, the notable points moved last: it submits", async () => {
+		const { id, owner, root, space } = await planning();
+		const c = toolCtx(id, owner);
+		const added = await outlineEditTool.execute(
+			{
+				edits: [
+					{
+						add: root.address,
+						markdown: [
+							`- ${NOTABLE_POINTS_TITLE["zh-CN"]}`,
+							"  - 错误码保留一个版本",
+							"- [ ] 阶段 1：去掉固定时间拒绝",
+							"  - [ ] 清除模型历史链路的固定时间拒绝",
+						].join("\n"),
+					},
+				],
+			},
+			c,
+		);
+		expect(added.isError).toBeFalsy();
+		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		const message = refused && !refused.ok ? refused.message : "";
+		const first = (await findChildren(root.blockId))[0];
+		const firstAddress = `${space.key}/${first?.sid}`;
+		// It names the block to insert before, in the words OutlineEdit takes.
+		expect(message).toContain(`before: "${firstAddress}"`);
+		expect(message).toContain("不是根下最后一块：用 OutlineEdit 把它 move 到计划根");
+		// The agent does as it says: insert before that block, move the section to the root.
+		const fixed = await outlineEditTool.execute(
+			{
+				edits: [
+					{ add: root.address, markdown: `- ${BACKGROUND}`, before: firstAddress },
+					{ move: firstAddress, to: root.address },
+				],
+			},
+			c,
+		);
+		expect(fixed.isError).toBeFalsy();
+		const children = await findChildren(root.blockId);
+		expect(children.map((b) => b.content)).toEqual([
+			BACKGROUND,
+			"阶段 1：去掉固定时间拒绝",
+			NOTABLE_POINTS_TITLE["zh-CN"],
+		]);
+		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		expect(resolved?.ok).toBe(true);
+	});
+
+	test("OutlineEdit refuses after and before together, and a before that is not a child of the parent", async () => {
+		const { id, owner, root } = await planning();
+		const c = toolCtx(id, owner);
+		await agentWrite(id, owner, [
+			{ op: "insert", sid: "PhaseOne", parent: { id: root.blockId }, content: "阶段 1" },
+		]);
+		const space = await ensureSessionSpace(id);
+		const both = await outlineEditTool.execute(
+			{
+				edits: [
+					{
+						add: root.address,
+						markdown: "- x",
+						after: `${space.key}/PhaseOne`,
+						before: `${space.key}/PhaseOne`,
+					},
+				],
+			},
+			c,
+		);
+		expect(both.isError).toBe(true);
+		expect(String(both.output)).toContain("give after or before, not both");
+		const stranger = await outlineEditTool.execute(
+			{ edits: [{ add: `${space.key}/PhaseOne`, markdown: "- x", before: root.address }] },
+			c,
+		);
+		expect(stranger.isError).toBe(true);
+	});
+});
+
+describe("questions put to a person: the check and the display agree", () => {
+	test("an Ask on the root before the background is skipped by both", async () => {
+		const { id, owner, root, space } = await planning();
+		const asked = await askTool.execute(
+			{
+				under: root.address,
+				questions: [{ question: "要不要按会话限频？", options: ["要", "不要"], recommend: 2 }],
+			},
+			toolCtx(id, owner),
+		);
+		expect(asked.isError).toBeFalsy();
+		// A background longer than a point: were the question taken for the background, this
+		// paragraph would be checked as a point and refused.
+		const background = `${BACKGROUND}${"读历史的固定超时在慢磁盘上会让会话莫名失败。".repeat(3)}`;
+		await agentWrite(id, owner, [
+			{ op: "insert", sid: "BackGrnd", parent: { id: root.blockId }, content: background },
+			{ op: "insert", parent: { id: root.blockId }, content: "阶段 1", task: { status: "todo" } },
+		]);
+		const children = await findChildren(root.blockId);
+		expect(children[0]?.askJson).toBeTruthy();
+		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		expect(resolved?.ok).toBe(true);
+		const tree = parsePlanTree(String(resolved?.input.plan));
+		expect(tree?.root.children.map((c) => [c.role, !!c.question])).toEqual([
+			["point", true],
+			["background", false],
+			["point", false],
+		]);
+		expect(space.key).toBeTruthy();
+	});
+});
+
+describe("a plan has big points; the notable points have items", () => {
+	test("a background alone, and an empty notable section, are refused", async () => {
+		const { id, owner, root, space } = await planning();
+		await agentWrite(id, owner, [
+			backgroundOp(root.blockId),
+			{
+				op: "insert",
+				sid: "Notable1",
+				parent: { id: root.blockId },
+				content: NOTABLE_POINTS_TITLE["zh-CN"],
+			},
+		]);
+		const refused = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
+		const message = refused && !refused.ok ? refused.message : "";
+		expect(message).toContain(`\`${root.address}\`（计划根）下面除了背景还没有大点`);
+		expect(message).toContain(
+			`\`${space.key}/Notable1\`（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）下面还没有条目`,
+		);
+	});
+});
+
+describe("the permission itself refuses (handlePermission)", () => {
+	test("nothing waits for a person and nothing is written", async () => {
+		const { id, owner, root, space } = await planning();
+		await writeWallOfText(id, owner, root.blockId);
+		const before = await snapshot(space.id, root.blockId);
+		const toolUseId = `toolu_${generateId()}`;
+		const msg = await narratorService.persistAssistantMessage(id, {
+			uuid: randomUUID(),
+			session_id: randomUUID(),
+			parent_tool_use_id: null,
+			message: {
+				content: [
+					{ type: "tool_use", id: toolUseId, name: "ExitPlanMode", input: { mode: "outline" } },
+				],
+			},
+		});
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.messageId, msg.id),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true },
+		});
+		expect(row).toBeDefined();
+		const cwd = process.cwd();
+		const pendingBefore = pendingPermissions.size;
+		const result = await handlePermission(
+			id,
+			new AbortController().signal,
+			"ExitPlanMode",
+			{ mode: "outline" },
+			toolUseId,
+			cwd,
+			"zh-CN",
+			undefined,
+			{
+				executionBackend: localBackend,
+				executionTarget: {
+					deviceId: localBackend.deviceId,
+					backendKind: localBackend.kind,
+					cwd,
+					pathFlavor: localBackend.pathFlavor ?? localBackend.paths.flavor,
+					runtimeGeneration: localBackend.runtimeGeneration ?? 0,
+					selectionSource: "local_default",
+				},
+			},
+		);
+		expect(pendingPermissions.size).toBe(pendingBefore);
+		expect(result.behavior).toBe("deny");
+		expect(result.behavior === "deny" ? result.message : "").toContain(
+			`计划 \`${root.address}\` 还不符合计划格式，这次没有提交给用户`,
+		);
+		expect(await snapshot(space.id, root.blockId)).toEqual(before);
+	});
+});
+
 describe("what is not refused", () => {
 	test("a call restored from what was persisted is not held to the format", async () => {
 		const { id, owner, root } = await planning();
@@ -404,7 +628,10 @@ describe("what is not refused", () => {
 	test("the root EnterPlanMode makes from a long plan_name is a title the format accepts", async () => {
 		const { id, owner, root } = await planning(`${"很长的计划名".repeat(30)}`);
 		expect(Array.from(root.title).length).toBe(rootChars);
-		await agentWrite(id, owner, [backgroundOp(root.blockId)]);
+		await agentWrite(id, owner, [
+			backgroundOp(root.blockId),
+			{ op: "insert", parent: { id: root.blockId }, content: "阶段 1", task: { status: "todo" } },
+		]);
 		const resolved = await resolveOutlineExitPlanInput(id, { mode: "outline" }, "zh-CN");
 		expect(resolved?.ok).toBe(true);
 	});
@@ -420,6 +647,16 @@ describe("notes for the agent", () => {
 		expect(isPlanNoteBlock({ content: "阶段 1：退回意见（第 1 版）" })).toBe(false);
 		expect(isPlanNoteBlock({ content: null })).toBe(false);
 	});
+
+	test("the display's copy of the rule (shared) recognizes the same notes", () => {
+		for (const locale of ["en", "zh-CN"] as const)
+			for (const version of [1, 12]) {
+				expect(isPlanNoteContent(getOutlinePlanReturnedNote(locale, version, "x"))).toBe(true);
+				expect(isPlanNoteContent(getOutlinePlanReviewTitle(locale, version))).toBe(true);
+			}
+		expect(isPlanNoteContent("Returned the parcel")).toBe(false);
+		expect(isPlanNoteContent("阶段 1：退回意见（第 1 版）")).toBe(false);
+	});
 });
 
 describe("the prompts state the format with the check's numbers", () => {
@@ -428,6 +665,7 @@ describe("the prompts state the format with the check's numbers", () => {
 		for (const part of [
 			`计划根：一行短标题（不超过 ${rootChars} 字）`,
 			`根下第一块：背景。一段话（不超过 ${backgroundChars} 字），不是任务，下面不挂子块`,
+			"用 OutlineEdit add 的 before 插到最前面",
 			"审批人同时跟着很多任务，对这个项目只是大概了解",
 			`大点、小点各只写一个要点（不超过 ${pointChars} 字）`,
 			`每条一个子块（不超过 ${detailChars} 字）`,
@@ -439,7 +677,8 @@ describe("the prompts state the format with the check's numbers", () => {
 		const en = getOutlinePlanModeSystemReminder("en", { address: "k/AbCdEfGh" }, false);
 		for (const part of [
 			`a short one-line title (at most ${rootChars} characters)`,
-			`The root's first block: the background. One paragraph (at most ${backgroundChars} characters), not a task, with nothing under it.`,
+			`The root's first block: the background. One paragraph (at most ${backgroundChars} characters), not a task, with nothing under it`,
+			"OutlineEdit add with before puts it first",
 			"The approver tracks many tasks at once and knows this project only roughly",
 			`A big or small point is one idea (at most ${pointChars} characters)`,
 			`one child block each (at most ${detailChars} characters)`,
@@ -459,14 +698,16 @@ describe("the prompts state the format with the check's numbers", () => {
 			`The root's first block is the background: one concise paragraph (at most ${backgroundChars} characters`,
 		);
 		expect(exit).toContain(
-			`"${NOTABLE_POINTS_TITLE.en}" (「${NOTABLE_POINTS_TITLE["zh-CN"]}」 in Chinese)`,
+			`"${NOTABLE_POINTS_TITLE.en}" (「${NOTABLE_POINTS_TITLE["zh-CN"]}」 in Chinese, not a task)`,
 		);
 		expect(exit).toContain(`at most ${pointChars} characters); a detail at most ${detailChars}`);
 		expect(enterPlanModeTool.description).toContain(
 			"the background paragraph goes in the first block under it",
 		);
 		const root = { address: "k/AbCdEfGh", title: "导入器", version: 1 };
-		expect(getOutlinePlanEnterOutput("zh-CN", root, "created")).toContain("第一块是背景（一段话）");
+		expect(getOutlinePlanEnterOutput("zh-CN", root, "created")).toContain(
+			"第一块是背景（一段话；根下已有块时用 add 的 before 插到最前面）",
+		);
 		expect(getOutlinePlanEnterOutput("en", root, "created")).toContain(
 			"the background paragraph first",
 		);

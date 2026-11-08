@@ -209,7 +209,7 @@ async function newSession(title: string): Promise<string> {
  * A session with a submitted plan waiting for a decision; its outcome is captured. `review`: a
  * plan review's comments on it (by step index, or the plan as a whole), as PlanReview leaves them.
  */
-async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
+async function waitingPlan(review?: Array<{ step?: number; text: string }>, detail?: string) {
 	// The test preload restores settings after every test.
 	settings.outline.enabled = true;
 	const id = await newSession("Planner");
@@ -228,6 +228,7 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 			},
 			{
 				op: "insert",
+				tempId: "b",
 				parent: { id: root?.blockId as string },
 				content: "Step B",
 				task: { status: "todo" },
@@ -239,6 +240,8 @@ async function waitingPlan(review?: Array<{ step?: number; text: string }>) {
 				position: { first: true },
 				content: "The importer fails every night and is rerun by hand.",
 			},
+			// An implementation detail under step B, when the case needs one.
+			...(detail ? [{ op: "insert" as const, parent: { tempId: "b" }, content: detail }] : []),
 		],
 		actor: { kind: "agent", id },
 		responsibleUserId: owner,
@@ -460,6 +463,80 @@ test("with feedback typed, Enter returns the plan (review round 1 S5)", async ()
 	expect(plan.outcome()?.behavior).toBe("deny");
 	expect(plan.outcome()?.message).toContain("Split step B");
 	expect((await outlineStore.getBlock(plan.root))?.taskJson?.plan?.state).toBe("planning");
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("Enter on a control of the card is the control's: View changes opens the diff, the shortcut does not decide (review round 1 B1)", async () => {
+	const plan = await waitingPlan();
+	const { page, errors } = await openCard(plan.permission, undefined, { keyboard: true });
+	await until(page, "the keyboard default", (f) => f.enterTarget() === "Execute as draft");
+	await page.focus("[data-testid=outline-plan-view-changes]");
+	await page.keyboard.press("Enter");
+	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 4);
+	// The diff came from the server after the key: a decision would have been sent before it.
+	expect(plan.outcome()).toBeNull();
+	await page.keyboard.press("Escape");
+	await until(
+		page,
+		"the diff closed",
+		(f) => f.count("[data-testid=outline-plan-diff-entry]") === 0,
+	);
+	expect(plan.outcome()).toBeNull();
+	// Where nothing else owns Enter (the page itself), the shortcut still decides.
+	await call(page, (f) => f.blur());
+	await page.keyboard.press("Enter");
+	await waitFor("the draft", () => plan.outcome());
+	expect(plan.outcome()?.behavior).toBe("allow");
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("Enter in the empty composer is still the shortcut: the plan is decided (review round 1 B1)", async () => {
+	const plan = await waitingPlan();
+	const { page, errors } = await openCard(plan.permission, undefined, { keyboard: true });
+	await until(page, "the keyboard default", (f) => f.enterTarget() === "Execute as draft");
+	await page.focus("[data-testid=composer]");
+	await page.keyboard.press("Enter");
+	await waitFor("the draft", () => plan.outcome());
+	expect(plan.outcome()?.behavior).toBe("allow");
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("a text the diff's clamp cuts at the modal's width has its toggle, measured; a short one has none (review round 1 S6)", async () => {
+	// 116 characters (a small point within its limit): under the old 160-character rule, yet five
+	// lines on a phone.
+	const plan = await waitingPlan(undefined, "细节".repeat(58));
+	const { page, errors } = await openCard(plan.permission, { width: 375, height: 740 });
+	expect(await call(page, (f) => f.click("[data-testid=outline-plan-view-changes]"))).toBe(true);
+	await until(page, "the diff", (f) => f.count("[data-testid=outline-plan-diff-entry]") === 5);
+	const read = () =>
+		page.evaluate(() => {
+			const rows = [...document.querySelectorAll("[data-testid=outline-plan-diff-entry]")];
+			const long = rows.find((r) => r.textContent?.includes("细节细节"));
+			const text = long?.querySelector("[data-testid=outline-plan-diff-after]") as HTMLElement;
+			return {
+				toggle: long?.querySelector("[data-testid=outline-plan-diff-whole]")?.textContent ?? null,
+				cut: text.scrollHeight > text.clientHeight + 1,
+				lines: Math.round(text.clientHeight / Number.parseFloat(getComputedStyle(text).lineHeight)),
+				others: rows.filter(
+					(r) => r !== long && r.querySelector("[data-testid=outline-plan-diff-whole]"),
+				).length,
+			};
+		});
+	await until(page, "the toggle", (f) => f.count("[data-testid=outline-plan-diff-whole]") === 1);
+	expect(await read()).toEqual({ toggle: "Show all", cut: true, lines: 3, others: 0 });
+	await page.click("[data-testid=outline-plan-diff-whole]");
+	await until(
+		page,
+		"the whole text",
+		(f) => f.text("[data-testid=outline-plan-diff-whole]") === "Show less",
+	);
+	const whole = await read();
+	expect(whole.cut).toBe(false);
+	expect(whole.lines).toBeGreaterThan(3);
+	expect(await call(page, (f) => f.overflowsX())).toBe(false);
 	expect(errors).toEqual([]);
 	await page.close();
 });

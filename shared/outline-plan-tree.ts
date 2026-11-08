@@ -32,7 +32,14 @@
 import { parseBlock } from "./outline/dialect";
 import type { Inline, Mark, TaskStatus } from "./outline/dialect/types";
 import { type OutlineItem, parseMarkdownOutline } from "./outline/md-outline";
-import { isNotablePointsHeading, planBackgroundProblem } from "./outline-plan-structure";
+import {
+	isNotablePointsHeading,
+	isPlanNoteContent,
+	OUTLINE_PLAN_STRUCTURE,
+	planBackgroundProblem,
+	planBlockText,
+	planTextChars,
+} from "./outline-plan-structure";
 
 /** Nodes shallower than this are open by default: the root and the big points. */
 export const PLAN_TREE_OPEN_DEPTH = 2;
@@ -78,6 +85,8 @@ export interface PlanTreeNode {
 	task: TaskStatus | null;
 	/** A heading block (drawn strong). */
 	heading?: boolean;
+	/** A question put to a person (`Ask`): never the background. */
+	question?: boolean;
 	/** The block's text by hard line, then its properties; never empty (one empty line at least). */
 	lines: PlanTreeLine[];
 	/** The text as plain characters, lines joined with newlines (a tooltip, a copy). */
@@ -123,12 +132,13 @@ export type PlanTreeAction =
 	/** Show one text whole or clamped. */
 	| { kind: "text"; key: string }
 	/**
-	 * Everything inside one node: expanded (every node in it open, every text whole) unless it is
-	 * already, in which case back to the default view inside it.
+	 * Everything inside one node: expanded (every node in it open, every text whole), or back to
+	 * the default view inside it. `open` says which (what the control showed); without it, the
+	 * one it is not now.
 	 */
-	| { kind: "subtree"; key: string }
+	| { kind: "subtree"; key: string; open?: boolean }
 	/** 「全部展开 / 全部收起」: the root's subtree. */
-	| { kind: "all" };
+	| { kind: "all"; open?: boolean };
 
 /** Whether `key` is `under` or a node below it. */
 function within(key: string, under: string): boolean {
@@ -171,10 +181,15 @@ export function isPlanTreeAllExpanded(view: PlanTreeView): boolean {
 
 /** The reader's view after `action`. */
 export function applyPlanTreeAction(view: PlanTreeView, action: PlanTreeAction): PlanTreeView {
-	if (action.kind === "all") return applyPlanTreeAction(view, subtreeOf(PLAN_TREE_ROOT_KEY));
+	if (action.kind === "all")
+		return applyPlanTreeAction(view, {
+			kind: "subtree",
+			key: PLAN_TREE_ROOT_KEY,
+			...(action.open !== undefined ? { open: action.open } : {}),
+		});
 	if (action.kind === "subtree") {
 		const key = action.key;
-		const expanded = isPlanSubtreeExpanded(view, key);
+		const expanded = action.open === undefined ? isPlanSubtreeExpanded(view, key) : !action.open;
 		const keep = (k: string) => !within(k, key);
 		const scopes = new Map([...view.scopes].filter(([k]) => keep(k)));
 		const next: PlanTreeView = {
@@ -194,10 +209,6 @@ export function applyPlanTreeAction(view: PlanTreeView, action: PlanTreeAction):
 	if (flipped.has(action.key)) flipped.delete(action.key);
 	else flipped.add(action.key);
 	return { ...view, [field]: flipped };
-}
-
-function subtreeOf(key: string): PlanTreeAction {
-	return { kind: "subtree", key };
 }
 
 /** Whether the view is the default one (nothing changed). */
@@ -325,7 +336,19 @@ export function planDescendants(node: PlanTreeNode): number {
 
 // ─── Parsing ───
 
+/** A note a read adds on its own line (`‹… 3 more›`, `‹question …›`): not a block. */
 const ANNOTATION_LINE = /^[ \t]*‹[^›\n]*›[ \t]*$/;
+/** The note under a question put to a person (`Ask`), indented like the block's children. */
+const QUESTION_LINE = /^( *)‹question [^\n]*›[ \t]*$/;
+/** A block's line: its bullet, indented by its depth. */
+const ITEM_LINE = /^( *)(?:[-*+]|\d{1,9}[.)]) /;
+/**
+ * A code fence opening a line, or right after an item's bullet, its label and its checkbox (as
+ * the server's read writes them, `stripReadAnnotations`).
+ */
+const FENCE = /^ *(?:(?:[-*+]|\d{1,9}[.)]) +(?:\[[^\]\n]*\] +)?(?:\[[ xX/-]\] +)?)?(`{3,}|~{3,})/;
+/** Indentation per level of the rendered outline. */
+const INDENT = 2;
 
 const cache = new Map<string, PlanTree | null>();
 
@@ -348,58 +371,122 @@ export function parsePlanTree(markdown: string): PlanTree | null {
 	return tree;
 }
 
-/** A node's role from where it sits (see {@link PlanTreeRole}). */
-function roleOf(
-	item: OutlineItem,
-	depth: number,
-	index: number,
-	parent: PlanTreeRole | null,
-): PlanTreeRole {
-	if (depth === 0) return "title";
-	if (depth === 1) {
-		if (
-			index === 0 &&
-			planBackgroundProblem({
-				content: item.content,
-				task: item.task !== null,
-				children: item.children.length,
-			}) === null
-		)
-			return "background";
-		return isNotablePointsHeading(item.content) ? "notable" : "point";
+/**
+ * The rendering without the read's notes (lines inside code fences left alone), and which blocks
+ * are questions put to a person (by their place in document order: the read writes a
+ * `‹question …›` note under each).
+ */
+function readNotes(markdown: string): { text: string; questions: Set<number> } {
+	const out: string[] = [];
+	const questions = new Set<number>();
+	const lastAt = new Map<number, number>();
+	let items = -1;
+	let fence: { char: string; length: number } | null = null;
+	for (const line of markdown.split("\n")) {
+		if (fence) {
+			const closing = line.trim();
+			if (closing[0] === fence.char && closing.length >= fence.length && /^(`+|~+)$/.test(closing))
+				fence = null;
+			out.push(line);
+			continue;
+		}
+		const item = ITEM_LINE.exec(line);
+		if (item) {
+			items++;
+			lastAt.set((item[1] as string).length, items);
+		}
+		const run = FENCE.exec(line)?.[1];
+		if (run) {
+			fence = { char: run[0] as string, length: run.length };
+			out.push(line);
+			continue;
+		}
+		if (!ANNOTATION_LINE.test(line)) {
+			out.push(line);
+			continue;
+		}
+		const question = QUESTION_LINE.exec(line);
+		if (question) {
+			const owner = lastAt.get((question[1] as string).length - INDENT);
+			if (owner !== undefined) questions.add(owner);
+		}
 	}
-	if (depth === 2) return parent === "notable" ? "notableItem" : "point";
-	return "detail";
+	return { text: out.join("\n"), questions };
+}
+
+/** A legacy plan's first paragraph past this many characters is a point, not the background. */
+const BACKGROUND_MAX_CHARS = 2 * OUTLINE_PLAN_STRUCTURE.backgroundChars;
+
+/**
+ * The background: the root's first block that is the plan's own (not a question put to a person,
+ * not a note for the agent), when it has a background's shape (`planBackgroundProblem`: what
+ * is under it but questions does not count) — the submission check's rule. A legacy plan's
+ * first paragraph far longer than a background reads as a point (clamped).
+ */
+function backgroundOf(
+	root: OutlineItem,
+	isQuestion: (item: OutlineItem) => boolean,
+): OutlineItem | null {
+	const first = root.children.find(
+		(child) => !isQuestion(child) && !isPlanNoteContent(child.content),
+	);
+	if (!first) return null;
+	const problem = planBackgroundProblem({
+		content: first.content,
+		task: first.task !== null,
+		children: first.children.filter((child) => !isQuestion(child)).length,
+	});
+	if (problem !== null) return null;
+	return planTextChars(planBlockText(first.content).text) <= BACKGROUND_MAX_CHARS ? first : null;
 }
 
 function buildPlanTree(markdown: string): PlanTree | null {
-	const text = markdown
-		.split("\n")
-		.filter((line) => !ANNOTATION_LINE.test(line))
-		.join("\n");
+	const { text, questions } = readNotes(markdown);
 	if (!/^\s*[-*+]\s/.test(text)) return null;
 	const { items } = parseMarkdownOutline(text);
 	if (items.length !== 1) return null;
+	const top = items[0] as OutlineItem;
+	// Each item's place in document order (what the question notes name).
+	const order = new Map<OutlineItem, number>();
+	const number = (item: OutlineItem) => {
+		order.set(item, order.size);
+		for (const child of item.children) number(child);
+	};
+	number(top);
+	const isQuestion = (item: OutlineItem) => questions.has(order.get(item) ?? -1);
+	const background = backgroundOf(top, isQuestion);
 	let size = 0;
 	const build = (
 		item: OutlineItem,
 		key: string,
 		depth: number,
-		index: number,
 		parent: PlanTreeRole | null,
 	): PlanTreeNode => {
 		size++;
-		const role = roleOf(item, depth, index, parent);
+		const question = isQuestion(item);
+		const role: PlanTreeRole =
+			depth === 0
+				? "title"
+				: depth === 1
+					? item === background
+						? "background"
+						: item.task === null && !question && isNotablePointsHeading(item.content)
+							? "notable"
+							: "point"
+					: depth === 2
+						? parent === "notable"
+							? "notableItem"
+							: "point"
+						: "detail";
 		const { lines, heading } = itemLines(item);
-		const children = item.children.map((child, i) =>
-			build(child, `${key}.${i}`, depth + 1, i, role),
-		);
+		const children = item.children.map((child, i) => build(child, `${key}.${i}`, depth + 1, role));
 		return {
 			key,
 			depth,
 			role,
 			task: item.task?.status ?? null,
 			...(heading ? { heading: true } : {}),
+			...(question ? { question: true } : {}),
 			lines,
 			plain: lines.map((line) => line.runs.map((run) => run.text).join("")).join("\n"),
 			children,
@@ -408,7 +495,7 @@ function buildPlanTree(markdown: string): PlanTree | null {
 				children.some((child) => child.folds),
 		};
 	};
-	const root = build(items[0] as OutlineItem, PLAN_TREE_ROOT_KEY, 0, 0, null);
+	const root = build(top, PLAN_TREE_ROOT_KEY, 0, null);
 	return { root, size, folds: root.folds };
 }
 

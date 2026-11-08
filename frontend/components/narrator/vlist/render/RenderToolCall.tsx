@@ -2155,6 +2155,7 @@ export function RenderToolBody({
 	if (model.kind === "plan-tree")
 		return (
 			<PlanTreeBody
+				bodyId={`plan-tree:${model.markdown.id}`}
 				blocks={blocks}
 				frames={frame.blocks}
 				availableWidth={contentWidth}

@@ -239,10 +239,10 @@ function outlinePlanLayoutRules(): string {
 	return (
 		"An outline plan follows one format, read top-down by an approver who tracks many tasks and knows the project only roughly. " +
 		`The root is a short one-line title (at most ${rootChars} characters). ` +
-		`The root's first block is the background: one concise paragraph (at most ${backgroundChars} characters; not a task, nothing under it) that brings back what this work is and why, and leads into the plan. ` +
+		`The root's first block is the background: one concise paragraph (at most ${backgroundChars} characters; not a task, nothing under it) that brings back what this work is and why, and leads into the plan (OutlineEdit add with before puts it first when the root has blocks already). ` +
 		"Then the big points (phases or workstreams), each with its small points (tasks), each small point with its implementation details as child blocks (the person sees one line of them until they open them). " +
 		`A big or small point is one idea (at most ${pointChars} characters); a detail at most ${detailChars} characters; at most ${maxChildren} blocks on one level. ` +
-		`The root's last block is "${NOTABLE_POINTS_TITLE.en}" (「${NOTABLE_POINTS_TITLE["zh-CN"]}」 in Chinese), with risks, irreversible steps and what the approver must look at as its children; leave it out only when there is truly nothing. ` +
+		`The root's last block is "${NOTABLE_POINTS_TITLE.en}" (「${NOTABLE_POINTS_TITLE["zh-CN"]}」 in Chinese, not a task), with risks, irreversible steps and what the approver must look at as its children; leave it out only when there is truly nothing. ` +
 		"A plan that breaks the format is refused with the blocks to fix; fix them with OutlineEdit and call ExitPlanMode again.\n\n"
 	);
 }

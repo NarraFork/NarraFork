@@ -9,7 +9,8 @@
  * Nothing in the diff is folded (plan readability): it lists only the blocks that changed, each
  * at its depth under the root, so a change shows however deep it sits — unlike the plan's own
  * overview, which folds what is under its second level. A long text before or after is clamped
- * to {@link DIFF_TEXT_LINES} lines, and opens whole on a click.
+ * to {@link DIFF_TEXT_LINES} lines, and opens whole on a click: the toggle shows when the clamp
+ * actually cuts a text at the modal's width (measured by the browser, again on resize).
  */
 
 import {
@@ -31,7 +32,7 @@ import type {
 	OutlinePlanReview,
 	OutlinePlanTaskView,
 } from "@shared/outline-api";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 function taskLine(
@@ -59,11 +60,51 @@ const CHANGE_COLOR: Record<string, string> = {
 
 /** Lines a changed block's text shows before it is clamped (a click shows it whole). */
 const DIFF_TEXT_LINES = 3;
-/** A text this long, or of more lines than the clamp, gets the "show all" toggle. */
-const DIFF_TEXT_LONG = 160;
 
-function isLongText(text: string | null): boolean {
-	return !!text && (text.length > DIFF_TEXT_LONG || text.split("\n").length > DIFF_TEXT_LINES);
+/**
+ * Whether one of a row's texts is longer than the clamp, read from what the browser drew: cut
+ * now (clamped: its content is taller than its box), or taller than the clamp (shown whole).
+ * Checked after each render and whenever a text's box changes size (the modal's width, a phone's
+ * fullscreen, the depth's indent), so the toggle is there exactly when the clamp cuts something.
+ */
+function useClampCuts(whole: boolean): {
+	ref: (el: HTMLElement | null) => void;
+	long: boolean;
+} {
+	const els = useRef(new Set<HTMLElement>());
+	const [long, setLong] = useState(false);
+	const check = useRef(() => {});
+	check.current = () => {
+		let cut = false;
+		for (const el of els.current) {
+			if (!el.isConnected) continue;
+			if (whole) {
+				const line = Number.parseFloat(getComputedStyle(el).lineHeight);
+				if (Number.isFinite(line) && el.clientHeight > line * DIFF_TEXT_LINES + 1) cut = true;
+			} else if (el.scrollHeight > el.clientHeight + 1) cut = true;
+		}
+		setLong(cut);
+	};
+	useLayoutEffect(() => {
+		check.current();
+	});
+	const observer = useRef<ResizeObserver | null>(null);
+	useLayoutEffect(() => {
+		if (typeof ResizeObserver === "undefined") return;
+		const watch = new ResizeObserver(() => check.current());
+		observer.current = watch;
+		for (const el of els.current) watch.observe(el);
+		return () => {
+			watch.disconnect();
+			observer.current = null;
+		};
+	}, []);
+	const ref = useCallback((el: HTMLElement | null) => {
+		if (!el) return;
+		els.current.add(el);
+		observer.current?.observe(el);
+	}, []);
+	return { ref, long };
 }
 
 function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
@@ -72,9 +113,7 @@ function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
 	const added = entry.changes.includes("added");
 	const removed = entry.changes.includes("removed");
 	const clamp = whole ? undefined : DIFF_TEXT_LINES;
-	const long =
-		isLongText(entry.after) ||
-		(entry.changes.includes("text") || removed ? isLongText(entry.before) : false);
+	const { ref: watch, long } = useClampCuts(whole);
 	return (
 		<Paper
 			withBorder
@@ -98,27 +137,32 @@ function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
 			</Group>
 			{entry.changes.includes("text") && entry.before !== null && (
 				<Text
+					ref={watch}
 					size="xs"
 					c="dimmed"
 					td="line-through"
 					lineClamp={clamp}
 					style={{ whiteSpace: "pre-wrap" }}
+					data-testid="outline-plan-diff-before"
 				>
 					{entry.before}
 				</Text>
 			)}
 			{removed ? (
 				<Text
+					ref={watch}
 					size="xs"
 					c="red"
 					td="line-through"
 					lineClamp={clamp}
 					style={{ whiteSpace: "pre-wrap" }}
+					data-testid="outline-plan-diff-before"
 				>
 					{entry.before}
 				</Text>
 			) : (
 				<Text
+					ref={watch}
 					size="xs"
 					c={added ? "green" : undefined}
 					lineClamp={clamp}

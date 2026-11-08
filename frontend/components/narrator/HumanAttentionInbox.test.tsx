@@ -923,6 +923,32 @@ describe("human attention decisions", () => {
 		expect(rows()).toEqual(["r", "r.0", "r.1", "r.1.0", "r.1.1", "r.2", "r.2.0"]);
 	});
 
+	test("an outline plan declared in any case reads as its outline, as on the card", async () => {
+		const plan = item("outline-plan-mode", { toolName: "ExitPlanMode", kind: "plan_approval" });
+		addPermission(plan, {
+			mode: " Outline ",
+			plan: serializeMarkdownOutline([
+				{
+					content: "Ship the importer",
+					task: { status: "todo", assignee: null },
+					props: {},
+					children: [
+						{ content: "Background.", task: null, props: {}, children: [] },
+						{
+							content: "Phase 1",
+							task: { status: "todo", assignee: null },
+							props: {},
+							children: [],
+						},
+					],
+				},
+			]),
+		});
+		await openDrawer();
+		await click("Review decision", row(plan.id));
+		expect(row(plan.id).querySelector("[data-testid=outline-plan-tree]")).not.toBeNull();
+	});
+
 	test("each item stays independently busy and denial preserves feedback and frozen remote target", async () => {
 		const one = item("one");
 		const two = item("two");

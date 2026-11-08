@@ -31,6 +31,14 @@ export interface UsePermissionFocusNavResult {
 }
 
 /**
+ * Controls whose own Enter is theirs: a press on one of them (or inside one) activates it, never
+ * the waiting permission's highlighted button. Text fields are handled before this (only the
+ * empty composer hands its Enter over).
+ */
+const OWN_ENTER_SELECTOR =
+	'button, a[href], summary, select, [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"])';
+
+/**
  * Index-based keyboard navigation for permission buttons, extracted from
  * NarratorPanel: left/right arrows shift the highlighted button and Enter fires
  * its registered action, defaulting to Allow (first) or Deny (last, when the
@@ -136,6 +144,15 @@ export function usePermissionFocusNav(
 			}
 
 			if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
+				// Enter belongs to the permission only where nothing else owns it: the page itself,
+				// or the empty composer (whose own handler prevents the newline and hands it over).
+				// A focused control — a plan tree's toggle, "View changes", a link — keeps its Enter,
+				// and one that handled the key itself (prevented its default) is not run over.
+				const composer = !!target && !!composerRef.current?.ownsTextarea(target);
+				if (!composer) {
+					if (e.defaultPrevented) return;
+					if (target instanceof Element && target.closest(OWN_ENTER_SELECTOR)) return;
+				}
 				const action = permActionsRef.current[effectiveFocusIndex];
 				if (!action) return;
 				e.preventDefault();

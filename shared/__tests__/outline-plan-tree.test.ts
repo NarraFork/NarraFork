@@ -118,6 +118,72 @@ describe("parsing the plan's markdown", () => {
 		expect(t?.root.children.map((c) => c.role)).toEqual(["point", "point"]);
 	});
 
+	test("a question put to a person or a note for the agent first: the background is the block after it", () => {
+		// As the read renders an `Ask` asked on the plan root: its note under it.
+		const asked = [
+			"- [ ] Title",
+			"  - Rate-limit per session?",
+			"    ‹question for human:bob · 1. yes  2. no · open›",
+			"  - The importer fails every night.",
+			"  - [ ] Phase 1",
+		].join("\n");
+		const t = parsePlanTree(asked);
+		expect(t?.root.children.map((c) => [c.role, !!c.question])).toEqual([
+			["point", true],
+			["background", false],
+			["point", false],
+		]);
+		// A question under the background is not one of its children for the shape.
+		const under = parsePlanTree(
+			[
+				"- [ ] Title",
+				"  - The importer fails every night.",
+				"    - Rate-limit per session?",
+				"      ‹question for human:bob · open›",
+				"  - [ ] Phase 1",
+			].join("\n"),
+		);
+		expect(under?.root.children[0]?.role).toBe("background");
+		const noted = parsePlanTree(
+			serializeMarkdownOutline([
+				step("Title", [
+					item("Returned (version 1): add a rollback"),
+					item("The importer fails every night."),
+					step("Phase 1"),
+				]),
+			]),
+		);
+		expect(noted?.root.children.map((c) => c.role)).toEqual(["point", "background", "point"]);
+	});
+
+	test("a legacy first paragraph far past a background's length is a point", () => {
+		const long = (n: number) =>
+			parsePlanTree(serializeMarkdownOutline([step("Title", [item("景".repeat(n)), step("P")])]))
+				?.root.children[0]?.role;
+		expect(long(800)).toBe("background");
+		expect(long(801)).toBe("point");
+	});
+
+	test("a task titled like the notable points is a big point", () => {
+		const t = parsePlanTree(
+			serializeMarkdownOutline([
+				step("Title", [
+					item("Background."),
+					step("注意事项", [step("x")]),
+					item("注意事项", [item("y")]),
+				]),
+			]),
+		);
+		expect(t?.root.children.map((c) => c.role)).toEqual(["background", "point", "notable"]);
+	});
+
+	test("a note-looking line inside a code block is the code's, not a note", () => {
+		const code = ["- [ ] Title", "  - ```", "    ‹question for x›", "    ```"].join("\n");
+		const t = parsePlanTree(code);
+		expect(t?.root.children[0]?.lines.map((l) => l.runs[0]?.text)).toContain("‹question for x›");
+		expect(t?.root.children[0]?.question).toBeUndefined();
+	});
+
 	test("marks, links, line breaks, a heading, code, properties and the assignee", () => {
 		const md = serializeMarkdownOutline([
 			{
@@ -346,6 +412,23 @@ describe("the reader's view", () => {
 		expect(isPlanTreeAllExpanded(one)).toBe(false);
 		expect(isPlanTreeAllExpanded(applyPlanTreeAction(one, { kind: "all" }))).toBe(true);
 		expect(isDefaultPlanTreeView(applyPlanTreeAction(all, { kind: "all" }))).toBe(true);
+	});
+
+	test("an action can say which way: what the control showed, whatever the view is now", () => {
+		const expanded = act(DEFAULT_PLAN_TREE_VIEW, { kind: "subtree", key: "r.1" });
+		// Asked to open what is open: stays open (no toggle back).
+		expect(applyPlanTreeAction(expanded, { kind: "subtree", key: "r.1", open: true })).toEqual(
+			expanded,
+		);
+		expect(
+			isDefaultPlanTreeView(
+				applyPlanTreeAction(expanded, { kind: "subtree", key: "r.1", open: false }),
+			),
+		).toBe(true);
+		expect(isDefaultPlanTreeView(act(DEFAULT_PLAN_TREE_VIEW, { kind: "all", open: false }))).toBe(
+			true,
+		);
+		expect(isPlanTreeAllExpanded(act(expanded, { kind: "all", open: true }))).toBe(true);
 	});
 
 	test("the signature names the view; the default view's is empty", () => {

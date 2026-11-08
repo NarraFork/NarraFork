@@ -37,9 +37,9 @@ const task = (content: string, children: PlanStructureNode[] = []) =>
 const background = () =>
 	node("导入器每天夜里失败，要人工重跑；这次让它无人值守地跑完，失败时自己重试并告警。");
 
-/** A plan in the format: a title, the background, then `children`. */
-const plan = (children: PlanStructureNode[] = [], title = "Ship the importer") =>
-	node(title, [background(), ...children]);
+/** A plan in the format: a title, the background, then `children` (by default one big point). */
+const plan = (children?: PlanStructureNode[], title = "Ship the importer") =>
+	node(title, [background(), ...(children ?? [task("Phase 1")])]);
 const issues = (root: PlanStructureNode, isNote?: (n: PlanStructureNode) => boolean) =>
 	planStructureIssues(root, { isNote }).issues;
 
@@ -78,38 +78,38 @@ describe("a plan in the format", () => {
 
 describe("the root is a short one-line title", () => {
 	test("exactly the limit passes, one more is refused (Latin)", () => {
-		expect(planStructureIssues(plan([], "a".repeat(rootChars))).total).toBe(0);
-		const root = plan([], "a".repeat(rootChars + 1));
+		expect(planStructureIssues(plan(undefined, "a".repeat(rootChars))).total).toBe(0);
+		const root = plan(undefined, "a".repeat(rootChars + 1));
 		expect(issues(root)).toEqual([{ kind: "root", sid: root.sid, chars: rootChars + 1, lines: 1 }]);
 	});
 
 	test("a CJK character counts 1, like a letter; an astral character too", () => {
-		expect(planStructureIssues(plan([], "历".repeat(rootChars))).total).toBe(0);
-		expect(issues(plan([], "历".repeat(rootChars + 1)))[0]).toMatchObject({
+		expect(planStructureIssues(plan(undefined, "历".repeat(rootChars))).total).toBe(0);
+		expect(issues(plan(undefined, "历".repeat(rootChars + 1)))[0]).toMatchObject({
 			kind: "root",
 			chars: 81,
 		});
-		expect(planStructureIssues(plan([], "𠀋".repeat(rootChars))).total).toBe(0);
+		expect(planStructureIssues(plan(undefined, "𠀋".repeat(rootChars))).total).toBe(0);
 	});
 
 	test("markup and a link's target do not count; its label does", () => {
 		const link = `[导入器](https://example.com/${"x".repeat(200)})`;
-		expect(planStructureIssues(plan([], `**${"a".repeat(70)}** ${link}`)).total).toBe(0);
+		expect(planStructureIssues(plan(undefined, `**${"a".repeat(70)}** ${link}`)).total).toBe(0);
 		expect(planBlockText(`**粗体** \`code\` [[k/AbCdEfGh|标签]]`).text).toBe("粗体 code 标签");
 	});
 
 	test("a second line is refused however short (the goal and the acceptance crammed in)", () => {
-		const root = plan([], "导入器\n目标：能导入\n验收：测试通过");
+		const root = plan(undefined, "导入器\n目标：能导入\n验收：测试通过");
 		expect(issues(root)).toEqual([{ kind: "root", sid: root.sid, chars: 16, lines: 3 }]);
 	});
 
 	test("a code block or a table is not a title; an empty root and a heading root are", () => {
-		expect(issues(plan([], "```\nx\n```"))[0]).toMatchObject({ kind: "root" });
-		expect(issues(plan([], "| a | b |\n| - | - |\n| 1 | 2 |"))[0]).toMatchObject({
+		expect(issues(plan(undefined, "```\nx\n```"))[0]).toMatchObject({ kind: "root" });
+		expect(issues(plan(undefined, "| a | b |\n| - | - |\n| 1 | 2 |"))[0]).toMatchObject({
 			kind: "root",
 		});
-		expect(planStructureIssues(plan([], "")).total).toBe(0);
-		expect(planStructureIssues(plan([], "# 导入器")).total).toBe(0);
+		expect(planStructureIssues(plan(undefined, "")).total).toBe(0);
+		expect(planStructureIssues(plan(undefined, "# 导入器")).total).toBe(0);
 	});
 });
 
@@ -148,21 +148,24 @@ describe("the root's first block is the background", () => {
 
 	test(`at most ${backgroundChars} characters, CJK counting 1; more is refused as a background`, () => {
 		const fits = node("景".repeat(backgroundChars));
-		expect(planStructureIssues(node("Title", [fits])).total).toBe(0);
+		expect(planStructureIssues(node("Title", [fits, task("Phase")])).total).toBe(0);
 		const long = node("景".repeat(backgroundChars + 1));
-		expect(issues(node("Title", [long]))).toEqual([
+		expect(issues(node("Title", [long, task("Phase")]))).toEqual([
 			{ kind: "long", sid: long.sid, chars: backgroundChars + 1, role: "background" },
 		]);
 		// Markup is not counted: a long link target in the background is fine.
 		const linked = node(`${"景".repeat(backgroundChars - 2)}[链接](https://x/${"y".repeat(300)})`);
-		expect(planStructureIssues(node("Title", [linked])).total).toBe(0);
+		expect(planStructureIssues(node("Title", [linked, task("Phase")])).total).toBe(0);
 	});
 
 	test("notes for the agent and questions put to a person do not take its place", () => {
 		const isNote = (n: PlanStructureNode) => (n.content ?? "").startsWith("退回意见");
 		const note = node("退回意见（第 1 版）：请先写背景");
 		const ask = node("要不要按会话限频？", [], { ask: { status: "open" } });
-		expect(planStructureIssues(node("Title", [note, ask, background()]), { isNote }).total).toBe(0);
+		expect(
+			planStructureIssues(node("Title", [note, ask, background(), task("Phase")]), { isNote })
+				.total,
+		).toBe(0);
 		const only = node("Title", [note, ask]);
 		expect(issues(only, isNote)).toEqual([{ kind: "background", sid: only.sid, problem: "none" }]);
 	});
@@ -245,7 +248,9 @@ describe("the notable points section", () => {
 		const notable = node("Notable points", [node("A risk")]);
 		const note = node("Returned (version 1): add a rollback");
 		const ask = node("Rate-limit per session?", [], { ask: { status: "open" } });
-		expect(planStructureIssues(plan([notable, note, ask]), { isNote }).total).toBe(0);
+		expect(planStructureIssues(plan([task("Phase"), notable, note, ask]), { isNote }).total).toBe(
+			0,
+		);
 		const again = node("注意事项", [node("另一个风险")]);
 		expect(issues(plan([notable, task("Phase"), again]))).toEqual([
 			{ kind: "notable", sid: notable.sid },
@@ -254,9 +259,34 @@ describe("the notable points section", () => {
 
 	test("its items are points", () => {
 		const item = node("险".repeat(pointChars + 1));
-		expect(issues(plan([node("Notable points", [item])]))).toEqual([
+		expect(issues(plan([task("Phase"), node("Notable points", [item])]))).toEqual([
 			{ kind: "long", sid: item.sid, chars: pointChars + 1, role: "point" },
 		]);
+	});
+});
+
+describe("a plan has points; a notable section has items", () => {
+	test("a background alone, or with the notable points only, has no big point", () => {
+		const bare = node("Title", [background()]);
+		expect(issues(bare)).toEqual([{ kind: "noPoints", sid: bare.sid }]);
+		const notableOnly = node("Title", [background(), node("Notable points", [node("A risk")])]);
+		expect(issues(notableOnly)).toEqual([{ kind: "noPoints", sid: notableOnly.sid }]);
+	});
+
+	test("an empty notable section is refused; a question under it is not an item", () => {
+		const empty = node("特别值得注意的点");
+		expect(issues(plan([task("Phase"), empty]))).toEqual([
+			{ kind: "notableEmpty", sid: empty.sid },
+		]);
+		const asked = node("特别值得注意的点", [node("要不要限频？", [], { ask: { status: "open" } })]);
+		expect(issues(plan([task("Phase"), asked]))).toEqual([
+			{ kind: "notableEmpty", sid: asked.sid },
+		]);
+	});
+
+	test("a task titled like the section is a big point, not the section", () => {
+		const phase = task("注意事项");
+		expect(planStructureIssues(plan([phase, task("Phase 2")])).total).toBe(0);
 	});
 });
 
@@ -271,6 +301,15 @@ describe("no flat level of many blocks", () => {
 		expect(issues(plan([phase]))).toEqual([
 			{ kind: "flat", sid: phase.sid, children: maxChildren + 3 },
 		]);
+	});
+
+	test("questions put to a person do not count toward a level, nor as a background's children", () => {
+		const ask = () => node("要不要按会话限频？", [], { ask: { status: "open" } });
+		const kids = Array.from({ length: maxChildren }, (_, i) => task(`Step ${i}`));
+		const phase = task("Phase", [...kids, ask(), ask()]);
+		expect(planStructureIssues(plan([phase])).total).toBe(0);
+		const asked = node("背景：导入器每天夜里失败。", [ask()]);
+		expect(planStructureIssues(node("Title", [asked, task("Phase")])).total).toBe(0);
 	});
 });
 
@@ -308,6 +347,7 @@ describe("the report", () => {
 			pointChars + 1,
 			pointChars + 2,
 			"notable",
+			"notableEmpty",
 			pointChars + 3,
 		]);
 	});

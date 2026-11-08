@@ -88,7 +88,7 @@ async function render(options: Fixture.FixtureOptions): Promise<Fixture.CardRepo
 		options as never,
 	);
 	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.steady());
-	if (options.scene === "inbox") return null as unknown as Fixture.CardReport;
+	if (options.scene.startsWith("inbox")) return null as unknown as Fixture.CardReport;
 	return await page.evaluate(() => (window as unknown as FixtureWindow).fixture.report());
 }
 
@@ -118,6 +118,20 @@ async function press(selector: string, key: "Enter" | "Space", alt = false) {
 	if (alt) await page.keyboard.up("Alt");
 	await page.evaluate((b) => (window as unknown as FixtureWindow).fixture.afterCommit(b), before);
 	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.steady());
+}
+
+async function decisions(): Promise<number> {
+	return await page.evaluate(() => (window as unknown as FixtureWindow).fixture.decisionCount());
+}
+
+async function focusedAt() {
+	return await page.evaluate(() => (window as unknown as FixtureWindow).fixture.focused());
+}
+
+/** Enter on the page itself (nothing focused): where the waiting permission's shortcut lives. */
+async function enterOnPage(): Promise<void> {
+	await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+	await page.keyboard.press("Enter");
 }
 
 async function report(): Promise<Fixture.CardReport> {
@@ -537,6 +551,165 @@ describe("the inbox's tree", () => {
 			expect(tree.overflowX).toBe(false);
 		});
 	}
+});
+
+describe("the keyboard: a control's Enter and Space are its own (review round 1 B1, S4)", () => {
+	test("on the approval card, under the panel's shortcut: nothing decides but the page's Enter", async () => {
+		await render({
+			scene: "format",
+			lang: "zh-CN",
+			scheme: "dark",
+			width: 720,
+			approval: true,
+			keyboard: true,
+		});
+		expect(await decisions()).toBe(0);
+		// The arrow: closes, then opens again.
+		await press('[data-plan-row="r.1"] [data-plan-toggle]', "Enter");
+		let card = await report();
+		expect(row(card, "r.1").open).toBe("0");
+		await press('[data-plan-row="r.1"] [data-plan-toggle]', "Space");
+		card = await report();
+		expect(row(card, "r.1").open).toBe("1");
+		// A preview line: everything inside the small point; the focus goes to its quick control.
+		await press('[data-plan-row="r.1.0"] [data-plan-preview]', "Enter");
+		card = await report();
+		expectExact(card);
+		expect(keys(card)).toContain("r.1.0.3.0");
+		expect(await focusedAt()).toEqual({ row: "r.1.0", control: "subtree:collapse" });
+		// The quick control, where the focus now is: back to one line.
+		await press('[data-plan-row="r.1.0"] [data-plan-subtree]', "Enter");
+		card = await report();
+		expect(row(card, "r.1.0").preview?.label).toBe("还有 4 条 ▸");
+		// 「全部展开」 and back.
+		await press("[data-plan-all]", "Enter");
+		card = await report();
+		expect(card.allLabel).toBe("全部收起");
+		await press("[data-plan-all]", "Enter");
+		card = await report();
+		expect(card.allLabel).toBe("全部展开");
+		expect(keys(card)).toEqual(DEFAULT_KEYS);
+		expect(await decisions()).toBe(0);
+		// Enter on the page itself is still the shortcut: the plan is decided (executed as a draft).
+		await enterOnPage();
+		await page.waitForFunction(
+			() => (window as unknown as FixtureWindow).fixture.decisionCount() === 1,
+			{ timeout: 5000, polling: 20 },
+		);
+	});
+
+	test("in the inbox, under a session panel's shortcut: the same", async () => {
+		await render({ scene: "inbox", lang: "en", scheme: "light", width: 720, keyboard: true });
+		const before = await decisions();
+		await press('[data-plan-row="r.2"] [data-plan-toggle]', "Enter");
+		expect(row(await inbox(), "r.2").open).toBe("0");
+		await press('[data-plan-row="r.1.0"] + [data-plan-preview]', "Enter");
+		let tree = await inbox();
+		expect(keys(tree)).toContain("r.1.0.3.0");
+		expect(await focusedAt()).toEqual({ row: "r.1.0", control: "subtree:collapse" });
+		await press('[data-plan-row="r.1.0"] [data-plan-subtree]', "Space");
+		tree = await inbox();
+		expect(keys(tree)).not.toContain("r.1.0.0");
+		await press("[data-testid=outline-plan-tree-all]", "Enter");
+		tree = await inbox();
+		expect(tree.allLabel).toBe("Collapse all");
+		await press('[data-plan-row="r.3"] [data-plan-toggle]', "Enter", true);
+		expect(await decisions()).toBe(before);
+		await enterOnPage();
+		await page.waitForFunction(
+			(n) => (window as unknown as FixtureWindow).fixture.decisionCount() === n,
+			{ timeout: 5000, polling: 20 },
+			before + 1,
+		);
+	});
+});
+
+describe("clicks and names", () => {
+	test("a Ctrl/Cmd/Shift click is the list's selection, not a toggle", async () => {
+		let card = await render({ scene: "format", lang: "en", scheme: "light", width: 720 });
+		const folded = card.measured;
+		for (const key of ["Control", "Shift"] as const) {
+			await page.keyboard.down(key);
+			await page.click('[data-plan-row="r.1"] [data-plan-toggle]');
+			await page.click('[data-plan-row="r.1.0"] [data-plan-preview]');
+			await page.keyboard.up(key);
+		}
+		card = await report();
+		expect(card.measured).toBe(folded);
+		expect(keys(card)).toEqual(DEFAULT_KEYS);
+	});
+
+	test("the quick control keeps its name; its state is aria-expanded; no arrow in a name", async () => {
+		await render({ scene: "format", lang: "zh-CN", scheme: "dark", width: 720 });
+		const read = () =>
+			page.evaluate(() => {
+				const quick = document.querySelector('[data-plan-row="r.1.0"] [data-plan-subtree]');
+				const preview = document.querySelector('[data-plan-row="r.1.1"] [data-plan-preview]');
+				const arrow = document.querySelector('[data-plan-row="r.1"] [data-plan-toggle]');
+				return {
+					quick: [quick?.getAttribute("aria-label"), quick?.getAttribute("aria-expanded")],
+					preview: preview?.getAttribute("aria-label"),
+					arrow: [arrow?.getAttribute("aria-label"), arrow?.getAttribute("aria-expanded")],
+					all: document.querySelector("[data-plan-all]")?.hasAttribute("aria-pressed"),
+				};
+			});
+		expect(await read()).toEqual({
+			quick: ["其中全部", "false"],
+			preview: "展开这一项里的全部: 还有 2 条",
+			arrow: ["阶段 1：去掉固定时间拒绝", "true"],
+			all: false,
+		});
+		await click('[data-plan-row="r.1.0"] [data-plan-subtree]');
+		expect((await read()).quick).toEqual(["其中全部", "true"]);
+	});
+
+	test("the box scrolls with the list's overlay scrollbars: rows keep its full width", async () => {
+		await render({ scene: "format", lang: "zh-CN", scheme: "dark", width: 720 });
+		const card = await click("[data-plan-all]");
+		expectExact(card);
+		expect(card.box && card.box.scrollHeight > card.box.clientHeight).toBe(true);
+		const widths = await page.evaluate(() => {
+			const port = document.querySelector<HTMLElement>("[data-plan-box] [data-content-scrollport]");
+			return port
+				? [port.clientWidth, port.offsetWidth, getComputedStyle(port).scrollbarWidth]
+				: null;
+		});
+		expect(widths?.[0]).toBe(widths?.[1]);
+		expect(widths?.[2]).toBe("none");
+	});
+});
+
+describe("the inbox's text controls (review round 1 S5)", () => {
+	test("only a text longer than its clamp is a control; a short point's is not", async () => {
+		await render({ scene: "inbox", lang: "zh-CN", scheme: "dark", width: 360 });
+		let tree = await inbox();
+		// The format plan's points are short: none of them is a control.
+		expect(tree.rows.filter((r) => r.textToggles)).toEqual([]);
+		await render({ scene: "inbox-legacy", lang: "zh-CN", scheme: "dark", width: 360 });
+		tree = await inbox();
+		const toggles = tree.rows.filter((r) => r.textToggles).map((r) => r.key);
+		expect(toggles).toContain("r");
+		expect(toggles).not.toContain("r.1.2");
+		// A click shows it whole; Enter clamps it again.
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.click('[data-plan-row="r"] [data-plan-text]'),
+		);
+		await page.waitForFunction(
+			() =>
+				document
+					.querySelector('[data-inbox] [data-plan-row="r"] [data-plan-text]')
+					?.getAttribute("aria-expanded") === "true",
+			{ timeout: 5000, polling: 20 },
+		);
+		await press('[data-plan-row="r"] [data-plan-text]', "Enter");
+		expect(
+			await page.evaluate(() =>
+				document
+					.querySelector('[data-inbox] [data-plan-row="r"] [data-plan-text]')
+					?.getAttribute("aria-expanded"),
+			),
+		).toBe("false");
+	});
 });
 
 describe("before (the old card, for the screenshots)", () => {

@@ -25,7 +25,8 @@
  * root still has to be a title, a background a paragraph). Notes written FOR the agent under the
  * root (a person's returned feedback, an earlier review's comments) and questions put to a person
  * (`Ask`, with their answers) are not the agent's text: they are neither checked nor counted, nor
- * do they take the background's or the notable points' place.
+ * do they take the background's or the notable points' place. A plan needs at least one big
+ * point, and a notable points section at least one item.
  *
  * Pure: no database, no DOM. Content is the block's canonical dialect markdown.
  */
@@ -106,7 +107,11 @@ export type PlanStructureIssue =
 	/** Too many blocks directly under one block: a flat list, not levels. */
 	| { kind: "flat"; sid: string; children: number }
 	/** The notable points section is not the root's last block. */
-	| { kind: "notable"; sid: string };
+	| { kind: "notable"; sid: string }
+	/** The notable points section has nothing under it. */
+	| { kind: "notableEmpty"; sid: string }
+	/** Under the root there is no big point (only the background, the notable points). */
+	| { kind: "noPoints"; sid: string };
 
 export interface PlanStructureReport {
 	/** The first {@link OUTLINE_PLAN_STRUCTURE.listed} problems, in document order. */
@@ -199,6 +204,24 @@ export function isNotablePointsHeading(content: string | null): boolean {
 	return NOTABLE_HEADINGS.some((pattern) => pattern.test(words));
 }
 
+/**
+ * The notes written under a plan root for the agent, by their first words (both languages, any
+ * version): a person's returned feedback and a plan review's block. The server's prompts write
+ * them (`getOutlinePlanReturnedNote`, `getOutlinePlanReviewTitle`); its tests hold these to them.
+ */
+const PLAN_NOTE_PREFIXES: readonly RegExp[] = [
+	/^退回意见（第 \d+ 版）：/,
+	/^Returned \(version \d+\):/,
+	/^审查意见（第 \d+ 版）/,
+	/^Review \(version \d+\)/,
+];
+
+/** Whether a block's content is a note for the agent (a person's or a review's, not its). */
+export function isPlanNoteContent(content: string | null): boolean {
+	if (!content) return false;
+	return PLAN_NOTE_PREFIXES.some((prefix) => prefix.test(content));
+}
+
 /** Whether a root's content is a title: one prose line of at most `rootChars` characters. */
 function rootIssue(sid: string, content: string): PlanStructureIssue | null {
 	const limit = OUTLINE_PLAN_STRUCTURE.rootChars;
@@ -234,7 +257,9 @@ function longIssue(sid: string, content: string, role: PlanBlockRole): PlanStruc
 /**
  * The plan's problems, in document order (each block: its own text, then how many blocks are
  * directly under it; the background's and the notable section's place where they sit). `isNote`
- * names the root's children that are notes for the agent (left out with what is under them).
+ * names the root's children that are notes for the agent (left out with what is under them);
+ * questions put to a person (`ask`) are left out everywhere, and do not count toward a level's
+ * blocks or a background's children.
  */
 export function planStructureIssues(
 	root: PlanStructureNode,
@@ -248,21 +273,20 @@ export function planStructureIssues(
 		if (issues.length < OUTLINE_PLAN_STRUCTURE.listed) issues.push(issue);
 	};
 	add(rootIssue(root.sid, root.content ?? ""));
-	const top = root.children.filter((child) => !options.isNote?.(child));
-	if (top.length > OUTLINE_PLAN_STRUCTURE.maxChildren)
-		add({ kind: "flat", sid: root.sid, children: top.length });
 	// The plan's own blocks under the root: the background first, the notable section last.
-	const plan = top.filter((child) => !child.ask);
+	const plan = root.children.filter((child) => !child.ask && !options.isNote?.(child));
+	if (plan.length > OUTLINE_PLAN_STRUCTURE.maxChildren)
+		add({ kind: "flat", sid: root.sid, children: plan.length });
 	const first = plan[0];
 	if (!first) add({ kind: "background", sid: root.sid, problem: "none" });
 	const last = plan[plan.length - 1];
-	for (const child of top) {
-		if (child.ask) continue;
+	let points = 0;
+	for (const child of plan) {
 		if (child === first) {
 			const problem = planBackgroundProblem({
 				content: child.content,
 				task: !!child.task,
-				children: child.children.length,
+				children: ownChildren(child).length,
 			});
 			if (!problem) {
 				add(longIssue(child.sid, child.content ?? "", "background"));
@@ -271,11 +295,25 @@ export function planStructureIssues(
 			// Not a background: say so, and check it as the point it is.
 			add({ kind: "background", sid: child.sid, problem });
 		}
-		if (child !== last && isNotablePointsHeading(child.content))
-			add({ kind: "notable", sid: child.sid });
+		if (isNotableSection(child)) {
+			if (child !== last) add({ kind: "notable", sid: child.sid });
+			if (ownChildren(child).length === 0) add({ kind: "notableEmpty", sid: child.sid });
+		} else points++;
 		walk(child, 1, add);
 	}
+	// A background (and the notable points) alone is not a plan yet.
+	if (first && points === 0) add({ kind: "noPoints", sid: root.sid });
 	return { issues, total };
+}
+
+/** Its children that are the agent's (questions put to a person left out). */
+function ownChildren(node: PlanStructureNode): PlanStructureNode[] {
+	return node.children.filter((child) => !child.ask);
+}
+
+/** The notable points section: a block (not a task) titled so. */
+function isNotableSection(node: PlanStructureNode): boolean {
+	return !node.task && isNotablePointsHeading(node.content);
 }
 
 /** A block at `depth` (1 under the root) and what is under it, in document order. */
@@ -290,8 +328,9 @@ function walk(
 		// A question put to a person, and its answers: not the agent's text to shorten.
 		if (node.ask) continue;
 		add(longIssue(node.sid, node.content ?? "", at <= 2 ? "point" : "detail"));
-		if (node.children.length > OUTLINE_PLAN_STRUCTURE.maxChildren)
-			add({ kind: "flat", sid: node.sid, children: node.children.length });
+		const own = ownChildren(node).length;
+		if (own > OUTLINE_PLAN_STRUCTURE.maxChildren)
+			add({ kind: "flat", sid: node.sid, children: own });
 		for (let i = node.children.length - 1; i >= 0; i--)
 			stack.push({ node: node.children[i] as PlanStructureNode, depth: at + 1 });
 	}

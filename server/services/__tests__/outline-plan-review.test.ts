@@ -885,6 +885,34 @@ describe("this version's reviews are not the plan (review round 1 N1, N2, N4)", 
 
 // ── ok ─────────────────────────────────────────────────────────────────────────────────────
 
+describe("a plan not in the plan format (plan readability)", () => {
+	test("is sent back to the agent by the gate before any review runs; nothing is written", async () => {
+		const plan = await planned();
+		// The background taken out: the first block is now a step.
+		const first = (await outlineStore.listChildren(plan.space.id, plan.root, 10))[0];
+		await agentWrite(plan.id, plan.owner, [{ op: "delete", block: { id: first?.id as string } }]);
+		const commitsBefore = (await outlineStore.listCommits(plan.space.id, { limit: 200 })).length;
+		const call = await exitPlanCall(plan.id, { mode: "outline" });
+		requests.length = 0;
+		turns = [async () => [review({ verdict: "ok" })]];
+		const result = await resolveExitPlanModeReflection(
+			config(plan.id, plan.owner),
+			[],
+			call.toolUse,
+		);
+		expect(result.decision.action).toBe("revise");
+		expect(result.decision.action === "revise" ? result.decision.feedback : "").toContain(
+			"does not follow the plan format yet; nothing was submitted to the user",
+		);
+		expect(requests).toHaveLength(0);
+		expect(await reviewCommits(plan.space.id)).toHaveLength(0);
+		expect((await outlineStore.listCommits(plan.space.id, { limit: 200 })).length).toBe(
+			commitsBefore,
+		);
+		expect((await block(plan.root)).taskJson?.plan).toMatchObject({ state: "planning", round: 0 });
+	});
+});
+
 describe("ok: approved as a draft on the person's behalf", () => {
 	test("by system:plan-review, never locked, nothing written, not the person's work", async () => {
 		const plan = await planned();

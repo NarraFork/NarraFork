@@ -19,6 +19,7 @@ import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
 import { outlineAddressPath } from "../outline-links";
+import { isOutlinePlanInput } from "../outline-plan-submission";
 import {
 	DEFAULT_PLAN_TREE_VIEW,
 	type PlanTree,
@@ -2762,18 +2763,6 @@ const REPROCESSING_FAILURE_DENY_PREFIX = "Permission reprocessing failed:";
  */
 export function isServerAuthoredDenyMessage(text: string): boolean {
 	return text === PLACEHOLDER_DENY_MESSAGE || text.startsWith(REPROCESSING_FAILURE_DENY_PREFIX);
-}
-
-/**
- * Whether an ExitPlanMode input is an outline plan's (outline P2 PR 8): the model declares
- * `mode: "outline"`, and the server's resolution writes `_planRoot`. A plan file's input has
- * neither.
- */
-function isOutlinePlanInput(inputJson: unknown): boolean {
-	const input = asObject(inputJson);
-	if (!input) return false;
-	if (asObject(input._planRoot)) return true;
-	return typeof input.mode === "string" && input.mode.trim().toLowerCase() === "outline";
 }
 
 function classifyPlan(

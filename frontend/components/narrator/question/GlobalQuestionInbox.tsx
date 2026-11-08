@@ -20,7 +20,7 @@ import {
 	Text,
 } from "@mantine/core";
 import type { HumanAttentionItem } from "@shared/human-attention";
-import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
+import { isOutlinePlanInput, outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { parsePlanTree } from "@shared/outline-plan-tree";
 import {
 	getReflectionSuggestion,
@@ -588,7 +588,7 @@ function PermissionReviewContext({
 	const planTree = useMemo(
 		() =>
 			plan !== null &&
-			(outlinePlanSubmissionOf(record ?? undefined) !== null || record?.mode === "outline")
+			(outlinePlanSubmissionOf(record ?? undefined) !== null || isOutlinePlanInput(record))
 				? parsePlanTree(previewPlan ?? plan)
 				: null,
 		[plan, previewPlan, record],

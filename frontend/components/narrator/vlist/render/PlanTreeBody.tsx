@@ -6,7 +6,9 @@
  * 「还有 N 条 ▸」). Every row sits where the measure put it; its text is laid out again from the
  * same prepared flows at the same width, line by line, and only as many lines as were measured
  * are drawn (a clamped text's last line, and a preview's line, narrower by the ellipsis and the
- * label, so they fit on it). Nothing here changes a height.
+ * label, so they fit on it). Nothing here changes a height. The box scrolls past its cap with the
+ * list's overlay scrollbars (`AutoFollowScroll` with a declared layout), so a scrollbar never
+ * takes room from rows laid out for the box's full width.
  *
  * The controls, each calling `onPlanTree` (the list's interaction state flips, the card is
  * measured again):
@@ -15,10 +17,13 @@
  *   - the quick control at the right of a row with something folded inside does the same as
  *     Alt+click, for touch and for a reader who does not know the gesture;
  *   - a preview line opens everything inside its node (the small point's details, each whole);
+ *     focus then moves to that row's quick control (or its arrow), not to the page;
  *   - a clamped text shows whole, and clamps again.
- * The arrow and the quick control are native buttons sized by the measure's slots; the preview
- * and the text are `role="button"` boxes (a native button's chrome is not in the measure). None
- * has a hover style: they are always drawn, and focus shows them as every button in the list.
+ * Enter and Space on each control are its own: handled here, their default prevented and the
+ * key kept from the window (the waiting permission's Enter shortcut never runs over them). A
+ * Ctrl/Cmd/Shift click is the list's selection, not a toggle. The arrow and the quick control are
+ * native buttons sized by the measure's slots; the preview and the text are `role="button"` boxes
+ * (a native button's chrome is not in the measure). None has a hover style.
  */
 import {
 	layoutNextRichInlineLineRange,
@@ -30,8 +35,9 @@ import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { IconFoldDown, IconFoldUp } from "@tabler/icons-react";
 import type React from "react";
-import { Fragment, useMemo } from "react";
+import { Fragment, useLayoutEffect, useMemo, useRef } from "react";
 import { FOLD_ICONS, TASK_ICONS } from "../../../outline/outline-icons";
+import { AutoFollowScroll, useContentViewport } from "../../scroll/AutoFollowScroll";
 import type {
 	PlanTreeLayout,
 	PlanTreePreparedLine,
@@ -44,6 +50,7 @@ import {
 	PLAN_TREE_PAD_Y,
 	PLAN_TREE_PREVIEW_LABEL_GAP,
 	PLAN_TREE_SUBTREE_SLOT,
+	PLAN_TREE_TOGGLE_HIT,
 	PLAN_TREE_TOGGLE_SLOT,
 	planTreeIconPx,
 } from "../measure/measure-plan-tree";
@@ -64,31 +71,59 @@ export interface PlanTreeLabels {
 	collapse: string;
 	/** What Alt+click on the arrow does (the arrow's tooltip). */
 	altHint: string;
-	/** The quick control: everything inside this node. */
+	/** The quick control's name (its state is `aria-expanded`), and what a press does now. */
+	subtree: string;
 	subtreeExpand: string;
 	subtreeCollapse: string;
-	/** A preview line's name for assistive technology. */
-	showDetails: string;
+	/** A preview line's name for assistive technology (its label follows, without the arrow). */
+	showInside: string;
 	showWhole: string;
 	showLess: string;
 	more: (count: number) => string;
 }
 
 export const DEFAULT_PLAN_TREE_LABELS: PlanTreeLabels = {
-	overview: (count) => `Outline · ${count} blocks`,
-	overviewAll: (count) => `Outline · all ${count} blocks shown`,
+	overview: (count) => `Outline · ${count} ${count === 1 ? "block" : "blocks"}`,
+	overviewAll: (count) => `Outline · all ${count} ${count === 1 ? "block" : "blocks"} shown`,
 	expandAll: "Expand all",
 	collapseAll: "Collapse all",
 	expand: "Expand",
 	collapse: "Collapse",
 	altHint: "Alt+click: everything inside",
+	subtree: "Everything inside",
 	subtreeExpand: "Expand everything inside",
 	subtreeCollapse: "Collapse everything inside",
-	showDetails: "Show the details",
+	showInside: "Show everything inside this item",
 	showWhole: "Show the whole text",
 	showLess: "Show less",
-	more: (count) => `${count} more blocks: open the plan in the outline to see them`,
+	more: (count) =>
+		`${count} more ${count === 1 ? "block" : "blocks"}: open the plan in the outline to see them`,
 };
+
+/** A label without its trailing arrow (an accessible name says what, not "▸"). */
+function spoken(label: string): string {
+	return label.replace(/\s*[▸▾▴►]\s*$/u, "");
+}
+
+/** A modified click is the list's selection (Ctrl/Cmd/Shift), not a toggle. */
+function plainClick(e: React.MouseEvent): boolean {
+	return !(e.metaKey || e.ctrlKey || e.shiftKey);
+}
+
+/**
+ * Enter and Space on one of the tree's controls: the control's own, never the window's (the
+ * waiting permission's Enter shortcut listens there). `activate` gets whether Alt was held.
+ */
+function ownKeys(activate: (alt: boolean) => void) {
+	return (e: React.KeyboardEvent) => {
+		const space = e.code === "Space" || e.key === " " || e.key === "Spacebar";
+		if (e.key !== "Enter" && !space) return;
+		if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing) return;
+		e.preventDefault();
+		e.stopPropagation();
+		activate(e.altKey);
+	};
+}
 
 interface PaintedFragment {
 	text: string;
@@ -186,16 +221,6 @@ function Ellipsis() {
 	);
 }
 
-/** Alt+Enter / Alt+Space on the arrow: everything inside, as Alt+click. */
-function onArrowKey(subtree: () => void) {
-	return (e: React.KeyboardEvent) => {
-		if (!e.altKey || (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar")) return;
-		e.preventDefault();
-		e.stopPropagation();
-		subtree();
-	};
-}
-
 function PlanTreeRow({
 	row,
 	layout,
@@ -216,11 +241,31 @@ function PlanTreeRow({
 		if (!p?.line.flow) return [];
 		return nextLine({ ...p.line, flow: p.line.flow }, p.width, undefined)?.fragments ?? [];
 	}, [row.preview]);
+	const arrowRef = useRef<HTMLButtonElement>(null);
+	const quickRef = useRef<HTMLButtonElement>(null);
+	// A preview line activated from here goes away with it: focus follows to the row's controls.
+	const focusAfterPreview = useRef(false);
+	useLayoutEffect(() => {
+		if (!focusAfterPreview.current || row.preview) return;
+		focusAfterPreview.current = false;
+		(quickRef.current ?? arrowRef.current)?.focus();
+	}, [row.preview]);
 	const lineHeight = layout.lineHeight;
 	const icon = planTreeIconPx();
 	const background = row.role === "background";
 	const toggleNode = () => onPlanTree?.({ kind: "node", key: row.key });
-	const toggleSubtree = () => onPlanTree?.({ kind: "subtree", key: row.key });
+	// Which way the subtree goes: what its quick control shows (a row with nothing folded inside
+	// has none, and toggles).
+	const toggleSubtree = () =>
+		onPlanTree?.({
+			kind: "subtree",
+			key: row.key,
+			...(row.subtree ? { open: row.subtree === "expand" } : {}),
+		});
+	const openPreview = () => {
+		focusAfterPreview.current = true;
+		onPlanTree?.({ kind: "subtree", key: row.key, open: true });
+	};
 	const toggleText = () => {
 		// A drag that selected text is a selection, not a click on the text.
 		if (typeof window !== "undefined" && window.getSelection()?.toString()) return;
@@ -228,8 +273,9 @@ function PlanTreeRow({
 	};
 	const Fold = FOLD_ICONS[row.open ? "expanded" : "collapsed"].Icon;
 	const Task = row.task ? TASK_ICONS[row.task].Icon : null;
-	const arrowLabel = row.open ? labels.collapse : labels.expand;
-	const subtreeLabel = row.subtree === "collapse" ? labels.subtreeCollapse : labels.subtreeExpand;
+	const arrowAction = row.open ? labels.collapse : labels.expand;
+	const firstLine = row.plain.split("\n")[0]?.slice(0, 80) ?? "";
+	const subtreeAction = row.subtree === "collapse" ? labels.subtreeCollapse : labels.subtreeExpand;
 	const SubtreeIcon = row.subtree === "collapse" ? IconFoldUp : IconFoldDown;
 	const smallIcon = Math.min(14, Math.max(10, Math.round(typographyMetrics().size.sm)));
 	return (
@@ -250,19 +296,25 @@ function PlanTreeRow({
 		>
 			{row.hasChildren && !background ? (
 				<button
+					ref={arrowRef}
 					type="button"
 					aria-expanded={row.open}
-					aria-label={arrowLabel}
-					title={`${arrowLabel} · ${labels.altHint}`}
+					aria-label={firstLine || arrowAction}
+					title={`${arrowAction} · ${labels.altHint}`}
 					data-plan-toggle=""
 					className={`${ROW_BUTTON_CLASS} vlist-plan-toggle`}
-					onClick={(e) => (e.altKey ? toggleSubtree() : toggleNode())}
-					onKeyDown={onArrowKey(toggleSubtree)}
+					onClick={(e) => {
+						if (!plainClick(e)) return;
+						if (e.altKey) toggleSubtree();
+						else toggleNode();
+					}}
+					onKeyDown={ownKeys((alt) => (alt ? toggleSubtree() : toggleNode()))}
 					style={{
 						position: "absolute",
-						left: row.left,
+						// The slot, and 3px either side (into the indent and the marker's room): a 24px target.
+						left: row.left - (PLAN_TREE_TOGGLE_HIT - PLAN_TREE_TOGGLE_SLOT) / 2,
 						top: 0,
-						width: PLAN_TREE_TOGGLE_SLOT,
+						width: PLAN_TREE_TOGGLE_HIT,
 						height: lineHeight,
 					}}
 				>
@@ -292,7 +344,9 @@ function PlanTreeRow({
 							tabIndex: 0,
 							"aria-expanded": !row.clamped,
 							title: row.clamped ? labels.showWhole : labels.showLess,
-							onClick: toggleText,
+							onClick: (e: React.MouseEvent) => {
+								if (plainClick(e)) toggleText();
+							},
 							onKeyDown: activateOnKey(toggleText),
 						}
 					: {})}
@@ -333,13 +387,17 @@ function PlanTreeRow({
 			</div>
 			{row.subtree ? (
 				<button
+					ref={quickRef}
 					type="button"
 					aria-expanded={row.subtree === "collapse"}
-					aria-label={subtreeLabel}
-					title={subtreeLabel}
+					aria-label={labels.subtree}
+					title={subtreeAction}
 					data-plan-subtree={row.subtree}
 					className={`${ROW_BUTTON_CLASS} vlist-plan-subtree`}
-					onClick={toggleSubtree}
+					onClick={(e) => {
+						if (plainClick(e)) toggleSubtree();
+					}}
+					onKeyDown={ownKeys(() => toggleSubtree())}
 					style={{
 						position: "absolute",
 						right: 0,
@@ -358,12 +416,16 @@ function PlanTreeRow({
 					tabIndex={0}
 					aria-expanded={false}
 					aria-label={
-						row.preview.label ? `${labels.showDetails}: ${row.preview.label}` : labels.showDetails
+						row.preview.label
+							? `${labels.showInside}: ${spoken(row.preview.label)}`
+							: labels.showInside
 					}
 					data-plan-preview=""
 					className="vlist-plan-preview mantine-focus-auto"
-					onClick={toggleSubtree}
-					onKeyDown={activateOnKey(toggleSubtree)}
+					onClick={(e) => {
+						if (plainClick(e)) openPreview();
+					}}
+					onKeyDown={activateOnKey(openPreview)}
 					style={{
 						position: "absolute",
 						left: row.preview.left,
@@ -415,8 +477,59 @@ function PlanTreeRow({
 	);
 }
 
+/** The rows inside the box's scrollport, publishing their extent to it. */
+function PlanTreeRows({
+	layout,
+	labels,
+	onPlanTree,
+	width,
+}: {
+	layout: PlanTreeLayout;
+	labels: PlanTreeLabels;
+	onPlanTree?: (action: PlanTreeAction) => void;
+	width: number;
+}) {
+	const viewport = useContentViewport();
+	const height = layout.contentHeight + PLAN_TREE_PAD_Y * 2;
+	useLayoutEffect(() => {
+		viewport?.setContentSize({ width, height });
+	}, [viewport, width, height]);
+	const xs = typographyMetrics().line.xs;
+	return (
+		<div style={{ position: "relative", width, height }}>
+			{layout.rows.map((row) => (
+				<PlanTreeRow
+					key={row.key}
+					row={row}
+					layout={layout}
+					labels={labels}
+					onPlanTree={onPlanTree}
+				/>
+			))}
+			{layout.cut > 0 ? (
+				<div
+					className="vlist-plan-more"
+					data-plan-more=""
+					style={{
+						position: "absolute",
+						left: PLAN_TREE_PAD_X,
+						right: PLAN_TREE_PAD_X,
+						top: PLAN_TREE_PAD_Y + layout.contentHeight - xs,
+						height: xs,
+						font: typographyMetrics().font.xs,
+						lineHeight: `${xs}px`,
+					}}
+				>
+					{labels.more(layout.cut)}
+				</div>
+			) : null}
+		</div>
+	);
+}
+
 /** The plan's toolbar line and its rows' box, from the measured blocks. */
 export function PlanTreeBody({
+	bodyId,
 	blocks,
 	frames,
 	availableWidth,
@@ -424,6 +537,8 @@ export function PlanTreeBody({
 	labels = DEFAULT_PLAN_TREE_LABELS,
 	onPlanTree,
 }: {
+	/** The plan body's identity (its scrollport's). */
+	bodyId: string;
 	blocks: readonly PreparedBlock[];
 	frames: readonly BlockFrame[];
 	availableWidth: number;
@@ -441,7 +556,8 @@ export function PlanTreeBody({
 	if (!tree || tree.kind !== "fixed" || !treeFrame) return null;
 	const layout = (tree.data as { layout: PlanTreeLayout }).layout;
 	const all = layout.allOpen;
-	const toggleAll = () => onPlanTree?.({ kind: "all" });
+	// What the button says is what it does: 「全部收起」 back to the default view, else expand all.
+	const toggleAll = () => onPlanTree?.({ kind: "all", open: !all });
 	const xs = typographyMetrics().line.xs;
 	return (
 		<div data-plan-tree="" style={{ position: "relative", width: availableWidth, height }}>
@@ -464,10 +580,10 @@ export function PlanTreeBody({
 					</span>
 					<button
 						type="button"
-						aria-pressed={all}
 						data-plan-all=""
 						className={`${ROW_BUTTON_CLASS} vlist-plan-toolbar-action`}
 						onClick={toggleAll}
+						onKeyDown={ownKeys(toggleAll)}
 						style={{ font: "inherit", lineHeight: "inherit" }}
 					>
 						{all ? labels.collapseAll : labels.expandAll}
@@ -483,45 +599,20 @@ export function PlanTreeBody({
 					left: 0,
 					width: availableWidth,
 					height: treeFrame.height,
-					overflowY:
-						layout.contentHeight + PLAN_TREE_PAD_Y * 2 > treeFrame.height ? "auto" : "hidden",
-					overflowX: "hidden",
 				}}
 			>
-				<div
-					style={{
-						position: "relative",
-						width: "100%",
-						height: layout.contentHeight + PLAN_TREE_PAD_Y * 2,
-					}}
+				<AutoFollowScroll
+					bodyId={bodyId}
+					layout={{ width: availableWidth, height: treeFrame.height }}
+					viewportStyle={{ overflowX: "hidden", borderRadius: 4 }}
 				>
-					{layout.rows.map((row) => (
-						<PlanTreeRow
-							key={row.key}
-							row={row}
-							layout={layout}
-							labels={labels}
-							onPlanTree={onPlanTree}
-						/>
-					))}
-					{layout.cut > 0 ? (
-						<div
-							className="vlist-plan-more"
-							data-plan-more=""
-							style={{
-								position: "absolute",
-								left: PLAN_TREE_PAD_X,
-								right: PLAN_TREE_PAD_X,
-								top: PLAN_TREE_PAD_Y + layout.contentHeight - xs,
-								height: xs,
-								font: typographyMetrics().font.xs,
-								lineHeight: `${xs}px`,
-							}}
-						>
-							{labels.more(layout.cut)}
-						</div>
-					) : null}
-				</div>
+					<PlanTreeRows
+						layout={layout}
+						labels={labels}
+						onPlanTree={onPlanTree}
+						width={availableWidth}
+					/>
+				</AutoFollowScroll>
 			</div>
 		</div>
 	);

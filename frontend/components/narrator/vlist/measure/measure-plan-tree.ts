@@ -35,7 +35,6 @@ import {
 	type RichInlineItem,
 } from "@chenglou/pretext/rich-inline";
 import {
-	isDefaultPlanTreeView,
 	isPlanTreeAllExpanded,
 	PLAN_TREE_CLAMP_LINES,
 	type PlanTree,
@@ -68,7 +67,9 @@ export const PLAN_TREE_PAD_Y = 4;
 /** Gap between the toolbar line and the box (px). */
 export const PLAN_TREE_TOOLBAR_GAP = 4;
 /** The quick control (everything inside this node) at the right of a row's first line (px). */
-export const PLAN_TREE_SUBTREE_SLOT = 20;
+export const PLAN_TREE_SUBTREE_SLOT = 24;
+/** The fold arrow's hit area (px): its slot and 3px either side (into the indent and marker). */
+export const PLAN_TREE_TOGGLE_HIT = 24;
 /** Gap between a row's text and its quick control (px). */
 export const PLAN_TREE_SUBTREE_GAP = 4;
 /** Gap between a preview's ellipsis and its label (px). */
@@ -172,9 +173,16 @@ export interface PlanTreeLayout {
 	innerWidth: number;
 	/** The ellipsis's width in the body font (the room a clamped last line leaves for it). */
 	ellipsisWidth: number;
-	/** Something is folded or clamped, or the reader changed the view: the toolbar shows. */
+	/**
+	 * Something is folded behind a preview, a text is longer than its clamp, or the reader opened
+	 * or closed nodes: the toolbar shows. (A text flip alone does not keep it: once the card is
+	 * wide enough that nothing clamps, there is nothing for it to do.)
+	 */
 	toolbar: boolean;
-	/** Everything is expanded (the toolbar offers 「全部收起」). */
+	/**
+	 * Everything is expanded, or nothing drawn is hidden any more (no preview, no clamp, no closed
+	 * node): the toolbar offers 「全部收起」, which returns to the default view.
+	 */
 	allOpen: boolean;
 	/** Nodes in the plan. */
 	size: number;
@@ -288,7 +296,8 @@ export function layoutPlanTree(
 	const ellipsisWidth = Math.ceil(textWidth(PLAN_TREE_ELLIPSIS, bodyFont));
 	const rows: PlanTreeRowLayout[] = [];
 	let y = 0;
-	let anyClamp = false;
+	let anyLonger = false;
+	let anyHidden = false;
 	for (const { node, open, whole, preview, subtree } of visible) {
 		const previous = rows[rows.length - 1];
 		if (previous) {
@@ -310,7 +319,8 @@ export function layoutPlanTree(
 		const total = counts.reduce((sum, n) => sum + n, 0);
 		const longer = planTextClamps(node) && total > PLAN_TREE_CLAMP_LINES;
 		const clamp = !whole && longer;
-		if (clamp) anyClamp = true;
+		if (longer) anyLonger = true;
+		if (clamp || preview || (node.children.length > 0 && !open)) anyHidden = true;
 		let remaining = clamp ? PLAN_TREE_CLAMP_LINES : total;
 		let lineTop = 0;
 		const lines: PlanTreeRowLayout["lines"] = [];
@@ -379,8 +389,8 @@ export function layoutPlanTree(
 		lineHeight,
 		innerWidth,
 		ellipsisWidth,
-		toolbar: tree.folds || anyClamp || !isDefaultPlanTreeView(view),
-		allOpen: isPlanTreeAllExpanded(view),
+		toolbar: tree.folds || anyLonger || view.scopes.size > 0 || view.nodes.size > 0,
+		allOpen: isPlanTreeAllExpanded(view) || (!anyHidden && cut === 0),
 		size: tree.size,
 	};
 }

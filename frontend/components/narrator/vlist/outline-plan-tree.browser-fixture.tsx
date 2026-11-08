@@ -21,7 +21,7 @@ import { parsePlanTree } from "@shared/outline-plan-tree";
 import { setTypography } from "@shared/pretext-layout/typography";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useContext, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { OutlineOpenerProvider } from "../../../lib/outline-opener";
@@ -37,8 +37,11 @@ import zhOutline from "../../../locales/zh-CN/outline.json";
 import type { PendingPermission } from "../../../types/narrator";
 import { ImageViewerProvider } from "../../common/ImageViewerProvider";
 import { OutlinePlanTree } from "../../outline/plan/OutlinePlanTree";
+import type { NarratorComposerHandle } from "../composer/NarratorComposer";
+import { usePermissionFocusNav } from "../interaction/use-permission-focus-nav";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { getCategory, getCategoryColor, getSummary } from "../tool-call/tool-display";
 import { toolCardInnerWidth } from "./measure/measure-tool-call";
 import { FORMAT_EN, FORMAT_ZH, LEGACY } from "./outline-plan-tree.browser-plans";
@@ -85,12 +88,18 @@ export interface FixtureOptions {
 	 * `format` (the owner's format, in `lang`) / `legacy`: the card as it is now; `inbox`: the
 	 * format plan in the inbox's DOM tree; `before`: the old markdown body.
 	 */
-	scene: "format" | "legacy" | "inbox" | "before";
+	scene: "format" | "legacy" | "inbox" | "inbox-legacy" | "before";
 	lang?: "zh-CN" | "en";
 	width: number;
 	scheme: "light" | "dark";
 	/** The plan waits for a decision: the card hosts the approval form. */
 	approval?: boolean;
+	/**
+	 * The session panel's keyboard navigation (`usePermissionFocusNav`) listens on the window, as
+	 * in the app: for the approval scene, over the plan's own approval form; for the inbox, over
+	 * a stand-in for the panel's waiting permission (its one action counted as a decision).
+	 */
+	keyboard?: boolean;
 	viewportHeight?: number;
 	fontScalePercent?: number;
 	lineHeightScalePercent?: number;
@@ -99,7 +108,8 @@ export interface FixtureOptions {
 const TOOL_USE = "toolu_plan_readability";
 
 function planText(options: FixtureOptions): string {
-	if (options.scene === "legacy" || options.scene === "before") return PLANS.legacy;
+	if (options.scene === "legacy" || options.scene === "before" || options.scene === "inbox-legacy")
+		return PLANS.legacy;
 	return options.lang === "en" ? PLANS.formatEn : PLANS.formatZh;
 }
 
@@ -171,6 +181,46 @@ let root: Root | null = null;
 /** Commits of the scene (a click is answered once this moves and the frame is painted). */
 let commits = 0;
 
+// ── Decisions: what Enter would have run instead of the control under the focus ──
+
+const decisions: string[] = [];
+const realFetch = window.fetch.bind(window);
+window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+	const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+	const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+	if (method === "POST" && /\/permissions\/[^/]+\/plan\b/.test(url)) decisions.push(url);
+	return realFetch(input, init);
+}) as typeof window.fetch;
+
+/** Decisions sent (the approval form's POST, or the inbox stand-in's action). */
+export function decisionCount(): number {
+	return decisions.length;
+}
+
+/** The panel's keyboard navigation of a waiting request, as `NarratorPanel` hosts it. */
+function KeyboardHost({ permissionId, children }: { permissionId: string; children: ReactNode }) {
+	const composerRef = useRef<NarratorComposerHandle | null>(null);
+	const { permEnterHintCtxValue } = usePermissionFocusNav({
+		pendingPermissionId: permissionId,
+		pendingPermissionToolName: "ExitPlanMode",
+		composerSendable: false,
+		composerRef,
+	});
+	return (
+		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>{children}</PermEnterHintCtx.Provider>
+	);
+}
+
+/** A stand-in for the session panel's own waiting permission: one action, counted. */
+function PanelPermission() {
+	const { setButtonCount, registerActions } = useContext(PermEnterHintCtx);
+	useLayoutEffect(() => {
+		setButtonCount(1);
+		registerActions([() => decisions.push("panel")]);
+	}, [setButtonCount, registerActions]);
+	return null;
+}
+
 /** The inbox's DOM tree of the same plan (its view is the component's own state). */
 function InboxScene({ options }: { options: FixtureOptions }) {
 	const tree = parsePlanTree(planText(options));
@@ -201,6 +251,11 @@ function InboxScene({ options }: { options: FixtureOptions }) {
 			}}
 		>
 			{tree ? <OutlinePlanTree tree={tree} /> : null}
+			{options.keyboard ? (
+				<KeyboardHost permissionId="panel-request">
+					<PanelPermission />
+				</KeyboardHost>
+			) : null}
 		</div>
 	);
 }
@@ -252,7 +307,7 @@ function Scene({ options }: { options: FixtureOptions }) {
 	useLayoutEffect(() => {
 		commits++;
 	});
-	return (
+	const cards = (
 		<div
 			id="shot"
 			style={{
@@ -293,6 +348,11 @@ function Scene({ options }: { options: FixtureOptions }) {
 			})}
 		</div>
 	);
+	return options.keyboard && permission ? (
+		<KeyboardHost permissionId={permission.id}>{cards}</KeyboardHost>
+	) : (
+		cards
+	);
 }
 
 /** Render a scene; resolves once it is committed and painted. */
@@ -313,7 +373,7 @@ export async function render(options: FixtureOptions): Promise<void> {
 				<MantineProvider forceColorScheme={options.scheme}>
 					<ImageViewerProvider>
 						<OutlineOpenerProvider value={{ open: () => true }}>
-							{options.scene === "inbox" ? (
+							{options.scene === "inbox" || options.scene === "inbox-legacy" ? (
 								<InboxScene options={options} />
 							) : (
 								<Scene options={options} />
@@ -405,6 +465,28 @@ export interface PlanRowReport {
 	/** The row's painted height and what its lines take. */
 	height: number;
 	lines: number;
+	/** Its text is a control (it is longer than its clamp). */
+	textToggles: boolean;
+}
+
+/** Where the focus is: the plan row it is in and which of its controls. */
+export function focused(): { row: string | null; control: string | null } {
+	const el = document.activeElement as HTMLElement | null;
+	const row = el?.closest<HTMLElement>("[data-plan-row]") ?? null;
+	const control = !el
+		? null
+		: el.matches("[data-plan-toggle]")
+			? "toggle"
+			: el.matches("[data-plan-subtree]")
+				? `subtree:${el.dataset.planSubtree}`
+				: el.matches("[data-plan-preview]")
+					? "preview"
+					: el.matches("[data-plan-text]")
+						? "text"
+						: el === document.body
+							? "body"
+							: el.tagName.toLowerCase();
+	return { row: row?.dataset.planRow ?? null, control };
 }
 
 export interface CardReport {
@@ -458,6 +540,7 @@ function rowReport(row: HTMLElement): PlanRowReport {
 			: null,
 		height: Math.round(rect.height * 10) / 10,
 		lines: text ? text.children.length : 0,
+		textToggles: text?.getAttribute("role") === "button",
 	};
 }
 
@@ -539,7 +622,10 @@ export function report(): CardReport {
 		}
 	}
 	const rows = rowEls.map(rowReport);
-	const planBox = card.querySelector<HTMLElement>("[data-plan-box]");
+	const planBoxOuter = card.querySelector<HTMLElement>("[data-plan-box]");
+	// The box scrolls in its scrollport (the list's overlay scrollbars), when it has one.
+	const planBox =
+		planBoxOuter?.querySelector<HTMLElement>("[data-content-scrollport]") ?? planBoxOuter;
 	let toolbarOverlap = 0;
 	const boxTop = planBox?.getBoundingClientRect().top;
 	for (const word of card.querySelectorAll<HTMLElement>("[data-plan-summary], [data-plan-all]")) {
