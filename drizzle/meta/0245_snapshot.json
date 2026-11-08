@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "83e5bcd1-c0b8-4e61-b716-5af7c579c3f3",
+  "id": "1920b949-285a-44c1-9694-c3dc0a98d759",
   "prevId": "369f5eb5-79ed-4fdc-bbbe-d8a63ee1c64c",
   "tables": {
     "acl_events": {
@@ -12451,6 +12451,14 @@
           "notNull": false,
           "autoincrement": false
         },
+        "workspace_directories": {
+          "name": "workspace_directories",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'{}'"
+        },
         "error_message": {
           "name": "error_message",
           "type": "text",
@@ -16452,87 +16460,6 @@
             "id"
           ],
           "onDelete": "set null",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "recent_tab_archive_marks": {
-      "name": "recent_tab_archive_marks",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "user_id": {
-          "name": "user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "narrator_id": {
-          "name": "narrator_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "folder_id": {
-          "name": "folder_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "archived_at": {
-          "name": "archived_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_recent_tab_archive_mark": {
-          "name": "idx_recent_tab_archive_mark",
-          "columns": [
-            "user_id",
-            "narrator_id"
-          ],
-          "isUnique": true
-        }
-      },
-      "foreignKeys": {
-        "recent_tab_archive_marks_user_id_users_id_fk": {
-          "name": "recent_tab_archive_marks_user_id_users_id_fk",
-          "tableFrom": "recent_tab_archive_marks",
-          "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "recent_tab_archive_marks_narrator_id_narrators_id_fk": {
-          "name": "recent_tab_archive_marks_narrator_id_narrators_id_fk",
-          "tableFrom": "recent_tab_archive_marks",
-          "tableTo": "narrators",
-          "columnsFrom": [
-            "narrator_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

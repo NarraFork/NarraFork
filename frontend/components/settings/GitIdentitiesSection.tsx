@@ -111,6 +111,12 @@ export function GitIdentitiesSection() {
 									checked={visibility.createModal}
 									onChange={(e) => visibility.setCreateModal(e.currentTarget.checked)}
 								/>
+								<Switch
+									size="sm"
+									label={t("gitIdentitiesDisplayFolderContextMenu")}
+									checked={visibility.folderContextMenu}
+									onChange={(e) => visibility.setFolderContextMenu(e.currentTarget.checked)}
+								/>
 							</Stack>
 						</Popover.Dropdown>
 					</Popover>

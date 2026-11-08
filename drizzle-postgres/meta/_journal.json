@@ -439,8 +439,22 @@
 		{
 			"idx": 62,
 			"version": "7",
-			"when": 1794136326500,
-			"tag": "0062_recent-tab-archive-marks",
+			"when": 1794136142791,
+			"tag": "0062_narrator_workspace_directories",
+			"breakpoints": true
+		},
+		{
+			"idx": 63,
+			"version": "7",
+			"when": 1794137358287,
+			"tag": "0063_folder-git-identity-bindings",
+			"breakpoints": true
+		},
+		{
+			"idx": 64,
+			"version": "7",
+			"when": 1794138790612,
+			"tag": "0064_recent-tab-archive-marks",
 			"breakpoints": true
 		}
   ]

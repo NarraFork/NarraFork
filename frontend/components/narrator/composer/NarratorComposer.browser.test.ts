@@ -4,6 +4,7 @@ import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ComposerDocument } from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { heightTransitionStepLimit } from "./height-transition-sampling.test-support";
 import type * as Fixture from "./NarratorComposer.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -1540,14 +1541,26 @@ test("height transitions reverse in flight without remounting the editor or queu
 				const root = document.querySelector<HTMLElement>("[data-inline-composer]");
 				if (!root) throw new Error("No input");
 				const frames: { time: number; height: number; target: number }[] = [];
-				for (let index = 0; index < 48; index++) {
-					if (index < 24 && index % 3 === 0) fixture.load(index % 6 === 0 ? long : short);
-					await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+				const sample = () => {
+					// CSS transitions use this frame's document timeline, not the wall-clock
+					// time when a CPU-starved rAF callback happens to execute.
+					const time = document.timeline.currentTime;
+					if (typeof time !== "number") throw new Error("Missing animation timeline");
 					frames.push({
-						time: performance.now(),
+						time,
 						height: root.getBoundingClientRect().height,
 						target: Number.parseFloat(root.style.height),
 					});
+				};
+				for (let index = 0; index < 48; index++) {
+					if (index < 24 && index % 3 === 0) {
+						sample();
+						fixture.load(index % 6 === 0 ? long : short);
+						// Also test synchronous layout changes without advancing animation time.
+						sample();
+					}
+					await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+					sample();
 				}
 				return {
 					frames,
@@ -1565,21 +1578,35 @@ test("height transitions reverse in flight without remounting the editor or queu
 		expect(
 			result.frames.some((frame) => frame.height > compact + 1 && frame.height < max - 1),
 		).toBe(true);
+		expect(
+			result.frames.some(
+				(frame, index) =>
+					index > 0 &&
+					frame.target !== result.frames[index - 1].target &&
+					result.frames[index - 1].height > compact + 1 &&
+					result.frames[index - 1].height < max - 1,
+			),
+		).toBe(true);
+		// Both directions must be visible, not merely a non-endpoint static height.
+		for (const direction of [-1, 1]) {
+			expect(
+				result.frames.some(
+					(frame, index) =>
+						index > 0 && direction * (frame.height - result.frames[index - 1].height) > 1,
+				),
+			).toBe(true);
+		}
+		expect(
+			result.frames.some(
+				(frame, index) => index > 0 && frame.time === result.frames[index - 1].time,
+			),
+		).toBe(true);
 		for (let index = 1; index < result.frames.length; index++) {
 			const current = result.frames[index];
 			const previous = result.frames[index - 1];
 			expect(current.height).toBeGreaterThanOrEqual(compact - 1);
 			expect(current.height).toBeLessThanOrEqual(max + 1);
-			// cubic-bezier(0.2, 0, 0, 1) peaks near 4× linear over the 180ms height
-			// transition. Headless CI often composites more than one vsync between two
-			// close performance.now() samples, so the budget also covers a 30Hz gap.
-			// It still rejects a same-frame snap of the whole travel.
-			const frameMs = Math.max(current.time - previous.time, 1000 / 60);
-			const step = (duration: number) => ((span * duration) / 180) * 4 + 2;
-			const allowed = Math.min(
-				span * 0.75,
-				Math.max(step(frameMs), step(Math.max(frameMs, 1000 / 30))),
-			);
+			const allowed = heightTransitionStepLimit(span, current.time - previous.time);
 			expect(Math.abs(current.height - previous.height)).toBeLessThanOrEqual(allowed);
 		}
 		await layoutSettled(page);

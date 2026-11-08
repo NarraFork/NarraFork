@@ -27,6 +27,9 @@ export const SNAPSHOT_TABLES = {
 		"narrator_text_snapshots",
 		// Per-user folder placement remembered between archive and unarchive.
 		"recent_tab_archive_marks",
+		// Personal folder-level Git identity picks. Import validates the referenced user and
+		// identity in the target database, and never reassigns a pick across users.
+		"folder_git_identity_bindings",
 	],
 } as const;
 

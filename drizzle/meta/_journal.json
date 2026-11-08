@@ -1720,8 +1720,22 @@
     {
       "idx": 245,
       "version": "6",
-      "when": 1794136300408,
-      "tag": "0245_real_proudstar",
+      "when": 1794136137719,
+      "tag": "0245_narrator_workspace_directories",
+      "breakpoints": true
+    },
+    {
+      "idx": 246,
+      "version": "6",
+      "when": 1794137353073,
+      "tag": "0246_folder-git-identity-bindings",
+      "breakpoints": true
+    },
+    {
+      "idx": 247,
+      "version": "6",
+      "when": 1794138761567,
+      "tag": "0247_minor_eternals",
       "breakpoints": true
     }
   ]

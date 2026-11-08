@@ -13,26 +13,31 @@ export interface GitIdentityVisibility {
 	contextMenu: boolean;
 	/** 新建会话弹窗右侧、默认模型下方。 */
 	createModal: boolean;
+	/** 左侧边栏中文件夹的右键菜单。 */
+	folderContextMenu: boolean;
 }
 
 export interface GitIdentityVisibilitySource {
 	gitIdentityContextMenu?: boolean | null;
 	gitIdentityCreateModal?: boolean | null;
+	gitIdentityFolderContextMenu?: boolean | null;
 }
 
-/** 缺失（还没加载、或该账号没有偏好行）一律按关闭处理，两个开关互不影响。 */
+/** 缺失（还没加载、或该账号没有偏好行）一律按关闭处理，三个开关互不影响。 */
 export function gitIdentityVisibilityFrom(
 	source: GitIdentityVisibilitySource | null | undefined,
 ): GitIdentityVisibility {
 	return {
 		contextMenu: source?.gitIdentityContextMenu ?? false,
 		createModal: source?.gitIdentityCreateModal ?? false,
+		folderContextMenu: source?.gitIdentityFolderContextMenu ?? false,
 	};
 }
 
 export function useGitIdentityVisibility(): GitIdentityVisibility & {
 	setContextMenu: (value: boolean) => void;
 	setCreateModal: (value: boolean) => void;
+	setFolderContextMenu: (value: boolean) => void;
 } {
 	const { data } = useUserPreferences();
 	const update = useUpdateUserPreferences();
@@ -41,5 +46,6 @@ export function useGitIdentityVisibility(): GitIdentityVisibility & {
 		...gitIdentityVisibilityFrom(data),
 		setContextMenu: (value) => update.mutate({ gitIdentityContextMenu: value }),
 		setCreateModal: (value) => update.mutate({ gitIdentityCreateModal: value }),
+		setFolderContextMenu: (value) => update.mutate({ gitIdentityFolderContextMenu: value }),
 	};
 }

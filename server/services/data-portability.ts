@@ -32,6 +32,7 @@ import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
 import { BundleError, bundleCatalogError } from "@server/lib/credential-transfer/bundle";
 import { AppError, catalogError } from "@server/lib/errors";
+import { invalidateGitIdentityCache } from "@server/lib/git-identity";
 import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
@@ -773,6 +774,7 @@ const IMPORTED_TABLES = [
 	"narrator_blocks",
 	"narrator_text_snapshots",
 	"recent_tab_archive_marks",
+	"folder_git_identity_bindings",
 	"api_requests",
 ] as const;
 
@@ -874,6 +876,32 @@ function repairDanglingReferences(baselines: Map<string, number>): void {
 		details: [...new Set(remaining.map((v) => `${v.table}->${v.parent}`))].slice(0, 20),
 	});
 	throw new AppError("Import failed: unresolvable foreign key references (see server log)", 400);
+}
+
+/**
+ * Folder picks are personal: the two foreign keys alone do not prove that the picked
+ * identity belongs to the binding's user. Drop only newly imported mismatches; existing
+ * local rows are not this import's responsibility. Missing identities are rejected by the
+ * same ownership check; any other dangling references are repaired in this transaction.
+ */
+function removeInvalidFolderIdentityBindings(baseline: number): void {
+	const removed = changesOf(
+		sqlite.run(
+			`DELETE FROM main.folder_git_identity_bindings
+			 WHERE rowid > ?
+			   AND NOT EXISTS (
+			     SELECT 1 FROM main.user_git_identities
+			     WHERE user_git_identities.id = folder_git_identity_bindings.identity_id
+			       AND user_git_identities.user_id = folder_git_identity_bindings.user_id
+			   )`,
+			[baseline],
+		),
+	);
+	if (removed > 0) {
+		logger.warn("Import skipped folder bindings with missing or cross-user identities", {
+			removed,
+		});
+	}
 }
 
 /**
@@ -1156,6 +1184,8 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				copyTable(attachName, "recent_tab_archive_marks", {
 					excludeNarrators: excludedNarrators,
 				});
+				copyTable(attachName, "folder_git_identity_bindings");
+				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (
 					counts.sessionsInserted + counts.sessionsOverwritten > 0 &&
 					tableColumns(attachName, "narrator_text_snapshots").includes("sha256")
@@ -1251,6 +1281,8 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 			// 忽略
 		}
 	}
+
+	if (options.include?.sessions ?? true) invalidateGitIdentityCache();
 
 	// The key store is a file outside the SQLite transaction, so the remaining keys are
 	// written only once the transaction committed. The first key of each provider (and the
@@ -1699,6 +1731,8 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(`DELETE FROM narrator_tool_calls`);
 				sqlite.run(`DELETE FROM narrator_messages`);
 				sqlite.run(`DELETE FROM recent_tab_archive_marks`);
+				// Unlike narrator picks, folder picks have no narrator FK to cascade through.
+				sqlite.run(`DELETE FROM folder_git_identity_bindings`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}
@@ -1740,6 +1774,7 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 			}
 		});
 		transaction();
+		if (clearSessions) invalidateGitIdentityCache();
 	}
 
 	return { target, deleted };

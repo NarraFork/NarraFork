@@ -271,6 +271,9 @@ export const narrators = pgTable(
 		cwd: text("cwd"),
 		workspaceRevision: integer("workspace_revision").notNull().default(0),
 		workspaceContext: jsonText("workspace_context"),
+		workspaceDirectories: jsonText("workspace_directories")
+			.notNull()
+			.default(sql.raw("'{}'::text")),
 		errorMessage: text("error_message"),
 		errorRetryable: boolean("error_retryable"),
 		refsInheritedFrom: text("refs_inherited_from").references((): PgColumn => narrators.id, {}),
@@ -1337,6 +1340,9 @@ export const userPreferences = pgTable("user_preferences", {
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
 	gitIdentityContextMenu: boolean("git_identity_context_menu").notNull().default(false),
 	gitIdentityCreateModal: boolean("git_identity_create_modal").notNull().default(false),
+	gitIdentityFolderContextMenu: boolean("git_identity_folder_context_menu")
+		.notNull()
+		.default(false),
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
@@ -1503,6 +1509,28 @@ export const recentTabArchiveMarks = pgTable(
 		archivedAt: text("archived_at").notNull(),
 	},
 	(table) => [uniqueIndex("idx_recent_tab_archive_mark").on(table.userId, table.narratorId)],
+);
+
+export const folderGitIdentityBindings = pgTable(
+	"folder_git_identity_bindings",
+	{
+		id: text("id").primaryKey().notNull(),
+		folderId: text("folder_id").notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		identityId: text("identity_id").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_folder_git_identity_unique").on(table.folderId, table.userId),
+		index("idx_folder_git_identity_user").on(table.userId),
+		foreignKey({
+			name: "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk",
+			columns: [table.identityId],
+			foreignColumns: [userGitIdentities.id],
+		}).onDelete("cascade"),
+	],
 );
 
 export const userRecentTabsMeta = pgTable("user_recent_tabs_meta", {
@@ -4335,8 +4363,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 140,
-  "columnCount": 1854,
+  "tableCount": 141,
+  "columnCount": 1861,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5849,6 +5877,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "workspaceDirectories",
+          "name": "workspace_directories",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "{}",
+          "defaultExpression": "sql.raw(\"'{}'::text\")"
         },
         {
           "property": "errorMessage",
@@ -11973,6 +12013,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "false"
         },
         {
+          "property": "gitIdentityFolderContextMenu",
+          "name": "git_identity_folder_context_menu",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
           "property": "specTabLayout",
           "name": "spec_tab_layout",
           "kind": "text",
@@ -12937,6 +12989,93 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "narratorId"
           ],
           "unique": true
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "folderGitIdentityBindings",
+      "name": "folder_git_identity_bindings",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "folderId",
+          "name": "folder_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "folder_git_identity_bindings_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "identityId",
+          "name": "identity_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "userGitIdentities",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_folder_git_identity_unique",
+          "columns": [
+            "folderId",
+            "userId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_folder_git_identity_user",
+          "columns": [
+            "userId"
+          ],
+          "unique": false
         }
       ],
       "checks": [],
