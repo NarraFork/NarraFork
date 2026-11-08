@@ -35,7 +35,7 @@
 import { realpath } from "node:fs/promises";
 import { basename, isAbsolute, posix, resolve } from "node:path";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
-import { activeDatabaseBackend, db } from "../db";
+import { activeDatabaseBackend, db, sqlite } from "../db";
 import { narratorProjectLinks, narrators, projects } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -51,6 +51,90 @@ const GIT_PROBE_CACHE_MAX_ENTRIES = 512;
 const MAX_ANCESTOR_DEPTH = 64;
 const REBUILD_BATCH_SIZE = 200;
 const ROOT_KEY_BATCH_SIZE = 100;
+const REBUILD_CACHE_MAX_ENTRIES = 512;
+const REBUILD_TIME_SLICE_MS = 8;
+const DERIVATION_MAX_ATTEMPTS = 8;
+
+type DirectoryProject = { projectId: string; directory: string } | null;
+
+/** Facts needed to validate only the relevant project topology after asynchronous IO. */
+interface DirectoryResolution {
+	projectId: string | null;
+	directory: string;
+	repositoryRootKey: string | null;
+}
+
+interface DerivedIndexState {
+	links: DerivedProjectLink[];
+	directory: DirectoryResolution | null;
+}
+
+type IndexReader = Pick<typeof db, "select">;
+
+/** No persistent completion marker: every pass probes its directories again. */
+interface RebuildContext {
+	keys: Map<string, string>;
+	roots: Map<string, string | null>;
+	resolved: Map<string, DirectoryResolution>;
+	freshGitProbes: boolean;
+	revision: string;
+	directoryResolutions: number;
+	gitProbes: number;
+}
+
+function cacheInPass<T>(cache: Map<string, T>, key: string, value: T): void {
+	if (cache.size >= REBUILD_CACHE_MAX_ENTRIES && !cache.has(key)) {
+		const oldest = cache.keys().next().value;
+		if (oldest !== undefined) cache.delete(oldest);
+	}
+	cache.set(key, value);
+}
+
+/**
+ * A cheap conservative invalidation token, not a project-table scan. total_changes
+ * sees writes through our connection (including triggers); data_version sees other
+ * connections. Any write invalidates derived project matches and page snapshots.
+ * Prepared lazily: PG must never touch its deliberately unavailable SQLite handle.
+ */
+function databaseRevision(): string {
+	const row = sqlite
+		.query<{ changes: number; version: number }, []>(
+			"select total_changes() as changes, data_version as version from pragma_data_version",
+		)
+		.get();
+	return `${row?.changes}:${row?.version}`;
+}
+
+function createResolutionContext(freshGitProbes: boolean): RebuildContext {
+	return {
+		keys: new Map(),
+		roots: new Map(),
+		resolved: new Map(),
+		freshGitProbes,
+		revision: databaseRevision(),
+		directoryResolutions: 0,
+		gitProbes: 0,
+	};
+}
+
+function refreshResolutionCache(context: RebuildContext): string {
+	const revision = databaseRevision();
+	if (context.revision !== revision) {
+		context.resolved.clear();
+		context.revision = revision;
+	}
+	return revision;
+}
+
+async function directoryKeyInPass(dir: string, context?: RebuildContext): Promise<string> {
+	if (!context) return directoryKey(dir);
+	const cached = context.keys.get(dir);
+	if (cached !== undefined) return cached;
+	context.directoryResolutions++;
+	const key = await directoryKey(dir);
+	cacheInPass(context.keys, dir, key);
+	return key;
+}
 
 type LinkRole = "primary" | "additional";
 type LinkSource = "cwd" | "explicit";
@@ -110,12 +194,13 @@ export function ancestorKeys(key: string): string[] {
 }
 
 /** The project whose root is the longest prefix of `key`, if any. */
-async function matchProjectByKey(key: string): Promise<string | null> {
+function matchProjectByKey(key: string, reader: IndexReader = db): string | null {
 	const candidates = ancestorKeys(key);
-	const rows = await db
+	const rows = reader
 		.select({ id: projects.id, rootKey: projects.rootKey })
 		.from(projects)
-		.where(inArray(projects.rootKey, candidates));
+		.where(inArray(projects.rootKey, candidates))
+		.all();
 	let best: { id: string; length: number } | null = null;
 	for (const row of rows) {
 		const length = row.rootKey?.length ?? 0;
@@ -207,18 +292,45 @@ async function createProjectForRoot(
 export async function resolveProjectForDirectory(
 	dir: string,
 	ownerUserId: string | null,
-): Promise<{ projectId: string; directory: string } | null> {
-	await ensureProjectRootKeys();
-	const key = await directoryKey(dir);
-	const matched = await matchProjectByKey(key);
-	if (matched) return { projectId: matched, directory: key };
+): Promise<DirectoryProject> {
+	const resolved = await resolveDirectoryProject(dir, ownerUserId);
+	return resolved.projectId
+		? { projectId: resolved.projectId, directory: resolved.directory }
+		: null;
+}
 
-	const root = await cachedRepositoryRoot(dir, key);
-	if (!root) return null;
-	const rootKey = await directoryKey(root);
-	// Another session may have created it while the probe ran.
-	const existing = await matchProjectByKey(rootKey);
-	if (existing) return { projectId: existing, directory: key };
+async function resolveDirectoryProject(
+	dir: string,
+	ownerUserId: string | null,
+	context?: RebuildContext,
+): Promise<DirectoryResolution> {
+	await ensureProjectRootKeys();
+	if (context) {
+		refreshResolutionCache(context);
+		const cached = context.resolved.get(dir);
+		if (cached) return cached;
+	}
+	const key = await directoryKeyInPass(dir, context);
+	const matched = matchProjectByKey(key);
+	if (matched) return { projectId: matched, directory: key, repositoryRootKey: null };
+
+	let root: string | null;
+	if (context?.freshGitProbes) {
+		// Do not reuse the normal 30s probe cache across rebuilds: an offline git init
+		// or worktree change must be observed even by an immediately repeated pass.
+		if (context.roots.has(key)) root = context.roots.get(key) ?? null;
+		else {
+			context.gitProbes++;
+			root = await probeRepositoryRoot(dir);
+			cacheInPass(context.roots, key, root);
+		}
+	} else root = await cachedRepositoryRoot(dir, key);
+	if (!root) return { projectId: null, directory: key, repositoryRootKey: null };
+	const rootKey = await directoryKeyInPass(root, context);
+	// Recheck the original directory too: a more specific project may have been
+	// created while the git probe ran.
+	const existing = matchProjectByKey(key) ?? matchProjectByKey(rootKey);
+	if (existing) return { projectId: existing, directory: key, repositoryRootKey: rootKey };
 
 	let creation = creationsInFlight.get(rootKey);
 	if (!creation) {
@@ -230,7 +342,7 @@ export async function resolveProjectForDirectory(
 		creationsInFlight.set(rootKey, creation);
 	}
 	const projectId = await creation;
-	return projectId ? { projectId, directory: key } : null;
+	return { projectId, directory: key, repositoryRootKey: rootKey };
 }
 
 function isLocalDevice(deviceId: string | null): boolean {
@@ -241,7 +353,15 @@ function isLocalDevice(deviceId: string | null): boolean {
 export async function deriveNarratorProjectLinks(
 	row: ProjectIndexNarratorRow,
 ): Promise<DerivedProjectLink[]> {
+	return (await deriveLinks(row)).links;
+}
+
+async function deriveLinks(
+	row: ProjectIndexNarratorRow,
+	context?: RebuildContext,
+): Promise<DerivedIndexState> {
 	const links: DerivedProjectLink[] = [];
+	let directory: DirectoryResolution | null = null;
 	if (row.contextProjectId) {
 		links.push({
 			projectId: row.contextProjectId,
@@ -252,8 +372,10 @@ export async function deriveNarratorProjectLinks(
 		});
 	}
 	if (row.cwd && isLocalDevice(row.defaultDeviceId)) {
-		const resolved = await resolveProjectForDirectory(row.cwd, row.ownerUserId);
-		if (resolved && resolved.projectId !== row.contextProjectId) {
+		const resolved = await resolveDirectoryProject(row.cwd, row.ownerUserId, context);
+		directory = resolved;
+		if (context) cacheInPass(context.resolved, row.cwd, resolved);
+		if (resolved.projectId && resolved.projectId !== row.contextProjectId) {
 			links.push({
 				projectId: resolved.projectId,
 				role: links.length === 0 ? "primary" : "additional",
@@ -263,7 +385,18 @@ export async function deriveNarratorProjectLinks(
 			});
 		}
 	}
-	return links;
+	return { links, directory };
+}
+
+function directoryResolutionMatches(
+	resolution: DirectoryResolution | null,
+	reader: IndexReader = db,
+): boolean {
+	if (!resolution) return true;
+	const current =
+		matchProjectByKey(resolution.directory, reader) ??
+		(resolution.repositoryRootKey ? matchProjectByKey(resolution.repositoryRootKey, reader) : null);
+	return current === resolution.projectId;
 }
 
 function sameLinks(
@@ -287,15 +420,39 @@ function sameLinks(
  * Replace a narrator's links with `desired`; writes nothing when they already match.
  * Returns whether anything changed.
  */
-function writeNarratorProjectLinks(narratorId: string, desired: DerivedProjectLink[]): boolean {
+function sameNarratorInputs(a: ProjectIndexNarratorRow, b: ProjectIndexNarratorRow): boolean {
+	return (
+		a.cwd === b.cwd &&
+		a.contextProjectId === b.contextProjectId &&
+		a.defaultDeviceId === b.defaultDeviceId &&
+		a.ownerUserId === b.ownerUserId
+	);
+}
+
+function readNarrator(
+	narratorId: string,
+	reader: IndexReader = db,
+): ProjectIndexNarratorRow | undefined {
+	return reader
+		.select(NARRATOR_INDEX_COLUMNS)
+		.from(narrators)
+		.where(eq(narrators.id, narratorId))
+		.get();
+}
+
+function writeNarratorProjectLinks(
+	row: ProjectIndexNarratorRow,
+	derived: DerivedIndexState,
+): boolean | "retry" {
+	const narratorId = row.id;
+	const desired = derived.links;
 	return db.transaction((tx) => {
-		// The narrator may have been deleted while the links were being derived.
-		const alive = tx
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(eq(narrators.id, narratorId))
-			.get();
+		// Validate the target inputs and relevant project roots in the same read
+		// snapshot as the write. Unrelated message/narrator writes are not conflicts.
+		const alive = readNarrator(narratorId, tx);
 		if (!alive) return false;
+		if (!sameNarratorInputs(alive, row) || !directoryResolutionMatches(derived.directory, tx))
+			return "retry";
 		const current = tx
 			.select({
 				projectId: narratorProjectLinks.projectId,
@@ -339,14 +496,69 @@ function writeNarratorProjectLinks(narratorId: string, desired: DerivedProjectLi
  */
 export async function syncNarratorProjectLinks(narratorId: string): Promise<void> {
 	if (activeDatabaseBackend !== "sqlite") return;
-	const row = await db
-		.select(NARRATOR_INDEX_COLUMNS)
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.get();
-	if (!row) return;
-	if (writeNarratorProjectLinks(row.id, await deriveNarratorProjectLinks(row)))
+	await ensureProjectRootKeys();
+	const row = readNarrator(narratorId);
+	if (row && (await syncIndexRow(row, createResolutionContext(false))) === "changed")
 		await invalidateProjectDerivedState(row.id);
+}
+
+type CurrentLink = Omit<DerivedProjectLink, "deviceId"> & { deviceId: string };
+
+/** Retries async derivation, never committing an obsolete directory or explicit project. */
+async function syncIndexRow(
+	initial: ProjectIndexNarratorRow,
+	context: RebuildContext,
+	prefetched?: { links: CurrentLink[]; revision: string },
+): Promise<"changed" | "skipped"> {
+	let row: ProjectIndexNarratorRow | undefined = initial;
+	for (let attempt = 0; attempt < DERIVATION_MAX_ATTEMPTS; attempt++) {
+		const revision = refreshResolutionCache(context);
+		// Page rows and links are a snapshot, not authority after an async mutation.
+		if (attempt > 0 || (prefetched && prefetched.revision !== revision))
+			row = readNarrator(initial.id);
+		if (!row) return "skipped";
+		const derived = await deriveLinks(row, context);
+		const afterDerivation = databaseRevision();
+		if (afterDerivation !== revision) {
+			const latest = readNarrator(row.id);
+			if (!latest) return "skipped";
+			// The global token invalidates caches, but is NOT a reason to retry:
+			// unrelated message writes must never starve a cwd/permission update.
+			if (!sameNarratorInputs(latest, row) || !directoryResolutionMatches(derived.directory)) {
+				context.resolved.clear();
+				await yieldToEventLoop();
+				continue;
+			}
+		}
+		const current =
+			prefetched?.revision === afterDerivation
+				? prefetched.links
+				: db
+						.select({
+							projectId: narratorProjectLinks.projectId,
+							role: narratorProjectLinks.role,
+							source: narratorProjectLinks.source,
+							deviceId: narratorProjectLinks.deviceId,
+							directory: narratorProjectLinks.directory,
+						})
+						.from(narratorProjectLinks)
+						.where(eq(narratorProjectLinks.narratorId, row.id))
+						.all();
+		// Even after a page snapshot was invalidated by an earlier changed row,
+		// re-read only this small link set; do not open a no-op transaction.
+		if (sameLinks(current, derived.links) && databaseRevision() === afterDerivation)
+			return "skipped";
+		const changed = writeNarratorProjectLinks(row, derived);
+		if (changed === "retry") {
+			context.resolved.clear();
+			await yieldToEventLoop();
+			continue;
+		}
+		return changed ? "changed" : "skipped";
+	}
+	// Only changes to this narrator's inputs or its relevant roots can consume this
+	// budget. Keep retries bounded when those actual inputs continuously move.
+	throw new Error("Project index inputs changed repeatedly during derivation");
 }
 
 /**
@@ -384,17 +596,19 @@ export async function assignProjectRootKey(projectId: string): Promise<void> {
 		.get();
 	if (!row) return;
 	const key = row.gitPath ? await directoryKey(row.gitPath) : null;
-	await db.update(projects).set({ rootKey: null }).where(eq(projects.id, projectId));
+	// A slow realpath must not put an old key back after another root update.
+	const sameRoot = and(
+		eq(projects.id, projectId),
+		row.gitPath === null ? isNull(projects.gitPath) : eq(projects.gitPath, row.gitPath),
+	);
+	await db.update(projects).set({ rootKey: null }).where(sameRoot);
 	if (!key) return;
 	try {
 		await db
 			.update(projects)
 			.set({ rootKey: key })
 			.where(
-				and(
-					eq(projects.id, projectId),
-					sql`not exists (select 1 from projects held where held.root_key = ${key})`,
-				),
+				and(sameRoot, sql`not exists (select 1 from projects held where held.root_key = ${key})`),
 			);
 	} catch (error) {
 		// Lost a race for the key: this project stays out of matching, like any duplicate.
@@ -451,34 +665,86 @@ function yieldToEventLoop(): Promise<void> {
 	return new Promise((resolveYield) => setImmediate(resolveYield));
 }
 
-async function rebuildProjectIndex(): Promise<{ narrators: number }> {
+async function rebuildProjectIndex() {
 	await ensureProjectRootKeys();
+	const context = createResolutionContext(true);
 	let cursor = "";
-	let count = 0;
+	let scanned = 0;
+	let changed = 0;
+	let skipped = 0;
+	let failed = 0;
+	let sliceStarted = performance.now();
 	for (;;) {
-		const page = await db
+		const revision = databaseRevision();
+		const page = db
 			.select(NARRATOR_INDEX_COLUMNS)
 			.from(narrators)
 			.where(gt(narrators.id, cursor))
 			.orderBy(asc(narrators.id))
-			.limit(REBUILD_BATCH_SIZE);
+			.limit(REBUILD_BATCH_SIZE)
+			.all();
 		if (page.length === 0) break;
+		const current = new Map<string, CurrentLink[]>();
+		const links = db
+			.select({
+				narratorId: narratorProjectLinks.narratorId,
+				projectId: narratorProjectLinks.projectId,
+				role: narratorProjectLinks.role,
+				source: narratorProjectLinks.source,
+				deviceId: narratorProjectLinks.deviceId,
+				directory: narratorProjectLinks.directory,
+			})
+			.from(narratorProjectLinks)
+			.where(
+				inArray(
+					narratorProjectLinks.narratorId,
+					page.map((row) => row.id),
+				),
+			)
+			.all();
+		for (const link of links) {
+			const rows = current.get(link.narratorId) ?? [];
+			rows.push(link);
+			current.set(link.narratorId, rows);
+		}
 		for (const row of page) {
 			try {
-				if (writeNarratorProjectLinks(row.id, await deriveNarratorProjectLinks(row)))
+				const outcome = await syncIndexRow(row, context, {
+					links: current.get(row.id) ?? [],
+					revision,
+				});
+				if (outcome === "changed") {
+					changed++;
 					await invalidateProjectDerivedState(row.id);
+				} else skipped++;
 			} catch (error) {
+				failed++;
+				// Do not let a failed resolution poison a later narrator with the same cwd.
+				context.resolved.clear();
 				logger.warn("Project index: narrator skipped during rebuild", {
 					narratorId: row.id,
 					error: String(error),
 				});
 			}
+			scanned++;
+			if (performance.now() - sliceStarted >= REBUILD_TIME_SLICE_MS) {
+				await yieldToEventLoop();
+				sliceStarted = performance.now();
+			}
 		}
-		count += page.length;
 		cursor = page[page.length - 1].id;
 		await yieldToEventLoop();
+		sliceStarted = performance.now();
 	}
-	return { narrators: count };
+	return {
+		narrators: scanned,
+		scanned,
+		changed,
+		skipped,
+		failed,
+		directoryResolutions: context.directoryResolutions,
+		gitProbes: context.gitProbes,
+	};
 }
 
 let rebuildRunning: Promise<void> | null = null;
