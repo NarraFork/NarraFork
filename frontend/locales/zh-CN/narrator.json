@@ -849,6 +849,8 @@
 	"modelGroupAuto": "模型 · 自动选来源",
 	"modelGroupFamily": "{{family}} · 自动选来源",
 	"modelGroupFamilyOther": "其他模型 · 自动选来源",
+	"modelMenuModeModel": "按模型",
+	"modelMenuModeProvider": "按供应商",
 	"autoCurrentSource": "自动 · 现在用 {{provider}}",
 	"autoSourceAuto": "自动",
 	"autoSourceSubscription": "订阅",

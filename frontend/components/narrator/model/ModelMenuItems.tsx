@@ -2,6 +2,7 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
+	Button,
 	CloseButton,
 	Group,
 	Menu,
@@ -32,6 +33,7 @@ import {
 	parseAggModelValue,
 } from "../../../lib/constants";
 import { formatCountdown } from "../../../lib/relative-time";
+import { ModelSourceBrowser } from "./ModelSourceBrowser";
 import { modelInheritanceLabel } from "./model-inheritance-label";
 import {
 	AUTO_FAMILY_GROUP_PREFIX,
@@ -160,6 +162,23 @@ export function ModelMenuItems({
 	const selectedItemRef = useRef<HTMLButtonElement>(null);
 	const footerRef = useRef<HTMLDivElement>(null);
 	const [filter, setFilter] = useState("");
+	/** "model": two-column model/source browser. "provider": grouped by service. Remembered. */
+	const [mode, setMode] = useState<"model" | "provider">(() => {
+		try {
+			return localStorage.getItem("narrafork_model_menu_mode") === "provider"
+				? "provider"
+				: "model";
+		} catch {
+			return "model";
+		}
+	});
+	useEffect(() => {
+		try {
+			localStorage.setItem("narrafork_model_menu_mode", mode);
+		} catch {
+			/* storage unavailable */
+		}
+	}, [mode]);
 	/** Model value whose three-dot global-role actions are currently expanded. */
 	const [actionsModelValue, setActionsModelValue] = useState<string | null>(null);
 	// Never recenter on search or catalog refresh, including during the exit transition.
@@ -268,8 +287,34 @@ export function ModelMenuItems({
 		? (allModels.find((o) => o.value === followModel)?.label ?? followModel)
 		: null;
 	const followModelPrefix = modelProviderPrefix(followModel);
+	// Auto rows live in the model browser; provider mode keeps only service/role groups, so the
+	// two dimensions never share one list. Roles (default/summary/aggregations) stay in both.
+	const isAutoGroup = (key: string) =>
+		key === "__auto__" || key.startsWith(AUTO_FAMILY_GROUP_PREFIX);
+	const entriesToRender =
+		mode === "model"
+			? filteredEntries.filter(
+					([key]) => key === "__default__" || key === "__summary__" || key === "__agg__",
+				)
+			: filteredEntries.filter(([key]) => !isAutoGroup(key));
 	return (
 		<>
+			<Box px={4} pb={4}>
+				<Button.Group>
+					{(["model", "provider"] as const).map((value) => (
+						<Button
+							key={value}
+							size="xs"
+							variant={mode === value ? "light" : "subtle"}
+							fullWidth
+							data-model-menu-mode={value}
+							onClick={() => setMode(value)}
+						>
+							{value === "model" ? t("modelMenuModeModel") : t("modelMenuModeProvider")}
+						</Button>
+					))}
+				</Button.Group>
+			</Box>
 			{/* Inheritance is a current-state group, not a catalog model or a global role. */}
 			{(followsParent || canFollowParent) && (
 				<span>
@@ -318,12 +363,26 @@ export function ModelMenuItems({
 				</>
 			)}
 			{label && <Menu.Label>{label}</Menu.Label>}
-			{filteredEntries.length === 0 ? (
+			{mode === "model" && (
+				<ModelSourceBrowser
+					allModels={allModels.filter(
+						(option) =>
+							option.provider !== "__default__" &&
+							option.provider !== "__summary__" &&
+							option.provider !== "__agg__",
+					)}
+					currentModel={currentModel}
+					providerLabels={provLabels}
+					onSelect={onSelect}
+					filter={filter}
+				/>
+			)}
+			{entriesToRender.length === 0 && mode === "provider" ? (
 				<Text c="dimmed" p="xs" size="xs">
 					{t("noModelMatches")}
 				</Text>
 			) : (
-				filteredEntries.map(([prov, models], gi) => {
+				entriesToRender.map(([prov, models], gi) => {
 					const isDefaultGroup = prov === "__default__";
 					const isSummaryGroup = prov === "__summary__";
 					const editHandler = isDefaultGroup
