@@ -133,6 +133,29 @@ export function localFileImagePreview(path: string, signal?: AbortSignal): Promi
 	);
 }
 
+/** One zip entry as the archive viewer lists it (raw name, never a filesystem path). */
+export interface ArchiveEntryInfo {
+	name: string;
+	isDirectory: boolean;
+	isSymlink: boolean;
+	isSpecial: boolean;
+	encrypted: boolean;
+	compressionMethod: number;
+	compressedSize: number;
+	uncompressedSize: number;
+	readable: boolean;
+}
+
+export interface ArchiveListing extends FilePanelInfo {
+	entries: ArchiveEntryInfo[];
+}
+
+export type ArchiveEntryRead =
+	| { kind: "text"; name: string; size: number; content: string; encoding: string }
+	| { kind: "binary"; name: string; size: number };
+
+/** 10,000 entries with long names and JSON escaping stay well below this. */
+const MAX_ARCHIVE_LISTING_BYTES = 16 * 1024 * 1024;
 /** Metadata-only search/resolve. Preview readers never create snapshots. */
 export const fileReferenceApi = {
 	info(
@@ -247,6 +270,51 @@ export const fileReferenceApi = {
 		// Preview returns saved source; positions belong to the separate resolver.
 		return boundedRequest(
 			`${basePath(narratorId)}/preview?${query}`,
+			MAX_FILE_REFERENCE_SOURCE_BYTES * 6 + MAX_FILE_REFERENCE_METADATA_BYTES,
+			FILE_REFERENCE_READ_TIMEOUT_MS,
+			{ signal },
+		);
+	},
+	/**
+	 * Local archives only. `referenceOrigin` (a file a chat message linked to) asks the server
+	 * for the reference read policy the text editor applies to the same link.
+	 */
+	archive(
+		narratorId: string,
+		path: string,
+		referenceOrigin: boolean,
+		signal?: AbortSignal,
+	): Promise<ArchiveListing> {
+		if (path.length > MAX_FILE_REFERENCE_PATH_CHARS)
+			return Promise.reject(new Error("File path exceeds the limit"));
+		const query = new URLSearchParams({
+			path,
+			origin: referenceOrigin ? "reference" : "legacy",
+		});
+		return boundedRequest(
+			`/api/narrators/${encodeURIComponent(narratorId)}/editor-documents/archive?${query}`,
+			MAX_ARCHIVE_LISTING_BYTES,
+			FILE_REFERENCE_READ_TIMEOUT_MS,
+			{ signal },
+		);
+	},
+	archiveEntry(
+		narratorId: string,
+		path: string,
+		entry: string,
+		referenceOrigin: boolean,
+		signal?: AbortSignal,
+	): Promise<ArchiveEntryRead> {
+		if (path.length > MAX_FILE_REFERENCE_PATH_CHARS || entry.length > MAX_FILE_REFERENCE_PATH_CHARS)
+			return Promise.reject(new Error("Archive entry path exceeds the limit"));
+		const query = new URLSearchParams({
+			path,
+			entry,
+			origin: referenceOrigin ? "reference" : "legacy",
+		});
+		// JSON may escape every decoded byte as six bytes (e.g. control characters).
+		return boundedRequest(
+			`/api/narrators/${encodeURIComponent(narratorId)}/editor-documents/archive-entry?${query}`,
 			MAX_FILE_REFERENCE_SOURCE_BYTES * 6 + MAX_FILE_REFERENCE_METADATA_BYTES,
 			FILE_REFERENCE_READ_TIMEOUT_MS,
 			{ signal },
