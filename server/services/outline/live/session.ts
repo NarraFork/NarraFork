@@ -70,6 +70,8 @@ import {
 	type LiveRejectHead,
 	type LiveSelWire,
 	type LiveTaskChar,
+	livePeerColor,
+	OUTLINE_LIVE_AGENT_PNO_BASE,
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
 import * as Y from "yjs";
@@ -82,7 +84,7 @@ import {
 	OutlineTaskClaimedError,
 	OutlineWriteError,
 } from "../errors";
-import { OUTLINE_LIMITS, type OutlineTaskJson } from "../model";
+import { OUTLINE_CHANGE, OUTLINE_LIMITS, type OutlineTaskJson } from "../model";
 import { outlineStore } from "../store";
 import type { OutlineVersionRow } from "../store/port";
 import {
@@ -91,6 +93,12 @@ import {
 	type OutlineWriteResult,
 	writeOutline,
 } from "../write";
+import {
+	type LiveAgentWrite,
+	OUTLINE_LIVE_AGENT_BOUNDS,
+	readLiveAgentReaders,
+	readLiveAgents,
+} from "./agent-presence";
 import { asOwnLiveWrite } from "./lane";
 import { type MirrorBlock, PageMirror, taskCharOf } from "./mirror";
 import { type LiveNormalized, normalizeLiveTexts } from "./normalize";
@@ -105,7 +113,8 @@ export const OUTLINE_LIVE_TIMING: Record<
 	| "flushMaxMs"
 	| "idleCloseMs"
 	| "flushRetryMs"
-	| "narrowBudgetMs",
+	| "narrowBudgetMs"
+	| "agentsMs",
 	number
 > = {
 	/** Changes are coalesced and broadcast this often (design §7.2). */
@@ -124,6 +133,8 @@ export const OUTLINE_LIVE_TIMING: Record<
 	flushRetryMs: 5_000,
 	/** Time one flush may spend narrowing a permanent failure down block by block. */
 	narrowBudgetMs: 15_000,
+	/** The agents of a page are worked out again at most this often (P2 PR 10b). */
+	agentsMs: 1_000,
 };
 
 /** Bounds of a session. Mutable only so tests can shrink them. */
@@ -227,6 +238,20 @@ export class Participant {
 	}
 }
 
+/**
+ * An agent in the page's presence (outline P2 PR 10b, `agent-presence.ts`): sent by the server,
+ * never a participant (no socket, not counted against the page's limits).
+ */
+interface AgentPeer {
+	pno: number;
+	narratorId: string;
+	title: string;
+	/** For a subagent: its session's title. */
+	session: string | null;
+	color: string;
+	sel: LiveSelWire;
+}
+
 interface WindowUpdate {
 	from: number;
 	update: Uint8Array;
@@ -297,6 +322,30 @@ export class LivePage {
 	/** Recipients that skipped presence under backpressure and need the full picture. */
 	private readonly presenceBehind = new Set<number>();
 	private presenceTimer: ReturnType<typeof setTimeout> | null = null;
+
+	// Agents (outline P2 PR 10b): sessions running with a cursor on this page.
+	/** By narrator id, in the order shown. */
+	private readonly agents = new Map<string, AgentPeer>();
+	/** Agents present beyond those shown. */
+	private agentsMore = 0;
+	/** An agent keeps its participant number for the session's life. */
+	private readonly agentPnos = new Map<string, number>();
+	private readonly agentPeersChanged = new Set<number>();
+	private readonly agentGone = new Set<number>();
+	private readonly agentCursors = new Set<number>();
+	private agentsMoreChanged = false;
+	/** Blocks of this page agents wrote lately, by narrator. */
+	private readonly agentWrites = new Map<string, LiveAgentWrite>();
+	/** Who may read which agent's session: user id → narrator id → verdict. */
+	private readonly agentReaders = new Map<string, Map<string, boolean>>();
+	private agentReadersStale = false;
+	/** Narrators whose run starting or ending may change this page's agents. */
+	agentInterest: ReadonlySet<string> = new Set();
+	private agentTimer: ReturnType<typeof setTimeout> | null = null;
+	private agentExpiry: ReturnType<typeof setTimeout> | null = null;
+	private agentRunning = false;
+	private agentDirty = false;
+	private agentLastAt = 0;
 
 	// Text not committed yet: block id → who changed it last (null: not a person).
 	private readonly dirty = new Map<string, string | null>();
@@ -516,6 +565,8 @@ export class LivePage {
 			this.flushTimer,
 			this.persistTimer,
 			this.idleTimer,
+			this.agentTimer,
+			this.agentExpiry,
 		]) {
 			if (timer) clearTimeout(timer);
 		}
@@ -589,10 +640,18 @@ export class LivePage {
 			w: canWrite,
 			op: this.opSeq,
 			me: p.pno,
-			peers: [...this.participants.values()].map((x) => x.peer()),
-			cur: [...this.participants.values()]
-				.filter((x) => x.sel !== null)
-				.map((x) => [x.pno, x.sel] as [number, LiveSelWire | null]),
+			// Agents are named once this person's verdicts are known (`learnAgentReaders`).
+			peers: [
+				...[...this.participants.values()].map((x) => x.peer()),
+				...[...this.agents.values()].map((a) => this.agentWire(a, socket.userId)),
+			],
+			cur: [
+				...[...this.participants.values()]
+					.filter((x) => x.sel !== null)
+					.map((x) => [x.pno, x.sel] as [number, LiveSelWire | null]),
+				...[...this.agents.values()].map((a) => [a.pno, a.sel] as [number, LiveSelWire | null]),
+			],
+			...(this.agentsMore > 0 ? { am: this.agentsMore } : {}),
 		};
 		// Which of the client's transactions of its previous session the page has: this session's
 		// own bookkeeping when it is that session (a resume, or a snapshot after a refusal), else
@@ -661,6 +720,9 @@ export class LivePage {
 		this.cancelIdle();
 		this.presencePeers.add(p.pno);
 		this.schedulePresence();
+		// The first person in: who else is working here. Later ones: whose names they may see.
+		if (this.participants.size === 1 && this.agents.size === 0) this.requestAgents();
+		else if (this.agents.size > 0) void this.learnAgentReaders([p], [...this.agents.keys()]);
 		return p;
 	}
 
@@ -947,25 +1009,63 @@ export class LivePage {
 		this.presencePeers.clear();
 		this.presenceGone.clear();
 		this.presenceCursors.clear();
-		let delta: Uint8Array | null | undefined;
-		let full: Uint8Array | null | undefined;
-		const deltaHead = (): Uint8Array | null => {
-			if (delta !== undefined) return delta;
+		// Agents (P2 PR 10b): who changed, left or moved, and the count past the limit.
+		const shown = [...this.agents.values()];
+		const byPno = new Map(shown.map((a) => [a.pno, a]));
+		const agentPeers = [...this.agentPeersChanged].flatMap((n) => byPno.get(n) ?? []);
+		const agentGone = [...this.agentGone];
+		const agentCur = [...this.agentCursors].flatMap((n) => byPno.get(n) ?? []);
+		const moreChanged = this.agentsMoreChanged;
+		this.agentPeersChanged.clear();
+		this.agentGone.clear();
+		this.agentCursors.clear();
+		this.agentsMoreChanged = false;
+		// Heads differ only in which agents a recipient may name: one head per (kind, verdicts).
+		const heads = new Map<string, Uint8Array | null>();
+		const headFor = (r: Participant, full: boolean): Uint8Array | null => {
+			const verdicts = shown.map((a) => (this.mayName(r.userId, a) ? "1" : "0")).join("");
+			const key = `${full ? "f" : "d"}${verdicts}`;
+			if (heads.has(key)) return heads.get(key) ?? null;
 			const head: LivePresenceDown = {};
-			if (peers.length) head.peers = peers.map((p) => p.peer());
-			if (gone.length) head.gone = gone;
-			if (cursors.length) head.cur = cursors.map((p) => [p.pno, p.sel]);
-			delta = head.peers || head.gone || head.cur ? encodeLiveHead(head) : null;
-			return delta;
-		};
-		const fullHead = (): Uint8Array | null => {
-			if (full !== undefined) return full;
-			const all = [...this.participants.values()];
-			const head: LivePresenceDown = { peers: all.map((p) => p.peer()) };
-			const cur = all.filter((p) => p.sel !== null);
-			if (cur.length) head.cur = cur.map((p) => [p.pno, p.sel]);
-			full = encodeLiveHead(head);
-			return full;
+			if (full) {
+				const all = [...this.participants.values()];
+				head.peers = [
+					...all.map((p) => p.peer()),
+					...shown.map((a) => this.agentWire(a, r.userId)),
+				];
+				const cur: Array<[number, LiveSelWire | null]> = [
+					...all.filter((p) => p.sel !== null).map((p) => [p.pno, p.sel] as [number, LiveSelWire]),
+					...shown.map((a) => [a.pno, a.sel] as [number, LiveSelWire]),
+				];
+				if (cur.length) head.cur = cur;
+				// A recipient that skipped rounds may still show agents that left meanwhile, and an
+				// old count: every agent this page numbered and no longer shows is gone.
+				if (this.agentPnos.size > 0) {
+					const showing = new Set(shown.map((a) => a.pno));
+					const left = [...this.agentPnos.values()]
+						.filter((pno) => !showing.has(pno))
+						.slice(-OUTLINE_LIVE_AGENT_BOUNDS.narrators);
+					if (left.length) head.gone = left;
+					head.am = this.agentsMore;
+				}
+			} else {
+				const changed = [
+					...peers.map((p) => p.peer()),
+					...agentPeers.map((a) => this.agentWire(a, r.userId)),
+				];
+				if (changed.length) head.peers = changed;
+				if (gone.length || agentGone.length) head.gone = [...gone, ...agentGone];
+				const cur: Array<[number, LiveSelWire | null]> = [
+					...cursors.map((p) => [p.pno, p.sel] as [number, LiveSelWire | null]),
+					...agentCur.map((a) => [a.pno, a.sel] as [number, LiveSelWire]),
+				];
+				if (cur.length) head.cur = cur;
+				if (moreChanged) head.am = this.agentsMore;
+			}
+			const raw =
+				head.peers || head.gone || head.cur || head.am !== undefined ? encodeLiveHead(head) : null;
+			heads.set(key, raw);
+			return raw;
 		};
 		for (const r of [...this.participants.values()]) {
 			if (r.lagging) {
@@ -978,13 +1078,245 @@ export class LivePage {
 				this.presenceBehind.add(r.pno);
 				continue;
 			}
-			const raw = behind ? fullHead() : deltaHead();
+			const raw = headFor(r, behind);
 			if (!raw) continue;
 			const sent = this.deliver(r, "presence", () =>
 				encodeLiveFrame({ kind: LIVE_FRAME.presence, handle: r.handle, rawHead: raw }),
 			);
 			if (sent) this.presenceBehind.delete(r.pno);
 			else this.presenceBehind.add(r.pno);
+		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// Agents (outline P2 PR 10b, `agent-presence.ts`)
+	// ─────────────────────────────────────────────────────────────────────────
+
+	/** Whether the person may see the agent's name (its session is one they may read). */
+	private mayName(userId: string, agent: AgentPeer): boolean {
+		return this.agentReaders.get(userId)?.get(agent.narratorId) === true;
+	}
+
+	/** An agent as one person sees it: named, with its session, or just "Agent". */
+	private agentWire(agent: AgentPeer, userId: string): LivePeerWire {
+		if (!this.mayName(userId, agent)) return [agent.pno, "", "", agent.color, "e", "a"];
+		return agent.session
+			? [agent.pno, "", agent.title, agent.color, "e", "a", agent.narratorId, agent.session]
+			: [agent.pno, "", agent.title, agent.color, "e", "a", agent.narratorId];
+	}
+
+	/** Agents shown now (tests and diagnostics). */
+	get agentsShown(): Array<{ narratorId: string; blocks: string[] }> {
+		return [...this.agents.values()].map((a) => ({
+			narratorId: a.narratorId,
+			blocks: "b" in a.sel ? [...a.sel.b] : [],
+		}));
+	}
+
+	/**
+	 * Work the page's agents out again soon: at most once every
+	 * {@link OUTLINE_LIVE_TIMING.agentsMs}, one at a time (a request meanwhile runs once after).
+	 */
+	requestAgents(): void {
+		if (this.closed) return;
+		if (this.agentRunning) {
+			this.agentDirty = true;
+			return;
+		}
+		if (this.agentTimer) return;
+		const wait = Math.max(0, this.agentLastAt + OUTLINE_LIVE_TIMING.agentsMs - Date.now());
+		this.agentTimer = setTimeout(() => {
+			this.agentTimer = null;
+			void this.runAgents();
+		}, wait);
+		this.agentTimer.unref?.();
+	}
+
+	/** Access changed somewhere: who may name which agent is asked again. */
+	agentAccessChanged(): void {
+		if (this.agents.size === 0) return;
+		this.agentReadersStale = true;
+		this.requestAgents();
+	}
+
+	private async runAgents(): Promise<void> {
+		if (this.closed) return;
+		this.agentRunning = true;
+		this.agentLastAt = Date.now();
+		try {
+			await this.refreshAgents();
+		} catch (error) {
+			logger.warn("Outline live agents could not be worked out", {
+				pageId: this.pageId,
+				error: String(error),
+			});
+		} finally {
+			this.agentRunning = false;
+			if (this.agentDirty) {
+				this.agentDirty = false;
+				this.requestAgents();
+			}
+		}
+	}
+
+	/** Note the blocks of this page an agent's commit wrote (the last few), for its cursor. */
+	private noteAgentWrite(narratorId: string, versions: readonly OutlineVersionRow[]): void {
+		const blocks = versions
+			.filter((v) => !v.deleted && v.pageId === this.pageId && v.blockId !== this.pageId)
+			.map((v) => v.blockId)
+			.slice(-OUTLINE_LIVE_AGENT_BOUNDS.writtenBlocks);
+		if (blocks.length === 0) return;
+		this.agentWrites.delete(narratorId);
+		this.agentWrites.set(narratorId, { blocks, at: Date.now() });
+		while (this.agentWrites.size > OUTLINE_LIVE_AGENT_BOUNDS.narrators) {
+			const oldest = this.agentWrites.keys().next().value;
+			if (oldest === undefined) break;
+			this.agentWrites.delete(oldest);
+		}
+	}
+
+	/** Learn who of these people may name these agents; tell those who now may. */
+	private async learnAgentReaders(
+		people: readonly Participant[],
+		narratorIds: readonly string[],
+	): Promise<void> {
+		const persons = people.map((p) => ({ userId: p.userId, isAdmin: p.socket.isAdmin }));
+		const allowed = new Set<string>();
+		for (const narratorId of narratorIds) {
+			const readers = await readLiveAgentReaders(narratorId, persons).catch(
+				() => new Set<string>(),
+			);
+			for (const person of persons) {
+				let verdicts = this.agentReaders.get(person.userId);
+				if (!verdicts) {
+					verdicts = new Map();
+					this.agentReaders.set(person.userId, verdicts);
+				}
+				const may = readers.has(person.userId);
+				if (may && verdicts.get(narratorId) !== true) allowed.add(person.userId);
+				verdicts.set(narratorId, may);
+			}
+		}
+		if (this.closed || allowed.size === 0) return;
+		// Those who may now name an agent get the whole picture again.
+		for (const p of this.participants.values())
+			if (allowed.has(p.userId)) this.presenceBehind.add(p.pno);
+		this.schedulePresence();
+	}
+
+	private agentPnoOf(narratorId: string): number {
+		let pno = this.agentPnos.get(narratorId);
+		if (pno === undefined) {
+			if (this.agentPnos.size >= 4096) this.agentPnos.clear();
+			pno = OUTLINE_LIVE_AGENT_PNO_BASE + this.agentPnos.size;
+			while ([...this.agents.values()].some((a) => a.pno === pno)) pno++;
+			this.agentPnos.set(narratorId, pno);
+		}
+		return pno;
+	}
+
+	private async refreshAgents(): Promise<void> {
+		const now = Date.now();
+		for (const [id, w] of this.agentWrites)
+			if (now - w.at >= OUTLINE_LIVE_AGENT_BOUNDS.writeMs) this.agentWrites.delete(id);
+		const doing: string[] = [];
+		for (const b of this.mirror.all())
+			if (!b.deleted && b.taskJson?.status === "doing") doing.push(b.id);
+		const read = await readLiveAgents({ doing, writes: this.agentWrites, now });
+		if (this.closed) return;
+		this.agentInterest = read.interest;
+		const next = read.agents.flatMap((a) => {
+			const ids = a.blocks
+				.filter((id) => this.mirror.alive(id))
+				.slice(0, OUTLINE_LIVE_BOUNDS.presenceBlocks);
+			return ids.length > 0 ? [{ ...a, blocks: ids }] : [];
+		});
+		// Names for everyone in, before an agent shows: a new agent, or all of them after an
+		// access change.
+		const people = [...this.participants.values()];
+		if (this.agentReadersStale) {
+			this.agentReadersStale = false;
+			this.agentReaders.clear();
+			for (const p of people) this.presenceBehind.add(p.pno);
+			if (people.length > 0)
+				await this.learnAgentReaders(
+					people,
+					next.map((a) => a.narratorId),
+				);
+		} else {
+			const fresh = next.filter((a) => !this.agents.has(a.narratorId)).map((a) => a.narratorId);
+			if (fresh.length > 0 && people.length > 0) await this.learnAgentReaders(people, fresh);
+		}
+		if (this.closed) return;
+		let changed = false;
+		const wanted = new Set(next.map((a) => a.narratorId));
+		for (const [id, peer] of this.agents) {
+			if (wanted.has(id)) continue;
+			this.agents.delete(id);
+			this.agentGone.add(peer.pno);
+			this.agentPeersChanged.delete(peer.pno);
+			this.agentCursors.delete(peer.pno);
+			changed = true;
+		}
+		for (const a of next) {
+			const sel: LiveSelWire = { b: a.blocks };
+			const prior = this.agents.get(a.narratorId);
+			if (!prior) {
+				const pno = this.agentPnoOf(a.narratorId);
+				this.agents.set(a.narratorId, {
+					pno,
+					narratorId: a.narratorId,
+					title: a.title,
+					session: a.session,
+					color: livePeerColor(a.narratorId),
+					sel,
+				});
+				this.agentGone.delete(pno);
+				this.agentPeersChanged.add(pno);
+				this.agentCursors.add(pno);
+				changed = true;
+				continue;
+			}
+			if (prior.title !== a.title || prior.session !== a.session) {
+				prior.title = a.title;
+				prior.session = a.session;
+				this.agentPeersChanged.add(prior.pno);
+				changed = true;
+			}
+			if (JSON.stringify(prior.sel) !== JSON.stringify(sel)) {
+				prior.sel = sel;
+				this.agentCursors.add(prior.pno);
+				changed = true;
+			}
+		}
+		if (read.more !== this.agentsMore) {
+			this.agentsMore = read.more;
+			this.agentsMoreChanged = true;
+			changed = true;
+		}
+		if (
+			this.agentReaders.size >
+			4 * (OUTLINE_LIVE_LIMITS.editorsPerPage + OUTLINE_LIVE_LIMITS.viewersPerPage)
+		) {
+			const here = new Set(people.map((p) => p.userId));
+			for (const userId of [...this.agentReaders.keys()])
+				if (!here.has(userId)) this.agentReaders.delete(userId);
+		}
+		if (changed) this.schedulePresence();
+		// A cursor on a block just written lasts its while: look again when the first one ends.
+		if (this.agentExpiry) clearTimeout(this.agentExpiry);
+		this.agentExpiry = null;
+		let first = Number.POSITIVE_INFINITY;
+		for (const w of this.agentWrites.values()) first = Math.min(first, w.at);
+		if (Number.isFinite(first)) {
+			this.agentExpiry = setTimeout(
+				() => {
+					this.agentExpiry = null;
+					this.requestAgents();
+				},
+				Math.max(0, first + OUTLINE_LIVE_AGENT_BOUNDS.writeMs - Date.now()),
+			);
+			this.agentExpiry.unref?.();
 		}
 	}
 
@@ -1741,6 +2073,13 @@ export class LivePage {
 	}
 
 	private recordCommit(commit: LiveCommitWire): void {
+		// A person's checkbox or delete here may end a task an agent's cursor is on.
+		if (
+			typeof commit.by === "number" &&
+			this.agents.size > 0 &&
+			commit.ops.some((op) => op.t === "k" || op.t === "d")
+		)
+			this.requestAgents();
 		this.windowCommits.push(commit);
 		this.opLog.push(commit);
 		while (this.opLog.length > OUTLINE_LIVE_BOUNDS.opLog) this.opLog.shift();
@@ -1924,6 +2263,16 @@ export class LivePage {
 				for (const v of rows) if (v.fromSeq === commit.seq) versions.push(v);
 			}
 			await this.applyVersions(versions, actorOf(commit));
+			// An agent wrote here (or the system for one): its cursor is on what it wrote. Any other
+			// commit that changed tasks may have ended or handed over one an agent holds.
+			if (commit.narratorId) {
+				this.noteAgentWrite(commit.narratorId, versions);
+				this.requestAgents();
+			} else if (
+				this.agents.size > 0 &&
+				versions.some((v) => v.deleted || v.changeFlags & OUTLINE_CHANGE.TASK)
+			)
+				this.requestAgents();
 		}
 	}
 
@@ -2299,6 +2648,8 @@ export class LivePage {
 			this.flushTimer,
 			this.persistTimer,
 			this.idleTimer,
+			this.agentTimer,
+			this.agentExpiry,
 		]) {
 			if (timer) clearTimeout(timer);
 		}

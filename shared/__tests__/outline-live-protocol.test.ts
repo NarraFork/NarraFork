@@ -7,9 +7,12 @@ import {
 	isLiveHandle,
 	isLiveTaskChar,
 	LIVE_FRAME,
+	LIVE_PEER_PALETTE,
 	LIVE_STATUS_OF_TASK,
 	LIVE_TASK_OF_STATUS,
 	type LiveRejectHead,
+	livePeerColor,
+	OUTLINE_LIVE_AGENT_PNO_BASE,
 	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_MAGIC,
 	OUTLINE_LIVE_MAX_HANDLE,
@@ -124,5 +127,15 @@ describe("live frames", () => {
 			expect(isLiveTaskChar(char)).toBe(true);
 		}
 		expect(isLiveTaskChar("?")).toBe(false);
+	});
+});
+
+describe("agents in presence (P2 PR 10b)", () => {
+	test("an id's palette colour is stable, and agents number apart from people", () => {
+		expect(livePeerColor("abc")).toBe(livePeerColor("abc"));
+		expect(LIVE_PEER_PALETTE).toContain(livePeerColor("some-narrator-id"));
+		expect(OUTLINE_LIVE_AGENT_PNO_BASE).toBeGreaterThan(
+			OUTLINE_LIVE_LIMITS.editorsPerPage + OUTLINE_LIVE_LIMITS.viewersPerPage,
+		);
 	});
 });

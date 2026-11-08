@@ -9,7 +9,12 @@
  *
  * Anonymous public-share sockets have no person behind them and never reach a session.
  */
-import { decodeLiveFrame, LIVE_FRAME, OUTLINE_LIVE_LIMITS } from "@shared/outline-live-protocol";
+import {
+	decodeLiveFrame,
+	LIVE_FRAME,
+	livePeerColor,
+	OUTLINE_LIVE_LIMITS,
+} from "@shared/outline-live-protocol";
 import { logger } from "../lib/logger";
 import {
 	drainLiveSocket,
@@ -28,23 +33,6 @@ export interface OutlineLiveWS {
 	};
 	sendBinary(data: Uint8Array): number;
 	getBufferedAmount(): number;
-}
-
-const PALETTE = [
-	"#d6336c",
-	"#1c7ed6",
-	"#2f9e44",
-	"#e8590c",
-	"#7048e8",
-	"#0c8599",
-	"#c2255c",
-	"#5f3dc4",
-];
-
-function colorOf(userId: string): string {
-	let h = 0;
-	for (let i = 0; i < userId.length; i++) h = (h * 31 + userId.charCodeAt(i)) >>> 0;
-	return PALETTE[h % PALETTE.length] as string;
 }
 
 class NarratorLiveSocket implements LiveSocket {
@@ -66,7 +54,7 @@ class NarratorLiveSocket implements LiveSocket {
 	}
 
 	get color(): string {
-		return this.ws.data.avatarColor || colorOf(this.userId);
+		return this.ws.data.avatarColor || livePeerColor(this.userId);
 	}
 
 	send(frame: Uint8Array): boolean {

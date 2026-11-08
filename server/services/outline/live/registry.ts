@@ -624,6 +624,13 @@ function scheduleReauth(filter: ReauthFilter): void {
 
 /** Re-check the participants an access change may affect (exported for tests). */
 export function onOutlineLiveAccessEvent(event: NarraForkEvent): void {
+	// Who may see an agent's name can change with any of these (P2 PR 10b).
+	if (
+		event.type === "narrator:access_changed" ||
+		event.type === "project:access_changed" ||
+		event.type === "auth:changed"
+	)
+		for (const page of state.sessions.values()) page.agentAccessChanged();
 	switch (event.type) {
 		case "narrator:access_changed":
 			scheduleReauth((space) => space.narratorId === event.narratorId);
@@ -754,6 +761,17 @@ export function runInLane<T>(spaceId: string, fn: () => Promise<T> | T): Promise
 	return laneFor(spaceId).run(fn);
 }
 
+/**
+ * A narrator's run started or ended: the pages whose agents may change with it work them out
+ * again (agent presence, P2 PR 10b: only running sessions are shown).
+ */
+function onNarratorStatus(
+	event: Extract<NarraForkEvent, { type: "narrator:status_changed" }>,
+): void {
+	for (const page of state.sessions.values())
+		if (page.agentInterest.has(event.narratorId)) page.requestAgents();
+}
+
 if (hotOnce("narrafork.outlineLive.listenersRegistered")) {
 	eventBus.on("outline:committed", onCommitted);
 	eventBus.on("narrator:access_changed", onOutlineLiveAccessEvent);
@@ -762,4 +780,8 @@ if (hotOnce("narrafork.outlineLive.listenersRegistered")) {
 	subscribeSettingsChanges(() => {
 		if (!isOutlineEnabled() && state.sessions.size > 0) void closeAllLiveSessions("unavailable");
 	});
+}
+
+if (hotOnce("narrafork.outlineLive.agentListeners")) {
+	eventBus.on("narrator:status_changed", onNarratorStatus);
 }
