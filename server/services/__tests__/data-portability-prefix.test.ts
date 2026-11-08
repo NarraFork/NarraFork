@@ -100,7 +100,6 @@ async function recover() {
 		narratorId: "owner",
 		versioned: true,
 		bodiesFromBlocks: true,
-		deadline: Date.now() + 10_000,
 	});
 	const messages = source.messages.map((row) => ({ ...row }));
 	attachPrefixHistorySource(messages, source);
@@ -273,6 +272,7 @@ test("old packages without snapshots/reply_context import null and preserve abse
 		const preview = await previewImport(bytes, "legacy.zip");
 		const incoming = new Database(preview.snapshotPath);
 		incoming.run("DROP TABLE narrator_text_snapshots");
+		incoming.run("DROP TABLE recent_tab_archive_marks");
 		incoming.run("ALTER TABLE narrators DROP COLUMN reply_context");
 		incoming.close();
 		await applyImport(preview.token, { include: selection, conflictDefault });

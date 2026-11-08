@@ -1,6 +1,7 @@
 import {
 	MODEL_JSON_CONTAINER_BYTES,
 	MODEL_JSON_SLOT_BYTES,
+	ModelJsonBudgetError,
 	measureModelJsonShape,
 } from "../../services/agent-runtime/model-history-json";
 import { DISPLAY_PAGE_LIMITS, DisplayPageReadError } from "./display-page-protocol";
@@ -34,16 +35,13 @@ export class DisplayJsonAllocationBudget {
 		this.check();
 		try {
 			this.used += measureModelJsonShape(raw, {
-				deadline: this.deadline,
+				check: () => this.check(),
 				maxBytes: Math.max(0, this.ceiling - this.used),
 				maxContainerSlots: DISPLAY_PAGE_LIMITS.maxContainerSlots,
 			}).bytes;
-		} catch {
-			if (Date.now() >= this.deadline)
-				throw new DisplayPageReadError(
-					"DISPLAY_PAGE_DEADLINE",
-					"Display page read exceeded its deadline",
-				);
+		} catch (error) {
+			// Caller deadlines and programming/worker failures are not oversized history.
+			if (!(error instanceof ModelJsonBudgetError)) throw error;
 			throw new DisplayPageReadError(
 				"DISPLAY_PAGE_BUDGET_EXCEEDED",
 				"Display page JSON shape exceeded the allocation/width budget; request a smaller history window",

@@ -86,6 +86,7 @@ export const createNarratorSchema = z.object({
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
+	questionReflectionOverride: booleanOverrideSchema.optional(),
 	autoContinuationOverride: autoContinuationOverrideSchema.optional(),
 	behaviorFenceIntervalOverride: z
 		.number()

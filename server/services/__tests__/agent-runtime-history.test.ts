@@ -1,4 +1,5 @@
-import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterAll, afterEach, beforeEach, expect, expectTypeOf, mock, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,8 +17,22 @@ import { setOutboundFetchOverrideForTest } from "../../lib/net/outbound-fetch";
 import { settings } from "../../lib/settings";
 import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
+import { modelHistoryFixtureSql } from "../agent-runtime/model-history-fixture";
+import type {
+	ModelHistoryJson,
+	ModelHistorySource,
+	ModelSourceRow,
+} from "../agent-runtime/model-history-query";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
-import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
+import {
+	MODEL_HISTORY_REVISION_CONTRACT,
+	renderModelHistoryRevisionSql,
+} from "../agent-runtime/model-history-revision-sql";
+import {
+	clearModelHistorySourceCacheForTest,
+	freezeModelHistorySource,
+	loadModelHistorySource,
+} from "../agent-runtime/model-history-source";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -345,7 +360,7 @@ for (const scenario of [
 	});
 }
 
-test("hydration may outlive the source-read deadline without rejecting a valid history", async () => {
+test("hydration may exceed ten seconds without rejecting a valid history", async () => {
 	const prefix = await import("../narrator-prefix-state");
 	const original = prefix.hydrateContextUpdates;
 	let now = Date.now();
@@ -358,7 +373,6 @@ test("hydration may outlive the source-read deadline without rejecting a valid h
 	try {
 		const built = await buildRuntimeHistory({
 			...options(),
-			deadline: now + 10_000,
 			sourceMessages: [message("input", "user", "large history survives hydration")],
 		});
 		expect(built.modelMessages[0].contentText).toBe("large history survives hydration");
@@ -520,6 +534,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 					);
 				if (placement !== "trailing")
 					source.push(message("after-question", "assistant", "Acknowledged"));
+				await freezeModelHistorySource(source);
 				const before = structuredClone(source);
 				const prepared = await buildRuntimeHistory({
 					...options(profile),
@@ -600,6 +615,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 			},
 		];
 		const source = [tool];
+		await freezeModelHistorySource(source);
 		const before = structuredClone(source);
 		const prepared = await buildRuntimeHistory({
 			...options(),
@@ -680,6 +696,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 			},
 		];
 		const source = [orphan];
+		await freezeModelHistorySource(source);
 		const before = structuredClone(source);
 		const prepared = await buildRuntimeHistory({
 			...options(),
@@ -719,6 +736,7 @@ for (const entry of [
 			},
 			{ ...injectionMessage("display-notice", "sys", "display-only-body"), role: "disp" as const },
 		];
+		await freezeModelHistorySource(source);
 		const before = structuredClone(source);
 		const prepared = await buildRuntimeHistory({ ...options(), ...entry, sourceMessages: source });
 		expect(prepared.replayedInjectionMessageIds).toEqual(["u", "historical-notice", "tail-notice"]);
@@ -879,6 +897,203 @@ test("child placement is projected while complete tools and reasoning metadata a
 	const primary = await buildRuntimeHistory({ ...options(), sourceMessages: source });
 	expect(primary.history).toEqual([]);
 });
+
+test("model source exposes recursive readonly JSON and preserves the public return boundary", () => {
+	type Returned = Awaited<
+		ReturnType<
+			typeof import("../narrator-messages").narratorMessageQueries.getModelHistorySinceLastCompact
+		>
+	>;
+	expectTypeOf<Returned>().toEqualTypeOf<readonly ModelSourceRow[]>();
+	// Compile-only negative probes: these must remain errors after future type refactors.
+	const readonlyProbe = (
+		source: ModelHistorySource,
+		array: readonly ModelHistoryJson[],
+		object: { readonly [key: string]: ModelHistoryJson },
+	) => {
+		// @ts-expect-error Shared source containers cannot be appended to.
+		source.messages.push(source.messages[0]);
+		// @ts-expect-error Shared source row fields cannot be replaced.
+		source.messages[0].contentJson = null;
+		// @ts-expect-error Shared tool containers cannot be appended to.
+		source.messages[0].toolCalls.push(source.messages[0].toolCalls[0]);
+		// @ts-expect-error Shared nested tool JSON cannot be replaced.
+		source.messages[0].toolCalls[0].inputJson = null;
+		// @ts-expect-error Shared parsed JSON arrays are recursively readonly.
+		array.push(null);
+		// @ts-expect-error Shared parsed JSON objects are recursively readonly.
+		object.nested = null;
+	};
+	expect(readonlyProbe).toBeFunction();
+});
+
+for (const width of [3, 17_001])
+	test(`real provider projections preserve frozen worker sources and delta subtrees (width=${width})`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-provider-source-ownership-"));
+		const connection = new Database(join(directory, "history.db"));
+		const started = performance.now();
+		let lastHeartbeat = started;
+		let maxHeartbeatGapMs = 0;
+		let heartbeats = 0;
+		const heartbeat = setInterval(() => {
+			const now = performance.now();
+			maxHeartbeatGapMs = Math.max(maxHeartbeatGapMs, now - lastHeartbeat);
+			lastHeartbeat = now;
+			heartbeats++;
+		}, 5);
+		try {
+			connection.run("PRAGMA journal_mode = WAL");
+			connection.run(modelHistoryFixtureSql);
+			connection.run(renderModelHistoryRevisionSql("sqlite"));
+			connection.run("INSERT INTO narrators (id, title) VALUES ('primary', 'Frozen owner')");
+			const insert = (
+				id: string,
+				seq: number,
+				role: string,
+				content: ModelHistoryJson,
+				parent: string | null = null,
+			) => {
+				connection
+					.query(
+						"INSERT INTO narrator_messages (id, narrator_id, role, content_json, parent_tool_use_id) VALUES (?, 'primary', ?, ?, ?)",
+					)
+					.run(id, role, JSON.stringify(content), parent);
+				connection
+					.query(
+						"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, 'primary', ?, ?)",
+					)
+					.run(`ref:${id}`, id, seq);
+			};
+			// This is within the preparation byte budget, but wider than the former 16,384 limit.
+			const wide = Array.from({ length: width }, (_, index) => ({
+				type: "text",
+				text: `wide-${index}`,
+			}));
+			insert("wide-user", 1, "user", wide);
+			const input = { path: "example", nested: { values: [1, { preserve: "input-subtree" }] } };
+			const output = {
+				result: "shared-output-marker",
+				nested: { values: [2, { preserve: "output-subtree" }] },
+			};
+			insert(
+				"shared-assistant",
+				2,
+				"assistant",
+				[
+					{ type: "text", text: "source answer" },
+					{ type: "tool_use", id: "shared-call", name: "Read", input },
+				],
+				"origin",
+			);
+			connection
+				.query(
+					"INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json, status, created_at) VALUES ('tool-row', 'primary', 'shared-assistant', 'shared-call', 'Read', ?, ?, 'success', ?)",
+				)
+				.run(JSON.stringify(input), JSON.stringify(output), time);
+			const backend = { backend: "sqlite" as const, sqlite: connection };
+			const source = await loadModelHistorySource(backend, "primary");
+			await freezeModelHistorySource(source);
+			const before = structuredClone(source);
+			expect(Object.isFrozen(source.messages[0].contentJson)).toBe(true);
+			expect(Object.isFrozen(source.messages[1].toolCalls[0].inputJson)).toBe(true);
+			insert("delta-user", 3, "user", [{ type: "text", text: "appended delta question" }]);
+			const delta = await loadModelHistorySource(backend, "primary");
+			await freezeModelHistorySource(delta);
+			const deltaBefore = structuredClone(delta);
+			expect(delta.counters.reusedBodies).toBe(2);
+			expect(delta.counters.reusedTools).toBe(1);
+			expect(delta.messages[0].contentJson).toBe(source.messages[0].contentJson);
+			expect(delta.messages[1].contentJson).toBe(source.messages[1].contentJson);
+			expect(delta.messages[1].toolCalls[0].inputJson).toBe(
+				source.messages[1].toolCalls[0].inputJson,
+			);
+			expect(delta.messages[1].toolCalls[0].outputJson).toBe(
+				source.messages[1].toolCalls[0].outputJson,
+			);
+			for (const entry of [
+				{ model: "claude-sonnet-4", provider: "history-official" },
+				{ model: "claude-sonnet-4", provider: "history-relay" },
+				{ model: "gpt-5", provider: "question-responses" },
+				{ model: "gpt-5", provider: "question-completions" },
+				{ model: "gemini-2.5-pro", provider: "question-gemini" },
+				{ model: "gemini-2.5-pro", provider: "question-interactions" },
+			]) {
+				const project = (shared: ModelHistorySource) =>
+					buildRuntimeHistory({
+						...entry,
+						narratorId: "primary",
+						ownTurnPlacement: "origin",
+						sourceMessages: shared.messages,
+					});
+				// Measure one real build only; assertions/clones and sibling builds are outside this timer.
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				let projectionLastBeat = performance.now();
+				let projectionMaxGap = 0;
+				let projectionBeats = 0;
+				const projectionHeartbeat = setInterval(() => {
+					const now = performance.now();
+					projectionMaxGap = Math.max(projectionMaxGap, now - projectionLastBeat);
+					projectionLastBeat = now;
+					projectionBeats++;
+				}, 1);
+				const projectionStarted = performance.now();
+				let first: Awaited<ReturnType<typeof buildRuntimeHistory>>;
+				try {
+					first = await project(source);
+					const buildMs = performance.now() - projectionStarted;
+					await new Promise<void>((resolve) => setTimeout(resolve, 0));
+					console.info("single provider projection timing", {
+						width,
+						provider: entry.provider,
+						buildMs: Math.round(buildMs),
+						heartbeats: projectionBeats,
+						maxHeartbeatGapMs: Math.round(
+							Math.max(projectionMaxGap, performance.now() - projectionLastBeat),
+						),
+					});
+				} finally {
+					clearInterval(projectionHeartbeat);
+				}
+				const [second, next] = await Promise.all([project(source), project(delta)]);
+				expect(first.history).toEqual(second.history);
+				expect(first.history).not.toBe(second.history);
+				expect(JSON.stringify(first.history)).toContain(`wide-${width - 1}`);
+				expect(JSON.stringify(first.history)).toContain("shared-output-marker");
+				expect(JSON.stringify(next.history)).toContain("appended delta question");
+				expect(first.sourceMessages).toBe(source.messages);
+				expect(first.modelMessages[1]).not.toBe(second.modelMessages[1]);
+				expect(first.modelMessages[1].toolCalls?.[0]).not.toBe(
+					second.modelMessages[1].toolCalls?.[0],
+				);
+				expect(first.modelMessages[1].parentToolUseId).toBeNull();
+				const secondBefore = structuredClone(second);
+				const nextBefore = structuredClone(next);
+				// These containers are request-owned. Mutating them cannot alter another request or source.
+				first.modelMessages[1].contentText = "request-local edit";
+				const call = first.modelMessages[1].toolCalls?.[0];
+				if (!call) throw new Error("Missing request-owned tool projection");
+				call.outputJson = "request-local output";
+				first.history.push({ role: "user", content: "request-local history" });
+				expect(second).toEqual(secondBefore);
+				expect(next).toEqual(nextBefore);
+				expect(source).toEqual(before);
+				expect(delta).toEqual(deltaBefore);
+			}
+			console.info("frozen provider source probe", {
+				width,
+				elapsedMs: Math.round(performance.now() - started),
+				heartbeats,
+				maxHeartbeatGapMs: Math.round(
+					Math.max(maxHeartbeatGapMs, performance.now() - lastHeartbeat),
+				),
+			});
+		} finally {
+			clearInterval(heartbeat);
+			clearModelHistorySourceCacheForTest();
+			connection.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 test("reconciled epoch and raw candidates are reused without a second epoch query", async () => {
 	const epochs = await import("../narrator-epochs");

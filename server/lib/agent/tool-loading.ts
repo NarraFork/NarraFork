@@ -42,6 +42,7 @@ import {
 	parseClaudeModel,
 } from "@shared/reasoning-effort-support";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../builtin-routines";
+import { AppError } from "../errors";
 import { isModelProtocol, type ModelProtocol } from "../settings/types";
 import type { ProviderAdapter } from "./provider";
 import { effectiveModelProfile } from "./provider-model-metadata";
@@ -332,10 +333,17 @@ export function classifyToolAdditions(
 	return { allowed, blocked };
 }
 
-/** A persisted epoch boundary failed; do not fall back to a transcript from the old epoch. */
+/** Request preparation failed; do not fall back to a transcript from the old epoch. */
 export class ToolEpochError extends Error {
 	constructor(cause: unknown) {
-		super("Could not save the tool epoch. Retry when message storage is available.", { cause });
+		// AppError already marks public prose; raw driver errors may contain credentials or SQL.
+		const message =
+			cause instanceof AppError
+				? cause.message
+				: cause instanceof Error && cause.name === "AbortError"
+					? "Request preparation cancelled."
+					: "Could not prepare tool and context state. See server logs for details.";
+		super(message, { cause });
 		this.name = "ToolEpochError";
 	}
 }

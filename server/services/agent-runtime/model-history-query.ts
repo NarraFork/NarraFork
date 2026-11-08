@@ -1,17 +1,16 @@
 import type { Database } from "bun:sqlite";
 import { assembleContent } from "@shared/narrator-blocks/storage";
 import { bodyBytesSql, bodySql } from "../../lib/narrator-bodies";
-import { modelJsonContainerBytes } from "./model-history-json";
+import { ModelHistoryBudget } from "./model-history-json";
 
 export const MODEL_HISTORY_REF_BATCH = 200;
 export const MODEL_HISTORY_BATCH_BYTES = 4 * 1024 * 1024;
 export const MODEL_HISTORY_MAX_BYTES = 128 * 1024 * 1024;
-export const MODEL_HISTORY_TIMEOUT_MS = 10_000;
 
 export interface ModelHistoryQueryOptions {
 	narratorId: string;
 	limit?: number;
-	deadline: number;
+	signal?: AbortSignal;
 	maxBytes?: number;
 	/** In-memory unit fixtures have no worker identity; reject large inline JSON before decoding. */
 	inlineRowBytes?: number;
@@ -29,46 +28,63 @@ export interface ModelHistoryCounters {
 	maxRefsPerQuery: number;
 	maxBodyBatchBytes: number;
 	maxToolBatchBytes: number;
-	preparedBytes?: number;
+	preparedBytes: number;
 	reusedBodies?: number;
 	reusedTools?: number;
 }
-export type ModelSourceRow = {
+/** Parsed JSON shared across requests; consumers own only their projection containers. */
+export type ModelHistoryJson =
+	| null
+	| boolean
+	| number
+	| string
+	| readonly ModelHistoryJson[]
+	| { readonly [key: string]: ModelHistoryJson };
+
+export type ModelSourceRow = Readonly<{
 	id: string;
 	seq: number;
 	bodyRevision: number;
+	/** Stored UTF-8 body bytes for this revision, reused without rereading its text. */
+	rawBytes?: number;
 	jsonContainerBytes?: number;
 	narratorId: string;
 	authorNarratorId: string | null;
 	role: "user" | "assistant" | "system" | "sys" | "disp";
-	contentJson: unknown;
+	contentJson: ModelHistoryJson;
 	contentText: string | null;
 	parentToolUseId: string | null;
 	messageUuid: string | null;
 	createdBy: string | null;
 	origin: string | null;
 	originLabel: string | null;
-	creator: { username: string } | null;
-	narrator: { title: string | null } | null;
+	creator: Readonly<{ username: string }> | null;
+	narrator: Readonly<{ title: string | null }> | null;
+	toolCalls: readonly ModelToolSourceRow[];
+}>;
+/** Only the loader owns this tool container while assembling a row. */
+export type ModelSourceRowBuilder = Omit<ModelSourceRow, "toolCalls"> & {
 	toolCalls: ModelToolSourceRow[];
 };
-export type ModelToolSourceRow = {
+export type ModelToolSourceRow = Readonly<{
 	id: string;
 	modelRevision: number;
+	/** Stored UTF-8 body bytes for this revision, reused without rereading its text. */
+	rawBytes?: number;
 	jsonContainerBytes?: number;
 	executionAttempt: number;
 	createdAt: string;
 	toolUseId: string;
 	toolName: string;
-	inputJson: unknown;
-	outputJson: unknown;
+	inputJson: ModelHistoryJson;
+	outputJson: ModelHistoryJson;
 	status: string;
-};
+}>;
 export type HistoryQuery = <T>(sql: string, parameters?: unknown[]) => Promise<T[]>;
 export interface ModelHistorySource {
-	messages: ModelSourceRow[];
-	counters: ModelHistoryCounters;
-	compactSeq?: number | null;
+	readonly messages: readonly ModelSourceRow[];
+	readonly counters: Readonly<ModelHistoryCounters>;
+	readonly compactSeq?: number | null;
 }
 
 /** SQLite work runs in a read-only worker; this adapter is also useful for tiny in-memory tests. */
@@ -77,20 +93,13 @@ export function sqliteHistoryQuery(sqlite: Database): HistoryQuery {
 		sqlite.query(sql).all(...(parameters as Array<string | number | null>)) as T[];
 }
 
-function decode(value: unknown): unknown {
-	return typeof value === "string" ? JSON.parse(value) : value;
-}
-
-/**
- * The bodies `bodySql` left out, assembled from their block rows, with the allocation
- * preflight each row's stored payload and state pass, as a `content_json` string would.
- */
+/** Each block payload/state reserves graph allocations before parsing, across the entire batch. */
 export async function assembleBlockBodies(
 	query: HistoryQuery,
 	ids: readonly string[],
-	deadline: number,
-	remainingBytes: () => number,
+	budget: ModelHistoryBudget,
 ): Promise<Map<string, { content: unknown[]; jsonContainerBytes: number }>> {
+	budget.check();
 	const bodies = new Map<
 		string,
 		{ rows: Array<{ payload: unknown; state: unknown }>; bytes: number }
@@ -103,12 +112,13 @@ export async function assembleBlockBodies(
 	);
 	for (const row of rows) {
 		const body = bodies.get(row.messageId) ?? { rows: [], bytes: 0 };
-		body.bytes +=
-			modelJsonContainerBytes(row.payload, deadline, remainingBytes()) +
-			modelJsonContainerBytes(row.state, deadline, remainingBytes());
-		body.rows.push({ payload: decode(row.payload), state: decode(row.state) });
+		const payload = budget.parse(row.payload);
+		const state = budget.parse(row.state);
+		body.bytes += payload.jsonContainerBytes + state.jsonContainerBytes;
+		body.rows.push({ payload: payload.value, state: state.value });
 		bodies.set(row.messageId, body);
 	}
+	budget.check();
 	return new Map(
 		ids.map((id) => {
 			const body = bodies.get(id);
@@ -124,8 +134,10 @@ export async function assembleBlockBodies(
 export async function queryModelHistory(
 	query: HistoryQuery,
 	options: ModelHistoryQueryOptions,
-	onPage?: (rows: ModelSourceRow[]) => void | Promise<void>,
-	onTools?: (rows: Array<ModelToolSourceRow & { messageId: string }>) => void | Promise<void>,
+	onPage?: (rows: readonly ModelSourceRow[]) => void | Promise<void>,
+	onTools?: (
+		rows: ReadonlyArray<ModelToolSourceRow & { readonly messageId: string }>,
+	) => void | Promise<void>,
 ): Promise<ModelHistorySource> {
 	const counters: ModelHistoryCounters = {
 		refQueries: 0,
@@ -137,21 +149,13 @@ export async function queryModelHistory(
 		maxRefsPerQuery: 0,
 		maxBodyBatchBytes: 0,
 		maxToolBatchBytes: 0,
+		preparedBytes: 0,
 	};
 	const maxBytes = Math.min(options.maxBytes ?? MODEL_HISTORY_MAX_BYTES, MODEL_HISTORY_MAX_BYTES);
 	const fromBlocks = options.bodiesFromBlocks === true;
-	// Reserve decoded UTF-16 strings, detached provider projections and object overhead, not
-	// only wire bytes. Exhaustion is an error, never a silently shortened model conversation.
-	let preparedBytes = 0;
-	const check = (bytes = 0, rows = 0, objectBytes = 0) => {
-		if (Date.now() >= options.deadline)
-			throw new Error("Model history preparation exceeded 10s budget");
-		preparedBytes += bytes * 4 + rows * 1024 + objectBytes;
-		counters.preparedBytes = preparedBytes;
-		counters.sourceBytes += bytes;
-		if (preparedBytes > maxBytes)
-			throw new Error("Model history preparation exceeded 128MiB budget");
-	};
+	const budget = new ModelHistoryBudget(maxBytes, options.signal);
+	const check = budget.check;
+	check();
 	const boundary = await query<{ seq: number }>(
 		"SELECT seq FROM narrator_message_refs WHERE narrator_id = ? AND is_compact = 1 ORDER BY seq DESC LIMIT 1",
 		[options.narratorId],
@@ -166,7 +170,7 @@ export async function queryModelHistory(
 		check();
 		const refs = await query<{ messageId: string; seq: number; bytes: number }>(
 			`SELECT r.message_id AS "messageId", r.seq,
-			 ${bodyBytesSql("m", fromBlocks)} + coalesce(length(CAST(m.content_text AS BLOB)), 0) AS bytes
+			 coalesce(${bodyBytesSql("m", fromBlocks)}, 0) + coalesce(length(CAST(m.content_text AS BLOB)), 0) AS bytes
 			 FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id
 			 WHERE r.narrator_id = ? AND r.seq > ? AND r.segment_compact_id IS NULL AND m.role <> 'disp'
 			 ORDER BY r.seq LIMIT ?`,
@@ -192,10 +196,12 @@ export async function queryModelHistory(
 					.some((row) => Number(row.bytes) > (options.inlineRowBytes ?? Number.POSITIVE_INFINITY))
 			)
 				throw new Error("Model history large JSON requires a read-only worker");
-			check(batchBytes, end - offset);
+			budget.reserve(batchBytes, end - offset);
+			counters.sourceBytes += batchBytes;
 			counters.maxBodyBatchBytes = Math.max(counters.maxBodyBatchBytes, batchBytes);
 			const batchRefs = refs.slice(offset, end);
 			const ids = batchRefs.map((ref) => ref.messageId);
+			const refById = new Map(batchRefs.map((ref) => [ref.messageId, ref]));
 			const placeholders = ids.map(() => "?").join(",");
 			const bodies = await query<
 				Omit<ModelSourceRow, "creator" | "narrator" | "toolCalls"> & {
@@ -219,21 +225,21 @@ export async function queryModelHistory(
 			const fromRows = await assembleBlockBodies(
 				query,
 				bodies.filter((body) => body.contentJson === null).map((body) => body.id),
-				options.deadline,
-				() => maxBytes - preparedBytes,
+				budget,
 			);
-			const byId = new Map<string, ModelSourceRow>();
+			const byId = new Map<string, ModelSourceRowBuilder>();
 			for (const { username, title, ...body } of bodies) {
 				const assembled = fromRows.get(body.id);
-				const jsonContainerBytes =
-					assembled?.jsonContainerBytes ??
-					modelJsonContainerBytes(body.contentJson, options.deadline, maxBytes - preparedBytes);
-				check(0, 0, jsonContainerBytes);
+				const parsed = assembled
+					? { value: assembled.content, jsonContainerBytes: assembled.jsonContainerBytes }
+					: budget.parse(body.contentJson);
+				const ref = refById.get(body.id);
 				byId.set(body.id, {
-					jsonContainerBytes,
 					...body,
-					seq: batchRefs.find((ref) => ref.messageId === body.id)?.seq ?? 0,
-					contentJson: assembled ? assembled.content : decode(body.contentJson),
+					rawBytes: ref ? Number(ref.bytes) : undefined,
+					jsonContainerBytes: parsed.jsonContainerBytes,
+					seq: ref?.seq ?? 0,
+					contentJson: parsed.value as ModelHistoryJson,
 					creator: username == null ? null : { username },
 					narrator: { title },
 					toolCalls: [],
@@ -257,61 +263,58 @@ export async function queryModelHistory(
 				);
 				counters.toolQueries++;
 				if (!toolMeta.length) break;
-				let selected = 0;
-				let toolBytes = 0;
-				while (
-					selected < toolMeta.length &&
-					(selected === 0 ||
-						toolBytes + Number(toolMeta[selected].bytes) <= MODEL_HISTORY_BATCH_BYTES)
-				) {
-					toolBytes += Number(toolMeta[selected++].bytes);
-				}
-				if (
-					options.inlineRowBytes != null &&
-					toolMeta
-						.slice(0, selected)
-						.some((row) => Number(row.bytes) > (options.inlineRowBytes ?? Number.POSITIVE_INFINITY))
-				)
-					throw new Error("Model history large JSON requires a read-only worker");
-				check(toolBytes, selected);
-				counters.maxToolBatchBytes = Math.max(counters.maxToolBatchBytes, toolBytes);
-				const selectedIds = toolMeta.slice(0, selected).map((row) => row.id);
-				const tools = await query<ModelToolSourceRow & { messageId: string }>(
-					`SELECT id, ${options.versioned ? "model_revision" : "0"} AS "modelRevision", message_id AS "messageId", execution_attempt AS "executionAttempt", created_at AS "createdAt",
-					 tool_use_id AS "toolUseId", tool_name AS "toolName", input_json AS "inputJson", output_json AS "outputJson", status
-					 FROM narrator_tool_calls WHERE id IN (${selectedIds.map(() => "?").join(",")})`,
-					selectedIds,
-				);
-				counters.toolQueries++;
-				if (tools.length !== selectedIds.length)
-					throw new Error("Model history snapshot contains missing tool rows");
-				const decodedTools = tools.map((tool) => {
-					const inputBytes = modelJsonContainerBytes(
-						tool.inputJson,
-						options.deadline,
-						maxBytes - preparedBytes,
+				// Consume the whole metadata page in soft byte batches; never refetch its tail.
+				for (let toolOffset = 0; toolOffset < toolMeta.length; ) {
+					let selected = toolOffset;
+					let toolBytes = 0;
+					while (
+						selected < toolMeta.length &&
+						(selected === toolOffset ||
+							toolBytes + Number(toolMeta[selected].bytes) <= MODEL_HISTORY_BATCH_BYTES)
+					) {
+						toolBytes += Number(toolMeta[selected++].bytes);
+					}
+					const selectedMeta = toolMeta.slice(toolOffset, selected);
+					if (
+						options.inlineRowBytes != null &&
+						selectedMeta.some(
+							(row) => Number(row.bytes) > (options.inlineRowBytes ?? Number.POSITIVE_INFINITY),
+						)
+					)
+						throw new Error("Model history large JSON requires a read-only worker");
+					budget.reserve(toolBytes, selectedMeta.length);
+					counters.sourceBytes += toolBytes;
+					counters.maxToolBatchBytes = Math.max(counters.maxToolBatchBytes, toolBytes);
+					const selectedIds = selectedMeta.map((row) => row.id);
+					const rawBytesById = new Map(selectedMeta.map((row) => [row.id, Number(row.bytes)]));
+					const tools = await query<ModelToolSourceRow & { messageId: string }>(
+						`SELECT id, ${options.versioned ? "model_revision" : "0"} AS "modelRevision", message_id AS "messageId", execution_attempt AS "executionAttempt", created_at AS "createdAt",
+						 tool_use_id AS "toolUseId", tool_name AS "toolName", input_json AS "inputJson", output_json AS "outputJson", status
+						 FROM narrator_tool_calls WHERE id IN (${selectedIds.map(() => "?").join(",")})`,
+						selectedIds,
 					);
-					const jsonContainerBytes =
-						inputBytes +
-						modelJsonContainerBytes(
-							tool.outputJson,
-							options.deadline,
-							maxBytes - preparedBytes - inputBytes,
-						);
-					check(0, 0, jsonContainerBytes);
-					return {
-						...tool,
-						jsonContainerBytes,
-						inputJson: decode(tool.inputJson),
-						outputJson: decode(tool.outputJson),
-					};
-				});
-				if (onTools) await onTools(decodedTools);
-				else
-					for (const { messageId, ...tool } of decodedTools)
-						byId.get(messageId)?.toolCalls.push(tool);
-				counters.toolRows += tools.length;
-				const tail = toolMeta[selected - 1];
+					counters.toolQueries++;
+					if (tools.length !== selectedIds.length)
+						throw new Error("Model history snapshot contains missing tool rows");
+					const decodedTools = tools.map((tool) => {
+						const input = budget.parse(tool.inputJson);
+						const output = budget.parse(tool.outputJson);
+						return {
+							...tool,
+							rawBytes: rawBytesById.get(tool.id),
+							jsonContainerBytes: input.jsonContainerBytes + output.jsonContainerBytes,
+							inputJson: input.value as ModelHistoryJson,
+							outputJson: output.value as ModelHistoryJson,
+						};
+					});
+					if (onTools) await onTools(decodedTools);
+					else
+						for (const { messageId, ...tool } of decodedTools)
+							byId.get(messageId)?.toolCalls.push(tool);
+					counters.toolRows += tools.length;
+					toolOffset = selected;
+				}
+				const tail = toolMeta[toolMeta.length - 1];
 				toolMessageId = tail.messageId;
 				toolId = tail.id;
 			}
@@ -324,6 +327,7 @@ export async function queryModelHistory(
 		remaining -= refs.length;
 	}
 	check();
+	counters.preparedBytes = budget.preparedBytes;
 	return { messages, counters, compactSeq: boundary[0]?.seq ?? null };
 }
 

@@ -19,9 +19,21 @@ export interface GenUiRouteDependencies {
 	): Promise<{
 		id: string;
 		toolName: string;
+		/** Absent in older callers/mocks: no live card, the result is the only reference. */
+		inputJson?: unknown;
 		outputJson: unknown;
 		executionOriginToolCallId?: string | null;
 	}>;
+	/**
+	 * The reference for an app whose tool call has not returned yet. Only `render({path})`
+	 * qualifies, and the service refuses anything outside the workspace GenUI directory.
+	 */
+	liveReference(options: {
+		narratorId: string;
+		toolUseId: string;
+		toolCallId: string;
+		appPath: string;
+	}): Promise<GenUiFileReference>;
 	preview(
 		narratorId: string,
 		userId: string,
@@ -54,6 +66,10 @@ const defaults: GenUiRouteDependencies = {
 		const { narratorService } = await import("../services/narrator-service");
 		return narratorService.getToolCallDetail(narratorId, toolUseId, { toolCallId });
 	},
+	async liveReference(options) {
+		const { resolveLiveGenUiReference } = await import("../services/gen-ui/live-reference");
+		return resolveLiveGenUiReference(options);
+	},
 	async preview(...args) {
 		const { buildGenUiPreview } = await import("../services/gen-ui/preview");
 		return buildGenUiPreview(...args);
@@ -78,6 +94,15 @@ const defaults: GenUiRouteDependencies = {
 	},
 	answerForm: answerGenUiForm,
 };
+
+/** The directory argument of a still-running render({path}); anything else has no live card. */
+function liveAppPath(input: unknown): string | undefined {
+	if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+	const value = input as { action?: unknown; path?: unknown };
+	return value.action === "render" && typeof value.path === "string" && value.path
+		? value.path
+		: undefined;
+}
 
 export function createGenUiRoutes(overrides: Partial<GenUiRouteDependencies> = {}) {
 	const deps = { ...defaults, ...overrides };
@@ -111,9 +136,20 @@ export function createGenUiRoutes(overrides: Partial<GenUiRouteDependencies> = {
 		const output = tool.outputJson;
 		const metadata =
 			output && typeof output === "object" && "_metadata" in output ? output._metadata : null;
-		const reference = readGenUiFileReference(
+		const settled = readGenUiFileReference(
 			metadata && typeof metadata === "object" && "genUi" in metadata ? metadata.genUi : null,
 		);
+		// A render({path}) app must already be on screen while its call still waits, so the
+		// result does not exist yet. The running call's own arguments are the only source
+		// left; liveReference still refuses anything outside the workspace GenUI directory.
+		const appPath = liveAppPath(tool.inputJson);
+		const reference =
+			settled ??
+			(tool.toolName === GEN_UI_TOOL_NAME && tool.id === toolCallId && appPath
+				? await deps
+						.liveReference({ narratorId, toolUseId, toolCallId: tool.id, appPath })
+						.catch(() => null)
+				: null);
 		if (
 			tool.toolName !== GEN_UI_TOOL_NAME ||
 			tool.id !== toolCallId ||

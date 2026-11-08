@@ -778,6 +778,7 @@ export function useCreateNarrator() {
 			relaxedPlan?: boolean;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			cwd?: string;
 			title?: string;
 			makeNamed?: boolean;
@@ -803,7 +804,8 @@ export function useArchiveNarrator() {
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			// Cascade cleanup after archive — no undo token for entities that are gone.
-			void removeRecentTabCascade(qc, "narrator", narratorId);
+			// 归档是可撤销的，所以它所在的文件夹即使变空也留着，撤销归档才回得去。
+			void removeRecentTabCascade(qc, "narrator", narratorId, { keepEmptyFolder: true });
 		},
 		onError: () => {
 			notifications.show({ color: "red", message: t("archiveFailed") });
@@ -1151,6 +1153,7 @@ export function useUpdateReflectionOverrides() {
 			id: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 			tasksReminderIntervalOverride?: number | null;
 		}) => api.updateNarratorReflectionOverrides(id, data),

@@ -25,6 +25,8 @@ export const SNAPSHOT_TABLES = {
 		"narrator_blocks",
 		// Prefix epoch / updates / tools manifests and all their content-addressed children.
 		"narrator_text_snapshots",
+		// Per-user folder placement remembered between archive and unarchive.
+		"recent_tab_archive_marks",
 	],
 } as const;
 

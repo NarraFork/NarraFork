@@ -381,15 +381,18 @@ export function applyRecentTabFolderDissolve<T extends LayoutTab>(
 }
 
 /** Remove a tab; a folder takes its members with it, and a folder left empty goes too. */
-export function applyRecentTabRemove<T extends LayoutTab>(tabs: T[], key: string): T[] {
+export function applyRecentTabRemove<T extends LayoutTab>(
+	tabs: T[],
+	key: string,
+	options: { keepEmptyFolder?: boolean } = {},
+): T[] {
 	const index = findKey(tabs, key);
 	if (index < 0) return tabs;
 	const removed = tabs[index];
 	if (!isFolderTab(removed)) {
-		return dropEmptyFolder(
-			tabs.filter((_, candidate) => candidate !== index),
-			removed.folderId,
-		);
+		const remaining = tabs.filter((_, candidate) => candidate !== index);
+		// Archiving is reversible, so the folder outlives its last member there.
+		return options.keepEmptyFolder ? remaining : dropEmptyFolder(remaining, removed.folderId);
 	}
 	return tabs.filter((tab) => tab !== removed && tab.folderId !== removed.id);
 }

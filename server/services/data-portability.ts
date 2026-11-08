@@ -772,6 +772,7 @@ const IMPORTED_TABLES = [
 	"narrator_tool_calls",
 	"narrator_blocks",
 	"narrator_text_snapshots",
+	"recent_tab_archive_marks",
 	"api_requests",
 ] as const;
 
@@ -1152,6 +1153,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				copyTable(attachName, "narrator_blocks", { excludeNarrators: excludedNarrators });
+				copyTable(attachName, "recent_tab_archive_marks", {
+					excludeNarrators: excludedNarrators,
+				});
 				if (
 					counts.sessionsInserted + counts.sessionsOverwritten > 0 &&
 					tableColumns(attachName, "narrator_text_snapshots").includes("sha256")
@@ -1233,7 +1237,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				break;
 			} catch (error) {
 				const code = (error as { code?: string } | null)?.code;
-				const busy = code === "SQLITE_BUSY" || code === "SQLITE_LOCKED";
+				// The transaction is deferred, so a concurrent commit surfaces as
+				// SQLITE_BUSY_SNAPSHOT: same "database is locked", suffixed code.
+				const busy = !!code?.startsWith("SQLITE_BUSY") || code === "SQLITE_LOCKED";
 				if (!busy || attempt >= 3) throw error;
 				await Bun.sleep(250 * attempt);
 			}
@@ -1692,6 +1698,7 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(`DELETE FROM narrator_message_refs`);
 				sqlite.run(`DELETE FROM narrator_tool_calls`);
 				sqlite.run(`DELETE FROM narrator_messages`);
+				sqlite.run(`DELETE FROM recent_tab_archive_marks`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}

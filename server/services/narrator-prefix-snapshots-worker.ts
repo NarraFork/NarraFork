@@ -31,52 +31,12 @@ export interface PrefixSnapshotRequest {
 	backend: PrefixSnapshotBackend;
 	operation: PrefixSnapshotOperation;
 	value: unknown;
-	cacheBytes: number;
 	deadline: number;
-}
-
-/** Cache capacity is NOT a snapshot size limit. Oversized values simply bypass the cache. */
-export class PrefixSnapshotCache {
-	private entries = new Map<string, { text: string; bytes: number }>();
-	private bytes = 0;
-	constructor(private budget: number) {}
-	get retainedBytes() {
-		return this.bytes;
-	}
-	get size() {
-		return this.entries.size;
-	}
-	get(hash: string): string | undefined {
-		const entry = this.entries.get(hash);
-		if (!entry) return;
-		this.entries.delete(hash);
-		this.entries.set(hash, entry);
-		return entry.text;
-	}
-	set(hash: string, text: string, byteSize: number): void {
-		const previous = this.entries.get(hash);
-		if (previous) {
-			this.bytes -= previous.bytes;
-			this.entries.delete(hash);
-		}
-		// Charge UTF-16 backing storage as well as UTF-8 and bounded metadata per entry.
-		const bytes = Math.max(byteSize, text.length * 2) + 256;
-		if (bytes > this.budget) return;
-		while (this.bytes + bytes > this.budget) {
-			const oldest = this.entries.entries().next().value;
-			if (!oldest) break;
-			this.entries.delete(oldest[0]);
-			this.bytes -= oldest[1].bytes;
-		}
-		this.entries.set(hash, { text, bytes });
-		this.bytes += bytes;
-	}
 }
 
 const port = parentPort;
 let sqlite: Database | undefined;
 let postgres: SQL | undefined;
-let cache: PrefixSnapshotCache | undefined;
 let collector: PrefixSnapshotCollector | undefined;
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 
@@ -104,7 +64,6 @@ const SLOW_WRITE_MS = 25;
 const WRITE_STATEMENT = /^\s*(INSERT|UPDATE|DELETE)\b(?:\s+INTO|\s+FROM)?\s+(\w+)/i;
 
 async function connect(request: PrefixSnapshotRequest): Promise<void> {
-	cache ??= new PrefixSnapshotCache(request.cacheBytes);
 	if (request.backend.backend === "sqlite") {
 		if (sqlite) return;
 		if (!request.backend.path || request.backend.path === ":memory:")
@@ -150,7 +109,10 @@ async function retry<T>(request: PrefixSnapshotRequest, action: () => Promise<T>
 			return await action();
 		} catch (error) {
 			const code = (error as { code?: string }).code;
-			if (code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED" && code !== "55P03") throw error;
+			// BUSY_SNAPSHOT/RECOVERY read the same "database is locked" but carry a suffixed
+			// code. Every statement here is autocommit, so a retry opens a fresh snapshot.
+			if (!code?.startsWith("SQLITE_BUSY") && code !== "SQLITE_LOCKED" && code !== "55P03")
+				throw error;
 			await Bun.sleep(Math.min(250, 10 * 2 ** Math.min(attempts++, 5)));
 		}
 	}
@@ -165,22 +127,24 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 		const result = await retry(request, () =>
 			current.step(request.value as PrefixSnapshotGcOptions),
 		);
-		if (result.deleted) cache = new PrefixSnapshotCache(request.cacheBytes);
 		return result;
 	}
 	if (request.operation === "lease") {
 		const roots = request.value as string[];
 		const hashes = new Set(roots);
 		for (const hash of roots) {
-			const rows = await query<{ prefix: string }>(
-				"SELECT substr(text, 1, 1) AS prefix FROM narrator_text_snapshots WHERE sha256 = ?",
-				[hash],
+			const rows = await retry(request, () =>
+				query<{ prefix: string }>(
+					"SELECT substr(text, 1, 1) AS prefix FROM narrator_text_snapshots WHERE sha256 = ?",
+					[hash],
+				),
 			);
 			if (!rows[0]) throw new Error("Prefix snapshot publication target is missing");
 			if (/^[{\s]$/.test(rows[0].prefix)) {
-				const [content] = await query<{ text: string }>(
-					"SELECT text FROM narrator_text_snapshots WHERE sha256 = ?",
-					[hash],
+				const [content] = await retry(request, () =>
+					query<{ text: string }>("SELECT text FROM narrator_text_snapshots WHERE sha256 = ?", [
+						hash,
+					]),
 				);
 				if (!content) throw new Error("Prefix snapshot publication target is missing");
 				let manifest: unknown;
@@ -253,7 +217,6 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 			);
 		}
 		await execute({ ...request, operation: "touch", value: entries.map((entry) => entry.hash) });
-		for (const entry of entries) cache?.set(entry.hash, entry.text, entry.byteSize);
 		return entries.map(({ hash, byteSize }) => ({ hash, byteSize }));
 	}
 	if (request.operation === "getJsonBatch") {
@@ -315,26 +278,21 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 		}
 		// created_at is also the durable publication-grace clock; content/hash never change.
 		await execute({ ...request, operation: "touch", value: [hash] });
-		cache?.set(hash, text, byteSize);
 		return hash;
 	}
 	const hash = request.value;
 	if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash))
 		throw new Error("Prefix snapshot hash is invalid");
-	let text = cache?.get(hash);
-	if (text === undefined) {
-		const rows = await retry(request, () =>
-			query<{ text: string; byte_size: number }>(
-				"SELECT text, byte_size FROM narrator_text_snapshots WHERE sha256 = ?",
-				[hash],
-			),
-		);
-		if (!rows[0]) throw new Error("Prefix snapshot not found");
-		text = rows[0].text;
-		if (digest(text) !== hash || Buffer.byteLength(text) !== Number(rows[0].byte_size))
-			throw new Error("Prefix snapshot integrity mismatch");
-		cache?.set(hash, text, Number(rows[0].byte_size));
-	}
+	const rows = await retry(request, () =>
+		query<{ text: string; byte_size: number }>(
+			"SELECT text, byte_size FROM narrator_text_snapshots WHERE sha256 = ?",
+			[hash],
+		),
+	);
+	if (!rows[0]) throw new Error("Prefix snapshot not found");
+	const text = rows[0].text;
+	if (digest(text) !== hash || Buffer.byteLength(text) !== Number(rows[0].byte_size))
+		throw new Error("Prefix snapshot integrity mismatch");
 	return request.operation === "getJson"
 		? { json: JSON.parse(text), byteSize: Buffer.byteLength(text) }
 		: text;

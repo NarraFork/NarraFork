@@ -47,6 +47,10 @@ function fixture(overrides: Partial<GenUiRouteDependencies> = {}) {
 			seen.push(args);
 			return args[1] === "waiting";
 		},
+		liveReference: async (options) => {
+			seen.push([options]);
+			return { ...reference, toolCallId: options.toolCallId, directory: options.appPath };
+		},
 		...overrides,
 	};
 	return { app: createGenUiRoutes(deps), seen };

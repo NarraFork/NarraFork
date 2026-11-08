@@ -747,11 +747,21 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	async buildHistory(
-		dbMessages: DbMessage[],
+		dbMessages: readonly DbMessage[],
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
-		this.assertMediaInput(model, dbMessages.flatMap(storedMessageMedia));
+		const media = dbMessages.flatMap(storedMessageMedia);
+		// Stored user content includes text as well as media. Bound each validation
+		// pass over wide rows without changing the capability/payload checks.
+		let lastMediaYield = performance.now();
+		for (let offset = 0; offset < Math.max(media.length, 1); offset += 1024) {
+			this.assertMediaInput(model, media.slice(offset, offset + 1024));
+			if (performance.now() - lastMediaYield >= 8) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				lastMediaYield = performance.now();
+			}
+		}
 		// Strictness belongs to the bare model; a provider prefix (`nug:`, a custom one)
 		// must not turn a credential-bound model into a relay.
 		const strict = hasCredentialBoundReasoning(parseModelId(model).model);

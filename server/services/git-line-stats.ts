@@ -100,6 +100,8 @@ async function gitOutput(cwd: string, args: string[], signal: AbortSignal): Prom
 			maxBytes: GIT_LINE_STATS_OUTPUT_BYTES,
 			onChunk(chunk) {
 				chunks.push(chunk.slice());
+				// Keep reading; `false` is the only value that stops the stream early.
+				return undefined;
 			},
 		},
 	});

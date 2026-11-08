@@ -253,6 +253,7 @@ export const narrators = pgTable(
 			.notNull()
 			.default("inherit"),
 		dangerReflectionOverride: text("danger_reflection_override").notNull().default("inherit"),
+		questionReflectionOverride: text("question_reflection_override").notNull().default("inherit"),
 		autoContinuationOverride: text("auto_continuation_override").notNull().default("inherit"),
 		behaviorFenceIntervalOverride: integer("behavior_fence_interval_override"),
 		tasksReminderIntervalOverride: integer("tasks_reminder_interval_override"),
@@ -4333,7 +4334,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 140,
-  "columnCount": 1852,
+  "columnCount": 1853,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5673,6 +5674,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "dangerReflectionOverride",
           "name": "danger_reflection_override",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"inherit\"",
+          "defaultExpression": "\"inherit\""
+        },
+        {
+          "property": "questionReflectionOverride",
+          "name": "question_reflection_override",
           "kind": "text",
           "pgType": "text",
           "notNull": true,

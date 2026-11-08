@@ -747,6 +747,9 @@ export async function executeQueuedNewCommand(
 		dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
 			sourceNarrator.dangerReflectionOverride,
 		),
+		questionReflectionOverride: normalizeOptionalBooleanOverride(
+			sourceNarrator.questionReflectionOverride,
+		),
 		cwd: active.cwd,
 		// The person who queued `/new` owns the session it spawns. Falling back to the
 		// source narrator's owner keeps it out of "ownerless" territory when the
@@ -2962,7 +2965,7 @@ interface ContinuableTopLevelMessage {
 	parentToolUseId?: string | null;
 	contentJson?: unknown;
 	contentText?: unknown;
-	toolCalls?: Array<{ toolUseId?: string | null; toolName?: string | null }>;
+	toolCalls?: ReadonlyArray<{ toolUseId?: string | null; toolName?: string | null }>;
 }
 
 /**
@@ -2980,7 +2983,7 @@ interface ContinuableTopLevelMessage {
  * so nothing is lost by continuing from the turn underneath.
  */
 export function resolveContinuationTail<T extends ContinuableTopLevelMessage>(
-	messages: T[],
+	messages: readonly T[],
 ): { tail: T | undefined; danglingReasoningIds: string[] } {
 	const danglingReasoningIds: string[] = [];
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -3022,7 +3025,7 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
  * injection from the trailing position, and the model reads it as background while
  * being asked to continue something unnamed.
  */
-export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
+export function hasTrailingInjectionRow(messages: readonly ContinuableTopLevelMessage[]): boolean {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (!msg || msg.parentToolUseId) continue;
@@ -5122,6 +5125,41 @@ export function isQuestionAnswerDeliveryReady(narratorId: string, messageId: str
 		.get();
 }
 
+/** task_notice 的通知预算里给 metadata 预留的额度。 */
+const QUESTION_ANSWER_METADATA_RESERVE = 1024;
+
+/**
+ * 按 UTF-8 字节上限截断，不切断代理对。
+ */
+function truncateUtf8Bytes(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	let low = 0;
+	let high = text.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(text.slice(0, mid), "utf8") <= maxBytes) low = mid;
+		else high = mid - 1;
+	}
+	const last = low > 0 ? text.charCodeAt(low - 1) : 0;
+	if (last >= 0xd800 && last <= 0xdbff) low -= 1;
+	return text.slice(0, low);
+}
+
+/**
+ * 问答回执正文可以到 80KB，但入箱的 task_notice 只允许 4KB。
+ *
+ * 直接塞全文会让这次投递永远失败：每次 run 释放都重试一遍、日志刷屏，答案也永远
+ * 追不上会话。超预算时降级成「正文前缀 + 消息指针」，通知照样送达，全文留在消息里。
+ */
+function boundQuestionAnswerNotice(text: string, messageId: string): string {
+	const budget = MAILBOX_LIMITS.publicationBytes - QUESTION_ANSWER_METADATA_RESERVE;
+	if (Buffer.byteLength(text, "utf8") <= budget) return text;
+	const pointer = `\n\n[完整回答见消息 ${messageId}]`;
+	const head = truncateUtf8Bytes(text, budget - Buffer.byteLength(pointer, "utf8"));
+	return `${head}${pointer}`;
+}
+
 export async function scheduleQuestionAnswerDelivery(
 	narratorId: string,
 	messageId: string,
@@ -5162,6 +5200,7 @@ export async function scheduleQuestionAnswerDelivery(
 			{ ...message, contentJson: [], contentText: text, parentToolUseId: null, messageUuid: null },
 			text,
 		);
+		const noticeText = boundQuestionAnswerNotice(modelText, messageId);
 		return runtimeInbox.enqueue(
 			{
 				kind: "task_notice",
@@ -5169,8 +5208,8 @@ export async function scheduleQuestionAnswerDelivery(
 				narratorId,
 				sourceKey: `question-answer:${messageId}`,
 				recipientMessageId: messageId,
-				text: modelText,
-				projectedByteSize: Buffer.byteLength(modelText),
+				text: noticeText,
+				projectedByteSize: Buffer.byteLength(noticeText),
 				metadata: {
 					eventKind: "question_answer",
 					questionAnswer: { messageId, executionPrincipal },

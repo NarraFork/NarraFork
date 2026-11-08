@@ -19,7 +19,11 @@ describe("GenUI file preview classification", () => {
 			});
 			expect(result?.sections).toHaveLength(1);
 			const body = result?.sections[0].body;
-			expect(body).toEqual({ kind: "gen-ui", file: fileReference });
+			expect(body).toEqual({
+				kind: "gen-ui",
+				file: fileReference,
+				stateKey: fileReference.toolUseId,
+			});
 			if (!body) throw new Error("Missing card");
 			expect(measureToolBody(body, 360).height).toBe(88);
 		});
@@ -35,6 +39,7 @@ describe("GenUI file preview classification", () => {
 		expect(result?.sections[0].body).toEqual({
 			kind: "gen-ui",
 			file: { ...fileReference, toolCallId: "visible-copy" },
+			stateKey: fileReference.toolUseId,
 		});
 		expect(fileReference.toolCallId).toBe("call/1");
 	});

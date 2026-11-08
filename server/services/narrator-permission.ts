@@ -80,6 +80,7 @@ import type {
 import {
 	type DangerReflectionLevel,
 	normalizeDangerReflectionLevel,
+	resolveBooleanOverride,
 	resolveDangerReflectionLevel,
 } from "../lib/boolean-override";
 import {
@@ -2152,16 +2153,25 @@ function getQuestionReflectionTimeoutMs(): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(10_000, value) : 300_000;
 }
 
-function shouldScheduleQuestionReflection(effectiveMode: string): boolean {
-	return effectiveMode === "bypassPermissions" && settings.agent.questionReflectionEnabled === true;
+/**
+ * Whether automatic AskUserQuestion reflection may run: it needs 全部允许 mode AND
+ * the per-session override resolved against the instance default
+ * (`agent.questionReflectionEnabled`).
+ */
+function shouldScheduleQuestionReflection(effectiveMode: string, override: unknown): boolean {
+	return (
+		effectiveMode === "bypassPermissions" &&
+		resolveBooleanOverride(override, settings.agent.questionReflectionEnabled === true)
+	);
 }
 
 function scheduleQuestionReflection(
 	requestId: string,
 	effectiveMode: string,
 	deadline: number,
+	override: unknown,
 ): ReturnType<typeof setTimeout> | undefined {
-	if (!shouldScheduleQuestionReflection(effectiveMode)) return undefined;
+	if (!shouldScheduleQuestionReflection(effectiveMode, override)) return undefined;
 	const delay = Math.max(0, deadline - Date.now());
 	return setTimeout(() => {
 		void reflectPendingAskUserQuestion(requestId, { automatic: true }).catch((err) => {
@@ -2183,6 +2193,7 @@ async function currentPermissionModeAllowsAutomaticQuestionReflection(
 			relaxedPlan: true,
 			previousPermissionMode: true,
 			traits: true,
+			questionReflectionOverride: true,
 		},
 	});
 	if (!narrator) return false;
@@ -2192,7 +2203,7 @@ async function currentPermissionModeAllowsAutomaticQuestionReflection(
 		resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
 		narrator.previousPermissionMode,
 	);
-	return shouldScheduleQuestionReflection(effectiveMode);
+	return shouldScheduleQuestionReflection(effectiveMode, narrator.questionReflectionOverride);
 }
 
 export async function reflectPendingAskUserQuestion(
@@ -5246,6 +5257,7 @@ export async function handlePermission(
 			previousPermissionMode: true,
 			planFileId: true,
 			dangerReflectionOverride: true,
+			questionReflectionOverride: true,
 			variant: true,
 			type: true,
 			parentNarratorId: true,
@@ -6140,7 +6152,7 @@ export async function handlePermission(
 	const questionReflectionDeadline =
 		toolName === "AskUserQuestion" &&
 		!isRecoveredHumanPermission(restoredGate) &&
-		shouldScheduleQuestionReflection(effectiveMode)
+		shouldScheduleQuestionReflection(effectiveMode, narrator?.questionReflectionOverride)
 			? Date.now() + getQuestionReflectionTimeoutMs()
 			: undefined;
 
@@ -6266,6 +6278,7 @@ export async function handlePermission(
 				toolCallId,
 				effectiveMode,
 				questionReflectionDeadline,
+				narrator?.questionReflectionOverride,
 			);
 		}
 		pendingPermissionContexts.set(pendingEntry, { options, runtimeConstraint, reviewReadOnlyBash });

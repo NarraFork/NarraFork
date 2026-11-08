@@ -26,6 +26,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 }));
 
 const {
+	dissolveRecentTabFolder,
 	listAllRecentTabs,
 	rememberArchivedTabPlacement,
 	removeRecentTab,
@@ -94,6 +95,11 @@ async function folderOfRow(narratorId: string): Promise<string | null> {
 	return tabs.find((tab) => tab.type === "narrator" && tab.id === narratorId)?.folderId ?? null;
 }
 
+async function folderExists(folderId: string): Promise<boolean> {
+	const tabs = await listAllRecentTabs(USER);
+	return tabs.some((tab) => tab.type === "folder" && tab.id === folderId);
+}
+
 function marks(): Array<{ folderId: string | null }> {
 	return db.select({ folderId: recentTabArchiveMarks.folderId }).from(recentTabArchiveMarks).all();
 }
@@ -133,26 +139,63 @@ describe("archived tab placement", () => {
 		expect(marks()).toEqual([]);
 	});
 
-	it("leaves the session at the top level when the folder is gone", async () => {
+	it("restores the last archived member into the empty folder and consumes its mark", async () => {
+		seedNarrator("only-child");
+		seedFolderRow("single-folder", 0);
+		seedNarratorRow("only-child", 1, "single-folder");
+
+		// 与归档链路一致：先记住位置，再以 keepEmptyFolder 清理侧栏行。
+		await rememberArchivedTabPlacement(USER, "only-child");
+		await removeRecentTab(USER, "narrator", "only-child", { keepEmptyFolder: true });
+		expect(await folderExists("single-folder")).toBe(true);
+		expect(await folderOfRow("only-child")).toBeNull();
+
+		// 撤销归档把唯一成员放回原文件夹，标记只消费一次。
+		expect(await restoreArchivedTabPlacement(USER, "only-child", "only-child")).toBe(true);
+		expect(await folderOfRow("only-child")).toBe("single-folder");
+		expect(marks()).toEqual([]);
+		expect(await restoreArchivedTabPlacement(USER, "only-child", "only-child")).toBe(false);
+	});
+
+	it("leaves the session at the top level when the folder is deleted", async () => {
 		seedNarrator("child");
 		seedFolderRow("work-folder", 0);
 		seedNarratorRow("child", 1, "work-folder");
 		await rememberArchivedTabPlacement(USER, "child");
-		await removeRecentTab(USER, "narrator", "child");
-		// 文件夹在会话归档期间被删掉。
-		db.delete(userRecentTabs)
-			.where(and(eq(userRecentTabs.userId, USER), eq(userRecentTabs.entityId, "work-folder")))
-			.run();
+		await removeRecentTab(USER, "narrator", "child", { keepEmptyFolder: true });
+		// 文件夹在会话归档期间被显式删掉。
+		await removeRecentTab(USER, "folder", "work-folder");
 
 		expect(await restoreArchivedTabPlacement(USER, "child", "child")).toBe(false);
 		expect(await folderOfRow("child")).toBeNull();
 		expect(marks()).toEqual([]);
 	});
 
-	it("remembers nothing for a session that sat at the top level", async () => {
-		seedNarrator("loose");
-		seedNarratorRow("loose", 0);
+	it("leaves the session at the top level when the folder is dissolved", async () => {
+		seedNarrator("child");
+		seedFolderRow("work-folder", 0);
+		seedNarratorRow("child", 1, "work-folder");
+		await rememberArchivedTabPlacement(USER, "child");
+		await removeRecentTab(USER, "narrator", "child", { keepEmptyFolder: true });
+		await dissolveRecentTabFolder(USER, "work-folder");
 
+		expect(await restoreArchivedTabPlacement(USER, "child", "child")).toBe(false);
+		expect(await folderOfRow("child")).toBeNull();
+		expect(marks()).toEqual([]);
+	});
+
+	it("clears a previous folder mark when the session is archived at the top level", async () => {
+		seedNarrator("loose");
+		seedFolderRow("old-folder", 1);
+		seedNarratorRow("loose", 0, "old-folder");
+		await rememberArchivedTabPlacement(USER, "loose");
+		expect(marks()).toEqual([{ folderId: "old-folder" }]);
+
+		// 再次归档前已移到顶层，旧的文件夹位置不能留到下一次撤销。
+		db.update(userRecentTabs)
+			.set({ folderId: null })
+			.where(and(eq(userRecentTabs.userId, USER), eq(userRecentTabs.entityId, "loose")))
+			.run();
 		await rememberArchivedTabPlacement(USER, "loose");
 		expect(marks()).toEqual([]);
 
