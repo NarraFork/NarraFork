@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 139 tables and 1847 columns including the outline tables and reply context", () => {
-		expect(target.tables.length).toBe(139);
+	test("covers 140 tables and 1853 columns including the outline tables and reply context", () => {
+		expect(target.tables.length).toBe(140);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -557,7 +557,9 @@ describe("real schema parity", () => {
 		// Reports (outline P2 PR 11) add outline_digests (14), outline_spaces.last_commit_at and the
 		// two user_preferences report settings (time zone and time, both nullable).
 		// The board's 「新完成」 (outline P2 PR 9b) adds outline_task_seen (4).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1847);
+		// Sidebar-folder commit identity adds folder_git_identity_bindings (5) and
+		// user_preferences.git_identity_folder_context_menu.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1853);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({
