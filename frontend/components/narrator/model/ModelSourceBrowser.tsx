@@ -115,6 +115,9 @@ export function ModelSourceBrowser({
 	const sources = focusedOption ? sourcesOf(focusedOption) : [];
 	const autoChoice = sources.find((s) => s.available) ?? sources[0];
 	const isAutoSelected = focusedOption ? currentValue === focusedOption.value : false;
+	// The source actually in use: the pin when one is chosen, otherwise what auto would pick.
+	// Mark it on the source row itself, not in a sentence the user has to read and compare.
+	const inUseValue = currentValue.startsWith("auto:") ? autoChoice?.value : currentValue;
 
 	return (
 		<Group align="flex-start" gap={0} wrap="nowrap" grow>
@@ -201,17 +204,11 @@ export function ModelSourceBrowser({
 											style={{ visibility: isAutoSelected ? "visible" : "hidden" }}
 										/>
 									</Group>
-									{autoChoice && (
-										<Text size="xs" c="dimmed" lh={1.3} truncate>
-											{t("autoCurrentSource", {
-												provider: providerLabels[autoChoice.provider] ?? autoChoice.provider,
-											})}
-										</Text>
-									)}
 								</UnstyledButton>
 							)}
 							{sources.map((source) => {
 								const selected = currentValue === source.value;
+								const inUse = source.value === inUseValue;
 								return (
 									<Tooltip
 										key={source.value}
@@ -233,9 +230,25 @@ export function ModelSourceBrowser({
 											}}
 										>
 											<Group justify="space-between" wrap="nowrap" gap={4}>
-												<Text size="sm" c={source.available ? undefined : "dimmed"} truncate>
-													{providerLabels[source.provider] ?? source.provider}
-												</Text>
+												<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+													{inUse && (
+														<span
+															role="img"
+															aria-label={t("autoSourceInUse")}
+															title={t("autoSourceInUse")}
+															style={{
+																width: 6,
+																height: 6,
+																borderRadius: "50%",
+																background: "var(--mantine-color-teal-5)",
+																flexShrink: 0,
+															}}
+														/>
+													)}
+													<Text size="sm" c={source.available ? undefined : "dimmed"} truncate>
+														{providerLabels[source.provider] ?? source.provider}
+													</Text>
+												</Group>
 												<Group gap={4} wrap="nowrap">
 													{source.subscription && (
 														<Badge size="xs" variant="light" color="teal">
