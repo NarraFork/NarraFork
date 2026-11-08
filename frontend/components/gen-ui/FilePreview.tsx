@@ -7,14 +7,21 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { PreviewBundle } from "./preview-loader";
 import { createPreviewShell, readPreviewTheme } from "./preview-shell";
+import { readAppState, writeAppState } from "./preview-state";
 
 /** This component's entire lifetime is the open modal's lifetime. */
 export function FilePreview({
 	narratorId,
 	file,
+	formToolUseId,
+	onSubmitted,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
+	formToolUseId?: string;
+	onSubmitted?: () => void;
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -45,6 +52,9 @@ export function FilePreview({
 						title={file.title}
 						failureMessage={t("genUi.renderFailed")}
 						height="65dvh"
+						formToolUseId={formToolUseId}
+						onSubmitted={onSubmitted}
+						stateKey={stateKey}
 					/>
 				</>
 			) : (
@@ -65,10 +75,16 @@ export function AppFrame({
 	narratorId,
 	file,
 	height,
+	formToolUseId,
+	onSubmitted,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	height: number;
+	formToolUseId?: string;
+	onSubmitted?: () => void;
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const { bundle, error, reload } = useGenUI(narratorId, file);
@@ -101,6 +117,9 @@ export function AppFrame({
 			title={file.title}
 			failureMessage={t("genUi.renderFailed")}
 			height={height}
+			formToolUseId={formToolUseId}
+			onSubmitted={onSubmitted}
+			stateKey={stateKey}
 		/>
 	);
 }
@@ -120,12 +139,21 @@ function PreviewFrame({
 	title,
 	failureMessage,
 	height,
+	formToolUseId,
+	onSubmitted,
+	stateKey,
 }: {
 	narratorId: string;
 	bundle: PreviewBundle;
 	title: string;
 	failureMessage: string;
 	height: number | string;
+	/** Set while a render({path}) call waits for this app's submit as its tool result. */
+	formToolUseId?: string;
+	/** The answer reached the waiting call: the card has nothing left to ask. */
+	onSubmitted?: () => void;
+	/** Tool call this app belongs to; keys the draft it persists across frame rebuilds. */
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	// An app is code the agent wrote, running in the reader's session: nothing it sends
@@ -139,7 +167,11 @@ function PreviewFrame({
 	const [navigated, setNavigated] = useState(false);
 	// Theme changes update only tokens/provider state, never recreate the user's open UI.
 	const [srcDoc] = useState(() =>
-		createPreviewShell(bundle, readPreviewTheme(), failureMessage, { kit: bundle.kitRuntime }),
+		createPreviewShell(bundle, readPreviewTheme(), failureMessage, {
+			kit: bundle.kitRuntime,
+			// 应用上次交出来的草稿；它在挂载时就能读到，晚一步注入就来不及了。
+			restored: stateKey ? readAppState(stateKey) : null,
+		}),
 	);
 	const sendTheme = () =>
 		frame.current?.contentWindow?.postMessage(
@@ -156,7 +188,13 @@ function PreviewFrame({
 		const onNavigation = (event: MessageEvent) => {
 			if (event.source !== frame.current?.contentWindow) return;
 			if (event.data?.type === "narrafork:preview-left") setNavigated(true);
-			const data = event.data as { type?: unknown; action?: unknown; value?: unknown } | null;
+			const data = event.data as {
+				type?: unknown;
+				action?: unknown;
+				value?: unknown;
+				fields?: unknown;
+				message?: unknown;
+			} | null;
 			if (
 				data?.type === "narrafork:ui-action" &&
 				typeof data.value === "string" &&
@@ -171,8 +209,47 @@ function PreviewFrame({
 					setRequest({ kind: "link", text: url });
 				} else if (data.action === "sendPrompt" || data.action === "submit") {
 					pending.current = true;
+					// A render({path}) call waits for exactly this submit, so it becomes the
+					// tool result. Only a call that already ended falls back to a chat message.
+					if (
+						data.action === "submit" &&
+						formToolUseId &&
+						data.fields &&
+						typeof data.fields === "object"
+					) {
+						// An app loads slower than markup, so the call may not be waiting yet:
+						// retry briefly before falling back to an ordinary chat message.
+						const deliver = async (tries: number): Promise<void> => {
+							const client = await import("./kit-client");
+							const delivered = await client.answerGenUiForm(narratorId, formToolUseId, {
+								status: "submitted",
+								message: typeof data.message === "string" ? data.message : text,
+								fields: data.fields as Record<string, unknown>,
+							});
+							if (delivered === "answered") {
+								pending.current = false;
+								onSubmitted?.();
+								return;
+							}
+							if (tries > 0) {
+								await new Promise((resume) => setTimeout(resume, 1000));
+								return deliver(tries - 1);
+							}
+							setRequest({ kind: "prompt", text });
+						};
+						void deliver(5).catch(() => {
+							pending.current = false;
+						});
+						return;
+					}
 					setRequest({ kind: "prompt", text });
 				}
+			}
+			if (data?.type === "narrafork:ui-persist") {
+				const values = (data as { values?: unknown }).values;
+				if (stateKey && values && typeof values === "object" && !Array.isArray(values))
+					writeAppState(stateKey, values as Record<string, unknown>);
+				return;
 			}
 			if (event.data?.type === "narrafork:preview-present" && event.data.id === loads.current)
 				clearTimeout(loadProbe.current);
@@ -184,7 +261,7 @@ function PreviewFrame({
 			window.removeEventListener("message", onNavigation);
 			unsubscribe();
 		};
-	}, [navigated]);
+	}, [navigated, formToolUseId, narratorId, onSubmitted, stateKey]);
 	const done = () => {
 		pending.current = false;
 		setRequest(null);

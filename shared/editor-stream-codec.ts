@@ -64,11 +64,28 @@ export class EditorStreamCodec {
 			throw new Error("EDITOR_ENCODING_UNSUPPORTED");
 		this.decoder = new TextDecoder(encoding, { fatal: true, ignoreBOM: true });
 	}
+	/**
+	 * Strict decoding throws the runtime's own TypeError ("Invalid byte sequence" in Bun), which
+	 * used to reach the user verbatim. Binary content is rejected before decoding (see push), so a
+	 * failure here means text in an encoding the sniff could not name, or a damaged file.
+	 */
+	private decode(bytes: Uint8Array, options: { stream: boolean }): string {
+		try {
+			return this.decoder.decode(bytes, options);
+		} catch (error) {
+			if (error instanceof TypeError) throw new Error("EDITOR_ENCODING_INVALID");
+			throw error;
+		}
+	}
 	push(bytes: Uint8Array, eof = false): { text: string; tags: Uint8Array } {
 		if (this.ended) throw new Error("EDITOR_CODEC_CLOSED");
 		this.bytes += bytes.length;
 		if (this.bytes > EDITOR_FILE_MAX_BYTES) throw new Error("EDITOR_RAW_LIMIT");
 		this.raw.update(bytes);
+		// In byte-oriented encodings a 0x00 byte can only be U+0000, which is rejected below anyway.
+		// Checking the raw bytes first also catches binaries whose leading bytes are not valid text
+		// (gzip, exe, class files), which would otherwise fail strict decoding before any NUL.
+		if (!this.encoding.startsWith("utf-16") && bytes.includes(0)) throw new Error("EDITOR_BINARY");
 		let decoded = "";
 		if (!this.started) {
 			let offset = 0;
@@ -77,12 +94,12 @@ export class EditorStreamCodec {
 			const prefix = Uint8Array.from(this.prefix);
 			this.bom = editorSignature(prefix);
 			editorRawEncoding(prefix, this.encoding);
-			decoded = this.decoder.decode(prefix, { stream: true });
+			decoded = this.decode(prefix, { stream: true });
 			this.prefix = [];
 			this.started = true;
 			bytes = bytes.subarray(offset);
 		}
-		decoded += this.decoder.decode(bytes, { stream: !eof });
+		decoded += this.decode(bytes, { stream: !eof });
 		if (decoded && this.firstText) {
 			this.firstText = false;
 			if (this.bom !== "none") {

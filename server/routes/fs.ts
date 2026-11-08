@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { open, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -231,12 +231,12 @@ fsRoutes.post("/mkdir", async (c) => {
 /**
  * POST /api/fs/reveal
  *
- * Open a directory in the system file manager.
+ * Open an existing regular file or directory in the system file manager.
  * Body: { path: string }
  *
- * - macOS: `open <path>`
- * - Windows: `explorer <path>`
- * - Linux desktop: `xdg-open <path>` (requires xdg-utils)
+ * - macOS: `open -R <file>` or `open <directory>`
+ * - Windows: `explorer /select, <file>` or `explorer <directory>`
+ * - Linux desktop: `xdg-open <file's parent>` or `xdg-open <directory>` (requires xdg-utils)
  *
  * On Windows, for a browser on this machine, nothing is launched here: the response carries a
  * one-time `protocolUrl` for the browser to open, so Explorer is started by a process the user's
@@ -251,15 +251,23 @@ fsRoutes.post("/reveal", async (c) => {
 	}
 
 	const absPath = resolve(rawPath);
-	if (!existsSync(absPath) || !statSync(absPath).isDirectory()) {
-		throw new ValidationError(`Directory does not exist: ${absPath}`);
+	if (!existsSync(absPath)) {
+		throw new ValidationError(`File or directory does not exist: ${absPath}`);
+	}
+	const stats = statSync(absPath);
+	const selectFile = stats.isFile();
+	if (!selectFile && !stats.isDirectory()) {
+		throw new ValidationError(`Not a file or directory: ${absPath}`);
 	}
 
 	// A remote browser would activate the protocol on its own machine, so it keeps the direct launch.
 	if (IS_WINDOWS && isLocalMachineAddress(getClientIp(c))) {
 		const origin = getLocalServerOrigin();
 		if (origin && ensureRevealProtocolRegistered(origin)) {
-			return c.json({ ok: true, protocolUrl: buildRevealUri(issueRevealToken(absPath)) });
+			return c.json({
+				ok: true,
+				protocolUrl: buildRevealUri(issueRevealToken({ path: absPath, selectFile })),
+			});
 		}
 	}
 
@@ -268,13 +276,13 @@ fsRoutes.post("/reveal", async (c) => {
 
 	if (IS_MACOS) {
 		cmd = "open";
-		args = [absPath];
+		args = selectFile ? ["-R", absPath] : [absPath];
 	} else if (IS_WINDOWS) {
 		cmd = "explorer";
-		args = [absPath];
+		args = selectFile ? ["/select,", absPath] : [absPath];
 	} else if (IS_LINUX) {
 		cmd = "xdg-open";
-		args = [absPath];
+		args = [selectFile ? dirname(absPath) : absPath];
 	} else {
 		throw new ValidationError("Opening file manager is not supported on this platform");
 	}

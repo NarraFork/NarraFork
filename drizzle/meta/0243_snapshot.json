@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1a230420-a478-4279-be4c-1552ad3e5490",
+  "id": "99a59e43-f324-4726-81c2-e85bb26be015",
   "prevId": "53e2fc0b-e74c-4f2d-91e6-1a4bab073a1f",
   "tables": {
     "acl_events": {
@@ -4498,94 +4498,6 @@
       },
       "indexes": {},
       "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "folder_git_identity_bindings": {
-      "name": "folder_git_identity_bindings",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "folder_id": {
-          "name": "folder_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "user_id": {
-          "name": "user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "identity_id": {
-          "name": "identity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_folder_git_identity_unique": {
-          "name": "idx_folder_git_identity_unique",
-          "columns": [
-            "folder_id",
-            "user_id"
-          ],
-          "isUnique": true
-        },
-        "idx_folder_git_identity_user": {
-          "name": "idx_folder_git_identity_user",
-          "columns": [
-            "user_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "folder_git_identity_bindings_user_id_users_id_fk": {
-          "name": "folder_git_identity_bindings_user_id_users_id_fk",
-          "tableFrom": "folder_git_identity_bindings",
-          "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "folder_git_identity_bindings_identity_id_user_git_identities_id_fk": {
-          "name": "folder_git_identity_bindings_identity_id_user_git_identities_id_fk",
-          "tableFrom": "folder_git_identity_bindings",
-          "tableTo": "user_git_identities",
-          "columnsFrom": [
-            "identity_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
@@ -12396,6 +12308,14 @@
         },
         "danger_reflection_override": {
           "name": "danger_reflection_override",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'inherit'"
+        },
+        "question_reflection_override": {
+          "name": "question_reflection_override",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
@@ -20481,14 +20401,6 @@
         },
         "git_identity_create_modal": {
           "name": "git_identity_create_modal",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        },
-        "git_identity_folder_context_menu": {
-          "name": "git_identity_folder_context_menu",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,

@@ -25,7 +25,11 @@ import {
 } from "../lib/validators/editor-documents";
 import type { AuthPrincipal } from "../middleware/auth";
 import { RemoteBackend } from "../services/device-remote-backend";
-import { readLegacyFilePanel } from "../services/editor-document-panel";
+import {
+	listLegacyArchive,
+	readLegacyArchiveEntry,
+	readLegacyFilePanel,
+} from "../services/editor-document-panel";
 import {
 	editorRuntimeUnavailable,
 	getEditorDocumentService,
@@ -325,7 +329,8 @@ export function createEditorDocumentRoutes(
 	const base = "/:id/editor-documents";
 	routes.use(`${base}/*`, async (c, next) => {
 		if (
-			(c.req.method === "GET" && /\/editor-documents\/(info|page)$/.test(c.req.path)) ||
+			(c.req.method === "GET" &&
+				/\/editor-documents\/(info|page|archive|archive-entry)$/.test(c.req.path)) ||
 			/\/editor-documents\/[^/]+\/raw-reads(?:\/[^/]+)?$/.test(c.req.path)
 		) {
 			// The panel operation budgets access checks together with metadata/IO.
@@ -406,6 +411,37 @@ export function createEditorDocumentRoutes(
 				c.req.query("path"),
 				Number(rawOffset),
 				c.req.raw.signal,
+			),
+		);
+	});
+	// Zip-family archive viewer, local only. `origin=reference` (a file a chat message linked to)
+	// runs the same reference read policy the text editor applies to that link.
+	const archiveOrigin = (c: Context) => {
+		const origin = c.req.query("origin") ?? "legacy";
+		if (origin !== "legacy" && origin !== "reference")
+			throw new AppError("Invalid archive origin", 400, "VALIDATION_ERROR");
+		return origin;
+	};
+	routes.get(`${base}/archive`, async (c) => {
+		localPanelDevice(c);
+		return c.json(
+			await listLegacyArchive(
+				editorActor(c),
+				c.req.query("path"),
+				c.req.raw.signal,
+				archiveOrigin(c),
+			),
+		);
+	});
+	routes.get(`${base}/archive-entry`, async (c) => {
+		localPanelDevice(c);
+		return c.json(
+			await readLegacyArchiveEntry(
+				editorActor(c),
+				c.req.query("path"),
+				c.req.query("entry"),
+				c.req.raw.signal,
+				archiveOrigin(c),
 			),
 		);
 	});

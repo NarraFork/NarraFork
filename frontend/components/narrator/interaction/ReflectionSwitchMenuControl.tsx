@@ -2,8 +2,15 @@ import { Box, Group, Switch, Text } from "@mantine/core";
 import { InlineOverrideActions } from "./InlineOverrideActions";
 import type { BooleanOverride } from "./reflection-types";
 
-export function PlanReflectionMenuControl({
+/**
+ * One tri-state boolean reflection switch inside the permission-mode dropdown
+ * (plan reflection, question reflection). The switch shows the EFFECTIVE value;
+ * flipping it writes an explicit "on"/"off" override, and flipping it back to the
+ * instance default collapses to "inherit" so later default changes still apply.
+ */
+export function ReflectionSwitchMenuControl({
 	visible,
+	label,
 	override,
 	effective,
 	globalDefault,
@@ -14,6 +21,7 @@ export function PlanReflectionMenuControl({
 	t,
 }: {
 	visible: boolean;
+	label: string;
 	override: BooleanOverride;
 	effective: boolean;
 	globalDefault: boolean;
@@ -28,7 +36,7 @@ export function PlanReflectionMenuControl({
 		<Box px="sm" py={6} onClick={(event) => event.stopPropagation()}>
 			<Group justify="space-between" align="center" wrap="nowrap" gap="sm">
 				<Text size="xs" fw={600}>
-					{t("planReflectionShort")}
+					{label}
 				</Text>
 				<Switch
 					size="xs"

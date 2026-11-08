@@ -2710,6 +2710,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				dangerReflectionOverride: normalizeDangerReflectionOverride(
 					narrator.dangerReflectionOverride,
 				),
+				questionReflectionOverride: normalizeBooleanOverride(narrator.questionReflectionOverride),
 				autoContinuationOverride: normalizeAutoContinuationOverride(
 					narrator.autoContinuationOverride,
 				),
@@ -5444,6 +5445,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	const updates: {
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		dangerReflectionOverride?: DangerReflectionOverride;
+		questionReflectionOverride?: BooleanOverride;
 		autoContinuationOverride?: AutoContinuationOverride;
 		tasksReminderIntervalOverride?: number | null;
 	} = {};
@@ -5451,6 +5453,12 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
 			input.planReflectionAutoApproveOverride,
 			"planReflectionAutoApproveOverride",
+		);
+	}
+	if (Object.hasOwn(input, "questionReflectionOverride")) {
+		updates.questionReflectionOverride = parseBooleanOverride(
+			input.questionReflectionOverride,
+			"questionReflectionOverride",
 		);
 	}
 	if (Object.hasOwn(input, "dangerReflectionOverride")) {
@@ -5485,6 +5493,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	}
 	if (
 		!updates.planReflectionAutoApproveOverride &&
+		!updates.questionReflectionOverride &&
 		!updates.dangerReflectionOverride &&
 		!updates.autoContinuationOverride &&
 		!Object.hasOwn(updates, "tasksReminderIntervalOverride")

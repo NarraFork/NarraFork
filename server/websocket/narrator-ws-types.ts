@@ -539,6 +539,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 	  }
 	| {
 			type: "behavior_fence_settings_changed";

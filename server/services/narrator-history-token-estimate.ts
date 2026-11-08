@@ -49,8 +49,7 @@ export async function estimateNarratorBuildHistoryTokens(
 	// This is compact-after display work, not a per-pass request statistic. Reuse only
 	// immutable, signed source rows; never cache provider packets/current input/attachments.
 	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
-		...options,
-		deadline,
+		signal: options.signal,
 	});
 	// Historical transcript mounting is top level even without a live delivery target.
 	const { readSessionOwnTurnPlacement } = await import("./narrator-session");

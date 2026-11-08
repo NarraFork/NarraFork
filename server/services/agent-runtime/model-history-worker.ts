@@ -18,7 +18,7 @@ import {
 
 declare const self: Worker;
 
-type Request = ModelHistoryQueryOptions & {
+type Request = Omit<ModelHistoryQueryOptions, "signal"> & {
 	previous?: ModelHistoryManifest;
 	previousCatalogIdentity?: string;
 } & ({ backend: "sqlite"; path: string } | { backend: "postgres"; url: string });
@@ -80,13 +80,8 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 			try {
 				completed = await sql.begin(async (tx) => {
 					await tx.unsafe("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
-					await tx.unsafe("SET LOCAL statement_timeout = '10s'");
 					const signature = request.versioned
-						? pin(
-								await readPostgresModelHistorySignature(tx, request.narratorId, {
-									deadline: request.deadline,
-								}),
-							)
+						? pin(await readPostgresModelHistorySignature(tx, request.narratorId))
 						: undefined;
 					const query = async <T>(statement: string, parameters: unknown[] = []) =>
 						(await tx.unsafe(postgresHistorySql(statement), parameters as string[])) as T[];

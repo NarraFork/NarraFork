@@ -1,6 +1,6 @@
 {
-  "id": "e18da153-05a6-4a89-9257-feb31c3df896",
-  "prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
+  "id": "1213a2f0-3ad6-4ba3-8620-19ebe283f7d6",
+  "prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -14997,6 +14997,13 @@
         },
         "danger_reflection_override": {
           "name": "danger_reflection_override",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'inherit'"
+        },
+        "question_reflection_override": {
+          "name": "question_reflection_override",
           "type": "text",
           "primaryKey": false,
           "notNull": true,

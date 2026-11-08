@@ -25,11 +25,16 @@ export async function projectHistory(
 	target: ProjectionTarget,
 	narratorId?: string,
 ): Promise<ProjectedHistory> {
+	const phaseStarted = performance.now();
 	const envelopes = rows.map((row) =>
 		decodeLegacyContent(row, {
 			toolChangeOf: (message) => toolLoadingChangeOf(message as DbMessage),
 		}),
 	);
+	// Asset resolution can complete entirely in microtasks when there are no files.
+	// Release the event loop after a wide decode before walking the neutral blocks again.
+	if (performance.now() - phaseStarted >= 8)
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 	const assets = await resolveProjectionAssets(envelopes, narratorId);
 	const projected = toTurns(envelopes, target, assets);
 	const emitted = new Set(projected.emittedInputIds);

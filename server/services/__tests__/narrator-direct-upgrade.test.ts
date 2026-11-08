@@ -172,7 +172,6 @@ const inline = {
 async function modelBodies(): Promise<Record<string, string>> {
 	const source = await queryModelHistory(sqliteHistoryQuery(sqlite), {
 		narratorId: "n1",
-		deadline: Date.now() + 10_000,
 		versioned: true,
 		bodiesFromBlocks: true,
 	});

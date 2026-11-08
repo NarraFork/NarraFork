@@ -2,7 +2,7 @@ import { Menu } from "@mantine/core";
 import { IconNotebook } from "@tabler/icons-react";
 import { DangerReflectionMenuControl } from "./DangerReflectionMenuControl";
 import { PermModeMenuItems } from "./PermModeMenuItems";
-import { PlanReflectionMenuControl } from "./PlanReflectionMenuControl";
+import { ReflectionSwitchMenuControl } from "./ReflectionSwitchMenuControl";
 import type {
 	BooleanOverride,
 	DangerReflectionLevel,
@@ -27,6 +27,13 @@ export function PermissionMenuContent({
 	onPlanReflectionAutoApproveChange,
 	onFollowDefaultPlanReflection,
 	onSetPlanReflectionAsDefault,
+	showQuestionReflectionToggle,
+	questionReflectionOverride,
+	questionReflectionEffective,
+	questionReflectionGlobal,
+	onQuestionReflectionChange,
+	onFollowDefaultQuestionReflection,
+	onSetQuestionReflectionAsDefault,
 	showDangerReflectionToggle,
 	dangerReflectionOverride,
 	dangerReflectionEffectiveLevel,
@@ -53,6 +60,13 @@ export function PermissionMenuContent({
 	onPlanReflectionAutoApproveChange: (value: BooleanOverride) => void;
 	onFollowDefaultPlanReflection: () => void;
 	onSetPlanReflectionAsDefault: () => void;
+	showQuestionReflectionToggle: boolean;
+	questionReflectionOverride: BooleanOverride;
+	questionReflectionEffective: boolean;
+	questionReflectionGlobal: boolean;
+	onQuestionReflectionChange: (value: BooleanOverride) => void;
+	onFollowDefaultQuestionReflection: () => void;
+	onSetQuestionReflectionAsDefault: () => void;
 	showDangerReflectionToggle: boolean;
 	dangerReflectionOverride: DangerReflectionOverride;
 	dangerReflectionEffectiveLevel: DangerReflectionLevel;
@@ -100,8 +114,9 @@ export function PermissionMenuContent({
 						? t("exitPlanMode")
 						: t("enterPlanMode")}
 			</Menu.Item>
-			<PlanReflectionMenuControl
+			<ReflectionSwitchMenuControl
 				visible={showPlanReflectionAutoApproveToggle}
+				label={t("planReflectionShort")}
 				override={planReflectionAutoApproveOverride}
 				effective={planReflectionAutoApproveEffective}
 				globalDefault={planReflectionAutoApproveGlobal}
@@ -109,6 +124,18 @@ export function PermissionMenuContent({
 				onChange={onPlanReflectionAutoApproveChange}
 				onFollowDefault={onFollowDefaultPlanReflection}
 				onSetAsDefault={onSetPlanReflectionAsDefault}
+				t={t}
+			/>
+			<ReflectionSwitchMenuControl
+				visible={showQuestionReflectionToggle}
+				label={t("questionReflectionShort")}
+				override={questionReflectionOverride}
+				effective={questionReflectionEffective}
+				globalDefault={questionReflectionGlobal}
+				disabled={reflectionSettingsDisabled}
+				onChange={onQuestionReflectionChange}
+				onFollowDefault={onFollowDefaultQuestionReflection}
+				onSetAsDefault={onSetQuestionReflectionAsDefault}
 				t={t}
 			/>
 		</>

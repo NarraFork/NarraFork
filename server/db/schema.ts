@@ -395,6 +395,13 @@ export const narrators = sqliteTable(
 		})
 			.notNull()
 			.default("inherit"),
+		/** AskUserQuestion 自动反思回答的三态覆盖：inherit = 跟随 settings.agent.questionReflectionEnabled，
+		 *  on/off = 本会话显式覆盖。 */
+		questionReflectionOverride: text("question_reflection_override", {
+			enum: ["inherit", "on", "off"],
+		})
+			.notNull()
+			.default("inherit"),
 		autoContinuationOverride: text("auto_continuation_override", {
 			enum: ["inherit", "always", "blockStop", "protectedOnly", "off"],
 		})

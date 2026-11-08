@@ -8,7 +8,12 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	defaultScheduler,
+	notifyManager,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -18,14 +23,39 @@ import commonLocale from "../../locales/en/common.json";
 import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 
 let root: Root | undefined;
+let client: QueryClient | undefined;
 let restoreDom: (() => void) | undefined;
+const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 
-afterEach(async () => {
-	if (root) await act(async () => root?.unmount());
-	root = undefined;
-	restoreDom?.();
-	restoreDom = undefined;
-});
+async function cleanup() {
+	try {
+		await act(async () => {
+			root?.unmount();
+			root = undefined;
+			await client?.cancelQueries();
+			client?.clear();
+			// Unsubscribing does not retract already queued React store callbacks.
+			// Deliver all of them while window still exists, without a timing guess.
+			while (notificationTimers.size) {
+				for (const [timer, callback] of [...notificationTimers]) {
+					clearTimeout(timer);
+					notificationTimers.delete(timer);
+					callback();
+				}
+				await Promise.resolve();
+			}
+		});
+	} finally {
+		for (const timer of notificationTimers.keys()) clearTimeout(timer);
+		notificationTimers.clear();
+		notifyManager.setScheduler(defaultScheduler);
+		client = undefined;
+		restoreDom?.();
+		restoreDom = undefined;
+	}
+}
+
+afterEach(cleanup);
 
 async function mount() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -55,14 +85,23 @@ async function mount() {
 
 	const i18n = i18next.createInstance();
 	await i18n.init({ lng: "en", resources: { en: { common: commonLocale } }, initImmediate: false });
-	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	// Keep production's asynchronous delivery, but own its lifetime in this DOM fixture.
+	notifyManager.setScheduler((callback) => {
+		const timer = setTimeout(() => {
+			notificationTimers.delete(timer);
+			callback();
+		}, 0);
+		notificationTimers.set(timer, callback);
+	});
+	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	client = queryClient;
 	const container = window.document.createElement("div");
 	window.document.body.append(container);
 	root = createRoot(container);
 	const closes: number[] = [];
 	await act(async () => {
 		root?.render(
-			<QueryClientProvider client={client}>
+			<QueryClientProvider client={queryClient}>
 				<I18nextProvider i18n={i18n}>
 					<MantineProvider env="test">
 						<TabGitIdentityMenu narratorId="n1" onClose={() => closes.push(1)} />
@@ -106,5 +145,31 @@ describe("tab git identity menu", () => {
 		// this pins down is the toggle — and that expanding it does not dismiss the menu,
 		// which would make the entry unusable.
 		expect(closeCount()).toBe(0);
+	});
+
+	it("drains queued React notifications before restoring the DOM globals", async () => {
+		const { click } = await mount();
+		await click();
+		const mountedClient = client;
+		mountedClient?.setQueryData(["auth", "git-identities", "narrator", "n1"], {
+			identities: [],
+			selectedId: null,
+		});
+		expect(notificationTimers.size).toBeGreaterThan(0);
+		const mountedWindow = window;
+		let deliveredWithDom = false;
+		notifyManager.schedule(() => {
+			deliveredWithDom = globalThis.window === mountedWindow;
+		});
+		// Hold real store notifications past unmount deterministically. Teardown must
+		// execute them, not just cancel their timers or hope that act flushes timers.
+		for (const timer of notificationTimers.keys()) clearTimeout(timer);
+
+		await cleanup();
+
+		expect(deliveredWithDom).toBe(true);
+		expect(notificationTimers.size).toBe(0);
+		expect(mountedClient?.getQueryCache().getAll()).toEqual([]);
+		expect(globalThis.window).not.toBe(mountedWindow);
 	});
 });

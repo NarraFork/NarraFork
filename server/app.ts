@@ -359,8 +359,8 @@ app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
 // Claimed by the `narrafork://` protocol client, which has no session: the one-time token is the
 // credential (see lib/reveal-protocol.ts).
 app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
-	const path = claimRevealToken(c.req.param("token"));
-	return path ? c.json({ path }) : c.json({ error: "Unknown or expired reveal token" }, 404);
+	const target = claimRevealToken(c.req.param("token"));
+	return target ? c.json(target) : c.json({ error: "Unknown or expired reveal token" }, 404);
 });
 
 // 管理器面板的更新与停止：凭本机回环 + 进程令牌，因此必须注册在全局会话认证之前。
