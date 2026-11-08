@@ -10,7 +10,9 @@
  *   - `turnEnd`   — `outline_task_turn_end`: a long turn ended with a task still in progress;
  *   - `edited`    — `outline_task_edit`: people changed tasks of the session; also
  *                   `outline_task_finished`: tasks the session created were finished elsewhere
- *                   (outline P2 PR 9b), titled by who finished them;
+ *                   (outline P2 PR 9b), titled by who finished them; also
+ *                   `outline_team_activity`: what others did around the session's tasks since its
+ *                   last turn (outline P2 PR 10b), each row naming who;
  *   - `interrupt` — `interrupt_task_guard`: the open tasks after a user interrupt (outline and spec);
  *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`);
  *   - `answers`   — `outline_answer`: a person answered questions the session asked (outline P2
@@ -124,6 +126,12 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeChangeUnassigned: "handed back to this session",
 	taskNoticeChangeRejected: "rejected marking it {status}",
 	taskNoticeChangeRejectedReason: "rejected marking it {status}: {reason}",
+	taskNoticeChangeNotes: "{n} note(s) added",
+	taskNoticeChangeReports: "{n} report(s) attached",
+	taskNoticeChangeAnswers: "{n} question(s) answered",
+	taskNoticeChangeClaimable: "put in the claim pool",
+	taskNoticeChangeOverlap: "also changing {path}",
+	taskNoticeActivityTitle: "Team activity: {n} change(s)",
 	taskNoticeJoin: "; ",
 	taskNoticeWhoJoin: ", ",
 	taskNoticeEditedTitle: "{who} changed {n} task(s)",
@@ -225,6 +233,16 @@ function changeNote(change: OutlineTaskNoticeChange, labels: Labels): string | n
 				? label(labels, "taskNoticeChangeRejectedReason", { status, reason: change.reason })
 				: label(labels, "taskNoticeChangeRejected", { status });
 		}
+		case "notes":
+			return label(labels, "taskNoticeChangeNotes", { n: change.n });
+		case "reports":
+			return label(labels, "taskNoticeChangeReports", { n: change.n });
+		case "answers":
+			return label(labels, "taskNoticeChangeAnswers", { n: change.n });
+		case "claimable":
+			return label(labels, "taskNoticeChangeClaimable");
+		case "overlap":
+			return label(labels, "taskNoticeChangeOverlap", { path: change.path });
 	}
 }
 
@@ -327,6 +345,22 @@ export function taskNoticeFromBody(
 				{
 					row: rows[0],
 					tail: label(labels, "taskNoticeTurnEndTail"),
+				},
+				rows,
+			);
+		}
+		if (body.variant === "activity") {
+			// Team activity (outline P2 PR 10b): several sessions and people, one change a row; every
+			// row names who made it. Counted in changes, not tasks: one task may change twice.
+			const rows = body.items.map((item) => itemRow(item, labels, true));
+			if (body.more) rows.push(moreRow(body.more, labels));
+			const n = body.items.length + (body.more ?? 0);
+			return notice(
+				"edited",
+				label(labels, "taskNoticeActivityTitle", { n }),
+				{
+					row: rows[0],
+					...(n > 1 ? { tail: label(labels, "taskNoticeMoreTail", { n: n - 1 }) } : {}),
 				},
 				rows,
 			);

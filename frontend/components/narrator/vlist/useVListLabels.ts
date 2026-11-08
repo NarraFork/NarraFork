@@ -569,6 +569,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceOutlineTurnEnd: t("sidecar.sources.outline_task_turn_end"),
 			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
 			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
+			sidecarSourceOutlineTeamActivity: t("sidecar.sources.outline_team_activity"),
 			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
 			// ── task notices (`shared/pretext-layout/task-notice.ts`) ────────────────
 			taskNoticeStatusTodo: t("sidecar.taskNotice.statusTodo"),
@@ -594,6 +595,12 @@ export function useVListLabels(): VListLabels {
 				status: "{status}",
 				reason: "{reason}",
 			}),
+			taskNoticeChangeNotes: t("sidecar.taskNotice.changeNotes", { n: "{n}" }),
+			taskNoticeChangeReports: t("sidecar.taskNotice.changeReports", { n: "{n}" }),
+			taskNoticeChangeAnswers: t("sidecar.taskNotice.changeAnswers", { n: "{n}" }),
+			taskNoticeChangeClaimable: t("sidecar.taskNotice.changeClaimable"),
+			taskNoticeChangeOverlap: t("sidecar.taskNotice.changeOverlap", { path: "{path}" }),
+			taskNoticeActivityTitle: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
 			taskNoticeJoin: t("sidecar.taskNotice.join"),
 			taskNoticeWhoJoin: t("sidecar.taskNotice.whoJoin"),
 			taskNoticeEditedTitle: t("sidecar.taskNotice.editedTitle", { who: "{who}", n: "{n}" }),
@@ -615,6 +622,7 @@ export function useVListLabels(): VListLabels {
 			outlineTaskTurnEndHeading: t("sidecar.taskNotice.turnEndHeading"),
 			outlineTaskEditedHeading: t("sidecar.taskNotice.editedHeading", { n: "{n}" }),
 			outlineTaskFinishedHeading: t("sidecar.taskNotice.finishedHeading", { n: "{n}" }),
+			outlineTaskActivityHeading: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
 			outlineTaskMore: t("sidecar.taskNotice.moreRow", { n: "{n}" }),
 			// ── outline tool cards (`shared/pretext-layout/outline-tool-card.ts`) ─────────
 			outlineSpaceOwnSession: t("outlineCard.spaceOwnSession"),

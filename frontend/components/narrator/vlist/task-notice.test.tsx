@@ -251,6 +251,60 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		});
 	});
 
+	it("team activity: every row names who, counts and files in the reader's words, and it measures like the others", () => {
+		const segment = injection("m-activity", "outline_team_activity", "团队动态（…）", {
+			kind: "outlineTasks",
+			variant: "activity",
+			items: [
+				{
+					address: `${K}/mSsl3Ccf`,
+					title: "改刷新逻辑",
+					by: "B",
+					changes: [{ kind: "status", from: "todo", to: "done" }],
+				},
+				{
+					address: `${K}/Qp93LkaA`,
+					title: "auth 模块稳定",
+					by: "alice",
+					changes: [{ kind: "notes", n: 2 }],
+				},
+				{
+					address: `${K}/Zx81aaQe`,
+					title: "迁移配置",
+					by: "C",
+					changes: [{ kind: "added" }, { kind: "claimable" }],
+				},
+				{
+					address: `${K}/Gh5iJk6L`,
+					title: "T12 改登录页",
+					changes: [{ kind: "overlap", path: "auth/refresh.ts" }],
+				},
+			],
+			more: 3,
+		});
+		const folded = specOf(segment);
+		const data = folded.data as TaskNoticeData;
+		expect(data.title).toBe("团队动态：7 处变化");
+		expect(data.summary.tail).toBe("等 6 项");
+		expect(data.rows.map((row) => row.note ?? null)).toEqual([
+			"B",
+			"alice；加了 2 条笔记",
+			"C；新加；放进可领取池",
+			"也在改 auth/refresh.ts",
+			null,
+		]);
+		expect(data.rows[0]).toMatchObject({
+			status: { label: "完成", color: "green" },
+			statusFrom: { label: "待办", color: "gray" },
+		});
+		expect(data.rows.at(-1)).toEqual({ title: "还有 3 项未列出", dim: true });
+		const open = specOf(segment, true);
+		const measured = VLIST_REGISTRY[open.kind].measure(open.data, 800, 5, open.opts) as never as {
+			rowCount: number;
+		};
+		expect(measured.rowCount).toBe(5);
+	});
+
 	it("the interrupt guard: how many are open, outline tasks linked, spec tasks plain", () => {
 		const outline = specOf(
 			injection("m-guard", "interrupt_task_guard", "…", {

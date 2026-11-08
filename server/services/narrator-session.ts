@@ -1940,6 +1940,10 @@ export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
 		const { importOutlineBehaviorFence } = await import("./task-source/outline-behavior");
 		await importOutlineBehaviorFence(active.narratorId, active.locale);
+		// What others did since the last turn (outline P2 PR 10b): a history row the first
+		// request of this run reads, never part of the system prompt.
+		const { writeOutlineTeamActivity } = await import("./outline/team-activity");
+		await writeOutlineTeamActivity(active.narratorId, active.locale, "start");
 		const source = await taskSourceForNarrator(active.narratorId);
 		if (!source.turnEndNote) return;
 		const { revision } = await source.openTasks();
@@ -2944,6 +2948,12 @@ export async function drainInjectionsIntoHistory(
 			});
 			if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 		}
+		// A long run looks at what others did again, at most every ten minutes, and only says
+		// something new (outline P2 PR 10b; outline root sessions only, checked inside).
+		const { writeOutlineTeamActivity } = await import("./outline/team-activity");
+		const activity = await writeOutlineTeamActivity(narratorId, locale, "boundary");
+		if (activity?.turnText)
+			parts.push({ text: activity.turnText, messageId: activity.messageId ?? undefined });
 	}
 
 	return {
