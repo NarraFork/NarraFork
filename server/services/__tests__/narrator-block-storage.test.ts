@@ -369,7 +369,7 @@ describe("epoch reconcile", () => {
 		const withLoad = await rows();
 		expect(await reconcile(["WebFetch"], "t", later)).toBe(false);
 		expect(await rows()).toEqual(withLoad);
-		expect(withLoad.slice(0, baseline.length)).toEqual(baseline);
+		expect<unknown>(withLoad.slice(0, baseline.length)).toEqual(baseline);
 		expect(
 			withLoad
 				.filter((row) => (row.contentJson as { type?: string }[])[0]?.type === "epoch")

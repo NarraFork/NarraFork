@@ -100,7 +100,6 @@ async function recover() {
 		narratorId: "owner",
 		versioned: true,
 		bodiesFromBlocks: true,
-		deadline: Date.now() + 10_000,
 	});
 	const messages = source.messages.map((row) => ({ ...row }));
 	attachPrefixHistorySource(messages, source);

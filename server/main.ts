@@ -52,7 +52,7 @@ import {
 } from "./lib/manager-control-server";
 import { readManagerToken } from "./lib/manager-token";
 import { mcpManager } from "./lib/mcp/manager";
-import { syncMcpTools } from "./lib/mcp/tool-bridge";
+import { prepareMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
@@ -1366,15 +1366,10 @@ terminalService.recoverOnStartup().catch((err) => {
 });
 
 // Initialize external MCP servers
-mcpManager.onToolsChanged = () => syncMcpTools();
-mcpManager
-	.initialize()
-	.then(() => {
-		syncMcpTools();
-	})
-	.catch((err) => {
-		logger.error("MCP server initialization failed", { error: String(err) });
-	});
+mcpManager.prepareTools = prepareMcpTools;
+mcpManager.initialize().catch((err) => {
+	logger.error("MCP server initialization failed", { error: String(err) });
+});
 
 // Initialize the plugin control plane after core services are available. Plugin
 // activation is feature-flagged and must never prevent the core server from starting.

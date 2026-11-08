@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
 import { SQL } from "bun";
 import { migrate } from "drizzle-orm/bun-sql/migrator";
 import { withPostgres } from "../../../tests/db/pg-test-harness";
@@ -11,6 +11,74 @@ import {
 	loadModelHistorySource,
 	modelHistorySourceStats,
 } from "./model-history-source";
+
+function deferredSignatureQuery() {
+	let resolve!: (rows: unknown[]) => void;
+	let reject!: (error: Error) => void;
+	const cancel = mock(() => {});
+	const pending = Object.assign(
+		new Promise<unknown[]>((accept, fail) => {
+			resolve = accept;
+			reject = fail;
+		}),
+		{ cancel },
+	);
+	const unsafe = mock(() => pending);
+	return { sql: { unsafe } as unknown as Pick<SQL, "unsafe">, unsafe, cancel, resolve, reject };
+}
+
+test("PG signature remains pending beyond ten seconds and accepts the eventual result", async () => {
+	const query = deferredSignatureQuery();
+	const controller = new AbortController();
+	let now = Date.now();
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const timers = spyOn(globalThis, "setTimeout");
+	try {
+		const signature = readPostgresModelHistorySignature(query.sql, "owner", {
+			signal: controller.signal,
+		});
+		now += 11_000;
+		await Promise.resolve();
+		// A wall-clock jump alone cannot fire a real timer: assert that no timer was
+		// scheduled either, so the test also covers the former Promise.race timeout.
+		expect(timers).not.toHaveBeenCalled();
+		expect(query.cancel).not.toHaveBeenCalled();
+		query.resolve([{ revision: "42", catalogIdentity: "catalog" }]);
+		expect((await signature).revision).toBe("42");
+		controller.abort();
+		expect(query.cancel).not.toHaveBeenCalled();
+	} finally {
+		timers.mockRestore();
+		clock.mockRestore();
+	}
+});
+
+test("PG signature cancellation cancels the pending SQL even if the driver never settles", async () => {
+	const query = deferredSignatureQuery();
+	const controller = new AbortController();
+	const signature = readPostgresModelHistorySignature(query.sql, "owner", {
+		signal: controller.signal,
+	});
+	controller.abort();
+	await expect(signature).rejects.toThrow("Model history preparation cancelled");
+	expect(query.cancel).toHaveBeenCalledTimes(1);
+	query.reject(new Error("late driver cancellation"));
+	await Promise.resolve();
+});
+
+test("PG signature pre-cancellation skips SQL and driver failures stay sanitized", async () => {
+	const cancelled = deferredSignatureQuery();
+	await expect(
+		readPostgresModelHistorySignature(cancelled.sql, "owner", {
+			signal: AbortSignal.abort(new Error("already cancelled")),
+		}),
+	).rejects.toThrow("already cancelled");
+	expect(cancelled.unsafe).not.toHaveBeenCalled();
+	const failed = deferredSignatureQuery();
+	const signature = readPostgresModelHistorySignature(failed.sql, "owner");
+	failed.reject(new Error("postgres://private:secret@host"));
+	await expect(signature).rejects.toThrow("Model history PostgreSQL signature failed");
+});
 
 (process.env.PG_INTEGRATION === "1" ? test : test.skip)(
 	"PG persistent revisions and source cache invalidate across independent connections/shared holders",
@@ -46,7 +114,11 @@ import {
 				const original = await loadModelHistorySource(backend, "fork");
 				expect(await loadModelHistorySource(backend, "fork")).toBe(original);
 				const reloaded = await import(`./model-history-source.ts?pg-hot=${Date.now()}`);
-				expect(await reloaded.loadModelHistorySource(backend, "fork")).toBe(original);
+				const reevaluated = await reloaded.loadModelHistorySource(backend, "fork");
+				expect(reevaluated).not.toBe(original);
+				expect(reevaluated.messages).toEqual(original.messages);
+				expect(reevaluated.counters.reusedBodies ?? 0).toBe(0);
+				expect(await reloaded.loadModelHistorySource(backend, "fork")).toBe(reevaluated);
 				for (const mutation of [
 					`UPDATE narrator_messages SET content_json='[{"type":"text","text":"body edit"}]' WHERE id='shared'`,
 					"UPDATE narrator_messages SET sdk_message_uuid='final-uuid' WHERE id='shared'",
@@ -60,7 +132,7 @@ import {
 					expect((await signature()).revision).not.toBe(before.revision);
 				}
 				const changed = await loadModelHistorySource(backend, "fork");
-				expect(changed).not.toBe(original);
+				expect(changed).not.toBe(reevaluated);
 				expect(changed.messages[0].messageUuid).toBe("final-uuid");
 				expect(changed.messages[0].toolCalls[0].executionAttempt).toBe(2);
 				expect(changed.messages[0].creator?.username).toBe("Bob");

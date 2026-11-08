@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { ToolContext } from "../../../server/lib/agent/types";
@@ -17,6 +17,9 @@ let lastTestConfig: McpServerConfig | null = null;
 let saveSettingsCalls = 0;
 let refreshCalls: string[] = [];
 let refreshAllCalls = 0;
+let bridgeCalls = 0;
+let lifecycleCalls: string[] = [];
+let beforeManagerDone: (() => Promise<void>) | null = null;
 /** When set, refresh(id) fails with this message. */
 let refreshFailWith: string | null = null;
 
@@ -40,13 +43,18 @@ const mcpManagerMock = {
 			tools: connectedServerIds.has(config.id) ? [{ name: "demo" }] : [],
 		})),
 	connect: async (config: McpServerConfig) => {
+		lifecycleCalls.push(`connect:${config.id}`);
 		connectedServerIds.add(config.id);
+		await beforeManagerDone?.();
 	},
 	disconnect: async (serverId: string) => {
+		lifecycleCalls.push(`disconnect:${serverId}`);
 		connectedServerIds.delete(serverId);
+		await beforeManagerDone?.();
 	},
 	refresh: async (serverId: string) => {
 		refreshCalls.push(serverId);
+		await beforeManagerDone?.();
 		if (refreshFailWith) {
 			return { ok: false, toolCount: 0, error: refreshFailWith };
 		}
@@ -57,6 +65,7 @@ const mcpManagerMock = {
 	},
 	refreshAll: async () => {
 		refreshAllCalls++;
+		await beforeManagerDone?.();
 		return settingsState.mcpServers
 			.filter((s) => s.enabled)
 			.map((s) => ({
@@ -69,7 +78,10 @@ const mcpManagerMock = {
 					: { error: refreshFailWith ?? "not connected" }),
 			}));
 	},
-	reload: async () => {},
+	reload: async () => {
+		lifecycleCalls.push("reload");
+		await beforeManagerDone?.();
+	},
 	testConnection: async (config: McpServerConfig) => {
 		lastTestConfig = structuredClone(config);
 		return { ok: true, tools: [{ name: "demo" }] };
@@ -98,7 +110,11 @@ mock.module("../../../server/lib/mcp/manager", () => ({
 }));
 mock.module("../../../server/lib/mcp/tool-bridge", () => ({
 	...actualToolBridgeModule,
-	syncMcpTools: () => {},
+	// Catch accidental direct bridge publication by routes/admin callers.
+	prepareMcpTools: async () => {
+		bridgeCalls++;
+		return () => true;
+	},
 }));
 
 const { mcpRoutes } = await import("../../../server/routes/mcp");
@@ -167,8 +183,15 @@ beforeEach(() => {
 	saveSettingsCalls = 0;
 	refreshCalls = [];
 	refreshAllCalls = 0;
+	bridgeCalls = 0;
+	lifecycleCalls = [];
+	beforeManagerDone = null;
 	refreshFailWith = null;
 	settingsState.mcpServers = [structuredClone(existingServer)];
+});
+
+afterEach(() => {
+	expect(bridgeCalls).toBe(0);
 });
 
 afterAll(() => {
@@ -177,6 +200,42 @@ afterAll(() => {
 	mock.module("../../../server/lib/mcp/manager", () => actualManagerModule);
 	mock.module("../../../server/lib/mcp/tool-bridge", () => actualToolBridgeModule);
 	mock.restore();
+});
+
+describe("MCP publication ownership", () => {
+	it("awaits the manager once for refresh and permission-only patches", async () => {
+		role = "admin";
+		connectedServerIds.add("existing");
+		for (const operation of ["refresh", "permission"] as const) {
+			let release!: () => void;
+			let started!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const ready = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			beforeManagerDone = async () => {
+				started();
+				await gate;
+			};
+			let completed = false;
+			const response = (
+				operation === "refresh"
+					? request("/servers/existing/refresh", { method: "POST" })
+					: jsonRequest("/servers/existing", "PATCH", { defaultBehavior: "deny" })
+			).then((result) => {
+				completed = true;
+				return result;
+			});
+			await ready;
+			expect(completed).toBe(false);
+			release();
+			expect((await response).status).toBe(200);
+		}
+		expect(refreshCalls).toEqual(["existing"]);
+		expect(lifecycleCalls).toEqual(["reload"]);
+	});
 });
 
 describe("MCP loading modes", () => {
@@ -407,6 +466,50 @@ describe("agent-created MCP servers remain manageable through the UI API", () =>
 			expect(settingsState.mcpServers[0]).toMatchObject({ mode, enabled });
 		}
 		expect(saveSettingsCalls).toBe(3);
+	});
+
+	it("McpAdmin awaits one manager operation and never publishes directly for mutations", async () => {
+		const { createMcpAdminTool } = await import("../../../server/lib/agent/tools/mcp-admin");
+		const tool = createMcpAdminTool({ isAdminUser: () => true });
+		let release!: () => void;
+		let started!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const ready = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		beforeManagerDone = async () => {
+			started();
+			await gate;
+		};
+		let completed = false;
+		const connecting = tool.execute({ action: "connect", id: "existing" }, ctx).then((result) => {
+			completed = true;
+			return result;
+		});
+		await ready;
+		expect(completed).toBe(false);
+		release();
+		expect((await connecting).isError).toBeFalsy();
+		beforeManagerDone = null;
+		for (const input of [
+			{ action: "refresh", id: "existing" },
+			{ action: "refresh" },
+			{ action: "disconnect", id: "existing" },
+			{ action: "remove", id: "existing" },
+			{ action: "add", name: "new", command: "demo" },
+		])
+			expect((await tool.execute(input, ctx)).isError).toBeFalsy();
+		expect(refreshCalls).toEqual(["existing"]);
+		expect(refreshAllCalls).toBe(1);
+		expect(lifecycleCalls.slice(0, 3)).toEqual([
+			"connect:existing",
+			"disconnect:existing",
+			"disconnect:existing",
+		]);
+		expect(lifecycleCalls).toHaveLength(4);
+		expect(lifecycleCalls[3]).toStartWith("connect:");
 	});
 
 	it("writes McpAdmin additions through the real settings adapter before UI deletion", async () => {

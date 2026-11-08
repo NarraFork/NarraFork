@@ -11,6 +11,7 @@ import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
 import { GeminiMediaFiles } from "./gemini-media-files";
+import { sanitizeGeminiSchema } from "./gemini-tool-schema";
 import { reportInputCharacters } from "./input-characters";
 import {
 	createNativeMediaDumpEncoder,
@@ -43,6 +44,8 @@ import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
+
+export { sanitizeGeminiSchema } from "./gemini-tool-schema";
 
 const GEMINI_IDENTITY: Record<string, string> = {
 	en: "You are an AI coding assistant with access to tools for reading, writing, and editing files, running shell commands, searching codebases, and more. You MUST use your tools to accomplish tasks — do not just describe what you would do. When the user asks you to do something, take action by calling the appropriate tools.",
@@ -1278,71 +1281,3 @@ function mapUsageStream(usage: GeminiInteractionUsage): NonNullable<ParsedStream
 
 export const GEMINI_THOUGHT_SIGNATURE_KEY = "__geminiThoughtSignature";
 export const GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY = "__geminiThoughtSignatureSource";
-
-export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {
-	return sanitizeNode(schema) as Record<string, unknown>;
-}
-
-const GEMINI_UNSUPPORTED_KEYS = new Set([
-	"additionalProperties",
-	"propertyNames",
-	"unevaluatedProperties",
-	"patternProperties",
-	"minProperties",
-	"maxProperties",
-	"$schema",
-	"$id",
-	"$ref",
-	"$defs",
-	"$comment",
-	"definitions",
-	"default",
-	"examples",
-	"not",
-	"if",
-	"then",
-	"else",
-	"dependencies",
-	"dependentSchemas",
-	"dependentRequired",
-	"contains",
-	"minContains",
-	"maxContains",
-	"prefixItems",
-	"additionalItems",
-	"unevaluatedItems",
-	"multipleOf",
-	"exclusiveMinimum",
-	"exclusiveMaximum",
-	"uniqueItems",
-]);
-
-function sanitizeNode(node: unknown): unknown {
-	if (Array.isArray(node)) return node.map(sanitizeNode);
-	if (!node || typeof node !== "object") return node;
-	const output: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
-		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
-			continue;
-		}
-		if (key === "const") {
-			// Gemini's enum field accepts strings only; retain the type for other literals.
-			if (typeof value === "string") output.enum = [value];
-		} else if (key === "properties" && value && typeof value === "object") {
-			output.properties = Object.fromEntries(
-				Object.entries(value as Record<string, unknown>).map(([name, schema]) => [
-					name,
-					sanitizeNode(schema),
-				]),
-			);
-		} else if (key === "items") {
-			output.items = sanitizeNode(value);
-		} else if (key === "anyOf" || key === "oneOf" || key === "allOf") {
-			output.anyOf = (value as unknown[]).map(sanitizeNode);
-		} else {
-			output[key] = sanitizeNode(value);
-		}
-	}
-	return output;
-}
