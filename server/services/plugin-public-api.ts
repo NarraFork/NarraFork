@@ -1389,6 +1389,8 @@ export interface NarratorTaskAdapter {
 		added: boolean;
 		status: string;
 		started: boolean;
+		/** With `start`: why the session was not started (`finished`, `busy`, `continuation_off`, …). */
+		notStarted?: string;
 	}>;
 	taskSetStatus(input: {
 		narratorId: string;
@@ -2220,6 +2222,23 @@ export class PluginPublicApi {
 				resource: (input) => ({ type: "narrator", id: input.narratorId }),
 				handler: async (input, call) => {
 					const adapter = requireAdapter(this.adapters.narratorTasks, "Narrator tasks");
+					// Starting the session runs the agent: what `send_message` grants, on this session,
+					// checked before anything is written (review S1).
+					if (input.start === true) {
+						const startable = await this.authorize(
+							call.host,
+							"command",
+							"narrafork.narrator.send_message",
+							"command.narrator.send_message",
+							{ type: "narrator", id: input.narratorId },
+							0,
+						);
+						if (!startable.allowed)
+							throw new PluginPublicApiError(
+								"PERMISSION_DENIED",
+								"Starting the session (start: true) needs command.narrator.send_message",
+							);
+					}
 					const result = await adapter.taskAdd({
 						narratorId: input.narratorId,
 						text: input.text,
@@ -3648,6 +3667,7 @@ export function createCorePluginPublicApiAdapters(options: {
 						added: added.added,
 						status: added.status,
 						started: added.started,
+						...(added.notStarted ? { notStarted: added.notStarted } : {}),
 					};
 				} catch (error) {
 					throw mapNarratorCommandError(error);

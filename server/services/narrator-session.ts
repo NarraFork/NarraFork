@@ -4764,6 +4764,8 @@ export async function addOutlineTaskForPlugin(
 	added: boolean;
 	status: string;
 	started: boolean;
+	/** Why `start` did not start the session (the task is there either way). */
+	notStarted?: PluginTaskNotStarted;
 }> {
 	const { addPluginTask } = await import("./outline/plugin-tasks");
 	const task = await addPluginTask({
@@ -4775,21 +4777,29 @@ export async function addOutlineTaskForPlugin(
 		isRunning: isLoopRunning,
 	});
 	let started = false;
-	if (input.start === true && (task.status === "todo" || task.status === "doing")) {
-		const { readNarrator } = await import("./outline/access-reads");
-		const owner = (await readNarrator(task.sessionId))?.ownerUserId ?? null;
-		const { getUserReplyInLanguage } = await import("../lib/i18n");
-		const [locale, reply] = owner
-			? await Promise.all([
-					getUserLanguage(owner).catch(() => "en" as const),
-					getUserReplyInLanguage(owner).catch(() => false),
-				])
-			: (["en", false] as const);
-		started = (
-			await startSpecContinuationIfPossible(task.sessionId, locale, reply, null, {
-				preferTaskId: task.blockId,
-			})
-		).started;
+	let notStarted: PluginTaskNotStarted | undefined;
+	if (input.start === true) {
+		notStarted = await pluginStartBlocker(task.sessionId, task.status);
+		if (!notStarted) {
+			const { readNarrator } = await import("./outline/access-reads");
+			const owner = (await readNarrator(task.sessionId))?.ownerUserId ?? null;
+			const { getUserReplyInLanguage } = await import("../lib/i18n");
+			const [locale, reply] = owner
+				? await Promise.all([
+						getUserLanguage(owner).catch(() => "en" as const),
+						getUserReplyInLanguage(owner).catch(() => false),
+					])
+				: (["en", false] as const);
+			// Not an explicit start: the session's continuation setting decides, as for any
+			// continuation a person did not ask for (`off` is refused above).
+			started = (
+				await startSpecContinuationIfPossible(task.sessionId, locale, reply, null, {
+					preferTaskId: task.blockId,
+					explicitStart: false,
+				})
+			).started;
+			if (!started) notStarted = "not_started";
+		}
 	}
 	return {
 		blockId: task.blockId,
@@ -4797,7 +4807,38 @@ export async function addOutlineTaskForPlugin(
 		added: task.added,
 		status: task.status,
 		started,
+		...(notStarted ? { notStarted } : {}),
 	};
+}
+
+/**
+ * Why a plugin's `task_add` with `start` does not start the session (outline P2 PR 12a, review
+ * S1): the task is finished or cancelled already; the session is running (or not idle); it is in
+ * plan mode; its continuation is `off` (a plugin does not override the person's setting, unlike
+ * `/goal` and the board, which a person sends); or the continuation declined (`not_started`).
+ */
+export type PluginTaskNotStarted =
+	| "finished"
+	| "busy"
+	| "plan_mode"
+	| "continuation_off"
+	| "not_started";
+
+async function pluginStartBlocker(
+	narratorId: string,
+	status: string,
+): Promise<PluginTaskNotStarted | undefined> {
+	if (status !== "todo" && status !== "doing") return "finished";
+	if (isLoopRunning(narratorId)) return "busy";
+	const narrator = await narratorService.getById(narratorId);
+	if (narrator.status !== "idle") return "busy";
+	if (isPlanModeTrait(narrator.traits)) return "plan_mode";
+	const mode = resolveAutoContinuationMode(
+		narrator.autoContinuationOverride,
+		normalizeAutoContinuationMode(settings.agent.autoContinuationMode),
+	);
+	if (mode === "off") return "continuation_off";
+	return undefined;
 }
 
 export async function setOutlineTaskStatusForPlugin(
@@ -4848,6 +4889,11 @@ export async function startSpecContinuationIfPossible(
 	options: {
 		/** The task the person asked to start (outline): the continuation names it. */
 		preferTaskId?: string;
+		/**
+		 * A person asked for this turn (`/goal`, the board): it starts even when continuation is
+		 * `off`. Default true; a plugin's start (`addOutlineTaskForPlugin`) passes false.
+		 */
+		explicitStart?: boolean;
 	} = {},
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
@@ -4869,7 +4915,7 @@ export async function startSpecContinuationIfPossible(
 		active._turnStartedAt = new Date().toISOString();
 
 		const prompt = await maybeStartContinuation(active, false, {
-			explicitStart: true,
+			explicitStart: options.explicitStart !== false,
 			...(options.preferTaskId ? { preferTaskId: options.preferTaskId } : {}),
 		});
 		if (!prompt) return { started: false };

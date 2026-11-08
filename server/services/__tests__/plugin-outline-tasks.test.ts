@@ -435,6 +435,49 @@ describe("task_add", () => {
 		expect(await outlineStore.listCommits(space.id, { limit: 10 })).toHaveLength(1);
 	});
 
+	test("start takes send_message on the session, checked before anything is written (review S1)", async () => {
+		const id = await session();
+		const asked: string[] = [];
+		const strict = new PluginPublicApi({
+			capabilityBroker: {
+				authorize: async (request) => {
+					asked.push(`${request.capability}@${request.resource?.id ?? ""}`);
+					return request.capability === "command.narrator.send_message"
+						? { allowed: false, code: "PERMISSION_DENIED", reason: "not granted" }
+						: { allowed: true };
+				},
+			},
+			adapters: createCorePluginPublicApiAdapters({
+				db,
+				pluginManager: {
+					list: async () => [],
+					getStatus: async () => undefined,
+					enable: async () => {
+						throw new Error("not used");
+					},
+					disable: async () => {
+						throw new Error("not used");
+					},
+				},
+			}),
+		});
+		const run = async (input: Record<string, unknown>) => {
+			const ctx = context();
+			return await strict.command(
+				ctx,
+				createCommandRequest(ctx, "narrafork.narrator.task_add", input),
+			);
+		};
+		const refusedStart = await run({ narratorId: id, text: "Go", start: true });
+		expect(refusedStart.error?.code).toBe("PERMISSION_DENIED");
+		expect(asked).toContain(`command.narrator.send_message@${id}`);
+		expect(await outlineStore.findSpace({ kind: "session", narratorId: id })).toBeNull();
+		// Without start the write capability is enough.
+		const added = await run({ narratorId: id, text: "Go" });
+		expect(added.status).toBe("succeeded");
+		expect(added.data).toMatchObject({ added: true, started: false });
+	});
+
 	test("protected: created by a person and not locked (D52)", async () => {
 		const id = await session();
 		const added = await ok<{ blockId: string }>("task_add", {

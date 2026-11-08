@@ -1,9 +1,10 @@
 /**
  * A plugin's `task_add` with `start` (outline P2 PR 12a): on an idle outline session it starts a
  * turn on that task, as the task board's "Add and start" does (the task in progress, held by the
- * session, named to the turn); without `start`, or in plan mode, nothing runs. A model stand-in
- * answers the turn (the provider module is replaced for this file, as in
- * `outline-goal-start.test.ts`).
+ * session, named to the turn); without `start`, in plan mode, or with the session's continuation
+ * `off` nothing runs (review S1: a plugin does not override the person's setting, as `/goal` and
+ * the board, which a person sends, do), and the answer says why. A model stand-in answers the
+ * turn (the provider module is replaced for this file, as in `outline-goal-start.test.ts`).
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; each case makes its own session.
  */
@@ -72,7 +73,9 @@ beforeEach(async () => {
 	}
 });
 
-async function session(options: { traits?: string[] } = {}): Promise<string> {
+async function session(
+	options: { traits?: string[]; continuation?: "off" | "blockStop" } = {},
+): Promise<string> {
 	const id = `plugin-start-${crypto.randomUUID()}`;
 	await db.insert(narrators).values({
 		id,
@@ -81,7 +84,7 @@ async function session(options: { traits?: string[] } = {}): Promise<string> {
 		traits: options.traits ?? ["standalone"],
 		model: "openai:test-model",
 		permissionMode: "bypassPermissions",
-		autoContinuationOverride: "off",
+		autoContinuationOverride: options.continuation ?? "blockStop",
 		status: "idle",
 		taskBackend: "outline",
 		ownerUserId: OWNER,
@@ -108,7 +111,7 @@ async function idleAfterTurns(narratorId: string, turns: number): Promise<void> 
 
 describe("task_add with start", () => {
 	test("an idle session starts a turn on the task, which it holds", async () => {
-		const id = await session();
+		const id = await session({ continuation: "blockStop" });
 		const added = await addOutlineTaskForPlugin(id, {
 			pluginId: "com.example.lead",
 			text: "Review the parser",
@@ -124,11 +127,27 @@ describe("task_add with start", () => {
 		closeNarrator(id);
 	});
 
+	test("continuation off: the task is added, the session is not started, and the answer says why", async () => {
+		const id = await session({ continuation: "off" });
+		const added = await addOutlineTaskForPlugin(id, {
+			pluginId: "com.example.lead",
+			text: "Review the parser",
+			start: true,
+		});
+		expect(added).toMatchObject({ added: true, started: false, notStarted: "continuation_off" });
+		expect((await outlineStore.getBlock(added.blockId))?.taskJson?.status).toBe("todo");
+		await Bun.sleep(100);
+		expect(providerInputs).toHaveLength(0);
+	});
+
 	test("without start, or in plan mode, nothing runs", async () => {
 		const quiet = await session();
-		expect(
-			await addOutlineTaskForPlugin(quiet, { pluginId: "com.example.lead", text: "Later" }),
-		).toMatchObject({ added: true, started: false });
+		const plain = await addOutlineTaskForPlugin(quiet, {
+			pluginId: "com.example.lead",
+			text: "Later",
+		});
+		expect(plain).toMatchObject({ added: true, started: false });
+		expect(plain.notStarted).toBeUndefined();
 		const planning = await session({ traits: ["standalone", "plan"] });
 		expect(
 			await addOutlineTaskForPlugin(planning, {
@@ -136,7 +155,7 @@ describe("task_add with start", () => {
 				text: "Later",
 				start: true,
 			}),
-		).toMatchObject({ added: true, started: false });
+		).toMatchObject({ added: true, started: false, notStarted: "plan_mode" });
 		await Bun.sleep(100);
 		expect(providerInputs).toHaveLength(0);
 	});
