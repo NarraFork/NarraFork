@@ -850,6 +850,8 @@
 	"modelGroupAuto": "Models · automatic source",
 	"modelGroupFamily": "{{family}} · automatic source",
 	"modelGroupFamilyOther": "Other models · automatic source",
+	"modelMenuModeModel": "By model",
+	"modelMenuModeProvider": "By provider",
 	"autoCurrentSource": "Auto · now {{provider}}",
 	"autoSourceAuto": "Automatic",
 	"autoSourceSubscription": "Subscription",

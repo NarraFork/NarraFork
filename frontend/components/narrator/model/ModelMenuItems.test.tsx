@@ -67,6 +67,12 @@ beforeEach(async () => {
 			frames.delete(id);
 		},
 		IS_REACT_ACT_ENVIRONMENT: true,
+		// Old-list tests render in provider mode; browser tests opt into model mode per render.
+		localStorage: {
+			getItem: (key: string) => (key === "narrafork_model_menu_mode" ? menuMode : null),
+			setItem() {},
+			removeItem() {},
+		},
 	};
 	for (const [key, value] of Object.entries(globals)) {
 		previousGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -96,6 +102,8 @@ afterEach(async () => {
 	previousGlobals.clear();
 });
 
+let menuMode: "model" | "provider" = "provider";
+
 async function render(
 	currentModel: string | null,
 	allModels = models,
@@ -109,9 +117,11 @@ async function render(
 		summaryModelValue?: string | null;
 		canFollowParent?: boolean;
 		inheritance?: SubagentModelInheritance | null;
+		mode?: "model" | "provider";
 		extraProps?: Partial<Parameters<typeof ModelMenuItems>[0]>;
 	},
 ) {
+	menuMode = options?.mode ?? "provider";
 	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
 	const withRoleEditors = options?.withRoleEditors ?? false;
 	await act(async () => {
@@ -168,12 +178,7 @@ function button(text: string) {
 	if (!found) throw new Error(`Missing menu item: ${text}`);
 	return found;
 }
-/** The "automatic" entry of an expanded auto row; its text also carries the reason line. */
-function autoEntry() {
-	const found = host.querySelector<HTMLButtonElement>('[data-auto-source="auto"]');
-	if (!found) throw new Error("Missing automatic source entry");
-	return found;
-}
+
 function prepareGeometry() {
 	const dropdown = host.querySelector<HTMLElement>("[data-model-menu-scroll]");
 	if (!dropdown) throw new Error("Missing dropdown");
@@ -502,33 +507,27 @@ describe("auto:<model> rows", () => {
 		},
 	];
 
-	test("name the source auto would use now, skipping one that cannot serve", async () => {
-		await render("a:one", autoModels);
+	test("the auto entry names the source auto would use now, skipping one that cannot serve", async () => {
+		await render("auto:gpt-5.5", autoModels, true, true, { mode: "model" });
 		// A catalog model without a recorded family sits in the "other models" vendor group.
 		expect(host.textContent).toContain(narratorLocale.modelGroupFamilyOther);
-		expect(host.textContent).toContain(
+		const automatic = host.querySelector('[data-model-auto="auto:gpt-5.5"]');
+		expect(automatic?.textContent).toContain(
 			narratorLocale.autoCurrentSource.replace("{{provider}}", "Provider A"),
-		);
-		// Sources stay folded until the auto row (or one of its sources) is the selection.
-		expect(buttons().some((item) => item.textContent === narratorLocale.autoSourceAuto)).toBe(
-			false,
 		);
 	});
 
-	test("the selected auto row lists automatic and every source, and picks keep their values", async () => {
-		await render("auto:gpt-5.5", autoModels);
-		const automatic = autoEntry();
-		// The automatic entry says which source it uses and why.
-		expect(automatic.textContent?.startsWith(narratorLocale.autoSourceAuto)).toBe(true);
-		expect(automatic.textContent).toContain("Provider A");
-		const labels = buttons().map((item) => item.textContent ?? "");
-		expect(labels.some((text) => text.startsWith("codex"))).toBe(true);
+	test("the focused model lists automatic and every source, and picks keep their values", async () => {
+		await render("auto:gpt-5.5", autoModels, true, true, { mode: "model" });
+		expect(host.querySelector('[data-model-source="codex:gpt-5.5"]')).toBeTruthy();
+		expect(host.querySelector('[data-model-source="a:gpt-5.5"]')).toBeTruthy();
 		expect(host.textContent).toContain(narratorLocale.autoSourceSubscription);
-		await act(async () => {
-			const codex = buttons().find((item) => item.textContent?.startsWith("codex"));
-			codex?.click();
-		});
-		await act(async () => autoEntry().click());
+		await act(async () =>
+			host.querySelector<HTMLButtonElement>('[data-model-source="codex:gpt-5.5"]')?.click(),
+		);
+		await act(async () =>
+			host.querySelector<HTMLButtonElement>('[data-model-auto="auto:gpt-5.5"]')?.click(),
+		);
 		expect(selected).toEqual(["codex:gpt-5.5", "auto:gpt-5.5"]);
 	});
 
@@ -542,16 +541,15 @@ describe("auto:<model> rows", () => {
 		expect(host.textContent).toContain("One");
 	});
 
-	test("a pinned source opens its auto row and is the checked entry", async () => {
-		await render("a:gpt-5.5", autoModels);
-		expect(autoEntry()).toBeTruthy();
-		// The check icon is always rendered and toggled by visibility; only the pin shows it.
-		const checked = buttons().filter((item) =>
-			Array.from(item.querySelectorAll("svg")).some(
+	test("a pinned source focuses its auto model and is the checked source", async () => {
+		await render("a:gpt-5.5", autoModels, true, true, { mode: "model" });
+		const hasVisibleCheck = (element: Element | null) =>
+			!!element &&
+			Array.from(element.querySelectorAll("svg")).some(
 				(icon) => (icon as SVGElement).style.visibility === "visible",
-			),
-		);
-		expect(checked.map((item) => item.textContent)).toEqual(["Provider A"]);
+			);
+		expect(hasVisibleCheck(host.querySelector('[data-model-source="a:gpt-5.5"]'))).toBe(true);
+		expect(hasVisibleCheck(host.querySelector('[data-model-auto="auto:gpt-5.5"]'))).toBe(false);
 	});
 });
 
