@@ -16,6 +16,8 @@ import { eventBus, type NarraForkEvent } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, TEAM_SOP_PLUGIN_ID } from "../behavior-fence-sop";
+import { prepareOutlineRun } from "../narrator-session";
+import type { ActiveNarrator } from "../narrator-session-state";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_TASK_IDLE_LEASE_MS } from "../outline/model";
 import { addPersonTask, OUTLINE_TASKS_PAGE_ALIAS } from "../outline/person-tasks";
 import {
@@ -40,7 +42,8 @@ import {
 } from "../plugin-public-api";
 import { readSpecFile, writeSpecFile } from "../spec-vfs-service";
 import { invalidateTaskBackend } from "../task-source";
-import { pluginRulesSid } from "../task-source/outline-plugin-rules";
+import { copyOutlineBehaviorPage, findBehaviorPage } from "../task-source/outline-behavior";
+import { moveOutlineFenceSop, pluginRulesSid } from "../task-source/outline-plugin-rules";
 import { outlineBehaviorView } from "../task-source/outline-views";
 
 const NOW = "2026-11-08T00:00:00.000Z";
@@ -621,6 +624,77 @@ describe("behavior_rules_set", () => {
 		expect((await rules(id))?.children.map(([c]) => c)).toEqual(["Lead rules."]);
 		const fence = (await readSpecFile(id, "spec://behavior_fence")).content;
 		expect(fence).toBe("Own rule.");
+	});
+});
+
+describe("an SOP left in the old fence", () => {
+	async function oldFence(narratorId: string, text: string) {
+		settings.outline.enabled = false;
+		try {
+			await writeSpecFile(narratorId, "spec://behavior_fence", text, { actor: "user" });
+		} finally {
+			settings.outline.enabled = true;
+		}
+	}
+
+	test("moves to the marked plugin's block when the session starts a run, once", async () => {
+		const id = await session();
+		await oldFence(id, `- Own rule\n\n${TEAM_SOP_OPEN}\nTeam SOP.\n${TEAM_SOP_CLOSE}`);
+		const active = { narratorId: id, locale: "en" } as unknown as ActiveNarrator;
+		await prepareOutlineRun(active);
+		const space = await ensureSessionSpace(id);
+		const [held] = await outlineStore.getBlockMetas(space.id, {
+			sids: [pluginRulesSid(TEAM_SOP_PLUGIN_ID)],
+		});
+		expect(
+			(await outlineStore.listChildren(space.id, held?.id as string, 10)).map((b) => b.content),
+		).toEqual(["Team SOP."]);
+		// PR 4's import took the own rule, this the SOP: the old fence holds nothing now.
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).toBe("");
+		const view = await outlineBehaviorView(id, "en");
+		expect(view?.match(/Team SOP\./g)).toHaveLength(1);
+		expect(await moveOutlineFenceSop(id)).toBe("nothing");
+		// A block the plugin has already: the fence's copy is stale and only leaves the fence.
+		const other = await session();
+		await ok(
+			"behavior_rules_set",
+			{ narratorId: other, mode: "upsert", text: "Current SOP." },
+			TEAM_SOP_PLUGIN_ID,
+		);
+		await oldFence(other, `${TEAM_SOP_OPEN}\nStale SOP.\n${TEAM_SOP_CLOSE}`);
+		expect(await moveOutlineFenceSop(other)).toBe("dropped");
+		expect((await readSpecFile(other, "spec://behavior_fence")).content).toBe("");
+		const otherSpace = await ensureSessionSpace(other);
+		const [current] = await outlineStore.getBlockMetas(otherSpace.id, {
+			sids: [pluginRulesSid(TEAM_SOP_PLUGIN_ID)],
+		});
+		expect(
+			(await outlineStore.listChildren(otherSpace.id, current?.id as string, 10)).map(
+				(b) => b.content,
+			),
+		).toEqual(["Current SOP."]);
+	});
+
+	test("a subagent's own fence is left alone; a fork's copy of the block is updated, not doubled", async () => {
+		const id = await session();
+		const sub = await subagentOf(id);
+		await oldFence(sub, `${TEAM_SOP_OPEN}\nWorker SOP.\n${TEAM_SOP_CLOSE}`);
+		expect(await moveOutlineFenceSop(sub)).toBe("nothing");
+		expect((await readSpecFile(sub, "spec://behavior_fence")).content).toContain("Worker SOP.");
+
+		await ok("behavior_rules_set", { narratorId: id, mode: "upsert", text: "Parent rules." });
+		const fork = await session();
+		expect(await copyOutlineBehaviorPage(id, fork)).toBe(true);
+		await ok("behavior_rules_set", { narratorId: fork, mode: "upsert", text: "Fork rules." });
+		const space = await ensureSessionSpace(fork);
+		const page = await findBehaviorPage(space.id);
+		const blocks = await outlineStore.listChildren(space.id, page?.id as string, 10);
+		expect(blocks.map((b) => b.content)).toEqual([`Rules from plugin ${PLUGIN}`]);
+		expect(
+			(await outlineStore.listChildren(space.id, blocks[0]?.id as string, 10)).map(
+				(b) => b.content,
+			),
+		).toEqual(["Fork rules."]);
 	});
 });
 
