@@ -656,13 +656,18 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 		id: c.req.param("id"),
 		// `?cascade=1` marks entity-teardown cleanups (project deleted, narrator archived).
 		cascade: c.req.query("cascade") === "1" ? true : undefined,
+		// 归档是 cascade，但会话可以撤销归档回来：文件夹要留着。
+		keepEmptyFolder: c.req.query("keepEmptyFolder") === "1" ? true : undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const type = parsed.data.type === "session" ? "narrator" : parsed.data.type;
 	// User-initiated close (swipe / context menu / middle-click) mints an undo token;
 	// cascade cleanups must not (they would clobber a pending user undo).
 	return c.json(
-		await removeRecentTab(userId, type, parsed.data.id, { storeUndo: !parsed.data.cascade }),
+		await removeRecentTab(userId, type, parsed.data.id, {
+			storeUndo: !parsed.data.cascade,
+			keepEmptyFolder: parsed.data.keepEmptyFolder,
+		}),
 	);
 });
 

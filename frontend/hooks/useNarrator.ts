@@ -803,7 +803,8 @@ export function useArchiveNarrator() {
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			// Cascade cleanup after archive — no undo token for entities that are gone.
-			void removeRecentTabCascade(qc, "narrator", narratorId);
+			// 归档是可撤销的，所以它所在的文件夹即使变空也留着，撤销归档才回得去。
+			void removeRecentTabCascade(qc, "narrator", narratorId, { keepEmptyFolder: true });
 		},
 		onError: () => {
 			notifications.show({ color: "red", message: t("archiveFailed") });
