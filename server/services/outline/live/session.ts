@@ -245,6 +245,8 @@ export interface CommittedEvent {
 	pageIds: string[];
 	actorKind: "human" | "agent" | "system";
 	actorId: string;
+	/** The session the commit was written for (agent presence, `agent-presence.ts`). */
+	narratorId?: string | null;
 }
 
 type Refusal = { refused: LiveCloseCode };
