@@ -1,8 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { BUILTIN_PLUGIN_ROOTS } from "@server/builtin-plugins/registry";
-import { embeddedBuiltinPlugins } from "@server/generated/embedded-builtin-plugins";
 import { PluginCatalog } from "@server/services/plugin-catalog";
 
 /**
@@ -13,8 +12,45 @@ import { PluginCatalog } from "@server/services/plugin-catalog";
  * notices if it goes stale: a compiled binary would materialize an old package while a
  * source run uses the new one, so the two distributions would behave differently with no
  * error anywhere. Type checking cannot see it either, because both sides are plain strings.
+ *
+ * `server/generated/` is untracked, so a job that only checks out and runs tests has no
+ * embedding at all. Those cases skip instead of passing silently: `bun run build` generates
+ * it, and every job that type-checks or ships an artifact runs that first.
  */
+const GENERATED_MODULE_FILE = join(
+	import.meta.dir,
+	"..",
+	"..",
+	"..",
+	"server",
+	"generated",
+	"embedded-builtin-plugins.ts",
+);
+const hasEmbedding = existsSync(GENERATED_MODULE_FILE);
+const drift = hasEmbedding ? test : test.skip;
 const PACKAGE_DIR = join(import.meta.dir, "..", "..", "..", "server", "builtin-plugins");
+
+interface EmbeddedBuiltinFile {
+	path: string;
+	content: string;
+}
+interface EmbeddedBuiltinPackage {
+	dir: string;
+	pluginId: string;
+	version: string;
+	files: readonly EmbeddedBuiltinFile[];
+}
+
+/** Loaded inside the cases: the module only exists in a tree that was built. */
+async function loadEmbedded(): Promise<readonly EmbeddedBuiltinPackage[]> {
+	// Variable path, so a tree without generated files still type-checks (a literal path is
+	// resolved by the compiler even inside a dynamic import).
+	const modulePath = "@server/generated/embedded-builtin-plugins";
+	const generated = (await import(modulePath)) as {
+		embeddedBuiltinPlugins?: readonly EmbeddedBuiltinPackage[];
+	};
+	return generated.embeddedBuiltinPlugins ?? [];
+}
 
 function listFiles(root: string, dir = root): string[] {
 	const out: string[] = [];
@@ -26,35 +62,35 @@ function listFiles(root: string, dir = root): string[] {
 	return out.sort((a, b) => a.localeCompare(b));
 }
 
+const packageDirName = (root: string) => root.split(/[\\/]/).pop() as string;
+
 describe("embedded builtin plugin packages match the checked-out packages", () => {
-	test("every builtin root is embedded, and nothing extra is", () => {
-		const expected = BUILTIN_PLUGIN_ROOTS.map(
-			(root) => root.split(/[\\/]/).pop() as string,
-		).sort((a, b) => a.localeCompare(b));
-		expect(embeddedBuiltinPlugins.map((pkg) => pkg.dir).sort((a, b) => a.localeCompare(b))).toEqual(
-			expected,
-		);
+	drift("every builtin root is embedded, and nothing extra is", async () => {
+		const embedded = await loadEmbedded();
+		const expected = BUILTIN_PLUGIN_ROOTS.map(packageDirName).sort((a, b) => a.localeCompare(b));
+		expect(embedded.map((pkg) => pkg.dir).sort((a, b) => a.localeCompare(b))).toEqual(expected);
 	});
 
 	for (const root of BUILTIN_PLUGIN_ROOTS) {
-		const dir = root.split(/[\\/]/).pop() as string;
+		const dir = packageDirName(root);
 
-		test(`${dir}: embedded files are exactly the package files, byte for byte`, () => {
-			const pkg = embeddedBuiltinPlugins.find((entry) => entry.dir === dir);
+		drift(`${dir}: embedded files are exactly the package files, byte for byte`, async () => {
+			const embedded = await loadEmbedded();
+			const pkg = embedded.find((entry) => entry.dir === dir);
 			expect(pkg).toBeDefined();
-			const onDisk = listFiles(root);
-			expect(pkg?.files.map((file) => file.path)).toEqual(onDisk);
+			expect(pkg?.files.map((file) => file.path)).toEqual(listFiles(root));
 			for (const file of pkg?.files ?? []) {
 				expect(readFileSync(join(root, file.path), "utf8")).toBe(file.content);
 			}
 		});
 
-		test(`${dir}: the embedded identity the package declares`, () => {
+		drift(`${dir}: the embedded identity the package declares`, async () => {
+			const embedded = await loadEmbedded();
 			const manifest = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8")) as {
 				pluginId: string;
 				version: string;
 			};
-			const pkg = embeddedBuiltinPlugins.find((entry) => entry.dir === dir);
+			const pkg = embedded.find((entry) => entry.dir === dir);
 			expect(pkg?.pluginId).toBe(manifest.pluginId);
 			expect(pkg?.version).toBe(manifest.version);
 		});
@@ -69,9 +105,8 @@ describe("embedded builtin plugin packages match the checked-out packages", () =
 describe("the generator scans the same directory the registry points at", () => {
 	test("every builtin root sits directly under server/builtin-plugins", () => {
 		for (const root of BUILTIN_PLUGIN_ROOTS) {
-			const parent = join(root, "..");
 			// `relative` answers "" for the same directory, not ".".
-			expect(relative(PACKAGE_DIR, parent).replaceAll(sep, "/")).toBe("");
+			expect(relative(PACKAGE_DIR, join(root, "..")).replaceAll(sep, "/")).toBe("");
 		}
 	});
 });
@@ -86,16 +121,14 @@ describe("the generator scans the same directory the registry points at", () => 
  * developer's real data directory.
  */
 describe("materializing the embedded packages produces a package the catalog accepts", () => {
-	test("the materialized directory holds a readable package and scans as compatible", async () => {
+	drift("the materialized directory holds a readable package and scans as compatible", async () => {
 		const { materializeBuiltinPlugins } = await import("@server/builtin-plugins/materialize");
 		const dirs = await materializeBuiltinPlugins();
 		expect(dirs.length).toBe(BUILTIN_PLUGIN_ROOTS.length);
 
 		for (const [index, dir] of dirs.entries()) {
-			const name = BUILTIN_PLUGIN_ROOTS[index]?.split(/[\\/]/).pop() as string;
 			// Versioned layout: .../builtin-plugins/<dir>/<version>
-			const parts = dir.split(/[\\/]/);
-			expect(parts.at(-2)).toBe(name);
+			expect(dir.split(/[\\/]/).at(-2)).toBe(packageDirName(BUILTIN_PLUGIN_ROOTS[index] as string));
 
 			// The manifest must parse and still declare the entry the runtime spawns.
 			const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")) as {

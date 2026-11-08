@@ -22,9 +22,32 @@
  */
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { embeddedBuiltinPlugins } from "../generated/embedded-builtin-plugins";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
+
+/**
+ * Shape of the build-time generated module.
+ *
+ * Declared here instead of importing it: `server/generated/` is not tracked, so a clean
+ * checkout has no such file and a static import would fail `tsgo --noEmit` on every CI job.
+ * `server/db/run-migrations.ts` reads its own generated module the same way — dynamic import
+ * through a variable path plus a local type — so both survive a tree without generated files.
+ */
+interface EmbeddedBuiltinFile {
+	path: string;
+	content: string;
+}
+
+interface EmbeddedBuiltinPackage {
+	dir: string;
+	pluginId: string;
+	version: string;
+	files: readonly EmbeddedBuiltinFile[];
+}
+
+interface EmbeddedBuiltinPluginsModule {
+	embeddedBuiltinPlugins: readonly EmbeddedBuiltinPackage[];
+}
 
 /** Root the embedded packages are written under, inside the NarraFork home. */
 export const BUILTIN_PLUGIN_MATERIALIZED_ROOT = "builtin-plugins";
@@ -38,9 +61,20 @@ let materializing: Promise<readonly string[]> | undefined;
  */
 export function materializeBuiltinPlugins(): Promise<readonly string[]> {
 	materializing ??= (async () => {
+		// Variable path so a clean tree (no generated files) still type-checks; see the type
+		// declaration above. A compiled binary always has the module inlined.
+		const generatedModulePath = "../generated/embedded-builtin-plugins";
+		const generated = (await import(generatedModulePath)) as
+			| EmbeddedBuiltinPluginsModule
+			| undefined;
+		const packages = generated?.embeddedBuiltinPlugins;
+		if (!Array.isArray(packages) || packages.length === 0) {
+			logger.warn("no embedded builtin plugin packages in this build");
+			return [];
+		}
 		const root = getNarraforkPath(BUILTIN_PLUGIN_MATERIALIZED_ROOT);
 		const dirs: string[] = [];
-		for (const pkg of embeddedBuiltinPlugins) {
+		for (const pkg of packages) {
 			const dir = join(root, pkg.dir, pkg.version);
 			dirs.push(dir);
 			for (const file of pkg.files) {
