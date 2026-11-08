@@ -12,6 +12,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL, IS_WINDOWS } from "../lib/platform";
+import { createDtachRecoveryProbe } from "./dtach-recovery-probe";
 import type { TerminalRuntime } from "./runtime";
 import { spawnBunTerminal } from "./runtime-bun";
 
@@ -453,6 +454,9 @@ export const dtachService = {
 			onData: opts.onData,
 		});
 	},
+
+	/** Shared, bounded, tri-state probe for startup only; runtime probes stay compatible. */
+	createRecoveryProbe: createDtachRecoveryProbe,
 
 	async isSocketAlive(terminalId: string): Promise<boolean> {
 		const socketPath = this.getSocketPath(terminalId);
