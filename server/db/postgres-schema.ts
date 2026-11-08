@@ -1495,6 +1495,22 @@ export const userRecentTabs = pgTable(
 	],
 );
 
+export const recentTabArchiveMarks = pgTable(
+	"recent_tab_archive_marks",
+	{
+		id: text("id").primaryKey().notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		folderId: text("folder_id"),
+		archivedAt: text("archived_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_recent_tab_archive_mark").on(table.userId, table.narratorId)],
+);
+
 export const folderGitIdentityBindings = pgTable(
 	"folder_git_identity_bindings",
 	{
@@ -4347,8 +4363,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 140,
-  "columnCount": 1856,
+  "tableCount": 141,
+  "columnCount": 1861,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -12893,6 +12909,86 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "userId"
           ],
           "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "recentTabArchiveMarks",
+      "name": "recent_tab_archive_marks",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "recent_tab_archive_marks_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "recent_tab_archive_marks_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "folderId",
+          "name": "folder_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "archivedAt",
+          "name": "archived_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_recent_tab_archive_mark",
+          "columns": [
+            "userId",
+            "narratorId"
+          ],
+          "unique": true
         }
       ],
       "checks": [],

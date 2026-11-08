@@ -1730,6 +1730,13 @@
       "when": 1794137353073,
       "tag": "0246_folder-git-identity-bindings",
       "breakpoints": true
+    },
+    {
+      "idx": 247,
+      "version": "6",
+      "when": 1794138761567,
+      "tag": "0247_minor_eternals",
+      "breakpoints": true
     }
   ]
 }

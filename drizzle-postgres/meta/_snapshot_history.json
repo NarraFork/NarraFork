@@ -512,6 +512,14 @@
 			"prevId": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
 			"version": "7",
 			"snapshotDigest": "e5ad93f773a265a6d73fb349d4faec2da9c42df4c20b7f984bf2b589b6bf93c0"
+		},
+		{
+			"idx": 64,
+			"tag": "0064_recent-tab-archive-marks",
+			"id": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
+			"prevId": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+			"version": "7",
+			"snapshotDigest": "35afd24fe71da1b35c8fc9fb75d252f93560e1549c4e18f1bd2594d3057d6f26"
 		}
 	]
 }

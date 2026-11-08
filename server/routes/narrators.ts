@@ -5831,6 +5831,9 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 narratorRoutes.patch("/:id/archive", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
+	// 归档会删掉侧栏那一行（连同它所在的文件夹）。先记住位置，撤销归档时才放得回去。
+	const { rememberArchivedTabPlacement } = await import("../services/recent-tabs-service");
+	await rememberArchivedTabPlacement(c.get("user").sub, id);
 	// HTTP write ACL and Agent controller authorization share the same mechanism:
 	// end the complete run (including a hold), then archive any kind of session.
 	const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
@@ -5843,8 +5846,11 @@ narratorRoutes.patch("/:id/archive", async (c) => {
 // Unarchive narrator
 narratorRoutes.patch("/:id/unarchive", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	const narrator = await narratorService.getById(id);
 	await narratorService.updateStatus(id, "idle");
+	// 位置还留着、文件夹也还在时，直接回到它原来所在的那一层。
+	const { restoreArchivedTabPlacement } = await import("../services/recent-tabs-service");
+	await restoreArchivedTabPlacement(c.get("user").sub, id, narrator.title ?? id);
 	return c.json({ ok: true });
 });
 

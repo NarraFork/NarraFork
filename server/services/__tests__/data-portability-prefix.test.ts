@@ -279,6 +279,7 @@ test("old packages without snapshots/new narrator columns use defaults and prese
 		const preview = await previewImport(bytes, "legacy.zip");
 		const incoming = new Database(preview.snapshotPath);
 		incoming.run("DROP TABLE narrator_text_snapshots");
+		incoming.run("DROP TABLE recent_tab_archive_marks");
 		incoming.run("ALTER TABLE narrators DROP COLUMN reply_context");
 		incoming.run("ALTER TABLE narrators DROP COLUMN workspace_directories");
 		incoming.close();

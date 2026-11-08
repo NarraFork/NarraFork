@@ -773,6 +773,7 @@ const IMPORTED_TABLES = [
 	"narrator_tool_calls",
 	"narrator_blocks",
 	"narrator_text_snapshots",
+	"recent_tab_archive_marks",
 	"folder_git_identity_bindings",
 	"api_requests",
 ] as const;
@@ -1180,6 +1181,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				copyTable(attachName, "narrator_blocks", { excludeNarrators: excludedNarrators });
+				copyTable(attachName, "recent_tab_archive_marks", {
+					excludeNarrators: excludedNarrators,
+				});
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (
@@ -1726,6 +1730,7 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(`DELETE FROM narrator_message_refs`);
 				sqlite.run(`DELETE FROM narrator_tool_calls`);
 				sqlite.run(`DELETE FROM narrator_messages`);
+				sqlite.run(`DELETE FROM recent_tab_archive_marks`);
 				// Unlike narrator picks, folder picks have no narrator FK to cascade through.
 				sqlite.run(`DELETE FROM folder_git_identity_bindings`);
 				sqlite.run(`DELETE FROM narrators`);

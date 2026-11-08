@@ -167,6 +167,39 @@ describe("data portability · 全链路", () => {
 		expect(settings.customApiProviders ?? []).toEqual([]);
 	});
 
+	test("归档位置标记随会话导出与恢复，并保持用户隔离", async () => {
+		for (const userId of ["archive-user-a", "archive-user-b"]) {
+			sqlite.run(
+				`INSERT INTO users (id, username, password_hash, created_at)
+				 VALUES (?, ?, 'x', '2026-10-01T00:00:00Z')`,
+				[userId, userId],
+			);
+			sqlite.run(
+				`INSERT INTO recent_tab_archive_marks
+				 (id, user_id, narrator_id, folder_id, archived_at)
+				 VALUES (?, ?, 'sess-1', ?, '2026-10-02T00:00:00Z')`,
+				[`mark-${userId}`, userId, `folder-${userId}`],
+			);
+		}
+
+		const zip = await readFile((await exportData()).zipPath);
+		await clearData("sessions");
+		expect(count("recent_tab_archive_marks")).toBe(0);
+
+		const preview = await previewImport(toArrayBuffer(zip), "archive-marks.zip");
+		const result = await applyImport(preview.token, { conflictDefault: "skip" });
+		expect(result.sessionsInserted).toBe(1);
+		const restored = sqlite
+			.prepare(
+				`SELECT user_id, narrator_id, folder_id FROM recent_tab_archive_marks ORDER BY user_id`,
+			)
+			.all();
+		expect(restored).toEqual([
+			{ user_id: "archive-user-a", narrator_id: "sess-1", folder_id: "folder-archive-user-a" },
+			{ user_id: "archive-user-b", narrator_id: "sess-1", folder_id: "folder-archive-user-b" },
+		]);
+	});
+
 	test("文件夹 Git 身份绑定可导出恢复，且不会跨用户串联", async () => {
 		const now = "2026-10-01T00:00:00Z";
 		for (const id of ["user-a", "user-b"]) {

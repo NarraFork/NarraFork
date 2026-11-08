@@ -2670,6 +2670,29 @@ export const userRecentTabs = sqliteTable(
 	],
 );
 
+// === recent_tab_archive_marks ===
+// Where a narrator sat in one user's sidebar when they archived it. Archiving removes the
+// sidebar row, and `folder_id` goes with it, so restoring would otherwise drop the session
+// back at the top of the list. This remembers the folder just long enough to put it back on
+// unarchive; one row per (user × narrator), overwritten by another archive, consumed by the
+// restore.
+export const recentTabArchiveMarks = sqliteTable(
+	"recent_tab_archive_marks",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** The sidebar folder the row was in; null when it sat at the top level. */
+		folderId: text("folder_id"),
+		archivedAt: text("archived_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_recent_tab_archive_mark").on(table.userId, table.narratorId)],
+);
+
 // === folder_git_identity_bindings ===
 // Per (user × sidebar folder) choice of identity. A narrator with no pick of its own
 // inherits the folder it sits in before falling back to the user's default, so organising

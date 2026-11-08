@@ -449,6 +449,13 @@
 			"when": 1794137358287,
 			"tag": "0063_folder-git-identity-bindings",
 			"breakpoints": true
+		},
+		{
+			"idx": 64,
+			"version": "7",
+			"when": 1794138790612,
+			"tag": "0064_recent-tab-archive-marks",
+			"breakpoints": true
 		}
   ]
 }

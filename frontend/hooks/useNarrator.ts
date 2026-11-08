@@ -43,7 +43,7 @@ import {
 	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
-import { removeRecentTabCascade } from "./useRecentTabs";
+import { recentTabsSectionQueryKey, removeRecentTabCascade } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
@@ -818,6 +818,9 @@ export function useUnarchiveNarrator() {
 		mutationFn: (id: string) => api.unarchiveNarrator(id),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+			// 恢复可能把它放回归档前所在的文件夹，侧栏要重新读一遍。
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("work") });
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("projects") });
 		},
 	});
 }
