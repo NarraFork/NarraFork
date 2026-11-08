@@ -45,6 +45,12 @@ test.skipIf(!executablePath)(
 							style="padding:10px 16px"><button>Details</button></div></div>
 					</div>
 					<div id="lower" class="header nf-panel-header" style="padding:10px 16px"><button>Lower</button></div>
+					<div id="workspace-toolbar" class="header" data-nf-titlebar-row data-nf-titlebar-candidate>
+						<button id="workspace-title"><span>Workspace title</span></button>
+						<input id="workspace-title-input" aria-label="Title" />
+						<button id="workspace-title-save">Save</button>
+						<div style="flex:1"></div>
+					</div>
 				</div>
 			`);
 			const measure = () =>
@@ -69,6 +75,20 @@ test.skipIf(!executablePath)(
 					document.documentElement.style.setProperty("--nf-wco-strip-height", `${value}px`);
 				}, height);
 				const actual = await measure();
+				expect(
+					await page.evaluate(() =>
+						[
+							"workspace-toolbar",
+							"workspace-title",
+							"workspace-title-input",
+							"workspace-title-save",
+						].map((id) => {
+							const el = document.getElementById(id);
+							if (!el) throw new Error(`Missing ${id}`);
+							return getComputedStyle(el).getPropertyValue("-webkit-app-region");
+						}),
+					),
+				).toEqual(["drag", "no-drag", "no-drag", "no-drag"]);
 				// The shared extra pixel is the separator below the native control area;
 				// putting it inside `height` lets native button backgrounds cover it.
 				expect(actual.rows).toEqual(

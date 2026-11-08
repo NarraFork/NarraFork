@@ -11,7 +11,17 @@
  *   of the workspace, not a new visit to it).
  */
 
-import { ActionIcon, Box, Center, Group, Loader, Text, TextInput, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Box,
+	Center,
+	Group,
+	Loader,
+	Text,
+	TextInput,
+	Tooltip,
+	UnstyledButton,
+} from "@mantine/core";
 import type { WorkspacePanel } from "@shared/workspace-panels";
 import {
 	IconArrowLeft,
@@ -266,12 +276,16 @@ export function WorkspacePage({
 						}
 					/>
 				) : (
-					<Group gap={4} style={{ cursor: "pointer" }} onClick={startEditing}>
-						<Text size="sm" fw={500}>
-							{serverTitle || "Workspace"}
-						</Text>
-						<IconPencil size={14} color="var(--mantine-color-dimmed)" />
-					</Group>
+					// A real button also opts out of the WCO toolbar's window-drag region.
+					// A clickable Group lost its click to native dragging before editing began.
+					<UnstyledButton onClick={startEditing}>
+						<Group gap={4} wrap="nowrap">
+							<Text size="sm" fw={500}>
+								{serverTitle || "Workspace"}
+							</Text>
+							<IconPencil size={14} color="var(--mantine-color-dimmed)" />
+						</Group>
+					</UnstyledButton>
 				)}
 				<Box style={{ flex: 1 }} />
 				<Group gap={4}>
