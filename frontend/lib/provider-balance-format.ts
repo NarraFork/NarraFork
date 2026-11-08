@@ -31,7 +31,7 @@ export function formatProviderBalance(
 		const text = t(`providerBalance.${queryFailed ? "failed" : (snapshot?.status ?? "pending")}`);
 		return { quotaBalance: text, detailedQuotaBalance: text };
 	}
-	// A wallet needs no scope label; key/subscription allowances still need that distinction.
+	// 徽标只放数值：状态栏本来就窄，额度种类留给悬浮提示（见下方 lines）。
 	const scope = balance.scope === "wallet" ? "" : t(`providerBalance.${balance.scope}`);
 	const values = balance.unlimited
 		? t("providerBalance.unlimited")
@@ -43,7 +43,7 @@ export function formatProviderBalance(
 		failed ? t("providerBalance.failed") : "",
 		stale ? t("providerBalance.stale") : "",
 	].filter(Boolean);
-	const summary = `${scope ? `${scope}: ` : ""}${values}${suffix.length ? ` · ${suffix.join(" · ")}` : ""}`;
+	const summary = `${values}${suffix.length ? ` · ${suffix.join(" · ")}` : ""}`;
 	const lines =
 		balance.unlimited || balance.amounts.length === 0
 			? [values]
