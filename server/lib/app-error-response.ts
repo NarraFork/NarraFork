@@ -11,6 +11,7 @@ import { AppError, RateLimitError } from "./errors";
  */
 export function toErrorPayload(error: AppError): ErrorResponsePayload {
 	const payload: ErrorResponsePayload = { error: error.message, code: error.code };
+	if (error.details) payload.details = error.details;
 	if (error.messageCode) {
 		payload.messageCode = error.messageCode;
 		// Omitted when empty so a parameterless error does not ship `{}` on every response.

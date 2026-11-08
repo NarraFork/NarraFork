@@ -1,6 +1,6 @@
 {
-  "id": "1213a2f0-3ad6-4ba3-8620-19ebe283f7d6",
-  "prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
+  "id": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+  "prevId": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -9082,6 +9082,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "author_read_at": {
+          "name": "author_read_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "merged_revision_id": {
           "name": "merged_revision_id",
           "type": "text",
@@ -9218,6 +9224,27 @@
           "columns": [
             {
               "expression": "draft_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ks_submitter_author_read": {
+          "name": "idx_ks_submitter_author_read",
+          "columns": [
+            {
+              "expression": "submitter_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "author_read_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -15107,6 +15134,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "workspace_directories": {
+          "name": "workspace_directories",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::text"
         },
         "error_message": {
           "name": "error_message",

@@ -34,7 +34,11 @@ import {
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
-import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
+import {
+	bindSessionWorkspaceCwd,
+	targetPathSemantics,
+	toolBaseCwd,
+} from "./execution/path-resolve";
 import {
 	ExecutionTargetAuthorizationError,
 	ExecutionTargetError,
@@ -203,8 +207,10 @@ async function resolveEndpoint(
 		);
 	}
 	assertAuthorizedExecutionDevice(requested, config);
-	const backend =
-		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId });
+	const backend = bindSessionWorkspaceCwd(
+		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId }),
+		config.workspaceContext,
+	);
 	if (previous && backend.deviceId !== previous.target.deviceId) {
 		throw new Error(`Endpoint ${request.key} changed its frozen execution device.`);
 	}
@@ -1391,7 +1397,10 @@ export async function executeTool(
 					}
 					return frozenExecution.backend;
 				}
-				return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
+				return bindSessionWorkspaceCwd(
+					resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId }),
+					config.workspaceContext,
+				);
 			},
 			executionTarget: frozenExecution?.target,
 			executionPlan: frozenExecution?.plan,

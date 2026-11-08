@@ -491,11 +491,27 @@
 		},
 		{
 			"idx": 61,
-			"tag": "0061_folder-git-identity-bindings",
-			"id": "1213a2f0-3ad6-4ba3-8620-19ebe283f7d6",
+			"tag": "0061_submission_author_read",
+			"id": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
 			"prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
 			"version": "7",
-			"snapshotDigest": "f8e74175318e077f87aec8ae6c4b60b3ceaa30ebd9460377e7925d8c9e5bc89b"
+			"snapshotDigest": "6ee0ea437708c2e7d7d59873f16084fed98d57e61226cc6433dbc6a6f6892f3a"
+		},
+		{
+			"idx": 62,
+			"tag": "0062_narrator_workspace_directories",
+			"id": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+			"prevId": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
+			"version": "7",
+			"snapshotDigest": "31d3a09f3fdf1de5e444e2b63fe1ab1e775ff1638f78e09dfe3e4eab62b397cb"
+		},
+		{
+			"idx": 63,
+			"tag": "0063_folder-git-identity-bindings",
+			"id": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+			"prevId": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+			"version": "7",
+			"snapshotDigest": "e5ad93f773a265a6d73fb349d4faec2da9c42df4c20b7f984bf2b589b6bf93c0"
 		}
 	]
 }

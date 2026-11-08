@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4163bfd3-b71d-4098-bf13-e9fd453156c7",
+  "id": "369f5eb5-79ed-4fdc-bbbe-d8a63ee1c64c",
   "prevId": "99a59e43-f324-4726-81c2-e85bb26be015",
   "tables": {
     "acl_events": {
@@ -4502,94 +4502,6 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "folder_git_identity_bindings": {
-      "name": "folder_git_identity_bindings",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "folder_id": {
-          "name": "folder_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "user_id": {
-          "name": "user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "identity_id": {
-          "name": "identity_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_folder_git_identity_unique": {
-          "name": "idx_folder_git_identity_unique",
-          "columns": [
-            "folder_id",
-            "user_id"
-          ],
-          "isUnique": true
-        },
-        "idx_folder_git_identity_user": {
-          "name": "idx_folder_git_identity_user",
-          "columns": [
-            "user_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "folder_git_identity_bindings_user_id_users_id_fk": {
-          "name": "folder_git_identity_bindings_user_id_users_id_fk",
-          "tableFrom": "folder_git_identity_bindings",
-          "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "folder_git_identity_bindings_identity_id_user_git_identities_id_fk": {
-          "name": "folder_git_identity_bindings_identity_id_user_git_identities_id_fk",
-          "tableFrom": "folder_git_identity_bindings",
-          "tableTo": "user_git_identities",
-          "columnsFrom": [
-            "identity_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
     "gateway_session_mappings": {
       "name": "gateway_session_mappings",
       "columns": {
@@ -7413,6 +7325,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "author_read_at": {
+          "name": "author_read_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "merged_revision_id": {
           "name": "merged_revision_id",
           "type": "text",
@@ -7484,6 +7403,14 @@
           "name": "idx_ks_draft",
           "columns": [
             "draft_id"
+          ],
+          "isUnique": false
+        },
+        "idx_ks_submitter_author_read": {
+          "name": "idx_ks_submitter_author_read",
+          "columns": [
+            "submitter_user_id",
+            "author_read_at"
           ],
           "isUnique": false
         }
@@ -20489,14 +20416,6 @@
         },
         "git_identity_create_modal": {
           "name": "git_identity_create_modal",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        },
-        "git_identity_folder_context_menu": {
-          "name": "git_identity_folder_context_menu",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,

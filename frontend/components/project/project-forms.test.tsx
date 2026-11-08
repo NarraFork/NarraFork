@@ -149,6 +149,9 @@ mock.module("../../hooks/useProjects", () => ({
 }));
 mock.module("../../lib/api", () => ({
 	api: { getSettings: mock(() => {}), listDevices: mock(() => {}) },
+	// Device selection reaches the narrator socket manager, which needs the session
+	// accessor at import time.
+	getToken: () => null,
 }));
 mock.module("../permissions/PermissionRuleEditor", () => ({ PermissionRuleEditor: box }));
 mock.module("../settings/TraitLayerEditor", () => ({ TraitLayerEditor: box }));

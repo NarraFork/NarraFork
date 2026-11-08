@@ -629,6 +629,7 @@ export async function removeRecentTabCascade(
 	qc: QueryClient,
 	type: RecentTab["type"],
 	id: string,
+	options: { keepEmptyFolder?: boolean } = {},
 ): Promise<void> {
 	const section = recentTabsSectionQueryKey(type === "project" ? "projects" : "work");
 	await qc.cancelQueries({ queryKey: section });
@@ -638,7 +639,10 @@ export async function removeRecentTabCascade(
 	);
 	syncCompatibilityCache(qc);
 	try {
-		const result = await api.removeRecentTab(type, id, { cascade: true });
+		const result = await api.removeRecentTab(type, id, {
+			cascade: true,
+			keepEmptyFolder: options.keepEmptyFolder,
+		});
 		await applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result));
 	} catch {
 		restoreSectionSnapshots(qc, snapshots);

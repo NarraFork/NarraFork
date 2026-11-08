@@ -432,8 +432,22 @@
 		{
 			"idx": 61,
 			"version": "7",
-			"when": 1794134253512,
-			"tag": "0061_folder-git-identity-bindings",
+			"when": 1794134144250,
+			"tag": "0061_submission_author_read",
+			"breakpoints": true
+		},
+		{
+			"idx": 62,
+			"version": "7",
+			"when": 1794136142791,
+			"tag": "0062_narrator_workspace_directories",
+			"breakpoints": true
+		},
+		{
+			"idx": 63,
+			"version": "7",
+			"when": 1794137358287,
+			"tag": "0063_folder-git-identity-bindings",
 			"breakpoints": true
 		}
   ]

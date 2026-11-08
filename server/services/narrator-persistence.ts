@@ -2545,152 +2545,162 @@ const sqliteNarratorPersistence = {
 		let toolCallId: string | undefined;
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
-		const persisted = db.transaction(
-			(tx) => {
-				const queueMark = syncQueueMark();
-				const existing = fillBody(
-					tx.query.narratorMessages
-						.findFirst({
-							where: eq(narratorMessages.id, messageId),
-							...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
-						})
-						.sync(),
-				);
-				if (!existing) throw new NotFoundError("Assistant message", messageId);
-
-				type StoredAssistantBlock =
-					| {
-							type: "text";
-							text: string;
-							outputIndex?: number;
-							citations?: import("@shared/citations").TextCitation[];
-							fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
-							id?: string;
-							revision?: number;
-							rawTextLength?: number;
-							completed?: boolean;
-					  }
-					| {
-							type: "reasoning";
-							text: string;
-							id?: string;
-							revision?: number;
-							rawTextLength?: number;
-							completed?: boolean;
-							providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
-							outputIndex?: number;
-					  }
-					| {
-							type: "redacted_thinking";
-							data: string;
-							outputIndex?: number;
-							signatureSource?: string;
-					  }
-					| {
-							type: "tool_use";
-							id: string;
-							name: string;
-							input: Record<string, unknown>;
-							streamStartedAt?: number;
-							streamCompletedAt?: number;
-							outputIndex?: number;
-							thoughtSignature?: string;
-							thoughtSignatureSource?: string;
-					  }
-					| {
-							type: "web_search";
-							id: string;
-							query?: string;
-							queries?: string[];
-							outputIndex?: number;
-					  }
-					| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
-				const current = (
-					Array.isArray(existing.contentJson) ? existing.contentJson : []
-				) as StoredAssistantBlock[];
-				let content: StoredAssistantBlock[];
-				const matchingIndex =
-					(block.type === "text" || block.type === "reasoning") && block.id
-						? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
-						: -1;
-				if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
-					const previous = current[matchingIndex] as Record<string, unknown>;
-					const stale =
-						typeof previous.revision === "number" &&
-						(block.revision == null || block.revision < previous.revision);
-					const next: Record<string, unknown> = {
-						...previous,
-						...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
-					};
-					if (block.type === "reasoning" && block.providerMetadata) {
-						next.providerMetadata = mergeReasoningMetadata(
-							previous.providerMetadata as ReasoningProviderMetadata | undefined,
-							block.providerMetadata,
+		// A transient BUSY here aborts the whole assistant-content checkpoint, and the
+		// loop treats that as a critical persistence failure. Other writers in this file
+		// already retry the same way; this path must not be the one that gives up first.
+		const persisted = await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						const existing = fillBody(
+							tx.query.narratorMessages
+								.findFirst({
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
+								})
+								.sync(),
 						);
-					}
-					if (previous.text !== block.text) delete next.translatedText;
-					if (stale || isDeepStrictEqual(previous, next)) {
-						content = current;
-					} else {
-						// A checkpoint updates the original chronological slot, even when its
-						// metadata arrives after a tool has already been committed.
-						content = [...current];
-						content[matchingIndex] = next as StoredAssistantBlock;
-					}
-				} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
-					const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
-						const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
-						return typeof outputIndex === "number" ? outputIndex : undefined;
-					};
-					// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
-					// avoid the former wrapper object + two extra arrays for every checkpoint.
-					content = [...current, block as StoredAssistantBlock];
-					content.sort((a, b) => {
-						const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
-						const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
-						return aOrder === bOrder ? 0 : aOrder - bOrder;
-					});
-				} else {
-					// Unindexed providers/checkpoints already arrive in occurrence order. Do not
-					// pull later reasoning in front of text/tools that were actually seen first.
-					content = [...current, block];
-				}
-				if (content === current && !options?.republishUnchanged) return undefined;
-				const writeLedgerRow = () => {
-					if (block.type === "tool_use")
-						toolCallId = insertToolCallRowTx(tx, {
-							narratorId,
-							messageId,
-							parentSegmentId: toolParentSegmentId,
-							block,
-							createdAt: toolCreatedAt,
-						});
-				};
-				// One item changed: its block row (and the tool's ledger binding) follows.
-				const stamp = { attemptId: options?.attemptId };
-				if (content !== current) {
-					const textParts: string[] = [];
-					for (const entry of content)
-						if (entry.type === "text" && typeof entry.text === "string") textParts.push(entry.text);
-					const contentText = textParts.join("\n");
-					writeEnvelopeBody(tx, messageId, content, {
-						set: {
-							contextCharsJson: measureMessageCharacters("assistant", content),
-							contentText: contentText || null,
-						},
-						mode: "streaming",
-						stamp,
-						rows: writeLedgerRow,
-					});
-					queueContextCharacterRefresh(narratorId, messageId);
-				} else {
-					writeLedgerRow();
-					syncEnvelopeNow(messageId, "streaming", stamp);
-				}
-				flushQueuedSince(queueMark);
-				return existing;
-			},
-			{ behavior: "immediate" },
+						if (!existing) throw new NotFoundError("Assistant message", messageId);
+
+						type StoredAssistantBlock =
+							| {
+									type: "text";
+									text: string;
+									outputIndex?: number;
+									citations?: import("@shared/citations").TextCitation[];
+									fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
+									id?: string;
+									revision?: number;
+									rawTextLength?: number;
+									completed?: boolean;
+							  }
+							| {
+									type: "reasoning";
+									text: string;
+									id?: string;
+									revision?: number;
+									rawTextLength?: number;
+									completed?: boolean;
+									providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+									outputIndex?: number;
+							  }
+							| {
+									type: "redacted_thinking";
+									data: string;
+									outputIndex?: number;
+									signatureSource?: string;
+							  }
+							| {
+									type: "tool_use";
+									id: string;
+									name: string;
+									input: Record<string, unknown>;
+									streamStartedAt?: number;
+									streamCompletedAt?: number;
+									outputIndex?: number;
+									thoughtSignature?: string;
+									thoughtSignatureSource?: string;
+							  }
+							| {
+									type: "web_search";
+									id: string;
+									query?: string;
+									queries?: string[];
+									outputIndex?: number;
+							  }
+							| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
+						const current = (
+							Array.isArray(existing.contentJson) ? existing.contentJson : []
+						) as StoredAssistantBlock[];
+						let content: StoredAssistantBlock[];
+						const matchingIndex =
+							(block.type === "text" || block.type === "reasoning") && block.id
+								? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
+								: -1;
+						if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
+							const previous = current[matchingIndex] as Record<string, unknown>;
+							const stale =
+								typeof previous.revision === "number" &&
+								(block.revision == null || block.revision < previous.revision);
+							const next: Record<string, unknown> = {
+								...previous,
+								...Object.fromEntries(
+									Object.entries(block).filter(([, value]) => value !== undefined),
+								),
+							};
+							if (block.type === "reasoning" && block.providerMetadata) {
+								next.providerMetadata = mergeReasoningMetadata(
+									previous.providerMetadata as ReasoningProviderMetadata | undefined,
+									block.providerMetadata,
+								);
+							}
+							if (previous.text !== block.text) delete next.translatedText;
+							if (stale || isDeepStrictEqual(previous, next)) {
+								content = current;
+							} else {
+								// A checkpoint updates the original chronological slot, even when its
+								// metadata arrives after a tool has already been committed.
+								content = [...current];
+								content[matchingIndex] = next as StoredAssistantBlock;
+							}
+						} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+							const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
+								const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
+								return typeof outputIndex === "number" ? outputIndex : undefined;
+							};
+							// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
+							// avoid the former wrapper object + two extra arrays for every checkpoint.
+							content = [...current, block as StoredAssistantBlock];
+							content.sort((a, b) => {
+								const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
+								const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
+								return aOrder === bOrder ? 0 : aOrder - bOrder;
+							});
+						} else {
+							// Unindexed providers/checkpoints already arrive in occurrence order. Do not
+							// pull later reasoning in front of text/tools that were actually seen first.
+							content = [...current, block];
+						}
+						if (content === current && !options?.republishUnchanged) return undefined;
+						const writeLedgerRow = () => {
+							if (block.type === "tool_use")
+								toolCallId = insertToolCallRowTx(tx, {
+									narratorId,
+									messageId,
+									parentSegmentId: toolParentSegmentId,
+									block,
+									createdAt: toolCreatedAt,
+								});
+						};
+						// One item changed: its block row (and the tool's ledger binding) follows.
+						const stamp = { attemptId: options?.attemptId };
+						if (content !== current) {
+							const textParts: string[] = [];
+							for (const entry of content)
+								if (entry.type === "text" && typeof entry.text === "string")
+									textParts.push(entry.text);
+							const contentText = textParts.join("\n");
+							writeEnvelopeBody(tx, messageId, content, {
+								set: {
+									contextCharsJson: measureMessageCharacters("assistant", content),
+									contentText: contentText || null,
+								},
+								mode: "streaming",
+								stamp,
+								rows: writeLedgerRow,
+							});
+							queueContextCharacterRefresh(narratorId, messageId);
+						} else {
+							writeLedgerRow();
+							syncEnvelopeNow(messageId, "streaming", stamp);
+						}
+						flushQueuedSince(queueMark);
+						return existing;
+					},
+					{ behavior: "immediate" },
+				),
+			{ label: "appendBlockToMessage", maxRetries: 5 },
 		);
 		if (!persisted) return undefined;
 		const existing = persisted;
@@ -4536,13 +4546,19 @@ const sqliteNarratorPersistence = {
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
 		// The step is complete: items it left incomplete are interrupted, not streaming.
-		db.transaction(
-			(tx) => {
-				const queueMark = syncQueueMark();
-				updateEnvelope(tx, messageId, updates, { mode: "sealed" });
-				flushQueuedSince(queueMark);
-			},
-			{ behavior: "immediate" },
+		// 这一步是 assistant_message 的封口写：一次 BUSY 会把整个 loop 判死，
+		// 与其它写路径一样交给带退避的 withDbRetry。
+		await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						updateEnvelope(tx, messageId, updates, { mode: "sealed" });
+						flushQueuedSince(queueMark);
+					},
+					{ behavior: "immediate" },
+				),
+			{ label: "patchStepMeta", maxRetries: 5 },
 		);
 	},
 

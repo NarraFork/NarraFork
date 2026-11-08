@@ -492,8 +492,8 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"model_history_revision",
 		]);
 		// 0047 追加 ModelTrace 舱的两列，0048 追加大纲任务后端，0051 追加回复上下文，
-		// 0060 追加按会话的问题反思覆盖。
-		expect(narrators?.slice(-7)).toEqual([
+		// 0060 追加按会话的问题反思覆盖，0062 追加每执行器的工作目录映射。
+		expect(narrators?.slice(-8)).toEqual([
 			"runtime_registration_json",
 			"policy_source_narrator_id",
 			"hidden_from_lists",
@@ -501,6 +501,7 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"task_backend",
 			"reply_context",
 			"question_reflection_override",
+			"workspace_directories",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		// The main-branch 0010 migration appends background_kind after insert_seq.
