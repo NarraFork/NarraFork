@@ -38,6 +38,7 @@ import {
 	pluginPrincipalSchema,
 } from "./plugin-capability-broker";
 import type { PluginManager, PluginManagerStatus } from "./plugin-manager";
+import { noteSpecCompatCall, type SpecCompatCommand } from "./plugin-spec-compat-telemetry";
 
 export type { HostCallContext, InvocationPrincipal, InvocationScope, PluginPrincipal };
 export { hostCallContextSchema, invocationPrincipalSchema, pluginPrincipalSchema };
@@ -357,6 +358,16 @@ export interface PluginPublicApiAuditEntry {
 	responseBytes: number;
 	idempotentReplay?: boolean;
 	diagnostics?: PublicDiagnostic[];
+	/**
+	 * The call was an old Dynamic Spec command converted for an outline session (outline P2
+	 * PR 12a): kept until those commands retire, one release after outline plan PR 13.
+	 */
+	compat?: "outline";
+}
+
+/** What a command's handler adds to its audit record. */
+interface PublicApiAuditNote {
+	compat?: "outline";
 }
 
 export interface PluginPublicApiAuditSink {
@@ -412,6 +423,8 @@ export interface CommandHandlerContext {
 	idempotencyKey?: string;
 	expectedVersion?: number;
 	authorization: Extract<GatewayAuthorizationDecision, { allowed: true }>;
+	/** Mark the call as an old Dynamic Spec command converted for an outline session (audit). */
+	markCompat?: () => void;
 }
 
 export interface QueryDefinition<TInput = unknown, TOutput extends JsonValue = JsonValue> {
@@ -1272,6 +1285,8 @@ export interface NarratorCommandAdapter {
 		pluginId: string;
 		context: HostCallContext;
 		signal: AbortSignal;
+		/** Called when the command is converted for an outline session (outline P2 PR 12a). */
+		onCompat?: () => void;
 	}): Promise<{
 		content: string;
 		revisionId: string | null;
@@ -1289,6 +1304,7 @@ export interface NarratorCommandAdapter {
 		pluginId: string;
 		context: HostCallContext;
 		signal: AbortSignal;
+		onCompat?: () => void;
 	}): Promise<{ added: boolean; taskText: string; protected: boolean; revisionId: string | null }>;
 	specBehaviorFenceUpdate(input: {
 		narratorId: string;
@@ -1297,6 +1313,7 @@ export interface NarratorCommandAdapter {
 		pluginId: string;
 		context: HostCallContext;
 		signal: AbortSignal;
+		onCompat?: () => void;
 	}): Promise<{ updated: boolean; revisionId: string | null }>;
 	updateProfile(input: {
 		narratorId: string;
@@ -1315,6 +1332,7 @@ export interface NarratorCommandAdapter {
 		pluginId: string;
 		context: HostCallContext;
 		signal: AbortSignal;
+		onCompat?: () => void;
 	}): Promise<{ path: string; uri: string; revisionId: string | null }>;
 	interrupt(input: {
 		narratorId: string;
@@ -1323,12 +1341,87 @@ export interface NarratorCommandAdapter {
 	}): Promise<{ interrupted: boolean }>;
 }
 
+/** One task of an outline session as `tasks_read` returns it. */
+export type NarratorTaskRow = {
+	blockId: string;
+	address: string;
+	text: string;
+	status: "todo" | "doing" | "done" | "cancelled";
+	waiting: boolean;
+	humanCreated: boolean;
+	parentBlockId: string | null;
+	depth: number;
+	versionSeq: number;
+};
+
+/**
+ * The block commands on an outline session's tasks (outline P2 PR 12a). Separate from
+ * {@link NarratorCommandAdapter} so a host without them answers `HOST_UNAVAILABLE`.
+ */
+export interface NarratorTaskAdapter {
+	tasksRead(input: {
+		narratorId: string;
+		cursor?: string;
+		limit?: number;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		backend: "outline";
+		narratorId: string;
+		spaceKey: string | null;
+		seq: number;
+		tasks: NarratorTaskRow[];
+		nextCursor: string | null;
+	}>;
+	taskAdd(input: {
+		narratorId: string;
+		text: string;
+		parentBlockId?: string;
+		start?: boolean;
+		protected?: boolean;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		blockId: string;
+		address: string;
+		added: boolean;
+		status: string;
+		started: boolean;
+	}>;
+	taskSetStatus(input: {
+		narratorId: string;
+		blockId: string;
+		status: "todo" | "doing" | "done" | "cancelled";
+		baseVersionSeq?: number;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		blockId: string;
+		address: string;
+		status: string;
+		versionSeq: number;
+		changed: boolean;
+	}>;
+	behaviorRulesSet(input: {
+		narratorId: string;
+		mode: "upsert" | "clear";
+		text?: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ blockId: string | null }>;
+}
+
 export interface PluginPublicApiAdapters {
 	plugins?: PluginQueryAdapter;
 	projects?: ProjectQueryAdapter;
 	pluginLifecycle?: PluginLifecycleAdapter;
 	narrators?: NarratorQueryAdapter;
 	narratorCommands?: NarratorCommandAdapter;
+	narratorTasks?: NarratorTaskAdapter;
 }
 
 const listInputBase = {
@@ -1449,6 +1542,47 @@ export const narratorUpdateProfileInputSchema = z
 		},
 	);
 
+/** `tasks_read`: an outline session's tasks in document order, a page at a time. */
+export const narratorTasksReadInputSchema = z
+	.object({
+		narratorId: idSchema,
+		cursor: z.string().min(1).max(MAX_CURSOR_BYTES).optional(),
+		limit: z.number().int().min(1).max(MAX_PAGE_LIMIT).optional(),
+	})
+	.strict();
+/** `task_add`: a task on an outline session's task page, or under a block of its space. */
+export const narratorTaskAddInputSchema = z
+	.object({
+		narratorId: idSchema,
+		text: z.string().trim().min(1).max(1000),
+		parentBlockId: idSchema.optional(),
+		/** Start the session on it when it is idle (the task board's "Add and start"). */
+		start: z.boolean().optional(),
+		/**
+		 * Created by a person, as a protected spec task was: it drives `protectedOnly`
+		 * continuation. Not locked: only a person locks (D52).
+		 */
+		protected: z.boolean().optional(),
+	})
+	.strict();
+/** `task_set_status`: one task of an outline session's space. */
+export const narratorTaskSetStatusInputSchema = z
+	.object({
+		narratorId: idSchema,
+		blockId: idSchema,
+		status: z.enum(["todo", "doing", "done", "cancelled"]),
+		baseVersionSeq: z.number().int().min(1).optional(),
+	})
+	.strict();
+/** `behavior_rules_set`: the plugin's block on an outline session's behavior page. */
+export const narratorBehaviorRulesSetInputSchema = z
+	.object({
+		narratorId: idSchema,
+		mode: z.enum(["upsert", "clear"]),
+		text: z.string().trim().max(2000).optional(),
+	})
+	.strict();
+
 /** Spec files a plugin may write through the public API (safety allowlist). */
 const SPEC_WRITE_WHITELIST = new Set(["tasks.json", "index.md"]);
 
@@ -1466,6 +1600,17 @@ export const narratorSpecWriteInputSchema = z
 
 const pluginCursorSchema = z.object({ pluginId: pluginIdSchema }).strict();
 const timestampCursorSchema = z.object({ updatedAt: deadlineSchema, id: idSchema }).strict();
+
+/**
+ * What a converted Dynamic Spec command (outline P2 PR 12a) reports: the audit record's mark and
+ * the hourly warning per plugin and command.
+ */
+function compatMarker(call: CommandHandlerContext, command: SpecCompatCommand): () => void {
+	return () => {
+		call.markCompat?.();
+		noteSpecCompatCall(call.host.plugin.pluginId, command);
+	};
+}
 
 function requireAdapter<T>(adapter: T | undefined, name: string): T {
 	if (!adapter) {
@@ -1962,6 +2107,7 @@ export class PluginPublicApi {
 						pluginId: call.host.plugin.pluginId,
 						context: call.host,
 						signal: call.signal,
+						onCompat: compatMarker(call, "spec_tasks_get"),
 					});
 					return { data: result };
 				},
@@ -1985,6 +2131,7 @@ export class PluginPublicApi {
 						pluginId: call.host.plugin.pluginId,
 						context: call.host,
 						signal: call.signal,
+						onCompat: compatMarker(call, "spec_task_add"),
 					});
 					return { data: result };
 				},
@@ -2008,6 +2155,7 @@ export class PluginPublicApi {
 						pluginId: call.host.plugin.pluginId,
 						context: call.host,
 						signal: call.signal,
+						onCompat: compatMarker(call, "spec_behavior_fence_update"),
 					});
 					return { data: result };
 				},
@@ -2028,6 +2176,103 @@ export class PluginPublicApi {
 						narratorId: input.narratorId,
 						uri: input.uri,
 						content: input.content,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+						onCompat: compatMarker(call, "spec_write"),
+					});
+					return { data: result };
+				},
+			});
+		}
+		// Block commands on an outline session's tasks (outline P2 PR 12a).
+		if (!this.commands.has("narrafork.narrator.tasks_read")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.tasks_read",
+				capability: "command.narrator.tasks_read",
+				inputSchema: narratorTasksReadInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "none",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorTasks, "Narrator tasks");
+					const result = await adapter.tasksRead({
+						narratorId: input.narratorId,
+						...(input.cursor ? { cursor: input.cursor } : {}),
+						...(input.limit !== undefined ? { limit: input.limit } : {}),
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.task_add")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.task_add",
+				capability: "command.narrator.task_add",
+				inputSchema: narratorTaskAddInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorTasks, "Narrator tasks");
+					const result = await adapter.taskAdd({
+						narratorId: input.narratorId,
+						text: input.text,
+						...(input.parentBlockId ? { parentBlockId: input.parentBlockId } : {}),
+						...(input.start !== undefined ? { start: input.start } : {}),
+						...(input.protected !== undefined ? { protected: input.protected } : {}),
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.task_set_status")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.task_set_status",
+				capability: "command.narrator.task_set_status",
+				inputSchema: narratorTaskSetStatusInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorTasks, "Narrator tasks");
+					const result = await adapter.taskSetStatus({
+						narratorId: input.narratorId,
+						blockId: input.blockId,
+						status: input.status,
+						...(input.baseVersionSeq !== undefined ? { baseVersionSeq: input.baseVersionSeq } : {}),
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.behavior_rules_set")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.behavior_rules_set",
+				capability: "command.narrator.behavior_rules_set",
+				inputSchema: narratorBehaviorRulesSetInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorTasks, "Narrator tasks");
+					const result = await adapter.behaviorRulesSet({
+						narratorId: input.narratorId,
+						mode: input.mode,
+						...(input.text !== undefined ? { text: input.text } : {}),
 						pluginId: call.host.plugin.pluginId,
 						context: call.host,
 						signal: call.signal,
@@ -2476,11 +2721,12 @@ export class PluginPublicApi {
 			return result;
 		}
 
+		const note: PublicApiAuditNote = {};
 		const execute = () =>
-			this.runCommandHandler(context, request, definition, parsedInput, authorization);
+			this.runCommandHandler(context, request, definition, parsedInput, authorization, note);
 		if (!request.idempotencyKey || definition.idempotency === "none") {
 			const result = await execute();
-			await this.audit(context, definition, resource, result, startedAt, request, false);
+			await this.audit(context, definition, resource, result, startedAt, request, false, note);
 			return result;
 		}
 
@@ -2518,7 +2764,7 @@ export class PluginPublicApi {
 			result: resultPromise,
 		});
 		const result = await resultPromise;
-		await this.audit(context, definition, resource, result, startedAt, request, false);
+		await this.audit(context, definition, resource, result, startedAt, request, false, note);
 		return result;
 	}
 
@@ -2528,6 +2774,7 @@ export class PluginPublicApi {
 		definition: AnyCommandDefinition,
 		input: unknown,
 		authorization: Extract<GatewayAuthorizationDecision, { allowed: true }>,
+		note: PublicApiAuditNote = {},
 	): Promise<CommandResult> {
 		try {
 			const response = await runWithDeadline(
@@ -2539,6 +2786,9 @@ export class PluginPublicApi {
 							idempotencyKey: request.idempotencyKey,
 							expectedVersion: request.expectedVersion,
 							authorization,
+							markCompat: () => {
+								note.compat = "outline";
+							},
 						}),
 					),
 				request.deadlineAt,
@@ -2812,6 +3062,7 @@ export class PluginPublicApi {
 		startedAt: number,
 		request: unknown,
 		idempotentReplay: boolean,
+		note: PublicApiAuditNote = {},
 	): Promise<void> {
 		if (!this.auditSink) return;
 		let requestBytes = 0;
@@ -2845,6 +3096,7 @@ export class PluginPublicApi {
 				responseBytes,
 				idempotentReplay: idempotentReplay || undefined,
 				diagnostics: normalizeDiagnostics(result.diagnostics, this.limits),
+				...(note.compat ? { compat: note.compat } : {}),
 			});
 		} catch {
 			// Audit storage must never alter the already-determined public API result.
@@ -2909,12 +3161,63 @@ export type NarratorSessionFacade = {
 	getById: typeof narratorService.getById;
 };
 
+type NarratorSessionModule = typeof import("./narrator-session");
+
+/**
+ * The session functions of the block commands on an outline session's tasks (outline P2 PR 12a),
+ * so tests can inject a fake; the real ones are loaded on first use.
+ */
+export type NarratorTaskFacade = {
+	tasksRead: NarratorSessionModule["readOutlineTasksForPlugin"];
+	taskAdd: NarratorSessionModule["addOutlineTaskForPlugin"];
+	taskSetStatus: NarratorSessionModule["setOutlineTaskStatusForPlugin"];
+	behaviorRulesSet: NarratorSessionModule["setOutlineRulesForPlugin"];
+};
+
+const lazyNarratorTasks: NarratorTaskFacade = {
+	tasksRead: async (...args) =>
+		(await import("./narrator-session")).readOutlineTasksForPlugin(...args),
+	taskAdd: async (...args) => (await import("./narrator-session")).addOutlineTaskForPlugin(...args),
+	taskSetStatus: async (...args) =>
+		(await import("./narrator-session")).setOutlineTaskStatusForPlugin(...args),
+	behaviorRulesSet: async (...args) =>
+		(await import("./narrator-session")).setOutlineRulesForPlugin(...args),
+};
+
+/** Outline write errors a plugin can act on, by their codes. */
+const OUTLINE_CONFLICT_CODES = new Set([
+	"OUTLINE_VERSION_CONFLICT",
+	"OUTLINE_TASK_CLAIMED",
+	"OUTLINE_CLAIM_CHANGED",
+	"OUTLINE_SPACE_BUSY",
+]);
+const OUTLINE_TOO_LARGE_CODES = new Set([
+	"OUTLINE_TOO_MANY_OPS",
+	"OUTLINE_BODY_TOO_LARGE",
+	"OUTLINE_TRANSACTION_TOO_LARGE",
+	"OUTLINE_TOO_MANY_ROWS",
+	"OUTLINE_TEXT_TOO_LARGE",
+]);
+
 /** Map core narrator errors to stable public error codes. */
 function mapNarratorCommandError(error: unknown): PluginPublicApiError {
 	if (error instanceof PluginPublicApiError) return error;
-	// A Dynamic Spec command for a session whose tasks live in the outline (outline P2): not a
-	// bad request, the session is in the other task system. The block-based commands come with
-	// the plugin compatibility work (plan PR 12).
+	// A plugin's task command refused for a reason it can act on (`outline/plugin-tasks.ts`).
+	if (error instanceof AppError && "publicCode" in error && typeof error.publicCode === "string") {
+		const code = publicErrorCodeSchema.safeParse(error.publicCode);
+		if (code.success) return new PluginPublicApiError(code.data, error.message);
+	}
+	// An outline write that met someone else's change or work, or that is too large.
+	if (error instanceof AppError && OUTLINE_CONFLICT_CODES.has(error.code)) {
+		return new PluginPublicApiError("CONFLICT", error.message, {
+			retryable: error.code === "OUTLINE_SPACE_BUSY",
+		});
+	}
+	if (error instanceof AppError && OUTLINE_TOO_LARGE_CODES.has(error.code)) {
+		return new PluginPublicApiError("PAYLOAD_TOO_LARGE", error.message);
+	}
+	// A Dynamic Spec task command for a subagent of an outline session (outline P2): not a bad
+	// request, the session is in the other task system and a subagent has no tasks of its own.
 	if (error instanceof AppError && error.code === "SPEC_OUTLINE_SESSION") {
 		return new PluginPublicApiError("CONFLICT", error.message);
 	}
@@ -2953,8 +3256,10 @@ export function createCorePluginPublicApiAdapters(options: {
 	db: NarraForkDatabase;
 	pluginManager: PluginManagerPublicMethods;
 	narratorSession?: NarratorSessionFacade;
+	narratorTasks?: NarratorTaskFacade;
 }): PluginPublicApiAdapters {
 	const { db, pluginManager } = options;
+	const tasks = options.narratorTasks ?? lazyNarratorTasks;
 	const session = options.narratorSession ?? {
 		sendMessage: sendNarratorMessage,
 		sendSubagentMessage: sendSubagentMessageToSession,
@@ -3183,7 +3488,10 @@ export function createCorePluginPublicApiAdapters(options: {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
 				try {
-					const result = await session.specTasksGet(input.narratorId);
+					const result = await session.specTasksGet(input.narratorId, {
+						pluginId: input.pluginId,
+						onCompat: input.onCompat,
+					});
 					return {
 						content: result.content,
 						revisionId: result.revisionId,
@@ -3207,6 +3515,8 @@ export function createCorePluginPublicApiAdapters(options: {
 				try {
 					const result = await session.specTaskAdd(input.narratorId, input.text, {
 						protected: input.protected === true,
+						pluginId: input.pluginId,
+						onCompat: input.onCompat,
 					});
 					return {
 						added: result.added,
@@ -3226,6 +3536,7 @@ export function createCorePluginPublicApiAdapters(options: {
 						input.narratorId,
 						input.text ?? "",
 						input.mode,
+						{ pluginId: input.pluginId, onCompat: input.onCompat },
 					);
 					return {
 						updated: result.updated,
@@ -3262,7 +3573,10 @@ export function createCorePluginPublicApiAdapters(options: {
 				try {
 					// Resolve existence first so the caller gets a stable NOT_FOUND.
 					await session.getById(input.narratorId);
-					const result = await session.specWrite(input.narratorId, input.uri, input.content);
+					const result = await session.specWrite(input.narratorId, input.uri, input.content, {
+						pluginId: input.pluginId,
+						onCompat: input.onCompat,
+					});
 					return {
 						path: result.path,
 						uri: result.uri,
@@ -3284,6 +3598,95 @@ export function createCorePluginPublicApiAdapters(options: {
 				}
 				const interrupted = session.interruptNarrator(input.narratorId);
 				return { interrupted };
+			},
+		},
+		narratorTasks: {
+			async tasksRead(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const read = await tasks.tasksRead(input.narratorId, {
+						cursor: input.cursor ?? null,
+						limit: input.limit,
+					});
+					return {
+						backend: read.backend,
+						narratorId: read.narratorId,
+						spaceKey: read.spaceKey,
+						seq: read.seq,
+						tasks: read.tasks.map((task) => ({
+							blockId: task.blockId,
+							address: task.address,
+							text: task.text,
+							status: task.status,
+							waiting: task.waiting,
+							humanCreated: task.humanCreated,
+							parentBlockId: task.parentBlockId,
+							depth: task.depth,
+							versionSeq: task.versionSeq,
+						})),
+						nextCursor: read.nextCursor,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async taskAdd(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const added = await tasks.taskAdd(input.narratorId, {
+						pluginId: input.pluginId,
+						text: input.text,
+						parentBlockId: input.parentBlockId ?? null,
+						start: input.start === true,
+						protected: input.protected === true,
+					});
+					return {
+						blockId: added.blockId,
+						address: added.address,
+						added: added.added,
+						status: added.status,
+						started: added.started,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async taskSetStatus(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const set = await tasks.taskSetStatus(input.narratorId, {
+						pluginId: input.pluginId,
+						blockId: input.blockId,
+						status: input.status,
+						...(input.baseVersionSeq !== undefined ? { baseVersionSeq: input.baseVersionSeq } : {}),
+					});
+					return {
+						blockId: set.blockId,
+						address: set.address,
+						status: set.status,
+						versionSeq: set.versionSeq,
+						changed: set.changed,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async behaviorRulesSet(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const written = await tasks.behaviorRulesSet(input.narratorId, {
+						pluginId: input.pluginId,
+						mode: input.mode,
+						...(input.text !== undefined ? { text: input.text } : {}),
+					});
+					return { blockId: written.blockId };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
 			},
 		},
 	};
@@ -3309,6 +3712,10 @@ export const PUBLIC_COMMAND_IDS = [
 	"narrafork.narrator.spec_behavior_fence_update",
 	"narrafork.narrator.update_profile",
 	"narrafork.narrator.spec_write",
+	"narrafork.narrator.tasks_read",
+	"narrafork.narrator.task_add",
+	"narrafork.narrator.task_set_status",
+	"narrafork.narrator.behavior_rules_set",
 ] as const;
 
 export type PublicQueryId = (typeof PUBLIC_QUERY_IDS)[number];

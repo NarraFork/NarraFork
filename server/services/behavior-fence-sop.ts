@@ -12,8 +12,11 @@
  *   - the outline behavior view, which shows the SOP after the page.
  */
 
+/** The plugin the markers name: whose SOP an outline session's old fence holds (PR 12a moves it). */
+export const TEAM_SOP_PLUGIN_ID = "com.whisent.narrator-team";
+
 /** Marker that scopes plugin-written team-SOP sections inside spec://behavior_fence. */
-export const TEAM_SOP_MARKER = "team-sop:com.whisent.narrator-team";
+export const TEAM_SOP_MARKER = `team-sop:${TEAM_SOP_PLUGIN_ID}`;
 
 export const TEAM_SOP_OPEN = `<!-- ${TEAM_SOP_MARKER} -->`;
 export const TEAM_SOP_CLOSE = `<!-- /${TEAM_SOP_MARKER} -->`;

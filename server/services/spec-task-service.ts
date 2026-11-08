@@ -295,6 +295,20 @@ async function syncProtectedLocks(
 	}
 }
 
+/**
+ * The refusal of a write that changes protected tasks without taskReflection: what a spec session's
+ * write throws, and what a plugin's `spec_write` of tasks.json in an outline session throws for a
+ * task a person created (`plugin-spec-compat.ts`), so both read the same.
+ */
+export function protectedMutationMessage(
+	mutations: ReadonlyArray<{ kind: string; text: string; details: string }>,
+): string {
+	const details = mutations
+		.map((mutation) => `- ${mutation.kind}: ${mutation.text} (${mutation.details})`)
+		.join("\n");
+	return `This change affects protected task(s) and requires taskReflection before it can be applied.\n${details}`;
+}
+
 export async function validateSpecTasksWrite(
 	namespaceId: string,
 	content: string,

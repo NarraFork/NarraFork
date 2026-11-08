@@ -137,15 +137,18 @@ export interface PluginEventMappingContext {
 export type PublicEventMapping = Partial<PublicEvent> &
 	Pick<PublicEvent, "topic" | "eventClass" | "data" | "redaction">;
 
+/** What one internal event maps to: none, one public event, or several (each its own event id). */
+export type PluginEventMapperResult =
+	| PublicEventMapping
+	| PublicEvent
+	| ReadonlyArray<PublicEventMapping | PublicEvent>
+	| null
+	| undefined;
+
 export type PluginEventMapper = (
 	event: NarraForkEvent,
 	context: PluginEventMappingContext,
-) =>
-	| PublicEventMapping
-	| PublicEvent
-	| null
-	| undefined
-	| Promise<PublicEventMapping | PublicEvent | null | undefined>;
+) => PluginEventMapperResult | Promise<PluginEventMapperResult>;
 
 export interface EventDeliveryOptions {
 	maxRatePerSecond?: number;
@@ -565,6 +568,50 @@ export const defaultPluginEventMapper: PluginEventMapper = (event, context) => {
 				}),
 			},
 		);
+	}
+	if (type === "outline:session_tasks_changed") {
+		// Tasks of an outline session (outline P2 PR 12a): the new topic, and (until the old spec
+		// commands retire, one release after outline plan PR 13) the spec topic a plugin following
+		// tasks.json listens to, as a spec session's write sends it.
+		const narratorId = String(value.narratorId);
+		const seq = typeof value.seq === "number" ? value.seq : 0;
+		const revisionId = `outline:${String(value.spaceKey)}:${seq}`;
+		const updatedBy =
+			value.actorKind === "human" ? "user" : value.actorKind === "agent" ? "agent" : "system";
+		const extra = { resource: resource("narrator", narratorId, { narratorId }) };
+		const changes = Array.isArray(value.changes)
+			? value.changes.slice(0, 50).flatMap((change): JsonValue[] => {
+					const item = change as { blockId?: unknown; status?: unknown };
+					return typeof item.blockId === "string" && typeof item.status === "string"
+						? [{ blockId: item.blockId, status: item.status }]
+						: [];
+				})
+			: [];
+		return [
+			baseMapping(
+				"narrafork.narrator.tasks.changed",
+				"state",
+				{
+					narratorId,
+					seq,
+					revisionId,
+					updatedBy,
+					changes,
+					truncated: value.truncated === true,
+				},
+				"user_scoped",
+				context,
+				extra,
+			),
+			baseMapping(
+				"narrafork.narrator.spec.changed",
+				"state",
+				{ narratorId, path: "tasks.json", uri: "spec://tasks.json", revisionId, updatedBy },
+				"user_scoped",
+				context,
+				{ ...extra, eventId: `${context.eventId}_spec` },
+			),
+		];
 	}
 	if (type === "narrator:tool_changed") {
 		// Bounded metadata only. The tool input/output stay server-side: subscribers need to know
@@ -1070,10 +1117,15 @@ export class PluginEventGateway {
 
 	private async processInternalEvent(event: NarraForkEvent): Promise<void> {
 		const context = { eventId: `evt_${generateId()}`, occurredAt: new Date().toISOString() };
-		let mapped: PublicEvent;
+		let all: PublicEvent[];
 		try {
 			const result = await this.mapper(event, context);
-			if (!result) {
+			const results: ReadonlyArray<PublicEventMapping | PublicEvent> = !result
+				? []
+				: Array.isArray(result)
+					? result
+					: [result as PublicEventMapping | PublicEvent];
+			if (results.length === 0) {
 				this.recordDiagnostic({
 					code: "UNKNOWN_INTERNAL_EVENT",
 					message: "Internal event has no public mapping",
@@ -1081,7 +1133,7 @@ export class PluginEventGateway {
 				});
 				return;
 			}
-			mapped = sanitizeMappedEvent(result, context);
+			all = results.map((one) => sanitizeMappedEvent(one, context));
 		} catch (error) {
 			this.recordDiagnostic({
 				code: error instanceof z.ZodError ? "INVALID_PUBLIC_EVENT" : "MAPPER_FAILED",
@@ -1093,18 +1145,20 @@ export class PluginEventGateway {
 			});
 			return;
 		}
-		if (mapped.topic === "narrafork.plugin.lifecycle") {
-			const state = String(mapped.data.desiredState ?? mapped.data.runtimeState ?? "");
-			const changeKind = String(mapped.data.changeKind ?? "");
-			if (
-				["disabled", "inactive", "stopped", "quarantine", "deactivated"].includes(state) ||
-				["disabled", "deactivated", "stopped"].includes(changeKind)
-			) {
-				const pluginId = mapped.resource?.id ?? asString(mapped.data.pluginId);
-				if (pluginId) this.revokePlugin(pluginId, "plugin-lifecycle-disabled");
+		for (const mapped of all) {
+			if (mapped.topic === "narrafork.plugin.lifecycle") {
+				const state = String(mapped.data.desiredState ?? mapped.data.runtimeState ?? "");
+				const changeKind = String(mapped.data.changeKind ?? "");
+				if (
+					["disabled", "inactive", "stopped", "quarantine", "deactivated"].includes(state) ||
+					["disabled", "deactivated", "stopped"].includes(changeKind)
+				) {
+					const pluginId = mapped.resource?.id ?? asString(mapped.data.pluginId);
+					if (pluginId) this.revokePlugin(pluginId, "plugin-lifecycle-disabled");
+				}
 			}
+			this.dispatcher.publish(mapped);
 		}
-		this.dispatcher.publish(mapped);
 	}
 
 	private async auditLegacyRecord(record: IntegrationEventAuditRecord): Promise<void> {

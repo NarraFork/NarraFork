@@ -1930,6 +1930,9 @@ export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
 		const { importOutlineBehaviorFence } = await import("./task-source/outline-behavior");
 		await importOutlineBehaviorFence(active.narratorId, active.locale);
+		// A plugin's SOP the old fence still holds moves to its block on the page (PR 12a).
+		const { moveOutlineFenceSop } = await import("./task-source/outline-plugin-rules");
+		await moveOutlineFenceSop(active.narratorId);
 		const source = await taskSourceForNarrator(active.narratorId);
 		if (!source.turnEndNote) return;
 		const { revision } = await source.openTasks();
@@ -4473,14 +4476,53 @@ export async function deleteNarratorForPlugin(narratorId: string): Promise<void>
 }
 
 /**
- * Read a narrator's Dynamic Spec tasks.json (compiled). Used by the team plugin
- * to track the shared task queue it maintains for each member.
+ * Where a plugin's Dynamic Spec command goes (outline P2 PR 12a): `spec` for a session that keeps
+ * its tasks in Dynamic Spec, `outline` for an outline root session (the command is converted,
+ * `plugin-spec-compat.ts`). A subagent of an outline session has no tasks of its own (D27c): its
+ * task commands are refused as before (`SPEC_IN_OUTLINE_SESSION`); its fence command (`fence`)
+ * still writes its own old fence (a plugin's temporary worker keeps its SOP there).
  */
-export async function readSpecTasksForPlugin(narratorId: string) {
-	// An outline session's tasks are not in Dynamic Spec: an empty list would read as an idle
-	// member to a plugin that then dispatches to it (refused too). Refused like the writes.
-	const { assertSpecTasksUsed } = await import("./task-source/backend");
-	await assertSpecTasksUsed(narratorId);
+async function pluginSpecRoute(
+	narratorId: string,
+	command: "tasks" | "fence",
+): Promise<"spec" | "outline"> {
+	const { assertSpecTasksUsed, readTaskBackend, readTaskSession } = await import(
+		"./task-source/backend"
+	);
+	if ((await readTaskBackend(narratorId)) !== "outline") return "spec";
+	if ((await readTaskSession(narratorId))?.subagent === true) {
+		if (command === "fence") return "spec";
+		await assertSpecTasksUsed(narratorId);
+	}
+	return "outline";
+}
+
+/** How a plugin's command reports that it was converted for an outline session. */
+export interface PluginSpecCallOptions {
+	/** The plugin calling: the actor of what the conversion writes. */
+	pluginId?: string;
+	/** Called once the command is converted for an outline session (audit, telemetry). */
+	onCompat?: () => void;
+}
+
+function pluginActorOf(options: PluginSpecCallOptions): string {
+	return options.pluginId ?? "unknown";
+}
+
+/**
+ * Read a narrator's Dynamic Spec tasks.json (compiled). Used by the team plugin
+ * to track the shared task queue it maintains for each member. In an outline session the
+ * session's top-level tasks are read as that list (outline P2 PR 12a).
+ */
+export async function readSpecTasksForPlugin(
+	narratorId: string,
+	options: PluginSpecCallOptions = {},
+) {
+	if ((await pluginSpecRoute(narratorId, "tasks")) === "outline") {
+		options.onCompat?.();
+		const { readSpecTasksCompat } = await import("./plugin-spec-compat");
+		return await readSpecTasksCompat(narratorId);
+	}
 	const { readTasksFileForNarrator } = await import("./spec-vfs-service");
 	const { parseSpecTasksDocument, compileSpecTasks } = await import("./spec-task-service");
 	const file = await readTasksFileForNarrator(narratorId);
@@ -4509,11 +4551,23 @@ export async function readSpecTasksForPlugin(narratorId: string) {
 export async function addSpecTaskForPlugin(
 	narratorId: string,
 	text: string,
-	options: { protected?: boolean } = {},
+	options: { protected?: boolean } & PluginSpecCallOptions = {},
 ): Promise<{ added: boolean; taskText: string; protected: boolean; revisionId: string | null }> {
-	const { appendSpecTaskForExternalActor } = await import("./spec-vfs-service");
 	const objective = text.trim();
 	if (!objective) throw new ValidationError("task text is required");
+	if ((await pluginSpecRoute(narratorId, "tasks")) === "outline") {
+		options.onCompat?.();
+		const { addSpecTaskCompat } = await import("./plugin-spec-compat");
+		const added = await addSpecTaskCompat({
+			narratorId,
+			pluginId: pluginActorOf(options),
+			text: objective,
+			protected: options.protected === true,
+			isRunning: isLoopRunning,
+		});
+		return { ...added, taskText: objective };
+	}
+	const { appendSpecTaskForExternalActor } = await import("./spec-vfs-service");
 	const result = await appendSpecTaskForExternalActor(narratorId, objective, {
 		protected: options.protected === true,
 		actor: "agent",
@@ -4541,7 +4595,19 @@ export async function setSpecBehaviorFenceForPlugin(
 	narratorId: string,
 	text: string,
 	mode: "upsert" | "clear",
+	options: PluginSpecCallOptions = {},
 ): Promise<{ updated: boolean; revisionId: string | null }> {
+	// An outline root session's boundary is its behavior page: the plugin's block there.
+	if ((await pluginSpecRoute(narratorId, "fence")) === "outline") {
+		options.onCompat?.();
+		const { setSpecFenceCompat } = await import("./plugin-spec-compat");
+		return await setSpecFenceCompat({
+			narratorId,
+			pluginId: pluginActorOf(options),
+			mode,
+			text,
+		});
+	}
 	const { readSpecFile, writeSpecFile } = await import("./spec-vfs-service");
 	let current = "";
 	try {
@@ -4562,8 +4628,8 @@ export async function setSpecBehaviorFenceForPlugin(
 		const section = `${TEAM_SOP_OPEN}\n${body}\n${TEAM_SOP_CLOSE}`;
 		next = withoutSop ? `${withoutSop}\n\n${section}` : section;
 	}
-	// `pluginSop`: in an outline session the old fence is closed to everyone but this channel
-	// (the plugin's SOP, until its block commands exist, outline plan PR 12).
+	// `pluginSop`: a subagent of an outline session keeps its own old fence, written through this
+	// channel only (its session's boundary is the behavior page).
 	const written = await writeSpecFile(narratorId, "spec://behavior_fence", next, {
 		actor: "agent",
 		allowFenceMutation: true,
@@ -4629,7 +4695,31 @@ export async function writeSpecForPlugin(
 	narratorId: string,
 	uri: string,
 	content: string,
+	options: PluginSpecCallOptions = {},
 ): Promise<{ path: string; uri: string; revisionId: string | null }> {
+	if ((await pluginSpecRoute(narratorId, "tasks")) === "outline") {
+		const { normalizeSpecPath } = await import("./spec-vfs-service");
+		const path = normalizeSpecPath(uri);
+		const compat = await import("./plugin-spec-compat");
+		if (path === "tasks.json") {
+			options.onCompat?.();
+			return await compat.writeSpecTasksCompat({
+				narratorId,
+				pluginId: pluginActorOf(options),
+				content,
+				isRunning: isLoopRunning,
+			});
+		}
+		if (path === "index.md") {
+			options.onCompat?.();
+			return await compat.writeSpecIndexCompat({
+				narratorId,
+				pluginId: pluginActorOf(options),
+				content,
+			});
+		}
+		// Any other file is refused, as before.
+	}
 	const { writeSpecFile } = await import("./spec-vfs-service");
 	const written = await writeSpecFile(narratorId, uri, content, {
 		actor: "agent",
@@ -4640,6 +4730,106 @@ export async function writeSpecForPlugin(
 		uri: written.uri,
 		revisionId: written.revisionId ?? null,
 	};
+}
+
+/**
+ * A plugin's block commands on an outline session's tasks (outline P2 PR 12a; implementations in
+ * `outline/plugin-tasks.ts` and `task-source/outline-plugin-rules.ts`): read the tasks, add one
+ * (and start the session on it when asked and idle, as the task board's "Add and start"), set
+ * one's status, write the plugin's rules on the behavior page. A Dynamic Spec session and a
+ * subagent are refused there.
+ */
+export async function readOutlineTasksForPlugin(
+	narratorId: string,
+	input: { cursor?: string | null; limit?: number } = {},
+) {
+	const { readPluginTasks } = await import("./outline/plugin-tasks");
+	return await readPluginTasks({ narratorId, cursor: input.cursor, limit: input.limit });
+}
+
+export async function addOutlineTaskForPlugin(
+	narratorId: string,
+	input: {
+		pluginId: string;
+		text: string;
+		parentBlockId?: string | null;
+		start?: boolean;
+		protected?: boolean;
+	},
+): Promise<{
+	blockId: string;
+	address: string;
+	added: boolean;
+	status: string;
+	started: boolean;
+}> {
+	const { addPluginTask } = await import("./outline/plugin-tasks");
+	const task = await addPluginTask({
+		narratorId,
+		pluginId: input.pluginId,
+		text: input.text,
+		parentBlockId: input.parentBlockId ?? null,
+		protected: input.protected === true,
+		isRunning: isLoopRunning,
+	});
+	let started = false;
+	if (input.start === true && (task.status === "todo" || task.status === "doing")) {
+		const { readNarrator } = await import("./outline/access-reads");
+		const owner = (await readNarrator(task.sessionId))?.ownerUserId ?? null;
+		const { getUserReplyInLanguage } = await import("../lib/i18n");
+		const [locale, reply] = owner
+			? await Promise.all([
+					getUserLanguage(owner).catch(() => "en" as const),
+					getUserReplyInLanguage(owner).catch(() => false),
+				])
+			: (["en", false] as const);
+		started = (
+			await startSpecContinuationIfPossible(task.sessionId, locale, reply, null, {
+				preferTaskId: task.blockId,
+			})
+		).started;
+	}
+	return {
+		blockId: task.blockId,
+		address: task.address,
+		added: task.added,
+		status: task.status,
+		started,
+	};
+}
+
+export async function setOutlineTaskStatusForPlugin(
+	narratorId: string,
+	input: {
+		pluginId: string;
+		blockId: string;
+		status: "todo" | "doing" | "done" | "cancelled";
+		baseVersionSeq?: number;
+	},
+) {
+	const { setPluginTaskStatus } = await import("./outline/plugin-tasks");
+	return await setPluginTaskStatus({
+		narratorId,
+		pluginId: input.pluginId,
+		blockId: input.blockId,
+		status: input.status,
+		baseVersionSeq: input.baseVersionSeq,
+		isRunning: isLoopRunning,
+	});
+}
+
+export async function setOutlineRulesForPlugin(
+	narratorId: string,
+	input: { pluginId: string; mode: "upsert" | "clear"; text?: string },
+): Promise<{ blockId: string | null }> {
+	const { setOutlinePluginRules } = await import("./task-source/outline-plugin-rules");
+	const written = await setOutlinePluginRules({
+		narratorId,
+		pluginId: input.pluginId,
+		mode: input.mode,
+		text: input.text,
+	});
+	return { blockId: written.blockId };
 }
 
 /**
