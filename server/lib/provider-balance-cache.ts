@@ -3,6 +3,7 @@ import type {
 	ProviderBalanceData,
 	ProviderBalanceSnapshot,
 } from "@shared/provider-balance";
+import { selectProviderKey } from "./agent/pooled-provider";
 import { isDeepSeekCustomApiProvider } from "./deepseek-balance-cache";
 import { isKimiCustomApiProvider } from "./kimi-usage-cache";
 import { logger } from "./logger";
@@ -21,6 +22,7 @@ import {
 	getProviderBalanceEngine,
 	type ProviderBalanceQueryEngine,
 } from "./provider-balance-engine";
+import { getProviderKeyStore } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 export const PROVIDER_BALANCE_STALE_MS = 60_000;
@@ -90,6 +92,32 @@ function connectionIdentity(config: CustomApiProviderConfig, globalProxy: unknow
 	]);
 }
 
+/**
+ * The credential a *new* request would use for this provider.
+ *
+ * A custom API provider can now hold several keys, and settings only ever exposes the first
+ * one (provider-keys-projection.ts). Probing that field would therefore report the balance —
+ * and cache the discovered root — of a key the requests no longer use: a key that was
+ * disabled or is cooling down keeps a stale number on screen while another key actually
+ * serves. The pool's own choice for a new request is `selectProviderKey` without a session,
+ * the same call the auto-source rows use for "the credential a new request uses".
+ *
+ * The chosen key's per-key network overrides (proxy / User-Agent / headers) are deliberately
+ * *not* applied here: `selectProviderKey` selects the credential, and mapping every override
+ * onto the balance transport would widen this change beyond credential identity. What matters
+ * for the reviewer's concern is that balance and root belong to the selected key.
+ *
+ * Falls back to the configured value when the key store is unreadable or holds no key for
+ * this provider, which is the pre-existing single-key behaviour.
+ */
+function withSelectedCredential(config: CustomApiProviderConfig): CustomApiProviderConfig {
+	const store = getProviderKeyStore();
+	if (!store.readable || store.list(config.id).length === 0) return config;
+	const chosen = selectProviderKey(config.id);
+	if (!chosen || chosen.apiKey === config.apiKey) return config;
+	return { ...config, apiKey: chosen.apiKey };
+}
+
 /** What survives a restart: the discovery result and the last good balance. */
 export interface PersistedProviderBalance {
 	status: "supported" | "unsupported";
@@ -155,6 +183,11 @@ interface CacheOptions {
 	maxQueued?: number;
 	/** Resolved per round so a plugin engine can be installed or dropped at runtime. */
 	engine?: () => ProviderBalanceQueryEngine;
+	/**
+	 * Which credential each provider is probed with. Defaults to the pool's choice for a new
+	 * request; injectable so a test can pin the credential without a real key store.
+	 */
+	resolveCredential?: (config: CustomApiProviderConfig) => CustomApiProviderConfig;
 }
 
 /** Bounded background jobs. Read paths never await upstream IO. */
@@ -169,9 +202,11 @@ export class ProviderBalanceCache {
 	}
 
 	sync(): void {
+		const resolveCredential = this.options.resolveCredential ?? withSelectedCredential;
 		const providers = new Map(
 			this.options
 				.providers()
+				.map(resolveCredential)
 				.filter(isProviderBalanceCandidate)
 				.map((p) => [p.id, p]),
 		);

@@ -584,3 +584,53 @@ describe("capability plugin gating", () => {
 		expect(f.cache.peek("relay-test")?.balance?.amounts[0]?.remaining).toBe(7);
 	});
 });
+
+/**
+ * A provider can hold several keys and settings only ever exposes the first one. Probing
+ * that field would report a balance and cache a discovery root belonging to a key requests
+ * no longer use — a disabled or cooling-down key would keep a stale number on screen while
+ * another key actually serves.
+ */
+describe("provider balance probes the credential a request would use", () => {
+	function credentialFixture() {
+		let selected = "second-key";
+		const probes: string[] = [];
+		const fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+			const headers = new Headers(init?.headers);
+			probes.push(headers.get("authorization") ?? "");
+			return Response.json(wallet());
+		});
+		const cache = new ProviderBalanceCache({
+			providers: () => [provider()],
+			globalProxy: () => ({ mode: "direct" }),
+			fetch,
+			now: () => 100_000,
+			resolveCredential: (config) => ({ ...config, apiKey: selected }),
+		});
+		return {
+			cache,
+			probes,
+			select: (key: string) => {
+				selected = key;
+			},
+		};
+	}
+
+	test("sends the selected credential, not the one settings exposes", async () => {
+		const f = credentialFixture();
+		await f.cache.request("relay-test");
+		expect(f.probes).toEqual(["Bearer second-key"]);
+	});
+
+	test("a different selected credential withdraws the previous balance and root", async () => {
+		const f = credentialFixture();
+		await f.cache.request("relay-test");
+		expect(f.cache.peek("relay-test")).toMatchObject({ status: "supported" });
+
+		// Another key now serves requests, so the balance on screen describes a different
+		// account: it must not survive as if it were current.
+		f.select("third-key");
+		f.cache.sync();
+		expect(f.cache.peek("relay-test")).toMatchObject({ status: "pending", balance: null });
+	});
+});
