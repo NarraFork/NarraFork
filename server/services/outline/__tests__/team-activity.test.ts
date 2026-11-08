@@ -10,6 +10,9 @@
  * project and starts from empty cursors.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../../../db";
 import {
@@ -20,11 +23,13 @@ import {
 	projects,
 	users,
 } from "../../../db/schema";
+import { localBackend } from "../../../lib/agent/execution/local-backend";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { invalidateTaskBackend, taskSourceForNarrator } from "../../task-source";
+import { noteOutlineFileChange, resetOutlineOverlapForTests } from "../overlap";
 import { invalidateSessionReadScopes } from "../session-scope";
-import { ensureProjectSpace } from "../spaces";
+import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import { outlineStore } from "../store";
 import type { OutlineStore } from "../store/port";
 import {
@@ -46,6 +51,7 @@ beforeEach(() => {
 	invalidateTaskBackend();
 	invalidateSessionReadScopes();
 	resetOutlineTeamActivityForTests();
+	resetOutlineOverlapForTests();
 });
 
 afterEach(() => {
@@ -314,6 +320,46 @@ describe("the row and its cadence", () => {
 		expect(partsAfter).toBe(partsBefore);
 		expect(partsAfter).not.toContain("Team activity");
 		expect(partsAfter).not.toContain('session "B"');
+	});
+
+	test("files alone: a project without an outline space yet, another session's task in its own space", async () => {
+		const owner = await sqlite.person("fay");
+		const projectId = await sqlite.project(owner.id);
+		const made = new Date(Date.now() - 60 * 60_000).toISOString();
+		const a = await sqlite.session(owner.id, projectId, { title: "A", createdAt: made });
+		const b = await sqlite.session(owner.id, projectId, { title: "B", createdAt: made });
+		const theirs = await ensureSessionSpace(b);
+		const written = await writeOutline({
+			spaceId: theirs.id,
+			actor: { kind: "agent", id: b },
+			narratorId: b,
+			responsibleUserId: owner.id,
+			ops: [
+				{ op: "insert", tempId: "p", parent: null, content: "B's page" },
+				{ op: "insert", parent: { tempId: "p" }, content: "B's work", task: { status: "doing" } },
+			],
+		});
+		const task = written.results[1];
+		const repo = mkdtempSync(join(tmpdir(), "nf-team-files-"));
+		mkdirSync(join(repo, ".git"));
+		const touch = (narratorId: string) =>
+			noteOutlineFileChange({
+				narratorId,
+				projectId,
+				cwd: repo,
+				filePaths: [join(repo, "src/shared.ts")],
+				backend: localBackend,
+				locale: "en",
+				hint: false,
+			});
+		await touch(a);
+		await touch(b);
+		const rows = capture();
+		await writeOutlineTeamActivity(a, "en", "start");
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.row.content.split("\n").slice(1)).toEqual([
+			`- Files: [[${task?.address}|B's work]] of session "B" is also changing \`src/shared.ts\`, which you changed`,
+		]);
 	});
 
 	test("a spec session's run start and tool boundaries write nothing", async () => {

@@ -348,15 +348,17 @@ async function lookAtSpace(
 	skipped: number,
 ): Promise<SpaceLook> {
 	const { store, root } = ctx;
-	const look: SpaceLook = { drafts: [], more: 0, metas: new Map(), taskPageId: null };
+	// Older commits than those read, and versions past the read's limit, are counted, not looked
+	// at (a line saying so only goes out with something to say).
+	const look: SpaceLook = { drafts: [], more: skipped, metas: new Map(), taskPageId: null };
 	const read = await store.listCommitRangeChanges(
 		space.id,
 		from,
 		to,
 		OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerSpace + 1,
 	);
-	const truncated = read.length > OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerSpace;
 	const changes = read.slice(0, OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerSpace);
+	if (read.length > changes.length) look.more++;
 	if (changes.length === 0) return look;
 	const commits = new Map(
 		(await store.getCommitsBySeqs(space.id, [...new Set(changes.map((c) => c.seq))])).map((c) => [
@@ -407,10 +409,7 @@ async function lookAtSpace(
 		look.taskPageId !== null &&
 		c.pageId === look.taskPageId;
 	const wanted = others.filter((c) => treeOfChange(c) !== null || onTaskPage(c));
-	if (wanted.length === 0) {
-		look.more += truncated ? 1 : 0;
-		return look;
-	}
+	if (wanted.length === 0) return look;
 
 	// Every version of the blocks wanted, in order, and the version before the window.
 	const byBlock = new Map<string, OutlineRangeChange[]>();
@@ -530,7 +529,6 @@ async function lookAtSpace(
 			draft.event.kind === "answers"
 		)
 			draft.event = { kind: draft.event.kind, n };
-	look.more += (truncated ? 1 : 0) + skipped;
 	return look;
 }
 
@@ -632,7 +630,8 @@ export async function readOutlineTeamActivity(
 	current.lastLookAt = now;
 	keepSessionState(root, current);
 
-	const drafts: Array<{ space: OutlineSpaceRow; draft: Draft }> = [];
+	// A file's line names its task through `overlap.ts`, which reads the task's space itself.
+	const drafts: Array<{ space: OutlineSpaceRow | null; draft: Draft }> = [];
 	let more = 0;
 	for (const { space, look } of looks) {
 		more += look.more;
@@ -671,7 +670,7 @@ export async function readOutlineTeamActivity(
 			continue;
 		}
 		drafts.push({
-			space: spaces.find((s) => s.id === o.spaceId) ?? (spaces[0] as OutlineSpaceRow),
+			space: null,
 			draft: { where: "file", spaceId: o.spaceId, other: o.other, taskId: o.taskId, path: o.path },
 		});
 	}
@@ -749,7 +748,7 @@ function order(draft: Draft): number {
 async function nameDrafts(
 	store: OutlineStore,
 	root: string,
-	drafts: ReadonlyArray<{ space: OutlineSpaceRow; draft: Draft }>,
+	drafts: ReadonlyArray<{ space: OutlineSpaceRow | null; draft: Draft }>,
 	looks: ReadonlyArray<{ space: OutlineSpaceRow; look: SpaceLook }>,
 	overlaps: Awaited<ReturnType<typeof readOutlineFileOverlaps>>,
 	locale: Locale,
@@ -773,7 +772,9 @@ async function nameDrafts(
 			clip(blockTitle(h.contentHead)),
 		]),
 	);
-	const spaceKeys = new Map(drafts.map(({ space }) => [space.id, space.key]));
+	const spaceKeys = new Map(
+		drafts.flatMap(({ space }) => (space ? [[space.id, space.key] as const] : [])),
+	);
 	const taskOf = (id: string, spaceId: string): OutlineTeamTask | null => {
 		const meta = metas.get(id);
 		const key = spaceKeys.get(spaceId);
@@ -823,7 +824,7 @@ async function nameDrafts(
 	};
 	const described = await describeOutlineOverlaps(root, overlaps, store);
 
-	return drafts.map(({ space, draft }): Named | null => {
+	return drafts.map(({ draft }): Named | null => {
 		if (draft.where === "file") {
 			const d = described.get(`${draft.other}\u0000${draft.taskId}`);
 			const by: OutlineTeamActor = { kind: "session", name: d?.session ?? null };
@@ -839,7 +840,7 @@ async function nameDrafts(
 			};
 		}
 		const by = actorOf(draft.actor);
-		const tree = draft.treeId ? taskOf(draft.treeId, space.id) : null;
+		const tree = draft.treeId ? taskOf(draft.treeId, draft.spaceId) : null;
 		if (draft.where === "tree" && !tree) return null;
 		const e = draft.event;
 		let event: OutlineTeamEvent;
@@ -850,7 +851,7 @@ async function nameDrafts(
 			subject = tree;
 			changes = [{ kind: e.kind, n: e.n }];
 		} else {
-			const task = taskOf(e.taskId, space.id);
+			const task = taskOf(e.taskId, draft.spaceId);
 			if (!task) return null;
 			subject = task;
 			switch (e.kind) {
