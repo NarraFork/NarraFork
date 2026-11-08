@@ -280,6 +280,35 @@ describe("BackendProcess lifecycle ownership", () => {
 		expect(clock.pending).toBe(0);
 	});
 
+	test("the startup page is reported but neither counts as listening nor as running", async () => {
+		const startupPages: number[] = [];
+		backend.dispose();
+		backend = new BackendProcess({
+			host: "127.0.0.1",
+			port: 7779,
+			tls: false,
+			managerToken: "test-manager-token",
+			onLine: (line) => lines.push(line),
+			onState: (state, detail) => states.push({ state, detail }),
+			onStartupPage: () => startupPages.push(Date.now()),
+		});
+		const child = fakeChild(101);
+		children.push(child);
+		child.stdout.write("NarraFork startup page on http://127.0.0.1:7780\n");
+		const probe = spyOn(backend, "checkHealth").mockResolvedValue(true);
+		const started = backend.start();
+		await clock.advance(700);
+		expect(startupPages).toHaveLength(1);
+		// Still waiting for `running on`: the page's 503 health must not be probed as the service.
+		expect(probe).not.toHaveBeenCalled();
+		expect(backend.current).toBe("starting");
+		child.stdout.write(ADDRESS);
+		await clock.advance(700);
+		await started;
+		expect(backend.current).toBe("running");
+		expect(backend.listeningPort).toBe(7780);
+	});
+
 	test("stop cancels the address wait without waiting for a timer or health", async () => {
 		const child = fakeChild(101);
 		children.push(child);

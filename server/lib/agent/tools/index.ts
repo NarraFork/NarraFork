@@ -12,6 +12,7 @@ import {
 	exitPlanConfirmAndCompactTool,
 	exitPlanConfirmTool,
 	exitPlanReviseTool,
+	planReviewTool,
 } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
 import { genUiTool } from "./gen-ui";
@@ -158,6 +159,7 @@ const coreProvider: ToolProvider = {
 			exitPlanConfirmTool,
 			exitPlanConfirmAndCompactTool,
 			exitPlanReviseTool,
+			planReviewTool,
 			taskReflectConfirmTool,
 			taskReflectReviseTool,
 		];

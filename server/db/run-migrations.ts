@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
+import { reportStartupStep } from "../lib/startup-status";
 import {
 	MODEL_HISTORY_REVISION_CONTRACT,
 	MODEL_HISTORY_REVISION_CONTRACT_V1,
@@ -1081,7 +1082,8 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					? modelHistoryCandidate.index
 					: -1;
 			const effectiveLastAppliedIndex = Math.max(lastAppliedIndex, installedModelHistoryIndex);
-			for (const { migration, index } of pending) {
+			for (const [position, { migration, index }] of pending.entries()) {
+				reportStartupStep({ key: "migrating", current: position + 1, total: pending.length });
 				const statements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
 				const retirementReceipt = legacyRequestRetirementReceipt(statements);
 				const deferPhysicalCleanup =

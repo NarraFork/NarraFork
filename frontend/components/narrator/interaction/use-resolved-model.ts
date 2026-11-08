@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import {
 	FOLLOW_PARENT_MODEL,
+	isAutoModelOptionValue,
 	type ModelAggregation,
 	type ModelOption,
 	resolveDisplayModel,
@@ -21,10 +22,16 @@ import {
 export function capabilityModelReference(
 	narratorModel: string | null | undefined,
 	inheritanceModel: string | null | undefined,
+	runtimeModel?: { model?: unknown } | null,
 ): string | null | undefined {
-	return narratorModel === FOLLOW_PARENT_MODEL && inheritanceModel
-		? inheritanceModel
-		: narratorModel;
+	const reference =
+		narratorModel === FOLLOW_PARENT_MODEL && inheritanceModel ? inheritanceModel : narratorModel;
+	// An `auto:` value is served by whichever source routing picked, which can change between
+	// turns. The server reports the concrete `<prefix>:<model>` its last turn used (only while
+	// the selection is still the same value), so quota, balance and capability lookups follow
+	// the source actually in use rather than the first one in the list.
+	const served = typeof runtimeModel?.model === "string" ? runtimeModel.model.trim() : "";
+	return isAutoModelOptionValue(reference ?? "") && served.includes(":") ? served : reference;
 }
 
 export interface UseResolvedModelResult {
@@ -47,9 +54,15 @@ export function useResolvedModel(
 	aggregations: ModelAggregation[] | undefined,
 	allModels: ModelOption[],
 ): UseResolvedModelResult {
+	// `auto:` rows carry their sources, so the same list resolves an auto value for display.
 	const resolvedModel = useMemo(
-		() => resolveDisplayModel(narratorModel, { defaultModelValue, aggregations }),
-		[narratorModel, defaultModelValue, aggregations],
+		() =>
+			resolveDisplayModel(narratorModel, {
+				defaultModelValue,
+				aggregations,
+				autoModels: allModels,
+			}),
+		[narratorModel, defaultModelValue, aggregations, allModels],
 	);
 
 	const { resolvedProvider, resolvedBareModel } = useMemo(() => {

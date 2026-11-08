@@ -54,8 +54,10 @@ export const MAP_MONO_FAMILY = MONO_FAMILY;
 export const NODE = {
 	padX: 8,
 	padY: 4,
+	/** The arrow and the bullet (`.mm-node > .ob-gutter`, 14px each). */
 	gutter: 28,
-	check: 18,
+	/** After a task's checkbox icon, before its text (`.ob-check`): see {@link frameWidth}. */
+	checkGap: 4,
 	/** Widest a body grows before it wraps. */
 	maxBody: 264,
 	minBody: 6,
@@ -544,10 +546,24 @@ onTypographyChange(() => {
 	typeCache = null;
 });
 
+/**
+ * The checkbox icon at the reader's typography (px): `--nf-outline-icon` in
+ * `../outline-icons.css`, the body size + 2 between 12 and 24 — the same formula, so the column
+ * measured here is the one CSS draws.
+ */
+export function checkIconPx(): number {
+	return Math.min(Math.max(mapType().px + 2, 12), 24);
+}
+
+/** A node's frame: the arrow and the bullet, and a task's checkbox column (icon + gap). */
+export function frameWidth(task: boolean): number {
+	return NODE.gutter + (task ? checkIconPx() + NODE.checkGap : 0);
+}
+
 /** A node's outer size: padding + frame (arrow, bullet, checkbox) + body. */
 export function nodeSize(body: BodySize, task: boolean): { w: number; h: number; bodyW: number } {
 	const bodyW = Math.ceil(Math.max(NODE.minBody, body.w)) + 1;
-	const gutter = NODE.gutter + (task ? NODE.check : 0);
+	const gutter = frameWidth(task);
 	return {
 		w: NODE.padX * 2 + gutter + bodyW + NODE.border * 2,
 		h: NODE.padY * 2 + Math.max(mapType().lineH, body.h) + NODE.border * 2,

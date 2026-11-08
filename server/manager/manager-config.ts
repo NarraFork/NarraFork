@@ -29,7 +29,7 @@ function settingsPath(): string {
 /** 读取监听地址；文件缺失或不可解析时回落到默认值。 */
 export function readServerAddress(): ServerAddress {
 	try {
-		const raw = JSON.parse(readFileSync(settingsPath(), "utf8")) as {
+		const raw = Bun.JSONC.parse(readFileSync(settingsPath(), "utf8")) as {
 			server?: { host?: string; port?: number; tls?: { enabled?: boolean } };
 		};
 		return {
@@ -51,7 +51,7 @@ export function writeServerAddress(address: Pick<ServerAddress, "host" | "port">
 		withSettingsFileLock(resolveNarraforkHome(), () => {
 			const path = settingsPath();
 			const raw = existsSync(path)
-				? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
+				? (Bun.JSONC.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
 				: {};
 			const server = (
 				typeof raw.server === "object" && raw.server !== null ? raw.server : {}
@@ -90,7 +90,7 @@ const DEFAULT_NARRAFORK_SETTINGS: NarraForkSettings = {
 
 export function readNarraForkSettings(): NarraForkSettings {
 	try {
-		const raw = JSON.parse(readFileSync(settingsPath(), "utf8")) as {
+		const raw = Bun.JSONC.parse(readFileSync(settingsPath(), "utf8")) as {
 			server?: { openBrowser?: unknown };
 			branding?: { name?: unknown; iconColor?: unknown };
 		};
@@ -114,7 +114,7 @@ export function writeNarraForkSettings(patch: Partial<NarraForkSettings>): boole
 		withSettingsFileLock(resolveNarraforkHome(), () => {
 			const path = settingsPath();
 			const raw = existsSync(path)
-				? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
+				? (Bun.JSONC.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
 				: {};
 			if (patch.openBrowser !== undefined) {
 				const server = (

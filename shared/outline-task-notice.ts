@@ -158,6 +158,91 @@ export function boundOutlineTaskNoticeItems(raw: unknown): OutlineTaskNoticeItem
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Answers to the session's questions (outline P2 PR 7), as the delivered message shows them
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A person's answer to one question the session asked. */
+export interface OutlineAnswerNoticeAnswer {
+	/** The option chosen (1-based), and its text. */
+	option?: number;
+	optionText?: string;
+	/** Their words. */
+	text?: string;
+	/** They took the session's recommendation as it was. */
+	adopted?: true;
+}
+
+/** One answered question of an answer delivery. */
+export interface OutlineAnswerNoticeItem {
+	/** The question's block (`key/sid`). */
+	address: string;
+	alias?: string;
+	/** The question, one plain line. */
+	question: string;
+	answer: OutlineAnswerNoticeAnswer;
+	/** The session went ahead with its recommendation, and the answer differs. */
+	differs?: true;
+}
+
+export const OUTLINE_ANSWER_NOTICE_LIMITS = {
+	/** Questions one delivery names; the rest are counted. */
+	items: 20,
+	/** Characters of a question or an option. */
+	questionChars: 120,
+	/** Characters of an answer's words. */
+	textChars: 200,
+} as const;
+
+/** An answered question as a notice keeps it, or null when it names none. */
+export function boundOutlineAnswerNoticeItem(raw: unknown): OutlineAnswerNoticeItem | null {
+	if (!isRecord(raw)) return null;
+	const address = typeof raw.address === "string" ? clipNoticeLine(raw.address, 80) : "";
+	const question =
+		typeof raw.question === "string"
+			? clipNoticeLine(raw.question, OUTLINE_ANSWER_NOTICE_LIMITS.questionChars)
+			: "";
+	if (!address && !question) return null;
+	const a = isRecord(raw.answer) ? raw.answer : {};
+	const option =
+		typeof a.option === "number" && Number.isSafeInteger(a.option) && a.option > 0
+			? a.option
+			: undefined;
+	const optionText =
+		typeof a.optionText === "string" && a.optionText.trim()
+			? clipNoticeLine(a.optionText, OUTLINE_ANSWER_NOTICE_LIMITS.questionChars)
+			: undefined;
+	const text =
+		typeof a.text === "string" && a.text.trim()
+			? clipNoticeLine(a.text, OUTLINE_ANSWER_NOTICE_LIMITS.textChars)
+			: undefined;
+	const alias =
+		typeof raw.alias === "string" && raw.alias.trim() ? clipNoticeLine(raw.alias, 32) : "";
+	return {
+		address,
+		...(alias ? { alias } : {}),
+		question,
+		answer: {
+			...(option !== undefined ? { option } : {}),
+			...(optionText ? { optionText } : {}),
+			...(text ? { text } : {}),
+			...(a.adopted === true ? { adopted: true as const } : {}),
+		},
+		...(raw.differs === true ? { differs: true as const } : {}),
+	};
+}
+
+/** Bounded answered questions of a delivery. */
+export function boundOutlineAnswerNoticeItems(raw: unknown): OutlineAnswerNoticeItem[] {
+	if (!Array.isArray(raw)) return [];
+	const out: OutlineAnswerNoticeItem[] = [];
+	for (const item of raw.slice(0, OUTLINE_ANSWER_NOTICE_LIMITS.items)) {
+		const bounded = boundOutlineAnswerNoticeItem(item);
+		if (bounded) out.push(bounded);
+	}
+	return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The current-tasks view, as a `context_update` row shows it
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -180,8 +265,16 @@ export interface OutlineTasksViewDisplay {
 	doing: OutlineTasksViewTask[];
 	waiting: OutlineTasksViewTask[];
 	next: OutlineTasksViewTask[];
-	/** Open tasks by section, counted over everything the view read (not only those listed). */
-	counts: { doing: number; waiting: number; todo: number };
+	/**
+	 * Tasks handed to the session's subagents that are still running with them (outline P2 PR 9b);
+	 * absent when there are none (and on rows written before the section existed).
+	 */
+	delegated?: OutlineTasksViewTask[];
+	/**
+	 * Open tasks by section, counted over everything the view read (not only those listed);
+	 * `delegated` only when there are some.
+	 */
+	counts: { doing: number; waiting: number; todo: number; delegated?: number };
 	/** The view read only a leading part of the open tasks: there are more than counted. */
 	more?: true;
 }
@@ -216,14 +309,18 @@ export function coerceOutlineTasksViewDisplay(
 	if (value === null) return null;
 	if (!isRecord(value)) return undefined;
 	const counts = isRecord(value.counts) ? value.counts : {};
+	const delegated = viewTasks(value.delegated);
+	const delegatedCount = Math.max(count(counts.delegated), delegated.length);
 	return {
 		doing: viewTasks(value.doing),
 		waiting: viewTasks(value.waiting),
 		next: viewTasks(value.next),
+		...(delegated.length > 0 ? { delegated } : {}),
 		counts: {
 			doing: count(counts.doing),
 			waiting: count(counts.waiting),
 			todo: count(counts.todo),
+			...(delegatedCount > 0 ? { delegated: delegatedCount } : {}),
 		},
 		...(value.more === true ? { more: true as const } : {}),
 	};

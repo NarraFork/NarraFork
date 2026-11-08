@@ -96,6 +96,8 @@ import {
 	type PublicationIntent,
 	type PublicationRun,
 	publicationDedupeKey,
+	publicationEventFromDedupeKey,
+	type RunPublicationStatus,
 } from "./publication-outbox";
 import {
 	AGENT_RESULT_JSON_MAX_BYTES,
@@ -134,6 +136,8 @@ export type PgPublicationCommitResult = {
 	status: "duplicate" | "committed";
 	deliveryId: string | null;
 	arrivalSeq: number | null;
+	/** False when onlyIfActive suppressed a terminal/missing parent conclusion write. */
+	toolConclusionApplied?: boolean;
 };
 
 /**
@@ -603,6 +607,68 @@ export function createPostgresRuntimePublication(
 		const sourceResultRef = agentSourceResultRef(`message:${messageId}`);
 		return result ? { ...result, ...(sourceResultRef ? { sourceResultRef } : {}) } : null;
 	}
+	function runIdentity(run: PublicationRun) {
+		return and(
+			eq(outbox.producerKind, run.producerKind),
+			eq(outbox.taskId, run.taskId),
+			eq(outbox.logicalRunId, run.logicalRunId),
+			eq(outbox.recipientId, run.recipientId),
+		);
+	}
+	function reservedTerminalSlot(run: PublicationRun) {
+		return and(runIdentity(run), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved"));
+	}
+	/** Same three-state authority as the SQLite outbox; recovery never infers it from result reads. */
+	async function readRunPublicationState(run: PublicationRun): Promise<RunPublicationStatus> {
+		const reserved = await db
+			.select({ id: outbox.id })
+			.from(outbox)
+			.where(reservedTerminalSlot(run))
+			.limit(1);
+		if (reserved[0]) return { state: "reserved" };
+		const committed = await db
+			.select({ eventKind: outbox.eventKind })
+			.from(outbox)
+			.where(
+				and(
+					runIdentity(run),
+					ne(outbox.eventKind, "started"),
+					ne(outbox.eventKind, "terminal"),
+					ne(outbox.state, "reserved"),
+				),
+			)
+			.limit(1);
+		if (committed[0])
+			return {
+				state: "settled",
+				eventKind: committed[0].eventKind as Exclude<PublicationEvent, "started">,
+			};
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		const delivered = await db
+			.select({ dedupeKey: mailbox.dedupeKey })
+			.from(mailbox)
+			.where(and(eq(mailbox.narratorId, run.recipientId), inArray(mailbox.dedupeKey, keys)))
+			.limit(1);
+		if (delivered[0]) {
+			const eventKind = publicationEventFromDedupeKey(delivered[0].dedupeKey);
+			return { state: "settled", ...(eventKind ? { eventKind } : {}) };
+		}
+		const consumed = await db
+			.select({ taskId: consumptions.taskId })
+			.from(consumptions)
+			.where(
+				and(
+					eq(consumptions.producerKind, run.producerKind),
+					eq(consumptions.taskId, run.taskId),
+					eq(consumptions.logicalRunId, run.logicalRunId),
+					eq(consumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1);
+		return consumed[0] ? { state: "settled" } : { state: "none" };
+	}
 	async function readAgentTerminalResult(
 		run: PublicationRun,
 		readOptions: AgentTerminalResultReadOptions = {},
@@ -726,6 +792,7 @@ export function createPostgresRuntimePublication(
 
 	return {
 		readAgentTerminalResult,
+		readRunPublicationState,
 		/**
 		 * Run registration: logical run and relationship facts, plus (for a run with a
 		 * destination) slot reservation, the `source_after` result boundary and the
@@ -763,14 +830,12 @@ export function createPostgresRuntimePublication(
 							.select({ id: outbox.id })
 							.from(outbox)
 							.where(
-								and(
-									eq(outbox.producerKind, "agent"),
-									eq(outbox.taskId, input.narratorId),
-									eq(outbox.logicalRunId, currentRunId),
-									eq(outbox.recipientId, recipientId),
-									eq(outbox.eventKind, "terminal"),
-									eq(outbox.state, "reserved"),
-								),
+								reservedTerminalSlot({
+									producerKind: "agent",
+									taskId: input.narratorId,
+									logicalRunId: currentRunId,
+									recipientId,
+								}),
 							)
 							.limit(1);
 						const consumed = await tx
@@ -965,6 +1030,7 @@ export function createPostgresRuntimePublication(
 		async commitAgentTerminal(input: PgTerminalCommitInput): Promise<PgPublicationCommitResult> {
 			if (input.run.producerKind !== "agent")
 				throw new Error("Agent terminal commit requires an agent run");
+			let conclusionApplied: boolean | undefined;
 			const composite = await runComposite("publication.commitAgentTerminal", async (tx) => {
 				// Narrators precede outbox/mailbox locks, in the same order as refs append.
 				await lockPgNarratorRefs(tx, [input.run.taskId, input.run.recipientId]);
@@ -989,10 +1055,14 @@ export function createPostgresRuntimePublication(
 								conclusion.attempt === undefined
 									? undefined
 									: eq(narratorToolCalls.executionAttempt, conclusion.attempt),
+								conclusion.onlyIfActive ? ne(narratorToolCalls.status, "success") : undefined,
+								conclusion.onlyIfActive ? ne(narratorToolCalls.status, "fail") : undefined,
 							),
 						)
 						.returning({ id: narratorToolCalls.id });
-					if (updated.length !== 1) throw new Error("Detached terminal tool conclusion is stale");
+					conclusionApplied = updated.length === 1;
+					if (updated.length !== 1 && !conclusion.onlyIfActive)
+						throw new Error("Detached terminal tool conclusion is stale");
 				}
 				const existing =
 					input.delivery === "foreground"
@@ -1023,7 +1093,10 @@ export function createPostgresRuntimePublication(
 				return { commit, needsSeqFloorMark: section.needsSeqFloorMark };
 			});
 			if (composite.needsSeqFloorMark) markPgNarratorSeqFloorHealed(input.run.taskId);
-			return composite.commit;
+			return {
+				...composite.commit,
+				...(input.toolConclusion ? { toolConclusionApplied: conclusionApplied === true } : {}),
+			};
 		},
 
 		/** Bash terminal: the pointer resultRef + terminal intent, atomically. */

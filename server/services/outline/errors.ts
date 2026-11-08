@@ -131,6 +131,22 @@ export class OutlineTaskClaimedError extends OutlineWriteError {
 }
 
 /**
+ * A claim the caller decided on is no longer as it read it (`OutlineWriteOptions.expectClaims`),
+ * or a delegation's claim moved on before it was written (`delegateClaim`: someone claimed the
+ * task in between). Nothing was written; the caller reads the claim again and decides again.
+ */
+export class OutlineClaimChangedError extends AppError {
+	constructor(readonly blockId: string) {
+		super(
+			`the claim of task ${blockId} changed while the write was planned`,
+			409,
+			"OUTLINE_CLAIM_CHANGED",
+		);
+		this.name = "OutlineClaimChangedError";
+	}
+}
+
+/**
  * A lease expiry found claims that are no longer expired (renewed since they were listed) or no
  * longer in progress. Nothing was written; `blockIds` are the tasks to leave alone.
  */

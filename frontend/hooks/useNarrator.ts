@@ -21,6 +21,7 @@ import {
 	type RevertActionPreview,
 	type RevertActionTarget,
 	type RevertDiagnostic,
+	type RevertPlanApplyResult,
 	type RevertPlanFile,
 	type RevertPlanPreviewIssue,
 	type RevertScopePreviews,
@@ -35,9 +36,11 @@ import type {
 	RuleTargetSelector,
 } from "../lib/api/types";
 import {
+	extractRevertResult,
 	formatRevertFailure,
 	formatRevertSuccessWarning,
 	invalidateRevertQueries,
+	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
 import { removeRecentTabCascade } from "./useRecentTabs";
@@ -476,13 +479,32 @@ export function useRevertHistoryAction(narratorId: string) {
 			if (!plan?.planId || !plan.planHash || plan.action !== action) {
 				throw new Error(t("revertPlanReloadRequired"));
 			}
-			const result = await api.applyRevertPlan(narratorId, plan);
+			let result: RevertPlanApplyResult;
+			try {
+				result = await api.applyRevertPlan(narratorId, plan);
+			} catch (error) {
+				// The server answers 409 for anything but a history commit, including the
+				// reviewed "restore available files" outcome of a partial-coverage plan.
+				const restored = extractRevertResult(error);
+				if (restored?.planId === plan.planId && isAvailableFilesRestored(restored)) {
+					return { ...restored, availableFilesOnly: true as const };
+				}
+				throw error;
+			}
 			if (result.planId !== plan.planId || !isRevertHistoryCommitted(result)) {
 				throw new ApiError(result.reason ?? t("revertPlanApplyFailed"), 409, { ...result });
 			}
 			return result;
 		},
 		onSuccess: (result) => {
+			if ("availableFilesOnly" in result && result.availableFilesOnly) {
+				notifications.show({
+					title: t("revertAvailableFilesRestoredTitle"),
+					message: t("revertAvailableFilesRestored", { count: result.files.length }),
+					color: "blue",
+				});
+				return;
+			}
 			const warning = formatRevertSuccessWarning(t, result);
 			if (warning) {
 				notifications.show({

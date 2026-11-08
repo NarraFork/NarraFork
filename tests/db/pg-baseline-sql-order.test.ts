@@ -492,7 +492,7 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"model_history_revision",
 		]);
 		// 0047 追加 ModelTrace 舱的两列，0048 追加大纲任务后端，0051 追加回复上下文，
-		// 0057 追加按会话的问题反思覆盖。
+		// 0060 追加按会话的问题反思覆盖。
 		expect(narrators?.slice(-7)).toEqual([
 			"runtime_registration_json",
 			"policy_source_narrator_id",

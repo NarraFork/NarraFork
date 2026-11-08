@@ -1,3 +1,8 @@
+import {
+	type CredentialNetwork,
+	CredentialNetworkError,
+	normalizeCredentialNetwork,
+} from "@shared/credential-network";
 import { Hono } from "hono";
 import { CodexOAuthError } from "../lib/codex-auth";
 import {
@@ -508,7 +513,7 @@ codexRoutes.get("/credentials/:id/usage-stats", (c) => {
 
 /**
  * PATCH /api/codex/credentials/:id
- * Update credential fields (displayName, priority, useCreditQuota).
+ * Update credential fields (displayName, priority, useCreditQuota, network identity).
  */
 codexRoutes.patch("/credentials/:id", async (c) => {
 	const id = c.req.param("id");
@@ -516,10 +521,23 @@ codexRoutes.patch("/credentials/:id", async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: "Invalid Codex credential update" }, 400);
 	}
-	const body = parsed.data;
+	const { network, ...body } = parsed.data;
+	let normalized: CredentialNetwork | null | undefined;
+	try {
+		normalized =
+			network === undefined
+				? undefined
+				: network === null
+					? null
+					: normalizeCredentialNetwork(network);
+	} catch (err) {
+		if (err instanceof CredentialNetworkError)
+			return c.json({ error: err.message, code: "INVALID_NETWORK", field: err.field }, 400);
+		throw err;
+	}
 	const manager = getCodexManager();
 	try {
-		manager.updateCredential(id, body);
+		manager.updateCredential(id, { ...body, network: normalized });
 		return c.json({ ok: true });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);

@@ -29,6 +29,13 @@ export interface RecentTabPlacement {
 	position?: "top" | "above_idle";
 	toIndex?: number;
 	folderId?: string | null;
+	/**
+	 * A top-level unit dragged across the pin divider takes this pinned state with it. The
+	 * pinned block is positional (`getPinnedSectionEndIndex`), so it lands at the pinned
+	 * block's end (pinning) or the unpinned block's start (unpinning) when its anchor is in
+	 * the other block. Ignored for folder members, whose pinning is per folder.
+	 */
+	pinned?: boolean;
 }
 
 export function recentTabKey(tab: Pick<LayoutTab, "type" | "id">): string {
@@ -243,6 +250,14 @@ export function applyRecentTabMove<T extends LayoutTab>(
 		return dropEmptyFolder(regroupFolders(moveMember(next, index, target)), source.folderId);
 	}
 	const { group, originalIndex } = extractUnit(next, index);
+	if (target.pinned !== undefined && !!group[0].pinned !== target.pinned) {
+		// Across the pin divider: the unit's head carries the zone (its members keep their
+		// own in-folder pinning).
+		const head = { ...group[0] };
+		if (target.pinned) head.pinned = true;
+		else delete head.pinned;
+		group[0] = head;
+	}
 	if (target.beforeKey) insertRelativeToKey(next, group, target.beforeKey, "before");
 	else if (target.afterKey) insertRelativeToKey(next, group, target.afterKey, "after");
 	else if (target.position === "top") next.unshift(...group);
@@ -273,6 +288,8 @@ function moveMember<T extends LayoutTab>(
 	if ((moved.folderId ?? null) !== targetFolder) delete moved.pinned;
 	if (targetFolder) moved.folderId = targetFolder;
 	else delete moved.folderId;
+	// Out of a folder into the top level's pinned block (a drag aimed above the divider).
+	if (!targetFolder && target.pinned) moved.pinned = true;
 
 	if (!targetFolder) {
 		if (target.beforeKey) insertRelativeToKey(tabs, [moved], target.beforeKey, "before");
@@ -335,19 +352,28 @@ export function applyRecentTabPin<T extends LayoutTab>(
 	return regroupFolders(next);
 }
 
-/** Remove a folder but keep its members, in order and unpinned, at the folder's position. */
+/**
+ * Remove a folder but keep its members, in order, at the folder's position.
+ *
+ * Released members take the folder's pin, not their own: the pinned block is positional
+ * (`getPinnedSectionEndIndex`), so unpinning them would drop the whole folder's contents
+ * into the unpinned area instead of leaving them where the user was looking. A member's
+ * own `pinned` only orders it inside the folder (pinned members first).
+ */
 export function applyRecentTabFolderDissolve<T extends LayoutTab>(
 	tabs: T[],
 	folderId: string,
 ): T[] {
 	const index = folderHeaderIndex(tabs, folderId);
 	if (index < 0) return tabs;
+	const pinned = tabs[index]?.pinned === true;
 	const range = unitRange(tabs, index);
 	const next = [...tabs];
 	const members = next.slice(range.start + 1, range.end + 1).map((member) => {
 		const released = { ...member };
 		delete released.folderId;
-		delete released.pinned;
+		if (pinned) released.pinned = true;
+		else delete released.pinned;
 		return released;
 	});
 	next.splice(range.start, range.end - range.start + 1, ...members);

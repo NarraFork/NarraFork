@@ -695,6 +695,225 @@ describe("C. a new run of an ended background task", () => {
 		expect(fresh[0].dedupeKey).toContain(restarted.logicalRunId as string);
 	});
 
+	test("publication state distinguishes reserved and never-reserved runs", async () => {
+		seed();
+		const task = await backgroundTaskService.createAgentTask({
+			id: RUN,
+			subagentNarratorId: RUN,
+			subagentType: "general",
+			alias: "race-alias",
+			binding: binding({ cancelWith: undefined }),
+		});
+		const publication = getRuntimePublicationService();
+		expect(
+			await publication.readRunPublicationState({
+				producerKind: "agent",
+				taskId: RUN,
+				logicalRunId: task.logicalRunId as string,
+				recipientId: CALLER,
+			}),
+		).toEqual({ state: "reserved" });
+		expect(
+			await publication.readRunPublicationState({
+				producerKind: "agent",
+				taskId: RUN,
+				logicalRunId: "never-registered",
+				recipientId: CALLER,
+			}),
+		).toEqual({ state: "none" });
+	});
+
+	test("a settled run whose snapshot is unreadable is not executed again", async () => {
+		seed();
+		scriptPasses([async () => ({ finalText: "first run answer" })]);
+		const task = await backgroundTaskService.createAgentTask({
+			id: RUN,
+			subagentNarratorId: RUN,
+			subagentType: "general",
+			alias: "race-alias",
+			binding: binding({ cancelWith: undefined }),
+		});
+		const first = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: task.logicalRunId ?? undefined,
+		});
+		const firstRunId = (await first.terminal).logicalRunId as string;
+		await settle(() => !getExecutionOwner(RUN));
+		// Terminal evidence survives in the caller's mailbox, but the stored snapshot is gone.
+		runtimePublication.flushRecipient(CALLER);
+		const noticesBefore = notices().length;
+		const publicationRun = {
+			producerKind: "agent" as const,
+			taskId: RUN,
+			logicalRunId: firstRunId,
+			recipientId: CALLER,
+		};
+		expect(await getRuntimePublicationService().readRunPublicationState(publicationRun)).toEqual({
+			state: "settled",
+			eventKind: "completed",
+		});
+		db.delete(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.messageId, `publication-result:${firstRunId}`))
+			.run();
+		db.delete(narratorMessages)
+			.where(eq(narratorMessages.id, `publication-result:${firstRunId}`))
+			.run();
+		mock.restore();
+		const calls = scriptPasses([]);
+		const resumed = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: firstRunId,
+			recovered: true,
+		});
+		const terminal = await resumed.completion;
+		expect(terminal.logicalRunId).toBe(firstRunId);
+		// No second model pass and no "Publication requires a startup reservation".
+		expect(calls).toHaveLength(0);
+		expect(terminal.finalText).toContain("not executed again");
+		expect(taskRow()).toMatchObject({ status: "completed", logicalRunId: firstRunId });
+		expect(taskRow()?.output).toContain("first run answer");
+		// The parent was still active, so it receives an explanatory terminal ToolResult.
+		expect(toolOutput()).toContain("not executed again");
+		expect(
+			db
+				.select({ status: narratorToolCalls.status })
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, ORIGIN_ROW))
+				.get()?.status,
+		).toBe("success");
+		runtimePublication.flushRecipient(CALLER);
+		expect(notices().slice(noticesBefore)).toHaveLength(0);
+
+		// Once the parent is terminal, another recovery leaves its result untouched.
+		const parentOutputAfter = toolOutput();
+		const again = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: firstRunId,
+			recovered: true,
+		});
+		await again.completion;
+		expect(toolOutput()).toBe(parentOutputAfter);
+
+		// A missing/stale parent tool row must not fail recovery either.
+		db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, ORIGIN_ROW)).run();
+		const withoutParentRow = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: firstRunId,
+			recovered: true,
+		});
+		await expect(withoutParentRow.completion).resolves.toMatchObject({
+			logicalRunId: firstRunId,
+		});
+		expect(calls).toHaveLength(0);
+	});
+
+	test("an unreadable settled run also converges a still-running task projection", async () => {
+		const firstRunId = await endedBackgroundTask();
+		runtimePublication.flushRecipient(CALLER);
+		db.delete(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.messageId, `publication-result:${firstRunId}`))
+			.run();
+		db.delete(narratorMessages)
+			.where(eq(narratorMessages.id, `publication-result:${firstRunId}`))
+			.run();
+		// Simulate a crash between the durable terminal and its task/narrator projections.
+		db.update(backgroundTasks)
+			.set({ status: "running", output: null, completedAt: null })
+			.where(eq(backgroundTasks.id, RUN))
+			.run();
+		db.update(narrators)
+			.set({
+				status: "working",
+				backgroundStatus: "running",
+				backgroundResult: null,
+				backgroundCompletedAt: null,
+			})
+			.where(eq(narrators.id, RUN))
+			.run();
+		const parentOutputBefore = toolOutput();
+
+		mock.restore();
+		const calls = scriptPasses([]);
+		const resumed = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: firstRunId,
+			recovered: true,
+		});
+		await resumed.completion;
+		expect(calls).toHaveLength(0);
+		expect(taskRow()).toMatchObject({ status: "completed", logicalRunId: firstRunId });
+		expect(taskRow()?.output).toContain("not executed again");
+		expect(sessionRow()).toMatchObject({
+			backgroundStatus: "completed",
+			backgroundCompletedAt: expect.any(String),
+		});
+		expect(sessionRow()?.backgroundResult).toContain("not executed again");
+		// The task projection owns this delivery; the parent tool row is not rewritten.
+		expect(toolOutput()).toBe(parentOutputBefore);
+	});
+
+	test("a consumed foreground result with an unreadable snapshot settles the active parent tool", async () => {
+		seed();
+		scriptPasses([async () => ({ finalText: "foreground answer" })]);
+		const first = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			binding: binding(),
+			foreground: true,
+		});
+		const firstRunId = (await first.foreground).logicalRunId as string;
+		await settle(() => !getExecutionOwner(RUN));
+		const publicationRun = {
+			producerKind: "agent" as const,
+			taskId: RUN,
+			logicalRunId: firstRunId,
+			recipientId: CALLER,
+		};
+		expect(await getRuntimePublicationService().readRunPublicationState(publicationRun)).toEqual({
+			state: "settled",
+		});
+		db.delete(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.messageId, `publication-result:${firstRunId}`))
+			.run();
+		db.delete(narratorMessages)
+			.where(eq(narratorMessages.id, `publication-result:${firstRunId}`))
+			.run();
+
+		mock.restore();
+		const calls = scriptPasses([]);
+		const resumed = await startNarratorRun({
+			narratorId: RUN,
+			locale: "en",
+			text: "",
+			resumeRunId: firstRunId,
+			recovered: true,
+		});
+		const terminal = await resumed.completion;
+		expect(terminal.logicalRunId).toBe(firstRunId);
+		expect(calls).toHaveLength(0);
+		// Consumption proves publication, not that the caller wrote its ToolResult.
+		// The still-running parent must be settled instead of left invisible to history.
+		expect(toolOutput()).toContain("not executed again");
+		expect(
+			db
+				.select({ status: narratorToolCalls.status })
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, ORIGIN_ROW))
+				.get()?.status,
+		).toBe("fail");
+	});
+
 	test("retrying a denied tool republishes the task as running, then its new terminal", async () => {
 		const firstRunId = await endedBackgroundTask();
 		// The ended run's last turn is a tool call the user denied.

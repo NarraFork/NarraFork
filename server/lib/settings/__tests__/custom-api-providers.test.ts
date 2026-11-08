@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { getModelOverride, replaceModelOverridesForTests } from "../../model-catalog";
 import {
 	customApiProtocolFromOpenAI,
 	customApiProviderToGemini,
@@ -13,21 +14,22 @@ import {
 import { DEFAULTS } from "../defaults";
 import type { GeminiProviderConfig, NarraForkSettings, OpenAIProviderConfig } from "../types";
 
-/** Provider entries' own windows, as the provider page stores them in the catalog. */
-function withOwnWindows(settings: NarraForkSettings, windows: Record<string, number>): void {
-	settings.agent.modelCatalog = {
-		schemaVersion: 2,
-		migrationVersion: 2,
-		local: {
-			revision: 0,
+const restores: Array<() => void> = [];
+afterEach(() => {
+	while (restores.length) restores.pop()?.();
+});
+
+/** Provider entries' own windows, as the provider page stores them (in memory only). */
+function withOwnWindows(windows: Record<string, number>): void {
+	restores.push(
+		replaceModelOverridesForTests({
 			connections: Object.fromEntries(
-				Object.entries(windows).map(([model, value]) => [model, { working_context_tokens: value }]),
+				Object.entries(windows).map(([model, value]) => [model, { contextWindow: value }]),
 			),
-		},
-		autoApply: false,
-		pinnedVersion: null,
-	};
+		}),
+	);
 }
+const ownWindow = (model: string) => getModelOverride("connection", model)?.contextWindow;
 
 describe("custom API provider migration", () => {
 	test("preserves legacy responsesApi=false as completions-compatible", () => {
@@ -445,7 +447,7 @@ describe("custom API provider migration", () => {
 		];
 		settings.agent.hiddenModels = ["old:hidden"];
 		settings.agent.customModels = [{ value: "old:custom", label: "Custom", provider: "old" }];
-		withOwnWindows(settings, { "old:model-a": 1230, "other:model-b": 4560 });
+		withOwnWindows({ "old:model-a": 1230, "other:model-b": 4560 });
 		settings.agent.providerOrder = ["other", "old"];
 		settings.agent.disabledProviders = ["old"];
 
@@ -475,10 +477,9 @@ describe("custom API provider migration", () => {
 			disabledProviders: ["new"],
 		});
 		expect(settings.agent.modelAggregations?.[0]?.models).toEqual(["new:model-a", "other:model-b"]);
-		expect(settings.agent.modelCatalog?.local.connections).toEqual({
-			"new:model-a": { working_context_tokens: 1230 },
-			"other:model-b": { working_context_tokens: 4560 },
-		});
+		expect(ownWindow("new:model-a")).toBe(1230);
+		expect(ownWindow("old:model-a")).toBeUndefined();
+		expect(ownWindow("other:model-b")).toBe(4560);
 	});
 
 	test("migrates effort keys including aggregate members and preserves per-type tiers", () => {
@@ -522,7 +523,7 @@ describe("custom API provider migration", () => {
 		const settings = structuredClone(DEFAULTS);
 		settings.agent.defaultModel = "old:default";
 		settings.agent.subagentAllowedModels.explore = ["old:model"];
-		withOwnWindows(settings, { "old:model": 1230 });
+		withOwnWindows({ "old:model": 1230 });
 		settings.agent.subagentModelReasoningEfforts = {
 			explore: { "old:model": "high" },
 			review: { "old:model": "low", "new:model": "max" },
@@ -532,6 +533,8 @@ describe("custom API provider migration", () => {
 			migrateProviderPrefixReferences(settings, [{ id: "stable", from: "old", to: "new" }]),
 		).toThrow("would overwrite subagent reasoning effort");
 		expect(settings).toEqual(before);
+		expect(ownWindow("old:model")).toBe(1230);
+		expect(ownWindow("new:model")).toBeUndefined();
 	});
 
 	test("keeps optional map absent when migrating legacy settings", () => {
@@ -556,13 +559,15 @@ describe("custom API provider migration", () => {
 
 	test("rejects prefix migration when context-window targets conflict", () => {
 		const settings = structuredClone(DEFAULTS) as NarraForkSettings;
-		withOwnWindows(settings, { "old:model": 1000, "new:model": 2000 });
+		withOwnWindows({ "old:model": 1000, "new:model": 2000 });
 		settings.agent.defaultModel = "old:default";
 		const before = structuredClone(settings);
 		expect(() =>
 			migrateProviderPrefixReferences(settings, [{ id: "stable", from: "old", to: "new" }]),
 		).toThrow("would overwrite model overrides");
 		expect(settings).toEqual(before);
+		expect(ownWindow("old:model")).toBe(1000);
+		expect(ownWindow("new:model")).toBe(2000);
 	});
 
 	test("rejects prefix migration when custom-model targets conflict", () => {

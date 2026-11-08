@@ -50,7 +50,13 @@
  */
 
 import { knowledgeExcerpt } from "./knowledge-excerpt";
-import { boundOutlineTaskNoticeItems, type OutlineTaskNoticeItem } from "./outline-task-notice";
+import {
+	boundOutlineAnswerNoticeItems,
+	boundOutlineTaskNoticeItems,
+	clipNoticeLine,
+	type OutlineAnswerNoticeItem,
+	type OutlineTaskNoticeItem,
+} from "./outline-task-notice";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Body payloads
@@ -247,13 +253,28 @@ export type SideCarBody =
 	 * A notice about the session's outline tasks, beside its model-facing text (which the producer
 	 * wrote and no template renders): `turnEnd`, a long turn ended with a task still in progress
 	 * (`outline_task_turn_end`); `edited`, people changed tasks of the session
-	 * (`outline_task_edit`). The reader sees the tasks as titled outline links with status chips.
+	 * (`outline_task_edit`); `finished`, tasks the session created were finished by another
+	 * session or a person (`outline_task_finished`, outline P2 PR 9b). The reader sees the tasks as
+	 * titled outline links with status chips.
 	 */
 	| {
 			kind: "outlineTasks";
-			variant: "turnEnd" | "edited";
+			variant: "turnEnd" | "edited" | "finished";
 			items: OutlineTaskNoticeItem[];
 			/** Tasks (or changes) the notice counts without naming. */
+			more?: number;
+	  }
+	/**
+	 * A person answered questions the session asked in the outline (`outline_answer`, outline
+	 * P2 PR 7), beside the model-facing message (which the producer wrote). The reader sees the
+	 * questions as titled outline links with the answers beside them.
+	 */
+	| {
+			kind: "outlineAnswers";
+			/** Who answered: a display name, never their words. */
+			by?: string;
+			items: OutlineAnswerNoticeItem[];
+			/** Questions the delivery counts without naming. */
 			more?: number;
 	  };
 
@@ -268,6 +289,7 @@ const SIDECAR_BODY_KINDS = new Set([
 	"specUpdates",
 	"asyncQuestionAnswers",
 	"outlineTasks",
+	"outlineAnswers",
 ]);
 
 /**
@@ -306,8 +328,23 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			const more = typeof body.more === "number" && body.more > 0 ? Math.floor(body.more) : 0;
 			return {
 				kind: "outlineTasks",
-				variant: body.variant === "edited" ? "edited" : "turnEnd",
+				variant:
+					body.variant === "edited" || body.variant === "finished" ? body.variant : "turnEnd",
 				items: boundOutlineTaskNoticeItems(body.items),
+				...(more > 0 ? { more } : {}),
+			};
+		}
+		case "outlineAnswers": {
+			if (!Array.isArray(body.items)) return undefined;
+			const items = boundOutlineAnswerNoticeItems(body.items);
+			const more =
+				(typeof body.more === "number" && body.more > 0 ? Math.floor(body.more) : 0) +
+				Math.max(0, body.items.length - items.length);
+			const by = typeof body.by === "string" && body.by.trim() ? clipNoticeLine(body.by, 64) : "";
+			return {
+				kind: "outlineAnswers",
+				...(by ? { by } : {}),
+				items,
 				...(more > 0 ? { more } : {}),
 			};
 		}
@@ -422,7 +459,10 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	// Outline task notices (`outlineTasks`).
 	outlineTaskTurnEndHeading: "Still in progress — tick it done when it is",
 	outlineTaskEditedHeading: "{n} task(s) changed by people",
+	outlineTaskFinishedHeading: "{n} task(s) this session created were finished elsewhere",
 	outlineTaskMore: "{n} more not listed",
+	outlineAnswersHeading: "{who} answered {n} question(s)",
+	outlineAnswersSomeone: "Someone",
 	// Generic.
 	empty: "(empty)",
 };
@@ -747,7 +787,26 @@ function projectSideCarBody(
 						? labelWith(labels, "outlineTaskEditedHeading", {
 								n: body.items.length + (body.more ?? 0),
 							})
-						: label(labels, "outlineTaskTurnEndHeading"),
+						: body.variant === "finished"
+							? labelWith(labels, "outlineTaskFinishedHeading", {
+									n: body.items.length + (body.more ?? 0),
+								})
+							: label(labels, "outlineTaskTurnEndHeading"),
+				lines,
+			};
+		}
+
+		case "outlineAnswers": {
+			// Drawn as question rows in the transcript (`pretext-layout/task-notice.ts`); this is
+			// what is left for a reader without them: the heading and how many it left out.
+			const lines: SideCarLine[] = body.more
+				? [{ kind: "meta", text: labelWith(labels, "outlineTaskMore", { n: body.more }) }]
+				: [];
+			return {
+				headline: labelWith(labels, "outlineAnswersHeading", {
+					who: body.by || label(labels, "outlineAnswersSomeone"),
+					n: body.items.length + (body.more ?? 0),
+				}),
 				lines,
 			};
 		}
@@ -936,8 +995,9 @@ export function renderSideCarBodyToText(
 		}
 
 		case "outlineTasks":
-			// Its model-facing text is written by its producer (the outline task prompts) and
-			// stored with the row; no template renders it.
+		case "outlineAnswers":
+			// Its model-facing text is written by its producer (the outline task prompts, the
+			// answer delivery) and stored with the row; no template renders it.
 			return "";
 	}
 }
@@ -1123,6 +1183,7 @@ export function sideCarBodyToPlainText(
 const PLAIN_TICKLESS_SOURCES: ReadonlySet<string> = new Set([
 	"outline_task_turn_end",
 	"outline_task_edit",
+	"outline_task_finished",
 	"interrupt_task_guard",
 ]);
 

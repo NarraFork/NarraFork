@@ -459,11 +459,35 @@
 		},
 		{
 			"idx": 57,
-			"tag": "0057_add-question-reflection-override",
-			"id": "25920868-16cc-4d2a-aceb-8757129d241d",
+			"tag": "0057_outline_digests",
+			"id": "c8e93667-215c-4bc9-b8ec-84ecf074ef84",
 			"prevId": "bda6d6c2-f7b5-4a64-853d-0c2f72edeb47",
 			"version": "7",
-			"snapshotDigest": "c3d63184696e32a4d8b978e1e3d0ee8489523ef76e60a7525eec48535688397d"
+			"snapshotDigest": "fa50fc938d78a7f87584db4f4387ad57634c3269d42074070a53b08a9b6bc63e"
+		},
+		{
+			"idx": 58,
+			"tag": "0058_outline_task_seen",
+			"id": "1a1b92df-c79f-493f-972f-b5da55789ccd",
+			"prevId": "c8e93667-215c-4bc9-b8ec-84ecf074ef84",
+			"version": "7",
+			"snapshotDigest": "a72d6560eaf73674d8d5da3dd89f1ddb64eb93eb3906b2ad8b19c3d8ba45c882"
+		},
+		{
+			"idx": 59,
+			"tag": "0059_usage_daily",
+			"id": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
+			"prevId": "1a1b92df-c79f-493f-972f-b5da55789ccd",
+			"version": "7",
+			"snapshotDigest": "e2635f635c17f1f6f6742876063b58c9ac3734a9d0a99cf5a6437896cc49e6be"
+		},
+		{
+			"idx": 60,
+			"tag": "0060_add-question-reflection-override",
+			"id": "1ebab60c-5206-4565-af03-e1d8342147e0",
+			"prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
+			"version": "7",
+			"snapshotDigest": "c72a83d718b1d4f06ffe3b3030fdc15a18f7d57aa67657a136f95ec545ff8b1e"
 		}
 	]
 }

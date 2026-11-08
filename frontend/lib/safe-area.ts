@@ -72,6 +72,26 @@ export const TOP_BANNER_SAFE_AREA_STYLE = {
  */
 export const APP_SHELL_HEADER_OFFSET = "var(--app-shell-header-offset, 60px)";
 export const APP_SHELL_HEADER_HEIGHT = `calc(60px + ${SAFE_AREA_INSET_TOP})`;
+/**
+ * There is no header row at any width: brand, search and notifications live in the
+ * sidebar (on phones, in the drawer), and each page's title row carries the phone's menu
+ * button. The header element stays because it still owns the top inset, and Main's offset
+ * and the phone drawer's `top` are derived from it; it is only the inset tall (0 on an
+ * ordinary desktop, the status-bar height on a phone).
+ *
+ * `APP_SHELL_HEADER_HEIGHT` is what the header was with a row: still the height of the
+ * setup wizard's phone "return" bar, the one thing that header renders now.
+ */
+export const APP_SHELL_DESKTOP_HEADER_HEIGHT = `calc(0px + ${SAFE_AREA_INSET_TOP})`;
+export const APP_SHELL_HEADER_HEIGHTS = {
+	base: APP_SHELL_DESKTOP_HEADER_HEIGHT,
+	sm: APP_SHELL_DESKTOP_HEADER_HEIGHT,
+} as const;
+/** While the setup wizard's drawer is closed on a phone, the header is its return bar. */
+export const APP_SHELL_WIZARD_HEADER_HEIGHTS = {
+	base: APP_SHELL_HEADER_HEIGHT,
+	sm: APP_SHELL_DESKTOP_HEADER_HEIGHT,
+} as const;
 export const APP_SHELL_MOBILE_NAVBAR_HEIGHT = `calc(${APP_VIEWPORT_BOTTOM} - ${APP_SHELL_HEADER_OFFSET})`;
 export const APP_SHELL_DESKTOP_NAVBAR_HEIGHT = `calc(${APP_VIEWPORT_BOTTOM} - ${SAFE_AREA_INSET_TOP})`;
 

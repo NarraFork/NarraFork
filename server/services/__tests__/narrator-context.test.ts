@@ -3,6 +3,7 @@ import * as agent from "../../lib/agent";
 import { estimateTokens } from "../../lib/agent/estimate-tokens";
 import * as provider from "../../lib/agent/provider";
 import * as requestTracker from "../../lib/api-request-tracker";
+import { replaceModelOverridesForTests } from "../../lib/model-catalog";
 import * as prompts from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { narratorService } from "../narrator-service";
@@ -143,7 +144,6 @@ describe("question inputs in actual summary provider requests", () => {
 	const normalOutput = { text: `NORMAL_OUTPUT_START${"x".repeat(50_000)}NORMAL_OUTPUT_END` };
 	const model = "anthropic:claude-haiku-4-5";
 	const originalSummary = settings.agent.summaryModel;
-	const originalCatalog = settings.agent.modelCatalog;
 	const generateText = mock(async (_text: string, _model: string, _system?: string) => ({
 		text: "Saved summary",
 	}));
@@ -216,7 +216,7 @@ describe("question inputs in actual summary provider requests", () => {
 	beforeEach(() => {
 		generateText.mockClear();
 		settings.agent.summaryModel = model;
-		settings.agent.modelCatalog = catalogWithWindow(model, 40_000);
+		withWindow(model, 40_000);
 		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
 			id: "n-question-summary",
 			contextSummary: "",
@@ -242,7 +242,7 @@ describe("question inputs in actual summary provider requests", () => {
 		tracking.mockRestore();
 		spec.mockRestore();
 		settings.agent.summaryModel = originalSummary;
-		settings.agent.modelCatalog = originalCatalog;
+		restoreWindows();
 	});
 
 	for (const kind of ["compact", "fork"] as const) {
@@ -333,18 +333,15 @@ describe("question inputs in actual summary provider requests", () => {
 	});
 });
 
-/** A provider entry's own working window, held where production holds it: the catalog. */
-function catalogWithWindow(model: string, window: number) {
-	return {
-		schemaVersion: 2 as const,
-		migrationVersion: 2 as const,
-		autoApply: false,
-		pinnedVersion: null,
-		local: {
-			revision: 0,
-			connections: { [model]: { working_context_tokens: window } },
-		},
-	};
+/** A provider entry's own working window, as the provider page saves it (in memory only). */
+const windowRestores: Array<() => void> = [];
+function withWindow(model: string, window: number): void {
+	windowRestores.push(
+		replaceModelOverridesForTests({ connections: { [model]: { contextWindow: window } } }),
+	);
+}
+function restoreWindows(): void {
+	while (windowRestores.length) windowRestores.pop()?.();
 }
 
 describe("compact context-window budget guard", () => {
@@ -367,11 +364,10 @@ describe("compact context-window budget guard", () => {
 
 			const originalDefault = settings.agent.defaultModel;
 			const originalSummary = settings.agent.summaryModel;
-			const originalCatalog = settings.agent.modelCatalog;
 			// 512 * 0.8 = 409 token budget — below the real fixed prompt overhead.
 			settings.agent.defaultModel = "anthropic:claude-haiku-4-5";
 			settings.agent.summaryModel = "anthropic:claude-haiku-4-5";
-			settings.agent.modelCatalog = catalogWithWindow("anthropic:claude-haiku-4-5", 512);
+			withWindow("anthropic:claude-haiku-4-5", 512);
 
 			try {
 				await expect(narratorContext.generateCompactSummary("n-budget", "en")).rejects.toThrow(
@@ -380,7 +376,7 @@ describe("compact context-window budget guard", () => {
 			} finally {
 				settings.agent.defaultModel = originalDefault;
 				settings.agent.summaryModel = originalSummary;
-				settings.agent.modelCatalog = originalCatalog;
+				restoreWindows();
 			}
 		} finally {
 			narratorService.getById = originalGetById;
@@ -392,7 +388,6 @@ describe("compact context-window budget guard", () => {
 describe("compact small positive budgets use actual request capacity", () => {
 	const model = "anthropic:claude-haiku-4-5";
 	const originalSummary = settings.agent.summaryModel;
-	const originalCatalog = settings.agent.modelCatalog;
 	let previousSummary = "";
 	let specContext = "";
 	const message = { id: "small", role: "user" as const, contentText: "Keep the evidence" };
@@ -406,7 +401,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 		previousSummary = "";
 		specContext = "";
 		settings.agent.summaryModel = model;
-		settings.agent.modelCatalog = catalogWithWindow(model, 1_200);
+		withWindow(model, 1_200);
 		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
 			id: "n-small",
 			contextSummary: previousSummary,
@@ -426,7 +421,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 		toolHint.mockRestore();
 		spec.mockRestore();
 		settings.agent.summaryModel = originalSummary;
-		settings.agent.modelCatalog = originalCatalog;
+		restoreWindows();
 	});
 
 	function assertRequestFits(window = 1_200) {
@@ -455,7 +450,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("a positive budget still rejects an unsplittable entry that cannot fit", async () => {
-		settings.agent.modelCatalog = catalogWithWindow(model, 250);
+		withWindow(model, 250);
 		const oversized = { ...message, contentText: "evidence".repeat(100) };
 		await expect(
 			narratorContext.generateCompactSummary("n-small", "en", [oversized]),
@@ -464,7 +459,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("fixed overhead that cannot fit fails with its context-window hint", async () => {
-		settings.agent.modelCatalog = catalogWithWindow(model, 1);
+		withWindow(model, 1);
 		await expect(
 			narratorContext.generateCompactSummary("n-small", "en", [message]),
 		).rejects.toThrow(/context window/i);
@@ -487,7 +482,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	});
 
 	test("cancellation takes priority over an impossible budget or empty history", async () => {
-		settings.agent.modelCatalog = catalogWithWindow(model, 1);
+		withWindow(model, 1);
 		const controller = new AbortController();
 		controller.abort();
 		for (const entries of [[message], []]) {

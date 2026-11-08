@@ -4,6 +4,7 @@
  * strip-and-retry the whole turn dies even though the model is fine.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { replaceModelOverridesForTests } from "../../model-catalog";
 import { settings } from "../../settings";
 import { ProviderInvalidStateError } from "../error-handling";
 import { OpenAIProvider } from "../openai-provider";
@@ -157,33 +158,17 @@ describe("OpenAI request paths", () => {
 	const originalFetch = globalThis.fetch;
 	let requests: Array<Record<string, unknown>> = [];
 	let savedOpenAI: typeof settings.openaiProviders;
-	let savedCatalog: typeof settings.agent.modelCatalog;
+	let restoreOverrides: () => void = () => {};
 
 	beforeEach(() => {
 		resetUnsupportedParameterMemory();
 		requests = [];
 		savedOpenAI = settings.openaiProviders;
-		savedCatalog = settings.agent.modelCatalog;
 		settings.openaiProviders = [...(savedOpenAI ?? []), { ...config }];
-		settings.agent.modelCatalog = {
-			schemaVersion: 2,
-			migrationVersion: 2,
-			autoApply: false,
-			pinnedVersion: null,
-			local: {
-				revision: 1,
-				models: [{ id: "card", metadata: {} }],
-				bindings: [
-					{
-						id: "b",
-						providerId: config.id,
-						upstreamModelId: "gpt-6-astra",
-						modelId: "card",
-						overrides: { max_output_tokens: 2300 },
-					},
-				],
-			},
-		};
+		// The entry's own override declares an output ceiling.
+		restoreOverrides = replaceModelOverridesForTests({
+			connections: { [model]: { maxOutputTokens: 2300 } },
+		});
 
 		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
 			const raw = init?.body;
@@ -202,7 +187,7 @@ describe("OpenAI request paths", () => {
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
 		settings.openaiProviders = savedOpenAI;
-		settings.agent.modelCatalog = savedCatalog;
+		restoreOverrides();
 	});
 
 	test("codex chat omits max_output_tokens even when metadata declares a ceiling", async () => {

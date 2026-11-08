@@ -405,7 +405,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 			case "blocking_compact":
 				return `${t("compacting")} · ${workIndicator.compactProgressFragment}`;
 			case "model_unavailable":
-				return t("status_model_unavailable");
+				return workIndicator.quotaWaitText;
 			case "quota_exhausted":
 				return workIndicator.quotaWaitText;
 			case "spec_task":

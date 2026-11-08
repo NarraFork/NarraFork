@@ -33,6 +33,7 @@ import {
 	workspaceQueryKey,
 } from "../../../hooks/useWorkspace";
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "../../../lib/safe-area";
+import { useWcoTitlebarRows } from "../../../lib/wco-titlebar";
 import type { WebviewLeafConfig } from "../split-tree";
 import { DirectorLayout } from "./DirectorLayout";
 import { type DirectorControl, DockviewWorkspace } from "./DockviewWorkspace";
@@ -212,6 +213,8 @@ export function WorkspacePage({
 					my: "calc(var(--mantine-spacing-md) * -1)",
 				};
 
+	const titlebarRootRef = useWcoTitlebarRows(chrome !== "window" && !isLoading && !!workspace);
+
 	if (isLoading || !workspace) {
 		return (
 			<Box {...shellBoxProps}>
@@ -224,11 +227,21 @@ export function WorkspacePage({
 
 	return (
 		<Box
+			ref={titlebarRootRef}
 			{...shellBoxProps}
+			// Desktop WCO: the toolbar row below is the window title bar (lib/wco-titlebar).
+			data-nf-wco-titlebar={chrome !== "window" || undefined}
 			style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}
 		>
 			{/* Toolbar with editable title */}
-			<Group px="sm" py={4} gap="xs" style={{ flexShrink: 0 }}>
+			<Group
+				px="sm"
+				py={4}
+				gap="xs"
+				wrap="nowrap"
+				data-nf-titlebar-candidate
+				style={{ flexShrink: 0 }}
+			>
 				<Tooltip label={t("listView")}>
 					<ActionIcon size="sm" variant="subtle" component={Link} to="/narrators">
 						<IconArrowLeft size={16} />

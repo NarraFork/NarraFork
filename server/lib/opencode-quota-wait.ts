@@ -1,3 +1,4 @@
+import { isCapacityRefusalText } from "@shared/agent-protocol/quota-exhausted";
 import type { ApiRequestDiagnostics } from "@shared/agent-protocol/types";
 import { isHardUsageLimitText } from "./agent/error-handling";
 import { parseRetryAfterMs } from "./agent/retry-after";
@@ -63,12 +64,18 @@ export const OPENCODE_RATE_LIMIT_SUSPEND_MIN_MS = 30_000;
 /** Length of the rolling window; also the upper bound of its reset. */
 const ROLLING_WINDOW_MS = 5 * 60 * 60 * 1000;
 
-export type OpencodeQuotaBucket = "fiveHour" | "weekly" | "monthly" | "rateLimit" | "other";
+export type OpencodeQuotaBucket =
+	| "fiveHour"
+	| "weekly"
+	| "monthly"
+	| "rateLimit"
+	| "capacity"
+	| "other";
 
 /** Where a resolved reset instant came from, for logs. */
 export type OpencodeResetSource = "retry-after" | "usage" | "message" | "window-rule";
 
-export type OpencodeRefusalKind = "quota" | "rate_limit";
+export type OpencodeRefusalKind = "quota" | "rate_limit" | "capacity";
 
 export interface OpencodeQuotaTarget {
 	bucket: OpencodeQuotaBucket;
@@ -132,6 +139,7 @@ export function classifyOpencodeRefusal(
 	// "usagelimit" and its message says "limit exceeded", which the generic
 	// usage-limit wording below would read as a plan wall.
 	if (QUOTA_CODES.some((code) => text.includes(code))) return "quota";
+	if (isCapacityRefusalText(text)) return "capacity";
 	if (RATE_LIMIT_CODES.some((code) => text.includes(code))) return "rate_limit";
 	if (isHardUsageLimitText(text) || /go usage limit/.test(text)) return "quota";
 	if (
@@ -300,11 +308,12 @@ export function planOpencodeQuotaTarget(input: {
 export function planOpencodeRateLimitWait(
 	headers: Record<string, string> | undefined,
 	now: number,
+	kind: "rate_limit" | "capacity" = "rate_limit",
 ): OpencodeQuotaWaitTarget | OpencodeQuotaRefusalTarget | null {
 	const hint = parseRetryAfterMs(headers, now);
 	if (hint == null || hint < OPENCODE_RATE_LIMIT_SUSPEND_MIN_MS) return null;
 	const target: OpencodeQuotaTarget = {
-		bucket: "rateLimit",
+		bucket: kind === "capacity" ? "capacity" : "rateLimit",
 		resetAt: now + hint,
 		source: "retry-after",
 	};
@@ -344,7 +353,7 @@ export async function resolveOpencodeQuotaTarget(
 	const kind = classifyOpencodeRefusal(errorText, diagnostics);
 	if (!kind) return null;
 	const headers = diagnostics?.responseHeaders;
-	if (kind === "rate_limit") return planOpencodeRateLimitWait(headers, now);
+	if (kind !== "quota") return planOpencodeRateLimitWait(headers, now, kind);
 
 	const messageText = refusalText(errorText, diagnostics);
 	const cached = getOpencodeCachedUsage(providerId);

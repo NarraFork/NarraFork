@@ -17,6 +17,7 @@ import {
 } from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
 import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
@@ -173,7 +174,12 @@ import {
 import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	getQueueDuringCompaction,
+	normalizeAutoModelValueForSave,
+	settings,
+} from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -246,6 +252,7 @@ import {
 	revertPlanIdSchema,
 	rollbackToBlocksSchema,
 } from "../lib/validators/narrators";
+import { outlinePlanDecisionSchema } from "../lib/validators/outline";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
@@ -1421,7 +1428,7 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	const input = parsed.data;
+	const input = { ...parsed.data, model: normalizeAutoModelValueForSave(parsed.data.model) };
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -5131,8 +5138,9 @@ narratorRoutes.patch("/:id/model", async (c) => {
 			c.get("user").sub,
 		);
 	}
-	await narratorService.updateModel(id, parsed.data.model);
-	await updateNarratorModel(id, parsed.data.model);
+	const model = normalizeAutoModelValueForSave(parsed.data.model);
+	await narratorService.updateModel(id, model);
+	await updateNarratorModel(id, model);
 	return c.json({ ok: true });
 });
 
@@ -5236,12 +5244,31 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		columns: { id: true },
 	});
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
+	// An outline session plans in the outline (outline P2 PR 8): its plan root is made or resumed
+	// now, and the result names it instead of a plan file.
+	const { enterOutlinePlanMode } = await import("../services/outline-plan-mode");
+	const outline = await enterOutlinePlanMode({
+		narratorId: id,
+		userId,
+		input: {},
+		locale: locale as Locale,
+		toolCallId: manualToolCall.id,
+		messageId: msg.id,
+	}).catch((error: unknown) => {
+		logger.warn("Outline plan root could not be made on the plan-mode switch", {
+			narratorId: id,
+			error: String(error),
+		});
+		return null;
+	});
 	await narratorService.updateToolCallResult(
 		toolUseId,
 		{
-			output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
-				planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
-			}),
+			output:
+				outline?.output ??
+				getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
+					planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
+				}),
 			status: "success",
 			// The following message broadcast already accounts for this persisted tool state.
 			bumpMessageVersion: false,
@@ -5293,6 +5320,12 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	const message = getToolMessage("planModeCancelled", locale);
 	const cancelledPermissions = await cancelPendingExitPlanMode(id, message);
 	const planState = await exitNarratorPlanMode(id);
+	// An outline session's unapproved plan stays planning (never executed); an empty one goes
+	// (outline P2 PR 8, D48 Q3).
+	if (planState.wasPlanMode) {
+		const { cancelOutlinePlanMode } = await import("../services/outline-plan-mode");
+		await cancelOutlinePlanMode(id, userId);
+	}
 	const active = activeNarrators.get(id);
 	if (active) {
 		active._planFileId = undefined;
@@ -6237,6 +6270,26 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
 	return c.json({ ok: true });
+});
+
+/**
+ * A person's decision on an outline session's submitted plan (outline P2 PR 8, D48): return it,
+ * execute it as a draft, or lock it and execute it. The outline is written first, then the
+ * waiting ExitPlanMode is resolved, so a refused decision (403, 409) leaves it waiting.
+ */
+narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	const user = c.get("user");
+	const parsed = outlinePlanDecisionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
+	const result = await decideOutlinePlanRequest({
+		requestId,
+		principal: { userId: user.sub, isAdmin: user.role === "admin" },
+		body: parsed.data,
+	});
+	const response: OutlinePlanDecisionResponse = { ok: true, commit: result.commit };
+	return c.json(response);
 });
 
 /**

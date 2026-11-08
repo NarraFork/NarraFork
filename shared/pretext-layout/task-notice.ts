@@ -8,9 +8,13 @@
  * status as a chip, and the tasks as rows when unfolded:
  *
  *   - `turnEnd`   — `outline_task_turn_end`: a long turn ended with a task still in progress;
- *   - `edited`    — `outline_task_edit`: people changed tasks of the session;
+ *   - `edited`    — `outline_task_edit`: people changed tasks of the session; also
+ *                   `outline_task_finished`: tasks the session created were finished elsewhere
+ *                   (outline P2 PR 9b), titled by who finished them;
  *   - `interrupt` — `interrupt_task_guard`: the open tasks after a user interrupt (outline and spec);
- *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`).
+ *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`);
+ *   - `answers`   — `outline_answer`: a person answered questions the session asked (outline P2
+ *                   PR 7), the questions as rows with the answers beside them.
  *
  * Everything here is derived from STRUCTURED data the server stored beside the model-facing text
  * (`SideCarBody` `outlineTasks` / `tasks`, a `context_update` row's `display`); nothing parses the
@@ -28,6 +32,7 @@ import { outlineAddressPath } from "../outline-links";
 import {
 	coerceOutlineTasksViewDisplay,
 	OUTLINE_TASKS_VIEW_KEY,
+	type OutlineAnswerNoticeItem,
 	type OutlineTaskNoticeChange,
 	type OutlineTaskNoticeItem,
 	type OutlineTasksViewDisplay,
@@ -35,7 +40,7 @@ import {
 } from "../outline-task-notice";
 import type { SideCarBody, SideCarTaskEntry } from "../sidecar-body";
 
-export type TaskNoticeVariant = "turnEnd" | "edited" | "interrupt" | "view";
+export type TaskNoticeVariant = "turnEnd" | "edited" | "interrupt" | "view" | "answers";
 
 /** A status chip: its words and its Mantine colour. */
 export interface TaskNoticeChip {
@@ -60,6 +65,8 @@ export interface TaskNoticeRow {
 	note?: string;
 	/** A row that names no task ("3 more not listed"): dimmed text only. */
 	dim?: true;
+	/** A row under the one before it (a question's answer): drawn indented, still one line. */
+	indent?: true;
 }
 
 /** The folded line after the notice's title: `lead`, one task row inline, `tail`. */
@@ -67,6 +74,11 @@ export interface TaskNoticeSummary {
 	lead?: string;
 	row?: TaskNoticeRow;
 	tail?: string;
+	/**
+	 * The tail is what the notice is for (a question's answer), so the row's title gives way to it
+	 * rather than the other way round.
+	 */
+	tailFirst?: true;
 }
 
 /** The `system-text` card data of a task notice (`kind: "tasks_notice"`). */
@@ -97,6 +109,7 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeStatusDone: "Done",
 	taskNoticeStatusCancelled: "Cancelled",
 	taskNoticeStatusWaiting: "Waiting",
+	taskNoticeStatusDelegated: "Delegated",
 	taskNoticeMarkHumanCreated: "Set by a person",
 	taskNoticeMarkLocked: "Locked",
 	taskNoticeMarkProtected: "Protected",
@@ -114,6 +127,7 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeJoin: "; ",
 	taskNoticeWhoJoin: ", ",
 	taskNoticeEditedTitle: "{who} changed {n} task(s)",
+	taskNoticeFinishedTitle: "{who} finished {n} task(s) this session created",
 	taskNoticeTurnEndTail: "not ticked done yet",
 	taskNoticeOpenLead: "{n} open:",
 	taskNoticeOpenLeadAtLeast: "at least {n} open:",
@@ -124,8 +138,16 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeViewEmpty: "The current task list is empty",
 	taskNoticeCountDoing: "{n} in progress",
 	taskNoticeCountWaiting: "{n} waiting",
+	taskNoticeCountDelegated: "{n} delegated",
 	taskNoticeCountTodo: "{n} to do",
 	taskNoticeCountSep: " · ",
+	taskNoticeAnswersTitle: "{who} answered {n} question(s)",
+	taskNoticeAnswersSomeone: "Someone",
+	taskNoticeAnswerOption: "option {n}: {option}",
+	taskNoticeAnswerOptionBare: "option {n}",
+	taskNoticeAnswerText: "\u201c{text}\u201d",
+	taskNoticeAnswerAdopted: "your recommendation",
+	taskNoticeAnswerDiffers: "differs from your pick",
 };
 
 type Labels = Readonly<Record<string, string>> | undefined;
@@ -143,6 +165,7 @@ const STATUS_COLOR: Record<string, string> = {
 	done: "green",
 	cancelled: "gray",
 	waiting: "orange",
+	delegated: "violet",
 };
 
 const STATUS_KEY: Record<string, string> = {
@@ -151,6 +174,7 @@ const STATUS_KEY: Record<string, string> = {
 	done: "taskNoticeStatusDone",
 	cancelled: "taskNoticeStatusCancelled",
 	waiting: "taskNoticeStatusWaiting",
+	delegated: "taskNoticeStatusDelegated",
 };
 
 function chip(status: string | undefined | null, labels: Labels): TaskNoticeChip | undefined {
@@ -308,6 +332,9 @@ export function taskNoticeFromBody(
 			);
 		}
 		const people = [...new Set(body.items.map((item) => item.by).filter(Boolean))] as string[];
+		// Tasks the session created that someone else finished (outline P2 PR 9b): one finisher
+		// per notice (one commit), named in the heading.
+		const finished = body.variant === "finished";
 		const showBy = people.length > 1;
 		const rows = body.items.map((item) => itemRow(item, labels, showBy));
 		if (body.more) rows.push(moreRow(body.more, labels));
@@ -322,10 +349,40 @@ export function taskNoticeFromBody(
 					: `${people.slice(0, 3).join(label(labels, "taskNoticeWhoJoin"))}…`;
 		return notice(
 			"edited",
-			people.length === 0 ? sourceTitle : label(labels, "taskNoticeEditedTitle", { who, n }),
+			people.length === 0
+				? sourceTitle
+				: label(labels, finished ? "taskNoticeFinishedTitle" : "taskNoticeEditedTitle", {
+						who,
+						n,
+					}),
 			{
 				row: rows[0],
 				...(n > 1 ? { tail: label(labels, "taskNoticeMoreTail", { n: n - 1 }) } : {}),
+			},
+			rows,
+		);
+	}
+	if (body.kind === "outlineAnswers") {
+		if (body.items.length === 0) return null;
+		// Two rows a question (it, then its answer under it), within the card's rows and a last
+		// row counting the questions left out.
+		const listed = body.items.slice(0, ANSWERS_LISTED);
+		const rows = listed.flatMap((item) => answerRows(item, labels));
+		const left = body.items.length - listed.length + (body.more ?? 0);
+		if (left > 0) rows.push(moreRow(left, labels));
+		const n = body.items.length + (body.more ?? 0);
+		const first = listed[0] as OutlineAnswerNoticeItem;
+		return notice(
+			"answers",
+			label(labels, "taskNoticeAnswersTitle", {
+				who: body.by || label(labels, "taskNoticeAnswersSomeone"),
+				n,
+			}),
+			{
+				// The folded line names the first question and gives its answer the room.
+				row: rows[0] as TaskNoticeRow,
+				tail: answerNote(first, labels),
+				tailFirst: true,
 			},
 			rows,
 		);
@@ -358,6 +415,41 @@ export function taskNoticeFromBody(
 		);
 	}
 	return null;
+}
+
+/** The answer in the reader's words: the option chosen and/or their words, after an arrow. */
+function answerNote(item: OutlineAnswerNoticeItem, labels: Labels): string {
+	const a = item.answer;
+	const parts: string[] = [];
+	if (a.option !== undefined) {
+		parts.push(
+			a.optionText
+				? label(labels, "taskNoticeAnswerOption", { n: a.option, option: a.optionText })
+				: label(labels, "taskNoticeAnswerOptionBare", { n: a.option }),
+		);
+	}
+	if (a.text) parts.push(label(labels, "taskNoticeAnswerText", { text: a.text }));
+	if (a.adopted) parts.push(label(labels, "taskNoticeAnswerAdopted"));
+	return `→ ${parts.join(label(labels, "taskNoticeJoin"))}`;
+}
+
+/** Questions an answer notice lists, two rows each, leaving one row for the rest. */
+const ANSWERS_LISTED = Math.floor((TASK_NOTICE_MAX_ROWS - 1) / 2);
+
+/**
+ * A question (its alias chip, its title as a link) and, on its own indented row under it, the
+ * answer: what the notice is for, so it never shares a line with a long question.
+ */
+function answerRows(item: OutlineAnswerNoticeItem, labels: Labels): TaskNoticeRow[] {
+	return [
+		{
+			...named(item.address, item.question),
+			// The question's alias, as written (case-sensitive): the chip before its title.
+			...(item.alias ? { status: { label: item.alias, color: "teal" } } : {}),
+			...(item.differs ? { marks: [label(labels, "taskNoticeAnswerDiffers")] } : {}),
+		},
+		{ title: answerNote(item, labels), indent: true },
+	];
 }
 
 function interruptRow(task: SideCarTaskEntry, outline: boolean, labels: Labels): TaskNoticeRow {
@@ -445,12 +537,16 @@ function viewNotice(
 			...(task.humanCreated ? { marks: [label(labels, "taskNoticeMarkHumanCreated")] } : {}),
 		};
 	};
+	const delegated = view.delegated ?? [];
 	const rows = [
 		...view.doing.map((task) => row(task, "doing")),
+		// Handed to the session's subagents (outline P2 PR 9b), right after its own work.
+		...delegated.map((task) => row(task, "delegated")),
 		...view.waiting.map((task) => row(task, "waiting")),
 		...view.next.map((task) => row(task, "todo")),
 	];
-	const total = view.counts.doing + view.counts.waiting + view.counts.todo;
+	const delegatedCount = view.counts.delegated ?? 0;
+	const total = view.counts.doing + delegatedCount + view.counts.waiting + view.counts.todo;
 	// A read that stopped early counted only what it read: there are more than `total`.
 	if (view.more) rows.push(moreRow(Math.max(1, total - rows.length), labels, true));
 	else if (total > rows.length) rows.push(moreRow(total - rows.length, labels));
@@ -458,15 +554,23 @@ function viewNotice(
 		return notice("view", title, { lead: label(labels, "taskNoticeViewEmpty") }, []);
 	}
 	// The folded line: the first task listed, then how many of each kind besides it.
-	const first: "doing" | "waiting" | "todo" =
-		view.doing.length > 0 ? "doing" : view.waiting.length > 0 ? "waiting" : "todo";
+	const first: "doing" | "delegated" | "waiting" | "todo" =
+		view.doing.length > 0
+			? "doing"
+			: delegated.length > 0
+				? "delegated"
+				: view.waiting.length > 0
+					? "waiting"
+					: "todo";
 	const left = {
 		doing: view.counts.doing - (first === "doing" ? 1 : 0),
+		delegated: delegatedCount - (first === "delegated" ? 1 : 0),
 		waiting: view.counts.waiting - (first === "waiting" ? 1 : 0),
 		todo: view.counts.todo - (first === "todo" ? 1 : 0),
 	};
 	const counts = [
 		left.doing > 0 ? label(labels, "taskNoticeCountDoing", { n: left.doing }) : null,
+		left.delegated > 0 ? label(labels, "taskNoticeCountDelegated", { n: left.delegated }) : null,
 		left.waiting > 0 ? label(labels, "taskNoticeCountWaiting", { n: left.waiting }) : null,
 		left.todo > 0 ? label(labels, "taskNoticeCountTodo", { n: left.todo }) : null,
 	].filter((part): part is string => !!part);

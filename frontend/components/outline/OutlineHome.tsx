@@ -20,7 +20,7 @@ import {
 import { useDebouncedValue } from "@mantine/hooks";
 import type { OutlineSpaceKind, OutlineSpaceSummary } from "@shared/outline-api";
 import { IconFolder, IconMessages, IconSearch, IconUser } from "@tabler/icons-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useEnsurePersonalOutlineSpace,
@@ -69,7 +69,8 @@ function SpaceCard({ space }: { space: OutlineSpaceSummary }) {
 	);
 }
 
-export function OutlineHome() {
+/** `header`: the host's entry above the title (the outline route's reports entry). */
+export function OutlineHome({ header }: { header?: ReactNode } = {}) {
 	const { t } = useTranslation("outline");
 	const { mutate: ensurePersonal } = useEnsurePersonalOutlineSpace();
 	const ensured = useRef(false);
@@ -93,6 +94,7 @@ export function OutlineHome() {
 
 	return (
 		<Stack gap="lg">
+			{header}
 			<Stack gap={4}>
 				<Title order={2}>{t("title")}</Title>
 				<Text size="sm" c="dimmed">

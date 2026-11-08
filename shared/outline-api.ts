@@ -13,7 +13,7 @@ export type OutlineViewMode = "facts" | "all";
 
 export type OutlineActorKind = "human" | "agent" | "system";
 
-export type OutlineCommitKind = "edit" | "revert" | "import" | "confirm" | "answer";
+export type OutlineCommitKind = "edit" | "revert" | "import" | "confirm" | "answer" | "plan";
 
 export type OutlineTaskStatus = "todo" | "doing" | "done" | "cancelled";
 
@@ -596,4 +596,134 @@ export interface OutlineDigestResponse {
 	items: OutlineDigestItem[];
 	/** More than shown. */
 	truncated: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plans (outline P2 PR 8): a plan is a task tree; ExitPlanMode submits its root, and the person
+// decides against the diff from the previous version.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A task's fields as a plan diff shows them. */
+export interface OutlinePlanTaskView {
+	status: OutlineTaskStatus;
+	assignee: string | null;
+	due: string | null;
+	depends: string[];
+}
+
+/** What changed about one block of a plan. */
+export type OutlinePlanChange = "added" | "removed" | "text" | "task" | "moved";
+
+/** One block of a plan's diff against its previous version, in tree order. */
+export interface OutlinePlanDiffEntry {
+	blockId: string;
+	sid: string;
+	changes: OutlinePlanChange[];
+	/** Depth under the plan root (0: the root), in the tree it is shown from (removed: before). */
+	depth: number;
+	/** The text before and after (clipped); null when the block was not there. */
+	before: string | null;
+	after: string | null;
+	/** The task fields before and after; null when it was not a task (or not there). */
+	taskBefore: OutlinePlanTaskView | null;
+	taskAfter: OutlinePlanTaskView | null;
+	/** For an added, moved or removed block: its parent's title (where it is, or was). */
+	parentTitle?: string | null;
+}
+
+/** How many blocks of each kind a plan diff has (each block counted once per change). */
+export interface OutlinePlanDiffCounts {
+	added: number;
+	removed: number;
+	text: number;
+	task: number;
+	moved: number;
+}
+
+/** `GET /plans/:blockId/diff`: a plan against the version it is compared with (bounded). */
+export interface OutlinePlanDiffResponse {
+	root: { blockId: string; spaceId: string; address: string; title: string };
+	/** The seq compared from (0: nothing before, everything is new) and the seq shown. */
+	fromSeq: number;
+	toSeq: number;
+	counts: OutlinePlanDiffCounts;
+	entries: OutlinePlanDiffEntry[];
+	/** More changes than shown, or a plan larger than one diff reads. */
+	truncated: boolean;
+}
+
+/** One comment of a plan review (outline P2 PR 8b): a child block of the review's block. */
+export interface OutlinePlanReviewComment {
+	/** The comment's text, without the link to its target. */
+	text: string;
+	/** The block of the plan it is about, when it names one. */
+	target: { address: string; title: string } | null;
+}
+
+/**
+ * A plan review's comments (outline P2 PR 8b, D48 Q1): one block 「审查意见（第 N 版）」 under the
+ * plan root, each comment a child of it. The person decides with them in view; nothing goes back
+ * to the planning agent until they decide.
+ */
+export interface OutlinePlanReview {
+	/** The review's block under the plan root, and its address. */
+	blockId: string;
+	address: string;
+	/** The version reviewed. */
+	round: number;
+	/** How many comments it holds (as written). */
+	count: number;
+	/** The comments as written, at most `OUTLINE_PLAN_LIMITS.reviewComments`. */
+	comments: OutlinePlanReviewComment[];
+	/**
+	 * The seq of the version the review reviewed (the submission's): what the person changed
+	 * since then is what the agent is told they changed while deciding.
+	 */
+	submittedSeq: number;
+}
+
+/**
+ * What a pending ExitPlanMode of an outline session carries in its input (`_planRoot`,
+ * `_planSeq`, `_planBaseSeq`, `_planDiff`, `_planReview`): enough for the approval card to show
+ * its summary and fetch the diff.
+ */
+export interface OutlinePlanSubmission {
+	root: {
+		blockId: string;
+		spaceId: string;
+		/** The page the plan is on (what the card subscribes to, to refresh its diff). */
+		pageId: string;
+		address: string;
+		title: string;
+		round: number;
+	};
+	/** The seq of the version submitted. */
+	seq: number;
+	/** The seq it is compared with. */
+	baseSeq: number;
+	counts: OutlinePlanDiffCounts;
+	truncated: boolean;
+	/** What the agent said changed in this version. */
+	summary: string | null;
+	/** The plan review's comments on this version, when a review left any (PR 8b). */
+	review: OutlinePlanReview | null;
+}
+
+/** `POST /narrators/permissions/:requestId/plan`: the person's decision on a submitted plan. */
+export interface OutlinePlanDecisionRequest {
+	/** `return`: back to the agent with feedback; `draft`: execute; `lock`: lock, then execute. */
+	action: "return" | "draft" | "lock";
+	feedback?: string;
+	/** `lock`: the session that may confirm step changes on the person's behalf. */
+	delegate?: string | null;
+	/** The seq of the diff the person looked at: a change by someone else since is a 409. */
+	seenSeq: number;
+	/** Reset the context onto the plan before executing. */
+	compactAfter?: boolean;
+}
+
+export interface OutlinePlanDecisionResponse {
+	ok: true;
+	/** The commit the decision wrote. */
+	commit: { id: string; seq: number } | null;
 }

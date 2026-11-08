@@ -365,7 +365,7 @@ describe("kimi quota wait wiring", () => {
 		// One shared generator emits the suspension; both refusal paths must call it.
 		expect(loopSource.match(/resolveProviderQuotaWait\(/g)?.length).toBe(1);
 		expect(loopSource.match(/yield\* tryQuotaSuspension\(/g)?.length).toBe(2);
-		expect(loopSource.match(/waitKind: "quota"/g)?.length).toBe(1);
+		expect(loopSource.match(/waitKind: decided\.waitKind \?\? "quota"/g)?.length).toBe(1);
 	});
 
 	test("the suspension carries both the wake instant and the upstream reset", () => {

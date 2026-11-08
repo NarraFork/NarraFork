@@ -1027,6 +1027,8 @@ const productionDependencies: FileReferenceDependencies = {
 				[
 					"settings.json",
 					"codex-credentials.json",
+					"provider-keys.json",
+					"secret.key",
 					"update-server.json",
 					"update-server-test.json",
 					"narrafork.lock",

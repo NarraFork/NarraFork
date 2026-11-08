@@ -26,14 +26,21 @@ import {
 	AGG_MODEL_PREFIX,
 	buildAggModelValue,
 	FOLLOW_PARENT_MODEL,
+	isAutoModelOptionValue,
 	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
+import { formatCountdown } from "../../../lib/relative-time";
 import { modelInheritanceLabel } from "./model-inheritance-label";
 import {
+	AUTO_FAMILY_GROUP_PREFIX,
+	autoChoiceReason,
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
+	familyLabel,
+	formatReferencePrice,
+	groupModelOptions,
 	modelMenuSelection,
 	modelProviderPrefix,
 	orderModelGroupEntries,
@@ -45,7 +52,7 @@ import type { ProviderQuotaBadge } from "./use-opencode-provider-badges";
 import type { ProviderBalanceBadge } from "./use-provider-balance-badges";
 
 /** Model-menu meta groups; they are not providers, so they get no provider actions. */
-const META_GROUPS = new Set(["__default__", "__summary__", "__agg__", "unknown"]);
+const META_GROUPS = new Set(["__default__", "__summary__", "__auto__", "__agg__", "unknown"]);
 
 /**
  * The provider-grouped model list rendered inside a narrator's model menu.
@@ -184,19 +191,35 @@ export function ModelMenuItems({
 	useEffect(() => {
 		if (opened) onPickerOpenedRef.current?.();
 	}, [opened]);
-	const groups = new Map<string, ModelOption[]>();
-	for (const m of allModels) {
-		const prov = m.provider ?? "unknown";
-		if (!groups.has(prov)) groups.set(prov, []);
-		groups.get(prov)?.push(m);
-	}
+	// Auto models by vendor family; a service keeps only the models no auto row lists.
+	const groups = groupModelOptions(allModels, currentModel || "");
 	const provLabels: Record<string, string> = {
 		openai: "OpenAI",
 		...providerLabels,
 		__default__: t("modelGroupDefault"),
 		__summary__: t("modelGroupSummary"),
+		__auto__: t("modelGroupAuto"),
 		__agg__: t("modelGroupAggregations"),
 	};
+	for (const key of groups.keys()) {
+		if (!key.startsWith(AUTO_FAMILY_GROUP_PREFIX)) continue;
+		const family = key.slice(AUTO_FAMILY_GROUP_PREFIX.length);
+		provLabels[key] = family
+			? t("modelGroupFamily", { family: familyLabel(family) })
+			: t("modelGroupFamilyOther");
+	}
+	// The auto row a pinned source belongs to: `codex:gpt-5.5` sits under `auto:gpt-5.5`
+	// when that row lists it, so the picker can show the pin inside its model.
+	const autoRowOfSource = new Map<string, string>();
+	for (const option of allModels) {
+		for (const source of option.autoSources ?? []) {
+			if (!autoRowOfSource.has(source.value)) autoRowOfSource.set(source.value, option.value);
+		}
+	}
+	const currentValue = currentModel || "";
+	const expandedAutoRow = isAutoModelOptionValue(currentValue)
+		? currentValue
+		: autoRowOfSource.get(currentValue);
 	// Default, Summary, and Aggregations stay pinned at the top. Every provider
 	// group is sorted alphabetically by its display label.
 	const entries = orderModelGroupEntries([...groups.entries()], (prov) => provLabels[prov] ?? prov);
@@ -220,6 +243,11 @@ export function ModelMenuItems({
 							roleTargetValue ?? "",
 							modelProviderPrefix(roleTargetValue) ?? "",
 							m.rateMultiplier != null ? String(m.rateMultiplier) : "",
+							// An auto row is found by the services that serve it, too.
+							...(m.autoSources ?? []).flatMap((source) => [
+								source.value,
+								provLabels[source.provider] ?? source.provider,
+							]),
 						]
 							.join(" ")
 							.toLowerCase();
@@ -303,7 +331,8 @@ export function ModelMenuItems({
 						: isSummaryGroup
 							? onEditSummaryModel
 							: undefined;
-					const isProviderGroup = !META_GROUPS.has(prov);
+					const isProviderGroup =
+						!META_GROUPS.has(prov) && !prov.startsWith(AUTO_FAMILY_GROUP_PREFIX);
 					const actions = isProviderGroup ? providerActions?.[prov] : undefined;
 					const headerIcon = (props: {
 						key: string;
@@ -471,9 +500,20 @@ export function ModelMenuItems({
 								// For aggregation items, check if the current model's aggId matches
 								const isAggItem = m.provider === "__agg__";
 								const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
+								const isAutoItem = !!m.autoSources;
+								// An auto row is selected for itself and for any of its pinned sources.
 								const selected = isAggItem
 									? currentAgg?.aggId === aggId
-									: selection.value === m.value;
+									: isAutoItem
+										? expandedAutoRow === m.value
+										: selection.value === m.value;
+								const showAutoSources = isAutoItem && expandedAutoRow === m.value;
+								// What "auto" would use now: the first source that can serve.
+								const autoChoice =
+									m.autoSources?.find((source) => source.available) ?? m.autoSources?.[0];
+								const autoReason = showAutoSources
+									? autoChoiceReason(m.autoSources ?? [], provLabels, t)
+									: null;
 								// Default/Summary rows sit under a role header, not a provider group,
 								// so surface the resolved target's provider prefix as a small line.
 								const roleTargetValue =
@@ -499,7 +539,7 @@ export function ModelMenuItems({
 									current: boolean;
 									onSelect: () => void;
 								}> = [];
-								if (onShowPrice && !m.value.startsWith(AGG_MODEL_PREFIX)) {
+								if (onShowPrice && !m.value.startsWith(AGG_MODEL_PREFIX) && !isAutoItem) {
 									rowActions.push({
 										key: "details",
 										label: ts("catalog.details"),
@@ -567,8 +607,9 @@ export function ModelMenuItems({
 									<Fragment key={m.value}>
 										<Menu.Item
 											ref={
-												selection.targetValue === m.value &&
-												(!showMembers || !!currentAgg?.pinnedModel)
+												(selection.targetValue === m.value &&
+													(!showMembers || !!currentAgg?.pinnedModel)) ||
+												(isAutoItem && selection.value === m.value)
 													? selectedItemRef
 													: undefined
 											}
@@ -590,9 +631,15 @@ export function ModelMenuItems({
 															×{m.rateMultiplier}
 														</Badge>
 													)}
+													{/* An auto row is checked only for `auto:` itself; a pinned source checks its own entry. */}
 													<IconCheck
 														size={14}
-														style={{ visibility: selected ? "visible" : "hidden" }}
+														style={{
+															visibility:
+																selected && (!isAutoItem || selection.value === m.value)
+																	? "visible"
+																	: "hidden",
+														}}
 													/>
 													{showActionsToggle && (
 														<ActionIcon
@@ -628,6 +675,13 @@ export function ModelMenuItems({
 												<Text size="sm" inherit>
 													{m.label}
 												</Text>
+												{autoChoice && (
+													<Text size="xs" c="dimmed" lh={1.3}>
+														{t("autoCurrentSource", {
+															provider: provLabels[autoChoice.provider] ?? autoChoice.provider,
+														})}
+													</Text>
+												)}
 												{catalogMissingHint && (
 													<Group gap={4} wrap="nowrap" mt={2} align="flex-start">
 														<IconAlertTriangle size={12} color="var(--mantine-color-orange-6)" />
@@ -662,6 +716,128 @@ export function ModelMenuItems({
 												))}
 											</Box>
 										)}
+										{showAutoSources &&
+											[
+												{
+													value: m.value,
+													provider: "",
+													available: true,
+													subscription: false,
+													referencePrice: undefined,
+												},
+												...(m.autoSources ?? []),
+											].map((source) => {
+												const isAutoEntry = source.value === m.value;
+												const sourceSelected = source.value === selection.value;
+												const providerLabel = provLabels[source.provider] ?? source.provider;
+												// The same allowance bars the provider's own group header shows.
+												const quota = isAutoEntry ? undefined : providerBadges?.[source.provider];
+												const price = isAutoEntry
+													? null
+													: formatReferencePrice(source.referencePrice);
+												const resetIn =
+													!isAutoEntry && !source.available && source.resetsAt
+														? formatCountdown(source.resetsAt)
+														: undefined;
+												return (
+													<Menu.Item
+														key={`auto-source:${source.value}`}
+														ref={sourceSelected && !isAutoEntry ? selectedItemRef : undefined}
+														pl="xl"
+														fw={sourceSelected ? 600 : 400}
+														c={!isAutoEntry && !source.available ? "dimmed" : undefined}
+														onClick={() => onSelect(source.value)}
+														data-auto-source={isAutoEntry ? "auto" : source.value}
+														rightSection={
+															<Group gap={4} wrap="nowrap">
+																{quota?.bars && quota.bars.length > 0 && (
+																	<Tooltip
+																		label={quota.tooltip}
+																		disabled={!quota.tooltip}
+																		multiline
+																		withinPortal
+																		style={{ whiteSpace: "pre-line" }}
+																	>
+																		<span
+																			role="img"
+																			aria-label={quota.text}
+																			style={{ display: "inline-flex", flexShrink: 0 }}
+																		>
+																			<QuotaWindowBars
+																				bars={quota.bars}
+																				size="xs"
+																				stale={quota.stale}
+																			/>
+																		</span>
+																	</Tooltip>
+																)}
+																{!isAutoEntry && source.subscription && (
+																	<Badge size="xs" variant="light" color="teal">
+																		{t("autoSourceSubscription")}
+																	</Badge>
+																)}
+																{!isAutoEntry && !source.available && (
+																	<Badge size="xs" variant="light" color="yellow">
+																		{t("modelTemporarilyUnavailable")}
+																	</Badge>
+																)}
+																<IconCheck
+																	size={14}
+																	style={{ visibility: sourceSelected ? "visible" : "hidden" }}
+																/>
+																{!isAutoEntry && onOpenProviderSettings && (
+																	<ActionIcon
+																		component="div"
+																		role="button"
+																		tabIndex={0}
+																		variant="subtle"
+																		color="gray"
+																		size="sm"
+																		aria-label={t("autoSourceSettings", {
+																			provider: providerLabel,
+																		})}
+																		title={t("autoSourceSettings", { provider: providerLabel })}
+																		onClick={(e) => {
+																			e.stopPropagation();
+																			e.preventDefault();
+																			onOpenProviderSettings(source.provider);
+																		}}
+																	>
+																		<IconDotsVertical size={14} />
+																	</ActionIcon>
+																)}
+															</Group>
+														}
+													>
+														<Text
+															size="sm"
+															style={{ overflowWrap: "anywhere", whiteSpace: "normal" }}
+														>
+															{isAutoEntry ? t("autoSourceAuto") : providerLabel}
+														</Text>
+														{isAutoEntry && autoReason && (
+															<Text size="xs" c="dimmed" lh={1.3}>
+																{autoReason}
+															</Text>
+														)}
+														{price && (
+															<Text size="xs" c="dimmed" lh={1.3}>
+																{t("autoSourcePrice", { price })}
+															</Text>
+														)}
+														{!isAutoEntry && source.credentialLabel && (
+															<Text size="xs" c="dimmed" lh={1.3} truncate>
+																{t("autoSourceCredential", { label: source.credentialLabel })}
+															</Text>
+														)}
+														{resetIn && (
+															<Text size="xs" c="dimmed" lh={1.3}>
+																{t("autoSourceResetsIn", { time: resetIn })}
+															</Text>
+														)}
+													</Menu.Item>
+												);
+											})}
 										{showMembers &&
 											aggId &&
 											[undefined, ...selection.members].map((member) => {

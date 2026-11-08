@@ -607,7 +607,13 @@ export const miscApi = {
 		),
 	codexCredentialUpdate: (
 		id: string,
-		data: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+		data: {
+			displayName?: string;
+			priority?: number;
+			useCreditQuota?: boolean;
+			/** `null` clears the account's network identity back to the Codex settings. */
+			network?: import("@shared/credential-network").CredentialNetwork | null;
+		},
 	) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
 			method: "PATCH",
@@ -1108,7 +1114,7 @@ export const miscApi = {
 			body: JSON.stringify({ parent, name }),
 		}),
 	/**
-	 * Open a directory in the server host's file manager.
+	 * Open a directory, or select a file, in the server host's file manager.
 	 *
 	 * On Windows the server answers with a one-time `narrafork://` URI instead of launching Explorer
 	 * itself; opening it from the page lets Explorer come to the foreground.

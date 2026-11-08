@@ -22,6 +22,8 @@ export interface BackendProcessOptions extends ListenTarget {
 	onLine: (line: string) => void;
 	/** 状态变化；`detail` 用于异常退出等需要说明的情形。 */
 	onState: (state: BackendState, detail?: string) => void;
+	/** 启动状态页开始应答：服务还在启动，但已经可以打开前端看进度。 */
+	onStartupPage?: () => void;
 }
 
 /** 健康检查间隔；超过提示时间仍未就绪只记一次日志（多半在迁移数据库），不判失败。 */
@@ -303,6 +305,11 @@ export class BackendProcess {
 		if (!event) return;
 		if (event.kind === "lock") {
 			this.lockConflictPid = event.pid;
+			return;
+		}
+		if (event.startupPage) {
+			// 只是状态页在应答（同一地址），健康检查仍要等 `running on`。
+			if (this.state === "starting") this.options.onStartupPage?.();
 			return;
 		}
 		this.observedProtocol = event.protocol;

@@ -767,6 +767,7 @@ export function resolvePermissionDecision(
 		planFilePath: designatedPlanFilePath,
 		relaxedPlan = false,
 		planMode = false,
+		outlinePlan = false,
 		meta,
 		projectGitPath,
 		executionBackend,
@@ -842,7 +843,19 @@ export function resolvePermissionDecision(
 	// A question put to a person writes one block under the task (outline P2 PR 7).
 	if (toolName === OUTLINE_ASK_TOOL) return "allow";
 
-	const planFileCandidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
+	const planFileCandidates = outlinePlan
+		? []
+		: planFileWriteCandidates(planFileId, designatedPlanFilePath);
+	if (planMode && outlinePlan && !relaxedPlan && (toolName === "Write" || toolName === "Edit")) {
+		if (meta) {
+			meta.blacklistReason =
+				"Plan mode: this session's plan is a task tree in the outline, not a file. " +
+				"Write it under the plan root with OutlineEdit, then call ExitPlanMode. " +
+				"Only after the user approves your plan can you implement changes.";
+			meta.planModeSoftDeny = true;
+		}
+		return "deny";
+	}
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileCandidates.length > 0) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
@@ -1449,6 +1462,11 @@ export interface PermissionDecisionOpts {
 	 */
 	planFilePath?: string;
 	planMode?: boolean;
+	/**
+	 * The session plans in the outline (outline P2 PR 8): plan mode has no plan file, so strict
+	 * planning allows no file write at all.
+	 */
+	outlinePlan?: boolean;
 	/** Hard Bash policy for review follow-up subagents. */
 	reviewReadOnlyBash?: boolean;
 	whitelistDirs?: WhitelistDir[];
@@ -3586,14 +3604,44 @@ function isPlanFileReadAuthorized(
 export async function resolveExitPlanModeInputWithBackend(
 	narratorId: string,
 	cwd: string,
-	input: Record<string, unknown>,
+	rawInput: Record<string, unknown>,
 	locale: Locale = "en",
 	isRelaxedPlan = false,
 	backend: ExecutionBackend = localBackend,
 	executionTarget?: ToolExecutionTarget,
 	designatedPlanPath?: string,
 	planReadPolicy?: PlanFileReadPolicy,
+	/** The call was persisted before (restored after a restart; outline P2 PR 8 review N3). */
+	recovered = false,
+	/**
+	 * The call itself (outline P2 PR 8b): an outline plan's review is the one handed on for this
+	 * tool use, and counts only as written for this tool call.
+	 */
+	call: { toolUseId?: string | null; toolCallId?: string | null } = {},
 ): Promise<ExitPlanModeInputResolution> {
+	// An outline session plans in the outline (outline P2 PR 8): the plan is its task tree, read
+	// as of now. A plan-file cycle begun before that keeps this flow (null).
+	const { resolveOutlineExitPlanInput, withoutOutlinePlanKeys } = await import(
+		"./outline-plan-mode"
+	);
+	const outline = await resolveOutlineExitPlanInput(narratorId, rawInput, locale, {
+		recovered,
+		toolUseId: call.toolUseId ?? null,
+		toolCallId: call.toolCallId ?? null,
+	});
+	if (outline) {
+		return outline.ok
+			? {
+					ok: true,
+					input: outline.input,
+					resolvedFromFile: false,
+					planSource: { kind: "inline" },
+				}
+			: { ok: false, message: outline.message, input: outline.input, resolvedFromFile: false };
+	}
+	// The keys of an outline submission are the server's own: on any other path they are dropped,
+	// so a model cannot make a spec plan read as an outline one (review round 1 S6).
+	const input = withoutOutlinePlanKeys(rawInput);
 	const active = activeNarrators.get(narratorId);
 	const planFileId = active?._planFileId;
 	const allowInlinePlan = settings.agent.planModeAllowInlinePlan;
@@ -5517,11 +5565,17 @@ export async function handlePermission(
 			executionContext.target as ToolExecutionTarget,
 			activeNarrators.get(narratorId)?._planFilePath,
 			{ narratorId, compiledPolicy },
+			isRecoveredHumanPermission(getPermissionRecovery(options)),
+			{ toolUseId, toolCallId: permissionToolCallId || null },
 		);
+		// An outline plan is the outline itself (outline P2 PR 8b, review round 1): one that changed
+		// while it waited is put to the person again as it is now (they see the changes, and the
+		// agent is told of them), never sent back to the agent. A plan file stays refused.
 		if (
 			isRecoveredHumanPermission(getPermissionRecovery(options)) &&
 			typeof input.plan === "string" &&
-			input.plan !== resolved.input.plan
+			input.plan !== resolved.input.plan &&
+			!(resolved.ok && resolved.input._planRoot)
 		) {
 			return { behavior: "deny", message: "Plan changed while its approval was awaiting a user" };
 		}
@@ -5550,6 +5604,12 @@ export async function handlePermission(
 			: runtimeConstraint && oauthKnowledgeCapability === "write"
 				? "bypassPermissions"
 				: permMode;
+	// An outline session plans in the outline, without a plan file (outline P2 PR 8).
+	// A plan-file cycle begun before PR 8 keeps writing its file (review round 1 S7).
+	const outlinePlanSession =
+		isPlanMode &&
+		(toolName === "Write" || toolName === "Edit") &&
+		(await (await import("./outline-plan-mode")).outlinePlanCycle(narratorId))?.kind === "outline";
 	let decision =
 		toolName === "Send" &&
 		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))
@@ -5563,6 +5623,7 @@ export async function handlePermission(
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
+					outlinePlan: outlinePlanSession,
 					reviewReadOnlyBash,
 					compiledPolicy,
 					executionContext,
@@ -6517,6 +6578,11 @@ export interface ResolvePermissionOpts {
 	 */
 	decidedBy?: "user" | "auto" | "reflection" | `narrator:${string}`;
 	exitPlanCancelled?: boolean;
+	/**
+	 * ExitPlanMode of an outline session returned on the card (`outline-plan-mode.ts`): the tool
+	 * result the agent gets, as is.
+	 */
+	outlinePlanMessage?: string;
 }
 
 type DangerReflectionDecidedBy = "reflection" | "user" | "auto" | `narrator:${string}`;
@@ -6574,6 +6640,7 @@ export async function resolvePermission(
 		userId,
 		decidedBy = "user",
 		exitPlanCancelled,
+		outlinePlanMessage,
 	} = opts;
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -6795,7 +6862,9 @@ export async function resolvePermission(
 			// `activeNarrators` instead resolved to undefined for every subagent and
 			// silently degraded this message to English for Chinese users.
 			const locale = pending.locale ?? "en";
-			if (exitPlanCancelled && userFeedback) {
+			if (outlinePlanMessage) {
+				pending.resolve({ behavior: "deny", message: outlinePlanMessage, rawMessage: true });
+			} else if (exitPlanCancelled && userFeedback) {
 				pending.resolve({ behavior: "deny", message: userFeedback, rawMessage: true });
 			} else {
 				const denyKey = pending.planSubmittedFromFile

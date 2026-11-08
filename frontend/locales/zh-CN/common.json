@@ -303,6 +303,8 @@
 	"activeBackgroundTasks": "{{count}} 个后台任务正在运行",
 	"activeBackgroundServices": "{{count}} 个后台服务正在运行",
 	"viewersWatching": "{{count}} 人正在查看",
+	"recentTabScheduled": "由定时任务启动",
+	"recentTabHasDraft": "有未发送的草稿",
 	"containerRunning": "容器运行中",
 	"containerPaused": "容器已暂停",
 	"containerStopped": "容器已停止",

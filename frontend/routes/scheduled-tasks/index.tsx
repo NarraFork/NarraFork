@@ -1,3 +1,4 @@
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import {
 	ActionIcon,
 	Alert,
@@ -216,7 +217,8 @@ function ScheduledTasksPage() {
 			</style>
 			<Group justify="space-between" mb="md" align="flex-start">
 				<Stack gap={4}>
-					<Group gap="xs">
+					<Group gap="xs" wrap="nowrap">
+						<MobileNavButton />
 						<IconClock size={22} />
 						<Title order={2}>{t("title")}</Title>
 					</Group>

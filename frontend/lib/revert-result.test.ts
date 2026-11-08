@@ -10,6 +10,7 @@ import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
 	invalidateRevertQueries,
+	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "./revert-result";
 
@@ -166,6 +167,26 @@ test("history success requires an explicit complete acknowledgement", () => {
 		expect(isRevertHistoryCommitted(value)).toBe(false);
 	expect(extractRevertResult(new Error("lost response"))).toBeNull();
 	expect(extractRevertResult({ ...partial, files: [null] })).toBeNull();
+});
+
+test("only a fully restored partial-coverage plan counts as its reviewed outcome", () => {
+	const restored = {
+		...partial,
+		reason: "SELECTED_HISTORY_UNAVAILABLE",
+		files: partial.files.filter((file) => file.status === "applied" || file.status === "unchanged"),
+	};
+	expect(isAvailableFilesRestored(restored)).toBe(true);
+	expect(isAvailableFilesRestored(new ApiError("conflict", 409, { ...restored }))).toBe(true);
+	expect(isAvailableFilesRestored({ ...restored, files: [] })).toBe(true);
+	for (const value of [
+		{ ...restored, files: partial.files },
+		{ ...restored, reason: "history retained after file failure" },
+		{ ...restored, reason: "CANCELLED", journalStatus: "cancelled", status: "cancelled" },
+		{ ...restored, settling: true },
+		{ ...restored, historyCommitted: true },
+		committed,
+	])
+		expect(isAvailableFilesRestored(value)).toBe(false);
 });
 
 test("network failures remain errors without fabricated file or history outcomes", async () => {

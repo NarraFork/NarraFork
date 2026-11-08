@@ -31,9 +31,13 @@ export interface RecentTabDropRow {
 }
 
 export type RecentTabDropTarget =
-	/** Top-level placement next to a top-level unit (a folder anchor means the whole folder). */
-	| { kind: "before"; key: string }
-	| { kind: "after"; key: string }
+	/**
+	 * Top-level placement next to a top-level unit (a folder anchor means the whole folder).
+	 * `pinned` is set when the slot lies in the other block than the source: the drop pins
+	 * or unpins it (see `zoneTarget`).
+	 */
+	| { kind: "before"; key: string; pinned?: boolean }
+	| { kind: "after"; key: string; pinned?: boolean }
 	/** Placement inside a folder, next to one of its visible members. */
 	| { kind: "member-before"; folderId: string; key: string }
 	| { kind: "member-after"; folderId: string; key: string }
@@ -78,12 +82,18 @@ function unitBounds(
 
 /**
  * Pinned top-level units are positional on the server (`getPinnedSectionEndIndex` walks
- * from the top while units are pinned), so an unpinned unit can never be placed among
- * them and vice versa. A drop aimed across the boundary is clamped to it.
+ * from the top while units are pinned), so a unit's pinned state follows the block it is
+ * dropped into: above the pin divider it is pinned, below it unpinned. Dragging across
+ * the divider is how a tab is pinned or unpinned by hand.
+ *
+ * `zonePinned` is which side of the divider the pointer is on. The target is kept inside
+ * that block (a slot aimed past the block's edge lands at its edge), and carries
+ * `pinned` when the source comes from the other block.
  */
-function clampTopLevel(
+function zoneTarget(
 	rows: RecentTabDropRow[],
 	target: { kind: "before" | "after"; key: string },
+	zonePinned: boolean,
 	sourcePinned: boolean,
 ): RecentTabDropTarget | null {
 	const units: string[] = [];
@@ -91,22 +101,24 @@ function clampTopLevel(
 		const unit = unitKeyOf(row);
 		if (!units.includes(unit)) units.push(unit);
 	}
-	const pinnedOf = (unit: string) => rows.find((row) => unitKeyOf(row) === unit)?.pinned;
-	const zone = units.filter((unit) => !!pinnedOf(unit) === sourcePinned);
+	if (units.length === 0) return null;
+	const pinnedOf = (unit: string) => !!rows.find((row) => unitKeyOf(row) === unit)?.pinned;
+	const zone = units.filter((unit) => pinnedOf(unit) === zonePinned);
+	let placed: { kind: "before" | "after"; key: string } = target;
 	if (zone.length === 0) {
-		// Nothing in the source's zone is rendered: unpinned goes after the pinned block,
-		// pinned goes before the unpinned one.
-		if (units.length === 0) return null;
-		return sourcePinned
+		// Nothing rendered in that block yet: the pinned block starts before every unit,
+		// the unpinned one after them all.
+		placed = zonePinned
 			? { kind: "before", key: units[0] }
 			: { kind: "after", key: units[units.length - 1] };
+	} else if (!zone.includes(target.key)) {
+		const targetIndex = units.indexOf(target.key);
+		placed =
+			targetIndex < units.indexOf(zone[0])
+				? { kind: "before", key: zone[0] }
+				: { kind: "after", key: zone[zone.length - 1] };
 	}
-	if (zone.includes(target.key)) return target;
-	const targetIndex = units.indexOf(target.key);
-	const firstZone = units.indexOf(zone[0]);
-	return targetIndex < firstZone
-		? { kind: "before", key: zone[0] }
-		: { kind: "after", key: zone[zone.length - 1] };
+	return zonePinned === sourcePinned ? placed : { ...placed, pinned: zonePinned };
 }
 
 /**
@@ -117,6 +129,11 @@ export function resolveRecentTabDropTarget(
 	rows: RecentTabDropRow[],
 	y: number,
 	source: RecentTabDropSource | null,
+	/**
+	 * The rendered pin divider, when the caller has it. Above it is the pinned block even
+	 * when nothing is pinned yet; without it the zone is inferred from the target row.
+	 */
+	pinDivider?: { top: number; bottom: number } | null,
 ): RecentTabDropTarget | null {
 	const others = source
 		? rows.filter(
@@ -129,16 +146,28 @@ export function resolveRecentTabDropTarget(
 	if (others.length === 0) return rows.length === 0 ? { kind: "empty" } : null;
 	const sourcePinned = source?.pinned ?? false;
 	const canNest = source ? source.canNest && source.kind !== "folder" : true;
+	// Which side of the pin divider the pointer is on. With the divider measured, that is
+	// exact and works with an empty pinned block; otherwise fall back to the target row's
+	// block, with the line after the last pinned unit reading as unpinned (one line, one
+	// outcome, like the in-folder boundary).
+	const place = (target: { kind: "before" | "after"; key: string }) =>
+		zoneTarget(
+			others,
+			target,
+			pinDivider ? y < (pinDivider.top + pinDivider.bottom) / 2 : slotPinned(others, target),
+			sourcePinned,
+		);
 
 	const hovered = others.find((row) => y >= row.top && y < row.bottom);
 	if (!hovered) {
 		// Above everything, below everything, or in a gap: place relative to the nearest
 		// unit above (or before the first one).
 		const above = [...others].reverse().find((row) => y >= row.bottom);
-		const raw = above
-			? ({ kind: "after", key: unitKeyOf(above) } as const)
-			: ({ kind: "before", key: unitKeyOf(others[0]) } as const);
-		return clampTopLevel(others, raw, sourcePinned);
+		return place(
+			above
+				? { kind: "after", key: unitKeyOf(above) }
+				: { kind: "before", key: unitKeyOf(others[0]) },
+		);
 	}
 
 	const height = hovered.bottom - hovered.top;
@@ -151,11 +180,7 @@ export function resolveRecentTabDropTarget(
 		if (!canNest) {
 			const bounds = unitBounds(others, `folder:${hovered.folderId}`);
 			const before = bounds ? y < (bounds.top + bounds.bottom) / 2 : upper;
-			return clampTopLevel(
-				others,
-				{ kind: before ? "before" : "after", key: `folder:${hovered.folderId}` },
-				sourcePinned,
-			);
+			return place({ kind: before ? "before" : "after", key: `folder:${hovered.folderId}` });
 		}
 		if (!upper && hovered.memberPinned) {
 			// The line under the last pinned member is also the line above the first
@@ -190,19 +215,31 @@ export function resolveRecentTabDropTarget(
 					: { kind: "into-folder", folderId: hovered.folderId };
 			}
 		}
-		return clampTopLevel(
-			others,
-			{ kind: upper ? "before" : "after", key: hovered.key },
-			sourcePinned,
-		);
+		return place({ kind: upper ? "before" : "after", key: hovered.key });
 	}
 
 	if (canNest && hovered.canNest && inMiddle) return { kind: "merge", key: hovered.key };
-	return clampTopLevel(
-		others,
-		{ kind: upper ? "before" : "after", key: hovered.key },
-		sourcePinned,
-	);
+	return place({ kind: upper ? "before" : "after", key: hovered.key });
+}
+
+/**
+ * Whether a top-level slot lies in the pinned block: next to a pinned unit, but not on
+ * the divider (after the last pinned unit).
+ */
+function slotPinned(
+	rows: RecentTabDropRow[],
+	target: { kind: "before" | "after"; key: string },
+): boolean {
+	const units: string[] = [];
+	for (const row of rows) {
+		const unit = unitKeyOf(row);
+		if (!units.includes(unit)) units.push(unit);
+	}
+	const pinnedOf = (unit: string | undefined) =>
+		unit !== undefined && !!rows.find((row) => unitKeyOf(row) === unit)?.pinned;
+	if (!pinnedOf(target.key)) return false;
+	if (target.kind === "before") return true;
+	return pinnedOf(units[units.indexOf(target.key) + 1]);
 }
 
 /** Bounds to highlight for a merge / join target, or null for line targets. */

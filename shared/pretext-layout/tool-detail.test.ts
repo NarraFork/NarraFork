@@ -2861,7 +2861,8 @@ describe("classifyToolDetail — outline", () => {
 		expect(body.format).toBe("markdown");
 		expect(body.text).toBe(outline);
 		expect(metaTexts(d)).toEqual(["Kx81mPqa/Ab3dEf9Q"]);
-		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa", "2 blocks", "more not shown"]);
+		// The space by its name, then its key as written (a verbatim chip: never upper-cased).
+		expect(metaBadgeLabels(d)).toEqual(["Project", "Kx81mPqa", "2 blocks", "more not shown"]);
 	});
 
 	it("lists OutlineSearch hits with their address, path and process mark", () => {
@@ -2888,17 +2889,17 @@ describe("classifyToolDetail — outline", () => {
 		expect(d.badges).toEqual([{ label: "1 results", color: "teal" }]);
 		expect(d.entries?.[0]).toMatchObject({
 			title: "Token refresh",
-			meta: "Kx81mPqa/Ab3dEf9Q · Auth › Tokens",
+			meta: "Auth › Tokens · Kx81mPqa/Ab3dEf9Q",
 			snippet: "refresh has a race",
 			badges: [
-				{ label: "Q7", color: "teal" },
+				{ label: "Q7", color: "teal", verbatim: true },
 				{ label: "process", color: "gray" },
 			],
 		});
 	});
 
-	it("shows what an OutlineEdit wrote and its commit", () => {
-		const d = classifyToolDetail({
+	it("shows what an OutlineEdit wrote and its commit; its input and result are folded", () => {
+		const call = {
 			previewId: "classifier-fixture",
 			toolName: "OutlineEdit",
 			category: "outline",
@@ -2911,7 +2912,15 @@ describe("classifyToolDetail — outline", () => {
 			},
 			outputJson: "Committed #4 to Kx81mPqa",
 			metadata: { space: { key: "Kx81mPqa" }, commit: { id: "c1", seq: 4 } },
-		});
+		} as const;
+		// Folded: the change list, no input, no result.
+		const folded = classifyToolDetail(call);
+		expect(folded?.sections.map((s) => s.key)).toEqual(["meta.edit", "output.changes"]);
+		const changes = folded?.sections[1]?.body;
+		expect(changes?.kind).toBe("change-rows");
+		expect(changes?.kind === "change-rows" ? changes.toggle?.open : null).toBe(false);
+		// Open: the input and the result, as they were shown before the change list.
+		const d = classifyToolDetail({ ...call, rawOpen: true });
 		const input = sectionBody(d, "input") as ToolCappedDetail;
 		expect(input.format).toBe("markdown");
 		expect(input.text).toBe(
@@ -2927,8 +2936,9 @@ describe("classifyToolDetail — outline", () => {
 		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("Committed #4 to Kx81mPqa");
 		// The commit is a link to the page it changed (as of the commit), not a badge.
 		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa"]);
-		expect(metaTexts(d)).toEqual(["commit #4"]);
-		expect(metaRowsOf(d).rows.find((row) => row.text === "commit #4")?.href).toBe(
+		const commit = "Commit #4 · view in the timeline / revert";
+		expect(metaTexts(d)).toEqual([commit]);
+		expect(metaRowsOf(d).rows.find((row) => row.text === commit)?.href).toBe(
 			"/outline/ref?space=Kx81mPqa&commit=4",
 		);
 	});
@@ -2946,6 +2956,7 @@ describe("classifyToolDetail — outline", () => {
 				],
 			},
 			outputJson: "Committed #5",
+			rawOpen: true,
 			metadata: {
 				space: { key: "Kx81mPqa" },
 				commit: { id: "c2", seq: 5 },

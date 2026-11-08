@@ -365,6 +365,134 @@ describe("measureInlinePermission — ExitPlanMode editing", () => {
 	});
 });
 
+describe("measureInlinePermission — an outline plan's approval (outline P2 PR 8)", () => {
+	it("adds one xs line (mb 4) per summary row and drops the decision reason", async () => {
+		const { measureInlinePermission } = await import("./measure-permission");
+		const c = await livePermissionConstants();
+		const plain = measureInlinePermission({ isExitPlanMode: true, buttonRows: 1 }, 600);
+		const one = measureInlinePermission(
+			{ isExitPlanMode: true, outlinePlanSummaryRows: 1, buttonRows: 1, hasDecisionReason: true },
+			600,
+		);
+		const two = measureInlinePermission(
+			{ isExitPlanMode: true, outlinePlanSummaryRows: 2, buttonRows: 1 },
+			600,
+		);
+		expect(one.metas.map((m) => m.role)).toEqual([
+			"outline-plan-summary",
+			"feedback-textarea",
+			"button-bar",
+		]);
+		expect(one.height - plain.height).toBe(c.XS_LINE_HEIGHT + 4);
+		expect(two.height - one.height).toBe(c.XS_LINE_HEIGHT + 4);
+	});
+
+	it("is predicted from a waiting ExitPlanMode that carries an outline plan", async () => {
+		const { predictInlinePermission } = await import("../vlist-permission-prediction");
+		const root = {
+			blockId: "b",
+			spaceId: "s",
+			pageId: "p",
+			address: "sess/AbCdEfGh",
+			title: "Plan",
+			round: 1,
+		};
+		const base = {
+			id: "r",
+			toolName: "ExitPlanMode",
+			inputJson: { plan: "- [ ] Plan", _planRoot: root, _planDiff: { counts: { added: 1 } } },
+		};
+		expect(predictInlinePermission(base, { innerWidth: 600, canDecide: true })).toMatchObject({
+			isExitPlanMode: true,
+			outlinePlanSummaryRows: 1,
+		});
+		expect(
+			predictInlinePermission(
+				{ ...base, inputJson: { ...base.inputJson, _planSummary: "Added a step" } },
+				{ innerWidth: 600, canDecide: true },
+			)?.outlinePlanSummaryRows,
+		).toBe(2);
+		// A plan-file plan is predicted as before.
+		expect(
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson: { plan: "x" } },
+				{ innerWidth: 600, canDecide: true },
+			)?.outlinePlanSummaryRows,
+		).toBeUndefined();
+		// A plan review's comments (PR 8b) lead the first summary line: no row is added.
+		const review = {
+			blockId: "rv",
+			address: "sess/RvRvRvRv",
+			round: 1,
+			count: 2,
+			comments: [{ text: "A concern", target: null }],
+		};
+		expect(
+			predictInlinePermission(
+				{ ...base, inputJson: { ...base.inputJson, _planReview: review } },
+				{ innerWidth: 600, canDecide: true },
+			),
+		).toEqual(predictInlinePermission(base, { innerWidth: 600, canDecide: true }));
+	});
+
+	it("gives the empty feedback box its placeholder's rows (outline P2 PR 8b review round 1)", async () => {
+		const { predictInlinePermission, OUTLINE_PLAN_FEEDBACK_PLACEHOLDER } = await import(
+			"../vlist-permission-prediction"
+		);
+		const inputJson = {
+			plan: "- [ ] Plan",
+			_planRoot: { blockId: "b", spaceId: "s", pageId: "p", address: "a", title: "P", round: 1 },
+		};
+		const rows = (innerWidth: number, placeholder?: string) =>
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{
+					innerWidth,
+					canDecide: true,
+					...(placeholder ? { planFeedbackPlaceholder: placeholder } : {}),
+				},
+			)?.feedbackRows;
+		// Stub: 0.6 × 12px a character; the box's text area is 22px narrower than the card.
+		const one = Math.ceil(OUTLINE_PLAN_FEEDBACK_PLACEHOLDER.length * 7.2) + 22;
+		expect(rows(one + 40)).toBe(1);
+		expect(rows(one - 40)).toBe(2);
+		expect(rows(60)).toBe(3);
+		expect(rows(328, "短")).toBe(1);
+	});
+
+	it("wraps the three decisions at phone width (review round 1 U1)", async () => {
+		const { predictInlinePermission, estimateButtonRows } = await import(
+			"../vlist-permission-prediction"
+		);
+		const inputJson = {
+			plan: "- [ ] Plan",
+			_planRoot: { blockId: "b", spaceId: "s", pageId: "p", address: "a", title: "P", round: 1 },
+		};
+		const rows = (innerWidth: number, extra: Record<string, unknown> = {}) =>
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{ innerWidth, canDecide: true, ...extra },
+			)?.buttonRows;
+		expect(rows(700)).toBe(1);
+		// Phone widths: the English bar paints over two rows, then three.
+		expect(rows(340)).toBe(2);
+		expect(rows(160)).toBe(3);
+		// Shorter labels (the reader's language) fit where the English ones wrap.
+		expect(rows(340, { planButtonLabels: ["按草稿执行", "锁定后执行…", "退回"] })).toBe(1);
+		// Read-only readers see a note, not the bar.
+		expect(
+			predictInlinePermission(
+				{ id: "r", toolName: "ExitPlanMode", inputJson },
+				{ innerWidth: 160, canDecide: false },
+			)?.buttonRows,
+		).toBe(1);
+		// Larger type wraps sooner.
+		const labels = ["Execute as draft", "Lock and execute…", "Return"];
+		expect(estimateButtonRows(labels, 560, 14)).toBe(1);
+		expect(estimateButtonRows(labels, 560, 24)).toBeGreaterThan(1);
+	});
+});
+
 describe("measureInlinePermission — feedback rows, decision reason, read-only", () => {
 	it("the feedback textarea grows with its autosize row count (clamped 1..3)", async () => {
 		const { measureInlinePermission } = await import("./measure-permission");
@@ -374,6 +502,29 @@ describe("measureInlinePermission — feedback rows, decision reason, read-only"
 		expect(three.height - one.height).toBe(2 * c.TEXTAREA_ROW_HEIGHT);
 		const five = measureInlinePermission({ feedbackRows: 5 }, 600);
 		expect(five.height).toBe(three.height);
+	});
+
+	it("predicts a plain approval's empty feedback box at its placeholder's rows (D49 review round 1)", async () => {
+		const { predictInlinePermission, FEEDBACK_PLACEHOLDER } = await import(
+			"../vlist-permission-prediction"
+		);
+		const rows = (toolName: string, innerWidth: number, placeholder?: string) =>
+			predictInlinePermission(
+				{ id: "r", toolName, inputJson: { command: "ls", plan: "x" } },
+				{
+					innerWidth,
+					canDecide: true,
+					...(placeholder ? { feedbackPlaceholder: placeholder } : {}),
+				},
+			)?.feedbackRows;
+		// Stub: 0.6 × 12px a character; the box's text area is 22px narrower than the card.
+		const one = Math.ceil(FEEDBACK_PLACEHOLDER.length * 7.2) + 22;
+		for (const toolName of ["Bash", "ExitPlanMode"]) {
+			expect(rows(toolName, one + 40), toolName).toBe(1);
+			expect(rows(toolName, one - 40), toolName).toBe(2);
+			expect(rows(toolName, 60), toolName).toBe(3);
+			expect(rows(toolName, one - 40, "短"), toolName).toBe(1);
+		}
 	});
 
 	it("adds decision-reason lines above the feedback textarea", async () => {

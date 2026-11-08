@@ -1,8 +1,9 @@
 /**
  * 数据导入 / 导出 / 清空（仅管理员）。
  *
- * - GET  /api/storage/export          导出 ZIP（带会话，供 File System Access 流式写入）
- * - POST /api/storage/export/ticket   签发一次性下载票据
+ * - GET  /api/storage/export          导出 ZIP（不含供应商，供 File System Access 流式写入）
+ * - POST /api/storage/export          导出 ZIP；含供应商时需 step-up，Key 用口令加密
+ * - POST /api/storage/export/ticket   签发一次性下载票据（含供应商时同样需 step-up）
  * - GET  /api/storage/export/download 凭票据下载（挂在全局会话认证之前）
  * - POST /api/storage/import/preview  上传 ZIP，返回统计与会话冲突清单
  * - POST /api/storage/import          按预览 token + 冲突决策执行导入
@@ -11,19 +12,21 @@
 
 import { Hono } from "hono";
 import { z } from "zod/v4";
+import { MIN_PASSPHRASE_LENGTH } from "../lib/credential-transfer/bundle";
 import { catalogError } from "../lib/errors";
 import { requireAdmin } from "../middleware/auth";
 import { authSessionStore } from "../services/auth/store";
 import {
 	applyImport,
 	clearData,
-	consumeExportTicket,
 	createExportTicket,
 	exportData,
 	previewImport,
 	previewImportFromStream,
+	redeemExportTicket,
 	type TransferSelection,
 } from "../services/data-portability";
+import { consumeStepUp } from "../services/step-up-service";
 
 export const storageTransferRoutes = new Hono();
 
@@ -41,7 +44,35 @@ const importSchema = z.object({
 	conflictById: z.record(z.string(), conflictDecisionSchema).optional(),
 	/** 只导入选中的类别；缺省全选。 */
 	include: selectionSchema.partial().optional(),
+	/** Opens the archive's sealed provider keys. */
+	passphrase: z.string().min(1).max(1024).optional(),
 });
+
+/** Exporting providers carries every key: step-up first, and a passphrase to seal them with. */
+const providersExportSchema = z.object({
+	stepUpToken: z.string().min(1).optional(),
+	passphrase: z.string().min(MIN_PASSPHRASE_LENGTH).max(1024).optional(),
+});
+
+/**
+ * The passphrase for a selection that includes providers, after consuming the step-up grant
+ * (bound to this user, session and purpose). Undefined for a selection without providers.
+ */
+function providersExportPassphrase(
+	user: { sub: string; sid?: string },
+	selection: TransferSelection,
+	body: z.infer<typeof providersExportSchema>,
+): string | undefined {
+	if (!selection.providers) return undefined;
+	// Checked before the grant is spent, so a missing passphrase does not cost a re-verify.
+	if (!body.passphrase) throw catalogError("EXPORT_PARAMS_INVALID");
+	consumeStepUp(body.stepUpToken, {
+		userId: user.sub,
+		sessionId: user.sid,
+		purpose: "storage.export.providers",
+	});
+	return body.passphrase;
+}
 
 const clearSchema = z.object({
 	target: z.enum(["requests", "sessions", "providers", "all"]),
@@ -57,13 +88,27 @@ function selectionFromQuery(url: URL): TransferSelection {
 	};
 }
 
+/** What the browser sees of a preview; the sealed keys themselves stay on the server. */
+function previewResponse(preview: Awaited<ReturnType<typeof previewImport>>) {
+	return {
+		token: preview.token,
+		counts: preview.counts,
+		conflicts: preview.conflicts,
+		exportedAt: preview.exportedAt,
+		version: preview.version,
+		...(preview.sealedKeys
+			? { providerKeys: { sealed: true, count: preview.sealedKeyCount ?? 0 } }
+			: {}),
+	};
+}
+
 function exportFilename(): string {
 	return `narrafork-export-${new Date().toISOString().slice(0, 10)}.zip`;
 }
 
 /** 打包并流式返回 ZIP。调用方负责已经完成管理员或票据鉴权。 */
-async function sendExport(selection: TransferSelection): Promise<Response> {
-	const { zipPath, counts } = await exportData(selection);
+async function sendExport(selection: TransferSelection, passphrase?: string): Promise<Response> {
+	const { zipPath, counts } = await exportData(selection, passphrase ? { passphrase } : {});
 	const file = Bun.file(zipPath);
 	const response = new Response(file.stream(), {
 		headers: {
@@ -90,17 +135,48 @@ async function sendExport(selection: TransferSelection): Promise<Response> {
  * 响应流式发送。浏览器应把 body 直接写入用户选定的文件，不要先读成 Blob。
  */
 storageTransferRoutes.get("/export", requireAdmin, async (c) => {
-	return sendExport(selectionFromQuery(new URL(c.req.url)));
+	const selection = selectionFromQuery(new URL(c.req.url));
+	// Providers carry their keys: that export needs step-up, so it goes through POST.
+	if (selection.providers) throw catalogError("STEP_UP_REQUIRED");
+	return sendExport(selection);
 });
 
-/** POST /api/storage/export/ticket — 给无法流式写文件的浏览器换一张下载票据。 */
-storageTransferRoutes.post("/export/ticket", requireAdmin, async (c) => {
-	const parsed = selectionSchema.safeParse(await c.req.json());
+/**
+ * POST /api/storage/export — streaming export with a JSON body:
+ * `{ selection, stepUpToken?, passphrase? }`. With providers selected, the step-up grant is
+ * consumed and every provider key is sealed with the passphrase. Neither appears in a URL.
+ */
+storageTransferRoutes.post("/export", requireAdmin, async (c) => {
+	const parsed = z
+		.object({ selection: selectionSchema, ...providersExportSchema.shape })
+		.safeParse(await c.req.json());
 	if (!parsed.success) throw catalogError("EXPORT_PARAMS_INVALID");
-	if (!parsed.data.requests && !parsed.data.sessions && !parsed.data.providers) {
+	const { selection } = parsed.data;
+	if (!selection.requests && !selection.sessions && !selection.providers) {
 		throw catalogError("EXPORT_PARAMS_INVALID");
 	}
-	return c.json({ ticket: createExportTicket(parsed.data) });
+	return sendExport(selection, providersExportPassphrase(c.get("user"), selection, parsed.data));
+});
+
+/**
+ * POST /api/storage/export/ticket — 给无法流式写文件的浏览器换一张下载票据。
+ * With providers selected, step-up is consumed here and the passphrase is kept with the ticket.
+ */
+storageTransferRoutes.post("/export/ticket", requireAdmin, async (c) => {
+	const parsed = z
+		.object({ ...selectionSchema.shape, ...providersExportSchema.shape })
+		.safeParse(await c.req.json());
+	if (!parsed.success) throw catalogError("EXPORT_PARAMS_INVALID");
+	const selection = {
+		requests: parsed.data.requests,
+		sessions: parsed.data.sessions,
+		providers: parsed.data.providers,
+	};
+	if (!selection.requests && !selection.sessions && !selection.providers) {
+		throw catalogError("EXPORT_PARAMS_INVALID");
+	}
+	const passphrase = providersExportPassphrase(c.get("user"), selection, parsed.data);
+	return c.json({ ticket: createExportTicket(selection, Date.now(), passphrase) });
 });
 
 /**
@@ -111,9 +187,9 @@ storageTransferRoutes.post("/export/ticket", requireAdmin, async (c) => {
 export const exportTicketDownloadRoutes = new Hono();
 
 exportTicketDownloadRoutes.get("/", async (c) => {
-	const selection = consumeExportTicket(c.req.query("ticket") ?? "");
-	if (!selection) throw catalogError("EXPORT_TICKET_INVALID");
-	return sendExport(selection);
+	const ticket = redeemExportTicket(c.req.query("ticket") ?? "");
+	if (!ticket) throw catalogError("EXPORT_TICKET_INVALID");
+	return sendExport(ticket.selection, ticket.passphrase);
 });
 
 /**
@@ -128,14 +204,7 @@ storageTransferRoutes.post("/import/preview", requireAdmin, async (c) => {
 		const form = await c.req.formData();
 		const file = form.get("file");
 		if (!(file instanceof File)) throw catalogError("IMPORT_FILE_REQUIRED");
-		const preview = await previewImport(await file.arrayBuffer(), file.name);
-		return c.json({
-			token: preview.token,
-			counts: preview.counts,
-			conflicts: preview.conflicts,
-			exportedAt: preview.exportedAt,
-			version: preview.version,
-		});
+		return c.json(previewResponse(await previewImport(await file.arrayBuffer(), file.name)));
 	}
 
 	const body = c.req.raw.body;
@@ -145,13 +214,7 @@ storageTransferRoutes.post("/import/preview", requireAdmin, async (c) => {
 		body,
 		Number.isFinite(declared) && declared > 0 ? declared : undefined,
 	);
-	return c.json({
-		token: preview.token,
-		counts: preview.counts,
-		conflicts: preview.conflicts,
-		exportedAt: preview.exportedAt,
-		version: preview.version,
-	});
+	return c.json(previewResponse(preview));
 });
 
 /** POST /api/storage/import — 按预览结果执行导入。 */
@@ -162,6 +225,7 @@ storageTransferRoutes.post("/import", requireAdmin, async (c) => {
 		conflictDefault: parsed.data.conflictDefault,
 		conflictById: parsed.data.conflictById,
 		include: parsed.data.include,
+		...(parsed.data.passphrase ? { passphrase: parsed.data.passphrase } : {}),
 	});
 	return c.json(result);
 });

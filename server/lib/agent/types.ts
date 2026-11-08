@@ -710,7 +710,7 @@ export type AgentEvent =
 			/** `channel:bareModel` id used to match this model in `/v1/models`. */
 			nugModelId?: string;
 			/** How recovery is awaited; `credentials` when omitted. */
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted (older events). */
 			quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
 			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */

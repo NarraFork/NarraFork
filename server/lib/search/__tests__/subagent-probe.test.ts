@@ -161,6 +161,7 @@ describe("search subagent settings probe", () => {
 			"ExitPlanConfirm",
 			"ExitPlanConfirmAndCompact",
 			"ExitPlanRevise",
+			"PlanReview",
 			"TaskReflectConfirm",
 			"TaskReflectRevise",
 		]);

@@ -704,10 +704,11 @@ export interface NarratorWSCallbacks {
 		providerId?: string;
 		providerPrefix?: string;
 		nugModelId?: string;
-		waitKind?: "credentials" | "quota";
+		waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 		quotaProvider?: "kimi" | "opencode";
-		/** Epoch ms the quota window resets at (`quota` waits only). */
+		quotaBucket?: string;
+		/** Epoch ms the timed refusal can be retried. */
 		resumeAt?: number;
 	}) => void;
 	/**
@@ -717,7 +718,7 @@ export interface NarratorWSCallbacks {
 	onModelUnavailableRecovered?: (info: {
 		model: string;
 		nugModelId?: string;
-		waitKind?: "credentials" | "quota";
+		waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 		quotaProvider?: "kimi" | "opencode";
 	}) => void;
@@ -1479,16 +1480,27 @@ export function useNarratorWS(
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							nugModelId: data.nugModelId as string | undefined,
-							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							waitKind: data.waitKind as
+								| "credentials"
+								| "quota"
+								| "capacity"
+								| "rate_limit"
+								| undefined,
 							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 							resumeAt: data.resumeAt as number | undefined,
+							quotaBucket: data.quotaBucket as string | undefined,
 						});
 						break;
 					case "model_unavailable_recovered":
 						callbackOwner.callbacks.onModelUnavailableRecovered?.({
 							model: data.model as string,
 							nugModelId: data.nugModelId as string | undefined,
-							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							waitKind: data.waitKind as
+								| "credentials"
+								| "quota"
+								| "capacity"
+								| "rate_limit"
+								| undefined,
 							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 						});
 						break;

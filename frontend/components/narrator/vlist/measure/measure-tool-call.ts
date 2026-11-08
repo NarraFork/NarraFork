@@ -85,7 +85,11 @@ import type {
 	ToolSectionLabel,
 	ToolStructuredEntry,
 } from "@shared/pretext-layout/tool-detail";
-import { ASK_OPTIONS_MAX, ASK_QUESTIONS_MAX } from "@shared/pretext-layout/tool-detail";
+import {
+	ASK_OPTIONS_MAX,
+	ASK_QUESTIONS_MAX,
+	CHANGE_ROWS_MAX,
+} from "@shared/pretext-layout/tool-detail";
 import { sharePreviewHeight } from "@shared/share-preview";
 
 export type {
@@ -481,6 +485,20 @@ export const META_ACTION_ROW = 30;
 export const META_PROGRESS_ROW = 18;
 /** Reserved figures line under a progress bar (xs text). */
 export const META_PROGRESS_FIGURES_ROW = 16;
+/** Change list (outline cards): gap between two change rows. */
+export const CHANGE_ROW_GAP = 4;
+/** Change list: gap above the raw input / result fold under it. */
+export const CHANGE_TOGGLE_GAP = 6;
+
+/**
+ * One change row (and the fold row under a change list): a single nowrap line of xs text with
+ * xs badges beside it, so the taller of the reader's live xs line box and a badge. Read at
+ * measure time — the line follows the reader's typography, the badge does not.
+ */
+export function changeRowHeight(): number {
+	return Math.max(typographyMetrics().line.xs, META_BADGE_ROW);
+}
+
 /** Max meta rows measured/painted in one region (bounded work). */
 export const META_ROWS_MAX = 12;
 /** Max structured entries measured/painted (mirrors the classifier's slice). */
@@ -1772,6 +1790,25 @@ export function measureToolBody(
 				innerWidth,
 				null,
 			);
+		case "change-rows": {
+			// Every row is one fixed line (truncated, never wrapped): the height is the row count.
+			const line = changeRowHeight();
+			const blocks: PreparedBlock[] = detail.rows
+				.slice(0, CHANGE_ROWS_MAX)
+				.map((row, i) =>
+					makeFixed(line, "detail-change-row", i === 0 ? 0 : CHANGE_ROW_GAP, { row }),
+				);
+			if (detail.toggle) {
+				blocks.push(
+					makeFixed(line, "detail-change-toggle", blocks.length > 0 ? CHANGE_TOGGLE_GAP : 0, {
+						toggle: detail.toggle,
+					}),
+				);
+			}
+			if (blocks.length === 0) blocks.push(makeFixed(line, "detail-change-empty", 0));
+			return finishRegion(detail, blocks, innerWidth, null);
+		}
+
 		case "meta-rows": {
 			const rows = detail.rows.slice(0, META_ROWS_MAX);
 			const blocks: PreparedBlock[] = [];

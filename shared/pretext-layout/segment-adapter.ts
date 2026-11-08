@@ -29,6 +29,7 @@ import {
 	injectionBlockViews,
 	isNativeModelContextBlock,
 } from "../native-injection";
+import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
@@ -71,6 +72,7 @@ import {
 } from "./communication-state";
 import type { VListElementKind } from "./element-kinds";
 import type { InjectionTarget } from "./injection-target";
+import { outlineEditHeaderStats } from "./outline-tool-card";
 import type { RenderLod } from "./prepared-block";
 import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
 import {
@@ -645,7 +647,7 @@ interface AdapterTraceItem {
 	 * Edit, a live patch landing the tool's metadata), and a stale entry would keep
 	 * drawing the previous numbers.
 	 */
-	diffStats?: { added: number; removed: number };
+	diffStats?: { added: number; removed: number; done?: number; commit?: number };
 	/**
 	 * Raw tool status. Height-neutral (a fixed 12px glyph slot inside the row's
 	 * existing content lane), and part of the measure cache's `traceRevision` so a
@@ -2405,6 +2407,8 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
 	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
 	sidecarSourceOutlineTaskEdit: "Task changes by people",
+	sidecarSourceOutlineTaskFinished: "Tasks this session created were finished elsewhere",
+	sidecarSourceOutlineAnswer: "Answers to your questions",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2524,6 +2528,9 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
 	// People's changes to the session's outline tasks, told to it as a system notice (PR 5).
 	outline_task_edit: "sidecarSourceOutlineTaskEdit",
+	// Tasks the session created were finished by another session or a person (P2 PR 9b).
+	outline_task_finished: "sidecarSourceOutlineTaskFinished",
+	outline_answer: "sidecarSourceOutlineAnswer",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
@@ -4236,6 +4243,11 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? undefined
 			: makeBody("output.main", resultContent, hasTruncatedLeaf(outputJson));
 	const isBackground = input.background === true || input.run_in_background === true;
+	// An agent sent with an outline task (`task`, outline P2 PR 9): the card names the task under
+	// its description and marks a late result, from the call's metadata (the server writes it;
+	// no projection of the text cuts it), else from the result's note or the line a background
+	// launch names the task in (calls from before the metadata).
+	const delegation = readSubagentDelegation(readLeafText(input.task), resultContent, metadata);
 	const agentType = readNonEmptyString(input, "subagent_type") ?? item.tc.toolName;
 	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
 	// narrator query (which the adapter has no access to): the activity summary
@@ -4274,6 +4286,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		// Still a preview → the shell may fetch the real body while it is open.
 		...(promptTruncated ? { promptTruncated: true } : {}),
 		isBackground,
+		...(delegation ? { delegation } : {}),
 		// Files the child wrote. Absent when it changed nothing, so a card with no
 		// file list keeps the payload (and the height) it had before.
 		...(activity?.fileChanges ? { fileChanges: activity.fileChanges } : {}),
@@ -4476,6 +4489,13 @@ function buildToolCardData(
 			// classifier is the single place that decides what counts as a denial.
 			...(denyMessage ? { denyMessage } : {}),
 			hasPendingPermission,
+			// An outline card's fold (its raw input and model result under the change list), keyed
+			// by the CARD (`promptOpen`, the subagent prompt fold's channel): the same key whether
+			// the card stands alone or is drilled into from a folded row, so it survives an LOD
+			// change.
+			...(category === "outline" && ctx.isPromptOpen?.(toolItemKey(item)) === true
+				? { rawOpen: true }
+				: {}),
 			// Only MEASURED chrome strings (the ask replay's answer prefixes) —
 			// render-layer chrome is injected through renderLabels instead.
 			...(ctx.labels ? { labels: ctx.labels } : {}),
@@ -4496,8 +4516,15 @@ function toolDiffStatsFields(
 	item: AdapterToolItem,
 	isStreaming: boolean,
 	metadata: unknown,
-): { diffStats?: { added: number; removed: number } } {
+): { diffStats?: { added: number; removed: number; done?: number; commit?: number } } {
 	if (isStreaming) return {};
+	// An outline edit's figures: tasks ticked done, blocks added and deleted, its commit.
+	if (item.tc.toolName === "OutlineEdit") {
+		const stats = outlineEditHeaderStats(
+			metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : null,
+		);
+		return stats ? { diffStats: stats } : {};
+	}
 	const stats = resolveFileDiffStats(
 		item.tc.toolName,
 		item.tc.inputJson,

@@ -33,6 +33,8 @@ export interface ImportPreviewResult {
 	conflicts: ImportConflict[];
 	exportedAt?: string;
 	version?: number;
+	/** Present when the archive carries sealed provider keys; importing providers needs the passphrase. */
+	providerKeys?: { sealed: true; count: number };
 }
 
 export type ConflictDecision = "overwrite" | "skip";
@@ -46,6 +48,18 @@ export interface ImportResult {
 	sessionsRejected: number;
 	providersAdded: number;
 	providersRenamed: number;
+	/** Provider keys restored from the sealed file; absent from older servers. */
+	keysImported?: number;
+	keysFailed?: number;
+}
+
+/**
+ * What a providers export sends along: a single-use step-up grant and the passphrase that
+ * seals the keys. Neither goes into a URL.
+ */
+export interface ProvidersExportAuth {
+	stepUpToken: string;
+	passphrase: string;
 }
 
 /** 导出/导入的类别选择；`ALL_DATA_KINDS` 即全选。 */
@@ -129,6 +143,12 @@ function isPickerUnavailable(error: unknown): boolean {
 
 export interface ExportSaveDeps {
 	/**
+	 * Runs after the save dialog and before the export request: a providers export does its
+	 * step-up here. Must be given when `selection.providers` is set. When it fails, the file
+	 * the user picked is discarded and the error is rethrown.
+	 */
+	authorize?: () => Promise<ProvidersExportAuth>;
+	/**
 	 * 测试注入。`undefined` 用 `window.showSaveFilePicker`；`null` 表示这个环境没有该 API。
 	 */
 	showSaveFilePicker?: ExportFilePicker | null;
@@ -155,12 +175,20 @@ async function streamAuthorizedExport(
 	selection: TransferSelection,
 	writable: WritableStream<Uint8Array>,
 	fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
+	auth?: ProvidersExportAuth,
 ): Promise<void> {
 	let response: Response;
 	try {
-		response = await fetchImpl(`${apiBase()}/storage/export?${exportQuery(selection)}`, {
-			headers: authHeaders(),
-		});
+		// With providers the grant and passphrase go in a POST body, never in the URL.
+		response = auth
+			? await fetchImpl(`${apiBase()}/storage/export`, {
+					method: "POST",
+					headers: { ...authHeaders(), "Content-Type": "application/json" },
+					body: JSON.stringify({ selection, ...auth }),
+				})
+			: await fetchImpl(`${apiBase()}/storage/export?${exportQuery(selection)}`, {
+					headers: authHeaders(),
+				});
 	} catch (error) {
 		await writable.abort(error).catch(() => {});
 		throw error;
@@ -181,11 +209,12 @@ async function saveExportWithTicket(
 	filename: string,
 	fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
 	open: (url: string, filename: string) => void,
+	auth?: ProvidersExportAuth,
 ): Promise<void> {
 	const response = await fetchImpl(`${apiBase()}/storage/export/ticket`, {
 		method: "POST",
 		headers: { ...authHeaders(), "Content-Type": "application/json" },
-		body: JSON.stringify(selection),
+		body: JSON.stringify({ ...selection, ...(auth ?? {}) }),
 	});
 	if (!response.ok) await throwApiError(response, "Export failed");
 	const body = (await response.json()) as { ticket?: unknown };
@@ -212,6 +241,11 @@ export async function saveExport(
 		deps.showSaveFilePicker === undefined
 			? (window as ExportFilePickerWindow).showSaveFilePicker
 			: (deps.showSaveFilePicker ?? undefined);
+	const authorize = async (): Promise<ProvidersExportAuth | undefined> => {
+		if (!selection.providers) return undefined;
+		if (!deps.authorize) throw new ApiError("Export failed", 400);
+		return deps.authorize();
+	};
 	if (picker) {
 		let handle: ExportFileHandle;
 		try {
@@ -222,14 +256,22 @@ export async function saveExport(
 		} catch (error) {
 			if (isUserCancel(error)) return "cancelled";
 			if (!isPickerUnavailable(error)) throw error;
-			await saveExportWithTicket(selection, filename, fetchImpl, open);
+			await saveExportWithTicket(selection, filename, fetchImpl, open, await authorize());
 			return "saved";
 		}
 		const writable = await handle.createWritable();
-		await streamAuthorizedExport(selection, writable, fetchImpl);
+		let auth: ProvidersExportAuth | undefined;
+		try {
+			auth = await authorize();
+		} catch (error) {
+			// Step-up failed after a file was chosen: drop that empty file.
+			await writable.abort(error).catch(() => {});
+			throw error;
+		}
+		await streamAuthorizedExport(selection, writable, fetchImpl, auth);
 		return "saved";
 	}
-	await saveExportWithTicket(selection, filename, fetchImpl, open);
+	await saveExportWithTicket(selection, filename, fetchImpl, open, await authorize());
 	return "saved";
 }
 
@@ -258,13 +300,22 @@ export const storageTransferApi = {
 		conflictDefault?: ConflictDecision,
 		conflictById?: Record<string, ConflictDecision>,
 		include?: Partial<TransferSelection>,
+		/** Opens sealed provider keys; needed when the preview reported them and providers are imported. */
+		passphrase?: string,
 	): Promise<ImportResult> {
 		const response = await fetch(`${apiBase()}/storage/import`, {
 			method: "POST",
 			headers: { ...authHeaders(), "Content-Type": "application/json" },
-			body: JSON.stringify({ token, conflictDefault, conflictById, include }),
+			body: JSON.stringify({
+				token,
+				conflictDefault,
+				conflictById,
+				include,
+				...(passphrase ? { passphrase } : {}),
+			}),
 		});
-		if (!response.ok) throw new Error(await errorText(response));
+		// Keep the error code: a wrong passphrase must be told apart from other failures.
+		if (!response.ok) await throwApiError(response, "Import failed");
 		return (await response.json()) as ImportResult;
 	},
 

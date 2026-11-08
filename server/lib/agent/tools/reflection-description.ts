@@ -9,3 +9,14 @@ export const REFLECTION_ONLY_TOOL_AVAILABILITY =
 export function describeReflectionOnlyTool(instructions: string): string {
 	return `${instructions}\n\nAvailability: ${REFLECTION_ONLY_TOOL_AVAILABILITY}`;
 }
+
+/**
+ * The one decision tool of an outline plan's review (outline P2 PR 8b): it leaves comments under
+ * the plan for the user; it never sends the plan back for revision.
+ */
+export const PLAN_REVIEW_TOOL_NAME = "PlanReview";
+
+/** Whether a reflection loop is an outline plan's review (PlanReview is its only tool). */
+export function isPlanReviewLoop(allowedTools: readonly string[]): boolean {
+	return allowedTools.length === 1 && allowedTools[0] === PLAN_REVIEW_TOOL_NAME;
+}

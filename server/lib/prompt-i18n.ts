@@ -17,13 +17,31 @@ export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
 export type {
+	OutlinePlanPromptReview,
+	OutlinePlanPromptRoot,
+	OutlinePlanSubmitProblem,
+} from "./prompts/outline-plan";
+export {
+	getOutlinePlanApprovedPrompt,
+	getOutlinePlanEnterOutput,
+	getOutlinePlanModeSystemReminder,
+	getOutlinePlanRelaxedReminder,
+	getOutlinePlanReturnedMessage,
+	getOutlinePlanReturnedNote,
+	getOutlinePlanReviewPrompt,
+	getOutlinePlanReviewTitle,
+	getOutlinePlanSubmitProblem,
+} from "./prompts/outline-plan";
+export type {
 	OutlineCompactNote,
 	OutlineTaskEdit,
 	OutlineTaskEditChange,
 	OutlineTaskEditGroup,
+	OutlineTaskFinishedEntry,
 	OutlineTaskPromptTask,
 	OutlineTasksViewSection,
 	OutlineTaskWaitText,
+	OutlineViewAgent,
 	OutlineViewTask,
 } from "./prompts/outline-tasks";
 export {
@@ -43,11 +61,13 @@ export {
 	getOutlineInterruptNote,
 	getOutlineSpecUnavailableHint,
 	getOutlineTaskEditNote,
+	getOutlineTaskFinishedNote,
 	getOutlineTaskSystemReminder,
 	getOutlineTasksViewHeading,
 	getOutlineTasksViewMore,
 	getOutlineTasksViewSection,
 	getOutlineTurnEndNote,
+	getOutlineViewDelegatedLine,
 	getOutlineViewTaskLine,
 } from "./prompts/outline-tasks";
 export type {

@@ -222,6 +222,60 @@ describe("edit-and-regenerate file rollback", () => {
 			restore.mockRestore();
 		}
 	});
+	test("a confirmed restore of available files finishes the edit history-only", async () => {
+		const revertResult = {
+			...emptyRevertResult(),
+			planId: confirmedPlan.planId,
+			status: "partial" as const,
+			journalStatus: "partial" as const,
+			reason: "SELECTED_HISTORY_UNAVAILABLE",
+			historyCommitted: false,
+			files: [{ deviceId: "local", filePath: "a.ts", status: "applied" as const }],
+		};
+		const restore = spyOn(scopedRevert, "revertNarratorScopedForEdit").mockImplementation(
+			async () => {
+				eventLog.push("confirmedRestore");
+				return revertResult;
+			},
+		);
+		try {
+			const result = await edit({
+				revertPlan: confirmedPlan,
+				keepTextFilePaths: [],
+				newTextFiles: [new File(["notes"], "added.txt", { type: "text/plain" })],
+			});
+			expect(result).toEqual({ ok: true, revertResult });
+			expect(deleteCalls).toEqual([
+				{ messageId: "m1", opts: { preserveConversationId: true, skipRevert: true } },
+			]);
+			expect(eventLog).toEqual([
+				"confirmedRestore",
+				"deleteMessagesAfter",
+				"saveTextFileToWorktree",
+			]);
+		} finally {
+			restore.mockRestore();
+		}
+	});
+	test("a partial-coverage restore with a failed file still refuses the edit", async () => {
+		const restore = spyOn(scopedRevert, "revertNarratorScopedForEdit").mockResolvedValue({
+			...emptyRevertResult(),
+			status: "partial",
+			journalStatus: "partial",
+			reason: "SELECTED_HISTORY_UNAVAILABLE",
+			historyCommitted: false,
+			files: [{ deviceId: "local", filePath: "a.ts", status: "failed", reason: "EACCES" }],
+		});
+		try {
+			await expect(edit({ revertPlan: confirmedPlan })).rejects.toThrow();
+			expect(deleteCalls).toHaveLength(0);
+			expect(
+				sqlite.query("SELECT content_text FROM narrator_messages WHERE id = ?").get("m1"),
+			).toEqual({ content_text: "old" });
+		} finally {
+			restore.mockRestore();
+		}
+	});
 });
 
 describe("right-click rollback uses one fixed block-boundary plan", () => {

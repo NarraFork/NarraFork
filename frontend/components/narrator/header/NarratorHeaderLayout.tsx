@@ -51,6 +51,7 @@ export function NarratorHeaderLayout({
 	titleFullWidth,
 	surfacedToolCount,
 	showBack = false,
+	showMenu = false,
 	showTitleActions = false,
 	showClose = false,
 	onHeaderPointerDown,
@@ -69,6 +70,7 @@ export function NarratorHeaderLayout({
 			titleFullWidth,
 			surfacedToolCount,
 			showBack,
+			showMenu,
 			showTitleActions,
 			showClose,
 			showPin,
@@ -85,6 +87,7 @@ export function NarratorHeaderLayout({
 			titleFullWidth,
 			surfacedToolCount,
 			showBack,
+			showMenu,
 			showTitleActions,
 			showClose,
 			showPin,
@@ -92,7 +95,7 @@ export function NarratorHeaderLayout({
 		if (sameLayout(published.current, next)) return;
 		published.current = next;
 		setLayout(next);
-	}, [titleFullWidth, surfacedToolCount, showBack, showTitleActions, showClose, showPin]);
+	}, [titleFullWidth, surfacedToolCount, showBack, showMenu, showTitleActions, showClose, showPin]);
 
 	useLayoutEffect(() => {
 		const row = rowRef.current;

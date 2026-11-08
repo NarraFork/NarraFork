@@ -49,6 +49,7 @@ import {
 } from "./pipeline-state";
 import { isBashToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
+import { isPlanReviewLoop } from "./tools/reflection-description";
 import { truncateOutput } from "./truncate";
 import type {
 	AgentConfig,
@@ -741,6 +742,17 @@ export function getReflectionToolRejection(
 		return undefined;
 	}
 	const allowedTools = config.reflectionLoop.allowedTools.join(", ") || "(none / 无)";
+	// An outline plan's review leaves comments for the user; nothing goes back for revision.
+	if (isPlanReviewLoop(config.reflectionLoop.allowedTools)) {
+		return {
+			output:
+				config.locale === "zh-CN"
+					? `工具 ${tu.name} 没有执行。这个计划审查只能调用 ${allowedTools}。不得直接编辑文件或执行原操作；用 PlanReview 给出结论，意见会写在计划下面给用户看。`
+					: `Tool ${tu.name} was not executed. This plan review only allows ${allowedTools}. Do not edit files or execute the original operation; give your verdict with PlanReview: its comments are written under the plan for the user.`,
+			isError: true,
+			durationMs: 0,
+		};
+	}
 	return {
 		output:
 			config.locale === "zh-CN"

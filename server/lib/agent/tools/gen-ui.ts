@@ -54,7 +54,7 @@ export const genUiParameters = z
 				: input.action === "show"
 					? given("path") && only("path", "size")
 					: input.action === "render"
-						? given("source") && only("source", "title", "size", "wait")
+						? given("source") !== given("path") && only("source", "path", "title", "size", "wait")
 						: input.action === "inspect"
 							? given("toolUseId") &&
 								given("toolCallId") &&
@@ -66,7 +66,7 @@ export const genUiParameters = z
 			ctx.addIssue({
 				code: "custom",
 				message:
-					"create takes only prefix; show takes path (+ size); render takes source (+ title, size, wait); inspect takes toolUseId and toolCallId (+ width, height, theme); kit_build and kit_status take nothing",
+					"create takes only prefix; show takes path (+ size); render takes source or path (exactly one) (+ title, size, wait); inspect takes toolUseId and toolCallId (+ width, height, theme); kit_build and kit_status take nothing",
 			});
 	});
 export type GenUiInput =
@@ -74,7 +74,10 @@ export type GenUiInput =
 	| { action: "show"; path: string; size?: "sm" | "md" | "lg" }
 	| {
 			action: "render";
-			source: string;
+			/** JSX-like markup drawn inline; exactly one of source/path. */
+			source?: string;
+			/** An app directory written by create: full React, still able to wait. */
+			path?: string;
 			title?: string;
 			size?: "sm" | "md" | "lg";
 			wait?: boolean;
@@ -102,6 +105,7 @@ render({title, size, wait, source}) — the default. Draws markup inline in the 
 - wait: true makes it a form you wait on: the call stays open until the user clicks a submit() control, and its result is the bound values as JSON instead of a chat message (or that they closed it). Use it when you need their answers before going on; it needs a submit() control.
 - Put title and size before source: "sm" (240px), "md" (400px, default) or "lg" (580px).
 Example: <Stack gap="sm"><Title order={4}>Card corners</Title><Slider bind="radius" defaultValue={12} min={0} max={48} /><Card withBorder radius={$radius}><Text>border-radius: {$radius}px</Text></Card><TextInput bind="note" label="Note" /><Button onClick={submit("Use these settings")}>Apply</Button></Stack>
+- render({path, wait}) — draw an app written by create instead of markup. Same card, but the call itself is what waits, so an app with real computation (arithmetic, conditions, growing lists, timers) can still answer you as a tool result. show cannot wait; use render({path}) whenever you need the app's answer before going on.
 
 create({prefix}) then show({path, size}) — a full React app, only when markup cannot do it (arithmetic or conditions on values, lists that grow, timers, live data). create writes ${GEN_UI_DIRECTORY}/<prefix>-<id>/App.tsx. Edit it with the normal file tools: default-export a component; import react, @mantine/core, @mantine/hooks and relative files, or "kit" when the project has a kit; no other packages. Then show the directory: the app is built and runs inside the chat (only the latest one starts by itself; older ones wait for a click). To reach you, call globalThis.genUI.sendPrompt(text), genUI.submit(values, message?) or genUI.openLink(url) from a click handler; the user confirms each before it is sent.
 
@@ -123,14 +127,14 @@ Never put secrets in UI.`,
 				deviceId: workspace?.deviceId ?? config.defaultDeviceId ?? "local",
 				workdir: cwd,
 				path:
-					input.action === "show" && typeof input.path === "string"
+					(input.action === "show" || input.action === "render") && typeof input.path === "string"
 						? input.path
 						: paths.resolve(workspace?.git?.rootPath ?? cwd, GEN_UI_DIRECTORY),
 			};
 		},
 	},
 	formatValidationError: () =>
-		"Use {action:'render',title,size,wait,source}, {action:'inspect',toolUseId,toolCallId,width,height,theme}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx',size}.",
+		"Use {action:'render',title,size,wait,source} or {action:'render',path,size,wait} for an app, {action:'inspect',toolUseId,toolCallId,width,height,theme}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx',size}.",
 	async execute(args, ctx) {
 		try {
 			const { executeGenUiTool } = await import("@server/services/gen-ui/runtime");

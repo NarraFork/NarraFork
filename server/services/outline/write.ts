@@ -73,8 +73,13 @@
  * work is recorded: the commit's summary and the result's `ended` say whose work it ended. A
  * session's decision rests on the claim rows as it read them, so a takeover landing before its
  * commit makes it plan again. Rewriting a task that stays in progress (its text, its place)
- * neither claims nor ends it. Which late result to accept by its claim generation is the
- * delegation's to decide (plan PR 9).
+ * neither claims nor ends it.
+ *
+ * A delegation (`delegation.ts`, outline P2 PR 9a) is the one write that moves a claim within a
+ * session: `OutlineWriteOptions.delegateClaim` hands the task to the subagent sent to do it, on the
+ * running lease, with the next claim generation, whoever of the session held it; anyone else
+ * doing it refuses the write as above. The generation is what tells a subagent's result, when it
+ * comes, whether the task is still the one it was sent with (a late result otherwise).
  *
  * LOCKED PLANS AND PENDING CONFIRMATION
  * -------------------------------------
@@ -132,6 +137,7 @@ import {
 } from "@shared/outline";
 import {
 	OutlineBusyError,
+	OutlineClaimChangedError,
 	type OutlineClaimHolder,
 	OutlineConflictError,
 	OutlineLeaseNotExpiredError,
@@ -170,6 +176,7 @@ import {
 	type OutlineTaskActorRef,
 	type OutlineTaskJson,
 	type OutlineTaskLockJson,
+	type OutlineTaskPlanJson,
 	outlineLeaseEnd,
 } from "./model";
 import {
@@ -196,6 +203,7 @@ import {
 	OutlineStaleWriteError,
 	type OutlineStore,
 	type OutlineTaskClaimRow,
+	sameClaimRow,
 	WriteConflictError,
 } from "./store/port";
 import { canonicalTaskJson, sameTaskJson, sameTaskLock } from "./task-json";
@@ -247,7 +255,16 @@ interface OutlineTaskExtraInput {
 	lock?: OutlineTaskLockInput | null;
 	/** Put the task in the claimable pool. */
 	claimable?: boolean | null;
+	/**
+	 * A plan's state on its root (`plans.ts`, outline P2 PR 8; `null` clears it). Agents' edits
+	 * may not set it. `baseSeq` left out is stamped with this commit's seq (as a lock's version
+	 * is); a compensating commit restores what it read.
+	 */
+	plan?: OutlineTaskPlanInput | null;
 }
+
+/** A plan's state as a writer gives it; see {@link OutlineTaskExtraInput.plan}. */
+export type OutlineTaskPlanInput = Omit<OutlineTaskPlanJson, "baseSeq"> & { baseSeq?: number };
 
 export interface OutlineTaskInput extends OutlineTaskExtraInput {
 	status: TaskStatus;
@@ -502,7 +519,7 @@ export interface OutlineWriteOptions {
 	 * Record the commit as an `import` (a system path that brings content from elsewhere as one
 	 * commit: an outline session's old behavior fence, outline plan PR 4). Not with `compensating`.
 	 */
-	kind?: "import" | "answer";
+	kind?: "import" | "answer" | "plan";
 	/**
 	 * Internal to `questions.ts`: the asker of the questions this commit creates (their routing
 	 * rows take it; an existing row keeps its own), and `delivered` when the asker needs no telling
@@ -524,6 +541,21 @@ export interface OutlineWriteOptions {
 	 * turn's one-shot grant in it. People and system writes are never asked.
 	 */
 	agentBehaviorGrant?: () => boolean;
+	/**
+	 * Internal to `delegation.ts` (outline P2 PR 9a): this commit hands the task `blockId` to the
+	 * subagent `holderNarratorId` sent to do it. A system write for the delegating session
+	 * (`narratorId`) that sets the task in progress: the claim goes to the subagent on the running
+	 * lease with generation `epoch`, whoever of the session held it. The generation is the one the
+	 * delegation read plus one: a claim that moved on since rejects the write with
+	 * `OutlineClaimChangedError`, and anyone else doing the task with `OutlineTaskClaimedError`.
+	 */
+	delegateClaim?: { blockId: string; holderNarratorId: string; epoch: number };
+	/**
+	 * Internal to `delegation.ts`: claim rows the commit rests on (null: no row), checked when the
+	 * plan is made and written only while still exactly as given; otherwise the write rejects with
+	 * `OutlineClaimChangedError`, writing nothing (the caller decides again).
+	 */
+	expectClaims?: ReadonlyArray<{ taskBlockId: string; expect: OutlineTaskClaimRow | null }>;
 }
 
 /** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
@@ -717,11 +749,28 @@ function checkFlag(value: unknown, what: string, opIndex: number): void {
 		throw invalid(`task ${what} must be a boolean`, opIndex);
 }
 
+const PLAN_STATES: ReadonlySet<string> = new Set(["planning", "approved"]);
+
+function checkPlanInput(plan: OutlineTaskPlanInput, opIndex: number): void {
+	const p = plan as Partial<OutlineTaskPlanInput>;
+	if (typeof p !== "object") throw invalid("task plan must be an object", opIndex);
+	if (typeof p.state !== "string" || !PLAN_STATES.has(p.state))
+		throw invalid("task plan.state must be planning or approved", opIndex);
+	if (typeof p.by !== "string" || p.by === "" || p.by.length > MAX_ACTOR_ID)
+		throw invalid("task plan.by must be a narrator id", opIndex);
+	if (!Number.isSafeInteger(p.round) || (p.round as number) < 0)
+		throw invalid("task plan.round must be a non-negative integer", opIndex);
+	if (p.baseSeq !== undefined && (!Number.isSafeInteger(p.baseSeq) || p.baseSeq < 0))
+		throw invalid("task plan.baseSeq must be a non-negative integer", opIndex);
+	if (p.approvedBy !== undefined) checkActorRef(p.approvedBy, "task plan.approvedBy", opIndex);
+}
+
 function checkTaskFields(task: OutlineTaskPatch, opIndex: number): void {
 	if (task.manager !== undefined && task.manager !== null)
 		checkActorRef(task.manager, "task manager", opIndex);
 	checkFlag(task.humanCreated, "humanCreated", opIndex);
 	checkFlag(task.claimable, "claimable", opIndex);
+	if (task.plan !== undefined && task.plan !== null) checkPlanInput(task.plan, opIndex);
 	if (task.lock !== undefined && task.lock !== null) {
 		const lock = task.lock as Partial<OutlineTaskLockInput>;
 		if (typeof lock !== "object") throw invalid("task lock must be an object", opIndex);
@@ -1137,6 +1186,8 @@ interface PlannerExtra {
 	/** Asked when an agent's commit writes the session's behavior page; see `agentBehaviorGrant`. */
 	behaviorGrant?: () => boolean;
 	question?: OutlineWriteOptions["question"];
+	delegateClaim?: OutlineWriteOptions["delegateClaim"];
+	expectClaims?: OutlineWriteOptions["expectClaims"];
 }
 
 class OutlinePlanner {
@@ -1186,10 +1237,16 @@ class OutlinePlanner {
 		return this.input.actor.kind === "agent" && this.commitKind === "edit" && !this.leaseExpiry;
 	}
 
-	/** An agent may not lock or unlock (Q5): only people lock, through `lockOutlineTask`. */
+	/**
+	 * An agent may not lock or unlock (Q5): only people lock, through `lockOutlineTask`. Nor may it
+	 * set or clear a plan's state: plan mode and the approval keep it (`plans.ts`).
+	 */
 	private checkLockInput(task: OutlineTaskPatch | null | undefined, opIndex: number): void {
-		if (task?.lock !== undefined && this.input.actor.kind === "agent" && this.commitKind === "edit")
+		if (this.input.actor.kind !== "agent" || this.commitKind !== "edit") return;
+		if (task?.lock !== undefined)
 			throw new OutlineWriteError(OUTLINE_TEXT.lockDenied, "OUTLINE_LOCK_DENIED", opIndex);
+		if (task?.plan !== undefined)
+			throw new OutlineWriteError(OUTLINE_TEXT.planStateDenied, "OUTLINE_INVALID_OP", opIndex);
 	}
 
 	private readonly claimer: OutlineClaimer | null;
@@ -1309,7 +1366,20 @@ class OutlinePlanner {
 					? this.lockFrom(given.lock, base?.lock ?? null, opIndex)
 					: (base?.lock ?? null),
 			claimable: pick(given.claimable, base?.claimable ?? null),
+			plan: given.plan !== undefined ? this.planFrom(given.plan) : (base?.plan ?? null),
 		});
+	}
+
+	/** A plan's state as stored: `baseSeq` left out is this commit's seq. */
+	private planFrom(given: OutlineTaskPlanInput | null): OutlineTaskPlanJson | null {
+		if (given === null) return null;
+		return {
+			state: given.state,
+			by: given.by,
+			round: given.round,
+			baseSeq: given.baseSeq ?? this.space.nextSeq,
+			...(given.approvedBy ? { approvedBy: given.approvedBy } : {}),
+		};
 	}
 
 	/**
@@ -3154,13 +3224,31 @@ class OutlinePlanner {
 		}
 		const ending = all.filter((b) => doingBefore(b) && !doingNow(b));
 		const expiring = new Set(this.leaseExpiry?.blockIds ?? []);
-		const ids = [...new Set([...started.keys(), ...ending.map((b) => b.id), ...expiring])];
+		const delegate = this.extra.delegateClaim;
+		const expected = this.extra.expectClaims ?? [];
+		const ids = [
+			...new Set([
+				...started.keys(),
+				...ending.map((b) => b.id),
+				...expiring,
+				...expected.map((e) => e.taskBlockId),
+			]),
+		];
 		const rows = new Map(
 			(ids.length > 0 ? await this.store.getTaskClaims(ids) : []).map((r) => [r.taskBlockId, r]),
 		);
 		const roots = await this.sessionRoots(rows.values());
 		const own = (row: OutlineTaskClaimRow) => ownClaim(row, claimer, roots);
 		const plan: OutlineClaimPlan = { put: [], release: [], expire: [], verify: [] };
+		// What the caller decided on must still hold now, and still when the commit is written.
+		for (const { taskBlockId, expect } of expected) {
+			if (!sameClaimRow(rows.get(taskBlockId) ?? null, expect))
+				throw new OutlineClaimChangedError(taskBlockId);
+			plan.verify.push({ taskBlockId, expect });
+		}
+		if (delegate && !started.has(delegate.blockId)) {
+			throw invalid("a delegation sets its task in progress", null);
+		}
 		const holderOf = (row: OutlineTaskClaimRow): OutlineClaimHolder =>
 			row.holderUserId !== null
 				? { kind: "human", userId: row.holderUserId }
@@ -3222,6 +3310,32 @@ class OutlinePlanner {
 		for (const [id, opIndex] of started) {
 			const block = this.block(id);
 			const row = rows.get(id) ?? null;
+			if (delegate?.blockId === id) {
+				// A delegation: the subagent takes it from whoever of its session held it, with the
+				// generation the delegation read plus one. It starts work, never resumes a task that
+				// was finished meanwhile (the caller's base version makes that a conflict first).
+				const before = block.base?.deleted ? null : (block.base?.taskJson?.status ?? null);
+				if (before !== "todo" && before !== "doing") throw new OutlineClaimChangedError(id);
+				if (row && !own(row) && liveClaim(row, this.now)) {
+					throw new OutlineTaskClaimedError(id, this.address(block.sid), holderOf(row), opIndex);
+				}
+				if ((row?.epoch ?? 0) + 1 !== delegate.epoch) throw new OutlineClaimChangedError(id);
+				plan.put.push({
+					row: {
+						taskBlockId: id,
+						holderNarratorId: delegate.holderNarratorId,
+						holderUserId: null,
+						epoch: delegate.epoch,
+						taskVersionAtClaim: versioned.has(id) ? seq : (block.base?.versionSeq ?? seq),
+						claimedAt: this.now,
+						expiresAt: outlineLeaseEnd(this.now),
+						lastHolderNarratorId: null,
+						lastHolderUserId: null,
+					},
+					expect: row,
+				});
+				continue;
+			}
 			if (row && own(row)) {
 				// Its own (or its session's): a running lease stays as it is; a lapsed one runs
 				// again, held by the writer, only while the row is still as read.
@@ -3504,6 +3618,13 @@ async function writePrepared(
 	const store = options.store ?? outlineStore;
 	const compensating = options.compensating;
 	const attempts = options.maxAttempts ?? DEFAULT_ATTEMPTS;
+	// A delegation's claim and the claims a commit rests on are the system's own decisions.
+	if ((options.delegateClaim || options.expectClaims) && input.actor.kind !== "system") {
+		throw invalid("only the system hands a task to a subagent or rests a commit on claims", null);
+	}
+	if (options.delegateClaim && !input.narratorId) {
+		throw invalid("a delegation is written for the delegating session", null);
+	}
 	const commitKind: OutlineCommitKind = compensating
 		? "revert"
 		: options.confirm
@@ -3556,6 +3677,8 @@ async function writePrepared(
 					confirm: options.confirm,
 					behaviorGrant,
 					question: options.question,
+					delegateClaim: options.delegateClaim,
+					expectClaims: options.expectClaims,
 				},
 			);
 			let outcome: Planned | Hold | null;
