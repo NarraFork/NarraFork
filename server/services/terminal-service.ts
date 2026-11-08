@@ -10,7 +10,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { getHome, IS_WINDOWS } from "../lib/platform";
-import { BufferManager } from "../terminal/buffer-manager";
+import { BufferManager, type BufferReadCursor } from "../terminal/buffer-manager";
 import {
 	dtachService,
 	findProcessesByArg,
@@ -36,6 +36,13 @@ import {
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
 
 const DEFAULT_SHELL = detectShell().path;
+
+/** Internal tool observation only; marker/buffer never enter the public scrollback DTO. */
+export type TerminalReadObserver = (
+	buffer: BufferManager,
+	cursor: BufferReadCursor | undefined,
+	sequence: number,
+) => void;
 
 export interface TerminalProcessInfo {
 	pid: number;
@@ -473,6 +480,8 @@ export const terminalService = {
 				if (activeTerminals.get(terminalId) !== active) return;
 				await active.buffer.resize(cols, rows);
 				if (activeTerminals.get(terminalId) !== active) return;
+				// Reflow can expire an observation even if the child emits no output.
+				notifyTerminalOutput(terminalId);
 				active.runtime.resize(cols, rows);
 				// Bun.Terminal.resize() does not send SIGWINCH to the child.
 				// dtach relies on SIGWINCH to forward the new size. Only on Unix.
@@ -703,12 +712,15 @@ export const terminalService = {
 
 	async getScrollback(
 		terminalId: string,
+		observe?: TerminalReadObserver,
 	): Promise<{ data: string; cols: number; rows: number } | null> {
 		// Same-ID legacy buffers are not evidence of ownership of a resource terminal.
 		await this.getById(terminalId);
 		const active = activeTerminals.get(terminalId);
 		if (active) {
-			const contents = await active.buffer.getContents();
+			const contents = await active.buffer.getContents(
+				observe ? (cursor, sequence) => observe(active.buffer, cursor, sequence) : undefined,
+			);
 			await this.getById(terminalId);
 			if (!contents) return null;
 			return { data: contents, cols: active.buffer.cols, rows: active.buffer.rows };
