@@ -16,6 +16,7 @@ import { narrators, outlineQuestions, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import { settings } from "../../lib/settings";
+import { readSpecTasksForPlugin, writeSpecForPlugin } from "../narrator-session";
 import { OUTLINE_BEHAVIOR_ALIAS } from "../outline/model";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../outline/person-tasks";
 import { ensureSessionSpace } from "../outline/spaces";
@@ -478,6 +479,47 @@ describe("the overwrite in an outline session", () => {
 		await command("spec_write", { narratorId: id, uri: "tasks.json", content });
 		const page = await taskPage(id);
 		expect(page.map((t) => [t.id, t.status])).toEqual([[first?.id, "todo"]]);
+	});
+
+	test("a full list of long tasks reads and writes back; new text past one commit writes nothing", async () => {
+		const id = await session("outline");
+		const space = await ensureSessionSpace(id);
+		const texts = Array.from({ length: 100 }, (_, n) => `${n} ${"任务正文".repeat(249)}`);
+		for (let i = 0; i < texts.length; i += 25) {
+			await writeOutline({
+				spaceId: space.id,
+				ops: texts.slice(i, i + 25).map((content) => ({
+					op: "insert" as const,
+					parent: null,
+					content,
+					task: { status: "todo" as const },
+				})),
+				actor: { kind: "human", id: "pat" },
+				responsibleUserId: null,
+			});
+		}
+		// Through the session layer: the public API caps one string at 64 KiB, which this list's
+		// tasks.json is over in either backend (as before; not a conversion matter).
+		const read = await readSpecTasksForPlugin(id, { pluginId: PLUGIN });
+		const listed = read.compiled.tasks;
+		expect(listed.map((t) => t.text)).toEqual(texts);
+		// Written back as read: matched, nothing to write (the texts are normalized in several jobs).
+		const commits = (await outlineStore.listCommits(space.id, { limit: 100 })).length;
+		await writeSpecForPlugin(
+			id,
+			"tasks.json",
+			doc(listed.map((t) => ({ text: t.text, status: "todo" }))),
+			{ pluginId: PLUGIN },
+		);
+		expect(await outlineStore.listCommits(space.id, { limit: 100 })).toHaveLength(commits);
+		// Replaced by as many new long tasks: more text than one commit carries; nothing written.
+		const replaced = await command("spec_write", {
+			narratorId: id,
+			uri: "tasks.json",
+			content: doc(texts.map((text) => ({ text: `new ${text.slice(0, 990)}`, status: "todo" }))),
+		});
+		expect(replaced.error?.code).toBe("PAYLOAD_TOO_LARGE");
+		expect(await outlineStore.listCommits(space.id, { limit: 100 })).toHaveLength(commits);
 	});
 
 	test("index.md: a page of notes, replaced on the next write; too large writes nothing", async () => {

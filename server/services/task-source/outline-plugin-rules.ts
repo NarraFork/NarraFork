@@ -49,9 +49,11 @@ import {
 	resolvePluginTaskSession,
 	writeForPlugin,
 } from "../outline/plugin-tasks";
+import { loadBodiesWithin, readSubtree } from "../outline/read";
 import type { ReportBlock } from "../outline/report-text";
 import { outlineStore } from "../outline/store";
 import type { OutlineSpaceRow, OutlineStore } from "../outline/store/port";
+import { type OutlineNode, subtreeNodes } from "../outline/tree";
 import type { OutlineCanonicalContent, OutlineOp } from "../outline/write";
 import { writeSpecFile } from "../spec-vfs-service";
 import { readTaskSession } from "./backend";
@@ -133,6 +135,17 @@ async function writeRulesBlock(
 			return { blockId: null, changed: false, space, seq: latestSeq(space) };
 		push({ op: "delete", block: { id: block.id } });
 	} else {
+		const blocks = await rulesBlocks(text, session.locale);
+		// The same rules where they belong: nothing to write (a plugin may send them on every
+		// dispatch; each would otherwise be a commit on the session's timeline).
+		if (
+			block &&
+			!block.deleted &&
+			page &&
+			block.parentId === page.id &&
+			(await holdsRules(store, block.id, blocks))
+		)
+			return { blockId: block.id, changed: false, space, seq: latestSeq(space) };
 		const pageRef = page ? { id: page.id } : { tempId: "page" };
 		if (!page)
 			push({
@@ -181,7 +194,7 @@ async function writeRulesBlock(
 				walk(node.children, { tempId });
 			}
 		};
-		walk(await rulesBlocks(text, session.locale), parentRef);
+		walk(blocks, parentRef);
 	}
 	const result = await writeForPlugin(
 		session,
@@ -204,6 +217,47 @@ async function writeRulesBlock(
 		space,
 		seq: result.commit?.seq ?? latestSeq(space),
 	};
+}
+
+/**
+ * Whether the plugin's block holds exactly these rules (contents and nesting) under it. Its
+ * subtree is a few blocks (the rules are at most 2000 characters); a larger one is not compared.
+ */
+async function holdsRules(
+	store: OutlineStore,
+	blockId: string,
+	blocks: readonly ReportBlock[],
+): Promise<boolean> {
+	const read = await readSubtree(blockId, { store });
+	if (!read) return false;
+	const nodes = subtreeNodes(read.root).filter((node) => node !== read.root);
+	if (nodes.length > OUTLINE_PLUGIN_RULES_LIMITS.children) return false;
+	await loadBodiesWithin(read.state, nodes, 64 * 1024, { store });
+	const same = (have: readonly OutlineNode[], want: readonly ReportBlock[]): boolean =>
+		have.length === want.length &&
+		have.every((node, i) => {
+			const block = want[i] as ReportBlock;
+			return (
+				node.content === block.content && node.task === null && same(node.children, block.children)
+			);
+		});
+	return same(read.root.children, blocks);
+}
+
+/**
+ * The session's old fence, or null when it cannot be read (the Dynamic Spec reads are SQLite only:
+ * on PostgreSQL a plugin's rules are written without looking at an old SOP).
+ */
+async function oldFenceOrNull(narratorId: string) {
+	try {
+		return await readOldBehaviorFence(narratorId);
+	} catch (error) {
+		logger.warn("Could not read the old behavior fence for a plugin's rules", {
+			narratorId,
+			error: String(error),
+		});
+		return null;
+	}
 }
 
 /** The old fence without its SOP, through the plugin-SOP channel: what any rules write ends with. */
@@ -239,9 +293,9 @@ export async function setOutlinePluginRules(args: {
 		);
 	const session = await resolvePluginTaskSession(args.narratorId);
 	return await oneAtATime(`rules:${session.narratorId}`, async () => {
-		const fence = await readOldBehaviorFence(session.narratorId);
+		const fence = await oldFenceOrNull(session.narratorId);
 		// An SOP another plugin left in the fence is kept, in that plugin's block.
-		if (fence.sop && !args.compat && args.pluginId !== TEAM_SOP_PLUGIN_ID) {
+		if (fence?.sop && !args.compat && args.pluginId !== TEAM_SOP_PLUGIN_ID) {
 			const space = await store.findSpace({ kind: "session", narratorId: session.narratorId });
 			const sid = pluginRulesSid(TEAM_SOP_PLUGIN_ID);
 			const [held] = space ? await store.getBlockMetas(space.id, { sids: [sid] }) : [];
@@ -257,7 +311,7 @@ export async function setOutlinePluginRules(args: {
 			args.mode === "clear" || !text ? null : text,
 			{ store },
 		);
-		if (fence.sopSections) await dropFenceSop(session.narratorId);
+		if (fence?.sopSections) await dropFenceSop(session.narratorId);
 		return written;
 	});
 }

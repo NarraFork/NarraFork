@@ -71,8 +71,13 @@ export const OUTLINE_PLUGIN_TASK_LIMITS = {
 	readDefault: 50,
 	/** Characters of a task's text a read returns, and of a task a plugin adds. */
 	textChars: 1000,
-	/** Pages one read looks at; the next call continues after the last. */
-	pagesPerRead: 50,
+	/**
+	 * Pages one read looks at; the next call continues after the last. Each is one indexed read of
+	 * the page's structure (off the main thread when large), so the row budget is what bounds the
+	 * work; this keeps a space of many one-block pages (a task per page) from costing a read each
+	 * past it.
+	 */
+	pagesPerRead: 200,
 	/** Structure rows (blocks of the pages, without content) one read takes. */
 	rowsPerRead: 20_000,
 	/** Pages one listing of a space's pages takes. */

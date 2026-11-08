@@ -53,7 +53,7 @@ import { createHash } from "node:crypto";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { DELEGATION_BLOCK_TEXT } from "./outline/delegation-text";
-import { processEditText } from "./outline/edit-text-runner";
+import { OUTLINE_EDIT_TEXT_LIMITS, processEditText } from "./outline/edit-text-runner";
 import { OUTLINE_TEXT } from "./outline/messages";
 import { OUTLINE_LIMITS, OUTLINE_TASKS_PAGE_ALIAS } from "./outline/model";
 import { OUTLINE_TASKS_PAGE_TITLE, oneAtATime } from "./outline/person-tasks";
@@ -264,6 +264,27 @@ function matchItems(
 	});
 }
 
+/**
+ * The texts as the write path would store them: normalized off the main thread when large, in
+ * jobs within half of what one job may carry (100 tasks of 1000 characters can exceed one).
+ */
+async function normalizedTexts(texts: readonly string[]): Promise<string[]> {
+	const out: string[] = [];
+	for (let i = 0; i < texts.length; ) {
+		const job: string[] = [];
+		let bytes = 0;
+		for (; i < texts.length; i++) {
+			const size = Buffer.byteLength(texts[i] as string, "utf8");
+			if (job.length > 0 && bytes + size > OUTLINE_EDIT_TEXT_LIMITS.maxBytes / 2) break;
+			job.push(texts[i] as string);
+			bytes += size;
+		}
+		const normalized = await processEditText({ kind: "normalize", contents: job });
+		for (const entry of normalized) out.push(entry.content);
+	}
+	return out;
+}
+
 /** `spec_write` of tasks.json in an outline session. */
 export async function writeSpecTasksCompat(args: {
 	narratorId: string;
@@ -284,9 +305,7 @@ export async function writeSpecTasksCompat(args: {
 			new Date().toISOString(),
 		);
 		const { entries } = await readSpecCompatList(session, store);
-		const normalized = (
-			await processEditText({ kind: "normalize", contents: document.tasks.map((t) => t.text) })
-		).map((entry) => entry.content);
+		const normalized = await normalizedTexts(document.tasks.map((t) => t.text));
 		const matches = matchItems(entries, document.tasks, normalized);
 		const matched = new Set(matches.filter((at) => at >= 0));
 

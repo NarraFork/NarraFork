@@ -26,7 +26,12 @@ import {
 	settleOutlinePluginTaskEventsForTests,
 	startOutlinePluginTaskEvents,
 } from "../outline/plugin-task-events";
-import { comparePaths, encodeTaskCursor, isAfterCursor } from "../outline/plugin-tasks";
+import {
+	comparePaths,
+	encodeTaskCursor,
+	isAfterCursor,
+	OUTLINE_PLUGIN_TASK_LIMITS,
+} from "../outline/plugin-tasks";
 import { ensureSessionSpace } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
 import { type OutlineOp, writeOutline } from "../outline/write";
@@ -354,6 +359,34 @@ describe("tasks_read", () => {
 		);
 	});
 
+	test("a read stops at its page budget and the cursor continues past the last page read", async () => {
+		const id = await session();
+		for (let i = 0; i < OUTLINE_PLUGIN_TASK_LIMITS.pagesPerRead + 5; i += 150) {
+			await human(
+				id,
+				Array.from({ length: 150 }, (_, n) => ({
+					op: "insert" as const,
+					parent: null,
+					content: `Notes ${i + n}`,
+				})),
+			);
+		}
+		await human(id, [
+			{ op: "insert", parent: null, content: "Late task", task: { status: "todo" } },
+		]);
+		const first = await ok<{ tasks: unknown[]; nextCursor: string | null }>("tasks_read", {
+			narratorId: id,
+		});
+		expect(first.tasks).toEqual([]);
+		expect(first.nextCursor).not.toBeNull();
+		const second = await ok<{ tasks: Array<{ text: string }>; nextCursor: string | null }>(
+			"tasks_read",
+			{ narratorId: id, cursor: first.nextCursor },
+		);
+		expect(second.tasks.map((t) => t.text)).toEqual(["Late task"]);
+		expect(second.nextCursor).toBeNull();
+	});
+
 	test("positions compare in document order; a cursor past a page skips what is under it", () => {
 		const page: [string, string] = ["a0", "page1"];
 		const under = [page, ["a0", "x"] as [string, string]];
@@ -586,6 +619,12 @@ describe("behavior_rules_set", () => {
 		await ok("behavior_rules_set", { narratorId: id, mode: "upsert", text: "Only this." });
 		held = await rules(id);
 		expect(held?.children.map(([content]) => content)).toEqual(["Only this."]);
+		// The same rules again: nothing is written.
+		const before = (await outlineStore.listCommits(space.id, { limit: 50 })).length;
+		expect(
+			await ok("behavior_rules_set", { narratorId: id, mode: "upsert", text: "Only this." }),
+		).toEqual({ blockId: first.blockId });
+		expect(await outlineStore.listCommits(space.id, { limit: 50 })).toHaveLength(before);
 
 		// A person deletes it: the next update brings it back with the new rules.
 		await human(id, [{ op: "delete", block: { id: first.blockId } }]);
