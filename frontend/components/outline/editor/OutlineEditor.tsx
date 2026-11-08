@@ -32,14 +32,21 @@ import {
 import { notifications } from "@mantine/notifications";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import type { LiveCloseCode } from "@shared/outline-live-protocol";
-import { IconArrowDown, IconArrowRight, IconArrowsMaximize, IconSearch } from "@tabler/icons-react";
+import {
+	IconArrowDown,
+	IconArrowRight,
+	IconArrowsMaximize,
+	IconRobot,
+	IconSearch,
+} from "@tabler/icons-react";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
+import { OutlineHrefLink } from "../outline-nav";
 import type { OutlineViewState } from "../view-state";
 import { type BlockMark, chromeText } from "./chrome";
-import type { LiveClient, LiveTransport } from "./live-client";
+import type { LiveClient, LiveTransport, Peer } from "./live-client";
 import {
 	acquireLiveSession,
 	liveSessionClient,
@@ -367,7 +374,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 		setRefusal(null);
 	}, [refusal, t]);
 
-	const peers = [...client.presence.values()];
+	// People first, then the agents the server shows (P2 PR 10b); the ones past six, and agents
+	// past the server's limit, are counted.
+	const present = [...client.presence.values()];
+	const peers = [...present.filter((p) => !p.agent), ...present.filter((p) => p.agent)];
+	const hidden = Math.max(0, peers.length - 6) + client.agentsMore;
 	const status = client.status;
 	const deleted = client.deleted;
 	const view = viewState.view;
@@ -437,23 +448,27 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 					)}
 				</Group>
 				<Group gap={6} wrap="nowrap" className="nf-outline-presence">
-					{peers.length > 0 && (
+					{(peers.length > 0 || hidden > 0) && (
 						<Avatar.Group spacing={6}>
-							{peers.slice(0, 6).map((p) => (
-								<Tooltip
-									key={p.pno}
-									label={t(p.editing ? "editor.peerEditing" : "editor.peerViewing", {
-										name: p.name || t("editor.someone"),
-									})}
-								>
-									<Avatar size={22} radius="xl" style={{ background: p.color, color: "#fff" }}>
-										{(p.name || "?").slice(0, 1).toUpperCase()}
-									</Avatar>
-								</Tooltip>
-							))}
-							{peers.length > 6 && (
-								<Avatar size={22} radius="xl">
-									+{peers.length - 6}
+							{peers.slice(0, 6).map((p) =>
+								p.agent ? (
+									<AgentAvatar key={p.pno} peer={p} />
+								) : (
+									<Tooltip
+										key={p.pno}
+										label={t(p.editing ? "editor.peerEditing" : "editor.peerViewing", {
+											name: p.name || t("editor.someone"),
+										})}
+									>
+										<Avatar size={22} radius="xl" style={{ background: p.color, color: "#fff" }}>
+											{(p.name || "?").slice(0, 1).toUpperCase()}
+										</Avatar>
+									</Tooltip>
+								),
+							)}
+							{hidden > 0 && (
+								<Avatar size={22} radius="xl" data-testid="outline-presence-more">
+									+{hidden}
 								</Avatar>
 							)}
 						</Avatar.Group>
@@ -521,5 +536,66 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			)}
 			<div ref={frame} className="nf-outline-editor-host" data-testid="outline-frame" />
 		</div>
+	);
+}
+
+/**
+ * An agent at work on the page (outline P2 PR 10b): a robot in its session's colour, with the
+ * first letter of its title. Named, and a link to its session, only for a person who may read
+ * that session (the server sends its id then); otherwise just "an agent".
+ */
+function AgentAvatar({ peer }: { peer: Peer }) {
+	const { t } = useTranslation("outline");
+	const narratorId = peer.agent?.narratorId ?? null;
+	const name = peer.name.trim();
+	const session = peer.agent?.session ?? null;
+	const label =
+		narratorId && name
+			? session
+				? t("editor.agentWorkingIn", { name, session })
+				: t("editor.agentWorking", { name })
+			: t("editor.agentHidden");
+	const style = { background: peer.color, color: "#fff" };
+	const face = (
+		<>
+			{narratorId && name ? (
+				<span className="nf-outline-agent-initial">{name.slice(0, 1).toUpperCase()}</span>
+			) : null}
+			<IconRobot
+				size={narratorId && name ? 9 : 14}
+				className={narratorId && name ? "nf-outline-agent-badge" : undefined}
+				aria-hidden
+			/>
+		</>
+	);
+	return (
+		<Tooltip label={label}>
+			{narratorId ? (
+				<Avatar
+					component={OutlineHrefLink}
+					path={`/narrators/${encodeURIComponent(narratorId)}`}
+					size={22}
+					radius="xl"
+					style={style}
+					className="nf-outline-agent-avatar"
+					aria-label={label}
+					data-testid="outline-agent-avatar"
+					data-agent={narratorId}
+				>
+					{face}
+				</Avatar>
+			) : (
+				<Avatar
+					size={22}
+					radius="xl"
+					style={style}
+					className="nf-outline-agent-avatar"
+					aria-label={label}
+					data-testid="outline-agent-avatar"
+				>
+					{face}
+				</Avatar>
+			)}
+		</Tooltip>
 	);
 }

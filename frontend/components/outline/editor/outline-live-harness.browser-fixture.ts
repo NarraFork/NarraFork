@@ -249,7 +249,14 @@ export async function openEditor(
 	h: Harness,
 	userId: string,
 	pageId: string,
-	options: { canWrite?: boolean; focusId?: string; lens?: "facts" | "all"; width?: number } = {},
+	options: {
+		canWrite?: boolean;
+		focusId?: string;
+		lens?: "facts" | "all";
+		width?: number;
+		lang?: "en" | "zh-CN";
+		scheme?: "light" | "dark";
+	} = {},
 ): Promise<Editor> {
 	const context = await h.browser.createBrowserContext();
 	h.contexts.push(context);
@@ -274,6 +281,8 @@ export async function openEditor(
 		...(options.focusId ? { focusId: options.focusId } : {}),
 		...(options.lens ? { lens: options.lens } : {}),
 		...(options.width ? { width: options.width - 32 } : {}),
+		...(options.lang ? { lang: options.lang } : {}),
+		...(options.scheme ? { scheme: options.scheme } : {}),
 	});
 	try {
 		await page.waitForFunction(
