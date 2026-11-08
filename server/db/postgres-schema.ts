@@ -3283,6 +3283,7 @@ export const knowledgeSubmissions = pgTable(
 		verdict: text("verdict"),
 		findingsJson: jsonText("findings_json"),
 		reviewedAt: text("reviewed_at"),
+		authorReadAt: text("author_read_at"),
 		mergedRevisionId: text("merged_revision_id"),
 		createdAt: text("created_at").notNull(),
 	},
@@ -3295,6 +3296,7 @@ export const knowledgeSubmissions = pgTable(
 		index("idx_ks_reviewer_user").on(table.reviewerUserId),
 		index("idx_ks_collection").on(table.collectionId),
 		index("idx_ks_draft").on(table.draftId),
+		index("idx_ks_submitter_author_read").on(table.submitterUserId, table.authorReadAt),
 	],
 );
 
@@ -4321,7 +4323,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 139,
-  "columnCount": 1849,
+  "columnCount": 1850,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -23374,6 +23376,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "authorReadAt",
+          "name": "author_read_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "mergedRevisionId",
           "name": "merged_revision_id",
           "kind": "text",
@@ -23448,6 +23459,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_ks_draft",
           "columns": [
             "draftId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_ks_submitter_author_read",
+          "columns": [
+            "submitterUserId",
+            "authorReadAt"
           ],
           "unique": false
         }

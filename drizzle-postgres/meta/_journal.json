@@ -432,8 +432,15 @@
 		{
 			"idx": 61,
 			"version": "7",
-			"when": 1794134412599,
-			"tag": "0061_narrator_workspace_directories",
+			"when": 1794134144250,
+			"tag": "0061_submission_author_read",
+			"breakpoints": true
+		},
+		{
+			"idx": 62,
+			"version": "7",
+			"when": 1794136142791,
+			"tag": "0062_narrator_workspace_directories",
 			"breakpoints": true
 		}
   ]

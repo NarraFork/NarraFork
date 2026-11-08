@@ -515,12 +515,17 @@ export const settingsApi = {
 	removeRecentTab: (
 		type: PersistedRecentTab["type"],
 		id: string,
-		options?: { cascade?: boolean },
-	) =>
-		request<RecentTabsMutationResponse>(
-			`/user-preferences/recent-tabs/${type}/${id}${options?.cascade ? "?cascade=1" : ""}`,
+		options?: { cascade?: boolean; keepEmptyFolder?: boolean },
+	) => {
+		const params = new URLSearchParams();
+		if (options?.cascade) params.set("cascade", "1");
+		if (options?.keepEmptyFolder) params.set("keepEmptyFolder", "1");
+		const query = params.size > 0 ? `?${params.toString()}` : "";
+		return request<RecentTabsMutationResponse>(
+			`/user-preferences/recent-tabs/${type}/${id}${query}`,
 			{ method: "DELETE" },
-		),
+		);
+	},
 	moveRecentTab: (key: string, target: RecentTabMoveTarget, signal?: AbortSignal) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",

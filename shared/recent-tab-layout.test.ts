@@ -97,6 +97,16 @@ describe("folder operations", () => {
 		expect(shape(applyRecentTabRemove(single, "narrator:m2"))).toEqual(["a", "*b"]);
 	});
 
+	test("keepEmptyFolder leaves an emptied folder header in place", () => {
+		// 归档是可撤销的：最后一条记录离开时，文件夹不该跟着消失。
+		const tabs = [tab("a"), folder("f"), tab("m1", { folderId: "f" })];
+		expect(shape(applyRecentTabRemove(tabs, "narrator:m1"))).toEqual(["a"]);
+		expect(shape(applyRecentTabRemove(tabs, "narrator:m1", { keepEmptyFolder: true }))).toEqual([
+			"a",
+			"[f]",
+		]);
+	});
+
 	test("operations never mutate their input", () => {
 		const tabs = base();
 		const snapshot = JSON.stringify(tabs);

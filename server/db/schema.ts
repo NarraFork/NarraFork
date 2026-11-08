@@ -5213,6 +5213,10 @@ export const knowledgeSubmissions = sqliteTable(
 		verdict: text("verdict", { enum: ["approve", "request_changes", "reject", "comment_only"] }),
 		findingsJson: text("findings_json", { mode: "json" }),
 		reviewedAt: text("reviewed_at"),
+		// When the AUTHOR opened this verdict. NULL = still unread, which is what the
+		// notification bell counts. Symmetric with `reviewedAt` on the other side of the same
+		// handshake: the reviewer marks the review, the author marks having read it.
+		authorReadAt: text("author_read_at"),
 		// The main revision produced when this submission was merged.
 		mergedRevisionId: text("merged_revision_id"),
 		createdAt: text("created_at").notNull(),
@@ -5228,6 +5232,9 @@ export const knowledgeSubmissions = sqliteTable(
 		index("idx_ks_reviewer_user").on(table.reviewerUserId),
 		index("idx_ks_collection").on(table.collectionId),
 		index("idx_ks_draft").on(table.draftId),
+		// Serves the author's unread-verdict count and the per-row "mark read" update: both
+		// filter on submitter + author_read_at IS NULL.
+		index("idx_ks_submitter_author_read").on(table.submitterUserId, table.authorReadAt),
 	],
 );
 

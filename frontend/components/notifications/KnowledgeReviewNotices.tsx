@@ -11,6 +11,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import {
 	useKnowledgeSubmissions,
+	useMarkSubmissionOutcomesRead,
 	useMyKnowledgeSubmissionOutcomes,
 	useReviewInboxCount,
 } from "../../hooks/useKnowledge";
@@ -24,6 +25,7 @@ export function KnowledgeReviewNotices({ onOpen }: { onOpen: () => void }) {
 	const navigate = useNavigate();
 	const inbox = useReviewInboxCount();
 	const outcomes = useMyKnowledgeSubmissionOutcomes();
+	const markOutcomeRead = useMarkSubmissionOutcomesRead();
 	const pending = useKnowledgeSubmissions({ status: "pending" });
 	const conflicts = useKnowledgeSubmissions({ status: "conflict" });
 
@@ -40,6 +42,16 @@ export function KnowledgeReviewNotices({ onOpen }: { onOpen: () => void }) {
 	const openRequest = (submissionId: string) => {
 		void navigate(knowledgeRequestDestination(submissionId));
 		onOpen();
+	};
+
+	/**
+	 * Opening a verdict is what marks it read — the same "activation is acknowledgement"
+	 * rule the notification center uses for its own rows. Fire-and-forget: navigation
+	 * unmounts this panel, and a failed stamp must not block the jump.
+	 */
+	const openOutcome = (submissionId: string, unread: boolean) => {
+		if (unread) void markOutcomeRead.mutateAsync([submissionId]).catch(() => {});
+		openRequest(submissionId);
 	};
 
 	const inboxLabel = inbox.data?.capped
@@ -86,15 +98,17 @@ export function KnowledgeReviewNotices({ onOpen }: { onOpen: () => void }) {
 			))}
 			{authorRows.map((row) => {
 				const finding = row.findingsJson?.[0];
+				const unread = !row.authorReadAt;
 				return (
 					<UnstyledButton
 						key={row.id}
 						data-testid="knowledge-review-outcome"
 						data-submission-id={row.id}
-						onClick={() => openRequest(row.id)}
+						data-unread={unread ? "true" : undefined}
+						onClick={() => openOutcome(row.id, unread)}
 						style={{ width: "100%", textAlign: "left", padding: "8px 12px", borderRadius: 8 }}
 					>
-						<Text size="sm" fw={600} lineClamp={1}>
+						<Text size="sm" fw={unread ? 700 : 600} lineClamp={1}>
 							{t(`reviewNoticeOutcome_${row.status}`)}
 						</Text>
 						{finding ? (

@@ -219,7 +219,10 @@ function normalizeTab(tab: PersistedRecentTab): PersistedRecentTab {
 	return normalized;
 }
 
-function deduplicateTabs(input: PersistedRecentTab[]): PersistedRecentTab[] {
+function deduplicateTabs(
+	input: PersistedRecentTab[],
+	options: { prune?: boolean } = {},
+): PersistedRecentTab[] {
 	const seen = new Set<string>();
 	const result: PersistedRecentTab[] = [];
 	for (const tab of input) {
@@ -228,7 +231,9 @@ function deduplicateTabs(input: PersistedRecentTab[]): PersistedRecentTab[] {
 		seen.add(key);
 		result.push(normalizeTab(tab));
 	}
-	return regroupFolders(result, { prune: true });
+	// `prune: false` keeps an emptied folder header: archiving is reversible, so the folder
+	// has to outlive its last member long enough for the restore to land in it.
+	return regroupFolders(result, { prune: options.prune ?? true });
 }
 
 /**
@@ -249,10 +254,11 @@ function trimTabsAtomic(
 	input: PersistedRecentTab[],
 	limit: number,
 	protectedKey?: string,
+	options: { prune?: boolean } = {},
 ): { tabs: PersistedRecentTab[]; protectedGroupTooLarge: boolean } {
 	// A copy: the shared regroup hands back `input` itself when it is already in shape,
 	// and the loop below splices.
-	const tabs = [...regroupFolders(input, { prune: true })];
+	const tabs = [...regroupFolders(input, { prune: options.prune ?? true })];
 	if (tabs.length <= limit) return { tabs, protectedGroupTooLarge: false };
 
 	const protectedIndex = protectedKey
@@ -314,8 +320,14 @@ function findEvictionVictim(
 function normalizeAndLimitTabs(
 	input: PersistedRecentTab[],
 	protectedKey?: string,
+	options: { prune?: boolean } = {},
 ): { tabs: PersistedRecentTab[]; protectedGroupTooLarge: boolean } {
-	return trimTabsAtomic(deduplicateTabs(input), RECENT_TABS_STORAGE_LIMIT, protectedKey);
+	return trimTabsAtomic(
+		deduplicateTabs(input, options),
+		RECENT_TABS_STORAGE_LIMIT,
+		protectedKey,
+		options,
+	);
 }
 
 function parseLegacyTabs(recentTabsJson: string | null | undefined): PersistedRecentTab[] {
@@ -884,13 +896,14 @@ function persistMutationLocked(
 async function mutate(
 	userId: string,
 	transform: (tabs: PersistedRecentTab[]) => MutationState | Promise<MutationState>,
+	options: { prune?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
 		const baseRevision = ensureMigratedLocked(userId);
 		const oldRows = readRows(userId);
 		const before = oldRows.map(rowToTab);
 		const transformed = await transform(before.map(cloneTab));
-		const normalized = normalizeAndLimitTabs(transformed.tabs);
+		const normalized = normalizeAndLimitTabs(transformed.tabs, undefined, options);
 		return persistMutationLocked(
 			userId,
 			oldRows,
@@ -1081,20 +1094,26 @@ export async function removeRecentTab(
 	userId: string,
 	type: RecentTabType,
 	id: string,
-	options: { storeUndo?: boolean } = {},
+	options: { storeUndo?: boolean; keepEmptyFolder?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => {
-		const key = `${type}:${id}`;
-		const index = tabs.findIndex((tab) => tabKey(tab) === key);
-		if (index < 0) return { tabs };
-		// Snapshot BEFORE the splice — after it the removed tab is gone and the undo
-		// entry would restore an already-empty slot.
-		const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
-		const next = applyRecentTabRemove(tabs, key);
-		// An emptied folder header goes with its last member but is not counted as closed.
-		const removedCount = isFolderTab(tabs[index]) ? tabs.length - next.length : 1;
-		return { tabs: next, options: { removedCount, ...(undoTabs ? { undoTabs } : {}) } };
-	});
+	return mutate(
+		userId,
+		(tabs) => {
+			const key = `${type}:${id}`;
+			const index = tabs.findIndex((tab) => tabKey(tab) === key);
+			if (index < 0) return { tabs };
+			// Snapshot BEFORE the splice — after it the removed tab is gone and the undo
+			// entry would restore an already-empty slot.
+			const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
+			const next = applyRecentTabRemove(tabs, key, {
+				keepEmptyFolder: options.keepEmptyFolder,
+			});
+			// An emptied folder header goes with its last member but is not counted as closed.
+			const removedCount = isFolderTab(tabs[index]) ? tabs.length - next.length : 1;
+			return { tabs: next, options: { removedCount, ...(undoTabs ? { undoTabs } : {}) } };
+		},
+		{ prune: !options.keepEmptyFolder },
+	);
 }
 
 export interface MoveRecentTabInput {

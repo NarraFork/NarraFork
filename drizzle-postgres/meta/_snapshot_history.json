@@ -491,11 +491,19 @@
 		},
 		{
 			"idx": 61,
-			"tag": "0061_narrator_workspace_directories",
-			"id": "89ee704a-9e32-4b0b-b2a6-1fd5f5bef803",
+			"tag": "0061_submission_author_read",
+			"id": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
 			"prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
 			"version": "7",
-			"snapshotDigest": "944ca5a51df0663a97618c327bb5c204b06dbd89d187d5432e7aa273be80ea0c"
+			"snapshotDigest": "6ee0ea437708c2e7d7d59873f16084fed98d57e61226cc6433dbc6a6f6892f3a"
+		},
+		{
+			"idx": 62,
+			"tag": "0062_narrator_workspace_directories",
+			"id": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+			"prevId": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
+			"version": "7",
+			"snapshotDigest": "31d3a09f3fdf1de5e444e2b63fe1ab1e775ff1638f78e09dfe3e4eab62b397cb"
 		}
 	]
 }

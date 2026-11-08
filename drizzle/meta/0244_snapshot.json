@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "338444a6-6224-4aeb-b75b-3f7da7ba42a4",
+  "id": "369f5eb5-79ed-4fdc-bbbe-d8a63ee1c64c",
   "prevId": "99a59e43-f324-4726-81c2-e85bb26be015",
   "tables": {
     "acl_events": {
@@ -7325,6 +7325,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "author_read_at": {
+          "name": "author_read_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "merged_revision_id": {
           "name": "merged_revision_id",
           "type": "text",
@@ -7396,6 +7403,14 @@
           "name": "idx_ks_draft",
           "columns": [
             "draft_id"
+          ],
+          "isUnique": false
+        },
+        "idx_ks_submitter_author_read": {
+          "name": "idx_ks_submitter_author_read",
+          "columns": [
+            "submitter_user_id",
+            "author_read_at"
           ],
           "isUnique": false
         }
@@ -12435,14 +12450,6 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
-        },
-        "workspace_directories": {
-          "name": "workspace_directories",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": "'{}'"
         },
         "error_message": {
           "name": "error_message",

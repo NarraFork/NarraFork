@@ -109,7 +109,10 @@ async function retry<T>(request: PrefixSnapshotRequest, action: () => Promise<T>
 			return await action();
 		} catch (error) {
 			const code = (error as { code?: string }).code;
-			if (code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED" && code !== "55P03") throw error;
+			// BUSY_SNAPSHOT/RECOVERY read the same "database is locked" but carry a suffixed
+			// code. Every statement here is autocommit, so a retry opens a fresh snapshot.
+			if (!code?.startsWith("SQLITE_BUSY") && code !== "SQLITE_LOCKED" && code !== "55P03")
+				throw error;
 			await Bun.sleep(Math.min(250, 10 * 2 ** Math.min(attempts++, 5)));
 		}
 	}
@@ -130,15 +133,18 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 		const roots = request.value as string[];
 		const hashes = new Set(roots);
 		for (const hash of roots) {
-			const rows = await query<{ prefix: string }>(
-				"SELECT substr(text, 1, 1) AS prefix FROM narrator_text_snapshots WHERE sha256 = ?",
-				[hash],
+			const rows = await retry(request, () =>
+				query<{ prefix: string }>(
+					"SELECT substr(text, 1, 1) AS prefix FROM narrator_text_snapshots WHERE sha256 = ?",
+					[hash],
+				),
 			);
 			if (!rows[0]) throw new Error("Prefix snapshot publication target is missing");
 			if (/^[{\s]$/.test(rows[0].prefix)) {
-				const [content] = await query<{ text: string }>(
-					"SELECT text FROM narrator_text_snapshots WHERE sha256 = ?",
-					[hash],
+				const [content] = await retry(request, () =>
+					query<{ text: string }>("SELECT text FROM narrator_text_snapshots WHERE sha256 = ?", [
+						hash,
+					]),
 				);
 				if (!content) throw new Error("Prefix snapshot publication target is missing");
 				let manifest: unknown;

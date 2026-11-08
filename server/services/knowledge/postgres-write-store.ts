@@ -106,6 +106,7 @@ import type {
 	KnowledgeTagRowWrite,
 	KnowledgeTagTypeRowWrite,
 	KnowledgeWriteStore,
+	MarkSubmissionAuthorReadWrite,
 	MarkSubmissionConflictWrite,
 	RebaseDraftContentWrite,
 	RecordInjectionEventsWrite,
@@ -1243,6 +1244,23 @@ export function createPostgresKnowledgeWriteStore(db: BunSQLDatabase): Knowledge
 					label: "knowledge.markSubmissionConflict",
 				},
 			);
+		},
+
+		async markSubmissionAuthorRead(input: MarkSubmissionAuthorReadWrite): Promise<number> {
+			if (input.submissionIds.length === 0) return 0;
+			const rows = await db
+				.update(knowledgeSubmissions)
+				.set({ authorReadAt: input.now })
+				// `author_read_at IS NULL` keeps the first-read timestamp stable across repeats.
+				.where(
+					and(
+						inArray(knowledgeSubmissions.id, input.submissionIds),
+						eq(knowledgeSubmissions.submitterUserId, input.authorUserId),
+						isNull(knowledgeSubmissions.authorReadAt),
+					),
+				)
+				.returning({ id: knowledgeSubmissions.id });
+			return rows.length;
 		},
 
 		async approveStandalonePublish(input: ApproveStandalonePublishWrite): Promise<void> {

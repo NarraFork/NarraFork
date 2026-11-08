@@ -1,6 +1,6 @@
 {
-  "id": "89ee704a-9e32-4b0b-b2a6-1fd5f5bef803",
-  "prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
+  "id": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+  "prevId": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -8975,6 +8975,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "author_read_at": {
+          "name": "author_read_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "merged_revision_id": {
           "name": "merged_revision_id",
           "type": "text",
@@ -9111,6 +9117,27 @@
           "columns": [
             {
               "expression": "draft_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ks_submitter_author_read": {
+          "name": "idx_ks_submitter_author_read",
+          "columns": [
+            {
+              "expression": "submitter_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "author_read_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
