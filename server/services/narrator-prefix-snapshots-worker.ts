@@ -184,10 +184,9 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 			if (!rows[0]) throw new Error("Prefix snapshot publication target is missing");
 			if (/^[{\s]$/.test(rows[0].prefix)) {
 				const [content] = await retry(request, () =>
-					query<{ text: string }>(
-						"SELECT text FROM narrator_text_snapshots WHERE sha256 = ?",
-						[hash],
-					),
+					query<{ text: string }>("SELECT text FROM narrator_text_snapshots WHERE sha256 = ?", [
+						hash,
+					]),
 				);
 				if (!content) throw new Error("Prefix snapshot publication target is missing");
 				let manifest: unknown;
