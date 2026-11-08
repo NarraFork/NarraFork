@@ -300,6 +300,11 @@ export const removeRecentTabSchema = z.object({
 	 * a snapshot that points at entities that are already gone.
 	 */
 	cascade: z.boolean().optional(),
+	/**
+	 * 保留因这次移除而变空的文件夹。归档走的是 cascade 清理，但会话还能撤销归档回来，
+	 * 所以文件夹不该跟着最后一条记录一起消失。
+	 */
+	keepEmptyFolder: z.boolean().optional(),
 });
 
 export const moveRecentTabSchema = z
