@@ -252,11 +252,12 @@ export function createPrefixSnapshotStore(
 		await remember(hash, result.json, result.byteSize);
 		return result.json;
 	}
-	async function readText(hash: string): Promise<string> {
+	async function readText(hash: string, signal?: AbortSignal): Promise<string> {
 		check();
+		signal?.throwIfAborted();
 		const cached = peek(hash, "text");
 		if (cached !== undefined) return cached as string;
-		const text = await run<string>("getText", hash);
+		const text = await run<string>("getText", hash, signal);
 		await remember(hash, text, 0, "text");
 		return text;
 	}
@@ -296,7 +297,8 @@ export function createPrefixSnapshotStore(
 
 	return {
 		putPrefixText: (text, signal) => run<string>("putText", text, signal),
-		getPrefixText: (hash, signal) => sharedRead("text", hash, () => readText(hash), signal),
+		// Keep text reads independently cancellable down to the worker; the LRU remains shared.
+		getPrefixText: readText,
 		putPrefixJson(value, signal) {
 			// Only coalesce in-flight object identities, never memoize mutable objects after a put.
 			// Signalled requests keep independent cancellation. All other puts remain serialized.

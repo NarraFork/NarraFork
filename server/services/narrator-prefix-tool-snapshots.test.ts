@@ -365,6 +365,42 @@ function controlledQueue() {
 	};
 }
 
+test("cancelling a queued text read never dispatches it", async () => {
+	const { store, nextDispatch } = controlledQueue();
+	const blocking = store.putPrefixText("hold queue");
+	const first = await nextDispatch();
+	const controller = new AbortController();
+	const pending = store.getPrefixText("a".repeat(64), controller.signal).catch((error) => error);
+	const reason = new Error("cancel queued text read");
+	controller.abort(reason);
+	expect(await pending).toBe(reason);
+	first.worker.emit("message", { value: "b".repeat(64) });
+	await blocking;
+	const barrier = store.putPrefixText("after cancelled read").catch((error) => error);
+	const next = await nextDispatch();
+	expect(next.request.operation).toBe("putText");
+	expect(next.request.value).toBe("after cancelled read");
+	next.worker.emit("message", { value: "c".repeat(64) });
+	expect(await barrier).toBe("c".repeat(64));
+});
+
+test("cancelling an active text read releases its worker and the queue", async () => {
+	const { store, nextDispatch } = controlledQueue();
+	const controller = new AbortController();
+	const pending = store.getPrefixText("a".repeat(64), controller.signal).catch((error) => error);
+	const first = await nextDispatch();
+	expect(first.request.operation).toBe("getText");
+	const reason = new Error("cancel active text read");
+	controller.abort(reason);
+	expect(await pending).toBe(reason);
+	expect(first.worker.terminated).toBe(true);
+	const barrier = store.putPrefixText("after cancelled read").catch((error) => error);
+	const next = await nextDispatch();
+	expect(next.request.operation).toBe("putText");
+	next.worker.emit("message", { value: "b".repeat(64) });
+	expect(await barrier).toBe("b".repeat(64));
+});
+
 test("cancelling an active tools batch dispatches no later batch or manifest", async () => {
 	const { store, nextDispatch } = controlledQueue();
 	const controller = new AbortController();
