@@ -38,21 +38,26 @@ export function parseRevealActivation(argv: string[]): { token: string; server: 
 	return { token, server: flag?.slice(REVEAL_SERVER_FLAG.length) ?? "" };
 }
 
-const pending = new Map<string, { path: string; expiresAt: number }>();
+export interface RevealTarget {
+	path: string;
+	selectFile: boolean;
+}
 
-/** Authorize one reveal of `path`; the token is good for a single claim within a few seconds. */
-export function issueRevealToken(path: string, now = Date.now()): string {
+const pending = new Map<string, RevealTarget & { expiresAt: number }>();
+
+/** Authorize one reveal of a file or directory within a few seconds. */
+export function issueRevealToken(target: RevealTarget, now = Date.now()): string {
 	for (const [token, entry] of pending) {
 		if (entry.expiresAt <= now) pending.delete(token);
 	}
 	const token = generateId();
-	pending.set(token, { path, expiresAt: now + TOKEN_TTL_MS });
+	pending.set(token, { ...target, expiresAt: now + TOKEN_TTL_MS });
 	return token;
 }
 
-/** Consume a token: its path when it is known and unexpired, otherwise null. */
-export function claimRevealToken(token: string, now = Date.now()): string | null {
+/** Consume a token: its path and file-selection flag, or null if unknown or expired. */
+export function claimRevealToken(token: string, now = Date.now()): RevealTarget | null {
 	const entry = pending.get(token);
 	pending.delete(token);
-	return entry && entry.expiresAt > now ? entry.path : null;
+	return entry && entry.expiresAt > now ? { path: entry.path, selectFile: entry.selectFile } : null;
 }

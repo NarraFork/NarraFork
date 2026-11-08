@@ -1169,6 +1169,8 @@
 	"contextMenu_copyFileRemote": "Copying a file only works in a browser on the machine running NarraFork.",
 	"contextMenu_downloadFile": "Download file",
 	"contextMenu_downloadPopupBlocked": "The browser blocked the download tab. Allow pop-ups for this site and try again.",
+	"contextMenu_revealFile": "Show in File Manager",
+	"contextMenu_revealFileFailed": "Could not open the file manager",
 	"contextMenu_copyImage": "Copy image",
 	"contextMenu_copyImagePath": "Copy image file path",
 	"contextMenu_saveImageAs": "Save image as...",
