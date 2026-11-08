@@ -41,6 +41,7 @@ import { and, asc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narrators,
+	recentTabArchiveMarks,
 	userPreferences,
 	userRecentTabs,
 	userRecentTabsMeta,
@@ -1745,4 +1746,108 @@ export async function removeTabFromAllUsers(
 	for (const userId of await getRecentTabUserIds(tabType, tabId)) {
 		await removeRecentTab(userId, tabType, tabId);
 	}
+}
+
+/**
+ * Remember where this user's sidebar row for a narrator sat, right before archiving it.
+ *
+ * Archiving deletes the row, and `folder_id` goes with it — without this the restore could
+ * only put the session back at the top of the list. Only a row that actually sits in a folder
+ * is worth remembering: "top level" is where a restore lands anyway.
+ */
+export async function rememberArchivedTabPlacement(
+	userId: string,
+	narratorId: string,
+): Promise<void> {
+	const rows = await db
+		.select({ folderId: userRecentTabs.folderId })
+		.from(userRecentTabs)
+		.where(
+			and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.representedNarratorId, narratorId)),
+		)
+		.orderBy(asc(userRecentTabs.sortOrder));
+	const folderId = rows.find((row) => row.folderId)?.folderId ?? null;
+	const key = and(
+		eq(recentTabArchiveMarks.userId, userId),
+		eq(recentTabArchiveMarks.narratorId, narratorId),
+	);
+	if (!folderId) {
+		await db.delete(recentTabArchiveMarks).where(key);
+		return;
+	}
+	const archivedAt = new Date().toISOString();
+	await db
+		.insert(recentTabArchiveMarks)
+		.values({ id: generateId(), userId, narratorId, folderId, archivedAt })
+		.onConflictDoUpdate({
+			target: [recentTabArchiveMarks.userId, recentTabArchiveMarks.narratorId],
+			set: { folderId, archivedAt },
+		});
+}
+
+/**
+ * Put an unarchived narrator back into the folder it was archived from.
+ *
+ * Returns false when there is nothing to restore to — no mark, or the folder is gone because
+ * it was deleted (or dissolved) while the session was archived. The session then simply stays
+ * at the top of the list, which is the old behaviour and the only honest answer once the
+ * destination no longer exists.
+ */
+export async function restoreArchivedTabPlacement(
+	userId: string,
+	narratorId: string,
+	title: string,
+): Promise<boolean> {
+	const marks = await db
+		.select({ folderId: recentTabArchiveMarks.folderId })
+		.from(recentTabArchiveMarks)
+		.where(
+			and(
+				eq(recentTabArchiveMarks.userId, userId),
+				eq(recentTabArchiveMarks.narratorId, narratorId),
+			),
+		)
+		.limit(1);
+	const folderId = marks[0]?.folderId;
+	if (!folderId) return false;
+	await db
+		.delete(recentTabArchiveMarks)
+		.where(
+			and(
+				eq(recentTabArchiveMarks.userId, userId),
+				eq(recentTabArchiveMarks.narratorId, narratorId),
+			),
+		);
+
+	const folder = await db
+		.select({ id: userRecentTabs.id })
+		.from(userRecentTabs)
+		.where(
+			and(
+				eq(userRecentTabs.userId, userId),
+				eq(userRecentTabs.type, "folder"),
+				eq(userRecentTabs.entityId, folderId),
+			),
+		)
+		.limit(1);
+	if (folder.length === 0) return false;
+
+	const tabs = await listAllRecentTabs(userId);
+	const index = tabs.findIndex((tab) => tabKey(tab) === `narrator:${narratorId}`);
+	if (index >= 0) {
+		tabs[index] = { ...tabs[index], folderId };
+	} else {
+		// The row is gone (that is what archiving does): re-add it at the end and let the
+		// shared layout regroup it into its folder.
+		tabs.push({
+			type: "narrator",
+			id: narratorId,
+			narratorId,
+			folderId,
+			title,
+			lastVisitedAt: Date.now(),
+		});
+	}
+	await restoreRecentTabs(userId, { tabs });
+	return true;
 }

@@ -1702,6 +1702,13 @@
       "when": 1794042972342,
       "tag": "0242_flimsy_terrax",
       "breakpoints": true
+    },
+    {
+      "idx": 243,
+      "version": "6",
+      "when": 1794127993720,
+      "tag": "0243_red_mandroid",
+      "breakpoints": true
     }
   ]
 }
