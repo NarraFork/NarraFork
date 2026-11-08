@@ -297,9 +297,32 @@ export function ModelMenuItems({
 					([key]) => key === "__default__" || key === "__summary__" || key === "__agg__",
 				)
 			: filteredEntries.filter(([key]) => !isAutoGroup(key));
+	const filterField = (
+		<TextInput
+			ref={filterInputRef}
+			leftSection={<IconSearch size={14} />}
+			onChange={(e) => setFilter(e.currentTarget.value)}
+			onKeyDown={(e) => e.stopPropagation()}
+			placeholder={t("modelFilterPlaceholder")}
+			rightSection={
+				filter ? (
+					<CloseButton
+						aria-label={t("clearModelFilter")}
+						onClick={(e) => {
+							e.stopPropagation();
+							setFilter("");
+						}}
+						size="xs"
+					/>
+				) : undefined
+			}
+			size="xs"
+			value={filter}
+		/>
+	);
 	return (
 		<>
-			<Box px={4} pb={4}>
+			<Box ref={footerRef} px={4} pb={4}>
 				<Button.Group>
 					{(["model", "provider"] as const).map((value) => (
 						<Button
@@ -308,12 +331,16 @@ export function ModelMenuItems({
 							variant={mode === value ? "light" : "subtle"}
 							fullWidth
 							data-model-menu-mode={value}
+							title={
+								value === "model" ? t("modelMenuModeModelHint") : t("modelMenuModeProviderHint")
+							}
 							onClick={() => setMode(value)}
 						>
 							{value === "model" ? t("modelMenuModeModel") : t("modelMenuModeProvider")}
 						</Button>
 					))}
 				</Button.Group>
+				<Box mt={6}>{filterField}</Box>
 			</Box>
 			{/* Inheritance is a current-state group, not a catalog model or a global role. */}
 			{(followsParent || canFollowParent) && (
@@ -938,40 +965,6 @@ export function ModelMenuItems({
 					);
 				})
 			)}
-			<Menu.Divider />
-			<Box
-				ref={footerRef}
-				p={4}
-				style={{
-					position: "sticky",
-					bottom: 0,
-					zIndex: 2,
-					background: "var(--mantine-color-body)",
-				}}
-				onClick={(e) => e.stopPropagation()}
-			>
-				<TextInput
-					ref={filterInputRef}
-					leftSection={<IconSearch size={14} />}
-					onChange={(e) => setFilter(e.currentTarget.value)}
-					onKeyDown={(e) => e.stopPropagation()}
-					placeholder={t("modelFilterPlaceholder")}
-					rightSection={
-						filter ? (
-							<CloseButton
-								aria-label={t("clearModelFilter")}
-								onClick={(e) => {
-									e.stopPropagation();
-									setFilter("");
-								}}
-								size="xs"
-							/>
-						) : undefined
-					}
-					size="xs"
-					value={filter}
-				/>
-			</Box>
 		</>
 	);
 }

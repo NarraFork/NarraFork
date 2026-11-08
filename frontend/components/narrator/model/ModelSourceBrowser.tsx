@@ -26,7 +26,8 @@ export interface ModelSourceBrowserProps {
 	filter?: string;
 }
 
-const COLUMN_MAX_HEIGHT = 5 * 46;
+/** Columns share the viewport instead of a fixed five rows; they still scroll past it. */
+const COLUMN_MAX_HEIGHT = "45vh";
 
 function familyOf(option: ModelOption): string {
 	return option.family ?? "";
@@ -55,6 +56,9 @@ export function ModelSourceBrowser({
 }: ModelSourceBrowserProps) {
 	const { t } = useTranslation("narrator");
 	const currentValue = currentModel ?? "";
+	// Only logical (auto) models live here. A model no auto row covers is a service-specific
+	// model and belongs to the provider view; listing it here too shows the same model twice.
+	const autoModels = useMemo(() => allModels.filter((option) => option.autoSources), [allModels]);
 	const autoRowOfSource = useMemo(() => {
 		const map = new Map<string, string>();
 		for (const option of allModels) {
@@ -67,18 +71,17 @@ export function ModelSourceBrowser({
 
 	const initialFocus = isAutoModelOptionValue(currentValue)
 		? currentValue
-		: (autoRowOfSource.get(currentValue) ?? (currentValue || allModels[0]?.value));
+		: (autoRowOfSource.get(currentValue) ?? autoModels[0]?.value);
 	const [focused, setFocused] = useState<string | undefined>(initialFocus);
 
 	const needle = filter.trim().toLowerCase();
 	const visible = useMemo(() => {
-		if (!needle) return allModels;
-		return allModels.filter((option) => {
+		if (!needle) return autoModels;
+		return autoModels.filter((option) => {
 			const haystack = [
 				option.label,
 				option.value,
 				familyOf(option),
-				providerLabels[option.provider ?? ""] ?? option.provider ?? "",
 				...(option.autoSources ?? []).flatMap((s) => [
 					s.value,
 					providerLabels[s.provider] ?? s.provider,
@@ -88,10 +91,10 @@ export function ModelSourceBrowser({
 				.toLowerCase();
 			return haystack.includes(needle);
 		});
-	}, [allModels, needle, providerLabels]);
+	}, [autoModels, needle, providerLabels]);
 	const focusedOption =
 		visible.find((o) => o.value === focused) ??
-		allModels.find((o) => o.value === focused) ??
+		autoModels.find((o) => o.value === focused) ??
 		visible[0];
 
 	const groups = useMemo(() => {
