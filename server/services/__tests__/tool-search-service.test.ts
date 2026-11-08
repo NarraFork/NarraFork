@@ -402,7 +402,7 @@ test("explicit custom-injection epoch accepts additions without replacing the ba
 		(message) => (message.contentJson as { type?: string }[])[0]?.type === "epoch",
 	);
 	expect(epochs.map((message) => message.id)).toEqual([epoch.id]);
-	expect(epochs[0]?.contentJson).toEqual(epoch.contentJson);
+	expect<unknown>(epochs[0]?.contentJson).toEqual(epoch.contentJson);
 	expect(await notices(id)).toHaveLength(1);
 });
 

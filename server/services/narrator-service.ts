@@ -9,7 +9,7 @@ import {
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
-import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	aclGrants,
@@ -2183,7 +2183,9 @@ export const narratorService = {
 	async listNamed() {
 		const rows = await db.query.narrators.findMany({
 			columns: { runtimeRegistrationJson: false },
-			where: and(eq(narrators.type, "primary"), isNotNull(narrators.handle)),
+			// Valid handles are non-empty. The range predicate uses idx_narrators_handle;
+			// IS NOT NULL made SQLite scan every narrator before sorting this small result.
+			where: and(eq(narrators.type, "primary"), gt(narrators.handle, "")),
 			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
 		});
 		// Defensive: only return those actually flagged as named.

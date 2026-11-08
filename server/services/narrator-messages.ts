@@ -75,6 +75,7 @@ import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings"
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { ModelSourceRow } from "./agent-runtime/model-history-query";
 import {
 	type LoadModelHistoryOptions,
 	loadModelHistorySource,
@@ -3644,7 +3645,7 @@ const narratorMessageQueriesUnlocked = {
 		narratorId: string,
 		limit?: number,
 		options: Omit<LoadModelHistoryOptions, "limit"> = {},
-	) {
+	): Promise<readonly ModelSourceRow[]> {
 		const postgres = modelHistoryDatabase.postgresRuntime;
 		if (
 			modelHistoryDatabase.activeDatabaseBackend === "postgres" &&

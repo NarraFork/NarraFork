@@ -1,7 +1,8 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { contextUpdateOf, renderContextUpdate } from "@shared/prefix-context";
 import { serializeWorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
@@ -19,7 +20,11 @@ import { settings } from "../../lib/settings";
 import { safeSpawn } from "../../lib/spawn";
 import { resolveNarratorGitTarget } from "../git-workspace";
 import { enterNarratorPlanMode } from "../narrator-plan-mode";
-import { getPrefixToolDefinitions } from "../narrator-prefix-snapshots";
+import {
+	cleanupPrefixSnapshots,
+	closePrefixSnapshotStore,
+	getPrefixToolDefinitions,
+} from "../narrator-prefix-snapshots";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
 import { workspaceContextService } from "../workspace-context-service";
 
@@ -294,6 +299,36 @@ describe("unified prefix epochs with real SQLite history", () => {
 		expect(resumed.epoch?.definitionSnapshots?.[0].description).toBe("Read original");
 	});
 
+	test("unchanged epochs never rewrite the tool catalog after write memo removal or store restart", async () => {
+		const { input } = await fixture();
+		const candidates = Array.from({ length: 200 }, (_, index) => ({
+			...baseTool,
+			name: `Stable${index}`,
+			description: `Stable description ${index}`,
+		}));
+		const current = { ...input, candidates, managed: new Set<string>() };
+		const post = spyOn(Worker.prototype, "postMessage");
+		try {
+			const baseline = await reconcileEpoch(current);
+			const writes = () =>
+				post.mock.calls.filter(([request]) => request.operation === "putJsonBatch").length;
+			expect(writes()).toBeGreaterThan(1);
+			const initialWrites = writes();
+			for (let round = 0; round < 3; round++) {
+				const next = await reconcileEpoch({ ...current, registryRevision: `round-${round}` });
+				expect(next.changed).toBe(false);
+				expect(next.epoch?.markerId).toBe(baseline.epoch?.markerId);
+			}
+			await closePrefixSnapshotStore();
+			const replay = await reconcileEpoch(current);
+			expect(replay.epoch?.markerId).toBe(baseline.epoch?.markerId);
+			expect(replay.epoch?.definitionSnapshots).toHaveLength(candidates.length);
+			expect(writes()).toBe(initialWrites);
+		} finally {
+			post.mockRestore();
+		}
+	});
+
 	test("tool loads persist immutable snapshot references without changing baseline", async () => {
 		const { narratorId, input } = await fixture();
 		const initial = await reconcileEpoch(input);
@@ -560,6 +595,19 @@ describe("unified prefix epochs with real SQLite history", () => {
 		expect((await history(fork.narratorId)).map((row) => row.id)).toEqual(
 			(await history(narratorId)).map((row) => row.id),
 		);
+		await narratorService.remove(narratorId);
+		const now = Date.now() + 2 * 24 * 60 * 60 * 1000;
+		for (let step = 0; ; step++) {
+			expect(step).toBeLessThan(1000);
+			if ((await cleanupPrefixSnapshots({ now })).phase === "done") break;
+		}
+		await closePrefixSnapshotStore();
+		const surviving = await reconcileEpoch({ ...moved, narratorId: fork.narratorId });
+		expect(surviving.epoch?.markerId).toBe(initial.epoch?.markerId);
+		expect(surviving.epoch?.definitionSnapshots).toEqual(initial.epoch?.definitionSnapshots);
+		const definitions = initial.epoch?.definitionSnapshots;
+		if (!definitions) throw new Error("Missing baseline definitions");
+		expect(await getPrefixToolDefinitions(initial.epoch?.prefix?.tools ?? "")).toEqual(definitions);
 	});
 });
 

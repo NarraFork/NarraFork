@@ -1446,7 +1446,7 @@ export async function runAgentLoopUnlocked(
 					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
 						narratorId,
 						undefined,
-						{ signal: active.abortController.signal, deadline: Date.now() + 10_000 },
+						{ signal: active.abortController.signal },
 					),
 				});
 			}

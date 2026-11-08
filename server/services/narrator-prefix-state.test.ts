@@ -5,6 +5,7 @@ import type { ContextUpdate } from "@shared/prefix-context";
 import { modelHistoryFixtureSql } from "./agent-runtime/model-history-fixture";
 import { queryModelHistory, sqliteHistoryQuery } from "./agent-runtime/model-history-query";
 import { renderModelHistoryRevisionSql } from "./agent-runtime/model-history-revision-sql";
+import { freezePrefixValue, prefixValueBytes } from "./narrator-prefix-snapshot-values";
 import { attachPrefixHistorySource, createPrefixStateLoader } from "./narrator-prefix-state";
 
 const connections: Database[] = [];
@@ -31,7 +32,6 @@ async function read(db: Database) {
 	const source = await queryModelHistory(sqliteHistoryQuery(db), {
 		narratorId: "owner",
 		versioned: true,
-		deadline: Date.now() + 10_000,
 	});
 	const messages = source.messages.map((row) => ({ ...row }));
 	attachPrefixHistorySource(messages, source);
@@ -245,6 +245,10 @@ test("large definitions are never serialized for size and their schema is measur
 			throw new Error("schema serialized on main thread");
 		},
 	});
+	// The snapshot adoption boundary already measured the schema; consumers must not repeat it.
+	const bytes = await freezePrefixValue(definition);
+	expect(prefixValueBytes(definition)).toBe(bytes);
+	expect(schemaReads).toBe(1);
 	const loader = createPrefixStateLoader(
 		{
 			async getPrefixText() {
