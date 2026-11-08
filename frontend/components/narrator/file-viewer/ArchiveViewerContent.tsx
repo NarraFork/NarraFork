@@ -23,7 +23,6 @@ import {
 	Text,
 	Tooltip,
 	Tree,
-	type TreeNodeData,
 	useTree,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
@@ -42,7 +41,6 @@ import { useTranslation } from "react-i18next";
 import { useMobileViewport } from "../../../hooks/useMobileViewport";
 import { ApiError, api } from "../../../lib/api";
 import {
-	type ArchiveEntryInfo,
 	type ArchiveEntryRead,
 	type ArchiveListing,
 	fileReferenceApi,
@@ -52,84 +50,13 @@ import { TruncatedText } from "../../common/TruncatedText";
 import { MonacoEditor } from "../file-editor/MonacoEditor";
 import { filePanelSizeLabel } from "../file-panel/LargeFileGate";
 import { FileTreeIcon } from "../file-tree/file-icons";
+import { type ArchiveNodeProps, buildArchiveTree } from "./archive-tree";
 import { archiveExtension } from "./archive-viewable";
 import { fileBaseName, HEADER_FIXED_STYLE, HEADER_FLEXIBLE_STYLE } from "./FileViewerContent";
 
 /** Java packages open on their manifest: the usual first question about a jar. */
 const MANIFEST_ENTRY = "META-INF/MANIFEST.MF";
 const MANIFEST_FIRST = new Set(["jar", "war", "ear", "aar"]);
-
-/** Same per-level cap as the workspace file tree, for the same reason: render cost. */
-const MAX_NODES_PER_LEVEL = 1_000;
-const TRUNCATED_PREFIX = "\u0000truncated:";
-
-interface ArchiveNodeProps {
-	entry?: ArchiveEntryInfo;
-	/** Synthetic folder for a path prefix that has no entry of its own. */
-	folder?: boolean;
-	truncatedCount?: number;
-}
-
-/** Turn flat raw names into tree levels; folders implied by a prefix are synthesized. */
-export function buildArchiveTree(entries: readonly ArchiveEntryInfo[]): TreeNodeData[] {
-	interface Level {
-		children: Map<string, { node: TreeNodeData; level?: Level }>;
-	}
-	const root: Level = { children: new Map() };
-	for (const entry of entries) {
-		const parts = entry.name.split("/").filter((part) => part.length > 0);
-		if (parts.length === 0) continue;
-		let level = root;
-		let prefix = "";
-		for (let index = 0; index < parts.length; index++) {
-			const part = parts[index];
-			prefix = prefix ? `${prefix}/${part}` : part;
-			const leaf = index === parts.length - 1 && !entry.isDirectory;
-			let slot = level.children.get(part);
-			if (!slot) {
-				slot = {
-					node: {
-						value: leaf ? entry.name : `${prefix}/`,
-						label: part,
-						nodeProps: (leaf ? { entry } : { folder: true }) satisfies ArchiveNodeProps,
-					},
-				};
-				if (!leaf) slot.level = { children: new Map() };
-				level.children.set(part, slot);
-			} else if (!leaf && !slot.level) {
-				// A file and a folder share a name: keep both, the folder second.
-				const key = `${part}/`;
-				slot = level.children.get(key) ?? {
-					node: { value: `${prefix}/`, label: part, nodeProps: { folder: true } },
-					level: { children: new Map() },
-				};
-				level.children.set(key, slot);
-			}
-			if (!leaf && slot.level) level = slot.level;
-		}
-	}
-	const toNodes = (level: Level, parentKey: string): TreeNodeData[] => {
-		const slots = [...level.children.values()].sort((a, b) => {
-			const folderA = a.level ? 0 : 1;
-			const folderB = b.level ? 0 : 1;
-			return folderA - folderB || String(a.node.label).localeCompare(String(b.node.label));
-		});
-		const shown = slots
-			.slice(0, MAX_NODES_PER_LEVEL)
-			.map((slot) =>
-				slot.level ? { ...slot.node, children: toNodes(slot.level, slot.node.value) } : slot.node,
-			);
-		const hidden = slots.length - shown.length;
-		if (hidden > 0)
-			shown.push({
-				value: `${TRUNCATED_PREFIX}${parentKey}`,
-				label: String(hidden),
-				nodeProps: { truncatedCount: hidden } satisfies ArchiveNodeProps,
-			});
-		return shown;
-	};
-	return toNodes(root, "");
-}
 
 function errorMessage(error: unknown, t: (key: string) => string): string {
 	if (error instanceof ApiError) {
@@ -194,8 +121,12 @@ export function ArchiveViewerContent({
 		return () => controller.abort();
 	}, [narratorId, filePath, reloadToken, referenceOrigin]);
 
+	// Encrypted / unsupported entries never open: the pane explains why, so don't fetch.
+	const selectedReadable = selected
+		? (listing?.entries.find((item) => item.name === selected)?.readable ?? true)
+		: false;
 	useEffect(() => {
-		if (!selected) return;
+		if (!selected || !selectedReadable) return;
 		const controller = new AbortController();
 		setEntry({ status: "loading", name: selected });
 		fileReferenceApi
@@ -208,7 +139,7 @@ export function ArchiveViewerContent({
 					setEntry({ status: "error", name: selected, message: errorMessage(error, tRef.current) });
 			});
 		return () => controller.abort();
-	}, [narratorId, filePath, selected, referenceOrigin]);
+	}, [narratorId, filePath, selected, selectedReadable, referenceOrigin]);
 
 	const data = useMemo(() => (listing ? buildArchiveTree(listing.entries) : []), [listing]);
 	const fileCount = useMemo(
