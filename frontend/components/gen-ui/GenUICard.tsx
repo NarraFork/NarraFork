@@ -33,7 +33,8 @@ export interface GenUICardProps {
 	height: number;
 	/** `render` markup, drawn in the row itself and re-drawn as it streams. */
 	inline?: {
-		source: string;
+		/** Absent for a render({path}) app: its body comes from the file, not from markup. */
+		source?: string;
 		live: boolean;
 		title?: string;
 		/** What the finished call was drawn with; old UI keeps that runtime. */
@@ -53,33 +54,38 @@ export interface GenUICardProps {
 export function GenUICard(props: GenUICardProps) {
 	const interactive = useRenderInteractive();
 	const { t } = useTranslation("narrator");
+	// A render({path}) card has no result to time it: mounting is when it was shown.
+	const shownAtRef = useRef<string | undefined>(undefined);
+	shownAtRef.current ??= new Date().toISOString();
+	const liveShownAt = shownAtRef.current;
 	const usable = !props.publicSummary && interactive && !!props.narratorId;
-	if (usable && props.narratorId && props.inline) {
+	if (usable && props.narratorId && props.inline?.source !== undefined) {
 		return (
 			<InlineCard
 				key={props.narratorId}
 				narratorId={props.narratorId}
-				inline={props.inline}
-				kit={props.kit}
-				height={props.height}
-			/>
-		);
-	}
-	if (usable && props.narratorId && props.file && props.appShownAt) {
-		return (
-			<AppCard
-				key={`${props.narratorId}:${props.file.toolCallId}`}
-				narratorId={props.narratorId}
-				file={props.file}
-				shownAt={props.appShownAt}
-				historyUnavailable={props.historyUnavailable}
+				inline={{ ...props.inline, source: props.inline.source }}
 				kit={props.kit}
 				height={props.height}
 			/>
 		);
 	}
 	if (usable && props.narratorId && props.file) {
-		return (
+		// A live app render has no shownAt in its result yet; the others do.
+		const shownAt = props.appShownAt ?? (props.inline ? liveShownAt : undefined);
+		return shownAt ? (
+			<AppCard
+				key={`${props.narratorId}:${props.file.toolCallId}`}
+				narratorId={props.narratorId}
+				file={props.file}
+				shownAt={shownAt}
+				historyUnavailable={props.historyUnavailable}
+				kit={props.kit}
+				height={props.height}
+				formToolUseId={props.inline?.formToolUseId}
+				stateKey={props.inline?.stateKey}
+			/>
+		) : (
 			<PrivateCard
 				key={`${props.narratorId}:${props.file.toolCallId}`}
 				narratorId={props.narratorId}
@@ -87,6 +93,7 @@ export function GenUICard(props: GenUICardProps) {
 				historyUnavailable={props.historyUnavailable}
 				kit={props.kit}
 				height={props.height}
+				stateKey={props.inline?.stateKey}
 			/>
 		);
 	}
@@ -128,7 +135,7 @@ function InlineCard({
 	height,
 }: {
 	narratorId: string;
-	inline: NonNullable<GenUICardProps["inline"]>;
+	inline: NonNullable<GenUICardProps["inline"]> & { source: string };
 	kit?: GenUiKitNotice;
 	height: number;
 }) {
@@ -219,6 +226,7 @@ function InlineCard({
 					runtime={inline.runtime}
 					formToolUseId={form}
 					stateKey={inline.stateKey}
+					onSubmitted={() => setExpanded(false)}
 				/>
 			</Suspense>
 			{expanded &&
@@ -247,12 +255,15 @@ function PrivateCard({
 	height,
 	historyUnavailable,
 	kit,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
 	height: number;
 	historyUnavailable?: boolean;
 	kit?: GenUiKitNotice;
+	/** Keys the draft the app persists across frame rebuilds. */
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const mobile = useMobileViewport();
@@ -273,7 +284,7 @@ function PrivateCard({
 	const path = `${file.directory.replace(/[\\/]$/, "")}/${file.entry}`;
 	const preview = opened ? (
 		<Suspense fallback={<Loader size="sm" />}>
-			<FilePreview narratorId={narratorId} file={file} />
+			<FilePreview narratorId={narratorId} file={file} stateKey={stateKey} />
 		</Suspense>
 	) : null;
 	return (
@@ -355,6 +366,8 @@ function AppCard({
 	height,
 	historyUnavailable,
 	kit,
+	formToolUseId,
+	stateKey,
 }: {
 	narratorId: string;
 	file: GenUiFileReference;
@@ -362,6 +375,10 @@ function AppCard({
 	height: number;
 	historyUnavailable?: boolean;
 	kit?: GenUiKitNotice;
+	/** Set while a render({path}) call waits for this app's submit. */
+	formToolUseId?: string;
+	/** Keys the draft the app persists across frame rebuilds. */
+	stateKey?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	const mobile = useMobileViewport();
@@ -375,6 +392,11 @@ function AppCard({
 	}, [narratorId, shownAt]);
 	const [run, setRun] = useState(0);
 	const [expanded, setExpanded] = useState(false);
+	// 提交已经交回给正在等待的调用，卡片没有别的要问了：停下应用并收起展开视图。
+	const collapseAfterSubmit = () => {
+		setRunning(false);
+		setExpanded(false);
+	};
 	useEffect(() => {
 		if (!running && !expanded) return;
 		const stop = () => {
@@ -397,7 +419,13 @@ function AppCard({
 	const bodyHeight = Math.max(60, height - INLINE_HEADER - notice);
 	const preview = expanded ? (
 		<Suspense fallback={<Loader size="sm" />}>
-			<FilePreview narratorId={narratorId} file={file} />
+			<FilePreview
+				narratorId={narratorId}
+				file={file}
+				formToolUseId={formToolUseId}
+				onSubmitted={collapseAfterSubmit}
+				stateKey={stateKey}
+			/>
 		</Suspense>
 	) : null;
 	return (
@@ -432,7 +460,15 @@ function AppCard({
 			)}
 			{running ? (
 				<Suspense fallback={null}>
-					<AppFrame key={run} narratorId={narratorId} file={file} height={bodyHeight} />
+					<AppFrame
+						key={run}
+						narratorId={narratorId}
+						file={file}
+						height={bodyHeight}
+						formToolUseId={formToolUseId}
+						onSubmitted={collapseAfterSubmit}
+						stateKey={stateKey}
+					/>
 				</Suspense>
 			) : (
 				<Box px="xs" h={bodyHeight}>
