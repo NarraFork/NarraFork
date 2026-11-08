@@ -323,24 +323,29 @@ export function ModelMenuItems({
 	return (
 		<>
 			<Box ref={footerRef} px={4} pb={4}>
-				<Button.Group>
-					{(["model", "provider"] as const).map((value) => (
-						<Button
-							key={value}
-							size="xs"
-							variant={mode === value ? "light" : "subtle"}
-							fullWidth
-							data-model-menu-mode={value}
-							title={
-								value === "model" ? t("modelMenuModeModelHint") : t("modelMenuModeProviderHint")
-							}
-							onClick={() => setMode(value)}
-						>
-							{value === "model" ? t("modelMenuModeModel") : t("modelMenuModeProvider")}
-						</Button>
-					))}
-				</Button.Group>
-				<Box mt={6}>{filterField}</Box>
+				{/* One view setting, not two column titles: keep it off the columns' headers. */}
+				<Group justify="space-between" wrap="nowrap" mb={6}>
+					<Text size="xs" c="dimmed">
+						{t("modelMenuModeLabel")}
+					</Text>
+					<Button.Group>
+						{(["model", "provider"] as const).map((value) => (
+							<Button
+								key={value}
+								size="compact-xs"
+								variant={mode === value ? "light" : "subtle"}
+								data-model-menu-mode={value}
+								title={
+									value === "model" ? t("modelMenuModeModelHint") : t("modelMenuModeProviderHint")
+								}
+								onClick={() => setMode(value)}
+							>
+								{value === "model" ? t("modelMenuModeModel") : t("modelMenuModeProvider")}
+							</Button>
+						))}
+					</Button.Group>
+				</Group>
+				<Box>{filterField}</Box>
 			</Box>
 			{/* Inheritance is a current-state group, not a catalog model or a global role. */}
 			{(followsParent || canFollowParent) && (
@@ -600,15 +605,6 @@ export function ModelMenuItems({
 								const autoReason = showAutoSources
 									? autoChoiceReason(m.autoSources ?? [], provLabels, t)
 									: null;
-								// Default/Summary rows sit under a role header, not a provider group,
-								// so surface the resolved target's provider prefix as a small line.
-								const roleTargetValue =
-									m.provider === "__default__"
-										? defaultModelValue
-										: m.provider === "__summary__"
-											? summaryModelValue
-											: null;
-								const roleProviderPrefix = modelProviderPrefix(roleTargetValue);
 								const showMembers = isAggItem && selected && selection.members.length > 0;
 								// Three-dot actions only on top-level rows that can actually occupy a
 								// global slot. Meta sentinels would make the slot circular.
@@ -689,9 +685,13 @@ export function ModelMenuItems({
 											})
 										: t("modelCatalogMissingHintGeneric")
 									: null;
+								// Role slots (default/summary) are compact single rows, so they do not
+								// dominate the menu the way full model rows used to.
+								const isRoleRow = m.provider === "__default__" || m.provider === "__summary__";
 								return (
 									<Fragment key={m.value}>
 										<Menu.Item
+											py={isRoleRow ? 2 : undefined}
 											ref={
 												(selection.targetValue === m.value &&
 													(!showMembers || !!currentAgg?.pinnedModel)) ||
@@ -753,12 +753,7 @@ export function ModelMenuItems({
 											c={m.available === false || isCatalogMissing ? "dimmed" : undefined}
 										>
 											<Box>
-												{roleProviderPrefix && (
-													<Text size="xs" c="dimmed" lh={1.3}>
-														{roleProviderPrefix}
-													</Text>
-												)}
-												<Text size="sm" inherit>
+												<Text size={isRoleRow ? "xs" : "sm"} inherit>
 													{m.label}
 												</Text>
 												{autoChoice && (
