@@ -49,6 +49,8 @@ export interface UsePretextDocumentOptions {
 	layoutReady?: boolean;
 	/** Keep the trailing empty reasoning live while the narrator is active. */
 	keepEmptyReasoningLive?: boolean;
+	/** Whether the latest tasks.json call may be pinned (see `buildPretextDocumentLayout`). */
+	pinLatestSpecTasks?: boolean;
 	/**
 	 * A subagent page treats its own (parent-pointing) messages as top-level, which
 	 * decides whether an arriving child message may be appended locally.
@@ -420,6 +422,7 @@ export function usePretextDocument(
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
 			resolvePermissionFormPrediction: options.resolvePermissionFormPrediction,
 			resolvePermissionFormHeight: options.resolvePermissionFormHeight,
+			pinLatestSpecTasks: options.pinLatestSpecTasks,
 			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
 			// is resolved by `buildPretextDocumentLayout` from the exact message list it
 			// lays out, so it needs no build option and cannot go stale: every event that
@@ -435,6 +438,8 @@ export function usePretextDocument(
 		}),
 		[
 			options.keepEmptyReasoningLive,
+			// An outline session's backend arriving unpins its old tasks card: a structural change.
+			options.pinLatestSpecTasks,
 			options.isSubagent,
 			options.bottomPadding,
 			// The preference changes the item list. The breakpoint here is already
