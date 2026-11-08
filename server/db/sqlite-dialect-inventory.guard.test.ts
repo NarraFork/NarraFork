@@ -638,6 +638,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
 	"server/services/outline/store/sqlite-store.ts": ["json1"],
 	"server/services/parent-injection-queue.ts": ["json1"],
+	// SQLite-gated project indexing uses connection change counters only to invalidate
+	// per-pass caches; a PostgreSQL implementation must provide its own revision signal.
+	"server/services/project-index.ts": ["handle", "sessionFn"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",

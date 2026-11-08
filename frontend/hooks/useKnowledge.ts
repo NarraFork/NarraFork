@@ -1,4 +1,10 @@
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	type QueryClient,
+	useInfiniteQuery,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
 import { useEffect } from "react";
 import type {
 	BulkKnowledgeGrantInput,
@@ -351,7 +357,7 @@ export function useReviewKnowledgeSubmission() {
 			qc.invalidateQueries({ queryKey: ["knowledge", "entry"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
 			qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
-			qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
+			invalidateSubmissionOutcomes(qc);
 		},
 	});
 }
@@ -369,7 +375,7 @@ export function useResolveKnowledgeConflict() {
 			qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "entry"] });
 			qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
-			qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
+			invalidateSubmissionOutcomes(qc);
 		},
 	});
 }
@@ -758,6 +764,18 @@ export function useReviewInboxCount() {
 /** React Query key for the author's recent verdicts (notification bell). */
 export const SUBMISSION_OUTCOMES_KEY = ["knowledge", "submissionOutcomes"] as const;
 
+/** React Query key for the unread half of the author's verdicts (bell badge). */
+export const SUBMISSION_OUTCOMES_UNREAD_KEY = ["knowledge", "submissionOutcomesUnread"] as const;
+
+/**
+ * Invalidate the list and its unread count together — every path that changes a verdict
+ * changes both, and a caller that forgets one leaves the bell stale.
+ */
+export function invalidateSubmissionOutcomes(qc: QueryClient): void {
+	qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
+	qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_UNREAD_KEY });
+}
+
 /**
  * Verdicts on the caller's own submissions from the last 30 days.
  *
@@ -773,13 +791,43 @@ export function useMyKnowledgeSubmissionOutcomes(limit?: number) {
 }
 
 /**
- * True when the bell should show a knowledge-review section: open reviews for this
- * user, or a recent verdict on something they submitted.
+ * How many of the caller's verdicts are still unread.
+ *
+ * Split from the list query so the badge costs one bounded count instead of pulling the
+ * rows. Both keys are invalidated together by {@link useKnowledgeNotifications}.
+ */
+export function useUnreadSubmissionOutcomeCount() {
+	return useQuery({
+		queryKey: SUBMISSION_OUTCOMES_UNREAD_KEY,
+		queryFn: api.getKnowledgeSubmissionOutcomesUnreadCount,
+		staleTime: STALE,
+	});
+}
+
+/**
+ * Acknowledge verdicts the author opened. The server ignores ids that are not the caller's,
+ * so a stale list degrades to a no-op instead of an error.
+ */
+export function useMarkSubmissionOutcomesRead() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (ids: string[]) => api.markKnowledgeSubmissionOutcomesRead(ids),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_UNREAD_KEY });
+			invalidateSubmissionOutcomes(qc);
+		},
+	});
+}
+
+/**
+ * True when the bell should show a knowledge-review section: open reviews for this user, or
+ * an UNREAD verdict on something they submitted. Read verdicts keep their row in the panel
+ * but must not keep the section alive on their own.
  */
 export function useHasKnowledgeReviewNotices(): boolean {
 	const inbox = useReviewInboxCount();
-	const outcomes = useMyKnowledgeSubmissionOutcomes();
-	return (inbox.data?.count ?? 0) > 0 || (outcomes.data?.length ?? 0) > 0;
+	const unread = useUnreadSubmissionOutcomeCount();
+	return (inbox.data?.count ?? 0) > 0 || (unread.data?.count ?? 0) > 0;
 }
 
 /**
@@ -830,7 +878,7 @@ export function useKnowledgeNotifications(): void {
 				}
 				if (data.type !== "knowledge:review_inbox_changed") return;
 				qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
-				qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
+				invalidateSubmissionOutcomes(qc);
 				qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
 				qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 				qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
@@ -867,7 +915,7 @@ function invalidateSubmissionViews(qc: ReturnType<typeof useQueryClient>, id?: s
 	qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
 	qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
 	qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
-	qc.invalidateQueries({ queryKey: SUBMISSION_OUTCOMES_KEY });
+	invalidateSubmissionOutcomes(qc);
 	// The history list is keyed by personal-entry (draft) id; invalidate the whole prefix
 	// when the caller only knows the submission id.
 	if (id) qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", id] });

@@ -9265,6 +9265,7 @@ export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<voi
 
 export async function recoverOnStartup(
 	protection: NarratorStartupProtectionSets = {},
+	options: { heldRunIds?: ReadonlySet<string> } = {},
 ): Promise<void> {
 	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
 	if ((globalThis as any)[HOT_RELOAD_GUARD]) {
@@ -9326,7 +9327,7 @@ export async function recoverOnStartup(
 		toolCallIds: new Set(protection.toolCallIds),
 		backgroundTaskIds: new Set(protection.backgroundTaskIds),
 	};
-	const held = await protectHeldRunFacts(protectedFacts);
+	const held = await protectHeldRunFacts(protectedFacts, options.heldRunIds);
 	protection = protectedFacts;
 	for (const id of held)
 		await db

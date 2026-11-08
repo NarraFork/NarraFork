@@ -10,7 +10,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { getHome, IS_WINDOWS } from "../lib/platform";
-import { BufferManager } from "../terminal/buffer-manager";
+import { BufferManager, type BufferReadCursor } from "../terminal/buffer-manager";
 import {
 	dtachService,
 	findProcessesByArg,
@@ -36,6 +36,13 @@ import {
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
 
 const DEFAULT_SHELL = detectShell().path;
+
+/** Internal tool observation only; marker/buffer never enter the public scrollback DTO. */
+export type TerminalReadObserver = (
+	buffer: BufferManager,
+	cursor: BufferReadCursor | undefined,
+	sequence: number,
+) => void;
 
 export interface TerminalProcessInfo {
 	pid: number;
@@ -145,6 +152,8 @@ interface ActiveTerminal {
 }
 
 const activeTerminals = new Map<string, ActiveTerminal>();
+let startupRecovery: Promise<void> | undefined;
+const RECOVERY_CONCURRENCY = 4;
 
 /**
  * Mark a terminal as exited in DB and emit the lifecycle event.
@@ -253,6 +262,153 @@ function monitorAttachProcess(
 		await markTerminalExited(terminalId, code ?? 0, narratorId);
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: code ?? 0 });
 		logger.info("Terminal exited", { terminalId, code });
+	});
+}
+
+/** Startup work is deliberately batched: cap xterm/disk/PTY work and yield even
+ * when every operation completes synchronously (e.g. missing buffer files).
+ */
+async function recoverTerminalsOnStartup(): Promise<void> {
+	const started = performance.now();
+	const stats = {
+		tracked: 0,
+		recovered: 0,
+		marked: 0,
+		revivedFromExited: 0,
+		unknown: 0,
+		failed: 0,
+		yieldedBatches: 0,
+		concurrency: RECOVERY_CONCURRENCY,
+		loadMs: 0,
+		attachMs: 0,
+		phase1Ms: 0,
+		phase2Ms: 0,
+	};
+	async function batches<T>(items: T[], work: (item: T) => Promise<void>) {
+		for (let offset = 0; offset < items.length; offset += RECOVERY_CONCURRENCY) {
+			await Promise.all(items.slice(offset, offset + RECOVERY_CONCURRENCY).map(work));
+			stats.yieldedBatches++;
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		}
+	}
+	async function isolated(terminalId: string, work: () => Promise<void>) {
+		try {
+			await work();
+		} catch (error) {
+			stats.failed++;
+			logger.warn("Terminal startup recovery failed; preserving status", { terminalId, error });
+		}
+	}
+	async function attach(terminalId: string, narratorId: string | null) {
+		if (activeTerminals.has(terminalId)) return;
+		const buffer = createBufferManager(terminalId);
+		try {
+			const loadStarted = performance.now();
+			await buffer.loadFromDisk();
+			stats.loadMs += performance.now() - loadStarted;
+			// An on-demand reattach may have completed while disk IO was pending.
+			if (activeTerminals.has(terminalId)) {
+				await buffer.dispose();
+				return;
+			}
+			const attachStarted = performance.now();
+			const runtime = dtachService.attachSession({
+				terminalId,
+				cols: 80,
+				rows: 24,
+				onData: (text) => onData(terminalId, buffer, text),
+			});
+			activeTerminals.set(terminalId, { runtime, terminalId, buffer, useDtach: true });
+			buffer.startPeriodicFlush();
+			resetCursorForTerminal(terminalId);
+			monitorAttachProcess(terminalId, runtime, narratorId);
+			stats.attachMs += performance.now() - attachStarted;
+		} catch (error) {
+			// Releasing a failed restore must not delete its persisted scrollback.
+			await buffer.dispose();
+			throw error;
+		}
+	}
+
+	const available = await dtachService.isAvailable();
+	const availabilityMs = Math.round(performance.now() - started);
+	const queryStarted = performance.now();
+	const running = await db.query.terminals.findMany({
+		where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
+		columns: { id: true, narratorId: true, dtachSocket: true, worktreeResourceId: true },
+	});
+	const queryMs = Math.round(performance.now() - queryStarted);
+	stats.tracked = running.length;
+	let probeTask: ReturnType<typeof dtachService.createRecoveryProbe> | undefined;
+	const getProbe = () => (probeTask ??= dtachService.createRecoveryProbe());
+	const phase1Started = performance.now();
+	const attempted = new Set(running.map((terminal) => terminal.id));
+	await batches(running, (terminal) =>
+		isolated(terminal.id, async () => {
+			if (terminal.worktreeResourceId != null || activeTerminals.has(terminal.id)) return;
+			const state =
+				terminal.dtachSocket && available
+					? await (await getProbe()).check(dtachService.getSocketPath(terminal.id))
+					: "dead";
+			if (state === "unknown") {
+				stats.unknown++;
+			} else if (state === "alive") {
+				await attach(terminal.id, terminal.narratorId);
+				stats.recovered++;
+			} else {
+				await markTerminalExited(terminal.id, null, terminal.narratorId);
+				stats.marked++;
+			}
+		}),
+	);
+	stats.phase1Ms = Math.round(performance.now() - phase1Started);
+
+	// Only revive exited legacy rows. Never adopt resource-owned or untracked sockets.
+	// Phase 1 failures/unknowns are not retried again within the same recovery run.
+	const phase2Started = performance.now();
+	if (available) {
+		let files: string[] = [];
+		try {
+			files = await readdir(dtachService.socketsDir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				stats.failed++;
+				logger.warn("Terminal recovery socket listing failed", { error });
+			}
+		}
+		await batches(files, async (file) => {
+			const match = file.match(/^terminal-(.+)\.sock$/);
+			if (!match) return;
+			const terminalId = match[1];
+			if (attempted.has(terminalId) || activeTerminals.has(terminalId)) return;
+			await isolated(terminalId, async () => {
+				const existing = await db.query.terminals.findFirst({
+					where: eq(terminals.id, terminalId),
+					columns: { status: true, worktreeResourceId: true, narratorId: true },
+				});
+				if (!existing || existing.worktreeResourceId != null || existing.status !== "exited")
+					return;
+				const state = await (await getProbe()).check(dtachService.getSocketPath(terminalId));
+				if (state === "unknown") stats.unknown++;
+				if (state !== "alive") return;
+				await attach(terminalId, existing.narratorId);
+				await db
+					.update(terminals)
+					.set({ status: "running", dtachSocket: dtachService.getSocketPath(terminalId) })
+					.where(eq(terminals.id, terminalId));
+				stats.revivedFromExited++;
+			});
+		});
+	}
+	stats.phase2Ms = Math.round(performance.now() - phase2Started);
+	stats.loadMs = Math.round(stats.loadMs);
+	stats.attachMs = Math.round(stats.attachMs);
+	logger.info("Terminal startup recovery completed", {
+		...stats,
+		...((await probeTask)?.stats ?? { processProbes: 0, socketChecks: 0 }),
+		availabilityMs,
+		queryMs,
+		durationMs: Math.round(performance.now() - started),
 	});
 }
 
@@ -473,6 +629,8 @@ export const terminalService = {
 				if (activeTerminals.get(terminalId) !== active) return;
 				await active.buffer.resize(cols, rows);
 				if (activeTerminals.get(terminalId) !== active) return;
+				// Reflow can expire an observation even if the child emits no output.
+				notifyTerminalOutput(terminalId);
 				active.runtime.resize(cols, rows);
 				// Bun.Terminal.resize() does not send SIGWINCH to the child.
 				// dtach relies on SIGWINCH to forward the new size. Only on Unix.
@@ -633,6 +791,12 @@ export const terminalService = {
 
 		const buffer = createBufferManager(terminalId);
 		await buffer.loadFromDisk();
+		// Startup or another subscriber may have attached while disk IO was pending.
+		// From this ownership check through registration there must be no await.
+		if (activeTerminals.has(terminalId)) {
+			await buffer.dispose();
+			return true;
+		}
 		buffer.startPeriodicFlush();
 
 		const runtime = dtachService.attachSession({
@@ -703,12 +867,15 @@ export const terminalService = {
 
 	async getScrollback(
 		terminalId: string,
+		observe?: TerminalReadObserver,
 	): Promise<{ data: string; cols: number; rows: number } | null> {
 		// Same-ID legacy buffers are not evidence of ownership of a resource terminal.
 		await this.getById(terminalId);
 		const active = activeTerminals.get(terminalId);
 		if (active) {
-			const contents = await active.buffer.getContents();
+			const contents = await active.buffer.getContents(
+				observe ? (cursor, sequence) => observe(active.buffer, cursor, sequence) : undefined,
+			);
 			await this.getById(terminalId);
 			if (!contents) return null;
 			return { data: contents, cols: active.buffer.cols, rows: active.buffer.rows };
@@ -735,135 +902,14 @@ export const terminalService = {
 		return active.buffer.getState();
 	},
 
-	/** On startup, recover dtach sessions or mark stale terminals as exited. */
-	async recoverOnStartup() {
-		if (!(await dtachService.isAvailable())) {
-			// No dtach — just mark all running terminals as exited
-			const running = await db.query.terminals.findMany({
-				where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
-			});
-			for (const terminal of running) {
-				if (terminal.worktreeResourceId != null) continue;
-				await markTerminalExited(terminal.id, null, terminal.narratorId);
-			}
-			if (running.length > 0) {
-				logger.info("Marked stale terminals as exited (no dtach)", { count: running.length });
-			}
-			return;
-		}
-
-		// Phase 1: recover DB-tracked running terminals
-		const running = await db.query.terminals.findMany({
-			where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
-		});
-
-		let recovered = 0;
-		let marked = 0;
-
-		for (const terminal of running) {
-			if (terminal.worktreeResourceId != null) continue;
-			if (terminal.dtachSocket && (await dtachService.isSocketAlive(terminal.id))) {
-				// Re-attach to the dtach session
-				const buffer = createBufferManager(terminal.id);
-				await buffer.loadFromDisk();
-				buffer.startPeriodicFlush();
-
-				const runtime = dtachService.attachSession({
-					terminalId: terminal.id,
-					cols: 80,
-					rows: 24,
-					onData: (text) => onData(terminal.id, buffer, text),
-				});
-
-				activeTerminals.set(terminal.id, {
-					runtime,
-					terminalId: terminal.id,
-					buffer,
-					useDtach: true,
-				});
-
-				// Clear stale read cursors so next read returns full buffer
-				resetCursorForTerminal(terminal.id);
-
-				monitorAttachProcess(terminal.id, runtime, terminal.narratorId);
-
-				recovered++;
-				continue;
-			}
-
-			// Socket dead — mark as exited
-			await markTerminalExited(terminal.id, null, terminal.narratorId);
-			marked++;
-		}
-
-		// Phase 2: recover orphan sockets that have a matching exited DB record.
-		// This handles the case where a previous server run incorrectly marked a
-		// still-alive dtach terminal as exited (e.g. due to a detection failure).
-		// We restore the DB record to running and re-attach.
-		let revivedFromExited = 0;
-		try {
-			const files = await readdir(dtachService.socketsDir);
-			for (const file of files) {
-				const match = file.match(/^terminal-(.+)\.sock$/);
-				if (!match) continue;
-				const terminalId = match[1];
-
-				// Skip if already recovered in phase 1
-				if (activeTerminals.has(terminalId)) continue;
-
-				// Resource rows are not legacy sockets, even if a stale file has the same ID.
-				const existing = await db.query.terminals.findFirst({
-					where: eq(terminals.id, terminalId),
-				});
-				if (existing?.worktreeResourceId != null) continue;
-				if (!(await dtachService.isSocketAlive(terminalId))) continue;
-				if (existing && existing.status === "exited") {
-					// Revive: update status back to running and re-attach
-					await db
-						.update(terminals)
-						.set({
-							status: "running",
-							dtachSocket: dtachService.getSocketPath(terminalId),
-						})
-						.where(eq(terminals.id, terminalId));
-
-					const buffer = createBufferManager(terminalId);
-					await buffer.loadFromDisk();
-					buffer.startPeriodicFlush();
-
-					const runtime = dtachService.attachSession({
-						terminalId,
-						cols: 80,
-						rows: 24,
-						onData: (text) => onData(terminalId, buffer, text),
-					});
-
-					activeTerminals.set(terminalId, {
-						runtime,
-						terminalId,
-						buffer,
-						useDtach: true,
-					});
-
-					// Clear stale read cursors so next read returns full buffer
-					resetCursorForTerminal(terminalId);
-
-					monitorAttachProcess(terminalId, runtime, existing.narratorId);
-
-					revivedFromExited++;
-				}
-			}
-		} catch {
-			// sockets dir may not exist
-		}
-
-		if (recovered > 0) logger.info("Recovered dtach terminals", { count: recovered });
-		if (marked > 0) logger.info("Marked stale terminals as exited", { count: marked });
-		if (revivedFromExited > 0) {
-			logger.info("Revived exited terminals with live dtach sockets", {
-				count: revivedFromExited,
+	/** Concurrent startup callers share one scan and one attach per terminal. */
+	recoverOnStartup(): Promise<void> {
+		if (!startupRecovery) {
+			startupRecovery = recoverTerminalsOnStartup().finally(() => {
+				startupRecovery = undefined;
 			});
 		}
+		return startupRecovery;
 	},
 
 	async cleanupForNarrator(narratorId: string) {

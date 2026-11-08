@@ -1428,7 +1428,7 @@ withBackgroundOccupancyInitialization(
 		for (const target of ordinaryRestart.manifest?.targets ?? [])
 			startupRecoveryNarratorIds.add(target.narratorId);
 		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
-		await recoverNarrators(protection);
+		await recoverNarrators(protection, { heldRunIds: ordinaryRestart.heldRunIds });
 		return { plannedUpdate, ordinaryRestart };
 	},
 	activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
