@@ -45,10 +45,11 @@
 	line-height: 1;
 }
 
+/* Bottom left: the next avatar of the group overlaps this one's right side. */
 .nf-outline-agent-badge {
 	position: absolute;
-	right: -3px;
-	bottom: -3px;
+	left: -4px;
+	bottom: -4px;
 	padding: 1px;
 	border-radius: 50%;
 	background: var(--mantine-color-body);

@@ -162,6 +162,7 @@
 		"agentWorking": "Session \"{{name}}\" is working here",
 		"agentWorkingIn": "\"{{name}}\" of session \"{{session}}\" is working here",
 		"agentHidden": "An agent is working here",
+		"untitledSession": "Untitled session",
 		"someone": "Someone",
 		"readOnly": "Read only",
 		"connecting": "Connecting…",

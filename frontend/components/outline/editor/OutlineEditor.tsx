@@ -39,10 +39,11 @@ import {
 	IconRobot,
 	IconSearch,
 } from "@tabler/icons-react";
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { type MouseEvent, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
+import { useOutlineHost } from "../outline-host";
 import { OutlineHrefLink } from "../outline-nav";
 import type { OutlineViewState } from "../view-state";
 import { type BlockMark, chromeText } from "./chrome";
@@ -543,27 +544,32 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
  * An agent at work on the page (outline P2 PR 10b): a robot in its session's colour, with the
  * first letter of its title. Named, and a link to its session, only for a person who may read
  * that session (the server sends its id then); otherwise just "an agent".
+ *
+ * A plain click opens the session where the host keeps sessions (beside the outline in its dock,
+ * the phone's own page: `useOutlineHost().openSession`), as the timeline's "Open session" does;
+ * a modified click, or a host without the action, follows the link.
  */
 function AgentAvatar({ peer }: { peer: Peer }) {
 	const { t } = useTranslation("outline");
+	const host = useOutlineHost();
 	const narratorId = peer.agent?.narratorId ?? null;
-	const name = peer.name.trim();
+	const title = peer.name.trim();
+	const name = title || t("editor.untitledSession");
 	const session = peer.agent?.session ?? null;
-	const label =
-		narratorId && name
-			? session
-				? t("editor.agentWorkingIn", { name, session })
-				: t("editor.agentWorking", { name })
-			: t("editor.agentHidden");
+	const label = narratorId
+		? session
+			? t("editor.agentWorkingIn", { name, session })
+			: t("editor.agentWorking", { name })
+		: t("editor.agentHidden");
+	// The first character, not the first UTF-16 unit (an emoji is one character).
+	const initial = narratorId && title ? (Array.from(title)[0] ?? "").toUpperCase() : "";
 	const style = { background: peer.color, color: "#fff" };
 	const face = (
 		<>
-			{narratorId && name ? (
-				<span className="nf-outline-agent-initial">{name.slice(0, 1).toUpperCase()}</span>
-			) : null}
+			{initial ? <span className="nf-outline-agent-initial">{initial}</span> : null}
 			<IconRobot
-				size={narratorId && name ? 9 : 14}
-				className={narratorId && name ? "nf-outline-agent-badge" : undefined}
+				size={initial ? 10 : 14}
+				className={initial ? "nf-outline-agent-badge" : undefined}
 				aria-hidden
 			/>
 		</>
@@ -574,6 +580,17 @@ function AgentAvatar({ peer }: { peer: Peer }) {
 				<Avatar
 					component={OutlineHrefLink}
 					path={`/narrators/${encodeURIComponent(narratorId)}`}
+					onClick={(event: MouseEvent<HTMLAnchorElement>) => {
+						const plain =
+							event.button === 0 &&
+							!event.ctrlKey &&
+							!event.metaKey &&
+							!event.shiftKey &&
+							!event.altKey;
+						if (!plain || !host.openSession) return;
+						event.preventDefault();
+						host.openSession(narratorId);
+					}}
 					size={22}
 					radius="xl"
 					style={style}
@@ -590,6 +607,7 @@ function AgentAvatar({ peer }: { peer: Peer }) {
 					radius="xl"
 					style={style}
 					className="nf-outline-agent-avatar"
+					role="img"
 					aria-label={label}
 					data-testid="outline-agent-avatar"
 				>

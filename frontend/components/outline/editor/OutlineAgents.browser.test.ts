@@ -9,6 +9,9 @@
  *   - a running subagent that just wrote a block is an agent of its own, its session named;
  *   - someone who may not read the sessions sees agents without a name or a link, the same
  *     cursors;
+ *   - a plain click on a named agent opens its session where the host keeps sessions (beside the
+ *     outline in a dock), without leaving the page; an unnamed one is an image, not a link;
+ *   - more agents than the bar holds are counted in its "+N";
  *   - the agents leave the bar and the blocks when their runs end.
  * Nothing scrolls sideways. No timing is asserted.
  *
@@ -136,7 +139,7 @@ test("agents at work: named and linked for who may read them, a block cursor, go
 
 	for (const view of VIEWS) {
 		const labels = (view.lang === "en" ? en : zh).editor;
-		const owner = await openEditor(h, h.owner, pageId, { width: WIDTH, ...view });
+		const owner = await openEditor(h, h.owner, pageId, { width: WIDTH, host: true, ...view });
 		await helperWrites();
 		await until(
 			owner,
@@ -145,6 +148,8 @@ test("agents at work: named and linked for who may read them, a block cursor, go
 			8000,
 		);
 		const avatars = await owner.call((f) => f.agentAvatars());
+		// The robot badge stays in sight beside the next avatar.
+		expect(avatars.map((a) => a.badgeSeen)).toEqual([true, true]);
 		expect(avatars.map((a) => ({ label: a.label, href: a.href, initial: a.initial }))).toEqual([
 			{
 				label: fill(labels.agentWorking, { name: "Refresh worker" }),
@@ -183,6 +188,13 @@ test("agents at work: named and linked for who may read them, a block cursor, go
 		);
 		if (shots) await owner.page.screenshot({ path: join(shots, `agents-label-${name}.png`) });
 
+		// A plain click opens the session beside the outline: the host is asked, the page stays.
+		const at = await owner.page.evaluate(() => location.href);
+		await owner.page.click(`[data-testid=outline-agent-avatar][data-agent="${worker}"]`);
+		await until(owner, (f, id) => f.openedSessions().includes(id as never), [worker]);
+		expect(await owner.page.evaluate(() => location.href)).toBe(at);
+		expect(await owner.call((f) => f.openedSessions())).toEqual([worker]);
+
 		// Someone who may read the page but not the sessions: agents without names or links.
 		const reader = await openEditor(h, h.reader, pageId, { width: WIDTH, ...view });
 		await until(
@@ -192,10 +204,10 @@ test("agents at work: named and linked for who may read them, a block cursor, go
 			8000,
 		);
 		expect(
-			(await reader.call((f) => f.agentAvatars())).map((a) => [a.label, a.href, a.initial]),
+			(await reader.call((f) => f.agentAvatars())).map((a) => [a.label, a.href, a.role, a.initial]),
 		).toEqual([
-			[labels.agentHidden, null, ""],
-			[labels.agentHidden, null, ""],
+			[labels.agentHidden, null, "img", ""],
+			[labels.agentHidden, null, "img", ""],
 		]);
 		expect((await reader.call((f) => f.agentBlocks())).map((b) => b.id).sort()).toEqual(
 			[task, notes].sort(),
@@ -224,5 +236,29 @@ test("agents at work: named and linked for who may read them, a block cursor, go
 		[],
 		8000,
 	);
+	expect(errorsOf(owner)).toEqual([]);
+}, 120_000);
+
+test("more agents than the bar holds: six shown, the rest and the server's count in +N", async () => {
+	const lines = Array.from({ length: 9 }, (_, i) => `[ ] Task ${i}`);
+	const { pageId, ids } = await seedPage(h, "Busy page", lines);
+	for (const [i, task] of ids.entries()) {
+		const worker = await session(`Worker ${i}`);
+		await run(worker, true);
+		await writeOutline({
+			spaceId: h.space.id,
+			ops: [{ op: "setTask", block: { id: task }, task: { status: "doing" } }],
+			actor: { kind: "agent", id: worker },
+			narratorId: worker,
+			responsibleUserId: h.owner,
+		});
+	}
+	const owner = await openEditor(h, h.owner, pageId, { width: WIDTH });
+	// The server lists eight and counts one; the bar shows six and counts the other three.
+	await until(owner, (f) => f.presenceMore() === "+3", [], 8000);
+	expect((await owner.call((f) => f.agentAvatars())).length).toBe(6);
+	expect(await owner.call((f) => f.agentBlocks())).toHaveLength(8);
+	expect(await owner.call((f) => f.overflowsX())).toBe(false);
+	await shoot(owner, "agents-more-en-light");
 	expect(errorsOf(owner)).toEqual([]);
 }, 120_000);

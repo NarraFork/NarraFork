@@ -15,6 +15,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import en from "../../../locales/en/outline.json";
 import zh from "../../../locales/zh-CN/outline.json";
+import { OutlineHostProvider } from "../outline-host";
 import { OutlineViewStates } from "../view-state";
 import {
 	deleteBlock,
@@ -160,13 +161,22 @@ export interface OpenOptions {
 	/** The reader's language and colour scheme (English and light by default). */
 	lang?: "en" | "zh-CN";
 	scheme?: "light" | "dark";
+	/** Host the editor as a dock does: sessions open beside it (`openedSessions`). */
+	host?: boolean;
+}
+
+const opened: string[] = [];
+
+/** Sessions the host was asked to open (`host` option). */
+export function openedSessions(): string[] {
+	return [...opened];
 }
 
 function editor(
 	options: OpenOptions,
 	onClient: (client: LiveClient, view: () => OutlineView | null) => void,
 ) {
-	return (
+	const tree = (
 		<I18nextProvider i18n={instance}>
 			<MantineProvider {...(options.scheme ? { forceColorScheme: options.scheme } : {})}>
 				<OutlineEditor
@@ -183,6 +193,13 @@ function editor(
 				/>
 			</MantineProvider>
 		</I18nextProvider>
+	);
+	return options.host ? (
+		<OutlineHostProvider openSession={(narratorId) => opened.push(narratorId)}>
+			{tree}
+		</OutlineHostProvider>
+	) : (
+		tree
 	);
 }
 
@@ -502,16 +519,30 @@ export function blockSelection(): string[] {
 export function agentAvatars(): Array<{
 	label: string | null;
 	href: string | null;
+	role: string | null;
 	initial: string;
 	color: string;
+	/** The robot badge is drawn and nothing in the bar paints over its middle. */
+	badgeSeen: boolean | null;
 }> {
 	return [...document.querySelectorAll<HTMLElement>("[data-testid=outline-agent-avatar]")].map(
-		(el) => ({
-			label: el.getAttribute("aria-label"),
-			href: el.getAttribute("href"),
-			initial: el.querySelector(".nf-outline-agent-initial")?.textContent ?? "",
-			color: el.style.background,
-		}),
+		(el) => {
+			const badge = el.querySelector<SVGElement>(".nf-outline-agent-badge");
+			let badgeSeen: boolean | null = null;
+			if (badge) {
+				const r = badge.getBoundingClientRect();
+				const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+				badgeSeen = !!hit && (hit === badge || badge.contains(hit) || el.contains(hit));
+			}
+			return {
+				label: el.getAttribute("aria-label"),
+				href: el.getAttribute("href"),
+				role: el.getAttribute("role"),
+				initial: el.querySelector(".nf-outline-agent-initial")?.textContent ?? "",
+				color: el.style.background,
+				badgeSeen,
+			};
+		},
 	);
 }
 

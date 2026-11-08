@@ -256,6 +256,7 @@ export async function openEditor(
 		width?: number;
 		lang?: "en" | "zh-CN";
 		scheme?: "light" | "dark";
+		host?: boolean;
 	} = {},
 ): Promise<Editor> {
 	const context = await h.browser.createBrowserContext();
@@ -283,6 +284,7 @@ export async function openEditor(
 		...(options.width ? { width: options.width - 32 } : {}),
 		...(options.lang ? { lang: options.lang } : {}),
 		...(options.scheme ? { scheme: options.scheme } : {}),
+		...(options.host ? { host: true } : {}),
 	});
 	try {
 		await page.waitForFunction(
