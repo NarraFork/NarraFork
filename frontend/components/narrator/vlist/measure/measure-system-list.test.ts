@@ -25,42 +25,50 @@ const D = (n: number, over: Partial<KnowledgeHintData> = {}): KnowledgeHintData 
 	...over,
 });
 
+/**
+ * The live default geometry. The exported `KNOWLEDGE_HINT_*` constants are the
+ * bare-Mantine baseline (xs line 17); the default setting measures the xs line at 120%
+ * of it (`LINE_HEIGHT_BASELINE_PERCENT`): 20, so base 10×2 + 20 = 40, per entry 20 + 2.
+ */
+const BASE = 40;
+const PER_ENTRY = 22;
+
 describe("measureKnowledgeHint — linear height in entry count", () => {
-	it("N=0 → base height only (padding×2 + heading line) = 37px", () => {
-		expect(KNOWLEDGE_HINT_BASE_HEIGHT).toBe(37);
+	it("N=0 → base height only (padding×2 + heading line) = 40px", () => {
+		expect(KNOWLEDGE_HINT_BASE_HEIGHT).toBe(37); // the bare-Mantine baseline
 		const r = measureKnowledgeHint(D(0), 800);
-		expect(r.height).toBe(37);
+		expect(r.height).toBe(BASE);
 	});
 
-	it("N=1 → base + one entry row (line 17 + gap 2) = 56px", () => {
-		expect(KNOWLEDGE_HINT_HEIGHT_PER_ENTRY).toBe(19);
+	it("N=1 → base + one entry row (line 20 + gap 2) = 62px", () => {
+		expect(KNOWLEDGE_HINT_HEIGHT_PER_ENTRY).toBe(19); // the bare-Mantine baseline
 		const r = measureKnowledgeHint(D(1), 800);
-		expect(r.height).toBe(56);
+		expect(r.height).toBe(62);
 	});
 
-	it("N=2 → 37 + 2×19 = 75px", () => {
+	it("N=2 → 40 + 2×22 = 84px", () => {
 		const r = measureKnowledgeHint(D(2), 800);
-		expect(r.height).toBe(75);
+		expect(r.height).toBe(84);
 	});
 
-	it("N=5 → 37 + 5×19 = 132px", () => {
+	it("N=5 → 40 + 5×22 = 150px", () => {
 		const r = measureKnowledgeHint(D(5), 800);
-		expect(r.height).toBe(132);
+		expect(r.height).toBe(150);
 	});
 
-	it("height grows by exactly KNOWLEDGE_HINT_HEIGHT_PER_ENTRY (19) per entry", () => {
+	it("height grows by exactly one entry row (22) per entry", () => {
 		for (let n = 0; n < 12; n++) {
 			const cur = measureKnowledgeHint(D(n), 800).height;
 			const next = measureKnowledgeHint(D(n + 1), 800).height;
-			expect(next - cur).toBe(KNOWLEDGE_HINT_HEIGHT_PER_ENTRY);
+			expect(next - cur).toBe(PER_ENTRY);
 			// the closed form matches the measured height
 			expect(cur).toBe(knowledgeHintHeight(n));
-			expect(cur).toBe(KNOWLEDGE_HINT_BASE_HEIGHT + n * KNOWLEDGE_HINT_HEIGHT_PER_ENTRY);
+			expect(cur).toBe(BASE + n * PER_ENTRY);
 		}
 	});
 
 	it("knowledgeHintHeight clamps negative counts to the base height", () => {
-		expect(knowledgeHintHeight(-3)).toBe(KNOWLEDGE_HINT_BASE_HEIGHT);
+		expect(knowledgeHintHeight(-3)).toBe(BASE);
 	});
 });
 
@@ -78,7 +86,7 @@ describe("measureKnowledgeHint — height is independent of text content (trunca
 			800,
 		);
 		expect(long.height).toBe(short.height);
-		expect(long.height).toBe(56);
+		expect(long.height).toBe(62);
 	});
 
 	it("height does NOT change with heading length", () => {
@@ -137,7 +145,7 @@ describe("measureKnowledgeHint — block/frame shape", () => {
 		expect(block?.kind).toBe("fixed");
 		if (block?.kind === "fixed") {
 			expect(block.tag).toBe(KNOWLEDGE_HINT_TAG);
-			expect(block.height).toBe(75);
+			expect(block.height).toBe(84);
 		}
 	});
 

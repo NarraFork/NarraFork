@@ -20,7 +20,7 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { chmod, mkdir, open } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
-import { Transform } from "node:stream";
+import { Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import zlib, { createInflateRaw } from "node:zlib";
 import { isInsidePath } from "./platform-path";
@@ -56,9 +56,12 @@ const DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024;
 
 /** Thrown for malformed, unsupported or unsafe archives. */
 export class ZipArchiveError extends Error {
-	constructor(message: string) {
+	/** Set only where a caller must tell the case apart; otherwise the archive is just unusable. */
+	readonly reason?: "ENTRY_NOT_FOUND" | "ENTRY_UNREADABLE" | "ENTRY_TOO_LARGE" | "TOO_MANY_ENTRIES";
+	constructor(message: string, reason?: ZipArchiveError["reason"]) {
 		super(message);
 		this.name = "ZipArchiveError";
+		this.reason = reason;
 	}
 }
 
@@ -586,6 +589,247 @@ export async function extractZipArchive(
 	return { files, directories, totalBytes };
 }
 
+/** One central-directory entry as an archive viewer lists it. */
+export interface ZipListedEntry {
+	/** Raw entry name as recorded (directories end with `/`). Never used as a filesystem path. */
+	name: string;
+	isDirectory: boolean;
+	/** Symlinks and special entries are listed but have no readable content. */
+	isSymlink: boolean;
+	isSpecial: boolean;
+	encrypted: boolean;
+	compressionMethod: number;
+	compressedSize: number;
+	uncompressedSize: number;
+	/** True when `readZipEntry` can decode this entry: a regular, unencrypted, stored/deflated file. */
+	readable: boolean;
+}
+
+export interface ZipListing {
+	entries: ZipListedEntry[];
+	archiveSize: number;
+}
+
+/** Location data `readZipEntry` needs; kept out of the listing sent to clients. */
+interface ZipEntryLocation {
+	entry: ZipListedEntry;
+	localHeaderOffset: number;
+	crc32: number;
+}
+
+/**
+ * Parse the central directory for an archive VIEWER.
+ *
+ * Unlike `readZipArchive`, encrypted entries, unsupported compression methods and
+ * oversized declarations are reported rather than rejected: a listing reads no entry
+ * data, so they are not a risk here, and a viewer should still show such archives.
+ * Only structural damage, the entry-count cap and the central-directory cap fail the
+ * whole listing. Names are returned raw and are never resolved against a filesystem.
+ */
+async function scanZipDirectory(
+	handle: FileHandle,
+	archiveSize: number,
+	limits: Pick<ZipReadLimits, "maxEntries" | "maxCentralDirectoryBytes">,
+): Promise<ZipEntryLocation[]> {
+	const location = await locateCentralDirectory(handle, archiveSize);
+	if (location.entryCount > limits.maxEntries) {
+		throw new ZipArchiveError(
+			`Archive contains more than ${limits.maxEntries} entries`,
+			"TOO_MANY_ENTRIES",
+		);
+	}
+	if (location.size > limits.maxCentralDirectoryBytes) {
+		throw new ZipArchiveError("Archive central directory is too large", "TOO_MANY_ENTRIES");
+	}
+	const central = await readExact(handle, location.offset, location.size, "central directory");
+	const located: ZipEntryLocation[] = [];
+	let cursor = 0;
+	for (let index = 0; index < location.entryCount; index++) {
+		if (cursor + CENTRAL_ENTRY_MIN_SIZE > central.length) {
+			throw new ZipArchiveError("Archive central directory is truncated");
+		}
+		if (central.readUInt32LE(cursor) !== CENTRAL_SIGNATURE) {
+			throw new ZipArchiveError("Archive central directory has a malformed entry header");
+		}
+		const versionMadeBy = central.readUInt16LE(cursor + 4);
+		const flags = central.readUInt16LE(cursor + 8);
+		const compressionMethod = central.readUInt16LE(cursor + 10);
+		const crc = central.readUInt32LE(cursor + 16) >>> 0;
+		let compressedSize = central.readUInt32LE(cursor + 20);
+		let uncompressedSize = central.readUInt32LE(cursor + 24);
+		const nameLength = central.readUInt16LE(cursor + 28);
+		const extraLength = central.readUInt16LE(cursor + 30);
+		const commentLength = central.readUInt16LE(cursor + 32);
+		const externalAttributes = central.readUInt32LE(cursor + 38);
+		let localHeaderOffset = central.readUInt32LE(cursor + 42);
+		const nameStart = cursor + CENTRAL_ENTRY_MIN_SIZE;
+		const extraStart = nameStart + nameLength;
+		const commentStart = extraStart + extraLength;
+		const nextCursor = commentStart + commentLength;
+		if (nextCursor > central.length) {
+			throw new ZipArchiveError("Archive central directory is truncated");
+		}
+		const needsUncompressed = uncompressedSize === 0xffffffff;
+		const needsCompressed = compressedSize === 0xffffffff;
+		const needsOffset = localHeaderOffset === 0xffffffff;
+		if (needsUncompressed || needsCompressed || needsOffset) {
+			const zip64 = parseZip64Extra(
+				central.subarray(extraStart, commentStart),
+				needsUncompressed,
+				needsCompressed,
+				needsOffset,
+			);
+			if (needsUncompressed) uncompressedSize = zip64.uncompressedSize ?? uncompressedSize;
+			if (needsCompressed) compressedSize = zip64.compressedSize ?? compressedSize;
+			if (needsOffset) localHeaderOffset = zip64.localHeaderOffset ?? localHeaderOffset;
+		}
+		const name = decodeEntryName(central.subarray(nameStart, extraStart), flags);
+		const unixMode = versionMadeBy >>> 8 === HOST_UNIX ? (externalAttributes >>> 16) & 0xffff : 0;
+		const fileType = unixMode & S_IFMT;
+		const isDirectory = name.endsWith("/") || (fileType !== 0 && fileType === S_IFDIR);
+		const isSymlink = fileType === S_IFLNK;
+		const isSpecial = fileType !== 0 && fileType !== S_IFREG && fileType !== S_IFDIR && !isSymlink;
+		const encrypted = (flags & FLAG_ENCRYPTED) !== 0;
+		const inBounds = localHeaderOffset + LOCAL_HEADER_MIN_SIZE <= archiveSize;
+		located.push({
+			entry: {
+				name,
+				isDirectory,
+				isSymlink,
+				isSpecial,
+				encrypted,
+				compressionMethod,
+				compressedSize,
+				uncompressedSize,
+				readable:
+					inBounds &&
+					!isDirectory &&
+					!isSymlink &&
+					!isSpecial &&
+					!encrypted &&
+					(compressionMethod === METHOD_STORE || compressionMethod === METHOD_DEFLATE),
+			},
+			localHeaderOffset,
+			crc32: crc,
+		});
+		cursor = nextCursor;
+	}
+	return located;
+}
+
+/** List an archive's entries for a viewer. Reads only the central directory. */
+export async function listZipArchive(
+	archivePath: string,
+	limitOverrides?: Partial<Pick<ZipReadLimits, "maxEntries" | "maxCentralDirectoryBytes">>,
+): Promise<ZipListing> {
+	const limits = createLimits(limitOverrides);
+	const handle = await open(archivePath, "r");
+	try {
+		const archiveSize = (await handle.stat()).size;
+		const located = await scanZipDirectory(handle, archiveSize, limits);
+		return { entries: located.map((item) => item.entry), archiveSize };
+	} finally {
+		await handle.close().catch(() => undefined);
+	}
+}
+
+export interface ZipEntryContent {
+	entry: ZipListedEntry;
+	bytes: Uint8Array;
+}
+
+/**
+ * Decompress ONE entry (selected by its exact raw name) into memory.
+ *
+ * `maxBytes` is enforced while inflating, so a small entry that expands enormously is
+ * aborted mid-stream instead of being buffered. Size and CRC-32 are verified against the
+ * central directory, exactly as extraction does. Nothing is written to disk.
+ */
+export async function readZipEntry(
+	archivePath: string,
+	entryName: string,
+	maxBytes: number,
+	limitOverrides?: Partial<Pick<ZipReadLimits, "maxEntries" | "maxCentralDirectoryBytes">>,
+): Promise<ZipEntryContent> {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+		throw new ZipArchiveError("Invalid entry byte limit");
+	}
+	const limits = createLimits(limitOverrides);
+	const handle = await open(archivePath, "r");
+	try {
+		const archiveSize = (await handle.stat()).size;
+		const located = (await scanZipDirectory(handle, archiveSize, limits)).find(
+			(item) => item.entry.name === entryName,
+		);
+		if (!located)
+			throw new ZipArchiveError(`Archive entry not found: ${entryName}`, "ENTRY_NOT_FOUND");
+		const { entry, localHeaderOffset } = located;
+		if (!entry.readable)
+			throw new ZipArchiveError(`Archive entry cannot be read: ${entryName}`, "ENTRY_UNREADABLE");
+		if (entry.uncompressedSize > maxBytes) {
+			throw new ZipArchiveError("Archive entry exceeds the read limit", "ENTRY_TOO_LARGE");
+		}
+		const header = await readExact(
+			handle,
+			localHeaderOffset,
+			LOCAL_HEADER_MIN_SIZE,
+			`local header for ${entry.name}`,
+		);
+		if (header.readUInt32LE(0) !== LOCAL_SIGNATURE) {
+			throw new ZipArchiveError(`Archive entry has a malformed local header: ${entry.name}`);
+		}
+		const dataStart =
+			localHeaderOffset + LOCAL_HEADER_MIN_SIZE + header.readUInt16LE(26) + header.readUInt16LE(28);
+		if (dataStart + entry.compressedSize > archiveSize) {
+			throw new ZipArchiveError(
+				`Archive entry data extends past the end of the file: ${entry.name}`,
+			);
+		}
+		if (entry.compressedSize === 0) {
+			if (entry.uncompressedSize !== 0) {
+				throw new ZipArchiveError(`Archive entry has inconsistent sizes: ${entry.name}`);
+			}
+			return { entry, bytes: new Uint8Array(0) };
+		}
+		const chunks: Buffer[] = [];
+		let actualBytes = 0;
+		let actualCrc = 0;
+		const guard = createGuard(
+			entry.uncompressedSize,
+			maxBytes,
+			() => Number.POSITIVE_INFINITY,
+			(bytes, crc) => {
+				actualBytes = bytes;
+				actualCrc = crc;
+			},
+		);
+		const sink = new Writable({
+			write(chunk: Buffer, _encoding, callback) {
+				chunks.push(chunk);
+				callback();
+			},
+		});
+		const source = handle.createReadStream({
+			start: dataStart,
+			end: dataStart + entry.compressedSize - 1,
+			autoClose: false,
+		});
+		if (entry.compressionMethod === METHOD_DEFLATE) {
+			await pipeline(source, createInflateRaw(), guard, sink);
+		} else {
+			await pipeline(source, guard, sink);
+		}
+		if (actualBytes !== entry.uncompressedSize) {
+			throw new ZipArchiveError(`Archive entry size mismatch: ${entry.name}`);
+		}
+		if (actualCrc !== located.crc32) {
+			throw new ZipArchiveError(`Archive entry failed its CRC check: ${entry.name}`);
+		}
+		return { entry, bytes: new Uint8Array(Buffer.concat(chunks, actualBytes)) };
+	} finally {
+		await handle.close().catch(() => undefined);
+	}
+}
 /** Join helper used by tests to build expected extraction paths. */
 export function zipEntryPath(destination: string, name: string): string {
 	return join(destination, ...name.split("/"))

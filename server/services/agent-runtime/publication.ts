@@ -32,6 +32,12 @@ export interface StartRunInput {
 	started?: boolean;
 	/** Task projection of a delivered run; adopts the actor's pre-registered run. */
 	taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
+	/**
+	 * Adopt the actor's pre-registered run (an unconsumed terminal reservation for this
+	 * destination) without inserting a task row; a settled run starts a new one. Implied
+	 * by `taskRow`.
+	 */
+	adoptRegisteredRun?: boolean;
 }
 /** A registered run; `publication` exists exactly when the run delivers a result. */
 export interface StartedRun {
@@ -76,6 +82,7 @@ import {
 	type PublicationIntent,
 	type PublicationRun,
 	publicationDedupeKey,
+	type RunPublicationStatus,
 } from "./publication-outbox";
 import {
 	AGENT_RESULT_JSON_MAX_BYTES,
@@ -177,7 +184,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return runAtomicWrite(database, "publication.startRun", (tx) => {
 			const recipientId = input.binding.deliverTo?.narratorId;
 			let resumeRunId = input.resumeRunId;
-			if (input.taskRow && recipientId && resumeRunId === undefined) {
+			if ((input.taskRow || input.adoptRegisteredRun) && recipientId && resumeRunId === undefined) {
 				const actor = tx
 					.select({ logicalRunId: narrators.logicalRunId })
 					.from(narrators)
@@ -192,22 +199,10 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 					};
 					// Only a pre-registered start is adopted. An old terminal/consumed run is
 					// not an admission token for the next task.
-					const reservation = tx
-						.select({ id: runtimePublicationOutbox.id })
-						.from(runtimePublicationOutbox)
-						.where(
-							and(
-								eq(runtimePublicationOutbox.producerKind, "agent"),
-								eq(runtimePublicationOutbox.taskId, input.narratorId),
-								eq(runtimePublicationOutbox.logicalRunId, actor.logicalRunId),
-								eq(runtimePublicationOutbox.recipientId, recipientId),
-								eq(runtimePublicationOutbox.eventKind, "terminal"),
-								eq(runtimePublicationOutbox.state, "reserved"),
-							),
-						)
-						.limit(1)
-						.get();
-					if (reservation && !store.isAwaitedTerminal(existingRun, tx))
+					if (
+						store.hasReservedTerminalSlot(existingRun, tx) &&
+						!store.isAwaitedTerminal(existingRun, tx)
+					)
 						resumeRunId = actor.logicalRunId;
 				}
 			}
@@ -669,6 +664,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		getAgentRun,
 		persistResult,
 		readAgentTerminalResult,
+		readRunPublicationState: store.readRunPublicationState,
 		commit,
 		flushRecipient,
 		flushPage,
@@ -856,6 +852,7 @@ export function createUnwiredPublicationFacade(
 		getAgentRun: () => unavailable("getAgentRun"),
 		persistResult: () => unavailable("persistResult"),
 		readAgentTerminalResult: () => unavailable("readAgentTerminalResult"),
+		readRunPublicationState: () => unavailable("readRunPublicationState"),
 		commit: () => unavailable("commit"),
 		flushRecipient: () => unavailable("flushRecipient"),
 		flushPage: () => unavailable("flushPage"),
@@ -894,6 +891,8 @@ export type PublicationCommitResult = {
 	status: "duplicate" | "committed";
 	deliveryId: string | null;
 	arrivalSeq: number | null;
+	/** False when onlyIfActive suppressed a terminal/missing parent conclusion write. */
+	toolConclusionApplied?: boolean;
 };
 
 /** The terminal-commit composite input (result snapshot + intent in one section). */
@@ -914,6 +913,8 @@ export interface PublicationTerminalCommit {
 		output: string;
 		status: "success" | "fail";
 		resultMessageId?: string;
+		/** Recovery explanations may update only an active row, never a terminal result. */
+		onlyIfActive?: boolean;
 	};
 }
 
@@ -1006,6 +1007,8 @@ export interface AsyncRuntimePublicationService {
 		run: PublicationRun,
 		options?: AgentTerminalResultReadOptions,
 	): Promise<AgentTerminalResult | null>;
+	/** Whether this run may still publish a terminal: the ONLY authority for resume-vs-deliver decisions. */
+	readRunPublicationState(run: PublicationRun): Promise<RunPublicationStatus>;
 	/** Durable, exact-run consumption; revoke only terminal notices not yet in recipient history. */
 	consumeAwaitedTerminal(
 		run: PublicationRun,
@@ -1080,14 +1083,14 @@ function createSqliteAsyncPublicationService(
 				.where(eq(backgroundTasks.id, input.taskId))
 				.get();
 			if (!existing) return undefined;
-			const run = legacy.getAgentRun(input.taskId, input.taskId);
 			return Promise.resolve(
 				runAtomicWrite(db, "publication.restartAgentTask", (tx) => {
 					const updated = tx
 						.update(backgroundTasks)
 						.set({
 							status: "running",
-							logicalRunId: run.logicalRunId,
+							// The run the caller registered for this restart (same as PostgreSQL).
+							logicalRunId: input.logicalRunId,
 							command: null,
 							exitCode: null,
 							subagentNarratorId: input.subagentNarratorId,
@@ -1420,6 +1423,7 @@ function createSqliteAsyncPublicationService(
 		migrateLegacyTaskNotice: async (recipientId, entry) =>
 			legacy.migrateLegacyTaskNotice(recipientId, entry),
 		readAgentTerminalResult: async (run, options) => legacy.readAgentTerminalResult(run, options),
+		readRunPublicationState: async (run) => legacy.readRunPublicationState(run),
 		consumeAwaitedTerminal: async (run, options) => legacy.consumeAwaitedTerminal(run, options),
 		hasPendingSource: async (run) => legacy.hasPendingSource(run),
 		flushRecipient: async (recipientId) => legacy.flushRecipient(recipientId),
@@ -1606,6 +1610,7 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 			return status;
 		},
 		readAgentTerminalResult: (run, options) => engine.readAgentTerminalResult(run, options),
+		readRunPublicationState: (run) => engine.readRunPublicationState(run),
 		consumeAwaitedTerminal: (run, options) => queue.outbox.consumeAwaitedTerminal(run, options),
 		hasPendingSource: (run) => engine.hasPendingSource(run),
 		flushRecipient,
@@ -1751,4 +1756,4 @@ export type {
 } from "./postgres-runtime-publication";
 
 // Re-export domain types for callers that import from this module.
-export type { PublicationEvent, PublicationRun } from "./publication-outbox";
+export type { PublicationEvent, PublicationRun, RunPublicationStatus } from "./publication-outbox";

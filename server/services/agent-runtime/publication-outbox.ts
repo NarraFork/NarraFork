@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
 	backgroundTasks,
 	runtimeAwaitedTerminalConsumptions as consumptions,
@@ -24,6 +24,19 @@ import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publ
 import { runAtomicWrite } from "./runtime-write";
 
 export type PublicationEvent = "started" | "completed" | "failed" | "timed_out" | "cancelled";
+/**
+ * Whether a run may still publish its terminal result.
+ * - `reserved`: its terminal slot is still open, so the same run may continue.
+ * - `settled`: a terminal was already committed, delivered or consumed; never run it again.
+ * - `none`: no reservation and no terminal evidence (no recipient, or slots already released).
+ * Only this module answers it; callers must not infer it from narrator rows or result reads.
+ */
+export type RunPublicationState = "reserved" | "settled" | "none";
+/** The settled event kind lets a recovery pass finish through the normal dedupe path. */
+export interface RunPublicationStatus {
+	state: RunPublicationState;
+	eventKind?: Exclude<PublicationEvent, "started">;
+}
 export const LEGACY_UNKNOWN_BASH_FAILURE_SUMMARY =
 	"Execution outcome unknown after restart; the command was not rerun.";
 export interface PublicationRun {
@@ -174,6 +187,23 @@ export function publicationDedupeKey(
 		eventKind,
 		run.recipientId,
 	]);
+}
+/** Inverse of the event slot in publicationDedupeKey, for delivered mailbox receipts. */
+export function publicationEventFromDedupeKey(
+	dedupeKey: string | null,
+): Exclude<PublicationEvent, "started"> | undefined {
+	if (!dedupeKey) return undefined;
+	try {
+		const eventKind = (JSON.parse(dedupeKey) as unknown[])[4];
+		return eventKind === "completed" ||
+			eventKind === "failed" ||
+			eventKind === "timed_out" ||
+			eventKind === "cancelled"
+			? eventKind
+			: undefined;
+	} catch {
+		return undefined;
+	}
 }
 function runWhere(run: PublicationRun) {
 	return and(
@@ -689,6 +719,54 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 			.run();
 		return { status: "registered", run, eventKind: admission.eventKind };
 	}
+	function hasReservedTerminalSlot(run: PublicationRun, tx: RuntimeStoreDb = db): boolean {
+		return !!tx
+			.select({ id: outbox.id })
+			.from(outbox)
+			.where(and(runWhere(run), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved")))
+			.limit(1)
+			.get();
+	}
+	function readRunPublicationState(
+		run: PublicationRun,
+		tx: RuntimeStoreDb = db,
+	): RunPublicationStatus {
+		assertRun(run);
+		if (hasReservedTerminalSlot(run, tx)) return { state: "reserved" };
+		const committed = tx
+			.select({ eventKind: outbox.eventKind })
+			.from(outbox)
+			.where(
+				and(
+					runWhere(run),
+					ne(outbox.eventKind, "started"),
+					ne(outbox.eventKind, "terminal"),
+					ne(outbox.state, "reserved"),
+				),
+			)
+			.limit(1)
+			.get();
+		if (committed)
+			return {
+				state: "settled",
+				eventKind: committed.eventKind as Exclude<PublicationEvent, "started">,
+			};
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		const delivered = tx
+			.select({ dedupeKey: mailbox.dedupeKey })
+			.from(mailbox)
+			.where(and(eq(mailbox.narratorId, run.recipientId), inArray(mailbox.dedupeKey, keys)))
+			.limit(1)
+			.get();
+		if (delivered) {
+			const eventKind = publicationEventFromDedupeKey(delivered.dedupeKey);
+			return { state: "settled", ...(eventKind ? { eventKind } : {}) };
+		}
+		if (isAwaitedTerminal(run, tx)) return { state: "settled" };
+		return { state: "none" };
+	}
 	function isAwaitedTerminal(run: PublicationRun, tx: RuntimeStoreDb = db): boolean {
 		return !!tx
 			.select({ taskId: consumptions.taskId })
@@ -1089,6 +1167,8 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		reserveRunSlots,
 		consumeAwaitedTerminal,
 		isAwaitedTerminal,
+		hasReservedTerminalSlot,
+		readRunPublicationState,
 		commitIntent,
 		transferNext,
 		persistLogicalRun,

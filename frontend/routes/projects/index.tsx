@@ -1,3 +1,4 @@
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	Alert,
@@ -199,7 +200,10 @@ function ProjectListPage() {
 	return (
 		<Stack>
 			<Group justify="space-between">
-				<Title order={2}>{t("title")}</Title>
+				<Group gap="xs" wrap="nowrap">
+					<MobileNavButton />
+					<Title order={2}>{t("title")}</Title>
+				</Group>
 				<Button onClick={guardedOpen}>{t("newProject")}</Button>
 			</Group>
 

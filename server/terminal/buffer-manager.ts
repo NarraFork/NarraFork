@@ -14,7 +14,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { SerializeAddon } from "@xterm/addon-serialize";
-import { Terminal } from "@xterm/headless";
+import { type IBuffer, type IMarker, Terminal } from "@xterm/headless";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 
@@ -58,6 +58,22 @@ interface BufferFileV3 {
  * timeout expires (crossterm waits ~2s) and then reports
  * "The cursor position could not be read within a normal duration".
  */
+export interface BufferReadCursor {
+	readonly marker: IMarker;
+	/** Last populated row already included in the snapshot; follows row moves. */
+	readonly observedEndMarker?: IMarker;
+	readonly prefixUnknown: boolean;
+	dispose(): void;
+	readonly offset: number;
+	readonly textBefore: string;
+	readonly sequence: number;
+	/** Horizontal reflow changes a physical-row prefix, so it expires this point. */
+	readonly columns: number;
+	readonly layoutRevision: number;
+}
+
+export type BufferReadObserver = (cursor: BufferReadCursor | undefined, sequence: number) => void;
+
 export interface BufferManagerOptions {
 	/**
 	 * Receives parser replies, ready to be written to the PTY. Not called
@@ -66,6 +82,44 @@ export interface BufferManagerOptions {
 	 * queries inside it would inject stray characters into a live shell.
 	 */
 	onReply?: (data: string) => void;
+	/**
+	 * Runs once before the headless terminal is disposed, while its contents can
+	 * still be read. Terminal watches use it for a last match on the final output.
+	 */
+	beforeDispose?: () => Promise<void> | void;
+}
+
+/**
+ * Plain text of the normal buffer from row `start` to the end. Soft-wrapped rows
+ * are joined without a line break, so a long line reads as one line.
+ */
+export function joinBufferLines(
+	buffer: IBuffer,
+	start: number,
+	endRow = buffer.length,
+	trimTrailingEmpty = true,
+): string {
+	const lines: string[] = [];
+	let current = "";
+	for (let y = Math.max(0, start); y < Math.min(endRow, buffer.length); y++) {
+		const line = buffer.getLine(y);
+		if (!line) break;
+		const continues = buffer.getLine(y + 1)?.isWrapped ?? false;
+		// A row that continues onto the next keeps its trailing spaces: they are content.
+		current += line.translateToString(!continues);
+		if (!continues) {
+			lines.push(current);
+			current = "";
+		}
+	}
+	if (current) lines.push(current);
+	// A partial observed prefix must retain blank rows/newlines that are still
+	// present before subsequent new output; otherwise its boundary moves backwards.
+	if (!trimTrailingEmpty) return lines.join("\n");
+	// Rows below the cursor are blank until output reaches them.
+	let end = lines.length;
+	while (end > 0 && lines[end - 1] === "") end--;
+	return lines.slice(0, end).join("\n");
 }
 
 export class BufferManager {
@@ -75,6 +129,7 @@ export class BufferManager {
 	private dirty = false;
 	private flushTimer: ReturnType<typeof setInterval> | null = null;
 	private onReply: ((data: string) => void) | undefined;
+	private beforeDispose: (() => Promise<void> | void) | undefined;
 	/** True while a restored snapshot is being fed to the parser (replies muted). */
 	private replaying = false;
 	/** True once dispose() ran, so late parser replies cannot touch a dead PTY. */
@@ -93,6 +148,9 @@ export class BufferManager {
 	 * Promise + one pending string array regardless of throughput.
 	 */
 	private writeChain: Promise<void> = Promise.resolve();
+	private readSequence = 0;
+	private layoutSequence = 0;
+	private readonly ownedReadCursors = new WeakSet<BufferReadCursor>();
 
 	/** Buffered data waiting to be written to xterm in the next drain cycle. */
 	private pendingWrites: string[] = [];
@@ -120,6 +178,7 @@ export class BufferManager {
 	) {
 		this.terminalId = terminalId;
 		this.onReply = options.onReply;
+		this.beforeDispose = options.beforeDispose;
 		this.xterm = new Terminal({
 			cols,
 			rows,
@@ -195,11 +254,160 @@ export class BufferManager {
 	 * Get buffer contents as a clean state snapshot.
 	 * Waits for pending writes to complete first.
 	 */
-	async getContents(): Promise<string> {
+	async getContents(observe?: BufferReadObserver): Promise<string> {
 		await this.writeChain;
-		return this.serializeAddon.serialize({
+		const contents = this.serializeAddon.serialize({
 			scrollback: this.xterm.options.scrollback,
 		});
+		if (observe) {
+			// No await between serialization and the point: later parsed output must
+			// remain after this frontier even if permission checks delay the response.
+			const sequence = ++this.readSequence;
+			const cursor = this.captureReadCursor(sequence);
+			try {
+				observe(cursor, sequence);
+			} catch (error) {
+				cursor?.dispose();
+				throw error;
+			}
+		}
+		return contents;
+	}
+
+	private captureReadCursor(sequence: number): BufferReadCursor | undefined {
+		if (this.disposed || this.xterm.buffer.active.type !== "normal") return undefined;
+		const marker = this.xterm.registerMarker(0);
+		if (!marker) return undefined;
+		const normal = this.xterm.buffer.normal;
+		let last = normal.length - 1;
+		while (last > marker.line && !normal.getLine(last)?.translateToString(true)) last--;
+		const observedEndMarker =
+			last === marker.line
+				? marker
+				: this.xterm.registerMarker(last - (normal.baseY + normal.cursorY));
+		if (!observedEndMarker) {
+			marker.dispose();
+			return undefined;
+		}
+		const textBefore = joinBufferLines(normal, marker.line);
+		const owners = this.ownedReadCursors;
+		const cursor: BufferReadCursor = {
+			marker,
+			observedEndMarker,
+			prefixUnknown: false,
+			offset: textBefore.length,
+			textBefore,
+			sequence,
+			columns: this.xterm.cols,
+			layoutRevision: this.layoutSequence,
+			dispose() {
+				owners.delete(cursor);
+				marker.dispose();
+				if (observedEndMarker !== marker) observedEndMarker.dispose();
+			},
+		};
+		this.ownedReadCursors.add(cursor);
+		return cursor;
+	}
+
+	/** A fresh future-only point, captured with its baseline in one synchronous step. */
+	async markReadCursor(): Promise<BufferReadCursor | undefined> {
+		await this.writeChain;
+		return this.captureReadCursor(++this.readSequence);
+	}
+
+	/** The watch owns the clone; disposing it must not consume the stored observation. */
+	cloneReadCursor(source: BufferReadCursor): BufferReadCursor | undefined {
+		if (
+			this.disposed ||
+			this.xterm.buffer.active.type !== "normal" ||
+			!this.ownedReadCursors.has(source) ||
+			source.columns !== this.xterm.cols ||
+			source.layoutRevision !== this.layoutSequence
+		)
+			return undefined;
+		const normal = this.xterm.buffer.normal;
+		const lost = source.marker.isDisposed || source.marker.line < 0;
+		const line = lost ? 0 : source.marker.line;
+		const marker = this.xterm.registerMarker(line - (normal.baseY + normal.cursorY));
+		if (!marker) return undefined;
+		const end = source.observedEndMarker;
+		const endLost = !end || end.isDisposed || end.line < 0;
+		const observedEndMarker = endLost
+			? undefined
+			: end.line === line
+				? marker
+				: this.xterm.registerMarker(end.line - (normal.baseY + normal.cursorY));
+		if (!endLost && !observedEndMarker) {
+			marker.dispose();
+			return undefined;
+		}
+		const allNew = lost && endLost;
+		const owners = this.ownedReadCursors;
+		const cursor: BufferReadCursor = {
+			marker,
+			observedEndMarker,
+			prefixUnknown: !allNew && (source.prefixUnknown || lost),
+			offset: allNew ? 0 : source.offset,
+			textBefore: allNew ? "" : source.textBefore,
+			sequence: source.sequence,
+			columns: source.columns,
+			layoutRevision: source.layoutRevision,
+			dispose() {
+				owners.delete(cursor);
+				marker.dispose();
+				if (observedEndMarker !== marker) observedEndMarker?.dispose();
+			},
+		};
+		this.ownedReadCursors.add(cursor);
+		return cursor;
+	}
+
+	/**
+	 * Mark the cursor row of the normal buffer, after pending output is parsed.
+	 * The marker follows its row as output scrolls and is disposed once the row
+	 * leaves the scrollback. Returns undefined while a full-screen app has the
+	 * alternate buffer active, or after dispose.
+	 */
+	async markCursorRow(): Promise<IMarker | undefined> {
+		await this.writeChain;
+		if (this.disposed || this.xterm.buffer.active.type !== "normal") return undefined;
+		return this.xterm.registerMarker(0);
+	}
+
+	/**
+	 * Plain text of the normal buffer from `marker`'s row to the end, or the whole
+	 * normal buffer when the marker is gone (`markerLost`: everything still in the
+	 * buffer was written after it). Reads only the rows it returns.
+	 */
+	async readFromMarker(
+		marker: IMarker,
+		observedEndMarker?: IMarker,
+	): Promise<{ text: string; markerLost: boolean; observedPrefixEnd?: number }> {
+		await this.writeChain;
+		if (this.disposed) return { text: "", markerLost: true, observedPrefixEnd: 0 };
+		const normal = this.xterm.buffer.normal;
+		const lost = marker.isDisposed || marker.line < 0;
+		const start = lost ? 0 : marker.line;
+		let observedPrefixEnd: number | undefined;
+		if (observedEndMarker) {
+			const endLost = observedEndMarker.isDisposed || observedEndMarker.line < 0;
+			if (!endLost && observedEndMarker.line >= start) {
+				observedPrefixEnd = joinBufferLines(
+					normal,
+					start,
+					observedEndMarker.line + 1,
+					false,
+				).length;
+			} else if (lost && endLost) {
+				observedPrefixEnd = 0;
+			}
+		}
+		return {
+			text: joinBufferLines(normal, start),
+			markerLost: lost,
+			observedPrefixEnd,
+		};
 	}
 
 	/** Get current terminal state for client notification */
@@ -220,9 +428,15 @@ export class BufferManager {
 		return this.xterm.rows;
 	}
 
+	/** Revision is monotonic even when a later resize restores the original columns. */
+	get layoutRevision(): number {
+		return this.layoutSequence;
+	}
+
 	/** Resize the internal headless terminal after pending writes complete */
 	async resize(cols: number, rows: number): Promise<void> {
 		await this.writeChain;
+		if (cols !== this.xterm.cols) this.layoutSequence++;
 		this.xterm.resize(cols, rows);
 	}
 
@@ -361,6 +575,16 @@ export class BufferManager {
 	/** Cleanup: stop flush timer, save final state, optionally delete */
 	async dispose(deleteBuffer = false): Promise<void> {
 		this.stopPeriodicFlush();
+		const beforeDispose = this.beforeDispose;
+		this.beforeDispose = undefined;
+		try {
+			await beforeDispose?.();
+		} catch (err) {
+			logger.warn("Terminal beforeDispose hook failed", {
+				terminalId: this.terminalId,
+				error: String(err),
+			});
+		}
 		if (deleteBuffer) {
 			await this.deleteFromDisk();
 		} else if (this.dirty) {

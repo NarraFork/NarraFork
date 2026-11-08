@@ -1,7 +1,8 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { contextUpdateOf, renderContextUpdate } from "@shared/prefix-context";
 import { serializeWorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
@@ -19,7 +20,11 @@ import { settings } from "../../lib/settings";
 import { safeSpawn } from "../../lib/spawn";
 import { resolveNarratorGitTarget } from "../git-workspace";
 import { enterNarratorPlanMode } from "../narrator-plan-mode";
-import { getPrefixToolDefinitions } from "../narrator-prefix-snapshots";
+import {
+	cleanupPrefixSnapshots,
+	closePrefixSnapshotStore,
+	getPrefixToolDefinitions,
+} from "../narrator-prefix-snapshots";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
 import { workspaceContextService } from "../workspace-context-service";
 
@@ -294,6 +299,36 @@ describe("unified prefix epochs with real SQLite history", () => {
 		expect(resumed.epoch?.definitionSnapshots?.[0].description).toBe("Read original");
 	});
 
+	test("unchanged epochs never rewrite the tool catalog after write memo removal or store restart", async () => {
+		const { input } = await fixture();
+		const candidates = Array.from({ length: 200 }, (_, index) => ({
+			...baseTool,
+			name: `Stable${index}`,
+			description: `Stable description ${index}`,
+		}));
+		const current = { ...input, candidates, managed: new Set<string>() };
+		const post = spyOn(Worker.prototype, "postMessage");
+		try {
+			const baseline = await reconcileEpoch(current);
+			const writes = () =>
+				post.mock.calls.filter(([request]) => request.operation === "putJsonBatch").length;
+			expect(writes()).toBeGreaterThan(1);
+			const initialWrites = writes();
+			for (let round = 0; round < 3; round++) {
+				const next = await reconcileEpoch({ ...current, registryRevision: `round-${round}` });
+				expect(next.changed).toBe(false);
+				expect(next.epoch?.markerId).toBe(baseline.epoch?.markerId);
+			}
+			await closePrefixSnapshotStore();
+			const replay = await reconcileEpoch(current);
+			expect(replay.epoch?.markerId).toBe(baseline.epoch?.markerId);
+			expect(replay.epoch?.definitionSnapshots).toHaveLength(candidates.length);
+			expect(writes()).toBe(initialWrites);
+		} finally {
+			post.mockRestore();
+		}
+	});
+
 	test("tool loads persist immutable snapshot references without changing baseline", async () => {
 		const { narratorId, input } = await fixture();
 		const initial = await reconcileEpoch(input);
@@ -560,7 +595,94 @@ describe("unified prefix epochs with real SQLite history", () => {
 		expect((await history(fork.narratorId)).map((row) => row.id)).toEqual(
 			(await history(narratorId)).map((row) => row.id),
 		);
+		await narratorService.remove(narratorId);
+		const now = Date.now() + 2 * 24 * 60 * 60 * 1000;
+		for (let step = 0; ; step++) {
+			expect(step).toBeLessThan(1000);
+			if ((await cleanupPrefixSnapshots({ now })).phase === "done") break;
+		}
+		await closePrefixSnapshotStore();
+		const surviving = await reconcileEpoch({ ...moved, narratorId: fork.narratorId });
+		expect(surviving.epoch?.markerId).toBe(initial.epoch?.markerId);
+		expect(surviving.epoch?.definitionSnapshots).toEqual(initial.epoch?.definitionSnapshots);
+		const definitions = initial.epoch?.definitionSnapshots;
+		if (!definitions) throw new Error("Missing baseline definitions");
+		expect(await getPrefixToolDefinitions(initial.epoch?.prefix?.tools ?? "")).toEqual(definitions);
 	});
+});
+
+const epochMarkers = async (id: string) =>
+	(await history(id)).filter(
+		(row) =>
+			row.role === "system" &&
+			Array.isArray(row.contentJson) &&
+			(row.contentJson[0] as { type?: string })?.type === "epoch",
+	);
+
+test("an explicit load the strategy cannot append opens one new epoch that declares it", async () => {
+	const { narratorId, input: original } = await fixture();
+	const input = { ...original, model: "claude-sonnet-4" };
+	const first = await reconcileEpoch(input);
+	expect(first.epoch?.strategy).toBe("replace_tools");
+	expect(first.epoch?.baseToolNames).not.toContain(optionalTool.name);
+	await narratorStore.appendToolChange(
+		narratorId,
+		{
+			type: "tool_loaded",
+			toolName: optionalTool.name,
+			toolNames: [optionalTool.name],
+			text: "loaded",
+			rebaseline: true,
+		},
+		undefined,
+		[optionalTool.name],
+	);
+	const loaded = { ...input, current: [optionalTool.name] };
+	const next = await reconcileEpoch(loaded);
+	expect(next.opened).toBe(true);
+	expect(next.epoch?.markerId).not.toBe(first.epoch?.markerId);
+	expect(next.epoch?.reason).toBe("tools");
+	expect(next.epoch?.baseToolNames).toContain(optionalTool.name);
+	// The new baseline declares the tool, so the notice no longer reopens epochs.
+	const again = await reconcileEpoch(loaded);
+	expect(again.opened).toBe(false);
+	expect(again.epoch?.markerId).toBe(next.epoch?.markerId);
+	expect(await epochMarkers(narratorId)).toHaveLength(2);
+});
+
+test("a protocol change on the same model opens a new epoch with the new strategy", async () => {
+	const { narratorId, input } = await fixture();
+	const first = await reconcileEpoch(input);
+	expect(first.epoch?.protocol).toBe("anthropic-messages");
+	expect(first.epoch?.strategy).toBe("anthropic_tool_addition");
+	const key = `${provider}:${input.model}`;
+	const saved = settings.agent.modelProtocols;
+	settings.agent.modelProtocols = { ...saved, [key]: "completions-compatible" };
+	try {
+		const next = await reconcileEpoch(input);
+		expect(next.opened).toBe(true);
+		expect(next.epoch?.reason).toBe("target");
+		expect(next.epoch?.protocol).toBe("completions-compatible");
+		expect(next.epoch?.strategy).toBe("replace_tools");
+		expect((await reconcileEpoch(input)).opened).toBe(false);
+	} finally {
+		settings.agent.modelProtocols = saved;
+	}
+	expect(await epochMarkers(narratorId)).toHaveLength(2);
+});
+
+test("an epoch without a recorded protocol is kept while its strategy still matches", async () => {
+	const { narratorId, input } = await fixture();
+	await reconcileEpoch(input);
+	const marker = (await epochMarkers(narratorId))[0];
+	const recorded = epochRecordOf((marker?.contentJson as unknown[] | undefined)?.[0]);
+	if (!recorded?.protocol) throw new Error("Missing recorded protocol");
+	// The same baseline as written before `protocol` was recorded.
+	const { protocol: _protocol, ...legacy } = recorded;
+	const legacyMarker = await narratorStore.openEpoch(narratorId, legacy);
+	const next = await reconcileEpoch(input);
+	expect(next.opened).toBe(false);
+	expect(next.epoch?.markerId).toBe(legacyMarker.id);
 });
 
 for (const change of ["device", "resident"] as const) {

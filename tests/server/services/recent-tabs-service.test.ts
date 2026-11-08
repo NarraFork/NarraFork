@@ -25,6 +25,7 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 
 const recentTabs = await import("../../../server/services/recent-tabs-service");
 const { reduceRecentTabsOperations } = await import("../../../frontend/hooks/useRecentTabs");
+const { applyRecentTabMove } = await import("../../../shared/recent-tab-layout");
 
 const NOW = "2026-07-19T00:00:00.000Z";
 
@@ -40,13 +41,25 @@ function seedUser(userId = "user-1"): void {
 		.run();
 }
 
+/**
+ * Seed through the legacy JSON path. Tabs are written in the CURRENT shape and
+ * translated to what pre-folder clients stored (a `workspace` header plus children
+ * carrying `workspaceId`), which the lazy migration converts back into folders — so
+ * these scenarios also exercise that conversion.
+ */
+function toLegacyShape(tab: PersistedRecentTab): Record<string, unknown> {
+	const { folderId, ...rest } = tab;
+	if (tab.type === "folder") return { ...rest, type: "workspace" };
+	return folderId ? { ...rest, workspaceId: folderId } : rest;
+}
+
 function seedLegacyTabs(tabs: PersistedRecentTab[], userId = "user-1"): void {
 	seedUser(userId);
 	db.insert(userPreferences)
 		.values({
 			id: `pref-${userId}`,
 			userId,
-			recentTabs: JSON.stringify(tabs),
+			recentTabs: JSON.stringify(tabs.map(toLegacyShape)),
 			createdAt: NOW,
 			updatedAt: NOW,
 		})
@@ -148,22 +161,23 @@ describe("recent-tabs indexed side paths", () => {
 		expect(storedKeys()).toEqual(["project:pinned", "narrator:draft-target", "narrator:older"]);
 	});
 
-	it("supports updateOnly workspace membership release with workspaceId null", async () => {
+	it("ignores folder membership carried by an updateOnly upsert", async () => {
 		seedLegacyTabs([
-			makeTab("ws-1", { type: "workspace" }),
-			makeTab("child-1", { workspaceId: "ws-1" }),
+			makeTab("folder-1", { type: "folder", title: "F" }),
+			makeTab("child-1", { folderId: "folder-1" }),
+			makeTab("child-2", { folderId: "folder-1" }),
 		]);
 		await recentTabs.ensureMigrated("user-1");
 
-		await recentTabs.upsertRecentTab("user-1", makeTab("child-1", { workspaceId: null }), {
+		await recentTabs.upsertRecentTab("user-1", makeTab("child-1", { title: "Renamed" }), {
 			updateOnly: true,
 		});
 		const child = db
-			.select({ workspaceId: userRecentTabs.workspaceId })
+			.select({ folderId: userRecentTabs.folderId, title: userRecentTabs.title })
 			.from(userRecentTabs)
 			.where(eq(userRecentTabs.tabKey, "narrator:child-1"))
 			.get();
-		expect(child?.workspaceId).toBeNull();
+		expect(child).toEqual({ folderId: "folder-1", title: "Renamed" });
 	});
 
 	it("uses narrator/entity membership indexes for title sync and all-user removal", async () => {
@@ -308,12 +322,12 @@ describe("recent-tabs revisions and deltas", () => {
 		]);
 	});
 
-	it("replays server deltas to the persisted order across mixed-section workspace permutations", async () => {
+	it("replays server deltas to the persisted order across mixed-section folder permutations", async () => {
 		const blocks = [
 			[makeTab("p-1", { type: "project" })],
 			[makeTab("n-1")],
-			[makeTab("ws-1", { type: "workspace" }), makeTab("child-1", { workspaceId: "ws-1" })],
-			[makeTab("ws-2", { type: "workspace" }), makeTab("child-2", { workspaceId: "ws-2" })],
+			[makeTab("ws-1", { type: "folder" }), makeTab("child-1", { folderId: "ws-1" })],
+			[makeTab("ws-2", { type: "folder" }), makeTab("child-2", { folderId: "ws-2" })],
 		];
 		function permutations<T>(items: T[]): T[][] {
 			if (items.length === 0) return [[]];
@@ -341,23 +355,23 @@ describe("recent-tabs revisions and deltas", () => {
 		}
 	});
 
-	it("atomically batch-upserts a workspace header and children with one revision", async () => {
+	it("a batch upsert cannot create a folder or a workspace header", async () => {
 		seedLegacyTabs([]);
 		const result = await recentTabs.upsertRecentTabsBatch("user-1", [
-			makeTab("child-1", { workspaceId: "ws-batch" }),
-			makeTab("ws-batch", { type: "workspace", title: "Batch workspace" }),
+			makeTab("child-1", { folderId: "ws-batch" }),
+			makeTab("ws-batch", { type: "folder", title: "Batch" }),
+			makeTab("ws-legacy", { type: "workspace", title: "Legacy" }),
 		]);
 
 		expect(result).toMatchObject({ changed: true, baseRevision: 0, revision: 1 });
-		expect(storedKeys()).toEqual(["workspace:ws-batch", "narrator:child-1"]);
+		expect(storedKeys()).toEqual(["narrator:child-1"]);
 		expect(
 			db
-				.select({ workspaceId: userRecentTabs.workspaceId })
+				.select({ folderId: userRecentTabs.folderId })
 				.from(userRecentTabs)
 				.where(eq(userRecentTabs.tabKey, "narrator:child-1"))
-				.get()?.workspaceId,
-		).toBe("ws-batch");
-		expect(db.select().from(userRecentTabsMeta).get()?.revision).toBe(1);
+				.get()?.folderId,
+		).toBe(null);
 	});
 
 	it("splits large deltas into bounded WebSocket batches", async () => {
@@ -415,189 +429,7 @@ describe("recent-tabs row-level persistence", () => {
 	});
 });
 
-/**
- * `dir_sort_order` records the member order a user arranged by hand inside a directory
- * group in the sidebar. It has to be a column of its own: the flat `sort_order` carries
- * recency and is rewritten by the `above_idle` auto-promote whenever a narrator starts
- * working, so an arrangement expressed through flat moves was destroyed by the next
- * status change. These tests pin the two properties that make it durable.
- */
-describe("recent-tabs directory member order", () => {
-	function storedDirOrder(userId = "user-1"): Array<{ key: string; dirSortOrder: number | null }> {
-		return db
-			.select({ key: userRecentTabs.tabKey, dirSortOrder: userRecentTabs.dirSortOrder })
-			.from(userRecentTabs)
-			.where(eq(userRecentTabs.userId, userId))
-			.orderBy(userRecentTabs.sortOrder)
-			.all();
-	}
-
-	it("records the requested order without touching the flat order", async () => {
-		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
-		await recentTabs.ensureMigrated("user-1");
-		const flatBefore = storedKeys();
-
-		const result = await recentTabs.setRecentTabDirectoryOrder("user-1", [
-			"narrator:n-3",
-			"narrator:n-1",
-		]);
-
-		expect(result.changed).toBe(true);
-		expect(storedKeys()).toEqual(flatBefore);
-		expect(storedDirOrder()).toEqual([
-			{ key: "narrator:n-1", dirSortOrder: 1 },
-			{ key: "narrator:n-2", dirSortOrder: null },
-			{ key: "narrator:n-3", dirSortOrder: 0 },
-		]);
-	});
-
-	it("broadcasts a delta so other clients converge", async () => {
-		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
-		await recentTabs.ensureMigrated("user-1");
-		broadcasts.length = 0;
-
-		const result = await recentTabs.setRecentTabDirectoryOrder("user-1", [
-			"narrator:n-2",
-			"narrator:n-1",
-		]);
-
-		expect(result.revision).toBeGreaterThan(result.baseRevision);
-		const delta = broadcasts.find((entry) => entry.event.type === "user:recent_tabs_delta");
-		expect(delta).toBeDefined();
-		// The OPERATIONS matter, not just the event name: the delta is the only channel
-		// another client has for this change, and a payload that omits `dirSortOrder`
-		// leaves every other tab converging on the old order while this one shows the new
-		// one. Asserting the event type alone would not notice that.
-		const operations = (delta?.event as { operations?: Array<Record<string, unknown>> })
-			?.operations;
-		expect(Array.isArray(operations)).toBe(true);
-		const positions = new Map(
-			(operations ?? [])
-				.filter((op) => op.type === "upsert")
-				.map((op) => {
-					const tab = op.tab as { type?: string; id?: string; dirSortOrder?: number } | undefined;
-					return [`${tab?.type}:${tab?.id}`, tab?.dirSortOrder];
-				}),
-		);
-		expect(positions.get("narrator:n-2")).toBe(0);
-		expect(positions.get("narrator:n-1")).toBe(1);
-	});
-
-	/**
-	 * The snapshot restore path must carry hand-arranged positions back.
-	 *
-	 * The client sends `dirSortOrder` (`toPersistedRecentTab` carries it precisely so an
-	 * undo does not flatten the groups) and the service honours it (`dirSortOrderFor`),
-	 * but the request schema did not DECLARE it — and Zod strips unknown keys, so it was
-	 * gone before the service ever saw it. Every restore silently reverted the groups to
-	 * recency order, with nothing to indicate the positions had been dropped.
-	 */
-	it("restores hand-arranged positions from a tab snapshot", async () => {
-		seedUser();
-		await recentTabs.restoreRecentTabs("user-1", {
-			tabs: [
-				{ ...makeTab("n-1"), dirSortOrder: 1 },
-				{ ...makeTab("n-2"), dirSortOrder: 0 },
-			],
-		});
-		expect(storedDirOrder()).toEqual([
-			{ key: "narrator:n-1", dirSortOrder: 1 },
-			{ key: "narrator:n-2", dirSortOrder: 0 },
-		]);
-	});
-
-	it("accepts a snapshot tab WITHOUT a position (never hand-ordered)", async () => {
-		seedUser();
-		await recentTabs.restoreRecentTabs("user-1", { tabs: [makeTab("n-1")] });
-		expect(storedDirOrder()).toEqual([{ key: "narrator:n-1", dirSortOrder: null }]);
-	});
-
-	it("ignores keys the user no longer has instead of failing the whole reorder", async () => {
-		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
-		await recentTabs.ensureMigrated("user-1");
-
-		await recentTabs.setRecentTabDirectoryOrder("user-1", [
-			"narrator:ghost",
-			"narrator:n-2",
-			"narrator:n-1",
-		]);
-
-		expect(storedDirOrder()).toEqual([
-			{ key: "narrator:n-1", dirSortOrder: 2 },
-			{ key: "narrator:n-2", dirSortOrder: 1 },
-		]);
-	});
-
-	/**
-	 * The regression that motivated the separate column. `above_idle` is fired on every
-	 * transition to `working`; if it disturbed `dir_sort_order`, hand-ordering would decay
-	 * on its own with no user action and no error.
-	 */
-	it("survives an above_idle auto-promote", async () => {
-		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
-		await recentTabs.ensureMigrated("user-1");
-		await recentTabs.setRecentTabDirectoryOrder("user-1", [
-			"narrator:n-3",
-			"narrator:n-2",
-			"narrator:n-1",
-		]);
-
-		await recentTabs.moveRecentTab("user-1", {
-			key: "narrator:n-3",
-			position: "above_idle",
-		});
-
-		expect(storedDirOrder().sort((a, b) => a.key.localeCompare(b.key))).toEqual([
-			{ key: "narrator:n-1", dirSortOrder: 2 },
-			{ key: "narrator:n-2", dirSortOrder: 1 },
-			{ key: "narrator:n-3", dirSortOrder: 0 },
-		]);
-	});
-
-	/**
-	 * A cwd change moves the tab into a DIFFERENT directory group. Carrying the old index
-	 * across would interleave it with that group's members and produce an order nobody
-	 * chose — and since both orders are plausible-looking, nobody would spot the cause.
-	 */
-	it("clears the hand-arranged position when the tab changes directory", async () => {
-		seedLegacyTabs([
-			makeTab("n-1", { subtitle: "/w/repo" }),
-			makeTab("n-2", { subtitle: "/w/repo" }),
-		]);
-		await recentTabs.ensureMigrated("user-1");
-		await recentTabs.setRecentTabDirectoryOrder("user-1", ["narrator:n-2", "narrator:n-1"]);
-
-		await recentTabs.upsertRecentTab("user-1", makeTab("n-1", { subtitle: "/w/other" }));
-
-		const rows = storedDirOrder().sort((a, b) => a.key.localeCompare(b.key));
-		expect(rows).toEqual([
-			{ key: "narrator:n-1", dirSortOrder: null },
-			{ key: "narrator:n-2", dirSortOrder: 0 },
-		]);
-	});
-
-	it("keeps the position when an unrelated field changes", async () => {
-		seedLegacyTabs([
-			makeTab("n-1", { subtitle: "/w/repo" }),
-			makeTab("n-2", { subtitle: "/w/repo" }),
-		]);
-		await recentTabs.ensureMigrated("user-1");
-		await recentTabs.setRecentTabDirectoryOrder("user-1", ["narrator:n-2", "narrator:n-1"]);
-
-		await recentTabs.upsertRecentTab(
-			"user-1",
-			makeTab("n-1", { subtitle: "/w/repo", title: "Renamed" }),
-		);
-
-		const rows = storedDirOrder().sort((a, b) => a.key.localeCompare(b.key));
-		expect(rows).toEqual([
-			{ key: "narrator:n-1", dirSortOrder: 1 },
-			{ key: "narrator:n-2", dirSortOrder: 0 },
-		]);
-	});
-});
-
-describe("recent-tabs pagination and workspace groups", () => {
+describe("recent-tabs pagination and folders", () => {
 	it("places narrator tabs in work and only project tabs in projects", async () => {
 		seedLegacyTabs([
 			makeTab("project-1", { type: "project" }),
@@ -636,11 +468,11 @@ describe("recent-tabs pagination and workspace groups", () => {
 		).rejects.toMatchObject({ statusCode: 409, code: "STALE_CURSOR" });
 	});
 
-	it("does not split a workspace group at a page boundary", async () => {
+	it("does not split a folder at a page boundary", async () => {
 		const tabs = Array.from({ length: 49 }, (_, index) => makeTab(`n-${index}`));
-		tabs.push(makeTab("ws-1", { type: "workspace", title: "Workspace" }));
+		tabs.push(makeTab("ws-1", { type: "folder", title: "Folder" }));
 		for (let index = 0; index < 5; index++) {
-			tabs.push(makeTab(`child-${index}`, { workspaceId: "ws-1" }));
+			tabs.push(makeTab(`child-${index}`, { folderId: "ws-1" }));
 		}
 		tabs.push(makeTab("n-last"));
 		seedLegacyTabs(tabs);
@@ -648,7 +480,7 @@ describe("recent-tabs pagination and workspace groups", () => {
 		const first = await recentTabs.listPage("user-1", "work", undefined, 50);
 		expect(first.items).toHaveLength(55);
 		expect(first.items.slice(-6).map((tab) => `${tab.type}:${tab.id}`)).toEqual([
-			"workspace:ws-1",
+			"folder:ws-1",
 			"narrator:child-0",
 			"narrator:child-1",
 			"narrator:child-2",
@@ -661,19 +493,56 @@ describe("recent-tabs pagination and workspace groups", () => {
 		expect(second.items.map((tab) => tab.id)).toEqual(["n-last"]);
 	});
 
-	it("evicts a workspace atomically at the 500-row boundary", async () => {
-		const tabs = Array.from({ length: 498 }, (_, index) => makeTab(`n-${index}`));
-		tabs.push(makeTab("ws-old", { type: "workspace", title: "Old workspace" }));
-		tabs.push(makeTab("ws-child", { workspaceId: "ws-old" }));
+	it("shrinks a folder at the 500-row boundary instead of dropping it whole", async () => {
+		const tabs = Array.from({ length: 497 }, (_, index) => makeTab(`n-${index}`));
+		tabs.push(makeTab("f", { type: "folder", title: "Old folder" }));
+		tabs.push(makeTab("f-new", { folderId: "f", lastVisitedAt: 50 }));
+		tabs.push(makeTab("f-old", { folderId: "f", lastVisitedAt: 10 }));
 		seedLegacyTabs(tabs);
 		await recentTabs.ensureMigrated("user-1");
 
 		await recentTabs.upsertRecentTab("user-1", makeTab("n-new"));
 		const keys = storedKeys();
-		expect(keys).toHaveLength(RECENT_TABS_STORAGE_LIMIT - 1);
+		expect(keys).toHaveLength(RECENT_TABS_STORAGE_LIMIT);
 		expect(keys).toContain("narrator:n-new");
-		expect(keys).not.toContain("workspace:ws-old");
-		expect(keys).not.toContain("narrator:ws-child");
+		expect(keys).toContain("folder:f");
+		expect(keys).toContain("narrator:f-new");
+		expect(keys).not.toContain("narrator:f-old");
+	});
+
+	it("takes a loose tab before a folder's last member, and that member before a pinned one", async () => {
+		const tabs = Array.from({ length: 496 }, (_, index) => makeTab(`n-${index}`));
+		tabs.push(makeTab("solo", { type: "folder", title: "Solo" }));
+		tabs.push(makeTab("solo-only", { folderId: "solo", lastVisitedAt: 1 }));
+		tabs.push(makeTab("kept", { type: "folder", title: "Kept" }));
+		tabs.push(makeTab("kept-pinned", { folderId: "kept", pinned: true, lastVisitedAt: 1 }));
+		seedLegacyTabs(tabs);
+		await recentTabs.ensureMigrated("user-1");
+
+		// One over: the lowest loose tab goes, both folders stay.
+		await recentTabs.upsertRecentTab("user-1", makeTab("over-1"));
+		let keys = storedKeys();
+		expect(keys).not.toContain("narrator:n-495");
+		expect(keys).toContain("narrator:solo-only");
+		expect(keys).toContain("narrator:kept-pinned");
+
+		// Now with every loose tab pinned: the folder's last unpinned member goes, header
+		// and all, and the pinned member of the other folder still stays.
+		cleanDb(sqlite);
+		seedLegacyTabs([
+			...Array.from({ length: 496 }, (_, index) => makeTab(`p-${index}`, { pinned: true })),
+			makeTab("solo", { type: "folder", title: "Solo" }),
+			makeTab("solo-only", { folderId: "solo", lastVisitedAt: 1 }),
+			makeTab("kept", { type: "folder", title: "Kept" }),
+			makeTab("kept-pinned", { folderId: "kept", pinned: true, lastVisitedAt: 1 }),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+		await recentTabs.upsertRecentTab("user-1", makeTab("over-2"));
+		keys = storedKeys();
+		expect(keys).toHaveLength(RECENT_TABS_STORAGE_LIMIT - 1);
+		expect(keys).not.toContain("folder:solo");
+		expect(keys).not.toContain("narrator:solo-only");
+		expect(keys).toContain("narrator:kept-pinned");
 	});
 });
 
@@ -736,37 +605,15 @@ describe("recent-tabs capacity and undo", () => {
 		expect(removed.undoToken).toBeUndefined();
 	});
 
-	it("stores no undo token for cascade removes or workspace dissolve", async () => {
-		seedLegacyTabs([
-			makeTab("n-1"),
-			makeTab("n-2"),
-			makeTab("ws-1", { type: "workspace", title: "WS" }),
-			makeTab("n-child", { workspaceId: "ws-1" }),
-		]);
-		db.insert(workspaces)
-			.values({
-				id: "ws-1",
-				userId: "user-1",
-				title: "WS",
-				tree: "{}",
-				createdAt: new Date(NOW),
-				updatedAt: new Date(NOW),
-			})
-			.run();
+	it("stores no undo token for cascade removes", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
 		await recentTabs.ensureMigrated("user-1");
 
 		// Cascade / internal path (no storeUndo): must not mint an undo token.
 		const cascaded = await recentTabs.removeRecentTab("user-1", "narrator", "n-1");
 		expect(cascaded).toMatchObject({ changed: true, removedCount: 1 });
 		expect(cascaded.undoToken).toBeUndefined();
-
-		// Workspace dissolve never stores undo — the entity and panels are torn down too.
-		const dissolved = await recentTabs.removeRecentTab("user-1", "workspace", "ws-1", {
-			storeUndo: true,
-		});
-		expect(dissolved).toMatchObject({ changed: true });
-		expect(dissolved.undoToken).toBeUndefined();
-		expect(storedKeys()).toEqual(["narrator:n-2", "narrator:n-child"]);
+		expect(storedKeys()).toEqual(["narrator:n-2"]);
 	});
 
 	it("rejects an undo token after another mutation advances revision", async () => {
@@ -778,40 +625,6 @@ describe("recent-tabs capacity and undo", () => {
 			recentTabs.restoreRecentTabs("user-1", { token: cleared.undoToken }),
 		).rejects.toMatchObject({ statusCode: 409, code: "RECENT_TABS_UNDO_CONFLICT" });
 		expect(storedKeys()).toEqual(["narrator:n-new"]);
-	});
-
-	it("defers inactive workspace deletion until undo expiry and cancels it on restore", async () => {
-		seedLegacyTabs([
-			makeTab("ws-undo", { type: "workspace", title: "Undo workspace" }),
-			makeTab("n-idle", { workspaceId: "ws-undo" }),
-		]);
-		db.insert(narrators)
-			.values({
-				id: "n-idle",
-				type: "primary",
-				inheritMode: "fresh",
-				status: "idle",
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
-			.run();
-		db.insert(workspaces)
-			.values({
-				id: "ws-undo",
-				userId: "user-1",
-				title: "Undo workspace",
-				tree: "{}",
-				createdAt: new Date(NOW),
-				updatedAt: new Date(NOW),
-			})
-			.run();
-
-		const cleared = await recentTabs.clearRecentTabs("user-1", "inactive_narrators");
-		expect(db.select().from(workspaces).where(eq(workspaces.id, "ws-undo")).get()).toBeDefined();
-		await recentTabs.restoreRecentTabs("user-1", { token: cleared.undoToken });
-		await recentTabs.runExpiredRecentTabsWorkspaceCleanup(Date.now() + 31_000);
-		expect(db.select().from(workspaces).where(eq(workspaces.id, "ws-undo")).get()).toBeDefined();
-		expect(storedKeys()).toEqual(["workspace:ws-undo", "narrator:n-idle"]);
 	});
 
 	it("never clears pinned tabs, in any scope", async () => {
@@ -833,27 +646,30 @@ describe("recent-tabs capacity and undo", () => {
 		expect(storedKeys()).toEqual(["project:p-pinned", "narrator:n-pinned"]);
 	});
 
-	it("keeps a pinned workspace group intact when clearing inactive narrators", async () => {
+	it("keeps folders intact and never touches workspaces when clearing", async () => {
 		seedLegacyTabs([
-			makeTab("ws-pinned", { type: "workspace", title: "Pinned workspace", pinned: true }),
-			makeTab("n-child", { workspaceId: "ws-pinned" }),
+			makeTab("ws-1", { type: "folder", title: "Folder" }),
+			makeTab("n-child", { folderId: "ws-1" }),
 			makeTab("n-loose"),
 		]);
 		db.insert(narrators)
-			.values({
-				id: "n-child",
-				type: "primary",
-				inheritMode: "fresh",
-				status: "idle",
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
+			.values(
+				["n-child", "n-loose"].map((id) => ({
+					id,
+					type: "primary",
+					inheritMode: "fresh",
+					status: "idle",
+					createdAt: NOW,
+					updatedAt: NOW,
+				})) as Array<typeof narrators.$inferInsert>,
+			)
 			.run();
+		// Same id as the folder: a converted legacy group whose workspace still exists.
 		db.insert(workspaces)
 			.values({
-				id: "ws-pinned",
+				id: "ws-1",
 				userId: "user-1",
-				title: "Pinned workspace",
+				title: "Folder",
 				tree: "{}",
 				createdAt: new Date(NOW),
 				updatedAt: new Date(NOW),
@@ -862,54 +678,21 @@ describe("recent-tabs capacity and undo", () => {
 		await recentTabs.ensureMigrated("user-1");
 
 		await recentTabs.clearRecentTabs("user-1", "inactive_narrators");
-		expect(storedKeys()).toEqual(["workspace:ws-pinned", "narrator:n-child"]);
-		await recentTabs.runExpiredRecentTabsWorkspaceCleanup(Date.now() + 31_000);
-		expect(db.select().from(workspaces).where(eq(workspaces.id, "ws-pinned")).get()).toBeDefined();
-	});
-
-	it("deletes an inactive workspace only after the undo TTL expires", async () => {
-		seedLegacyTabs([
-			makeTab("ws-expire", { type: "workspace", title: "Expire workspace" }),
-			makeTab("n-expire", { workspaceId: "ws-expire" }),
-		]);
-		db.insert(narrators)
-			.values({
-				id: "n-expire",
-				type: "primary",
-				inheritMode: "fresh",
-				status: "idle",
-				createdAt: NOW,
-				updatedAt: NOW,
-			})
-			.run();
-		db.insert(workspaces)
-			.values({
-				id: "ws-expire",
-				userId: "user-1",
-				title: "Expire workspace",
-				tree: "{}",
-				createdAt: new Date(NOW),
-				updatedAt: new Date(NOW),
-			})
-			.run();
-
-		await recentTabs.clearRecentTabs("user-1", "inactive_narrators");
-		expect(db.select().from(workspaces).where(eq(workspaces.id, "ws-expire")).get()).toBeDefined();
-		await recentTabs.runExpiredRecentTabsWorkspaceCleanup(Date.now() + 31_000);
-		expect(
-			db.select().from(workspaces).where(eq(workspaces.id, "ws-expire")).get(),
-		).toBeUndefined();
+		expect(storedKeys()).toEqual(["folder:ws-1", "narrator:n-child"]);
+		await recentTabs.clearRecentTabs("user-1", "all");
+		expect(storedKeys()).toEqual(["folder:ws-1", "narrator:n-child"]);
+		expect(db.select().from(workspaces).where(eq(workspaces.id, "ws-1")).get()).toBeDefined();
 	});
 });
 
-describe("recent-tabs workspace member anchored moves", () => {
+describe("recent-tabs folder member anchored moves", () => {
 	const memberIds = ["child-a", "child-b", "child-c", "child-d"];
 	const seedWorkspace = async () => {
 		seedLegacyTabs([
 			makeTab("project-1", { type: "project", pinned: true }),
 			makeTab("n-top"),
-			makeTab("ws-1", { type: "workspace", title: "Workspace" }),
-			...memberIds.map((id) => makeTab(id, { workspaceId: "ws-1" })),
+			makeTab("ws-1", { type: "folder", title: "Folder" }),
+			...memberIds.map((id) => makeTab(id, { folderId: "ws-1" })),
 			makeTab("n-tail"),
 		]);
 		await recentTabs.ensureMigrated("user-1");
@@ -919,7 +702,7 @@ describe("recent-tabs workspace member anchored moves", () => {
 			.select({
 				key: userRecentTabs.tabKey,
 				type: userRecentTabs.type,
-				workspaceId: userRecentTabs.workspaceId,
+				folderId: userRecentTabs.folderId,
 			})
 			.from(userRecentTabs)
 			.where(eq(userRecentTabs.userId, "user-1"))
@@ -949,7 +732,7 @@ describe("recent-tabs workspace member anchored moves", () => {
 					expect(storedKeys()).toEqual([
 						"project:project-1",
 						"narrator:n-top",
-						"workspace:ws-1",
+						"folder:ws-1",
 						...expectedMembers.map((id) => `narrator:${id}`),
 						"narrator:n-tail",
 					]);
@@ -971,7 +754,7 @@ describe("recent-tabs workspace member anchored moves", () => {
 	}
 
 	for (const position of ["before", "after"] as const) {
-		it(`keeps an external top-level move ${position} a child at the workspace edge`, async () => {
+		it(`keeps an external top-level move ${position} a member at the folder edge`, async () => {
 			await seedWorkspace();
 			const membership = storedMembership();
 			await recentTabs.moveRecentTab("user-1", {
@@ -980,7 +763,7 @@ describe("recent-tabs workspace member anchored moves", () => {
 					? { beforeKey: "narrator:child-b" }
 					: { afterKey: "narrator:child-b" }),
 			});
-			const workspaceKeys = ["workspace:ws-1", ...memberIds.map((id) => `narrator:${id}`)];
+			const workspaceKeys = ["folder:ws-1", ...memberIds.map((id) => `narrator:${id}`)];
 			expect(storedKeys()).toEqual(
 				position === "before"
 					? ["project:project-1", "narrator:n-top", "narrator:n-tail", ...workspaceKeys]
@@ -1041,15 +824,15 @@ describe("recent-tabs anchored upsert", () => {
 		]);
 	});
 
-	// A workspace is contiguous, so an index inside it is not a position anything can
-	// occupy. Anchoring to a CHILD must therefore resolve to the group's boundary, or
-	// `regroupWorkspaces` would move the tab somewhere the user did not choose.
-	it("expands an anchor on a workspace child to the whole group", async () => {
+	// A folder is contiguous, so an index inside it is not a position a top-level tab can
+	// occupy. Anchoring to a MEMBER must therefore resolve to the folder's boundary, or
+	// `regroupFolders` would move the tab somewhere the user did not choose.
+	it("expands an anchor on a folder member to the whole folder", async () => {
 		seedLegacyTabs([
 			makeTab("n-top"),
-			makeTab("ws-1", { type: "workspace", title: "Workspace" }),
-			makeTab("child-a", { workspaceId: "ws-1" }),
-			makeTab("child-b", { workspaceId: "ws-1" }),
+			makeTab("ws-1", { type: "folder", title: "Folder" }),
+			makeTab("child-a", { folderId: "ws-1" }),
+			makeTab("child-b", { folderId: "ws-1" }),
 			makeTab("n-tail"),
 		]);
 		await recentTabs.ensureMigrated("user-1");
@@ -1059,7 +842,7 @@ describe("recent-tabs anchored upsert", () => {
 		});
 		expect(storedKeys()).toEqual([
 			"narrator:n-top",
-			"workspace:ws-1",
+			"folder:ws-1",
 			"narrator:child-a",
 			"narrator:child-b",
 			"narrator:n-new",
@@ -1097,19 +880,20 @@ describe("recent-tabs anchored upsert", () => {
 		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2"]);
 	});
 
-	// Membership owns a child's position; an anchor must not pull it out of its group.
-	it("ignores an anchor on a tab that belongs to a workspace", async () => {
+	// Dropping a folder member (e.g. from the list page) next to a top-level tab is an
+	// explicit "put it here": it leaves its folder, and an emptied folder disappears.
+	it("an anchor on a folder member takes it out of the folder", async () => {
 		seedLegacyTabs([
 			makeTab("n-top"),
-			makeTab("ws-1", { type: "workspace", title: "Workspace" }),
-			makeTab("child-a", { workspaceId: "ws-1" }),
+			makeTab("ws-1", { type: "folder", title: "Folder" }),
+			makeTab("child-a", { folderId: "ws-1" }),
 		]);
 		await recentTabs.ensureMigrated("user-1");
 
-		await recentTabs.upsertRecentTab("user-1", makeTab("child-a", { workspaceId: "ws-1" }), {
+		await recentTabs.upsertRecentTab("user-1", makeTab("child-a"), {
 			beforeKey: "narrator:n-top",
 		});
-		expect(storedKeys()).toEqual(["narrator:n-top", "workspace:ws-1", "narrator:child-a"]);
+		expect(storedKeys()).toEqual(["narrator:child-a", "narrator:n-top"]);
 	});
 
 	// One revision is the entire reason this endpoint grew anchors.
@@ -1122,5 +906,182 @@ describe("recent-tabs anchored upsert", () => {
 		});
 		expect(result.revision).toBe(baseline + 1);
 		expect(result.changed).toBe(true);
+	});
+});
+
+/**
+ * Folder operations must replay on the client to exactly the order the server persists:
+ * the sidebar applies every mutation's delta through `reduceRecentTabsOperations`.
+ */
+describe("recent-tabs folder deltas replay on the client", () => {
+	async function expectReplay(run: () => Promise<{ operations: unknown[] }>): Promise<void> {
+		const before = (await recentTabs.listAllRecentTabs("user-1")).filter(
+			(tab) => tab.type !== "project",
+		);
+		const result = (await run()) as Awaited<ReturnType<typeof recentTabs.moveRecentTab>>;
+		const persisted = (await recentTabs.listAllRecentTabs("user-1")).filter(
+			(tab) => tab.type !== "project",
+		);
+		expect(reduceRecentTabsOperations(before, "work", result.operations)).toEqual(persisted);
+	}
+
+	it("dissolving a pinned folder keeps its members pinned, and undo brings the folder back", async () => {
+		seedLegacyTabs(["a", "b", "c"].map((id) => makeTab(id)));
+		await recentTabs.ensureMigrated("user-1");
+		const created = await recentTabs.createRecentTabFolder("user-1", {
+			targetKey: "narrator:b",
+			sourceKey: "narrator:c",
+			title: "F",
+		});
+		const folderId = created.folderId ?? "";
+		// The folder into the pinned block: its members go with it.
+		await recentTabs.pinRecentTab("user-1", `folder:${folderId}`, true);
+		const before = await recentTabs.listAllRecentTabs("user-1");
+		expect(before.filter((tab) => tab.type === "folder").map((tab) => tab.pinned)).toEqual([true]);
+
+		const dissolved = await recentTabs.dissolveRecentTabFolder("user-1", folderId);
+		expect(dissolved.changed).toBe(true);
+		expect(dissolved.undoToken).toBeString();
+
+		const after = await recentTabs.listAllRecentTabs("user-1");
+		expect(after.some((tab) => tab.type === "folder")).toBe(false);
+		// The members stayed in the pinned block they were released from.
+		expect(
+			after.filter((tab) => tab.id === "b" || tab.id === "c").map((tab) => !!tab.pinned),
+		).toEqual([true, true]);
+
+		const restored = await recentTabs.restoreRecentTabs("user-1", {
+			token: dissolved.undoToken,
+		});
+		expect(restored.changed).toBe(true);
+		const restoredTabs = await recentTabs.listAllRecentTabs("user-1");
+		const folder = restoredTabs.find((tab) => tab.type === "folder");
+		expect(folder?.pinned).toBe(true);
+		expect(
+			restoredTabs
+				.filter((tab) => tab.folderId === folderId)
+				.map((tab) => tab.id)
+				.sort(),
+		).toEqual(["b", "c"]);
+	});
+
+	it("create, join, reorder, pin, leave, dissolve and close", async () => {
+		seedLegacyTabs(["a", "b", "c", "d", "e"].map((id) => makeTab(id)));
+		await recentTabs.ensureMigrated("user-1");
+		let folderId = "";
+		await expectReplay(async () => {
+			const result = await recentTabs.createRecentTabFolder("user-1", {
+				targetKey: "narrator:b",
+				sourceKey: "narrator:d",
+				title: "F",
+			});
+			folderId = result.folderId ?? "";
+			return result;
+		});
+		await expectReplay(() => recentTabs.moveRecentTab("user-1", { key: "narrator:e", folderId }));
+		await expectReplay(() =>
+			recentTabs.moveRecentTab("user-1", { key: "narrator:e", beforeKey: "narrator:b" }),
+		);
+		await expectReplay(() => recentTabs.pinRecentTab("user-1", "narrator:d", true));
+		await expectReplay(() =>
+			recentTabs.moveRecentTab("user-1", { key: `folder:${folderId}`, position: "top" }),
+		);
+		await expectReplay(() =>
+			recentTabs.moveRecentTab("user-1", {
+				key: "narrator:b",
+				folderId: null,
+				afterKey: "narrator:c",
+			}),
+		);
+		await expectReplay(() => recentTabs.dissolveRecentTabFolder("user-1", folderId));
+		const second = await recentTabs.createRecentTabFolder("user-1", {
+			targetKey: "narrator:a",
+			sourceKey: "narrator:c",
+			title: "G",
+		});
+		await expectReplay(() =>
+			recentTabs.removeRecentTab("user-1", "folder", second.folderId ?? "", { storeUndo: true }),
+		);
+	});
+});
+
+/**
+ * The sidebar renders a drop OPTIMISTICALLY with the client mirror while the server call
+ * is in flight. If the mirror lands anywhere else, the list visibly jumps when the
+ * response arrives — so each server move is checked against the mirror's prediction.
+ */
+describe("recent-tabs optimistic moves match the server", () => {
+	const work = async () =>
+		(await recentTabs.listAllRecentTabs("user-1")).filter((tab) => tab.type !== "project");
+	const shape = (tabs: PersistedRecentTab[]) =>
+		tabs.map((tab) => [`${tab.type}:${tab.id}`, tab.folderId ?? null, !!tab.pinned]);
+
+	async function expectParity(
+		key: string,
+		target: Parameters<typeof applyRecentTabMove>[2],
+	): Promise<void> {
+		const before = await work();
+		const predicted = applyRecentTabMove(before, key, target);
+		await recentTabs.moveRecentTab("user-1", { key, ...target });
+		expect(shape(predicted)).toEqual(shape(await work()));
+	}
+
+	async function seedFolder(pinnedFolder = false) {
+		seedLegacyTabs([
+			makeTab("x"),
+			makeTab("f", { type: "folder", title: "F", ...(pinnedFolder ? { pinned: true } : {}) }),
+			makeTab("m1", { folderId: "f", pinned: true }),
+			makeTab("m2", { folderId: "f" }),
+			makeTab("m3", { folderId: "f" }),
+			makeTab("y"),
+			makeTab("g", { type: "folder", title: "G" }),
+			makeTab("g1", { folderId: "g" }),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+	}
+
+	it("joins a folder at its end and next to a pinned member", async () => {
+		await seedFolder();
+		await expectParity("narrator:x", { folderId: "f" });
+		await expectParity("narrator:y", { beforeKey: "narrator:m1", folderId: "f" });
+	});
+
+	it("leaves a folder next to a loose tab, and with no anchor", async () => {
+		await seedFolder();
+		await expectParity("narrator:m2", { afterKey: "narrator:y", folderId: null });
+		await expectParity("narrator:m3", { folderId: null });
+	});
+
+	it("leaves a pinned folder without an anchor", async () => {
+		await seedFolder(true);
+		await expectParity("narrator:m2", { folderId: null });
+	});
+
+	it("moves the last member out, removing its folder", async () => {
+		await seedFolder();
+		await expectParity("narrator:g1", { beforeKey: "narrator:x", folderId: null });
+	});
+
+	it("moves a member into another folder", async () => {
+		await seedFolder();
+		await expectParity("narrator:m3", { afterKey: "narrator:g1", folderId: "g" });
+	});
+
+	it("moves a folder past another folder and next to a member of it", async () => {
+		await seedFolder();
+		await expectParity("folder:f", { afterKey: "folder:g" });
+		await expectParity("folder:g", { beforeKey: "narrator:m2" });
+	});
+
+	it("reorders inside a folder and moves a member to the folder top", async () => {
+		await seedFolder();
+		await expectParity("narrator:m3", { beforeKey: "narrator:m2" });
+		await expectParity("narrator:m2", { position: "top" });
+	});
+
+	it("pins and unpins a top-level tab dragged across the divider", async () => {
+		await seedFolder();
+		await expectParity("narrator:y", { beforeKey: "folder:f", pinned: true });
+		await expectParity("narrator:y", { afterKey: "narrator:x", pinned: false });
 	});
 });

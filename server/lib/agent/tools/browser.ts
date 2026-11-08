@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { z } from "zod/v4";
+import type { BrowserViewport } from "../../browser";
 import {
 	actions,
 	closeSession,
@@ -8,13 +9,19 @@ import {
 	DEFAULT_SESSION_TTL_MS,
 	getSession,
 	listSessions,
+	MAX_DEVICE_SCALE_FACTOR,
 	MAX_SESSION_TTL_MS,
+	MAX_VIEWPORT_SIZE,
+	MIN_DEVICE_SCALE_FACTOR,
 	MIN_SESSION_TTL_MS,
+	MIN_VIEWPORT_SIZE,
 	setSessionTtl,
+	setSessionViewport,
 	startNetworkCapture,
 	stopNetworkCapture,
 } from "../../browser";
 import { PROFILE_LIMITS } from "../../browser/memory-profile-constants";
+import { DEFAULT_VIEWPORT } from "../../browser/pool";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { createShare, getShareDir, SCREENSHOT_PREVIEW_EXPIRY_HOURS } from "../../shares";
@@ -46,6 +53,7 @@ const ACTIONS = [
 	"dom",
 	"close",
 	"set_ttl",
+	"set_viewport",
 	"list_sessions",
 	"perf_start",
 	"perf_stop",
@@ -58,6 +66,8 @@ const ACTIONS = [
 ] as const;
 
 type Action = (typeof ACTIONS)[number];
+
+const DEFAULT_VIEWPORT_DESCRIPTION = `${DEFAULT_VIEWPORT.width}x${DEFAULT_VIEWPORT.height}`;
 
 export const browserTool: ToolDefinition = {
 	name: "Browser",
@@ -93,6 +103,9 @@ export const browserTool: ToolDefinition = {
 		'- "dom": Get cleaned HTML of the page or a specific selector\n' +
 		'- "close": Close a browser session\n' +
 		'- "set_ttl": Update a session inactivity auto-close TTL in milliseconds\n' +
+		'- "set_viewport": Resize the page viewport of an existing session (width/height, optional ' +
+		"device_scale_factor and is_mobile). Omitted fields keep their current value. " +
+		"Size/scale changes re-lay out the page in place; toggling is_mobile reloads the page\n" +
 		'- "list_sessions": List all active browser sessions\n' +
 		'- "perf_start": Start performance tracing (records CPU profile, layout, scripting, etc.). ' +
 		"Note: the user can stop tracing or close the session from the browser management panel — " +
@@ -157,6 +170,10 @@ export const browserTool: ToolDefinition = {
 		"Useful for debugging, visual inspection, or interacting with pages that require a display. " +
 		"Headed sessions open as a new tab in the user's own Edge/Chrome when its remote debugging is enabled " +
 		"and the user allows the connection; otherwise in one separate browser window.\n" +
+		"- width / height (optional): Viewport size in CSS pixels for launch/set_viewport " +
+		`(${MIN_VIEWPORT_SIZE}–${MAX_VIEWPORT_SIZE}; launch default ${DEFAULT_VIEWPORT_DESCRIPTION})\n` +
+		`- device_scale_factor (optional): Device pixel ratio for launch/set_viewport (${MIN_DEVICE_SCALE_FACTOR}–${MAX_DEVICE_SCALE_FACTOR}, default 1)\n` +
+		"- is_mobile (optional): Emulate a mobile device (meta viewport + touch) for launch/set_viewport (default false)\n" +
 		"- categories (optional): Array of Chrome trace categories for perf_start (uses sensible defaults if omitted)",
 	rawJsonSchema: {
 		type: "object",
@@ -276,6 +293,28 @@ export const browserTool: ToolDefinition = {
 					"Only applies to the launch action.",
 				type: "boolean",
 			},
+			width: {
+				description: "Viewport width in CSS pixels for launch/set_viewport",
+				type: "number",
+				minimum: MIN_VIEWPORT_SIZE,
+				maximum: MAX_VIEWPORT_SIZE,
+			},
+			height: {
+				description: "Viewport height in CSS pixels for launch/set_viewport",
+				type: "number",
+				minimum: MIN_VIEWPORT_SIZE,
+				maximum: MAX_VIEWPORT_SIZE,
+			},
+			device_scale_factor: {
+				description: "Device pixel ratio for launch/set_viewport (default 1)",
+				type: "number",
+				minimum: MIN_DEVICE_SCALE_FACTOR,
+				maximum: MAX_DEVICE_SCALE_FACTOR,
+			},
+			is_mobile: {
+				description: "Emulate a mobile device for launch/set_viewport (default false)",
+				type: "boolean",
+			},
 			categories: {
 				description:
 					"Array of Chrome trace categories for perf_start " +
@@ -348,6 +387,10 @@ export const browserTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe("Launch visible browser GUI (default: true = headless)"),
+		width: looseNumber("Viewport width in CSS pixels for launch/set_viewport"),
+		height: looseNumber("Viewport height in CSS pixels for launch/set_viewport"),
+		device_scale_factor: looseNumber("Device pixel ratio for launch/set_viewport"),
+		is_mobile: z.boolean().optional().describe("Emulate a mobile device for launch/set_viewport"),
 		categories: z.array(z.string()).optional().describe("Chrome trace categories for perf_start"),
 	}),
 
@@ -418,6 +461,20 @@ export const browserTool: ToolDefinition = {
 		const coordinateY = normalizeNumber(rawCoordinate?.y, {});
 		const coordinate =
 			coordinateX != null && coordinateY != null ? { x: coordinateX, y: coordinateY } : undefined;
+		// Range checks happen in normalizeViewport so out-of-range values fail loudly
+		// instead of silently clamping to a size the caller did not ask for.
+		const rawViewport = args as {
+			width?: unknown;
+			height?: unknown;
+			device_scale_factor?: unknown;
+			is_mobile?: boolean;
+		};
+		const viewport: Partial<BrowserViewport> = {
+			width: normalizeNumber(rawViewport.width, {}),
+			height: normalizeNumber(rawViewport.height, {}),
+			deviceScaleFactor: normalizeNumber(rawViewport.device_scale_factor, { integer: false }),
+			isMobile: rawViewport.is_mobile,
+		};
 
 		logger.info("Browser tool executing", {
 			action,
@@ -435,6 +492,7 @@ export const browserTool: ToolDefinition = {
 						headless ?? true,
 						ttl_ms,
 						capture_network ?? false,
+						viewport,
 					);
 				case "list_sessions":
 					return handleListSessions(ctx.narratorId);
@@ -442,6 +500,8 @@ export const browserTool: ToolDefinition = {
 					return await handleClose(ctx.narratorId, session_id);
 				case "set_ttl":
 					return handleSetTtl(ctx.narratorId, session_id, ttl_ms);
+				case "set_viewport":
+					return await handleSetViewport(ctx.narratorId, session_id, viewport);
 				default:
 					return await handleSessionAction(ctx, action, {
 						session_id,
@@ -498,6 +558,7 @@ async function handleLaunch(
 	headless = true,
 	ttlMs?: number,
 	captureNetwork = false,
+	viewport?: Partial<BrowserViewport>,
 ): Promise<ToolResult> {
 	if (!url) {
 		return { output: "url is required for launch action", isError: true };
@@ -516,7 +577,7 @@ async function handleLaunch(
 		return { output: `Invalid URL: ${url}`, isError: true };
 	}
 
-	const session = await createSession(narratorId, url, headless, ttlMs, captureNetwork);
+	const session = await createSession(narratorId, url, headless, ttlMs, captureNetwork, viewport);
 	const { title } = await actions.getPageSnapshot(session.page);
 	return {
 		output:
@@ -524,6 +585,7 @@ async function handleLaunch(
 			`Session ID: ${session.id}\n` +
 			(headless ? "" : `Window: ${describeHeadedWindow(session.inUserBrowser)}\n`) +
 			`Session ID: ${session.id}\n` +
+			`Viewport: ${formatViewport(session.viewport)}\n` +
 			`Auto-close TTL: ${session.ttlMs}ms (${formatDurationMs(session.ttlMs)} of inactivity)\n` +
 			`Network capture: ${session.networkCaptureEnabled ? "enabled" : "disabled"}\n` +
 			`URL: ${session.page.url()}\n` +
@@ -540,6 +602,7 @@ function handleListSessions(narratorId: string): ToolResult {
 	const lines = list.map(
 		(s) =>
 			`- ${s.id} | ${s.url} | ${s.headless ? "headless" : "headed"} | ` +
+			`viewport: ${formatViewport(s.viewport)} | ` +
 			`network: ${s.networkCaptureEnabled ? "capturing" : "off"} (${s.networkRequestCount}) | ` +
 			(s.memoryProfile
 				? `memory profile: ${s.memoryProfile.state} (${s.memoryProfile.profileId ?? "none"}) | `
@@ -595,6 +658,41 @@ function handleSetTtl(narratorId: string, sessionId?: string, ttlMs?: number): T
 			`(${formatDurationMs(session.ttlMs)} of inactivity).\n` +
 			`Expires at: ${new Date(session.lastActivity + session.ttlMs).toISOString()}`,
 		metadata: { sessionId: session.id, ttlMs: session.ttlMs },
+	};
+}
+
+function formatViewport(viewport: BrowserViewport): string {
+	return (
+		`${viewport.width}x${viewport.height}` +
+		` @${viewport.deviceScaleFactor ?? 1}x` +
+		(viewport.isMobile ? " (mobile)" : "")
+	);
+}
+
+async function handleSetViewport(
+	narratorId: string,
+	sessionId: string | undefined,
+	viewport: Partial<BrowserViewport>,
+): Promise<ToolResult> {
+	if (!sessionId) {
+		return { output: "session_id is required for set_viewport action", isError: true };
+	}
+	if (Object.values(viewport).every((value) => value === undefined)) {
+		return {
+			output:
+				"set_viewport requires at least one of width, height, device_scale_factor or is_mobile",
+			isError: true,
+		};
+	}
+	const session = await setSessionViewport(narratorId, sessionId, viewport);
+	if (!session) {
+		return { output: `Session not found or expired: ${sessionId}`, isError: true };
+	}
+	return {
+		output:
+			`Session ${sessionId} viewport set to ${formatViewport(session.viewport)}.\n` +
+			`URL: ${session.page.url()}`,
+		metadata: { sessionId: session.id, viewport: session.viewport },
 	};
 }
 

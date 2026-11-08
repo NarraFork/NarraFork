@@ -25,6 +25,11 @@ export interface RunResult {
 	terminalStatus?: import("./input").RuntimeTerminalStatus;
 	/** True when the caller was handed back early (detach); the run continues. */
 	handoff?: boolean;
+	/**
+	 * A delegated session's result (outline P2 PR 9b): the head of the note added to it, as data
+	 * for the Agent call's card. Absent for every other run, and when no note was written.
+	 */
+	outlineReport?: import("@shared/outline-report-note").OutlineReportNote;
 }
 
 /**

@@ -220,7 +220,6 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 					settingsRef.save();
 					if (config.enabled) {
 						await manager.connect(config);
-						await syncTools();
 					}
 					return {
 						output: JSON.stringify(project(config), null, 2),
@@ -250,7 +249,6 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 						if (denied) return errorResult(denied, "McpAdmin denied");
 
 						const result = await manager.refresh(id);
-						await syncTools();
 						const status = manager.getServerStatuses().find((s) => s.id === id);
 						return {
 							output: JSON.stringify(
@@ -277,7 +275,6 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 					if (denied) return errorResult(denied, "McpAdmin denied");
 
 					const results = await manager.refreshAll();
-					await syncTools();
 					const failed = results.filter((r) => !r.ok);
 					return {
 						output: JSON.stringify(
@@ -328,11 +325,10 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 					if (denied) return errorResult(denied, "McpAdmin denied");
 
 					if (action === "remove") {
-						await manager.disconnect(id);
 						servers.splice(idx, 1);
 						settingsRef.mcpServers = servers;
 						settingsRef.save();
-						await syncTools();
+						await manager.disconnect(id);
 						return {
 							output: `Removed MCP server ${id}.`,
 							title: "MCP server removed",
@@ -354,7 +350,6 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 					}
 					if (action === "connect") {
 						await manager.connect(servers[idx]);
-						await syncTools();
 						return {
 							output: `Connected MCP server ${id}.`,
 							title: "MCP server connected",
@@ -362,7 +357,6 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 						};
 					}
 					await manager.disconnect(id);
-					await syncTools();
 					return {
 						output: `Disconnected MCP server ${id}.`,
 						title: "MCP server disconnected",
@@ -422,11 +416,6 @@ async function loadSettingsRef(): Promise<SettingsLike> {
 			mod.saveSettings(mod.settings);
 		},
 	};
-}
-
-async function syncTools(): Promise<void> {
-	const mod = await import("../../mcp/tool-bridge");
-	mod.syncMcpTools();
 }
 
 export const mcpAdminTool: ToolDefinition = createMcpAdminTool();

@@ -5,6 +5,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { GitIdentitiesSection } from "../../components/settings/GitIdentitiesSection";
+import { OutlineDigestSettingsSection } from "../../components/settings/OutlineDigestSettingsSection";
 import { ProfileSection } from "../../components/settings/ProfileSection";
 import { useCurrentUser, useDeleteAvatar, useUploadAvatar } from "../../hooks/useAuth";
 
@@ -81,6 +82,7 @@ function SettingsProfilePage() {
 				deleteAvatar={deleteAvatar}
 			/>
 			<GitIdentitiesSection />
+			<OutlineDigestSettingsSection />
 			{cropSrc && (
 				<Suspense fallback={null}>
 					<AvatarCropModal

@@ -6,12 +6,15 @@ import { useTranslation } from "react-i18next";
 export interface ProviderConfigViewProps {
 	providerLabel: string;
 	onClose: () => void;
+	/** Settings every provider shares, shown above its own sections (e.g. "join auto"). */
+	header?: React.ReactNode;
 	children: React.ReactNode;
 }
 
 export const ProviderConfigView = React.memo(function ProviderConfigView({
 	providerLabel,
 	onClose,
+	header,
 	children,
 }: ProviderConfigViewProps) {
 	const { t } = useTranslation("settings");
@@ -31,6 +34,7 @@ export const ProviderConfigView = React.memo(function ProviderConfigView({
 
 			<ScrollArea style={{ flex: 1 }} offsetScrollbars scrollbarSize={10}>
 				<Box pb="xl" pr="sm">
+					{header && <Box mb="md">{header}</Box>}
 					{children}
 				</Box>
 			</ScrollArea>

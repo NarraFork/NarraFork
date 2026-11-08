@@ -36,6 +36,7 @@ import {
 
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import type { CredentialNetwork } from "@shared/credential-network";
 import {
 	IconArchive,
 	IconArchiveOff,
@@ -49,6 +50,7 @@ import {
 	IconRefresh,
 	IconSettings,
 	IconTrash,
+	IconWorld,
 	IconX,
 } from "@tabler/icons-react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -84,6 +86,7 @@ import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { CodexQuotaOverview } from "./CodexQuotaOverview";
 import { CodexUsageDisplay } from "./CodexUsageDisplay";
+import { CredentialNetworkEditor } from "./CredentialNetworkEditor";
 import { reconcileCodexBrowserAuthState } from "./codex-browser-auth-state";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
@@ -1979,6 +1982,68 @@ interface CodexCredentialListEntry {
 	failureCount: number;
 	lastUsedAt?: string;
 	expiresAt?: number;
+	/** This account's own proxy, fingerprint and device id (proxy passwords masked). */
+	network?: CredentialNetwork;
+}
+
+/**
+ * Opens the network identity editor for one account. Self-contained so the desktop
+ * table and the mobile cards share it.
+ */
+function CredentialNetworkButton({
+	entry,
+	disabled,
+	compact,
+}: {
+	entry: CodexCredentialListEntry;
+	disabled: boolean;
+	compact?: boolean;
+}) {
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const [opened, setOpened] = useState(false);
+	const customized = !!entry.network && Object.keys(entry.network).length > 0;
+	return (
+		<>
+			{compact ? (
+				<Button
+					variant="subtle"
+					size="compact-xs"
+					disabled={disabled}
+					onClick={() => setOpened(true)}
+				>
+					{t("credentialNetwork.button")}
+				</Button>
+			) : (
+				<Tooltip label={t("credentialNetwork.button")}>
+					<ActionIcon
+						size="sm"
+						variant={customized ? "light" : "subtle"}
+						color={customized ? "indigo" : "gray"}
+						disabled={disabled}
+						onClick={() => setOpened(true)}
+					>
+						<IconWorld size={16} />
+					</ActionIcon>
+				</Tooltip>
+			)}
+			{opened && (
+				<CredentialNetworkEditor
+					opened={opened}
+					onClose={() => setOpened(false)}
+					title={t("credentialNetwork.title", {
+						name: entry.displayName || entry.accountId || entry.id.slice(0, 8),
+					})}
+					value={entry.network}
+					onSave={async (network) => {
+						await api.codexCredentialUpdate(entry.id, { network });
+						await qc.invalidateQueries({ queryKey: ["codex", "status"] });
+						notifications.show({ message: t("codexUpdateSuccess"), color: "green" });
+					}}
+				/>
+			)}
+		</>
+	);
 }
 
 interface CodexCredentialListProps {
@@ -2275,6 +2340,7 @@ function CredentialList(props: CodexCredentialListProps) {
 														<IconPencil size={16} />
 													</ActionIcon>
 												</Tooltip>
+												<CredentialNetworkButton entry={entry} disabled={!canUpdateCredential} />
 
 												<Tooltip label={t("codexQueryUsage")}>
 													<ActionIcon
@@ -2687,6 +2753,11 @@ function CredentialCards(props: CodexCredentialListProps) {
 										>
 											{t("codexEdit")}
 										</Button>
+										<CredentialNetworkButton
+											entry={entry}
+											disabled={!canUpdateCredential}
+											compact
+										/>
 
 										<Button
 											variant="subtle"

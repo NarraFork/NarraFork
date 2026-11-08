@@ -424,20 +424,50 @@ export async function editorCacheBrowserAcceptance(
 	await page.evaluate(() => window.__editorCache.workspaceVisible(true));
 	await wait(() => window.__editorCache.snapshot().views === 1);
 	const externalNavigationLifetime = (await state()).panes[0]?.lifetime;
+	// Line references keep split mode: Monaco reveals the line, the preview follows.
 	await page.evaluate(() => window.__editorCache.navigate("file-16", 550));
-	await wait(
-		() =>
-			window.__editorCache.snapshot().panes[0]?.position?.lineNumber === 550 &&
-			!document.querySelector('[data-cache-pane="file-16"] [data-file-editor-preview]'),
-	);
-	await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 250)));
+	await wait(() => window.__editorCache.snapshot().panes[0]?.position?.lineNumber === 550);
+	// The preview eases toward its target frame by frame; on a busy CI runner a fixed 500 ms
+	// caught it part-way (0.69-0.79 of the way down). Wait for it to arrive instead.
+	await wait(() => {
+		const preview = document.querySelector<HTMLElement>(
+			'[data-cache-pane="file-16"] [data-file-editor-preview]',
+		);
+		return !!preview && preview.scrollTop / (preview.scrollHeight - preview.clientHeight) > 0.8;
+	});
 	expect((await state()).panes[0]?.scroll).toBeGreaterThan(8000);
+	expect(await page.$(previewSelector)).not.toBeNull();
+	expect((await previewPosition()).fraction).toBeGreaterThan(0.8);
 	expect((await state()).panes[0]?.lifetime).toBe(externalNavigationLifetime);
 	await page.evaluate(() => window.__editorCache.navigate("file-16", 42));
 	await wait(() => window.__editorCache.snapshot().panes[0]?.position?.lineNumber === 42);
 	await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 250)));
 	expect((await state()).panes[0]?.scroll).toBeLessThan(2000);
 	expect((await state()).panes[0]?.lifetime).toBe(externalNavigationLifetime);
+	// In rendered mode a line reference scrolls the preview itself instead of forcing
+	// the panel back to source, and switching to source resumes at that same line.
+	// The earlier live edit prefixed line 1, so the heading no longer renders as h1.
+	await page.evaluate(() => window.__editorCache.mode("file-16", "preview"));
+	await wait(
+		() =>
+			window.__editorCache.snapshot().views === 0 &&
+			!!document
+				.querySelector('[data-cache-pane="file-16"] [data-file-editor-preview]')
+				?.textContent?.includes("LIVE_SPLIT"),
+	);
+	await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 500)));
+	const previewBeforeJump = await previewPosition();
+	expect(previewBeforeJump.fraction).toBeLessThan(0.15);
+	await page.evaluate(() => window.__editorCache.navigate("file-16", 550));
+	await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 500)));
+	expect(await page.$(previewSelector)).not.toBeNull();
+	const previewAfterJump = await previewPosition();
+	expect(previewAfterJump.fraction).toBeGreaterThan(0.8);
+	await page.evaluate(() => window.__editorCache.mode("file-16", "raw"));
+	await wait(() => window.__editorCache.snapshot().views === 1);
+	await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 250)));
+	expect((await state()).panes[0]?.scroll).toBeGreaterThan(8000);
+	expect(await page.$(previewSelector)).toBeNull();
 	console.info(
 		"EDITOR_PREVIEW_SCROLL_CHROMIUM",
 		JSON.stringify({
@@ -451,6 +481,8 @@ export async function editorCacheBrowserAcceptance(
 			splitAfterSearchReveal,
 			splitAfterNextReveal,
 			externalNavigationLines: [550, 42],
+			previewBeforeJump,
+			previewAfterJump,
 		}),
 	);
 	await page.evaluate(() => window.__editorCache.dispose());

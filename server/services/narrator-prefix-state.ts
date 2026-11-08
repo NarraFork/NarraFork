@@ -7,6 +7,7 @@ import {
 	renderPrefixPrompt,
 } from "@shared/prefix-context";
 import type { ToolDefinitionSnapshot } from "../lib/agent/tool-loading";
+import { freezePrefixValue, prefixValueBytes } from "./narrator-prefix-snapshot-values";
 import {
 	getPrefixJson,
 	getPrefixText,
@@ -63,39 +64,6 @@ export function createPrefixStateLoader(
 	const requestPayloads = new WeakMap<object, Map<string, Payload>>();
 	const livePayloads = new Map<string, WeakRef<Payload>>();
 	const hydratedOwners = new WeakMap<object, Payload>();
-	const definitionSizes = new WeakMap<object, number>();
-	async function definitionBytes(definition: ToolDefinitionSnapshot, signal?: AbortSignal) {
-		const cached = definitionSizes.get(definition);
-		if (cached !== undefined) return cached;
-		let bytes = 0;
-		const queue: unknown[] = [definition];
-		const seen = new WeakSet<object>();
-		let visited = 0;
-		while (queue.length) {
-			if (++visited % 512 === 0) {
-				signal?.throwIfAborted();
-				await new Promise<void>((resolve) => setImmediate(resolve));
-			}
-			const value = queue.pop();
-			if (typeof value === "string") bytes += value.length * 2;
-			else if (value && typeof value === "object") {
-				if (seen.has(value)) continue;
-				seen.add(value);
-				bytes += 64;
-				for (const key in value) {
-					if (++visited % 512 === 0) {
-						signal?.throwIfAborted();
-						await new Promise<void>((resolve) => setImmediate(resolve));
-					}
-					if (!Object.hasOwn(value, key)) continue;
-					bytes += key.length * 2 + 16;
-					queue.push((value as Record<string, unknown>)[key]);
-				}
-			} else bytes += 8;
-		}
-		definitionSizes.set(definition, bytes);
-		return bytes;
-	}
 
 	function remember(state: CachedState) {
 		const old = resident.get(state.key);
@@ -172,7 +140,9 @@ export function createPrefixStateLoader(
 				contentText: loaded.modelText ?? row.contentText,
 				contentJson: [
 					{ type: "text", text: loaded.modelText },
-					{ ...loaded, modelText: undefined },
+					// The reader's summary (`display`) stays on the stored row: the model's history
+					// carries the update without it.
+					{ ...loaded, modelText: undefined, display: undefined },
 				],
 			};
 			const payload = requestPayloads.get(sourceMessages)?.get(update.snapshotRef);
@@ -264,12 +234,10 @@ export function createPrefixStateLoader(
 			}
 			baselinePrompt = renderPrefixPrompt(contract, baselineParts);
 			parts = new Map(baselineParts.map((part) => [part.key, part.text]));
-			definitions = new Map(
-				(await reader.getPrefixToolDefinitions(epoch.prefix.tools, signal)).map((value) => [
-					value.name,
-					value,
-				]),
-			);
+			const baseline = await reader.getPrefixToolDefinitions(epoch.prefix.tools, signal);
+			// Store readers already adopted these values; legacy/custom readers adopt here once.
+			await freezePrefixValue(baseline, () => signal?.throwIfAborted());
+			definitions = new Map(baseline.map((value) => [value.name, value]));
 		}
 		const start = appendOnly && previous ? previous.stamps.length : 0;
 		for (let index = start; index < events.length; index++) {
@@ -296,6 +264,7 @@ export function createPrefixStateLoader(
 			const additions = block.definitionSnapshotRef
 				? await reader.getPrefixToolDefinitions(block.definitionSnapshotRef, signal)
 				: (block.definitionSnapshots ?? []);
+			await freezePrefixValue(additions, () => signal?.throwIfAborted());
 			for (const definition of additions) {
 				if (!definitions.has(definition.name)) definitions.set(definition.name, definition);
 			}
@@ -304,8 +273,7 @@ export function createPrefixStateLoader(
 		const definitionSnapshots = [...definitions.values()];
 		const payloads = requestPayloads.get(messages);
 		let toolsBytes = 0;
-		for (const definition of definitionSnapshots)
-			toolsBytes += await definitionBytes(definition, signal);
+		for (const definition of definitionSnapshots) toolsBytes += prefixValueBytes(definition);
 		signal?.throwIfAborted();
 		const state: CachedState = {
 			key,

@@ -340,18 +340,20 @@ test("snapshot persistence failure cannot publish a load or change enabled tools
 	}
 });
 
-test("replace-tools prefix refuses new declarations without changing state or opening an epoch", async () => {
+test("replace-tools prefix loads a new declaration and marks it for a new baseline", async () => {
 	const id = await fixture();
 	const epoch = await openPrefixEpoch(id, "replace_tools");
 	const result = await toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id));
 	const output = JSON.parse(result.output);
-	expect(output.results[0].status).toBe("error");
-	expect(output.results[0].error).toContain("cannot append new tool definitions");
-	expect(output.results[0].error).toContain("Compact the conversation or switch models");
-	expect(await notices(id)).toHaveLength(0);
+	expect(output.results[0].status).toBe("loaded");
+	expect(output.note).toBeString();
+	const rows = await notices(id);
+	expect(rows).toHaveLength(1);
+	expect((rows[0]?.contentJson as { rebaseline?: boolean }[])[0]?.rebaseline).toBe(true);
 	expect(
-		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools ?? [],
-	).toEqual([]);
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+	).toEqual([selectedMarker]);
+	// The epoch itself is replaced by the next request's preparation, not by the load.
 	const messages = await narratorService.getModelHistorySinceLastCompact(id);
 	expect(
 		messages
@@ -370,7 +372,7 @@ test("replace-tools prefix permits unloading and reloading an already declared b
 	expect(await changeLoadedToolGroup(id, group, true)).toBe("loaded");
 });
 
-test("a blocked new tool does not prevent another search hit from re-enabling its base declaration", async () => {
+test("re-enabling a base declaration keeps the epoch while a new tool asks for a new baseline", async () => {
 	const id = await fixture();
 	await openPrefixEpoch(id, "replace_tools", [NAMES[0]]);
 	const result = await toolSearchTool.execute({ query: "calendar", limit: 2 }, context(id));
@@ -380,16 +382,14 @@ test("a blocked new tool does not prevent another search hit from re-enabling it
 		error?: string;
 	}[];
 	expect(results.find((item) => item.group === NAMES[0])?.status).toBe("loaded");
-	expect(results.find((item) => item.group === NAMES[1])).toMatchObject({
-		status: "error",
-		error: expect.stringContaining(NAMES[1]),
-	});
-	expect(
-		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
-	).toEqual([selectedMarker]);
+	expect(results.find((item) => item.group === NAMES[1])?.status).toBe("loaded");
 	const rows = await notices(id);
-	expect(rows).toHaveLength(1);
-	expect((rows[0]?.contentJson as { toolNames: string[] }[])[0]?.toolNames).toEqual([NAMES[0]]);
+	expect(rows).toHaveLength(2);
+	const blocks = rows.map(
+		(row) => (row.contentJson as { toolNames: string[]; rebaseline?: boolean }[])[0],
+	);
+	expect(blocks.find((block) => block?.toolNames.includes(NAMES[0]))?.rebaseline).toBeUndefined();
+	expect(blocks.find((block) => block?.toolNames.includes(NAMES[1]))?.rebaseline).toBe(true);
 });
 
 test("explicit custom-injection epoch accepts additions without replacing the baseline", async () => {
@@ -402,7 +402,7 @@ test("explicit custom-injection epoch accepts additions without replacing the ba
 		(message) => (message.contentJson as { type?: string }[])[0]?.type === "epoch",
 	);
 	expect(epochs.map((message) => message.id)).toEqual([epoch.id]);
-	expect(epochs[0]?.contentJson).toEqual(epoch.contentJson);
+	expect<unknown>(epochs[0]?.contentJson).toEqual(epoch.contentJson);
 	expect(await notices(id)).toHaveLength(1);
 });
 
@@ -740,28 +740,42 @@ test("manual /load displays a localized trait denial and never reports success",
 	expect(await notices(id)).toHaveLength(0);
 });
 
-test("manual /load reports a client-visible error when the prefix cannot append tools", async () => {
+test("manual /load on a replace-tools prefix loads and says the cache will be rebuilt", async () => {
 	const id = await fixture();
 	await openPrefixEpoch(id, "replace_tools");
-	// Await normally: Bun's promise matcher can starve an already-running worker's messages.
-	let failure: unknown;
-	try {
-		await handleLoadToolCommand(
-			id,
-			{ resolved: true, loadTool: "Recall", rawCommand: "/load Recall" },
-			"en",
-		);
-	} catch (error) {
-		failure = error;
-	}
-	expect(failure).toMatchObject({
-		statusCode: 400,
-		message: expect.stringContaining("cannot append new tool definitions"),
-	});
-	expect(await notices(id)).toHaveLength(0);
+	const result = await handleLoadToolCommand(
+		id,
+		{ resolved: true, loadTool: "Recall", rawCommand: "/load Recall" },
+		"zh-CN",
+	);
+	expect(result.loaded).toBe(true);
+	const rows = await notices(id);
+	expect(rows).toHaveLength(1);
+	expect((rows[0]?.contentJson as { rebaseline?: boolean }[])[0]?.rebaseline).toBe(true);
 	expect(
-		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools ?? [],
-	).toEqual([]);
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+	).toEqual(["Recall"]);
+	const all = await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, id));
+	const info = all.find((row) => row.role === "disp")?.contentText ?? "";
+	expect(info.split("\n").length).toBeGreaterThan(1);
+});
+
+test("an already-enabled tool missing from the epoch asks for a new baseline once", async () => {
+	const id = await fixture();
+	await db
+		.update(narrators)
+		.set({ enabledTools: [selectedMarker] })
+		.where(eq(narrators.id, id));
+	await openPrefixEpoch(id, "replace_tools");
+	const search = async () =>
+		JSON.parse((await toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id))).output);
+	const first = await search();
+	expect(first.results[0].status).toBe("loaded");
+	const rows = await notices(id);
+	expect(rows).toHaveLength(1);
+	expect(rows[0]?.contentJson).toMatchObject([{ toolNames: [NAMES[0]], rebaseline: true }]);
+	expect((await search()).results[0].status).toBe("already_loaded");
+	expect(await notices(id)).toHaveLength(1);
 });
 
 test("manual /load writes a localized model notice and description", async () => {

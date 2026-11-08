@@ -15,9 +15,13 @@
 
 ## 请求准备、增量状态与快照生命周期
 
-- 首次请求、后续轮次和重试统一进入 [prepare-prefix-request.ts](../server/services/agent-runtime/prepare-prefix-request.ts)。工具刷新、prompt 构建和权威历史协调沿已有加载串行队列执行；prefix 整条准备链没有固定 10 秒总超时，真实 signal 可取消。每次历史源读取仍有独立查询预算，不能把两者混为一谈。
+- 首次请求、后续轮次和重试统一进入 [prepare-prefix-request.ts](../server/services/agent-runtime/prepare-prefix-request.ts)。工具刷新、prompt 构建和权威历史协调沿已有加载串行队列执行；prefix 整条准备链及模型历史读取均没有固定 10 秒失败期限，真实 signal 可取消。历史源入口超过 10 秒只记录一次慢操作告警；真实 IO 错误与内存预算仍生效，显示分页自己的 deadline 不受影响。
+- 历史冷读保留 200 条 metadata 页和约 4MiB 的软批次目标，完整消费一页再推进游标；增量先查版本/顺序/作者 metadata，复用行从 source manifest 取 `rawBytes` 与结构估算，只测量和解析变化正文。full/delta/block 共用 [model-history-json.ts](../server/services/agent-runtime/model-history-json.ts) 的预留入口，在每份 JSON 解析前扣除结构估算，复用内容也计入本次总量。128MiB 是准备成本估算上限而非 RSS 硬顶；失败不采用部分历史，取消和真实 IO 错误仍立即失败。
+- 模型 source／嵌套 JSON 对外递归只读，请求只修改自己拥有的投影容器；生产不再深冻结整图，显式冻结仅作测试/开发违规写入探针。source 缓存只保留 64MiB 字节 LRU、每会话一代及持久 revision/catalog 身份，空条目也计费；超缓存预算仅旁路，不拒绝读取。热重载换空缓存，SQLite 仅在同连接 `schema_version` 变化时重核 trigger/contract，PG 仍检查现行 catalog。
+- 宽历史在既有异步投影阶段间协作让出；OpenAI 对宽输入分批执行原媒体验证，不减少校验或改变协议。取消仍阻止未完成历史发布。分片不是单阶段延迟/RSS硬保证，单个大值的扫描、解析、结构化传输仍有成本。
 - [narrator-prefix-state.ts](../server/services/narrator-prefix-state.ts) 复用已归并状态：相同历史源直接复用；追加历史只重放新增的本代 `context_update` 与工具事件。无关普通消息不触发旧更新再次归并；历史修订、compact 边界变化或非追加变更需要重建。请求生命周期内共享已读取的更新载荷，协调与 `hydrateContextUpdates` 不重复读取同一快照；驻留预算影响缓存保留，不是用户总量上限。
-- 工具目录采用 manifest：`{format:"narrafork.prefix-tools.v1", definitions:[hash,...]}`，每份静态定义按 hash 独立存储。`putPrefixToolDefinitions` / `getPrefixToolDefinitions` 以定义单元分批读写，复用未变定义与冻结对象，不把每个新目录重新存成整包 schema；旧整包快照仍有兼容读取。见 [narrator-prefix-tool-snapshots.ts](../server/services/narrator-prefix-tool-snapshots.ts)。
+- 工具目录采用 manifest：`{format:"narrafork.prefix-tools.v1", definitions:[hash,...]}`，每份静态定义按 hash 独立存储。`putPrefixToolDefinitions` 每次以普通循环按最多 64 项、约 512KiB 的软目标写 children，再写 manifest；不维护跨调用写 memo/聚合队列，去重由 CAS 承担。读取仍分批并兼容旧整包快照；单个大项可独立超过软目标，不声称严格 IPC 上限。见 [narrator-prefix-tool-snapshots.ts](../server/services/narrator-prefix-tool-snapshots.ts)。
+- 快照 text／JSON／解码 tools 共用主线程 `kind:hash` 字节 LRU，worker 不再持有字符串强缓存。工具声明采纳时冻结并记录估算大小，prefix-state 复用该计量，不再第二遍遍历；`getPrefixJson` 的冻结返回契约与原始 JSON 形状保留。这与模型历史 source 的只读所有权约定是两个边界，不能混为一谈。
 - 发布通过 `withPrefixSnapshotPublication` 持有并刷新 publication lease，保护尚未挂上历史引用的根及 manifest 子定义。后台 GC 分批标记已登记资产、兼容历史载荷与 manifest 子引用，只在完整标记后清理过宽限期的无根快照；畸形载荷或失败不按“无引用”继续 sweep。关闭时停止维护、取消并等待相关工作，`close()` 清缓存并等待队列与 worker 退出，不把异步退出当作已经完成。见 [narrator-prefix-snapshots.ts](../server/services/narrator-prefix-snapshots.ts) 与 [narrator-prefix-snapshot-gc.ts](../server/services/narrator-prefix-snapshot-gc.ts)。
 - `senders` 是具名上下文部分，冻结同代首次见到的具名 human 用户名（未知名称也冻结为空）；后来改名不改写旧 sender 投影，新出现身份追加进该部分。`projectFrozenSenders` 只投影显示名，不改持久行、身份、role 或 origin。当前实现不应被扩大描述为已冻结所有 agent 标题。见 [sender-context.ts](../server/lib/agent/sender-context.ts)。
 
@@ -35,6 +39,15 @@
 2. 同名模型的音视频输入能力发生变化时，实时投影可能把旧原生媒体变成文本 fallback 或反向变化。完整修复需要持久记录投影决策及能力撤销的明确处理，不能为了缓存继续发送不合法 payload。
 3. task backend 的专属提醒仍在冻结 contract 中；运行中切换 backend 的旧 epoch 迁移需要明确边界，不能声称新 backend 的提示已经替换旧 contract。
 4. 下述 Codex hosted 原生工具撤权例外仍存在；缓存过期、上游路由及真实请求参数变化也不由应用保证。
+
+## MCP 目录与输入边界
+
+- [manager.ts](../server/lib/mcp/manager.ts) 通过 SDK 的低层 `request` 校验 `tools/list` / `tools/call` 协议结构，不调用会预编译 `outputSchema` 的高层便利方法。执行元数据来自同一份已发布完整分页目录，前页的 task-required 工具也会在发送前拒绝；刷新失败保留旧目录。不消费 `structuredContent` 为类型化业务数据，只有结构化结果时明确提示调用已完成、内容暂不显示，不重放调用。
+- 每个服务器只有一个当前连接生命周期和进行中的 discovery；并发刷新共用工作，变更通知合并并补读。manager 统一协调目录发布，bridge 异步准备差量，最后同步提交 registry 与执行元数据，再发送事件。失效连接或准备失败不能发布半新半旧状态，正常初始化与批量刷新各合并一次发布。
+- [tool-bridge.ts](../server/lib/mcp/tool-bridge.ts) 只重建真正变化的工具；未变定义保留对象身份。变化的定义取得一份完整原始 `inputSchema` 副本，不做通用字段白名单清洗，也不强制 `additionalProperties:false`。供应商格式投影只在对应 provider 边界处理，不能回写原始 schema。
+- Gemini 两条路径共用 [gemini-tool-schema.ts](../server/lib/agent/gemini-tool-schema.ts) 的单次 Schema 投影，过滤协议字段之外的注解但保留真实属性名。它仍是既有有损适配：省略 `$ref`、`additionalProperties`，纯动态根对象不发 `parameters`，`oneOf/allOf` 转为 `anyOf`；不据此宣称完整 JSON Schema 支持，也不制造 `type:string` 替代约束。本轮没有切换协议字段或新增编译器。
+- 所有 MCP 工具共用对象 passthrough 校验；本地只拒绝非对象输入，不逐字段制造 Zod schema、不按 `properties` 白名单过滤参数。缺少 required 字段、类型错误以及动态参数是否允许由 MCP 服务端验证；本地执行权限和当前连接检查仍独立生效。
+- 协议结构校验不是传输体积限制。移除 output validator 不等于解决 SDK transport 在完整接收/解析大消息前的内存上限；本轮不另造 transport、编译器或层层工具数/页数限制。上述 fixture 验证本地 wire 结构与行为，不代表所有第三方兼容网关或付费上游已实测。
 
 ## NUG 网关事件与图片去重
 

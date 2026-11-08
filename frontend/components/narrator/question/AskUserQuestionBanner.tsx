@@ -20,6 +20,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../../lib/api";
 import { readSession, removeSession, writeSession } from "../../../lib/session-store";
+import { usePermissionTextareaStyle } from "../permission/permission-textarea-typography";
 import {
 	coerceQuestions,
 	formatHMS,
@@ -182,6 +183,8 @@ export function AskUserQuestionBanner({
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
+	// In the transcript the answer box paints the rows its height model counts (D49).
+	const textareaStyle = usePermissionTextareaStyle();
 	const qc = useQueryClient();
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const { data: settingsData, isLoading: settingsLoading } = useQuery({
@@ -459,6 +462,7 @@ export function AskUserQuestionBanner({
 										autosize
 										minRows={1}
 										maxRows={3}
+										styles={textareaStyle ? { input: textareaStyle } : undefined}
 									/>
 								)}
 								{readOnly && savedAnswer && (

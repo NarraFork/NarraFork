@@ -28,6 +28,8 @@ export const OUTLINE_TASK_BOARD_LIMITS = {
 	maxTaskChars: 4000,
 	/** Characters of a username an assignment names. */
 	maxUsernameChars: 128,
+	/** Tasks one "seen" request (「新完成」, outline P2 PR 9b) names at most. */
+	seenPerRequest: 100,
 } as const;
 
 /**
@@ -68,6 +70,11 @@ export interface OutlineBoardTask {
 	/** The lock on the task's tree, when this task is a locked root. */
 	lock: { by: { kind: OutlineActorKind; id: string; name: string | null } } | null;
 	/**
+	 * When this task is a plan's root (outline P2 PR 8): `planning` (not approved yet, never
+	 * executed: "计划中") or `approved`, and the versions decided so far.
+	 */
+	plan: { state: "planning" | "approved"; round: number } | null;
+	/**
 	 * An open change asking to end the task (a locked plan's root done or cancelled, D26b): the
 	 * person who locked it confirms or rejects it on the board.
 	 */
@@ -80,6 +87,11 @@ export interface OutlineBoardTask {
 	} | null;
 	/** The task's `version_seq` as read: a change names it as its base. */
 	versionSeq: number;
+	/**
+	 * 「新完成」 (outline P2 PR 9b, D50 ④): a task the reader manages that an agent finished, and the
+	 * reader has not seen on a board since (`POST /outline/tasks/seen`). Absent otherwise.
+	 */
+	newlyDone?: true;
 }
 
 export interface OutlineBoardSpace {
@@ -178,6 +190,20 @@ export interface OutlineBoardTaskUpdateResponse {
 	/** The task's new `version_seq`, or null when nothing changed. */
 	versionSeq: number | null;
 	started: boolean;
+}
+
+/**
+ * The reader saw these tasks marked 「新完成」 on a board, each at the version shown (outline P2
+ * PR 9b). At most {@link OUTLINE_TASK_BOARD_LIMITS.seenPerRequest}; tasks that are not done, not
+ * theirs or not readable are ignored.
+ */
+export interface OutlineBoardSeenRequest {
+	tasks: Array<{ id: string; versionSeq: number }>;
+}
+
+export interface OutlineBoardSeenResponse {
+	/** How many were recorded. */
+	marked: number;
 }
 
 /** The status bar's read (any task backend). */

@@ -20,10 +20,11 @@ import {
 	IconRefresh,
 } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { RemoteDirectoryListing } from "../../lib/api/devices";
 import { DIRECTORY_BROWSER_ROOT_STYLE } from "../common/directory-browser-modal";
+import { useDirectoryTypeahead } from "../common/useDirectoryTypeahead";
 
 /** Fetches one level of a remote directory; see RemotePathInput for rationale. */
 export type RemoteDirectoryLister = (
@@ -76,8 +77,30 @@ export function RemoteDirectoryBrowser({
 		if (data?.parent) setCurrentPath(data.parent);
 	}, [data?.parent]);
 
+	const entries = useMemo(() => data?.entries ?? [], [data?.entries]);
+	const names = useMemo(() => entries.map((entry) => entry.name), [entries]);
+	// Rows are plain buttons, so the enclosing element is the keyboard surface:
+	// arrows move the highlight and typing jumps it to a matching directory.
+	const typeahead = useDirectoryTypeahead({
+		names,
+		onActivate: (index) => {
+			const entry = entries[index];
+			if (entry) setCurrentPath(entry.path);
+		},
+		resetKey: data?.path,
+	});
+
 	return (
-		<Stack gap="xs" p="md" style={DIRECTORY_BROWSER_ROOT_STYLE}>
+		<Stack
+			gap="xs"
+			p="md"
+			style={DIRECTORY_BROWSER_ROOT_STYLE}
+			ref={typeahead.containerRef}
+			onKeyDown={typeahead.onKeyDown}
+			role="group"
+			aria-label={tc("directoryList")}
+			tabIndex={0}
+		>
 			<Group gap="xs" justify="space-between" wrap="nowrap">
 				<Text size="xs" c="dimmed" truncate>
 					{t("permissionBrowseDeviceTitle", { device: deviceLabel })}
@@ -137,14 +160,20 @@ export function RemoteDirectoryBrowser({
 								{t("permissionBrowseNoSubdirectories")}
 							</Text>
 						)}
-						{data?.entries.map((entry) => {
+						{data?.entries.map((entry, index) => {
 							const EntryIcon = entry.isSymlink ? IconFolderSymlink : IconFolder;
+							const active = index === typeahead.cursorIndex;
 							return (
 								<UnstyledButton
 									key={entry.path}
 									onClick={() => setCurrentPath(entry.path)}
 									p={6}
-									style={{ borderRadius: 4 }}
+									data-dir-index={index}
+									data-cursor={active ? "true" : undefined}
+									style={{
+										borderRadius: 4,
+										background: active ? "var(--mantine-color-default-hover)" : undefined,
+									}}
 									title={entry.isSymlink ? tc("symlinkDirectory") : undefined}
 								>
 									<Group gap={8} wrap="nowrap">

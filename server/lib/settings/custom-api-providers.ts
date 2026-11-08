@@ -449,10 +449,7 @@ export function migrateProviderPrefixReferences(
 	// document first so a collision rejects the migration before anything is rewritten.
 	const renameConnection = (model: string) => rewriteModelReference(model, prefixMap);
 	try {
-		rewriteConnectionOverrides(
-			{ agent: { modelCatalog: settings.agent.modelCatalog } } as NarraForkSettings,
-			renameConnection,
-		);
+		rewriteConnectionOverrides(renameConnection, { dryRun: true });
 	} catch (error) {
 		throw new ValidationError(
 			`Provider prefix migration would overwrite model overrides: ${
@@ -526,10 +523,11 @@ export function migrateProviderPrefixReferences(
 		customModels: settings.agent.customModels,
 		providerOrder: settings.agent.providerOrder,
 		disabledProviders: settings.agent.disabledProviders,
+		autoExcludedProviders: settings.agent.autoExcludedProviders,
 		searchChannels: settings.search?.channels,
 	});
 
-	const connectionsMoved = rewriteConnectionOverrides(settings, renameConnection);
+	const connectionsMoved = rewriteConnectionOverrides(renameConnection);
 	settings.agent.defaultModel = rewriteModelReference(settings.agent.defaultModel, prefixMap);
 	settings.agent.summaryModel = rewriteModelReference(settings.agent.summaryModel, prefixMap);
 	settings.agent.translationModel = rewriteModelReference(
@@ -572,6 +570,9 @@ export function migrateProviderPrefixReferences(
 	settings.agent.disabledProviders = settings.agent.disabledProviders?.map(
 		(prefix) => prefixMap.get(prefix) ?? prefix,
 	);
+	settings.agent.autoExcludedProviders = settings.agent.autoExcludedProviders?.map(
+		(prefix) => prefixMap.get(prefix) ?? prefix,
+	);
 	if (settings.search?.channels) {
 		settings.search.channels = settings.search.channels.map((channel) => ({
 			...channel,
@@ -592,6 +593,7 @@ export function migrateProviderPrefixReferences(
 		customModels: settings.agent.customModels,
 		providerOrder: settings.agent.providerOrder,
 		disabledProviders: settings.agent.disabledProviders,
+		autoExcludedProviders: settings.agent.autoExcludedProviders,
 		searchChannels: settings.search?.channels,
 	});
 	return connectionsMoved || before !== after;

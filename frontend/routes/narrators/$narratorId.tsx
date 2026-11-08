@@ -19,6 +19,7 @@ import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/do
 import { readOpeningLod } from "../../hooks/useNarratorLod";
 import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorLoadingMetrics } from "../../lib/narrator-loading-metrics";
+import { queryClient } from "../../lib/query-client";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
@@ -51,7 +52,6 @@ import { useMobileTerminalDrawerOpen } from "../../hooks/useMobileTerminalDrawer
 import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
-	addRecentTabsBatch,
 	addSubagentRecentTab,
 	recordRecentTabVisit,
 	shouldAddSubagentRecentTab,
@@ -74,6 +74,7 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../lib/safe-area";
+import { useWcoTitlebarRows } from "../../lib/wco-titlebar";
 
 export const Route = createFileRoute("/narrators/$narratorId")({
 	component: NarratorDetailPage,
@@ -464,29 +465,9 @@ function NarratorDetailPage() {
 
 			api
 				.createWorkspace({ tree: serializeSeedEnvelope(seed) })
-				.then(async (ws) => {
-					await addRecentTabsBatch([
-						{
-							type: "workspace",
-							id: ws.id,
-							// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-							title: (ws as any).title || "Workspace",
-						},
-						{
-							type: "narrator",
-							id: narratorId,
-							title: "",
-							workspaceId: ws.id,
-							updateOnly: true,
-						},
-						{
-							type: "narrator",
-							id: final.id,
-							title: "",
-							workspaceId: ws.id,
-							updateOnly: true,
-						},
-					]).catch(() => {});
+				.then((ws) => {
+					// Workspaces are reached from the header switcher, not the sidebar.
+					void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
 					navigate({
 						to: "/narrators/workspace/$workspaceId",
 						params: { workspaceId: ws.id },
@@ -501,10 +482,18 @@ function NarratorDetailPage() {
 		};
 	}, [narratorId, navigate]);
 
-	// Ref for drag-to-split drop zone detection
-	const mergedRef = useCallback((el: HTMLDivElement | null) => {
-		pageBoxRef.current = el;
-	}, []);
+	// The page root mounts once the narrator has loaded (the skeleton is returned before
+	// it) and again on every switch to another session, so the title-bar marks follow the
+	// element rather than a ref object.
+	const titlebarRootRef = useWcoTitlebarRows(!isMobile && !narratorLoading && !!narrator);
+	// Ref for drag-to-split drop zone detection, and the title-bar root.
+	const mergedRef = useCallback(
+		(el: HTMLDivElement | null) => {
+			pageBoxRef.current = el;
+			titlebarRootRef(el);
+		},
+		[titlebarRootRef],
+	);
 
 	if (narratorLoading)
 		return (
@@ -554,6 +543,8 @@ function NarratorDetailPage() {
 		>
 			<Box
 				ref={mergedRef}
+				// Desktop WCO: this page's top row of headers is the window title bar.
+				data-nf-wco-titlebar={!isMobile || undefined}
 				h={APP_SHELL_FULL_BLEED_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"

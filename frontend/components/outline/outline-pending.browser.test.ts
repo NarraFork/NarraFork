@@ -499,6 +499,21 @@ test("the facts view's in-progress marker lists the open tasks under a fact and 
 		expect(listed).toContain("Check quoting");
 		expect(listed).toContain("Encoding");
 		expect(listed).not.toContain("Old files");
+		// Each task: its checkbox icon, labelled with its status, then its title (no glyph in it).
+		expect(
+			await page.evaluate(() =>
+				[...document.querySelectorAll("[data-testid=outline-in-progress-list] .ob-task-item")].map(
+					(item) => [
+						item.querySelector(".ob-task-icon")?.getAttribute("aria-label"),
+						item.querySelector(".ob-task-icon svg")?.getAttribute("class"),
+						item.querySelector(".ob-task-title")?.textContent,
+					],
+				),
+			),
+		).toEqual([
+			["In progress", "tabler-icon tabler-icon-square-half", "Check quoting"],
+			["To do", "tabler-icon tabler-icon-square", "Encoding"],
+		]);
 		await call(
 			page,
 			(f, id: string) => f.click(`.ob-task-item[data-task-id="${id}"]`, "mousedown"),

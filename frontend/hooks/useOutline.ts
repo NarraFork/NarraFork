@@ -2,6 +2,7 @@
  * Queries and live updates of the read-only outline pages.
  */
 import type {
+	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
 	OutlineSpaceSummary,
 	OutlineViewMode,
@@ -43,6 +44,8 @@ export const outlineKeys = {
 	pagePending: (spaceId: string, pageId: string) =>
 		["outline", "pending", spaceId, pageId] as const,
 	pending: (pendingId: string) => ["outline", "pending-detail", pendingId] as const,
+	questions: (blockId: string) => ["outline", "questions", blockId] as const,
+	digest: () => ["outline", "digest"] as const,
 };
 
 export function useOutlineSpaces(enabled: boolean) {
@@ -289,6 +292,64 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 		void queryClient.invalidateQueries({ queryKey: ["outline", kind, spaceId] });
 	}
 	void queryClient.invalidateQueries({ queryKey: ["outline", "pending-detail"] });
+	void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
+}
+
+/** The questions under a block, with who may answer which (the inbox, the side panel). */
+export function useOutlineQuestions(blockId: string | null, enabled = true) {
+	return useQuery({
+		queryKey: outlineKeys.questions(blockId ?? ""),
+		queryFn: () => api.getOutlineQuestions(blockId as string),
+		enabled: enabled && !!blockId,
+		retry: false,
+		staleTime: 5_000,
+	});
+}
+
+/** Answer questions of one space at once; questions, views and the inbox re-read after. */
+export function useAnswerOutlineQuestions(spaceId: string | null) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (answers: OutlineAnswerHttpInput[]) => api.answerOutlineQuestions({ answers }),
+		onSettled: () => {
+			if (spaceId) invalidateOutlineSpace(queryClient, spaceId);
+			void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
+}
+
+/** What agents confirmed on the person's behalf that they have not acknowledged. */
+export function useOutlineDigest(enabled = true) {
+	return useQuery({
+		queryKey: outlineKeys.digest(),
+		queryFn: () => api.getOutlineDigest(),
+		enabled,
+		retry: false,
+	});
+}
+
+/** Acknowledge confirmations in the digest. */
+export function useMarkOutlineDigestSeen() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (pendingIds: string[]) => api.markOutlineDigestSeen(pendingIds),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: outlineKeys.digest() });
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
+}
+
+/** Mark all unread reports read (P2 PR 11): the inbox row's "Got it". */
+export function useMarkOutlineReportsSeen() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.markOutlineReportsSeen(),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
+		},
+	});
 }
 
 /** What waits for confirmation on a page, and its locked tasks (design §2.2, §2.6). */
@@ -383,6 +444,65 @@ export function useOutlinePageLive(
 			}
 		});
 	}, [spaceId, pageId, queryClient]);
+}
+
+/** How long a burst of commits is gathered before the plan's diff is read again. */
+const PLAN_DIFF_REFRESH_MS = 300;
+
+/**
+ * A submitted plan against the version it is compared with (outline P2 PR 8), kept fresh while
+ * shown: its page is subscribed to, and a commit past what is shown reads it again (the person may
+ * be editing the plan in the outline beside the session).
+ *
+ * At most one read per burst (review round 1 N6): hints only raise the newest seq wanted, and a
+ * short timer compares it with what is shown once no read is in flight, so the subscription's
+ * first hint does not restart the first read and a live flush's commits share one refetch. The
+ * space-wide invalidation leaves this query to its own subscription.
+ */
+export function useOutlinePlanDiff(
+	plan: { spaceId: string; pageId: string; blockId: string; from: number },
+	enabled: boolean,
+) {
+	const queryClient = useQueryClient();
+	const { spaceId, pageId, blockId, from } = plan;
+	const query = useQuery({
+		queryKey: ["outline", "plan-diff", spaceId, blockId, from],
+		queryFn: () => api.getOutlinePlanDiff(spaceId, blockId, from),
+		enabled,
+		retry: false,
+		staleTime: 5_000,
+	});
+	const state = useRef({ wanted: -1, shown: -1, fetching: false });
+	state.current.shown = query.data?.toSeq ?? -1;
+	state.current.fetching = query.isFetching;
+	useEffect(() => {
+		if (!enabled) return;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const check = () => {
+			timer = null;
+			const s = state.current;
+			if (s.wanted <= s.shown) return;
+			// A read in flight may already include the newest commit: look again once it lands.
+			if (s.fetching) {
+				timer = setTimeout(check, PLAN_DIFF_REFRESH_MS);
+				return;
+			}
+			void queryClient.invalidateQueries({
+				queryKey: ["outline", "plan-diff", spaceId, blockId],
+			});
+		};
+		const unsubscribe = pageSubscriptions().subscribe(pageId, (hint) => {
+			if (hint.kind !== "changed" && hint.kind !== "subscribed") return;
+			if (hint.seq <= state.current.wanted) return;
+			state.current.wanted = hint.seq;
+			timer ??= setTimeout(check, PLAN_DIFF_REFRESH_MS);
+		});
+		return () => {
+			unsubscribe();
+			if (timer !== null) clearTimeout(timer);
+		};
+	}, [enabled, pageId, spaceId, blockId, queryClient]);
+	return query;
 }
 
 /**

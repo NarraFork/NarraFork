@@ -77,7 +77,13 @@ export type SystemTextKind =
 	 * human authored — auto-continuation, review kickoff, AI-initiated sends — plus
 	 * plain-text `sys` notices. Heading row (icon + source + time) above the body.
 	 */
-	| "origin_notice";
+	| "origin_notice"
+	/**
+	 * A notice about the session's tasks (`shared/pretext-layout/task-notice.ts`): one heading
+	 * line (title + the first task inline), and one line per task when unfolded. Every line is
+	 * fixed (truncated, never wrapped), so its height is a count, not a text layout.
+	 */
+	| "tasks_notice";
 
 /**
  * Render payload carried alongside the MeasuredElement. Only `text`/`command`
@@ -132,6 +138,16 @@ export interface SystemTextData {
 	 * locale/formatting imports. Height-neutral (a fixed single-line row).
 	 */
 	timeLabel?: string;
+	/** tasks_notice: the task lines an unfolded card lists (only their count is measured). */
+	rows?: readonly unknown[];
+	/** tasks_notice: unfolding shows more than the folded line. */
+	expandable?: boolean;
+}
+
+/** Options the registry forwards (`spec.opts`). */
+export interface SystemTextMeasureOptions {
+	/** tasks_notice: the card is unfolded (the generic per-key expansion). */
+	expanded?: boolean;
 }
 
 // ── Chrome constants (px) — CONTRACT.md §3/§4 + pretext-fonts.ts ──────────────
@@ -207,7 +223,10 @@ export interface KindChrome {
 	leftChrome: number;
 	/** px reserved to the RIGHT of the body (action buttons). */
 	rightChrome: number;
-	/** fixed height ABOVE the body within the card (title row + gap). */
+	/**
+	 * fixed height ABOVE the body within the card (title row + gap). A kind whose title row is a
+	 * text line defines it as a getter, so it follows the reader's typography at measure time.
+	 */
 	preBody: number;
 	/** fixed height BELOW the body within the card (button row + gap). */
 	postBody: number;
@@ -274,7 +293,10 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		whiteSpace: "pre-wrap",
 		leftChrome: SEGMENT_LEFT,
 		rightChrome: SEGMENT_RIGHT,
-		preBody: typographyMetrics().line.xs + SEGMENT_TITLE_GAP, // title line (17) + gap (2) = 19
+		// Title line + gap (2). A getter, like origin_notice's: see the note there.
+		get preBody() {
+			return typographyMetrics().line.xs + SEGMENT_TITLE_GAP;
+		},
 		postBody: 0,
 		sideMin: BUTTON_COMPACT_XS, // 18
 		prefix: "",
@@ -316,12 +338,77 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		// so the body keeps the full card width.
 		leftChrome: 0,
 		rightChrome: 0,
-		preBody: typographyMetrics().line.xs + ORIGIN_HEADING_GAP, // heading (17) + gap (4) = 21
+		// Heading line + gap (4), as a getter so it is read at measure time. The render draws the
+		// heading at the reader's live `line.xs`; a value computed here was frozen at the
+		// typography of module load (the default), so on enlarged type the body was drawn lower
+		// than measured, into the card's bottom padding (11px at 130% type, 120% line height).
+		get preBody() {
+			return typographyMetrics().line.xs + ORIGIN_HEADING_GAP;
+		},
+		postBody: 0,
+		sideMin: 0,
+		prefix: "",
+	},
+	// Measured by `measureTaskNotice` (fixed lines, no wrapping body); listed for completeness.
+	tasks_notice: {
+		font: FONT_XS,
+		whiteSpace: "normal",
+		leftChrome: 0,
+		rightChrome: 0,
+		preBody: 0,
 		postBody: 0,
 		sideMin: 0,
 		prefix: "",
 	},
 };
+
+/** tasks_notice: gap between task lines of an unfolded card. */
+export const TASK_NOTICE_ROW_GAP = 4;
+
+/**
+ * tasks_notice: height of one line (the heading or a task line). A line holds xs text and xs
+ * badges side by side, so it is the taller of the two; the text's line box follows the reader's
+ * typography (`typographyMetrics`), the badge does not.
+ */
+export function taskNoticeLineHeight(): number {
+	return Math.max(typographyMetrics().line.xs, BADGE_XS);
+}
+
+/** Geometry of a measured task notice beyond MeasuredElement. */
+export interface MeasuredTaskNotice extends MeasuredElement {
+	/** The card is unfolded (its task lines are drawn). Read by the generic fold toggle. */
+	expanded: boolean;
+	/** Task lines drawn (0 when folded). */
+	rowCount: number;
+}
+
+/**
+ * Measure a task notice: the heading line, plus the task lines when unfolded. Pure arithmetic
+ * over the line count — every line is a single truncated line, so no text is laid out.
+ */
+export function measureTaskNotice(
+	data: SystemTextData,
+	contentWidth: number,
+	opts: SystemTextMeasureOptions = {},
+): MeasuredTaskNotice {
+	const rows = Array.isArray(data.rows) ? data.rows.length : 0;
+	const expanded = data.expandable === true && opts.expanded === true && rows > 0;
+	const line = taskNoticeLineHeight();
+	const rowCount = expanded ? rows : 0;
+	const body =
+		rowCount > 0 ? ORIGIN_HEADING_GAP + rowCount * line + (rowCount - 1) * TASK_NOTICE_ROW_GAP : 0;
+	const height = CARD_PADDING * 2 + line + body;
+	const innerWidth = Math.max(1, contentWidth - CARD_PADDING * 2);
+	return {
+		height,
+		blocks: [],
+		frame: { blocks: [], contentHeight: height - CARD_PADDING * 2, usedWidth: innerWidth },
+		contentWidth: innerWidth,
+		usedWidth: contentWidth,
+		expanded,
+		rowCount,
+	};
+}
 
 /** Resolve the body text for a kind (bash prepends "$ "; command wins if set). */
 export function resolveBodyText(kind: SystemTextKind, data: SystemTextData): string {
@@ -370,7 +457,9 @@ export function measureSystemTextCard(
 	data: SystemTextData,
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
+	opts?: SystemTextMeasureOptions,
 ): MeasuredElement {
+	if (kind === "tasks_notice") return measureTaskNotice(data, contentWidth, opts);
 	const chrome = resolveSystemTextChrome(kind, data);
 	const bodyText = resolveBodyText(kind, data);
 

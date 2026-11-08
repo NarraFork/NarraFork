@@ -3,6 +3,7 @@ import { apiRequests, users, userUsageTotals } from "@server/db/schema";
 import { aggregateCostStatus } from "@server/lib/cost-estimate";
 import { TOKEN_ACCOUNTING_VERSION } from "@shared/token-accounting";
 import { asc, eq, gt, sql } from "drizzle-orm";
+import { addUsageDaily, resolveRequestAttribution } from "./usage-daily";
 
 type Db = typeof defaultDb;
 type RequestRecord = typeof apiRequests.$inferInsert;
@@ -12,8 +13,9 @@ function nonNegative(value: number | null | undefined): number {
 }
 
 /**
- * Commit detail and lifetime user totals together. Only one indexed insert/upsert,
- * never an aggregate scan. Duplicate completion cannot charge the user twice.
+ * Commit detail, lifetime user totals and the daily ledger together. Only indexed
+ * lookups and upserts, never an aggregate scan. Duplicate completion cannot charge twice.
+ * Billing user and project are resolved here from the narrator unless the caller set them.
  * Throw on failure so callers can log/retry; never leave a detail without its rollup.
  * Unknown initiators remain null and do not get attributed to any real user.
  * Callers supply normalized, disjoint token buckets; stamp only newly inserted rows,
@@ -24,13 +26,18 @@ export function insertApiRequestWithUserUsage(
 	database: Db = defaultDb,
 ): boolean {
 	return database.transaction((tx) => {
+		const attributed =
+			record.billingUserId !== undefined && record.projectId !== undefined
+				? record
+				: { ...record, ...resolveRequestAttribution(tx, record.narratorId, record.userId) };
 		const inserted = tx
 			.insert(apiRequests)
-			.values({ ...record, tokenAccountingVersion: TOKEN_ACCOUNTING_VERSION })
+			.values({ ...attributed, tokenAccountingVersion: TOKEN_ACCOUNTING_VERSION })
 			.onConflictDoNothing({ target: apiRequests.id })
 			.returning({ id: apiRequests.id })
 			.get();
 		if (!inserted) return false;
+		addUsageDaily(tx, attributed);
 		if (!record.userId) return true;
 
 		const inputTokens = Math.round(nonNegative(record.inputTokens));

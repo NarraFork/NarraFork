@@ -9,7 +9,16 @@ import {
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
-import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
+import {
+	inferWorkspacePathFlavor,
+	isAbsoluteForFlavor,
+	normalizeWorkspacePathFlavor,
+	parseWorkspaceDirectoryMap,
+	type WorkspaceDirectoryMap,
+	type WorkspacePathFlavor,
+	withDeviceDirectory,
+} from "@shared/workspace-directories";
+import { and, desc, eq, gt, inArray, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	aclGrants,
@@ -34,6 +43,7 @@ import {
 	terminalViewState,
 } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
+import { resolveBackend } from "../lib/agent/execution/registry";
 import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS,
 	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
@@ -362,6 +372,8 @@ export interface CreateNarratorInput {
 	relaxedPlan?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	dangerReflectionOverride?: DangerReflectionOverride;
+	/** AskUserQuestion 自动反思回答的三态覆盖；inherit = 跟随 settings.agent.questionReflectionEnabled。 */
+	questionReflectionOverride?: BooleanOverride;
 	autoContinuationOverride?: AutoContinuationOverride;
 	behaviorFenceIntervalOverride?: number | null;
 	behaviorFenceAttachOverride?: BooleanOverride;
@@ -424,6 +436,7 @@ interface CreateSubagentInput {
 	title?: string;
 	permissionMode?: string;
 	planReflectionAutoApproveOverride?: BooleanOverride;
+	questionReflectionOverride?: BooleanOverride;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
@@ -516,13 +529,29 @@ export async function handleLoadToolCommand(
 		return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 	}
 	const alreadyLoaded = status === "already_loaded";
-	const infoText = alreadyLoaded
+	let infoText = alreadyLoaded
 		? locale === "zh-CN"
 			? `🔧 工具已加载：${displayToolName}`
 			: `🔧 Tool already loaded: ${displayToolName}`
 		: locale === "zh-CN"
 			? `🔧 工具加载成功：${displayToolName}`
 			: `🔧 Tool loaded: ${displayToolName}`;
+	if (status === "loaded_new_epoch") {
+		const { suggestProtocolsForToolLoading } = await import("./tool-loading-service");
+		const protocols = await suggestProtocolsForToolLoading(narratorId, locale);
+		infoText +=
+			locale === "zh-CN"
+				? `\n当前协议无法在对话中途追加工具声明，下一次请求会重建提示缓存（对话内容保留）。${
+						protocols.length
+							? `把这个模型的协议切换为 ${protocols.join(" 或 ")} 后，之后加载工具可以保持缓存。`
+							: ""
+					}`
+				: `\nThis protocol cannot add tool declarations mid-conversation, so the next request rebuilds the prompt cache (the conversation is kept).${
+						protocols.length
+							? ` Switching this model's protocol to ${protocols.join(" or ")} would let later tool loads keep the cache.`
+							: ""
+					}`;
+	}
 	await narratorService.persistDisplayMessage(narratorId, infoText);
 
 	return { toolName: displayToolName, loaded: true, alreadyLoaded };
@@ -1362,6 +1391,9 @@ async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect
 		workspaceContext: committedContext
 			? { ...committedContext, revision: 0, contextProjectId: contextProjectId ?? undefined }
 			: null,
+		// A fork may switch devices, so it carries the parent's per-device directories
+		// instead of starting with an empty map the picker would read as "unconfigured".
+		workspaceDirectories: parseWorkspaceDirectoryMap(parent.workspaceDirectories),
 		aclRootNarratorId: parent.aclRootNarratorId,
 		enabledTools: parent.enabledTools,
 		isAskInPassing: parent.isAskInPassing,
@@ -1494,6 +1526,7 @@ export async function prepareNarratorCreation(
 			}),
 			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
 			dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
+			questionReflectionOverride: input.questionReflectionOverride ?? "inherit",
 			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
 			behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
 			behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
@@ -1503,6 +1536,7 @@ export async function prepareNarratorCreation(
 			contextProjectId: input.contextProjectId ?? null,
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
 			defaultDeviceId: input.defaultDeviceId ?? null,
+			workspaceDirectories: initialWorkspaceDirectories(input),
 			ownerUserId: input.ownerUserId ?? null,
 			...resolveNarratorAudiences(
 				input.visibility,
@@ -1528,7 +1562,7 @@ export async function prepareNarratorCreation(
 
 type CreationWorkspace = Pick<
 	typeof narrators.$inferInsert,
-	"contextProjectId" | "cwd" | "workspaceContext" | "defaultDeviceId"
+	"contextProjectId" | "cwd" | "workspaceContext" | "workspaceDirectories" | "defaultDeviceId"
 >;
 const preparedWorkspaceAdmissions = new WeakMap<
 	PreparedNarratorCreation,
@@ -1540,8 +1574,40 @@ function creationWorkspaceFields(row: CreationWorkspace): string {
 		row.cwd ?? null,
 		row.defaultDeviceId ?? null,
 		row.workspaceContext ?? null,
+		row.workspaceDirectories ?? null,
 	]);
 }
+
+/** Path grammar of a device, as far as it can be known before a handshake. */
+function workspacePathFlavorForDevice(deviceId: string, cwd?: string): WorkspacePathFlavor {
+	if (deviceId === "local") return normalizeWorkspacePathFlavor(localPathSemantics.flavor);
+	try {
+		return normalizeWorkspacePathFlavor(resolveBackend({ requested: deviceId }).pathFlavor);
+	} catch {
+		return cwd ? inferWorkspacePathFlavor(cwd) : "posix";
+	}
+}
+
+/**
+ * Seed the per-device directory map for a creation on a remote device.
+ *
+ * A local creation needs nothing here: `cwd` + `defaultDeviceId` are read as the
+ * local entry. A remote one must be explicit, because `cwd` never meant "a remote
+ * directory" before this map existed, so the picker would otherwise consider the
+ * device unconfigured on the session it was just created on.
+ */
+function initialWorkspaceDirectories(
+	input: Pick<CreateNarratorInput, "cwd" | "defaultDeviceId">,
+): WorkspaceDirectoryMap | undefined {
+	const cwd = input.cwd?.trim();
+	const deviceId = input.defaultDeviceId?.trim();
+	if (!cwd || !deviceId || deviceId === "local") return undefined;
+	return withDeviceDirectory({}, deviceId, {
+		cwd,
+		pathFlavor: workspacePathFlavorForDevice(deviceId, cwd),
+	});
+}
+
 export async function narratorCreationWorkspaceTarget(
 	row: CreationWorkspace,
 ): Promise<LifecycleTarget[]> {
@@ -1554,10 +1620,23 @@ export async function narratorCreationWorkspaceTarget(
 				.limit(1)
 				.get()
 		: undefined;
-	const cwd = resolveNarratorSessionCwd(row.cwd, project?.path, getHome());
-	const deviceId = !localPathSemantics.isAbsolute(cwd)
-		? (row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local")
-		: "local";
+	// The row's own device decides the path grammar. A remote Windows `C:\…` is not a
+	// relative path, and a remote POSIX `/srv/app` is not this server's directory —
+	// checking with the host's grammar got both of those wrong.
+	const requestedDeviceId = row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local";
+	const flavor = workspacePathFlavorForDevice(
+		requestedDeviceId,
+		row.cwd ?? row.workspaceContext?.cwd ?? undefined,
+	);
+	const explicitCwd = row.cwd?.trim();
+	const remoteCwd =
+		requestedDeviceId !== "local" && explicitCwd && isAbsoluteForFlavor(explicitCwd, flavor)
+			? explicitCwd
+			: null;
+	// Everything else (empty, relative, or a path that only makes sense here) stays a
+	// local claim, resolved from the project/home exactly as before.
+	const cwd = remoteCwd ?? resolveNarratorSessionCwd(row.cwd, project?.path, getHome());
+	const deviceId = remoteCwd ? requestedDeviceId : "local";
 	const target = await canonicalWorkspaceAdmissionTarget({
 		deviceId,
 		// Match the trusted local backend's lexical base for old relative cwd rows.
@@ -1768,6 +1847,8 @@ export const narratorService = {
 							parent.planReflectionAutoApproveOverride ??
 							"inherit",
 						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+						questionReflectionOverride:
+							input.questionReflectionOverride ?? parent.questionReflectionOverride ?? "inherit",
 						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
@@ -2167,7 +2248,9 @@ export const narratorService = {
 	async listNamed() {
 		const rows = await db.query.narrators.findMany({
 			columns: { runtimeRegistrationJson: false },
-			where: and(eq(narrators.type, "primary"), isNotNull(narrators.handle)),
+			// Valid handles are non-empty. The range predicate uses idx_narrators_handle;
+			// IS NOT NULL made SQLite scan every narrator before sorting this small result.
+			where: and(eq(narrators.type, "primary"), gt(narrators.handle, "")),
 			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
 		});
 		// Defensive: only return those actually flagged as named.
@@ -2494,6 +2577,7 @@ export const narratorService = {
 								planReflectionAutoApproveOverride:
 									parent.planReflectionAutoApproveOverride ?? "inherit",
 								dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+								questionReflectionOverride: parent.questionReflectionOverride ?? "inherit",
 								autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 								behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 								behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
@@ -2701,6 +2785,7 @@ export const narratorService = {
 								planReflectionAutoApproveOverride:
 									parent.planReflectionAutoApproveOverride ?? "inherit",
 								dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+								questionReflectionOverride: parent.questionReflectionOverride ?? "inherit",
 								autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 								behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 								behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",

@@ -13,6 +13,8 @@ import { expect } from "bun:test";
 import { settings } from "../../../lib/settings";
 import { newOutlineSid } from "../../outline/keys";
 import { OUTLINE_BEHAVIOR_ALIAS } from "../../outline/model";
+import { readPlanDiff } from "../../outline/plan-diff";
+import { decideOutlinePlan, ensurePlanRoot, readPlanSubmission } from "../../outline/plans";
 import { ensureSessionSpace } from "../../outline/spaces";
 import { outlineStore } from "../../outline/store";
 import { type OutlineOp, writeOutline } from "../../outline/write";
@@ -308,6 +310,14 @@ export const OUTLINE_TASK_SOURCE_SCENARIOS: OutlineScenario[] = [
 						`- [ ] \`${printer.address}\` Write the printer`,
 						"1 more; read `session/` with OutlineRead.",
 					].join("\n"),
+					// The reader's summary beside it (a `context_update` row stores it): the tasks
+					// listed, titled, and how many are open of each kind. Prerequisites stay out.
+					display: {
+						doing: [{ address: parser.address, title: "Write the parser", humanCreated: true }],
+						waiting: [{ address: waiting.address, title: "Waiting on access" }],
+						next: [{ address: printer.address, title: "Write the printer" }],
+						counts: { doing: 1, waiting: 1, todo: 2 },
+					},
 				},
 			]);
 			const zh = (await source.contextParts("zh-CN"))[0]?.text ?? "";
@@ -336,6 +346,99 @@ export const OUTLINE_TASK_SOURCE_SCENARIOS: OutlineScenario[] = [
 			const sub = await ctx.subagent(root);
 			const subParts = await (await taskSourceForNarrator(sub)).contextParts("en");
 			expect(subParts).toEqual([{ key: "outline.behavior", text: expected }]);
+		},
+	},
+	{
+		name: "a plan (P2 PR 8): never continued while planned; its diff, a decision refused for another's change, then its first step that can start",
+		async run(ctx) {
+			const id = await ctx.session();
+			const { root } = await ensurePlanRoot({
+				session: id,
+				userId: null,
+				title: "Plan",
+				locale: "en",
+			});
+			const space = await ensureSessionSpace(id);
+			const r = await writeOutline({
+				spaceId: space.id,
+				ops: [
+					{
+						op: "insert",
+						sid: "PlanStp2",
+						parent: { id: root.blockId },
+						content: "Step two placeholder",
+					},
+					{
+						op: "insert",
+						parent: { id: root.blockId },
+						position: { first: true },
+						content: "Step one",
+						task: { status: "todo", depends: [{ target: `${space.key}/PlanStp2`, label: null }] },
+					},
+					{ op: "setTask", block: { sid: "PlanStp2" }, task: { status: "todo" } },
+					{ op: "update", block: { sid: "PlanStp2" }, content: "Step two" },
+				],
+				actor: { kind: "agent", id },
+				responsibleUserId: null,
+				narratorId: id,
+			});
+			const stepTwo = r.results[0]?.blockId as string;
+			const source = await taskSourceForNarrator(id);
+			expect((await source.prepareContinuation({ promoteTodo: true })).openTask).toBeNull();
+
+			const submitted = await readPlanSubmission({ session: id });
+			if (!submitted.ok) throw new Error("not submitted");
+			expect(submitted.submission.counts).toEqual({
+				added: 3,
+				removed: 0,
+				text: 0,
+				task: 0,
+				moved: 0,
+			});
+			expect(submitted.markdown).toContain("Step two");
+
+			// Someone else rewrites a step after the version seen: the decision is refused.
+			await writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "update", block: { id: stepTwo }, content: "Step two, revised" }],
+				actor: { kind: "human", id: "someone-else" },
+				responsibleUserId: null,
+			});
+			const decide = (userId: string) =>
+				decideOutlinePlan({
+					session: id,
+					rootId: root.blockId,
+					round: submitted.submission.root.round,
+					action: "draft",
+					decider: { kind: "human", userId },
+					seenSeq: submitted.submission.seq,
+					locale: "en",
+				});
+			await expect(decide("the-person")).rejects.toMatchObject({ code: "OUTLINE_PLAN_CHANGED" });
+			// That person's own change does not count against them.
+			await decide("someone-else");
+			expect((await outlineStore.getBlock(root.blockId))?.taskJson?.plan).toMatchObject({
+				state: "approved",
+				round: 1,
+				approvedBy: { kind: "human", id: "someone-else" },
+			});
+			const diff = await readPlanDiff({
+				rootId: root.blockId,
+				fromSeq: submitted.submission.seq,
+				toSeq: null,
+			});
+			expect(diff?.counts.text).toBe(1);
+
+			// Started from the root: step one waits for step two, so step two is started and named.
+			const target = await source.prepareContinuation({
+				promoteTodo: true,
+				preferTaskId: root.blockId,
+			});
+			expect(target.openTask?.text).toBe("Step two, revised");
+			expect(target.protectedOpenCount).toBe(1);
+			expect((await outlineStore.getBlock(root.blockId))?.taskJson?.status).toBe("doing");
+			const [claim] = await outlineStore.getTaskClaims([stepTwo]);
+			expect(claim?.holderNarratorId).toBe(id);
 		},
 	},
 ];

@@ -1,53 +1,11 @@
-import {
-	startNavResize,
-	toggleNavCollapsed,
-	useNavCollapsed,
-	useNavWidth,
-} from "@frontend/hooks/useResizableNav";
+import { toggleNavCollapsed, useNavCollapsed, useNavWidth } from "@frontend/hooks/useResizableNav";
 import type { AppShellProps } from "@mantine/core";
-import {
-	ActionIcon,
-	Anchor,
-	AppShell,
-	Badge,
-	Box,
-	Burger,
-	Button,
-	Center,
-	Group,
-	Indicator,
-	Loader,
-	Menu,
-	Modal,
-	NavLink,
-	Text,
-	Tooltip,
-} from "@mantine/core";
-import { useDisclosure, useMediaQuery } from "@mantine/hooks";
-import {
-	IconAdjustmentsHorizontal,
-	IconAlertTriangle,
-	IconArrowLeft,
-	IconCheck,
-	IconClearAll,
-	IconDashboard,
-	IconFolders,
-	IconList,
-	IconMessageChatbot,
-	IconMessageReport,
-	IconPlus,
-	IconSettings,
-} from "@tabler/icons-react";
+import { AppShell, Box, Button, Center, Group, Loader, Modal, Text, Tooltip } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
+import { IconAlertTriangle, IconArrowLeft } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import {
-	Link,
-	Navigate,
-	Outlet,
-	useNavigate,
-	useRouter,
-	useRouterState,
-} from "@tanstack/react-router";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Navigate, Outlet, useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
@@ -57,10 +15,7 @@ import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useMobileViewport } from "../hooks/useMobileViewport";
 import { useNavLayout } from "../hooks/useNavLayout";
-import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
-import { addRecentTab, useRecentTabs } from "../hooks/useRecentTabs";
-import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
 import { api, clearToken } from "../lib/api";
@@ -75,13 +30,14 @@ import { narratorWSManager } from "../lib/narrator-ws-manager";
 import {
 	APP_SHELL_CLASSNAME,
 	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
-	APP_SHELL_HEADER_HEIGHT,
+	APP_SHELL_HEADER_HEIGHTS,
 	APP_SHELL_HEADER_OFFSET,
 	APP_SHELL_MAIN_CLASSNAME,
 	APP_SHELL_MAIN_ID,
 	APP_SHELL_MAIN_PADDING_BOTTOM,
 	APP_SHELL_MOBILE_NAVBAR_HEIGHT,
 	APP_SHELL_SAFE_HEADER_STYLE,
+	APP_SHELL_WIZARD_HEADER_HEIGHTS,
 	APP_VIEWPORT_BOTTOM,
 	appShellNavbarBottomGutter,
 	installAppViewportTracking,
@@ -90,27 +46,16 @@ import {
 } from "../lib/safe-area";
 import { installThemeColorSync } from "../lib/theme-color-sync";
 import { installWcoTracking } from "../lib/wco";
-import { BrandTitle } from "./common/BrandTitle";
 import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { RoutePendingIndicator } from "./common/RouteChunkErrorBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
-import {
-	CreateNarratorLazyModal,
-	preloadCreateNarratorModal,
-} from "./narrator/CreateNarratorLazyModal";
-import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
-import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
-import { HeaderSearchBox } from "./nav/HeaderSearchBox";
-import { NavOverflowMenu } from "./nav/NavOverflowMenu";
-import { NavUserMenu } from "./nav/NavUserMenu";
-import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
+import { MobileNavFallback } from "./nav/MobileNavButton";
+import { NavBottomBar } from "./nav/NavBottomBar";
+import { NavHoverPanel } from "./nav/NavHoverPanel";
+import { NavTopSection } from "./nav/NavTopSection";
+import { MobileNavContext } from "./nav/nav-render-context";
 import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
-// `isTabActive` comes from the logic module, not `RecentTabs.tsx`: a non-component export
-// there breaks its Fast Refresh boundary and turns tab-list edits into page reloads.
-import { isTabActive } from "./nav/recent-tabs-logic";
-import { useNavBadges } from "./nav/use-nav-badges";
-import { NotificationBell } from "./notifications/NotificationBell";
 import { PluginPermissionRequestHost } from "./plugins-admin/PluginPermissionRequestHost";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
 import { SystemMaintenanceBadge } from "./SystemMaintenanceBadge";
@@ -127,45 +72,6 @@ const SetupWizard = lazy(() =>
 		default: m.SetupWizard,
 	})),
 );
-
-/** Format chars/sec as a human-readable rate string. */
-function formatRate(cps: number): string {
-	if (cps >= 1000) return `${(cps / 1000).toFixed(1)}k`;
-	return String(cps);
-}
-
-/** Format total chars with K/M suffix. */
-function formatChars(total: number): string {
-	if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(1)}M`;
-	if (total >= 1_000) return `${(total / 1_000).toFixed(1)}K`;
-	return String(total);
-}
-
-/**
- * The header's AI output-rate badge.
- *
- * The stats stream ticks every second while any narrator produces output. Owning
- * that subscription here — rather than in AuthenticatedLayout — keeps each tick
- * from re-rendering the whole AppShell (navbar NavLinks, tab strip, tooltips),
- * which cost ~140ms of main-thread work per second and dropped frames while
- * scrolling a narrator.
- */
-function OutputStatsBadge({ enabled }: { enabled: boolean }) {
-	const { t } = useTranslation("nav");
-	const stats = useOutputStats(enabled);
-	if (!enabled || stats.charsPerSec <= 0) return null;
-	return (
-		<Tooltip
-			label={`${t("totalOutputChars")}: ${formatChars(stats.totalChars)}`}
-			position="bottom"
-			withArrow
-		>
-			<Text size="sm" c="dimmed" style={{ cursor: "default", fontVariantNumeric: "tabular-nums" }}>
-				{formatRate(stats.charsPerSec)}
-			</Text>
-		</Tooltip>
-	);
-}
 
 /**
  * The mobile breakpoint only affects these two side effects, not shell JSX.
@@ -228,17 +134,9 @@ function AppShellWithNavWidth({
 
 export function AuthenticatedLayout() {
 	const [opened, { toggle, open: openNav, close: closeNav }] = useDisclosure();
-	// Touch/pen input only: a mouse drag across the header must keep collapsing
-	// the sidebar rather than arming a reload gesture.
-	const isTouchPointer = useMediaQuery("(pointer: coarse)", false, {
-		getInitialValueInEffect: false,
-	});
-	const headerRef = useRef<HTMLElement>(null);
+	// Phones have no header row; each page's title row renders the menu button from this.
+	const mobileNav = useMemo(() => ({ opened, toggle }), [opened, toggle]);
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
-	// The search QUERY state lives in HeaderSearchBox (per-keystroke re-renders
-	// must not touch the AppShell). Only the mobile open/closed toggle stays
-	// here because the title below is gated on it.
-	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
 	const { t } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
@@ -246,8 +144,6 @@ export function AuthenticatedLayout() {
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
-	const tabGroupMode = prefs?.recentTabsGroupMode ?? "flat";
-	const { tabs, clearTabs } = useRecentTabs();
 	useAuthenticatedAppearance(prefs);
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
@@ -289,9 +185,6 @@ export function AuthenticatedLayout() {
 	// client even for rooms it has not subscribed to, so the count is correct without
 	// polling and without opening the conversation.
 	useChatUnreadLive();
-	// Every nav badge is resolved by one shared hook so a new badge key cannot be
-	// silently ignored by one of the two surfaces that paint the nav.
-	const resolveNavBadge = useNavBadges();
 	const legacyFastModeDefaultMigrationRef = useRef(false);
 
 	useEffect(() => {
@@ -356,27 +249,6 @@ export function AuthenticatedLayout() {
 	const [wizardOpen, setWizardOpen] = useState(false);
 	const wizardAutoOpenedRef = useRef(false);
 
-	// --- Create narrator modal (triggered from nav) ---
-	const [createNarratorOpened, setCreateNarratorOpened] = useState(false);
-	const requireSetup = useSetupWizardGuard();
-	const openCreateNarrator = useCallback(() => {
-		preloadCreateNarratorModal();
-		if (!requireSetup()) return;
-		setCreateNarratorOpened(true);
-	}, [requireSetup]);
-	const handleNarratorCreated = useCallback(
-		(data: CreateNarratorResult) => {
-			addRecentTab({
-				type: "narrator",
-				id: data.id,
-				title: data.title,
-				subtitle: data.cwd,
-				status: data.status,
-			});
-			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.id } });
-		},
-		[navigate],
-	);
 	useEffect(() => {
 		if (prefs?.setupWizardCompleted !== false) {
 			wizardAutoOpenedRef.current = false;
@@ -411,12 +283,6 @@ export function AuthenticatedLayout() {
 		}
 	}, []);
 
-	// Find the active tab key so clearTabs can preserve it
-	const activeTabKey = useMemo(() => {
-		const active = tabs.find((tab) => isTabActive(tab, pathname));
-		return active ? `${active.type}:${active.id}` : undefined;
-	}, [tabs, pathname]);
-
 	// No token → redirect to login (useCurrentUser is disabled, won't fire)
 	if (!hasToken) {
 		return <Navigate to="/login" search={{ redirect: previewLoginRedirect }} replace />;
@@ -444,484 +310,235 @@ export function AuthenticatedLayout() {
 		navigate({ to: "/settings/agent", hash: "request-evidence" });
 	};
 
-	// Only session tabs are projected; persisted project visits are left untouched.
-	const narratorTabs = tabs.filter((t) => t.type !== "project");
-	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
-
-	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
 	// The Navbar's gutter for the three sides that are not the bottom edge. The bottom
 	// edge is owned by the `data-safe-area` spacer, which folds this same value into a
 	// `max()` against the inset instead of adding to it.
-	const navbarPadding = wizardOpen ? 0 : navCollapsed ? 4 : "md";
+	// The same collapsed or not: collapsed is the expanded sidebar clipped (NavHoverPanel),
+	// so its rows must sit where they would expanded.
+	const navbarPadding = wizardOpen ? 0 : "md";
 	const navbarBottomGutter = appShellNavbarBottomGutter(
-		wizardOpen ? "0px" : navCollapsed ? "4px" : "var(--mantine-spacing-md)",
+		wizardOpen ? "0px" : "var(--mantine-spacing-md)",
 	);
+	// Phone only (the bar is `hiddenFrom="sm"`): the wizard's drawer was closed to look at
+	// the page, and the header becomes the bar that brings it back.
+	const wizardReturnBar = wizardOpen && !opened;
 
 	return (
-		<AppShellWithNavWidth
-			className={APP_SHELL_CLASSNAME}
-			layout="alt"
-			header={{ height: APP_SHELL_HEADER_HEIGHT }}
-			// Only the wrapper subscribes to settled width and threshold crossings;
-			// ordinary drag frames bypass React (see AppShellWithNavWidth).
-			navbar={{
-				breakpoint: "sm",
-				collapsed: { mobile: !opened },
-			}}
-			wizardWidth={wizardOpen ? "min(420px, 100vw)" : undefined}
-			padding="md"
-		>
-			<MobileNavbarEffects
-				wizardOpen={wizardOpen}
-				opened={opened}
-				openNav={openNav}
-				closeNav={closeNav}
-			/>
-			<AppShell.Header ref={headerRef} style={APP_SHELL_SAFE_HEADER_STYLE}>
-				<HeaderPullToRefresh targetRef={headerRef} enabled={isTouchPointer && !wizardOpen} />
-				{wizardOpen && !opened && (
-					<Button
-						hiddenFrom="sm"
-						fullWidth
-						h="100%"
-						radius={0}
-						variant="light"
-						leftSection={<IconArrowLeft size={18} />}
-						onClick={openNav}
-					>
-						{ts("wizardReturn")}
-					</Button>
-				)}
-				<Group
-					h="100%"
-					px="md"
-					justify="space-between"
-					wrap="nowrap"
-					className="nf-header-row"
-					visibleFrom={wizardOpen && !opened ? "sm" : undefined}
-				>
-					<Group wrap="nowrap" className="nf-header-side">
-						<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-						<Tooltip
-							label={t(navCollapsed ? "expandSidebar" : "collapseSidebar")}
-							position="bottom"
-							openDelay={400}
-							disabled={wizardOpen}
-						>
-							<BrandTitle
-								order={3}
-								visibleFrom="sm"
-								onClick={wizardOpen ? undefined : toggleNavCollapsed}
-								style={{ cursor: wizardOpen ? "default" : "pointer", userSelect: "none" }}
-							/>
-						</Tooltip>
-
-						<SystemMaintenanceBadge />
-						<UpdateBadge />
-						{requestEvidencePinning && (
-							<Tooltip
-								label={t(
-									requestEvidenceAutoPin === "errors"
-										? "requestEvidenceErrorsTooltip"
-										: "requestEvidenceAllTooltip",
-								)}
-								position="bottom"
-								withArrow
-							>
-								<Button
-									variant="light"
-									color="orange"
-									size="xs"
-									leftSection={<IconAlertTriangle size={14} />}
-									onClick={openRequestEvidenceSetting}
-									style={{ flexShrink: 0 }}
-								>
-									{t("requestEvidencePinningBadge")}
-								</Button>
-							</Tooltip>
-						)}
-						{!searchOpen && <BrandTitle order={3} hiddenFrom="sm" />}
-					</Group>
-					<Group wrap="nowrap" className="nf-header-side">
-						<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
-						<NotificationBell />
-						<Tooltip label={t("feedback")} position="bottom" withArrow>
-							<ActionIcon
-								variant="subtle"
-								color="gray"
-								component="a"
-								href="https://github.com/NarraFork/NarraFork/issues"
-								target="_blank"
-								rel="noopener noreferrer"
-							>
-								<IconMessageReport size={20} />
-							</ActionIcon>
-						</Tooltip>
-						<HeaderSearchBox searchOpen={searchOpen} onSearchOpenChange={setSearchOpen} />
-					</Group>
-				</Group>
-			</AppShell.Header>
-
-			<AppShell.Navbar
-				top={{ base: APP_SHELL_HEADER_OFFSET, sm: SAFE_AREA_INSET_TOP }}
-				h={{
-					base: APP_SHELL_MOBILE_NAVBAR_HEIGHT,
-					sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
+		<MobileNavContext.Provider value={mobileNav}>
+			<AppShellWithNavWidth
+				className={APP_SHELL_CLASSNAME}
+				layout="alt"
+				header={{
+					height: wizardReturnBar ? APP_SHELL_WIZARD_HEADER_HEIGHTS : APP_SHELL_HEADER_HEIGHTS,
 				}}
-				// `px`/`pt` rather than `p`: the bottom gutter is the `data-safe-area` spacer
-				// below, and a symmetric `p` here would stack under it — the same
-				// inset-plus-spacing double reservation APP_SHELL_MAIN_PADDING_BOTTOM removed
-				// from Main (measured 50px where 34px was intended). Splitting the sides out
-				// keeps one owner per edge instead of relying on `p`/`pb` precedence.
-				px={navbarPadding}
-				pt={navbarPadding}
-				data-collapsed={!wizardOpen && navCollapsed ? true : undefined}
-				style={{
-					display: "flex",
-					flexDirection: "column",
-					isolation: "isolate",
-					transition: "padding 150ms ease",
+				// Only the wrapper subscribes to settled width and threshold crossings;
+				// ordinary drag frames bypass React (see AppShellWithNavWidth).
+				navbar={{
+					breakpoint: "sm",
+					collapsed: { mobile: !opened },
 				}}
+				wizardWidth={wizardOpen ? "min(420px, 100vw)" : undefined}
+				padding="md"
 			>
-				<RecentTabsWSProvider />
-				{/* WCO (buttons left, e.g. macOS): pushes nav content below the traffic
+				<MobileNavbarEffects
+					wizardOpen={wizardOpen}
+					opened={opened}
+					openNav={openNav}
+					closeNav={closeNav}
+				/>
+				{/* No header row at any width (see APP_SHELL_HEADER_HEIGHTS): the element only
+			    owns the top inset, plus the wizard's phone return bar. */}
+				<AppShell.Header style={APP_SHELL_SAFE_HEADER_STYLE}>
+					{wizardReturnBar && (
+						<Button
+							hiddenFrom="sm"
+							fullWidth
+							h="100%"
+							radius={0}
+							variant="light"
+							leftSection={<IconArrowLeft size={18} />}
+							onClick={openNav}
+						>
+							{ts("wizardReturn")}
+						</Button>
+					)}
+				</AppShell.Header>
+
+				<AppShell.Navbar
+					top={{ base: APP_SHELL_HEADER_OFFSET, sm: SAFE_AREA_INSET_TOP }}
+					h={{
+						base: APP_SHELL_MOBILE_NAVBAR_HEIGHT,
+						sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
+					}}
+					// `px`/`pt` rather than `p`: the bottom gutter is the `data-safe-area` spacer
+					// below, and a symmetric `p` here would stack under it — the same
+					// inset-plus-spacing double reservation APP_SHELL_MAIN_PADDING_BOTTOM removed
+					// from Main (measured 50px where 34px was intended). Splitting the sides out
+					// keeps one owner per edge instead of relying on `p`/`pb` precedence.
+					px={navbarPadding}
+					pt={navbarPadding}
+					style={{
+						display: "flex",
+						flexDirection: "column",
+						isolation: "isolate",
+						transition: "padding 150ms ease",
+					}}
+				>
+					<RecentTabsWSProvider />
+					{/* WCO (buttons left, e.g. macOS): pushes nav content below the traffic
 				    lights and doubles as drag surface. display:none everywhere else —
 				    see styles/wco.css. */}
-				<Box className="nf-wco-nav-spacer" aria-hidden />
-				{wizardOpen ? (
-					// The wizard replaces the navbar contents, so a failed chunk here used to
-					// take down the shell that hosts it and leave no way to navigate.
-					<LazyOverlayBoundary resetKey={wizardOpen} label={ts("wizardTitle")}>
-						<Suspense fallback={null}>
-							<SetupWizard
-								initialStep={wizardInitialStep}
-								onClose={() => {
-									setWizardOpen(false);
-									setWizardInitialStep(undefined);
-									closeNav();
-								}}
-							/>
-						</Suspense>
-					</LazyOverlayBoundary>
-				) : (
-					<>
-						{/* Drag handle for resizing navbar. Pointer events so touch drags work;
-						    `touch-action: none` keeps the browser from claiming the gesture as a
-						    scroll (preventDefault on pointerdown cannot do that). */}
-						<Box
-							visibleFrom="sm"
-							onPointerDown={startNavResize}
-							style={{
-								position: "absolute",
-								top: 0,
-								right: -3,
-								width: 6,
-								height: "100%",
-								cursor: "col-resize",
-								touchAction: "none",
-								zIndex: 100,
-							}}
-						/>
-						<Box>
-							<Tooltip label={t("dashboard")} position="right" disabled={!navCollapsed}>
-								<NavLink
-									component={Link}
-									to="/"
-									label={navCollapsed ? undefined : t("dashboard")}
-									leftSection={<IconDashboard size={16} />}
+					<Box className="nf-wco-nav-spacer" aria-hidden />
+					{wizardOpen ? (
+						// The wizard replaces the navbar contents, so a failed chunk here used to
+						// take down the shell that hosts it and leave no way to navigate.
+						<LazyOverlayBoundary resetKey={wizardOpen} label={ts("wizardTitle")}>
+							<Suspense fallback={null}>
+								<SetupWizard
+									initialStep={wizardInitialStep}
+									onClose={() => {
+										setWizardOpen(false);
+										setWizardInitialStep(undefined);
+										closeNav();
+									}}
 								/>
-							</Tooltip>
-						</Box>
-						<Box>
-							<Tooltip label={t("narrators")} position="right" disabled={!navCollapsed}>
-								<NavLink
-									label={navCollapsed ? undefined : t("narrators")}
-									active={pathname.startsWith("/narrators")}
-									leftSection={<IconMessageChatbot size={16} />}
-									onClick={() => navigate({ to: "/narrators" })}
-									styles={
-										firstNarratorTabActive
-											? {
-													root: {
-														borderBottomLeftRadius: 0,
-														borderBottomRightRadius: 0,
-													},
-												}
-											: undefined
-									}
-									rightSection={
-										navCollapsed ? undefined : (
-											<Group gap={8} wrap="nowrap">
-												{/* Display-mode switch for the tab list below. Wrapped in a Box that
-												    swallows the click: this lives INSIDE the NavLink, whose own
-												    onClick navigates to /narrators, and both sibling ActionIcons
-												    below stop propagation for the same reason. */}
-												<Box
-													onClick={(e: React.MouseEvent) => {
-														e.preventDefault();
-														e.stopPropagation();
-													}}
-													onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
-													style={{ display: "flex" }}
-												>
-													<Menu position="right-start" withinPortal shadow="md" width={210}>
-														<Menu.Target>
-															<Tooltip label={t("recentTabsGrouping")} position="right" withArrow>
-																<ActionIcon
-																	size={28}
-																	variant="subtle"
-																	color="gray"
-																	aria-label={t("recentTabsGrouping")}
-																>
-																	<IconAdjustmentsHorizontal size={16} />
-																</ActionIcon>
-															</Tooltip>
-														</Menu.Target>
-														<Menu.Dropdown>
-															<Menu.Label>{t("recentTabsGrouping")}</Menu.Label>
-															<Menu.Item
-																leftSection={<IconList size={14} />}
-																rightSection={
-																	tabGroupMode === "flat" ? <IconCheck size={14} /> : undefined
-																}
-																onClick={() => updatePrefs.mutate({ recentTabsGroupMode: "flat" })}
-															>
-																{t("groupModeFlat")}
-															</Menu.Item>
-															<Menu.Item
-																leftSection={<IconFolders size={14} />}
-																rightSection={
-																	tabGroupMode === "directory" ? <IconCheck size={14} /> : undefined
-																}
-																onClick={() =>
-																	updatePrefs.mutate({ recentTabsGroupMode: "directory" })
-																}
-															>
-																{t("groupModeDirectory")}
-															</Menu.Item>
-														</Menu.Dropdown>
-													</Menu>
-												</Box>
-												<Tooltip label={t("newNarrator")} position="right" withArrow>
-													<ActionIcon
-														size={28}
-														variant="subtle"
-														color="gray"
-														onPointerEnter={preloadCreateNarratorModal}
-														onFocus={preloadCreateNarratorModal}
-														onPointerDown={preloadCreateNarratorModal}
-														onClick={(e: React.MouseEvent) => {
-															e.preventDefault();
-															e.stopPropagation();
-															openCreateNarrator();
-															closeNav();
-														}}
-														aria-label={t("newNarrator")}
-													>
-														<IconPlus size={16} />
-													</ActionIcon>
-												</Tooltip>
-												{tabs.some(
-													(t) =>
-														t.type !== "project" &&
-														!["working", "waiting"].includes(t.status ?? "") &&
-														!t.substatus?.includes("unread"),
-												) && (
-													<Tooltip label={t("clearNarrators")} position="right" withArrow>
-														<ActionIcon
-															size={28}
-															variant="subtle"
-															color="gray"
-															onClick={(e: React.MouseEvent) => {
-																e.preventDefault();
-																e.stopPropagation();
-																clearTabs("inactive_narrators", activeTabKey);
-															}}
-															aria-label={t("clearNarrators")}
-														>
-															<IconClearAll size={16} />
-														</ActionIcon>
-													</Tooltip>
+							</Suspense>
+						</LazyOverlayBoundary>
+					) : (
+						<NavHoverPanel collapsed={navCollapsed}>
+							<NavTopSection
+								onToggleCollapsed={toggleNavCollapsed}
+								onNavigate={closeNav}
+								statusBadges={
+									<>
+										<SystemMaintenanceBadge />
+										<UpdateBadge />
+										{requestEvidencePinning && (
+											<Tooltip
+												label={t(
+													requestEvidenceAutoPin === "errors"
+														? "requestEvidenceErrorsTooltip"
+														: "requestEvidenceAllTooltip",
 												)}
-											</Group>
-										)
-									}
-								/>
-							</Tooltip>
-						</Box>
-						{!navCollapsed && (
-							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-								<RecentTabList filter="narrator" firstTabConnected />
+												position="right"
+												withArrow
+											>
+												<Button
+													variant="light"
+													color="orange"
+													size="compact-xs"
+													leftSection={<IconAlertTriangle size={12} />}
+													onClick={openRequestEvidenceSetting}
+													style={{ flexShrink: 0 }}
+												>
+													{t("requestEvidencePinningBadge")}
+												</Button>
+											</Tooltip>
+										)}
+										{/* The output-speed readout is off the sidebar until it returns as a
+										    fixed-height stats strip: appearing and disappearing in this row
+										    shifted the whole sidebar. */}
+									</>
+								}
+							/>
+							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }} className="nf-nav-tabs">
+								<RecentTabList filter="narrator" onNavigate={closeNav} />
 							</Box>
-						)}
-						<Box>
-							{navVisibleItems.map((item) => {
-								// "projects" is rendered in the top section above; settings is mandatory
-								// and rendered after this list. Skip them here.
-								if (item.id === "projects") return null;
-								const def = secondaryNavDefs.get(item.id);
-								if (!def) return null;
-								const Icon = def.icon;
-								const { count: badgeCount, label: badgeLabel } = resolveNavBadge(def.badge);
-								return (
-									<Tooltip
-										key={item.id}
-										label={t(def.labelKey)}
-										position="right"
-										disabled={!navCollapsed}
-									>
-										<NavLink
-											component={Link}
-											to={def.to}
-											label={navCollapsed ? undefined : t(def.labelKey)}
-											active={def.activePrefix ? pathname.startsWith(def.activePrefix) : undefined}
-											leftSection={
-												badgeCount > 0 && navCollapsed ? (
-													// Collapsed rail has no room for a right section — dot the icon instead.
-													<Indicator size={7} color="indigo" offset={2} withBorder>
-														<Icon size={16} />
-													</Indicator>
-												) : (
-													<Icon size={16} />
-												)
-											}
-											rightSection={
-												badgeCount > 0 && !navCollapsed ? (
-													<Badge size="sm" circle variant="filled" color="indigo">
-														{badgeLabel}
-													</Badge>
-												) : undefined
-											}
-										/>
-									</Tooltip>
-								);
-							})}
-							<Tooltip label={t("settings")} position="right" disabled={!navCollapsed}>
-								<NavLink
-									component={Link}
-									to="/settings"
-									label={navCollapsed ? undefined : t("settings")}
-									leftSection={<IconSettings size={16} />}
-								/>
-							</Tooltip>
-						</Box>
-						{navCollapsed ? (
-							<Group justify="center" mt={4} gap={4}>
-								<NavOverflowMenu
-									entries={navEntries}
-									onSaveLayout={saveNavLayout}
-									navCollapsed={navCollapsed}
-								/>
-								<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
-							</Group>
-						) : (
-							<Group gap={4} mt={4} wrap="nowrap" align="center" px={8} justify="space-between">
-								<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
-								<Text size="xs" c="dimmed" ta="center" style={{ flex: 1, minWidth: 0 }}>
-									v{__APP_VERSION__}
-									<Anchor
-										component={Link}
-										to="/licenses"
-										size="xs"
-										c="dimmed"
-										td="underline"
-										ml={8}
-									>
-										{t("licenses")}
-									</Anchor>
-								</Text>
-								<NavOverflowMenu
-									entries={navEntries}
-									onSaveLayout={saveNavLayout}
-									navCollapsed={navCollapsed}
-								/>
-							</Group>
-						)}
-					</>
-				)}
+							<NavBottomBar
+								entries={navEntries}
+								visibleItems={navVisibleItems}
+								onSaveLayout={saveNavLayout}
+								onLogout={openLogout}
+							/>
+						</NavHoverPanel>
+					)}
+					{/*
+					 * The Navbar's sole bottom gutter: home-indicator clearance where there is an
+					 * inset, the state's ordinary padding where there is not. `max()`, not a sum,
+					 * for the reason APP_SHELL_MAIN_PADDING_BOTTOM documents — this box used to be
+					 * the inset alone and sat on top of the Navbar's symmetric `p`, reserving the
+					 * strip twice (measured 50px of gutter for a 34px indicator).
+					 */}
+					<Box
+						aria-hidden
+						data-safe-area="bottom"
+						h={navbarBottomGutter}
+						mih={navbarBottomGutter}
+						style={{ flexShrink: 0, backgroundColor: "var(--mantine-color-body)" }}
+					/>
+				</AppShell.Navbar>
+
+				<AppShell.Main
+					id={APP_SHELL_MAIN_ID}
+					className={APP_SHELL_MAIN_CLASSNAME}
+					style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
+				>
+					{/* Phones: the drawer's menu button for pages whose title row has none. */}
+					<MobileNavFallback />
+					{/* WCO on desktop: the shell's top padding is a drag surface of its own, so a
+					    grab at the window's very top edge moves the window (there is no header
+					    row). display:none everywhere else, see wco.css. */}
+					<Box className="nf-wco-top-gap" aria-hidden />
+					{/* WCO on desktop: the title-bar strip over the page, and its drag surface. */}
+					<Box className="nf-wco-main-strip" aria-hidden />
+					{/*
+					 * No data-directory permission probe here: it ran on every login and turned an
+					 * inconclusive check (slow filesystem, timeout) into a permission warning.
+					 * The check lives in Settings > Storage, where an operator asks for it.
+					 */}
+					<GitMissingAlert />
+					<StartupRecoveryAlert />
+					<Suspense fallback={<RoutePendingIndicator />}>
+						<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
+							<Outlet />
+						</I18nNamespaceGate>
+					</Suspense>
+				</AppShell.Main>
+
+				<Modal
+					opened={logoutOpened}
+					onClose={closeLogout}
+					title={t("logoutConfirmTitle")}
+					centered
+					size="sm"
+				>
+					<Text mb="lg">{t("logoutConfirmMessage")}</Text>
+					<Group justify="flex-end">
+						<Button variant="default" onClick={closeLogout}>
+							{t("cancel")}
+						</Button>
+						<Button color="red" onClick={logout}>
+							{t("confirm")}
+						</Button>
+					</Group>
+				</Modal>
+
+				<SummaryModelPickerHost />
+				<ProviderBaseUrlFixHost />
+				<TokenDanceRecoveryHost />
+				<BrokenModelMigrationHost />
+				<PluginPermissionRequestHost />
+
 				{/*
-				 * The Navbar's sole bottom gutter: home-indicator clearance where there is an
-				 * inset, the state's ordinary padding where there is not. `max()`, not a sum,
-				 * for the reason APP_SHELL_MAIN_PADDING_BOTTOM documents — this box used to be
-				 * the inset alone and sat on top of the Navbar's symmetric `p`, reserving the
-				 * strip twice (measured 50px of gutter for a 34px indicator).
+				 * The two fixed top banners are rendered LAST on purpose.
+				 *
+				 * Under WCO the whole title-bar strip is ours and the header row is the
+				 * drag surface (`styles/wco.css`), so the banners paint over a draggable
+				 * rect. `-webkit-app-region` hit-testing is purely geometric, and the
+				 * browser folds the rects the page reported into one region *in list
+				 * order, later rects winning where they overlap* — the list being the
+				 * layout-tree order. A banner emitted before the header row therefore
+				 * loses its clicks to window dragging: only its own `no-drag` rect, seen
+				 * after the row's `drag` rect, can cancel it. The header clusters work
+				 * because they are children of the row and so are collected after it;
+				 * these banners are siblings, so their place in the tree is what decides.
+				 * Emitted after every drag surface (the phone header row, the navbar's WCO
+				 * spacer and brand row, the strip above Main), they are collected last and
+				 * stay clickable.
 				 */}
-				<Box
-					aria-hidden
-					data-safe-area="bottom"
-					h={navbarBottomGutter}
-					mih={navbarBottomGutter}
-					style={{ flexShrink: 0, backgroundColor: "var(--mantine-color-body)" }}
-				/>
-			</AppShell.Navbar>
-
-			<AppShell.Main
-				id={APP_SHELL_MAIN_ID}
-				className={APP_SHELL_MAIN_CLASSNAME}
-				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
-			>
-				{/*
-				 * No data-directory permission probe here: it ran on every login and turned an
-				 * inconclusive check (slow filesystem, timeout) into a permission warning.
-				 * The check lives in Settings > Storage, where an operator asks for it.
-				 */}
-				<GitMissingAlert />
-				<StartupRecoveryAlert />
-				<Suspense fallback={<RoutePendingIndicator />}>
-					<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
-						<Outlet />
-					</I18nNamespaceGate>
-				</Suspense>
-			</AppShell.Main>
-
-			<Modal
-				opened={logoutOpened}
-				onClose={closeLogout}
-				title={t("logoutConfirmTitle")}
-				centered
-				size="sm"
-			>
-				<Text mb="lg">{t("logoutConfirmMessage")}</Text>
-				<Group justify="flex-end">
-					<Button variant="default" onClick={closeLogout}>
-						{t("cancel")}
-					</Button>
-					<Button color="red" onClick={logout}>
-						{t("confirm")}
-					</Button>
-				</Group>
-			</Modal>
-
-			<SummaryModelPickerHost />
-			<ProviderBaseUrlFixHost />
-			<TokenDanceRecoveryHost />
-			<BrokenModelMigrationHost />
-			<PluginPermissionRequestHost />
-
-			<CreateNarratorLazyModal
-				opened={createNarratorOpened}
-				onClose={() => setCreateNarratorOpened(false)}
-				onCreated={handleNarratorCreated}
-			/>
-
-			{/*
-			 * The two fixed top banners are rendered LAST on purpose.
-			 *
-			 * Under WCO the whole title-bar strip is ours and the header row is the
-			 * drag surface (`styles/wco.css`), so the banners paint over a draggable
-			 * rect. `-webkit-app-region` hit-testing is purely geometric, and the
-			 * browser folds the rects the page reported into one region *in list
-			 * order, later rects winning where they overlap* — the list being the
-			 * layout-tree order. A banner emitted before the header row therefore
-			 * loses its clicks to window dragging: only its own `no-drag` rect, seen
-			 * after the row's `drag` rect, can cancel it. The header clusters work
-			 * because they are children of the row and so are collected after it;
-			 * these banners are siblings, so their place in the tree is what decides.
-			 * Emitted after the header row *and* the navbar's WCO spacer, they are
-			 * collected last and stay clickable.
-			 */}
-			<WSConnectionAlert />
-			<VersionUpdateBanner />
-		</AppShellWithNavWidth>
+				<WSConnectionAlert />
+				<VersionUpdateBanner />
+			</AppShellWithNavWidth>
+		</MobileNavContext.Provider>
 	);
 }

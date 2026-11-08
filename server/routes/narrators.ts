@@ -17,12 +17,15 @@ import {
 } from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
 import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
+import { isAbsoluteForFlavor, normalizeWorkspacePathFlavor } from "@shared/workspace-directories";
 import {
 	and,
 	asc,
@@ -56,11 +59,17 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
+import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
+import {
+	findStagedAttachment,
+	releaseStagedAttachment,
+	stagedAttachmentAsFile,
+} from "../lib/attachment-staging";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
 	type AutoContinuationOverride,
@@ -167,7 +176,12 @@ import {
 import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	getQueueDuringCompaction,
+	normalizeAutoModelValueForSave,
+	settings,
+} from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -240,6 +254,7 @@ import {
 	revertPlanIdSchema,
 	rollbackToBlocksSchema,
 } from "../lib/validators/narrators";
+import { outlinePlanDecisionSchema } from "../lib/validators/outline";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
@@ -277,6 +292,7 @@ import {
 import { dependencyService } from "../services/dependency-service";
 import {
 	browseRemoteDirectory,
+	resolveRemoteBrowsePath,
 	resolveRemoteBrowseTarget,
 } from "../services/device-transfer-service";
 import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/execution-policy";
@@ -324,6 +340,7 @@ import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-wri
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
+	releaseStagedFiles,
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
@@ -410,8 +427,10 @@ import {
 	reExecuteDeniedToolCall,
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
+	resolveNarratorDefaultDeviceRequest,
 	resolveOptionalToolState,
 	resolvePermissionOrDangerReflection,
+	resolveSessionDevices,
 	restoreAssistantMessage,
 	restoreOutputBlock,
 	retryFailedCompact,
@@ -511,6 +530,104 @@ function parseNewCommand(message: string): { rawCommand: string; initialMessage:
 	return { rawCommand: message.trim(), initialMessage: match[1]?.trim() ?? "" };
 }
 
+/** Index is in the original newly-added textFiles list, excluding kept attachments. */
+export interface StagedAttachmentInput {
+	uploadId: string;
+	index: number;
+}
+
+const MAX_STAGED_ATTACHMENT_IDS = MAX_EDIT_TEXT_FILES_PER_MESSAGE;
+
+/** Parse the `stagedAttachments` form field, rejecting anything malformed outright. */
+export function parseStagedAttachmentInput(
+	raw: FormDataEntryValue | null | undefined,
+): StagedAttachmentInput[] {
+	if (raw === null || raw === undefined) return [];
+	if (typeof raw !== "string") {
+		throw new ValidationError("stagedAttachments must be a JSON array");
+	}
+	// At most ten small descriptors; reject oversized control data before JSON.parse.
+	if (raw.length > 4096) throw new ValidationError("stagedAttachments metadata is too large");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new ValidationError("stagedAttachments must be valid JSON");
+	}
+	if (!Array.isArray(parsed)) throw new ValidationError("stagedAttachments must be a JSON array");
+	if (parsed.length > MAX_STAGED_ATTACHMENT_IDS) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
+	}
+	const out: StagedAttachmentInput[] = [];
+	const ids = new Set<string>();
+	const indexes = new Set<number>();
+	for (const entry of parsed) {
+		const uploadId = entry && typeof entry === "object" ? entry.uploadId : undefined;
+		const index = entry && typeof entry === "object" ? entry.index : undefined;
+		if (typeof uploadId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(uploadId)) {
+			throw new ValidationError("Each staged attachment needs a valid uploadId");
+		}
+		if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+			throw new ValidationError("Each staged attachment needs a valid index");
+		}
+		if (ids.has(uploadId) || indexes.has(index)) {
+			throw new ValidationError("Duplicate staged attachment uploadId or index");
+		}
+		ids.add(uploadId);
+		indexes.add(index);
+		out.push({ uploadId, index });
+	}
+	return out;
+}
+
+/**
+ * Turn staged upload ids into disk-backed `File` values for the shared pipeline.
+ *
+ * The returned objects behave like any other upload: `size`, `name` and `type`
+ * are real, and `Bun.write` streams from the staged path. That is what lets the
+ * buffered mailbox, the worktree copy and the retry path stay unaware that these
+ * attachments never travelled inside a request body.
+ *
+ * A missing id is a user-visible condition, not an internal one: the TTL sweep,
+ * a restart or another tab can remove it between upload and send.
+ */
+export function resolveStagedAttachments(
+	narratorId: string,
+	inputs: readonly StagedAttachmentInput[],
+	inlineFiles: readonly FormDataEntryValue[] = [],
+): File[] {
+	const count = inputs.length + inlineFiles.length;
+	if (count > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
+	}
+	for (const file of inlineFiles) {
+		if (!(file instanceof File)) throw new ValidationError("textFiles must contain files");
+	}
+	const stagedByIndex = new Map<number, File>();
+	for (const { uploadId, index } of inputs) {
+		if (!Number.isInteger(index) || index < 0 || index >= count || stagedByIndex.has(index)) {
+			throw new ValidationError("Invalid or duplicate staged attachment index");
+		}
+		const staged = findStagedAttachment(narratorId, uploadId);
+		if (!staged) {
+			throw new ValidationError(
+				"An attached file is no longer available (its upload expired); attach it again",
+			);
+		}
+		stagedByIndex.set(index, stagedAttachmentAsFile(staged));
+	}
+	let inlineIndex = 0;
+	return Array.from(
+		{ length: count },
+		(_, index) => stagedByIndex.get(index) ?? (inlineFiles[inlineIndex++] as File),
+	);
+}
+
+/** Combined size of a set of attachment files, in bytes. */
+export function attachmentBytesOf(files: readonly File[]): number {
+	return files.reduce((total, file) => total + file.size, 0);
+}
+
 /** Parse message request supporting both JSON and multipart/form-data (with images and text files) */
 export async function parseMessageRequest(
 	c: {
@@ -562,11 +679,14 @@ export async function parseMessageRequest(
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
-			throw new ValidationError(
-				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
-			);
-		}
+		// Attachments over the buffered ceiling never appear here: the composer
+		// uploaded them through the streaming endpoint and sent only their ids, so
+		// the multipart body stays small no matter how large the file is.
+		const allTextFiles = resolveStagedAttachments(
+			narratorId,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
 		// when the user typed nothing. Only a fully empty request is rejected.
@@ -574,7 +694,7 @@ export async function parseMessageRequest(
 			!message.trim() &&
 			imageFiles.length === 0 &&
 			mediaFiles.length === 0 &&
-			textFileEntries.length === 0 &&
+			allTextFiles.length === 0 &&
 			!fileReferences?.length
 		) {
 			throw new ValidationError("message or an attachment is required");
@@ -584,6 +704,12 @@ export async function parseMessageRequest(
 		for (const file of textFileEntries) {
 			validateTextFile(file);
 		}
+		// Staged files were size-checked while streaming, and re-reading a gigabyte
+		// to check it again would undo the point of staging; only the count and the
+		// combined ceiling apply to them.
+		if (attachmentBytesOf(allTextFiles) > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
+		}
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 		}
@@ -592,7 +718,7 @@ export async function parseMessageRequest(
 			text: message,
 			references: fileReferences,
 		} = bindComposerMediaProjection(composerDocument, message, fileReferences, mediaMetadata));
-		validateComposerAssets(composerDocument, imageFiles, textFileEntries, mediaMetadata);
+		validateComposerAssets(composerDocument, imageFiles, allTextFiles, mediaMetadata);
 		const images: ImageRef[] = [];
 		const media: MediaRef[] = [];
 		try {
@@ -622,7 +748,7 @@ export async function parseMessageRequest(
 			message,
 			images,
 			media,
-			textFiles: textFileEntries,
+			textFiles: allTextFiles,
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
 			queueMode: modeResult.data,
@@ -802,6 +928,11 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"blacklist-dirs",
 	"cmd-whitelist",
 	"cmd-blacklist",
+	// Creating a session needs a device list and a directory browser BEFORE the
+	// narrator exists, so these cannot be keyed on a narrator id. Both authorize
+	// against the caller's own device visibility instead (`assertWorkspaceDeviceVisible`).
+	"workspace-devices",
+	"workspace-directory-browse",
 ]);
 
 /**
@@ -1297,6 +1428,161 @@ function standaloneNarratorCwd(
 	return decision.kind === "cwd" ? decision.cwd : undefined;
 }
 
+/**
+ * Which device a new session starts on.
+ *
+ * Only devices this caller can already see through the project axis (plus the OAuth
+ * allowlist) — the same list its tools are authorized against — and a remote one has to
+ * be online: creating a session on a device that cannot run anything would leave it
+ * stuck from its first tool call.
+ */
+async function resolveCreationDevice(
+	userId: string,
+	projectId: string | null | undefined,
+	requested: string,
+): Promise<string> {
+	const devices = (await resolveSessionDevices(projectId ?? null, userId)) ?? [];
+	const resolved = resolveNarratorDefaultDeviceRequest(requested, devices, { allowLocal: true });
+	return resolved ?? "local";
+}
+
+/**
+ * Validate a creation directory on a remote device.
+ *
+ * The path belongs to that machine, so it is checked in that machine's grammar and by
+ * that machine's own filesystem call — resolving it here would both misjudge a Windows
+ * path as relative and silently accept a directory that only exists on the server.
+ * There is deliberately no fallback to the device default directory: the session would
+ * then start somewhere the user did not pick.
+ */
+async function resolveRemoteCreationCwd(
+	deviceId: string,
+	requestedCwd: string | undefined,
+): Promise<string> {
+	let backend: ReturnType<typeof resolveBackend>;
+	try {
+		backend = resolveBackend({ requested: deviceId });
+	} catch {
+		throw new ValidationError(`Device is offline: ${deviceId}`);
+	}
+	const flavor = normalizeWorkspacePathFlavor(backend.pathFlavor);
+	const requested = requestedCwd?.trim();
+	if (!requested)
+		throw new ValidationError("Choose a working directory for the selected execution device");
+	if (!isAbsoluteForFlavor(requested, flavor))
+		throw new ValidationError("Working directory must be an absolute path on that device");
+	const normalized = backend.paths.normalize(requested);
+	let isDirectory = false;
+	let resolvedPath: string | undefined;
+	try {
+		const stat = await backend.statFile(normalized);
+		isDirectory = stat?.isDirectory === true;
+		resolvedPath = stat?.resolvedPath;
+	} catch (err) {
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
+	if (!isDirectory)
+		throw new ValidationError("Working directory does not exist or is not accessible");
+	return resolvedPath ?? normalized;
+}
+
+/**
+ * The caller must be able to see the device at all.
+ *
+ * An unknown id gets the same answer as an unauthorized one, so this cannot be used to
+ * enumerate device ids. Visibility is the same project-axis list (`getSessionDevices`,
+ * which already filters by project membership and private ownership) that authorizes
+ * the caller's own tool routing.
+ */
+async function assertWorkspaceDeviceVisible(
+	deviceId: string,
+	projectId: string | null,
+	userId: string,
+): Promise<NonNullable<Awaited<ReturnType<typeof resolveSessionDevices>>>[number]> {
+	const devices = (await resolveSessionDevices(projectId, userId)) ?? [];
+	const device = devices.find((entry) => entry.id === deviceId || entry.slug === deviceId);
+	if (!device) throw new ValidationError(`Unknown or unauthorized device: ${deviceId}`);
+	return device;
+}
+
+/**
+ * Devices this caller may start a session on.
+ *
+ * The creation dialog needs this list BEFORE a narrator exists, so it cannot be the
+ * per-narrator endpoint. Authorization is the caller's own device visibility; nothing
+ * here reveals a device the caller could not otherwise route tools to.
+ */
+narratorRoutes.get("/workspace-devices", async (c) => {
+	const projectId = c.req.query("projectId")?.trim() || null;
+	const devices = (await resolveSessionDevices(projectId, c.get("user").sub)) ?? [];
+	return c.json({
+		devices: devices.map((device) => ({
+			id: device.id,
+			name: device.name,
+			online: device.online,
+			platform: device.platform ? { os: device.platform.os } : undefined,
+			defaultCwd: device.defaultCwd ?? null,
+			ownedByActingUser: device.ownedByActingUser ?? false,
+			scope: device.scope,
+		})),
+	});
+});
+
+/**
+ * Browse one level of a device filesystem before the session exists.
+ *
+ * Deliberately narrower than `/:id/device-browse`: there is no narrator whose rules
+ * could anchor a non-admin caller, and `/api/devices` (arbitrary device browse) is
+ * admin-only because `allowRoots` defaults to empty. So a non-admin may only walk the
+ * subtree of the device's own declared workspace root (`defaultCwd`) — a path the
+ * creation dialog is handed anyway as `defaultCwd`, so listing inside it reveals
+ * nothing the caller could not already see. Widening that means changing the device's
+ * `defaultCwd` (or making the caller an administrator); there is intentionally no
+ * "browse anywhere" for non-admins.
+ */
+narratorRoutes.get("/workspace-directory-browse", async (c) => {
+	const deviceId = c.req.query("deviceId")?.trim();
+	if (!deviceId) throw new ValidationError("deviceId is required");
+	const parsed = deviceBrowseQuerySchema.safeParse({
+		path: c.req.query("path") || undefined,
+		showHidden: c.req.query("showHidden") === "1",
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const device = await assertWorkspaceDeviceVisible(
+		deviceId,
+		c.req.query("projectId")?.trim() || null,
+		c.get("user").sub,
+	);
+	// Admins already hold the unrestricted /api/devices browse capability, so deriving a
+	// narrower scope for them would only break the admin picker.
+	if (c.get("user").role !== "admin") {
+		// Resolve the target the way the listing itself will, then decide: a refused path
+		// never reaches the device.
+		let target: ReturnType<typeof resolveRemoteBrowseTarget>;
+		try {
+			target = resolveRemoteBrowseTarget(device.id, parsed.data.path);
+		} catch (err) {
+			throw new ValidationError(err instanceof Error ? err.message : String(err));
+		}
+		const allowed = await isRemoteDeviceBrowsePathWithinNarratorScope({
+			deviceId: device.id,
+			target,
+			defaultCwd: device.defaultCwd ?? null,
+			rules: [],
+		});
+		if (!allowed) throw new AppError(DEVICE_BROWSE_FORBIDDEN_MESSAGE, 403, "FORBIDDEN");
+	}
+	try {
+		return c.json(
+			await browseRemoteDirectory(device.id, parsed.data.path, {
+				showHidden: parsed.data.showHidden,
+			}),
+		);
+	} catch (err) {
+		throw new ValidationError(err instanceof Error ? err.message : String(err));
+	}
+});
+
 // Create narrator
 narratorRoutes.post("/", async (c) => {
 	const body = await c.req.json();
@@ -1307,7 +1593,7 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	const input = parsed.data;
+	const input = { ...parsed.data, model: normalizeAutoModelValueForSave(parsed.data.model) };
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -1325,7 +1611,16 @@ narratorRoutes.post("/", async (c) => {
 		});
 		projectDir = project?.gitPath ?? undefined;
 	}
-	const resolvedCwd = standaloneNarratorCwd(input, projectDir);
+	// The device comes first: it decides what the directory even means.
+	const deviceId = await resolveCreationDevice(
+		ownerUserId,
+		input.contextProjectId,
+		input.deviceId?.trim() || "local",
+	);
+	const resolvedCwd =
+		deviceId === "local"
+			? standaloneNarratorCwd(input, projectDir)
+			: await resolveRemoteCreationCwd(deviceId, input.cwd);
 	// Only ordinary HTTP project sessions adopt the legacy project defaults. External
 	// provisioning still uses the service's private default and frozen OAuth policy.
 	const audiences = input.contextProjectId
@@ -1345,6 +1640,7 @@ narratorRoutes.post("/", async (c) => {
 			...input,
 			...audiences,
 			cwd: resolvedCwd,
+			defaultDeviceId: deviceId === "local" ? null : deviceId,
 			ownerUserId,
 			creatorIsAdmin: user.role === "admin",
 			locale,
@@ -1356,6 +1652,7 @@ narratorRoutes.post("/", async (c) => {
 		...input,
 		...audiences,
 		cwd: resolvedCwd,
+		defaultDeviceId: deviceId === "local" ? null : deviceId,
 		ownerUserId,
 	});
 	return c.json(publicNarratorResponse(narrator), 201);
@@ -2589,6 +2886,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				dangerReflectionOverride: normalizeDangerReflectionOverride(
 					narrator.dangerReflectionOverride,
 				),
+				questionReflectionOverride: normalizeBooleanOverride(narrator.questionReflectionOverride),
 				autoContinuationOverride: normalizeAutoContinuationOverride(
 					narrator.autoContinuationOverride,
 				),
@@ -2698,6 +2996,20 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					logger.warn("Failed to clean rejected message upload", {
 						narratorId: id,
 						imageId: image.imageId,
+						error: String(error),
+					});
+				}
+			}
+			// Staged uploads are only consumed once an attachment reaches its
+			// durable location. A rejected message never got that far, so anything
+			// still staged would sit there until the TTL sweep — which for a
+			// gigabyte attachment is a long time to hold disk for a failed send.
+			for (const file of textFiles) {
+				try {
+					releaseStagedAttachment(file);
+				} catch (error) {
+					logger.warn("Failed to clean rejected staged attachment", {
+						narratorId: id,
 						error: String(error),
 					});
 				}
@@ -3054,22 +3366,28 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 			newImages.push(file);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
-			throw new ValidationError(
-				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
-			);
-		}
+		const orderedTextFiles = resolveStagedAttachments(
+			id,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
 		for (const file of textFileEntries) {
 			validateTextFile(file);
-			newTextFiles.push(file);
 		}
 		newMedia.push(...mediaFiles);
-		const attachmentBytes = [...imageFiles, ...textFileEntries, ...mediaFiles].reduce(
+		newTextFiles.push(...orderedTextFiles);
+		// Everything that arrived inside this multipart body was buffered by
+		// `req.formData()`; staged text files did not, so they are excluded here and
+		// bounded by the 2 GiB ceiling below instead.
+		const bodyBytes = [...imageFiles, ...textFileEntries, ...mediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
-		if (attachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		if (bodyBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+		}
+		if (attachmentBytesOf(newTextFiles) > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 		}
 	} else {
 		const body = editAndRegenerateJsonSchema.parse(await c.req.json());
@@ -3337,16 +3655,32 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			validateUploadedImage(file);
 			newImageFiles.push(file);
 		}
-		for (const file of formData.getAll("textFiles") as File[]) {
+		const textFileEntries = formData.getAll("textFiles") as File[];
+		const orderedTextFiles = resolveStagedAttachments(
+			id,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
+		for (const file of textFileEntries) {
 			validateTextFile(file);
-			newTextFiles.push(file);
+		}
+		newTextFiles.push(...orderedTextFiles);
+		// The multipart body (images, inline text files, media) was buffered whole by
+		// `req.formData()` and keeps the 128 MiB budget; staged text files only count
+		// toward the 2 GiB per-message ceiling.
+		const bodyBytes = [...newImageFiles, ...textFileEntries, ...newMediaFiles].reduce(
+			(total, file) => total + file.size,
+			0,
+		);
+		if (bodyBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 		}
 		const uploadBytes = [...newImageFiles, ...newTextFiles, ...newMediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
-		if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
-			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+		if (uploadBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 		}
 	} else {
 		const parsed = updateBufferedMessageSchema.safeParse(await c.req.json());
@@ -3507,6 +3841,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		});
 		if (!ok) throw new NotFoundError("Buffered message", mid);
 		committed = true;
+		// The queued row now references its own mailbox copies, so the staged
+		// originals can go. Only after the update landed: a refused edit keeps them,
+		// so the composer's retry can still claim the same uploads.
+		releaseStagedFiles(newTextFiles);
 	} finally {
 		if (!committed) {
 			for (const item of createdMedia) deleteUploadedMedia(id, item.mediaId);
@@ -4865,6 +5203,65 @@ export function isDeviceBrowsePathWithinNarratorScope(input: {
 	});
 }
 
+/**
+ * Canonical counterpart to the cheap lexical preflight above. Both are required:
+ * lexical containment rejects obvious escapes without any device RPC, while the
+ * device-resolved paths catch symlinks and Windows junctions before `fs.list`.
+ * Missing canonical support, malformed responses and unreadable roots fail closed.
+ */
+export async function isRemoteDeviceBrowsePathWithinNarratorScope(
+	input: {
+		deviceId: string;
+		target: ReturnType<typeof resolveRemoteBrowseTarget>;
+		defaultCwd: string | null;
+		rules: readonly { path: string; pathFlavor: PathFlavor; enabled: boolean }[];
+	},
+	resolvePath: (deviceId: string, path: string) => Promise<string> = resolveRemoteBrowsePath,
+): Promise<boolean> {
+	if (
+		!isDeviceBrowsePathWithinNarratorScope({
+			requestedPath: input.target.path,
+			pathFlavor: input.target.pathFlavor,
+			defaultCwd: input.defaultCwd,
+			rules: input.rules,
+		})
+	) {
+		return false;
+	}
+
+	let resolvedTarget: string;
+	try {
+		resolvedTarget = await resolvePath(input.deviceId, input.target.path);
+	} catch {
+		return false;
+	}
+	const anchors = [
+		...(input.defaultCwd?.trim() ? [input.defaultCwd.trim()] : []),
+		...input.rules
+			.filter((rule) => rule.enabled && rule.pathFlavor === input.target.pathFlavor)
+			.map((rule) => rule.path),
+	];
+	for (const anchor of anchors) {
+		try {
+			const resolvedAnchor = await resolvePath(input.deviceId, anchor);
+			if (
+				isDeviceBrowsePathWithinNarratorScope({
+					requestedPath: resolvedTarget,
+					pathFlavor: input.target.pathFlavor,
+					defaultCwd: resolvedAnchor,
+					rules: [],
+				})
+			) {
+				return true;
+			}
+		} catch {
+			// One malformed or disappearing rule must not authorize the target, but it
+			// also need not disable another independent valid root.
+		}
+	}
+	return false;
+}
+
 narratorRoutes.get("/:id/device-browse", async (c) => {
 	const narratorId = c.req.param("id");
 	const deviceId = c.req.query("deviceId");
@@ -4896,9 +5293,9 @@ narratorRoutes.get("/:id/device-browse", async (c) => {
 		const deviceRules = [...rules.directoryWhitelist, ...rules.directoryBlacklist].filter(
 			(rule) => rule.selector.kind === "device" && rule.selector.deviceId === deviceId,
 		);
-		const allowed = isDeviceBrowsePathWithinNarratorScope({
-			requestedPath: target.path,
-			pathFlavor: target.pathFlavor,
+		const allowed = await isRemoteDeviceBrowsePathWithinNarratorScope({
+			deviceId,
+			target,
 			defaultCwd: target.defaultCwd,
 			rules: deviceRules,
 		});
@@ -4976,8 +5373,9 @@ narratorRoutes.patch("/:id/model", async (c) => {
 			c.get("user").sub,
 		);
 	}
-	await narratorService.updateModel(id, parsed.data.model);
-	await updateNarratorModel(id, parsed.data.model);
+	const model = normalizeAutoModelValueForSave(parsed.data.model);
+	await narratorService.updateModel(id, model);
+	await updateNarratorModel(id, model);
 	return c.json({ ok: true });
 });
 
@@ -5081,12 +5479,31 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		columns: { id: true },
 	});
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
+	// An outline session plans in the outline (outline P2 PR 8): its plan root is made or resumed
+	// now, and the result names it instead of a plan file.
+	const { enterOutlinePlanMode } = await import("../services/outline-plan-mode");
+	const outline = await enterOutlinePlanMode({
+		narratorId: id,
+		userId,
+		input: {},
+		locale: locale as Locale,
+		toolCallId: manualToolCall.id,
+		messageId: msg.id,
+	}).catch((error: unknown) => {
+		logger.warn("Outline plan root could not be made on the plan-mode switch", {
+			narratorId: id,
+			error: String(error),
+		});
+		return null;
+	});
 	await narratorService.updateToolCallResult(
 		toolUseId,
 		{
-			output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
-				planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
-			}),
+			output:
+				outline?.output ??
+				getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
+					planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
+				}),
 			status: "success",
 			// The following message broadcast already accounts for this persisted tool state.
 			bumpMessageVersion: false,
@@ -5138,6 +5555,12 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	const message = getToolMessage("planModeCancelled", locale);
 	const cancelledPermissions = await cancelPendingExitPlanMode(id, message);
 	const planState = await exitNarratorPlanMode(id);
+	// An outline session's unapproved plan stays planning (never executed); an empty one goes
+	// (outline P2 PR 8, D48 Q3).
+	if (planState.wasPlanMode) {
+		const { cancelOutlinePlanMode } = await import("../services/outline-plan-mode");
+		await cancelOutlinePlanMode(id, userId);
+	}
 	const active = activeNarrators.get(id);
 	if (active) {
 		active._planFileId = undefined;
@@ -5257,6 +5680,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	const updates: {
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		dangerReflectionOverride?: DangerReflectionOverride;
+		questionReflectionOverride?: BooleanOverride;
 		autoContinuationOverride?: AutoContinuationOverride;
 		tasksReminderIntervalOverride?: number | null;
 	} = {};
@@ -5264,6 +5688,12 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
 			input.planReflectionAutoApproveOverride,
 			"planReflectionAutoApproveOverride",
+		);
+	}
+	if (Object.hasOwn(input, "questionReflectionOverride")) {
+		updates.questionReflectionOverride = parseBooleanOverride(
+			input.questionReflectionOverride,
+			"questionReflectionOverride",
 		);
 	}
 	if (Object.hasOwn(input, "dangerReflectionOverride")) {
@@ -5298,6 +5728,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	}
 	if (
 		!updates.planReflectionAutoApproveOverride &&
+		!updates.questionReflectionOverride &&
 		!updates.dangerReflectionOverride &&
 		!updates.autoContinuationOverride &&
 		!Object.hasOwn(updates, "tasksReminderIntervalOverride")
@@ -6074,6 +6505,26 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
 	return c.json({ ok: true });
+});
+
+/**
+ * A person's decision on an outline session's submitted plan (outline P2 PR 8, D48): return it,
+ * execute it as a draft, or lock it and execute it. The outline is written first, then the
+ * waiting ExitPlanMode is resolved, so a refused decision (403, 409) leaves it waiting.
+ */
+narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	const user = c.get("user");
+	const parsed = outlinePlanDecisionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
+	const result = await decideOutlinePlanRequest({
+		requestId,
+		principal: { userId: user.sub, isAdmin: user.role === "admin" },
+		body: parsed.data,
+	});
+	const response: OutlinePlanDecisionResponse = { ok: true, commit: result.commit };
+	return c.json(response);
 });
 
 /**

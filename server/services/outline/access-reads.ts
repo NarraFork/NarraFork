@@ -242,6 +242,14 @@ export async function readUserExists(id: string): Promise<boolean> {
 	return rows.length > 0;
 }
 
+/** The user a name names: their username, or their id; null when nobody (or two) match. */
+export async function readUserIdByName(name: string): Promise<string | null> {
+	const rows = await all(
+		sql`select id from users where username = ${name} or id = ${name} limit 2`,
+	);
+	return rows.length === 1 && rows[0] ? text(rows[0], "id") : null;
+}
+
 /** A user by exact username (the name an `@human:` assignment carries), or null. */
 export async function readUserByUsername(
 	username: string,
@@ -397,6 +405,70 @@ export async function readDisplayNames(ids: {
 		for (const row of rows) out.users.set(text(row, "id"), text(row, "username"));
 	}
 	return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reports (P2 PR 11)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A person the reports are made for, with their report settings (null: the defaults). */
+export interface DigestPersonRow {
+	id: string;
+	username: string;
+	isAdmin: boolean;
+	timeZone: string | null;
+	time: string | null;
+}
+
+function toDigestPerson(row: Row): DigestPersonRow {
+	return {
+		id: text(row, "id"),
+		username: text(row, "username"),
+		isAdmin: row.role === "admin",
+		timeZone: textOrNull(row, "outline_digest_time_zone"),
+		time: textOrNull(row, "outline_digest_time"),
+	};
+}
+
+/** People by id after `afterId`, at most `limit`, with their report settings. */
+export async function readDigestPeoplePage(
+	afterId: string | null,
+	limit: number,
+): Promise<DigestPersonRow[]> {
+	const rows = await all(sql`
+		select u.id, u.username, u.role, p.outline_digest_time_zone, p.outline_digest_time
+		from users u left join user_preferences p on p.user_id = u.id
+		where u.id > ${afterId ?? ""}
+		order by u.id
+		limit ${limit}
+	`);
+	return rows.map(toDigestPerson);
+}
+
+/** One person with their report settings, or null. */
+export async function readDigestPerson(userId: string): Promise<DigestPersonRow | null> {
+	const rows = await all(sql`
+		select u.id, u.username, u.role, p.outline_digest_time_zone, p.outline_digest_time
+		from users u left join user_preferences p on p.user_id = u.id
+		where u.id = ${userId}
+		limit 1
+	`);
+	return rows[0] ? toDigestPerson(rows[0]) : null;
+}
+
+/**
+ * People holding a grant of their own on a project (any capability, admins included), at most
+ * `limit`: with the owner, the people a project space's report concerns (Q1-A). Grants to the
+ * `user` role are not anyone's own.
+ */
+export async function readProjectGrantees(projectId: string, limit: number): Promise<string[]> {
+	const rows = await all(sql`
+		select distinct principal_id from acl_grants
+		where scope_type = 'project' and scope_id = ${projectId} and domain_kind is null
+			and principal_type = 'user'
+		limit ${limit}
+	`);
+	return rows.map((row) => text(row, "principal_id"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -459,9 +459,14 @@ export function extractDataRevision(data: unknown): string | undefined {
  */
 function diffStatsRevision(value: unknown): string {
 	if (value == null || typeof value !== "object") return "";
-	const stats = value as { added?: unknown; removed?: unknown };
+	const stats = value as { added?: unknown; removed?: unknown; done?: unknown; commit?: unknown };
 	if (typeof stats.added !== "number" || typeof stats.removed !== "number") return "";
-	return `|df:${stats.added}/${stats.removed}`;
+	// An outline edit's own figures (tasks ticked done, its commit) are painted the same way.
+	const extra =
+		typeof stats.done === "number" || typeof stats.commit === "number"
+			? `/${String(stats.done ?? "")}/${String(stats.commit ?? "")}`
+			: "";
+	return `|df:${stats.added}/${stats.removed}${extra}`;
 }
 
 /**
@@ -497,6 +502,7 @@ const PERMISSION_PREDICTION_KEYS = [
 	"isEditingPlan",
 	"planEditRows",
 	"planEdited",
+	"outlinePlanSummaryRows",
 	"hasDecisionReason",
 	"decisionReasonLines",
 	"hasPreviewLoading",
@@ -698,6 +704,17 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// but the takeover patch writes it ALONE (the card stays `running` throughout),
 	// which makes this the only key component that can move.
 	if (d.isTakenOver === true) rev += "|gw:1";
+	// The outline task the agent was sent with (P2 PR 9b): the task row is height-bearing by its
+	// presence, and its title, link and the late badge are painted from the cached payload. The
+	// conclusion patch can bring all three alone (the note arrives with the result).
+	const delegation = d.delegation as
+		| { title?: unknown; address?: unknown; late?: unknown }
+		| undefined;
+	if (delegation && typeof delegation === "object") {
+		rev += `|gtk:${typeof delegation.title === "string" ? textSignature(delegation.title) : ""}`;
+		rev += `|gta:${typeof delegation.address === "string" ? delegation.address : ""}`;
+		rev += `|gtl:${typeof delegation.late === "string" ? delegation.late : ""}`;
+	}
 	// Measured bodies: the description wraps when expanded, the prompt and result
 	// are measured up to their caps.
 	if (typeof d.description === "string") rev += `|gd:${textSignature(d.description)}`;
@@ -972,6 +989,15 @@ function leafTextRevision(d: Record<string, unknown>): string {
 				}`;
 			})
 			.join(";")}`;
+	}
+	// A change list (outline cards): one fixed line per row, so the row count above sets the
+	// height, but the rows' words, links and chips are painted from the cached payload and can
+	// change at the same count (a display landing on a live patch). Bounded: at most 24 short rows.
+	if (d.kind === "change-rows") {
+		rev += `|chg:${textSignature(JSON.stringify(d.rows ?? []))}`;
+		const toggle = d.toggle as { open?: unknown; label?: unknown } | undefined;
+		if (toggle)
+			rev += `|tgl:${toggle.open === true ? 1 : 0}:${textSignature(String(toggle.label ?? ""))}`;
 	}
 	for (const key of [
 		"id",

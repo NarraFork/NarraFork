@@ -1,19 +1,13 @@
-import {
-	Alert,
-	Button,
-	Group,
-	Loader,
-	Pagination,
-	SegmentedControl,
-	Stack,
-	Text,
-	Title,
-} from "@mantine/core";
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
+import { Alert, Button, Group, Loader, Pagination, Stack, Tabs, Text } from "@mantine/core";
+import { IconArrowRight } from "@tabler/icons-react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { EntityResultCard } from "../components/search/EntityResultCard";
+import classes from "../components/search/Search.module.css";
 import { SearchFilterBar, type SearchFilterState } from "../components/search/SearchFilterBar";
+import { SearchQueryBox } from "../components/search/SearchQueryBox";
 import { SessionResultCard } from "../components/search/SessionResultCard";
 import {
 	SEARCH_PAGE_LIMIT,
@@ -110,22 +104,32 @@ function Overview({
 }) {
 	const { t } = useTranslation("search");
 	const visible = SEARCH_SECTION_ORDER.filter((name) => (sections[name]?.items.length ?? 0) > 0);
-	if (visible.length === 0) return <Text c="dimmed">{t("noResults")}</Text>;
+	if (visible.length === 0)
+		return (
+			<Text c="dimmed" size="sm" ta="center" mt="xl">
+				{t("noResults")}
+			</Text>
+		);
 	return (
-		<Stack gap="lg">
+		<Stack gap="xl">
 			{visible.map((name) => {
 				const page = sections[name] as SearchSectionPage<SessionSearchResult | EntitySearchResult>;
 				return (
 					<Stack key={name} gap="xs">
 						<Group justify="space-between" align="center">
-							<Title order={4}>
+							<Text fw={600}>
 								{t(`section_${name}`)}{" "}
 								<Text span c="dimmed" fw={400}>
 									{formatSearchTotal(page)}
 								</Text>
-							</Title>
+							</Text>
 							{page.nextCursor && (
-								<Button size="compact-sm" variant="subtle" onClick={() => onOpen(name)}>
+								<Button
+									size="compact-sm"
+									variant="subtle"
+									rightSection={<IconArrowRight size={14} />}
+									onClick={() => onOpen(name)}
+								>
 									{t("viewAll", { count: formatSearchTotal(page) })}
 								</Button>
 							)}
@@ -157,11 +161,16 @@ function SectionList({
 	const query = useSearchSection(request, section, page, true);
 	const data = query.data;
 	const items = (data?.items ?? []) as Array<SessionSearchResult | EntitySearchResult>;
-	if (query.isLoading) return <Loader />;
-	if (items.length === 0 && page === 1) return <Text c="dimmed">{t("noResults")}</Text>;
+	if (query.isLoading) return <Loader size="sm" mx="auto" mt="lg" />;
+	if (items.length === 0 && page === 1)
+		return (
+			<Text c="dimmed" size="sm" ta="center" mt="xl">
+				{t("noResults")}
+			</Text>
+		);
 	const pages = Math.max(page, searchPageCount(data, SEARCH_PAGE_LIMIT));
 	return (
-		<Stack ref={top} style={{ opacity: query.isPlaceholderData ? 0.6 : 1 }}>
+		<Stack ref={top} gap="xs" style={{ opacity: query.isPlaceholderData ? 0.6 : 1 }}>
 			{items.map((result) => (
 				<ResultCard key={`${result.type}-${result.id}`} result={result} request={request} />
 			))}
@@ -248,42 +257,63 @@ function SearchPage() {
 	const searchFullHistory = () =>
 		navigate({ search: (prev) => ({ ...prev, history: "all", page: undefined }), replace: true });
 
-	const tabLabel = (name: SearchSectionName) =>
-		t(`tab_${name}`, { count: formatSearchTotal(sections[name]) });
+	const submitQuery = (q: string) =>
+		navigate({
+			search: (prev) => ({ ...prev, q: q || undefined, page: undefined, history: undefined }),
+			replace: true,
+		});
 
 	return (
-		<Stack>
-			<Title order={2}>{t("title")}</Title>
-			{request.q ? (
-				<Text c="dimmed" size="sm">
-					{t("resultsFor", { query: request.q })}
+		<Stack gap="md" className={classes.page}>
+			<Group gap="xs" wrap="nowrap">
+				<MobileNavButton />
+				<SearchQueryBox key={params.q ?? ""} initial={params.q ?? ""} onSubmit={submitQuery} />
+			</Group>
+
+			{!request.q ? (
+				<Text c="dimmed" size="sm" ta="center" mt="xl">
+					{t("enterQuery")}
 				</Text>
 			) : (
-				<Text c="dimmed">{t("enterQuery")}</Text>
-			)}
-
-			{request.q && (
 				<>
-					<SearchFilterBar state={filters} onChange={setFilters} />
-					<SegmentedControl
-						size="xs"
-						value={tab}
-						onChange={(value) => openTab(normalizeSearchTab(value))}
-						data={[
-							{ value: "all", label: t("tab_all") },
-							...SEARCH_SECTION_ORDER.map((name) => ({ value: name, label: tabLabel(name) })),
-						]}
-						style={{ alignSelf: "flex-start" }}
-					/>
+					<div className={classes.toolbar}>
+						<Tabs
+							value={tab}
+							onChange={(value) => openTab(normalizeSearchTab(value))}
+							className={classes.tabs}
+						>
+							<Tabs.List>
+								<Tabs.Tab value="all">{t("tab_all")}</Tabs.Tab>
+								{SEARCH_SECTION_ORDER.map((name) => (
+									<Tabs.Tab
+										key={name}
+										value={name}
+										rightSection={
+											sections[name] ? (
+												<Text size="xs" c="dimmed">
+													{formatSearchTotal(sections[name])}
+												</Text>
+											) : undefined
+										}
+									>
+										{t(`section_${name}`)}
+									</Tabs.Tab>
+								))}
+							</Tabs.List>
+						</Tabs>
+						<div className={classes.filters}>
+							<SearchFilterBar state={filters} onChange={setFilters} />
+						</div>
+					</div>
 					{recentDays && (
-						<Alert color="blue" variant="light" p="xs">
-							<Group gap="xs" justify="space-between" wrap="wrap">
-								<Text size="sm">{t("recentOnly", { days: recentDays })}</Text>
-								<Button size="compact-sm" variant="light" onClick={searchFullHistory}>
-									{t("searchFullHistory")}
-								</Button>
-							</Group>
-						</Alert>
+						<Group gap="xs" wrap="nowrap">
+							<Text size="sm" c="dimmed">
+								{t("recentOnly", { days: recentDays })}
+							</Text>
+							<Button size="compact-sm" variant="subtle" onClick={searchFullHistory}>
+								{t("searchFullHistory")}
+							</Button>
+						</Group>
 					)}
 					{tab === "all" ? (
 						overview.isError ? (
@@ -301,7 +331,7 @@ function SearchPage() {
 								</Group>
 							</Alert>
 						) : overview.isLoading ? (
-							<Loader />
+							<Loader size="sm" mx="auto" mt="lg" />
 						) : (
 							<div
 								aria-busy={overview.isPlaceholderData}

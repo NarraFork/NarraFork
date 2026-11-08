@@ -102,6 +102,30 @@ export const outlinePendingRejectBodySchema = z.object({
 	reason: z.string().trim().max(OUTLINE_PENDING_API_LIMITS.maxReasonChars).nullable().optional(),
 });
 
+/** Answering questions put to the person (`POST /questions/answer`, outline P2 PR 7). */
+export const outlineAnswerBodySchema = z.object({
+	answers: z
+		.array(
+			z
+				.object({
+					blockId: outlineIdSchema,
+					option: z.number().int().min(1).max(100).optional(),
+					text: z.string().max(16_384).optional(),
+					adopt: z.boolean().optional(),
+					// The version the person read: required, so every caller gets the stale check (S3).
+					versionSeq: z.number().int().min(1),
+				})
+				.strict(),
+		)
+		.min(1)
+		.max(50),
+});
+
+/** Acknowledging confirmations agents made on the person's behalf (`POST /digest/seen`). */
+export const outlineDigestSeenBodySchema = z.object({
+	pendingIds: z.array(outlineIdSchema).min(1).max(50),
+});
+
 // ── Task board (outline P2 PR 5) ──────────────────────────────────────────────
 
 /** A project board's next page of spaces. */
@@ -142,3 +166,32 @@ export const outlineBoardTaskUpdateBodySchema = z
 	.refine((body) => body.status !== undefined || body.assign !== undefined, {
 		message: "nothing to change",
 	});
+
+/** The reader saw these tasks marked 「新完成」 on a board (outline P2 PR 9b). */
+export const outlineBoardSeenBodySchema = z.object({
+	tasks: z
+		.array(
+			z.object({
+				id: outlineIdSchema,
+				versionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+			}),
+		)
+		.min(1)
+		.max(OUTLINE_TASK_BOARD_LIMITS.seenPerRequest),
+});
+
+/** A plan's diff (outline P2 PR 8): compared from `from` (a seq; 0 is nothing) to now. */
+export const outlinePlanDiffQuerySchema = z.object({
+	from: seqSchema,
+});
+
+/** A person's decision on a submitted plan (`POST /narrators/permissions/:id/plan`). */
+export const outlinePlanDecisionSchema = z
+	.object({
+		action: z.enum(["return", "draft", "lock"]),
+		feedback: z.string().max(4000).optional(),
+		delegate: outlineIdSchema.nullable().optional(),
+		seenSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		compactAfter: z.boolean().optional(),
+	})
+	.strict();

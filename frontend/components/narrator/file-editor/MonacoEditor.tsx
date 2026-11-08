@@ -39,6 +39,12 @@ export interface MonacoEditorHandle {
 	undo(): void;
 	redo(): void;
 	focus(): void;
+	/**
+	 * Drop a navigation reveal still waiting for the view to become visible. A host
+	 * that restores its own reading position (e.g. returning from a rendered preview
+	 * that already showed the target) must not be overridden by the stale reveal.
+	 */
+	cancelReveal(): void;
 }
 export interface MonacoDocumentStatus extends MonacoLanguageStatus {
 	revision: number;
@@ -81,6 +87,7 @@ interface Runtime {
 	view: editor.IStandaloneCodeEditor;
 	model: editor.ITextModel;
 	sync(): void;
+	cancelReveal(): void;
 }
 
 /** Resolve Mantine variables to actual CSS colours, which Monaco's theme parser requires. */
@@ -155,6 +162,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			}
 		},
 		focus: () => runtime.current?.view.focus(),
+		cancelReveal: () => runtime.current?.cancelReveal(),
 	}).current;
 	useImperativeHandle(ref, () => handle, [handle]);
 
@@ -485,7 +493,15 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				if (!externalModel) model.dispose();
 				readyCallback?.(null);
 			};
-			runtime.current = { api, view, model, sync };
+			runtime.current = {
+				api,
+				view,
+				model,
+				sync,
+				cancelReveal: () => {
+					pendingReveal = null;
+				},
+			};
 			readyCallback?.(handle);
 			emit();
 			sync();

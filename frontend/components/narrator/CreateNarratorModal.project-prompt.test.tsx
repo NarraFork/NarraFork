@@ -105,6 +105,8 @@ mock.module("@tanstack/react-query", () => ({
 	useQuery: (options: { queryKey: unknown[] }) =>
 		options.queryKey[0] === "project-prompt" ? promptQuery : { data: { agent: {} } },
 	useQueryClient: () => ({ invalidateQueries: mock(() => {}), setQueryData: mock(() => {}) }),
+	// The dialog's device list lives next to the workspace-context mutations.
+	useMutation: () => ({ mutate: mock(() => {}), reset: mock(() => {}), isPending: false }),
 }));
 mock.module("../../hooks/useModels", () => ({ useAllModels: () => ({ groupedModels: [] }) }));
 mock.module("../../hooks/useProjectDirStatus", () => ({
@@ -149,6 +151,9 @@ mock.module("../../lib/api", () => ({
 		getProjectPrompt: () => promptQuery,
 		saveProjectPrompt,
 	},
+	// The dialog reads its device list through the workspace-context hook, which pulls in
+	// the narrator socket manager; that module needs the session accessor at import time.
+	getToken: () => null,
 }));
 mock.module("../common/DirectoryPicker", () => ({
 	DirectoryPicker: () => <div data-part="directory-picker" />,

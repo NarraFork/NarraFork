@@ -242,29 +242,13 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 	});
 
 	test("declared output limits clip large requests without raising small requests", async () => {
-		const { bindModelCatalogSettings, getModelCardSnapshot, mutateModelCard } = await import(
-			"../../model-catalog"
-		);
-		const { settings, saveSettings } = await import("../../settings");
+		const { replaceModelOverridesForTests } = await import("../../model-catalog");
 		const bodies: Array<Record<string, unknown>> = [];
-		const local = {
-			agent: {
-				modelCatalog: {
-					schemaVersion: 2,
-					migrationVersion: 2,
-					local: { revision: 0 },
-					autoApply: false,
-					pinnedVersion: null,
-				},
-			},
-		};
-		bindModelCatalogSettings(local as typeof settings, () => {});
+		// An entry the catalog does not know, with its own declared output ceiling.
+		const restore = replaceModelOverridesForTests({
+			connections: { "anthropic:output-fixture": { maxOutputTokens: 64_000 } },
+		});
 		try {
-			mutateModelCard({
-				baseRevision: getModelCardSnapshot().local.revision,
-				action: "upsert-model",
-				model: { id: "output-fixture", metadata: { max_output_tokens: 64_000 } },
-			});
 			setOutboundFetchOverrideForTest(async (_input, init) => {
 				bodies.push(JSON.parse(String(init?.body)));
 				return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), {
@@ -282,7 +266,7 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 			}
 			expect(bodies.map((body) => body.max_tokens)).toEqual([4_096, 64_000, 1_024]);
 		} finally {
-			bindModelCatalogSettings(settings, () => saveSettings(settings));
+			restore();
 		}
 	});
 

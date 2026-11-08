@@ -22,6 +22,8 @@ export interface TurnUsageJson {
 	cache_creation_5m_tokens?: number;
 	cache_creation_1h_tokens?: number;
 	reasoning_tokens?: number;
+	/** This request's first content → end, in ms (output-speed denominator). */
+	decode_ms?: number;
 	[key: string]: unknown;
 }
 
@@ -98,6 +100,40 @@ export function formatTurnUsageParts(
 	return parts;
 }
 
+/**
+ * Output tokens per second over a request's decode window, or null when either side
+ * is missing. Decode time starts at the first content token, so queueing and prefill
+ * (TTFT) do not dilute the figure.
+ */
+export function outputTokensPerSecond(
+	outputTokens: number | null | undefined,
+	decodeMs: number | null | undefined,
+): number | null {
+	if (typeof outputTokens !== "number" || !Number.isFinite(outputTokens) || outputTokens <= 0)
+		return null;
+	if (typeof decodeMs !== "number" || !Number.isFinite(decodeMs) || decodeMs <= 0) return null;
+	return outputTokens / (decodeMs / 1000);
+}
+
+/** `42 tok/s` (whole numbers from 10 up, one decimal below). */
+export function formatTokensPerSecond(tokensPerSecond: number): string {
+	const clamped = Math.max(0, tokensPerSecond);
+	const value = clamped >= 10 ? Math.round(clamped) : Math.round(clamped * 10) / 10;
+	return `${value} tok/s`;
+}
+
+/** The turn's output-speed part, or null when its request did not time its decode. */
+export function formatTurnOutputSpeed(
+	turnUsageJson: TurnUsageJson | null | undefined,
+): string | null {
+	if (!turnUsageJson) return null;
+	const speed = outputTokensPerSecond(
+		usageNumberOrNull(turnUsageJson.output_tokens),
+		usageNumberOrNull(turnUsageJson.decode_ms),
+	);
+	return speed == null ? null : formatTokensPerSecond(speed);
+}
+
 /** Cost string (`$0.1234`) when a positive cost was recorded, else null. */
 export function formatTurnUsageCost(costUsd: number | null | undefined): string | null {
 	return typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd > 0
@@ -152,6 +188,9 @@ export function resolveTurnUsageLines(
 	const credits = formatMeterUsage(message.meterUsage);
 	const parts = formatTurnUsageParts(message.turnUsageJson, formatNumber);
 	const cost = formatTurnUsageCost(message.costUsd);
+	const speed = formatTurnOutputSpeed(message.turnUsageJson);
+	// Speed rides after the cost: it describes the request, not its billing buckets.
+	const tail = [cost, speed].filter((part): part is string => part != null);
 
 	const leading =
 		isAssistant && footprint != null
@@ -167,11 +206,10 @@ export function resolveTurnUsageLines(
 	if (parts != null) {
 		if (options.mobile) {
 			trailing = parts.slice(0, 3).join(" · ");
-			const rest = parts.slice(3);
-			if (cost != null) rest.push(cost);
+			const rest = [...parts.slice(3), ...tail];
 			trailingSecondary = rest.length > 0 ? rest.join(" · ") : null;
 		} else {
-			trailing = cost != null ? `${parts.join(" · ")} · ${cost}` : parts.join(" · ");
+			trailing = [...parts, ...tail].join(" · ");
 		}
 	} else if (credits != null && footprint == null) {
 		trailing = credits;

@@ -18,6 +18,12 @@ const REASONING_EFFORT_DESCRIPTION =
 	"If the selected model/provider does not support configurable thinking intensity, this option is ignored. " +
 	"A fixed reasoning effort configured in the matching model pool overrides this parameter.";
 
+const TASK_DESCRIPTION =
+	"An outline task to hand to this agent, in a session whose tasks live in the outline: its address (an id, key/id, an alias or its title). " +
+	"The agent's instructions are written from the task's tree, so prompt may be left out; when given, it is added as further instructions. " +
+	"While the agent works the task is its own; its report is attached under the task when it finishes, and the task comes back to you, still in progress. " +
+	"Not available in other sessions.";
+
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
 
@@ -36,7 +42,8 @@ function filterSubagentModels(models: string[]): string[] {
 }
 
 const MODEL_PARAM_BASE =
-	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects its first entry and pins the child independently. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Explicit models must also be allowed by the pool.";
+	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects its first entry and pins the child independently. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Explicit models must also be allowed by the pool. " +
+	"`<provider>:<model>` pins that provider; `auto:<model>` lets NarraFork choose any provider that serves the model.";
 
 /** Dynamic prompt context only; never used to construct tool definitions. */
 export function buildSubagentModelContext(
@@ -139,6 +146,7 @@ function buildParameters() {
 				.string()
 				.optional()
 				.describe("The task for the agent to perform (required when launching a new agent)"),
+			task: z.string().optional().describe(TASK_DESCRIPTION),
 			alias: z
 				.string()
 				.optional()
@@ -234,6 +242,10 @@ function buildRawJsonSchema(): Record<string, unknown> {
 				description: "The task for the agent to perform (required when launching a new agent)",
 				type: "string",
 			},
+			task: {
+				description: TASK_DESCRIPTION,
+				type: "string",
+			},
 		},
 		required: [] as string[],
 		additionalProperties: false,
@@ -285,6 +297,7 @@ export const agentTool: ToolDefinition = {
 			alias?: string;
 			archive?: string;
 			unarchive?: string;
+			task?: string;
 			// Legacy parameter name (pre-rename compat)
 			background?: boolean;
 		};
@@ -410,7 +423,8 @@ export const agentTool: ToolDefinition = {
 			}
 		}
 
-		const { prompt, description, subagent_type, model, reasoning_effort, workdir, alias } = raw;
+		const { subagent_type, model, reasoning_effort, workdir, alias } = raw;
+		let { prompt, description } = raw;
 		// Normalize timeout leniently: floats/strings/negatives → sane non-negative int
 		// (0 = no wall-clock limit).
 		const timeout = normalizeNumber(raw.timeout, { min: 0, max: Number.MAX_SAFE_INTEGER });
@@ -439,6 +453,39 @@ export const agentTool: ToolDefinition = {
 		// Lazy import to avoid circular dependency at module load time
 		const { runSubagent } = await import("@server/services/narrator-subagent");
 
+		// An outline task (outline P2 PR 9a): checked and written into the agent's instructions
+		// before anything is created; the caller's prompt is added to them.
+		let delegation:
+			| import("@server/services/outline/delegation").PreparedOutlineDelegation
+			| undefined;
+		if (raw.task !== undefined) {
+			const { OutlineDelegationError, prepareOutlineDelegation } = await import(
+				"@server/services/outline/delegation"
+			);
+			try {
+				delegation = await prepareOutlineDelegation({
+					narratorId: ctx.narratorId,
+					userId: ctx.userId ?? null,
+					task: raw.task,
+					prompt,
+					takeoverByUser: raw.takeover_by_user === true,
+					readOnlyCeiling:
+						ctx.runtimePolicy?.tools.readOnly === true ||
+						ctx.runtimePolicy?.readOnlyGitShell === true,
+				});
+			} catch (err) {
+				return {
+					output:
+						err instanceof OutlineDelegationError
+							? err.message
+							: `Subagent error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+			prompt = delegation.brief;
+			description ||= delegation.title;
+		}
+
 		if (!prompt) {
 			return {
 				output: "Missing required parameter: prompt (the task for the agent to perform)",
@@ -446,6 +493,9 @@ export const agentTool: ToolDefinition = {
 			};
 		}
 
+		// What the call carries for its card (outline P2 PR 9b): the task, and the head of the note
+		// its result was delivered with, as data no projection of the text can cut.
+		let delivered: import("@shared/outline-report-note").OutlineReportNote | null = null;
 		try {
 			const result = await runSubagent({
 				parentNarratorId: ctx.narratorId,
@@ -467,13 +517,33 @@ export const agentTool: ToolDefinition = {
 				// The subagent acts on behalf of whoever triggered this parent turn:
 				// knowledge ACL and fast-mode "inherit" both resolve against them.
 				userId: ctx.userId ?? null,
+				...(delegation
+					? {
+							delegation,
+							onDelegatedResult: (note) => {
+								delivered = note;
+							},
+						}
+					: {}),
 			});
 
 			// The runner already writes the alias into the `<subagent_id>` /
 			// `<background_task_id>` tag and registers it, so no string surgery is
 			// needed here. Conflicts are reported by the runner too.
-			return { output: result };
+			if (!delegation) return { output: result };
+			const { OUTLINE_DELEGATION_METADATA_KEY, outlineDelegationMetadata } = await import(
+				"@shared/outline-report-note"
+			);
+			return {
+				output: result,
+				metadata: {
+					[OUTLINE_DELEGATION_METADATA_KEY]: outlineDelegationMetadata(delegation, delivered),
+				},
+			};
 		} catch (err) {
+			// A delegation refused once the agent existed (the task changed hands) says so itself.
+			if (delegation && err instanceof Error && err.name === "OutlineDelegationError")
+				return { output: err.message, isError: true };
 			return {
 				output: `Subagent error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,

@@ -260,6 +260,7 @@ export async function buildPendingPut(args: {
 		decisionCommitId: null,
 		reason: null,
 		reportedAt: null,
+		digestSeenAt: null,
 	};
 	return {
 		put: { row, expectRev: existing ? existing.rev : null },

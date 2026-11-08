@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 135 tables and 1787 columns including durable reply context", () => {
-		expect(target.tables.length).toBe(135);
+	test("covers 139 tables and 1850 columns including the outline tables and reply context", () => {
+		expect(target.tables.length).toBe(139);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -549,7 +549,18 @@ describe("real schema parity", () => {
 		// The outline task source (P2) adds narrators.task_backend.
 		// Locks and pending confirmation (P2) add outline_pending (25).
 		// Durable reply language adds narrators.reply_context without a NOT NULL constraint.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1787);
+		// Questions and the inbox (P2) add outline_questions (12), ask_json on outline_blocks and
+		// outline_block_versions, and outline_pending.digest_seen_at.
+		// Output-speed timing adds api_requests.decode_ms (1).
+		// The line-height rescale adds user_preferences.narrator_line_height_v2_percent (nullable).
+		// Sidebar folders add four user_recent_tabs columns and user_recent_tabs_meta.folders_migrated.
+		// Reports (outline P2 PR 11) add outline_digests (14), outline_spaces.last_commit_at and the
+		// two user_preferences report settings (time zone and time, both nullable).
+		// The board's 「新完成」 (outline P2 PR 9b) adds outline_task_seen (4).
+		// Per-narrator question reflection adds narrators.question_reflection_override.
+		// Submission outcome read receipts add knowledge_submissions.author_read_at (nullable).
+		// Per-executor working directories add narrators.workspace_directories (1).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1850);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

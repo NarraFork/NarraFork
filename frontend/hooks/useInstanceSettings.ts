@@ -46,6 +46,8 @@ export interface InstanceSettingsState {
 	tlsKeyFile: string;
 	tlsPassphrase: string;
 	tlsCaFile: string;
+	// Credential files (codex-credentials.json …) encrypted at rest
+	encryptSecrets: boolean;
 	// Update
 	updateSource: UpdateSource;
 	updateGithubRepository: string;
@@ -230,6 +232,7 @@ function makeDefaults(): InstanceSettingsState {
 		tlsKeyFile: "",
 		tlsPassphrase: "",
 		tlsCaFile: "",
+		encryptSecrets: true,
 		updateSource: "github",
 		updateGithubRepository: DEFAULT_GITHUB_REPOSITORY,
 		updateServerUrl: "",
@@ -333,6 +336,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				tlsKeyFile: settings.server?.tls?.keyFile ?? "",
 				tlsPassphrase: "",
 				tlsCaFile: settings.server?.tls?.caFile ?? "",
+				encryptSecrets: settings.secrets?.encrypt !== false,
 				updateSource: settings.update?.source ?? "github",
 				updateGithubRepository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 				updateServerUrl: settings.update?.serverUrl ?? "",
@@ -450,6 +454,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					},
 				},
 				paths: { defaultProjectDir: state.projectDir },
+				secrets: { encrypt: state.encryptSecrets },
 				branding: {
 					// "" is meaningful for both fields ("clear it"), so they are always
 					// sent. Omitting a key would be read as "leave unchanged" by the

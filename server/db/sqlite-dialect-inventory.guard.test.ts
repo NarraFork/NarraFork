@@ -507,6 +507,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"rowid",
 		"insertOr",
 		"errorCode",
+		// Session model remap filters the imported ids with json_each over a JSON parameter.
+		"json1",
 	],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
@@ -585,6 +587,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"rowid",
 	],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
+	// The startup migrations run on both backends: SQLite column types and the synchronous
+	// Drizzle handle are used only in the SQLite branch; PostgreSQL goes through BunSQLDatabase.
+	"server/services/migration-db.ts": ["drizzleDialect"],
+	// Same two-backend shape as migration-db.ts: dialect-bound column types in the plan phase.
+	"server/services/aggregation-migration-service.ts": ["drizzleDialect"],
+	"server/services/provider-prefix-migration-service.ts": ["drizzleDialect"],
+	// The usage ledger is fed from the api_requests rowid cursor after an import; the SQLite
+	// driver type is the function's parameter type.
+	"server/services/usage-daily.ts": ["driver", "rowid", "blobFn"],
 	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
 	"server/services/narrator-block-backfill.ts": [
 		"handle",
@@ -627,6 +638,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
 	"server/services/outline/store/sqlite-store.ts": ["json1"],
 	"server/services/parent-injection-queue.ts": ["json1"],
+	// SQLite-gated project indexing uses connection change counters only to invalidate
+	// per-pass caches; a PostgreSQL implementation must provide its own revision signal.
+	"server/services/project-index.ts": ["handle", "sessionFn"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",

@@ -1,5 +1,6 @@
 import { parseCompactMessageBlock } from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
+import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
@@ -74,6 +75,7 @@ import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings"
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { ModelSourceRow } from "./agent-runtime/model-history-query";
 import {
 	type LoadModelHistoryOptions,
 	loadModelHistorySource,
@@ -1991,8 +1993,16 @@ const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 /**
  * Tool names whose inputJson should not be truncated. OutlineEdit's input is the markdown it
  * writes, bounded by the tool (200 edits, 256 KiB of text), and its card renders it whole.
+ * GenUI `render` carries the UI itself in `source` (schema-capped at 12K chars): a truncated
+ * leaf is not markup, so the finished card would drop the UI and show the model-facing output.
  */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set([
+	"Agent",
+	"Task",
+	"Send",
+	OUTLINE_EDIT_TOOL,
+	GEN_UI_TOOL_NAME,
+]);
 
 const SPEC_TASKS_URI = "spec://tasks.json";
 
@@ -3635,7 +3645,7 @@ const narratorMessageQueriesUnlocked = {
 		narratorId: string,
 		limit?: number,
 		options: Omit<LoadModelHistoryOptions, "limit"> = {},
-	) {
+	): Promise<readonly ModelSourceRow[]> {
 		const postgres = modelHistoryDatabase.postgresRuntime;
 		if (
 			modelHistoryDatabase.activeDatabaseBackend === "postgres" &&

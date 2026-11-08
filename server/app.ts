@@ -28,6 +28,7 @@ import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
 import { commandCodeRoutes } from "./routes/commandcode";
 import { containerRoutes } from "./routes/containers";
+import { credentialTransferRoutes } from "./routes/credential-transfer";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
 import { deepseekRoutes } from "./routes/deepseek";
@@ -53,6 +54,7 @@ import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { narratorAttachmentRoutes } from "./routes/narrator-attachments";
 import { narratorTimelineRoutes } from "./routes/narrator-timeline";
 import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
@@ -72,6 +74,7 @@ import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
+import { providerKeyRoutes } from "./routes/provider-keys";
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
@@ -356,8 +359,8 @@ app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
 // Claimed by the `narrafork://` protocol client, which has no session: the one-time token is the
 // credential (see lib/reveal-protocol.ts).
 app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
-	const path = claimRevealToken(c.req.param("token"));
-	return path ? c.json({ path }) : c.json({ error: "Unknown or expired reveal token" }, 404);
+	const target = claimRevealToken(c.req.param("token"));
+	return target ? c.json(target) : c.json({ error: "Unknown or expired reveal token" }, 404);
 });
 
 // 管理器面板的更新与停止：凭本机回环 + 进程令牌，因此必须注册在全局会话认证之前。
@@ -441,6 +444,10 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
 app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
+// Streaming attachment staging. Deliberately outside /api/narrators: the narrator
+// router's body limit and work-admission middleware describe buffered request
+// bodies and narrator work, neither of which an upload is.
+app.route("/api/narrator-attachments", narratorAttachmentRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);
 // Project/user trait layers. Narrator-level traits live under /api/narrators.
@@ -461,6 +468,8 @@ app.route("/api/provider-import", providerImportRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/credential-transfer", credentialTransferRoutes);
+app.route("/api/provider-keys", providerKeyRoutes);
 app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);

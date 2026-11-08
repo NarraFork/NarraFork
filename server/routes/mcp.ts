@@ -10,7 +10,6 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { generateShortId } from "../lib/id";
 import { mcpManager, projectMcpServerConfig } from "../lib/mcp/manager";
-import { syncMcpTools } from "../lib/mcp/tool-bridge";
 import { type McpServerConfig, saveSettings, settings } from "../lib/settings";
 import { requireAdmin } from "../middleware/auth";
 import { narratorContext } from "../services/narrator-context";
@@ -215,7 +214,6 @@ mcpRoutes.post("/servers", requireAdmin, async (c) => {
 
 	if (config.enabled) {
 		await mcpManager.connect(config);
-		syncMcpTools();
 	}
 
 	return c.json(projectMcpServerConfig(config), 201);
@@ -241,7 +239,6 @@ mcpRoutes.patch("/servers/:id", requireAdmin, async (c) => {
 	saveSettings(settings);
 
 	await mcpManager.reload();
-	syncMcpTools();
 
 	return c.json(projectMcpServerConfig(updated));
 });
@@ -253,11 +250,10 @@ mcpRoutes.delete("/servers/:id", requireAdmin, async (c) => {
 	const idx = servers.findIndex((s) => s.id === id);
 	if (idx === -1) return c.json({ error: "Not found" }, 404);
 
-	await mcpManager.disconnect(id);
 	servers.splice(idx, 1);
 	settings.mcpServers = servers;
 	saveSettings(settings);
-	syncMcpTools();
+	await mcpManager.disconnect(id);
 
 	return c.json({ ok: true });
 });
@@ -289,7 +285,6 @@ mcpRoutes.post("/servers/:id/connect", requireAdmin, async (c) => {
 	// through status/error. Reverting would silently discard that request and
 	// stop future startups from retrying.
 	await mcpManager.connect(config);
-	syncMcpTools();
 
 	const statuses = mcpManager.getServerStatuses();
 	const status = statuses.find((s) => s.id === id);
@@ -312,7 +307,6 @@ mcpRoutes.post("/servers/:id/disconnect", requireAdmin, async (c) => {
 	}
 
 	await mcpManager.disconnect(id);
-	syncMcpTools();
 
 	const statuses = mcpManager.getServerStatuses();
 	const status = statuses.find((s) => s.id === id);
@@ -333,7 +327,6 @@ mcpRoutes.post("/servers/:id/refresh", requireAdmin, async (c) => {
 	if (!config) return c.json({ error: "Not found" }, 404);
 
 	const result = await mcpManager.refresh(id);
-	syncMcpTools();
 
 	const status = mcpManager.getServerStatuses().find((s) => s.id === id);
 	if (!result.ok) {
@@ -357,7 +350,6 @@ mcpRoutes.post("/servers/:id/refresh", requireAdmin, async (c) => {
 /** Re-fetch tool lists of every enabled MCP server. */
 mcpRoutes.post("/servers/refresh", requireAdmin, async (c) => {
 	const results = await mcpManager.refreshAll();
-	syncMcpTools();
 	const failed = results.filter((r) => !r.ok);
 	return c.json({
 		ok: failed.length === 0,
@@ -529,7 +521,6 @@ mcpRoutes.post("/servers/import", requireAdmin, async (c) => {
 				await mcpManager.connect(cfg);
 			}
 		}
-		syncMcpTools();
 	}
 
 	return c.json({ added: added.length, skipped });

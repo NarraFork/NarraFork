@@ -6,6 +6,7 @@ import type {
 } from "@frontend/lib/api/narrators";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import type { PendingPermission } from "@frontend/types/narrator";
+import { notifications } from "@mantine/notifications";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import { notifyManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import i18next from "i18next";
@@ -230,6 +231,73 @@ afterEach(async () => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 	originals.clear();
+});
+
+describe("upstream timed wait notifications with the real WS hook", () => {
+	test.each([
+		["capacity", "capacity"],
+		["rate_limit", "rateLimit"],
+		["quota", "quotaExhausted"],
+	] as const)("%s keeps the wait reason through waiting and recovery", async (waitKind, prefix) => {
+		const show = spyOn(notifications, "show").mockReturnValue("notice");
+		const hide = spyOn(notifications, "hide").mockImplementation((id) => id);
+		restores.push(
+			() => show.mockRestore(),
+			() => hide.mockRestore(),
+		);
+		await render();
+		await event({
+			type: "model_unavailable_waiting",
+			waitKind,
+			model: "ocg:test",
+			quotaProvider: "opencode",
+			resumeAt: 123456,
+		});
+		expect(show.mock.calls.at(-1)?.[0]).toMatchObject({
+			title: `${prefix}WaitingTitle`,
+			autoClose: false,
+		});
+		expect(current.quotaWaitInfo).toMatchObject({ waitKind, resumeAt: 123456 });
+		await event({
+			type: "model_unavailable_recovered",
+			waitKind,
+			model: "ocg:test",
+			quotaProvider: "opencode",
+		});
+		expect(show.mock.calls.at(-1)?.[0]).toMatchObject({ title: `${prefix}RecoveredTitle` });
+		expect(current.quotaWaitInfo).toBeNull();
+		await event({
+			type: "model_unavailable_waiting",
+			waitKind,
+			model: "ocg:test",
+			resumeAt: 123456,
+		});
+		await event({ type: "status_change", status: "idle", substatus: ["error"] });
+		expect(current.quotaWaitInfo).toBeNull();
+		expect(hide).toHaveBeenCalledWith("model-unavailable-n1");
+	});
+
+	test("old quota/rateLimit events recover without claiming quota was restored", async () => {
+		const show = spyOn(notifications, "show").mockReturnValue("notice");
+		const hide = spyOn(notifications, "hide").mockImplementation((id) => id);
+		restores.push(
+			() => show.mockRestore(),
+			() => hide.mockRestore(),
+		);
+		await render();
+		await event({
+			type: "model_unavailable_waiting",
+			waitKind: "quota",
+			quotaBucket: "rateLimit",
+			message: "[prefill_cap_refused] the cell is at capacity",
+			model: "ocg:test",
+			resumeAt: 123456,
+		});
+		expect(current.quotaWaitInfo?.waitKind).toBe("capacity");
+		expect(show.mock.calls.at(-1)?.[0].title).toBe("capacityWaitingTitle");
+		await event({ type: "model_unavailable_recovered", waitKind: "quota", model: "ocg:test" });
+		expect(show.mock.calls.at(-1)?.[0].title).toBe("capacityRecoveredTitle");
+	});
 });
 
 describe("pushed custom API quota precedence with the real WS hook", () => {

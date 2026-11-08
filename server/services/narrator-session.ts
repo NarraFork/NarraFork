@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import { isAutoModelValue } from "@shared/auto-model";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
@@ -29,7 +30,9 @@ import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
+import { parseWorkspaceDirectoryMap, readDeviceDirectory } from "@shared/workspace-directories";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -177,6 +180,7 @@ import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
+import { lastServedProvider } from "./auto-sticky-source";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import {
@@ -438,6 +442,7 @@ import { recoverInterruptedTurns } from "./narrator-turns";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
 import {
 	assertSnapshotRevertComplete,
+	isAvailableFilesRestored,
 	type RevertResult,
 	type RevertScope,
 	type RevertWarning,
@@ -657,6 +662,12 @@ async function resolveNarratorProjectId(narratorId: string): Promise<string | nu
 export async function getNarratorExecutionDeviceState(narratorId: string): Promise<{
 	defaultDeviceId: string | null;
 	devices: NonNullable<import("../lib/agent").AgentConfig["availableDevices"]>;
+	/**
+	 * Working directory recorded per device. The device picker needs this to tell
+	 * "switch there" from "enter a directory first", and the details panel renders
+	 * each device with its own directory.
+	 */
+	directories: import("@shared/workspace-directories").WorkspaceDirectoryMap;
 }> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -666,9 +677,11 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 	const projectId = await resolveNarratorProjectId(narratorId);
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
 	const devices = (await resolveSessionDevices(projectId)) ?? [];
+	const { getWorkspaceDirectories } = await import("./workspace-context-service");
 	return {
 		defaultDeviceId: runtime?.defaultDeviceId ?? narrator.defaultDeviceId,
 		devices: runtime ? filterOAuthSessionDevices(devices, runtime) : devices,
+		directories: await getWorkspaceDirectories(narratorId),
 	};
 }
 
@@ -742,6 +755,9 @@ export async function executeQueuedNewCommand(
 		),
 		dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
 			sourceNarrator.dangerReflectionOverride,
+		),
+		questionReflectionOverride: normalizeOptionalBooleanOverride(
+			sourceNarrator.questionReflectionOverride,
 		),
 		cwd: active.cwd,
 		// The person who queued `/new` owns the session it spawns. Falling back to the
@@ -1367,6 +1383,7 @@ export async function buildSystemPrompt(
 		| "runtimeHints"
 		| "taskSection"
 		| "contextParts"
+		| "outlinePlan"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1425,11 +1442,24 @@ async function createNarrator(
 		narrator.workspaceContext.deviceId === "local"
 			? narrator.workspaceContext.cwd
 			: null;
+	/**
+	 * `narrator.cwd` is the *currently effective* directory, which on a remote device is
+	 * a path that does not exist on this server. The session's own local directory — the
+	 * base for local tool calls and skills, and what a switch back to `local` restores —
+	 * is the `local` entry of the per-device map.
+	 */
+	const localDeviceCwd =
+		executionDeviceId === "local"
+			? null
+			: readDeviceDirectory(parseWorkspaceDirectoryMap(narrator.workspaceDirectories), "local")
+					?.cwd;
 	// A former chapter session's directory came from its committed workspace first (its
 	// own cwd column was often never written); every other session keeps its own cwd first.
-	const storedCwd = isFormerChapterSessionWithoutDirectory({ cwd: null, traits: narrator.traits })
-		? committedLocalCwd || narrator.cwd
-		: narrator.cwd || committedLocalCwd;
+	const storedCwd =
+		localDeviceCwd ??
+		(isFormerChapterSessionWithoutDirectory({ cwd: null, traits: narrator.traits })
+			? committedLocalCwd || narrator.cwd
+			: narrator.cwd || committedLocalCwd);
 	if (
 		executionDeviceId === "local" &&
 		isFormerChapterSessionWithoutDirectory({ cwd: storedCwd, traits: narrator.traits })
@@ -1513,6 +1543,21 @@ async function createNarrator(
 				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
 				narrator.type,
 			),
+			// An outline session plans in the outline (outline P2 PR 8).
+			...(isPlanMode
+				? await (async () => {
+						const planMode = await import("./outline-plan-mode");
+						const view = await planMode.outlinePlanPromptRoot(narratorId);
+						if (!view) return {};
+						const { resolveEffectiveRelaxedPlan } = await import("../lib/permission-modes");
+						return {
+							outlinePlan: {
+								root: view.root,
+								relaxed: resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
+							},
+						};
+					})()
+				: {}),
 		},
 	);
 
@@ -1545,7 +1590,12 @@ async function createNarrator(
 	const inheritedModel =
 		narrator.model === FOLLOW_PARENT_MODEL ? await resolveSubagentModelForRun(narrator) : null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
-	const narratorModel = inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef);
+	const narratorModel =
+		inheritedModel?.model ??
+		resolveEffectiveModel(
+			narratorModelRef,
+			isAutoModelValue(narratorModelRef) ? lastServedProvider(narratorId) : undefined,
+		);
 	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {
@@ -1864,10 +1914,15 @@ async function maybeDeliverInterruptTaskGuard(
 		if (interruptTaskGuardRevisions.get(narratorId) === revision) return;
 		interruptTaskGuardRevisions.set(narratorId, revision);
 
-		const { content, body } = taskSource.interruptGuardNote(
-			openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS),
-			active.locale,
-		);
+		const listed = openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS);
+		const note = taskSource.interruptGuardNote(listed, active.locale);
+		const content = note.content;
+		// The reader's card counts the open tasks it does not list (the source's own list may be a
+		// prefix of a longer one, so the card reads it as "at least"). The model text is unchanged.
+		const body =
+			note.body.kind === "tasks" && openTasks.length > listed.length
+				? { ...note.body, taskCount: openTasks.length }
+				: note.body;
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
@@ -2932,7 +2987,7 @@ interface ContinuableTopLevelMessage {
 	parentToolUseId?: string | null;
 	contentJson?: unknown;
 	contentText?: unknown;
-	toolCalls?: Array<{ toolUseId?: string | null; toolName?: string | null }>;
+	toolCalls?: ReadonlyArray<{ toolUseId?: string | null; toolName?: string | null }>;
 }
 
 /**
@@ -2950,7 +3005,7 @@ interface ContinuableTopLevelMessage {
  * so nothing is lost by continuing from the turn underneath.
  */
 export function resolveContinuationTail<T extends ContinuableTopLevelMessage>(
-	messages: T[],
+	messages: readonly T[],
 ): { tail: T | undefined; danglingReasoningIds: string[] } {
 	const danglingReasoningIds: string[] = [];
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -2992,7 +3047,7 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
  * injection from the trailing position, and the model reads it as background while
  * being asked to continue something unnamed.
  */
-export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
+export function hasTrailingInjectionRow(messages: readonly ContinuableTopLevelMessage[]): boolean {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (!msg || msg.parentToolUseId) continue;
@@ -3931,6 +3986,8 @@ async function updateToolCallConclusionUnlocked(opts: {
 	 * manual/third-party conclusion text updates preserve the original execution timing.
 	 */
 	refreshTiming?: boolean;
+	/** Recovery explanations may update only an active row, never a terminal result. */
+	onlyIfActive?: boolean;
 	onPersist?: (tx: import("./agent-runtime/mailbox-types").RuntimeTx) => void;
 }): Promise<void> {
 	const {
@@ -3977,15 +4034,19 @@ async function updateToolCallConclusionUnlocked(opts: {
 			streamStartedAt: true,
 			permissionStartedAt: true,
 			executionStartedAt: true,
+			status: true,
 		},
 		limit: 2,
 	});
-	if (resultRows.length !== 1)
+	if (resultRows.length !== 1) {
+		if (opts.onlyIfActive) return;
 		throw new ValidationError("Subagent conclusion requires an exact parent tool-call row");
+	}
 	const resultRow = resultRows[0];
+	if (opts.onlyIfActive && (resultRow.status === "success" || resultRow.status === "fail")) return;
 	const timing = refreshTiming ? resolveToolCallConclusionTiming(resultRow) : undefined;
 
-	await narratorStore.settleTool(
+	const settled = await narratorStore.settleTool(
 		toolUseId,
 		{
 			output,
@@ -3993,11 +4054,15 @@ async function updateToolCallConclusionUnlocked(opts: {
 			errorMessage: hasError ? finalText : undefined,
 			resultMessageId,
 			onPersist: opts.onPersist,
+			onlyIfActive: opts.onlyIfActive,
 			...(timing ?? { preserveTiming: true }),
 		},
 		messageId,
 		resultRow.id,
 	);
+	// A competing writer settled the row between our read and the active-only CAS.
+	// Do not broadcast a conclusion that was never actually written.
+	if (opts.onlyIfActive && !settled) return;
 	// Broadcast to parent narrator so the frontend can update the SubagentCard
 	broadcastToNarrator(parentNarratorId, {
 		type: "subagent_conclusion_updated",
@@ -4731,8 +4796,11 @@ export function isQuestionAnswerWakeEligible(recipient: {
  * tails are not replies: a crash can leave them after the answer without the
  * model having continued, and treating them as delivered would drop the wake
  * forever. Text or a tool call is enough; other non-reasoning bodies count too.
+ *
+ * Exported for the outline's answer delivery, whose retry wakes only a session that has not
+ * replied after the message yet.
  */
-function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
+export function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
 	const substantive = db
 		.select({ id: narratorMessageRefs.id })
 		.from(narratorMessageRefs)
@@ -5079,6 +5147,41 @@ export function isQuestionAnswerDeliveryReady(narratorId: string, messageId: str
 		.get();
 }
 
+/** task_notice 的通知预算里给 metadata 预留的额度。 */
+const QUESTION_ANSWER_METADATA_RESERVE = 1024;
+
+/**
+ * 按 UTF-8 字节上限截断，不切断代理对。
+ */
+function truncateUtf8Bytes(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	let low = 0;
+	let high = text.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(text.slice(0, mid), "utf8") <= maxBytes) low = mid;
+		else high = mid - 1;
+	}
+	const last = low > 0 ? text.charCodeAt(low - 1) : 0;
+	if (last >= 0xd800 && last <= 0xdbff) low -= 1;
+	return text.slice(0, low);
+}
+
+/**
+ * 问答回执正文可以到 80KB，但入箱的 task_notice 只允许 4KB。
+ *
+ * 直接塞全文会让这次投递永远失败：每次 run 释放都重试一遍、日志刷屏，答案也永远
+ * 追不上会话。超预算时降级成「正文前缀 + 消息指针」，通知照样送达，全文留在消息里。
+ */
+function boundQuestionAnswerNotice(text: string, messageId: string): string {
+	const budget = MAILBOX_LIMITS.publicationBytes - QUESTION_ANSWER_METADATA_RESERVE;
+	if (Buffer.byteLength(text, "utf8") <= budget) return text;
+	const pointer = `\n\n[完整回答见消息 ${messageId}]`;
+	const head = truncateUtf8Bytes(text, budget - Buffer.byteLength(pointer, "utf8"));
+	return `${head}${pointer}`;
+}
+
 export async function scheduleQuestionAnswerDelivery(
 	narratorId: string,
 	messageId: string,
@@ -5119,6 +5222,7 @@ export async function scheduleQuestionAnswerDelivery(
 			{ ...message, contentJson: [], contentText: text, parentToolUseId: null, messageUuid: null },
 			text,
 		);
+		const noticeText = boundQuestionAnswerNotice(modelText, messageId);
 		return runtimeInbox.enqueue(
 			{
 				kind: "task_notice",
@@ -5126,8 +5230,8 @@ export async function scheduleQuestionAnswerDelivery(
 				narratorId,
 				sourceKey: `question-answer:${messageId}`,
 				recipientMessageId: messageId,
-				text: modelText,
-				projectedByteSize: Buffer.byteLength(modelText),
+				text: noticeText,
+				projectedByteSize: Buffer.byteLength(noticeText),
 				metadata: {
 					eventKind: "question_answer",
 					questionAnswer: { messageId, executionPrincipal },
@@ -6381,6 +6485,18 @@ async function reExecuteDeniedToolCallUnlocked(
 					if (!result.isError && toolName === "ExitPlanMode") {
 						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
 						const planState = await exitNarratorPlanMode(narratorId);
+						// An outline session's plan is recorded as approved (a draft: outline P2 PR 8).
+						const { settleApprovedOutlinePlan } = await import("./outline-plan-mode");
+						await settleApprovedOutlinePlan({
+							narratorId,
+							toolUseId,
+							locale: active.locale,
+							approverUserId: userId ?? null,
+							turnUserId: active._currentUserId ?? null,
+							byReview: false,
+							// The input as just resolved: the row is written after this (review N2).
+							input: (result.updatedInput as Record<string, unknown> | undefined) ?? null,
+						});
 						active._preparedPlanModes?.clear();
 						active._planFileId = undefined;
 						active._planFilePath = undefined;
@@ -7077,7 +7193,12 @@ async function editAndRegenerateUnlocked(
 	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
 		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	// Two budgets, because the two kinds reach the model differently. Images and
+	// media are base64-inlined into every provider request, so what the message
+	// retains of them stays bounded by the buffered 128 MiB. Text files are only
+	// passed to the model as paths, so they count toward the 2 GiB total alone.
 	let retainedAttachmentBytes = 0;
+	let retainedInlineBytes = 0;
 	const countedMediaIds = new Set<string>();
 	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
 		const owner = item.uploadNarratorId || targetMsg.narratorId;
@@ -7086,7 +7207,9 @@ async function editAndRegenerateUnlocked(
 		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
 		if (!countedMediaIds.has(mediaKey)) {
 			countedMediaIds.add(mediaKey);
-			retainedAttachmentBytes += Bun.file(mediaPath).size;
+			const size = Bun.file(mediaPath).size;
+			retainedAttachmentBytes += size;
+			retainedInlineBytes += size;
 		}
 	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
@@ -7138,13 +7261,20 @@ async function editAndRegenerateUnlocked(
 	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [
-		...(opts?.newImages ?? []),
-		...(opts?.newTextFiles ?? []),
-		...(opts?.newMedia ?? []),
-	].reduce((total, file) => total + file.size, 0);
-	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+	// Images and media are read whole (`arrayBuffer()`) for validation, so they keep
+	// the buffered 128 MiB budget. Text files reach the worktree by streamed copy, so
+	// with them included only the 2 GiB staged ceiling applies.
+	const bufferedUploadBytes = [...(opts?.newImages ?? []), ...(opts?.newMedia ?? [])].reduce(
+		(total, file) => total + file.size,
+		0,
+	);
+	if (bufferedUploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const uploadBytes =
+		bufferedUploadBytes + (opts?.newTextFiles ?? []).reduce((total, file) => total + file.size, 0);
+	if (uploadBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	if (keepImageIds.length + (opts?.newImages?.length ?? 0) > MAX_EDIT_IMAGES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -7194,6 +7324,7 @@ async function editAndRegenerateUnlocked(
 			if (!countedImageIds.has(imageKey)) {
 				countedImageIds.add(imageKey);
 				retainedAttachmentBytes += imageInfo.size;
+				retainedInlineBytes += imageInfo.size;
 			}
 		}
 		if (
@@ -7231,14 +7362,17 @@ async function editAndRegenerateUnlocked(
 			}
 		}
 	}
-	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
-	if (finalAttachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+	if (bufferedUploadBytes + retainedInlineBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
+	if (finalAttachmentBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	const materializedBytes =
 		uploadBytes + [...textFilesToCopy.values()].reduce((total, file) => total + file.size, 0);
-	if (materializedBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
-		throw new ValidationError("Combined materialized attachments exceed the 128 MiB limit");
+	if (materializedBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined materialized attachments exceed the 2 GiB limit");
 	}
 	if (isLoopRunning(narratorId)) {
 		await reconcileRunningStatus(narratorId);
@@ -7275,9 +7409,20 @@ async function editAndRegenerateUnlocked(
 				revertPlan: opts?.revertPlan,
 			},
 		);
-		assertSnapshotRevertComplete(revertResult);
-		if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
-		revertWarnings = revertResult.warnings;
+		if (isAvailableFilesRestored(revertResult)) {
+			// A partial-coverage plan was confirmed as "restore available files": they are
+			// restored and the plan deliberately leaves history alone. The edit itself
+			// still has to truncate, so finish it history-only, exactly like keep-files.
+			({ deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
+				preserveConversationId: true,
+				skipRevert: true,
+			}));
+			revertWarnings = revertResult.warnings;
+		} else {
+			assertSnapshotRevertComplete(revertResult);
+			if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
+			revertWarnings = revertResult.warnings;
+		}
 	}
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
@@ -9142,6 +9287,7 @@ export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<voi
 
 export async function recoverOnStartup(
 	protection: NarratorStartupProtectionSets = {},
+	options: { heldRunIds?: ReadonlySet<string> } = {},
 ): Promise<void> {
 	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
 	if ((globalThis as any)[HOT_RELOAD_GUARD]) {
@@ -9203,7 +9349,7 @@ export async function recoverOnStartup(
 		toolCallIds: new Set(protection.toolCallIds),
 		backgroundTaskIds: new Set(protection.backgroundTaskIds),
 	};
-	const held = await protectHeldRunFacts(protectedFacts);
+	const held = await protectHeldRunFacts(protectedFacts, options.heldRunIds);
 	protection = protectedFacts;
 	for (const id of held)
 		await db
@@ -9532,7 +9678,7 @@ export async function loadOptionalTool(
 		{ id: toolName, description: toolName, toolNames: [toolName] },
 		true,
 	);
-	return result === "loaded"
+	return result === "loaded" || result === "loaded_new_epoch"
 		? "loaded"
 		: result === "already_loaded"
 			? "already_loaded"

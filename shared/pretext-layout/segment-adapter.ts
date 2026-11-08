@@ -29,6 +29,7 @@ import {
 	injectionBlockViews,
 	isNativeModelContextBlock,
 } from "../native-injection";
+import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
@@ -39,6 +40,7 @@ import {
 	type SideCarBody,
 	type SideCarInboundMessage,
 	sideCarBodyToMarkdown,
+	sideCarBodyToPlainText,
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
@@ -70,6 +72,7 @@ import {
 } from "./communication-state";
 import type { VListElementKind } from "./element-kinds";
 import type { InjectionTarget } from "./injection-target";
+import { outlineEditHeaderStats } from "./outline-tool-card";
 import type { RenderLod } from "./prepared-block";
 import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
 import {
@@ -99,6 +102,7 @@ import {
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
+import { contextUpdateKeys, taskNoticeFromBody, taskNoticeFromContextUpdate } from "./task-notice";
 import { TEXT_PREVIEW_MAX_CHARS } from "./text-preview";
 import {
 	type ClassifyToolDetailInput,
@@ -643,7 +647,7 @@ interface AdapterTraceItem {
 	 * Edit, a live patch landing the tool's metadata), and a stale entry would keep
 	 * drawing the previous numbers.
 	 */
-	diffStats?: { added: number; removed: number };
+	diffStats?: { added: number; removed: number; done?: number; commit?: number };
 	/**
 	 * Raw tool status. Height-neutral (a fixed 12px glyph slot inside the row's
 	 * existing content lane), and part of the measure cache's `traceRevision` so a
@@ -1175,9 +1179,6 @@ const OUTLINE_VIEW_LABEL_KEYS: Readonly<Record<string, string>> = {
 	"outline.behavior": "contextViewOutlineBehavior",
 };
 
-/** How the host's `context_update` notice row starts (`narrator-epochs.ts`). */
-const CONTEXT_UPDATE_NOTICE = "Context updated: ";
-
 /**
  * The line a host `context_update` row reads as when it updates an outline session's views:
  * "Context updated: Current tasks / Behavior boundary" in the reader's language, other keys as
@@ -1188,15 +1189,8 @@ function outlineViewUpdateLine(
 	blocks: readonly AdapterContentBlock[],
 	ctx: AdapterContext,
 ): string | null {
-	if (!blocks.some((block) => block.type === "context_update")) return null;
-	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
-	if (!notice.startsWith(CONTEXT_UPDATE_NOTICE)) return null;
-	const keys = notice
-		.slice(CONTEXT_UPDATE_NOTICE.length)
-		.split(",")
-		.map((key) => key.trim())
-		.filter(Boolean);
-	if (!keys.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
+	const keys = contextUpdateKeys(blocks);
+	if (!keys?.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
 	const names = keys.map((key) => {
 		const label = OUTLINE_VIEW_LABEL_KEYS[key];
 		return label ? sysLabel(ctx, label) : key;
@@ -2007,6 +2001,24 @@ function adaptMessage(
 		// An update of an outline session's views reads in the reader's words, not as the stored
 		// English notice naming internal keys (the row itself is unchanged).
 		const viewUpdate = outlineViewUpdateLine(blocks, ctx);
+		// One that changed the current-tasks view and carries its summary names the tasks: one
+		// line, the tasks as rows when unfolded. Older rows keep the line above.
+		const tasksUpdate = taskNoticeFromContextUpdate(blocks, viewUpdate, ctx.labels);
+		if (tasksUpdate) {
+			specs.push(
+				taskNoticeSpec(
+					`${elementKey(idBase, msg, blockIndex)}-sys`,
+					{
+						...tasksUpdate,
+						timeLabel: formatOriginNoticeTime(msg.createdAt),
+						origin: "system",
+						originLabel: "context_update",
+					},
+					ctx,
+				),
+			);
+			return specs;
+		}
 		specs.push(
 			adaptSystemBlock(
 				sysBlock.type,
@@ -2395,6 +2407,8 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
 	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
 	sidecarSourceOutlineTaskEdit: "Task changes by people",
+	sidecarSourceOutlineTaskFinished: "Tasks this session created were finished elsewhere",
+	sidecarSourceOutlineAnswer: "Answers to your questions",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2514,6 +2528,9 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
 	// People's changes to the session's outline tasks, told to it as a system notice (PR 5).
 	outline_task_edit: "sidecarSourceOutlineTaskEdit",
+	// Tasks the session created were finished by another session or a person (P2 PR 9b).
+	outline_task_finished: "sidecarSourceOutlineTaskFinished",
+	outline_answer: "sidecarSourceOutlineAnswer",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
@@ -3344,6 +3361,24 @@ function spokenSpeakerLabel(message: SideCarInboundMessage): string {
 	);
 }
 
+/**
+ * The `system-text` spec of a task notice. Its fold is the generic per-key expansion (the
+ * header toggles it): the measure pass reads `opts.expanded`, so the open and folded heights are
+ * separate cache entries. A notice with nothing more to show unfolded carries no opts at all.
+ */
+function taskNoticeSpec(
+	key: string,
+	data: Record<string, unknown>,
+	ctx: AdapterContext,
+): ElementSpec {
+	return {
+		kind: "system-text",
+		key,
+		data,
+		...(data.expandable === true ? { opts: { expanded: ctx.isExpanded?.(key) === true } } : {}),
+	};
+}
+
 function adaptSystemBlock(
 	blockType: string,
 	block: AdapterContentBlock,
@@ -3488,11 +3523,10 @@ function adaptSystemBlock(
 		};
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
-		return {
-			kind: "system-text",
-			key: `${keyBase}-sys`,
-			data: adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt),
-		};
+		const data = adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt);
+		return data.kind === "tasks_notice"
+			? taskNoticeSpec(`${keyBase}-sys`, data, ctx)
+			: { kind: "system-text", key: `${keyBase}-sys`, data };
 	}
 	// fallback: treat as info text. `message` is checked first because that is
 	// where display notices keep their body (see the `info` case below).
@@ -3627,12 +3661,26 @@ function adaptSystemTextData(
 			// Native self-contained injections keep their model-facing projection on
 			// `modelText`; legacy rows may still provide a sibling `text` block.
 			const modelFacingText = block.modelText ?? block.text ?? contentText;
-			const markdown = body
-				? sideCarBodyToMarkdown(source, body, ctx.labels)
-				: rawSideCarToMarkdown(modelFacingText);
+			// A notice about the session's tasks (turn end, people's changes, the interrupt
+			// guard) is one line naming the tasks, with the tasks as rows when unfolded.
+			const tasks = body
+				? taskNoticeFromBody(source, body, injectionHeadingLabel(ctx, source), ctx.labels)
+				: null;
+			if (tasks) {
+				return {
+					...tasks,
+					timeLabel: formatOriginNoticeTime(createdAt),
+					origin: "system",
+					originLabel: source || null,
+					modelFacing: modelFacingText,
+				};
+			}
+			// The card paints its body as PLAIN text, so it gets the plain projection: the
+			// Markdown one showed its `######` and escapes, and a prose body twice.
+			const plain = body ? sideCarBodyToPlainText(source, body, ctx.labels) : "";
 			return {
 				kind: "origin_notice",
-				text: markdown || rawSideCarToMarkdown(modelFacingText),
+				text: plain || rawSideCarToMarkdown(modelFacingText),
 				title: injectionHeadingLabel(ctx, source),
 				timeLabel: formatOriginNoticeTime(createdAt),
 				origin: "system",
@@ -4195,6 +4243,11 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? undefined
 			: makeBody("output.main", resultContent, hasTruncatedLeaf(outputJson));
 	const isBackground = input.background === true || input.run_in_background === true;
+	// An agent sent with an outline task (`task`, outline P2 PR 9): the card names the task under
+	// its description and marks a late result, from the call's metadata (the server writes it;
+	// no projection of the text cuts it), else from the result's note or the line a background
+	// launch names the task in (calls from before the metadata).
+	const delegation = readSubagentDelegation(readLeafText(input.task), resultContent, metadata);
 	const agentType = readNonEmptyString(input, "subagent_type") ?? item.tc.toolName;
 	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
 	// narrator query (which the adapter has no access to): the activity summary
@@ -4233,6 +4286,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		// Still a preview → the shell may fetch the real body while it is open.
 		...(promptTruncated ? { promptTruncated: true } : {}),
 		isBackground,
+		...(delegation ? { delegation } : {}),
 		// Files the child wrote. Absent when it changed nothing, so a card with no
 		// file list keeps the payload (and the height) it had before.
 		...(activity?.fileChanges ? { fileChanges: activity.fileChanges } : {}),
@@ -4435,6 +4489,13 @@ function buildToolCardData(
 			// classifier is the single place that decides what counts as a denial.
 			...(denyMessage ? { denyMessage } : {}),
 			hasPendingPermission,
+			// An outline card's fold (its raw input and model result under the change list), keyed
+			// by the CARD (`promptOpen`, the subagent prompt fold's channel): the same key whether
+			// the card stands alone or is drilled into from a folded row, so it survives an LOD
+			// change.
+			...(category === "outline" && ctx.isPromptOpen?.(toolItemKey(item)) === true
+				? { rawOpen: true }
+				: {}),
 			// Only MEASURED chrome strings (the ask replay's answer prefixes) —
 			// render-layer chrome is injected through renderLabels instead.
 			...(ctx.labels ? { labels: ctx.labels } : {}),
@@ -4455,8 +4516,15 @@ function toolDiffStatsFields(
 	item: AdapterToolItem,
 	isStreaming: boolean,
 	metadata: unknown,
-): { diffStats?: { added: number; removed: number } } {
+): { diffStats?: { added: number; removed: number; done?: number; commit?: number } } {
 	if (isStreaming) return {};
+	// An outline edit's figures: tasks ticked done, blocks added and deleted, its commit.
+	if (item.tc.toolName === "OutlineEdit") {
+		const stats = outlineEditHeaderStats(
+			metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : null,
+		);
+		return stats ? { diffStats: stats } : {};
+	}
 	const stats = resolveFileDiffStats(
 		item.tc.toolName,
 		item.tc.inputJson,

@@ -34,7 +34,11 @@ import {
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
-import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
+import {
+	bindSessionWorkspaceCwd,
+	targetPathSemantics,
+	toolBaseCwd,
+} from "./execution/path-resolve";
 import {
 	ExecutionTargetAuthorizationError,
 	ExecutionTargetError,
@@ -49,6 +53,7 @@ import {
 } from "./pipeline-state";
 import { isBashToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
+import { isPlanReviewLoop } from "./tools/reflection-description";
 import { truncateOutput } from "./truncate";
 import type {
 	AgentConfig,
@@ -202,8 +207,10 @@ async function resolveEndpoint(
 		);
 	}
 	assertAuthorizedExecutionDevice(requested, config);
-	const backend =
-		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId });
+	const backend = bindSessionWorkspaceCwd(
+		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId }),
+		config.workspaceContext,
+	);
 	if (previous && backend.deviceId !== previous.target.deviceId) {
 		throw new Error(`Endpoint ${request.key} changed its frozen execution device.`);
 	}
@@ -741,6 +748,17 @@ export function getReflectionToolRejection(
 		return undefined;
 	}
 	const allowedTools = config.reflectionLoop.allowedTools.join(", ") || "(none / 无)";
+	// An outline plan's review leaves comments for the user; nothing goes back for revision.
+	if (isPlanReviewLoop(config.reflectionLoop.allowedTools)) {
+		return {
+			output:
+				config.locale === "zh-CN"
+					? `工具 ${tu.name} 没有执行。这个计划审查只能调用 ${allowedTools}。不得直接编辑文件或执行原操作；用 PlanReview 给出结论，意见会写在计划下面给用户看。`
+					: `Tool ${tu.name} was not executed. This plan review only allows ${allowedTools}. Do not edit files or execute the original operation; give your verdict with PlanReview: its comments are written under the plan for the user.`,
+			isError: true,
+			durationMs: 0,
+		};
+	}
 	return {
 		output:
 			config.locale === "zh-CN"
@@ -1379,7 +1397,10 @@ export async function executeTool(
 					}
 					return frozenExecution.backend;
 				}
-				return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
+				return bindSessionWorkspaceCwd(
+					resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId }),
+					config.workspaceContext,
+				);
 			},
 			executionTarget: frozenExecution?.target,
 			executionPlan: frozenExecution?.plan,

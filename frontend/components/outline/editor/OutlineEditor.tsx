@@ -210,6 +210,13 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.waiting = t("editor.waitingConfirmation");
 	chromeText.locked = (name) => t("lock.badge", { name });
 	chromeText.pending = t("pending.badge");
+	chromeText.question = t("editor.questionMark");
+	chromeText.status = {
+		todo: t("page.task.todo"),
+		doing: t("page.task.doing"),
+		done: t("page.task.done"),
+		cancelled: t("page.task.cancelled"),
+	};
 	mapText.more = (count) => t("map.more", { count });
 	mapText.stage = t("map.stage");
 
@@ -241,6 +248,19 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			clearTimeout(timer);
 		};
 	}, [client]);
+
+	// Deleting questions put to people withdrew them: say so (undo asks them again).
+	useEffect(
+		() =>
+			client.on((event) => {
+				if (event !== "withdrew") return;
+				notifications.show({
+					color: "yellow",
+					message: t("editor.questionsWithdrawn", { count: client.withdrawnQuestions }),
+				});
+			}),
+		[client, t],
+	);
 
 	// Read-only first: the page's HTTP read until the session is live (before the surface is
 	// built, so its first paint has the page).

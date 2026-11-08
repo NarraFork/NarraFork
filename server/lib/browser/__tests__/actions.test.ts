@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { browserTool } from "../../agent/tools/browser";
+import type { ToolContext } from "../../agent/types";
 import {
 	actions,
 	type BrowserSession,
@@ -7,6 +9,7 @@ import {
 	createSession,
 	listSessions,
 	setSessionTtl,
+	setSessionViewport,
 } from "../index";
 
 let browserChecked = false;
@@ -75,6 +78,90 @@ describe("Browser actions — evaluate and console capture", () => {
 		} finally {
 			await closeSession(narratorId, session.id).catch(() => {});
 		}
+	}, 30_000);
+
+	test("viewport can be set at launch and changed on a live session", async () => {
+		if (await skipIfNoBrowser()) return;
+
+		const narratorId = `test-browser-${crypto.randomUUID()}`;
+		const session = await createSession(
+			narratorId,
+			dataUrl("<html><body>ok</body></html>"),
+			true,
+			undefined,
+			false,
+			{ width: 800, height: 600 },
+		);
+		const innerSize = () =>
+			session.page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+		try {
+			expect(session.viewport).toEqual({ width: 800, height: 600 });
+			expect(await innerSize()).toEqual({ w: 800, h: 600 });
+
+			// Partial update keeps the other dimension; the page re-lays out in place.
+			await session.page.evaluate(() => {
+				(window as unknown as { marker: number }).marker = 42;
+			});
+			const updated = await setSessionViewport(narratorId, session.id, { width: 375 });
+			expect(updated?.viewport).toEqual({ width: 375, height: 600 });
+			expect(await innerSize()).toEqual({ w: 375, h: 600 });
+			expect(
+				await session.page.evaluate(() => (window as unknown as { marker?: number }).marker),
+			).toBe(42);
+			expect(listSessions(narratorId)[0]?.viewport).toEqual({ width: 375, height: 600 });
+
+			await expect(setSessionViewport(narratorId, session.id, { width: 10 })).rejects.toThrow(
+				/between/,
+			);
+			// A rejected update leaves the previous viewport in place.
+			expect(session.viewport).toEqual({ width: 375, height: 600 });
+		} finally {
+			await closeSession(narratorId, session.id).catch(() => {});
+		}
+	}, 30_000);
+
+	test("Browser tool exposes viewport on launch and set_viewport", async () => {
+		if (await skipIfNoBrowser()) return;
+
+		const ctx = { narratorId: `test-browser-${crypto.randomUUID()}` } as ToolContext;
+		const launched = await browserTool.execute(
+			{ action: "launch", url: dataUrl("<p>ok</p>"), width: 1024, height: 768 },
+			ctx,
+		);
+		expect(launched.isError).toBeFalsy();
+		expect(launched.output).toContain("Viewport: 1024x768 @1x");
+		const sessionId = (launched.metadata as { sessionId: string }).sessionId;
+		try {
+			const missing = await browserTool.execute(
+				{ action: "set_viewport", session_id: sessionId },
+				ctx,
+			);
+			expect(missing.isError).toBe(true);
+
+			const resized = await browserTool.execute(
+				{ action: "set_viewport", session_id: sessionId, width: "390", height: 844 },
+				ctx,
+			);
+			expect(resized.isError).toBeFalsy();
+			expect(resized.output).toContain("390x844");
+
+			const tooSmall = await browserTool.execute(
+				{ action: "set_viewport", session_id: sessionId, width: 20 },
+				ctx,
+			);
+			expect(tooSmall.isError).toBe(true);
+			expect(tooSmall.output).toContain("between");
+		} finally {
+			await closeSession(ctx.narratorId, sessionId).catch(() => {});
+		}
+	}, 30_000);
+
+	test("launch defaults to the standard viewport", async () => {
+		if (await skipIfNoBrowser()) return;
+
+		await withSession("<html><body>ok</body></html>", async (session) => {
+			expect(session.viewport).toEqual({ width: 1280, height: 900 });
+		});
 	}, 30_000);
 
 	test("network capture defaults off and can be enabled before launch navigation", async () => {

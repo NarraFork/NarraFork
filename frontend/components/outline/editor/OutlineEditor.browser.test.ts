@@ -483,6 +483,141 @@ test("the block someone is in is deleted: they are told who, and can restore it"
 	noErrors(a, b);
 }, 30_000);
 
+test("a question put to a person: marked, never ticked, deleting it withdraws it, undo brings it back", async () => {
+	const { pageId, ids } = await seedPage(h, "Decisions", ["a fact"]);
+	const asked = await writeOutline(
+		{
+			spaceId: h.space.id,
+			ops: [
+				{
+					op: "insert",
+					parent: { id: pageId },
+					content: "Which format?",
+					ask: {
+						to: { kind: "human", id: h.owner },
+						options: ["v1", "v2"],
+						recommend: { option: 2 },
+					},
+				},
+			],
+			actor: { kind: "agent", id: "narrator-asking" },
+			narratorId: "narrator-asking",
+			responsibleUserId: h.owner,
+		},
+		{
+			question: {
+				askerNarratorId: "narrator-asking",
+				askerUserId: h.owner,
+				askerToolCallId: null,
+			},
+		},
+	);
+	const question = asked.results[0]?.blockId as string;
+	const fact = ids[0] as string;
+	const [a, b] = await both(pageId);
+	const mark = (e: Editor, id: string) =>
+		e.call((f, x) => {
+			const el = f.dom(x as never)?.querySelector("[data-testid=outline-question-mark]");
+			return el
+				? {
+						role: el.getAttribute("role"),
+						label: el.getAttribute("aria-label"),
+						title: el.getAttribute("title"),
+						// The tree's icon as inline SVG, not a text glyph.
+						icon: el.querySelector("svg")?.getAttribute("class") ?? null,
+						text: el.textContent,
+					}
+				: null;
+		}, id);
+	const said = "A question for a person: answered in the inbox. Deleting it withdraws it.";
+	expect(await mark(a, question)).toEqual({
+		role: "img",
+		label: said,
+		title: said,
+		icon: "tabler-icon tabler-icon-help-circle",
+		text: "",
+	});
+	expect(await mark(a, fact)).toBeNull();
+	// The task shortcut does nothing on a question.
+	expect(await a.call((f, x) => f.cmd("task", x as never), question)).toBe(false);
+	// Deleting it withdraws the question, and the editor says so.
+	await a.call((f, x) => f.deleteVia(x as never), question);
+	await until(b, (f, x) => !f.kids(f.client().pageId).includes(x as never), [question]);
+	expect(await a.call((f) => f.client().withdrawnQuestions)).toBe(1);
+	await settle(a, b);
+	await flushed(pageId);
+	expect((await outlineStore.getQuestions([question]))[0]?.state).toBe("withdrawn");
+	// Undone: back for everyone, still marked, open again.
+	expect(await a.call((f) => f.undo())).toBe(true);
+	await until(b, (f, x) => f.kids(f.client().pageId).includes(x as never), [question]);
+	await settle(a, b);
+	expect(await mark(b, question)).not.toBeNull();
+	expect(await mark(a, question)).not.toBeNull();
+	await flushed(pageId);
+	expect((await outlineStore.getQuestions([question]))[0]?.state).toBe("open");
+	await converged(pageId, a, b);
+	noErrors(a, b);
+}, 30_000);
+
+test("the frame's icons take real clicks: the checkbox cycles the task, the arrow folds, the bullet focuses, the caret stays out", async () => {
+	const { pageId, ids } = await seedPage(h, "Frame", ["[ ] 任务", "父块", "  子块"]);
+	const [task, parent] = ids as [string, string];
+	const [a, b] = await both(pageId);
+	/** Where a part of a block's frame is drawn (its icon's middle), and which icon it shows. */
+	const icon = (e: Editor, id: string, part: "ob-check" | "ob-arrow" | "ob-bullet") =>
+		e.call(
+			(f, x, p) => {
+				const el = f.dom(x as never)?.querySelector<HTMLElement>(`:scope > .ob-gutter > .${p}`);
+				// The bullet is a CSS dot, centred in its part.
+				const r = (el?.querySelector("svg") ?? el)?.getBoundingClientRect();
+				return el && r
+					? {
+							x: r.x + r.width / 2,
+							y: r.y + r.height / 2,
+							icon: el.dataset.icon ?? null,
+							checked: el.getAttribute("aria-checked"),
+							text: el.textContent,
+						}
+					: null;
+			},
+			id,
+			part,
+		);
+	const click = async (id: string, part: "ob-check" | "ob-arrow" | "ob-bullet") => {
+		const at = await icon(a, id, part);
+		if (!at) throw new Error(`no ${part} icon on ${id}`);
+		await a.page.mouse.click(at.x, at.y);
+		await settle(a, b);
+	};
+	expect(await icon(a, task, "ob-check")).toMatchObject({
+		icon: "square",
+		checked: "false",
+		text: "",
+	});
+	await caret(a, task, 1);
+	await click(task, "ob-check");
+	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-half", checked: "mixed" });
+	await click(task, "ob-check");
+	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-check", checked: "true" });
+	expect(serverOutline(pageId)).toBe("- [x] 任务\n- 父块\n  - 子块");
+	// The caret stayed in the text (the frame is not editable and takes no caret).
+	expect(await head(a)).toMatchObject({ blockId: task, offset: 1 });
+	expect(await icon(a, parent, "ob-arrow")).toMatchObject({ icon: "chevron-down" });
+	await click(parent, "ob-arrow");
+	expect(await icon(a, parent, "ob-arrow")).toMatchObject({ icon: "chevron-right" });
+	expect(await a.call((f, x) => f.dom(x as never)?.classList.contains("collapsed"), parent)).toBe(
+		true,
+	);
+	await converged(pageId, a, b);
+	// The bullet focuses its block: the host is told, and the view shows what is under it.
+	expect(await a.call((f) => f.events().focused)).toEqual([]);
+	await click(parent, "ob-bullet");
+	await until(a, (f, x) => f.events().focused.at(-1) === x, [parent]);
+	expect(await a.call((f) => f.events().focused)).toEqual([parent]);
+	expect(await a.call((f) => f.viewOutline())).toBe("- 子块");
+	noErrors(a, b);
+}, 30_000);
+
 test("presence: who is here, their cursor in the text, their block selection", async () => {
 	const { pageId, ids } = await seedPage(h, "在场", ["第一块", "第二块", "第三块"]);
 	const [b0, b1, b2] = ids as [string, string, string];

@@ -34,7 +34,7 @@ import {
 import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, typographyMetrics } from "../pretext-fonts";
 
 /** xs single-line box: round(12 × 1.4) = 17. */
-export const TURN_USAGE_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+export const TURN_USAGE_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 /** `mb={2}` on the leading line / `mt={2}` on the trailing one. */
 export const TURN_USAGE_LINE_MARGIN = 2;
 /** Right inset (`pr="sm"`) the chunked lines use. Height-neutral. */
@@ -116,7 +116,7 @@ export function measureTurnUsage(
 }
 
 export const MEASURE_TURN_USAGE_CONSTANTS = {
-	TURN_USAGE_LINE_HEIGHT,
+	TURN_USAGE_LINE_HEIGHT_BASELINE,
 	TURN_USAGE_LINE_MARGIN,
 	TURN_USAGE_PADDING_RIGHT,
 } as const;

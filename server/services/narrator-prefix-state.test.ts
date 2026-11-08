@@ -5,6 +5,7 @@ import type { ContextUpdate } from "@shared/prefix-context";
 import { modelHistoryFixtureSql } from "./agent-runtime/model-history-fixture";
 import { queryModelHistory, sqliteHistoryQuery } from "./agent-runtime/model-history-query";
 import { renderModelHistoryRevisionSql } from "./agent-runtime/model-history-revision-sql";
+import { freezePrefixValue, prefixValueBytes } from "./narrator-prefix-snapshot-values";
 import { attachPrefixHistorySource, createPrefixStateLoader } from "./narrator-prefix-state";
 
 const connections: Database[] = [];
@@ -31,7 +32,6 @@ async function read(db: Database) {
 	const source = await queryModelHistory(sqliteHistoryQuery(db), {
 		narratorId: "owner",
 		versioned: true,
-		deadline: Date.now() + 10_000,
 	});
 	const messages = source.messages.map((row) => ({ ...row }));
 	attachPrefixHistorySource(messages, source);
@@ -99,6 +99,29 @@ test("distinct views of one source are zero-IO; appended source only replays new
 	);
 	expect(hydrated.find((row) => row.id === "u2")?.contentText).toBe("two-text");
 	expect(reads).toEqual([]);
+});
+
+test("the model's history carries an update without the row's reader summary", async () => {
+	const db = fixture();
+	add(db, "u1", 1, {
+		...update("one"),
+		display: { "outline.tasks": { doing: [{ address: "K/a", title: "Secret-ish title" }] } },
+	});
+	const { loader, payloads } = harness();
+	payloads.set("one", {
+		changes: [{ key: "outline.tasks", value: "view" }],
+		modelText: "one-text",
+	});
+	const { messages } = await read(db);
+	const [row] = await loader.hydrateContextUpdates(
+		messages.map((message) => ({ ...message })),
+		undefined,
+		messages,
+	);
+	expect(row?.contentText).toBe("one-text");
+	expect(JSON.stringify(row?.contentJson)).not.toContain("Secret-ish title");
+	// The stored row keeps it, for the transcript.
+	expect(JSON.stringify(messages[0]?.contentJson)).toContain("Secret-ish title");
 });
 
 test("real body_revision changes and rollback rebuild the merged state", async () => {
@@ -222,6 +245,10 @@ test("large definitions are never serialized for size and their schema is measur
 			throw new Error("schema serialized on main thread");
 		},
 	});
+	// The snapshot adoption boundary already measured the schema; consumers must not repeat it.
+	const bytes = await freezePrefixValue(definition);
+	expect(prefixValueBytes(definition)).toBe(bytes);
+	expect(schemaReads).toBe(1);
 	const loader = createPrefixStateLoader(
 		{
 			async getPrefixText() {

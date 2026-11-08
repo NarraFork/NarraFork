@@ -53,6 +53,8 @@ interface RestartManifest {
 export interface RestartStartupRecovery {
 	manifest: RestartManifest | null;
 	protection: ToolContinuationProtectionSets;
+	/** This cold-start pass only; never persisted or reused for a later explicit hydration. */
+	heldRunIds?: ReadonlySet<string>;
 }
 const processState = hotSafe("restart-recovery", () => ({
 	prepared: false,
@@ -289,9 +291,13 @@ export function mergeStartupProtection(
 /** A restored user hold protects facts, not permission to automatically execute them. */
 export async function protectHeldRunFacts(
 	protection: ToolContinuationProtectionSets,
+	hydratedRunIds?: ReadonlySet<string>,
 ): Promise<Set<string>> {
-	const { hydrateRunHolds } = await import("./agent-runtime/run");
-	const held = await hydrateRunHolds();
+	// Share only the snapshot explicitly passed by this cold-start orchestration. A later
+	// standalone caller must still read current durable holds, including newly taken-over runs.
+	const held = hydratedRunIds
+		? new Set(hydratedRunIds)
+		: await import("./agent-runtime/run").then(({ hydrateRunHolds }) => hydrateRunHolds());
 	for (const id of held) {
 		protection.narratorIds.add(id);
 		for (let after = ""; ; ) {
@@ -363,6 +369,7 @@ export async function prepareOrdinaryRestartRecovery(
 	if (processState.prepared) return empty; // Hot reload must not mount duplicate runtimes.
 	processState.prepared = true;
 	const held = await protectHeldRunFacts(empty.protection);
+	empty.heldRunIds = held;
 	const saved = await readManifest();
 	// A v3 planned root already owns this source; never load the ordinary file a second time.
 	const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
@@ -405,38 +412,51 @@ export async function prepareOrdinaryRestartRecovery(
 	const publication = getRuntimePublicationService();
 	const rows: typeof candidates = [];
 	for (const row of candidates) {
-		const result =
+		const run =
 			row.logicalRunId && row.deliverTo
-				? await publication.readAgentTerminalResult(
-						{
-							producerKind: "agent",
-							taskId: row.id,
-							logicalRunId: row.logicalRunId,
-							recipientId: row.deliverTo.narratorId,
-						},
-						{ includeEventKind: true },
-					)
+				? {
+						producerKind: "agent" as const,
+						taskId: row.id,
+						logicalRunId: row.logicalRunId,
+						recipientId: row.deliverTo.narratorId,
+					}
 				: null;
-		if (!result) {
+		const publicationState = run
+			? await publication.readRunPublicationState(run)
+			: { state: "none" as const };
+		if (publicationState.state !== "settled") {
 			// Idle rows entered this set only through the verified retained manifest.
 			if (restartEligible(row) || row.status === "idle") rows.push(row);
 			continue;
 		}
+		const result = run
+			? await publication.readAgentTerminalResult(run, { includeEventKind: true })
+			: null;
 		// A crash after the terminal transaction but before idle needs delivery only.
-		// The durable snapshot/intent is authoritative; never execute the model again.
+		// The durable terminal evidence is authoritative; never execute the model again,
+		// even when the result snapshot itself can no longer be read.
+		const eventKind = result?.eventKind ?? publicationState.eventKind;
 		await db
 			.update(narrators)
 			.set({
 				status: "idle",
 				substatus: JSON.stringify([
-					result.eventKind === "failed"
-						? "error"
-						: result.eventKind === "timed_out"
-							? "timeout"
-							: result.eventKind === "cancelled"
-								? "interrupted"
-								: "unread",
+					!eventKind
+						? "interrupted"
+						: eventKind === "failed"
+							? "error"
+							: eventKind === "timed_out"
+								? "timeout"
+								: eventKind === "cancelled"
+									? "interrupted"
+									: "unread",
 				]),
+				...(!result
+					? {
+							errorMessage:
+								"Run had already published its terminal result before restart; the stored result is no longer readable, so it was not rerun.",
+						}
+					: {}),
 			})
 			.where(and(eq(narrators.id, row.id), eq(narrators.logicalRunId, row.logicalRunId as string)));
 		publication.schedule();
@@ -635,12 +655,12 @@ export async function prepareOrdinaryRestartRecovery(
 		toolCount: protection.toolCallIds.size,
 		automaticResume: automaticResumeEnabled(),
 	});
-	const prepared = { manifest, protection };
+	const prepared = { manifest, protection, heldRunIds: held };
 	if (!automaticResumeEnabled()) {
 		processState.pausedRecovery = prepared;
 		// A disabled recovery has no runtime owner: show an honest interrupted/resting state,
 		// while keeping permission/tool records protected and available for a manual resume.
-		return { manifest, protection: { ...protection, narratorIds: held } };
+		return { manifest, protection: { ...protection, narratorIds: held }, heldRunIds: held };
 	}
 	return prepared;
 }

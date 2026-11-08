@@ -9,6 +9,7 @@ import {
 	mediaRefToContentBlock,
 	type NativeMediaInput,
 } from "@shared/media-attachments";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -33,7 +34,12 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
-import { getPrompt, getToolMessage, type Locale } from "../prompt-i18n";
+import {
+	getOutlinePlanRelaxedReminder,
+	getPrompt,
+	getToolMessage,
+	type Locale,
+} from "../prompt-i18n";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -123,10 +129,13 @@ import {
 	EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
+	handOverExitPlanReflection,
 	isExitPlanReflectionWaitingForUser,
 	markExitPlanReflectionStarted,
+	PLAN_REVIEW_TOOL_NAME,
 } from "./tools/exit-plan-reflection";
 import { isOutlineTool } from "./tools/outline-names";
+import { isPlanReviewLoop } from "./tools/reflection-description";
 import {
 	broadcastTaskReflectionProgress,
 	cleanupTaskReflection,
@@ -655,6 +664,8 @@ export async function shouldInjectRelaxedPlanToolReminder(
 ): Promise<boolean> {
 	if (!config.planMode || !config.relaxedPlan) return false;
 	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
+	// Writing the outline is how an outline session writes its plan (outline P2 PR 8).
+	if (isOutlineTool(tu.name)) return false;
 	if (isTaskStateMaintenanceToolUse(tu)) return false;
 	if (isPlanAuthoringToolUse(tu, config)) return false;
 
@@ -982,9 +993,16 @@ export function shouldAllowExitPlanReflectionAutoCompact(
 	return config.planReflectionAllowAutoCompact ?? settings.agent.planReflectionAllowAutoCompact;
 }
 
+/**
+ * The decision tools of a plan reflection. An outline plan's review has one, PlanReview (outline
+ * P2 PR 8b): it leaves comments under the plan instead of sending it back, and never resets the
+ * context. A spec session's keep the three ExitPlan* tools.
+ */
 export function getExitPlanReflectionAllowedTools(
 	config: Partial<ExitPlanReflectionAutoCompactConfig> = {},
+	outline = false,
 ): string[] {
+	if (outline) return [PLAN_REVIEW_TOOL_NAME];
 	const allowedTools = [...EXIT_PLAN_REFLECTION_TOOLS];
 	if (shouldAllowExitPlanReflectionAutoCompact(config)) {
 		allowedTools.push(EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME);
@@ -1236,6 +1254,7 @@ async function recordReflectionApiRequestEnd(
 			credentialId: event.credentialId,
 			ttftMs: event.ttftMs ?? null,
 			durationMs: event.durationMs ?? null,
+			decodeMs: event.decodeMs ?? null,
 			contextPercent: event.contextPercent ?? null,
 			contextSnapshot: event.contextSnapshot,
 			meterUsage: event.meterUsage ?? null,
@@ -1298,6 +1317,12 @@ const requestToolSnapshots = new WeakMap<
 
 function buildReflectionCorrectionPrompt(config: AgentConfig): string {
 	const tools = config.reflectionLoop?.allowedTools.join(", ") ?? "";
+	// An outline plan's review (PR 8b): its comments go to the user, nothing back to the planner.
+	if (isPlanReviewLoop(config.reflectionLoop?.allowedTools ?? [])) {
+		return config.locale === "zh-CN"
+			? "审查还没有形成有效结论。你最多有两轮；如仍有下一轮，请根据工具结果改正参数，再调用一次 PlanReview。不要执行原操作，也不要直接修改文件或大纲。"
+			: "The review has not produced a valid verdict. You have at most two responses; if another remains, correct the arguments using the tool result and call PlanReview once. Do not execute the original operation or edit files or the outline.";
+	}
 	const strict = config.reflectionLoop?.context.purpose === "permissionRuleRequest";
 	const budget = strict ? "一轮" : "两轮";
 	return config.locale === "zh-CN"
@@ -1572,15 +1597,17 @@ async function runExitPlanModeReflectionLoop(
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
 	reflectionAbort: AbortController,
+	/** An outline plan's review prompt (PR 8b): its tool is PlanReview. */
+	outlinePrompt: string | null = null,
 ): Promise<ReflectionLoopObservation> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
 	return runReflectionLoop({
 		parentConfig,
 		rows,
-		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
+		prompt: outlinePrompt ?? buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
 		onProgress: (snapshot) => void broadcastPlanReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
-			allowedTools: getExitPlanReflectionAllowedTools(parentConfig),
+			allowedTools: getExitPlanReflectionAllowedTools(parentConfig, outlinePrompt !== null),
 			context: {
 				kind: "exitPlanMode",
 				requestId,
@@ -1834,6 +1861,10 @@ export async function resolveDangerReflectionDecision(
 
 interface ExitPlanReflectionGateResult {
 	checkFailed?: boolean;
+	/**
+	 * `human` (an outline plan's review, PR 8b): the plan goes to a person, as with `manual`, but
+	 * with the person told as for any plan waiting for them (they are not already watching).
+	 */
 	decision: ExitPlanReflectionDecision | { action: "manual"; reason?: string };
 	input: Record<string, unknown>;
 }
@@ -1849,6 +1880,9 @@ export async function resolveExitPlanModeReflection(
 		"@server/services/narrator-permission"
 	);
 	const planReadPolicy = await loadPlanFileReadPolicy(config.narratorId);
+	// The ExitPlanMode call: an outline plan's review is written for it and handed on by it.
+	const toolCallId =
+		recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId ?? null;
 	const resolvedInput = await resolveExitPlanModeInputWithBackend(
 		config.narratorId,
 		config.cwd,
@@ -1859,6 +1893,10 @@ export async function resolveExitPlanModeReflection(
 		config.executionTarget,
 		config.planFilePath,
 		planReadPolicy,
+		// A restored gate's input is the one resolved before (an outline plan decided meanwhile).
+		recoveryGate !== undefined,
+		// Not the call's permission: nothing handed on is taken here (review round 2 N8).
+		{ toolCallId },
 	);
 	if (!resolvedInput.ok) {
 		return {
@@ -1875,7 +1913,13 @@ export async function resolveExitPlanModeReflection(
 		// A taken-over plan gate is no longer AI-owned. The caller must re-register
 		// the real ExitPlanMode permission under the original tool-call identity.
 		// Do not create a synthetic running gate or launch an auxiliary model request.
-		if (typeof toolUse.input.plan === "string" && toolUse.input.plan !== resolvedInput.input.plan) {
+		// An outline plan that changed while it waited is put to the person again as it is now
+		// (outline P2 PR 8b, review round 1); a plan file is still refused.
+		if (
+			typeof toolUse.input.plan === "string" &&
+			toolUse.input.plan !== resolvedInput.input.plan &&
+			!outlinePlanSubmissionOf(resolvedInput.input)
+		) {
 			return {
 				decision: {
 					action: "revise",
@@ -1892,6 +1936,53 @@ export async function resolveExitPlanModeReflection(
 	const requestId =
 		restoredReflection?.requestId ??
 		`exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	// An outline plan (outline P2 PR 8b, D48 Q1) is reviewed, not revised: PlanReview leaves its
+	// concerns under the plan and hands it to a person; no concerns approves it as before.
+	const outlinePlan = outlinePlanSubmissionOf(resolvedInput.input) !== null;
+	const outlinePlanMode = outlinePlan ? await import("@server/services/outline-plan-mode") : null;
+	// A new review of this call: whatever an earlier attempt handed on is stale (round 2 N8).
+	outlinePlanMode?.forgetHandedCall(config.narratorId, toolUse.toolUseId);
+	if (outlinePlanMode && restoredReflection?.requestId) {
+		// Restored after its comments were written: a person decides on them; no second review.
+		const recovered = await outlinePlanMode.recoverOutlinePlanReview({
+			narratorId: config.narratorId,
+			requestId,
+			toolUseId: toolUse.toolUseId,
+			toolCallId,
+			input: resolvedInput.input,
+			locale,
+		});
+		if (recovered) {
+			const restoredGate = createExitPlanReflectionDecision(requestId, {
+				narratorId: config.narratorId,
+				broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+				parentToolUseId: config.parentToolUseId,
+				toolUseId: toolUse.toolUseId,
+				toolName: toolUse.name,
+				inputJson: recovered.input,
+				toolCallId: toolCallId ?? undefined,
+				restoredStartedAt: restoredReflection.startedAt,
+			});
+			const reason = `Plan review left ${recovered.review.count} comment(s) under the plan; awaiting user decision`;
+			const handed = await handOverExitPlanReflection(requestId, {
+				reason,
+				input: recovered.input,
+			});
+			const decision = handed
+				? await restoredGate
+				: { action: "human" as const, reason, input: recovered.input };
+			cleanupExitPlanReflection(requestId);
+			return { decision, input: recovered.input };
+		}
+	}
+	const outlinePrompt = outlinePlanMode
+		? await outlinePlanMode.outlinePlanReviewPrompt({
+				narratorId: config.narratorId,
+				requestId,
+				input: resolvedInput.input,
+				locale,
+			})
+		: null;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -1920,6 +2011,7 @@ export async function resolveExitPlanModeReflection(
 		toolUse,
 		resolvedInput.input,
 		reflectionAbort,
+		outlinePrompt,
 	).finally(() => {
 		reflectionDone = true;
 	});
@@ -1941,6 +2033,29 @@ export async function resolveExitPlanModeReflection(
 					typeof outcome === "string"
 						? `the reflection loop crashed before producing a decision: ${outcome}`
 						: outcome.failureSummary;
+				// An outline plan's review that could not finish hands the plan to a person (PR 8b):
+				// a review never holds a plan back.
+				if (outlinePlan) {
+					const reason = `Plan review could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
+					// The version submitted goes on with it (review round 2 N7), handed on before
+					// the handover so the permission always finds it (round 3). This runs after a
+					// review that decided too: then it writes nothing over that review's hand-off,
+					// and takes back only its own when its handover does not happen.
+					const handed = outlinePlanMode?.handOnSubmission({
+						narratorId: config.narratorId,
+						toolUseId: toolUse.toolUseId,
+						toolCallId,
+						input: resolvedInput.input,
+					});
+					if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+					if (handed)
+						outlinePlanMode?.forgetHandedCall(config.narratorId, toolUse.toolUseId, handed);
+					const settled = await Promise.race<ExitPlanReflectionDecision | null>([
+						decisionPromise,
+						Promise.resolve(null),
+					]);
+					return settled ?? { action: "human" as const, reason };
+				}
 				const fallbackMessage = buildReflectionFallbackMessage(
 					"ExitPlanMode reflection",
 					failureSummary,
@@ -1972,6 +2087,27 @@ export async function resolveExitPlanModeReflection(
 	}
 	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupExitPlanReflection(requestId);
+	if (outlinePlanMode && decision.action === "manual") {
+		// Taken over just as the review wrote its comments: the person decides with them.
+		const written = await outlinePlanMode
+			.recoverOutlinePlanReview({
+				narratorId: config.narratorId,
+				requestId,
+				toolUseId: toolUse.toolUseId,
+				toolCallId,
+				input: resolvedInput.input,
+				locale,
+			})
+			.catch(() => null);
+		if (written) return { decision, input: written.input };
+		// Taken over before it wrote anything: the version submitted goes on (round 2 N7).
+		outlinePlanMode.handOnSubmission({
+			narratorId: config.narratorId,
+			toolUseId: toolUse.toolUseId,
+			toolCallId,
+			input: resolvedInput.input,
+		});
+	}
 	return {
 		decision,
 		input: resolvedInput.input,
@@ -2568,12 +2704,33 @@ async function executeToolAfterReflections(
 				tu,
 				options.recoveryGate,
 			);
+			// What the review gate handed on for an outline plan is taken by its permission; if the
+			// permission never ran (an abort first), it is forgotten here (review round 2 N8).
+			const forgetHanded = async () => {
+				if (!outlinePlanSubmissionOf(tu.input)) return;
+				const { forgetHandedCall } = await import("@server/services/outline-plan-mode");
+				forgetHandedCall(config.narratorId, tu.toolUseId);
+			};
 			if (reflected.decision.action === "manual") {
 				tu.input = reflected.input;
 				// User manually took over the plan reflection; the loop falls back to the
 				// normal ExitPlanMode approval. They are already driving this, so the
 				// fallback permission request must not raise a user-facing notification.
-				return executeAfterPreAdmission({ suppressAttention: true });
+				try {
+					return await executeAfterPreAdmission({ suppressAttention: true });
+				} finally {
+					await forgetHanded();
+				}
+			}
+			if (reflected.decision.action === "human") {
+				// An outline plan's review left its comments under the plan, or could not finish
+				// (PR 8b): the plan waits for a person like any ExitPlanMode, told as usual.
+				tu.input = reflected.decision.input ?? reflected.input;
+				try {
+					return await executeAfterPreAdmission();
+				} finally {
+					await forgetHanded();
+				}
 			}
 			if (
 				reflected.decision.action !== "confirm" &&
@@ -2614,6 +2771,12 @@ async function executeToolAfterReflections(
 				pendingPlanApproverSource.delete(config.narratorId);
 			}
 			return result;
+		}
+		if (tu.name === "ExitPlanMode") {
+			// No review this time: nothing an earlier attempt of this call handed on may reach its
+			// permission (outline P2 PR 8b review round 2 N8).
+			const { forgetHandedCall } = await import("@server/services/outline-plan-mode");
+			forgetHandedCall(config.narratorId, tu.toolUseId);
 		}
 		if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
 			const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
@@ -3080,17 +3243,34 @@ async function* agentLoopInMetadataSnapshot(
 			// Re-check after awaiting classification: parallel tool completions may
 			// reach this point together, but must still queue only one reminder.
 			relaxedPlanReminderQueued = true;
+			// An outline session's plan goes under its plan root (outline P2 PR 8), not in a file:
+			// its own wording (review round 1 N4). A plan-file cycle keeps the file's (S7).
+			const outlineView =
+				config.taskBackend === "outline"
+					? await (await import("@server/services/outline-plan-mode")).outlinePlanPromptRoot(
+							config.narratorId,
+						)
+					: null;
 			queueLoopInjection({
 				source: "relaxed_plan",
-				...sideCarBodyWithText(
-					"relaxed_plan",
-					// The reminder now says WHERE the plan goes. Without it the model is told
-					// "keep planning" and left to rediscover the designated path from the
-					// EnterPlanMode result many turns back — which is how a plan ends up
-					// written somewhere ExitPlanMode will not read.
-					{ kind: "notice", params: { planFile: relaxedPlanReminderPlanFile(config) } },
-					locale,
-				),
+				...(outlineView
+					? sideCarBodyWithText(
+							"relaxed_plan",
+							{
+								kind: "prose",
+								text: getOutlinePlanRelaxedReminder(locale, outlineView.root?.address ?? null),
+							},
+							locale,
+						)
+					: sideCarBodyWithText(
+							"relaxed_plan",
+							// The reminder now says WHERE the plan goes. Without it the model is told
+							// "keep planning" and left to rediscover the designated path from the
+							// EnterPlanMode result many turns back — which is how a plan ends up
+							// written somewhere ExitPlanMode will not read.
+							{ kind: "notice", params: { planFile: relaxedPlanReminderPlanFile(config) } },
+							locale,
+						)),
 				toolUseId: tu.toolUseId,
 			});
 		}
@@ -3963,6 +4143,12 @@ async function* agentLoopInMetadataSnapshot(
 			let requestId = "";
 			let requestStartTime = 0;
 			let requestTtftMs: number | undefined;
+			/**
+			 * When this attempt's first persistable content (text / reasoning / named tool
+			 * call / search / image) arrived. Unlike TTFT it ignores queue notices, so
+			 * `now - requestFirstContentAt` is pure decode time for output-speed figures.
+			 */
+			let requestFirstContentAt: number | undefined;
 			let requestUsage:
 				| {
 						promptTokens?: number;
@@ -4181,6 +4367,9 @@ async function* agentLoopInMetadataSnapshot(
 						),
 					ttftMs: requestTtftMs,
 					durationMs: Date.now() - requestStartTime,
+					...(requestFirstContentAt !== undefined
+						? { decodeMs: Math.max(0, Date.now() - requestFirstContentAt) }
+						: {}),
 					contextPercent: requestContextPercent,
 					meterUsage: requestMeterUsage,
 					meterUnit: requestMeterUnit,
@@ -4408,7 +4597,7 @@ async function* agentLoopInMetadataSnapshot(
 					model: effectiveModel,
 					providerId: decided.providerId,
 					providerPrefix: decided.providerPrefix,
-					waitKind: "quota",
+					waitKind: decided.waitKind ?? "quota",
 					quotaProvider: decided.quotaProvider,
 					quotaBucket: decided.bucket,
 					resumeAt: quota.kind === "wait" ? quota.wait.resumeAt : undefined,
@@ -4637,6 +4826,7 @@ async function* agentLoopInMetadataSnapshot(
 				requestFinished = false;
 				requestStartPending = false;
 				requestTtftMs = undefined;
+				requestFirstContentAt = undefined;
 				requestUsage = undefined;
 				inputCharacters = null;
 				inputComposition = null;
@@ -5030,6 +5220,7 @@ async function* agentLoopInMetadataSnapshot(
 						// notice or an id-only toolUseChunk must register as contentless,
 						// otherwise "only bookkeeping arrived" cannot be detected.
 						if (!hasPersistableStreamContent(parsed)) contentlessEventCount++;
+						else requestFirstContentAt ??= Date.now();
 						// `stopReason` is the provider's own completion reason. It was
 						// previously read nowhere in this loop, which is why an empty turn
 						// could not distinguish "model stopped" from "nothing arrived".

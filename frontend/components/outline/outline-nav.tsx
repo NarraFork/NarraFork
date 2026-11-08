@@ -7,6 +7,10 @@
  *
  * Links render through the host's link renderer, so a routed host keeps real anchors (open in
  * a new tab, copy the address). Without one, a link is an anchor that calls `onNavigate`.
+ *
+ * A few links leave the outline's places (a session, the reports page, the page a commit changed
+ * through the reference route): `OutlineHrefLink` is a real anchor to the app path, which the host
+ * opens on a plain click (`onNavigateHref`); without one the browser follows it.
  */
 import type { OutlineViewMode } from "@shared/outline-api";
 import {
@@ -18,6 +22,7 @@ import {
 	useContext,
 	useMemo,
 } from "react";
+import { assetUrl } from "../../lib/base-path";
 
 export type OutlineTarget =
 	| { kind: "home" }
@@ -42,22 +47,34 @@ export type OutlineLinkRenderer = (props: OutlineLinkProps) => ReactElement;
 interface OutlineNav {
 	navigate: (to: OutlineTarget) => void;
 	renderLink: OutlineLinkRenderer | null;
+	/** Open an app path (no mount prefix) that is no outline place; null: the browser does. */
+	navigateHref: ((path: string) => void) | null;
 }
 
-const OutlineNavContext = createContext<OutlineNav>({ navigate: () => {}, renderLink: null });
+const OutlineNavContext = createContext<OutlineNav>({
+	navigate: () => {},
+	renderLink: null,
+	navigateHref: null,
+});
 
 export function OutlineNavProvider({
 	onNavigate,
 	renderLink,
+	onNavigateHref,
 	children,
 }: {
 	onNavigate: (to: OutlineTarget) => void;
 	renderLink?: OutlineLinkRenderer;
+	onNavigateHref?: (path: string) => void;
 	children: ReactNode;
 }) {
 	const value = useMemo(
-		() => ({ navigate: onNavigate, renderLink: renderLink ?? null }),
-		[onNavigate, renderLink],
+		() => ({
+			navigate: onNavigate,
+			renderLink: renderLink ?? null,
+			navigateHref: onNavigateHref ?? null,
+		}),
+		[onNavigate, renderLink, onNavigateHref],
 	);
 	return <OutlineNavContext.Provider value={value}>{children}</OutlineNavContext.Provider>;
 }
@@ -83,6 +100,33 @@ export function OutlineLink(props: OutlineLinkProps): ReactElement {
 				if (event.defaultPrevented) return;
 				event.preventDefault();
 				nav.navigate(to);
+			}}
+		/>
+	);
+}
+
+export type OutlineHrefLinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "href"> & {
+	/** The app path, with its query, without the mount prefix. */
+	path: string;
+};
+
+/**
+ * A link to an app path that is no outline place: a real anchor (the mount prefix added), opened
+ * by the host on a plain click; a modified click, or no host, is the browser's.
+ */
+export function OutlineHrefLink({ path, onClick, ...rest }: OutlineHrefLinkProps): ReactElement {
+	const nav = useContext(OutlineNavContext);
+	return (
+		<a
+			{...rest}
+			href={assetUrl(path)}
+			onClick={(event: MouseEvent<HTMLAnchorElement>) => {
+				onClick?.(event);
+				const modified =
+					event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey;
+				if (event.defaultPrevented || modified || !nav.navigateHref) return;
+				event.preventDefault();
+				nav.navigateHref(path);
 			}}
 		/>
 	);

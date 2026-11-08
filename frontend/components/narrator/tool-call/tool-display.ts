@@ -5,6 +5,7 @@ import {
 	formatCommunicationState,
 	resolveCommunicationTargets,
 } from "@shared/pretext-layout/communication-state";
+import { outlineToolSummary } from "@shared/pretext-layout/outline-tool-card";
 import { workspaceSummary } from "@shared/pretext-layout/workspace-tool-display";
 
 /** Only a live foreground Bash command can be detached; never stop/Agent/Send calls. */
@@ -142,8 +143,8 @@ const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeAdmin",
 ]);
 
-/** The block outline: reads, searches and edits of the team's versioned notes. */
-const OUTLINE_TOOLS = new Set(["OutlineRead", "OutlineSearch", "OutlineEdit"]);
+/** The block outline: reads, searches and edits of the team's versioned notes, and questions. */
+const OUTLINE_TOOLS = new Set(["OutlineRead", "OutlineSearch", "OutlineEdit", "Ask"]);
 
 export function getCategory(name: string, input?: unknown): ToolCategory {
 	// Spec task-queue file operations render as a task list, not a raw file diff.
@@ -468,52 +469,18 @@ export function knowledgeSummary(
 }
 
 /**
- * Header summary for the outline tools, shared by every renderer: the address read, the query,
- * or the edits made, completed from persisted metadata (block and result counts, the commit).
+ * Header summary for the outline tools, shared by every renderer: what the call did, in the
+ * reader's words (`@shared/pretext-layout/outline-tool-card`) — "勾成完成 <task> · 记下 3 条",
+ * a read's block by its title, a search's query and hit count, an Ask's first question. An
+ * OutlineEdit's figures (`✓1 +3 #6`) are drawn beside it from its metadata.
  */
 export function outlineSummary(
 	toolName: string,
 	input: unknown,
 	metadata?: Record<string, unknown>,
+	labels?: Readonly<Record<string, string>>,
 ): string {
-	const meta = metadata ?? {};
-	switch (toolName) {
-		case "OutlineRead": {
-			const address = extractField(input, "address") || readLeafText(meta.address) || "";
-			const asOf = extractField(input, "asOf") || String(extractNumericField(input, "asOf") ?? "");
-			const blocks = typeof meta.blocks === "number" ? meta.blocks : undefined;
-			const parts = [address ? short(address, 48) : "spaces"];
-			if (asOf) parts.push(`as of ${short(asOf, 24)}`);
-			if (blocks != null) parts.push(`${blocks} blocks`);
-			return parts.join(" · ");
-		}
-		case "OutlineSearch": {
-			const query = extractField(input, "query") || readLeafText(meta.query) || "";
-			const count = typeof meta.resultCount === "number" ? meta.resultCount : undefined;
-			if (!query) return count != null ? `${count} results` : "Search";
-			return count != null ? `${short(query, 48)} · ${count}` : short(query, 60);
-		}
-		case "OutlineEdit": {
-			const raw =
-				input && !isTruncated(input) && typeof input === "object"
-					? (input as Record<string, unknown>).edits
-					: undefined;
-			const edits = Array.isArray(raw) ? raw : [];
-			const commit = meta.commit && typeof meta.commit === "object" ? meta.commit : null;
-			const seq = commit ? (commit as Record<string, unknown>).seq : undefined;
-			const kinds = new Map<string, number>();
-			for (const edit of edits) {
-				if (!edit || typeof edit !== "object") continue;
-				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
-				if (kind) kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
-			}
-			const parts = [...kinds].map(([kind, n]) => (n === 1 ? kind : `${kind} ×${n}`));
-			if (typeof seq === "number") parts.push(`#${seq}`);
-			return parts.length > 0 ? parts.join(" · ") : "Edit";
-		}
-		default:
-			return toolName;
-	}
+	return outlineToolSummary(toolName, isTruncated(input) ? undefined : input, metadata, labels);
 }
 
 /** Only routing fields belong in a collapsed notification row, never its message body. */
@@ -812,7 +779,7 @@ export function getSummary(
 		case "knowledge":
 			return knowledgeSummary(toolName, input, metadata);
 		case "outline":
-			return outlineSummary(toolName, input, metadata);
+			return outlineSummary(toolName, input, metadata, labels);
 		case "contextAsk": {
 			const target = contextAskTargetLabel(input, metadata);
 			const questionCount = contextAskQuestionCount(input, metadata);

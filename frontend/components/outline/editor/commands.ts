@@ -399,7 +399,10 @@ export function toggleTask(): Command {
 		const d = blockDepth(state.selection.$from);
 		if (d < 0) return false;
 		const pos = state.selection.$from.before(d);
-		const cur = state.selection.$from.node(d).attrs.task;
+		const node = state.selection.$from.node(d);
+		// A question put to a person is answered, never ticked (the page refuses its checkbox).
+		if (node.attrs.question) return false;
+		const cur = node.attrs.task;
 		dispatch?.(state.tr.setNodeAttribute(pos, "task", cur ? null : " "));
 		return true;
 	};

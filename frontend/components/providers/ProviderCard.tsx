@@ -25,6 +25,8 @@ export interface ProviderCardProps {
 	hiddenCount: number;
 	previewModels: string[];
 	disabled: boolean;
+	/** Left out of `auto:<model>` routing; models stay usable when named explicitly. */
+	autoExcluded?: boolean;
 	isRefreshing?: boolean;
 	controlsDisabled?: boolean;
 	onToggleDisabled: () => void;
@@ -45,6 +47,7 @@ export const ProviderCard = React.memo(function ProviderCard({
 	hiddenCount,
 	previewModels,
 	disabled,
+	autoExcluded,
 	isRefreshing,
 	controlsDisabled,
 	onToggleDisabled,
@@ -98,21 +101,32 @@ export const ProviderCard = React.memo(function ProviderCard({
 						}}
 						style={{ flex: 1, minWidth: 0 }}
 					>
-						<Group gap="xs" wrap="nowrap">
+						<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
 							<Text fw={600} size="sm" truncate>
 								{label}
 							</Text>
-							<Badge size="xs" variant="light" color={type === "platform" ? "violet" : "blue"}>
+							<Badge
+								size="xs"
+								variant="light"
+								color={type === "platform" ? "violet" : "blue"}
+								style={{ flexShrink: 0 }}
+							>
 								{type === "platform"
 									? t("providerTypePlatform")
 									: (badgeLabel ?? t("providerTypeCustom"))}
 							</Badge>
+							{autoExcluded && !disabled && (
+								<Badge size="xs" variant="outline" color="gray" style={{ flexShrink: 0 }}>
+									{t("autoParticipation.excludedBadge")}
+								</Badge>
+							)}
 						</Group>
 					</UnstyledButton>
 					<Box
 						onClick={(event) => {
 							event.stopPropagation();
 						}}
+						style={{ flexShrink: 0 }}
 					>
 						<Group gap={4} wrap="nowrap">
 							<Switch

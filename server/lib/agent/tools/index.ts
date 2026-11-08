@@ -12,6 +12,7 @@ import {
 	exitPlanConfirmAndCompactTool,
 	exitPlanConfirmTool,
 	exitPlanReviseTool,
+	planReviewTool,
 } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
 import { genUiTool } from "./gen-ui";
@@ -26,7 +27,7 @@ import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { notificationTool } from "./notification";
-import { outlineEditTool, outlineReadTool, outlineSearchTool } from "./outline";
+import { askTool, outlineEditTool, outlineReadTool, outlineSearchTool } from "./outline";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
@@ -146,6 +147,7 @@ const coreProvider: ToolProvider = {
 			knowledgeLibraryTool,
 			outlineReadTool,
 			outlineSearchTool,
+			askTool,
 			switchDeviceTool,
 			switchWorkingDirectoryTool,
 			worktreeTool,
@@ -157,6 +159,7 @@ const coreProvider: ToolProvider = {
 			exitPlanConfirmTool,
 			exitPlanConfirmAndCompactTool,
 			exitPlanReviseTool,
+			planReviewTool,
 			taskReflectConfirmTool,
 			taskReflectReviseTool,
 		];
