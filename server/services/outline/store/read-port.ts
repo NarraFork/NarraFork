@@ -12,6 +12,7 @@
  */
 import type {
 	OutlineActorKind,
+	OutlineAskJson,
 	OutlineLinkKind,
 	OutlineLinkTargetKind,
 	OutlineTaskJson,
@@ -26,6 +27,8 @@ export interface OutlineStructureRow {
 	orderKey: string;
 	alias: string | null;
 	taskJson: OutlineTaskJson | null;
+	/** A question put to a person; process like a task (design §2.1). Absent: none. */
+	askJson?: OutlineAskJson | null;
 	/** `from_seq` of the version this row comes from (the block's `version_seq` when current). */
 	versionSeq: number;
 }
@@ -213,6 +216,11 @@ export interface OutlineReadPort {
 	): Promise<string[]>;
 	/** Blocks by id, live or deleted, in any space. */
 	getBlocks(ids: readonly string[]): Promise<OutlineBlockRow[]>;
+	/**
+	 * The first {@link OUTLINE_PAGE_HEAD_CHARS} characters of the content of blocks, by id, in any
+	 * space: enough for their titles (a task list shows many, and a whole body is up to 16 KiB).
+	 */
+	getBlockHeads(ids: readonly string[]): Promise<Array<{ id: string; contentHead: string }>>;
 	/** Live blocks of the given spaces with a sid or an alias, at most `limit`. */
 	findLiveBlocks(
 		spaceIds: readonly string[],

@@ -58,7 +58,7 @@ export const REVIEW_HEADER_BADGE = 17;
 /** Button size="compact-xs" height (the action). */
 export const REVIEW_HEADER_BUTTON = 18;
 /** xs single line box (12 × 1.4 ≈ 17) — the header's own label. */
-export const REVIEW_HEADER_LABEL_LINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const REVIEW_HEADER_LABEL_LINE_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Gap between the header row and the body. */
 export const REVIEW_HEADER_GAP = 6;
 
@@ -176,7 +176,7 @@ export const MEASURE_REVIEW_CARD_CONSTANTS = {
 	REVIEW_HEADER_ICON,
 	REVIEW_HEADER_BADGE,
 	REVIEW_HEADER_BUTTON,
-	REVIEW_HEADER_LABEL_LINE,
+	REVIEW_HEADER_LABEL_LINE_BASELINE,
 	REVIEW_HEADER_GAP,
 	REVIEW_BODY_CAP,
 } as const;

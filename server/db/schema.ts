@@ -32,6 +32,11 @@ import type {
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import type { NotificationLink } from "@shared/notification-center";
 import type { LinkTarget, TaskStatus } from "@shared/outline";
+import type {
+	OutlineDigestCounts,
+	OutlineDigestRanges,
+	OutlineDigestStored,
+} from "@shared/outline-digest";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { sql } from "drizzle-orm";
 import {
@@ -622,6 +627,10 @@ export const narrators = sqliteTable(
 		aclRootNarratorId: text("acl_root_narrator_id").references((): any => narrators.id, {
 			onDelete: "set null",
 		}),
+		/** Durable reply policy; null identifies legacy records awaiting initialization. */
+		replyContext: text("reply_context", { mode: "json" }).$type<
+			import("../../shared/reply-context").ReplyContext
+		>(),
 		/**
 		 * Bounded runtime relationships of this narrator: policy source, controller
 		 * grant and the current run binding (cancel source, result delivery, principal,
@@ -2266,27 +2275,42 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * family of roles (body, xs, headings, code) from one factor. Storing an absolute
 	 * size would fix only one role and leave the rest to drift.
 	 *
-	 * Defaults are the neutral setting: 100 / 0 / 100 measures byte-identically to a
-	 * build without this feature, so existing rows and fresh installs are unaffected.
+	 * Font, spacing and block defaults are the neutral setting (100 / 0 / 100). Line
+	 * height moved to a new scale whose 100% is the old 120% (see the two columns below).
 	 * Ranges are enforced in `TYPOGRAPHY_RANGE` and clamped on read as well as write —
 	 * a value outside them makes scaled text collide with unscalable card chrome.
 	 */
 	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
 	/** Letter spacing as a percentage OF the font size (an em fraction ×100). */
 	narratorLetterSpacingPercent: integer("narrator_letter_spacing_percent").notNull().default(0),
-	/** Intra-paragraph line-height (leading) multiplier; distinct from block spacing. */
+	/**
+	 * Intra-paragraph line-height (leading) multiplier on the OLD scale: 100 = the bare
+	 * Mantine ratios (body 1.45). Superseded by `narratorLineHeightV2Percent`; kept, and
+	 * still written (mirrored), so a build from before the rescale reads the same
+	 * effective line height after a downgrade.
+	 */
 	narratorLineHeightScalePercent: integer("narrator_line_height_scale_percent")
 		.notNull()
 		.default(100),
+	/**
+	 * Line-height multiplier on the CURRENT scale: 100 = the Mantine ratios × 1.2
+	 * (`LINE_HEIGHT_BASELINE_PERCENT` — the old 120% became the new 100%).
+	 *
+	 * NULL until the reader saves a line height on this scale; the value is then derived
+	 * from the old column on read (`lineHeightPercentFromLegacy`: old default → new default,
+	 * any other old value keeps its effective height). Deriving on read instead of
+	 * rewriting the old column in place is what makes the rescale happen exactly once:
+	 * the old column is never modified by it, so there is nothing to rescale twice.
+	 */
+	narratorLineHeightV2Percent: integer("narrator_line_height_v2_percent"),
 	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),
-	// How the sidebar renders the recent-tab work section. "flat" is the historical
-	// behaviour (one row per tab, manually sortable); "directory" merges narrators
-	// that share a working directory into collapsible groups so the path is shown once.
+	// RETIRED: the sidebar's directory-aggregation mode was replaced by user-made folders.
+	// Still accepted and returned for old clients; the sidebar no longer reads it.
 	recentTabsGroupMode: text("recent_tabs_group_mode", { enum: ["flat", "directory"] })
 		.notNull()
 		.default("flat"),
@@ -2386,6 +2410,14 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * for a lesson that no longer exists is simply not shown.
 	 */
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
+	/**
+	 * The outline's daily report (汇报, P2 PR 11, owner decision Q2 = B): the IANA time zone a
+	 * person's day is cut in (midnight to midnight there), and the local time of day (`HH:MM`) the
+	 * report of a day is made on the next day. NULL until the person sets one: the server's time
+	 * zone, and 07:00 (`services/outline/digest-time.ts`).
+	 */
+	outlineDigestTimeZone: text("outline_digest_time_zone"),
+	outlineDigestTime: text("outline_digest_time"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -2551,13 +2583,35 @@ export const userRecentTabs = sqliteTable(
 		tabKey: text("tab_key").notNull(),
 		section: text("section", { enum: ["projects", "work"] }).notNull(),
 		type: text("type", {
-			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group"],
+			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder"],
 		}).notNull(),
 		entityId: text("entity_id").notNull(),
 		narratorId: text("narrator_id"),
 		representedNarratorId: text("represented_narrator_id"),
 		parentNarratorId: text("parent_narrator_id"),
+		/**
+		 * RETIRED. The sidebar used to group a workspace's narrators under a
+		 * `type = "workspace"` header through this column. Those groups were converted to
+		 * folders (`folder_id`) by the one-time per-user migration that sets
+		 * `user_recent_tabs_meta.folders_migrated`. New rows never set it; the only reader
+		 * is `workspace-panel-service`'s one-time backfill, which clears it afterwards.
+		 * Kept because dropping a SQLite column rebuilds the table.
+		 */
 		workspaceId: text("workspace_id"),
+		/**
+		 * The sidebar folder this tab belongs to: the `entity_id` of a `type = "folder"`
+		 * row of the same user. A folder's rows are kept contiguous right after its
+		 * header (see `regroupFolders`). Folders never nest.
+		 */
+		folderId: text("folder_id"),
+		/** Folder rows only: icon key and colour key chosen in the folder editor. */
+		folderIcon: text("folder_icon"),
+		folderColor: text("folder_color"),
+		/**
+		 * Folder rows only: how many members stay visible while the folder is open but
+		 * not fully expanded. NULL means the client default.
+		 */
+		folderPreviewCount: integer("folder_preview_count"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -2566,21 +2620,8 @@ export const userRecentTabs = sqliteTable(
 		isScheduled: integer("is_scheduled", { mode: "boolean" }).notNull().default(false),
 		sortOrder: integer("sort_order").notNull(),
 		/**
-		 * The member position the user arranged by hand inside a directory group
-		 * (sidebar directory-aggregation mode).
-		 *
-		 * MUST stay separate from `sort_order`. That column carries recency and is
-		 * rewritten by the `above_idle` auto-promote every time a narrator starts
-		 * working, so a hand-ordered position stored there is wiped by the next status
-		 * change — that was the actual reason drag-to-reorder never stuck in this mode.
-		 *
-		 * NULL means "never hand-ordered" and sorts BEFORE the ordered members, in
-		 * recency order. A newly visited narrator is the newest thing in the group, so
-		 * burying it under older hand-placed rows would contradict the recency promise
-		 * the rest of the list makes.
-		 *
-		 * Cleared when the tab's cwd changes, otherwise a stale index from the previous
-		 * directory would interleave with the new group's members.
+		 * RETIRED with the sidebar's directory-aggregation mode (replaced by folders).
+		 * Nothing reads or writes it; kept to avoid a table rebuild.
 		 */
 		dirSortOrder: integer("dir_sort_order"),
 		createdAt: text("created_at").notNull(),
@@ -2599,6 +2640,7 @@ export const userRecentTabs = sqliteTable(
 			table.workspaceId,
 			table.sortOrder,
 		),
+		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
 	],
@@ -2611,6 +2653,11 @@ export const userRecentTabsMeta = sqliteTable("user_recent_tabs_meta", {
 		.primaryKey()
 		.references(() => users.id, { onDelete: "cascade" }),
 	revision: integer("revision").notNull().default(0),
+	/**
+	 * True once this user's legacy workspace groups were converted into folders. Set in
+	 * the same transaction as the conversion; see `ensureMigratedLocked`.
+	 */
+	foldersMigrated: integer("folders_migrated", { mode: "boolean" }).notNull().default(false),
 	migratedAt: text("migrated_at").notNull(),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
@@ -3461,13 +3508,9 @@ export const workspaces = sqliteTable(
 // === workspace_panels ===
 // The authoritative membership of a workspace: one row per TOP-LEVEL panel.
 //
-// Rows, not a blob, for two reasons that the previous blob-only design could not
-// satisfy:
-//   - Adding or removing one panel touches one row, so two clients editing
-//     different panels never overwrite each other (a whole-blob write does).
-//   - Membership can be written in the SAME transaction as its
-//     `user_recent_tabs.workspace_id` projection, so a client can no longer end
-//     up with a persisted sidebar tab and a panel that exists nowhere.
+// Rows, not a blob: adding or removing one panel touches one row, so two clients
+// editing different panels never overwrite each other (a whole-blob write does).
+// The sidebar no longer mirrors this membership (its folders are independent).
 //
 // Scope is deliberately limited to panels that can stand on their own and are
 // rendered as top-level cells by BOTH presentation modes — the same set as
@@ -3538,6 +3581,11 @@ export const apiRequests = sqliteTable(
 		/** Request initiator, frozen at start; null for unknown legacy/system usage.
 		 * No FK: removing a user must not rewrite the accounting identity. */
 		userId: text("user_id"),
+		/** Who pays: the owner of the (root) narrator, else the initiator. Frozen at write.
+		 * Differs from userId when a collaborator drives someone else's narrator. No FK. */
+		billingUserId: text("billing_user_id"),
+		/** The narrator's primary project at request time; never rewritten. No FK. */
+		projectId: text("project_id"),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		// 外部 Agent 写入时可自带的叙述者文本（无 narrator 关联时用于占位显示）
 		agentLabel: text("agent_label"),
@@ -3562,6 +3610,8 @@ export const apiRequests = sqliteTable(
 		// 性能指标
 		ttftMs: integer("ttft_ms"), // Time to first token
 		durationMs: integer("duration_ms"), // 总耗时
+		// 首个内容输出 → 请求结束（不含排队与 prefill），用于输出速度；旧记录为 null
+		decodeMs: integer("decode_ms"),
 		// 成本
 		costUsd: real("cost_usd"),
 		/** Null marks an untouched historical record. */
@@ -3621,6 +3671,45 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 	lastUsedAt: text("last_used_at").notNull(),
 });
 
+// === usage_daily ===
+// Durable per-day usage ledger: one row per (UTC day, billing user, project, provider,
+// credential, model), upserted in the same transaction as the api_requests detail row and
+// never touched by narrator cleanup. Backs usage analysis and budgets without scanning
+// api_requests. Key columns store "" for "none" so the unique index always matches.
+// Costs are reference-price USD (server/lib/model-pricing.ts).
+export const usageDaily = sqliteTable(
+	"usage_daily",
+	{
+		id: text("id").primaryKey(),
+		/** UTC calendar day, YYYY-MM-DD. */
+		day: text("day").notNull(),
+		billingUserId: text("billing_user_id").notNull(),
+		projectId: text("project_id").notNull(),
+		provider: text("provider").notNull(),
+		credentialId: text("credential_id").notNull(),
+		model: text("model").notNull(),
+		requestCount: integer("request_count").notNull().default(0),
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+		cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		costUsd: real("cost_usd").notNull().default(0),
+		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	},
+	(table) => [
+		// Natural key; leading `day` also serves every date-range read.
+		uniqueIndex("idx_usage_daily_key").on(
+			table.day,
+			table.billingUserId,
+			table.projectId,
+			table.provider,
+			table.credentialId,
+			table.model,
+		),
+	],
+);
+
 // === credential_usage_totals ===
 // Lifetime token/cost rollup per (provider, credential, model).
 //
@@ -3635,15 +3724,11 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 // server/lib/model-pricing.ts). For subscription-based access that is an
 // equivalent-consumption figure, not an amount actually billed.
 //
-// SCOPE — this is NOT a full ledger of the deployment's spend. Rows only exist
-// for providers that have credential management (codex). Anthropic and
-// OpenAI direct connections carry credentialId = null (see
-// usage-history-service.getCredentialName) and are deliberately not rolled up
-// here: a synthetic bucket would give every unrelated keyless provider one
-// shared row, and the natural key would stop meaning "one credential".
-// "How much has this deployment spent in total" is answered from `api_requests`
-// for as long as those rows live. Do not read a sum over this table as the
-// deployment total.
+// SCOPE — rows exist for every source that can be identified: pooled credentials
+// (codex accounts, plugins) and API connections (keyed by their stable connection
+// id, see lib/request-source.ts). Requests from an unidentifiable source are not
+// rolled up here, and neither are failed requests, so a sum over this table is not
+// a deployment total; use usage_daily for that.
 export const credentialUsageTotals = sqliteTable(
 	"credential_usage_totals",
 	{
@@ -5436,6 +5521,29 @@ export interface OutlineTaskLockJson {
 }
 
 /**
+ * A plan's state on its root task (outline P2 PR 8, D48; design §4.3): written by the system only
+ * (`EnterPlanMode`, the approval), never by an agent's edit. While `planning`, the root and every
+ * task under it are left out of continuation and the "current tasks" view: an unapproved plan is
+ * never executed. `approved` (as a draft or locked) counts as work the person wants
+ * (`protectedOnly`, D48 Q2).
+ */
+export interface OutlineTaskPlanJson {
+	state: "planning" | "approved";
+	/** The session (root narrator id) planning it. */
+	by: string;
+	/** Submissions decided so far (approved or returned). */
+	round: number;
+	/**
+	 * The seq the next submission is compared against ("the diff against the previous version"):
+	 * the commit that began this round of planning or returned the last submission. 0: nothing
+	 * (a plan root created for this planning: its first version is all new).
+	 */
+	baseSeq: number;
+	/** Who approved it: a person, or the system on a person's behalf (plan review). */
+	approvedBy?: OutlineTaskActorRef;
+}
+
+/**
  * Task state of an outline block (`task_json`): checkbox, assignee, prerequisites, due date, and
  * the P2 fields. Rows written before a field existed simply lack it; every optional field reads
  * as its default when absent (no manager known, not human-created, not locked, not claimable),
@@ -5457,6 +5565,8 @@ export interface OutlineTaskJson {
 	lock?: OutlineTaskLockJson;
 	/** In the claimable pool (design §4.5, D38); absent means false. */
 	claimable?: true;
+	/** Present on a plan's root task (outline P2 PR 8). */
+	plan?: OutlineTaskPlanJson;
 }
 
 /** Who proposed a pending change, with the provenance its confirmation commits under. */
@@ -5476,6 +5586,49 @@ export interface OutlinePendingDeciderJson {
 	by: OutlineTaskActorRef;
 	/** Narrator id of the session that may confirm on the locker's behalf, or null. */
 	delegate: string | null;
+}
+
+/**
+ * The answer of a question (`OutlineAskJson.answer`): the person's decision. A choice
+ * (`option`, 1-based), their own words (`text`), or both; `adopted` when it is the asker's
+ * recommendation. `relayed`: the asking session wrote it down from what the person said in the
+ * conversation (design §3.3), the message it came from when known.
+ */
+export interface OutlineAskAnswerJson {
+	option?: number;
+	text?: string;
+	adopted?: true;
+	/** The person whose decision it is. */
+	by: OutlineTaskActorRef;
+	at: string;
+	/**
+	 * `via`: the origin label of the message it came from when it did not come through NarraFork
+	 * itself (`gateway:<platform handle>`, `oauth:<client>`): who actually typed it.
+	 */
+	relayed?: { narratorId: string; messageId: string | null; via?: string };
+}
+
+/**
+ * A question put to a person (`Ask`, outline P2 PR 7; design §3.3), stored on its block next to
+ * the content (the question itself): who is asked, the choices, the asker's recommendation and
+ * why, and later the answer or the withdrawal. Versioned with the block, so the time machine and
+ * reverts see it. A block is a question or a task, never both. What only routes and delivers it
+ * (who asked, whether the asker was told) is `outline_questions`.
+ */
+export interface OutlineAskJson {
+	/** Who is asked: a person. */
+	to: OutlineTaskActorRef;
+	/** The choices, when there are any. */
+	options?: string[];
+	/** The asker's recommendation: one of the options (1-based), or in words; and why. */
+	recommend: { option?: number; text?: string; reason?: string };
+	/**
+	 * A reversible decision the asker went ahead with (owner decision Q4): its task does not wait,
+	 * and the asker is woken only when the answer differs from the recommendation.
+	 */
+	proceed?: true;
+	answer?: OutlineAskAnswerJson;
+	withdrawn?: { by: OutlineTaskActorRef; at: string; reason?: string };
 }
 
 // === outline_spaces ===
@@ -5517,9 +5670,22 @@ export const outlineSpaces = sqliteTable(
 		 * rebuild has since rewritten is refused as stale and planned again.
 		 */
 		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
+		/**
+		 * `created_at` of the space's latest commit, written by the statement that claims the seq
+		 * (P2 PR 11): which spaces had commits since a time is one range read on its index, not a
+		 * scan of every space. NULL until the space's first commit; spaces committed to before the
+		 * column existed are stamped by the report job from their last commit.
+		 */
+		lastCommitAt: text("last_commit_at"),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		// Spaces with commits since a time, by that time then id (the report job's pages).
+		index("idx_outline_spaces_last_commit").on(table.lastCommitAt, table.id),
+		// Spaces committed to before `last_commit_at` existed: what the report job still stamps.
+		index("idx_outline_spaces_unstamped")
+			.on(table.id)
+			.where(sql`"last_commit_at" IS NULL AND "next_seq" > 1`),
 		// Spaces the in-process rebuild still has to visit; empty once it has run.
 		index("idx_outline_spaces_in_process_pending").on(table.id).where(sql`"in_process_ready" = 0`),
 		uniqueIndex("uq_outline_spaces_project").on(table.projectId).where(sql`"kind" = 'project'`),
@@ -5570,6 +5736,8 @@ export const outlineBlocks = sqliteTable(
 		contentHash: text("content_hash").notNull(),
 		alias: text("alias"),
 		taskJson: text("task_json", { mode: "json" }).$type<OutlineTaskJson>(),
+		/** A question put to a person (`OutlineAskJson`); never set together with `task_json`. */
+		askJson: text("ask_json", { mode: "json" }).$type<OutlineAskJson>(),
 		/** Who last wrote the content (creation included); moves and deletes do not change it. */
 		authorKind: text("author_kind", { enum: ["human", "agent", "system"] }).notNull(),
 		authorId: text("author_id").notNull(),
@@ -5596,6 +5764,19 @@ export const outlineBlocks = sqliteTable(
 		index("idx_outline_blocks_locked")
 			.on(table.pageId)
 			.where(sql`json_extract("task_json", '$.lock') IS NOT NULL AND "deleted" = 0`),
+		// Open tasks of a space that are in progress or locked (a person's goal, a locked plan,
+		// one waiting for its locker to confirm it done): what the task board always shows of a
+		// space with more open tasks than it shows (outline P2 PR 5).
+		index("idx_outline_blocks_active_tasks")
+			.on(table.spaceId)
+			.where(
+				sql`"deleted" = 0 AND (json_extract("task_json", '$.status') = 'doing' OR (json_extract("task_json", '$.status') = 'todo' AND json_extract("task_json", '$.lock') IS NOT NULL))`,
+			),
+		// Finished tasks of a space (done or cancelled, live), latest change first: the task
+		// board's finished lists, paged by (version_seq, id) (outline P2 PR 5).
+		index("idx_outline_blocks_finished_tasks")
+			.on(table.spaceId, table.versionSeq, table.id)
+			.where(sql`json_extract("task_json", '$.status') IN ('done', 'cancelled') AND "deleted" = 0`),
 	],
 );
 
@@ -5613,8 +5794,14 @@ export const outlineCommits = sqliteTable(
 			.notNull()
 			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
 		seq: integer("seq").notNull(),
-		/** `confirm`: a pending change taking effect (design §2.6), its decider recorded on the row. */
-		kind: text("kind", { enum: ["edit", "revert", "import", "confirm"] }).notNull(),
+		/**
+		 * `confirm`: a pending change taking effect (design §2.6), its decider recorded on the row.
+		 * `answer`: a person's answer to questions (outline P2 PR 7), their confirmation.
+		 * `plan`: a plan entering planning, returned or approved (outline P2 PR 8).
+		 */
+		kind: text("kind", {
+			enum: ["edit", "revert", "import", "confirm", "answer", "plan"],
+		}).notNull(),
 		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
 		actorId: text("actor_id").notNull(),
 		responsibleUserId: text("responsible_user_id"),
@@ -5656,6 +5843,7 @@ export const outlineBlockVersions = sqliteTable(
 		orderKey: text("order_key").notNull(),
 		content: text("content"),
 		taskJson: text("task_json", { mode: "json" }).$type<OutlineTaskJson>(),
+		askJson: text("ask_json", { mode: "json" }).$type<OutlineAskJson>(),
 		alias: text("alias"),
 		contentHash: text("content_hash").notNull(),
 		changeFlags: integer("change_flags").notNull(),
@@ -5820,6 +6008,11 @@ export const outlinePending = sqliteTable(
 		decisionCommitId: text("decision_commit_id"),
 		reason: text("reason"),
 		reportedAt: text("reported_at"),
+		/**
+		 * When the locker acknowledged a confirmation an agent made on their behalf (their digest,
+		 * outline P2 PR 7); null until then, and for every other row.
+		 */
+		digestSeenAt: text("digest_seen_at"),
 	},
 	(table) => [
 		// FK covering index (a partial index cannot serve the FK action); open rows of a space.
@@ -5835,6 +6028,67 @@ export const outlinePending = sqliteTable(
 			.where(sql`"reported_at" IS NULL AND "status" <> 'open'`),
 		index("idx_outline_pending_decider_open").on(table.deciderUserId).where(sql`"status" = 'open'`),
 		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
+		// Confirmations an agent made on a locker's behalf that the locker has not seen: their digest.
+		index("idx_outline_pending_digest")
+			.on(table.deciderUserId)
+			.where(
+				sql`"status" = 'confirmed' AND "digest_seen_at" IS NULL AND json_extract("decided_by_json", '$.kind') = 'agent'`,
+			),
+	],
+);
+
+// === outline_questions ===
+/**
+ * Routing and delivery of the questions people are asked (`Ask`, outline P2 PR 7; design §3.3):
+ * one row per question block, derived by the write path from the block's `ask_json` in the commit
+ * that changes it (as `outline_task_claims` is to `task_json`), so a revert, a restore or a delete
+ * keeps it in step. Not versioned.
+ *
+ *   - `state`: `open`, `answered` or `withdrawn` (withdrawn, or the block deleted). `proceed`
+ *     copies the block's: such a question makes no task wait.
+ *   - `answered_at`, `answer_commit_id`: the last answer and the commit that recorded it. They
+ *     stay when the question leaves answered, so the same answer coming back (an undo) is not
+ *     delivered again.
+ *   - `to_user_id`: the person asked: their inbox.
+ *   - `asker_*`: the session that asked (its root), the person its turn ran for (the execution
+ *     principal an answer wakes it with; never the person answering) and the tool call. Set when
+ *     the row is created, never after.
+ *   - `delivered_at`: when the answer's message was written to the asker (or there was nobody to
+ *     tell); null while a new answer waits to be delivered (a background sweep retries).
+ *
+ * Ids carry no foreign keys but the block's: a session that is gone simply is not woken.
+ */
+export const outlineQuestions = sqliteTable(
+	"outline_questions",
+	{
+		blockId: text("block_id")
+			.primaryKey()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		spaceId: text("space_id").notNull(),
+		state: text("state", { enum: ["open", "answered", "withdrawn"] }).notNull(),
+		proceed: integer("proceed", { mode: "boolean" }).notNull().default(false),
+		toUserId: text("to_user_id"),
+		askerNarratorId: text("asker_narrator_id"),
+		askerUserId: text("asker_user_id"),
+		askerToolCallId: text("asker_tool_call_id"),
+		createdAt: text("created_at").notNull(),
+		answeredAt: text("answered_at"),
+		answerCommitId: text("answer_commit_id"),
+		deliveredAt: text("delivered_at"),
+	},
+	(table) => [
+		// A person's open questions: their inbox.
+		index("idx_outline_questions_to_open").on(table.toUserId).where(sql`"state" = 'open'`),
+		// Open questions of a space: what makes its tasks wait for people.
+		index("idx_outline_questions_space_open").on(table.spaceId).where(sql`"state" = 'open'`),
+		// A session's open questions: its limit, and what archiving it withdraws.
+		index("idx_outline_questions_asker_open")
+			.on(table.askerNarratorId)
+			.where(sql`"state" = 'open'`),
+		// Answers the asker has not been told of yet: the delivery sweep, oldest first.
+		index("idx_outline_questions_undelivered")
+			.on(table.answeredAt)
+			.where(sql`"state" = 'answered' AND "delivered_at" IS NULL`),
 	],
 );
 
@@ -5881,6 +6135,81 @@ export const outlineViewState = sqliteTable(
 	(table) => [
 		primaryKey({ columns: [table.userId, table.pageBlockId] }),
 		index("idx_outline_view_state_page").on(table.pageBlockId),
+	],
+);
+
+// === outline_task_seen ===
+/**
+ * When a person saw, on the task board, a task they manage that an agent finished (outline P2
+ * PR 9b, owner decision D50 ④): the board marks such a task 「新完成」 until they have seen it.
+ * One row per person and task: `seen_seq` is the task's `version_seq` they saw finished (a later
+ * finish of it is new again). Personal UI state, never a commit; rows older than the board's
+ * window are pruned when the person's rows are written (`idx_outline_task_seen_user_at`).
+ */
+export const outlineTaskSeen = sqliteTable(
+	"outline_task_seen",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		taskBlockId: text("task_block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		seenSeq: integer("seen_seq").notNull(),
+		seenAt: text("seen_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.userId, table.taskBlockId] }),
+		// The FK's index: deleting a block (a purge) finds its rows.
+		index("idx_outline_task_seen_block").on(table.taskBlockId),
+		// A person's oldest rows first: the prune.
+		index("idx_outline_task_seen_user_at").on(table.userId, table.seenAt),
+	],
+);
+
+// === outline_digests ===
+/**
+ * A person's reports (汇报, outline P2 PR 11; design §3.4): one row per person per day (`daily`,
+ * `period_key` the day in the person's time zone), plus at most one "today so far" preview
+ * (`today`). Derived data, made by the background job (`services/outline/digest-job.ts`) from
+ * commits and versions; it holds ids, seqs, kinds and counts, never block text, so a title is read
+ * when shown and today's read access decides what is shown.
+ *
+ *   - `period_start`, `period_end`: the window the report covers (ISO instants). Consecutive days
+ *     of a person meet exactly: a day starts where the previous report ended, also when the person
+ *     changed their time zone in between.
+ *   - `ranges_json`: per space, the seqs `(from, to]` the window covered; the next day continues
+ *     from them, so no commit is counted twice or skipped.
+ *   - `counts_json`, `item_count`: what lists and the inbox read; `items_json` (at most 64 KiB) only
+ *     the detail reads.
+ *   - `seen_at`: when the person read it; a report with nothing in it is written already seen.
+ */
+export const outlineDigests = sqliteTable(
+	"outline_digests",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["daily", "today"] }).notNull(),
+		/** The day (`YYYY-MM-DD`) in `time_zone`. */
+		periodKey: text("period_key").notNull(),
+		timeZone: text("time_zone").notNull(),
+		periodStart: text("period_start").notNull(),
+		periodEnd: text("period_end").notNull(),
+		countsJson: text("counts_json", { mode: "json" }).$type<OutlineDigestCounts>().notNull(),
+		itemCount: integer("item_count").notNull().default(0),
+		itemsJson: text("items_json", { mode: "json" }).$type<OutlineDigestStored>().notNull(),
+		rangesJson: text("ranges_json", { mode: "json" }).$type<OutlineDigestRanges>().notNull(),
+		truncated: integer("truncated", { mode: "boolean" }).notNull().default(false),
+		createdAt: text("created_at").notNull(),
+		seenAt: text("seen_at"),
+	},
+	(table) => [
+		// One per person, kind and day; also the person's reports by day (and the FK's index).
+		uniqueIndex("uq_outline_digests_user_period").on(table.userId, table.kind, table.periodKey),
+		// A person's unread reports: the inbox row.
+		index("idx_outline_digests_unseen").on(table.userId).where(sql`"seen_at" IS NULL`),
 	],
 );
 

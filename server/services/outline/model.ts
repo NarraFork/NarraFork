@@ -24,19 +24,25 @@
  *      writer that planned against an older counter value knows the space changed under it.
  */
 import type {
+	OutlineAskAnswerJson,
+	OutlineAskJson,
 	OutlinePendingDeciderJson,
 	OutlinePendingRequesterJson,
 	OutlineTaskActorRef,
 	OutlineTaskJson,
 	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
 } from "@server/db/schema";
 
 export type {
+	OutlineAskAnswerJson,
+	OutlineAskJson,
 	OutlinePendingDeciderJson,
 	OutlinePendingRequesterJson,
 	OutlineTaskActorRef,
 	OutlineTaskJson,
 	OutlineTaskLockJson,
+	OutlineTaskPlanJson,
 };
 
 /** What a version changed relative to the previous one. A bitmask: several can be set. */
@@ -63,6 +69,8 @@ export const OUTLINE_CHANGE = {
 	 * together with what the write changed.
 	 */
 	MERGE: 256,
+	/** Its question (`ask_json`: asked, answered, withdrawn) changed. */
+	ASK: 512,
 } as const;
 
 export type OutlineChangeFlag = (typeof OUTLINE_CHANGE)[keyof typeof OUTLINE_CHANGE];
@@ -83,11 +91,30 @@ export type OutlineActorKind = (typeof OUTLINE_ACTOR_KINDS)[number];
 export const OUTLINE_BEHAVIOR_ALIAS = "behavior";
 
 /**
+ * The alias of a session's task page (outline P2 PR 5): the page of its session space where
+ * `/goal` and the task board add a person's tasks. People and the system give, take and move it
+ * freely; an agent may write under it (the steps it adds under a goal live there) but not give or
+ * take the alias, nor move or delete the page (review round 1, trade-off 2), so later goals land
+ * where people put them. Reserved in session spaces only.
+ */
+export const OUTLINE_TASKS_PAGE_ALIAS = "tasks";
+
+/**
  * `edit` is every ordinary write; `revert` and `import` are written by their own paths; `confirm`
  * is a pending change taking effect (`pending.ts`): its actor is the proposer, its responsible
- * person the decider's.
+ * person the decider's; `answer` is a person's answer to questions (`questions.ts`), written as
+ * that person (or relayed by the asking session, the person still responsible); `plan` is a plan
+ * entering planning, returned or approved (`plans.ts`, outline P2 PR 8): a marker on the
+ * timeline, written like an `edit`.
  */
-export const OUTLINE_COMMIT_KINDS = ["edit", "revert", "import", "confirm"] as const;
+export const OUTLINE_COMMIT_KINDS = [
+	"edit",
+	"revert",
+	"import",
+	"confirm",
+	"answer",
+	"plan",
+] as const;
 export type OutlineCommitKind = (typeof OUTLINE_COMMIT_KINDS)[number];
 
 /**

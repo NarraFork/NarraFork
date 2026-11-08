@@ -25,8 +25,8 @@ import { generateShortId } from "../id";
 import { logger } from "../logger";
 import {
 	bindModelCatalogSettings,
-	keepLatestCatalog,
-	normalizeModelCatalogSettings,
+	keepModelCatalogSettings,
+	migrateModelCatalogSettings,
 	rewriteConnectionOverrides,
 	startModelCatalogDailyCheck,
 } from "../model-catalog";
@@ -36,7 +36,9 @@ import {
 	normalizeDefaultNarratorWriteAudience,
 } from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
+import { getProviderKeyStore } from "../provider-keys";
 import { normalizeSearchSettings } from "../search/settings";
+import { changeSecretEncryption, setSecretEncryption } from "../secret-store";
 import { withSettingsFileLock } from "../settings-file-lock";
 import {
 	type ManagerOwnedFields,
@@ -44,9 +46,18 @@ import {
 	preserveExternalManagerFields,
 	readManagerOwnedFields,
 } from "../settings-manager-fields";
+import { loadSpeechSettings } from "../speech-settings";
+import { settingsUnreadable } from "../startup-status/startup-problems";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
+import {
+	absorbProviderKeys,
+	hydrateProviderKeys,
+	pruneProviderKeys,
+	syncProviderKeys,
+	withoutProviderKeys,
+} from "./provider-keys-projection";
 import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
 import { normalizeUpdateSourceSettings } from "./update-source";
@@ -75,6 +86,7 @@ export { DEFAULTS, SETTING_DOCS } from "./defaults";
 export {
 	_bindSettings,
 	AGG_MODEL_PREFIX,
+	AutoModelUnavailableError,
 	anthropicProviderPrefix,
 	buildAggModelValue,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
@@ -108,15 +120,21 @@ export {
 	isAnthropicProvider,
 	isGeminiProvider,
 	LARGE_CONTEXT_BOUNDARY,
+	listAutoModelCandidates,
+	listAutoModelIds,
 	type ModelContextWindowResolution,
 	type ModelContextWindowSource,
 	modelProtocolKey,
+	normalizeAutoModelValueForSave,
 	nugProviderPrefix,
 	openaiProviderPrefix,
+	orderedAutoModelCandidates,
 	parseAggModelValue,
 	parseModelId,
+	referencePricePerMillion,
 	registerAnthropicModelChecker,
 	registerAnthropicModelLister,
+	registerAutoSourceProbe,
 	registerCodexModelChecker,
 	registerCodexModelLister,
 	registerExtraModelSource,
@@ -129,6 +147,7 @@ export {
 	resolveAggregation,
 	resolveAllowedModelCandidate,
 	resolveAllowedModelCandidateMatch,
+	resolveAutoModel,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveModelContextWindow,
@@ -354,6 +373,26 @@ export function reloadSettings(): NarraForkSettings {
 	return _cache.current!;
 }
 
+/**
+ * Hand-edited settings often carry a comment or a trailing comma; both are accepted. The file is
+ * rewritten as plain JSON on the next save. Anything else unreadable stops startup with a
+ * message naming the file.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure, validated by the merge below
+export function parseSettingsText(text: string): any {
+	let raw: unknown;
+	try {
+		raw = Bun.JSONC.parse(text);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message.replace(/^JSONC Parse error: /, "") : "";
+		throw settingsUnreadable(settingsPath, reason || String(error));
+	}
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+		throw settingsUnreadable(settingsPath, "the top level must be an object");
+	}
+	return raw;
+}
+
 function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
@@ -372,9 +411,11 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		writeFileSync(settingsPath, JSON.stringify(initial, null, 2), { mode: 0o600 });
 	}
 	const text = existsSync(settingsPath) ? readFileSync(settingsPath, "utf-8") : undefined;
-	const raw = text === undefined ? {} : JSON.parse(text);
+	const raw = text === undefined ? {} : parseSettingsText(text);
 	lastSettingsText = text;
 	const merged = deepMerge(DEFAULTS, raw);
+	// Do not let the generic defaults merge conceal an invalid partial speech config.
+	merged.speech = loadSpeechSettings(raw.speech);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
 
@@ -582,10 +623,16 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (normalizeCustomApiProviderSettings(merged)) {
 		needsSave = true;
 	}
+	// Keys move to provider-keys.json, written in the form `secrets.encrypt` asks for. A hot
+	// reload leaves the switch to the change listener, which also rewrites existing files.
+	if (!_cache.current) setSecretEncryption(merged.secrets?.encrypt !== false);
+	if (absorbProviderKeys(merged)) {
+		needsSave = true;
+	}
 
-	// The model catalog has one stored and in-memory form; both startup and hot reload
-	// pass through this, so no reader can see a document that skipped the import.
-	if (normalizeModelCatalogSettings(merged)) {
+	// Overrides an older file kept inline move to the catalog's own file; startup and hot
+	// reload both pass through this.
+	if (migrateModelCatalogSettings(merged)) {
 		needsSave = true;
 	}
 
@@ -772,8 +819,14 @@ export function purgeStaleAgentModelRefs(
 		settings.agent.hiddenModels = cleanedHidden;
 		dirty = true;
 	}
-	if (rewriteConnectionOverrides(settings, (model) => (isStale(model) ? null : model)))
+	rewriteConnectionOverrides((model) => (isStale(model) ? null : model));
+	// A removed provider's prefix must not keep a future provider of the same prefix out of auto.
+	const origExcluded = settings.agent.autoExcludedProviders ?? [];
+	const cleanedExcluded = origExcluded.filter((prefix) => !isPrefixStale(prefix));
+	if (cleanedExcluded.length !== origExcluded.length) {
+		settings.agent.autoExcludedProviders = cleanedExcluded;
 		dirty = true;
+	}
 	const origCustom = settings.agent.customModels ?? [];
 	const cleanedCustom = origCustom.filter((m) => !isStale(m.value));
 	if (cleanedCustom.length !== origCustom.length) {
@@ -923,18 +976,21 @@ export function migrateGlobalProxy(
 export function saveSettings(newSettings: NarraForkSettings): void {
 	stripObsoleteSettingsKeys(newSettings as unknown as Record<string, unknown>);
 	normalizeCustomApiProviderSettings(newSettings);
+	syncProviderKeys(newSettings);
+	hydrateProviderKeys(newSettings);
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
 	initializeTokenDanceModelCollection(newSettings);
-	keepLatestCatalog(newSettings);
+	keepModelCatalogSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	withSettingsFileLock(narraforkDir, () => {
+		newSettings.speech = loadSpeechSettings(newSettings.speech);
 		let disk: unknown = {};
 		if (existsSync(settingsPath)) {
 			try {
-				disk = JSON.parse(readFileSync(settingsPath, "utf-8"));
+				disk = Bun.JSONC.parse(readFileSync(settingsPath, "utf-8"));
 			} catch {
 				disk = {};
 			}
@@ -942,7 +998,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		preserveExternalManagerFields(newSettings, readManagerOwnedFields(disk), lastDiskManagerFields);
 		const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 		try {
-			const text = JSON.stringify(newSettings, null, 2);
+			const text = JSON.stringify(withoutProviderKeys(newSettings), null, 2);
 			writeFileSync(tempPath, text, { mode: 0o600 });
 			renameSync(tempPath, settingsPath);
 			lastSettingsText = text;
@@ -952,6 +1008,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		}
 		lastDiskManagerFields = managerFieldsFromSettings(newSettings);
 	});
+	if (_cache.current) pruneProviderKeys(_cache.current, newSettings);
 	settingsRevision++;
 	if (_cache.current) {
 		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);
@@ -971,6 +1028,10 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
+// Credential files follow `secrets.encrypt`; a change rewrites them in the new form.
+settingsChangeListeners.add(() => changeSecretEncryption(settings.secrets?.encrypt !== false));
+// Keys added, removed or reordered outside settings (the key list UI) refresh the projection.
+getProviderKeyStore().onChange(() => hydrateProviderKeys(settings));
 // Bind settings to provider module so it can access the singleton
 _bindSettings(settings);
 bindModelCatalogSettings(settings, () => saveSettings(settings));

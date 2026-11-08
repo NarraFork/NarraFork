@@ -99,9 +99,15 @@ async function seedTask(row: typeof backgroundTasks.$inferInsert): Promise<void>
 }
 
 function session(id: string, model: string, provider: string): ActiveNarrator {
+	// Recreated fixtures obey ensureNarrator's cold-start contract: the first
+	// request already persisted its identity, even if that pass was interrupted.
+	const stored =
+		db.select({ id: narrators.apiConversationId }).from(narrators).where(eq(narrators.id, id)).get()
+			?.id ?? null;
 	return {
 		narratorId: id,
-		conversationId: `original-${id}`,
+		conversationId: stored ?? `original-${id}`,
+		_persistedConversationId: stored,
 		cwd: process.env.HOME as string,
 		model,
 		provider,

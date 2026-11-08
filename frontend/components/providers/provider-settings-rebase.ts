@@ -79,6 +79,13 @@ export function rebaseProviderState(
 		disabledProviders: equalSet(local.disabledProviders, baseline.disabledProviders)
 			? fresh.disabledProviders
 			: local.disabledProviders,
+		// A baseline stored before this field existed has none: the draft did not change it.
+		autoExcludedProviders: equalSet(
+			local.autoExcludedProviders,
+			baseline.autoExcludedProviders ?? [],
+		)
+			? fresh.autoExcludedProviders
+			: local.autoExcludedProviders,
 		customModels: equalValue(local.customModels, baseline.customModels)
 			? fresh.customModels
 			: local.customModels,

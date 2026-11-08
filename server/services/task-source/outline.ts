@@ -12,7 +12,9 @@
  *
  *   - `doing` / `todo`: a candidate in progress / to do;
  *   - `blocked`: a waiting task, whatever its checkbox (it cannot be started or continued);
- *   - `protected`: created by a person (`/goal`, the interface; D27a).
+ *   - `protected`: created by a person (`/goal`, the board; D27a). The count that drives
+ *     `protectedOnly` leaves out a person's goal whose completion only waits for that person to
+ *     confirm it (D26b; outline P2 PR 5): the agent has done its part.
  *
  * Order is document order. Current is the first `doing`, next the first `todo` (anywhere, as
  * spec's). At most {@link OUTLINE_TASK_SOURCE_LIMITS.tasks} of each kind are read.
@@ -27,7 +29,9 @@
  * tasks are read again and the next to-do is tried, a few times at most
  * ({@link OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts}). With nothing in progress the target is
  * the first waiting task, and the prompt then asks to split out an unblocking task or ask a
- * person (D27b).
+ * person (D27b). A task a person asked to start (`preferTaskId`: the board's "Add and start",
+ * "Reopen and start") is started the same way, whatever else is in progress, and is the target;
+ * when it cannot be started, there is none (nothing else is started or continued instead).
  *
  * A subagent has no tasks of its own (D27c): every read is empty, it continues on its turn
  * budget only (`turnBudgetOnly`), and its behavior boundary is its root's.
@@ -49,6 +53,7 @@
  */
 import { createHash } from "node:crypto";
 import { blockTitle } from "@shared/outline";
+import { boundOutlineTaskNoticeItem } from "@shared/outline-task-notice";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { logger } from "../../lib/logger";
 import {
@@ -62,7 +67,7 @@ import {
 	type Locale,
 	type OutlineTaskPromptTask,
 } from "../../lib/prompt-i18n";
-import { readNarrator } from "../outline/access-reads";
+import { readDisplayNames, readNarrator } from "../outline/access-reads";
 import {
 	OutlineBusyError,
 	OutlineConflictError,
@@ -71,6 +76,7 @@ import {
 } from "../outline/errors";
 import { OUTLINE_TEXT } from "../outline/messages";
 import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "../outline/model";
+import { findCompletionsAwaitingConfirmation } from "../outline/pending";
 import { recordOutlineReads, seenOutlineVersion } from "../outline/read-ledger";
 import { resolveNarratorSpaces } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
@@ -79,6 +85,7 @@ import { writeOutline } from "../outline/write";
 import { readTaskSession } from "./backend";
 import {
 	firstOf,
+	firstUnder,
 	isProtected,
 	type OpenEntry,
 	type OpenRead,
@@ -103,6 +110,7 @@ import type {
 	OpenTaskList,
 	OpenTaskStatus,
 	OpenTaskView,
+	StatusBarView,
 	TaskView,
 } from "./types";
 
@@ -128,6 +136,9 @@ export const OUTLINE_TASK_SOURCE_LIMITS = {
 	/** To-dos tried in turn when the write path refuses to start one. */
 	promotionAttempts: 3,
 } as const;
+
+/** People the status bar names as deciding goals the viewer does not. */
+const STATUS_BAR_DECIDERS = 3;
 
 /** The system actor of the commit that starts a session's next task. */
 export const OUTLINE_TASK_START_ACTOR = "outline-task-start";
@@ -170,6 +181,35 @@ function isRefusedClaim(error: unknown): boolean {
 	);
 }
 
+/**
+ * Of the given open tasks, those whose being done waits for its person's confirmation (a locked
+ * goal the agent ticked done, D26b), by task id.
+ */
+async function completionsAwaited(entries: readonly OpenEntry[]): Promise<Set<string>> {
+	const waiting = entries.filter((entry) => entry.wait?.confirmation);
+	if (waiting.length === 0) return new Set();
+	const found = await findCompletionsAwaitingConfirmation(
+		waiting.map((entry) => ({
+			id: entry.ref.blockId,
+			spaceId: entry.ref.spaceId,
+			taskJson: entry.ref.taskJson,
+		})),
+	);
+	return new Set(found.keys());
+}
+
+/**
+ * The open person-created tasks that drive `protectedOnly` (D27a): all of them except those whose
+ * completion only waits for the person to confirm it (outline P2 PR 5). The agent has done its
+ * part there, so continuing would only run a pass saying everything waits.
+ */
+async function protectedOpen(read: OpenRead): Promise<OpenEntry[]> {
+	// Every person's work read, not only the first entries (review round 1 S3).
+	const entries = read.personWork;
+	const awaited = await completionsAwaited(entries);
+	return awaited.size === 0 ? entries : entries.filter((e) => !awaited.has(e.ref.blockId));
+}
+
 /** One narrator's outline task source. Reads go to the database each time. */
 export function createOutlineTaskSource(narratorId: string): NarratorTaskSource {
 	const session = outlineSessionReader(narratorId);
@@ -180,7 +220,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		known.set(view, {
 			text: view.text,
 			address: entry.ref.address,
-			humanCreated: isProtected(entry),
+			humanCreated: entry.ref.taskJson.humanCreated === true,
 		});
 		return view;
 	};
@@ -249,23 +289,62 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		}
 	}
 
-	async function prepareContinuation(promoteTodo: boolean): Promise<ContinuationTarget> {
+	async function prepareContinuation(
+		promoteTodo: boolean,
+		preferTaskId?: string,
+	): Promise<ContinuationTarget> {
 		const current = await session();
 		if (current.subagent) return { openTask: null, protectedOpenCount: 0, turnBudgetOnly: true };
+		// A task a person asked the session to start ("Add and start", "Reopen and start"; review
+		// round 1 S4), or the root of a plan they approved (outline P2 PR 8): read as its own
+		// subtree, so the tasks before it in the session cannot crowd it out (P2 PR 8 review S3).
+		let tree: OpenRead | null = null;
+		if (preferTaskId) {
+			// Started for the session through the same system start as a promotion, whatever else
+			// is in progress, and named by the continuation. Nothing else is started or named
+			// instead: when it cannot be started, nothing continues. The subtree is read once
+			// (P2 PR 8 review round 2 N5): a start only changes the started task's checkbox, kept
+			// in the read as it is; a refused start moves on to the next step.
+			tree = await readOpen(current, { within: preferTaskId });
+			const wanted = tree.entries.find((entry) => entry.ref.blockId === preferTaskId);
+			if (wanted?.status === "todo" && wanted.ref.spaceId === current.spaceId) {
+				if (await claim(current, wanted)) wanted.status = "doing";
+			}
+			// A tree (a goal with steps, a plan): its first step that can start is started too, and
+			// named (D48 Q2: continue from the first startable task of the tree being worked).
+			if (wanted?.ref.container && !firstUnder(tree, preferTaskId, "doing")) {
+				const steps = tree.entries.filter(
+					(entry) =>
+						entry.status === "todo" &&
+						!entry.ref.container &&
+						entry.ref.spaceId === current.spaceId &&
+						entry.ref.taskAncestorIds.includes(preferTaskId),
+				);
+				for (const next of steps.slice(0, OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts)) {
+					if (await claim(current, next)) {
+						next.status = "doing";
+						break;
+					}
+				}
+			}
+		}
 		let read = await readOpen(current);
-		if (promoteTodo) {
+		if (!preferTaskId && promoteTodo) {
 			// Only a task of the session's own space is started on its behalf: anything else it
 			// may continue it holds already. A refused start moves on to the next to-do (a task
 			// changed meanwhile may be tried again at its new version), a few times at most.
 			const tried = new Set<string>();
 			for (let attempt = 0; attempt < OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts; attempt++) {
 				if (firstOf(read, "doing")) break;
-				const next = read.entries.find(
+				// The tree being worked first (D48 Q2), then document order.
+				const startable = read.entries.filter(
 					(entry) =>
 						entry.status === "todo" &&
+						!entry.ref.container &&
 						entry.ref.spaceId === current.spaceId &&
 						!tried.has(`${entry.ref.blockId}@${entry.ref.versionSeq}`),
 				);
+				const next = startable.find((entry) => entry.ref.inWorkedTree) ?? startable[0];
 				if (!next) break;
 				tried.add(`${next.ref.blockId}@${next.ref.versionSeq}`);
 				if (await claim(current, next)) {
@@ -275,8 +354,11 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 				read = await readOpen(current);
 			}
 		}
-		const chosen = firstOf(read, "doing") ?? firstOf(read, "blocked");
-		const protectedOpenCount = read.entries.filter(isProtected).length;
+		const chosen =
+			preferTaskId && tree
+				? (firstUnder(tree, preferTaskId, "doing") ?? firstUnder(tree, preferTaskId, "blocked"))
+				: (firstOf(read, "doing") ?? firstOf(read, "blocked"));
+		const protectedOpenCount = (await protectedOpen(read)).length;
 		if (!chosen) return { openTask: null, protectedOpenCount };
 		const text = (await titlesOf([chosen])).get(chosen.ref.blockId) ?? chosen.ref.sid;
 		const openTask: ContinuationTask = remember(
@@ -422,10 +504,50 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			};
 		},
 		async protectedOpenCount() {
-			const read = await readOpen(await session());
-			return read.entries.filter(isProtected).length;
+			return (await protectedOpen(await readOpen(await session()))).length;
 		},
-		prepareContinuation: ({ promoteTodo }) => prepareContinuation(promoteTodo),
+		async statusBar(viewerUserId: string | null): Promise<StatusBarView> {
+			const read = await readOpen(await session());
+			const doing = firstOf(read, "doing");
+			const current = doing
+				? {
+						text: (await titlesOf([doing])).get(doing.ref.blockId) ?? doing.ref.sid,
+						status: "doing" as const,
+						protected: isProtected(doing),
+						address: doing.ref.address,
+					}
+				: null;
+			const waiting = read.entries.filter(
+				(entry) => isProtected(entry) && entry.wait?.confirmation,
+			);
+			if (waiting.length === 0)
+				return { current, awaitingConfirmation: { total: 0, mine: 0, from: [] } };
+			const found = await findCompletionsAwaitingConfirmation(
+				waiting.map((entry) => ({
+					id: entry.ref.blockId,
+					spaceId: entry.ref.spaceId,
+					taskJson: entry.ref.taskJson,
+				})),
+			);
+			// The viewer's: they locked it, so the board gives them Confirm and Reject. The others
+			// wait for their lockers, named (a session confirming for its locker confirms through
+			// the outline, not here).
+			let mine = 0;
+			const others = new Set<string>();
+			for (const entry of waiting) {
+				if (!found.has(entry.ref.blockId)) continue;
+				const by = entry.ref.taskJson.lock?.by;
+				if (by?.kind === "human" && viewerUserId !== null && by.id === viewerUserId) mine++;
+				else if (by?.kind === "human") others.add(by.id);
+			}
+			const named = [...others].slice(0, STATUS_BAR_DECIDERS);
+			const names = named.length > 0 ? await readDisplayNames({ userIds: named }) : null;
+			const from = named.map((id) => names?.users.get(id) ?? id);
+			return { current, awaitingConfirmation: { total: found.size, mine, from } };
+		},
+		taskAddress: (task) => known.get(task)?.address ?? null,
+		prepareContinuation: ({ promoteTodo, preferTaskId }) =>
+			prepareContinuation(promoteTodo, preferTaskId),
 		continuationPrompt,
 		// Retired for the outline: the views carry the tasks and the boundary (plan PR 4).
 		taskDigest: async () => null,
@@ -458,8 +580,22 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			}
 		},
 		turnEndNote(task: OpenTaskView, locale: Locale): InterruptGuardNote {
-			const content = getOutlineTurnEndNote(promptTask(task), locale);
-			return { content, body: { kind: "prose", text: content } };
+			const named = promptTask(task);
+			const content = getOutlineTurnEndNote(named, locale);
+			// The reader's copy: the task as a titled outline link with its status (the model's
+			// text above is unchanged; the transcript used to show it with its markdown).
+			const item = boundOutlineTaskNoticeItem({
+				address: named.address ?? "",
+				title: task.text,
+				status: "doing",
+				...(named.humanCreated ? { humanCreated: true } : {}),
+			});
+			return {
+				content,
+				body: item
+					? { kind: "outlineTasks", variant: "turnEnd", items: [item] }
+					: { kind: "prose", text: content },
+			};
 		},
 		interruptGuardNote(tasks: readonly OpenTaskView[], locale: Locale): InterruptGuardNote {
 			const content = getOutlineInterruptNote(

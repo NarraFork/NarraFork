@@ -27,6 +27,7 @@ import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
 } from "../lib/agent/file-reference-projection";
+import { releaseStagedAttachment } from "../lib/attachment-staging";
 import {
 	parseOptionalComposerDocument,
 	validateComposerAssets,
@@ -226,8 +227,27 @@ async function acquirePreparation(): Promise<() => void> {
 		else activePreparations--;
 	};
 }
+/**
+ * Slowest write throughput the preparation budget will wait for.
+ *
+ * `MAILBOX_LIMITS.prepareTimeoutMs` (30 s) was sized for the inline payloads
+ * this used to carry — the REST text cap is 100k UTF-16 units. Attachments are
+ * now streamed to disk and may be a gigabyte, where a slow-but-healthy disk
+ * legitimately needs longer than 30 s; expiring mid-write deletes the copy and
+ * fails an otherwise valid queued message. The budget therefore scales with the
+ * payload and never drops below the original value.
+ */
+const PREPARE_MIN_THROUGHPUT_BYTES_PER_SEC = 10 * 1024 * 1024;
+
+function preparationTimeoutMs(value: File | string): number {
+	const bytes = typeof value === "string" ? Buffer.byteLength(value) : value.size;
+	const scaled = Math.ceil((bytes / PREPARE_MIN_THROUGHPUT_BYTES_PER_SEC) * 1000);
+	return Math.max(MAILBOX_LIMITS.prepareTimeoutMs, scaled);
+}
+
 async function writeBufferedFile(path: string, value: File | string): Promise<void> {
 	const release = await acquirePreparation();
+	const budgetMs = preparationTimeoutMs(value);
 	const started = Date.now();
 	let expired = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -247,7 +267,7 @@ async function writeBufferedFile(path: string, value: File | string): Promise<vo
 				timer = setTimeout(() => {
 					expired = true;
 					reject(new Error("Buffered file preparation timed out"));
-				}, MAILBOX_LIMITS.prepareTimeoutMs);
+				}, budgetMs);
 			}),
 		]);
 	} finally {
@@ -311,6 +331,7 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	humanReplyContext?: import("@shared/reply-context").ReplyContext;
 	composerDocumentPath?: string;
 	queueMode?: BufferQueueMode;
 	executionIntent?: BufferedMessage["executionIntent"];
@@ -337,6 +358,23 @@ async function writeStagingText(id: string, prefix: string, text: string): Promi
 		throw error;
 	}
 }
+/**
+ * Drop staged upload originals once a committed mailbox row owns its copies.
+ *
+ * Best effort: a failed delete only leaves bytes the TTL sweep reclaims, and must
+ * never turn an accepted message into a reported failure. No-op for multipart
+ * files, which never entered the staging area.
+ */
+export function releaseStagedFiles(files: readonly File[] | undefined): void {
+	for (const file of files ?? []) {
+		try {
+			releaseStagedAttachment(file);
+		} catch (error) {
+			logger.warn("Failed to release staged attachment", { error: String(error) });
+		}
+	}
+}
+
 /** Save attachments once; both primary and subagent producers use this durable representation. */
 export async function persistBufferedTextFiles(
 	id: string,
@@ -370,6 +408,10 @@ export async function persistBufferedTextFiles(
 				sourceMimeType: file.type,
 			});
 			await writeBufferedFile(path, file);
+			// Deliberately NOT releasing the staged original here: this copy only
+			// becomes the message's attachment once the mailbox row commits. Callers
+			// release after their commit (see `releaseStagedFiles`), so a full queue
+			// or a DB error still leaves the upload claimable on retry.
 		}
 		return saved;
 	} catch (error) {
@@ -651,7 +693,9 @@ export async function enqueueBufferedMessage(
 	queueMode?: BufferQueueMode,
 	composerDocument?: ComposerDocument,
 	media?: MediaRef[],
+	humanReplyContext?: import("@shared/reply-context").ReplyContext,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+	humanReplyContext = humanReplyContext ? { ...humanReplyContext } : undefined;
 	composerDocument = parseOptionalComposerDocument(composerDocument);
 	validateComposerProjection(
 		composerDocument,
@@ -682,7 +726,7 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
+		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode, humanReplyContext };
 		if (composerDocument)
 			metadata.composerDocumentPath = await writeStagingText(
 				stagingId,
@@ -801,6 +845,8 @@ export async function enqueueBufferedMessage(
 			discardUnownedStaging(stagingId);
 			return { ok: false, bufferedAt: "", id: "", full: true };
 		}
+		// The mailbox row now owns its own copy, so the staged originals can go.
+		releaseStagedFiles(textFiles);
 		return { ok: true, bufferedAt: result.delivery.bufferedAt, id: result.delivery.id };
 	} catch (error) {
 		if (!admissionStarted) {

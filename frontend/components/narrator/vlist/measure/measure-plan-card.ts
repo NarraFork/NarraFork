@@ -41,7 +41,7 @@ export const PLAN_CARD_BORDER = 1;
 /** IconListCheck size=16 in the header row. */
 export const PLAN_HEADER_ICON = 16;
 /** Text size="xs" single line box (12 × 1.4 ≈ 17). */
-export const PLAN_HEADER_LABEL_LINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+export const PLAN_HEADER_LABEL_LINE_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 /** Optional right-aligned Button size="compact-xs" = 18px. */
 export const PLAN_HEADER_BUTTON = 18;
 /** Group mb={6} — gap between the header row and the markdown body. */
@@ -97,7 +97,7 @@ export const MEASURE_PLAN_CARD_CONSTANTS = {
 	PLAN_CARD_PADDING,
 	PLAN_CARD_BORDER,
 	PLAN_HEADER_ICON,
-	PLAN_HEADER_LABEL_LINE,
+	PLAN_HEADER_LABEL_LINE_BASELINE,
 	PLAN_HEADER_BUTTON,
 	PLAN_HEADER_MB,
 	PLAN_CARD_RADIUS,

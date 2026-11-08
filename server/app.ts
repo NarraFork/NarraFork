@@ -28,6 +28,7 @@ import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
 import { commandCodeRoutes } from "./routes/commandcode";
 import { containerRoutes } from "./routes/containers";
+import { credentialTransferRoutes } from "./routes/credential-transfer";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
 import { deepseekRoutes } from "./routes/deepseek";
@@ -53,6 +54,7 @@ import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { narratorAttachmentRoutes } from "./routes/narrator-attachments";
 import { narratorTimelineRoutes } from "./routes/narrator-timeline";
 import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
@@ -72,6 +74,7 @@ import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
+import { providerKeyRoutes } from "./routes/provider-keys";
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
@@ -85,6 +88,7 @@ import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
 import { specRoutes } from "./routes/spec";
+import { speechRoutes } from "./routes/speech";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
 import { exportTicketDownloadRoutes, storageTransferRoutes } from "./routes/storage-transfer";
@@ -440,6 +444,10 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
 app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
+// Streaming attachment staging. Deliberately outside /api/narrators: the narrator
+// router's body limit and work-admission middleware describe buffered request
+// bodies and narrator work, neither of which an upload is.
+app.route("/api/narrator-attachments", narratorAttachmentRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);
 // Project/user trait layers. Narrator-level traits live under /api/narrators.
@@ -451,6 +459,7 @@ app.route("/api/fs", fsRoutes);
 app.route("/api/prompt-optimize", promptOptimizeRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
+app.route("/api/speech", speechRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/kimi", kimiRoutes);
 app.route("/api/deepseek", deepseekRoutes);
@@ -459,6 +468,8 @@ app.route("/api/provider-import", providerImportRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/credential-transfer", credentialTransferRoutes);
+app.route("/api/provider-keys", providerKeyRoutes);
 app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);

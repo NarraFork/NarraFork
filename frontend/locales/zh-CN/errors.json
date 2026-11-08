@@ -38,7 +38,7 @@
 	"DEFAULT_MODEL_NOT_CONFIGURED": "尚未配置默认模型。请在「设置 → 模型」中选择一个后重试。",
 	"PODMAN_NOT_FOUND": "未安装 Podman",
 	"SPEC_IN_OUTLINE_SESSION": "本会话的任务在大纲里，不再使用 Dynamic Spec 的任务和笔记，只有行为护栏仍然生效。",
-	"GOAL_IN_OUTLINE_SESSION": "任务在大纲里的会话暂时不能用 /goal。请让 agent 把目标写成一个任务。",
+	"GOAL_IN_OUTLINE_SESSION": "/goal 会给会话本身添加任务。请在主会话里发送，不要发给子代理。",
 	"GIT_AUTH_REQUIRED": "需要 Git 认证",
 	"AUTH_REQUIRED": "请先登录",
 	"TOKEN_EXPIRED": "登录状态已过期，请重新登录。",
@@ -68,6 +68,7 @@
 	"IMPORT_PARAMS_INVALID": "导入参数不合法",
 	"IMPORT_PREVIEW_EXPIRED": "导入预览已过期，请重新选择文件",
 	"IMPORT_SNAPSHOT_EXPIRED": "导入快照已失效，请重新选择文件",
+	"IMPORT_PASSPHRASE_REQUIRED": "请输入导出供应商 Key 时设置的口令",
 	"CLEAR_PARAMS_INVALID": "清空参数不合法",
 	"CLEAR_USER_UNKNOWN": "无法确认当前用户",
 	"CLEAR_PASSWORD_NOT_SET": "当前账号未设置密码，无法执行清空操作",
@@ -93,5 +94,12 @@
 		"Chat attachment": "聊天附件",
 		"Global skill": "全局技能",
 		"Buffered message": "缓冲消息"
-	}
+	},
+	"STEP_UP_MFA_REQUIRED": "请先在“安全”设置中开启两步验证（验证器 App 或通行密钥）。",
+	"STEP_UP_METHOD_UNAVAILABLE": "你的账号没有设置这种验证方式。",
+	"STEP_UP_FAILED": "密码或验证码不正确。",
+	"STEP_UP_REQUIRED": "请重新验证身份后再继续。",
+	"BUNDLE_INVALID": "这不是 NarraFork 导出的凭据文件。",
+	"BUNDLE_PASSPHRASE": "口令不对，或文件在导出后被改动过。",
+	"BUNDLE_TOO_LARGE": "文件过大，不是凭据导出文件。"
 }

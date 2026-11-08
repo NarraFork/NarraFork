@@ -5,6 +5,7 @@ import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { Hono } from "hono";
 import {
@@ -34,7 +35,9 @@ const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
 		section('narratorRoutes.post("/:id/messages"', "// Retry last user message"),
 	]
 		.join("\n")
-		.replaceAll("export async function", "async function"),
+		.replaceAll("export async function", "async function")
+		.replaceAll("export function", "function")
+		.replaceAll("export interface", "interface"),
 );
 
 function fixture(
@@ -109,6 +112,13 @@ function fixture(
 		MAX_MEDIA_ATTACHMENTS,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+		MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
+		// Staged attachments need a real store; these tests never send any, so the
+		// bindings only have to exist for the helper's code path to be reachable.
+		findStagedAttachment: () => null,
+		stagedAttachmentAsFile: () => {
+			throw new Error("no staged attachments in this fixture");
+		},
 		fileReferenceMessageForDisplay,
 		captureFileReferences: async (_id: string, _userId: string, refs: FileReference[]) =>
 			refs.map((reference) => ({
@@ -197,6 +207,9 @@ function fixture(
 		eq: () => undefined,
 		logger: { warn: () => {} },
 		resolveTaskBackend: async () => options.taskBackend ?? "spec",
+		// Only an outline subagent refuses `/goal` (outline P2 PR 5).
+		isRefusedOutlineGoal: async (_id: string, text: string) =>
+			options.taskBackend === "outline" && !!options.subagent && text.startsWith("/goal"),
 		catalogError,
 	};
 	new Function(...Object.keys(bindings), compiled)(...Object.values(bindings));
@@ -574,14 +587,30 @@ describe("primary HTTP message admission", () => {
 		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
 	});
 
+	test("a busy outline session queues /goal like a spec session, saying where its task goes", async () => {
+		const f = fixture({ status: "working", busy: true, buffered: true, taskBackend: "outline" });
+		const response = await f.post({ message: "/goal do work" });
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({
+			buffered: true,
+			id: "queued-message",
+			bufferedAt: "now",
+			specGoalQueued: true,
+			objective: "do work",
+			taskBackend: "outline",
+		});
+		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
+	});
+
 	test.each([
 		false,
 		true,
-	])("/goal in an outline session is refused before anything is persisted (busy=%s)", async (busy) => {
+	])("/goal to an outline subagent is refused before anything is persisted (busy=%s)", async (busy) => {
 		const f = fixture({
 			status: busy ? "working" : "idle",
 			busy,
 			buffered: busy,
+			subagent: true,
 			taskBackend: "outline",
 		});
 		const response = await f.post({ message: "/goal do work" });

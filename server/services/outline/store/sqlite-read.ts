@@ -49,6 +49,7 @@ import { escapedContains, prefixExpr } from "../../search/sqlite-expressions";
 import { executeSqliteSearchQuery } from "../../search/sqlite-worker-runner";
 import type {
 	OutlineActorKind,
+	OutlineAskJson,
 	OutlineCommitKind,
 	OutlineLinkKind,
 	OutlineTaskJson,
@@ -90,7 +91,12 @@ type LinkSelect = typeof outlineLinks.$inferSelect;
 type CommitSelect = typeof outlineCommits.$inferSelect;
 
 function toBlock(row: BlockSelect): OutlineBlockRow {
-	return { ...row, taskJson: row.taskJson ?? null, authorKind: row.authorKind as OutlineActorKind };
+	return {
+		...row,
+		taskJson: row.taskJson ?? null,
+		askJson: row.askJson ?? null,
+		authorKind: row.authorKind as OutlineActorKind,
+	};
 }
 
 /**
@@ -106,7 +112,7 @@ function caseOf(pairs: ReadonlyArray<readonly [string, number]>): SQL {
 }
 
 function toVersion(row: VersionSelect): OutlineVersionRow {
-	return { ...row, taskJson: row.taskJson ?? null };
+	return { ...row, taskJson: row.taskJson ?? null, askJson: row.askJson ?? null };
 }
 
 function toLink(row: LinkSelect): OutlineLinkRow {
@@ -121,7 +127,7 @@ function toCommit(row: CommitSelect): OutlineCommitRow {
 	};
 }
 
-/** Columns of a structure row, positionally: id, sid, parent, order key, alias, task, seq. */
+/** Columns of a structure row, positionally: id, sid, parent, order key, alias, task, seq, ask. */
 type StructureValues = [
 	string,
 	string,
@@ -130,6 +136,7 @@ type StructureValues = [
 	string | null,
 	string | null,
 	number,
+	string | null,
 ];
 
 function toStructure(row: StructureValues): OutlineStructureRow {
@@ -141,13 +148,15 @@ function toStructure(row: StructureValues): OutlineStructureRow {
 		alias: row[4],
 		taskJson: row[5] ? (JSON.parse(row[5]) as OutlineTaskJson) : null,
 		versionSeq: Number(row[6]),
+		askJson: row[7] ? (JSON.parse(row[7]) as OutlineAskJson) : null,
 	};
 }
 
-const STRUCTURE_CURRENT = `SELECT id, sid, parent_id, order_key, alias, task_json, version_seq
+const STRUCTURE_CURRENT = `SELECT id, sid, parent_id, order_key, alias, task_json, version_seq,
+		ask_json
 	FROM outline_blocks WHERE page_id = ? AND deleted = 0 LIMIT ? OFFSET ?`;
 const STRUCTURE_AS_OF = `SELECT v.block_id, b.sid, v.parent_id, v.order_key, v.alias, v.task_json,
-		v.from_seq
+		v.from_seq, v.ask_json
 	FROM outline_block_versions v JOIN outline_blocks b ON b.id = v.block_id
 	WHERE v.page_id = ? AND v.from_seq <= ? AND (v.to_seq IS NULL OR v.to_seq > ?) AND v.deleted = 0
 	LIMIT ? OFFSET ?`;
@@ -260,14 +269,14 @@ export const sqliteOutlineReads: OutlineReadPort = {
 			// `page_id IN (…) ORDER BY page_id` walks the page index in order: a page's rows come
 			// together, and the read stops one row past what is left of the limit.
 			const values = inlineValues(
-				`SELECT id, sid, parent_id, order_key, alias, task_json, version_seq, page_id
+				`SELECT id, sid, parent_id, order_key, alias, task_json, version_seq, ask_json, page_id
 				 FROM outline_blocks
 				 WHERE page_id IN (${chunk.map(() => "?").join(", ")}) AND deleted = 0
 				 ORDER BY page_id LIMIT ?`,
 				[...chunk, max - rows.length + 1],
 			) as Array<[...StructureValues, string]>;
 			for (const row of values) {
-				rows.push({ ...toStructure(row.slice(0, 7) as StructureValues), pageId: row[7] });
+				rows.push({ ...toStructure(row.slice(0, 8) as StructureValues), pageId: row[8] });
 			}
 			if (rows.length > max) return { rows: rows.slice(0, max), truncated: true };
 		}
@@ -531,6 +540,23 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		for (const chunk of chunked(ids)) {
 			const rows = db.select().from(outlineBlocks).where(inArray(outlineBlocks.id, chunk)).all();
 			for (const row of rows) out.push(toBlock(row));
+		}
+		return out;
+	},
+
+	async getBlockHeads(ids) {
+		const out: Array<{ id: string; contentHead: string }> = [];
+		for (const chunk of chunked(ids)) {
+			out.push(
+				...db
+					.select({
+						id: outlineBlocks.id,
+						contentHead: sql<string>`substr(${outlineBlocks.content}, 1, ${OUTLINE_PAGE_HEAD_CHARS})`,
+					})
+					.from(outlineBlocks)
+					.where(inArray(outlineBlocks.id, chunk))
+					.all(),
+			);
 		}
 		return out;
 	},

@@ -35,6 +35,7 @@ import {
 	type OutlineInProgressItem,
 	type OutlineLockView,
 	type OutlinePageListResponse,
+	type OutlineQuestionMark,
 	type OutlineSpaceSummary,
 	type OutlineTimelineResponse,
 	type OutlineViewBlock,
@@ -42,13 +43,18 @@ import {
 } from "@shared/outline-api";
 import type { OutlinePrincipal } from "./access";
 import { readDisplayNames } from "./access-reads";
-import { OUTLINE_CHANGE, OUTLINE_PENDING_LIMITS, type OutlineTaskLockJson } from "./model";
+import {
+	OUTLINE_CHANGE,
+	OUTLINE_PENDING_LIMITS,
+	type OutlineAskJson,
+	type OutlineTaskLockJson,
+} from "./model";
 import { loadBodies, loadBodiesWithin, readPageTimeline, readSubtree } from "./read";
 import { clampBudget, type OutlineBudget } from "./render";
 import { isOrphanedSpace } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineCommitRow, OutlineSpaceRow, OutlineStore } from "./store/port";
-import { effectiveView, type OutlineNode, viewChildren } from "./tree";
+import { effectiveView, isProcessNode, type OutlineNode, viewChildren } from "./tree";
 
 /** Characters of a title in a page list. */
 const TITLE_CHARS = 200;
@@ -157,6 +163,19 @@ export async function listSpacePages(
 
 const OPEN_TASK = new Set(["todo", "doing"]);
 
+/** A task not done or cancelled, or a question not answered or withdrawn: "in progress". */
+function isOpenWork(node: OutlineNode): boolean {
+	if (node.task) return OPEN_TASK.has(node.task.status);
+	return !!node.ask && !node.ask.answer && !node.ask.withdrawn;
+}
+
+function questionMark(ask: OutlineAskJson): OutlineQuestionMark {
+	return {
+		state: ask.withdrawn ? "withdrawn" : ask.answer ? "answered" : "open",
+		proceed: ask.proceed === true,
+	};
+}
+
 function countSubtree(root: OutlineNode): number {
 	let count = 0;
 	const stack = [root];
@@ -233,7 +252,7 @@ export async function readBlockView(
 	for (const node of shown) {
 		const room = IN_PROGRESS_TITLES - listed.length;
 		if (room <= 0) break;
-		const open = node.children.filter((c) => c.task && OPEN_TASK.has(c.task.status));
+		const open = node.children.filter(isOpenWork);
 		// Past the titles a view loads, a marker lists what fits (the client says how many more).
 		const take = open.slice(0, Math.min(OUTLINE_PENDING_API_LIMITS.inProgressItems, room));
 		inProgressOf.set(node, take);
@@ -275,8 +294,8 @@ export async function readBlockView(
 		let processHidden = 0;
 		let openTasks = 0;
 		for (const child of node.children) {
-			if (child.task && OPEN_TASK.has(child.task.status)) openTasks++;
-			if (view === "facts" && child.task) processHidden += countSubtree(child);
+			if (isOpenWork(child)) openTasks++;
+			if (view === "facts" && isProcessNode(child)) processHidden += countSubtree(child);
 		}
 		return {
 			id: node.id,
@@ -291,6 +310,7 @@ export async function readBlockView(
 						depends: (node.task.depends ?? []).map((d) => d.target),
 					}
 				: null,
+			question: node.ask ? questionMark(node.ask) : null,
 			alias: node.alias,
 			tags: node.tags ?? [],
 			childIds,
@@ -305,6 +325,7 @@ export async function readBlockView(
 					status: task.task?.status ?? "todo",
 					assignee: task.task?.assignee ?? null,
 					waiting: pendingOf.has(task.id),
+					...(task.ask ? { question: true } : {}),
 				}),
 			),
 			lock: locks.get(node.id) ?? null,
@@ -313,7 +334,8 @@ export async function readBlockView(
 	});
 	if (view === "facts") {
 		for (const node of order) {
-			for (const child of node.children) if (child.task) hiddenByView += countSubtree(child);
+			for (const child of node.children)
+				if (isProcessNode(child)) hiddenByView += countSubtree(child);
 		}
 	}
 	return {

@@ -52,8 +52,12 @@ export function useMessageRevertConfirm(
 		t,
 	} = options;
 
-	const { mutateAsync: applyHistoryAction, isPending: revertHistorySubmitting } =
-		useRevertHistoryAction(narratorId);
+	const { mutateAsync: applyHistoryAction, isPending } = useRevertHistoryAction(narratorId);
+	// Set in the same event as the confirm click. The mutation only reports pending a
+	// tick later, and the dialog revokes its plan at once, so without this it would
+	// briefly render the spent plan as "unavailable".
+	const [applying, setApplying] = useState(false);
+	const revertHistorySubmitting = isPending || applying;
 
 	// Deleting a block rolls its file changes back, so it asks first rather than
 	// firing straight from the context menu.
@@ -70,13 +74,15 @@ export function useMessageRevertConfirm(
 	const confirmBlockDelete = useCallback(
 		async (opts: RevertActionConfirmOptions) => {
 			if (!pendingBlockDelete || revertHistorySubmitting) return;
+			setApplying(true);
 			try {
 				await applyHistoryAction({ action: "delete_tool_block", target: pendingBlockDelete, opts });
-				setPendingBlockDelete(null);
 			} catch {
-				// The mutation explains the journal outcome. Keep the revoked preview open
-				// for an explicit reload or a history-only choice; never retry automatically.
+				// The mutation's notification explains the outcome. The plan is spent, so
+				// close instead of leaving a revoked review open; never retry automatically.
 			} finally {
+				setPendingBlockDelete(null);
+				setApplying(false);
 				chunkListRef.current?.refreshStructure("full");
 			}
 		},
@@ -119,12 +125,15 @@ export function useMessageRevertConfirm(
 				setPendingRollback(null);
 				return;
 			}
+			setApplying(true);
 			try {
 				await applyHistoryAction({ action: "rollback_to_block", target: pendingRollback, opts });
-				setPendingRollback(null);
 			} catch {
-				// No second history mutation, and no re-plan/retry after an uncertain apply.
+				// The notification explains the outcome. No second history mutation, and no
+				// re-plan/retry after an uncertain apply; reopening creates a fresh plan.
 			} finally {
+				setPendingRollback(null);
+				setApplying(false);
 				chunkListRef.current?.refreshStructure("full");
 			}
 		},

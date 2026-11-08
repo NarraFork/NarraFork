@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import { isAutoModelValue } from "@shared/auto-model";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
@@ -18,6 +19,7 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { parseStored } from "@shared/narrator-blocks/plan";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import {
 	isPreloadedMode,
 	type RoutineModeConfig,
@@ -28,6 +30,7 @@ import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -97,7 +100,7 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getToolMessage, getUserLanguage, type Locale } from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -176,6 +179,7 @@ import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
+import { lastServedProvider } from "./auto-sticky-source";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import {
@@ -199,6 +203,11 @@ import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./na
 import { buildEffectiveSystemPrompt, taskSectionFor } from "./narrator-prompt";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
 import { getNarratorMessageRefsPort } from "./narrator-refs/store";
+import {
+	adoptHumanReplyContext,
+	ensureReplyContext,
+	syncActiveReplyContext,
+} from "./narrator-reply-context";
 import { enrichToolUseBlocks, narratorService, truncateToolIO } from "./narrator-service";
 import { generateQuickTitle, setProvisionalTitleFromUserMessage } from "./narrator-title";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
@@ -432,6 +441,7 @@ import { recoverInterruptedTurns } from "./narrator-turns";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
 import {
 	assertSnapshotRevertComplete,
+	isAvailableFilesRestored,
 	type RevertResult,
 	type RevertScope,
 	type RevertWarning,
@@ -773,6 +783,9 @@ export async function executeQueuedNewCommand(
  * existed. Uses the `disp` role so this UI-only notice never enters the model
  * history (unlike spec_continuation, which is an instruction to the model).
  * Shared by the idle route path and the busy buffer-consumption path.
+ *
+ * An outline session's card (`outline` given) names the task's address and its
+ * lock instead of Dynamic Spec's protection; its button opens the task board.
  */
 export async function persistGoalAddedNotice(
 	...args: Parameters<typeof persistGoalAddedNoticeUnlocked>
@@ -784,7 +797,25 @@ async function persistGoalAddedNoticeUnlocked(
 	narratorId: string,
 	objective: string,
 	added: boolean,
+	outline?: { address: string; locked: boolean },
 ): Promise<void> {
+	if (outline) {
+		const text = added
+			? `Goal added to the outline (${outline.address}${outline.locked ? ", locked" : ""}) — ${objective}`
+			: `Goal already in the outline (${outline.address}) — ${objective}`;
+		await narratorService.persistDisplayMessage(narratorId, text, [
+			{
+				type: "spec_goal_added",
+				task: objective,
+				added,
+				protected: true,
+				taskBackend: "outline",
+				ref: outline.address,
+				locked: outline.locked,
+			},
+		]);
+		return;
+	}
 	const text = added
 		? `Dynamic Spec: protected task added — ${objective}`
 		: `Dynamic Spec: protected task already exists — ${objective}`;
@@ -794,19 +825,70 @@ async function persistGoalAddedNoticeUnlocked(
 	]);
 }
 
+/** What a `/goal` did: whether it added the task, and for an outline session where. */
+export interface GoalApplied {
+	added: boolean;
+	/** An outline session's task (its address and lock); absent for Dynamic Spec. */
+	outline?: { address: string; locked: boolean };
+}
+
+/**
+ * Add a `/goal`'s task where the session keeps its tasks, after its message was saved:
+ *
+ *   - Dynamic Spec: a protected todo appended to tasks.json (deduped by text), as before;
+ *   - the outline (P2 PR 5): a person-created, locked task on the session space's task page,
+ *     deduped by title (`addPersonTask`). Its commit does not also leave the "a person changed
+ *     your tasks" note: the `/goal` message says it already.
+ *
+ * The first turn is started by the caller (`startSpecContinuationIfPossible`), the same way for
+ * both: it runs once even when continuation is off, and never in plan mode.
+ */
+export async function applyGoalCommand(
+	narratorId: string,
+	objective: string,
+	options: { userId: string | null; messageId?: string | null; locale?: Locale },
+): Promise<GoalApplied> {
+	if ((await resolveTaskBackend(narratorId)) === "outline") {
+		if (!options.userId) throw new ValidationError("/goal needs the person who sent it");
+		const { addPersonTask } = await import("./outline/person-tasks");
+		const { skipOutlineTaskEditNotice } = await import("./outline-task-edits");
+		const task = await addPersonTask({
+			narratorId,
+			userId: options.userId,
+			text: objective,
+			lock: true,
+			locale: options.locale === "zh-CN" ? "zh-CN" : "en",
+			messageId: options.messageId ?? null,
+		});
+		if (task.commitId) skipOutlineTaskEditNotice(task.commitId);
+		return { added: task.added, outline: { address: task.address, locked: task.locked } };
+	}
+	const { added, written } = await specVfsService.appendProtectedSpecTask(narratorId, objective);
+	if (added) {
+		broadcastSpecChanged(
+			narratorId,
+			{ uri: written.uri, path: written.path, revisionId: written.revisionId },
+			"ui",
+			"user",
+		);
+	}
+	return { added };
+}
+
 /**
  * Execute a buffered `/goal` command: persist it as the canonical user message
- * (so it stays visible in the conversation) and append the protected task to
- * spec://tasks.json. Runs when a queued /goal is consumed after the turn that
- * was busy at submit time; the caller then starts a Spec continuation turn.
+ * (so it stays visible in the conversation) and add its task where the session
+ * keeps its tasks ({@link applyGoalCommand}). Runs when a queued /goal is consumed
+ * after the turn that was busy at submit time; the caller then starts the goal's
+ * first turn.
  */
 export async function executeQueuedGoalCommand(
 	narratorId: string,
 	buffered: BufferedMessage,
 	objective: string,
-): Promise<{ refused: boolean }> {
-	// Before anything is saved: a session whose tasks live in the outline has no tasks.json.
-	if ((await resolveTaskBackend(narratorId)) === "outline") {
+): Promise<{ refused: true } | ({ refused: false } & GoalApplied)> {
+	// Before anything is saved: an outline subagent has no tasks of its own to add the goal to.
+	if (await isRefusedOutlineGoal(narratorId, buffered.text, buffered.commandText)) {
 		await refuseQueuedOutlineGoal(narratorId, buffered);
 		return { refused: true };
 	}
@@ -821,27 +903,15 @@ export async function executeQueuedGoalCommand(
 		const claim = buffered._mailboxClaim ?? (row ? inboxClaim(row) : undefined);
 		if (!claim) throw new ValidationError("Buffered goal is no longer at the mailbox head");
 		try {
-			// PostgreSQL: the queue's materialize section commits message + ref + mailbox flip
-			// atomically; SQLite keeps the synchronous placement transaction.
-			if (getNarratorMessageRefsPort())
-				return await materializeClaimedInboxUserMessage({
-					claim,
-					reservedMessageId: row?.recipientMessageId,
-					narratorId,
-					text: rawCommand,
-					contentBlocks: [...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
-					commandText: rawCommand,
-					createdBy: buffered.createdBy,
-				});
-			return await narratorService.persistUserMessage(
+			return await persistClaimedUserInput({
+				claim,
+				reservedMessageId: row?.recipientMessageId,
 				narratorId,
-				rawCommand,
-				[...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
-				rawCommand,
-				buffered.createdBy,
-				undefined,
-				{ mailboxClaim: claim },
-			);
+				text: rawCommand,
+				contentBlocks: [...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
+				commandText: rawCommand,
+				createdBy: buffered.createdBy,
+			});
 		} catch (error) {
 			if (row) await releaseInboxClaim(row, error);
 			throw error;
@@ -852,34 +922,36 @@ export async function executeQueuedGoalCommand(
 		narratorId,
 		message: fileReferenceMessageForDisplay(userMsg),
 	});
-	const { added, written } = await specVfsService.appendProtectedSpecTask(narratorId, objective);
-	if (added) {
-		broadcastSpecChanged(
-			narratorId,
-			{ uri: written.uri, path: written.path, revisionId: written.revisionId },
-			"ui",
-			"user",
-		);
-	}
+	const locale = buffered.createdBy
+		? await getUserLanguage(buffered.createdBy).catch(() => "en" as const)
+		: "en";
+	const applied = await applyGoalCommand(narratorId, objective, {
+		userId: buffered.createdBy ?? null,
+		messageId: userMsg.id,
+		locale,
+	});
 	// The task mutation is the command's durable effect. A display-only confirmation
 	// card is best-effort so a transient message persistence failure cannot mark the
 	// narrator errored or prevent later buffered messages from draining.
-	await persistGoalAddedNotice(narratorId, objective, added).catch((err) => {
-		logger.warn("Failed to persist queued /goal confirmation notice", {
-			narratorId,
-			error: String(err),
-		});
-	});
-	return { refused: false };
+	await persistGoalAddedNotice(narratorId, objective, applied.added, applied.outline).catch(
+		(err) => {
+			logger.warn("Failed to persist queued /goal confirmation notice", {
+				narratorId,
+				error: String(err),
+			});
+		},
+	);
+	return { refused: false, ...applied };
 }
 
 /**
- * Whether this input is a `/goal` the queue consumer would run, for a session whose tasks live in
- * the outline (outline P2). Such a session has no tasks.json to add the goal to; its `/goal` (a
- * person-created, locked task) arrives with the task board (plan PR 5). Every entry point that
- * queues input refuses it before anything is queued or saved.
+ * Whether this input is a `/goal` the queue consumer would refuse: one sent to a subagent of a
+ * session whose tasks live in the outline. The goal is a task of the session, and an outline
+ * subagent has no tasks of its own (D27c). Every entry point that queues input refuses it before
+ * anything is queued or saved; in a root outline session `/goal` adds a person-created, locked
+ * task (outline P2 PR 5).
  */
-export async function isOutlineSessionGoal(
+export async function isRefusedOutlineGoal(
 	narratorId: string,
 	message: string,
 	commandText?: string | null,
@@ -887,14 +959,16 @@ export async function isOutlineSessionGoal(
 	intent?: BufferedExecutionIntent,
 ): Promise<boolean> {
 	if (!parseQueuedGoalCommand(message, commandText, composerDocument, intent)) return false;
-	return (await resolveTaskBackend(narratorId)) === "outline";
+	if ((await resolveTaskBackend(narratorId)) !== "outline") return false;
+	const { readTaskSession } = await import("./task-source/backend");
+	return (await readTaskSession(narratorId))?.subagent === true;
 }
 
 /**
- * The consumers' backstop for a queued `/goal` that reached an outline session anyway (queued
- * while the outline was switched off, say): the row is dropped from the queue without its message
- * ever being saved, the person is told why, and the caller drains on as after any terminal
- * command. Never throws: a refusal must not stall the queue.
+ * The consumers' backstop for a queued `/goal` an outline subagent cannot take (queued while the
+ * outline was switched off, say): the row is dropped from the queue without its message ever
+ * being saved, the person is told why, and the caller drains on as after any terminal command.
+ * Never throws: a refusal must not stall the queue.
  */
 async function refuseQueuedOutlineGoal(narratorId: string, buffered: BufferedMessage) {
 	const refusal = catalogError("GOAL_IN_OUTLINE_SESSION");
@@ -1146,12 +1220,12 @@ async function resumeNextBufferedMessageUnlocked(
 				})
 				.catch((err) => handleTerminalCommandError("/new", err));
 		} else if (goalCommand) {
-			// Queued /goal: persist the protected task, then launch its first Spec turn.
-			// If plan mode or another guard prevents starting, keep draining as before.
+			// Queued /goal: persist its task (Dynamic Spec or the outline), then launch its first
+			// turn. If plan mode or another guard prevents starting, keep draining as before.
 			await executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
 				.then(async ({ refused }) => {
 					inputOwner.release();
-					// Refused for an outline session: nothing to start, drain on.
+					// Refused (an outline subagent): nothing to start, drain on.
 					if (refused) {
 						await settleAfterTerminalCommand();
 						return;
@@ -1297,6 +1371,7 @@ export async function buildSystemPrompt(
 		| "runtimeHints"
 		| "taskSection"
 		| "contextParts"
+		| "outlinePlan"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1333,6 +1408,7 @@ async function createNarrator(
 	}
 
 	const narrator = await narratorService.getById(narratorId);
+	({ locale, replyInUserLanguage } = await ensureReplyContext(narratorId));
 	const initialOAuthRuntime = await assertOAuthNarratorRuntimeActive(narratorId);
 
 	// Use narrator-level state directly
@@ -1442,6 +1518,21 @@ async function createNarrator(
 				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
 				narrator.type,
 			),
+			// An outline session plans in the outline (outline P2 PR 8).
+			...(isPlanMode
+				? await (async () => {
+						const planMode = await import("./outline-plan-mode");
+						const view = await planMode.outlinePlanPromptRoot(narratorId);
+						if (!view) return {};
+						const { resolveEffectiveRelaxedPlan } = await import("../lib/permission-modes");
+						return {
+							outlinePlan: {
+								root: view.root,
+								relaxed: resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
+							},
+						};
+					})()
+				: {}),
 		},
 	);
 
@@ -1474,7 +1565,12 @@ async function createNarrator(
 	const inheritedModel =
 		narrator.model === FOLLOW_PARENT_MODEL ? await resolveSubagentModelForRun(narrator) : null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
-	const narratorModel = inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef);
+	const narratorModel =
+		inheritedModel?.model ??
+		resolveEffectiveModel(
+			narratorModelRef,
+			isAutoModelValue(narratorModelRef) ? lastServedProvider(narratorId) : undefined,
+		);
 	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {
@@ -1793,10 +1889,15 @@ async function maybeDeliverInterruptTaskGuard(
 		if (interruptTaskGuardRevisions.get(narratorId) === revision) return;
 		interruptTaskGuardRevisions.set(narratorId, revision);
 
-		const { content, body } = taskSource.interruptGuardNote(
-			openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS),
-			active.locale,
-		);
+		const listed = openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS);
+		const note = taskSource.interruptGuardNote(listed, active.locale);
+		const content = note.content;
+		// The reader's card counts the open tasks it does not list (the source's own list may be a
+		// prefix of a longer one, so the card reads it as "at least"). The model text is unchanged.
+		const body =
+			note.body.kind === "tasks" && openTasks.length > listed.length
+				? { ...note.body, taskCount: openTasks.length }
+				: note.body;
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
@@ -2000,6 +2101,12 @@ export interface SpecContinuationOptions {
 	state?: SpecContinuationState;
 	/** Delivery/transcript placement changes only persistence, never continuation decisions. */
 	placement?: InjectionRecipientPlacement;
+	/**
+	 * The task a person asked the session to start (outline P2 PR 5: "Add and start", "Reopen and
+	 * start"): started for the session and named by the continuation; nothing else when it cannot
+	 * be (`NarratorTaskSource.prepareContinuation`).
+	 */
+	preferTaskId?: string;
 }
 
 /**
@@ -2009,9 +2116,13 @@ export interface SpecContinuationOptions {
 async function readContinuationTarget(
 	taskSource: NarratorTaskSource,
 	promoteTodo: boolean,
+	preferTaskId?: string,
 ): Promise<ContinuationTarget> {
 	try {
-		return await taskSource.prepareContinuation({ promoteTodo });
+		return await taskSource.prepareContinuation({
+			promoteTodo,
+			...(preferTaskId ? { preferTaskId } : {}),
+		});
 	} catch {
 		return { openTask: null, protectedOpenCount: 0 };
 	}
@@ -2069,7 +2180,11 @@ async function maybeStartSpecContinuation(
 		suppressed: active._continuationSuppressed === true,
 	};
 	const taskSource = await taskSourceForNarrator(active.narratorId);
-	const spec = await readContinuationTarget(taskSource, policy.continuation.promoteTodo);
+	const spec = await readContinuationTarget(
+		taskSource,
+		policy.continuation.promoteTodo,
+		options?.preferTaskId,
+	);
 	const cause = options?.cause ?? "spec";
 	// A narrator without tasks of its own (an outline subagent, D27c) continues only when a pass
 	// spent its turn budget before the final reply: the mode's task conditions do not apply to
@@ -2203,50 +2318,6 @@ async function maybeStartSpecContinuation(
 	});
 	active._continuationTurn = "task";
 	return prompt;
-}
-
-/**
- * Write the session's upstream conversation id back to the DB, but only while the
- * row still holds the id this session started from.
- *
- * The guard exists because `apiConversationId = null` is a compact's way of saying
- * "the history was replaced; the next request must open a fresh upstream session".
- * Background compacts are fire-and-forget and routinely settle around a turn
- * boundary, so a plain write at teardown — on a turn that ended with no error at
- * all — could reinstate the stale id and make the next activation resume a session
- * whose upstream state still contains the pre-compact conversation.
- *
- * Losing the CAS is the correct outcome, not a failure: it means someone
- * deliberately moved the row, so we leave their value alone.
- */
-export function persistConversationIdIfUnchanged(
-	narratorId: string,
-	active: ActiveNarrator,
-	context?: string,
-): void {
-	const expected = active._persistedConversationId ?? null;
-	const next = active.conversationId;
-	// Nothing to write: the row already holds exactly this id.
-	if (expected === next) return;
-	narratorService
-		.updateConversationId(narratorId, next, expected)
-		.then((applied) => {
-			if (applied) {
-				active._persistedConversationId = next;
-				return;
-			}
-			logger.debug("Skipped conversationId write: row moved since session start", {
-				narratorId,
-				...(context ? { context } : {}),
-			});
-		})
-		.catch((err) => {
-			logger.error("Failed to persist conversationId", {
-				narratorId,
-				...(context ? { context } : {}),
-				error: String(err),
-			});
-		});
 }
 
 /**
@@ -2854,6 +2925,24 @@ export async function drainInjectionsIntoHistory(
 		if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 	}
 
+	// Outline tasks people changed while this session worked: a system notice naming who
+	// changed what, never a person's message (outline-task-edits.ts). Sessions only; a
+	// subagent's tasks are its session's.
+	if (!subagent) {
+		const { takeOutlineTaskEditNotice } = await import("./outline-task-edits");
+		const notice = await takeOutlineTaskEditNotice(narratorId, locale).catch(() => null);
+		if (notice) {
+			const { messageId, turnText } = await deliverInjection(narratorId, {
+				content: notice.content,
+				body: notice.body,
+				source: "outline_task_edit",
+				schedule: "onNextTurn",
+				locale,
+			});
+			if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
+		}
+	}
+
 	return {
 		text: parts.map((part) => part.text).join("\n\n"),
 		parts,
@@ -2948,6 +3037,8 @@ export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]):
 export interface ContextManagementOptions {
 	narratorId: string;
 	locale: Locale;
+	getReplyContext?: () => ReplyContext;
+	ensureRequestIdentity?: () => Promise<void>;
 	/** Dynamic getter for the current model (supports mid-loop model switching) */
 	getModel: () => string;
 	/** Dynamic getter for the current provider (supports mid-loop model switching) */
@@ -2968,7 +3059,10 @@ export interface ContextManagementOptions {
 	/** Clear the compact-done flag after the rebuild has been applied */
 	clearCompactDone?: () => void;
 	/** Collect current dynamic parts before each provider request; reconcile freezes the baseline. */
-	buildPrefixPrompt?: (identity: RequestModelIdentity) => Promise<{
+	buildPrefixPrompt?: (
+		identity: RequestModelIdentity,
+		replyContext: ReplyContext,
+	) => Promise<{
 		contract: string;
 		parts: import("../../shared/prefix-context").PromptPart[];
 		compactMessageId?: string | null;
@@ -3035,6 +3129,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		const preparedPrefix = await preparePrefixRequest({
 			narratorId,
 			locale,
+			getReplyContext: opts.getReplyContext,
+			ensureRequestIdentity: opts.ensureRequestIdentity,
 			getModel,
 			getProvider,
 			signal,
@@ -3303,6 +3399,7 @@ async function feedMessageUnlocked(
 	rawTextFiles?: File[],
 	preBashCommand?: string | null,
 	internalOptions?: {
+		humanReplyContext?: ReplyContext;
 		preserveTurnStart?: boolean;
 		turnStartedAt?: string;
 		/** A buffered message may be restored only before its user row is committed. */
@@ -3412,6 +3509,7 @@ async function feedMessageUnlocked(
 					undefined,
 					composerDocument,
 					media,
+					internalOptions?.humanReplyContext,
 				)
 			).id;
 		acceptedInputId = acceptedId;
@@ -3863,6 +3961,8 @@ async function updateToolCallConclusionUnlocked(opts: {
 	 * manual/third-party conclusion text updates preserve the original execution timing.
 	 */
 	refreshTiming?: boolean;
+	/** Recovery explanations may update only an active row, never a terminal result. */
+	onlyIfActive?: boolean;
 	onPersist?: (tx: import("./agent-runtime/mailbox-types").RuntimeTx) => void;
 }): Promise<void> {
 	const {
@@ -3909,15 +4009,19 @@ async function updateToolCallConclusionUnlocked(opts: {
 			streamStartedAt: true,
 			permissionStartedAt: true,
 			executionStartedAt: true,
+			status: true,
 		},
 		limit: 2,
 	});
-	if (resultRows.length !== 1)
+	if (resultRows.length !== 1) {
+		if (opts.onlyIfActive) return;
 		throw new ValidationError("Subagent conclusion requires an exact parent tool-call row");
+	}
 	const resultRow = resultRows[0];
+	if (opts.onlyIfActive && (resultRow.status === "success" || resultRow.status === "fail")) return;
 	const timing = refreshTiming ? resolveToolCallConclusionTiming(resultRow) : undefined;
 
-	await narratorStore.settleTool(
+	const settled = await narratorStore.settleTool(
 		toolUseId,
 		{
 			output,
@@ -3925,11 +4029,15 @@ async function updateToolCallConclusionUnlocked(opts: {
 			errorMessage: hasError ? finalText : undefined,
 			resultMessageId,
 			onPersist: opts.onPersist,
+			onlyIfActive: opts.onlyIfActive,
 			...(timing ?? { preserveTiming: true }),
 		},
 		messageId,
 		resultRow.id,
 	);
+	// A competing writer settled the row between our read and the active-only CAS.
+	// Do not broadcast a conclusion that was never actually written.
+	if (opts.onlyIfActive && !settled) return;
 	// Broadcast to parent narrator so the frontend can update the SubagentCard
 	broadcastToNarrator(parentNarratorId, {
 		type: "subagent_conclusion_updated",
@@ -3945,6 +4053,8 @@ async function updateToolCallConclusionUnlocked(opts: {
 // === Public API ===
 
 export interface UserMessageAdmissionOptions {
+	/** Set only by authenticated human input endpoints; absent for agent/plugin traffic. */
+	humanReplyContext?: ReplyContext;
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	images?: ImageRef[];
 	media?: MediaRef[];
@@ -4019,6 +4129,7 @@ export async function acceptUserMessage(
 	prompt: string,
 	options: UserMessageAdmissionOptions = {},
 ): Promise<UserMessageAdmissionResult> {
+	const humanReplyContext = parseReplyContext(options.humanReplyContext) ?? undefined;
 	const locale = options.locale ?? "en";
 	const queueMode =
 		options.queueMode ?? (options.interrupt ? "interrupt" : options.priority ? "tool" : "turn");
@@ -4048,6 +4159,7 @@ export async function acceptUserMessage(
 					queueMode,
 					options.composerDocument,
 					options.media,
+					humanReplyContext,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -4196,7 +4308,9 @@ export async function sendMessage(
 	fileReferences?: FileReferenceSnapshot[],
 	composerDocument?: ComposerDocument,
 	media?: MediaRef[],
+	humanReplyContext?: ReplyContext,
 ): Promise<typeof narratorMessages.$inferSelect> {
+	const frozenHumanReplyContext = parseReplyContext(humanReplyContext) ?? undefined;
 	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const { userMsg, userBroadcasted } = await feedMessage(
 		narratorId,
@@ -4208,7 +4322,7 @@ export async function sendMessage(
 		userId,
 		textFiles,
 		preBashCommand,
-		undefined,
+		{ humanReplyContext: frozenHumanReplyContext },
 		origin,
 		acceptedReferences,
 		composerDocument,
@@ -4222,6 +4336,12 @@ export async function sendMessage(
 		});
 	}
 	return userMsg;
+}
+
+/** Trusted human entry; automation must use sendMessage without this wrapper. */
+export function sendHumanMessage(...args: Parameters<typeof sendMessage>) {
+	args[13] = { locale: args[3] ?? "en", replyInUserLanguage: args[4] ?? false };
+	return sendMessage(...args);
 }
 
 export interface SendSubagentMessageInput {
@@ -4540,6 +4660,10 @@ export async function startSpecContinuationIfPossible(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
+	options: {
+		/** The task the person asked to start (outline): the continuation names it. */
+		preferTaskId?: string;
+	} = {},
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
 		if (isLoopRunning(narratorId)) return { started: false };
@@ -4561,6 +4685,7 @@ export async function startSpecContinuationIfPossible(
 
 		const prompt = await maybeStartContinuation(active, false, {
 			explicitStart: true,
+			...(options.preferTaskId ? { preferTaskId: options.preferTaskId } : {}),
 		});
 		if (!prompt) return { started: false };
 
@@ -4646,8 +4771,11 @@ export function isQuestionAnswerWakeEligible(recipient: {
  * tails are not replies: a crash can leave them after the answer without the
  * model having continued, and treating them as delivered would drop the wake
  * forever. Text or a tool call is enough; other non-reasoning bodies count too.
+ *
+ * Exported for the outline's answer delivery, whose retry wakes only a session that has not
+ * replied after the message yet.
  */
-function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
+export function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
 	const substantive = db
 		.select({ id: narratorMessageRefs.id })
 		.from(narratorMessageRefs)
@@ -5402,6 +5530,7 @@ export function resolveRetryTarget<T extends RetryCandidateMessage>(
 export async function retryLastMessage(
 	...args: Parameters<typeof retryLastMessageUnlocked>
 ): ReturnType<typeof retryLastMessageUnlocked> {
+	args[4] = parseReplyContext(args[4]) ?? undefined;
 	return withNarratorStartAdmission(args[0], () => retryLastMessageUnlocked(...args));
 }
 
@@ -5410,6 +5539,7 @@ async function retryLastMessageUnlocked(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
+	humanReplyContext?: ReplyContext,
 ): Promise<{ ok: boolean }> {
 	// Guard before any destructive work (deleteMessagesAfter below): if a loop is
 	// already running, refuse rather than mutate history under a live session.
@@ -5520,6 +5650,7 @@ async function retryLastMessageUnlocked(
 		.map((item) => mediaRefToContentBlock(item, lastMsg.narratorId));
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	if (humanReplyContext) await adoptHumanReplyContext(narratorId, humanReplyContext);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
@@ -5551,9 +5682,14 @@ export async function continueNarrator(
 	replyInUserLanguage = false,
 	userId?: string | null,
 	run?: NonNullable<Parameters<typeof continueNarratorUnlocked>[4]>["run"],
+	humanReplyContext?: ReplyContext,
 ): ReturnType<typeof continueNarratorUnlocked> {
+	const frozenHumanReplyContext = parseReplyContext(humanReplyContext) ?? undefined;
 	return withNarratorStartAdmission(narratorId, () =>
-		continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, { run }),
+		continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
+			run,
+			humanReplyContext: frozenHumanReplyContext,
+		}),
 	);
 }
 
@@ -5597,6 +5733,7 @@ export async function continueNarratorAfterPlannedUpdate(
 		// remains registered across ALL asynchronous history/session/input preparation.
 		control.releaseRuntimeClaim();
 		try {
+			await ensureReplyContext(narratorId, { locale, replyInUserLanguage });
 			const result = await continueNarratorUnlocked(
 				narratorId,
 				locale,
@@ -5625,6 +5762,7 @@ async function continueNarratorUnlocked(
 	replyInUserLanguage = false,
 	userId?: string | null,
 	options: {
+		humanReplyContext?: ReplyContext;
 		/** Recovery: re-enter a persisted run (deadline kept) and whether it delivers. */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
@@ -5721,6 +5859,7 @@ async function continueNarratorUnlocked(
 			undefined,
 			{
 				recoveryStart,
+				humanReplyContext: options.humanReplyContext,
 				bufferedId: queuedInput?.id,
 				...(continueTiming.preserveTurnStart
 					? { preserveTurnStart: true, turnStartedAt: continueTiming.turnStartedAt }
@@ -5739,6 +5878,8 @@ async function continueNarratorUnlocked(
 	recoveryStart?.check();
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	recoveryStart?.check();
+	if (options.humanReplyContext)
+		await adoptHumanReplyContext(narratorId, options.humanReplyContext);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild
 	// (interrupt may have destroyed the prior active, leaving _currentUserId unset).
 	active._currentUserId = userId ?? active._currentUserId ?? null;
@@ -5804,7 +5945,6 @@ export type ReExecuteDeniedResult =
 
 function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrator): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-	persistConversationIdIfUnchanged(narratorId, active, "inactive narrator session");
 	active._preparedPlanModes?.clear();
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
@@ -6143,6 +6283,12 @@ async function reExecuteDeniedToolCallUnlocked(
 						narrator.planReflectionAutoApproveOverride,
 					),
 					conversationId: active.conversationId,
+					beforeProviderRequest: async () => {
+						const { ensureConversationIdentityPersisted } = await import(
+							"./narrator-conversation-identity"
+						);
+						await ensureConversationIdentityPersisted(narratorId, active);
+					},
 					model: active.model,
 					provider: active.provider,
 					cwd: active.cwd,
@@ -6314,6 +6460,18 @@ async function reExecuteDeniedToolCallUnlocked(
 					if (!result.isError && toolName === "ExitPlanMode") {
 						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
 						const planState = await exitNarratorPlanMode(narratorId);
+						// An outline session's plan is recorded as approved (a draft: outline P2 PR 8).
+						const { settleApprovedOutlinePlan } = await import("./outline-plan-mode");
+						await settleApprovedOutlinePlan({
+							narratorId,
+							toolUseId,
+							locale: active.locale,
+							approverUserId: userId ?? null,
+							turnUserId: active._currentUserId ?? null,
+							byReview: false,
+							// The input as just resolved: the row is written after this (review N2).
+							input: (result.updatedInput as Record<string, unknown> | undefined) ?? null,
+						});
 						active._preparedPlanModes?.clear();
 						active._planFileId = undefined;
 						active._planFilePath = undefined;
@@ -6901,12 +7059,23 @@ export async function editAndRegenerate(
 	replyInUserLanguage = false,
 	opts?: EditAndRegenerateOptions,
 ): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
+	const acceptedOptions = opts
+		? { ...opts, humanReplyContext: parseReplyContext(opts.humanReplyContext) ?? undefined }
+		: undefined;
 	return continuationStartLock.acquire(narratorId, () =>
-		editAndRegenerateUnlocked(narratorId, messageId, newContent, locale, replyInUserLanguage, opts),
+		editAndRegenerateUnlocked(
+			narratorId,
+			messageId,
+			newContent,
+			locale,
+			replyInUserLanguage,
+			acceptedOptions,
+		),
 	);
 }
 
 export interface EditAndRegenerateOptions {
+	humanReplyContext?: ReplyContext;
 	revertPlan?: ScopedRevertOptions["revertPlan"];
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
@@ -6999,7 +7168,12 @@ async function editAndRegenerateUnlocked(
 	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
 		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	// Two budgets, because the two kinds reach the model differently. Images and
+	// media are base64-inlined into every provider request, so what the message
+	// retains of them stays bounded by the buffered 128 MiB. Text files are only
+	// passed to the model as paths, so they count toward the 2 GiB total alone.
 	let retainedAttachmentBytes = 0;
+	let retainedInlineBytes = 0;
 	const countedMediaIds = new Set<string>();
 	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
 		const owner = item.uploadNarratorId || targetMsg.narratorId;
@@ -7008,7 +7182,9 @@ async function editAndRegenerateUnlocked(
 		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
 		if (!countedMediaIds.has(mediaKey)) {
 			countedMediaIds.add(mediaKey);
-			retainedAttachmentBytes += Bun.file(mediaPath).size;
+			const size = Bun.file(mediaPath).size;
+			retainedAttachmentBytes += size;
+			retainedInlineBytes += size;
 		}
 	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
@@ -7060,13 +7236,20 @@ async function editAndRegenerateUnlocked(
 	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [
-		...(opts?.newImages ?? []),
-		...(opts?.newTextFiles ?? []),
-		...(opts?.newMedia ?? []),
-	].reduce((total, file) => total + file.size, 0);
-	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+	// Images and media are read whole (`arrayBuffer()`) for validation, so they keep
+	// the buffered 128 MiB budget. Text files reach the worktree by streamed copy, so
+	// with them included only the 2 GiB staged ceiling applies.
+	const bufferedUploadBytes = [...(opts?.newImages ?? []), ...(opts?.newMedia ?? [])].reduce(
+		(total, file) => total + file.size,
+		0,
+	);
+	if (bufferedUploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const uploadBytes =
+		bufferedUploadBytes + (opts?.newTextFiles ?? []).reduce((total, file) => total + file.size, 0);
+	if (uploadBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	if (keepImageIds.length + (opts?.newImages?.length ?? 0) > MAX_EDIT_IMAGES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -7116,6 +7299,7 @@ async function editAndRegenerateUnlocked(
 			if (!countedImageIds.has(imageKey)) {
 				countedImageIds.add(imageKey);
 				retainedAttachmentBytes += imageInfo.size;
+				retainedInlineBytes += imageInfo.size;
 			}
 		}
 		if (
@@ -7153,14 +7337,17 @@ async function editAndRegenerateUnlocked(
 			}
 		}
 	}
-	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
-	if (finalAttachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+	if (bufferedUploadBytes + retainedInlineBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
+	if (finalAttachmentBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 	}
 	const materializedBytes =
 		uploadBytes + [...textFilesToCopy.values()].reduce((total, file) => total + file.size, 0);
-	if (materializedBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
-		throw new ValidationError("Combined materialized attachments exceed the 128 MiB limit");
+	if (materializedBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+		throw new ValidationError("Combined materialized attachments exceed the 2 GiB limit");
 	}
 	if (isLoopRunning(narratorId)) {
 		await reconcileRunningStatus(narratorId);
@@ -7197,9 +7384,20 @@ async function editAndRegenerateUnlocked(
 				revertPlan: opts?.revertPlan,
 			},
 		);
-		assertSnapshotRevertComplete(revertResult);
-		if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
-		revertWarnings = revertResult.warnings;
+		if (isAvailableFilesRestored(revertResult)) {
+			// A partial-coverage plan was confirmed as "restore available files": they are
+			// restored and the plan deliberately leaves history alone. The edit itself
+			// still has to truncate, so finish it history-only, exactly like keep-files.
+			({ deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
+				preserveConversationId: true,
+				skipRevert: true,
+			}));
+			revertWarnings = revertResult.warnings;
+		} else {
+			assertSnapshotRevertComplete(revertResult);
+			if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
+			revertWarnings = revertResult.warnings;
+		}
 	}
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
@@ -7290,12 +7488,27 @@ async function editAndRegenerateUnlocked(
 				"This narrator did not stop after being interrupted; try again in a moment",
 			);
 		}
-		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
-			contentText: effectivePrompt,
-			contentJson: newContentJson,
-			composerDocument: document ?? null,
-		});
+		privateMessageId = await narratorService.copyOnWriteMessage(
+			narratorId,
+			messageId,
+			{
+				contentText: effectivePrompt,
+				contentJson: newContentJson,
+				composerDocument: document ?? null,
+			},
+			{
+				afterWrite: opts?.humanReplyContext
+					? (tx) => {
+							tx.update(narrators)
+								.set({ replyContext: opts.humanReplyContext })
+								.where(eq(narrators.id, narratorId))
+								.run();
+						}
+					: undefined,
+			},
+		);
 		copyOnWriteSucceeded = true;
+		if (opts?.humanReplyContext) syncActiveReplyContext(narratorId, opts.humanReplyContext);
 	} catch (error) {
 		if (!copyOnWriteSucceeded) {
 			for (const mediaId of createdMediaIds) deleteUploadedMedia(narratorId, mediaId);
@@ -9439,7 +9652,7 @@ export async function loadOptionalTool(
 		{ id: toolName, description: toolName, toolNames: [toolName] },
 		true,
 	);
-	return result === "loaded"
+	return result === "loaded" || result === "loaded_new_epoch"
 		? "loaded"
 		: result === "already_loaded"
 			? "already_loaded"

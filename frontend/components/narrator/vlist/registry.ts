@@ -154,7 +154,8 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "system-text",
 		label: "System card (multi-line text)",
 		lodSensitive: false,
-		measure: (d, w, l) => measureSystemTextCard((d as AnyData).kind, d as AnyData, w, l),
+		measure: (d, w, l, o) =>
+			measureSystemTextCard((d as AnyData).kind, d as AnyData, w, l, o as AnyData),
 	},
 	"knowledge-hint": {
 		kind: "knowledge-hint",

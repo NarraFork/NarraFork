@@ -4,7 +4,7 @@
  * when the input is large (`edit-text-runner.ts`): normalizing a block costs tens of
  * milliseconds per 16 KiB, and agent input is untrusted.
  *
- * FOUR JOBS
+ * FIVE JOBS
  * ---------
  *   - `parse`: a markdown outline (an `add`) or the text of one block (a `replace`) becomes
  *     items with canonical content. Read annotations (`‹…›` lines) are dropped first, and the
@@ -23,6 +23,9 @@
  *     changes overlap the merge is refused with the overlapping ranges, and a merged text that
  *     normalization would change (the two changes meet in markup) is refused too, so what is
  *     written is exactly both changes.
+ *   - `report`: a delegated subagent's report becomes the blocks attached under its task
+ *     (`report-text.ts`, outline P2 PR 9a): headings hold their sections, nothing in it is read
+ *     as outline syntax, and it is cut to what one commit may carry.
  *
  * Every content returned is canonical (`normalizeBlock(content).content === content`), with the
  * links `contentLinks` would read from it: what `writeOutline` takes as `canonical` content.
@@ -47,6 +50,7 @@ import {
 } from "@shared/outline";
 import { bodyLinks, type ExtractedLink } from "./links";
 import { stripReadAnnotations } from "./render";
+import { convertReport, type ReportConversion } from "./report-text";
 
 /**
  * A label a read puts after a bullet: a block's sid (8 letters and digits), or `key/sid` where a
@@ -166,6 +170,13 @@ export type EditTextJob =
 	| {
 			kind: "merge";
 			merges: EditTextMergeInput[];
+	  }
+	| {
+			/** A delegated subagent's report as blocks (`report-text.ts`). */
+			kind: "report";
+			text: string;
+			/** The marker in front of the pieces of a block cut in several. */
+			continued: string;
 	  };
 
 export type EditTextResult<J extends EditTextJob> = J extends { kind: "parse" }
@@ -174,7 +185,9 @@ export type EditTextResult<J extends EditTextJob> = J extends { kind: "parse" }
 		? EditTextNormalized[]
 		: J extends { kind: "merge" }
 			? EditTextMerged[]
-			: EditTextRewritten[];
+			: J extends { kind: "report" }
+				? ReportConversion
+				: EditTextRewritten[];
 
 /** UTF-8 bytes of the text a job carries. */
 export function editTextJobBytes(job: EditTextJob): number {
@@ -182,6 +195,7 @@ export function editTextJobBytes(job: EditTextJob): number {
 	if (job.kind === "parse") for (const input of job.inputs) bytes += utf8(input.text);
 	else if (job.kind === "merge")
 		for (const m of job.merges) bytes += utf8(m.base) + utf8(m.mine) + utf8(m.theirs);
+	else if (job.kind === "report") bytes += utf8(job.text);
 	else for (const content of job.contents) bytes += utf8(content);
 	return bytes;
 }
@@ -199,6 +213,7 @@ export function runEditTextJob<J extends EditTextJob>(job: J): EditTextResult<J>
 		return job.inputs.map((input) => parseEditText(input, labels)) as EditTextResult<J>;
 	}
 	if (job.kind === "merge") return job.merges.map(mergeContent) as EditTextResult<J>;
+	if (job.kind === "report") return convertReport(job) as EditTextResult<J>;
 	return job.contents.map((content) => rewriteContent(content, job.targets)) as EditTextResult<J>;
 }
 

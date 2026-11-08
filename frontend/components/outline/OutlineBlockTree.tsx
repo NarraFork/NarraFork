@@ -1,40 +1,28 @@
 import { ActionIcon, Badge, Box, Popover, Stack, Text, Tooltip } from "@mantine/core";
 import type {
 	OutlineBlockViewResponse,
+	OutlineQuestionMark,
 	OutlineTaskStatus,
 	OutlineViewBlock,
 } from "@shared/outline-api";
-import {
-	IconChevronDown,
-	IconChevronRight,
-	IconLock,
-	IconSquare,
-	IconSquareCheck,
-	IconSquareHalf,
-	IconSquareX,
-} from "@tabler/icons-react";
+import { IconLock } from "@tabler/icons-react";
 import { memo, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { visibleRows } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
+import { FOLD_ICONS, QUESTION_ICON, TASK_ICONS } from "./outline-icons";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 /** Indentation stops growing past this depth so deep outlines stay inside a phone's width. */
 const MAX_INDENT_DEPTH = 8;
 const INDENT_PX = 18;
 
-const TASK_ICONS: Record<OutlineTaskStatus, typeof IconSquare> = {
-	todo: IconSquare,
-	doing: IconSquareHalf,
-	done: IconSquareCheck,
-	cancelled: IconSquareX,
-};
-
+/** A task's checkbox: the same icon the live editor's frame draws (`outline-icons.ts`). */
 export function OutlineTaskIcon({ status }: { status: OutlineTaskStatus }) {
 	const { t } = useTranslation("outline");
-	const Icon = TASK_ICONS[status];
+	const { Icon } = TASK_ICONS[status];
 	return (
 		<Tooltip label={t(`page.task.${status}`)} openDelay={400}>
 			<span className={classes.taskIcon} role="img" aria-label={t(`page.task.${status}`)}>
@@ -42,6 +30,47 @@ export function OutlineTaskIcon({ status }: { status: OutlineTaskStatus }) {
 			</span>
 		</Tooltip>
 	);
+}
+
+const QUESTION_COLORS: Record<OutlineQuestionMark["state"], string> = {
+	open: "var(--mantine-color-teal-5)",
+	answered: "var(--mantine-color-green-6)",
+	withdrawn: "var(--mantine-color-dimmed)",
+};
+
+/**
+ * The mark of a question put to a person (`Ask`) where a task has its checkbox: a question is
+ * answered or withdrawn, never checked off.
+ */
+export function OutlineQuestionIcon({
+	state,
+	proceed = false,
+}: {
+	state: OutlineQuestionMark["state"];
+	proceed?: boolean;
+}) {
+	const { t } = useTranslation("outline");
+	const label = t(`page.question.${state}${state === "open" && proceed ? "Proceeded" : ""}`);
+	const { Icon } = QUESTION_ICON;
+	return (
+		<Tooltip label={label} openDelay={400}>
+			<span
+				className={classes.taskIcon}
+				role="img"
+				aria-label={label}
+				data-testid="outline-question-mark"
+				data-state={state}
+				style={{ color: QUESTION_COLORS[state] }}
+			>
+				<Icon size={16} />
+			</span>
+		</Tooltip>
+	);
+}
+
+function FoldIcon({ collapsed }: { collapsed: boolean }) {
+	const { Icon } = FOLD_ICONS[collapsed ? "collapsed" : "expanded"];
+	return <Icon size={14} />;
 }
 
 interface RowProps {
@@ -92,12 +121,19 @@ const OutlineRow = memo(function OutlineRow({
 						aria-expanded={!collapsed}
 						onClick={() => onToggle(block.id)}
 					>
-						{collapsed ? <IconChevronRight size={14} /> : <IconChevronDown size={14} />}
+						<FoldIcon collapsed={collapsed} />
 					</ActionIcon>
 				)}
 			</span>
-			{focusLink(<span className={classes.bulletDot} />, classes.bullet, t("page.focus"))}
+			{focusLink(
+				<span className={classes.bulletDot} data-collapsed={hasChildren && collapsed} />,
+				classes.bullet,
+				t("page.focus"),
+			)}
 			{block.task && <OutlineTaskIcon status={block.task.status} />}
+			{!block.task && block.question && (
+				<OutlineQuestionIcon state={block.question.state} proceed={block.question.proceed} />
+			)}
 			<div className={classes.content} data-done={done}>
 				<OutlineBlockBody content={block.content} />
 				{(block.alias ||
@@ -219,46 +255,69 @@ function InProgressMarker({
 				<Text size="xs" c="dimmed" px={6} pb={2}>
 					{t("page.inProgressHint")}
 				</Text>
-				<Stack gap={0}>
-					{block.inProgress.map((item) => (
-						<OutlineLink
-							key={item.id}
-							to={outlineBlockTarget(spaceId, item.id, search.view, search.asOf)}
-							className={classes.listItem}
-						>
-							<Box style={{ display: "flex", gap: 6, alignItems: "center", minWidth: 0 }}>
-								<OutlineTaskIcon status={item.status} />
-								<Text size="sm" className={classes.ellipsis}>
-									{item.title || item.sid}
-								</Text>
-							</Box>
-							{(item.assignee || item.waiting) && (
-								<Text size="xs" c="dimmed" className={classes.ellipsis}>
-									{[
-										item.assignee ? `@${item.assignee}` : null,
-										item.waiting ? t("page.waitingConfirmation") : null,
-									]
-										.filter(Boolean)
-										.join(" · ")}
-								</Text>
-							)}
-						</OutlineLink>
-					))}
-					{block.openTasks > block.inProgress.length && (
-						<OutlineLink
-							to={outlineBlockTarget(spaceId, block.id, "all", search.asOf)}
-							className={classes.listItem}
-						>
-							<Text size="xs" c="dimmed">
-								{t("page.inProgressMore", {
-									count: block.openTasks - block.inProgress.length,
-								})}
-							</Text>
-						</OutlineLink>
-					)}
-				</Stack>
+				<InProgressList block={block} spaceId={spaceId} search={search} />
 			</Popover.Dropdown>
 		</Popover>
+	);
+}
+
+/**
+ * The tasks and questions put to people in progress under a block (the "in progress" marker's
+ * list): a question shows its mark, a task its checkbox.
+ */
+export function InProgressList({
+	block,
+	spaceId,
+	search,
+}: {
+	block: OutlineViewBlock;
+	spaceId: string;
+	search: OutlineBlockSearch;
+}) {
+	const { t } = useTranslation("outline");
+	return (
+		<Stack gap={0}>
+			{block.inProgress.map((item) => (
+				<OutlineLink
+					key={item.id}
+					to={outlineBlockTarget(spaceId, item.id, search.view, search.asOf)}
+					className={classes.listItem}
+				>
+					<Box style={{ display: "flex", gap: 6, alignItems: "center", minWidth: 0 }}>
+						{item.question ? (
+							<OutlineQuestionIcon state="open" />
+						) : (
+							<OutlineTaskIcon status={item.status} />
+						)}
+						<Text size="sm" className={classes.ellipsis}>
+							{item.title || item.sid}
+						</Text>
+					</Box>
+					{(item.assignee || item.waiting) && (
+						<Text size="xs" c="dimmed" className={classes.ellipsis}>
+							{[
+								item.assignee ? `@${item.assignee}` : null,
+								item.waiting ? t("page.waitingConfirmation") : null,
+							]
+								.filter(Boolean)
+								.join(" · ")}
+						</Text>
+					)}
+				</OutlineLink>
+			))}
+			{block.openTasks > block.inProgress.length && (
+				<OutlineLink
+					to={outlineBlockTarget(spaceId, block.id, "all", search.asOf)}
+					className={classes.listItem}
+				>
+					<Text size="xs" c="dimmed">
+						{t("page.inProgressMore", {
+							count: block.openTasks - block.inProgress.length,
+						})}
+					</Text>
+				</OutlineLink>
+			)}
+		</Stack>
 	);
 }
 

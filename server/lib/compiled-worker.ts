@@ -36,6 +36,7 @@ export const COMPILED_WORKER_ENTRIES = [
 	"lib/browser/memory-profile-worker.ts",
 	"lib/share-preview-worker.ts",
 	"lib/request-recorder-worker.ts",
+	"lib/startup-status/worker.ts",
 	"lib/agent/request-json-worker.ts",
 	"services/editor-document-worker.ts",
 	"services/editor-document-stream-worker.ts",

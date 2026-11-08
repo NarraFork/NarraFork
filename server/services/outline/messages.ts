@@ -89,9 +89,16 @@ export const OUTLINE_TEXT = {
 	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
 		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
 
+	/** A question block given a checkbox, or a task given a question. */
+	questionNotTask: (address: string) =>
+		`${address} is a question (asked with Ask); it cannot be a task too. Answer it, or withdraw it with Ask`,
+
 	/** An agent's write tried to lock or unlock (only people lock, through the page). */
 	lockDenied:
 		"only people lock or unlock a task (from the outline page); an agent cannot change a lock",
+	/** An agent's write tried to change a plan's state (the system keeps it: plan mode, approval). */
+	planStateDenied:
+		"a plan's state (planning, approved) is kept by plan mode; an agent cannot set or clear it",
 	/** Locking a task someone else locked. */
 	lockHeld: (address: string) =>
 		`${address} is locked by someone else; it has to be unlocked first (by them, a manager of the space or an admin) before anyone locks it again`,
@@ -118,6 +125,9 @@ export const OUTLINE_TEXT = {
 		/** An agent's write to the session's behavior page without the user turn's grant. */
 		behaviorPageReadonly:
 			"the behavior page of this session (alias behavior) holds the user's standing rules: you may write it only as the first tool call of a user turn in which the user asked you to record a rule",
+		/** An agent's write giving or taking the task page's alias, moving or deleting the page. */
+		tasksPageReserved:
+			"the task page of this session (alias tasks) is where people add their tasks: you may add and change blocks under it, but not give or take its alias, nor move or delete the page",
 	},
 	/** Summary of the commit that imports a session's old behavior fence into its page. */
 	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",

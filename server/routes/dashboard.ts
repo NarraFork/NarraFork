@@ -86,19 +86,25 @@ dashboardRoutes.get("/summary", async (c) => {
 
 	// ── Today cost (from api_requests table, not narrators.totalCostUsd) ──
 	// narrators.totalCostUsd is a cumulative lifetime value, not a daily delta.
-	// api_requests has per-request cost_usd + created_at with idx_api_requests_created index.
+	// Scoped to the requests this user initiated: deployment-wide spend is admin data
+	// (usage history), not something every signed-in user may see on their home page.
+	// Served by idx_api_requests_user_created.
 	const todayStart = new Date();
 	todayStart.setHours(0, 0, 0, 0);
 	const todayStartIso = todayStart.toISOString();
+	const ownRequestsToday = and(
+		eq(apiRequests.userId, c.get("user").sub),
+		gte(apiRequests.createdAt, todayStartIso),
+	);
 
 	const [todayCostResult] = await db
 		.select({ total: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)` })
 		.from(apiRequests)
-		.where(gte(apiRequests.createdAt, todayStartIso));
+		.where(ownRequestsToday);
 	const todayCostUsd = todayCostResult?.total ?? 0;
 
 	// ── Today tokens (input + output + reasoning) ─────────────────────────
-	// Same api_requests source and created_at index as the cost aggregate above.
+	// Same scope and index as the cost aggregate above.
 	const [todayTokensResult] = await db
 		.select({
 			input: sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`,
@@ -106,7 +112,7 @@ dashboardRoutes.get("/summary", async (c) => {
 			reasoning: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
 		})
 		.from(apiRequests)
-		.where(gte(apiRequests.createdAt, todayStartIso));
+		.where(ownRequestsToday);
 	const todayTokens = {
 		input: todayTokensResult?.input ?? 0,
 		output: todayTokensResult?.output ?? 0,

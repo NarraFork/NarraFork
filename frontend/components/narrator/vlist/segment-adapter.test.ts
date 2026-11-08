@@ -1364,6 +1364,28 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		expect(data.badges[1]).toBe("Already tracked");
 	});
 
+	it("spec_goal_added of an outline session: its own words, the same layout (outline P2 PR 5)", () => {
+		const data = sysData([
+			{
+				type: "spec_goal_added",
+				task: "Ship the release",
+				added: true,
+				protected: true,
+				taskBackend: "outline",
+				ref: "abc/xyz",
+				locked: true,
+			},
+		]);
+		expect(data.kind).toBe("spec_goal_added");
+		expect(data.text).toBe("Ship the release");
+		expect(data.badges).toEqual(["Locked goal", "Added to the outline"]);
+		expect(data.buttons).toEqual(["View task board"]);
+		const exists = sysData([
+			{ type: "spec_goal_added", task: "x", added: false, taskBackend: "outline", locked: false },
+		]);
+		expect(exists.badges).toEqual(["Set by a person", "Already on the board"]);
+	});
+
 	it("spec_continuation: framed as a bubble task row (glyph + lock + wrapping text)", () => {
 		// The Dynamic Spec continuation is a framed BUBBLE whose body is a task row the
 		// bubble draws itself — not the clamped single-line card it used to nest.
@@ -4804,7 +4826,8 @@ describe("adaptSegment — a concluded review", () => {
 				},
 			});
 			const measured = VLIST_REGISTRY[specs[0].kind].measure(specs[0].data, 320, lod);
-			expect(measured.height).toBe(25);
+			// py 4×2 + one xs line (20 at the default setting: 120% of the Mantine 17).
+			expect(measured.height).toBe(28);
 		});
 		it.each(["sys", "system", "assistant"])("does not collapse %s messages", (role) => {
 			const specs = adaptSegment(

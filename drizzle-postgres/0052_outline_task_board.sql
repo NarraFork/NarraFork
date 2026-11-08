@@ -1,0 +1,2 @@
+CREATE INDEX "idx_outline_blocks_active_tasks" ON "outline_blocks" USING btree ("space_id") WHERE "deleted" = FALSE AND (("task_json"::jsonb #>> '{status}') = 'doing' OR (("task_json"::jsonb #>> '{status}') = 'todo' AND ("task_json"::jsonb #>> '{lock}') IS NOT NULL));--> statement-breakpoint
+CREATE INDEX "idx_outline_blocks_finished_tasks" ON "outline_blocks" USING btree ("space_id","version_seq","id") WHERE ("task_json"::jsonb #>> '{status}') IN ('done', 'cancelled') AND "deleted" = FALSE;

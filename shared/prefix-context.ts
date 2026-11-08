@@ -1,3 +1,5 @@
+import { OUTLINE_TASKS_VIEW_KEY } from "./outline-task-notice";
+
 /** Model-facing context is an immutable baseline followed by named replacements. */
 export interface PromptPart {
 	key: string;
@@ -11,6 +13,12 @@ export interface PromptPart {
  */
 export interface ContextPart extends PromptPart {
 	unreadable?: true;
+	/**
+	 * A small, bounded summary of the part for the READER (the transcript's update row), written
+	 * beside a `context_update` that changes it. Never compared (the change key is `text`), never
+	 * hashed into the prefix and never sent to the model.
+	 */
+	display?: unknown;
 }
 
 export interface ContextChange {
@@ -24,6 +32,46 @@ export interface ContextUpdate {
 	changes: ContextChange[];
 	/** Stored updates can keep large replacement bodies out of their message envelope. */
 	snapshotRef?: string;
+	/**
+	 * Reader-only summaries of the changed parts that have one (`ContextPart.display`), by key;
+	 * `null` for a changed part that was removed. Absent on rows written before it existed.
+	 */
+	display?: Record<string, unknown>;
+}
+
+/** Reader summaries above this many bytes of JSON are not stored (they are bounded at source). */
+export const CONTEXT_UPDATE_DISPLAY_MAX_BYTES = 8192;
+
+/**
+ * Parts whose removal the transcript shows (as `null` in a row's `display`): an outline session's
+ * current-tasks view, which goes away when no task is open. Any other part's removal stores
+ * nothing, so rows of sessions without such parts are written exactly as before.
+ */
+export const DISPLAYED_CONTEXT_PARTS: ReadonlySet<string> = new Set([OUTLINE_TASKS_VIEW_KEY]);
+
+/**
+ * The `display` a `context_update` row stores for `changes`: the summary each changed part
+ * supplied (`ContextPart.display`), and `null` for each removed part of
+ * {@link DISPLAYED_CONTEXT_PARTS}. Undefined when there is none, or when it would exceed
+ * {@link CONTEXT_UPDATE_DISPLAY_MAX_BYTES}.
+ */
+export function contextUpdateDisplay(
+	changes: readonly ContextChange[],
+	displays: Readonly<Record<string, unknown>> | undefined,
+): Record<string, unknown> | undefined {
+	const display: Record<string, unknown> = {};
+	for (const change of changes) {
+		if (change.value === null) {
+			if (DISPLAYED_CONTEXT_PARTS.has(change.key)) display[change.key] = null;
+		} else if (displays?.[change.key] !== undefined) {
+			display[change.key] = displays[change.key];
+		}
+	}
+	if (Object.keys(display).length === 0) return undefined;
+	return new TextEncoder().encode(JSON.stringify(display)).length <=
+		CONTEXT_UPDATE_DISPLAY_MAX_BYTES
+		? display
+		: undefined;
 }
 
 /** Only content references live in an epoch marker; large bodies are shared snapshots. */

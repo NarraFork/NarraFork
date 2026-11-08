@@ -14,6 +14,7 @@ import { DEFAULT_UPDATE_SETTINGS } from "./update-source";
 
 export const DEFAULTS: NarraForkSettings = {
 	tokendance: { apiKey: "", disabled: false, generation: 0 },
+	speech: { enabled: false, providers: [] },
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
@@ -226,6 +227,8 @@ export const DEFAULTS: NarraForkSettings = {
  * Kept alongside DEFAULTS so changes stay in sync.
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
+	"speech.enabled": { desc: "启用独立语音识别与合成 API。", type: "boolean" },
+	"speech.providers": { desc: "独立语音提供商及 ASR/TTS 协议配置。", type: "array" },
 	customApiProviders: {
 		desc: "通过自定义供应商面板维护的结构化 API 供应商配置。密钥由对应面板管理，不作为普通文本设置展示。",
 		type: "array",

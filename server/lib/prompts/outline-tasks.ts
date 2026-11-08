@@ -1,4 +1,5 @@
 import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i18n-locales";
+import type { OutlineTaskNoticeChange } from "@shared/outline-task-notice";
 
 // ─── Outline tasks ───
 //
@@ -85,12 +86,12 @@ export function getOutlineContinuationPrompt(input: {
 	const note = task.humanCreated ? pickLocalizedValue(humanCreatedNote, locale) : "";
 	if (input.status === "blocked") {
 		return locale === "zh-CN"
-			? `大纲任务续跑：所有任务都在等待（系统消息，不是用户发言）。\n\n本会话所有未完成的任务都在等待——等前置任务完成，或等人回答——时，系统自动发出这条消息。\n\n等待中的任务（仅这一条，本会话的其他任务仍在大纲里）：${label}\n\n请按实际情况选择：\n- 不需要人也能解除等待（调查、修复、换一条路）：在它下面加一个解阻任务，勾成进行中（\`[/]\`），立刻动手。\n- 需要人提供信息、权限或决定：先做完不需要人的部分，再用 AskUserQuestion 提一个精确的问题并附上你的建议，然后结束回合。\n- 已不符合当前实际：在保留原意图的前提下改写它或勾成取消（\`[-]\`），并说明原因。\n\n不要在之后的续跑里重复同一段等待说明。${note}`
-			: `Outline task continuation: every task is waiting (system message, not the user speaking).\n\nThe system sends this when every open task of this session is waiting — on a prerequisite that is not finished, or on a person's answer.\n\nWaiting task (this one only; the session's other tasks are still in the outline): ${label}\n\nTake the path that fits:\n- The wait can be removed without a person (an investigation, a fix, another approach): add a task for that under it, tick it in progress (\`[/]\`) and work on it now.\n- It needs a person's information, permission or decision: finish every part that does not need them, then ask one precise question with your recommendation using AskUserQuestion, and end the turn.\n- It no longer matches reality: rewrite it or tick it cancelled (\`[-]\`), keeping the original intent, and say why.\n\nDo not repeat an explanation of the same wait on later continuations.${note}`;
+			? `大纲任务续跑：所有任务都在等待（系统消息，不是用户发言）。\n\n本会话所有未完成的任务都在等待——等前置任务完成，或等人回答——时，系统自动发出这条消息。\n\n等待中的任务（仅这一条，本会话的其他任务仍在大纲里）：${label}\n\n请按实际情况选择：\n- 不需要人也能解除等待（调查、修复、换一条路）：在它下面加一个解阻任务，勾成进行中（\`[/]\`），立刻动手。\n- 需要人提供信息、权限或决定：先做完不需要人的部分，再用 Ask 提一个精确的问题并附上你的建议（问题记在任务下，回答回来会唤醒本会话），然后结束回合。\n- 已不符合当前实际：在保留原意图的前提下改写它或勾成取消（\`[-]\`），并说明原因。\n\n不要在之后的续跑里重复同一段等待说明。${note}`
+			: `Outline task continuation: every task is waiting (system message, not the user speaking).\n\nThe system sends this when every open task of this session is waiting — on a prerequisite that is not finished, or on a person's answer.\n\nWaiting task (this one only; the session's other tasks are still in the outline): ${label}\n\nTake the path that fits:\n- The wait can be removed without a person (an investigation, a fix, another approach): add a task for that under it, tick it in progress (\`[/]\`) and work on it now.\n- It needs a person's information, permission or decision: finish every part that does not need them, then ask one precise question with your recommendation using Ask (it is recorded under the task, and the answer comes back to this session as a message), and end the turn.\n- It no longer matches reality: rewrite it or tick it cancelled (\`[-]\`), keeping the original intent, and say why.\n\nDo not repeat an explanation of the same wait on later continuations.${note}`;
 	}
 	return locale === "zh-CN"
-		? `大纲任务续跑（系统消息，不是用户发言）。\n\n本会话在大纲里还有进行中的任务时，系统自动发出这条消息。它只说明该任务还没勾成完成——不代表系统判断你没做完，任务内容也可能已经过时。\n\n当前任务（仅这一条，本会话的其他任务仍在大纲里）：${label}\n\n请先判断这个任务的真实状态，再按实际情况选择其一：\n- 已经完成：用 OutlineEdit 把它勾成完成（\`[x]\`）。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要人提供信息、权限、决定，或需要人亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提一个精确的问题并附上你的建议，然后结束回合。\n- 已不符合当前实际：在保留原意图的前提下改写它或勾成取消（\`[-]\`），并说明原因。${note}`
-		: `Outline task continuation (system message, not the user speaking).\n\nThe system sends this while a task of this session is still in progress in the outline. It only means the task is not ticked done yet — not that the system judged your work unfinished, and the task may be out of date.\n\nCurrent task (this one only; the session's other tasks are still in the outline): ${label}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: tick it done (\`[x]\`) with OutlineEdit. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs a person's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with your recommendation using AskUserQuestion, and end the turn.\n- No longer matches reality: rewrite it or tick it cancelled (\`[-]\`), keeping the original intent, and say why.${note}`;
+		? `大纲任务续跑（系统消息，不是用户发言）。\n\n本会话在大纲里还有进行中的任务时，系统自动发出这条消息。它只说明该任务还没勾成完成——不代表系统判断你没做完，任务内容也可能已经过时。\n\n当前任务（仅这一条，本会话的其他任务仍在大纲里）：${label}\n\n请先判断这个任务的真实状态，再按实际情况选择其一：\n- 已经完成：用 OutlineEdit 把它勾成完成（\`[x]\`）。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要人提供信息、权限、决定，或需要人亲自操作：先做完不受阻的部分，再用 Ask 提一个精确的问题并附上你的建议（问题记在任务下，回答回来会唤醒本会话），然后结束回合。\n- 已不符合当前实际：在保留原意图的前提下改写它或勾成取消（\`[-]\`），并说明原因。${note}`
+		: `Outline task continuation (system message, not the user speaking).\n\nThe system sends this while a task of this session is still in progress in the outline. It only means the task is not ticked done yet — not that the system judged your work unfinished, and the task may be out of date.\n\nCurrent task (this one only; the session's other tasks are still in the outline): ${label}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: tick it done (\`[x]\`) with OutlineEdit. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs a person's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with your recommendation using Ask (it is recorded under the task, and the answer comes back to this session as a message), and end the turn.\n- No longer matches reality: rewrite it or tick it cancelled (\`[-]\`), keeping the original intent, and say why.${note}`;
 }
 
 /**
@@ -201,11 +202,15 @@ const tasksViewText = {
 		"zh-CN": "本会话在大纲里的当前任务（由系统维护，有变化时更新）：",
 	},
 	doing: { en: "In progress:", "zh-CN": "进行中：" },
+	delegated: {
+		en: "Delegated to subagents (do not work on these yourself; each report comes back to you):",
+		"zh-CN": "已交给子代理（不要自己再做；报告会交回给你）：",
+	},
 	waiting: { en: "Waiting:", "zh-CN": "等待中：" },
 	next: { en: "Next:", "zh-CN": "下一个：" },
 } satisfies Record<string, LocalizedValue<string>>;
 
-export type OutlineTasksViewSection = "doing" | "waiting" | "next";
+export type OutlineTasksViewSection = "doing" | "delegated" | "waiting" | "next";
 
 /** The first line of the current-tasks view. */
 export function getOutlineTasksViewHeading(locale: Locale): string {
@@ -236,6 +241,34 @@ function waitNote(wait: OutlineTaskWaitText, locale: Locale): string {
 export function getOutlineViewTaskLine(task: OutlineViewTask, locale: Locale): string {
 	const box = task.checkbox === "doing" ? "[/]" : "[ ]";
 	return `- ${box} ${taskLabel(task, locale)}${task.wait ? waitNote(task.wait, locale) : ""}`;
+}
+
+/** The subagent a delegated task was handed to (outline P2 PR 9b), as the view names it. */
+export interface OutlineViewAgent {
+	/** Its narrator id: what Send, Stop and Await take. */
+	id: string;
+	/** Its title (the Agent call's description), when it has one. */
+	title: string | null;
+}
+
+/**
+ * One line of the view's "delegated" section: the task, then the subagent doing it, running (its
+ * lease is live). `- [/] \`key/sid\` title — subagent "X" (\`id\`), running`.
+ */
+export function getOutlineViewDelegatedLine(
+	task: OutlineTaskPromptTask,
+	agent: OutlineViewAgent,
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const name = agent.title
+		? zh
+			? `子代理「${agent.title}」（\`${agent.id}\`）`
+			: `subagent "${agent.title}" (\`${agent.id}\`)`
+		: zh
+			? `子代理 \`${agent.id}\``
+			: `subagent \`${agent.id}\``;
+	return `- [/] ${taskLabel(task, locale)} — ${name}${zh ? "，运行中" : ", running"}`;
 }
 
 /** The last line of a current-tasks view that could not list everything. */
@@ -422,4 +455,159 @@ const specUnavailable: LocalizedValue<string> = {
 /** What a tool call naming a `spec://` path gets in an outline session. */
 export function getOutlineSpecUnavailableHint(locale: Locale): string {
 	return pickLocalizedValue(specUnavailable, locale);
+}
+
+// ─── People's changes to the session's tasks (outline P2 PR 5) ───
+
+/** One change a person made to a task of the session (the board, the outline editor). */
+export type OutlineTaskEditChange = OutlineTaskNoticeChange;
+
+export interface OutlineTaskEdit {
+	/** `key/sid`. */
+	address: string;
+	title: string;
+	/** Created by a person (`/goal`, the board). */
+	humanCreated: boolean;
+	locked: boolean;
+	changes: OutlineTaskEditChange[];
+}
+
+/** The changes one person made, as a note lists them. */
+export interface OutlineTaskEditGroup {
+	/** The person's name (a username), never their words: the note is the system's. */
+	person: string;
+	edits: OutlineTaskEdit[];
+}
+
+const STATUS_WORDS: Record<string, LocalizedValue<string>> = {
+	todo: { en: "to do", "zh-CN": "待办" },
+	doing: { en: "in progress", "zh-CN": "进行中" },
+	done: { en: "done", "zh-CN": "完成" },
+	cancelled: { en: "cancelled", "zh-CN": "取消" },
+};
+
+function editStatusWord(status: string, locale: Locale): string {
+	return pickLocalizedValue(STATUS_WORDS[status] ?? { en: status, "zh-CN": status }, locale);
+}
+
+function changeText(change: OutlineTaskEditChange, locale: Locale): string {
+	const zh = locale === "zh-CN";
+	switch (change.kind) {
+		case "added":
+			return zh ? "新加" : "added";
+		case "deleted":
+			return zh ? "删除" : "deleted";
+		case "unchecked":
+			return zh ? "去掉了复选框，不再是任务" : "no longer a task (checkbox removed)";
+		case "moved":
+			return zh ? "移动了位置" : "moved";
+		case "locked":
+			return zh ? "锁定" : "locked";
+		case "unlocked":
+			return zh ? "解锁" : "unlocked";
+		case "fields":
+			return zh ? "改了前置或截止日期" : "prerequisites or due date changed";
+		case "assigned":
+			return change.to
+				? zh
+					? `交给 @${change.to}`
+					: `handed to @${change.to}`
+				: zh
+					? "交回本会话（去掉指派）"
+					: "handed back to this session (assignee removed)";
+		case "status": {
+			if (change.to === "todo" && (change.from === "done" || change.from === "cancelled"))
+				return zh ? "重开（回到待办）" : "reopened (back to to do)";
+			return zh
+				? `改成${editStatusWord(change.to, locale)}`
+				: `set to ${editStatusWord(change.to, locale)}`;
+		}
+		case "rejected": {
+			const reason = change.reason
+				? zh
+					? `，理由：${change.reason}`
+					: `; reason: ${change.reason}`
+				: "";
+			return zh
+				? `退回了你把它标为${editStatusWord(change.status, locale)}的改动${reason}。它仍未完成，接着做`
+				: `rejected your marking it ${editStatusWord(change.status, locale)}${reason}. It is still open; carry on with it`;
+		}
+	}
+}
+
+/**
+ * The notice people's changes to the session's tasks leave for the agent: a system notice (not
+ * the user speaking), grouped by who made them, one line per task with its address. Only what the
+ * outline holds: names, task titles, the changes. Delivered at the next tool boundary while the
+ * agent works, else ahead of its next turn.
+ */
+export function getOutlineTaskEditNote(
+	groups: readonly OutlineTaskEditGroup[],
+	more: number,
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const blocks = groups.map((group) => {
+		const lines = group.edits.map((edit) => {
+			const marks = [
+				edit.humanCreated ? (zh ? "人建" : "set by a person") : null,
+				edit.locked ? (zh ? "已锁定" : "locked") : null,
+			].filter(Boolean);
+			const tail = marks.length > 0 ? ` (${marks.join(zh ? "，" : ", ")})` : "";
+			const what = edit.changes.map((c) => changeText(c, locale)).join(zh ? "；" : "; ");
+			return `- \`${edit.address}\` ${edit.title}${tail}${zh ? "：" : ": "}${what}`;
+		});
+		return `${zh ? `${group.person}：` : `${group.person}:`}\n${lines.join("\n")}`;
+	});
+	if (more > 0)
+		blocks.push(zh ? `还有 ${more} 处改动未列出。` : `${more} more changes not listed.`);
+	return zh
+		? `系统通知（不是用户发言）：有人在界面上改了本会话的任务。\n\n${blocks.join("\n\n")}\n\n请据此调整你的工作；要确认细节就用 OutlineRead 读这些任务。`
+		: `System notice (not the user speaking): people changed tasks of this session in the interface.\n\n${blocks.join("\n\n")}\n\nAdjust your work to these changes; read the tasks with OutlineRead if you need the details.`;
+}
+
+// ─── Tasks this session created, finished elsewhere (outline P2 PR 9b) ───
+
+/** One task a session created that someone else finished, as the notice names it. */
+export interface OutlineTaskFinishedEntry {
+	/** `key/sid`. */
+	address: string;
+	title: string;
+	status: "done" | "cancelled";
+	/** Created by a person (`/goal`, the board). */
+	humanCreated: boolean;
+}
+
+/**
+ * The notice a session gets when tasks it created are ticked done or cancelled by another
+ * session or a person (design §2.7): a system notice (not the user speaking), one line per task
+ * with its address, who finished it, where the result is and that it may be reopened. Only what
+ * the outline holds. `by` is the finisher as the caller names it (a session, a person, the
+ * system); `more` counts tasks of the same commit not listed.
+ */
+export function getOutlineTaskFinishedNote(
+	input: { by: string; entries: readonly OutlineTaskFinishedEntry[]; more: number },
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const lines = input.entries.map((entry) => {
+		const mark = entry.humanCreated ? (zh ? "（人建）" : " (set by a person)") : "";
+		const what = zh
+			? entry.status === "done"
+				? `已被${input.by}勾成完成`
+				: `已被${input.by}取消`
+			: entry.status === "done"
+				? `ticked done by ${input.by}`
+				: `cancelled by ${input.by}`;
+		return `- \`${entry.address}\` ${entry.title}${mark}${zh ? "：" : ": "}${what}`;
+	});
+	if (input.more > 0)
+		lines.push(
+			zh
+				? `- 同一次改动还结束了你建的 ${input.more} 个任务，未列出。`
+				: `- ${input.more} more tasks this session created were finished in the same change (not listed).`,
+		);
+	return zh
+		? `系统通知（不是用户发言）：本会话在大纲里建的任务在别处结束了。\n\n${lines.join("\n")}\n\n结果和报告在各自的任务下面，用 OutlineRead 读；不满意可以重开（设回待办）。`
+		: `System notice (not the user speaking): tasks this session created in the outline were finished elsewhere.\n\n${lines.join("\n")}\n\nThe results and any reports are under each task; read them with OutlineRead. If one does not meet what you wanted, reopen it (set it to do).`;
 }

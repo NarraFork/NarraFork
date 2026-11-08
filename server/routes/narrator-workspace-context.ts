@@ -9,7 +9,7 @@ import { workspaceContextService } from "../services/workspace-context-service";
 export const narratorWorkspaceContextRoutes = new Hono();
 narratorWorkspaceContextRoutes.use("/:id/workspace-context/*", bodyLimit({ maxSize: 16 * 1024 }));
 narratorWorkspaceContextRoutes.get("/:id/workspace-context", async (c) => {
-	return c.json(await workspaceContextService.get(c.req.param("id")));
+	return c.json(await workspaceContextService.getForDirectorySwitch(c.req.param("id")));
 });
 narratorWorkspaceContextRoutes.post("/:id/workspace-context/switch", async (c) => {
 	const request = switchWorkingDirectorySchema.parse(await c.req.json());
@@ -25,7 +25,7 @@ narratorWorkspaceContextRoutes.post("/:id/workspace-context/switch", async (c) =
 narratorWorkspaceContextRoutes.patch("/:id/cwd", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorCwdSchema.parse(await c.req.json());
-	const previous = await workspaceContextService.get(id);
+	const previous = await workspaceContextService.getForDirectorySwitch(id);
 	const result = await workspaceContextService.switch(
 		id,
 		{

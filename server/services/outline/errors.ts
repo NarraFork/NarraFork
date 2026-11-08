@@ -46,7 +46,9 @@ export type OutlineWriteErrorCode =
 	/** A pending change would grow past its limits. */
 	| "OUTLINE_PENDING_TOO_LARGE"
 	/** An agent wrote a session's behavior page without the user turn's one-shot grant. */
-	| "OUTLINE_BEHAVIOR_PAGE_READONLY";
+	| "OUTLINE_BEHAVIOR_PAGE_READONLY"
+	/** An agent gave or took a session's task page alias, or moved or deleted the page. */
+	| "OUTLINE_TASKS_PAGE_RESERVED";
 
 /** The transaction is invalid as written. `opIndex` is the offending operation, when one is. */
 export class OutlineWriteError extends ValidationError {
@@ -125,6 +127,22 @@ export class OutlineTaskClaimedError extends OutlineWriteError {
 			opIndex,
 		);
 		this.name = "OutlineTaskClaimedError";
+	}
+}
+
+/**
+ * A claim the caller decided on is no longer as it read it (`OutlineWriteOptions.expectClaims`),
+ * or a delegation's claim moved on before it was written (`delegateClaim`: someone claimed the
+ * task in between). Nothing was written; the caller reads the claim again and decides again.
+ */
+export class OutlineClaimChangedError extends AppError {
+	constructor(readonly blockId: string) {
+		super(
+			`the claim of task ${blockId} changed while the write was planned`,
+			409,
+			"OUTLINE_CLAIM_CHANGED",
+		);
+		this.name = "OutlineClaimChangedError";
 	}
 }
 

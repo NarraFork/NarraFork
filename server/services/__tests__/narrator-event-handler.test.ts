@@ -706,6 +706,7 @@ describe("request occupancy is independent from billing and historical usage", (
 					contextPercent: 92.6,
 					contextSnapshot: snapshot,
 					usage: { promptTokens: 510800, inputTokens: 510800, completionTokens: 12 },
+					decodeMs: 400,
 				},
 				ctx,
 			);
@@ -725,6 +726,7 @@ describe("request occupancy is independent from billing and historical usage", (
 			const request = db.select().from(apiRequests).where(eq(apiRequests.narratorId, id)).get();
 			expect(request?.inputTokens).toBe(510800);
 			expect(request?.contextUsageSnapshotJson).toEqual(snapshot);
+			expect(request?.decodeMs).toBe(400);
 			expect(broadcastMessages.at(-1)).toMatchObject({
 				type: "context_usage",
 				promptTokens: 926000,
@@ -739,7 +741,9 @@ describe("request occupancy is independent from billing and historical usage", (
 			expect(message?.usage).toMatchObject({
 				input_tokens: 510800,
 				prompt_tokens: 510800,
+				output_tokens: 12,
 				context_snapshot: snapshot,
+				decode_ms: 400,
 			});
 		} finally {
 			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));

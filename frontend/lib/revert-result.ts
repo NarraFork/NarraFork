@@ -64,6 +64,24 @@ export function isRevertHistoryCommitted(value: unknown): boolean {
 	);
 }
 
+/**
+ * A plan with incomplete coverage is confirmed as "restore available files": the
+ * server restores them and deliberately keeps message history. That is the
+ * reviewed outcome, not a failure, as long as every file actually succeeded.
+ */
+export function isAvailableFilesRestored(value: unknown): boolean {
+	const result = extractRevertResult(value);
+	return (
+		!!result &&
+		result.status === "partial" &&
+		result.journalStatus === "partial" &&
+		result.reason === "SELECTED_HISTORY_UNAVAILABLE" &&
+		result.historyCommitted === false &&
+		result.settling === false &&
+		result.files.every((file) => file.status === "applied" || file.status === "unchanged")
+	);
+}
+
 function formatFileResults(t: Translate, result: FileChangeRevertApplyResponse | null): string {
 	if (!result) return "";
 	const exceptions = result.files.filter(

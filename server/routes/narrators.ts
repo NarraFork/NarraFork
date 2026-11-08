@@ -17,10 +17,13 @@ import {
 } from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import type { OutlinePlanDecisionResponse } from "@shared/outline-api";
+import type { NarratorCurrentTaskResponse } from "@shared/outline-task-board";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
+	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import {
 	and,
@@ -60,6 +63,11 @@ import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflect
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
+import {
+	findStagedAttachment,
+	releaseStagedAttachment,
+	stagedAttachmentAsFile,
+} from "../lib/attachment-staging";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
 	type AutoContinuationOverride,
@@ -166,7 +174,12 @@ import {
 import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	getQueueDuringCompaction,
+	normalizeAutoModelValueForSave,
+	settings,
+} from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -239,6 +252,7 @@ import {
 	revertPlanIdSchema,
 	rollbackToBlocksSchema,
 } from "../lib/validators/narrators";
+import { outlinePlanDecisionSchema } from "../lib/validators/outline";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
@@ -323,6 +337,7 @@ import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-wri
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
+	releaseStagedFiles,
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
@@ -394,6 +409,7 @@ import {
 	editAndRegenerate,
 	editAssistantMessage,
 	editOutputBlock,
+	executeQueuedGoalCommand,
 	getBufferedMessagesAsync,
 	getNarratorExecutionDeviceState,
 	interruptAndWaitForIdle,
@@ -401,9 +417,8 @@ import {
 	isCompactInProgress,
 	isLoopRunning,
 	isNarratorActive,
-	isOutlineSessionGoal,
+	isRefusedOutlineGoal,
 	normalizeRollbackBlockIndexForMessage,
-	persistGoalAddedNotice,
 	readSessionDeliverTo,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
@@ -418,7 +433,7 @@ import {
 	rollbackToBlocks,
 	runCustomCompact,
 	runSegmentCompact,
-	sendMessage,
+	sendHumanMessage as sendMessage,
 	setNarratorDefaultDevice,
 	startSpecContinuationIfPossible,
 	toBufferSummary,
@@ -478,15 +493,13 @@ import {
 	SnapshotRevertError,
 	unavailableSnapshotRevert,
 } from "../services/snapshot-revert";
-import { broadcastSpecChanged } from "../services/spec-broadcast";
-import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
 import {
 	resolveSubagentModelForRun,
 	resolveSubagentModelInheritance,
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
-import { resolveTaskBackend } from "../services/task-source";
+import { resolveTaskBackend, taskSourceForNarrator } from "../services/task-source";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -510,6 +523,104 @@ function parseNewCommand(message: string): { rawCommand: string; initialMessage:
 	const match = message.trim().match(/^\/new(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
 	return { rawCommand: message.trim(), initialMessage: match[1]?.trim() ?? "" };
+}
+
+/** Index is in the original newly-added textFiles list, excluding kept attachments. */
+export interface StagedAttachmentInput {
+	uploadId: string;
+	index: number;
+}
+
+const MAX_STAGED_ATTACHMENT_IDS = MAX_EDIT_TEXT_FILES_PER_MESSAGE;
+
+/** Parse the `stagedAttachments` form field, rejecting anything malformed outright. */
+export function parseStagedAttachmentInput(
+	raw: FormDataEntryValue | null | undefined,
+): StagedAttachmentInput[] {
+	if (raw === null || raw === undefined) return [];
+	if (typeof raw !== "string") {
+		throw new ValidationError("stagedAttachments must be a JSON array");
+	}
+	// At most ten small descriptors; reject oversized control data before JSON.parse.
+	if (raw.length > 4096) throw new ValidationError("stagedAttachments metadata is too large");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new ValidationError("stagedAttachments must be valid JSON");
+	}
+	if (!Array.isArray(parsed)) throw new ValidationError("stagedAttachments must be a JSON array");
+	if (parsed.length > MAX_STAGED_ATTACHMENT_IDS) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
+	}
+	const out: StagedAttachmentInput[] = [];
+	const ids = new Set<string>();
+	const indexes = new Set<number>();
+	for (const entry of parsed) {
+		const uploadId = entry && typeof entry === "object" ? entry.uploadId : undefined;
+		const index = entry && typeof entry === "object" ? entry.index : undefined;
+		if (typeof uploadId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(uploadId)) {
+			throw new ValidationError("Each staged attachment needs a valid uploadId");
+		}
+		if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+			throw new ValidationError("Each staged attachment needs a valid index");
+		}
+		if (ids.has(uploadId) || indexes.has(index)) {
+			throw new ValidationError("Duplicate staged attachment uploadId or index");
+		}
+		ids.add(uploadId);
+		indexes.add(index);
+		out.push({ uploadId, index });
+	}
+	return out;
+}
+
+/**
+ * Turn staged upload ids into disk-backed `File` values for the shared pipeline.
+ *
+ * The returned objects behave like any other upload: `size`, `name` and `type`
+ * are real, and `Bun.write` streams from the staged path. That is what lets the
+ * buffered mailbox, the worktree copy and the retry path stay unaware that these
+ * attachments never travelled inside a request body.
+ *
+ * A missing id is a user-visible condition, not an internal one: the TTL sweep,
+ * a restart or another tab can remove it between upload and send.
+ */
+export function resolveStagedAttachments(
+	narratorId: string,
+	inputs: readonly StagedAttachmentInput[],
+	inlineFiles: readonly FormDataEntryValue[] = [],
+): File[] {
+	const count = inputs.length + inlineFiles.length;
+	if (count > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
+	}
+	for (const file of inlineFiles) {
+		if (!(file instanceof File)) throw new ValidationError("textFiles must contain files");
+	}
+	const stagedByIndex = new Map<number, File>();
+	for (const { uploadId, index } of inputs) {
+		if (!Number.isInteger(index) || index < 0 || index >= count || stagedByIndex.has(index)) {
+			throw new ValidationError("Invalid or duplicate staged attachment index");
+		}
+		const staged = findStagedAttachment(narratorId, uploadId);
+		if (!staged) {
+			throw new ValidationError(
+				"An attached file is no longer available (its upload expired); attach it again",
+			);
+		}
+		stagedByIndex.set(index, stagedAttachmentAsFile(staged));
+	}
+	let inlineIndex = 0;
+	return Array.from(
+		{ length: count },
+		(_, index) => stagedByIndex.get(index) ?? (inlineFiles[inlineIndex++] as File),
+	);
+}
+
+/** Combined size of a set of attachment files, in bytes. */
+export function attachmentBytesOf(files: readonly File[]): number {
+	return files.reduce((total, file) => total + file.size, 0);
 }
 
 /** Parse message request supporting both JSON and multipart/form-data (with images and text files) */
@@ -563,11 +674,14 @@ export async function parseMessageRequest(
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
-			throw new ValidationError(
-				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
-			);
-		}
+		// Attachments over the buffered ceiling never appear here: the composer
+		// uploaded them through the streaming endpoint and sent only their ids, so
+		// the multipart body stays small no matter how large the file is.
+		const allTextFiles = resolveStagedAttachments(
+			narratorId,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
 		// when the user typed nothing. Only a fully empty request is rejected.
@@ -575,7 +689,7 @@ export async function parseMessageRequest(
 			!message.trim() &&
 			imageFiles.length === 0 &&
 			mediaFiles.length === 0 &&
-			textFileEntries.length === 0 &&
+			allTextFiles.length === 0 &&
 			!fileReferences?.length
 		) {
 			throw new ValidationError("message or an attachment is required");
@@ -585,6 +699,12 @@ export async function parseMessageRequest(
 		for (const file of textFileEntries) {
 			validateTextFile(file);
 		}
+		// Staged files were size-checked while streaming, and re-reading a gigabyte
+		// to check it again would undo the point of staging; only the count and the
+		// combined ceiling apply to them.
+		if (attachmentBytesOf(allTextFiles) > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
+		}
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 		}
@@ -593,7 +713,7 @@ export async function parseMessageRequest(
 			text: message,
 			references: fileReferences,
 		} = bindComposerMediaProjection(composerDocument, message, fileReferences, mediaMetadata));
-		validateComposerAssets(composerDocument, imageFiles, textFileEntries, mediaMetadata);
+		validateComposerAssets(composerDocument, imageFiles, allTextFiles, mediaMetadata);
 		const images: ImageRef[] = [];
 		const media: MediaRef[] = [];
 		try {
@@ -623,7 +743,7 @@ export async function parseMessageRequest(
 			message,
 			images,
 			media,
-			textFiles: textFileEntries,
+			textFiles: allTextFiles,
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
 			queueMode: modeResult.data,
@@ -1308,7 +1428,7 @@ narratorRoutes.post("/", async (c) => {
 	// tri-state override and "inherit" is resolved against the user's
 	// fastModeDefault on every turn, so changing that default also affects
 	// narrators created before the change.
-	const input = parsed.data;
+	const input = { ...parsed.data, model: normalizeAutoModelValueForSave(parsed.data.model) };
 
 	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
 	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
@@ -1613,6 +1733,31 @@ narratorRoutes.get("/:id/git/summary", async (c) => {
 	);
 	await requireNarratorAccess(c, id, "read");
 	return c.json(summary);
+});
+
+/**
+ * The status bar's current task, from the task source (outline P2 PR 5): the first task in
+ * progress for either task backend (with its outline address), and for an outline session how
+ * many of its person-created goals wait for confirmation of being done, and how many of those the
+ * caller decides. Read access to the session.
+ */
+narratorRoutes.get("/:id/tasks/current", async (c) => {
+	const id = c.req.param("id");
+	getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const source = await taskSourceForNarrator(id);
+	// One read of the tasks; an unreadable source shows nothing rather than failing the bar.
+	const view = await source.statusBar(c.get("user").sub).catch(() => null);
+	const current = view?.current ?? null;
+	const body: NarratorCurrentTaskResponse = {
+		backend: source.backend,
+		current: current
+			? { text: current.text, address: current.address, protected: current.protected }
+			: null,
+		awaitingConfirmation: view?.awaitingConfirmation.total ?? 0,
+		awaitingYourConfirmation: view?.awaitingConfirmation.mine ?? 0,
+		awaitingFrom: view?.awaitingConfirmation.from ?? [],
+	};
+	return c.json(body);
 });
 
 narratorRoutes.get("/:id/panel-state", async (c) => {
@@ -2186,6 +2331,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Set when a busy `/goal` falls through to the buffer path, so the buffered
 		// response can prompt the UI to show a "queued protected task" toast.
 		let specGoalQueued = false;
+		let specGoalOutline = false;
 		let specGoalObjective = "";
 		const cmdResult =
 			queuedNewCommand || mixedDocument
@@ -2214,7 +2360,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			!("loadSkill" in cmdResult) &&
 			!("specGoal" in cmdResult)
 		) {
+			const locale = await getUserLanguage(userId);
+			const replyInUserLanguage = await getUserReplyInLanguage(userId);
 			const result = await acceptUserMessage(id, message, {
+				humanReplyContext: { locale, replyInUserLanguage },
 				userId,
 				commandText: message,
 				locale: await getUserLanguage(userId),
@@ -2298,18 +2447,19 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			);
 			return c.json(bashResult, 201);
 		}
-		// Handle /goal <objective> — add a protected task to spec://tasks.json and
-		// immediately start its first Spec execution turn. When the narrator is busy,
-		// queue the command and append/start it once the buffer consumer reaches it;
-		// this avoids mutating tasks.json in the middle of the current turn.
+		// Handle /goal <objective> — add its task where the session keeps its tasks (a protected
+		// todo in spec://tasks.json, or a person-created, locked task in the outline: P2 PR 5) and
+		// immediately start its first execution turn. When the narrator is busy, queue the command
+		// and add/start it once the buffer consumer reaches it; this avoids changing the tasks in
+		// the middle of the current turn.
 		if (cmdResult.resolved && "specGoal" in cmdResult) {
-			// A session whose tasks live in the outline has no tasks.json to add the goal to; its
-			// `/goal` (a person-created, locked task) arrives with the task board (plan PR 5).
-			// Refused before anything is persisted, so nothing lands where the session cannot see.
-			if ((await resolveTaskBackend(id)) === "outline") {
+			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			// An outline subagent has no tasks of its own to add the goal to. Refused before
+			// anything is persisted, so nothing lands where the session cannot see.
+			if (await isRefusedOutlineGoal(id, rawCommand)) {
 				throw catalogError("GOAL_IN_OUTLINE_SESSION");
 			}
-			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			const goalBackend = await resolveTaskBackend(id);
 			// A compacting narrator counts as busy here for the same reason a running one
 			// does: appending the protected task now and starting its Spec turn would run
 			// that turn against the history the compact is replacing.
@@ -2319,59 +2469,176 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				isLoopRunning(id) ||
 				queueBehindCompaction;
 			if (!goalNarratorBusy) {
-				// Idle: persist the typed /goal command as the canonical user message and
-				// append the protected task immediately.
-				const userMsg = await narratorService.persistUserMessage(
-					id,
-					rawCommand,
-					[{ type: "text", text: rawCommand }],
-					rawCommand,
-					userId,
-				);
-				broadcastToNarrator(id, {
-					type: "user_message",
-					narratorId: id,
-					message: {
-						id: userMsg.id,
-						narratorId: id,
-						role: "user",
-						contentJson: userMsg.contentJson,
-						contentText: userMsg.contentText,
-						commandText: rawCommand,
-						createdAt: userMsg.createdAt,
-						seq: userMsg.seq,
-						children: [],
-						creator: userMsg.creator ?? null,
-					},
-				});
-				const { added, written } = await appendProtectedSpecTask(id, objective);
-				if (added) {
-					broadcastSpecChanged(
-						id,
-						{ uri: written.uri, path: written.path, revisionId: written.revisionId },
-						"ui",
-						"user",
-					);
-				}
-				// Leave a durable, self-explanatory card in the conversation so the
-				// effect of /goal is visible on scrollback, not only via a toast. This
-				// display-only side effect must not turn an already-applied goal into a
-				// failed command if message persistence is temporarily unavailable.
-				await persistGoalAddedNotice(id, objective, added).catch((err) => {
-					logger.warn("Failed to persist /goal confirmation notice", {
-						narratorId: id,
-						error: String(err),
-					});
-				});
 				const locale = await getUserLanguage(userId);
 				const replyInUserLanguage = await getUserReplyInLanguage(userId);
-				const { started } = await startSpecContinuationIfPossible(
-					id,
-					locale,
-					replyInUserLanguage,
-					userId,
+				const {
+					enqueueBufferedMessage,
+					projectMailboxUserMessage,
+					readBufferedMessageDeliveryReceipt,
+				} = await import("../services/narrator-buffer");
+				const { isNarratorRuntimeBusy, withNarratorStartAdmission } = await import(
+					"../services/narrator-session-state"
 				);
-				return c.json({ specGoal: true, added, objective, started }, 200);
+				const { getExecutionOwner } = await import("../services/agent-runtime/ownership");
+				const { claimInboxHead, withInboxOwner, wakeInboxIfEligible } = await import(
+					"../services/agent-runtime/inbox"
+				);
+				const result = await withNarratorStartAdmission(id, async () => {
+					// Recheck under admission: an idle HTTP snapshot does not own execution.
+					if (getExecutionOwner(id) || isNarratorRuntimeBusy(id) || isCompactInProgress(id))
+						return null;
+					const accepted = await enqueueBufferedMessage(
+						id,
+						rawCommand,
+						undefined,
+						rawCommand,
+						userId,
+						undefined,
+						undefined,
+						"back",
+						undefined,
+						undefined,
+						"fifo",
+						undefined,
+						"turn",
+						undefined,
+						undefined,
+						{ locale, replyInUserLanguage },
+					);
+					if (!accepted.ok) throw new ValidationError("Message queue is full");
+					try {
+						return await withInboxOwner(id, async () => {
+							const claimed = await claimInboxHead(
+								id,
+								(row) => row.id === accepted.id && row.kind === "user_input",
+							);
+							if (!claimed) return { accepted, outcome: null };
+							const outcome = await executeQueuedGoalCommand(
+								id,
+								projectMailboxUserMessage(claimed),
+								objective,
+							);
+							return { accepted, outcome };
+						});
+					} catch (error) {
+						// Acceptance already committed. Owner cleanup releases an uncommitted
+						// claim; never make the client retry and duplicate that durable input.
+						logger.warn("Accepted goal dispatch failed", {
+							narratorId: id,
+							messageId: accepted.id,
+							error: String(error),
+						});
+						const receipt = await readBufferedMessageDeliveryReceipt(id, accepted.id).catch(
+							() => undefined,
+						);
+						if (
+							receipt &&
+							(receipt.state === "queued" ||
+								receipt.state === "failed" ||
+								receipt.state === "claimed")
+						)
+							return { accepted, outcome: null };
+						// After materialization the user message/policy is committed, but a later
+						// task write can fail. Acknowledge it without claiming it is still queued.
+						return {
+							accepted,
+							outcome: null,
+							dispatchFailure: {
+								messageId: receipt?.recipientMessageId,
+								error: String(error),
+							},
+						};
+					}
+				});
+				if (result?.outcome) {
+					if (result.outcome.refused) throw catalogError("GOAL_IN_OUTLINE_SESSION");
+					const { started } = await startSpecContinuationIfPossible(
+						id,
+						locale,
+						replyInUserLanguage,
+						userId,
+					).catch((error) => {
+						logger.warn("Accepted goal continuation deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+						return { started: false };
+					});
+					const outcome = result.outcome;
+					return c.json(
+						{
+							specGoal: true,
+							added: outcome.added,
+							objective,
+							started,
+							...(outcome.outline
+								? {
+										taskBackend: "outline" as const,
+										address: outcome.outline.address,
+										locked: outcome.outline.locked,
+									}
+								: {}),
+						},
+						200,
+					);
+				}
+				if (result && "dispatchFailure" in result && result.dispatchFailure) {
+					try {
+						broadcastToNarrator(id, {
+							type: "narrator_error",
+							narratorId: id,
+							error:
+								locale === "zh-CN"
+									? `/goal 输入已接收，但目标处理失败。请检查任务列表后再决定是否重试。${result.dispatchFailure.error}`
+									: `The /goal input was accepted, but goal processing failed. Check the task list before retrying. ${result.dispatchFailure.error}`,
+						});
+					} catch (error) {
+						logger.warn("Accepted goal error notification deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+					}
+					return c.json(
+						{
+							accepted: true,
+							buffered: false,
+							objective,
+							started: false,
+							messageId: result.dispatchFailure.messageId,
+							goalError: result.dispatchFailure.error,
+						},
+						202,
+					);
+				}
+				if (result) {
+					// An earlier inbox row owns the next turn; do not consume this goal twice.
+					try {
+						broadcastToNarrator(id, {
+							type: "buffer_set",
+							narratorId: id,
+							messages: toBufferSummary(await getBufferedMessagesAsync(id)),
+						});
+					} catch (error) {
+						logger.warn("Accepted goal buffer notification deferred", {
+							narratorId: id,
+							error: String(error),
+						});
+					}
+					void wakeInboxIfEligible(id, locale).catch((error) =>
+						logger.warn("Queued goal wake deferred", { narratorId: id, error: String(error) }),
+					);
+					return c.json(
+						{
+							buffered: true,
+							id: result.accepted.id,
+							bufferedAt: result.accepted.bufferedAt,
+							specGoalQueued: true,
+							objective,
+							...(goalBackend === "outline" ? { taskBackend: "outline" as const } : {}),
+						},
+						202,
+					);
+				}
 			}
 			// Busy: fall through to the shared buffer path. Carry the raw command so the
 			// buffer consumer recognizes it as a /goal, appends the task, and starts its
@@ -2380,6 +2647,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			commandText = rawCommand;
 			specGoalQueued = true;
 			specGoalObjective = objective;
+			specGoalOutline = goalBackend === "outline";
 		}
 		let prePromptBashCommand: string | undefined;
 		if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
@@ -2494,6 +2762,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// The service atomically enqueues and claims this message, or leaves it queued
 		// behind an existing owner/backlog. HTTP status observations never decide admission.
 		const result = await acceptUserMessage(id, finalMessage, {
+			humanReplyContext: { locale, replyInUserLanguage },
 			images,
 			media,
 			locale,
@@ -2519,7 +2788,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					buffered: true,
 					bufferedAt: result.bufferedAt,
 					id: result.id,
-					...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
+					...(specGoalQueued
+						? {
+								specGoalQueued: true,
+								objective: specGoalObjective,
+								...(specGoalOutline ? { taskBackend: "outline" as const } : {}),
+							}
+						: {}),
 				},
 				202,
 			);
@@ -2548,6 +2823,20 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					});
 				}
 			}
+			// Staged uploads are only consumed once an attachment reaches its
+			// durable location. A rejected message never got that far, so anything
+			// still staged would sit there until the TTL sweep — which for a
+			// gigabyte attachment is a long time to hold disk for a failed send.
+			for (const file of textFiles) {
+				try {
+					releaseStagedAttachment(file);
+				} catch (error) {
+					logger.warn("Failed to clean rejected staged attachment", {
+						narratorId: id,
+						error: String(error),
+					});
+				}
+			}
 		}
 	}
 });
@@ -2565,7 +2854,10 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId);
+	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId, {
+		locale,
+		replyInUserLanguage,
+	});
 	return c.json(result);
 });
 
@@ -2604,8 +2896,10 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: [recoveryMessageId],
 		});
 	};
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+	const humanReplyContext = { locale, replyInUserLanguage };
 	const { manuallyResumeRestartRecovery } = await import("../services/restart-recovery-service");
-	if (await manuallyResumeRestartRecovery(id)) {
+	if (await manuallyResumeRestartRecovery(id, humanReplyContext)) {
 		await dismissRecoveryMessage();
 		return c.json({
 			ok: true,
@@ -2613,7 +2907,6 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
 		});
 	}
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	// Seamless subagent recovery: when the latest assistant turn still holds
 	// unfinished Agent / Await work, re-drive it first. The recovery flow owns the
@@ -2624,6 +2917,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 		locale,
 		replyInUserLanguage,
 		userId,
+		humanReplyContext,
 	});
 	if (recovery.recovering) {
 		await dismissRecoveryMessage();
@@ -2634,7 +2928,14 @@ narratorRoutes.post("/:id/continue", async (c) => {
 		});
 	}
 
-	const result = await continueNarrator(id, locale, replyInUserLanguage, userId);
+	const result = await continueNarrator(
+		id,
+		locale,
+		replyInUserLanguage,
+		userId,
+		undefined,
+		humanReplyContext,
+	);
 	await dismissRecoveryMessage();
 	return c.json({
 		...result,
@@ -2692,6 +2993,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			locale,
 			replyInUserLanguage,
 			userId,
+			humanReplyContext: { locale, replyInUserLanguage },
 		});
 		return c.json({ ok: true, mode: "await", resumed: resumed.length, skipped });
 	}
@@ -2887,22 +3189,28 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 			newImages.push(file);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
-			throw new ValidationError(
-				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
-			);
-		}
+		const orderedTextFiles = resolveStagedAttachments(
+			id,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
 		for (const file of textFileEntries) {
 			validateTextFile(file);
-			newTextFiles.push(file);
 		}
 		newMedia.push(...mediaFiles);
-		const attachmentBytes = [...imageFiles, ...textFileEntries, ...mediaFiles].reduce(
+		newTextFiles.push(...orderedTextFiles);
+		// Everything that arrived inside this multipart body was buffered by
+		// `req.formData()`; staged text files did not, so they are excluded here and
+		// bounded by the 2 GiB ceiling below instead.
+		const bodyBytes = [...imageFiles, ...textFileEntries, ...mediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
-		if (attachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		if (bodyBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+		}
+		if (attachmentBytesOf(newTextFiles) > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 		}
 	} else {
 		const body = editAndRegenerateJsonSchema.parse(await c.req.json());
@@ -2959,6 +3267,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage, {
+		humanReplyContext: { locale, replyInUserLanguage },
 		fileReferences: snapshots,
 		composerDocument,
 		keepImageIds,
@@ -3169,16 +3478,32 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			validateUploadedImage(file);
 			newImageFiles.push(file);
 		}
-		for (const file of formData.getAll("textFiles") as File[]) {
+		const textFileEntries = formData.getAll("textFiles") as File[];
+		const orderedTextFiles = resolveStagedAttachments(
+			id,
+			parseStagedAttachmentInput(formData.get("stagedAttachments")),
+			textFileEntries,
+		);
+		for (const file of textFileEntries) {
 			validateTextFile(file);
-			newTextFiles.push(file);
+		}
+		newTextFiles.push(...orderedTextFiles);
+		// The multipart body (images, inline text files, media) was buffered whole by
+		// `req.formData()` and keeps the 128 MiB budget; staged text files only count
+		// toward the 2 GiB per-message ceiling.
+		const bodyBytes = [...newImageFiles, ...textFileEntries, ...newMediaFiles].reduce(
+			(total, file) => total + file.size,
+			0,
+		);
+		if (bodyBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 		}
 		const uploadBytes = [...newImageFiles, ...newTextFiles, ...newMediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
-		if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
-			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+		if (uploadBytes > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 2 GiB limit");
 		}
 	} else {
 		const parsed = updateBufferedMessageSchema.safeParse(await c.req.json());
@@ -3258,9 +3583,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	) {
 		throw new ValidationError("File references are not supported by queued /new or /goal commands");
 	}
-	// Nor the outline session's refusal of /goal: an edit must not turn a queued message into one.
+	// Nor an outline subagent's refusal of /goal: an edit must not turn a queued message into one.
 	if (
-		await isOutlineSessionGoal(
+		await isRefusedOutlineGoal(
 			id,
 			text,
 			located.message.commandText,
@@ -3339,6 +3664,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		});
 		if (!ok) throw new NotFoundError("Buffered message", mid);
 		committed = true;
+		// The queued row now references its own mailbox copies, so the staged
+		// originals can go. Only after the update landed: a refused edit keeps them,
+		// so the composer's retry can still claim the same uploads.
+		releaseStagedFiles(newTextFiles);
 	} finally {
 		if (!committed) {
 			for (const item of createdMedia) deleteUploadedMedia(id, item.mediaId);
@@ -4808,8 +5137,9 @@ narratorRoutes.patch("/:id/model", async (c) => {
 			c.get("user").sub,
 		);
 	}
-	await narratorService.updateModel(id, parsed.data.model);
-	await updateNarratorModel(id, parsed.data.model);
+	const model = normalizeAutoModelValueForSave(parsed.data.model);
+	await narratorService.updateModel(id, model);
+	await updateNarratorModel(id, model);
 	return c.json({ ok: true });
 });
 
@@ -4913,12 +5243,31 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		columns: { id: true },
 	});
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
+	// An outline session plans in the outline (outline P2 PR 8): its plan root is made or resumed
+	// now, and the result names it instead of a plan file.
+	const { enterOutlinePlanMode } = await import("../services/outline-plan-mode");
+	const outline = await enterOutlinePlanMode({
+		narratorId: id,
+		userId,
+		input: {},
+		locale: locale as Locale,
+		toolCallId: manualToolCall.id,
+		messageId: msg.id,
+	}).catch((error: unknown) => {
+		logger.warn("Outline plan root could not be made on the plan-mode switch", {
+			narratorId: id,
+			error: String(error),
+		});
+		return null;
+	});
 	await narratorService.updateToolCallResult(
 		toolUseId,
 		{
-			output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
-				planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
-			}),
+			output:
+				outline?.output ??
+				getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
+					planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
+				}),
 			status: "success",
 			// The following message broadcast already accounts for this persisted tool state.
 			bumpMessageVersion: false,
@@ -4970,6 +5319,12 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	const message = getToolMessage("planModeCancelled", locale);
 	const cancelledPermissions = await cancelPendingExitPlanMode(id, message);
 	const planState = await exitNarratorPlanMode(id);
+	// An outline session's unapproved plan stays planning (never executed); an empty one goes
+	// (outline P2 PR 8, D48 Q3).
+	if (planState.wasPlanMode) {
+		const { cancelOutlinePlanMode } = await import("../services/outline-plan-mode");
+		await cancelOutlinePlanMode(id, userId);
+	}
 	const active = activeNarrators.get(id);
 	if (active) {
 		active._planFileId = undefined;
@@ -5906,6 +6261,26 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
 	return c.json({ ok: true });
+});
+
+/**
+ * A person's decision on an outline session's submitted plan (outline P2 PR 8, D48): return it,
+ * execute it as a draft, or lock it and execute it. The outline is written first, then the
+ * waiting ExitPlanMode is resolved, so a refused decision (403, 409) leaves it waiting.
+ */
+narratorRoutes.post("/permissions/:requestId/plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	const user = c.get("user");
+	const parsed = outlinePlanDecisionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	const { decideOutlinePlanRequest } = await import("../services/outline-plan-mode");
+	const result = await decideOutlinePlanRequest({
+		requestId,
+		principal: { userId: user.sub, isAdmin: user.role === "admin" },
+		body: parsed.data,
+	});
+	const response: OutlinePlanDecisionResponse = { ok: true, commit: result.commit };
+	return c.json(response);
 });
 
 /**

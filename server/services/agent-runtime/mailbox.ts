@@ -1,3 +1,4 @@
+import { mailboxReplyContext } from "@shared/reply-context";
 import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import {
 	narratorBufferedMessages as mailbox,
@@ -312,6 +313,9 @@ export function createMailboxStore(db: RuntimeDb) {
 			)
 			.get();
 		if (!ref) throw new Error("Materializer did not persist the recipient ref in this transaction");
+		const replyContext = mailboxReplyContext(row);
+		if (replyContext)
+			tx.update(narrators).set({ replyContext }).where(eq(narrators.id, row.narratorId)).run();
 		return tx
 			.update(mailbox)
 			.set({

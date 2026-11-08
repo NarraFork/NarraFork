@@ -1,9 +1,10 @@
 /**
- * Shared affordance for sidebar reordering and external narrator drops.
+ * Shared affordance for sidebar drags and external narrator drops.
  *
- * Two shapes, because the two outcomes are not variations of each other: an insertion
- * LINE for "order it here", and a BOX around a workspace group for "join this workspace".
- * Drawing a line for the join case would promise ordering and deliver membership.
+ * Two shapes, because the outcomes are not variations of each other: an insertion LINE
+ * for "order it here", and a BOX for "put it together with this" (merge two tabs into a
+ * new folder, or join an existing folder). Drawing a line for the box case would promise
+ * ordering and deliver membership.
  *
  * Absolutely positioned inside the tab list (which is `position: relative`), rendered
  * above the rows but never interactive — the drag singleton owns the pointer, and a
@@ -14,8 +15,8 @@ import { Z } from "@frontend/lib/z-index";
 import {
 	type RecentTabDropRow,
 	type RecentTabDropTarget,
+	recentTabDropHighlight,
 	recentTabDropIndicatorRow,
-	recentTabWorkspaceBounds,
 } from "./recent-tab-drop-target";
 
 export interface RecentTabDropIndicatorProps {
@@ -32,18 +33,18 @@ export function RecentTabDropIndicator({
 	target,
 	containerTop,
 }: RecentTabDropIndicatorProps) {
-	if (target.kind === "workspace") {
-		const bounds = recentTabWorkspaceBounds(rows, target.workspaceId);
-		if (!bounds) return null;
+	const highlight = recentTabDropHighlight(rows, target);
+	if (highlight) {
 		return (
 			<div
 				aria-hidden
+				data-drop-indicator={target.kind}
 				style={{
 					position: "absolute",
 					left: 0,
 					right: 0,
-					top: bounds.top - containerTop,
-					height: bounds.bottom - bounds.top,
+					top: highlight.top - containerTop,
+					height: highlight.bottom - highlight.top,
 					border: `2px solid ${ACCENT}`,
 					borderRadius: "var(--mantine-radius-sm)",
 					background: "var(--mantine-color-indigo-light)",
@@ -57,12 +58,15 @@ export function RecentTabDropIndicator({
 	const indicator = recentTabDropIndicatorRow(rows, target);
 	if (!indicator) return null;
 	const edge = indicator.side === "top" ? indicator.row.top : indicator.row.bottom;
+	const nested = target.kind === "member-before" || target.kind === "member-after";
 	return (
 		<div
 			aria-hidden
+			data-drop-indicator={target.kind}
 			style={{
 				position: "absolute",
-				left: 0,
+				// A line inside a folder is indented like the members it sits between.
+				left: nested ? 20 : 0,
 				right: 0,
 				// Centre the 2px line on the boundary so it reads as "between rows"
 				// rather than as an underline belonging to the row above it.

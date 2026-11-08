@@ -1,3 +1,4 @@
+import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import {
 	Affix,
 	Alert,
@@ -144,16 +145,19 @@ function SettingsLayout() {
 
 				{/* Main content column */}
 				<Box style={{ flex: 1, minWidth: 0 }}>
-					{/* Mobile: back button header (only on sub-pages, not on index) */}
-					{currentItem && (
-						<Box
-							hiddenFrom="sm"
-							px="xs"
-							py={8}
-							style={{
-								borderBottom: "1px solid var(--mantine-color-default-border)",
-							}}
-						>
+					{/* Mobile: title row with the drawer button; sub-pages add a back link. */}
+					<Group
+						hiddenFrom="sm"
+						px="xs"
+						py={8}
+						gap="xs"
+						wrap="nowrap"
+						style={{
+							borderBottom: "1px solid var(--mantine-color-default-border)",
+						}}
+					>
+						<MobileNavButton />
+						{currentItem ? (
 							<Link
 								to="/settings"
 								style={{
@@ -169,8 +173,12 @@ function SettingsLayout() {
 									{t(currentItem.labelKey)}
 								</Text>
 							</Link>
-						</Box>
-					)}
+						) : (
+							<Text size="sm" fw={500}>
+								{t("title")}
+							</Text>
+						)}
+					</Group>
 
 					<Box p="md" pb={80}>
 						{settingsValidation.looseValidation && (

@@ -487,6 +487,8 @@ export const InlineComposerEditor = forwardRef<
 	 * rebuild the state and wipe the undo history.
 	 */
 	const pendingEchoesRef = useRef<string[]>([]);
+	/** A focus() that came before the editor existed (see the handle's focus). */
+	const focusOnCreateRef = useRef(false);
 	const receivedValueRef = useRef(props.value);
 	const transactionStartedRef = useRef(0);
 	const bookmarksRef = useRef(new Set<{ value: SelectionBookmark | null }>());
@@ -677,6 +679,10 @@ export const InlineComposerEditor = forwardRef<
 			actualSignatureRef.current = JSON.stringify(
 				readEditorDocument(instance.state.doc, assetsRef.current),
 			);
+			if (focusOnCreateRef.current) {
+				focusOnCreateRef.current = false;
+				instance.commands.focus();
+			}
 		},
 		onUpdate: ({ editor: instance, transaction }) => {
 			if (!transaction.docChanged) return;
@@ -833,7 +839,10 @@ export const InlineComposerEditor = forwardRef<
 	};
 	useImperativeHandle(ref, () => ({
 		focus: () => {
-			editor?.commands.focus();
+			// `useEditor` creates its instance after the first commit, so a caller focusing on
+			// mount (the home page's "New session") arrives first; `onCreate` honours it then.
+			if (editor && !editor.isDestroyed) editor.commands.focus();
+			else focusOnCreateRef.current = true;
 		},
 		getDocument: () =>
 			editor && actualSignatureRef.current !== null

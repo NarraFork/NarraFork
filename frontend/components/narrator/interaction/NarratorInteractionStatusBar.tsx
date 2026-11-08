@@ -30,6 +30,10 @@ import {
 	statusRegistry,
 } from "../../../lib/constants";
 import { TruncatedText } from "../../common/TruncatedText";
+import {
+	AwaitingConfirmationBadge,
+	type AwaitingConfirmationCounts,
+} from "../../outline/task-board/AwaitingConfirmationBadge";
 import { UserAvatar } from "../../UserAvatar";
 import {
 	BackgroundTasksStatusButton,
@@ -111,6 +115,11 @@ export interface NarratorInteractionStatusBarProps {
 		isRetrying: boolean;
 		isCompacting: boolean;
 		currentSpecTask: SpecTaskItem | null;
+		/**
+		 * Goals whose completion waits for a person (outline P2 PR 5: a locked goal the agent ticked
+		 * done, D26b), and how many the viewer decides; a click opens the task board.
+		 */
+		awaitingConfirmation?: AwaitingConfirmationCounts | null;
 		retryInfo: RetryInfo | null;
 		compactingMarkerMessageId: string | null;
 		compactFailure: CompactFailureInfo | null;
@@ -387,7 +396,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 			case "blocking_compact":
 				return `${t("compacting")} · ${workIndicator.compactProgressFragment}`;
 			case "model_unavailable":
-				return t("status_model_unavailable");
+				return workIndicator.quotaWaitText;
 			case "quota_exhausted":
 				return workIndicator.quotaWaitText;
 			case "spec_task":
@@ -490,6 +499,12 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									workCount={tasks.workCount}
 									serviceCount={tasks.serviceCount}
 									onOpen={tasks.onOpenPanel}
+								/>
+							)}
+							{!isWorkspacePreview && (
+								<AwaitingConfirmationBadge
+									counts={workIndicator.awaitingConfirmation}
+									onOpen={workIndicator.onOpenSpecTool}
 								/>
 							)}
 							{workIndicator.compactFailure && !workIndicator.isCompacting && (

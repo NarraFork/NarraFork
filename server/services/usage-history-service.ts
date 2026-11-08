@@ -76,6 +76,21 @@ function cacheHitRate(row?: Partial<CacheHitRateTotals>): number | null {
 	return denominator > 0 ? toNumber(row?.cacheHitRateReadTokens) / denominator : null;
 }
 
+/** Only requests that timed their decode AND reported output take part in the speed. */
+const decodeSpeedParticipates = sql`${apiRequests.decodeMs} > 0 AND ${apiRequests.outputTokens} > 0`;
+
+const decodeSpeedSelection = {
+	decodeSpeedOutputTokens: sql<number>`coalesce(sum(CASE WHEN ${decodeSpeedParticipates} THEN ${apiRequests.outputTokens} END), 0)`,
+	decodeSpeedMs: sql<number>`coalesce(sum(CASE WHEN ${decodeSpeedParticipates} THEN ${apiRequests.decodeMs} END), 0)`,
+};
+
+function outputTokensPerSecond(
+	row: { decodeSpeedOutputTokens?: unknown; decodeSpeedMs?: unknown } | undefined,
+): number | null {
+	const decodeMs = toNumber(row?.decodeSpeedMs);
+	return decodeMs > 0 ? toNumber(row?.decodeSpeedOutputTokens) / (decodeMs / 1000) : null;
+}
+
 export interface UsageHistoryStats extends CostCoverage, CacheHitRateTotals {
 	/** Ratio in [0, 1]; null means no participating requests. */
 	cacheHitRate: number | null;
@@ -91,6 +106,11 @@ export interface UsageHistoryStats extends CostCoverage, CacheHitRateTotals {
 	totalCost: number;
 	averageDurationMs: number;
 	averageTtftMs: number;
+	/**
+	 * Output speed weighted by tokens: Σ output tokens / Σ decode seconds over requests
+	 * that recorded both. Null when no request did (e.g. only pre-decode-timing rows).
+	 */
+	outputTokensPerSecond: number | null;
 }
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
@@ -637,6 +657,7 @@ export class UsageHistoryService {
 				...costCoverageSelection,
 				averageDurationMs: sql<number>`coalesce(avg(${apiRequests.durationMs}), 0)`,
 				averageTtftMs: sql<number>`coalesce(avg(${apiRequests.ttftMs}), 0)`,
+				...decodeSpeedSelection,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
@@ -668,6 +689,7 @@ export class UsageHistoryService {
 			...costCoverage(stats),
 			averageDurationMs: stats?.averageDurationMs ?? 0,
 			averageTtftMs: stats?.averageTtftMs ?? 0,
+			outputTokensPerSecond: outputTokensPerSecond(stats),
 		};
 	}
 

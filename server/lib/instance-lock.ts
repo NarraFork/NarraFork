@@ -25,6 +25,8 @@ import {
 	sameInstanceProcessDomain,
 } from "./instance-process-identity";
 import { logger } from "./logger";
+import { InstanceLockedError } from "./startup-status/startup-problems";
+import { observeWindowsProcess } from "./windows-process-identity";
 
 /**
  * Single-instance guard for the NarraFork data directory.
@@ -387,12 +389,30 @@ function observeWindowsStartTimeMs(pid: number): number | null {
 }
 
 /**
- * Observe a pid on Windows via `tasklist`, plus a creation time from CIM/wmic.
+ * Observe a pid on Windows: the Win32 API first (under 1 ms), `tasklist` plus CIM/wmic only if
+ * that is unavailable.
  *
- * The image name (CSV column 0) alone cannot settle identity — every NarraFork runs under the same
- * `bun.exe` — so the creation time is what actually distinguishes "still our process" from "this pid
- * was recycled". A missing creation time degrades to the pre-existing `unknown` handling.
+ * The image name alone cannot settle identity — every NarraFork runs under the same `bun.exe` —
+ * so the creation time is what actually distinguishes "still our process" from "this pid was
+ * recycled". A missing creation time degrades to the pre-existing `unknown` handling.
  */
+function observeViaWindows(pid: number): ProcessObservation | null {
+	const viaApi = observeWindowsProcess(pid);
+	if (viaApi === "absent") return { kind: "absent" };
+	if (viaApi) {
+		return {
+			kind: "present",
+			startTicks: null,
+			startedAtMs: viaApi.startedAtMs,
+			zombie: false,
+			imageName: viaApi.imageName,
+			cmdline: viaApi.imageName ? [viaApi.imageName] : null,
+			uid: null,
+		};
+	}
+	return observeViaWindowsTasklist(pid);
+}
+
 function observeViaWindowsTasklist(pid: number): ProcessObservation | null {
 	const result = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
 		encoding: "utf8",
@@ -509,8 +529,8 @@ function observeProcess(pid: number): ProcessObservation {
 		const viaProcfs = observeViaProcfs(pid);
 		if (viaProcfs) return viaProcfs;
 	} else if (process.platform === "win32") {
-		const viaTasklist = observeViaWindowsTasklist(pid);
-		if (viaTasklist) return viaTasklist;
+		const viaWindows = observeViaWindows(pid);
+		if (viaWindows) return viaWindows;
 	} else {
 		const viaPs = observeViaPs(pid);
 		if (viaPs) return viaPs;
@@ -907,7 +927,7 @@ export function acquireInstanceLock(dbPath: string): void {
 					detail: verdict.detail,
 					...describeHolder(existing),
 				});
-				throw new Error(message);
+				throw new InstanceLockedError(existing.pid, message);
 			}
 		} else if (verdict.kind === "unknown") {
 			// Undecidable. Clearing the lock is the lesser evil: refusing here would make an

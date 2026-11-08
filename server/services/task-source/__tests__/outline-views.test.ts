@@ -804,6 +804,16 @@ describe("the turn-end note", () => {
 			`System note: \`${address}\` Write the parser is still in progress; when it is done, tick it [x] with OutlineEdit.`,
 		);
 		expect(rows[0]?.contentText?.includes("\n")).toBe(false);
+		// Beside the unchanged model text, the reader's copy: the task as data (address, title,
+		// status), so the transcript shows a titled link and a status chip, not the text's markdown.
+		const block = (rows[0]?.contentJson as Array<Record<string, unknown>>).find(
+			(entry) => entry.source === "outline_task_turn_end",
+		);
+		expect(block?.body).toEqual({
+			kind: "outlineTasks",
+			variant: "turnEnd",
+			items: [{ address, title: "Write the parser", status: "doing" }],
+		});
 		// Once per run.
 		expect(await maybeDeliverOutlineTurnEndNote(active)).toBe(false);
 		expect(await notes(id)).toHaveLength(1);

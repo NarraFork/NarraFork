@@ -20,6 +20,10 @@ export interface MfaChallenge {
 
 export type LoginResult = LoginSession | MfaChallenge;
 
+export type StepUpMethod = "totp" | "backup_code" | "passkey";
+/** Mirrors STEP_UP_PURPOSES in server/services/step-up-service.ts. */
+export type StepUpPurpose = "credentials.export" | "storage.export.providers";
+
 export function isMfaChallenge(r: LoginResult): r is MfaChallenge {
 	return "mfaRequired" in r && r.mfaRequired === true;
 }
@@ -211,6 +215,31 @@ export const authApi = {
 		return request<LoginSession>("/auth/mfa/passkey/verify", {
 			method: "POST",
 			body: JSON.stringify({ mfaToken, response }),
+		});
+	},
+
+	// === Step-up: password + second factor before a high-risk action ===
+
+	stepUpMethods: () => request<{ methods: StepUpMethod[] }>("/auth/step-up/methods"),
+
+	/** Returns a single-use grant for `purpose`; a passkey prompts the browser first. */
+	stepUp: async (input: {
+		purpose: StepUpPurpose;
+		password: string;
+		method: StepUpMethod;
+		code?: string;
+	}): Promise<{ token: string; expiresAt: number }> => {
+		let response: unknown;
+		if (input.method === "passkey") {
+			const optionsJSON = await request<Parameters<typeof startAuthentication>[0]["optionsJSON"]>(
+				"/auth/step-up/passkey/options",
+				{ method: "POST", body: JSON.stringify({}) },
+			);
+			response = await startAuthentication({ optionsJSON });
+		}
+		return request("/auth/step-up", {
+			method: "POST",
+			body: JSON.stringify({ ...input, ...(response ? { response } : {}) }),
 		});
 	},
 

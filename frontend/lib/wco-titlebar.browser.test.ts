@@ -1,0 +1,118 @@
+import { expect, test } from "bun:test";
+import puppeteer from "puppeteer-core";
+
+const executablePath = process.env.NF_TEST_CHROMIUM_PATH;
+
+test.skipIf(!executablePath)(
+	"WCO top-row headers share the overlay height without changing lower rows or shell padding",
+	async () => {
+		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
+		const dockCss = await Bun.file(
+			import.meta.resolve("dockview-core/dist/styles/dockview.css").replace("file://", ""),
+		).text();
+		const browser = await puppeteer.launch({
+			executablePath,
+			headless: true,
+			args: ["--no-sandbox"],
+			timeout: 15_000,
+		});
+		try {
+			const page = await browser.newPage();
+			await page.setViewport({ width: 1400, height: 900 });
+			// Match the actual header structures: chat has 8px inline padding, panel header
+			// has Mantine xs padding, Dockview uses its own stylesheet and height variable.
+			await page.setContent(`
+				<style>${dockCss}\n${css}</style>
+				<style>
+					:root { --mantine-spacing-md: 16px; --mantine-color-default-border: #ced4da; }
+					body { margin: 0; }
+					.rows { display: flex; align-items: flex-start; }
+					.rows > div { width: 33.333%; }
+					.header { display: flex; align-items: center; box-sizing: border-box;
+						border-bottom: 1px solid #ced4da; flex-shrink: 0; }
+					button { height: 22px; padding: 0; }
+					.dock { --dv-tabs-and-actions-container-height: 39px; }
+				</style>
+				<div class="nf-app-shell">
+					<nav class="mantine-AppShell-navbar" style="position:fixed;padding-top:16px"></nav>
+					<div class="rows">
+						<div><div id="chat" class="header" data-narrator-header-layout data-nf-titlebar-row
+							style="padding:8px 12px"><button>Tools</button></div></div>
+						<div class="dock"><div id="tabs" class="dv-tabs-and-actions-container" data-nf-titlebar-row data-nf-titlebar-end>
+							<div class="dv-scrollable"><div class="dv-tabs-container"><div class="dv-tab">Session</div></div></div>
+							<div class="dv-void-container"></div></div></div>
+						<div><div id="details" class="header nf-panel-header" data-nf-titlebar-row
+							style="padding:10px 16px"><button>Details</button></div></div>
+					</div>
+					<div id="lower" class="header nf-panel-header" style="padding:10px 16px"><button>Lower</button></div>
+				</div>
+			`);
+			const measure = () =>
+				page.evaluate(() => {
+					const rect = (id: string) => {
+						const el = document.getElementById(id);
+						if (!el) throw new Error(`Missing ${id}`);
+						const r = el.getBoundingClientRect();
+						return { top: r.top, height: r.height, bottom: r.bottom };
+					};
+					return {
+						rows: [rect("chat"), rect("tabs"), rect("details")],
+						lower: rect("lower").height,
+						navPadding: getComputedStyle(document.querySelector("nav") as HTMLElement).paddingTop,
+					};
+				});
+			const normal = await measure();
+			for (const height of [32, 40, 48, 36]) {
+				await page.evaluate((value) => {
+					document.documentElement.setAttribute("data-nf-wco", "right");
+					// Substitute OS geometry only; all padding, border and tab sizes are real CSS.
+					document.documentElement.style.setProperty("--nf-wco-strip-height", `${value}px`);
+				}, height);
+				const actual = await measure();
+				// The shared extra pixel is the separator below the native control area;
+				// putting it inside `height` lets native button backgrounds cover it.
+				expect(actual.rows).toEqual(
+					Array.from({ length: 3 }, () => ({ top: 0, height: height + 1, bottom: height + 1 })),
+				);
+				expect(actual.lower).toBe(normal.lower);
+				expect(actual.navPadding).toBe("16px");
+			}
+			// The OS-button reservation must have a divider of its own: the trailing void's
+			// shadow stops before this padding. Do not put a shadow on the whole strip, which
+			// would close the intentional gap under the active tab.
+			for (const inset of [96, 180, 240]) {
+				const line = await page.evaluate((value) => {
+					document.documentElement.style.setProperty("--nf-wco-inset-right", `${value}px`);
+					const tabs = document.getElementById("tabs");
+					if (!tabs) throw new Error("Missing tabs");
+					const style = getComputedStyle(tabs, "::after");
+					return {
+						width: style.width,
+						height: style.height,
+						right: style.right,
+						bottom: style.bottom,
+						color: style.backgroundColor,
+						pointer: style.pointerEvents,
+						stripShadow: getComputedStyle(tabs).boxShadow,
+					};
+				}, inset);
+				expect(line).toEqual({
+					width: `${inset + 8}px`,
+					height: "1px",
+					right: "0px",
+					bottom: "0px",
+					color: "rgb(206, 212, 218)",
+					pointer: "none",
+					stripShadow: "none",
+				});
+			}
+			await page.evaluate(() => {
+				document.documentElement.removeAttribute("data-nf-wco");
+			});
+			expect(await measure()).toEqual(normal);
+		} finally {
+			await browser.close();
+		}
+	},
+	30_000,
+);

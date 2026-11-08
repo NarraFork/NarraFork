@@ -48,6 +48,8 @@ function SettingsServerPage() {
 				setTlsPassphrase={is.setTlsPassphrase}
 				tlsCaFile={is.tlsCaFile}
 				setTlsCaFile={is.setTlsCaFile}
+				encryptSecrets={is.encryptSecrets}
+				setEncryptSecrets={is.setEncryptSecrets}
 				updateSource={is.updateSource}
 				setUpdateSource={is.setUpdateSource}
 				updateGithubRepository={is.updateGithubRepository}

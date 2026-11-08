@@ -13,11 +13,16 @@ import { api, type BufferMessageSummary, isAbortError } from "../../../lib/api";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
 import {
+	clearDraftImageAttachments,
 	getComposerAssetId,
 	retainInterruptedDraftAttachments,
 } from "../composer/draft-image-attachments";
 import { editFileReferenceInput, trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
+import {
+	persistNarratorInputDraft,
+	readNarratorInputDraft,
+} from "../composer/narrator-draft-storage";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { revokeContentBlockPreviewUrls } from "../narrator-message-helpers";
 import type { ContentBlock } from "../narrator-panel-types";
@@ -64,6 +69,8 @@ export type BufferedSendResult = {
 	specGoalQueued?: boolean;
 	/** The protected task text carried by a queued `/goal`. */
 	objective?: string;
+	/** `outline` when the session keeps its tasks in the outline (outline P2 PR 5). */
+	taskBackend?: "outline";
 };
 
 /** Live sending/upload progress surfaced to the composer + cancel button. */
@@ -174,6 +181,59 @@ export interface UseNarratorSendResult {
 	handleContinue: () => Promise<void>;
 }
 
+/** One composer send, tracked so an owner change can tell an unsent upload from a delivered one. */
+interface ComposerSendRecord {
+	controller: AbortController;
+	userId: string | null;
+	narratorId: string;
+	/** The composer text when the send started; the draft that acceptance should clear. */
+	composerText: string;
+	files: { images: File[]; textFiles: File[]; media: File[] };
+	/** The whole request body has left the browser, so aborting can no longer un-send it. */
+	bodySent: boolean;
+	/** The owner changed after the body was sent: the request was left to finish on its own. */
+	detached: boolean;
+	/** False while the request is not this narrator's message (e.g. idle `/new`). */
+	detachable: boolean;
+}
+
+/** Source id of the clear written for a send accepted after its composer went away. */
+const DELIVERED_SEND_DRAFT_SOURCE = "delivered-send";
+
+/**
+ * Clear the stored draft of a send the server accepted after its composer was
+ * switched away, but only while that draft still holds what was sent. Anything
+ * typed since (here or on another device) is newer than the send and stays.
+ * A composer of this narrator that is mounted elsewhere follows the server clear
+ * through its `draft_changed` event.
+ */
+async function clearDeliveredDraft(record: ComposerSendRecord) {
+	const { userId, narratorId } = record;
+	const sent = record.composerText.trim();
+	if (!userId) return;
+	// Typing since the send (possibly not yet synced) is mirrored here first.
+	const typedSince = () => {
+		const local = readNarratorInputDraft(userId, narratorId).text.trim();
+		return !!local && local !== sent;
+	};
+	if (typedSince()) return;
+	try {
+		const draft = await api.getNarratorDraft(narratorId, AbortSignal.timeout(15_000));
+		if ((draft.hasDraft && draft.text.trim() !== sent) || typedSince()) return;
+		const cleared = draft.hasDraft
+			? await api.updateNarratorDraft(narratorId, "", DELIVERED_SEND_DRAFT_SOURCE, [])
+			: draft;
+		if (typedSince()) return;
+		persistNarratorInputDraft(userId, narratorId, "", cleared.revision, cleared.updatedAt, [], {
+			text: "",
+			fileReferences: [],
+		});
+		await clearDraftImageAttachments(userId, narratorId);
+	} catch {
+		// The draft stays. A leftover copy of sent text is recoverable; deleting text is not.
+	}
+}
+
 /**
  * The narrator's send subsystem, extracted whole from NarratorPanel: the
  * in-flight sending state + upload-progress throttle + cancel, the buffered-send
@@ -255,9 +315,9 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	);
 	// AbortController for the in-flight send request; used by cancel and unmount.
 	const sendAbortRef = useRef<AbortController | null>(null);
-	const interruptedFilesRef = useRef<{ images: File[]; textFiles: File[]; media: File[] } | null>(
-		null,
-	);
+	const composerSendRef = useRef<ComposerSendRecord | null>(null);
+	const clearAttachedFilesRef = useRef(clearAttachedFilesAndDraft);
+	clearAttachedFilesRef.current = clearAttachedFilesAndDraft;
 	useLayoutEffect(() => {
 		currentSendScopeRef.current = sendScope;
 		setSendingState(null);
@@ -265,28 +325,64 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		return () => {
 			if (currentSendScopeRef.current === sendScope) currentSendScopeRef.current = null;
 			const controller = sendAbortRef.current;
-			const files = interruptedFilesRef.current;
-			if (controller && files && sendScope.userId) {
+			const record = composerSendRef.current;
+			sendAbortRef.current = null;
+			composerSendRef.current = null;
+			sendingRef.current = false;
+			if (record && record.controller === controller && record.detachable && record.bodySent) {
+				// The server already has the whole message: aborting now only hides the
+				// outcome, so a send it accepts would leave its text behind as a draft.
+				record.detached = true;
+				return;
+			}
+			if (controller && record && sendScope.userId) {
 				// IndexedDB intentionally excludes large files. Preserve the live Files
 				// before aborting, so returning to this narrator can recover them too.
 				retainInterruptedDraftAttachments(
 					sendScope.userId,
 					sendScope.narratorId,
-					files.images,
-					files.textFiles,
-					files.media,
+					record.files.images,
+					record.files.textFiles,
+					record.files.media,
 				);
 			}
-			sendAbortRef.current = null;
-			interruptedFilesRef.current = null;
-			sendingRef.current = false;
 			controller?.abort();
 		};
 	}, [sendScope, sendingRef]);
+
+	/**
+	 * A detached send finished: the server accepted it after its composer was
+	 * switched away. Clear the draft it came from, never anything typed since.
+	 */
+	const settleDetachedSend = (record: ComposerSendRecord) => {
+		if (!record.detached) return;
+		const current = currentSendScopeRef.current;
+		if (current && current.userId !== record.userId) return;
+		if (
+			current?.narratorId === record.narratorId &&
+			current.composerVisible &&
+			composerRef.current
+		) {
+			// Switched back already: the mounted composer owns the draft and its sync.
+			if (composerRef.current.getText() !== record.composerText) return;
+			composerRef.current.clearTextAndDraft();
+			clearAttachedFilesRef.current();
+			return;
+		}
+		void clearDeliveredDraft(record);
+	};
+	/** A detached send failed: keep its large Files for the next visit, as a cancel would. */
+	const retainDetachedFiles = (record: ComposerSendRecord) => {
+		if (!record.detached || !record.userId) return;
+		const { images, textFiles, media } = record.files;
+		retainInterruptedDraftAttachments(record.userId, record.narratorId, images, textFiles, media);
+	};
 	// Throttle progress updates to whole-percent changes to avoid re-render storms.
 	const lastProgressPercentRef = useRef(-1);
 	const reportUploadProgress = useCallback(
 		(fraction: number) => {
+			const record = composerSendRef.current;
+			if (record && fraction >= 1 && !record.controller.signal.aborted) record.bodySent = true;
 			if (!isCurrentSendScope() || sendAbortRef.current?.signal.aborted) return;
 			const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
 			if (percent === lastProgressPercentRef.current) return;
@@ -355,7 +451,10 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			// the protected task will be added once the queued command is consumed.
 			if (result.specGoalQueued) {
 				notifications.show({
-					title: t("spec.specGoalQueued"),
+					title:
+						result.taskBackend === "outline"
+							? t("spec.outlineGoalQueued")
+							: t("spec.specGoalQueued"),
 					message: result.objective ?? undefined,
 					color: "blue",
 					autoClose: 4000,
@@ -447,8 +546,11 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				scrollToBottom(true);
 			} else if (result?.specGoal) {
 				// /goal added a protected task; the real user message arrives via WS.
+				const outline = result.taskBackend === "outline";
 				notifications.show({
-					title: result.added ? t("spec.specGoalAdded") : t("spec.specGoalExists"),
+					title: result.added
+						? t(outline ? "spec.outlineGoalAdded" : "spec.specGoalAdded")
+						: t(outline ? "spec.outlineGoalExists" : "spec.specGoalExists"),
 					message: result.objective ?? undefined,
 					color: result.added ? "green" : "yellow",
 					autoClose: 4000,
@@ -631,7 +733,25 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		lastProgressPercentRef.current = -1;
 		const abortController = new AbortController();
 		sendAbortRef.current = abortController;
-		interruptedFilesRef.current = files;
+		const sendRecord: ComposerSendRecord = {
+			controller: abortController,
+			userId,
+			narratorId,
+			composerText,
+			files,
+			// A request without files is a small JSON body, out of the browser at once.
+			bodySent: files.images.length + files.textFiles.length + files.media.length === 0,
+			detached: false,
+			// Set only around requests that deliver this composer's message here.
+			detachable: false,
+		};
+		/** The owner changed while the request ran; settle a delivered send's draft. */
+		const finishedDetached = () => {
+			if (isCurrentSendScope()) return false;
+			settleDetachedSend(sendRecord);
+			return true;
+		};
+		composerSendRef.current = sendRecord;
 		// Only offer cancellation when there's an upload worth aborting.
 		setSendingState({
 			attachmentCount,
@@ -731,6 +851,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				if (fileReferences.length) throw new Error(t("fileReferences.newSessionFirst"));
 				if (isActive) {
 					// /new while active: always normal queue (never interrupt to spawn).
+					sendRecord.detachable = true;
 					await doSendBuffered(
 						msg,
 						undefined,
@@ -741,6 +862,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 						composerDocument,
 						files,
 					);
+					finishedDetached();
 					return;
 				}
 
@@ -804,6 +926,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			if (isActive) {
 				// The server owns admission and runner identity for both primary and
 				// child narrators. All modes travel in the same durable send request.
+				sendRecord.detachable = true;
 				await doSendBuffered(
 					msg,
 					mode !== "turn",
@@ -813,6 +936,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					mode,
 					composerDocument,
 				);
+				finishedDetached();
 				return;
 			}
 			// Idle but compacting: the server decides queue-or-send, so this only has to
@@ -823,6 +947,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			if (showCompactQueueChoice) {
 				const images = files.images;
 				const textFiles = files.textFiles;
+				sendRecord.detachable = true;
 				await submitMessage(
 					msg,
 					images,
@@ -835,7 +960,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					composerDocument,
 					files.media,
 				);
-				if (!isCurrentSendScope()) return;
+				if (finishedDetached()) return;
 				composerRef.current?.hideTextForSend();
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
@@ -845,6 +970,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			const textFiles = files.textFiles;
 			// Keep the full draft during upload. In-flight draft-save/WS replies
 			// must never persist a temporary empty document as the recovery draft.
+			sendRecord.detachable = true;
 			await submitMessage(
 				msg,
 				images,
@@ -857,12 +983,15 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				composerDocument,
 				files.media,
 			);
-			if (!isCurrentSendScope()) return;
+			if (finishedDetached()) return;
 			composerRef.current?.hideTextForSend();
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
 		} catch (err) {
-			if (!isCurrentSendScope()) return;
+			if (!isCurrentSendScope()) {
+				retainDetachedFiles(sendRecord);
+				return;
+			}
 			// The original draft stays visible and persisted until acceptance. Do not
 			// restore an old snapshot over a newer remotely synchronized draft.
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
@@ -877,10 +1006,10 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			});
 		} finally {
 			// A late completion must not unlock or clear the next owner's send.
+			if (composerSendRef.current === sendRecord) composerSendRef.current = null;
 			if (isCurrentSendScope() && sendAbortRef.current === abortController) {
 				sendingRef.current = false;
 				sendAbortRef.current = null;
-				interruptedFilesRef.current = null;
 				setSendingState(null);
 			}
 		}

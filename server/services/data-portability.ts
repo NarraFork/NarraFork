@@ -30,11 +30,31 @@ import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
+import { BundleError, bundleCatalogError } from "@server/lib/credential-transfer/bundle";
 import { AppError, catalogError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
+import { getProviderKeyStore } from "@server/lib/provider-keys";
 import { saveSettings, settings } from "@server/lib/settings";
+import {
+	COMMAND_CODE_KEY_OWNER,
+	nugKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+} from "@server/lib/settings/provider-keys-projection";
 import type { NarraForkSettings } from "@server/lib/settings/types";
+import {
+	collectProviderKeys,
+	countSingleKeys,
+	type ExportedKeys,
+	openProviderKeys,
+	restoreExtraKeys,
+	SEALED_KEYS_ENTRY,
+	sealProviderKeys,
+	withFirstKeys,
+	withoutKeys,
+} from "@server/services/data-portability-keys";
+import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
 import {
 	MAX_IMPORT_BYTES,
 	MAX_IMPORT_LABEL,
@@ -47,7 +67,12 @@ import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
 
-const EXPORT_VERSION = 1;
+/** Archives without sealed provider keys; every version of this importer reads them. */
+const PLAIN_EXPORT_VERSION = 1;
+/** Archives whose provider keys are sealed in `provider-keys.sealed.json`. */
+const SEALED_KEYS_EXPORT_VERSION = 2;
+/** The newest version this importer reads. */
+const EXPORT_VERSION = SEALED_KEYS_EXPORT_VERSION;
 const PREVIEW_TTL_MS = 30 * 60 * 1000;
 
 /** 供应商配置里参与导出/导入的顶层字段。 */
@@ -71,6 +96,8 @@ const PROVIDER_KEYS = [
 const AGENT_PROVIDER_KEYS = [
 	"platformInstances",
 	"hiddenModels",
+	// Provider prefixes left out of auto:<model> routing; follows prefix renames on import.
+	"autoExcludedProviders",
 	"modelProtocols",
 	"modelProtocolOverrides",
 	"customModels",
@@ -90,6 +117,10 @@ interface ImportPreview {
 	conflicts: Array<{ id: string; name: string; importedMessages: number }>;
 	exportedAt?: string;
 	version?: number;
+	/** `provider-keys.sealed.json` as found in the archive; opened at import with a passphrase. */
+	sealedKeys?: string;
+	/** Owners in the sealed file, from its plaintext header; for the preview only. */
+	sealedKeyCount?: number;
 }
 
 const previews = new Map<string, ImportPreview>();
@@ -282,6 +313,11 @@ const EXPORT_TICKET_LIMIT = 32;
 interface ExportTicket {
 	selection: TransferSelection;
 	expiresAt: number;
+	/**
+	 * Seals provider keys. Kept only in memory, for one download, so it never appears in the
+	 * download URL. Step-up was consumed when the ticket was issued.
+	 */
+	passphrase?: string;
 }
 
 const exportTickets = new Map<string, ExportTicket>();
@@ -306,12 +342,17 @@ function pruneExportTickets(now: number) {
 }
 
 /** 签发一张导出下载票据。`now` 只给测试注入时钟。 */
-export function createExportTicket(selection: TransferSelection, now = Date.now()): string {
+export function createExportTicket(
+	selection: TransferSelection,
+	now = Date.now(),
+	passphrase?: string,
+): string {
 	pruneExportTickets(now);
 	const token = randomBytes(18).toString("base64url");
 	exportTickets.set(token, {
 		selection: copySelection(selection),
 		expiresAt: now + EXPORT_TICKET_TTL_MS,
+		...(passphrase ? { passphrase } : {}),
 	});
 	return token;
 }
@@ -321,19 +362,36 @@ export function createExportTicket(selection: TransferSelection, now = Date.now(
  * 先删除再判断过期，避免时钟回拨后同一张票据还能用。
  */
 export function consumeExportTicket(token: string, now = Date.now()): TransferSelection | null {
+	return redeemExportTicket(token, now)?.selection ?? null;
+}
+
+/** Like consumeExportTicket, with the passphrase a providers export was issued with. */
+export function redeemExportTicket(
+	token: string,
+	now = Date.now(),
+): { selection: TransferSelection; passphrase?: string } | null {
 	const ticket = exportTickets.get(token);
 	if (!ticket) return null;
 	exportTickets.delete(token);
 	if (now >= ticket.expiresAt) return null;
-	return ticket.selection;
+	return {
+		selection: ticket.selection,
+		...(ticket.passphrase ? { passphrase: ticket.passphrase } : {}),
+	};
 }
 
 /**
  * 导出一份 ZIP：先在子进程里把导入需要的表复制成原生 SQLite 快照，再压缩进 ZIP。
  * 供应商配置与清单是小的 JSON 文件。
  */
+/**
+ * Provider keys never go into `providers.json`. With `options.passphrase` they are sealed
+ * into `provider-keys.sealed.json` (data-portability-keys.ts); without it the providers are
+ * exported without keys. The route requires step-up before it passes a passphrase.
+ */
 export async function exportData(
 	selection: TransferSelection = ALL_DATA_KINDS,
+	options: { passphrase?: string } = {},
 ): Promise<{ zipPath: string; counts: ExportCounts }> {
 	const dir = await mkdtemp(join(tmpdir(), "narrafork-export-"));
 	const snapshotPath = join(dir, "snapshot.db");
@@ -355,9 +413,16 @@ export async function exportData(
 			});
 		}
 
-		const providers = selection.providers
+		const collected = selection.providers
 			? collectProviders(settings)
 			: ({} as Partial<Record<ProviderKey, unknown>>);
+		// Keys leave providers.json and travel sealed. Sealing (async scrypt) is done before
+		// archiving starts, so a failure leaves no half-written ZIP.
+		const sealedKeys =
+			selection.providers && options.passphrase
+				? await sealProviderKeys(collectProviderKeys(collected), options.passphrase)
+				: null;
+		const providers = selection.providers ? withoutKeys(collected) : collected;
 		// 计数从快照读，与实际导出的内容一致；没有快照时这两类必然是 0。
 		const counts: ExportCounts = {
 			requests: needsSnapshot ? countRowsIn(snapshotPath, "api_requests") : 0,
@@ -375,9 +440,16 @@ export async function exportData(
 		archive.append(JSON.stringify(providers, null, 2), {
 			name: "providers.json",
 		});
+		if (sealedKeys) archive.append(sealedKeys, { name: SEALED_KEYS_ENTRY });
+		// Only an archive with sealed keys is version 2: an older instance cannot read them and
+		// must refuse it, while archives without providers stay importable there.
 		archive.append(
 			JSON.stringify(
-				{ version: EXPORT_VERSION, exportedAt: new Date().toISOString(), counts },
+				{
+					version: sealedKeys ? SEALED_KEYS_EXPORT_VERSION : PLAIN_EXPORT_VERSION,
+					exportedAt: new Date().toISOString(),
+					counts,
+				},
 				null,
 				2,
 			),
@@ -412,6 +484,8 @@ function collectProviders(source: NarraForkSettings): Partial<Record<ProviderKey
 		const value = agent?.[key];
 		if (value !== undefined) (out as Record<string, unknown>)[key] = value;
 	}
+	// Model overrides live beside settings.json, not in it.
+	out.modelCatalog = exportModelCatalogSettings();
 	return out;
 }
 
@@ -573,6 +647,11 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 				Record<ProviderKey, unknown>
 			>)
 		: {};
+	// Opened only at import, with the passphrase; the preview just says the keys are there.
+	const sealedEntry = index.get(SEALED_KEYS_ENTRY);
+	const sealedKeys = sealedEntry
+		? (await readSmallEntry(zipPath, sealedEntry)).toString("utf8")
+		: undefined;
 
 	// ATTACH 快照到主库连接，联查冲突（单条 SQL，不把 id 集合搬进 JS）
 	const attachName = `imp_${randomBytes(4).toString("hex")}`;
@@ -615,7 +694,8 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 				importedMessages: Number(row.messageCount ?? 0),
 			})),
 			exportedAt: typeof manifest?.exportedAt === "string" ? manifest.exportedAt : undefined,
-			version: manifest ? Number(manifest.version ?? EXPORT_VERSION) : undefined,
+			version: manifest ? Number(manifest.version ?? PLAIN_EXPORT_VERSION) : undefined,
+			...(sealedKeys ? { sealedKeys, sealedKeyCount: sealedHeaderCount(sealedKeys) } : {}),
 		};
 		previews.set(token, preview);
 		prunePreviews();
@@ -626,6 +706,16 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 		} catch {
 			// 连接可能已关闭；忽略
 		}
+	}
+}
+
+/** The plaintext `count` of a sealed bundle; 0 when it cannot be read. */
+function sealedHeaderCount(text: string): number {
+	try {
+		const count = Number((JSON.parse(text) as { count?: unknown }).count);
+		return Number.isSafeInteger(count) && count > 0 ? count : 0;
+	} catch {
+		return 0;
 	}
 }
 
@@ -644,6 +734,8 @@ export interface ImportOptions {
 	conflictById?: Record<string, ConflictDecision>;
 	/** 只导入选中的类别；缺省为全选。 */
 	include?: Partial<TransferSelection>;
+	/** Opens the archive's sealed provider keys; required when it has them and providers are imported. */
+	passphrase?: string;
 }
 
 export interface ImportResult {
@@ -655,6 +747,10 @@ export interface ImportResult {
 	sessionsRejected: number;
 	providersAdded: number;
 	providersRenamed: number;
+	/** Provider keys restored from the archive's sealed file (0 for an archive without it). */
+	keysImported: number;
+	/** Sealed keys that could not be written to the key store; see the server log. */
+	keysFailed: number;
 }
 
 function changesOf(run: { changes?: number }): number {
@@ -675,6 +771,7 @@ const IMPORTED_TABLES = [
 	"narrator_message_refs",
 	"narrator_tool_calls",
 	"narrator_blocks",
+	"narrator_text_snapshots",
 	"api_requests",
 ] as const;
 
@@ -905,11 +1002,36 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		sessionsRejected: 0,
 		providersAdded: 0,
 		providersRenamed: 0,
+		keysImported: 0,
+		keysFailed: 0,
 	};
 
 	await access(preview.snapshotPath).catch(() => {
 		throw catalogError("IMPORT_SNAPSHOT_EXPIRED");
 	});
+
+	// Sealed provider keys are opened before the transaction: scrypt is async and the import
+	// transaction is synchronous. A wrong passphrase stops here, before anything is written.
+	const importProviders = options.include?.providers ?? true;
+	let sealedKeys: ExportedKeys | null = null;
+	if (preview.sealedKeys && importProviders) {
+		if (!options.passphrase) throw catalogError("IMPORT_PASSPHRASE_REQUIRED");
+		try {
+			sealedKeys = await openProviderKeys(preview.sealedKeys, options.passphrase);
+		} catch (error) {
+			if (error instanceof BundleError) bundleCatalogError(error);
+			throw error;
+		}
+	}
+	// providers.json has no keys; the merge's same-endpoint check and the settings save need
+	// each provider's first key in place, as an old plain export had it.
+	const incomingProviders = sealedKeys
+		? (withFirstKeys(preview.providers, sealedKeys) as Partial<Record<ProviderKey, unknown>>)
+		: preview.providers;
+	/** Incoming custom API provider id → the local id it was added under. */
+	let addedProviders: ReadonlyMap<string, string> = new Map();
+	/** Single-key providers that were added; their key came in with the settings save. */
+	let addedSingleKeyOwners: ReadonlySet<string> = new Set();
 
 	const attachName = `imp_${randomBytes(4).toString("hex")}`;
 	sqlite.run(`ATTACH DATABASE ? AS ${attachName}`, [preview.snapshotPath]);
@@ -936,6 +1058,8 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				sessionsRejected: 0,
 				providersAdded: 0,
 				providersRenamed: 0,
+				keysImported: 0,
+				keysFailed: 0,
 			};
 			// 批内互相引用（会话父子、消息↔引用）无法靠行序满足，统一延到提交时校验：
 			// 提交仍失败就整批回滚，主库不会被改坏。
@@ -1028,6 +1152,22 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				copyTable(attachName, "narrator_blocks", { excludeNarrators: excludedNarrators });
+				if (
+					counts.sessionsInserted + counts.sessionsOverwritten > 0 &&
+					tableColumns(attachName, "narrator_text_snapshots").includes("sha256")
+				) {
+					// Shared content store: copy complete manifests and their children without
+					// parsing potentially large JSON bodies on the application thread.
+					copyTable(attachName, "narrator_text_snapshots");
+					// A collector may already have marked roots before this import. Renew the
+					// publication grace in the SAME transaction, including reused orphan hashes;
+					// INSERT OR IGNORE alone would leave their old timestamps sweepable.
+					sqlite.run(
+						`UPDATE main.narrator_text_snapshots SET created_at = MAX(created_at, ?)
+						 WHERE sha256 IN (SELECT sha256 FROM ${attachName}.narrator_text_snapshots)`,
+						[new Date().toISOString()],
+					);
+				}
 			}
 
 			// 3) 请求历史最后：它同时引用会话与消息，必须在两者就位后插入
@@ -1041,11 +1181,24 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 
 			// 4) 自检：只处理本次新增行，兜住无法预见的悬空引用（日志会写明表与数量）
 			repairDanglingReferences(baselines);
+			// 本次新增的请求计入用量日账本（按 rowid 基线，重复导入被主键跳过的行不会重复计数）
+			if (include.requests)
+				addImportedRequestsToUsageDaily(sqlite, baselines.get("api_requests") ?? 0);
 
 			// 5) 供应商合并：`saveSettings` 是原子写（临时文件 + rename），放在事务末尾，
 			// 失败时数据整批回滚，不会留下「数据进了、供应商没进」的半成品。
 			if (include.providers) {
-				const merge = mergeProviders(preview.providers);
+				const merge = mergeProviders(incomingProviders);
+				// Read after the transaction commits; a retried transaction recomputes them.
+				addedProviders = merge.addedCustomApiProviders;
+				addedSingleKeyOwners = merge.addedSingleKeyOwners;
+				// 改名的供应商：本次写入的会话跟着指向新前缀，不留在本地同名的另一个服务上。
+				if (include.sessions) {
+					remapImportedNarratorModels(
+						incomingIds.filter((id) => !excludedNarrators.includes(id)),
+						merge.prefixRemaps,
+					);
+				}
 				if (merge.changed) {
 					const next = structuredClone(settings) as NarraForkSettings;
 					for (const key of PROVIDER_KEYS) {
@@ -1095,6 +1248,18 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		}
 	}
 
+	// The key store is a file outside the SQLite transaction, so the remaining keys are
+	// written only once the transaction committed. The first key of each provider (and the
+	// single key of NUG / TokenDance / Command Code) was stored by the settings save above.
+	if (sealedKeys) {
+		const restored = restoreExtraKeys(sealedKeys, addedProviders);
+		result.keysImported = restored.imported + countSingleKeys(sealedKeys, addedSingleKeyOwners);
+		result.keysFailed = restored.failed;
+		if (restored.failed > 0) {
+			logger.warn("Import could not restore some provider keys", restored);
+		}
+	}
+
 	previews.delete(token);
 	void rm(preview.snapshotPath, { force: true }).catch(() => {});
 	return result;
@@ -1127,63 +1292,6 @@ function uniqueProviderId(taken: Set<string>): string {
  *
  * 实例级策略（`autoApply` / `pinnedVersion`）保留本地——导入搬的是模型数据，不是目录更新策略。
  */
-function mergeModelCatalog(current: unknown, incoming: unknown): unknown {
-	const base = (current ?? {}) as Record<string, unknown>;
-	const patch = incoming as Record<string, unknown>;
-	const baseLocal = (base.local ?? {}) as Record<string, unknown>;
-	const patchLocal = (patch.local ?? {}) as Record<string, unknown>;
-
-	const byId = (before: unknown, after: unknown): unknown => {
-		if (!Array.isArray(after)) return before;
-		const map = new Map<string, unknown>();
-		for (const entry of (Array.isArray(before) ? before : []) as Array<Record<string, unknown>>) {
-			map.set(String(entry.id ?? ""), entry);
-		}
-		for (const entry of after as Array<Record<string, unknown>>) {
-			map.set(String(entry.id ?? ""), entry);
-		}
-		return [...map.values()];
-	};
-	// overrides 没有 id，用 target + targetId 定位同一条。
-	const mergeOverrides = (): unknown => {
-		if (!Array.isArray(patchLocal.overrides)) return baseLocal.overrides;
-		const keyOf = (entry: Record<string, unknown>) => `${entry.target}:${entry.targetId}`;
-		const map = new Map<string, unknown>();
-		for (const entry of (baseLocal.overrides ?? []) as Array<Record<string, unknown>>) {
-			map.set(keyOf(entry), entry);
-		}
-		for (const entry of patchLocal.overrides as Array<Record<string, unknown>>) {
-			map.set(keyOf(entry), entry);
-		}
-		return [...map.values()];
-	};
-	const union = (before: unknown, after: unknown): unknown =>
-		Array.isArray(after)
-			? [...new Set([...(Array.isArray(before) ? before : []), ...after])]
-			: before;
-
-	return {
-		...base,
-		local: {
-			...baseLocal,
-			// 合并算一次本地编辑，revision 必须往前走，否则前端的 baseRevision 校验会拒绝后续保存。
-			revision: Math.max(Number(baseLocal.revision ?? 0), Number(patchLocal.revision ?? 0)) + 1,
-			models: byId(baseLocal.models, patchLocal.models),
-			variants: byId(baseLocal.variants, patchLocal.variants),
-			bindings: byId(baseLocal.bindings, patchLocal.bindings),
-			overrides: mergeOverrides(),
-			connections: {
-				...((baseLocal.connections as Record<string, unknown>) ?? {}),
-				...((patchLocal.connections as Record<string, unknown>) ?? {}),
-			},
-			hiddenModelIds: union(baseLocal.hiddenModelIds, patchLocal.hiddenModelIds),
-			hiddenVariantIds: union(baseLocal.hiddenVariantIds, patchLocal.hiddenVariantIds),
-		},
-		autoApply: base.autoApply,
-		pinnedVersion: base.pinnedVersion,
-	};
-}
-
 /**
  * 按模型键的第一段（`prefix:model`）改写。
  *
@@ -1229,6 +1337,12 @@ function remapIncomingModelSettings(
 	if (Array.isArray(incoming.hiddenModels)) {
 		next.hiddenModels = incoming.hiddenModels.map((item) => rewrite(String(item)));
 	}
+	// A list of bare prefixes, not `前缀:模型` keys.
+	if (Array.isArray(incoming.autoExcludedProviders)) {
+		next.autoExcludedProviders = incoming.autoExcludedProviders.map(
+			(prefix) => remaps.get(String(prefix)) ?? String(prefix),
+		);
+	}
 	for (const key of ["modelProtocols", "modelProtocolOverrides"] as const) {
 		const record = incoming[key];
 		if (!record || typeof record !== "object" || Array.isArray(record)) continue;
@@ -1248,6 +1362,26 @@ function remapIncomingModelSettings(
 			return copy;
 		});
 	}
+	// 模型自定义参数里「单个来源」的键是 `前缀:模型`，跟着前缀改名；旧包的内联本地层同理。
+	const catalog = incoming.modelCatalog as Record<string, unknown> | undefined;
+	if (catalog && typeof catalog === "object") {
+		const rekey = (record: unknown) =>
+			record && typeof record === "object" && !Array.isArray(record)
+				? Object.fromEntries(
+						Object.entries(record as Record<string, unknown>).map(([key, value]) => [
+							rewrite(key),
+							value,
+						]),
+					)
+				: record;
+		const copy: Record<string, unknown> = { ...catalog };
+		for (const layer of ["overrides", "local"] as const) {
+			const value = catalog[layer] as Record<string, unknown> | undefined;
+			if (value && typeof value === "object")
+				copy[layer] = { ...value, connections: rekey(value.connections) };
+		}
+		next.modelCatalog = copy;
+	}
 	return next;
 }
 
@@ -1261,13 +1395,10 @@ function mergeAgentModelSettings(
 	const out = merged as Record<string, unknown>;
 	let changed = false;
 
-	if (Array.isArray(incoming.hiddenModels)) {
-		out.hiddenModels = [
-			...new Set([
-				...((agent.hiddenModels as string[] | undefined) ?? []),
-				...incoming.hiddenModels,
-			]),
-		];
+	for (const key of ["hiddenModels", "autoExcludedProviders"] as const) {
+		const list = incoming[key];
+		if (!Array.isArray(list)) continue;
+		out[key] = [...new Set([...((agent[key] as string[] | undefined) ?? []), ...list])];
 		changed = true;
 	}
 
@@ -1293,8 +1424,10 @@ function mergeAgentModelSettings(
 		changed = true;
 	}
 
+	// Overrides are merged into the catalog's own file (incoming wins per entry); the
+	// catalog keeps owning `agent.modelCatalog`, so nothing goes into the settings patch.
 	if (incoming.modelCatalog && typeof incoming.modelCatalog === "object") {
-		out.modelCatalog = mergeModelCatalog(agent.modelCatalog, incoming.modelCatalog);
+		importModelCatalogSettings(incoming.modelCatalog);
 		changed = true;
 	}
 
@@ -1307,6 +1440,15 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	added: number;
 	renamed: number;
 	skipped: number;
+	/** Incoming prefix → the prefix it was imported under, for providers that were renamed. */
+	prefixRemaps: Map<string, string>;
+	/**
+	 * Incoming custom API provider id → the local id it was added under. Providers merged
+	 * into a local one (same key and base URL) are absent: they keep their local keys.
+	 */
+	addedCustomApiProviders: Map<string, string>;
+	/** Exporting-instance owner ids of single-key providers that were added (NUG, TokenDance, Command Code). */
+	addedSingleKeyOwners: Set<string>;
 } {
 	const current = structuredClone(settings) as NarraForkSettings;
 	const merged: Partial<Record<ProviderKey, unknown>> = {};
@@ -1315,6 +1457,8 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	let renamed = 0;
 	let skipped = 0;
 	const prefixRemaps = new Map<string, string>();
+	const addedCustomApiProviders = new Map<string, string>();
+	const addedSingleKeyOwners = new Set<string>();
 
 	const listKeys = ["customApiProviders", "nugProviders"] as const;
 	for (const key of listKeys) {
@@ -1326,7 +1470,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			>),
 		];
 		const existingNames = new Set(currentList.map((item) => String(item.name ?? "")));
-		const existingPrefixes = new Set(currentList.map((item) => String(item.prefix ?? "")));
+		// `auto` is reserved for auto:<model> values; an older export may still use it.
+		const existingPrefixes = new Set([
+			"auto",
+			...currentList.map((item) => String(item.prefix ?? "")),
+		]);
 		const existingIds = new Set(currentList.map((item) => String(item.id ?? "")));
 		for (const item of incomingList as Array<Record<string, unknown>>) {
 			const copy = { ...item };
@@ -1343,10 +1491,16 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				skipped += 1;
 				continue;
 			}
+			const incomingId = typeof item.id === "string" ? item.id : "";
 			if (!copy.id || existingIds.has(String(copy.id))) {
 				copy.id = uniqueProviderId(existingIds);
 			}
 			existingIds.add(String(copy.id));
+			if (key === "customApiProviders" && incomingId) {
+				addedCustomApiProviders.set(incomingId, String(copy.id));
+			}
+			// A NUG provider's key is stored by the settings save under its (possibly new) id.
+			if (key === "nugProviders" && incomingId) addedSingleKeyOwners.add(nugKeyOwner(incomingId));
 			// 重名 → 自动追加「-副本」（多次重复时继续加编号）
 			const name = String(copy.name ?? "导入的供应商");
 			if (existingNames.has(name)) {
@@ -1391,7 +1545,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		const agent = (current.agent ?? {}) as unknown as Record<string, unknown>;
 		const currentList = [...((agent.platformInstances ?? []) as Array<Record<string, unknown>>)];
 		const existingIds = new Set(currentList.map((entry) => String(entry.id ?? "")));
-		const existingPrefixes = new Set(currentList.map((entry) => String(entry.prefix ?? "")));
+		// `auto` is reserved for auto:<model> values, like the provider lists above.
+		const existingPrefixes = new Set([
+			"auto",
+			...currentList.map((entry) => String(entry.prefix ?? "")),
+		]);
 		for (const item of incomingInstances as Array<Record<string, unknown>>) {
 			const copy = { ...item };
 			const platform = String(copy.platform ?? "");
@@ -1447,10 +1605,56 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		}
 		added += 1;
 		(merged as Record<string, unknown>)[key] = value;
+		if (key === "tokendance") addedSingleKeyOwners.add(TOKENDANCE_KEY_OWNER);
+		if (key === "commandCode") addedSingleKeyOwners.add(COMMAND_CODE_KEY_OWNER);
 		changed = true;
 	}
 
-	return { merged, changed, added, renamed, skipped };
+	return {
+		merged,
+		changed,
+		added,
+		renamed,
+		skipped,
+		prefixRemaps,
+		addedCustomApiProviders,
+		addedSingleKeyOwners,
+	};
+}
+
+/** Session columns that hold a model value (`<prefix>:<model>`, `__agg__:<prefix>:<model>`, …). */
+const NARRATOR_MODEL_COLUMNS = ["model", "pending_model_restore"] as const;
+
+/**
+ * Point imported sessions at the providers' new prefixes.
+ *
+ * A provider that came in renamed (`openai` → `openai-2`) leaves the sessions that used it
+ * naming the local `openai`, which is a different service. Only the rows this import wrote
+ * are touched. Each value is rewritten once with the same rule as the model settings, so a
+ * chain of renames (`a` → `a-2` while `a-2` → `a-3`) cannot apply twice. Reads only the two
+ * short model columns of the imported sessions.
+ */
+function remapImportedNarratorModels(ids: readonly string[], remaps: Map<string, string>): void {
+	if (remaps.size === 0 || ids.length === 0) return;
+	const present = tableColumns("main", "narrators");
+	const columns = NARRATOR_MODEL_COLUMNS.filter((column) => present.includes(column));
+	if (columns.length === 0) return;
+	const select = sqlite.prepare(
+		`SELECT id, ${columns.map((column) => `"${column}"`).join(", ")}
+		 FROM main.narrators WHERE id IN (SELECT value FROM json_each(?))`,
+	);
+	const updates = columns.map((column) =>
+		sqlite.prepare(`UPDATE main.narrators SET "${column}" = ? WHERE id = ?`),
+	);
+	const rows = select.all(JSON.stringify(ids)) as Array<Record<string, string | null>>;
+	for (const row of rows) {
+		columns.forEach((column, index) => {
+			const value = row[column];
+			if (!value) return;
+			const next = rewritePrefixedModelKey(value, remaps);
+			if (next !== value) updates[index]?.run(next, row.id as string);
+		});
+	}
 }
 
 // ── 清空 ─────────────────────────────────────────────────────────────────
@@ -1474,6 +1678,8 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 					n: number;
 				};
 				sqlite.run(`DELETE FROM api_requests`);
+				// 用量日账本是按天汇总的请求历史，随请求历史一起清空。
+				sqlite.run(`DELETE FROM usage_daily`);
 				deleted.requests = Number(before.n);
 			}
 			if (clearSessions) {
@@ -1505,7 +1711,12 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				// 不属于"删掉这个供应商"的范畴。
 				const agent = next.agent as unknown as Record<string, unknown> | undefined;
 				if (agent) {
-					for (const key of ["platformInstances", "hiddenModels", "customModels"] as const) {
+					for (const key of [
+						"platformInstances",
+						"hiddenModels",
+						"customModels",
+						"autoExcludedProviders",
+					] as const) {
 						const value = agent[key];
 						if (Array.isArray(value)) removed += value.length;
 						agent[key] = [];
@@ -1516,7 +1727,10 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 						agent[key] = {};
 					}
 				}
+				const customIds = (settings.customApiProviders ?? []).map((provider) => provider.id);
 				saveSettings(next);
+				// Every key of the cleared providers, not only the first one settings held.
+				for (const id of customIds) getProviderKeyStore().removeProvider(id);
 				deleted.providers = removed;
 			}
 		});

@@ -57,6 +57,7 @@ import {
 	getProviderBalanceGenerations,
 	syncProviderBalanceCache,
 } from "../lib/provider-balance-cache";
+import { getProviderKeyStore } from "../lib/provider-keys";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
@@ -76,6 +77,7 @@ import {
 	isOpenAICustomApiProtocol,
 	migrateProviderPrefixReferences,
 	type NarraForkSettings,
+	normalizeAutoModelValueForSave,
 	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	purgeStaleAgentModelRefs,
@@ -88,6 +90,7 @@ import {
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
+import { mergeSpeechSettingsPatch, redactSpeechSettings } from "../lib/speech-settings";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
@@ -100,6 +103,7 @@ import {
 	defaultNarratorWriteAudienceSchema,
 	diskSafetySettingsSchema,
 } from "../lib/validators/settings";
+import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
@@ -326,6 +330,7 @@ export const updateSettingsSchema = z
 	.object({
 		// Optional request precondition, never a persisted setting.
 		expectedUpdateSettingsKey: z.string().max(2048).optional(),
+		secrets: z.object({ encrypt: z.boolean().optional() }).optional(),
 		server: z
 			.object({
 				port: z.number().int().min(1).max(65535),
@@ -588,6 +593,7 @@ export const updateSettingsSchema = z
 					.optional(),
 				providerOrder: z.array(z.string()).max(50).optional(),
 				disabledProviders: z.array(z.string()).max(200).optional(),
+				autoExcludedProviders: z.array(z.string().min(1).max(100)).max(200).optional(),
 			})
 			.partial()
 			.optional(),
@@ -712,6 +718,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		speech: speechSettingsPatchSchema.optional(),
 		search: searchSettingsSchema.optional(),
 		routines: z
 			.object({
@@ -981,6 +988,7 @@ async function buildSettingsResponse(
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
 		vnet: maskVNetSettings(source.vnet),
+		speech: redactSpeechSettings(source.speech),
 		search: maskSearchSettings(source.search),
 		// Executable-plugin providers, grouped per provider prefix. Read straight from
 		// the in-memory registry; no plugin process is started to build this.
@@ -1182,6 +1190,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
 	}
+	// A deleted provider takes all of its keys with it, not just the one settings showed.
+	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	const staleCustomApiQuotaIds = uniqueIds([
 		...removedCustomApiIds,
 		...getCustomApiProviderIdsWithQuotaIdentityChanges(
@@ -1428,13 +1438,62 @@ settingsRoutes.get("/search/protocols", (c) => {
 	return c.json(PROTOCOL_REGISTRY);
 });
 
+/**
+ * Check and canonicalize the `auto:` model values a settings patch writes. Only values that
+ * differ from what is saved are checked: the UI sends the whole agent section, and a value
+ * saved before a catalog change must not make every later save fail.
+ */
+function normalizeChangedAutoModelValues(
+	patch: {
+		defaultModel?: string;
+		summaryModel?: string;
+		translationModel?: string;
+		promptOptimizeModel?: string;
+		subagentModels?: Partial<Record<string, string>>;
+		subagentAllowedModels?: Partial<Record<string, string[]>>;
+	},
+	saved: NarraForkSettings["agent"],
+): void {
+	for (const key of [
+		"defaultModel",
+		"summaryModel",
+		"translationModel",
+		"promptOptimizeModel",
+	] as const) {
+		const value = patch[key];
+		if (value !== undefined && value !== saved[key]) {
+			patch[key] = normalizeAutoModelValueForSave(value);
+		}
+	}
+	const savedSubagent = (saved.subagentModels ?? {}) as Partial<Record<string, string>>;
+	for (const [type, value] of Object.entries(patch.subagentModels ?? {})) {
+		if (value !== undefined && value !== savedSubagent[type] && patch.subagentModels) {
+			patch.subagentModels[type] = normalizeAutoModelValueForSave(value);
+		}
+	}
+	const savedPools = (saved.subagentAllowedModels ?? {}) as Partial<Record<string, string[]>>;
+	for (const [type, pool] of Object.entries(patch.subagentAllowedModels ?? {})) {
+		if (!pool || !patch.subagentAllowedModels) continue;
+		const before = new Set(savedPools[type] ?? []);
+		patch.subagentAllowedModels[type] = pool.map((entry) =>
+			before.has(entry) ? entry : normalizeAutoModelValueForSave(entry),
+		);
+	}
+}
+
 settingsRoutes.patch("/", requireAdmin, async (c) => {
 	const requestStartedAt = performance.now();
 	return settingsUpdateLock.acquire("settings", async () => {
 		const lockAcquiredAt = performance.now();
 		const body = normalizeLegacySettingsPatch(await c.req.json());
 		const parsed = updateSettingsSchema.safeParse(body);
-		if (!parsed.success) throw new ValidationError(parsed.error.message);
+		if (!parsed.success) {
+			// Never serialize speech credential-bearing validation paths or rejected input.
+			if (parsed.error.issues.some((issue) => issue.path[0] === "speech")) {
+				throw new ValidationError("Invalid speech settings patch");
+			}
+			throw new ValidationError(parsed.error.message);
+		}
 
 		const current = structuredClone(settings);
 		const { expectedUpdateSettingsKey, ...validated } = parsed.data;
@@ -1459,7 +1518,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["codex", "tokendance"]);
+			// `auto` selects a source for `auto:<model>` values (shared/auto-model.ts).
+			const RESERVED_PREFIXES = new Set(["codex", "tokendance", "auto"]);
 			const allPrefixes: Array<{ prefix: string; source: string; legacyTokenDance?: boolean }> = [];
 			const previousCustomProviders = [
 				...(current.customApiProviders ?? []),
@@ -1524,6 +1584,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		if (validated.codex?.defaultReasoningEffort === null) {
 			validated.codex.defaultReasoningEffort = undefined;
 		}
+
+		if (validated.agent) normalizeChangedAutoModelValues(validated.agent, current.agent);
 
 		// An explicit "" from the UI means "auto" — drop the stored tier instead of
 		// persisting an invalid empty value.
@@ -1695,6 +1757,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				// Array — replace entirely, don't merge
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				(merged as any)[key] = val;
+			} else if (key === "speech") {
+				merged.speech = mergeSpeechSettingsPatch(current.speech, val);
 			} else if (key === "proxy") {
 				// Replace entirely so switching modes drops the stale custom url.
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1755,7 +1819,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		>["narrators"] = [];
 		const persistStartedAt = performance.now();
 		if (prefixChanges.length > 0) {
-			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
+			migratedNarrators = await commitProviderPrefixMigration(current, merged, prefixPlan);
 		} else {
 			saveSettings(merged);
 		}

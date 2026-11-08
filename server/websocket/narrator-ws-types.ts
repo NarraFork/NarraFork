@@ -341,7 +341,7 @@ export type NarratorServerMessage =
 			providerPrefix?: string;
 			nugModelId?: string;
 			/** `credentials` when omitted. `quota` waits carry `resumeAt`. */
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 			quotaProvider?: "kimi" | "opencode";
 			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
@@ -360,7 +360,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			model: string;
 			nugModelId?: string;
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 			quotaProvider?: "kimi" | "opencode";
 	  }
@@ -1112,7 +1112,7 @@ export type NarratorServerMessage =
 			message: string;
 			model: string;
 			nugModelId?: string;
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			quotaProvider?: "kimi" | "opencode";
 			quotaBucket?: string;
 			resumeAt?: number;
@@ -1125,7 +1125,7 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			model: string;
 			nugModelId?: string;
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			quotaProvider?: "kimi" | "opencode";
 	  }
 	| {
@@ -1244,6 +1244,14 @@ export type NarratorServerMessage =
 			type: "subagent_attached";
 			narratorId: string;
 			subagentNarratorId: string;
+	  }
+	| {
+			/**
+			 * The tasks a session's task board shows changed (outline P2 PR 5): ids only, merged
+			 * within 250 ms; the board and the status bar read again over HTTP.
+			 */
+			type: "outline_tasks_changed";
+			narratorId: string;
 	  }
 	| {
 			type: "spec_changed";

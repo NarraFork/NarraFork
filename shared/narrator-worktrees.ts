@@ -1,4 +1,8 @@
-/** Local narrator worktree management. No remote cwd, removal, pruning or implicit switching. */
+/**
+ * Local narrator worktree management. This service never switches the caller's
+ * working directory — the CreateWorktree/AttachWorktree tools do that after a
+ * creation — and never handles remote cwd, removal or pruning.
+ */
 export interface WorktreeEntry {
 	path: string;
 	head: string | null;

@@ -8,14 +8,18 @@ beforeAll(() => {
 const LONG_LINE =
 	"Σ 1,234,567 ctx · 987,654 in · 321,098 out · 111,111 cache hit · 222,222 cache write (111,111 5m / 111,111 1h) · 99,999 reasoning · $12.3456";
 
+/**
+ * The xs line the measure layer reads live: 20 at the default setting (120% of the
+ * bare-Mantine 17 that `TURN_USAGE_LINE_HEIGHT` records — LINE_HEIGHT_BASELINE_PERCENT).
+ */
+const LIVE_LINE = 20;
+
 describe("measureTurnUsage — leading line", () => {
 	it("is one xs line plus the gap facing the body", async () => {
-		const { measureTurnUsage, TURN_USAGE_LINE_HEIGHT, TURN_USAGE_LINE_MARGIN } = await import(
-			"./measure-turn-usage"
-		);
+		const { measureTurnUsage, TURN_USAGE_LINE_MARGIN } = await import("./measure-turn-usage");
 		const r = measureTurnUsage({ placement: "leading", text: "↑ 12,345" }, 600);
-		expect(r.height).toBe(TURN_USAGE_LINE_HEIGHT + TURN_USAGE_LINE_MARGIN);
-		expect(r.height).toBe(19);
+		expect(r.height).toBe(LIVE_LINE + TURN_USAGE_LINE_MARGIN);
+		expect(r.height).toBe(22);
 		expect(r.lines).toEqual(["↑ 12,345"]);
 		expect(r.placement).toBe("leading");
 	});
@@ -30,12 +34,10 @@ describe("measureTurnUsage — leading line", () => {
 
 describe("measureTurnUsage — trailing lines", () => {
 	it("is one xs line plus the gap facing the body", async () => {
-		const { measureTurnUsage, TURN_USAGE_LINE_HEIGHT, TURN_USAGE_LINE_MARGIN } = await import(
-			"./measure-turn-usage"
-		);
+		const { measureTurnUsage, TURN_USAGE_LINE_MARGIN } = await import("./measure-turn-usage");
 		const r = measureTurnUsage({ placement: "trailing", text: "Σ 100 ctx · 100 in · 20 out" }, 600);
-		expect(r.height).toBe(TURN_USAGE_LINE_HEIGHT + TURN_USAGE_LINE_MARGIN);
-		expect(r.height).toBe(19);
+		expect(r.height).toBe(LIVE_LINE + TURN_USAGE_LINE_MARGIN);
+		expect(r.height).toBe(22);
 	});
 
 	it("puts the gap ABOVE the text (block marginTop)", async () => {
@@ -45,13 +47,13 @@ describe("measureTurnUsage — trailing lines", () => {
 	});
 
 	it("grows by exactly one line height for the mobile second line", async () => {
-		const { measureTurnUsage, TURN_USAGE_LINE_HEIGHT } = await import("./measure-turn-usage");
+		const { measureTurnUsage } = await import("./measure-turn-usage");
 		const single = measureTurnUsage({ placement: "trailing", text: "Σ 1" }, 600);
 		const split = measureTurnUsage(
 			{ placement: "trailing", text: "Σ 1", secondaryText: "8 cache hit · $0.5000" },
 			600,
 		);
-		expect(split.height - single.height).toBe(TURN_USAGE_LINE_HEIGHT);
+		expect(split.height - single.height).toBe(LIVE_LINE);
 		expect(split.lines).toEqual(["Σ 1", "8 cache hit · $0.5000"]);
 	});
 

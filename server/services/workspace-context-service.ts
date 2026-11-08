@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, constants, realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import type { SwitchWorkingDirectoryRequest, WorkspaceContext } from "@shared/workspace-context";
+import {
+	type SwitchWorkingDirectoryRequest,
+	serializeWorkspaceContext,
+	type WorkspaceContext,
+} from "@shared/workspace-context";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects } from "../db/schema";
@@ -167,7 +171,11 @@ export async function cacheLocalWorkspaceContext(
 	>,
 	context: WorkspaceContext,
 ): Promise<boolean> {
-	if (JSON.stringify(context) === JSON.stringify(row.workspaceContext)) return true;
+	if (
+		row.workspaceContext &&
+		serializeWorkspaceContext(context) === serializeWorkspaceContext(row.workspaceContext)
+	)
+		return true;
 	const saved = await db
 		.update(narrators)
 		.set({ workspaceContext: context })
@@ -326,7 +334,14 @@ export const workspaceContextService = {
 			return action(context);
 		});
 	},
-	async get(id: string): Promise<WorkspaceContext> {
+	/** Metadata for directory recovery only; never use this to admit tool execution. */
+	async getForDirectorySwitch(id: string): Promise<WorkspaceContext> {
+		return this.get(id, { allowMissingDirectory: true });
+	},
+	async get(
+		id: string,
+		options: { allowMissingDirectory?: boolean } = {},
+	): Promise<WorkspaceContext> {
 		const row = await loadWorkspaceRow(id);
 		const projectId = row.contextProjectId ?? undefined;
 		const project = projectId
@@ -379,12 +394,32 @@ export const workspaceContextService = {
 			(isFormerChapterSessionWithoutDirectory(row)
 				? null
 				: resolveNarratorSessionCwd(row.cwd, project?.gitPath, getHome()));
-		if (!cwd)
-			throw new AppError(
-				"This legacy workspace has no directory. Choose a working directory to continue.",
-				409,
-				"WORKSPACE_DIRECTORY_REQUIRED",
-			);
+		if (!cwd) {
+			if (!options.allowMissingDirectory)
+				throw new AppError(
+					"This legacy workspace has no directory. Choose a working directory to continue.",
+					409,
+					"WORKSPACE_DIRECTORY_REQUIRED",
+				);
+			// An unselected directory is metadata, not an executable workspace. Do not
+			// resolve an empty path against process.cwd(), probe Git, or cache it.
+			return {
+				revision: row.workspaceRevision,
+				deviceId: "local",
+				cwd: "",
+				pathFlavor: localBackend.paths.flavor === "windows" ? "windows" : "posix",
+				contextProjectId: projectId,
+				contextKey: createHash("sha256")
+					.update(JSON.stringify(["local", "directory-required", id]))
+					.digest("hex"),
+				capabilities: {
+					switchDirectory: supported,
+					...(!supported
+						? { reason: "Only ordinary primary narrators support directory switching" }
+						: {}),
+				},
+			};
+		}
 		let context = committed
 			? { ...committed, contextProjectId: projectId }
 			: await prepareLocalWorkspaceContext(cwd, row.workspaceRevision, projectId, true);
@@ -398,7 +433,8 @@ export const workspaceContextService = {
 			// A missing checkout must retain its last known identity, not erase it.
 			if (discovered.git) context = discovered;
 		}
-		if (context.git && !(await cacheLocalWorkspaceContext(id, row, context))) return this.get(id);
+		if (context.git && !(await cacheLocalWorkspaceContext(id, row, context)))
+			return this.get(id, options);
 		return {
 			...context,
 			capabilities: {
@@ -548,7 +584,7 @@ export const workspaceContextService = {
 		options: WorkspaceSwitchOptions,
 	) {
 		const result = await transitionWorkspaceContext(request, {
-			read: () => this.get(id),
+			read: () => this.getForDirectorySwitch(id),
 			checkAdmission: () => assertSwitchAdmission(id, options),
 			prepare: async (previous, input) => {
 				if (!previous.capabilities.switchDirectory || input.target.deviceId !== "local")

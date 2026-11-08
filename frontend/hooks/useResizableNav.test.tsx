@@ -226,6 +226,65 @@ describe("nav width store", () => {
 		expect(renderHookCounts.lastValue).toBe(false);
 	});
 
+	it("previews the rail as soon as the drag goes below the minimum width", async () => {
+		const { startNavResize, useNavWidth, useNavCollapsed, NAV_WIDTH_CONSTANTS } = await import(
+			"./useResizableNav"
+		);
+		const collapsed = await mountHarness(useNavCollapsed);
+		const width = await mountHarness(useNavWidth);
+		startNavResize({ clientX: 250, preventDefault: () => {} });
+		// Halfway between the rail and the minimum: the two states have nothing in
+		// between, so the drag already shows the rail rather than a squeezed sidebar.
+		firePointer("pointermove", 250 - 110);
+		expect(collapsed.renderHookCounts.lastValue).toBe(true);
+		expect(width.renderHookCounts.lastValue).toBe(NAV_WIDTH_CONSTANTS.COLLAPSED_WIDTH);
+		firePointer("pointerup", 140);
+		// And the release keeps exactly what the preview showed.
+		expect(width.renderHookCounts.lastValue).toBe(NAV_WIDTH_CONSTANTS.COLLAPSED_WIDTH);
+	});
+
+	it("keeps a width at or above the minimum, without a jump on release", async () => {
+		const { startNavResize, useNavWidth, useNavCollapsed, NAV_WIDTH_CONSTANTS } = await import(
+			"./useResizableNav"
+		);
+		const collapsed = await mountHarness(useNavCollapsed);
+		const width = await mountHarness(useNavWidth);
+		const target = NAV_WIDTH_CONSTANTS.EXPANDED_MIN;
+		startNavResize({ clientX: 250, preventDefault: () => {} });
+		firePointer("pointermove", 250 - (250 - target));
+		expect(collapsed.renderHookCounts.lastValue).toBe(false);
+		firePointer("pointerup", 0);
+		expect(width.renderHookCounts.lastValue).toBe(target);
+		expect(collapsed.renderHookCounts.lastValue).toBe(false);
+	});
+
+	it("grabbing a hover-expanded edge pins it immediately and resizes from its visible width", async () => {
+		const {
+			resetNavWidthStoreForTest,
+			toggleNavCollapsed,
+			startNavResize,
+			useNavCollapsed,
+			useNavWidth,
+		} = await import("./useResizableNav");
+		resetNavWidthStoreForTest(320);
+		toggleNavCollapsed();
+		const collapsed = await mountHarness(useNavCollapsed);
+		const width = await mountHarness(useNavWidth);
+		expect(width.renderHookCounts.lastValue).toBe(73);
+		flushSyncRef.current(() => {
+			startNavResize({ clientX: 319, preventDefault: () => {} }, { expandFromHover: true });
+		});
+		// Already pinned at pointerdown, before the first move or release.
+		expect(collapsed.renderHookCounts.lastValue).toBe(false);
+		expect(width.renderHookCounts.lastValue).toBe(320);
+		expect(localStorage.getItem("narrafork_nav_width")).toBe("320");
+		firePointer("pointermove", 343); // +24 from the visible 320, not the hidden 73.
+		firePointer("pointerup", 343);
+		expect(width.renderHookCounts.lastValue).toBe(344);
+		expect(collapsed.renderHookCounts.lastValue).toBe(false);
+		expect(localStorage.getItem("narrafork_nav_width")).toBe("344");
+	});
+
 	it("toggle flips to the rail and back to the previous width", async () => {
 		const { toggleNavCollapsed, useNavCollapsed } = await import("./useResizableNav");
 		const { renderHookCounts } = await mountHarness(useNavCollapsed);

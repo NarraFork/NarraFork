@@ -88,6 +88,11 @@ export interface ActiveNarrator {
 	 *  "continue" = no compact; "compact" = compact was performed, needs fresh context. */
 	_planApprovedContinue?: "continue" | "compact";
 	/**
+	 * The outline plan the approved ExitPlanMode submitted (outline P2 PR 8), settled as approved
+	 * by `onExitPlanMode`: the restart starts its first step and names it.
+	 */
+	_outlinePlanApproved?: import("./outline-plan-mode").ApprovedOutlinePlan;
+	/**
 	 * Plan approval that landed while the approving response was still streaming. The
 	 * restart (plan compact + pass abort) runs once that assistant message is finalized,
 	 * so the response is recorded and persisted whole before the pass ends.
@@ -196,6 +201,11 @@ export interface ActiveNarrator {
 	_substatus: Set<string>;
 	/** One-shot reset for reusable upstream provider sessions before the next request. */
 	_resetUpstreamSessionOnNextRequest?: boolean;
+	/**
+	 * One-shot: a compact opened a new epoch, so the next `auto:` resolution picks a source
+	 * afresh instead of staying on the current one (§4.3 "epoch boundary").
+	 */
+	_autoReselectOnNextTurn?: boolean;
 	/**
 	 * The persisted `apiConversationId` this session started from, used as the
 	 * compare-and-set baseline when teardown writes the id back.
@@ -545,6 +555,8 @@ export function markActiveHistoryCompactPending(narratorId: string, seq?: number
 	if (!active?.alive) return false;
 	const nextSeq = typeof seq === "number" ? seq : 0;
 	active._pendingHistoryCompactSeq = Math.max(active._pendingHistoryCompactSeq ?? 0, nextSeq);
+	// The compact opened a new epoch: the cache the sticky source held is gone.
+	active._autoReselectOnNextTurn = true;
 	return true;
 }
 
@@ -831,20 +843,33 @@ function admissionWorkFor(narratorId: string): NarratorWorkAdmission[] {
 
 /** Resolve ownership from persisted parent links, never a request's broadcast/cwd hint. */
 export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<string> {
-	const [{ db }, { narrators }, { eq }] = await Promise.all([
+	const [database, { narrators }, { eq }] = await Promise.all([
 		import("../db"),
 		import("../db/schema"),
 		import("drizzle-orm"),
 	]);
+	const { db } = database;
+	let postgresQuery: import("./context-composition-history").ContextQuery | undefined;
+	if (database.activeDatabaseBackend === "postgres") {
+		if (!database.postgresRuntime) throw new AppError("PostgreSQL runtime is not connected", 503);
+		const { postgresContextQuery } = await import("./context-composition-history");
+		postgresQuery = postgresContextQuery(database.postgresRuntime.client.sql);
+	}
 	const seen = new Set<string>();
 	let id = narratorId;
 	while (seen.size < 32 && !seen.has(id)) {
 		seen.add(id);
 		// Admission is a frequent metadata read; never load prompts or compact summaries.
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { id: true, variant: true, parentNarratorId: true },
-		});
+		const narrator = postgresQuery
+			? await postgresQuery.get<{ id: string; variant: string; parentNarratorId: string | null }>(
+					`SELECT id, variant, parent_narrator_id AS "parentNarratorId"
+					 FROM narrators WHERE id = ?`,
+					[id],
+				)
+			: await db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { id: true, variant: true, parentNarratorId: true },
+				});
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (!isSubagentVariant(narrator.variant)) return id;
 		if (!narrator.parentNarratorId) break;

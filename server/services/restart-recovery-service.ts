@@ -1,6 +1,7 @@
 import { closeSync, openSync, readSync } from "node:fs";
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators, narratorToolCalls } from "../db/schema";
@@ -404,38 +405,51 @@ export async function prepareOrdinaryRestartRecovery(
 	const publication = getRuntimePublicationService();
 	const rows: typeof candidates = [];
 	for (const row of candidates) {
-		const result =
+		const run =
 			row.logicalRunId && row.deliverTo
-				? await publication.readAgentTerminalResult(
-						{
-							producerKind: "agent",
-							taskId: row.id,
-							logicalRunId: row.logicalRunId,
-							recipientId: row.deliverTo.narratorId,
-						},
-						{ includeEventKind: true },
-					)
+				? {
+						producerKind: "agent" as const,
+						taskId: row.id,
+						logicalRunId: row.logicalRunId,
+						recipientId: row.deliverTo.narratorId,
+					}
 				: null;
-		if (!result) {
+		const publicationState = run
+			? await publication.readRunPublicationState(run)
+			: { state: "none" as const };
+		if (publicationState.state !== "settled") {
 			// Idle rows entered this set only through the verified retained manifest.
 			if (restartEligible(row) || row.status === "idle") rows.push(row);
 			continue;
 		}
+		const result = run
+			? await publication.readAgentTerminalResult(run, { includeEventKind: true })
+			: null;
 		// A crash after the terminal transaction but before idle needs delivery only.
-		// The durable snapshot/intent is authoritative; never execute the model again.
+		// The durable terminal evidence is authoritative; never execute the model again,
+		// even when the result snapshot itself can no longer be read.
+		const eventKind = result?.eventKind ?? publicationState.eventKind;
 		await db
 			.update(narrators)
 			.set({
 				status: "idle",
 				substatus: JSON.stringify([
-					result.eventKind === "failed"
-						? "error"
-						: result.eventKind === "timed_out"
-							? "timeout"
-							: result.eventKind === "cancelled"
-								? "interrupted"
-								: "unread",
+					!eventKind
+						? "interrupted"
+						: eventKind === "failed"
+							? "error"
+							: eventKind === "timed_out"
+								? "timeout"
+								: eventKind === "cancelled"
+									? "interrupted"
+									: "unread",
 				]),
+				...(!result
+					? {
+							errorMessage:
+								"Run had already published its terminal result before restart; the stored result is no longer readable, so it was not rerun.",
+						}
+					: {}),
 			})
 			.where(and(eq(narrators.id, row.id), eq(narrators.logicalRunId, row.logicalRunId as string)));
 		publication.schedule();
@@ -731,6 +745,7 @@ export async function restoreCarriedOrdinaryTargets(
 	source: RecoverySource,
 	driven: ReadonlySet<string>,
 	includedNarratorIds?: ReadonlySet<string>,
+	humanReplyContext?: { narratorId: string; context: ReplyContext },
 ): Promise<void> {
 	const { continueNarrator } = await import("./narrator-session");
 	const failures: string[] = [];
@@ -761,11 +776,18 @@ export async function restoreCarriedOrdinaryTargets(
 				if (valid) {
 					// The same persisted run continues (deadline kept); its result was already
 					// owed through its own task/tool call, so recovery does not deliver it again.
-					const resumed = await continueNarrator(row.id, "en", false, undefined, {
-						resumeRunId: row.logicalRunId ?? undefined,
-						recovered: true,
-						deliver: false,
-					});
+					const resumed = await continueNarrator(
+						row.id,
+						"en",
+						false,
+						undefined,
+						{
+							resumeRunId: row.logicalRunId ?? undefined,
+							recovered: true,
+							deliver: false,
+						},
+						humanReplyContext?.narratorId === row.id ? humanReplyContext.context : undefined,
+					);
 					if (!resumed.ok) throw new Error("Standalone delivering run recovery did not start");
 				}
 				const original = getRegisteredRecoverySource(source.updateEpoch);
@@ -789,7 +811,11 @@ export async function restoreCarriedOrdinaryTargets(
 
 export async function restoreOrdinaryRestartRecovery(
 	prepared: RestartStartupRecovery,
-	options: { manual?: boolean; includedNarratorIds?: ReadonlySet<string> } = {},
+	options: {
+		manual?: boolean;
+		includedNarratorIds?: ReadonlySet<string>;
+		humanReplyContext?: { narratorId: string; context: ReplyContext };
+	} = {},
 ) {
 	if (!prepared.manifest || (!options.manual && !automaticResumeEnabled())) return null;
 	const { manifest, protection } = prepared;
@@ -813,8 +839,14 @@ export async function restoreOrdinaryRestartRecovery(
 		{ snapshot: manifest.snapshot, protection },
 		{
 			includedNarratorIds: options.includedNarratorIds,
+			humanReplyContext: options.humanReplyContext,
 			onSendWaitersSettled: () =>
-				restoreCarriedOrdinaryTargets(source, driven, options.includedNarratorIds),
+				restoreCarriedOrdinaryTargets(
+					source,
+					driven,
+					options.includedNarratorIds,
+					options.humanReplyContext,
+				),
 			onQueueCompleted: async () => {
 				if (!options.includedNarratorIds) {
 					await removeManifest(manifest.snapshot.updateEpoch);
@@ -836,7 +868,11 @@ export async function restoreOrdinaryRestartRecovery(
 }
 
 /** Explicit Continue bypasses only the startup flag, and only for this narrator's subtree. */
-export async function manuallyResumeRestartRecovery(narratorId: string): Promise<boolean> {
+export async function manuallyResumeRestartRecovery(
+	narratorId: string,
+	humanReplyContext?: ReplyContext,
+): Promise<boolean> {
+	const context = parseReplyContext(humanReplyContext);
 	const prepared = processState.pausedRecovery;
 	if (!prepared?.manifest?.targets.some((target) => target.narratorId === narratorId)) return false;
 	const ids = new Set([narratorId]);
@@ -857,6 +893,7 @@ export async function manuallyResumeRestartRecovery(narratorId: string): Promise
 	const handle = await restoreOrdinaryRestartRecovery(prepared, {
 		manual: true,
 		includedNarratorIds: ids,
+		humanReplyContext: context ? { narratorId, context } : undefined,
 	});
 	if (!handle) return false;
 	processState.pausedRecovery = {

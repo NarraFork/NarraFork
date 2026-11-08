@@ -35,6 +35,7 @@ const {
 const { narratorService } = await import("../narrator-service");
 const { narratorContext } = await import("../narrator-context");
 const { settings, getSummaryModelContextWindowDetail } = await import("../../lib/settings");
+const catalog = await import("../../lib/model-catalog");
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -177,7 +178,6 @@ describe("compact metadata lookup failure cleanup", () => {
 	const narratorId = "n-metadata";
 	const validModel = "anthropic:claude-haiku-4-5";
 	const originalSummaryModel = settings.agent.summaryModel;
-	const originalCatalog = settings.agent.modelCatalog;
 
 	beforeEach(() => {
 		cleanDb(sqlite);
@@ -205,21 +205,18 @@ describe("compact metadata lookup failure cleanup", () => {
 			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('r-metadata', ?, 'm-metadata', 0)",
 			[narratorId],
 		);
-		// Exercise the real catalog query's empty upstream ID validation, not a
-		// fake provider failure or a replacement metadata resolver.
-		settings.agent.modelCatalog = {
-			schemaVersion: 2,
-			migrationVersion: 2,
-			local: { revision: 1, models: [] },
-			autoApply: false,
-			pinnedVersion: null,
-		};
+		// The catalog accepts any model value, so a lookup failure is injected at the
+		// catalog boundary for this one value; the settings and compact paths stay real.
+		const realProfile = catalog.getEffectiveModelProfile;
+		spyOn(catalog, "getEffectiveModelProfile").mockImplementation((model, options) => {
+			if (model === "anthropic:") throw new Error("catalog lookup failed: upstreamModelId");
+			return realProfile(model, options);
+		});
 		settings.agent.summaryModel = "anthropic:";
 	});
 
 	afterEach(() => {
 		settings.agent.summaryModel = originalSummaryModel;
-		settings.agent.modelCatalog = originalCatalog;
 		mock.restore();
 	});
 
@@ -247,7 +244,7 @@ describe("compact metadata lookup failure cleanup", () => {
 		return marker?.id ?? "";
 	}
 
-	test("history and failed-marker retry both settle a genuine catalog lookup throw", async () => {
+	test("history and failed-marker retry both settle a catalog lookup throw", async () => {
 		expect(() => getSummaryModelContextWindowDetail("anthropic:")).toThrow("upstreamModelId");
 		const generate = spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
 			summary: "Retained history summary",

@@ -2,7 +2,7 @@
 
 > 实现：`server/services/data-portability.ts`（服务层） + `server/routes/storage-transfer.ts`（HTTP）
 > 入口：设置 → 存储空间 →「数据导入 / 导出 / 清空」卡片
-> 测试：`server/services/__tests__/data-portability.test.ts`、`data-portability-edge.test.ts`
+> 测试：`server/services/__tests__/data-portability.test.ts`、`data-portability-edge.test.ts`、`data-portability-prefix.test.ts`
 
 ## 一、为什么这样做（性能取向）
 
@@ -20,37 +20,53 @@
 
 | 文件 | 内容 |
 |---|---|
-| `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`。**新增的表不会自动包含** |
-| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`（**含凭据**） |
-| `manifest.json` | `{ version, exportedAt, counts }`，导入时校验 `version <= 1` |
+| `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`、`narrator_text_snapshots`。**新增的表不会自动包含** |
+| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`autoExcludedProviders`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`。**不含 Key**：所有 `apiKey` 都是空的 |
+| `provider-keys.sealed.json` | 只在导出供应商时出现。导出的每个供应商的**全部** Key（自定义 API 的多 Key 连同标签、开关、网络身份；NUG、TokenDance、Command Code 各一个），按导出方的归属 id 分组，用导出时设置的口令封装（与凭据迁移同一格式：scrypt + AES-256-GCM，口令至少 10 个字符），见 `server/services/data-portability-keys.ts` |
+| `manifest.json` | `{ version, exportedAt, counts }`。有 `provider-keys.sealed.json` 时 `version` 是 2，否则是 1；导入时校验 `version <= 2` |
+
+**导出供应商需要核验**：勾选「供应商」时，要先通过密码 + 两步验证（step-up 用途 `storage.export.providers`），并设置口令。流式导出走 `POST /api/storage/export`，授权和口令都在请求体里；没有文件选择器的浏览器走票据，签发票据时消费 step-up，口令只存在内存里的票据记录中，不进 URL。`GET /api/storage/export?providers=1` 会被拒绝。没有第二因素的账号不能导出供应商，请求和会话照常可以导出。Codex 账号不在数据导出里，只能用凭据迁移搬。
+
+**版本号**：只有带密文的包是 `version: 2`。只含请求和会话的包仍是 1，旧版实例照常能导入；带密文的包在旧版实例上会被拒绝，因为旧版不认识密文，导入只会得到没有 Key 的供应商。
 
 ## 三、导入的合并语义
 
 | 数据 | 规则 |
 |---|---|
 | 请求历史 `api_requests` | 按主键 `INSERT OR IGNORE` 追加（重复 id 跳过）。指向被跳过会话的请求不导入 |
+| 用量日账本 `usage_daily` | 不在快照里。本次新增的请求（rowid 大于导入前基线）按日 / 计费用户 / 项目 / 来源 / 模型汇总后加进账本，一条 SQL 完成；重复导入被主键跳过的请求不会重复计数。旧包没有计费用户与项目时，用会话所有者、再退到发起人 |
 | 会话 `narrators` | 预览列出 id 冲突 → 用户逐条或统一选择**覆盖**或**跳过**；新会话直接插入 |
 | 跳过会话 | 不导入该会话的消息、引用、工具调用、消息块，以及 `narrator_id` 指向它的请求 |
 | 覆盖会话 | 保留会话行（`narrator_messages.narrator_id` 是 NOT NULL，删行会失败），用导入行 `UPDATE` 各列。子行按主键合并，不删除本地的引用、工具调用或消息块 |
 | 消息 `narrator_messages` | `INSERT OR IGNORE`（主键相同的消息被复用，保持 fork 共享语义，不覆盖其它会话内容） |
 | 引用 / 工具调用 | `INSERT OR IGNORE` |
 | 消息块 `narrator_blocks` | `INSERT OR IGNORE`。`body_rows_only = 1` 时正文只在块行里，旧包没有这张表时跳过 |
+| 文本快照 `narrator_text_snapshots` | 会话导出携带完整共享内容库（含 prefix contract、parts、context updates、tools manifest 及其 children）。至少一个会话新增或覆盖时，按 hash `INSERT OR IGNORE` 合并**整包**内容，不按单个会话精确过滤；全跳过或只导入请求时不搬运。旧包缺表时跳过。引用与内容同事务导入，并刷新包内 hash 的 GC 宽限时间（含已有 hash 复用），防止并发 mark/sweep 删掉刚导入的引用 |
 | 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则跳过 |
+| 供应商 Key | 包里有密文且勾选了供应商时必须给口令，否则报 `IMPORT_PASSPHRASE_REQUIRED`；只导请求或会话时不需要。① 在导入事务**之前**解密（scrypt 是异步的，事务是同步的），口令错误报 `BUNDLE_PASSPHRASE`，什么都不写。② 把每个供应商的第一个 Key 放回导入的配置里，所以"同 apiKey + 同 baseUrl 视为同一供应商"的去重照常成立，保存设置时第一个 Key 经投影写进 Key 存储。③ 事务**提交成功之后**，给新加入的自定义 API 供应商写入其余的 Key（按导入后的本地 id，前缀改名后同样正确），并补上第一个 Key 的标签、开关和网络身份。与本地供应商合并的、被跳过的保留本地 Key，不覆盖。Key 存储是事务之外的文件，单个 Key 写入失败只记日志，结果里 `keysFailed` 计数，其余照常写入 |
+| 旧版包（`version: 1`） | `providers.json` 里的明文 Key 照旧导入，不要求口令 |
 | 平台实例 | 同按前缀避让：本地已有同平台同前缀时跳过，前缀被占用则改名后追加 |
-| 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的本地编辑层按 id 合并，`revision` 前进一格。供应商前缀被改名，或同一端点因已存在而跳过但两边前缀不同时，`prefix:model` 的第一段改到新前缀（`openai` 不会误改 `openai-2`） |
+| 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的自定义参数（`modelCatalog.overrides`，存于 `~/.narrafork/model-catalog/overrides.json`）按键合并、导入优先，旧包里的内联本地层按同样规则转成自定义参数；自动更新偏好不随导入改变。供应商前缀被改名，或同一端点因已存在而跳过但两边前缀不同时，`prefix:model` 的第一段改到新前缀（`openai` 不会误改 `openai-2`） |
 
 **列交集**：拷贝与 UPDATE 都按「两库 `PRAGMA table_info` 的交集」生成列清单。这样快照与
 当前库的迁移进度不同（列多了/少了）也能导入——但也意味着**旧快照缺少的新列会用数据库默认值**，
-若新列是 `NOT NULL` 且无默认值，导入会失败（事务回滚，主库不受影响）。
+若新列是 `NOT NULL` 且无默认值，导入会失败（事务回滚，主库不受影响）。覆盖时旧包缺少的列保留本地值。
+例如 nullable `narrators.reply_context`：新包保留完整 `{ locale, replyInUserLanguage }` 或显式 null；旧包新增会话时用 null，覆盖时保留本地值，跳过时不改变本地语言上下文。
+
+文本快照不额外导入或回填 `narrator_block_assets`：现有 GC 同时扫描 legacy 消息正文与 rows-only 块正文，
+并追踪 tools manifest children；导入宽限时间保护扫描已完成、稍后才 sweep 的并发窗口。
 
 ## 四、清空语义
 
-- 分项：`requests`（只删 `api_requests`）、`sessions`（删会话及其消息/引用/工具调用，
+- 分项：`requests`（删 `api_requests` 与按天汇总它的 `usage_daily`）、`sessions`（删会话及其消息/引用/工具调用，
   消息块随消息级联删除；并把 `terminals` / `benchmark_task_results` 的 `narrator_id` 置空，
   保留这些数据本体）、
   `providers`（清空全部供应商配置：含平台实例、隐藏模型、逐模型协议与自定义模型；
-  **不清模型目录**，那里有用户手写的模型卡片）。
+  **不清模型自定义参数**（`overrides.json`），那里是用户手写的数据）。
 - 全量：以上全部。
+- 会话清空仅释放快照的消息/块引用，不直接清空共享 `narrator_text_snapshots`，不误删非会话数据。
+  不再可达的内容由既有 GC 在宽限期后回收；孤儿 manifest 的 children 可能再保留一轮。
+  因此「清空会话」**不等于立即物理擦除文本快照**。
 - **安全**：前端先「确认弹窗」，再「输入当前登录密码」；后端复用登录密码校验
   （`authSessionStore.findPasswordHash` + `Bun.password.verify`），密码错误拒绝执行。
 - 所有操作都在管理员权限（`requireAdmin`）下，导入/清空在单事务里完成，失败整体回滚。
@@ -76,13 +92,16 @@
    ```
    测试覆盖：全链路、导出/预览只读、无效/畸形/缺表/空/损坏快照、重复导入幂等、
    分项清空隔离、逐条混合冲突决策、供应商多次重名、100 会话 / 5000 消息批量、
-   5000 请求性能护栏。
+   5000 请求性能护栏；真实 prefix 导出→空库导入→epoch/updates/tools manifest 恢复（legacy 与 rows-only）、
+   GC mark→导入→sweep 竞态、新旧 `reply_context` 列兼容、清空后的延迟回收。
 
 ## 六、已知边界
 
 - **跨版本导入**依赖「列交集 + 数据库默认值」。如果未来做**破坏性 schema 变更**
   （删列/改类型/改语义），旧快照导入后数据的语义可能不再正确——此时应提升
   `EXPORT_VERSION` 并在 `assertVersion` 里拒绝旧版本包，或提供专门的迁移脚本。
+- 旧导出包若已带 prefix hash、却未携带其文本快照，导入兼容不代表能凭 hash 重建丢失内容；
+  应从仍保留快照的原实例重新导出。本修补不伪造或静默重建旧前缀。
 - 快照是**单文件**：导入期间快照被 ATTACH 使用，预览 token 30 分钟过期后自动清理临时文件。
 - 供应商配置里的凭据（API key）是**明文**导出，导出文件请按敏感文件保管。
 - **下载不进页面内存。** 支持 File System Access API 的浏览器先选保存位置，再把

@@ -6,6 +6,7 @@
  * flight: the main thread measures it when it needs it). Without a Worker (it failed to start,
  * or there is no `Worker`), nothing happens here and bodies are measured where they are needed.
  */
+import { getTypography } from "@shared/pretext-layout/typography";
 import { hasMeasuredKey, type LabelOf, measureKey, storeMeasured } from "./measure";
 import type { MeasureReply, MeasureRequest } from "./measure.worker";
 
@@ -97,13 +98,15 @@ export function prewarmBodies(
 		batch.push({ key, content: it.content, labels });
 	}
 	const jobs: Promise<void>[] = [...earlier];
+	// The setting the keys above were made under (their signature), sent with every batch.
+	const typography = { ...getTypography() };
 	for (let i = 0; i < batch.length; i += BATCH) {
 		const id = ++reqId;
 		const chunk = batch.slice(i, i + BATCH);
 		const job = new Promise<void>((resolve) => waiting.set(id, resolve));
 		for (const it of chunk) inflight.set(it.key, job);
 		jobs.push(job);
-		w.postMessage({ id, items: chunk } satisfies MeasureRequest);
+		w.postMessage({ id, typography, items: chunk } satisfies MeasureRequest);
 		prewarmStats.posted += chunk.length;
 		prewarmStats.batches++;
 	}

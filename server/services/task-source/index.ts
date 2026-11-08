@@ -34,6 +34,7 @@ export type {
 	OpenTaskList,
 	OpenTaskStatus,
 	OpenTaskView,
+	StatusBarView,
 	TaskBackend,
 	TaskStatus,
 	TaskView,

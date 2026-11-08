@@ -1,3 +1,5 @@
+import { mailboxReplyContext } from "@shared/reply-context";
+
 /**
  * agent-runtime/postgres-runtime-queue.ts — the PostgreSQL production adapter for the
  * runtime queue (mailbox + publication outbox atomic write sections).
@@ -1211,6 +1213,9 @@ export function createPostgresRuntimeQueue(
 			);
 		if (!refs[0])
 			throw new Error("Materializer did not persist the recipient ref in this transaction");
+		const replyContext = mailboxReplyContext(row);
+		if (replyContext)
+			await tx.update(narrators).set({ replyContext }).where(eq(narrators.id, row.narratorId));
 		const updated = await tx
 			.update(mailbox)
 			.set({

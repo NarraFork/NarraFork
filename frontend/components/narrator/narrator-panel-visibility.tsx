@@ -69,6 +69,20 @@ export function useNarratorPanelVisible(): boolean {
 	return useContext(NarratorPanelVisibleContext);
 }
 
+/**
+ * Whether a dock panel is shown: every split group's selected tab is visible; only one group owns
+ * focus. Layout and document loading must not wait for api.isActive.
+ */
+export function useDockviewPanelVisible(api: DockviewPanelApi): boolean {
+	const [visible, setVisible] = useState(api.isVisible);
+	useLayoutEffect(() => {
+		setVisible(api.isVisible);
+		const subscription = api.onDidVisibilityChange(() => setVisible(api.isVisible));
+		return () => subscription.dispose();
+	}, [api]);
+	return visible;
+}
+
 export function DockviewNarratorPanelVisibilityProvider({
 	api,
 	children,
@@ -76,14 +90,7 @@ export function DockviewNarratorPanelVisibilityProvider({
 	api: DockviewPanelApi;
 	children: ReactNode;
 }) {
-	// Every split group's selected tab is visible; only one group owns focus.
-	// Layout and document loading must not wait for api.isActive.
-	const [visible, setVisible] = useState(api.isVisible);
-	useLayoutEffect(() => {
-		setVisible(api.isVisible);
-		const subscription = api.onDidVisibilityChange(() => setVisible(api.isVisible));
-		return () => subscription.dispose();
-	}, [api]);
+	const visible = useDockviewPanelVisible(api);
 	return (
 		<NarratorPanelVisibilityProvider value={visible}>{children}</NarratorPanelVisibilityProvider>
 	);

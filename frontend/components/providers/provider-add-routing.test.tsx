@@ -1044,17 +1044,12 @@ describe("provider add nested route", () => {
 			},
 		};
 		queryClient.setQueryData(["admin", "settings"], serverSettings);
-		// Row windows come from the catalog's window endpoint, which reports the platform's value.
-		queryClient.setQueryData(["model-catalog", "window", "tokendance:raw:model"], {
-			revision: 0,
-			info: {
-				model: "tokendance:raw:model",
-				contextWindow: 64000,
-				source: "discovered",
-				inherited: 64000,
-				inheritedSource: "discovered",
-				others: [],
-			},
+		// Row windows come from the catalog's model description, which reports the platform's value.
+		queryClient.setQueryData(["model-catalog", "model", "tokendance:raw:model"], {
+			model: "tokendance:raw:model",
+			matchedVia: "none",
+			modelWideEditable: false,
+			effective: { contextWindow: { value: 64000, origin: "upstream" } },
 		});
 		const complete = spyOn(tokenDanceFlow, "completeTokenDanceCallback").mockResolvedValue(true);
 		restorers.push(() => complete.mockRestore());
@@ -1217,7 +1212,10 @@ describe("provider add nested route", () => {
 		if (!card) throw new Error("Missing TokenDance card");
 		await click(card);
 		// 详情页的「启用」开关同样只写草稿，不直接改连接记录。
-		const toggle = container.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		// The shared "use for auto models" switch sits above it; skip that one.
+		const toggle = container.querySelector<HTMLInputElement>(
+			'input[type="checkbox"]:not([data-auto-participation])',
+		);
 		if (!toggle) throw new Error("Missing detail enable switch");
 		await act(async () => {
 			toggle.dispatchEvent(new Event("click", { bubbles: true }));
@@ -1295,5 +1293,46 @@ describe("provider add nested route", () => {
 		// codex + CommandCode + existing：CommandCode 平台卡加入概览后多一张。
 		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
 		expectNoSave();
+	});
+});
+
+describe("草稿删除供应商", () => {
+	const card = (name: string) =>
+		[...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes(name),
+		);
+
+	test("删除 API key 供应商后卡片立即从概览消失，放弃更改后回来", async () => {
+		await mount("/settings/providers");
+		expect(card("Existing provider")).toBeDefined();
+
+		await act(async () => {
+			await router.navigate({ to: "/settings/providers", search: { provider: "existing" } });
+		});
+		const detail = currentCustomDetail();
+		expect(detail?.provider.id).toBe("existing");
+
+		// 与详情页删除按钮同一条路径：把这条供应商从草稿里去掉。
+		await act(async () => {
+			detail?.onProvidersChange((prev) => prev.filter((provider) => provider.id !== "existing"));
+		});
+
+		// 卡片的数据来自服务端下发的模型分组，草稿删除后必须立刻消失。
+		expect(card("Existing provider")).toBeUndefined();
+		expect(
+			[...container.querySelectorAll('[role="button"]')].map((node) => node.textContent),
+		).toHaveLength(2);
+
+		// 放弃更改：草稿回到快照，URL 仍指向它，于是又落回这条供应商的详情页。
+		const discard = [...container.querySelectorAll("button")].find(
+			(node) => node.textContent === text("unsavedDiscard"),
+		);
+		expect(discard).toBeDefined();
+		await click(discard as Element);
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+
+		// 退回概览，卡片回来。
+		await leaveDetail();
+		expect(card("Existing provider")).toBeDefined();
 	});
 });

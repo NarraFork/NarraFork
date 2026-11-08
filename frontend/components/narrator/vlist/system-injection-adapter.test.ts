@@ -231,14 +231,18 @@ describe("system_injection — the body the reader gets", () => {
 		expect(data.text).not.toContain("excerpt of open tasks");
 	});
 
-	it("projects to Markdown structure (heading + list), not the private line vocabulary", () => {
+	it("projects to PLAIN text: the card paints its body as text, not as Markdown", () => {
+		// The card used to be handed the Markdown projection, so the reader saw its syntax: a
+		// `######` before the headline and a backslash before every escaped character.
 		const data = injectionData({
 			type: "system_injection",
 			source: CARD_SOURCE,
 			body: TASKS_BODY,
 		});
-		expect(data.text).toContain("### ");
-		expect(data.text).toContain("- doing: migrate the queues");
+		expect(data.text).not.toContain("#");
+		expect(data.text).not.toContain("\\");
+		expect(data.text).toContain("Dynamic Spec — 1 open task(s)");
+		expect(data.text).toContain("• doing: migrate the queues · protected");
 	});
 
 	it("falls back to the row text verbatim when the producer supplied no body", () => {
@@ -259,7 +263,7 @@ describe("system_injection — the body the reader gets", () => {
 			source: CARD_SOURCE,
 			bodyJson: TASKS_BODY,
 		});
-		expect(data.text).toContain("- doing: migrate the queues");
+		expect(data.text).toContain("• doing: migrate the queues");
 	});
 
 	it("ignores a malformed body rather than throwing inside a render pass", () => {

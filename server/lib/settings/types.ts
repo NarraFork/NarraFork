@@ -6,6 +6,7 @@
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { RecordingSettings } from "@shared/request-recording";
+import type { SpeechSettings } from "@shared/speech";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
@@ -139,6 +140,11 @@ export interface OpenAIProviderConfig {
 	apiMode?: "responses" | "completions" | "codex";
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header (for org subscriptions). */
 	codexAccountId?: string;
+	/**
+	 * Internal: the installation id a Codex-mode request sends in `client_metadata`, set per
+	 * credential by the Codex provider. Absent = this instance's id. Not persisted.
+	 */
+	codexInstallationId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP (experimental; falls back to HTTP when unavailable). */
 	codexWebSocket?: boolean;
 	/** Codex: allow the native web_search tool to be sent to the model. */
@@ -506,11 +512,17 @@ export interface OidcProviderConfig {
 }
 
 /** 逐模型可选的协议；`agent.modelProtocols` 与 `agent.modelProtocolOverrides` 的值域。 */
-export type ModelProtocol =
-	| "anthropic-messages"
-	| "openai-responses"
-	| "completions-compatible"
-	| "gemini-compatible";
+export const MODEL_PROTOCOLS = [
+	"anthropic-messages",
+	"openai-responses",
+	"completions-compatible",
+	"gemini-compatible",
+] as const;
+export type ModelProtocol = (typeof MODEL_PROTOCOLS)[number];
+
+export function isModelProtocol(value: unknown): value is ModelProtocol {
+	return typeof value === "string" && (MODEL_PROTOCOLS as readonly string[]).includes(value);
+}
 
 export interface TokenDanceSettings {
 	apiKey: string;
@@ -523,6 +535,8 @@ export interface TokenDanceSettings {
 }
 
 export interface NarraForkSettings {
+	/** Independent ASR/TTS providers; absent legacy configurations remain disabled. */
+	speech?: SpeechSettings;
 	/** Backend-only singleton credentials; never return this object to clients. */
 	tokendance?: TokenDanceSettings;
 	/** Tool-triggered local filesystem safety; absent older settings use safe defaults. */
@@ -579,6 +593,11 @@ export interface NarraForkSettings {
 	clientFingerprint?: {
 		installationId?: string;
 		claudeDeviceId?: string;
+	};
+	/** How credential files (e.g. codex-credentials.json) are stored. See lib/secret-store.ts. */
+	secrets?: {
+		/** Encrypt credential files with the instance key in secret.key. Default true. */
+		encrypt?: boolean;
 	};
 	/**
 	 * Unified outbound proxy policy applied to every outbound network channel.
@@ -848,6 +867,11 @@ export interface NarraForkSettings {
 		 * Multi-instance providers use their own `disabled` field instead.
 		 */
 		disabledProviders?: string[];
+		/**
+		 * Provider prefixes left out of `auto:<model>` routing. They still serve values that
+		 * name them (`<prefix>:<model>`); use it for relays whose same-named models may differ.
+		 */
+		autoExcludedProviders?: string[];
 		/** Browser proxy override for new sessions. Absent/"default" = global policy. */
 		browserProxy?: ProxyOverride;
 		/** Explicit pre-approval for Notification.send; never overrides read-only mode. */

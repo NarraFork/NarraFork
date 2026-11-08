@@ -57,6 +57,11 @@ export function isRecentTabBackgroundActive(
 	);
 }
 
+/** Tab types whose `subtitle` is a working directory. */
+export function hasDirectorySubtitle(tab: Pick<RecentTab, "type">): boolean {
+	return tab.type === "narrator" || tab.type === "subagent";
+}
+
 export function clampRecentTabText(value: string | null | undefined): string | undefined {
 	if (value == null) return undefined;
 	if (!value) return value;
@@ -292,7 +297,7 @@ export function reconcileRecentTabsRuntimePatches(
 
 function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "project") return pathname === `/projects/${tab.id}`;
-	if (tab.type === "workspace") return pathname === `/narrators/workspace/${tab.id}`;
+	if (tab.type === "folder") return false;
 	return pathname === `/narrators/${tab.id}`;
 }
 
@@ -353,8 +358,9 @@ export function buildRecentTabUpsert(tab: AddRecentTabInput): RecentTab & { upda
  * `status` and `lastVisitedAt` are deliberately excluded: live status reaches the tab
  * over the narrator WS and the runtime endpoint (which both override the persisted
  * column), so re-sending it buys nothing, and `lastVisitedAt` does not affect ordering
- * on a revisit. Every other persisted field is included, so a real title/cwd/workspace
- * change is still written through.
+ * on a revisit. Every other persisted field is included, so a real title/cwd change is
+ * still written through. Folder membership is not sent by a visit (it only changes
+ * through the folder endpoints), so it is not part of the signature.
  */
 export function recentTabVisitSignature(tab: AddRecentTabInput): string {
 	return JSON.stringify([
@@ -362,7 +368,6 @@ export function recentTabVisitSignature(tab: AddRecentTabInput): string {
 		tab.id,
 		tab.narratorId ?? null,
 		tab.parentNarratorId ?? null,
-		tab.workspaceId ?? null,
 		clampRecentTabText(tab.title) ?? "",
 		clampRecentTabText(tab.subtitle) ?? null,
 		tab.pinned ?? null,

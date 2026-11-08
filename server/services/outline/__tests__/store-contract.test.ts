@@ -23,14 +23,16 @@ import { generateId } from "../../../lib/id";
 import { chunked, type OutlineVersionRow } from "../store/port";
 import { MAIN_THREAD_PAGE_ROWS } from "../store/sqlite-read";
 import { sqliteOutlineStore } from "../store/sqlite-store";
-import { OUTLINE_STORE_CONTRACT, type OutlineContractContext } from "./contract";
+import { OUTLINE_STORE_CONTRACT } from "./contract";
+import { OUTLINE_DIGEST_CONTRACT, type OutlineDigestContractContext } from "./digest-contract";
 import { OUTLINE_PENDING_CONTRACT } from "./pending-contract";
+import { OUTLINE_QUESTION_CONTRACT } from "./question-contract";
 import { OUTLINE_READ_CONTRACT } from "./read-contract";
 import { OUTLINE_TASK_CONTRACT } from "./task-contract";
 
 const NOW = "2026-10-26T00:00:00.000Z";
 
-const ctx: OutlineContractContext = {
+const ctx: OutlineDigestContractContext = {
 	store: sqliteOutlineStore,
 	randomTransactions: 80,
 	async seedUser() {
@@ -113,6 +115,12 @@ const ctx: OutlineContractContext = {
 			.delete(outlineTaskClaims)
 			.where(inArray(outlineTaskClaims.taskBlockId, [...taskBlockIds]));
 	},
+	async setLastCommitAt(spaceId, value) {
+		await db
+			.update(outlineSpaces)
+			.set({ lastCommitAt: value })
+			.where(eq(outlineSpaces.id, spaceId));
+	},
 	async searchContent(needle) {
 		const rows = sqlite
 			.prepare(
@@ -139,6 +147,18 @@ describe("outline task contract (SQLite)", () => {
 
 describe("outline pending contract (SQLite)", () => {
 	for (const contractCase of OUTLINE_PENDING_CONTRACT) {
+		test(contractCase.name, () => contractCase.run(ctx), 120_000);
+	}
+});
+
+describe("outline question contract (SQLite)", () => {
+	for (const contractCase of OUTLINE_QUESTION_CONTRACT) {
+		test(contractCase.name, () => contractCase.run(ctx), 120_000);
+	}
+});
+
+describe("outline digest contract (SQLite)", () => {
+	for (const contractCase of OUTLINE_DIGEST_CONTRACT) {
 		test(contractCase.name, () => contractCase.run(ctx), 120_000);
 	}
 });
@@ -268,6 +288,42 @@ describe("SQLite specifics", () => {
 		expect(rendered?.blockIds).toHaveLength(80);
 		expect(rendered?.truncated).toBe(true);
 	}, 120_000);
+
+	test("the reports' statements use their indexes", () => {
+		const plan = (query: string) =>
+			(sqlite.prepare(`EXPLAIN QUERY PLAN ${query}`).all() as Array<{ detail: string }>)
+				.map((r) => r.detail)
+				.join("\n");
+		expect(
+			plan(
+				`SELECT id FROM outline_spaces WHERE last_commit_at >= 'x' AND (last_commit_at, id) > ('x', 'a') ORDER BY last_commit_at, id LIMIT 5`,
+			),
+		).toContain("idx_outline_spaces_last_commit");
+		// Either index serves the spaces still to stamp (both start at `last_commit_at IS NULL`).
+		const unstamped = plan(
+			`SELECT id FROM outline_spaces WHERE "last_commit_at" IS NULL AND "next_seq" > 1 ORDER BY id LIMIT 5`,
+		);
+		expect(unstamped).toMatch(/idx_outline_spaces_(unstamped|last_commit)/);
+		expect(unstamped).not.toMatch(/SCAN outline_spaces\b/);
+		const range = plan(
+			`SELECT c.seq, v.block_id FROM outline_commits c JOIN outline_block_versions v ON v.commit_id = c.id WHERE c.space_id = 's' AND c.seq > 3 AND c.seq <= 9 ORDER BY c.seq, v.block_id LIMIT 5`,
+		);
+		expect(range).toContain("uq_outline_commits_space_seq");
+		expect(range).toContain("idx_outline_versions_commit");
+		expect(
+			plan(
+				`SELECT id FROM outline_digests WHERE user_id = 'u' AND "seen_at" IS NULL ORDER BY period_key DESC LIMIT 8`,
+			),
+		).toContain("idx_outline_digests_unseen");
+		expect(
+			plan(
+				`SELECT id FROM outline_digests WHERE user_id = 'u' AND kind = 'daily' AND period_key < 'k' ORDER BY period_key DESC LIMIT 8`,
+			),
+		).toContain("uq_outline_digests_user_period");
+		expect(plan(`SELECT id FROM outline_pending WHERE decision_commit_id IN ('a', 'b')`)).toContain(
+			"uq_outline_pending_decision_commit",
+		);
+	});
 
 	test("history, timeline and search statements use their indexes", () => {
 		const plan = (query: string) =>

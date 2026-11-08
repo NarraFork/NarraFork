@@ -23,10 +23,17 @@
 
 import type { CSSProperties } from "react";
 
-/** Added / removed line totals for one file-tool call. */
+/**
+ * Added / removed line totals for one file-tool call.
+ *
+ * An outline edit (`OutlineEdit`) reports blocks instead of lines, and two figures of its own:
+ * tasks it ticked done (`✓1`) and its commit (`#6`), so the header reads `✓1 +3 #6`.
+ */
 export interface DiffStatsValue {
 	added: number;
 	removed: number;
+	done?: number;
+	commit?: number;
 }
 
 /**
@@ -50,6 +57,7 @@ const CONTAINER_STYLE: CSSProperties = {
 };
 
 const ADDED_STYLE: CSSProperties = { color: "var(--mantine-color-green-5)" };
+const COMMIT_STYLE: CSSProperties = { color: "var(--mantine-color-dimmed)" };
 const REMOVED_STYLE: CSSProperties = { color: "var(--mantine-color-red-5)" };
 
 /**
@@ -62,7 +70,9 @@ export function hasVisibleDiffStats(
 	stats: DiffStatsValue | null | undefined,
 ): stats is DiffStatsValue {
 	if (!stats) return false;
-	return stats.added > 0 || stats.removed > 0;
+	return (
+		stats.added > 0 || stats.removed > 0 || (stats.done ?? 0) > 0 || stats.commit !== undefined
+	);
 }
 
 /**
@@ -88,12 +98,19 @@ export function DiffStatsText({ stats }: { stats: DiffStatsValue | null | undefi
 			// figure that visually reads `+240` describes a number the sighted reader is
 			// not shown, which is the kind of divergence that makes a label untrustworthy.
 			aria-label={[
+				(stats.done ?? 0) > 0 ? `✓${stats.done}` : null,
 				stats.added > 0 ? `+${stats.added}` : null,
 				stats.removed > 0 ? `-${stats.removed}` : null,
+				stats.commit !== undefined ? `#${stats.commit}` : null,
 			]
 				.filter(Boolean)
 				.join(" ")}
 		>
+			{(stats.done ?? 0) > 0 ? (
+				<span data-nf-diff-done style={ADDED_STYLE}>
+					✓{stats.done}
+				</span>
+			) : null}
 			{stats.added > 0 ? (
 				<span data-nf-diff-added style={ADDED_STYLE}>
 					+{stats.added}
@@ -102,6 +119,11 @@ export function DiffStatsText({ stats }: { stats: DiffStatsValue | null | undefi
 			{stats.removed > 0 ? (
 				<span data-nf-diff-removed style={REMOVED_STYLE}>
 					-{stats.removed}
+				</span>
+			) : null}
+			{stats.commit !== undefined ? (
+				<span data-nf-diff-commit style={COMMIT_STYLE}>
+					#{stats.commit}
 				</span>
 			) : null}
 		</span>

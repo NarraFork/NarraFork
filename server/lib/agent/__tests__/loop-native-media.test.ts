@@ -9,6 +9,7 @@ import {
 	type NativeMediaInput,
 } from "@shared/media-attachments";
 import { z } from "zod/v4";
+import { AppError } from "../../errors";
 import {
 	deleteUploadedMedia,
 	getMediaPath,
@@ -506,5 +507,61 @@ describe("native media survives the public main transcript loop", () => {
 		expect(calls).toEqual([]);
 		expect(projectedRows).toEqual([]);
 		expect(warnings).toEqual([]);
+	});
+});
+
+describe("runtime model-switch request preparation", () => {
+	test.each([
+		new AppError("Conversation identity changed", 409),
+		new Error("Identity storage unavailable"),
+	])("propagates preflight failure without dispatching the prepared first attempt: %s", async (failure) => {
+		useTool = false;
+		let preparations = 0;
+		await expect(
+			run([], {
+				hostBuilt: true,
+				config: {
+					getRuntimeSettingsOverride: async () => ({ model: "test:changed" }),
+					onBeforeTurn: async (_turn, options) => {
+						expect(options).toEqual({ force: true, cause: "model_switch" });
+						preparations++;
+						throw failure;
+					},
+				},
+			}),
+		).rejects.toBe(failure);
+		expect(preparations).toBe(1);
+		expect(calls).toHaveLength(0);
+	});
+});
+
+describe("provider request admission without prefix hooks", () => {
+	test("awaits admission again for each tool turn", async () => {
+		await durableProbe();
+		let admissions = 0;
+		await run([], {
+			config: {
+				beforeProviderRequest: async () => {
+					expect(calls).toHaveLength(admissions);
+					admissions++;
+				},
+			},
+		});
+		expect(calls).toHaveLength(2);
+		expect(admissions).toBe(2);
+	});
+
+	test("propagates admission failure before any provider dispatch", async () => {
+		const failure = new AppError("Conversation identity changed", 409);
+		await expect(
+			run([], {
+				config: {
+					beforeProviderRequest: async () => {
+						throw failure;
+					},
+				},
+			}),
+		).rejects.toBe(failure);
+		expect(calls).toHaveLength(0);
 	});
 });

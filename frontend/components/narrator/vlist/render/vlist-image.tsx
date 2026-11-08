@@ -6,7 +6,8 @@
  *
  *   1. a ready-to-use `previewUrl` (blob:/http[s]/data:)          → use directly
  *   2. a server file path (`filePath`) via /api/fs/preview        → blob fetch
- *   3. an uploaded image id (`imageId` + narratorId) via /api/uploads → blob fetch
+ *   3. an uploaded image id (`imageId` + narratorId) via /api/uploads → blob fetch,
+ *      naming the panel narrator as the reference context when it is not the owner
  *
  * The image is painted inside a FIXED box whose height the measure layer already
  * reserved (media cap = contentPx), so async loading never shifts layout — the
@@ -19,7 +20,7 @@
  */
 
 import { useUploadCapability } from "@frontend/hooks/usePlatform";
-import { clearTokenOnSessionFailure, getToken } from "@frontend/lib/api";
+import { clearTokenOnSessionFailure, getToken, getUploadedImageUrl } from "@frontend/lib/api";
 import { apiUrl, resolveServerUrl } from "@frontend/lib/base-path";
 import { useCallback, useEffect, useState } from "react";
 import { useImageViewer } from "../../../common/image-viewer-context";
@@ -199,7 +200,8 @@ export function useResolvedImageSrc(
 		if (filePath) {
 			url = `${apiUrl("/fs/preview")}?path=${encodeURIComponent(filePath)}`;
 		} else if (imageId && uploadNarratorId) {
-			url = apiUrl(`/uploads/${uploadNarratorId}/${imageId}`);
+			// The panel narrator is the reference context for an image a fork inherited.
+			url = getUploadedImageUrl(uploadNarratorId, imageId, narratorId);
 		} else if (fetchUrl) {
 			url = apiUrl(fetchUrl);
 		}
@@ -232,7 +234,7 @@ export function useResolvedImageSrc(
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [direct, filePath, imageId, uploadNarratorId, fetchUrl, supported]);
+	}, [direct, filePath, imageId, uploadNarratorId, narratorId, fetchUrl, supported]);
 
 	const src = direct ?? blobUrl;
 	/**

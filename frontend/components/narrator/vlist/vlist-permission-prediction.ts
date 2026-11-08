@@ -20,14 +20,24 @@
  *
  * Mirrors the regions `InlinePermission` paints for a NON-AskUserQuestion request, in
  * its order: the execution-target block (not for ExitPlanMode), StructSed's preview
- * loading row, the decision reason, the feedback box (one row: the draft restore is
+ * loading row, the decision reason, the feedback box (empty: the draft restore is
  * sessionStorage-only and invisible here), and the button bar. Wrapped line counts are
  * estimated from character counts against the card's inner width — the prediction
- * only has to be close; the reading makes it exact.
+ * only has to be close; the reading makes it exact. A few short strings are measured with
+ * pretext as painted instead, so a card is predicted as well at phone width as at any other:
+ * the feedback box's placeholder, since an empty autosize box is as tall as its placeholder,
+ * which wraps in a narrow card at a large font size (outline P2 PR 8b review round 1; every
+ * card since D49 review round 1, when the box's text began to follow that size); and an
+ * outline plan's decision labels.
  *
  * Pure: no DOM, no React.
  */
 
+import { measureLineStats, measureNaturalWidth } from "@chenglou/pretext";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
+import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
+import { FONT_WEIGHT, SANS_FAMILY, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
+import { letterSpacingPxFor } from "@shared/pretext-layout/typography";
 import type { PendingPermission } from "../narrator-panel-types";
 import type { InlinePermissionData } from "./measure/measure-permission";
 
@@ -78,11 +88,136 @@ export function estimateLines(text: string, width: number): number {
 }
 const MAX_SCAN = 4_000;
 
+/** Mantine `Button size="sm"`: 18px side padding plus a 1px border, on each side. */
+const SM_BUTTON_CHROME = (18 + 1) * 2;
+/** PermButtonBar's `Group gap="sm"`. */
+const BUTTON_GAP = 12;
+/** The keyboard default's "⏎" hint (an xs span, 4px margin): one button carries it. */
+const FOCUS_HINT_ALLOWANCE = 16;
+/**
+ * Semibold advance per em, for the estimate: latin ≈ 0.6em; a wide character, and the "…" the
+ * labels end with, ≈ 1em (measured in Chromium: the sm chrome is a constant 38px at every scale).
+ */
+const LATIN_EM = 0.6;
+const ELLIPSIS = 0x2026;
+
+/** The outline plan's decisions, in the bar's order, when the caller passes no labels. */
+export const OUTLINE_PLAN_BUTTON_LABELS = ["Execute as draft", "Lock and execute…", "Return"];
+
+/** A plain approval's feedback placeholder, when the caller passes none (en). */
+export const FEEDBACK_PLACEHOLDER = "Feedback to model (optional)";
+
+/** The outline plan's feedback placeholder, when the caller passes none (en). */
+export const OUTLINE_PLAN_FEEDBACK_PLACEHOLDER =
+	"Feedback for the agent (sent when you return the plan)";
+
+/** The "⏎" hint's left margin (`ml={4}`). */
+const FOCUS_HINT_MARGIN = 4;
+
+/**
+ * One line of `text` in `font`, measured by pretext (canvas), or null where text cannot be
+ * measured (no canvas: the char-count estimate stands in).
+ */
+function measuredWidth(text: string, font: string, letterSpacing: number): number | null {
+	try {
+		return measureNaturalWidth(
+			getPreparedTextWithSegments(text, font, undefined, letterSpacing || undefined),
+		);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Rows a `PermButtonBar` wraps to at `width`: each button's label at the sm size (semibold, as
+ * Mantine's Button paints it) plus its chrome, flowed left to right with the group's gap. The
+ * labels are measured as painted (outline P2 PR 8b review round 1: a 0.6em-per-letter estimate
+ * put a whole extra row on the English bar at 130%); without a canvas, estimated by character.
+ * The first button carries the focus hint.
+ */
+export function estimateButtonRows(
+	labels: readonly string[],
+	width: number,
+	fontSize: number,
+): number {
+	let rows = 1;
+	let used = 0;
+	const font = `${FONT_WEIGHT.medium} ${fontSize}px ${SANS_FAMILY}`;
+	const spacing = letterSpacingPxFor(fontSize);
+	const xs = typographyMetrics();
+	const hint = measuredWidth("⏎", xs.font.xs, xs.letterSpacing.xs);
+	const hintWidth = hint === null ? FOCUS_HINT_ALLOWANCE : Math.ceil(hint) + FOCUS_HINT_MARGIN;
+	labels.forEach((label, i) => {
+		const measured = measuredWidth(label, font, spacing);
+		let text: number;
+		if (measured !== null) text = Math.ceil(measured);
+		else {
+			let em = 0;
+			for (let c = 0; c < label.length; c++) {
+				const code = label.charCodeAt(c);
+				em += isWide(code) || code === ELLIPSIS ? 1 : LATIN_EM;
+			}
+			text = Math.ceil(em * fontSize);
+		}
+		const button = Math.min(width, text + SM_BUTTON_CHROME + (i === 0 ? hintWidth : 0));
+		if (used > 0 && used + BUTTON_GAP + button > width) {
+			rows += 1;
+			used = button;
+		} else {
+			used += (used > 0 ? BUTTON_GAP : 0) + button;
+		}
+	});
+	return rows;
+}
+
+/** Mantine `Textarea size="xs"`: 10px padding plus a 1px border, on each side. */
+const XS_TEXTAREA_HORIZONTAL_CHROME = (10 + 1) * 2;
+
+/**
+ * Rows an empty autosized feedback box (1 to 3) paints at `width`: its placeholder wrapped in
+ * the xs font (an empty autosize textarea is as tall as its placeholder; review round 1: the
+ * English one wraps to two rows at phone width). Measured by pretext; estimated without a canvas.
+ */
+export function estimatePlaceholderRows(placeholder: string, width: number): number {
+	const content = Math.max(1, width - XS_TEXTAREA_HORIZONTAL_CHROME);
+	const metrics = typographyMetrics();
+	let lines: number;
+	try {
+		lines = measureLineStats(
+			getPreparedTextWithSegments(
+				placeholder,
+				metrics.font.xs,
+				"pre-wrap",
+				metrics.letterSpacing.xs || undefined,
+			),
+			content,
+		).lineCount;
+	} catch {
+		lines = estimateLines(placeholder, content);
+	}
+	return Math.min(3, Math.max(1, lines));
+}
+
 export interface PermissionPredictionContext {
 	/** The card's inner width (px) — what the form wraps against. */
 	innerWidth: number;
 	/** Whether the reader may decide here (else the form shows a read-only note). */
 	canDecide: boolean;
+	/**
+	 * The outline plan's decision labels as the reader sees them (their language decides the
+	 * bar's wrap at phone width); {@link OUTLINE_PLAN_BUTTON_LABELS} when absent.
+	 */
+	planButtonLabels?: readonly string[];
+	/**
+	 * The outline plan's feedback placeholder as the reader sees it (it decides the empty box's
+	 * rows); {@link OUTLINE_PLAN_FEEDBACK_PLACEHOLDER} when absent.
+	 */
+	planFeedbackPlaceholder?: string;
+	/**
+	 * Every other card's feedback placeholder as the reader sees it (it decides the empty box's
+	 * rows); {@link FEEDBACK_PLACEHOLDER} when absent.
+	 */
+	feedbackPlaceholder?: string;
 }
 
 /**
@@ -95,6 +230,30 @@ export function predictInlinePermission(
 	ctx: PermissionPredictionContext,
 ): InlinePermissionData | null {
 	if (permission.toolName === "AskUserQuestion") return null;
+	// An outline session's plan (outline P2 PR 8): summary lines, the feedback box and the
+	// buttons, which wrap at phone width (review round 1 U1).
+	const plan =
+		permission.toolName === "ExitPlanMode"
+			? outlinePlanSubmissionOf(permission.inputJson as Record<string, unknown> | undefined)
+			: null;
+	if (plan) {
+		return {
+			readOnly: !ctx.canDecide,
+			isExitPlanMode: true,
+			outlinePlanSummaryRows: plan.summary ? 2 : 1,
+			feedbackRows: estimatePlaceholderRows(
+				ctx.planFeedbackPlaceholder ?? OUTLINE_PLAN_FEEDBACK_PLACEHOLDER,
+				ctx.innerWidth,
+			),
+			buttonRows: ctx.canDecide
+				? estimateButtonRows(
+						ctx.planButtonLabels ?? OUTLINE_PLAN_BUTTON_LABELS,
+						ctx.innerWidth,
+						typographyMetrics().size.sm,
+					)
+				: 1,
+		};
+	}
 	const isExitPlanMode = permission.toolName === "ExitPlanMode";
 	const target = permission.executionTarget ?? permission.executionTargets?.[0];
 	const deviceId = target?.deviceId ?? permission.executionDeviceId;
@@ -119,7 +278,12 @@ export function predictInlinePermission(
 			permission.toolName === "StructSed" && !!(permission.ownerNarratorId && permission.toolUseId),
 		hasDecisionReason: reason.length > 0,
 		decisionReasonLines: estimateLines(reason, ctx.innerWidth),
-		feedbackRows: 1,
+		// In the transcript the box's text follows the reader's font size (D49), so its placeholder
+		// wraps at a large one in a narrow card (D49 review round 1 S1).
+		feedbackRows: estimatePlaceholderRows(
+			ctx.feedbackPlaceholder ?? FEEDBACK_PLACEHOLDER,
+			ctx.innerWidth,
+		),
 		buttonRows: 1,
 	};
 }

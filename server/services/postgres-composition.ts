@@ -36,6 +36,7 @@ import { setAuthStores } from "./auth/store";
 import { createPostgresKnowledgeReadStore } from "./knowledge/postgres-read-store";
 import { createPostgresKnowledgeWriteStore } from "./knowledge/postgres-write-store";
 import { setKnowledgeReadStore, setKnowledgeWriteStore } from "./knowledge/store";
+import { setMigrationPgHandle } from "./migration-db";
 import { createPostgresNarratorMessageRefsPort } from "./narrator-refs/postgres-store";
 import { bindNarratorMessageRefs } from "./narrator-refs/store";
 import {
@@ -59,6 +60,8 @@ import { bindPostgresSearchClient } from "./search/postgres-store";
  */
 export function composePostgresStores(runtime: PostgresRuntime): void {
 	const db = runtime.client.db;
+	// Startup migrations (aggregation values, reserved `auto` prefix) use this handle too.
+	setMigrationPgHandle(db);
 	setRegistrationAccountStore(createPostgresRegistrationAccountStore(db));
 	// The auth loop (login lookup, session gate, MFA factors, token-generation revocation)
 	// is one store pair over the same handle: a deployment can never register an account

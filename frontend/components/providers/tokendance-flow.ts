@@ -32,6 +32,8 @@ export function restoreTokenDanceDraft(
 		initialized: true,
 		hiddenModels: new Set(draft.hiddenModels),
 		disabledProviders: new Set(draft.disabledProviders),
+		// A draft stored before this field existed has none.
+		autoExcludedProviders: new Set(draft.autoExcludedProviders ?? []),
 	};
 	return rebaseProviderState(local, snapshot.baseline as unknown as SavedSnapshot, fresh);
 }

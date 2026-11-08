@@ -26,6 +26,15 @@ const RETIRED = [
 	"ModelCatalogSnapshot",
 	"rawLocalToLegacy",
 	"reconcileLegacyWindowSettings",
+	// The editable raw local layer (variants, bindings, revisioned mutations) it replaced.
+	"createModelCardResolver",
+	"createModelIdentityResolver",
+	"mutateModelCard",
+	"getModelCardSnapshot",
+	"ModelCardMutation",
+	"ModelCardSnapshot",
+	"RawLocalState",
+	"RawBinding",
 ];
 
 function sources(): string[] {

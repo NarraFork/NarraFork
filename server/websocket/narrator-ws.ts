@@ -63,7 +63,7 @@ import {
 	clearBufferedMessageSoftStopIfIdle,
 	clearBufferedMessages,
 	getBufferedMessagesAsync,
-	isOutlineSessionGoal,
+	isRefusedOutlineGoal,
 	pushBufferedMessage,
 	removeBufferedMessage,
 	resolveDecisionNarratorId,
@@ -504,7 +504,7 @@ export function* toolInputFrames(message: ToolInputChunkMessage): Generator<stri
 type InputLaneSocket = Pick<NarratorWS, "send" | "close" | "getBufferedAmount">;
 const INPUT_LANE_BACKLOG_BYTES = 256 * 1024;
 
-/** What a `/goal` queued over this socket for an outline session is answered with (English, as the
+/** What a `/goal` queued over this socket for an outline subagent is answered with (English, as the
  * socket's other errors; the HTTP admission carries the localized catalog code). */
 const OUTLINE_GOAL_REFUSAL = ERROR_CATALOG.GOAL_IN_OUTLINE_SESSION.en;
 
@@ -1542,27 +1542,55 @@ export function broadcastToUser(userId: string, data: NarratorServerMessage): vo
 }
 
 let humanAttentionBroadcastTimer: ReturnType<typeof setTimeout> | undefined;
+/** When the pending wake-up fires (epoch ms). */
+let humanAttentionDueAt = 0;
+/** People a coalesced wake-up concerns; null: everyone (an untargeted change came in). */
+let humanAttentionTargets: Set<string> | null = new Set();
+/** Wake-ups for outline pending changes: coalesced over a longer window (review S10). */
+const OUTLINE_PENDING_ATTENTION_MS = 1_000;
 
-/** A bounded, data-free wake-up for inboxes, including sessions absent from RecentTabs. */
-function scheduleHumanAttentionBroadcast(): void {
-	if (humanAttentionBroadcastTimer) return;
+/**
+ * A bounded, data-free wake-up for inboxes, including sessions absent from RecentTabs. With
+ * `userIds` (an outline question's recipients) only those people's sockets are told; any
+ * untargeted change in the same window tells everyone. A wake-up due sooner than the pending one
+ * brings it forward (review N-c): an open outline-pending window never delays a permission
+ * request or a question past its own short delay.
+ */
+function scheduleHumanAttentionBroadcast(event?: { userIds?: string[] }, delayMs = 50): void {
+	if (event?.userIds) {
+		if (humanAttentionTargets) for (const id of event.userIds) humanAttentionTargets.add(id);
+	} else humanAttentionTargets = null;
+	const due = Date.now() + delayMs;
+	if (humanAttentionBroadcastTimer) {
+		if (due >= humanAttentionDueAt) return;
+		clearTimeout(humanAttentionBroadcastTimer);
+	}
+	humanAttentionDueAt = due;
 	humanAttentionBroadcastTimer = setTimeout(() => {
 		humanAttentionBroadcastTimer = undefined;
+		const targets = humanAttentionTargets;
+		humanAttentionTargets = new Set();
 		const payload = JSON.stringify({ type: HUMAN_ATTENTION_CHANGED_WS_TYPE });
 		for (const ws of connections) {
 			if (!ws.data.userId) continue;
+			if (targets && !targets.has(ws.data.userId)) continue;
 			try {
 				ws.send(payload);
 			} catch {
 				removeConnection(ws);
 			}
 		}
-	}, 50);
+	}, delayMs);
 }
 
 // A separate key also registers the new bridge when an older WS module was hot-loaded.
 if (hotOnce("narrafork.humanAttentionWs.listenersRegistered")) {
-	eventBus.on("human_attention:changed", scheduleHumanAttentionBroadcast);
+	eventBus.on("human_attention:changed", (event) => scheduleHumanAttentionBroadcast(event));
+	// A change waiting for a locker's confirmation is in their inbox (outline P2 PR 7). The event
+	// does not name the locker, so everyone reads again, coalesced over a second.
+	eventBus.on("outline:pending", () =>
+		scheduleHumanAttentionBroadcast(undefined, OUTLINE_PENDING_ATTENTION_MS),
+	);
 	// Deleting history can cascade-delete an async question without calling its
 	// decision service. The frame is emitted after the history change commits.
 	eventBus.on("narrator:message_broadcast", ({ message }) => {
@@ -2139,9 +2167,9 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
-				// A session whose tasks live in the outline has no /goal yet (plan PR 5): refused
-				// before anything is queued, as the HTTP admission refuses it.
-				if (await isOutlineSessionGoal(msg.narratorId, bufferText, commandText)) {
+				// An outline subagent has no tasks of its own to add a /goal to: refused before
+				// anything is queued, as the HTTP admission refuses it.
+				if (await isRefusedOutlineGoal(msg.narratorId, bufferText, commandText)) {
 					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
 					break;
 				}
@@ -2203,7 +2231,7 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_buffer": {
-				if (await isOutlineSessionGoal(msg.narratorId, msg.text)) {
+				if (await isRefusedOutlineGoal(msg.narratorId, msg.text)) {
 					safeSend(ws, { type: "error", message: OUTLINE_GOAL_REFUSAL });
 					break;
 				}

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { RawMetadata } from "@shared/model-catalog/card";
 import { modelProfile } from "@shared/model-catalog/profile";
-import { setNugCachedModels } from "../../nug-model-cache";
+import { replaceModelOverridesForTests } from "../../model-catalog";
+import { deleteNugCachedModels, setNugCachedModels } from "../../nug-model-cache";
 import { withSearchExecutionScope } from "../../search/execution-scope";
 import {
 	supportsNativeSearch,
@@ -32,9 +33,15 @@ const config = {
 	baseUrl: "https://example.invalid/v1",
 	defaultModel: "opaque",
 };
-const model = `${config.prefix}:opaque`;
+/**
+ * Catalog-shaped metadata (fixed/budget reasoning modes, explicit unsupported reasoning,
+ * output modalities) for a model the catalog does not know reaches the runtime only as a
+ * gateway card. A gateway entry registered under the provider entry's id makes this model
+ * value resolve through such a card; the request itself goes through each test's adapter.
+ */
+const model = `${config.prefix}:chan:opaque`;
 const originalFetch = globalThis.fetch;
-let savedCatalog: typeof settings.agent.modelCatalog;
+let restoreOverrides: () => void = () => {};
 let savedOpenAI: typeof settings.openaiProviders;
 let savedAnthropic: typeof settings.anthropicProviders;
 let savedNug: typeof settings.nugProviders;
@@ -42,25 +49,19 @@ let savedFingerprint: typeof settings.clientFingerprint;
 let savedSearch: typeof settings.search;
 let requests: Record<string, any>[] = [];
 function setMetadata(metadata: RawMetadata): void {
-	settings.agent.modelCatalog = {
-		schemaVersion: 2,
-		migrationVersion: 2,
-		autoApply: false,
-		pinnedVersion: null,
-		local: {
-			revision: 101,
-			models: [{ id: "runtime-card", metadata: {} }],
-			bindings: [
-				{
-					id: "runtime-binding",
-					providerId: config.id,
-					upstreamModelId: "opaque",
-					modelId: "runtime-card",
-					overrides: metadata,
-				},
-			],
+	settings.nugProviders = [
+		...(savedNug ?? []).filter((entry) => entry.id !== config.id),
+		{ ...config },
+	];
+	setNugCachedModels(config.id, [
+		{
+			id: "chan:opaque",
+			channel: "chan",
+			channelType: "chan",
+			model: "opaque",
+			modelCard: { schemaVersion: 2, metadata },
 		},
-	};
+	]);
 }
 function params(extra: Partial<ChatParams> = {}): ChatParams {
 	return {
@@ -100,7 +101,6 @@ async function captureGenerate(
 	return requests.at(-1)!;
 }
 beforeEach(() => {
-	savedCatalog = settings.agent.modelCatalog;
 	savedOpenAI = settings.openaiProviders;
 	savedAnthropic = settings.anthropicProviders;
 	savedNug = settings.nugProviders;
@@ -127,7 +127,9 @@ beforeEach(() => {
 	}) as typeof fetch;
 });
 afterEach(() => {
-	settings.agent.modelCatalog = savedCatalog;
+	restoreOverrides();
+	restoreOverrides = () => {};
+	deleteNugCachedModels(config.id);
 	settings.openaiProviders = savedOpenAI;
 	settings.anthropicProviders = savedAnthropic;
 	settings.nugProviders = savedNug;
@@ -196,7 +198,7 @@ describe("metadata policy", () => {
 
 describe("actual provider request bodies", () => {
 	for (const apiMode of ["completions", "responses", "codex"] as const) {
-		test(`OpenAI ${apiMode} chat and both utility paths enforce binding output/reasoning`, async () => {
+		test(`OpenAI ${apiMode} chat and both utility paths enforce declared output/reasoning`, async () => {
 			const provider = new OpenAIProvider({ ...config, apiMode, codexWebSocket: false });
 			const body = await captureChat(provider, { reasoningEffort: "none", maxOutputTokens: 20000 });
 			if (apiMode === "completions") {
@@ -243,7 +245,7 @@ describe("actual provider request bodies", () => {
 			expect(body.reasoning.effort).toBe("high");
 		}
 	});
-	test("Anthropic chat and utility max_tokens use the same binding and legal thinking budget", async () => {
+	test("Anthropic chat and utility max_tokens use the same declared cap and legal thinking budget", async () => {
 		const provider = new AnthropicProvider(config);
 		const body = await captureChat(provider, { reasoningEffort: "none" });
 		expect(body.max_tokens).toBe(2300);
@@ -461,19 +463,15 @@ describe("actual provider request bodies", () => {
 		expect(body.output_config).toBeUndefined();
 	});
 	for (const channelType of ["openai", "responses", "codex", "anthropic"]) {
-		test(`NUG ${channelType} delegate retains channel binding capabilities`, async () => {
+		test(`NUG ${channelType} delegate retains the entry's own override`, async () => {
 			const nugConfig = { ...config, id: "runtime-nug", prefix: "runtime-nug" };
 			settings.nugProviders = [...(savedNug ?? []), nugConfig];
 			setNugCachedModels(nugConfig.id, [
 				{ id: "channel:opaque", channel: "channel", channelType, model: "opaque" },
 			]);
-			settings.agent.modelCatalog!.local.bindings!.push({
-				id: "nug-runtime-binding",
-				providerId: nugConfig.id,
-				channelId: "channel",
-				upstreamModelId: "opaque",
-				modelId: "runtime-card",
-				overrides: { max_output_tokens: 101, supports_reasoning: false },
+			// The gateway entry's own override, by its full model value.
+			restoreOverrides = replaceModelOverridesForTests({
+				connections: { "runtime-nug:channel:opaque": { maxOutputTokens: 101 } },
 			});
 			const body = await captureChat(new NugProvider(nugConfig), {
 				model: "runtime-nug:channel:opaque",
@@ -635,15 +633,12 @@ describe("native search and context policy", () => {
 		setMetadata({ supports_web_search: true });
 		expect(usesInlineNativeSearch("gemini", model)).toBe(false);
 	});
-	test("user binding context window is not raised by the Anthropic official floor", () => {
-		settings.agent.modelCatalog!.local.bindings = [
-			{
-				id: "window",
-				providerId: config.id,
-				upstreamModelId: "claude-opus-4-8",
-				overrides: { working_context_tokens: 32000, max_output_tokens: 16000 },
+	test("a provider entry's own context window is not raised by the Anthropic official floor", () => {
+		restoreOverrides = replaceModelOverridesForTests({
+			connections: {
+				[`${config.prefix}:claude-opus-4-8`]: { contextWindow: 32000, maxOutputTokens: 16000 },
 			},
-		];
+		});
 		expect(
 			getAnthropicEffectiveContextWindow(`${config.prefix}:claude-opus-4-8`, {
 				...config,

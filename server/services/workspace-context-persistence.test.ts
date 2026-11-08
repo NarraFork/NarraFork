@@ -114,6 +114,56 @@ function change(cwd: string, expectedRevision = 0) {
 }
 
 describe("real SQLite workspace CAS", () => {
+	test.each([
+		"PATCH",
+		"POST",
+	])("real HTTP %s recovers a directoryless legacy session without bypassing ACL", async (method) => {
+		await db.update(narrators).set({ cwd: null, traits: [] }).where(eq(narrators.id, id));
+		const router = app(owner);
+		const get = await router.request(`/api/narrators/${id}/workspace-context`);
+		expect(get.status).toBe(200);
+		const previous = await get.json();
+		expect(previous.cwd).toBe("");
+		expect(previous.revision).toBe(0);
+		await expect(workspaceContextService.get(id)).rejects.toMatchObject({
+			code: "WORKSPACE_DIRECTORY_REQUIRED",
+		});
+		const url = `/api/narrators/${id}/${method === "PATCH" ? "cwd" : "workspace-context/switch"}`;
+		const init = {
+			method,
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(
+				method === "PATCH"
+					? { cwd: join(root, "new") }
+					: {
+							expectedRevision: previous.revision,
+							requestId: "legacy-recovery",
+							target: { deviceId: "local", cwd: join(root, "new") },
+						},
+			),
+		};
+		const denied = await app("unrelated-user").request(url, init);
+		expect([403, 404]).toContain(denied.status);
+		const before = await db.query.narrators.findFirst({ where: eq(narrators.id, id) });
+		expect(before?.cwd).toBeNull();
+		expect(before?.workspaceContext).toBeNull();
+		expect(before?.workspaceRevision).toBe(0);
+		const switched = await router.request(url, init);
+		expect(switched.status).toBe(200);
+		const result = await switched.json();
+		expect(result.changed).toBe(true);
+		expect(result.previous.cwd).toBe("");
+		expect(result.current.revision).toBe(1);
+		expect(await workspaceContextService.get(id)).toEqual(result.current);
+		const persisted = await db.query.narrators.findFirst({ where: eq(narrators.id, id) });
+		expect(persisted?.cwd).toBe(join(root, "new"));
+		expect(persisted?.workspaceContext).toEqual(result.current);
+		expect(persisted?.contextProjectId).toBe(projectId);
+		const reminder = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.narratorId, id),
+		});
+		expect(JSON.stringify(reminder?.contentJson)).toContain(join(root, "new"));
+	});
 	test("production HTTP and model device switches publish CAS identities and preserve frozen children", async () => {
 		const devices = [
 			{

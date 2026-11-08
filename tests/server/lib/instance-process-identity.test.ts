@@ -1,12 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import type { spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
 import {
 	createInstanceProcessProbe,
 	type InstanceProcessProbeDependencies,
-	runInstanceIdentityCommand,
 } from "../../../server/lib/instance-process-identity";
+import { __testing as windowsFileTime } from "../../../server/lib/windows-process-identity";
 
 const machine = "1234567890abcdef1234567890abcdef";
 const boot = "12345678-1234-1234-1234-123456789012";
@@ -160,65 +157,11 @@ describe("strict local OS identity probe", () => {
 	});
 });
 
-function fakeChild() {
-	const child = Object.assign(new EventEmitter(), {
-		stdout: new PassThrough(),
-		stderr: new PassThrough(),
-		kills: 0,
-		kill() {
-			this.kills++;
-			return true;
-		},
-	});
-	const spawnChild = (() => child) as unknown as typeof spawn;
-	return { child, spawnChild };
-}
-describe("bounded identity child process", () => {
-	it("accepts bounded stdout on successful close", async () => {
-		const { child, spawnChild } = fakeChild();
-		const result = runInstanceIdentityCommand("test", [], new AbortController().signal, spawnChild);
-		child.stdout.write("ok");
-		child.emit("close", 0);
-		expect(await result).toBe("ok");
-		expect(child.kills).toBe(0);
-	});
-	it("caps combined stdout/stderr at 64KiB and stops without waiting for child close", async () => {
-		const { child, spawnChild } = fakeChild();
-		const result = runInstanceIdentityCommand("test", [], new AbortController().signal, spawnChild);
-		child.stdout.write(Buffer.alloc(32 * 1024));
-		child.stderr.write(Buffer.alloc(32 * 1024 + 1));
-		expect(await result).toBeNull();
-		expect(child.kills).toBe(1);
-	});
-	it("a child that never closes is terminated at the hard deadline", async () => {
-		const { child, spawnChild } = fakeChild();
-		const started = performance.now();
-		const result = await runInstanceIdentityCommand(
-			"test",
-			[],
-			new AbortController().signal,
-			spawnChild,
-		);
-		expect(result).toBeNull();
-		expect(child.kills).toBe(1);
-		expect(performance.now() - started).toBeLessThan(2200);
-	});
-
-	it("abort and spawn errors are unknown, without inspecting or killing real PIDs", async () => {
-		const { child, spawnChild } = fakeChild();
-		const abort = new AbortController();
-		const result = runInstanceIdentityCommand("test", [], abort.signal, spawnChild);
-		abort.abort();
-		expect(await result).toBeNull();
-		expect(child.kills).toBe(1);
-		const failed = fakeChild();
-		const next = runInstanceIdentityCommand(
-			"test",
-			[],
-			new AbortController().signal,
-			failed.spawnChild,
-		);
-		failed.child.emit("error", new Error("missing powershell"));
-		expect(await next).toBeNull();
+describe("Windows FILETIME from the Win32 API", () => {
+	it("truncates to the microsecond precision CIM reports, so both sources compare equal", () => {
+		// Measured on Windows 11: GetProcessTimes vs CIM CreationDate.ToFileTimeUtc() for one pid.
+		expect(windowsFileTime.toCimFileTime(134383560174690036n)).toBe("134383560174690030");
+		expect(windowsFileTime.toCimFileTime(134378858541610059n)).toBe("134378858541610050");
+		expect(windowsFileTime.toCimFileTime(0n)).toBeNull();
 	});
 });

@@ -15,8 +15,7 @@ import { IconPaperclip } from "@tabler/icons-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { clearTokenOnSessionFailure, getToken } from "../../../lib/api";
-import { apiUrl } from "../../../lib/base-path";
+import { clearTokenOnSessionFailure, getToken, getUploadedImageUrl } from "../../../lib/api";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
@@ -204,8 +203,10 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 			jobs.push(async () => {
 				const token = getToken();
 				const response = await fetch(
-					apiUrl(
-						`/uploads/${encodeURIComponent(resource.uploadNarratorId ?? "")}/${encodeURIComponent(resource.imageId ?? "")}`,
+					getUploadedImageUrl(
+						resource.uploadNarratorId ?? "",
+						resource.imageId ?? "",
+						props.narratorId,
 					),
 					{
 						headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -259,7 +260,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 			controller.abort();
 			for (const url of urls) URL.revokeObjectURL(url);
 		};
-	}, [session]);
+	}, [session, props.narratorId]);
 
 	const change = (next: ComposerDocument) => {
 		if (!session) return;

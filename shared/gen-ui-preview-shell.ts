@@ -246,7 +246,7 @@ export function createPreviewShell(
       if (action === "sendPrompt") return act(action, fill(value));
       if (action === "openLink") return act(action, value);
       const fields = {};
-      for (const [name, current] of state) fields[name] = plain(current);
+      for (const [name, current] of state) if (!name.startsWith(implicitPrefix)) fields[name] = plain(current);
       submitFields(value, fields);
     };
     const submitFields = (value, fields) => {
@@ -328,6 +328,27 @@ export function createPreviewShell(
       else if (props.defaultValue !== undefined) state.set(bind, props.defaultValue);
       else state.set(bind, kind === "multi" ? [] : kind === "text" ? "" : null);
     };
+    // A control the markup left without bind still holds what the reader typed, and that
+    // must survive into the card's other frame (the expanded view and back). Such a control
+    // gets a name of its own from its place in the tree, the same in every frame drawing
+    // the same markup. Nothing in the markup can read it, and submit() leaves it out.
+    const implicitPrefix = "__nf";
+    const implicit = new WeakMap();
+    let implicitCount = 0;
+    const implicitControl = /^(input|textarea|select|TextInput|PasswordInput|Textarea|JsonInput|NumberInput|ColorInput|Autocomplete|Select|NativeSelect|MultiSelect|TagsInput|PillsInput|Checkbox|Switch|Chip|Checkbox\\.Group|Chip\\.Group|Radio\\.Group|Slider|RangeSlider|SegmentedControl|Rating|Tabs)$/;
+    const markImplicit = (node, given) => {
+      if (!implicitControl.test(node.name)) return;
+      // A literal value or checked is the markup's own (a Radio, a group's Checkbox), and a
+      // change handler of its own stays the markup's to keep.
+      for (const name of ["bind", "value", "checked", "onChange", "onValueChange", "onCheckedChange"])
+        if (name in given) return;
+      if (node.name === "input" && /^(button|submit|reset|radio|hidden|file|image)$/.test(String(given.type))) return;
+      implicit.set(node, implicitPrefix + implicitCount++);
+    };
+    const seedNodes = (nodes) => {
+      implicitCount = 0;
+      seedTree(nodes);
+    };
     // A $x may come before the control that binds x, so every bound control's starting
     // value is in place before a tree is drawn.
     const seedTree = (value) => {
@@ -335,6 +356,7 @@ export function createPreviewShell(
       if (!value || typeof value !== "object" || "$ref" in value || "$action" in value) return;
       if (value.$node === "el") {
         const given = value.props && typeof value.props === "object" && !Array.isArray(value.props) ? value.props : {};
+        if (typeof value.name === "string") markImplicit(value, given);
         if (typeof given.bind === "string" && stateName.test(given.bind) && typeof value.name === "string") {
           const props = {};
           for (const name of ["type", "value", "defaultValue", "defaultChecked", "multiple"]) {
@@ -382,7 +404,7 @@ export function createPreviewShell(
       if (type === null) return placeholder(key, "<" + node.name.slice(0, 80) + ">");
       const props = {};
       const given = node.props && typeof node.props === "object" && !Array.isArray(node.props) ? node.props : {};
-      const bind = typeof given.bind === "string" && stateName.test(given.bind) ? given.bind : null;
+      const bind = typeof given.bind === "string" && stateName.test(given.bind) ? given.bind : implicit.get(node) ?? null;
       for (const name of Object.keys(given)) {
         if (name === "ref" || name === "key" || name === "__proto__" || name === "bind") continue;
         const value = toValue(given[name], name);
@@ -462,7 +484,7 @@ export function createPreviewShell(
     window.addEventListener("message", event => {
       if (event.source !== parent) return;
       const data = event.data;
-      if (data?.type === "narrafork:ui-tree" && Array.isArray(data.nodes)) { seedTree(data.nodes); setTree?.(data.nodes); return; }
+      if (data?.type === "narrafork:ui-tree" && Array.isArray(data.nodes)) { seedNodes(data.nodes); setTree?.(data.nodes); return; }
       if (data?.type === "narrafork:ui-state") { adopt(data.values); return; }
       if (data?.type !== "narrafork:preview-theme" || config.kit) return;
       const theme = data.theme;

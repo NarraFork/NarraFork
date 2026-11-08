@@ -29,6 +29,62 @@ export const OPENCODE_QUOTA_EXHAUSTED = "opencode_quota_exhausted";
 /** Providers whose quota refusals are waited out on a known reset clock. */
 export type QuotaProviderKind = "kimi" | "opencode";
 
+/** Timed upstream refusals are not necessarily exhausted account allowances. */
+export type ProviderWaitKind = "credentials" | "quota" | "capacity" | "rate_limit";
+
+export function isCapacityRefusalText(text: string): boolean {
+	return /prefill_cap_refused|\b(?:cell is at capacity|at capacity|capacity exhausted|capacity overload)\b/i.test(
+		text,
+	);
+}
+
+/** Read old quota/rateLimit payloads without perpetuating their quota mislabel. */
+export function providerWaitKind(info: {
+	waitKind?: unknown;
+	quotaBucket?: unknown;
+	message?: unknown;
+}): ProviderWaitKind {
+	if (info.waitKind === "capacity" || info.waitKind === "rate_limit") return info.waitKind;
+	if (info.waitKind === "quota") {
+		if (info.quotaBucket === "capacity") return "capacity";
+		if (info.quotaBucket === "rateLimit") {
+			return typeof info.message === "string" && isCapacityRefusalText(info.message)
+				? "capacity"
+				: "rate_limit";
+		}
+		return "quota";
+	}
+	return "credentials";
+}
+
+/** The persisted errorMessage is the reload-safe source of timed wait details. */
+export function parseProviderWaitInfo(errorMessage: string | null | undefined): {
+	waitKind: "quota" | "capacity" | "rate_limit";
+	resumeAt: number | null;
+	quotaProvider?: QuotaProviderKind;
+} | null {
+	if (!errorMessage) return null;
+	try {
+		const payload = JSON.parse(errorMessage);
+		if (!payload || typeof payload !== "object") return null;
+		const waitKind = providerWaitKind(payload);
+		if (waitKind === "credentials") return null;
+		return {
+			waitKind,
+			resumeAt:
+				typeof payload.resumeAt === "number" && Number.isFinite(payload.resumeAt)
+					? payload.resumeAt
+					: null,
+			quotaProvider:
+				payload.quotaProvider === "kimi" || payload.quotaProvider === "opencode"
+					? payload.quotaProvider
+					: undefined,
+		};
+	} catch {
+		return null;
+	}
+}
+
 /** Display name of a quota provider, for user-facing messages. */
 export const QUOTA_PROVIDER_LABELS: Record<QuotaProviderKind, string> = {
 	kimi: "Kimi",

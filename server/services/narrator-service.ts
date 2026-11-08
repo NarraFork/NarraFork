@@ -147,6 +147,7 @@ import {
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
+import { ensureReplyContext } from "./narrator-reply-context";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
@@ -515,13 +516,29 @@ export async function handleLoadToolCommand(
 		return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 	}
 	const alreadyLoaded = status === "already_loaded";
-	const infoText = alreadyLoaded
+	let infoText = alreadyLoaded
 		? locale === "zh-CN"
 			? `🔧 工具已加载：${displayToolName}`
 			: `🔧 Tool already loaded: ${displayToolName}`
 		: locale === "zh-CN"
 			? `🔧 工具加载成功：${displayToolName}`
 			: `🔧 Tool loaded: ${displayToolName}`;
+	if (status === "loaded_new_epoch") {
+		const { suggestProtocolsForToolLoading } = await import("./tool-loading-service");
+		const protocols = await suggestProtocolsForToolLoading(narratorId, locale);
+		infoText +=
+			locale === "zh-CN"
+				? `\n当前协议无法在对话中途追加工具声明，下一次请求会重建提示缓存（对话内容保留）。${
+						protocols.length
+							? `把这个模型的协议切换为 ${protocols.join(" 或 ")} 后，之后加载工具可以保持缓存。`
+							: ""
+					}`
+				: `\nThis protocol cannot add tool declarations mid-conversation, so the next request rebuilds the prompt cache (the conversation is kept).${
+						protocols.length
+							? ` Switching this model's protocol to ${protocols.join(" or ")} would let later tool loads keep the cache.`
+							: ""
+					}`;
+	}
 	await narratorService.persistDisplayMessage(narratorId, infoText);
 
 	return { toolName: displayToolName, loaded: true, alreadyLoaded };
@@ -1743,11 +1760,14 @@ export const narratorService = {
 			};
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
 			return withWorkspaceAdmission(creationTarget, async () => {
+				// Legacy initialization is a write: resource admission must accept creation first.
+				const replyContext = await ensureReplyContext(parent.id);
 				const [narrator] = await db
 					.insert(narrators)
 					.values({
 						id,
 						type: "subagent",
+						replyContext,
 						subagentType: input.subagentType,
 						variant: subagentVariant(input.subagentType),
 						traits: subTraits,
@@ -2456,8 +2476,10 @@ export const narratorService = {
 			// initializeRefSeqFloor records into the active raise scope.
 			const creationWorkspace: CreationWorkspace = { ...executionContext };
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
-			const newNarrator = await withWorkspaceAdmission(creationTarget, async () =>
-				withSeqFloorRaiseScope(() =>
+			const newNarrator = await withWorkspaceAdmission(creationTarget, async () => {
+				// Legacy initialization is a write: resource admission must accept creation first.
+				const replyContext = await ensureReplyContext(parent.id);
+				return withSeqFloorRaiseScope(() =>
 					db.transaction((tx) => {
 						// Insert first so this transaction owns SQLite's write lock before it
 						// snapshots the parent's marker state.
@@ -2469,6 +2491,7 @@ export const narratorService = {
 								variant: "primary",
 								traits: inheritedTraits,
 								...policySource,
+								replyContext,
 								...executionContext,
 								...creationWorkspace,
 								model: storedModel,
@@ -2542,8 +2565,8 @@ export const narratorService = {
 
 						return { ...created, nextSeq };
 					}),
-				),
-			);
+				);
+			});
 
 			await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
 			await applySpecForkCarryover(newNarrator.id, "card");
@@ -2662,8 +2685,10 @@ export const narratorService = {
 			// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
 			const creationWorkspace: CreationWorkspace = { ...executionContext };
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
-			const newNarrator = await withWorkspaceAdmission(creationTarget, async () =>
-				withSeqFloorRaiseScope(() =>
+			const newNarrator = await withWorkspaceAdmission(creationTarget, async () => {
+				// Legacy initialization is a write: resource admission must accept creation first.
+				const replyContext = await ensureReplyContext(parent.id);
+				return withSeqFloorRaiseScope(() =>
 					db.transaction((tx) => {
 						// Insert before reading parent refs so this transaction acquires the write
 						// lock first; a concurrent finalize then waits and cannot change the state
@@ -2675,6 +2700,7 @@ export const narratorService = {
 								variant: "primary",
 								traits: forkTraits2,
 								...policySource,
+								replyContext,
 								...executionContext,
 								...creationWorkspace,
 								model: storedModel,
@@ -2953,8 +2979,8 @@ export const narratorService = {
 						if (!finalNarrator) throw new NotFoundError("Narrator", id);
 						return finalNarrator;
 					}),
-				),
-			);
+				);
+			});
 
 			queueContextCharacterRefresh(id);
 			// fire-and-forget: spec fork 和 carryover 不阻塞 fork 响应
