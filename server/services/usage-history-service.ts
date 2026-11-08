@@ -14,6 +14,7 @@ import { normalizeModelFamily } from "@shared/model-id";
 import {
 	addBuckets,
 	bucketLabelAt,
+	bucketStartAt,
 	countBucketsBetween,
 	normalizeUsageTimeZone,
 } from "@shared/usage-time-zone";
@@ -277,13 +278,12 @@ function resolveUsageTimeSeriesRange(
 	let startLabel = clampedStart
 		? bucketLabelAt(clampedStart, granularity, timeZone)
 		: addBuckets(endLabel, -(config.defaultBuckets - 1), granularity);
-	let effectiveStart = clampedStart ?? new Date(startLabel);
+	let effectiveStart = clampedStart ?? bucketStartAt(startLabel, timeZone);
 	let truncated = false;
 
 	if (countBucketsBetween(startLabel, endLabel, granularity) > config.maxBuckets) {
 		startLabel = addBuckets(endLabel, -(config.maxBuckets - 1), granularity);
-		// 标签当 UTC 只可能把下界取早：多出来的记录落在窗口之前，补点时按标签取不到就丢掉。
-		effectiveStart = new Date(startLabel);
+		effectiveStart = bucketStartAt(startLabel, timeZone);
 		truncated = true;
 	}
 

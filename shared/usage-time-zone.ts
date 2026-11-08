@@ -152,6 +152,42 @@ export function countBucketsBetween(
 	);
 }
 
+/**
+ * 桶标签对应的实际查询下界。重复的墙上时间取较早一次，确保两次出现都进入同一个桶；
+ * 不存在的墙上时间取 DST 跳变点，避免漏掉跳变后的记录。全程只使用指定 IANA 时区。
+ */
+export function bucketStartAt(label: string, timeZone: string): Date {
+	const wallMs = new Date(label).getTime();
+	if (Number.isNaN(wallMs)) throw new RangeError(`Invalid usage bucket label: ${label}`);
+
+	// 实际时刻与标签的 UTC 表示最多相差一个时区偏移；两天余量也覆盖国际日期变更线。
+	const segments = offsetSegments(
+		new Date(wallMs - 2 * DAY_MS),
+		new Date(wallMs + 2 * DAY_MS),
+		timeZone,
+	);
+	let earliest = Number.POSITIVE_INFINITY;
+	for (const [index, segment] of segments.entries()) {
+		const candidate = wallMs - segment.offsetMinutes * MINUTE_MS;
+		const segmentEnd = segments[index + 1]?.fromMs ?? Number.POSITIVE_INFINITY;
+		if (candidate >= segment.fromMs && candidate < segmentEnd) {
+			earliest = Math.min(earliest, candidate);
+		}
+	}
+	if (Number.isFinite(earliest)) return new Date(earliest);
+
+	// 春季跳变时没有任何 instant 能表示这段墙上时间，下界应是偏移切换本身。
+	for (let index = 1; index < segments.length; index++) {
+		const previous = segments[index - 1];
+		const current = segments[index];
+		if (!previous || !current) continue;
+		const previousWallMs = current.fromMs + previous.offsetMinutes * MINUTE_MS;
+		const currentWallMs = current.fromMs + current.offsetMinutes * MINUTE_MS;
+		if (previousWallMs <= wallMs && wallMs < currentWallMs) return new Date(current.fromMs);
+	}
+	throw new RangeError(`Cannot resolve usage bucket label in ${timeZone}: ${label}`);
+}
+
 /** 查询跨度内该时区的偏移分段：DST 切换一次多一段，SQL 侧据此按区间取偏移。 */
 export function offsetSegments(start: Date, end: Date, timeZone: string): OffsetSegment[] {
 	const from = start.getTime();

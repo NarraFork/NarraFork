@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	addBuckets,
 	bucketLabelAt,
+	bucketStartAt,
 	countBucketsBetween,
 	DEFAULT_USAGE_TIME_ZONE,
 	normalizeUsageTimeZone,
@@ -85,6 +86,41 @@ describe("bucketLabelAt", () => {
 	test("month labels cross the year boundary in the reader's zone", () => {
 		expect(bucketLabelAt(new Date("2026-12-31T20:00:00.000Z"), "month", "Asia/Shanghai")).toBe(
 			"2027-01-01T00:00:00.000Z",
+		);
+	});
+});
+
+describe("bucketStartAt", () => {
+	test("turns local labels into absolute instants on both sides of UTC", () => {
+		expect(bucketStartAt("2026-11-05T00:00:00.000Z", "Asia/Shanghai").toISOString()).toBe(
+			"2026-11-04T16:00:00.000Z",
+		);
+		expect(bucketStartAt("2026-01-14T00:00:00.000Z", "America/New_York").toISOString()).toBe(
+			"2026-01-14T05:00:00.000Z",
+		);
+	});
+
+	test("chooses the earlier occurrence when a wall clock hour repeats", () => {
+		const label = "2026-11-01T01:00:00.000Z";
+		expect(bucketStartAt(label, "America/New_York").toISOString()).toBe("2026-11-01T05:00:00.000Z");
+		// 回退前后的 01:30 都属于同一个桶，查询下界必须覆盖较早的一次。
+		expect(bucketLabelAt(new Date("2026-11-01T05:30:00.000Z"), "hour", "America/New_York")).toBe(
+			label,
+		);
+		expect(bucketLabelAt(new Date("2026-11-01T06:30:00.000Z"), "hour", "America/New_York")).toBe(
+			label,
+		);
+	});
+
+	test("uses the offset transition when a wall clock hour does not exist", () => {
+		expect(bucketStartAt("2026-03-08T02:00:00.000Z", "America/New_York").toISOString()).toBe(
+			"2026-03-08T07:00:00.000Z",
+		);
+	});
+
+	test("handles a local midnight skipped by DST", () => {
+		expect(bucketStartAt("2026-09-06T00:00:00.000Z", "America/Santiago").toISOString()).toBe(
+			"2026-09-06T04:00:00.000Z",
 		);
 	});
 });
