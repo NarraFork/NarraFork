@@ -14,10 +14,7 @@ import type { SQLWrapper } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { cleanDb, getTestDb } from "../../tests/setup";
-import { setUsageUtcOffsetMinutes, UsageHistoryService } from "./usage-history-service";
-
-// 分桶按读者日历切日，偏移量默认跟随服务器时区；测试固定为 UTC 才与时区无关。
-setUsageUtcOffsetMinutes(0);
+import { UsageHistoryService } from "./usage-history-service";
 
 const { db, sqlite } = getTestDb();
 const service = new UsageHistoryService(db);

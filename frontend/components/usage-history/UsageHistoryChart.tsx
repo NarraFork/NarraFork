@@ -54,21 +54,56 @@ const PADDING = { left: 58, right: 18, top: 18, bottom: 48 };
 const CHART_INNER_WIDTH = CHART_WIDTH - PADDING.left - PADDING.right;
 const CHART_INNER_HEIGHT = CHART_HEIGHT - PADDING.top - PADDING.bottom;
 
+/**
+ * 桶标签是读者日历的日期（服务端按请求时区切出来的），不是绝对时刻：
+ * 按 UTC 原样读，否则浏览器时区会把它再挪一次。
+ */
+const BUCKET_LABEL_READ_OPTIONS = { timeZone: "UTC" } as const;
+
 function formatTimestamp(timestamp: string, granularity: UsageHistoryGranularity): string {
 	if (granularity === "hour") {
 		return formatLocaleDateTime(timestamp, {
+			...BUCKET_LABEL_READ_OPTIONS,
 			month: "short",
 			day: "numeric",
 			hour: "2-digit",
 		});
 	}
 	if (granularity === "day") {
-		return formatLocaleDate(timestamp, { month: "short", day: "numeric" });
+		return formatLocaleDate(timestamp, {
+			...BUCKET_LABEL_READ_OPTIONS,
+			month: "short",
+			day: "numeric",
+		});
 	}
-	return formatLocaleDate(timestamp, { year: "numeric", month: "short" });
+	return formatLocaleDate(timestamp, {
+		...BUCKET_LABEL_READ_OPTIONS,
+		year: "numeric",
+		month: "short",
+	});
 }
 
 function formatRangeTimestamp(timestamp: string, granularity: UsageHistoryGranularity): string {
+	if (granularity === "hour") {
+		return formatLocaleDateTime(timestamp, {
+			...BUCKET_LABEL_READ_OPTIONS,
+			year: "numeric",
+			month: "short",
+			day: "numeric",
+			hour: "2-digit",
+			minute: "2-digit",
+		});
+	}
+	return formatLocaleDate(timestamp, {
+		...BUCKET_LABEL_READ_OPTIONS,
+		year: "numeric",
+		month: "short",
+		day: "numeric",
+	});
+}
+
+/** 查询边界是真正的绝对时刻，按读者自己的时区显示。 */
+function formatBoundaryTimestamp(timestamp: string, granularity: UsageHistoryGranularity): string {
 	if (granularity === "hour") {
 		return formatLocaleDateTime(timestamp, {
 			year: "numeric",
@@ -78,11 +113,7 @@ function formatRangeTimestamp(timestamp: string, granularity: UsageHistoryGranul
 			minute: "2-digit",
 		});
 	}
-	return formatLocaleDate(timestamp, {
-		year: "numeric",
-		month: "short",
-		day: "numeric",
-	});
+	return formatLocaleDate(timestamp, { year: "numeric", month: "short", day: "numeric" });
 }
 
 function getTickIndexes(pointCount: number): number[] {
@@ -641,8 +672,8 @@ export function UsageHistoryChart({
 				{data?.truncated ? (
 					<Text size="xs" c="dimmed">
 						{t("usageHistoryChartTruncated", {
-							start: formatRangeTimestamp(data.effectiveStartDate, granularity),
-							end: formatRangeTimestamp(data.effectiveEndDate, granularity),
+							start: formatBoundaryTimestamp(data.effectiveStartDate, granularity),
+							end: formatBoundaryTimestamp(data.effectiveEndDate, granularity),
 							bucketCount: formatLocaleNumber(data.bucketCount),
 							maxBuckets: formatLocaleNumber(data.maxBuckets),
 						})}
