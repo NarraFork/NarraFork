@@ -586,6 +586,7 @@
 	"save": "保存",
 	"rename": "重命名",
 	"delete": "删除",
+	"providerDelete": "删除这个供应商",
 	"passkeyTitle": "通行密钥",
 	"passkeyDescription": "使用设备的生物识别或安全密钥免密码登录。通行密钥也可作为第二验证因素。",
 	"passkeyAdd": "添加通行密钥",

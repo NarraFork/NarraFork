@@ -392,6 +392,15 @@ function SettingsProvidersPage() {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
 	}, []);
 
+	// 卡片上的删除与详情页里的删除按钮是同一条路径：只从草稿移除，保存条统一提交。
+	const deleteDraftProvider = useCallback(
+		(id: string) => {
+			dispatchers.setCustomApiProviders((prev) => prev.filter((provider) => provider.id !== id));
+			dispatchers.setNugProviders((prev) => prev.filter((provider) => provider.id !== id));
+		},
+		[dispatchers.setCustomApiProviders, dispatchers.setNugProviders],
+	);
+
 	const saveProvidersState = useCallback(
 		async (stateToSave: ProvidersState = state) => {
 			if (!settingsFeatureCapability.patchSupported) {
@@ -1299,6 +1308,7 @@ function SettingsProvidersPage() {
 					dispatchers.toggleProviderDisabled(prefix);
 				}}
 				onOpenProviderConfig={setSelectedProvider}
+				onDeleteProvider={deleteDraftProvider}
 				selectedProvider={selectedProvider}
 			/>
 		);

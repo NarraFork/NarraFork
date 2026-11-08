@@ -10,7 +10,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { IconRefresh } from "@tabler/icons-react";
+import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import React, { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ProviderStatus } from "./ProviderStatusBadge";
@@ -32,6 +32,8 @@ export interface ProviderCardProps {
 	onToggleDisabled: () => void;
 	onRefresh?: () => void;
 	onOpenConfig: () => void;
+	/** 删除按钮（草稿，保存后才落库）；平台/插件供应商不传。 */
+	onDelete?: () => void;
 	isSelected?: boolean;
 }
 
@@ -51,6 +53,7 @@ export const ProviderCard = React.memo(function ProviderCard({
 	onToggleDisabled,
 	onRefresh,
 	onOpenConfig,
+	onDelete,
 	isSelected,
 }: ProviderCardProps) {
 	const { t } = useTranslation("settings");
@@ -98,17 +101,22 @@ export const ProviderCard = React.memo(function ProviderCard({
 						}}
 						style={{ flex: 1, minWidth: 0 }}
 					>
-						<Group gap="xs" wrap="nowrap">
+						<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
 							<Text fw={600} size="sm" truncate>
 								{label}
 							</Text>
-							<Badge size="xs" variant="light" color={type === "platform" ? "violet" : "blue"}>
+							<Badge
+								size="xs"
+								variant="light"
+								color={type === "platform" ? "violet" : "blue"}
+								style={{ flexShrink: 0 }}
+							>
 								{type === "platform"
 									? t("providerTypePlatform")
 									: (badgeLabel ?? t("providerTypeCustom"))}
 							</Badge>
 							{autoExcluded && !disabled && (
-								<Badge size="xs" variant="outline" color="gray">
+								<Badge size="xs" variant="outline" color="gray" style={{ flexShrink: 0 }}>
 									{t("autoParticipation.excludedBadge")}
 								</Badge>
 							)}
@@ -118,17 +126,37 @@ export const ProviderCard = React.memo(function ProviderCard({
 						onClick={(event) => {
 							event.stopPropagation();
 						}}
+						style={{ flexShrink: 0 }}
 					>
-						<Switch
-							disabled={controlsDisabled}
-							size="xs"
-							checked={!disabled}
-							onChange={(event) => {
-								event.stopPropagation();
-								onToggleDisabled();
-							}}
-							aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
-						/>
+						<Group gap={4} wrap="nowrap">
+							<Switch
+								disabled={controlsDisabled}
+								size="xs"
+								checked={!disabled}
+								onChange={(event) => {
+									event.stopPropagation();
+									onToggleDisabled();
+								}}
+								aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
+							/>
+							{onDelete && (
+								<Tooltip label={t("providerDelete")}>
+									<ActionIcon
+										size="sm"
+										color="red"
+										variant="subtle"
+										disabled={controlsDisabled}
+										aria-label={t("providerDelete")}
+										onClick={(event) => {
+											event.stopPropagation();
+											onDelete();
+										}}
+									>
+										<IconTrash size={14} />
+									</ActionIcon>
+								</Tooltip>
+							)}
+						</Group>
 					</Box>
 				</Group>
 

@@ -586,6 +586,7 @@
 	"save": "Save",
 	"rename": "Rename",
 	"delete": "Delete",
+	"providerDelete": "Remove this provider",
 	"passkeyTitle": "Passkeys",
 	"passkeyDescription": "Sign in without a password using your device's biometrics or a security key. Passkeys can also serve as a second factor.",
 	"passkeyAdd": "Add passkey",
