@@ -230,23 +230,34 @@ describe("the same calls on a spec session and an outline session", () => {
 		const [claim] = await outlineStore.getTaskClaims([page[0]?.id as string]);
 		expect(claim?.holderNarratorId).toBe(ids.outline);
 
-		// A task no longer listed: gone from the list on both; cancelled (not deleted) in the outline.
-		await both(ids, "spec_write", {
-			uri: "tasks.json",
-			content: doc([
-				{ text: "Ship", status: "doing", protected: true },
-				{ text: "Review", status: "todo", protected: true },
-			]),
-		});
-		expect((await sameList(ids)).tasks.map((t) => t.text)).toEqual(["Ship", "Review"]);
+		// An open task no longer listed: gone from the list on both; cancelled (not deleted) in the
+		// outline.
+		await both(ids, "spec_task_add", { text: "Temp" });
+		const kept = doc([
+			{ text: "Ship", status: "doing", protected: true },
+			{ text: "Write tests", status: "done" },
+			{ text: "Review", status: "todo", protected: true },
+		]);
+		await both(ids, "spec_write", { uri: "tasks.json", content: kept });
+		expect((await sameList(ids)).tasks.map((t) => t.text)).toEqual([
+			"Ship",
+			"Write tests",
+			"Review",
+		]);
 		expect((await taskPage(ids.outline)).map((t) => [t.text, t.status])).toEqual([
 			["Ship", "doing"],
-			["Write tests", "cancelled"],
+			["Write tests", "done"],
 			["Review", "todo"],
+			["Temp", "cancelled"],
 		]);
 		// Writing the same list again writes nothing.
 		const space = await ensureSessionSpace(ids.outline);
 		const commits = (await outlineStore.listCommits(space.id, { limit: 100 })).length;
+		await both(ids, "spec_write", { uri: "tasks.json", content: kept });
+		expect(await outlineStore.listCommits(space.id, { limit: 100 })).toHaveLength(commits);
+
+		// A done task no longer listed stays done in the outline (review S3: it is finished work,
+		// the report counts it so), and is still listed; the spec file drops it.
 		await both(ids, "spec_write", {
 			uri: "tasks.json",
 			content: doc([
@@ -255,6 +266,12 @@ describe("the same calls on a spec session and an outline session", () => {
 			]),
 		});
 		expect(await outlineStore.listCommits(space.id, { limit: 100 })).toHaveLength(commits);
+		const outline = await command("spec_tasks_get", { narratorId: ids.outline });
+		expect(
+			(outline.data as { compiled: { tasks: Array<{ text: string }> } }).compiled.tasks.map(
+				(t) => t.text,
+			),
+		).toEqual(["Ship", "Write tests", "Review"]);
 		// The spec session's file is what it always was.
 		expect(
 			JSON.parse((await readSpecFile(ids.spec, "spec://tasks.json")).content).tasks,
@@ -262,28 +279,45 @@ describe("the same calls on a spec session and an outline session", () => {
 		expect(await outlineStore.findSpace({ kind: "session", narratorId: ids.spec })).toBeNull();
 	});
 
-	test("finishing, dropping or un-protecting an open protected task is refused alike", async () => {
+	test("finishing, dropping or un-protecting an open protected task is refused alike: CONFLICT", async () => {
 		const ids = await pair();
 		await both(ids, "spec_task_add", { text: "Ship", protected: true });
 		await both(ids, "spec_task_add", { text: "Other" });
+		await both(ids, "spec_task_add", { text: "Ship too", protected: true });
 		const attempts = [
 			doc([
 				{ text: "Ship", status: "done", protected: true },
 				{ text: "Other", status: "todo" },
+				{ text: "Ship too", status: "todo", protected: true },
 			]),
-			doc([{ text: "Other", status: "todo" }]),
+			doc([
+				{ text: "Other", status: "todo" },
+				{ text: "Ship too", status: "todo", protected: true },
+			]),
 			doc([
 				{ text: "Ship", status: "todo" },
+				{ text: "Other", status: "todo" },
+				{ text: "Ship too", status: "todo", protected: true },
+			]),
+			// Two at once: the lines in the same order (review N6).
+			doc([
+				{ text: "Ship", status: "done", protected: true },
 				{ text: "Other", status: "todo" },
 			]),
 		];
 		for (const content of attempts) {
 			const { spec, outline } = await both(ids, "spec_write", { uri: "tasks.json", content });
-			expect(spec.status).not.toBe("succeeded");
+			// Owner decision 4: a permanent refusal says so, with what it touched, in both sessions.
+			expect(spec.error?.code).toBe("CONFLICT");
+			expect(spec.error?.message).toContain("requires taskReflection");
 			expect(outline.error).toEqual(spec.error);
 		}
-		expect(await sameList(ids)).toMatchObject({ protectedOpenCount: 1 });
-		expect((await taskPage(ids.outline)).map((t) => t.status)).toEqual(["todo", "todo"]);
+		expect(
+			(await both(ids, "spec_write", { uri: "tasks.json", content: attempts[3] as string })).spec
+				.error?.message,
+		).toMatch(/- complete: Ship \(.*\)\n- delete: Ship too \(/);
+		expect(await sameList(ids)).toMatchObject({ protectedOpenCount: 2 });
+		expect((await taskPage(ids.outline)).map((t) => t.status)).toEqual(["todo", "todo", "todo"]);
 		// Invalid documents are refused alike too.
 		for (const content of [
 			"not json",
@@ -449,26 +483,167 @@ describe("the overwrite in an outline session", () => {
 		).toEqual(["Plan step"]);
 	});
 
-	test("blocked is in progress with a note under it, and no question is asked", async () => {
+	test("blocked: in progress with the plugin's note, read back as blocked, never written twice (S5)", async () => {
 		const id = await session("outline");
-		await command("spec_write", {
-			narratorId: id,
-			uri: "tasks.json",
-			content: doc([{ text: "Stuck", status: "blocked" }]),
-		});
+		const blocked = doc([{ text: "Stuck", status: "blocked" }]);
+		await command("spec_write", { narratorId: id, uri: "tasks.json", content: blocked });
 		const [task] = await taskPage(id);
 		expect(task).toMatchObject({ text: "Stuck", status: "doing" });
 		const space = await ensureSessionSpace(id);
-		const under = await outlineStore.listChildren(space.id, task?.id as string, 10);
-		expect(under.map((b) => b.content)).toEqual([`Blocked (marked by plugin ${PLUGIN})`]);
+		const notes = async () =>
+			(await outlineStore.listChildren(space.id, task?.id as string, 10)).map((b) => b.content);
+		expect(await notes()).toEqual([`Blocked (marked by plugin ${PLUGIN})`]);
 		expect(
 			await db.select().from(outlineQuestions).where(eq(outlineQuestions.spaceId, space.id)),
 		).toEqual([]);
-		// Known difference: without a question nothing waits, so it reads back as in progress.
-		const list = await command("spec_tasks_get", { narratorId: id });
-		expect((list.data as { compiled: { tasks: unknown[] } }).compiled.tasks).toEqual([
-			{ text: "Stuck", status: "doing", protected: false },
+		// Read back as blocked (owner decision 2), by both reads.
+		const list = async () =>
+			(
+				(await command("spec_tasks_get", { narratorId: id })).data as {
+					compiled: { tasks: unknown[] };
+				}
+			).compiled.tasks;
+		expect(await list()).toEqual([{ text: "Stuck", status: "blocked", protected: false }]);
+		const read = await command("tasks_read", { narratorId: id });
+		expect((read.data as { tasks: Array<Record<string, unknown>> }).tasks[0]).toMatchObject({
+			text: "Stuck",
+			status: "doing",
+			blocked: true,
+		});
+		// The same list again writes nothing: no second note, no commit.
+		const commits = (await outlineStore.listCommits(space.id, { limit: 100 })).length;
+		for (let i = 0; i < 3; i++)
+			await command("spec_write", { narratorId: id, uri: "tasks.json", content: blocked });
+		expect(await outlineStore.listCommits(space.id, { limit: 100 })).toHaveLength(commits);
+		expect(await notes()).toHaveLength(1);
+		// Unblocked: the note goes; blocked again: it comes back (its short id is the task's).
+		await command("spec_write", {
+			narratorId: id,
+			uri: "tasks.json",
+			content: doc([{ text: "Stuck", status: "doing" }]),
+		});
+		expect(await notes()).toEqual([]);
+		expect(await list()).toEqual([{ text: "Stuck", status: "doing", protected: false }]);
+		await command("spec_write", { narratorId: id, uri: "tasks.json", content: blocked });
+		expect(await notes()).toEqual([`Blocked (marked by plugin ${PLUGIN})`]);
+		// The session finishes it; the plugin marks it blocked again: back in progress, the note it
+		// still has is not written a second time.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "setTask", block: { id: task?.id as string }, task: { status: "done" } }],
+			actor: { kind: "agent", id },
+			narratorId: id,
+			responsibleUserId: null,
+		});
+		expect(await list()).toEqual([{ text: "Stuck", status: "done", protected: false }]);
+		const again = await command("spec_write", {
+			narratorId: id,
+			uri: "tasks.json",
+			content: blocked,
+		});
+		expect(again.status).toBe("succeeded");
+		expect(await notes()).toEqual([`Blocked (marked by plugin ${PLUGIN})`]);
+		expect(await list()).toEqual([{ text: "Stuck", status: "blocked", protected: false }]);
+		// A status the plugin sets through the block command ends the mark too.
+		await command("task_set_status", {
+			narratorId: id,
+			blockId: task?.id,
+			status: "todo",
+		});
+		expect(await notes()).toEqual([]);
+	});
+
+	test("a task a person locked is not finished or cancelled by the overwrite (review S2)", async () => {
+		const id = await session("outline");
+		await command("spec_task_add", { narratorId: id, text: "Agent work" });
+		await command("spec_task_add", { narratorId: id, text: "Free" });
+		const [work] = await taskPage(id);
+		const space = await ensureSessionSpace(id);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "setTask", block: { id: work?.id as string }, task: { lock: { delegate: null } } },
+			],
+			actor: { kind: "human", id: "pat" },
+			responsibleUserId: null,
+		});
+		for (const content of [
+			doc([
+				{ text: "Agent work", status: "done" },
+				{ text: "Free", status: "todo" },
+			]),
+			doc([{ text: "Free", status: "todo" }]),
+		]) {
+			const refused = await command("spec_write", { narratorId: id, uri: "tasks.json", content });
+			expect(refused.error?.code).toBe("CONFLICT");
+			expect(refused.error?.message).toContain("Agent work (Task is locked by a person");
+		}
+		expect((await taskPage(id)).map((t) => [t.text, t.status, t.locked])).toEqual([
+			["Agent work", "todo", true],
+			["Free", "todo", false],
 		]);
+		// Starting it, or finishing the free one, is the plugin's to do.
+		const fine = await command("spec_write", {
+			narratorId: id,
+			uri: "tasks.json",
+			content: doc([
+				{ text: "Agent work", status: "doing" },
+				{ text: "Free", status: "done" },
+			]),
+		});
+		expect(fine.status).toBe("succeeded");
+	});
+
+	test("over 100 tasks: every open one, then the latest done ones; no duplicate on write-back (S4)", async () => {
+		const id = await session("outline");
+		await command("spec_task_add", { narratorId: id, text: "Seed" });
+		const space = await ensureSessionSpace(id);
+		const [page] = await outlineStore.findAliasOwners(space.id, [OUTLINE_TASKS_PAGE_ALIAS]);
+		for (let i = 0; i < 120; i += 60)
+			await writeOutline({
+				spaceId: space.id,
+				ops: Array.from({ length: 60 }, (_, n) => ({
+					op: "insert" as const,
+					parent: { id: page?.id as string },
+					content: `Old ${i + n}`,
+					task: { status: "done" as const },
+				})),
+				actor: { kind: "human", id: "pat" },
+				responsibleUserId: null,
+			});
+		await command("spec_task_add", { narratorId: id, text: "Fresh work" });
+		const read = await command("spec_tasks_get", { narratorId: id });
+		const compiled = (
+			read.data as {
+				compiled: { tasks: Array<{ text: string; status: string }>; openCount: number };
+			}
+		).compiled;
+		expect(compiled.tasks).toHaveLength(100);
+		expect(compiled.openCount).toBe(2);
+		expect(compiled.tasks.map((t) => t.text)).toContain("Fresh work");
+		expect(compiled.tasks.map((t) => t.text)).toContain("Seed");
+		// The most recent done ones fill the rest: the second batch whole, part of the first.
+		const listed = new Set(compiled.tasks.map((t) => t.text));
+		for (let n = 60; n < 120; n++) expect(listed.has(`Old ${n}`)).toBe(true);
+		const left = Array.from({ length: 60 }, (_, n) => `Old ${n}`).filter((t) => !listed.has(t));
+		expect(left).toHaveLength(22);
+		// Written back as read, and with a done task the list left out: nothing new is added.
+		const before = (await taskPage(id)).length;
+		const commits = (await outlineStore.listCommits(space.id, { limit: 100 })).length;
+		const back = await command("spec_write", {
+			narratorId: id,
+			uri: "tasks.json",
+			content: doc([
+				// One listed done task left out for room (left alone: S3), one the list left out added.
+				...compiled.tasks
+					.filter((t) => t.text !== "Old 119")
+					.map((t) => ({ text: t.text, status: t.status })),
+				{ text: left[0] as string, status: "done" },
+			]),
+		});
+		expect(back.status).toBe("succeeded");
+		expect(await taskPage(id)).toHaveLength(before);
+		expect(await outlineStore.listCommits(space.id, { limit: 100 })).toHaveLength(commits);
 	});
 
 	test("texts match as stored: markup a plugin wrote raw does not churn the list", async () => {
@@ -541,12 +716,49 @@ describe("the overwrite in an outline session", () => {
 		expect(
 			(await outlineStore.listChildren(space.id, page?.id as string, 10)).map((b) => b.content),
 		).toEqual(["Just this."]);
+		// A task on the page is kept by a rewrite; a person's task under a note refuses it (N1).
+		const seeded = await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "insert", tempId: "note", parent: { id: page?.id as string }, content: "A note" },
+				{
+					op: "insert",
+					parent: { tempId: "note" },
+					content: "A person's task",
+					task: { status: "todo", humanCreated: true },
+				},
+				{
+					op: "insert",
+					parent: { id: page?.id as string },
+					content: "A task on the page",
+					task: { status: "todo" },
+				},
+			],
+			actor: { kind: "human", id: "pat" },
+			responsibleUserId: null,
+		});
+		const guarded = await command("spec_write", {
+			narratorId: id,
+			uri: "index.md",
+			content: "Replaced.",
+		});
+		expect(guarded.error?.code).toBe("CONFLICT");
+		const children = async () =>
+			(await outlineStore.listChildren(space.id, page?.id as string, 10)).map((b) => b.content);
+		expect(await children()).toEqual(["Just this.", "A note", "A task on the page"]);
+		// The person takes their note away: the rewrite goes through and keeps the page's task.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "delete", block: { id: seeded.results[0]?.blockId as string } }],
+			actor: { kind: "human", id: "pat" },
+			responsibleUserId: null,
+		});
+		await command("spec_write", { narratorId: id, uri: "index.md", content: "Just this." });
+		expect(await children()).toEqual(["A task on the page", "Just this."]);
 		const big = Array.from({ length: 300 }, (_, n) => `Paragraph ${n}.`).join("\n\n");
 		const refused = await command("spec_write", { narratorId: id, uri: "index.md", content: big });
 		expect(refused.error?.code).toBe("PAYLOAD_TOO_LARGE");
-		expect(
-			(await outlineStore.listChildren(space.id, page?.id as string, 10)).map((b) => b.content),
-		).toEqual(["Just this."]);
+		expect(await children()).toEqual(["A task on the page", "Just this."]);
 	});
 });
 

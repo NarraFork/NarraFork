@@ -1348,6 +1348,8 @@ export type NarratorTaskRow = {
 	text: string;
 	status: "todo" | "doing" | "done" | "cancelled";
 	waiting: boolean;
+	/** Open and marked blocked by a plugin (the old `spec_write`'s `blocked`). */
+	blocked: boolean;
 	humanCreated: boolean;
 	parentBlockId: string | null;
 	depth: number;
@@ -3232,6 +3234,12 @@ function mapNarratorCommandError(error: unknown): PluginPublicApiError {
 			retryable: error.code === "OUTLINE_SPACE_BUSY",
 		});
 	}
+	// A protected task (a task a person created, in the outline) the write would finish, drop or
+	// un-protect: permanent for the plugin as it is, with the list of what it touched (owner
+	// decision 4: no longer an opaque internal error, in spec and outline sessions alike).
+	if (error instanceof AppError && error.code === "SPEC_PROTECTED_TASK") {
+		return new PluginPublicApiError("CONFLICT", error.message);
+	}
 	if (error instanceof AppError && OUTLINE_TOO_LARGE_CODES.has(error.code)) {
 		return new PluginPublicApiError("PAYLOAD_TOO_LARGE", error.message);
 	}
@@ -3639,6 +3647,7 @@ export function createCorePluginPublicApiAdapters(options: {
 							text: task.text,
 							status: task.status,
 							waiting: task.waiting,
+							blocked: task.blocked,
 							humanCreated: task.humanCreated,
 							parentBlockId: task.parentBlockId,
 							depth: task.depth,

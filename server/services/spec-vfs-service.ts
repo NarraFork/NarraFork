@@ -7,14 +7,13 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX } from "../lib/spec-uri";
 import { knowledgeWriteStore } from "./knowledge/store";
-import type { SpecProtectedMutation } from "./knowledge/write-store";
 import {
 	analyzeSpecTasksCandidate,
 	compileSpecTasks,
 	detectProtectedMutations,
 	parseSpecTasksDocument,
-	protectedMutationMessage,
 	SPEC_TASKS_PATH,
+	SpecProtectedTaskError,
 	type SpecTasksDocument,
 	serializeSpecTasksDocument,
 	taskTextHash,
@@ -133,10 +132,6 @@ export function toSpecUri(path: string): string {
 
 function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
-}
-
-function formatProtectedMutationError(mutations: readonly SpecProtectedMutation[]): string {
-	return protectedMutationMessage(mutations);
 }
 
 export async function ensureNamespace(
@@ -311,7 +306,7 @@ export async function writeSpecFile(
 				: {}),
 		});
 		if (!result.ok) {
-			throw new Error(formatProtectedMutationError(result.protectedMutations));
+			throw new SpecProtectedTaskError(result.protectedMutations);
 		}
 
 		const written = await readSpecFile(narratorId, toSpecUri(path));

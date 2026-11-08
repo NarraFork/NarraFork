@@ -72,7 +72,11 @@ export const OUTLINE_PLUGIN_RULES_TITLE: Record<Locale, (pluginId: string) => st
 	"zh-CN": (pluginId) => `插件 ${pluginId} 的规程`,
 };
 
-/** The short id of a plugin's block in a session space: the same for the same plugin. */
+/**
+ * The short id of a plugin's block in a session space: the same for the same plugin. The import of
+ * old sessions (outline plan PR 12b) must write the team SOP it moves under
+ * `pluginRulesSid(TEAM_SOP_PLUGIN_ID)`, so the plugin's later updates find that block (review N2).
+ */
 export function pluginRulesSid(pluginId: string): string {
 	const tag = createHash("sha256")
 		.update(`plugin-rules\u0000${pluginId}`)
@@ -252,13 +256,23 @@ async function oldFenceOrNull(narratorId: string) {
 	try {
 		return await readOldBehaviorFence(narratorId);
 	} catch (error) {
-		logger.warn("Could not read the old behavior fence for a plugin's rules", {
-			narratorId,
-			error: String(error),
-		});
+		// Once per session and process (review N5): on PostgreSQL every write would fail the read.
+		if (!fenceUnreadable.has(narratorId)) {
+			fenceUnreadable.add(narratorId);
+			logger.warn("Could not read the old behavior fence for a plugin's rules", {
+				narratorId,
+				error: String(error),
+			});
+		}
 		return null;
 	}
 }
+
+/** Sessions whose old fence could not be read for a plugin's rules (warned once). */
+const fenceUnreadable = hotSafe(
+	"narrafork.outlinePluginRules.fenceUnreadable",
+	() => new Set<string>(),
+);
 
 /** The old fence without its SOP, through the plugin-SOP channel: what any rules write ends with. */
 async function dropFenceSop(narratorId: string): Promise<void> {

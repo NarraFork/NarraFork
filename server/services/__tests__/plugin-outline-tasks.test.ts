@@ -28,8 +28,8 @@ import {
 } from "../outline/plugin-task-events";
 import {
 	comparePaths,
+	decodeTaskCursor,
 	encodeTaskCursor,
-	isAfterCursor,
 	OUTLINE_PLUGIN_TASK_LIMITS,
 } from "../outline/plugin-tasks";
 import { ensureSessionSpace } from "../outline/spaces";
@@ -387,15 +387,47 @@ describe("tasks_read", () => {
 		expect(second.nextCursor).toBeNull();
 	});
 
-	test("positions compare in document order; a cursor past a page skips what is under it", () => {
+	test("positions compare in document order; a cursor is its page and task, round trip", () => {
 		const page: [string, string] = ["a0", "page1"];
 		const under = [page, ["a0", "x"] as [string, string]];
 		expect(comparePaths([page], under)).toBeLessThan(0);
 		expect(comparePaths(under, [["a1", "page0"]])).toBeLessThan(0);
-		expect(isAfterCursor(under, { path: [page] })).toBe(true);
-		expect(isAfterCursor(under, { path: [page], past: true })).toBe(false);
-		expect(isAfterCursor([["a1", "p"]], { path: [page], past: true })).toBe(true);
-		expect(encodeTaskCursor({ path: [page] })).toMatch(/^[A-Za-z0-9_-]+$/);
+		const cursor = encodeTaskCursor({ page, blockId: "abcdefgh" });
+		expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
+		expect(decodeTaskCursor(cursor)).toEqual({ page, blockId: "abcdefgh" });
+		expect(decodeTaskCursor(encodeTaskCursor({ page }))).toEqual({ page });
+	});
+
+	test("a cursor stays small however deep the task (review N4)", async () => {
+		const id = await session();
+		const depth = 90;
+		const ops: OutlineOp[] = [{ op: "insert", tempId: "n0", parent: null, content: "Deep" }];
+		for (let n = 1; n < depth; n++)
+			ops.push({
+				op: "insert",
+				tempId: `n${n}`,
+				parent: { tempId: `n${n - 1}` },
+				content: `L${n}`,
+			});
+		for (const text of ["First deep task", "Second deep task"])
+			ops.push({
+				op: "insert",
+				parent: { tempId: `n${depth - 1}` },
+				content: text,
+				task: { status: "todo" },
+			});
+		await human(id, ops);
+		const first = await ok<{ tasks: Array<{ text: string; depth: number }>; nextCursor: string }>(
+			"tasks_read",
+			{ narratorId: id, limit: 1 },
+		);
+		expect(first.tasks.map((t) => [t.text, t.depth])).toEqual([["First deep task", depth]]);
+		expect(first.nextCursor.length).toBeLessThan(200);
+		const second = await ok<{ tasks: Array<{ text: string }> }>("tasks_read", {
+			narratorId: id,
+			cursor: first.nextCursor,
+		});
+		expect(second.tasks.map((t) => t.text)).toEqual(["Second deep task"]);
 	});
 });
 
@@ -581,6 +613,47 @@ describe("task_set_status", () => {
 			).toMatchObject({ status: "doing" });
 			expect((await block(blockId)).taskJson?.status).toBe("doing");
 		}
+	});
+
+	test("a person's lock holds the plugin as it holds an agent (review S2)", async () => {
+		const id = await session();
+		const space = await ensureSessionSpace(id);
+		// An agent's plan, which a person then locks.
+		const plan = await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "insert", tempId: "root", parent: null, content: "Plan", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "root" }, content: "Step 1", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "root" }, content: "Step 2", task: { status: "todo" } },
+			],
+			actor: { kind: "agent", id },
+			narratorId: id,
+			responsibleUserId: null,
+		});
+		const [root, step1, step2] = plan.results.map((r) => r.blockId);
+		await human(id, [
+			{ op: "setTask", block: { id: root as string }, task: { lock: { delegate: null } } },
+		]);
+		const status = (blockId: string | undefined, to: string) =>
+			command("task_set_status", { narratorId: id, blockId, status: to });
+		for (const [blockId, to] of [
+			[root, "done"],
+			[root, "cancelled"],
+			[step1, "cancelled"],
+		] as const) {
+			const result = await status(blockId, to);
+			expect(result.error?.code).toBe("CONFLICT");
+			expect(result.error?.message).toContain("locked by a person");
+		}
+		for (const parentBlockId of [root, step2]) {
+			const added = await command("task_add", { narratorId: id, text: "More", parentBlockId });
+			expect(added.error?.code).toBe("CONFLICT");
+		}
+		// What an agent may do in the locked plan, the plugin may: tick a step done, start one.
+		expect((await status(step1, "done")).status).toBe("succeeded");
+		expect((await status(step2, "doing")).status).toBe("succeeded");
+		expect((await block(root as string)).taskJson?.status).toBe("todo");
+		expect((await block(step1 as string)).taskJson?.status).toBe("done");
 	});
 
 	test("not a task of the session: not found; someone else doing it: conflict", async () => {

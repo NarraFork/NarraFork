@@ -109,9 +109,13 @@ export async function readSessionTasksChanged(
 	const read = versions.slice(0, OUTLINE_PLUGIN_TASK_EVENT_LIMITS.versionsPerCommit);
 	const candidates = read.filter((v) => v.seq === event.seq && (v.changeFlags & CHANGES) !== 0);
 	if (candidates.length === 0) return null;
-	// A block that is not a task after the commit counts when it was one just before.
+	// A block that is not a task after the commit counts when it was one just before: only a
+	// version that changed its task or deleted it can be such (review N3).
 	const unknown = candidates.filter(
-		(v) => (v.deleted || v.taskJson === null) && (v.changeFlags & OUTLINE_CHANGE.CREATE) === 0,
+		(v) =>
+			(v.deleted || v.taskJson === null) &&
+			(v.changeFlags & OUTLINE_CHANGE.CREATE) === 0 &&
+			(v.changeFlags & (OUTLINE_CHANGE.TASK | OUTLINE_CHANGE.DELETE)) !== 0,
 	);
 	const before = new Map(
 		unknown.length === 0

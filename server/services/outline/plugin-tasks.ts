@@ -22,7 +22,14 @@
  * The write path does not hold the system to locks (`write.ts`, "Unconstrained"), so the plugin
  * side is held here: a plugin may not finish, cancel or un-mark a task created by a person (as a
  * plugin could not complete or drop a protected spec task: it wrote on the agent's side). It may
- * still start one or put it back to do.
+ * still start one or put it back to do. A person's lock holds the plugin as it would hold an
+ * agent's change to the plan (review S2): no finishing or cancelling the locked task, no
+ * cancelling anything under it, no adding under it.
+ *
+ * A plugin marks a task blocked (the old `spec_write`) with a note under it whose short id follows
+ * from the task ({@link pluginBlockedNoteSid}): while the note is there and the task open, reads
+ * say so (`blocked`), and the same mark is not written twice; a status set by the plugin takes it
+ * away.
  *
  * A write that puts a task in progress for a session that is not running leaves the claim on the
  * idle lease (D41), as a run's end would: a session the plugin starts later renews it.
@@ -31,14 +38,15 @@
  * -------
  * The session space's tasks in document order (its behavior page left out: its checkboxes are
  * rules), page by page in sibling order, each page's structure read once without content
- * (`listPageStructure`, off the main thread when large). A cursor is the position of the last
- * task returned (the order keys and ids from its page down), so a page read later continues after
- * it even when that task has moved or gone. One call reads at most
+ * (`listPageStructure`, off the main thread when large). A cursor names the last task returned
+ * and its page, so a read later continues after it (found on its page again, or placed from its
+ * ancestors when it is gone), whatever its depth. One call reads at most
  * {@link OUTLINE_PLUGIN_TASK_LIMITS.pagesPerRead} pages and
  * {@link OUTLINE_PLUGIN_TASK_LIMITS.rowsPerRead} structure rows; a call that stops early returns a
  * cursor past the last page it read. Text is the head of each task's content, what waits is
  * derived for the open tasks returned only.
  */
+import { createHash } from "node:crypto";
 import { AppError, NotFoundError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { getUserLanguage, type Locale } from "@server/lib/prompt-i18n";
@@ -123,6 +131,8 @@ export const PLUGIN_TASK_TEXT = {
 	notATask: (blockId: string) => `Block ${blockId} is not a task of this session`,
 	parentNotFound: (blockId: string) => `Block ${blockId} is not a live block of this session`,
 	parentOnRules: "Tasks cannot be added on the behavior page: its checkboxes are rules.",
+	locked: (address: string) =>
+		`Task ${address} is locked by a person: a plugin may not finish or cancel it, nor cancel or add tasks under it.`,
 	badCursor: "The cursor is invalid",
 } as const;
 
@@ -175,10 +185,14 @@ export function latestSeq(space: Pick<OutlineSpaceRow, "nextSeq">): number {
 /** One step of a position: a block's order key and id, from its page down. */
 export type OutlinePathStep = readonly [orderKey: string, id: string];
 
-/** Where a read stopped: after the task at `path`, or (`past`) after everything under `path`. */
+/**
+ * Where a read stopped: after the task `blockId` on the page `page` (its order key and id), or,
+ * without `blockId`, after everything on that page. Compact whatever the depth (review N4): the
+ * task's position is found again when its page is read (or from its ancestors when it is gone).
+ */
 export interface SessionTaskCursor {
-	path: readonly OutlinePathStep[];
-	past?: boolean;
+	page: OutlinePathStep;
+	blockId?: string;
 }
 
 /** A task of the session space, as a read finds it. */
@@ -196,6 +210,15 @@ export interface SessionTask {
 	topLevel: boolean;
 	/** A direct child of the session's task page. */
 	onTasksPage: boolean;
+	/** A person locked this task (its plan, design §2.2). */
+	lockRoot: boolean;
+	/** A person locked this task or a task above it. */
+	inLockedTree: boolean;
+}
+
+/** A lock a person holds (only people lock; Q5). */
+export function isPersonLock(task: OutlineTaskJson | null | undefined): boolean {
+	return task?.lock?.by.kind === "human";
 }
 
 function compareStep(a: OutlinePathStep, b: OutlinePathStep): number {
@@ -211,25 +234,11 @@ export function comparePaths(a: readonly OutlinePathStep[], b: readonly OutlineP
 	return a.length - b.length;
 }
 
-/** Whether `path` comes after the cursor (and, for `past`, is not under it). */
-export function isAfterCursor(
-	path: readonly OutlinePathStep[],
-	cursor: SessionTaskCursor,
-): boolean {
-	if (cursor.past && path.length >= cursor.path.length) {
-		const under = cursor.path.every(
-			(step, i) => compareStep(step, path[i] as OutlinePathStep) === 0,
-		);
-		if (under) return false;
-	}
-	return comparePaths(path, cursor.path) > 0;
-}
-
 const CURSOR_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 export function encodeTaskCursor(cursor: SessionTaskCursor): string {
 	return Buffer.from(
-		JSON.stringify({ p: cursor.path, ...(cursor.past ? { x: 1 } : {}) }),
+		JSON.stringify({ p: cursor.page, ...(cursor.blockId ? { b: cursor.blockId } : {}) }),
 		"utf8",
 	).toString("base64url");
 }
@@ -245,23 +254,18 @@ export function decodeTaskCursor(cursor: string): SessionTaskCursor {
 		throw bad();
 	}
 	if (!parsed || typeof parsed !== "object") throw bad();
-	const { p, x } = parsed as { p?: unknown; x?: unknown };
-	if (!Array.isArray(p) || p.length === 0 || p.length > OUTLINE_LIMITS.maxDepth) throw bad();
-	const path: OutlinePathStep[] = [];
-	for (const step of p) {
-		if (
-			!Array.isArray(step) ||
-			step.length !== 2 ||
-			typeof step[0] !== "string" ||
-			typeof step[1] !== "string" ||
-			!isOrderKey(step[0]) ||
-			!CURSOR_ID.test(step[1])
-		)
-			throw bad();
-		path.push([step[0], step[1]]);
-	}
-	if (x !== undefined && x !== 1) throw bad();
-	return { path, ...(x === 1 ? { past: true } : {}) };
+	const { p, b } = parsed as { p?: unknown; b?: unknown };
+	if (
+		!Array.isArray(p) ||
+		p.length !== 2 ||
+		typeof p[0] !== "string" ||
+		typeof p[1] !== "string" ||
+		!isOrderKey(p[0]) ||
+		!CURSOR_ID.test(p[1])
+	)
+		throw bad();
+	if (b !== undefined && (typeof b !== "string" || !CURSOR_ID.test(b))) throw bad();
+	return { page: [p[0], p[1]], ...(typeof b === "string" ? { blockId: b } : {}) };
 }
 
 export interface SessionTaskWalk {
@@ -270,6 +274,29 @@ export interface SessionTaskWalk {
 	next: SessionTaskCursor | null;
 	/** The read stopped at its page or row budget before the end of the space. */
 	cut: boolean;
+}
+
+/**
+ * The position of a block that is not on its page's live structure any more (deleted, or moved
+ * since a cursor named it), from its ancestors as stored (a deleted block keeps its parent and
+ * order key): one read per level. Null when its chain does not lead to `pageId`.
+ */
+async function storedPath(
+	store: OutlineStore,
+	spaceId: string,
+	blockId: string,
+	pageId: string,
+): Promise<OutlinePathStep[] | null> {
+	const steps: OutlinePathStep[] = [];
+	let id: string | null = blockId;
+	for (let depth = 0; id !== null && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+		const [meta] = await store.getBlockMetas(spaceId, { ids: [id] });
+		if (!meta) return null;
+		steps.unshift([meta.orderKey, meta.id]);
+		if (meta.parentId === null) return meta.id === pageId ? steps : null;
+		id = meta.parentId;
+	}
+	return null;
 }
 
 /**
@@ -301,7 +328,8 @@ export async function walkSessionTasks(
 	let lastPage: OutlinePathStep | null = null;
 	const full = () => out.length > options.limit || budgetHit;
 
-	const visitPage = async (page: { id: string; orderKey: string }) => {
+	/** Read a page's tasks; with `resumeAfter`, only those after that block (the cursor's). */
+	const visitPage = async (page: { id: string; orderKey: string }, resumeAfter?: string) => {
 		if (rulePages.has(page.id)) return;
 		if (pagesRead >= limits.pagesPerRead || rowsRead >= limits.rowsPerRead) {
 			budgetHit = true;
@@ -320,7 +348,9 @@ export async function walkSessionTasks(
 			});
 		const children = new Map<string, OutlineStructureRow[]>();
 		let root: OutlineStructureRow | null = null;
+		let resumeLive = false;
 		for (const row of structure.rows) {
+			if (row.id === resumeAfter) resumeLive = true;
 			if (row.parentId === null) {
 				if (row.id === page.id) root = row;
 				continue;
@@ -332,12 +362,26 @@ export async function walkSessionTasks(
 		if (!root) return;
 		for (const siblings of children.values())
 			siblings.sort((a, b) => compareStep([a.orderKey, a.id], [b.orderKey, b.id]));
+		// The cursor's task: skipped up to and including it when it is on the page; else its stored
+		// position (or, when it cannot be placed here, nothing) decides.
+		let skipping = resumeAfter !== undefined && resumeLive;
+		const after =
+			resumeAfter !== undefined && !resumeLive
+				? await storedPath(store, space.id, resumeAfter, page.id)
+				: null;
 		// Depth first in document order, without recursion (an outline may be deep).
-		const stack: Array<{ row: OutlineStructureRow; path: OutlinePathStep[]; underTask: boolean }> =
-			[{ row: root, path: [[root.orderKey, root.id]], underTask: false }];
+		const stack: Array<{
+			row: OutlineStructureRow;
+			path: OutlinePathStep[];
+			underTask: boolean;
+			locked: boolean;
+		}> = [{ row: root, path: [[root.orderKey, root.id]], underTask: false, locked: false }];
 		while (stack.length > 0) {
-			const { row, path, underTask } = stack.pop() as (typeof stack)[number];
-			if (row.taskJson) {
+			const { row, path, underTask, locked } = stack.pop() as (typeof stack)[number];
+			const lockRoot = isPersonLock(row.taskJson);
+			if (skipping) {
+				if (row.id === resumeAfter) skipping = false;
+			} else if (row.taskJson && (!after || comparePaths(path, after) > 0)) {
 				const task: SessionTask = {
 					id: row.id,
 					sid: row.sid,
@@ -349,8 +393,10 @@ export async function walkSessionTasks(
 					depth: path.length - 1,
 					topLevel: !underTask,
 					onTasksPage: tasksPageId !== null && row.parentId === tasksPageId,
+					lockRoot,
+					inLockedTree: locked || lockRoot,
 				};
-				if ((!cursor || isAfterCursor(path, cursor)) && (options.keep?.(task) ?? true)) {
+				if (options.keep?.(task) ?? true) {
 					out.push(task);
 					if (out.length > options.limit) return;
 				}
@@ -362,6 +408,7 @@ export async function walkSessionTasks(
 					row: child,
 					path: [...path, [child.orderKey, child.id]],
 					underTask: underTask || row.taskJson !== null,
+					locked: locked || lockRoot,
 				});
 			}
 		}
@@ -371,12 +418,11 @@ export async function walkSessionTasks(
 	// The cursor's page again, when it is still where the cursor left it; then the pages after it.
 	let after: { orderKey: string; id: string } | null = null;
 	if (cursor) {
-		const first = cursor.path[0] as OutlinePathStep;
-		after = { orderKey: first[0], id: first[1] };
-		if (!(cursor.past && cursor.path.length === 1)) {
-			const [meta] = await store.getBlockMetas(space.id, { ids: [first[1]] });
-			if (meta && !meta.deleted && meta.parentId === null && meta.orderKey === first[0])
-				await visitPage(meta);
+		after = { orderKey: cursor.page[0], id: cursor.page[1] };
+		if (cursor.blockId) {
+			const [meta] = await store.getBlockMetas(space.id, { ids: [cursor.page[1]] });
+			if (meta && !meta.deleted && meta.parentId === null && meta.orderKey === cursor.page[0])
+				await visitPage(meta, cursor.blockId);
 		}
 	}
 	while (!full()) {
@@ -390,11 +436,14 @@ export async function walkSessionTasks(
 	}
 	if (out.length > options.limit) {
 		const tasks = out.slice(0, options.limit);
-		return { tasks, next: { path: (tasks.at(-1) as SessionTask).path }, cut: false };
+		const last = tasks.at(-1) as SessionTask;
+		return {
+			tasks,
+			next: { page: last.path[0] as OutlinePathStep, blockId: last.id },
+			cut: false,
+		};
 	}
-	if (budgetHit) {
-		return { tasks: out, next: lastPage ? { path: [lastPage], past: true } : null, cut: true };
-	}
+	if (budgetHit) return { tasks: out, next: lastPage ? { page: lastPage } : null, cut: true };
 	return { tasks: out, next: null, cut: false };
 }
 
@@ -439,6 +488,8 @@ export interface PluginTaskRow {
 	status: OutlineTaskJson["status"];
 	/** It cannot go on now: a prerequisite, a person or a confirmation. */
 	waiting: boolean;
+	/** Open and marked blocked by a plugin (its note under the task; the old `spec_write`). */
+	blocked: boolean;
 	humanCreated: boolean;
 	parentBlockId: string | null;
 	depth: number;
@@ -483,9 +534,17 @@ export async function readPluginTasks(args: {
 		};
 	const walk = await walkSessionTasks(space, { cursor, limit, store });
 	const ids = walk.tasks.map((t) => t.id);
-	const [texts, waiting] = await Promise.all([
+	const open = walk.tasks.filter(
+		(t) => t.taskJson.status === "todo" || t.taskJson.status === "doing",
+	);
+	const [texts, waiting, notes] = await Promise.all([
 		readTaskTexts(ids, store),
 		readWaitingTasks(walk.tasks, space.id, store),
+		readPluginBlockedNotes(
+			open.map((t) => t.id),
+			space.id,
+			store,
+		),
 	]);
 	return {
 		backend: "outline",
@@ -498,6 +557,7 @@ export async function readPluginTasks(args: {
 			text: texts.get(t.id) ?? "",
 			status: t.taskJson.status,
 			waiting: waiting.has(t.id),
+			blocked: notes.get(t.id)?.live === true,
 			humanCreated: t.taskJson.humanCreated === true,
 			parentBlockId: t.parentId,
 			depth: t.depth,
@@ -552,6 +612,47 @@ export async function writeForPlugin(
 		);
 	}
 	return result;
+}
+
+/** The task holding the nearest person's lock over a block (it, or a task above it), if any. */
+export async function personLockOver(
+	store: OutlineStore,
+	spaceId: string,
+	blockId: string,
+): Promise<{ id: string; sid: string; self: boolean } | null> {
+	let id: string | null = blockId;
+	for (let depth = 0; id !== null && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+		const [meta] = await store.getBlockMetas(spaceId, { ids: [id] });
+		if (!meta) return null;
+		if (isPersonLock(meta.taskJson)) return { id: meta.id, sid: meta.sid, self: depth === 0 };
+		id = meta.parentId;
+	}
+	return null;
+}
+
+function lockAddress(space: Pick<OutlineSpaceRow, "key">, lock: { sid: string }): string {
+	return `${space.key}/${lock.sid}`;
+}
+
+/** The short id of the note a plugin writes under a task it marks blocked: one per task (S5). */
+export function pluginBlockedNoteSid(taskId: string): string {
+	return `pb${createHash("sha256").update(`plugin-blocked\u0000${taskId}`).digest("hex").slice(0, 12)}`;
+}
+
+/** The blocked notes of these tasks, by task id: live, or deleted (a person or agent took it). */
+export async function readPluginBlockedNotes(
+	taskIds: readonly string[],
+	spaceId: string,
+	store: OutlineStore = outlineStore,
+): Promise<Map<string, { id: string; live: boolean }>> {
+	const out = new Map<string, { id: string; live: boolean }>();
+	if (taskIds.length === 0) return out;
+	const bySid = new Map(taskIds.map((id) => [pluginBlockedNoteSid(id), id]));
+	for (const meta of await store.getBlockMetas(spaceId, { sids: [...bySid.keys()] })) {
+		const taskId = bySid.get(meta.sid);
+		if (taskId && meta.parentId === taskId) out.set(taskId, { id: meta.id, live: !meta.deleted });
+	}
+	return out;
 }
 
 /** The session's task page, made (in `ops`, as temp id `page`) when it does not exist yet. */
@@ -643,6 +744,12 @@ export async function addPluginTask(args: {
 			parentId = page.id;
 			ops.push(...page.ops);
 		}
+		// Nothing is added to a plan a person locked (review S2).
+		if (parentId) {
+			const lock = await personLockOver(store, space.id, parentId);
+			if (lock)
+				throw new PluginTaskError("CONFLICT", PLUGIN_TASK_TEXT.locked(lockAddress(space, lock)));
+		}
 		if (parentId) {
 			const existing = await findSameTask(store, space, parentId, bodyFromText(text));
 			if (existing)
@@ -727,6 +834,16 @@ export async function setPluginTaskStatus(args: {
 		meta.taskJson.status !== args.status
 	)
 		throw new PluginTaskError("CONFLICT", PLUGIN_TASK_TEXT.humanCreated(address));
+	// A person's lock (review S2): the locked task is not finished or cancelled by a plugin, and
+	// nothing under it is cancelled (an agent's such change waits for the person).
+	if (
+		meta.taskJson.status !== args.status &&
+		(args.status === "done" || args.status === "cancelled")
+	) {
+		const lock = await personLockOver(store, space.id, meta.id);
+		if (lock && (lock.self || args.status === "cancelled"))
+			throw new PluginTaskError("CONFLICT", PLUGIN_TASK_TEXT.locked(lockAddress(space, lock)));
+	}
 	if (meta.taskJson.status === args.status) {
 		if (args.baseVersionSeq !== undefined && args.baseVersionSeq !== meta.versionSeq)
 			throw new PluginTaskError(
@@ -741,6 +858,8 @@ export async function setPluginTaskStatus(args: {
 			changed: false,
 		};
 	}
+	// A status the plugin sets ends a blocked mark it made.
+	const note = (await readPluginBlockedNotes([meta.id], space.id, store)).get(meta.id);
 	const result = await writeForPlugin(
 		session,
 		space,
@@ -752,6 +871,7 @@ export async function setPluginTaskStatus(args: {
 				task: { status: args.status },
 				...(args.baseVersionSeq !== undefined ? { baseVersionSeq: args.baseVersionSeq } : {}),
 			},
+			...(note?.live ? [{ op: "delete" as const, block: { id: note.id } }] : []),
 		],
 		OUTLINE_TEXT.pluginTaskStatus(args.pluginId, address, args.status),
 		{ store, isRunning: args.isRunning },
