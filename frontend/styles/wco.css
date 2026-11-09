@@ -107,7 +107,9 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 	html[data-nf-wco] .nf-wco-main-strip {
 		display: block;
 		position: sticky;
-		top: 0;
+		/* Main's padded scrollport shifts sticky top: 0 down by its md gutter.
+		   Match the negative margin so the strip stays at the window's top edge. */
+		top: calc(var(--mantine-spacing-md) * -1);
 		z-index: 100;
 		height: var(--nf-wco-strip-height);
 		margin-top: calc(var(--mantine-spacing-md) * -1);
