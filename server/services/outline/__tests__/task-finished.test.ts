@@ -9,7 +9,8 @@
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { db } from "../../../db";
+import { readTestMessageContent } from "../../../../tests/setup";
+import { db, sqlite } from "../../../db";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -189,7 +190,6 @@ async function notices(narratorId: string) {
 	const rows = await db
 		.select({
 			id: narratorMessages.id,
-			json: narratorMessages.contentJson,
 			role: narratorMessages.role,
 			createdBy: narratorMessages.createdBy,
 		})
@@ -197,7 +197,7 @@ async function notices(narratorId: string) {
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId));
 	return rows.flatMap((row) =>
-		((row.json ?? []) as Array<Record<string, unknown>>)
+		readTestMessageContent(sqlite, row.id)
 			.filter((b) => b.type === "system_injection" && b.source === OUTLINE_TASK_FINISHED_SOURCE)
 			.map((b) => ({
 				id: row.id,

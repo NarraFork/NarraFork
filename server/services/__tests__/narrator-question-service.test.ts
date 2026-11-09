@@ -14,7 +14,7 @@
  *     never injects looks fine in the UI and is invisible to the agent.
  */
 
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
@@ -86,6 +86,11 @@ const {
 	withdrawAsyncQuestions,
 } = await import("../narrator-question-service");
 const { settings } = await import("../../lib/settings");
+const compactJson = settings.narratorBlocks.compactJson;
+const { noteRowsOnlyEnvelopes } = await import("../narrator-block-scans");
+afterEach(() => {
+	settings.narratorBlocks.compactJson = compactJson;
+});
 
 const createAsyncQuestion = (args: Parameters<typeof createQuestionRecord>[0]) =>
 	createQuestionRecord({
@@ -1468,6 +1473,9 @@ describe("listAsyncQuestions", () => {
 
 describe("receipt supplements with block reads", () => {
 	test("event text matches the content_json read, and comes from the receipt's block", async () => {
+		// Both copies must exist for the read switch to select the deliberately different one.
+		settings.narratorBlocks.compactJson = false;
+		noteRowsOnlyEnvelopes(undefined);
 		const call = await seedToolCall();
 		const { record } = await createAsyncQuestion({
 			narratorId: NARRATOR_ID,

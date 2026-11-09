@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { asc, eq } from "drizzle-orm";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 
 // The snapshot worker shares the preload-isolated file-backed database.
@@ -136,10 +136,15 @@ async function narratorStatus(narratorId: string): Promise<string | undefined> {
 	return narrator?.status;
 }
 
-async function guardNoteCount(narratorId: string): Promise<number> {
-	const messages = await db.query.narratorMessages.findMany({
+async function storedMessages(narratorId: string) {
+	const rows = await db.query.narratorMessages.findMany({
 		where: eq(narratorMessages.narratorId, narratorId),
 	});
+	return rows.map((row) => ({ ...row, contentJson: readTestMessageContent(sqlite, row.id) }));
+}
+
+async function guardNoteCount(narratorId: string): Promise<number> {
+	const messages = await storedMessages(narratorId);
 	return messages.filter((message) =>
 		(message.contentJson as Array<{ type?: string; source?: string }>).some(
 			(block) => block.type === "system_injection" && block.source === "interrupt_task_guard",
@@ -148,9 +153,7 @@ async function guardNoteCount(narratorId: string): Promise<number> {
 }
 
 async function specContinuationCount(narratorId: string): Promise<number> {
-	const messages = await db.query.narratorMessages.findMany({
-		where: eq(narratorMessages.narratorId, narratorId),
-	});
+	const messages = await storedMessages(narratorId);
 	return messages.filter((message) =>
 		(message.contentJson as Array<{ type?: string }>).some(
 			(block) => block.type === "spec_continuation",
@@ -212,9 +215,7 @@ describe("interrupt task guard", () => {
 		// interrupt_task_guard system_injection block. contentJson may come back as
 		// a raw string from the driver, so parse defensively before matching.
 		await waitFor(async () => {
-			const messages = await db.query.narratorMessages.findMany({
-				where: eq(narratorMessages.narratorId, narratorId),
-			});
+			const messages = await storedMessages(narratorId);
 			return messages.some((message) => {
 				const blocks: unknown =
 					typeof message.contentJson === "string"
@@ -226,11 +227,7 @@ describe("interrupt task guard", () => {
 			});
 		}, 15_000);
 
-		const guardMessage = (
-			await db.query.narratorMessages.findMany({
-				where: eq(narratorMessages.narratorId, narratorId),
-			})
-		).find((message) => {
+		const guardMessage = (await storedMessages(narratorId)).find((message) => {
 			const blocks: unknown =
 				typeof message.contentJson === "string"
 					? JSON.parse(message.contentJson)
@@ -310,9 +307,7 @@ describe("interrupt task guard", () => {
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.narratorId, narratorId))
 			.orderBy(asc(narratorMessageRefs.seq));
-		const messages = await db.query.narratorMessages.findMany({
-			where: eq(narratorMessages.narratorId, narratorId),
-		});
+		const messages = await storedMessages(narratorId);
 		const guardId = messages.find((message) => {
 			const blocks: unknown =
 				typeof message.contentJson === "string"
@@ -404,9 +399,7 @@ describe("interrupt task guard", () => {
 		await sendPromise;
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
 
-		const messages = await db.query.narratorMessages.findMany({
-			where: eq(narratorMessages.narratorId, narratorId),
-		});
+		const messages = await storedMessages(narratorId);
 		const block = messages
 			.flatMap(
 				(message) =>

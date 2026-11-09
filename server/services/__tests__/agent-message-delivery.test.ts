@@ -1,5 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import type { NativeInjectionBlock } from "@shared/native-injection";
+import type { SideCarBody } from "@shared/sidecar-body";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	agentMessageDeliveryBody,
 	consumeAgentMessageHistory,
@@ -170,13 +172,17 @@ function send(
 }
 function row(id: string | undefined) {
 	return sqlite
-		.prepare("SELECT id, role, content_text, content_json FROM narrator_messages WHERE id = ?")
+		.prepare("SELECT id, role, content_text FROM narrator_messages WHERE id = ?")
 		.get(id ?? "") as {
 		id: string;
 		role: string;
 		content_text: string;
-		content_json: string;
 	} | null;
+}
+function messageContent(id: string | undefined) {
+	return readTestMessageContent<
+		NativeInjectionBlock & { body: Extract<SideCarBody, { kind: "messages" }> }
+	>(sqlite, id ?? "");
 }
 function consumedAt(messageId: string | undefined, narratorId = "child") {
 	return (
@@ -374,11 +380,8 @@ describe("Send exact delivery receipts", () => {
 		const id = sent.targets[0].deliveryMessageId as string;
 		expect((await agentQueued())[0].delivery?.senderToolCallBinding).toEqual(binding);
 		const prepared = await consume();
-		const saved = row(id);
 		// The Send is one injection row: its first block carries the exact delivery body.
-		expect(JSON.parse(saved?.content_json ?? "[]")[0].body.items[0].fromToolCallBinding).toEqual(
-			binding,
-		);
+		expect(messageContent(id)[0].body.items[0].fromToolCallBinding).toEqual(binding);
 		consumeAgentMessageHistory(prepared?.history ?? []);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		const receipts = broadcasts.filter(
@@ -414,13 +417,12 @@ describe("Send exact delivery receipts", () => {
 				"INSERT INTO narrator_message_refs (id,narrator_id,message_id,seq) VALUES ('fork-ref','sibling',?,1)",
 			)
 			.run(id);
-		const saved = row(id);
 		const reloaded = [
 			{
 				id,
 				narratorId: "child",
 				role: "user",
-				contentJson: JSON.parse(saved?.content_json ?? "[]"),
+				contentJson: messageContent(id),
 			},
 		];
 		const freshHistory: unknown[] = [];
@@ -667,10 +669,9 @@ describe("Send exact delivery receipts", () => {
 		const sent = await send();
 		const id = sent.targets[0].deliveryMessageId as string;
 		await consume();
-		const saved = row(id);
 		const history: unknown[] = [];
 		trackAgentMessageHistory("child", history, [
-			{ id, narratorId: "child", role, contentJson: JSON.parse(saved?.content_json ?? "[]") },
+			{ id, narratorId: "child", role, contentJson: messageContent(id) },
 		]);
 		consumeAgentMessageHistory(history);
 		await new Promise((resolve) => setTimeout(resolve, 0));
@@ -722,7 +723,7 @@ describe("Send exact delivery receipts", () => {
 		// Materialized once as an injection row of the recipient, with the producer's framing.
 		expect(row(id)?.content_text).toBe("[Message from the parent narrator]\nsame words");
 		expect(row(id)?.role).toBe("sys");
-		expect(JSON.parse(row(id)?.content_json ?? "[]")[0]).toMatchObject({
+		expect(messageContent(id)[0]).toMatchObject({
 			type: "system_injection",
 			source: "subagent_message",
 			body: agentMessageDeliveryBody(envelope as NonNullable<typeof envelope>),
@@ -749,8 +750,8 @@ describe("Send exact delivery receipts", () => {
 		);
 		await consume();
 		await consume();
-		expect(JSON.parse(row(ids[0])?.content_json ?? "[]")[0].body.items[0].fromId).toBe("parent");
-		expect(JSON.parse(row(ids[1])?.content_json ?? "[]")[0].body.items[0].fromId).toBe("sibling");
+		expect(messageContent(ids[0])[0].body.items[0].fromId).toBe("parent");
+		expect(messageContent(ids[1])[0].body.items[0].fromId).toBe("sibling");
 	});
 
 	test("clearing user buffers preserves accepted agent delivery and identical human text stays separate", async () => {
@@ -765,11 +766,11 @@ describe("Send exact delivery receipts", () => {
 		await restart();
 		const human = sqlite
 			.prepare(
-				"SELECT origin, content_json FROM narrator_messages WHERE narrator_id = 'child' AND origin = 'user'",
+				"SELECT id, origin FROM narrator_messages WHERE narrator_id = 'child' AND origin = 'user'",
 			)
-			.get() as { origin: string; content_json: string };
+			.get() as { id: string; origin: string };
 		expect(human.origin).toBe("user");
-		expect(JSON.parse(human.content_json)).toHaveLength(1);
+		expect(readTestMessageContent(sqlite, human.id)).toHaveLength(1);
 	});
 
 	test("human buffer editing cannot rewrite an accepted agent message or its attribution", async () => {
@@ -865,20 +866,19 @@ describe("Send exact delivery receipts", () => {
 		});
 		expect(injected.messageId).toBe(id ?? null);
 		expect(row(id)?.role).toBe("sys");
-		const nativeBlocks = JSON.parse(row(id)?.content_json ?? "[]");
+		const nativeBlocks = messageContent(id);
 		expect(nativeBlocks).toHaveLength(1);
 		expect(nativeBlocks[0].modelText).toBe("same words");
 		expect(injected.turnText).toBe('<sender kind="agent" id="child" name="child" />\nsame words');
 		expect(injected.turnText?.match(/same words/g)).toHaveLength(1);
 		expect(consumedAt(id, "parent")).toBeNull();
-		const source = row(id);
 		const history: unknown[] = [];
 		trackAgentMessageHistory("parent", history, [
 			{
 				id: id as string,
 				narratorId: "parent",
 				role: "sys",
-				contentJson: JSON.parse(source?.content_json ?? "[]"),
+				contentJson: messageContent(id),
 			},
 		]);
 		consumeAgentMessageHistory(history);
@@ -1141,7 +1141,7 @@ describe("Send exact delivery receipts", () => {
 			schedule: "onNextTurn",
 		});
 		expect(consumedAt(first)).toBeNull();
-		const teamBlocks = JSON.parse(row(first)?.content_json ?? "[]");
+		const teamBlocks = messageContent(first);
 		expect(teamBlocks).toHaveLength(1);
 		expect(teamBlocks[0].modelText).toBe("same");
 		expect(injection.turnText).toBe('<sender kind="agent" id="parent" name="parent" />\nsame');
@@ -1151,7 +1151,7 @@ describe("Send exact delivery receipts", () => {
 				id: first as string,
 				narratorId: "child",
 				role: "sys",
-				contentJson: JSON.parse(row(first)?.content_json ?? "[]"),
+				contentJson: messageContent(first),
 			},
 		]);
 		consumeAgentMessageHistory(history);

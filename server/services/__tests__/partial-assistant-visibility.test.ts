@@ -17,7 +17,7 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { FileReferenceContext } from "@shared/file-reference";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import type { AgentConfig, AgentEvent, ContentBlock } from "../../lib/agent/types";
 import type { EventHandlerContext } from "../narrator-event-handler";
 
@@ -110,10 +110,7 @@ function makeContext(subagent = false): EventHandlerContext {
 }
 
 function storedBlocks(messageId: string): Array<Record<string, unknown>> {
-	const row = sqlite
-		.prepare("SELECT content_json AS c FROM narrator_messages WHERE id = ?")
-		.get(messageId) as { c: string };
-	return JSON.parse(row.c);
+	return readTestMessageContent(sqlite, messageId);
 }
 
 function seqOf(messageId: string): number {
@@ -169,10 +166,7 @@ describe("partial assistant visibility", () => {
 		});
 
 		expect(messageVersionOf()).toBeGreaterThan(0);
-		const raw = sqlite
-			.prepare("SELECT content_json AS c FROM narrator_messages WHERE id = ?")
-			.get(partial.id) as { c: string } | undefined;
-		const blocks: unknown[] = raw?.c ? JSON.parse(raw.c) : [];
+		const blocks = readTestMessageContent(sqlite, partial.id);
 		expect(blocks.some((b) => (b as { type?: string }).type === "reasoning")).toBe(true);
 
 		// Catch-up that follows a version bump must be able to see the same body.

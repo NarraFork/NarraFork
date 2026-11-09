@@ -7,7 +7,7 @@ import type { MediaRef } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { modelInputText } from "../../../tests/fixtures/model-input";
 import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -1031,7 +1031,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{ type: "error", message: "fixture exhausted provider retries", diagnostics },
 			]);
 		});
@@ -1059,7 +1060,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{
 					type: "error",
 					message: "upstream failure 3",

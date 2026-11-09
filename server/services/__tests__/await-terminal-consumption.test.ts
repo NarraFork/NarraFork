@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -718,12 +718,8 @@ test("Await forwards the exact deferred source even when another run starts befo
 		text: "awaited run answer",
 		summary: "completed",
 	});
-	const snapshot = db
-		.select()
-		.from(narratorMessages)
-		.where(eq(narratorMessages.id, `publication-result:${next.logicalRunId}`))
-		.get();
-	expect(snapshot?.contentJson).toMatchObject([
+	const snapshot = readTestMessageContent(sqlite, `publication-result:${next.logicalRunId}`);
+	expect(snapshot).toMatchObject([
 		{ publicationResult: { sourceResultRef: "message:awaited-answer" } },
 	]);
 });

@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { modelInputText, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -576,7 +576,7 @@ describe("a held run (user takeover) is continued in place", () => {
 			.from(narratorMessages)
 			.where(eq(narratorMessages.narratorId, CHILD))
 			.all()
-			.filter((row) => JSON.stringify(row.contentJson).includes(text));
+			.filter((row) => JSON.stringify(readTestMessageContent(sqlite, row.id)).includes(text));
 		expect(rows).toHaveLength(1);
 		await settle(() => !!getRunControl(CHILD)?.wake);
 		const queued = db
