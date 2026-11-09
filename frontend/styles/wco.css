@@ -147,9 +147,25 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 		--dv-tabs-and-actions-container-height: var(--nf-wco-row-height);
 	}
 
+	/*
+	 * Controls inside a title-bar row stay clickable. The tab-overflow counter is a
+	 * bare div, so without an entry here the drag region swallows its clicks and
+	 * pressing it moves the window instead of opening the tab list.
+	 */
 	html[data-nf-wco]
 		[data-nf-titlebar-row]
-		:is(button, a, input, select, textarea, [role="button"], [role="tab"], .dv-tab) {
+		:is(
+			button,
+			a,
+			input,
+			select,
+			textarea,
+			[role="button"],
+			[role="tab"],
+			.dv-tab,
+			.dv-tabs-overflow-dropdown-root,
+			.dv-tabs-overflow-dropdown-default
+		) {
 		-webkit-app-region: no-drag;
 	}
 

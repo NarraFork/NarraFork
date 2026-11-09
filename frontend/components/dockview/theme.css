@@ -64,6 +64,15 @@
 	--dv-context-menu-background-color: var(--mantine-color-default);
 	--dv-context-menu-color: var(--mantine-color-text);
 
+	/*
+	 * Dockview paints its built-in popovers — the tab-overflow list and the context
+	 * menu — in a wrapper whose z-index is this variable. The built-in themes define
+	 * it; a custom theme replaces them, so leaving it out makes the declaration
+	 * invalid and the popover stacks below the panels that follow it in the DOM. It
+	 * opens, but nothing of it is visible or clickable.
+	 */
+	--dv-overlay-z-index: 999;
+
 	/* Icons */
 	--dv-icon-hover-background-color: var(--mantine-color-default-hover);
 
@@ -251,4 +260,61 @@
 
 .dockview-theme-narrafork .dv-tab .dv-default-tab-action:hover {
 	background-color: var(--mantine-color-default-hover);
+}
+
+/*
+ * The tab-overflow list ("▾ N").
+ *
+ * Dockview builds it from bare elements with no styling of their own — the built-in
+ * themes dress it, and a custom theme replaces those — so without this it renders as
+ * raw rows floating over the panel. Entries reuse `.dv-tab`, which means the tab
+ * chrome below (background, separators, active underline) has to be undone here.
+ */
+.dockview-theme-narrafork .dv-tabs-overflow-container {
+	min-width: 180px;
+	max-width: 280px;
+	max-height: min(320px, 60vh);
+	overflow-y: auto;
+	padding: 4px;
+	background-color: var(--mantine-color-body);
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: var(--mantine-radius-sm);
+	box-shadow: var(--mantine-shadow-md);
+}
+
+.dockview-theme-narrafork .dv-tabs-overflow-container .dv-tab {
+	width: 100%;
+	height: 30px;
+	padding: 0 8px;
+	border-radius: var(--mantine-radius-sm);
+	background-color: transparent;
+	--tab-shadow-left: 0 0 0 0 transparent;
+	--tab-shadow-bottom: 0 0 0 0 transparent;
+	box-shadow: none;
+	color: var(--mantine-color-text);
+	font-weight: 400;
+}
+
+.dockview-theme-narrafork .dv-tabs-overflow-container .dv-tab:hover {
+	background-color: var(--mantine-color-default-hover);
+}
+
+/* The current tab, marked but without the strip's underline bar. */
+.dockview-theme-narrafork .dv-tabs-overflow-container .dv-tab.dv-active-tab {
+	background-color: var(--mantine-color-default-hover) !important;
+	font-weight: 600;
+}
+
+.dockview-theme-narrafork .dv-tabs-overflow-container .dv-tab.dv-active-tab::before {
+	display: none;
+}
+
+/* Rows carry a close button too; keep it quiet until the row is pointed at. */
+.dockview-theme-narrafork .dv-tabs-overflow-container .dv-tab .dv-default-tab-action {
+	opacity: 0.35;
+	margin-left: 12px;
+}
+
+.dockview-theme-narrafork .dv-tabs-overflow-container .dv-tab:hover .dv-default-tab-action {
+	opacity: 1;
 }
