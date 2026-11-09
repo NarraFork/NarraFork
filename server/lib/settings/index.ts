@@ -53,6 +53,7 @@ import { loadSpeechSettings } from "../speech-settings";
 import { settingsUnreadable } from "../startup-status/startup-problems";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
+import { initialPlatformInstances } from "./platform-instances";
 import { _bindSettings } from "./provider";
 import {
 	absorbProviderKeys,
@@ -122,6 +123,7 @@ export {
 	hasConfiguredNugProvider,
 	isAnthropicProvider,
 	isGeminiProvider,
+	isPlatformInstanceUsable,
 	LARGE_CONTEXT_BOUNDARY,
 	listAutoModelCandidates,
 	listAutoModelIds,
@@ -134,6 +136,7 @@ export {
 	orderedAutoModelCandidates,
 	parseAggModelValue,
 	parseModelId,
+	platformInstanceForPrefix,
 	referencePricePerMillion,
 	registerAnthropicModelChecker,
 	registerAnthropicModelLister,
@@ -669,6 +672,18 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (normalizeCustomApiProviderSettings(merged)) {
 		needsSave = true;
 	}
+	// 「平台集成」实例清单：旧单例落成每个平台的初始实例，只在文件里还没有清单时执行一次。
+	// 之后清单就是唯一事实来源，删光实例也不会再生成。必须排在密钥吸收之前：实例的密钥要
+	// 在同一次加载里落进 key store，否则首轮升级只会把它当成待清空的遗留明文。
+	if (raw.agent?.platformInstances === undefined) {
+		merged.agent.platformInstances = initialPlatformInstances({
+			codex: merged.codex as Record<string, unknown> | undefined,
+			commandCode: merged.commandCode as Record<string, unknown> | undefined,
+			tokendance: merged.tokendance as Record<string, unknown> | undefined,
+		});
+		needsSave = true;
+	}
+
 	// Keys move to provider-keys.json, written in the form `secrets.encrypt` asks for. A hot
 	// reload leaves the switch to the change listener, which also rewrites existing files.
 	if (!_cache.current) setSecretEncryption(merged.secrets?.encrypt !== false);

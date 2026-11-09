@@ -175,6 +175,33 @@ describe("provider keys in a data export", () => {
 		expect(keysOf("local-id").map((key) => key.apiKey)).toEqual(["sk-first", "sk-local-only"]);
 	});
 
+	test("平台实例的密钥同样走封存包，导入后回到同一个实例", async () => {
+		setProviders({});
+		const instance = {
+			id: "platform-cc-1",
+			platform: "CommandCode" as const,
+			suffix: "1",
+			prefix: "CommandCode-1",
+			disabled: false,
+			config: { apiKey: "cc-secret" },
+		};
+		const draft = structuredClone(settings);
+		draft.agent.platformInstances = [instance];
+		saveSettings(draft);
+		expect(getProviderKeyStore().firstKey("platform:platform-cc-1")).toBe("cc-secret");
+
+		const zip = await readFile(
+			(await exportData(providersOnly, { passphrase: PASSPHRASE })).zipPath,
+		);
+		setProviders({});
+		const preview = await previewImport(toArrayBuffer(zip), "instances.zip");
+		expect(JSON.stringify(preview.providers.platformInstances)).not.toContain("cc-secret");
+
+		await applyImport(preview.token, { conflictDefault: "skip", passphrase: PASSPHRASE });
+		expect(settings.agent.platformInstances?.[0]?.config.apiKey).toBe("cc-secret");
+		expect(getProviderKeyStore().firstKey("platform:platform-cc-1")).toBe("cc-secret");
+	});
+
 	test("a provider that had to take a new prefix gets its keys under its new id", async () => {
 		const zip = await exportFromSource();
 		setProviders({

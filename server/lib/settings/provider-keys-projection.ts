@@ -21,6 +21,8 @@ export const TOKENDANCE_KEY_OWNER = "builtin:tokendance";
 export const COMMAND_CODE_KEY_OWNER = "builtin:CommandCode";
 export const nugKeyOwner = (providerId: string) => `nug:${providerId}`;
 export const searchKeyOwner = (providerId: string) => `search:${providerId}`;
+/** 每个平台实例一份密钥，删掉实例时由 pruneProviderKeys 一并清掉。 */
+export const platformInstanceKeyOwner = (instanceId: string) => `platform:${instanceId}`;
 
 /** One settings field whose secret lives in the key store. */
 interface KeySlot {
@@ -51,6 +53,15 @@ function keySlots(settings: NarraForkSettings): KeySlot[] {
 	}
 	for (const holder of settings.search?.customProviders ?? []) {
 		slots.push({ owner: searchKeyOwner(holder.id), pooled: false, holder, required: false });
+	}
+	// 平台实例的密钥写在实例自己的 config 里；投影把它挪进 key store，删实例即删密钥。
+	for (const instance of settings.agent?.platformInstances ?? []) {
+		slots.push({
+			owner: platformInstanceKeyOwner(instance.id),
+			pooled: false,
+			holder: instance.config,
+			required: false,
+		});
 	}
 	return slots;
 }
@@ -119,6 +130,17 @@ export function withoutProviderKeys(settings: NarraForkSettings): NarraForkSetti
 		nugProviders: blank(settings.nugProviders),
 		...(settings.tokendance ? { tokendance: { ...settings.tokendance, apiKey: "" } } : {}),
 		...(settings.commandCode ? { commandCode: omit(settings.commandCode) } : {}),
+		...(settings.agent?.platformInstances
+			? {
+					agent: {
+						...settings.agent,
+						platformInstances: settings.agent.platformInstances.map((instance) => ({
+							...instance,
+							config: omit(instance.config),
+						})),
+					},
+				}
+			: {}),
 		...(settings.search
 			? {
 					search: {

@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import type { PlatformInstanceKind } from "@shared/platform-instances";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
 import type { StorageRetentionSettings } from "@shared/storage-retention";
@@ -720,6 +721,22 @@ export interface NarraForkSettings {
 		};
 		/** Optional fixed tiers for entries in the corresponding allowed model pool. */
 		subagentModelReasoningEfforts?: SubagentModelReasoningEfforts;
+		/**
+		 * 「平台集成」的实例清单。每一条是 Codex / Command Code / TokenDance 的一个实例，
+		 * 靠 `prefix` 划分模型命名空间（模型 ID 为 `<prefix>:<model>`）；同一平台可以有
+		 * 多条，彼此的配置与凭据互不影响。首次加载时按旧的单例字段生成每个平台一条。
+		 */
+		platformInstances?: Array<{
+			id: string;
+			platform: PlatformInstanceKind;
+			/** 卡片标记的后缀（卡片名 = `<平台前缀>-<后缀>`）；空串表示平台默认那一条。 */
+			suffix: string;
+			/** 模型 ID 前缀，全局唯一；留空创建时等于卡片名。 */
+			prefix: string;
+			disabled: boolean;
+			/** 该实例自己的配置，字段由所属平台决定。 */
+			config: Record<string, unknown>;
+		}>;
 		/**
 		 * Enable non-UTF-8 charset detection (GBK, Shift_JIS, …) for file read/write
 		 * and grep. Note: shell command output is auto-detected on Windows regardless

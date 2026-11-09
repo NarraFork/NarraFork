@@ -1,3 +1,4 @@
+import { instanceCardName, type PlatformInstanceRow } from "@shared/platform-instances";
 import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
@@ -617,19 +618,62 @@ export function useAllModels() {
 			addGroup(group.prefix, group.models, group.agentProviderType, group.nugProviderId);
 		const tokenDance = settingsData?.tokendance as TokenDancePublicConnection | undefined;
 		providerLabels.tokendance = tokenDance?.name || "TokenDance";
-		if (tokenDance?.connected && tokenDance.disabled) disabledProviders.add("tokendance");
-		if (tokenDance?.connected)
-			addGroup(
-				"tokendance",
-				tokenDance.models.map((m) => ({
-					value: `tokendance:${m.id}`,
-					label: m.name || m.id,
-					provider: "tokendance",
-					contextWindow: m.context_length,
-				})),
-			);
-		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
-		if (commandcodeModels.length > 0) addGroup("CommandCode", commandcodeModels, "CommandCode");
+		// 平台集成的模型目录按实例清单展开：同一平台共用目录，只是模型 value 换成实例前缀。
+		const platformInstances =
+			(
+				settingsData?.agent as unknown as
+					| { platformInstances?: readonly PlatformInstanceRow[] }
+					| undefined
+			)?.platformInstances ?? [];
+		const instanceModels = (instance: PlatformInstanceRow): ModelOption[] => {
+			if (instance.platform === "codex") {
+				return settingsData?.codexAvailable
+					? codexModelIds.map((id) => ({
+							value: `${instance.prefix}:${id}`,
+							label: id,
+							provider: instance.prefix,
+							bareModel: id,
+						}))
+					: [];
+			}
+			if (instance.platform === "CommandCode") {
+				return settingsData?.commandcodeAvailable
+					? commandcodeModelIds.map((id) => ({
+							value: `${instance.prefix}:${id}`,
+							label: id,
+							provider: instance.prefix,
+							bareModel: id,
+						}))
+					: [];
+			}
+			const config = instance.config as { apiKey?: string; models?: unknown };
+			if (!config.apiKey) return [];
+			const rows = Array.isArray(config.models) ? config.models : [];
+			return rows.map((row) => {
+				const model = row as { id: string; name?: string; context_length?: number };
+				return {
+					value: `${instance.prefix}:${model.id}`,
+					label: model.name || model.id,
+					provider: instance.prefix,
+					contextWindow: model.context_length,
+				};
+			});
+		};
+		for (const instance of platformInstances) {
+			providerLabels[instance.prefix] = instanceCardName(instance.platform, instance.suffix);
+			if (instance.disabled) disabledProviders.add(instance.prefix);
+			const models = instanceModels(instance);
+			if (models.length > 0)
+				addGroup(
+					instance.prefix,
+					models,
+					instance.platform === "CommandCode"
+						? "CommandCode"
+						: instance.platform === "codex"
+							? "codex"
+							: undefined,
+				);
+		}
 		// Executable-plugin providers, after every builtin so a plugin never reorders
 		// the familiar provider list. Each group already carries fully-prefixed values.
 		for (const group of pluginProviderGroups) {

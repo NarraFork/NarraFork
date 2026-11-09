@@ -9,9 +9,14 @@
  *   两把 key、Bearer 与 x-api-key 两种认证都如此，而同一 key 的其它端点均 200），属上游问题。
  */
 
-export const COMMAND_CODE_API_BASE = "https://api.commandcode.ai";
+import {
+	COMMAND_CODE_API_BASE as SHARED_COMMAND_CODE_API_BASE,
+	COMMAND_CODE_PROVIDER_BASE as SHARED_COMMAND_CODE_PROVIDER_BASE,
+} from "@shared/commandcode";
+
+export const COMMAND_CODE_API_BASE = SHARED_COMMAND_CODE_API_BASE;
 /** Provider API 根：各推理端点挂在其下（`/messages`、`/chat/completions`、`/responses`、`/models`）。 */
-export const COMMAND_CODE_PROVIDER_BASE = `${COMMAND_CODE_API_BASE}/provider/v1`;
+export const COMMAND_CODE_PROVIDER_BASE = SHARED_COMMAND_CODE_PROVIDER_BASE;
 /**
  * 平台 provider 的前缀。
  *
@@ -40,13 +45,12 @@ export function commandCodeApiOrigin(baseUrl?: string): string {
 	}
 }
 
-/** `CommandCode:claude-haiku` 与裸 id `claude-haiku` 都收成裸模型名。 */
-export function bareCommandCodeModelId(modelRef: string): string {
+/** `CommandCode:claude-haiku` 与裸 id `claude-haiku` 都收成裸模型名；`prefix` 是实例自己的前缀。 */
+export function bareCommandCodeModelId(modelRef: string, prefix = COMMAND_CODE_PREFIX): string {
 	const trimmed = modelRef.trim();
 	const separator = trimmed.indexOf(":");
 	if (separator <= 0) return trimmed;
-	const prefix = trimmed.slice(0, separator);
-	if (prefix !== COMMAND_CODE_PREFIX) return trimmed;
+	if (trimmed.slice(0, separator) !== prefix) return trimmed;
 	return trimmed.slice(separator + 1);
 }
 
@@ -111,7 +115,7 @@ export function endpointFromSupported(
 
 /**
  * 端点优先级：显式协议、`commandCode.endpoints`、目录里的 supported_endpoints、模型名。
- * `modelRef` 可以是裸 id，也可以是 `CommandCode:` 前缀的完整 id。
+ * `modelRef` 可以是裸 id，也可以是 `<prefix>:` 前缀的完整 id；`prefix` 省略时按内置前缀算。
  */
 export function selectCommandCodeEndpoint(
 	modelRef: string,
@@ -119,9 +123,10 @@ export function selectCommandCodeEndpoint(
 		protocol?: string;
 		overrides?: Record<string, CommandCodeEndpoint>;
 		supportedEndpoints?: readonly string[];
+		prefix?: string;
 	},
 ): CommandCodeEndpoint {
-	const bare = bareCommandCodeModelId(modelRef);
+	const bare = bareCommandCodeModelId(modelRef, options?.prefix);
 	const mapped = mapCommandCodeProtocol(options?.protocol);
 	if (mapped) return mapped;
 	const override = options?.overrides?.[bare] ?? options?.overrides?.[modelRef];

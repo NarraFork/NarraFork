@@ -600,7 +600,9 @@ describe("平台实例随供应商一起导出", () => {
 
 			const zip = await readFile(exported.zipPath);
 			const preview = await previewImport(toArrayBuffer(zip), "instances.zip");
-			expect(preview.providers.platformInstances).toEqual([instance]);
+			// 实例密钥和其它供应商一样走封存包；不带口令的 providers.json 里只有配置。
+			const withoutKey = { ...instance, config: {} };
+			expect(preview.providers.platformInstances).toEqual([withoutKey]);
 
 			await clearData("providers");
 			expect(instancesNow()).toEqual([]);
@@ -608,7 +610,7 @@ describe("平台实例随供应商一起导出", () => {
 			const result = await applyImport(preview.token, { conflictDefault: "skip" });
 			// 清空后本地两者都没有：导入恢复 1 个 API key 供应商 + 1 个平台实例。
 			expect(result.providersAdded).toBe(2);
-			expect(instancesNow()).toEqual([instance]);
+			expect(instancesNow()).toEqual([withoutKey]);
 		} finally {
 			saveSettings(original);
 		}

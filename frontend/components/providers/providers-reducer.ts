@@ -1,4 +1,5 @@
 import { useCallback, useMemo } from "react";
+import type { PlatformInstanceRow } from "../../../shared/platform-instances";
 import type { ProxyOverride } from "../../lib/proxy";
 import type { NUGProviderState } from "./NUGProvidersSection";
 import type {
@@ -54,7 +55,8 @@ export interface ProvidersState {
 	tokenDanceDisabled: boolean;
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
-	/** 逐模型协议覆盖（`agent.modelProtocols`），键是带前缀的完整模型 ID。 */
+	/** 平台集成实例清单（含启用与配置），与其它供应商一样作为草稿统一提交。 */
+	platformInstances: PlatformInstanceRow[];
 	modelProtocols: Record<string, CustomApiProtocol>;
 	providerOrder: string[];
 	disabledProviders: Set<string>;
@@ -70,6 +72,7 @@ export interface SavedSnapshot {
 	nugProviders: NUGProviderState[];
 	commandCode: CommandCodeState;
 	tokenDanceDisabled: boolean;
+	platformInstances: PlatformInstanceRow[];
 	hiddenModels: string[];
 	customModels: CustomModelEntry[];
 	modelProtocols: Record<string, CustomApiProtocol>;
@@ -90,6 +93,7 @@ export type ProvidersAction =
 	| { type: "SET_NUG_PROVIDERS"; providers: Updater<NUGProviderState[]> }
 	| { type: "SET_COMMAND_CODE"; config: CommandCodeState }
 	| { type: "SET_PLATFORM_DISABLED"; prefix: PlatformProviderPrefix; disabled: boolean }
+	| { type: "SET_PLATFORM_INSTANCES"; instances: Updater<PlatformInstanceRow[]> }
 	| { type: "TOGGLE_HIDDEN"; modelVal: string }
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
 	| { type: "SET_CUSTOM_MODELS"; models: CustomModelEntry[] }
@@ -288,6 +292,7 @@ export const initialProvidersState: ProvidersState = {
 	nugProviders: [],
 	commandCode: { apiKey: "", disabled: false },
 	tokenDanceDisabled: false,
+	platformInstances: [],
 	hiddenModels: new Set(),
 	customModels: [],
 	modelProtocols: {},
@@ -442,6 +447,13 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 					extraHeaders: s.commandCode?.extraHeaders,
 				},
 				tokenDanceDisabled: s.tokendance?.disabled === true,
+				// 平台实例清单：卡片、开关与配置都从这里出发，改动先落在草稿上。
+				platformInstances: Array.isArray(agent.platformInstances)
+					? (agent.platformInstances as PlatformInstanceRow[]).map((instance) => ({
+							...instance,
+							config: { ...instance.config },
+						}))
+					: [],
 				hiddenModels: new Set(hidden),
 				customModels: custom,
 				modelProtocols,
@@ -478,6 +490,12 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 		case "SET_COMMAND_CODE":
 			return { ...state, commandCode: action.config };
+
+		case "SET_PLATFORM_INSTANCES":
+			return {
+				...state,
+				platformInstances: resolveUpdater(state.platformInstances, action.instances),
+			};
 
 		case "SET_PLATFORM_DISABLED": {
 			// 平台 provider 的启用开关只有这一个写入点：它只改草稿，绝不碰后端接口。
@@ -596,6 +614,10 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				nugProviders: snap.nugProviders.map((p) => ({ ...p })),
 				commandCode: { ...snap.commandCode },
 				tokenDanceDisabled: snap.tokenDanceDisabled,
+				platformInstances: snap.platformInstances.map((instance) => ({
+					...instance,
+					config: { ...instance.config },
+				})),
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
 				modelProtocols: { ...snap.modelProtocols },
@@ -630,6 +652,8 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (JSON.stringify(state.commandCode) !== JSON.stringify(savedSnapshot.commandCode))
 			return true;
 		if (state.tokenDanceDisabled !== savedSnapshot.tokenDanceDisabled) return true;
+		if (JSON.stringify(state.platformInstances) !== JSON.stringify(savedSnapshot.platformInstances))
+			return true;
 		// Key order is not meaningful here, so compare sorted entries rather than the raw objects.
 		if (
 			JSON.stringify(Object.entries(state.modelProtocols).sort()) !==
@@ -684,6 +708,10 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		nugProviders: state.nugProviders.map((p) => ({ ...p })),
 		commandCode: { ...state.commandCode },
 		tokenDanceDisabled: state.tokenDanceDisabled,
+		platformInstances: state.platformInstances.map((instance) => ({
+			...instance,
+			config: { ...instance.config },
+		})),
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
 		modelProtocols: { ...state.modelProtocols },

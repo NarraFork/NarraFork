@@ -17,6 +17,7 @@ import { getProviderKeyStore, type ProviderKeyDisabledReason } from "../lib/prov
 import {
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
+	platformInstanceKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "../lib/settings/provider-keys-projection";
 
@@ -50,6 +51,8 @@ function ownersOf(providers: ProviderSection): string[] {
 		...ids(providers.nugProviders, nugKeyOwner),
 		...(providers.tokendance ? [TOKENDANCE_KEY_OWNER] : []),
 		...(providers.commandCode ? [COMMAND_CODE_KEY_OWNER] : []),
+		// 平台实例各持一份密钥，owner 是实例 id。
+		...ids(providers.platformInstances, platformInstanceKeyOwner),
 	];
 }
 
@@ -91,6 +94,16 @@ export function withoutKeys(providers: ProviderSection): ProviderSection {
 	if (out.commandCode && typeof out.commandCode === "object") {
 		const { apiKey: _secret, ...rest } = out.commandCode as Record<string, unknown>;
 		out.commandCode = rest;
+	}
+	if (Array.isArray(out.platformInstances)) {
+		out.platformInstances = (out.platformInstances as Array<Record<string, unknown>>).map(
+			(instance) => {
+				const config = instance.config;
+				if (!config || typeof config !== "object") return instance;
+				const { apiKey: _secret, ...rest } = config as Record<string, unknown>;
+				return { ...instance, config: rest };
+			},
+		);
 	}
 	return out;
 }
@@ -159,6 +172,15 @@ export function withFirstKeys(providers: ProviderSection, keys: ExportedKeys): P
 	const commandCode = first(COMMAND_CODE_KEY_OWNER);
 	if (commandCode && out.commandCode && typeof out.commandCode === "object") {
 		(out.commandCode as Record<string, unknown>).apiKey = commandCode;
+	}
+	if (Array.isArray(out.platformInstances)) {
+		for (const instance of out.platformInstances as Array<Record<string, unknown>>) {
+			const key =
+				typeof instance.id === "string" ? first(platformInstanceKeyOwner(instance.id)) : undefined;
+			if (!key) continue;
+			const config = instance.config;
+			instance.config = { ...(config as Record<string, unknown> | undefined), apiKey: key };
+		}
 	}
 	return out;
 }

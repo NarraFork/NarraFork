@@ -14,8 +14,6 @@ import type {
 import type { ContextInputCharacters } from "@shared/context-usage";
 import type { NativeMediaInput } from "@shared/media-attachments";
 import type { ProviderReadiness } from "@shared/provider-readiness";
-import { getCodexManager } from "../codex-manager";
-import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
 import { logger } from "../logger";
 import {
@@ -30,15 +28,19 @@ import {
 	resolveProvider,
 	settings,
 } from "../settings";
-import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
+import { getTokenDanceCatalogModels } from "../tokendance-runtime";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
-import { CodexProvider } from "./codex-provider";
-import { buildCommandCodeProvider } from "./commandcode-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
+import {
+	currentPlatformInstances,
+	listPlatformInstanceReadiness,
+	platformPrefixConflicts,
+	resolvePlatformInstanceAdapter,
+} from "./platform-instance-providers";
 import { PooledProvider, usableProviderKeys, withProviderKey } from "./pooled-provider";
 import {
 	connectionForProtocolSwitch,
@@ -331,71 +333,11 @@ export function createGeminiProvider(
 const builtinProviderSources = new ProviderSourceRegistry();
 const externalProviderSources = new ProviderSourceRegistry();
 
-function hasTokenDancePrefixConflict(): boolean {
-	return [
-		...(settings.customApiProviders ?? []),
-		...(settings.openaiProviders ?? []),
-		...(settings.anthropicProviders ?? []),
-		...(settings.geminiProviders ?? []),
-		...(settings.nugProviders ?? []),
-	].some((entry) => entry.prefix === "tokendance");
-}
-
-builtinProviderSources.register("tokendance", {
-	resolve: (provider) => {
-		if (provider !== "tokendance" || !getTokenDanceRuntimeConfig()) return null;
-		if (hasTokenDancePrefixConflict()) {
-			throw new Error(
-				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
-			);
-		}
-		return new TokenDanceProvider();
-	},
-	listReadiness: () => {
-		const config = getTokenDanceRuntimeConfig();
-		return [
-			{
-				id: "builtin:tokendance",
-				prefix: "tokendance",
-				name: "TokenDance",
-				ready: !!config && !config.disabled,
-			},
-		];
-	},
-});
-
-builtinProviderSources.register("codex", {
-	resolve: (provider) =>
-		provider === "codex"
-			? new CodexProvider({
-					useWebSocket: settings.codex?.useWebSocket ?? true,
-					useWebSearch: settings.codex?.useWebSearch ?? true,
-					useImageGeneration: settings.codex?.useImageGeneration ?? true,
-				})
-			: null,
-	listReadiness: () => [
-		{
-			id: "builtin:codex",
-			prefix: "codex",
-			name: "Codex",
-			ready: getCodexManager().hasAvailableCredentials,
-		},
-	],
-});
-
-builtinProviderSources.register("CommandCode", {
-	resolve: (provider, model) =>
-		provider === "CommandCode" ? buildCommandCodeProvider(model, settings.commandCode) : null,
-	listReadiness: () => [
-		{
-			id: "builtin:CommandCode",
-			prefix: "CommandCode",
-			name: "Command Code",
-			ready:
-				!settings.commandCode?.disabled &&
-				!!resolveCommandCodeToken(settings.commandCode?.apiKey).credential,
-		},
-	],
+// 平台集成（Codex / Command Code / TokenDance）的实例全部来自 `agent.platformInstances`：
+// 内置前缀与额外前缀共用同一条解析路径，清单里没有的前缀就不会被注册。
+builtinProviderSources.register("platform-instances", {
+	resolve: (provider, model) => resolvePlatformInstanceAdapter(provider, model),
+	listReadiness: () => listPlatformInstanceReadiness(),
 });
 
 /** API families expose the same instances used to construct their adapters. */
@@ -492,15 +434,12 @@ registerCredentialProviderSource(
 export async function listProviderReadiness(): Promise<ProviderReadiness[]> {
 	const disabled = new Set(settings.agent.disabledProviders ?? []);
 	disabled.add("tutorial");
-	if (getTokenDanceRuntimeConfig() && hasTokenDancePrefixConflict()) disabled.add("tokendance");
+	// 前缀撞车时双方都不算就绪：解析阶段本来就会报错，向导不能先放行。
+	for (const prefix of platformPrefixConflicts()) disabled.add(prefix);
 	const builtin = await builtinProviderSources.listReadiness(disabled);
 	const external = await externalProviderSources.listReadiness(disabled);
-	const reserved = new Set([
-		"codex",
-		"tokendance",
-		"tutorial",
-		...builtin.map((entry) => entry.prefix),
-	]);
+	// 平台前缀由实例清单决定：删掉实例后，同名的自定义供应商才能正常出现。
+	const reserved = new Set(["tutorial", ...builtin.map((entry) => entry.prefix)]);
 	return [...builtin, ...external.filter((entry) => !reserved.has(entry.prefix))];
 }
 
@@ -528,15 +467,16 @@ function prefixProviderModel(provider: string, model: string | undefined): strin
 }
 
 function defaultModelForProvider(provider: string): string | null {
-	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
-		const model = getTokenDanceCatalogModels()[0];
-		return model ? `tokendance:${model.id}` : null;
+	// 平台实例的默认模型跟着自己的前缀走：`codex-2` 的默认模型不能落到 `codex` 上。
+	const instance = currentPlatformInstances().find((entry) => entry.prefix === provider);
+	if (instance?.platform === "tokendance") {
+		const model = getTokenDanceCatalogModels(provider)[0];
+		return model ? `${provider}:${model.id}` : null;
 	}
-	if (provider === "codex") {
+	if (instance?.platform === "codex") {
 		const custom = settings.agent.customModels ?? [];
-		const codexCustom = custom.find((m) => m.provider === "codex")?.value;
-		const normalized = prefixProviderModel("codex", codexCustom);
-		return normalized ?? "codex:gpt-5.5";
+		const codexCustom = custom.find((m) => m.provider === provider)?.value;
+		return prefixProviderModel(provider, codexCustom) ?? `${provider}:gpt-5.5`;
 	}
 
 	const openaiDefault = prefixProviderModel(

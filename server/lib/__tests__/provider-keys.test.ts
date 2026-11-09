@@ -10,6 +10,7 @@ import {
 	absorbProviderKeys,
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
+	platformInstanceKeyOwner,
 	searchKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "../settings/provider-keys-projection";
@@ -196,6 +197,34 @@ describe("settings projection", () => {
 			]) {
 				store.removeProvider(owner);
 			}
+		}
+	});
+
+	test("平台实例的密钥按实例 id 存进 key store，删掉实例即删掉密钥", () => {
+		const saved = structuredClone(settings.agent?.platformInstances);
+		const instance = {
+			id: "platform-inst",
+			platform: "CommandCode" as const,
+			suffix: "2",
+			prefix: "cc-2",
+			disabled: false,
+			config: { apiKey: "sk-inst" },
+		};
+		try {
+			saveSettings({ ...settings, agent: { ...settings.agent, platformInstances: [instance] } });
+			const text = readFileSync(getNarraforkPath("settings.json"), "utf8");
+			expect(text).not.toContain("sk-inst");
+			expect(JSON.parse(text).agent.platformInstances[0].config).not.toHaveProperty("apiKey");
+			// 内存里仍是可用的真实密钥，读单字段的代码不需要改。
+			expect(settings.agent.platformInstances?.[0]?.config.apiKey).toBe("sk-inst");
+			const store = getProviderKeyStore();
+			expect(store.firstKey(platformInstanceKeyOwner("platform-inst"))).toBe("sk-inst");
+
+			saveSettings({ ...settings, agent: { ...settings.agent, platformInstances: [] } });
+			expect(store.list(platformInstanceKeyOwner("platform-inst"))).toEqual([]);
+		} finally {
+			saveSettings({ ...settings, agent: { ...settings.agent, platformInstances: saved } });
+			getProviderKeyStore().removeProvider(platformInstanceKeyOwner("platform-inst"));
 		}
 	});
 

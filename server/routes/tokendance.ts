@@ -129,15 +129,22 @@ tokendanceRoutes.post("/oauth/restore", async (c) => {
 	const input = await body(c.req.raw, flowSchema);
 	return c.json(restoreTokenDanceDraft(c.get("user").sub, input.flowId));
 });
-tokendanceRoutes.get("/connection", (c) => c.json(getTokenDanceConnection()));
+tokendanceRoutes.get("/connection", (c) =>
+	c.json(getTokenDanceConnection(c.req.query("prefix") || undefined)),
+);
 tokendanceRoutes.post("/models/refresh", async (c) =>
-	c.json({ models: await refreshTokenDanceModels(c.req.raw.signal) }),
+	c.json({
+		models: await refreshTokenDanceModels(c.req.raw.signal, c.req.query("prefix") || undefined),
+	}),
 );
 tokendanceRoutes.patch("/connection", async (c) => {
-	const input = await body(c.req.raw, z.object({ disabled: z.boolean() }).strict());
-	return c.json(await setTokenDanceDisabled(input.disabled));
+	const input = await body(
+		c.req.raw,
+		z.object({ disabled: z.boolean(), prefix: z.string().min(1).optional() }).strict(),
+	);
+	return c.json(await setTokenDanceDisabled(input.disabled, input.prefix));
 });
 tokendanceRoutes.delete("/connection", async (c) => {
-	await deleteTokenDanceConnection();
+	await deleteTokenDanceConnection(c.req.query("prefix") || undefined);
 	return c.json({ success: true });
 });

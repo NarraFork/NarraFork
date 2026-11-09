@@ -3,6 +3,35 @@ import { readFileSync } from "node:fs";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import type { NarraForkSettings } from "../lib/settings/types";
 
+// 平台集成实例化之后，连接记录存在清单里的实例 config 上；`tokendance` 字段只剩迁移来源，
+// 所以测试统一通过这两个辅助函数读写「那一条 TokenDance 实例」。
+function tokenDanceInstance() {
+	const instances = (fakeSettings.agent?.platformInstances ?? []) as Array<{
+		platform: string;
+		prefix: string;
+		suffix: string;
+		id: string;
+		disabled: boolean;
+		config: Record<string, unknown>;
+	}>;
+	return instances.find((entry) => entry.platform === "tokendance");
+}
+function tokenDanceConfig(): Record<string, unknown> {
+	return tokenDanceInstance()?.config ?? {};
+}
+function setTokenDanceConfig(config: Record<string, unknown>) {
+	fakeSettings.agent.platformInstances = [
+		{
+			id: "platform-tokendance",
+			platform: "tokendance",
+			suffix: "",
+			prefix: "tokendance",
+			disabled: false,
+			config,
+		},
+	] as unknown as NonNullable<NarraForkSettings["agent"]["platformInstances"]>;
+}
+
 const fakeSettings = {
 	server: { allowedOrigins: ["https://ui.example"] },
 	tokendance: { apiKey: "", disabled: false, generation: 0 },
@@ -40,9 +69,14 @@ function fetchMock(fn: (url: string, init?: RequestInit) => Response | Promise<R
 }
 beforeEach(async () => {
 	Date.now = originalNow;
+	// 保留上一轮的 generation：计费与在途请求按 generation 区分，重置成 0 会让不同用例撞车。
+	const generation = Number(tokenDanceConfig().generation ?? 0);
+	setTokenDanceConfig({ apiKey: "", disabled: false, generation });
 	await service.deleteTokenDanceConnection();
 	saves = 0;
+	// 只清用例关心的字段，实例清单（含 generation）要留着，否则不同用例会撞 generation。
 	fakeSettings.agent = {
+		...fakeSettings.agent,
 		hiddenModels: [],
 		modelAggregations: [],
 	} as unknown as NarraForkSettings["agent"];
@@ -64,12 +98,9 @@ function createPayment(
 	});
 }
 function connectBilling() {
-	fakeSettings.tokendance = {
-		apiKey: "billing-secret-key",
-		disabled: false,
-		generation: (fakeSettings.tokendance?.generation ?? 0) + 1,
-	};
-	return fakeSettings.tokendance.generation;
+	const generation = Number(tokenDanceConfig().generation ?? 0) + 1;
+	setTokenDanceConfig({ apiKey: "billing-secret-key", disabled: false, generation });
+	return generation;
 }
 function paymentFixture(overrides: Record<string, unknown> = {}) {
 	const seconds = Math.floor(Date.now() / 1000);
@@ -737,12 +768,12 @@ describe("TokenDance billing", () => {
 
 describe("TokenDance backend", () => {
 	test("refresh and reauthorization preserve initialized collection and user visibility choices", async () => {
-		fakeSettings.tokendance = {
+		setTokenDanceConfig({
 			apiKey: "existing-platform-key",
 			disabled: false,
 			generation: 100,
 			modelCollectionInitialized: true,
-		};
+		});
 		fakeSettings.agent.hiddenModels = ["tokendance:kimi-k3", "other:hidden"];
 		fetchMock((url) =>
 			url.endsWith("/auth/keys")
@@ -759,11 +790,11 @@ describe("TokenDance backend", () => {
 					}),
 		);
 		await service.refreshTokenDanceModels();
-		expect(fakeSettings.tokendance.modelCollectionInitialized).toBe(true);
+		expect(tokenDanceConfig().modelCollectionInitialized).toBe(true);
 		expect(fakeSettings.agent.hiddenModels).toEqual(["tokendance:kimi-k3", "other:hidden"]);
 		const flow = start();
 		await service.completeTokenDanceOAuth(flow.owner, flow.flowId, "one-time-code");
-		expect(fakeSettings.tokendance.modelCollectionInitialized).toBe(true);
+		expect(tokenDanceConfig().modelCollectionInitialized).toBe(true);
 		expect(fakeSettings.agent.hiddenModels).toEqual(["tokendance:kimi-k3", "other:hidden"]);
 		expect(service.getTokenDanceCatalogModels().map((model) => model.id)).toEqual([
 			"glm-5",
@@ -775,7 +806,7 @@ describe("TokenDance backend", () => {
 		"reauthorize_api_key",
 		"api_key_quota",
 	] as const)("refresh preserves %s even when its error body never finishes", async (action) => {
-		fakeSettings.tokendance = { apiKey: "secret-refresh-key", disabled: false, generation: 100 };
+		setTokenDanceConfig({ apiKey: "secret-refresh-key", disabled: false, generation: 100 });
 		let cancelled = false;
 		fetchMock(
 			() =>
@@ -801,11 +832,14 @@ describe("TokenDance backend", () => {
 		expect(cancelled).toBe(true);
 	});
 	test("public DTO omits key and ordinary settings explicitly override spread", () => {
-		fakeSettings.tokendance = { apiKey: "secret-never-return", disabled: false, generation: 100 };
+		setTokenDanceConfig({ apiKey: "secret-never-return", disabled: false, generation: 100 });
 		expect(JSON.stringify(service.getTokenDanceConnection())).not.toContain("secret-never-return");
 		const source = readFileSync(new URL("../routes/settings.ts", import.meta.url), "utf8");
 		expect(source).toContain("tokendance: getTokenDanceConnection()");
-		expect(source).toContain('new Set(["codex", "tokendance", "auto"])');
+		// 保留前缀来自平台实例清单：删掉实例后同名前缀可以给自定义供应商复用。
+		expect(source).toContain("validated.agent?.platformInstances");
+		// `auto` 不是实例，它选中 `auto:<model>` 的来源，永远保留。
+		expect(source).toMatch(/RESERVED_PREFIXES = new Set\(\[\s*"auto",/);
 	});
 	test.each([
 		"not-a-url",
@@ -989,7 +1023,7 @@ describe("TokenDance backend", () => {
 		});
 	});
 	test("catalog filters non-conversation entries, sends attribution, and ignores late refresh", async () => {
-		fakeSettings.tokendance = { apiKey: "key-private", disabled: false, generation: 501 };
+		setTokenDanceConfig({ apiKey: "key-private", disabled: false, generation: 501 });
 		fetchMock((_url, init) => {
 			expect(new Headers(init?.headers).get("X-App-URL")).toBe(
 				"https://tokendanceconnect.narrafork.dev/",
@@ -1039,7 +1073,7 @@ describe("TokenDance backend", () => {
 		);
 	});
 	test("delete cleans settings references and cancels runtime requests", async () => {
-		fakeSettings.tokendance = { apiKey: "key-private", disabled: false, generation: 600 };
+		setTokenDanceConfig({ apiKey: "key-private", disabled: false, generation: 600 });
 		fakeSettings.agent.defaultModel = "tokendance:chat";
 		fakeSettings.agent.hiddenModels = ["tokendance:chat", "other:chat"];
 		fakeSettings.agent.modelAggregations = [
@@ -1054,7 +1088,7 @@ describe("TokenDance backend", () => {
 		expect(fakeSettings.agent.modelAggregations).toEqual([]);
 	});
 	test("delete clears only known model references and preserves unrelated prefix-like strings", async () => {
-		fakeSettings.tokendance = { apiKey: "key-private", disabled: false, generation: 700 };
+		setTokenDanceConfig({ apiKey: "key-private", disabled: false, generation: 700 });
 		fakeSettings.agent = {
 			...fakeSettings.agent,
 			defaultModel: "tokendance:vendor:opaque/id",
@@ -1143,16 +1177,16 @@ describe("TokenDance backend", () => {
 				supported_protocols: ["openai:responses"],
 			},
 		];
-		fakeSettings.tokendance = {
+		setTokenDanceConfig({
 			apiKey: "key-private",
 			disabled: true,
 			generation: 800,
 			models: catalog,
-		};
+		});
 		expect(service.getTokenDanceCatalogModels()).toEqual(catalog);
 		fetchMock(() => json({ data: catalog }));
 		await service.refreshTokenDanceModels();
-		expect(fakeSettings.tokendance.models).toEqual(catalog);
+		expect(tokenDanceConfig().models).toEqual(catalog);
 		expect(service.getTokenDanceConnection().disabled).toBe(true);
 		expect((await service.setTokenDanceDisabled(false)).models).toEqual(catalog);
 		expect((await service.setTokenDanceDisabled(true)).models).toEqual(catalog);
@@ -1195,13 +1229,13 @@ describe("TokenDance backend", () => {
 		await expect(service.completeTokenDanceOAuth(flow.owner, flow.flowId, "code")).rejects.toThrow(
 			"authorization failed",
 		);
-		fakeSettings.tokendance = { apiKey: "key-private", disabled: false, generation: 900 };
+		setTokenDanceConfig({ apiKey: "key-private", disabled: false, generation: 900 });
 		fetchMock(() => json({ recovery_action: "top_up_balance" }, 402));
 		await expect(service.refreshTokenDanceModels()).rejects.toThrow("model refresh failed");
 		expect(service.getTokenDanceConnection().recoveryAction).toBeUndefined();
 	});
 	test("runtime recovery is generation checked and successful refresh clears it", async () => {
-		fakeSettings.tokendance = { apiKey: "key-private", disabled: false, generation: 901 };
+		setTokenDanceConfig({ apiKey: "key-private", disabled: false, generation: 901 });
 		service.setTokenDanceRecoveryAction("top_up_balance", 900);
 		expect(service.getTokenDanceConnection().recoveryAction).toBeUndefined();
 		service.setTokenDanceRecoveryAction("top_up_balance", 901);
@@ -1211,7 +1245,7 @@ describe("TokenDance backend", () => {
 		expect(service.getTokenDanceConnection().recoveryAction).toBeUndefined();
 	});
 	test("new authorization cancels runtime requests from the prior generation", async () => {
-		fakeSettings.tokendance = { apiKey: "old-key-private", disabled: false, generation: 902 };
+		setTokenDanceConfig({ apiKey: "old-key-private", disabled: false, generation: 902 });
 		const old = new AbortController();
 		service.registerTokenDanceRequest(old, 902);
 		const flow = start();
@@ -1220,7 +1254,7 @@ describe("TokenDance backend", () => {
 		);
 		await service.completeTokenDanceOAuth(flow.owner, flow.flowId, "code");
 		expect(old.signal.aborted).toBe(true);
-		expect(fakeSettings.tokendance.apiKey).toBe("new-key-private");
+		expect(tokenDanceConfig().apiKey).toBe("new-key-private");
 	});
 	test("request timeout also bounds a stalled response reader", async () => {
 		const timeout = globalThis.setTimeout;
@@ -1249,7 +1283,7 @@ describe("TokenDance backend", () => {
 		}
 	});
 	test("catalog and snapshot storage are bounded; mounted paths may contain dots", async () => {
-		fakeSettings.tokendance = { apiKey: "key-private", disabled: false, generation: 910 };
+		setTokenDanceConfig({ apiKey: "key-private", disabled: false, generation: 910 });
 		fetchMock(() =>
 			json({
 				data: Array.from({ length: 1002 }, (_, index) => ({
@@ -1305,7 +1339,7 @@ describe("TokenDance backend", () => {
 		await service.completeTokenDanceOAuth(flow.owner, flow.flowId, "code");
 	});
 	test("model normalization retains supported protocols after unknowns and rejects unsafe IDs", async () => {
-		fakeSettings.tokendance = { apiKey: "key-private", disabled: false, generation: 950 };
+		setTokenDanceConfig({ apiKey: "key-private", disabled: false, generation: 950 });
 		fetchMock(() =>
 			json({
 				data: [
