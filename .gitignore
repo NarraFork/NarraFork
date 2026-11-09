@@ -1,5 +1,8 @@
 node_modules
 dist/
+# Local scratch: the retired in-app desktop pet (code + 75 MB of frames) and the
+# diagnostic UI kept beside it. Not part of the build, not part of the repository.
+.pet-backup/
 # Required bundled model metadata, imported directly by the runtime.
 !shared/model-catalog/dist/
 shared/model-catalog/dist/*

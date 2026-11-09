@@ -39,6 +39,7 @@ import type {
 } from "@frontend/components/plugins";
 import {
 	invalidatePluginUiContributions,
+	PluginOverlayHost,
 	PluginThemeInjector,
 	PluginUiRuntimeProvider,
 	requestPluginUiBackend,
@@ -282,6 +283,12 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 			}
 		>
 			{children}
+			{/*
+			 * The plugin `overlay` surface: a pet that is a plugin rather than part of the
+			 * app. It renders nothing when no view claims the surface, which is the point —
+			 * NarraFork ships no pet of its own.
+			 */}
+			<PluginOverlayHost />
 		</PluginUiRuntimeProvider>
 	);
 }

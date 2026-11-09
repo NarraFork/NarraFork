@@ -1,4 +1,5 @@
 import type { PluginUiContributionItem } from "../../lib/api/plugins";
+import { HOST_SURFACE_VALUES } from "./protocol";
 import type {
 	PluginContributionAvailability,
 	PluginContributionRecord,
@@ -44,13 +45,7 @@ function readString(value: unknown): string | undefined {
  * empty ("mounts nowhere") — that is what a view declaring only a surface the host no
  * longer has arrives as, and it must not be offered on every surface instead.
  */
-const KNOWN_VIEW_SURFACES: readonly PluginViewSurface[] = [
-	"workspace",
-	"director",
-	"focus",
-	"settings",
-	"provider-settings",
-];
+const KNOWN_VIEW_SURFACES: readonly PluginViewSurface[] = HOST_SURFACE_VALUES;
 
 function readSurfaces(value: unknown): PluginViewSurface[] | undefined {
 	if (!Array.isArray(value)) return undefined;

@@ -22,6 +22,7 @@ import {
  */
 import { readHostPresentation, subscribeHostPresentation } from "./host-presentation";
 import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
+import { pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
 import {
 	fallbackPluginUiContext,
@@ -187,6 +188,23 @@ export function PluginUiRuntimeProvider({
 				openExternal: hostLocalRef.current?.openExternal,
 				modelsChanged: hostLocalRef.current?.modelsChanged,
 				testModel: hostLocalRef.current?.testModel,
+				// Overlay bounds are clamped here rather than in the router: only the
+				// browser knows the viewport, and the router is deliberately kept
+				// DOM-free so it stays unit-testable.
+				overlaySetBounds: (panelInstanceId, bounds) => {
+					const viewportWidth = Math.max(0, window.innerWidth);
+					const viewportHeight = Math.max(0, window.innerHeight);
+					// Clamp into the viewport and drop a rectangle that would be empty:
+					// a zero-area hit region on a scrolling page is just noise.
+					const left = Math.min(Math.max(bounds.x, 0), viewportWidth);
+					const top = Math.min(Math.max(bounds.y, 0), viewportHeight);
+					const width = Math.max(0, Math.min(bounds.width, viewportWidth - left));
+					const height = Math.max(0, Math.min(bounds.height, viewportHeight - top));
+					const applied = { x: left, y: top, width, height };
+					if (width > 0 && height > 0) pluginOverlayBoundsStore.set(panelInstanceId, applied);
+					else pluginOverlayBoundsStore.clear(panelInstanceId);
+					return { ...applied, viewportWidth, viewportHeight };
+				},
 				navigate:
 					// App.tsx's createAppPluginHostLocal only wires modelsChanged/testModel,
 					// so today every navigate call lands on this fallback. Kept as an explicit

@@ -393,6 +393,20 @@ export const VIEW_SURFACES = [
 	"focus",
 	"settings",
 	"provider-settings",
+	/**
+	 * A transparent, full-viewport layer above the app shell — not a dock panel.
+	 *
+	 * Added for views that are decorative overlays rather than tools (a desktop pet
+	 * is the motivating case): a dock panel is a rectangle inside the layout, and no
+	 * amount of plugin CSS can draw outside it. `scope` is restricted to `global`
+	 * because there is exactly one overlay layer per app instance, so a
+	 * workspace/narrator binding would have nothing to bind to.
+	 *
+	 * The host mounts it (`frontend/components/plugins/PluginOverlayHost.tsx`) and
+	 * keeps the iframe click-through unless the view reports a hit rectangle, so an
+	 * overlay can never make the app underneath unusable.
+	 */
+	"overlay",
 ] as const;
 export type ViewSurface = (typeof VIEW_SURFACES)[number];
 

@@ -7,14 +7,16 @@ import {
 	useRef,
 	useState,
 } from "react";
-import type { PluginDockPanelParams } from "./protocol";
+import type { PluginDockPanelParams, PluginHostSurface } from "./protocol";
 
-export type PluginUiHostSurface =
-	| "focus"
-	| "workspace"
-	| "director"
-	| "settings"
-	| "provider-settings";
+/**
+ * Host surfaces a plugin view may be mounted on.
+ *
+ * An alias of `PluginHostSurface` rather than a second hand-written union: the binding
+ * schema in `protocol.ts` is the value the runtime actually validates against, so a
+ * surface added there but forgotten here would type-check and then fail at runtime.
+ */
+export type PluginUiHostSurface = PluginHostSurface;
 
 /** Runtime-only host context. IDs never need to be copied into arbitrary view state. */
 export interface PluginUiSessionContext {
@@ -48,6 +50,11 @@ const PluginUiSurfaceContext = createContext<PluginUiSurfaceContextValue | null>
  * Two families exist:
  *  - `workspace` / `director` — the same workspace seen as a grid or as an overlay.
  *  - `focus` — a single narrator's dock.
+ *
+ * `settings`, `provider-settings` and `overlay` deliberately belong to no family:
+ * each is only itself, so a binding recorded for one of them can never resolve on
+ * another. The overlay in particular must not fall back to a narrator context —
+ * there is one overlay layer per app, with no workspace or narrator in scope.
  */
 function isFocusFamily(surface: PluginUiHostSurface): boolean {
 	return surface === "focus";

@@ -39,6 +39,7 @@ export {
 	PluginUiLayer,
 	PluginUiRuntimeProvider,
 } from "./PluginUiRuntimeProvider";
+export { PluginOverlayHost } from "./PluginOverlayHost";
 export type { PluginUiHostSurface, PluginUiSessionContext } from "./PluginUiSurfaceContext";
 export {
 	PluginUiSurfaceProvider,

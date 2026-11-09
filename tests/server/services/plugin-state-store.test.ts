@@ -59,6 +59,32 @@ describe("PluginStateStore", () => {
 		expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 	});
 
+	test("keeps writing a journal whose operations together exceed one value's key budget", async () => {
+		/*
+		 * Regression: the object-key budget bounds ONE value, but a journal is a container of
+		 * unrelated operations. Counting them cumulatively made a healthy journal unwritable
+		 * once enough ordinary operations had been recorded — well below `maxOperations` — and
+		 * every later plugin operation failed with "Plugin metadata contains too many object
+		 * keys". The budget below is sized so that one operation fits comfortably while a
+		 * dozen of them do not.
+		 */
+		const root = await makeTempRoot();
+		const store = new PluginStateStore({ root, limits: { maxObjectKeys: 60 } });
+		const pluginId = "com.example.journal-budget";
+		await store.setState(createPluginStateRecord(pluginId));
+		for (let index = 0; index < 12; index += 1) {
+			const operation = await store.beginOperation({
+				pluginId,
+				operation: "install",
+				context: { index, to: { version: "1.0.0", hash: "d".repeat(64) } },
+			});
+			await store.updateOperation(operation.id, { status: "succeeded" });
+		}
+
+		const journal = JSON.parse(await readFile(store.journalPath, "utf8"));
+		expect(journal.operations).toHaveLength(12);
+	});
+
 	test("migrates legacy package-hash authority identities on read", async () => {
 		const root = await makeTempRoot();
 		await mkdir(root, { recursive: true });

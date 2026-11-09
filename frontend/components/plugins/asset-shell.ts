@@ -309,6 +309,10 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     }),
     notifications: Object.freeze({ show: (input) => request("notifications.show", input) }),
     ui: Object.freeze({ openExternal: (input) => request("ui.openExternal", input) }),
+    // Overlay views only: declare the rectangle that should receive pointer input.
+    // Resolves with the applied (viewport-clamped) rectangle and the viewport size —
+    // the iframe cannot measure the host document, so this answer is its only view of it.
+    overlay: Object.freeze({ setBounds: (input) => request("overlay.setBounds", input) }),
     // Language. Theme needs no API at all: the host rewrites the token style element and the
     // browser recalculates. Text cannot work that way -- a string already in the DOM can only
     // be replaced by the plugin -- which is why this side needs an onChange hook.
