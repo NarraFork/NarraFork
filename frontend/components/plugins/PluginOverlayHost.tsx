@@ -29,7 +29,6 @@
  */
 
 import {
-	type MouseEvent as ReactMouseEvent,
 	type PointerEvent as ReactPointerEvent,
 	useCallback,
 	useEffect,
@@ -174,10 +173,7 @@ function PluginOverlayLayer({
 	);
 
 	const sendPointer = useCallback(
-		(
-			type: "down" | "move" | "up" | "cancel" | "contextmenu",
-			event: ReactPointerEvent<HTMLDivElement> | ReactMouseEvent<HTMLDivElement>,
-		) => {
+		(type: "down" | "move" | "up" | "cancel", event: ReactPointerEvent<HTMLDivElement>) => {
 			// `sendNotification` is optional on the controller interface: a session that has
 			// not finished its handshake cannot deliver anything, and the concrete class
 			// drops these silently until then. Optional-calling keeps that contract honest.
@@ -187,9 +183,8 @@ function PluginOverlayLayer({
 				// to translate between the hit region and its own canvas.
 				x: event.clientX,
 				y: event.clientY,
-				pointerId: "pointerId" in event ? event.pointerId : 0,
-				buttons: "buttons" in event ? event.buttons : 0,
-				button: "button" in event ? event.button : 0,
+				pointerId: event.pointerId,
+				buttons: event.buttons,
 			});
 		},
 		[runtime, panelInstanceId],
@@ -235,9 +230,7 @@ function PluginOverlayLayer({
 					data-plugin-overlay-hit={panelInstanceId}
 					role="presentation"
 					onPointerDown={(event) => {
-						// Only the primary button drags. The relay used to report `button: 0`
-						// unconditionally, so a right-press started a drag and the context
-						// menu never got a chance to open.
+						// Only the primary button drags.
 						if (event.button !== 0) return;
 						capturedPointer.current = event.pointerId;
 						// Suppress the browser's own gesture handling, which otherwise starts a
@@ -255,10 +248,10 @@ function PluginOverlayLayer({
 						sendPointer("down", event);
 					}}
 					onContextMenu={(event) => {
-						// A click-through frame never receives this event, so the menu inside it
-						// would be unreachable; relay it instead of showing the browser's own.
+						// The view has no menu of its own on this surface (a click-through frame
+						// cannot show one), so right-click should do nothing at all rather than
+						// pop the browser's menu over the app.
 						event.preventDefault();
-						sendPointer("contextmenu", event);
 					}}
 					onPointerMove={(event) => {
 						if (capturedPointer.current !== event.pointerId) return;
