@@ -162,7 +162,11 @@ export function ModelSourceBrowser({
 										}}
 									>
 										<Group justify="space-between" wrap="nowrap" gap={4}>
-											<Text size="sm" truncate fw={currentValue === option.value ? 600 : 400}>
+											<Text
+												size="sm"
+												fw={currentValue === option.value ? 600 : 400}
+												style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}
+											>
 												{option.label}
 											</Text>
 											<IconCheck
