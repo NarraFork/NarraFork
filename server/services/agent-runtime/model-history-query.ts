@@ -1,7 +1,13 @@
 import type { Database } from "bun:sqlite";
+import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import { assembleContent } from "@shared/narrator-blocks/storage";
 import { bodyBytesSql, bodySql } from "../../lib/narrator-bodies";
 import { ModelHistoryBudget } from "./model-history-json";
+
+/** Portable bounded marker probe: retention writes this exact compact JSON tombstone. */
+export const MODEL_HISTORY_TOOL_CLEARED_SQL = clearedToolOutputSql();
+export const MODEL_HISTORY_TOOL_INPUT_SQL = `CASE WHEN ${MODEL_HISTORY_TOOL_CLEARED_SQL}
+	THEN NULL ELSE input_json END`;
 
 export const MODEL_HISTORY_REF_BATCH = 200;
 export const MODEL_HISTORY_BATCH_BYTES = 4 * 1024 * 1024;
@@ -255,7 +261,7 @@ export async function queryModelHistory(
 				check();
 				const toolMeta = await query<{ id: string; messageId: string; bytes: number }>(
 					`SELECT id, message_id AS "messageId",
-					 coalesce(length(CAST(input_json AS BLOB)), 0) + coalesce(length(CAST(output_json AS BLOB)), 0) AS bytes
+					 CASE WHEN ${MODEL_HISTORY_TOOL_CLEARED_SQL} THEN 0 ELSE coalesce(length(CAST(input_json AS BLOB)), 0) END + coalesce(length(CAST(output_json AS BLOB)), 0) AS bytes
 					 FROM narrator_tool_calls WHERE message_id IN (${placeholders})
 					 AND (message_id > ? OR (message_id = ? AND id > ?))
 					 ORDER BY message_id, id LIMIT ${MODEL_HISTORY_REF_BATCH}`,
@@ -289,7 +295,7 @@ export async function queryModelHistory(
 					const rawBytesById = new Map(selectedMeta.map((row) => [row.id, Number(row.bytes)]));
 					const tools = await query<ModelToolSourceRow & { messageId: string }>(
 						`SELECT id, ${options.versioned ? "model_revision" : "0"} AS "modelRevision", message_id AS "messageId", execution_attempt AS "executionAttempt", created_at AS "createdAt",
-						 tool_use_id AS "toolUseId", tool_name AS "toolName", input_json AS "inputJson", output_json AS "outputJson", status
+						 tool_use_id AS "toolUseId", tool_name AS "toolName", ${MODEL_HISTORY_TOOL_INPUT_SQL} AS "inputJson", output_json AS "outputJson", status
 						 FROM narrator_tool_calls WHERE id IN (${selectedIds.map(() => "?").join(",")})`,
 						selectedIds,
 					);

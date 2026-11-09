@@ -39,7 +39,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 } from "../../../db/schema";
-import { runReadTask, WorkersUnavailableError } from "../../../lib/db-worker/pool";
+import { runReadTask } from "../../../lib/db-worker/pool";
 import {
 	SELECT_ROWS_MAX_ROWS,
 	type SelectRowsParams,
@@ -165,24 +165,20 @@ function inlineValues(text: string, params: Array<string | number>): unknown[][]
 	return sqlite.query(text).values(...params) as unknown[][];
 }
 
-/** A read on the worker pool; inline when there is no file to open there or no worker. */
+/** Large pages must stay off-thread; unavailable workers fail the read without re-reading inline. */
 async function workerValues(
 	text: string,
 	params: Array<string | number>,
 	maxRows: number,
 ): Promise<unknown[][]> {
 	const file = sqlite.filename;
-	if (!file || file === ":memory:" || sqlite.inTransaction) return inlineValues(text, params);
+	if (!file || file === ":memory:" || sqlite.inTransaction)
+		throw new Error("Large Outline page reads require a committed file-backed database");
 	const task: SelectRowsParams = { kind: "selectRows", sql: text, params, maxRows };
-	try {
-		const result = await runReadTask<SelectRowsResult>(file, task, {
-			timeoutMs: WORKER_TIMEOUT_MS,
-		});
-		return result.rows;
-	} catch (error) {
-		if (error instanceof WorkersUnavailableError) return inlineValues(text, params);
-		throw error;
-	}
+	const result = await runReadTask<SelectRowsResult>(file, task, {
+		timeoutMs: WORKER_TIMEOUT_MS,
+	});
+	return result.rows;
 }
 
 /**

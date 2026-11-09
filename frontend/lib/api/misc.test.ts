@@ -92,6 +92,37 @@ describe("misc APIs", () => {
 		expect(urls[0]).toContain("/search/sessions/n%2F1/hits?q=kestrel&sort=time");
 	});
 
+	test("history cleanup API keeps target, exact cutoff and AbortSignal across its four endpoints", async () => {
+		installEnvironment(new Response());
+		const calls: { path: string; options: RequestInit }[] = [];
+		Object.defineProperty(g, "fetch", {
+			value: async (path: string, options: RequestInit) => {
+				calls.push({ path, options });
+				return Response.json({}, { status: path.endsWith("/cleanup") ? 202 : 200 });
+			},
+			configurable: true,
+		});
+		const signal = new AbortController().signal;
+		const input = { target: "messageHistory" as const, cutoffAt: "2026-02-14T16:00:00.000Z" };
+		await api.getStorageHistoryJobs(signal);
+		await api.previewStorageHistory(input, signal);
+		await api.cleanupStorageHistory(input, signal);
+		await api.cancelStorageHistory("messageHistory", signal);
+		expect(calls.map(({ path }) => path)).toEqual([
+			"/api/storage/database/history/jobs",
+			"/api/storage/database/history/preview",
+			"/api/storage/database/history/cleanup",
+			"/api/storage/database/history/cancel",
+		]);
+		for (const { options } of calls) expect(options.signal).toBe(signal);
+		expect(calls[0].options.body).toBeUndefined();
+		for (const index of [1, 2]) {
+			expect(calls[index].options.method).toBe("POST");
+			expect(JSON.parse(calls[index].options.body as string)).toEqual(input);
+		}
+		expect(JSON.parse(calls[3].options.body as string)).toEqual({ target: "messageHistory" });
+	});
+
 	test("surfaces structured storage cleanup errors", async () => {
 		installEnvironment(
 			new Response(

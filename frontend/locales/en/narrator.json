@@ -1,4 +1,6 @@
 {
+	"historyCleared": "History cleared",
+	"toolDetailsCleared": "Tool-call details cleared",
 	"modelTraceReturn": "Return",
 	"modelTraceSampling": "Sampling…",
 	"modelTraceRetry": "Retry",

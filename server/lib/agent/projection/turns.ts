@@ -19,6 +19,7 @@ import {
 	isModelVisible,
 	type ToolChange,
 } from "@shared/narrator-blocks/types";
+import { isClearedToolOutput } from "@shared/storage-retention";
 
 /** What the request targets; everything here can change the projected bytes. */
 export interface ProjectionTarget {
@@ -193,6 +194,13 @@ function assistantItems(
 				break;
 			}
 			case "tool": {
+				if (
+					block.payload.payloadCleared ||
+					isClearedToolOutput(envelope.toolOutputs?.[block.wireId]?.output)
+				) {
+					items.push({ kind: "text", blockId: block.id, text: "[Tool details cleared]" });
+					break;
+				}
 				if (block.payload.executor === "provider") {
 					const input = record(block.payload.input);
 					if (block.subtype === "web_search") {
@@ -259,7 +267,7 @@ function toolResults(envelope: CanonicalEnvelope, assets: ProjectionAssets): Neu
 		if (block.kind !== "tool" || block.payload.executor !== "local" || !isModelVisible(block))
 			continue;
 		const output = envelope.toolOutputs?.[block.wireId];
-		if (!output) continue;
+		if (!output || block.payload.payloadCleared || isClearedToolOutput(output.output)) continue;
 		const appendix = block.payload.result?.appendix;
 		const text = outputToText(output.output);
 		results.push({

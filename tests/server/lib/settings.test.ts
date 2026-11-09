@@ -183,6 +183,55 @@ describe("settings deepMerge", () => {
 	});
 });
 
+describe("stable single-copy block defaults migration", () => {
+	it("defaults to block reads/writes and one body copy", () => {
+		expect(getDefaults().narratorBlocks).toEqual({
+			write: true,
+			read: true,
+			compactJson: true,
+			singleCopyDefaultsVersion: 1,
+			singleCopyBackfillResumeVersion: 0,
+		});
+	});
+
+	it("upgrades persisted rollout switches once without a UI visit and preserves later rollbacks", () => {
+		const path = resolve(getNarraforkHome(), "settings.json");
+		const original = readFileSync(path, "utf8");
+		const snapshot = structuredClone(liveSettings);
+		try {
+			for (const narratorBlocks of [
+				undefined,
+				{ write: true, read: true, compactJson: false },
+				{ write: false, read: false, compactJson: false, singleCopyDefaultsVersion: 0 },
+			]) {
+				writeFileSync(path, JSON.stringify({ ...getDefaults(), narratorBlocks }));
+				expect(reloadSettings().narratorBlocks).toEqual(getDefaults().narratorBlocks);
+				expect(JSON.parse(readFileSync(path, "utf8")).narratorBlocks).toEqual(
+					getDefaults().narratorBlocks,
+				);
+				const migrated = readFileSync(path, "utf8");
+				reloadSettings();
+				expect(readFileSync(path, "utf8")).toBe(migrated);
+			}
+			const rollback = structuredClone(liveSettings);
+			rollback.narratorBlocks.write = false;
+			rollback.narratorBlocks.read = false;
+			rollback.narratorBlocks.compactJson = false;
+			saveSettings(rollback);
+			expect(reloadSettings().narratorBlocks).toEqual({
+				write: false,
+				read: false,
+				compactJson: false,
+				singleCopyDefaultsVersion: 1,
+				singleCopyBackfillResumeVersion: 0,
+			});
+		} finally {
+			saveSettings(snapshot);
+			writeFileSync(path, original);
+		}
+	});
+});
+
 describe("auto-continuation defaults", () => {
 	it("uses protected-only mode when no value has been configured", () => {
 		expect(getDefaults().agent.autoContinuationMode).toBe("protectedOnly");

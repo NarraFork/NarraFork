@@ -51,6 +51,10 @@ import type {
 	SearchSectionsResponse,
 	SessionHitsResponse,
 	StorageCategoryKey,
+	StorageHistoryJob,
+	StorageHistoryJobs,
+	StorageHistoryPreview,
+	StorageRetentionTarget,
 	StorageScanJobState,
 	StorageScanResult,
 } from "./types";
@@ -1497,6 +1501,32 @@ export const miscApi = {
 	getLicenseText: (id: string) => request<{ id: string; text: string }>(`/licenses/text/${id}`),
 
 	// Storage
+	getStorageHistoryJobs: (signal?: AbortSignal) =>
+		request<{ jobs: StorageHistoryJobs }>("/storage/database/history/jobs", { signal }),
+	previewStorageHistory: (
+		data: { target: StorageRetentionTarget; cutoffAt: string },
+		signal?: AbortSignal,
+	) =>
+		request<{ preview: StorageHistoryPreview }>("/storage/database/history/preview", {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
+	cleanupStorageHistory: (
+		data: { target: StorageRetentionTarget; cutoffAt: string },
+		signal?: AbortSignal,
+	) =>
+		request<{ job: StorageHistoryJob }>("/storage/database/history/cleanup", {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
+	cancelStorageHistory: (target: StorageRetentionTarget, signal?: AbortSignal) =>
+		request<{ job: StorageHistoryJob | null }>("/storage/database/history/cancel", {
+			method: "POST",
+			body: JSON.stringify({ target }),
+			signal,
+		}),
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
 	startStorageScan: (categories?: StorageCategoryKey[]) =>
 		request<{ started: boolean; state: StorageScanJobState }>("/storage/scan/start", {

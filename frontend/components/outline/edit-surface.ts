@@ -40,7 +40,7 @@ import { caretIn } from "./editor/commands";
 import type { LiveClient, SelInfo } from "./editor/live-client";
 import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "./editor/view";
 import { MindMapView } from "./mindmap/mindmap";
-import { prewarmBodies } from "./mindmap/prewarm";
+import { type PrewarmResult, prewarmBodies } from "./mindmap/prewarm";
 import {
 	FrameDeferral,
 	OUTLINE_MOTION_EASING,
@@ -58,10 +58,10 @@ interface Pos {
 
 /**
  * The map waits at most this long for the Worker's sizes: of a page that just arrived, and after
- * a change of typography (then it measures what is left itself).
+ * a change of typography (uncached bodies retain provisional geometry, never local measuring).
  */
 const PREWARM_HOLD_MS = 1500;
-/** Pages smaller than this are measured on the spot (faster than waiting for the Worker). */
+/** Small pages can immediately lay out lightweight placeholders while the Worker runs. */
 const PREWARM_HOLD_MIN_BLOCKS = 300;
 /** A typography change measures the page ahead again once the setting has been still this long. */
 const TYPOGRAPHY_PREWARM_DELAY_MS = 300;
@@ -138,7 +138,11 @@ export class EditSurface {
 	/** The outline behind the map was never shown (see the constructor). */
 	private outlineCold = false;
 	private warmTimer: ReturnType<typeof setTimeout> | undefined;
-	prewarmDone: Promise<void> = Promise.resolve();
+	prewarmDone: Promise<PrewarmResult> = Promise.resolve({
+		status: "ready",
+		measured: 0,
+		failed: 0,
+	});
 	/**
 	 * A focus the host asked for while the page is still seeded and the block is not here yet
 	 * (its read is on its way): applied once it arrives.
@@ -234,8 +238,8 @@ export class EditSurface {
 		// The reader changed the typography (外观 · 排版): every node size measured ahead is for
 		// the old setting (`measure.ts` keys sizes by it). Once the setting settles — a slider drag
 		// changes it every frame — the page is measured ahead again in the Worker, and then the
-		// map is told: it measured only the nodes on screen while the setting moved
-		// (`MindMapView.typographySettled`), and the next switch to the map finds the sizes.
+		// map is told (`MindMapView.typographySettled`). Until then it preserves provisional
+		// geometry; no slider step, failed job or deadline authorizes local measuring.
 		let typographyTimer: ReturnType<typeof setTimeout> | undefined;
 		const offTypography = onTypographyChange(() => {
 			clearTimeout(typographyTimer);
@@ -251,9 +255,8 @@ export class EditSurface {
 				};
 				// Not shown yet: the first prewarm is still to come, under the new setting.
 				if (this.prewarmed === "none") return settled();
-				// Then the map measures what it still holds from the old setting — from the cache
-				// the Worker just filled, rather than body by body on the main thread. A Worker that
-				// does not answer in time does not leave the map moving: it settles anyway.
+				// Release the animation hold even on failure/timeout. This does NOT authorize
+				// measuring: the map reads successful cache entries or keeps provisional sizes.
 				Promise.race([
 					this.prewarm(),
 					new Promise<void>((resolve) => setTimeout(resolve, PREWARM_HOLD_MS)),
@@ -318,7 +321,7 @@ export class EditSurface {
 	 * Measure every block of the page for the map, in a Worker: once the page is seeded from its
 	 * HTTP read, and again once live (only bodies not measured yet are sent).
 	 */
-	prewarm(): Promise<void> {
+	prewarm(): Promise<PrewarmResult> {
 		const from = this.shownFrom();
 		if (this.opts.premeasure === false || this.destroyed || from === "none") {
 			return this.prewarmDone;
@@ -331,9 +334,9 @@ export class EditSurface {
 		const client = this.client;
 		// Posted after this task (the page arriving is busy enough); the map's hold below starts
 		// now, before its first layout.
-		this.prewarmDone = new Promise<void>((resolve) => {
+		this.prewarmDone = new Promise<PrewarmResult>((resolve) => {
 			setTimeout(() => {
-				if (this.destroyed) return resolve();
+				if (this.destroyed) return resolve({ status: "cancelled", measured: 0, failed: 0 });
 				// Every block the client has (a seed of a focused block has no page around it).
 				const ids: string[] = [];
 				for (const b of client.visible.blocks.values()) if (!b.deleted) ids.push(b.id);
@@ -341,7 +344,7 @@ export class EditSurface {
 					(function* () {
 						for (const id of ids) yield { content: client.textOf(id), labelOf };
 					})(),
-				).then(resolve, resolve);
+				).then(resolve, () => resolve({ status: "failed", measured: 0, failed: ids.length }));
 			}, 0);
 		});
 		// The map on screen as the page arrives (a panel restored in the map, a jump to another

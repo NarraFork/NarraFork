@@ -12,6 +12,8 @@ import { getSummary } from "../tool-call/tool-display";
 import { useVListLabels, type VListLabels } from "./useVListLabels";
 
 const SUMMARY_KEYS = [
+	"historyCleared",
+	"toolDetailsCleared",
 	"communicationRunning",
 	"communicationNoRecipients",
 	"communicationSuccess",

@@ -20,6 +20,14 @@ export type {
 	ProviderBalanceSnapshot,
 	ProviderBalanceStatus,
 } from "@shared/provider-balance";
+export type {
+	StorageHistoryJob,
+	StorageHistoryJobs,
+	StorageHistoryPreview,
+	StorageRetentionRule,
+	StorageRetentionSettings,
+	StorageRetentionTarget,
+} from "@shared/storage-retention";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type ChangelogEntry = {
@@ -792,6 +800,8 @@ export interface ToolCallRecord {
 	toolName: string;
 	inputJson?: unknown;
 	outputJson?: unknown;
+	/** A cleared pair is not user-visible even if the replay ledger retains input. */
+	payloadCleared?: boolean;
 	status?: string;
 	durationMs?: number;
 	streamStartedAt?: string | number | null;

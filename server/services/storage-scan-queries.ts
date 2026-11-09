@@ -170,6 +170,17 @@ export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCa
 		[
 			"narrators",
 			"narrator_messages",
+			"narrator_blocks",
+			"narrator_block_assets",
+			"narrator_turns",
+			"narrator_text_snapshots",
+			"narrator_message_context_stats",
+			"narrator_block_backfill",
+			"narrator_block_index_queue",
+			"narrator_block_sync_queue",
+			"narrator_block_diagnostics",
+			"narrator_drafts",
+			"narrator_context_pins",
 			"narrator_message_refs",
 			"narrator_tool_calls",
 			"narrator_buffered_messages",
@@ -291,25 +302,24 @@ export function loadDbstatObjectBytes(sqlite: Database): DbstatObjectBytes {
 		}>;
 		return new Map(rows.map((row) => [row.name, numberFromRow(row.bytes)]));
 	};
-	try {
-		return {
-			supported: true,
-			bytesByName: readRows(
-				"SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat WHERE schema = 'main' GROUP BY name",
-			),
-		};
-	} catch {
+	// Native aggregate mode emits one row per btree instead of one per page. A multi-GB
+	// database has millions of pages: grouping them in SQL needlessly builds a large temporary
+	// aggregate (and page-path strings). pgsize already includes overflow pages in this mode.
+	// This still walks the database, so callers must budget it as a full scan, not metadata.
+	const queries = [
+		"SELECT name, pgsize AS bytes FROM dbstat WHERE schema = 'main' AND aggregate = TRUE",
+		// Older SQLite builds may expose dbstat without its aggregate or schema column.
+		"SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat WHERE schema = 'main' GROUP BY name",
+		"SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat GROUP BY name",
+	];
+	for (const query of queries) {
 		try {
-			return {
-				supported: true,
-				bytesByName: readRows(
-					"SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat GROUP BY name",
-				),
-			};
+			return { supported: true, bytesByName: readRows(query) };
 		} catch {
-			return { supported: false, bytesByName: new Map() };
+			// Feature probing is read-only; retain approximate measurement when dbstat is absent.
 		}
 	}
+	return { supported: false, bytesByName: new Map() };
 }
 
 // ── Per-table measurement ──────────────────────────────────────────────────
