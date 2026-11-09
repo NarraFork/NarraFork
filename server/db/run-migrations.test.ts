@@ -1992,6 +1992,8 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 	test("replays the entire journal against an already-final schema without failing", async () => {
 		const folder = preRetirementJournal();
 		sqlite = new Database(":memory:");
+		// Apple's SQLite defaults this to ON; assert the replay restores it, not a platform default.
+		const legacyAlterTableBefore = sqlite.prepare("PRAGMA legacy_alter_table").get();
 		applyPendingMigrationsByHash(sqlite, folder);
 		sqlite.run("PRAGMA foreign_keys=ON");
 
@@ -2071,7 +2073,7 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		}
 		expect(sqlite.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
 		expect(sqlite.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
-		expect(sqlite.prepare("PRAGMA legacy_alter_table").get()).toEqual({ legacy_alter_table: 0 });
+		expect(sqlite.prepare("PRAGMA legacy_alter_table").get()).toEqual(legacyAlterTableBefore);
 		const changesBefore = sqlite.prepare("SELECT total_changes() AS changes").get();
 		applyPendingMigrationsByHash(sqlite, folder);
 		expect(sqlite.prepare("SELECT total_changes() AS changes").get()).toEqual(changesBefore);

@@ -21,6 +21,7 @@ import {
 	initializeAbsentReceiptProtectionSource,
 	installResourceProtectionTriggers,
 } from "../server/db/resource-protection-index";
+import { rewriteQualifiedNewTableChecks } from "../server/db/run-migrations";
 import * as schema from "../server/db/schema";
 import { getNarraforkPath } from "../server/lib/narrafork-home";
 
@@ -66,12 +67,17 @@ function isKnownAlreadyAppliedMigrationError(statement: MigrationStatement, err:
  * every statement in one transaction, where a migration's own `PRAGMA foreign_keys` is a no-op.
  * Outside a transaction a mid-file `PRAGMA foreign_keys=ON` would take effect, and a later
  * table rebuild's `DROP TABLE` would run FK actions/checks against already dropped tables.
+ *
+ * Replay with the production runner's own statement rewrite. Each platform's SQLite has its own
+ * defaults (Apple's `legacy_alter_table` is ON, stock SQLite's is OFF), so the harness must not
+ * depend on them — it must apply the same protection production does.
+ * Exported so `tests/setup-migrations.test.ts` can replay under Apple's default.
  */
-function applyMigrations(sqlite: Database): void {
+export function applyMigrations(sqlite: Database): void {
 	sqlite.transaction(() => {
 		for (const statement of MIGRATION_STATEMENTS) {
 			try {
-				sqlite.run(statement.sql);
+				sqlite.run(rewriteQualifiedNewTableChecks(statement.sql));
 			} catch (err) {
 				if (isKnownAlreadyAppliedMigrationError(statement, err)) continue;
 				throw err;
