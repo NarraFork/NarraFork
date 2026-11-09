@@ -29,6 +29,7 @@
  */
 
 import {
+	type MouseEvent as ReactMouseEvent,
 	type PointerEvent as ReactPointerEvent,
 	useCallback,
 	useEffect,
@@ -173,7 +174,10 @@ function PluginOverlayLayer({
 	);
 
 	const sendPointer = useCallback(
-		(type: "down" | "move" | "up" | "cancel", event: ReactPointerEvent<HTMLDivElement>) => {
+		(
+			type: "down" | "move" | "up" | "cancel" | "contextmenu",
+			event: ReactPointerEvent<HTMLDivElement> | ReactMouseEvent<HTMLDivElement>,
+		) => {
 			// `sendNotification` is optional on the controller interface: a session that has
 			// not finished its handshake cannot deliver anything, and the concrete class
 			// drops these silently until then. Optional-calling keeps that contract honest.
@@ -183,8 +187,9 @@ function PluginOverlayLayer({
 				// to translate between the hit region and its own canvas.
 				x: event.clientX,
 				y: event.clientY,
-				pointerId: event.pointerId,
-				buttons: event.buttons,
+				pointerId: "pointerId" in event ? event.pointerId : 0,
+				buttons: "buttons" in event ? event.buttons : 0,
+				button: "button" in event ? event.button : 0,
 			});
 		},
 		[runtime, panelInstanceId],
@@ -203,6 +208,10 @@ function PluginOverlayLayer({
 				// The layer itself never takes input; only the hit region below does.
 				pointerEvents: "none",
 				background: "transparent",
+				// No text, no selection, no caret: a drag across the layer must not leave the
+				// document's insertion point blinking behind the pet.
+				userSelect: "none",
+				caretColor: "transparent",
 			}}
 		>
 			{/*
@@ -226,7 +235,15 @@ function PluginOverlayLayer({
 					data-plugin-overlay-hit={panelInstanceId}
 					role="presentation"
 					onPointerDown={(event) => {
+						// Only the primary button drags. The relay used to report `button: 0`
+						// unconditionally, so a right-press started a drag and the context
+						// menu never got a chance to open.
+						if (event.button !== 0) return;
 						capturedPointer.current = event.pointerId;
+						// Suppress the browser's own gesture handling, which otherwise starts a
+						// text selection on the document underneath and leaves a blinking
+						// caret somewhere in the app while the pet is being dragged.
+						event.preventDefault();
 						// Capture so a gesture survives the pointer leaving the rectangle:
 						// the region only covers what the view last reported, and the view may
 						// deliberately lag its reports to save round trips.
@@ -236,6 +253,12 @@ function PluginOverlayLayer({
 							/* capture unsupported: dragging still works inside the region */
 						}
 						sendPointer("down", event);
+					}}
+					onContextMenu={(event) => {
+						// A click-through frame never receives this event, so the menu inside it
+						// would be unreachable; relay it instead of showing the browser's own.
+						event.preventDefault();
+						sendPointer("contextmenu", event);
 					}}
 					onPointerMove={(event) => {
 						if (capturedPointer.current !== event.pointerId) return;
@@ -267,6 +290,8 @@ function PluginOverlayLayer({
 						// No cursor opinion: the view draws its own affordance, and a host that
 						// guessed "grab" would be wrong for every other kind of overlay.
 						touchAction: "none",
+						userSelect: "none",
+						caretColor: "transparent",
 					}}
 				/>
 			) : null}

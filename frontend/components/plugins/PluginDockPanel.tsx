@@ -356,11 +356,18 @@ export function PluginDockPanelView({
 	if (controller && !sessionBroken) {
 		// Live session: render the iframe directly in the panel content. The
 		// handshake happens on iframe load (controller.attach), same as before.
+		/*
+		 * `allow` delegates autoplay to the frame. A click-through overlay never receives a
+		 * real pointer event — input arrives as relayed notifications, which do NOT count as
+		 * user activation — so without this its AudioContext stays suspended forever and
+		 * every sound it plays is silently dropped. Dock panels get genuine clicks, so they
+		 * keep the empty policy.
+		 */
 		return withSlot(
 			<iframe
 				srcDoc={controller.getSrcdoc()}
 				sandbox="allow-scripts"
-				allow=""
+				allow={passthrough ? "autoplay" : ""}
 				referrerPolicy="no-referrer"
 				title={contribution.title || params.contributionId}
 				onLoad={(event) => controller.attach(event.currentTarget)}
