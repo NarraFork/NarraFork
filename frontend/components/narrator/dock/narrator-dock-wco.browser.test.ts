@@ -69,6 +69,16 @@ const settle = (page: Page) =>
 			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 	});
 
+/** 溢出菜单是点到才创建的弹层，点击后要等它真的上屏再判断命中。 */
+async function openOverflowMenu(page: Page) {
+	await page.click(".dv-tabs-overflow-dropdown-root");
+	await page.waitForFunction(() => !!(window as unknown as FixtureWindow).fixture.snapshot().popup);
+	await settle(page);
+}
+
+/** 布局宽度是小数，页签是否在可视范围内按一像素容差判断。 */
+const EDGE_TOLERANCE = 1;
+
 async function withFixture(run: (page: Page) => Promise<void>) {
 	if (!browser || !server) throw new Error("浏览器夹具未初始化");
 	const page = await browser.newPage();
@@ -117,7 +127,7 @@ test("真实 Dockview：只下移右侧标签和内容，主会话矩形及编�
 			}
 		}
 		const beforeSwitch = await state(page);
-		await page.click(".dv-tabs-overflow-dropdown-root");
+		await openOverflowMenu(page);
 		const popup = await state(page);
 		expect(popup.popup).not.toBeNull();
 		expect(popup.popupHit).toBe(true);
@@ -214,17 +224,18 @@ test("真实 AppShell：父容器可滚动时，普通页签及溢出选择均�
 				await settle(page);
 				expect(vertical(await state(page))).toEqual(baseline);
 				for (let selection = 0; selection < 3; selection++) {
-					await page.click(".dv-tabs-overflow-dropdown-root");
+					await openOverflowMenu(page);
+					expect((await state(page)).popupHit).toBe(true);
 					await page.click(".dv-tabs-overflow-container .dv-tab");
 					await settle(page);
 					const after = await state(page);
 					expect(vertical(after)).toEqual(baseline);
 					expect(after.tool.tabs?.top).toBe(height + 1);
-					expect(after.tool.activeTab?.left ?? -1).toBeGreaterThanOrEqual(
-						after.tool.tabViewport?.left ?? 0,
+					expect(after.tool.activeTab?.left ?? Number.NEGATIVE_INFINITY).toBeGreaterThanOrEqual(
+						(after.tool.tabViewport?.left ?? 0) - EDGE_TOLERANCE,
 					);
-					expect(after.tool.activeTab?.right ?? Infinity).toBeLessThanOrEqual(
-						(after.tool.tabViewport?.right ?? 0) + 1,
+					expect(after.tool.activeTab?.right ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(
+						(after.tool.tabViewport?.right ?? 0) + EDGE_TOLERANCE,
 					);
 					expect(after.popup).toBeNull();
 				}

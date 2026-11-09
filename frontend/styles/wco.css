@@ -152,8 +152,7 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 	 * bare div, so without an entry here the drag region swallows its clicks and
 	 * pressing it moves the window instead of opening the tab list.
 	 */
-	html[data-nf-wco]
-		[data-nf-titlebar-row]
+	html[data-nf-wco] [data-nf-titlebar-row]
 		:is(
 			button,
 			a,

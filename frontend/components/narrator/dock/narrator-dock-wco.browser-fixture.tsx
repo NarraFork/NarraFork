@@ -209,8 +209,16 @@ export function snapshot() {
 			document.getElementById("fixture-page"),
 		].map((element) => ({ top: element?.scrollTop ?? 0, left: element?.scrollLeft ?? 0 })),
 		popup: rect(popup),
+		// 取弹层中心命中：靠左上角会落到分组标题等空白处，与遮挡无关。
 		popupHit: popupRect
-			? Boolean(popup?.contains(document.elementFromPoint(popupRect.x + 20, popupRect.y + 15)))
+			? Boolean(
+					popup?.contains(
+						document.elementFromPoint(
+							popupRect.x + popupRect.width / 2,
+							popupRect.y + popupRect.height / 2,
+						),
+					),
+				)
 			: false,
 		overflow: rect(document.querySelector(".dv-tabs-overflow-dropdown-root")),
 	};
