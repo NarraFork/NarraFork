@@ -1082,6 +1082,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 		}
 
+		if (this.apiMode !== "codex" && params.conversationId) {
+			// OpenAI's prompt cache is per-machine; load-balanced relays need a stable routing key (codex sets its own).
+			body.prompt_cache_key = params.conversationId;
+		}
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
 

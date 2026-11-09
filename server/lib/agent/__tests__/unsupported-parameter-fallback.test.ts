@@ -223,3 +223,64 @@ describe("OpenAI request paths", () => {
 		expect(requests[0]).not.toHaveProperty("max_output_tokens");
 	});
 });
+
+describe("Completions prompt cache key fallback", () => {
+	const completionsConfig = { ...config, apiMode: "completions" as const };
+	const completionsModel = `${completionsConfig.prefix}:gpt-6-astra`;
+	const originalFetch = globalThis.fetch;
+	let requests: Array<Record<string, unknown>> = [];
+	let savedOpenAI: typeof settings.openaiProviders;
+
+	beforeEach(() => {
+		resetUnsupportedParameterMemory();
+		requests = [];
+		savedOpenAI = settings.openaiProviders;
+		settings.openaiProviders = [...(savedOpenAI ?? []), { ...completionsConfig }];
+		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requests.push(body);
+			if ("prompt_cache_key" in body)
+				return new Response('{"detail":"Unsupported parameter: prompt_cache_key"}', {
+					status: 400,
+				});
+			return new Response(
+				'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		settings.openaiProviders = savedOpenAI;
+	});
+
+	const send = async (provider: OpenAIProvider) => {
+		for await (const _event of provider.chat({
+			conversationId: "unsupported-cache-key",
+			content: "hello",
+			model: completionsModel,
+			cwd: process.cwd(),
+			history: [],
+			tools: [],
+			toolResults: [],
+			signal: new AbortController().signal,
+		})) {
+			/* drain */
+		}
+	};
+
+	test("chat strips the rejected key, retries, and skips it afterwards", async () => {
+		const provider = new OpenAIProvider({ ...completionsConfig });
+		await send(provider);
+		expect(requests).toHaveLength(2);
+		expect(requests[0].prompt_cache_key).toBe("unsupported-cache-key");
+		expect(requests[1]).not.toHaveProperty("prompt_cache_key");
+		expect(modelRejectsParameter(completionsModel, "prompt_cache_key")).toBe(true);
+
+		requests = [];
+		await send(provider);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).not.toHaveProperty("prompt_cache_key");
+	});
+});
