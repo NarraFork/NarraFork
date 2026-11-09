@@ -123,7 +123,11 @@ export function ModelSourceBrowser({
 		<Group align="flex-start" gap={0} wrap="nowrap" grow>
 			<Stack
 				gap={2}
-				style={{ flex: 1, minWidth: 0, borderRight: "1px solid var(--mantine-color-dark-4)" }}
+				style={{
+					flex: 1,
+					minWidth: 0,
+					borderRight: "1px solid var(--mantine-color-default-border)",
+				}}
 			>
 				<div style={{ maxHeight: COLUMN_MAX_HEIGHT, overflowY: "auto" }}>
 					{groups.length === 0 && (
@@ -154,7 +158,7 @@ export function ModelSourceBrowser({
 											width: "100%",
 											textAlign: "left",
 											borderRadius: 4,
-											backgroundColor: active ? "var(--mantine-color-dark-5)" : undefined,
+											backgroundColor: active ? "var(--mantine-color-default-hover)" : undefined,
 										}}
 									>
 										<Group justify="space-between" wrap="nowrap" gap={4}>
@@ -192,7 +196,9 @@ export function ModelSourceBrowser({
 										width: "100%",
 										textAlign: "left",
 										borderRadius: 4,
-										backgroundColor: isAutoSelected ? "var(--mantine-color-dark-5)" : undefined,
+										backgroundColor: isAutoSelected
+											? "var(--mantine-color-default-hover)"
+											: undefined,
 									}}
 								>
 									<Group justify="space-between" wrap="nowrap" gap={4}>
@@ -226,7 +232,9 @@ export function ModelSourceBrowser({
 												width: "100%",
 												textAlign: "left",
 												borderRadius: 4,
-												backgroundColor: selected ? "var(--mantine-color-dark-5)" : undefined,
+												backgroundColor: selected
+													? "var(--mantine-color-default-hover)"
+													: undefined,
 											}}
 										>
 											<Group justify="space-between" wrap="nowrap" gap={4}>
