@@ -77,7 +77,7 @@ test.each([
 					const line = pending.slice(0, end);
 					pending = pending.slice(end + 1);
 					onLine?.(line);
-					logs = `${logs}\n${line}`.slice(-8192);
+					if (!line.startsWith("EDITOR_HOST_READY ")) logs = `${logs}\n${line}`.slice(-8192);
 				}
 			}
 		} finally {
@@ -258,7 +258,18 @@ test.each([
 	}
 	async function query(operationId: string) {
 		const response = await request(`${endpoint}/editor-operations/${operationId}`);
-		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			const reader = response.body?.getReader();
+			let body = "";
+			try {
+				const chunk = await reader?.read();
+				if (chunk?.value) body = new TextDecoder().decode(chunk.value.subarray(0, 4096));
+			} finally {
+				await reader?.cancel();
+				reader?.releaseLock();
+			}
+			throw new Error(`Operation query failed (${response.status}): ${body}\n${logs}`);
+		}
 		return (await response.json()) as EditorOperationResult;
 	}
 	try {
@@ -319,6 +330,15 @@ test.each([
 				snapshotRevision: Number.MAX_SAFE_INTEGER,
 			});
 			const savedInfo = await info();
+			expect(
+				savedInfo.operations,
+				`Cold recovery requires SQLite evidence: ${JSON.stringify(first.body)}\n${logs}`,
+			).toContainEqual(
+				expect.objectContaining({
+					sourceId: first.operationId,
+					snapshotRevision: Number.MAX_SAFE_INTEGER,
+				}),
+			);
 			expect(savedInfo.nativeCalls).toMatchObject({
 				apply: 1,
 				query: 0,
