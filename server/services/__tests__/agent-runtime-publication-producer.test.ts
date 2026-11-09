@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { and, asc, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -13,7 +13,7 @@ import { MAILBOX_LIMITS as L } from "../agent-runtime/limits";
 import { createMailboxStore } from "../agent-runtime/mailbox";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
 const { runtimePublication: publisher, createRuntimePublicationService } = await import(
 	"../agent-runtime/publication"
@@ -357,7 +357,8 @@ describe("real task producers use publication outbox", () => {
 			.get();
 		expect(receipt?.contentText?.length).toBe(12001);
 		expect(
-			(receipt?.contentJson as Array<{ publicationResult: unknown }>)[0].publicationResult,
+			readTestMessageContent<{ publicationResult: unknown }>(sqlite, receipt?.id ?? "")[0]
+				.publicationResult,
 		).toMatchObject({ sourceResultRef: "message:assistant-result", truncated: true });
 	});
 
@@ -378,7 +379,8 @@ describe("real task producers use publication outbox", () => {
 		expect(Buffer.byteLength(fallback.contentText ?? "")).toBeLessThanOrEqual(64 * 1024);
 		expect(fallback.contentText).not.toContain("�");
 		expect(
-			(fallback.contentJson as Array<{ publicationResult: unknown }>)[0].publicationResult,
+			readTestMessageContent<{ publicationResult: unknown }>(sqlite, fallback.id)[0]
+				.publicationResult,
 		).toMatchObject({ truncated: true, originalBytes: Buffer.byteLength(text) });
 	});
 

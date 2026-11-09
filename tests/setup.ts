@@ -23,6 +23,7 @@ import {
 } from "../server/db/resource-protection-index";
 import * as schema from "../server/db/schema";
 import { getNarraforkPath } from "../server/lib/narrafork-home";
+import { bodySql, hasBlockStorage, readBodies } from "../server/lib/narrator-bodies";
 
 const DRIZZLE_DIR = join(import.meta.dir, "..", "drizzle");
 
@@ -109,6 +110,20 @@ export function getTestDb() {
 	initializeAbsentReceiptProtectionSource(sqlite, getNarraforkPath("worktree-requests"));
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 	return { db, sqlite };
+}
+
+/** Read the logical SDK body, not the optional content_json storage projection. */
+export function readTestMessageContent<T = Record<string, unknown>>(
+	sqlite: Database,
+	messageId: string,
+): T[] {
+	const row = sqlite
+		.query<{ id: string; body: string | null }, [string]>(
+			`SELECT m.id, ${bodySql("m", hasBlockStorage(sqlite))} AS body
+			 FROM narrator_messages m WHERE m.id = ?`,
+		)
+		.get(messageId);
+	return row ? (readBodies(sqlite, [row]).get(row.id) as T[]) : [];
 }
 
 /**

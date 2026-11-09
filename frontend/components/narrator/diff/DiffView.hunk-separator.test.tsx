@@ -18,26 +18,28 @@
  * catches nothing and breaks on every legitimate tweak.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { clearShikiTokenCache } from "@frontend/lib/shiki-token-cache";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as shikiTokenCache from "@frontend/lib/shiki-token-cache";
+import {
+	createShikiTokenWorkerLoader,
+	type ShikiTokenWorkerPort,
+} from "@frontend/lib/shiki-token-worker-client";
+import type { ShikiTokenWorkerResponse } from "@frontend/lib/shiki-token-worker-protocol";
 import { MantineProvider } from "@mantine/core";
 import { parseUnifiedDiff } from "@shared/pretext-layout/parse-unified-diff";
 import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
 
 /**
- * Shiki cannot run here (it wants `import.meta.env` and a wasm engine), so the
- * loader is replaced with a deterministic tokeniser: one token spanning each whole
- * line. What matters is only that the tokens partition each line EXACTLY —
- * `sliceTokensByWordChanges` refuses to slice when token and chunk lengths
- * disagree, which is precisely the silent-fallback this suite must not hit.
+ * Bun deliberately does not boot the browser Shiki Worker. Inject a port through
+ * the real Worker-client/cache factories instead of mocking the retired UI-thread
+ * loader. Replies carry one token spanning each whole line: the tokens must
+ * partition each line EXACTLY or `sliceTokensByWordChanges` silently degrades.
  *
- * The stub also emulates the ONE grammar behaviour under test: a line-by-line
- * state machine. Once a line opens `/*`, every following line in that same source
- * is "inside a comment" until one closes it. Real Shiki does this; a stateless stub
- * could not show that splitting the sides is what fixes the leak.
+ * The port emulates the ONE grammar behaviour under test: a line-by-line state
+ * machine. Once a line opens `/*`, following lines in the same request stay inside
+ * a comment until one closes it. A stateless fixture could not expose side leaks.
  */
-const realShikiLoader = { ...(await import("../../../lib/shiki-loader")) };
 
 const FAKE_TOKEN_COLOR = "#ff00ff";
 const FAKE_COMMENT_COLOR = "#8b949e";
@@ -50,18 +52,43 @@ function tokenizeStatefully(code: string) {
 		if (opensHere) inComment = true;
 		if (inComment && line.includes("*/")) inComment = false;
 		const color = wasInComment || opensHere ? FAKE_COMMENT_COLOR : FAKE_TOKEN_COLOR;
-		return line.length === 0 ? [] : [{ content: line, color, offset: 0, fontStyle: 0 }];
+		return line.length === 0 ? [] : [{ content: line, color }];
 	});
 }
 
-mock.module("../../../lib/shiki-loader", () => ({
-	...realShikiLoader,
-	loadShiki: async () => ({
-		bundledLanguages: { typescript: {} },
-		codeToHtml: async () => "",
-		codeToTokens: async (code: string) => ({ tokens: tokenizeStatefully(code) }),
-	}),
-}));
+function installTokenWorkerCache() {
+	const port: ShikiTokenWorkerPort = {
+		onmessage: null,
+		onerror: null,
+		postMessage(request) {
+			if (request.type === "boot") return;
+			queueMicrotask(() => {
+				port.onmessage?.({
+					data: { type: "tokens", id: request.id, tokens: tokenizeStatefully(request.code) },
+				} as MessageEvent<ShikiTokenWorkerResponse>);
+			});
+		},
+		terminate() {},
+	};
+	const cache = shikiTokenCache.createShikiTokenCache(
+		createShikiTokenWorkerLoader({
+			factory: () => port,
+			appBase: () => "https://diff.test/",
+		}),
+	);
+	// Only redirect the singleton bindings; subscription/version/cache behaviour
+	// and the Worker client's asynchronous request/reply path remain real.
+	const bindings = [
+		spyOn(shikiTokenCache, "getShikiTokens").mockImplementation(cache.get),
+		spyOn(shikiTokenCache, "subscribeShikiTokens").mockImplementation(cache.subscribe),
+		spyOn(shikiTokenCache, "getShikiTokensVersion").mockImplementation(cache.getVersion),
+	];
+	return () => {
+		port.onerror?.({ message: "fixture cleanup" } as ErrorEvent);
+		for (const binding of bindings) binding.mockRestore();
+		cache.clear();
+	};
+}
 
 const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 installCanvasStub();
@@ -75,6 +102,7 @@ class TestResizeObserver {
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
+let disposeTokenWorkerCache: () => void;
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -215,36 +243,33 @@ function flushRender() {
 /**
  * Wait for the highlight to land.
  *
- * `useTokenMap` chains loadShiki → codeToTokens → setState, so a fixed number of
- * ticks is a race. Poll for the first coloured span instead and fail loudly if it
- * never appears — a silent timeout would make the colour assertions vacuous.
+ * The Worker reply updates the cache's external-store subscribers asynchronously,
+ * so a fixed number of ticks is a race. Poll for the first coloured span instead
+ * and fail loudly: a silent timeout would make the colour assertions vacuous.
  */
 async function waitForHighlight() {
 	for (let attempt = 0; attempt < 50; attempt++) {
 		if (colouredRowIndexes(diffRows()).length > 0) return;
 		await flushRender();
 	}
-	throw new Error("syntax highlighting never rendered; the shiki stub did not resolve");
+	throw new Error("syntax highlighting never rendered; the Shiki Worker reply did not land");
 }
 
 describe("DiffView", () => {
 	beforeEach(() => {
 		installDom();
+		disposeTokenWorkerCache = installTokenWorkerCache();
 	});
 
 	afterEach(() => {
-		root?.unmount();
-		container?.remove();
-		root = undefined;
-		container = undefined;
-	});
-
-	afterAll(() => {
-		// `mock.module` is process-wide and survives `mock.restore()`, so the real
-		// loader has to be handed back or every later suite gets the fake tokeniser.
-		clearShikiTokenCache();
-		mock.module("../../../lib/shiki-loader", () => realShikiLoader);
-		mock.restore();
+		try {
+			root?.unmount();
+		} finally {
+			container?.remove();
+			root = undefined;
+			container = undefined;
+			disposeTokenWorkerCache();
+		}
 	});
 
 	test("draws one `@@ range @@` band per hunk, with git's counts and heading", async () => {

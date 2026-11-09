@@ -14,6 +14,7 @@ import {
 	getConfiguredConcurrency,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
+	runEphemeralReadTask,
 	runReadTask,
 	setDbWorkerSpecifiersForTest,
 	shutdownDbWorkerPool,
@@ -473,6 +474,50 @@ describe("worker pool", () => {
 		});
 		expect(ok.pageSize).toBeGreaterThan(0);
 	}, 60_000);
+
+	test("ephemeral watchdog is classified and does not restart on another specifier", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "ephemeral-hang.ts", HANGING_WORKER_BODY),
+			writeWorkerFixture(
+				home,
+				"ephemeral-must-not-run.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "result", requestId: event.data.requestId, result: "restarted" });
+				};
+			`,
+			),
+		]);
+		await expect(
+			runEphemeralReadTask(dbPath, { kind: "storageScanContext" }, { timeoutMs: 200 }),
+		).rejects.toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
+	}, 5000);
+
+	test("ephemeral query failure does not retry another worker entry", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"ephemeral-query-error.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "error", requestId: event.data.requestId, message: "query failed" });
+				};
+			`,
+			),
+			writeWorkerFixture(
+				home,
+				"ephemeral-must-not-retry.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "result", requestId: event.data.requestId, result: "restarted" });
+				};
+			`,
+			),
+		]);
+		await expect(
+			runEphemeralReadTask(dbPath, { kind: "storageScanContext" }),
+		).rejects.toMatchObject({ name: "DbReadTaskExecutionError", message: "query failed" });
+	}, 5000);
 
 	test("rejects an already-aborted signal", async () => {
 		const controller = new AbortController();

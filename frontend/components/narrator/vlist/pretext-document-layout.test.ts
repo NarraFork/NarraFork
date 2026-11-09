@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { historyClearedText } from "@shared/storage-retention";
 import type { NarratorMsg } from "../narrator-panel-types";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -484,6 +485,77 @@ describe("buildPretextDocumentLayout", () => {
 		expect(translated.spec.data).toMatchObject({
 			labels: { communicationReceiptLegacy: "旧消息回执" },
 		});
+	});
+
+	it.each([
+		"user",
+		"assistant",
+		"compact",
+		"segment_compact",
+	] as const)("localizes native %s history tombstones before both measurement and rendering without mutating protocol rows", (kind) => {
+		const marker = historyClearedText("2026-01-01T00:00:00.000Z");
+		const element =
+			kind === "user" || kind === "assistant"
+				? { ...marker }
+				: {
+						type: kind,
+						subtype: "plan",
+						status: "completed",
+						historyClearVersion: 1,
+						historyClearedAt: marker.historyClearedAt,
+						summary: marker.text,
+					};
+		const source = rowWithElements(
+			{
+				...message(`cleared-${kind}`, 1, "assistant", marker.text),
+				role: kind === "user" ? "user" : kind === "assistant" ? "assistant" : "system",
+			},
+			[element],
+		) as unknown as NarratorMsg;
+		const nativeBlocks = source.blocks;
+		const build = (language: string, label: string) =>
+			buildPretextDocumentLayout([source], {
+				layoutRevision: `cleared-${kind}`,
+				documentRevision: 1,
+				lod: 5,
+				widthBucket: "300",
+				contentWidth: 300,
+				labelsRevision: language,
+				labels: { historyCleared: label },
+				isExpanded: () => true,
+			});
+		const english = build("en", "History cleared");
+		const chinese = build("zh-CN", "历史已清理");
+		const projected = JSON.stringify(
+			chinese.items.map(({ spec, measured }) => ({ data: spec.data, measured })),
+		);
+		expect(projected).toContain("历史已清理");
+		expect(projected).not.toContain("[History cleared]");
+		expect(chinese.items.map(({ spec }) => spec.key)).toEqual(
+			english.items.map(({ spec }) => spec.key),
+		);
+		expect(chinese.items[0].measured).not.toBe(english.items[0].measured);
+		expect(source.blocks).toBe(nativeBlocks);
+		expect(messageBody(source)[0]).toEqual(element);
+		expect(source.contentText).toBe("[History cleared]");
+		const rebuilt = build("zh-CN", "历史已清理");
+		expect(rebuilt.items[0].measured).toBe(chinese.items[0].measured);
+	});
+
+	it("does not translate ordinary user text that resembles a history tombstone", () => {
+		const source = message("ordinary-marker-quote", 1, "user", "[History cleared]");
+		const result = buildPretextDocumentLayout([source], {
+			layoutRevision: "ordinary-marker-quote",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "300",
+			contentWidth: 300,
+			labelsRevision: "zh-CN",
+			labels: { historyCleared: "历史已清理" },
+		});
+		const projected = JSON.stringify(result.items.map(({ spec }) => spec.data));
+		expect(projected).toContain("[History cleared]");
+		expect(projected).not.toContain("历史已清理");
 	});
 
 	it("is deterministic for a 95-message mixed history with long, tool, compact, and tail content", () => {

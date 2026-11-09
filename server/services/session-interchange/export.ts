@@ -19,6 +19,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import { parseCompactMessageBlock } from "@shared/compact-message";
+import { clearedToolOutputSql, isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import {
 	claudeCodeSessionLayout,
@@ -46,6 +47,7 @@ import {
 	type InterchangeWarning,
 	WarningCollector,
 } from "@shared/session-interchange/model";
+import { isClearedToolOutput } from "@shared/storage-retention";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { db, sqlite } from "../../db";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
@@ -111,6 +113,8 @@ export interface SessionExportResult {
 }
 
 // ── Reading ────────────────────────────────────────────────────────────────
+
+const CLEARED_SESSION_TOOL_SQL = sql.raw(clearedToolOutputSql("narrator_tool_calls.output_json"));
 
 /** The message columns the conversion reads; never the large or derived ones. */
 const MESSAGE_COLUMNS = {
@@ -311,6 +315,14 @@ function assistantMessages(
 	let chars = 0;
 
 	const pushTool = (tool: ToolRow) => {
+		emitted.add(tool.toolUseId);
+		if (isClearedToolOutput(tool.outputJson)) {
+			// Replace the whole call/result pair: an empty Write/Edit is not replayable.
+			const text = `[Tool details cleared: ${tool.toolName}]`;
+			blocks.push({ type: "text", text });
+			chars += text.length;
+			return;
+		}
 		const input = parseInput(tool.inputJson);
 		chars += JSON.stringify(input).length;
 		const subagentRef = ctx.subagentByToolUseId.get(tool.toolUseId);
@@ -321,7 +333,6 @@ function assistantMessages(
 			input,
 			...(subagentRef ? { subagentRef } : {}),
 		});
-		emitted.add(tool.toolUseId);
 	};
 
 	for (const block of blocksOf(row.contentJson)) {
@@ -412,7 +423,10 @@ async function loadTools(messageIds: string[]): Promise<Map<string, ToolRow[]>> 
 			messageId: narratorToolCalls.messageId,
 			toolUseId: narratorToolCalls.toolUseId,
 			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
+			inputJson:
+				sql`CASE WHEN ${CLEARED_SESSION_TOOL_SQL} THEN NULL ELSE ${narratorToolCalls.inputJson} END`.mapWith(
+					narratorToolCalls.inputJson,
+				),
 			outputJson: narratorToolCalls.outputJson,
 			status: narratorToolCalls.status,
 			errorMessage: narratorToolCalls.errorMessage,
@@ -436,7 +450,12 @@ async function rowsToMessages(
 	ctx: ReadContext,
 	isCompactRef: (messageId: string) => boolean,
 ): Promise<InterchangeMessage[]> {
-	const tools = await loadTools(rows.filter((r) => r.role === "assistant").map((r) => r.id));
+	// A cleared body (or a later human edit) must not resurrect the old ledger.
+	const tools = await loadTools(
+		rows
+			.filter((r) => r.role === "assistant" && !isHistoryProtectedContent(r.contentJson))
+			.map((r) => r.id),
+	);
 	const out: InterchangeMessage[] = [];
 	for (const row of rows) {
 		if (row.role === "assistant") {

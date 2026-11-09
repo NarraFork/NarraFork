@@ -3,7 +3,7 @@ import { getTestDb } from "../../../tests/setup";
 import { hotSafe } from "../../lib/hot-safe";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 let shouldFail = true;
 const migrateLegacyTaskNotice = async () => {

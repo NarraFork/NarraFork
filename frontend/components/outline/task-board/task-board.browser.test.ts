@@ -20,7 +20,7 @@ import { basename } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
-import { db } from "../../../../server/db";
+import { db, sqlite } from "../../../../server/db";
 import {
 	aclGrants,
 	narratorMessageRefs,
@@ -39,6 +39,7 @@ import { outlineStore } from "../../../../server/services/outline/store";
 import { writeOutline } from "../../../../server/services/outline/write";
 import { settleOutlineTaskEditsForTests } from "../../../../server/services/outline-task-edits";
 import { OUTLINE_TASK_BOARD_LIMITS } from "../../../../shared/outline-task-board";
+import { readTestMessageContent } from "../../../../tests/setup";
 import type * as Fixture from "./task-board.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -215,12 +216,12 @@ async function taskByTitle(spaceId: string, title: string) {
 /** What the session was told of people's changes to its tasks. */
 async function notes(narratorId: string): Promise<string> {
 	const rows = await db
-		.select({ json: narratorMessages.contentJson })
+		.select({ id: narratorMessages.id })
 		.from(narratorMessageRefs)
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId));
 	return rows
-		.flatMap((row) => (row.json ?? []) as Array<Record<string, unknown>>)
+		.flatMap((row) => readTestMessageContent(sqlite, row.id))
 		.filter((b) => b.source === "outline_task_edit")
 		.map((b) => String(b.modelText))
 		.join("\n");

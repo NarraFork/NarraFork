@@ -8,7 +8,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { historyStrings } from "../../../tests/fixtures/model-input";
 import { wavBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
 import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
@@ -659,7 +659,8 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 			where: eq(narratorToolCalls.id, call.id),
 		});
 		expect(auditBefore?.inputJson).toEqual(audit);
-		expect(before?.contentJson).toEqual([
+		const contentBefore = readTestMessageContent(sqlite, saved.id);
+		expect(contentBefore).toEqual([
 			{ type: "tool_use", id: "question-use", name: "AskUserQuestion", input: questionInput },
 		]);
 		for (const narratorId of ["primary", "fork"]) {
@@ -680,6 +681,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 				where: (messages, { eq }) => eq(messages.id, saved.id),
 			}),
 		).toEqual(before);
+		expect(readTestMessageContent(sqlite, saved.id)).toEqual(contentBefore);
 		expect(
 			await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, call.id) }),
 		).toEqual(auditBefore);

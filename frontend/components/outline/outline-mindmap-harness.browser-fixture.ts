@@ -277,7 +277,7 @@ export async function openHost(
 		touch?: boolean;
 		userId?: string;
 		lens?: "facts" | "all";
-		/** No measuring Worker (node sizes measured on the spot). */
+		/** No measuring Worker; uncached nodes keep provisional geometry. */
 		noWorker?: boolean;
 	} = {},
 ): Promise<MapEditor> {

@@ -21,11 +21,12 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { clearedToolOutput, isClearedToolOutput } from "@shared/storage-retention";
 import { QueryClient, QueryClientProvider, replaceEqualDeep } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { createElement, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { narratorsApi } from "../../../lib/api/narrators";
+import { narratorsApi, toolCallDetailQueryKey } from "../../../lib/api/narrators";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { type AdapterSegment, adaptSegments } from "./segment-adapter";
@@ -237,6 +238,18 @@ describe("buildToolDetailRevision", () => {
 		expect(buildToolDetailRevision(["a"], [], [])).toBe(settled);
 	});
 
+	test("changes once when a settled identity becomes cleared, and retains that signal off-screen", () => {
+		const before = buildToolDetailRevision(["a"], ["a"], [{ data: { inputJson: "private" } }]);
+		const after = buildToolDetailRevision(
+			["a"],
+			["a"],
+			[{ data: { payloadCleared: true, inputJson: "private" } }],
+		);
+		expect(after).not.toBe(before);
+		expect(after).not.toContain("private");
+		expect(buildToolDetailRevision(["a"], [], [], ["a"])).toBe(after);
+	});
+
 	test("ignores the order the shell requested ids in", () => {
 		expect(buildToolDetailRevision(["b", "a"], [], [])).toBe(
 			buildToolDetailRevision(["a", "b"], [], []),
@@ -297,6 +310,27 @@ describe("mergeToolDetailPayloads", () => {
 		const payloads = mergeToolDetailPayloads(retained, ["b"], [{ data: { inputJson: "new" } }]);
 		expect(payloads.get("a")).toEqual({ inputJson: "kept" });
 		expect(payloads.get("b")).toEqual({ inputJson: "new", outputJson: undefined });
+	});
+
+	test.each([
+		"native-output",
+		"dto",
+	])("a %s tombstone evicts both retained payloads and cannot be undone by a late response", (source) => {
+		const secret = {
+			inputJson: { content: "INTERNAL_REPLAY_SECRET" },
+			outputJson: "OLD_OUTPUT_SECRET",
+		};
+		const incoming =
+			source === "native-output"
+				? { ...secret, outputJson: clearedToolOutput("2026-01-01T00:00:00.000Z") }
+				: { ...secret, payloadCleared: true };
+		const cleared = mergeToolDetailPayloads(new Map([["a", secret]]), ["a"], [{ data: incoming }]);
+		expect(cleared.get("a")?.inputJson).toBeUndefined();
+		expect(cleared.get("a")?.payloadCleared).toBe(true);
+		expect(isClearedToolOutput(cleared.get("a")?.outputJson)).toBe(true);
+		expect(JSON.stringify([...cleared])).not.toContain("SECRET");
+		expect(mergeToolDetailPayloads(cleared, ["a"], [{ data: secret }])).toBe(cleared);
+		expect(mergeToolDetailPayloads(cleared, ["a"], [{ data: incoming }])).toBe(cleared);
 	});
 
 	test("returns the same map when nothing new settled", () => {
@@ -464,6 +498,34 @@ const secondRef = {
 } satisfies VListToolDetailRequest;
 
 describe("exact tool identity — mounted hook through the real API fetch adapter", () => {
+	test("clears an already hydrated identity, updates its resolvers once, and rejects a late old cached response", async () => {
+		const calls = installDetailFetch();
+		await render({ narratorId: "n1", toolUseIds: [firstRef], tick: 0 });
+		const before = current();
+		expect(before.resolveFullToolInput(firstRef.toolUseId, firstRef)).toBeDefined();
+		const key = toolCallDetailQueryKey("n1", firstRef.toolUseId, firstRef);
+		const marker = clearedToolOutput("2026-01-01T00:00:00.000Z");
+		queryClient?.setQueryData(key, {
+			payloadCleared: true,
+			inputJson: { content: "INTERNAL_REPLAY_SECRET" },
+			outputJson: marker,
+		});
+		await settle();
+		const cleared = current();
+		expect(cleared.resolveFullToolInput).not.toBe(before.resolveFullToolInput);
+		expect(cleared.resolveFullToolInput(firstRef.toolUseId, firstRef)).toBeUndefined();
+		expect(cleared.resolveFullToolOutput(firstRef.toolUseId, firstRef)).toEqual(marker);
+		const projected = JSON.stringify(adapted([firstRef], cleared));
+		expect(projected).toContain("Tool-call details cleared");
+		expect(projected).not.toContain("INTERNAL_REPLAY_SECRET");
+		await render({ narratorId: "n1", toolUseIds: [], tick: 1 });
+		queryClient?.setQueryData(key, responseBody(calls[0]));
+		await render({ narratorId: "n1", toolUseIds: [firstRef], tick: 2 });
+		expect(current().resolveFullToolInput(firstRef.toolUseId, firstRef)).toBeUndefined();
+		expect(current().resolveFullToolOutput(firstRef.toolUseId, firstRef)).toEqual(marker);
+		expect(current().resolveFullToolInput).toBe(cleared.resolveFullToolInput);
+	});
+
 	test("loads two messages with the same provider ID into their own inputs and outputs", async () => {
 		const calls = installDetailFetch();
 		const refs = [firstRef, secondRef];

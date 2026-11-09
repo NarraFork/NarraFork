@@ -17,11 +17,10 @@
  * - Worker code must not import `server/db/index.ts` (a test enforces this); see
  *   `storage-scan-queries.ts` for the destructive re-bootstrap that would otherwise occur.
  * - Every task has a single absolute deadline covering BOTH the wait for pool capacity and the
- *   execution itself, and it is cancellable throughout. A caller therefore always settles, which is
- *   what makes the fallback below reachable.
+ *   execution itself, and it is cancellable throughout. A caller therefore always settles.
  * - A crashed worker fails only its own in-flight task.
- * - If workers are unavailable for any reason, callers fall back to running the work inline on the
- *   main thread. Degraded performance is acceptable; a missing feature is not.
+ * - Unavailable workers fail the task. Callers must propagate the failure, pause/retry, or use an
+ *   equivalent isolated worker/subprocess; they must never re-run the task on the main thread.
  * - Pool state is pinned to `globalThis` via hot-safe helpers so Bun `--hot` reloads reuse the
  *   existing workers instead of leaking a new set on every edit.
  */
@@ -42,7 +41,7 @@ const DEFAULT_TASK_TIMEOUT_MS = 120_000;
 /** Idle workers are terminated after this long so a one-off scan does not pin threads forever. */
 const IDLE_REAP_MS = 60_000;
 const IDLE_REAP_INTERVAL_MS = 15_000;
-/** After this many consecutive spawn/ready failures, stop trying and let callers fall back. */
+/** After this many consecutive spawn/ready failures, stop trying and report unavailability. */
 const MAX_SPAWN_FAILURES = 2;
 
 const REAPER_TIMER_KEY = "narrafork.dbWorkerPool.reaper";
@@ -53,6 +52,14 @@ export class DbReadTaskTimeoutError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "DbReadTaskTimeoutError";
+	}
+}
+
+/** The worker accepted a task and reported a query failure, not a failed entry-point probe. */
+export class DbReadTaskExecutionError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "DbReadTaskExecutionError";
 	}
 }
 
@@ -507,10 +514,10 @@ function ensureReaper(): void {
  * Park until the pool has capacity, or the budget/abort ends the wait.
  *
  * Queue waiting used to be unbounded and uncancellable: neither the task timeout nor the abort signal
- * was armed before a worker had been obtained, so a caller stuck here never settled and its callers'
- * fallbacks never ran (an SSE request would hang until the client gave up, and shutdown then blocked
- * on HTTP drain). Both are now armed for the wait itself, and a waiter removes ITS OWN entry from the
- * queue when it gives up so a later drain does not release a dead slot.
+ * was armed before a worker had been obtained, so a caller stuck here never settled (an SSE request
+ * would hang until the client gave up, and shutdown then blocked on HTTP drain). Both are now armed
+ * for the wait itself, and a waiter removes ITS OWN entry from the queue when it gives up so a later
+ * drain does not release a dead slot.
  */
 function waitForCapacity(deadlineAt: number, signal: AbortSignal | undefined): Promise<void> {
 	const s = state();
@@ -587,7 +594,7 @@ async function dispatch(
 			break;
 		}
 		// Spawning failed: no live worker exists to ever trigger a drain, so queueing here would wait
-		// forever. Surface it and let the caller run its main-thread fallback.
+		// forever. Surface the failure without allowing work to move onto the main thread.
 		if (outcome.kind === "spawn_failed") throw new WorkersUnavailableError(outcome.reason);
 		await waitForCapacity(deadlineAt, options.signal);
 	}
@@ -684,7 +691,7 @@ async function dispatch(
 	});
 }
 
-/** Thrown when the pool cannot run a task at all, signalling the caller to use its fallback. */
+/** The pool cannot execute the task; callers must fail, pause, or use equivalent isolation. */
 export class WorkersUnavailableError extends Error {
 	constructor(public readonly reason: string) {
 		super(`database read workers unavailable: ${reason}`);
@@ -710,7 +717,12 @@ export async function runEphemeralReadTask<T>(
 		try {
 			return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options);
 		} catch (err) {
-			if (options.signal?.aborted) throw err;
+			if (
+				options.signal?.aborted ||
+				err instanceof DbReadTaskTimeoutError ||
+				err instanceof DbReadTaskExecutionError
+			)
+				throw err;
 			lastError = err instanceof Error ? err : new Error(String(err));
 		}
 	}
@@ -751,7 +763,7 @@ function runEphemeralOnSpecifier<T>(
 			finish(new Error("database read task aborted"));
 		};
 		const timer = setTimeout(
-			() => finish(new Error(`database read task timed out after ${timeoutMs}ms`)),
+			() => finish(new DbReadTaskTimeoutError(`database read task timed out after ${timeoutMs}ms`)),
 			timeoutMs,
 		);
 		if (options.signal) {
@@ -792,7 +804,7 @@ function runEphemeralOnSpecifier<T>(
 				return;
 			}
 			if (message?.type === "error" && message.requestId === requestId) {
-				finish(new Error(message.message || "database worker failed"));
+				finish(new DbReadTaskExecutionError(message.message || "database worker failed"));
 			}
 		};
 	});
@@ -801,8 +813,8 @@ function runEphemeralOnSpecifier<T>(
 /**
  * Run a read-only task in a worker.
  *
- * Throws {@link WorkersUnavailableError} when workers cannot be used; callers are expected to catch
- * that and run their main-thread fallback.
+ * Throws {@link WorkersUnavailableError} when workers cannot be used. Failures must propagate or
+ * pause the caller's job; retries must remain isolated, never run the task on the main thread.
  */
 export async function runReadTask<T>(
 	dbPath: string,

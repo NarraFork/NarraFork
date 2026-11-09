@@ -1,10 +1,7 @@
 /**
- * Run a storage directory walk off the server thread.
- *
- * Several categories scan at once, so a small gate caps how many walks are in
- * flight. Spawn failure degrades to the same async walk in-process: slower for
- * the event loop, but still not the synchronous sqlite stall, and the settings
- * page still gets a number.
+ * Run storage directory walks only in filesystem workers, with bounded concurrency.
+ * A failed worker is never replaced with a walk on the server thread. Failed
+ * candidates enter a short cooldown before another request can retry isolation.
  */
 
 import { Worker } from "node:worker_threads";
@@ -18,8 +15,7 @@ import {
 	DirectoryMeasureAbortedError,
 	type DirectoryTreeMeasurement,
 	type MeasureDirectoryTreesOptions,
-	measureDirectoryTrees,
-} from "./measure-tree";
+} from "./protocol";
 
 export { DirectoryMeasureAbortedError };
 
@@ -27,11 +23,21 @@ const CONCURRENCY = 4;
 const READY_TIMEOUT_MS = 5_000;
 /** A multi-million-entry tree can take minutes. This only bounds a wedged worker. */
 const MEASURE_TIMEOUT_MS = 15 * 60 * 1000;
+const RETRY_COOLDOWN_MS = 5_000;
+
+export class FsScanWorkerUnavailableError extends Error {
+	constructor(cause: unknown) {
+		const reason = cause instanceof Error ? cause.message : String(cause);
+		super(`Filesystem scan worker unavailable: ${reason}`, { cause });
+		this.name = "FsScanWorkerUnavailableError";
+	}
+}
 
 interface FsScanGate {
 	active: number;
 	waiters: Array<() => void>;
-	workersDisabled: boolean;
+	unavailableError?: FsScanWorkerUnavailableError;
+	retryAfter?: number;
 	resolvedSpecifier?: string;
 }
 
@@ -39,7 +45,6 @@ function gate(): FsScanGate {
 	return hotSafe<FsScanGate>("narrafork.fsScan.gate", () => ({
 		active: 0,
 		waiters: [],
-		workersDisabled: false,
 	}));
 }
 
@@ -55,15 +60,30 @@ export function fsScanWorkerSpecifierCandidates(
 	);
 }
 
-async function withSlot<T>(run: () => Promise<T>): Promise<T> {
+async function withSlot<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal?.aborted) throw new DirectoryMeasureAbortedError();
 	const current = gate();
 	if (current.active >= CONCURRENCY) {
-		await new Promise<void>((resolve) => {
-			current.waiters.push(resolve);
+		await new Promise<void>((resolve, reject) => {
+			const resume = () => {
+				signal?.removeEventListener("abort", onAbort);
+				// Reserve the slot before resolving, so a new caller cannot take it.
+				current.active++;
+				resolve();
+			};
+			const onAbort = () => {
+				const index = current.waiters.indexOf(resume);
+				if (index !== -1) current.waiters.splice(index, 1);
+				reject(new DirectoryMeasureAbortedError());
+			};
+			current.waiters.push(resume);
+			signal?.addEventListener("abort", onAbort, { once: true });
 		});
+	} else {
+		current.active++;
 	}
-	current.active++;
 	try {
+		if (signal?.aborted) throw new DirectoryMeasureAbortedError();
 		return await run();
 	} finally {
 		current.active--;
@@ -74,7 +94,7 @@ async function withSlot<T>(run: () => Promise<T>): Promise<T> {
 interface WorkerResultMessage {
 	type: "result";
 	requestId: string;
-	roots: DirectoryTreeMeasurement[];
+	roots: unknown;
 }
 
 interface WorkerProgressMessage {
@@ -91,6 +111,23 @@ interface WorkerErrorMessage {
 	aborted?: boolean;
 }
 
+function validMeasurements(value: unknown, count: number): value is DirectoryTreeMeasurement[] {
+	return (
+		Array.isArray(value) &&
+		value.length === count &&
+		value.every(
+			(entry) =>
+				entry &&
+				typeof entry === "object" &&
+				Number.isFinite(entry.sizeBytes) &&
+				entry.sizeBytes >= 0 &&
+				Number.isSafeInteger(entry.entriesScanned) &&
+				entry.entriesScanned >= 0 &&
+				typeof entry.truncated === "boolean",
+		)
+	);
+}
+
 function measureInWorker(
 	specifier: string,
 	roots: string[],
@@ -103,13 +140,10 @@ function measureInWorker(
 		const worker = new Worker(workerEntryFromSpecifier(specifier));
 		let settled = false;
 		let ready = false;
+		let measureTimer: ReturnType<typeof setTimeout> | undefined;
 		const readyTimer = setTimeout(
 			() => finish(new Error("filesystem scan worker did not become ready")),
 			READY_TIMEOUT_MS,
-		);
-		const measureTimer = setTimeout(
-			() => finish(new Error("filesystem scan worker timed out")),
-			MEASURE_TIMEOUT_MS,
 		);
 
 		const finish = (error?: unknown, result?: DirectoryTreeMeasurement[]) => {
@@ -118,9 +152,10 @@ function measureInWorker(
 			clearTimeout(readyTimer);
 			clearTimeout(measureTimer);
 			options.signal?.removeEventListener("abort", onAbort);
-			void worker.terminate();
+			void worker.terminate().catch(() => {});
 			if (error) reject(error);
-			else resolve(result ?? []);
+			else if (result) resolve(result);
+			else reject(new Error("filesystem scan worker returned no measurements"));
 		};
 
 		const onAbort = () => {
@@ -141,7 +176,11 @@ function measureInWorker(
 		}
 
 		worker.once("error", (error) => finish(error));
+		worker.once("exit", (code) => {
+			finish(new Error(`filesystem scan worker exited before completing (code ${code})`));
+		});
 		worker.on("message", (message: { type?: string }) => {
+			if (settled) return;
 			if (!ready) {
 				if (message?.type !== "ready") {
 					finish(new Error("filesystem scan worker sent no ready handshake"));
@@ -149,6 +188,10 @@ function measureInWorker(
 				}
 				ready = true;
 				clearTimeout(readyTimer);
+				measureTimer = setTimeout(
+					() => finish(new Error("filesystem scan worker timed out")),
+					MEASURE_TIMEOUT_MS,
+				);
 				try {
 					worker.postMessage({
 						type: "measure",
@@ -174,7 +217,12 @@ function measureInWorker(
 			}
 			if (message?.type === "result") {
 				const result = message as WorkerResultMessage;
-				if (result.requestId === requestId) finish(undefined, result.roots);
+				if (result.requestId !== requestId) return;
+				if (!validMeasurements(result.roots, roots.length)) {
+					finish(new Error("filesystem scan worker returned invalid measurements"));
+				} else {
+					finish(undefined, result.roots);
+				}
 				return;
 			}
 			if (message?.type === "error") {
@@ -195,33 +243,51 @@ async function measureWithWorkers(
 	options: MeasureDirectoryTreesOptions,
 ): Promise<DirectoryTreeMeasurement[]> {
 	const current = gate();
-	if (current.workersDisabled) return measureDirectoryTrees(roots, options);
+	if (current.unavailableError && Date.now() < (current.retryAfter ?? 0)) {
+		throw current.unavailableError;
+	}
 
 	const candidates = current.resolvedSpecifier
 		? [current.resolvedSpecifier]
 		: fsScanWorkerSpecifierCandidates();
-	let lastError: unknown;
+	const failures: unknown[] = [];
 	for (const specifier of candidates) {
+		if (options.signal?.aborted) throw new DirectoryMeasureAbortedError();
 		try {
 			const result = await measureInWorker(specifier, roots, options);
 			current.resolvedSpecifier = specifier;
+			current.unavailableError = undefined;
+			current.retryAfter = undefined;
 			return result;
 		} catch (error) {
-			if (error instanceof DirectoryMeasureAbortedError || options.signal?.aborted) throw error;
-			lastError = error;
+			if (options.signal?.aborted) throw new DirectoryMeasureAbortedError();
+			if (error instanceof DirectoryMeasureAbortedError) throw error;
+			failures.push(error);
 		}
 	}
-	current.workersDisabled = true;
-	logger.warn("Filesystem scan worker unavailable; measuring directories in-process", {
-		reason: lastError instanceof Error ? lastError.message : String(lastError),
+	current.resolvedSpecifier = undefined;
+	const lastError = failures.at(-1);
+	const error = new FsScanWorkerUnavailableError(
+		failures.length > 1
+			? new AggregateError(
+					failures,
+					lastError instanceof Error ? lastError.message : String(lastError),
+				)
+			: (lastError ?? new Error("no filesystem scan worker candidates")),
+	);
+	current.unavailableError = error;
+	current.retryAfter = Date.now() + RETRY_COOLDOWN_MS;
+	logger.warn("Filesystem scan worker unavailable; directory measurement failed", {
+		reason: error.message,
 	});
-	return measureDirectoryTrees(roots, options);
+	throw error;
 }
 
 export async function measureDirectoriesOffThread(
 	roots: string[],
 	options: MeasureDirectoryTreesOptions = {},
 ): Promise<DirectoryTreeMeasurement[]> {
+	if (options.signal?.aborted) throw new DirectoryMeasureAbortedError();
 	if (roots.length === 0) return [];
-	return withSlot(() => measureWithWorkers(roots, options));
+	return withSlot(() => measureWithWorkers(roots, options), options.signal);
 }

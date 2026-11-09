@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -466,6 +466,7 @@ describe("async question receipt runtime adoption", () => {
 			.where(eq(narratorMessages.id, answer.record.answerMessageId))
 			.get();
 		if (!row) throw new Error("receipt missing");
+		row.contentJson = readTestMessageContent(sqlite, row.id);
 		const replay = [
 			{
 				...row,
@@ -561,6 +562,7 @@ describe("async question receipt runtime adoption", () => {
 			.where(eq(narratorMessages.id, answer.record.answerMessageId))
 			.get();
 		if (!row) throw new Error("receipt missing");
+		row.contentJson = readTestMessageContent(sqlite, row.id);
 		const { questionModelReceipts } = await import("../agent-runtime/history");
 		const receipts = questionModelReceipts([row]);
 		const evidence = await captureAwaitRequests(running, question.id, [1, 1], receipts);

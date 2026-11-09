@@ -202,6 +202,9 @@ describe("floating overlays above the WCO drag surface", () => {
 			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		expect(layout).toContain('className="nf-wco-main-strip"');
+		// The inset-only Header has zero height on desktop. Mantine's default border
+		// otherwise gives it a 1px box at y=0, across every authenticated page.
+		expect(layout).toContain("<AppShell.Header withBorder={false}");
 		const top = await Bun.file(
 			new URL("../components/nav/NavTopSection.tsx", import.meta.url),
 		).text();
