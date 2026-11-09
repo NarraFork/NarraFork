@@ -214,6 +214,50 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 	}
 }
 
+/* 仅右侧工具组向下避让；主会话和其他 Dockview 界面保持原布局。 */
+@media (min-width: 48em) {
+	:root .dv-groupview[data-nf-wco-below-controls] {
+		position: relative;
+		box-sizing: border-box;
+		padding-top: var(--nf-dock-wco-inset);
+	}
+
+	:root .dv-groupview[data-nf-wco-below-controls]::before {
+		content: "";
+		position: absolute;
+		top: 0;
+		inset-inline: 0;
+		height: var(--nf-dock-wco-inset);
+		background: var(--dv-tabs-and-actions-container-background-color);
+		border-bottom: 1px solid var(--mantine-color-default-border);
+		box-sizing: border-box;
+		-webkit-app-region: drag;
+	}
+
+	:root .dv-groupview[data-nf-wco-below-controls] > .dv-tabs-and-actions-container {
+		--dv-tabs-and-actions-container-height: var(--nf-panel-header-height);
+		height: var(--nf-panel-header-height);
+		min-height: var(--nf-panel-header-height);
+		/* biome-ignore lint/complexity/noImportantStyles: 覆盖尚未清除的旧标题栏横向避让 */
+		padding-inline: 0 !important;
+		-webkit-app-region: no-drag;
+	}
+
+	:root .dv-groupview[data-nf-wco-below-controls] > .dv-tabs-and-actions-container::after {
+		content: none;
+	}
+
+	/* 溢出菜单的 scrollIntoView() 也会滚动父页面，须保留标签上方的避让空间。 */
+	:root .dv-groupview[data-nf-wco-below-controls] .dv-tabs-container > .dv-tab {
+		scroll-margin-top: var(--nf-dock-wco-inset);
+	}
+
+	:root .dv-groupview[data-nf-wco-below-controls] .dv-void-container {
+		-webkit-app-region: no-drag;
+		-webkit-user-drag: auto;
+	}
+}
+
 /*
  * Buttons on the left: push the navbar content below the traffic lights. The
  * spacer doubles as drag surface, so the strip next to the lights still moves
