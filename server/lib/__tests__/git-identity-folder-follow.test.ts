@@ -76,9 +76,21 @@ describe("会话的 git 身份跟随文件夹", () => {
 	});
 
 	it("会话在文件夹里且文件夹设过身份：解析到该文件夹与它的身份", async () => {
-		insertTab({ key: "narrator:in-folder", type: "narrator", entityId: "in-folder", folderId: FOLDER, sortOrder: 1 });
+		insertTab({
+			key: "narrator:in-folder",
+			type: "narrator",
+			entityId: "in-folder",
+			folderId: FOLDER,
+			sortOrder: 1,
+		});
 		db.insert(folderGitIdentityBindings)
-			.values({ id: generateId(), folderId: FOLDER, userId: USER, identityId: IDENTITY, updatedAt: NOW })
+			.values({
+				id: generateId(),
+				folderId: FOLDER,
+				userId: USER,
+				identityId: IDENTITY,
+				updatedAt: NOW,
+			})
 			.run();
 
 		expect(await getNarratorFolderIdForUser("in-folder", USER)).toBe(FOLDER);
@@ -92,7 +104,13 @@ describe("会话的 git 身份跟随文件夹", () => {
 	});
 
 	it("文件夹存在但没设身份：回落到全局默认", async () => {
-		insertTab({ key: "narrator:bare", type: "narrator", entityId: "bare", folderId: FOLDER, sortOrder: 1 });
+		insertTab({
+			key: "narrator:bare",
+			type: "narrator",
+			entityId: "bare",
+			folderId: FOLDER,
+			sortOrder: 1,
+		});
 
 		expect(await getNarratorFolderIdForUser("bare", USER)).toBe(FOLDER);
 		expect(await getFolderGitIdentityPick(USER, FOLDER)).toBeNull();

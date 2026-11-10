@@ -1379,9 +1379,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 							gitIdentityFolderId={newNarratorTarget?.folderId}
 							onClose={closeNewNarratorHere}
 							// 闭包捕获本次打开时的目标：onCreated 触发时状态已被清空。
-							onCreated={(data) =>
-								handleNewNarratorHereCreated(data, newNarratorTarget?.folderId)
-							}
+							onCreated={(data) => handleNewNarratorHereCreated(data, newNarratorTarget?.folderId)}
 						/>
 					</Box>
 					{/* Keep preview rows outside the measured source container. */}
