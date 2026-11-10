@@ -1,4 +1,9 @@
 import { z } from "zod";
+import {
+	hasUsernamePlaceholder,
+	isSupportedLdapUrl,
+	LDAP_DEFAULT_SEARCH_FILTER,
+} from "../ldap/protocol";
 import { localeSchema } from "./common";
 
 const usernameSchema = z
@@ -223,6 +228,101 @@ export const oidcProviderInputSchema = z.object({
 	enabled: z.boolean().optional(),
 });
 
+// === Admin: LDAP directory used as a credential provider ===
+
+/**
+ * LDAP settings as submitted by the admin UI.
+ *
+ * Cross-field rules live in the `superRefine` below because they only make sense
+ * together: which fields are required depends on `mode`, and a template without
+ * `{username}` would silently bind every person as one fixed account.
+ */
+export const ldapSettingsInputSchema = z
+	.object({
+		enabled: z.boolean(),
+		url: z.string().trim().max(512),
+		startTls: z.boolean().optional(),
+		tlsRejectUnauthorized: z.boolean().optional(),
+		connectTimeoutMs: z.number().int().min(1000).max(30_000).optional(),
+		timeoutMs: z.number().int().min(1000).max(30_000).optional(),
+		mode: z.enum(["search", "direct"]).optional(),
+		bindDn: z.string().trim().max(512).optional(),
+		// Optional on update: empty or a masked value means "keep the stored password".
+		bindPassword: z.string().max(512).optional(),
+		searchBase: z.string().trim().max(512).optional(),
+		searchScope: z.enum(["sub", "one", "base"]).optional(),
+		searchFilter: z.string().trim().max(512).optional(),
+		bindDnTemplate: z.string().trim().max(512).optional(),
+		usernameAttribute: z.string().trim().max(64).optional(),
+		emailAttribute: z.string().trim().max(64).optional(),
+		displayNameAttribute: z.string().trim().max(64).optional(),
+	})
+	.superRefine((value, ctx) => {
+		const url = value.url.trim();
+		// A URL may be blank while the feature is off: an admin clears it to disable the
+		// directory without also clearing every other field.
+		if (url !== "" && !isSupportedLdapUrl(url)) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["url"],
+				message: "Must be an ldap:// or ldaps:// URL without credentials, path or query",
+			});
+		}
+		if (value.enabled && url === "") {
+			ctx.addIssue({ code: "custom", path: ["url"], message: "Server URL is required" });
+		}
+		if (value.startTls && url.toLowerCase().startsWith("ldaps://")) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["startTls"],
+				message: "StartTLS applies only to ldap:// URLs",
+			});
+		}
+		if ((value.bindDn ?? "") !== "" && (value.bindPassword ?? "") === "") {
+			// A DN with an empty password is an unauthenticated bind, which may "succeed"
+			// without authenticating anyone.
+			ctx.addIssue({
+				code: "custom",
+				path: ["bindPassword"],
+				message: "A service account DN requires a bind password",
+			});
+		}
+		if (!value.enabled) return;
+
+		if ((value.mode ?? "search") === "search") {
+			if (!value.searchBase?.trim()) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["searchBase"],
+					message: "Search base DN is required in search mode",
+				});
+			}
+			const filter = value.searchFilter?.trim() || LDAP_DEFAULT_SEARCH_FILTER;
+			if (!hasUsernamePlaceholder(filter)) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["searchFilter"],
+					message: "The filter must contain {username}",
+				});
+			}
+		} else {
+			const template = value.bindDnTemplate?.trim() ?? "";
+			if (!template) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["bindDnTemplate"],
+					message: "Bind DN template is required in direct mode",
+				});
+			} else if (!hasUsernamePlaceholder(template)) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["bindDnTemplate"],
+					message: "The template must contain {username}",
+				});
+			}
+		}
+	});
+
 /** Full admin auth-config payload. */
 export const adminAuthConfigSchema = z.object({
 	oidcProviders: z.array(oidcProviderInputSchema).max(20),
@@ -233,4 +333,17 @@ export const adminAuthConfigSchema = z.object({
 			origins: z.array(z.string().trim().url().max(512)).max(20).optional(),
 		})
 		.optional(),
+	/** Omitted or null = leave the stored directory configuration untouched. */
+	ldap: ldapSettingsInputSchema.nullable().optional(),
+});
+
+/**
+ * Admin connection test. `config` lets the UI test the form values before saving; when
+ * omitted the stored settings are used. A masked/empty `bindPassword` inside `config`
+ * means "keep the stored one", exactly as on PATCH.
+ */
+export const ldapConnectionTestSchema = z.object({
+	config: ldapSettingsInputSchema.optional(),
+	username: z.string().trim().max(256).optional(),
+	password: z.string().max(512).optional(),
 });

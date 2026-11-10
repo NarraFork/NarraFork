@@ -59,6 +59,7 @@
 		"iconv-lite": "^0.7.2",
 		"katex": "^0.18.2",
 		"lang-map": "^0.4.0",
+		"ldapts": "^9.2.0",
 		"linkedom": "^0.18.12",
 		"marked": "^18.0.7",
 		"mermaid": "^11.16.0",
