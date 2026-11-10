@@ -1,6 +1,6 @@
 {
-  "id": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
-  "prevId": "0880024e-08f7-4aff-8440-7060586a6aaf",
+  "id": "35748555-debf-4155-bbff-1561d3be9674",
+  "prevId": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -24538,6 +24538,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'"
+        },
+        "recent_tabs_show_directory": {
+          "name": "recent_tabs_show_directory",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "add_subagent_to_recent_tabs": {
           "name": "add_subagent_to_recent_tabs",

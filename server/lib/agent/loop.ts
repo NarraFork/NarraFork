@@ -6534,19 +6534,6 @@ async function* agentLoopInMetadataSnapshot(
 					// retry budget re-uploading the whole history. Mirrors the invalidState
 					// branch earlier in this loop.
 					if (yield* tryQuotaSuspension(msg)) return;
-					// Detect upstream API context length exceeded (HTTP 400)
-					if (
-						err &&
-						typeof err === "object" &&
-						"code" in err &&
-						(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
-					) {
-						// Persist partial content before signalling overflow
-						yield* outputContent.flush();
-						yield* finishRequest(msg);
-						yield { type: "context_length_exceeded", message: msg };
-						return;
-					}
 					// Detect context overflow errors from OpenAI/Codex-compatible providers.
 					// Treat as context_length_exceeded so caller can prune/compact+retry.
 					if (isContextWindowExceededError(err)) {

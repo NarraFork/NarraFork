@@ -202,6 +202,14 @@ export function AppearanceSection({
 				}}
 			/>
 			<Switch
+				label={t("recentTabsShowDirectory")}
+				description={t("recentTabsShowDirectoryDesc")}
+				checked={userPrefs?.recentTabsShowDirectory ?? false}
+				onChange={(e) =>
+					updateUserPref.mutate({ recentTabsShowDirectory: e.currentTarget.checked })
+				}
+			/>
+			<Switch
 				label={t("bottomSpacingResize")}
 				description={t("bottomSpacingResizeDesc")}
 				checked={bottomSpacingResize}
