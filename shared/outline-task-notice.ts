@@ -276,6 +276,74 @@ export interface OutlineTasksViewTask {
 	humanCreated?: true;
 }
 
+/** Where the current-tasks view files an open task. */
+export type OutlineTasksViewState = "doing" | "delegated" | "waiting" | "todo";
+
+/** The sections of {@link OutlineTasksViewDisplay.states}, in the order a full table is cut. */
+export const OUTLINE_TASKS_VIEW_STATES: readonly OutlineTasksViewState[] = [
+	"doing",
+	"delegated",
+	"waiting",
+	"todo",
+];
+
+/**
+ * What happened to one task between two injections of the current-tasks view.
+ *
+ *   - `done` / `cancelled`: it left the list finished (read from its block when the row was written);
+ *   - `removed`: it left the list because its block was deleted or is no longer a task;
+ *   - `unlisted`: it left the list and is still open (no longer the session's), or left it and
+ *     could not be read;
+ *   - `started`: now in progress; `requeued`: back from in progress to to-do;
+ *   - `waiting` / `unblocked`: began / stopped waiting on a prerequisite or a person;
+ *   - `delegated` / `returned`: handed to a subagent / back from one;
+ *   - `added`: new on the list; `renamed`: same state, another title.
+ */
+export type OutlineTasksViewChangeKind =
+	| "done"
+	| "started"
+	| "cancelled"
+	| "returned"
+	| "delegated"
+	| "waiting"
+	| "unblocked"
+	| "added"
+	| "requeued"
+	| "removed"
+	| "unlisted"
+	| "renamed";
+
+/** The kinds, most worth naming first (a notice names only its first few changes). */
+export const OUTLINE_TASKS_VIEW_CHANGE_KINDS: readonly OutlineTasksViewChangeKind[] = [
+	"done",
+	"started",
+	"cancelled",
+	"returned",
+	"delegated",
+	"waiting",
+	"unblocked",
+	"added",
+	"requeued",
+	"removed",
+	"unlisted",
+	"renamed",
+];
+
+/** One change a `context_update` row of the view names. */
+export interface OutlineTasksViewChange {
+	address: string;
+	/** The task's title when the row was written: one plain line. */
+	title: string;
+	kind: OutlineTasksViewChangeKind;
+	/** Where the view filed it before; absent when it was not listed (or not known). */
+	from?: OutlineTasksViewState;
+	/**
+	 * `from` is absent because the previous state table was cut, not because the task is new: the
+	 * task may have been a to-do past the cut. A reader must not call it new.
+	 */
+	fromUnknown?: true;
+}
+
 /**
  * What the current-tasks view held when it changed: the tasks it listed by section, and how many
  * open tasks there were. Stored on the `context_update` row beside the model-facing update (never
@@ -297,10 +365,34 @@ export interface OutlineTasksViewDisplay {
 	counts: { doing: number; waiting: number; todo: number; delegated?: number };
 	/** The view read only a leading part of the open tasks: there are more than counted. */
 	more?: true;
+	/**
+	 * Every open task the view read, by address under its state: what the NEXT update of the view
+	 * is compared with to say what changed. At most {@link OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.states}
+	 * addresses over all states, cut in the order of {@link OUTLINE_TASKS_VIEW_STATES} (to-dos
+	 * first to go). Absent on rows written before the table existed: nothing is compared with them.
+	 */
+	states?: Partial<Record<OutlineTasksViewState, string[]>>;
+	/** `states` is not every open task (cut at its limit, or the view's read stopped early). */
+	statesMore?: true;
+	/**
+	 * What changed since the view last shown to the session in the same epoch: the changes named
+	 * (at most {@link OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.changes}). Present, possibly empty, only on
+	 * a row that was compared with an earlier one; absent when there was nothing to compare with.
+	 */
+	changes?: OutlineTasksViewChange[];
+	/** How many changes there were in all (`changes` names the first few); set with `changes`. */
+	changed?: number;
 }
 
-/** Tasks a section of the display lists at most. */
-export const OUTLINE_TASKS_VIEW_DISPLAY_LIMITS = { perSection: 5 } as const;
+/** Bounds of the display. */
+export const OUTLINE_TASKS_VIEW_DISPLAY_LIMITS = {
+	/** Tasks a section lists at most. */
+	perSection: 5,
+	/** Addresses the state table keeps over all states. */
+	states: 60,
+	/** Changes a row names; the rest are counted. */
+	changes: 5,
+} as const;
 
 function viewTasks(raw: unknown): OutlineTasksViewTask[] {
 	if (!Array.isArray(raw)) return [];
@@ -319,6 +411,60 @@ function count(raw: unknown): number {
 	return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
 }
 
+const VIEW_STATES = new Set<string>(OUTLINE_TASKS_VIEW_STATES);
+const CHANGE_KINDS = new Set<string>(OUTLINE_TASKS_VIEW_CHANGE_KINDS);
+
+/**
+ * A state table within its limit: addresses by state, each once (the first state that names it
+ * wins), cut in the order of {@link OUTLINE_TASKS_VIEW_STATES}. `cut` when addresses were left out.
+ */
+export function boundOutlineTasksViewStates(raw: unknown): {
+	states: Partial<Record<OutlineTasksViewState, string[]>>;
+	cut: boolean;
+} {
+	const states: Partial<Record<OutlineTasksViewState, string[]>> = {};
+	if (!isRecord(raw)) return { states, cut: false };
+	const seen = new Set<string>();
+	let cut = false;
+	for (const state of OUTLINE_TASKS_VIEW_STATES) {
+		const list = raw[state];
+		if (!Array.isArray(list)) continue;
+		const kept: string[] = [];
+		for (const item of list) {
+			if (typeof item !== "string" || !item || item.length > 80 || seen.has(item)) continue;
+			if (seen.size >= OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.states) {
+				cut = true;
+				break;
+			}
+			seen.add(item);
+			kept.push(item);
+		}
+		if (kept.length > 0) states[state] = kept;
+	}
+	return { states, cut };
+}
+
+function viewChanges(raw: unknown): OutlineTasksViewChange[] {
+	if (!Array.isArray(raw)) return [];
+	const out: OutlineTasksViewChange[] = [];
+	for (const item of raw.slice(0, OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.changes)) {
+		if (!isRecord(item) || typeof item.kind !== "string" || !CHANGE_KINDS.has(item.kind)) continue;
+		const address = typeof item.address === "string" ? clipNoticeLine(item.address, 80) : "";
+		const title = typeof item.title === "string" ? clipNoticeLine(item.title) : "";
+		if (!address && !title) continue;
+		out.push({
+			address,
+			title,
+			kind: item.kind as OutlineTasksViewChangeKind,
+			...(typeof item.from === "string" && VIEW_STATES.has(item.from)
+				? { from: item.from as OutlineTasksViewState }
+				: {}),
+			...(item.fromUnknown === true ? { fromUnknown: true as const } : {}),
+		});
+	}
+	return out;
+}
+
 /**
  * Read a stored display back: the bounded display, `null` when the view was removed (no open
  * tasks), `undefined` when the value is not one (a row written before displays existed).
@@ -331,6 +477,8 @@ export function coerceOutlineTasksViewDisplay(
 	const counts = isRecord(value.counts) ? value.counts : {};
 	const delegated = viewTasks(value.delegated);
 	const delegatedCount = Math.max(count(counts.delegated), delegated.length);
+	const table = isRecord(value.states) ? boundOutlineTasksViewStates(value.states) : null;
+	const changes = Array.isArray(value.changes) ? viewChanges(value.changes) : null;
 	return {
 		doing: viewTasks(value.doing),
 		waiting: viewTasks(value.waiting),
@@ -343,5 +491,8 @@ export function coerceOutlineTasksViewDisplay(
 			...(delegatedCount > 0 ? { delegated: delegatedCount } : {}),
 		},
 		...(value.more === true ? { more: true as const } : {}),
+		...(table ? { states: table.states } : {}),
+		...(table && (table.cut || value.statesMore === true) ? { statesMore: true as const } : {}),
+		...(changes ? { changes, changed: Math.max(count(value.changed), changes.length) } : {}),
 	};
 }

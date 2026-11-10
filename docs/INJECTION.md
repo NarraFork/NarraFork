@@ -79,6 +79,7 @@
 // { changes: [{ key: "workspace", value: "/repo/b" }], modelText: frozenModelText }
 ```
 
+- `context_update` 块可以带一份只给读者看的 `display`（按部件 key，`ContextPart.display`；不参与变更比较、不进前缀哈希、不发给模型，JSON 超过 8 KiB 不存）。部件可以在 `server/services/context-display-refiners.ts` 注册 refiner：写更新行时拿到「本代里上一条改过该部件的行存的 display」和这一次的 display，返回要存的那份。基线是会话上一次**被注入**的内容，不是读缓存：每代第一条更新行与代标记上的 `baselineDisplays` 比（开代时把前缀基线里该部件的 display 存在标记行上，基线里没有该部件存 `null`；只给读者，不进前缀及其哈希）；旧代标记没有这个字段、或上一行没存 display 时没有基线。大纲「当前任务」视图（`outline.tasks`）用它存状态表 `states`（最多 60 个地址）和变化 `changes`（最多 5 条，其余计数），转录里那一行据此写成「完成『…』，开始『…』」；refiner 最多点读 5 个块，失败时按未比较的 display 存。模型侧文字在 refiner 运行前已经渲染并冻结。
 - `buildRuntimeHistory` 在进入 provider 投影前调用 `hydrateContextUpdates`，从快照恢复完整 text 与 changes。`narrator-prefix-state` 增量归并本代新增的相关更新/工具事件；相同历史源或仅增加无关消息不重放旧更新，修订/非追加变化则重建。同一请求的协调与水合共享载荷，避免重复读取。持久行不内联全文，列表不展开正文；`snapshotRef` 登记块资产引用。
 - 旧版 `[{type:"text",text:frozenModelText},{type:"context_update",epochId,changes}]` 内联双块仍可读。恢复/重试使用原快照，不能根据实时配置重新生成模型正文。
 - 恢复后的 `changes` 是同名部分的完整替换；`null` 删除，空字符串合法，未提及的 key 保持当前值。引用行上的 `changes:[]` 只是载荷外置的占位，不能当作无变化。正文生成一次后冻结，元数据不再渲染成第二份文本。

@@ -4,8 +4,10 @@
  */
 import type { DbMessage } from "@shared/agent-protocol/types";
 import {
+	boundContextUpdateDisplay,
+	CONTEXT_UPDATE_NOTICE,
 	contextChanges,
-	contextUpdateDisplay,
+	contextUpdateDisplayEntries,
 	type PrefixSnapshot,
 	type PromptPart,
 	renderContextUpdate,
@@ -34,6 +36,7 @@ import { sqliteErrorCode } from "../lib/db-resilience";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { baselineContextDisplays, refineContextDisplay } from "./context-display-refiners";
 import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
 import {
 	getPrefixToolDefinitions,
@@ -389,6 +392,16 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 				tools: await putPrefixToolDefinitions(definitions, signal),
 			};
 		}
+		// Reader-only: the summaries of the parts this baseline holds, for the epoch's first update
+		// row to be compared with. Stored on the marker; no part of the prefix or its hashes.
+		const baselineDisplays =
+			prefix && input.prompt
+				? baselineContextDisplays({
+						parts: prefix.parts,
+						keepParts: input.prompt.keepParts,
+						displays: input.prompt.displays,
+					})
+				: undefined;
 		const record: EpochRecord = {
 			reason:
 				targetChanged || profileChanged
@@ -410,6 +423,7 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 						...(profile.protocol ? { protocol: profile.protocol } : {}),
 					}
 				: { definitionSnapshots: definitions }),
+			...(baselineDisplays ? { baselineDisplays } : {}),
 		};
 		const marker = await withPrefixSnapshotPublication(
 			prefix ? [prefix.contract, prefix.tools, ...prefix.parts.map((part) => part.hash)] : [],
@@ -485,14 +499,26 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 	if (changes.length) {
 		const modelText = renderContextUpdate(changes);
 		const snapshotRef = await putPrefixJson({ changes, modelText }, signal);
-		const display = contextUpdateDisplay(changes, input.prompt.displays);
+		// The reader's summaries: each changed part's own, refined against the row this session was
+		// last shown (the current-tasks view then names what was finished or started in between).
+		// Rendered after, and never read by, the model's text above.
+		const display = boundContextUpdateDisplay(
+			await refineContextDisplay({
+				narratorId,
+				display: contextUpdateDisplayEntries(changes, input.prompt.displays),
+				messages,
+				epochId: epoch.markerId,
+				baseline: epoch.baselineDisplays,
+				signal,
+			}),
+		);
 		const row = await withPrefixSnapshotPublication(
 			[snapshotRef],
 			() =>
 				publish(() =>
 					narratorStore.appendNotice(
 						narratorId,
-						`Context updated: ${changes.map((part) => part.key).join(", ")}`,
+						`${CONTEXT_UPDATE_NOTICE}${changes.map((part) => part.key).join(", ")}`,
 						[
 							{
 								type: "context_update",
