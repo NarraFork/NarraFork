@@ -224,6 +224,7 @@ export const updateUserPreferencesSchema = z.object({
 	gitIdentityContextMenu: z.boolean().optional(),
 	gitIdentityCreateModal: z.boolean().optional(),
 	gitIdentityFolderContextMenu: z.boolean().optional(),
+	recentTabsShowDirectory: z.boolean().optional(),
 });
 
 /**

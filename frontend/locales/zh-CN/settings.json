@@ -1219,6 +1219,8 @@
 	"displaySection": "显示",
 	"ignoreSafeArea": "全屏模式",
 	"ignoreSafeAreaDesc": "隐藏系统状态栏，应用占满整个屏幕。关闭后显示状态栏。",
+	"recentTabsShowDirectory": "最近标签显示目录",
+	"recentTabsShowDirectoryDesc": "在侧栏会话标题下显示工作目录，长路径优先展示末尾。默认关闭，设置跟随账号同步。",
 	"bottomSpacingResize": "允许拖动输入区域",
 	"bottomSpacingResizeDesc": "拖动叙述者输入区域的顶部边界可调整底部留白。默认关闭，输入区域保持在最底部。",
 	"wakeLock": "屏幕常亮",

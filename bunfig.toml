@@ -1,2 +1,5 @@
+[install]
+registry = "https://registry.npmmirror.com"
+
 [test]
 preload = ["./tests/preload.ts"]

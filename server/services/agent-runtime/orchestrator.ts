@@ -2958,6 +2958,16 @@ export async function runAgentLoopUnlocked(
 				});
 
 				runState.recovery.overflowRetries = overflow.overflowRetries;
+				// A compact can settle concurrently with user/parent interruption. Do not
+				// turn cancellation into a recovery failure or authorize another request.
+				if (active.abortController.signal.aborted) {
+					const next = await applyInterruptedTurnControl(abortedPass(result));
+					if (next === "continue") continue;
+					if (next === "break") break;
+					await finalizeInterruptedRun(active, narratorId, undefined);
+					runState.wasInterrupted = true;
+					break;
+				}
 
 				if (overflow.action === "retry_compacted") {
 					// Keep conversationId stable for prompt-cache affinity. Compact may
