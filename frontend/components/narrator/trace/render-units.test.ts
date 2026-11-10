@@ -3,6 +3,7 @@ import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-bl
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits, groupToolRunItemsForLod } from "./render-units";
+import { recentRunSegmentMessageIds } from "./run-segments";
 
 function toolMessage(
 	messageId: string,
@@ -59,6 +60,160 @@ function toolRunItems(statuses: string[]) {
 	if (toolRun?.kind !== "tool-run") throw new Error("expected a tool-run segment");
 	return toolRun.items;
 }
+
+describe("compact auxiliary grouping", () => {
+	function auxiliary(id: string): NarratorMsg {
+		return rowWithElements({ ...userMessage(id), role: "user", origin: "system" }, [
+			{
+				type: "system_injection",
+				source: "silent_progress",
+				modelText: "model reminder",
+				body: { kind: "prose", text: "reminder" },
+			},
+		]) as NarratorMsg;
+	}
+
+	test("merges auxiliary with adjacent reasoning/tools without crossing human input", () => {
+		const messages = [
+			toolMessage("before", "first", "reason"),
+			auxiliary("notice"),
+			toolMessage("after", "second", "reason"),
+			userMessage("human"),
+			auxiliary("later"),
+		];
+		const segments = segmentMessages(messages);
+		const units = groupRenderUnits(segments, true, { compactAuxiliaryContent: true });
+		expect(units.map((unit) => unit.kind)).toEqual(["activity", "segment", "activity"]);
+		if (units[0].kind !== "activity") throw new Error("expected activity");
+		expect(units[0].items.map((item) => item.kind)).toEqual([
+			"reasoning",
+			"tool",
+			"auxiliary",
+			"reasoning",
+			"tool",
+		]);
+		if (units[2].kind !== "activity") throw new Error("expected auxiliary activity");
+		expect(units[2].items).toHaveLength(1);
+		expect(groupRenderUnits(segments, true).filter((unit) => unit.kind === "segment")).toHaveLength(
+			3,
+		);
+		expect(
+			groupRenderUnits(segments, false, { compactAuxiliaryContent: true }).every(
+				(unit) => unit.kind === "segment",
+			),
+		).toBe(true);
+	});
+
+	test("mixed assistant message preserves auxiliary and both answer positions", () => {
+		const msg = rowWithElements({ ...userMessage("mixed"), role: "assistant" }, [
+			{ type: "text", text: "before" },
+			{
+				type: "system_injection",
+				source: "behavior_fence",
+				modelText: "model",
+				body: { kind: "prose", text: "reminder" },
+			},
+			{ type: "text", text: "after" },
+		]) as NarratorMsg;
+		const units = groupRenderUnits(
+			segmentMessages([msg], { compactAuxiliaryContent: true }),
+			true,
+			{ compactAuxiliaryContent: true },
+		);
+		expect(units.map((unit) => unit.kind)).toEqual(["segment", "activity", "segment"]);
+		expect(units[0]).toMatchObject({ kind: "segment", seg: { visibleBlockIndices: [0] } });
+		expect(units[1]).toMatchObject({
+			kind: "activity",
+			items: [{ kind: "auxiliary", blockIndex: 1, sourceIndices: [1] }],
+		});
+		expect(units[2]).toMatchObject({ kind: "segment", seg: { visibleBlockIndices: [2] } });
+		const filtered = groupRenderUnits([{ kind: "message", msg, visibleBlockIndices: [2] }], true, {
+			compactAuxiliaryContent: true,
+		});
+		expect(filtered).toHaveLength(1);
+		expect(filtered[0].kind).toBe("segment");
+	});
+
+	test("internal Send ignores the legacy subagent flag, shown and Bot sends keep bubbles", () => {
+		const items = toolRunItems(["success", "success", "success"]);
+		for (const item of items) {
+			item.tc.toolName = "Send";
+			item.isSubagent = true;
+		}
+		items[0].tc.inputJson = { id: "child", show_to_user: false };
+		items[1].tc.inputJson = { id: "child", show_to_user: true };
+		items[2].tc.inputJson = { user: "person" };
+		const segment = {
+			kind: "tool-run" as const,
+			items,
+			sourceMessages: items.map((item) => item.msg),
+		};
+		const units = groupRenderUnits([segment], true, { compactAuxiliaryContent: true });
+		expect(units.map((unit) => unit.kind)).toEqual(["activity", "segment"]);
+		expect(units[1]).toMatchObject({
+			kind: "segment",
+			seg: {
+				items: [
+					{ tc: { inputJson: { show_to_user: true } } },
+					{ tc: { inputJson: { user: "person" } } },
+				],
+			},
+		});
+		expect(groupRenderUnits([segment], true)[0].kind).toBe("segment");
+	});
+
+	test("async answer lifecycle resolver is shared by both grouping entry points", () => {
+		const items = toolRunItems(["success"]);
+		items[0].tc.toolName = "AskUserQuestion";
+		items[0].tc.inputJson = { async: true };
+		const segment = {
+			kind: "tool-run" as const,
+			items,
+			sourceMessages: items.map((item) => item.msg),
+		};
+		for (const questionStatus of ["open", "answered", undefined]) {
+			const opts = { compactAuxiliaryContent: true, resolveQuestionStatus: () => questionStatus };
+			expect(groupRenderUnits([segment], true, opts)[0].kind).toBe(
+				questionStatus === "answered" ? "activity" : "segment",
+			);
+			expect(groupToolRunItemsForLod(items, undefined, opts)[0].kind).toBe(
+				questionStatus === "answered" ? "folded" : "active",
+			);
+		}
+	});
+
+	test("completed subagents fold in compact mode while live agents remain cards", () => {
+		const items = toolRunItems(["success", "running"]);
+		for (const item of items) {
+			item.tc.toolName = "Agent";
+			item.isSubagent = true;
+		}
+		const units = groupRenderUnits(
+			[{ kind: "tool-run", items, sourceMessages: items.map((item) => item.msg) }],
+			true,
+			{ compactAuxiliaryContent: true },
+		);
+		expect(units.map((unit) => unit.kind)).toEqual(["activity", "segment"]);
+	});
+
+	test("recency includes auxiliary ids in the same run and legacy stays unchanged", () => {
+		const messages = [
+			userMessage("old-human"),
+			toolMessage("old", "old-tool", ""),
+			auxiliary("old-aux"),
+			userMessage("new-human"),
+			toolMessage("new", "new-tool", ""),
+			auxiliary("new-aux"),
+		];
+		expect([...recentRunSegmentMessageIds(messages, 1, { compactAuxiliaryContent: true })]).toEqual(
+			["new-aux", "new"],
+		);
+		expect([...recentRunSegmentMessageIds(messages, 1)]).toEqual(["new"]);
+		expect(
+			recentRunSegmentMessageIds(messages, 2, { compactAuxiliaryContent: true }).has("old-aux"),
+		).toBe(true);
+	});
+});
 
 describe("groupToolRunItemsForLod", () => {
 	test("keeps a trailing live tool below earlier folded calls", () => {

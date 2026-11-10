@@ -60,7 +60,7 @@ function fixture(
 describe("cleared tool payloads outrank hydration and specialized renderers", () => {
 	for (const toolName of ["Write", "Read", "Edit", "GenUI", "Send", "Agent"]) {
 		for (const source of ["native-output", "dto", "current-block"] as const) {
-			for (const view of ["card", "trace"] as const) {
+			for (const view of ["card", "trace", "compact-card", "compact-trace"] as const) {
 				test(`${toolName} ${source} ${view} never consults full input/output or displays old relation data`, () => {
 					const item = fixture(toolName, source);
 					const resolveFullToolInput = mock(() => oldInput);
@@ -68,7 +68,8 @@ describe("cleared tool payloads outrank hydration and specialized renderers", ()
 					const resolveToolSummary = mock(() => SECRET);
 					const resolveToolTitle = mock(() => SECRET);
 					const ctx: AdapterContext = {
-						lod: view === "card" ? 5 : 2,
+						lod: view.endsWith("card") ? 5 : 2,
+						compactAuxiliaryContent: view.startsWith("compact"),
 						labels: { toolDetailsCleared: label },
 						resolveFullToolInput,
 						resolveFullToolOutput,
@@ -78,13 +79,12 @@ describe("cleared tool payloads outrank hydration and specialized renderers", ()
 						isExpanded: () => true,
 						isRowExpanded: () => true,
 					};
-					const specs =
-						view === "card"
-							? adaptSegment(
-									{ kind: "tool-run", items: [item], sourceMessages: item.msg ? [item.msg] : [] },
-									ctx,
-								)
-							: [adaptActivityUnit([{ ...item, kind: "tool" }], "folded", ctx)];
+					const specs = view.endsWith("card")
+						? adaptSegment(
+								{ kind: "tool-run", items: [item], sourceMessages: item.msg ? [item.msg] : [] },
+								ctx,
+							)
+						: [adaptActivityUnit([{ ...item, kind: "tool" }], "folded", ctx)];
 					const serialized = JSON.stringify(specs);
 					expect(serialized).toContain(label);
 					expect(serialized).not.toContain(SECRET);
