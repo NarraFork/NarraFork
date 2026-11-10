@@ -261,7 +261,8 @@ describe("the hint", () => {
 	test("a tool that does not show the line only records: the pair is not marked told", async () => {
 		const t = await team();
 		const dir = repo();
-		await noteOutlineFileChange(change(t.a, t.projectId, dir, "src/auth.ts"));
+		// `trackFileChange` reads the real clock: the first write is recorded by it too.
+		await noteOutlineFileChange(change(t.a, t.projectId, dir, "src/auth.ts", { now: Date.now() }));
 		const ctx = {
 			narratorId: t.b,
 			projectId: t.projectId,
