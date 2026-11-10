@@ -114,11 +114,29 @@ export function resolveActingGitUserId(
  */
 async function createIdentityQueryDependencies() {
 	const [
-		{ and, asc, desc, eq },
+		{ and, asc, desc, eq, isNotNull },
 		{ db },
-		{ narratorGitIdentityBindings, narrators, userGitIdentities },
+		{
+			folderGitIdentityBindings,
+			narratorGitIdentityBindings,
+			narrators,
+			userGitIdentities,
+			userRecentTabs,
+		},
 	] = await Promise.all([import("drizzle-orm"), import("../db"), import("../db/schema")]);
-	return { db, eq, and, asc, desc, narrators, narratorGitIdentityBindings, userGitIdentities };
+	return {
+		db,
+		eq,
+		and,
+		asc,
+		desc,
+		isNotNull,
+		narrators,
+		narratorGitIdentityBindings,
+		userGitIdentities,
+		folderGitIdentityBindings,
+		userRecentTabs,
+	};
 }
 
 let identityQueryDependencies: ReturnType<typeof createIdentityQueryDependencies> | undefined;
@@ -138,9 +156,9 @@ function loadIdentityQueryDependencies() {
  * enough that a stale entry is never surprising; edits evict their own entries
  * immediately (see {@link invalidateGitIdentityCache}).
  *
- * Two kinds of entries share the map: `user:<id>` for the user's default
- * identity and `pick:<narratorId>:<userId>` for one user's choice of identity
- * for one narrator. `null` is cached in both: "nothing configured" and "no
+ * Three kinds of entries share the map: `user:<id>` for the user's default,
+ * `pick:<narratorId>:<userId>` for a narrator pick, and `folder:<folderId>:<userId>`
+ * for a folder pick. `null` is cached in all of them: "nothing configured" and "no
  * pick" are common cases and must not re-query on every command.
  */
 const IDENTITY_CACHE_TTL_MS = 30_000;
@@ -149,6 +167,12 @@ const identityCache = new Map<string, { identity: GitIdentity | null; expiresAt:
 const userCacheKey = (userId: string) => `user:${userId}`;
 // Narrator ids are nanoid-derived and never contain the separator.
 const pickCacheKey = (narratorId: string, userId: string) => `pick:${narratorId}:${userId}`;
+// Folder ids are nanoid-derived too, so the prefix is what keeps the shapes apart.
+const folderCacheKey = (folderId: string, userId: string) => `folder:${folderId}:${userId}`;
+const folderOfCacheKey = (narratorId: string, userId: string) => `folderOf:${narratorId}:${userId}`;
+
+/** 会话 → 它所处的侧栏文件夹。与身份缓存分开放，因为这里的值不是身份。 */
+const folderOfCache = new Map<string, { folderId: string | null; expiresAt: number }>();
 
 /**
  * Drop one user's cached default identity and every pick they made, or the whole
@@ -158,18 +182,35 @@ const pickCacheKey = (narratorId: string, userId: string) => `pick:${narratorId}
 export function invalidateGitIdentityCache(userId?: string | null): void {
 	if (!userId) {
 		identityCache.clear();
+		folderOfCache.clear();
 		return;
 	}
 	identityCache.delete(userCacheKey(userId));
 	const suffix = `:${userId}`;
 	for (const key of identityCache.keys()) {
-		if (key.startsWith("pick:") && key.endsWith(suffix)) identityCache.delete(key);
+		if ((key.startsWith("pick:") || key.startsWith("folder:")) && key.endsWith(suffix)) {
+			identityCache.delete(key);
+		}
+	}
+	invalidateNarratorFolderCache(userId);
+}
+
+/** Drop cached narrator→folder lookups after any sidebar layout mutation for this user. */
+export function invalidateNarratorFolderCache(userId: string): void {
+	const suffix = `:${userId}`;
+	for (const key of folderOfCache.keys()) {
+		if (key.endsWith(suffix)) folderOfCache.delete(key);
 	}
 }
 
 /** Drop one user's narrated pick. Called when that pick (not their identities) changes. */
 export function invalidateNarratorGitIdentityPickCache(narratorId: string, userId: string): void {
 	identityCache.delete(pickCacheKey(narratorId, userId));
+}
+
+/** Drop one folder's cached pick. The narrator→folder lookup itself is unaffected. */
+export function invalidateFolderGitIdentityPickCache(folderId: string, userId: string): void {
+	identityCache.delete(folderCacheKey(folderId, userId));
 }
 
 /**
@@ -209,27 +250,59 @@ export async function resolveGitIdentityForUser(
 /**
  * The identity a user commits under for a given narrator.
  *
- * The pick is the more specific choice, so it wins over the default; a missing
- * pick — or no narrator at all, which is how the user-scoped call sites resolve
- * (manual commits, project init, chapter merge/cleanup) — falls back to the
- * default. `null` means "this user configured nothing", which the callers turn
- * into "inherit the host config".
+ * Most specific first: the user's pick for this narrator, then the pick of the sidebar
+ * folder that narrator sits in, then the user's default. A missing pick at every level —
+ * or no narrator at all, which is how the user-scoped call sites resolve (manual commits,
+ * project init, chapter merge/cleanup) — falls back to the default. `null` means "this
+ * user configured nothing", which the callers turn into "inherit the host config".
  */
 export async function resolveGitIdentityForTurn(
 	narratorId: string | null | undefined,
 	userId: string,
 ): Promise<GitIdentity | null> {
 	if (narratorId) {
-		const key = pickCacheKey(narratorId, userId);
-		const cached = identityCache.get(key);
-		if (cached && cached.expiresAt > Date.now()) {
-			return cached.identity ?? resolveGitIdentityForUser(userId);
-		}
-		const picked = await fetchPickedIdentity(narratorId, userId).catch(() => null);
-		identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+		const picked = await cachedNarratorPick(narratorId, userId);
 		if (picked) return picked;
+		const folderId = await cachedNarratorFolder(narratorId, userId);
+		if (folderId) {
+			const folderPick = await cachedFolderPick(folderId, userId);
+			if (folderPick) return folderPick;
+		}
 	}
 	return resolveGitIdentityForUser(userId);
+}
+
+async function cachedNarratorPick(narratorId: string, userId: string): Promise<GitIdentity | null> {
+	const key = pickCacheKey(narratorId, userId);
+	const cached = identityCache.get(key);
+	if (cached && cached.expiresAt > Date.now()) return cached.identity;
+	const picked = await fetchPickedIdentity(narratorId, userId).catch(() => null);
+	identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	return picked;
+}
+
+async function cachedFolderPick(folderId: string, userId: string): Promise<GitIdentity | null> {
+	const key = folderCacheKey(folderId, userId);
+	const cached = identityCache.get(key);
+	if (cached && cached.expiresAt > Date.now()) return cached.identity;
+	const picked = await fetchFolderPick(folderId, userId).catch(() => null);
+	identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	return picked;
+}
+
+/**
+ * Which sidebar folder this narrator currently sits in, for this user.
+ *
+ * Cached separately from identities: moving a session between folders is a layout change,
+ * and the TTL bounds how long the old folder's identity can still apply.
+ */
+async function cachedNarratorFolder(narratorId: string, userId: string): Promise<string | null> {
+	const key = folderOfCacheKey(narratorId, userId);
+	const cached = folderOfCache.get(key);
+	if (cached && cached.expiresAt > Date.now()) return cached.folderId;
+	const folderId = await fetchNarratorFolderId(narratorId, userId).catch(() => null);
+	folderOfCache.set(key, { folderId, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	return folderId;
 }
 
 /** The default row (see {@link resolveGitIdentityForUser} for what "default" means). */
@@ -267,6 +340,53 @@ async function fetchPickedIdentity(
 		)
 		.limit(1);
 	return toIdentity(rows[0]);
+}
+
+/** The identity one user picked for one sidebar folder, or null when they made no pick. */
+async function fetchFolderPick(folderId: string, userId: string): Promise<GitIdentity | null> {
+	const { and, db, eq, folderGitIdentityBindings, userGitIdentities } =
+		await loadIdentityQueryDependencies();
+	const rows = await db
+		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+		.from(folderGitIdentityBindings)
+		.innerJoin(
+			userGitIdentities,
+			and(
+				eq(userGitIdentities.id, folderGitIdentityBindings.identityId),
+				eq(userGitIdentities.userId, userId),
+			),
+		)
+		.where(
+			and(
+				eq(folderGitIdentityBindings.folderId, folderId),
+				eq(folderGitIdentityBindings.userId, userId),
+			),
+		)
+		.limit(1);
+	return toIdentity(rows[0]);
+}
+
+/**
+ * The sidebar folder this narrator sits in, for this user.
+ *
+ * A session can sit in more than one folder; the first one in sidebar order wins, so the
+ * inherited identity matches the folder the reader sees first.
+ */
+async function fetchNarratorFolderId(narratorId: string, userId: string): Promise<string | null> {
+	const { and, asc, db, eq, isNotNull, userRecentTabs } = await loadIdentityQueryDependencies();
+	const rows = await db
+		.select({ folderId: userRecentTabs.folderId })
+		.from(userRecentTabs)
+		.where(
+			and(
+				eq(userRecentTabs.userId, userId),
+				eq(userRecentTabs.representedNarratorId, narratorId),
+				isNotNull(userRecentTabs.folderId),
+			),
+		)
+		.orderBy(asc(userRecentTabs.sortOrder))
+		.limit(1);
+	return rows[0]?.folderId ?? null;
 }
 
 /** Re-validate a stored row through the shared identifier rules. */

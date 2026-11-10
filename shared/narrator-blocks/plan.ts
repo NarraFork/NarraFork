@@ -9,6 +9,7 @@
  */
 
 import { isBrokenToolOutput, outputToText, toolOutputImages } from "../agent-protocol/tool-output";
+import { isClearedToolOutput, isHistoryClearedElement } from "../storage-retention";
 import { type DecodableMessage, INTERNAL_READ_TOOL_USE_PREFIX } from "./decode";
 import { type BlockDraft, splitEnvelope } from "./storage";
 import type { CanonicalBlock } from "./types";
@@ -86,7 +87,12 @@ const INDEX_RESULT_CHARS = 64 * 1024;
  * (`narrator_blocks_fts`) and the job started over for existing blocks to follow.
  */
 export function blockIndexText(block: CanonicalBlock | null, adoptedOutput?: unknown): string {
-	if (!block) return "";
+	if (
+		!block ||
+		(block.kind === "tool" && (block.payload.payloadCleared || isClearedToolOutput(adoptedOutput)))
+	)
+		return "";
+	if (block.kind === "context" && isHistoryClearedElement(block.payload.body)) return "";
 	switch (block.kind) {
 		case "input":
 		case "context":
@@ -117,6 +123,12 @@ export function blockAssets(
 	adoptedOutput: unknown,
 ): Array<[assetId: string, role: string]> {
 	const assets: Array<[string, string]> = [];
+	if (
+		draft.payload.raw.some(isHistoryClearedElement) ||
+		(draft.canonical?.kind === "tool" && draft.canonical.payload.payloadCleared) ||
+		isClearedToolOutput(adoptedOutput)
+	)
+		return assets;
 	for (const element of draft.payload.raw) {
 		if (!element || typeof element !== "object") continue;
 		const raw = element as Record<string, unknown>;

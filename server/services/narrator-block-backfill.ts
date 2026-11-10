@@ -17,7 +17,8 @@
  *     rare changed one itself. The envelope index retires once it has completed
  *     (`ensureFts`), which also starts it over when the block index has to be cleared.
  *
- * Two more are started from the storage page (P3b, §10.4), one at a time:
+ * Two projection jobs run one at a time (P3b, §10.4). `clear` starts automatically once
+ * convert/verify/reindex complete; `restore` remains available for explicit rollback:
  *
  *   - `clear` drops the `content_json` projection of every verified block-format envelope
  *     whose rows assemble to it exactly, leaving it rows-only (`body_rows_only`); compact
@@ -49,18 +50,14 @@ import {
 	ledgerFingerprint,
 	type ReindexEnvelope,
 	rowsSignature,
-	runBlockBackfillSlice,
-	runBlockProjectionSlice,
-	runBlockReindexSlice,
-	runBlockVerifySlice,
 } from "../lib/db-worker/block-backfill-query";
-import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import { runReadTask } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { hasRowsOnlyBodies } from "../lib/narrator-bodies";
-import { settings } from "../lib/settings";
+import { saveSettings, settings } from "../lib/settings";
 import { noteRowsOnlyEnvelopes, rowsOnlyEnvelopesExist } from "./narrator-block-scans";
 import {
 	reindexEnvelope,
@@ -91,9 +88,6 @@ const APPLY_TARGET_MS = 50;
  */
 const APPLY_PACE_FACTOR = 3;
 const MAX_PACE_MS = 30_000;
-/** Without workers the main thread decodes, so slices shrink to stay short. */
-const INLINE_SLICE_ENVELOPES = 10;
-const INLINE_SLICE_SOURCE_BYTES = 256 * 1024;
 const WORKER_TIMEOUT_MS = 30_000;
 /** Index text one reindex slice computes; the main thread writes it in short transactions. */
 const REINDEX_SLICE_INDEX_CHARS = 256 * 1024;
@@ -105,7 +99,7 @@ const REINDEX_SLICE_INDEX_CHARS = 256 * 1024;
 const REINDEX_TX_CHARS = { initial: 32 * 1024, min: 4 * 1024, max: 256 * 1024 };
 const SLOW_LOG_INTERVAL_MS = 60_000;
 
-/** How a slice is read: by a db-worker (production) or inline on a given connection. */
+/** Production slices use a db-worker; unit tests may explicitly inject a reader. */
 export interface SliceReader {
 	backfill(params: BlockBackfillSliceParams): Promise<BlockBackfillSliceResult>;
 	verify(params: BlockVerifySliceParams): Promise<BlockVerifySliceResult>;
@@ -118,39 +112,22 @@ async function readInWorker<T>(
 		| BlockVerifySliceParams
 		| BlockReindexSliceParams
 		| BlockProjectionSliceParams,
-	inline: () => T,
 ): Promise<T> {
-	try {
-		return await runReadTask<T>(getDbPath(), params, { timeoutMs: WORKER_TIMEOUT_MS });
-	} catch (error) {
-		if (!(error instanceof WorkersUnavailableError) || error.reason === "pool_shutdown")
-			throw error;
-		return inline();
-	}
+	return await runReadTask<T>(getDbPath(), params, { timeoutMs: WORKER_TIMEOUT_MS });
 }
 
-const inlineLimits = <T extends { maxEnvelopes: number; maxSourceBytes: number }>(params: T) => ({
-	...params,
-	maxEnvelopes: Math.min(params.maxEnvelopes, INLINE_SLICE_ENVELOPES),
-	maxSourceBytes: Math.min(params.maxSourceBytes, INLINE_SLICE_SOURCE_BYTES),
-});
-
 const workerReader: SliceReader = {
-	backfill: (params) =>
-		readInWorker(params, () => runBlockBackfillSlice(database.sqlite, inlineLimits(params))),
-	verify: (params) =>
-		readInWorker(params, () => runBlockVerifySlice(database.sqlite, inlineLimits(params))),
-	reindex: (params) =>
-		readInWorker(params, () => runBlockReindexSlice(database.sqlite, inlineLimits(params))),
+	backfill: (params) => readInWorker(params),
+	verify: (params) => readInWorker(params),
+	reindex: (params) => readInWorker(params),
 };
 
-/** How a projection job's slice is read: by a db-worker, or inline on a given connection. */
+/** Production projections use a db-worker; unit tests may explicitly inject a reader. */
 export type ProjectionReader = (
 	params: BlockProjectionSliceParams,
 ) => Promise<BlockProjectionSliceResult>;
 
-const workerProjectionReader: ProjectionReader = (params) =>
-	readInWorker(params, () => runBlockProjectionSlice(database.sqlite, inlineLimits(params)));
+const workerProjectionReader: ProjectionReader = (params) => readInWorker(params);
 
 const state = hotSafe("narrator-block-backfill:state", () => ({
 	running: false,
@@ -206,12 +183,14 @@ export interface BlockJobState {
 }
 
 function jobState(job: BlockJob): BlockJobState {
-	// A projection job only runs once started: its row starts out paused.
+	// New stable clear metadata carries automatic intent, including after an import/reset;
+	// INSERT OR IGNORE preserves every explicit pause on an existing row. Restore stays opt-in.
+	const paused = job === "restore" || (job === "clear" && !rowsOnlyWrites());
 	database.sqlite
 		.prepare(
 			"INSERT OR IGNORE INTO narrator_block_backfill (job, paused, updated_at) VALUES (?, ?, ?)",
 		)
-		.run(job, PROJECTION_JOBS.includes(job as ProjectionJob) ? 1 : 0, new Date().toISOString());
+		.run(job, paused ? 1 : 0, new Date().toISOString());
 	const row = database.sqlite
 		.prepare(
 			`SELECT cursor, complete, paused, processed, updated_at AS updatedAt
@@ -591,19 +570,68 @@ export function rearmBlockConvert(): void {
 		.run(first.rowid - 1, new Date().toISOString());
 }
 
+/**
+ * Old rollout pauses must not require the retired UI to finish the single-copy upgrade.
+ * The job column has a closed CHECK constraint, so this receipt lives in settings rather
+ * than inventing a job row. Commit the bounded metadata update before the receipt: a crash
+ * in between can only repeat the idempotent resume, never skip it with jobs still paused.
+ */
+function resumeSingleCopyUpgrade(): void {
+	if (!rowsOnlyWrites() || (settings.narratorBlocks.singleCopyBackfillResumeVersion ?? 0) >= 1)
+		return;
+	database.sqlite.transaction(() => {
+		for (const job of ["convert", "verify", "reindex", "clear", "restore"] as const) jobState(job);
+		database.sqlite
+			.prepare(
+				`UPDATE narrator_block_backfill SET paused = CASE WHEN job = 'restore' THEN 1 ELSE 0 END,
+					updated_at = ? WHERE job IN ('convert', 'verify', 'reindex', 'clear', 'restore')`,
+			)
+			.run(new Date().toISOString());
+	})();
+	saveSettings({
+		...settings,
+		narratorBlocks: { ...settings.narratorBlocks, singleCopyBackfillResumeVersion: 1 },
+	});
+}
+
 /** Start the jobs in the background, if they have work; a no-op while they already run. */
-export function startBlockBackfill(): void {
+export function startBlockBackfill(
+	reader: SliceReader = workerReader,
+	readProjection: ProjectionReader = workerProjectionReader,
+): void {
 	if (!hasSchema()) return;
-	// A projection job started before a restart resumes where it was.
-	startProjectionRunner();
 	if (state.running) return;
+	resumeSingleCopyUpgrade();
+	// Resume an interrupted pass without resetting its durable cursor. A completed pass
+	// gets one fresh sweep per startup, including projections restored during a rollback.
+	const restartClear = jobState("clear").complete;
 	rearmBlockConvert();
+	const resumedProjection = activeProjection();
+	// Keep an automatic clear queued while prerequisites run, rather than launching it
+	// prematurely and turning its unpaused intent back into a blocked pause.
+	if (resumedProjection && !projectionBlocked(resumedProjection))
+		startProjectionRunner(readProjection);
 	state.running = true;
 	const next = () => {
-		runBlockJobSlice()
+		runBlockJobSlice(reader)
 			.then((ran) => {
 				if (ran) setTimeout(next, 0);
-				else state.running = false;
+				else {
+					state.running = false;
+					const prerequisites = ["convert", "verify", "reindex"] as const;
+					if (
+						rowsOnlyWrites() &&
+						prerequisites.every((job) => {
+							const current = jobState(job);
+							return current.complete && !current.paused;
+						}) &&
+						!jobState("clear").paused &&
+						(restartClear || !jobState("clear").complete)
+					) {
+						// No scan here: only persist job intent and schedule bounded worker slices.
+						beginProjectionJob("clear", readProjection);
+					}
+				}
 			})
 			.catch((error) => {
 				state.running = false;
@@ -708,7 +736,9 @@ function projectionBlocked(job: ProjectionJob): ProjectionBlock | null {
 	if (!hasSchema()) return "unavailable";
 	if (job === "restore") return rowsOnlyWrites() ? "compact_json_on" : null;
 	if (!rowsOnlyWrites()) return "compact_json_off";
-	return jobState("convert").complete && jobState("verify").complete ? null : "backfill_incomplete";
+	return ["convert", "verify", "reindex"].every((job) => jobState(job as BlockJob).complete)
+		? null
+		: "backfill_incomplete";
 }
 
 function pauseProjection(job: ProjectionJob): void {
@@ -728,6 +758,12 @@ export function startProjectionJob(
 	const blocked = projectionBlocked(job);
 	if (blocked)
 		throw new AppError(`Cannot ${job} projections: ${blocked}`, 409, "BLOCK_PROJECTION_BLOCKED");
+	beginProjectionJob(job, read);
+	return blockBackfillStatus();
+}
+
+/** Shared by the automatic post-backfill upgrade and explicit rollback maintenance. */
+function beginProjectionJob(job: ProjectionJob, read: ProjectionReader): void {
 	for (const name of PROJECTION_JOBS) jobState(name);
 	pauseProjection(job === "clear" ? "restore" : "clear");
 	database.sqlite
@@ -739,7 +775,6 @@ export function startProjectionJob(
 		)
 		.run(new Date().toISOString(), job);
 	startProjectionRunner(read);
-	return blockBackfillStatus();
 }
 
 /** Stop whichever projection job runs, where it is; starting it again resumes it. */
@@ -892,7 +927,7 @@ function startProjectionRunner(read: ProjectionReader = workerProjectionReader):
 			})
 			.catch((error) => {
 				projection.running = false;
-				logger.warn("Projection job stopped; start it again from the storage page", {
+				logger.warn("Projection job stopped; it resumes at the next start", {
 					error: String(error),
 				});
 			});

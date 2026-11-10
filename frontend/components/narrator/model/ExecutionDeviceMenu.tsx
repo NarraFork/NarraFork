@@ -6,12 +6,16 @@
  * so an entry that is a Menu rather than a toggle needs to be a component it can
  * place — the IIFE could not be.
  *
- * Behaviour is unchanged: "local" plus every registered device, a check mark on
- * the current target, offline devices listed but not selectable.
+ * Behaviour: "local" plus every registered device, a check mark on the current
+ * target, offline devices listed but not selectable. A device that has no recorded
+ * working directory is listed too, but selecting it opens the directory dialog
+ * instead of switching — a switch to an unconfigured device must not run tools in a
+ * directory nobody chose.
  */
 
-import { ActionIcon, Menu, Tooltip } from "@mantine/core";
-import { IconCheck, IconDeviceDesktop, IconDevices } from "@tabler/icons-react";
+import { ActionIcon, Group, Menu, Text, Tooltip } from "@mantine/core";
+import { IconAlertCircle, IconCheck, IconDeviceDesktop, IconDevices } from "@tabler/icons-react";
+import type { WorkspaceDirectoryMap } from "../../../lib/api/narrators";
 
 export interface ExecutionDeviceOption {
 	id: string;
@@ -30,6 +34,16 @@ export interface ExecutionDeviceOptionsProps {
 	onSelect: (deviceId: string | null) => void;
 	/** Hide the heading when the surrounding surface already labels the group. */
 	withLabel?: boolean;
+	/**
+	 * Working directory recorded per device (`execution-devices.directories`).
+	 * Unknown (undefined) degrades to the old behaviour: attempt the switch and let the
+	 * server's 409 open the dialog.
+	 */
+	directories?: WorkspaceDirectoryMap;
+	/** Marker appended to a device row that still needs a directory. */
+	noDirectoryLabel?: string;
+	/** Selecting an unconfigured device asks for its directory instead of switching. */
+	onRequireDirectory?: (deviceId: string) => void;
 }
 
 /**
@@ -48,21 +62,47 @@ export function ExecutionDeviceOptions({
 	currentDeviceId,
 	onSelect,
 	withLabel = true,
+	directories,
+	noDirectoryLabel,
+	onRequireDirectory,
 }: ExecutionDeviceOptionsProps) {
+	const needsDirectory = (deviceId: string) =>
+		directories !== undefined && directories[deviceId] === undefined;
+	const choose = (deviceId: string) => {
+		if (needsDirectory(deviceId) && onRequireDirectory) {
+			onRequireDirectory(deviceId);
+			return;
+		}
+		onSelect(deviceId === "local" ? null : deviceId);
+	};
+	const noDirectoryHint = noDirectoryLabel ? (
+		<Text size="xs" c="orange">
+			{noDirectoryLabel}
+		</Text>
+	) : null;
+
 	return (
 		<>
 			{withLabel && <Menu.Label>{label}</Menu.Label>}
 			<Menu.Item
 				leftSection={<IconDeviceDesktop size={14} />}
 				rightSection={
-					<IconCheck
-						size={14}
-						style={{ visibility: currentDeviceId === "local" ? "visible" : "hidden" }}
-					/>
+					<Group gap={6} wrap="nowrap">
+						{needsDirectory("local") && (
+							<IconAlertCircle size={13} style={{ color: "var(--mantine-color-orange-5)" }} />
+						)}
+						<IconCheck
+							size={14}
+							style={{ visibility: currentDeviceId === "local" ? "visible" : "hidden" }}
+						/>
+					</Group>
 				}
-				onClick={() => onSelect(null)}
+				onClick={() => choose("local")}
 			>
-				{localLabel}
+				<Group gap={8} wrap="nowrap" justify="space-between">
+					<span>{localLabel}</span>
+					{needsDirectory("local") && noDirectoryHint}
+				</Group>
 			</Menu.Item>
 			{devices.map((device) => (
 				<Menu.Item
@@ -70,14 +110,22 @@ export function ExecutionDeviceOptions({
 					leftSection={<IconDevices size={14} />}
 					disabled={!device.online}
 					rightSection={
-						<IconCheck
-							size={14}
-							style={{ visibility: currentDeviceId === device.id ? "visible" : "hidden" }}
-						/>
+						<Group gap={6} wrap="nowrap">
+							{device.online && needsDirectory(device.id) && (
+								<IconAlertCircle size={13} style={{ color: "var(--mantine-color-orange-5)" }} />
+							)}
+							<IconCheck
+								size={14}
+								style={{ visibility: currentDeviceId === device.id ? "visible" : "hidden" }}
+							/>
+						</Group>
 					}
-					onClick={() => onSelect(device.id)}
+					onClick={() => choose(device.id)}
 				>
-					{device.online ? device.name : `${device.name} (${offlineLabel})`}
+					<Group gap={8} wrap="nowrap" justify="space-between">
+						<span>{device.online ? device.name : `${device.name} (${offlineLabel})`}</span>
+						{device.online && needsDirectory(device.id) && noDirectoryHint}
+					</Group>
 				</Menu.Item>
 			))}
 		</>

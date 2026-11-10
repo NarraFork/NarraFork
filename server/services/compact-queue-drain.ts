@@ -1,21 +1,19 @@
 /**
- * Consume messages a user queued while a narrator's context was being compacted.
+ * Recheck messages queued while a narrator's context was being compacted.
  *
  * A compacting narrator can be perfectly idle — `isNarratorRuntimeBusy` is false and
  * no agent loop exists — yet starting a turn right then would run it against the
  * history the compact is about to replace (a compact resets the upstream session).
- * So `POST /:id/messages` queues instead, and that queue needs an owner.
+ * So user input queues instead, and mailbox wakes for task notices / agent messages
+ * are also deferred until the compact lock is released.
  *
- * Every other queue producer is paired with a live loop that drains the buffer at its
- * next safe boundary. Nothing plays that role here, so this sweep is the SOLE consumer
- * for the idle-during-compaction window. It must therefore run on every compact exit,
+ * No live loop owns that idle-during-compaction window. Recheck on every compact exit,
  * not just the successful one: a failed, cancelled or timed-out compact leaves the same
- * queue behind, and skipping those paths would strand the message until the user
- * happened to send another one.
+ * queue behind, and skipping those paths would strand work until another wake.
  *
- * Best-effort by construction: `resumeBufferedMessagesIfIdle` declines whenever another
- * owner exists or the narrator must not be woken (plan mode, subagent, non-idle status),
- * so calling it after a compact can only ever start a turn that was already legal.
+ * Best-effort by construction: existing user input keeps its locale-aware consumer;
+ * otherwise the unified mailbox wake rechecks eligibility without bypassing execution
+ * ownership, busy/stop guards or principal requirements.
  */
 
 import { getUserLanguage, getUserReplyInLanguage } from "../lib/i18n";
@@ -52,16 +50,16 @@ async function resolveQueueOwnerLocale(
 }
 
 /**
- * Start a turn for whatever the user queued while this narrator was compacting.
- *
- * Called from the compact lock's release path, so it covers success, failure,
- * cancellation and watchdog timeouts alike. A no-op when the queue is empty, which is
- * the overwhelmingly common case — the check is a map lookup, so it stays free for
- * every compact that nobody typed into.
+ * Recheck queued work after the compact lock is released, including failure,
+ * cancellation and watchdog timeouts. Empty / ineligible mailboxes do not start a turn.
  */
 export async function drainQueuedMessagesAfterCompact(narratorId: string): Promise<void> {
-	if ((getBufferedMessages(narratorId)?.length ?? 0) === 0) return;
 	try {
+		if ((getBufferedMessages(narratorId)?.length ?? 0) === 0) {
+			const { wakeInboxIfEligible } = await import("./agent-runtime/inbox");
+			await wakeInboxIfEligible(narratorId);
+			return;
+		}
 		const { locale, replyInUserLanguage } = await resolveQueueOwnerLocale(narratorId);
 		const { resumeBufferedMessagesIfIdle } = await import("./narrator-session");
 		await resumeBufferedMessagesIfIdle(narratorId, locale, replyInUserLanguage);

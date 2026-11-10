@@ -1,4 +1,4 @@
-import { db } from "@server/db";
+import { activeDatabaseBackend, db } from "@server/db";
 import { apiRequests, narrators, users } from "@server/db/schema";
 import { readQuery } from "@server/db/worker-read";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
@@ -11,6 +11,14 @@ import {
 } from "@server/lib/usage-history-cursor";
 import { narratorProjectIdColumn } from "@server/services/narrator-project";
 import { normalizeModelFamily } from "@shared/model-id";
+import {
+	addBuckets,
+	bucketLabelAt,
+	bucketStartAt,
+	countBucketsBetween,
+	normalizeUsageTimeZone,
+} from "@shared/usage-time-zone";
+import { usageBucketExpression } from "./usage-bucket-sql";
 
 const costCoverageSelection = {
 	unpricedRequestCount: sql<number>`coalesce(sum(case when ${apiRequests.costStatus} in ('partial','unknown') or (${apiRequests.costStatus} is null and ${apiRequests.costUsd} is null) then 1 else 0 end), 0)`,
@@ -57,6 +65,8 @@ export interface UsageHistoryFilters {
 	kind?: string;
 	startDate?: string;
 	endDate?: string;
+	/** 读者日历的 IANA 时区；时间序列按它切日，缺省 UTC。 */
+	timeZone?: string;
 	includeSubagents?: boolean;
 }
 
@@ -201,8 +211,8 @@ const USAGE_TIME_SERIES_CONFIG = {
 } satisfies Record<UsageHistoryGranularity, { maxBuckets: number; defaultBuckets: number }>;
 
 interface UsageTimeSeriesRange {
-	startBucketDate: Date;
-	endBucketDate: Date;
+	startBucketLabel: string;
+	endBucketLabel: string;
 	requestedStartDate: string;
 	requestedEndDate: string;
 	effectiveStartDate: string;
@@ -232,54 +242,21 @@ function normalizeModelFilter(value: string | undefined): string | undefined {
 	return trimmed.slice(0, MODEL_FILTER_MAX_LENGTH).replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
-function normalizeToBucketStart(date: Date, granularity: UsageHistoryGranularity): Date {
-	const normalized = new Date(date.getTime());
-	if (granularity === "hour") {
-		normalized.setUTCMinutes(0, 0, 0);
-		return normalized;
-	}
-	if (granularity === "day") {
-		normalized.setUTCHours(0, 0, 0, 0);
-		return normalized;
-	}
-	normalized.setUTCDate(1);
-	normalized.setUTCHours(0, 0, 0, 0);
-	return normalized;
-}
-
-function addBuckets(date: Date, amount: number, granularity: UsageHistoryGranularity): Date {
-	const next = new Date(date.getTime());
-	if (granularity === "hour") next.setUTCHours(next.getUTCHours() + amount);
-	else if (granularity === "day") next.setUTCDate(next.getUTCDate() + amount);
-	else next.setUTCMonth(next.getUTCMonth() + amount);
-	return next;
-}
-
-function countBucketsBetween(start: Date, end: Date, granularity: UsageHistoryGranularity): number {
-	if (start.getTime() > end.getTime()) return 0;
-	if (granularity === "hour") {
-		return Math.floor((end.getTime() - start.getTime()) / (60 * 60 * 1000)) + 1;
-	}
-	if (granularity === "day") {
-		return Math.floor((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1;
-	}
-	return (
-		(end.getUTCFullYear() - start.getUTCFullYear()) * 12 +
-		(end.getUTCMonth() - start.getUTCMonth()) +
-		1
-	);
+/** 桶标签落在哪个日历，由查询声明的读者时区决定；服务端不推断。 */
+function usageTimeZoneOf(filters: UsageHistoryFilters): string {
+	return normalizeUsageTimeZone(filters.timeZone);
 }
 
 function buildBucketTimestamps(
-	start: Date,
-	end: Date,
+	startLabel: string,
+	endLabel: string,
 	granularity: UsageHistoryGranularity,
 ): string[] {
 	const timestamps: string[] = [];
-	let cursor = new Date(start.getTime());
+	let cursor = startLabel;
 	const maxBuckets = USAGE_TIME_SERIES_CONFIG[granularity].maxBuckets;
-	while (cursor.getTime() <= end.getTime() && timestamps.length < maxBuckets) {
-		timestamps.push(cursor.toISOString());
+	while (cursor <= endLabel && timestamps.length < maxBuckets) {
+		timestamps.push(cursor);
 		cursor = addBuckets(cursor, 1, granularity);
 	}
 	return timestamps;
@@ -288,36 +265,32 @@ function buildBucketTimestamps(
 function resolveUsageTimeSeriesRange(
 	filters: UsageHistoryFilters,
 	granularity: UsageHistoryGranularity,
+	timeZone: string,
 	now: Date,
 ): UsageTimeSeriesRange {
 	const config = USAGE_TIME_SERIES_CONFIG[granularity];
 	const parsedEnd = parseDateOrNull(filters.endDate);
 	const requestedEnd = parsedEnd ?? now;
-	const requestedEndBucket = normalizeToBucketStart(requestedEnd, granularity);
 	const parsedStart = parseDateOrNull(filters.startDate);
-	let requestedStart =
-		parsedStart ?? addBuckets(requestedEndBucket, -(config.defaultBuckets - 1), granularity);
-
-	if (requestedStart.getTime() > requestedEnd.getTime()) {
-		requestedStart = new Date(requestedEnd.getTime());
-	}
-
-	let startBucketDate = normalizeToBucketStart(requestedStart, granularity);
-	const endBucketDate = normalizeToBucketStart(requestedEnd, granularity);
-	let effectiveStart = requestedStart;
+	const clampedStart =
+		parsedStart && parsedStart.getTime() > requestedEnd.getTime() ? requestedEnd : parsedStart;
+	const endLabel = bucketLabelAt(requestedEnd, granularity, timeZone);
+	let startLabel = clampedStart
+		? bucketLabelAt(clampedStart, granularity, timeZone)
+		: addBuckets(endLabel, -(config.defaultBuckets - 1), granularity);
+	let effectiveStart = clampedStart ?? bucketStartAt(startLabel, timeZone);
 	let truncated = false;
 
-	const bucketCount = countBucketsBetween(startBucketDate, endBucketDate, granularity);
-	if (bucketCount > config.maxBuckets) {
-		startBucketDate = addBuckets(endBucketDate, -(config.maxBuckets - 1), granularity);
-		effectiveStart = startBucketDate;
+	if (countBucketsBetween(startLabel, endLabel, granularity) > config.maxBuckets) {
+		startLabel = addBuckets(endLabel, -(config.maxBuckets - 1), granularity);
+		effectiveStart = bucketStartAt(startLabel, timeZone);
 		truncated = true;
 	}
 
 	return {
-		startBucketDate,
-		endBucketDate,
-		requestedStartDate: requestedStart.toISOString(),
+		startBucketLabel: startLabel,
+		endBucketLabel: endLabel,
+		requestedStartDate: effectiveStart.toISOString(),
 		requestedEndDate: requestedEnd.toISOString(),
 		effectiveStartDate: effectiveStart.toISOString(),
 		effectiveEndDate: requestedEnd.toISOString(),
@@ -325,14 +298,18 @@ function resolveUsageTimeSeriesRange(
 	};
 }
 
-function getBucketExpression(granularity: UsageHistoryGranularity) {
-	if (granularity === "hour") {
-		return sql<string>`substr(${apiRequests.createdAt}, 1, 13) || ':00:00.000Z'`;
-	}
-	if (granularity === "day") {
-		return sql<string>`substr(${apiRequests.createdAt}, 1, 10) || 'T00:00:00.000Z'`;
-	}
-	return sql<string>`substr(${apiRequests.createdAt}, 1, 7) || '-01T00:00:00.000Z'`;
+function getBucketExpression(
+	granularity: UsageHistoryGranularity,
+	timeZone: string,
+	range: { start: Date; end: Date },
+) {
+	return usageBucketExpression({
+		dialect: activeDatabaseBackend === "postgres" ? "postgres" : "sqlite",
+		granularity,
+		timeZone,
+		start: range.start,
+		end: range.end,
+	});
 }
 
 function toNumber(value: unknown): number {
@@ -426,7 +403,7 @@ export class UsageHistoryService {
 	): Promise<Row[]> {
 		const startedAt = Date.now();
 		try {
-			return await readQuery(query, { maxRows, signal: execution.signal, inlineFallback: false });
+			return await readQuery(query, { maxRows, signal: execution.signal });
 		} catch (error) {
 			logger.warn("Usage history aggregation worker failed", {
 				error: error instanceof Error ? error.message : String(error),
@@ -700,13 +677,22 @@ export class UsageHistoryService {
 	): Promise<UsageHistoryTimeSeriesResponse> {
 		const granularity = options.granularity ?? "day";
 		const config = USAGE_TIME_SERIES_CONFIG[granularity];
-		const range = resolveUsageTimeSeriesRange(filters, granularity, options.now ?? new Date());
+		const timeZone = usageTimeZoneOf(filters);
+		const range = resolveUsageTimeSeriesRange(
+			filters,
+			granularity,
+			timeZone,
+			options.now ?? new Date(),
+		);
 		const conditions = this.buildWhereConditions({
 			...filters,
 			startDate: range.effectiveStartDate,
 			endDate: range.effectiveEndDate,
 		});
-		const bucket = getBucketExpression(granularity);
+		const bucket = getBucketExpression(granularity, timeZone, {
+			start: new Date(range.effectiveStartDate),
+			end: new Date(range.effectiveEndDate),
+		});
 
 		const query = this.database
 			.select({
@@ -740,8 +726,8 @@ export class UsageHistoryService {
 		const rows = await this.aggregate(query, config.maxBuckets, execution);
 		const rowsByBucket = new Map(rows.map((row) => [row.bucket, row]));
 		const points = buildBucketTimestamps(
-			range.startBucketDate,
-			range.endBucketDate,
+			range.startBucketLabel,
+			range.endBucketLabel,
 			granularity,
 		).map((timestamp) => {
 			const row = rowsByBucket.get(timestamp);
@@ -967,7 +953,13 @@ export class UsageHistoryService {
 		const topN = Math.min(Math.max(options.topN ?? 5, 2), 10);
 		const { dimension, metric, cluster = true } = options;
 		const shouldCluster = dimension === "model" && cluster;
-		const range = resolveUsageTimeSeriesRange(filters, granularity, options.now ?? new Date());
+		const timeZone = usageTimeZoneOf(filters);
+		const range = resolveUsageTimeSeriesRange(
+			filters,
+			granularity,
+			timeZone,
+			options.now ?? new Date(),
+		);
 		const conditions = this.buildWhereConditions({
 			...filters,
 			startDate: range.effectiveStartDate,
@@ -1025,7 +1017,10 @@ export class UsageHistoryService {
 
 		// Fold non-top dimensions into NULL in SQL, not after transferring every dimension.
 		// NULL is an internal "other" bucket distinct from real labels such as "other".
-		const bucket = getBucketExpression(granularity);
+		const bucket = getBucketExpression(granularity, timeZone, {
+			start: new Date(range.effectiveStartDate),
+			end: new Date(range.effectiveEndDate),
+		});
 		const groupedLabel = shouldCluster
 			? dimensionColumn
 			: topLabelSet.size
@@ -1057,8 +1052,8 @@ export class UsageHistoryService {
 
 		// Step 3: build timestamps and series
 		const timestamps = buildBucketTimestamps(
-			range.startBucketDate,
-			range.endBucketDate,
+			range.startBucketLabel,
+			range.endBucketLabel,
 			granularity,
 		);
 

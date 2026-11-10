@@ -43,7 +43,7 @@ import {
 	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
-import { removeRecentTabCascade } from "./useRecentTabs";
+import { recentTabsSectionQueryKey, removeRecentTabCascade } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
@@ -804,7 +804,8 @@ export function useArchiveNarrator() {
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			// Cascade cleanup after archive — no undo token for entities that are gone.
-			void removeRecentTabCascade(qc, "narrator", narratorId);
+			// 归档是可撤销的，所以它所在的文件夹即使变空也留着，撤销归档才回得去。
+			void removeRecentTabCascade(qc, "narrator", narratorId, { keepEmptyFolder: true });
 		},
 		onError: () => {
 			notifications.show({ color: "red", message: t("archiveFailed") });
@@ -817,6 +818,9 @@ export function useUnarchiveNarrator() {
 		mutationFn: (id: string) => api.unarchiveNarrator(id),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+			// 恢复可能把它放回归档前所在的文件夹，侧栏要重新读一遍。
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("work") });
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("projects") });
 		},
 	});
 }

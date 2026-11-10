@@ -4,6 +4,98 @@ import puppeteer from "puppeteer-core";
 const executablePath = process.env.NF_TEST_CHROMIUM_PATH;
 
 test.skipIf(!executablePath)(
+	"WCO page strip stays at the viewport top inside the padded shell while scrolling",
+	async () => {
+		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
+		const safeAreaCss = await Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text();
+		const browser = await puppeteer.launch({
+			executablePath,
+			headless: true,
+			args: ["--no-sandbox"],
+			timeout: 15_000,
+		});
+		try {
+			const page = await browser.newPage();
+			await page.setViewport({ width: 1400, height: 900 });
+			await page.setContent(`
+				<style>${safeAreaCss}\n${css}</style>
+				<style>
+					:root { --mantine-spacing-md: 16px; --mantine-color-body: white; }
+					body { margin: 0; }
+					.nf-app-shell-main { padding: var(--mantine-spacing-md);
+						padding-left: calc(240px + var(--mantine-spacing-md)); }
+					#content { height: 2400px; }
+				</style>
+				<div id="root"><div class="nf-app-shell"><main class="nf-app-shell-main">
+					<div class="nf-wco-top-gap" aria-hidden="true"></div>
+					<div class="nf-wco-main-strip" aria-hidden="true"></div>
+					<div id="content">Page content</div>
+				</main></div></div>
+			`);
+			await page.evaluate(() => {
+				document.documentElement.setAttribute("data-nf-authenticated-app-shell", "true");
+			});
+			for (const side of ["right", "left"]) {
+				for (const padding of [12, 16, 24]) {
+					for (const height of [32, 40]) {
+						await page.evaluate(
+							({ side, padding, height }) => {
+								const root = document.documentElement;
+								root.setAttribute("data-nf-wco", side);
+								root.style.setProperty("--mantine-spacing-md", `${padding}px`);
+								root.style.setProperty("--nf-wco-strip-height", `${height}px`);
+							},
+							{ side, padding, height },
+						);
+						for (const scroll of [0, 8, 100, 500]) {
+							const actual = await page.evaluate(async (scroll) => {
+								const main = document.querySelector<HTMLElement>("main");
+								const strip = document.querySelector<HTMLElement>(".nf-wco-main-strip");
+								if (!main || !strip) throw new Error("Missing shell fixture");
+								main.scrollTop = scroll;
+								await new Promise(requestAnimationFrame);
+								const rect = strip.getBoundingClientRect();
+								return {
+									top: rect.top,
+									bottom: rect.bottom,
+									left: rect.left,
+									scroll: main.scrollTop,
+									padding: getComputedStyle(main).paddingTop,
+								};
+							}, scroll);
+							expect(actual).toEqual({
+								top: 0,
+								bottom: height,
+								left: 240,
+								scroll,
+								padding: `${padding}px`,
+							});
+						}
+					}
+				}
+			}
+			const stripDisplay = () =>
+				page.$eval(".nf-wco-main-strip", (el) => getComputedStyle(el).display);
+			await page.evaluate(() => document.documentElement.removeAttribute("data-nf-wco"));
+			expect(await stripDisplay()).toBe("none");
+			await page.evaluate(() => {
+				document.documentElement.setAttribute("data-nf-wco", "right");
+				document.getElementById("content")?.setAttribute("data-nf-wco-titlebar", "");
+			});
+			expect(await stripDisplay()).toBe("none");
+			await page.evaluate(() => {
+				document.getElementById("content")?.removeAttribute("data-nf-wco-titlebar");
+			});
+			await page.setViewport({ width: 700, height: 900 });
+			expect(await stripDisplay()).toBe("none");
+		} finally {
+			await browser.close();
+		}
+	},
+	30_000,
+);
+
+test.skipIf(!executablePath)(
 	"WCO top-row headers share the overlay height without changing lower rows or shell padding",
 	async () => {
 		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
@@ -45,6 +137,12 @@ test.skipIf(!executablePath)(
 							style="padding:10px 16px"><button>Details</button></div></div>
 					</div>
 					<div id="lower" class="header nf-panel-header" style="padding:10px 16px"><button>Lower</button></div>
+					<div id="workspace-toolbar" class="header" data-nf-titlebar-row data-nf-titlebar-candidate>
+						<button id="workspace-title"><span>Workspace title</span></button>
+						<input id="workspace-title-input" aria-label="Title" />
+						<button id="workspace-title-save">Save</button>
+						<div style="flex:1"></div>
+					</div>
 				</div>
 			`);
 			const measure = () =>
@@ -69,6 +167,20 @@ test.skipIf(!executablePath)(
 					document.documentElement.style.setProperty("--nf-wco-strip-height", `${value}px`);
 				}, height);
 				const actual = await measure();
+				expect(
+					await page.evaluate(() =>
+						[
+							"workspace-toolbar",
+							"workspace-title",
+							"workspace-title-input",
+							"workspace-title-save",
+						].map((id) => {
+							const el = document.getElementById(id);
+							if (!el) throw new Error(`Missing ${id}`);
+							return getComputedStyle(el).getPropertyValue("-webkit-app-region");
+						}),
+					),
+				).toEqual(["drag", "no-drag", "no-drag", "no-drag"]);
 				// The shared extra pixel is the separator below the native control area;
 				// putting it inside `height` lets native button backgrounds cover it.
 				expect(actual.rows).toEqual(

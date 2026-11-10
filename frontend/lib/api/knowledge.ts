@@ -36,6 +36,7 @@ import type {
 	KnowledgeSubmissionDetail,
 	KnowledgeSubmissionListItem,
 	KnowledgeSubmissionOutcome,
+	KnowledgeSubmissionOutcomeUnreadCount,
 	KnowledgeSubmitResult,
 	KnowledgeTag,
 	KnowledgeTagType,
@@ -444,6 +445,19 @@ export const knowledgeApi = {
 	// ─── Review inbox badge ───
 	getKnowledgeReviewInboxCount: () =>
 		request<KnowledgeReviewInboxCount>("/knowledge/review-inbox/count"),
+
+	// ─── Author verdicts (notification bell) ───
+	/** Unread half of `/my-submission-outcomes`, so the badge needs one bounded query. */
+	getKnowledgeSubmissionOutcomesUnreadCount: () =>
+		request<KnowledgeSubmissionOutcomeUnreadCount>(
+			"/knowledge/my-submission-outcomes/unread-count",
+		),
+	/** Acknowledge verdicts the author just opened. Server scopes to the caller's own rows. */
+	markKnowledgeSubmissionOutcomesRead: (ids: string[]) =>
+		request<{ updated: number }>("/knowledge/my-submission-outcomes/read", {
+			method: "POST",
+			body: JSON.stringify({ ids }),
+		}),
 
 	// ─── Review state machine closure (withdraw / resubmit / scope) ───
 

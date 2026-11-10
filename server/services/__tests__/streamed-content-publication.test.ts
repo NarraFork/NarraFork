@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { AgentConfig, AgentEvent } from "../../lib/agent/types";
 import type { EventHandlerContext } from "../narrator-event-handler";
@@ -261,10 +261,10 @@ function makeConfig(ctx: EventHandlerContext): AgentConfig {
 function readMessage(messageId: string) {
 	const row = sqlite
 		.prepare(
-			"SELECT m.content_json AS content, r.seq AS seq FROM narrator_messages m JOIN narrator_message_refs r ON r.message_id = m.id WHERE m.id = ?",
+			"SELECT r.seq AS seq FROM narrator_messages m JOIN narrator_message_refs r ON r.message_id = m.id WHERE m.id = ?",
 		)
-		.get(messageId) as { content: string; seq: number };
-	return { blocks: JSON.parse(row.content) as Array<Record<string, unknown>>, seq: row.seq };
+		.get(messageId) as { seq: number };
+	return { blocks: readTestMessageContent(sqlite, messageId), seq: row.seq };
 }
 
 beforeEach(() => {
@@ -280,7 +280,8 @@ beforeEach(() => {
 afterEach(() => {
 	releaseFirstTool.resolve();
 	releaseProvider.resolve();
-	sqlite.run("DROP TRIGGER IF EXISTS fail_content_checkpoint");
+	sqlite.run("DROP TRIGGER IF EXISTS fail_content_checkpoint_insert");
+	sqlite.run("DROP TRIGGER IF EXISTS fail_content_checkpoint_update");
 	for (const id of ["main", "child", "parent"]) clearStreamingSnapshot(id);
 });
 afterAll(() => {
@@ -415,9 +416,13 @@ describe("real loop content publication before tools", () => {
 			scenario = "eager";
 			seed(false);
 			const ctx = makeContext(false);
-			sqlite.run(
-				`CREATE TEMP TRIGGER fail_content_checkpoint BEFORE UPDATE OF content_json ON narrator_messages WHEN NEW.content_json LIKE '%"type":"${failedType}"%' BEGIN SELECT RAISE(ABORT, 'real content write rejected'); END`,
-			);
+			for (const operation of ["INSERT", "UPDATE"] as const)
+				sqlite.run(
+					`CREATE TEMP TRIGGER fail_content_checkpoint_${operation.toLowerCase()}
+					 BEFORE ${operation} ON narrator_blocks
+					 WHEN json_extract(NEW.payload, '$.raw[0].type') = '${failedType}'
+					 BEGIN SELECT RAISE(ABORT, 'real content write rejected'); END`,
+				);
 			await expect(
 				executeAgentLoop({
 					config: makeConfig(ctx),

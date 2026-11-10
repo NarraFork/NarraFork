@@ -64,6 +64,11 @@ export interface UseHeaderToolbarOptions {
 
 	// Inline options (self-contained entries).
 	updateExecutionDeviceMutation: MutationLike;
+	/**
+	 * Ask for a device's working directory instead of switching to an unconfigured one.
+	 * The dialog itself is mounted by the panel, outside these menus.
+	 */
+	onRequireDeviceDirectory: (deviceId: string) => void;
 	renderLod: RenderLod;
 	renderLodIsDefault: boolean;
 	handleSelectLod: (lod: RenderLod) => void;
@@ -118,6 +123,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		toggleTerminalTool,
 		toggleSpecTool,
 		updateExecutionDeviceMutation,
+		onRequireDeviceDirectory,
 		renderLod,
 		renderLodIsDefault,
 		handleSelectLod,
@@ -299,8 +305,14 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 							label={t("executionDeviceSelector")}
 							localLabel={t("executionTargetLocal")}
 							offlineLabel={t("executionDeviceOffline")}
+							noDirectoryLabel={t("executionDeviceNoDirectory")}
+							directories={executionDevicesQuery.data?.directories}
 							devices={executionDevicesQuery.data?.devices ?? []}
 							currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
+							onRequireDirectory={(deviceId) => {
+								close();
+								onRequireDeviceDirectory(deviceId);
+							}}
 							onSelect={(deviceId) => {
 								close();
 								updateExecutionDeviceMutation.mutate(deviceId);
@@ -343,6 +355,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			hostSurface,
 			executionDevicesQuery.data,
 			updateExecutionDeviceMutation,
+			onRequireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,

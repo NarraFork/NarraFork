@@ -108,3 +108,32 @@ export function useSetNarratorGitIdentity(narratorId: string) {
 		onError,
 	});
 }
+
+/** Query key for one caller's pick on one sidebar folder. */
+export function folderGitIdentityQueryKey(folderId: string) {
+	return [...IDENTITIES_KEY, "folder", folderId] as const;
+}
+
+/** The caller's pick for one sidebar folder, together with the identities to choose from. */
+export function useFolderGitIdentity(folderId: string | null) {
+	return useQuery({
+		queryKey: folderGitIdentityQueryKey(folderId ?? ""),
+		queryFn: () => api.getFolderGitIdentity(folderId as string),
+		enabled: !!folderId,
+		staleTime: 30_000,
+	});
+}
+
+/**
+ * Pick which of the caller's identities commits inside one sidebar folder
+ * (null = no folder pick, so sessions there follow the default).
+ */
+export function useSetFolderGitIdentity(folderId: string) {
+	const qc = useQueryClient();
+	const onError = useIdentityWriteFailure();
+	return useMutation({
+		mutationFn: (identityId: string | null) => api.setFolderGitIdentity(folderId, identityId),
+		onSuccess: () => qc.invalidateQueries({ queryKey: folderGitIdentityQueryKey(folderId) }),
+		onError,
+	});
+}

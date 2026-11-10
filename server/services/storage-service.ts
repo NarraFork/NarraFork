@@ -145,12 +145,14 @@ async function measureDirSize(
 	dirPath: string,
 	options: CategoryScanOptions = {},
 ): Promise<DirSizeResult> {
+	throwIfAborted(options.signal);
 	if (!existsSync(dirPath)) return { sizeBytes: 0, entriesScanned: 0, truncated: false };
 	const [measured] = await measureDirectoriesOffThread([dirPath], {
 		signal: options.signal,
 		onProgress: directoryProgress(options.onProgress),
 	});
-	return measured ?? { sizeBytes: 0, entriesScanned: 0, truncated: false };
+	if (!measured) throw new Error("Filesystem scan worker returned no directory measurement");
+	return measured;
 }
 
 /**
@@ -284,34 +286,40 @@ export async function scanUploads(
 	let narratorCount = 0;
 	let avatarBytes = 0;
 	let truncated = false;
+	throwIfAborted(options.signal);
+	let entries: Dirent[];
 	try {
-		const entries = await readdir(uploadsDir, { withFileTypes: true });
-		for (const entry of entries) {
-			const fullPath = resolve(uploadsDir, entry.name);
-			if (entry.isDirectory()) {
-				const measured = await measureDirSize(fullPath, options);
-				truncated ||= measured.truncated;
-				if (entry.name === "avatars") {
-					avatarBytes = measured.sizeBytes;
-					continue;
-				}
-				narratorBytes += measured.sizeBytes;
-				narratorCount++;
+		entries = await readdir(uploadsDir, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		entries = [];
+	}
+	for (const entry of entries) {
+		throwIfAborted(options.signal);
+		const fullPath = resolve(uploadsDir, entry.name);
+		if (entry.isDirectory()) {
+			// A worker failure must reject the category, not publish a partial total.
+			const measured = await measureDirSize(fullPath, options);
+			truncated ||= measured.truncated;
+			if (entry.name === "avatars") {
+				avatarBytes = measured.sizeBytes;
 				continue;
 			}
-			// Stray files directly under the uploads root belong to no narrator. Count them
-			// here so the reported size never understates what the directory holds.
-			if (entry.isFile()) {
-				try {
-					narratorBytes += (await stat(fullPath)).size;
-				} catch {
-					// skip inaccessible files
-				}
+			narratorBytes += measured.sizeBytes;
+			narratorCount++;
+			continue;
+		}
+		// Stray files directly under the uploads root belong to no narrator. Count them
+		// here so the reported size never understates what the directory holds.
+		if (entry.isFile()) {
+			try {
+				narratorBytes += (await stat(fullPath)).size;
+			} catch {
+				// skip inaccessible files
 			}
 		}
-	} catch {
-		// dir may not exist
 	}
+	throwIfAborted(options.signal);
 	return {
 		key: "uploads",
 		sizeBytes: narratorBytes,
@@ -443,39 +451,38 @@ async function scanWorktrees(options: CategoryScanOptions = {}): Promise<Storage
 	let truncated = false;
 	const projectList: Array<{ name: string; sizeBytes: number; worktreeCount: number }> = [];
 
-	try {
-		const allProjects = db
-			.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath })
-			.from(projects)
-			.all();
+	throwIfAborted(options.signal);
+	const allProjects = db
+		.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath })
+		.from(projects)
+		.all();
 
-		for (const proj of allProjects) {
-			if (!proj.gitPath) continue;
-			const wtDir = resolve(proj.gitPath, ".worktrees");
-			if (!existsSync(wtDir)) continue;
-			const measured = await measureDirSize(wtDir, options);
-			truncated ||= measured.truncated;
-			const projSize = measured.sizeBytes;
-			let projWtCount = 0;
-			try {
-				const entries = await readdir(wtDir, { withFileTypes: true });
-				projWtCount = entries.filter((e) => e.isDirectory()).length;
-			} catch {
-				// skip
-			}
-			totalSize += projSize;
-			worktreeCount += projWtCount;
-			if (projSize > 0) {
-				projectList.push({
-					name: proj.name,
-					sizeBytes: projSize,
-					worktreeCount: projWtCount,
-				});
-			}
+	for (const proj of allProjects) {
+		throwIfAborted(options.signal);
+		if (!proj.gitPath) continue;
+		const wtDir = resolve(proj.gitPath, ".worktrees");
+		if (!existsSync(wtDir)) continue;
+		const measured = await measureDirSize(wtDir, options);
+		truncated ||= measured.truncated;
+		const projSize = measured.sizeBytes;
+		let projWtCount = 0;
+		try {
+			const entries = await readdir(wtDir, { withFileTypes: true });
+			projWtCount = entries.filter((e) => e.isDirectory()).length;
+		} catch {
+			// A directory may disappear after it was measured.
 		}
-	} catch (err) {
-		logger.error("Failed to scan worktrees", { error: String(err) });
+		totalSize += projSize;
+		worktreeCount += projWtCount;
+		if (projSize > 0) {
+			projectList.push({
+				name: proj.name,
+				sizeBytes: projSize,
+				worktreeCount: projWtCount,
+			});
+		}
 	}
+	throwIfAborted(options.signal);
 
 	return {
 		key: "worktrees",

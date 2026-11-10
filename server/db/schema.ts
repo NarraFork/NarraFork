@@ -449,6 +449,19 @@ export const narrators = sqliteTable(
 		workspaceContext: text("workspace_context", { mode: "json" }).$type<
 			import("@shared/workspace-context").WorkspaceContext
 		>(),
+		/**
+		 * Per-execution-device working directories (`deviceId → { cwd, pathFlavor }`).
+		 *
+		 * `cwd` and `defaultDeviceId` above keep meaning "the currently effective
+		 * directory / device". This map is what a device switch restores from, and
+		 * the only thing the UI consults to decide whether a device still needs its
+		 * directory entered. Existing rows start empty and are backfilled lazily the
+		 * first time the current device's directory is written — no data migration.
+		 */
+		workspaceDirectories: text("workspace_directories", { mode: "json" })
+			.$type<import("@shared/workspace-directories").WorkspaceDirectoryMap>()
+			.notNull()
+			.default({}),
 		errorMessage: text("error_message"),
 		/**
 		 * Whether the last failure is worth retrying, when the provider diagnostics said so.
@@ -2390,6 +2403,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	gitIdentityCreateModal: integer("git_identity_create_modal", { mode: "boolean" })
 		.notNull()
 		.default(false),
+	/** 侧栏文件夹右键菜单里的身份入口；与上面两个开关互相独立。 */
+	gitIdentityFolderContextMenu: integer("git_identity_folder_context_menu", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	/**
 	 * 大纲标签排布，按叙述者记录：`{ [narratorId]: { order: string[], pinned: string[] } }`。
 	 * order = 普通文档的展示序，pinned = 置顶文档的展示序；内置的
@@ -2650,6 +2667,58 @@ export const userRecentTabs = sqliteTable(
 		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
+	],
+);
+
+// === recent_tab_archive_marks ===
+// Where a narrator sat in one user's sidebar when they archived it. Archiving removes the
+// sidebar row, and `folder_id` goes with it, so restoring would otherwise drop the session
+// back at the top of the list. This remembers the folder just long enough to put it back on
+// unarchive; one row per (user × narrator), overwritten by another archive, consumed by the
+// restore.
+export const recentTabArchiveMarks = sqliteTable(
+	"recent_tab_archive_marks",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** The sidebar folder the row was in; null when it sat at the top level. */
+		folderId: text("folder_id"),
+		archivedAt: text("archived_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_recent_tab_archive_mark").on(table.userId, table.narratorId)],
+);
+
+// === folder_git_identity_bindings ===
+// Per (user × sidebar folder) choice of identity. A narrator with no pick of its own
+// inherits the folder it sits in before falling back to the user's default, so organising
+// sessions into folders is also how a person says "work commits as X".
+//
+// `folderId` is the folder's `user_recent_tabs.entity_id` (see `folder_id` above), not that
+// row's primary key, so it carries no foreign key: the sidebar service validates ownership
+// and a binding whose folder no longer exists is simply ignored. Deleting a folder is a
+// layout change and must not silently rewrite anyone's commit identity.
+export const folderGitIdentityBindings = sqliteTable(
+	"folder_git_identity_bindings",
+	{
+		id: text("id").primaryKey(),
+		folderId: text("folder_id").notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** The picked identity, which must belong to the same `userId` (enforced by the service). */
+		identityId: text("identity_id")
+			.notNull()
+			.references(() => userGitIdentities.id, { onDelete: "cascade" }),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_folder_git_identity_unique").on(table.folderId, table.userId),
+		index("idx_folder_git_identity_user").on(table.userId),
 	],
 );
 
@@ -3476,6 +3545,12 @@ export const workspaces = sqliteTable(
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
+		// Conservative migration/import default: existing names must never be auto-renamed.
+		titleSource: text("title_source", { enum: ["default", "auto", "manual"] })
+			.notNull()
+			.default("manual"),
+		// Also invalidated when title inputs change, so generated candidates cannot become stale.
+		titleRevision: integer("title_revision").notNull().default(0),
 		/**
 		 * Serialized dockview layout — ARRANGEMENT ONLY.
 		 *
@@ -3576,6 +3651,8 @@ export const workspacePanels = sqliteTable(
 		 */
 		uniqueIndex("idx_workspace_panels_narrator").on(table.workspaceId, table.narratorId),
 		index("idx_workspace_panels_narrator_lookup").on(table.narratorId),
+		// Cursor-paged outline invalidation never scans layouts or non-outline memberships.
+		index("idx_workspace_panels_kind_workspace").on(table.kind, table.workspaceId, table.id),
 	],
 );
 
@@ -5200,6 +5277,10 @@ export const knowledgeSubmissions = sqliteTable(
 		verdict: text("verdict", { enum: ["approve", "request_changes", "reject", "comment_only"] }),
 		findingsJson: text("findings_json", { mode: "json" }),
 		reviewedAt: text("reviewed_at"),
+		// When the AUTHOR opened this verdict. NULL = still unread, which is what the
+		// notification bell counts. Symmetric with `reviewedAt` on the other side of the same
+		// handshake: the reviewer marks the review, the author marks having read it.
+		authorReadAt: text("author_read_at"),
 		// The main revision produced when this submission was merged.
 		mergedRevisionId: text("merged_revision_id"),
 		createdAt: text("created_at").notNull(),
@@ -5215,6 +5296,9 @@ export const knowledgeSubmissions = sqliteTable(
 		index("idx_ks_reviewer_user").on(table.reviewerUserId),
 		index("idx_ks_collection").on(table.collectionId),
 		index("idx_ks_draft").on(table.draftId),
+		// Serves the author's unread-verdict count and the per-row "mark read" update: both
+		// filter on submitter + author_read_at IS NULL.
+		index("idx_ks_submitter_author_read").on(table.submitterUserId, table.authorReadAt),
 	],
 );
 

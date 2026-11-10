@@ -488,6 +488,54 @@
 			"prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
 			"version": "7",
 			"snapshotDigest": "c72a83d718b1d4f06ffe3b3030fdc15a18f7d57aa67657a136f95ec545ff8b1e"
+		},
+		{
+			"idx": 61,
+			"tag": "0061_submission_author_read",
+			"id": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
+			"prevId": "1ebab60c-5206-4565-af03-e1d8342147e0",
+			"version": "7",
+			"snapshotDigest": "6ee0ea437708c2e7d7d59873f16084fed98d57e61226cc6433dbc6a6f6892f3a"
+		},
+		{
+			"idx": 62,
+			"tag": "0062_narrator_workspace_directories",
+			"id": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+			"prevId": "641f6b9e-bce7-41d7-a7ba-448e2a9947d8",
+			"version": "7",
+			"snapshotDigest": "31d3a09f3fdf1de5e444e2b63fe1ab1e775ff1638f78e09dfe3e4eab62b397cb"
+		},
+		{
+			"idx": 63,
+			"tag": "0063_folder-git-identity-bindings",
+			"id": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+			"prevId": "fd3fb1c8-e0f2-48fa-9d39-b8d9c0043ad2",
+			"version": "7",
+			"snapshotDigest": "e5ad93f773a265a6d73fb349d4faec2da9c42df4c20b7f984bf2b589b6bf93c0"
+		},
+		{
+			"idx": 64,
+			"tag": "0064_recent-tab-archive-marks",
+			"id": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
+			"prevId": "3e874b04-2a23-4576-b5b9-ce3c9e3c435e",
+			"version": "7",
+			"snapshotDigest": "35afd24fe71da1b35c8fc9fb75d252f93560e1549c4e18f1bd2594d3057d6f26"
+		},
+		{
+			"idx": 65,
+			"tag": "0065_workspace-auto-title",
+			"id": "0880024e-08f7-4aff-8440-7060586a6aaf",
+			"prevId": "574502c1-4b4e-446a-8c02-1e2dd4beee29",
+			"version": "7",
+			"snapshotDigest": "c487631ef1a8e05d2fabc5fef7a0e002a7c403bd6c2348d764e00df4df886753"
+		},
+		{
+			"idx": 66,
+			"tag": "0066_workspace-outline-title-invalidation",
+			"id": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
+			"prevId": "0880024e-08f7-4aff-8440-7060586a6aaf",
+			"version": "7",
+			"snapshotDigest": "ce03b5a8956b6c97e9d06ed31669097c7b9164e809a6b08f9d1ffa7d21ab8967"
 		}
 	]
 }

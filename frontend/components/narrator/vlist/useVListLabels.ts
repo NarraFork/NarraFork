@@ -307,6 +307,8 @@ export function useVListLabels(): VListLabels {
 
 	const adapterLabels = useMemo<Record<string, string>>(
 		() => ({
+			historyCleared: t("historyCleared"),
+			toolDetailsCleared: t("toolDetailsCleared"),
 			// ── compact / segment-compact indicator lines ───────────────────────────
 			compacting: t("compacting"),
 			compacted: t("compacted"),

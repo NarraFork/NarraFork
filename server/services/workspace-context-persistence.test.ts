@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ZodError } from "zod";
 import { blockIdAt } from "../../tests/block-ids";
+import { readTestMessageContent } from "../../tests/setup";
 import {
 	narratorBlacklistDirs,
 	narratorMessageRefs,
@@ -28,10 +29,10 @@ import { executionPolicyEngine } from "./execution-policy/engine";
 import { applySessionDefaultDevice } from "./narrator-session";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
 import { permissionPolicyChanges } from "./permission-rule-service";
-import { workspaceContextService } from "./workspace-context-service";
+import { getWorkspaceDirectories, workspaceContextService } from "./workspace-context-service";
 
 // Test preload gives this real SQLite DB a temporary, process-isolated home.
-const { db } = await import("../db");
+const { db, sqlite } = await import("../db");
 const { narratorRoutes } = await import("../routes/narrators");
 function app(actor: string) {
 	const routes = new Hono();
@@ -162,7 +163,9 @@ describe("real SQLite workspace CAS", () => {
 		const reminder = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.narratorId, id),
 		});
-		expect(JSON.stringify(reminder?.contentJson)).toContain(join(root, "new"));
+		expect(JSON.stringify(readTestMessageContent(sqlite, reminder?.id ?? ""))).toContain(
+			join(root, "new"),
+		);
 	});
 	test("production HTTP and model device switches publish CAS identities and preserve frozen children", async () => {
 		const devices = [
@@ -185,6 +188,16 @@ describe("real SQLite workspace CAS", () => {
 					})
 				: null,
 		);
+		// A device switch restores that device's own recorded directory; the round trip
+		// below relies on both entries surviving independently.
+		await db
+			.update(narrators)
+			.set({
+				workspaceDirectories: {
+					"remote-fixture": { cwd: "/remote/default", pathFlavor: "posix" },
+				},
+			})
+			.where(eq(narrators.id, id));
 		await db
 			.update(narrators)
 			.set({ apiConversationId: "stable-device-cache" })
@@ -222,7 +235,7 @@ describe("real SQLite workspace CAS", () => {
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({ deviceId }),
 				});
-				expect(response.status).toBe(200);
+				expect(response.status, await response.clone().text()).toBe(200);
 				const contextResponse = await router.request(`/api/narrators/${id}/workspace-context`);
 				expect(contextResponse.status).toBe(200);
 				return await contextResponse.json();
@@ -232,7 +245,7 @@ describe("real SQLite workspace CAS", () => {
 				revision: 1,
 				deviceId: "remote-fixture",
 				cwd: "/remote/default",
-				capabilities: { switchDirectory: false },
+				capabilities: { switchDirectory: true },
 			});
 			expect(remote.git).toBeUndefined();
 			expect(remote.contextKey).not.toBe(initial.contextKey);
@@ -300,16 +313,35 @@ describe("real SQLite workspace CAS", () => {
 			setRemoteBackendResolver(null);
 		}
 	});
-	test("unknown or remote devices without a default cwd never create a local hybrid context", async () => {
+	test("a device without a recorded directory never yields a local hybrid context", async () => {
 		setRemoteBackendResolver((deviceId) =>
 			Object.assign(Object.create(localBackend), { kind: "remote", deviceId, defaultCwd: "" }),
 		);
 		try {
 			await expect(
 				workspaceContextService.switchDevice(id, "no-cwd", { origin: "http" }),
-			).rejects.toThrow("default working directory");
+			).rejects.toMatchObject({
+				statusCode: 409,
+				code: "WORKSPACE_DIRECTORY_REQUIRED",
+				details: { deviceId: "no-cwd" },
+			});
 			expect((await workspaceContextService.get(id)).revision).toBe(0);
-			await db.update(narrators).set({ defaultDeviceId: "offline" }).where(eq(narrators.id, id));
+			// A recorded relative path is refused in that device's own grammar instead of
+			// being resolved against the server's filesystem.
+			await db
+				.update(narrators)
+				.set({
+					workspaceDirectories: { "no-cwd": { cwd: "relative/path", pathFlavor: "posix" } },
+				})
+				.where(eq(narrators.id, id));
+			await expect(
+				workspaceContextService.switchDevice(id, "no-cwd", { origin: "http" }),
+			).rejects.toThrow("absolute");
+			expect((await workspaceContextService.get(id)).revision).toBe(0);
+			await db
+				.update(narrators)
+				.set({ defaultDeviceId: "offline", workspaceDirectories: {} })
+				.where(eq(narrators.id, id));
 			setRemoteBackendResolver(null);
 			const context = await workspaceContextService.get(id);
 			expect(context.deviceId).toBe("offline");
@@ -478,6 +510,80 @@ describe("real SQLite workspace CAS", () => {
 		expect(persisted?.workspaceContext).toEqual(result.current);
 		expect(persisted?.contextProjectId).toBe(projectId);
 		expect(await workspaceContextService.get(id)).toEqual(result.current);
+	});
+	test("every commit keeps cwd, the committed context and the device map in one row", async () => {
+		const devices = [
+			{
+				id: "remote-fixture",
+				slug: "remote-fixture",
+				scope: "global" as const,
+				name: "remote",
+				online: true,
+				defaultCwd: "/remote/default",
+			},
+		];
+		const deviceSpy = spyOn(deviceConnections, "getSessionDevices").mockResolvedValue(devices);
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === "remote-fixture"
+				? Object.assign(Object.create(localBackend), {
+						kind: "remote",
+						deviceId,
+						defaultCwd: "/remote/default",
+						statFile: async (path: string) => ({
+							isDirectory: path === "/remote/work",
+							isFile: false,
+							size: 0,
+						}),
+					})
+				: null,
+		);
+		try {
+			await workspaceContextService.switch(
+				id,
+				{
+					expectedRevision: 0,
+					requestId: generateId(),
+					target: { deviceId: "remote-fixture", cwd: "/remote/work" },
+				},
+				{ origin: "http", userId: owner },
+			);
+			const row = await db.query.narrators.findFirst({ where: eq(narrators.id, id) });
+			expect(row?.cwd).toBe("/remote/work");
+			expect(row?.defaultDeviceId).toBe("remote-fixture");
+			expect(row?.workspaceContext).toMatchObject({
+				revision: row?.workspaceRevision,
+				deviceId: "remote-fixture",
+				cwd: "/remote/work",
+				pathFlavor: "posix",
+			});
+			// The local directory the session left is remembered, so the switch is reversible.
+			expect(row?.workspaceDirectories).toEqual({
+				local: { cwd: join(root, "old"), pathFlavor: "posix" },
+				"remote-fixture": { cwd: "/remote/work", pathFlavor: "posix" },
+			});
+			expect(await getWorkspaceDirectories(id)).toEqual({
+				local: { cwd: join(root, "old"), pathFlavor: "posix" },
+				"remote-fixture": { cwd: "/remote/work", pathFlavor: "posix" },
+			});
+			// A stale CAS must not touch either half of the pair.
+			await expect(
+				workspaceContextService.switch(
+					id,
+					{
+						expectedRevision: 0,
+						requestId: generateId(),
+						target: { deviceId: "local", cwd: join(root, "new") },
+					},
+					{ origin: "http", userId: owner },
+				),
+			).rejects.toMatchObject({ statusCode: 409 });
+			const unchanged = await db.query.narrators.findFirst({ where: eq(narrators.id, id) });
+			expect(unchanged?.workspaceDirectories).toEqual(row?.workspaceDirectories);
+			expect(unchanged?.cwd).toBe("/remote/work");
+		} finally {
+			setRemoteBackendResolver(null);
+			deviceSpy.mockRestore();
+		}
 	});
 	test("racing revision-zero callers have one durable winner, and a stale retry stays 409", async () => {
 		const outcomes = await Promise.allSettled([
@@ -668,11 +774,9 @@ describe("history-only HTTP actions after a workspace switch", () => {
 					? [f.user, f.answer, f.later, f.workspaceReminder]
 					: [f.user, f.answer, f.workspaceReminder],
 			);
-			const remaining = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, f.answer),
-				columns: { contentJson: true },
-			});
-			expect(remaining?.contentJson).toEqual([{ type: "text", text: "keep this text" }]);
+			expect(readTestMessageContent(sqlite, f.answer)).toEqual([
+				{ type: "text", text: "keep this text" },
+			]);
 		}
 		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
 		await assertFiles(f);

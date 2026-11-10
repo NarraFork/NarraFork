@@ -266,6 +266,44 @@ describe("ordinary restart eligibility and tool disposition", () => {
 });
 
 describe("ordinary restart with real persisted recovery records", () => {
+	test("an empty startup hold snapshot skips the second scan, but standalone hydration stays fresh", async () => {
+		await seedNarrator("later-held", { runtimeRegistrationJson: null });
+		const runtime = await import("../agent-runtime/run");
+		const hydration = spyOn(runtime, "hydrateRunHolds");
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(prepared.heldRunIds).toEqual(new Set());
+		expect(hydration).toHaveBeenCalledTimes(1);
+		expect(await recovery.protectHeldRunFacts(emptyProtection(), prepared.heldRunIds)).toEqual(
+			new Set(),
+		);
+		expect(hydration).toHaveBeenCalledTimes(1);
+
+		await db
+			.update(narrators)
+			.set({ substatus: '["taken_over"]' })
+			.where(eq(narrators.id, "later-held"));
+		const fresh = emptyProtection();
+		expect(await recovery.protectHeldRunFacts(fresh)).toEqual(new Set(["later-held"]));
+		expect(fresh.narratorIds.has("later-held")).toBe(true);
+		expect(prepared.heldRunIds).toEqual(new Set());
+		expect(hydration).toHaveBeenCalledTimes(2);
+	});
+
+	test("failed hold hydration is not cached and can be retried", async () => {
+		await seedNarrator("held-retry", {
+			runtimeRegistrationJson: null,
+			substatus: '["taken_over"]',
+		});
+		const runtime = await import("../agent-runtime/run");
+		const hydration = spyOn(runtime, "hydrateRunHolds");
+		hydration.mockRejectedValueOnce(new Error("temporary hold read failure"));
+		await expect(recovery.protectHeldRunFacts(emptyProtection())).rejects.toThrow(
+			"temporary hold read failure",
+		);
+		expect(await recovery.protectHeldRunFacts(emptyProtection())).toEqual(new Set(["held-retry"]));
+		expect(hydration).toHaveBeenCalledTimes(2);
+	});
+
 	test("M5 full startup preserves a held background task and pending permission without notifying its caller", async () => {
 		await seedAgent(true);
 		await seedTool("held-permission", "child", {
@@ -280,14 +318,18 @@ describe("ordinary restart with real persisted recovery records", () => {
 			.where(eq(narrators.id, "child"));
 		const { runtimePublication } = await import("../agent-runtime/publication");
 		runtimePublication.stop();
+		const runtime = await import("../agent-runtime/run");
+		const hydration = spyOn(runtime, "hydrateRunHolds");
 		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
 		expect(prepared.manifest).toBeNull();
+		expect(prepared.heldRunIds).toEqual(new Set(["child"]));
 		expect(prepared.protection.narratorIds.has("child")).toBe(true);
 		expect(prepared.protection.backgroundTaskIds.has("background-child")).toBe(true);
 		expect(prepared.protection.toolCallIds.has("held-permission")).toBe(true);
 		Reflect.deleteProperty(globalThis, Symbol.for("narrafork.narrator.initialized"));
 		try {
-			await session.recoverOnStartup(prepared.protection);
+			await session.recoverOnStartup(prepared.protection, { heldRunIds: prepared.heldRunIds });
+			expect(hydration).toHaveBeenCalledTimes(1);
 			expect(
 				(
 					await db.query.backgroundTasks.findFirst({

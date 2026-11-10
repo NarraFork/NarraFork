@@ -1,6 +1,6 @@
 {
-  "id": "1ebab60c-5206-4565-af03-e1d8342147e0",
-  "prevId": "0a6abc93-0fbc-4dc6-ad81-3b2fda681e9f",
+  "id": "de117d63-10a9-49b7-8df0-f51e4ec920e1",
+  "prevId": "0880024e-08f7-4aff-8440-7060586a6aaf",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -5453,6 +5453,113 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.folder_git_identity_bindings": {
+      "name": "folder_git_identity_bindings",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "folder_id": {
+          "name": "folder_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "identity_id": {
+          "name": "identity_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_folder_git_identity_unique": {
+          "name": "idx_folder_git_identity_unique",
+          "columns": [
+            {
+              "expression": "folder_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_folder_git_identity_user": {
+          "name": "idx_folder_git_identity_user",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "folder_git_identity_bindings_user_id_users_id_fk": {
+          "name": "folder_git_identity_bindings_user_id_users_id_fk",
+          "tableFrom": "folder_git_identity_bindings",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk": {
+          "name": "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk",
+          "tableFrom": "folder_git_identity_bindings",
+          "tableTo": "user_git_identities",
+          "columnsFrom": [
+            "identity_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.gateway_session_mappings": {
       "name": "gateway_session_mappings",
       "schema": "",
@@ -8975,6 +9082,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "author_read_at": {
+          "name": "author_read_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "merged_revision_id": {
           "name": "merged_revision_id",
           "type": "text",
@@ -9111,6 +9224,27 @@
           "columns": [
             {
               "expression": "draft_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ks_submitter_author_read": {
+          "name": "idx_ks_submitter_author_read",
+          "columns": [
+            {
+              "expression": "submitter_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "author_read_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -15001,6 +15135,13 @@
           "primaryKey": false,
           "notNull": false
         },
+        "workspace_directories": {
+          "name": "workspace_directories",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::text"
+        },
         "error_message": {
           "name": "error_message",
           "type": "text",
@@ -19820,6 +19961,98 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.recent_tab_archive_marks": {
+      "name": "recent_tab_archive_marks",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "folder_id": {
+          "name": "folder_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "archived_at": {
+          "name": "archived_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_recent_tab_archive_mark": {
+          "name": "idx_recent_tab_archive_mark",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "recent_tab_archive_marks_user_id_users_id_fk": {
+          "name": "recent_tab_archive_marks_user_id_users_id_fk",
+          "tableFrom": "recent_tab_archive_marks",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "recent_tab_archive_marks_narrator_id_narrators_id_fk": {
+          "name": "recent_tab_archive_marks_narrator_id_narrators_id_fk",
+          "tableFrom": "recent_tab_archive_marks",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.registration_codes": {
       "name": "registration_codes",
       "schema": "",
@@ -24494,6 +24727,13 @@
           "notNull": true,
           "default": false
         },
+        "git_identity_folder_context_menu": {
+          "name": "git_identity_folder_context_menu",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "spec_tab_layout": {
           "name": "spec_tab_layout",
           "type": "text",
@@ -25729,6 +25969,33 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_workspace_panels_kind_workspace": {
+          "name": "idx_workspace_panels_kind_workspace",
+          "columns": [
+            {
+              "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "workspace_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -26019,6 +26286,20 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "title_source": {
+          "name": "title_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'manual'"
+        },
+        "title_revision": {
+          "name": "title_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "tree": {
           "name": "tree",

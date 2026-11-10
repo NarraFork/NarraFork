@@ -20,6 +20,7 @@
 
 import type { Database } from "bun:sqlite";
 import { parseStored } from "@shared/narrator-blocks/plan";
+import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { assembleContent } from "@shared/narrator-blocks/storage";
 import { assembledBodyLengthSql } from "./narrator-body-length";
 
@@ -45,11 +46,12 @@ export function hasBlockStorage(db: Database): boolean {
 /**
  * Whether a block-format body keeps its `content_json` projection with rows-only writes on:
  * a compact marker (compact, plan, clear, segment compact), whose lifecycle is read from
- * the column (the `compact_pending` column behind startup recovery and fork exclusion).
+ * the column (the `compact_pending` column behind startup recovery and fork exclusion),
+ * or a retention fence, which late/checkpoint writers must check without reading a large body.
  */
 export function keepsProjection(content: unknown[]): boolean {
 	const type = (content[0] as { type?: unknown } | undefined)?.type;
-	return type === "compact" || type === "segment_compact";
+	return type === "compact" || type === "segment_compact" || isHistoryProtectedContent(content);
 }
 
 /**

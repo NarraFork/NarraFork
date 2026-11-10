@@ -9,6 +9,15 @@ import {
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
+import {
+	inferWorkspacePathFlavor,
+	isAbsoluteForFlavor,
+	normalizeWorkspacePathFlavor,
+	parseWorkspaceDirectoryMap,
+	type WorkspaceDirectoryMap,
+	type WorkspacePathFlavor,
+	withDeviceDirectory,
+} from "@shared/workspace-directories";
 import { and, desc, eq, gt, inArray, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -32,8 +41,11 @@ import {
 	projects,
 	terminals,
 	terminalViewState,
+	workspacePanels,
+	workspaces,
 } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
+import { resolveBackend } from "../lib/agent/execution/registry";
 import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS,
 	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
@@ -1381,6 +1393,9 @@ async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect
 		workspaceContext: committedContext
 			? { ...committedContext, revision: 0, contextProjectId: contextProjectId ?? undefined }
 			: null,
+		// A fork may switch devices, so it carries the parent's per-device directories
+		// instead of starting with an empty map the picker would read as "unconfigured".
+		workspaceDirectories: parseWorkspaceDirectoryMap(parent.workspaceDirectories),
 		aclRootNarratorId: parent.aclRootNarratorId,
 		enabledTools: parent.enabledTools,
 		isAskInPassing: parent.isAskInPassing,
@@ -1523,6 +1538,7 @@ export async function prepareNarratorCreation(
 			contextProjectId: input.contextProjectId ?? null,
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
 			defaultDeviceId: input.defaultDeviceId ?? null,
+			workspaceDirectories: initialWorkspaceDirectories(input),
 			ownerUserId: input.ownerUserId ?? null,
 			...resolveNarratorAudiences(
 				input.visibility,
@@ -1548,7 +1564,7 @@ export async function prepareNarratorCreation(
 
 type CreationWorkspace = Pick<
 	typeof narrators.$inferInsert,
-	"contextProjectId" | "cwd" | "workspaceContext" | "defaultDeviceId"
+	"contextProjectId" | "cwd" | "workspaceContext" | "workspaceDirectories" | "defaultDeviceId"
 >;
 const preparedWorkspaceAdmissions = new WeakMap<
 	PreparedNarratorCreation,
@@ -1560,8 +1576,40 @@ function creationWorkspaceFields(row: CreationWorkspace): string {
 		row.cwd ?? null,
 		row.defaultDeviceId ?? null,
 		row.workspaceContext ?? null,
+		row.workspaceDirectories ?? null,
 	]);
 }
+
+/** Path grammar of a device, as far as it can be known before a handshake. */
+function workspacePathFlavorForDevice(deviceId: string, cwd?: string): WorkspacePathFlavor {
+	if (deviceId === "local") return normalizeWorkspacePathFlavor(localPathSemantics.flavor);
+	try {
+		return normalizeWorkspacePathFlavor(resolveBackend({ requested: deviceId }).pathFlavor);
+	} catch {
+		return cwd ? inferWorkspacePathFlavor(cwd) : "posix";
+	}
+}
+
+/**
+ * Seed the per-device directory map for a creation on a remote device.
+ *
+ * A local creation needs nothing here: `cwd` + `defaultDeviceId` are read as the
+ * local entry. A remote one must be explicit, because `cwd` never meant "a remote
+ * directory" before this map existed, so the picker would otherwise consider the
+ * device unconfigured on the session it was just created on.
+ */
+function initialWorkspaceDirectories(
+	input: Pick<CreateNarratorInput, "cwd" | "defaultDeviceId">,
+): WorkspaceDirectoryMap | undefined {
+	const cwd = input.cwd?.trim();
+	const deviceId = input.defaultDeviceId?.trim();
+	if (!cwd || !deviceId || deviceId === "local") return undefined;
+	return withDeviceDirectory({}, deviceId, {
+		cwd,
+		pathFlavor: workspacePathFlavorForDevice(deviceId, cwd),
+	});
+}
+
 export async function narratorCreationWorkspaceTarget(
 	row: CreationWorkspace,
 ): Promise<LifecycleTarget[]> {
@@ -1574,10 +1622,23 @@ export async function narratorCreationWorkspaceTarget(
 				.limit(1)
 				.get()
 		: undefined;
-	const cwd = resolveNarratorSessionCwd(row.cwd, project?.path, getHome());
-	const deviceId = !localPathSemantics.isAbsolute(cwd)
-		? (row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local")
-		: "local";
+	// The row's own device decides the path grammar. A remote Windows `C:\…` is not a
+	// relative path, and a remote POSIX `/srv/app` is not this server's directory —
+	// checking with the host's grammar got both of those wrong.
+	const requestedDeviceId = row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local";
+	const flavor = workspacePathFlavorForDevice(
+		requestedDeviceId,
+		row.cwd ?? row.workspaceContext?.cwd ?? undefined,
+	);
+	const explicitCwd = row.cwd?.trim();
+	const remoteCwd =
+		requestedDeviceId !== "local" && explicitCwd && isAbsoluteForFlavor(explicitCwd, flavor)
+			? explicitCwd
+			: null;
+	// Everything else (empty, relative, or a path that only makes sense here) stays a
+	// local claim, resolved from the project/home exactly as before.
+	const cwd = remoteCwd ?? resolveNarratorSessionCwd(row.cwd, project?.path, getHome());
+	const deviceId = remoteCwd ? requestedDeviceId : "local";
 	const target = await canonicalWorkspaceAdmissionTarget({
 		deviceId,
 		// Match the trusted local backend's lexical base for old relative cwd rows.
@@ -2393,6 +2454,20 @@ export const narratorService = {
 				tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds)).run();
 			}
 
+			// Invalidate generated workspace candidates before the panel FK cascade removes
+			// the only index telling us which workspaces contained this narrator.
+			tx.update(workspaces)
+				.set({ titleRevision: sql`${workspaces.titleRevision} + 1` })
+				.where(
+					inArray(
+						workspaces.id,
+						tx
+							.select({ id: workspacePanels.workspaceId })
+							.from(workspacePanels)
+							.where(eq(workspacePanels.narratorId, narratorId)),
+					),
+				)
+				.run();
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});

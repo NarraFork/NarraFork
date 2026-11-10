@@ -53,6 +53,8 @@ interface RestartManifest {
 export interface RestartStartupRecovery {
 	manifest: RestartManifest | null;
 	protection: ToolContinuationProtectionSets;
+	/** This cold-start pass only; never persisted or reused for a later explicit hydration. */
+	heldRunIds?: ReadonlySet<string>;
 }
 const processState = hotSafe("restart-recovery", () => ({
 	prepared: false,
@@ -289,9 +291,13 @@ export function mergeStartupProtection(
 /** A restored user hold protects facts, not permission to automatically execute them. */
 export async function protectHeldRunFacts(
 	protection: ToolContinuationProtectionSets,
+	hydratedRunIds?: ReadonlySet<string>,
 ): Promise<Set<string>> {
-	const { hydrateRunHolds } = await import("./agent-runtime/run");
-	const held = await hydrateRunHolds();
+	// Share only the snapshot explicitly passed by this cold-start orchestration. A later
+	// standalone caller must still read current durable holds, including newly taken-over runs.
+	const held = hydratedRunIds
+		? new Set(hydratedRunIds)
+		: await import("./agent-runtime/run").then(({ hydrateRunHolds }) => hydrateRunHolds());
 	for (const id of held) {
 		protection.narratorIds.add(id);
 		for (let after = ""; ; ) {
@@ -363,6 +369,7 @@ export async function prepareOrdinaryRestartRecovery(
 	if (processState.prepared) return empty; // Hot reload must not mount duplicate runtimes.
 	processState.prepared = true;
 	const held = await protectHeldRunFacts(empty.protection);
+	empty.heldRunIds = held;
 	const saved = await readManifest();
 	// A v3 planned root already owns this source; never load the ordinary file a second time.
 	const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
@@ -648,12 +655,12 @@ export async function prepareOrdinaryRestartRecovery(
 		toolCount: protection.toolCallIds.size,
 		automaticResume: automaticResumeEnabled(),
 	});
-	const prepared = { manifest, protection };
+	const prepared = { manifest, protection, heldRunIds: held };
 	if (!automaticResumeEnabled()) {
 		processState.pausedRecovery = prepared;
 		// A disabled recovery has no runtime owner: show an honest interrupted/resting state,
 		// while keeping permission/tool records protected and available for a manual resume.
-		return { manifest, protection: { ...protection, narratorIds: held } };
+		return { manifest, protection: { ...protection, narratorIds: held }, heldRunIds: held };
 	}
 	return prepared;
 }

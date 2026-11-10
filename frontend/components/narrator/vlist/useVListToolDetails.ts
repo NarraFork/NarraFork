@@ -28,6 +28,7 @@ import {
 	toolCallDetailQueryKey,
 } from "@frontend/lib/api/narrators";
 import type { AdapterContext } from "@shared/pretext-layout/segment-adapter";
+import { clearedToolOutput, isClearedToolOutput } from "@shared/storage-retention";
 import { useQueries } from "@tanstack/react-query";
 import { useCallback, useMemo, useRef } from "react";
 import type { VListDataSource } from "./vlist-data-source";
@@ -35,12 +36,17 @@ import type { VListDataSource } from "./vlist-data-source";
 /** Max detail records fetched concurrently, so one screen cannot storm the API. */
 const MAX_CONCURRENT_FETCHES = 6;
 
-/** Cache lifetime — a completed tool call's payload is immutable. */
+/** Completed payloads are cached, but a cleanup tombstone always supersedes them. */
 const DETAIL_CACHE_MS = 10 * 60 * 1000;
 
 export interface VListFullToolPayload {
 	inputJson?: unknown;
 	outputJson?: unknown;
+	payloadCleared?: boolean;
+}
+
+function clearedPayload(data: VListFullToolPayload | undefined): boolean {
+	return data?.payloadCleared === true || isClearedToolOutput(data?.outputJson);
 }
 
 export interface VListToolDetailRequest extends ToolCallDetailRef {
@@ -88,7 +94,7 @@ export function toolDetailIdentityKey(toolUseId: string, ref?: ToolCallDetailRef
 }
 
 export type ToolDetailQueryResult = {
-	data?: { inputJson?: unknown; outputJson?: unknown } | undefined;
+	data?: VListFullToolPayload | undefined;
 	isError?: boolean;
 };
 
@@ -107,7 +113,7 @@ export function buildToolDetailStatusRevision(
 }
 
 /**
- * Which exact identity keys currently have a settled payload, as a plain string.
+ * Which exact identities have settled payloads or cleanup tombstones, as a plain string.
  *
  * This is what `combine` returns, and it must contain NO functions and no fresh
  * object identities. React Query stabilizes a combined result with
@@ -128,15 +134,21 @@ export function buildToolDetailRevision(
 	retainedIds: readonly string[],
 	identityKeys: readonly string[],
 	results: readonly ToolDetailQueryResult[],
+	clearedIds: readonly string[] = [],
 ): string {
 	const settled = new Set(retainedIds);
+	const cleared = new Set(clearedIds);
 	identityKeys.forEach((toolUseId, index) => {
-		if (results[index]?.data) settled.add(toolUseId);
+		const data = results[index]?.data;
+		if (data) settled.add(toolUseId);
+		if (clearedPayload(data)) cleared.add(toolUseId);
 	});
 	// Sorted so the revision tracks the SET of known payloads, not the order the
 	// shell happened to request them in (a scroll reorders the list without
 	// changing what is available, and must not move the revision).
-	return JSON.stringify([...settled].sort());
+	return JSON.stringify(
+		[...settled].sort().map((key) => (cleared.has(key) ? [key, "cleared"] : key)),
+	);
 }
 
 /**
@@ -161,7 +173,18 @@ export function mergeToolDetailPayloads(
 	let merged: Map<string, VListFullToolPayload> | null = null;
 	identityKeys.forEach((toolUseId, index) => {
 		const data = results[index]?.data;
-		if (!data || retained.has(toolUseId)) return;
+		if (!data || clearedPayload((merged ?? retained).get(toolUseId))) return;
+		if (clearedPayload(data)) {
+			if (!merged) merged = new Map(retained);
+			const at = (data.outputJson as { _payloadClearedAt?: unknown } | null)?._payloadClearedAt;
+			// Retain the small tombstone, never replay-only input or stale hydrated output.
+			merged.set(toolUseId, {
+				payloadCleared: true,
+				outputJson: clearedToolOutput(typeof at === "string" ? at : ""),
+			});
+			return;
+		}
+		if (retained.has(toolUseId)) return;
 		if (!merged) merged = new Map(retained);
 		merged.set(toolUseId, { inputJson: data.inputJson, outputJson: data.outputJson });
 	});
@@ -209,7 +232,12 @@ export function useVListToolDetails(
 			const merged = mergeToolDetailPayloads(payloads.current, wantedKeys, results);
 			payloads.current = merged;
 			return {
-				revision: buildToolDetailRevision([...merged.keys()], wantedKeys, results),
+				revision: buildToolDetailRevision(
+					[...merged.keys()],
+					wantedKeys,
+					results,
+					[...merged].filter(([, value]) => clearedPayload(value)).map(([key]) => key),
+				),
 				statusRevision: buildToolDetailStatusRevision(wantedKeys, results),
 			};
 		},

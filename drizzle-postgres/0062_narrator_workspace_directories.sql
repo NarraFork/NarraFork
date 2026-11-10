@@ -1,0 +1,1 @@
+ALTER TABLE "narrators" ADD COLUMN "workspace_directories" text DEFAULT '{}'::text NOT NULL;

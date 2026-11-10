@@ -43,6 +43,7 @@ import {
 	sideCarBodyToPlainText,
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
+import { isClearedToolOutput } from "../storage-retention";
 import { subagentResultText } from "../subagent-result-text";
 import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
 
@@ -326,6 +327,7 @@ export interface AdapterToolItem {
 		status?: string | null;
 		inputJson?: unknown;
 		outputJson?: unknown;
+		payloadCleared?: boolean;
 		toolUseId?: string;
 		/** Subagent activity summary (drives recent-calls rows on subagent cards). */
 		_subagentActivity?: {
@@ -510,6 +512,7 @@ function isTerminalStatus(status?: string | null): boolean {
  * those through `_hints` / a preview scan, hence the injection.
  */
 function toolSummary(tc: AdapterToolItem["tc"], ctx?: AdapterContext): string {
+	if (toolPayloadCleared(tc)) return sysLabel(ctx ?? { lod: 5 }, "toolDetailsCleared");
 	const resolved = ctx?.resolveToolSummary?.(tc);
 	if (typeof resolved === "string") return resolved;
 	const input = (tc.inputJson ?? {}) as Record<string, unknown>;
@@ -2248,6 +2251,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// like every other composed string: without one, `sysLabel` returns the raw key and
 	// the reader would see the literal "empty" in the bubble.
 	empty: "(empty)",
+	toolDetailsCleared: "Tool-call details cleared",
 	specProtectedBadge: "Protected",
 	specGoalAddedBadge: "Goal added",
 	specGoalExistsBadge: "Already tracked",
@@ -4050,8 +4054,11 @@ function adaptToolItemFull(
 	ctx: AdapterContext,
 	runContext: ToolRunContext = { inRun: false, isLast: true, isSoleSubagent: false },
 ): ElementSpec {
-	const isCommunication = isCommunicationTool(item.tc);
-	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
+	item = visibleToolItem(item, ctx);
+	const cleared = item.tc.payloadCleared === true;
+	const isCommunication = !cleared && isCommunicationTool(item.tc);
+	const hasPendingPermission =
+		!cleared && (ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false);
 	// Approval controls only mount on a generic tool card. Once the decision lands,
 	// the same tool identity becomes its conversation bubble, never a subagent card.
 	if (isCommunication && !hasPendingPermission) return adaptCommunicationBubble(item, ctx);
@@ -4072,7 +4079,7 @@ function adaptToolItemFull(
 	// exactly the L5 bug `userCollapsed` was introduced to fix. `collapsesByLod`
 	// must stay false so the header toggle writes `expanded` rather than
 	// `lodUserOverride` (the override channel FORCE-expands and cannot fold).
-	const preferOpen = isPreferOpenTool(item.tc);
+	const preferOpen = !cleared && isPreferOpenTool(item.tc);
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -4397,6 +4404,8 @@ function buildToolCardData(
 	runContext: ToolRunContext,
 	hasPendingPermission: boolean,
 ): unknown {
+	item = visibleToolItem(item);
+	if (item.tc.payloadCleared) return clearedToolCardData(item, ctx, runContext);
 	// category drives measure-tool-call's default-open (→ height). Resolved
 	// via the injected authoritative resolver; "generic" when absent.
 	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic";
@@ -4927,7 +4936,75 @@ const completedEditInputs = new WeakMap<
 	WeakMap<object, { context: string; value: unknown }>
 >();
 
+function toolPayloadCleared(source: Record<string, unknown>): boolean {
+	return (
+		source.payloadCleared === true ||
+		isClearedToolOutput(source.outputJson) ||
+		isClearedToolOutput(source.output)
+	);
+}
+
+/** A current block's tombstone wins over an already-hydrated, pre-cleanup relation. */
+function isClearedToolItem(item: AdapterToolItem): boolean {
+	if (toolPayloadCleared(item.tc)) return true;
+	const block = messageBody(item.msg)[item.blockIndex];
+	return block?.type === "tool_use" && block.id === item.tc.toolUseId && toolPayloadCleared(block);
+}
+
+/** One display boundary for every tool kind; never carry ledger-only data into a spec. */
+function visibleToolItem(item: AdapterToolItem, ctx?: AdapterContext): AdapterToolItem {
+	const cleared = isClearedToolItem(item);
+	// A fetched tombstone is authoritative too. Inspect output before any input
+	// hydration or specialized renderer; known row tombstones call neither resolver.
+	const cachedCleared =
+		!cleared &&
+		hasTruncatedLeaf(item.tc.outputJson) &&
+		isClearedToolOutput(
+			ctx?.resolveFullToolOutput?.(item.tc.toolUseId, resolveToolDetailRef(item)),
+		);
+	if (!cleared && !cachedCleared) return item;
+	return {
+		...item,
+		isSubagent: false,
+		tc: {
+			id: item.tc.id,
+			messageId: item.tc.messageId,
+			executionAttempt: item.tc.executionAttempt,
+			toolUseId: item.tc.toolUseId,
+			toolName: item.tc.toolName,
+			status: item.tc.status,
+			...toolTimingStamps(item.tc),
+			...(typeof item.tc.durationMs === "number" ? { durationMs: item.tc.durationMs } : {}),
+			payloadCleared: true,
+			inputJson: null,
+			outputJson: null,
+		},
+	};
+}
+
+function clearedToolCardData(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+	runContext: ToolRunContext,
+) {
+	return {
+		toolName: item.tc.toolName,
+		summary: sysLabel(ctx, "toolDetailsCleared"),
+		status: item.tc.status ?? "success",
+		isStreaming: false,
+		inRun: runContext.inRun,
+		isLast: runContext.isLast,
+		category: "generic",
+		payloadCleared: true,
+		toolUseId: item.tc.toolUseId,
+		toolDetailRef: resolveToolDetailRef(item),
+		...cardTiming(item.tc),
+		detail: null,
+	};
+}
+
 function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
+	if (isClearedToolItem(item)) return null;
 	if (
 		!ctx.resolveFullToolInput ||
 		(item.tc.toolName !== "Write" && !hasTruncatedLeaf(item.tc.inputJson))
@@ -4998,6 +5075,7 @@ function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
 
 /** Full (un-truncated) tool output once the shell has fetched it. */
 function withFullOutput(item: AdapterToolItem, ctx: AdapterContext): unknown {
+	if (isClearedToolItem(item)) return null;
 	if (!ctx.resolveFullToolOutput || !hasTruncatedLeaf(item.tc.outputJson))
 		return item.tc.outputJson;
 	return (
@@ -5072,15 +5150,20 @@ function toolTraceItem(
 	expanded = false,
 	queuedBehindUpstream = false,
 ): AdapterTraceItem {
+	item = visibleToolItem(item, ctx);
+	const cleared = item.tc.payloadCleared === true;
 	const summary = toolSummary(item.tc, ctx);
 	const name = item.tc.toolName === "Task" ? "Agent" : item.tc.toolName;
-	const rawTitle = ctx.resolveToolTitle?.(item.tc) ?? (summary ? `${name} · ${summary}` : name);
+	const fallbackTitle = summary ? `${name} · ${summary}` : name;
+	const rawTitle = cleared ? fallbackTitle : (ctx.resolveToolTitle?.(item.tc) ?? fallbackTitle);
 	// Only a real, identifiable tool call can be drilled into: the card's detail
 	// classification and its on-demand payload fetch are both keyed by tool use id.
 	const canDrillDown = !!item.tc.toolUseId;
 	// The gate's own status, read with the same live-wins precedence the card uses.
-	const reflectionStatus = resolveToolReflectionStatus(item, ctx);
-	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson);
+	const reflectionStatus = cleared ? undefined : resolveToolReflectionStatus(item, ctx);
+	const category = cleared
+		? "generic"
+		: ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson);
 	// The figure the row PAINTS, which is not always `timing.durationMs`: for bash
 	// that field absorbs permission / reflection / queue waiting, and a 1.2s command
 	// that waited 19s on a gate read as a 20s command. Same shared rule the card
@@ -5090,7 +5173,7 @@ function toolTraceItem(
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
-		iconColor: ctx.resolveToolColor?.(item.tc.toolName, item.tc.inputJson),
+		iconColor: cleared ? "gray" : ctx.resolveToolColor?.(item.tc.toolName, item.tc.inputJson),
 		toolName: item.tc.toolName,
 		category,
 		key: toolItemKey(item),

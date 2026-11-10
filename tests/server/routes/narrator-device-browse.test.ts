@@ -11,9 +11,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	DEVICE_BROWSE_FORBIDDEN_MESSAGE,
 	isDeviceBrowsePathWithinNarratorScope,
+	isRemoteDeviceBrowsePathWithinNarratorScope,
 } from "@server/routes/narrators";
 
 const WORKSPACE = "/remote/work";
@@ -165,5 +169,68 @@ describe("non-admin device browse scope", () => {
 		// the refusal must not vary with the requested path.
 		expect(DEVICE_BROWSE_FORBIDDEN_MESSAGE).not.toContain("/");
 		expect(DEVICE_BROWSE_FORBIDDEN_MESSAGE).toContain("administrators");
+	});
+
+	test("resolves real symlinks before allowing a listing and still permits normal children", async () => {
+		const fixture = await mkdtemp(join(tmpdir(), "narrator-device-browse-"));
+		try {
+			const workspace = join(fixture, "workspace");
+			const child = join(workspace, "src");
+			const outside = join(fixture, "outside");
+			await mkdir(child, { recursive: true });
+			await mkdir(outside);
+			await symlink(outside, join(workspace, "escape"), "dir");
+			await symlink(child, join(workspace, "source-link"), "dir");
+			const target = (path: string) => ({
+				path,
+				defaultCwd: workspace,
+				pathFlavor: "posix" as const,
+				sep: "/",
+			});
+			const scope = (path: string) => ({
+				deviceId: "posix-device",
+				target: target(path),
+				defaultCwd: workspace,
+				rules: [],
+			});
+			const resolvePath = async (_deviceId: string, path: string) => realpath(path);
+
+			await expect(
+				isRemoteDeviceBrowsePathWithinNarratorScope(scope(join(workspace, "escape")), resolvePath),
+			).resolves.toBe(false);
+			await expect(
+				isRemoteDeviceBrowsePathWithinNarratorScope(scope(child), resolvePath),
+			).resolves.toBe(true);
+			// A link that resolves back inside the same root remains a valid child.
+			await expect(
+				isRemoteDeviceBrowsePathWithinNarratorScope(
+					scope(join(workspace, "source-link")),
+					resolvePath,
+				),
+			).resolves.toBe(true);
+		} finally {
+			await rm(fixture, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed when the device cannot provide canonical paths", async () => {
+		await expect(
+			isRemoteDeviceBrowsePathWithinNarratorScope(
+				{
+					deviceId: "legacy-device",
+					target: {
+						path: "/remote/work/src",
+						defaultCwd: WORKSPACE,
+						pathFlavor: "posix",
+						sep: "/",
+					},
+					defaultCwd: WORKSPACE,
+					rules: [],
+				},
+				async () => {
+					throw new Error("canonical fs.stat unavailable");
+				},
+			),
+		).resolves.toBe(false);
 	});
 });

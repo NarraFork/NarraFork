@@ -1428,7 +1428,7 @@ withBackgroundOccupancyInitialization(
 		for (const target of ordinaryRestart.manifest?.targets ?? [])
 			startupRecoveryNarratorIds.add(target.narratorId);
 		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
-		await recoverNarrators(protection);
+		await recoverNarrators(protection, { heldRunIds: ordinaryRestart.heldRunIds });
 		return { plannedUpdate, ordinaryRestart };
 	},
 	activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
@@ -1465,6 +1465,9 @@ withBackgroundOccupancyInitialization(
 					error: err instanceof Error ? err.message : String(err),
 				}),
 			);
+		void import("./services/storage-history-runtime")
+			.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
+			.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
 		if (completions.length) {
 			Promise.all(completions)
 				.then(() => {

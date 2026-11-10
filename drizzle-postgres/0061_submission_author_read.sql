@@ -1,0 +1,2 @@
+ALTER TABLE "knowledge_submissions" ADD COLUMN "author_read_at" text;--> statement-breakpoint
+CREATE INDEX "idx_ks_submitter_author_read" ON "knowledge_submissions" USING btree ("submitter_user_id","author_read_at");
