@@ -701,6 +701,8 @@ export const narrators = sqliteTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		// Startup recovery and legacy backfills look up active/legacy rows by status.
+		index("idx_narrators_status").on(table.status),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
 		index("idx_narrators_owner").on(table.ownerUserId),
 		// Leads the visibility predicate pushed down into the paginated list query.

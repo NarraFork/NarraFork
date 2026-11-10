@@ -328,6 +328,7 @@ export const narrators = pgTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		index("idx_narrators_status").on(table.status),
 		index("idx_narrators_owner").on(table.ownerUserId),
 		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_write_audience").on(table.writeAudience),
@@ -6292,6 +6293,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_origin_tool_call",
           "columns": [
             "originToolCallId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_status",
+          "columns": [
+            "status"
           ],
           "unique": false
         },
