@@ -57,6 +57,8 @@ function emailDomainAllowed(provider: OidcProviderConfig, email: string | undefi
 export interface SsoIdentitySummary {
 	id: string;
 	provider: string;
+	/** The provider's own identifier for this account. Shown for directory bindings. */
+	subject: string;
 	email: string | null;
 	displayName: string | null;
 	lastLoginAt: string | null;
@@ -214,6 +216,7 @@ export const ssoService = {
 		return rows.map((r) => ({
 			id: r.id,
 			provider: r.provider,
+			subject: r.subject,
 			email: r.email,
 			displayName: r.displayName,
 			lastLoginAt: r.lastLoginAt,

@@ -67,10 +67,17 @@ export interface SsoProvider {
 	name: string;
 }
 
-/** A user's linked SSO identity. */
+/**
+ * A user's linked external identity.
+ *
+ * A `provider` starting with `ldap:` means this is the account's directory login rather
+ * than a federation link: it cannot be unlinked, because doing so would lock the person out.
+ */
 export interface SsoIdentity {
 	id: string;
 	provider: string;
+	/** The provider's own identifier for this account (the directory login name for LDAP). */
+	subject: string;
 	email: string | null;
 	displayName: string | null;
 	lastLoginAt: string | null;
@@ -96,9 +103,48 @@ export interface AdminWebauthnConfig {
 	origins?: string[];
 }
 
+/**
+ * The single LDAP / Active Directory directory used as a credential provider.
+ *
+ * Only a credential source: the local account stays the authorization record, so this
+ * block carries connection details and attribute mapping — never a role or a policy
+ * about who may sign in (that is the registration switch).
+ */
+export interface AdminLdapConfig {
+	enabled: boolean;
+	url: string;
+	startTls?: boolean;
+	tlsRejectUnauthorized?: boolean;
+	connectTimeoutMs?: number;
+	timeoutMs?: number;
+	mode?: "search" | "direct";
+	bindDn?: string;
+	/** Arrives masked on read; empty or masked on write keeps the stored value. */
+	bindPassword?: string;
+	searchBase?: string;
+	searchScope?: "sub" | "one" | "base";
+	searchFilter?: string;
+	bindDnTemplate?: string;
+	usernameAttribute?: string;
+	emailAttribute?: string;
+	displayNameAttribute?: string;
+}
+
+/** Where a connection probe stopped; mirrors the server's `LdapProbeStage`. */
+export type LdapProbeStage = "config" | "connect" | "service_bind" | "search" | "user_bind" | "ok";
+
+export interface LdapProbeResult {
+	stage: LdapProbeStage;
+	ok: boolean;
+	message: string;
+	user?: { dn: string; id: string; email?: string; displayName?: string };
+}
+
 export interface AdminAuthConfig {
 	oidcProviders: AdminOidcProvider[];
 	webauthn: AdminWebauthnConfig | null;
+	/** `null` when the instance has no directory configured. */
+	ldap?: AdminLdapConfig | null;
 }
 
 /** A single-use registration code as shown in the admin list (never the plaintext). */
@@ -297,13 +343,26 @@ export const authApi = {
 	unlinkIdentity: (id: string) =>
 		request<{ ok: boolean }>(`/auth/me/identities/${id}`, { method: "DELETE" }),
 
-	// === Admin: instance auth configuration (OIDC + WebAuthn) ===
+	// === Admin: instance auth configuration (LDAP + OIDC + WebAuthn) ===
 
 	getAuthConfig: () => request<AdminAuthConfig>("/admin/auth-config"),
 	updateAuthConfig: (config: AdminAuthConfig) =>
 		request<AdminAuthConfig>("/admin/auth-config", {
 			method: "PATCH",
 			body: JSON.stringify(config),
+		}),
+
+	/**
+	 * Probe the directory configuration, optionally with a test account.
+	 *
+	 * `config` carries unsaved form values so an admin can find out whether the settings
+	 * work before committing them; the server inherits the stored service password when
+	 * the submitted one is empty or masked.
+	 */
+	testLdap: (input: { config?: AdminLdapConfig; username?: string; password?: string }) =>
+		request<LdapProbeResult>("/admin/ldap/test", {
+			method: "POST",
+			body: JSON.stringify(input),
 		}),
 
 	// Avatar

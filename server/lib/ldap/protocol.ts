@@ -7,18 +7,13 @@
  */
 import type { LdapSettings } from "../settings/types";
 
-/**
- * Prefix shared by every directory-bound `user_identities.provider` value.
- *
- * The colon is deliberate: OIDC provider ids are validated against
- * `^[a-z0-9][a-z0-9_-]*$`, so no configured SSO provider id can ever start with it —
- * which is what lets the identity list treat `ldap:` bindings differently from
- * federation links without a per-row lookup.
- */
-export const LDAP_PROVIDER_PREFIX = "ldap:";
-
-/** `user_identities.provider` for the single configured directory. */
-export const LDAP_PROVIDER_ID = `${LDAP_PROVIDER_PREFIX}default`;
+// The identity-provider constants are shared with the UI; re-exported here so the LDAP
+// layer keeps one import surface for callers.
+export {
+	isDirectoryIdentityProvider,
+	LDAP_PROVIDER_ID,
+	LDAP_PROVIDER_PREFIX,
+} from "@shared/identity-providers";
 
 export const LDAP_DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 export const LDAP_DEFAULT_TIMEOUT_MS = 5_000;

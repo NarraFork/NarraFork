@@ -149,6 +149,8 @@
 	"ssoCodeInvalid": "此 SSO 登录链接已过期，请重新登录。",
 	"ssoDomainDenied": "你的邮箱域名不被允许通过 SSO 登录。",
 	"ssoSignupDisabled": "没有账户关联到此身份。请联系管理员开启注册，或先关联你的账户。",
+	"ldapUnavailable": "目录服务器暂时不可用，请稍后重试或联系管理员。",
+	"ldapAccountRequired": "目录已确认你的密码，但本实例没有你的账户且注册已关闭。请联系管理员创建账户。",
 	"or": "或",
 	"adminPanel": "管理面板",
 	"registrationSettings": "注册设置",

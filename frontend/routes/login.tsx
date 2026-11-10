@@ -59,6 +59,11 @@ function mapAuthErrorCode(e: ApiError): string | null {
 		SSO_CODE_INVALID: "ssoCodeInvalid",
 		SSO_DOMAIN_DENIED: "ssoDomainDenied",
 		SSO_SIGNUP_DISABLED: "ssoSignupDisabled",
+		// The directory answered "valid password" but this instance has no account for the
+		// person and registration is closed; a 401 would send them hunting for a password.
+		LDAP_ACCOUNT_REQUIRED: "ldapAccountRequired",
+		// An outage, not a wrong password.
+		LDAP_UNAVAILABLE: "ldapUnavailable",
 		REGISTRATION_CLOSED: "registrationClosedError",
 		REGISTRATION_THROTTLED: retryAfter ? "registrationThrottledRetry" : "registrationThrottled",
 		USERNAME_TAKEN: "usernameTaken",
