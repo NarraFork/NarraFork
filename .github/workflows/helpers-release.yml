@@ -66,6 +66,8 @@ jobs:
         with:
           bun-version: 1.4.3
       - name: Install trusted control dependencies without lifecycle scripts
+        env:
+          BUN_CONFIG_REGISTRY: https://registry.npmjs.org
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Freeze exact existing tag and source
         id: plan
