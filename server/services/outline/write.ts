@@ -3780,6 +3780,8 @@ async function writePrepared(
 			pageIds: planned.pageIds,
 			actorKind: commit.actorKind,
 			actorId: commit.actorId,
+			// An agent's write names its session even when the caller left `narratorId` out.
+			narratorId: commit.narratorId ?? (commit.actorKind === "agent" ? commit.actorId : null),
 		});
 		const pendingPages = new Set(planned.pendingPageIds);
 		if (hold) pendingPages.add(hold.put.row.pageId);

@@ -251,6 +251,10 @@ const editSchema = z.object({
 		.string()
 		.optional()
 		.describe("With add or move: the sibling to place after (default: last)"),
+	before: z
+		.string()
+		.optional()
+		.describe("With add or move: the sibling to place before (instead of after)"),
 	delete: z.string().optional().describe("Delete this block and everything under it"),
 	set: z.string().optional().describe("Set the checkbox, assignee or alias of this block"),
 	checkbox: z
@@ -282,9 +286,9 @@ type EditInput = z.infer<typeof editSchema>;
 
 const EDIT_KINDS = ["add", "replace", "move", "delete", "set", "confirm", "reject"] as const;
 const EDIT_FIELDS: Record<(typeof EDIT_KINDS)[number], readonly string[]> = {
-	add: ["markdown", "after"],
+	add: ["markdown", "after", "before"],
 	replace: ["text"],
-	move: ["to", "after"],
+	move: ["to", "after", "before"],
 	delete: [],
 	set: ["checkbox", "assignee", "alias"],
 	confirm: [],
@@ -303,6 +307,8 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 	const kind = kinds[0] as (typeof EDIT_KINDS)[number];
 	const stray = present.filter((key) => key !== kind && !EDIT_FIELDS[kind].includes(key));
 	if (stray.length > 0) return `edit ${n}: ${stray.join(", ")} does not go with ${kind}`;
+	if (edit.after !== undefined && edit.before !== undefined)
+		return `edit ${n}: give after or before, not both`;
 	switch (kind) {
 		case "add":
 			if (edit.markdown === undefined) return `edit ${n}: add needs markdown`;
@@ -310,6 +316,7 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 				add: edit.add as string,
 				markdown: edit.markdown,
 				...(edit.after !== undefined ? { after: edit.after } : {}),
+				...(edit.before !== undefined ? { before: edit.before } : {}),
 			};
 		case "replace":
 			if (edit.text === undefined) return `edit ${n}: replace needs text`;
@@ -320,6 +327,7 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 				move: edit.move as string,
 				to: edit.to,
 				...(edit.after !== undefined ? { after: edit.after } : {}),
+				...(edit.before !== undefined ? { before: edit.before } : {}),
 			};
 		case "delete":
 			return { delete: edit.delete as string };
@@ -347,14 +355,14 @@ export const outlineEditTool: ToolDefinition = {
 	name: OUTLINE_EDIT_TOOL,
 	description: `Write to the outline. One call is one commit in one space: all edits apply, or none does. Every commit records who wrote it and can be reverted.
 edits, in order, each one of:
-- { add: <parent>, markdown, after? }: add blocks written as a markdown outline under a block, or as new pages with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last).
+- { add: <parent>, markdown, after? | before? }: add blocks written as a markdown outline under a block, or as new pages with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last); before: the sibling to place them before (before the first child puts them first).
 - { replace: <block>, text }: the block's new text, written like one outline item without its bullet. A checkbox, @assignee and key:: lines in it are applied, whatever you leave out keeps its value, indented items become child blocks.
-- { move: <block>, to: <parent or key/>, after? }
+- { move: <block>, to: <parent or key/>, after? | before? }
 - { delete: <block> }: the block and everything under it.
 - { set: <block>, checkbox?, assignee?, alias? }: checkbox " " todo, "/" doing, "x" done, "-" cancelled, "none" makes a task a plain block; assignee agent:name, human:name or null; alias Q17, "Q?" (next free number) or null.
 Markdown outline: every list item is a block, indentation nests; \`- [ ] task @agent:name\` is a task; \`depends:: [[…]]\`, \`due:: 2026-11-01\`, \`alias:: Q?\`, \`tags:: [[…]]\` lines under an item are properties. Link with [[title]], [[alias]] or [[key/id]]; links are stored as addresses, so renaming never breaks them, and blocks added in one call can link to each other by title. Text copied from OutlineRead works as is: the ids after bullets and the ‹…› notes are dropped. Lists or extra paragraphs inside one item become child blocks; the result says what was split.
 <block>, <parent>: an id, key/id, an alias or a title. message: a short summary for the timeline.
-Locked plans: a task tree a person locked takes changes to its plan (its steps, their text and order, its goal and acceptance, cancelling a step, the whole plan done) as proposals waiting for their confirmation; the rest of the call is written. The result names the proposal (P and 8 characters) and the tasks waiting for it: do other work meanwhile; reading the plan shows your proposed version. Progress, findings, ticking steps and splitting a step into sub-steps are written directly. A session the locker named confirms with { confirm: "P…" } or rejects with { reject: "P…", reason }, in a call of their own; never its own proposals (rejecting your own withdraws it).
+Locked plans: a task tree a person locked takes changes to its plan (its steps, their text and order, its background, cancelling a step, the whole plan done) as proposals waiting for their confirmation; the rest of the call is written. The result names the proposal (P and 8 characters) and the tasks waiting for it: do other work meanwhile; reading the plan shows your proposed version. Progress, findings, ticking steps and splitting a step into sub-steps are written directly. A session the locker named confirms with { confirm: "P…" } or rejects with { reject: "P…", reason }, in a call of their own; never its own proposals (rejecting your own withdraws it).
 The result gives each edit's outcome and the ids of new blocks. Read a block (OutlineRead) before you replace or delete it, unless this session wrote it (blocks another session or a subagent wrote need a read too): what you read is forgotten when the server restarts, and an edit of a block you have not read that someone else wrote writes nothing and shows the block's current text, which then counts as read. If someone else changed a block after you read it, your replace is merged with their change where the two do not overlap, and the result shows the merged text (continue from that text); if they overlap, or the block's edit is a move, delete or set, nothing is written: read it again and redo the edit. A delete also writes nothing when blocks under the block changed (or were added by someone else) since you read them; the result shows them.`,
 	parameters: z.object({
 		edits: z.array(editSchema).min(1).max(200).describe("The edits, applied in order"),

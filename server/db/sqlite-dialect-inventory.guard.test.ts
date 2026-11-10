@@ -615,6 +615,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
 	// Main-thread Drizzle readers' bodies from block rows (SQLite-only, like block storage).
 	"server/services/narrator-body-reads.ts": ["handle", "json1"],
+	// Retention fences consult the SQLite body projection before accepting late writes.
+	"server/services/narrator-body-writes.ts": ["handle"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
 	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
@@ -705,11 +707,23 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
+	"server/services/tool-input-stream-source.ts": ["driver", "pragma", "handle"],
 	// 用量分桶：SQLite 用 strftime + 按 DST 分段应用的偏移，PostgreSQL 用 date_trunc/AT TIME ZONE。
 	// 两个分支都在 usage-bucket-sql.ts 里，PG 分支有真实库测试。
 	"server/services/usage-bucket-sql.ts": ["timeFn"],
 	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
+	// History retention has an explicit SQLite capability boundary; a PG implementation
+	// needs its own async candidate/read/write adapter, rather than opening a second DB.
+	"server/lib/db-worker/storage-history-query.ts": ["driver", "rowid", "json1", "timeFn"],
+	"server/services/storage-history-runtime.ts": ["connectionModule"],
+	"server/services/storage-history-mutations.ts": [
+		"handle",
+		"connectionModule",
+		"pragma",
+		"sessionFn",
+	],
+	"server/services/storage-history-service.ts": ["rowid"],
+	"shared/storage-retention.ts": ["rowid"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
 

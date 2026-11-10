@@ -14,9 +14,12 @@
  * The loader is injected, so no process-wide module mocking is needed.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as shikiLoader from "./shiki-loader";
 import {
+	clearShikiTokenCache,
 	createShikiTokenCache,
+	getShikiTokens,
 	MAX_HIGHLIGHT_CODE_CHARS,
 	normalizeThemedTokens,
 	type ShikiToken,
@@ -67,6 +70,23 @@ function makeLoader(
 }
 
 describe("shiki token cache", () => {
+	it("keeps plain text without a browser Worker and never loads the main-thread highlighter", async () => {
+		const cached = spyOn(shikiLoader, "getCachedShiki");
+		const load = spyOn(shikiLoader, "loadShiki");
+		try {
+			clearShikiTokenCache();
+			expect(getShikiTokens("const x = 1", "typescript", THEME)).toBeNull();
+			for (let i = 0; i < 6; i++) await Promise.resolve();
+			expect(getShikiTokens("const x = 2", "typescript", THEME)).toBeNull();
+			expect(cached).not.toHaveBeenCalled();
+			expect(load).not.toHaveBeenCalled();
+		} finally {
+			cached.mockRestore();
+			load.mockRestore();
+			clearShikiTokenCache();
+		}
+	});
+
 	it("returns null on first ask and the tokens after the load lands", async () => {
 		const probe = makeLoader();
 		const cache = createShikiTokenCache(probe.loader);

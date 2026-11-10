@@ -48,6 +48,7 @@ import {
 	resetOutlineBehaviorImport,
 } from "../outline-behavior";
 import { OUTLINE_VIEW_LIMITS, resetOutlineViewCache } from "../outline-views";
+import { seedLegacyPluginSop } from "./legacy-plugin-sop";
 import { seedBehaviorPage, seedOutlineTasks, taskState } from "./outline-task-source-scenarios";
 
 const NOW = "2026-11-02T00:00:00.000Z";
@@ -211,7 +212,7 @@ describe("the behavior view", () => {
 		const root = await session();
 		const pageId = await seedBehaviorPage(root, "Never force-push the main branch.");
 		const address = await addressOf(pageId);
-		await setSpecBehaviorFenceForPlugin(root, "Report to the session lead.", "upsert");
+		await seedLegacyPluginSop(root, "Report to the session lead.");
 		const sub = await subagent(root);
 		await setSpecBehaviorFenceForPlugin(sub, "Report to the worker lead.", "upsert");
 
@@ -335,7 +336,7 @@ describe("the view cache", () => {
 		expect(await parts(id)).toEqual(first);
 		expect(total(counts)).toBeGreaterThan(0);
 
-		await setSpecBehaviorFenceForPlugin(id, "Report back.", "upsert");
+		await seedLegacyPluginSop(id, "Report back.");
 		expect(part(await parts(id), "outline.behavior")).toContain("Plugin SOP:\nReport back.");
 	});
 
@@ -489,7 +490,7 @@ describe("importing an old fence", () => {
 		const owner = await user();
 		const id = await session({ owner });
 		await oldFence(id, "- Never force-push.\n- Ask before deleting files.");
-		await setSpecBehaviorFenceForPlugin(id, "Report to the lead.", "upsert");
+		await seedLegacyPluginSop(id, "Report to the lead.");
 		expect(await importOutlineBehaviorFence(id, "zh-CN")).toBe("imported");
 
 		const space = await ensureSessionSpace(id);

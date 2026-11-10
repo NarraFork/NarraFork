@@ -24,7 +24,9 @@
  * Pure and deterministic, like the decoder: no server imports.
  */
 
+import { isClearedToolOutput, isHistoryClearedContent } from "../storage-retention";
 import { type DecodableMessage, decodeLegacyContent } from "./decode";
+import { redactToolPayloadElement } from "./retention";
 import type { BlockKind, BlockPhase, CanonicalBlock, CanonicalEnvelope } from "./types";
 
 export interface StoredBlockPayload {
@@ -165,7 +167,15 @@ export function splitEnvelope(
 	message: DecodableMessage,
 	options: SplitOptions = {},
 ): { blocks: BlockDraft[]; envelope: CanonicalEnvelope } {
-	const elements: unknown[] = Array.isArray(message.contentJson) ? message.contentJson : [];
+	const clearedCalls = new Set(
+		(message.toolCalls ?? [])
+			.filter((call) => isClearedToolOutput(call.outputJson))
+			.map((call) => call.toolUseId),
+	);
+	const stored = Array.isArray(message.contentJson) ? message.contentJson : [];
+	const elements: unknown[] = (isHistoryClearedContent(stored) ? stored.slice(0, 1) : stored).map(
+		(element) => redactToolPayloadElement(element, clearedCalls),
+	);
 	const envelope = decodeLegacyContent({ ...message, contentJson: elements });
 	if (message.role !== "assistant") {
 		const block = envelope.blocks[0] ?? null;

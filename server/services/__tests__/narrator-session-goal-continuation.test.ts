@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 
@@ -172,7 +172,7 @@ describe("explicit Dynamic Spec goal continuation", () => {
 		});
 		expect(
 			messages.some((message) =>
-				(message.contentJson as Array<{ type?: string }>).some(
+				readTestMessageContent<{ type?: string }>(sqlite, message.id).some(
 					(block) => block.type === "spec_continuation",
 				),
 			),
@@ -276,7 +276,7 @@ describe("explicit Dynamic Spec goal continuation", () => {
 			where: eq(narratorMessages.narratorId, narratorId),
 		});
 		const blockedContinuationMessages = messages.filter((message) =>
-			(message.contentJson as Array<{ type?: string }>).some(
+			readTestMessageContent<{ type?: string }>(sqlite, message.id).some(
 				(block) => block.type === "spec_blocked_continuation",
 			),
 		);

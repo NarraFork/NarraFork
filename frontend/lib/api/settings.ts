@@ -344,6 +344,7 @@ export const settingsApi = {
 			 */
 			narratorLineHeightV2Percent: number;
 			narratorParagraphScalePercent: number;
+			recentTabsShowDirectory: boolean;
 			addSubagentToRecentTabs: boolean;
 			// Notification preferences
 			notifyOnDone: boolean;
@@ -417,6 +418,7 @@ export const settingsApi = {
 		narratorLetterSpacingPercent?: number;
 		narratorLineHeightV2Percent?: number;
 		narratorParagraphScalePercent?: number;
+		recentTabsShowDirectory?: boolean;
 		addSubagentToRecentTabs?: boolean;
 		// Notification preferences
 		notifyOnDone?: boolean;

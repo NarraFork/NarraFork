@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrator";
 import { MantineProvider } from "@mantine/core";
 import type { HumanAttentionItem, HumanAttentionPage } from "@shared/human-attention";
+import { type OutlineItem, serializeMarkdownOutline } from "@shared/outline";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -802,6 +803,150 @@ describe("human attention decisions", () => {
 		expect(fileLink).toBeUndefined();
 		expect(row(command.id).querySelector("[data-md-body]")).toBeNull();
 		expect(row(command.id).textContent).toContain("rm -rf **/*.tmp # cleanup");
+	});
+
+	test("an outline plan reads in its format: background whole, details behind one line, quick folds", async () => {
+		const plan = item("outline-plan", { toolName: "ExitPlanMode", kind: "plan_approval" });
+		const node = (content: string, children: OutlineItem[] = [], task = true): OutlineItem => ({
+			content,
+			task: task ? { status: "todo", assignee: null } : null,
+			props: {},
+			children,
+		});
+		addPermission(plan, {
+			mode: "outline",
+			plan: serializeMarkdownOutline([
+				node("Ship the importer", [
+					node("The importer fails every night and is rerun by hand.", [], false),
+					node("Phase 1", [
+						node("Parse", [
+							node("Read the CSV header first", [], false),
+							node("Then stream the rows", [node("in batches of 500", [], false)], false),
+						]),
+						node("Validate"),
+					]),
+					node("Notable points", [node("Rollback is manual", [], false)], false),
+				]),
+			]),
+			_planRoot: {
+				blockId: "b",
+				spaceId: "s",
+				pageId: "p",
+				address: "k/AbCdEfGh",
+				title: "Ship the importer",
+				round: 1,
+			},
+			_planSeq: 3,
+			_planBaseSeq: 0,
+			_planDiff: { counts: { added: 9, removed: 0, text: 0, task: 0, moved: 0 } },
+		});
+		await openDrawer();
+		await click("Review decision", row(plan.id));
+		const tree = row(plan.id).querySelector("[data-testid=outline-plan-tree]");
+		expect(tree).not.toBeNull();
+		expect(row(plan.id).querySelector("[data-md-body]")).toBeNull();
+		const at = (key: string) => tree?.querySelector(`[data-plan-row="${key}"]`) as HTMLElement;
+		const rows = () =>
+			[...(tree?.querySelectorAll("[data-plan-row]") ?? [])].map((r) =>
+				r.getAttribute("data-plan-row"),
+			);
+		// The DOM here has no MouseEvent / KeyboardEvent: a bubbling Event with their fields.
+		const fire = async (
+			el: Element | null | undefined,
+			type: string,
+			fields: Record<string, unknown> = {},
+		) => {
+			const event = new Event(type, { bubbles: true, cancelable: true });
+			for (const [name, value] of Object.entries(fields))
+				Object.defineProperty(event, name, { value });
+			await act(async () => {
+				el?.dispatchEvent(event);
+			});
+		};
+		const press = (el: Element | null | undefined, fields: Record<string, unknown> = {}) =>
+			fire(el, "click", fields);
+		// The title, the background whole (no arrow, no bullet), the points; the small point's
+		// details are one preview line with how many more.
+		expect(rows()).toEqual(["r", "r.0", "r.1", "r.1.0", "r.1.1", "r.2", "r.2.0"]);
+		expect(at("r.0").getAttribute("data-plan-role")).toBe("background");
+		expect(at("r.0").querySelector("[data-plan-toggle]")).toBeNull();
+		expect(at("r.1.0").getAttribute("data-plan-open")).toBe("0");
+		const preview = () => tree?.querySelector("[data-plan-preview]");
+		expect(preview()?.querySelector("[data-plan-preview-text]")?.textContent).toBe(
+			"Read the CSV header first…",
+		);
+		expect(preview()?.querySelector("[data-plan-preview-label]")?.textContent).toBe("1 more ▸");
+		// The preview opens everything inside the small point, each detail with its children.
+		await press(preview());
+		expect(rows()).toEqual([
+			"r",
+			"r.0",
+			"r.1",
+			"r.1.0",
+			"r.1.0.0",
+			"r.1.0.1",
+			"r.1.0.1.0",
+			"r.1.1",
+			"r.2",
+			"r.2.0",
+		]);
+		expect(
+			at("r.1.0").querySelector("[data-plan-subtree]")?.getAttribute("data-plan-subtree"),
+		).toBe("collapse");
+		// Its quick control collapses it back to one line.
+		await press(at("r.1.0").querySelector("[data-plan-subtree]"));
+		expect(rows()).toEqual(["r", "r.0", "r.1", "r.1.0", "r.1.1", "r.2", "r.2.0"]);
+		// Alt+click on the big point's arrow: everything inside it; again: back.
+		await press(at("r.1").querySelector("[data-plan-toggle]"), { altKey: true });
+		expect(rows()).toContain("r.1.0.1.0");
+		expect(at("r.1").getAttribute("data-plan-open")).toBe("1");
+		await press(at("r.1").querySelector("[data-plan-toggle]"), { altKey: true });
+		expect(rows()).not.toContain("r.1.0.0");
+		// Alt+Enter on the arrow does the same from the keyboard.
+		await fire(at("r.1").querySelector("[data-plan-toggle]"), "keydown", {
+			key: "Enter",
+			altKey: true,
+		});
+		expect(rows()).toContain("r.1.0.1.0");
+		// The big point's quick control now collapses everything inside it.
+		const quick = at("r.1").querySelector("[data-plan-subtree]");
+		expect(quick?.getAttribute("data-plan-subtree")).toBe("collapse");
+		await press(quick);
+		expect(rows()).toEqual(["r", "r.0", "r.1", "r.1.0", "r.1.1", "r.2", "r.2.0"]);
+		// A plain click on the arrow folds one node: the big point previews its first small point.
+		await press(at("r.1").querySelector("[data-plan-toggle]"));
+		expect(rows()).toEqual(["r", "r.0", "r.1", "r.2", "r.2.0"]);
+		expect(preview()?.querySelector("[data-plan-preview-label]")?.textContent).toBe("1 more ▸");
+		await click("Expand all", tree as ParentNode);
+		expect(rows()).toHaveLength(10);
+		await click("Collapse all", tree as ParentNode);
+		expect(rows()).toEqual(["r", "r.0", "r.1", "r.1.0", "r.1.1", "r.2", "r.2.0"]);
+	});
+
+	test("an outline plan declared in any case reads as its outline, as on the card", async () => {
+		const plan = item("outline-plan-mode", { toolName: "ExitPlanMode", kind: "plan_approval" });
+		addPermission(plan, {
+			mode: " Outline ",
+			plan: serializeMarkdownOutline([
+				{
+					content: "Ship the importer",
+					task: { status: "todo", assignee: null },
+					props: {},
+					children: [
+						{ content: "Background.", task: null, props: {}, children: [] },
+						{
+							content: "Phase 1",
+							task: { status: "todo", assignee: null },
+							props: {},
+							children: [],
+						},
+					],
+				},
+			]),
+		});
+		await openDrawer();
+		await click("Review decision", row(plan.id));
+		expect(row(plan.id).querySelector("[data-testid=outline-plan-tree]")).not.toBeNull();
 	});
 
 	test("each item stays independently busy and denial preserves feedback and frozen remote target", async () => {

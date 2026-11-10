@@ -7,7 +7,7 @@ import type { MediaRef } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { modelInputText } from "../../../tests/fixtures/model-input";
 import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -246,6 +246,37 @@ function fixture(
 			),
 	};
 }
+
+describe("context overflow recovery cancellation", () => {
+	for (const profile of profiles) {
+		test(`${profile.kind}: abort during compact remains an interruption, not a compact failure`, async () => {
+			const service = await import("../narrator-service");
+			const session = await import("../narrator-session");
+			const h = fixture(profile, [
+				{
+					...finished,
+					finalText: "",
+					completedAssistantTurn: false,
+					completedNaturally: false,
+					contextLengthExceeded: true,
+				},
+			]);
+			spyOn(service.narratorService, "getCompactBoundaryMessage").mockResolvedValue("boundary");
+			const compact = spyOn(session, "runCustomCompact").mockImplementation(async () => {
+				h.session.abortController.abort();
+				return true;
+			});
+			const emitted: Array<{ type: string }> = [];
+			h.session.events.on("event", (event) => emitted.push(event));
+			const result = await h.run();
+			expect(result.aborted).toBe(true);
+			expect(result.hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+			expect(compact).toHaveBeenCalledTimes(1);
+			expect(emitted.some((event) => event.type === "error")).toBe(false);
+		});
+	}
+});
 
 describe("round token totals at the Stop hook", () => {
 	for (const exit of ["normal", "workspace", "tool-limit", "throw"] as const) {
@@ -1031,7 +1062,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{ type: "error", message: "fixture exhausted provider retries", diagnostics },
 			]);
 		});
@@ -1059,7 +1091,8 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.find((row) => row.contentText?.startsWith("[Error]"))?.contentJson).toEqual([
+			const error = rows.find((row) => row.contentText?.startsWith("[Error]"));
+			expect(readTestMessageContent(sqlite, error?.id ?? "")).toEqual([
 				{
 					type: "error",
 					message: "upstream failure 3",

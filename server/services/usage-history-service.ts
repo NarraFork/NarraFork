@@ -403,7 +403,7 @@ export class UsageHistoryService {
 	): Promise<Row[]> {
 		const startedAt = Date.now();
 		try {
-			return await readQuery(query, { maxRows, signal: execution.signal, inlineFallback: false });
+			return await readQuery(query, { maxRows, signal: execution.signal });
 		} catch (error) {
 			logger.warn("Usage history aggregation worker failed", {
 				error: error instanceof Error ? error.message : String(error),

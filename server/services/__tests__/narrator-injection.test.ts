@@ -21,7 +21,7 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { SideCarBody } from "@shared/sidecar-body";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
 // Captured before the mock lands: `mock.module` is process-wide, so leaving the
@@ -105,7 +105,7 @@ function readRow(id: string): Row {
 }
 
 function blocksOf(id: string): Array<Record<string, unknown>> {
-	return JSON.parse(readRow(id).content_json);
+	return readTestMessageContent(sqlite, id);
 }
 
 function rowCount(): number {

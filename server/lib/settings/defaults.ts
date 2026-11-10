@@ -49,6 +49,10 @@ export const DEFAULTS: NarraForkSettings = {
 		ringResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
 		autoPin: "off",
 	},
+	storageRetention: {
+		toolCallPayloads: { retentionDays: null, autoCleanup: false },
+		messageHistory: { retentionDays: null, autoCleanup: false },
+	},
 	plugins: {
 		enabled: true,
 	},
@@ -131,7 +135,9 @@ export const DEFAULTS: NarraForkSettings = {
 	narratorBlocks: {
 		write: true,
 		read: true,
-		compactJson: false,
+		compactJson: true,
+		singleCopyDefaultsVersion: 1,
+		singleCopyBackfillResumeVersion: 0,
 	},
 	editor: {
 		type: "vscode",
@@ -793,7 +799,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── narratorBlocks ──────────────────────────────────────────────────
 	"narratorBlocks.write": {
-		desc: "新消息是否以原生块存储（narrator_blocks 表），同时写入兼容的 content_json。关闭后新消息回到只写 content_json 的旧格式；已是块格式的消息仍按块维护。默认 true。",
+		desc: "新消息是否以原生块存储（narrator_blocks 表），默认配合 compactJson 只存一份正文。关闭仅用于回滚，新消息回到只写 content_json 的旧格式；已有块格式仍按块维护。默认 true。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},
@@ -803,9 +809,33 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 true",
 	},
 	"narratorBlocks.compactJson": {
-		desc: "新写入的块格式消息是否只把正文存在块表里（content_json 写 []，body_rows_only 置 1），省去重复的兼容投影。只在 SQLite 且 write、read 都开启时生效。关闭后新消息恢复写完整的 content_json；已是只存块的消息保持不变，需要回退时先在存储页运行「恢复副本」。默认 false。",
+		desc: "块格式消息默认只在块表保存一份正文（content_json 写 []，body_rows_only 置 1），compact 标记保留兼容投影。只在 SQLite 且 write、read 都开启时生效；旧投影经后台转换、校验和重建索引后自动清理。关闭仅用于显式回滚，新消息恢复兼容投影，既有块正文保持不变。默认 true。",
 		type: "boolean",
-		valid: "true / false，默认 false",
+		valid: "true / false，默认 true",
+	},
+	"narratorBlocks.singleCopyDefaultsVersion": {
+		desc: "稳定单份块存储默认值的一次性迁移版本（系统内部使用）。",
+		type: "number",
+	},
+	"narratorBlocks.singleCopyBackfillResumeVersion": {
+		desc: "旧暂停块迁移任务已在后台启动时恢复的一次性收据，默认 0；系统完成恢复后置 1，之后保留显式暂停。",
+		type: "number",
+	},
+	"storageRetention.toolCallPayloads.retentionDays": {
+		desc: "工具调用详情保留天数，范围 1..36500；null 永久保留。独立于消息正文策略。",
+		type: "number | null",
+	},
+	"storageRetention.toolCallPayloads.autoCleanup": {
+		desc: "自动清理过期工具调用详情，默认关闭；保留天数为 null 时不清理。",
+		type: "boolean",
+	},
+	"storageRetention.messageHistory.retentionDays": {
+		desc: "消息历史正文保留天数，范围 1..36500；null 永久保留。独立于工具调用详情策略。",
+		type: "number | null",
+	},
+	"storageRetention.messageHistory.autoCleanup": {
+		desc: "自动清理过期消息正文，默认关闭；保留天数为 null 时不清理。",
+		type: "boolean",
 	},
 
 	// ── editor ──────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@ import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { type NarratorWSCallbacks, useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
+import { useNarratorCurrentTask } from "@frontend/hooks/useTaskBoard";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
@@ -219,6 +220,7 @@ import type { InjectionNavigation } from "./vlist-injection-header";
 import { createVListInteractionAdmission } from "./vlist-interaction-admission";
 import { VListInteractionAdmissionContext } from "./vlist-interaction-admission-context";
 import {
+	applyVListPlanTreeAction,
 	createVListInteractionState,
 	isFileChangesOpenRow,
 	isFullPayloadRequestedRow,
@@ -227,6 +229,7 @@ import {
 	isVListTextExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
+	resolvePlanTreeViewRow,
 	setVListExpanded,
 	setVListTextExpanded,
 	toggleVListFileChangesOpen,
@@ -991,6 +994,11 @@ export const PretextExactMessageList = memo(
 				(key: string) => isFileChangesOpenRow(activeInteraction, key),
 				[activeInteraction],
 			);
+			// An outline plan card's tree as the reader opened it (the overview when untouched).
+			const resolvePlanTreeView = useCallback(
+				(key: string) => resolvePlanTreeViewRow(activeInteraction, key),
+				[activeInteraction],
+			);
 			const resolveExactToolColor = useCallback(
 				(toolName: string, input?: unknown) => getCategoryColor(getCategory(toolName, input)),
 				[],
@@ -1564,6 +1572,11 @@ export const PretextExactMessageList = memo(
 							captureFoldBefore(key);
 							setInteraction((prev) => toggleVListFileChangesOpen(prev, key));
 						},
+						// A node, a text or the whole tree of an outline plan card: the card resizes.
+						onPlanTree: (action) => {
+							captureFoldBefore(key);
+							setInteraction((prev) => applyVListPlanTreeAction(prev, key, action));
+						},
 					};
 					togglesCacheRef.current.set(key, toggles);
 					return toggles;
@@ -1624,7 +1637,11 @@ export const PretextExactMessageList = memo(
 			const openSpecTasks = useCallback(() => {
 				viewportRef.current?.dispatchEvent(new CustomEvent("spec-open-tasks", { bubbles: true }));
 			}, []);
-			const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
+			// The session's task backend, read from the cache the panel fills (no request of its own):
+			// an outline session's old spec cards are read-only and its old tasks.json call is not
+			// pinned (outline P2 PR 12a).
+			const taskBackend = useNarratorCurrentTask(narratorId, false).data?.backend;
+			const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks, taskBackend);
 
 			// Error notice cards: "mark as retryable" opens the shared rule dialog, the
 			// close button deletes the notice. The dialog is one shell-level instance
@@ -2128,6 +2145,7 @@ export const PretextExactMessageList = memo(
 				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
 				keepEmptyReasoningLive: isActive,
+				pinLatestSpecTasks: taskBackend !== "outline",
 				labels: vlistLabels,
 				labelsRevision,
 				widthBucket: String(Math.round(contentWidth)),
@@ -2159,6 +2177,7 @@ export const PretextExactMessageList = memo(
 				showOriginal: resolveShowOriginal,
 				isPromptOpen: resolvePromptOpen,
 				isFileChangesOpen: resolveFileChangesOpen,
+				planTreeView: resolvePlanTreeView,
 				resolveToolCategory: getCategory,
 				resolveToolColor: resolveExactToolColor,
 				resolveToolSummary: resolveExactToolSummary,

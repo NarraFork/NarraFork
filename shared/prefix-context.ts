@@ -59,6 +59,14 @@ export function contextUpdateDisplay(
 	changes: readonly ContextChange[],
 	displays: Readonly<Record<string, unknown>> | undefined,
 ): Record<string, unknown> | undefined {
+	return boundContextUpdateDisplay(contextUpdateDisplayEntries(changes, displays));
+}
+
+/** {@link contextUpdateDisplay} before its size limit: the summaries by key, possibly none. */
+export function contextUpdateDisplayEntries(
+	changes: readonly ContextChange[],
+	displays: Readonly<Record<string, unknown>> | undefined,
+): Record<string, unknown> {
 	const display: Record<string, unknown> = {};
 	for (const change of changes) {
 		if (change.value === null) {
@@ -67,14 +75,53 @@ export function contextUpdateDisplay(
 			display[change.key] = displays[change.key];
 		}
 	}
-	if (Object.keys(display).length === 0) return undefined;
-	return new TextEncoder().encode(JSON.stringify(display)).length <=
-		CONTEXT_UPDATE_DISPLAY_MAX_BYTES
-		? display
-		: undefined;
+	return display;
 }
 
-/** Only content references live in an epoch marker; large bodies are shared snapshots. */
+/** Bytes of a reader summary as stored (its JSON, UTF-8). */
+export function contextDisplayBytes(display: unknown): number {
+	return new TextEncoder().encode(JSON.stringify(display) ?? "").length;
+}
+
+/** The summaries a row stores: undefined when there are none, or they exceed the limit. */
+export function boundContextUpdateDisplay(
+	display: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	if (Object.keys(display).length === 0) return undefined;
+	return contextDisplayBytes(display) <= CONTEXT_UPDATE_DISPLAY_MAX_BYTES ? display : undefined;
+}
+
+/** How the host's `context_update` notice row starts (`narrator-epochs.ts`). */
+export const CONTEXT_UPDATE_NOTICE = "Context updated: ";
+
+export interface ContextUpdateBlockLike {
+	type: string;
+	text?: string | null;
+	[key: string]: unknown;
+}
+
+/**
+ * The part keys a host `context_update` row names in its notice text, or null when the row is
+ * not one (no `context_update` block, or a notice that does not start the host's way). The
+ * stored row names the keys in English; the update itself is in its snapshot.
+ */
+export function contextUpdateKeys(blocks: readonly ContextUpdateBlockLike[]): string[] | null {
+	if (!blocks.some((block) => block.type === "context_update")) return null;
+	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
+	if (!notice.startsWith(CONTEXT_UPDATE_NOTICE)) return null;
+	return notice
+		.slice(CONTEXT_UPDATE_NOTICE.length)
+		.split(",")
+		.map((key) => key.trim())
+		.filter(Boolean);
+}
+
+/**
+ * The prefix as an epoch marker records it: content references only (large bodies are shared
+ * snapshots). The marker may also carry small reader-only summaries of the baseline's parts
+ * (`EpochRecord.baselineDisplays`, at most {@link CONTEXT_UPDATE_DISPLAY_MAX_BYTES}); those are
+ * no part of this snapshot or its hashes.
+ */
 export interface PrefixSnapshot {
 	contract: string;
 	parts: Array<{ key: string; hash: string }>;

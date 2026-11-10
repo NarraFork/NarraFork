@@ -761,6 +761,8 @@ export const ExactRow = memo(
 		// An outline card's fold (raw input, model result) rides the prompt-fold channel, keyed by
 		// the card: see `rawOpen` in segment-adapter's buildToolCardData.
 		if (kind === "tool-call") extra.onTogglePrompt = toggles.onTogglePrompt;
+		// An outline plan card's tree (its nodes, texts, 「全部展开」), keyed by the card.
+		if (kind === "tool-call") extra.onPlanTree = toggles.onPlanTree;
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;

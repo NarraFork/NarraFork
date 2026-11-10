@@ -5,6 +5,8 @@ import {
 	type HistoryQuery,
 	MODEL_HISTORY_BATCH_BYTES,
 	MODEL_HISTORY_MAX_BYTES,
+	MODEL_HISTORY_TOOL_CLEARED_SQL,
+	MODEL_HISTORY_TOOL_INPUT_SQL,
 	type ModelHistoryCounters,
 	type ModelHistoryQueryOptions,
 	type ModelHistorySource,
@@ -267,7 +269,7 @@ export async function queryModelHistoryDelta(
 			if (changedTools.length) {
 				budget.check();
 				const sizes = await query<{ id: string; bytes: number }>(
-					`SELECT id, coalesce(length(CAST(input_json AS BLOB)),0)+coalesce(length(CAST(output_json AS BLOB)),0) AS bytes
+					`SELECT id, CASE WHEN ${MODEL_HISTORY_TOOL_CLEARED_SQL} THEN 0 ELSE coalesce(length(CAST(input_json AS BLOB)),0) END+coalesce(length(CAST(output_json AS BLOB)),0) AS bytes
 					 FROM narrator_tool_calls WHERE id IN (${changedTools.map(() => "?").join(",")})`,
 					changedTools.map((tool) => tool.id),
 				);
@@ -292,7 +294,7 @@ export async function queryModelHistoryDelta(
 				const toolIds = changedTools.slice(index, end).map((tool) => tool.id);
 				const bodies = await query<ModelToolSourceRow & { messageId: string }>(
 					`SELECT id,message_id AS "messageId",model_revision AS "modelRevision",execution_attempt AS "executionAttempt",created_at AS "createdAt",
-					 tool_use_id AS "toolUseId",tool_name AS "toolName",input_json AS "inputJson",output_json AS "outputJson",status
+					 tool_use_id AS "toolUseId",tool_name AS "toolName",${MODEL_HISTORY_TOOL_INPUT_SQL} AS "inputJson",output_json AS "outputJson",status
 					 FROM narrator_tool_calls WHERE id IN (${toolIds.map(() => "?").join(",")})`,
 					toolIds,
 				);

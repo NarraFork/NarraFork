@@ -4,7 +4,7 @@ import { getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const inbox = await import("../agent-runtime/inbox");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");

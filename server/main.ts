@@ -1465,6 +1465,9 @@ withBackgroundOccupancyInitialization(
 					error: err instanceof Error ? err.message : String(err),
 				}),
 			);
+		void import("./services/storage-history-runtime")
+			.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
+			.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
 		if (completions.length) {
 			Promise.all(completions)
 				.then(() => {
@@ -1650,6 +1653,12 @@ void startupReadiness.barrier.then((recovery) => {
 		.then(({ startOutlineTaskFinishedNotices }) => startOutlineTaskFinishedNotices())
 		.catch((err) =>
 			logger.warn("Outline task-finished notices failed to start", { error: String(err) }),
+		);
+	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
+	import("./services/outline/plugin-task-events")
+		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
+		.catch((err) =>
+			logger.warn("Outline plugin task events failed to start", { error: String(err) }),
 		);
 });
 

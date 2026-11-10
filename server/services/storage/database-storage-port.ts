@@ -73,11 +73,11 @@ export interface DatabaseStorageCapabilities {
 /**
  * Default wall-clock budget for one whole measurement.
  *
- * Deliberately far above every internal budget it contains (the read-worker pool allows 30s for
- * the schema task and 120s per table shard, and the serial main-thread fallback was measured at
- * ~4.9s over 116 tables on a 5.3 GB database). This is a backstop against a measurement that
- * never returns at all — not a performance target, and not a replacement for those budgets. Set
- * it lower only when a caller genuinely prefers "no answer" to "a late answer".
+ * The SQLite object scan shares this deadline across context, shards and worker-unavailable
+ * fallbacks. Context walks dbstat over the whole database: a separate 30s "schema" budget
+ * incorrectly killed cold multi-GB scans and restarted them from scratch. All heavy work stays
+ * off the request thread, and expiration cancels outstanding workers. This is a backstop, not a
+ * performance target. Set it lower only when a caller prefers "no answer" to "a late answer".
  */
 export const DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS = 300_000;
 
