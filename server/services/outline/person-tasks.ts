@@ -43,7 +43,7 @@ import {
 } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
 import { readDisplayNames, readUserByUsername } from "./access-reads";
-import { OUTLINE_TASKS_PAGE_ALIAS } from "./model";
+import { OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
@@ -79,7 +79,11 @@ export interface PersonTaskAdded {
 /** Adds of one session, one at a time (dedupe reads and the write must not interleave). */
 const adding = new Map<string, Promise<unknown>>();
 
-async function oneAtATime<T>(key: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * Run `fn` after every add of session `key` before it (a person's here, a plugin's in
+ * `plugin-tasks.ts`): the dedupe read and the write of one add never interleave with another's.
+ */
+export async function oneAtATime<T>(key: string, fn: () => Promise<T>): Promise<T> {
 	const before = adding.get(key) ?? Promise.resolve();
 	const run = before.catch(() => {}).then(fn);
 	const settled = run.catch(() => {});
@@ -108,12 +112,12 @@ function bodyKey(content: string): string {
 }
 
 /** The body a task written from `text` gets: its block, and the blocks split off it in order. */
-interface TaskBody {
+export interface TaskBody {
 	first: string;
 	rest: string[];
 }
 
-function bodyFromText(text: string): TaskBody {
+export function bodyFromText(text: string): TaskBody {
 	const normalized = normalizeBlock(text);
 	const rest: string[] = [];
 	const walk = (nodes: readonly BlockNode[]) => {
@@ -214,13 +218,16 @@ export async function addPersonTask(args: {
 	});
 }
 
-/** A task directly on the task page with this body that is not cancelled, if any. */
-async function findSameTask(
+/**
+ * A task directly under `pageId` (the task page, or the parent a plugin names) with this body that
+ * is not cancelled, if any.
+ */
+export async function findSameTask(
 	store: OutlineStore,
 	space: OutlineSpaceRow,
 	pageId: string,
 	body: TaskBody,
-): Promise<{ id: string; sid: string; locked: boolean } | null> {
+): Promise<{ id: string; sid: string; locked: boolean; task: OutlineTaskJson } | null> {
 	const children = (await store.listLastChildMetas(space.id, pageId, DEDUPE_SCAN)).filter(
 		(meta) => meta.taskJson && meta.taskJson.status !== "cancelled",
 	);
@@ -239,8 +246,13 @@ async function findSameTask(
 		})
 		.slice(0, DEDUPE_FULL_READS);
 	for (const child of matching) {
-		if (await sameBody(store, child.id, body))
-			return { id: child.id, sid: child.sid, locked: !!child.taskJson?.lock };
+		if ((await sameBody(store, child.id, body)) && child.taskJson)
+			return {
+				id: child.id,
+				sid: child.sid,
+				locked: !!child.taskJson.lock,
+				task: child.taskJson,
+			};
 	}
 	return null;
 }

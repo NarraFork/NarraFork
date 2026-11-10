@@ -133,6 +133,17 @@ export const OUTLINE_TEXT = {
 	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",
 	/** Summary of the commit that copies the behavior page into a fork. */
 	behaviorForkSummary: (from: string) => `copied the behavior page from session ${from}`,
+	/** Summaries of a plugin's commits for a session (`plugin-tasks.ts`, outline P2 PR 12a). */
+	pluginTaskAdded: (pluginId: string) => `plugin ${pluginId} added a task`,
+	pluginTaskStatus: (pluginId: string, address: string, status: string) =>
+		`plugin ${pluginId} set ${address} to ${status}`,
+	pluginTasksWritten: (pluginId: string) =>
+		`plugin ${pluginId} wrote its task list (spec://tasks.json)`,
+	pluginIndexWritten: (pluginId: string) => `plugin ${pluginId} wrote index.md (spec://index.md)`,
+	pluginRulesSet: (pluginId: string) => `plugin ${pluginId} updated its rules on this page`,
+	pluginRulesCleared: (pluginId: string) => `plugin ${pluginId} cleared its rules on this page`,
+	pluginSopMoved: (pluginId: string) =>
+		`moved plugin ${pluginId}'s rules from the old behavior fence (spec://behavior_fence) into this page`,
 } as const;
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;

@@ -106,7 +106,9 @@ describe("spec carryover actions — shell wiring", () => {
 		// The chunked card bubbles this DOM event to the NarratorPanel scroll
 		// viewport; the shell's scroll node IS that viewport, so it dispatches there.
 		expect(SHELL).toContain('new CustomEvent("spec-open-tasks", { bubbles: true })');
-		expect(SHELL).toContain("useSpecCarryoverActions(narratorId, openSpecTasks)");
+		expect(SHELL).toContain("useSpecCarryoverActions(narratorId, openSpecTasks, taskBackend)");
+		// The backend comes from the panel's cache: no request of the list's own (first screen).
+		expect(SHELL).toContain("useNarratorCurrentTask(narratorId, false).data?.backend");
 	});
 
 	it("passes the actions through the render dispatch to the card", () => {

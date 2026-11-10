@@ -159,6 +159,7 @@ describe("PluginPublicApi", () => {
 			"narrafork.projects.list",
 		]);
 		expect(api.commands.listIds()).toEqual([
+			"narrafork.narrator.behavior_rules_set",
 			"narrafork.narrator.create",
 			"narrafork.narrator.delete",
 			"narrafork.narrator.interrupt",
@@ -168,6 +169,9 @@ describe("PluginPublicApi", () => {
 			"narrafork.narrator.spec_task_add",
 			"narrafork.narrator.spec_tasks_get",
 			"narrafork.narrator.spec_write",
+			"narrafork.narrator.task_add",
+			"narrafork.narrator.task_set_status",
+			"narrafork.narrator.tasks_read",
 			"narrafork.narrator.update_profile",
 			"narrafork.plugins.disable",
 			"narrafork.plugins.enable",

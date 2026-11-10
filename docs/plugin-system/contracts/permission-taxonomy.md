@@ -33,7 +33,7 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 | `plugin` | `plugin.install`、`plugin.enable`、`plugin.disable`、`plugin.upgrade`、`plugin.uninstall`、`plugin.grant` |
 | `query` | `query.read.projects`、`query.read.narrators`、`query.read.message_summary`、`query.read.message_content`、`query.read.audit_self`、`query.read.audit_all`、`query.read.host_settings` |
 | `event` | `event.subscribe.narrator`、`event.subscribe.permission`、`event.subscribe.provider` |
-| `command` | `command.narrator.send_message`、`command.narrator.interrupt`、`command.permission.decide`、`command.routine.write` |
+| `command` | `command.narrator.send_message`、`command.narrator.interrupt`、`command.narrator.tasks_read`、`command.narrator.task_add`、`command.narrator.task_set_status`、`command.narrator.behavior_rules_set`、`command.permission.decide`、`command.routine.write` |
 | `provider` | `provider.register`、`provider.use`、`provider.refresh_catalog` |
 | `config` | `config.read_self`、`config.write_self` |
 | `secret` | `secret.use_self` |

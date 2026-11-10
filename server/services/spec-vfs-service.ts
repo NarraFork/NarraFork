@@ -7,13 +7,13 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX } from "../lib/spec-uri";
 import { knowledgeWriteStore } from "./knowledge/store";
-import type { SpecProtectedMutation } from "./knowledge/write-store";
 import {
 	analyzeSpecTasksCandidate,
 	compileSpecTasks,
 	detectProtectedMutations,
 	parseSpecTasksDocument,
 	SPEC_TASKS_PATH,
+	SpecProtectedTaskError,
 	type SpecTasksDocument,
 	serializeSpecTasksDocument,
 	taskTextHash,
@@ -22,7 +22,7 @@ import { assertSpecWritable } from "./task-source/backend";
 
 export { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX };
 
-const MAX_SPEC_FILE_CHARS = 200_000;
+export const MAX_SPEC_FILE_CHARS = 200_000;
 
 const specWriteLock = new AsyncMutex();
 
@@ -132,13 +132,6 @@ export function toSpecUri(path: string): string {
 
 function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
-}
-
-function formatProtectedMutationError(mutations: readonly SpecProtectedMutation[]): string {
-	const details = mutations
-		.map((mutation) => `- ${mutation.kind}: ${mutation.text} (${mutation.details})`)
-		.join("\n");
-	return `This change affects protected task(s) and requires taskReflection before it can be applied.\n${details}`;
 }
 
 export async function ensureNamespace(
@@ -313,7 +306,7 @@ export async function writeSpecFile(
 				: {}),
 		});
 		if (!result.ok) {
-			throw new Error(formatProtectedMutationError(result.protectedMutations));
+			throw new SpecProtectedTaskError(result.protectedMutations);
 		}
 
 		const written = await readSpecFile(narratorId, toSpecUri(path));
@@ -331,6 +324,8 @@ export async function writeSpecFile(
 
 export async function deleteSpecFile(narratorId: string, uri: string): Promise<void> {
 	const path = normalizeSpecPath(uri);
+	// An outline session has no Dynamic Spec to change, as for every other write.
+	await assertSpecWritable(narratorId, path);
 	// Built-in files are never deletable: they would reappear in listSpecFiles,
 	// so deletion has no lasting effect and only causes confusion.
 	if (BUILTIN_FILES[path])

@@ -27,6 +27,7 @@ import { narrators, userPreferences, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
+import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN } from "../../behavior-fence-sop";
 import { narratorService } from "../../narrator-service";
 import {
 	decideOutlineTurnEndNote,
@@ -53,6 +54,7 @@ import {
 	OUTLINE_BEHAVIOR_LIMITS,
 	resetOutlineBehaviorImport,
 } from "../outline-behavior";
+import { pluginRulesSid } from "../outline-plugin-rules";
 import { OUTLINE_VIEW_LIMITS, resetOutlineViewCache } from "../outline-views";
 import { seedBehaviorPage, seedOutlineTasks } from "./outline-task-source-scenarios";
 
@@ -152,8 +154,9 @@ const oversizeFence = () =>
 describe("S-R2-1: an import that cannot write everything at once (probe R2-1)", () => {
 	test("an item over a block's size becomes several blocks, and the whole fence imports", async () => {
 		const id = await session();
-		await oldFence(id, oversizeFence());
-		await setSpecBehaviorFenceForPlugin(id, "Report back.", "upsert");
+		// A plugin's SOP in the fence as it was written before PR 12a (the plugin's command now
+		// writes its block on the page, outline-plugin-rules.ts).
+		await oldFence(id, `${oversizeFence()}\n\n${TEAM_SOP_OPEN}\nReport back.\n${TEAM_SOP_CLOSE}`);
 		expect(await importOutlineBehaviorFence(id, "en")).toBe("imported");
 
 		const kids = await pageChildren(id);
@@ -357,7 +360,6 @@ describe("N-R2-6: checkboxes on the behavior page and the candidate scan (probe 
 
 describe("N-R2-7: an SOP in the middle of the fence updated during the import (probe R2-7)", () => {
 	test("the fence is rewritten, and a restart imports nothing a second time", async () => {
-		const { TEAM_SOP_CLOSE, TEAM_SOP_OPEN } = await import("../../behavior-fence-sop");
 		const id = await session();
 		await oldFence(id, `- Rule A\n\n${TEAM_SOP_OPEN}\nOLD SOP\n${TEAM_SOP_CLOSE}\n\n- Rule B`);
 		const real = runner.processEditText;
@@ -375,13 +377,25 @@ describe("N-R2-7: an SOP in the middle of the fence updated during the import (p
 		restores.push(() => spy.mockRestore());
 		expect(await importOutlineBehaviorFence(id, "en")).toBe("imported");
 		spy.mockRestore();
+		// Since PR 12a the plugin's update lands in its block on the page and takes the SOP out of
+		// the fence; the import then leaves the fence with nothing.
 		const fence = (await readSpecFile(id, "spec://behavior_fence")).content;
-		expect(fence).toContain("NEW SOP");
+		expect(fence).not.toContain("SOP");
 		expect(fence).not.toContain("Rule A");
+		const space = await ensureSessionSpace(id);
+		const [block] = await outlineStore.getBlockMetas(space.id, {
+			sids: [pluginRulesSid("unknown")],
+		});
+		expect(
+			(await outlineStore.listChildren(space.id, block?.id ?? "", 10)).map((b) => b.content),
+		).toEqual(["NEW SOP"]);
 
 		resetOutlineBehaviorImport(id); // a restart
 		expect(await importOutlineBehaviorFence(id, "en")).toBe("nothing");
-		expect(await pageChildren(id)).toEqual(["Rule A", "Rule B"]);
+		expect((await pageChildren(id)).filter((c) => !c.startsWith("Rules from plugin"))).toEqual([
+			"Rule A",
+			"Rule B",
+		]);
 	});
 });
 
