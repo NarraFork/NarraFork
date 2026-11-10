@@ -458,7 +458,8 @@ export const agentTool: ToolDefinition = {
 		let delegation:
 			| import("@server/services/outline/delegation").PreparedOutlineDelegation
 			| undefined;
-		if (raw.task !== undefined) {
+		// Weak models emit every optional parameter as an empty string; "" means "no task".
+		if (typeof raw.task === "string" && raw.task.trim() !== "") {
 			const { OutlineDelegationError, prepareOutlineDelegation } = await import(
 				"@server/services/outline/delegation"
 			);
