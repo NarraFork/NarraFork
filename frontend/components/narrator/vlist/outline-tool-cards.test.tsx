@@ -32,6 +32,7 @@ import {
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { extractDataRevision } from "./measure-cache";
 import { VLIST_REGISTRY } from "./registry";
+import { diffStatsLabels } from "./render/diff-stats-text";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { type AdapterContext, type AdapterSegment, adaptSegments } from "./segment-adapter";
 import { useVListLabels } from "./useVListLabels";
@@ -258,7 +259,10 @@ describe("an OutlineEdit card", () => {
 		const done = figures?.querySelector("[data-nf-diff-done] svg");
 		expect(done?.getAttribute("data-status")).toBe("done");
 		expect(done?.getAttribute("class")).toContain("nf-status");
-		expect(figures?.getAttribute("aria-label")).toBe("done 1 +3 #6");
+		// Its accessible name says the state in the reader's language: the shell (here zh-CN)
+		// gives the word, the task status's own name.
+		expect(figures?.getAttribute("aria-label")).toBe("完成 1 +3 #6");
+		expect(diffStatsLabels.done).toBe("完成");
 		view.unmount();
 	});
 

@@ -690,6 +690,45 @@ test("one marker per row: a task shows arrow + checkbox, a plain row arrow + bul
 	expect(await narrow.call((f) => f.overflowsX())).toBe(false);
 	noErrors(narrow);
 
+	// The handle is the only pointer route to focusing a task: 3:1 or more against the page, in
+	// both schemes (its icon strokes the handle's own colour).
+	const handleContrast = () =>
+		a.call((f, x) => {
+			const el = f.dom(x as never)?.querySelector<HTMLElement>(":scope > .ob-zoom");
+			if (!el) return 0;
+			const parse = (color: string) => {
+				const p = (/rgba?\(([^)]+)\)/.exec(color)?.[1] ?? "")
+					.split(/[\s,/]+/)
+					.filter(Boolean)
+					.map(Number);
+				return [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 1] as const;
+			};
+			const page = parse(getComputedStyle(document.body).backgroundColor);
+			const own = parse(getComputedStyle(el).color);
+			let alpha = own[3];
+			for (let n: HTMLElement | null = el; n; n = n.parentElement)
+				alpha *= Number(getComputedStyle(n).opacity);
+			const lum = (rgb: number[]) => {
+				const [r, g, b] = rgb.map((v) => {
+					const s = v / 255;
+					return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+				}) as [number, number, number];
+				return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+			};
+			const over = [0, 1, 2].map(
+				(i) => (own[i] as number) * alpha + (page[i] as number) * (1 - alpha),
+			);
+			const [hi, lo] = [lum(over), lum([page[0], page[1], page[2]])].sort((x, y) => y - x);
+			return ((hi as number) + 0.05) / ((lo as number) + 0.05);
+		}, task);
+	for (const scheme of ["dark", "light"] as const) {
+		await a.page.evaluate(
+			(s) => document.documentElement.setAttribute("data-mantine-color-scheme", s),
+			scheme,
+		);
+		expect(await handleContrast(), `${scheme} focus handle`).toBeGreaterThanOrEqual(3);
+	}
+
 	// What the bullet did is still one real click away on a task.
 	expect(await a.call((f) => f.events().focused)).toEqual([]);
 	const at = taskRow?.zoom as { x: number; y: number };
@@ -799,6 +838,34 @@ test("a task's status is a badge: its icon on a tinted background, in both schem
 	expect(serverOutline(pageId)).toStartWith(
 		"- [/] to do\n- [/] in progress\n- [x] done\n- [-] cancelled",
 	);
+	noErrors(a);
+}, 30_000);
+
+test("a task whose body is a code block: the focus handle takes no width from the block", async () => {
+	const { pageId, ids } = await seedPage(h, "Code task", [
+		"[ ] ```\nconst x = 1;\n```",
+		"```\nconst y = 2;\n```",
+	]);
+	const [task, plain] = ids as [string, string];
+	const a = await openEditor(h, h.owner, pageId);
+	const box = (id: string) =>
+		a.call((f, x) => {
+			const block = f.dom(x as never);
+			const pre = block?.querySelector<HTMLElement>(":scope > .ob-content > pre");
+			const zoom = block?.querySelector<HTMLElement>(":scope > .ob-zoom");
+			const p = pre?.getBoundingClientRect();
+			const z = zoom?.getBoundingClientRect();
+			return p
+				? { right: Math.round(p.right), zoom: z && z.width > 0 ? Math.round(z.right) : null }
+				: null;
+		}, id);
+	const [withHandle, without] = [await box(task), await box(plain)];
+	expect(withHandle).not.toBeNull();
+	// The block runs to the same right edge as one without a handle; the handle sits over its
+	// top right corner.
+	expect(withHandle?.right).toBe(without?.right as number);
+	expect(withHandle?.zoom).toBe(withHandle?.right as number);
+	expect(without?.zoom).toBeNull();
 	noErrors(a);
 }, 30_000);
 

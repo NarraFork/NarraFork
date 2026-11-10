@@ -92,14 +92,16 @@ export function hasVisibleDiffStats(
  * `+240 -0` — the trailing zero adds a token the reader has to parse to learn
  * nothing. Both zero → nothing at all (see the module header).
  */
-export function DiffStatsText({
-	stats,
-	doneLabel = "done",
-}: {
-	stats: DiffStatsValue | null | undefined;
-	/** The word for "tasks ticked done" in the figure's accessible name (the badge is drawn). */
-	doneLabel?: string;
-}) {
+/**
+ * Words of the figure's accessible name, in the reader's language. Set once by the shell
+ * (`useVListLabels`): this module is hook-free, like the rest of the transcript's renderers.
+ */
+export const diffStatsLabels = {
+	/** "Tasks ticked done" (the badge is what is drawn): the task status's own name. */
+	done: "Done",
+};
+
+export function DiffStatsText({ stats }: { stats: DiffStatsValue | null | undefined }) {
 	if (!hasVisibleDiffStats(stats)) return null;
 	return (
 		<span
@@ -115,7 +117,7 @@ export function DiffStatsText({
 			// figure that visually reads `+240` describes a number the sighted reader is
 			// not shown, which is the kind of divergence that makes a label untrustworthy.
 			aria-label={[
-				(stats.done ?? 0) > 0 ? `${doneLabel} ${stats.done}` : null,
+				(stats.done ?? 0) > 0 ? `${diffStatsLabels.done} ${stats.done}` : null,
 				stats.added > 0 ? `+${stats.added}` : null,
 				stats.removed > 0 ? `-${stats.removed}` : null,
 				stats.commit !== undefined ? `#${stats.commit}` : null,

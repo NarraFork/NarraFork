@@ -10,6 +10,7 @@ import "../../styles/safe-area.css";
 import { MantineProvider } from "@mantine/core";
 import type { ComposerDocument } from "@shared/composer-document";
 import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
+import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -210,6 +211,57 @@ export function open(options: { wsUrl: string }): void {
 			</QueryClientProvider>
 		</I18nextProvider>,
 	);
+}
+
+/** Set the reader's typography (外观 · 排版), as the sliders do. */
+export function applyTypography(next: Partial<TypographySettings>): void {
+	setTypography(next);
+}
+
+/** What this browser remembers as recently opened (titles as stored). */
+export function recents(): Array<{ blockId: string; title: string }> {
+	try {
+		const stored = JSON.parse(localStorage.getItem("narrafork_outline_recents") ?? "[]");
+		return (Array.isArray(stored) ? stored : []).map((r) => ({
+			blockId: String(r.blockId),
+			title: String(r.title),
+		}));
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * How well an element's own colour (its icon strokes `currentColor`) stands against the page:
+ * the contrast ratio of its computed colour, with every opacity up to the root applied, on the
+ * page's background.
+ */
+export function contrastOnPage(selector: string): number | null {
+	const el = document.querySelector<HTMLElement>(selector);
+	if (!el) return null;
+	const parse = (color: string): [number, number, number, number] => {
+		const m = /rgba?\(([^)]+)\)/.exec(color);
+		const p = (m?.[1] ?? "")
+			.split(/[\s,/]+/)
+			.filter(Boolean)
+			.map(Number);
+		return [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 1];
+	};
+	const [pr, pg, pb] = parse(getComputedStyle(document.body).backgroundColor);
+	const [r, g, b, a] = parse(getComputedStyle(el).color);
+	let alpha = a;
+	for (let node: HTMLElement | null = el; node; node = node.parentElement)
+		alpha *= Number(getComputedStyle(node).opacity);
+	const over = [r, g, b].map((v, i) => v * alpha + ([pr, pg, pb][i] as number) * (1 - alpha));
+	const lum = (rgb: number[]) => {
+		const [x, y, z] = rgb.map((v) => {
+			const s = v / 255;
+			return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+		}) as [number, number, number];
+		return 0.2126 * x + 0.7152 * y + 0.0722 * z;
+	};
+	const [hi, lo] = [lum(over), lum([pr, pg, pb])].sort((x, y) => y - x) as [number, number];
+	return (hi + 0.05) / (lo + 0.05);
 }
 
 /** Switch the interface language (`en`, `zh-CN`). */

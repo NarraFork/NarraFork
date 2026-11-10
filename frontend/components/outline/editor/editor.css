@@ -174,7 +174,7 @@
 
 /*
  * The focus handle of a row without a bullet: floated to the end of the first line, always drawn
- * (touch has no hover), muted. It takes the first line's end only; later lines run full width.
+ * (touch has no hover). It takes the first line's end only; later lines run full width.
  */
 .nf-outline-editor .ob-zoom {
 	float: right;
@@ -182,9 +182,22 @@
 	width: 20px;
 	height: var(--nf-type-body-line);
 	margin-left: 4px;
+	/* The only pointer and touch route to focusing a task: 3:1 or more against the page in both
+	   schemes (the muted colour as it is, no opacity over it). */
 	color: var(--ob-muted);
-	opacity: 0.55;
 	user-select: none;
+}
+
+/*
+ * A body that is one box (a code block, a table) would be narrowed whole by a float beside it:
+ * there the handle sits over the box's top right corner and takes no room.
+ */
+.nf-outline-editor .ob-block:has(> .ob-content > :is(pre, table):first-child) > .ob-zoom {
+	float: none;
+	position: absolute;
+	right: 0;
+	top: 0;
+	z-index: 1;
 }
 
 .nf-outline-editor .ob-zoom svg {

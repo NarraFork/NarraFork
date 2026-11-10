@@ -226,6 +226,15 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	};
 	mapText.more = (count) => t("map.more", { count });
 	mapText.stage = t("map.stage");
+	// Frames already drawn keep their words until their block redraws: the focus handle (the only
+	// pointer route to focusing a task) follows a change of language at once.
+	const focusLabel = t("page.focus");
+	useEffect(() => {
+		for (const handle of frame.current?.querySelectorAll<HTMLElement>(".ob-zoom") ?? []) {
+			handle.title = focusLabel;
+			handle.setAttribute("aria-label", focusLabel);
+		}
+	}, [focusLabel]);
 
 	useEffect(() => {
 		callbacks.current.onClient?.(client, () => surfaceRef.current?.outline ?? null);

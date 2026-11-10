@@ -135,6 +135,11 @@ export function applyChrome(container: HTMLElement, g: Gutter, s: ChromeState): 
 	container.dataset.marker = marker;
 	g.bullet.style.display = marker === "bullet" ? "" : "none";
 	g.zoom.style.display = marker === "bullet" ? "none" : "";
+	// Said in the language of the moment (a frame outlives a change of language).
+	if (g.zoom.title !== chromeText.focus) {
+		g.zoom.title = chromeText.focus;
+		g.zoom.setAttribute("aria-label", chromeText.focus);
+	}
 	g.check.classList.toggle("is-question", question);
 	if (question) {
 		setIcon(g.check, QUESTION_ICON);

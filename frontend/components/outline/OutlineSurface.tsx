@@ -340,7 +340,9 @@ function SurfaceBody({
 	const root = view?.blocks.find((block) => block.id === view.rootId);
 	const storedTitle = root ? titleOf(root.content) || root.sid : "";
 	// A subagent report's container, focused: its line as people read it (their language and
-	// time zone), here, on the tab and in "recent".
+	// time zone). Display only: what is remembered ("recent") and what is handed on (`onLoaded`,
+	// from which hosts name the tab and write references into messages) is the stored title,
+	// decoded again wherever it is shown, so a time never goes stale or loses its date.
 	const rootTitle =
 		(root && reportLineDisplay(root.content, { t, locale: i18n?.language })) ?? storedTitle;
 
@@ -348,9 +350,9 @@ function SurfaceBody({
 	const missing = query.error instanceof ApiError && query.error.status === 404;
 	useEffect(() => {
 		if (view?.current && root && settled) {
-			recordOutlineRecent({ spaceId, blockId, title: rootTitle, visitedAt: Date.now() });
+			recordOutlineRecent({ spaceId, blockId, title: storedTitle, visitedAt: Date.now() });
 		}
-	}, [view?.current, root, settled, spaceId, blockId, rootTitle]);
+	}, [view?.current, root, settled, spaceId, blockId, storedTitle]);
 	useEffect(() => {
 		if (missing && asOf === undefined) forgetOutlineRecent(blockId);
 	}, [missing, asOf, blockId]);
@@ -368,7 +370,7 @@ function SurfaceBody({
 			pageId,
 			rootId: blockId,
 			address: `${loadedSpaceKey}/${rootSid}`,
-			title: rootTitle,
+			title: storedTitle,
 			canWrite: loadedCanWrite,
 		});
 	}, [
@@ -378,7 +380,7 @@ function SurfaceBody({
 		pageId,
 		loadedSpaceKey,
 		rootSid,
-		rootTitle,
+		storedTitle,
 		loadedCanWrite,
 		settled,
 	]);

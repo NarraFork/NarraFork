@@ -54,9 +54,10 @@
 	--nf-status-bg: var(--mantine-color-green-6);
 }
 
+/* Cancelled is not "to do": the cross, on a warmer (red-tinted) ground than to do's gray. */
 .nf-status[data-status="cancelled"] {
 	--nf-status-fg: var(--mantine-color-gray-7);
-	--nf-status-bg: var(--mantine-color-gray-6);
+	--nf-status-bg: var(--mantine-color-red-6);
 }
 
 .nf-status[data-status="waiting"] {
@@ -100,7 +101,7 @@
 
 [data-mantine-color-scheme="dark"] .nf-status[data-status="cancelled"] {
 	--nf-status-fg: var(--mantine-color-gray-5);
-	--nf-status-bg: var(--mantine-color-gray-5);
+	--nf-status-bg: var(--mantine-color-red-6);
 }
 
 [data-mantine-color-scheme="dark"] .nf-status[data-status="waiting"] {

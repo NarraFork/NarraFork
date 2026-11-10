@@ -720,6 +720,25 @@ test("a page's title is shown twice at most in the dock: the tab and the page's 
 		await expectShownAs(page, "Fix the refresh race", ["page", "tab"]);
 		await expectShownAs(page, "Tidy page", ["breadcrumbs"]);
 
+		// A report container focused: the tab and the page read it as people do, but what is
+		// remembered ("recent", later shown days on) is the stored text, decoded when shown.
+		await call(
+			page,
+			(f, s, b, p) => f.openOutline({ spaceId: s, blockId: b, pageId: p }),
+			space.id,
+			tidy.report,
+			tidy.pageId,
+		);
+		await until(page, (f) => (f.outlinePanels()[0]?.title ?? "").startsWith("Subagent report · "));
+		expect((await call(page, (f) => f.outlinePanels()))[0]?.title).not.toMatch(/UTC|generation|代/);
+		await until(page, (f) => f.recents().length > 0);
+		const remembered = await call(page, (f) => f.recents());
+		expect(remembered.find((r) => r.blockId === tidy.report)).toEqual({
+			blockId: tidy.report,
+			title: STORED_REPORT,
+		});
+		expect(remembered.map((r) => r.title).join("\n")).not.toContain("Subagent report");
+
 		// Read only (as of a commit): the same count with the tree's own title.
 		await call(
 			page,
@@ -897,6 +916,15 @@ test("the read-only tree: one marker per row, body-size headings, the report lin
 				expect(new Set(["todo", "doing", "done"].map((s) => got[s]?.color)).size).toBe(3);
 				colours[scheme] = got.doing?.color as string;
 			}
+			// The focus handle is the only pointer route to focusing a task: plainly visible.
+			expect(
+				await call(
+					page,
+					(f, id: string) => f.contrastOnPage(`[data-block-id="${id}"] > a:last-child`),
+					tidy.task,
+				),
+				`${scheme} focus handle`,
+			).toBeGreaterThanOrEqual(3);
 		}
 		expect(colours.light).not.toBe(colours.dark);
 		await page.evaluate(() =>
@@ -910,6 +938,26 @@ test("the read-only tree: one marker per row, body-size headings, the report lin
 					?.getAttribute("aria-label") === "Done",
 			{ timeout: 10_000 },
 			tidy.statuses.done,
+		);
+
+		// With larger text the badge grows; the bullet's column grows with it, so a task's text
+		// and a plain row's still start in one column.
+		await call(page, (f) => f.applyTypography({ fontScalePercent: 150 }));
+		await page.waitForFunction(
+			(id) =>
+				(document.querySelector(`[data-block-id="${id}"] > [role=img] svg`)?.getBoundingClientRect()
+					.width ?? 0) > 18,
+			{ timeout: 10_000 },
+			tidy.task,
+		);
+		expect((await row(tidy.task))?.textLeft).toBe((await row(tidy.plain))?.textLeft as number);
+		await call(page, (f) => f.applyTypography({ fontScalePercent: 100 }));
+		await page.waitForFunction(
+			(id) =>
+				document.querySelector(`[data-block-id="${id}"] > [role=img] svg`)?.getBoundingClientRect()
+					.width === 16,
+			{ timeout: 10_000 },
+			tidy.task,
 		);
 
 		// What the bullet did, on a task: the handle focuses it (a real click).

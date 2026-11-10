@@ -86,8 +86,10 @@ describe("task state badges: colours", () => {
 				const tokens = tokensOf(status, scheme);
 				expect(tokens, `${status} in ${scheme}`).not.toBeNull();
 				// The colour named for the state (`shared/outline-status.ts`), background and icon.
+				// Cancelled alone has a ground of another colour (red-tinted), so it never looks
+				// like to do, which shares its gray.
 				expect(tokens?.bg.split("-")[0], `${status} ${scheme} background`).toBe(
-					OUTLINE_STATUS_TONE[status],
+					status === "cancelled" ? "red" : OUTLINE_STATUS_TONE[status],
 				);
 				expect(tokens?.fg.split("-")[0], `${status} ${scheme} icon`).toBe(
 					OUTLINE_STATUS_TONE[status],
@@ -109,6 +111,15 @@ describe("task state badges: colours", () => {
 			}
 		}
 		expect(low).toEqual([]);
+	});
+
+	test("to do and cancelled, both gray icons, do not share a background", () => {
+		for (const scheme of ["light", "dark"] as const) {
+			const surface = SURFACES[scheme][0] as Rgb;
+			const ground = (status: string) =>
+				mix(palette((tokensOf(status, scheme) as Tokens).bg), surface, tintOf(scheme));
+			expect(ground("cancelled"), scheme).not.toEqual(ground("todo"));
+		}
 	});
 
 	test("the badge is seen against the page: its tint is not the page's own colour", () => {

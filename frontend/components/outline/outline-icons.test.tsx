@@ -238,6 +238,14 @@ describe("outline icons", () => {
 		expect(g.zoom.getAttribute("aria-label")).toBe(chromeText.focus);
 		expect(g.zoom.textContent).toBe("");
 		expect(g.el.contains(g.zoom)).toBe(false);
+		// A frame outlives a change of language: its handle says the action in the new one the
+		// next time the frame is drawn.
+		const english = chromeText.focus;
+		chromeText.focus = "聚焦到这一块";
+		applyChrome(block, g, { hasKids: false, collapsed: false, task: " " });
+		expect(g.zoom.title).toBe("聚焦到这一块");
+		expect(g.zoom.getAttribute("aria-label")).toBe("聚焦到这一块");
+		chromeText.focus = english;
 	});
 
 	test("an icon is built in the document it goes into, not the first one it was built for", () => {

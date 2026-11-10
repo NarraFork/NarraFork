@@ -182,8 +182,10 @@
 	justify-content: center;
 }
 
+/* The marker's column is one width whatever the marker (the bullet or a task's badge, which
+   grows with the reader's text), so text starts in one column on every row. */
 .bullet {
-	flex: 0 0 16px;
+	flex: 0 0 max(16px, var(--nf-outline-icon));
 	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
@@ -221,6 +223,11 @@
 	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
+}
+
+.row > .taskIcon {
+	flex: 0 0 max(16px, var(--nf-outline-icon));
+	justify-content: center;
 }
 
 /*
@@ -293,7 +300,7 @@
 /*
  * The focus handle of a row without a bullet (a task, a question): the bullet is how a block is
  * focused, and those rows show their checkbox or mark in its place. Always drawn (touch has no
- * hover), muted, on the first line.
+ * hover), on the first line.
  */
 .focusHandle {
 	flex: 0 0 20px;
@@ -301,14 +308,11 @@
 	display: flex;
 	align-items: center;
 	justify-content: center;
+	/* The only pointer and touch route to focusing a task: 3:1 or more against the page in both
+	   schemes (the dimmed colour as it is, no opacity over it). */
 	color: var(--mantine-color-dimmed);
-	opacity: 0.55;
 	text-decoration: none;
 	border-radius: var(--mantine-radius-sm);
-}
-
-.focusHandle:focus-visible {
-	opacity: 1;
 }
 
 .focusHandle svg {
