@@ -441,6 +441,25 @@ export type NarraForkEvent =
 	  }
 	| {
 			/**
+			 * Tasks of an outline root session changed in one commit of its session space (outline P2
+			 * PR 12a, `outline/plugin-task-events.ts`): what plugins follow a session's tasks by (the
+			 * public topic `narrafork.narrator.tasks.changed`, and `narrafork.narrator.spec.changed`
+			 * while the old commands last). Ids and statuses only; `deleted` / `none` for a task deleted
+			 * or no longer a task. At most 50 changes; `truncated` when the commit made more.
+			 */
+			type: "outline:session_tasks_changed";
+			narratorId: string;
+			spaceKey: string;
+			seq: number;
+			actorKind: "human" | "agent" | "system";
+			changes: Array<{
+				blockId: string;
+				status: "todo" | "doing" | "done" | "cancelled" | "deleted" | "none";
+			}>;
+			truncated: boolean;
+	  }
+	| {
+			/**
 			 * Pending changes of outline pages changed (one proposed, merged into, decided or
 			 * withdrawn; design §2.6). Ids only: a page subscriber re-reads the page's summary.
 			 * Notifying the people who decide is plan PR 7 (the inbox).

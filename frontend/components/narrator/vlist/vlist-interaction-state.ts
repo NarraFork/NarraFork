@@ -1,3 +1,11 @@
+import {
+	applyPlanTreeAction,
+	DEFAULT_PLAN_TREE_VIEW,
+	isDefaultPlanTreeView,
+	type PlanTreeAction,
+	type PlanTreeView,
+	planTreeViewSignature,
+} from "@shared/outline-plan-tree";
 import type { RenderLod } from "./prepared-block";
 
 export interface VListInteractionState {
@@ -77,6 +85,13 @@ export interface VListInteractionState {
 	 * `toggleVListFileChangesOpen`).
 	 */
 	fileChangesOpen: ReadonlySet<string>;
+	/**
+	 * Outline plan cards (ExitPlanMode of an outline session): which nodes and texts of the plan's
+	 * tree the reader opened, by card (`outline-plan-tree.ts`). Absent: the overview, the root and
+	 * two levels under it. Height-affecting (rows appear, texts unclamp), so it is resolved during
+	 * adaptation like `promptOpen`, and it survives an LOD change like every reader-owned fold.
+	 */
+	planTrees: ReadonlyMap<string, PlanTreeView>;
 }
 
 export function createVListInteractionState(lod: RenderLod): VListInteractionState {
@@ -93,6 +108,7 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 		fullPayloadRequested: new Set(),
 		promptOpen: new Set(),
 		fileChangesOpen: new Set(),
+		planTrees: new Map(),
 	};
 }
 
@@ -116,6 +132,7 @@ export function resetVListInteractionStateForLod(
 		promptOpen: state.promptOpen,
 		// Survives an LOD change like every other reader-owned fold state.
 		fileChangesOpen: state.fileChangesOpen,
+		planTrees: state.planTrees,
 	};
 }
 
@@ -293,6 +310,30 @@ export function toggleVListFileChangesOpen(
 /** True when this subagent card's file-change list is expanded. */
 export function isFileChangesOpenRow(state: VListInteractionState, key: string): boolean {
 	return state.fileChangesOpen.has(key);
+}
+
+/** The reader's view of an outline plan card's tree (the overview when they opened nothing). */
+export function resolvePlanTreeViewRow(state: VListInteractionState, key: string): PlanTreeView {
+	return state.planTrees.get(key) ?? DEFAULT_PLAN_TREE_VIEW;
+}
+
+/** Open or fold a node, a text, or the whole tree of an outline plan card. */
+export function applyVListPlanTreeAction(
+	state: VListInteractionState,
+	key: string,
+	action: PlanTreeAction,
+): VListInteractionState {
+	const view = applyPlanTreeAction(resolvePlanTreeViewRow(state, key), action);
+	const next = new Map(state.planTrees);
+	if (isDefaultPlanTreeView(view)) next.delete(key);
+	else next.set(key, view);
+	return { ...state, planTrees: next };
+}
+
+/** A row-local memo term for a plan card's view (empty for the overview). */
+export function planTreeRowSignature(state: VListInteractionState, key: string): string {
+	const view = state.planTrees.get(key);
+	return view ? planTreeViewSignature(view) : "";
 }
 
 export function toggleVListRow(

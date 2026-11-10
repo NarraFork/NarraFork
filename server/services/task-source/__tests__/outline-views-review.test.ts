@@ -31,7 +31,6 @@ import { settings } from "../../../lib/settings";
 import { compileDelegationCeiling } from "../../custom-subagent-service";
 import { buildEffectiveSystemPrompt } from "../../narrator-prompt";
 import { narratorService } from "../../narrator-service";
-import { setSpecBehaviorFenceForPlugin } from "../../narrator-session";
 import * as runner from "../../outline/edit-text-runner";
 import { ensureSessionSpace } from "../../outline/spaces";
 import { outlineStore } from "../../outline/store";
@@ -47,6 +46,7 @@ import {
 	resetOutlineBehaviorImport,
 } from "../outline-behavior";
 import { OUTLINE_VIEW_LIMITS, resetOutlineViewCache } from "../outline-views";
+import { seedLegacyPluginSop } from "./legacy-plugin-sop";
 import { seedBehaviorPage, seedOutlineTasks } from "./outline-task-source-scenarios";
 
 const NOW = "2026-11-02T00:00:00.000Z";
@@ -149,7 +149,7 @@ describe("B1: the outline switched off after the import", () => {
 	test("the session runs as spec and its fence carries the page's rules ahead of the SOP", async () => {
 		const id = await session();
 		await oldFence(id, "Never force-push the main branch.");
-		await setSpecBehaviorFenceForPlugin(id, "Report to the lead.", "upsert");
+		await seedLegacyPluginSop(id, "Report to the lead.");
 		expect(await importOutlineBehaviorFence(id, "en")).toBe("imported");
 		expect((await readSpecFile(id, "spec://behavior_fence")).content).not.toContain("force-push");
 
@@ -319,11 +319,7 @@ describe("S2: the page first, the plugin SOP with what is left (probe C)", () =>
 		const id = await session();
 		const pageId = await seedBehaviorPage(id, "Rule 1: never force-push the main branch.");
 		for (let n = 2; n <= 5; n++) await personAdds(id, pageId, `Rule ${n}: ${"keep it ".repeat(6)}`);
-		await setSpecBehaviorFenceForPlugin(
-			id,
-			`Team SOP. ${"report to the lead ".repeat(260)}`,
-			"upsert",
-		);
+		await seedLegacyPluginSop(id, `Team SOP. ${"report to the lead ".repeat(260)}`);
 		const view = part(await parts(id), "outline.behavior") ?? "";
 		expect(view.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.behaviorChars);
 		for (const n of [1, 2, 3, 4, 5]) expect(view).toContain(`Rule ${n}:`);
@@ -347,7 +343,7 @@ describe("S2: the page first, the plugin SOP with what is left (probe C)", () =>
 			actor: { kind: "human", id: "pat" },
 			responsibleUserId: null,
 		});
-		await setSpecBehaviorFenceForPlugin(id, "Report back.", "upsert");
+		await seedLegacyPluginSop(id, "Report back.");
 		const view = part(await parts(id), "outline.behavior") ?? "";
 		expect(view.length).toBeLessThanOrEqual(OUTLINE_VIEW_LIMITS.behaviorChars);
 		expect(view).toContain("not all shown");
@@ -415,7 +411,7 @@ describe("S4: fence text that is not on the page yet", () => {
 	test("a fence of 230 items imports in several commits, resumes where it stopped, never twice", async () => {
 		const id = await session();
 		await oldFence(id, Array.from({ length: 230 }, (_, n) => `- Old fence rule ${n}`).join("\n"));
-		await setSpecBehaviorFenceForPlugin(id, "Report back.", "upsert");
+		await seedLegacyPluginSop(id, "Report back.");
 		// The second commit fails: the first stays, the fence is untouched, the view shows both.
 		const real = outlineWrite.writeOutline;
 		let calls = 0;
@@ -512,7 +508,7 @@ describe("N2: the import and the plugin's SOP channel (probe G)", () => {
 	test("an SOP update landing during the import is kept; the rewrite is the system's", async () => {
 		const id = await session();
 		await oldFence(id, "Never force-push the main branch.");
-		await setSpecBehaviorFenceForPlugin(id, "OLD SOP", "upsert");
+		await seedLegacyPluginSop(id, "OLD SOP");
 		const real = runner.processEditText;
 		let once = false;
 		const spy = spyOn(runner, "processEditText").mockImplementation((async (
@@ -521,7 +517,8 @@ describe("N2: the import and the plugin's SOP channel (probe G)", () => {
 			const out = await real(...args);
 			if (!once) {
 				once = true;
-				await setSpecBehaviorFenceForPlugin(id, "NEW SOP", "upsert");
+				// The pre-PR 12a channel (since then the plugin's command writes its block).
+				await seedLegacyPluginSop(id, "NEW SOP");
 			}
 			return out;
 		}) as typeof real);

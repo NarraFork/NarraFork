@@ -192,7 +192,7 @@ async function block(id: string) {
 	return row;
 }
 
-/** A session in plan mode with a plan of two steps and a note (four blocks with the root). */
+/** A session in plan mode with a plan: the background, two steps and a note (five with the root). */
 async function planned() {
 	const owner = await user();
 	const id = await session(owner);
@@ -214,6 +214,13 @@ async function planned() {
 			task: { status: "todo" },
 		},
 		{ op: "insert", parent: { id: root.blockId }, content: "Decision: use the v2 API" },
+		// The plan format's background, first under the root (plan readability).
+		{
+			op: "insert",
+			parent: { id: root.blockId },
+			position: { first: true },
+			content: "The importer fails every night and is rerun by hand; this makes it run unattended.",
+		},
 	]);
 	const space = await ensureSessionSpace(id);
 	const a = await block(written.results[1]?.blockId as string);
@@ -427,20 +434,20 @@ describe("concerns: comments under the plan, and a person decides", () => {
 		expect((await block(plan.root)).taskJson?.plan).toMatchObject({ state: "planning", round: 0 });
 		expect(submission?.root.round).toBe(1);
 		expect(submission?.summary).toBe("First version");
-		expect(submission?.counts.added).toBe(4);
+		expect(submission?.counts.added).toBe(5);
 		const skip = new Set([reviewBlock?.id as string]);
 		expect((await readPlanDiff({ rootId: plan.root, fromSeq: 0, toSeq: null }))?.counts.added).toBe(
-			7,
+			8,
 		);
 		expect(
 			(await readPlanDiff({ rootId: plan.root, fromSeq: 0, toSeq: null, skip }))?.counts.added,
-		).toBe(4);
+		).toBe(5);
 		expect(plan.outcome()).toBeNull();
 		// The inbox has the plan's own approval row and nothing for the review (D48 Q1).
 		const inbox = await listHumanAttentionForPrincipal({ userId: plan.owner, isAdmin: false });
 		const rows = inbox.items.filter((item) => item.narratorId === plan.id);
 		expect(rows.map((item) => item.kind)).toEqual(["plan_approval"]);
-		expect(rows[0]?.summary).toBe("Ship the importer · v1 +4 ~0 −0");
+		expect(rows[0]?.summary).toBe("Ship the importer · v1 +5 ~0 −0");
 	});
 
 	test("a return tells the agent how many comments there are and where", async () => {
@@ -762,7 +769,7 @@ describe("this version's reviews are not the plan (review round 1 N1, N2, N4)", 
 		expect(requests[0]?.prompt).not.toContain("] Review (version 1)");
 		const input = await permissionInput(plan.id, call, result.decision.input ?? result.input);
 		const submission = outlinePlanSubmissionOf(input);
-		expect(submission?.counts.added).toBe(4);
+		expect(submission?.counts.added).toBe(5);
 		expect(submission?.review?.blockId).not.toBe(first?.blockId);
 		expect(submission?.review?.comments.map((c) => c.text)).toEqual(["Name the parser"]);
 		expect(input.plan).not.toContain("Review (version 1)");
@@ -774,17 +781,37 @@ describe("this version's reviews are not the plan (review round 1 N1, N2, N4)", 
 	test("a plan near the size limit is not sent back once its comments are written; the limit names bytes", async () => {
 		const plan = await planned();
 		const filler = "x".repeat(1000);
-		// About 245 KB of plan (one transaction holds at most 200 operations).
-		for (const batch of [0, 1])
-			await agentWrite(
-				plan.id,
-				plan.owner,
-				Array.from({ length: 120 }, (_, i) => ({
-					op: "insert" as const,
+		// About 245 KB of plan, in the plan format (plan readability: short points in levels, at
+		// most 15 on one, longer details under them): with the background, the two steps and the
+		// note, 11 phases of 15 tasks of 5 details. Two phases a transaction (one holds at most 200
+		// operations).
+		for (let pair = 0; pair < 6; pair++) {
+			const ops: OutlineOp[] = [];
+			for (const p of [pair * 2, pair * 2 + 1].filter((n) => n < 11)) {
+				ops.push({
+					op: "insert",
+					tempId: `p${p}`,
 					parent: { id: plan.root },
-					content: `Detail ${batch}-${i}: ${filler}`,
-				})),
-			);
+					content: `Phase ${p}`,
+				});
+				for (let t = 0; t < 15; t++) {
+					ops.push({
+						op: "insert",
+						tempId: `t${p}-${t}`,
+						parent: { tempId: `p${p}` },
+						content: `Task ${p}-${t}`,
+						task: { status: "todo" },
+					});
+					for (let d = 0; d < 5; d++)
+						ops.push({
+							op: "insert",
+							parent: { tempId: `t${p}-${t}` },
+							content: `Detail ${p}-${t}-${d}: ${filler.slice(0, 273)}`,
+						});
+				}
+			}
+			await agentWrite(plan.id, plan.owner, ops);
+		}
 		const call = await exitPlanCall(plan.id, { mode: "outline" });
 		turns = [
 			async () => [
@@ -857,6 +884,34 @@ describe("this version's reviews are not the plan (review round 1 N1, N2, N4)", 
 });
 
 // ── ok ─────────────────────────────────────────────────────────────────────────────────────
+
+describe("a plan not in the plan format (plan readability)", () => {
+	test("is sent back to the agent by the gate before any review runs; nothing is written", async () => {
+		const plan = await planned();
+		// The background taken out: the first block is now a step.
+		const first = (await outlineStore.listChildren(plan.space.id, plan.root, 10))[0];
+		await agentWrite(plan.id, plan.owner, [{ op: "delete", block: { id: first?.id as string } }]);
+		const commitsBefore = (await outlineStore.listCommits(plan.space.id, { limit: 200 })).length;
+		const call = await exitPlanCall(plan.id, { mode: "outline" });
+		requests.length = 0;
+		turns = [async () => [review({ verdict: "ok" })]];
+		const result = await resolveExitPlanModeReflection(
+			config(plan.id, plan.owner),
+			[],
+			call.toolUse,
+		);
+		expect(result.decision.action).toBe("revise");
+		expect(result.decision.action === "revise" ? result.decision.feedback : "").toContain(
+			"does not follow the plan format yet; nothing was submitted to the user",
+		);
+		expect(requests).toHaveLength(0);
+		expect(await reviewCommits(plan.space.id)).toHaveLength(0);
+		expect((await outlineStore.listCommits(plan.space.id, { limit: 200 })).length).toBe(
+			commitsBefore,
+		);
+		expect((await block(plan.root)).taskJson?.plan).toMatchObject({ state: "planning", round: 0 });
+	});
+});
 
 describe("ok: approved as a draft on the person's behalf", () => {
 	test("by system:plan-review, never locked, nothing written, not the person's work", async () => {
@@ -1150,9 +1205,9 @@ describe("review round 2", () => {
 		);
 		expect(requests[0]?.prompt).toContain("Step B2: DROP THE PROD TABLE");
 		const submission = outlinePlanSubmissionOf(result.input);
-		// The plan's 4 blocks and the task: the review's own blocks, as it wrote them, are passed
+		// The plan's 5 blocks and the task: the review's own blocks, as it wrote them, are passed
 		// over (review round 3 N9), what was added under them is not.
-		expect(submission?.counts.added).toBe(5);
+		expect(submission?.counts.added).toBe(6);
 		expect(String(result.input.plan)).toContain("Step B2: DROP THE PROD TABLE");
 		expect(String(result.input.plan)).toContain("Review (version 1)");
 		// The diff a person opens shows it too (the route leaves out only the omittable ones).
@@ -1221,7 +1276,7 @@ describe("review round 2", () => {
 				actor: { kind: "human", id: plan.owner },
 				responsibleUserId: plan.owner,
 			});
-			// The diff a person opens: the plan's 4 blocks and the person's one, not the review's.
+			// The diff a person opens: the plan's 5 blocks and the person's one, not the review's.
 			const reviews = await planReviewBlocks(outlineStore, plan.id, await block(plan.root), 0);
 			expect(reviews.get(current.blockId)?.omittable).toBe(false);
 			const diff = await readPlanDiff({
@@ -1230,7 +1285,7 @@ describe("review round 2", () => {
 				toSeq: null,
 				...reviewDiffOptions(reviews),
 			});
-			expect(diff?.counts.added).toBe(5);
+			expect(diff?.counts.added).toBe(6);
 			expect(diff?.entries.filter((e) => e.after?.includes(text))).toHaveLength(1);
 			// The agent is told the person's line only.
 			await decideOutlinePlanRequest({
@@ -1537,7 +1592,7 @@ describe("a restart after the comments were written", () => {
 		expect(restored.decision.action).toBe("human");
 		const handed = restored.decision.action === "human" ? restored.decision.input : undefined;
 		expect(outlinePlanSubmissionOf(handed)?.review?.count).toBe(2);
-		expect(outlinePlanSubmissionOf(handed)?.counts.added).toBe(4);
+		expect(outlinePlanSubmissionOf(handed)?.counts.added).toBe(5);
 		expect(await reviewCommits(plan.space.id)).toHaveLength(1);
 		const row = await persisted(call.rowId);
 		expect(row.permissionSuggestions?.[0]).toMatchObject({ status: "awaiting_user", requestId });

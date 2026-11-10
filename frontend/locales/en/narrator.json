@@ -1090,6 +1090,7 @@
 	"specForkResetConfirmMessage": "This clears the tasks, restores index.md and the behavior fence to their defaults, and deletes any custom note files. It only affects this fork, not the original conversation. This cannot be undone.",
 	"specForkClearedToast": "Tasks cleared",
 	"specForkResetToast": "Spec reset",
+	"specCarryoverOutlineReadonly": "This session's tasks are in the outline now: an old card cannot clear or reset them.",
 	"specClearedCarryoverTitle": "Remaining tasks",
 	"specClearedCarryoverDesc": "Context was cleared, but {{count}} task(s) remain in the spec ({{open}} open, {{protectedOpen}} protected). You can clear the tasks or reset the spec.",
 	"autoContinuation": "Auto-continuation",
@@ -2897,6 +2898,27 @@
 		"summaryShort": "v{{version}} · +{{added}} ~{{changed}} −{{removed}}",
 		"summaryFirstShort": "v{{version}} · new · +{{added}}",
 		"agentSummary": "What changed: {{summary}}",
+		"tree": {
+			"overview_one": "Outline · {{count}} block",
+			"overview_other": "Outline · {{count}} blocks",
+			"overviewAll_one": "Outline · all {{count}} block shown",
+			"overviewAll_other": "Outline · all {{count}} blocks shown",
+			"expandAll": "Expand all",
+			"collapseAll": "Collapse all",
+			"expand": "Expand",
+			"collapse": "Collapse",
+			"altHint": "Alt+click: everything inside",
+			"subtree": "Expand/collapse everything in “{{title}}”",
+			"subtreeExpand": "Expand everything inside",
+			"subtreeCollapse": "Collapse everything inside",
+			"detailsMore": "{{n}} more ▸",
+			"detailsOne": "Expand ▸",
+			"showInside": "Show everything inside this item",
+			"showWhole": "Show the whole text",
+			"showLess": "Show less",
+			"more_one": "{{count}} more block: open the plan in the outline to see it",
+			"more_other": "{{count}} more blocks: open the plan in the outline to see them"
+		},
 		"reviewCount_one": "{{count}} review comment",
 		"reviewCount_other": "{{count}} review comments",
 		"review": {
@@ -2945,7 +2967,9 @@
 				"doing": "in progress",
 				"done": "done",
 				"cancelled": "cancelled"
-			}
+			},
+			"showWhole": "Show all",
+			"showLess": "Show less"
 		}
 	}
 }

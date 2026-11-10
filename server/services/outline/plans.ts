@@ -22,6 +22,14 @@
  * committed first): its rendering (the snapshot the approval shows) and its diff against the
  * version it is compared with (`plan.baseSeq`, `plan-diff.ts`). Nothing is written.
  *
+ * A model's fresh submission is also held to the plan format (`checkStructure`, plan
+ * readability; `@shared/outline-plan-structure`): the root a one-line title, its first block a
+ * background paragraph, big and small points one idea each with their implementation details
+ * under them, the notable points last, no flat list of many blocks. A plan that breaks it is
+ * refused with the blocks to fix, before anything waits for a person. The notes for the agent
+ * under the root (returned feedback, earlier reviews: {@link isPlanNoteBlock}) are not the
+ * agent's text and are left out.
+ *
  * DECIDING ({@link decideOutlinePlan}): one `plan` commit, behind the barrier.
  *
  *   | decision | the root                                                          | also       |
@@ -73,6 +81,11 @@ import type {
 	OutlinePlanReviewComment,
 	OutlinePlanSubmission,
 } from "@shared/outline-api";
+import {
+	OUTLINE_PLAN_STRUCTURE,
+	type PlanStructureNode,
+	planStructureIssues,
+} from "@shared/outline-plan-structure";
 import { withOutlineLiveBarrier } from "./live-barrier";
 import {
 	OUTLINE_LIMITS,
@@ -398,9 +411,13 @@ export async function ensurePlanRoot(args: {
 			}
 		}
 		const fallback = args.locale === "zh-CN" ? "计划" : "Plan";
+		// A title the plan format accepts as its root (plan readability): one line, at most
+		// `rootChars` characters, so the root plan mode makes is never the first thing refused.
 		const title =
-			(args.title ?? "").replace(/\s+/g, " ").trim().slice(0, OUTLINE_PLAN_LIMITS.titleChars) ||
-			fallback;
+			Array.from((args.title ?? "").replace(/\s+/g, " ").trim())
+				.slice(0, OUTLINE_PLAN_STRUCTURE.rootChars)
+				.join("")
+				.trim() || fallback;
 		ops.push({
 			op: "insert",
 			parent,
@@ -436,6 +453,32 @@ async function planningRootById(
 	return space ? { space, block } : null;
 }
 
+/**
+ * The notes written under a plan root for the agent, as their first words (both languages, any
+ * version): a person's returned feedback (`getOutlinePlanReturnedNote`) and a review's block
+ * (`getOutlinePlanReviewTitle`).
+ */
+const PLAN_NOTE_PREFIXES: readonly RegExp[] = (["en", "zh-CN"] as const)
+	.flatMap((locale) => [
+		getOutlinePlanReturnedNote(locale, 0, ""),
+		getOutlinePlanReviewTitle(locale, 0),
+	])
+	.map(
+		(text) =>
+			new RegExp(
+				`^${text
+					.trim()
+					.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+					.replace("0", "\\d+")}`,
+			),
+	);
+
+/** Whether a child of a plan root is a note for the agent (a person's or a review's, not its). */
+export function isPlanNoteBlock(node: Pick<PlanStructureNode, "content">): boolean {
+	const content = node.content ?? "";
+	return PLAN_NOTE_PREFIXES.some((prefix) => prefix.test(content));
+}
+
 export type OutlinePlanSubmissionRead =
 	| {
 			ok: true;
@@ -461,6 +504,11 @@ export async function readPlanSubmission(args: {
 	 * version. Anything else is ignored.
 	 */
 	review?: OutlinePlanReviewClaim | null;
+	/**
+	 * Hold the plan to its format (a model's fresh submission; not a call restored or handed on,
+	 * which a person already has in front of them): refused as `structure` when it breaks it.
+	 */
+	checkStructure?: boolean;
 	store?: OutlineStore;
 }): Promise<OutlinePlanSubmissionRead> {
 	const store = args.store ?? outlineStore;
@@ -495,6 +543,7 @@ export async function readPlanSubmission(args: {
 			budget: { blocks: OUTLINE_PLAN_LIMITS.maxBlocks, bytes: OUTLINE_PLAN_LIMITS.renderBytes },
 			planNotes: false,
 			omit,
+			withTree: args.checkStructure === true,
 			store,
 		});
 		if (!read) return { ok: false, problem: { kind: "notFound", address: found.address } };
@@ -508,6 +557,21 @@ export async function readPlanSubmission(args: {
 					kib: OUTLINE_PLAN_LIMITS.renderBytes / 1024,
 				},
 			};
+		if (args.checkStructure === true && read.tree) {
+			const report = planStructureIssues(read.tree, { isNote: isPlanNoteBlock });
+			if (report.total > 0) {
+				const key = read.space.key;
+				return {
+					ok: false,
+					problem: {
+						kind: "structure",
+						address: found.address,
+						issues: report.issues.map((issue) => ({ ...issue, address: `${key}/${issue.sid}` })),
+						total: report.total,
+					},
+				};
+			}
+		}
 		const claim = args.review;
 		const written = claim ? reviews.get(claim.blockId) : undefined;
 		const review =

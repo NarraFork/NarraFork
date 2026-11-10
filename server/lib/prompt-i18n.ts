@@ -19,6 +19,7 @@ export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
 export type {
 	OutlinePlanPromptReview,
 	OutlinePlanPromptRoot,
+	OutlinePlanStructureProblem,
 	OutlinePlanSubmitProblem,
 } from "./prompts/outline-plan";
 export {

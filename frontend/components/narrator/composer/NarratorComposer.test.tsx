@@ -1476,11 +1476,25 @@ describe("composer Enter focus", () => {
 			host.append(control);
 			expect(press(control).defaultPrevented).toBe(false);
 		}
+		// The rule the waiting permission's Enter shortcut uses too (`enter-ownership.ts`): a tab,
+		// a link, a menu item in the composer's own panel own their Enter (plain text there does
+		// not: Enter on it returns to the chat input).
+		host.setAttribute("data-narrator-panel", "");
+		const text = document.createElement("p");
+		host.append(text);
+		expect(press(text).defaultPrevented).toBe(true);
+		for (const attrs of [{ role: "tab" }, { href: "#" }, { role: "menuitem" }]) {
+			const control = document.createElement(attrs.href ? "a" : "div");
+			for (const [name, value] of Object.entries(attrs)) control.setAttribute(name, value);
+			host.append(control);
+			expect(press(control).defaultPrevented).toBe(false);
+		}
+		host.removeAttribute("data-narrator-panel");
 		const modal = document.createElement("div");
 		modal.setAttribute("aria-modal", "true");
 		host.append(modal);
 		expect(press(document.body).defaultPrevented).toBe(false);
-		expect(focus).toHaveBeenCalledTimes(1);
+		expect(focus).toHaveBeenCalledTimes(2);
 		focus.mockRestore();
 	});
 });

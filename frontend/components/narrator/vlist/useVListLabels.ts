@@ -31,6 +31,7 @@ import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import type { PlanTreeLabels } from "./render/PlanTreeBody";
 
 /**
  * Literal placeholder passed as i18next's `count` so plural selection resolves
@@ -149,6 +150,12 @@ export interface VListRenderLabels {
 			thinkingChars: (chars: number) => string;
 			outputChars: (chars: number) => string;
 		};
+		/**
+		 * An outline plan's tree (ExitPlanMode of an outline session): its toolbar line, folds,
+		 * quick controls and clamped texts. Render-only: each sits in a fixed line or a tooltip
+		 * (the preview's measured labels are the adapter's `planTreeDetails*`).
+		 */
+		planTree: PlanTreeLabels;
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
@@ -429,6 +436,9 @@ export function useVListLabels(): VListLabels {
 			liveOutputChars: t("liveOutputChars", { count: COUNT_PLACEHOLDER }),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
+			// An outline plan's preview line (「还有 N 条 ▸」): measured, it shares the line.
+			planTreeDetailsMore: t("outlinePlan.tree.detailsMore", { n: "{n}" }),
+			planTreeDetailsOne: t("outlinePlan.tree.detailsOne"),
 			specProtectedBadge: t("specProtectedBadge"),
 			specGoalAddedBadge: t("specGoalAddedBadge"),
 			specGoalExistsBadge: t("specGoalExistsBadge"),
@@ -839,6 +849,22 @@ export function useVListLabels(): VListLabels {
 					thinking: t("reflectionThinking"),
 					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
 					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
+				},
+				planTree: {
+					overview: (count: number) => t("outlinePlan.tree.overview", { count }),
+					overviewAll: (count: number) => t("outlinePlan.tree.overviewAll", { count }),
+					expandAll: t("outlinePlan.tree.expandAll"),
+					collapseAll: t("outlinePlan.tree.collapseAll"),
+					expand: t("outlinePlan.tree.expand"),
+					collapse: t("outlinePlan.tree.collapse"),
+					altHint: t("outlinePlan.tree.altHint"),
+					subtree: (title: string) => t("outlinePlan.tree.subtree", { title }),
+					subtreeExpand: t("outlinePlan.tree.subtreeExpand"),
+					subtreeCollapse: t("outlinePlan.tree.subtreeCollapse"),
+					showInside: t("outlinePlan.tree.showInside"),
+					showWhole: t("outlinePlan.tree.showWhole"),
+					showLess: t("outlinePlan.tree.showLess"),
+					more: (count: number) => t("outlinePlan.tree.more", { count }),
 				},
 			},
 			toolCallGroup: {

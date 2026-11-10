@@ -85,6 +85,7 @@ describe("render-registry dispatch", () => {
 							onToggleTranslation: () => {},
 							onTogglePrompt: () => {},
 							onToggleFileChanges: () => {},
+							onPlanTree: () => {},
 							onToggleTextExpanded: () => calls.push(key),
 						}}
 						renderLabels={labels as never}

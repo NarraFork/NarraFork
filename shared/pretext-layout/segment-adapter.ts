@@ -29,6 +29,7 @@ import {
 	injectionBlockViews,
 	isNativeModelContextBlock,
 } from "../native-injection";
+import type { PlanTreeView } from "../outline-plan-tree";
 import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
@@ -946,6 +947,12 @@ export interface AdapterContext {
 	 * draws every row instead of the capped head.
 	 */
 	isFileChangesOpen?: (key: string) => boolean;
+	/**
+	 * The reader's view of an outline plan card's tree (ExitPlanMode of an outline session):
+	 * which nodes and texts they opened. Undefined: the overview (root and two levels).
+	 * Height-affecting, so it is resolved here like every other fold.
+	 */
+	planTreeView?: (key: string) => PlanTreeView | undefined;
 	/** L4 recency window. Undefined preserves the old "all recent" fallback. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -4507,6 +4514,10 @@ function buildToolCardData(
 			// change.
 			...(category === "outline" && ctx.isPromptOpen?.(toolItemKey(item)) === true
 				? { rawOpen: true }
+				: {}),
+			// An outline plan's tree, as the reader opened it, keyed by the CARD like the fold above.
+			...(category === "plan" && ctx.planTreeView
+				? { planView: ctx.planTreeView(toolItemKey(item)) }
 				: {}),
 			// Only MEASURED chrome strings (the ask replay's answer prefixes) —
 			// render-layer chrome is injected through renderLabels instead.
