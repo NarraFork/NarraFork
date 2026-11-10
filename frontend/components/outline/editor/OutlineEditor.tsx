@@ -41,6 +41,7 @@ import {
 } from "@tabler/icons-react";
 import { type MouseEvent, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { reportLineDisplay } from "../../../lib/outline-report-line";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
 import { useOutlineHost } from "../outline-host";
@@ -194,7 +195,7 @@ function firstLine(text: string): string {
 
 function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSession }) {
 	const { focusId, lens, spaceKey, viewState, shared, pageId } = props;
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const client = shared.client;
 	useEffect(() => {
 		retainLiveSession(shared);
@@ -209,6 +210,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	// Structure refused while connecting: the "connecting" badge nudges.
 	const [nudge, setNudge] = useState(0);
 
+	// Stable per language: the editor caches report-line decorations by this function.
+	const reportLine = useMemo(
+		() => (content: string) => reportLineDisplay(content, { t, locale: i18n?.language }),
+		[t, i18n?.language],
+	);
 	chromeText.fold = t("page.collapse");
 	chromeText.focus = t("page.focus");
 	chromeText.task = t("editor.changeStatus");
@@ -219,6 +225,7 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.locked = (name) => t("lock.badge", { name });
 	chromeText.pending = t("pending.badge");
 	chromeText.question = t("editor.questionMark");
+	chromeText.reportLine = reportLine;
 	chromeText.status = {
 		todo: t("page.task.todo"),
 		doing: t("page.task.doing"),
@@ -227,6 +234,15 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	};
 	mapText.more = (count) => t("map.more", { count });
 	mapText.stage = t("map.stage");
+	// Frames already drawn keep their words until their block redraws: the focus handle (the only
+	// pointer route to focusing a task) follows a change of language at once.
+	const focusLabel = t("page.focus");
+	useEffect(() => {
+		for (const handle of frame.current?.querySelectorAll<HTMLElement>(".ob-zoom") ?? []) {
+			handle.title = focusLabel;
+			handle.setAttribute("aria-label", focusLabel);
+		}
+	}, [focusLabel]);
 
 	useEffect(() => {
 		callbacks.current.onClient?.(client, () => surfaceRef.current?.outline ?? null);

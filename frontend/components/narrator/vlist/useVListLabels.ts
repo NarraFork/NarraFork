@@ -31,6 +31,7 @@ import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { diffStatsLabels } from "./render/diff-stats-text";
 import type { PlanTreeLabels } from "./render/PlanTreeBody";
 
 /**
@@ -311,6 +312,11 @@ export function reflectionTitleLabels(t: (key: string) => string): Record<string
 export function useVListLabels(): VListLabels {
 	const { t } = useTranslation("narrator");
 	const { t: tCommon } = useTranslation("common");
+	// The tool cards' figures name "tasks ticked done" by the task status's own name (translated
+	// once per language, like every label here).
+	useMemo(() => {
+		diffStatsLabels.done = t("sidecar.taskNotice.statusDone");
+	}, [t]);
 
 	const adapterLabels = useMemo<Record<string, string>>(
 		() => ({
@@ -887,6 +893,12 @@ export function useVListLabels(): VListLabels {
 					showWhole: t("outlinePlan.tree.showWhole"),
 					showLess: t("outlinePlan.tree.showLess"),
 					more: (count: number) => t("outlinePlan.tree.more", { count }),
+					status: {
+						todo: t("sidecar.taskNotice.statusTodo"),
+						doing: t("sidecar.taskNotice.statusDoing"),
+						done: t("sidecar.taskNotice.statusDone"),
+						cancelled: t("sidecar.taskNotice.statusCancelled"),
+					},
 				},
 			},
 			toolCallGroup: {

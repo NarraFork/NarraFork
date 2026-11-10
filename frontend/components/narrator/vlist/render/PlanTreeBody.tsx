@@ -36,7 +36,8 @@ import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/
 import { IconFoldDown, IconFoldUp } from "@tabler/icons-react";
 import type React from "react";
 import { Fragment, useLayoutEffect, useMemo, useRef } from "react";
-import { FOLD_ICONS, TASK_ICONS } from "../../../outline/outline-icons";
+import { OutlineStatusIcon } from "../../../outline/OutlineStatusIcon";
+import { FOLD_ICONS } from "../../../outline/outline-icons";
 import { AutoFollowScroll, useContentViewport } from "../../scroll/AutoFollowScroll";
 import type {
 	PlanTreeLayout,
@@ -80,6 +81,8 @@ export interface PlanTreeLabels {
 	showWhole: string;
 	showLess: string;
 	more: (count: number) => string;
+	/** A task's status, said by its badge (`OutlineStatusIcon`). */
+	status?: Partial<Record<"todo" | "doing" | "done" | "cancelled", string>>;
 }
 
 export const DEFAULT_PLAN_TREE_LABELS: PlanTreeLabels = {
@@ -280,7 +283,6 @@ function PlanTreeRow({
 		onPlanTree?.({ kind: "text", key: row.key });
 	};
 	const Fold = FOLD_ICONS[row.open ? "expanded" : "collapsed"].Icon;
-	const Task = row.task ? TASK_ICONS[row.task].Icon : null;
 	const arrowAction = row.open ? labels.collapse : labels.expand;
 	const firstLine = row.plain.split("\n")[0]?.slice(0, 80) ?? "";
 	const subtreeAction = row.subtree === "collapse" ? labels.subtreeCollapse : labels.subtreeExpand;
@@ -332,7 +334,7 @@ function PlanTreeRow({
 			) : null}
 			{background ? null : (
 				<span
-					aria-hidden
+					aria-hidden={row.task && labels.status?.[row.task] ? undefined : true}
 					className="vlist-plan-marker"
 					style={{
 						position: "absolute",
@@ -342,7 +344,11 @@ function PlanTreeRow({
 						height: lineHeight,
 					}}
 				>
-					{Task ? <Task size={icon} /> : <span className="vlist-plan-dot" />}
+					{row.task ? (
+						<OutlineStatusIcon status={row.task} size={icon} label={labels.status?.[row.task]} />
+					) : (
+						<span className="vlist-plan-dot" />
+					)}
 				</span>
 			)}
 			<div

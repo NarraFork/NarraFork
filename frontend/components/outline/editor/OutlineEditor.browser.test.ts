@@ -590,15 +590,18 @@ test("the frame's icons take real clicks: the checkbox cycles the task, the arro
 		await settle(a, b);
 	};
 	expect(await icon(a, task, "ob-check")).toMatchObject({
-		icon: "square",
+		icon: "circle",
 		checked: "false",
 		text: "",
 	});
 	await caret(a, task, 1);
 	await click(task, "ob-check");
-	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-half", checked: "mixed" });
+	expect(await icon(b, task, "ob-check")).toMatchObject({
+		icon: "circle-half-2",
+		checked: "mixed",
+	});
 	await click(task, "ob-check");
-	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-check", checked: "true" });
+	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "check", checked: "true" });
 	expect(serverOutline(pageId)).toBe("- [x] 任务\n- 父块\n  - 子块");
 	// The caret stayed in the text (the frame is not editable and takes no caret).
 	expect(await head(a)).toMatchObject({ blockId: task, offset: 1 });
@@ -616,6 +619,382 @@ test("the frame's icons take real clicks: the checkbox cycles the task, the arro
 	expect(await a.call((f) => f.events().focused)).toEqual([parent]);
 	expect(await a.call((f) => f.viewOutline())).toBe("- 子块");
 	noErrors(a, b);
+}, 30_000);
+
+/** What a block's frame draws, left to right: the parts that take room and show something. */
+const frameParts = (e: Editor, id: string) =>
+	e.call((f, x) => {
+		const block = f.dom(x as never);
+		if (!block) return null;
+		const drawn = (el: HTMLElement | null, needsIcon: boolean) => {
+			if (!el) return false;
+			const r = el.getBoundingClientRect();
+			return r.width > 0 && r.height > 0 && (!needsIcon || el.querySelector("svg") !== null);
+		};
+		const part = (name: string) =>
+			block.querySelector<HTMLElement>(`:scope > .ob-gutter > .${name}`);
+		const zoom = block.querySelector<HTMLElement>(":scope > .ob-zoom");
+		const body = block.querySelector<HTMLElement>(":scope > .ob-content > :first-child");
+		const zr = zoom?.getBoundingClientRect();
+		return {
+			parts: [
+				drawn(part("ob-arrow"), true) && "arrow",
+				drawn(part("ob-bullet"), false) && "bullet",
+				drawn(part("ob-check"), true) && "check",
+			].filter(Boolean) as string[],
+			marker: block.dataset.marker ?? null,
+			zoom: drawn(zoom, true) && zr ? { x: zr.x + zr.width / 2, y: zr.y + zr.height / 2 } : null,
+			textLeft: body ? Math.round(body.getBoundingClientRect().left) : null,
+		};
+	}, id);
+
+test("one marker per row: a task shows arrow + checkbox, a plain row arrow + bullet; a task's focus handle focuses", async () => {
+	const { pageId, ids } = await seedPage(h, "Markers", [
+		"[ ] Task with notes",
+		"  a note under the task",
+		"Plain parent",
+		"  a child",
+		"[x] Done leaf",
+	]);
+	const [task, note, plain, child, leaf] = ids as [string, string, string, string, string];
+	const a = await openEditor(h, h.owner, pageId);
+	// A task: the arrow and its checkbox, never a bullet; the handle at the row's end focuses.
+	const taskRow = await frameParts(a, task);
+	expect(taskRow).toMatchObject({ parts: ["arrow", "check"], marker: "task" });
+	expect(taskRow?.zoom).not.toBeNull();
+	expect(await frameParts(a, leaf)).toMatchObject({ parts: ["check"], marker: "task" });
+	// A plain row: the arrow and the bullet; the bullet focuses, so there is no handle.
+	expect(await frameParts(a, plain)).toMatchObject({
+		parts: ["arrow", "bullet"],
+		marker: "bullet",
+		zoom: null,
+	});
+	expect(await frameParts(a, child)).toMatchObject({
+		parts: ["bullet"],
+		marker: "bullet",
+		zoom: null,
+	});
+	expect(await frameParts(a, note)).toMatchObject({ parts: ["bullet"], zoom: null });
+	// The checkbox stands where the bullet would: the two rows' text starts in one column.
+	expect((await frameParts(a, task))?.textLeft).toBe(
+		(await frameParts(a, plain))?.textLeft as number,
+	);
+	expect(await a.call((f) => f.overflowsX())).toBe(false);
+	// Also where the editor is narrow (a phone, a dock panel) and the indent is smaller.
+	const narrow = await openEditor(h, h.writer, pageId, { width: 360 });
+	expect(await frameParts(narrow, task)).toMatchObject({ parts: ["arrow", "check"] });
+	expect((await frameParts(narrow, task))?.textLeft).toBe(
+		(await frameParts(narrow, plain))?.textLeft as number,
+	);
+	expect((await frameParts(narrow, task))?.zoom).not.toBeNull();
+	expect(await narrow.call((f) => f.overflowsX())).toBe(false);
+	noErrors(narrow);
+
+	// The handle is the only pointer route to focusing a task: 3:1 or more against the page, in
+	// both schemes (its icon strokes the handle's own colour).
+	const handleContrast = () =>
+		a.call((f, x) => {
+			const el = f.dom(x as never)?.querySelector<HTMLElement>(":scope > .ob-zoom");
+			if (!el) return 0;
+			const parse = (color: string) => {
+				const p = (/rgba?\(([^)]+)\)/.exec(color)?.[1] ?? "")
+					.split(/[\s,/]+/)
+					.filter(Boolean)
+					.map(Number);
+				return [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 1] as const;
+			};
+			const page = parse(getComputedStyle(document.body).backgroundColor);
+			const own = parse(getComputedStyle(el).color);
+			let alpha = own[3];
+			for (let n: HTMLElement | null = el; n; n = n.parentElement)
+				alpha *= Number(getComputedStyle(n).opacity);
+			const lum = (rgb: number[]) => {
+				const [r, g, b] = rgb.map((v) => {
+					const s = v / 255;
+					return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+				}) as [number, number, number];
+				return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+			};
+			const over = [0, 1, 2].map(
+				(i) => (own[i] as number) * alpha + (page[i] as number) * (1 - alpha),
+			);
+			const [hi, lo] = [lum(over), lum([page[0], page[1], page[2]])].sort((x, y) => y - x);
+			return ((hi as number) + 0.05) / ((lo as number) + 0.05);
+		}, task);
+	for (const scheme of ["dark", "light"] as const) {
+		await a.page.evaluate(
+			(s) => document.documentElement.setAttribute("data-mantine-color-scheme", s),
+			scheme,
+		);
+		expect(await handleContrast(), `${scheme} focus handle`).toBeGreaterThanOrEqual(3);
+	}
+
+	// What the bullet did is still one real click away on a task.
+	expect(await a.call((f) => f.events().focused)).toEqual([]);
+	const at = taskRow?.zoom as { x: number; y: number };
+	await a.page.mouse.click(at.x, at.y);
+	await until(a, (f, x) => f.events().focused.at(-1) === x, [task]);
+	expect(await a.call((f) => f.viewOutline())).toBe("- a note under the task");
+	// Focusing changed nothing on the page.
+	expect(serverOutline(pageId)).toBe(
+		"- [ ] Task with notes\n  - a note under the task\n- Plain parent\n  - a child\n- [x] Done leaf",
+	);
+	noErrors(a);
+}, 30_000);
+
+test("a task's status is a badge: its icon on a tinted background, in both schemes, and still the checkbox", async () => {
+	const { pageId, ids } = await seedPage(h, "Statuses", [
+		"[ ] to do",
+		"[/] in progress",
+		"[x] done",
+		"[-] cancelled",
+		"a plain block",
+	]);
+	const [todo, doing, done, cancelled, plain] = ids as [string, string, string, string, string];
+	const a = await openEditor(h, h.owner, pageId);
+	const badge = (id: string) =>
+		a.call((f, x) => {
+			const check = f
+				.dom(x as never)
+				?.querySelector<HTMLElement>(":scope > .ob-gutter > .ob-check");
+			const svg = check?.querySelector<SVGSVGElement>("svg");
+			if (!check || !svg) return null;
+			const cs = getComputedStyle(svg);
+			const box = svg.getBoundingClientRect();
+			return {
+				status: svg.dataset.status ?? null,
+				icon: check.dataset.icon ?? null,
+				// An icon (shapes), never a character.
+				shapes: svg.childElementCount,
+				text: check.textContent,
+				background: cs.backgroundColor,
+				color: cs.color,
+				radius: cs.borderTopLeftRadius,
+				padding: cs.paddingTop,
+				size: [Math.round(box.width), Math.round(box.height)],
+				role: check.getAttribute("role"),
+				checked: check.getAttribute("aria-checked"),
+				at: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+			};
+		}, id);
+	const alpha = (color: string | undefined) => {
+		const parts = /rgba?\(([^)]+)\)|color\(srgb ([^)]+)\)/.exec(color ?? "");
+		const values = (parts?.[1] ?? parts?.[2] ?? "").split(/[\s,/]+/).filter(Boolean);
+		return values.length >= 4 ? Number(values[3]) : values.length === 3 ? 1 : 0;
+	};
+	const expected = [
+		[todo, "todo", "circle", "false"],
+		[doing, "doing", "circle-half-2", "mixed"],
+		[done, "done", "check", "true"],
+		[cancelled, "cancelled", "x", "false"],
+	] as const;
+	for (const scheme of ["light", "dark"] as const) {
+		await a.page.evaluate(
+			(s) => document.documentElement.setAttribute("data-mantine-color-scheme", s),
+			scheme,
+		);
+		const seen = [];
+		for (const [id, status, icon, checked] of expected) {
+			const got = await badge(id);
+			expect(got, `${scheme} ${status}`).toMatchObject({
+				status,
+				icon,
+				text: "",
+				radius: "4px",
+				padding: "2px",
+				// The box a bare icon had: nothing the frame measures moved.
+				size: [16, 16],
+				// Still the checkbox: the badge is its drawing.
+				role: "checkbox",
+				checked,
+			});
+			expect(got?.shapes, `${scheme} ${status}`).toBeGreaterThan(0);
+			// A background of its own, tinted (not solid), under an icon in the state's colour.
+			expect(alpha(got?.background), `${scheme} ${status} background`).toBeGreaterThan(0.05);
+			expect(alpha(got?.background), `${scheme} ${status} background`).toBeLessThan(0.5);
+			seen.push(got);
+		}
+		// The states do not share one look: icon colours of doing, done and to do all differ.
+		expect(new Set(seen.slice(0, 3).map((b) => b?.color)).size, scheme).toBe(3);
+		expect(new Set(seen.slice(0, 3).map((b) => b?.background)).size, scheme).toBe(3);
+		// A plain block has no badge at all.
+		expect(await badge(plain)).toBeNull();
+	}
+	// The two schemes have colours of their own (the loop ended in dark).
+	const dark = await badge(doing);
+	await a.page.evaluate(() =>
+		document.documentElement.setAttribute("data-mantine-color-scheme", "light"),
+	);
+	expect((await badge(doing))?.color).not.toBe(dark?.color);
+	// A real click on the badge changes the status, as on the bare checkbox before.
+	const at = (await badge(todo))?.at as { x: number; y: number };
+	await a.page.mouse.click(at.x, at.y);
+	await settle(a);
+	expect(await badge(todo)).toMatchObject({
+		status: "doing",
+		icon: "circle-half-2",
+		checked: "mixed",
+	});
+	expect(serverOutline(pageId)).toStartWith(
+		"- [/] to do\n- [/] in progress\n- [x] done\n- [-] cancelled",
+	);
+	noErrors(a);
+}, 30_000);
+
+test("a task whose body is a code block: the focus handle takes no width from the block", async () => {
+	const { pageId, ids } = await seedPage(h, "Code task", [
+		"[ ] ```\nconst x = 1;\n```",
+		"```\nconst y = 2;\n```",
+	]);
+	const [task, plain] = ids as [string, string];
+	const a = await openEditor(h, h.owner, pageId);
+	const box = (id: string) =>
+		a.call((f, x) => {
+			const block = f.dom(x as never);
+			const pre = block?.querySelector<HTMLElement>(":scope > .ob-content > pre");
+			const zoom = block?.querySelector<HTMLElement>(":scope > .ob-zoom");
+			const p = pre?.getBoundingClientRect();
+			const z = zoom?.getBoundingClientRect();
+			return p
+				? { right: Math.round(p.right), zoom: z && z.width > 0 ? Math.round(z.right) : null }
+				: null;
+		}, id);
+	const [withHandle, without] = [await box(task), await box(plain)];
+	expect(withHandle).not.toBeNull();
+	// The block runs to the same right edge as one without a handle; the handle sits over its
+	// top right corner.
+	expect(withHandle?.right).toBe(without?.right as number);
+	expect(withHandle?.zoom).toBe(withHandle?.right as number);
+	expect(without?.zoom).toBeNull();
+	noErrors(a);
+}, 30_000);
+
+test("a heading inside a block is body size, bold: the page title stays the largest text", async () => {
+	const { pageId, ids } = await seedPage(h, "Headings", [
+		"[ ] Task title",
+		"  # Delivery and conclusions",
+		"  ## Second level",
+		"  ### Third level",
+		"  a plain note",
+	]);
+	const [task, h1, h2, h3, note] = ids as [string, string, string, string, string];
+	const a = await openEditor(h, h.owner, pageId);
+	const type = (id: string) =>
+		a.call((f, x) => {
+			const block = f.dom(x as never);
+			const body = block?.querySelector<HTMLElement>(":scope > .ob-content > :first-child");
+			if (!block || !body) return null;
+			const cs = getComputedStyle(body);
+			const gutter = block.querySelector<HTMLElement>(":scope > .ob-gutter");
+			return {
+				tag: body.tagName,
+				size: cs.fontSize,
+				line: cs.lineHeight,
+				weight: cs.fontWeight,
+				gutter: gutter ? getComputedStyle(gutter).height : null,
+			};
+		}, id);
+	const body = await type(note);
+	expect(body?.tag).toBe("P");
+	const taskTitle = await type(task);
+	expect(taskTitle).toMatchObject({ size: body?.size, line: body?.line });
+	for (const [id, tag] of [
+		[h1, "H1"],
+		[h2, "H2"],
+		[h3, "H3"],
+	] as const) {
+		// The same size and line box as body text (and as the task's title above it), in bold;
+		// the frame sits on that same line.
+		expect(await type(id)).toEqual({
+			tag,
+			size: body?.size as string,
+			line: body?.line as string,
+			weight: "700",
+			gutter: body?.gutter as string,
+		});
+	}
+	const title = await type(pageId);
+	expect(Number.parseFloat(title?.size ?? "0")).toBeGreaterThan(
+		Number.parseFloat(body?.size ?? "0"),
+	);
+	noErrors(a);
+}, 30_000);
+
+test("a subagent report's line reads in the viewer's language and time zone; the stored text never changes", async () => {
+	const stored = "报告（第 2 代 · 2025-03-04 17:38 UTC）";
+	const { pageId, ids } = await seedPage(h, "Report", [
+		"[ ] Task",
+		`  ${stored}`,
+		"    what the subagent wrote",
+		"  报告（第 2 代）不是报告行",
+	]);
+	const [task, report, , other] = ids as [string, string, string, string];
+	const shown = (e: Editor, id: string) =>
+		e.call((f, x) => {
+			const block = f.dom(x as never);
+			const p = block?.querySelector<HTMLElement>(":scope > .ob-content > :first-child");
+			if (!block || !p) return null;
+			const raw = p.querySelector<HTMLElement>(".ob-report-raw");
+			const before = getComputedStyle(p, "::before").content;
+			const r = p.getBoundingClientRect();
+			return {
+				label: p.dataset.reportLabel ?? null,
+				// What CSS draws before the text (`none` when nothing).
+				drawn: before === "none" ? null : before.replace(/^"|"$/g, ""),
+				rawWidth: raw ? raw.getBoundingClientRect().width : null,
+				here: block.classList.contains("ob-here"),
+				at: { x: r.x + 12, y: r.y + r.height / 2 },
+			};
+		}, id);
+	// Two viewers in two zones read the same stored minute in their own time.
+	const tokyo = await openEditor(h, h.owner, pageId, { timezone: "Asia/Tokyo" });
+	const la = await openEditor(h, h.writer, pageId, { timezone: "America/Los_Angeles" });
+	const inTokyo = await shown(tokyo, report);
+	expect(inTokyo).toMatchObject({
+		label: "Subagent report · Mar 5, 2025, 02:38",
+		drawn: "Subagent report · Mar 5, 2025, 02:38",
+		rawWidth: 0,
+		here: false,
+	});
+	expect((await shown(la, report))?.drawn).toBe("Subagent report · Mar 4, 2025, 09:38");
+	// Never the generation, never UTC; a line that only looks like one is left as it is.
+	expect(inTokyo?.drawn).not.toMatch(/UTC|generation|代/);
+	expect(await shown(tokyo, other)).toMatchObject({ label: null, drawn: null, rawWidth: null });
+	// Display only: the editor's document, the client and the server all hold the stored text.
+	expect(await tokyo.call((f, x) => f.viewText(x as never), report)).toBe(stored);
+	expect(await tokyo.call((f, x) => f.text(x as never), report)).toBe(stored);
+	expect(serverText(pageId, report)).toBe(stored);
+
+	// Being edited, the block shows what is stored: click the line, the text appears.
+	await tokyo.page.mouse.click(
+		(inTokyo as { at: { x: number; y: number } }).at.x,
+		inTokyo?.at.y as number,
+	);
+	await until(tokyo, (f, x) => f.dom(x as never)?.classList.contains("ob-here") === true, [report]);
+	const editing = await shown(tokyo, report);
+	expect(editing?.drawn).toBeNull();
+	expect(editing?.rawWidth).toBeGreaterThan(50);
+	// Typing edits the stored text itself, never the line shown for it.
+	await caret(tokyo, report);
+	await tokyo.page.keyboard.type("!");
+	await settle(tokyo, la);
+	expect(serverText(pageId, report)).toBe(`${stored}!`);
+	expect((await shown(la, report))?.label).toBeNull();
+	await tokyo.page.keyboard.press("Backspace");
+	await settle(tokyo, la);
+	expect(serverText(pageId, report)).toBe(stored);
+	// The cursor moves on: the line reads as a report again, for both.
+	await caret(tokyo, task);
+	await until(tokyo, (f, x) => f.dom(x as never)?.classList.contains("ob-here") === false, [
+		report,
+	]);
+	expect(await shown(tokyo, report)).toMatchObject({
+		drawn: "Subagent report · Mar 5, 2025, 02:38",
+		rawWidth: 0,
+	});
+	expect((await shown(la, report))?.drawn).toBe("Subagent report · Mar 4, 2025, 09:38");
+	await converged(pageId, tokyo, la);
+	noErrors(tokyo, la);
 }, 30_000);
 
 test("presence: who is here, their cursor in the text, their block selection", async () => {
