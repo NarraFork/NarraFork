@@ -161,6 +161,17 @@
 	min-width: 0;
 }
 
+/* A missing Worker result is a clipped plain-text placeholder, not a measured body. */
+.nf-outline-editor .mm-node.is-provisional {
+	overflow: hidden;
+}
+
+.nf-outline-editor .mm-node.is-provisional > .mm-body {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
 /* Done or cancelled: struck through and muted, as in the outline (paint only, no size). */
 .nf-outline-editor .mm-node:is([data-task="x"], [data-task="-"]) > .mm-body {
 	color: var(--ob-muted);

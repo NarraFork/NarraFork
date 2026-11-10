@@ -120,7 +120,7 @@ for (const host of HOSTS) {
 		const { pageId, ids } = await seedPage(h, `Perf ${host}`, bigLines(1999, "B"));
 		const metrics: Record<string, unknown> = {};
 
-		// Without measuring ahead: the first switch measures 2000 bodies on the spot.
+		// Without a Worker: a cold switch draws fixed placeholders, never local measurement.
 		{
 			const cold = await openHost(h, host, pageId, { ...VIEWPORT, noWorker: true });
 			await middle(cold, ids);
@@ -133,6 +133,9 @@ for (const host of HOSTS) {
 				measureMs: +st.measure.ms.toFixed(1),
 				firstLayoutMs: +(st.layouts[0] ?? 0).toFixed(1),
 			};
+			expect(st.measure.misses).toBe(0);
+			expect(st.measure.placeholders).toBeGreaterThan(0);
+			expect(st.provisional).toBeGreaterThan(0);
 			expect((await cold.call((f) => f.mapState())).active).toBe(true);
 			await resetMap(h);
 		}
@@ -433,7 +436,7 @@ for (const host of HOSTS) {
 	}, 300_000);
 }
 
-test("page: a typography slider drag over an open 800-block map measures only what is on screen", async () => {
+test("page: a typography slider drag over an open 800-block map never measures on the UI thread", async () => {
 	const { pageId } = await seedPage(h, "Typography drag", bigLines(799, "T"));
 	const a = await openHost(h, "page", pageId, VIEWPORT);
 	await a.call((f) => f.prewarmDone());
@@ -457,10 +460,8 @@ test("page: a typography slider drag over an open 800-block map measures only wh
 		});
 	}
 	for (const step of steps) {
-		// Only the nodes drawn (on screen, plus the margin) are measured on each step, not 800
-		// (the root, kept for the layout, is one more).
-		expect(step.measured).toBeLessThanOrEqual(step.inDom + 1);
-		expect(step.measured).toBeLessThan(400);
+		// Neither visible nor off-screen nodes perform exact UI-thread measurement.
+		expect(step.measured).toBe(0);
 	}
 	// Panned while the setting still moves: the nodes that come into view have sizes from the
 	// earlier setting, and are measured again on the next frame (not drawn over their neighbours
@@ -517,7 +518,7 @@ test("page: a setting that moves again while the Worker measures the last one ke
 	await a.call((f) => f.mapFlush());
 	const after = await a.call((f) => f.mapStats());
 	const measured = after.measure.misses - before.measure.misses;
-	expect(measured).toBeLessThan(400);
+	expect(measured).toBe(0);
 	// The latest setting settles in turn, from the Worker's sizes for it.
 	await new Promise((r) => setTimeout(r, 400));
 	await a.call((f) => f.prewarmDone());

@@ -40,7 +40,11 @@ import {
 	isGenUiToolName,
 	publicGenUiSummary,
 } from "@shared/gen-ui-public";
+import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+
+const CLEARED_EXPORT_TOOL_SQL = sql.raw(clearedToolOutputSql("narrator_tool_calls.output_json"));
+
 import { db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { logger } from "../lib/logger";
@@ -669,7 +673,7 @@ async function loadToolCallMeta(messageIds: string[]) {
 				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
 				ELSE length(COALESCE(${narratorToolCalls.errorMessage}, '')) END`.as("error_bytes"),
 			inputBytes: sql<number>`CASE
-				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} OR ${CLEARED_EXPORT_TOOL_SQL} THEN 0
 				ELSE length(COALESCE(CAST(${narratorToolCalls.inputJson} AS TEXT), '')) END`.as(
 				"input_bytes",
 			),
@@ -764,7 +768,7 @@ async function loadToolCalls(
 				id: narratorToolCalls.id,
 				input: sql<
 					string | null
-				>`substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${EXPORT_TOOL_FIELD_LIMIT})`,
+				>`CASE WHEN ${CLEARED_EXPORT_TOOL_SQL} THEN NULL ELSE substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${EXPORT_TOOL_FIELD_LIMIT}) END`,
 				output: sql<
 					string | null
 				>`substr(CAST(${narratorToolCalls.outputJson} AS TEXT), 1, ${EXPORT_TOOL_FIELD_LIMIT})`,

@@ -21,6 +21,8 @@ await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
 const { narratorPersistence } = await import("../narrator-persistence");
 const { settings } = await import("../../lib/settings");
+const compactJson = settings.narratorBlocks.compactJson;
+const { blockReadsEnabled, noteRowsOnlyEnvelopes } = await import("../narrator-block-scans");
 const blockSync = await import("../narrator-block-sync");
 const { narratorMessageQueries } = await import("../narrator-messages");
 const bodyReads = await import("../narrator-body-reads");
@@ -39,6 +41,7 @@ const STALE = [{ type: "text", text: "stale" }];
 
 beforeEach(() => {
 	cleanDb(sqlite);
+	noteRowsOnlyEnvelopes(undefined);
 	sqlite.run(
 		`INSERT INTO narrators (id, title, model, created_at, updated_at)
 		 VALUES ('n1', 'Main', 'claude-opus-4.6', ?, ?)`,
@@ -47,6 +50,7 @@ beforeEach(() => {
 });
 afterEach(() => {
 	settings.narratorBlocks.read = true;
+	settings.narratorBlocks.compactJson = compactJson;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -56,6 +60,8 @@ afterAll(() => {
 
 /** A conversation in the shapes the store writes, a translated reasoning item among them. */
 async function writeConversation() {
+	// This fixture compares the two readable copies; afterEach restores the default.
+	settings.narratorBlocks.compactJson = false;
 	const input = await narratorStore.appendInput("n1", "List the files, 请");
 	const step = await narratorStore.openStep("n1", { uuid: "u1", session_id: "s" });
 	await narratorStore.writeStepItem(step.id, "n1", {
@@ -122,6 +128,8 @@ function withoutRevisions<T>(value: T): T {
 /** Read with the switch off, then from block rows alone with it on. */
 async function readBoth<T>(read: () => T | Promise<T>): Promise<{ legacy: T; blocks: T }> {
 	settings.narratorBlocks.read = false;
+	// A rows-only fixture would force block reads and make this comparison vacuous.
+	expect(blockReadsEnabled()).toBe(false);
 	const legacy = await read();
 	overwriteContentJson();
 	settings.narratorBlocks.read = true;
@@ -187,6 +195,7 @@ describe("narrator message queries", () => {
 	});
 
 	test("dismissing a card checks the card in its block", async () => {
+		settings.narratorBlocks.compactJson = false;
 		const card = await narratorPersistence.persistDisplayMessage("n1", "cwd", [
 			{ type: "cwd_recovery", path: "/gone" },
 		]);
@@ -208,6 +217,7 @@ describe("narrator message queries", () => {
 
 describe("bodies not in rows", () => {
 	test("legacy and queued envelopes read content_json, decoded, with block reads on", async () => {
+		settings.narratorBlocks.compactJson = false;
 		settings.narratorBlocks.write = false;
 		try {
 			await narratorStore.appendInput("n1", "written legacy");
@@ -283,6 +293,7 @@ describe("segment compaction", () => {
 
 describe("tool continuation recovery", () => {
 	test("orders a message's calls by their blocks without reading its body", async () => {
+		settings.narratorBlocks.compactJson = false;
 		const step = await narratorStore.openStep("n1", { uuid: "u1", session_id: "s" });
 		await narratorStore.writeStepItem(step.id, "n1", {
 			type: "text",
@@ -333,6 +344,7 @@ describe("prompt optimization context", () => {
 
 describe("agent results", () => {
 	test("a subagent's result is read from its assistant message's blocks", async () => {
+		settings.narratorBlocks.compactJson = false;
 		sqlite.run(
 			`INSERT INTO narrators (id, type, variant, parent_narrator_id, status, created_at, updated_at)
 			 VALUES ('actor', 'subagent', 'subagent:general', 'n1', 'idle', ?, ?)`,
@@ -368,6 +380,7 @@ describe("agent results", () => {
 
 describe("subagent extraction", () => {
 	test("a full copy carries the source's block bodies", async () => {
+		settings.narratorBlocks.compactJson = false;
 		sqlite.run(
 			`INSERT INTO narrators (id, type, variant, subagent_type, status, permission_mode, inherit_mode,
 				traits, parent_narrator_id, policy_source_narrator_id, runtime_registration_json, title,

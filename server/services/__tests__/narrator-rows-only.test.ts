@@ -183,7 +183,7 @@ describe("rows-only envelopes", () => {
 	});
 
 	test("with the read switch off, they are still read from their rows", async () => {
-		const { stepId } = await conversation();
+		const { inputId, stepId } = await conversation();
 		const body = assembled(stepId);
 		makeRowsOnly(stepId);
 		settings.narratorBlocks.read = false;
@@ -193,11 +193,13 @@ describe("rows-only envelopes", () => {
 		const source = await loadModelHistorySource({ backend: "sqlite", sqlite }, "n1");
 		expect<unknown>(source.messages.find((m) => m.id === stepId)?.contentJson).toEqual(body);
 		expect(exportBodiesFromBlocks()).toBe(true);
-		// Once none is rows-only, the switch takes effect again.
-		sqlite.run("UPDATE narrator_messages SET content_json = ?, body_rows_only = 0 WHERE id = ?", [
-			JSON.stringify(body),
-			stepId,
-		]);
+		// Restore every rows-only envelope: inputs are rows-only by default as well.
+		// Only once none remain can the read switch take effect again.
+		for (const id of [inputId, stepId])
+			sqlite.run("UPDATE narrator_messages SET content_json = ?, body_rows_only = 0 WHERE id = ?", [
+				JSON.stringify(assembled(id)),
+				id,
+			]);
 		scans.noteRowsOnlyEnvelopes(undefined);
 		expect(scans.blockReadsEnabled()).toBe(false);
 	});

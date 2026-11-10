@@ -3,15 +3,19 @@ import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
-import { createServer, type ViteDevServer } from "vite";
+import { build, createServer, type ViteDevServer } from "vite";
 import type { fixture } from "./MonacoEditor.browser-fixture";
+import type { fixture as workerFixture } from "./monaco-worker-policy.browser-fixture";
 
 type FixtureWindow = Window & { monacoQuoteFixture: typeof fixture };
+type WorkerFixtureWindow = Window & { monacoWorkerFixture: typeof workerFixture };
 const root = resolve(import.meta.dir, "../../../..");
 const cacheDir = resolve(root, ".narrafork", `monaco-quote-test-${crypto.randomUUID()}`);
 let server: ViteDevServer | undefined;
 let browser: Browser | undefined;
 let origin: string;
+let builtEntry = "";
+const builtAssets = new Map<string, { body: string | Uint8Array; contentType: string }>();
 const selected = { startLineNumber: 2, startColumn: 3, endLineNumber: 4, endColumn: 7 };
 const button = '[data-editor="0"] [data-monaco-quote-selection]';
 
@@ -21,6 +25,34 @@ beforeAll(async () => {
 		process.env.PUPPETEER_EXECUTABLE_PATH ??
 		"/home/fulcrum/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome";
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
+	// Exercise the private arity/shape checks against production minification, not only Vite dev.
+	// In-memory output: no app config, route generation, backend or production build artifacts.
+	const outputs = await build({
+		configFile: false,
+		root,
+		base: "/worker-policy-build/",
+		logLevel: "error",
+		build: {
+			write: false,
+			target: "esnext",
+			minify: true,
+			rollupOptions: {
+				input: resolve(
+					root,
+					"frontend/components/narrator/file-editor/monaco-worker-policy.browser-fixture.ts",
+				),
+			},
+		},
+	});
+	if (!("output" in outputs)) throw new Error("Expected one isolated Monaco browser build");
+	for (const output of outputs.output) {
+		if (output.type === "chunk" && output.isEntry) builtEntry = output.fileName;
+		builtAssets.set(`/worker-policy-build/${output.fileName}`, {
+			body: output.type === "chunk" ? output.code : output.source,
+			contentType: output.fileName.endsWith(".css") ? "text/css" : "text/javascript",
+		});
+	}
+	if (!builtEntry) throw new Error("Missing isolated Monaco production entry");
 	// Vite must transform Monaco's real new-URL module worker; no app config/backend/database.
 	server = await createServer({
 		configFile: false,
@@ -53,7 +85,30 @@ beforeAll(async () => {
 				configureServer(vite) {
 					vite.middlewares.use((request, response, next) => {
 						const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
-						if (path === "/") {
+						const builtAsset = builtAssets.get(path);
+						if (builtAsset) {
+							response.setHeader("Content-Type", builtAsset.contentType);
+							response.end(builtAsset.body);
+						} else if (path === "/worker-policy-production") {
+							response.setHeader("Content-Type", "text/html");
+							response.end(
+								`<!doctype html><html><head><meta charset="utf-8"></head><body><script type="module" src="/worker-policy-build/${builtEntry}"></script></body></html>`,
+							);
+						} else if (path === "/monaco-policy-rejected-handshake.js") {
+							response.setHeader("Content-Type", "text/javascript");
+							response.end(`self.onmessage = ({ data: request }) => {
+								if (request?.type !== 0) return;
+								self.postMessage({type: 1, vsWorker: request.vsWorker, seq: request.req,
+									err: request.method === '$ping'
+										? {$isError: true, name: 'Error', message: 'injected handshake rejection'}
+										: undefined});
+							};`);
+						} else if (path === "/worker-policy") {
+							response.setHeader("Content-Type", "text/html");
+							response.end(
+								'<!doctype html><html><head><meta charset="utf-8"></head><body><script type="module" src="/frontend/components/narrator/file-editor/monaco-worker-policy.browser-fixture.ts"></script></body></html>',
+							);
+						} else if (path === "/") {
 							response.setHeader("Content-Type", "text/html");
 							response.setHeader(
 								"Content-Security-Policy",
@@ -284,6 +339,74 @@ test("native range widget follows long selection scrolling/folding and is remove
 		expect((await snapshot(page)).modelId).toBeUndefined();
 	});
 }, 30_000);
+
+for (const deployment of ["development", "production"] as const) {
+	for (const path of ["service", "standalone"] as const) {
+		for (const mode of ["healthy", "construct", "disabled", "handshake", "crash"] as const) {
+			test(`strict Monaco ${deployment} ${path} ${mode}: real Worker RPC, no synchronous instance`, async () => {
+				if (!browser) throw new Error("Browser unavailable");
+				const page = await browser.newPage();
+				const errors: string[] = [];
+				page.on("pageerror", (error) => errors.push(String(error)));
+				try {
+					await page.goto(
+						`${origin}/worker-policy${deployment === "production" ? "-production" : ""}`,
+					);
+					await page.waitForFunction(() =>
+						Boolean((window as unknown as WorkerFixtureWindow).monacoWorkerFixture),
+					);
+					const result = await page.evaluate(
+						(input) =>
+							(window as unknown as WorkerFixtureWindow).monacoWorkerFixture.run(
+								input.mode,
+								input.path,
+							),
+						{ mode, path },
+					);
+					expect(result.synchronousInstances).toBe(0);
+					expect(result.originalFallbackCalls).toBe(0);
+					expect(result.workerCleared).toBe(true);
+					expect(result.modelManagerCleared).toBe(true);
+					if (mode === "healthy" || mode === "crash") {
+						if (path === "service") {
+							expect(result.firstResult).toMatchObject([{ url: "https://example.com/first" }]);
+						} else {
+							expect(result.firstResult).toEqual({
+								dom: "undefined",
+								text: ["visit https://example.com/first"],
+							});
+						}
+					}
+					if (mode === "healthy") {
+						expect(result.failure).toBeUndefined();
+						if (path === "service") {
+							expect(result.secondResult).toMatchObject([{ url: "https://example.com/second" }]);
+						} else {
+							expect(result.secondResult).toEqual({
+								dom: "undefined",
+								text: ["updated https://example.com/second"],
+							});
+						}
+					} else {
+						expect(result.failure?.name).toBe("MonacoWorkerUnavailableError");
+						expect(result.failure?.message).toContain("Monaco Worker unavailable");
+						if (mode === "crash") expect(result.failure?.cause).toContain("timed out after 1000ms");
+					}
+					if (mode === "construct" || mode === "disabled") expect(result.created).toBe(0);
+					else {
+						expect(result.created).toBe(1);
+						expect(result.terminated).toBeGreaterThanOrEqual(1);
+					}
+					// Let Chromium dispatch unhandledrejection/pageerror before closing this page.
+					await page.evaluate(() => new Promise<void>((done) => setTimeout(done, 0)));
+					expect(errors).toEqual([]);
+				} finally {
+					await page.close();
+				}
+			}, 30_000);
+		}
+	}
+}
 
 test("Vite serves the production Monaco module worker with a live handler", async () => {
 	await withPage(async (page) => {

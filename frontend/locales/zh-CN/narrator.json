@@ -1,4 +1,6 @@
 {
+	"historyCleared": "历史已清理",
+	"toolDetailsCleared": "工具调用详情已清理",
 	"modelTraceReturn": "返回",
 	"modelTraceSampling": "采样中…",
 	"modelTraceRetry": "重试",

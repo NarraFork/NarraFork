@@ -47,6 +47,7 @@ const { clearModelHistorySourceCacheForTest } = await import(
 const NOW = "2026-10-01T00:00:00.000Z";
 
 beforeEach(async () => {
+	(await import("../../lib/settings")).settings.narratorBlocks.compactJson = false;
 	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
 	clearModelHistorySourceCacheForTest();
 	cleanDb(sqlite);

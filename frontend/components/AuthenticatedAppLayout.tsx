@@ -348,7 +348,7 @@ export function AuthenticatedLayout() {
 				/>
 				{/* No header row at any width (see APP_SHELL_HEADER_HEIGHTS): the element only
 			    owns the top inset, plus the wizard's phone return bar. */}
-				<AppShell.Header style={APP_SHELL_SAFE_HEADER_STYLE}>
+				<AppShell.Header withBorder={false} style={APP_SHELL_SAFE_HEADER_STYLE}>
 					{wizardReturnBar && (
 						<Button
 							hiddenFrom="sm"

@@ -7,6 +7,7 @@ import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
+import type { StorageRetentionSettings } from "@shared/storage-retention";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
@@ -923,7 +924,9 @@ export interface NarraForkSettings {
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
-	/** Block storage rollout switches (docs/BLOCK_STORAGE-DESIGN.md §10.6). */
+	/** Independent retention policies. A null horizon never expires historical content. */
+	storageRetention: StorageRetentionSettings;
+	/** Stable block storage; switches remain available for deliberate rollback. */
 	narratorBlocks: {
 		/**
 		 * Whether new envelopes are stored as blocks (`body_format = 2`), with the
@@ -945,6 +948,10 @@ export interface NarraForkSettings {
 		 * restore job writes their projection back.
 		 */
 		compactJson: boolean;
+		/** Internal one-time migration; subsequent explicit rollback switches are preserved. */
+		singleCopyDefaultsVersion?: number;
+		/** Backend startup resumed pre-upgrade paused jobs; later explicit pauses stay effective. */
+		singleCopyBackfillResumeVersion?: number;
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";
