@@ -126,7 +126,8 @@ export const sendTool: ToolDefinition = {
 			resume?: boolean;
 			model?: string;
 		};
-		if (raw.user !== undefined) return sendToUser(raw, ctx);
+		// Weak models fill optional strings with ""; only a non-empty user selects bot mode.
+		if (raw.user?.trim()) return sendToUser(raw, ctx);
 		if (!raw.message?.trim()) {
 			return { output: "Error: message is required.", isError: true };
 		}
@@ -225,7 +226,7 @@ async function sendToUser(
 	if (raw.id || raw.ids?.length || raw.name || raw.names?.length) {
 		return { output: "Send error: `user` cannot be combined with agent targets.", isError: true };
 	}
-	if (raw.resume || raw.model !== undefined) {
+	if (raw.resume || raw.model?.trim()) {
 		return {
 			output: "Send error: `user` cannot be combined with resume or model.",
 			isError: true,

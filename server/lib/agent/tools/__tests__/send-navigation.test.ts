@@ -4,6 +4,7 @@ import type { ToolContext } from "../../types";
 const realCommunication = { ...(await import("@server/services/agent-communication")) };
 const realWebsocket = { ...(await import("@server/websocket/narrator-ws")) };
 const frames: unknown[] = [];
+const detailedCalls: Array<Record<string, unknown>> = [];
 let release: (() => void) | undefined;
 let frameReceived: (() => void) | undefined;
 const deliveryTargets = [
@@ -17,6 +18,7 @@ mock.module("@server/services/agent-communication", () => ({
 		onTargetsResolved?: (count: number) => void;
 		onDeliveryResolved?: (target: { id: string; deliveryMessageId: string }) => void;
 	}) => {
+		detailedCalls.push(input as Record<string, unknown>);
 		if (deliveryTargets.length) input.onTargetsResolved?.(deliveryTargets.length);
 		for (const target of deliveryTargets) input.onDeliveryResolved?.(target);
 		await new Promise<void>((resolve) => {
@@ -77,4 +79,32 @@ test("queued receipts stream before completion and remain in final target metada
 	const result = await waiting;
 	expect(result.metadata?.targets).toEqual(deliveryTargets);
 	expect(result.metadata?.targetCount).toBe(2);
+});
+
+// Models that fill every optional parameter with "" (observed via a completions
+// relay) must still reach agent delivery, not be hijacked into bot-user mode.
+test("empty-string user falls through to agent-target delivery", async () => {
+	frames.length = 0;
+	detailedCalls.length = 0;
+	const received = new Promise<void>((resolve) => {
+		frameReceived = () => {
+			if (frames.length >= 1) resolve();
+		};
+	});
+	const waiting = sendTool.execute(
+		{ message: "Review the diff", name: "child-a", user: "", id: "" },
+		{
+			narratorId: "primary",
+			currentToolUseId: "send-empty-user",
+			signal: new AbortController().signal,
+			locale: "en",
+		} as ToolContext,
+	);
+	await received;
+	expect(detailedCalls).toHaveLength(1);
+	expect(detailedCalls[0]).toMatchObject({ name: "child-a" });
+	release?.();
+	const result = await waiting;
+	expect(result.isError).toBeFalsy();
+	expect(String(result.output)).toBe("Delivered");
 });
