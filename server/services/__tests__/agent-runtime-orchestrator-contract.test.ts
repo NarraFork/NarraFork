@@ -247,6 +247,37 @@ function fixture(
 	};
 }
 
+describe("context overflow recovery cancellation", () => {
+	for (const profile of profiles) {
+		test(`${profile.kind}: abort during compact remains an interruption, not a compact failure`, async () => {
+			const service = await import("../narrator-service");
+			const session = await import("../narrator-session");
+			const h = fixture(profile, [
+				{
+					...finished,
+					finalText: "",
+					completedAssistantTurn: false,
+					completedNaturally: false,
+					contextLengthExceeded: true,
+				},
+			]);
+			spyOn(service.narratorService, "getCompactBoundaryMessage").mockResolvedValue("boundary");
+			const compact = spyOn(session, "runCustomCompact").mockImplementation(async () => {
+				h.session.abortController.abort();
+				return true;
+			});
+			const emitted: Array<{ type: string }> = [];
+			h.session.events.on("event", (event) => emitted.push(event));
+			const result = await h.run();
+			expect(result.aborted).toBe(true);
+			expect(result.hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+			expect(compact).toHaveBeenCalledTimes(1);
+			expect(emitted.some((event) => event.type === "error")).toBe(false);
+		});
+	}
+});
+
 describe("round token totals at the Stop hook", () => {
 	for (const exit of ["normal", "workspace", "tool-limit", "throw"] as const) {
 		test(`accounts every owned request before ${exit} exits`, async () => {
