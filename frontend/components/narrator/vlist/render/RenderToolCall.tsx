@@ -59,6 +59,10 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import {
+	coerceInjectionTarget,
+	type InjectionTarget,
+} from "@shared/pretext-layout/injection-target";
+import {
 	CARD_SHIMMER_CLASS,
 	resolveToolShimmerFlash,
 	resolveToolShimmerPhase,
@@ -163,6 +167,8 @@ import { readExactDisplayBox, VListImage } from "./vlist-image";
 // i18n-facing labels, injected by the dispatch/registry layer (no i18n import
 // across the vlist edge). Sensible English fallbacks keep this self-contained.
 // ─────────────────────────────────────────────────────────────────────────────
+export type ContentTargetResolver = (target: InjectionTarget) => (() => void) | undefined;
+
 export interface ToolCallLabels {
 	/** Detail "Input" section label (generic / capped-with-label). */
 	input?: string;
@@ -361,6 +367,7 @@ function InlineLines({
 	unlinkedColor,
 	leadingSlot,
 	href: rawHref,
+	onOpen,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
@@ -379,6 +386,7 @@ function InlineLines({
 	 * session instead, and is plain text where nothing can open it.
 	 */
 	href?: string | null;
+	onOpen?: () => void;
 }) {
 	const lines = useInlineLines(block, availableWidth);
 	const outlineLink = useOutlineLinkProps(rawHref);
@@ -394,7 +402,28 @@ function InlineLines({
 				height: frame.height,
 			}}
 		>
-			{href ? (
+			{onOpen ? (
+				<button
+					type="button"
+					aria-label={lines
+						.flatMap((line) => line.fragments.map((fragment) => fragment.text))
+						.join("")}
+					onClick={(event) => {
+						event.stopPropagation();
+						onOpen();
+					}}
+					style={{
+						position: "absolute",
+						inset: 0,
+						zIndex: 1,
+						padding: 0,
+						border: 0,
+						background: "transparent",
+						cursor: "pointer",
+					}}
+				/>
+			) : null}
+			{!onOpen && href ? (
 				<a
 					href={href}
 					{...(outlineLink
@@ -474,6 +503,8 @@ function InlineLines({
 // Header row.
 // ─────────────────────────────────────────────────────────────────────────────
 interface ToolHeaderRowProps {
+	/** A notice has no execution status; do not invent a success glyph for it. */
+	hideStatus?: boolean;
 	queuedBehindUpstream?: boolean;
 	reflectionStatus?: string | null;
 	toolName: string;
@@ -512,6 +543,7 @@ interface ToolHeaderRowProps {
 }
 
 function ToolHeaderRow({
+	hideStatus = false,
 	queuedBehindUpstream,
 	reflectionStatus,
 	toolName,
@@ -675,20 +707,22 @@ function ToolHeaderRow({
 						{takenOverLabel}
 					</Badge>
 				) : null}
-				<span
-					style={{
-						display: "inline-flex",
-						alignItems: "center",
-						color: cssColor(statusColor, 6),
-						flexShrink: 0,
-					}}
-				>
-					{statusMark != null ? (
-						<TraceRowStatusGlyph mark={statusMark} />
-					) : (
-						<StatusGlyph status={status} color={statusColor} />
-					)}
-				</span>
+				{!hideStatus && (
+					<span
+						style={{
+							display: "inline-flex",
+							alignItems: "center",
+							color: cssColor(statusColor, 6),
+							flexShrink: 0,
+						}}
+					>
+						{statusMark != null ? (
+							<TraceRowStatusGlyph mark={statusMark} />
+						) : (
+							<StatusGlyph status={status} color={statusColor} />
+						)}
+					</span>
+				)}
 				{/* Timing lives INSIDE the existing single header row (height-neutral):
 			    a live elapsed counter while running, else the final duration. The
 			    breakdown popover and the timeout editor are portaled, so neither can
@@ -1629,6 +1663,7 @@ function DetailBlocks({
 	labels,
 	narratorId,
 	openSession,
+	resolveTargetOpener,
 	specTasksLive,
 }: {
 	kind: MeasuredToolBody["kind"];
@@ -1645,6 +1680,7 @@ function DetailBlocks({
 	 * chips) — each is the row that names the session being opened.
 	 */
 	openSession?: { onOpen: () => void; label: string };
+	resolveTargetOpener?: ContentTargetResolver;
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
 }) {
@@ -1715,6 +1751,8 @@ function DetailBlocks({
 					// A row/entry whose text is a link paints an anchor overlay so the
 					// measured line geometry stays authoritative.
 					const href = typeof data.href === "string" ? data.href : null;
+					const target = coerceInjectionTarget(data.target);
+					const onOpen = target ? resolveTargetOpener?.(target) : undefined;
 					const dimmed = data.dimmed === true;
 					// A warning-toned error line is a DENIED PLAN's reviewer feedback: the
 					// user's own note back to the model, not a tool failure. The chunked
@@ -1731,10 +1769,11 @@ function DetailBlocks({
 							block={block}
 							frame={bf}
 							availableWidth={availableWidth}
-							color={href ? "var(--mantine-color-teal-text)" : lineColor}
+							color={href || onOpen ? "var(--mantine-color-teal-text)" : lineColor}
 							unlinkedColor={lineColor}
 							leadingSlot={iconSlot}
 							href={href}
+							onOpen={onOpen}
 						/>
 					);
 				}
@@ -2002,6 +2041,7 @@ function DetailRegion({
 	labels,
 	narratorId,
 	openSession,
+	resolveTargetOpener,
 	viewTargets,
 	viewControls,
 	specTasksLive,
@@ -2013,6 +2053,7 @@ function DetailRegion({
 	narratorId?: string;
 	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
+	resolveTargetOpener?: ContentTargetResolver;
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
@@ -2062,6 +2103,7 @@ function DetailRegion({
 								}
 								viewControls={viewControls}
 								specTasksLive={specTasksLive}
+								resolveTargetOpener={resolveTargetOpener}
 								onToggleRaw={onToggleRaw}
 							/>
 						</div>
@@ -2078,6 +2120,7 @@ export function RenderToolBody({
 	labels = DEFAULT_LABELS,
 	narratorId,
 	openSession,
+	resolveTargetOpener,
 	viewTarget,
 	viewControls,
 	specTasksLive,
@@ -2088,6 +2131,7 @@ export function RenderToolBody({
 	narratorId?: string;
 	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
+	resolveTargetOpener?: ContentTargetResolver;
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
@@ -2163,6 +2207,7 @@ export function RenderToolBody({
 				labels={labels}
 				openSession={openSession}
 				specTasksLive={specTasksLive}
+				resolveTargetOpener={resolveTargetOpener}
 			/>
 		);
 	if (model.format === "media") {
@@ -2332,6 +2377,7 @@ export interface RenderToolCallProps {
 	 * the subagent card's in-card button; absent → no button.
 	 */
 	onOpenSession?: () => void;
+	resolveTargetOpener?: ContentTargetResolver;
 	/**
 	 * Terminate the running tool. Supplied by the integration layer for bash / MCP
 	 * cards (the chunked header's InlineTerminateControl equivalent).
@@ -2539,6 +2585,7 @@ export function RenderToolCall({
 	narratorId,
 	onToggle,
 	onOpenSession,
+	resolveTargetOpener,
 	onTerminate,
 	onUpdateTimeout,
 	onPermissionAllow,
@@ -2625,6 +2672,7 @@ export function RenderToolCall({
 	const body = (
 		<>
 			<ToolHeaderRow
+				hideStatus={measured.contentRole === "auxiliary" && measured.sourceStatus == null}
 				queuedBehindUpstream={queuedBehindUpstream}
 				reflectionStatus={reflection?.status}
 				toolName={measured.toolName}
@@ -2666,6 +2714,7 @@ export function RenderToolCall({
 							viewTargets={viewTargets}
 							viewControls={viewControls}
 							specTasksLive={specTasksLive}
+							resolveTargetOpener={resolveTargetOpener}
 							onToggleRaw={onTogglePrompt}
 						/>
 					</div>
@@ -2679,12 +2728,15 @@ export function RenderToolCall({
 		</>
 	);
 	const quoteFile = quoteFilePath(measured.detail);
-	const quoteSource = {
-		[QUOTE_TOOL_ATTR]: measured.toolName,
-		[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
-		...(quoteFile ? { [QUOTE_FILE_ATTR]: quoteFile } : {}),
-		...(measured.toolUseId ? { [QUOTE_TOOL_ID_ATTR]: measured.toolUseId } : {}),
-	};
+	const quoteSource =
+		measured.contentRole === "auxiliary"
+			? {}
+			: {
+					[QUOTE_TOOL_ATTR]: measured.toolName,
+					[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
+					...(quoteFile ? { [QUOTE_FILE_ATTR]: quoteFile } : {}),
+					...(measured.toolUseId ? { [QUOTE_TOOL_ID_ATTR]: measured.toolUseId } : {}),
+				};
 
 	// In a run: no border, a trailing divider unless last. The shimmer overlay
 	// sits on the inner padded box (not the outer wrapper) so the divider stays

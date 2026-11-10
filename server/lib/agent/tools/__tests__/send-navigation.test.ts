@@ -4,6 +4,8 @@ import type { ToolContext } from "../../types";
 const realCommunication = { ...(await import("@server/services/agent-communication")) };
 const realWebsocket = { ...(await import("@server/websocket/narrator-ws")) };
 const frames: unknown[] = [];
+const showIntents: Array<boolean | undefined> = [];
+let pauseDelivery = true;
 let release: (() => void) | undefined;
 let frameReceived: (() => void) | undefined;
 const deliveryTargets = [
@@ -14,14 +16,17 @@ const deliveryTargets = [
 mock.module("@server/services/agent-communication", () => ({
 	...realCommunication,
 	sendSubagentMessageDetailed: async (input: {
+		showToUser?: boolean;
 		onTargetsResolved?: (count: number) => void;
 		onDeliveryResolved?: (target: { id: string; deliveryMessageId: string }) => void;
 	}) => {
+		showIntents.push(input.showToUser);
 		if (deliveryTargets.length) input.onTargetsResolved?.(deliveryTargets.length);
 		for (const target of deliveryTargets) input.onDeliveryResolved?.(target);
-		await new Promise<void>((resolve) => {
-			release = resolve;
-		});
+		if (pauseDelivery)
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
 		return {
 			output: "Delivered",
 			targets: deliveryTargets,
@@ -77,4 +82,49 @@ test("queued receipts stream before completion and remain in final target metada
 	const result = await waiting;
 	expect(result.metadata?.targets).toEqual(deliveryTargets);
 	expect(result.metadata?.targetCount).toBe(2);
+	expect(showIntents.at(-1)).toBe(false);
+});
+
+test.each([
+	undefined,
+	false,
+	true,
+])("tool schema accepts optional display intent %s and sends a concrete boolean", async (showToUser) => {
+	const args = {
+		id: "worker-a",
+		message: "Report",
+		...(showToUser === undefined ? {} : { show_to_user: showToUser }),
+	};
+	expect(sendTool.parameters.safeParse(args).success).toBe(true);
+	pauseDelivery = false;
+	try {
+		const result = await sendTool.execute(args, {
+			narratorId: "primary",
+			currentToolUseId: "display-intent",
+			signal: new AbortController().signal,
+			locale: "en",
+		} as ToolContext);
+		expect(result.isError).toBeFalsy();
+		expect(showIntents.at(-1)).toBe(showToUser ?? false);
+		expect(result.metadata?.targets).toEqual(deliveryTargets);
+	} finally {
+		pauseDelivery = true;
+	}
+});
+
+test("raw and Zod schemas agree on optional boolean display intent", () => {
+	const raw = sendTool.rawJsonSchema;
+	expect((raw?.properties as Record<string, unknown>).show_to_user).toMatchObject({
+		type: "boolean",
+	});
+	expect(raw?.required as string[]).not.toContain("show_to_user");
+	for (const value of ["false", "true", 0, 1, null])
+		expect(sendTool.parameters.safeParse({ message: "Report", show_to_user: value }).success).toBe(
+			false,
+		);
+	const description = (raw?.properties as Record<string, { description: string }>).show_to_user
+		.description;
+	expect(description).toContain("default false");
+	expect(description).toContain("expandable");
+	expect(description).toContain("not a privacy or permission flag");
 });

@@ -40,7 +40,11 @@ import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
 import { RenderSystemSimple } from "./render/RenderSystemSimple";
 import { RenderSystemText } from "./render/RenderSystemText";
-import { RenderToolCall, RenderToolCallGroup } from "./render/RenderToolCall";
+import {
+	type ContentTargetResolver,
+	RenderToolCall,
+	RenderToolCallGroup,
+} from "./render/RenderToolCall";
 import {
 	RenderToolRun,
 	RenderTraceCountLine,
@@ -461,6 +465,7 @@ export function renderElement(
 					onDismiss={extra.onDismiss as (() => void) | undefined}
 				/>
 			);
+		case "auxiliary-content":
 		case "tool-call":
 			return (
 				<RenderToolCall
@@ -470,6 +475,7 @@ export function renderElement(
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
+					resolveTargetOpener={extra.resolveTargetOpener as ContentTargetResolver | undefined}
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}

@@ -1,0 +1,1 @@
+ALTER TABLE "user_preferences" ADD COLUMN "compact_auxiliary_content" boolean DEFAULT true NOT NULL;

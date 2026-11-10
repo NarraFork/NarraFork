@@ -3,6 +3,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	agentMessageDeliveryBody,
 	consumeAgentMessageHistory,
+	createAgentMessageDelivery,
 	isLastModelInputMailbox,
 	markAgentMessageConsumed,
 	trackAgentMessageHistory,
@@ -354,6 +355,74 @@ describe("last model input mailbox provenance", () => {
 });
 
 describe("Send exact delivery receipts", () => {
+	test.each([
+		undefined,
+		false,
+		true,
+	])("factory preserves optional display intent %s without defaulting other producers", (showToUser) => {
+		const delivery = createAgentMessageDelivery(
+			"child",
+			{ id: "parent", title: "Parent", label: "Parent", isParent: true },
+			"send-call",
+			"same words",
+			undefined,
+			showToUser,
+		);
+		const body = agentMessageDeliveryBody(delivery);
+		expect(body.kind).toBe("messages");
+		if (body.kind !== "messages") throw new Error("Expected messages body");
+		expect(body.items[0].showToUser).toBe(showToUser);
+		if (showToUser === undefined) {
+			expect(delivery).not.toHaveProperty("showToUser");
+			expect(body.items[0]).not.toHaveProperty("showToUser");
+		}
+	});
+
+	test.each([
+		undefined,
+		false,
+		true,
+	])("display intent %s survives durable inbox, adoption and body replay", async (showToUser) => {
+		const sent = await send("parent", "child", { showToUser });
+		const id = sent.targets[0].deliveryMessageId as string;
+		const [queued] = await agentQueued();
+		expect(queued.delivery.showToUser).toBe(showToUser ?? false);
+		expect(queued.delivery.text).toBe("same words");
+		const prepared = await consume();
+		const saved = row(id);
+		const [block] = JSON.parse(saved?.content_json ?? "[]");
+		expect(block.body.items[0]).toMatchObject({
+			showToUser: showToUser ?? false,
+			text: "same words",
+		});
+		expect(saved?.content_text).toBeString();
+		expect(saved?.content_text).not.toContain("showToUser");
+		expect(saved?.content_text).not.toContain("show_to_user");
+		expect(consumedAt(id)).toBeNull();
+		consumeAgentMessageHistory(prepared?.history ?? []);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(consumedAt(id)).toBeNumber();
+		expect(sent.targets[0]).not.toHaveProperty("showToUser");
+	});
+
+	test("legacy inbox metadata without display intent still adopts and acknowledges normally", async () => {
+		const sent = await send();
+		const id = sent.targets[0].deliveryMessageId as string;
+		const [queued] = await listInboxRows("child", ["agent_message"]);
+		const metadata = JSON.parse(queued.metadataJson ?? "{}");
+		delete metadata.delivery.showToUser;
+		sqlite
+			.prepare("UPDATE narrator_buffered_messages SET metadata_json = ? WHERE id = ?")
+			.run(JSON.stringify(metadata), queued.id);
+		expect((await agentQueued())[0].delivery).not.toHaveProperty("showToUser");
+		const prepared = await consume();
+		const [block] = JSON.parse(row(id)?.content_json ?? "[]");
+		expect(block.body.items[0]).not.toHaveProperty("showToUser");
+		consumeAgentMessageHistory(prepared?.history ?? []);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(consumedAt(id)).toBeNumber();
+	});
+
 	test("persisted and rebuilt input stays unconsumed until the recipient adopts that exact history", async () => {
 		const sent = await send();
 		const id = sent.targets[0].deliveryMessageId;

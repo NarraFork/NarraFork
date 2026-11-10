@@ -296,6 +296,20 @@ export function AppearanceSection({
 				checked={lodAltGesture}
 				onChange={(e) => setLodAltGesture(e.currentTarget.checked)}
 			/>
+			<Select
+				label={t("auxiliaryContentDisplay")}
+				description={t("auxiliaryContentDisplayDesc")}
+				value={userPrefs?.compactAuxiliaryContent === false ? "legacy" : "compact"}
+				data={[
+					{ value: "compact", label: t("auxiliaryContentDisplayCompact") },
+					{ value: "legacy", label: t("auxiliaryContentDisplayLegacy") },
+				]}
+				allowDeselect={false}
+				disabled={!userPrefs || updateUserPref.isPending}
+				onChange={(value) => {
+					if (value) updateUserPref.mutate({ compactAuxiliaryContent: value === "compact" });
+				}}
+			/>
 			{/* Narrator typography — the same three knobs the in-session Typography panel
 			    exposes. Both write the SAME user preference; this surface exists so the
 			    controls are reachable without opening a conversation, while the docked

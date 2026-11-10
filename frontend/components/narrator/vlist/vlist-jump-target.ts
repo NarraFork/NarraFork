@@ -29,6 +29,7 @@ const ANCILLARY_JUMP_ROW_KINDS: ReadonlySet<string> = new Set([
 	"reasoning-steps",
 	"reasoning-count",
 	"tool-call",
+	"auxiliary-content",
 	"tool-call-group",
 	"tool-run-count",
 	"activity-trace",

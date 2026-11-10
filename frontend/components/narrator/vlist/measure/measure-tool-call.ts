@@ -597,6 +597,10 @@ function mediaContentPx(
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface ToolCallData {
+	/** Auxiliary records share this view model without acquiring tool execution identity. */
+	contentRole?: "auxiliary";
+	/** Omitted for notices that have no real execution/delivery status. */
+	sourceStatus?: string | null;
 	/** Tool name (renderer header; height-neutral). */
 	toolName: string;
 	/** Header summary line (truncated → height-neutral). */
@@ -782,6 +786,8 @@ export function earliestToolStartMs(timing: ToolTimingStamps): number | null {
 }
 
 export interface MeasureToolCallOpts {
+	/** Presentation default, separate from a reader's explicit opened preference. */
+	defaultOpened?: boolean;
 	/** Viewport height (px) — plan cards cap their detail at 0.85 × this. */
 	viewportHeight?: number;
 	/** L5: recent cards follow `opened`; older ones collapse. Default true. */
@@ -858,6 +864,8 @@ export interface MeasuredToolDetail {
 }
 
 export interface MeasuredToolCall extends MeasuredElement {
+	contentRole?: "auxiliary";
+	sourceStatus?: string | null;
 	/** Resolved expand decision (the height/shape main switch). */
 	effectiveOpened: boolean;
 	/** True when running/streaming/pendingPermission (always expanded). */
@@ -1563,6 +1571,7 @@ function entryBlocks(
 			"vlist-tc-entry-title",
 			{
 				...(entry.href ? { href: entry.href } : {}),
+				...(entry.target ? { target: entry.target } : {}),
 				...(entry.tone ? { tone: entry.tone } : {}),
 			},
 		),
@@ -2036,14 +2045,15 @@ export function measureToolCall(
 	// forces the card expanded so the permission area shows.
 	const hasPendingPermission = opts.hasPendingPermission === true;
 	const forceExpanded = hasPending || hasPendingPermission || opts.forceExpanded === true;
-	const preferOpen = opts.preferOpen === true || prefersOpenToolCategory(data.category);
+	const preferOpen = opts.preferOpen ?? prefersOpenToolCategory(data.category);
 
 	const innerWidth = toolCardInnerWidth(contentWidth, inRun);
 
 	// ── Expand decision ──────────────────────────────────────────────────────
 	const lodExempt = isRunningStatus(data.status) || isStreaming || forceExpanded;
 	const isRecent = opts.isRecent ?? true;
-	const opened = opts.opened ?? (preferOpen || computeDefaultOpen(data, forceExpanded));
+	const opened =
+		opts.opened ?? opts.defaultOpened ?? (preferOpen || computeDefaultOpen(data, forceExpanded));
 	// An EXPLICIT fold, as opposed to `opened === false` derived from
 	// `computeDefaultOpen`. The two must stay distinct: at L5 the derived default is
 	// not a decision the reader made, so honouring it there would collapse every
@@ -2141,6 +2151,8 @@ export function measureToolCall(
 		lodExempt,
 		isStreaming,
 		queuedBehindUpstream: data.queuedBehindUpstream === true ? true : undefined,
+		contentRole: data.contentRole,
+		sourceStatus: data.sourceStatus,
 		inRun,
 		isLast,
 		hasBorder,

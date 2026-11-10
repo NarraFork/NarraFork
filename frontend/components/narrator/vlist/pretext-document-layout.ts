@@ -1,5 +1,9 @@
 import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { PretextLayoutIndex, PretextLayoutManifest } from "@shared/pretext-layout";
+import {
+	auxiliaryContentKey,
+	auxiliaryContentViews,
+} from "@shared/pretext-layout/auxiliary-content";
 import type { MeasureElement } from "@shared/pretext-layout/layout-pipeline";
 import {
 	type ContentBlockLike,
@@ -21,6 +25,7 @@ import type { VListItem } from "./vlist-pipeline";
 import { findLatestSpecTasksToolUseIdInMessages } from "./vlist-spec-tasks-pin";
 
 export interface BuildPretextDocumentLayoutOptions {
+	compactAuxiliaryContent?: boolean;
 	/** Transient document-owned caches/providers, not part of the persisted snapshot. */
 	segmentationCache?: MessageSegmentationCache;
 	measure?: MeasureElement;
@@ -76,6 +81,7 @@ export interface BuildPretextDocumentLayoutOptions {
 	/** Whether an error card may offer the model probe (shares that measured row). */
 	canOfferModelTest?: (errorText: string) => boolean;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
 	/** First-frame layout of a live InlinePermission form (see AdapterContext). */
 	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;
 	/** Painted height of that form once it has mounted (see AdapterContext). */
@@ -150,6 +156,9 @@ export function activityUnitKey(
 	unitIndex: number,
 ): string {
 	const first = unit.items[0];
+	if (first?.kind === "auxiliary" && first.msg) {
+		return `activity-a:${auxiliaryContentKey(first.msg, first.blockIndex ?? 0)}`;
+	}
 	if (first?.kind === "tool") {
 		const toolUseId = first.tc?.toolUseId;
 		if (toolUseId) {
@@ -234,8 +243,16 @@ export function createLongestPrefixLookup<T>(registry: ReadonlyMap<string, T>): 
 function buildSourceResolver(
 	renderUnits: readonly RenderUnit[],
 	messages: readonly SourceMessage[],
+	compactAuxiliaryContent = false,
 ): (spec: ElementSpec, itemIndex: number) => ReturnType<typeof sourceForMessages> {
 	const exact = new Map<string, SourceMessage[]>();
+	if (compactAuxiliaryContent) {
+		for (const message of messages) {
+			for (const view of auxiliaryContentViews(message)) {
+				exact.set(auxiliaryContentKey(message, view.blockIndex), [message]);
+			}
+		}
+	}
 	const all = renderUnits.flatMap((unit, unitIndex) => {
 		const sources = sourceMessagesForUnit(unit);
 		if (unit.kind === "activity") {
@@ -335,7 +352,10 @@ export function buildPretextDocumentLayout(
 	options: BuildPretextDocumentLayoutOptions,
 ): BuiltPretextDocumentLayout {
 	const sourceMessages = messages as readonly SourceMessage[];
-	const segments = segmentMessages(messages as NarratorMsg[], { cache: options.segmentationCache });
+	const segments = segmentMessages(messages as NarratorMsg[], {
+		cache: options.segmentationCache,
+		compactAuxiliaryContent: options.compactAuxiliaryContent,
+	});
 	// The pinned tasks card: one id, derived HERE — once per build, over the SAME
 	// message list being laid out (persisted window + live streaming row). It drives
 	// both fold gates below and the adapter's per-card forceExpanded flag, so the
@@ -355,6 +375,8 @@ export function buildPretextDocumentLayout(
 	// a bare "tool calls ×N" line that names none of them. Their named rows are
 	// exactly what a reader at a low LOD still has (see splitToolRunForActivity).
 	const groupingOptions = {
+		compactAuxiliaryContent: options.compactAuxiliaryContent,
+		resolveQuestionStatus: options.resolveQuestionStatus,
 		keepToolUseIds:
 			latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
 	};
@@ -394,6 +416,10 @@ export function buildPretextDocumentLayout(
 			if (unit.items.length < 2) continue;
 			const groupId = `mg-${unit.sourceMessages[0]?.id ?? "unknown"}-${index}`;
 			for (const item of unit.items) {
+				if (item.kind === "auxiliary" && item.msg) {
+					morphGroupIdByUnitId.set(auxiliaryContentKey(item.msg, item.blockIndex ?? 0), groupId);
+					continue;
+				}
 				if (item.kind === "tool") {
 					const toolUseId = item.tc?.toolUseId;
 					// Mirrors `toolItemKey`, including the retry disambiguator, so the label
@@ -420,7 +446,11 @@ export function buildPretextDocumentLayout(
 			}
 		}
 	}
-	const resolveSource = buildSourceResolver(renderUnits, sourceMessages);
+	const resolveSource = buildSourceResolver(
+		renderUnits,
+		sourceMessages,
+		options.compactAuxiliaryContent,
+	);
 	const recentMessageIds =
 		options.recentMessageIds ??
 		options.resolveRecentMessageIds?.(messages as readonly NarratorMsg[]);
@@ -428,9 +458,12 @@ export function buildPretextDocumentLayout(
 	// the manifest identity) treat a language switch as new content: the adapter
 	// bakes localized strings into measured card/trace text, which the spec.key and
 	// message version alone cannot distinguish.
-	const documentRevision = options.labelsRevision
+	const labelRevision = options.labelsRevision
 		? `${options.documentRevision}~l:${options.labelsRevision}`
 		: options.documentRevision;
+	const documentRevision = options.compactAuxiliaryContent
+		? `${labelRevision}~aux:1`
+		: labelRevision;
 	const built = buildPretextLayoutManifest({
 		...options,
 		documentRevision,
