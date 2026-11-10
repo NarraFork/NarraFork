@@ -151,7 +151,7 @@
 		"sessionUnavailable": "你无法打开写入它的会话。"
 	},
 	"editor": {
-		"questionMark": "问人的提问：在收件箱里回答。删除它就是撤回提问。",
+		"questionMark": "打开提问即可回答；删除即撤回。",
 		"questionsWithdrawn_one": "删除撤回了一条问人的提问；撤销即可重新提问。",
 		"questionsWithdrawn_other": "删除撤回了 {{count}} 条问人的提问；撤销即可重新提问。",
 		"changeStatus": "切换状态",
@@ -327,10 +327,9 @@
 		"answeredRelayedVia": "{{name}} 在对话里回答（经 {{via}}）：{{choice}}",
 		"withdrawn": "已撤回",
 		"waitingFor": "等 {{name}} 回答",
-		"notePlaceholder": "补充说明，或用自己的话回答",
+		"notePlaceholder": "或直接写下你的回答",
 		"answerPlaceholder": "你的回答",
-		"adoptAll": "全部采纳建议（{{count}}）",
-		"submit": "回答",
+		"submit": "提交回答",
 		"nothingToSend": "先选一个选项或写下回答",
 		"answered": "已回答 {{count}} 条提问，已通知 agent",
 		"answerFailed": "回答没有保存",

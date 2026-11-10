@@ -280,6 +280,7 @@ import {
 	prefersReducedMotion,
 	rowScope,
 } from "./vlist-motion-scheduler";
+import { useOutlineAskSlots } from "./vlist-outline-ask-bridge";
 import {
 	toolUseIdFromSpecKey,
 	usePermissionSlots,
@@ -415,6 +416,8 @@ type PretextExactMessageListProps = {
 	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
+	/** Private narrator surfaces only: mount the current Outline Ask answer form. */
+	enableOutlineAsk?: boolean;
 	/**
 	 * Deep-link / search target: jump to this message once and flash it.
 	 *
@@ -536,6 +539,7 @@ export const PretextExactMessageList = memo(
 				onSelectionResolverChange,
 				rowHandlers,
 				permCb,
+				enableOutlineAsk = false,
 				highlightMessageId,
 				highlightRequestId,
 				highlightNeedle,
@@ -2893,6 +2897,11 @@ export const PretextExactMessageList = memo(
 				() => buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]),
 				[pretextDocument.messages],
 			);
+			const outlineAskSlotByKey = useOutlineAskSlots({
+				renderItems: semanticItems,
+				tools: rowToolMetaIndex,
+				enabled: enableOutlineAsk && !dataSource,
+			});
 			const permissionSlotByKey = usePermissionSlots({
 				renderItems: semanticItems,
 				tools: rowToolMetaIndex,
@@ -2981,6 +2990,9 @@ export const PretextExactMessageList = memo(
 				const keys = new Set<string>();
 				for (const item of semanticItems) {
 					if (!item) continue;
+					// Outline forms are only present while expanded. Removing the slot also
+					// prunes its height override in the same render as the fold.
+					if (outlineAskSlotByKey.has(item.spec.key)) keys.add(item.spec.key);
 					// A card that RESERVED its form arithmetically stays a fixed, clipped row: the
 					// form reports its own height through `permissionFormHeight`. Only a form the
 					// card could not reserve (AskUserQuestion's banner, a subagent card's) keeps
@@ -3004,7 +3016,7 @@ export const PretextExactMessageList = memo(
 				}
 				if (editingRow) keys.add(editingRow.key);
 				return keys;
-			}, [semanticItems, permissionSlotByKey, editingRow]);
+			}, [semanticItems, permissionSlotByKey, outlineAskSlotByKey, editingRow]);
 			dynamicRowKeysRef.current = dynamicRowKeys;
 
 			// Drop overrides that must no longer apply. The decisive case is a RESOLVED
@@ -5367,6 +5379,7 @@ export const PretextExactMessageList = memo(
 						injectionNavigation,
 						currentUserId,
 						permissionSlot,
+						outlineAskSlot: outlineAskSlotByKey.get(item.spec.key),
 						traceRowPermissionSlots: tracePermissionSlotsByKey.get(item.spec.key),
 						onPermissionFormHeight: getPermissionHeightReporter(
 							item.spec.key,
