@@ -20,7 +20,9 @@
  *   - a task done or cancelled is closed: its title, and one line of its result;
  *   - a subagent report's container is closed: one line of its summary;
  *   - any other block under a task or inside a report (a DETAIL) is closed: one preview line;
- *   - any other block (a fact) is open, as before.
+ *   - any other block (a fact) is open, as before;
+ *   - whatever it is, a block with a question waiting for an answer somewhere under it is open:
+ *     an unanswered question is never folded away by default.
  *
  * THE READER'S VIEW ({@link FoldView})
  * -----------------------------------
@@ -173,7 +175,7 @@ function addMarks(into: FoldMarks | null, from: Partial<FoldMarks> | null | unde
 	return out;
 }
 
-/** The tree under `rootId` with what is open in `view`. One walk down, one back up. */
+/** The tree under `rootId` with what is open in `view`: two walks down and two back up. */
 export function buildFoldTree(
 	source: FoldSource,
 	options: FoldTreeOptions,
@@ -184,6 +186,7 @@ export function buildFoldTree(
 	const stack: Array<{ id: string; parent: FoldNode | null }> = [
 		{ id: options.rootId, parent: null },
 	];
+	// Down: the structure, and what each block is.
 	while (stack.length > 0) {
 		const { id, parent } = stack.pop() as { id: string; parent: FoldNode | null };
 		// A block reached twice (bad data) is shown once.
@@ -195,11 +198,6 @@ export function buildFoldTree(
 		const detail = parent
 			? parent.detail || parent.task !== null || parent.report
 			: options.rootDetail === true;
-		const defaultOpen = foldDefaultOpen({ root: parent === null, task, report, detail });
-		const open =
-			kids.length > 0 &&
-			(parent === null ||
-				(view.expanded.has(id) ? true : view.collapsed.has(id) ? false : defaultOpen));
 		const node: FoldNode = {
 			id,
 			parent: parent?.id ?? null,
@@ -208,9 +206,9 @@ export function buildFoldTree(
 			task,
 			report,
 			detail,
-			defaultOpen,
-			open,
-			visible: parent ? parent.visible && parent.open : true,
+			defaultOpen: foldDefaultOpen({ root: parent === null, task, report, detail }),
+			open: false,
+			visible: true,
 			size: 0,
 			allOpen: true,
 			defaultAllOpen: true,
@@ -220,26 +218,34 @@ export function buildFoldTree(
 		order.push(id);
 		for (let i = kids.length - 1; i >= 0; i--) stack.push({ id: kids[i] as string, parent: node });
 	}
-	if (options.pinned) {
-		let forced = false;
-		for (const id of options.pinned) {
-			for (let at = nodes.get(id)?.parent ?? null; at !== null; ) {
-				const node = nodes.get(at) as FoldNode;
-				if (!node.open) {
-					node.open = true;
-					forced = true;
-				}
-				at = node.parent;
-			}
-		}
-		// Parents come before their children in `order`.
-		if (forced)
-			for (const id of order) {
-				const node = nodes.get(id) as FoldNode;
-				const parent = node.parent === null ? null : (nodes.get(node.parent) as FoldNode);
-				node.visible = parent ? parent.visible && parent.open : true;
-			}
+	// Up: how much is under each block, and the marks of it.
+	for (let i = order.length - 1; i >= 0; i--) {
+		const node = nodes.get(order[i] as string) as FoldNode;
+		if (node.parent === null) continue;
+		const parent = nodes.get(node.parent) as FoldNode;
+		parent.size += node.size + 1;
+		parent.under = addMarks(addMarks(parent.under, node.under), source.marks?.(node.id));
 	}
+	const forced = new Set<string>();
+	for (const id of options.pinned ?? []) {
+		for (let at = nodes.get(id)?.parent ?? null; at !== null; at = nodes.get(at)?.parent ?? null)
+			forced.add(at);
+	}
+	// Down again (parents come before their children in `order`): what is open and on screen.
+	for (const id of order) {
+		const node = nodes.get(id) as FoldNode;
+		const parent = node.parent === null ? null : (nodes.get(node.parent) as FoldNode);
+		// A question waiting for an answer is never folded away by default: the blocks above it
+		// are open until the reader closes them (then the closed row counts it).
+		if ((node.under?.question ?? 0) > 0) node.defaultOpen = true;
+		node.open =
+			node.kids.length > 0 &&
+			(parent === null ||
+				forced.has(id) ||
+				(view.expanded.has(id) ? true : view.collapsed.has(id) ? false : node.defaultOpen));
+		node.visible = parent ? parent.visible && parent.open : true;
+	}
+	// Up again: whether everything inside each block is open, now and by default.
 	for (let i = order.length - 1; i >= 0; i--) {
 		const node = nodes.get(order[i] as string) as FoldNode;
 		if (node.kids.length > 0) {
@@ -248,10 +254,8 @@ export function buildFoldTree(
 		}
 		if (node.parent === null) continue;
 		const parent = nodes.get(node.parent) as FoldNode;
-		parent.size += node.size + 1;
 		if (!node.allOpen) parent.allOpen = false;
 		if (!node.defaultAllOpen) parent.defaultAllOpen = false;
-		parent.under = addMarks(addMarks(parent.under, node.under), source.marks?.(node.id));
 	}
 	return { rootId: options.rootId, nodes, order };
 }
@@ -340,6 +344,18 @@ function hasOverride(tree: FoldTree, view: FoldView): boolean {
 	if (view.expanded.size === 0 && view.collapsed.size === 0) return false;
 	for (const id of tree.order) if (view.expanded.has(id) || view.collapsed.has(id)) return true;
 	return false;
+}
+
+/**
+ * The blocks under `id` that are questions waiting for an answer (what a closed row's question
+ * count stands for), in document order: the count opens them.
+ */
+export function foldQuestionsUnder(tree: FoldTree, source: FoldSource, id: string): string[] {
+	const out: string[] = [];
+	for (const node of subtreeOf(tree, id)) {
+		if (node.id !== id && (source.marks?.(node.id)?.question ?? 0) > 0) out.push(node.id);
+	}
+	return out;
 }
 
 /** What a closed row counts of what it hides, or null. */

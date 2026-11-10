@@ -27,6 +27,7 @@ import {
 	type FoldView,
 	foldPageControl,
 	foldPreviewLine,
+	foldQuestionsUnder,
 	visibleFoldRows,
 } from "@shared/outline-fold";
 import { IconFoldDown, IconFoldUp } from "@tabler/icons-react";
@@ -146,6 +147,8 @@ interface RowProps {
 	spaceId: string;
 	search: OutlineBlockSearch;
 	onFold: (action: FoldAction) => void;
+	/** The row's count of hidden unanswered questions was used. */
+	onQuestions: (id: string) => void;
 }
 
 const OutlineRow = memo(function OutlineRow({
@@ -164,6 +167,7 @@ const OutlineRow = memo(function OutlineRow({
 	spaceId,
 	search,
 	onFold,
+	onQuestions,
 }: RowProps) {
 	const { t, i18n } = useTranslation("outline");
 	const collapsed = hasChildren && !open;
@@ -350,13 +354,22 @@ const OutlineRow = memo(function OutlineRow({
 										{count}
 									</OutlineStatusChip>
 								) : (
+									// The questions it hides are one step away: the count opens them and
+									// where they are answered.
 									<Badge
 										key={kind}
+										component="button"
+										type="button"
 										size="xs"
 										variant="light"
 										color="teal"
 										tt="none"
+										style={{ cursor: "pointer" }}
 										leftSection={<QUESTION_ICON.Icon size={10} aria-hidden />}
+										onClick={(e: React.MouseEvent) => {
+											if (plainClick(e)) onQuestions(id);
+										}}
+										onKeyDown={ownKeys(() => onQuestions(id))}
 										{...props}
 									>
 										{count}
@@ -529,25 +542,45 @@ export interface OutlineBlockTreeProps {
 	search: OutlineBlockSearch;
 	/** The reader folds: the tree as it is shown, and what they did. */
 	onFold: (tree: FoldTree, action: FoldAction) => void;
+	/**
+	 * The reader used a closed row's count of unanswered questions: they are on screen now, and
+	 * the host takes the reader to where they are answered (`under`: the block the first is
+	 * under, whose page holds its answer form).
+	 */
+	onOpenQuestions?: (ids: string[], under: string | null) => void;
 }
 
 /**
  * The blocks under the view's root, as an indented list with the default folding, the reader's
  * own over it, and focus.
  */
-export function OutlineBlockTree({ view, fold, search, onFold }: OutlineBlockTreeProps) {
+export function OutlineBlockTree({
+	view,
+	fold,
+	search,
+	onFold,
+	onOpenQuestions,
+}: OutlineBlockTreeProps) {
 	const { t } = useTranslation("outline");
 	const byId = useMemo(() => new Map(view.blocks.map((b) => [b.id, b])), [view]);
 	const source = useMemo(() => viewFoldSource(view), [view]);
 	const tree = useMemo(() => viewFoldTree(view, source, fold), [view, source, fold]);
 	const rows = useMemo(() => visibleFoldRows(tree, source).rows, [tree, source]);
 	// Stable for the memoized rows: the tree of the moment is read when a row acts.
-	const latest = useRef({ tree, onFold });
-	latest.current = { tree, onFold };
+	const latest = useRef({ tree, source, onFold, onOpenQuestions });
+	latest.current = { tree, source, onFold, onOpenQuestions };
 	const act = useCallback(
 		(action: FoldAction) => latest.current.onFold(latest.current.tree, action),
 		[],
 	);
+	const questions = useCallback((id: string) => {
+		const now = latest.current;
+		const ids = foldQuestionsUnder(now.tree, now.source, id);
+		// (Opening is by each block's own default, so the tree as it was serves them all.)
+		for (const q of ids) now.onFold(now.tree, { kind: "reveal", id: q });
+		if (ids.length > 0)
+			now.onOpenQuestions?.(ids, now.tree.nodes.get(ids[0] as string)?.parent ?? null);
+	}, []);
 	const root = byId.get(view.rootId);
 	if (rows.length === 0) {
 		return (
@@ -598,6 +631,7 @@ export function OutlineBlockTree({ view, fold, search, onFold }: OutlineBlockTre
 						spaceId={view.space.id}
 						search={search}
 						onFold={act}
+						onQuestions={questions}
 					/>
 				);
 			})}

@@ -20,8 +20,11 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { db } from "../../../server/db";
 import { narrators } from "../../../server/db/schema";
+import { askTool } from "../../../server/lib/agent/tools/outline";
+import type { ToolContext } from "../../../server/lib/agent/types";
 import { generateId } from "../../../server/lib/id";
 import { reportBlockId } from "../../../server/services/outline/delegation";
+import { setOutlineAnswerDelivery } from "../../../server/services/outline/questions";
 import { OUTLINE_REPORT_ACTOR } from "../../../server/services/outline/report-authors";
 import { outlineStore } from "../../../server/services/outline/store";
 import { writeOutline } from "../../../server/services/outline/write";
@@ -941,21 +944,33 @@ test("a closed row counts the questions, pending changes and locks it hides", as
 		[idOf("store.ts:12")]: { pending: ["chg-1"] },
 		[idOf("A lone note")]: { pending: ["chg-2"] },
 	});
+	// The questions are never folded away by default: the blocks above them open.
 	await eventually(
-		() => rowOf(a, note),
-		(row) => row?.hidden.question === 2,
-		"counts on the closed note",
+		() => texts(a),
+		(t) => t.includes("Deep detail") && t.includes("Detail two"),
+		"unanswered questions are on screen",
 	);
-	expect((await rowOf(a, note))?.hidden).toEqual({ question: 2, locked: 1 });
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	expect((await rowOf(a, note))?.hidden).toEqual({});
+	// The pending change under the finished task is counted on its closed row.
 	expect((await rowOf(a, done))?.hidden).toEqual({ pending: 1 });
 	// A mark on a row that is shown is its own badge, not a count on its parent.
 	expect((await rowOf(a, doing))?.hidden).toEqual({});
-	// Opening the note moves the counts down to the row that still hides them.
+	// The reader closes the note: its row counts what it hides now.
 	await click(a, note, "arrow");
 	await eventually(
 		() => rowOf(a, note),
-		(row) => row?.state === "open",
-		"open",
+		(row) => row?.state === "closed",
+		"closed by the reader",
+	);
+	expect((await rowOf(a, note))?.hidden).toEqual({ question: 2, locked: 1 });
+	// Open again, and one level down closed: the counts move to the row that hides them.
+	await click(a, note, "arrow");
+	await click(a, idOf("Detail one"), "arrow");
+	await eventually(
+		() => rowOf(a, idOf("Detail one")),
+		(row) => row?.state === "closed",
+		"one level down",
 	);
 	expect((await rowOf(a, note))?.hidden).toEqual({});
 	expect((await rowOf(a, idOf("Detail one")))?.hidden).toEqual({ question: 1, locked: 1 });
@@ -1175,4 +1190,257 @@ test("the mind map folds the same tree: closed nodes carry a count, sizes stay e
 		"the outline follows the map's folding",
 	);
 	expect(a.errors).toEqual([]);
+}, 60_000);
+
+test("an unanswered question is never folded away; a closed row's count opens to its answer form; a draft survives folding", async () => {
+	const { pageId, idOf } = await page();
+	const NOW = "2026-10-27T00:00:00.000Z";
+	const session = generateId();
+	await db.insert(narrators).values({
+		id: session,
+		title: "Question worker",
+		ownerUserId: h.owner,
+		visibility: "private",
+		contextProjectId: h.space.projectId,
+		taskBackend: "outline",
+		createdAt: NOW,
+		updatedAt: NOW,
+	});
+	// The session works on the subtask, asks a question under it and a follow-up under that.
+	const sub = idOf("A subtask");
+	await writeOutline({
+		spaceId: h.space.id,
+		ops: [{ op: "setTask", block: { id: sub }, task: { status: "doing" } }],
+		actor: { kind: "agent", id: session },
+		narratorId: session,
+		responsibleUserId: h.owner,
+	});
+	const context = {
+		narratorId: session,
+		cwd: "/",
+		signal: new AbortController().signal,
+		locale: "en",
+		userId: h.owner,
+		requestPermission: async () => ({ behavior: "allow" }),
+	} as ToolContext;
+	const asked = await askTool.execute(
+		{
+			questions: [
+				{
+					question: "Which format should we export?",
+					options: ["CSV", "JSON"],
+					recommend: 2,
+					items: [
+						{
+							question: "Anything to leave out?",
+							recommend: "Nothing",
+							reason: "It is all small",
+						},
+					],
+				},
+			],
+		},
+		context,
+	);
+	if (asked.isError) throw new Error(JSON.stringify(asked));
+	const first = (asked.metadata?.blockIds as string[])[0] as string;
+	const second = (await outlineStore.listChildMetas(h.space.id, [first], 5)).find(
+		(meta) => meta.askJson !== null,
+	)?.id as string;
+	expect((await outlineStore.getBlock(second))?.parentId).toBe(first);
+	// The task is finished with the questions still open: by the usual rule it would fold.
+	await writeOutline({
+		spaceId: h.space.id,
+		ops: [{ op: "setTask", block: { id: sub }, task: { status: "done" } }],
+		actor: { kind: "human", id: h.owner },
+		responsibleUserId: h.owner,
+	});
+	const previousDelivery = setOutlineAnswerDelivery({
+		async deliver() {
+			return { written: true, woke: false };
+		},
+	});
+	try {
+		const a = await openHost(h, "page", pageId);
+		const card = (id: string) => `[data-testid="outline-question-${id}"][data-state="open"]`;
+		const draft = `${card(second)} [data-testid="outline-question-text"]`;
+		const ids = async () => (await rows(a)).map((row) => row.id);
+		// Both questions are rows on screen: the finished task, and the question over its
+		// follow-up, stay open for them. Nothing is stored for it: it is the default.
+		await eventually(ids, (shown) => shown.includes(first) && shown.includes(second), "on screen");
+		expect((await rowOf(a, sub))?.state).toBe("open");
+		expect((await rowOf(a, sub))?.hidden).toEqual({});
+		expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+
+		// The reader closes the task: its row counts the questions, and the count is the way to
+		// them: it opens the rows and goes to the block whose page holds their answer form.
+		await click(a, sub, "arrow");
+		await eventually(
+			() => rowOf(a, sub),
+			(row) => row?.state === "closed" && row.hidden.question === 2,
+			"closed over the questions",
+		);
+		const chipOf = (id: string) =>
+			a.call((f, x) => {
+				const el = f
+					.view()
+					.blockEls.get(x as never)
+					?.querySelector<HTMLElement>(
+						':scope > .ob-marks > .ob-fold-hidden[data-kind="question"]',
+					);
+				if (!el) return null;
+				const r = el.getBoundingClientRect();
+				return {
+					role: el.getAttribute("role"),
+					label: el.getAttribute("aria-label"),
+					x: r.left + r.width / 2,
+					y: r.top + r.height / 2,
+				};
+			}, id);
+		const chip = await chipOf(sub);
+		expect(chip).toMatchObject({
+			role: "button",
+			label: "2 questions waiting for an answer inside",
+		});
+		await a.page.mouse.click(chip?.x ?? 0, chip?.y ?? 0);
+		await a.page.waitForSelector(draft, { visible: true, timeout: 10_000 });
+		const inCard = (id: string) =>
+			a.page.evaluate(
+				(selector) => !!document.querySelector(selector)?.contains(document.activeElement),
+				card(id),
+			);
+		await eventually(
+			() => inCard(first),
+			(inside) => inside,
+			"the keyboard is in the first form",
+		);
+		expect(await a.call((f) => f.state().focus)).toBe(sub);
+		expect((await foldState(a)).collapsed).toEqual([]);
+		await settled(a);
+		await eventually(ids, (shown) => shown.includes(first) && shown.includes(second), "rows");
+		// No shortcut that answers for the reader.
+		expect(
+			await a.page.evaluate(() =>
+				[...document.querySelectorAll("button")]
+					.map((b) => b.textContent ?? "")
+					.filter((text) => /adopt|采纳/i.test(text)),
+			),
+		).toEqual([]);
+
+		// A draft in progress: a choice for the first, words for the second.
+		await a.page.click(`${card(first)} input[type=radio][value="1"]`);
+		await a.page.click(draft);
+		await a.page.keyboard.type("Leave the logs out");
+		const mark = () =>
+			a.page.evaluate((selector) => {
+				const el = document.querySelector(selector) as
+					| (HTMLTextAreaElement & { __kept?: 1 })
+					| null;
+				if (!el) return null;
+				const kept = el.__kept === 1;
+				el.__kept = 1;
+				return { kept, value: el.value, focused: document.activeElement === el };
+			}, draft);
+		expect(await mark()).toEqual({ kept: false, value: "Leave the logs out", focused: true });
+
+		// The reader folds the question over its follow-up: the form is not remounted, the draft
+		// and the keyboard stay where they are, and the closed row counts the follow-up.
+		await click(a, first, "arrow");
+		await eventually(
+			() => rowOf(a, first),
+			(row) => row?.state === "closed" && row.hidden.question === 1,
+			"closed over the follow-up",
+		);
+		expect(await ids()).not.toContain(second);
+		expect(await mark()).toEqual({ kept: true, value: "Leave the logs out", focused: true });
+		await a.page.keyboard.type(" for now");
+		// Open again, and the page's control both ways: still the same form and draft.
+		await click(a, first, "arrow");
+		await eventually(
+			() => rowOf(a, first),
+			(row) => row?.state === "open",
+			"open again",
+		);
+		await click(a, first, "arrow");
+		await eventually(
+			() => rowOf(a, first),
+			(row) => row?.state === "closed",
+			"closed again",
+		);
+		const all = await a.call((f) => f.foldAll());
+		expect(all?.offers).toBe("expand");
+		await a.page.mouse.click(all?.x ?? 0, all?.y ?? 0);
+		await eventually(
+			() => rowOf(a, first),
+			(row) => row?.state === "open",
+			"everything open",
+		);
+		expect(await mark()).toEqual({
+			kept: true,
+			value: "Leave the logs out for now",
+			focused: true,
+		});
+		expect(
+			await a.page.evaluate(
+				(selector) => (document.querySelector(selector) as HTMLInputElement | null)?.checked,
+				`${card(first)} input[type=radio][value="1"]`,
+			),
+		).toBe(true);
+
+		// Closed by the reader again, the count puts the keyboard in the hidden question's form.
+		await click(a, first, "arrow");
+		await eventually(
+			() => rowOf(a, first),
+			(row) => row?.state === "closed" && row.hidden.question === 1,
+			"closed once more",
+		);
+		await a.page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+		const inner = await chipOf(first);
+		expect(inner?.label).toBe("1 question waiting for an answer inside");
+		await a.page.mouse.click(inner?.x ?? 0, inner?.y ?? 0);
+		await eventually(
+			() => rowOf(a, first),
+			(row) => row?.state === "open",
+			"the count opens it",
+		);
+		await eventually(
+			() => inCard(second),
+			(inside) => inside,
+			"the keyboard is in its form",
+		);
+		expect(await mark()).toEqual({
+			kept: true,
+			value: "Leave the logs out for now",
+			focused: true,
+		});
+
+		// The draft is sent as written, bound to the version of each question it was written for.
+		const versions = Object.fromEntries(
+			(await outlineStore.getBlockMetasByIds([first, second])).map((m) => [m.id, m.versionSeq]),
+		);
+		const request = a.page.waitForRequest(
+			(r) => r.url().endsWith("/api/outline/questions/answer") && r.method() === "POST",
+		);
+		const response = a.page.waitForResponse(
+			(r) => r.url().endsWith("/api/outline/questions/answer") && r.request().method() === "POST",
+		);
+		await a.page.click('[data-testid="outline-questions-submit"]');
+		const sent = JSON.parse((await request).postData() ?? "{}") as {
+			answers: Array<{ blockId: string; versionSeq: number; option?: number; text?: string }>;
+		};
+		expect((await response).status()).toBe(200);
+		expect(sent.answers.map((x) => [x.blockId, x.versionSeq])).toEqual([
+			[first, versions[first]],
+			[second, versions[second]],
+		]);
+		expect(sent.answers[0]?.option).toBe(1);
+		expect(sent.answers[1]?.text).toBe("Leave the logs out for now");
+		expect((await outlineStore.getQuestions([first, second])).map((q) => q.state)).toEqual([
+			"answered",
+			"answered",
+		]);
+		expect(a.errors).toEqual([]);
+	} finally {
+		setOutlineAnswerDelivery(previousDelivery);
+	}
 }, 60_000);

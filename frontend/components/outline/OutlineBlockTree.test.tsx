@@ -433,6 +433,8 @@ describe("OutlineBlockTree: the default view of a task page", () => {
 			"leaf",
 			"report",
 			"ask",
+			// A question waiting for an answer is never folded away by default.
+			"askctx",
 			"done",
 			"bare",
 			"gone",
@@ -477,8 +479,13 @@ describe("OutlineBlockTree: the default view of a task page", () => {
 			text: "The summary paragraph.",
 			label: "fold.reportAll:count=3",
 		});
-		// One child with nothing more: the line alone.
-		expect(parts("ask")).toEqual({ kind: "details", text: "Context", label: null });
+		// One child with nothing more: the line alone (here: closed by the reader).
+		const closed = dom({ expanded: new Set(), collapsed: new Set(["ask"]) });
+		expect(preview(closed, "ask")?.querySelector("[data-fold-preview-text]")?.textContent).toBe(
+			"Context",
+		);
+		expect(preview(closed, "ask")?.querySelector("[data-fold-preview-label]")).toBeNull();
+		expect(preview(doc, "ask")).toBeNull();
 		// A finished task with only subtasks: its title is all there is.
 		expect(preview(doc, "bare")).toBeNull();
 		expect(preview(doc, "doing")).toBeNull();
@@ -535,7 +542,8 @@ describe("OutlineBlockTree: the default view of a task page", () => {
 			[...doc.querySelectorAll(`[data-block-id="${id}"] [data-testid="outline-fold-hidden"]`)].map(
 				(el) => `${el.getAttribute("data-kind")}:${el.getAttribute("aria-label")}`,
 			);
-		expect(hidden("ask")).toEqual(["question:fold.hiddenQuestion:count=1"]);
+		// The question's row is on screen: nothing counts it.
+		expect(hidden("ask")).toEqual([]);
 		expect(hidden("done")).toEqual(["pending:fold.hiddenPending:count=1"]);
 		expect(hidden("note")).toEqual(["locked:fold.hiddenLocked:count=1"]);
 		expect(hidden("doing")).toEqual([]);
@@ -544,6 +552,15 @@ describe("OutlineBlockTree: the default view of a task page", () => {
 		expect(chip?.getAttribute("data-status-chip")).toBe("locked");
 		expect(chip?.querySelector("svg")).not.toBeNull();
 		expect(chip?.textContent).toBe("1");
+		// The reader closes above the question: the row counts it, and the count is a control
+		// (it opens the question and where it is answered).
+		const asked = dom({ expanded: new Set(), collapsed: new Set(["ask"]) });
+		const count = asked.querySelector('[data-block-id="ask"] [data-testid="outline-fold-hidden"]');
+		expect(count?.getAttribute("data-kind")).toBe("question");
+		expect(count?.getAttribute("aria-label")).toBe("fold.hiddenQuestion:count=1");
+		expect(count?.tagName).toBe("BUTTON");
+		// The other counts say what is there; they are not controls.
+		expect(chip?.tagName).not.toBe("BUTTON");
 		// Closing the task above moves all three up to it; opening a row moves its count down.
 		const closed = dom({ expanded: new Set(), collapsed: new Set(["doing"]) });
 		expect(
@@ -568,7 +585,7 @@ describe("OutlineBlockTree: the default view of a task page", () => {
 		expect(all?.getAttribute("data-fold-all")).toBe("expand");
 		expect(all?.textContent).toBe("fold.expandAll");
 		const everything = {
-			expanded: new Set(["done", "bare", "gone", "note", "n1", "report", "rh", "ask", "result"]),
+			expanded: new Set(["done", "bare", "gone", "note", "n1", "report", "rh", "result"]),
 			collapsed: new Set<string>(),
 		};
 		const open = dom(everything);

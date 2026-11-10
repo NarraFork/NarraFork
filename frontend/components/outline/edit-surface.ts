@@ -108,6 +108,8 @@ export interface EditSurfaceOptions {
 	onHiddenChange?: (count: number) => void;
 	/** Measure the map's nodes ahead in a Worker (default on). */
 	premeasure?: boolean;
+	/** The reader asked for the unanswered questions a closed row hid (they are on screen now). */
+	onOpenQuestions?: (ids: string[], under: string | null) => void;
 	/** What the page's folding control offers now (see `EditSurface.pageFold`), when it changes. */
 	onPageFold?: (state: "expand" | "collapse" | null) => void;
 }
@@ -471,6 +473,7 @@ export class EditSurface {
 			},
 			onRefused: this.opts.onRefused,
 			restoreSel: (sel) => this.restoreSel(sel),
+			onQuestions: (ids, under) => this.opts.onOpenQuestions?.(ids, under),
 		});
 		v.noScroll = this.state.view === "map";
 		if (this.marks.size > 0) v.setMarks(this.marks);

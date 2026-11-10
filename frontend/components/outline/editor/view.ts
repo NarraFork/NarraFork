@@ -55,6 +55,7 @@ import {
 	foldHiddenMarks,
 	foldPreview,
 	foldPreviewLine,
+	foldQuestionsUnder,
 	foldSubtreeControl,
 	type MutableFoldView,
 } from "@shared/outline-fold";
@@ -258,6 +259,12 @@ export interface ViewOptions {
 	onBullet?: (id: string) => void;
 	/** The reader folded something here (this view re-projected already). */
 	onCollapse?: () => void;
+	/**
+	 * The reader asked for the questions a closed row hides (its count): they are on screen now;
+	 * the host takes the reader to where they are answered (`under`: the block the first of
+	 * them is under, whose page holds its answer form).
+	 */
+	onQuestions?: (ids: string[], under: string | null) => void;
 	/** The cursor moved to another block. */
 	onSelect?: (blockId: string) => void;
 	/** Block selection changed (empty: left block selection). */
@@ -883,6 +890,31 @@ export class OutlineView implements CmdHost, ClientView {
 		const node = this.foldTree?.nodes.get(id);
 		if (!node) return;
 		this.foldAct({ kind: "subtree", id, open: open ?? foldSubtreeControl(node) !== "collapse" });
+	}
+
+	/**
+	 * The count of unanswered questions on a closed row was used: the blocks above each of them
+	 * open, and the host is told which they are (it shows where they are answered).
+	 */
+	openQuestionsUnder(id: string): void {
+		const tree = this.foldTree;
+		if (this.destroyed || !tree || !this.foldSource) return;
+		const ids = foldQuestionsUnder(tree, this.foldSource, id);
+		if (ids.length === 0) return;
+		let changed = false;
+		// (Opening is by each block's own default, so the tree as it was serves them all.)
+		for (const q of ids)
+			if (applyFoldAction(tree, this.foldView, { kind: "reveal", id: q })) changed = true;
+		if (changed) {
+			this.folding = true;
+			try {
+				this.sync();
+			} finally {
+				this.folding = false;
+			}
+			this.opts.onCollapse?.();
+		}
+		this.opts.onQuestions?.(ids, tree.nodes.get(ids[0] as string)?.parent ?? null);
 	}
 
 	/** Mod-. and Alt-Enter: fold the cursor's block; taken only where there is something to fold. */
@@ -2136,6 +2168,20 @@ class BlockView implements NodeView {
 			chip.setAttribute("role", "img");
 			chip.setAttribute("aria-label", label);
 			chip.append(iconSvg(FOLD_HIDDEN_ICONS[kind], chip.ownerDocument), String(count));
+			if (kind === "question") {
+				// The questions it hides are one step away: the count opens them and where they
+				// are answered.
+				const open = () => this.owner.openQuestionsUnder(this.node.attrs.id as string);
+				chip.setAttribute("role", "button");
+				chip.tabIndex = -1;
+				chip.addEventListener("mousedown", (e) => {
+					e.preventDefault();
+					if (plainClick(e)) open();
+				});
+				chip.addEventListener("keydown", (e) => {
+					takeFoldKey(e, open);
+				});
+			}
 			this.marksEl.append(chip);
 		});
 		this.marksEl.style.display = this.marksEl.childElementCount > 0 ? "" : "none";

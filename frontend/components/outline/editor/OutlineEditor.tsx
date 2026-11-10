@@ -112,6 +112,11 @@ export interface OutlineEditorProps {
 	 * names the reader may be told, read by the host.
 	 */
 	reportAuthors?: Readonly<Record<string, string>>;
+	/**
+	 * The reader used a closed row's count of unanswered questions: the questions (block ids) are
+	 * on screen now, and the host takes the reader to where they are answered.
+	 */
+	onOpenQuestions?: (ids: string[], under: string | null) => void;
 	/** The page's report containers (ids, sorted), whenever they change: the host reads their authors. */
 	onReportContainers?: (ids: string[]) => void;
 	/** Tests: the transport to use instead of the narrator socket. */
@@ -372,6 +377,7 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			onHiddenChange: (count) => callbacks.current.onHiddenChange?.(count),
 			premeasure: callbacks.current.premeasure,
 			onPageFold: setPageFold,
+			onOpenQuestions: (ids, under) => callbacks.current.onOpenQuestions?.(ids, under),
 		});
 		surfaceRef.current = surface;
 		setPageFold(surface.pageFold());

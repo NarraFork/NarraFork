@@ -329,6 +329,16 @@
 	height: 14px;
 }
 
+.nf-outline-editor .ob-fold-hidden[role="button"] {
+	cursor: pointer;
+	border-radius: 4px;
+}
+
+.nf-outline-editor .ob-fold-hidden[role="button"]:focus-visible {
+	outline: 2px solid var(--ob-accent);
+	outline-offset: 1px;
+}
+
 .nf-outline-editor .ob-fold-hidden[data-kind="question"] svg {
 	color: var(--mantine-color-teal-text);
 }

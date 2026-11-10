@@ -313,6 +313,43 @@ function SurfaceBody({
 	// Who wrote the live page's subagent reports (the editor names the containers it holds).
 	const [reportContainers, setReportContainers] = useState<string[]>([]);
 	const reportAuthors = useOutlineReportAuthors(spaceId, reportContainers, editing).data;
+	// A closed row's count of unanswered questions was used: the rows are open now, and the
+	// reader goes to where the first of them is answered. The form in the page's body holds the
+	// questions directly under the focused block (and their sub-questions): when the question is
+	// deeper, the block it is under is focused, and its form takes the keyboard once it is there.
+	const formWatch = useRef<MutationObserver | null>(null);
+	useEffect(() => () => formWatch.current?.disconnect(), []);
+	const openQuestionForm = useCallback((ids: string[], under: string | null) => {
+		const host = pageRef.current;
+		if (!host || ids.length === 0) return;
+		const focusForm = (): boolean => {
+			for (const id of ids) {
+				const card = host.querySelector<HTMLElement>(`[data-testid="outline-question-${id}"]`);
+				if (!card) continue;
+				card.scrollIntoView({ block: "nearest" });
+				card.querySelector<HTMLElement>("input:not(:disabled), textarea:not(:disabled)")?.focus();
+				return true;
+			}
+			return false;
+		};
+		formWatch.current?.disconnect();
+		formWatch.current = null;
+		if (focusForm()) return;
+		if (under) goRef.current({ blockId: under });
+		// The form arrives with the focused block's questions (bounded: a few seconds, then quiet).
+		const watch = new MutationObserver(() => {
+			if (focusForm()) stop();
+		});
+		const timer = setTimeout(() => stop(), 8000);
+		const stop = () => {
+			clearTimeout(timer);
+			watch.disconnect();
+			if (formWatch.current === watch) formWatch.current = null;
+		};
+		formWatch.current = watch;
+		watch.observe(host, { childList: true, subtree: true });
+	}, []);
+	const pageRef = useRef<HTMLDivElement | null>(null);
 	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
 	const switcher = useRef<QuickSwitcherHandle | null>(null);
 	const openSwitcher = useCallback(() => switcher.current?.open(), []);
@@ -633,6 +670,7 @@ function SurfaceBody({
 								onOpenSwitcher={openSwitcher}
 								reportAuthors={reportAuthors}
 								onReportContainers={setReportContainers}
+								onOpenQuestions={openQuestionForm}
 								seed={seed && seed.pageId === (pageId ?? view.pageId) ? seed : null}
 							/>
 						) : (
@@ -657,7 +695,13 @@ function SurfaceBody({
 										<OutlineBlockBody content={root.content} />
 									</Box>
 								)}
-								<OutlineBlockTree view={view} fold={fold} search={linkSearch} onFold={onFold} />
+								<OutlineBlockTree
+									view={view}
+									fold={fold}
+									search={linkSearch}
+									onFold={onFold}
+									onOpenQuestions={openQuestionForm}
+								/>
 							</>
 						)}
 						{/* Answer in the main content, also when live editing or the sidebar is unavailable.
@@ -696,7 +740,9 @@ function SurfaceBody({
 			data-testid="outline-surface"
 			onKeyDown={onKeyDown}
 		>
-			<Box className={classes.page}>{content}</Box>
+			<Box className={classes.page} ref={pageRef}>
+				{content}
+			</Box>
 			{drawer}
 			<QuickSwitcherHost
 				ref={switcher}

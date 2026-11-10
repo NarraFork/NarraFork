@@ -19,6 +19,7 @@ import {
 	foldPageControl,
 	foldPreview,
 	foldPreviewLine,
+	foldQuestionsUnder,
 	foldSubtreeControl,
 	type MutableFoldView,
 	visibleFoldRows,
@@ -461,7 +462,12 @@ describe("marks of what a closed row hides", () => {
 				},
 			],
 		});
-		const t = buildFoldTree(marked, { rootId: "p" });
+		// (Closed by the reader: with a question inside, the default keeps it open.)
+		const t = buildFoldTree(
+			marked,
+			{ rootId: "p" },
+			{ expanded: new Set(), collapsed: new Set(["t"]) },
+		);
 		expect(foldHiddenMarks(t.nodes.get("t") as never)).toEqual({
 			question: 2,
 			pending: 2,
@@ -469,6 +475,78 @@ describe("marks of what a closed row hides", () => {
 			fresh: 1,
 		});
 		expect(foldHiddenMarks(t.nodes.get("a") as never)).toBeNull();
+	});
+});
+
+describe("a question waiting for an answer is never folded away by default", () => {
+	const asked = sourceOf({
+		id: "p",
+		kids: [
+			{
+				id: "done",
+				task: "done",
+				kids: [
+					{
+						id: "note",
+						kids: [
+							{ id: "q", marks: { question: 1 }, kids: [{ id: "ctx" }] },
+							{ id: "other", kids: [{ id: "deep" }] },
+						],
+					},
+					{ id: "side", kids: [{ id: "sidekid" }] },
+				],
+			},
+			{ id: "quiet", task: "done", kids: [{ id: "n", marks: { pending: 1, locked: 1 } }] },
+		],
+	});
+	const build = (view = emptyView()) => buildFoldTree(asked, { rootId: "p" }, view);
+	const ids = (t: FoldTree) => visibleFoldRows(t, asked).rows.map((r) => r.node.id);
+
+	test("the blocks above it are open, whatever they are; nothing else opens for it", () => {
+		const t = build();
+		expect(ids(t)).toEqual(["done", "note", "q", "other", "side", "quiet"]);
+		expect(t.nodes.get("done")).toMatchObject({ defaultOpen: true, open: true });
+		expect(t.nodes.get("note")).toMatchObject({ defaultOpen: true, open: true });
+		// The question's own details, its siblings and other finished tasks fold as ever.
+		expect(t.nodes.get("q")?.open).toBe(false);
+		expect(t.nodes.get("other")?.open).toBe(false);
+		expect(t.nodes.get("side")?.open).toBe(false);
+		// Other marks do not hold a block open: the closed row counts them.
+		expect(t.nodes.get("quiet")?.open).toBe(false);
+		expect(foldHiddenMarks(t.nodes.get("quiet") as never)).toMatchObject({ pending: 1, locked: 1 });
+	});
+
+	test("the reader may close above it: the closed row counts it and names it", () => {
+		const view = emptyView();
+		expect(applyFoldAction(build(view), view, { kind: "node", id: "done" })).toBe(true);
+		expect(sets(view)).toEqual({ expanded: [], collapsed: ["done"] });
+		const t = build(view);
+		expect(ids(t)).toEqual(["done", "quiet"]);
+		expect(foldHiddenMarks(t.nodes.get("done") as never)).toMatchObject({ question: 1 });
+		expect(foldQuestionsUnder(t, asked, "done")).toEqual(["q"]);
+		expect(foldQuestionsUnder(t, asked, "q")).toEqual([]);
+		expect(foldQuestionsUnder(t, asked, "nope")).toEqual([]);
+		// The count opens straight to it.
+		applyFoldAction(t, view, { kind: "reveal", id: "q" });
+		expect(sets(view)).toEqual({ expanded: [], collapsed: [] });
+		expect(ids(build(view))).toContain("q");
+	});
+
+	test("once it is answered the blocks above fold by the usual rules again", () => {
+		const answered = sourceOf({
+			id: "p",
+			kids: [{ id: "done", task: "done", kids: [{ id: "note", kids: [{ id: "q" }] }] }],
+		});
+		const t = buildFoldTree(answered, { rootId: "p" });
+		expect(t.nodes.get("done")).toMatchObject({ defaultOpen: false, open: false });
+	});
+
+	test("back to the default view keeps it on screen", () => {
+		const view = emptyView();
+		applyFoldAction(build(view), view, { kind: "closeAll" });
+		expect(ids(build(view))).toEqual(["done", "quiet"]);
+		applyFoldAction(build(view), view, { kind: "all", open: false });
+		expect(ids(build(view))).toContain("q");
 	});
 });
 
