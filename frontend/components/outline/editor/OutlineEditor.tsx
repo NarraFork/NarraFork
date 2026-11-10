@@ -32,10 +32,13 @@ import {
 import { notifications } from "@mantine/notifications";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import type { LiveCloseCode } from "@shared/outline-live-protocol";
+import { isOutlineReportBlockId } from "@shared/outline-report-line";
 import {
 	IconArrowDown,
 	IconArrowRight,
 	IconArrowsMaximize,
+	IconFoldDown,
+	IconFoldUp,
 	IconRobot,
 	IconSearch,
 } from "@tabler/icons-react";
@@ -104,6 +107,13 @@ export interface OutlineEditorProps {
 	onSurface?: (surface: EditSurface | null) => void;
 	/** Open the quick switcher (shown on the toolbar when given). */
 	onOpenSwitcher?: () => void;
+	/**
+	 * Who wrote the page's subagent reports, by container block (their lines say 「来自 …」): the
+	 * names the reader may be told, read by the host.
+	 */
+	reportAuthors?: Readonly<Record<string, string>>;
+	/** The page's report containers (ids, sorted), whenever they change: the host reads their authors. */
+	onReportContainers?: (ids: string[]) => void;
 	/** Tests: the transport to use instead of the narrator socket. */
 	transport?: LiveTransport;
 	/** Tests: the session client and the current outline view. */
@@ -210,11 +220,19 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	// Structure refused while connecting: the "connecting" badge nudges.
 	const [nudge, setNudge] = useState(0);
 
-	// Stable per language: the editor caches report-line decorations by this function.
+	// Stable per language and authors: the editor caches report-line decorations by this function.
+	const reportAuthors = props.reportAuthors;
 	const reportLine = useMemo(
-		() => (content: string) => reportLineDisplay(content, { t, locale: i18n?.language }),
-		[t, i18n?.language],
+		() => (content: string, blockId?: string) =>
+			reportLineDisplay(content, {
+				t,
+				locale: i18n?.language,
+				from: blockId ? reportAuthors?.[blockId] : undefined,
+			}),
+		[t, i18n?.language, reportAuthors],
 	);
+	// What the page's folding control offers (the surface says when it changes).
+	const [pageFold, setPageFold] = useState<"expand" | "collapse" | null>(null);
 	chromeText.fold = t("page.collapse");
 	chromeText.focus = t("page.focus");
 	chromeText.task = t("editor.changeStatus");
@@ -226,6 +244,23 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.pending = t("pending.badge");
 	chromeText.question = t("editor.questionMark");
 	chromeText.reportLine = reportLine;
+	chromeText.foldExpand = t("page.expand");
+	chromeText.foldCollapse = t("page.collapse");
+	chromeText.foldAltHint = t("fold.altHint");
+	chromeText.foldSubtree = (title) => t("fold.subtree", { title });
+	chromeText.foldSubtreeExpand = t("fold.subtreeExpand");
+	chromeText.foldSubtreeCollapse = t("fold.subtreeCollapse");
+	chromeText.foldMore = (count) => t("fold.more", { count });
+	chromeText.foldOpen = t("fold.open");
+	chromeText.foldReportAll = (count) => t("fold.reportAll", { count });
+	chromeText.foldShowInside = t("fold.showInside");
+	chromeText.foldUntitled = t("fold.untitled");
+	chromeText.foldHidden = {
+		question: (count) => t("fold.hiddenQuestion", { count }),
+		pending: (count) => t("fold.hiddenPending", { count }),
+		locked: (count) => t("fold.hiddenLocked", { count }),
+		fresh: (count) => t("fold.hiddenFresh", { count }),
+	};
 	chromeText.status = {
 		todo: t("page.task.todo"),
 		doing: t("page.task.doing"),
@@ -243,6 +278,13 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			handle.setAttribute("aria-label", focusLabel);
 		}
 	}, [focusLabel]);
+
+	// The report lines are drawn from `reportLine`: when it changes (the language, the authors
+	// arriving) the frames already drawn follow.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: the function's identity is the change
+	useEffect(() => {
+		surfaceRef.current?.refreshChrome();
+	}, [reportLine]);
 
 	useEffect(() => {
 		callbacks.current.onClient?.(client, () => surfaceRef.current?.outline ?? null);
@@ -329,9 +371,28 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			},
 			onHiddenChange: (count) => callbacks.current.onHiddenChange?.(count),
 			premeasure: callbacks.current.premeasure,
+			onPageFold: setPageFold,
 		});
 		surfaceRef.current = surface;
+		setPageFold(surface.pageFold());
 		callbacks.current.onSurface?.(surface);
+		// The page's report containers, for the host to read who wrote them (a page has few; the
+		// ids are read on a timer after changes, never per keystroke).
+		let containersKey = "";
+		let containersTimer: ReturnType<typeof setTimeout> | null = null;
+		const reportContainers = () => {
+			containersTimer = null;
+			if (!callbacks.current.onReportContainers) return;
+			const ids: string[] = [];
+			for (const b of client.visible.blocks.values())
+				if (!b.deleted && isOutlineReportBlockId(b.id)) ids.push(b.id);
+			ids.sort();
+			const key = ids.join(",");
+			if (key === containersKey) return;
+			containersKey = key;
+			callbacks.current.onReportContainers(ids);
+		};
+		reportContainers();
 		let infoKey = "";
 		let reportTimer: ReturnType<typeof setTimeout> | null = null;
 		const report = () => {
@@ -353,10 +414,13 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			if (part === "view" || part === "layout" || part === "stored") rerender();
 		});
 		const offClient = client.on((event) => {
-			if (event === "sync") reportSoon();
+			if (event !== "sync") return;
+			reportSoon();
+			containersTimer ??= setTimeout(reportContainers, 500);
 		});
 		return () => {
 			if (reportTimer) clearTimeout(reportTimer);
+			if (containersTimer) clearTimeout(containersTimer);
 			offState();
 			offClient();
 			surface.destroy();
@@ -448,6 +512,28 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 								</ActionIcon>
 							</Tooltip>
 						</>
+					)}
+					{pageFold && (
+						<Tooltip
+							label={
+								pageFold === "expand"
+									? t("fold.expandAll")
+									: `${t("fold.collapseAll")} · ${t("fold.collapseAllHint")}`
+							}
+						>
+							<ActionIcon
+								variant="subtle"
+								color="gray"
+								size="sm"
+								aria-label={t(pageFold === "expand" ? "fold.expandAll" : "fold.collapseAll")}
+								data-testid="outline-fold-all"
+								data-fold-all={pageFold}
+								onMouseDown={(e) => e.preventDefault()}
+								onClick={() => surfaceRef.current?.foldAll(pageFold === "expand")}
+							>
+								{pageFold === "expand" ? <IconFoldDown size={16} /> : <IconFoldUp size={16} />}
+							</ActionIcon>
+						</Tooltip>
 					)}
 					{props.onOpenSwitcher && (
 						<Tooltip label={t("switcher.open")}>

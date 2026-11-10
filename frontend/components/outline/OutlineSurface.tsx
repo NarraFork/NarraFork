@@ -75,6 +75,7 @@ import {
 	useOutlineBlock,
 	useOutlinePageLive,
 	useOutlinePagePending,
+	useOutlineReportAuthors,
 	useOutlineSeed,
 	useOutlineViewStateSync,
 } from "../../hooks/useOutline";
@@ -273,6 +274,8 @@ function SurfaceBody({
 				out.set(id, { ...mark, pending: [...(mark.pending ?? []), change.label] });
 			}
 		}
+		// Questions nobody answered yet: a folded row counts the ones it hides.
+		for (const id of data.questions ?? []) out.set(id, { ...out.get(id), openQuestion: true });
 		return out;
 	}, [pagePending.data, lockedLabel]);
 
@@ -307,6 +310,9 @@ function SurfaceBody({
 		[viewState, foldVersion],
 	);
 	useOutlineViewStateSync(pageId, viewState);
+	// Who wrote the live page's subagent reports (the editor names the containers it holds).
+	const [reportContainers, setReportContainers] = useState<string[]>([]);
+	const reportAuthors = useOutlineReportAuthors(spaceId, reportContainers, editing).data;
 	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
 	const switcher = useRef<QuickSwitcherHandle | null>(null);
 	const openSwitcher = useCallback(() => switcher.current?.open(), []);
@@ -625,6 +631,8 @@ function SurfaceBody({
 								onFocusInfo={setFocusInfo}
 								onSurface={setEditSurface}
 								onOpenSwitcher={openSwitcher}
+								reportAuthors={reportAuthors}
+								onReportContainers={setReportContainers}
 								seed={seed && seed.pageId === (pageId ?? view.pageId) ? seed : null}
 							/>
 						) : (

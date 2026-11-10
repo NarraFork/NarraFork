@@ -11,6 +11,7 @@ import type {
 } from "@shared/outline-api";
 import {
 	OUTLINE_BLOCK_ID_RE,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
@@ -402,6 +403,23 @@ export function useOutlinePagePending(spaceId: string, pageId: string | undefine
 		enabled: enabled && !!pageId,
 		retry: false,
 		staleTime: 5_000,
+	});
+}
+
+/**
+ * Who wrote the subagent reports with these container ids, for a reader who may be told: the
+ * live editor's report lines say 「来自 …」. At most the first
+ * {@link OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds} containers are asked for (the rest show the
+ * time alone); a session's title rarely changes, so the answer is kept for a while.
+ */
+export function useOutlineReportAuthors(spaceId: string, ids: readonly string[], enabled = true) {
+	const asked = ids.slice(0, OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds);
+	return useQuery({
+		queryKey: [...outlineKeys.all, "report-authors", spaceId, asked.join(",")],
+		queryFn: async () => (await api.getOutlineReportAuthors(spaceId, asked)).authors,
+		enabled: enabled && asked.length > 0,
+		retry: false,
+		staleTime: 60_000,
 	});
 }
 

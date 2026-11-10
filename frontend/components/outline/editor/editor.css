@@ -238,6 +238,101 @@
 	height: var(--nf-outline-chevron);
 }
 
+/*
+ * The row's quick control (everything inside it: expand, or back to the default view): floated
+ * to the end of the first line beside the focus handle, always drawn (touch has no hover). No
+ * `:hover` style, as on the other frame parts.
+ */
+.nf-outline-editor .ob-subtree {
+	float: right;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: var(--nf-type-body-line);
+	margin-left: 4px;
+	color: var(--ob-muted);
+	cursor: pointer;
+	user-select: none;
+	border-radius: 4px;
+}
+
+.nf-outline-editor .ob-subtree svg {
+	flex: none;
+	display: block;
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
+	pointer-events: none;
+}
+
+/* Beside a body that is one box (see `.ob-zoom` above): over its corner, left of the handle. */
+.nf-outline-editor .ob-block:has(> .ob-content > :is(pre, table):first-child) > .ob-subtree {
+	float: none;
+	position: absolute;
+	right: 24px;
+	top: 0;
+	z-index: 1;
+}
+
+/*
+ * What a closed block holds, as ONE line in its children's place: the first line of its first
+ * block, cut with an ellipsis, and how much more there is. Frame DOM (not part of the document):
+ * nothing to select or type into; a click opens everything inside the block.
+ */
+.nf-outline-editor .ob-preview {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	clear: both;
+	white-space: nowrap;
+	color: var(--ob-muted);
+	cursor: pointer;
+	user-select: none;
+	border-radius: 4px;
+}
+
+.nf-outline-editor .ob-preview-text {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.nf-outline-editor .ob-preview-label {
+	flex: none;
+	color: var(--mantine-color-anchor);
+}
+
+/* The folding controls take focus from assistive technology and scripts, never from Tab. */
+.nf-outline-editor :is(.ob-arrow, .ob-subtree, .ob-preview):focus-visible {
+	outline: 2px solid var(--ob-accent);
+	outline-offset: 1px;
+}
+
+/*
+ * What a closed block hides that must not be missed: each kind's icon (the states' badges, the
+ * question's mark) and how many, among the block's own marks.
+ */
+.nf-outline-editor .ob-fold-hidden {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	color: var(--ob-muted);
+	font-variant-numeric: tabular-nums;
+	user-select: none;
+}
+
+.nf-outline-editor .ob-fold-hidden svg {
+	flex: none;
+	width: 14px;
+	height: 14px;
+}
+
+.nf-outline-editor .ob-fold-hidden[data-kind="question"] svg {
+	color: var(--mantine-color-teal-text);
+}
+
 .nf-outline-editor .ob-check svg {
 	width: var(--nf-outline-icon);
 	height: var(--nf-outline-icon);
