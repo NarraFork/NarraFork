@@ -152,7 +152,7 @@
 	},
 	"editor": {
 		"changeStatus": "Change status",
-		"questionMark": "A question for a person: answered in the inbox. Deleting it withdraws it.",
+		"questionMark": "Open to answer; delete to withdraw.",
 		"questionsWithdrawn_one": "Deleting it withdrew a question put to a person; undo asks it again.",
 		"questionsWithdrawn_other": "Deleting them withdrew {{count}} questions put to people; undo asks them again.",
 		"tooLarge": "A block can hold at most 16 KB. Split it into more blocks.",
@@ -250,6 +250,22 @@
 	"workspace": {
 		"addTitle": "Add an outline page"
 	},
+	"crumbs": {
+		"label": "Where this page is",
+		"more_one": "{{count}} more level",
+		"more_other": "{{count}} more levels"
+	},
+	"reportLine": {
+		"title": "Subagent report",
+		"lateEnded": "Late subagent report (the task was ended after it was sent)",
+		"lateReopened": "Late subagent report (the task went back to do after it was sent)",
+		"lateTakenOver": "Late subagent report (the task changed hands after it was sent)",
+		"from": "from {{name}}",
+		"timedOut": "unfinished: timed out",
+		"failed": "unfinished: failed",
+		"interrupted": "unfinished: interrupted",
+		"empty": "no output"
+	},
 	"lock": {
 		"badge": "Locked · {{name}}",
 		"someone": "someone",
@@ -327,10 +343,9 @@
 		"answeredRelayedVia": "{{name}} answered in the conversation (via {{via}}): {{choice}}",
 		"withdrawn": "Withdrawn",
 		"waitingFor": "Waiting for {{name}} to answer",
-		"notePlaceholder": "Add a note, or answer in your own words",
+		"notePlaceholder": "Or write your own answer",
 		"answerPlaceholder": "Your answer",
-		"adoptAll": "Adopt all recommendations ({{count}})",
-		"submit": "Answer",
+		"submit": "Submit answer",
 		"nothingToSend": "Choose an option or write an answer first",
 		"answered": "Answered {{count}} question(s); the agent is told",
 		"answerFailed": "The answers were not saved",

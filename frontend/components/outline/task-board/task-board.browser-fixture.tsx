@@ -14,12 +14,15 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import outlineEn from "../../../locales/en/outline.json";
+import outlineZh from "../../../locales/zh-CN/outline.json";
 import { ProjectTaskBoard, SessionTaskBoard } from "./TaskBoardViews";
 
 const instance = i18next.createInstance();
-await instance
-	.use(initReactI18next)
-	.init({ lng: "en", resources: { en: { outline: outlineEn } }, react: { useSuspense: false } });
+await instance.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { outline: outlineEn }, "zh-CN": { outline: outlineZh } },
+	react: { useSuspense: false },
+});
 
 let root: Root | null = null;
 let queryClient: QueryClient | null = null;
@@ -78,6 +81,57 @@ export function rows(): Array<{ title: string; status: string; group: string; ba
 		badges: [...row.querySelectorAll<HTMLElement>("[data-testid^=task-badge-]")].map(
 			(badge) => badge.dataset.testid ?? "",
 		),
+	}));
+}
+
+/** Switch the interface language (`en`, `zh-CN`). */
+export async function setLanguage(language: string): Promise<void> {
+	await instance.changeLanguage(language);
+}
+
+/**
+ * The badge of each status group the board shows: which state it draws, whether it is an icon on
+ * a tinted background, and the group's heading beside it.
+ */
+export function statusBadges(): Array<{
+	group: string;
+	status: string | null;
+	badge: boolean;
+	/** The icon's Tabler class (`tabler-icon-<name>`). */
+	icon: string;
+	shapes: number;
+	tinted: boolean;
+	color: string;
+	heading: string;
+}> {
+	return [...document.querySelectorAll<HTMLElement>("[data-testid=task-board-status]")].map(
+		(group) => {
+			const svg = group.querySelector<SVGSVGElement>("svg.nf-status");
+			const cs = svg ? getComputedStyle(svg) : null;
+			const rgba = /rgba?\(([^)]+)\)|color\(srgb ([^)]+)\)/.exec(cs?.backgroundColor ?? "");
+			const parts = (rgba?.[1] ?? rgba?.[2] ?? "").split(/[\s,/]+/).filter(Boolean);
+			return {
+				group: group.dataset.status ?? "",
+				status: svg?.dataset.status ?? null,
+				badge: !!svg,
+				icon:
+					(svg?.getAttribute("class") ?? "").split(" ").find((c) => c.startsWith("tabler-icon-")) ??
+					"",
+				shapes: svg?.childElementCount ?? 0,
+				tinted: parts.length >= 4 && Number(parts[3]) > 0.05 && Number(parts[3]) < 0.5,
+				color: cs?.color ?? "",
+				heading: svg?.parentElement?.textContent ?? "",
+			};
+		},
+	);
+}
+
+/** The state chips (words with the state's icon) the board shows: which state, their words. */
+export function statusChips(): Array<{ status: string; text: string; icon: boolean }> {
+	return [...document.querySelectorAll<HTMLElement>("[data-status-chip]")].map((chip) => ({
+		status: chip.dataset.statusChip ?? "",
+		text: chip.textContent ?? "",
+		icon: chip.querySelector("svg") !== null,
 	}));
 }
 

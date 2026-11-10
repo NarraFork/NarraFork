@@ -211,7 +211,8 @@ describe("OutlineBlockTree", () => {
 				.querySelector(`[data-block-id="${id}"] [role="img"] svg`)
 				?.getAttribute("class")
 				?.split(" ");
-		expect(iconOf("t")).toContain("tabler-icon-square");
+		expect(iconOf("t")).toContain("tabler-icon-circle");
+		expect(iconOf("t")).toContain("nf-status");
 		expect(iconOf("q")).toContain("tabler-icon-help-circle");
 
 		const list = render(
@@ -249,6 +250,94 @@ describe("OutlineBlockTree", () => {
 			false,
 		]);
 		expect(links[1]?.querySelector('[aria-label="page.task.doing"]')).not.toBeNull();
+	});
+
+	test("one marker per row: a task or a question has no bullet, and a focus handle instead", () => {
+		const html = render(
+			<OutlineBlockTree
+				view={view(
+					[
+						block("root", ["p", "t", "q"]),
+						block("p", ["c"]),
+						block("c"),
+						block("t", ["n"], {
+							task: { status: "doing", assignee: null, due: null, depends: [] },
+						}),
+						block("n"),
+						block("q", [], { question: { state: "open", proceed: false } }),
+					],
+					{ view: "all" },
+				)}
+				collapsed={new Set(["t"])}
+				search={{ view: "all" }}
+				onToggle={() => {}}
+			/>,
+		);
+		const doc = parseHTML(`<!doctype html><html><body>${html}</body></html>`).document;
+		const parts = (id: string) => {
+			const row = doc.querySelector(`[data-block-id="${id}"]`);
+			return {
+				marker: row?.getAttribute("data-marker"),
+				arrow: row?.querySelector("button[aria-expanded]") !== null,
+				bullet: row?.querySelector("[data-collapsed]") !== null,
+				icons: row?.querySelectorAll('[role="img"]').length,
+				// Links that focus the block (the bullet, or the handle that stands in for it).
+				focus: [...(row?.querySelectorAll('a[aria-label="page.focus"]') ?? [])].map((a) =>
+					a.getAttribute("href"),
+				),
+			};
+		};
+		// A plain row: arrow + bullet; the bullet focuses.
+		expect(parts("p")).toEqual({
+			marker: "bullet",
+			arrow: true,
+			bullet: true,
+			icons: 0,
+			focus: ["/outline/space/p?view=all"],
+		});
+		// A task: arrow + checkbox, no bullet; focusing is still one link away.
+		expect(parts("t")).toEqual({
+			marker: "task",
+			arrow: true,
+			bullet: false,
+			icons: 1,
+			focus: ["/outline/space/t?view=all"],
+		});
+		// A question: its mark only (no children, so no arrow).
+		expect(parts("q")).toEqual({
+			marker: "question",
+			arrow: false,
+			bullet: false,
+			icons: 1,
+			focus: ["/outline/space/q?view=all"],
+		});
+	});
+
+	test("a subagent report's container line reads as a report, without generation or UTC", () => {
+		const stored = "报告（第 2 代 · 2026-11-09 17:38 UTC）";
+		const html = render(
+			<OutlineBlockTree
+				view={view([
+					block("root", ["r", "x"]),
+					block("r", [], { content: stored }),
+					block("x", [], { content: "报告（第 2 代）不是报告行" }),
+				])}
+				collapsed={new Set()}
+				search={{}}
+				onToggle={() => {}}
+			/>,
+		);
+		const doc = parseHTML(`<!doctype html><html><body>${html}</body></html>`).document;
+		const line = doc.querySelector('[data-block-id="r"] [data-testid="outline-report-line"]');
+		expect(line?.textContent).toStartWith("reportLine.title · ");
+		expect(line?.textContent).not.toContain("UTC");
+		expect(line?.textContent).not.toContain("代");
+		// The stored text is still there to read (a tooltip), and anything else is left alone.
+		expect(line?.getAttribute("title")).toBe(stored);
+		expect(doc.querySelector('[data-block-id="x"]')?.textContent).toContain(
+			"报告（第 2 代）不是报告行",
+		);
+		expect(doc.querySelector('[data-block-id="x"] [data-testid="outline-report-line"]')).toBeNull();
 	});
 
 	test("an empty facts view says the process is hidden", () => {

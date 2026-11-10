@@ -19,6 +19,7 @@ const {
 	bodySize,
 	checkIconPx,
 	clearMeasureCache,
+	frameTail,
 	frameWidth,
 	hasMeasured,
 	MAP_FONT_FAMILY,
@@ -64,7 +65,7 @@ describe("mind-map node typography", () => {
 		expect(labels[JSON.stringify(["real", "乙"])]).toBe("real:乙");
 	});
 
-	it("measures with the conversation's body, heading and code metrics", () => {
+	it("measures with the conversation's body and code metrics", () => {
 		const m = typographyMetrics();
 		const t = mapType();
 		expect(t.px).toBe(m.size.sm);
@@ -73,18 +74,24 @@ describe("mind-map node typography", () => {
 		expect(t.codeFont).toContain(`${m.size.xs}px`);
 		expect(t.codeBlockFont).toContain(`${m.codeSize}px`);
 		expect(t.codeBlockLineH).toBe(m.line.code);
-		for (const level of [1, 2, 3] as const) {
-			expect(t.heading[level]).toEqual({
-				px: headingMetrics(level).size,
-				lineH: headingMetrics(level).lineHeight,
-			});
+	});
+
+	it("measures a heading inside a node as body text in bold: never larger than a task's title", () => {
+		const t = mapType();
+		// The conversation's headings are larger than its body: that size is not used here.
+		expect(headingMetrics(1).size).toBeGreaterThan(t.px);
+		for (const level of [1, 2, 3]) {
+			const heading = measuredSize(`${"#".repeat(level)} Delivery and conclusions`);
+			expect(heading.h).toBe(t.lineH);
+			// The same width as the same words in bold body text, whatever the level.
+			expect(heading.w).toBe(measuredSize("**Delivery and conclusions**").w);
 		}
 	});
 
 	it("gives a one-line body, a heading and a code block their line boxes", () => {
 		const t = mapType();
 		expect(measuredSize("短句 short").h).toBe(t.lineH);
-		expect(measuredSize("## 结论").h).toBe(t.heading[2].lineH);
+		expect(measuredSize("## 结论").h).toBe(t.lineH);
 		expect(measuredSize("```\na\nb\n```").h).toBe(2 * t.codeBlockLineH + 8);
 		// A node is never shorter than one body line plus its frame.
 		expect(nodeSize({ w: 10, h: 0 }, false).h).toBe(NODE.padY * 2 + t.lineH + NODE.border * 2);
@@ -94,7 +101,12 @@ describe("mind-map node typography", () => {
 		// `--nf-outline-icon` (outline-icons.css): body + 2, between 12 and 24 (16 by default).
 		expect(checkIconPx()).toBe(16);
 		expect(frameWidth(false)).toBe(NODE.gutter);
-		expect(frameWidth(true)).toBe(NODE.gutter + 16 + NODE.checkGap);
+		// One marker: a task's checkbox column stands where the bullet would be, after the arrow.
+		expect(frameWidth(true)).toBe(NODE.part + 16 + NODE.checkGap);
+		expect(frameWidth(true)).toBe(frameWidth(false) - NODE.part + 16 + NODE.checkGap);
+		// The focus handle the bullet would be follows a task's body.
+		expect(frameTail(false)).toBe(0);
+		expect(frameTail(true)).toBe(NODE.part);
 		const widthOf = (task: boolean) => nodeSize({ w: 100, h: 0 }, task).w;
 		expect(widthOf(true) - widthOf(false)).toBe(16 + NODE.checkGap);
 		setTypography(LARGER);

@@ -632,17 +632,16 @@ export function nodeText(id: string): string {
 	return surface().map.el(id)?.textContent ?? "";
 }
 
-/** Breadcrumbs: every crumb's text. */
+/** Breadcrumbs: every crumb's text (the ancestors of what is focused, never its own title). */
 export function crumbs(): string[] {
-	const bar = document.querySelector("[data-testid=outline-surface] .mantine-Breadcrumbs-root");
-	return [...(bar?.children ?? [])]
-		.map((el) => (el as HTMLElement).textContent?.trim() ?? "")
-		.filter((t) => t && t !== "/");
+	return [
+		...document.querySelectorAll("[data-testid=outline-surface] [data-testid=outline-crumbs] a"),
+	].map((el) => el.textContent?.trim() ?? "");
 }
 
 export function clickCrumb(text: string): boolean {
 	const a = [
-		...document.querySelectorAll("[data-testid=outline-surface] .mantine-Breadcrumbs-root a"),
+		...document.querySelectorAll("[data-testid=outline-surface] [data-testid=outline-crumbs] a"),
 	].find((el) => el.textContent?.trim() === text) as HTMLElement | undefined;
 	if (!a) return false;
 	a.click();

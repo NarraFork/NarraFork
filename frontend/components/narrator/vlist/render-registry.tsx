@@ -475,6 +475,7 @@ export function renderElement(
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
+					outlineAskSlot={extra.outlineAskSlot as React.ReactNode}
 					onPermissionFormHeight={
 						extra.onPermissionFormHeight as ((height: number) => void) | undefined
 					}

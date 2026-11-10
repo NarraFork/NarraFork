@@ -34,13 +34,21 @@ import { IconFoldDown, IconFoldUp } from "@tabler/icons-react";
 import type React from "react";
 import { Fragment, type RefObject, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { FOLD_ICONS, TASK_ICONS } from "../outline-icons";
+import { OutlineStatusIcon } from "../OutlineStatusIcon";
+import { FOLD_ICONS } from "../outline-icons";
 
 const INDENT_PX = 16;
 const MAX_INDENT_DEPTH = 6;
 /** The arrow's slot, the marker's slot and the gaps after them: where a row's text starts. */
 const ARROW_PX = 16;
 const MARKER_PX = 16;
+/** The transcript's names of the task statuses (`narrator` namespace), for the badge's label. */
+const PLAN_STATUS_LABEL = {
+	todo: "statusTodo",
+	doing: "statusDoing",
+	done: "statusDone",
+	cancelled: "statusCancelled",
+} as const;
 const GAP_PX = 4;
 const TEXT_OFFSET_PX = ARROW_PX + GAP_PX + MARKER_PX + GAP_PX;
 
@@ -251,7 +259,6 @@ function PlanRow({
 		act({ kind: "text", key });
 	};
 	const Fold = FOLD_ICONS[open ? "expanded" : "collapsed"].Icon;
-	const Task = node.task ? TASK_ICONS[node.task].Icon : null;
 	const weight = background
 		? undefined
 		: node.depth === 0 || node.heading
@@ -352,8 +359,12 @@ function PlanRow({
 					}
 					style={{ flex: `0 0 ${MARKER_PX}px`, display: "flex", paddingTop: 2 }}
 				>
-					{Task ? (
-						<Task size={MARKER_PX} />
+					{node.task ? (
+						<OutlineStatusIcon
+							status={node.task}
+							size={MARKER_PX}
+							label={t(`sidecar.taskNotice.${PLAN_STATUS_LABEL[node.task]}`)}
+						/>
 					) : (
 						<span
 							style={{

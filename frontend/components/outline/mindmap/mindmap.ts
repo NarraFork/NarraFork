@@ -35,6 +35,7 @@ import { ensureTypographyCssVars } from "../../../lib/typography-css-vars";
 import { pinchStep, wheelZoomFactor, zoomAround } from "../../common/pan-zoom-math";
 import {
 	applyChrome,
+	chromeText,
 	createGutter,
 	type Gutter,
 	type MentionResolver,
@@ -440,7 +441,10 @@ export class MindMapView {
 		const ed = this.editing;
 		const gen = getTypographyRevision();
 		const make = (id: string, parent: string | null, index: number): LayoutNode => {
-			const content = client.textOf(id);
+			// A subagent report's container line is measured and drawn as people read it (their
+			// language and time zone); editing the node shows the stored text.
+			const stored = client.textOf(id);
+			const content = chromeText.reportLine(stored) ?? stored;
 			const task = v.get(id)?.task ?? null;
 			const allKids = kidsOf(id);
 			const collapsed = id !== rootId && collapsedOf(id) && allKids.length > 0;
@@ -794,7 +798,7 @@ export class MindMapView {
 		const badge = document.createElement("span");
 		badge.className = "mm-more";
 		if (more) el.append(body);
-		else el.append(g.el, body, badge);
+		else el.append(g.el, body, g.zoom, badge);
 		return { el, g, body, badge, key: "", x: Number.NaN, y: Number.NaN, w: -1 };
 	}
 
@@ -1336,7 +1340,10 @@ export class MindMapView {
 		const target = e.target as HTMLElement;
 		const id = this.nodeIdAt(target);
 		// Inside the node being edited, the editor handles the pointer itself.
-		if (this.editing && id === this.editing.id && !target.closest(".ob-gutter")) return;
+		// The frame: the gutter before the body and, on a task, the focus handle after it.
+		const zoom = target.closest(".ob-zoom");
+		const frame = zoom ?? target.closest(".ob-gutter");
+		if (this.editing && id === this.editing.id && !frame) return;
 		this.pointers.set(e.pointerId, p);
 		if (this.pointers.size === 2) {
 			// A second finger: pinch.
@@ -1351,10 +1358,10 @@ export class MindMapView {
 			return;
 		}
 		if (this.pointers.size > 2) return;
-		if (id && target.closest(".ob-gutter")) {
+		if (id && frame) {
 			e.preventDefault();
 			if (target.closest(".ob-arrow")) this.host.toggleCollapse(id);
-			else if (target.closest(".ob-bullet")) {
+			else if (zoom || target.closest(".ob-bullet")) {
 				if (id === this.rootId) this.host.focusUp();
 				else this.host.focusBlock(id);
 			} else if (target.closest(".ob-check")) this.cmdCycleTask(id);

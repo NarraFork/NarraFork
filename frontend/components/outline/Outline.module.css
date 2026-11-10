@@ -52,19 +52,67 @@
 	flex-wrap: wrap;
 }
 
+/*
+ * The breadcrumbs: one line, always. Crumbs shrink and truncate inside the width there is; the
+ * "Outline" crumb and the fold never shrink, the last crumb (where the page hangs) gives way last.
+ */
 .breadcrumbs {
 	flex: 1 1 16rem;
 	min-width: 0;
+	display: flex;
+	flex-wrap: nowrap;
+	align-items: center;
+	gap: 4px;
 	overflow: hidden;
+	white-space: nowrap;
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
 }
 
 .crumb {
+	flex: 0 4 auto;
+	min-width: 1.5em;
 	max-width: 14rem;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	display: inline-block;
-	vertical-align: bottom;
+	color: var(--mantine-color-anchor);
+	text-decoration: none;
+}
+
+.crumb:hover {
+	text-decoration: underline;
+}
+
+.crumb[data-fixed] {
+	flex: none;
+}
+
+.crumb[data-last] {
+	flex-shrink: 1;
+	min-width: 3em;
+}
+
+.crumbSeparator {
+	flex: none;
+	color: var(--mantine-color-dimmed);
+}
+
+.crumbFold {
+	flex: none;
+	padding-inline: 4px;
+	border-radius: var(--mantine-radius-sm);
+	color: var(--mantine-color-anchor);
+	font-size: inherit;
+	line-height: inherit;
+}
+
+.crumbMenuItem {
+	display: block;
+	max-width: min(20rem, 70vw);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
 .body {
@@ -124,7 +172,8 @@
 	flex: 0 0 auto;
 }
 
-/* Toggle, bullet and task icon sit on the first line: the conversation's body line box. */
+/* Toggle, marker (bullet, checkbox or question mark) and focus handle sit on the first line:
+   the conversation's body line box. */
 .toggle {
 	flex: 0 0 20px;
 	height: var(--nf-type-body-line);
@@ -133,8 +182,10 @@
 	justify-content: center;
 }
 
+/* The marker's column is one width whatever the marker (the bullet or a task's badge, which
+   grows with the reader's text), so text starts in one column on every row. */
 .bullet {
-	flex: 0 0 16px;
+	flex: 0 0 max(16px, var(--nf-outline-icon));
 	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
@@ -172,6 +223,11 @@
 	height: var(--nf-type-body-line);
 	display: flex;
 	align-items: center;
+}
+
+.row > .taskIcon {
+	flex: 0 0 max(16px, var(--nf-outline-icon));
+	justify-content: center;
 }
 
 /*
@@ -230,22 +286,38 @@
 }
 
 /*
- * A heading block's toggle, bullet and task icon sit on the heading's own first line (the body
- * is `.content > .nf-type-scope > [markdown root] > h1…h3`), as in the live editor.
+ * A markdown heading inside a block is body text in bold: the page title is the largest text on
+ * the page, and a heading nested under a task never outgrows the task's own title. Its toggle,
+ * marker and focus handle therefore sit on the body line box like every other row's. Two
+ * classes and an element, over the markdown renderer's own heading sizes (one class, one element).
  */
-.row:has(> .content > :global(.nf-type-scope) > * > h1:first-child)
-> :is(.toggle, .bullet, .taskIcon) {
-	height: var(--nf-type-h1-line);
+.content :global(.nf-type-scope) :is(h1, h2, h3, h4, h5, h6) {
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+	font-weight: 700;
 }
 
-.row:has(> .content > :global(.nf-type-scope) > * > h2:first-child)
-	> :is(.toggle, .bullet, .taskIcon) {
-	height: var(--nf-type-h2-line);
+/*
+ * The focus handle of a row without a bullet (a task, a question): the bullet is how a block is
+ * focused, and those rows show their checkbox or mark in its place. Always drawn (touch has no
+ * hover), on the first line.
+ */
+.focusHandle {
+	flex: 0 0 20px;
+	height: var(--nf-type-body-line);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	/* The only pointer and touch route to focusing a task: 3:1 or more against the page in both
+	   schemes (the dimmed colour as it is, no opacity over it). */
+	color: var(--mantine-color-dimmed);
+	text-decoration: none;
+	border-radius: var(--mantine-radius-sm);
 }
 
-.row:has(> .content > :global(.nf-type-scope) > * > h3:first-child)
-	> :is(.toggle, .bullet, .taskIcon) {
-	height: var(--nf-type-h3-line);
+.focusHandle svg {
+	width: var(--nf-outline-chevron);
+	height: var(--nf-outline-chevron);
 }
 
 .meta {

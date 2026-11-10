@@ -100,6 +100,7 @@ const PROP_KEYS = {
 	onQuoteJump: true,
 	onFetchAttachment: true,
 	resolveToolDetailStatus: true,
+	outlineAskSlot: true,
 } satisfies Record<keyof ExactRowProps, true>;
 
 describe("window row element frames", () => {
@@ -242,6 +243,7 @@ describe("window row element frames", () => {
 			},
 			{ props: { ...props, animateStreaming: true } },
 			{ props: { ...props, permissionSlot: <input /> } },
+			{ props: { ...props, outlineAskSlot: <input /> } },
 			{ props: { ...props, editorSlot: <input /> } },
 			{ props: { ...props, onUnknownHeight: noop } },
 			{ props: { ...props, traceRowPermissionSlots: new Map([["q", <input />]]) } },
@@ -273,7 +275,7 @@ function ProbeRow(props: ExactRowProps) {
 			<button type="button" onClick={props.onTerminate}>
 				action
 			</button>
-			{props.editorSlot ?? props.permissionSlot}
+			{props.editorSlot ?? props.permissionSlot ?? props.outlineAskSlot}
 		</div>
 	);
 }
@@ -397,6 +399,7 @@ describe("committed window hook behavior", () => {
 
 	test.each([
 		"permissionSlot",
+		"outlineAskSlot",
 		"editorSlot",
 	] as const)("updates a dynamic %s without losing its draft when the window moves", async (slot) => {
 		let setDraft: (value: string) => void = noop;
