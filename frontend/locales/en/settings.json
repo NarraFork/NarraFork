@@ -1163,6 +1163,8 @@
 	"displaySection": "Display",
 	"ignoreSafeArea": "Fullscreen Mode",
 	"ignoreSafeAreaDesc": "Hide the system status bar and use the entire screen. Turn off to show the status bar.",
+	"recentTabsShowDirectory": "Show Directories in Recent Tabs",
+	"recentTabsShowDirectoryDesc": "Show the working directory below session titles in the sidebar, keeping the end of long paths visible. Off by default; synced with your account.",
 	"bottomSpacingResize": "Allow Dragging the Input Area",
 	"bottomSpacingResizeDesc": "Drag the top edge of the narrator input area to adjust bottom spacing. Off by default to keep the input area at the bottom.",
 	"wakeLock": "Keep Screen Awake",
