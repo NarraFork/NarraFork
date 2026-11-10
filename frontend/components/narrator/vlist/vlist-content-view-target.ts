@@ -1,7 +1,11 @@
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { ElementSpec } from "@shared/pretext-layout/segment-adapter";
-import type { ToolCappedDetail, ToolDetailData } from "@shared/pretext-layout/tool-detail";
+import type {
+	ToolCappedDetail,
+	ToolDetailData,
+	ToolDetailSection,
+} from "@shared/pretext-layout/tool-detail";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import type { MeasuredToolCall, MeasuredToolDetail } from "./measure/measure-tool-call";
 
@@ -90,6 +94,11 @@ export function resolveDetailViewTargets(
 	const targets: VListViewTarget[] = [];
 	for (const section of detail.sections) {
 		const body = section.measuredBody;
+		if (body.model.kind === "plan-tree") {
+			const target = planTreeTarget(owner, body.model.markdown, section.label, labels);
+			if (target) targets.push(target);
+			continue;
+		}
 		if (body.model.kind !== "capped") continue;
 		const target = targetFromModel(
 			owner,
@@ -102,6 +111,22 @@ export function resolveDetailViewTargets(
 	return targets;
 }
 
+/**
+ * An outline plan's tree (plan readability) opens fullscreen as the markdown it was parsed from.
+ * Its card draws the tree, not that text, so it offers no in-place source view.
+ */
+function planTreeTarget(
+	owner: string | VListViewOwner,
+	markdown: ToolCappedDetail,
+	label: ToolDetailSection["label"],
+	labels?: VListViewTargetLabels,
+): VListViewTarget | null {
+	const target = targetFromModel(owner, markdown, label ? labels?.sections?.[label] : undefined);
+	if (!target) return null;
+	const { sourceInline: _inline, ...rest } = target;
+	return rest;
+}
+
 /** Fullscreen refresh uses source data even when the inline card is not measured. */
 export function resolveToolDetailModelTargets(
 	owner: string | VListViewOwner,
@@ -110,6 +135,11 @@ export function resolveToolDetailModelTargets(
 ): VListViewTarget[] {
 	const targets: VListViewTarget[] = [];
 	for (const section of detail?.sections ?? []) {
+		if (section.body.kind === "plan-tree") {
+			const target = planTreeTarget(owner, section.body.markdown, section.label, labels);
+			if (target) targets.push(target);
+			continue;
+		}
 		if (section.body.kind !== "capped") continue;
 		const target = targetFromModel(
 			owner,

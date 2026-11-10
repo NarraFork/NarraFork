@@ -101,8 +101,14 @@ export function OutlinePlanApproval({
 		() => outlinePlanSubmissionOf(permission.inputJson as Record<string, unknown> | undefined),
 		[permission.inputJson],
 	);
-	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
-		useContext(PermEnterHintCtx);
+	const {
+		focusIndex,
+		setFocusIndex,
+		setButtonCount,
+		setHasFeedback,
+		registerActions,
+		activePermissionId,
+	} = useContext(PermEnterHintCtx);
 	const isActive = permission.id === activePermissionId;
 	// In the transcript the feedback box paints the rows its height model counts (D49).
 	const textareaStyle = usePermissionTextareaStyle();
@@ -401,6 +407,7 @@ export function OutlinePlanApproval({
 			) : (
 				<PermButtonBar
 					focusIndex={isActive ? focusIndex : null}
+					setFocusIndex={isActive ? setFocusIndex : undefined}
 					buttons={buttons}
 					setButtonCount={isActive ? setButtonCount : noop}
 					registerActions={isActive ? registerActions : noop}

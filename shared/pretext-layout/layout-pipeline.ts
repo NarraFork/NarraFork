@@ -14,6 +14,7 @@
  * arithmetic). The only inputs are data + width + lod + scroll offsets.
  */
 
+import type { PlanTreeView } from "../outline-plan-tree";
 import type { VListElementKind } from "./element-kinds";
 import type { MeasuredElement, RenderLod } from "./prepared-block";
 import {
@@ -76,6 +77,8 @@ export interface ComputeLayoutOptions {
 	isPromptOpen?: (key: string) => boolean;
 	/** Reader expanded a subagent card's file-change list (its own fold). */
 	isFileChangesOpen?: (key: string) => boolean;
+	/** The reader's view of an outline plan card's tree (undefined: the overview). */
+	planTreeView?: (key: string) => PlanTreeView | undefined;
 	/** L5 recency window for tool/subagent cards. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -181,6 +184,7 @@ export function computePretextVListLayout(
 		showOriginal: opts.showOriginal,
 		isPromptOpen: opts.isPromptOpen,
 		isFileChangesOpen: opts.isFileChangesOpen,
+		planTreeView: opts.planTreeView,
 		recentMessageIds: opts.recentMessageIds,
 		viewportHeight: opts.viewportHeight,
 		labels: opts.labels,

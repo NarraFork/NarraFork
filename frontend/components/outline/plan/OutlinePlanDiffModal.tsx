@@ -5,6 +5,12 @@
  * editing it in the outline beside the session), so the version a decision names (`seenSeq`) is
  * the one on screen. A plan review's comments (PR 8b) come first, as the submission carries them;
  * the diff leaves them out.
+ *
+ * Nothing in the diff is folded (plan readability): it lists only the blocks that changed, each
+ * at its depth under the root, so a change shows however deep it sits — unlike the plan's own
+ * overview, which folds what is under its second level. A long text before or after is clamped
+ * to {@link DIFF_TEXT_LINES} lines, and opens whole on a click: the toggle shows when the clamp
+ * actually cuts a text at the modal's width (measured by the browser, again on resize).
  */
 
 import {
@@ -26,7 +32,7 @@ import type {
 	OutlinePlanReview,
 	OutlinePlanTaskView,
 } from "@shared/outline-api";
-import type { ReactNode } from "react";
+import { type ReactNode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 function taskLine(
@@ -52,10 +58,62 @@ const CHANGE_COLOR: Record<string, string> = {
 	moved: "gray",
 };
 
+/** Lines a changed block's text shows before it is clamped (a click shows it whole). */
+const DIFF_TEXT_LINES = 3;
+
+/**
+ * Whether one of a row's texts is longer than the clamp, read from what the browser drew: cut
+ * now (clamped: its content is taller than its box), or taller than the clamp (shown whole).
+ * Checked after each render and whenever a text's box changes size (the modal's width, a phone's
+ * fullscreen, the depth's indent), so the toggle is there exactly when the clamp cuts something.
+ */
+function useClampCuts(whole: boolean): {
+	ref: (el: HTMLElement | null) => void;
+	long: boolean;
+} {
+	const els = useRef(new Set<HTMLElement>());
+	const [long, setLong] = useState(false);
+	const check = useRef(() => {});
+	check.current = () => {
+		let cut = false;
+		for (const el of els.current) {
+			if (!el.isConnected) continue;
+			if (whole) {
+				const line = Number.parseFloat(getComputedStyle(el).lineHeight);
+				if (Number.isFinite(line) && el.clientHeight > line * DIFF_TEXT_LINES + 1) cut = true;
+			} else if (el.scrollHeight > el.clientHeight + 1) cut = true;
+		}
+		setLong(cut);
+	};
+	useLayoutEffect(() => {
+		check.current();
+	});
+	const observer = useRef<ResizeObserver | null>(null);
+	useLayoutEffect(() => {
+		if (typeof ResizeObserver === "undefined") return;
+		const watch = new ResizeObserver(() => check.current());
+		observer.current = watch;
+		for (const el of els.current) watch.observe(el);
+		return () => {
+			watch.disconnect();
+			observer.current = null;
+		};
+	}, []);
+	const ref = useCallback((el: HTMLElement | null) => {
+		if (!el) return;
+		els.current.add(el);
+		observer.current?.observe(el);
+	}, []);
+	return { ref, long };
+}
+
 function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
 	const { t } = useTranslation("narrator");
+	const [whole, setWhole] = useState(false);
 	const added = entry.changes.includes("added");
 	const removed = entry.changes.includes("removed");
+	const clamp = whole ? undefined : DIFF_TEXT_LINES;
+	const { ref: watch, long } = useClampCuts(whole);
 	return (
 		<Paper
 			withBorder
@@ -78,18 +136,52 @@ function DiffRow({ entry }: { entry: OutlinePlanDiffEntry }) {
 				)}
 			</Group>
 			{entry.changes.includes("text") && entry.before !== null && (
-				<Text size="xs" c="dimmed" td="line-through" style={{ whiteSpace: "pre-wrap" }}>
+				<Text
+					ref={watch}
+					size="xs"
+					c="dimmed"
+					td="line-through"
+					lineClamp={clamp}
+					style={{ whiteSpace: "pre-wrap" }}
+					data-testid="outline-plan-diff-before"
+				>
 					{entry.before}
 				</Text>
 			)}
 			{removed ? (
-				<Text size="xs" c="red" td="line-through" style={{ whiteSpace: "pre-wrap" }}>
+				<Text
+					ref={watch}
+					size="xs"
+					c="red"
+					td="line-through"
+					lineClamp={clamp}
+					style={{ whiteSpace: "pre-wrap" }}
+					data-testid="outline-plan-diff-before"
+				>
 					{entry.before}
 				</Text>
 			) : (
-				<Text size="xs" c={added ? "green" : undefined} style={{ whiteSpace: "pre-wrap" }}>
+				<Text
+					ref={watch}
+					size="xs"
+					c={added ? "green" : undefined}
+					lineClamp={clamp}
+					style={{ whiteSpace: "pre-wrap" }}
+					data-testid="outline-plan-diff-after"
+				>
 					{entry.after}
 				</Text>
+			)}
+			{long && (
+				<Anchor
+					component="button"
+					type="button"
+					size="xs"
+					onClick={() => setWhole((value) => !value)}
+					data-testid="outline-plan-diff-whole"
+				>
+					{whole ? t("outlinePlan.diff.showLess") : t("outlinePlan.diff.showWhole")}
+				</Anchor>
 			)}
 			{entry.changes.includes("task") && (
 				<Text size="xs" c="grape">
