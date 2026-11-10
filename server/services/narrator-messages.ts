@@ -4683,7 +4683,12 @@ const narratorMessageQueriesUnlocked = {
 			const msg = fillBody(
 				tx.query.narratorMessages
 					.findFirst({
-						...bodyColumns(),
+						...bodyColumns({
+							id: true,
+							contentJson: true,
+							tokensIn: true,
+							contextPercent: true,
+						}),
 						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
 					})
 					.sync(),
@@ -4719,6 +4724,34 @@ const narratorMessageQueriesUnlocked = {
 			const latestAttempt = compactBlock.attempts?.at(-1);
 			const live =
 				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
+
+			// Display fallbacks for markers written before both ends of the occupancy pair
+			// were recorded. A marker without `before` inherits the last real occupancy its
+			// history carried; a marker without `after` inherits its own row only when that
+			// row came from the post-compact estimate — the summary model's own request
+			// occupancy also lands in this column, and that is a percentage of a different
+			// window, so it must not be shown as the narrator's occupancy.
+			const contextPercentBefore =
+				compactBlock.contextPercentBefore ??
+				tx
+					.select({ contextPercent: narratorMessages.contextPercent })
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							lt(narratorMessageRefs.seq, ref.seq),
+							isNotNull(narratorMessages.contextPercent),
+						),
+					)
+					.orderBy(desc(narratorMessageRefs.seq))
+					.limit(1)
+					.get()?.contextPercent ??
+				undefined;
+			const contextPercentAfter =
+				compactBlock.contextPercentAfter ??
+				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
+
 			return {
 				status: compactBlock.status,
 				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
@@ -4747,8 +4780,8 @@ const narratorMessageQueriesUnlocked = {
 							: undefined,
 				mode: compactBlock.mode,
 				trigger: compactBlock.trigger,
-				contextPercentBefore: compactBlock.contextPercentBefore,
-				contextPercentAfter: compactBlock.contextPercentAfter,
+				contextPercentBefore,
+				contextPercentAfter,
 				attempts: compactBlock.attempts ?? [],
 				canRetry,
 			};

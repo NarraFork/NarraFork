@@ -9757,6 +9757,7 @@ export {
 	compactLocks,
 	isCompactInProgress,
 	markCompactAsBlocking,
+	refreshCompactContextPercentAfter,
 	retryFailedCompact,
 	runCustomCompact,
 	runSegmentCompact,

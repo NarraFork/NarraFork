@@ -3322,6 +3322,7 @@ export const narratorService = {
 	persistSystemMessage: narratorPersistence.persistSystemMessage.bind(narratorPersistence),
 	persistDisplayMessage: narratorPersistence.persistDisplayMessage.bind(narratorPersistence),
 	persistCompactingMessage: narratorPersistence.persistCompactingMessage.bind(narratorPersistence),
+	setCompactContextPercent: narratorPersistence.setCompactContextPercent.bind(narratorPersistence),
 	prepareFailedCompactRetry:
 		narratorPersistence.prepareFailedCompactRetry.bind(narratorPersistence),
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),

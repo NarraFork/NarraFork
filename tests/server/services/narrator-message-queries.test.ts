@@ -884,8 +884,14 @@ describe("narratorService message query regressions", () => {
 			summary: "new summary",
 			canRetry: false,
 			contextPercentBefore: 97,
-			contextPercentAfter: 12,
 		});
+		// The summary model's own request occupancy is measured on its own window, so
+		// finalize must not publish it as the narrator's post-compact occupancy.
+		expect(detail.contextPercentAfter).toBeUndefined();
+		// The real `after` is the post-compact estimate, written back by the compact run.
+		await narratorService.setCompactContextPercent("n1", marker.id, { after: 4.2 });
+		detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail.contextPercentAfter).toBe(4.2);
 		expect(
 			detail.attempts.map((attempt: { status: string; model: string }) => [
 				attempt.status,
@@ -901,6 +907,59 @@ describe("narratorService message query regressions", () => {
 		expect(detail.summary).toBe("edited summary");
 		expect(detail.attempts).toHaveLength(2);
 		expect(detail.contextPercentBefore).toBe(97);
+		expect(detail.contextPercentAfter).toBe(4.2);
+	});
+
+	it("falls back to real history occupancy for markers written without the pair", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+		});
+		await db
+			.update(narratorMessages)
+			.set({ contextPercent: 88 })
+			.where(eq(narratorMessages.id, "before"));
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+		});
+
+		const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+			model: "provider:model-with-history",
+			trigger: "manual",
+		});
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "summary", 62, {
+			mode: "blocking",
+		});
+
+		let detail = await narratorService.getCompactSummary("n1", marker.id);
+		// Before the compact the history really carried 88%: that is the only honest `before`.
+		expect(detail.contextPercentBefore).toBe(88);
+		// 62 was the summary model's own request occupancy. Without a post-compact estimate
+		// there is no honest `after`, so the detail stays silent instead of borrowing it.
+		expect(detail.contextPercentAfter).toBeUndefined();
+
+		await narratorService.updateMessageHistoryTokenEstimate(marker.id, "n1", {
+			promptTokens: 1_200,
+			turnUsage: { prompt_tokens: 1_200, is_estimated: true },
+			contextPercent: 1.2,
+		});
+		detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail.contextPercentAfter).toBe(1.2);
+
+		const marked = await narratorService.setCompactContextPercent("n1", marker.id, {
+			before: 87.5,
+			after: 1.4,
+		});
+		expect(marked?.seq).toBe(marker.seq);
+		detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail.contextPercentBefore).toBe(87.5);
+		expect(detail.contextPercentAfter).toBe(1.4);
 	});
 
 	it("rejects an old failed marker after a newer compact has succeeded", async () => {
