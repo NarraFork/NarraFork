@@ -2326,6 +2326,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	/** 最近标签中的会话是否显示工作目录；按账号同步，默认隐藏。 */
+	recentTabsShowDirectory: integer("recent_tabs_show_directory", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),

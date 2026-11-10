@@ -6,9 +6,9 @@
  * the path read `home/user/repo` with the root slash gone; the fix was LTR isolation
  * (`<bdo dir="ltr">` inside `LeftTruncatedPathText`).
  *
- * Rows are now one line and the cwd lives in the details card (hover) and the touch menu
- * header, shown in full and wrapped. Plain LTR text needs no isolation, so the guard is
- * that no RTL trick comes back around the subtitle on either surface.
+ * Rows are one line by default. An appearance preference restores the cwd line using
+ * the shared left-truncating path component. The details card and touch menu still
+ * show the full, wrapped cwd as plain LTR text.
  *
  * Asserted against the source because RecentTabs is not unit-mountable here
  * (drag sensors, router, query cache), matching sibling source-guard suites.
@@ -21,11 +21,31 @@ import { join } from "node:path";
 const RECENT_TABS = readFileSync(join(import.meta.dir, "RecentTabs.tsx"), "utf8");
 const DETAILS = readFileSync(join(import.meta.dir, "RecentTabDetailCard.tsx"), "utf8");
 const PATH_TEXT = readFileSync(join(import.meta.dir, "../common/TruncatedPath.tsx"), "utf8");
+const APPEARANCE = readFileSync(join(import.meta.dir, "../settings/AppearanceSection.tsx"), "utf8");
 
 describe("recentTabs working-directory display", () => {
-	it("rows no longer render the subtitle; the details do", () => {
-		expect(RECENT_TABS).not.toContain("{tab.subtitle}");
+	it("restores only directory subtitles behind the appearance preference", () => {
+		expect(RECENT_TABS).toContain(
+			"const showDirectory = userPrefs?.recentTabsShowDirectory ?? false",
+		);
+		expect(RECENT_TABS).toContain("showDirectory && hasDirectorySubtitle(tab) && tab.subtitle");
+		expect(RECENT_TABS).toContain(
+			'<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />',
+		);
 		expect(DETAILS).toContain("{tab.subtitle}");
+	});
+
+	it("reads and writes the account preference rather than browser-local storage", () => {
+		expect(APPEARANCE).toContain("checked={userPrefs?.recentTabsShowDirectory ?? false}");
+		expect(APPEARANCE).toContain(
+			"updateUserPref.mutate({ recentTabsShowDirectory: e.currentTarget.checked })",
+		);
+		expect(APPEARANCE).not.toContain("narrafork_recent_tabs_show_directory");
+		expect(RECENT_TABS).not.toContain("narrafork_recent_tabs_show_directory");
+	});
+
+	it("uses the same title and optional directory in rows and drag overlays", () => {
+		expect(RECENT_TABS.match(/label=\{<RecentTabTitle tab=\{tab\} \/>\}/g)).toHaveLength(2);
 	});
 
 	it("the details show the path as plain LTR text, never through a bare rtl box", () => {
