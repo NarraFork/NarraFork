@@ -934,9 +934,17 @@ function TaskNoticeCard({
 						alignItems: "center",
 						gap: GROUP_GAP,
 						overflow: "hidden",
+						// Beside a heading that is the notice (the view's changes) the counts are shown
+						// whole or not at all, never cut to a stub: the summary is one line high and
+						// wraps, so counts that do not fit what the heading leaves go to a second line
+						// that is not drawn (`TaskNoticeSummaryLine` puts a zero-width item before
+						// them: a lone item would overflow its line instead of wrapping).
+						...(titleFirst && !expanded
+							? { flexWrap: "wrap", alignContent: "flex-start", height: line }
+							: {}),
 					}}
 				>
-					{expanded ? null : <TaskNoticeSummaryLine data={data} narrow={narrow} />}
+					{expanded ? null : <TaskNoticeSummaryLine data={data} narrow={narrow} line={line} />}
 				</div>
 				{timeLabel ? (
 					<span
@@ -1010,8 +1018,39 @@ function TaskNoticeCard({
  * title), a tail. Where it changed from and what changed are the unfolded row's; the heading
  * already names who changed it.
  */
-function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow: boolean }) {
+function TaskNoticeSummaryLine({
+	data,
+	narrow,
+	line,
+}: {
+	data: TaskNoticeData;
+	narrow: boolean;
+	line: number;
+}) {
 	const { lead, row, tail, tailFirst } = data.summary ?? {};
+	// After a heading that keeps the line (the view's changes): the counts, whole or not drawn.
+	if (data.titleFirst === true) {
+		if (!lead) return null;
+		return (
+			<>
+				<span
+					aria-hidden="true"
+					style={{ flexShrink: 0, width: 0, height: line, marginRight: -GROUP_GAP }}
+				/>
+				<span
+					data-task-notice-lead=""
+					style={{
+						...noticeText(),
+						whiteSpace: "nowrap",
+						flex: "0 0 auto",
+						color: "var(--mantine-color-dimmed)",
+					}}
+				>
+					{lead}
+				</span>
+			</>
+		);
+	}
 	const dim = {
 		...noticeText(),
 		...NOWRAP_ELLIPSIS,
@@ -1021,9 +1060,8 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 	return (
 		<>
 			{/* On a phone a lead beside a task ("2 个未完成：") would only be cut to "2…": it is left
-			    out like the tail, the chevron opens the list. So is one beside a heading that keeps
-			    the line (the counts after the view's changes). A lead that is the whole line stays. */}
-			{lead && !(narrow && (row || data.titleFirst)) ? (
+			    out like the tail, the chevron opens the list. A lead that is the whole line stays. */}
+			{lead && !(narrow && row) ? (
 				<span style={dim} data-task-notice-lead="">
 					{lead}
 				</span>

@@ -569,7 +569,7 @@ describe("an update of the current-tasks view says what changed (任务树可读
 
 	it("a row written before state tables existed reads exactly as it did", () => {
 		const data = specOf(viewUpdate("m-old", VIEW)).data as TaskNoticeData;
-		expect(data).toEqual({
+		expect(data as unknown).toEqual({
 			kind: "tasks_notice",
 			variant: "view",
 			title: "当前任务已更新",
