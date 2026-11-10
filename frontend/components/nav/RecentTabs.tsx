@@ -787,8 +787,9 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [ctxMenu, newNarratorHereFor]);
 
 	const handleNewNarratorHereCreated = useCallback(
-		(data: CreateNarratorResult) => {
-			const folderId = newNarratorTargetRef.current?.folderId;
+		// 目标文件夹由调用点按当次渲染传入：弹窗会先 onClose 再 onCreated，那时
+		// `newNarratorTarget` 已经被清空，从状态里读只会拿到 undefined。
+		(data: CreateNarratorResult, folderId?: string) => {
 			closeNewNarratorHere();
 			void (async () => {
 				await addRecentTab({
@@ -800,7 +801,9 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 				});
 				// 侧栏 upsert 会剥离 folderId，归属只能走文件夹端点；失败不影响已创建的会话。
 				if (folderId) {
-					await api.moveRecentTab(`narrator:${data.id}`, { folderId }).catch(() => {});
+					await api.moveRecentTab(`narrator:${data.id}`, { folderId }).catch((error) => {
+						if (import.meta.env.DEV) console.warn("[RecentTabs] join folder failed:", error);
+					});
 				}
 			})();
 			navigate({ to: `/narrators/${data.id}` });
@@ -1375,7 +1378,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 							// 从文件夹里新建时，弹窗要说清 git 身份跟的是这个文件夹。
 							gitIdentityFolderId={newNarratorTarget?.folderId}
 							onClose={closeNewNarratorHere}
-							onCreated={handleNewNarratorHereCreated}
+							// 闭包捕获本次打开时的目标：onCreated 触发时状态已被清空。
+							onCreated={(data) =>
+								handleNewNarratorHereCreated(data, newNarratorTarget?.folderId)
+							}
 						/>
 					</Box>
 					{/* Keep preview rows outside the measured source container. */}
