@@ -19,7 +19,10 @@ const step = (content: string, children: OutlineItem[] = []) => item(content, ch
 /** The owner's format, in Chinese. */
 export const FORMAT_ZH: OutlineItem = step("历史读取超过 10 秒改为告警", [
 	item(
-		"模型历史链路、工具结果回放和会话恢复读历史时都带着 10 秒的固定超时，超过就直接拒绝并报 HISTORY_READ_TIMEOUT；慢磁盘或大会话上，用户只看到会话莫名失败，看不到原因。这次把三处固定时间拒绝都改成告警：读取照常完成，慢的时候在日志里记一条带耗时的 warn，并在会话头部提示正在读取历史。分页、游标和每页上限都不变。",
+		// Keep the expanded background longer than four lines with narrow fallback glyphs too.
+		"模型历史链路、工具结果回放和会话恢复读历史时都带着 10 秒的固定超时，超过就直接拒绝并报 HISTORY_READ_TIMEOUT；慢磁盘或大会话上，用户只看到会话莫名失败，看不到原因。这次把三处固定时间拒绝都改成告警：读取照常完成，慢的时候在日志里记一条带耗时的 warn，并在会话头部提示正在读取历史。分页、游标和每页上限都不变。".repeat(
+			2,
+		),
 	),
 	step("阶段 1：去掉固定时间拒绝", [
 		step("清除模型历史链路的固定时间拒绝", [
@@ -122,7 +125,10 @@ export const LEGACY: OutlineItem = step(
 	[
 		item("已确定的边界与取舍", [
 			item(
-				"只改“超时即拒绝”的行为，不改读取本身：分页、游标和每页上限都保持不变，避免同时改两件事时无法判断回归来自哪里。",
+				// Exceed three lines even with narrow CJK fallback glyphs on CI.
+				"只改“超时即拒绝”的行为，不改读取本身：分页、游标和每页上限都保持不变，避免同时改两件事时无法判断回归来自哪里。".repeat(
+					3,
+				),
 			),
 			item(
 				"告警阈值沿用 10 秒，但做成常量放在 history-limits.ts 里，后面要调只改一处；不做成用户设置，因为没有人需要按会话调它。",
