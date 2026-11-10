@@ -76,6 +76,8 @@ function SettingsPluginsPage() {
 		});
 	}, [pluginsQuery.data, search]);
 
+	// Plugins ship either with the application or as an installed package; both are enabled,
+	// disabled and diagnosed through the same controls, so the list makes no distinction.
 	const anyMutationPending =
 		enableMutation.isPending || disableMutation.isPending || uninstallMutation.isPending;
 
@@ -202,7 +204,7 @@ function SettingsPluginsPage() {
 				</Paper>
 			) : (
 				<Box style={{ overflowX: "auto" }}>
-					<Table striped highlightOnHover withTableBorder miw={640}>
+					<Table striped highlightOnHover withTableBorder miw={720}>
 						<Table.Thead>
 							<Table.Tr>
 								<Table.Th>{t("admin.table.name")}</Table.Th>
@@ -279,17 +281,24 @@ function SettingsPluginsPage() {
 														</ActionIcon>
 													</Tooltip>
 												)}
-												<Tooltip label={t("admin.actions.uninstall")}>
-													<ActionIcon
-														variant="subtle"
-														color="red"
-														disabled={anyMutationPending || !!pluginsDisabled}
-														onClick={() => handleUninstall(plugin)}
-														aria-label={t("admin.actions.uninstall")}
-													>
-														<IconTrash size={18} />
-													</ActionIcon>
-												</Tooltip>
+												{/*
+												 * A plugin that ships with the application has no package to
+												 * remove, so it gets no uninstall action — the list itself
+												 * makes no other distinction.
+												 */}
+												{plugin.builtin ? null : (
+													<Tooltip label={t("admin.actions.uninstall")}>
+														<ActionIcon
+															variant="subtle"
+															color="red"
+															disabled={anyMutationPending || !!pluginsDisabled}
+															onClick={() => handleUninstall(plugin)}
+															aria-label={t("admin.actions.uninstall")}
+														>
+															<IconTrash size={18} />
+														</ActionIcon>
+													</Tooltip>
+												)}
 											</Group>
 										</Table.Td>
 									</Table.Tr>
