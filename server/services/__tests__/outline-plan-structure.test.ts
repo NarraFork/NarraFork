@@ -463,7 +463,10 @@ describe("questions put to a person: the check and the display agree", () => {
 		const asked = await askTool.execute(
 			{
 				under: root.address,
-				questions: [{ question: "要不要按会话限频？", options: ["要", "不要"], recommend: 2 }],
+				// An option holding a `›` (review round 2): the question's note still reads as one.
+				questions: [
+					{ question: "要不要按会话限频？", options: ["keep › v1", "不要"], recommend: 2 },
+				],
 			},
 			toolCtx(id, owner),
 		);

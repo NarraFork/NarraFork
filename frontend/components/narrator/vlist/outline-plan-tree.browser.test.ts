@@ -654,17 +654,35 @@ describe("clicks and names", () => {
 				};
 			});
 		expect(await read()).toEqual({
-			quick: ["其中全部", "false"],
-			preview: "展开这一项里的全部: 还有 2 条",
+			quick: ["展开/收起「清除模型历史链路的固定时间拒绝」里的全部", "false"],
+			preview:
+				"展开这一项里的全部: 回放超过 10 秒只记 warn，不再拒绝，结果照常回放给模型和界面 (还有 2 条)",
 			arrow: ["阶段 1：去掉固定时间拒绝", "true"],
 			all: false,
 		});
 		await click('[data-plan-row="r.1.0"] [data-plan-subtree]');
-		expect((await read()).quick).toEqual(["其中全部", "true"]);
+		expect((await read()).quick).toEqual([
+			"展开/收起「清除模型历史链路的固定时间拒绝」里的全部",
+			"true",
+		]);
 	});
 
-	test("the box scrolls with the list's overlay scrollbars: rows keep its full width", async () => {
+	test("the box scrolls with the list's overlay scrollbars; the quick controls stay clear of it", async () => {
 		await render({ scene: "format", lang: "zh-CN", scheme: "dark", width: 720 });
+		// Not scrolling: the quick controls reach the box's inner edge.
+		const edge = () =>
+			page.evaluate(() => {
+				const port = document.querySelector<HTMLElement>(
+					"[data-plan-box] [data-content-scrollport]",
+				);
+				const quick = [
+					...document.querySelectorAll<HTMLElement>("[data-card] [data-plan-subtree]"),
+				];
+				if (!port || quick.length === 0) return null;
+				const right = port.getBoundingClientRect().right;
+				return Math.min(...quick.map((q) => right - q.getBoundingClientRect().right));
+			});
+		expect(await edge()).toBeLessThan(8);
 		const card = await click("[data-plan-all]");
 		expectExact(card);
 		expect(card.box && card.box.scrollHeight > card.box.clientHeight).toBe(true);
@@ -676,6 +694,41 @@ describe("clicks and names", () => {
 		});
 		expect(widths?.[0]).toBe(widths?.[1]);
 		expect(widths?.[2]).toBe("none");
+		// Scrolling: every quick control is clear of the scrollbar's 8px strip.
+		expect(await edge()).toBeGreaterThanOrEqual(8);
+	});
+
+	test("the arrow's whole 24px target is the arrow's (the marker lets clicks through)", async () => {
+		await render({ scene: "format", lang: "en", scheme: "light", width: 720 });
+		const hit = await page.evaluate(() => {
+			const arrow = document.querySelector<HTMLElement>('[data-plan-row="r.1"] [data-plan-toggle]');
+			if (!arrow) return null;
+			const r = arrow.getBoundingClientRect();
+			const at = document.elementFromPoint(r.right - 1, r.top + r.height / 2);
+			return { width: Math.round(r.width), arrow: !!at && arrow.contains(at) };
+		});
+		expect(hit).toEqual({ width: 24, arrow: true });
+	});
+
+	test("a held key toggles once", async () => {
+		await render({ scene: "format", lang: "en", scheme: "light", width: 720 });
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.focus(
+				'[data-plan-row="r.1"] [data-plan-toggle]',
+			),
+		);
+		const before = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.commitCount(),
+		);
+		await page.keyboard.down("Enter");
+		await page.evaluate((b) => (window as unknown as FixtureWindow).fixture.afterCommit(b), before);
+		// The key held: the browser repeats it once more (a toggle per keydown would open it again).
+		await page.keyboard.down("Enter");
+		await page.keyboard.up("Enter");
+		await page.evaluate(
+			() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+		);
+		expect(row(await report(), "r.1").open).toBe("0");
 	});
 });
 

@@ -2827,7 +2827,7 @@
 			"expand": "展开",
 			"collapse": "收起",
 			"altHint": "Alt+点击：展开或收起其中全部",
-			"subtree": "其中全部",
+			"subtree": "展开/收起「{{title}}」里的全部",
 			"subtreeExpand": "展开其中全部",
 			"subtreeCollapse": "收起其中全部",
 			"detailsMore": "还有 {{n}} 条 ▸",

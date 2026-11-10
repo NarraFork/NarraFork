@@ -71,8 +71,8 @@ export interface PlanTreeLabels {
 	collapse: string;
 	/** What Alt+click on the arrow does (the arrow's tooltip). */
 	altHint: string;
-	/** The quick control's name (its state is `aria-expanded`), and what a press does now. */
-	subtree: string;
+	/** The quick control's name, naming its row (its state is `aria-expanded`). */
+	subtree: (title: string) => string;
 	subtreeExpand: string;
 	subtreeCollapse: string;
 	/** A preview line's name for assistive technology (its label follows, without the arrow). */
@@ -90,7 +90,7 @@ export const DEFAULT_PLAN_TREE_LABELS: PlanTreeLabels = {
 	expand: "Expand",
 	collapse: "Collapse",
 	altHint: "Alt+click: everything inside",
-	subtree: "Everything inside",
+	subtree: (title) => `Expand/collapse everything in “${title}”`,
 	subtreeExpand: "Expand everything inside",
 	subtreeCollapse: "Collapse everything inside",
 	showInside: "Show everything inside this item",
@@ -103,6 +103,12 @@ export const DEFAULT_PLAN_TREE_LABELS: PlanTreeLabels = {
 /** A label without its trailing arrow (an accessible name says what, not "▸"). */
 function spoken(label: string): string {
 	return label.replace(/\s*[▸▾▴►]\s*$/u, "");
+}
+
+/** A preview line's accessible name: what it does, the line it shows, how much more. */
+function previewName(action: string, text: string, label: string | null): string {
+	const line = text.length > 80 ? `${text.slice(0, 79)}…` : text;
+	return `${action}: ${line}${label ? ` (${spoken(label)})` : ""}`;
 }
 
 /** A modified click is the list's selection (Ctrl/Cmd/Shift), not a toggle. */
@@ -121,6 +127,8 @@ function ownKeys(activate: (alt: boolean) => void) {
 		if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing) return;
 		e.preventDefault();
 		e.stopPropagation();
+		// A held key repeats: one toggle per press.
+		if (e.repeat) return;
 		activate(e.altKey);
 	};
 }
@@ -290,7 +298,8 @@ function PlanTreeRow({
 				position: "absolute",
 				top: PLAN_TREE_PAD_Y + row.top,
 				left: PLAN_TREE_PAD_X,
-				right: PLAN_TREE_PAD_X,
+				// The rows' width as laid out (narrower by the scrollbar's strip when the box scrolls).
+				width: layout.innerWidth,
 				height: row.height,
 			}}
 		>
@@ -390,7 +399,7 @@ function PlanTreeRow({
 					ref={quickRef}
 					type="button"
 					aria-expanded={row.subtree === "collapse"}
-					aria-label={labels.subtree}
+					aria-label={labels.subtree(firstLine || arrowAction)}
 					title={subtreeAction}
 					data-plan-subtree={row.subtree}
 					className={`${ROW_BUTTON_CLASS} vlist-plan-subtree`}
@@ -415,11 +424,7 @@ function PlanTreeRow({
 					role="button"
 					tabIndex={0}
 					aria-expanded={false}
-					aria-label={
-						row.preview.label
-							? `${labels.showInside}: ${spoken(row.preview.label)}`
-							: labels.showInside
-					}
+					aria-label={previewName(labels.showInside, row.preview.text, row.preview.label)}
 					data-plan-preview=""
 					className="vlist-plan-preview mantine-focus-auto"
 					onClick={(e) => {

@@ -504,6 +504,184 @@ test("Enter in the empty composer is still the shortcut: the plan is decided (re
 	await page.close();
 });
 
+/** A plain permission (a shell command), as the panel's real form shows it. */
+const BASH = {
+	id: "bash-request",
+	toolName: "Bash",
+	toolUseId: "toolu_bash_request",
+	ownerNarratorId: "n-bash",
+	inputJson: { command: "rm -rf build" },
+};
+
+/** The plain permission form under the panel's keyboard navigation. */
+async function openForm(permission: Record<string, unknown>) {
+	const { page, errors } = await openPage({ width: 1000, height: 800 });
+	await page.evaluate(
+		(p) => (window as unknown as FixtureWindow).fixture.open(p as never, { keyboard: true }),
+		permission,
+	);
+	await page.waitForSelector('[data-perm-button-bar="active"]', { timeout: 15_000 });
+	return { page, errors };
+}
+
+const focusedLabel = (page: Page) => call(page, (f) => f.focusedLabel());
+const decided = (page: Page) => call(page, (f) => f.decisions());
+
+test("feedback typed, Tab, Enter: the plain form denies with it; the focus lands on Deny (review round 2 B1)", async () => {
+	const { page, errors } = await openForm(BASH);
+	await until(page, "Allow by default", (f) => f.enterTarget() === "Allow");
+	await call(page, (f) => f.type("[data-testid=permission-feedback]", "too broad"));
+	await until(page, "Deny with feedback", (f) => f.enterTarget() === "Deny");
+	await page.focus("[data-testid=permission-feedback]");
+	await page.keyboard.press("Tab");
+	// The keyboard focus entering the row lands on the highlighted button: the two agree.
+	await until(page, "the focus on Deny", (f) => f.focusedLabel() === "Deny");
+	expect(await call(page, (f) => f.enterTarget())).toBe("Deny");
+	await page.keyboard.press("Enter");
+	await waitFor("the decision", async () => ((await decided(page)).length > 0 ? true : null));
+	expect(await decided(page)).toEqual(["deny:too broad"]);
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("Tab to Allow, ArrowRight, Enter: the focus moves with the highlight and Deny decides (review round 2 B1)", async () => {
+	const { page, errors } = await openForm(BASH);
+	await until(page, "Allow by default", (f) => f.enterTarget() === "Allow");
+	await page.focus("[data-testid=permission-feedback]");
+	await page.keyboard.press("Tab");
+	await until(page, "the focus on Allow", (f) => f.focusedLabel() === "Allow");
+	await page.keyboard.press("ArrowRight");
+	await until(page, "Deny highlighted", (f) => f.enterTarget() === "Deny");
+	await until(page, "the focus on Deny", (f) => f.focusedLabel() === "Deny");
+	// Shift+Tab inside the row: the highlight follows the focus back to Allow, Tab to Deny again.
+	await page.keyboard.down("Shift");
+	await page.keyboard.press("Tab");
+	await page.keyboard.up("Shift");
+	await until(
+		page,
+		"both on Allow",
+		(f) => f.enterTarget() === "Allow" && f.focusedLabel() === "Allow",
+	);
+	await page.keyboard.press("Tab");
+	await until(
+		page,
+		"both on Deny",
+		(f) => f.enterTarget() === "Deny" && f.focusedLabel() === "Deny",
+	);
+	await page.keyboard.press("Enter");
+	await waitFor("the decision", async () => ((await decided(page)).length > 0 ? true : null));
+	expect(await decided(page)).toEqual(["deny:"]);
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("a focus the row did not place (a mouse press dragged off Allow): Enter still runs the highlighted Deny (review round 2 B1)", async () => {
+	const { page, errors } = await openForm(BASH);
+	await call(page, (f) => f.type("[data-testid=permission-feedback]", "too broad"));
+	await until(page, "Deny with feedback", (f) => f.enterTarget() === "Deny");
+	const allow = await page.evaluateHandle(
+		() =>
+			[...document.querySelectorAll('[data-perm-button-bar="active"] button')].find((b) =>
+				b.textContent?.startsWith("Allow"),
+			) as HTMLElement,
+	);
+	const box = await (
+		allow as unknown as {
+			boundingBox(): Promise<{ x: number; y: number; width: number; height: number } | null>;
+		}
+	).boundingBox();
+	if (!box) throw new Error("no Allow button");
+	await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(box.x + box.width / 2, box.y + box.height + 200);
+	await page.mouse.up();
+	expect(await focusedLabel(page)).toBe("Allow");
+	expect(await decided(page)).toEqual([]);
+	await page.keyboard.press("Enter");
+	await waitFor("the decision", async () => ((await decided(page)).length > 0 ? true : null));
+	expect(await decided(page)).toEqual(["deny:too broad"]);
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("the plan approval: feedback typed, Tab, Enter returns the plan (review round 2 B1)", async () => {
+	const plan = await waitingPlan();
+	const { page, errors } = await openCard(plan.permission, undefined, { keyboard: true });
+	await call(page, (f) => f.type("[data-testid=outline-plan-feedback]", "Split step B"));
+	await until(page, "Return as the default", (f) => f.enterTarget() === "Return");
+	await page.focus("[data-testid=outline-plan-feedback]");
+	await page.keyboard.press("Tab");
+	await until(page, "the focus on Return", (f) => f.focusedLabel() === "Return");
+	await page.keyboard.press("Enter");
+	await waitFor("the return", () => plan.outcome());
+	expect(plan.outcome()?.behavior).toBe("deny");
+	expect(plan.outcome()?.message).toContain("Split step B");
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("the ⏎ hint hides while a control elsewhere owns Enter, and comes back (review round 2)", async () => {
+	const plan = await waitingPlan();
+	const { page, errors } = await openCard(plan.permission, undefined, { keyboard: true });
+	await until(page, "the keyboard default", (f) => f.enterTarget() === "Execute as draft");
+	await page.focus("[data-testid=outline-plan-view-changes]");
+	await until(page, "no hint", (f) => f.enterTarget() === null);
+	await call(page, (f) => f.blur());
+	await until(page, "the hint back", (f) => f.enterTarget() === "Execute as draft");
+	expect(plan.outcome()).toBeNull();
+	expect(errors).toEqual([]);
+	await page.close();
+});
+
+test("unchanged: an IME composition's Enter and an AskUserQuestion do not decide (review round 2)", async () => {
+	const { page, errors } = await openForm(BASH);
+	await until(page, "Allow by default", (f) => f.enterTarget() === "Allow");
+	await page.evaluate(() => {
+		window.dispatchEvent(
+			new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true }),
+		);
+	});
+	await page.evaluate(
+		() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+	);
+	expect(await decided(page)).toEqual([]);
+	await page.close();
+	const ask = await openPage({ width: 1000, height: 800 });
+	await ask.page.evaluate(
+		(p) => (window as unknown as FixtureWindow).fixture.open(p as never, { keyboard: true }),
+		{
+			id: "ask-request",
+			toolName: "AskUserQuestion",
+			toolUseId: "toolu_ask",
+			ownerNarratorId: "n-ask",
+			inputJson: {
+				questions: [
+					{
+						question: "Which format?",
+						header: "Format",
+						multiSelect: false,
+						options: [
+							{ label: "v1", description: "old" },
+							{ label: "v2", description: "new" },
+						],
+					},
+				],
+			},
+		},
+	);
+	await ask.page.waitForFunction(() => document.body.innerText.includes("Which format?"), {
+		timeout: 15_000,
+	});
+	expect(await call(ask.page, (f) => f.enterTarget())).toBeNull();
+	await ask.page.keyboard.press("Enter");
+	await ask.page.evaluate(
+		() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+	);
+	expect(await decided(ask.page)).toEqual([]);
+	expect([...errors, ...ask.errors]).toEqual([]);
+	await ask.page.close();
+});
+
 test("a text the diff's clamp cuts at the modal's width has its toggle, measured; a short one has none (review round 1 S6)", async () => {
 	// 116 characters (a small point within its limit): under the old 160-character rule, yet five
 	// lines on a phone.

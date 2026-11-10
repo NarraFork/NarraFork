@@ -43,6 +43,7 @@ import {
 	PLAN_TREE_PAD_Y,
 	PLAN_TREE_PREVIEW_LABEL_GAP,
 	PLAN_TREE_ROW_GAP,
+	PLAN_TREE_SCROLL_GUTTER,
 	PLAN_TREE_SUBTREE_GAP,
 	PLAN_TREE_SUBTREE_SLOT,
 	PLAN_TREE_TOGGLE_SLOT,
@@ -366,6 +367,19 @@ describe("in the card", () => {
 		expect(all.height).toBe(
 			planTreeToolbarHeight() + PLAN_TREE_TOOLBAR_GAP + resolveDetailCap("plan", 200),
 		);
+	});
+
+	test("a box that scrolls lays its rows out clear of the overlay scrollbar's strip", () => {
+		const treeOf = (m: ReturnType<typeof measureToolBody>) =>
+			(
+				m.blocks.find((b) => b.kind === "fixed" && b.tag === "detail-plan-tree") as unknown as {
+					data: { layout: ReturnType<typeof layoutPlanTree> };
+				}
+			).data.layout;
+		const fits = treeOf(measureToolBody(body(), 612, 900));
+		const scrolls = treeOf(measureToolBody(body(view({ kind: "all" })), 612, 200));
+		expect(scrolls.innerWidth).toBe(fits.innerWidth - PLAN_TREE_SCROLL_GUTTER);
+		expect(PLAN_TREE_SCROLL_GUTTER).toBe(8);
 	});
 
 	test("the measured body counts the plan's text against the cache's source budget", () => {

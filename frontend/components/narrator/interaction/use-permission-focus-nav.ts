@@ -1,6 +1,7 @@
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
+import { enterOwnedByTarget, inActivePermButtonBar } from "./enter-ownership";
 
 /** Value shape published on PermEnterHintCtx (see tool-call-contexts). */
 export interface PermEnterHintCtxValue {
@@ -29,14 +30,6 @@ export interface UsePermissionFocusNavResult {
 	/** Context value to publish on PermEnterHintCtx.Provider. */
 	permEnterHintCtxValue: PermEnterHintCtxValue;
 }
-
-/**
- * Controls whose own Enter is theirs: a press on one of them (or inside one) activates it, never
- * the waiting permission's highlighted button. Text fields are handled before this (only the
- * empty composer hands its Enter over).
- */
-const OWN_ENTER_SELECTOR =
-	'button, a[href], summary, select, [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="switch"], [role="combobox"], [contenteditable]:not([contenteditable="false"])';
 
 /**
  * Index-based keyboard navigation for permission buttons, extracted from
@@ -144,14 +137,17 @@ export function usePermissionFocusNav(
 			}
 
 			if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
-				// Enter belongs to the permission only where nothing else owns it: the page itself,
-				// or the empty composer (whose own handler prevents the newline and hands it over).
-				// A focused control — a plan tree's toggle, "View changes", a link — keeps its Enter,
-				// and one that handled the key itself (prevented its default) is not run over.
+				// Enter belongs to the permission where nothing else owns it: the page itself, the
+				// empty composer (whose own handler prevents the newline and hands it over), and the
+				// permission's own button row — there it runs the highlighted decision whichever
+				// button has the focus (the row keeps the two together, `PermButtonBar`), and the
+				// native click of the focused one is prevented. Any other control — a plan tree's
+				// toggle, "View changes", a link, a tab — keeps its Enter, as does a key a handler
+				// already took, and everything while a modal dialog is open.
 				const composer = !!target && !!composerRef.current?.ownsTextarea(target);
-				if (!composer) {
+				if (!composer && !inActivePermButtonBar(target)) {
 					if (e.defaultPrevented) return;
-					if (target instanceof Element && target.closest(OWN_ENTER_SELECTOR)) return;
+					if (enterOwnedByTarget(target, document)) return;
 				}
 				const action = permActionsRef.current[effectiveFocusIndex];
 				if (!action) return;

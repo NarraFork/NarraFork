@@ -179,6 +179,7 @@ import {
 	layoutPlanTree,
 	PLAN_TREE_PAD_X,
 	PLAN_TREE_PAD_Y,
+	PLAN_TREE_SCROLL_GUTTER,
 	PLAN_TREE_TOOLBAR_GAP,
 	planTreeToolbarHeight,
 } from "./measure-plan-tree";
@@ -1821,12 +1822,16 @@ export function measureToolBody(
 			// clamped or opened, then the rows in the plan's capped box (scrolls past 0.85 × viewport, as the
 			// markdown plan did). Rows are laid out by `measure-plan-tree`.
 			const cap = resolveDetailCap("plan", viewportHeight);
-			const layout = layoutPlanTree(
-				detail.tree,
-				detail.view,
-				Math.max(1, innerWidth - PLAN_TREE_PAD_X * 2),
-				detail.labels,
-			);
+			const inner = Math.max(1, innerWidth - PLAN_TREE_PAD_X * 2);
+			let layout = layoutPlanTree(detail.tree, detail.view, inner, detail.labels);
+			// A box past its cap scrolls: its rows are laid out clear of the overlay scrollbar's strip.
+			if (layout.contentHeight + PLAN_TREE_PAD_Y * 2 > cap)
+				layout = layoutPlanTree(
+					detail.tree,
+					detail.view,
+					Math.max(1, inner - PLAN_TREE_SCROLL_GUTTER),
+					detail.labels,
+				);
 			const blocks: PreparedBlock[] = [];
 			if (layout.toolbar)
 				blocks.push(makeFixed(planTreeToolbarHeight(), "detail-plan-toolbar", 0, { layout }));

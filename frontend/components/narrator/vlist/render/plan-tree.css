@@ -52,6 +52,8 @@
 
 .vlist-plan-marker {
 	color: var(--mantine-color-dimmed);
+	/* The arrow's 24px target reaches into the marker's room: clicks there are the arrow's. */
+	pointer-events: none;
 }
 
 .vlist-plan-row[data-plan-role="notable"] .vlist-plan-marker {

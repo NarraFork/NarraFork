@@ -87,8 +87,16 @@ function ownKeys(activate: (alt: boolean) => void) {
 		if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey) return;
 		e.preventDefault();
 		e.stopPropagation();
+		// A held key repeats: one toggle per press.
+		if (e.repeat) return;
 		activate(e.altKey);
 	};
+}
+
+/** The preview's line as plain text, for its accessible name. */
+function firstLineText(preview: PlanTreePreview): string {
+	const text = preview.first.plain.split("\n")[0] ?? "";
+	return text.length > 80 ? `${text.slice(0, 79)}…` : text;
 }
 
 /** A label without its trailing arrow (an accessible name says what, not "▸"). */
@@ -148,11 +156,9 @@ function PreviewLine({
 			role="button"
 			tabIndex={0}
 			aria-expanded={false}
-			aria-label={
-				label
-					? `${t("outlinePlan.tree.showInside")}: ${spoken(label)}`
-					: t("outlinePlan.tree.showInside")
-			}
+			aria-label={`${t("outlinePlan.tree.showInside")}: ${firstLineText(preview)}${
+				label ? ` (${spoken(label)})` : ""
+			}`}
 			onClick={(e: React.MouseEvent) => {
 				if (plainClick(e)) onOpen();
 			}}
@@ -398,7 +404,9 @@ function PlanRow({
 						type="button"
 						c="dimmed"
 						aria-expanded={subtree === "collapse"}
-						aria-label={t("outlinePlan.tree.subtree")}
+						aria-label={t("outlinePlan.tree.subtree", {
+							title: node.plain.split("\n")[0]?.slice(0, 80) || subtreeAction,
+						})}
 						title={subtreeAction}
 						onClick={(e: React.MouseEvent) => {
 							if (plainClick(e)) toggleSubtree();

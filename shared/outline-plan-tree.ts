@@ -336,8 +336,18 @@ export function planDescendants(node: PlanTreeNode): number {
 
 // ─── Parsing ───
 
-/** A note a read adds on its own line (`‹… 3 more›`, `‹question …›`): not a block. */
-const ANNOTATION_LINE = /^[ \t]*‹[^›\n]*›[ \t]*$/;
+/**
+ * The notes a read adds on lines of their own, as the server's `isReadAnnotation` knows them
+ * (`render.ts`): not blocks. A note's words may hold a `›` themselves (a question's option
+ * "Settings › Privacy"), so each is matched by its opening word, up to the line's last `›`.
+ */
+const NOTE_LINES: readonly RegExp[] = [
+	/^‹[^\n]*›[ \t]*$/,
+	/^ *‹… \d+ more›[ \t]*$/,
+	/^ *‹pending [^\n]*›[ \t]*$/,
+	/^ *‹question [^\n]*›[ \t]*$/,
+	/^ *‹plan [^\n]*›[ \t]*$/,
+];
 /** The note under a question put to a person (`Ask`), indented like the block's children. */
 const QUESTION_LINE = /^( *)‹question [^\n]*›[ \t]*$/;
 /** A block's line: its bullet, indented by its depth. */
@@ -401,7 +411,7 @@ function readNotes(markdown: string): { text: string; questions: Set<number> } {
 			out.push(line);
 			continue;
 		}
-		if (!ANNOTATION_LINE.test(line)) {
+		if (!NOTE_LINES.some((note) => note.test(line))) {
 			out.push(line);
 			continue;
 		}

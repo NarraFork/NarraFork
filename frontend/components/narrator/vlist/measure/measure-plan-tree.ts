@@ -74,6 +74,12 @@ export const PLAN_TREE_TOGGLE_HIT = 24;
 export const PLAN_TREE_SUBTREE_GAP = 4;
 /** Gap between a preview's ellipsis and its label (px). */
 export const PLAN_TREE_PREVIEW_LABEL_GAP = 8;
+/**
+ * Room kept clear at the right of a box that scrolls, for the list's overlay scrollbar (its
+ * strip is `ContentScrollbars`' 8px hit size): the rows are laid out this much narrower then, so
+ * the quick controls at their right never sit under the thumb.
+ */
+export const PLAN_TREE_SCROLL_GUTTER = 8;
 /** Inline code runs carry the markdown path's chip padding (`INLINE_CODE_EXTRA_WIDTH`). */
 const INLINE_CODE_EXTRA_WIDTH = 10;
 /** The ellipsis a clamped text or a preview ends with. */
@@ -129,6 +135,8 @@ export interface PlanTreePreviewLayout {
 	labelWidth: number;
 	/** Children after the first. */
 	rest: number;
+	/** The first child's first line as plain text (the preview's accessible name). */
+	text: string;
 }
 
 /** One row, laid out (box-local coordinates, inside the padding). */
@@ -354,6 +362,7 @@ export function layoutPlanTree(
 				label,
 				labelWidth,
 				rest: preview.rest,
+				text: preview.first.plain.split("\n")[0] ?? "",
 			};
 			height = top + lineHeight;
 		}

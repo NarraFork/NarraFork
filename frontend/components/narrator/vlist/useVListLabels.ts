@@ -847,7 +847,7 @@ export function useVListLabels(): VListLabels {
 					expand: t("outlinePlan.tree.expand"),
 					collapse: t("outlinePlan.tree.collapse"),
 					altHint: t("outlinePlan.tree.altHint"),
-					subtree: t("outlinePlan.tree.subtree"),
+					subtree: (title: string) => t("outlinePlan.tree.subtree", { title }),
 					subtreeExpand: t("outlinePlan.tree.subtreeExpand"),
 					subtreeCollapse: t("outlinePlan.tree.subtreeCollapse"),
 					showInside: t("outlinePlan.tree.showInside"),

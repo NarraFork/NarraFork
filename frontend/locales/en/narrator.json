@@ -2830,7 +2830,7 @@
 			"expand": "Expand",
 			"collapse": "Collapse",
 			"altHint": "Alt+click: everything inside",
-			"subtree": "Everything inside",
+			"subtree": "Expand/collapse everything in “{{title}}”",
 			"subtreeExpand": "Expand everything inside",
 			"subtreeCollapse": "Collapse everything inside",
 			"detailsMore": "{{n}} more ▸",

@@ -156,6 +156,24 @@ describe("parsing the plan's markdown", () => {
 		expect(noted?.root.children.map((c) => c.role)).toEqual(["point", "background", "point"]);
 	});
 
+	test("a question whose options hold a › is still a question (review round 2)", () => {
+		const t = parsePlanTree(
+			[
+				"- [ ] Title",
+				"  - Which import path?",
+				"    ‹question for human:bob · 1. keep › v1  2. Settings › Privacy · open›",
+				"  - The importer fails every night.",
+				"  - [ ] Phase 1",
+			].join("\n"),
+		);
+		expect(t?.root.children.map((c) => [c.role, !!c.question])).toEqual([
+			["point", true],
+			["background", false],
+			["point", false],
+		]);
+		expect(t?.size).toBe(4);
+	});
+
 	test("a legacy first paragraph far past a background's length is a point", () => {
 		const long = (n: number) =>
 			parsePlanTree(serializeMarkdownOutline([step("Title", [item("景".repeat(n)), step("P")])]))

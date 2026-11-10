@@ -87,6 +87,20 @@ function KeyboardHost({
 	);
 }
 
+/** What the plain permission form decided (`decision:feedback`), in order. */
+const decided: string[] = [];
+
+export function decisions(): string[] {
+	return [...decided];
+}
+
+/** The focused element's text (a button's label without the ⏎ hint), or null for the page. */
+export function focusedLabel(): string | null {
+	const el = document.activeElement as HTMLElement | null;
+	if (!el || el === document.body) return null;
+	return el.textContent?.replace("⏎", "").trim() ?? "";
+}
+
 /** Mount the approval form of one waiting plan (under the panel's keyboard navigation). */
 export function open(permission: PendingPermission, options: { keyboard?: boolean } = {}): void {
 	// The diff's page subscription rides the narrator socket, as in the app.
@@ -101,16 +115,20 @@ export function open(permission: PendingPermission, options: { keyboard?: boolea
 					<div style={{ maxWidth: 720, padding: 16, boxSizing: "border-box" }}>
 						{options.keyboard ? (
 							<KeyboardHost permission={permission}>
-								<InlinePermission permission={permission} />
+								<InlinePermission permission={permission} onDecision={record} />
 							</KeyboardHost>
 						) : (
-							<InlinePermission permission={permission} />
+							<InlinePermission permission={permission} onDecision={record} />
 						)}
 					</div>
 				</QueryClientProvider>
 			</MantineProvider>
 		</I18nextProvider>,
 	);
+}
+
+function record(_id: string, decision: "allow" | "deny", feedback?: string): void {
+	decided.push(`${decision}:${feedback ?? ""}`);
 }
 
 export function socketConnected(): boolean {
