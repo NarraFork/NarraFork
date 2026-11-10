@@ -39,6 +39,7 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import { useUndoOutlineDecision, wasUndoneHere } from "../../../hooks/useOutlineReports";
 import { formatLocaleTime } from "../../../lib/intl-format";
+import { reportLineDisplay } from "../../../lib/outline-report-line";
 import { OutlineHrefLink, OutlineLink, type OutlineTarget } from "../outline-nav";
 import {
 	commitPath,
@@ -116,6 +117,15 @@ export function useDigestSpaceLabel(): (
 
 const wrap = { overflowWrap: "anywhere", minWidth: 0 } as const;
 
+/**
+ * A block's title as the report shows it. A subagent report's container line reads in the
+ * reader's language and time zone, as on the page it links to; any other title is as it is.
+ */
+function blockTitle(ctx: ItemContext, title: string | null): string {
+	if (!title) return ctx.t("report.untitled");
+	return reportLineDisplay(title, { t: ctx.t as never, locale: ctx.lang }) ?? title;
+}
+
 function TitleLink({
 	ctx,
 	title,
@@ -125,7 +135,7 @@ function TitleLink({
 	title: string | null;
 	target: OutlineTarget | null;
 }) {
-	const text = title || ctx.t("report.untitled");
+	const text = blockTitle(ctx, title);
 	if (!target)
 		return (
 			<Text size="sm" fw={500} style={wrap}>
@@ -540,11 +550,11 @@ function KnowledgeItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestKno
 											onClick={() => ctx.onOpen?.()}
 											data-testid="outline-report-block-link"
 										>
-											{block.title || t("report.untitled")}
+											{blockTitle(ctx, block.title)}
 										</Anchor>
 									) : (
 										<Text size="xs" style={wrap}>
-											{block.title || t("report.untitled")}
+											{blockTitle(ctx, block.title)}
 										</Text>
 									)}
 									{block.deleted && (

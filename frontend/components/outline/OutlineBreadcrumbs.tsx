@@ -3,6 +3,7 @@ import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import { planCrumbs } from "../../lib/outline-crumbs";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
@@ -29,19 +30,23 @@ export function OutlineBreadcrumbs({
 	search: OutlineBlockSearch;
 	path?: OutlineBlockViewResponse["path"];
 }) {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
 	const plan = planCrumbs(path ?? view.path);
 	const targetOf = (ancestor: Ancestor) =>
 		outlineBlockTarget(view.space.id, ancestor.id, search.view, search.asOf);
+	// An ancestor that is a subagent report's container reads as on its own page.
+	const labelOf = (ancestor: Ancestor) =>
+		reportLineDisplay(ancestor.title, { t, locale: i18n?.language }) ??
+		(ancestor.title || ancestor.sid);
 	const crumb = (ancestor: Ancestor, last: boolean) => (
 		<OutlineLink
 			to={targetOf(ancestor)}
 			className={classes.crumb}
 			data-last={last || undefined}
-			title={ancestor.title}
+			title={labelOf(ancestor)}
 		>
-			{ancestor.title || ancestor.sid}
+			{labelOf(ancestor)}
 		</OutlineLink>
 	);
 	const separator = (
@@ -94,7 +99,7 @@ export function OutlineBreadcrumbs({
 									key={ancestor.id}
 									renderRoot={(props) => <OutlineLink {...props} to={targetOf(ancestor)} />}
 								>
-									<span className={classes.crumbMenuItem}>{ancestor.title || ancestor.sid}</span>
+									<span className={classes.crumbMenuItem}>{labelOf(ancestor)}</span>
 								</Menu.Item>
 							))}
 						</Menu.Dropdown>

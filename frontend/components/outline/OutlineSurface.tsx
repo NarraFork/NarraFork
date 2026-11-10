@@ -79,6 +79,7 @@ import {
 } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import { forgetOutlineRecent, recordOutlineRecent } from "../../lib/outline-recents";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { MANTINE_SM_BREAKPOINT_PX, MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
@@ -195,7 +196,7 @@ function SurfaceBody({
 	actions,
 	history,
 }: OutlineSurfaceProps) {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const mode: OutlineViewMode = viewMode ?? "facts";
 	// The current page is edited live while on screen, unless live editing turned out
 	// unavailable here.
@@ -337,7 +338,11 @@ function SurfaceBody({
 	);
 
 	const root = view?.blocks.find((block) => block.id === view.rootId);
-	const rootTitle = root ? titleOf(root.content) || root.sid : "";
+	const storedTitle = root ? titleOf(root.content) || root.sid : "";
+	// A subagent report's container, focused: its line as people read it (their language and
+	// time zone), here, on the tab and in "recent".
+	const rootTitle =
+		(root && reportLineDisplay(root.content, { t, locale: i18n?.language })) ?? storedTitle;
 
 	// Remember pages actually opened (their current state), and forget ones that are gone.
 	const missing = query.error instanceof ApiError && query.error.status === 404;
@@ -436,11 +441,11 @@ function SurfaceBody({
 			? focusInfo
 			: null;
 	const seedRoot = seed && !liveCrumbs ? seed.blocks.find((b) => b.id === seed.rootId) : undefined;
-	const crumbs = liveCrumbs
-		? { title: liveCrumbs.title || liveCrumbs.sid, path: liveCrumbs.path }
+	const crumbPath = liveCrumbs
+		? liveCrumbs.path
 		: seed && seedRoot && editing
-			? { title: titleOf(seedRoot.content) || seedRoot.sid, path: seed.path }
-			: null;
+			? seed.path
+			: undefined;
 
 	let content: React.ReactNode;
 	let drawer: React.ReactNode = null;
@@ -492,7 +497,7 @@ function SurfaceBody({
 		content = (
 			<>
 				<div className={classes.toolbar}>
-					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbs?.path} />
+					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbPath} />
 					<Group gap="xs" wrap="nowrap">
 						{history && (
 							<Group gap={2} wrap="nowrap">
@@ -626,7 +631,7 @@ function SurfaceBody({
 										{rootTitle}
 									</Title>
 								</Group>
-								{root.content.trim() !== rootTitle && (
+								{root.content.trim() !== storedTitle && (
 									<Box className={classes.content} mb="xs">
 										<OutlineBlockBody content={root.content} />
 									</Box>
