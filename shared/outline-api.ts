@@ -179,6 +179,11 @@ export interface OutlineViewBlock {
 	 * it (a mark only).
 	 */
 	pending: string[];
+	/**
+	 * On a subagent report's container: the subagent's session title, when the reader may read
+	 * that session (absent otherwise, and past the containers one view names).
+	 */
+	reportFrom?: string;
 }
 
 export interface OutlineBlockViewResponse {
@@ -191,6 +196,11 @@ export interface OutlineBlockViewResponse {
 	current: boolean;
 	/** The view applied: `all` when the root is a task or under one. */
 	view: OutlineViewMode;
+	/**
+	 * The root is under a task or inside a subagent report: its blocks are details, folded by
+	 * default (`shared/outline-fold.ts`). Absent from an older server: false.
+	 */
+	rootInTask?: boolean;
 	/** The root's ancestors, the page first. */
 	path: Array<{ id: string; sid: string; title: string }>;
 	/** The blocks shown, the root first, breadth first. */
@@ -374,6 +384,8 @@ export interface OutlineViewStatePutRequest {
 export const OUTLINE_PENDING_API_LIMITS = {
 	/** Tasks one "in progress" marker lists. */
 	inProgressItems: 10,
+	/** Unanswered questions of a space a page's summary names. */
+	openQuestions: 50,
 	/** Characters of a rejection's reason. */
 	maxReasonChars: 500,
 } as const;
@@ -419,6 +431,23 @@ export interface OutlinePagePendingResponse {
 	pending: OutlinePendingSummary[];
 	/** Locked tasks of the page. */
 	locks: OutlineLockView[];
+	/**
+	 * Blocks of the page's space that are questions put to a person and not answered yet (the
+	 * oldest {@link OUTLINE_PENDING_API_LIMITS.openQuestions}): a folded row counts the ones it
+	 * hides. Absent from an older server.
+	 */
+	questions?: string[];
+}
+
+/** Limits of `GET /spaces/:spaceId/report-authors`: who wrote the subagent reports of a page. */
+export const OUTLINE_REPORT_AUTHORS_API_LIMITS = {
+	/** Report containers one request names. */
+	maxIds: 20,
+} as const;
+
+/** The subagent's session title by report container, for those the reader may be told. */
+export interface OutlineReportAuthorsResponse {
+	authors: Record<string, string>;
 }
 
 /** One block of a pending change: as proposed against, as proposed, and as it is now. */

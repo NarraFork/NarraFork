@@ -1,6 +1,7 @@
 import {
 	OUTLINE_BLOCK_ID_RE,
 	OUTLINE_PENDING_API_LIMITS,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_RESOLVE_REQUEST_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
@@ -82,6 +83,20 @@ export const outlineResolveQuerySchema = z
 	.refine((query) => query.commit === undefined || query.space !== undefined, {
 		message: "commit needs space",
 	});
+
+/** The report containers to name the subagents of (`GET /spaces/:spaceId/report-authors`). */
+export const outlineReportAuthorsQuerySchema = z.object({
+	ids: z
+		.string()
+		.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds * (OUTLINE_VIEW_STATE_LIMITS.maxIdChars + 1))
+		.transform((value) => value.split(",").filter(Boolean))
+		.pipe(
+			z
+				.array(z.string().regex(OUTLINE_BLOCK_ID_RE))
+				.min(1)
+				.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds),
+		),
+});
 
 /** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
 export const outlineViewStatePutSchema = z.object({

@@ -110,6 +110,7 @@ import { linkTitles } from "./link-display";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import type { OutlineAskJson, OutlineTaskJson } from "./model";
 import { loadBodies, loadBodiesWithin, readSubtree } from "./read";
+import { OUTLINE_REPORT_ACTOR } from "./report-authors";
 import { OUTLINE_REPORT_LIMITS, type ReportBlock, type ReportConversion } from "./report-text";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineStore, OutlineTaskClaimRow } from "./store/port";
@@ -126,7 +127,7 @@ import { type OutlineOp, writeOutline } from "./write";
 /** The system actor of the commit that hands a task to a subagent. */
 export const OUTLINE_DELEGATION_ACTOR = "outline-delegate";
 /** The system actor of the commit that attaches a subagent's report under its task. */
-export const OUTLINE_REPORT_ACTOR = "outline-report";
+export { OUTLINE_REPORT_ACTOR };
 
 export const OUTLINE_DELEGATION_LIMITS = {
 	/** UTF-8 bytes of the instructions written from the task tree (the caller's prompt aside). */
