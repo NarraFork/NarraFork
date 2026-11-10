@@ -4778,8 +4778,9 @@ export async function addOutlineTaskForPlugin(
 	});
 	let started = false;
 	let notStarted: PluginTaskNotStarted | undefined;
+	let status: string = task.status;
 	if (input.start === true) {
-		notStarted = await pluginStartBlocker(task.sessionId, task.status);
+		notStarted = await pluginStartBlocker(task.sessionId, task);
 		if (!notStarted) {
 			const { readNarrator } = await import("./outline/access-reads");
 			const owner = (await readNarrator(task.sessionId))?.ownerUserId ?? null;
@@ -4799,13 +4800,39 @@ export async function addOutlineTaskForPlugin(
 				})
 			).started;
 			if (!started) notStarted = "not_started";
+			// The start claims the task before the continuation decides (review round 2, R1): a
+			// start that declined after all gives a task it put in progress back, and the answer
+			// carries the status as it is now.
+			const { outlineStore } = await import("./outline/store");
+			let now = (await outlineStore.getBlock(task.blockId))?.taskJson?.status;
+			if (!started && task.status === "todo" && now === "doing") {
+				const { setPluginTaskStatus } = await import("./outline/plugin-tasks");
+				await setPluginTaskStatus({
+					narratorId: task.sessionId,
+					pluginId: input.pluginId,
+					blockId: task.blockId,
+					status: "todo",
+					isRunning: isLoopRunning,
+				})
+					.then(() => {
+						now = "todo";
+					})
+					.catch((error: unknown) =>
+						logger.warn("Could not give back a task a plugin's start claimed", {
+							narratorId: task.sessionId,
+							blockId: task.blockId,
+							error: String(error),
+						}),
+					);
+			}
+			if (now) status = now;
 		}
 	}
 	return {
 		blockId: task.blockId,
 		address: task.address,
 		added: task.added,
-		status: task.status,
+		status,
 		started,
 		...(notStarted ? { notStarted } : {}),
 	};
@@ -4815,19 +4842,24 @@ export async function addOutlineTaskForPlugin(
  * Why a plugin's `task_add` with `start` does not start the session (outline P2 PR 12a, review
  * S1): the task is finished or cancelled already; the session is running (or not idle); it is in
  * plan mode; its continuation is `off` (a plugin does not override the person's setting, unlike
- * `/goal` and the board, which a person sends); or the continuation declined (`not_started`).
+ * `/goal` and the board, which a person sends); its continuation mode would not continue on this
+ * task (`continuation_mode`: `protectedOnly` with no open task of a person, the added one
+ * included; `blockStop` when the task waits), decided BEFORE anything is claimed (review round 2,
+ * R1); or the continuation declined all the same (`not_started`).
  */
 export type PluginTaskNotStarted =
 	| "finished"
 	| "busy"
 	| "plan_mode"
 	| "continuation_off"
+	| "continuation_mode"
 	| "not_started";
 
 async function pluginStartBlocker(
 	narratorId: string,
-	status: string,
+	task: { blockId: string; status: string },
 ): Promise<PluginTaskNotStarted | undefined> {
+	const status = task.status;
 	if (status !== "todo" && status !== "doing") return "finished";
 	if (isLoopRunning(narratorId)) return "busy";
 	const narrator = await narratorService.getById(narratorId);
@@ -4838,6 +4870,23 @@ async function pluginStartBlocker(
 		normalizeAutoContinuationMode(settings.agent.autoContinuationMode),
 	);
 	if (mode === "off") return "continuation_off";
+	if (mode === "protectedOnly") {
+		// Read only (no promotion, no preferred task): nothing is claimed by asking.
+		const source = await taskSourceForNarrator(narratorId);
+		const target = await source.prepareContinuation({ promoteTodo: false });
+		if (target.protectedOpenCount === 0) return "continuation_mode";
+	}
+	if (mode === "blockStop") {
+		const { outlineStore } = await import("./outline/store");
+		const block = await outlineStore.getBlock(task.blockId);
+		if (block?.taskJson) {
+			const { deriveOutlineTaskWaits, isWaiting } = await import("./outline/tasks");
+			const waits = await deriveOutlineTaskWaits([
+				{ id: block.id, spaceId: block.spaceId, taskJson: block.taskJson },
+			]);
+			if (isWaiting(waits.get(block.id))) return "continuation_mode";
+		}
+	}
 	return undefined;
 }
 

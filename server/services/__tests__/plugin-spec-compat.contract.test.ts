@@ -544,6 +544,23 @@ describe("the overwrite in an outline session", () => {
 		expect(again.status).toBe("succeeded");
 		expect(await notes()).toEqual([`Blocked (marked by plugin ${PLUGIN})`]);
 		expect(await list()).toEqual([{ text: "Stuck", status: "blocked", protected: false }]);
+		// A person moves the note away: the task no longer reads blocked, and marking it again
+		// brings the same note back under it (round 2, nit 3).
+		const [noteRow] = await outlineStore.listChildren(space.id, task?.id as string, 10);
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "move", block: { id: noteRow?.id as string }, parent: null }],
+			actor: { kind: "human", id: "pat" },
+			responsibleUserId: null,
+		});
+		expect(await list()).toEqual([{ text: "Stuck", status: "doing", protected: false }]);
+		const marked = await command("spec_write", {
+			narratorId: id,
+			uri: "tasks.json",
+			content: blocked,
+		});
+		expect(marked.status).toBe("succeeded");
+		expect(await notes()).toEqual([`Blocked (marked by plugin ${PLUGIN})`]);
 		// A status the plugin sets through the block command ends the mark too.
 		await command("task_set_status", {
 			narratorId: id,

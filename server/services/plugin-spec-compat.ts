@@ -74,6 +74,7 @@ import {
 	OUTLINE_PLUGIN_TASK_LIMITS,
 	outlineRevisionId,
 	PLUGIN_TASK_TEXT,
+	type PluginBlockedNote,
 	PluginTaskError,
 	type PluginTaskSession,
 	pluginBlockedNoteSid,
@@ -132,7 +133,7 @@ export interface SpecCompatEntry {
 	status: SpecTaskStatus;
 	protected: boolean;
 	/** The blocked mark a plugin wrote under it (its note), when there is one, live or not. */
-	blockedNote: { id: string; live: boolean } | null;
+	blockedNote: PluginBlockedNote | null;
 }
 
 export interface SpecCompatList {
@@ -435,7 +436,16 @@ export async function writeSpecTasksCompat(args: {
 		// The blocked mark: written once, brought back when someone took it, taken by another status.
 		const markBlocked = (taskId: string, note: SpecCompatEntry["blockedNote"]) => {
 			if (note?.live) return;
-			if (note) ops.push({ op: "restore", block: { id: note.id }, parent: { id: taskId } });
+			if (note?.deleted)
+				ops.push({ op: "restore", block: { id: note.id }, parent: { id: taskId } });
+			else if (note)
+				// Moved away by someone: back under its task, first (its short id is taken).
+				ops.push({
+					op: "move",
+					block: { id: note.id },
+					parent: { id: taskId },
+					position: { first: true },
+				});
 			else
 				ops.push({
 					op: "insert",

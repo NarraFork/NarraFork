@@ -74,7 +74,7 @@ beforeEach(async () => {
 });
 
 async function session(
-	options: { traits?: string[]; continuation?: "off" | "blockStop" } = {},
+	options: { traits?: string[]; continuation?: "off" | "blockStop" | "protectedOnly" } = {},
 ): Promise<string> {
 	const id = `plugin-start-${crypto.randomUUID()}`;
 	await db.insert(narrators).values({
@@ -136,6 +136,79 @@ describe("task_add with start", () => {
 		});
 		expect(added).toMatchObject({ added: true, started: false, notStarted: "continuation_off" });
 		expect((await outlineStore.getBlock(added.blockId))?.taskJson?.status).toBe("todo");
+		await Bun.sleep(100);
+		expect(providerInputs).toHaveLength(0);
+	});
+
+	test("protectedOnly (the default): nothing is claimed for a task it would not continue on (R1)", async () => {
+		const id = await session({ continuation: "protectedOnly" });
+		const added = await addOutlineTaskForPlugin(id, {
+			pluginId: "com.example.lead",
+			text: "Ordinary work",
+			start: true,
+		});
+		expect(added).toMatchObject({
+			added: true,
+			status: "todo",
+			started: false,
+			notStarted: "continuation_mode",
+		});
+		expect((await outlineStore.getBlock(added.blockId))?.taskJson?.status).toBe("todo");
+		expect(await outlineStore.getTaskClaims([added.blockId])).toEqual([]);
+		await Bun.sleep(100);
+		expect(providerInputs).toHaveLength(0);
+		// A protected task is a person's: the mode continues on it, so it starts.
+		const goal = await addOutlineTaskForPlugin(id, {
+			pluginId: "com.example.lead",
+			text: "Protected work",
+			protected: true,
+			start: true,
+		});
+		expect(goal).toMatchObject({ started: true, status: "doing" });
+		await idleAfterTurns(id, 1);
+		closeNarrator(id);
+	});
+
+	test("blockStop: a task that waits is not claimed (R1)", async () => {
+		const id = await session({ continuation: "blockStop" });
+		const first = await addOutlineTaskForPlugin(id, {
+			pluginId: "com.example.lead",
+			text: "Before",
+		});
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		const { writeOutline } = await import("../outline/write");
+		const page = await writeOutline({
+			spaceId: space?.id as string,
+			ops: [
+				{
+					op: "insert",
+					tempId: "p",
+					parent: null,
+					content: "Holder",
+				},
+				{
+					op: "insert",
+					parent: { tempId: "p" },
+					content: "Waiting task",
+					task: { status: "todo", depends: [{ target: first.address, label: null }] },
+				},
+			],
+			actor: { kind: "human", id: OWNER },
+			responsibleUserId: OWNER,
+		});
+		const again = await addOutlineTaskForPlugin(id, {
+			pluginId: "com.example.lead",
+			text: "Waiting task",
+			parentBlockId: page.results[0]?.blockId as string,
+			start: true,
+		});
+		expect(again).toMatchObject({
+			added: false,
+			status: "todo",
+			started: false,
+			notStarted: "continuation_mode",
+		});
+		expect(await outlineStore.getTaskClaims([again.blockId])).toEqual([]);
 		await Bun.sleep(100);
 		expect(providerInputs).toHaveLength(0);
 	});

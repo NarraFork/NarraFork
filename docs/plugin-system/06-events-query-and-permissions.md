@@ -453,13 +453,13 @@ type CommandResult<T> =
 | 命令 | 输入 | 返回 |
 |---|---|---|
 | `narrafork.narrator.tasks_read` | `narratorId`、可选 `cursor`、`limit ≤ 100` | 会话空间里的任务，文档顺序（行为边界页除外）：`blockId`、`address`、`text`（≤1000 字）、`status`（todo/doing/done/cancelled）、`waiting`、`blocked`（插件标的受阻）、`humanCreated`、`parentBlockId`、`depth`、`versionSeq`，外加 `backend`、`spaceKey`、`seq`、`nextCursor` |
-| `narrafork.narrator.task_add` | `narratorId`、`text`（≤1000）、可选 `parentBlockId`、`start`、`protected` | `blockId`、`address`、`added`（同样正文已在就是 false）、`status`、`started`，没开跑时 `notStarted`（`finished`/`busy`/`plan_mode`/`continuation_off`/`not_started`） |
+| `narrafork.narrator.task_add` | `narratorId`、`text`（≤1000）、可选 `parentBlockId`、`start`、`protected` | `blockId`、`address`、`added`（同样正文已在就是 false）、`status`、`started`，没开跑时 `notStarted`（`finished`/`busy`/`plan_mode`/`continuation_off`/`continuation_mode`/`not_started`） |
 | `narrafork.narrator.task_set_status` | `narratorId`、`blockId`、`status`、可选 `baseVersionSeq` | `blockId`、`address`、`status`、`versionSeq`、`changed` |
 | `narrafork.narrator.behavior_rules_set` | `narratorId`、`mode: upsert/clear`、`text`（≤2000） | 插件规程块的 `blockId`（清掉后为 null） |
 
 - 只对大纲根会话；Dynamic Spec 会话和子代理返回 `CONFLICT`（子代理没有自己的任务）。
 - 写入是会话的 system 提交，actor `plugin:<pluginId>`，责任人是会话负责人；加的任务管理者是插件。`protected: true` 记为人建任务（驱动 `protectedOnly` 续跑），不锁定（只有人锁定，D52）。
-- `start: true` 会让会话开跑，所以另外要 `command.narrator.send_message`（对同一个会话），没有就 `PERMISSION_DENIED`、什么都不写；会话的续跑是 `off` 时不开跑（插件不越过人的设置），返回 `notStarted: "continuation_off"`。
+- `start: true` 会让会话开跑，所以另外要 `command.narrator.send_message`（对同一个会话），没有就 `PERMISSION_DENIED`、什么都不写；会话的续跑是 `off` 时不开跑（插件不越过人的设置），返回 `notStarted: "continuation_off"`。续跑档位不会接这条任务时（`protectedOnly` 而会话里没有未完成的受保护任务，或 `blockStop` 而这条任务在等待）也不开跑、不领取，返回 `notStarted: "continuation_mode"`。`status` 总是任务此刻的真实状态。
 - 插件不能把人建任务勾完成、取消或去掉人建标记（`CONFLICT`）；人锁定的任务不能勾完成或取消，它下面的任务不能取消，也不能往它下面加任务（`CONFLICT`，同 agent 受锁的约束）；别人在做、版本对不上照写入路径的规则拒绝（`CONFLICT`）。
 - 规程块：行为边界页上每个插件一个块，短 id 由插件 id 推出；被人删了下次 upsert 恢复。
 - 旧命令在大纲会话里的转换：`spec_tasks_get` 读会话空间的顶层任务（等待中的和插件标了受阻的读成 `blocked`，取消的不列，`protected` = 人建，`revisionId` 是 `outline:<空间 key>:<seq>`；超过 100 条时列全部未完成的，再用最近改过的已完成任务补满）；`spec_task_add` 等于 `task_add`；`spec_write tasks.json` 按正文比对转成一个提交（不在列表里的正文先和任务页上的任务比对；只取消任务页上未完成的直接子块，已完成的留着；`blocked` 写成进行中加一条插件的受阻说明，只写一次，不建提问；改人建的未完成任务、完成或取消人锁定的任务，整次拒绝）；`spec_write index.md` 整页替换会话空间 `index.md` 页上的笔记（页上的任务留着）；`spec_behavior_fence_update` 写插件规程块（子代理仍写它自己的旧 fence）。

@@ -354,6 +354,25 @@ describe("tasks_read", () => {
 			cursor: first.nextCursor,
 		});
 		expect(next.tasks.map((t) => t.text)).toEqual(["B", "C1", "C2"]);
+		// The cursor's task moved to another page: its old page is not read again (round 2, nit 1).
+		const head = await ok<{ tasks: Array<{ blockId: string; text: string }>; nextCursor: string }>(
+			"tasks_read",
+			{ narratorId: id, limit: 1 },
+		);
+		expect(head.tasks.map((t) => t.text)).toEqual(["A"]);
+		const moved = await human(id, [{ op: "insert", tempId: "z", parent: null, content: "Z" }]);
+		await human(id, [
+			{
+				op: "move",
+				block: { id: head.tasks[0]?.blockId as string },
+				parent: { id: moved.results[0]?.blockId as string },
+			},
+		]);
+		const rest = await ok<{ tasks: Array<{ text: string }> }>("tasks_read", {
+			narratorId: id,
+			cursor: head.nextCursor,
+		});
+		expect(rest.tasks.map((t) => t.text)).toEqual(["B", "C1", "C2", "A"]);
 		expect(await refused("tasks_read", { narratorId: id, cursor: "not-a-cursor" })).toBe(
 			"INVALID_PARAMS",
 		);

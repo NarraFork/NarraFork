@@ -90,6 +90,11 @@ export const OUTLINE_PLUGIN_TASK_LIMITS = {
 	rowsPerRead: 20_000,
 	/** Pages one listing of a space's pages takes. */
 	pageBatch: 50,
+	/**
+	 * Ancestors read one by one (a lock above a block, the place of a cursor's deleted task): a
+	 * block deeper than this is taken as not under a lock, and its cursor as past its page.
+	 */
+	ancestorReads: 64,
 	/** UTF-8 bytes of a read cursor. */
 	cursorBytes: 4096,
 } as const;
@@ -289,7 +294,7 @@ async function storedPath(
 ): Promise<OutlinePathStep[] | null> {
 	const steps: OutlinePathStep[] = [];
 	let id: string | null = blockId;
-	for (let depth = 0; id !== null && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+	for (let depth = 0; id !== null && depth < OUTLINE_PLUGIN_TASK_LIMITS.ancestorReads; depth++) {
 		const [meta] = await store.getBlockMetas(spaceId, { ids: [id] });
 		if (!meta) return null;
 		steps.unshift([meta.orderKey, meta.id]);
@@ -369,6 +374,12 @@ export async function walkSessionTasks(
 			resumeAfter !== undefined && !resumeLive
 				? await storedPath(store, space.id, resumeAfter, page.id)
 				: null;
+		// The cursor's task is on another page now (or too deep to place): nothing of this page is
+		// read again; the read goes on after it (round 2, nit 1).
+		if (resumeAfter !== undefined && !resumeLive && after === null) {
+			lastPage = [page.orderKey, page.id];
+			return;
+		}
 		// Depth first in document order, without recursion (an outline may be deep).
 		const stack: Array<{
 			row: OutlineStructureRow;
@@ -621,7 +632,7 @@ export async function personLockOver(
 	blockId: string,
 ): Promise<{ id: string; sid: string; self: boolean } | null> {
 	let id: string | null = blockId;
-	for (let depth = 0; id !== null && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+	for (let depth = 0; id !== null && depth < OUTLINE_PLUGIN_TASK_LIMITS.ancestorReads; depth++) {
 		const [meta] = await store.getBlockMetas(spaceId, { ids: [id] });
 		if (!meta) return null;
 		if (isPersonLock(meta.taskJson)) return { id: meta.id, sid: meta.sid, self: depth === 0 };
@@ -639,18 +650,35 @@ export function pluginBlockedNoteSid(taskId: string): string {
 	return `pb${createHash("sha256").update(`plugin-blocked\u0000${taskId}`).digest("hex").slice(0, 12)}`;
 }
 
+export interface PluginBlockedNote {
+	id: string;
+	/** Under its task and not deleted: the task reads blocked. */
+	live: boolean;
+	/** Still under its task (deleted or not). */
+	placed: boolean;
+	deleted: boolean;
+}
+
 /** The blocked notes of these tasks, by task id: live, or deleted (a person or agent took it). */
 export async function readPluginBlockedNotes(
 	taskIds: readonly string[],
 	spaceId: string,
 	store: OutlineStore = outlineStore,
-): Promise<Map<string, { id: string; live: boolean }>> {
-	const out = new Map<string, { id: string; live: boolean }>();
+): Promise<Map<string, PluginBlockedNote>> {
+	const out = new Map<string, PluginBlockedNote>();
 	if (taskIds.length === 0) return out;
 	const bySid = new Map(taskIds.map((id) => [pluginBlockedNoteSid(id), id]));
 	for (const meta of await store.getBlockMetas(spaceId, { sids: [...bySid.keys()] })) {
 		const taskId = bySid.get(meta.sid);
-		if (taskId && meta.parentId === taskId) out.set(taskId, { id: meta.id, live: !meta.deleted });
+		// A note someone moved elsewhere no longer marks the task; it is still its note (its
+		// short id is taken), so a new mark brings it back under the task (`placed` false).
+		if (taskId)
+			out.set(taskId, {
+				id: meta.id,
+				live: !meta.deleted && meta.parentId === taskId,
+				placed: meta.parentId === taskId,
+				deleted: meta.deleted,
+			});
 	}
 	return out;
 }
