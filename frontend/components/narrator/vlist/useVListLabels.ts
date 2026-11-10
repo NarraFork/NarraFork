@@ -856,6 +856,12 @@ export function useVListLabels(): VListLabels {
 					showWhole: t("outlinePlan.tree.showWhole"),
 					showLess: t("outlinePlan.tree.showLess"),
 					more: (count: number) => t("outlinePlan.tree.more", { count }),
+					status: {
+						todo: t("sidecar.taskNotice.statusTodo"),
+						doing: t("sidecar.taskNotice.statusDoing"),
+						done: t("sidecar.taskNotice.statusDone"),
+						cancelled: t("sidecar.taskNotice.statusCancelled"),
+					},
 				},
 			},
 			toolCallGroup: {

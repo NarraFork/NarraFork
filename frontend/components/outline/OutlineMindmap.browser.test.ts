@@ -1314,11 +1314,11 @@ test("page: a node's frame icons take real clicks: the checkbox cycles, the arro
 		await settle(a);
 		await a.call((f) => f.mapFlush());
 	};
-	expect(await part(task, "ob-check")).toMatchObject({ icon: "square", checked: "false" });
+	expect(await part(task, "ob-check")).toMatchObject({ icon: "circle", checked: "false" });
 	await click(task, "ob-check");
-	expect(await part(task, "ob-check")).toMatchObject({ icon: "square-half", checked: "mixed" });
+	expect(await part(task, "ob-check")).toMatchObject({ icon: "circle-half-2", checked: "mixed" });
 	await click(task, "ob-check");
-	expect(await part(task, "ob-check")).toMatchObject({ icon: "square-check", checked: "true" });
+	expect(await part(task, "ob-check")).toMatchObject({ icon: "check", checked: "true" });
 	expect(serverOutline(pageId)).toBe("- [x] 任务\n- 父块\n  - 子块");
 	expect(await part(parent, "ob-arrow")).toMatchObject({ icon: "chevron-down" });
 	await click(parent, "ob-arrow");

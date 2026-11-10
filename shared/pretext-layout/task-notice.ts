@@ -29,6 +29,7 @@
  */
 
 import { outlineAddressPath } from "../outline-links";
+import { isOutlineStatusKey, OUTLINE_STATUS_TONE, type OutlineStatusKey } from "../outline-status";
 import {
 	coerceOutlineTasksViewDisplay,
 	OUTLINE_TASKS_VIEW_KEY,
@@ -42,10 +43,12 @@ import type { SideCarBody, SideCarTaskEntry } from "../sidecar-body";
 
 export type TaskNoticeVariant = "turnEnd" | "edited" | "interrupt" | "view" | "answers";
 
-/** A status chip: its words and its Mantine colour. */
+/** A status chip: its words, its Mantine colour and, for a task's state, which state it is. */
 export interface TaskNoticeChip {
 	label: string;
 	color: string;
+	/** The state the chip says: drawn with the state's icon (`outline-icons.ts`). */
+	status?: OutlineStatusKey;
 }
 
 /** One task line of a notice. Every field is height-neutral: a row is one line. */
@@ -61,6 +64,11 @@ export interface TaskNoticeRow {
 	statusFrom?: TaskNoticeChip;
 	/** Small chips after the title (set by a person, locked, protected). */
 	marks?: string[];
+	/**
+	 * Which of `marks` say a task state (a lock), by index: drawn as that state's chip, with its
+	 * icon. Absent when none does.
+	 */
+	markStatus?: Array<OutlineStatusKey | null>;
 	/** What changed, in the reader's words (dimmed, after the title). */
 	note?: string;
 	/** A row that names no task ("3 more not listed"): dimmed text only. */
@@ -159,15 +167,6 @@ function label(labels: Labels, key: string, params?: Record<string, string | num
 	return out;
 }
 
-const STATUS_COLOR: Record<string, string> = {
-	todo: "gray",
-	doing: "blue",
-	done: "green",
-	cancelled: "gray",
-	waiting: "orange",
-	delegated: "violet",
-};
-
 const STATUS_KEY: Record<string, string> = {
 	todo: "taskNoticeStatusTodo",
 	doing: "taskNoticeStatusDoing",
@@ -180,7 +179,9 @@ const STATUS_KEY: Record<string, string> = {
 function chip(status: string | undefined | null, labels: Labels): TaskNoticeChip | undefined {
 	if (!status) return undefined;
 	const key = STATUS_KEY[status];
-	return key ? { label: label(labels, key), color: STATUS_COLOR[status] ?? "gray" } : undefined;
+	if (!key || !isOutlineStatusKey(status)) return undefined;
+	// The state's colour and icon are the outline's own (`shared/outline-status.ts`).
+	return { label: label(labels, key), color: OUTLINE_STATUS_TONE[status], status };
 }
 
 /** The row's title and link; a task with no address is plain text. */
@@ -242,6 +243,10 @@ function itemRow(item: OutlineTaskNoticeItem, labels: Labels, showBy: boolean): 
 		item.humanCreated ? label(labels, "taskNoticeMarkHumanCreated") : null,
 		item.locked ? label(labels, "taskNoticeMarkLocked") : null,
 	].filter((mark): mark is string => !!mark);
+	// The lock is a state with an icon of its own; it is the last mark when present.
+	const markStatus = item.locked
+		? marks.map((_, i) => (i === marks.length - 1 ? ("locked" as const) : null))
+		: null;
 	const status = statusChange
 		? chip(statusChange.to, labels)
 		: chip(item.waiting ? "waiting" : item.status, labels);
@@ -251,6 +256,7 @@ function itemRow(item: OutlineTaskNoticeItem, labels: Labels, showBy: boolean): 
 		...(status ? { status } : {}),
 		...(from ? { statusFrom: from } : {}),
 		...(marks.length > 0 ? { marks } : {}),
+		...(markStatus ? { markStatus } : {}),
 		...(notes.length > 0 ? { note: notes.join(label(labels, "taskNoticeJoin")) } : {}),
 	};
 }

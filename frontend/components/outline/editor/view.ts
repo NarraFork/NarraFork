@@ -49,7 +49,7 @@ import {
 } from "prosemirror-state";
 import { ReplaceStep } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView, type NodeView } from "prosemirror-view";
-import { iconSvg, taskIconOf } from "../outline-icons";
+import { iconSvg, LOCK_CHIP_ICON, taskIconOf } from "../outline-icons";
 import {
 	applyChrome,
 	type BlockMark,
@@ -1664,7 +1664,8 @@ class BlockView implements NodeView {
 			const lock = document.createElement("span");
 			lock.className = "ob-lock";
 			lock.dataset.testid = "outline-lock-badge";
-			lock.textContent = chromeText.locked(mark.lockedBy);
+			// The lock's icon, then who: the same chip the read-only tree shows.
+			lock.append(iconSvg(LOCK_CHIP_ICON, lock.ownerDocument), chromeText.locked(mark.lockedBy));
 			this.marksEl.append(lock);
 		}
 		if (mark?.pending?.length) {

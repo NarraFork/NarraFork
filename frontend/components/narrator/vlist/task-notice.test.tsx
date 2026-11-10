@@ -219,9 +219,12 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 				title: "排查中断后无重试按钮",
 				href: href("mSsl3Ccf"),
 				address: `${K}/mSsl3Ccf`,
-				status: { label: "完成", color: "green" },
-				statusFrom: { label: "进行中", color: "blue" },
+				// A chip says which state it is: drawn with that state's icon, in its colour.
+				status: { label: "完成", color: "green", status: "done" },
+				statusFrom: { label: "进行中", color: "blue", status: "doing" },
 				marks: ["人建", "已锁定"],
+				// The lock is a state too (its own icon); "set by a person" is not.
+				markStatus: [null, "locked"],
 				note: "alice",
 			},
 			{
@@ -277,7 +280,11 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 			}),
 		).data as TaskNoticeData;
 		expect(spec.rows).toEqual([
-			{ title: "补测试", status: { label: "待办", color: "gray" }, marks: ["受保护"] },
+			{
+				title: "补测试",
+				status: { label: "待办", color: "gray", status: "todo" },
+				marks: ["受保护"],
+			},
 		]);
 		// More open than the guard lists: counted, as a lower bound, and the rest named as such.
 		const many = specOf(

@@ -211,7 +211,8 @@ describe("OutlineBlockTree", () => {
 				.querySelector(`[data-block-id="${id}"] [role="img"] svg`)
 				?.getAttribute("class")
 				?.split(" ");
-		expect(iconOf("t")).toContain("tabler-icon-square");
+		expect(iconOf("t")).toContain("tabler-icon-circle");
+		expect(iconOf("t")).toContain("nf-status");
 		expect(iconOf("q")).toContain("tabler-icon-help-circle");
 
 		const list = render(

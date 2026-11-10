@@ -590,15 +590,18 @@ test("the frame's icons take real clicks: the checkbox cycles the task, the arro
 		await settle(a, b);
 	};
 	expect(await icon(a, task, "ob-check")).toMatchObject({
-		icon: "square",
+		icon: "circle",
 		checked: "false",
 		text: "",
 	});
 	await caret(a, task, 1);
 	await click(task, "ob-check");
-	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-half", checked: "mixed" });
+	expect(await icon(b, task, "ob-check")).toMatchObject({
+		icon: "circle-half-2",
+		checked: "mixed",
+	});
 	await click(task, "ob-check");
-	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "square-check", checked: "true" });
+	expect(await icon(b, task, "ob-check")).toMatchObject({ icon: "check", checked: "true" });
 	expect(serverOutline(pageId)).toBe("- [x] 任务\n- 父块\n  - 子块");
 	// The caret stayed in the text (the frame is not editable and takes no caret).
 	expect(await head(a)).toMatchObject({ blockId: task, offset: 1 });

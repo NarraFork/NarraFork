@@ -3,16 +3,23 @@
  * read-only tree's Tabler icons as inline SVG (never text glyphs), with the frame's ARIA intact.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { LiveTaskChar } from "@shared/outline-live-protocol";
+import { MantineProvider } from "@mantine/core";
+import { LIVE_STATUS_OF_TASK, type LiveTaskChar } from "@shared/outline-live-protocol";
+import { OUTLINE_STATUS_KEYS, OUTLINE_STATUS_TONE } from "@shared/outline-status";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import { applyChrome, chromeText, createGutter } from "./editor/chrome";
+import { OutlineStatusChip, OutlineStatusIcon } from "./OutlineStatusIcon";
 import {
+	FOCUS_ICON,
 	FOLD_ICONS,
 	iconSvg,
+	LOCK_CHIP_ICON,
 	type OutlineIcon,
 	QUESTION_ICON,
 	rowMarker,
+	STATUS_CLASS,
+	STATUS_ICONS,
 	setIcon,
 	TASK_ICONS,
 	taskIconOf,
@@ -35,8 +42,10 @@ afterAll(() => {
 });
 
 const ICONS: OutlineIcon[] = [
-	...Object.values(TASK_ICONS),
+	...Object.values(STATUS_ICONS),
 	QUESTION_ICON,
+	FOCUS_ICON,
+	LOCK_CHIP_ICON,
 	...Object.values(FOLD_ICONS),
 ];
 
@@ -51,8 +60,14 @@ function drawing(svg: Element | null | undefined) {
 describe("outline icons", () => {
 	test("the frames draw exactly what the tree's React icons draw", () => {
 		for (const icon of ICONS) {
+			// A task state is drawn by `OutlineStatusIcon` (its badge); anything else by the icon.
+			const element = icon.status ? (
+				<OutlineStatusIcon status={icon.status} />
+			) : (
+				<icon.Icon size={16} />
+			);
 			const react = parseHTML(
-				`<!doctype html><html><body>${renderToStaticMarkup(<icon.Icon size={16} />)}</body></html>`,
+				`<!doctype html><html><body>${renderToStaticMarkup(element)}</body></html>`,
 			).document.querySelector("svg");
 			const dom = iconSvg(icon);
 			expect(drawing(dom).length).toBeGreaterThan(0);
@@ -64,7 +79,48 @@ describe("outline icons", () => {
 			// The same Tabler icon by name: the component's class is `tabler-icon-<name>`.
 			expect(dom.getAttribute("class")).toBe(react?.getAttribute("class")?.trim() ?? "");
 			expect(dom.getAttribute("aria-hidden")).toBe("true");
+			// A state's badge is the same element either way: its class and which state it is.
+			expect(dom.getAttribute("data-status")).toBe(react?.getAttribute("data-status") ?? null);
+			expect(dom.classList.contains(STATUS_CLASS)).toBe(icon.status !== undefined);
 		}
+	});
+
+	test("every task state has a badge of its own: a distinct icon, its state, a known colour", () => {
+		expect(Object.keys(STATUS_ICONS).sort()).toEqual([...OUTLINE_STATUS_KEYS].sort());
+		// Colour is never the only signal: no two states share an icon shape.
+		const names = Object.values(STATUS_ICONS).map((icon) => icon.name);
+		expect(new Set(names).size).toBe(names.length);
+		for (const key of OUTLINE_STATUS_KEYS) {
+			expect(STATUS_ICONS[key].status).toBe(key);
+			expect(OUTLINE_STATUS_TONE[key]).toBeString();
+			const svg = iconSvg(STATUS_ICONS[key]);
+			expect(svg.getAttribute("data-status")).toBe(key);
+			// An icon, never a character.
+			expect(svg.textContent).toBe("");
+		}
+		// A task's checkbox is its state's badge.
+		for (const status of ["todo", "doing", "done", "cancelled"] as const)
+			expect(TASK_ICONS[status]).toBe(STATUS_ICONS[status]);
+		// A state named for assistive technology is an image with that name; unnamed, decoration.
+		const named = renderToStaticMarkup(<OutlineStatusIcon status="waiting" label="Waiting" />);
+		expect(named).toContain('role="img"');
+		expect(named).toContain('aria-label="Waiting"');
+		expect(named).not.toContain("aria-hidden");
+		expect(renderToStaticMarkup(<OutlineStatusIcon status="waiting" />)).toContain(
+			'aria-hidden="true"',
+		);
+		// In words: a chip in the state's colour with the bare icon before the words.
+		const chip = parseHTML(
+			`<!doctype html><html><body>${renderToStaticMarkup(
+				<MantineProvider>
+					<OutlineStatusChip status="locked">Locked · alice</OutlineStatusChip>
+				</MantineProvider>,
+			)}</body></html>`,
+		).document.querySelector("[data-status-chip]");
+		expect(chip?.getAttribute("data-status-chip")).toBe("locked");
+		expect(chip?.textContent).toBe("Locked · alice");
+		expect(chip?.querySelector("svg")?.getAttribute("class")).toContain("tabler-icon-lock");
+		expect(chip?.querySelector("svg")?.classList.contains(STATUS_CLASS)).toBe(false);
 	});
 
 	test("one map from a task's status to its icon, for the live page's task characters too", () => {
@@ -82,10 +138,10 @@ describe("outline icons", () => {
 		const block = document.createElement("div");
 		const g = createGutter();
 		const cases: Array<[LiveTaskChar, string, string]> = [
-			[" ", "false", "square"],
-			["/", "mixed", "square-half"],
-			["x", "true", "square-check"],
-			["-", "false", "square-x"],
+			[" ", "false", "circle"],
+			["/", "mixed", "circle-half-2"],
+			["x", "true", "check"],
+			["-", "false", "x"],
 		];
 		for (const [task, checked, name] of cases) {
 			applyChrome(block, g, { hasKids: false, collapsed: false, task });
@@ -94,7 +150,11 @@ describe("outline icons", () => {
 			expect(g.check.title).toBe(chromeText.task);
 			expect(g.check.dataset.icon).toBe(name);
 			expect(g.check.querySelector("svg")?.getAttribute("class")).toBe(
-				`tabler-icon tabler-icon-${name}`,
+				`tabler-icon tabler-icon-${name} nf-status`,
+			);
+			// The badge says which state it is (its colours are CSS, by this attribute).
+			expect(g.check.querySelector("svg")?.getAttribute("data-status")).toBe(
+				LIVE_STATUS_OF_TASK[task],
 			);
 			// No text glyph: nothing for IME, copy or the caret to land on.
 			expect(g.check.textContent).toBe("");

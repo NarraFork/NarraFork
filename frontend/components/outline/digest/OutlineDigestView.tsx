@@ -40,6 +40,7 @@ import { useCurrentUser } from "../../../hooks/useAuth";
 import { useUndoOutlineDecision, wasUndoneHere } from "../../../hooks/useOutlineReports";
 import { formatLocaleTime } from "../../../lib/intl-format";
 import { reportLineDisplay } from "../../../lib/outline-report-line";
+import { OutlineStatusChip } from "../OutlineStatusIcon";
 import { OutlineHrefLink, OutlineLink, type OutlineTarget } from "../outline-nav";
 import {
 	commitPath,
@@ -573,8 +574,6 @@ function KnowledgeItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestKno
 }
 
 const TASK_COLOR = {
-	done: "green",
-	cancelled: "gray",
 	reopened: "yellow",
 	assigned: "violet",
 } as const;
@@ -592,17 +591,22 @@ function TaskItem({ ctx, item }: { ctx: ItemContext; item: OutlineDigestTaskView
 			space={item.link.spaceId}
 			badges={
 				<>
-					<Tag color={TASK_COLOR[item.event]}>{t(`report.task.${item.event}`)}</Tag>
+					{item.event === "done" || item.event === "cancelled" ? (
+						// A task's state: the outline's chip for it (the state's icon, then the words).
+						<OutlineStatusChip status={item.event}>
+							{t(`report.task.${item.event}`)}
+						</OutlineStatusChip>
+					) : (
+						<Tag color={TASK_COLOR[item.event]}>{t(`report.task.${item.event}`)}</Tag>
+					)}
 					{item.newlyDoneForYou && (
-						<Badge
-							size="xs"
+						<OutlineStatusChip
+							status="newly_done"
 							variant="filled"
-							color="teal"
-							tt="none"
 							data-testid="outline-report-newly-done"
 						>
 							{t("report.task.newlyDone")}
-						</Badge>
+						</OutlineStatusChip>
 					)}
 					{item.forYou && item.event !== "assigned" && (
 						<Tag color="grape">{t("report.task.yours")}</Tag>

@@ -21,18 +21,34 @@ declare module "@tabler/icons-react/dist/esm/icons/IconHelpCircle.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }
 
-declare module "@tabler/icons-react/dist/esm/icons/IconSquare.mjs" {
+declare module "@tabler/icons-react/dist/esm/icons/IconArrowForwardUp.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }
 
-declare module "@tabler/icons-react/dist/esm/icons/IconSquareCheck.mjs" {
+declare module "@tabler/icons-react/dist/esm/icons/IconCheck.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }
 
-declare module "@tabler/icons-react/dist/esm/icons/IconSquareHalf.mjs" {
+declare module "@tabler/icons-react/dist/esm/icons/IconChecks.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }
 
-declare module "@tabler/icons-react/dist/esm/icons/IconSquareX.mjs" {
+declare module "@tabler/icons-react/dist/esm/icons/IconCircle.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconCircleHalf2.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconHourglass.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconLock.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
+declare module "@tabler/icons-react/dist/esm/icons/IconX.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }

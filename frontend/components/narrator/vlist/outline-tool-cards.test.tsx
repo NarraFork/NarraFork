@@ -253,8 +253,12 @@ describe("an OutlineEdit card", () => {
 		expect(data.diffStats).toEqual({ added: 3, removed: 0, done: 1, commit: 6 });
 		const view = render(spec);
 		const figures = view.container.querySelector("[data-nf-diff-stats]");
-		expect(figures?.textContent).toBe("✓1+3#6");
-		expect(figures?.getAttribute("aria-label")).toBe("✓1 +3 #6");
+		// Tasks ticked done: the outline's "done" badge and a count, never a tick character.
+		expect(figures?.textContent).toBe("1+3#6");
+		const done = figures?.querySelector("[data-nf-diff-done] svg");
+		expect(done?.getAttribute("data-status")).toBe("done");
+		expect(done?.getAttribute("class")).toContain("nf-status");
+		expect(figures?.getAttribute("aria-label")).toBe("done 1 +3 #6");
 		view.unmount();
 	});
 

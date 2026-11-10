@@ -5,7 +5,6 @@ import type {
 	OutlineTaskStatus,
 	OutlineViewBlock,
 } from "@shared/outline-api";
-import { IconLock } from "@tabler/icons-react";
 import { memo, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { reportLineDisplay } from "../../lib/outline-report-line";
@@ -13,21 +12,24 @@ import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { visibleRows } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
-import { FOCUS_ICON, FOLD_ICONS, QUESTION_ICON, rowMarker, TASK_ICONS } from "./outline-icons";
+import { OutlineStatusChip, OutlineStatusIcon } from "./OutlineStatusIcon";
+import { FOCUS_ICON, FOLD_ICONS, QUESTION_ICON, rowMarker } from "./outline-icons";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 /** Indentation stops growing past this depth so deep outlines stay inside a phone's width. */
 const MAX_INDENT_DEPTH = 8;
 const INDENT_PX = 18;
 
-/** A task's checkbox: the same icon the live editor's frame draws (`outline-icons.ts`). */
+/**
+ * A task's status: the state's badge, the same one the live editor's frame draws
+ * (`outline-icons.ts`).
+ */
 export function OutlineTaskIcon({ status }: { status: OutlineTaskStatus }) {
 	const { t } = useTranslation("outline");
-	const { Icon } = TASK_ICONS[status];
 	return (
 		<Tooltip label={t(`page.task.${status}`)} openDelay={400}>
 			<span className={classes.taskIcon} role="img" aria-label={t(`page.task.${status}`)}>
-				<Icon size={16} />
+				<OutlineStatusIcon status={status} />
 			</span>
 		</Tooltip>
 	);
@@ -200,14 +202,7 @@ const OutlineRow = memo(function OutlineRow({
 							</Tooltip>
 						)}
 						{block.lock && (
-							<Badge
-								size="xs"
-								variant="light"
-								color="indigo"
-								tt="none"
-								leftSection={<IconLock size={10} />}
-								data-testid="outline-lock-badge"
-							>
+							<OutlineStatusChip status="locked" data-testid="outline-lock-badge">
 								{t("lock.badge", {
 									name:
 										block.lock.by.kind === "human"
@@ -216,7 +211,7 @@ const OutlineRow = memo(function OutlineRow({
 												? t("lock.session", { title: block.lock.by.name })
 												: t("lock.untitledSession"),
 								})}
-							</Badge>
+							</OutlineStatusChip>
 						)}
 						{block.pending.length > 0 && (
 							<Badge

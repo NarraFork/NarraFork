@@ -17,6 +17,7 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
+import { OutlineStatusChip } from "@frontend/components/outline/OutlineStatusIcon";
 import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import {
 	ActionIcon,
@@ -1095,22 +1096,34 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 			) : null}
 			{row.status ? <StatusChip chip={row.status} /> : null}
 			<TaskNoticeTitle row={row} />
-			{(row.marks ?? []).map((mark) => (
-				<Badge
-					key={mark}
-					size="xs"
-					// Outlined: a light gray chip has the card's own background and vanishes.
-					variant="outline"
-					color="gray"
-					tt="none"
-					title={mark}
-					// Whole while the row has room; on a narrow row it gives way after the title has
-					// (truncated, in full on hover) rather than being cut at the row's edge.
-					style={{ flex: "0 1 auto", minWidth: "3em" }}
-				>
-					{mark}
-				</Badge>
-			))}
+			{(row.marks ?? []).map((mark, index) => {
+				// Whole while the row has room; on a narrow row it gives way after the title has
+				// (truncated, in full on hover) rather than being cut at the row's edge.
+				const style = { flex: "0 1 auto", minWidth: "3em" } as const;
+				const status = row.markStatus?.[index];
+				// A mark that says a task state (a lock): the outline's chip for it, with its icon.
+				if (status) {
+					return (
+						<OutlineStatusChip key={mark} status={status} title={mark} style={style}>
+							{mark}
+						</OutlineStatusChip>
+					);
+				}
+				return (
+					<Badge
+						key={mark}
+						size="xs"
+						// Outlined: a light gray chip has the card's own background and vanishes.
+						variant="outline"
+						color="gray"
+						tt="none"
+						title={mark}
+						style={style}
+					>
+						{mark}
+					</Badge>
+				);
+			})}
 			{row.note ? (
 				<span
 					data-task-notice-note=""
@@ -1131,6 +1144,14 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 }
 
 function StatusChip({ chip }: { chip: TaskNoticeChip }) {
+	// A task's state: the outline's chip for it (the state's icon, then the words).
+	if (chip.status) {
+		return (
+			<OutlineStatusChip status={chip.status} data-task-notice-status="" style={{ flexShrink: 0 }}>
+				{chip.label}
+			</OutlineStatusChip>
+		);
+	}
 	return (
 		<Badge
 			size="xs"

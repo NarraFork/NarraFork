@@ -290,8 +290,17 @@
 }
 
 .nf-outline-editor .ob-lock {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
 	color: var(--mantine-color-indigo-text);
 	background: var(--mantine-color-indigo-light);
+}
+
+.nf-outline-editor .ob-lock svg {
+	flex: none;
+	width: 10px;
+	height: 10px;
 }
 
 .nf-outline-editor .ob-pending {
