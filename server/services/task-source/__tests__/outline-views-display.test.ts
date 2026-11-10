@@ -153,6 +153,7 @@ describe("context_update rows of the current-tasks view", () => {
 		]);
 		const docs = await taskState(id, "Write the docs");
 		const tag = await taskState(id, "Tag the build");
+		const announce = await taskState(id, "Announce it");
 		await request(id);
 		const [row] = await updates(id);
 		expect(row?.text).toBe("Context updated: outline.tasks");
@@ -162,6 +163,9 @@ describe("context_update rows of the current-tasks view", () => {
 				waiting: [],
 				next: [{ address: tag.address, title: "Tag the build" }],
 				counts: { doing: 1, waiting: 0, todo: 2 },
+				// Every open task by address under its state: what the next update is compared with.
+				// The first row of an epoch has nothing to compare with, so it names no changes.
+				states: { doing: [docs.address], todo: [tag.address, announce.address] },
 			},
 		});
 		// What the model reads (the frozen update text and its changes) is the view's text alone:

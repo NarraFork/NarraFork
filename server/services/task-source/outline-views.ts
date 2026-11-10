@@ -55,8 +55,25 @@ import {
 	type OutlineViewTask,
 } from "@server/lib/prompt-i18n";
 import { blockTitle } from "@shared/outline";
-import type { OutlineTasksViewDisplay, OutlineTasksViewTask } from "@shared/outline-task-notice";
-import type { ContextPart } from "@shared/prefix-context";
+import {
+	boundOutlineTasksViewStates,
+	coerceOutlineTasksViewDisplay,
+	OUTLINE_TASKS_VIEW_KEY,
+	type OutlineTasksViewDisplay,
+	type OutlineTasksViewTask,
+} from "@shared/outline-task-notice";
+import {
+	diffOutlineTasksViews,
+	type OutlineTasksViewFact,
+	outlineTasksViewDeltasToRead,
+	settleOutlineTasksViewChanges,
+} from "@shared/outline-tasks-view-diff";
+import {
+	CONTEXT_UPDATE_DISPLAY_MAX_BYTES,
+	type ContextPart,
+	contextDisplayBytes,
+} from "@shared/prefix-context";
+import { registerContextDisplayRefiner } from "../context-display-refiners";
 import { readDisplayNames, readNarrator } from "../outline/access-reads";
 import { loadBodies, readSubtree } from "../outline/read";
 import { renderOutline } from "../outline/render";
@@ -586,7 +603,110 @@ async function readTasksView(
 		},
 		...(read.truncated || delegated.more ? { more: true as const } : {}),
 	};
+	// Every open task read, by address under its state: what the next update is compared with
+	// (`refineTasksViewDisplay`). A task a subagent holds is delegated, whatever its checkbox says.
+	const handed = new Set(delegated.entries.map((entry) => entry.task.address));
+	const own = read.entries.filter((entry) => !handed.has(entry.ref.address));
+	const table = boundOutlineTasksViewStates({
+		doing: addressesOf(own, "doing"),
+		delegated: [...handed],
+		waiting: addressesOf(own, "blocked"),
+		todo: addressesOf(own, "todo"),
+	});
+	display.states = table.states;
+	if (table.cut || read.truncated || delegated.more) display.statesMore = true;
 	return { text: lines.join("\n"), display };
+}
+
+function addressesOf(entries: readonly OpenEntry[], status: OpenEntry["status"]): string[] {
+	return entries.filter((entry) => entry.status === status).map((entry) => entry.ref.address);
+}
+
+/** A task as its block says it is now: what became of one that left the view. */
+async function readTaskFact(
+	address: string,
+	spaces: Map<string, string | null>,
+): Promise<OutlineTasksViewFact | null> {
+	const slash = address.indexOf("/");
+	if (slash <= 0) return null;
+	const key = address.slice(0, slash);
+	const sid = address.slice(slash + 1);
+	if (!spaces.has(key)) spaces.set(key, (await outlineStore.getSpaceByKey(key))?.id ?? null);
+	const spaceId = spaces.get(key);
+	if (!spaceId) return { fate: "removed" };
+	const block = await outlineStore.getBlockBySid(spaceId, sid);
+	if (!block || block.deleted || !block.taskJson) {
+		// Its title is still worth naming when the block is there (no longer a task, or deleted).
+		const title = block ? clip(blockTitle(block.content), OUTLINE_VIEW_LIMITS.titleChars) : "";
+		return { fate: "removed", ...(title ? { title } : {}) };
+	}
+	const title = clip(blockTitle(block.content) || block.sid, OUTLINE_VIEW_LIMITS.titleChars);
+	const status = block.taskJson.status;
+	return {
+		fate: status === "done" ? "done" : status === "cancelled" ? "cancelled" : "open",
+		title,
+	};
+}
+
+/** Bytes the current-tasks summary may take of a row's display (its limit, less some room). */
+const TASKS_DISPLAY_BYTES = CONTEXT_UPDATE_DISPLAY_MAX_BYTES - 256;
+
+/**
+ * The current-tasks summary a `context_update` row stores, saying what changed since the view the
+ * session was last shown (`previous`: that row's summary; `null` when it removed the view;
+ * `undefined` when there is none to compare with).
+ *
+ * Two state tables of at most {@link OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.states} addresses are
+ * compared in memory; at most {@link OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.changes} blocks are read by
+ * address (the tasks that left the list: finished, cancelled or deleted; and changed tasks no
+ * view titled). Nothing here reaches the model.
+ *
+ * A view that goes away (`current === null`) keeps `null` unless the comparison names what
+ * emptied it (the last task finished), which is then stored as an empty list with its changes.
+ */
+export async function refineTasksViewDisplay(input: {
+	previous: unknown;
+	current: unknown;
+}): Promise<unknown> {
+	const current = coerceOutlineTasksViewDisplay(input.current);
+	if (current === undefined) return input.current;
+	const previous = coerceOutlineTasksViewDisplay(input.previous);
+	if (previous === undefined) return input.current;
+	const deltas = diffOutlineTasksViews(previous, current);
+	if (!deltas) return input.current;
+	const facts = new Map<string, OutlineTasksViewFact>();
+	const spaces = new Map<string, string | null>();
+	for (const address of outlineTasksViewDeltasToRead(deltas)) {
+		try {
+			const fact = await readTaskFact(address, spaces);
+			if (fact) facts.set(address, fact);
+		} catch (error) {
+			// Unread, the task is counted (or left out when the table is cut), never guessed.
+			logger.warn("Outline task could not be read for the view's changes", {
+				address,
+				error: String(error),
+			});
+		}
+	}
+	const settled = settleOutlineTasksViewChanges(deltas, facts);
+	if (current === null) {
+		if (settled.changed === 0) return null;
+		return {
+			doing: [],
+			waiting: [],
+			next: [],
+			counts: { doing: 0, waiting: 0, todo: 0 },
+			states: {},
+			...settled,
+		} satisfies OutlineTasksViewDisplay;
+	}
+	const refined: OutlineTasksViewDisplay = { ...current, ...settled };
+	// Long titles: the changes give way before the list does (the row then reads as a first view).
+	return contextDisplayBytes(refined) <= TASKS_DISPLAY_BYTES ? refined : input.current;
+}
+
+if (hotOnce("narrafork.outlineViews.displayRefiner")) {
+	registerContextDisplayRefiner(OUTLINE_TASKS_VIEW_KEY, (input) => refineTasksViewDisplay(input));
 }
 
 /**
