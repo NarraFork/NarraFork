@@ -1654,6 +1654,12 @@ void startupReadiness.barrier.then((recovery) => {
 		.catch((err) =>
 			logger.warn("Outline task-finished notices failed to start", { error: String(err) }),
 		);
+	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
+	import("./services/outline/plugin-task-events")
+		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
+		.catch((err) =>
+			logger.warn("Outline plugin task events failed to start", { error: String(err) }),
+		);
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this

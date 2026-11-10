@@ -227,6 +227,23 @@ export const CANONICAL_CAPABILITY_DESCRIPTORS = {
 		true,
 	),
 	"narrator.spec_write": capability("narrator.spec_write", "narrator", "write", "medium", true),
+	// Block commands on an outline session's tasks (outline P2 PR 12a).
+	"narrator.tasks.read": capability("narrator.tasks.read", "narrator", "read", "low", true),
+	"narrator.task.add": capability("narrator.task.add", "narrator", "write", "medium", true),
+	"narrator.task.set_status": capability(
+		"narrator.task.set_status",
+		"narrator",
+		"write",
+		"medium",
+		true,
+	),
+	"narrator.behavior_rules.set": capability(
+		"narrator.behavior_rules.set",
+		"narrator",
+		"write",
+		"medium",
+		true,
+	),
 	"narrator.execute": capability("narrator.execute", "narrator", "execute", "critical", true, true),
 	"message.summary.read": capability("message.summary.read", "message", "read", "medium", true),
 	"message.content.read": capability("message.content.read", "message", "read", "high", true),
