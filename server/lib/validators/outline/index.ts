@@ -89,6 +89,11 @@ export const outlineViewStatePutSchema = z.object({
 	collapsed: z
 		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
 		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
+	// What the reader opened that is folded by default; absent from an older client.
+	expanded: z
+		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)
+		.optional(),
 	layout: z.enum(["right", "down"]),
 });
 

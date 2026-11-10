@@ -6210,7 +6210,12 @@ export const outlineLiveUpdates = sqliteTable(
 );
 
 // === outline_view_state ===
-/** Per user and page: collapsed blocks and the mind-map layout direction. Not part of history. */
+/**
+ * Per user and page: the reader's own folding and the mind-map layout direction. Not part of
+ * history. A page folds some blocks by default (`shared/outline-fold.ts`): `collapsed_json` holds
+ * the blocks the reader closed that are open by default, `expanded_json` those they opened that
+ * are closed by default.
+ */
 export const outlineViewState = sqliteTable(
 	"outline_view_state",
 	{
@@ -6222,6 +6227,8 @@ export const outlineViewState = sqliteTable(
 			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
 		/** Ids of the collapsed blocks. */
 		collapsedJson: text("collapsed_json", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/** Ids of the blocks the reader opened; null (a row written before the column): none. */
+		expandedJson: text("expanded_json", { mode: "json" }).$type<string[]>(),
 		layout: text("layout", { enum: ["right", "down"] })
 			.notNull()
 			.default("right"),

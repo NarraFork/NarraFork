@@ -19,14 +19,16 @@
  */
 import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { OUTLINE_VIEW_STATE_LIMITS, type OutlineViewStateResponse } from "@shared/outline-api";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
-import { aclGrants, projects, users } from "../../db/schema";
+import { aclGrants, outlineViewState, projects, users } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { ensureProjectSpace } from "../../services/outline/spaces";
 import { outlineStore } from "../../services/outline/store";
+import { normalizeFolding } from "../../services/outline/view-state";
 import { writeOutline } from "../../services/outline/write";
 import { outlineRoutes } from "../outline";
 
@@ -152,7 +154,13 @@ describe("outline view state", () => {
 	test("defaults until written; a write replaces both parts and reads back", async () => {
 		const first = await call(alice, "GET", pageId);
 		expect(first.status).toBe(200);
-		expect(first.body).toEqual({ pageId, collapsed: [], layout: "right", updatedAt: null });
+		expect(first.body).toEqual({
+			pageId,
+			collapsed: [],
+			expanded: [],
+			layout: "right",
+			updatedAt: null,
+		});
 
 		const put = await call(alice, "PUT", pageId, { collapsed: [childId, childId], layout: "down" });
 		expect(put.status).toBe(200);
@@ -168,6 +176,80 @@ describe("outline view state", () => {
 		expect((await call(alice, "GET", pageId)).body).toMatchObject({
 			collapsed: [],
 			layout: "right",
+		});
+	});
+
+	test("what the reader opened is stored beside what they closed", async () => {
+		const put = await call(alice, "PUT", pageId, {
+			collapsed: [childId],
+			expanded: [grandchildId, grandchildId],
+			layout: "right",
+		});
+		expect(put.status).toBe(200);
+		expect(put.body).toMatchObject({ collapsed: [childId], expanded: [grandchildId] });
+		expect((await call(alice, "GET", pageId)).body).toMatchObject({
+			collapsed: [childId],
+			expanded: [grandchildId],
+		});
+		// A client from before the default folding sends no `expanded`: what is stored is kept.
+		const old = await call(alice, "PUT", pageId, { collapsed: [], layout: "down" });
+		expect(old.body).toMatchObject({ collapsed: [], expanded: [grandchildId], layout: "down" });
+		expect((await outlineStore.getViewState(alice, pageId))?.expanded).toEqual([grandchildId]);
+		// An empty list clears it.
+		const cleared = await call(alice, "PUT", pageId, {
+			collapsed: [],
+			expanded: [],
+			layout: "down",
+		});
+		expect(cleared.body).toMatchObject({ collapsed: [], expanded: [] });
+		// A block in both is one the reader opened; ids of other pages are dropped from both.
+		const both = await call(alice, "PUT", pageId, {
+			collapsed: [childId, grandchildId, otherChildId],
+			expanded: [childId, otherChildId, generateId()],
+			layout: "down",
+		});
+		expect(both.body).toMatchObject({ collapsed: [grandchildId], expanded: [childId] });
+		// Someone else's stays theirs.
+		expect((await call(bob, "GET", pageId)).body.expanded).toEqual([]);
+		// An older client closing a block the reader had opened: closed it is.
+		const closed = await call(alice, "PUT", pageId, { collapsed: [childId], layout: "down" });
+		expect(closed.body).toMatchObject({ collapsed: [childId], expanded: [] });
+	});
+
+	test("a row written before the column reads as nothing opened", async () => {
+		await db
+			.insert(outlineViewState)
+			.values({
+				userId: bob,
+				pageBlockId: pageId,
+				collapsedJson: [childId],
+				updatedAt: "2026-11-01T00:00:00.000Z",
+			})
+			.onConflictDoUpdate({
+				target: [outlineViewState.userId, outlineViewState.pageBlockId],
+				set: { collapsedJson: [childId], expandedJson: null },
+			});
+		expect((await call(bob, "GET", pageId)).body).toMatchObject({
+			collapsed: [childId],
+			expanded: [],
+		});
+		await db.delete(outlineViewState).where(eq(outlineViewState.userId, bob));
+	});
+
+	test("the two sets share one limit", () => {
+		const max = OUTLINE_VIEW_STATE_LIMITS.maxCollapsed;
+		const ids = (prefix: string, n: number) =>
+			Array.from({ length: n }, (_, i) => `${prefix}${String(i).padStart(8, "0")}`);
+		const fit = normalizeFolding({ collapsed: ids("c", max), expanded: ids("e", 10) });
+		expect(fit.expanded.length).toBe(10);
+		expect(fit.collapsed.length).toBe(max - 10);
+		expect(fit.collapsed[0]).toBe("c00000000");
+		const full = normalizeFolding({ collapsed: ids("c", 5), expanded: ids("e", max + 5) });
+		expect(full.expanded.length).toBe(max);
+		expect(full.collapsed).toEqual([]);
+		expect(normalizeFolding({ collapsed: ["has space", "ok-block-1"], expanded: ["x"] })).toEqual({
+			collapsed: ["ok-block-1"],
+			expanded: [],
 		});
 	});
 
@@ -219,6 +301,18 @@ describe("outline view state", () => {
 		).toBe(400);
 		expect((await call(alice, "PUT", pageId, { collapsed: [], layout: "left" })).status).toBe(400);
 		expect((await call(alice, "PUT", pageId, { layout: "right" })).status).toBe(400);
+		expect(
+			(await call(alice, "PUT", pageId, { collapsed: [], expanded: tooMany, layout: "right" }))
+				.status,
+		).toBe(400);
+		expect(
+			(await call(alice, "PUT", pageId, { collapsed: [], expanded: [longId], layout: "right" }))
+				.status,
+		).toBe(400);
+		expect(
+			(await call(alice, "PUT", pageId, { collapsed: [], expanded: "all", layout: "right" }))
+				.status,
+		).toBe(400);
 		expect((await call(alice, "PUT", pageId, "not json")).status).toBe(400);
 		const huge = JSON.stringify({
 			collapsed: [],

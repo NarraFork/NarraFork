@@ -327,7 +327,8 @@ export type OutlineMapLayout = "right" | "down";
  * Limits of `GET/PUT /api/outline/view-state/:pageId`: one person's folding and mind-map
  * direction of one page (design §7.1 `outline_view_state`). Folding is personal and never part
  * of the block model; a page shows at most `maxCollapsed` blocks per view (design §7.2), so more
- * folded ids than that are never needed.
+ * folded ids than that are never needed. `maxCollapsed` bounds the blocks the reader closed and
+ * the blocks they opened TOGETHER (`shared/outline-fold.ts`): one budget, not one each.
  */
 export const OUTLINE_VIEW_STATE_LIMITS = {
 	maxCollapsed: 2000,
@@ -350,7 +351,10 @@ export const OUTLINE_BLOCK_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 /** One person's view state of one page; defaults when they never changed it. */
 export interface OutlineViewStateResponse {
 	pageId: string;
+	/** Blocks the reader closed that the page shows open by default. */
 	collapsed: string[];
+	/** Blocks the reader opened that the page folds by default (`shared/outline-fold.ts`). */
+	expanded: string[];
 	layout: OutlineMapLayout;
 	/** When it was last written; null for the defaults. */
 	updatedAt: string | null;
@@ -358,6 +362,8 @@ export interface OutlineViewStateResponse {
 
 export interface OutlineViewStatePutRequest {
 	collapsed: string[];
+	/** Left out (a client from before the default folding): what is stored is kept. */
+	expanded?: string[];
 	layout: OutlineMapLayout;
 }
 

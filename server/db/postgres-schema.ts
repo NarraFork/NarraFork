@@ -3856,6 +3856,7 @@ export const outlineViewState = pgTable(
 			.notNull()
 			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
 		collapsedJson: jsonText("collapsed_json").notNull().default(sql.raw("'[]'::text")),
+		expandedJson: jsonText("expanded_json"),
 		layout: text("layout").notNull().default("right"),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -4368,7 +4369,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 141,
-  "columnCount": 1864,
+  "columnCount": 1865,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -26458,6 +26459,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "[]",
           "defaultExpression": "sql.raw(\"'[]'::text\")"
+        },
+        {
+          "property": "expandedJson",
+          "name": "expanded_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "layout",

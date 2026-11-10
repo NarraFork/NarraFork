@@ -155,13 +155,15 @@ export interface OutlineLiveUpdateRow {
 }
 
 /**
- * One person's view state of one page (`outline_view_state`, design §7.1): folded blocks and the
- * mind map's direction. Personal and outside history: never versioned, never part of a commit.
+ * One person's view state of one page (`outline_view_state`, design §7.1): the blocks they
+ * closed, the blocks they opened, and the mind map's direction. Personal and outside history: never versioned, never part of a commit.
  */
 export interface OutlineViewStateRow {
 	userId: string;
 	pageBlockId: string;
 	collapsed: string[];
+	/** Blocks the reader opened that are closed by default (`shared/outline-fold.ts`). */
+	expanded: string[];
 	layout: "right" | "down";
 	updatedAt: string;
 }

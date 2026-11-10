@@ -477,6 +477,13 @@
 			"when": 1794283712715,
 			"tag": "0067_recent_tabs_show_directory",
 			"breakpoints": true
+		},
+		{
+			"idx": 68,
+			"version": "7",
+			"when": 1794319228173,
+			"tag": "0068_outline_view_state_expanded",
+			"breakpoints": true
 		}
   ]
 }

@@ -188,11 +188,15 @@ type ViewStateSelect = typeof outlineViewState.$inferSelect;
 
 function toViewState(row: ViewStateSelect): OutlineViewStateRow {
 	const collapsed = row.collapsedJson;
+	const expanded = row.expandedJson;
 	return {
 		userId: row.userId,
 		pageBlockId: row.pageBlockId,
 		collapsed: Array.isArray(collapsed)
 			? collapsed.filter((id): id is string => typeof id === "string")
+			: [],
+		expanded: Array.isArray(expanded)
+			? expanded.filter((id): id is string => typeof id === "string")
 			: [],
 		layout: row.layout === "down" ? "down" : "right",
 		updatedAt: row.updatedAt,
@@ -239,12 +243,18 @@ async function putViewStateSection(
 			userId: row.userId,
 			pageBlockId: row.pageBlockId,
 			collapsedJson: row.collapsed,
+			expandedJson: row.expanded,
 			layout: row.layout,
 			updatedAt: row.updatedAt,
 		})
 		.onConflictDoUpdate({
 			target: [outlineViewState.userId, outlineViewState.pageBlockId],
-			set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
+			set: {
+				collapsedJson: row.collapsed,
+				expandedJson: row.expanded,
+				layout: row.layout,
+				updatedAt: row.updatedAt,
+			},
 		});
 	// The person's oldest pages beyond the cap (found by the primary key's prefix, at most
 	// `keepPerUser + 2` rows).
