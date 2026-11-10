@@ -104,6 +104,7 @@ function Fixture({ enabled, width }: { enabled: boolean; width: number }) {
 			onToggleTranslation: noop,
 			onTogglePrompt: noop,
 			onToggleFileChanges: noop,
+			onPlanTree: noop,
 		},
 		renderLabels: {} as ExactRowProps["renderLabels"],
 		outlineAskSlot: slot,
