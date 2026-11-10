@@ -1,9 +1,4 @@
-/**
- * The questions form (P2 PR 7), rendered from a group as the API returns it: each open question
- * put to the viewer starts on the asker's recommendation, sub-questions sit under their question,
- * a question put to someone else is read-only, an answered one shows its answer, and the side
- * panel shows nothing for a block without questions.
- */
+/** Shared question form: explicit answers, no adoption shortcut, and concise read-only results. */
 import { describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type {
@@ -20,6 +15,7 @@ import { I18nextProvider } from "react-i18next";
 import { outlineKeys } from "../../hooks/useOutline";
 import outlineEn from "../../locales/en/outline.json";
 import { OutlineQuestionsForm, OutlineQuestionsSection } from "./OutlineQuestions";
+import { outlineAnswerInput } from "./outline-answer-draft";
 
 const i18n = createInstance();
 await i18n.init({
@@ -99,24 +95,22 @@ function render(node: ReactNode, data: OutlineQuestionGroupResponse | null): Doc
 }
 
 describe("the questions form", () => {
-	test("starts on the recommendations, nests sub-questions, and shows what others decide", () => {
+	test("starts empty, keeps one submit action, and shows read-only answers", () => {
 		const doc = render(<OutlineQuestionsForm blockId="task" showOpenLink={false} />, group);
 		const card = (id: string) => doc.querySelector(`[data-testid=outline-question-${id}]`);
-		// The recommended option is chosen.
-		const checked = card("1")?.querySelector("input[type=radio][checked]");
-		expect(checked?.getAttribute("value")).toBe("2");
-		expect(card("1")?.textContent).toContain("Recommended: v2 (most exports are v2)");
-		// A sub-question without options: words, the recommendation as the placeholder.
-		expect(card("2")?.querySelector("textarea")?.getAttribute("placeholder")).toBe("skip");
-		// Someone else's question is read-only; an answered one shows the answer.
+		expect(card("1")?.querySelector("input[type=radio][checked]")).toBeNull();
+		expect(card("1")?.textContent).toContain("v2 (recommended)");
+		expect(card("1")?.textContent).toContain("most exports are v2");
+		expect(card("1")?.textContent).not.toContain("Recommended: v2");
+		expect(card("2")?.querySelector("textarea")?.getAttribute("placeholder")).toBe("Your answer");
 		expect(card("3")?.querySelector("input, textarea")).toBeNull();
 		expect(card("3")?.textContent).toContain("Waiting for bob to answer");
-		expect(card("4")?.getAttribute("data-state")).toBe("answered");
 		expect(card("4")?.textContent).toContain("alice answered in the conversation: v1");
-		// Adopting takes every answerable question with a recommendation.
-		expect(doc.querySelector("[data-testid=outline-questions-adopt-all]")?.textContent).toContain(
-			"(2)",
-		);
+		expect(doc.querySelector("[data-testid=outline-questions-adopt-all]")).toBeNull();
+		expect(doc.querySelectorAll("button")).toHaveLength(1);
+		expect(
+			doc.querySelector("[data-testid=outline-questions-submit]")?.hasAttribute("disabled"),
+		).toBe(true);
 	});
 
 	test("an answer relayed from a gateway says through which door it came (review N-1)", () => {
@@ -138,21 +132,18 @@ describe("the questions form", () => {
 		);
 	});
 
-	test("the asking session is named only to a viewer who may read it (review B2)", () => {
+	test("does not repeat source metadata or expose a hidden session", () => {
 		const shown = render(<OutlineQuestionsForm blockId="task" showOpenLink={false} />, group);
-		expect(shown.querySelector("[data-testid=outline-question-1]")?.textContent).toContain(
-			"asked by Worker",
-		);
+		expect(shown.body.textContent).not.toContain("asked by Worker");
 		const hidden = render(<OutlineQuestionsForm blockId="task" showOpenLink={false} />, {
 			...group,
 			questions: [question("1", { askedBy: { narratorId: null, title: null, hidden: true } })],
 		});
-		const text = hidden.querySelector("[data-testid=outline-question-1]")?.textContent ?? "";
-		expect(text).toContain("asked by a session you cannot open");
-		expect(text).not.toContain("Worker");
+		expect(hidden.body.textContent).not.toContain("Worker");
+		expect(hidden.body.textContent).not.toContain("asked by a session you cannot open");
 	});
 
-	test("the side panel shows questions under the focused block, and nothing without any", () => {
+	test("the body section shows questions under the focused block, and nothing without any", () => {
 		const view = {
 			rootId: "task",
 			current: true,
@@ -162,5 +153,65 @@ describe("the questions form", () => {
 		expect(shown.querySelector("[data-testid=outline-questions-section]")).not.toBeNull();
 		const empty = render(<OutlineQuestionsSection view={view} />, { ...group, questions: [] });
 		expect(empty.querySelector("[data-testid=outline-questions-section]")).toBeNull();
+	});
+});
+
+describe("explicit answer semantics", () => {
+	test("an empty draft never adopts the recommendation", () => {
+		expect(outlineAnswerInput(question("1"), { option: null, text: "  " })).toBeNull();
+	});
+	test("submits an explicitly selected option", () => {
+		expect(outlineAnswerInput(question("1"), { option: 2, text: "" })).toEqual({
+			blockId: "1",
+			versionSeq: 3,
+			option: 2,
+		});
+	});
+	test("authored text replaces a previously selected recommendation", () => {
+		const text = "不要按建议执行。\n".repeat(300);
+		expect(outlineAnswerInput(question("1"), { option: 2, text })).toEqual({
+			blockId: "1",
+			versionSeq: 3,
+			text: text.trim(),
+		});
+	});
+	test("background refresh never upgrades the version of an existing draft", () => {
+		expect(
+			outlineAnswerInput(question("1", { versionSeq: 9 }), { option: 2, text: "", versionSeq: 3 }),
+		).toEqual({ blockId: "1", versionSeq: 3, option: 2 });
+		expect(
+			outlineAnswerInput(question("1", { versionSeq: 9 }), {
+				option: null,
+				text: "old question's answer",
+				versionSeq: 3,
+			}),
+		).toEqual({ blockId: "1", versionSeq: 3, text: "old question's answer" });
+	});
+	test("invalid choices are not silently submitted", () => {
+		expect(outlineAnswerInput(question("1"), { option: 3, text: "" })).toBeNull();
+	});
+	test("read-only forms never expose answer controls", () => {
+		const doc = render(
+			<OutlineQuestionsForm blockId="task" showOpenLink={false} readOnly />,
+			group,
+		);
+		expect(doc.querySelector("input, textarea, button")).toBeNull();
+	});
+	test("a card's whitelist excludes other questions under the same task", () => {
+		const doc = render(
+			<OutlineQuestionsForm blockId="task" showOpenLink={false} questionIds={["1", "2"]} />,
+			group,
+		);
+		expect(doc.querySelectorAll("[data-state]")).toHaveLength(2);
+		expect(doc.body.textContent).not.toContain("Question 3");
+	});
+	test("historical outline views never show a live form", () => {
+		const view = {
+			rootId: "task",
+			current: false,
+			blocks: [{ id: "task", childIds: ["1"], openTasks: 1, question: null }],
+		} as unknown as OutlineBlockViewResponse;
+		const doc = render(<OutlineQuestionsSection view={view} />, group);
+		expect(doc.querySelector("[data-testid=outline-questions-section]")).toBeNull();
 	});
 });

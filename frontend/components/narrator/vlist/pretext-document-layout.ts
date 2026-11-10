@@ -95,6 +95,12 @@ export interface BuildPretextDocumentLayoutOptions {
 	 * a caller-supplied id could not correct itself once stale).
 	 */
 	resolveLatestSpecTasksToolUseId?: () => string | null;
+	/**
+	 * Whether the latest tasks.json call may be pinned at all (default yes). An outline session's
+	 * tasks are not in tasks.json (outline P2 PR 12a): its old tasks.json calls are history, so
+	 * none is kept out of the low-LOD fold. Whether, never which: the id is still derived here.
+	 */
+	pinLatestSpecTasks?: boolean;
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/** Full (un-truncated) tool payloads once the shell has fetched them. */
 	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
@@ -391,9 +397,10 @@ export function buildPretextDocumentLayout(
 	// the task-board spinner, but that one is scanned over a different list, so the
 	// two can disagree; deriving locally means the pin is always consistent with the
 	// document it belongs to and can never go stale.
-	const latestSpecTasksToolUseId = findLatestSpecTasksToolUseIdInMessages(
-		messages as NarratorMsg[],
-	);
+	const latestSpecTasksToolUseId =
+		options.pinLatestSpecTasks === false
+			? null
+			: findLatestSpecTasksToolUseIdInMessages(messages as NarratorMsg[]);
 	// The pinned card must not fold into an activity unit at L1/L2 (its task board
 	// would vanish into a trace row). The keep set is expressed in TOOL-USE ids, so
 	// only THAT call leaves the fold: keeping the whole segment out — as this once

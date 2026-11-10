@@ -100,6 +100,7 @@ import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
 import { OutlineBreadcrumbs } from "./OutlineBreadcrumbs";
 import { OutlineGate } from "./OutlineGate";
+import { OutlineQuestionsSection } from "./OutlineQuestions";
 import { OutlineSidePanel } from "./OutlineSidePanel";
 import { OutlineTimeline } from "./OutlineTimeline";
 import {
@@ -208,7 +209,7 @@ function SurfaceBody({
 	useEffect(() => {
 		if (!onScreen) setFallback((current) => (current === "tab_limit" ? null : current));
 	}, [onScreen]);
-	// While editing, the HTTP read only feeds the breadcrumbs, side panel and timeline.
+	// While editing, the HTTP read feeds the breadcrumbs, questions, side panel and timeline.
 	const query = useOutlineBlock(spaceId, blockId, {
 		asOf,
 		view: mode,
@@ -645,6 +646,11 @@ function SurfaceBody({
 									onToggle={toggle}
 								/>
 							</>
+						)}
+						{/* Answer in the main content, also when live editing or the sidebar is unavailable.
+						    A retained read from the previous focus must not offer answers for that block. */}
+						{settled && view.current && asOf === undefined && (
+							<OutlineQuestionsSection view={view} hideQuestionTitle={!!root.question} />
 						)}
 						{view.view === "facts" && (editing ? hiddenLive : view.hiddenByView) > 0 && (
 							<Text size="xs" c="dimmed" mt="sm">

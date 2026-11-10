@@ -312,8 +312,11 @@ export function reflectionTitleLabels(t: (key: string) => string): Record<string
 export function useVListLabels(): VListLabels {
 	const { t } = useTranslation("narrator");
 	const { t: tCommon } = useTranslation("common");
-	// The tool cards' figures name "tasks ticked done" by the task status's own name.
-	diffStatsLabels.done = t("sidecar.taskNotice.statusDone");
+	// The tool cards' figures name "tasks ticked done" by the task status's own name (translated
+	// once per language, like every label here).
+	useMemo(() => {
+		diffStatsLabels.done = t("sidecar.taskNotice.statusDone");
+	}, [t]);
 
 	const adapterLabels = useMemo<Record<string, string>>(
 		() => ({
@@ -584,6 +587,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceOutlineTurnEnd: t("sidecar.sources.outline_task_turn_end"),
 			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
 			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
+			sidecarSourceOutlineTeamActivity: t("sidecar.sources.outline_team_activity"),
 			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
 			// ── task notices (`shared/pretext-layout/task-notice.ts`) ────────────────
 			taskNoticeStatusTodo: t("sidecar.taskNotice.statusTodo"),
@@ -609,6 +613,13 @@ export function useVListLabels(): VListLabels {
 				status: "{status}",
 				reason: "{reason}",
 			}),
+			taskNoticeChangeNotes: t("sidecar.taskNotice.changeNotes", { n: "{n}" }),
+			taskNoticeChangeReports: t("sidecar.taskNotice.changeReports", { n: "{n}" }),
+			taskNoticeChangeAnswers: t("sidecar.taskNotice.changeAnswers", { n: "{n}" }),
+			taskNoticeChangeClaimable: t("sidecar.taskNotice.changeClaimable"),
+			taskNoticeChangeOverlap: t("sidecar.taskNotice.changeOverlap", { path: "{path}" }),
+			taskNoticeChangeOverlapHidden: t("sidecar.taskNotice.changeOverlapHidden"),
+			taskNoticeActivityTitle: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
 			taskNoticeJoin: t("sidecar.taskNotice.join"),
 			taskNoticeWhoJoin: t("sidecar.taskNotice.whoJoin"),
 			taskNoticeEditedTitle: t("sidecar.taskNotice.editedTitle", { who: "{who}", n: "{n}" }),
@@ -621,6 +632,28 @@ export function useVListLabels(): VListLabels {
 			taskNoticeMoreRowAtLeast: t("sidecar.taskNotice.moreRowAtLeast", { n: "{n}" }),
 			taskNoticeViewTitle: t("sidecar.taskNotice.viewTitle"),
 			taskNoticeViewEmpty: t("sidecar.taskNotice.viewEmpty"),
+			taskNoticeViewCurrent: t("sidecar.taskNotice.viewCurrent"),
+			taskNoticeViewRefreshed: t("sidecar.taskNotice.viewRefreshed"),
+			taskNoticeViewChangedOne: t("sidecar.taskNotice.viewChangedOne"),
+			taskNoticeViewChanged: t("sidecar.taskNotice.viewChanged", { n: "{n}" }),
+			taskNoticeViewDid_done: t("sidecar.taskNotice.viewDid_done", { title: "{title}" }),
+			taskNoticeViewDid_started: t("sidecar.taskNotice.viewDid_started", { title: "{title}" }),
+			taskNoticeViewDid_cancelled: t("sidecar.taskNotice.viewDid_cancelled", { title: "{title}" }),
+			taskNoticeViewDid_returned: t("sidecar.taskNotice.viewDid_returned", { title: "{title}" }),
+			taskNoticeViewDid_delegated: t("sidecar.taskNotice.viewDid_delegated", { title: "{title}" }),
+			taskNoticeViewDid_waiting: t("sidecar.taskNotice.viewDid_waiting", { title: "{title}" }),
+			taskNoticeViewDid_unblocked: t("sidecar.taskNotice.viewDid_unblocked", { title: "{title}" }),
+			taskNoticeViewDid_added: t("sidecar.taskNotice.viewDid_added", { title: "{title}" }),
+			taskNoticeViewDid_requeued: t("sidecar.taskNotice.viewDid_requeued", { title: "{title}" }),
+			taskNoticeViewDid_removed: t("sidecar.taskNotice.viewDid_removed", { title: "{title}" }),
+			taskNoticeViewDid_unlisted: t("sidecar.taskNotice.viewDid_unlisted", { title: "{title}" }),
+			taskNoticeViewDid_renamed: t("sidecar.taskNotice.viewDid_renamed", { title: "{title}" }),
+			taskNoticeViewDidJoin: t("sidecar.taskNotice.viewDidJoin"),
+			taskNoticeViewDidMore: t("sidecar.taskNotice.viewDidMore", { list: "{list}", n: "{n}" }),
+			taskNoticeViewNoteReturned: t("sidecar.taskNotice.viewNoteReturned"),
+			taskNoticeViewNoteRemoved: t("sidecar.taskNotice.viewNoteRemoved"),
+			taskNoticeViewNoteUnlisted: t("sidecar.taskNotice.viewNoteUnlisted"),
+			taskNoticeViewNoteRenamed: t("sidecar.taskNotice.viewNoteRenamed"),
 			taskNoticeCountDoing: t("sidecar.taskNotice.countDoing", { n: "{n}" }),
 			taskNoticeCountWaiting: t("sidecar.taskNotice.countWaiting", { n: "{n}" }),
 			taskNoticeCountDelegated: t("sidecar.taskNotice.countDelegated", { n: "{n}" }),
@@ -630,6 +663,7 @@ export function useVListLabels(): VListLabels {
 			outlineTaskTurnEndHeading: t("sidecar.taskNotice.turnEndHeading"),
 			outlineTaskEditedHeading: t("sidecar.taskNotice.editedHeading", { n: "{n}" }),
 			outlineTaskFinishedHeading: t("sidecar.taskNotice.finishedHeading", { n: "{n}" }),
+			outlineTaskActivityHeading: t("sidecar.taskNotice.activityTitle", { n: "{n}" }),
 			outlineTaskMore: t("sidecar.taskNotice.moreRow", { n: "{n}" }),
 			// ── outline tool cards (`shared/pretext-layout/outline-tool-card.ts`) ─────────
 			outlineSpaceOwnSession: t("outlineCard.spaceOwnSession"),

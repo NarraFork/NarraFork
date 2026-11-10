@@ -24,6 +24,19 @@ export function isPreferOpenTool(tool: {
 	if (PREFER_OPEN_TOOL_NAMES.has(tool.toolName)) return true;
 	// A question wait is an answer surface, not an ordinary task-status card.
 	const input = tool.inputJson;
+	// Outline Ask also records answers and withdrawals; only new questions are an
+	// answer surface. Keep those calls separate from activity traces at every LOD.
+	if (tool.toolName === "Ask") {
+		return (
+			typeof input === "object" &&
+			input !== null &&
+			"questions" in input &&
+			Array.isArray(input.questions) &&
+			input.questions.length > 0 &&
+			!("withdraw" in input) &&
+			!("answered" in input)
+		);
+	}
 	return (
 		tool.toolName === "Await" &&
 		(tool.status === "running" || tool.status === "executing") &&

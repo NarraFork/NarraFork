@@ -816,13 +816,16 @@ export class OutlineView implements CmdHost, ClientView {
 			if (!sel) continue;
 			const style = `--peer:${peer.color}`;
 			if ("b" in sel) {
+				// An agent's cursor is always whole blocks: the task it holds, what it just wrote
+				// (P2 PR 10b); drawn as a person's block selection is.
+				const attrs = peer.agent
+					? { class: "ob-peer-bsel ob-agent-bsel", style, "data-agent": peer.name || "agent" }
+					: { class: "ob-peer-bsel", style };
 				for (const id of sel.b) {
 					const bpos = findBlockPos(doc, id);
 					if (bpos == null) continue;
 					const block = doc.nodeAt(bpos) as PMNode;
-					decos.push(
-						Decoration.node(bpos, bpos + block.nodeSize, { class: "ob-peer-bsel", style }),
-					);
+					decos.push(Decoration.node(bpos, bpos + block.nodeSize, attrs));
 				}
 				continue;
 			}

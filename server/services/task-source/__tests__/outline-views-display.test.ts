@@ -153,6 +153,7 @@ describe("context_update rows of the current-tasks view", () => {
 		]);
 		const docs = await taskState(id, "Write the docs");
 		const tag = await taskState(id, "Tag the build");
+		const announce = await taskState(id, "Announce it");
 		await request(id);
 		const [row] = await updates(id);
 		expect(row?.text).toBe("Context updated: outline.tasks");
@@ -162,6 +163,23 @@ describe("context_update rows of the current-tasks view", () => {
 				waiting: [],
 				next: [{ address: tag.address, title: "Tag the build" }],
 				counts: { doing: 1, waiting: 0, todo: 2 },
+				// Every open task by address under its state: what the next update is compared with.
+				states: { doing: [docs.address], todo: [tag.address, announce.address] },
+				// Compared with the view the epoch's baseline held (the seed replaced every task:
+				// the two old ones were deleted, three new ones came).
+				changes: [
+					{ address: docs.address, title: "Write the docs", kind: "started" },
+					{ address: tag.address, title: "Tag the build", kind: "added" },
+					{ address: expect.any(String), title: "Announce it", kind: "added" },
+					{
+						address: expect.any(String),
+						title: "Write the parser",
+						kind: "removed",
+						from: "doing",
+					},
+					{ address: expect.any(String), title: "Write the docs", kind: "removed", from: "todo" },
+				],
+				changed: 5,
 			},
 		});
 		// What the model reads (the frozen update text and its changes) is the view's text alone:
@@ -174,7 +192,7 @@ describe("context_update rows of the current-tasks view", () => {
 		expect(loaded.modelText ?? "").not.toContain("counts");
 	});
 
-	test("a view that goes away stores null; a change of another part stores no summary", async () => {
+	test("a view that goes away stores an empty list; a change of another part stores no summary", async () => {
 		const id = await session();
 		const pageId = await seedBehaviorPage(id, "Never force-push the main branch.");
 		await seedOutlineTasks(id, [{ text: "Write the parser", status: "doing" }]);
@@ -184,7 +202,25 @@ describe("context_update rows of the current-tasks view", () => {
 		await request(id);
 		const removed = await updates(id);
 		expect(removed).toHaveLength(1);
-		expect(removed[0]?.block.display).toEqual({ "outline.tasks": null });
+		// (Compared with the epoch's baseline, it also says what emptied the list.)
+		expect(removed[0]?.block.display).toEqual({
+			"outline.tasks": {
+				doing: [],
+				waiting: [],
+				next: [],
+				counts: { doing: 0, waiting: 0, todo: 0 },
+				states: {},
+				changes: [
+					{
+						address: expect.any(String),
+						title: "Write the parser",
+						kind: "removed",
+						from: "doing",
+					},
+				],
+				changed: 1,
+			},
+		});
 		// Only the behavior boundary changes: an update without a summary, written as before.
 		const { writeOutline } = await import("../../outline/write");
 		const { ensureSessionSpace } = await import("../../outline/spaces");

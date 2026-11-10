@@ -1180,6 +1180,9 @@ async function applySpecForkCarryover(
  */
 async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void> {
 	try {
+		// An outline session's tasks are not in Dynamic Spec (outline P2 PR 12a): a card would
+		// point at spec tasks it does not use (and reading them would create a spec namespace).
+		if ((await readTaskBackend(narratorId)) === "outline") return;
 		const summary = await specVfsService.summarizeSpecTasks(narratorId);
 		if (summary.total <= 0) return;
 		await narratorPersistence.persistDisplayMessage(narratorId, "", [

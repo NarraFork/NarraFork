@@ -255,6 +255,9 @@ export async function openEditor(
 		width?: number;
 		/** The viewer's time zone (IANA), for what is shown in local time. */
 		timezone?: string;
+		lang?: "en" | "zh-CN";
+		scheme?: "light" | "dark";
+		host?: boolean;
 	} = {},
 ): Promise<Editor> {
 	const context = await h.browser.createBrowserContext();
@@ -281,6 +284,9 @@ export async function openEditor(
 		...(options.focusId ? { focusId: options.focusId } : {}),
 		...(options.lens ? { lens: options.lens } : {}),
 		...(options.width ? { width: options.width - 32 } : {}),
+		...(options.lang ? { lang: options.lang } : {}),
+		...(options.scheme ? { scheme: options.scheme } : {}),
+		...(options.host ? { host: true } : {}),
 	});
 	try {
 		await page.waitForFunction(
