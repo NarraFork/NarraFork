@@ -241,25 +241,53 @@ describe("single-file restore", () => {
 			return unlink(path);
 		});
 		restores.push(() => spy.mockRestore());
+		// Expire the real restore deadline only after unlink has started. A wall-clock
+		// 15ms race can otherwise abort preflight, leaving `entered` unresolved on CI.
+		const realSetTimeout = globalThis.setTimeout;
+		let expire: (() => void) | undefined;
+		const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			...args: Parameters<typeof setTimeout>
+		) => {
+			const [callback, delay, ...callbackArgs] = args;
+			const timer = realSetTimeout(callback, delay, ...callbackArgs);
+			if (delay === request.timeoutMs && typeof callback === "function") {
+				clearTimeout(timer);
+				expire = () => callback(...callbackArgs);
+			}
+			return timer;
+		}) as typeof setTimeout);
+		restores.push(() => timerSpy.mockRestore());
 		const response = Promise.withResolvers<Awaited<ReturnType<typeof restoreLocalFile>>>();
 		const first = withFileWrite(request.identity, async () => {
 			const result = await restoreLocalFile(request);
 			response.resolve(result);
 			await result.whenSettled;
 		});
-		await entered.promise;
-		const result = await response.promise;
-		expect(result.status).toBe("uncertain_after_dispatch");
-		expect(result.ioPending).toBe(true);
 		let secondStarted = false;
-		const second = withFileWrite(request.identity, () => {
-			secondStarted = true;
-		});
-		await Promise.resolve();
-		expect(secondStarted).toBe(false);
-		gate.resolve();
-		await first;
-		await second;
+		let second: Promise<void> | undefined;
+		try {
+			await Promise.race([
+				entered.promise,
+				response.promise.then((result) => {
+					throw new Error(`Restore finished before IO: ${result.status}/${result.reason}`);
+				}),
+			]);
+			if (!expire) throw new Error("Restore deadline was not registered");
+			expire();
+			const result = await response.promise;
+			expect(result.status).toBe("uncertain_after_dispatch");
+			expect(result.reason).toBe("timeout");
+			expect(result.ioPending).toBe(true);
+			second = withFileWrite(request.identity, () => {
+				secondStarted = true;
+			});
+			await Promise.resolve();
+			expect(secondStarted).toBe(false);
+		} finally {
+			gate.resolve();
+			await first;
+			await second;
+		}
 		expect(secondStarted).toBe(true);
 	});
 });
