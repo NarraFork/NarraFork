@@ -12,7 +12,8 @@
  */
 import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { db } from "../../db";
+import { readTestMessageContent } from "../../../tests/setup";
+import { db, sqlite } from "../../db";
 import { narratorMessages, narrators, specNamespaces } from "../../db/schema";
 import { shouldRunTaskReflection } from "../../lib/agent/loop";
 import { executeTool, getOutlineSpecRejection } from "../../lib/agent/tool-executor";
@@ -332,10 +333,14 @@ describe("Dynamic Spec writes from other paths", () => {
 		await appendProtectedSpecTask(spec, "Ship it");
 		await narratorService.insertSpecClearedCarryoverCard(spec);
 		const cards = await db
-			.select({ contentJson: narratorMessages.contentJson })
+			.select({ id: narratorMessages.id })
 			.from(narratorMessages)
 			.where(eq(narratorMessages.narratorId, spec));
-		expect(JSON.stringify(cards)).toContain("spec_context_cleared");
+		expect(cards.length).toBeGreaterThan(0);
+		// The body lives in the block store, not in `contentJson`.
+		expect(JSON.stringify(cards.map((card) => readTestMessageContent(sqlite, card.id)))).toContain(
+			"spec_context_cleared",
+		);
 	});
 
 	test("spec sessions write as before; an outline session reads as spec while switched off", async () => {
