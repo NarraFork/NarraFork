@@ -16,6 +16,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { customApiBalanceDisplayFor } from "./model/custom-api-usage-source";
 import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "./useNarratorPanelWS";
+import { findPendingForKey } from "./vlist/vlist-permission-match";
 
 type QuotaSettings = {
 	customApiQuotas: NonNullable<Parameters<typeof customApiBalanceDisplayFor>[0]["pushedQuotas"]>;
@@ -475,4 +476,106 @@ describe("mounted panel and real WS hook reconciliation", () => {
 			second.resolve(page(permissions(8, 32)));
 		});
 	}
+});
+
+describe("plan reflection handover with the real WS hook", () => {
+	for (const child of [false, true]) {
+		for (const stoppedFirst of [true, false]) {
+			test(`${child ? "child" : "primary"}: ${stoppedFirst ? "handover then permission" : "late handover"} uses only the durable approval id`, async () => {
+				connected = true;
+				const unrelated = permissions(1);
+				panelSpy.mockResolvedValue(page(unrelated));
+				await render();
+				const routing = {
+					ownerNarratorId: child ? "child-narrator" : narratorId,
+					...(child ? { subagentNarratorId: "child-narrator", parentToolUseId: "agent-call" } : {}),
+				};
+				const permission: PendingPermission = {
+					id: "durable-plan-call",
+					toolUseId: "plan-tool-use",
+					toolName: "ExitPlanMode",
+					inputJson: { mode: "outline" },
+					...routing,
+				};
+				const stopped = {
+					type: "plan_reflection_stopped",
+					requestId: "exit_plan_synthetic",
+					toolUseId: permission.toolUseId,
+					toolName: permission.toolName,
+					inputJson: permission.inputJson,
+					...routing,
+				};
+				if (stoppedFirst) {
+					await event(stopped);
+					// A stopped reflection is not an approval request, even with outline input.
+					expect(current.pendingPermissions).toEqual(unrelated);
+					expect(findPendingForKey("tool-plan-tool-use", current.pendingPermissions)).toBeNull();
+				}
+				panelSpy.mockResolvedValue(page([...unrelated, permission]));
+				await event({ type: "permission_request", request: permission });
+				await event(stopped); // A late/repeated handover must not recreate a synthetic gate.
+				expect(current.pendingPermissions).toEqual([...unrelated, permission]);
+				expect(findPendingForKey("tool-plan-tool-use", current.pendingPermissions)).toEqual(
+					permission,
+				);
+				await event({ type: "plan_reflection_resolved", requestId: stopped.requestId });
+				expect(current.pendingPermissions).toEqual([...unrelated, permission]);
+				await event({ type: "permission_resolved", requestId: permission.id, decision: "allow" });
+				expect(current.pendingPermissions).toEqual(unrelated);
+			});
+		}
+	}
+
+	test("handover refreshes the panel snapshot when the permission event is missed", async () => {
+		connected = true;
+		await render();
+		const permission: PendingPermission = {
+			id: "durable-plan-call",
+			toolUseId: "plan-tool-use",
+			toolName: "ExitPlanMode",
+			inputJson: { mode: "outline" },
+		};
+		panelSpy.mockResolvedValue(page([permission]));
+		await event({
+			type: "plan_reflection_stopped",
+			requestId: "exit_plan_synthetic",
+			toolUseId: permission.toolUseId,
+			toolName: permission.toolName,
+			inputJson: permission.inputJson,
+		});
+		expect(current.pendingPermissions).toEqual([]);
+		await retryTick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(panelSpy.mock.calls[1]?.[1]?.fresh).toBe(true);
+		expect(current.pendingPermissions).toEqual([permission]);
+	});
+
+	test("reconnect restores the durable request when its permission event was missed", async () => {
+		connected = true;
+		await render();
+		await event({
+			type: "plan_reflection_stopped",
+			requestId: "exit_plan_synthetic",
+			toolUseId: "plan-tool-use",
+			toolName: "ExitPlanMode",
+			inputJson: { mode: "outline" },
+		});
+		expect(current.pendingPermissions).toEqual([]);
+		const permission: PendingPermission = {
+			id: "durable-plan-call",
+			toolUseId: "plan-tool-use",
+			toolName: "ExitPlanMode",
+			inputJson: { mode: "outline" },
+			suggestions: [
+				{ type: "plan_reflection", status: "awaiting_user", requestId: "exit_plan_synthetic" },
+			],
+		};
+		await connection(false);
+		panelSpy.mockResolvedValue(page([permission]));
+		await connection(true);
+		expect(findPendingForKey("tool-plan-tool-use", current.pendingPermissions)?.id).toBe(
+			permission.id,
+		);
+		expect(current.pendingPermissions).toEqual([permission]);
+	});
 });
