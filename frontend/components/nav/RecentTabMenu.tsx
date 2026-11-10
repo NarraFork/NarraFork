@@ -100,6 +100,8 @@ export interface TabContextMenuProps {
 	canReveal: boolean;
 	onNewNarratorHere: () => void;
 	canNewNarratorHere: boolean;
+	/** 文件夹上删的是分组语义，文案与「在此目录新建」不同；缺省用会话版本。 */
+	newNarratorHereLabel?: string;
 	onCopyCwd: () => void;
 	canCopyCwd: boolean;
 	onOpenInWindow: () => void;
@@ -172,6 +174,7 @@ export function TabContextMenu({
 	canReveal,
 	onNewNarratorHere,
 	canNewNarratorHere,
+	newNarratorHereLabel,
 	onCopyCwd,
 	canCopyCwd,
 	onOpenInWindow,
@@ -360,7 +363,7 @@ export function TabContextMenu({
 						>
 							<Group gap={8} wrap="nowrap">
 								<IconFolderPlus size={14} />
-								<Text size="sm">{t("newNarratorHere")}</Text>
+								<Text size="sm">{newNarratorHereLabel ?? t("newNarratorHere")}</Text>
 							</Group>
 						</UnstyledButton>
 					)}

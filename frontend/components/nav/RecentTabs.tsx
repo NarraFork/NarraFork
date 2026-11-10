@@ -97,6 +97,7 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * reload. Importers must reach the logic module directly.
  */
 import { stripKey } from "./recent-tab-keyboard-nav";
+import { newSessionTargetFor } from "./recent-tab-new-session";
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
@@ -523,9 +524,11 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const [editFolder, setEditFolder] = useState<RecentTab | null>(null);
 
 	// Open the shell before resolving cwd; only a resolved target mounts the form body.
+	// 文件夹目标没有目录要解析，`folderId` 表示"建完把新会话放进去"。
 	const [newNarratorTarget, setNewNarratorTarget] = useState<{
-		narratorId: string;
+		narratorId?: string;
 		cwd?: string;
+		folderId?: string;
 	} | null>(null);
 	const newNarratorTargetRef = useRef(newNarratorTarget);
 	newNarratorTargetRef.current = newNarratorTarget;
@@ -747,11 +750,17 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const newNarratorHereFor = useCallback(
 		async (tab: RecentTab) => {
 			if (!requireSetup()) return;
-			const narratorId = getRecentTabNarratorId(tab);
-			if (!narratorId) {
-				notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+			const sessionTarget = newSessionTargetFor(tab);
+			if (!sessionTarget) return;
+			// 文件夹没有目录要解析：直接用弹窗的默认预填，建完再归入这个文件夹。
+			if ("folderId" in sessionTarget) {
+				newNarratorRequestRef.current += 1;
+				const folderTarget = { folderId: sessionTarget.folderId };
+				newNarratorTargetRef.current = folderTarget;
+				setNewNarratorTarget(folderTarget);
 				return;
 			}
+			const { narratorId } = sessionTarget;
 			const request = ++newNarratorRequestRef.current;
 			const target = { narratorId };
 			newNarratorTargetRef.current = target;
@@ -779,14 +788,21 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 
 	const handleNewNarratorHereCreated = useCallback(
 		(data: CreateNarratorResult) => {
+			const folderId = newNarratorTargetRef.current?.folderId;
 			closeNewNarratorHere();
-			addRecentTab({
-				type: "narrator",
-				id: data.id,
-				title: data.title,
-				subtitle: data.cwd,
-				status: data.status,
-			});
+			void (async () => {
+				await addRecentTab({
+					type: "narrator",
+					id: data.id,
+					title: data.title,
+					subtitle: data.cwd,
+					status: data.status,
+				});
+				// 侧栏 upsert 会剥离 folderId，归属只能走文件夹端点；失败不影响已创建的会话。
+				if (folderId) {
+					await api.moveRecentTab(`narrator:${data.id}`, { folderId }).catch(() => {});
+				}
+			})();
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
@@ -1270,7 +1286,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								onReveal={handleReveal}
 								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
 								onNewNarratorHere={handleNewNarratorHere}
-								canNewNarratorHere={ctxTab.type === "narrator" || ctxTab.type === "subagent"}
+								canNewNarratorHere={newSessionTargetFor(ctxTab) !== null}
+								newNarratorHereLabel={ctxIsFolder ? t("newNarratorInFolder") : t("newNarratorHere")}
 								onCopyCwd={handleCopyCwd}
 								canCopyCwd={["narrator", "subagent"].includes(ctxTab.type)}
 								onOpenInWindow={handleOpenInWindow}
@@ -1352,7 +1369,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						/>
 						<CreateNarratorLazyModal
 							opened={newNarratorTarget !== null}
-							busy={newNarratorTarget?.cwd == null}
+							// 只有"待解析目录的会话目标"才算忙；文件夹目标直接出表单。
+							busy={newNarratorTarget?.narratorId != null && newNarratorTarget.cwd == null}
 							initialCwd={newNarratorTarget?.cwd}
 							onClose={closeNewNarratorHere}
 							onCreated={handleNewNarratorHereCreated}

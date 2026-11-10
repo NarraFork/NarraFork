@@ -300,3 +300,22 @@ describe("touch access to the details a row no longer shows", () => {
 		expect(container?.querySelector("[data-recent-tab-clear]")).toBeNull();
 	});
 });
+
+describe("new session entry", () => {
+	test("a session tab keeps the directory wording", async () => {
+		await render(<TabContextMenu {...menuProps({ canNewNarratorHere: true })} />);
+		const text = container?.ownerDocument.body.textContent ?? "";
+		expect(text).toContain("newNarratorHere");
+	});
+
+	test("a folder shows its own wording: there is no directory to inherit", async () => {
+		await render(
+			<TabContextMenu
+				{...menuProps({ canNewNarratorHere: true, newNarratorHereLabel: "newNarratorInFolder" })}
+			/>,
+		);
+		const text = container?.ownerDocument.body.textContent ?? "";
+		expect(text).toContain("newNarratorInFolder");
+		expect(text).not.toContain("newNarratorHere");
+	});
+});
