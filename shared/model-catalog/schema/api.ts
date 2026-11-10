@@ -1,88 +1,73 @@
-import type { ModelCard } from "../card";
-import type { ModelQuery, RawCatalog, RawLocalState } from "./catalog";
+import type { ModelOverride, OverrideField } from "../override";
+import type { MatchedVia } from "./catalog";
 
-/** Common wire shapes. API roots differ between the two applications. */
-export interface CatalogUpdateStatus {
-	activeVersion: string;
-	bundledVersion: string;
+/** GET /api/model-catalog/status (and every update action's response). */
+export interface CatalogStatus {
+	/** Short catalog version (commit or bundle hash prefix). */
+	version: string;
+	publishedAt: string;
+	source: "builtin" | "downloaded";
+	models: number;
+	autoUpdate: boolean;
 	lastCheckedAt?: string;
-	pendingVersion?: string;
 	lastError?: string;
-	autoApply: boolean;
-	pinnedVersion: string | null;
-	history: Array<{ catalogVersion: string; publishedAt: string }>;
-	protectedFieldCount?: number;
-	pendingDiff?: {
-		added: string[];
-		changed: string[];
-		removed: string[];
-		/** Metadata leaf differences; absence of before/after means inheritance. */
-		fields?: Array<{
-			target: "model" | "variant";
-			id: string;
-			path: string;
-			before?: unknown;
-			after?: unknown;
-		}>;
-	};
+	/** A downloaded catalog waiting to be applied (only when auto update is off). */
+	pending?: { version: string; publishedAt: string; added: number; changed: number };
 }
-/** Complete source metadata plus the local layer, no derived defaults. */
-export interface ModelCardSnapshot {
-	schemaVersion: 2;
-	catalog: RawCatalog;
-	local: RawLocalState;
-	update: CatalogUpdateStatus;
-}
-/** GET root/v2 -> snapshot; POST root/v2/mutate -> ModelCardMutation -> snapshot.
- * POST root/v2/resolve -> {query} | {model} -> card (includes actual discovery).
- * POST root/updates/check -> snapshot.
- * POST root/updates/apply -> {version?: string} -> snapshot (staged checked version only).
- * POST root/updates/rollback -> {version: string} -> snapshot (retained version only).
- * PATCH root/updates/settings -> {autoApply?: boolean,pinnedVersion?: string|null} -> snapshot.
- * Stale baseRevision -> HTTP 409. Failed validation -> HTTP 400. Admin writes only.
- */
-export interface ModelCatalogResolveRequest {
-	query?: ModelQuery;
-	model?: string;
-}
-export type ModelCatalogResolveResponse = ModelCard;
 
-/** Where the window a provider entry runs with comes from, as the provider page labels it. */
-export type ModelWindowSource =
-	/** This provider entry's own value. */
-	| "own"
-	/** A catalog-editor binding for this connection. */
-	| "binding"
-	/** A model-wide value the user set for the catalog model. */
-	| "model"
-	/** Reported by the gateway or provider listing. */
-	| "discovered"
-	/** The provider's configured default window. */
+/** Where an effective value comes from, in the words the editor shows. */
+export type FieldOrigin =
+	/** The public model catalog. */
+	| "catalog"
+	/** Reported by the gateway or the provider's model listing. */
+	| "upstream"
+	/** The provider's configured default context window. */
 	| "provider"
-	/** The bundled catalog. */
-	| "preset"
-	/** Nothing declared: the runtime default. */
-	| "fallback";
+	/** The user's model-wide override. */
+	| "model"
+	/** The user's override for this provider entry. */
+	| "connection"
+	/** Nothing declared; the runtime default applies. */
+	| "default";
 
-/** One provider entry's context window and the two scopes that can set it. */
-export interface ModelWindowInfo {
+export type EffectiveFields = {
+	[K in OverrideField]?: { value: NonNullable<ModelOverride[K]>; origin: FieldOrigin };
+};
+
+/** One provider entry (`provider:model`) as the models page and provider page show it. */
+export interface ModelDescription {
 	model: string;
-	/** What requests use. */
-	contextWindow: number;
-	source: ModelWindowSource;
-	/** This provider entry's own working window. */
-	own?: number;
-	/** What applies when `own` is cleared. */
-	inherited: number;
-	inheritedSource: ModelWindowSource;
-	/** The catalog model a model-wide value targets; absent when there is none to target. */
-	modelId?: string;
-	/** The model-wide working window, when one is set. */
-	modelWide?: number;
-	/** Other provider entries of the same model that set their own window. */
-	others: Array<{ model: string; contextWindow: number }>;
+	/** Catalog model this entry matched, if any. */
+	catalogModelId?: string;
+	catalogName?: string;
+	matchedVia: MatchedVia;
+	/**
+	 * A model-wide override reaches this entry only on an exact or alias match; a
+	 * prefix/suffix match is a look-alike and is edited per entry.
+	 */
+	modelWideEditable: boolean;
+	effective: EffectiveFields;
+	modelOverride?: ModelOverride;
+	connectionOverride?: ModelOverride;
 }
-export interface ModelWindowsResponse {
+
+/** POST /api/model-catalog/models {models: string[]} */
+export interface ModelDescriptionsResponse {
 	revision: number;
-	windows: ModelWindowInfo[];
+	models: ModelDescription[];
+}
+
+/** PUT /api/model-catalog/overrides; `fields: null` clears the override. */
+export interface ModelOverrideRequest {
+	scope: "model" | "connection";
+	/** Catalog model id for `model`, the full `provider:model` value for `connection`. */
+	key: string;
+	fields: ModelOverride | null;
+}
+
+/** Field-level rejection body (HTTP 400). */
+export interface ModelOverrideError {
+	error: string;
+	code: "INVALID_OVERRIDE";
+	field: string;
 }

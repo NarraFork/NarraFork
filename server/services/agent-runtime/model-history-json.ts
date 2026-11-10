@@ -1,9 +1,48 @@
 export const MODEL_JSON_CONTAINER_BYTES = 256;
 export const MODEL_JSON_SLOT_BYTES = 32;
-export const MODEL_JSON_MAX_CONTAINER_SLOTS = 16_384;
+
+/** Only allocation failures may be translated into a history-size recovery error. */
+export class ModelJsonBudgetError extends Error {}
+
+/** One estimate for the complete preparation, including reused rows. This is not an RSS cap. */
+export class ModelHistoryBudget {
+	preparedBytes = 0;
+
+	constructor(
+		readonly maxBytes: number,
+		private readonly signal?: AbortSignal,
+	) {}
+
+	check = (): void => {
+		this.signal?.throwIfAborted();
+	};
+
+	/** Reserve wire/UTF-16/projection overhead before fetching a body, or known reused costs. */
+	reserve(rawBytes = 0, rows = 0, jsonContainerBytes = 0): void {
+		this.check();
+		const next = this.preparedBytes + rawBytes * 4 + rows * 1024 + jsonContainerBytes;
+		if (next > this.maxBytes)
+			throw new ModelJsonBudgetError(
+				`Model history preparation exceeded estimated ${this.maxBytes} byte budget`,
+			);
+		this.preparedBytes = next;
+	}
+
+	/** Each value pays its graph cost before JSON.parse, not after a row or batch is assembled. */
+	parse(raw: unknown): { value: unknown; jsonContainerBytes: number } {
+		const jsonContainerBytes = modelJsonContainerBytes(
+			raw,
+			this.maxBytes - this.preparedBytes,
+			this.check,
+		);
+		this.reserve(0, 0, jsonContainerBytes);
+		return { value: typeof raw === "string" ? JSON.parse(raw) : raw, jsonContainerBytes };
+	}
+}
 
 export interface ModelJsonShapeOptions {
-	deadline: number;
+	/** The caller owns cancellation/deadlines; this scanner only enforces allocation limits. */
+	check?: () => void;
 	maxBytes?: number;
 	maxContainerSlots?: number;
 }
@@ -21,18 +60,22 @@ export interface ModelJsonShape {
  */
 export function measureModelJsonShape(
 	raw: unknown,
-	options: ModelJsonShapeOptions,
+	options: ModelJsonShapeOptions = {},
 ): ModelJsonShape {
+	options.check?.();
 	const shape: ModelJsonShape = { bytes: 0, containers: 0, slots: 0, maxContainerSlots: 0 };
 	if (typeof raw !== "string") return shape;
 	const maxBytes = Math.min(options.maxBytes ?? 128 * 1024 * 1024, 128 * 1024 * 1024);
-	const maxContainerSlots = options.maxContainerSlots ?? MODEL_JSON_MAX_CONTAINER_SLOTS;
+	const maxContainerSlots = options.maxContainerSlots ?? Number.POSITIVE_INFINITY;
 	const stack: Array<{ array: boolean; expectingSlot: boolean; slots: number }> = [];
 	let quoted = false;
-	let nextDeadlineCheck = 0;
+	let nextCheck = 16_384;
 	const reserve = (bytes: number) => {
 		shape.bytes += bytes;
-		if (shape.bytes > maxBytes) throw new Error("Model history preparation exceeded 128MiB budget");
+		if (shape.bytes > maxBytes)
+			throw new ModelJsonBudgetError(
+				`Model history JSON allocation estimate exceeded remaining ${maxBytes} byte budget`,
+			);
 	};
 	for (let index = 0; index < raw.length; index++) {
 		const code = raw.charCodeAt(index);
@@ -54,7 +97,9 @@ export function measureModelJsonShape(
 				shape.maxContainerSlots = Math.max(shape.maxContainerSlots, parent.slots);
 				reserve(MODEL_JSON_SLOT_BYTES);
 				if (parent.slots > maxContainerSlots)
-					throw new Error("Model history JSON container width exceeded allocation budget");
+					throw new ModelJsonBudgetError(
+						"Model history JSON container width exceeded allocation budget",
+					);
 			}
 			if (code === 34) quoted = true;
 			else if (code === 123 || code === 91) {
@@ -64,16 +109,20 @@ export function measureModelJsonShape(
 			} else if (code === 125 || code === 93) stack.pop();
 			else if (code === 44 && parent) parent.expectingSlot = true;
 		}
-		if (index >= nextDeadlineCheck) {
-			nextDeadlineCheck = index + 16_384;
-			if (Date.now() >= options.deadline)
-				throw new Error("Model history preparation exceeded 10s budget");
+		if (index >= nextCheck) {
+			nextCheck = index + 16_384;
+			options.check?.();
 		}
 	}
+	options.check?.();
 	return shape;
 }
 
 /** Compatibility name: now reserves all graph slots, not only containers. */
-export function modelJsonContainerBytes(raw: unknown, deadline: number, maxBytes?: number): number {
-	return measureModelJsonShape(raw, { deadline, maxBytes }).bytes;
+export function modelJsonContainerBytes(
+	raw: unknown,
+	maxBytes?: number,
+	check?: () => void,
+): number {
+	return measureModelJsonShape(raw, { maxBytes, check }).bytes;
 }

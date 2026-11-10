@@ -194,7 +194,7 @@ const NON_RETRYABLE_PATTERNS = [
  * sounds. Single entry point so every caller shares the usage-limit wording
  * family instead of only the literal patterns above.
  */
-function isHardNonRetryableText(text: string): boolean {
+export function isHardNonRetryableText(text: string): boolean {
 	return (
 		NON_RETRYABLE_PATTERNS.some((pattern) => text.includes(pattern)) || isHardUsageLimitText(text)
 	);

@@ -1,26 +1,30 @@
 /**
- * FileLinkMenuItems.tsx — "copy file" / "download file" for a file link in message content.
+ * FileLinkMenuItems.tsx — "show in file manager" / "copy file" / "download file" for a file link
+ * in message content.
  *
- * Right-clicking a rendered file link opens the row's ordinary message menu; these two items sit
+ * Right-clicking a rendered file link opens the row's ordinary message menu; these items sit
  * directly under its "copy" entry and act on the file the gesture pointed at, rather than on the
  * message text. The target is resolved from the link's own marker (see
  * `lib/file-link-target.ts`), so a row containing several links answers for whichever one was hit.
  *
- * Why the two items differ in availability:
+ * Why the items differ in availability:
  *  - download  — the bytes are served by the server to this browser, so it works whether NarraFork
  *                is reached on the server machine or across the network. The click opens a tab
  *                immediately, then that tab navigates to a short-lived ticket URL so the browser
  *                streams the file to disk (`lib/file-download.ts`). A mint failure closes the tab
  *                and shows a notification. A claim failure stays in the tab as HTML.
- *  - copy file — the file is placed on the clipboard of the machine running NarraFork, which is
- *                why it is offered only when the browser is on that machine
- *                (`isLocalBrowserSession`). A page cannot do this itself: the clipboard API accepts
- *                only text/HTML/PNG, never an arbitrary file.
+ *  - show in file manager / copy file — both act on the desktop of the machine running NarraFork
+ *                (a file-manager window there, or its clipboard), which is why they are offered
+ *                only when the browser is on that machine (`isLocalBrowserSession`). A page cannot
+ *                copy a file itself: the clipboard API accepts only text/HTML/PNG. The file
+ *                manager also needs an absolute path on a supported desktop, the same rule the
+ *                file panels apply (`fileRevealDirectory`).
  *
- * Both are hidden for a target on another device: that file is not on the server host, so neither
- * action could reach it. The file panels gate their own download the same way.
+ * All are hidden for a target on another device: that file is not on the server host, so none
+ * of these actions could reach it. The file panels gate their own download the same way.
  */
 
+import { usePlatform } from "@frontend/hooks/usePlatform";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { ApiError, api } from "@frontend/lib/api";
 import {
@@ -29,10 +33,11 @@ import {
 	openDownloadTab,
 } from "@frontend/lib/file-download";
 import { isLocalBrowserSession } from "@frontend/lib/local-origin";
+import { fileRevealDirectory } from "@frontend/lib/reveal-directory";
 import { Menu } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { FileTarget } from "@shared/file-reference";
-import { IconClipboardCopy, IconDownload } from "@tabler/icons-react";
+import { IconClipboardCopy, IconDownload, IconFolder } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 
 /** Basename without a path module: the server sends a name, this is only the fallback. */
@@ -52,8 +57,26 @@ export function FileLinkMenuItems({
 }) {
 	const { t: tNarrator } = useTranslation("narrator");
 	const { data: userPrefs } = useUserPreferences();
+	const platform = usePlatform();
 
 	if (!target || target.deviceId !== "local") return null;
+
+	const localBrowser = isLocalBrowserSession(userPrefs?.treatAsLocalAccess);
+	// Same gate as the file panels; the server then selects the file itself, not just its folder.
+	const canReveal =
+		fileRevealDirectory(target.path, target.deviceId, platform, localBrowser) !== null;
+
+	const revealFile = async () => {
+		try {
+			await api.fsReveal(target.path);
+		} catch (error) {
+			notifications.show({
+				color: "red",
+				title: tNarrator("contextMenu_revealFileFailed"),
+				message: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
 
 	const copyFile = async () => {
 		try {
@@ -103,7 +126,18 @@ export function FileLinkMenuItems({
 
 	return (
 		<>
-			{isLocalBrowserSession(userPrefs?.treatAsLocalAccess) && (
+			{canReveal && (
+				<Menu.Item
+					leftSection={<IconFolder size={14} />}
+					onClick={() => {
+						onClose();
+						void revealFile();
+					}}
+				>
+					{tNarrator("contextMenu_revealFile")}
+				</Menu.Item>
+			)}
+			{localBrowser && (
 				<Menu.Item
 					leftSection={<IconClipboardCopy size={14} />}
 					onClick={() => {

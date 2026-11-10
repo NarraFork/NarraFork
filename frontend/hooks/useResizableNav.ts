@@ -290,16 +290,27 @@ function onVisibilityChange(): void {
 }
 
 /** Begin a resize drag. Stable identity, so it never invalidates a memo. */
-export function startNavResize(event: {
-	clientX: number;
-	preventDefault: () => void;
-	currentTarget?: HTMLElement | null;
-}): void {
+export function startNavResize(
+	event: {
+		clientX: number;
+		preventDefault: () => void;
+		currentTarget?: HTMLElement | null;
+	},
+	options: { expandFromHover?: boolean } = {},
+): void {
 	event.preventDefault();
 	if (drag) endDrag();
 	// A release frame from the previous gesture must never clear the next one.
 	restoreDragStyles();
 	dragStyles = captureDragStyles(event.currentTarget);
+	if (options.expandFromHover && getCollapsed()) {
+		// The pointer grabbed the visible overlay edge, not the stored 73px rail edge.
+		// Pin it open immediately and start from its visible width so the first move
+		// does not jump. Capture styles first to suppress the shell's resize transition.
+		const expanded = getNavExpandedWidth();
+		writeWidth(expanded, true);
+		persist(expanded);
+	}
 	drag = { startX: event.clientX, startWidth: getWidth() };
 	document.body.style.cursor = "col-resize";
 	document.body.style.userSelect = "none";

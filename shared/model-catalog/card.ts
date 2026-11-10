@@ -168,10 +168,10 @@ export interface ModelCardView {
 export interface ModelCard {
 	schemaVersion: 2;
 	catalogVersion: string;
+	/** Revision of the user's overrides the card was resolved with. */
 	localRevision: number;
 	modelId?: string;
 	variantId?: string;
-	bindingId?: string;
 	matchedVia: MatchedVia;
 	metadata: RawMetadata;
 	provenance: Record<string, FieldSource>;

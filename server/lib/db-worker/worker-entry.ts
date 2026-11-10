@@ -48,6 +48,7 @@ import type {
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
+import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 
 declare const self: Worker;
 
@@ -203,49 +204,53 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	try {
 		const params = message.params;
 		const result =
-			params.kind === "displayPageMessagesPostgres"
-				? await runPostgresDisplayPageQuery(
-						message.dbPath,
-						{ ...params, kind: "displayPageMessages" },
-						controller.signal,
-					)
-				: params.kind === "blockBackfillSlice"
-					? runBlockBackfillSlice(getConnection(message.dbPath), params)
-					: params.kind === "blockVerifySlice"
-						? runBlockVerifySlice(getConnection(message.dbPath), params)
-						: params.kind === "blockReindexSlice"
-							? runBlockReindexSlice(getConnection(message.dbPath), params)
-							: params.kind === "blockIndexQueueSlice"
-								? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
-								: params.kind === "blockProjectionSlice"
-									? runBlockProjectionSlice(getConnection(message.dbPath), params)
-									: params.kind === "displayPageMessages"
-										? runDisplayPageQuery(getConnection(message.dbPath), params)
-										: params.kind === "selectRows"
-											? runSelectRows(getConnection(message.dbPath), params)
-											: params.kind === "storageScanContext"
-												? runStorageScanContext(message.dbPath)
-												: params.kind === "storageScanSerial"
-													? runStorageScanSerial(
-															message.dbPath,
-															message.requestId,
-															params.mainBytes,
-															controller.signal,
-														)
-													: params.kind === "storageScanCleanupSummaries"
-														? runStorageScanCleanupSummaries(message.dbPath, params)
-														: params.kind === "storageScanSessionPreview"
-															? runStorageScanSessionPreview(
-																	message.dbPath,
-																	params,
-																	controller.signal,
-																)
-															: runStorageScanTables(
+			params.kind === "storageHistoryRead"
+				? runStorageHistoryRead(getConnection(message.dbPath), params)
+				: params.kind === "storageHistoryBody"
+					? runStorageHistoryBody(getConnection(message.dbPath), params)
+					: params.kind === "displayPageMessagesPostgres"
+						? await runPostgresDisplayPageQuery(
+								message.dbPath,
+								{ ...params, kind: "displayPageMessages" },
+								controller.signal,
+							)
+						: params.kind === "blockBackfillSlice"
+							? runBlockBackfillSlice(getConnection(message.dbPath), params)
+							: params.kind === "blockVerifySlice"
+								? runBlockVerifySlice(getConnection(message.dbPath), params)
+								: params.kind === "blockReindexSlice"
+									? runBlockReindexSlice(getConnection(message.dbPath), params)
+									: params.kind === "blockIndexQueueSlice"
+										? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
+										: params.kind === "blockProjectionSlice"
+											? runBlockProjectionSlice(getConnection(message.dbPath), params)
+											: params.kind === "displayPageMessages"
+												? runDisplayPageQuery(getConnection(message.dbPath), params)
+												: params.kind === "selectRows"
+													? runSelectRows(getConnection(message.dbPath), params)
+													: params.kind === "storageScanContext"
+														? runStorageScanContext(message.dbPath)
+														: params.kind === "storageScanSerial"
+															? runStorageScanSerial(
 																	message.dbPath,
 																	message.requestId,
-																	params,
+																	params.mainBytes,
 																	controller.signal,
-																);
+																)
+															: params.kind === "storageScanCleanupSummaries"
+																? runStorageScanCleanupSummaries(message.dbPath, params)
+																: params.kind === "storageScanSessionPreview"
+																	? runStorageScanSessionPreview(
+																			message.dbPath,
+																			params,
+																			controller.signal,
+																		)
+																	: runStorageScanTables(
+																			message.dbPath,
+																			message.requestId,
+																			params,
+																			controller.signal,
+																		);
 		post({
 			type: "result",
 			requestId: message.requestId,

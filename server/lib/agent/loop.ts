@@ -4597,7 +4597,7 @@ async function* agentLoopInMetadataSnapshot(
 					model: effectiveModel,
 					providerId: decided.providerId,
 					providerPrefix: decided.providerPrefix,
-					waitKind: "quota",
+					waitKind: decided.waitKind ?? "quota",
 					quotaProvider: decided.quotaProvider,
 					quotaBucket: decided.bucket,
 					resumeAt: quota.kind === "wait" ? quota.wait.resumeAt : undefined,

@@ -18,6 +18,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { parseProviderWaitInfo } from "@shared/agent-protocol/quota-exhausted";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
 import type {
@@ -91,6 +92,7 @@ import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUse
 import {
 	useUpdateExecutionDevice,
 	useWorkspaceContext,
+	workspaceDirectoryRequiredDeviceId,
 	workspaceFileTarget,
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
@@ -150,6 +152,7 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { DeviceDirectoryDialog } from "./header/DeviceDirectoryDialog";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -454,6 +457,7 @@ function NarratorPanelBody({
 	const permissionReflections = narratorPermissionsCapability.reflections;
 	const planReflectionSupported = permissionReflections.includes("plan");
 	const dangerReflectionSupported = permissionReflections.includes("danger");
+	const questionReflectionSupported = permissionReflections.includes("question");
 	const planModeCapability = useNarratorPlanModeCapability();
 	const planModeSupported = planModeCapability.supported;
 	const planModeUnsupportedReason = planModeSupported
@@ -508,9 +512,22 @@ function NarratorPanelBody({
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
-	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) =>
-		notifications.show({ color: "red", message: error.message }),
-	);
+	// A device with no recorded directory refuses the switch; that is a prompt, not a
+	// failure, so it opens the directory dialog instead of a red toast. The dialog is
+	// mounted here (outside the header and overflow menus) so both entry points share it.
+	const [directoryDeviceId, setDirectoryDeviceId] = useState<string | null>(null);
+	const requireDeviceDirectory = useCallback((deviceId: string) => {
+		setDirectoryDeviceId(deviceId);
+	}, []);
+	const closeDeviceDirectoryDialog = useCallback(() => setDirectoryDeviceId(null), []);
+	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) => {
+		const missingDirectoryDevice = workspaceDirectoryRequiredDeviceId(error);
+		if (missingDirectoryDevice) {
+			requireDeviceDirectory(missingDirectoryDevice);
+			return;
+		}
+		notifications.show({ color: "red", message: error.message });
+	});
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -561,6 +578,7 @@ function NarratorPanelBody({
 	);
 	const dangerReflectionGlobal = dangerReflectionGlobalLevel !== "off";
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
+	const questionReflectionGlobal = settingsData?.agent?.questionReflectionEnabled ?? false;
 	const reflectionSettingsDisabled =
 		!settingsData || updateSettingsMutation.isPending || reflectionOverridesMutation.isPending;
 	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
@@ -642,7 +660,11 @@ function NarratorPanelBody({
 	// status bar (see useStatusBarProps), which is where they are consumed.
 	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
 		useResolvedModel(
-			capabilityModelReference(narrator?.model, narrator?.modelInheritance?.model),
+			capabilityModelReference(
+				narrator?.model,
+				narrator?.modelInheritance?.model,
+				narrator?.runtimeModel,
+			),
 			defaultModelValue,
 			aggregations,
 			allModels,
@@ -1732,13 +1754,18 @@ function NarratorPanelBody({
 	 * "waiting for your approval", so it must be checked first to keep the
 	 * attention-colored (yellow) treatment off a wait the user cannot resolve.
 	 */
-	const isWaitingForModel = substatus.includes("model_unavailable");
+	const timedWaitInfo = quotaWaitInfo ?? parseProviderWaitInfo(narrator?.errorMessage);
+	const isTransientWait =
+		timedWaitInfo?.waitKind === "capacity" || timedWaitInfo?.waitKind === "rate_limit";
+	const isWaitingForModel =
+		substatus.includes("model_unavailable") ||
+		(substatus.includes("quota_exhausted") && isTransientWait);
 	/**
 	 * Parked until an exhausted Kimi quota window resets. A sibling of the model
 	 * outage above — also a wait on the machine — kept separate because the label
 	 * and the notice have to say which of the two is happening.
 	 */
-	const isWaitingForQuota = substatus.includes("quota_exhausted");
+	const isWaitingForQuota = substatus.includes("quota_exhausted") && !isTransientWait;
 	const isWaitingForRecovery = isWaitingForModel || isWaitingForQuota;
 	/** Registry-owned accent for that state, so the shade lives in one place. */
 	const modelUnavailableColor = statusRegistry.accentColor(
@@ -2824,6 +2851,7 @@ function NarratorPanelBody({
 		toggleTerminalTool,
 		toggleSpecTool,
 		updateExecutionDeviceMutation,
+		onRequireDeviceDirectory: requireDeviceDirectory,
 		renderLod,
 		renderLodIsDefault,
 		handleSelectLod,
@@ -2838,6 +2866,7 @@ function NarratorPanelBody({
 		() => ({
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			onRequireDeviceDirectory: requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -2847,6 +2876,7 @@ function NarratorPanelBody({
 		[
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -2915,16 +2945,23 @@ function NarratorPanelBody({
 	const compactProgressFragment = compactProgressText ?? "";
 
 	/**
-	 * Label for a quota wait, with the reset instant when the server reported one.
+	 * Label for a timed provider wait, with the retry instant when reported.
 	 *
-	 * Gated on `isWaitingForQuota` so a stale clock can never survive the wait it
-	 * belongs to: the substatus is the authoritative "still parked" signal and
-	 * `quotaWaitInfo` only supplies the time.
+	 * Gated on the waiting substatus so a stale clock cannot survive its wait.
+	 * Live details take precedence; the persisted payload restores them on reload.
 	 */
 	const quotaWaitText = (() => {
-		const label = t("status_quota_exhausted");
-		const resumeAt = quotaWaitInfo?.resumeAt;
-		if (!isWaitingForQuota || !resumeAt) return label;
+		const label = t(
+			isWaitingForRecovery && timedWaitInfo?.waitKind === "capacity"
+				? "status_capacity"
+				: isWaitingForRecovery && timedWaitInfo?.waitKind === "rate_limit"
+					? "status_rate_limit"
+					: isWaitingForQuota
+						? "status_quota_exhausted"
+						: "status_model_unavailable",
+		);
+		const resumeAt = timedWaitInfo?.resumeAt;
+		if (!isWaitingForRecovery || !resumeAt) return label;
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
@@ -3166,6 +3203,15 @@ function NarratorPanelBody({
 					{...dropZoneProps}
 				>
 					{toolbarController.toolbarOverlays}
+					<DeviceDirectoryDialog
+						narratorId={narratorId}
+						deviceId={directoryDeviceId}
+						deviceName={
+							executionDevicesQuery.data?.devices.find((device) => device.id === directoryDeviceId)
+								?.name
+						}
+						onClose={closeDeviceDirectoryDialog}
+					/>
 					<NugRechargeDialog
 						opened={nugRechargeOpened}
 						narratorId={narratorId}
@@ -3774,11 +3820,14 @@ function NarratorPanelBody({
 							planModeUnsupportedReason,
 							planReflectionSupported,
 							dangerReflectionSupported,
+							questionReflectionSupported,
 							narratorPlanReflectionAutoApproveOverride: narrator.planReflectionAutoApproveOverride,
 							narratorDangerReflectionOverride: narrator.dangerReflectionOverride,
+							narratorQuestionReflectionOverride: narrator.questionReflectionOverride,
 							planReflectionAutoApproveGlobal,
 							dangerReflectionGlobal,
 							dangerReflectionGlobalLevel,
+							questionReflectionGlobal,
 							settingsLoaded: !!settingsData,
 							enterPlanModeMutation,
 							exitPlanModeMutation,

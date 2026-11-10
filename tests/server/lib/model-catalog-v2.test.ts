@@ -8,13 +8,13 @@ import {
 import {
 	bindModelCatalogSettings,
 	getEffectiveModelProfile,
-	getModelCardSnapshot,
-	keepLatestCatalog,
-	type ModelCatalogSettings,
-	mutateModelCard,
-	normalizeModelCatalogSettings,
+	getModelOverride,
+	keepModelCatalogSettings,
+	migrateModelCatalogSettings,
+	replaceModelOverridesForTests,
 	resolveEffectiveModelCard,
-	setModelWindow,
+	setModelCatalogAutoUpdate,
+	setModelOverride,
 } from "../../../server/lib/model-catalog";
 import { _bindSettings, getDefaults, saveSettings, settings } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
@@ -24,10 +24,10 @@ import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/s
 
 let local: NarraForkSettings;
 let persisted: string | undefined;
-const future = { flags: [0, false, null, []], units: "source-defined" };
+let restoreOverrides: () => void = () => {};
 
 /**
- * The v2 mutate route runs the real `requireAdmin`, which authorizes against the LIVE role
+ * The override route runs the real `requireAdmin`, which authorizes against the LIVE role
  * read through the session store, never the token's `role` claim. The admin-only test seeds
  * its principal with `c.get("user")` only, so this seam makes the store resolve the role by
  * actor id (the two principals carry distinct subs below). Without it the lookup would hit
@@ -46,237 +46,98 @@ beforeEach(() => {
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
 	local = getDefaults();
-	local.agent.modelCatalog = {
-		schemaVersion: 2,
-		migrationVersion: 2,
-		autoApply: false,
-		pinnedVersion: null,
-		local: {
-			revision: 7,
-			models: [
-				{
-					id: "local-image",
-					name: "Image",
-					metadata: {
-						mode: "image_generation",
-						input_cost_per_token: 0,
-						output_cost_per_image: 0.04,
-						future,
-					},
-				},
-			],
-		},
-	} as unknown as ModelCatalogSettings;
+	local.agent.modelCatalog = { autoUpdate: true };
 	persisted = undefined;
 	bindModelCatalogSettings(local, () => {
 		persisted = JSON.stringify(local);
 	});
 	_bindSettings(local);
+	restoreOverrides = replaceModelOverridesForTests({});
 });
 afterEach(() => {
+	restoreOverrides();
 	setAuthStores(undefined);
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 	_bindSettings(settings);
 });
-const revision = () => getModelCardSnapshot().local.revision;
-const model = () => getModelCardSnapshot().local.models!.find((m) => m.id === "local-image")!;
-const patch = (set: Record<string, string | number | boolean | null>) =>
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "patch",
-		target: "model",
-		targetId: "local-image",
-		patch: { set },
-	});
 
-test("persists one raw v2 source and reloads all unknown fields", () => {
-	patch({ supports_vision: false });
-	const saved = JSON.parse(persisted!);
-	expect(saved.agent.modelCatalog.schemaVersion).toBe(2);
-	const raw = saved.agent.modelCatalog.local.models[0];
-	expect(raw.rawMetadata).toBeUndefined();
-	expect(raw.metadata.referencePricing).toBeUndefined();
-	expect(raw.metadata.future).toEqual(future);
-	expect(raw.metadata.output_cost_per_image).toBe(0.04);
-	expect(raw.metadata.supports_vision).toBe(false);
-	const before = getModelCardSnapshot();
-	bindModelCatalogSettings(saved, () => {
-		throw new Error("reload must not remigrate");
-	});
-	expect(getModelCardSnapshot().local).toEqual(before.local);
-});
-
-test("field patches and replacement-shaped upserts retain prices and unknown attributes", () => {
-	patch({ input_cost_per_token: "0.000001" });
-	expect(model().metadata.input_cost_per_token).toBe("0.000001");
-	expect(model().metadata.output_cost_per_image).toBe(0.04);
-	expect(model().metadata.future).toEqual(future);
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: { ...model(), name: "Renamed" },
-	});
-	expect(model().name).toBe("Renamed");
-	expect(model().metadata.future).toEqual(future);
-	expect(model().metadata.output_cost_per_image).toBe(0.04);
-	expect(getModelCardSnapshot().local.overrides).toEqual([]);
-});
-
-test("no-op, stale revision, unsafe writes and persistence failure do not publish", () => {
-	patch({ supports_vision: false });
-	const before = getModelCardSnapshot();
-	patch({ supports_vision: false });
-	expect(revision()).toBe(before.local.revision);
-	expect(() =>
-		mutateModelCard({
-			baseRevision: 0,
-			action: "patch",
-			target: "model",
-			targetId: "local-image",
-			patch: { set: { supports_vision: true } },
-		}),
-	).toThrow("changed");
-	expect(() => patch({ "future.units": "changed" })).toThrow();
-	expect(() => patch({ billingMultiplier: 5 })).toThrow();
-	bindModelCatalogSettings(local, () => {
-		throw new Error("disk full");
-	});
-	expect(() => patch({ supports_vision: true })).toThrow("disk full");
-	expect(getModelCardSnapshot().local).toEqual(before.local);
-});
-
-test("independent input and output caps remain valid through write, read and reload", () => {
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: {
-			id: "independent-caps",
-			metadata: { mode: "responses", max_input_tokens: 128000, max_output_tokens: 272000 },
-		},
-	});
-	const m = getModelCardSnapshot().local.models!.find((m) => m.id === "independent-caps")!;
-	expect(m.metadata.max_input_tokens).toBe(128000);
-	expect(m.metadata.max_output_tokens).toBe(272000);
-	expect(getEffectiveModelProfile("independent-caps").maxOutputTokens).toBe(272000);
-	bindModelCatalogSettings(JSON.parse(persisted!), () => {});
-	expect(
-		getModelCardSnapshot().local.models!.find((m) => m.id === "independent-caps")!.metadata,
-	).toEqual(m.metadata);
-});
+/** An older settings.json with its overrides inline in `agent.modelCatalog.local`. */
+function legacyDocument(localLayer: Record<string, unknown>): NarraForkSettings {
+	const stored = getDefaults();
+	(stored.agent as Record<string, unknown>).modelCatalog = {
+		schemaVersion: 2,
+		migrationVersion: 2,
+		autoApply: false,
+		pinnedVersion: null,
+		local: { revision: 3, ...localLayer },
+	};
+	return stored;
+}
 
 test("input and output budgets stay separate and never invent a total context", () => {
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: {
-			id: "budget-model",
-			metadata: { mode: "responses", max_input_tokens: 128000, max_output_tokens: 272000 },
-		},
-	});
-	const budgets = modelTokenBudgets("budget-model");
+	// gpt-5-pro declares an input ceiling below its output ceiling and no total.
+	const budgets = modelTokenBudgets("openai:gpt-5-pro");
 	expect(budgets).toEqual({ maxInputTokens: 128000, maxOutputTokens: 272000 });
 	// No declared total context: the output ask is capped only by the output ceiling,
 	// and a large prompt cannot be used to derive a combined limit.
 	expect(resolveOutputTokenBudget(budgets, 300000, 120000)).toBe(272000);
 	expect(resolveInputTokenBudget(budgets, 272000)).toBe(128000);
 
-	// A declared total context does constrain both directions.
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: {
-			id: "total-model",
-			metadata: {
-				mode: "responses",
-				context_window: 200000,
-				max_input_tokens: 190000,
-				max_output_tokens: 64000,
-				working_context_tokens: 150000,
-			},
-		},
+	// gpt-6.1-terra declares a total context; the entry adds its own working window.
+	setModelOverride("connection", "openai:gpt-6.1-terra", { contextWindow: 150000 });
+	const total = modelTokenBudgets("openai:gpt-6.1-terra");
+	expect(total).toEqual({
+		maxInputTokens: 922000,
+		maxOutputTokens: 128000,
+		totalContextTokens: 1050000,
+		workingContextTokens: 150000,
 	});
-	const total = modelTokenBudgets("total-model");
-	expect(resolveInputTokenBudget(total, 64000)).toBe(136000);
-	expect(resolveOutputTokenBudget(total, 64000, 180000)).toBe(20000);
+	expect(resolveInputTokenBudget(total, 128000)).toBe(150000);
+	expect(resolveOutputTokenBudget(total, 128000, 1_000_000)).toBe(50000);
 	// The working window is a local budget, so it never becomes an output ceiling.
-	expect(resolveOutputTokenBudget(total, 64000)).toBe(64000);
+	expect(resolveOutputTokenBudget(total, 128000)).toBe(128000);
 
-	// An explicitly unknown limit is not a zero budget and not a constraint.
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: { id: "unknown-model", metadata: { mode: "chat", max_output_tokens: null } },
-	});
-	const unknown = modelTokenBudgets("unknown-model");
+	// Nothing declared is not a zero budget and not a constraint.
+	const unknown = modelTokenBudgets("openai:not-a-catalog-model-xyz");
 	expect(unknown).toEqual({});
 	expect(resolveOutputTokenBudget(unknown, 8000)).toBe(8000);
 	expect(resolveInputTokenBudget(unknown)).toBeUndefined();
 });
 
-test("working_context_tokens is the prompt window: it never caps output or replaces the total", () => {
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: {
-			id: "working-window",
-			metadata: {
-				mode: "responses",
-				working_context_tokens: 150000,
-				max_output_tokens: 320000,
-			},
-		},
+test("an entry's context window is the prompt window: it never caps output or replaces the total", () => {
+	setModelOverride("connection", "openai:working-window", {
+		contextWindow: 150000,
+		maxOutputTokens: 320000,
 	});
 	// The working window is this instance's prompt budget; the output ceiling stays
 	// independent of it.
-	const profile = getEffectiveModelProfile("working-window");
+	const profile = getEffectiveModelProfile("openai:working-window");
 	expect(profile.maxOutputTokens).toBe(320000);
 	expect(profile.contextWindow).toBe(150000);
 	expect(profile.contextWindowSource?.key).toBe("working_context_tokens");
 	// Budgets keep the three facts distinct.
-	const budgets = modelTokenBudgets("working-window");
+	const budgets = modelTokenBudgets("openai:working-window");
 	expect(budgets).toEqual({ maxOutputTokens: 320000, workingContextTokens: 150000 });
 	expect(resolveOutputTokenBudget(budgets, 400000)).toBe(320000);
-
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: {
-			id: "working-plus-total",
-			metadata: {
-				mode: "responses",
-				context_window: 400000,
-				working_context_tokens: 150000,
-				max_output_tokens: 320000,
-			},
-		},
-	});
-	// The working window is still the prompt window; the total remains its own fact.
-	const withTotal = getEffectiveModelProfile("working-plus-total");
-	expect(withTotal.contextWindow).toBe(150000);
-	expect(withTotal.maxOutputTokens).toBe(320000);
-	expect(modelTokenBudgets("working-plus-total")).toEqual({
-		maxOutputTokens: 320000,
-		totalContextTokens: 400000,
-		workingContextTokens: 150000,
-	});
-
-	// A total context still clamps an oversized output (same total semantics).
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "upsert-model",
-		model: {
-			id: "legacy-total-clamp",
-			metadata: {
-				mode: "chat",
-				legacy_context_window: 100000,
-				max_output_tokens: 200000,
-			},
-		},
-	});
-	expect(getEffectiveModelProfile("legacy-total-clamp").maxOutputTokens).toBe(100000);
 });
 
-test("v2 writes are admin-only, return v2 conflicts and enforce body limits", async () => {
+test("an entry's oversized output under a catalog total is clamped, not a request failure", () => {
+	// Over a catalog total, the working window is still the prompt window and the total
+	// remains its own fact, which still holds an oversized output.
+	setModelOverride("connection", "openai:gpt-6.1-terra", {
+		contextWindow: 150000,
+		maxOutputTokens: 2_000_000,
+	});
+	const withTotal = getEffectiveModelProfile("openai:gpt-6.1-terra");
+	expect(withTotal.contextWindow).toBe(150000);
+	expect(withTotal.maxOutputTokens).toBe(1050000);
+	expect(modelTokenBudgets("openai:gpt-6.1-terra")).toMatchObject({
+		totalContextTokens: 1050000,
+		workingContextTokens: 150000,
+	});
+});
+
+test("override writes are admin-only, validate fields and enforce body limits", async () => {
 	const app = (role: "admin" | "user") => {
 		const app = new Hono();
 		app.use("*", async (c, next) => {
@@ -287,146 +148,190 @@ test("v2 writes are admin-only, return v2 conflicts and enforce body limits", as
 		app.route("/api/model-catalog", modelCatalogRoutes);
 		return app;
 	};
-	const body = JSON.stringify({
-		baseRevision: revision(),
-		action: "patch",
-		target: "model",
-		targetId: "local-image",
-		patch: { set: { supports_vision: false } },
+	const request = (body: unknown) => ({
+		method: "PUT",
+		headers: { "content-type": "application/json" },
+		body: typeof body === "string" ? body : JSON.stringify(body),
 	});
-	const init = { method: "POST", headers: { "content-type": "application/json" }, body };
-	expect((await app("user").request("/api/model-catalog/v2/mutate", init)).status).toBe(403);
-	const saved = await app("admin").request("/api/model-catalog/v2/mutate", init);
+	const body = {
+		scope: "connection",
+		key: "codex:gpt-5.5",
+		fields: { nativeSearch: false },
+		model: "codex:gpt-5.5",
+	};
+	expect((await app("user").request("/api/model-catalog/overrides", request(body))).status).toBe(
+		403,
+	);
+	expect(getModelOverride("connection", "codex:gpt-5.5")).toBeUndefined();
+	const saved = await app("admin").request("/api/model-catalog/overrides", request(body));
 	expect(saved.status).toBe(200);
-	expect((await saved.json()).schemaVersion).toBe(2);
-	const conflict = await app("admin").request("/api/model-catalog/v2/mutate", init);
-	expect(conflict.status).toBe(409);
-	expect((await conflict.json()).snapshot.schemaVersion).toBe(2);
+	expect(await saved.json()).toMatchObject({
+		model: "codex:gpt-5.5",
+		connectionOverride: { nativeSearch: false },
+		effective: { nativeSearch: { value: false, origin: "connection" } },
+	});
+	const invalid = await app("admin").request(
+		"/api/model-catalog/overrides",
+		request({ ...body, fields: { reasoningLevels: ["low"], defaultReasoningLevel: "high" } }),
+	);
+	expect(invalid.status).toBe(400);
+	expect(await invalid.json()).toMatchObject({
+		code: "INVALID_OVERRIDE",
+		field: "defaultReasoningLevel",
+	});
+	expect(getModelOverride("connection", "codex:gpt-5.5")).toEqual({ nativeSearch: false });
 	expect(
 		(
-			await app("admin").request("/api/model-catalog/v2/mutate", {
-				...init,
-				body: " ".repeat(1024 * 1024 + 1),
-			})
+			await app("admin").request(
+				"/api/model-catalog/overrides",
+				request(" ".repeat(256 * 1024 + 1)),
+			)
 		).status,
 	).toBe(413);
+	// The models page reads descriptions without admin rights.
+	const described = await app("user").request("/api/model-catalog/models", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ models: ["codex:gpt-5.5"] }),
+	});
+	expect(described.status).toBe(200);
 });
 
-// The provider page writes a provider entry's own window by its model value; nothing
-// beside the catalog stores it.
-test("provider-entry windows are stored by model value and reset only their own key", () => {
-	setModelWindow({
-		baseRevision: revision(),
-		scope: "connection",
-		target: "foxcx:gpt-5.4",
-		contextWindow: 300000,
-	});
-	const stored = getModelCardSnapshot().local;
-	expect(stored.revision).toBe(8);
-	expect(stored.connections).toEqual({ "foxcx:gpt-5.4": { working_context_tokens: 300000 } });
-	expect(JSON.parse(persisted!).agent).not.toHaveProperty("modelContextWindows");
-	mutateModelCard({
-		baseRevision: revision(),
-		action: "patch",
-		target: "connection",
-		targetId: "foxcx:gpt-5.4",
-		patch: { set: { max_output_tokens: 4096 } },
-	});
-	setModelWindow({
-		baseRevision: revision(),
-		scope: "connection",
-		target: "foxcx:gpt-5.4",
-		contextWindow: null,
-	});
-	expect(getModelCardSnapshot().local.connections).toEqual({
-		"foxcx:gpt-5.4": { max_output_tokens: 4096 },
-	});
-	expect(() =>
-		mutateModelCard({
-			baseRevision: revision(),
-			action: "hide",
-			target: "connection",
-			targetId: "foxcx:gpt-5.4",
-		}),
-	).toThrow();
+// The provider page writes a provider entry's override by its model value; nothing in
+// settings.json stores it.
+test("provider-entry overrides are stored by model value and clear only their own key", () => {
+	setModelOverride("connection", "foxcx:gpt-5.4", { contextWindow: 300000 });
+	setModelOverride("connection", "foxcx:gpt-5.5", { contextWindow: 200000 });
+	expect(persisted).toBeUndefined();
+	// Saving an entry replaces its fields as a whole.
+	setModelOverride("connection", "foxcx:gpt-5.4", { maxOutputTokens: 4096 });
+	expect(getModelOverride("connection", "foxcx:gpt-5.4")).toEqual({ maxOutputTokens: 4096 });
+	setModelOverride("connection", "foxcx:gpt-5.4", null);
+	expect(getModelOverride("connection", "foxcx:gpt-5.4")).toBeUndefined();
+	expect(getModelOverride("connection", "foxcx:gpt-5.5")).toEqual({ contextWindow: 200000 });
+	// An empty override is the same as none.
+	setModelOverride("connection", "foxcx:gpt-5.5", {});
+	expect(getModelOverride("connection", "foxcx:gpt-5.5")).toBeUndefined();
 });
 
-test("an old window map imports beside editor bindings and never stops startup", () => {
-	const stored = getDefaults();
-	stored.agent.modelCatalog = {
-		schemaVersion: 2,
-		migrationVersion: 2,
-		autoApply: false,
-		pinnedVersion: null,
-		local: {
-			revision: 3,
-			bindings: [
-				{
-					id: "editor-binding",
-					providerId: "codex",
-					upstreamModelId: "gpt-5.5",
-					overrides: { max_output_tokens: 1000 },
-				},
-			],
-		},
-	};
-	(stored.agent as Record<string, unknown>).modelContextWindows = {
-		"codex:gpt-5.5": 150000,
-		"codex:gpt-5.4": "200000",
-	};
-	expect(normalizeModelCatalogSettings(stored)).toBe(true);
-	const local = stored.agent.modelCatalog!.local;
-	expect(local.bindings).toEqual([
-		{
-			id: "editor-binding",
-			providerId: "codex",
-			upstreamModelId: "gpt-5.5",
-			overrides: { max_output_tokens: 1000 },
-		},
-	]);
-	expect(local.connections).toEqual({
-		"codex:gpt-5.5": { working_context_tokens: 150000 },
-		"codex:gpt-5.4": { working_context_tokens: 200000 },
+test("an older inline layer becomes typed overrides and only the preference stays", () => {
+	const stored = legacyDocument({
+		connections: { "codex:gpt-5.5": { working_context_tokens: 150000, mode: "chat" } },
+		overrides: [
+			{
+				target: "model",
+				targetId: "gpt-5.5",
+				metadata: { max_output_tokens: 1000, input_cost_per_token: 0.000002 },
+			},
+		],
+		models: [{ id: "local-image", metadata: { mode: "image_generation" } }],
 	});
-	expect(stored.agent).not.toHaveProperty("modelContextWindows");
-	bindModelCatalogSettings(stored, () => {});
+	expect(migrateModelCatalogSettings(stored)).toBe(true);
+	expect(stored.agent.modelCatalog).toEqual({ autoUpdate: true });
+	expect(getModelOverride("connection", "codex:gpt-5.5")).toEqual({ contextWindow: 150000 });
+	expect(getModelOverride("model", "gpt-5.5")).toEqual({
+		maxOutputTokens: 1000,
+		prices: { input: "2" },
+	});
 	expect(getEffectiveModelProfile("codex:gpt-5.5")).toMatchObject({
 		contextWindow: 150000,
 		maxOutputTokens: 1000,
 	});
+	// The current shape is left alone.
+	expect(migrateModelCatalogSettings(stored)).toBe(false);
+});
 
+test("a pre-catalog window map imports and never stops startup", () => {
 	const preCatalog = getDefaults();
 	delete preCatalog.agent.modelCatalog;
 	(preCatalog.agent as Record<string, unknown>).modelContextWindows = {
-		"codex:gpt-5.5": "120000",
+		"codex:gpt-5.5": 120000,
+		"codex:broken": { nested: true },
 	};
-	expect(() => normalizeModelCatalogSettings(preCatalog)).not.toThrow();
-	expect(preCatalog.agent.modelCatalog!.local.connections).toEqual({
-		"codex:gpt-5.5": { working_context_tokens: 120000 },
-	});
-	expect(preCatalog.agent.modelCatalog!.local.legacyFields).toMatchObject({
-		"connection:codex:gpt-5.5": ["working_context_tokens"],
-	});
+	expect(() => migrateModelCatalogSettings(preCatalog)).not.toThrow();
+	expect(getModelOverride("connection", "codex:gpt-5.5")).toEqual({ contextWindow: 120000 });
+	expect(getModelOverride("connection", "codex:broken")).toBeUndefined();
 	expect(preCatalog.agent).not.toHaveProperty("modelContextWindows");
+	expect(preCatalog.agent.modelCatalog as unknown).toEqual({ autoUpdate: true });
 });
 
-test("a settings save from a copy taken before a catalog edit does not undo the edit", () => {
+test("numeric-string windows in an old window map are imported", () => {
+	// Older builds accepted hand-edited windows written as strings.
+	const preCatalog = getDefaults();
+	delete preCatalog.agent.modelCatalog;
+	(preCatalog.agent as Record<string, unknown>).modelContextWindows = {
+		"codex:gpt-5.4": "200000",
+	};
+	migrateModelCatalogSettings(preCatalog);
+	expect(getModelOverride("connection", "codex:gpt-5.4")).toEqual({ contextWindow: 200000 });
+});
+
+test("an editor binding for a built-in provider becomes that entry's override", () => {
+	// Older queries named a built-in provider by its prefix (`providerId: "codex"`).
+	const stored = legacyDocument({
+		bindings: [
+			{
+				id: "editor-binding",
+				providerId: "codex",
+				upstreamModelId: "gpt-5.5",
+				overrides: { max_output_tokens: 1000 },
+			},
+		],
+	});
+	migrateModelCatalogSettings(stored);
+	expect(getModelOverride("connection", "codex:gpt-5.5")).toEqual({ maxOutputTokens: 1000 });
+});
+
+test("a gateway channel binding becomes the override of its full model value", () => {
+	// A gateway binding named the channel apart from the bare upstream model.
+	const stored = legacyDocument({
+		bindings: [
+			{
+				id: "gateway-binding",
+				providerId: "gw-id",
+				channelId: "chan",
+				upstreamModelId: "gpt-6-astra",
+				overrides: { max_output_tokens: 101 },
+			},
+		],
+	});
+	stored.nugProviders = [
+		{
+			id: "gw-id",
+			name: "Gateway",
+			prefix: "gw",
+			apiKey: "unused",
+			baseUrl: "https://gateway.invalid",
+			defaultModel: "",
+		},
+	];
+	migrateModelCatalogSettings(stored);
+	expect(getModelOverride("connection", "gw:chan:gpt-6-astra")).toEqual({ maxOutputTokens: 101 });
+	expect(getModelOverride("connection", "gw:gpt-6-astra")).toBeUndefined();
+});
+
+test("a settings save from a copy taken before a preference change does not undo it", () => {
 	const stale = structuredClone(local);
-	patch({ supports_vision: false });
-	keepLatestCatalog(stale);
-	const live = stale.agent.modelCatalog!.local;
-	expect(live.revision).toBe(revision());
-	expect(live.models!.find((m) => m.id === "local-image")!.metadata.supports_vision).toBe(false);
-	// A document assembled without the catalog keeps the live one too.
+	setModelCatalogAutoUpdate(false);
+	expect(JSON.parse(persisted ?? "{}").agent?.modelCatalog).toEqual({ autoUpdate: false });
+	keepModelCatalogSettings(stale);
+	expect(stale.agent.modelCatalog).toEqual({ autoUpdate: false });
+	// A document assembled without the catalog, or carrying an old inline layer, gets the
+	// live preference and nothing else.
 	const bare = getDefaults();
 	delete bare.agent.modelCatalog;
-	keepLatestCatalog(bare);
-	expect(bare.agent.modelCatalog === local.agent.modelCatalog).toBe(true);
+	keepModelCatalogSettings(bare);
+	expect(bare.agent.modelCatalog as unknown).toEqual({ autoUpdate: false });
+	const old = legacyDocument({ connections: { "codex:gpt-5.5": { working_context_tokens: 1 } } });
+	keepModelCatalogSettings(old);
+	expect(old.agent.modelCatalog).toEqual({ autoUpdate: false });
+	expect(getModelOverride("connection", "codex:gpt-5.5")).toBeUndefined();
 });
 
 test("gateway metadata that contradicts the catalog is ignored rather than failing requests", () => {
 	const query = { upstreamModelId: "gpt-5.5", providerKey: "codex" };
 	const card = resolveEffectiveModelCard(query, { context_window: 1000 });
+	expect(() => card.view).not.toThrow();
 	expect(card.metadata.context_window).toBeUndefined();
 	expect(card.metadata.max_output_tokens).toBeGreaterThan(1000);
 	expect(resolveEffectiveModelCard(query, { context_window: 900000 }).metadata.context_window).toBe(

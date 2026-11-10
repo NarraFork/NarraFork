@@ -26,7 +26,17 @@ async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
 	return response.json();
 }
 
+/** 读者的日历：统计按它切日，服务端不会用自己进程的时区去猜。 */
+function readerTimeZone(): string {
+	try {
+		return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+	} catch {
+		return "UTC";
+	}
+}
+
 function appendUsageHistoryFilters(params: URLSearchParams, filters: UsageHistoryFilters): void {
+	params.append("timeZone", readerTimeZone());
 	if (filters.userId) params.append("userId", filters.userId);
 	if (filters.narratorId) params.append("narratorId", filters.narratorId);
 	if (filters.projectId) params.append("projectId", filters.projectId);

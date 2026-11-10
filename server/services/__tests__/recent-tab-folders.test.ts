@@ -282,6 +282,14 @@ describe("folder metadata and dissolving", () => {
 		await restoreRecentTabs(USER, { token: removed.undoToken });
 		expect(await layout()).toEqual([`[${folder}:F]`, `b>${folder}`]);
 	});
+	it("keepEmptyFolder leaves the folder behind when its last member goes", async () => {
+		// 归档走这条路径：会话还能撤销归档回来，文件夹不该跟着最后一条记录消失。
+		await addNarratorTabs("a", "b");
+		const folder = await makeFolder("a", "b");
+		await removeRecentTab(USER, "narrator", "a", { keepEmptyFolder: true });
+		await removeRecentTab(USER, "narrator", "b", { keepEmptyFolder: true });
+		expect(await layout()).toEqual([`[${folder}:F]`]);
+	});
 });
 
 describe("bulk clear and the storage limit", () => {

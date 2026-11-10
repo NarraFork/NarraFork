@@ -7,6 +7,7 @@ import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
+import type { StorageRetentionSettings } from "@shared/storage-retention";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
@@ -140,6 +141,11 @@ export interface OpenAIProviderConfig {
 	apiMode?: "responses" | "completions" | "codex";
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header (for org subscriptions). */
 	codexAccountId?: string;
+	/**
+	 * Internal: the installation id a Codex-mode request sends in `client_metadata`, set per
+	 * credential by the Codex provider. Absent = this instance's id. Not persisted.
+	 */
+	codexInstallationId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP (experimental; falls back to HTTP when unavailable). */
 	codexWebSocket?: boolean;
 	/** Codex: allow the native web_search tool to be sent to the model. */
@@ -589,6 +595,11 @@ export interface NarraForkSettings {
 		installationId?: string;
 		claudeDeviceId?: string;
 	};
+	/** How credential files (e.g. codex-credentials.json) are stored. See lib/secret-store.ts. */
+	secrets?: {
+		/** Encrypt credential files with the instance key in secret.key. Default true. */
+		encrypt?: boolean;
+	};
 	/**
 	 * Unified outbound proxy policy applied to every outbound network channel.
 	 * Defaults to "system" (follow the OS/env proxy). Replaces the previous
@@ -857,6 +868,11 @@ export interface NarraForkSettings {
 		 * Multi-instance providers use their own `disabled` field instead.
 		 */
 		disabledProviders?: string[];
+		/**
+		 * Provider prefixes left out of `auto:<model>` routing. They still serve values that
+		 * name them (`<prefix>:<model>`); use it for relays whose same-named models may differ.
+		 */
+		autoExcludedProviders?: string[];
 		/** Browser proxy override for new sessions. Absent/"default" = global policy. */
 		browserProxy?: ProxyOverride;
 		/** Explicit pre-approval for Notification.send; never overrides read-only mode. */
@@ -908,7 +924,9 @@ export interface NarraForkSettings {
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
-	/** Block storage rollout switches (docs/BLOCK_STORAGE-DESIGN.md §10.6). */
+	/** Independent retention policies. A null horizon never expires historical content. */
+	storageRetention: StorageRetentionSettings;
+	/** Stable block storage; switches remain available for deliberate rollback. */
 	narratorBlocks: {
 		/**
 		 * Whether new envelopes are stored as blocks (`body_format = 2`), with the
@@ -930,6 +948,10 @@ export interface NarraForkSettings {
 		 * restore job writes their projection back.
 		 */
 		compactJson: boolean;
+		/** Internal one-time migration; subsequent explicit rollback switches are preserved. */
+		singleCopyDefaultsVersion?: number;
+		/** Backend startup resumed pre-upgrade paused jobs; later explicit pauses stay effective. */
+		singleCopyBackfillResumeVersion?: number;
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";

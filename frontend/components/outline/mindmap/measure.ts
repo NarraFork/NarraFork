@@ -13,7 +13,7 @@
  * took 0.4–0.6 s), so a page is measured AHEAD in a Worker (`measure.worker.ts`, OffscreenCanvas,
  * the same code and fonts) as soon as it opens: the first switch to the map then finds the sizes
  * cached (prototype: first draw 42–60 ms instead of 465–623 ms). Without a Worker (or before it
- * is done) a body is measured where it is needed, on the main thread.
+ * is done), the UI uses a fixed placeholder. It never parses or measures a cold body.
  *
  * The fonts must be the ones `mindmap.css` gives `.mm-node`: named families (pretext measures
  * `system-ui` inaccurately on macOS), the app's own sans and mono stacks.
@@ -45,7 +45,6 @@ import {
 	type TypographySettings,
 } from "@shared/pretext-layout/typography";
 import type { Node as PMNode } from "prosemirror-model";
-import { parseToPM } from "../editor/convert";
 
 export const MAP_FONT_FAMILY = SANS_FAMILY;
 export const MAP_MONO_FAMILY = MONO_FAMILY;
@@ -410,7 +409,7 @@ function measureInline(
 }
 
 /** A body's size (without the frame and padding). Mentions resolve through `labelOf`. */
-export function measureBody(body: PMNode, maxW = NODE.maxBody, labelOf = plainLabel): BodySize {
+function measureBodyContent(body: PMNode, maxW: number, labelOf: LabelOf): BodySize {
 	const t = mapType();
 	switch (body.type.name) {
 		case "heading": {
@@ -446,9 +445,29 @@ export function measureBody(body: PMNode, maxW = NODE.maxBody, labelOf = plainLa
 	}
 }
 
+/** UTF-16 input cap for exact Worker measurements (oversized nodes stay provisional). */
+export const MAX_MEASURE_BODY_CHARS = 64_000;
 const MAX_CACHE = 30_000;
 const cache = new Map<string, BodySize>();
-export const measureStats = { hits: 0, misses: 0, ms: 0 };
+export const measureStats = { hits: 0, misses: 0, ms: 0, placeholders: 0 };
+const measuredListeners = new Set<() => void>();
+
+/** Pure measurement core: production calls this only inside measure.worker.ts. */
+export function measureBody(body: PMNode, maxW = NODE.maxBody, labelOf = plainLabel): BodySize {
+	const t0 = performance.now();
+	measureStats.misses++;
+	try {
+		return measureBodyContent(body, maxW, labelOf);
+	} finally {
+		measureStats.ms += performance.now() - t0;
+	}
+}
+
+/** Repaint provisional nodes when exact Worker results arrive, including late replies. */
+export function onMeasured(listener: () => void): () => void {
+	measuredListeners.add(listener);
+	return () => measuredListeners.delete(listener);
+}
 
 /**
  * Cache key: the typography it was measured under, then the source; with mentions, also what
@@ -457,55 +476,48 @@ export const measureStats = { hits: 0, misses: 0, ms: 0 };
 export function measureKey(
 	content: string,
 	labelOf: LabelOf,
-): { key: string; labels: string[]; node: PMNode } {
-	const sig = keyPrefix();
-	// Without mentions the key is the text itself: parsed only when it is measured (a cache hit,
-	// or a body sent to the Worker, parses nothing here).
-	if (!content.includes("[[")) {
-		let parsed: PMNode | null = null;
-		return {
-			key: sig + content,
-			labels: [],
-			get node() {
-				parsed ??= parseToPM(content).node;
-				return parsed;
-			},
-		};
-	}
-	const node = parseToPM(content).node;
-	const labels: string[] = [];
+): { key: string; labels: Record<string, string> } {
+	const labels: Record<string, string> = Object.create(null);
+	// Collect candidates, NOT a markdown parse. The Worker decides which are real mentions
+	// (candidates inside code/escaped text are harmless extra cache dependencies). Match the
+	// dialect's ref/label escape syntax, without importing its marked/ProseMirror parser.
 	if (content.includes("[[")) {
-		node.descendants((n) => {
-			if (n.type.name === "mention") labels.push(labelOf(n.attrs.ref, n.attrs.label));
-			return true;
-		});
+		const candidates =
+			/\[\[((?:\\[^[\]|\n]|[^\\[\]|\n])+?)(?:\|((?:\\[^[\]\n]|[^\\[\]\n])*?))?\]\]/g;
+		const unescapeMention = (text: string) => text.replace(/\\([!-/:-@[-`{-~])/g, "$1");
+		for (const match of content.matchAll(candidates)) {
+			const ref = unescapeMention(match[1] ?? "").trim();
+			if (!ref) continue;
+			const label = match[2] === undefined ? null : unescapeMention(match[2]);
+			labels[JSON.stringify([ref, label])] = labelOf(ref, label);
+		}
 	}
 	return {
-		key: sig + (labels.length ? `${content}\u0000${labels.join("\u0001")}` : content),
+		key:
+			keyPrefix() + content + (Object.keys(labels).length ? `\u0000${JSON.stringify(labels)}` : ""),
 		labels,
-		node,
 	};
 }
 
-/** A body's size from the cache, measured on the spot when it is not there. */
+/** Fixed, explicitly provisional geometry. No text inspection, wrapping or font measuring. */
+export function placeholderBodySize(): BodySize {
+	return { w: NODE.maxBody, h: mapType().lineH };
+}
+
+/** Cache-only on the UI thread. Placeholders are never stored as exact measurements. */
 export function bodySize(content: string, labelOf: LabelOf = plainLabel): BodySize {
-	const { key, node } = measureKey(content, labelOf);
-	const hit = cache.get(key);
+	const hit = cachedBodySize(content, labelOf);
 	if (hit) {
 		measureStats.hits++;
 		return hit;
 	}
-	const t0 = performance.now();
-	measureStats.misses++;
-	const r = measureBody(node, NODE.maxBody, labelOf);
-	if (cache.size > MAX_CACHE) cache.clear();
-	cache.set(key, r);
-	measureStats.ms += performance.now() - t0;
-	return r;
+	measureStats.placeholders++;
+	return placeholderBodySize();
 }
 
 /** A body's size if it is cached; never measures. */
 export function cachedBodySize(content: string, labelOf: LabelOf = plainLabel): BodySize | null {
+	if (content.length > MAX_MEASURE_BODY_CHARS) return null;
 	return cache.get(measureKey(content, labelOf).key) ?? null;
 }
 
@@ -516,7 +528,7 @@ export function hasMeasuredKey(key: string): boolean {
 
 /** Whether a body's size is cached (tests and the first-switch path). */
 export function hasMeasured(content: string, labelOf: LabelOf = plainLabel): boolean {
-	return cache.has(measureKey(content, labelOf).key);
+	return content.length <= MAX_MEASURE_BODY_CHARS && cache.has(measureKey(content, labelOf).key);
 }
 
 /** Store sizes measured elsewhere (the Worker). */
@@ -526,11 +538,20 @@ export function storeMeasured(entries: Iterable<[string, number, number]>): numb
 	const current = keyPrefix();
 	let n = 0;
 	for (const [key, w, h] of entries) {
-		if (!key.startsWith(current) || cache.has(key)) continue;
+		if (
+			!key.startsWith(current) ||
+			cache.has(key) ||
+			!Number.isFinite(w) ||
+			!Number.isFinite(h) ||
+			w < 0 ||
+			h < 0
+		)
+			continue;
 		if (cache.size > MAX_CACHE) cache.clear();
 		cache.set(key, { w, h });
 		n++;
 	}
+	if (n > 0) for (const listener of measuredListeners) listener();
 	return n;
 }
 

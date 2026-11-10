@@ -22,7 +22,8 @@
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { db } from "../../db";
+import { readTestMessageContent } from "../../../tests/setup";
+import { db, sqlite } from "../../db";
 import { narratorMessageRefs, narratorMessages, narrators, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
@@ -118,11 +119,11 @@ async function savedMessages(narratorId: string): Promise<string[]> {
 
 async function contentBlocks(narratorId: string): Promise<Array<Record<string, unknown>>> {
 	const rows = await db
-		.select({ json: narratorMessages.contentJson })
+		.select({ id: narratorMessages.id })
 		.from(narratorMessageRefs)
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId));
-	return rows.flatMap((row) => (row.json ?? []) as Array<Record<string, unknown>>);
+	return rows.flatMap((row) => readTestMessageContent<Record<string, unknown>>(sqlite, row.id));
 }
 
 async function queued(narratorId: string): Promise<string[]> {

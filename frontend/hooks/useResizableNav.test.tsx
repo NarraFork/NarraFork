@@ -258,6 +258,33 @@ describe("nav width store", () => {
 		expect(collapsed.renderHookCounts.lastValue).toBe(false);
 	});
 
+	it("grabbing a hover-expanded edge pins it immediately and resizes from its visible width", async () => {
+		const {
+			resetNavWidthStoreForTest,
+			toggleNavCollapsed,
+			startNavResize,
+			useNavCollapsed,
+			useNavWidth,
+		} = await import("./useResizableNav");
+		resetNavWidthStoreForTest(320);
+		toggleNavCollapsed();
+		const collapsed = await mountHarness(useNavCollapsed);
+		const width = await mountHarness(useNavWidth);
+		expect(width.renderHookCounts.lastValue).toBe(73);
+		flushSyncRef.current(() => {
+			startNavResize({ clientX: 319, preventDefault: () => {} }, { expandFromHover: true });
+		});
+		// Already pinned at pointerdown, before the first move or release.
+		expect(collapsed.renderHookCounts.lastValue).toBe(false);
+		expect(width.renderHookCounts.lastValue).toBe(320);
+		expect(localStorage.getItem("narrafork_nav_width")).toBe("320");
+		firePointer("pointermove", 343); // +24 from the visible 320, not the hidden 73.
+		firePointer("pointerup", 343);
+		expect(width.renderHookCounts.lastValue).toBe(344);
+		expect(collapsed.renderHookCounts.lastValue).toBe(false);
+		expect(localStorage.getItem("narrafork_nav_width")).toBe("344");
+	});
+
 	it("toggle flips to the rail and back to the previous width", async () => {
 		const { toggleNavCollapsed, useNavCollapsed } = await import("./useResizableNav");
 		const { renderHookCounts } = await mountHarness(useNavCollapsed);

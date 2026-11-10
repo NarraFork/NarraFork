@@ -66,9 +66,11 @@ export function ModelPickerMenu({
 					? t("followDefault", { model: defaultModelValue })
 					: m.provider === "__agg__"
 						? `⚡ ${m.label}`
-						: m.provider
-							? `${m.provider}:${m.label}`
-							: m.label,
+						: m.provider === "__auto__"
+							? m.label
+							: m.provider
+								? `${m.provider}:${m.label}`
+								: m.label,
 		}));
 
 	return (

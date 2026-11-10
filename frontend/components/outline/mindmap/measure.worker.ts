@@ -16,14 +16,12 @@ export interface MeasureRequest {
 	 * setting its keys were made under (`measureKey`'s signature) and it is applied first.
 	 */
 	typography: TypographySettings;
-	items: Array<{ key: string; content: string; labels: string[] }>;
+	items: Array<{ key: string; content: string; labels: Record<string, string> }>;
 }
 
 export interface MeasureReply {
 	id: number;
 	out: Array<[string, number, number]>;
-	/** Keys measured nowhere here (the main thread measures them when it needs them). */
-	failed: string[];
 	ms: number;
 }
 
@@ -36,17 +34,18 @@ scope.onmessage = (e) => {
 	const t0 = performance.now();
 	setTypography(e.data.typography);
 	const out: Array<[string, number, number]> = [];
-	const failed: string[] = [];
 	for (const it of e.data.items) {
 		try {
 			const node = parseToPM(it.content).node;
-			let i = 0;
-			const r = measureBody(node, NODE.maxBody, (ref, label) => it.labels[i++] ?? label ?? ref);
+			const r = measureBody(
+				node,
+				NODE.maxBody,
+				(ref, label) => it.labels[JSON.stringify([ref, label])] ?? label ?? ref,
+			);
 			out.push([it.key, r.w, r.h]);
 		} catch {
-			// Answered as failed: the main thread measures it when needed (and may send it again).
-			failed.push(it.key);
+			// Missing keys are counted as failed by the client and keep their placeholder.
 		}
 	}
-	scope.postMessage({ id: e.data.id, out, failed, ms: performance.now() - t0 });
+	scope.postMessage({ id: e.data.id, out, ms: performance.now() - t0 });
 };

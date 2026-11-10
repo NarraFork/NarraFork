@@ -1028,7 +1028,7 @@ export async function deleteTokenDanceConnection(): Promise<void> {
 				agent.customModels = agent.customModels.filter((model) => !isReference(model.value));
 			if (agent.modelCards)
 				agent.modelCards = agent.modelCards.filter((card) => !isReference(card.modelKey));
-			rewriteConnectionOverrides(latest, (model) => (isReference(model) ? null : model));
+			rewriteConnectionOverrides((model) => (isReference(model) ? null : model));
 			if (agent.subagentModels) {
 				for (const key of Object.keys(
 					agent.subagentModels,

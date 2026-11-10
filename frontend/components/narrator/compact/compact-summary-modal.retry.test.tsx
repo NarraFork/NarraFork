@@ -271,6 +271,8 @@ afterAll(() => {
 
 describe("CompactSummaryModal failed compact retry", () => {
 	test("groups identical model names by provider and retries with the selected full model ID", async () => {
+		// This case is about disambiguating identical names by provider: use the grouped view.
+		localStorage.setItem("narrafork_model_menu_mode", "provider");
 		const retryCalls: unknown[][] = [];
 		api.retryFailedCompact = async (...args) => {
 			retryCalls.push(args);

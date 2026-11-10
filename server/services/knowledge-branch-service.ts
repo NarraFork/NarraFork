@@ -1912,6 +1912,8 @@ async function listSubmissionsForInbox(
 const SUBMISSION_OUTCOME_STATUSES = ["approved", "rejected", "changes_requested"] as const;
 const SUBMISSION_OUTCOME_LIMIT = 30;
 const SUBMISSION_OUTCOME_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+/** Badge ceiling for unread verdicts: `limit + 1` rows answer count and "is there more". */
+const SUBMISSION_OUTCOME_UNREAD_LIMIT = 99;
 
 async function listMySubmissionOutcomes(principal: Principal, opts: { limit?: number } = {}) {
 	if (!principal.userId) return [];
@@ -1932,11 +1934,58 @@ async function listMySubmissionOutcomes(principal: Principal, opts: { limit?: nu
 			verdict: true,
 			findingsJson: true,
 			reviewedAt: true,
+			authorReadAt: true,
 			createdAt: true,
 		},
 		orderBy: (s, { desc: d }) => [d(s.reviewedAt)],
 		limit,
 	});
+}
+
+/**
+ * Unread verdicts on the caller's own submissions — the number behind the bell.
+ *
+ * Same window as {@link listMySubmissionOutcomes}, plus `author_read_at IS NULL`. Bounded
+ * rather than a `COUNT(*)`: the UI only renders a capped label, so reading `limit + 1`
+ * rows answers "how many" and "is there more" in one pass.
+ */
+async function countUnreadSubmissionOutcomes(
+	principal: Principal,
+): Promise<{ count: number; capped: boolean }> {
+	if (!principal.userId) return { count: 0, capped: false };
+	const cutoff = new Date(Date.now() - SUBMISSION_OUTCOME_MAX_AGE_MS).toISOString();
+	const rows = await db.query.knowledgeSubmissions.findMany({
+		where: (s, { and: a, eq: e, inArray: ia, gte, isNull: n }) =>
+			a(
+				e(s.submitterUserId, principal.userId),
+				ia(s.status, [...SUBMISSION_OUTCOME_STATUSES]),
+				gte(s.reviewedAt, cutoff),
+				n(s.authorReadAt),
+			),
+		columns: { id: true },
+		limit: SUBMISSION_OUTCOME_UNREAD_LIMIT + 1,
+	});
+	const capped = rows.length > SUBMISSION_OUTCOME_UNREAD_LIMIT;
+	return { count: capped ? SUBMISSION_OUTCOME_UNREAD_LIMIT : rows.length, capped };
+}
+
+/**
+ * Mark the caller's own verdicts as read. Ids that belong to someone else, do not exist, or
+ * are already read are silently skipped — the UI marks a row it just opened, and a stale
+ * list must not turn that into an error.
+ */
+async function markSubmissionOutcomesRead(
+	principal: Principal,
+	opts: { ids: string[] },
+): Promise<{ updated: number }> {
+	if (!principal.userId || opts.ids.length === 0) return { updated: 0 };
+	const ids = [...new Set(opts.ids)].slice(0, SUBMISSION_OUTCOME_LIMIT);
+	const updated = await knowledgeWriteStore.markSubmissionAuthorRead({
+		submissionIds: ids,
+		authorUserId: principal.userId,
+		now: new Date().toISOString(),
+	});
+	return { updated };
 }
 
 async function listMyOpenSubmissions(principal: Principal, opts: { limit?: number } = {}) {
@@ -2238,9 +2287,11 @@ export const knowledgeBranchService = {
 	listMyOpenSubmissions,
 	listMySubmissionOutcomes,
 	countReviewInbox,
+	countUnreadSubmissionOutcomes,
 	getSubmission,
 	getSubmissionForViewer,
 	listSubmissionsForInbox,
+	markSubmissionOutcomesRead,
 	withdrawSubmission,
 	resubmit,
 	getMyReviewScope,

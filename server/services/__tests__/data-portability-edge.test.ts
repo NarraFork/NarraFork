@@ -236,11 +236,13 @@ describe("data portability · 异常与边界", () => {
 		];
 		saveSettings(next);
 
-		const zip = await readFile((await exportData()).zipPath);
+		// Keys travel sealed; the same-endpoint check needs them, so export with a passphrase.
+		const passphrase = "edge-passphrase";
+		const zip = await readFile((await exportData(undefined, { passphrase })).zipPath);
 		// 同一端点已经存在：连续导入两次都应被跳过
 		for (let i = 0; i < 2; i += 1) {
 			const preview = await previewImport(toArrayBuffer(zip), "export.zip");
-			await applyImport(preview.token, { conflictDefault: "skip" });
+			await applyImport(preview.token, { conflictDefault: "skip", passphrase });
 		}
 		const providers = settings.customApiProviders ?? [];
 		expect(providers).toHaveLength(1);

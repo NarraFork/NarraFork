@@ -1,4 +1,8 @@
-import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
+import {
+	type MessageBodySource,
+	mapRowElements,
+	messageBody,
+} from "@shared/narrator-blocks/message-blocks";
 import type { PlanTreeView } from "@shared/outline-plan-tree";
 import type { PretextLayoutIndex, PretextLayoutManifest } from "@shared/pretext-layout";
 import type { MeasureElement } from "@shared/pretext-layout/layout-pipeline";
@@ -6,6 +10,7 @@ import {
 	type ContentBlockLike,
 	groupReasoningRuns,
 } from "@shared/pretext-layout/reasoning-segments";
+import { isHistoryClearedElement } from "@shared/storage-retention";
 import { type MessageSegmentationCache, segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits, type RenderUnit } from "../trace/render-units";
@@ -113,6 +118,38 @@ export interface BuiltPretextDocumentLayout {
 }
 
 type SourceMessage = AdapterMessage & { seq?: number };
+
+const historyDisplayRows = new WeakMap<
+	NarratorMsg,
+	{ label: string; blocks: NarratorMsg["blocks"]; row: NarratorMsg }
+>();
+
+/** Localize only the display projection, before segmentation and measurement. */
+function historyDisplayRow(message: NarratorMsg, label: string): NarratorMsg {
+	// A cleared body is a single native text or compact marker. Ordinary text,
+	// including a user who typed the marker's wording, must remain untouched.
+	const first = messageBody(message)[0];
+	if (!isHistoryClearedElement(first)) return message;
+	const compact = first.type === "compact" || first.type === "segment_compact";
+	const cached = historyDisplayRows.get(message);
+	if (cached?.label === label && cached.blocks === message.blocks) return cached.row;
+	const mapped = mapRowElements(message, (element) =>
+		isHistoryClearedElement(element)
+			? {
+					...element,
+					type: "text",
+					text: label,
+					...(typeof element.summary === "string" ? { summary: label } : {}),
+				}
+			: element,
+	);
+	// A cleared compaction no longer has a summary to expand. Paint a system note,
+	// not the normal "segment compacted (0 messages)" chrome that ignores its body.
+	// Only this display copy changes; native compact boundaries keep their protocol type.
+	const row = { ...mapped, ...(compact ? { role: "system" } : {}), contentText: label };
+	historyDisplayRows.set(message, { label, blocks: message.blocks, row });
+	return row;
+}
 
 function sourceMessagesForUnit(unit: RenderUnit): SourceMessage[] {
 	if (unit.kind === "activity") return unit.sourceMessages as SourceMessage[];
@@ -337,8 +374,14 @@ export function buildPretextDocumentLayout(
 	messages: readonly NarratorMsg[],
 	options: BuildPretextDocumentLayoutOptions,
 ): BuiltPretextDocumentLayout {
-	const sourceMessages = messages as readonly SourceMessage[];
-	const segments = segmentMessages(messages as NarratorMsg[], { cache: options.segmentationCache });
+	const historyLabel = options.labels?.historyCleared;
+	const displayMessages = historyLabel
+		? messages.map((message) => historyDisplayRow(message, historyLabel))
+		: messages;
+	const sourceMessages = displayMessages as readonly SourceMessage[];
+	const segments = segmentMessages(displayMessages as NarratorMsg[], {
+		cache: options.segmentationCache,
+	});
 	// The pinned tasks card: one id, derived HERE — once per build, over the SAME
 	// message list being laid out (persisted window + live streaming row). It drives
 	// both fold gates below and the adapter's per-card forceExpanded flag, so the

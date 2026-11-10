@@ -68,6 +68,7 @@
 	"IMPORT_PARAMS_INVALID": "The import request is invalid",
 	"IMPORT_PREVIEW_EXPIRED": "The import preview expired. Choose the file again",
 	"IMPORT_SNAPSHOT_EXPIRED": "The import snapshot is no longer available. Choose the file again",
+	"IMPORT_PASSPHRASE_REQUIRED": "Enter the passphrase the provider keys were exported with",
 	"CLEAR_PARAMS_INVALID": "The clear request is invalid",
 	"CLEAR_USER_UNKNOWN": "Cannot identify the current user",
 	"CLEAR_PASSWORD_NOT_SET": "This account has no password, so data cannot be cleared",
@@ -93,5 +94,12 @@
 		"Chat attachment": "Chat attachment",
 		"Global skill": "Global skill",
 		"Buffered message": "Buffered message"
-	}
+	},
+	"STEP_UP_MFA_REQUIRED": "Set up two-factor authentication (an authenticator app or a passkey) in Security settings first.",
+	"STEP_UP_METHOD_UNAVAILABLE": "This verification method is not set up for your account.",
+	"STEP_UP_FAILED": "The password or verification code is incorrect.",
+	"STEP_UP_REQUIRED": "Verify your identity again to continue.",
+	"BUNDLE_INVALID": "This file is not a NarraFork credential export.",
+	"BUNDLE_PASSPHRASE": "Wrong passphrase, or the file was changed after export.",
+	"BUNDLE_TOO_LARGE": "The file is too large to be a credential export."
 }

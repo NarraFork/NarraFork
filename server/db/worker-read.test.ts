@@ -1,14 +1,25 @@
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	spyOn,
+	test,
+} from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import {
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
+	setDbWorkerSpecifiersForTest,
 	shutdownDbWorkerPool,
 } from "../lib/db-worker/pool";
 import { readQuery } from "./worker-read";
@@ -48,6 +59,51 @@ beforeAll(() => {
 	resetDbWorkerPoolForTest();
 });
 
+let previousWorker: string | undefined;
+let previousConcurrency: string | undefined;
+beforeEach(() => {
+	previousWorker = process.env.NARRAFORK_DB_WORKER;
+	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	delete process.env.NARRAFORK_DB_WORKER;
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	resetDbWorkerPoolForTest();
+});
+afterEach(() => {
+	resetDbWorkerPoolForTest();
+	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
+	else process.env.NARRAFORK_DB_WORKER = previousWorker;
+	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
+});
+
+function useWorkerFixture(name: string, source: string): void {
+	const file = join(home, `${name}.ts`);
+	writeFileSync(file, source);
+	setDbWorkerSpecifiersForTest([pathToFileURL(file).href]);
+}
+
+async function waitForBusy(): Promise<void> {
+	const deadline = Date.now() + 3_000;
+	while (getDbWorkerPoolStats().busy === 0 && Date.now() < deadline) await Bun.sleep(1);
+	expect(getDbWorkerPoolStats().busy).toBe(1);
+}
+
+/** Real pool failures must never call Drizzle's main-connection execution method. */
+async function rejectsOffThread(options: Parameters<typeof readQuery>[1] = {}) {
+	const query = db.select().from(owners);
+	const execute = spyOn(query, "execute");
+	try {
+		const error = await readQuery(query, options).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect(execute).not.toHaveBeenCalled();
+	} finally {
+		execute.mockRestore();
+	}
+}
+
 afterAll(() => {
 	shutdownDbWorkerPool();
 	sqlite.close();
@@ -84,6 +140,7 @@ describe("readQuery", () => {
 	}, 30_000);
 
 	test("runs inline inside a transaction so it sees uncommitted writes", async () => {
+		process.env.NARRAFORK_DB_WORKER = "off";
 		sqlite.run("BEGIN");
 		try {
 			db.insert(owners).values({ id: "o2", name: "bob" }).run();
@@ -93,25 +150,132 @@ describe("readQuery", () => {
 		}
 	});
 
-	test("runs inline for in-memory databases", async () => {
-		const memory = drizzle({ client: new Database(":memory:") });
-		expect(await readQuery(memory.select({ one: sql<number>`1` }).from(sql`(SELECT 1)`))).toEqual([
-			{ one: 1 },
-		]);
-	});
-
-	test("falls back inline when workers are unavailable unless told not to", async () => {
-		const original = process.env.NARRAFORK_DB_WORKER;
+	test("runs inline for in-memory databases even when workers are disabled", async () => {
 		process.env.NARRAFORK_DB_WORKER = "off";
+		const client = new Database(":memory:");
+		const memory = drizzle({ client });
 		try {
-			expect(await readQuery(db.select().from(owners))).toEqual([{ id: "o1", name: "alice" }]);
-			await expect(readQuery(db.select().from(owners), { inlineFallback: false })).rejects.toThrow(
-				"unavailable",
+			expect(await readQuery(memory.select({ one: sql<number>`1` }).from(sql`(SELECT 1)`))).toEqual(
+				[{ one: 1 }],
 			);
 		} finally {
-			if (original === undefined) delete process.env.NARRAFORK_DB_WORKER;
-			else process.env.NARRAFORK_DB_WORKER = original;
-			resetDbWorkerPoolForTest();
+			client.close();
 		}
+	});
+
+	test("preserves the ordinary non-SQLite/async builder path", async () => {
+		process.env.NARRAFORK_DB_WORKER = "off";
+		const query = Object.assign(Promise.resolve([{ one: 1 }]), {
+			toSQL: () => ({ sql: "SELECT 1", params: [] }),
+		});
+		expect(await readQuery(query)).toEqual([{ one: 1 }]);
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	});
+
+	const unsupportedConnections: Array<[string, unknown]> = [
+		["missing session", undefined],
+		["missing client", {}],
+		["null client", { client: null }],
+		["missing filename", { client: { inTransaction: true } }],
+		["null filename", { client: { filename: null, inTransaction: true } }],
+		["numeric filename", { client: { filename: 123, inTransaction: true } }],
+		["object filename", { client: { filename: {}, inTransaction: true } }],
+	];
+	for (const [shape, session] of unsupportedConnections) {
+		test(`${shape} fails explicitly without awaiting or executing the SQLite query`, async () => {
+			const query = db.select().from(owners);
+			// Replace only this builder's private session, simulating a Drizzle adapter/API change.
+			Reflect.set(query, "session", session);
+			const then = spyOn(query, "then");
+			const execute = spyOn(query, "execute");
+			const compile = spyOn(query, "toSQL");
+			try {
+				await expect(readQuery(query)).rejects.toMatchObject({
+					name: "WorkersUnavailableError",
+					reason: "unsupported_sqlite_connection",
+				});
+				expect(then).not.toHaveBeenCalled();
+				expect(execute).not.toHaveBeenCalled();
+				expect(compile).not.toHaveBeenCalled();
+				expect(getDbWorkerPoolStats().workers).toBe(0);
+			} finally {
+				then.mockRestore();
+				execute.mockRestore();
+				compile.mockRestore();
+			}
+		});
+	}
+
+	test("fails without executing the query when workers are disabled", async () => {
+		process.env.NARRAFORK_DB_WORKER = "off";
+		await rejectsOffThread();
+	});
+
+	test("fails without executing the query when concurrency is zero", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "0";
+		await rejectsOffThread();
+	});
+
+	test("pool shutdown rejects queued reads without executing them on the main connection", async () => {
+		useWorkerFixture(
+			"queued-shutdown",
+			'self.onmessage = () => {}; postMessage({ type: "ready" });',
+		);
+		const running = rejectsOffThread();
+		await waitForBusy();
+		const queued = rejectsOffThread();
+		const deadline = Date.now() + 3_000;
+		while (getDbWorkerPoolStats().queued === 0 && Date.now() < deadline) await Bun.sleep(1);
+		expect(getDbWorkerPoolStats().queued).toBe(1);
+		shutdownDbWorkerPool();
+		await Promise.all([running, queued]);
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+		expect(getDbWorkerPoolStats().queued).toBe(0);
+	});
+
+	test("a real creation failure never executes the query on the main connection", async () => {
+		setDbWorkerSpecifiersForTest([pathToFileURL(join(home, "missing-worker.ts")).href]);
+		await rejectsOffThread();
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	});
+
+	test("a missing ready handshake never executes the query on the main connection", async () => {
+		useWorkerFixture("no-ready", 'postMessage({ type: "not-ready" }); process.exit(4);');
+		await rejectsOffThread();
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	});
+
+	test("a worker that exits during the task never executes the query on the main connection", async () => {
+		useWorkerFixture(
+			"exits",
+			'self.onmessage = () => process.exit(3); postMessage({ type: "ready" });',
+		);
+		await rejectsOffThread();
+		expect(getDbWorkerPoolStats().busy).toBe(0);
+	});
+
+	test("a timeout never executes the query on the main connection", async () => {
+		useWorkerFixture("hangs", 'self.onmessage = () => {}; postMessage({ type: "ready" });');
+		await rejectsOffThread({ timeoutMs: 200 });
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	});
+
+	test("cancellation retires the worker without executing the query on the main connection", async () => {
+		useWorkerFixture("aborted", 'self.onmessage = () => {}; postMessage({ type: "ready" });');
+		const controller = new AbortController();
+		const pending = rejectsOffThread({ signal: controller.signal });
+		await waitForBusy();
+		controller.abort();
+		await pending;
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	});
+
+	test("pool shutdown during execution never executes the query on the main connection", async () => {
+		useWorkerFixture("shutdown", 'self.onmessage = () => {}; postMessage({ type: "ready" });');
+		const pending = rejectsOffThread();
+		await waitForBusy();
+		shutdownDbWorkerPool();
+		await pending;
+		expect(getDbWorkerPoolStats().workers).toBe(0);
 	});
 });

@@ -62,5 +62,8 @@ describe("WCO title-bar rows", () => {
 		expect(workspace).toContain("data-nf-titlebar-candidate");
 		expect(workspace).toContain("useWcoTitlebarRows(");
 		expect(workspace).toContain("ref={titlebarRootRef}");
+		// The editing entry point must be a semantic button: a plain Group with onClick
+		// stays in the drag region and cannot receive the click in a native WCO window.
+		expect(workspace).toContain("<UnstyledButton onClick={startEditing}>");
 	});
 });

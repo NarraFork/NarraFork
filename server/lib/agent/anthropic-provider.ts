@@ -1633,7 +1633,7 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	async buildHistory(
-		dbMessages: DbMessage[],
+		dbMessages: readonly DbMessage[],
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
@@ -3012,7 +3012,7 @@ export function parseAnthropicEvent(
 // === History builder ===
 
 async function buildAnthropicHistory(
-	dbMessages: DbMessage[],
+	dbMessages: readonly DbMessage[],
 	currentReasoningSource?: string,
 	useMidConversationSystemRole = false,
 	narratorId?: string,

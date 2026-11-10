@@ -26,6 +26,10 @@ interface ProxyOverrideFieldProps {
 	 * of the field the user is still typing in.
 	 */
 	disabled?: boolean;
+	/** Dropdown z-index; needed when the field sits in a modal raised above the default. */
+	dropdownZIndex?: number;
+	/** Label of the inherit option when it inherits something other than the global policy. */
+	defaultLabel?: string;
 }
 
 /**
@@ -45,6 +49,8 @@ export function ProxyOverrideField({
 	label,
 	hideDescription,
 	disabled,
+	dropdownZIndex,
+	defaultLabel,
 }: ProxyOverrideFieldProps) {
 	const { t } = useTranslation("settings");
 	const persistedMode = normalizeProxyOverrideMode(value?.mode);
@@ -110,12 +116,13 @@ export function ProxyOverrideField({
 		<Stack gap={4}>
 			<Select
 				size={size}
+				comboboxProps={dropdownZIndex === undefined ? undefined : { zIndex: dropdownZIndex }}
 				label={label ?? t("proxyOverrideLabel")}
 				description={hideDescription ? undefined : t("proxyOverrideDesc")}
 				disabled={disabled}
 				allowDeselect={false}
 				data={[
-					{ value: "default", label: t("proxyOverrideDefault") },
+					{ value: "default", label: defaultLabel ?? t("proxyOverrideDefault") },
 					{ value: "direct", label: t("proxyModeDirect") },
 					{ value: "system", label: t("proxyModeSystem") },
 					{ value: "custom", label: t("proxyModeCustom") },

@@ -2,7 +2,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { userPreferences, users } from "../../db/schema";
+import { userGitIdentities, userPreferences, userRecentTabs, users } from "../../db/schema";
+import { generateId } from "../../lib/id";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -58,34 +59,40 @@ describe("git identity visibility preferences", () => {
 		cleanDb(sqlite);
 	});
 
-	afterAll(() => {
-		mock.module("../../db", () => realDbModule);
-		mock.restore();
-	});
-
-	it("没有偏好行时两个入口默认关闭", async () => {
+	it("没有偏好行时三个入口默认关闭", async () => {
 		const prefs = await getPrefs();
 		expect(prefs.gitIdentityContextMenu).toBe(false);
 		expect(prefs.gitIdentityCreateModal).toBe(false);
+		expect(prefs.gitIdentityFolderContextMenu).toBe(false);
 	});
 
-	it("只改一个开关时另一个保持不变", async () => {
+	it("只改一个开关时另外两个保持不变", async () => {
 		await patchPrefs({ gitIdentityContextMenu: true });
 		expect(await getPrefs()).toMatchObject({
 			gitIdentityContextMenu: true,
 			gitIdentityCreateModal: false,
+			gitIdentityFolderContextMenu: false,
 		});
 
 		await patchPrefs({ gitIdentityCreateModal: true });
 		expect(await getPrefs()).toMatchObject({
 			gitIdentityContextMenu: true,
 			gitIdentityCreateModal: true,
+			gitIdentityFolderContextMenu: false,
+		});
+
+		await patchPrefs({ gitIdentityFolderContextMenu: true });
+		expect(await getPrefs()).toMatchObject({
+			gitIdentityContextMenu: true,
+			gitIdentityCreateModal: true,
+			gitIdentityFolderContextMenu: true,
 		});
 
 		await patchPrefs({ gitIdentityContextMenu: false });
 		expect(await getPrefs()).toMatchObject({
 			gitIdentityContextMenu: false,
 			gitIdentityCreateModal: true,
+			gitIdentityFolderContextMenu: true,
 		});
 	});
 
@@ -96,6 +103,7 @@ describe("git identity visibility preferences", () => {
 		expect(await getPrefs()).toMatchObject({
 			gitIdentityContextMenu: false,
 			gitIdentityCreateModal: false,
+			gitIdentityFolderContextMenu: false,
 		});
 		await patchPrefs({ gitIdentityCreateModal: true });
 
@@ -103,9 +111,101 @@ describe("git identity visibility preferences", () => {
 		expect(await getPrefs()).toMatchObject({
 			gitIdentityContextMenu: true,
 			gitIdentityCreateModal: false,
+			gitIdentityFolderContextMenu: false,
 		});
 
 		const rows = db.select().from(userPreferences).all();
 		expect(rows).toHaveLength(2);
 	});
+});
+
+describe("folder git identity endpoints", () => {
+	beforeEach(() => {
+		cleanDb(sqlite);
+		seedUsers();
+		actingUserId = "user-a";
+	});
+
+	afterEach(() => {
+		cleanDb(sqlite);
+	});
+
+	function seedIdentity(userId: string, name: string): string {
+		const id = generateId();
+		db.insert(userGitIdentities)
+			.values({ id, userId, name, email: `${name}@e.com`, isDefault: false, createdAt: NOW })
+			.run();
+		return id;
+	}
+
+	function seedFolder(userId: string, folderId: string): string {
+		db.insert(userRecentTabs)
+			.values({
+				id: generateId(),
+				userId,
+				tabKey: `folder:${folderId}`,
+				section: "work",
+				type: "folder",
+				entityId: folderId,
+				title: "Work",
+				lastVisitedAt: 0,
+				sortOrder: 0,
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		return folderId;
+	}
+
+	async function putFolderPick(folderId: string, identityId: string | null) {
+		return app.request(`/user-preferences/git-identity/folders/${folderId}`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ identityId }),
+		});
+	}
+
+	async function getFolderPick(folderId: string) {
+		const response = await app.request(`/user-preferences/git-identity/folders/${folderId}`);
+		expect(response.status).toBe(200);
+		return (await response.json()) as { identities: unknown[]; selectedId: string | null };
+	}
+
+	it("自己的文件夹可以设置自己的身份，并读回同一个值", async () => {
+		const identityId = seedIdentity("user-a", "alice");
+		const folderId = seedFolder("user-a", "folder-a");
+
+		const put = await putFolderPick(folderId, identityId);
+		if (put.status !== 200) throw new Error(`PUT failed: ${put.status} ${await put.text()}`);
+		const body = await getFolderPick(folderId);
+		expect(body.selectedId).toBe(identityId);
+		expect(body.identities).toHaveLength(1);
+	});
+
+	it("别人读不到也改不了我的文件夹选择", async () => {
+		const identityId = seedIdentity("user-a", "alice");
+		const folderId = seedFolder("user-a", "folder-a");
+		await putFolderPick(folderId, identityId);
+
+		actingUserId = "user-b";
+		expect((await app.request(`/user-preferences/git-identity/folders/${folderId}`)).status).toBe(
+			404,
+		);
+		expect((await putFolderPick(folderId, identityId)).status).toBe(404);
+	});
+
+	it("不能把别人的身份绑到自己的文件夹上", async () => {
+		const bobsIdentity = seedIdentity("user-b", "bob");
+		const folderId = seedFolder("user-a", "folder-a");
+
+		expect((await putFolderPick(folderId, bobsIdentity)).status).toBe(404);
+		expect((await getFolderPick(folderId)).selectedId).toBeNull();
+	});
+});
+
+// Restore the module mock only after every describe has run: restoring it at the end of one
+// describe leaves the next one resolving against the real database.
+afterAll(() => {
+	mock.module("../../db", () => realDbModule);
+	mock.restore();
 });

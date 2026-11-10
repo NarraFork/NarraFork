@@ -10,13 +10,14 @@ import { revealHandlerCommand } from "../reveal-protocol-registration";
 
 describe("reveal protocol tokens", () => {
 	test("a token reveals its path exactly once", () => {
-		const token = issueRevealToken("C:\\work\\repo");
-		expect(claimRevealToken(token)).toBe("C:\\work\\repo");
+		const target = { path: "C:\\work\\repo", selectFile: false };
+		const token = issueRevealToken(target);
+		expect(claimRevealToken(token)).toEqual(target);
 		expect(claimRevealToken(token)).toBeNull();
 	});
 
 	test("an expired token reveals nothing", () => {
-		const token = issueRevealToken("C:\\work\\repo", 0);
+		const token = issueRevealToken({ path: "C:\\work\\repo", selectFile: false }, 0);
 		expect(claimRevealToken(token, 10_000)).toBeNull();
 	});
 

@@ -45,6 +45,13 @@ export class AppError extends Error {
 		public statusCode: number = 500,
 		public code: string = "INTERNAL_ERROR",
 		localization?: AppErrorLocalization,
+		/**
+		 * Machine-readable extras for a client that must act on the error rather than
+		 * print it — e.g. which device still needs a working directory. Serialized
+		 * verbatim by `toErrorPayload`; keep it free of paths or secrets that the
+		 * caller is not already allowed to see.
+		 */
+		public readonly details?: unknown,
 	) {
 		super(message);
 		this.messageCode = localization?.messageCode;

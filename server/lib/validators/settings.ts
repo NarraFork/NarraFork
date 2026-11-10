@@ -223,6 +223,7 @@ export const updateUserPreferencesSchema = z.object({
 	// 提交身份入口的显示位置。跟账号走，不是浏览器本地偏好；默认关，叙述者详情里始终能选身份。
 	gitIdentityContextMenu: z.boolean().optional(),
 	gitIdentityCreateModal: z.boolean().optional(),
+	gitIdentityFolderContextMenu: z.boolean().optional(),
 });
 
 /**
@@ -300,6 +301,11 @@ export const removeRecentTabSchema = z.object({
 	 * a snapshot that points at entities that are already gone.
 	 */
 	cascade: z.boolean().optional(),
+	/**
+	 * 保留因这次移除而变空的文件夹。归档走的是 cascade 清理，但会话还能撤销归档回来，
+	 * 所以文件夹不该跟着最后一条记录一起消失。
+	 */
+	keepEmptyFolder: z.boolean().optional(),
 });
 
 export const moveRecentTabSchema = z

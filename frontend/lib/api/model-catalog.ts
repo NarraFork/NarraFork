@@ -1,53 +1,40 @@
+import type { AutoModelInfo } from "@shared/auto-model";
 import type { ModelCard } from "@shared/model-catalog/card";
-import type { ModelCardMutation } from "@shared/model-catalog/card-local";
-import type { ModelCardSnapshot, ModelWindowsResponse } from "@shared/model-catalog/schema/api";
-import type { ModelQuery } from "@shared/model-catalog/schema/catalog";
+import type { CatalogQuery } from "@shared/model-catalog/resolve";
+import type {
+	CatalogStatus,
+	ModelDescription,
+	ModelDescriptionsResponse,
+	ModelOverrideRequest,
+} from "@shared/model-catalog/schema/api";
 import { request } from "./client";
-
-export type { ModelCardSnapshot };
 
 const root = "/model-catalog";
 export const modelCatalogApi = {
-	snapshot: () => request<ModelCardSnapshot>(`${root}/v2`),
-	resolve: (query: ModelQuery) =>
-		request<ModelCard>(`${root}/v2/resolve`, {
-			method: "POST",
-			body: JSON.stringify({ query }),
-		}),
-	resolveModel: (model: string) =>
-		request<ModelCard & { resolvedQuery: ModelQuery }>(`${root}/v2/resolve`, {
-			method: "POST",
-			body: JSON.stringify({ model }),
-		}),
-	mutate: (mutation: ModelCardMutation) =>
-		request<ModelCardSnapshot>(`${root}/v2/mutate`, {
-			method: "POST",
-			body: JSON.stringify(mutation),
-		}),
-	windows: (models: string[]) =>
-		request<ModelWindowsResponse>(`${root}/v2/windows`, {
+	status: () => request<CatalogStatus>(`${root}/status`),
+	/** Every `auto:<model>` some provider serves, sources in the order routing tries them. */
+	autoModels: () => request<{ models: AutoModelInfo[] }>(`${root}/auto`),
+	/** The card a request for this full model value (`provider:model`) resolves to. */
+	card: (model: string) =>
+		request<ModelCard & { resolvedQuery: CatalogQuery }>(
+			`${root}/card?model=${encodeURIComponent(model)}`,
+		),
+	describe: (models: string[]) =>
+		request<ModelDescriptionsResponse>(`${root}/models`, {
 			method: "POST",
 			body: JSON.stringify({ models }),
 		}),
-	/** Set (or clear with null) one provider entry's own window, or a model-wide one. */
-	setWindow: (input: {
-		baseRevision: number;
-		scope: "connection" | "model";
-		target: string;
-		contextWindow: number | null;
-	}) =>
-		request<ModelCardSnapshot>(`${root}/v2/windows/set`, {
-			method: "POST",
+	/** Save (or clear with `fields: null`) one override; returns `model` re-described. */
+	setOverride: (input: ModelOverrideRequest & { model: string }) =>
+		request<ModelDescription>(`${root}/overrides`, {
+			method: "PUT",
 			body: JSON.stringify(input),
 		}),
-	update: (action: "check" | "apply" | "rollback", version?: string) =>
-		request<ModelCardSnapshot>(`${root}/updates/${action}`, {
-			method: "POST",
-			body: JSON.stringify(version ? { version } : {}),
-		}),
-	settings: (settings: { autoApply?: boolean; pinnedVersion?: string | null }) =>
-		request<ModelCardSnapshot>(`${root}/updates/settings`, {
+	update: (action: "check" | "apply" | "restore-builtin") =>
+		request<CatalogStatus>(`${root}/updates/${action}`, { method: "POST", body: "{}" }),
+	setAutoUpdate: (autoUpdate: boolean) =>
+		request<CatalogStatus>(`${root}/updates/settings`, {
 			method: "PATCH",
-			body: JSON.stringify(settings),
+			body: JSON.stringify({ autoUpdate }),
 		}),
 };

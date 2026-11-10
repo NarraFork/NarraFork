@@ -1,7 +1,7 @@
 import { afterAll, afterEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import { narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
@@ -103,9 +103,9 @@ function context(narratorId: string): ToolContext {
 	};
 }
 async function notices(id: string) {
-	return (
-		await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, id))
-	).filter((row) => JSON.stringify(row.contentJson).includes('"type":"tool_loaded"'));
+	return (await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, id)))
+		.map((row) => ({ ...row, contentJson: readTestMessageContent(sqlite, row.id) }))
+		.filter((row) => JSON.stringify(row.contentJson).includes('"type":"tool_loaded"'));
 }
 async function openPrefixEpoch(
 	id: string,
@@ -402,7 +402,7 @@ test("explicit custom-injection epoch accepts additions without replacing the ba
 		(message) => (message.contentJson as { type?: string }[])[0]?.type === "epoch",
 	);
 	expect(epochs.map((message) => message.id)).toEqual([epoch.id]);
-	expect(epochs[0]?.contentJson).toEqual(epoch.contentJson);
+	expect<unknown>(epochs[0]?.contentJson).toEqual(epoch.contentJson);
 	expect(await notices(id)).toHaveLength(1);
 });
 

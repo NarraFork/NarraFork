@@ -13,6 +13,7 @@
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
+import { readTestMessageContent } from "../../../tests/setup";
 
 let working = false;
 const realSession = { ...(await import("../narrator-session")) };
@@ -30,7 +31,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 	},
 }));
 
-const { db } = await import("../../db");
+const { db, sqlite } = await import("../../db");
 const { aclGrants, narratorMessageRefs, narratorMessages, narrators, projects, users } =
 	await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
@@ -101,7 +102,7 @@ async function notes(
 ): Promise<Array<{ role: string; createdBy: string | null; text: string }>> {
 	const rows = await db
 		.select({
-			json: narratorMessages.contentJson,
+			id: narratorMessages.id,
 			role: narratorMessages.role,
 			createdBy: narratorMessages.createdBy,
 		})
@@ -109,7 +110,7 @@ async function notes(
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId));
 	return rows.flatMap((row) =>
-		((row.json ?? []) as Array<Record<string, unknown>>)
+		readTestMessageContent(sqlite, row.id)
 			.filter((b) => b.type === "system_injection" && b.source === "outline_task_edit")
 			.map((b) => ({ role: row.role, createdBy: row.createdBy, text: String(b.modelText) })),
 	);

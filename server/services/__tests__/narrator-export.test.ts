@@ -16,6 +16,7 @@
  */
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "@shared/gen-ui-public";
+import { clearedToolOutput } from "@shared/storage-retention";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
@@ -128,6 +129,44 @@ beforeEach(() => cleanDb(sqlite));
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
+});
+
+test("ordinary export excludes retained legacy reconstruction input after tool details are cleared", async () => {
+	seedNarrator();
+	await seedMessage({
+		id: "cleared-tool-message",
+		narratorId: "n1",
+		seq: 1,
+		contentText: "ordinary prose",
+		contentJson: [
+			{ type: "text", text: "ordinary prose" },
+			{ type: "tool_use", id: "cleared-wire", name: "Write", input: {}, payloadCleared: true },
+		],
+	});
+	await seedToolCall({
+		id: "cleared-call",
+		narratorId: "n1",
+		messageId: "cleared-tool-message",
+		toolUseId: "cleared-wire",
+		toolName: "Write",
+		input: { file_path: "legacy.txt", content: "private-reconstruction-input".repeat(10000) },
+		output: clearedToolOutput(now),
+	});
+	for (const format of ["json", "markdown"] as const) {
+		const exported = await collect("n1", { format, includeToolIO: true });
+		expect(exported).toContain("ordinary prose");
+		expect(exported).toContain("Tool details cleared");
+		expect(exported).not.toContain("private-reconstruction-input");
+	}
+	expect(
+		(
+			sqlite
+				.query(
+					"SELECT length(input_json) AS bytes FROM narrator_tool_calls WHERE id = 'cleared-call'",
+				)
+				.get() as { bytes: number }
+		).bytes,
+	).toBeGreaterThan(100000);
 });
 
 describe("markdown fencing", () => {
