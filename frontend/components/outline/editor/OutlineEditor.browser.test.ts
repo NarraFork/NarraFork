@@ -676,7 +676,9 @@ test("one marker per row: a task shows arrow + checkbox, a plain row arrow + bul
 	});
 	expect(await frameParts(a, note)).toMatchObject({ parts: ["bullet"], zoom: null });
 	// The checkbox stands where the bullet would: the two rows' text starts in one column.
-	expect((await frameParts(a, task))?.textLeft).toBe((await frameParts(a, plain))?.textLeft as number);
+	expect((await frameParts(a, task))?.textLeft).toBe(
+		(await frameParts(a, plain))?.textLeft as number,
+	);
 	expect(await a.call((f) => f.overflowsX())).toBe(false);
 	// Also where the editor is narrow (a phone, a dock panel) and the indent is smaller.
 	const narrow = await openEditor(h, h.writer, pageId, { width: 360 });
