@@ -181,7 +181,7 @@ export interface DbMessage {
 	contentText: string | null;
 	parentToolUseId: string | null;
 	messageUuid: string | null;
-	toolCalls?: DbToolCall[];
+	toolCalls?: readonly DbToolCall[];
 }
 
 export interface DbToolCall {

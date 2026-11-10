@@ -202,6 +202,9 @@ describe("floating overlays above the WCO drag surface", () => {
 			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		expect(layout).toContain('className="nf-wco-main-strip"');
+		// The inset-only Header has zero height on desktop. Mantine's default border
+		// otherwise gives it a 1px box at y=0, across every authenticated page.
+		expect(layout).toContain("<AppShell.Header withBorder={false}");
 		const top = await Bun.file(
 			new URL("../components/nav/NavTopSection.tsx", import.meta.url),
 		).text();
@@ -209,23 +212,27 @@ describe("floating overlays above the WCO drag surface", () => {
 	});
 
 	test("nothing dead sits at the top edge or the sidebar's sides", async () => {
-		// The shell's padding put 16px of non-draggable band above both drag surfaces, and
-		// the navbar's inline padding left a dead column down the window's left edge — the
-		// two places a reader grabs first. Both belong to the title bar now.
+		// The shell's 16px top padding sits above both drag surfaces and is where a reader
+		// grabs first. It gets a surface of its own rather than being removed: zeroing the
+		// padding moved the whole sidebar and page up, which broke the layout.
 		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
 		const desktop = css.slice(css.indexOf("@media (min-width: 48em)"));
 		expect(desktop).toMatch(
-			/html\[data-nf-wco\] \.nf-app-shell \.mantine-AppShell-navbar,\s*\n?\s*html\[data-nf-wco\] \.nf-app-shell \.mantine-AppShell-main \{\s*\/\*[^*]*\*\/\s*padding-top: 0 !important/,
+			/html\[data-nf-wco\] \.nf-wco-top-gap \{[^}]*height: var\(--mantine-spacing-md\)[^}]*-webkit-app-region: drag/,
 		);
-		// The strip carries the spacing the shell no longer has, so the band above the page
-		// is one drag surface instead of a draggable top and an inert gap below it.
 		expect(desktop).toMatch(
-			/\.nf-wco-main-strip \{[^}]*height: calc\(var\(--nf-wco-strip-height\) \+ var\(--mantine-spacing-md\)\)/,
+			/html\[data-nf-wco\] \.nf-app-shell:has\(\[data-nf-wco-titlebar\]\) \.nf-wco-top-gap \{\s*display: none/,
 		);
-		// The brand row bleeds over the navbar's inline padding, keeping its content in place.
+		expect(css).not.toMatch(/mantine-AppShell-navbar[^{]*\{[^}]*padding-top: 0/);
+		// The navbar's inline padding leaves a dead column down the window's left edge.
+		// The brand row bleeds over it, keeping its content in place.
 		expect(desktop).toMatch(
 			/\.nf-nav-brand-row \{\s*\/\*[^*]*\*\/\s*margin-inline: calc\(var\(--mantine-spacing-md\) \* -1\) !important/,
 		);
+		const layout = await Bun.file(
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
+		).text();
+		expect(layout).toContain('className="nf-wco-top-gap"');
 	});
 
 	test("the theme stamps nf-overlay-layer on every Mantine floating part", async () => {

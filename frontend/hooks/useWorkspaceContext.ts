@@ -153,3 +153,37 @@ export function useSwitchWorkspaceContext(narratorId: string) {
 		},
 	});
 }
+
+export const workspaceDevicesKey = (projectId?: string | null) =>
+	["workspaceDevices", projectId ?? null] as const;
+/**
+ * The device a switch refused for lack of a working directory, or null.
+ *
+ * The device picker already knows which devices are configured, so this is the
+ * backstop for a stale client: instead of a red toast, the caller opens the same
+ * "set this device's directory" dialog.
+ */
+export function workspaceDirectoryRequiredDeviceId(error: unknown): string | null {
+	const body = (error as { data?: unknown } | null)?.data;
+	if (!body || typeof body !== "object") return null;
+	const payload = body as { code?: unknown; details?: unknown };
+	if (payload.code !== "WORKSPACE_DIRECTORY_REQUIRED") return null;
+	const details = payload.details;
+	if (!details || typeof details !== "object") return null;
+	const deviceId = (details as { deviceId?: unknown }).deviceId;
+	return typeof deviceId === "string" && deviceId.trim() ? deviceId : null;
+} /**
+ * Devices a session can be created on.
+ *
+ * Separate from the per-narrator list because creation needs it before the narrator
+ * exists; the server authorizes it against the caller's own device visibility.
+ */
+export function useWorkspaceDevices(projectId?: string | null, enabled = true) {
+	return useQuery({
+		queryKey: workspaceDevicesKey(projectId),
+		queryFn: () => api.getWorkspaceDevices(projectId),
+		enabled,
+		// Device connectivity changes slowly; the picker is opened on demand.
+		staleTime: 15_000,
+	});
+}

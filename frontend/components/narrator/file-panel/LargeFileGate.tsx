@@ -240,7 +240,13 @@ function LargeFileResource({
 }
 
 /** Unviewed or unviewable files still need a way out of the pane. */
-function LargeFileLocationActions({ filePath, deviceId }: { filePath: string; deviceId: string }) {
+export function LargeFileLocationActions({
+	filePath,
+	deviceId,
+}: {
+	filePath: string;
+	deviceId: string;
+}) {
 	const { t } = useTranslation("narrator");
 	const platform = usePlatform();
 	const { data: userPrefs } = useUserPreferences();

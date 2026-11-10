@@ -27,65 +27,55 @@ afterEach(() => {
 });
 
 describe("model catalog wire contract", () => {
-	test("snapshot, explicit patches and opaque actual identities use the mounted API root", async () => {
-		await modelCatalogApi.snapshot();
-		const mutation = {
-			action: "patch" as const,
-			target: "binding" as const,
-			targetId: "binding:exact",
-			baseRevision: 4,
-			patch: {
-				set: {
-					input_cost_per_token: "0",
-					supports_web_search: false,
-					supported_output_modalities: [],
-				},
-				reset: ["working_context_tokens"],
-			},
-		};
-		await modelCatalogApi.mutate(mutation);
-		await modelCatalogApi.resolveModel("my-provider:channel:model:opaque");
-		await modelCatalogApi.resolve({ upstreamModelId: "opaque" });
+	test("reads use the mounted API root and keep opaque model values intact", async () => {
+		await modelCatalogApi.status();
+		await modelCatalogApi.card("my-provider:channel:model:opaque");
+		await modelCatalogApi.describe(["relay:gpt-5.5"]);
 		expect(calls.map((call) => [call.url, call.method])).toEqual([
-			["/api/model-catalog/v2", "GET"],
-			["/api/model-catalog/v2/mutate", "POST"],
-			["/api/model-catalog/v2/resolve", "POST"],
-			["/api/model-catalog/v2/resolve", "POST"],
+			["/api/model-catalog/status", "GET"],
+			["/api/model-catalog/card?model=my-provider%3Achannel%3Amodel%3Aopaque", "GET"],
+			["/api/model-catalog/models", "POST"],
 		]);
-		expect(calls[1].body).toEqual(mutation);
-		expect(calls[2].body).toEqual({ model: "my-provider:channel:model:opaque" });
-		expect(calls[3].body).toEqual({ query: { upstreamModelId: "opaque" } });
+		expect(calls[2].body).toEqual({ models: ["relay:gpt-5.5"] });
 	});
-	test("check/apply/rollback and pin/auto-apply preserve method and false/null", async () => {
+	test("overrides and update actions preserve method, null and false", async () => {
+		await modelCatalogApi.setOverride({
+			scope: "connection",
+			key: "relay:gpt-5.5",
+			fields: null,
+			model: "relay:gpt-5.5",
+		});
 		await modelCatalogApi.update("check");
-		await modelCatalogApi.update("apply", "v2");
-		await modelCatalogApi.update("rollback", "v1");
-		await modelCatalogApi.settings({ autoApply: false, pinnedVersion: null });
+		await modelCatalogApi.update("restore-builtin");
+		await modelCatalogApi.setAutoUpdate(false);
 		expect(calls.map((call) => [call.url, call.method, call.body])).toEqual([
+			[
+				"/api/model-catalog/overrides",
+				"PUT",
+				{ scope: "connection", key: "relay:gpt-5.5", fields: null, model: "relay:gpt-5.5" },
+			],
 			["/api/model-catalog/updates/check", "POST", {}],
-			["/api/model-catalog/updates/apply", "POST", { version: "v2" }],
-			["/api/model-catalog/updates/rollback", "POST", { version: "v1" }],
-			["/api/model-catalog/updates/settings", "PATCH", { autoApply: false, pinnedVersion: null }],
+			["/api/model-catalog/updates/restore-builtin", "POST", {}],
+			["/api/model-catalog/updates/settings", "PATCH", { autoUpdate: false }],
 		]);
 	});
-	test("409 remains typed for the editor rather than retrying a write", async () => {
-		let writes = 0;
-		globalThis.fetch = (async () => {
-			writes += 1;
-			return Response.json({ error: "Conflict" }, { status: 409 });
-		}) as unknown as typeof fetch;
+	test("a field-level rejection stays typed for the editor", async () => {
+		globalThis.fetch = (async () =>
+			Response.json(
+				{ error: "bad", code: "INVALID_OVERRIDE", field: "prices.input" },
+				{ status: 400 },
+			)) as unknown as typeof fetch;
 		try {
-			await modelCatalogApi.mutate({
-				action: "hide",
-				target: "model",
-				targetId: "base",
-				baseRevision: 0,
+			await modelCatalogApi.setOverride({
+				scope: "connection",
+				key: "relay:x",
+				fields: { contextWindow: 1 },
+				model: "relay:x",
 			});
-			throw new Error("Expected conflict");
+			throw new Error("Expected rejection");
 		} catch (error) {
 			expect(error).toBeInstanceOf(ApiError);
-			expect((error as ApiError).status).toBe(409);
+			expect((error as ApiError).data?.field).toBe("prices.input");
 		}
-		expect(writes).toBe(1);
 	});
 });

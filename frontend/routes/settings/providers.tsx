@@ -26,6 +26,7 @@ import { nanoid } from "nanoid";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
+import { AutoParticipationSwitch } from "../../components/providers/AutoParticipationSwitch";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CommandCodeSection } from "../../components/providers/CommandCodeSection";
 import {
@@ -134,6 +135,7 @@ function prepareProviderSettingsSave(state: ProvidersState) {
 				modelProtocols: state.modelProtocols,
 				providerOrder: state.providerOrder,
 				disabledProviders: [...state.disabledProviders],
+				autoExcludedProviders: [...state.autoExcludedProviders],
 			},
 		} satisfies Record<string, unknown>,
 	};
@@ -390,6 +392,15 @@ function SettingsProvidersPage() {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
 	}, []);
 
+	// 卡片上的删除与详情页里的删除按钮是同一条路径：只从草稿移除，保存条统一提交。
+	const deleteDraftProvider = useCallback(
+		(id: string) => {
+			dispatchers.setCustomApiProviders((prev) => prev.filter((provider) => provider.id !== id));
+			dispatchers.setNugProviders((prev) => prev.filter((provider) => provider.id !== id));
+		},
+		[dispatchers.setCustomApiProviders, dispatchers.setNugProviders],
+	);
+
 	const saveProvidersState = useCallback(
 		async (stateToSave: ProvidersState = state) => {
 			if (!settingsFeatureCapability.patchSupported) {
@@ -422,6 +433,8 @@ function SettingsProvidersPage() {
 			void qc.invalidateQueries({ queryKey: ["commandcode", "usage"] });
 			// Prefix renames and removed providers move or drop provider-model overrides.
 			void qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
+			// Joining or leaving auto changes which sources each auto: model has.
+			void qc.invalidateQueries({ queryKey: ["settings", "auto-models"] });
 		},
 		[settingsFeatureCapability.patchSupported, t, updateMutation, state, qc],
 	);
@@ -998,6 +1011,7 @@ function SettingsProvidersPage() {
 								: getBadgeLabel(prefix),
 						models,
 						disabled,
+						autoExcluded: state.autoExcludedProviders.has(prefix),
 						inactive,
 						isPlatform,
 						...(plugin?.pluginId ? { pluginId: plugin.pluginId } : {}),
@@ -1019,6 +1033,7 @@ function SettingsProvidersPage() {
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,
+		state.autoExcludedProviders,
 		state.customApiProviders,
 		state.nugProviders,
 		state.commandCode,
@@ -1105,6 +1120,15 @@ function SettingsProvidersPage() {
 		state.nugProviders,
 		providerLabels,
 	]);
+
+	/** Model prefix of the selected provider: multi-instance ones are selected by id. */
+	const selectedProviderPrefix = useMemo(() => {
+		if (!selectedProvider) return null;
+		const configured =
+			state.customApiProviders.find((p) => p.id === selectedProvider) ??
+			state.nugProviders.find((p) => p.id === selectedProvider);
+		return configured ? configured.prefix || null : selectedProvider;
+	}, [selectedProvider, state.customApiProviders, state.nugProviders]);
 
 	// ── Auto-fetch models after a manual save ──
 	// Triggered by handleSave (only when a provider is being edited). Refreshes the
@@ -1209,6 +1233,20 @@ function SettingsProvidersPage() {
 				<ProviderConfigView
 					providerLabel={selectedProviderLabel}
 					onClose={() => setSelectedProvider(null)}
+					header={
+						selectedProviderPrefix ? (
+							<AutoParticipationSwitch
+								prefix={selectedProviderPrefix}
+								participates={!state.autoExcludedProviders.has(selectedProviderPrefix)}
+								savedParticipates={
+									!savedProviderSnapshot.autoExcludedProviders.includes(selectedProviderPrefix)
+								}
+								onChange={(participates) =>
+									dispatchers.setAutoExcluded(selectedProviderPrefix, !participates)
+								}
+							/>
+						) : undefined
+					}
 				>
 					{selectedProvider === "tokendance" && tokenDance?.connected ? (
 						<TokenDanceSection
@@ -1270,6 +1308,7 @@ function SettingsProvidersPage() {
 					dispatchers.toggleProviderDisabled(prefix);
 				}}
 				onOpenProviderConfig={setSelectedProvider}
+				onDeleteProvider={deleteDraftProvider}
 				selectedProvider={selectedProvider}
 			/>
 		);

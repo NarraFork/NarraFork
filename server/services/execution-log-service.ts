@@ -30,6 +30,7 @@ import {
 	toolCallWithExecutionTargets,
 } from "@server/lib/tool-execution-target-projection";
 import { narratorProjectIdColumn } from "@server/services/narrator-project";
+import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import { and, desc, eq, gte, isNotNull, lte, or, type SQL, sql } from "drizzle-orm";
 import { summarizeSubagentToolCall } from "./subagent-activity";
 
@@ -60,9 +61,11 @@ const FACET_WINDOW_ROWS = 20_000;
 
 /** Bounded, JSON-safe extraction of one small input field. Mirrors subagent-activity. */
 const SUMMARY_FIELD_MAX_LENGTH = 160;
+const CLEARED_TOOL_SQL = sql.raw(clearedToolOutputSql("narrator_tool_calls.output_json"));
 
 function boundedJsonText(path: string) {
 	return sql<string | null>`CASE
+		WHEN ${CLEARED_TOOL_SQL} THEN NULL
 		WHEN json_valid(${narratorToolCalls.inputJson})
 		THEN substr(CAST(json_extract(${narratorToolCalls.inputJson}, ${path}) AS TEXT), 1, ${SUMMARY_FIELD_MAX_LENGTH})
 		ELSE NULL
@@ -395,7 +398,11 @@ export class ExecutionLogService {
 				...LIST_COLUMNS,
 				...SUMMARY_HINT_COLUMNS,
 				messageId: narratorToolCalls.messageId,
-				inputJson: narratorToolCalls.inputJson,
+				// File replay inputs remain stored internally, never in ordinary details.
+				inputJson:
+					sql`CASE WHEN ${CLEARED_TOOL_SQL} THEN NULL ELSE ${narratorToolCalls.inputJson} END`.mapWith(
+						narratorToolCalls.inputJson,
+					),
 				outputJson: narratorToolCalls.outputJson,
 				permissionDenyMessage: narratorToolCalls.permissionDenyMessage,
 				permissionDecisionReason: narratorToolCalls.permissionDecisionReason,
@@ -621,7 +628,7 @@ export class ExecutionLogService {
 			];
 			if (filters.searchPayload) {
 				branches.push(
-					sql`${narratorToolCalls.inputJson} LIKE ${like} ESCAPE '\\'`,
+					sql`CASE WHEN ${CLEARED_TOOL_SQL} THEN FALSE ELSE ${narratorToolCalls.inputJson} LIKE ${like} ESCAPE '\\' END`,
 					sql`${narratorToolCalls.outputJson} LIKE ${like} ESCAPE '\\'`,
 				);
 				// The window bound is what keeps the payload LIKE from reading the whole

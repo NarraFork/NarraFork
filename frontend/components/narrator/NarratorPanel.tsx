@@ -92,6 +92,7 @@ import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUse
 import {
 	useUpdateExecutionDevice,
 	useWorkspaceContext,
+	workspaceDirectoryRequiredDeviceId,
 	workspaceFileTarget,
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
@@ -151,6 +152,7 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { DeviceDirectoryDialog } from "./header/DeviceDirectoryDialog";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -455,6 +457,7 @@ function NarratorPanelBody({
 	const permissionReflections = narratorPermissionsCapability.reflections;
 	const planReflectionSupported = permissionReflections.includes("plan");
 	const dangerReflectionSupported = permissionReflections.includes("danger");
+	const questionReflectionSupported = permissionReflections.includes("question");
 	const planModeCapability = useNarratorPlanModeCapability();
 	const planModeSupported = planModeCapability.supported;
 	const planModeUnsupportedReason = planModeSupported
@@ -509,9 +512,22 @@ function NarratorPanelBody({
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
-	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) =>
-		notifications.show({ color: "red", message: error.message }),
-	);
+	// A device with no recorded directory refuses the switch; that is a prompt, not a
+	// failure, so it opens the directory dialog instead of a red toast. The dialog is
+	// mounted here (outside the header and overflow menus) so both entry points share it.
+	const [directoryDeviceId, setDirectoryDeviceId] = useState<string | null>(null);
+	const requireDeviceDirectory = useCallback((deviceId: string) => {
+		setDirectoryDeviceId(deviceId);
+	}, []);
+	const closeDeviceDirectoryDialog = useCallback(() => setDirectoryDeviceId(null), []);
+	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) => {
+		const missingDirectoryDevice = workspaceDirectoryRequiredDeviceId(error);
+		if (missingDirectoryDevice) {
+			requireDeviceDirectory(missingDirectoryDevice);
+			return;
+		}
+		notifications.show({ color: "red", message: error.message });
+	});
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -562,6 +578,7 @@ function NarratorPanelBody({
 	);
 	const dangerReflectionGlobal = dangerReflectionGlobalLevel !== "off";
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
+	const questionReflectionGlobal = settingsData?.agent?.questionReflectionEnabled ?? false;
 	const reflectionSettingsDisabled =
 		!settingsData || updateSettingsMutation.isPending || reflectionOverridesMutation.isPending;
 	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
@@ -643,7 +660,11 @@ function NarratorPanelBody({
 	// status bar (see useStatusBarProps), which is where they are consumed.
 	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
 		useResolvedModel(
-			capabilityModelReference(narrator?.model, narrator?.modelInheritance?.model),
+			capabilityModelReference(
+				narrator?.model,
+				narrator?.modelInheritance?.model,
+				narrator?.runtimeModel,
+			),
 			defaultModelValue,
 			aggregations,
 			allModels,
@@ -2830,6 +2851,7 @@ function NarratorPanelBody({
 		toggleTerminalTool,
 		toggleSpecTool,
 		updateExecutionDeviceMutation,
+		onRequireDeviceDirectory: requireDeviceDirectory,
 		renderLod,
 		renderLodIsDefault,
 		handleSelectLod,
@@ -2844,6 +2866,7 @@ function NarratorPanelBody({
 		() => ({
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			onRequireDeviceDirectory: requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -2853,6 +2876,7 @@ function NarratorPanelBody({
 		[
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -3179,6 +3203,15 @@ function NarratorPanelBody({
 					{...dropZoneProps}
 				>
 					{toolbarController.toolbarOverlays}
+					<DeviceDirectoryDialog
+						narratorId={narratorId}
+						deviceId={directoryDeviceId}
+						deviceName={
+							executionDevicesQuery.data?.devices.find((device) => device.id === directoryDeviceId)
+								?.name
+						}
+						onClose={closeDeviceDirectoryDialog}
+					/>
 					<NugRechargeDialog
 						opened={nugRechargeOpened}
 						narratorId={narratorId}
@@ -3787,11 +3820,14 @@ function NarratorPanelBody({
 							planModeUnsupportedReason,
 							planReflectionSupported,
 							dangerReflectionSupported,
+							questionReflectionSupported,
 							narratorPlanReflectionAutoApproveOverride: narrator.planReflectionAutoApproveOverride,
 							narratorDangerReflectionOverride: narrator.dangerReflectionOverride,
+							narratorQuestionReflectionOverride: narrator.questionReflectionOverride,
 							planReflectionAutoApproveGlobal,
 							dangerReflectionGlobal,
 							dangerReflectionGlobalLevel,
+							questionReflectionGlobal,
 							settingsLoaded: !!settingsData,
 							enterPlanModeMutation,
 							exitPlanModeMutation,

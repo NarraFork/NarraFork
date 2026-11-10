@@ -521,9 +521,8 @@ describe("the SQLite adapter reports where the scan actually runs", () => {
 	});
 
 	test("loses offRequestThreadScan when read workers are disabled", () => {
-		// Read at access time on purpose. A frozen `true` would keep claiming the request thread is
-		// protected in exactly the states where it is not — workers off by configuration, or the
-		// pool torn down for a VACUUM maintenance window.
+		// Read shared-pool availability at access time. Disabling it must not leave a stale `true`;
+		// dedicated-worker recovery remains a separate isolated path, exercised below.
 		process.env.NARRAFORK_DB_WORKER = "off";
 		expect(sqliteDatabaseStoragePort.capabilities.offRequestThreadScan).toBe(false);
 
@@ -532,8 +531,8 @@ describe("the SQLite adapter reports where the scan actually runs", () => {
 	});
 
 	test("still measures with workers disabled, degrading rather than failing", async () => {
-		// The existing SQLite fallback, preserved: a serial main-thread scan is slow, but a slow
-		// report beats a broken settings page.
+		// A dedicated ephemeral worker runs the serial scan when the shared pool is disabled.
+		// The report remains available without moving measurement onto the request thread.
 		process.env.NARRAFORK_DB_WORKER = "off";
 		const report = await sqliteDatabaseStoragePort.scanBreakdown();
 		expect(report.sizeBytes).toBeGreaterThan(0);

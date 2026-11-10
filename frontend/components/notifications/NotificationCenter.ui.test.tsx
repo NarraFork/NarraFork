@@ -171,6 +171,8 @@ const originalList = api.listNotifications;
 const originalMarkRead = api.markNotificationsRead;
 const originalReviewInbox = api.getKnowledgeReviewInboxCount;
 const originalOutcomes = api.listMyKnowledgeSubmissionOutcomes;
+const originalOutcomesUnread = api.getKnowledgeSubmissionOutcomesUnreadCount;
+const originalMarkOutcomesRead = api.markKnowledgeSubmissionOutcomesRead;
 const originalSubmissions = api.listKnowledgeSubmissions;
 
 let restoreDom: (() => void) | null = null;
@@ -244,6 +246,12 @@ beforeEach(async () => {
 	});
 	api.getKnowledgeReviewInboxCount = async () => reviewInboxPayload;
 	api.listMyKnowledgeSubmissionOutcomes = async () => outcomePayload;
+	// Derived from the payload so a fixture that adds an unread row moves the bell with it.
+	api.getKnowledgeSubmissionOutcomesUnreadCount = async () => ({
+		count: outcomePayload.filter((row) => !row.authorReadAt).length,
+		capped: false,
+	});
+	api.markKnowledgeSubmissionOutcomesRead = async (ids) => ({ updated: ids.length });
 	api.listKnowledgeSubmissions = async (opts = {}) =>
 		submissionPayload.filter((row) => !opts.status || row.status === opts.status);
 
@@ -279,6 +287,8 @@ afterEach(async () => {
 	api.markNotificationsRead = originalMarkRead;
 	api.getKnowledgeReviewInboxCount = originalReviewInbox;
 	api.listMyKnowledgeSubmissionOutcomes = originalOutcomes;
+	api.getKnowledgeSubmissionOutcomesUnreadCount = originalOutcomesUnread;
+	api.markKnowledgeSubmissionOutcomesRead = originalMarkOutcomesRead;
 	api.listKnowledgeSubmissions = originalSubmissions;
 	restoreDom?.();
 	restoreDom = null;
@@ -618,6 +628,7 @@ describe("NotificationCenterDrawer", () => {
 				verdict: "request_changes",
 				findingsJson: [{ severity: "minor", message: "spell out the grant" }],
 				reviewedAt: new Date().toISOString(),
+				authorReadAt: null,
 				createdAt: new Date().toISOString(),
 			},
 		];
@@ -666,6 +677,7 @@ describe("NotificationCenterDrawer", () => {
 				verdict: "request_changes",
 				findingsJson: null,
 				reviewedAt: new Date().toISOString(),
+				authorReadAt: null,
 				createdAt: new Date().toISOString(),
 			},
 		];

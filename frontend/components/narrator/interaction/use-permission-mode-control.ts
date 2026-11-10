@@ -19,15 +19,19 @@ export interface UsePermissionModeControlOptions {
 	/** Raw override values off the narrator record. */
 	narratorPlanReflectionAutoApproveOverride: unknown;
 	narratorDangerReflectionOverride: unknown;
+	narratorQuestionReflectionOverride: unknown;
 	/** Whether the narrator currently carries the plan trait (owned by the panel). */
 	hasPlanTrait: boolean;
 	planModeSupported: boolean;
 	planReflectionSupported: boolean;
 	dangerReflectionSupported: boolean;
+	questionReflectionSupported: boolean;
 	/** Global (instance-default) reflection state. */
 	planReflectionAutoApproveGlobal: boolean;
 	dangerReflectionGlobal: boolean;
 	dangerReflectionGlobalLevel: DangerReflectionLevel;
+	/** Instance default for automatic AskUserQuestion reflection. */
+	questionReflectionGlobal: boolean;
 	/** Whether settings are loaded (guards "set as default"). */
 	settingsLoaded: boolean;
 	enterPlanModeMutation: Mutation<string>;
@@ -36,12 +40,14 @@ export interface UsePermissionModeControlOptions {
 		id: string;
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		dangerReflectionOverride?: DangerReflectionOverride;
+		questionReflectionOverride?: BooleanOverride;
 	}>;
 	updateSettingsMutation: Mutation<{
 		agent: {
 			planReflectionAutoApprove?: boolean;
 			dangerReflectionLevel?: DangerReflectionLevel;
 			dangerReflectionEnabled?: boolean;
+			questionReflectionEnabled?: boolean;
 		};
 	}>;
 	confirm: (options: { message: ReactNode }) => Promise<boolean>;
@@ -51,8 +57,10 @@ export interface UsePermissionModeControlOptions {
 export interface UsePermissionModeControlResult {
 	planReflectionAutoApproveOverride: BooleanOverride;
 	dangerReflectionOverride: DangerReflectionOverride;
+	questionReflectionOverride: BooleanOverride;
 	planReflectionAutoApproveEffective: boolean;
 	dangerReflectionEffectiveLevel: DangerReflectionLevel;
+	questionReflectionEffective: boolean;
 	togglePlanMode: () => void;
 	handlePlanReflectionAutoApproveOverride: (value: BooleanOverride) => void;
 	handleFollowDefaultPlanReflection: () => void;
@@ -60,6 +68,9 @@ export interface UsePermissionModeControlResult {
 	handleDangerReflectionOverride: (value: DangerReflectionOverride) => Promise<void>;
 	handleFollowDefaultDangerReflection: () => void;
 	handleSetDangerReflectionAsDefault: () => Promise<void>;
+	handleQuestionReflectionOverride: (value: BooleanOverride) => void;
+	handleFollowDefaultQuestionReflection: () => void;
+	handleSetQuestionReflectionAsDefault: () => void;
 }
 
 /**
@@ -79,13 +90,16 @@ export function usePermissionModeControl(
 		narratorId,
 		narratorPlanReflectionAutoApproveOverride,
 		narratorDangerReflectionOverride,
+		narratorQuestionReflectionOverride,
 		hasPlanTrait,
 		planModeSupported,
 		planReflectionSupported,
 		dangerReflectionSupported,
+		questionReflectionSupported,
 		planReflectionAutoApproveGlobal,
 		dangerReflectionGlobal,
 		dangerReflectionGlobalLevel,
+		questionReflectionGlobal,
 		settingsLoaded,
 		enterPlanModeMutation,
 		exitPlanModeMutation,
@@ -101,6 +115,7 @@ export function usePermissionModeControl(
 	const dangerReflectionOverride = normalizeDangerReflectionOverride(
 		narratorDangerReflectionOverride,
 	);
+	const questionReflectionOverride = normalizeBooleanOverride(narratorQuestionReflectionOverride);
 	const planReflectionAutoApproveEffective = resolveBooleanOverride(
 		planReflectionAutoApproveOverride,
 		planReflectionAutoApproveGlobal,
@@ -108,6 +123,10 @@ export function usePermissionModeControl(
 	const dangerReflectionEffectiveLevel = resolveDangerReflectionLevel(
 		dangerReflectionOverride,
 		dangerReflectionGlobalLevel,
+	);
+	const questionReflectionEffective = resolveBooleanOverride(
+		questionReflectionOverride,
+		questionReflectionGlobal,
 	);
 	const togglePlanMode = useCallback(() => {
 		if (!narratorId || !planModeSupported) return;
@@ -143,6 +162,36 @@ export function usePermissionModeControl(
 		narratorId,
 		planReflectionAutoApproveEffective,
 		planReflectionSupported,
+		reflectionOverridesMutation,
+		settingsLoaded,
+		updateSettingsMutation,
+	]);
+	const handleQuestionReflectionOverride = useCallback(
+		(value: BooleanOverride) => {
+			if (!questionReflectionSupported) return;
+			reflectionOverridesMutation.mutate({
+				id: narratorId,
+				questionReflectionOverride: value,
+			});
+		},
+		[narratorId, questionReflectionSupported, reflectionOverridesMutation],
+	);
+	const handleFollowDefaultQuestionReflection = useCallback(() => {
+		handleQuestionReflectionOverride("inherit");
+	}, [handleQuestionReflectionOverride]);
+	const handleSetQuestionReflectionAsDefault = useCallback(() => {
+		if (!settingsLoaded || !questionReflectionSupported) return;
+		updateSettingsMutation.mutate({
+			agent: { questionReflectionEnabled: questionReflectionEffective },
+		});
+		reflectionOverridesMutation.mutate({
+			id: narratorId,
+			questionReflectionOverride: "inherit",
+		});
+	}, [
+		narratorId,
+		questionReflectionEffective,
+		questionReflectionSupported,
 		reflectionOverridesMutation,
 		settingsLoaded,
 		updateSettingsMutation,
@@ -198,8 +247,10 @@ export function usePermissionModeControl(
 	return {
 		planReflectionAutoApproveOverride,
 		dangerReflectionOverride,
+		questionReflectionOverride,
 		planReflectionAutoApproveEffective,
 		dangerReflectionEffectiveLevel,
+		questionReflectionEffective,
 		togglePlanMode,
 		handlePlanReflectionAutoApproveOverride,
 		handleFollowDefaultPlanReflection,
@@ -207,5 +258,8 @@ export function usePermissionModeControl(
 		handleDangerReflectionOverride,
 		handleFollowDefaultDangerReflection,
 		handleSetDangerReflectionAsDefault,
+		handleQuestionReflectionOverride,
+		handleFollowDefaultQuestionReflection,
+		handleSetQuestionReflectionAsDefault,
 	};
 }

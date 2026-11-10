@@ -313,6 +313,7 @@
 	"browse": "Browse",
 	"selectDirectory": "Select Directory",
 	"selectThisDirectory": "Select This Directory",
+	"directoryList": "Directories",
 	"goUp": "Go up",
 	"emptyDirectory": "Empty directory",
 	"noMatchingDirectories": "No matching directories",

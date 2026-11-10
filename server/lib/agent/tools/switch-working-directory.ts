@@ -4,7 +4,7 @@ import type { ToolDefinition } from "../types";
 export const switchWorkingDirectoryTool: ToolDefinition = {
 	name: "SwitchWorkingDirectory",
 	description:
-		"Switch the local working directory of this ordinary primary narrator. Supply the current workspace revision and a unique requestId. Non-Git directories are supported. Remote arbitrary directories are unsupported. This is a strict serial barrier: after a successful change the current pass ends; only the next pass uses the new cwd, skills and permissions. Already started background tools, subagents and terminals retain their original targets. Consult the current workspace context for the authoritative revision and switching support.",
+		"Switch the working directory of this ordinary primary narrator. Supply the current workspace revision and a unique requestId. Non-Git directories are supported. A remote target needs `target.deviceId` and an absolute path in that device's own grammar: the device verifies the directory exists, and the directory is recorded for that device. This is a strict serial barrier: after a successful change the current pass ends; only the next pass uses the new cwd, skills and permissions. Already started background tools, subagents and terminals retain their original targets. Consult the current workspace context for the authoritative revision and switching support.",
 	parameters: switchWorkingDirectorySchema,
 	async execute(args, ctx) {
 		if (!ctx.switchWorkingDirectory)

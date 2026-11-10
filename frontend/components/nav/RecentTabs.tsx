@@ -1292,6 +1292,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								}
 								onLeaveFolder={ctxInFolder ? handleLeaveFolder : null}
 								gitIdentityNarratorId={ctxTab.type === "narrator" ? ctxTab.id : null}
+								gitIdentityFolderId={ctxIsFolder ? ctxTab.id : null}
 								detailsTab={isTouch && !ctxIsFolder ? ctxTab : null}
 								t={t}
 							/>

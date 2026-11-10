@@ -12,6 +12,7 @@ import type { ApiRequestDiagnostics } from "./agent/types";
 import { boundedContextSnapshot } from "./context-usage-snapshot";
 import { captureReferencePricingSnapshot, cloneReferencePricingSnapshot } from "./model-pricing";
 import { bindRecordingRequest } from "./request-recorder";
+import { defaultRequestSourceId } from "./request-source";
 
 export type ApiRequestKind =
 	| "narrator"
@@ -118,7 +119,8 @@ export async function finishApiRequest(
 	const cost = usage
 		? calculateCostDetailed(usage, handle.provider, handle.model, handle.referencePricingSnapshot)
 		: null;
-	const credentialId = options.credentialId ?? handle.credentialId ?? null;
+	const credentialId =
+		options.credentialId ?? handle.credentialId ?? defaultRequestSourceId(handle.provider);
 	const createdAt = new Date().toISOString();
 
 	const inserted = insertApiRequestWithUserUsage({
@@ -161,16 +163,9 @@ export async function finishApiRequest(
 	// detail row is later deleted with its narrator, the rollup is not.
 	//
 	// Failed requests (no usage at all) are skipped: they consumed no tokens and
-	// counting them would make "requests" mean two different things.
-	//
-	// Requests without a credentialId are skipped too, and that is deliberate:
-	// Anthropic and OpenAI direct connections have no credential management, so
-	// there is nothing to attribute the usage to. Bucketing them under a shared
-	// sentinel would break the table's "one row per real credential" key and give
-	// several unrelated providers a single merged row. The consequence is that
-	// `credential_usage_totals` is a per-credential rollup, not a deployment-wide
-	// ledger — see the SCOPE note on the table in db/schema.ts. Deployment totals
-	// come from `api_requests` while those rows exist.
+	// counting them would make "requests" mean two different things. Requests from
+	// an unknown source (no credential and no configured connection) are skipped
+	// too rather than merged into a shared sentinel row.
 	if (credentialId && usage) {
 		recordCredentialUsage({
 			provider: handle.provider,

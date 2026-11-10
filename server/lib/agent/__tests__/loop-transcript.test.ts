@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import type { MediaContentBlock } from "@shared/media-attachments";
 import { assembleContent, splitEnvelope } from "@shared/narrator-blocks/storage";
+import { clearedToolOutput, historyClearedText } from "@shared/storage-retention";
 import { AnthropicProvider } from "../anthropic-provider";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
 import { GeminiProvider } from "../gemini-provider";
@@ -88,6 +89,66 @@ function restoredRows(rows: DbMessage[]): DbMessage[] {
 }
 
 for (const [name, provider, model] of projectionProviders()) {
+	test(`${name}: cleared history continues as text without incomplete calls, credentials or ledger revival`, async () => {
+		const at = "2026-10-01T00:00:00.000Z";
+		const base = { contentText: null, parentToolUseId: null, messageUuid: null };
+		const rows: DbMessage[] = [
+			{ ...base, id: "old-user", role: "user", contentJson: [historyClearedText(at)] },
+			{
+				...base,
+				id: "cleared-assistant",
+				role: "assistant",
+				contentJson: [historyClearedText(at)],
+				toolCalls: [
+					{
+						toolUseId: "wire-old-ledger",
+						toolName: "Read",
+						inputJson: { path: "private-ledger-input" },
+						outputJson: "private-ledger-output",
+						status: "success",
+					},
+				],
+			},
+			{
+				...base,
+				id: "cleared-tool",
+				role: "assistant",
+				contentJson: [
+					{
+						type: "tool_use",
+						id: "wire-cleared",
+						name: "Write",
+						input: { content: "private-stale-input" },
+						thoughtSignature: "private-old-signature",
+					},
+				],
+				toolCalls: [
+					{
+						toolUseId: "wire-cleared",
+						toolName: "Write",
+						inputJson: null,
+						outputJson: clearedToolOutput(at),
+						status: "success",
+					},
+				],
+			},
+			{
+				...base,
+				id: "continue-input",
+				role: "user",
+				contentJson: [{ type: "text", text: "continue after retention" }],
+			},
+		];
+		const history = (await provider.buildHistory(rows, model)).history;
+		const wire = JSON.stringify(history);
+		expect(wire).toContain("[History cleared]");
+		expect(wire).toContain("[Tool details cleared]");
+		expect(wire).toContain("continue after retention");
+		expect(wire).not.toContain("wire-cleared");
+		expect(wire).not.toContain("wire-old-ledger");
+		expect(wire).not.toContain("private-");
+		expect((await provider.buildHistory(restoredRows(rows), model)).history).toEqual(history);
+	});
 	test(`${name}: typed updates append once and rebuild identically after a tool result`, async () => {
 		const transcript = new LoopTranscript([
 			{

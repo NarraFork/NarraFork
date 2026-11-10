@@ -112,6 +112,7 @@ function toolbarProps(): HeaderToolbarProps {
 		t: (key) => key,
 		inlineControls: {
 			executionDevicesQuery: { data: { devices: [] } },
+			onRequireDeviceDirectory: () => {},
 			updateExecutionDeviceMutation: { mutate: mock(() => {}) },
 			renderLod: 4,
 			renderLodIsDefault: true,

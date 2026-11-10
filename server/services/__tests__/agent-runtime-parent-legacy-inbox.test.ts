@@ -11,7 +11,7 @@ import { hotSafe } from "../../lib/hot-safe";
 import type { PendingInjection } from "../parent-injection-queue";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const before = new Date(Date.now() - 60_000).toISOString();
 db.insert(narrators).values({ id: "recipient", createdAt: before, updatedAt: before }).run();
 for (const id of ["legacy-terminal", "wrong-run"])

@@ -19,13 +19,12 @@
 import * as database from "../db";
 import { getDbPath } from "../db/connection";
 import { replaceBlockIndexRow } from "../db/fts";
-import {
-	type BlockIndexQueueSliceParams,
-	type BlockIndexQueueSliceResult,
-	type IndexQueueEntry,
-	runBlockIndexQueueSlice,
+import type {
+	BlockIndexQueueSliceParams,
+	BlockIndexQueueSliceResult,
+	IndexQueueEntry,
 } from "../lib/db-worker/block-backfill-query";
-import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import { runReadTask } from "../lib/db-worker/pool";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 
@@ -39,9 +38,6 @@ const SLICE_BLOCKS = 200;
 const SLICE_INDEX_CHARS = 256 * 1024;
 const SLICE_BUDGET_MS = 1_000;
 const WORKER_TIMEOUT_MS = 30_000;
-/** Without workers the main thread computes the text, so slices stay small. */
-const INLINE_SLICE_BLOCKS = 20;
-const INLINE_SLICE_INDEX_CHARS = 64 * 1024;
 /** A write transaction should stay under this, commit included. */
 const APPLY_TARGET_MS = 50;
 /** After a write transaction of T ms the next waits this many times T (a quarter of the time). */
@@ -82,34 +78,15 @@ export function unqueueBlockIndex(blockId: string): void {
 	database.sqlite.query("DELETE FROM narrator_block_index_queue WHERE block_id = ?").run(blockId);
 }
 
-/** How a slice is read: by a db-worker (production) or inline on the main connection. */
+/** Production slices use a db-worker; unit tests may explicitly inject a reader. */
 export type IndexQueueReader = (
 	params: BlockIndexQueueSliceParams,
 ) => Promise<BlockIndexQueueSliceResult>;
 
-const inlineParams = (params: BlockIndexQueueSliceParams): BlockIndexQueueSliceParams => ({
-	...params,
-	maxBlocks: Math.min(params.maxBlocks, INLINE_SLICE_BLOCKS),
-	maxIndexChars: Math.min(params.maxIndexChars, INLINE_SLICE_INDEX_CHARS),
-});
-
-const workerReader: IndexQueueReader = async (params) => {
-	// A worker opens the database file: an in-memory connection (tests) is read inline.
-	if (database.sqlite.filename === ":memory:" || !database.sqlite.filename)
-		return runBlockIndexQueueSlice(database.sqlite, inlineParams(params));
-	try {
-		return await runReadTask<BlockIndexQueueSliceResult>(getDbPath(), params, {
-			timeoutMs: WORKER_TIMEOUT_MS,
-		});
-	} catch (error) {
-		if (!(error instanceof WorkersUnavailableError) || error.reason === "pool_shutdown")
-			throw error;
-		return runBlockIndexQueueSlice(database.sqlite, inlineParams(params));
-	}
-};
-
-export const inlineIndexQueueReader: IndexQueueReader = async (params) =>
-	runBlockIndexQueueSlice(database.sqlite, inlineParams(params));
+const workerReader: IndexQueueReader = (params) =>
+	runReadTask<BlockIndexQueueSliceResult>(getDbPath(), params, {
+		timeoutMs: WORKER_TIMEOUT_MS,
+	});
 
 const runner = hotSafe("narrator-block-index:runner", () => ({
 	/** Tests write the queue themselves (`drainBlockIndexQueue`), when they choose. */
@@ -261,12 +238,10 @@ function noteSlow(elapsedMs: number, chars: number): void {
 }
 
 /**
- * Write everything queued now, on the main connection and unpaced: for tests, and for a
- * caller that must read the index it just changed. Returns the entries written.
+ * Test helper: drain fixture entries with an explicitly supplied reader and unpaced writes.
+ * There is deliberately no default main-thread reader in the production client.
  */
-export async function drainBlockIndexQueue(
-	reader: IndexQueueReader = inlineIndexQueueReader,
-): Promise<number> {
+export async function drainBlockIndexQueue(reader: IndexQueueReader): Promise<number> {
 	if (!hasIndexQueue()) return 0;
 	let total = 0;
 	for (;;) {

@@ -76,6 +76,11 @@ const statsQuerySchema = z.object({
 	kind: z.string().optional(),
 	startDate: z.string().optional(),
 	endDate: z.string().optional(),
+	/**
+	 * 读者日历的 IANA 时区（如 `Asia/Shanghai`）。时间序列按它切日；无法识别时按 UTC，
+	 * 服务端不会回退到自己的进程时区。
+	 */
+	timeZone: z.string().trim().max(64).optional(),
 });
 
 const timeSeriesQuerySchema = statsQuerySchema.extend({

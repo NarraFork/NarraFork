@@ -50,7 +50,7 @@ export interface PreparedPrefixRequest<Prompt extends RequestPrefixPrompt = Requ
 /**
  * Prepare the same authoritative prefix for first requests, later turns and retries.
  * Snapshot construction and prompt collection have no fixed total wall-clock budget:
- * they remain cancellable while progressing. Each source read gets its own query budget.
+ * source reads also remain cancellable while progressing, without a fixed time cutoff.
  */
 export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 	options: PreparePrefixRequestOptions<Prompt>,
@@ -71,7 +71,6 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 		signal?.throwIfAborted();
 		return narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 			signal,
-			deadline: Date.now() + 10_000,
 		});
 	};
 	for (;;) {

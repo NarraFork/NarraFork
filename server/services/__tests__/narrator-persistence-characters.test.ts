@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ContextCharStats } from "@shared/context-composition";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	hasPendingContextCharacterRefresh,
 	measureSerializedCharacters,
@@ -207,12 +207,8 @@ describe("character statistics at actual persistence boundaries", () => {
 		const question = calls.find((call) => call.toolUseId === "question-overwrite");
 		const read = calls.find((call) => call.toolUseId === "read-redirect");
 		if (!question || !read) throw new Error("Missing real persisted tool rows");
-		const readContent = () => {
-			const row = sqlite
-				.prepare("SELECT content_json AS content FROM narrator_messages WHERE id = ?")
-				.get(assistant.id) as { content: string };
-			return JSON.parse(row.content);
-		};
+		const readContent = () =>
+			readTestMessageContent<{ input: Record<string, unknown> }>(sqlite, assistant.id);
 		const readAudit = (id: string) => {
 			const row = sqlite
 				.prepare("SELECT input_json AS input FROM narrator_tool_calls WHERE id = ?")

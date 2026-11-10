@@ -16,7 +16,11 @@ const testHome = mkdtempSync(join(tmpdir(), "narrafork-portability-"));
 process.env.NARRAFORK_HOME = testHome;
 
 const { sqlite } = await import("../../db");
+const { SNAPSHOT_TABLES } = await import("../../db/snapshot-protocol");
 const { saveSettings, settings } = await import("../../lib/settings");
+const { getModelOverride, replaceModelOverridesForTests, setModelCatalogAutoUpdate } = await import(
+	"../../lib/model-catalog"
+);
 const {
 	applyImport,
 	clearData,
@@ -41,10 +45,15 @@ const count = (table: string) =>
 
 async function seed(rows = 2) {
 	sqlite.run("DELETE FROM api_requests");
+	sqlite.run("DELETE FROM usage_daily");
 	sqlite.run("DELETE FROM narrator_message_refs");
 	sqlite.run("DELETE FROM narrator_tool_calls");
 	sqlite.run("DELETE FROM narrator_messages");
 	sqlite.run("DELETE FROM narrators");
+	sqlite.run("DELETE FROM folder_git_identity_bindings");
+	sqlite.run("DELETE FROM user_git_identities");
+	sqlite.run("DELETE FROM user_recent_tabs");
+	sqlite.run("DELETE FROM users");
 
 	for (let i = 1; i <= rows; i += 1) {
 		sqlite.run(
@@ -120,6 +129,45 @@ beforeEach(async () => {
 });
 
 describe("data portability · 全链路", () => {
+	test("会话导入覆盖与清空只使本地 workspace 候选失效，不改已有名字", async () => {
+		sqlite.run(
+			"INSERT INTO users (id, username, password_hash, created_at) VALUES ('workspace-owner', 'workspace-owner', 'x', '2026-10-01T00:00:00Z')",
+		);
+		// Omit new columns, as an old importer would. The conservative defaults preserve names.
+		sqlite.run(
+			"INSERT INTO workspaces (id, user_id, title, tree, created_at, updated_at) VALUES ('local-workspace', 'workspace-owner', 'Keep my name', '{}', 0, 0)",
+		);
+		sqlite.run(
+			"INSERT INTO workspace_panels (id, workspace_id, kind, narrator_id, sort_order, created_at, updated_at) VALUES ('local-panel', 'local-workspace', 'narrator', 'sess-1', 0, 0, 0)",
+		);
+		const titleState = () =>
+			sqlite
+				.query(
+					"SELECT title, title_source, title_revision FROM workspaces WHERE id = 'local-workspace'",
+				)
+				.get();
+		expect(titleState()).toEqual({
+			title: "Keep my name",
+			title_source: "manual",
+			title_revision: 0,
+		});
+		expect(SNAPSHOT_TABLES.sessions as readonly string[]).not.toContain("workspaces");
+		const zip = await readFile((await exportData()).zipPath);
+		const preview = await previewImport(toArrayBuffer(zip), "workspace-compatible.zip");
+		await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect(titleState()).toEqual({
+			title: "Keep my name",
+			title_source: "manual",
+			title_revision: 1,
+		});
+		await clearData("sessions");
+		expect(titleState()).toEqual({
+			title: "Keep my name",
+			title_source: "manual",
+			title_revision: 2,
+		});
+		expect(count("workspace_panels")).toBe(0);
+	});
 	test("导出 → 预览 → 导入（跳过与覆盖）→ 清空", async () => {
 		const exported = await exportData();
 		expect(exported.counts).toEqual({ requests: 2, sessions: 1, providers: 1 });
@@ -156,6 +204,131 @@ describe("data portability · 全链路", () => {
 		expect(count("narrators")).toBe(0);
 		expect(count("narrator_messages")).toBe(0);
 		expect(settings.customApiProviders ?? []).toEqual([]);
+	});
+
+	test("归档位置标记随会话导出与恢复，并保持用户隔离", async () => {
+		for (const userId of ["archive-user-a", "archive-user-b"]) {
+			sqlite.run(
+				`INSERT INTO users (id, username, password_hash, created_at)
+				 VALUES (?, ?, 'x', '2026-10-01T00:00:00Z')`,
+				[userId, userId],
+			);
+			sqlite.run(
+				`INSERT INTO recent_tab_archive_marks
+				 (id, user_id, narrator_id, folder_id, archived_at)
+				 VALUES (?, ?, 'sess-1', ?, '2026-10-02T00:00:00Z')`,
+				[`mark-${userId}`, userId, `folder-${userId}`],
+			);
+		}
+
+		const zip = await readFile((await exportData()).zipPath);
+		await clearData("sessions");
+		expect(count("recent_tab_archive_marks")).toBe(0);
+
+		const preview = await previewImport(toArrayBuffer(zip), "archive-marks.zip");
+		const result = await applyImport(preview.token, { conflictDefault: "skip" });
+		expect(result.sessionsInserted).toBe(1);
+		const restored = sqlite
+			.prepare(
+				`SELECT user_id, narrator_id, folder_id FROM recent_tab_archive_marks ORDER BY user_id`,
+			)
+			.all();
+		expect(restored).toEqual([
+			{ user_id: "archive-user-a", narrator_id: "sess-1", folder_id: "folder-archive-user-a" },
+			{ user_id: "archive-user-b", narrator_id: "sess-1", folder_id: "folder-archive-user-b" },
+		]);
+	});
+
+	test("文件夹 Git 身份绑定可导出恢复，且不会跨用户串联", async () => {
+		const now = "2026-10-01T00:00:00Z";
+		for (const id of ["user-a", "user-b"]) {
+			sqlite.run(
+				`INSERT INTO users (id, username, password_hash, role, created_at)
+				 VALUES (?, ?, 'x', 'user', ?)`,
+				[id, id, now],
+			);
+		}
+		for (const [id, userId] of [
+			["identity-a", "user-a"],
+			["identity-b", "user-b"],
+		]) {
+			sqlite.run(
+				`INSERT INTO user_git_identities (id, user_id, name, email, is_default, created_at)
+				 VALUES (?, ?, ?, ?, 1, ?)`,
+				[id, userId, id, `${id}@example.com`, now],
+			);
+		}
+		for (const id of ["folder-a", "folder-cross"]) {
+			sqlite.run(
+				`INSERT INTO user_recent_tabs
+				 (id, user_id, tab_key, section, type, entity_id, title, last_visited_at, sort_order,
+				  created_at, updated_at)
+				 VALUES (?, 'user-a', ?, 'work', 'folder', ?, 'Work', 0, 0, ?, ?)`,
+				[`row-${id}`, `folder:${id}`, id, now, now],
+			);
+		}
+		sqlite.run(
+			`INSERT INTO folder_git_identity_bindings (id, folder_id, user_id, identity_id, updated_at)
+			 VALUES ('binding-a', 'folder-a', 'user-a', 'identity-a', ?),
+			        ('binding-cross', 'folder-cross', 'user-a', 'identity-b', ?)`,
+			[now, now],
+		);
+
+		expect(SNAPSHOT_TABLES.sessions).toContain("folder_git_identity_bindings");
+		const zip = await readFile(
+			(await exportData({ requests: false, sessions: true, providers: false })).zipPath,
+		);
+		await clearData("sessions");
+		expect(count("folder_git_identity_bindings")).toBe(0);
+
+		const preview = await previewImport(toArrayBuffer(zip), "folder-identities.zip");
+		await applyImport(preview.token, {
+			include: { requests: false, sessions: true, providers: false },
+		});
+		const rows = sqlite
+			.prepare(
+				`SELECT id, folder_id, user_id, identity_id FROM folder_git_identity_bindings ORDER BY id`,
+			)
+			.all();
+		expect(rows).toEqual([
+			{
+				id: "binding-a",
+				folder_id: "folder-a",
+				user_id: "user-a",
+				identity_id: "identity-a",
+			},
+		]);
+	});
+
+	test("目标库缺少绑定身份时只跳过该绑定，不回滚会话导入", async () => {
+		const now = "2026-10-01T00:00:00Z";
+		sqlite.run(
+			`INSERT INTO users (id, username, password_hash, role, created_at)
+			 VALUES ('user-a', 'user-a', 'x', 'user', ?)`,
+			[now],
+		);
+		sqlite.run(
+			`INSERT INTO user_git_identities (id, user_id, name, email, is_default, created_at)
+			 VALUES ('identity-a', 'user-a', 'Alice', 'alice@example.com', 1, ?)`,
+			[now],
+		);
+		sqlite.run(
+			`INSERT INTO folder_git_identity_bindings (id, folder_id, user_id, identity_id, updated_at)
+			 VALUES ('binding-a', 'folder-a', 'user-a', 'identity-a', ?)`,
+			[now],
+		);
+		const zip = await readFile(
+			(await exportData({ requests: false, sessions: true, providers: false })).zipPath,
+		);
+		await clearData("sessions");
+		sqlite.run("DELETE FROM user_git_identities WHERE id = 'identity-a'");
+
+		const preview = await previewImport(toArrayBuffer(zip), "missing-folder-identity.zip");
+		const result = await applyImport(preview.token, {
+			include: { requests: false, sessions: true, providers: false },
+		});
+		expect(result.sessionsInserted).toBe(1);
+		expect(count("folder_git_identity_bindings")).toBe(0);
 	});
 
 	/**
@@ -308,6 +481,30 @@ describe("data portability · 数据安全", () => {
 		expect(snapshotCounts()).toEqual(afterFirst);
 	});
 
+	test("导入的请求计入用量日账本一次，重复导入不重复计数；清空请求同时清空账本", async () => {
+		const ledger = () =>
+			sqlite
+				.prepare(
+					`SELECT COALESCE(SUM(request_count), 0) AS requests, COALESCE(SUM(input_tokens), 0) AS input
+					 FROM usage_daily`,
+				)
+				.get() as { requests: number; input: number };
+		const zip = await readFile((await exportData()).zipPath);
+		await clearData("all");
+		expect(ledger()).toEqual({ requests: 0, input: 0 });
+
+		const first = await previewImport(toArrayBuffer(zip), "export.zip");
+		await applyImport(first.token, { conflictDefault: "skip" });
+		expect(ledger()).toEqual({ requests: 2, input: 30 });
+
+		const second = await previewImport(toArrayBuffer(zip), "export.zip");
+		await applyImport(second.token, { conflictDefault: "skip" });
+		expect(ledger()).toEqual({ requests: 2, input: 30 });
+
+		await clearData("requests");
+		expect(ledger()).toEqual({ requests: 0, input: 0 });
+	});
+
 	test("清空单类别不影响其它类别", async () => {
 		await clearData("requests");
 		expect(count("api_requests")).toBe(0);
@@ -452,54 +649,66 @@ describe("逐模型设置随供应商一起导出", () => {
 		}
 	});
 
-	test("模型目录按 id 合并：同 id 以导入为准，本地独有保留", async () => {
+	test("不参与自动的前缀随导出导入走、取并集，清空供应商时一起清掉", async () => {
 		const original = structuredClone(settings);
 		try {
-			agent().modelCatalog = {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				autoApply: true,
-				pinnedVersion: null,
-				local: { revision: 3, models: [{ id: "m1", metadata: { max_input_tokens: 1000 } }] },
-			};
+			agent().autoExcludedProviders = ["remote-relay"];
+			const exported = await exportData({ requests: false, sessions: false, providers: true });
+			const zip = await readFile(exported.zipPath);
+			const preview = await previewImport(toArrayBuffer(zip), "auto-excluded.zip");
+			expect(preview.providers.autoExcludedProviders).toEqual(["remote-relay"]);
+
+			agent().autoExcludedProviders = ["local-relay"];
+			await applyImport(preview.token, { conflictDefault: "skip" });
+			expect(agent().autoExcludedProviders).toEqual(
+				expect.arrayContaining(["local-relay", "remote-relay"]),
+			);
+
+			await clearData("providers");
+			expect(agent().autoExcludedProviders).toEqual([]);
+		} finally {
+			saveSettings(original);
+		}
+	});
+
+	test("模型覆盖按键合并：同键以导入为准，本地独有保留", async () => {
+		const original = structuredClone(settings);
+		const originalCatalog = settings.agent.modelCatalog;
+		const restores: Array<() => void> = [];
+		try {
+			restores.push(
+				replaceModelOverridesForTests({
+					models: { "gpt-6-astra": { maxOutputTokens: 1000 } },
+					connections: { "remote:m1": { contextWindow: 1000 } },
+				}),
+			);
 
 			const exported = await exportData({ requests: false, sessions: false, providers: true });
 			const zip = await readFile(exported.zipPath);
 			const preview = await previewImport(toArrayBuffer(zip), "catalog.zip");
 
-			agent().modelCatalog = {
-				schemaVersion: 2,
-				migrationVersion: 2,
-				autoApply: false,
-				pinnedVersion: "v-local",
-				local: {
-					revision: 3,
-					models: [
-						{ id: "m1", metadata: { max_input_tokens: 2000 } },
-						{ id: "local-only", metadata: {} },
-					],
-				},
-			};
+			// 本地换一套：一条与导入同键但取值不同，一条本地独有；更新策略也不同。
+			restores.push(
+				replaceModelOverridesForTests({
+					connections: {
+						"remote:m1": { contextWindow: 2000 },
+						"local:only": { contextWindow: 3000 },
+					},
+				}),
+			);
+			setModelCatalogAutoUpdate(false);
 
 			await applyImport(preview.token, { conflictDefault: "skip" });
 
-			const merged = agent().modelCatalog as {
-				autoApply: boolean;
-				pinnedVersion: string | null;
-				local: {
-					revision: number;
-					models: Array<{ id: string; metadata: Record<string, unknown> }>;
-				};
-			};
-			const byId = new Map(merged.local.models.map((model) => [model.id, model]));
-			// 同 id 用导入的那份，本地独有的条目留着。
-			expect(byId.get("m1")?.metadata).toEqual({ max_input_tokens: 1000 });
-			expect(byId.has("local-only")).toBe(true);
-			// 合并算一次本地编辑：revision 前进，实例级策略仍是本地的。
-			expect(merged.local.revision).toBe(4);
-			expect(merged.autoApply).toBe(false);
-			expect(merged.pinnedVersion).toBe("v-local");
+			// 同键用导入的那份，本地独有的条目留着。
+			expect(getModelOverride("connection", "remote:m1")).toEqual({ contextWindow: 1000 });
+			expect(getModelOverride("connection", "local:only")).toEqual({ contextWindow: 3000 });
+			expect(getModelOverride("model", "gpt-6-astra")).toEqual({ maxOutputTokens: 1000 });
+			// 导入搬的是模型数据，不是目录更新策略：本地偏好不变，设置里也不内联覆盖。
+			expect(settings.agent.modelCatalog).toEqual({ autoUpdate: false });
 		} finally {
+			while (restores.length) restores.pop()?.();
+			setModelCatalogAutoUpdate(originalCatalog?.autoUpdate ?? true);
 			saveSettings(original);
 		}
 	});
@@ -514,9 +723,67 @@ describe("逐模型设置随供应商一起导出", () => {
 		defaultModel: "",
 	});
 
-	test("前缀冲突时逐模型设置改挂到新前缀，且不误伤更长的前缀", async () => {
+	test("前缀冲突时导入的会话跟着改到新前缀，跳过的本地会话不动", async () => {
 		const original = structuredClone(settings);
 		try {
+			await seed(1);
+			const insertSession = (id: string, model: string, restore: string | null = null) =>
+				sqlite.run(
+					`INSERT INTO narrators (id, type, model, pending_model_restore, created_at, updated_at)
+					 VALUES (?, 'primary', ?, ?, ?, ?)`,
+					[id, model, restore, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z"],
+				);
+			insertSession("sess-new", "openai:gpt-5.5", "__agg__:openai:gpt-5.5");
+			insertSession("sess-longer", "openai-extra:gpt-5.5");
+			insertSession("sess-auto", "auto:gpt-5.5");
+			insertSession("sess-kept", "openai:gpt-5.5");
+			const exported = structuredClone(settings);
+			exported.customApiProviders = [
+				apiProvider("remote-openai", "openai", "remote-key", "https://remote.example/v1"),
+			];
+			saveSettings(exported);
+			const zip = await readFile(
+				(await exportData({ requests: false, sessions: true, providers: true })).zipPath,
+			);
+			const preview = await previewImport(toArrayBuffer(zip), "sessions-prefix.zip");
+
+			// Locally, a different service took the `openai` prefix; one session already exists.
+			sqlite.run("DELETE FROM narrator_message_refs");
+			sqlite.run("DELETE FROM narrator_tool_calls");
+			sqlite.run("DELETE FROM narrator_messages");
+			sqlite.run("DELETE FROM narrators");
+			insertSession("sess-kept", "openai:local-model");
+			const local = structuredClone(original);
+			local.customApiProviders = [
+				apiProvider("local-openai", "openai", "local-key", "https://local.example/v1"),
+			];
+			saveSettings(local);
+
+			await applyImport(preview.token, { conflictDefault: "skip" });
+			const modelOf = (id: string) =>
+				sqlite
+					.prepare("SELECT model, pending_model_restore AS restore FROM narrators WHERE id = ?")
+					.get(id) as { model: string | null; restore: string | null };
+			expect(modelOf("sess-new")).toEqual({
+				model: "openai-2:gpt-5.5",
+				restore: "__agg__:openai-2:gpt-5.5",
+			});
+			expect(modelOf("sess-longer").model).toBe("openai-extra:gpt-5.5");
+			expect(modelOf("sess-auto").model).toBe("auto:gpt-5.5");
+			// Skipped on conflict: the local row and its local provider stay as they were.
+			expect(modelOf("sess-kept").model).toBe("openai:local-model");
+		} finally {
+			saveSettings(original);
+		}
+	});
+
+	test("前缀冲突时逐模型设置改挂到新前缀，且不误伤更长的前缀", async () => {
+		const original = structuredClone(settings);
+		const restores: Array<() => void> = [];
+		try {
+			restores.push(
+				replaceModelOverridesForTests({ connections: { "openai:ctx": { contextWindow: 5000 } } }),
+			);
 			const exported = structuredClone(settings);
 			exported.customApiProviders = [
 				apiProvider("remote-openai", "openai", "remote-key", "https://remote.example/v1"),
@@ -532,6 +799,10 @@ describe("逐模型设置随供应商一起导出", () => {
 			};
 			(exported.agent as unknown as Record<string, unknown>).customModels = [
 				{ value: "openai:custom", label: "remote", provider: "openai" },
+			];
+			(exported.agent as unknown as Record<string, unknown>).autoExcludedProviders = [
+				"openai",
+				"openai-extra",
 			];
 			saveSettings(exported);
 
@@ -549,9 +820,13 @@ describe("逐模型设置随供应商一起导出", () => {
 				"openai:local": "completions-compatible",
 			};
 			(local.agent as unknown as Record<string, unknown>).customModels = [];
+			(local.agent as unknown as Record<string, unknown>).autoExcludedProviders = [];
 			saveSettings(local);
+			restores.push(replaceModelOverridesForTests({}));
 
 			await applyImport(preview.token, { conflictDefault: "skip" });
+			expect(getModelOverride("connection", "openai-2:ctx")).toEqual({ contextWindow: 5000 });
+			expect(getModelOverride("connection", "openai:ctx")).toBeUndefined();
 
 			expect((settings.customApiProviders ?? []).map((item) => item.prefix).sort()).toEqual([
 				"openai",
@@ -571,7 +846,10 @@ describe("逐模型设置随供应商一起导出", () => {
 			expect(agent().customModels).toEqual([
 				{ value: "openai-2:custom", label: "remote", provider: "openai-2" },
 			]);
+			// Bare prefixes follow the rename too; the local provider stays in auto.
+			expect(agent().autoExcludedProviders).toEqual(["openai-2", "openai-extra"]);
 		} finally {
+			while (restores.length) restores.pop()?.();
 			saveSettings(original);
 		}
 	});
@@ -586,8 +864,11 @@ describe("逐模型设置随供应商一起导出", () => {
 			(exported.agent as unknown as Record<string, unknown>).hiddenModels = ["remote:hidden"];
 			saveSettings(exported);
 
+			// The same-endpoint check compares keys, which travel sealed.
+			const passphrase = "same-endpoint-pass";
 			const zip = await readFile(
-				(await exportData({ requests: false, sessions: false, providers: true })).zipPath,
+				(await exportData({ requests: false, sessions: false, providers: true }, { passphrase }))
+					.zipPath,
 			);
 			const preview = await previewImport(toArrayBuffer(zip), "same-endpoint.zip");
 
@@ -598,7 +879,7 @@ describe("逐模型设置随供应商一起导出", () => {
 			(local.agent as unknown as Record<string, unknown>).hiddenModels = ["local:keep"];
 			saveSettings(local);
 
-			const result = await applyImport(preview.token, { conflictDefault: "skip" });
+			const result = await applyImport(preview.token, { conflictDefault: "skip", passphrase });
 			expect(result.providersAdded).toBe(0);
 			expect(settings.customApiProviders ?? []).toHaveLength(1);
 			expect(settings.customApiProviders?.[0]?.prefix).toBe("local");

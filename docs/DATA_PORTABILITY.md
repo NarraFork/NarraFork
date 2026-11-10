@@ -20,15 +20,21 @@
 
 | 文件 | 内容 |
 |---|---|
-| `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`、`narrator_text_snapshots`。**新增的表不会自动包含** |
-| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`（**含凭据**） |
-| `manifest.json` | `{ version, exportedAt, counts }`，导入时校验 `version <= 1` |
+| `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`、`narrator_text_snapshots`、`folder_git_identity_bindings`。**新增的表不会自动包含** |
+| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`autoExcludedProviders`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`。**不含 Key**：所有 `apiKey` 都是空的 |
+| `provider-keys.sealed.json` | 只在导出供应商时出现。导出的每个供应商的**全部** Key（自定义 API 的多 Key 连同标签、开关、网络身份；NUG、TokenDance、Command Code 各一个），按导出方的归属 id 分组，用导出时设置的口令封装（与凭据迁移同一格式：scrypt + AES-256-GCM，口令至少 10 个字符），见 `server/services/data-portability-keys.ts` |
+| `manifest.json` | `{ version, exportedAt, counts }`。有 `provider-keys.sealed.json` 时 `version` 是 2，否则是 1；导入时校验 `version <= 2` |
+
+**导出供应商需要核验**：勾选「供应商」时，要先通过密码 + 两步验证（step-up 用途 `storage.export.providers`），并设置口令。流式导出走 `POST /api/storage/export`，授权和口令都在请求体里；没有文件选择器的浏览器走票据，签发票据时消费 step-up，口令只存在内存里的票据记录中，不进 URL。`GET /api/storage/export?providers=1` 会被拒绝。没有第二因素的账号不能导出供应商，请求和会话照常可以导出。Codex 账号不在数据导出里，只能用凭据迁移搬。
+
+**版本号**：只有带密文的包是 `version: 2`。只含请求和会话的包仍是 1，旧版实例照常能导入；带密文的包在旧版实例上会被拒绝，因为旧版不认识密文，导入只会得到没有 Key 的供应商。
 
 ## 三、导入的合并语义
 
 | 数据 | 规则 |
 |---|---|
 | 请求历史 `api_requests` | 按主键 `INSERT OR IGNORE` 追加（重复 id 跳过）。指向被跳过会话的请求不导入 |
+| 用量日账本 `usage_daily` | 不在快照里。本次新增的请求（rowid 大于导入前基线）按日 / 计费用户 / 项目 / 来源 / 模型汇总后加进账本，一条 SQL 完成；重复导入被主键跳过的请求不会重复计数。旧包没有计费用户与项目时，用会话所有者、再退到发起人 |
 | 会话 `narrators` | 预览列出 id 冲突 → 用户逐条或统一选择**覆盖**或**跳过**；新会话直接插入 |
 | 跳过会话 | 不导入该会话的消息、引用、工具调用、消息块，以及 `narrator_id` 指向它的请求 |
 | 覆盖会话 | 保留会话行（`narrator_messages.narrator_id` 是 NOT NULL，删行会失败），用导入行 `UPDATE` 各列。子行按主键合并，不删除本地的引用、工具调用或消息块 |
@@ -36,9 +42,12 @@
 | 引用 / 工具调用 | `INSERT OR IGNORE` |
 | 消息块 `narrator_blocks` | `INSERT OR IGNORE`。`body_rows_only = 1` 时正文只在块行里，旧包没有这张表时跳过 |
 | 文本快照 `narrator_text_snapshots` | 会话导出携带完整共享内容库（含 prefix contract、parts、context updates、tools manifest 及其 children）。至少一个会话新增或覆盖时，按 hash `INSERT OR IGNORE` 合并**整包**内容，不按单个会话精确过滤；全跳过或只导入请求时不搬运。旧包缺表时跳过。引用与内容同事务导入，并刷新包内 hash 的 GC 宽限时间（含已有 hash 复用），防止并发 mark/sweep 删掉刚导入的引用 |
+| 文件夹 Git 身份绑定 `folder_git_identity_bindings` | 随会话数据按主键 `INSERT OR IGNORE` 合并；旧包缺表时跳过。目标库必须已有对应用户和身份，缺失引用的入站绑定会被跳过；身份的 `user_id` 还必须与绑定一致，避免跨用户串联。用户与身份本体不在快照里 |
 | 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则跳过 |
+| 供应商 Key | 包里有密文且勾选了供应商时必须给口令，否则报 `IMPORT_PASSPHRASE_REQUIRED`；只导请求或会话时不需要。① 在导入事务**之前**解密（scrypt 是异步的，事务是同步的），口令错误报 `BUNDLE_PASSPHRASE`，什么都不写。② 把每个供应商的第一个 Key 放回导入的配置里，所以"同 apiKey + 同 baseUrl 视为同一供应商"的去重照常成立，保存设置时第一个 Key 经投影写进 Key 存储。③ 事务**提交成功之后**，给新加入的自定义 API 供应商写入其余的 Key（按导入后的本地 id，前缀改名后同样正确），并补上第一个 Key 的标签、开关和网络身份。与本地供应商合并的、被跳过的保留本地 Key，不覆盖。Key 存储是事务之外的文件，单个 Key 写入失败只记日志，结果里 `keysFailed` 计数，其余照常写入 |
+| 旧版包（`version: 1`） | `providers.json` 里的明文 Key 照旧导入，不要求口令 |
 | 平台实例 | 同按前缀避让：本地已有同平台同前缀时跳过，前缀被占用则改名后追加 |
-| 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的本地编辑层按 id 合并，`revision` 前进一格。供应商前缀被改名，或同一端点因已存在而跳过但两边前缀不同时，`prefix:model` 的第一段改到新前缀（`openai` 不会误改 `openai-2`） |
+| 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的自定义参数（`modelCatalog.overrides`，存于 `~/.narrafork/model-catalog/overrides.json`）按键合并、导入优先，旧包里的内联本地层按同样规则转成自定义参数；自动更新偏好不随导入改变。供应商前缀被改名，或同一端点因已存在而跳过但两边前缀不同时，`prefix:model` 的第一段改到新前缀（`openai` 不会误改 `openai-2`） |
 
 **列交集**：拷贝与 UPDATE 都按「两库 `PRAGMA table_info` 的交集」生成列清单。这样快照与
 当前库的迁移进度不同（列多了/少了）也能导入——但也意味着**旧快照缺少的新列会用数据库默认值**，
@@ -50,11 +59,11 @@
 
 ## 四、清空语义
 
-- 分项：`requests`（只删 `api_requests`）、`sessions`（删会话及其消息/引用/工具调用，
+- 分项：`requests`（删 `api_requests` 与按天汇总它的 `usage_daily`）、`sessions`（删会话及其消息/引用/工具调用，
   消息块随消息级联删除；并把 `terminals` / `benchmark_task_results` 的 `narrator_id` 置空，
-  保留这些数据本体）、
+  保留这些数据本体，同时清空不随会话外键级联的 `folder_git_identity_bindings`）、
   `providers`（清空全部供应商配置：含平台实例、隐藏模型、逐模型协议与自定义模型；
-  **不清模型目录**，那里有用户手写的模型卡片）。
+  **不清模型自定义参数**（`overrides.json`），那里是用户手写的数据）。
 - 全量：以上全部。
 - 会话清空仅释放快照的消息/块引用，不直接清空共享 `narrator_text_snapshots`，不误删非会话数据。
   不再可达的内容由既有 GC 在宽限期后回收；孤儿 manifest 的 children 可能再保留一轮。

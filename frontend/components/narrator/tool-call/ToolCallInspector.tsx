@@ -11,6 +11,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { readLeafText, stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
+import { isClearedToolOutput } from "@shared/storage-retention";
 import { resolveToolCallTiming } from "@shared/tool-display-duration";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
@@ -56,6 +57,8 @@ interface ToolCallLike {
 	inputJson?: any;
 	// biome-ignore lint/suspicious/noExplicitAny: tool call JSON is dynamic by design
 	outputJson?: any;
+	/** Payloads may remain in the internal replay ledger, but are hidden together. */
+	payloadCleared?: boolean;
 	/** Live tool_completed events carry the same bag outside the persisted output wrapper. */
 	_metadata?: Record<string, unknown>;
 }
@@ -387,11 +390,14 @@ export function ToolCallInspector({
 	detailError,
 }: ToolCallInspectorProps) {
 	const { t } = useTranslation("narrator");
+	const { t: storageText } = useTranslation("settings");
 	// `detail !== undefined` — not truthiness — marks an externally-fed inspector:
 	// a caller that is still loading passes `null`, and must not silently fall back
 	// to the ref-scoped fetch for the same call.
 	const externallyFed = detail !== undefined;
-	const enabled = opened && !externallyFed && !!narratorId && !!toolUseId;
+	const initialPayloadCleared =
+		initialToolCall?.payloadCleared === true || isClearedToolOutput(initialToolCall?.outputJson);
+	const enabled = opened && !externallyFed && !initialPayloadCleared && !!narratorId && !!toolUseId;
 	const {
 		data: fetched,
 		isLoading: fetchLoading,
@@ -412,8 +418,13 @@ export function ToolCallInspector({
 			...data,
 		};
 	}, [data, initialToolCall]);
+	// A pre-cleanup detail cache must never override a newer cleared list-row marker.
+	const payloadCleared =
+		initialPayloadCleared ||
+		toolCall?.payloadCleared === true ||
+		isClearedToolOutput(toolCall?.outputJson);
 	const ruleReceipt =
-		toolCall?.toolName === "RequestPermissionRule"
+		!payloadCleared && toolCall?.toolName === "RequestPermissionRule"
 			? readPermissionRuleReceipt(toolCall.outputJson)
 			: null;
 	const fileOutcome = toolCall?.outputJson?._metadata ?? toolCall?._metadata;
@@ -575,19 +586,27 @@ export function ToolCallInspector({
 						{t("revertPlanHistoryUnavailable")}
 					</Text>
 				)}
-				<JsonSection title={t("toolCallInspector.input")} value={toolCall?.inputJson} />
-				<JsonSection title={t("toolCallInspector.output")} value={toolCall?.outputJson} />
+				{payloadCleared ? (
+					<Text size="sm" c="dimmed" role="status">
+						{storageText("storageToolDetailsCleared")}
+					</Text>
+				) : (
+					<>
+						<JsonSection title={t("toolCallInspector.input")} value={toolCall?.inputJson} />
+						<JsonSection title={t("toolCallInspector.output")} value={toolCall?.outputJson} />
 
-				<Group gap="xs" justify="flex-end">
-					<LazyCopyJsonIconButton
-						value={toolCall?.inputJson}
-						label={t("toolCallInspector.copyInput")}
-					/>
-					<LazyCopyJsonIconButton
-						value={toolCall?.outputJson}
-						label={t("toolCallInspector.copyOutput")}
-					/>
-				</Group>
+						<Group gap="xs" justify="flex-end">
+							<LazyCopyJsonIconButton
+								value={toolCall?.inputJson}
+								label={t("toolCallInspector.copyInput")}
+							/>
+							<LazyCopyJsonIconButton
+								value={toolCall?.outputJson}
+								label={t("toolCallInspector.copyOutput")}
+							/>
+						</Group>
+					</>
+				)}
 			</Stack>
 		</Modal>
 	);

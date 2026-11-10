@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { deflateRawSync } from "node:zlib";
 import {
 	extractZipArchive,
+	listZipArchive,
 	normalizeZipEntryName,
 	readZipArchive,
+	readZipEntry,
 	ZipArchiveError,
 } from "@server/lib/zip-archive";
 
@@ -215,5 +217,51 @@ describe("zip-archive", () => {
 			"com.example.hello",
 		);
 		expect(await readFile(join(destination, "server", "index.js"), "utf8")).toContain("export");
+	});
+
+	test("listZipArchive marks encrypted entries that readZipArchive rejects", async () => {
+		const root = await makeTempRoot();
+		const archive = join(root, "locked.zip");
+		const bytes = buildZip([
+			{ name: "open.txt", data: Buffer.from("readable") },
+			{ name: "locked.txt", data: Buffer.from("secret") },
+		]);
+		// Set the encryption flag (0x1) on the SECOND central-directory record (locked.txt).
+		const centralSignature = Buffer.from([0x50, 0x4b, 0x01, 0x02]);
+		const first = bytes.indexOf(centralSignature);
+		const second = bytes.indexOf(centralSignature, first + 4);
+		expect(bytes.toString("utf8", second + 46, second + 46 + "locked.txt".length)).toBe(
+			"locked.txt",
+		);
+		bytes.writeUInt16LE(bytes.readUInt16LE(second + 8) | 0x1, second + 8);
+		await writeFile(archive, bytes);
+
+		await expect(readZipArchive(archive)).rejects.toThrow(/encrypted/i);
+		const listing = await listZipArchive(archive);
+		expect(listing.entries.map((entry) => [entry.name, entry.encrypted, entry.readable])).toEqual([
+			["open.txt", false, true],
+			["locked.txt", true, false],
+		]);
+		expect((await readZipEntry(archive, "open.txt", 1024)).bytes).toEqual(
+			new Uint8Array(Buffer.from("readable")),
+		);
+		await expect(readZipEntry(archive, "locked.txt", 1024)).rejects.toThrow(/cannot be read/i);
+	});
+
+	test("readZipEntry aborts an entry that inflates past its declared size", async () => {
+		const root = await makeTempRoot();
+		const archive = join(root, "bomb.zip");
+		const bytes = buildZip([
+			{ name: "bomb.txt", data: Buffer.alloc(8 * 1024 * 1024, 0x61), deflate: true },
+		]);
+		// Lie about the uncompressed size in both headers: 16 bytes declared, 8 MiB inside.
+		bytes.writeUInt32LE(16, 22);
+		const central = bytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+		bytes.writeUInt32LE(16, central + 24);
+		await writeFile(archive, bytes);
+
+		await expect(readZipEntry(archive, "bomb.txt", 1024 * 1024)).rejects.toThrow(
+			/larger than its declared size/i,
+		);
 	});
 });

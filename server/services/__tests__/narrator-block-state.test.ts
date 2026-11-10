@@ -13,7 +13,7 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 // narrator-service must be imported before narrator-persistence (pre-existing cycle).
-const { narratorService } = await import("../narrator-service");
+await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
 const { narratorPersistence } = await import("../narrator-persistence");
 const blockSync = await import("../narrator-block-sync");
@@ -121,6 +121,7 @@ async function measure<T>(id: string, write: () => T | Promise<T>) {
 }
 
 beforeEach(() => {
+	settings.narratorBlocks.compactJson = false;
 	cleanDb(sqlite);
 	for (const id of ["n1", "n2"])
 		sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)", [

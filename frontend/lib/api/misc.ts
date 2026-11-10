@@ -51,6 +51,10 @@ import type {
 	SearchSectionsResponse,
 	SessionHitsResponse,
 	StorageCategoryKey,
+	StorageHistoryJob,
+	StorageHistoryJobs,
+	StorageHistoryPreview,
+	StorageRetentionTarget,
 	StorageScanJobState,
 	StorageScanResult,
 } from "./types";
@@ -64,6 +68,8 @@ import type {
  */
 export interface WorkspaceDetail extends ApiEntity {
 	title?: string;
+	titleSource: "default" | "auto" | "manual";
+	titleRevision: number;
 	layout: string;
 	tree: string;
 	layoutRevision: number;
@@ -607,7 +613,13 @@ export const miscApi = {
 		),
 	codexCredentialUpdate: (
 		id: string,
-		data: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+		data: {
+			displayName?: string;
+			priority?: number;
+			useCreditQuota?: boolean;
+			/** `null` clears the account's network identity back to the Codex settings. */
+			network?: import("@shared/credential-network").CredentialNetwork | null;
+		},
 	) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
 			method: "PATCH",
@@ -1108,7 +1120,7 @@ export const miscApi = {
 			body: JSON.stringify({ parent, name }),
 		}),
 	/**
-	 * Open a directory in the server host's file manager.
+	 * Open a directory, or select a file, in the server host's file manager.
 	 *
 	 * On Windows the server answers with a one-time `narrafork://` URI instead of launching Explorer
 	 * itself; opening it from the page lets Explorer come to the foreground.
@@ -1446,8 +1458,13 @@ export const miscApi = {
 	createWorkspace: (data: { title?: string; tree: string }) =>
 		request<ApiEntity>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
 	/** Rename only. The layout goes through `saveWorkspaceLayout` (revision-guarded). */
-	updateWorkspace: (id: string, data: { title: string }) =>
+	updateWorkspace: (id: string, data: { title: string; expectedTitleRevision?: number }) =>
 		request<ApiEntity>(`/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+	generateWorkspaceTitle: (id: string) =>
+		request<{ title: string; expectedTitleRevision: number }>(`/workspaces/${id}/generate-title`, {
+			method: "POST",
+			body: JSON.stringify({}),
+		}),
 	deleteWorkspace: (id: string) =>
 		request<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
 
@@ -1491,6 +1508,32 @@ export const miscApi = {
 	getLicenseText: (id: string) => request<{ id: string; text: string }>(`/licenses/text/${id}`),
 
 	// Storage
+	getStorageHistoryJobs: (signal?: AbortSignal) =>
+		request<{ jobs: StorageHistoryJobs }>("/storage/database/history/jobs", { signal }),
+	previewStorageHistory: (
+		data: { target: StorageRetentionTarget; cutoffAt: string },
+		signal?: AbortSignal,
+	) =>
+		request<{ preview: StorageHistoryPreview }>("/storage/database/history/preview", {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
+	cleanupStorageHistory: (
+		data: { target: StorageRetentionTarget; cutoffAt: string },
+		signal?: AbortSignal,
+	) =>
+		request<{ job: StorageHistoryJob }>("/storage/database/history/cleanup", {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
+	cancelStorageHistory: (target: StorageRetentionTarget, signal?: AbortSignal) =>
+		request<{ job: StorageHistoryJob | null }>("/storage/database/history/cancel", {
+			method: "POST",
+			body: JSON.stringify({ target }),
+			signal,
+		}),
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
 	startStorageScan: (categories?: StorageCategoryKey[]) =>
 		request<{ started: boolean; state: StorageScanJobState }>("/storage/scan/start", {

@@ -112,7 +112,10 @@ associate("shell", "sh bash zsh fish ps1 bat cmd");
 associate("code", "java kt kts swift rb php lua pl r vue svelte astro xml graphql gql proto");
 associate("text", "txt log csv tsv rst tex");
 associate("pdf", "pdf");
-associate("archive", "zip tar gz tar.gz bz2 tar.bz2 xz tar.xz zst tar.zst tgz 7z rar");
+associate(
+	"archive",
+	"zip tar gz tar.gz bz2 tar.bz2 xz tar.xz zst tar.zst tgz 7z rar jar war ear aar apk whl vsix nupkg xpi",
+);
 associate("audio", "mp3 wav flac ogg m4a aac opus");
 associate("video", "mp4 webm mov avi mkv m4v");
 associate("image", "png jpg jpeg gif svg webp ico bmp tif tiff avif heic");

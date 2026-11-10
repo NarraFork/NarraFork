@@ -19,11 +19,14 @@
  * All synchronous, inside the caller's transaction (bun:sqlite cannot await in one).
  */
 
+import { redactToolPayloadElement } from "@shared/narrator-blocks/retention";
 import { and, eq, type SQL } from "drizzle-orm";
-import type { db } from "../db";
+import { activeDatabaseBackend, type db, sqlite } from "../db";
 import { narratorMessages } from "../db/schema";
 import {
 	type BlockStamp,
+	CLEARED_TOOL_OUTPUT_SQL,
+	isEnvelopeHistoryProtected,
 	type SyncMode,
 	storedProjection,
 	syncCopiedEnvelope,
@@ -41,6 +44,10 @@ type NewEnvelope = typeof narratorMessages.$inferInsert;
 export interface BodySync {
 	mode?: SyncMode;
 	stamp?: BlockStamp;
+	/** Only an explicit new human edit may replace a retention tombstone. */
+	allowHistoryRewrite?: boolean;
+	/** Internal retention write, not a new human body. */
+	retentionClear?: boolean;
 }
 
 /**
@@ -110,6 +117,17 @@ export function updateEnvelope(
 		writeEnvelopeBody(tx, messageId, set.contentJson, { ...sync, set });
 		return;
 	}
+	if (!sync.allowHistoryRewrite && isEnvelopeHistoryProtected(messageId)) {
+		const {
+			contentText: _text,
+			originalContentJson: _original,
+			composerDocument: _doc,
+			commandText: _command,
+			contextCharsJson: _chars,
+			...metadata
+		} = set;
+		set = metadata;
+	}
 	if (Object.keys(set).length)
 		tx.update(narratorMessages).set(set).where(eq(narratorMessages.id, messageId)).run();
 	syncEnvelopeNow(messageId, sync.mode, sync.stamp);
@@ -127,6 +145,58 @@ export function writeEnvelopeBody(
 	content: unknown,
 	options: BodySync & { set?: Partial<NewEnvelope>; where?: SQL; rows?: () => void } = {},
 ): boolean {
+	const wasCleared = isEnvelopeHistoryProtected(messageId);
+	if (wasCleared && !options.allowHistoryRewrite) return false;
+	if (
+		wasCleared &&
+		!options.retentionClear &&
+		Array.isArray(content) &&
+		content[0] &&
+		typeof content[0] === "object"
+	) {
+		// Keep the independent audit ledger from becoming ledger-only model calls again.
+		const { historyClearVersion: _version, historyClearedAt: _at, ...first } = content[0];
+		content = [{ historyToolsSuppressed: true, ...first }, ...content.slice(1)];
+	}
+	const hasToolCopies = [content, options.set?.originalContentJson].some(
+		(value) =>
+			Array.isArray(value) &&
+			value.some(
+				(element) =>
+					element &&
+					typeof element === "object" &&
+					["tool_use", "tool_result"].includes(element.type),
+			),
+	);
+	if (activeDatabaseBackend === "sqlite" && hasToolCopies) {
+		const calls = sqlite
+			.query<
+				{ toolUseId: string },
+				[string]
+			>(`SELECT tool_use_id AS toolUseId FROM narrator_tool_calls t
+			WHERE message_id = ? AND ${CLEARED_TOOL_OUTPUT_SQL} AND NOT EXISTS (
+			SELECT 1 FROM narrator_tool_calls newer WHERE newer.message_id = t.message_id
+			AND newer.tool_use_id = t.tool_use_id AND (newer.execution_attempt, newer.created_at, newer.id)
+			> (t.execution_attempt, t.created_at, t.id)) LIMIT 1025`)
+			.all(messageId);
+		if (calls.length > 1024) return false;
+		if (calls.length) {
+			const cleared = new Set(calls.map((call) => call.toolUseId));
+			if (Array.isArray(content))
+				content = content.map((element) => redactToolPayloadElement(element, cleared));
+			if (Array.isArray(options.set?.originalContentJson)) {
+				options = {
+					...options,
+					set: {
+						...options.set,
+						originalContentJson: options.set.originalContentJson.map((element) =>
+							redactToolPayloadElement(element, cleared),
+						),
+					},
+				};
+			}
+		}
+	}
 	const target = eq(narratorMessages.id, messageId);
 	const bodyFormat =
 		options.set?.bodyFormat ??

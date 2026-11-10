@@ -7,7 +7,11 @@ import {
 	resolveSubagentModelSelectionFromPolicy,
 } from "../lib/narrator-custom-traits";
 import { modelPoolKeyOf, policySourceIdOf } from "../lib/runtime-source";
-import { expandAllowedPoolForDisplay, getSubagentVisibleModels } from "../lib/settings";
+import {
+	expandAllowedPoolForDisplay,
+	getSubagentVisibleModels,
+	normalizeAutoModelValueForSave,
+} from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { updateNarratorProfileForPlugin } from "./narrator-session";
@@ -71,7 +75,8 @@ export async function planSubagentModelSwitch(
 	requested: string,
 	actingUserId: string | null,
 ): Promise<SubagentModelSwitchPlan> {
-	const model = requested.trim();
+	// `auto:<alias>` is written the catalog's way before the pool check compares it.
+	const model = normalizeAutoModelValueForSave(requested.trim());
 	if (!model) throw new ValidationError("model must not be empty");
 	if (FOLLOW_PARENT_ALIASES.has(model)) {
 		if (!policySourceIdOf(target))

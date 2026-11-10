@@ -15,6 +15,10 @@
 
 import type { Database } from "bun:sqlite";
 import {
+	DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS,
+	runWithScanBudget,
+} from "../../services/storage/database-storage-port";
+import {
 	aggregateObjectStorage,
 	type DatabaseObjectStorageResult,
 	type DatabaseStorageCategoryKey,
@@ -23,6 +27,8 @@ import {
 } from "../../services/storage-scan-queries";
 import { logger } from "../logger";
 import {
+	DbReadTaskExecutionError,
+	DbReadTaskTimeoutError,
 	getConfiguredConcurrency,
 	runEphemeralReadTask,
 	runReadTask,
@@ -31,12 +37,14 @@ import {
 import type { StorageScanContextResult, StorageScanTablesResult } from "./protocol";
 
 export interface ParallelScanOptions {
-	/** Shared main-thread connection, used only by the fallback path. */
+	/** Kept for caller compatibility; no scan path queries this main-thread connection. */
 	sqlite: Database;
 	dbPath: string;
 	mainBytes: number;
 	onProgress?: (progress: { done: number; total: number; tableName: string }) => void;
 	signal?: AbortSignal;
+	/** One deadline for context, shards and worker-unavailable fallbacks, including queueing. */
+	budgetMs?: number;
 }
 
 export interface ParallelScanOutcome extends DatabaseObjectStorageResult {
@@ -137,21 +145,43 @@ export async function runParallelObjectStorageScan(
 	options: ParallelScanOptions,
 ): Promise<ParallelScanOutcome> {
 	const startedAt = Date.now();
-	const { dbPath, mainBytes, onProgress, signal } = options;
-
+	const budgetMs = options.budgetMs ?? DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS;
+	const scope = new AbortController();
 	try {
-		// One cheap task first: pragmas + schema listing, so the shard plan uses the same table
-		// ordering the workers will see.
+		return await runWithScanBudget(budgetMs, options.signal, (linked) =>
+			runObjectStorageScan(
+				{ ...options, signal: AbortSignal.any([linked, scope.signal]) },
+				startedAt,
+				startedAt + budgetMs,
+			),
+		);
+	} finally {
+		// A failed shard must not leave its siblings consuming workers after the caller settles.
+		scope.abort();
+	}
+}
+
+async function runObjectStorageScan(
+	options: ParallelScanOptions,
+	startedAt: number,
+	deadlineAt: number,
+): Promise<ParallelScanOutcome> {
+	const { dbPath, mainBytes, onProgress, signal } = options;
+	const remainingMs = () => Math.max(0, deadlineAt - Date.now());
+	let phase = "context";
+	try {
+		// Context includes a full dbstat walk, not just pragmas/schema. On a cold 26.8 GB
+		// database it exceeded the former 30s cap, which threw away the work and restarted
+		// the SAME walk in a serial task capped at 120s. Give it the scan's remaining budget.
 		// No dedupeKey on purpose. The pool's dedupe makes concurrent callers share ONE execution
 		// promise, and an abort rejects that shared promise — so one admin closing the settings page
 		// would reject the other admin's context task too. That caller's own signal is not aborted, so
-		// it would not recognise the rejection as a cancellation and would silently degrade into the
-		// serial main-thread scan (measured: ~4.9s of event-loop freeze) for everyone. This task is
-		// only pragmas plus two schema queries, so paying for it twice is far cheaper than that.
+		// it would not recognise the rejection as a cancellation. Keep each caller's cancellation
+		// independent; the context also contains the dbstat result, reused by all its shards.
 		const context = await runReadTask<StorageScanContextResult>(
 			dbPath,
 			{ kind: "storageScanContext" },
-			{ signal, timeoutMs: 30_000 },
+			{ signal, timeoutMs: remainingMs() },
 		);
 
 		const tableNames = context.tables.map((table) => table.name);
@@ -164,13 +194,17 @@ export async function runParallelObjectStorageScan(
 		};
 		report("__dbstat__");
 
+		phase = "tables";
+		const shardScope = new AbortController();
+		const shardSignal = AbortSignal.any([signal ?? shardScope.signal, shardScope.signal]);
 		const shardResults = await Promise.all(
 			shards.map((shardNames) =>
 				runReadTask<StorageScanTablesResult>(
 					dbPath,
 					{ kind: "storageScanTables", tableNames: shardNames, context },
 					{
-						signal,
+						signal: shardSignal,
+						timeoutMs: remainingMs(),
 						onProgress: (progress) => {
 							// One count per table. Parallel shards must not each add 1 for the same name,
 							// and a shard's own 1..n counter is not the overall count.
@@ -181,7 +215,7 @@ export async function runParallelObjectStorageScan(
 					},
 				),
 			),
-		);
+		).finally(() => shardScope.abort());
 
 		const tableSummaries = shardResults.flatMap((shard) => shard.tables.map(toTableSummary));
 		const aggregated = aggregateObjectStorage({
@@ -203,6 +237,14 @@ export async function runParallelObjectStorageScan(
 		};
 	} catch (err) {
 		if (signal?.aborted) throw err;
+		if (!(err instanceof WorkersUnavailableError)) {
+			logger.warn("Storage scan read failed; not restarting the scan", {
+				phase,
+				durationMs: Date.now() - startedAt,
+				reason: err instanceof Error ? err.message : String(err),
+			});
+			throw err;
+		}
 		// A pool that was deliberately torn down is NOT an unavailable pool, and the main-thread
 		// fallback is the worst possible response to it: `vacuumDatabase` shuts the pool down
 		// precisely to clear readers out of the way, so falling back here would start a synchronous
@@ -223,6 +265,7 @@ export async function runParallelObjectStorageScan(
 				{ kind: "storageScanSerial", mainBytes },
 				{
 					signal,
+					timeoutMs: remainingMs(),
 					onProgress: (progress) => onProgress?.(progress),
 				},
 			);
@@ -237,20 +280,16 @@ export async function runParallelObjectStorageScan(
 			if (serialErr instanceof WorkersUnavailableError && serialErr.reason === "pool_shutdown") {
 				throw serialErr;
 			}
-			if (
-				!(serialErr instanceof WorkersUnavailableError) &&
-				!(err instanceof WorkersUnavailableError)
-			) {
-				// The sharded scan failed for a reason other than "no pool", and the serial task
-				// failed the same way. Don't hide a real query error behind an empty report.
-				throw serialErr;
-			}
+			// A real query error or watchdog is not worker unavailability. Restarting it on a
+			// fresh worker only repeats the expensive read and can hide the failure as zeroes.
+			if (!(serialErr instanceof WorkersUnavailableError)) throw serialErr;
 			try {
 				const result = await runEphemeralReadTask<DatabaseObjectStorageResult>(
 					dbPath,
 					{ kind: "storageScanSerial", mainBytes },
 					{
 						signal,
+						timeoutMs: remainingMs(),
 						onProgress: (progress) => onProgress?.(progress),
 					},
 				);
@@ -261,7 +300,12 @@ export async function runParallelObjectStorageScan(
 					durationMs: Date.now() - startedAt,
 				};
 			} catch (ephemeralErr) {
-				if (signal?.aborted) throw ephemeralErr;
+				if (
+					signal?.aborted ||
+					ephemeralErr instanceof DbReadTaskTimeoutError ||
+					ephemeralErr instanceof DbReadTaskExecutionError
+				)
+					throw ephemeralErr;
 				logger.warn("Storage scan could not run off-thread; per-table breakdown is unavailable", {
 					reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
 				});
