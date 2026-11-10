@@ -1,6 +1,13 @@
-import { AppShell, MantineProvider } from "@mantine/core";
+import { AppShell, MantineProvider, Menu, Portal } from "@mantine/core";
 import "@mantine/core/styles.css";
-import { type DockviewApi, DockviewReact, type IDockviewPanelProps } from "dockview-react";
+import {
+	type DockviewApi,
+	DockviewDefaultTab,
+	DockviewReact,
+	type IDockviewPanelHeaderProps,
+	type IDockviewPanelProps,
+} from "dockview-react";
+import { useState } from "react";
 import "dockview-react/dist/styles/dockview.css";
 import "../../dockview/theme.css";
 import "../../../styles/wco.css";
@@ -85,6 +92,60 @@ function Panel({ api: panelApi }: IDockviewPanelProps) {
 	);
 }
 
+// Same portal/viewport-coordinate pattern as SurfaceTab, without its API hooks.
+function TabWithMenu(props: IDockviewPanelHeaderProps) {
+	const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
+	return (
+		// biome-ignore lint/a11y/noStaticElementInteractions: supplemental tab context menu
+		<div
+			style={{ height: "100%" }}
+			onContextMenu={(event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				setPosition({ x: event.clientX, y: event.clientY });
+			}}
+		>
+			<DockviewDefaultTab {...props} />
+			{position && (
+				<Menu
+					opened
+					onChange={(opened) => {
+						if (!opened) setPosition(null);
+					}}
+					position="bottom-start"
+					withinPortal
+					transitionProps={{ duration: 0 }}
+				>
+					<Portal>
+						<Menu.Target>
+							<span
+								style={{
+									position: "fixed",
+									left: position.x,
+									top: position.y,
+									width: 0,
+									height: 0,
+									pointerEvents: "none",
+								}}
+							/>
+						</Menu.Target>
+					</Portal>
+					<Menu.Dropdown data-fixture-context-menu>
+						<Menu.Item
+							onClick={() => {
+								document.documentElement.dataset.fixtureMenuClicked = "true";
+								setPosition(null);
+							}}
+						>
+							测试菜单操作
+						</Menu.Item>
+					</Menu.Dropdown>
+				</Menu>
+			)}
+		</div>
+	);
+}
+
 function Fixture() {
 	const ref = useWcoTitlebarRows(true);
 	return (
@@ -97,6 +158,7 @@ function Fixture() {
 					tabGroupIndicator: "none",
 				}}
 				components={{ panel: Panel }}
+				defaultTabComponent={TabWithMenu}
 				defaultRenderer="always"
 				onReady={({ api: readyApi }) => {
 					api = readyApi;

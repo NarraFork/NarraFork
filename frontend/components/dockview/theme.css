@@ -72,6 +72,9 @@
 	 * opens, but nothing of it is visible or clickable.
 	 */
 	--dv-overlay-z-index: 999;
+	/* Keep Dockview's internal layer numbers below app-level portaled menus/modals.
+	 * Unlike transform/contain, isolation does not rebase fixed-position children. */
+	isolation: isolate;
 
 	/* Icons */
 	--dv-icon-hover-background-color: var(--mantine-color-default-hover);

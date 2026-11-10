@@ -56,7 +56,9 @@ export function bindNarratorDockWco(api: DockviewApi, primaryPanelId: string): {
 			side === "right" &&
 			(visible || mode.matches || html.getAttribute(WCO_ATTRIBUTE) === "right");
 		const primary = api.getPanel(primaryPanelId)?.group;
-		const primaryRect = primary?.element.getBoundingClientRect();
+		// Ordinary browser tabs still receive Dockview layout events. Do not force
+		// a geometry read there; the empty inset map below still clears old marks.
+		const primaryRect = enabled ? primary?.element.getBoundingClientRect() : undefined;
 		const insets = new Map<DockviewGroupPanel, number>();
 		if (enabled && primaryRect) {
 			for (const group of api.groups) {
@@ -127,6 +129,7 @@ export function bindNarratorDockWco(api: DockviewApi, primaryPanelId: string): {
 
 	return {
 		dispose() {
+			if (disposed) return;
 			disposed = true;
 			if (frame !== null) window.cancelAnimationFrame(frame);
 			for (const subscription of subscriptions) subscription.dispose();
@@ -141,6 +144,20 @@ export function bindNarratorDockWco(api: DockviewApi, primaryPanelId: string): {
 				element.style.removeProperty(INSET_PROPERTY);
 			}
 			for (const content of contents) content.removeAttribute(WCO_BELOW_CONTROLS_ATTRIBUTE);
+			// Clearing the exclusion also lets useWcoTitlebarRows restore the header
+			// height next frame. Relayout then: Dockview measures its content anchor
+			// in the following frame, after both CSS changes have settled.
+			const restored = [...groups.values()];
+			if (restored.length > 0) {
+				window.requestAnimationFrame(() => {
+					for (const group of restored) {
+						// The surface may have been unmounted or disposed in the meantime.
+						if (group.element.isConnected && api.groups.includes(group)) {
+							group.layout(group.api.width, group.api.height);
+						}
+					}
+				});
+			}
 			groups.clear();
 			contents.clear();
 		},

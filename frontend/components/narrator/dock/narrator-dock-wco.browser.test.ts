@@ -243,3 +243,81 @@ test("真实 AppShell：父容器可滚动时，普通页签及溢出选择均�
 		}
 	});
 }, 20_000);
+
+test("释放避让绑定后内容层立即跟随恢复后的标签栏", async () => {
+	await withFixture(async (page) => {
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.configure({ top: -32 });
+			fixture.activate("tool-0");
+		});
+		await settle(page);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.setAvoidance(false));
+		await settle(page);
+		const after = await state(page);
+		expect(after.tool.marked).toBe(false);
+		expect(after.tool.content?.top).toBe(after.tool.tabs?.bottom);
+		expect(after.tool.content?.bottom).toBe(900);
+	});
+});
+
+test("退出 WCO 后工具内容紧贴标签栏，不遗留旧标题栏高度", async () => {
+	await withFixture(async (page) => {
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.activate("tool-0"));
+		await settle(page);
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.configure({ visible: false, mode: false }),
+		);
+		await settle(page);
+		const after = await state(page);
+		expect(after.tool.marked).toBe(false);
+		expect(after.tool.content?.top).toBe(after.tool.tabs?.bottom);
+		expect(after.tool.content?.bottom).toBe(900);
+	});
+});
+
+test("溢出列表不遮挡通过 Portal 打开的 Mantine 右键菜单", async () => {
+	await withFixture(async (page) => {
+		await openOverflowMenu(page);
+		await page.click(".dv-tabs-overflow-container .dv-tab", { button: "right" });
+		await page.waitForSelector("[data-fixture-context-menu]", { visible: true });
+		await settle(page);
+		const hit = await page.evaluate(() => {
+			const menu = document.querySelector("[data-fixture-context-menu]");
+			const popup = document.querySelector(".dv-tabs-overflow-container");
+			if (!menu || !popup) throw new Error("菜单和溢出列表必须同时存在");
+			const m = menu.getBoundingClientRect();
+			const p = popup.getBoundingClientRect();
+			const left = Math.max(m.left, p.left);
+			const right = Math.min(m.right, p.right);
+			const top = Math.max(m.top, p.top);
+			const bottom = Math.min(m.bottom, p.bottom);
+			return {
+				overlaps: right > left && bottom > top,
+				menuOnTop: menu.contains(document.elementFromPoint((left + right) / 2, (top + bottom) / 2)),
+			};
+		});
+		expect(hit.overlaps).toBe(true);
+		expect(hit.menuOnTop).toBe(true);
+		await page.click("[data-fixture-context-menu] [role=menuitem]");
+		expect(await page.evaluate(() => document.documentElement.dataset.fixtureMenuClicked)).toBe(
+			"true",
+		);
+	});
+});
+
+test("Dockview 层级隔离不改变面板内 fixed 元素的视口坐标", async () => {
+	await withFixture(async (page) => {
+		const position = await page.evaluate(() => {
+			const panel = document.querySelector('[data-fixture-panel="primary"]');
+			if (!panel) throw new Error("缺少主会话面板");
+			const marker = document.createElement("div");
+			marker.style.cssText = "position:fixed;left:123px;top:77px;width:10px;height:10px";
+			panel.appendChild(marker);
+			const { left, top } = marker.getBoundingClientRect();
+			marker.remove();
+			return { left, top };
+		});
+		expect(position).toEqual({ left: 123, top: 77 });
+	});
+});

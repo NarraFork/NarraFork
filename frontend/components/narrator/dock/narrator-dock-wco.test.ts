@@ -216,11 +216,50 @@ describe("右侧工具组 WCO 向下避让", () => {
 		}
 	});
 
+	test("非 WCO 模式不读取主会话布局，但仍撤销已有避让", () => {
+		const r = realm();
+		try {
+			r.primary.element.getBoundingClientRect = () => {
+				throw new Error("Inactive WCO must not measure the primary group");
+			};
+			r.overlay.visible = false;
+			r.overlay.emit();
+			r.flush();
+			expect(r.right.element.hasAttribute(WCO_BELOW_CONTROLS_ATTRIBUTE)).toBe(false);
+			r.layout.emit();
+			r.active.emit();
+			r.flush();
+		} finally {
+			r.binding.dispose();
+		}
+	});
+
+	test("释放后的恢复帧跳过已移除或已卸载的组", () => {
+		for (const detach of [false, true]) {
+			const r = realm();
+			const previous = r.right.layoutCount();
+			r.binding.dispose();
+			if (detach) r.right.element.remove();
+			else
+				r.api.groups.splice(
+					r.api.groups.findIndex((group) => group.element === r.right.element),
+					1,
+				);
+			r.flush();
+			expect(r.right.layoutCount()).toBe(previous);
+		}
+	});
+
 	test("释放监听、取消排队帧并清除所有局部标记", () => {
 		const r = realm();
 		r.layout.emit();
 		expect(r.frames.size).toBe(1);
+		const previous = r.right.layoutCount();
 		r.binding.dispose();
+		r.binding.dispose(); // Idempotent: only one final restoration frame.
+		expect(r.frames.size).toBe(1);
+		r.flush();
+		expect(r.right.layoutCount()).toBe(previous + 1);
 		expect(r.frames.size).toBe(0);
 		for (const group of [r.primary, r.right, r.lower, r.left]) {
 			expect(group.element.hasAttribute(WCO_BELOW_CONTROLS_ATTRIBUTE)).toBe(false);
