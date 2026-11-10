@@ -27,7 +27,15 @@ export type OutlineTaskNoticeChange =
 	| { kind: "status"; from: OutlineTaskNoticeStatus | null; to: string }
 	| { kind: "assigned"; to: string | null }
 	/** The person rejected the agent's marking a locked goal done or cancelled (D26b). */
-	| { kind: "rejected"; status: "done" | "cancelled"; reason: string | null };
+	| { kind: "rejected"; status: "done" | "cancelled"; reason: string | null }
+	/**
+	 * Team activity (outline P2 PR 10b, `outline_team_activity`): notes added under the task, reports
+	 * attached to it, questions under it answered (counted, never their words); the task put in the
+	 * claim pool; the task's session also changing a file this session changed.
+	 */
+	| { kind: "notes" | "reports" | "answers"; n: number }
+	| { kind: "claimable" }
+	| { kind: "overlap"; path: string };
 
 /** One task a notice names. */
 export interface OutlineTaskNoticeItem {
@@ -101,6 +109,18 @@ function boundChange(raw: unknown): OutlineTaskNoticeChange | null {
 				kind: "assigned",
 				to: typeof raw.to === "string" && raw.to ? clipNoticeLine(raw.to) : null,
 			};
+		case "notes":
+		case "reports":
+		case "answers": {
+			const n = typeof raw.n === "number" && Number.isFinite(raw.n) ? Math.floor(raw.n) : 0;
+			return n > 0 ? { kind: raw.kind, n: Math.min(n, 999_999) } : null;
+		}
+		case "claimable":
+			return { kind: "claimable" };
+		case "overlap":
+			return typeof raw.path === "string" && raw.path.trim()
+				? { kind: "overlap", path: clipNoticeLine(raw.path) }
+				: null;
 		case "rejected":
 			if (raw.status !== "done" && raw.status !== "cancelled") return null;
 			return {

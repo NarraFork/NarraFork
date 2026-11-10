@@ -204,6 +204,51 @@ function notices(): AdapterSegment[] {
 				},
 			},
 		]),
+		// Team activity (outline P2 PR 10b): a long title beside a long name, counts, a file whose
+		// task the session may not name.
+		row([
+			{
+				type: "system_injection",
+				source: "outline_team_activity",
+				modelText: "团队动态（…）",
+				body: {
+					kind: "outlineTasks",
+					variant: "activity",
+					items: [
+						{
+							address: `${K}/mSsl3Ccf`,
+							title:
+								"改刷新逻辑，确保在网络断开后重连时不会重复提交同一个刷新请求并且要覆盖所有边界",
+							// Overflow without relying on the runner's CJK fallback font metrics.
+							by: "A deliberately long session title for browser truncation",
+							changes: [{ kind: "status", from: "todo", to: "done" }],
+						},
+						{
+							address: `${K}/Qp93LkaA`,
+							title: "auth 模块稳定",
+							by: "alice",
+							changes: [
+								{ kind: "notes", n: 2 },
+								{ kind: "reports", n: 1 },
+								{ kind: "answers", n: 3 },
+							],
+						},
+						{
+							address: "",
+							title: "server/services/outline/live/deeply/nested/directory/agent-presence.ts",
+							by: "B",
+							changes: [
+								{
+									kind: "overlap",
+									path: "server/services/outline/live/deeply/nested/directory/agent-presence.ts",
+								},
+							],
+						},
+					],
+					more: 3,
+				},
+			},
+		]),
 	];
 }
 
@@ -312,6 +357,8 @@ export interface CardReport {
 	/** The card's heading, and the status chips drawn (their text, in order). */
 	title: string;
 	statuses: string[];
+	/** Who made each change, where a row starts with it (team activity): width, cut short. */
+	by: Array<{ text: string; width: number; truncated: boolean }>;
 }
 
 export function report(): CardReport[] {
@@ -377,6 +424,13 @@ export function report(): CardReport[] {
 			statuses: [...card.querySelectorAll("[data-task-notice-status]")].map(
 				(chip) => chip.textContent ?? "",
 			),
+			by: [
+				...card.querySelectorAll<HTMLElement>("[data-task-notice-row] [data-task-notice-by]"),
+			].map((by) => ({
+				text: by.textContent ?? "",
+				width: Math.round(by.getBoundingClientRect().width),
+				truncated: by.scrollWidth > by.clientWidth + 0.5,
+			})),
 		};
 	});
 }

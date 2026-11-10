@@ -418,6 +418,24 @@ export function buildTreeSnapshotEventHooks(
 					error: String(err),
 				});
 			}
+			// The outline overlap index learns Bash's files too, without a hint in Bash's result:
+			// the change is observed after the fact, not owned by one command (P2 PR 10b).
+			try {
+				const { isOutlineEnabled } = await import("./outline/feature");
+				if (isOutlineEnabled()) {
+					const { noteOutlineFileChange } = await import("./outline/overlap");
+					await noteOutlineFileChange({
+						narratorId,
+						cwd: session.cwd,
+						filePaths: changedFiles,
+						backend: localBackend,
+						locale: "en",
+						hint: false,
+					});
+				}
+			} catch {
+				// The index is a convenience; Bash's result does not depend on it.
+			}
 		},
 	};
 }

@@ -82,6 +82,44 @@ describe("bounds", () => {
 		expect(boundOutlineTaskNoticeItem("x")).toBeNull();
 	});
 
+	it("keeps team activity's changes bounded: counts, the claim pool, a file (P2 PR 10b)", () => {
+		expect(
+			boundOutlineTaskNoticeItem({
+				address: "K/a",
+				title: "T",
+				by: "B",
+				changes: [
+					{ kind: "notes", n: 2.7 },
+					{ kind: "reports", n: 0 },
+					{ kind: "answers", n: "3" },
+					{ kind: "claimable", extra: true },
+					{ kind: "overlap", path: `  src/${"x".repeat(300)}.ts ` },
+					{ kind: "overlap", path: "" },
+				],
+			}),
+		).toEqual({
+			address: "K/a",
+			title: "T",
+			by: "B",
+			changes: [
+				{ kind: "notes", n: 2 },
+				{ kind: "claimable" },
+				{ kind: "overlap", path: expect.stringMatching(/^src\/x+…$/) },
+			],
+		});
+		expect(
+			coerceSideCarBody({ kind: "outlineTasks", variant: "activity", items: [], more: 2 }),
+		).toEqual({ kind: "outlineTasks", variant: "activity", items: [], more: 2 });
+		expect(
+			sideCarBodyToPlainText("outline_team_activity", {
+				kind: "outlineTasks",
+				variant: "activity",
+				items: [{ address: "K/a", title: "T" }],
+				more: 2,
+			}),
+		).toBe(["Team activity: 3 change(s)", "", "2 more not listed"].join("\n"));
+	});
+
 	it("caps the items of a notice", () => {
 		const many = Array.from({ length: 50 }, (_, i) => ({ address: `K/${i}`, title: `T${i}` }));
 		expect(boundOutlineTaskNoticeItems(many)).toHaveLength(OUTLINE_TASK_NOTICE_LIMITS.items);
