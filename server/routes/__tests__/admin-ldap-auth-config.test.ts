@@ -17,6 +17,7 @@ import { generateId } from "../../lib/id";
 import type { LdapAuthClient, LdapProbeResult } from "../../lib/ldap/client";
 import { LDAP_PROVIDER_ID } from "../../lib/ldap/protocol";
 import { settings } from "../../lib/settings";
+import type { LdapSettings } from "../../lib/settings/types";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { setLdapClientFactoryForTests } from "../../services/ldap-auth-service";
@@ -67,15 +68,28 @@ function installSessionStore(principal: { userId: string; role: "admin" | "user"
 	setAuthStores({ session: store, mfa: authMfaStore });
 }
 
+/** `app.request` may answer synchronously; the tests only ever await. */
 function adminRequest(path: string, init: RequestInit = {}): Promise<Response> {
-	return adminApp.request(`/api/admin${path}`, {
-		...init,
-		headers: {
-			Authorization: `Bearer ${SESSION_TOKEN}`,
-			"Content-Type": "application/json",
-			...init.headers,
-		},
-	});
+	return Promise.resolve(
+		adminApp.request(`/api/admin${path}`, {
+			...init,
+			headers: {
+				Authorization: `Bearer ${SESSION_TOKEN}`,
+				"Content-Type": "application/json",
+				...init.headers,
+			},
+		}),
+	);
+}
+
+/**
+ * Read the stored directory config.
+ *
+ * A plain `settings.auth.ldap` read is narrowed to `never` by the `= undefined`
+ * assignments in the tests below; this indirection keeps the declared type.
+ */
+function storedLdap(): LdapSettings | undefined {
+	return settings.auth.ldap;
 }
 
 async function createUser(username: string): Promise<string> {
@@ -142,9 +156,9 @@ describe("PATCH /api/admin/auth-config", () => {
 			body: JSON.stringify({ oidcProviders: [], ldap: submittedLdap }),
 		});
 		expect(response.status).toBe(200);
-		expect(settings.auth.ldap?.url).toBe(submittedLdap.url);
-		expect(settings.auth.ldap?.bindPassword).toBe("the-real-bind-password");
-		expect(settings.auth.ldap?.mode).toBe("search");
+		expect(storedLdap()?.url).toBe(submittedLdap.url);
+		expect(storedLdap()?.bindPassword).toBe("the-real-bind-password");
+		expect(storedLdap()?.mode).toBe("search");
 
 		const body = (await response.json()) as { ldap: { bindPassword: string } };
 		expect(body.ldap.bindPassword).toBe("********word");
@@ -161,7 +175,7 @@ describe("PATCH /api/admin/auth-config", () => {
 		});
 		expect(response.status).toBe(200);
 		// Not `********word`: the next bind would fail with a password nobody can read.
-		expect(settings.auth.ldap?.bindPassword).toBe("the-real-bind-password");
+		expect(storedLdap()?.bindPassword).toBe("the-real-bind-password");
 	});
 
 	test("an omitted password keeps the stored secret", async () => {
@@ -171,7 +185,7 @@ describe("PATCH /api/admin/auth-config", () => {
 			method: "PATCH",
 			body: JSON.stringify({ oidcProviders: [], ldap: withoutPassword }),
 		});
-		expect(settings.auth.ldap?.bindPassword).toBe("the-real-bind-password");
+		expect(storedLdap()?.bindPassword).toBe("the-real-bind-password");
 	});
 
 	test("null clears the directory", async () => {
@@ -181,7 +195,7 @@ describe("PATCH /api/admin/auth-config", () => {
 			body: JSON.stringify({ oidcProviders: [], ldap: null }),
 		});
 		expect(response.status).toBe(200);
-		expect(settings.auth.ldap).toBeUndefined();
+		expect(storedLdap()).toBeUndefined();
 	});
 
 	test("an omitted ldap key leaves the stored directory untouched", async () => {
@@ -190,7 +204,7 @@ describe("PATCH /api/admin/auth-config", () => {
 			method: "PATCH",
 			body: JSON.stringify({ oidcProviders: [] }),
 		});
-		expect(settings.auth.ldap?.url).toBe(submittedLdap.url);
+		expect(storedLdap()?.url).toBe(submittedLdap.url);
 	});
 
 	test("rejects a configuration the login path could not use", async () => {

@@ -7,6 +7,7 @@ export {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	createGitIdentitySchema,
+	type LdapSettingsInput,
 	ldapConnectionTestSchema,
 	ldapSettingsInputSchema,
 	loginSchema,
