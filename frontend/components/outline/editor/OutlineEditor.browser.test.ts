@@ -693,6 +693,105 @@ test("one marker per row: a task shows arrow + checkbox, a plain row arrow + bul
 	noErrors(a);
 }, 30_000);
 
+test("a task's status is a badge: its icon on a tinted background, in both schemes, and still the checkbox", async () => {
+	const { pageId, ids } = await seedPage(h, "Statuses", [
+		"[ ] to do",
+		"[/] in progress",
+		"[x] done",
+		"[-] cancelled",
+		"a plain block",
+	]);
+	const [todo, doing, done, cancelled, plain] = ids as [string, string, string, string, string];
+	const a = await openEditor(h, h.owner, pageId);
+	const badge = (id: string) =>
+		a.call((f, x) => {
+			const check = f
+				.dom(x as never)
+				?.querySelector<HTMLElement>(":scope > .ob-gutter > .ob-check");
+			const svg = check?.querySelector<SVGSVGElement>("svg");
+			if (!check || !svg) return null;
+			const cs = getComputedStyle(svg);
+			const box = svg.getBoundingClientRect();
+			return {
+				status: svg.dataset.status ?? null,
+				icon: check.dataset.icon ?? null,
+				// An icon (shapes), never a character.
+				shapes: svg.childElementCount,
+				text: check.textContent,
+				background: cs.backgroundColor,
+				color: cs.color,
+				radius: cs.borderTopLeftRadius,
+				padding: cs.paddingTop,
+				size: [Math.round(box.width), Math.round(box.height)],
+				role: check.getAttribute("role"),
+				checked: check.getAttribute("aria-checked"),
+				at: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+			};
+		}, id);
+	const alpha = (color: string | undefined) => {
+		const parts = /rgba?\(([^)]+)\)|color\(srgb ([^)]+)\)/.exec(color ?? "");
+		const values = (parts?.[1] ?? parts?.[2] ?? "").split(/[\s,/]+/).filter(Boolean);
+		return values.length >= 4 ? Number(values[3]) : values.length === 3 ? 1 : 0;
+	};
+	const expected = [
+		[todo, "todo", "circle", "false"],
+		[doing, "doing", "circle-half-2", "mixed"],
+		[done, "done", "check", "true"],
+		[cancelled, "cancelled", "x", "false"],
+	] as const;
+	for (const scheme of ["light", "dark"] as const) {
+		await a.page.evaluate(
+			(s) => document.documentElement.setAttribute("data-mantine-color-scheme", s),
+			scheme,
+		);
+		const seen = [];
+		for (const [id, status, icon, checked] of expected) {
+			const got = await badge(id);
+			expect(got, `${scheme} ${status}`).toMatchObject({
+				status,
+				icon,
+				text: "",
+				radius: "4px",
+				padding: "2px",
+				// The box a bare icon had: nothing the frame measures moved.
+				size: [16, 16],
+				// Still the checkbox: the badge is its drawing.
+				role: "checkbox",
+				checked,
+			});
+			expect(got?.shapes, `${scheme} ${status}`).toBeGreaterThan(0);
+			// A background of its own, tinted (not solid), under an icon in the state's colour.
+			expect(alpha(got?.background), `${scheme} ${status} background`).toBeGreaterThan(0.05);
+			expect(alpha(got?.background), `${scheme} ${status} background`).toBeLessThan(0.5);
+			seen.push(got);
+		}
+		// The states do not share one look: icon colours of doing, done and to do all differ.
+		expect(new Set(seen.slice(0, 3).map((b) => b?.color)).size, scheme).toBe(3);
+		expect(new Set(seen.slice(0, 3).map((b) => b?.background)).size, scheme).toBe(3);
+		// A plain block has no badge at all.
+		expect(await badge(plain)).toBeNull();
+	}
+	// The two schemes have colours of their own (the loop ended in dark).
+	const dark = await badge(doing);
+	await a.page.evaluate(() =>
+		document.documentElement.setAttribute("data-mantine-color-scheme", "light"),
+	);
+	expect((await badge(doing))?.color).not.toBe(dark?.color);
+	// A real click on the badge changes the status, as on the bare checkbox before.
+	const at = (await badge(todo))?.at as { x: number; y: number };
+	await a.page.mouse.click(at.x, at.y);
+	await settle(a);
+	expect(await badge(todo)).toMatchObject({
+		status: "doing",
+		icon: "circle-half-2",
+		checked: "mixed",
+	});
+	expect(serverOutline(pageId)).toStartWith(
+		"- [/] to do\n- [/] in progress\n- [x] done\n- [-] cancelled",
+	);
+	noErrors(a);
+}, 30_000);
+
 test("a heading inside a block is body size, bold: the page title stays the largest text", async () => {
 	const { pageId, ids } = await seedPage(h, "Headings", [
 		"[ ] Task title",

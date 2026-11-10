@@ -150,6 +150,36 @@ for (const { name, options } of CASES) {
 			expect(card.text).not.toContain("\\");
 			expect(card.text).not.toContain("`");
 		}
+		// A task's state is never bare words or a character: every status chip is the outline's
+		// chip for that state, its icon before the words, on a background (or outlined, when gray).
+		const ICONS: Record<string, string> = {
+			todo: "tabler-icon-circle",
+			doing: "tabler-icon-circle-half-2",
+			done: "tabler-icon-check",
+			cancelled: "tabler-icon-x",
+			waiting: "tabler-icon-hourglass",
+			delegated: "tabler-icon-arrow-forward-up",
+			locked: "tabler-icon-lock",
+		};
+		const chips = cards.flatMap((card) => card.chips);
+		for (const card of cards) {
+			// Every status chip drawn is such a chip (an answer's alias chip is not a status).
+			if (card.kind === "tasks_notice" && !card.title.includes("回答"))
+				expect(card.chips.length).toBeGreaterThanOrEqual(card.statuses.length);
+		}
+		expect(chips.length).toBeGreaterThan(0);
+		for (const chip of chips) {
+			expect(chip, chip.text).toMatchObject({ backed: true });
+			expect(chip.icon.split(" "), chip.text).toContain(ICONS[chip.status] as string);
+			expect(chip.shapes).toBeGreaterThan(0);
+			expect(chip.text).not.toMatch(/[☐☑✓✗◐●○]/);
+		}
+		if (options.expanded) {
+			// Unfolded, the rows show the whole range: every status and the lock.
+			expect([...new Set(chips.map((chip) => chip.status))].sort()).toEqual(
+				expect.arrayContaining(["delegated", "doing", "done", "todo", "waiting"]),
+			);
+		}
 		// The interrupt guard keeps its close button in its heading line.
 		expect(cards[2]?.closeButtons).toBe(1);
 		// Outline P2 PR 9b. The view with tasks the session's subagents are doing: unfolded, each

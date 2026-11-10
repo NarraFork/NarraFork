@@ -192,12 +192,11 @@ export async function seedPage(
 	lines.forEach((line, i) => {
 		const depth = (line.length - line.trimStart().length) / 2;
 		let content = line.trim();
-		let task: { status: "todo" | "done" } | null = null;
-		if (content.startsWith("[ ] ")) {
-			task = { status: "todo" };
-			content = content.slice(4);
-		} else if (content.startsWith("[x] ")) {
-			task = { status: "done" };
+		let task: { status: "todo" | "doing" | "done" | "cancelled" } | null = null;
+		const mark = /^\[([ x/-])\] /.exec(content);
+		if (mark) {
+			const status = { " ": "todo", "/": "doing", x: "done", "-": "cancelled" } as const;
+			task = { status: status[mark[1] as keyof typeof status] };
 			content = content.slice(4);
 		}
 		stack.length = depth + 1;

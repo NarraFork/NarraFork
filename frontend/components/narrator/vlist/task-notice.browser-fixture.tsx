@@ -312,6 +312,8 @@ export interface CardReport {
 	/** The card's heading, and the status chips drawn (their text, in order). */
 	title: string;
 	statuses: string[];
+	/** Every state chip (a status, a lock): which state, its words, its icon, its background. */
+	chips: Array<{ status: string; text: string; icon: string; shapes: number; backed: boolean }>;
 }
 
 export function report(): CardReport[] {
@@ -377,6 +379,20 @@ export function report(): CardReport[] {
 			statuses: [...card.querySelectorAll("[data-task-notice-status]")].map(
 				(chip) => chip.textContent ?? "",
 			),
+			chips: [...card.querySelectorAll<HTMLElement>("[data-status-chip]")].map((chip) => {
+				const svg = chip.querySelector<SVGSVGElement>("svg");
+				const background = getComputedStyle(chip).backgroundColor;
+				const border = getComputedStyle(chip).borderTopColor;
+				const clear = (color: string) => color === "rgba(0, 0, 0, 0)" || color === "transparent";
+				return {
+					status: chip.dataset.statusChip ?? "",
+					text: chip.textContent ?? "",
+					icon: svg ? (svg.getAttribute("class") ?? "") : "",
+					shapes: svg?.childElementCount ?? 0,
+					// A tinted background, or (a gray chip) an outline: never bare words.
+					backed: !clear(background) || !clear(border),
+				};
+			}),
 		};
 	});
 }

@@ -66,6 +66,8 @@ let tidy: {
 	plain: string;
 	/** A chain of blocks, each the next one's parent. */
 	deep: string[];
+	/** A task of each status. */
+	statuses: Record<"todo" | "doing" | "done" | "cancelled", string>;
 	/** The commit the page was written in. */
 	seq: number;
 };
@@ -227,6 +229,13 @@ beforeAll(async () => {
 				parent: { tempId: i === 0 ? "tp" : `d${i - 1}` },
 				content,
 			})),
+			// One task of each remaining status (the first task above is in progress).
+			...(["todo", "done", "cancelled"] as const).map((status) => ({
+				op: "insert" as const,
+				parent: { tempId: "tp" },
+				content: `A ${status} task`,
+				task: { status },
+			})),
 		],
 		actor: { kind: "human", id: owner },
 		responsibleUserId: owner,
@@ -240,6 +249,12 @@ beforeAll(async () => {
 		report: at(5),
 		plain: at(7),
 		deep: DEEP_TITLES.map((_, i) => at(9 + i)),
+		statuses: {
+			doing: at(1),
+			todo: at(9 + DEEP_TITLES.length),
+			done: at(10 + DEEP_TITLES.length),
+			cancelled: at(11 + DEEP_TITLES.length),
+		},
 		seq: tidied.commit?.seq as number,
 	};
 }, 60_000);
@@ -723,7 +738,7 @@ test("a page's title is shown twice at most in the dock: the tab and the page's 
 	}
 }, 60_000);
 
-test("the read-only tree: one marker per row, body-size headings, the report line in the reader's words", async () => {
+test("the read-only tree: one marker per row, body-size headings, the report line in the reader's words, statuses as badges", async () => {
 	const { page, errors } = await openDock({ timezone: "Asia/Tokyo" });
 	try {
 		await call(
@@ -815,6 +830,87 @@ test("the read-only tree: one marker per row, body-size headings, the report lin
 		expect(await reportLine()).toBe("子代理报告 · 2025年3月5日 02:38");
 		expect(await page.evaluate(() => document.body.innerText)).not.toMatch(/第 2 代|17:38 UTC/);
 		await call(page, (f) => f.setLanguage("en"));
+
+		// A task's status is a badge: the state's icon on a tinted background, named for
+		// assistive technology in the reader's language, in both schemes.
+		const badges = () =>
+			page.evaluate((byStatus) => {
+				const out: Record<string, unknown> = {};
+				for (const [status, id] of Object.entries(byStatus)) {
+					const mark = document.querySelector<HTMLElement>(`[data-block-id="${id}"] > [role=img]`);
+					const svg = mark?.querySelector<SVGSVGElement>("svg");
+					const cs = svg ? getComputedStyle(svg) : null;
+					const box = svg?.getBoundingClientRect();
+					const rgba = /rgba?\(([^)]+)\)|color\(srgb ([^)]+)\)/.exec(cs?.backgroundColor ?? "");
+					const parts = (rgba?.[1] ?? rgba?.[2] ?? "").split(/[\s,/]+/).filter(Boolean);
+					out[status] = {
+						label: mark?.getAttribute("aria-label") ?? null,
+						status: svg?.dataset.status ?? null,
+						badge: svg?.classList.contains("nf-status") ?? false,
+						shapes: svg?.childElementCount ?? 0,
+						text: mark?.textContent ?? null,
+						tinted: parts.length >= 4 && Number(parts[3]) > 0.05 && Number(parts[3]) < 0.5,
+						color: cs?.color ?? null,
+						radius: cs?.borderTopLeftRadius ?? null,
+						size: box ? [Math.round(box.width), Math.round(box.height)] : null,
+					};
+				}
+				return out as Record<
+					string,
+					{ label: string; status: string; color: string; [key: string]: unknown }
+				>;
+			}, tidy.statuses);
+		const LABELS = {
+			en: { todo: "To do", doing: "In progress", done: "Done", cancelled: "Cancelled" },
+			"zh-CN": { todo: "待办", doing: "进行中", done: "完成", cancelled: "已取消" },
+		} as const;
+		const colours: Record<string, string> = {};
+		for (const scheme of ["light", "dark"] as const) {
+			await page.evaluate(
+				(s) => document.documentElement.setAttribute("data-mantine-color-scheme", s),
+				scheme,
+			);
+			for (const language of ["en", "zh-CN"] as const) {
+				await call(page, (f, l) => f.setLanguage(l as never), language);
+				await page.waitForFunction(
+					(id, label) =>
+						document
+							.querySelector(`[data-block-id="${id}"] > [role=img]`)
+							?.getAttribute("aria-label") === label,
+					{ timeout: 10_000 },
+					tidy.statuses.done,
+					LABELS[language].done,
+				);
+				const got = await badges();
+				for (const status of ["todo", "doing", "done", "cancelled"] as const) {
+					expect(got[status], `${scheme} ${language} ${status}`).toMatchObject({
+						label: LABELS[language][status],
+						status,
+						badge: true,
+						text: "",
+						tinted: true,
+						radius: "4px",
+						size: [16, 16],
+					});
+					expect(got[status]?.shapes, `${scheme} ${status}`).toBeGreaterThan(0);
+				}
+				expect(new Set(["todo", "doing", "done"].map((s) => got[s]?.color)).size).toBe(3);
+				colours[scheme] = got.doing?.color as string;
+			}
+		}
+		expect(colours.light).not.toBe(colours.dark);
+		await page.evaluate(() =>
+			document.documentElement.setAttribute("data-mantine-color-scheme", "light"),
+		);
+		await call(page, (f) => f.setLanguage("en"));
+		await page.waitForFunction(
+			(id) =>
+				document
+					.querySelector(`[data-block-id="${id}"] > [role=img]`)
+					?.getAttribute("aria-label") === "Done",
+			{ timeout: 10_000 },
+			tidy.statuses.done,
+		);
 
 		// What the bullet did, on a task: the handle focuses it (a real click).
 		const handle = await page.$(
