@@ -7,7 +7,7 @@ import { mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { historyStrings } from "../../../tests/fixtures/model-input";
 import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBlocks,
@@ -700,13 +700,18 @@ describe("native media survives the unified runtime without duplicate current la
 					.select()
 					.from(narratorMessages)
 					.where(eq(narratorMessages.narratorId, id));
-				const users = rows.filter((row) => row.role === "user");
+				const logicalRows = rows.map((row) => ({
+					...row,
+					contentJson: readTestMessageContent<unknown>(sqlite, row.id),
+				}));
+				const users = logicalRows.filter((row) => row.role === "user");
 				expect(users).toHaveLength(1);
 				for (const ref of refs)
 					expect(users[0].contentJson).toContainEqual(mediaRefToContentBlock(ref));
+				// Keep the storage check meaningful when content_json is only an empty projection.
 				for (const data of bytes)
-					expect(JSON.stringify(rows)).not.toContain(data.toString("base64"));
-				expect(JSON.stringify(rows)).not.toContain('"base64"');
+					expect(JSON.stringify([rows, logicalRows])).not.toContain(data.toString("base64"));
+				expect(JSON.stringify([rows, logicalRows])).not.toContain('"base64"');
 			});
 		}
 	}
@@ -850,11 +855,15 @@ describe("unsupported native media preserves refs across retries and model chang
 						.select()
 						.from(narratorMessages)
 						.where(eq(narratorMessages.narratorId, id));
-					const users = rows.filter((row) => row.role === "user");
+					const logicalRows = rows.map((row) => ({
+						...row,
+						contentJson: readTestMessageContent<unknown>(sqlite, row.id),
+					}));
+					const users = logicalRows.filter((row) => row.role === "user");
 					expect(users).toHaveLength(1);
 					expect(users[0].contentJson).toContainEqual(block);
-					expect(JSON.stringify(rows)).not.toContain("nativeMediaFallback");
-					expect(JSON.stringify(rows)).not.toContain('"base64"');
+					expect(JSON.stringify([rows, logicalRows])).not.toContain("nativeMediaFallback");
+					expect(JSON.stringify([rows, logicalRows])).not.toContain('"base64"');
 					owner.release();
 					activeNarrators.delete(id);
 					await db.update(narrators).set({ model: capableModel }).where(eq(narrators.id, id));
@@ -894,7 +903,9 @@ describe("unsupported native media preserves refs across retries and model chang
 						.select()
 						.from(narratorMessages)
 						.where(eq(narratorMessages.id, users[0].id));
-					expect(unchanged[0].contentJson).toEqual(users[0].contentJson);
+					expect(readTestMessageContent<unknown>(sqlite, unchanged[0].id)).toEqual(
+						users[0].contentJson,
+					);
 				});
 			}
 });

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "5230a081-35ae-453b-94d7-31c6df10b32a",
+  "id": "66b96eb7-896d-4401-afea-7e5da606d8f8",
   "prevId": "167e164e-1496-4cfe-824f-6de99e16102b",
   "tables": {
     "acl_events": {
@@ -20321,14 +20321,6 @@
           "autoincrement": false,
           "default": true
         },
-        "compact_auxiliary_content": {
-          "name": "compact_auxiliary_content",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": true
-        },
         "terminal_theme": {
           "name": "terminal_theme",
           "type": "text",
@@ -20391,6 +20383,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'[]'"
+        },
+        "recent_tabs_show_directory": {
+          "name": "recent_tabs_show_directory",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
         },
         "add_subagent_to_recent_tabs": {
           "name": "add_subagent_to_recent_tabs",

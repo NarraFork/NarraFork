@@ -15,6 +15,7 @@
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import type { SubagentDelegation } from "@shared/outline-report-note";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
@@ -474,11 +475,13 @@ export function renderElement(
 					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}
+					onPlanTree={extra.onPlanTree as ((action: PlanTreeAction) => void) | undefined}
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					resolveTargetOpener={extra.resolveTargetOpener as ContentTargetResolver | undefined}
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
+					outlineAskSlot={extra.outlineAskSlot as React.ReactNode}
 					onPermissionFormHeight={
 						extra.onPermissionFormHeight as ((height: number) => void) | undefined
 					}

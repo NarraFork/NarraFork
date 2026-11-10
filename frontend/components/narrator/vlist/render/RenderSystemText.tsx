@@ -17,6 +17,7 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
+import { OutlineStatusChip } from "@frontend/components/outline/OutlineStatusIcon";
 import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import {
 	ActionIcon,
@@ -37,6 +38,7 @@ import type {
 } from "@shared/pretext-layout/task-notice";
 import {
 	IconAlertTriangle,
+	IconArrowRight,
 	IconChevronDown,
 	IconChevronRight,
 	IconClockPause,
@@ -92,6 +94,13 @@ export interface SpecCarryoverActions {
 	onResetSpec?: () => void;
 	/** Which action is in flight (drives the Button loading state). */
 	busy?: "clear" | "reset" | null;
+	/**
+	 * Why the buttons without a handler are off (an outline session's old card, outline P2
+	 * PR 12a), shown on hover or tap. Such a button keeps its place and look (Mantine's disabled
+	 * style through `data-disabled`, so the pointer still reaches it); nothing is measured
+	 * differently.
+	 */
+	readOnlyHint?: string;
 }
 
 /**
@@ -734,6 +743,31 @@ function SpecCarryoverCard({
 				<Group gap={6} wrap="wrap">
 					{buttons.map((label, i) => {
 						const onClick = buttonHandlers[i];
+						const hint = !onClick ? actions?.readOnlyHint : undefined;
+						if (hint)
+							return (
+								<Tooltip
+									// biome-ignore lint/suspicious/noArrayIndexKey: buttons are a stable ordered list
+									key={i}
+									label={hint}
+									events={{ hover: true, focus: true, touch: true }}
+									multiline
+									maw={260}
+								>
+									<Button
+										size="compact-xs"
+										variant={i === 0 ? "subtle" : "light"}
+										color={buttonColors[i] ?? color}
+										leftSection={buttonIcons[i]}
+										data-disabled
+										aria-disabled
+										data-readonly-spec-action=""
+										onClick={(event) => event.preventDefault()}
+									>
+										{label}
+									</Button>
+								</Tooltip>
+							);
 						return (
 							<Button
 								// biome-ignore lint/suspicious/noArrayIndexKey: buttons are a stable ordered list
@@ -861,6 +895,11 @@ function TaskNoticeCard({
 	const answerFirst = !expanded && !narrow && data.summary?.tailFirst === true;
 	const timeLabel = typeof data.timeLabel === "string" && !narrow ? data.timeLabel : "";
 	const Chevron = expanded ? IconChevronDown : IconChevronRight;
+	// The heading is the notice (the view's changes in words): it keeps the folded line, and the
+	// summary (the counts) takes what it leaves.
+	const titleFirst = data.titleFirst === true;
+	// Changed rows carry a mark; the others are indented by as much so the titles stay aligned.
+	const marked = rows.some((row) => row.changed === true);
 	return (
 		<Paper
 			p="xs"
@@ -902,14 +941,16 @@ function TaskNoticeCard({
 				/>
 				<span
 					data-task-notice-title=""
+					title={titleFirst ? data.title : undefined}
 					style={{
 						...noticeText(),
 						...NOWRAP_ELLIPSIS,
-						fontWeight: 600,
+						// A list that was only refreshed asks nothing of the reader: no emphasis.
+						fontWeight: data.quiet === true ? 400 : 600,
 						color: "var(--mantine-color-dimmed)",
 						// Folded, the heading yields its width to the task; unfolded, it has the line.
-						flex: expanded ? "0 1 auto" : "0 8 auto",
-						maxWidth: expanded ? undefined : HEADING_MAX_WIDTH,
+						flex: expanded || titleFirst ? "0 1 auto" : "0 8 auto",
+						maxWidth: expanded || titleFirst ? undefined : HEADING_MAX_WIDTH,
 						// Beside an answer it keeps who answered and how many, and gives the rest up.
 						...(answerFirst ? { minWidth: "min(7em, 30%)" } : {}),
 					}}
@@ -927,9 +968,17 @@ function TaskNoticeCard({
 						alignItems: "center",
 						gap: GROUP_GAP,
 						overflow: "hidden",
+						// Beside a heading that is the notice (the view's changes) the counts are shown
+						// whole or not at all, never cut to a stub: the summary is one line high and
+						// wraps, so counts that do not fit what the heading leaves go to a second line
+						// that is not drawn (`TaskNoticeSummaryLine` puts a zero-width item before
+						// them: a lone item would overflow its line instead of wrapping).
+						...(titleFirst && !expanded
+							? { flexWrap: "wrap", alignContent: "flex-start", height: line }
+							: {}),
 					}}
 				>
-					{expanded ? null : <TaskNoticeSummaryLine data={data} narrow={narrow} />}
+					{expanded ? null : <TaskNoticeSummaryLine data={data} narrow={narrow} line={line} />}
 				</div>
 				{timeLabel ? (
 					<span
@@ -990,7 +1039,7 @@ function TaskNoticeCard({
 				>
 					{rows.map((row, index) => (
 						// biome-ignore lint/suspicious/noArrayIndexKey: rows are a stable ordered list
-						<TaskNoticeRowView key={index} row={row} line={line} />
+						<TaskNoticeRowView key={index} row={row} line={line} marked={marked} />
 					))}
 				</div>
 			) : null}
@@ -1003,8 +1052,39 @@ function TaskNoticeCard({
  * title), a tail. Where it changed from and what changed are the unfolded row's; the heading
  * already names who changed it.
  */
-function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow: boolean }) {
+function TaskNoticeSummaryLine({
+	data,
+	narrow,
+	line,
+}: {
+	data: TaskNoticeData;
+	narrow: boolean;
+	line: number;
+}) {
 	const { lead, row, tail, tailFirst } = data.summary ?? {};
+	// After a heading that keeps the line (the view's changes): the counts, whole or not drawn.
+	if (data.titleFirst === true) {
+		if (!lead) return null;
+		return (
+			<>
+				<span
+					aria-hidden="true"
+					style={{ flexShrink: 0, width: 0, height: line, marginRight: -GROUP_GAP }}
+				/>
+				<span
+					data-task-notice-lead=""
+					style={{
+						...noticeText(),
+						whiteSpace: "nowrap",
+						flex: "0 0 auto",
+						color: "var(--mantine-color-dimmed)",
+					}}
+				>
+					{lead}
+				</span>
+			</>
+		);
+	}
 	const dim = {
 		...noticeText(),
 		...NOWRAP_ELLIPSIS,
@@ -1053,7 +1133,22 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 	);
 }
 
-function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) {
+/** The arrow between a row's two status chips (px): the width the `→` glyph took at xs. */
+const TASK_NOTICE_ARROW = 12;
+
+/** Width of a changed row's mark (and of the indent that aligns the rows without one). */
+const TASK_NOTICE_CHANGE_MARK = 3;
+
+function TaskNoticeRowView({
+	row,
+	line,
+	marked = false,
+}: {
+	row: TaskNoticeRow;
+	line: number;
+	/** The card has changed rows: every row keeps the mark's width, so the titles stay aligned. */
+	marked?: boolean;
+}) {
 	if (row.dim) {
 		return (
 			<div
@@ -1074,6 +1169,7 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 	return (
 		<div
 			data-task-notice-row=""
+			data-task-notice-changed={row.changed ? "" : undefined}
 			style={{
 				display: "flex",
 				alignItems: "center",
@@ -1085,32 +1181,79 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 				...(row.indent ? { paddingLeft: TASK_NOTICE_INDENT } : {}),
 			}}
 		>
+			{marked ? (
+				<span
+					aria-hidden="true"
+					data-task-notice-mark=""
+					style={{
+						flexShrink: 0,
+						width: TASK_NOTICE_CHANGE_MARK,
+						height: Math.round(line * 0.6),
+						borderRadius: TASK_NOTICE_CHANGE_MARK,
+						backgroundColor: row.changed ? "var(--mantine-color-blue-filled)" : "transparent",
+					}}
+				/>
+			) : null}
+			{row.lead ? (
+				<span
+					data-task-notice-by=""
+					title={row.lead}
+					style={{
+						...noticeText(),
+						...NOWRAP_ELLIPSIS,
+						// Whole up to a third of the row: a short name never gives way to the title.
+						flex: "0 0 auto",
+						maxWidth: "33%",
+						color: "var(--mantine-color-dimmed)",
+					}}
+				>
+					{row.lead}
+				</span>
+			) : null}
 			{row.statusFrom && row.status ? (
 				<>
 					<StatusChip chip={row.statusFrom} />
-					<span style={{ ...noticeText(), color: "var(--mantine-color-dimmed)", flexShrink: 0 }}>
-						→
-					</span>
+					{/* An icon, never a text glyph (a status mark is not prose). Its box is fixed, so it
+					    takes the same room at any typography; a row's height is its line either way. */}
+					<IconArrowRight
+						size={TASK_NOTICE_ARROW}
+						stroke={1.6}
+						aria-hidden="true"
+						data-task-notice-arrow=""
+						style={{ flexShrink: 0, color: "var(--mantine-color-dimmed)" }}
+					/>
 				</>
 			) : null}
 			{row.status ? <StatusChip chip={row.status} /> : null}
 			<TaskNoticeTitle row={row} />
-			{(row.marks ?? []).map((mark) => (
-				<Badge
-					key={mark}
-					size="xs"
-					// Outlined: a light gray chip has the card's own background and vanishes.
-					variant="outline"
-					color="gray"
-					tt="none"
-					title={mark}
-					// Whole while the row has room; on a narrow row it gives way after the title has
-					// (truncated, in full on hover) rather than being cut at the row's edge.
-					style={{ flex: "0 1 auto", minWidth: "3em" }}
-				>
-					{mark}
-				</Badge>
-			))}
+			{(row.marks ?? []).map((mark, index) => {
+				// Whole while the row has room; on a narrow row it gives way after the title has
+				// (truncated, in full on hover) rather than being cut at the row's edge.
+				const style = { flex: "0 1 auto", minWidth: "3em" } as const;
+				const status = row.markStatus?.[index];
+				// A mark that says a task state (a lock): the outline's chip for it, with its icon.
+				if (status) {
+					return (
+						<OutlineStatusChip key={mark} status={status} title={mark} style={style}>
+							{mark}
+						</OutlineStatusChip>
+					);
+				}
+				return (
+					<Badge
+						key={mark}
+						size="xs"
+						// Outlined: a light gray chip has the card's own background and vanishes.
+						variant="outline"
+						color="gray"
+						tt="none"
+						title={mark}
+						style={style}
+					>
+						{mark}
+					</Badge>
+				);
+			})}
 			{row.note ? (
 				<span
 					data-task-notice-note=""
@@ -1131,6 +1274,14 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 }
 
 function StatusChip({ chip }: { chip: TaskNoticeChip }) {
+	// A task's state: the outline's chip for it (the state's icon, then the words).
+	if (chip.status) {
+		return (
+			<OutlineStatusChip status={chip.status} data-task-notice-status="" style={{ flexShrink: 0 }}>
+				{chip.label}
+			</OutlineStatusChip>
+		);
+	}
 	return (
 		<Badge
 			size="xs"

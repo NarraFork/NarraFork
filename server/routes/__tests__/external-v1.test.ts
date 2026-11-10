@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CanonicalCapabilityId } from "@shared/integrations/capabilities";
+import { clearedToolOutput } from "@shared/storage-retention";
 
 /**
  * Frozen phase-two contract tests for the OAuth-only External v1 resource API.
@@ -2079,6 +2080,73 @@ describe("External v1 layered message detail", () => {
 		expect(bash?.input).toEqual({ command: "systemctl status robot" });
 		expect(bash?.output).toEqual({ stdout: "layered-output-secret" });
 		expect(assistant?.reasoning.steps?.[0]?.body).toBe("The drive reported a fault.");
+	});
+
+	test("cleared tool inputs stay internal in summary and full messages", async () => {
+		const fixture = await seedLayeredNarrator("cleared-replay-input", {
+			policy: { ...DEFAULT_POLICY, messageDetail: "full" },
+		});
+		const secret = "external-retained-replay-secret";
+		const marker = clearedToolOutput(new Date().toISOString());
+		for (const toolName of ["Write", "Edit", "StructSed", "GenUI"]) {
+			await db.insert(narratorToolCalls).values({
+				id: generateId(),
+				narratorId: fixture.narratorId,
+				messageId: fixture.assistantMessageId,
+				toolUseId: `cleared-${toolName}`,
+				toolName,
+				inputJson: { file_path: `/private/${secret}`, content: secret },
+				outputJson: marker,
+				status: "success",
+				createdAt: new Date().toISOString(),
+			});
+		}
+		for (const detail of ["summary", "full"]) {
+			const { status, body } = await fetchPage(
+				fixture.token,
+				fixture.narratorId,
+				`detail=${detail}&limit=5`,
+			);
+			expect(status).toBe(200);
+			expect(JSON.stringify(body)).not.toContain(secret);
+			const assistant = body.items.find((item) => item.id === fixture.assistantMessageId);
+			for (const toolName of ["Write", "Edit", "StructSed", "GenUI"]) {
+				const tool = assistant?.tools.items?.find(
+					(item) => item.toolUseId === `cleared-${toolName}`,
+				);
+				expect(tool).toMatchObject({
+					name: toolName,
+					status: "success",
+					target: null,
+					inputBytes: null,
+				});
+				if (detail === "full") {
+					expect(tool?.input).toBeNull();
+					expect(tool?.output).toEqual(marker);
+				}
+			}
+			const live = assistant?.tools.items?.find((item) => item.toolUseId === "layered-bash");
+			expect(live?.target).toBe("systemctl status robot");
+			if (detail === "full") expect(live?.output).toEqual({ stdout: "layered-output-secret" });
+		}
+		const detail = await app.request(
+			`/api/external/v1/narrators/${fixture.narratorId}/tool-calls/cleared-Write`,
+			{ headers: bearer(fixture.token) },
+		);
+		expect(detail.status).toBe(200);
+		const detailBody = await detail.json();
+		expect(JSON.stringify(detailBody)).not.toContain(secret);
+		expect(detailBody).toMatchObject({ input: null, inputBytes: null, output: marker });
+		const stored = await db
+			.select({ inputJson: narratorToolCalls.inputJson })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, fixture.narratorId),
+					eq(narratorToolCalls.toolUseId, "cleared-Write"),
+				),
+			);
+		expect(JSON.stringify(stored)).toContain(secret);
 	});
 
 	test("truncates an oversized payload leaf instead of dropping or inlining it whole", async () => {

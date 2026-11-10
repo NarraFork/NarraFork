@@ -4,6 +4,7 @@
 import type {
 	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
+	OutlineQuestionGroupResponse,
 	OutlineSpaceSummary,
 	OutlineViewMode,
 } from "@shared/outline-api";
@@ -16,6 +17,7 @@ import {
 	type QueryClient,
 	useInfiniteQuery,
 	useMutation,
+	useQueries,
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
@@ -295,15 +297,49 @@ export function invalidateOutlineSpace(queryClient: QueryClient, spaceId: string
 	void queryClient.invalidateQueries({ queryKey: ["outline", "questions"] });
 }
 
-/** The questions under a block, with who may answer which (the inbox, the side panel). */
-export function useOutlineQuestions(blockId: string | null, enabled = true) {
-	return useQuery({
-		queryKey: outlineKeys.questions(blockId ?? ""),
-		queryFn: () => api.getOutlineQuestions(blockId as string),
-		enabled: enabled && !!blockId,
-		retry: false,
+/** A question root, or all questions under a task. */
+function outlineQuestionsQuery(blockId: string) {
+	return {
+		queryKey: outlineKeys.questions(blockId),
+		queryFn: () => api.getOutlineQuestions(blockId),
+		retry: false as const,
 		staleTime: 5_000,
-	});
+	};
+}
+
+export function useOutlineQuestions(blockId: string | null, enabled = true) {
+	return useQuery({ ...outlineQuestionsQuery(blockId ?? ""), enabled: enabled && !!blockId });
+}
+
+/** An Ask card reads its own roots, never an older task's entire question history. */
+export function useOutlineQuestionGroups(blockIds: readonly string[]) {
+	return useQueries({ queries: [...new Set(blockIds)].map(outlineQuestionsQuery) });
+}
+
+/** Share the existing page subscriptions with the editor; no polling or second socket. */
+export function useOutlineQuestionsLive(groups: readonly OutlineQuestionGroupResponse[]) {
+	const client = useQueryClient();
+	const pages = JSON.stringify([
+		...new Map(groups.map(({ group }) => [group.pageId, [group.pageId, group.spaceId]])).values(),
+	]);
+	useEffect(() => {
+		const unsubscribe = (JSON.parse(pages) as [string, string][]).map(([pageId, spaceId]) => {
+			let seen = -1;
+			return pageSubscriptions().subscribe(pageId, (hint) => {
+				if (
+					hint.kind === "denied" ||
+					((hint.kind === "subscribed" || hint.kind === "changed") && hint.seq > seen)
+				) {
+					if (hint.kind !== "denied") seen = hint.seq;
+					invalidateOutlineSpace(client, spaceId);
+					void client.invalidateQueries({ queryKey: ["human-attention"] });
+				}
+			});
+		});
+		return () => {
+			for (const dispose of unsubscribe) dispose();
+		};
+	}, [client, pages]);
 }
 
 /** Answer questions of one space at once; questions, views and the inbox re-read after. */

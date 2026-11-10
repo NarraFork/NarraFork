@@ -48,15 +48,10 @@ import {
 } from "@shared/outline-task-board";
 import {
 	IconArrowBackUp,
-	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
-	IconCircle,
-	IconCircleDot,
-	IconCircleX,
 	IconDots,
 	IconExternalLink,
-	IconHourglass,
 	IconLock,
 	IconPlayerPlay,
 	IconUser,
@@ -77,6 +72,7 @@ import { observePageLifecycle } from "../../../lib/page-lifecycle";
 import { ensureTypographyCssVars, TYPE_ROLE_STYLE } from "../../../lib/typography-css-vars";
 import { useEditorPanelVisible } from "../../narrator/narrator-panel-visibility";
 import { DiffEntry } from "../OutlinePendingPanel";
+import { OutlineStatusChip, OutlineStatusIcon } from "../OutlineStatusIcon";
 
 // Task text paints with the reader's typography variables (TYPE_ROLE_STYLE).
 ensureTypographyCssVars();
@@ -160,12 +156,13 @@ function executorLabel(
 	}
 }
 
+/** A status group's badge: the same one a task's checkbox is drawn as everywhere else. */
 const STATUS_ICON: Record<StatusGroup, ReactNode> = {
-	doing: <IconCircleDot size={14} color="var(--mantine-color-indigo-5)" />,
-	waiting: <IconHourglass size={14} color="var(--mantine-color-orange-5)" />,
-	todo: <IconCircle size={14} color="var(--mantine-color-gray-5)" />,
-	done: <IconCheck size={14} color="var(--mantine-color-green-5)" />,
-	cancelled: <IconCircleX size={14} color="var(--mantine-color-gray-6)" />,
+	doing: <OutlineStatusIcon status="doing" />,
+	waiting: <OutlineStatusIcon status="waiting" />,
+	todo: <OutlineStatusIcon status="todo" />,
+	done: <OutlineStatusIcon status="done" />,
+	cancelled: <OutlineStatusIcon status="cancelled" />,
 };
 
 /** A 「新完成」 mark: the task at the version it was shown finished. */
@@ -326,9 +323,9 @@ function NewlyDoneBadge({
 	}, [task, visible, onSeen]);
 	return (
 		<Tooltip label={t("board.newlyDoneHint")} withinPortal openDelay={300} multiline maw={260}>
-			<Badge ref={ref} size="xs" variant="light" color="green" data-testid="task-badge-newly-done">
+			<OutlineStatusChip ref={ref} status="newly_done" data-testid="task-badge-newly-done">
 				{t("board.newlyDone")}
-			</Badge>
+			</OutlineStatusChip>
 		</Tooltip>
 	);
 }
@@ -657,32 +654,24 @@ function TaskRow({
 							</Badge>
 						)}
 						{task.lock && (
-							<Badge
-								size="xs"
-								variant="light"
-								color="grape"
-								leftSection={<IconLock size={10} />}
-								data-testid="task-badge-locked"
-							>
+							<OutlineStatusChip status="locked" data-testid="task-badge-locked">
 								{task.lock.by.name
 									? t("board.locked", { name: task.lock.by.name })
 									: t("board.lockedSomeone")}
-							</Badge>
+							</OutlineStatusChip>
 						)}
 						{task.waiting && task.waiting.prerequisites > 0 && (
-							<Badge size="xs" variant="light" color="orange">
+							<OutlineStatusChip status="waiting">
 								{t("board.waitPrerequisites", { count: task.waiting.prerequisites })}
-							</Badge>
+							</OutlineStatusChip>
 						)}
 						{task.waiting?.people && (
-							<Badge size="xs" variant="light" color="orange">
-								{t("board.waitPeople")}
-							</Badge>
+							<OutlineStatusChip status="waiting">{t("board.waitPeople")}</OutlineStatusChip>
 						)}
 						{task.waiting?.confirmation && (
-							<Badge size="xs" variant="light" color="orange" data-testid="task-badge-confirmation">
+							<OutlineStatusChip status="waiting" data-testid="task-badge-confirmation">
 								{t("board.waitConfirmation")}
-							</Badge>
+							</OutlineStatusChip>
 						)}
 						{task.assignee && (
 							<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
@@ -725,7 +714,7 @@ function TaskRow({
 										<>
 											{ending && (
 												<Menu.Item
-													leftSection={<IconCheck size={14} />}
+													leftSection={<OutlineStatusIcon status="done" />}
 													onClick={() => change({ status: "done" })}
 													data-testid="task-action-done"
 												>
@@ -743,7 +732,7 @@ function TaskRow({
 											)}
 											{ending && (
 												<Menu.Item
-													leftSection={<IconCircleX size={14} />}
+													leftSection={<OutlineStatusIcon status="cancelled" />}
 													onClick={() => change({ status: "cancelled" })}
 													data-testid="task-action-cancel"
 												>

@@ -121,6 +121,7 @@
 	},
 	"scripts": {
 		"approve": "bun server/scripts/approve-all.ts",
+		"sql:report": "bun scripts/sql-trace-report.ts",
 		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts",
 		"build:cross": "bun scripts/build-cross-platform.ts",
 		"build:update-server": "bun scripts/build-update-server.ts",
@@ -149,7 +150,7 @@
 		"format": "bunx @biomejs/biome check --write .",
 		"i18n:check": "bun server/scripts/check-i18n.ts",
 		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",
-		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts --mode production",
+		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production NF_SQL_TRACE=${NF_SQL_TRACE:-summary} bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts --mode production",
 		"test": "bun test --isolate",
 		"test:fast": "bun test",
 		"smoke:dock": "bun scripts/smoke-narrator-dock.ts",

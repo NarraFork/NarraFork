@@ -237,6 +237,61 @@ export async function readNarratorTitle(id: string): Promise<string | null> {
 	return rows[0] ? textOrNull(rows[0], "title") : null;
 }
 
+/**
+ * What a session's team activity starts from (outline P2 PR 10b): when the session was made, its
+ * handle (an `@agent:<handle>` assignee names it), and when its latest finished run ended (the
+ * run index `idx_turns_narrator_started`, newest first; a running one is skipped). Null when the
+ * narrator does not exist.
+ */
+export async function readTeamActivityFacts(
+	narratorId: string,
+): Promise<{ createdAt: string; handle: string | null; lastRunEndedAt: string | null } | null> {
+	const rows = await all(sql`
+		select created_at, handle from narrators where id = ${narratorId} limit 1
+	`);
+	const row = rows[0];
+	if (!row) return null;
+	const runs = await all(sql`
+		select ended_at from narrator_turns
+		where narrator_id = ${narratorId} and ended_at is not null
+		order by started_at desc limit 1
+	`);
+	return {
+		createdAt: text(row, "created_at"),
+		handle: textOrNull(row, "handle"),
+		lastRunEndedAt: runs[0] ? textOrNull(runs[0], "ended_at") : null,
+	};
+}
+
+/**
+ * Running state of narrators for the live editor's agent presence (outline P2 PR 10b): status,
+ * title, type and session root, by primary key, chunked. Missing narrators are left out.
+ */
+export async function readNarratorPresence(
+	ids: readonly string[],
+): Promise<
+	Map<string, { status: string; title: string | null; subagent: boolean; root: string | null }>
+> {
+	const out = new Map<
+		string,
+		{ status: string; title: string | null; subagent: boolean; root: string | null }
+	>();
+	for (const chunk of chunked([...new Set(ids)])) {
+		const rows = await all(sql`
+			select id, status, title, type, acl_root_narrator_id from narrators
+			where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows)
+			out.set(text(row, "id"), {
+				status: text(row, "status"),
+				title: textOrNull(row, "title"),
+				subagent: textOrNull(row, "type") === "subagent",
+				root: textOrNull(row, "acl_root_narrator_id"),
+			});
+	}
+	return out;
+}
+
 export async function readUserExists(id: string): Promise<boolean> {
 	const rows = await all(sql`select id from users where id = ${id} limit 1`);
 	return rows.length > 0;

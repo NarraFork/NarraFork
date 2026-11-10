@@ -151,7 +151,7 @@
 		"sessionUnavailable": "你无法打开写入它的会话。"
 	},
 	"editor": {
-		"questionMark": "问人的提问：在收件箱里回答。删除它就是撤回提问。",
+		"questionMark": "打开提问即可回答；删除即撤回。",
 		"questionsWithdrawn_one": "删除撤回了一条问人的提问；撤销即可重新提问。",
 		"questionsWithdrawn_other": "删除撤回了 {{count}} 条问人的提问；撤销即可重新提问。",
 		"changeStatus": "切换状态",
@@ -159,6 +159,10 @@
 		"rootKept": "正在聚焦的块不能在这里删除；退到上一层再删。",
 		"peerEditing": "{{name}} 正在编辑",
 		"peerViewing": "{{name}} 正在查看",
+		"agentWorking": "会话「{{name}}」正在处理",
+		"agentWorkingIn": "会话「{{session}}」的「{{name}}」正在处理",
+		"agentHidden": "一个 agent 正在处理",
+		"untitledSession": "未命名会话",
 		"someone": "有人",
 		"readOnly": "只读",
 		"connecting": "正在连接…",
@@ -246,14 +250,30 @@
 	"workspace": {
 		"addTitle": "添加大纲页"
 	},
+	"crumbs": {
+		"label": "这一页的位置",
+		"more_one": "还有 {{count}} 层",
+		"more_other": "还有 {{count}} 层"
+	},
+	"reportLine": {
+		"title": "子代理报告",
+		"lateEnded": "迟到的子代理报告（派出后任务已被结束）",
+		"lateReopened": "迟到的子代理报告（派出后任务已退回待办）",
+		"lateTakenOver": "迟到的子代理报告（派出后任务已转手）",
+		"from": "来自 {{name}}",
+		"timedOut": "未完成：超时",
+		"failed": "未完成：出错",
+		"interrupted": "未完成：被中断",
+		"empty": "没有输出"
+	},
 	"lock": {
 		"badge": "已锁定 · {{name}}",
 		"someone": "某人",
 		"section": "锁定",
 		"lockedBy": "{{name}} 锁定",
 		"delegate": "{{name}} 可以代锁定人确认",
-		"explainLocked": "agent 对这个计划的改动（步骤、目标和验收）要等确认才生效。人照常编辑。",
-		"explainUnlocked": "锁定这个计划：之后 agent 改它的步骤、目标和验收，都要等你确认。",
+		"explainLocked": "agent 对这个计划的改动（背景、步骤和它们的细节）要等确认才生效。人照常编辑。",
+		"explainUnlocked": "锁定这个计划：之后 agent 改它的背景、步骤和细节，都要等你确认。",
 		"delegateLabel": "代你确认的会话（可选）",
 		"delegatePlaceholder": "不指定：由你确认",
 		"lock": "锁定",
@@ -323,10 +343,9 @@
 		"answeredRelayedVia": "{{name}} 在对话里回答（经 {{via}}）：{{choice}}",
 		"withdrawn": "已撤回",
 		"waitingFor": "等 {{name}} 回答",
-		"notePlaceholder": "补充说明，或用自己的话回答",
+		"notePlaceholder": "或直接写下你的回答",
 		"answerPlaceholder": "你的回答",
-		"adoptAll": "全部采纳建议（{{count}}）",
-		"submit": "回答",
+		"submit": "提交回答",
 		"nothingToSend": "先选一个选项或写下回答",
 		"answered": "已回答 {{count}} 条提问，已通知 agent",
 		"answerFailed": "回答没有保存",

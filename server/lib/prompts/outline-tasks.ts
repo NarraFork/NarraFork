@@ -532,6 +532,18 @@ function changeText(change: OutlineTaskEditChange, locale: Locale): string {
 				? `退回了你把它标为${editStatusWord(change.status, locale)}的改动${reason}。它仍未完成，接着做`
 				: `rejected your marking it ${editStatusWord(change.status, locale)}${reason}. It is still open; carry on with it`;
 		}
+		// Team activity's changes (P2 PR 10b): its own text words them (`prompts/outline-team.ts`);
+		// people's edits never carry them, so these words are only a fallback.
+		case "notes":
+			return zh ? `加了 ${change.n} 条笔记` : `${change.n} notes added`;
+		case "reports":
+			return zh ? `挂回了 ${change.n} 份报告` : `${change.n} reports attached`;
+		case "answers":
+			return zh ? `回答了 ${change.n} 个提问` : `${change.n} questions answered`;
+		case "claimable":
+			return zh ? "放进了可领取池" : "put in the claim pool";
+		case "overlap":
+			return zh ? `也在改 ${change.path}` : `also changing ${change.path}`;
 	}
 }
 

@@ -31,6 +31,7 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import { type PlanTreeView, planTreeViewSignature } from "@shared/outline-plan-tree";
 import type { MeasuredElement } from "./prepared-block";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,6 +61,11 @@ export function retainedBodySourceChars(value: unknown): number {
 	chars += typeof preview?.sourceText === "string" ? preview.sourceText.length : 0;
 	for (const key of ["displayText", "sourceText"] as const)
 		chars += typeof item[key] === "string" ? item[key].length : 0;
+	// An outline plan's tree retains its plan's markdown (the viewer's, the tree parsed from it).
+	if (model?.kind === "plan-tree") {
+		const markdown = model.markdown as { text?: unknown } | undefined;
+		chars += typeof markdown?.text === "string" ? markdown.text.length : 0;
+	}
 	if (model?.kind === "capped") {
 		chars += typeof model.text === "string" ? model.text.length : 0;
 		const doc = model.diffDocument as
@@ -1003,6 +1009,19 @@ function leafTextRevision(d: Record<string, unknown>): string {
 				}`;
 			})
 			.join(";")}`;
+	}
+	// An outline plan's tree (plan readability): its rows follow the plan's text (the markdown
+	// it was parsed from), the reader's view of it (which nodes, subtrees and texts are open) and
+	// the preview labels. O(1) in the plan: the text is sampled, the view is what the reader
+	// clicked.
+	if (d.kind === "plan-tree") {
+		const markdown = d.markdown as { text?: unknown } | undefined;
+		rev += `|ptx:${textSignature(String(markdown?.text ?? ""))}`;
+		const view = d.view as PlanTreeView | undefined;
+		if (view) rev += `|ptv:${planTreeViewSignature(view)}`;
+		// The preview's labels share its line: a different language lays it out again.
+		const labels = d.labels as { more?: unknown; one?: unknown } | undefined;
+		if (labels) rev += `|ptl:${String(labels.more)}|${String(labels.one)}`;
 	}
 	// A change list (outline cards): one fixed line per row, so the row count above sets the
 	// height, but the rows' words, links and chips are painted from the cached payload and can

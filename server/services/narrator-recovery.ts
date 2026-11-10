@@ -147,6 +147,13 @@ export async function handleContextOverflow(opts: {
 }): Promise<OverflowResult> {
 	const { narratorId, locale, provider, signal, onBroadcast } = opts;
 	let { overflowRetries } = opts;
+	// Cancellation is not a new recovery attempt, nor permission to reuse a compact.
+	const interrupted = (): OverflowResult => ({
+		action: "failed",
+		overflowRetries,
+		reason: "compact_failed",
+	});
+	if (signal?.aborted) return interrupted();
 
 	logger.warn("Context length exceeded, attempting emergency recovery", {
 		narratorId,
@@ -164,6 +171,7 @@ export async function handleContextOverflow(opts: {
 	// compact to ride on do we fall through to Phase B and spend a retry.
 	const baselineCompactSeq = opts.baselineCompactSeq ?? -1;
 	const latestCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
+	if (signal?.aborted) return interrupted();
 	if (latestCompactSeq != null && latestCompactSeq > baselineCompactSeq) {
 		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 		logger.info("A completed compact already supersedes the failed request, retrying", {
@@ -194,6 +202,7 @@ export async function handleContextOverflow(opts: {
 			});
 			existingCompact.mode = "blocking";
 		}
+		if (signal?.aborted) return interrupted();
 		try {
 			// awaitCompactCompletion drains probe→history lock hand-offs and honors
 			// the interrupt signal. That signal matters more than it looks: the
@@ -202,7 +211,9 @@ export async function handleContextOverflow(opts: {
 			// its 30-minute ceiling. Passing the signal is what keeps a user/parent
 			// abort from waiting that long.
 			await awaitCompactCompletion(narratorId, signal);
+			if (signal?.aborted) return interrupted();
 			const seqAfterInflight = await narratorService.getLatestCompactSeq(narratorId);
+			if (signal?.aborted) return interrupted();
 			if (
 				hasPendingHistoryCompact(narratorId) ||
 				(seqAfterInflight != null && seqAfterInflight > baselineCompactSeq)
@@ -250,6 +261,7 @@ export async function handleContextOverflow(opts: {
 		return { action: "retry_compacted", overflowRetries };
 	}
 	const latestCompactSeqAfterWait = await narratorService.getLatestCompactSeq(narratorId);
+	if (signal?.aborted) return interrupted();
 	if (latestCompactSeqAfterWait != null && latestCompactSeqAfterWait > baselineCompactSeq) {
 		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 		logger.info("A compact completed while overflow recovery was running, retrying", {
@@ -275,6 +287,7 @@ export async function handleContextOverflow(opts: {
 		narratorId,
 		getAutoCompactKeepPairs(),
 	);
+	if (signal?.aborted) return interrupted();
 
 	// If the normal boundary is unavailable because there are too few messages to
 	// satisfy the configured keepPairs (e.g. a single oversized message blew the
@@ -283,6 +296,7 @@ export async function handleContextOverflow(opts: {
 	let usedEmergencyBoundary = false;
 	if (!boundaryMessageId) {
 		boundaryMessageId = await narratorService.getEmergencyCompactBoundaryMessage(narratorId);
+		if (signal?.aborted) return interrupted();
 		usedEmergencyBoundary = boundaryMessageId != null;
 		if (usedEmergencyBoundary) {
 			logger.warn("Falling back to emergency compact boundary (ignoring keepPairs)", {
@@ -311,6 +325,7 @@ export async function handleContextOverflow(opts: {
 				? { contextPercentBefore: opts.contextPercentBefore }
 				: {}),
 		});
+		if (signal?.aborted) return interrupted();
 		if (compacted) {
 			onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 			logger.info("Emergency compact succeeded, retrying", {

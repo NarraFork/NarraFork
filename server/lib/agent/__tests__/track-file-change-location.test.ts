@@ -18,7 +18,7 @@ describe("trackFileChange team location forwarding", () => {
 				select() { return this; }, from() { return this; }, where() { return this; },
 				get() { return { type: "subagent", variant: "subagent:general", parentId: "parent" }; },
 			};
-			mock.module("@server/db", () => ({ db: membership, activeDatabaseBackend: "sqlite" }));
+			mock.module("@server/db", () => ({ db: membership, sqlite: membership.$client, activeDatabaseBackend: "sqlite" }));
 			mock.module("@server/websocket/narrator-ws", () => ({ broadcastToNarrator() {} }));
 			mock.module("@server/lib/event-bus", () => ({ eventBus: { emit() {} } }));
 			mock.module("@server/lib/logger", () => ({ logger: { debug() {}, warn() {}, info() {} } }));

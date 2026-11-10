@@ -623,6 +623,148 @@ describe("unified invalidState classification", () => {
 	});
 });
 
+describe("context overflow evidence and precedence", () => {
+	test.each([
+		"context_length_exceeded",
+		"CONTEXT_LENGTH_EXCEEDED",
+		"model_context_window_exceeded",
+	])("uses diagnostics.code=%s with an opaque generic reason in both entry points", (code) => {
+		const diagnostics = {
+			schema: "narrafork.error-diagnostics.v1" as const,
+			reason: "api_error",
+			code,
+			message: "opaque upstream failure",
+			statusCode: 400,
+		};
+		expect(classifyInvalidState("api_error", diagnostics.message, diagnostics)).toMatchObject({
+			category: "context_overflow",
+			retryable: false,
+			resumable: false,
+		});
+		const err = new ProviderInvalidStateError("api_error", diagnostics.message, { diagnostics });
+		expect(err.classification).toBe("context_overflow");
+		expect(err.message).toBe(diagnostics.message);
+		expect(err.diagnostics).toBe(diagnostics);
+		expect(isContextWindowExceededError(err)).toBe(true);
+	});
+
+	test("matches only the confirmed Chinese prompt-overflow wording", () => {
+		const message = "请求提示词超出模型上限";
+		expect(classifyInvalidState("api_error", message).category).toBe("context_overflow");
+		expect(isContextWindowExceededError(new Error(message))).toBe(true);
+		for (const text of ["内容过长", "token limit", "token quota exceeded", "invalid max_tokens"]) {
+			expect(classifyInvalidState("api_error", text).category).not.toBe("context_overflow");
+			expect(isContextWindowExceededError(new Error(text))).toBe(false);
+		}
+	});
+
+	test.each([
+		"max_tokens",
+		"max_output_tokens",
+		"length",
+	])("an explicit %s anywhere outranks context code/text regardless of candidate order", (reason) => {
+		const message = "The input exceeds the context window";
+		for (const [outer, inner] of [
+			[reason, "CONTEXT_LENGTH_EXCEEDED"],
+			["CONTEXT_LENGTH_EXCEEDED", reason],
+		]) {
+			expect(classifyInvalidState(outer, message, { code: inner }).category).toBe(
+				"completion_limit",
+			);
+			expect(
+				isContextWindowExceededError({ code: outer, message, diagnostics: { code: inner } }),
+			).toBe(false);
+			expect(isContextWindowExceededError({ code: outer, message, error: { type: inner } })).toBe(
+				false,
+			);
+			expect(
+				isContextWindowExceededError(
+					new Error(message, { cause: { code: outer, error: { reason: inner } } }),
+				),
+			).toBe(false);
+		}
+	});
+
+	test.each([
+		"cyber_policy",
+		"refusal",
+		"content_filter",
+		"insufficient_quota",
+		"aborted",
+	])("terminal %s does not turn into compaction because of conflicting context evidence", (reason) => {
+		expect(
+			classifyInvalidState(reason, "context window exceeded", { code: "context_length_exceeded" })
+				.category,
+		).not.toBe("context_overflow");
+		expect(
+			isContextWindowExceededError({
+				reason,
+				message: "context window exceeded",
+				diagnostics: { code: "context_length_exceeded" },
+			}),
+		).toBe(false);
+	});
+
+	test("does not infer overflow from an empty 400/413 or arbitrary request fields", () => {
+		for (const status of [400, 413]) {
+			expect(isContextWindowExceededError({ status, message: "" })).toBe(false);
+			expect(classifyInvalidState("api_error", "", { statusCode: status }).category).toBe(
+				"non_retryable",
+			);
+		}
+		const err = {
+			message: "bad request",
+			request: { code: "context_length_exceeded" },
+			toJSON() {
+				throw new Error("must not serialize");
+			},
+		};
+		expect(isContextWindowExceededError(err)).toBe(false);
+	});
+
+	test("reads fixed nested error/cause fields with cycle, depth and node bounds", () => {
+		for (const err of [
+			{ type: "context_length_exceeded" },
+			{ error: { reason: "prompt_too_long" } },
+			new Error("wrapped", { cause: { error: { code: "context_length_exceeded" } } }),
+			"prompt is too long",
+		])
+			expect(isContextWindowExceededError(err)).toBe(true);
+		const cycle: Record<string, unknown> = { message: "unrelated" };
+		cycle.cause = cycle;
+		cycle.error = cycle;
+		expect(isContextWindowExceededError(cycle)).toBe(false);
+		cycle.diagnostics = { code: "context_length_exceeded" };
+		expect(isContextWindowExceededError(cycle)).toBe(true);
+		let deep: unknown = { code: "context_length_exceeded" };
+		for (let i = 0; i < 100; i++) deep = { cause: deep };
+		expect(isContextWindowExceededError(deep)).toBe(false);
+		const huge = {
+			message: "opaque",
+			get request() {
+				throw new Error("must not traverse request");
+			},
+		};
+		expect(isContextWindowExceededError(huge)).toBe(false);
+		expect(
+			isContextWindowExceededError({ message: `${"x".repeat(20_000)}context window exceeded` }),
+		).toBe(false);
+		let visited = 0;
+		const branch = (depth: number): object => ({
+			get reason() {
+				visited++;
+				return "api_error";
+			},
+			...(depth > 0
+				? { diagnostics: branch(depth - 1), error: branch(depth - 1), cause: branch(depth - 1) }
+				: {}),
+		});
+		expect(isContextWindowExceededError(branch(5))).toBe(false);
+		expect(visited).toBeLessThanOrEqual(16);
+		expect(visited).toBeGreaterThan(0);
+	});
+});
+
 describe("plugin provider retryable classification", () => {
 	test("explicit retryable=true wins over unknown reason/message patterns", () => {
 		// Plugin classified its own error retryable but the reason/message match no known

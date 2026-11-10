@@ -22,12 +22,15 @@
  */
 
 import type { CSSProperties } from "react";
+import { OutlineStatusIcon } from "../../../outline/OutlineStatusIcon";
 
 /**
  * Added / removed line totals for one file-tool call.
  *
  * An outline edit (`OutlineEdit`) reports blocks instead of lines, and two figures of its own:
- * tasks it ticked done (`✓1`) and its commit (`#6`), so the header reads `✓1 +3 #6`.
+ * tasks it ticked done (the "done" badge and a count) and its commit (`#6`), so the header reads
+ * `[done] 1 +3 #6`. The badge is the outline's own (`OutlineStatusIcon`): a task's state is an
+ * icon on its background everywhere, never a character.
  */
 export interface DiffStatsValue {
 	added: number;
@@ -57,6 +60,13 @@ const CONTAINER_STYLE: CSSProperties = {
 };
 
 const ADDED_STYLE: CSSProperties = { color: "var(--mantine-color-green-5)" };
+/** The done badge and its count on one line, the badge centred on the digits. */
+const DONE_STYLE: CSSProperties = {
+	color: "var(--mantine-color-green-5)",
+	display: "inline-flex",
+	alignItems: "center",
+	gap: 2,
+};
 const COMMIT_STYLE: CSSProperties = { color: "var(--mantine-color-dimmed)" };
 const REMOVED_STYLE: CSSProperties = { color: "var(--mantine-color-red-5)" };
 
@@ -82,6 +92,15 @@ export function hasVisibleDiffStats(
  * `+240 -0` — the trailing zero adds a token the reader has to parse to learn
  * nothing. Both zero → nothing at all (see the module header).
  */
+/**
+ * Words of the figure's accessible name, in the reader's language. Set once by the shell
+ * (`useVListLabels`): this module is hook-free, like the rest of the transcript's renderers.
+ */
+export const diffStatsLabels = {
+	/** "Tasks ticked done" (the badge is what is drawn): the task status's own name. */
+	done: "Done",
+};
+
 export function DiffStatsText({ stats }: { stats: DiffStatsValue | null | undefined }) {
 	if (!hasVisibleDiffStats(stats)) return null;
 	return (
@@ -98,7 +117,7 @@ export function DiffStatsText({ stats }: { stats: DiffStatsValue | null | undefi
 			// figure that visually reads `+240` describes a number the sighted reader is
 			// not shown, which is the kind of divergence that makes a label untrustworthy.
 			aria-label={[
-				(stats.done ?? 0) > 0 ? `✓${stats.done}` : null,
+				(stats.done ?? 0) > 0 ? `${diffStatsLabels.done} ${stats.done}` : null,
 				stats.added > 0 ? `+${stats.added}` : null,
 				stats.removed > 0 ? `-${stats.removed}` : null,
 				stats.commit !== undefined ? `#${stats.commit}` : null,
@@ -107,8 +126,9 @@ export function DiffStatsText({ stats }: { stats: DiffStatsValue | null | undefi
 				.join(" ")}
 		>
 			{(stats.done ?? 0) > 0 ? (
-				<span data-nf-diff-done style={ADDED_STYLE}>
-					✓{stats.done}
+				<span data-nf-diff-done style={DONE_STYLE}>
+					<OutlineStatusIcon status="done" size={12} />
+					{stats.done}
 				</span>
 			) : null}
 			{stats.added > 0 ? (

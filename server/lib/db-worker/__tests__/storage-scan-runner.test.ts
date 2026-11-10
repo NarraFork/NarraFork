@@ -10,17 +10,21 @@
  */
 
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS } from "../../../services/storage/database-storage-port";
 import {
 	type DatabaseObjectStorageResult,
 	isSqliteBusyError,
+	loadDbstatObjectBytes,
 	loadScanContext,
 	measureTable,
 } from "../../../services/storage-scan-queries";
+import * as pool from "../pool";
 import { resetDbWorkerPoolForTest, shutdownDbWorkerPool } from "../pool";
+import type { StorageScanContextResult } from "../protocol";
 import { runParallelObjectStorageScan } from "../storage-scan-runner";
 
 const MAIN_BYTES = 4_096 * 128;
@@ -85,6 +89,7 @@ describe("runParallelObjectStorageScan", () => {
 	});
 
 	afterEach(() => {
+		mock.restore();
 		shutdownDbWorkerPool();
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
@@ -187,7 +192,7 @@ describe("runParallelObjectStorageScan", () => {
 					mainBytes: MAIN_BYTES,
 					signal: controller.signal,
 				}),
-			).rejects.toThrow(/abort/i);
+			).rejects.toMatchObject({ code: "DATABASE_STORAGE_SCAN_CANCELLED" });
 		} finally {
 			sqlite.close();
 		}
@@ -230,6 +235,154 @@ describe("runParallelObjectStorageScan", () => {
 			sqlite.close();
 		}
 	}, 90_000);
+});
+
+describe("object scan deadlines and fallback", () => {
+	const context: StorageScanContextResult = {
+		pageSize: 4096,
+		pageCount: 1,
+		rawFreelistBytes: 0,
+		tables: [
+			{ name: "a", kind: "table" },
+			{ name: "b", kind: "table" },
+		],
+		dbstatSupported: true,
+		dbstatBytes: [["a", 4096]],
+		indexesByTable: [],
+	};
+	let sqlite: Database;
+	beforeEach(() => {
+		sqlite = new Database(":memory:");
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+	});
+	afterEach(() => {
+		mock.restore();
+		sqlite.close();
+		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	});
+	const timeout = () => new pool.DbReadTaskTimeoutError("database read task timed out");
+	const scan = (budgetMs?: number) =>
+		runParallelObjectStorageScan({
+			sqlite,
+			dbPath: "must-not-open.db",
+			mainBytes: MAIN_BYTES,
+			budgetMs,
+		});
+
+	test("context gets the full scan budget; shards get only what remains after a slow context", async () => {
+		let now = 1000;
+		spyOn(Date, "now").mockImplementation(() => now);
+		const run = spyOn(pool, "runReadTask").mockImplementation(
+			async <T>(...args: Parameters<typeof pool.runReadTask>): Promise<T> => {
+				if (args[1].kind === "storageScanContext") {
+					now += 35_000; // Past the old 30s limit, without waiting 35s in a test.
+					return context as T;
+				}
+				return { tables: [] } as T;
+			},
+		);
+		const result = await scan();
+		expect(result.executedOn).toBe("workers");
+		expect(run.mock.calls[0][2]?.timeoutMs).toBe(DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS);
+		expect(run.mock.calls).toHaveLength(3);
+		for (const call of run.mock.calls.slice(1)) {
+			expect(call[2]?.timeoutMs).toBe(DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS - 35_000);
+		}
+	});
+
+	test("context timeout does not restart the full walk as a serial scan", async () => {
+		const error = timeout();
+		const run = spyOn(pool, "runReadTask").mockRejectedValue(error);
+		const ephemeral = spyOn(pool, "runEphemeralReadTask").mockRejectedValue(error);
+		await expect(scan()).rejects.toBe(error);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(ephemeral).not.toHaveBeenCalled();
+	});
+
+	test("failed shard cancels its siblings without restarting the scan", async () => {
+		const error = timeout();
+		const signals: AbortSignal[] = [];
+		const run = spyOn(pool, "runReadTask")
+			.mockResolvedValueOnce(context)
+			.mockImplementation((_path, _params, options) => {
+				const signal = options?.signal;
+				if (!signal) throw new Error("missing cancellation signal");
+				signals.push(signal);
+				if (signals.length === 1) return Promise.reject(error);
+				return new Promise<never>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				});
+			});
+		const ephemeral = spyOn(pool, "runEphemeralReadTask").mockRejectedValue(error);
+		await expect(scan()).rejects.toBe(error);
+		expect(run).toHaveBeenCalledTimes(3);
+		expect(signals).toHaveLength(2);
+		expect(signals.every((signal) => signal.aborted)).toBe(true);
+		expect(ephemeral).not.toHaveBeenCalled();
+	});
+
+	test("whole-scan budget cancels a hung context and settles without fallback", async () => {
+		let signal: AbortSignal | undefined;
+		const run = spyOn(pool, "runReadTask").mockImplementation((_path, _params, options) => {
+			signal = options?.signal;
+			return new Promise<never>((_resolve, reject) => {
+				signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+			});
+		});
+		await expect(scan(10)).rejects.toMatchObject({ code: "DATABASE_STORAGE_SCAN_TIMEOUT" });
+		expect(signal?.aborted).toBe(true);
+		expect(run).toHaveBeenCalledTimes(1);
+	});
+
+	test("serial watchdog failure is not retried on an ephemeral worker", async () => {
+		const error = timeout();
+		const run = spyOn(pool, "runReadTask")
+			.mockRejectedValueOnce(new pool.WorkersUnavailableError("disabled"))
+			.mockRejectedValue(error);
+		const ephemeral = spyOn(pool, "runEphemeralReadTask").mockRejectedValue(error);
+		await expect(scan()).rejects.toBe(error);
+		expect(run).toHaveBeenCalledTimes(2);
+		expect(ephemeral).not.toHaveBeenCalled();
+	});
+
+	test("ephemeral watchdog failure is not reported as an empty breakdown", async () => {
+		const error = timeout();
+		spyOn(pool, "runReadTask").mockRejectedValue(new pool.WorkersUnavailableError("disabled"));
+		spyOn(pool, "runEphemeralReadTask").mockRejectedValue(error);
+		await expect(scan()).rejects.toBe(error);
+	});
+
+	test("ephemeral query failure is not hidden as an empty breakdown", async () => {
+		const error = new pool.DbReadTaskExecutionError("query failed");
+		spyOn(pool, "runReadTask").mockRejectedValue(new pool.WorkersUnavailableError("disabled"));
+		spyOn(pool, "runEphemeralReadTask").mockRejectedValue(error);
+		await expect(scan()).rejects.toBe(error);
+	});
+
+	test("worker-unavailable fallbacks share the original deadline", async () => {
+		let now = 1000;
+		spyOn(Date, "now").mockImplementation(() => now);
+		const run = spyOn(pool, "runReadTask").mockImplementation(() => {
+			now += 40_000;
+			return Promise.reject(new pool.WorkersUnavailableError("disabled"));
+		});
+		const ephemeral = spyOn(pool, "runEphemeralReadTask").mockResolvedValue({
+			pageSize: 4096,
+			pageCount: 1,
+			freelistBytes: 0,
+			objectBytes: 4096,
+			scanMode: "dbstat",
+			categories: [],
+			topTables: [],
+			readFailures: { tableCount: 0, tableNames: [] },
+		});
+		const result = await scan();
+		expect(result.executedOn).toBe("worker-serial");
+		expect(run.mock.calls[1][2]?.timeoutMs).toBe(DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS - 40_000);
+		expect(ephemeral.mock.calls[0][2]?.timeoutMs).toBe(
+			DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS - 80_000,
+		);
+	});
 });
 
 describe("read failures are not reported as empty tables", () => {
@@ -478,4 +631,60 @@ describe("read failures are not reported as empty tables", () => {
 		reader.close();
 		writer.close();
 	}, 30_000);
+});
+
+describe("dbstat object byte accounting", () => {
+	test("native aggregate matches page SUM for tables, indexes, FTS and overflow pages", () => {
+		const sqlite = new Database(":memory:");
+		try {
+			sqlite.exec(`
+				CREATE TABLE payloads (id INTEGER PRIMARY KEY, body TEXT);
+				CREATE INDEX idx_payloads_body ON payloads(body);
+				CREATE VIRTUAL TABLE payloads_fts USING fts5(body);
+			`);
+			sqlite.prepare("INSERT INTO payloads(body) VALUES (?)").run("溢出页".repeat(20_000));
+			sqlite.exec("INSERT INTO payloads_fts(body) SELECT body FROM payloads");
+			const pages = sqlite
+				.query("SELECT name, SUM(pgsize) AS bytes FROM dbstat GROUP BY name")
+				.all() as Array<{ name: string; bytes: number }>;
+			const overflow = sqlite
+				.query("SELECT COUNT(*) AS n FROM dbstat WHERE pagetype = 'overflow'")
+				.get() as { n: number };
+			expect(overflow.n).toBeGreaterThan(0);
+			const prepare = spyOn(sqlite, "prepare");
+			const result = loadDbstatObjectBytes(sqlite);
+			expect(result.supported).toBe(true);
+			expect(result.bytesByName).toEqual(new Map(pages.map(({ name, bytes }) => [name, bytes])));
+			expect(result.bytesByName.get("idx_payloads_body")).toBeGreaterThan(0);
+			expect(result.bytesByName.get("payloads_fts_data")).toBeGreaterThan(0);
+			expect(prepare).toHaveBeenCalledTimes(1);
+			expect(prepare.mock.calls[0][0]).toContain("aggregate = TRUE");
+			prepare.mockRestore();
+		} finally {
+			sqlite.close();
+		}
+	});
+
+	for (const unsupported of ["aggregate", "schema", "dbstat"]) {
+		test(`retains fallback when ${unsupported} is unavailable`, () => {
+			const sqlite = new Database(":memory:");
+			const prepare = sqlite.prepare.bind(sqlite);
+			const calls = spyOn(sqlite, "prepare").mockImplementation((sql, ...args) => {
+				if (sql.includes(unsupported)) throw new Error(`no such ${unsupported}`);
+				return prepare(sql, ...args);
+			});
+			try {
+				sqlite.exec("CREATE TABLE payloads (id INTEGER PRIMARY KEY, body TEXT)");
+				sqlite.query("INSERT INTO payloads(body) VALUES (?)").run("hello");
+				const result = loadDbstatObjectBytes(sqlite);
+				expect(result.supported).toBe(unsupported !== "dbstat");
+				if (result.supported) expect(result.bytesByName.get("payloads")).toBeGreaterThan(0);
+				else expect(result.bytesByName.size).toBe(0);
+				expect(calls).toHaveBeenCalledTimes(unsupported === "aggregate" ? 2 : 3);
+			} finally {
+				calls.mockRestore();
+				sqlite.close();
+			}
+		});
+	}
 });

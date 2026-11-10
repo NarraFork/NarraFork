@@ -206,6 +206,8 @@ export interface ExactRowProps {
 	 * after paint (see `onUnknownHeight`) instead of predicted arithmetically.
 	 */
 	permissionSlot?: ReactNode;
+	/** Collapsible Outline Ask detail, replacing the static question snapshot. */
+	outlineAskSlot?: ReactNode;
 	/**
 	 * Live permission form nodes for DRILLED-IN cards inside this row's trace, keyed by
 	 * trace row key. A call blocked on a request now stays a row of its activity trace
@@ -377,6 +379,7 @@ export const ExactRow = memo(
 		currentUserId,
 		narratorId,
 		permissionSlot,
+		outlineAskSlot,
 		traceRowPermissionSlots,
 		onPermissionFormHeight,
 		editorSlot,
@@ -777,6 +780,8 @@ export const ExactRow = memo(
 		// An outline card's fold (raw input, model result) rides the prompt-fold channel, keyed by
 		// the card: see `rawOpen` in segment-adapter's buildToolCardData.
 		if (kind === "tool-call") extra.onTogglePrompt = toggles.onTogglePrompt;
+		// An outline plan card's tree (its nodes, texts, 「全部展开」), keyed by the card.
+		if (kind === "tool-call") extra.onPlanTree = toggles.onPlanTree;
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
@@ -812,6 +817,7 @@ export const ExactRow = memo(
 				extra.onUpdateTimeout = resolveUpdateTimeout(measured.toolUseId);
 			}
 		}
+		if (outlineAskSlot !== undefined) extra.outlineAskSlot = outlineAskSlot;
 		// A live permission form (pending-permission tool/subagent card) is injected
 		// as a slot; the pure renderer draws it in place of the zero-DOM copy.
 		if (permissionSlot !== undefined) {
@@ -902,6 +908,7 @@ export const ExactRow = memo(
 			extra.isActive === true ||
 			specTaskLive === true ||
 			permissionSlot != null ||
+			outlineAskSlot != null ||
 			editorSlot != null ||
 			(traceRowPermissionSlots?.size ?? 0) > 0 ||
 			askInPassingPending != null ||
@@ -1092,6 +1099,7 @@ export const ExactRow = memo(
 		// Authorship decides the bubble's side; a row must repaint if the viewer changes.
 		prev.currentUserId === next.currentUserId &&
 		prev.permissionSlot === next.permissionSlot &&
+		prev.outlineAskSlot === next.outlineAskSlot &&
 		prev.traceRowPermissionSlots === next.traceRowPermissionSlots &&
 		prev.onPermissionFormHeight === next.onPermissionFormHeight &&
 		prev.editorSlot === next.editorSlot &&

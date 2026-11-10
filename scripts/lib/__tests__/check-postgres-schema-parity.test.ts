@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 141 tables and 1863 columns including workspace title metadata", () => {
+	test("covers 141 tables and 1865 columns including transcript appearance preferences", () => {
 		expect(target.tables.length).toBe(141);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -563,7 +563,8 @@ describe("real schema parity", () => {
 		// Folder Git identities add folder_git_identity_bindings (5) and one user preference.
 		// Sidebar archive marks add recent_tab_archive_marks (5).
 		// Workspace auto titles add title_source and title_revision (2).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1863);
+		// Recent-tab directory visibility adds one account-scoped user preference.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1865);
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

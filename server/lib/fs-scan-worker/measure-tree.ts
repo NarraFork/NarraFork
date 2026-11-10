@@ -1,10 +1,9 @@
 /**
  * Bounded directory walk used by the storage scan.
  *
- * The same function runs inside the filesystem worker and, if that worker cannot
- * be spawned, on the main thread. Either way it is async: one `lstat` at a time,
- * so a worker can observe cancellation between entries and the main-thread
- * fallback does not freeze the event loop the way synchronous sqlite does.
+ * Production calls run only inside the filesystem worker. Tests may call this
+ * pure core directly. Async filesystem operations let the worker observe
+ * cancellation between entries; they do not make a server-thread walk safe.
  *
  * Symlinks are not followed. A directory link is reported as a directory by
  * `readdir` when its target is a directory, so the walk identifies links with
@@ -16,41 +15,23 @@ import { existsSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
-/**
- * Entry budget for one measurement call.
- *
- * A checked-out worktree of a large monorepo is a few hundred thousand files.
- * 2,000,000 leaves headroom and still bounds a pathological tree.
- */
-export const DIR_SCAN_MAX_ENTRIES = 2_000_000;
+import {
+	DIR_SCAN_MAX_DEPTH,
+	DIR_SCAN_MAX_ENTRIES,
+	DirectoryMeasureAbortedError,
+	type DirectoryTreeMeasurement,
+	type MeasureDirectoryTreesOptions,
+} from "./protocol";
 
-/**
- * Depth budget. Real trees measured here are well under 30 levels; 64 is
- * generous for a nested source tree and far from any stack limit.
- */
-export const DIR_SCAN_MAX_DEPTH = 64;
+export {
+	DIR_SCAN_MAX_DEPTH,
+	DIR_SCAN_MAX_ENTRIES,
+	DirectoryMeasureAbortedError,
+	type DirectoryTreeMeasurement,
+	type MeasureDirectoryTreesOptions,
+} from "./protocol";
 
 const PROGRESS_EVERY_ENTRIES = 200;
-
-export interface DirectoryTreeMeasurement {
-	sizeBytes: number;
-	entriesScanned: number;
-	truncated: boolean;
-}
-
-export class DirectoryMeasureAbortedError extends Error {
-	constructor() {
-		super("directory measure aborted");
-		this.name = "DirectoryMeasureAbortedError";
-	}
-}
-
-export interface MeasureDirectoryTreesOptions {
-	maxEntries?: number;
-	maxDepth?: number;
-	signal?: AbortSignal;
-	onProgress?: (progress: { entriesScanned: number; sizeBytes: number }) => void;
-}
 
 /**
  * Measure each root independently for depth, and share one entry budget across
@@ -117,7 +98,8 @@ export async function measureDirectoryTrees(
 					acc.sizeBytes += info.size;
 					sizeBytes += info.size;
 				}
-			} catch {
+			} catch (error) {
+				if (error instanceof DirectoryMeasureAbortedError) throw error;
 				// skip inaccessible entries
 			}
 		}

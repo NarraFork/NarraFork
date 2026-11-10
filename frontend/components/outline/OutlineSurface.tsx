@@ -79,6 +79,7 @@ import {
 } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import { forgetOutlineRecent, recordOutlineRecent } from "../../lib/outline-recents";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { MANTINE_SM_BREAKPOINT_PX, MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
@@ -99,6 +100,7 @@ import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
 import { OutlineBreadcrumbs } from "./OutlineBreadcrumbs";
 import { OutlineGate } from "./OutlineGate";
+import { OutlineQuestionsSection } from "./OutlineQuestions";
 import { OutlineSidePanel } from "./OutlineSidePanel";
 import { OutlineTimeline } from "./OutlineTimeline";
 import {
@@ -195,7 +197,7 @@ function SurfaceBody({
 	actions,
 	history,
 }: OutlineSurfaceProps) {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const mode: OutlineViewMode = viewMode ?? "facts";
 	// The current page is edited live while on screen, unless live editing turned out
 	// unavailable here.
@@ -207,7 +209,7 @@ function SurfaceBody({
 	useEffect(() => {
 		if (!onScreen) setFallback((current) => (current === "tab_limit" ? null : current));
 	}, [onScreen]);
-	// While editing, the HTTP read only feeds the breadcrumbs, side panel and timeline.
+	// While editing, the HTTP read feeds the breadcrumbs, questions, side panel and timeline.
 	const query = useOutlineBlock(spaceId, blockId, {
 		asOf,
 		view: mode,
@@ -337,15 +339,21 @@ function SurfaceBody({
 	);
 
 	const root = view?.blocks.find((block) => block.id === view.rootId);
-	const rootTitle = root ? titleOf(root.content) || root.sid : "";
+	const storedTitle = root ? titleOf(root.content) || root.sid : "";
+	// A subagent report's container, focused: its line as people read it (their language and
+	// time zone). Display only: what is remembered ("recent") and what is handed on (`onLoaded`,
+	// from which hosts name the tab and write references into messages) is the stored title,
+	// decoded again wherever it is shown, so a time never goes stale or loses its date.
+	const rootTitle =
+		(root && reportLineDisplay(root.content, { t, locale: i18n?.language })) ?? storedTitle;
 
 	// Remember pages actually opened (their current state), and forget ones that are gone.
 	const missing = query.error instanceof ApiError && query.error.status === 404;
 	useEffect(() => {
 		if (view?.current && root && settled) {
-			recordOutlineRecent({ spaceId, blockId, title: rootTitle, visitedAt: Date.now() });
+			recordOutlineRecent({ spaceId, blockId, title: storedTitle, visitedAt: Date.now() });
 		}
-	}, [view?.current, root, settled, spaceId, blockId, rootTitle]);
+	}, [view?.current, root, settled, spaceId, blockId, storedTitle]);
 	useEffect(() => {
 		if (missing && asOf === undefined) forgetOutlineRecent(blockId);
 	}, [missing, asOf, blockId]);
@@ -363,7 +371,7 @@ function SurfaceBody({
 			pageId,
 			rootId: blockId,
 			address: `${loadedSpaceKey}/${rootSid}`,
-			title: rootTitle,
+			title: storedTitle,
 			canWrite: loadedCanWrite,
 		});
 	}, [
@@ -373,7 +381,7 @@ function SurfaceBody({
 		pageId,
 		loadedSpaceKey,
 		rootSid,
-		rootTitle,
+		storedTitle,
 		loadedCanWrite,
 		settled,
 	]);
@@ -436,11 +444,11 @@ function SurfaceBody({
 			? focusInfo
 			: null;
 	const seedRoot = seed && !liveCrumbs ? seed.blocks.find((b) => b.id === seed.rootId) : undefined;
-	const crumbs = liveCrumbs
-		? { title: liveCrumbs.title || liveCrumbs.sid, path: liveCrumbs.path }
+	const crumbPath = liveCrumbs
+		? liveCrumbs.path
 		: seed && seedRoot && editing
-			? { title: titleOf(seedRoot.content) || seedRoot.sid, path: seed.path }
-			: null;
+			? seed.path
+			: undefined;
 
 	let content: React.ReactNode;
 	let drawer: React.ReactNode = null;
@@ -492,12 +500,7 @@ function SurfaceBody({
 		content = (
 			<>
 				<div className={classes.toolbar}>
-					<OutlineBreadcrumbs
-						view={view}
-						rootTitle={crumbs ? crumbs.title : rootTitle}
-						search={linkSearch}
-						path={crumbs?.path}
-					/>
+					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbPath} />
 					<Group gap="xs" wrap="nowrap">
 						{history && (
 							<Group gap={2} wrap="nowrap">
@@ -631,7 +634,7 @@ function SurfaceBody({
 										{rootTitle}
 									</Title>
 								</Group>
-								{root.content.trim() !== rootTitle && (
+								{root.content.trim() !== storedTitle && (
 									<Box className={classes.content} mb="xs">
 										<OutlineBlockBody content={root.content} />
 									</Box>
@@ -643,6 +646,11 @@ function SurfaceBody({
 									onToggle={toggle}
 								/>
 							</>
+						)}
+						{/* Answer in the main content, also when live editing or the sidebar is unavailable.
+						    A retained read from the previous focus must not offer answers for that block. */}
+						{settled && view.current && asOf === undefined && (
+							<OutlineQuestionsSection view={view} hideQuestionTitle={!!root.question} />
 						)}
 						{view.view === "facts" && (editing ? hiddenLive : view.hiddenByView) > 0 && (
 							<Text size="xs" c="dimmed" mt="sm">

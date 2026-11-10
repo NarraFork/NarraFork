@@ -192,12 +192,11 @@ export async function seedPage(
 	lines.forEach((line, i) => {
 		const depth = (line.length - line.trimStart().length) / 2;
 		let content = line.trim();
-		let task: { status: "todo" | "done" } | null = null;
-		if (content.startsWith("[ ] ")) {
-			task = { status: "todo" };
-			content = content.slice(4);
-		} else if (content.startsWith("[x] ")) {
-			task = { status: "done" };
+		let task: { status: "todo" | "doing" | "done" | "cancelled" } | null = null;
+		const mark = /^\[([ x/-])\] /.exec(content);
+		if (mark) {
+			const status = { " ": "todo", "/": "doing", x: "done", "-": "cancelled" } as const;
+			task = { status: status[mark[1] as keyof typeof status] };
 			content = content.slice(4);
 		}
 		stack.length = depth + 1;
@@ -249,7 +248,17 @@ export async function openEditor(
 	h: Harness,
 	userId: string,
 	pageId: string,
-	options: { canWrite?: boolean; focusId?: string; lens?: "facts" | "all"; width?: number } = {},
+	options: {
+		canWrite?: boolean;
+		focusId?: string;
+		lens?: "facts" | "all";
+		width?: number;
+		/** The viewer's time zone (IANA), for what is shown in local time. */
+		timezone?: string;
+		lang?: "en" | "zh-CN";
+		scheme?: "light" | "dark";
+		host?: boolean;
+	} = {},
 ): Promise<Editor> {
 	const context = await h.browser.createBrowserContext();
 	h.contexts.push(context);
@@ -261,6 +270,7 @@ export async function openEditor(
 	const page = await context.newPage();
 	h.pages.push(page);
 	if (options.width) await page.setViewport({ width: options.width, height: 800 });
+	if (options.timezone) await page.emulateTimezone(options.timezone);
 	const errors: string[] = [];
 	page.on("pageerror", (error) => errors.push(String(error)));
 	await page.goto(h.server.url.origin);
@@ -274,6 +284,9 @@ export async function openEditor(
 		...(options.focusId ? { focusId: options.focusId } : {}),
 		...(options.lens ? { lens: options.lens } : {}),
 		...(options.width ? { width: options.width - 32 } : {}),
+		...(options.lang ? { lang: options.lang } : {}),
+		...(options.scheme ? { scheme: options.scheme } : {}),
+		...(options.host ? { host: true } : {}),
 	});
 	try {
 		await page.waitForFunction(

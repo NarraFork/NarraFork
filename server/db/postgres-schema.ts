@@ -328,12 +328,20 @@ export const narrators = pgTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		index("idx_narrators_status").on(table.status),
 		index("idx_narrators_owner").on(table.ownerUserId),
 		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_write_audience").on(table.writeAudience),
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
 		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
+		index("idx_narrators_variant_list").on(
+			table.variant,
+			table.hiddenFromLists,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 		uniqueIndex("idx_narrators_modeltrace_key").on(table.modeltraceKey),
@@ -1314,6 +1322,7 @@ export const userPreferences = pgTable("user_preferences", {
 	narratorLineHeightV2Percent: integer("narrator_line_height_v2_percent"),
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	recentTabsShowDirectory: boolean("recent_tabs_show_directory").notNull().default(false),
 	addSubagentToRecentTabs: boolean("add_subagent_to_recent_tabs").notNull().default(true),
 	recentTabsGroupMode: text("recent_tabs_group_mode").notNull().default("flat"),
 	notifyOnDone: boolean("notify_on_done").notNull().default(true),
@@ -4368,7 +4377,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 141,
-  "columnCount": 1864,
+  "columnCount": 1865,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6296,6 +6305,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_narrators_status",
+          "columns": [
+            "status"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_narrators_owner",
           "columns": [
             "ownerUserId"
@@ -6334,6 +6350,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_variant_updated",
           "columns": [
             "variant",
+            "updatedAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_variant_list",
+          "columns": [
+            "variant",
+            "hiddenFromLists",
+            "status",
             "updatedAt",
             "id"
           ],
@@ -11722,6 +11749,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"[]\"",
           "defaultExpression": "\"[]\""
+        },
+        {
+          "property": "recentTabsShowDirectory",
+          "name": "recent_tabs_show_directory",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         },
         {
           "property": "addSubagentToRecentTabs",

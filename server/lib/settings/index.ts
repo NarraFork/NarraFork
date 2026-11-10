@@ -18,9 +18,12 @@ import { resolve } from "node:path";
 import { normalizeMcpLoadingConfig } from "@shared/mcp-loading-mode";
 import { normalizeProxyUrl } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
+import type { StorageRetentionSettings } from "@shared/storage-retention";
+import { z } from "zod";
 import { getBuiltinToolRoutines } from "../builtin-routines";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
+import { ValidationError } from "../errors";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import {
@@ -393,6 +396,36 @@ export function parseSettingsText(text: string): any {
 	return raw;
 }
 
+const storageRetentionRulePatchSchema = z
+	.strictObject({
+		retentionDays: z.number().int().min(1).max(36_500).nullable(),
+		autoCleanup: z.boolean(),
+	})
+	.partial();
+
+export const storageRetentionPatchSchema = z
+	.strictObject({
+		toolCallPayloads: storageRetentionRulePatchSchema,
+		messageHistory: storageRetentionRulePatchSchema,
+	})
+	.partial();
+
+/** Absence and omitted leaves use safe defaults; malformed persisted policies fail closed. */
+function loadStorageRetentionSettings(value: unknown): StorageRetentionSettings {
+	const parsed = storageRetentionPatchSchema.safeParse(value === undefined ? {} : value);
+	if (!parsed.success) throw new ValidationError("Invalid storage retention settings");
+	return {
+		toolCallPayloads: {
+			...DEFAULTS.storageRetention.toolCallPayloads,
+			...parsed.data.toolCallPayloads,
+		},
+		messageHistory: {
+			...DEFAULTS.storageRetention.messageHistory,
+			...parsed.data.messageHistory,
+		},
+	};
+}
+
 function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
@@ -416,6 +449,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	const merged = deepMerge(DEFAULTS, raw);
 	// Do not let the generic defaults merge conceal an invalid partial speech config.
 	merged.speech = loadSpeechSettings(raw.speech);
+	merged.storageRetention = loadStorageRetentionSettings(raw.storageRetention);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
 
@@ -435,6 +469,18 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	const normalizedUpdate = normalizeUpdateSourceSettings(merged, raw);
 	merged.update = normalizedUpdate.update;
 	let needsSave = normalizedUpdate.needsSave;
+	// Old rollout files persisted false forever. Upgrade once on backend startup/reload,
+	// without a frontend visit; a versioned operator rollback remains effective afterwards.
+	if ((raw.narratorBlocks?.singleCopyDefaultsVersion ?? 0) < 1) {
+		merged.narratorBlocks = {
+			...merged.narratorBlocks,
+			write: true,
+			read: true,
+			compactJson: true,
+			singleCopyDefaultsVersion: 1,
+		};
+		needsSave = true;
+	}
 	if (stripObsoleteSettingsKeys(mergedAny)) {
 		needsSave = true;
 	}
@@ -974,6 +1020,8 @@ export function migrateGlobalProxy(
 }
 
 export function saveSettings(newSettings: NarraForkSettings): void {
+	// Reject malformed policies before changing the singleton or any credential/config file.
+	const storageRetention = loadStorageRetentionSettings(newSettings.storageRetention);
 	stripObsoleteSettingsKeys(newSettings as unknown as Record<string, unknown>);
 	normalizeCustomApiProviderSettings(newSettings);
 	syncProviderKeys(newSettings);
@@ -987,6 +1035,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	withSettingsFileLock(narraforkDir, () => {
 		newSettings.speech = loadSpeechSettings(newSettings.speech);
+		newSettings.storageRetention = storageRetention;
 		let disk: unknown = {};
 		if (existsSync(settingsPath)) {
 			try {

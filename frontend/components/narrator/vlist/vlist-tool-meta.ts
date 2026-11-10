@@ -46,6 +46,12 @@ const TERMINAL_STATUSES = new Set(["success", "fail", "error", "cancelled"]);
 
 const SUBAGENT_ID_TAG_RE = /<subagent_id>([^<]+)<\/subagent_id>/;
 
+/** The exact questions created by ONE Ask, never its shared task/group block. */
+export interface OutlineAskSource {
+	questionRootIds: readonly string[];
+	questionIds: readonly string[];
+}
+
 /** Per-row tool facts consumed by VListRowInteraction's menu gating. */
 export interface VListToolMeta {
 	/** Exact owning tool use id, needed for live Bash detachment. */
@@ -54,6 +60,8 @@ export interface VListToolMeta {
 	isRunningBash?: boolean;
 	/** Raw tool name (e.g. "Read", "Await", "Agent"). */
 	toolName?: string;
+	/** Successful question-creating Ask; absent for legacy/malformed results. */
+	outlineAsk?: OutlineAskSource;
 	/** Subagent card: the child narrator id, when the activity summary knows it. */
 	subagentNarratorId?: string;
 	/** Active Await({type:"question"}): the inbox question id. */
@@ -117,8 +125,9 @@ const AWAIT_AGENT_RESOLVED_FIELD = "_awaitAgentNarratorId";
  */
 function readMetadata(block: ContentBlock): Record<string, unknown> {
 	const record = block as unknown as Record<string, unknown>;
-	const output = asRecord(record.output ?? record.outputJson);
-	return asRecord(output._metadata ?? record._metadata);
+	return asRecord(
+		asRecord(record.output)._metadata ?? asRecord(record.outputJson)._metadata ?? record._metadata,
+	);
 }
 
 /**
@@ -225,6 +234,43 @@ export function deriveAwaitAgentNarratorId(
 	return nonEmpty(record[AWAIT_AGENT_RESOLVED_FIELD]);
 }
 
+/** Fail closed when an old result cannot identify precisely this call's questions. */
+export function deriveOutlineAskSource(
+	toolName: string | undefined,
+	status: string | undefined,
+	input: Record<string, unknown>,
+	metadata: Record<string, unknown>,
+): OutlineAskSource | undefined {
+	if (
+		toolName !== "Ask" ||
+		(status !== "success" && status !== "completed") ||
+		"withdraw" in input ||
+		"answered" in input ||
+		!Array.isArray(input.questions) ||
+		input.questions.length === 0 ||
+		!Array.isArray(metadata.blockIds)
+	)
+		return undefined;
+	const ids = metadata.blockIds;
+	if (!ids.every((id): id is string => typeof id === "string" && id.trim().length > 0))
+		return undefined;
+	if (new Set(ids).size !== ids.length) return undefined;
+	const questionRootIds: string[] = [];
+	let offset = 0;
+	for (const question of input.questions) {
+		const q = asRecord(question);
+		if (typeof q.question !== "string" || !q.question.trim()) return undefined;
+		if (q.items != null && !Array.isArray(q.items)) return undefined;
+		const rootId = ids[offset];
+		if (!rootId) return undefined;
+		questionRootIds.push(rootId);
+		// The server writes each parent immediately followed by its child questions.
+		offset += 1 + (Array.isArray(q.items) ? q.items.length : 0);
+	}
+	if (offset !== ids.length) return undefined;
+	return { questionRootIds, questionIds: ids };
+}
+
 /** Derive the tool meta for one `tool_use` content block. */
 export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 	if (block.type !== "tool_use") return null;
@@ -240,6 +286,8 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 
 	const meta: VListToolMeta = {};
 	if (toolName) meta.toolName = toolName;
+	const outlineAsk = deriveOutlineAskSource(toolName, status, inputRecord, metadata);
+	if (outlineAsk) meta.outlineAsk = outlineAsk;
 	const toolUseId = nonEmpty(record.id) ?? nonEmpty(record.toolUseId);
 	if (toolUseId) meta.toolUseId = toolUseId;
 	if (isRunningForegroundBash(toolName, inputRecord, status, metadata)) meta.isRunningBash = true;
@@ -321,6 +369,12 @@ export function buildToolMetaIndex(messages: readonly NarratorMsg[]): Map<string
 							input: call.inputJson ?? raw.input,
 							inputJson: call.inputJson ?? raw.inputJson,
 							status: call.status,
+							...(call.toolName === "Ask"
+								? {
+										outputJson: call.outputJson ?? raw.outputJson,
+										_metadata: asRecord(call)._metadata ?? raw._metadata,
+									}
+								: {}),
 						}
 					: {}),
 				seq: typeof raw.seq === "number" ? raw.seq : msg.seq,

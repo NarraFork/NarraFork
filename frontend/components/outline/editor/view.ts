@@ -49,7 +49,7 @@ import {
 } from "prosemirror-state";
 import { ReplaceStep } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView, type NodeView } from "prosemirror-view";
-import { iconSvg, taskIconOf } from "../outline-icons";
+import { iconSvg, LOCK_CHIP_ICON, taskIconOf } from "../outline-icons";
 import {
 	applyChrome,
 	type BlockMark,
@@ -122,6 +122,7 @@ interface Rec {
 
 const presenceKey = new PluginKey<DecorationSet>("outline-presence");
 const bselKey = new PluginKey<DecorationSet>("outline-block-selection");
+const reportLineKey = new PluginKey("outline-report-line");
 const TOP = "\u0000top";
 
 function sameArr(a: PMNode[], b: PMNode[]) {
@@ -268,6 +269,11 @@ export class OutlineView implements CmdHost, ClientView {
 				},
 				focus: () => {
 					this.afterSelection();
+					this.markCursorBlock(true);
+					return false;
+				},
+				blur: () => {
+					this.markCursorBlock(false);
 					return false;
 				},
 				mousedown: () => {
@@ -385,7 +391,69 @@ export class OutlineView implements CmdHost, ClientView {
 				},
 				props: { decorations: (s) => bselKey.getState(s) },
 			}),
+			// Subagent report container lines read in the reader's language and time zone
+			// (display only: the document, and so what is saved and copied, keeps the stored text).
+			new Plugin({
+				key: reportLineKey,
+				props: { decorations: (s) => this.reportLineDecorations(s.doc) },
+				view: () => ({ update: () => this.markCursorBlock() }),
+			}),
 		];
+	}
+
+	private reportLineCache: {
+		doc: PMNode;
+		label: typeof chromeText.reportLine;
+		set: DecorationSet;
+	} | null = null;
+
+	/**
+	 * A report container's line (`chromeText.reportLine`): the paragraph carries the readable
+	 * line as an attribute that CSS draws, and its stored text is wrapped so CSS can hide it. Both
+	 * only while the cursor is elsewhere (`markCursorBlock`): a block being edited shows its text.
+	 */
+	private reportLineDecorations(doc: PMNode): DecorationSet {
+		const cached = this.reportLineCache;
+		if (cached && cached.doc === doc && cached.label === chromeText.reportLine) return cached.set;
+		const decos: Decoration[] = [];
+		doc.descendants((n, pos) => {
+			if (n.type !== N.block) return n.type === N.children;
+			const body = n.child(0);
+			const only = body.childCount === 1 ? body.child(0) : null;
+			if (body.type === N.paragraph && only?.isText && only.marks.length === 0) {
+				const label = chromeText.reportLine(only.text ?? "");
+				if (label) {
+					decos.push(
+						Decoration.node(pos + 1, pos + 1 + body.nodeSize, {
+							class: "ob-report-line",
+							"data-report-label": label,
+						}),
+						Decoration.inline(pos + 2, pos + 2 + body.content.size, { class: "ob-report-raw" }),
+					);
+				}
+			}
+			return true;
+		});
+		const set = decos.length ? DecorationSet.create(doc, decos) : DecorationSet.empty;
+		this.reportLineCache = { doc, label: chromeText.reportLine, set };
+		return set;
+	}
+
+	private cursorEl: HTMLElement | null = null;
+
+	/**
+	 * Mark the block the cursor is in while the editor has focus (`.ob-here`): there a report
+	 * line shows its stored text. A class on the block's own frame element, so moving the cursor
+	 * or focus never redraws a body.
+	 */
+	private markCursorBlock(focused = this.pm?.hasFocus() ?? false): void {
+		if (!this.pm) return;
+		const p = focused ? this.locate(this.pm.state.doc, this.pm.state.selection.head) : null;
+		const el = p ? (this.blockEls.get(p.blockId) ?? null) : null;
+		if (el === this.cursorEl && (!el || el.classList.contains("ob-here"))) return;
+		this.cursorEl?.classList.remove("ob-here");
+		el?.classList.add("ob-here");
+		this.cursorEl = el;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -748,13 +816,16 @@ export class OutlineView implements CmdHost, ClientView {
 			if (!sel) continue;
 			const style = `--peer:${peer.color}`;
 			if ("b" in sel) {
+				// An agent's cursor is always whole blocks: the task it holds, what it just wrote
+				// (P2 PR 10b); drawn as a person's block selection is.
+				const attrs = peer.agent
+					? { class: "ob-peer-bsel ob-agent-bsel", style, "data-agent": peer.name || "agent" }
+					: { class: "ob-peer-bsel", style };
 				for (const id of sel.b) {
 					const bpos = findBlockPos(doc, id);
 					if (bpos == null) continue;
 					const block = doc.nodeAt(bpos) as PMNode;
-					decos.push(
-						Decoration.node(bpos, bpos + block.nodeSize, { class: "ob-peer-bsel", style }),
-					);
+					decos.push(Decoration.node(bpos, bpos + block.nodeSize, attrs));
 				}
 				continue;
 			}
@@ -1531,7 +1602,8 @@ export function findBlockPos(doc: PMNode, id: string): number | null {
 // Node views
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** A block's frame: folding arrow, bullet, checkbox; native DOM (`chrome.ts`). */
+/** A block's frame: folding arrow and one marker (bullet, checkbox or question mark), with a
+ * focus handle at the row's end where there is no bullet; native DOM (`chrome.ts`). */
 class BlockView implements NodeView {
 	dom: HTMLElement;
 	contentDOM: HTMLElement;
@@ -1550,12 +1622,16 @@ class BlockView implements NodeView {
 			e.preventDefault();
 			this.owner.toggleCollapse(this.node.attrs.id);
 		});
-		this.g.bullet.addEventListener("mousedown", (e) => {
+		// The bullet focuses its block; on a row without one (a task, a question) the focus handle
+		// at the row's end does.
+		const focus = (e: MouseEvent) => {
 			e.preventDefault();
 			const id = this.node.attrs.id as string;
 			if (this.owner.opts.onBullet) this.owner.opts.onBullet(id);
 			else this.owner.toggleCollapse(id);
-		});
+		};
+		this.g.bullet.addEventListener("mousedown", focus);
+		this.g.zoom.addEventListener("mousedown", focus);
 		this.g.check.addEventListener("mousedown", (e) => {
 			e.preventDefault();
 			const task = this.node.attrs.task as LiveTaskChar | null;
@@ -1575,7 +1651,7 @@ class BlockView implements NodeView {
 		this.marksEl = document.createElement("span");
 		this.marksEl.className = "ob-marks";
 		this.marksEl.contentEditable = "false";
-		this.dom.append(this.g.el, this.chip, this.marksEl, this.contentDOM);
+		this.dom.append(this.g.el, this.chip, this.g.zoom, this.marksEl, this.contentDOM);
 		this.render();
 	}
 
@@ -1591,7 +1667,8 @@ class BlockView implements NodeView {
 			const lock = document.createElement("span");
 			lock.className = "ob-lock";
 			lock.dataset.testid = "outline-lock-badge";
-			lock.textContent = chromeText.locked(mark.lockedBy);
+			// The lock's icon, then who: the same chip the read-only tree shows.
+			lock.append(iconSvg(LOCK_CHIP_ICON, lock.ownerDocument), chromeText.locked(mark.lockedBy));
 			this.marksEl.append(lock);
 		}
 		if (mark?.pending?.length) {
@@ -1714,6 +1791,7 @@ class BlockView implements NodeView {
 		const target = e.target as Node;
 		return (
 			this.g.el.contains(target) ||
+			this.g.zoom.contains(target) ||
 			this.chip.contains(target) ||
 			this.marksEl.contains(target) ||
 			(this.taskList?.contains(target) ?? false)

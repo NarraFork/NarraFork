@@ -316,6 +316,93 @@ describe("session cleanup read workers", () => {
 		expect(objects).toHaveBeenCalledTimes(1);
 	});
 
+	test("cleanup watchdog does not restart the payload scan and preview still degrades", async () => {
+		seedNarrator("archived");
+		forbidMainThreadPayloadReads();
+		const read = spyOn(pool, "runReadTask").mockRejectedValue(
+			new pool.DbReadTaskTimeoutError("cleanup read timed out"),
+		);
+		const ephemeral = spyOn(pool, "runEphemeralReadTask");
+		const preview = await databaseCleanupService.previewCleanup("archivedSessions");
+		expect(preview.warningCodes).toContain("statisticsUnavailable");
+		expect(preview.counts.sessions).toBe(1);
+		expect(read).toHaveBeenCalledTimes(1);
+		expect(ephemeral).not.toHaveBeenCalled();
+	});
+
+	test("storage summary and unavailable-worker fallback share the object scan deadline", async () => {
+		seedNarrator("archived");
+		// Use today's request schema here; the legacy dump-presence metadata probe is unrelated.
+		sqlite.exec("ALTER TABLE api_requests DROP COLUMN raw_dump_json");
+		forbidMainThreadPayloadReads();
+		let now = 1000;
+		spyOn(Date, "now").mockImplementation(() => now);
+		const read = spyOn(pool, "runReadTask").mockImplementation(() => {
+			now += 40_000;
+			return Promise.reject(new pool.WorkersUnavailableError("disabled"));
+		});
+		const ephemeral = spyOn(pool, "runEphemeralReadTask").mockResolvedValue({
+			archivedApproxBytes: 0,
+			staleApproxBytes: 0,
+			toolCalls: { count: 0, approxBytes: 0, oldestAt: null },
+		});
+		const objects = spyOn(scanRunner, "runParallelObjectStorageScan").mockResolvedValue({
+			executedOn: "workers",
+			workerCount: 1,
+			durationMs: 0,
+			pageSize: 4096,
+			pageCount: 1,
+			freelistBytes: 0,
+			objectBytes: 4096,
+			scanMode: "dbstat",
+			categories: [],
+			topTables: [],
+			readFailures: { tableCount: 0, tableNames: [] },
+		});
+		await databaseCleanupService.scanDatabaseBreakdown();
+		expect(read.mock.calls[0][2]?.timeoutMs).toBe(300_000);
+		expect(ephemeral.mock.calls[0][2]?.timeoutMs).toBe(260_000);
+		expect(objects.mock.calls[0][0].budgetMs).toBe(260_000);
+	});
+
+	test("object scan failure cancels the concurrent cleanup statistics worker", async () => {
+		seedNarrator("archived");
+		forbidMainThreadPayloadReads();
+		let cleanupSignal: AbortSignal | undefined;
+		spyOn(pool, "runReadTask").mockImplementation((_path, _params, options) => {
+			cleanupSignal = options?.signal;
+			return new Promise<never>((_resolve, reject) => {
+				cleanupSignal?.addEventListener("abort", () => reject(new Error("aborted")), {
+					once: true,
+				});
+			});
+		});
+		const ephemeral = spyOn(pool, "runEphemeralReadTask");
+		const error = new pool.DbReadTaskTimeoutError("object scan timed out");
+		spyOn(scanRunner, "runParallelObjectStorageScan").mockRejectedValue(error);
+		await expect(databaseCleanupService.scanDatabaseBreakdown()).rejects.toBe(error);
+		expect(cleanupSignal?.aborted).toBe(true);
+		expect(ephemeral).not.toHaveBeenCalled();
+	});
+
+	test("cleanup statistics failure cancels the concurrent object scan", async () => {
+		seedNarrator("archived");
+		forbidMainThreadPayloadReads();
+		spyOn(pool, "runReadTask").mockRejectedValue(new pool.WorkersUnavailableError("disabled"));
+		spyOn(pool, "runEphemeralReadTask").mockRejectedValue(new Error("spawn failed"));
+		let objectSignal: AbortSignal | undefined;
+		spyOn(scanRunner, "runParallelObjectStorageScan").mockImplementation((options) => {
+			objectSignal = options.signal;
+			return new Promise<never>((_resolve, reject) => {
+				objectSignal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+			});
+		});
+		await expect(databaseCleanupService.scanDatabaseBreakdown()).rejects.toMatchObject({
+			code: "DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
+		});
+		expect(objectSignal?.aborted).toBe(true);
+	});
+
 	test("cleanup waits for the worker re-preview before removing a root", async () => {
 		seedNarrator("archived");
 		forbidMainThreadPayloadReads();

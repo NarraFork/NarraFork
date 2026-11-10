@@ -23,6 +23,7 @@ import {
 	NATIVE_MODEL_CONTEXT_BLOCK_TYPES,
 } from "../native-injection";
 import { contextUpdateOf } from "../prefix-context";
+import { isClearedToolOutput, isHistoryClearedContent } from "../storage-retention";
 import type {
 	BlockPart,
 	BlockPhase,
@@ -242,6 +243,7 @@ function decodeToolUse(
 ): ToolBlock | undefined {
 	const wireId = string(raw.id) ?? string(raw.toolUseId);
 	if (!wireId) return undefined;
+	const cleared = raw.payloadCleared === true || isClearedToolOutput(call?.outputJson);
 	const ledger = call ? splitToolInput(call.inputJson) : undefined;
 	const blockInput = splitToolInput(raw.input);
 	const signature = string(raw.thoughtSignature) ?? ledger?.thoughtSignature;
@@ -255,14 +257,15 @@ function decodeToolUse(
 		ordinal: 0,
 		phase: state.phase,
 		payload: {
-			input: ledger ? ledger.input : blockInput.input,
+			input: cleared ? {} : ledger ? ledger.input : blockInput.input,
+			...(cleared ? { payloadCleared: true } : {}),
 			executor: "local",
 			issuer: USER_ISSUED_TOOL_USE_PREFIXES.some((prefix) => wireId.startsWith(prefix))
 				? "user"
 				: "model",
 			...(state.result ? { result: state.result } : {}),
 		},
-		...(signature
+		...(!cleared && signature
 			? {
 					providerMeta: {
 						...(source ? { source } : {}),
@@ -276,6 +279,7 @@ function decodeToolUse(
 function ledgerOnlyTool(messageId: string, call: DecodableToolCall): ToolBlock {
 	const { input, thoughtSignature, thoughtSignatureSource } = splitToolInput(call.inputJson);
 	const state = toolState(call);
+	const cleared = isClearedToolOutput(call.outputJson);
 	return {
 		id: `${messageId}:call:${call.toolUseId}`,
 		kind: "tool",
@@ -284,12 +288,13 @@ function ledgerOnlyTool(messageId: string, call: DecodableToolCall): ToolBlock {
 		ordinal: 0,
 		phase: state.phase,
 		payload: {
-			input,
+			input: cleared ? {} : input,
+			...(cleared ? { payloadCleared: true } : {}),
 			executor: "local",
 			issuer: "model",
 			...(state.result ? { result: state.result } : {}),
 		},
-		...(thoughtSignature
+		...(!cleared && thoughtSignature
 			? {
 					providerMeta: {
 						...(thoughtSignatureSource ? { source: thoughtSignatureSource } : {}),
@@ -344,8 +349,11 @@ function decodeAssistant(message: DecodableMessage): {
 } {
 	const raws = blocksOf(message);
 	const calls = new Map<string, DecodableToolCall>();
-	for (const call of message.toolCalls ?? []) {
-		if (call.toolUseId && !isInternalCall(call)) calls.set(call.toolUseId, call);
+	// An envelope tombstone must not be expanded again from its independent audit ledger.
+	if (!isHistoryClearedContent(message.contentJson) && raws[0]?.historyToolsSuppressed !== true) {
+		for (const call of message.toolCalls ?? []) {
+			if (call.toolUseId && !isInternalCall(call)) calls.set(call.toolUseId, call);
+		}
 	}
 	const toolOutputs: Record<string, ToolOutput> = {};
 	const consumed = new Set<string>();
@@ -667,6 +675,17 @@ export function decodeLegacyContent(
 	message: DecodableMessage,
 	options: DecodeOptions = {},
 ): CanonicalEnvelope {
+	if (isHistoryClearedContent(message.contentJson)) {
+		// A durable whole-envelope tombstone wins even over a stale flat-text/ledger
+		// projection or accidentally appended checkpoint elements.
+		message = {
+			...message,
+			contentJson: [(message.contentJson as unknown[])[0]],
+			contentText: "[History cleared]",
+			messageUuid: null,
+			toolCalls: [],
+		};
+	}
 	const envelope: CanonicalEnvelope = {
 		id: message.id,
 		...(message.narratorId ? { narratorId: message.narratorId } : {}),

@@ -1,5 +1,6 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
+import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
@@ -63,6 +64,7 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
+import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import { CreateNarratorLazyModal } from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
@@ -1503,12 +1505,19 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 	);
 }
 
-/** A row's only text: its title on one line. Everything else is in the details card. */
+/** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
 function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	const { data: userPrefs } = useUserPreferences();
+	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
 	return (
-		<Text size="sm" truncate>
-			{tab.title}
-		</Text>
+		<Stack gap={0} style={{ minWidth: 0 }}>
+			<Text size="sm" truncate>
+				{tab.title}
+			</Text>
+			{showDirectory && hasDirectorySubtitle(tab) && tab.subtitle && (
+				<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+			)}
+		</Stack>
 	);
 }
 

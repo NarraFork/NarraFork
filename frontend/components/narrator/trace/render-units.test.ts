@@ -316,6 +316,40 @@ describe("groupToolRunItemsForLod", () => {
 		});
 	});
 
+	test("Outline Ask splits only its own card out of adjacent ordinary calls", () => {
+		const inputJson = { questions: [{ question: "Which approach?" }] };
+		const ask = rowWithElements(
+			{
+				...toolMessage("message-ask", "ask-outline", ""),
+				toolCalls: [{ toolUseId: "ask-outline", toolName: "Ask", inputJson, status: "success" }],
+			},
+			[{ type: "tool_use", id: "ask-outline", name: "Ask", input: inputJson }],
+		) as NarratorMsg;
+		const segments = segmentMessages([
+			toolMessage("before", "before", ""),
+			ask,
+			toolMessage("after", "after", ""),
+		]);
+		const run = segments.find((segment) => segment.kind === "tool-run");
+		if (run?.kind !== "tool-run") throw new Error("missing run");
+		const groups = groupToolRunItemsForLod(run.items);
+		expect(groups.map((group) => group.kind)).toEqual(["folded", "active", "folded"]);
+		expect(
+			groups.map((group) =>
+				group.kind === "active" ? group.item.tc.toolUseId : group.items[0]?.tc.toolUseId,
+			),
+		).toEqual(["before", "ask-outline", "after"]);
+		const units = groupRenderUnits(segments, true);
+		expect(units.map((unit) => unit.kind)).toEqual(["activity", "segment", "activity"]);
+		expect(
+			units.flatMap((unit) =>
+				unit.kind === "segment" && unit.seg.kind === "tool-run"
+					? unit.seg.items.map((item) => item.tc.toolUseId)
+					: [],
+			),
+		).toEqual(["ask-outline"]);
+	});
+
 	test("a denied ExitPlanMode stays a standalone card out of the fold", () => {
 		const deniedPlan = toolMessage("message-plan", "plan-1", "", { status: "fail" });
 		deniedPlan.toolCalls = [

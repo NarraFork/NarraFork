@@ -32,14 +32,23 @@ import {
 import { notifications } from "@mantine/notifications";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import type { LiveCloseCode } from "@shared/outline-live-protocol";
-import { IconArrowDown, IconArrowRight, IconArrowsMaximize, IconSearch } from "@tabler/icons-react";
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+	IconArrowDown,
+	IconArrowRight,
+	IconArrowsMaximize,
+	IconRobot,
+	IconSearch,
+} from "@tabler/icons-react";
+import { type MouseEvent, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { reportLineDisplay } from "../../../lib/outline-report-line";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
+import { useOutlineHost } from "../outline-host";
+import { OutlineHrefLink } from "../outline-nav";
 import type { OutlineViewState } from "../view-state";
 import { type BlockMark, chromeText } from "./chrome";
-import type { LiveClient, LiveTransport } from "./live-client";
+import type { LiveClient, LiveTransport, Peer } from "./live-client";
 import {
 	acquireLiveSession,
 	liveSessionClient,
@@ -186,7 +195,7 @@ function firstLine(text: string): string {
 
 function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSession }) {
 	const { focusId, lens, spaceKey, viewState, shared, pageId } = props;
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const client = shared.client;
 	useEffect(() => {
 		retainLiveSession(shared);
@@ -201,6 +210,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	// Structure refused while connecting: the "connecting" badge nudges.
 	const [nudge, setNudge] = useState(0);
 
+	// Stable per language: the editor caches report-line decorations by this function.
+	const reportLine = useMemo(
+		() => (content: string) => reportLineDisplay(content, { t, locale: i18n?.language }),
+		[t, i18n?.language],
+	);
 	chromeText.fold = t("page.collapse");
 	chromeText.focus = t("page.focus");
 	chromeText.task = t("editor.changeStatus");
@@ -211,6 +225,7 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.locked = (name) => t("lock.badge", { name });
 	chromeText.pending = t("pending.badge");
 	chromeText.question = t("editor.questionMark");
+	chromeText.reportLine = reportLine;
 	chromeText.status = {
 		todo: t("page.task.todo"),
 		doing: t("page.task.doing"),
@@ -219,6 +234,15 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	};
 	mapText.more = (count) => t("map.more", { count });
 	mapText.stage = t("map.stage");
+	// Frames already drawn keep their words until their block redraws: the focus handle (the only
+	// pointer route to focusing a task) follows a change of language at once.
+	const focusLabel = t("page.focus");
+	useEffect(() => {
+		for (const handle of frame.current?.querySelectorAll<HTMLElement>(".ob-zoom") ?? []) {
+			handle.title = focusLabel;
+			handle.setAttribute("aria-label", focusLabel);
+		}
+	}, [focusLabel]);
 
 	useEffect(() => {
 		callbacks.current.onClient?.(client, () => surfaceRef.current?.outline ?? null);
@@ -367,7 +391,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 		setRefusal(null);
 	}, [refusal, t]);
 
-	const peers = [...client.presence.values()];
+	// People first, then the agents the server shows (P2 PR 10b); the ones past six, and agents
+	// past the server's limit, are counted.
+	const present = [...client.presence.values()];
+	const peers = [...present.filter((p) => !p.agent), ...present.filter((p) => p.agent)];
+	const hidden = Math.max(0, peers.length - 6) + client.agentsMore;
 	const status = client.status;
 	const deleted = client.deleted;
 	const view = viewState.view;
@@ -437,23 +465,27 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 					)}
 				</Group>
 				<Group gap={6} wrap="nowrap" className="nf-outline-presence">
-					{peers.length > 0 && (
+					{(peers.length > 0 || hidden > 0) && (
 						<Avatar.Group spacing={6}>
-							{peers.slice(0, 6).map((p) => (
-								<Tooltip
-									key={p.pno}
-									label={t(p.editing ? "editor.peerEditing" : "editor.peerViewing", {
-										name: p.name || t("editor.someone"),
-									})}
-								>
-									<Avatar size={22} radius="xl" style={{ background: p.color, color: "#fff" }}>
-										{(p.name || "?").slice(0, 1).toUpperCase()}
-									</Avatar>
-								</Tooltip>
-							))}
-							{peers.length > 6 && (
-								<Avatar size={22} radius="xl">
-									+{peers.length - 6}
+							{peers.slice(0, 6).map((p) =>
+								p.agent ? (
+									<AgentAvatar key={p.pno} peer={p} />
+								) : (
+									<Tooltip
+										key={p.pno}
+										label={t(p.editing ? "editor.peerEditing" : "editor.peerViewing", {
+											name: p.name || t("editor.someone"),
+										})}
+									>
+										<Avatar size={22} radius="xl" style={{ background: p.color, color: "#fff" }}>
+											{(p.name || "?").slice(0, 1).toUpperCase()}
+										</Avatar>
+									</Tooltip>
+								),
+							)}
+							{hidden > 0 && (
+								<Avatar size={22} radius="xl" data-testid="outline-presence-more">
+									+{hidden}
 								</Avatar>
 							)}
 						</Avatar.Group>
@@ -521,5 +553,83 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			)}
 			<div ref={frame} className="nf-outline-editor-host" data-testid="outline-frame" />
 		</div>
+	);
+}
+
+/**
+ * An agent at work on the page (outline P2 PR 10b): a robot in its session's colour, with the
+ * first letter of its title. Named, and a link to its session, only for a person who may read
+ * that session (the server sends its id then); otherwise just "an agent".
+ *
+ * A plain click opens the session where the host keeps sessions (beside the outline in its dock,
+ * the phone's own page: `useOutlineHost().openSession`), as the timeline's "Open session" does;
+ * a modified click, or a host without the action, follows the link.
+ */
+function AgentAvatar({ peer }: { peer: Peer }) {
+	const { t } = useTranslation("outline");
+	const host = useOutlineHost();
+	const narratorId = peer.agent?.narratorId ?? null;
+	const title = peer.name.trim();
+	const name = title || t("editor.untitledSession");
+	const session = peer.agent?.session ?? null;
+	const label = narratorId
+		? session
+			? t("editor.agentWorkingIn", { name, session })
+			: t("editor.agentWorking", { name })
+		: t("editor.agentHidden");
+	// The first character, not the first UTF-16 unit (an emoji is one character).
+	const initial = narratorId && title ? (Array.from(title)[0] ?? "").toUpperCase() : "";
+	const style = { background: peer.color, color: "#fff" };
+	const face = (
+		<>
+			{initial ? <span className="nf-outline-agent-initial">{initial}</span> : null}
+			<IconRobot
+				size={initial ? 10 : 14}
+				className={initial ? "nf-outline-agent-badge" : undefined}
+				aria-hidden
+			/>
+		</>
+	);
+	return (
+		<Tooltip label={label}>
+			{narratorId ? (
+				<Avatar
+					component={OutlineHrefLink}
+					path={`/narrators/${encodeURIComponent(narratorId)}`}
+					onClick={(event: MouseEvent<HTMLAnchorElement>) => {
+						const plain =
+							event.button === 0 &&
+							!event.ctrlKey &&
+							!event.metaKey &&
+							!event.shiftKey &&
+							!event.altKey;
+						if (!plain || !host.openSession) return;
+						event.preventDefault();
+						host.openSession(narratorId);
+					}}
+					size={22}
+					radius="xl"
+					style={style}
+					className="nf-outline-agent-avatar"
+					aria-label={label}
+					data-testid="outline-agent-avatar"
+					data-agent={narratorId}
+				>
+					{face}
+				</Avatar>
+			) : (
+				<Avatar
+					size={22}
+					radius="xl"
+					style={style}
+					className="nf-outline-agent-avatar"
+					role="img"
+					aria-label={label}
+					data-testid="outline-agent-avatar"
+				>
+					{face}
+				</Avatar>
+			)}
+		</Tooltip>
 	);
 }

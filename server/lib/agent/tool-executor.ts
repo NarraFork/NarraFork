@@ -31,6 +31,7 @@ import {
 	toolNamesSpecPath,
 	toolSpecPathError,
 } from "../spec-uri";
+import { withSqlTraceSpan } from "../sql-trace";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
@@ -788,10 +789,21 @@ export function getOutlineSpecRejection(
 	};
 }
 
-export async function executeTool(
+export function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
+): Promise<ToolExecResult> {
+	// SQL tracing (NF_SQL_TRACE): statements run by this tool call are attributed to it.
+	return withSqlTraceSpan("tool", `tool ${tu.name}`, { narratorId: config.narratorId }, () =>
+		executeToolUntraced(tu, config, options),
+	);
+}
+
+async function executeToolUntraced(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	options: ExecuteToolOptions,
 ): Promise<ToolExecResult> {
 	const reflectionRejection = getReflectionToolRejection(tu, config);
 	if (reflectionRejection) {

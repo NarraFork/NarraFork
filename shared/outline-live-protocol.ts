@@ -96,7 +96,34 @@ export const OUTLINE_LIVE_LIMITS = {
 	presenceIntervalMs: 80,
 	/** Client-side: text-only updates are batched for this long before they are sent. */
 	typingBatchMs: 30,
+	/** Agents a page shows in its presence at most; the rest are counted (`am`, P2 PR 10b). */
+	agentsPerPage: 8,
 } as const;
+
+/**
+ * Participant numbers of agents start here (outline P2 PR 10b): the server sends agents as
+ * participants of its own, apart from the people's numbers (which count up from 1).
+ */
+export const OUTLINE_LIVE_AGENT_PNO_BASE = 1 << 20;
+
+/** The presence palette; a person without an avatar colour, and every agent, get one by id. */
+export const LIVE_PEER_PALETTE = [
+	"#d6336c",
+	"#1c7ed6",
+	"#2f9e44",
+	"#e8590c",
+	"#7048e8",
+	"#0c8599",
+	"#c2255c",
+	"#5f3dc4",
+] as const;
+
+/** The palette colour of an id (a user's, or an agent's session id). */
+export function livePeerColor(id: string): string {
+	let h = 0;
+	for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+	return LIVE_PEER_PALETTE[h % LIVE_PEER_PALETTE.length] as string;
+}
 
 /** Task checkbox as the editor stores it on a block: todo, doing, done, cancelled. */
 export type LiveTaskChar = " " | "/" | "x" | "-";
@@ -162,13 +189,22 @@ export interface LiveJoinHead {
 	resume?: { epoch: number; op: number; tx: number; reset?: boolean };
 }
 
-/** Participant: number, user id, display name, color, `e` editing or `v` viewing. */
+/**
+ * Participant: number, user id, display name, color, `e` editing or `v` viewing. An agent (outline
+ * P2 PR 10b) adds `a`, and for a reader who may read its session: its narrator id and, for a
+ * subagent, the title of the session it belongs to; its user id is empty, and so is its name for a
+ * reader who may not read it ("Agent"). Added after the first protocol version: a client that
+ * reads only the first five shows an agent as a person without a name, which does no harm.
+ */
 export type LivePeerWire = [
 	pno: number,
 	userId: string,
 	name: string,
 	color: string,
 	mode: "e" | "v",
+	kind?: "a",
+	narratorId?: string,
+	session?: string,
 ];
 
 export interface LiveJoinedHead {
@@ -194,6 +230,8 @@ export interface LiveJoinedHead {
 	peers: LivePeerWire[];
 	/** Cursors of the peers now. */
 	cur?: Array<[pno: number, sel: LiveSelWire | null]>;
+	/** Agents present beyond those listed (P2 PR 10b); absent: none. */
+	am?: number;
 	/**
 	 * Of those, the highest already in the log or committed (so safe from a crash): the client
 	 * forgets them. Ones after it up to `tx` are applied but not logged yet; the client keeps
@@ -237,6 +275,8 @@ export interface LivePresenceDown {
 	gone?: number[];
 	/** Latest cursor per participant (last one wins). */
 	cur?: Array<[pno: number, sel: LiveSelWire | null]>;
+	/** Agents present beyond those listed, when it changed (P2 PR 10b). */
+	am?: number;
 }
 
 export type LiveCloseCode =

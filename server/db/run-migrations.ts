@@ -550,8 +550,11 @@ function rewriteOutsideSqlStrings(sql: string, rewrite: (chunk: string) => strin
  * `error in table x after rename: no such column: __new_x.col` — the 0.6.6→0.7.2
  * `file_attributions` crash. Strip only a qualifier that names this same `__new_*`
  * table, so the CHECK survives a rename without rewriting committed migration hashes.
+ *
+ * Exported so the test harness replays the journal through this same protection instead of
+ * re-deriving it.
  */
-function rewriteQualifiedNewTableChecks(stmt: string): string {
+export function rewriteQualifiedNewTableChecks(stmt: string): string {
 	const match = CREATE_NEW_TABLE.exec(stmt);
 	if (!match) return stmt;
 	const tableName = normalizeObjectName(match[1]);

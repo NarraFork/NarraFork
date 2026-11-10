@@ -701,6 +701,8 @@ export const narrators = sqliteTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		// Startup recovery and legacy backfills look up active/legacy rows by status.
+		index("idx_narrators_status").on(table.status),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
 		index("idx_narrators_owner").on(table.ownerUserId),
 		// Leads the visibility predicate pushed down into the paginated list query.
@@ -713,6 +715,16 @@ export const narrators = sqliteTable(
 		// Dependents of a policy source (permission-mode propagation, deletion guard).
 		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
+		// List pages filter by variant + hidden + status before ordering by recency, and count
+		// the same predicate per tab. Covering all three avoids a per-row filter over the
+		// whole variant bucket (measured: ~10ms -> <1ms for both the count and the page).
+		index("idx_narrators_variant_list").on(
+			table.variant,
+			table.hiddenFromLists,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 		// 一个模型只有一个 ModelTrace 舱；SQLite 的唯一索引允许多个 NULL。
@@ -2330,6 +2342,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	/** 最近标签中的会话是否显示工作目录；按账号同步，默认隐藏。 */
+	recentTabsShowDirectory: integer("recent_tabs_show_directory", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),

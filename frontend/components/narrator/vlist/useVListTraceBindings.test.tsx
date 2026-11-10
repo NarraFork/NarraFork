@@ -50,6 +50,7 @@ const toggles: RowToggles = {
 	onToggleTranslation: noop,
 	onTogglePrompt: noop,
 	onToggleFileChanges: noop,
+	onPlanTree: noop,
 };
 const labels = { trace: {}, subagent: { openSession: "open-child" } } as VListRenderLabels;
 const sourceIds: readonly string[] = [];

@@ -84,6 +84,7 @@ import {
 	requestEvidenceFromLegacyAgent,
 	saveSettings,
 	settings,
+	storageRetentionPatchSchema,
 	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
@@ -622,6 +623,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		storageRetention: storageRetentionPatchSchema.optional(),
 		workspace: z.object({ treeSnapshotsEnabled: z.boolean() }).partial().optional(),
 		outline: z.object({ enabled: z.boolean() }).partial().optional(),
 		narratorBlocks: z
@@ -1757,6 +1759,18 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				// Array — replace entirely, don't merge
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				(merged as any)[key] = val;
+			} else if (key === "storageRetention") {
+				const patch = validated.storageRetention;
+				merged.storageRetention = {
+					toolCallPayloads: {
+						...current.storageRetention.toolCallPayloads,
+						...patch?.toolCallPayloads,
+					},
+					messageHistory: {
+						...current.storageRetention.messageHistory,
+						...patch?.messageHistory,
+					},
+				};
 			} else if (key === "speech") {
 				merged.speech = mergeSpeechSettingsPatch(current.speech, val);
 			} else if (key === "proxy") {

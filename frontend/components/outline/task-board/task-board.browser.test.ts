@@ -20,7 +20,7 @@ import { basename } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
-import { db } from "../../../../server/db";
+import { db, sqlite } from "../../../../server/db";
 import {
 	aclGrants,
 	narratorMessageRefs,
@@ -39,6 +39,7 @@ import { outlineStore } from "../../../../server/services/outline/store";
 import { writeOutline } from "../../../../server/services/outline/write";
 import { settleOutlineTaskEditsForTests } from "../../../../server/services/outline-task-edits";
 import { OUTLINE_TASK_BOARD_LIMITS } from "../../../../shared/outline-task-board";
+import { readTestMessageContent } from "../../../../tests/setup";
 import type * as Fixture from "./task-board.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -215,12 +216,12 @@ async function taskByTitle(spaceId: string, title: string) {
 /** What the session was told of people's changes to its tasks. */
 async function notes(narratorId: string): Promise<string> {
 	const rows = await db
-		.select({ json: narratorMessages.contentJson })
+		.select({ id: narratorMessages.id })
 		.from(narratorMessageRefs)
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId));
 	return rows
-		.flatMap((row) => (row.json ?? []) as Array<Record<string, unknown>>)
+		.flatMap((row) => readTestMessageContent(sqlite, row.id))
 		.filter((b) => b.source === "outline_task_edit")
 		.map((b) => String(b.modelText))
 		.join("\n");
@@ -263,6 +264,12 @@ test("a session's board: add, finish, reopen, hand over and back, confirm a goal
 			"task-badge-human",
 			"task-badge-locked",
 		]);
+		// The lock is said by the outline's chip for that state: its icon, then who locked it.
+		expect(await call(page, (f) => f.statusChips())).toContainEqual({
+			status: "locked",
+			text: expect.stringContaining("Locked"),
+			icon: true,
+		});
 		const goal = await taskByTitle(space.id, "Ship the release");
 		expect(goal?.taskJson).toMatchObject({
 			humanCreated: true,
@@ -431,6 +438,50 @@ test("a session's board: reject a goal's completion, hand to a username, cancel 
 		expect(await call(page, (f) => f.row("Drop the flag"))).toBeNull();
 		await page.click("[data-testid=task-board-cancelled-toggle]");
 		await until(page, "unfolded", (f) => f.row("Drop the flag")?.status === "cancelled");
+
+		// Every status group is headed by its state's badge: an icon on a tinted background (the
+		// one a task's checkbox is drawn as in the outline), in both schemes and languages.
+		const colours: Record<string, string> = {};
+		for (const scheme of ["light", "dark"] as const) {
+			await page.evaluate(
+				(s) => document.documentElement.setAttribute("data-mantine-color-scheme", s),
+				scheme,
+			);
+			for (const [language, cancelled] of [
+				["en", "Cancelled"],
+				["zh-CN", "取消"],
+			] as const) {
+				await call(page, (f, l: string) => f.setLanguage(l), language);
+				await until(
+					page,
+					`the board in ${language}`,
+					(f, word: string) =>
+						f.statusBadges().some((b) => b.group === "cancelled" && b.heading.includes(word)),
+					10_000,
+					cancelled,
+				);
+				const badges = await call(page, (f) => f.statusBadges());
+				expect(badges.length).toBeGreaterThanOrEqual(2);
+				for (const badge of badges) {
+					expect(badge, `${scheme} ${language} ${badge.group}`).toMatchObject({
+						status: badge.group,
+						badge: true,
+						tinted: true,
+					});
+					expect(badge.shapes).toBeGreaterThan(0);
+					// The heading says the state in words; the badge adds no character to it.
+					expect(badge.heading).not.toMatch(/[☐☑✓✗◐●○]/);
+				}
+				// Not one look for all: no two statuses share an icon shape (to do and cancelled
+				// share a colour, so the shape is what tells them apart).
+				const statuses = new Set(badges.map((b) => b.group));
+				expect(statuses.size).toBeGreaterThanOrEqual(2);
+				expect(new Set(badges.map((b) => b.icon)).size).toBe(statuses.size);
+				colours[scheme] = badges.find((b) => b.group === "cancelled")?.color ?? "";
+			}
+		}
+		expect(colours.light).not.toBe(colours.dark);
+		await call(page, (f) => f.setLanguage("en"));
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();

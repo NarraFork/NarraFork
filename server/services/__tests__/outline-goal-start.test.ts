@@ -11,11 +11,12 @@ import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { modelInputText, requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
+import { readTestMessageContent } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators, users } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import { AppError } from "../../lib/errors";
 
-const { db } = await import("../../db");
+const { db, sqlite } = await import("../../db");
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 // Bun's mock.module is process-wide; the real module is put back after this file.
@@ -129,11 +130,11 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 5_000): Pr
 
 async function messageBlocks(narratorId: string): Promise<Array<Record<string, unknown>>> {
 	const rows = await db
-		.select({ json: narratorMessages.contentJson })
+		.select({ id: narratorMessages.id })
 		.from(narratorMessageRefs)
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId));
-	return rows.flatMap((row) => (row.json ?? []) as Array<Record<string, unknown>>);
+	return rows.flatMap((row) => readTestMessageContent<Record<string, unknown>>(sqlite, row.id));
 }
 
 function send(narratorId: string, message: string) {

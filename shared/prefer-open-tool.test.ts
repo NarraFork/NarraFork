@@ -118,6 +118,23 @@ describe("prefer-open-tool", () => {
 		expect(isPreferOpenTool({ toolName: "Await", status: "running" })).toBe(false);
 	});
 
+	test("Outline Ask prefers only question-creating calls", () => {
+		expect(
+			isPreferOpenTool({ toolName: "Ask", inputJson: { questions: [{ question: "Why?" }] } }),
+		).toBe(true);
+		for (const inputJson of [
+			undefined,
+			{},
+			{ questions: [] },
+			{ withdraw: ["Q1"] },
+			{ answered: [{ question: "Q1", answer: "yes" }] },
+			{ questions: [{ question: "Why?" }], withdraw: ["Q1"] },
+		]) {
+			expect(isPreferOpenTool({ toolName: "Ask", inputJson })).toBe(false);
+		}
+		expect(prefersOpenToolCategory("outline")).toBe(false);
+	});
+
 	test("EnterPlanMode and ordinary tools are not", () => {
 		// Category "plan" covers both plan-mode tools; only ExitPlanMode is prefer-open
 		// by NAME so a short EnterPlanMode call does not inherit the plan-body default.

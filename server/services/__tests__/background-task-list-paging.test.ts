@@ -70,6 +70,26 @@ const {
 	decodeBackgroundTaskListCursor,
 	encodeBackgroundTaskListCursor,
 } = await import("../background-task-service");
+
+// Observe completion without replacing the real queries, counts or WebSocket publication.
+const pendingBroadcasts = new Set<Promise<void>>();
+const asyncBroadcasters = backgroundTaskService as unknown as Record<
+	"broadcastTaskUpsert" | "broadcastListDelta",
+	(parentNarratorId: string, payload: unknown) => Promise<void>
+>;
+for (const method of ["broadcastTaskUpsert", "broadcastListDelta"] as const) {
+	const original = asyncBroadcasters[method].bind(backgroundTaskService);
+	spyOn(asyncBroadcasters, method).mockImplementation((parentNarratorId, payload) => {
+		const pending = original(parentNarratorId, payload);
+		pendingBroadcasts.add(pending);
+		void pending.then(
+			() => pendingBroadcasts.delete(pending),
+			() => pendingBroadcasts.delete(pending),
+		);
+		return pending;
+	});
+}
+
 const { BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS, BACKGROUND_TASK_LIST_PAGE_SIZE } = await import(
 	"@shared/background-task-list"
 );
@@ -214,9 +234,12 @@ function transitions(values: unknown[]): unknown[] {
 	return values.filter((value, index) => index === 0 || value !== values[index - 1]);
 }
 
-/** Let the fire-and-forget delta broadcasts settle. */
+/** Drain maintenance and actual publication promises, including broadcasts queued by either. */
 async function flushDeltas(): Promise<void> {
-	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+	do {
+		if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
+		await Promise.all([...pendingBroadcasts]);
+	} while (pendingBroadcasts.size > 0);
 }
 
 describe("background task list cursor paging", () => {
@@ -1510,7 +1533,8 @@ describe("background task list deltas", () => {
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
 		await flushDeltas();
 
-		const delta = listDeltas().at(-1);
+		// Maintenance may publish a separate invalidation after the row-removal frame.
+		const delta = listRowDeltas().at(-1);
 		expect(delta?.removeIds).toEqual(["reap-1"]);
 		expect(delta?.invalidate).toBeUndefined();
 	});

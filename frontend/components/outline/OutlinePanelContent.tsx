@@ -40,6 +40,7 @@ import {
 	outlinePanelTitle,
 	sameOutlinePanelState,
 } from "../../lib/outline-panel";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineSurfaceHistory, OutlineSurfaceLoaded } from "./OutlineSurface";
 import { OutlineView } from "./OutlineView";
 import type { OutlineLinkProps, OutlineTarget } from "./outline-nav";
@@ -78,7 +79,10 @@ export function OutlinePanelContent({
 	onTitle,
 	actions,
 }: OutlinePanelContentProps) {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
+	// The tab's name is shown, not stored: a report container's line reads as on its page.
+	const shownTitle = useRef((title: string) => title);
+	shownTitle.current = (title) => reportLineDisplay(title, { t, locale: i18n?.language }) ?? title;
 	const stateRef = useRef(state);
 	stateRef.current = state;
 	const handlers = useRef({ onChange, onOpenNew, onTitle });
@@ -171,7 +175,9 @@ export function OutlinePanelContent({
 			// A load of a state the panel already left (a newer one asked for) changes nothing.
 			const current = latest();
 			if (current.spaceId !== info.spaceId || current.blockId !== info.rootId) return;
-			handlers.current.onTitle?.(outlinePanelTitle(info.title || info.address) ?? null);
+			handlers.current.onTitle?.(
+				outlinePanelTitle(shownTitle.current(info.title) || info.address) ?? null,
+			);
 			if (current.pageId === info.pageId) return;
 			ask({ ...current, pageId: info.pageId });
 		},

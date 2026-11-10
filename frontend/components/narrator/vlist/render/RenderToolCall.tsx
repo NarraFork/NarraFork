@@ -58,6 +58,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import {
 	coerceInjectionTarget,
 	type InjectionTarget,
@@ -155,6 +156,7 @@ import { categoryIcon } from "./category-icons";
 import { DiffStatsText, type DiffStatsValue } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { FragmentGap, LineFragments } from "./line-fragments";
+import { PlanTreeBody, type PlanTreeLabels } from "./PlanTreeBody";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
@@ -211,6 +213,8 @@ export interface ToolCallLabels {
 	permission?: InlinePermissionLabels;
 	/** Reflection-notice labels forwarded to RenderReflectionNotice. */
 	reflection?: ReflectionNoticeLabels;
+	/** An outline plan's tree (toolbar, folds, clamped text): render-only words. */
+	planTree?: PlanTreeLabels;
 }
 
 const DEFAULT_LABELS: Required<
@@ -1524,7 +1528,7 @@ type DetailLabels = Required<
 		ToolCallLabels,
 		"input" | "output" | "planSource" | "download" | "copy" | "copied" | "tasksEmpty"
 	>
-> & { sections?: Partial<Record<ToolSectionLabel, string>> };
+> & { sections?: Partial<Record<ToolSectionLabel, string>>; planTree?: PlanTreeLabels };
 
 /** Localized section-label text (injected bundle wins over the English default). */
 function sectionLabelText(labels: DetailLabels, label: ToolSectionLabel): string {
@@ -2046,6 +2050,7 @@ function DetailRegion({
 	viewControls,
 	specTasksLive,
 	onToggleRaw,
+	onPlanTree,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -2059,6 +2064,8 @@ function DetailRegion({
 	specTasksLive?: boolean;
 	/** The fold under an outline card's change list (raw input, model result). */
 	onToggleRaw?: () => void;
+	/** An outline plan's tree: open or fold a node, a text, or everything. */
+	onPlanTree?: (action: PlanTreeAction) => void;
 }) {
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
@@ -2105,6 +2112,7 @@ function DetailRegion({
 								specTasksLive={specTasksLive}
 								resolveTargetOpener={resolveTargetOpener}
 								onToggleRaw={onToggleRaw}
+								onPlanTree={onPlanTree}
 							/>
 						</div>
 					</Fragment>
@@ -2125,6 +2133,7 @@ export function RenderToolBody({
 	viewControls,
 	specTasksLive,
 	onToggleRaw,
+	onPlanTree,
 }: {
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
@@ -2137,6 +2146,8 @@ export function RenderToolBody({
 	specTasksLive?: boolean;
 	/** The fold under an outline card's change list (raw input, model result). */
 	onToggleRaw?: () => void;
+	/** An outline plan's tree: open or fold a node, a text, or everything. */
+	onPlanTree?: (action: PlanTreeAction) => void;
 }) {
 	const { model, blocks, frame, contentWidth, height, appliedCap } = measured;
 	// The content-view host can update independently of the body. Keep its
@@ -2185,6 +2196,18 @@ export function RenderToolBody({
 				availableWidth={contentWidth}
 				height={height}
 				onToggleRaw={onToggleRaw}
+			/>
+		);
+	if (model.kind === "plan-tree")
+		return (
+			<PlanTreeBody
+				bodyId={`plan-tree:${model.markdown.id}`}
+				blocks={blocks}
+				frames={frame.blocks}
+				availableWidth={contentWidth}
+				height={height}
+				labels={labels.planTree}
+				onPlanTree={onPlanTree}
 			/>
 		);
 	if (model.kind === "ask")
@@ -2371,6 +2394,8 @@ export interface RenderToolCallProps {
 	 * an outline card's raw input and model result under its change list.
 	 */
 	onTogglePrompt?: () => void;
+	/** An outline plan card's tree: open or fold a node, a text, or everything. */
+	onPlanTree?: (action: PlanTreeAction) => void;
 	/**
 	 * Open the full session of the subagent this call waits on (an Await-agent
 	 * card whose target resolved, or a single-target Send). Same affordance as
@@ -2399,6 +2424,8 @@ export interface RenderToolCallProps {
 	 * copy; its height is corrected after paint via the shell's onUnknownHeight.
 	 */
 	permissionSlot?: ReactNode;
+	/** Current Outline questions; unlike permissions, hidden when the card folds. */
+	outlineAskSlot?: ReactNode;
 	/**
 	 * Report the live form's painted OUTER height (its own top margin included).
 	 *
@@ -2591,6 +2618,7 @@ export function RenderToolCall({
 	onPermissionAllow,
 	onPermissionDeny,
 	permissionSlot,
+	outlineAskSlot,
 	onPermissionFormHeight,
 	onReflectionTakeOver,
 	reflectionTakingOver,
@@ -2598,6 +2626,7 @@ export function RenderToolCall({
 	viewControls,
 	specTasksLive,
 	onTogglePrompt,
+	onPlanTree,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2696,7 +2725,9 @@ export function RenderToolCall({
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
 			/>
-			{effectiveOpened && detail ? (
+			{effectiveOpened && outlineAskSlot != null ? (
+				<Box mt={DETAIL_TOP_MARGIN}>{outlineAskSlot}</Box>
+			) : effectiveOpened && detail ? (
 				<Box mt={DETAIL_TOP_MARGIN} style={{ position: "relative" }}>
 					{/* The detail region's own top block already carries the mt gap,
 					    so we render it flush and let its frame own the spacing. */}
@@ -2716,6 +2747,7 @@ export function RenderToolCall({
 							specTasksLive={specTasksLive}
 							resolveTargetOpener={resolveTargetOpener}
 							onToggleRaw={onTogglePrompt}
+							onPlanTree={onPlanTree}
 						/>
 					</div>
 				</Box>

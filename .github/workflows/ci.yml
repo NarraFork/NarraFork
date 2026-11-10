@@ -23,6 +23,9 @@ defaults:
   run:
     shell: bash
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 jobs:
   static-checks:
     name: Static checks

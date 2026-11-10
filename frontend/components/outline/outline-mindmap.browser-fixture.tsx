@@ -58,7 +58,8 @@ import {
 	NODE,
 	nodeSize,
 } from "./mindmap/measure";
-import { prewarmStats, setMeasureWorkerFactoryForTests } from "./mindmap/prewarm";
+import type { MeasureRequest } from "./mindmap/measure.worker";
+import { prewarmBodies, prewarmStats, setMeasureWorkerFactoryForTests } from "./mindmap/prewarm";
 import { OutlineSurface } from "./OutlineSurface";
 import { quickSwitcherIndexOf } from "./QuickSwitcher";
 import { OutlineViewStates } from "./view-state";
@@ -631,17 +632,16 @@ export function nodeText(id: string): string {
 	return surface().map.el(id)?.textContent ?? "";
 }
 
-/** Breadcrumbs: every crumb's text. */
+/** Breadcrumbs: every crumb's text (the ancestors of what is focused, never its own title). */
 export function crumbs(): string[] {
-	const bar = document.querySelector("[data-testid=outline-surface] .mantine-Breadcrumbs-root");
-	return [...(bar?.children ?? [])]
-		.map((el) => (el as HTMLElement).textContent?.trim() ?? "")
-		.filter((t) => t && t !== "/");
+	return [
+		...document.querySelectorAll("[data-testid=outline-surface] [data-testid=outline-crumbs] a"),
+	].map((el) => el.textContent?.trim() ?? "");
 }
 
 export function clickCrumb(text: string): boolean {
 	const a = [
-		...document.querySelectorAll("[data-testid=outline-surface] .mantine-Breadcrumbs-root a"),
+		...document.querySelectorAll("[data-testid=outline-surface] [data-testid=outline-crumbs] a"),
 	].find((el) => el.textContent?.trim() === text) as HTMLElement | undefined;
 	if (!a) return false;
 	a.click();
@@ -812,6 +812,7 @@ export function mapStats() {
 		measureMs: [...m.stats.measureMs],
 		renders: [...m.stats.renders],
 		nodesInDom: m.stats.nodesInDom,
+		provisional: [...m.info.values()].filter((inf) => inf.provisional).length,
 		measure: { ...measureStats },
 		prewarm: { ...prewarmStats },
 	};
@@ -940,8 +941,9 @@ export function showAsOf(seq: number): void {
 	} as never);
 }
 
-/** The typography setting has settled: the map measures what it kept from earlier settings. */
-export function mapTypographySettled(): void {
+/** Explicitly warm the current typography in the Worker before exact-layout assertions. */
+export async function mapTypographySettled(): Promise<void> {
+	await surface().prewarm();
 	surface().map.typographySettled();
 	surface().map.flush();
 }
@@ -965,11 +967,110 @@ export function mapSlotMismatches(): number {
 	return mismatches;
 }
 
+let heldMeasurements: Array<() => void> = [];
+let postedMeasureKeys: string[] = [];
+
+/** Controlled isolated replies let browser tests release capacity one wave at a time. */
+export function controlMeasureWorker(omitFirst = false): void {
+	heldMeasurements = [];
+	postedMeasureKeys = [];
+	let omitted = false;
+	setMeasureWorkerFactoryForTests(() => {
+		const port = {
+			onmessage: null as Worker["onmessage"],
+			onerror: null as Worker["onerror"],
+			postMessage(request: MeasureRequest) {
+				postedMeasureKeys.push(...request.items.map((it) => it.key));
+				const out = request.items
+					.filter(() => {
+						if (!omitFirst || omitted) return true;
+						omitted = true;
+						return false;
+					})
+					.map((it) => [it.key, 200, 24]);
+				heldMeasurements.push(() =>
+					port.onmessage?.call(
+						port as unknown as Worker,
+						new MessageEvent("message", { data: { id: request.id, out, ms: 0 } }),
+					),
+				);
+			},
+			terminate() {
+				heldMeasurements = [];
+			},
+		};
+		return port as unknown as Worker;
+	});
+	clearMeasureCache();
+}
+
+export function controlledMeasureState() {
+	return {
+		waiting: heldMeasurements.length,
+		posted: postedMeasureKeys.length,
+		unique: new Set(postedMeasureKeys).size,
+	};
+}
+
+export function releaseMeasurements(): void {
+	for (const reply of heldMeasurements.splice(0)) reply();
+}
+
+export function occupyMeasureBudget(): void {
+	void prewarmBodies(
+		Array.from({ length: 30 }, (_, i) => ({
+			content: `outside-${i}${"y".repeat(32_000)}`,
+			labelOf: (ref: string, label: string | null) => label ?? ref,
+		})),
+	);
+}
+
 /** A measuring Worker that takes requests and never answers (hung, or very slow). */
 export function hangWorker(): void {
 	setMeasureWorkerFactoryForTests(
 		() => ({ postMessage() {}, terminate() {} }) as unknown as Worker,
 	);
+}
+
+/** Fault injection before requests are posted; no production fallback entry is exposed. */
+export function failWorker(mode: "construct" | "send" | "error" | "partial"): void {
+	setMeasureWorkerFactoryForTests(() => {
+		if (mode === "construct") throw new Error("injected creation failure");
+		const inner =
+			mode === "partial"
+				? new Worker(new URL("./mindmap/measure.worker.ts", import.meta.url), { type: "module" })
+				: null;
+		const port = {
+			onmessage: null as Worker["onmessage"],
+			onerror: null as Worker["onerror"],
+			postMessage(message: unknown) {
+				if (mode === "send") throw new Error("injected send failure");
+				if (mode === "error")
+					queueMicrotask(() => port.onerror?.call(inner as Worker, new ErrorEvent("error")));
+				else inner?.postMessage(message);
+			},
+			terminate() {
+				inner?.terminate();
+			},
+		};
+		if (inner)
+			inner.onmessage = (event) => {
+				const packet = event.data;
+				const out = packet.out.slice(0, 1);
+				port.onmessage?.call(inner, new MessageEvent("message", { data: { ...packet, out } }));
+			};
+		return port as unknown as Worker;
+	});
+	clearMeasureCache();
+}
+
+/** Restore the isolated executor and wait for its exact sizes (including a recovery repaint). */
+export async function restoreWorker(): Promise<void> {
+	setMeasureWorkerFactoryForTests(
+		() => new Worker(new URL("./mindmap/measure.worker.ts", import.meta.url), { type: "module" }),
+	);
+	await surface().prewarm();
+	surface().map.flush();
 }
 
 /** Set the reader's typography, as the 外观 panel's sliders do (the variables follow). */
@@ -1037,7 +1138,7 @@ export { findBlockPos };
 // Measuring (performance runs: numbers are logged, never asserted)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** No Worker: node sizes are measured where needed (the cold first switch). */
+/** No Worker: the cold first switch uses clipped plain-text placeholders. */
 export function disableWorker(): void {
 	setMeasureWorkerFactoryForTests(null);
 	clearMeasureCache();

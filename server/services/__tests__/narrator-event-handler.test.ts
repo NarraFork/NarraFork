@@ -4,7 +4,7 @@ import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
+import { getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	apiRequests,
 	narratorMessageRefs,
@@ -368,7 +368,7 @@ describe("request attribution", () => {
 				where: eq(narratorMessages.id, partialId as string),
 			});
 			expect(persisted).toMatchObject({ model: "gpt-resolved", provider: "openai" });
-			expect(persisted?.contentJson).toMatchObject([
+			expect(readTestMessageContent(sqlite, partialId as string)).toMatchObject([
 				{ type: "reasoning", text: "Actual reasoning" },
 			]);
 		} finally {
@@ -803,11 +803,11 @@ describe("durable API error association", () => {
 			});
 			// Re-read backing storage (the path used after refresh), not a live broadcast.
 			const message = db
-				.select({ content: narratorMessages.contentJson })
+				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, id))
 				.get();
-			expect(message?.content).toEqual([
+			expect(readTestMessageContent(sqlite, message?.id ?? "")).toEqual([
 				{ type: "error", message: "upstream failed", diagnostics },
 			]);
 			expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThanOrEqual(16 * 1024);
@@ -834,11 +834,13 @@ describe("durable API error association", () => {
 				errorMessage: "internal failure",
 			});
 			const message = db
-				.select({ content: narratorMessages.contentJson })
+				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, id))
 				.get();
-			expect(message?.content).toEqual([{ type: "error", message: "internal failure" }]);
+			expect(readTestMessageContent(sqlite, message?.id ?? "")).toEqual([
+				{ type: "error", message: "internal failure" },
+			]);
 			const diagnostics = {
 				schema: "narrafork.error-diagnostics.v1" as const,
 				requestId: "untrusted-upstream-only",
@@ -1096,17 +1098,15 @@ describe("assistant file-reference provenance", () => {
 				{ type: "assistant_message", text: "[file](src/a.ts#L2)next", toolUses: [] },
 				ctx,
 			);
-			const reloaded = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedId as string),
-			});
-			expect(reloaded?.contentJson).toMatchObject([
+			const reloaded = readTestMessageContent(sqlite, savedId as string);
+			expect(reloaded).toMatchObject([
 				{ fileReferenceContext: { deviceId: "DeviceA", cwd: "/repo" } },
 				{ fileReferenceContext: { deviceId: "DeviceB", cwd: "/other" } },
 			]);
 			const final = broadcastMessages.findLast(
 				(m) => (m as { type?: string }).type === "message",
 			) as { message: { contentJson: unknown } };
-			expect(final.message.contentJson).toEqual(reloaded?.contentJson);
+			expect(final.message.contentJson).toEqual(reloaded);
 		} finally {
 			clearStreamingSnapshot(id);
 			await cleanupFileContextNarrator(id);
@@ -1158,14 +1158,12 @@ describe("assistant file-reference provenance", () => {
 				{ type: "block_complete", block: { type: "text", text: "first second", outputIndex: 1 } },
 				ctx,
 			);
-			const message = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, partialId as string),
-			});
-			expect((message?.contentJson as unknown[])?.[0]).toMatchObject({
+			const content = readTestMessageContent(sqlite, partialId as string);
+			expect(content[0]).toMatchObject({
 				type: "text",
 				text: "first second",
 			});
-			expect((message?.contentJson as unknown[])?.[0]).not.toHaveProperty("fileReferenceContext");
+			expect(content[0]).not.toHaveProperty("fileReferenceContext");
 		} finally {
 			clearStreamingSnapshot(id);
 			await cleanupFileContextNarrator(id);
@@ -1197,10 +1195,8 @@ describe("assistant file-reference provenance", () => {
 				{ type: "block_complete", block: { type: "text", text: "src/a.ts" } },
 				ctx,
 			);
-			const message = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, partialId as string),
-			});
-			expect((message?.contentJson as unknown[])?.[0]).not.toHaveProperty("fileReferenceContext");
+			const content = readTestMessageContent(sqlite, partialId as string);
+			expect(content[0]).not.toHaveProperty("fileReferenceContext");
 		} finally {
 			await cleanupFileContextNarrator(id);
 		}
@@ -2030,10 +2026,7 @@ describe("narrator event handler persistence", () => {
 				ctx,
 			);
 
-			const saved = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedMessageId as string),
-				columns: { contentJson: true },
-			});
+			const saved = readTestMessageContent(sqlite, savedMessageId as string);
 			const getToolIds = (contentJson: unknown) =>
 				(Array.isArray(contentJson) ? contentJson : [])
 					.filter(
@@ -2045,7 +2038,7 @@ describe("narrator event handler persistence", () => {
 					)
 					.map((block) => block.id);
 			const expected = ["tool-a", "tool-b"];
-			expect(getToolIds(saved?.contentJson)).toEqual(expected);
+			expect(getToolIds(saved)).toEqual(expected);
 
 			const messageBroadcast = broadcastMessages.find(
 				(message): message is { type: "message"; message?: { contentJson?: unknown } } =>
@@ -2339,14 +2332,10 @@ test.each([
 		} finally {
 			cowSpy?.mockRestore();
 		}
-		const current = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-		});
-		const snapshot = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, sharedId),
-		});
-		expect(current?.contentJson).toEqual([{ type: "text", text: "historical prefix" }]);
-		expect(JSON.stringify(snapshot?.contentJson)).toContain("current thought");
+		const current = readTestMessageContent(sqlite, partialId);
+		const snapshot = readTestMessageContent(sqlite, sharedId);
+		expect(current).toEqual([{ type: "text", text: "historical prefix" }]);
+		expect(JSON.stringify(snapshot)).toContain("current thought");
 		expect(partialId).not.toBe(sharedId);
 		expect(
 			broadcastMessages.some((message) => (message as { type: string }).type === "streaming_reset"),
