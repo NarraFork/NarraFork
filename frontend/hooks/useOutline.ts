@@ -1,6 +1,7 @@
 /**
  * Queries and live updates of the read-only outline pages.
  */
+
 import type {
 	OutlineAnswerHttpInput,
 	OutlineBlockViewResponse,
@@ -13,6 +14,7 @@ import {
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
+import { boundedFoldView } from "@shared/outline-fold";
 import {
 	type QueryClient,
 	useInfiniteQuery,
@@ -199,11 +201,15 @@ export function useOutlineViewStateSync(
 		const write = () => {
 			timer = null;
 			// Block ids only (the server refuses anything else); the last write of the page wins.
-			const collapsed = [...state.collapsed]
-				.filter((id) => OUTLINE_BLOCK_ID_RE.test(id))
-				.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed);
+			// What the reader opened and what they closed share one limit.
+			const ok = (ids: Iterable<string>) =>
+				new Set([...ids].filter((id) => OUTLINE_BLOCK_ID_RE.test(id)));
+			const folding = boundedFoldView(
+				{ expanded: ok(state.expanded), collapsed: ok(state.collapsed) },
+				OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+			);
 			void api
-				.putOutlineViewState(pageId, { collapsed, layout: state.layout })
+				.putOutlineViewState(pageId, { ...folding, layout: state.layout })
 				.catch(() => undefined);
 		};
 		const off = state.on((part) => {
@@ -218,7 +224,7 @@ export function useOutlineViewStateSync(
 				.getOutlineViewState(pageId)
 				.then((stored) => {
 					if (disposed || touched || stored.updatedAt === null) return;
-					state.applyStored(stored.collapsed, stored.layout);
+					state.applyStored(stored.collapsed, stored.expanded ?? [], stored.layout);
 				})
 				.catch(() => loadedViewStates.delete(state));
 		}

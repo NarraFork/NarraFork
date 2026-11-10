@@ -51,6 +51,7 @@ import {
 import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
+import type { FoldAction, FoldTree, FoldView } from "@shared/outline-fold";
 import {
 	IconArrowLeft,
 	IconArrowRight,
@@ -296,16 +297,25 @@ function SurfaceBody({
 			}),
 		[viewState],
 	);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: foldVersion says the set changed
-	const collapsed = useMemo<ReadonlySet<string>>(
-		() => new Set(viewState?.collapsed ?? []),
+	// The reader's folding as the read-only tree takes it: a new object when it changed.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: foldVersion says the sets changed
+	const fold = useMemo<FoldView>(
+		() => ({
+			expanded: new Set(viewState?.expanded ?? []),
+			collapsed: new Set(viewState?.collapsed ?? []),
+		}),
 		[viewState, foldVersion],
 	);
 	useOutlineViewStateSync(pageId, viewState);
 	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
 	const switcher = useRef<QuickSwitcherHandle | null>(null);
 	const openSwitcher = useCallback(() => switcher.current?.open(), []);
-	const toggle = useCallback((id: string) => viewState?.toggleCollapsed(id), [viewState]);
+	const onFold = useCallback(
+		(tree: FoldTree, action: FoldAction) => {
+			viewState?.fold(tree, action);
+		},
+		[viewState],
+	);
 
 	const mobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const { ref: surfaceRef, width } = useElementSize();
@@ -639,12 +649,7 @@ function SurfaceBody({
 										<OutlineBlockBody content={root.content} />
 									</Box>
 								)}
-								<OutlineBlockTree
-									view={view}
-									collapsed={collapsed}
-									search={linkSearch}
-									onToggle={toggle}
-								/>
+								<OutlineBlockTree view={view} fold={fold} search={linkSearch} onFold={onFold} />
 							</>
 						)}
 						{/* Answer in the main content, also when live editing or the sidebar is unavailable.
