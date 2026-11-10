@@ -620,6 +620,7 @@ export function useVListLabels(): VListLabels {
 			taskNoticeViewEmpty: t("sidecar.taskNotice.viewEmpty"),
 			taskNoticeViewCurrent: t("sidecar.taskNotice.viewCurrent"),
 			taskNoticeViewRefreshed: t("sidecar.taskNotice.viewRefreshed"),
+			taskNoticeViewChangedOne: t("sidecar.taskNotice.viewChangedOne"),
 			taskNoticeViewChanged: t("sidecar.taskNotice.viewChanged", { n: "{n}" }),
 			taskNoticeViewDid_done: t("sidecar.taskNotice.viewDid_done", { title: "{title}" }),
 			taskNoticeViewDid_started: t("sidecar.taskNotice.viewDid_started", { title: "{title}" }),

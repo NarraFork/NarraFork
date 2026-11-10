@@ -317,6 +317,11 @@ export interface OutlineTasksViewChange {
 	kind: OutlineTasksViewChangeKind;
 	/** Where the view filed it before; absent when it was not listed (or not known). */
 	from?: OutlineTasksViewState;
+	/**
+	 * `from` is absent because the previous state table was cut, not because the task is new: the
+	 * task may have been a to-do past the cut. A reader must not call it new.
+	 */
+	fromUnknown?: true;
 }
 
 /**
@@ -434,6 +439,7 @@ function viewChanges(raw: unknown): OutlineTasksViewChange[] {
 			...(typeof item.from === "string" && VIEW_STATES.has(item.from)
 				? { from: item.from as OutlineTasksViewState }
 				: {}),
+			...(item.fromUnknown === true ? { fromUnknown: true as const } : {}),
 		});
 	}
 	return out;

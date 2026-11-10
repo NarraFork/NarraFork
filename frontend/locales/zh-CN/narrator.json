@@ -2100,6 +2100,7 @@
 			"viewEmpty": "当前任务列表为空",
 			"viewCurrent": "当前任务",
 			"viewRefreshed": "任务列表已刷新",
+			"viewChangedOne": "任务有 1 处变化",
 			"viewChanged": "任务有 {{n}} 处变化",
 			"viewDid_done": "完成『{{title}}』",
 			"viewDid_started": "开始『{{title}}』",

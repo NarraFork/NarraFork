@@ -132,8 +132,24 @@ describe("diffOutlineTasksViews", () => {
 	test("a cut PREVIOUS table: a to-do missing from it is not reported as added", () => {
 		const before = view({ doing: ["s/a"], todo: ["s/b"] }, {}, { statesMore: true });
 		const after = view({ doing: ["s/a", "s/x"], waiting: ["s/w"], todo: ["s/b", "s/new"] });
-		// Past the cut there were only to-dos: one in progress now did start, one waiting does wait.
-		expect(kinds(before, after)).toEqual(["s/x:started", "s/w:waiting"]);
+		// Past the cut there were only to-dos: one in progress now did start, but it is not known to
+		// be NEW (`fromUnknown`); whether the one waiting began to wait is not known at all, so it
+		// is counted and never named.
+		expect(diffOutlineTasksViews(before, after)).toEqual([
+			{ address: "s/x", kind: "started", fromUnknown: true },
+			{ address: "s/w", kind: "waiting", fromUnknown: true, unnamed: true },
+		]);
+		const delegated = view({ doing: ["s/a"], delegated: ["s/g"], todo: ["s/b"] });
+		expect(diffOutlineTasksViews(before, delegated)).toEqual([
+			{ address: "s/g", kind: "delegated", fromUnknown: true },
+		]);
+		// With a whole previous table the same arrivals are new, and say nothing of the kind.
+		const whole = view({ doing: ["s/a"], todo: ["s/b"] });
+		expect(diffOutlineTasksViews(whole, after)).toEqual([
+			{ address: "s/x", kind: "started" },
+			{ address: "s/w", kind: "added" },
+			{ address: "s/new", kind: "added" },
+		]);
 	});
 
 	test("a cut NEXT table: a task missing from it is gone only if its block says so", () => {
@@ -188,6 +204,55 @@ describe("settleOutlineTasksViewChanges", () => {
 		expect(settled.changed).toBe(9);
 		expect(settled.changes.map((c) => c.address)).toEqual(addresses.slice(0, 5));
 		expect(settled.changes).toHaveLength(OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.changes);
+	});
+
+	test("a cut previous table: the unknown origin is kept, the waiting arrival only counted", () => {
+		const before = view({ doing: ["s/a"], todo: ["s/b"] }, {}, { statesMore: true });
+		const after = view(
+			{ doing: ["s/a", "s/x"], waiting: ["s/w"], todo: ["s/b"] },
+			{ "s/x": "Past the cut", "s/w": "Waits" },
+		);
+		const deltas = diffOutlineTasksViews(before, after) ?? [];
+		// Even with its block read (a title in hand), the waiting one is not named.
+		const settled = settleOutlineTasksViewChanges(
+			deltas,
+			facts({ "s/w": { fate: "open", title: "Waits" } }),
+		);
+		expect(settled).toEqual({
+			changes: [{ address: "s/x", kind: "started", title: "Past the cut", fromUnknown: true }],
+			changed: 2,
+		});
+		// Stored and read back, the flag survives; anything but `true` is dropped.
+		const read = coerceOutlineTasksViewDisplay({
+			...after,
+			changes: [
+				...settled.changes,
+				{ address: "s/y", title: "Y", kind: "started", fromUnknown: "yes" },
+			],
+			changed: 3,
+		});
+		expect(read?.changes).toEqual([
+			{ address: "s/x", kind: "started", title: "Past the cut", fromUnknown: true },
+			{ address: "s/y", title: "Y", kind: "started" },
+		]);
+	});
+
+	test("the title the session was shown wins over the one a block has now", () => {
+		const before = view({ doing: ["s/a"] }, { "s/a": "Add tests" });
+		const deltas = diffOutlineTasksViews(before, view({ todo: ["s/n"] })) ?? [];
+		const settled = settleOutlineTasksViewChanges(
+			deltas,
+			facts({
+				// Renamed as it was finished: the reader knew it by the title the view listed.
+				"s/a": { fate: "done", title: "Add tests (final)" },
+				// No view titled this one: its block's title is all there is.
+				"s/n": { fate: "open", title: "Read from its block" },
+			}),
+		);
+		expect(settled.changes.map((c) => [c.kind, c.title])).toEqual([
+			["done", "Add tests"],
+			["added", "Read from its block"],
+		]);
 	});
 
 	test("a change nobody titled is counted, never named by its address", () => {

@@ -347,6 +347,37 @@ describe("what changed since the view the session saw before", () => {
 		expect(named(await latest(id))).toEqual(["done:Add tests<doing"]);
 	});
 
+	test("a full fork: its first row lists its own tasks, never the parent's as having left", async () => {
+		const id = await session();
+		const s = await seed(id, ["Parent task", "Parent next"]);
+		await write(s, id, [setTask(s, "Parent task", "doing")]);
+		await request(id);
+		await write(s, id, [setTask(s, "Parent next", "doing")]);
+		await request(id);
+		const parentRows = await updates(id);
+		expect(named(parentRows[0]?.view ?? null)).toEqual(["started:Parent next<todo"]);
+		const fork = await narratorService.forkNarrator(id, null, { inheritMode: "full" });
+		invalidateTaskBackend();
+		// The fork has the parent's history (its marker and its row), and tasks of its own.
+		expect(await updates(fork.id)).toHaveLength(1);
+		const f = await seed(fork.id, ["Fork task"]);
+		await write(f, fork.id, [setTask(f, "Fork task", "doing")]);
+		await request(fork.id);
+		const first = (await updates(fork.id)).at(-1)?.view ?? null;
+		expect(first?.doing.map((t) => t.title)).toEqual(["Fork task"]);
+		// Not compared with what the parent saw: nothing "no longer listed", nothing "started".
+		expect(first?.changes).toBeUndefined();
+		expect(first?.changed).toBeUndefined();
+		// From its own first row on, the fork compares as any session does.
+		await write(f, fork.id, [setTask(f, "Fork task", "done")]);
+		await request(fork.id);
+		expect(named((await updates(fork.id)).at(-1)?.view ?? null)).toEqual(["done:Fork task<doing"]);
+		// The parent goes on comparing with its own rows.
+		await write(s, id, [setTask(s, "Parent task", "done")]);
+		await request(id);
+		expect(named(await latest(id))).toEqual(["done:Parent task<doing"]);
+	});
+
 	test("the baseline's summary is the marker's alone: the prefix and its hashes do not move", async () => {
 		const { getPrefixText } = await import("../../narrator-prefix-snapshots");
 		const { narratorPersistence } = await import("../../narrator-persistence");
@@ -710,6 +741,53 @@ describe("the baseline is the session's previous row of the same epoch", () => {
 		expect(previousContextDisplay([], "e1", KEY, { [KEY]: null })).toBeNull();
 		expect(previousContextDisplay([], "e1", KEY, { other: 1 })).toBeUndefined();
 		expect(previousContextDisplay(messages, "e2", KEY, { [KEY]: { v: 0 } })).toEqual({ v: 0 });
+		// A fork inherits its parent's rows and marker: what the PARENT was shown is no baseline
+		// for the fork, whether the row is shared (still the parent's) or copied (written by it).
+		const owned = (owner: string, author: string | null) =>
+			({
+				...row("7", "e1", KEY, { [KEY]: { v: 7 } }),
+				narratorId: owner,
+				authorNarratorId: author,
+			}) as DbMessage;
+		expect(previousContextDisplay([owned("me", null)], "e1", KEY, undefined, "me")).toEqual({
+			v: 7,
+		});
+		expect(previousContextDisplay([owned("me", "me")], "e1", KEY, undefined, "me")).toEqual({
+			v: 7,
+		});
+		expect(
+			previousContextDisplay([owned("parent", null)], "e1", KEY, undefined, "me"),
+		).toBeUndefined();
+		expect(
+			previousContextDisplay([owned("me", "parent")], "e1", KEY, undefined, "me"),
+		).toBeUndefined();
+		// The parent's row is the latest: an older row of the fork's own does not stand in for it.
+		expect(
+			previousContextDisplay(
+				[owned("me", null), { ...owned("parent", null), id: "8" }],
+				"e1",
+				KEY,
+				undefined,
+				"me",
+			),
+		).toBeUndefined();
+		// The parent's marker: its baseline is the parent's too. A marker not in the history (the
+		// one this request opened) is the session's own.
+		const marker = (owner: string) =>
+			({
+				id: "e1",
+				role: "system",
+				narratorId: owner,
+				contentText: null,
+				contentJson: [{ type: "epoch" }],
+			}) as unknown as DbMessage;
+		expect(
+			previousContextDisplay([marker("parent")], "e1", KEY, { [KEY]: { v: 0 } }, "me"),
+		).toBeUndefined();
+		expect(previousContextDisplay([marker("me")], "e1", KEY, { [KEY]: { v: 0 } }, "me")).toEqual({
+			v: 0,
+		});
+		expect(previousContextDisplay([], "e1", KEY, { [KEY]: { v: 0 } }, "me")).toEqual({ v: 0 });
 		// A row of the epoch always wins over its baseline, a row without a summary included.
 		expect(previousContextDisplay(messages, "e1", KEY, { [KEY]: { v: 0 } })).toEqual({ v: 2 });
 		expect(

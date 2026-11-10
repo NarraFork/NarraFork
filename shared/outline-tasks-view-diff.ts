@@ -17,8 +17,9 @@
  * is no change, a new title is `renamed` when both views listed the task.
  *
  * A table that is not every open task (`statesMore`) never proves absence: a task missing from a
- * cut PREVIOUS table is not reported as added, and one missing from a cut NEXT table is reported
- * only when its block says it is finished or gone.
+ * cut PREVIOUS table is not reported as added (one in progress or delegated now is reported
+ * without calling it new, `fromUnknown`; one waiting now is only counted), and one missing from a
+ * cut NEXT table is reported only when its block says it is finished or gone.
  *
  * Zero DOM, no server imports.
  */
@@ -41,6 +42,16 @@ export interface OutlineTasksViewDelta {
 	from?: OutlineTasksViewState;
 	/** Its title, when one of the two views listed it. */
 	title?: string;
+	/**
+	 * The task was not in the previous table because that table was cut: where it came from is
+	 * not known (a to-do past the cut, or new). It is a change, but not a NEW task.
+	 */
+	fromUnknown?: true;
+	/**
+	 * Counted, never named: what the tables show of it is too little to put in words (a task
+	 * waiting now that a cut previous table did not list may have been waiting already).
+	 */
+	unnamed?: true;
 	/**
 	 * `gone` only: false when the next table is cut, so the task may simply be past the cut. It is
 	 * then a change only if its block says so.
@@ -91,11 +102,13 @@ function transition(
 	return from === "waiting" ? "unblocked" : "requeued";
 }
 
-/** What a task not listed before did by being `to` now; null when a cut table cannot tell. */
+/**
+ * What a task not listed before did by being `to` now; null when a cut table cannot tell (a to-do
+ * was a to-do past the cut already, or is new: only the cut knows).
+ */
 function arrival(to: OutlineTasksViewState, cut: boolean): OutlineTasksViewChangeKind | null {
 	if (to === "doing") return "started";
 	if (to === "delegated") return "delegated";
-	// Past the cut of the previous table it was a to-do already, or it is new: only the cut knows.
 	if (cut) return to === "waiting" ? "waiting" : null;
 	return "added";
 }
@@ -129,6 +142,10 @@ export function diffOutlineTasksViews(
 			kind,
 			...(from !== undefined ? { from } : {}),
 			...(title !== undefined ? { title } : {}),
+			// Missing from a CUT previous table: it is under way now, but nobody can say it is new;
+			// and whether a waiting one began to wait is not known either, so it is only counted.
+			...(from === undefined && before.more ? { fromUnknown: true as const } : {}),
+			...(from === undefined && before.more && to === "waiting" ? { unnamed: true as const } : {}),
 		});
 	}
 	for (const [address, from] of before.states) {
@@ -179,11 +196,14 @@ export function settleOutlineTasksViewChanges(
 		else if (fact?.fate && fact.fate !== "open") kind = fact.fate;
 		else if (delta.sure) kind = "unlisted";
 		else continue;
-		const title = fact?.title || delta.title;
+		// The title the session was shown, when a view listed the task; what its block says now
+		// only for a task no view titled. Counted only: no title, so it is never named.
+		const title = delta.unnamed ? undefined : delta.title || fact?.title;
 		settled.push({
 			address: delta.address,
 			kind,
 			...(delta.from ? { from: delta.from } : {}),
+			...(delta.fromUnknown ? { fromUnknown: true as const } : {}),
 			...(title ? { title } : {}),
 		});
 	}

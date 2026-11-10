@@ -477,6 +477,47 @@ describe("an update of the current-tasks view says what changed (任务树可读
 			.data as TaskNoticeData;
 		expect(data.title).toBe("任务有 3 处变化");
 		expect(data.quiet).toBeUndefined();
+		const one = specOf(viewUpdate("m-cnt1", { ...CHANGED_VIEW, changes: [], changed: 1 }))
+			.data as TaskNoticeData;
+		expect(one.title).toBe("任务有 1 处变化");
+	});
+
+	it("started from past a cut table: under way, but never called new", () => {
+		const view = (fromUnknown: boolean) =>
+			specOf(
+				viewUpdate(`m-cut-${fromUnknown}`, {
+					doing: [{ address: `${K}/Fx11race`, title: "修竞态" }],
+					waiting: [],
+					next: [],
+					counts: { doing: 1, waiting: 0, todo: 60 },
+					more: true,
+					states: { doing: [`${K}/Fx11race`] },
+					statesMore: true,
+					changes: [
+						{
+							address: `${K}/Fx11race`,
+							title: "修竞态",
+							kind: "started",
+							...(fromUnknown ? { fromUnknown: true } : {}),
+						},
+					],
+					changed: 1,
+				}),
+				true,
+			).data as TaskNoticeData;
+		// The previous table was cut: the task may have been a to-do all along.
+		const unknown = view(true);
+		expect(unknown.title).toBe("开始『修竞态』");
+		expect(unknown.rows[0]).toMatchObject({
+			title: "修竞态",
+			status: { label: "进行中" },
+			changed: true,
+		});
+		expect(unknown.rows[0]?.note).toBeUndefined();
+		expect(unknown.rows[0]?.statusFrom).toBeUndefined();
+		expect(unknown.text).not.toContain("新加");
+		// With a whole previous table the same change IS a new task, and the row says so.
+		expect(view(false).rows[0]?.note).toBe("新加");
 	});
 
 	it("unfolded: the changes the list does not show come first, changed rows are marked", () => {
@@ -676,6 +717,20 @@ describe("an update of the current-tasks view says what changed (任务树可读
 		);
 		// A phrase that starts with the title's quote has nothing to capitalise.
 		expect(waiting?.title).toBe("“Review” is now waiting");
+		// Counted changes: a singular and a plural, no "(s)".
+		const counted = (n: number) =>
+			taskNoticeFromContextUpdate(
+				[
+					blocks[0] as never,
+					{
+						type: "context_update",
+						display: { "outline.tasks": { ...CHANGED_VIEW, changes: [], changed: n } },
+					},
+				],
+				null,
+				undefined,
+			)?.title;
+		expect([counted(1), counted(2)]).toEqual(["1 task change", "2 task changes"]);
 	});
 
 	it("the shell has every label the card reads, in both languages", async () => {
@@ -944,7 +999,11 @@ describe("measure and render agree; links open the outline only inside a host", 
 			false,
 			true,
 		]);
-		expect(rows[0]?.textContent).toContain("进行中→完成补测试");
+		// From one chip to the other: an icon, never a text glyph.
+		expect(rows[0]?.textContent).toContain("进行中完成补测试");
+		expect(open.container.textContent).not.toContain("→");
+		expect(rows[0]?.querySelectorAll("svg[data-task-notice-arrow]")).toHaveLength(1);
+		expect(open.container.querySelectorAll("svg[data-task-notice-arrow]")).toHaveLength(3);
 		open.unmount();
 	});
 

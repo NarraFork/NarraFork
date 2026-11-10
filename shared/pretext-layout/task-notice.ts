@@ -155,7 +155,8 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeViewEmpty: "The current task list is empty",
 	taskNoticeViewCurrent: "Current tasks",
 	taskNoticeViewRefreshed: "Task list refreshed",
-	taskNoticeViewChanged: "{n} task change(s)",
+	taskNoticeViewChangedOne: "1 task change",
+	taskNoticeViewChanged: "{n} task changes",
 	taskNoticeViewDid_done: "finished \u201c{title}\u201d",
 	taskNoticeViewDid_started: "started \u201c{title}\u201d",
 	taskNoticeViewDid_cancelled: "cancelled \u201c{title}\u201d",
@@ -552,7 +553,11 @@ function changeSentence(view: OutlineTasksViewDisplay, labels: Labels): string |
 	const total = view.changed ?? 0;
 	if (total <= 0) return null;
 	const named = (view.changes ?? []).slice(0, TASK_NOTICE_VIEW_NAMED_CHANGES);
-	if (named.length === 0) return label(labels, "taskNoticeViewChanged", { n: total });
+	if (named.length === 0) {
+		return label(labels, total === 1 ? "taskNoticeViewChangedOne" : "taskNoticeViewChanged", {
+			n: total,
+		});
+	}
 	const list = named
 		.map((change) =>
 			label(labels, `taskNoticeViewDid_${change.kind}`, {
@@ -590,9 +595,12 @@ function changeMarks(
 ): Pick<TaskNoticeRow, "statusFrom" | "note" | "changed"> {
 	const from = change.from && change.from !== status ? chip(change.from, labels) : undefined;
 	// New on the list and already under way: no state to come from, so the row says it is new.
+	// Not when the state it came from is merely unknown (the previous table was cut).
 	const noteKey =
 		CHANGE_NOTE[change.kind] ??
-		(!change.from && !GONE_STATUS[change.kind] ? "taskNoticeChangeAdded" : undefined);
+		(!change.from && !change.fromUnknown && !GONE_STATUS[change.kind]
+			? "taskNoticeChangeAdded"
+			: undefined);
 	return {
 		...(from && status ? { statusFrom: from } : {}),
 		...(noteKey ? { note: label(labels, noteKey) } : {}),

@@ -634,13 +634,15 @@ async function readTaskFact(
 	if (!spaces.has(key)) spaces.set(key, (await outlineStore.getSpaceByKey(key))?.id ?? null);
 	const spaceId = spaces.get(key);
 	if (!spaceId) return { fate: "removed" };
-	const block = await outlineStore.getBlockBySid(spaceId, sid);
+	// Its fields and the head of its content (enough for a title), never its whole body.
+	const [block] = await outlineStore.getBlockMetas(spaceId, { sids: [sid] });
+	const [head] = block ? await outlineStore.getBlockHeads([block.id]) : [];
+	const named = clip(blockTitle(head?.contentHead ?? ""), OUTLINE_VIEW_LIMITS.titleChars);
 	if (!block || block.deleted || !block.taskJson) {
 		// Its title is still worth naming when the block is there (no longer a task, or deleted).
-		const title = block ? clip(blockTitle(block.content), OUTLINE_VIEW_LIMITS.titleChars) : "";
-		return { fate: "removed", ...(title ? { title } : {}) };
+		return { fate: "removed", ...(named ? { title: named } : {}) };
 	}
-	const title = clip(blockTitle(block.content) || block.sid, OUTLINE_VIEW_LIMITS.titleChars);
+	const title = named || block.sid;
 	const status = block.taskJson.status;
 	return {
 		fate: status === "done" ? "done" : status === "cancelled" ? "cancelled" : "open",
@@ -705,9 +707,9 @@ export async function refineTasksViewDisplay(input: {
 	return contextDisplayBytes(refined) <= TASKS_DISPLAY_BYTES ? refined : input.current;
 }
 
-if (hotOnce("narrafork.outlineViews.displayRefiner")) {
-	registerContextDisplayRefiner(OUTLINE_TASKS_VIEW_KEY, (input) => refineTasksViewDisplay(input));
-}
+// Registered on every load of this module: a dev hot reload replaces the refiner with the new code
+// (the registry is a keyed map, so there is never more than one).
+registerContextDisplayRefiner(OUTLINE_TASKS_VIEW_KEY, (input) => refineTasksViewDisplay(input));
 
 /**
  * The current-tasks view of an outline root session: in progress (at most five), waiting (at most

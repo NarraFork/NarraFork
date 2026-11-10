@@ -356,6 +356,8 @@ for (const { name, options } of CASES) {
 			expect(card.text).not.toContain("######");
 			expect(card.text).not.toContain("\\");
 			expect(card.text).not.toContain("`");
+			// Between two status chips there is an icon, never an arrow typed as text.
+			expect(card.text).not.toContain("→");
 		}
 		expectChangeNotices(cards, options);
 		// The older cards' copy is asserted in zh-CN (their fixture text is Chinese).

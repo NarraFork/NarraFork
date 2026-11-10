@@ -116,7 +116,12 @@ export function contextUpdateKeys(blocks: readonly ContextUpdateBlockLike[]): st
 		.filter(Boolean);
 }
 
-/** Only content references live in an epoch marker; large bodies are shared snapshots. */
+/**
+ * The prefix as an epoch marker records it: content references only (large bodies are shared
+ * snapshots). The marker may also carry small reader-only summaries of the baseline's parts
+ * (`EpochRecord.baselineDisplays`, at most {@link CONTEXT_UPDATE_DISPLAY_MAX_BYTES}); those are
+ * no part of this snapshot or its hashes.
+ */
 export interface PrefixSnapshot {
 	contract: string;
 	parts: Array<{ key: string; hash: string }>;

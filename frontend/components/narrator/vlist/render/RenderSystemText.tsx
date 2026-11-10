@@ -37,6 +37,7 @@ import type {
 } from "@shared/pretext-layout/task-notice";
 import {
 	IconAlertTriangle,
+	IconArrowRight,
 	IconChevronDown,
 	IconChevronRight,
 	IconClockPause,
@@ -1099,6 +1100,9 @@ function TaskNoticeSummaryLine({
 	);
 }
 
+/** The arrow between a row's two status chips (px): the width the `→` glyph took at xs. */
+const TASK_NOTICE_ARROW = 12;
+
 /** Width of a changed row's mark (and of the indent that aligns the rows without one). */
 const TASK_NOTICE_CHANGE_MARK = 3;
 
@@ -1160,9 +1164,15 @@ function TaskNoticeRowView({
 			{row.statusFrom && row.status ? (
 				<>
 					<StatusChip chip={row.statusFrom} />
-					<span style={{ ...noticeText(), color: "var(--mantine-color-dimmed)", flexShrink: 0 }}>
-						→
-					</span>
+					{/* An icon, never a text glyph (a status mark is not prose). Its box is fixed, so it
+					    takes the same room at any typography; a row's height is its line either way. */}
+					<IconArrowRight
+						size={TASK_NOTICE_ARROW}
+						stroke={1.6}
+						aria-hidden="true"
+						data-task-notice-arrow=""
+						style={{ flexShrink: 0, color: "var(--mantine-color-dimmed)" }}
+					/>
 				</>
 			) : null}
 			{row.status ? <StatusChip chip={row.status} /> : null}

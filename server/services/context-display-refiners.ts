@@ -86,8 +86,18 @@ export function previousContextDisplay(
 	epochId: string | undefined,
 	key: string,
 	baseline?: Readonly<Record<string, unknown>>,
+	/**
+	 * The session the row is written for. A fork inherits its parent's history, epoch included:
+	 * a row or a marker the parent wrote says what the PARENT was shown (its own tasks), so it is
+	 * no baseline for the fork, whose first row then lists instead of comparing.
+	 */
+	narratorId?: string,
 ): unknown {
 	if (!epochId) return undefined;
+	const foreign = (message: DbMessage): boolean =>
+		narratorId !== undefined &&
+		((message.narratorId !== undefined && message.narratorId !== narratorId) ||
+			(message.authorNarratorId != null && message.authorNarratorId !== narratorId));
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message?.role !== "sys" || !Array.isArray(message.contentJson)) continue;
@@ -99,9 +109,14 @@ export function previousContextDisplay(
 			contextUpdateKeys(blocks) ??
 			contextUpdateKeys([{ type: "text", text: message.contentText }, ...blocks]);
 		if (!keys?.includes(key)) continue;
+		if (foreign(message)) return undefined;
 		const display = update.display;
 		return display && typeof display === "object" && key in display ? display[key] : undefined;
 	}
+	// The epoch's own baseline: not when the marker in this history is another session's. (A marker
+	// opened by the request being prepared is not in `messages` yet, and is this session's.)
+	const marker = messages.find((message) => message.id === epochId);
+	if (marker && foreign(marker)) return undefined;
 	return baseline && key in baseline ? baseline[key] : undefined;
 }
 
@@ -125,7 +140,13 @@ export async function refineContextDisplay(input: {
 		try {
 			const refined = await refiner({
 				narratorId: input.narratorId,
-				previous: previousContextDisplay(input.messages, input.epochId, key, input.baseline),
+				previous: previousContextDisplay(
+					input.messages,
+					input.epochId,
+					key,
+					input.baseline,
+					input.narratorId,
+				),
 				current: input.display[key],
 				...(input.signal ? { signal: input.signal } : {}),
 			});
