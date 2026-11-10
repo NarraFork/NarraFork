@@ -79,8 +79,11 @@ const MIN_TASK_WIDTH = 48;
 
 const ENLARGED = { fontScalePercent: 130, lineHeightScalePercent: 120 } as const;
 
-/** Index of the first of the five notices that say what changed (after the eight older cards). */
-const CHANGES_AT = 8;
+/**
+ * Index of the first of the five notices that say what changed (after the eight older cards and
+ * the team-activity one).
+ */
+const CHANGES_AT = 9;
 
 /** What the change notices read as, per language. */
 const COPY = {
@@ -333,6 +336,8 @@ for (const { name, options } of CASES) {
 			"origin_notice",
 			"tasks_notice",
 			"tasks_notice",
+			// Outline P2 PR 10b: team activity.
+			"tasks_notice",
 			// 任务树可读性 PR B: the view's updates that say what changed.
 			"tasks_notice",
 			"tasks_notice",
@@ -377,6 +382,21 @@ for (const { name, options } of CASES) {
 			expect(finished?.statuses).toEqual(["进行中", "完成"]);
 		} else if (options.width >= 420) {
 			expect(delegated?.text).toContain("委派中 2");
+		}
+		// Outline P2 PR 10b. Team activity: who made each change leads its row and stays readable
+		// beside a long title, even at phone width; a file whose task cannot be named is said once.
+		const activity = cards[8];
+		expect(activity?.title).toBe("团队动态：6 处变化");
+		if (options.expanded) {
+			// Short names whole; a long one cut, but a good part of it still there.
+			expect(activity?.by.map((by) => [by.text, by.truncated])).toEqual([
+				["A deliberately long session title for browser truncation", true],
+				["alice", false],
+				["B", false],
+			]);
+			expect(activity?.by[0]?.width ?? 0).toBeGreaterThanOrEqual(60);
+			expect(activity?.text.split("agent-presence.ts").length).toBe(2);
+			expect(activity?.text).toContain("另一个会话的任务也在改它");
 		}
 		if (options.expanded) {
 			// Unfolded cards are taller than one line; the folded ones are all one line.

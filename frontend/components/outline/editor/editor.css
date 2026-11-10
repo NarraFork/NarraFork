@@ -24,6 +24,39 @@
 	margin-bottom: 4px;
 }
 
+/*
+ * An agent at work on the page (P2 PR 10b): its session's first letter with a small robot at the
+ * corner, or a robot alone for someone who may not read the session.
+ */
+.nf-outline-agent-avatar {
+	position: relative;
+	overflow: visible;
+	text-decoration: none;
+}
+
+.nf-outline-agent-avatar .mantine-Avatar-placeholder {
+	background: transparent;
+	color: inherit;
+}
+
+.nf-outline-agent-initial {
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1;
+}
+
+/* Bottom left: the next avatar of the group overlaps this one's right side. */
+.nf-outline-agent-badge {
+	position: absolute;
+	left: -4px;
+	bottom: -4px;
+	padding: 1px;
+	border-radius: 50%;
+	background: var(--mantine-color-body);
+	color: var(--mantine-color-text);
+	box-shadow: 0 0 0 1px var(--mantine-color-default-border);
+}
+
 .nf-outline-editor-host {
 	min-width: 0;
 	overflow-wrap: anywhere;

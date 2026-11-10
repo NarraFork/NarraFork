@@ -729,6 +729,18 @@ describe("buildPretextDocumentLayout", () => {
 		expect(afterKeys.some((key) => key.startsWith("tool-tu-a"))).toBe(false);
 	});
 
+	it("pins nothing in an outline session (PR 12a): its old tasks card folds like any call", () => {
+		const messages = [message("m0", 0, "user", "hello"), tasksToolMessage("m1", 1, "tu-only")];
+		const pinned = buildPretextDocumentLayout(messages, { ...PIN_OPTIONS, lod: 2 as const });
+		expect(pinned.manifest.items.some((i) => i.itemKey.startsWith("tool-tu-only"))).toBe(true);
+		const unpinned = buildPretextDocumentLayout(messages, {
+			...PIN_OPTIONS,
+			lod: 2 as const,
+			pinLatestSpecTasks: false,
+		});
+		expect(unpinned.manifest.items.some((i) => i.itemKey.startsWith("tool-tu-only"))).toBe(false);
+	});
+
 	it("leaves a document with no tasks write untouched (nothing pinned)", () => {
 		// The fold gate must be a no-op when the derivation finds nothing: a plain tool
 		// run at L2 keeps folding exactly as before.

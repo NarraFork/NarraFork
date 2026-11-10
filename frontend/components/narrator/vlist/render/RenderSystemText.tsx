@@ -93,6 +93,13 @@ export interface SpecCarryoverActions {
 	onResetSpec?: () => void;
 	/** Which action is in flight (drives the Button loading state). */
 	busy?: "clear" | "reset" | null;
+	/**
+	 * Why the buttons without a handler are off (an outline session's old card, outline P2
+	 * PR 12a), shown on hover or tap. Such a button keeps its place and look (Mantine's disabled
+	 * style through `data-disabled`, so the pointer still reaches it); nothing is measured
+	 * differently.
+	 */
+	readOnlyHint?: string;
 }
 
 /**
@@ -735,6 +742,31 @@ function SpecCarryoverCard({
 				<Group gap={6} wrap="wrap">
 					{buttons.map((label, i) => {
 						const onClick = buttonHandlers[i];
+						const hint = !onClick ? actions?.readOnlyHint : undefined;
+						if (hint)
+							return (
+								<Tooltip
+									// biome-ignore lint/suspicious/noArrayIndexKey: buttons are a stable ordered list
+									key={i}
+									label={hint}
+									events={{ hover: true, focus: true, touch: true }}
+									multiline
+									maw={260}
+								>
+									<Button
+										size="compact-xs"
+										variant={i === 0 ? "subtle" : "light"}
+										color={buttonColors[i] ?? color}
+										leftSection={buttonIcons[i]}
+										data-disabled
+										aria-disabled
+										data-readonly-spec-action=""
+										onClick={(event) => event.preventDefault()}
+									>
+										{label}
+									</Button>
+								</Tooltip>
+							);
 						return (
 							<Button
 								// biome-ignore lint/suspicious/noArrayIndexKey: buttons are a stable ordered list
@@ -1160,6 +1192,22 @@ function TaskNoticeRowView({
 						backgroundColor: row.changed ? "var(--mantine-color-blue-filled)" : "transparent",
 					}}
 				/>
+			) : null}
+			{row.lead ? (
+				<span
+					data-task-notice-by=""
+					title={row.lead}
+					style={{
+						...noticeText(),
+						...NOWRAP_ELLIPSIS,
+						// Whole up to a third of the row: a short name never gives way to the title.
+						flex: "0 0 auto",
+						maxWidth: "33%",
+						color: "var(--mantine-color-dimmed)",
+					}}
+				>
+					{row.lead}
+				</span>
 			) : null}
 			{row.statusFrom && row.status ? (
 				<>

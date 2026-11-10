@@ -254,12 +254,14 @@ export type SideCarBody =
 	 * wrote and no template renders): `turnEnd`, a long turn ended with a task still in progress
 	 * (`outline_task_turn_end`); `edited`, people changed tasks of the session
 	 * (`outline_task_edit`); `finished`, tasks the session created were finished by another
-	 * session or a person (`outline_task_finished`, outline P2 PR 9b). The reader sees the tasks as
-	 * titled outline links with status chips.
+	 * session or a person (`outline_task_finished`, outline P2 PR 9b); `activity`, what other
+	 * sessions and people did around the session's tasks since its last turn
+	 * (`outline_team_activity`, outline P2 PR 10b), each item with who did it. The reader sees the
+	 * tasks as titled outline links with status chips.
 	 */
 	| {
 			kind: "outlineTasks";
-			variant: "turnEnd" | "edited" | "finished";
+			variant: "turnEnd" | "edited" | "finished" | "activity";
 			items: OutlineTaskNoticeItem[];
 			/** Tasks (or changes) the notice counts without naming. */
 			more?: number;
@@ -329,7 +331,9 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			return {
 				kind: "outlineTasks",
 				variant:
-					body.variant === "edited" || body.variant === "finished" ? body.variant : "turnEnd",
+					body.variant === "edited" || body.variant === "finished" || body.variant === "activity"
+						? body.variant
+						: "turnEnd",
 				items: boundOutlineTaskNoticeItems(body.items),
 				...(more > 0 ? { more } : {}),
 			};
@@ -460,6 +464,7 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	outlineTaskTurnEndHeading: "Still in progress — tick it done when it is",
 	outlineTaskEditedHeading: "{n} task(s) changed by people",
 	outlineTaskFinishedHeading: "{n} task(s) this session created were finished elsewhere",
+	outlineTaskActivityHeading: "Team activity: {n} change(s)",
 	outlineTaskMore: "{n} more not listed",
 	outlineAnswersHeading: "{who} answered {n} question(s)",
 	outlineAnswersSomeone: "Someone",
@@ -791,7 +796,11 @@ function projectSideCarBody(
 							? labelWith(labels, "outlineTaskFinishedHeading", {
 									n: body.items.length + (body.more ?? 0),
 								})
-							: label(labels, "outlineTaskTurnEndHeading"),
+							: body.variant === "activity"
+								? labelWith(labels, "outlineTaskActivityHeading", {
+										n: body.items.length + (body.more ?? 0),
+									})
+								: label(labels, "outlineTaskTurnEndHeading"),
 				lines,
 			};
 		}

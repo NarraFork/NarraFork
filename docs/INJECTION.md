@@ -197,6 +197,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 | `subagent_message` | `messages` | `onNextTurn` | 子代理 `Send({ id: "parent" })` + `subagent_messages` extraBlock |
 | `spec_update` | `specUpdates` | `onNextTurn` | 用户在 UI 编辑 spec 文件（仅空闲回退路径） |
 | `outline_task_edit` | `prose` | `onNextTurn` | 大纲会话运行中有人改了它的任务（看板、大纲编辑器、退回目标完成）：`outline-task-edits.ts` 在内存里攒着，本函数在工具边界取走（`takeOutlineTaskEditNotice`，仅主会话，子代理不取） |
+| `outline_team_activity` | `outlineTasks`（`activity`） | `onNextTurn` | 长回合里团队动态再看一次：距上次看满 10 分钟、有新东西才写（`outline/team-activity.ts`，仅大纲根会话；见下） |
 
 **空闲**路径是分开的函数，`schedule: "none"`：
 
@@ -221,6 +222,13 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 - 一律 `role: sys`、不带 `createdBy`；body 是 `outlineTasks`，variant `finished`，每个任务带结束者和状态变化，读者看到「X 结束了本会话建的 N 个任务」（X 是会话标题或用户名，不带哪种语言的字）。
 - 每个提交、每个会话一条，一个提交最多告诉 20 个会话（其余记日志）；整次提交最多列 20 个任务，按会话轮流分，每个被告诉的会话至少列一个，其余在各自会话那条里计数。给模型的文字按会话所有者的语言（en、zh-CN）。
 - SQLite：消息 id 由（空间、提交 seq、会话、任务）推出，`schedule: wakeIfIdle`；同一提交再送一次时发现那一行已在，不再写也不再唤醒。人的提交 `schedule: none`：照样写一行，下一回合读到，不唤醒（同 PR 5：有人整理任务不该花一次请求）。PostgreSQL：不指定 id，`schedule: none`（同 PR 7 的回答送达）。没有补发队列：提交和送达之间进程停了，这条就丢了（PR 10 并进 runtime inbox 的 `team` 通道）。
+
+**团队动态（`outline_team_activity`，`server/services/outline/team-activity.ts`，outline P2 PR 10b）**：上一轮之后别人在本会话周围做的事。范围集中在 `OUTLINE_TEAM_ACTIVITY_SCOPE` 一处（负责人 Q5 未定，现按设计说明的推荐 A）：本会话领着、管着、被指派、最近 7 天写过的任务所在的任务树（项目空间里，往上到页下面最上层的任务）里别人的状态变化、转交、新子任务、笔记 / 报告 / 回答（只计数）；项目任务页（别名 `tasks`）上任务级的变化，最多 8 行；本会话改过、别的会话进行中的任务后来也改了的文件（`outline/overlap.ts`）。不放：自己和自己子代理的提交；人对它领着（或上次领着）的任务的改动（PR 5 的 `outline_task_edit` 已经说过）；整理（改字、挪位置）；会话空间。
+- 一律 `role: sys`、不带 `createdBy`，不唤醒。运行开头（`prepareOutlineRun`，第一次准备前缀之前）写一行，`schedule: none`，这一轮的历史读进来时已经带着；长回合在工具边界最多每 10 分钟再看一次（两次之间什么都不读），有新东西才写，`onNextTurn`。
+- 只追加在历史末尾，不进系统提示、工具定义和命名上下文：正文是确定的（没有相对时间、租约时间），重建历史、重试请求发出去的字节一样，两轮之间的系统提示字节不变。
+- 正文最多 4 KiB、20 行，一棵树最多 5 行，标题截到 80 字；放不下的在最后一行计数，并指向项目任务页。名字按 `canSessionReadNarrator`：读这个会话的人都能读的会话才写标题，否则写「另一个会话」；人写用户名。读者看到的 body 是 `outlineTasks`，variant `activity`，每项带「谁」（标题或用户名，不带哪种语言的字），change 多了 `notes` / `reports` / `answers`（计数）、`claimable`、`overlap`（文件路径）。
+- 窗口：每个（会话，空间）一个 seq 游标，只在内存；第一次（新进程、新会话、fork）从会话上一次运行结束（`narrator_turns`，没有就是会话创建）开始，最多往回 2 小时。读的都是有界、走索引的：每个空间最多 50 个提交、300 条不带正文的版本、30 个标题。会话运行时只在 SQLite 上跑，所以只在 SQLite 上写行；读的部分两种方言共用，PG 上有同一组场景测试。
+- 重叠提示（同一个 PR）不是注入：它是 Write、Edit 工具结果末尾的一行（`trackFileChange` 返回，`withOverlapHint` 接上），见 `outline/overlap.ts`。
 
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
@@ -326,7 +334,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 `silent_progress`、`todo_reminder`（`living_work_spec` 映射到它）、`relaxed_plan`、`knowledge_base_hint`、`bg_agent`、`bg_bash`、`team_message`、`buffered_user`、`subagent_message`、`spec_update`、`behavior_fence`、`pipeline_exit_confirmation`。
 
-之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）、`outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）和 `outline_task_finished`（P2 PR 9b，会话建的任务在别处结束了，标签「Tasks this session created were finished elsewhere / 本会话建的任务在别处结束了」）。
+之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）、`outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）、`outline_task_finished`（P2 PR 9b，会话建的任务在别处结束了，标签「Tasks this session created were finished elsewhere / 本会话建的任务在别处结束了」）和 `outline_team_activity`（P2 PR 10b，团队动态，标签「Team activity / 团队动态」）。
 
 ---
 

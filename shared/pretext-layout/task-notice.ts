@@ -10,7 +10,9 @@
  *   - `turnEnd`   — `outline_task_turn_end`: a long turn ended with a task still in progress;
  *   - `edited`    — `outline_task_edit`: people changed tasks of the session; also
  *                   `outline_task_finished`: tasks the session created were finished elsewhere
- *                   (outline P2 PR 9b), titled by who finished them;
+ *                   (outline P2 PR 9b), titled by who finished them; also
+ *                   `outline_team_activity`: what others did around the session's tasks since its
+ *                   last turn (outline P2 PR 10b), each row naming who;
  *   - `interrupt` — `interrupt_task_guard`: the open tasks after a user interrupt (outline and spec);
  *   - `view`      — a `context_update` of the outline current-tasks view (`outline.tasks`): its
  *                   heading says what changed since the view the session saw before ("Finished
@@ -71,6 +73,11 @@ export interface TaskNoticeRow {
 	marks?: string[];
 	/** What changed, in the reader's words (dimmed, after the title). */
 	note?: string;
+	/**
+	 * Who made the change, drawn first (dimmed) so a long title cannot push it out of the line
+	 * (team activity, where every row may be someone else's).
+	 */
+	lead?: string;
 	/** A row that names no task ("3 more not listed"): dimmed text only. */
 	dim?: true;
 	/** A row under the one before it (a question's answer): drawn indented, still one line. */
@@ -141,6 +148,13 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeChangeUnassigned: "handed back to this session",
 	taskNoticeChangeRejected: "rejected marking it {status}",
 	taskNoticeChangeRejectedReason: "rejected marking it {status}: {reason}",
+	taskNoticeChangeNotes: "{n} note(s) added",
+	taskNoticeChangeReports: "{n} report(s) attached",
+	taskNoticeChangeAnswers: "{n} question(s) answered",
+	taskNoticeChangeClaimable: "put in the claim pool",
+	taskNoticeChangeOverlap: "also changing {path}",
+	taskNoticeChangeOverlapHidden: "another session's task is also changing it",
+	taskNoticeActivityTitle: "Team activity: {n} change(s)",
 	taskNoticeJoin: "; ",
 	taskNoticeWhoJoin: ", ",
 	taskNoticeEditedTitle: "{who} changed {n} task(s)",
@@ -264,19 +278,39 @@ function changeNote(change: OutlineTaskNoticeChange, labels: Labels): string | n
 				? label(labels, "taskNoticeChangeRejectedReason", { status, reason: change.reason })
 				: label(labels, "taskNoticeChangeRejected", { status });
 		}
+		case "notes":
+			return label(labels, "taskNoticeChangeNotes", { n: change.n });
+		case "reports":
+			return label(labels, "taskNoticeChangeReports", { n: change.n });
+		case "answers":
+			return label(labels, "taskNoticeChangeAnswers", { n: change.n });
+		case "claimable":
+			return label(labels, "taskNoticeChangeClaimable");
+		case "overlap":
+			return label(labels, "taskNoticeChangeOverlap", { path: change.path });
 	}
 }
 
-function itemRow(item: OutlineTaskNoticeItem, labels: Labels, showBy: boolean): TaskNoticeRow {
+function itemRow(
+	item: OutlineTaskNoticeItem,
+	labels: Labels,
+	showBy: boolean,
+	byFirst = false,
+): TaskNoticeRow {
 	const changes = item.changes ?? [];
 	const statusChange = changes.find(
 		(change): change is Extract<OutlineTaskNoticeChange, { kind: "status" }> =>
 			change.kind === "status",
 	);
 	const notes = changes
-		.map((change) => changeNote(change, labels))
+		.map((change) =>
+			// A file whose task the session may not name: the row is the path, said once.
+			change.kind === "overlap" && !item.address && change.path === item.title
+				? label(labels, "taskNoticeChangeOverlapHidden")
+				: changeNote(change, labels),
+		)
 		.filter((note): note is string => !!note);
-	if (showBy && item.by) notes.unshift(item.by);
+	if (showBy && item.by && !byFirst) notes.unshift(item.by);
 	const marks = [
 		item.humanCreated ? label(labels, "taskNoticeMarkHumanCreated") : null,
 		item.locked ? label(labels, "taskNoticeMarkLocked") : null,
@@ -287,6 +321,7 @@ function itemRow(item: OutlineTaskNoticeItem, labels: Labels, showBy: boolean): 
 	const from = statusChange ? chip(statusChange.from, labels) : undefined;
 	return {
 		...named(item.address, item.title),
+		...(byFirst && item.by ? { lead: item.by } : {}),
 		...(status ? { status } : {}),
 		...(from ? { statusFrom: from } : {}),
 		...(marks.length > 0 ? { marks } : {}),
@@ -306,6 +341,7 @@ function moreRow(n: number, labels: Labels, atLeast = false): TaskNoticeRow {
 function plainText(title: string, summary: TaskNoticeSummary, rows: TaskNoticeRow[]): string {
 	const line = (row: TaskNoticeRow) =>
 		[
+			row.lead ? `${row.lead}:` : "",
 			row.statusFrom && row.status
 				? `[${row.statusFrom.label} → ${row.status.label}]`
 				: row.status
@@ -368,6 +404,22 @@ export function taskNoticeFromBody(
 				{
 					row: rows[0],
 					tail: label(labels, "taskNoticeTurnEndTail"),
+				},
+				rows,
+			);
+		}
+		if (body.variant === "activity") {
+			// Team activity (outline P2 PR 10b): several sessions and people, one change a row; every
+			// row names who made it. Counted in changes, not tasks: one task may change twice.
+			const rows = body.items.map((item) => itemRow(item, labels, true, true));
+			if (body.more) rows.push(moreRow(body.more, labels));
+			const n = body.items.length + (body.more ?? 0);
+			return notice(
+				"edited",
+				label(labels, "taskNoticeActivityTitle", { n }),
+				{
+					row: rows[0],
+					...(n > 1 ? { tail: label(labels, "taskNoticeMoreTail", { n: n - 1 }) } : {}),
 				},
 				rows,
 			);
