@@ -430,6 +430,14 @@ export type NarraForkEvent =
 			pageIds: string[];
 			actorKind: "human" | "agent" | "system";
 			actorId: string;
+			/**
+			 * The session the commit was written for: `outline_commits.narrator_id`, or the agent
+			 * itself when a write left it out; the session a system write was made for; null for a
+			 * person's commit and a system job. What the live editor shows an agent's cursor from
+			 * (outline P2 PR 10b).
+			 * Optional only so events built before it existed (tests) still type-check.
+			 */
+			narratorId?: string | null;
 	  }
 	| {
 			/**

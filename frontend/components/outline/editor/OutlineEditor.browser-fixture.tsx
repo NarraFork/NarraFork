@@ -14,6 +14,8 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import en from "../../../locales/en/outline.json";
+import zh from "../../../locales/zh-CN/outline.json";
+import { OutlineHostProvider } from "../outline-host";
 import { OutlineViewStates } from "../view-state";
 import {
 	deleteBlock,
@@ -31,9 +33,11 @@ import { keyBetweenLoose } from "./store";
 import { findBlockPos, type OutlineView } from "./view";
 
 const instance = i18next.createInstance();
-await instance
-	.use(initReactI18next)
-	.init({ lng: "en", resources: { en: { outline: en } }, react: { useSuspense: false } });
+await instance.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { outline: en }, "zh-CN": { outline: zh } },
+	react: { useSuspense: false },
+});
 
 class SocketTransport implements LiveTransport {
 	connected = false;
@@ -154,15 +158,27 @@ export interface OpenOptions {
 	canWrite: boolean;
 	lens?: "facts" | "all";
 	width?: number;
+	/** The reader's language and colour scheme (English and light by default). */
+	lang?: "en" | "zh-CN";
+	scheme?: "light" | "dark";
+	/** Host the editor as a dock does: sessions open beside it (`openedSessions`). */
+	host?: boolean;
+}
+
+const opened: string[] = [];
+
+/** Sessions the host was asked to open (`host` option). */
+export function openedSessions(): string[] {
+	return [...opened];
 }
 
 function editor(
 	options: OpenOptions,
 	onClient: (client: LiveClient, view: () => OutlineView | null) => void,
 ) {
-	return (
+	const tree = (
 		<I18nextProvider i18n={instance}>
-			<MantineProvider>
+			<MantineProvider {...(options.scheme ? { forceColorScheme: options.scheme } : {})}>
 				<OutlineEditor
 					pageId={options.pageId}
 					focusId={options.focusId ?? options.pageId}
@@ -178,10 +194,18 @@ function editor(
 			</MantineProvider>
 		</I18nextProvider>
 	);
+	return options.host ? (
+		<OutlineHostProvider openSession={(narratorId) => opened.push(narratorId)}>
+			{tree}
+		</OutlineHostProvider>
+	) : (
+		tree
+	);
 }
 
 /** Mount the editor for one person (one per browser page). */
 export async function open(options: OpenOptions): Promise<void> {
+	await instance.changeLanguage(options.lang ?? "en");
 	transport = new SocketTransport(options.wsUrl);
 	const host = document.getElementById("root") as HTMLElement;
 	if (options.width) host.style.width = `${options.width}px`;
@@ -486,4 +510,52 @@ export function editable(): boolean {
 
 export function blockSelection(): string[] {
 	return view().selectedBlocks();
+}
+
+/**
+ * The agents in the bar (outline P2 PR 10b): each avatar's label, where it links (null: not a
+ * link), its letter and colour.
+ */
+export function agentAvatars(): Array<{
+	label: string | null;
+	href: string | null;
+	role: string | null;
+	initial: string;
+	color: string;
+	/** The robot badge is drawn and nothing in the bar paints over its middle. */
+	badgeSeen: boolean | null;
+}> {
+	return [...document.querySelectorAll<HTMLElement>("[data-testid=outline-agent-avatar]")].map(
+		(el) => {
+			const badge = el.querySelector<SVGElement>(".nf-outline-agent-badge");
+			let badgeSeen: boolean | null = null;
+			if (badge) {
+				const r = badge.getBoundingClientRect();
+				const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+				badgeSeen = !!hit && (hit === badge || badge.contains(hit) || el.contains(hit));
+			}
+			return {
+				label: el.getAttribute("aria-label"),
+				href: el.getAttribute("href"),
+				role: el.getAttribute("role"),
+				initial: el.querySelector(".nf-outline-agent-initial")?.textContent ?? "",
+				color: el.style.background,
+				badgeSeen,
+			};
+		},
+	);
+}
+
+/** Blocks an agent's cursor marks, and with which agent's name. */
+export function agentBlocks(): Array<{ id: string; agent: string; color: string }> {
+	return [...document.querySelectorAll<HTMLElement>(".ob-agent-bsel")].map((el) => ({
+		id: el.dataset.id ?? "",
+		agent: el.dataset.agent ?? "",
+		color: el.style.getPropertyValue("--peer").trim(),
+	}));
+}
+
+/** The bar's "+N" (people past six and agents past the server's limit), or null. */
+export function presenceMore(): string | null {
+	return document.querySelector("[data-testid=outline-presence-more]")?.textContent ?? null;
 }
