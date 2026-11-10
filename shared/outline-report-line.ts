@@ -19,6 +19,26 @@
  * Pure: no DOM, no server imports.
  */
 
+/** Ids of report containers start with this, then 28 characters of a hash (`reportBlockId`). */
+export const OUTLINE_REPORT_ID_PREFIX = "dlrp";
+const REPORT_ID_LENGTH = OUTLINE_REPORT_ID_PREFIX.length + 28;
+
+/** Whether a block id is a report container's (the writer's `reportBlockId`). */
+export function isOutlineReportBlockId(id: string): boolean {
+	return id.length === REPORT_ID_LENGTH && id.startsWith(OUTLINE_REPORT_ID_PREFIX);
+}
+
+/**
+ * Whether a block is a subagent report's container: by its id (as the writer makes it), or by a
+ * line that is exactly a report line (a page read from a copy, a test page).
+ */
+export function isOutlineReportContainer(id: string, content: string): boolean {
+	if (isOutlineReportBlockId(id)) return true;
+	// Every stored form has a full-width or an ASCII bracket: skip the parse for ordinary text.
+	if (content.length > 400 || !/[（(]/.test(content)) return false;
+	return parseOutlineReportLine(content) !== null;
+}
+
 /** Why a report is late, as the container line says it (`gone` never gets a container). */
 export type OutlineReportLineLateReason = "ended" | "reopened" | "taken_over";
 

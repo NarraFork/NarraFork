@@ -79,6 +79,7 @@ import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import type { DelegatedTaskRegistration } from "@server/lib/validators/runtime-registration";
 import { blockTitle, parseAddress, TASK_BOX, type TaskStatus } from "@shared/outline";
+import { isOutlineReportBlockId, OUTLINE_REPORT_ID_PREFIX } from "@shared/outline-report-line";
 import {
 	OUTLINE_REPORT_NOTE_HEAD_RE,
 	OUTLINE_REPORT_NOTE_WINDOW,
@@ -145,7 +146,7 @@ export const OUTLINE_DELEGATION_LIMITS = {
 } as const;
 
 /** Ids of report containers start with this, then a hash of (subagent, logical run). */
-const REPORT_ID_PREFIX = "dlrp";
+const REPORT_ID_PREFIX = OUTLINE_REPORT_ID_PREFIX;
 
 /** The container block of a subagent's report for one logical run: the same on every retry. */
 export function reportBlockId(subagentId: string, logicalRunId: string): string {
@@ -157,7 +158,7 @@ export function reportBlockId(subagentId: string, logicalRunId: string): string 
 
 /** Whether a block is a report container (`reportBlockId`). */
 export function isReportBlockId(id: string): boolean {
-	return id.length === REPORT_ID_PREFIX.length + 28 && id.startsWith(REPORT_ID_PREFIX);
+	return isOutlineReportBlockId(id);
 }
 
 /** A refusal of `Agent({ task })`, or of the delegation's commit: the message is the agent's. */
