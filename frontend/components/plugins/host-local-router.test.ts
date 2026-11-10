@@ -318,3 +318,67 @@ describe("routePluginUiHostLocalRequest", () => {
 		).toBe("INVALID_PARAMS");
 	});
 });
+
+describe("overlay host-local routing", () => {
+	const overlayParams: PluginDockPanelParams = {
+		...params,
+		binding: { kind: "host-surface", surface: "overlay" },
+	};
+	const bounds = { x: -20, y: 10, width: 50, height: 50 };
+	const makeOverlayRequest = (input: JsonValue): PluginUiRequestContext => ({
+		...makeRequest("overlay.setBounds", input),
+		params: overlayParams,
+	});
+
+	test("uses the caller's panel ID, never a payload-supplied ID", async () => {
+		let calledId = "";
+		const result = await routePluginUiHostLocalRequest(
+			makeOverlayRequest({ ...bounds, panelInstanceId: "another-panel" }),
+			{
+				overlaySetBounds: (id, requested) => {
+					calledId = id;
+					return { ...requested, viewportWidth: 800, viewportHeight: 600 };
+				},
+			},
+		);
+		expect(calledId).toBe(params.panelInstanceId);
+		expect(result).toEqual({ ...bounds, viewportWidth: 800, viewportHeight: 600 });
+	});
+
+	test("rejects non-overlay bindings before touching host state", async () => {
+		let called = false;
+		await expect(
+			Promise.resolve().then(() =>
+				routePluginUiHostLocalRequest(makeRequest("overlay.setBounds", bounds), {
+					overlaySetBounds: () => {
+						called = true;
+						return { ...bounds, viewportWidth: 800, viewportHeight: 600 };
+					},
+				}),
+			),
+		).rejects.toMatchObject({ code: "NOT_SUPPORTED" });
+		expect(called).toBe(false);
+	});
+
+	test.each([
+		null,
+		{ ...bounds, x: Number.NaN },
+		{ ...bounds, y: Number.POSITIVE_INFINITY },
+		{ ...bounds, width: -1 },
+		{ ...bounds, height: 100_001 },
+		{ x: 0, y: 0, width: 20 },
+	])("rejects invalid rectangles without modifying host state: %j", async (input) => {
+		let called = false;
+		await expect(
+			Promise.resolve().then(() =>
+				routePluginUiHostLocalRequest(makeOverlayRequest(input), {
+					overlaySetBounds: () => {
+						called = true;
+						return { ...bounds, viewportWidth: 800, viewportHeight: 600 };
+					},
+				}),
+			),
+		).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+		expect(called).toBe(false);
+	});
+});

@@ -29,6 +29,7 @@ export {
 	type PluginDockPanelHostApi,
 	PluginDockPanelView,
 } from "./PluginDockPanel";
+export { PluginOverlayHost } from "./PluginOverlayHost";
 export {
 	PLUGIN_THEME_ATTRIBUTE,
 	PLUGIN_THEME_STYLE_ELEMENT_ID,
@@ -39,7 +40,6 @@ export {
 	PluginUiLayer,
 	PluginUiRuntimeProvider,
 } from "./PluginUiRuntimeProvider";
-export { PluginOverlayHost } from "./PluginOverlayHost";
 export type { PluginUiHostSurface, PluginUiSessionContext } from "./PluginUiSurfaceContext";
 export {
 	PluginUiSurfaceProvider,

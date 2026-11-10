@@ -17,6 +17,7 @@
 	"runtimeUnavailableMessage": "当前 surface 未提供宿主插件运行时。",
 	"reload": "重新加载",
 	"removePanel": "移除面板",
+	"hideOverlays": "隐藏插件浮层",
 	"picker": {
 		"title": "插件面板",
 		"addPanel": "添加插件面板",

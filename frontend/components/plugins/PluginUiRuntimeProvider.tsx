@@ -22,8 +22,8 @@ import {
  */
 import { readHostPresentation, subscribeHostPresentation } from "./host-presentation";
 import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
-import { pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
+import { clipOverlayBounds, pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import {
 	fallbackPluginUiContext,
 	RuntimeContext,
@@ -34,7 +34,7 @@ import {
 } from "./plugin-ui-runtime-context";
 import type { PluginDockPanelParams } from "./protocol";
 import { parsePluginDockPanelParams } from "./protocol";
-import { PluginUiSession } from "./runtime";
+import { PluginUiHostError, PluginUiSession } from "./runtime";
 import {
 	createPluginUiBackendSession,
 	type MaterializedPluginUiSession,
@@ -162,6 +162,7 @@ export function PluginUiRuntimeProvider({
 
 	const disposeRecord = useCallback(
 		(record: SessionRecord) => {
+			pluginOverlayBoundsStore.clear(record.params.panelInstanceId);
 			record.abortController.abort();
 			record.controller?.dispose();
 			if (record.materialized && !record.revoked) {
@@ -194,15 +195,8 @@ export function PluginUiRuntimeProvider({
 				overlaySetBounds: (panelInstanceId, bounds) => {
 					const viewportWidth = Math.max(0, window.innerWidth);
 					const viewportHeight = Math.max(0, window.innerHeight);
-					// Clamp into the viewport and drop a rectangle that would be empty:
-					// a zero-area hit region on a scrolling page is just noise.
-					const left = Math.min(Math.max(bounds.x, 0), viewportWidth);
-					const top = Math.min(Math.max(bounds.y, 0), viewportHeight);
-					const width = Math.max(0, Math.min(bounds.width, viewportWidth - left));
-					const height = Math.max(0, Math.min(bounds.height, viewportHeight - top));
-					const applied = { x: left, y: top, width, height };
-					if (width > 0 && height > 0) pluginOverlayBoundsStore.set(panelInstanceId, applied);
-					else pluginOverlayBoundsStore.clear(panelInstanceId);
+					const applied = clipOverlayBounds(bounds, viewportWidth, viewportHeight);
+					pluginOverlayBoundsStore.set(panelInstanceId, applied);
 					return { ...applied, viewportWidth, viewportHeight };
 				},
 				navigate:
@@ -321,6 +315,15 @@ export function PluginUiRuntimeProvider({
 							getContext: () =>
 								resolveContext(record.params, record.sessionContext, record.contribution),
 							onRequest: (context) => {
+								// A queued request from a retired generation must not recreate its hit region.
+								if (
+									sessionsRef.current.get(params.panelInstanceId) !== record ||
+									record.abortController.signal.aborted
+								) {
+									throw new PluginUiHostError("SESSION_CLOSED", "Plugin session is closed", {
+										retryable: false,
+									});
+								}
 								const local = handleHostLocal(context);
 								if (local !== null) return local;
 								const backend = handleBackendRequest(record, materialized);
@@ -345,6 +348,9 @@ export function PluginUiRuntimeProvider({
 								const latest = sessionsRef.current.get(params.panelInstanceId);
 								if (latest?.controller !== controller) return;
 								latest.snapshot = snapshot;
+								if (snapshot.status !== "ready") {
+									pluginOverlayBoundsStore.clear(params.panelInstanceId);
+								}
 								rerender();
 							},
 						});

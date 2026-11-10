@@ -269,6 +269,14 @@ export function PluginDockPanelView({
 		}
 	}, [contribution, params, hostApi]);
 
+	// Overlay failures must disappear, not put ordinary panel chrome over the app.
+	if (
+		passthrough &&
+		(!params || !runtime || missing || !contribution || status !== "available" || !sessionContext)
+	) {
+		return null;
+	}
+
 	if (!params) {
 		return (
 			<Placeholder
@@ -353,6 +361,8 @@ export function PluginDockPanelView({
 	);
 	// A crashed/disposed session must show the error placeholder, not the iframe.
 	const sessionBroken = snapshot && ["error", "crashed", "disposed"].includes(snapshot.status);
+	// Retain the slot while connecting/failed, but never paint a loading/error panel.
+	if (passthrough && (!controller || sessionBroken)) return withSlot(null);
 	if (controller && !sessionBroken) {
 		// Live session: render the iframe directly in the panel content. The
 		// handshake happens on iframe load (controller.attach), same as before.
@@ -361,6 +371,8 @@ export function PluginDockPanelView({
 				srcDoc={controller.getSrcdoc()}
 				sandbox="allow-scripts"
 				allow=""
+				inert={passthrough || undefined}
+				tabIndex={passthrough ? -1 : undefined}
 				referrerPolicy="no-referrer"
 				title={contribution.title || params.contributionId}
 				onLoad={(event) => controller.attach(event.currentTarget)}

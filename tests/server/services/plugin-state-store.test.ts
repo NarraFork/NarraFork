@@ -76,7 +76,7 @@ describe("PluginStateStore", () => {
 			const operation = await store.beginOperation({
 				pluginId,
 				operation: "install",
-				context: { index, to: { version: "1.0.0", hash: "d".repeat(64) } },
+				context: { to: { version: "1.0.0", hash: "d".repeat(64) } },
 			});
 			await store.updateOperation(operation.id, { status: "succeeded" });
 		}

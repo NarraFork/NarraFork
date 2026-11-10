@@ -325,7 +325,8 @@ function assertDocumentLimits(document: unknown, limits: PluginStateStoreLimits)
 	}
 }
 
-function parsePackageReference(value: unknown, label: string): PluginPackageReference | null {	if (value === null) return null;
+function parsePackageReference(value: unknown, label: string): PluginPackageReference | null {
+	if (value === null) return null;
 	if (!isRecord(value)) throw new ValidationError(`${label} is invalid`);
 	if (typeof value.version !== "string" || !VERSION_PATTERN.test(value.version)) {
 		throw new ValidationError(`${label}.version is invalid`);

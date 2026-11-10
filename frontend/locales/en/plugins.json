@@ -17,6 +17,7 @@
 	"runtimeUnavailableMessage": "The host plugin runtime is not available on this surface.",
 	"reload": "Reload",
 	"removePanel": "Remove panel",
+	"hideOverlays": "Hide plugin overlays",
 	"picker": {
 		"title": "Plugin panels",
 		"addPanel": "Add plugin panel",

@@ -451,5 +451,10 @@ function overlaySetBounds(
 	if (width < 0 || height < 0 || width > OVERLAY_BOUNDS_MAX || height > OVERLAY_BOUNDS_MAX) {
 		throw invalidParams("overlay.setBounds width/height are out of range");
 	}
-	return options.overlaySetBounds(params.panelInstanceId, { x, y, width, height }) as unknown as JsonValue;
+	return options.overlaySetBounds(params.panelInstanceId, {
+		x,
+		y,
+		width,
+		height,
+	}) as unknown as JsonValue;
 }

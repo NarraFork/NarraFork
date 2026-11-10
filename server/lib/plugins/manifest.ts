@@ -402,9 +402,9 @@ export const VIEW_SURFACES = [
 	 * because there is exactly one overlay layer per app instance, so a
 	 * workspace/narrator binding would have nothing to bind to.
 	 *
-	 * The host mounts it (`frontend/components/plugins/PluginOverlayHost.tsx`) and
-	 * keeps the iframe click-through unless the view reports a hit rectangle, so an
-	 * overlay can never make the app underneath unusable.
+	 * The host keeps the iframe click-through and relays pointer input through a
+	 * separate hit rectangle. A host-owned dismiss control above every overlay
+	 * restores the app even if a plugin paints or requests input over the full viewport.
 	 */
 	"overlay",
 ] as const;

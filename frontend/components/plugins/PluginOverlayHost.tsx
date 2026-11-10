@@ -23,11 +23,12 @@
  * implement its own drag without the host resizing anything mid-gesture.
  *
  * FAILURE BEHAVIOUR
- * No bounds reported yet ⇒ no hit region ⇒ the overlay is purely decorative but the
- * app is fully usable. That is the safe default: a misbehaving overlay can never
- * make the application unclickable, it can only fail to be interactive.
+ * Without bounds the overlay is decorative. Bounds can cover the viewport, so a
+ * host-owned dismiss button always sits above every overlay. Recovery never relies
+ * on a plugin responding, or on arbitrary size limits that penalize other widgets.
  */
 
+import { Button } from "@mantine/core";
 import {
 	type PointerEvent as ReactPointerEvent,
 	useCallback,
@@ -37,12 +38,14 @@ import {
 	useState,
 	useSyncExternalStore,
 } from "react";
+import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
 import { buildPluginDockPanelParams } from "./PluginContributionPicker";
-import { type PluginDockPanelHostApi, PluginDockPanelView } from "./PluginDockPanel";
 import { pluginContributionStore } from "./PluginContributionStore";
+import { type PluginDockPanelHostApi, PluginDockPanelView } from "./PluginDockPanel";
+import { PluginUiSurfaceProvider } from "./PluginUiSurfaceContext";
 import { type PluginOverlayBounds, pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import { useOptionalPluginUiRuntime } from "./plugin-ui-runtime-context";
-import { PluginUiSurfaceProvider } from "./PluginUiSurfaceContext";
 import { syncPluginUiContributions } from "./registry";
 import type { PluginContributionRecord } from "./types";
 
@@ -63,22 +66,26 @@ function overlayInstanceId(contribution: PluginContributionRecord): string {
 function selectOverlayContributions(
 	contributions: Readonly<Record<string, PluginContributionRecord>>,
 ): PluginContributionRecord[] {
-	return Object.values(contributions)
-		.filter((contribution) => contribution.surfaces?.includes("overlay") ?? false)
-		// One overlay layer per app instance, so only global scope can bind to it.
-		.filter((contribution) => (contribution.scope ?? "global") === "global")
-		// A disabled/denied plugin must not leave an invisible full-viewport layer
-		// behind; `PluginDockPanelView`'s placeholder is a panel affordance and would
-		// paint a box over the app here.
-		.filter((contribution) => contribution.availability === "available")
-		.sort((left, right) =>
-			`${left.pluginId}:${left.contributionId}`.localeCompare(
-				`${right.pluginId}:${right.contributionId}`,
-			),
-		);
+	return (
+		Object.values(contributions)
+			.filter((contribution) => contribution.surfaces?.includes("overlay") ?? false)
+			// One overlay layer per app instance, so only global scope can bind to it.
+			.filter((contribution) => (contribution.scope ?? "global") === "global")
+			// A disabled/denied plugin must not leave an invisible full-viewport layer
+			// behind; `PluginDockPanelView`'s placeholder is a panel affordance and would
+			// paint a box over the app here.
+			.filter((contribution) => contribution.availability === "available")
+			.sort((left, right) =>
+				`${left.pluginId}:${left.contributionId}`.localeCompare(
+					`${right.pluginId}:${right.contributionId}`,
+				),
+			)
+	);
 }
 
 export function PluginOverlayHost() {
+	const { t } = useTranslation("plugins");
+	const [hidden, setHidden] = useState(false);
 	const runtime = useOptionalPluginUiRuntime();
 	const contributionSnapshot = useSyncExternalStore(
 		pluginContributionStore.subscribe,
@@ -104,21 +111,24 @@ export function PluginOverlayHost() {
 		[contributionSnapshot.contributions],
 	);
 
-	/**
-	 * Escape hatch, one page load long (`?nfNoOverlay=1`).
-	 *
-	 * The layer covers the viewport by construction, so an overlay that misbehaves is
-	 * indistinguishable from an application that is broken — and there would be nothing
-	 * left to click. This is the one switch that guarantees a usable app.
-	 */
+	useEffect(() => {
+		const resize = () =>
+			pluginOverlayBoundsStore.clipToViewport(window.innerWidth, window.innerHeight);
+		window.addEventListener("resize", resize);
+		return () => window.removeEventListener("resize", resize);
+	}, []);
+
+	// An additional cold-start escape hatch, independent of the mounted UI.
 	const disabled =
 		typeof window !== "undefined" &&
 		new URLSearchParams(window.location.search).get("nfNoOverlay") === "1";
-	if (disabled) return null;
+	if (disabled || hidden) return null;
 
 	if (!runtime || overlays.length === 0) return null;
 
-	return (
+	// Portal both the layers and their escape hatch together: ancestor transforms or
+	// stacking contexts must not place a plugin above the host's dismiss control.
+	return createPortal(
 		<>
 			{overlays.map((contribution) => {
 				const instanceId = overlayInstanceId(contribution);
@@ -127,11 +137,36 @@ export function PluginOverlayHost() {
 						key={instanceId}
 						contribution={contribution}
 						panelInstanceId={instanceId}
-						bounds={boundsSnapshot[instanceId]}
+						bounds={
+							runtime.getSessionSnapshot(instanceId)?.status === "ready"
+								? boundsSnapshot[instanceId]
+								: undefined
+						}
 					/>
 				);
 			})}
-		</>
+			<Button
+				data-plugin-overlay-dismiss=""
+				size="compact-xs"
+				onClick={() => {
+					setHidden(true);
+					for (const contribution of overlays) {
+						const id = overlayInstanceId(contribution);
+						pluginOverlayBoundsStore.clear(id);
+						runtime.disposeSession(id);
+					}
+				}}
+				style={{
+					position: "fixed",
+					right: "max(12px, env(safe-area-inset-right))",
+					bottom: "max(12px, env(safe-area-inset-bottom))",
+					zIndex: OVERLAY_Z_INDEX + 1,
+				}}
+			>
+				{t("hideOverlays")}
+			</Button>
+		</>,
+		document.body,
 	);
 }
 
@@ -191,6 +226,9 @@ function PluginOverlayLayer({
 	);
 
 	const capturedPointer = useRef<number | null>(null);
+	useEffect(() => {
+		if (!bounds) capturedPointer.current = null;
+	}, [bounds]);
 
 	return (
 		<div
@@ -226,12 +264,13 @@ function PluginOverlayLayer({
 				</PluginUiSurfaceProvider>
 			</div>
 			{bounds ? (
+				// biome-ignore lint/a11y/noStaticElementInteractions: Pointer-only decoration; the host dismiss button is keyboard accessible. Forms belong in dock panels.
 				<div
 					data-plugin-overlay-hit={panelInstanceId}
 					role="presentation"
 					onPointerDown={(event) => {
 						// Only the primary button drags.
-						if (event.button !== 0) return;
+						if (event.button !== 0 || !event.isPrimary || capturedPointer.current !== null) return;
 						capturedPointer.current = event.pointerId;
 						// Suppress the browser's own gesture handling, which otherwise starts a
 						// text selection on the document underneath and leaves a blinking
@@ -266,6 +305,11 @@ function PluginOverlayLayer({
 						} catch {
 							/* never captured */
 						}
+					}}
+					onLostPointerCapture={(event) => {
+						if (capturedPointer.current !== event.pointerId) return;
+						capturedPointer.current = null;
+						sendPointer("cancel", event);
 					}}
 					onPointerCancel={(event) => {
 						if (capturedPointer.current !== event.pointerId) return;
