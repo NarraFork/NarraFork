@@ -40,6 +40,9 @@ on:
       - ".github/workflows/file-revert-cross-platform.yml"
   workflow_dispatch:
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 jobs:
   editor-host-save:
     name: Editor Host save (${{ matrix.os }})

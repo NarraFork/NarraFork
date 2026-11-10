@@ -35,6 +35,9 @@ defaults:
   run:
     shell: bash
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 jobs:
   preflight:
     name: Helper preflight
