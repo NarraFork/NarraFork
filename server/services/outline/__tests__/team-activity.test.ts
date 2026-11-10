@@ -14,7 +14,8 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { db } from "../../../db";
+import { readTestMessageContent } from "../../../../tests/setup";
+import { db, sqlite as testSqlite } from "../../../db";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -269,12 +270,13 @@ describe("the row and its cadence", () => {
 		const written = await writeOutlineTeamActivity(s.a, "zh-CN", "start", { now: s.base + 2 });
 		expect(written?.messageId).toBeTruthy();
 		const [row] = await db
-			.select({ role: narratorMessages.role, json: narratorMessages.contentJson })
+			.select({ role: narratorMessages.role, id: narratorMessages.id })
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 			.where(eq(narratorMessageRefs.narratorId, s.a));
 		expect(row?.role).toBe("sys");
-		const block = ((row?.json ?? []) as Array<Record<string, unknown>>).find(
+		// The body lives in block rows (content is no longer kept on the message): read as tests do.
+		const block = readTestMessageContent(testSqlite, row?.id ?? "").find(
 			(b) => b.type === "system_injection",
 		);
 		expect(block?.source).toBe(OUTLINE_TEAM_ACTIVITY_SOURCE);
@@ -302,17 +304,17 @@ describe("the row and its cadence", () => {
 		} as unknown as Parameters<typeof prepareOutlineRun>[0];
 		await prepareOutlineRun(active);
 		const rows = await db
-			.select({ json: narratorMessages.contentJson, text: narratorMessages.contentText })
+			.select({ id: narratorMessages.id })
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 			.where(eq(narratorMessageRefs.narratorId, s.a));
-		const activity = rows.filter((r) =>
-			((r.json ?? []) as Array<Record<string, unknown>>).some(
+		const activity = rows.flatMap((r) =>
+			readTestMessageContent(testSqlite, r.id).filter(
 				(b) => b.type === "system_injection" && b.source === OUTLINE_TEAM_ACTIVITY_SOURCE,
 			),
 		);
 		expect(activity).toHaveLength(1);
-		const text = String(activity[0]?.text ?? "");
+		const text = String(activity[0]?.modelText ?? "");
 		expect(text).toContain("Team activity since your last turn");
 		// The named context parts (what the system prompt carries) do not change with the team's
 		// activity, and do not carry it.
@@ -360,6 +362,22 @@ describe("the row and its cadence", () => {
 		expect(rows[0]?.row.content.split("\n").slice(1)).toEqual([
 			`- Files: [[${task?.address}|B's work]] of session "B" is also changing \`src/shared.ts\`, which you changed`,
 		]);
+	});
+
+	test("a window with more commits than a look reads says once, without a number, that earlier ones were not read", async () => {
+		const s = await changed();
+		// 52 more commits by B (it reopens and ticks in turn): the newest 50 are read.
+		for (let i = 0; i < 52; i++) await s.tick(i % 2 === 0 ? "todo" : "done", s.base + 1000 + i);
+		const rows = capture();
+		await writeOutlineTeamActivity(s.a, "en", "start", { now: s.base + 60_000 });
+		expect(rows[0]?.row.content.split("\n").slice(1)).toEqual([
+			expect.stringContaining('session "B"'),
+			"(Some earlier changes in this window were not read.)",
+		]);
+		// A window read whole says no such thing.
+		await s.tick("todo", s.base + 70_000);
+		await writeOutlineTeamActivity(s.a, "zh-CN", "start", { now: s.base + 80_000 });
+		expect(rows[1]?.row.content).not.toContain("没有读");
 	});
 
 	test("a spec session's run start and tool boundaries write nothing", async () => {

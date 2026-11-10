@@ -170,6 +170,16 @@ export function getOutlineTeamActivityMore(
 		: `(${more} more change${more === 1 ? "" : "s"} not listed; read the related tasks with OutlineRead)`;
 }
 
+/**
+ * The fixed line of a look that could not read its whole window (older commits of a busy window
+ * passed over, or one commit larger than a read): no number, the same bytes every time.
+ */
+export function getOutlineTeamActivityClipped(locale: Locale): string {
+	return locale === "zh-CN"
+		? "（这段时间里更早的一些变化没有读。）"
+		: "(Some earlier changes in this window were not read.)";
+}
+
 /** The overlap hint a Write or Edit result ends with: one line (design §2.6). */
 export function getOutlineOverlapHint(
 	input: {

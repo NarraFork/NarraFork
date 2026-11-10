@@ -63,6 +63,7 @@ import { hotSafe } from "@server/lib/hot-safe";
 import type { Locale } from "@server/lib/i18n";
 import { logger } from "@server/lib/logger";
 import {
+	getOutlineTeamActivityClipped,
 	getOutlineTeamActivityHeading,
 	getOutlineTeamActivityMore,
 	type OutlineTeamActor,
@@ -229,6 +230,8 @@ interface SpaceLook {
 	drafts: Draft[];
 	/** The last seq read whole: where the space's cursor goes. */
 	readThrough: number;
+	/** Part of the window was never read (one commit larger than a read, cut at the limit). */
+	clipped: boolean;
 	/** Blocks of this space that drafts name, with their metas. */
 	metas: Map<string, OutlineBlockMeta>;
 	/** The task page, for "read on". */
@@ -371,15 +374,16 @@ async function readWindow(
 	spaceId: string,
 	from: number,
 	to: number,
-): Promise<{ rows: OutlineRangeChange[]; readThrough: number }> {
+): Promise<{ rows: OutlineRangeChange[]; readThrough: number; clipped: boolean }> {
 	const per = OUTLINE_TEAM_ACTIVITY_LIMITS.versionsPerRead;
 	const rows: OutlineRangeChange[] = [];
 	let after = from;
+	let clipped = false;
 	for (let n = 0; n < OUTLINE_TEAM_ACTIVITY_LIMITS.readsPerSpace; n++) {
 		const read = await store.listCommitRangeChanges(spaceId, after, to, per + 1);
 		if (read.length <= per) {
 			rows.push(...read);
-			return { rows, readThrough: to };
+			return { rows, readThrough: to, clipped };
 		}
 		// The read stopped inside the commit of its last row: take the commits before it whole and
 		// start the next read at it. One commit larger than a read is taken up to the limit.
@@ -388,12 +392,13 @@ async function readWindow(
 		if (whole.length === 0) {
 			rows.push(...read.slice(0, per));
 			after = cut;
+			clipped = true;
 		} else {
 			rows.push(...whole);
 			after = cut - 1;
 		}
 	}
-	return { rows, readThrough: after };
+	return { rows, readThrough: after, clipped };
 }
 
 /** What one space's window says, for the session (see the module header). */
@@ -404,8 +409,14 @@ async function lookAtSpace(
 	to: number,
 ): Promise<SpaceLook> {
 	const { store, root } = ctx;
-	const { rows: changes, readThrough } = await readWindow(store, space.id, from, to);
-	const look: SpaceLook = { drafts: [], readThrough, metas: new Map(), taskPageId: null };
+	const { rows: changes, readThrough, clipped } = await readWindow(store, space.id, from, to);
+	const look: SpaceLook = {
+		drafts: [],
+		readThrough,
+		clipped,
+		metas: new Map(),
+		taskPageId: null,
+	};
 	if (changes.length === 0) return look;
 	const commits = new Map(
 		(await store.getCommitsBySeqs(space.id, [...new Set(changes.map((c) => c.seq))])).map((c) => [
@@ -663,6 +674,8 @@ export async function readOutlineTeamActivity(
 	}
 	const ctx: LookContext = { store, root, handle: facts.handle, held, now };
 	const looks: Array<{ space: OutlineSpaceRow; look: SpaceLook }> = [];
+	/** Some of a window was not read: said in one fixed line, when there is anything to say. */
+	let clipped = false;
 	for (const space of spaces) {
 		if (!(await canSessionReadSpace(root, space))) continue;
 		const latest = space.nextSeq - 1;
@@ -676,9 +689,13 @@ export async function readOutlineTeamActivity(
 			continue;
 		}
 		// A busy window: its newest commits only; the older ones are passed over, uncounted.
-		if (latest - from > OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace)
+		let passedOver = false;
+		if (latest - from > OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace) {
 			from = latest - OUTLINE_TEAM_ACTIVITY_LIMITS.commitsPerSpace;
+			passedOver = true;
+		}
 		const look = await lookAtSpace(ctx, space, from, latest);
+		if (passedOver || look.clipped) clipped = true;
 		// Up to what was read whole: a look cut short goes on from there next time.
 		current.cursors.set(space.id, { seq: look.readThrough, at: now });
 		looks.push({ space, look });
@@ -747,6 +764,7 @@ export async function readOutlineTeamActivity(
 	// The budget: lines and bytes, the heading and a count line included.
 	const heading = getOutlineTeamActivityHeading(locale);
 	const taskPage = await taskPageOf(store, main, looks, locale);
+	const clippedLine = clipped ? getOutlineTeamActivityClipped(locale) : "";
 	const lines: string[] = [];
 	const items: OutlineTaskNoticeItem[] = [];
 	let left = more + (named.length - named.filter(Boolean).length);
@@ -755,7 +773,7 @@ export async function readOutlineTeamActivity(
 		const text = outlineTeamLineText(entry.text, locale);
 		const rest = listed.length - index - 1 + left;
 		const tail = rest > 0 ? getOutlineTeamActivityMore(rest + 1, taskPage, locale) : "";
-		const size = bytesOf([heading, ...lines, text, tail].filter(Boolean).join("\n"));
+		const size = bytesOf([heading, ...lines, text, tail, clippedLine].filter(Boolean).join("\n"));
 		if (
 			lines.length >= OUTLINE_TEAM_ACTIVITY_LIMITS.lines ||
 			size > OUTLINE_TEAM_ACTIVITY_LIMITS.bytes
@@ -771,6 +789,7 @@ export async function readOutlineTeamActivity(
 		heading,
 		...lines,
 		...(left > 0 ? [getOutlineTeamActivityMore(left, taskPage, locale)] : []),
+		...(clippedLine ? [clippedLine] : []),
 	].join("\n");
 	return {
 		content,
