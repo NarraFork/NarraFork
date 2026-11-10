@@ -545,6 +545,28 @@ test("the cursor never stays in hidden content, and typing beside a closed block
 	expect((await head(a))?.blockId).toBe(note);
 	await a.page.keyboard.press("ArrowDown");
 	expect((await head(a))?.blockId).toBe(kids[1]);
+	// From the end of the closed block's line: right and down go to the next block on screen,
+	// left and up come back to its line; nothing opens on the way.
+	await caret(a, note);
+	await a.page.keyboard.press("ArrowRight");
+	expect(await head(a)).toEqual({ blockId: kids[1] as string, offset: 0 });
+	await a.page.keyboard.press("ArrowLeft");
+	expect(await head(a)).toEqual({ blockId: note, offset: "First note line!".length });
+	await a.page.keyboard.press("ArrowDown");
+	expect((await head(a))?.blockId).toBe(kids[1]);
+	await a.page.keyboard.press("ArrowUp");
+	expect((await head(a))?.blockId).toBe(note);
+	// Shift extends the selection over the closed block's edge the same way.
+	await caret(a, note);
+	await press(a, "Shift+ArrowRight");
+	expect(await a.call((f) => f.selection())).toEqual({
+		anchor: { blockId: note, offset: "First note line!".length },
+		head: { blockId: kids[1] as string, offset: 0 },
+	});
+	await caret(a, kids[1] as string);
+	expect((await rowOf(a, note))?.state).toBe("closed");
+	// (What the reader opened under the note earlier is still theirs; nothing was added.)
+	expect(await foldState(a)).toEqual({ expanded: [detail], collapsed: [] });
 
 	// Delete at the end of a closed block joins the next block on screen, never a hidden child.
 	await caret(a, note);
@@ -577,6 +599,18 @@ test("the cursor never stays in hidden content, and typing beside a closed block
 	);
 	expect(await a.call((f, id) => f.kids(id as never), note)).toHaveLength(4);
 	expect((await head(a))?.blockId).toBe(again[1]);
+	// Ticking a task done closes it at once (the cursor is elsewhere); ticking it back opens it.
+	const subtask = idOf("A subtask");
+	expect((await rowOf(a, subtask))?.state).toBe("open");
+	await a.call((f, id) => f.setTask(id as never, "x"), subtask);
+	expect((await rowOf(a, subtask))?.state).toBe("closed");
+	expect((await rowOf(a, subtask))?.preview).toMatchObject({
+		kind: "result",
+		text: "Subtask note",
+	});
+	await a.call((f, id) => f.setTask(id as never, "/"), subtask);
+	expect((await rowOf(a, subtask))?.state).toBe("open");
+	await settle(a);
 	await settle(a);
 	expect(await a.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
 	expect(a.errors).toEqual([]);
