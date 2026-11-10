@@ -32,18 +32,18 @@ const originalFetch = globalThis.fetch;
 
 function responseFailed(
 	message: string,
-	options: { code?: string; statusCode?: number } = {},
+	options: { code?: string; diagnosticsCode?: string; statusCode?: number } = {},
 ): Response {
 	const data = options.code
 		? {
 				type: "error",
 				error: { type: options.code, message },
-				diagnostics: { statusCode: options.statusCode },
+				diagnostics: { statusCode: options.statusCode, code: options.diagnosticsCode },
 			}
 		: {
 				type: "error",
 				message,
-				diagnostics: { statusCode: options.statusCode },
+				diagnostics: { statusCode: options.statusCode, code: options.diagnosticsCode },
 			};
 	return new Response(`event: error\ndata: ${JSON.stringify(data)}\n\n`, {
 		status: 200,
@@ -57,6 +57,7 @@ function structuredInvalidStateResponse(options: {
 	text?: string;
 	reasoning?: string;
 	completionTokens?: number;
+	diagnosticsCode?: string;
 }): Response {
 	const events = [
 		'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_limited","usage":{"input_tokens":3}}}\n\n',
@@ -86,6 +87,7 @@ function structuredInvalidStateResponse(options: {
 		`event: error\ndata: ${JSON.stringify({
 			type: "error",
 			error: { type: options.reason, message: options.message },
+			diagnostics: { code: options.diagnosticsCode },
 		})}\n\n`,
 		`event: message_delta\ndata: ${JSON.stringify({
 			type: "message_delta",
@@ -305,6 +307,109 @@ describe("agentLoop provider invalidState classification", () => {
 		expect(events.some((event) => event.type === "stream_reset")).toBe(false);
 		expect(events.some((event) => event.type === "retrying")).toBe(false);
 		expect(events.at(-1)).toEqual({ type: "done" });
+	});
+
+	test.each([
+		"http",
+		"sse",
+	])("%s generic reason + diagnostics.code 保留原错且不普通重试", async (transport) => {
+		const message = "Opaque original upstream failure";
+		const diagnostics = { code: "CONTEXT_LENGTH_EXCEEDED", requestId: "upstream-overflow-id" };
+		const response =
+			transport === "http"
+				? new Response(JSON.stringify({ error: { type: "api_error", message }, diagnostics }), {
+						status: 400,
+					})
+				: new Response(
+						`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message }, diagnostics })}\n\n`,
+						{ headers: { "content-type": "text/event-stream" } },
+					);
+		const calls = installResponses([response]);
+		const events = await runLoop();
+		expect(calls()).toBe(1);
+		expect(events.filter((event) => event.type === "context_length_exceeded")).toHaveLength(1);
+		expect(
+			events.some((event) => event.type === "retrying" || event.type === "retryable_error"),
+		).toBe(false);
+		const end = events.find((event) => event.type === "api_request_end");
+		expect(end?.diagnostics).toMatchObject({
+			...diagnostics,
+			message: expect.stringContaining(message),
+		});
+		expect(events.at(-1)).toMatchObject({
+			type: "context_length_exceeded",
+			message: expect.stringContaining(message),
+		});
+	});
+
+	test.each([
+		"http",
+		"sse",
+	])("%s 接受已证实中文提示词溢出，不扩大到模糊内容过长", async (transport) => {
+		for (const [message, overflow] of [
+			["请求提示词超出模型上限", true],
+			["内容过长", false],
+		] as const) {
+			const response =
+				transport === "http"
+					? new Response(JSON.stringify({ error: { type: "api_error", message } }), { status: 400 })
+					: responseFailed(message, { code: "api_error", statusCode: 400 });
+			const calls = installResponses([response]);
+			const events = await runLoop();
+			expect(calls()).toBe(1);
+			expect(events.some((event) => event.type === "context_length_exceeded")).toBe(overflow);
+		}
+	});
+
+	test.each([
+		"max_tokens",
+		"max_output_tokens",
+		"length",
+	])("%s 与 context code 冲突时保持输出截断", async (reason) => {
+		const calls = installResponses([
+			structuredInvalidStateResponse({
+				reason,
+				message: "input exceeds the context window",
+				diagnosticsCode: "CONTEXT_LENGTH_EXCEEDED",
+				text: "partial answer",
+			}),
+		]);
+		const events = await runLoop();
+		expect(calls()).toBe(1);
+		expect(events.filter((event) => event.type === "output_truncated")).toHaveLength(1);
+		expect(
+			events.some((event) => event.type === "context_length_exceeded" || event.type === "retrying"),
+		).toBe(false);
+	});
+
+	test("SSE context reason 不能覆盖 diagnostics.code 的显式输出限制", async () => {
+		const calls = installResponses([
+			structuredInvalidStateResponse({
+				reason: "model_context_window_exceeded",
+				message: "context window exceeded",
+				diagnosticsCode: "max_output_tokens",
+				text: "partial",
+			}),
+		]);
+		const events = await runLoop();
+		expect(calls()).toBe(1);
+		expect(events.filter((event) => event.type === "output_truncated")).toHaveLength(1);
+		expect(events.some((event) => event.type === "context_length_exceeded")).toBe(false);
+	});
+
+	test("HTTP throw 的 CONTEXT_LENGTH_EXCEEDED 特例不能绕过 completion-limit 优先级", async () => {
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			throw Object.assign(new Error("input exceeds the context window"), {
+				code: "CONTEXT_LENGTH_EXCEEDED",
+				reason: "max_tokens",
+			});
+		}) as unknown as typeof fetch;
+		const events = await runLoop({ maxTransientRetries: 0 });
+		expect(calls).toBe(1);
+		expect(events.some((event) => event.type === "context_length_exceeded")).toBe(false);
+		expect(events.at(-1)?.type).toBe("error");
 	});
 
 	test("真正的 context overflow 仍进入 context_length_exceeded", async () => {

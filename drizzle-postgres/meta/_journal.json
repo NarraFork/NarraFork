@@ -470,6 +470,13 @@
 			"when": 1794151608019,
 			"tag": "0066_workspace-outline-title-invalidation",
 			"breakpoints": true
+		},
+		{
+			"idx": 67,
+			"version": "7",
+			"when": 1794283712715,
+			"tag": "0067_recent_tabs_show_directory",
+			"breakpoints": true
 		}
   ]
 }

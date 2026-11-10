@@ -2890,6 +2890,27 @@
 		"summaryShort": "v{{version}} · +{{added}} ~{{changed}} −{{removed}}",
 		"summaryFirstShort": "v{{version}} · new · +{{added}}",
 		"agentSummary": "What changed: {{summary}}",
+		"tree": {
+			"overview_one": "Outline · {{count}} block",
+			"overview_other": "Outline · {{count}} blocks",
+			"overviewAll_one": "Outline · all {{count}} block shown",
+			"overviewAll_other": "Outline · all {{count}} blocks shown",
+			"expandAll": "Expand all",
+			"collapseAll": "Collapse all",
+			"expand": "Expand",
+			"collapse": "Collapse",
+			"altHint": "Alt+click: everything inside",
+			"subtree": "Expand/collapse everything in “{{title}}”",
+			"subtreeExpand": "Expand everything inside",
+			"subtreeCollapse": "Collapse everything inside",
+			"detailsMore": "{{n}} more ▸",
+			"detailsOne": "Expand ▸",
+			"showInside": "Show everything inside this item",
+			"showWhole": "Show the whole text",
+			"showLess": "Show less",
+			"more_one": "{{count}} more block: open the plan in the outline to see it",
+			"more_other": "{{count}} more blocks: open the plan in the outline to see them"
+		},
 		"reviewCount_one": "{{count}} review comment",
 		"reviewCount_other": "{{count}} review comments",
 		"review": {
@@ -2938,7 +2959,9 @@
 				"doing": "in progress",
 				"done": "done",
 				"cancelled": "cancelled"
-			}
+			},
+			"showWhole": "Show all",
+			"showLess": "Show less"
 		}
 	}
 }

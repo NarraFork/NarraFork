@@ -77,6 +77,13 @@ bun server/index.ts --no-auto-resume
 - `dist/frontend/index.html` 必须存在，防止构建后 PWA/品牌测试因为没有产物而跳过。
 - 通用 CI 不启用 `PG_INTEGRATION`、`NF_PG_HARNESS_INTEGRATION`、`NF_REFERENCE_COST_PG_URL`、`NF_PROGRAMMATIC_TEST_IMAGE` 或 `NF_TASK_CHALLENGES_PODMAN` 等现有 opt-in。它们有独立的数据库/专用镜像前提，不代表已由默认门禁验收。无 opt-in 的真实 PG baseline 仍运行，不排除 `pg-*`、`integration`、`browser` 或 `e2e` 文件。
 
+### 测试库的迁移回放
+
+- `tests/setup.ts` 回放整份 `drizzle/` 历史时，必须先用生产的 `rewriteQualifiedNewTableChecks()` 改写 `CREATE __new_*` 语句，不能直接 `sqlite.run()`；两套路径各写一份保障正是它们漂移的原因。
+- 平台差异：Apple 自带 SQLite 默认 `PRAGMA legacy_alter_table = ON`，stock SQLite（Linux CI）默认 OFF。ON 时 `ALTER TABLE __new_x RENAME TO x` 不重写 CHECK 里的限定符，0153 会在 macOS 上以 `no such column: __new_file_attributions.lines_added` 失败。
+- `tests/setup-migrations.test.ts` 守护：强制 `legacy_alter_table = ON` 回放全量迁移，并断言与 OFF 时 `sqlite_master` 逐条相同、无 `__new_*` 残留。
+- 不要改成在 harness 里 pin pragma：通用 CI 只在 ubuntu-24.04 上跑，平台相关默认值必须在测试内部显式制造。
+
 ### 预迁移 SQLite 模板
 
 `tests/preload.ts` 会用 `tests/sqlite-template.ts` 把一份已完成启动流程的数据库复制到隔离目录，再由 `@server/db` 照常执行完整启动（锁、标记、按哈希迁移、ensureColumns、回填、FTS），只是迁移已全部存在。此前每个导入数据库的测试文件都要重放约 200 条迁移（约 0.6–0.8s），4 vCPU 上占全仓时间的显著部分。

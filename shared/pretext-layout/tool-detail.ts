@@ -19,6 +19,13 @@ import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
 import { outlineAddressPath } from "../outline-links";
+import { isOutlinePlanInput } from "../outline-plan-submission";
+import {
+	DEFAULT_PLAN_TREE_VIEW,
+	type PlanTree,
+	type PlanTreeView,
+	parsePlanTree,
+} from "../outline-plan-tree";
 import { readOutlineAskDisplay, readOutlineEditDisplay } from "../outline-tool-display";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
@@ -360,6 +367,32 @@ export interface ToolChangeRowsDetail {
 }
 
 /**
+ * 🔴 An outline plan as an outline (plan readability): the title, the background paragraph whole,
+ * the big and small points, each small point's implementation details behind one preview line,
+ * the notable points whole, each opened by the reader (`outline-plan-tree.ts`; `view` is their
+ * choice, resolved during adaptation like every fold). Measured row by row
+ * (`measure-plan-tree.ts`) inside the plan's capped box.
+ *
+ * `markdown` is the same plan as the capped markdown body a plan file gets: what the fullscreen
+ * viewer opens and what a copy takes. It is never drawn inline.
+ */
+export interface ToolPlanTreeDetail {
+	kind: "plan-tree";
+	tree: PlanTree;
+	view: PlanTreeView;
+	markdown: ToolCappedDetail;
+	/**
+	 * The preview line's labels (measured: they share its line): `more` with `{n}` for the
+	 * children past the first (「还有 {n} 条 ▸」), `one` for a lone first child longer than its
+	 * line (「展开 ▸」). From the adapter's labels, English when absent.
+	 */
+	labels: { more: string; one: string };
+}
+
+/** The preview labels when the adapter injects none (tests, the purity-guarded default). */
+const PLAN_TREE_LABEL_FALLBACKS = { more: "{n} more ▸", one: "Expand ▸" } as const;
+
+/**
  * Defensive ceilings on a read-only AskUserQuestion replay. The tool schema
  * already bounds these (1-4 questions, 2-4 options), but a malformed provider
  * payload must never turn into unbounded measurement work — same rationale as
@@ -619,7 +652,8 @@ export type ToolSectionBody =
 	| ToolMetaRowsDetail
 	| ToolAskDetail
 	| ToolGenUiDetail
-	| ToolChangeRowsDetail;
+	| ToolChangeRowsDetail
+	| ToolPlanTreeDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -942,9 +976,11 @@ interface ClassifyToolDetailFields {
 	hasPendingPermission?: boolean;
 	/**
 	 * Injected chrome labels (the adapter forwards `ctx.labels`). Only the strings
-	 * that participate in MEASUREMENT belong here — currently the ask replay's
+	 * that participate in MEASUREMENT belong here — e.g. the ask replay's
 	 * "Answer:" / "Custom answer:" prefixes, which wrap with their answer text and
-	 * therefore cannot be substituted by the render layer.
+	 * therefore cannot be substituted by the render layer, and an outline plan's
+	 * preview labels (`planTreeDetailsMore` / `planTreeDetailsOne`), which share
+	 * the preview's line.
 	 */
 	labels?: Record<string, string>;
 	/**
@@ -952,6 +988,11 @@ interface ClassifyToolDetailFields {
 	 * result the model saw (`ToolChangeRowsDetail.toggle`). Folded by default.
 	 */
 	rawOpen?: boolean;
+	/**
+	 * The reader's view of an outline plan's tree (which nodes and texts they opened), keyed by
+	 * the card. Absent: the overview (the root and two levels under it).
+	 */
+	planView?: PlanTreeView;
 }
 
 /** Trim a possibly-null string; undefined when absent or blank. */
@@ -1089,7 +1130,13 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 		kind: "sections",
 		sections: base.sections.map((part) => ({
 			...part,
-			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
+			body:
+				part.body.kind === "capped"
+					? describeToolBody(part.body, input)
+					: // An outline plan's tree keeps its markdown for the viewer: the same identity.
+						part.body.kind === "plan-tree"
+						? { ...part.body, markdown: describeToolBody(part.body.markdown, input) }
+						: part.body,
 		})),
 	};
 }
@@ -1276,6 +1323,8 @@ function classifyByCategory(
 				inputJson,
 				metadata,
 				isFailStatus(status) ? nonEmptyTrimmedText(input.denyMessage) : undefined,
+				input.planView,
+				input.labels,
 			);
 		case "pipeline":
 			return classifyPipeline(toolName, inputJson, outputJson, metadata);
@@ -2749,6 +2798,8 @@ function classifyPlan(
 	inputJson: unknown,
 	metadata: Record<string, unknown> | null,
 	denyMessage?: string,
+	planView?: PlanTreeView,
+	labels?: Record<string, string>,
 ): ToolDetailData | null {
 	const planText = extractField(inputJson, "plan") || String(asObject(inputJson)?.plan ?? "");
 	// `hasUsablePlanBody` rejects our own model-facing plan reference. It reaches
@@ -2766,13 +2817,32 @@ function classifyPlan(
 	// degrade them to monospace plain text. `_planFile` marks a file-based plan;
 	// pass the raw path through and let the render layer localize it.
 	const planFile = extractField(inputJson, "_planFile");
-	const body = capped("input.plan", "plan", {
+	const markdown = capped("input.plan", "plan", {
 		contentLines: countLines(planText),
 		text: planText,
 		...truncatedFlag(inputJson),
 		format: "markdown",
 		...(planFile ? { sourcePath: planFile } : {}),
 	});
+	// An outline plan reads as its outline (plan readability): folded to the root and two levels.
+	// Only a whole one: a server-side prefix is a cut tree, so it stays the capped markdown body
+	// (which fetches the rest as it is read), as does anything that is not one outline tree.
+	const tree =
+		markdown.textTruncated !== true && isOutlinePlanInput(inputJson)
+			? parsePlanTree(planText)
+			: null;
+	const body: ToolSectionBody = tree
+		? {
+				kind: "plan-tree",
+				tree,
+				view: planView ?? DEFAULT_PLAN_TREE_VIEW,
+				markdown,
+				labels: {
+					more: labels?.planTreeDetailsMore ?? PLAN_TREE_LABEL_FALLBACKS.more,
+					one: labels?.planTreeDetailsOne ?? PLAN_TREE_LABEL_FALLBACKS.one,
+				},
+			}
+		: markdown;
 	// A DENIED plan carries the reviewer's feedback above the body.
 	//
 	// `permissionDenyMessage` is a TOP-LEVEL tool-call column, not part of
