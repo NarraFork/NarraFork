@@ -529,7 +529,7 @@ test("a question put to a person: marked, never ticked, deleting it withdraws it
 					}
 				: null;
 		}, id);
-	const said = "A question for a person: answered in the inbox. Deleting it withdraws it.";
+	const said = "Open to answer; delete to withdraw.";
 	expect(await mark(a, question)).toEqual({
 		role: "img",
 		label: said,
