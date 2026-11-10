@@ -396,12 +396,33 @@ describe("what changed since the view the session saw before", () => {
 		expect(first?.states?.doing).toHaveLength(2);
 		expect(first?.states?.delegated).toHaveLength(12);
 
-		// One to-do finished, one started: named. The to-dos that merely moved past the cut are not.
-		await write(s, id, [setTask(s, "Own 02", "done"), setTask(s, "Own 03", "doing")]);
+		// One to-do finished, one started, and two started that were past the cut: all four named.
+		// The table has less room for to-dos now, so a to-do that is still open falls off its
+		// end: its block is read (still open) and it is NOT reported as having left.
+		const before = new Set(first?.states?.todo ?? []);
+		await write(s, id, [
+			setTask(s, "Own 02", "done"),
+			setTask(s, "Own 03", "doing"),
+			setTask(s, "Own 50", "doing"),
+			setTask(s, "Own 51", "doing"),
+		]);
 		await request(id);
 		const second = await latest(id);
-		expect(named(second)).toEqual(["done:Own 02<todo", "started:Own 03<todo"]);
-		expect(second?.changed).toBe(2);
+		const after = new Set(second?.states?.todo ?? []);
+		const fellOff = [...before].filter(
+			(address) =>
+				!after.has(address) &&
+				address !== s.task["Own 02"]?.address &&
+				address !== s.task["Own 03"]?.address,
+		);
+		expect(fellOff.length).toBeGreaterThanOrEqual(1);
+		expect(named(second)).toEqual([
+			"done:Own 02<todo",
+			"started:Own 03<todo",
+			"started:Own 50",
+			"started:Own 51",
+		]);
+		expect(second?.changed).toBe(4);
 		expect(size(second)).toBeLessThanOrEqual(60);
 		expect(JSON.stringify(second).length).toBeLessThan(8192);
 	});

@@ -188,7 +188,13 @@ function expectChangeNotices(all: Fixture.CardReport[], options: Fixture.Fixture
 		copy.empty,
 	]);
 	// Never a stub: counts that are drawn are drawn whole (the others wrap out of the line).
-	for (const card of [changed, one, refreshed, emptied]) expect(card.leadTruncated).toBe(false);
+	for (const card of [changed, one, refreshed, emptied]) {
+		expect(card.leadTruncated).toBe(false);
+		expect({ title: card.title, leadCut: card.leadCut }).toEqual({
+			title: card.title,
+			leadCut: false,
+		});
+	}
 	if (locale !== "en") return;
 	// Widths, on Latin text only (see the file's header).
 	const enlarged = (options.fontScalePercent ?? 100) > 100;
@@ -344,6 +350,8 @@ for (const { name, options } of CASES) {
 			expect(card.spill).toBeLessThanOrEqual(0.5);
 			expect(card.scrollWidth).toBeLessThanOrEqual(card.width);
 			expect(card.lineOverflow).toBeLessThanOrEqual(0.5);
+			// Nor is a task notice taller than what it draws (its lines are all it reserves).
+			if (card.kind === "tasks_notice") expect(card.slack).toBeLessThanOrEqual(0.5);
 			// No Markdown reaches the reader.
 			expect(card.text).not.toContain("######");
 			expect(card.text).not.toContain("\\");

@@ -424,6 +424,14 @@ export interface CardReport {
 	 * wrap out of sight when the heading leaves them no room).
 	 */
 	leadShown: boolean;
+	/** The lead is painted in part: cut by its box (a stub). Never, for counts after a sentence. */
+	leadCut: boolean;
+	/**
+	 * Empty room between the last painted thing and the bottom of the card's content box (px): a
+	 * measure pass that reserves more than is drawn shows here, where `spill` sees one that
+	 * reserves less.
+	 */
+	slack: number;
 	/** Task rows drawn, and the rows the measure pass counted. */
 	rows: number;
 	measuredRows: number;
@@ -487,6 +495,7 @@ export function report(): CardReport[] {
 			}
 		}
 		let spill = 0;
+		let slack = 0;
 		if (paper) {
 			const box = paper.getBoundingClientRect();
 			const style = getComputedStyle(paper);
@@ -496,11 +505,14 @@ export function report(): CardReport[] {
 				box.bottom -
 				Number.parseFloat(style.borderBottomWidth) -
 				Number.parseFloat(style.paddingBottom);
+			let lowest = top;
 			for (const child of paper.querySelectorAll<HTMLElement>("*")) {
 				const r = paintedBox(child, paper);
 				if (!r) continue;
 				spill = Math.max(spill, top - r.top, r.bottom - bottom);
+				lowest = Math.max(lowest, r.bottom);
 			}
+			slack = bottom - lowest;
 		}
 		const task = card.querySelector<HTMLElement>(
 			"[data-task-notice-summary] [data-task-notice-task]",
@@ -541,6 +553,8 @@ export function report(): CardReport[] {
 			titleWeight: heading ? getComputedStyle(heading).fontWeight : "",
 			leadText: lead?.textContent ?? "",
 			leadShown: !!lead && !!head && wholeIn(lead, head),
+			leadCut: !!lead && !!head && !!paintedBox(lead, head) && !wholeIn(lead, head),
+			slack: Math.round(slack * 10) / 10,
 			rows: card.querySelectorAll("[data-task-notice-row]").length,
 			measuredRows: Number(card.dataset.measuredRows),
 			changedRows: card.querySelectorAll("[data-task-notice-changed]").length,
