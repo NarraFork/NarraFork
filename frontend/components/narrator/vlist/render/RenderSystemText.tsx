@@ -861,6 +861,11 @@ function TaskNoticeCard({
 	const answerFirst = !expanded && !narrow && data.summary?.tailFirst === true;
 	const timeLabel = typeof data.timeLabel === "string" && !narrow ? data.timeLabel : "";
 	const Chevron = expanded ? IconChevronDown : IconChevronRight;
+	// The heading is the notice (the view's changes in words): it keeps the folded line, and the
+	// summary (the counts) takes what it leaves.
+	const titleFirst = data.titleFirst === true;
+	// Changed rows carry a mark; the others are indented by as much so the titles stay aligned.
+	const marked = rows.some((row) => row.changed === true);
 	return (
 		<Paper
 			p="xs"
@@ -902,14 +907,16 @@ function TaskNoticeCard({
 				/>
 				<span
 					data-task-notice-title=""
+					title={titleFirst ? data.title : undefined}
 					style={{
 						...noticeText(),
 						...NOWRAP_ELLIPSIS,
-						fontWeight: 600,
+						// A list that was only refreshed asks nothing of the reader: no emphasis.
+						fontWeight: data.quiet === true ? 400 : 600,
 						color: "var(--mantine-color-dimmed)",
 						// Folded, the heading yields its width to the task; unfolded, it has the line.
-						flex: expanded ? "0 1 auto" : "0 8 auto",
-						maxWidth: expanded ? undefined : HEADING_MAX_WIDTH,
+						flex: expanded || titleFirst ? "0 1 auto" : "0 8 auto",
+						maxWidth: expanded || titleFirst ? undefined : HEADING_MAX_WIDTH,
 						// Beside an answer it keeps who answered and how many, and gives the rest up.
 						...(answerFirst ? { minWidth: "min(7em, 30%)" } : {}),
 					}}
@@ -990,7 +997,7 @@ function TaskNoticeCard({
 				>
 					{rows.map((row, index) => (
 						// biome-ignore lint/suspicious/noArrayIndexKey: rows are a stable ordered list
-						<TaskNoticeRowView key={index} row={row} line={line} />
+						<TaskNoticeRowView key={index} row={row} line={line} marked={marked} />
 					))}
 				</div>
 			) : null}
@@ -1014,8 +1021,9 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 	return (
 		<>
 			{/* On a phone a lead beside a task ("2 个未完成：") would only be cut to "2…": it is left
-			    out like the tail, the chevron opens the list. A lead that is the whole line stays. */}
-			{lead && !(narrow && row) ? (
+			    out like the tail, the chevron opens the list. So is one beside a heading that keeps
+			    the line (the counts after the view's changes). A lead that is the whole line stays. */}
+			{lead && !(narrow && (row || data.titleFirst)) ? (
 				<span style={dim} data-task-notice-lead="">
 					{lead}
 				</span>
@@ -1053,7 +1061,19 @@ function TaskNoticeSummaryLine({ data, narrow }: { data: TaskNoticeData; narrow:
 	);
 }
 
-function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) {
+/** Width of a changed row's mark (and of the indent that aligns the rows without one). */
+const TASK_NOTICE_CHANGE_MARK = 3;
+
+function TaskNoticeRowView({
+	row,
+	line,
+	marked = false,
+}: {
+	row: TaskNoticeRow;
+	line: number;
+	/** The card has changed rows: every row keeps the mark's width, so the titles stay aligned. */
+	marked?: boolean;
+}) {
 	if (row.dim) {
 		return (
 			<div
@@ -1074,6 +1094,7 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 	return (
 		<div
 			data-task-notice-row=""
+			data-task-notice-changed={row.changed ? "" : undefined}
 			style={{
 				display: "flex",
 				alignItems: "center",
@@ -1085,6 +1106,19 @@ function TaskNoticeRowView({ row, line }: { row: TaskNoticeRow; line: number }) 
 				...(row.indent ? { paddingLeft: TASK_NOTICE_INDENT } : {}),
 			}}
 		>
+			{marked ? (
+				<span
+					aria-hidden="true"
+					data-task-notice-mark=""
+					style={{
+						flexShrink: 0,
+						width: TASK_NOTICE_CHANGE_MARK,
+						height: Math.round(line * 0.6),
+						borderRadius: TASK_NOTICE_CHANGE_MARK,
+						backgroundColor: row.changed ? "var(--mantine-color-blue-filled)" : "transparent",
+					}}
+				/>
+			) : null}
 			{row.statusFrom && row.status ? (
 				<>
 					<StatusChip chip={row.statusFrom} />
