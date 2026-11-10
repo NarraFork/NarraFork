@@ -16,6 +16,7 @@ import { userIdentities, userPreferences, users } from "@server/db/schema";
 import { randomAvatarColor } from "@server/lib/avatar-colors";
 import { AppError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
+import { LDAP_PROVIDER_PREFIX } from "@server/lib/ldap/protocol";
 import type { OidcClaims } from "@server/lib/oidc";
 import type { OidcProviderConfig } from "@server/lib/settings/types";
 import { and, eq } from "drizzle-orm";
@@ -220,13 +221,24 @@ export const ssoService = {
 		}));
 	},
 
-	/** Remove a linked identity (must belong to the user). */
-	async unlink(userId: string, identityId: string): Promise<boolean> {
-		const res = await db
+	/**
+	 * Remove a linked identity (must belong to the user).
+	 *
+	 * `managed` is returned for a provider-owned binding the user may not drop — an LDAP
+	 * directory identity is not a federation link but the account's own login credential,
+	 * so unlinking it would lock the person out with no way back in.
+	 */
+	async unlink(userId: string, identityId: string): Promise<"ok" | "not_found" | "managed"> {
+		const identity = await db.query.userIdentities.findFirst({
+			where: and(eq(userIdentities.id, identityId), eq(userIdentities.userId, userId)),
+			columns: { provider: true },
+		});
+		if (!identity) return "not_found";
+		if (identity.provider.startsWith(LDAP_PROVIDER_PREFIX)) return "managed";
+		await db
 			.delete(userIdentities)
-			.where(and(eq(userIdentities.id, identityId), eq(userIdentities.userId, userId)))
-			.returning({ id: userIdentities.id });
-		return res.length > 0;
+			.where(and(eq(userIdentities.id, identityId), eq(userIdentities.userId, userId)));
+		return "ok";
 	},
 
 	/**

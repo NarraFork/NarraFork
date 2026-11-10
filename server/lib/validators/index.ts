@@ -7,6 +7,8 @@ export {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	createGitIdentitySchema,
+	ldapConnectionTestSchema,
+	ldapSettingsInputSchema,
 	loginSchema,
 	mfaToggleSchema,
 	mfaVerifySchema,

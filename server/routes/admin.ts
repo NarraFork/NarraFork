@@ -13,16 +13,19 @@ import { logger } from "../lib/logger";
 import { getOAuthRateLimitSnapshot } from "../lib/oauth-rate-limit";
 import { getOAuthSecurityObservabilitySnapshot } from "../lib/oauth-security-observability";
 import { saveSettings, settings } from "../lib/settings";
-import type { OidcProviderConfig } from "../lib/settings/types";
+import type { LdapSettings, NarraForkSettings, OidcProviderConfig } from "../lib/settings/types";
 import {
 	adminAuthConfigSchema,
 	adminCreateRegistrationCodeSchema,
 	adminCreateUserSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
+	type LdapSettingsInput,
+	ldapConnectionTestSchema,
 } from "../lib/validators";
 import { notifyAuthChanged, requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
+import { ldapAuthService } from "../services/ldap-auth-service";
 import { purgeNarratorGrantsForUser } from "../services/narrator-sharing";
 import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocation";
 import { purgeProjectGrantsForUser } from "../services/project-membership";
@@ -316,18 +319,24 @@ adminRoutes.delete("/registration-codes/:id", async (c) => {
 	return c.json({ ok: true });
 });
 
-// === Instance auth configuration (OIDC providers + WebAuthn) ===
+// === Instance auth configuration (LDAP + OIDC providers + WebAuthn) ===
 
-/** Admin: read the instance SSO/WebAuthn config (client secrets masked). */
+/** Admin: read the instance auth config (directory/OIDC secrets masked). */
 adminRoutes.get("/auth-config", (c) => {
 	const masked = maskAuthSettings(settings.auth);
 	return c.json({
 		oidcProviders: masked.oidcProviders ?? [],
 		webauthn: masked.webauthn ?? null,
+		ldap: masked.ldap ?? null,
 	});
 });
 
-/** Admin: replace the instance SSO/WebAuthn config. */
+/**
+ * Admin: replace the instance auth config.
+ *
+ * `bindPassword` (like `clientSecret`) is kept from storage when the UI sends an empty or
+ * masked value, so re-saving the form never blanks a secret the admin cannot read back.
+ */
 adminRoutes.patch("/auth-config", async (c) => {
 	const parsed = adminAuthConfigSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
@@ -367,13 +376,86 @@ adminRoutes.patch("/auth-config", async (c) => {
 				origins: parsed.data.webauthn.origins,
 			}
 		: undefined;
+	if (parsed.data.ldap !== undefined) {
+		current.auth.ldap =
+			parsed.data.ldap === null ? undefined : withStoredBindPassword(parsed.data.ldap, current);
+	}
 	saveSettings(current);
+
+	logger.info("Instance auth configuration updated", {
+		actorUserId: c.get("user").sub,
+		oidcProviderCount: providers.length,
+		ldapEnabled: current.auth.ldap?.enabled === true,
+	});
 
 	const masked = maskAuthSettings(current.auth);
 	return c.json({
 		oidcProviders: masked.oidcProviders ?? [],
 		webauthn: masked.webauthn ?? null,
+		ldap: masked.ldap ?? null,
 	});
+});
+
+/**
+ * Carry the stored service-account password over a submitted value that is empty or
+ * masked, then store only the fields the form manages.
+ *
+ * A masked value must never be persisted: it would replace a working password with
+ * `********abcd` and the next "test connection" would fail for reasons nobody can see.
+ */
+function withStoredBindPassword(
+	submitted: LdapSettingsInput,
+	current: NarraForkSettings,
+): LdapSettings {
+	const stored = current.auth.ldap;
+	const bindPassword = isMaskedSecret(submitted.bindPassword)
+		? (stored?.bindPassword ?? "")
+		: (submitted.bindPassword as string);
+	return {
+		enabled: submitted.enabled,
+		url: submitted.url.trim(),
+		startTls: submitted.startTls,
+		tlsRejectUnauthorized: submitted.tlsRejectUnauthorized,
+		connectTimeoutMs: submitted.connectTimeoutMs,
+		timeoutMs: submitted.timeoutMs,
+		mode: submitted.mode,
+		bindDn: submitted.bindDn || undefined,
+		bindPassword: bindPassword || undefined,
+		searchBase: submitted.searchBase || undefined,
+		searchScope: submitted.searchScope,
+		searchFilter: submitted.searchFilter || undefined,
+		bindDnTemplate: submitted.bindDnTemplate || undefined,
+		usernameAttribute: submitted.usernameAttribute || undefined,
+		emailAttribute: submitted.emailAttribute || undefined,
+		displayNameAttribute: submitted.displayNameAttribute || undefined,
+	};
+}
+
+/**
+ * Admin: probe the directory configuration, optionally with a test account.
+ *
+ * Reports the stage it reached, so "wrong service password" and "cannot reach the host"
+ * are distinguishable without reading server logs. Never echoes a credential or a stack.
+ */
+adminRoutes.post("/ldap/test", async (c) => {
+	const parsed = ldapConnectionTestSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
+
+	const config =
+		parsed.data.config === undefined
+			? undefined
+			: withStoredBindPassword(parsed.data.config, settings);
+	const result = await ldapAuthService.probe({
+		config,
+		username: parsed.data.username,
+		password: parsed.data.password,
+	});
+	logger.info("LDAP connection test ran", {
+		actorUserId: c.get("user").sub,
+		stage: result.stage,
+		ok: result.ok,
+	});
+	return c.json(result);
 });
 
 // === Terminal Management ===

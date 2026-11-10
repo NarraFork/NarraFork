@@ -323,6 +323,9 @@ export const ldapSettingsInputSchema = z
 		}
 	});
 
+/** What the admin form submits for the directory (before secret inheritance). */
+export type LdapSettingsInput = z.infer<typeof ldapSettingsInputSchema>;
+
 /** Full admin auth-config payload. */
 export const adminAuthConfigSchema = z.object({
 	oidcProviders: z.array(oidcProviderInputSchema).max(20),
