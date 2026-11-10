@@ -666,7 +666,7 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 			narratorId,
 			estimate,
 		);
-		let resolved = (updated ? { ...updated, seq: updated.seq ?? message.seq } : message) as T;
+		let resolved = updated ? { ...message, ...updated, seq: updated.seq ?? message.seq } : message;
 		if (options.recordCompactAfter && estimate.contextPercent != null) {
 			// The marker must show what the compact left in the narrator's own window.
 			// This estimate is the only place that number exists, so it is written here
@@ -681,7 +681,7 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 					});
 					return null;
 				});
-			if (marked) resolved = { ...marked, seq: resolved.seq } as T;
+			if (marked) resolved = { ...resolved, ...marked, seq: resolved.seq };
 		}
 		return { message: resolved, contextPercent: estimate.contextPercent };
 	} catch (err) {
