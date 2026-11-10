@@ -61,6 +61,8 @@ settings.update = {
 // executor bootstrap or network dependency is a fixture failure, not a fallback.
 const processGuard = denyHostEditorHelpers();
 const faultCounts = { historyFailures: 0, droppedReplies: 0 };
+let historyBudgetExpirations = 0;
+const nativeRequests: { method: "apply" | "query" | "ack"; operationId: string }[] = [];
 const nativeCalls = {
 	apply: 0,
 	query: 0,
@@ -141,7 +143,8 @@ const applyRequests = new Set<string>();
 // Instance-local evidence fault after actual Host write/sync/close/verification.
 // This is not a mock writer and never changes a global prototype or disk bytes.
 const { getDefaultLocalFileChangeRuntime } = await import("../services/file-change-runtime");
-const evidence = (await getDefaultLocalFileChangeRuntime()).evidence;
+const runtime = await getDefaultLocalFileChangeRuntime();
+const evidence = runtime.evidence;
 const recordEffect = evidence.recordEffect.bind(evidence);
 evidence.recordEffect = (...args: Parameters<typeof recordEffect>) => {
 	if (failSettlement && args[0].outcome === "applied") {
@@ -158,8 +161,30 @@ app.use("*", async (c, next) => {
 		return c.json({ error: "Fixture query unavailable until Host restart" }, 503);
 	await next();
 });
-app.post("/fixture-fault", (c) => {
+app.post("/fixture-fault", async (c) => {
 	const mode = c.req.query("mode");
+	if (mode === "history-budget") {
+		const { store } = await runtime.initialize();
+		const putBytes = store.putBytes.bind(store);
+		// Stall only the next optional history publication until its real production
+		// budget cancels it. Target IO, effect settlement and RPC remain untouched.
+		store.putBytes = async (_bytes, options) => {
+			store.putBytes = putBytes;
+			const signal = options.signal;
+			if (!signal) throw new Error("History fault requires its production budget signal");
+			signal.throwIfAborted();
+			return new Promise((_, reject) => {
+				signal.addEventListener(
+					"abort",
+					() => {
+						historyBudgetExpirations++;
+						reject(signal.reason);
+					},
+					{ once: true },
+				);
+			});
+		};
+	}
 	failSettlement = mode === "settlement" || c.req.query("pending") === "1";
 	dropApplyReply = mode === "lost-apply";
 	failAck = mode === "ack";
@@ -211,7 +236,14 @@ app.get("/fixture-info", (c) =>
 			.from(fileChangeOperations)
 			.where(eq(fileChangeOperations.sourceKind, "editor"))
 			.limit(4)
-			.all(),
+			.all()
+			.map((operation) => ({
+				...operation,
+				effects: evidence.listEffects(operation.id, { limit: 2 }).items.map((effect) => ({
+					diskOutcome: effect.diskOutcome,
+					intendedAfter: effect.intendedAfterStateJson,
+				})),
+			})),
 		leases: db
 			.select({ id: workspaceWriteLeases.leaseId, status: workspaceWriteLeases.status })
 			.from(workspaceWriteLeases)
@@ -220,6 +252,8 @@ app.get("/fixture-info", (c) =>
 		helpers: { processes: processGuard.starts },
 		editor: getEditorDocumentService().diagnostics,
 		nativeCalls,
+		nativeRequests,
+		historyBudgetExpirations,
 		faultCounts,
 		online: config.remote
 			? devices.getDeviceConnectionGeneration(config.remote.deviceId) !== null
@@ -247,6 +281,21 @@ function deviceAdapter(ws: Bun.ServerWebSocket<WSData>) {
 		send(data: string | Uint8Array) {
 			if (typeof data === "string") {
 				const frame = JSON.parse(data);
+				if (
+					frame.type === "rpc" &&
+					(frame.method === "editor.apply" || frame.method === "editor.query")
+				) {
+					if (nativeRequests.length === 32) nativeRequests.shift();
+					nativeRequests.push({
+						method:
+							frame.method === "editor.apply"
+								? "apply"
+								: frame.params.acknowledgeTerminal
+									? "ack"
+									: "query",
+						operationId: frame.params.operationId,
+					});
+				}
 				if (frame.type === "rpc" && frame.method === "editor.apply") {
 					nativeCalls.apply++;
 					applyRequests.add(frame.id);
