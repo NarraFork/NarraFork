@@ -2353,6 +2353,8 @@ export interface RenderToolCallProps {
 	 * copy; its height is corrected after paint via the shell's onUnknownHeight.
 	 */
 	permissionSlot?: ReactNode;
+	/** Current Outline questions; unlike permissions, hidden when the card folds. */
+	outlineAskSlot?: ReactNode;
 	/**
 	 * Report the live form's painted OUTER height (its own top margin included).
 	 *
@@ -2544,6 +2546,7 @@ export function RenderToolCall({
 	onPermissionAllow,
 	onPermissionDeny,
 	permissionSlot,
+	outlineAskSlot,
 	onPermissionFormHeight,
 	onReflectionTakeOver,
 	reflectionTakingOver,
@@ -2648,7 +2651,9 @@ export function RenderToolCall({
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
 			/>
-			{effectiveOpened && detail ? (
+			{effectiveOpened && outlineAskSlot != null ? (
+				<Box mt={DETAIL_TOP_MARGIN}>{outlineAskSlot}</Box>
+			) : effectiveOpened && detail ? (
 				<Box mt={DETAIL_TOP_MARGIN} style={{ position: "relative" }}>
 					{/* The detail region's own top block already carries the mt gap,
 					    so we render it flush and let its frame own the spacing. */}

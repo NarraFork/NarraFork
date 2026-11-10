@@ -14,6 +14,66 @@ function msg(contentJson: ContentBlock[], id = "m1", seq = 1): NarratorMsg {
 	return rowWithElements({ id, seq, role: "assistant" }, contentJson) as unknown as NarratorMsg;
 }
 
+describe("Outline Ask question source", () => {
+	const inputJson = {
+		questions: [{ question: "Parent?", items: [{ question: "Child?" }] }, { question: "Other?" }],
+	};
+	const metadata = { groupBlockId: "shared-task", blockIds: ["parent", "child", "other"] };
+	const source = { questionRootIds: ["parent", "other"], questionIds: metadata.blockIds };
+	it("resolves parent/child creation order from both metadata envelopes", () => {
+		for (const result of [
+			{ _metadata: metadata },
+			{ outputJson: { _metadata: metadata } },
+			{ output: "Asked questions", outputJson: { _metadata: metadata } },
+		]) {
+			expect(
+				deriveToolMeta(toolBlock({ name: "Ask", inputJson, status: "success", ...result }))
+					?.outlineAsk,
+			).toEqual(source);
+		}
+	});
+	it("reads metadata from the current successful tool-call projection", () => {
+		for (const result of [
+			{ _metadata: metadata },
+			{ outputJson: { _metadata: metadata } },
+			{ output: "Asked questions", outputJson: { _metadata: metadata } },
+		]) {
+			const message = {
+				...msg([toolBlock({ name: "Ask", input: {} })]),
+				toolCalls: [
+					{ toolUseId: "tu-1", toolName: "Ask", inputJson, status: "success", ...result },
+				],
+			} as unknown as NarratorMsg;
+			expect(buildToolMetaIndex([message]).get("tu-1")?.outlineAsk).toEqual(source);
+		}
+	});
+	it("never broadens to a task block for failed, legacy, withdrawn or recorded-answer calls", () => {
+		for (const overrides of [
+			{ status: "fail" },
+			{ status: "running" },
+			{ status: "cancelled" },
+			{ _metadata: { groupBlockId: "shared-task" } },
+			{ _metadata: { blockIds: ["parent", "child"] } },
+			{ _metadata: { blockIds: ["parent", "child", "parent"] } },
+			{ _metadata: { blockIds: ["parent", "child", 3] } },
+			{ inputJson: { withdraw: ["parent"] } },
+			{ inputJson: { answered: [{ question: "parent", answer: "yes" }] } },
+		]) {
+			expect(
+				deriveToolMeta(
+					toolBlock({
+						name: "Ask",
+						inputJson,
+						status: "success",
+						_metadata: metadata,
+						...overrides,
+					}),
+				)?.outlineAsk,
+			).toBeUndefined();
+		}
+	});
+});
+
 describe("captured file identity projection", () => {
 	it("does not borrow execution context from another persisted attempt", () => {
 		const message = {

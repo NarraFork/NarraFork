@@ -1,10 +1,11 @@
-import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { ExactRowProps } from "./ExactRow";
 import { measureMarkdown } from "./measure/measure-markdown";
+import { measureToolCall } from "./measure/measure-tool-call";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { useVListWindowRows } from "./useVListWindowRows";
 import type { WindowRowProjection } from "./vlist-window-row-reuse";
@@ -84,6 +85,81 @@ function Host({ rows }: { rows: WindowRowProjection[] }) {
 	const elements = useVListWindowRows("n1", rows);
 	return <MantineProvider>{elements}</MantineProvider>;
 }
+
+test("Outline Ask slots use the real row reporter for growth, answer shrink and collapse", async () => {
+	const prototype = HTMLElement.prototype;
+	const oldHeight = Object.getOwnPropertyDescriptor(prototype, "offsetHeight");
+	const oldObserver = Object.getOwnPropertyDescriptor(globalThis, "ResizeObserver");
+	let height = 120;
+	let report = () => {};
+	const disconnect = mock(() => {});
+	Object.defineProperty(prototype, "offsetHeight", { configurable: true, get: () => height });
+	Object.defineProperty(globalThis, "ResizeObserver", {
+		configurable: true,
+		value: class {
+			constructor(callback: () => void) {
+				report = callback;
+			}
+			observe() {}
+			disconnect = disconnect;
+		},
+	});
+	try {
+		const onHeight = mock((_height: number) => {});
+		const data = {
+			toolName: "Ask",
+			toolUseId: "ask",
+			summary: "Questions",
+			category: "outline",
+			status: "success",
+		} as const;
+		const measured = measureToolCall(data, 640, 3, { preferOpen: true });
+		const props: ExactRowProps = {
+			...propsFor("unused"),
+			item: { spec: { key: "tool-ask", kind: "tool-call", data }, measured },
+			height: measured.height,
+			hitHeight: measured.height,
+			outlineAskSlot: <div data-outline-form>Loading questions</div>,
+			onUnknownHeight: onHeight,
+		};
+		await act(async () => root.render(<Host rows={[{ props }]} />));
+		expect(container.querySelector("[data-outline-form]")).not.toBeNull();
+		expect(onHeight).toHaveBeenLastCalledWith(120);
+		height = 620;
+		await act(async () => report());
+		expect(onHeight).toHaveBeenLastCalledWith(620);
+		height = 90;
+		await act(async () => report());
+		expect(onHeight).toHaveBeenLastCalledWith(90);
+		// Removing the slot AND reporter is the list's fold/override-pruning contract.
+		const folded = measureToolCall(data, 640, 3, { preferOpen: true, opened: false });
+		await act(async () =>
+			root.render(
+				<Host
+					rows={[
+						{
+							props: {
+								...props,
+								item: { ...props.item, measured: folded },
+								outlineAskSlot: undefined,
+								onUnknownHeight: undefined,
+								height: folded.height,
+								hitHeight: folded.height,
+							},
+						},
+					]}
+				/>,
+			),
+		);
+		expect(container.querySelector("[data-outline-form]")).toBeNull();
+		expect(disconnect).toHaveBeenCalled();
+	} finally {
+		if (oldHeight) Object.defineProperty(prototype, "offsetHeight", oldHeight);
+		else Reflect.deleteProperty(prototype, "offsetHeight");
+		if (oldObserver) Object.defineProperty(globalThis, "ResizeObserver", oldObserver);
+		else Reflect.deleteProperty(globalThis, "ResizeObserver");
+	}
+});
 
 test("the real ExactRow memo receives a same-key content/measurement update", async () => {
 	const before = propsFor("original body");

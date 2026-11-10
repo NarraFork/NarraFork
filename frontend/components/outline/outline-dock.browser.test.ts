@@ -20,7 +20,9 @@ import { basename } from "node:path";
 import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { db } from "../../../server/db";
-import { projects, users } from "../../../server/db/schema";
+import { narrators, projects, users } from "../../../server/db/schema";
+import { askTool } from "../../../server/lib/agent/tools/outline";
+import type { ToolContext } from "../../../server/lib/agent/types";
 import { AppError } from "../../../server/lib/errors";
 import { generateId } from "../../../server/lib/id";
 import { settings } from "../../../server/lib/settings";
@@ -30,7 +32,9 @@ import {
 	liveSessionOf,
 	outlineLiveQuiet,
 } from "../../../server/services/outline/live/registry";
+import { setOutlineAnswerDelivery } from "../../../server/services/outline/questions";
 import { ensureProjectSpace } from "../../../server/services/outline/spaces";
+import { outlineStore } from "../../../server/services/outline/store";
 import type { OutlineSpaceRow } from "../../../server/services/outline/store/port";
 import { writeOutline } from "../../../server/services/outline/write";
 import {
@@ -226,6 +230,122 @@ async function quiet(): Promise<void> {
 	const end = Date.now() + 5000;
 	while (Date.now() < end && !outlineLiveQuiet()) await new Promise((r) => setTimeout(r, 20));
 }
+
+test("a narrow live panel answers a focused question and the remaining questions under its task", async () => {
+	settings.outline.enabled = true;
+	const session = generateId();
+	await db.insert(narrators).values({
+		id: session,
+		title: "Question worker",
+		ownerUserId: owner,
+		visibility: "private",
+		contextProjectId: space.projectId,
+		taskBackend: "outline",
+		createdAt: NOW,
+		updatedAt: NOW,
+	});
+	const written = await writeOutline({
+		spaceId: space.id,
+		ops: [
+			{ op: "insert", tempId: "questions", parent: null, content: "Question page" },
+			{
+				op: "insert",
+				parent: { tempId: "questions" },
+				content: "Choose exports",
+				task: { status: "todo" },
+			},
+		],
+		actor: { kind: "human", id: owner },
+		responsibleUserId: owner,
+	});
+	const questionPage = written.results[0]?.blockId as string;
+	const taskId = written.results[1]?.blockId as string;
+	await writeOutline({
+		spaceId: space.id,
+		ops: [{ op: "setTask", block: { id: taskId }, task: { status: "doing" } }],
+		actor: { kind: "agent", id: session },
+		narratorId: session,
+		responsibleUserId: owner,
+	});
+	const asked = await askTool.execute(
+		{
+			questions: [
+				{ question: "Which format should we export?", options: ["CSV", "JSON"], recommend: 2 },
+				{ question: "Which encoding should we use?", options: ["UTF-8", "ASCII"], recommend: 1 },
+			],
+		},
+		{
+			narratorId: session,
+			cwd: "/",
+			signal: new AbortController().signal,
+			locale: "en",
+			userId: owner,
+			requestPermission: async () => ({ behavior: "allow" }),
+		} as ToolContext,
+	);
+	if (asked.isError) throw new Error(JSON.stringify(asked));
+	const [first, second] = asked.metadata?.blockIds as [string, string];
+	const previousDelivery = setOutlineAnswerDelivery({
+		async deliver() {
+			return { written: true, woke: false };
+		},
+	});
+	const { page, errors } = await openDock();
+	try {
+		await page.setViewport({ width: 900, height: 800 });
+		for (const [focusId, questionId] of [
+			[first, first],
+			[taskId, second],
+		]) {
+			await call(
+				page,
+				(f, s, b, p) => f.openOutline({ spaceId: s, blockId: b, pageId: p }),
+				space.id,
+				focusId,
+				questionPage,
+			);
+			await until(page, (f) => f.liveEditors() === 1);
+			const card = `[data-testid="outline-question-${questionId}"][data-state="open"]`;
+			try {
+				await page.waitForSelector(`${card} input[type=radio]`, { visible: true, timeout: 10_000 });
+			} catch (error) {
+				throw new Error(
+					`${String(error)}; focus=${focusId}; ${await page.evaluate(() => document.body.innerText.slice(0, 4000))}`,
+				);
+			}
+			const placement = await page.evaluate(() => {
+				const form = document.querySelector('[data-testid="outline-questions-section"]');
+				return {
+					count: document.querySelectorAll('[data-testid="outline-questions-section"]').length,
+					main: !!form?.parentElement?.querySelector('[data-testid="outline-editor"]'),
+					compact: form?.closest('[data-testid="outline-surface"]')?.getAttribute("data-compact"),
+					text: form?.textContent,
+				};
+			});
+			expect(placement.count).toBe(1);
+			expect(placement.main).toBe(true);
+			expect(placement.compact).toBe("true");
+			if (focusId === first) expect(placement.text).not.toContain("Which format should we export?");
+			else expect(placement.text).toContain("Which encoding should we use?");
+			await page.click(`${card} input[type=radio][value="1"]`);
+			const response = page.waitForResponse(
+				(r) => r.url().endsWith("/api/outline/questions/answer") && r.request().method() === "POST",
+			);
+			await page.click('[data-testid="outline-questions-submit"]');
+			expect((await response).status()).toBe(200);
+			// When the last question is answered the parent's one-block read may remove the form.
+			await page.waitForFunction((selector) => !document.querySelector(selector), {}, card);
+		}
+		expect((await outlineStore.getQuestions([first, second])).map((q) => q.state)).toEqual([
+			"answered",
+			"answered",
+		]);
+		expect(errors).toEqual([]);
+	} finally {
+		setOutlineAnswerDelivery(previousDelivery);
+		await page.browserContext().close();
+	}
+}, 60_000);
 
 test("opening an outline timeline never scrolls the enclosing dock while geometry settles", async () => {
 	const { page, errors } = await openDock();
