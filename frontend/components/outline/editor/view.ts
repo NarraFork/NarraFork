@@ -345,7 +345,7 @@ export class OutlineView implements CmdHost, ClientView {
 			handlePaste: (_v, ev) => this.handlePaste(ev),
 			clipboardTextSerializer: (slice) => this.copyText(slice),
 			handleTextInput: (_v, from, to, text) => this.handleTextInput(from, to, text),
-			handleKeyDown: (_v, ev) => this.handleBlockKeys(ev),
+			handleKeyDown: (_v, ev) => this.handleBlockKeys(ev) || this.stepOverHidden(ev),
 			handleScrollToSelection: () => this.noScroll,
 			handleDOMEvents: {
 				compositionstart: () => {
@@ -900,6 +900,100 @@ export class OutlineView implements CmdHost, ClientView {
 	/** Whether a block is folded away under a closed ancestor. */
 	isHidden(id: string): boolean {
 		return this.foldTree?.nodes.get(id)?.visible === false;
+	}
+
+	/**
+	 * Arrow keys at the edge of a closed block step over what it hides: down or right from its
+	 * line goes to the next block on screen, up or left into it from the block after goes to its
+	 * line. Left to the browser, the caret would be looked for past the block's own line, where
+	 * the hidden children and the preview line are. With Shift the selection extends the same way.
+	 */
+	private stepOverHidden(ev: KeyboardEvent): boolean {
+		if (ev.altKey || ev.ctrlKey || ev.metaKey || this.pm.composing) return false;
+		const key = ev.key;
+		const forward = key === "ArrowDown" || key === "ArrowRight";
+		if (!forward && key !== "ArrowUp" && key !== "ArrowLeft") return false;
+		const state = this.pm.state;
+		const sel = state.selection;
+		if (!(sel instanceof TextSelection) || (!sel.empty && !ev.shiftKey)) return false;
+		const $head = sel.$head;
+		const d = blockDepth($head);
+		if (d < 0) return false;
+		const block = $head.node(d);
+		const body = block.child(0);
+		if ($head.parent !== body) return false;
+		const doc = state.doc;
+		const closed = (n: PMNode) => n.childCount > 1 && !!n.attrs.collapsed;
+		const horizontal = key === "ArrowRight" || key === "ArrowLeft";
+		let target: number | null = null;
+		let targetBlock: number | null = null;
+		if (forward) {
+			if (!closed(block)) return false;
+			if (horizontal ? $head.parentOffset !== body.content.size : !this.pm.endOfTextblock("down"))
+				return false;
+			// The next block in document order after this block and all it holds.
+			const after = $head.after(d);
+			doc.nodesBetween(after, doc.content.size, (n, pos) => {
+				if (targetBlock !== null) return false;
+				if (n.type === N.block && pos >= after) {
+					targetBlock = pos;
+					return false;
+				}
+				return true;
+			});
+			// The last block on screen: the caret stays (nothing below but what is hidden).
+			if (targetBlock === null) {
+				ev.preventDefault();
+				return true;
+			}
+			target = (targetBlock as number) + 2;
+		} else {
+			if (horizontal ? $head.parentOffset !== 0 : !this.pm.endOfTextblock("up")) return false;
+			const index = $head.index(d - 1);
+			// The block before on screen: the previous sibling, or the last block it shows.
+			if (index === 0) return false;
+			let prev = $head.node(d - 1).child(index - 1);
+			let prevPos = $head.before(d) - prev.nodeSize;
+			while (prev.childCount > 1 && !prev.attrs.collapsed) {
+				const kids = prev.child(1);
+				const last = kids.lastChild as PMNode;
+				prevPos = prevPos + 1 + prev.child(0).nodeSize + 1 + (kids.content.size - last.nodeSize);
+				prev = last;
+			}
+			if (!closed(prev)) return false;
+			targetBlock = prevPos;
+			target = prevPos + 2 + prev.child(0).content.size;
+		}
+		const at = targetBlock as number;
+		const targetBody = (doc.nodeAt(at) as PMNode).child(0);
+		if (!targetBody.isTextblock) {
+			// A table or an embed: the caret goes where the editor puts one in such a block.
+			if (ev.shiftKey) return false;
+			this.pm.dispatch(state.tr.setSelection(caretIn(doc, at, forward ? 0 : -1)).scrollIntoView());
+			ev.preventDefault();
+			return true;
+		}
+		if (!horizontal) {
+			// Keep the column: the position under (or over) the caret on the target's edge line.
+			const from = this.pm.coordsAtPos($head.pos);
+			const box = this.pm.nodeDOM(at + 1);
+			if (box instanceof HTMLElement) {
+				const r = box.getBoundingClientRect();
+				const hit = this.pm.posAtCoords({
+					left: from.left,
+					top: forward ? r.top + 2 : r.bottom - 2,
+				});
+				const lo = at + 2;
+				const hi = lo + targetBody.content.size;
+				if (hit && hit.pos >= lo && hit.pos <= hi) target = hit.pos;
+			}
+		}
+		const next = ev.shiftKey
+			? TextSelection.create(doc, sel.anchor, target as number)
+			: TextSelection.create(doc, target as number);
+		this.pm.dispatch(state.tr.setSelection(next).scrollIntoView());
+		ev.preventDefault();
+		return true;
 	}
 
 	private keepingVisible = false;
