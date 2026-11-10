@@ -676,9 +676,17 @@ test("one marker per row: a task shows arrow + checkbox, a plain row arrow + bul
 	});
 	expect(await frameParts(a, note)).toMatchObject({ parts: ["bullet"], zoom: null });
 	// The checkbox stands where the bullet would: the two rows' text starts in one column.
-	const lefts = [(await frameParts(a, task))?.textLeft, (await frameParts(a, plain))?.textLeft];
-	expect(Math.abs((lefts[0] as number) - (lefts[1] as number))).toBeLessThanOrEqual(2);
+	expect((await frameParts(a, task))?.textLeft).toBe((await frameParts(a, plain))?.textLeft as number);
 	expect(await a.call((f) => f.overflowsX())).toBe(false);
+	// Also where the editor is narrow (a phone, a dock panel) and the indent is smaller.
+	const narrow = await openEditor(h, h.writer, pageId, { width: 360 });
+	expect(await frameParts(narrow, task)).toMatchObject({ parts: ["arrow", "check"] });
+	expect((await frameParts(narrow, task))?.textLeft).toBe(
+		(await frameParts(narrow, plain))?.textLeft as number,
+	);
+	expect((await frameParts(narrow, task))?.zoom).not.toBeNull();
+	expect(await narrow.call((f) => f.overflowsX())).toBe(false);
+	noErrors(narrow);
 
 	// What the bullet did is still one real click away on a task.
 	expect(await a.call((f) => f.events().focused)).toEqual([]);

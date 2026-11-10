@@ -148,22 +148,25 @@
 
 /*
  * A task or a question: the checkbox (or the question's mark) stands where the bullet does on
- * other rows, centred on the bullet column's centre (11px), then the tree's 4px before the text.
- * At the default size that is 3 + 16 + 4 = 23px against a plain row's 22px.
+ * other rows, and its text starts in the same column as theirs (`--ob-indent`: 22px, 18px when
+ * the editor is narrow), the mark keeping at least 2px before the text. The mark sits 4px before
+ * the text where the column has that room.
  */
 .nf-outline-editor .ob-block[data-task]:not([data-task=""]),
 .nf-outline-editor .ob-block[data-question="1"] {
-	--ob-check-lead: max(0px, calc(11px - var(--nf-outline-icon) / 2));
-	padding-left: calc(var(--ob-check-lead) + var(--nf-outline-icon) + 4px);
+	--ob-check-pad: max(var(--ob-indent), calc(var(--nf-outline-icon) + 2px));
+	--ob-check-lead: max(0px, calc(var(--ob-check-pad) - var(--nf-outline-icon) - 4px));
+	padding-left: var(--ob-check-pad);
 }
 
 .nf-outline-editor .ob-block[data-task]:not([data-task=""]) > .ob-gutter,
 .nf-outline-editor .ob-block[data-question="1"] > .ob-gutter {
-	width: calc(16px + var(--ob-check-lead) + var(--nf-outline-icon) + 4px);
+	width: calc(16px + var(--ob-check-pad));
 }
 
+/* In the mind map (`mindmap.css`) the checkbox's column is its icon and the 4px after it. */
 .nf-outline-editor .ob-check {
-	width: calc(var(--ob-check-lead, 0px) + var(--nf-outline-icon) + 4px);
+	width: var(--ob-check-pad, calc(var(--nf-outline-icon) + 4px));
 	padding-left: var(--ob-check-lead, 0px);
 	box-sizing: border-box;
 	justify-content: flex-start;
