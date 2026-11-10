@@ -1817,6 +1817,7 @@
 	"details.gitIdentityCreateLoadFailed": "Could not load Git identities. Close this dialog and try again.",
 	"details.gitIdentityFollowDefault": "Follow default identity ({{name}})",
 	"details.gitIdentityFollowDefaultPlain": "Follow default identity",
+	"details.gitIdentityFollowFolder": "Follow the folder ({{name}})",
 	"details.gitIdentityUnconfigured": "No Git identities configured. Add one in Settings → Profile; until then, commits use the execution environment's Git configuration.",
 	"details.gitIdentityLoadFailed": "Could not load Git identities. Please reopen session details to try again.",
 	"details.relationships": "Relationships",

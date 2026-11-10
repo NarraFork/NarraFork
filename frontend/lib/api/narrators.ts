@@ -1714,9 +1714,12 @@ export const narratorsApi = {
 	// returned here and cannot be changed through these calls.
 
 	getNarratorGitIdentity: (id: string) =>
-		request<{ identities: GitIdentity[]; selectedId: string | null }>(
-			`/narrators/${id}/git-identity`,
-		),
+		request<{
+			identities: GitIdentity[];
+			selectedId: string | null;
+			/** 会话没有自己的 pick 时跟随的侧栏文件夹身份；没有文件夹或未设置时为 null。 */
+			folderSelectedId?: string | null;
+		}>(`/narrators/${id}/git-identity`),
 	setNarratorGitIdentity: (id: string, identityId: string | null) =>
 		request<{ ok: boolean }>(`/narrators/${id}/git-identity`, {
 			method: "PUT",

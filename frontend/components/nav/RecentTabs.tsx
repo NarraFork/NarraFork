@@ -1372,6 +1372,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 							// 只有"待解析目录的会话目标"才算忙；文件夹目标直接出表单。
 							busy={newNarratorTarget?.narratorId != null && newNarratorTarget.cwd == null}
 							initialCwd={newNarratorTarget?.cwd}
+							// 从文件夹里新建时，弹窗要说清 git 身份跟的是这个文件夹。
+							gitIdentityFolderId={newNarratorTarget?.folderId}
 							onClose={closeNewNarratorHere}
 							onCreated={handleNewNarratorHereCreated}
 						/>

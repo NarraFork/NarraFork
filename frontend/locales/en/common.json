@@ -72,6 +72,7 @@
 		"gitIdentityUnconfigured": "No git identity configured — add one in Settings → Profile",
 		"gitIdentityFollowDefault": "Follow the default identity ({{name}})",
 		"gitIdentityFollowDefaultPlain": "Follow the default identity",
+		"gitIdentityFollowFolder": "Follow the folder ({{name}})",
 		"revealInExplorer": "Show in File Manager",
 		"revealFailed": "Could not open the file manager",
 		"openInWindow": "Open in window",

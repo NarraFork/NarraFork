@@ -1,6 +1,7 @@
 import { NativeSelect, Stack, Text } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { useNarratorGitIdentity, useSetNarratorGitIdentity } from "../../../hooks/useGitIdentities";
+import { followIdentityKind } from "./git-identity-follow-label";
 
 const FOLLOW_DEFAULT = "__follow_default__";
 
@@ -11,9 +12,16 @@ export function NarratorGitIdentitySelect({ narratorId }: { narratorId: string }
 	const setPick = useSetNarratorGitIdentity(narratorId);
 	const identities = data?.identities ?? [];
 	const defaultIdentity = identities.find((identity) => identity.isDefault);
-	const followDefaultLabel = defaultIdentity
-		? t("details.gitIdentityFollowDefault", { name: defaultIdentity.name })
-		: t("details.gitIdentityFollowDefaultPlain");
+	// 会话自己没有 pick 时跟的是文件夹（若设过），不是全局默认。
+	const folderIdentity = data?.folderSelectedId
+		? identities.find((identity) => identity.id === data.folderSelectedId)
+		: undefined;
+	const followDefaultLabel =
+		followIdentityKind(folderIdentity, defaultIdentity) === "folder"
+			? t("details.gitIdentityFollowFolder", { name: folderIdentity?.name })
+			: defaultIdentity
+				? t("details.gitIdentityFollowDefault", { name: defaultIdentity.name })
+				: t("details.gitIdentityFollowDefaultPlain");
 
 	return (
 		<Stack gap={4}>

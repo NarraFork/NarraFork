@@ -1815,6 +1815,7 @@
 	"details.gitIdentityCreateLoadFailed": "无法加载 Git 身份，请关闭后重试。",
 	"details.gitIdentityFollowDefault": "跟随默认身份（{{name}}）",
 	"details.gitIdentityFollowDefaultPlain": "跟随默认身份",
+	"details.gitIdentityFollowFolder": "跟随文件夹设置（{{name}}）",
 	"details.gitIdentityUnconfigured": "尚未配置 Git 身份，可在「设置 → 个人资料」中添加；未配置时，提交沿用执行环境的 Git 配置。",
 	"details.gitIdentityLoadFailed": "无法加载 Git 身份，请重新打开会话详情重试。",
 	"details.relationships": "关联关系",
