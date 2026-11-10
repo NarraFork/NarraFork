@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { BalanceProbeRequestError } from "@server/lib/provider-balance-adapters";
 import { builtinProviderBalanceEngine } from "@server/lib/provider-balance-engine";
 import type { CustomApiProviderConfig } from "@server/lib/settings";
@@ -10,11 +10,9 @@ import type { ProviderBalanceData } from "@shared/provider-balance";
 /**
  * End-to-end parity between the two implementations of one engine interface.
  *
- * Both are driven against the *same* mock relay, with the *same* provider config, and must
- * produce identical results. This is the check that a fallback cannot hide: if the plugin
- * were unable to express something the bundled adapters can, these cases would diverge
- * rather than quietly succeeding through the bundled path (the plugin is healthy here, so
- * the engine never consults it).
+ * Both are driven against the same mock relay with the same provider config. Every plugin
+ * invocation must cross the real tools.invoke RPC and leave a successful registry audit;
+ * falling back to the host implementation fails the test instead of comparing it with itself.
  */
 const payloads = {
 	"sub2api wallet": {
@@ -58,33 +56,75 @@ const payloads = {
 let managerPromise: Promise<PluginManager> | undefined;
 
 function sharedManager(): Promise<PluginManager> {
-	// No explicit root/catalog/coordinator: the manager then takes the shared platform services,
-	// which is what the singleton host instance does, so `pluginPlatformServices.toolRegistry`
-	// is the registry the manager populates.
 	managerPromise ??= (async () => {
-		const manager = new PluginManager({ disabled: false });
+		// Match the production singleton: registry resolvers, lifecycle bindings and the
+		// manager must all refer to the same supervisor and state store.
+		const manager = new PluginManager({
+			disabled: false,
+			runtimeSupervisor: pluginPlatformServices.runtimeSupervisor,
+			stateStore: pluginPlatformServices.stateStore,
+			permissionStore: pluginPlatformServices.permissionStore,
+			hostServices: pluginPlatformServices.hostServices,
+			contributionRegistry: pluginPlatformServices.contributionRegistry,
+			toolRegistry: pluginPlatformServices.toolRegistry,
+			agentToolBridge: pluginPlatformServices.toolBridge,
+			contributionCoordinator: pluginPlatformServices.contributionCoordinator,
+			providerCatalogRefresher: pluginPlatformServices.providerCatalogRefresher,
+			lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: pluginPlatformServices.restorePlugin,
+		});
 		await manager.initialize();
 		return manager;
 	})();
 	return managerPromise;
 }
 
+afterAll(async () => {
+	const manager = await managerPromise?.catch(() => undefined);
+	await manager?.shutdown();
+});
+
 async function pluginEngine() {
 	const manager = await sharedManager();
+	const forbiddenFallback = async (): Promise<never> => {
+		throw new Error("Quota parity must execute plugin RPC, not the host fallback");
+	};
 	return createApikeyQuotaEngine({
-		tools: pluginPlatformServices.toolRegistry,
+		tools: {
+			async invoke(...args: Parameters<typeof pluginPlatformServices.toolRegistry.invoke>) {
+				const runtime = pluginPlatformServices.runtimeSupervisor.get("com.narrafork.apikey-quota");
+				expect(runtime).toBeDefined();
+				if (!runtime) throw new Error("Quota runtime was not activated");
+				const rpc = spyOn(runtime, "request");
+				try {
+					const result = await pluginPlatformServices.toolRegistry.invoke(...args);
+					expect(rpc).toHaveBeenCalledWith(
+						"tools.invoke",
+						expect.objectContaining({ contributionId: "query-balance" }),
+						expect.any(Object),
+					);
+					expect(pluginPlatformServices.toolRegistry.getAuditEntries().at(-1)).toMatchObject({
+						fullId: "com.narrafork.apikey-quota/query-balance",
+						methodId: "tools.invoke",
+						principalKind: "plugin_background",
+						outcome: "succeeded",
+					});
+					return result;
+				} finally {
+					rpc.mockRestore();
+				}
+			},
+		},
 		activator: manager,
+		fallback: { id: "forbidden-in-parity", probe: forbiddenFallback, refresh: forbiddenFallback },
 	});
 }
 
-/** Same engine, but the plugin is disabled so the bundled adapters must answer. */
+/** Disabling the same plugin must reject before RPC without invoking the host fallback. */
 async function disabledPluginEngine() {
 	const manager = await sharedManager();
 	await manager.disable("com.narrafork.apikey-quota");
-	const engine = createApikeyQuotaEngine({
-		tools: pluginPlatformServices.toolRegistry,
-		activator: manager,
-	});
+	const engine = await pluginEngine();
 	return {
 		...engine,
 		probe: engine.probe.bind(engine),
@@ -126,10 +166,8 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 		});
 	});
 
-	afterAll(async () => {
+	afterAll(() => {
 		server.stop(true);
-		const manager = await managerPromise?.catch(() => undefined);
-		await manager?.shutdown();
 	});
 
 	for (const [name, payload] of Object.entries(payloads)) {
@@ -317,10 +355,8 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 	 * The site-account route (`/api/user/self`) must behave identically through both
 	 * implementations, including its failure classification.
 	 *
-	 * These live inside this describe on purpose: they need the live shared manager. A second
-	 * manager created after this describe's `afterAll` cannot activate the plugin, and the
-	 * engine would then answer from the bundled adapters — turning every case below into a
-	 * comparison of the bundled engine with itself.
+	 * The file-level manager remains live through these cases and the timeout cases below.
+	 * All use the same fail-fast engine and real RPC assertions.
 	 */
 	describe("site-account credit", () => {
 		const siteBody = {
@@ -348,23 +384,6 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 			site.stop(true);
 		});
 
-		/**
-		 * The plugin-backed engine.
-		 *
-		 * This file degrades to a bundled-vs-bundled comparison whenever the plugin cannot be
-		 * activated with a live host context — which is what happens when it runs standalone
-		 * (`CONTEXT_UNAVAILABLE`), for every case in the file, not just the ones below. The
-		 * plugin's own site behaviour is therefore pinned by the contract test, which imports
-		 * the plugin module directly instead of crossing the RPC boundary.
-		 */
-		const pluginEngineForSite = async () => {
-			const manager = await sharedManager();
-			return createApikeyQuotaEngine({
-				tools: pluginPlatformServices.toolRegistry,
-				activator: manager,
-			});
-		};
-
 		const siteConfig = (baseUrl: string): CustomApiProviderConfig => ({
 			...config(baseUrl),
 			quotaSiteUrl: `http://127.0.0.1:${site.port}`,
@@ -375,7 +394,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 		test("probe returns the same USD credit and group", async () => {
 			respond = () => Response.json(siteBody);
 			const base = `http://127.0.0.1:${site.port}/v1`;
-			const plugin = await pluginEngineForSite();
+			const plugin = await pluginEngine();
 			try {
 				const viaPlugin = await plugin.probe({
 					config: siteConfig(base),
@@ -402,7 +421,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 		test("a rejected token is the same deterministic kind in both", async () => {
 			respond = () => new Response(null, { status: 401 });
 			const base = `http://127.0.0.1:${site.port}/v1`;
-			const plugin = await pluginEngineForSite();
+			const plugin = await pluginEngine();
 			try {
 				const pluginError = await plugin
 					.probe({ config: siteConfig(base), signal: AbortSignal.timeout(20_000) })
@@ -421,7 +440,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 			respond = () => Response.json(siteBody);
 			const base = `http://127.0.0.1:${site.port}/v1`;
 			const missing = { ...siteConfig(base), quotaUserId: "" };
-			const plugin = await pluginEngineForSite();
+			const plugin = await pluginEngine();
 			try {
 				const pluginError = await plugin
 					.probe({ config: missing, signal: AbortSignal.timeout(20_000) })
@@ -440,7 +459,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 			respond = () => Response.json(siteBody);
 			const base = `http://127.0.0.1:${site.port}/v1`;
 			const root = `http://127.0.0.1:${site.port}`;
-			const plugin = await pluginEngineForSite();
+			const plugin = await pluginEngine();
 			try {
 				const viaPlugin = await plugin.refresh({
 					config: siteConfig(base),
@@ -520,6 +539,36 @@ describe("per-request timeout means the same thing in both engines", () => {
 				slow.stop(true);
 			}
 		}, 20_000);
+	}
+});
+
+test("revoking the initial grant still denies RPC after re-enabling the builtin", async () => {
+	const manager = await sharedManager();
+	const pluginId = "com.narrafork.apikey-quota";
+	const permissions = await manager.getPermissions(pluginId);
+	await manager.replacePermissions(pluginId, {
+		grants: [],
+		expectedRevision: permissions.revision,
+		grantedBy: "quota-parity-admin",
+	});
+	await manager.disable(pluginId);
+	await manager.enable(pluginId);
+	await manager.activate(pluginId);
+	const runtime = pluginPlatformServices.runtimeSupervisor.get(pluginId);
+	if (!runtime) throw new Error("Quota runtime was not activated");
+	const rpc = spyOn(runtime, "request");
+	try {
+		await expect(
+			pluginPlatformServices.toolRegistry.invoke(
+				`${pluginId}/query-balance`,
+				{ mode: "probe", baseUrl: "https://unused.invalid/v1", apiKey: "quota-test-only" },
+				{ invocation: { kind: "plugin_background", source: "internal" } },
+			),
+		).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+		expect(rpc.mock.calls.some(([method]) => method === "tools.invoke")).toBe(false);
+		expect((await manager.getPermissions(pluginId)).grants).toEqual([]);
+	} finally {
+		rpc.mockRestore();
 	}
 });
 

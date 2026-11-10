@@ -1,6 +1,10 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import { clearKeyCooldown, reportKeyFault } from "../agent/pooled-provider";
+import { ApiError } from "../agent/types";
+import type { outboundFetch } from "../net/outbound-fetch";
 import { BalanceProbeRequestError } from "../provider-balance-adapters";
 import { isProviderBalanceCandidate, ProviderBalanceCache } from "../provider-balance-cache";
+import { getProviderKeyStore } from "../provider-keys";
 import type { CustomApiProviderConfig } from "../settings";
 
 function provider(id = "relay-test"): CustomApiProviderConfig {
@@ -592,45 +596,241 @@ describe("capability plugin gating", () => {
  * another key actually serves.
  */
 describe("provider balance probes the credential a request would use", () => {
+	const cleanups: Array<() => void> = [];
+	afterEach(() => {
+		for (const cleanup of cleanups.splice(0)) cleanup();
+	});
+
 	function credentialFixture() {
-		let selected = "second-key";
-		const probes: string[] = [];
-		const fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
-			const headers = new Headers(init?.headers);
-			probes.push(headers.get("authorization") ?? "");
-			return Response.json(wallet());
-		});
+		const config: CustomApiProviderConfig = {
+			...provider(`balance-selected-key-${crypto.randomUUID()}`),
+			proxy: { mode: "custom", url: "http://provider.proxy.invalid:8080" },
+			userAgentMode: "custom",
+			customUserAgent: "provider-agent",
+			extraHeaders: { "X-Provider": "keep", "X-Identity": "provider" },
+			tlsRejectUnauthorized: false,
+		};
+		const store = getProviderKeyStore();
+		let providers = [config];
+		let respond = async (_url: string) => Response.json(wallet());
+		const fetch = mock(async (...args: Parameters<typeof outboundFetch>) =>
+			respond(String(args[0])),
+		);
 		const cache = new ProviderBalanceCache({
-			providers: () => [provider()],
+			providers: () => providers,
 			globalProxy: () => ({ mode: "direct" }),
 			fetch,
 			now: () => 100_000,
-			resolveCredential: (config) => ({ ...config, apiKey: selected }),
+		});
+		cleanups.push(() => {
+			providers = [];
+			cache.sync();
+			for (const key of store.list(config.id)) clearKeyCooldown(key.id);
+			store.removeProvider(config.id);
 		});
 		return {
+			config,
+			store,
 			cache,
-			probes,
-			select: (key: string) => {
-				selected = key;
+			fetch,
+			request: (index = -1) => {
+				const call = fetch.mock.calls.at(index);
+				return {
+					url: String(call?.[0]),
+					headers: new Headers(call?.[1]?.headers),
+					init: call?.[1],
+					transport: call?.[2],
+				};
+			},
+			respond: (value: typeof respond) => {
+				respond = value;
 			},
 		};
 	}
 
-	test("sends the selected credential, not the one settings exposes", async () => {
+	test("the first selected key applies its network even when settings exposes the same secret", async () => {
 		const f = credentialFixture();
-		await f.cache.request("relay-test");
-		expect(f.probes).toEqual(["Bearer second-key"]);
+		const original = structuredClone(f.config);
+		f.store.add(f.config.id, {
+			apiKey: f.config.apiKey,
+			network: {
+				proxy: { mode: "custom", url: "http://first.proxy.invalid:8080" },
+				userAgentMode: "custom",
+				customUserAgent: "first-key-agent",
+				extraHeaders: { "X-Identity": "first-key", Host: "must-not-leave" },
+			},
+		});
+
+		expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
+		const sent = f.request();
+		expect(sent.headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
+		expect(sent.headers.get("user-agent")).toBe("first-key-agent");
+		expect(sent.headers.get("x-provider")).toBe("keep");
+		expect(sent.headers.get("x-identity")).toBe("first-key");
+		expect(sent.headers.has("host")).toBe(false);
+		expect(sent.init).toMatchObject({ method: "GET", redirect: "error" });
+		expect(sent.transport).toEqual({
+			proxyUrl: "http://first.proxy.invalid:8080",
+			tlsRejectUnauthorized: false,
+			retryPolicy: "never",
+		});
+		expect(f.config).toEqual(original);
 	});
 
-	test("a different selected credential withdraws the previous balance and root", async () => {
-		const f = credentialFixture();
-		await f.cache.request("relay-test");
-		expect(f.cache.peek("relay-test")).toMatchObject({ status: "supported" });
+	for (const unavailable of ["disabled", "cooling-down"] as const) {
+		test(`a ${unavailable} first key switches credential, network, generation and discovered root`, async () => {
+			const f = credentialFixture();
+			const first = f.store.add(f.config.id, { apiKey: f.config.apiKey });
+			f.store.add(f.config.id, {
+				apiKey: "second-key",
+				network: {
+					proxy: { mode: "direct" },
+					userAgentMode: "custom",
+					customUserAgent: "second-key-agent",
+					extraHeaders: { "X-Identity": "second-key" },
+				},
+			});
+			// Discover the non-canonical root, making a stale-root refresh observable.
+			f.respond(async (url) =>
+				url.endsWith("/v1/v1/usage")
+					? Response.json(wallet())
+					: new Response(null, { status: 404 }),
+			);
+			await f.cache.request(f.config.id);
+			const previous = f.cache.peek(f.config.id);
+			expect(previous?.status).toBe("supported");
+			expect(f.request().url).toBe("https://relay.example/v1/v1/usage");
 
-		// Another key now serves requests, so the balance on screen describes a different
-		// account: it must not survive as if it were current.
-		f.select("third-key");
-		f.cache.sync();
-		expect(f.cache.peek("relay-test")).toMatchObject({ status: "pending", balance: null });
+			if (unavailable === "disabled") f.store.update(first.id, { disabled: true });
+			else reportKeyFault(first, new ApiError(429, "rate limited"));
+			expect(f.cache.peek(f.config.id)).toMatchObject({ status: "pending", balance: null });
+			expect(f.cache.peek(f.config.id)?.generation).not.toBe(previous?.generation);
+			f.respond(async () => Response.json(wallet(23)));
+			const result = await f.cache.request(f.config.id, "refresh");
+
+			expect(result?.balance?.amounts[0]?.remaining).toBe(23);
+			const sent = f.request();
+			expect(sent.url).toBe("https://relay.example/v1/usage");
+			expect(sent.headers.get("authorization")).toBe("Bearer second-key");
+			expect(sent.headers.get("user-agent")).toBe("second-key-agent");
+			expect(sent.headers.get("x-identity")).toBe("second-key");
+			expect(sent.headers.get("x-provider")).toBe("keep");
+			expect(sent.transport).toMatchObject({ proxyUrl: undefined });
+		});
+	}
+
+	for (const field of ["proxy", "userAgent", "headers"] as const) {
+		test(`editing only the selected key's ${field} withdraws the balance and root`, async () => {
+			const f = credentialFixture();
+			const key = f.store.add(f.config.id, { apiKey: f.config.apiKey });
+			f.respond(async (url) =>
+				url.endsWith("/v1/v1/usage")
+					? Response.json(wallet())
+					: new Response(null, { status: 404 }),
+			);
+			await f.cache.request(f.config.id);
+			const previous = f.cache.peek(f.config.id);
+			f.store.update(key.id, {
+				network:
+					field === "proxy"
+						? { proxy: { mode: "direct" } }
+						: field === "userAgent"
+							? { userAgentMode: "custom", customUserAgent: "updated-agent" }
+							: { extraHeaders: { "X-Identity": "updated-device" } },
+			});
+
+			expect(f.cache.peek(f.config.id)).toMatchObject({ status: "pending", balance: null });
+			expect(f.cache.peek(f.config.id)?.generation).not.toBe(previous?.generation);
+			f.respond(async () => Response.json(wallet(25)));
+			expect((await f.cache.request(f.config.id, "refresh"))?.balance?.amounts[0]?.remaining).toBe(
+				25,
+			);
+			const sent = f.request();
+			expect(sent.url).toBe("https://relay.example/v1/usage");
+			expect(sent.headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
+			if (field === "proxy") expect(sent.transport).toMatchObject({ proxyUrl: undefined });
+			if (field === "userAgent") expect(sent.headers.get("user-agent")).toBe("updated-agent");
+			if (field === "headers") expect(sent.headers.get("x-identity")).toBe("updated-device");
+		});
+	}
+
+	test("a network-only edit aborts the old round and discards its late response", async () => {
+		const f = credentialFixture();
+		const key = f.store.add(f.config.id, { apiKey: f.config.apiKey });
+		const pending = deferred<Response>();
+		f.respond(() => pending.promise);
+		const original = f.cache.generations()[f.config.id];
+		const old = f.cache.request(f.config.id);
+		const oldSignal = f.request().init?.signal;
+
+		f.store.update(key.id, { network: { extraHeaders: { "X-Identity": "new-device" } } });
+		const generation = f.cache.generations()[f.config.id];
+		expect(generation).not.toBe(original);
+		expect(oldSignal?.aborted).toBe(true);
+		f.respond(async () => Response.json(wallet(26)));
+		const current = await f.cache.request(f.config.id);
+		expect(await old).toBeNull();
+		pending.resolve(Response.json(wallet(999)));
+		await pending.promise;
+
+		expect(f.cache.peek(f.config.id)).toEqual(current);
+		expect(current).toMatchObject({ generation, status: "supported" });
+		expect(current?.balance?.amounts[0]?.remaining).toBe(26);
+		expect(f.request().headers.get("x-identity")).toBe("new-device");
+	});
+
+	test("all disabled keys withdraw the cached balance instead of using the projected first key", async () => {
+		const f = credentialFixture();
+		const first = f.store.add(f.config.id, { apiKey: f.config.apiKey });
+		const second = f.store.add(f.config.id, { apiKey: "second-key" });
+		await f.cache.request(f.config.id);
+		f.store.update(first.id, { disabled: true });
+		f.store.update(second.id, { disabled: true, disabledReason: "invalid" });
+
+		expect(f.cache.peek(f.config.id)).toBeNull();
+		expect(f.cache.generations()).not.toHaveProperty(f.config.id);
+		expect(await f.cache.request(f.config.id)).toBeNull();
+		f.cache.read();
+		f.cache.discoverPending();
+		expect(f.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	test("all cooling-down keys keep the selector's earliest-recovery semantics", async () => {
+		const f = credentialFixture();
+		const first = f.store.add(f.config.id, { apiKey: f.config.apiKey });
+		const second = f.store.add(f.config.id, { apiKey: "second-key" });
+		const now = Date.now();
+		reportKeyFault(first, new ApiError(402, "quota exhausted"), now);
+		reportKeyFault(second, new ApiError(429, "rate limited"), now);
+
+		expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
+		expect(f.request().headers.get("authorization")).toBe("Bearer second-key");
+	});
+
+	test("no stored keys preserves the configured single-key credential and network", async () => {
+		const f = credentialFixture();
+		expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
+		expect(f.request().headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
+		expect(f.request().headers.get("user-agent")).toBe("provider-agent");
+		expect(f.request().transport?.proxyUrl).toBe("http://provider.proxy.invalid:8080");
+	});
+
+	test("an unreadable key store preserves the configured single-key behaviour", async () => {
+		const f = credentialFixture();
+		f.store.add(f.config.id, {
+			apiKey: "stored-key",
+			network: { proxy: { mode: "direct" } },
+		});
+		// Shadow the getter on this instance only; Bun cannot spy on accessors.
+		const ownReadable = Object.getOwnPropertyDescriptor(f.store, "readable");
+		Object.defineProperty(f.store, "readable", { value: false, configurable: true });
+		try {
+			expect(await f.cache.request(f.config.id)).toMatchObject({ status: "supported" });
+			expect(f.request().headers.get("authorization")).toBe(`Bearer ${f.config.apiKey}`);
+			expect(f.request().transport?.proxyUrl).toBe("http://provider.proxy.invalid:8080");
+		} finally {
+			if (ownReadable) Object.defineProperty(f.store, "readable", ownReadable);
+			else Reflect.deleteProperty(f.store, "readable");
+		}
 	});
 });

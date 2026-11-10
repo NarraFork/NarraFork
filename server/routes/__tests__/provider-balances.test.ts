@@ -1,9 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { getNarraforkPath } from "../../lib/narrafork-home";
 import * as outbound from "../../lib/net/outbound-fetch";
 import { providerBalanceCache } from "../../lib/provider-balance-cache";
+import { getProviderKeyStore } from "../../lib/provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
+import { quotaKeyOwner } from "../../lib/settings/provider-keys-projection";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { providerBalanceRoutes } from "../provider-balances";
@@ -166,6 +170,53 @@ describe("provider balance API and settings integration", () => {
 		const calls = fetchSpy.mock.calls;
 		const init = calls[1]?.[1];
 		expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer key-replaced");
+	});
+
+	test("settings masks site tokens and a masked PATCH preserves the separate stored credential", async () => {
+		const app = appForRole("admin");
+		const store = getProviderKeyStore();
+		const owner = quotaKeyOwner(config().id);
+		const patch = async (value: CustomApiProviderConfig) => {
+			const response = await app.request("/api/settings", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ customApiProviders: [value] }),
+			});
+			expect(response.status).toBe(200);
+			const body = await response.json();
+			expect(JSON.stringify(body)).not.toContain("site-route-secret");
+			return body.customApiProviders[0] as CustomApiProviderConfig;
+		};
+		try {
+			await patch({ ...config(), quotaAccessToken: "site-route-secret", quotaUserId: "42" });
+			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
+			expect(store.firstKey(owner)).toBe("site-route-secret");
+			expect(store.firstKey(config().id)).toBe("key-current");
+			for (const role of ["admin", "user"] as const) {
+				const response = await appForRole(role).request("/api/settings");
+				expect(response.status).toBe(200);
+				const body = await response.json();
+				expect(JSON.stringify(body)).not.toContain("site-route-secret");
+				expect(body.customApiProviders[0].quotaAccessToken).toMatch(/^\*/);
+			}
+			const masked = (await (await app.request("/api/settings")).json())
+				.customApiProviders[0] as CustomApiProviderConfig;
+			await patch({ ...masked, name: "Renamed without re-entering credentials" });
+			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
+			expect(store.firstKey(owner)).toBe("site-route-secret");
+			expect(store.firstKey(config().id)).toBe("key-current");
+			for (const file of ["settings.json", "provider-keys.json"]) {
+				expect(readFileSync(getNarraforkPath(file), "utf8")).not.toContain("site-route-secret");
+			}
+			await patch({ ...masked, quotaAccessToken: "" });
+			expect(store.list(owner)).toEqual([]);
+			expect(settings.customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
+			expect(store.firstKey(config().id)).toBe("key-current");
+		} finally {
+			saveSettings({ ...settings, customApiProviders: [] });
+			store.removeProvider(config().id);
+			store.removeProvider(owner);
+		}
 	});
 
 	test("failed save cannot start discovery", async () => {

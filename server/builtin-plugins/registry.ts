@@ -7,9 +7,9 @@ import { materializeBuiltinPlugins } from "./materialize";
  *
  * A builtin plugin is an ordinary plugin package: same `manifest.json`, same manifest
  * validation, same runtime lifecycle and health accounting, same enable/disable semantics.
- * The single difference is distribution — it has no install step, no package-store record and
- * no capability grant, because it is already on disk as part of the application and shares the
- * application's trust root. Everything that does not apply for that reason is listed in the
+ * The single difference is distribution — it has no install step or package-store record.
+ * Its initial manifest grants are seeded at first initialization through the same authority
+ * path as installed packages, and later revocations remain authoritative. Differences are in the
  * plugin's README under "与外部插件的标准差异".
  *
  * These roots are handed to `PluginCatalog`, which reads them through the *same* package

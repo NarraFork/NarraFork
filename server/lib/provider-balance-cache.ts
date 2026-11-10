@@ -22,7 +22,7 @@ import {
 	getProviderBalanceEngine,
 	type ProviderBalanceQueryEngine,
 } from "./provider-balance-engine";
-import { getProviderKeyStore } from "./provider-keys";
+import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 export const PROVIDER_BALANCE_STALE_MS = 60_000;
@@ -102,20 +102,20 @@ function connectionIdentity(config: CustomApiProviderConfig, globalProxy: unknow
  * serves. The pool's own choice for a new request is `selectProviderKey` without a session,
  * the same call the auto-source rows use for "the credential a new request uses".
  *
- * The chosen key's per-key network overrides (proxy / User-Agent / headers) are deliberately
- * *not* applied here: `selectProviderKey` selects the credential, and mapping every override
- * onto the balance transport would widen this change beyond credential identity. What matters
- * for the reviewer's concern is that balance and root belong to the selected key.
+ * Use the same per-key network composition as inference requests: proxy, User-Agent and
+ * headers are part of both the balance transport and its cache identity. Even the first key
+ * can override them without changing the secret settings exposes.
  *
- * Falls back to the configured value when the key store is unreadable or holds no key for
- * this provider, which is the pre-existing single-key behaviour.
+ * Falls back to the configured value only when the key store is unreadable or holds no key
+ * for this provider, preserving pre-existing single-key behaviour. If stored keys exist but
+ * none is usable, an empty credential makes the provider ineligible instead of probing a
+ * disabled key projected into settings.
  */
 function withSelectedCredential(config: CustomApiProviderConfig): CustomApiProviderConfig {
 	const store = getProviderKeyStore();
 	if (!store.readable || store.list(config.id).length === 0) return config;
 	const chosen = selectProviderKey(config.id);
-	if (!chosen || chosen.apiKey === config.apiKey) return config;
-	return { ...config, apiKey: chosen.apiKey };
+	return chosen ? withProviderKey(config, chosen) : { ...config, apiKey: "" };
 }
 
 /** What survives a restart: the discovery result and the last good balance. */

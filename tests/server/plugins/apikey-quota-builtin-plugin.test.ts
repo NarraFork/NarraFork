@@ -59,6 +59,11 @@ describe("builtin plugin lifecycle matches an installed plugin", () => {
 		expect(status?.desiredState).toBe("enabled");
 	});
 
+	test("its first authority contains only the manifest's declared capability", async () => {
+		const permissions = await manager.getPermissions(PLUGIN_ID);
+		expect(permissions.grants.map((grant) => grant.capability)).toEqual(["provider.use"]);
+	});
+
 	test("its tool is registered through the shared registry", async () => {
 		const tools = pluginPlatformServices.toolRegistry.list();
 		const entry = tools.find((tool) => tool.fullId === TOOL_ID);
@@ -87,5 +92,22 @@ describe("builtin plugin lifecycle matches an installed plugin", () => {
 				expect(typeof entry.requests).toBe("number");
 			}
 		}
+	});
+
+	test("explicitly revoked grants stay empty after re-enable and restart", async () => {
+		const permissions = await manager.getPermissions(PLUGIN_ID);
+		await manager.replacePermissions(PLUGIN_ID, {
+			grants: [],
+			expectedRevision: permissions.revision,
+			grantedBy: "quota-test-admin",
+		});
+		await manager.disable(PLUGIN_ID);
+		await manager.enable(PLUGIN_ID);
+		expect((await manager.getPermissions(PLUGIN_ID)).grants).toEqual([]);
+
+		await manager.shutdown();
+		manager = new PluginManager({ disabled: false });
+		await manager.initialize();
+		expect((await manager.getPermissions(PLUGIN_ID)).grants).toEqual([]);
 	});
 });

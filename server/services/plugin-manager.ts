@@ -1621,7 +1621,27 @@ export class PluginManager {
 		for (const state of reconciled) {
 			if (!state.current) continue;
 			try {
-				const { permissions } = await this.resolveInstallationContext(state);
+				let authorityState = state;
+				const plugin = this.catalogPlugin(state.pluginId);
+				const shippedPackage = currentPackage(plugin);
+				if (
+					!stateById.has(state.pluginId) &&
+					plugin?.builtin === true &&
+					shippedPackage?.status === "compatible" &&
+					state.desiredState === "enabled"
+				) {
+					// Builtins have no install operation to seed their first authority. Use the
+					// same manifest-to-grant path once, before an empty authority is persisted.
+					// Existing records, including explicit revocations, are never re-seeded.
+					const manifest = await this.readPackageManifest(shippedPackage);
+					authorityState = {
+						...state,
+						grants: seedGrantsFromManifest(state.grants, manifest.permissions.host, {
+							pluginId: state.pluginId,
+						}),
+					};
+				}
+				const { permissions } = await this.resolveInstallationContext(authorityState);
 				await this.syncPermissionSummary(state.pluginId, permissions);
 			} catch (error) {
 				await this.stateStore.updateState(state.pluginId, {
@@ -2831,10 +2851,14 @@ export class PluginManager {
 			);
 		}
 		const installationId = randomUUID();
+		// A nonexistent legacy source would create an empty permission set and shadow the
+		// initial manifest grants. Migrate only an actual legacy authority or mirror.
 		const legacyInstallationId =
 			legacyActive.length === 1
 				? (legacyActive[0].installationId as string)
-				: (state.current?.hash ?? undefined);
+				: state.current && (await this.permissionStore.hasSet(pluginId, state.current.hash))
+					? state.current.hash
+					: undefined;
 		logger.info("Allocated stable plugin installation identity", {
 			pluginId,
 			installationId,
