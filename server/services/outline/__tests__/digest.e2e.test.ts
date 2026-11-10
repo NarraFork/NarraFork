@@ -534,7 +534,13 @@ describe("reports: the acceptance", () => {
 		await expectLinksResolve(alice.id, a);
 		// Nothing of the next day, nothing of text in the stored items.
 		const stored = JSON.stringify(aliceDay.items);
-		for (const text of ["Shanghai's midnight", "BOM", "Formats we read", "Which format"])
+		// Use real phrases, not "BOM": opaque random IDs can legitimately contain that trigram.
+		for (const text of [
+			"Shanghai's midnight",
+			"The parser handles a BOM",
+			"Formats we read",
+			"Which format",
+		])
 			expect(stored).not.toContain(text);
 
 		// Bob's 11-04 (New York): the page and its facts as alice made them (the tasks are not

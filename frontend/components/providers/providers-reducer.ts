@@ -58,6 +58,8 @@ export interface ProvidersState {
 	modelProtocols: Record<string, CustomApiProtocol>;
 	providerOrder: string[];
 	disabledProviders: Set<string>;
+	/** Prefixes left out of `auto:<model>` routing (`agent.autoExcludedProviders`). */
+	autoExcludedProviders: Set<string>;
 	initialized: boolean;
 }
 
@@ -73,6 +75,7 @@ export interface SavedSnapshot {
 	modelProtocols: Record<string, CustomApiProtocol>;
 	providerOrder: string[];
 	disabledProviders: string[];
+	autoExcludedProviders: string[];
 }
 
 // Functional updater types
@@ -93,6 +96,7 @@ export type ProvidersAction =
 	| { type: "SET_MODEL_PROTOCOL"; modelVal: string; protocol: CustomApiProtocol | null }
 	| { type: "SET_PROVIDER_ORDER"; order: string[] }
 	| { type: "TOGGLE_PROVIDER_DISABLED"; prefix: string }
+	| { type: "SET_AUTO_EXCLUDED"; prefix: string; excluded: boolean }
 	| { type: "MARK_SAVED" }
 	| { type: "RESTORE_FROM_SNAPSHOT"; snapshot: SavedSnapshot }
 	| { type: "RESET_FOR_REINIT" };
@@ -289,6 +293,7 @@ export const initialProvidersState: ProvidersState = {
 	modelProtocols: {},
 	providerOrder: [],
 	disabledProviders: new Set(),
+	autoExcludedProviders: new Set(),
 	initialized: false,
 };
 
@@ -442,6 +447,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				modelProtocols,
 				providerOrder,
 				disabledProviders,
+				autoExcludedProviders: new Set<string>((agent.autoExcludedProviders as string[]) ?? []),
 				initialized: true,
 			};
 		}
@@ -570,6 +576,16 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			};
 		}
 
+		case "SET_AUTO_EXCLUDED": {
+			if (!action.prefix || state.autoExcludedProviders.has(action.prefix) === action.excluded) {
+				return state;
+			}
+			const next = new Set(state.autoExcludedProviders);
+			if (action.excluded) next.add(action.prefix);
+			else next.delete(action.prefix);
+			return { ...state, autoExcludedProviders: next };
+		}
+
 		case "RESTORE_FROM_SNAPSHOT": {
 			const snap = action.snapshot;
 			return {
@@ -585,6 +601,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				modelProtocols: { ...snap.modelProtocols },
 				providerOrder: [...snap.providerOrder],
 				disabledProviders: new Set(snap.disabledProviders),
+				autoExcludedProviders: new Set(snap.autoExcludedProviders),
 			};
 		}
 
@@ -648,6 +665,11 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 			JSON.stringify([...savedSnapshot.disabledProviders].sort())
 		)
 			return true;
+		if (
+			JSON.stringify([...state.autoExcludedProviders].sort()) !==
+			JSON.stringify([...savedSnapshot.autoExcludedProviders].sort())
+		)
+			return true;
 
 		return false;
 	}, [state, savedSnapshot]);
@@ -667,6 +689,7 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		modelProtocols: { ...state.modelProtocols },
 		providerOrder: [...state.providerOrder],
 		disabledProviders: [...state.disabledProviders],
+		autoExcludedProviders: [...state.autoExcludedProviders],
 	};
 }
 
@@ -746,6 +769,12 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
+	const setAutoExcluded = useCallback(
+		(prefix: string, excluded: boolean) =>
+			dispatch({ type: "SET_AUTO_EXCLUDED", prefix, excluded }),
+		[dispatch],
+	);
+
 	return useMemo(
 		() => ({
 			setCustomApiProviders,
@@ -760,6 +789,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			setModelProtocol,
 			setProviderOrder,
 			toggleProviderDisabled,
+			setAutoExcluded,
 		}),
 		[
 			setCustomApiProviders,
@@ -774,6 +804,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			setModelProtocol,
 			setProviderOrder,
 			toggleProviderDisabled,
+			setAutoExcluded,
 		],
 	);
 }

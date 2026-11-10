@@ -80,10 +80,13 @@ export interface UseStatusBarPropsOptions {
 	planModeUnsupportedReason: string | undefined;
 	planReflectionSupported: boolean;
 	dangerReflectionSupported: boolean;
+	questionReflectionSupported: boolean;
 	narratorPlanReflectionAutoApproveOverride: unknown;
 	narratorDangerReflectionOverride: unknown;
+	narratorQuestionReflectionOverride: unknown;
 	planReflectionAutoApproveGlobal: boolean;
 	dangerReflectionGlobal: boolean;
+	questionReflectionGlobal: boolean;
 	// biome-ignore lint/suspicious/noExplicitAny: reflection level enum passthrough.
 	dangerReflectionGlobalLevel: any;
 	settingsLoaded: boolean;
@@ -131,13 +134,16 @@ export function useStatusBarProps(
 		narratorId: options.narratorId,
 		narratorPlanReflectionAutoApproveOverride: options.narratorPlanReflectionAutoApproveOverride,
 		narratorDangerReflectionOverride: options.narratorDangerReflectionOverride,
+		narratorQuestionReflectionOverride: options.narratorQuestionReflectionOverride,
 		hasPlanTrait: options.hasPlanTrait,
 		planModeSupported: options.planModeSupported,
 		planReflectionSupported: options.planReflectionSupported,
 		dangerReflectionSupported: options.dangerReflectionSupported,
+		questionReflectionSupported: options.questionReflectionSupported,
 		planReflectionAutoApproveGlobal: options.planReflectionAutoApproveGlobal,
 		dangerReflectionGlobal: options.dangerReflectionGlobal,
 		dangerReflectionGlobalLevel: options.dangerReflectionGlobalLevel,
+		questionReflectionGlobal: options.questionReflectionGlobal,
 		settingsLoaded: options.settingsLoaded,
 		enterPlanModeMutation: options.enterPlanModeMutation,
 		exitPlanModeMutation: options.exitPlanModeMutation,
@@ -190,6 +196,15 @@ export function useStatusBarProps(
 				onChange: permissionControl.handlePlanReflectionAutoApproveOverride,
 				onFollowDefault: permissionControl.handleFollowDefaultPlanReflection,
 				onSetAsDefault: permissionControl.handleSetPlanReflectionAsDefault,
+			},
+			questionReflection: {
+				supported: options.questionReflectionSupported,
+				override: permissionControl.questionReflectionOverride,
+				effective: permissionControl.questionReflectionEffective,
+				global: options.questionReflectionGlobal,
+				onChange: permissionControl.handleQuestionReflectionOverride,
+				onFollowDefault: permissionControl.handleFollowDefaultQuestionReflection,
+				onSetAsDefault: permissionControl.handleSetQuestionReflectionAsDefault,
 			},
 			dangerReflection: {
 				supported: options.dangerReflectionSupported,

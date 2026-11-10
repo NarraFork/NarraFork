@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { replaceModelOverridesForTests } from "../../../server/lib/model-catalog";
 import {
 	getModelMaxCompletionTokens,
 	resolveModelContextWindow,
-	settings,
 } from "../../../server/lib/settings";
 
 /**
@@ -165,13 +165,11 @@ const ALL_PROBE_IDS = [...Object.keys(EXPECTED_BUILTIN_CONTEXT_WINDOWS), ...FUZZ
  * regression in the layer below it.
  */
 function withoutUserOverrides<T>(fn: () => T): T {
-	const local = settings.agent.modelCatalog?.local;
-	const original = local?.connections;
-	if (local) delete local.connections;
+	const restore = replaceModelOverridesForTests({});
 	try {
 		return fn();
 	} finally {
-		if (local && original) local.connections = original;
+		restore();
 	}
 }
 

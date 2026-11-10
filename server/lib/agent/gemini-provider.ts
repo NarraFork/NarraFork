@@ -12,6 +12,7 @@ import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason } from "./error-handling";
 import { GeminiMediaFiles } from "./gemini-media-files";
+import { sanitizeGeminiSchema } from "./gemini-tool-schema";
 import { reportInputCharacters } from "./input-characters";
 import {
 	createNativeMediaDumpEncoder,
@@ -45,6 +46,8 @@ import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
+
+export { sanitizeGeminiSchema } from "./gemini-tool-schema";
 
 // === Gemini identity prompt ===
 const GEMINI_IDENTITY: Record<string, string> = {
@@ -274,7 +277,7 @@ export class GeminiProvider implements ProviderAdapter {
 	}
 
 	async buildHistory(
-		dbMessages: DbMessage[],
+		dbMessages: readonly DbMessage[],
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
@@ -933,95 +936,6 @@ function geminiUserParts(
 			? { text: part.text }
 			: { inlineData: { mimeType: `image/${part.image.format}`, data: part.image.base64 } },
 	);
-}
-
-/**
- * Recursively sanitize a JSON Schema for Gemini's function-declaration format.
- * Gemini's Schema type is a strict OpenAPI subset — it rejects `additionalProperties`,
- * `$schema`, `const`, `$ref`, and a few other keywords. This drops the unsupported
- * keys and rewrites string `const` to a single-value `enum`. Non-string enum
- * constraints are dropped while preserving the schema's type.
- */
-export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {
-	return sanitizeNode(schema) as Record<string, unknown>;
-}
-
-// Gemini's function-declaration Schema is a strict OpenAPI 3.0 subset. Any JSON
-// Schema draft keyword outside that subset is rejected with a 400
-// ("Unknown name ... Cannot find field"). Strip every such keyword at all
-// nesting levels. Notably `propertyNames`/`additionalProperties` (emitted by
-// z.record()) and the draft applicator keywords must be removed.
-const GEMINI_UNSUPPORTED_KEYS = new Set([
-	"additionalProperties",
-	"propertyNames",
-	"unevaluatedProperties",
-	"patternProperties",
-	"minProperties",
-	"maxProperties",
-	"$schema",
-	"$id",
-	"$ref",
-	"$defs",
-	"$comment",
-	"definitions",
-	"default",
-	"examples",
-	"not",
-	"if",
-	"then",
-	"else",
-	"dependencies",
-	"dependentSchemas",
-	"dependentRequired",
-	"contains",
-	"minContains",
-	"maxContains",
-	"prefixItems",
-	"additionalItems",
-	"unevaluatedItems",
-	"multipleOf",
-	"exclusiveMinimum",
-	"exclusiveMaximum",
-	"uniqueItems",
-]);
-
-function sanitizeNode(node: unknown): unknown {
-	if (Array.isArray(node)) return node.map(sanitizeNode);
-	if (!node || typeof node !== "object") return node;
-
-	const input = node as Record<string, unknown>;
-	const out: Record<string, unknown> = {};
-
-	for (const [key, value] of Object.entries(input)) {
-		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
-		if (key === "const") {
-			// Gemini's enum field accepts strings only; retain the type for other literals.
-			if (typeof value === "string") out.enum = [value];
-			continue;
-		}
-		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
-			continue;
-		}
-		if (key === "properties" && value && typeof value === "object") {
-			const props: Record<string, unknown> = {};
-			for (const [pk, pv] of Object.entries(value as Record<string, unknown>)) {
-				props[pk] = sanitizeNode(pv);
-			}
-			out.properties = props;
-			continue;
-		}
-		if (key === "items") {
-			out.items = sanitizeNode(value);
-			continue;
-		}
-		if (key === "anyOf" || key === "oneOf" || key === "allOf") {
-			// Gemini supports anyOf; normalize oneOf/allOf to anyOf.
-			out.anyOf = (value as unknown[]).map(sanitizeNode);
-			continue;
-		}
-		out[key] = sanitizeNode(value);
-	}
-	return out;
 }
 
 /**

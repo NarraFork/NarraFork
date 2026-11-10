@@ -5,7 +5,9 @@ import {
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_PARENT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
+	isAutoModelOptionValue,
 	type ModelAggregation,
+	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
 
@@ -19,7 +21,7 @@ import {
  * which have no single provider.
  */
 export function modelProviderPrefix(value: string | null | undefined): string | null {
-	if (!value || value.startsWith(AGG_MODEL_PREFIX)) return null;
+	if (!value || value.startsWith(AGG_MODEL_PREFIX) || isAutoModelOptionValue(value)) return null;
 	if (
 		value === FOLLOW_DEFAULT_MODEL ||
 		value === FOLLOW_SUMMARY_MODEL ||
@@ -71,12 +73,37 @@ export function modelMenuSelection(
 
 /**
  * Role groups that stay pinned above the provider groups, in this exact order.
- * Default and Summary are the current selection; Aggregations is a virtual
- * catalog rather than a provider. All three titles are translated, so leaving
- * any of them in the alphabetical pass would move that group when the UI
- * language changes.
+ * Default and Summary are the current selection; Auto (`auto:<model>`) and
+ * Aggregations are virtual catalogs rather than providers. All four titles are
+ * translated, so leaving any of them in the alphabetical pass would move that
+ * group when the UI language changes.
  */
-const FIXED_MODEL_GROUP_ORDER: readonly string[] = ["__default__", "__summary__", "__agg__"];
+const FIXED_MODEL_GROUP_ORDER: readonly string[] = [
+	"__default__",
+	"__summary__",
+	"__auto__",
+	"__agg__",
+];
+
+/** Group key prefix for auto models of one vendor family (`__auto__:claude`). */
+export const AUTO_FAMILY_GROUP_PREFIX = "__auto__:";
+
+/** How the catalog's family ids are written for people; others are title-cased. */
+const FAMILY_LABELS: Record<string, string> = {
+	gpt: "GPT",
+	claude: "Claude",
+	gemini: "Gemini",
+	glm: "GLM",
+	grok: "Grok",
+	deepseek: "DeepSeek",
+	kimi: "Kimi",
+	minimax: "MiniMax",
+	cursor: "Cursor",
+};
+
+export function familyLabel(family: string): string {
+	return FAMILY_LABELS[family] ?? `${family.charAt(0).toUpperCase()}${family.slice(1)}`;
+}
 
 /**
  * Order model-menu groups: the fixed role groups first (in
@@ -91,14 +118,23 @@ export function orderModelGroupEntries<T>(
 	entries: ReadonlyArray<readonly [string, T]>,
 	labelOf: (provider: string) => string,
 ): Array<readonly [string, T]> {
-	const fixedRank = (provider: string) => FIXED_MODEL_GROUP_ORDER.indexOf(provider);
+	// Vendor groups of auto models (`__auto__:<family>`) take the `__auto__` slot.
+	const fixedRank = (provider: string) =>
+		FIXED_MODEL_GROUP_ORDER.indexOf(
+			provider.startsWith(AUTO_FAMILY_GROUP_PREFIX) ? "__auto__" : provider,
+		);
 	return [...entries].sort(([a], [b]) => {
 		const rankA = fixedRank(a);
 		const rankB = fixedRank(b);
 		if (rankA !== -1 || rankB !== -1) {
 			if (rankA === -1) return 1;
 			if (rankB === -1) return -1;
-			return rankA - rankB;
+			if (rankA !== rankB) return rankA - rankB;
+			// Two vendor groups: by label, with "other models" (no family) last.
+			const otherA = a === AUTO_FAMILY_GROUP_PREFIX;
+			const otherB = b === AUTO_FAMILY_GROUP_PREFIX;
+			if (otherA !== otherB) return otherA ? 1 : -1;
+			return labelOf(a).localeCompare(labelOf(b));
 		}
 		return labelOf(a).localeCompare(labelOf(b));
 	});
@@ -176,4 +212,81 @@ export function centerModelMenuSelection(
 				(visibleHeight - row.height) / 2,
 		),
 	);
+}
+
+/**
+ * Reference price of an `auto:` source, as "$X / 1M tokens" text (input + output per million).
+ * Null when the catalog has no price for it; such a source is never shown as free.
+ */
+export function formatReferencePrice(perMillion: number | undefined): string | null {
+	if (perMillion === undefined || !Number.isFinite(perMillion) || perMillion < 0) return null;
+	const digits = perMillion >= 10 ? 0 : perMillion >= 1 ? 1 : 2;
+	return `$${perMillion.toFixed(digits)}`;
+}
+
+/**
+ * Why "auto" uses its current source, in the order routing ranks them: unavailable sources go
+ * last, subscriptions come first, then the lowest reference price.
+ */
+export function autoChoiceReason(
+	sources: ReadonlyArray<{
+		provider: string;
+		available: boolean;
+		subscription: boolean;
+		referencePrice?: number;
+	}>,
+	providerLabels: Record<string, string>,
+	t: (key: string, options?: Record<string, unknown>) => string,
+): string | null {
+	const choice = sources.find((source) => source.available) ?? sources[0];
+	if (!choice) return null;
+	const provider = providerLabels[choice.provider] ?? choice.provider;
+	if (!choice.available) return t("autoReasonNoneAvailable", { provider });
+	if (choice.subscription) return t("autoReasonSubscription", { provider });
+	// "Cheapest" only when it was compared on price with another pay-per-use source.
+	const priced = sources.filter(
+		(source) => source.available && !source.subscription && source.referencePrice !== undefined,
+	);
+	return t(
+		choice.referencePrice !== undefined && priced.length > 1
+			? "autoReasonCheapest"
+			: "autoReasonFirst",
+		{ provider },
+	);
+}
+
+/**
+ * Group the picker's options: auto models by vendor family, everything else by service.
+ *
+ * A `<prefix>:<model>` that some auto row already lists as a source is left out of its
+ * service group, so a model shows once, under its family, with its services one level
+ * down. Services keep the models no auto row covers (outside the catalog, or excluded
+ * from auto), which can only be chosen by naming the service. The currently selected value
+ * is never dropped, so the selection always has a row to center on.
+ */
+export function groupModelOptions(
+	options: readonly ModelOption[],
+	currentValue: string,
+): Map<string, ModelOption[]> {
+	const coveredByAuto = new Set<string>();
+	for (const option of options) {
+		for (const source of option.autoSources ?? []) coveredByAuto.add(source.value);
+	}
+	const groups = new Map<string, ModelOption[]>();
+	const push = (key: string, option: ModelOption) => {
+		const list = groups.get(key);
+		if (list) list.push(option);
+		else groups.set(key, [option]);
+	};
+	for (const option of options) {
+		if (option.autoSources) {
+			push(`${AUTO_FAMILY_GROUP_PREFIX}${option.family ?? ""}`, option);
+			continue;
+		}
+		const provider = option.provider ?? "unknown";
+		const isService = !provider.startsWith("__");
+		if (isService && coveredByAuto.has(option.value) && option.value !== currentValue) continue;
+		push(provider, option);
+	}
+	return groups;
 }

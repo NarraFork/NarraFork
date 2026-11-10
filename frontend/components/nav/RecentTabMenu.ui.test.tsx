@@ -7,7 +7,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
 import { MantineProvider } from "@mantine/core";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	defaultScheduler,
+	notifyManager,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
@@ -45,6 +50,8 @@ const DOM_KEYS = [
 let restoreDom: (() => void) | null = null;
 let root: Root | null = null;
 let container: HTMLElement | null = null;
+let client: QueryClient;
+const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 
 beforeEach(() => {
 	const previous = new Map(
@@ -87,22 +94,49 @@ beforeEach(() => {
 			else Reflect.deleteProperty(globalThis, key);
 		}
 	};
+	// Keep asynchronous notifications owned by this DOM fixture, including on rerender.
+	notifyManager.setScheduler((callback) => {
+		const timer = setTimeout(() => {
+			notificationTimers.delete(timer);
+			callback();
+		}, 0);
+		notificationTimers.set(timer, callback);
+	});
+	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	client.setQueryData(["user-preferences"], {});
 	container = window.document.createElement("div");
 	window.document.body.append(container);
 	root = createRoot(container);
 });
 
 afterEach(async () => {
-	await act(async () => root?.unmount());
-	root = null;
-	container = null;
-	restoreDom?.();
-	restoreDom = null;
+	try {
+		await act(async () => {
+			root?.unmount();
+			await client.cancelQueries();
+			client.clear();
+			// Unmount cannot retract callbacks already captured by notifyManager.
+			while (notificationTimers.size) {
+				for (const [timer, callback] of [...notificationTimers]) {
+					clearTimeout(timer);
+					notificationTimers.delete(timer);
+					callback();
+				}
+				await Promise.resolve();
+			}
+		});
+	} finally {
+		for (const timer of notificationTimers.keys()) clearTimeout(timer);
+		notificationTimers.clear();
+		notifyManager.setScheduler(defaultScheduler);
+		root = null;
+		container = null;
+		restoreDom?.();
+		restoreDom = null;
+	}
 });
 
 async function render(ui: ReactNode) {
-	const client = new QueryClient();
-	client.setQueryData(["user-preferences"], {});
 	await act(async () => {
 		root?.render(
 			<QueryClientProvider client={client}>
@@ -157,6 +191,7 @@ function menuProps(overrides: Partial<TabContextMenuProps> = {}): TabContextMenu
 		folder: null,
 		onLeaveFolder: null,
 		gitIdentityNarratorId: null,
+		gitIdentityFolderId: null,
 		t: (key: string) => key,
 		...overrides,
 	};

@@ -1,0 +1,130 @@
+/*
+ * plan-tree.css — an outline plan's tree in its ExitPlanMode card (PlanTreeBody.tsx). Colours
+ * and alignment only: every box is sized by the measure (measure-plan-tree.ts), so nothing
+ * here may add padding, borders or line boxes that the measure does not count. No hover
+ * styles on the tree's arrows, checkboxes, bullets, quick controls or preview lines (the
+ * outline's frame parts have none; the controls are always drawn, for touch too).
+ */
+
+.vlist-plan-box {
+	background: var(--vlist-detail-panel-bg);
+	border-radius: 4px;
+	box-sizing: border-box;
+}
+
+.vlist-plan-toolbar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	white-space: nowrap;
+}
+
+.vlist-plan-toolbar-summary {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	color: var(--mantine-color-dimmed);
+}
+
+.vlist-plan-toolbar-action {
+	flex: 0 0 auto;
+	color: var(--mantine-color-anchor);
+	cursor: pointer;
+	user-select: none;
+}
+
+.vlist-plan-toggle,
+.vlist-plan-marker,
+.vlist-plan-subtree {
+	display: flex;
+	align-items: center;
+	box-sizing: border-box;
+}
+
+.vlist-plan-toggle {
+	justify-content: center;
+	cursor: pointer;
+	color: var(--mantine-color-dimmed);
+	user-select: none;
+}
+
+.vlist-plan-marker {
+	color: var(--mantine-color-dimmed);
+	/* The arrow's 24px target reaches into the marker's room: clicks there are the arrow's. */
+	pointer-events: none;
+}
+
+.vlist-plan-row[data-plan-role="notable"] .vlist-plan-marker {
+	color: var(--mantine-color-orange-6);
+}
+
+.vlist-plan-row[data-task-status="doing"] .vlist-plan-marker {
+	color: var(--mantine-color-blue-6);
+}
+
+.vlist-plan-row[data-task-status="done"] .vlist-plan-marker {
+	color: var(--mantine-color-green-6);
+}
+
+.vlist-plan-dot {
+	width: var(--nf-outline-dot, 6px);
+	height: var(--nf-outline-dot, 6px);
+	border-radius: 50%;
+	background: currentColor;
+	margin-left: calc((var(--nf-outline-icon, 16px) - var(--nf-outline-dot, 6px)) / 2);
+}
+
+.vlist-plan-text--toggles {
+	cursor: pointer;
+}
+
+.vlist-plan-row[data-task-status="done"] .vlist-plan-text,
+.vlist-plan-row[data-task-status="cancelled"] .vlist-plan-text {
+	color: var(--mantine-color-dimmed);
+}
+
+.vlist-plan-row[data-task-status="cancelled"] .vlist-plan-text .vlist-frag {
+	text-decoration: line-through;
+}
+
+.vlist-plan-dim {
+	color: var(--mantine-color-dimmed);
+}
+
+.vlist-plan-code {
+	color: var(--vlist-inline-code-fg);
+}
+
+.vlist-plan-subtree {
+	justify-content: center;
+	cursor: pointer;
+	color: var(--mantine-color-dimmed);
+	user-select: none;
+}
+
+/* The background: the title's paragraph, quieter than the points under it. */
+.vlist-plan-background {
+	color: var(--mantine-color-dimmed);
+}
+
+/* A closed row's preview line: its first child's first line, then 「还有 N 条 ▸」. */
+.vlist-plan-preview {
+	cursor: pointer;
+	color: var(--mantine-color-dimmed);
+	user-select: none;
+	border-radius: var(--mantine-radius-sm);
+}
+
+.vlist-plan-preview-label {
+	color: var(--mantine-color-anchor);
+	white-space: nowrap;
+}
+
+.vlist-plan-more {
+	color: var(--mantine-color-dimmed);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}

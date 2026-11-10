@@ -27,6 +27,9 @@ concurrency:
   group: independent-update-server-mirror
   cancel-in-progress: false
 
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+
 jobs:
   preflight:
     if: >-

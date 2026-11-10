@@ -74,6 +74,7 @@ function propsFor(text: string): ExactRowProps {
 			onToggleTranslation: noop,
 			onTogglePrompt: noop,
 			onToggleFileChanges: noop,
+			onPlanTree: noop,
 		},
 		renderLabels: {
 			reasoning: { reasoning: "Reasoning", thinking: "Thinking" },

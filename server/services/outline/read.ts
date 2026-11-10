@@ -276,6 +276,12 @@ export interface OutlineReadRequest extends OutlineReadOptions {
 	 * (a plan review's comments, outline P2 PR 8b: shown on their own, not as the plan).
 	 */
 	omit?: ReadonlySet<string>;
+	/**
+	 * Also return the tree read (`tree`): its blocks with their content, as far as the budget
+	 * loaded them (all of them when the read is not `truncated`). The plan submission checks the
+	 * plan's format on it (plan readability).
+	 */
+	withTree?: boolean;
 }
 
 export interface OutlineReadResult extends OutlineRenderResult {
@@ -289,6 +295,8 @@ export interface OutlineReadResult extends OutlineRenderResult {
 	truncated: boolean;
 	/** The root's ancestors, the page first. */
 	path: Array<{ id: string; sid: string; title: string }>;
+	/** The tree read, the root with its children (only with `withTree`). */
+	tree?: OutlineNode;
 }
 
 /** Leave the blocks in `omit` (and what is under them) out of the tree under `root`. */
@@ -349,6 +357,7 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 			sid: node.sid,
 			title: blockTitle(node.content ?? ""),
 		})),
+		...(request.withTree ? { tree: root } : {}),
 	};
 }
 

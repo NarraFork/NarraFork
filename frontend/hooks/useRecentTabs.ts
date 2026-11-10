@@ -629,6 +629,7 @@ export async function removeRecentTabCascade(
 	qc: QueryClient,
 	type: RecentTab["type"],
 	id: string,
+	options: { keepEmptyFolder?: boolean } = {},
 ): Promise<void> {
 	const section = recentTabsSectionQueryKey(type === "project" ? "projects" : "work");
 	await qc.cancelQueries({ queryKey: section });
@@ -638,7 +639,10 @@ export async function removeRecentTabCascade(
 	);
 	syncCompatibilityCache(qc);
 	try {
-		const result = await api.removeRecentTab(type, id, { cascade: true });
+		const result = await api.removeRecentTab(type, id, {
+			cascade: true,
+			keepEmptyFolder: options.keepEmptyFolder,
+		});
 		await applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result));
 	} catch {
 		restoreSectionSnapshots(qc, snapshots);
@@ -1150,12 +1154,17 @@ export function useRecentTabs() {
 			[runFolderMutation],
 		),
 		dissolveFolder: useCallback(
-			(folderId: string) =>
-				runFolderMutation(
+			async (folderId: string) => {
+				const result = await runFolderMutation(
 					() => api.dissolveRecentTabFolder(folderId),
 					(current) => applyRecentTabFolderDissolve(current, folderId),
-				).then(() => undefined),
-			[runFolderMutation],
+				);
+				// The folder layout is hand-built work; dissolving it is undoable like a close.
+				if (result.undoToken) {
+					showUndoNotification(t("folderDissolved"), { undoToken: result.undoToken });
+				}
+			},
+			[runFolderMutation, showUndoNotification, t],
 		),
 		clearTabs: useCallback(
 			(scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>

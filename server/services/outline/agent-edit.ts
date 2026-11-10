@@ -151,9 +151,9 @@ export type OutlineCheckbox =
 	| "none";
 
 export type OutlineEditRequest =
-	| { add: string; markdown: string; after?: string }
+	| { add: string; markdown: string; after?: string; before?: string }
 	| { replace: string; text: string }
-	| { move: string; to: string; after?: string }
+	| { move: string; to: string; after?: string; before?: string }
 	| { delete: string }
 	| { set: string; checkbox?: OutlineCheckbox; assignee?: string | null; alias?: string | null }
 	| { confirm: string }
@@ -270,6 +270,8 @@ interface EditState {
 	located?: Located;
 	parent?: Located;
 	after?: OutlineResolvedBlock;
+	/** The sibling to place before (an add's first block, a move), instead of `after`. */
+	before?: OutlineResolvedBlock;
 	items?: PlannedItem[];
 	/** For set: the alias asked for (`Q?` resolved later). */
 	alias?: string | null;
@@ -602,19 +604,23 @@ export async function outlineEdit(
 			}
 			return located;
 		};
-		if ("add" in r) {
-			edit.parent = await at(r.add, true);
-			if (r.after !== undefined) {
-				const after = await at(r.after, false);
+		const sibling = async (request: { after?: string; before?: string }) => {
+			if (request.after !== undefined) {
+				const after = await at(request.after, false);
 				if (after?.kind === "block") edit.after = after.block;
 			}
+			if (request.before !== undefined) {
+				const before = await at(request.before, false);
+				if (before?.kind === "block") edit.before = before.block;
+			}
+		};
+		if ("add" in r) {
+			edit.parent = await at(r.add, true);
+			await sibling(r);
 		} else if ("move" in r) {
 			edit.located = await at(r.move, false);
 			edit.parent = await at(r.to, true);
-			if (r.after !== undefined) {
-				const after = await at(r.after, false);
-				if (after?.kind === "block") edit.after = after.block;
-			}
+			await sibling(r);
 		} else {
 			edit.located = await at(targetOf(r), false);
 		}
@@ -622,7 +628,10 @@ export async function outlineEdit(
 	const located = edits.flatMap((edit) =>
 		[edit.located, edit.parent].filter((l): l is Located => l !== undefined),
 	);
-	for (const edit of edits) if (edit.after) located.push({ kind: "block", block: edit.after });
+	for (const edit of edits) {
+		if (edit.after) located.push({ kind: "block", block: edit.after });
+		if (edit.before) located.push({ kind: "block", block: edit.before });
+	}
 	const problems = edits.flatMap((edit) => edit.problems.map((p) => `${label(edit)}: ${p}`));
 	if (problems.length > 0) return failed(problems);
 
@@ -1171,7 +1180,9 @@ export async function outlineEdit(
 							? { after: { tempId: previous } }
 							: edit.after
 								? { after: { id: edit.after.id } }
-								: undefined;
+								: edit.before
+									? { before: { id: edit.before.id } }
+									: undefined;
 						previous = insertTree(edit, p, parent, position);
 					}
 				} else if ("replace" in r) {
@@ -1229,7 +1240,11 @@ export async function outlineEdit(
 						op: "move",
 						block: { id: block.id },
 						parent: edit.parent?.kind === "block" ? { id: edit.parent.block.id } : null,
-						...(edit.after ? { position: { after: { id: edit.after.id } } } : {}),
+						...(edit.after
+							? { position: { after: { id: edit.after.id } } }
+							: edit.before
+								? { position: { before: { id: edit.before.id } } }
+								: {}),
 						baseVersionSeq: base(block.id),
 					});
 				} else if ("delete" in r) {

@@ -2,7 +2,7 @@ import { beforeAll, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import { narrators, projects, users } from "../../db/schema";
 import { narratorService } from "../../services/narrator-service";
 import { narratorRoutes } from "../narrators";
@@ -52,6 +52,28 @@ test("list queries exclude the registration at SQL projection, not only response
 	]) {
 		expect(site).toMatch(/columns:\s*\{\s*runtimeRegistrationJson:\s*false\s*\}/);
 	}
+});
+test("named list searches by handle instead of scanning every narrator", () => {
+	const service = readFileSync(
+		join(import.meta.dir, "../../services/narrator-service.ts"),
+		"utf-8",
+	);
+	const namedList = service.slice(
+		service.indexOf("async listNamed()"),
+		service.indexOf("async setHandle("),
+	);
+	expect(namedList).toContain('gt(narrators.handle, "")');
+	const plan = sqlite
+		.prepare(
+			`EXPLAIN QUERY PLAN SELECT "id" FROM "narrators" "narrators"
+			WHERE ("narrators"."type" = ? AND "narrators"."handle" > ?)
+			ORDER BY "narrators"."last_message_at" DESC, "narrators"."created_at" DESC`,
+		)
+		.all("primary", "") as Array<{ detail: string }>;
+	expect(plan.some((row) => /SEARCH narrators USING (COVERING )?INDEX/.test(row.detail))).toBe(
+		true,
+	);
+	expect(plan.some((row) => row.detail === "SCAN narrators")).toBe(false);
 });
 test("all, project and named lists never return live runtime registration", async () => {
 	const app = new Hono();

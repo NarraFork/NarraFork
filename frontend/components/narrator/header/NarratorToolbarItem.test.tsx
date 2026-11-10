@@ -68,6 +68,7 @@ function makeProps(): Omit<NarratorToolbarItemProps, "def"> {
 		},
 		inlineControls: {
 			executionDevicesQuery: { data: { devices: [] } },
+			onRequireDeviceDirectory: () => {},
 			updateExecutionDeviceMutation: { isPending: false, mutate: mock(() => {}) },
 			renderLod: 4,
 			renderLodIsDefault: true,

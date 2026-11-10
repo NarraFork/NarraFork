@@ -44,6 +44,7 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { broadcastToUser } from "../websocket/narrator-ws";
+import { workspaceTitleInputsChanged } from "./workspace-title";
 
 type WorkspacePanelRow = typeof workspacePanels.$inferSelect;
 
@@ -478,7 +479,7 @@ export async function addWorkspacePanel(
 
 	db.insert(workspacePanels).values(row).run();
 
-	broadcastWorkspaceChanged(userId, workspaceId, "membership");
+	workspaceTitleInputsChanged(userId, workspaceId, "membership");
 
 	return {
 		panel: {
@@ -510,7 +511,7 @@ export async function removeWorkspacePanel(
 	if (!row) throw new NotFoundError("Workspace panel", panelId);
 
 	db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
-	broadcastWorkspaceChanged(userId, workspaceId, "membership");
+	workspaceTitleInputsChanged(userId, workspaceId, "membership");
 }
 
 /** Rejection code for a layout save that raced another client. */
@@ -600,5 +601,6 @@ export async function updateWorkspacePanelConfig(
 		.update(workspacePanels)
 		.set({ configJson, updatedAt: new Date() })
 		.where(eq(workspacePanels.id, panelId));
+	workspaceTitleInputsChanged(userId, workspaceId, "membership");
 	return { ...rowToPanel(row), config: parseConfig(configJson) };
 }

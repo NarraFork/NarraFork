@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { asc, eq } from "drizzle-orm";
 import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
 import type { RuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
@@ -198,7 +198,9 @@ test.each([
 		.where(eq(narratorMessages.contentText, "rich 😀"))
 		.get();
 	expect(row?.composerDocument).toEqual(document);
-	expect(row?.contentJson).toEqual([{ type: "text", text: "rich 😀" }]);
+	expect(readTestMessageContent(sqlite, row?.id ?? "")).toEqual([
+		{ type: "text", text: "rich 😀" },
+	]);
 	expect(providerCalls.at(-1)).toBe("rich 😀");
 	closeNarrator(narratorId);
 });

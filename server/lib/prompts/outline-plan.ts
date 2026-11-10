@@ -1,4 +1,10 @@
 import type { Locale } from "@shared/i18n-locales";
+import {
+	NOTABLE_POINTS_TITLE,
+	OUTLINE_PLAN_STRUCTURE,
+	type PlanBackgroundProblem,
+	type PlanBlockRole,
+} from "@shared/outline-plan-structure";
 
 // ─── Outline plans (outline P2 PR 8, D48) ───
 //
@@ -25,6 +31,62 @@ export interface OutlinePlanPromptAddress {
 }
 
 const zh = (locale: Locale) => locale === "zh-CN";
+
+/**
+ * The plan's format (plan readability; the owner's template): a one-line title, the background
+ * paragraph as the root's first block, big points with small points with their implementation
+ * details, and the notable points last. An approver tracks many plans and knows each project
+ * only roughly, so the background has to carry them into the plan; the details stay folded
+ * behind one line. ExitPlanMode refuses a plan that breaks the format
+ * (`@shared/outline-plan-structure`, the same numbers). Constant text (the prompt is cached).
+ */
+function structureRules(locale: Locale): string {
+	const { rootChars, backgroundChars, pointChars, detailChars, maxChildren } =
+		OUTLINE_PLAN_STRUCTURE;
+	return zh(locale)
+		? `计划按固定格式写。审批人同时跟着很多任务，对这个项目只是大概了解：列表里只看到标题，打开后先读背景，再顺着大点往下看；实施细节默认只显示一行，要看才展开。
+   - 计划根：一行短标题（不超过 ${rootChars} 字），说清是哪件事。
+   - 根下第一块：背景。一段话（不超过 ${backgroundChars} 字），不是任务，下面不挂子块（根下已有块时，用 OutlineEdit add 的 before 插到最前面）。让审批人想起这是在做什么、为什么做、做到哪一步，并能顺着它读懂后面的计划；简明精准，不写实施细节。
+   - 接着是大点（阶段或工作方向），每个大点下面是小点（具体任务），都写成复选框任务（\`[ ]\`），前置用 \`depends::\`。大点、小点各只写一个要点（不超过 ${pointChars} 字）。验收可以作为一个大点，也可以写进背景。
+   - 小点下面是实施细节：改哪里、怎么改、怎么验证，每条一个子块（不超过 ${detailChars} 字），更细的挂在它下面。
+   - 根下最后一块：「${NOTABLE_POINTS_TITLE["zh-CN"]}」，下面每条一个子块：风险、不可逆的操作、需要审批人特别看一眼的地方。确实没有才省略这一块。
+   - 一层不超过 ${maxChildren} 块，多了就分组。
+   例如：
+   \`\`\`
+   - [ ] 历史读取超过 10 秒改为告警
+     - 模型历史、工具结果回放和会话恢复读历史超过 10 秒就直接拒绝，慢磁盘上的会话会莫名失败。这次把固定时间拒绝改成告警：读取照常完成，慢的时候在日志和界面上说明原因。
+     - [ ] 阶段 1：去掉固定时间拒绝
+       - [ ] 清除模型历史链路的固定时间拒绝
+         - history-build.ts：删除 deadline 传播和超时 reject，读完后比较耗时
+         - loop.ts：删掉 HISTORY_READ_TIMEOUT 分支
+     - [ ] 阶段 2：验收
+       - [ ] 注入 15 秒延迟的读取照常返回，日志里有告警
+     - ${NOTABLE_POINTS_TITLE["zh-CN"]}
+       - HISTORY_READ_TIMEOUT 错误码保留一个版本，旧日志解析不报错
+   \`\`\`
+   不符合格式的计划，ExitPlanMode 会拒收并指出要改的块。`
+		: `Write the plan in a fixed format. The approver tracks many tasks at once and knows this project only roughly: a list shows them the title, the plan opens on the background, and they follow the big points down from there; implementation details show one line until opened.
+   - The plan root: a short one-line title (at most ${rootChars} characters) naming the work.
+   - The root's first block: the background. One paragraph (at most ${backgroundChars} characters), not a task, with nothing under it (when the root has blocks already, OutlineEdit add with before puts it first). It brings back what this work is, why, and where it stands, so the approver can follow it into the plan; concise and precise, no implementation details.
+   - Then the big points (phases or workstreams), each with its small points (concrete tasks) under it, as checkbox tasks (\`[ ]\`) with \`depends::\` for prerequisites. A big or small point is one idea (at most ${pointChars} characters). The acceptance can be a big point of its own or part of the background.
+   - Under a small point, its implementation details: where, how, how it is checked, one child block each (at most ${detailChars} characters), finer ones under them.
+   - The root's last block: "${NOTABLE_POINTS_TITLE.en}", one child block per item: risks, irreversible steps, what the approver should look at. Leave it out only when there is truly nothing.
+   - At most ${maxChildren} blocks on one level; group them when there are more.
+   For example:
+   \`\`\`
+   - [ ] Warn instead of failing on history reads over 10 seconds
+     - Reading history for the model, tool-result replay and session restore fails outright after 10 seconds, so sessions on slow disks break for no visible reason. This turns the fixed-time refusal into a warning: reads complete, and a slow one is explained in the log and the UI.
+     - [ ] Phase 1: remove the fixed-time refusal
+       - [ ] Remove the fixed-time refusal from the model history path
+         - history-build.ts: drop the deadline and the timeout reject; compare the elapsed time after the read
+         - loop.ts: delete the HISTORY_READ_TIMEOUT branch
+     - [ ] Phase 2: acceptance
+       - [ ] A read delayed 15 seconds still answers, and the log has the warning
+     - ${NOTABLE_POINTS_TITLE.en}
+       - Keep the HISTORY_READ_TIMEOUT code for one release so old log parsers do not fail
+   \`\`\`
+   ExitPlanMode refuses a plan that breaks the format and names the blocks to fix.`;
+}
 
 /** The plan-mode section of an outline session's system prompt (replaces the plan-file one). */
 export function getOutlinePlanModeSystemReminder(
@@ -56,8 +118,8 @@ ${limits}
 
 ## 怎么写计划
 1. 用 OutlineRead 读计划根，用 OutlineEdit 写在它下面。
-2. 计划根的正文写目标和验收；步骤写成它下面的复选框任务（\`[ ]\`），可以分层（里程碑 → 步骤 → 子步骤），前置用 \`depends::\`。
-3. 调研结论、决定、开放问题写成挂在计划下的普通块；需要人决定的用 Ask 提问并附建议。
+2. ${structureRules(locale)}
+3. 调研结论和已做的决定写进背景或它们所属的大点、小点；需要人决定的问题用 Ask 提问并附建议。
 4. 计划下出现的「退回意见」「审查意见」块是给你的意见，修改计划时要处理。
 
 ## 提交
@@ -74,8 +136,8 @@ ${limits}
 
 ## Writing the plan
 1. Read the plan root with OutlineRead and write under it with OutlineEdit.
-2. Write the goal and the acceptance in the root's text; write the steps as checkbox tasks (\`[ ]\`) under it, in levels if useful (milestones → steps → sub-steps), with \`depends::\` for prerequisites.
-3. Findings, decisions and open questions go under the plan as plain blocks; ask a person with Ask (with your recommendation) when they must decide.
+2. ${structureRules(locale)}
+3. Findings and decisions go into the background or the points they belong to; ask a person with Ask (with your recommendation) when they must decide.
 4. "Returned" and "Review" blocks under the plan are comments for you: address them when you revise it.
 
 ## Submitting
@@ -98,7 +160,7 @@ export function getOutlinePlanEnterOutput(
 				: how === "resumed"
 					? "已进入计划模式，接着改本会话还没批准的计划"
 					: "已进入计划模式，重新规划这棵任务树";
-		return `${lead}：\`${root.address}\`（「${root.title}」）。用 OutlineEdit 在它下面写目标、验收和步骤（复选框任务），写完调用 ExitPlanMode，\`mode: "outline"\`。`;
+		return `${lead}：\`${root.address}\`（「${root.title}」）。根只写一行标题；用 OutlineEdit 在它下面按计划格式写：第一块是背景（一段话；根下已有块时用 add 的 before 插到最前面），然后是大点、小点（复选框任务）和小点下的实施细节，最后一块是「${NOTABLE_POINTS_TITLE["zh-CN"]}」。写完调用 ExitPlanMode，\`mode: "outline"\`。`;
 	}
 	const lead =
 		how === "created"
@@ -106,7 +168,7 @@ export function getOutlinePlanEnterOutput(
 			: how === "resumed"
 				? "Entered plan mode; continuing this session's plan that is not approved yet"
 				: "Entered plan mode; re-planning this task tree";
-	return `${lead}: \`${root.address}\` ("${root.title}"). Write the goal, the acceptance and the steps (checkbox tasks) under it with OutlineEdit, then call ExitPlanMode with \`mode: "outline"\`.`;
+	return `${lead}: \`${root.address}\` ("${root.title}"). Keep the root a one-line title; under it, write the plan in its format with OutlineEdit: the background paragraph first (add with before when the root has blocks already), then the big and small points (checkbox tasks) with the implementation details under the small points, and "${NOTABLE_POINTS_TITLE.en}" last. Then call ExitPlanMode with \`mode: "outline"\`.`;
 }
 
 /** The reminder a tool call in relaxed planning gets: where the plan goes. */
@@ -124,7 +186,107 @@ export type OutlinePlanSubmitProblem =
 	| { kind: "notFound"; address: string }
 	/** More than `blocks` blocks or `kib` KiB of text (review round 1 N2: either can be what). */
 	| { kind: "tooLarge"; address: string; blocks: number; kib?: number }
-	| { kind: "wrongMode"; address: string };
+	| { kind: "wrongMode"; address: string }
+	/**
+	 * Not in the plan format (plan readability; `@shared/outline-plan-structure`): the first
+	 * problems, each naming its block (`key/sid`), and how many there are in all.
+	 */
+	| { kind: "structure"; address: string; issues: OutlinePlanStructureProblem[]; total: number };
+
+/** One way a plan breaks the format, about the block `address` (`key/sid`). */
+export type OutlinePlanStructureProblem =
+	| { kind: "root"; address: string; chars: number; lines: number }
+	| { kind: "background"; address: string; problem: PlanBackgroundProblem }
+	| { kind: "long"; address: string; chars: number; role: PlanBlockRole }
+	| { kind: "flat"; address: string; children: number }
+	| { kind: "notable"; address: string }
+	| { kind: "notableEmpty"; address: string }
+	| { kind: "noPoints"; address: string };
+
+function structureProblemLine(locale: Locale, problem: OutlinePlanStructureProblem): string {
+	const { rootChars, backgroundChars, pointChars, detailChars, maxChildren } =
+		OUTLINE_PLAN_STRUCTURE;
+	const at = `\`${problem.address}\``;
+	if (zh(locale)) {
+		switch (problem.kind) {
+			case "root":
+				return `- ${at}（计划根）有 ${problem.chars} 字${problem.lines > 1 ? `、${problem.lines} 行` : ""}：根只写一行短标题（不超过 ${rootChars} 字）；背景写成根下第一块的一段话，其余写成根下的大点。`;
+			case "background":
+				switch (problem.problem) {
+					case "none":
+						return `- ${at}（计划根）下面还没有背景：用 OutlineEdit 在根下加一块（add 指向计划根），用一段话（不超过 ${backgroundChars} 字）交代背景。`;
+					case "task":
+						return `- ${at} 是根下第一块，但它是任务：根下第一块必须是背景——一段不带复选框的话（不超过 ${backgroundChars} 字）。在它前面插入背景：OutlineEdit 的 add 指向计划根，带 before: "${problem.address}"。`;
+					case "heading":
+						return `- ${at} 是根下第一块，但它是标题：背景直接写成一段话（不超过 ${backgroundChars} 字），不用标题。`;
+					case "notProse":
+						return `- ${at} 是根下第一块，但它是代码块、表格或嵌入：背景要写成一段话（不超过 ${backgroundChars} 字）。在它前面插入背景：OutlineEdit 的 add 指向计划根，带 before: "${problem.address}"。`;
+					case "empty":
+						return `- ${at} 是根下第一块，但它是空的：在里面用一段话（不超过 ${backgroundChars} 字）写背景。`;
+					case "children":
+						return `- ${at} 是根下第一块，但它下面挂着子块：背景只是一段话，不挂子块。在它前面插入背景（OutlineEdit 的 add 指向计划根，带 before: "${problem.address}"），或把它的子块移到后面的大点里。`;
+				}
+				break;
+			case "long":
+				switch (problem.role) {
+					case "background":
+						return `- ${at}（背景）有 ${problem.chars} 字：背景只写一段简明的话（不超过 ${backgroundChars} 字），细节放进后面的大点、小点。`;
+					case "point":
+						return `- ${at} 有 ${problem.chars} 字：大点、小点各只写一个要点（不超过 ${pointChars} 字），说明写成它下面的实施细节。`;
+					case "detail":
+						return `- ${at} 有 ${problem.chars} 字：一条实施细节不超过 ${detailChars} 字，拆成几条，或把更细的挂在它下面。`;
+				}
+				break;
+			case "flat":
+				return `- ${at} 下面直接有 ${problem.children} 块：按阶段或主题分组，一层不超过 ${maxChildren} 块。`;
+			case "notable":
+				return `- ${at}（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）不是根下最后一块：用 OutlineEdit 把它 move 到计划根（不带 after、before 就放在最后），只留一块，值得注意的点都写在它下面。`;
+			case "notableEmpty":
+				return `- ${at}（「${NOTABLE_POINTS_TITLE["zh-CN"]}」）下面还没有条目：每一点写成它下面的一个子块；确实没有就删掉这一块。`;
+			case "noPoints":
+				return `- ${at}（计划根）下面除了背景还没有大点：把计划写成根下的大点（阶段或工作方向），小点和实施细节写在它们下面。`;
+		}
+	}
+	switch (problem.kind) {
+		case "root":
+			return `- ${at} (the plan root) has ${problem.chars} characters${problem.lines > 1 ? ` on ${problem.lines} lines` : ""}: make the root a short one-line title (at most ${rootChars} characters); write the background as one paragraph in the root's first block, and the rest as big points under the root.`;
+		case "background":
+			switch (problem.problem) {
+				case "none":
+					return `- ${at} (the plan root) has no background under it: add a block under the root with OutlineEdit (add: the plan root) holding one paragraph of background (at most ${backgroundChars} characters).`;
+				case "task":
+					return `- ${at} is the root's first block but a task: the first block must be the background, one paragraph without a checkbox (at most ${backgroundChars} characters). Insert it before this block: OutlineEdit add under the plan root with before: "${problem.address}".`;
+				case "heading":
+					return `- ${at} is the root's first block but a heading: write the background itself as one paragraph (at most ${backgroundChars} characters), not a heading.`;
+				case "notProse":
+					return `- ${at} is the root's first block but a code block, a table or an embed: the background is one paragraph (at most ${backgroundChars} characters). Insert it before this block: OutlineEdit add under the plan root with before: "${problem.address}".`;
+				case "empty":
+					return `- ${at} is the root's first block but empty: write the background in it as one paragraph (at most ${backgroundChars} characters).`;
+				case "children":
+					return `- ${at} is the root's first block but has blocks under it: the background is one paragraph with nothing under it. Insert it before this block (OutlineEdit add under the plan root with before: "${problem.address}"), or move its children into the big points.`;
+			}
+			break;
+		case "long":
+			switch (problem.role) {
+				case "background":
+					return `- ${at} (the background) has ${problem.chars} characters: keep it one concise paragraph (at most ${backgroundChars} characters) and move the details into the points.`;
+				case "point":
+					return `- ${at} has ${problem.chars} characters: a big or small point is one idea (at most ${pointChars} characters); write the explanation as implementation details under it.`;
+				case "detail":
+					return `- ${at} has ${problem.chars} characters: an implementation detail is at most ${detailChars} characters; split it, or put the finer parts under it.`;
+			}
+			break;
+		case "flat":
+			return `- ${at} has ${problem.children} blocks directly under it: group them by phase or topic, at most ${maxChildren} on one level.`;
+		case "notable":
+			return `- ${at} ("${NOTABLE_POINTS_TITLE.en}") is not the root's last block: OutlineEdit move it to the plan root with no after or before (that puts it last); keep one such block, with every notable point under it.`;
+		case "notableEmpty":
+			return `- ${at} ("${NOTABLE_POINTS_TITLE.en}") has nothing under it: write each point as a child block under it, or delete it when there is truly nothing.`;
+		case "noPoints":
+			return `- ${at} (the plan root) has no big point besides the background: write the plan as big points under the root (phases or workstreams), with the small points and details under them.`;
+	}
+	return `- ${at}`;
+}
 
 export function getOutlinePlanSubmitProblem(
 	locale: Locale,
@@ -152,6 +314,13 @@ export function getOutlinePlanSubmitProblem(
 			return z
 				? `本会话的计划在大纲里（\`${problem.address}\`），不用内联正文或计划文件。调用 ExitPlanMode 时传 \`mode: "outline"\`。`
 				: `This session's plan is in the outline (\`${problem.address}\`), not inline text or a plan file. Call ExitPlanMode with \`mode: "outline"\`.`;
+		case "structure": {
+			const lines = problem.issues.map((issue) => structureProblemLine(locale, issue)).join("\n");
+			const more = problem.total - problem.issues.length;
+			return z
+				? `计划 \`${problem.address}\` 还不符合计划格式，这次没有提交给用户：\n${lines}${more > 0 ? `\n- 另外还有 ${more} 处。` : ""}\n\n计划格式：根是一行标题；根下第一块是背景（一段话）；然后是大点（阶段或方向），大点下是小点，小点下是实施细节；最后一块是「${NOTABLE_POINTS_TITLE["zh-CN"]}」。用 OutlineEdit 改好后再调用 ExitPlanMode（mode: "outline"）。`
+				: `The plan \`${problem.address}\` does not follow the plan format yet; nothing was submitted to the user:\n${lines}${more > 0 ? `\n- ${more} more like these.` : ""}\n\nThe format: the root is a one-line title; its first block is the background (one paragraph); then the big points (phases or workstreams), small points under them, implementation details under the small points; the last block is "${NOTABLE_POINTS_TITLE.en}". Fix the tree with OutlineEdit, then call ExitPlanMode again (mode: "outline").`;
+		}
 	}
 }
 
@@ -322,7 +491,7 @@ ${summary}
 提交的计划（每块前面是它的短 id）：
 ${input.plan}
 
-检查：计划是否具体、可执行；是否符合用户的请求、范围合适；步骤的顺序是否可行、前置是否写明；是否还有本该先问用户的选择没定。
+检查：计划是否具体、可执行；是否符合用户的请求、范围合适；步骤的顺序是否可行、前置是否写明；是否还有本该先问用户的选择没定；背景能否让只大概了解这个项目的人想起这是在做什么；风险和不可逆的步骤是否写进了「${NOTABLE_POINTS_TITLE["zh-CN"]}」。
 
 只调用一次 PlanReview 给出结论：
 - \`verdict: "ok"\`，不带意见：你没有疑问。计划会替用户按草稿批准并开始执行。
@@ -337,7 +506,7 @@ ${summary}
 The plan as submitted (each block after its short id):
 ${input.plan}
 
-Check that the plan is specific and actionable; that it matches what the user asked for, in scope; that its steps are in a workable order with their prerequisites stated; and that no choice is left open the user should have made first.
+Check that the plan is specific and actionable; that it matches what the user asked for, in scope; that its steps are in a workable order with their prerequisites stated; that no choice is left open the user should have made first; that its background lets someone who knows the project only roughly recall what this is; and that risks and irreversible steps are under "${NOTABLE_POINTS_TITLE.en}".
 
 Give your verdict with one call of PlanReview:
 - \`verdict: "ok"\` with no comments: you have no concerns. The plan is then approved as a draft on the user's behalf and executed.

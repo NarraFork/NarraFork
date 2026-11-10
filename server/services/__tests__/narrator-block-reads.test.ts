@@ -49,7 +49,6 @@ async function conversation(): Promise<string[]> {
 async function modelBodies(fromBlocks: boolean): Promise<Map<string, unknown>> {
 	const source = await queryModelHistory(sqliteHistoryQuery(sqlite), {
 		narratorId: "n1",
-		deadline: Date.now() + 10_000,
 		versioned: true,
 		bodiesFromBlocks: fromBlocks,
 	});
@@ -62,7 +61,6 @@ async function deltaBodies(fromBlocks: boolean): Promise<Map<string, unknown>> {
 		sqliteHistoryQuery(sqlite),
 		{
 			narratorId: "n1",
-			deadline: Date.now() + 10_000,
 			versioned: true,
 			bodiesFromBlocks: fromBlocks,
 		},
@@ -103,6 +101,7 @@ function driftBlocks(id: string): void {
 }
 
 beforeEach(() => {
+	settings.narratorBlocks.compactJson = false;
 	cleanDb(sqlite);
 	sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('n1', 'N', ?, ?)", [
 		NOW,

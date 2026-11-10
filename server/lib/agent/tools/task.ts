@@ -42,7 +42,8 @@ function filterSubagentModels(models: string[]): string[] {
 }
 
 const MODEL_PARAM_BASE =
-	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects its first entry and pins the child independently. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Explicit models must also be allowed by the pool.";
+	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects its first entry and pins the child independently. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Explicit models must also be allowed by the pool. " +
+	"`<provider>:<model>` pins that provider; `auto:<model>` lets NarraFork choose any provider that serves the model.";
 
 /** Dynamic prompt context only; never used to construct tool definitions. */
 export function buildSubagentModelContext(

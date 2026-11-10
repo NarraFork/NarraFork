@@ -46,7 +46,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		logger: { logQuery: (query) => queries.push(query) },
 	});
 	// No real DB module or session runtime is imported by this fixture.
-	mock.module("../../db", () => ({ db, sqlite }));
+	mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 	mock.module("../narrator-session", () => ({
 		isNarratorActive: () => false,
 		isLoopRunning: () => false,

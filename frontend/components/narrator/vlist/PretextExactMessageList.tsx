@@ -219,6 +219,7 @@ import type { InjectionNavigation } from "./vlist-injection-header";
 import { createVListInteractionAdmission } from "./vlist-interaction-admission";
 import { VListInteractionAdmissionContext } from "./vlist-interaction-admission-context";
 import {
+	applyVListPlanTreeAction,
 	createVListInteractionState,
 	isFileChangesOpenRow,
 	isFullPayloadRequestedRow,
@@ -227,6 +228,7 @@ import {
 	isVListTextExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
+	resolvePlanTreeViewRow,
 	setVListExpanded,
 	setVListTextExpanded,
 	toggleVListFileChangesOpen,
@@ -987,6 +989,11 @@ export const PretextExactMessageList = memo(
 				(key: string) => isFileChangesOpenRow(activeInteraction, key),
 				[activeInteraction],
 			);
+			// An outline plan card's tree as the reader opened it (the overview when untouched).
+			const resolvePlanTreeView = useCallback(
+				(key: string) => resolvePlanTreeViewRow(activeInteraction, key),
+				[activeInteraction],
+			);
 			const resolveExactToolColor = useCallback(
 				(toolName: string, input?: unknown) => getCategoryColor(getCategory(toolName, input)),
 				[],
@@ -1559,6 +1566,11 @@ export const PretextExactMessageList = memo(
 						onToggleFileChanges: () => {
 							captureFoldBefore(key);
 							setInteraction((prev) => toggleVListFileChangesOpen(prev, key));
+						},
+						// A node, a text or the whole tree of an outline plan card: the card resizes.
+						onPlanTree: (action) => {
+							captureFoldBefore(key);
+							setInteraction((prev) => applyVListPlanTreeAction(prev, key, action));
 						},
 					};
 					togglesCacheRef.current.set(key, toggles);
@@ -2155,6 +2167,7 @@ export const PretextExactMessageList = memo(
 				showOriginal: resolveShowOriginal,
 				isPromptOpen: resolvePromptOpen,
 				isFileChangesOpen: resolveFileChangesOpen,
+				planTreeView: resolvePlanTreeView,
 				resolveToolCategory: getCategory,
 				resolveToolColor: resolveExactToolColor,
 				resolveToolSummary: resolveExactToolSummary,

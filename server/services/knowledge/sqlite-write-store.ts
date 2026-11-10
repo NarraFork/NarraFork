@@ -76,6 +76,7 @@ import type {
 	KnowledgeTagRowWrite,
 	KnowledgeTagTypeRowWrite,
 	KnowledgeWriteStore,
+	MarkSubmissionAuthorReadWrite,
 	MarkSubmissionConflictWrite,
 	RebaseDraftContentWrite,
 	RecordInjectionEventsWrite,
@@ -748,6 +749,27 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 				.where(eq(knowledgeSubmissions.id, input.submissionId))
 				.run();
 		});
+	},
+
+	async markSubmissionAuthorRead(input: MarkSubmissionAuthorReadWrite): Promise<number> {
+		if (input.submissionIds.length === 0) return 0;
+		let updated = 0;
+		db.transaction((tx) => {
+			// `author_read_at IS NULL` keeps the first-read timestamp stable across repeats.
+			updated = tx
+				.update(knowledgeSubmissions)
+				.set({ authorReadAt: input.now })
+				.where(
+					and(
+						inArray(knowledgeSubmissions.id, input.submissionIds),
+						eq(knowledgeSubmissions.submitterUserId, input.authorUserId),
+						isNull(knowledgeSubmissions.authorReadAt),
+					),
+				)
+				.returning({ id: knowledgeSubmissions.id })
+				.all().length;
+		});
+		return updated;
 	},
 
 	async approveStandalonePublish(input: ApproveStandalonePublishWrite): Promise<void> {

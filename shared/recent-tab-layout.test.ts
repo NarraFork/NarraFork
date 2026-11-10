@@ -81,11 +81,30 @@ describe("folder operations", () => {
 		]);
 	});
 
-	test("dissolve keeps members in place, unpinned; remove takes a folder's members along", () => {
-		expect(shape(applyRecentTabFolderDissolve(base(), "f"))).toEqual(["a", "m1", "m2", "*b"]);
+	test("dissolve keeps members in place, in the folder's own section", () => {
+		// The folder is pinned: its members stay pinned, where the user was looking, instead
+		// of dropping into the unpinned area below.
+		expect(shape(applyRecentTabFolderDissolve(base(), "f"))).toEqual(["a", "*m1", "*m2", "*b"]);
+		const unpinnedFolder = [
+			tab("a", { pinned: true }),
+			folder("f"),
+			tab("m1", { folderId: "f", pinned: true }),
+			tab("m2", { folderId: "f" }),
+		];
+		expect(shape(applyRecentTabFolderDissolve(unpinnedFolder, "f"))).toEqual(["*a", "m1", "m2"]);
 		expect(shape(applyRecentTabRemove(base(), "folder:f"))).toEqual(["a", "*b"]);
 		const single = applyRecentTabRemove(base(), "narrator:m1");
 		expect(shape(applyRecentTabRemove(single, "narrator:m2"))).toEqual(["a", "*b"]);
+	});
+
+	test("keepEmptyFolder leaves an emptied folder header in place", () => {
+		// 归档是可撤销的：最后一条记录离开时，文件夹不该跟着消失。
+		const tabs = [tab("a"), folder("f"), tab("m1", { folderId: "f" })];
+		expect(shape(applyRecentTabRemove(tabs, "narrator:m1"))).toEqual(["a"]);
+		expect(shape(applyRecentTabRemove(tabs, "narrator:m1", { keepEmptyFolder: true }))).toEqual([
+			"a",
+			"[f]",
+		]);
 	});
 
 	test("operations never mutate their input", () => {

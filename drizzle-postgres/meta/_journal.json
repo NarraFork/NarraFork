@@ -414,6 +414,69 @@
 			"when": 1793990635878,
 			"tag": "0058_outline_task_seen",
 			"breakpoints": true
+		},
+		{
+			"idx": 59,
+			"version": "7",
+			"when": 1794043084247,
+			"tag": "0059_usage_daily",
+			"breakpoints": true
+		},
+		{
+			"idx": 60,
+			"version": "7",
+			"when": 1794130719061,
+			"tag": "0060_add-question-reflection-override",
+			"breakpoints": true
+		},
+		{
+			"idx": 61,
+			"version": "7",
+			"when": 1794134144250,
+			"tag": "0061_submission_author_read",
+			"breakpoints": true
+		},
+		{
+			"idx": 62,
+			"version": "7",
+			"when": 1794136142791,
+			"tag": "0062_narrator_workspace_directories",
+			"breakpoints": true
+		},
+		{
+			"idx": 63,
+			"version": "7",
+			"when": 1794137358287,
+			"tag": "0063_folder-git-identity-bindings",
+			"breakpoints": true
+		},
+		{
+			"idx": 64,
+			"version": "7",
+			"when": 1794138790612,
+			"tag": "0064_recent-tab-archive-marks",
+			"breakpoints": true
+		},
+		{
+			"idx": 65,
+			"version": "7",
+			"when": 1794149533236,
+			"tag": "0065_workspace-auto-title",
+			"breakpoints": true
+		},
+		{
+			"idx": 66,
+			"version": "7",
+			"when": 1794151608019,
+			"tag": "0066_workspace-outline-title-invalidation",
+			"breakpoints": true
+		},
+		{
+			"idx": 67,
+			"version": "7",
+			"when": 1794283712715,
+			"tag": "0067_recent_tabs_show_directory",
+			"breakpoints": true
 		}
   ]
 }

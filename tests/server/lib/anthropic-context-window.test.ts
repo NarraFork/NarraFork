@@ -5,10 +5,9 @@ import {
 } from "../../../server/lib/agent/anthropic-provider";
 import {
 	bindModelCatalogSettings,
-	getModelCardSnapshot,
-	getModelCatalogRevision,
-	mutateModelCard,
-	setModelWindow,
+	getModelOverride,
+	replaceModelOverridesForTests,
+	setModelOverride,
 } from "../../../server/lib/model-catalog";
 import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/nug-model-cache";
 import type { AnthropicProviderConfig, NUGProviderConfig } from "../../../server/lib/settings";
@@ -42,33 +41,29 @@ function restoreFromSnapshot(snapshot: ReturnType<typeof cloneSettingsSnapshot>)
 	}
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 	saveSettings(settings);
+	restoreOverrides();
+	restoreOverrides = () => {};
 }
+
+let restoreOverrides: () => void = () => {};
 
 function resetCatalog(): void {
 	// These fixtures configure the legacy provider projection. Let saveSettings
 	// derive its canonical provider list instead of overwriting it with stale data.
 	delete settings.customApiProviders;
-	settings.agent.modelCatalog = {
-		schemaVersion: 2,
-		migrationVersion: 2,
-		local: { revision: 0 },
-		autoApply: false,
-		pinnedVersion: null,
-	};
+	settings.agent.modelCatalog = { autoUpdate: false };
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
+	// Start without overrides; edits below are undone after each test.
+	restoreOverrides();
+	restoreOverrides = replaceModelOverridesForTests({});
 }
 
 function setOwnWindow(model: string, contextWindow: number | null): void {
-	setModelWindow({
-		baseRevision: getModelCatalogRevision(),
-		scope: "connection",
-		target: model,
-		contextWindow,
-	});
+	setModelOverride("connection", model, contextWindow === null ? null : { contextWindow });
 }
 
 function saveWindow(value: number): void {
-	// The provider page's write: the entry's own window in the catalog.
+	// The provider page's write: the entry's own override.
 	setOwnWindow("relay:claude-opus-5", value);
 }
 
@@ -117,20 +112,11 @@ describe("Anthropic effective context window respects explicit configuration", (
 	test("model-wide and provider-entry windows outrank provider defaults; reset never re-pins archived values", () => {
 		const config = anthropicConfig({ defaultContextWindow: 400_000 });
 		settings.anthropicProviders = [config];
-		// Refresh the canonical provider projection before catalog mutations save it.
+		// Refresh the canonical provider projection.
 		delete settings.customApiProviders;
 		saveSettings(settings);
-		const patch = (target: "model" | "connection", targetId: string, value?: number) =>
-			mutateModelCard({
-				action: "patch",
-				baseRevision: getModelCardSnapshot().local.revision,
-				target,
-				targetId,
-				patch:
-					value === undefined
-						? { reset: ["working_context_tokens"] }
-						: { set: { working_context_tokens: value } },
-			});
+		const patch = (scope: "model" | "connection", key: string, value?: number) =>
+			setModelOverride(scope, key, value === undefined ? null : { contextWindow: value });
 		patch("model", "claude-opus-5", 600_000);
 		expect(resolveModelContextWindow("claude-opus-5", "relay")).toEqual({
 			contextWindow: 600_000,
@@ -144,7 +130,8 @@ describe("Anthropic effective context window respects explicit configuration", (
 		saveSettings(settings);
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(400_000);
 		// A reset window is gone from the entry, so nothing can pin it again.
-		expect(settings.agent.modelCatalog?.local.connections?.["relay:claude-opus-5"]).toBeUndefined();
+		expect(getModelOverride("connection", "relay:claude-opus-5")).toBeUndefined();
+		expect(getModelOverride("model", "claude-opus-5")).toBeUndefined();
 	});
 
 	test("a user override larger than 1M is kept as-is", () => {

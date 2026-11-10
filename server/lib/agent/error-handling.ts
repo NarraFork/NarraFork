@@ -194,7 +194,7 @@ const NON_RETRYABLE_PATTERNS = [
  * sounds. Single entry point so every caller shares the usage-limit wording
  * family instead of only the literal patterns above.
  */
-function isHardNonRetryableText(text: string): boolean {
+export function isHardNonRetryableText(text: string): boolean {
 	return (
 		NON_RETRYABLE_PATTERNS.some((pattern) => text.includes(pattern)) || isHardUsageLimitText(text)
 	);
@@ -213,6 +213,8 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 	"exceeds the maximum number of tokens",
 	"input token count exceeds",
 	"maximum number of tokens allowed",
+	// Confirmed upstream wording; a generic “内容过长” may refer to output or payload size.
+	"请求提示词超出模型上限",
 ];
 
 /**
@@ -425,12 +427,84 @@ function isContentFilterMessage(message: string): boolean {
 	);
 }
 
+interface LimitErrorCandidates {
+	reasons: string[];
+	messages: string[];
+}
+
+/** Only error-envelope fields: never serialize or inspect request/tool payloads. */
+function collectLimitErrorCandidates(error: unknown): LimitErrorCandidates {
+	const candidates: LimitErrorCandidates = { reasons: [], messages: [] };
+	const queue = [{ value: error, depth: 0 }];
+	const seen = new Set<object>();
+	const add = (target: string[], value: unknown) => {
+		if (typeof value === "string") target.push(value.slice(0, 8192).trim().toLowerCase());
+	};
+	// A small bound also handles wrappers with branching error/cause chains.
+	for (let index = 0; index < queue.length && index < 16; index++) {
+		const { value, depth } = queue[index];
+		if (typeof value === "string") {
+			add(candidates.messages, value);
+			continue;
+		}
+		if (!value || typeof value !== "object" || seen.has(value)) continue;
+		seen.add(value);
+		const obj = value as Record<string, unknown>;
+		for (const field of ["reason", "code", "type", "errorType", "name"] as const) {
+			add(candidates.reasons, obj[field]);
+		}
+		if (obj.classification === "completion_limit") candidates.reasons.push("max_tokens");
+		if (obj.classification === "context_overflow") candidates.reasons.push("context_overflow");
+		add(candidates.messages, obj.message);
+		if (depth < 4) {
+			for (const field of ["diagnostics", "error", "cause"] as const) {
+				if (queue.length < 16) queue.push({ value: obj[field], depth: depth + 1 });
+			}
+		}
+	}
+	return candidates;
+}
+
+/** Shared hard-stop/limit precedence for thrown HTTP errors and SSE invalidState. */
+function classifyLimitError({
+	reasons,
+	messages,
+}: LimitErrorCandidates): InvalidStateCategory | undefined {
+	if (reasons.some(isPolicyViolationCode)) return "content_filter";
+	if (
+		reasons.some((reason) =>
+			["aborterror", "abort_err", "aborted", "cancelled", "canceled"].includes(reason),
+		)
+	)
+		return "non_retryable";
+	if (reasons.some(isCompletionLimitReason)) return "completion_limit";
+	if (reasons.some(isRefusalReason)) return "refusal";
+	if (reasons.some(isContentFilterReason) || messages.some(isContentFilterMessage))
+		return "content_filter";
+	if (
+		[...reasons, ...messages].some(isHardNonRetryableText) ||
+		isHardUsageLimitText([...reasons, ...messages].join(" "))
+	)
+		return "non_retryable";
+	if (reasons.some(isContextOverflowReason) || messages.some(isContextOverflowMessage))
+		return "context_overflow";
+	return undefined;
+}
+
 export function classifyInvalidState(
 	reason: string,
 	message?: string,
 	diagnostics?: Pick<
 		ApiRequestDiagnostics,
-		"statusCode" | "retryable" | "resumable" | "provider" | "tokendanceRecoveryAction"
+		| "statusCode"
+		| "retryable"
+		| "resumable"
+		| "provider"
+		| "tokendanceRecoveryAction"
+		| "reason"
+		| "code"
+		| "errorType"
+		| "message"
 	>,
 	customRetryRules = settings.agent.customRetryRules,
 	providerRetryable?: boolean,
@@ -449,14 +523,6 @@ export function classifyInvalidState(
 	const normalizedReason = reason.toLowerCase().trim();
 	const normalizedMessage = message?.toLowerCase() ?? "";
 	const statusCode = inferInvalidStateStatus(reason, diagnostics);
-	// Literal patterns are matched per-field (a pattern never spans reason+message),
-	// but the usage-limit family legitimately splits across the two: opencode sends
-	// reason `GoUsageLimitError` (noun) with message "Weekly usage limit reached"
-	// (verb), so it is also matched against the joined text.
-	const hardNonRetryable =
-		NON_RETRYABLE_PATTERNS.some(
-			(pattern) => normalizedMessage.includes(pattern) || normalizedReason.includes(pattern),
-		) || isHardUsageLimitText(`${normalizedReason} ${normalizedMessage}`);
 	// The provider/gateway explicitly flagged this failure as safe to resume
 	// with a continuation turn (partial output was already produced). Any
 	// hard non-retryable classification below (quota, refusal, content
@@ -464,30 +530,14 @@ export function classifyInvalidState(
 	// safe to blindly continue past.
 	const providerResumable = diagnostics?.resumable === true;
 
-	// Upstream policy violations (e.g. Codex `cyber_policy`) are hard refusals of
-	// the request content itself. They must never retry, resume, or fail over to
-	// another credential — replaying the same prompt across the account pool is
-	// how upstream bans propagate. Bucketed as content_filter: the category only
-	// drives loop behaviour (terminal), while the exact reason code keeps flowing
-	// to the UI for precise wording.
-	if (isPolicyViolationCode(normalizedReason)) {
-		return { category: "content_filter", retryable: false, resumable: false, statusCode };
-	}
-
-	if (isCompletionLimitReason(normalizedReason)) {
-		return { category: "completion_limit", retryable: false, resumable: false, statusCode };
-	}
-	if (isContextOverflowReason(normalizedReason) || isContextOverflowMessage(normalizedMessage)) {
-		return { category: "context_overflow", retryable: false, resumable: false, statusCode };
-	}
-	if (isRefusalReason(normalizedReason)) {
-		return { category: "refusal", retryable: false, resumable: false, statusCode };
-	}
-	if (isContentFilterReason(normalizedReason) || isContentFilterMessage(normalizedMessage)) {
-		return { category: "content_filter", retryable: false, resumable: false, statusCode };
-	}
-	if (hardNonRetryable) {
-		return { category: "non_retryable", retryable: false, resumable: false, statusCode };
+	// Evaluate all explicit reasons/codes before falling back to text. In particular,
+	// a generic reason must not hide diagnostics.code, and a context code must not
+	// hide an explicit completion limit or hard refusal/quota wall in another field.
+	const limitCategory = classifyLimitError(
+		collectLimitErrorCandidates({ reason, message, diagnostics }),
+	);
+	if (limitCategory) {
+		return { category: limitCategory, retryable: false, resumable: false, statusCode };
 	}
 
 	// An executable-plugin provider may explicitly classify its own error. A hard
@@ -656,39 +706,7 @@ export function isContextOverflowMessage(message: string): boolean {
 }
 
 export function isContextWindowExceededError(err: unknown): boolean {
-	if (!err || typeof err !== "object") return false;
-	const obj = err as Record<string, unknown>;
-	const diagnostics =
-		obj.diagnostics && typeof obj.diagnostics === "object"
-			? (obj.diagnostics as Record<string, unknown>)
-			: undefined;
-	const nested =
-		obj.error && typeof obj.error === "object" ? (obj.error as Record<string, unknown>) : undefined;
-
-	if (obj.classification === "completion_limit") return false;
-	if (obj.classification === "context_overflow") return true;
-
-	// A structured stop reason is authoritative. In particular, max_tokens may carry
-	// provider text such as "maximum number of tokens allowed", which also resembles
-	// an input-context error and must not be reclassified by the message fallback.
-	for (const reason of [
-		obj.reason,
-		obj.code,
-		diagnostics?.reason,
-		nested?.reason,
-		nested?.code,
-		nested?.type,
-	]) {
-		if (typeof reason !== "string") continue;
-		if (isCompletionLimitReason(reason)) return false;
-		if (isContextOverflowReason(reason)) return true;
-	}
-
-	for (const message of [obj.message, obj.error, diagnostics?.message, nested?.message]) {
-		if (typeof message === "string" && isContextOverflowMessage(message)) return true;
-	}
-
-	return false;
+	return classifyLimitError(collectLimitErrorCandidates(err)) === "context_overflow";
 }
 
 export interface PaymentRequiredErrorInfo {

@@ -1,5 +1,6 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
+import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
@@ -63,6 +64,7 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
+import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import { CreateNarratorLazyModal } from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
@@ -917,11 +919,13 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	 */
 	const emptyBody =
 		topLevelCount > 0 ? null : sectionState.isLoading ? (
-			<Center py="xs">
+			// Collapsed, the rail shows icons only: these are not rows, so nothing clips them
+			// to it, and they would paint at the list's full width over the page.
+			<Center py="xs" className="nf-nav-expanded-only">
 				<Loader size="xs" />
 			</Center>
 		) : sectionState.isError ? (
-			<Stack gap={2} py={4} align="center">
+			<Stack gap={2} py={4} align="center" className="nf-nav-expanded-only">
 				<Text size="xs" c="red">
 					{t("recentTabsSyncError")}
 				</Text>
@@ -1232,7 +1236,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 
 						{topLevelCount > 0 &&
 							(sectionState.isError ? (
-								<Stack gap={2} py={4} align="center">
+								<Stack gap={2} py={4} align="center" className="nf-nav-expanded-only">
 									<Text size="xs" c="red">
 										{t("recentTabsSyncError")}
 									</Text>
@@ -1241,7 +1245,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 									</Button>
 								</Stack>
 							) : sectionState.hasMore ? (
+								// Not a row, so nothing clips it to the rail: collapsed, it would be
+								// painted at the list's full width over the page.
 								<Button
+									className="nf-nav-expanded-only"
 									size="compact-xs"
 									variant="subtle"
 									fullWidth
@@ -1287,6 +1294,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								}
 								onLeaveFolder={ctxInFolder ? handleLeaveFolder : null}
 								gitIdentityNarratorId={ctxTab.type === "narrator" ? ctxTab.id : null}
+								gitIdentityFolderId={ctxIsFolder ? ctxTab.id : null}
 								detailsTab={isTouch && !ctxIsFolder ? ctxTab : null}
 								t={t}
 							/>
@@ -1497,12 +1505,19 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 	);
 }
 
-/** A row's only text: its title on one line. Everything else is in the details card. */
+/** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
 function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	const { data: userPrefs } = useUserPreferences();
+	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
 	return (
-		<Text size="sm" truncate>
-			{tab.title}
-		</Text>
+		<Stack gap={0} style={{ minWidth: 0 }}>
+			<Text size="sm" truncate>
+				{tab.title}
+			</Text>
+			{showDirectory && hasDirectorySubtitle(tab) && tab.subtitle && (
+				<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+			)}
+		</Stack>
 	);
 }
 

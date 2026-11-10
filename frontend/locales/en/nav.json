@@ -107,6 +107,7 @@
 	"notificationPermissionPreview": "{{tool}}: {{summary}}",
 	"newFolderName": "New folder",
 	"folderClosed": "Folder closed",
+	"folderDissolved": "Folder dissolved",
 	"folderActionFailed": "Folder change could not be saved",
 	"editFolder": "Edit folder",
 	"folderName": "Name",

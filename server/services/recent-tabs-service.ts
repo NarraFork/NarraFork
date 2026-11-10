@@ -41,6 +41,7 @@ import { and, asc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narrators,
+	recentTabArchiveMarks,
 	userPreferences,
 	userRecentTabs,
 	userRecentTabsMeta,
@@ -48,6 +49,7 @@ import {
 } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { AppError, ValidationError } from "../lib/errors";
+import { invalidateNarratorFolderCache } from "../lib/git-identity";
 import { generateId } from "../lib/id";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser } from "../websocket/narrator-ws";
@@ -219,7 +221,10 @@ function normalizeTab(tab: PersistedRecentTab): PersistedRecentTab {
 	return normalized;
 }
 
-function deduplicateTabs(input: PersistedRecentTab[]): PersistedRecentTab[] {
+function deduplicateTabs(
+	input: PersistedRecentTab[],
+	options: { prune?: boolean } = {},
+): PersistedRecentTab[] {
 	const seen = new Set<string>();
 	const result: PersistedRecentTab[] = [];
 	for (const tab of input) {
@@ -228,7 +233,9 @@ function deduplicateTabs(input: PersistedRecentTab[]): PersistedRecentTab[] {
 		seen.add(key);
 		result.push(normalizeTab(tab));
 	}
-	return regroupFolders(result, { prune: true });
+	// `prune: false` keeps an emptied folder header: archiving is reversible, so the folder
+	// has to outlive its last member long enough for the restore to land in it.
+	return regroupFolders(result, { prune: options.prune ?? true });
 }
 
 /**
@@ -249,10 +256,11 @@ function trimTabsAtomic(
 	input: PersistedRecentTab[],
 	limit: number,
 	protectedKey?: string,
+	options: { prune?: boolean } = {},
 ): { tabs: PersistedRecentTab[]; protectedGroupTooLarge: boolean } {
 	// A copy: the shared regroup hands back `input` itself when it is already in shape,
 	// and the loop below splices.
-	const tabs = [...regroupFolders(input, { prune: true })];
+	const tabs = [...regroupFolders(input, { prune: options.prune ?? true })];
 	if (tabs.length <= limit) return { tabs, protectedGroupTooLarge: false };
 
 	const protectedIndex = protectedKey
@@ -314,8 +322,14 @@ function findEvictionVictim(
 function normalizeAndLimitTabs(
 	input: PersistedRecentTab[],
 	protectedKey?: string,
+	options: { prune?: boolean } = {},
 ): { tabs: PersistedRecentTab[]; protectedGroupTooLarge: boolean } {
-	return trimTabsAtomic(deduplicateTabs(input), RECENT_TABS_STORAGE_LIMIT, protectedKey);
+	return trimTabsAtomic(
+		deduplicateTabs(input, options),
+		RECENT_TABS_STORAGE_LIMIT,
+		protectedKey,
+		options,
+	);
 }
 
 function parseLegacyTabs(recentTabsJson: string | null | undefined): PersistedRecentTab[] {
@@ -866,7 +880,10 @@ function persistMutationLocked(
 		operations: diffOperations(before, after),
 		removedCount: options.removedCount,
 	};
-	if (options.undoTabs && (options.removedCount ?? 0) > 0) {
+	// Moves, folder removal/dissolve and reordering can all change which folder's identity
+	// a narrator inherits. Invalidate centrally so every layout mutation is covered.
+	invalidateNarratorFolderCache(userId);
+	if (options.undoTabs && options.undoTabs.length > 0) {
 		const token = generateId();
 		storeUndo({
 			token,
@@ -884,13 +901,14 @@ function persistMutationLocked(
 async function mutate(
 	userId: string,
 	transform: (tabs: PersistedRecentTab[]) => MutationState | Promise<MutationState>,
+	options: { prune?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
 		const baseRevision = ensureMigratedLocked(userId);
 		const oldRows = readRows(userId);
 		const before = oldRows.map(rowToTab);
 		const transformed = await transform(before.map(cloneTab));
-		const normalized = normalizeAndLimitTabs(transformed.tabs);
+		const normalized = normalizeAndLimitTabs(transformed.tabs, undefined, options);
 		return persistMutationLocked(
 			userId,
 			oldRows,
@@ -1081,20 +1099,26 @@ export async function removeRecentTab(
 	userId: string,
 	type: RecentTabType,
 	id: string,
-	options: { storeUndo?: boolean } = {},
+	options: { storeUndo?: boolean; keepEmptyFolder?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => {
-		const key = `${type}:${id}`;
-		const index = tabs.findIndex((tab) => tabKey(tab) === key);
-		if (index < 0) return { tabs };
-		// Snapshot BEFORE the splice — after it the removed tab is gone and the undo
-		// entry would restore an already-empty slot.
-		const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
-		const next = applyRecentTabRemove(tabs, key);
-		// An emptied folder header goes with its last member but is not counted as closed.
-		const removedCount = isFolderTab(tabs[index]) ? tabs.length - next.length : 1;
-		return { tabs: next, options: { removedCount, ...(undoTabs ? { undoTabs } : {}) } };
-	});
+	return mutate(
+		userId,
+		(tabs) => {
+			const key = `${type}:${id}`;
+			const index = tabs.findIndex((tab) => tabKey(tab) === key);
+			if (index < 0) return { tabs };
+			// Snapshot BEFORE the splice — after it the removed tab is gone and the undo
+			// entry would restore an already-empty slot.
+			const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
+			const next = applyRecentTabRemove(tabs, key, {
+				keepEmptyFolder: options.keepEmptyFolder,
+			});
+			// An emptied folder header goes with its last member but is not counted as closed.
+			const removedCount = isFolderTab(tabs[index]) ? tabs.length - next.length : 1;
+			return { tabs: next, options: { removedCount, ...(undoTabs ? { undoTabs } : {}) } };
+		},
+		{ prune: !options.keepEmptyFolder },
+	);
 }
 
 export interface MoveRecentTabInput {
@@ -1270,12 +1294,23 @@ export async function updateRecentTabFolder(
 	});
 }
 
-/** Remove a folder but keep its members, in order, at the folder's position. */
+/**
+ * Remove a folder but keep its members, in order, at the folder's position.
+ *
+ * The folder structure is hand-built, so dissolving it is undoable like a close: the
+ * snapshot is taken before the header goes.
+ */
 export async function dissolveRecentTabFolder(
 	userId: string,
 	folderId: string,
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => ({ tabs: applyRecentTabFolderDissolve(tabs, folderId) }));
+	return mutate(userId, (tabs) => {
+		if (folderHeaderIndex(tabs, folderId) < 0) return { tabs };
+		return {
+			tabs: applyRecentTabFolderDissolve(tabs, folderId),
+			options: { undoTabs: tabs.map(cloneTab) },
+		};
+	});
 }
 
 function isKeepUnit(tabs: PersistedRecentTab[], index: number, keepTabKey?: string): boolean {
@@ -1734,4 +1769,108 @@ export async function removeTabFromAllUsers(
 	for (const userId of await getRecentTabUserIds(tabType, tabId)) {
 		await removeRecentTab(userId, tabType, tabId);
 	}
+}
+
+/**
+ * Remember where this user's sidebar row for a narrator sat, right before archiving it.
+ *
+ * Archiving deletes the row, and `folder_id` goes with it — without this the restore could
+ * only put the session back at the top of the list. Only a row that actually sits in a folder
+ * is worth remembering: "top level" is where a restore lands anyway.
+ */
+export async function rememberArchivedTabPlacement(
+	userId: string,
+	narratorId: string,
+): Promise<void> {
+	const rows = await db
+		.select({ folderId: userRecentTabs.folderId })
+		.from(userRecentTabs)
+		.where(
+			and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.representedNarratorId, narratorId)),
+		)
+		.orderBy(asc(userRecentTabs.sortOrder));
+	const folderId = rows.find((row) => row.folderId)?.folderId ?? null;
+	const key = and(
+		eq(recentTabArchiveMarks.userId, userId),
+		eq(recentTabArchiveMarks.narratorId, narratorId),
+	);
+	if (!folderId) {
+		await db.delete(recentTabArchiveMarks).where(key);
+		return;
+	}
+	const archivedAt = new Date().toISOString();
+	await db
+		.insert(recentTabArchiveMarks)
+		.values({ id: generateId(), userId, narratorId, folderId, archivedAt })
+		.onConflictDoUpdate({
+			target: [recentTabArchiveMarks.userId, recentTabArchiveMarks.narratorId],
+			set: { folderId, archivedAt },
+		});
+}
+
+/**
+ * Put an unarchived narrator back into the folder it was archived from.
+ *
+ * Returns false when there is nothing to restore to — no mark, or the folder is gone because
+ * it was deleted (or dissolved) while the session was archived. The session then simply stays
+ * at the top of the list, which is the old behaviour and the only honest answer once the
+ * destination no longer exists.
+ */
+export async function restoreArchivedTabPlacement(
+	userId: string,
+	narratorId: string,
+	title: string,
+): Promise<boolean> {
+	const marks = await db
+		.select({ folderId: recentTabArchiveMarks.folderId })
+		.from(recentTabArchiveMarks)
+		.where(
+			and(
+				eq(recentTabArchiveMarks.userId, userId),
+				eq(recentTabArchiveMarks.narratorId, narratorId),
+			),
+		)
+		.limit(1);
+	const folderId = marks[0]?.folderId;
+	if (!folderId) return false;
+	await db
+		.delete(recentTabArchiveMarks)
+		.where(
+			and(
+				eq(recentTabArchiveMarks.userId, userId),
+				eq(recentTabArchiveMarks.narratorId, narratorId),
+			),
+		);
+
+	const folder = await db
+		.select({ id: userRecentTabs.id })
+		.from(userRecentTabs)
+		.where(
+			and(
+				eq(userRecentTabs.userId, userId),
+				eq(userRecentTabs.type, "folder"),
+				eq(userRecentTabs.entityId, folderId),
+			),
+		)
+		.limit(1);
+	if (folder.length === 0) return false;
+
+	const tabs = await listAllRecentTabs(userId);
+	const index = tabs.findIndex((tab) => tabKey(tab) === `narrator:${narratorId}`);
+	if (index >= 0) {
+		tabs[index] = { ...tabs[index], folderId };
+	} else {
+		// The row is gone (that is what archiving does): re-add it at the end and let the
+		// shared layout regroup it into its folder.
+		tabs.push({
+			type: "narrator",
+			id: narratorId,
+			narratorId,
+			folderId,
+			title,
+			lastVisitedAt: Date.now(),
+		});
+	}
+	await restoreRecentTabs(userId, { tabs });
+	return true;
 }

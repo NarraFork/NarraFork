@@ -2,8 +2,14 @@
 // Manages ChatGPT Pro/Plus OAuth tokens for the codex provider
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+	type CredentialNetwork,
+	publicCredentialNetwork,
+	restoreMaskedProxy,
+} from "@shared/credential-network";
+import { SessionAffinity } from "./agent/session-affinity";
 import {
 	type AgentIdentityKey,
 	buildAgentAssertion,
@@ -52,6 +58,12 @@ import { eventBus } from "./event-bus";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkHome } from "./narrafork-home";
+import {
+	onSecretEncryptionChange,
+	readSecretJSON,
+	SecretStoreError,
+	writeSecretJSON,
+} from "./secret-store";
 
 // === Constants ===
 
@@ -143,6 +155,8 @@ export interface CodexCredential {
 	archivedAt?: number;
 	/** Cached usage snapshot persisted with credential. */
 	usage?: CodexUsageResult;
+	/** This account's own proxy, client fingerprint and device id; absent fields follow Codex settings. */
+	network?: CredentialNetwork;
 	/** Rolling usage snapshots used to extend quota forecasts into the recent past. */
 	usageHistory?: CodexUsageHistoryEntry[];
 }
@@ -205,6 +219,8 @@ export interface CredentialSnapshot {
 	expiresAt?: number;
 	quotaResetsAt?: number;
 	usage?: CodexUsageResult;
+	/** Network identity with proxy passwords masked. */
+	network?: CredentialNetwork;
 }
 
 export interface UsageSchedulerSnapshot {
@@ -341,11 +357,6 @@ interface PendingDeviceFlow {
 	reject: (error: Error) => void;
 }
 
-interface SessionAffinityEntry {
-	credentialId: string;
-	lastUsedAt: number;
-}
-
 // === File paths ===
 
 function getCodexDataDir(baseDir?: string): string {
@@ -358,30 +369,6 @@ function getCredentialsPath(baseDir?: string): string {
 
 function getStatsPath(baseDir?: string): string {
 	return resolve(getCodexDataDir(baseDir), STATS_FILE);
-}
-
-/**
- * Write a file containing secrets with owner-only permissions (0o600).
- *
- * The Codex credential file holds refresh tokens, personal access tokens and
- * Agent Identity Ed25519 private keys. A plain writeFileSync lands on the umask
- * default (usually 0o644), i.e. world-readable — every other secret store in the
- * repo (settings/index.ts, plugin-secret-vault.ts) pins 0o600,
- * so this matches.
- *
- * `mode` only applies when the file is created, so pre-existing files from
- * earlier versions are chmod'd as well. Both the mode argument and the chmod are
- * no-ops on Windows, where NTFS ACLs govern access instead; the chmod failure is
- * swallowed rather than treated as an error there.
- */
-function writeSecretFile(path: string, contents: string): void {
-	writeFileSync(path, contents, { mode: 0o600 });
-	if (process.platform === "win32") return;
-	try {
-		chmodSync(path, 0o600);
-	} catch {
-		// Network filesystems can reject chmod; the file content is already written.
-	}
 }
 
 // === Helpers ===
@@ -587,6 +574,39 @@ function createAgentIdentityCredentialFromImport(
 	};
 }
 
+/**
+ * A stored or transferred credential, with tokens read from either field spelling and
+ * identity filled in from the access token. Null when it carries nothing usable.
+ */
+function normalizeStoredCredential(c: unknown): CodexCredential | null {
+	if (!c || typeof c !== "object") return null;
+	const credential = c as CodexCredential;
+	credential.refreshToken = getRefreshToken(credential);
+	credential.accessToken = getAccessToken(credential);
+
+	const isAgentIdentity =
+		getCodexAuthMode(credential) === "agent_identity" &&
+		!!normalizeOptionalString(credential.agentRuntimeId) &&
+		!!normalizeOptionalString(credential.agentPrivateKey);
+	// Agent Identity credentials carry no refresh/access token; keep them as-is.
+	if (!isAgentIdentity && !credential.refreshToken && !credential.accessToken) return null;
+	if (
+		!isAgentIdentity &&
+		credential.accessToken &&
+		(!credential.accountId || !credential.sub || !credential.email)
+	) {
+		const info = extractCodexTokenInfo({ accessToken: credential.accessToken });
+		credential.accountId ??= info.accountId;
+		credential.email ??= info.email;
+		credential.sub ??= info.sub;
+	}
+	credential.email ??= extractEmailFromString(credential.displayName);
+	if (isSerializedCodexCredentialLabel(credential.displayName)) {
+		credential.displayName = firstOptionalString(credential.email, credential.accountId);
+	}
+	return credential;
+}
+
 function createCredentialFromImport(
 	input: CodexImportCredentialInput,
 	defaultPriority: number,
@@ -714,7 +734,10 @@ export class CodexManager {
 	private agentTaskPromises = new Map<string, Promise<void>>();
 	private pendingDeviceFlow: PendingDeviceFlow | undefined;
 	private usageRefreshPromises = new Map<string, Promise<CodexUsageResult>>();
-	private sessionAffinity = new Map<string, SessionAffinityEntry>();
+	private sessionAffinity = new SessionAffinity<string>({
+		maxEntries: MAX_SESSION_AFFINITY_ENTRIES,
+		ttlMs: SESSION_AFFINITY_TTL_MS,
+	});
 	private readonly beforeExitHandler: () => void;
 	/** Exposed via snapshot so the frontend can show browser-auth errors. */
 	private _lastBrowserAuthError?: string;
@@ -726,6 +749,10 @@ export class CodexManager {
 	private quotaOverviewBroadcastTimer?: ReturnType<typeof setTimeout>;
 	// An upstream-triggered refresh must not waive quota exhaustion on credits alone.
 	private readonly upstreamQuotaRefreshes = new Set<string>();
+
+	/** Set when the stored credentials could not be decrypted; saving is refused. */
+	private credentialsUnreadable = false;
+	private unsubscribeSecretRewrite?: () => void;
 
 	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
@@ -748,10 +775,13 @@ export class CodexManager {
 		};
 		if (this.options?.registerProcessHooks ?? true) {
 			process.on("beforeExit", this.beforeExitHandler);
+			// Turning credential encryption on or off rewrites the file in the new form.
+			this.unsubscribeSecretRewrite = onSecretEncryptionChange(() => this.saveCredentials());
 		}
 	}
 
 	dispose(): void {
+		this.unsubscribeSecretRewrite?.();
 		this.stopUsageRefreshScheduler();
 		if (this.quotaOverviewBroadcastTimer) {
 			clearTimeout(this.quotaOverviewBroadcastTimer);
@@ -775,9 +805,9 @@ export class CodexManager {
 			!!sessionKey;
 
 		if (stickyEnabled && sessionKey) {
-			const sticky = this.sessionAffinity.get(sessionKey);
-			if (sticky) {
-				const stickyEntry = this.entries.find((e) => e.id === sticky.credentialId);
+			const stickyCredentialId = this.sessionAffinity.get(sessionKey);
+			if (stickyCredentialId) {
+				const stickyEntry = this.entries.find((e) => e.id === stickyCredentialId);
 				if (!stickyEntry || stickyEntry.disabled || isArchivedCodexCredential(stickyEntry)) {
 					this.unbindSession(sessionKey);
 				} else {
@@ -995,9 +1025,8 @@ export class CodexManager {
 		}
 
 		const promise = (async () => {
-			const { resolveOverride } = await import("./net/proxy");
-			const { settings } = await import("./settings");
-			const proxy = resolveOverride(settings.codex?.proxy);
+			const { codexProxy } = await import("./codex-network");
+			const proxy = codexProxy(entry);
 			const key: AgentIdentityKey = { runtimeId, privateKey };
 			const taskId = await registerAgentIdentityTask(key, proxy);
 			entry.taskId = taskId;
@@ -1049,9 +1078,8 @@ export class CodexManager {
 		}
 
 		const promise = (async () => {
-			const { resolveOverride } = await import("./net/proxy");
-			const { settings } = await import("./settings");
-			const proxy = resolveOverride(settings.codex?.proxy);
+			const { codexProxy } = await import("./codex-network");
+			const proxy = codexProxy(cred);
 			const tokens = await refreshCodexToken(refreshToken, proxy);
 			return {
 				...cred,
@@ -1071,8 +1099,7 @@ export class CodexManager {
 	}
 
 	private bindSession(sessionKey: string, credentialId: string): void {
-		this.sessionAffinity.set(sessionKey, { credentialId, lastUsedAt: Date.now() });
-		this.pruneSessionAffinity();
+		this.sessionAffinity.set(sessionKey, credentialId);
 	}
 
 	private unbindSession(sessionKey: string): void {
@@ -1080,28 +1107,11 @@ export class CodexManager {
 	}
 
 	private evictSessionsByCredential(credentialId: string): void {
-		for (const [sessionKey, binding] of this.sessionAffinity) {
-			if (binding.credentialId === credentialId) {
-				this.sessionAffinity.delete(sessionKey);
-			}
-		}
+		this.sessionAffinity.evictValue(credentialId);
 	}
 
 	private pruneSessionAffinity(now = Date.now()): void {
-		for (const [sessionKey, binding] of this.sessionAffinity) {
-			if (now - binding.lastUsedAt > SESSION_AFFINITY_TTL_MS) {
-				this.sessionAffinity.delete(sessionKey);
-			}
-		}
-		if (this.sessionAffinity.size <= MAX_SESSION_AFFINITY_ENTRIES) return;
-		const sorted = [...this.sessionAffinity.entries()].sort(
-			(a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
-		);
-		const overflow = this.sessionAffinity.size - MAX_SESSION_AFFINITY_ENTRIES;
-		for (let i = 0; i < overflow; i++) {
-			const item = sorted[i];
-			if (item) this.sessionAffinity.delete(item[0]);
-		}
+		this.sessionAffinity.prune(now);
 	}
 
 	// ==================== Reporting ====================
@@ -1495,6 +1505,7 @@ export class CodexManager {
 				expiresAt: e.expiresAt,
 				quotaResetsAt: e.quotaResetsAt,
 				usage: e.usage,
+				...(e.network ? { network: publicCredentialNetwork(e.network) } : {}),
 			};
 		};
 
@@ -1714,10 +1725,21 @@ export class CodexManager {
 
 	updateCredential(
 		id: string,
-		fields: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+		fields: {
+			displayName?: string;
+			priority?: number;
+			useCreditQuota?: boolean;
+			/** Replaces the network identity; `null` clears it. Validated by the caller. */
+			network?: CredentialNetwork | null;
+		},
 	): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
+		if (fields.network !== undefined) {
+			const next = fields.network && restoreMaskedProxy(fields.network, entry.network);
+			if (next && Object.keys(next).length) entry.network = next;
+			else delete entry.network;
+		}
 		if (fields.displayName !== undefined) entry.displayName = fields.displayName;
 		if (fields.priority !== undefined) entry.priority = fields.priority;
 		if (fields.useCreditQuota !== undefined) entry.useCreditQuota = fields.useCreditQuota === true;
@@ -1738,9 +1760,8 @@ export class CodexManager {
 		/** False when the local callback listener failed to start; the user must paste the callback URL. */
 		localCallbackServer: boolean;
 	}> {
-		const { resolveOverride } = await import("./net/proxy");
-		const { settings } = await import("./settings");
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const { codexProxy } = await import("./codex-network");
+		const proxy = codexProxy();
 		const generation = ++this.browserAuthGeneration;
 		const { authorizeUrl, tokenPromise, localCallbackServer } = await startBrowserOAuth(proxy);
 
@@ -1798,9 +1819,8 @@ export class CodexManager {
 		// Cancel any existing flow
 		this.cancelDeviceAuth();
 
-		const { resolveOverride } = await import("./net/proxy");
-		const { settings } = await import("./settings");
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const { codexProxy } = await import("./codex-network");
+		const proxy = codexProxy();
 		const { deviceAuthId, userCode, verificationUrl, interval } = await startDeviceCodeFlow(proxy);
 
 		const abortController = new AbortController();
@@ -2008,9 +2028,8 @@ export class CodexManager {
 			}
 			const authorization = buildAgentAssertion({ runtimeId, privateKey, taskId });
 
-			const { resolveOverride } = await import("./net/proxy");
-			const { settings } = await import("./settings");
-			const proxy = resolveOverride(settings.codex?.proxy);
+			const { codexProxy } = await import("./codex-network");
+			const proxy = codexProxy(entry);
 			// `authorization` overrides the Authorization header entirely, so the
 			// accessToken positional arg is unused for Agent Identity — pass "".
 			return { accessToken: "", accountId: entry.accountId, proxy, authorization };
@@ -2044,9 +2063,8 @@ export class CodexManager {
 			throw new Error("Account ID not available for this credential");
 		}
 
-		const { resolveOverride } = await import("./net/proxy");
-		const { settings } = await import("./settings");
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const { codexProxy } = await import("./codex-network");
+		const proxy = codexProxy(entry);
 
 		if (!entry.accessToken) {
 			throw new Error("Access token not available");
@@ -2361,47 +2379,121 @@ export class CodexManager {
 		return { added, duplicates, skipped };
 	}
 
+	// ==================== Transfer ====================
+
+	/** Credentials as they travel in an export bundle: login, settings and identity, no runtime state. */
+	exportForTransfer(ids?: readonly string[]): CodexCredential[] {
+		const wanted = ids ? new Set(ids) : null;
+		return this.entries
+			.filter((entry) => !wanted || wanted.has(entry.id))
+			.map((entry) => {
+				const { usage: _u, usageHistory: _h, quotaResetsAt: _q, ...rest } = structuredClone(entry);
+				// Failure counts and exhausted quota belong to this instance; a manual stop or a
+				// ban is a fact about the account and travels with it.
+				if (rest.disabledReason !== "manual" && rest.disabledReason !== "banned") {
+					rest.disabled = false;
+					delete rest.disabledReason;
+				}
+				return rest;
+			});
+	}
+
+	/** For each incoming credential: its label and the id of the same account here, if any. */
+	matchForTransfer(raw: readonly unknown[]): Array<{ label: string; existingId?: string } | null> {
+		return raw.map((item) => {
+			const credential = normalizeStoredCredential(structuredClone(item));
+			if (!credential) return null;
+			const keys = new Set(getCredentialDedupeKeys(credential));
+			const existing = this.entries.find((entry) =>
+				getCredentialDedupeKeys(entry).some((key) => keys.has(key)),
+			);
+			return {
+				label: credential.displayName ?? credential.email ?? credential.accountId ?? credential.id,
+				existingId: existing?.id,
+			};
+		});
+	}
+
+	/**
+	 * Add or replace credentials from a bundle. `decide` sees each usable item with the id
+	 * of the same account here; a replaced entry keeps its local id, priority and stats.
+	 */
+	importFromTransfer(
+		raw: readonly unknown[],
+		decide: (index: number, existingId: string | undefined) => "add" | "replace" | "skip",
+	): { added: number; replaced: number; skipped: number } {
+		if (this.credentialsUnreadable) {
+			throw new Error("Codex credentials on this server could not be read; nothing was imported");
+		}
+		const result = { added: 0, replaced: 0, skipped: 0 };
+		const touched: string[] = [];
+		raw.forEach((item, index) => {
+			const credential = normalizeStoredCredential(structuredClone(item));
+			if (!credential) {
+				result.skipped++;
+				return;
+			}
+			const keys = new Set(getCredentialDedupeKeys(credential));
+			const existing = this.entries.find((entry) =>
+				getCredentialDedupeKeys(entry).some((key) => keys.has(key)),
+			);
+			const action = decide(index, existing?.id);
+			if (action === "skip" || (action === "add" && existing)) {
+				result.skipped++;
+				return;
+			}
+			if (action === "replace" && existing) {
+				const next = { ...credential, id: existing.id, priority: existing.priority };
+				this.entries[this.entries.indexOf(existing)] = next;
+				touched.push(next.id);
+				result.replaced++;
+				return;
+			}
+			if (!credential.id || this.entries.some((entry) => entry.id === credential.id)) {
+				credential.id = generateShortId();
+			}
+			credential.priority = this.entries.length;
+			credential.disabled ??= false;
+			this.entries.push(credential);
+			this.stats.set(credential.id, { successCount: 0, failureCount: 0 });
+			touched.push(credential.id);
+			result.added++;
+		});
+		if (touched.length === 0) return result;
+		if (!this.entries.some((entry) => entry.id === this.currentId)) {
+			this.currentId = this.entries[0]?.id ?? "";
+		}
+		this.saveCredentials();
+		codexUsageQueue.enqueueMany(touched);
+		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
+		return result;
+	}
+
 	// ==================== Persistence ====================
 
 	private loadCredentials(): void {
 		try {
 			const baseDir = this.options?.homeDir;
 			const path = getCredentialsPath(baseDir);
-			if (!existsSync(path)) return;
-
-			const raw = JSON.parse(readFileSync(path, "utf-8"));
+			let raw: unknown;
+			try {
+				raw = readSecretJSON(path);
+			} catch (error) {
+				if (!(error instanceof SecretStoreError)) throw error;
+				// Never write over a file we could not read: it is the only copy.
+				this.credentialsUnreadable = true;
+				logger.error("Codex credentials are unreadable; leaving the file untouched", {
+					error: error.message,
+				});
+				return;
+			}
 			if (!Array.isArray(raw)) return;
 
 			const seen = new Set<string>();
 			for (const c of raw) {
-				if (!c || typeof c !== "object") continue;
-				const credential = c as CodexCredential;
-				credential.refreshToken = getRefreshToken(credential);
-				credential.accessToken = getAccessToken(credential);
-
-				const isAgentIdentity =
-					getCodexAuthMode(credential) === "agent_identity" &&
-					!!normalizeOptionalString(credential.agentRuntimeId) &&
-					!!normalizeOptionalString(credential.agentPrivateKey);
-				if (isAgentIdentity) {
-					// Agent Identity credentials carry no refresh/access token; keep them as-is.
-				} else if (!credential.refreshToken && !credential.accessToken) {
-					continue;
-				}
-				if (
-					!isAgentIdentity &&
-					credential.accessToken &&
-					(!credential.accountId || !credential.sub || !credential.email)
-				) {
-					const info = extractCodexTokenInfo({ accessToken: credential.accessToken });
-					credential.accountId ??= info.accountId;
-					credential.email ??= info.email;
-					credential.sub ??= info.sub;
-				}
-				credential.email ??= extractEmailFromString(credential.displayName);
-				if (isSerializedCodexCredentialLabel(credential.displayName)) {
-					credential.displayName = firstOptionalString(credential.email, credential.accountId);
-				}
+				const credential = normalizeStoredCredential(c);
+				if (!credential) continue;
 
 				const keys = getCredentialDedupeKeys(credential);
 				if (keys.length === 0 || keys.some((key) => seen.has(key))) continue;
@@ -2425,11 +2517,13 @@ export class CodexManager {
 	}
 
 	private saveCredentials(): void {
+		if (this.credentialsUnreadable) {
+			logger.warn("Codex credentials not saved: the stored file could not be read");
+			return;
+		}
 		try {
 			const baseDir = this.options?.homeDir;
-			const path = getCredentialsPath(baseDir);
-			mkdirSync(getCodexDataDir(baseDir), { recursive: true });
-			writeSecretFile(path, JSON.stringify(this.entries, null, 2));
+			writeSecretJSON(getCredentialsPath(baseDir), this.entries);
 		} catch (err) {
 			logger.warn("Failed to save Codex credentials", {
 				error: err instanceof Error ? err.message : String(err),
@@ -2487,6 +2581,36 @@ export class CodexManager {
 	/** Enabled, non-archived credentials — i.e. what can actually serve a request. */
 	get availableCount(): number {
 		return this.poolEntries.filter((e) => !e.disabled).length;
+	}
+
+	/**
+	 * Read-only "which account would a new request use" for routing/selector display.
+	 * No revive, no quota application, no file write: unlike snapshot()/hasAvailableCredentials
+	 * this is safe to call while routing. Priority mode's first available account; balanced
+	 * modes rotate, so the label is only the highest-priority one, marked by the caller.
+	 * When none can serve, the earliest quota reset among the resting accounts is reported.
+	 */
+	get routingPreview(): { label?: string; resetsAt?: number; rotating: boolean } {
+		const available = this.poolEntries.filter((e) => !e.disabled);
+		const chosen = available.reduce<CodexCredential | undefined>(
+			(best, e) => (!best || e.priority < best.priority ? e : best),
+			undefined,
+		);
+		const rotating = this.loadBalancingMode !== "priority";
+		if (chosen) {
+			return {
+				...(chosen.displayName || chosen.email || chosen.accountId
+					? { label: chosen.displayName || chosen.email || chosen.accountId || "" }
+					: {}),
+				...(chosen.quotaResetsAt ? { resetsAt: chosen.quotaResetsAt } : {}),
+				rotating,
+			};
+		}
+		const resets = this.poolEntries
+			.map((e) => e.quotaResetsAt)
+			.filter((t): t is number => typeof t === "number" && t > Date.now())
+			.sort((a, b) => a - b)[0];
+		return { ...(resets ? { resetsAt: resets } : {}), rotating };
 	}
 
 	/** Number of retired credentials whose data is retained. */

@@ -257,6 +257,12 @@ export const ERROR_CATALOG = {
 		code: "IMPORT_SNAPSHOT_EXPIRED",
 		en: "The import snapshot is no longer available. Choose the file again",
 	},
+	/** The archive carries sealed provider keys and providers were selected. */
+	IMPORT_PASSPHRASE_REQUIRED: {
+		status: 400,
+		code: "IMPORT_PASSPHRASE_REQUIRED",
+		en: "Enter the passphrase the provider keys were exported with",
+	},
 	CLEAR_PARAMS_INVALID: {
 		status: 400,
 		code: "VALIDATION_ERROR",
@@ -277,6 +283,45 @@ export const ERROR_CATALOG = {
 		status: 403,
 		code: "CLEAR_PASSWORD_INVALID",
 		en: "The password is incorrect. No data was cleared",
+	},
+
+	// --- step-up verification (credential export) -------------------------------
+	STEP_UP_MFA_REQUIRED: {
+		status: 403,
+		code: "STEP_UP_MFA_REQUIRED",
+		en: "Set up two-factor authentication first",
+	},
+	STEP_UP_METHOD_UNAVAILABLE: {
+		status: 400,
+		code: "STEP_UP_METHOD_UNAVAILABLE",
+		en: "This verification method is not set up",
+	},
+	STEP_UP_FAILED: {
+		status: 401,
+		code: "STEP_UP_FAILED",
+		en: "Password or verification code is incorrect",
+	},
+	STEP_UP_REQUIRED: {
+		status: 401,
+		code: "STEP_UP_REQUIRED",
+		en: "Verify your identity again to continue",
+	},
+
+	// --- credential transfer bundles -------------------------------------------
+	BUNDLE_INVALID: {
+		status: 400,
+		code: "BUNDLE_INVALID",
+		en: "Not a NarraFork credential bundle",
+	},
+	BUNDLE_PASSPHRASE: {
+		status: 400,
+		code: "BUNDLE_PASSPHRASE",
+		en: "Wrong passphrase, or the file was altered",
+	},
+	BUNDLE_TOO_LARGE: {
+		status: 400,
+		code: "BUNDLE_TOO_LARGE",
+		en: "The file is too large to be a credential bundle",
 	},
 } as const satisfies Record<string, ErrorCatalogEntry>;
 
@@ -360,6 +405,11 @@ export interface ErrorResponsePayload {
 	code: string;
 	messageCode?: ErrorMessageCode;
 	messageParams?: ErrorMessageParams;
+	/**
+	 * Machine-readable extras for errors the client must act on, not merely display.
+	 * Opaque on the wire: each error documents its own shape and the client narrows it.
+	 */
+	details?: unknown;
 }
 
 /**

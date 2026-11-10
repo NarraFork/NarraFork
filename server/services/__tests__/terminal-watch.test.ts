@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
@@ -12,9 +12,12 @@ import {
 	activeWatchIds,
 	CHECK_INTERVAL_MS,
 	contextAround,
+	createRenderedPatternMatcher,
 	echoEnd,
 	endWatchesForBuffer,
+	MAX_WATCH_PATTERN_CHARS,
 	notifyTerminalOutput,
+	PUBLISH_RETRY_DELAYS_MS,
 	resumeTerminalWatchesForTests,
 	startTerminalWatch,
 	suspendTerminalWatchesForShutdown,
@@ -50,6 +53,7 @@ afterEach(async () => {
 		for (const id of activeWatchIds(TERMINAL)) await backgroundTaskService.cancel(id);
 		await buffer.dispose(true);
 	}
+	mock.restore();
 	cleanDb(sqlite);
 });
 
@@ -124,6 +128,71 @@ describe("helpers", () => {
 	test("contextAround keeps whole lines around the match", () => {
 		const text = ["a", "b", "x MATCH y", "c"].join("\n");
 		expect(contextAround(text, text.indexOf("MATCH"), 5)).toBe(text);
+	});
+});
+
+describe("rendered pattern freshness", () => {
+	test("same-count movement in the observed prefix is not a new occurrence", () => {
+		const match = createRenderedPatternMatcher("READY", "READY");
+		expect(match(" READY", { newRegionStart: 6 })).toBe(-1);
+		expect(match("                     READY", { newRegionStart: 26 })).toBe(-1);
+	});
+
+	test("erasing old text cannot cancel a new appended occurrence", () => {
+		const match = createRenderedPatternMatcher("READY", "READY");
+		expect(match("\nREADY", { newRegionStart: 0 })).toBe(1);
+	});
+
+	test("observing disappearance permits a later appearance in the old row", () => {
+		const match = createRenderedPatternMatcher("READY", "READY");
+		expect(match("working", { newRegionStart: 7 })).toBe(-1);
+		expect(match("READY", { newRegionStart: 5 })).toBe(0);
+	});
+
+	test("overlapping literals and matches crossing the new-region boundary are retained", () => {
+		expect(createRenderedPatternMatcher("AA", "AAA")("AAAA", { newRegionStart: 4 })).toBe(2);
+		expect(createRenderedPatternMatcher("AA", "AAA")(" AAA", { newRegionStart: 4 })).toBe(-1);
+		expect(
+			createRenderedPatternMatcher("READY", "READY RE")("READY READY", { newRegionStart: 8 }),
+		).toBe(6);
+		expect(createRenderedPatternMatcher("READY", "READY")("READY", { resetHistory: true })).toBe(0);
+		expect(createRenderedPatternMatcher("READY", "")("READY", { prefixUnknown: true })).toBe(-1);
+	});
+
+	test("literal matching agrees with a naive overlapping oracle over small strings", () => {
+		const words = [""];
+		for (let length = 1; length <= 4; length++) {
+			for (let bits = 0; bits < 2 ** length; bits++)
+				words.push(Array.from({ length }, (_, i) => (bits & (1 << i) ? "A" : "B")).join(""));
+		}
+		const positions = (text: string, pattern: string) => {
+			const found: number[] = [];
+			for (let at = text.indexOf(pattern); at !== -1; at = text.indexOf(pattern, at + 1))
+				found.push(at);
+			return found;
+		};
+		for (const pattern of ["A", "B", "AA", "AB", "BA", "BB", "AAA"]) {
+			for (const before of words.slice(0, 7))
+				for (const text of words) {
+					for (const boundary of [0, Math.floor(text.length / 2), text.length]) {
+						const excluded = positions(before, pattern).length;
+						const found = positions(text, pattern);
+						let oldMatches = 0;
+						const expected =
+							found.find((at) => at + pattern.length > boundary || ++oldMatches > excluded) ?? -1;
+						expect(
+							createRenderedPatternMatcher(pattern, before)(text, { newRegionStart: boundary }),
+						).toBe(expected);
+					}
+				}
+		}
+	});
+
+	test("long overlapping prefixes remain bounded and literal", () => {
+		const pattern = `${"A".repeat(MAX_WATCH_PATTERN_CHARS - 1)}B`;
+		const text = `${"A".repeat(100_000)}B`;
+		expect(createRenderedPatternMatcher(pattern, "")(text)).toBe(text.indexOf(pattern));
+		expect(createRenderedPatternMatcher("[a].*", "")("xx[a].*xx")).toBe(2);
 	});
 });
 
@@ -212,6 +281,134 @@ describe("terminal watch", () => {
 		expect((await notices()).length).toBe(1);
 	});
 
+	test.each([
+		"completed",
+		"timeout",
+	] as const)("retries a rolled-back %s publication without losing or duplicating the notice", async (status) => {
+		const method = status === "completed" ? "markCompleted" : "markTimedOut";
+		const publish = backgroundTaskService[method].bind(backgroundTaskService);
+		let attempts = 0;
+		const published = spyOn(backgroundTaskService, method).mockImplementation(async (...args) => {
+			attempts++;
+			if (attempts !== 1) return publish(...args);
+			sqlite.exec(
+				"CREATE TRIGGER watch_publication_fault BEFORE UPDATE ON runtime_publication_outbox WHEN NEW.state = 'pending' BEGIN SELECT RAISE(ABORT, 'watch publication fault'); END;",
+			);
+			try {
+				return await publish(...args);
+			} finally {
+				sqlite.exec("DROP TRIGGER watch_publication_fault");
+			}
+		});
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await start(buffer, "READY", { kind: "offset", offset: 2 }, 300);
+		output(buffer, status === "completed" ? "READY\r\n" : "still working\r\n");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe(status);
+		expect(published).toHaveBeenCalledTimes(2);
+		const delivered = await notices();
+		expect(delivered).toHaveLength(1);
+		expect((await notices()).map((notice) => notice?.kind)).toEqual(["bg_bash"]);
+		expect(wakes).toEqual([PARENT]);
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
+	});
+
+	test("Stop during a publication retry cancels it without a late completion", async () => {
+		const published = spyOn(backgroundTaskService, "markCompleted").mockRejectedValue(
+			new Error("temporary publication failure"),
+		);
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await start(buffer, "READY", { kind: "offset", offset: 2 });
+		output(buffer, "READY\r\n");
+		const deadline = Date.now() + 1_000;
+		while (published.mock.calls.length === 0 && Date.now() < deadline) await Bun.sleep(10);
+		expect(published).toHaveBeenCalledTimes(1);
+		expect(activeWatchIds(TERMINAL)).toContain(id);
+		expect(await backgroundTaskService.cancel(id)).toBe(true);
+		await Bun.sleep(CHECK_INTERVAL_MS * 2);
+		expect(published).toHaveBeenCalledTimes(1);
+		expect((await row(id))?.status).toBe("cancelled");
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
+		const [notice] = await notices();
+		expect(notice?.kind).toBe("bg_bash");
+		if (notice?.kind === "bg_bash") expect(notice.task.status).toBe("cancelled");
+		expect(wakes).toEqual([]);
+	});
+
+	test("shutdown clears a pending publication retry for restart recovery", async () => {
+		const published = spyOn(backgroundTaskService, "markCompleted").mockRejectedValue(
+			new Error("temporary publication failure"),
+		);
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await start(buffer, "READY", { kind: "offset", offset: 2 });
+		output(buffer, "READY\r\n");
+		const deadline = Date.now() + 1_000;
+		while (published.mock.calls.length === 0 && Date.now() < deadline) await Bun.sleep(10);
+		expect(published).toHaveBeenCalledTimes(1);
+		expect(activeWatchIds(TERMINAL)).toContain(id);
+		suspendTerminalWatchesForShutdown();
+		await Bun.sleep(CHECK_INTERVAL_MS * 2);
+		expect(published).toHaveBeenCalledTimes(1);
+		expect((await row(id))?.status).toBe("running");
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
+		expect(await notices()).toEqual([]);
+	});
+
+	test("terminal exit during a publication retry preserves the frozen completion", async () => {
+		const publish = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+		let attempts = 0;
+		const published = spyOn(backgroundTaskService, "markCompleted").mockImplementation(
+			async (...args) => {
+				if (++attempts === 1) throw new Error("temporary publication failure");
+				return publish(...args);
+			},
+		);
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await start(buffer, "READY", { kind: "offset", offset: 2 });
+		output(buffer, "READY\r\n");
+		const deadline = Date.now() + 1_000;
+		while (published.mock.calls.length === 0 && Date.now() < deadline) await Bun.sleep(10);
+		expect(published).toHaveBeenCalledTimes(1);
+		output(buffer, "unrelated later output\r\n");
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).not.toContain("unrelated later output");
+		expect(published).toHaveBeenCalledTimes(2);
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("permanent publication failures have a bounded retry budget and release resources", async () => {
+		const published = spyOn(backgroundTaskService, "markCompleted").mockRejectedValue(
+			new Error("permanent publication failure"),
+		);
+		const schedule = globalThis.setTimeout;
+		const delays: number[] = [];
+		spyOn(globalThis, "setTimeout").mockImplementation(((
+			...args: Parameters<typeof setTimeout>
+		) => {
+			const [handler, delay, ...rest] = args;
+			const retry = PUBLISH_RETRY_DELAYS_MS.some((value) => value === delay);
+			if (retry && delay !== undefined) delays.push(delay);
+			return schedule(handler, retry ? 5 : delay, ...rest);
+		}) as typeof setTimeout);
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await start(buffer, "READY", { kind: "offset", offset: 2 });
+		output(buffer, "READY\r\n");
+		const deadline = Date.now() + 1_000;
+		while (activeWatchIds(TERMINAL).includes(id) && Date.now() < deadline) await Bun.sleep(10);
+		expect(delays).toEqual([...PUBLISH_RETRY_DELAYS_MS]);
+		expect(published).toHaveBeenCalledTimes(1 + PUBLISH_RETRY_DELAYS_MS.length);
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
+		expect((await row(id))?.status).toBe("running");
+		expect(await notices()).toEqual([]);
+	});
+
 	test("ending the buffer fails the watch after a last match attempt", async () => {
 		const buffer = newBuffer();
 		output(buffer, "$ ");
@@ -248,6 +445,34 @@ describe("terminal watch", () => {
 		output(buffer, "NEVER\r\n");
 		await Bun.sleep(CHECK_INTERVAL_MS * 2);
 		expect((await row(id))?.status).toBe("cancelled");
+	});
+
+	test.each([
+		["literal", "x".repeat(MAX_WATCH_PATTERN_CHARS + 1)],
+		["CRLF", `READY${"\r\n".repeat(MAX_WATCH_PATTERN_CHARS / 2)}`],
+	])("oversized %s service patterns reject before normalization and release both markers", async (_label, pattern) => {
+		const buffer = newBuffer();
+		output(buffer, "first row\r\nlast observed row\x1b[1A");
+		const point = await buffer.markReadCursor();
+		if (!point) throw new Error("missing point");
+		expect(point.observedEndMarker).not.toBe(point.marker);
+		const result = await startTerminalWatch({
+			narratorId: PARENT,
+			terminalId: TERMINAL,
+			terminalName: "T",
+			pattern,
+			timeoutMs: 1000,
+			buffer,
+			marker: point.marker,
+			observedEndMarker: point.observedEndMarker,
+			disposeMarkers: point.dispose,
+			start: { kind: "offset", offset: point.offset, textBefore: point.textBefore },
+		});
+		expect(result).toMatchObject({ status: "error", message: expect.stringContaining("exceeds") });
+		expect(point.marker.isDisposed).toBe(true);
+		expect(point.observedEndMarker?.isDisposed).toBe(true);
+		expect(buffer.cloneReadCursor(point)).toBeUndefined();
+		expect(db.select().from(backgroundTasks).all()).toEqual([]);
 	});
 
 	test("restart recovery reports a leftover watch as ended", async () => {

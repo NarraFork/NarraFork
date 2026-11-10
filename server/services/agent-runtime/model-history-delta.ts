@@ -1,10 +1,12 @@
 import { bodyBytesSql, bodySql } from "../../lib/narrator-bodies";
-import { modelJsonContainerBytes } from "./model-history-json";
+import { ModelHistoryBudget } from "./model-history-json";
 import {
 	assembleBlockBodies,
 	type HistoryQuery,
 	MODEL_HISTORY_BATCH_BYTES,
 	MODEL_HISTORY_MAX_BYTES,
+	MODEL_HISTORY_TOOL_CLEARED_SQL,
+	MODEL_HISTORY_TOOL_INPUT_SQL,
 	type ModelHistoryCounters,
 	type ModelHistoryQueryOptions,
 	type ModelHistorySource,
@@ -18,10 +20,16 @@ export interface ModelHistoryManifest {
 		id: string;
 		seq: number;
 		bodyRevision: number;
+		rawBytes?: number;
 		jsonContainerBytes: number;
 		username: string | null;
 		title: string | null;
-		tools: Array<{ id: string; modelRevision: number; jsonContainerBytes: number }>;
+		tools: Array<{
+			id: string;
+			modelRevision: number;
+			rawBytes?: number;
+			jsonContainerBytes: number;
+		}>;
 	}>;
 }
 export function modelHistoryManifest(source: ModelHistorySource): ModelHistoryManifest {
@@ -31,12 +39,14 @@ export function modelHistoryManifest(source: ModelHistorySource): ModelHistoryMa
 			id: row.id,
 			seq: row.seq,
 			bodyRevision: row.bodyRevision,
+			rawBytes: row.rawBytes,
 			jsonContainerBytes: row.jsonContainerBytes ?? 0,
 			username: row.creator?.username ?? null,
 			title: row.narrator?.title ?? null,
 			tools: row.toolCalls.map((tool) => ({
 				id: tool.id,
 				modelRevision: tool.modelRevision,
+				rawBytes: tool.rawBytes,
 				jsonContainerBytes: tool.jsonContainerBytes ?? 0,
 			})),
 		})),
@@ -66,18 +76,18 @@ export async function queryModelHistoryDelta(
 	};
 	const maxBytes = Math.min(options.maxBytes ?? MODEL_HISTORY_MAX_BYTES, MODEL_HISTORY_MAX_BYTES);
 	const fromBlocks = options.bodiesFromBlocks === true;
-	const remainingBytes = () => maxBytes - (counters.preparedBytes ?? 0);
-	const check = (bytes = 0, rows = 0, objectBytes = 0) => {
-		if (Date.now() >= options.deadline)
-			throw new Error("Model history preparation exceeded 10s budget");
-		counters.preparedBytes = (counters.preparedBytes ?? 0) + bytes * 4 + rows * 1024 + objectBytes;
-		if (counters.preparedBytes > maxBytes)
-			throw new Error("Model history preparation exceeded 128MiB budget");
+	const budget = new ModelHistoryBudget(maxBytes, options.signal);
+	const measuredBytes = (sizes: Map<string, number>, id: string): number => {
+		const bytes = sizes.get(id);
+		if (bytes === undefined) throw new Error("Model history snapshot contains unmeasured rows");
+		return bytes;
 	};
+	budget.check();
 	const compact = await query<{ seq: number }>(
 		"SELECT seq FROM narrator_message_refs WHERE narrator_id=? AND is_compact=1 ORDER BY seq DESC LIMIT 1",
 		[options.narratorId],
 	);
+	budget.check();
 	const compactSeq = compact[0]?.seq ?? null;
 	if (compactSeq !== previous.compactSeq) throw new Error("Model history delta structure changed");
 	type Ref = {
@@ -86,15 +96,13 @@ export async function queryModelHistoryDelta(
 		bodyRevision: number;
 		username: string | null;
 		title: string | null;
-		bytes: number;
 	};
 	const refs: Ref[] = [];
 	let cursor = compactSeq ?? Number.MIN_SAFE_INTEGER;
 	for (;;) {
-		check();
+		budget.check();
 		const page = await query<Ref>(
-			`SELECT m.id, r.seq, m.body_revision AS "bodyRevision", u.username, n.title,
-		 ${bodyBytesSql("m", fromBlocks)}+coalesce(length(CAST(m.content_text AS BLOB)),0) AS bytes
+			`SELECT m.id, r.seq, m.body_revision AS "bodyRevision", u.username, n.title
 		 FROM narrator_message_refs r JOIN narrator_messages m ON m.id=r.message_id
 		 LEFT JOIN users u ON u.id=m.created_by
 		 LEFT JOIN narrators n ON n.id=coalesce(m.author_narrator_id, m.narrator_id)
@@ -109,7 +117,7 @@ export async function queryModelHistoryDelta(
 			const old = previous.messages[refs.length];
 			if (old && (old.id !== row.id || old.seq !== row.seq))
 				throw new Error("Model history delta structure changed");
-			check(Number(row.bytes), 1);
+			budget.reserve(0, 1);
 			refs.push(row);
 		}
 		cursor = page[page.length - 1].seq;
@@ -118,44 +126,58 @@ export async function queryModelHistoryDelta(
 		throw new Error("Model history delta structure changed");
 	counters.refs = refs.length;
 	const oldById = new Map(previous.messages.map((row) => [row.id, row]));
-	const oldToolOverheads = new Map(
-		previous.messages.flatMap((row) =>
-			row.tools.map((tool) => [tool.id, tool.jsonContainerBytes] as const),
-		),
+	const oldTools = new Map(
+		previous.messages.flatMap((row) => row.tools.map((tool) => [tool.id, tool] as const)),
 	);
-	const oldToolRevisions = new Map(
-		previous.messages.flatMap((row) =>
-			row.tools.map((tool) => [tool.id, tool.modelRevision] as const),
-		),
-	);
-	const decode = (value: unknown) => (typeof value === "string" ? JSON.parse(value) : value);
 	for (let offset = 0; offset < refs.length; offset += 200) {
 		const page = refs.slice(offset, offset + 200);
 		const reused = page.filter((row) => {
 			const old = oldById.get(row.id);
 			return (
 				old &&
+				old.rawBytes !== undefined &&
 				old.bodyRevision === row.bodyRevision &&
 				old.username === row.username &&
 				old.title === row.title
 			);
 		});
 		if (reused.length) {
-			for (const row of reused) check(0, 0, oldById.get(row.id)?.jsonContainerBytes ?? 0);
+			for (const row of reused) {
+				const old = oldById.get(row.id);
+				if (!old) throw new Error("Model history delta structure changed");
+				budget.reserve(old.rawBytes, 0, old.jsonContainerBytes);
+			}
 			await send({ type: "reuseBodies", ids: reused.map((row) => row.id) });
 			counters.reusedBodies = (counters.reusedBodies ?? 0) + reused.length;
 		}
 		const reusedIds = new Set(reused.map((row) => row.id));
 		const changed = page.filter((row) => !reusedIds.has(row.id));
+		const bodySizes = new Map<string, number>();
+		if (changed.length) {
+			budget.check();
+			const sizes = await query<{ id: string; bytes: number }>(
+				`SELECT m.id, coalesce(${bodyBytesSql("m", fromBlocks)},0)+coalesce(length(CAST(m.content_text AS BLOB)),0) AS bytes
+				 FROM narrator_messages m WHERE m.id IN (${changed.map(() => "?").join(",")})`,
+				changed.map((row) => row.id),
+			);
+			if (sizes.length !== changed.length)
+				throw new Error("Model history snapshot contains missing messages");
+			for (const row of sizes) {
+				const bytes = Number(row.bytes);
+				budget.reserve(bytes);
+				bodySizes.set(row.id, bytes);
+			}
+		}
 		for (let index = 0; index < changed.length; ) {
 			let end = index;
 			let bytes = 0;
 			while (
 				end < changed.length &&
-				(end === index || bytes + Number(changed[end].bytes) <= MODEL_HISTORY_BATCH_BYTES)
+				(end === index ||
+					bytes + measuredBytes(bodySizes, changed[end].id) <= MODEL_HISTORY_BATCH_BYTES)
 			)
-				bytes += Number(changed[end++].bytes);
-			check();
+				bytes += measuredBytes(bodySizes, changed[end++].id);
+			budget.check();
 			const batch = changed.slice(index, end);
 			const ids = batch.map((row) => row.id);
 			const bodies = await query<
@@ -178,23 +200,22 @@ export async function queryModelHistoryDelta(
 			const fromRows = await assembleBlockBodies(
 				query,
 				bodies.filter((body) => body.contentJson === null).map((body) => body.id),
-				options.deadline,
-				remainingBytes,
+				budget,
 			);
 			const byId = new Map(
 				bodies.map(({ username, title, ...body }) => {
 					const assembled = fromRows.get(body.id);
-					const jsonContainerBytes =
-						assembled?.jsonContainerBytes ??
-						modelJsonContainerBytes(body.contentJson, options.deadline, remainingBytes());
-					check(0, 0, jsonContainerBytes);
+					const parsed = assembled
+						? { value: assembled.content, jsonContainerBytes: assembled.jsonContainerBytes }
+						: budget.parse(body.contentJson);
 					return [
 						body.id,
 						{
 							...body,
-							jsonContainerBytes,
+							rawBytes: measuredBytes(bodySizes, body.id),
+							jsonContainerBytes: parsed.jsonContainerBytes,
 							seq: batch.find((row) => row.id === body.id)?.seq ?? 0,
-							contentJson: assembled ? assembled.content : decode(body.contentJson),
+							contentJson: parsed.value,
 							creator: username == null ? null : { username },
 							narrator: { title },
 							toolCalls: [],
@@ -213,26 +234,29 @@ export async function queryModelHistoryDelta(
 		let messageId = "";
 		let toolId = "";
 		for (;;) {
-			check();
+			budget.check();
 			const tools = await query<{
 				id: string;
 				messageId: string;
 				modelRevision: number;
-				bytes: number;
 			}>(
-				`SELECT id,message_id AS "messageId",model_revision AS "modelRevision",
-				 coalesce(length(CAST(input_json AS BLOB)),0)+coalesce(length(CAST(output_json AS BLOB)),0) AS bytes
+				`SELECT id,message_id AS "messageId",model_revision AS "modelRevision"
 				 FROM narrator_tool_calls WHERE message_id IN (${placeholders}) AND (message_id>? OR (message_id=? AND id>?))
 				 ORDER BY message_id,id LIMIT 200`,
 				[...ids, messageId, messageId, toolId],
 			);
 			counters.toolQueries++;
 			if (!tools.length) break;
-			const reusedTools = tools.filter(
-				(tool) => oldToolRevisions.get(tool.id) === tool.modelRevision,
-			);
+			const reusedTools = tools.filter((tool) => {
+				const old = oldTools.get(tool.id);
+				return old?.rawBytes !== undefined && old.modelRevision === tool.modelRevision;
+			});
 			if (reusedTools.length) {
-				for (const tool of reusedTools) check(0, 0, oldToolOverheads.get(tool.id) ?? 0);
+				for (const tool of reusedTools) {
+					const old = oldTools.get(tool.id);
+					if (!old) throw new Error("Model history delta structure changed");
+					budget.reserve(old.rawBytes, 1, old.jsonContainerBytes);
+				}
 				await send({
 					type: "reuseTools",
 					rows: reusedTools.map(({ id, messageId }) => ({ id, messageId })),
@@ -241,20 +265,36 @@ export async function queryModelHistoryDelta(
 			}
 			const kept = new Set(reusedTools.map((tool) => tool.id));
 			const changedTools = tools.filter((tool) => !kept.has(tool.id));
-			for (const tool of tools) check(Number(tool.bytes), 1);
+			const toolSizes = new Map<string, number>();
+			if (changedTools.length) {
+				budget.check();
+				const sizes = await query<{ id: string; bytes: number }>(
+					`SELECT id, CASE WHEN ${MODEL_HISTORY_TOOL_CLEARED_SQL} THEN 0 ELSE coalesce(length(CAST(input_json AS BLOB)),0) END+coalesce(length(CAST(output_json AS BLOB)),0) AS bytes
+					 FROM narrator_tool_calls WHERE id IN (${changedTools.map(() => "?").join(",")})`,
+					changedTools.map((tool) => tool.id),
+				);
+				if (sizes.length !== changedTools.length)
+					throw new Error("Model history snapshot contains missing tool rows");
+				for (const tool of sizes) {
+					const bytes = Number(tool.bytes);
+					budget.reserve(bytes, 1);
+					toolSizes.set(tool.id, bytes);
+				}
+			}
 			for (let index = 0; index < changedTools.length; ) {
 				let end = index;
 				let bytes = 0;
 				while (
 					end < changedTools.length &&
-					(end === index || bytes + Number(changedTools[end].bytes) <= MODEL_HISTORY_BATCH_BYTES)
+					(end === index ||
+						bytes + measuredBytes(toolSizes, changedTools[end].id) <= MODEL_HISTORY_BATCH_BYTES)
 				)
-					bytes += Number(changedTools[end++].bytes);
-				check();
+					bytes += measuredBytes(toolSizes, changedTools[end++].id);
+				budget.check();
 				const toolIds = changedTools.slice(index, end).map((tool) => tool.id);
 				const bodies = await query<ModelToolSourceRow & { messageId: string }>(
 					`SELECT id,message_id AS "messageId",model_revision AS "modelRevision",execution_attempt AS "executionAttempt",created_at AS "createdAt",
-					 tool_use_id AS "toolUseId",tool_name AS "toolName",input_json AS "inputJson",output_json AS "outputJson",status
+					 tool_use_id AS "toolUseId",tool_name AS "toolName",${MODEL_HISTORY_TOOL_INPUT_SQL} AS "inputJson",output_json AS "outputJson",status
 					 FROM narrator_tool_calls WHERE id IN (${toolIds.map(() => "?").join(",")})`,
 					toolIds,
 				);
@@ -263,24 +303,14 @@ export async function queryModelHistoryDelta(
 				await send({
 					type: "tools",
 					rows: bodies.map((tool) => {
-						const inputBytes = modelJsonContainerBytes(
-							tool.inputJson,
-							options.deadline,
-							remainingBytes(),
-						);
-						const jsonContainerBytes =
-							inputBytes +
-							modelJsonContainerBytes(
-								tool.outputJson,
-								options.deadline,
-								remainingBytes() - inputBytes,
-							);
-						check(0, 0, jsonContainerBytes);
+						const input = budget.parse(tool.inputJson);
+						const output = budget.parse(tool.outputJson);
 						return {
 							...tool,
-							jsonContainerBytes,
-							inputJson: decode(tool.inputJson),
-							outputJson: decode(tool.outputJson),
+							rawBytes: measuredBytes(toolSizes, tool.id),
+							jsonContainerBytes: input.jsonContainerBytes + output.jsonContainerBytes,
+							inputJson: input.value,
+							outputJson: output.value,
 						};
 					}),
 				});
@@ -295,12 +325,15 @@ export async function queryModelHistoryDelta(
 		}
 	}
 	// The main side restores ref order after applying body/tool pages; it holds no provider arrays.
-	for (let offset = 0; offset < refs.length; offset += 200)
+	for (let offset = 0; offset < refs.length; offset += 200) {
+		budget.check();
 		await send({
 			type: "order",
 			reset: offset === 0,
 			ids: refs.slice(offset, offset + 200).map((row) => row.id),
 		});
-	check();
+	}
+	budget.check();
+	counters.preparedBytes = budget.preparedBytes;
 	return { counters, compactSeq };
 }

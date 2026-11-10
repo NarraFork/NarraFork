@@ -13,10 +13,11 @@
  *
  * `RAW_BODY_ACCESS` counts what each file still does to the column directly: the body
  * layer; readers where the column is the body (legacy envelopes, PG, the block read switch
- * off); and writes whose rows the sync queue builds from the column. The counts only go
- * down:
- *   - a raw access in an unlisted file, or more than its count, fails — read and write
- *     through the body layer instead;
+ * off); and writes whose rows the sync queue builds from the column. Ordinary readers and
+ * writers must use the body layer; a specialized body-layer owner needs an explicit audit
+ * and an exact inventory entry (retention's worker-prepared selective rewrite cannot run
+ * whole-envelope sync without reading unrelated tool payloads).
+ *   - a raw access in an unlisted file, or more than its audited count, fails;
  *   - fewer than its count fails too — lower it (drop the entry at zero).
  *
  * The scan is lexical over comment-stripped source: the column named in SQL
@@ -38,8 +39,16 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// The body layer.
 	"server/services/narrator-body-writes.ts": { count: 6, why: "body writes" },
 	"server/services/narrator-block-sync.ts": {
-		count: 4,
-		why: "the dual-write audit, column resync, the queued sync's column hash",
+		count: 7,
+		why: "dual-write audit, resync, queued column hash and three bounded retention-marker probes",
+	},
+	"server/services/storage-history-mutations.ts": {
+		count: 1,
+		why: "worker-prepared adopted payload rewrite under fence/admission/CAS; no whole-body sync",
+	},
+	"server/lib/db-worker/storage-history-query.ts": {
+		count: 6,
+		why: "isolated retention bytes/markers, pre-read budgets and legacy/queued body preparation",
 	},
 	"server/lib/narrator-bodies.ts": { count: 6, why: "body reads off the main thread" },
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
@@ -58,7 +67,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/db/postgres-schema.ts": { count: 8, why: "PG: the column is the body" },
 	"server/services/agent-runtime/model-history-revision-sql.ts": { count: 3, why: "triggers" },
 	"server/services/agent-runtime/model-history-fixture.ts": { count: 1, why: "trigger fixture" },
-	"server/lib/settings/defaults.ts": { count: 5, why: "switch descriptions" },
+	"server/lib/settings/defaults.ts": { count: 3, why: "switch descriptions" },
 	"server/db/test-role-migration.ts": { count: 4, why: "one-off role migration check" },
 	// Readers whose column branch serves block reads off (or PG), where it is the body.
 	"server/services/narrator-question-service.ts": { count: 3, why: "read switch off" },
@@ -185,7 +194,7 @@ describe("raw access to an envelope's body", () => {
 		expect(over, "read and write through narrator-body-reads/-writes instead").toEqual([]);
 	});
 
-	test("every count is current (the list only shrinks)", () => {
+	test("every audited owner count matches its current accesses", () => {
 		const stale = Object.entries(RAW_BODY_ACCESS)
 			.filter(([path, entry]) => (hits.get(path)?.length ?? 0) < entry.count)
 			.map(([path, entry]) => `${path}: ${hits.get(path)?.length ?? 0} < ${entry.count}`);

@@ -395,6 +395,13 @@ export const narrators = sqliteTable(
 		})
 			.notNull()
 			.default("inherit"),
+		/** AskUserQuestion 自动反思回答的三态覆盖：inherit = 跟随 settings.agent.questionReflectionEnabled，
+		 *  on/off = 本会话显式覆盖。 */
+		questionReflectionOverride: text("question_reflection_override", {
+			enum: ["inherit", "on", "off"],
+		})
+			.notNull()
+			.default("inherit"),
 		autoContinuationOverride: text("auto_continuation_override", {
 			enum: ["inherit", "always", "blockStop", "protectedOnly", "off"],
 		})
@@ -442,6 +449,19 @@ export const narrators = sqliteTable(
 		workspaceContext: text("workspace_context", { mode: "json" }).$type<
 			import("@shared/workspace-context").WorkspaceContext
 		>(),
+		/**
+		 * Per-execution-device working directories (`deviceId → { cwd, pathFlavor }`).
+		 *
+		 * `cwd` and `defaultDeviceId` above keep meaning "the currently effective
+		 * directory / device". This map is what a device switch restores from, and
+		 * the only thing the UI consults to decide whether a device still needs its
+		 * directory entered. Existing rows start empty and are backfilled lazily the
+		 * first time the current device's directory is written — no data migration.
+		 */
+		workspaceDirectories: text("workspace_directories", { mode: "json" })
+			.$type<import("@shared/workspace-directories").WorkspaceDirectoryMap>()
+			.notNull()
+			.default({}),
 		errorMessage: text("error_message"),
 		/**
 		 * Whether the last failure is worth retrying, when the provider diagnostics said so.
@@ -2306,6 +2326,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 	/** Block spacing (markdown block margins + transcript item gaps) multiplier. */
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	/** 最近标签中的会话是否显示工作目录；按账号同步，默认隐藏。 */
+	recentTabsShowDirectory: integer("recent_tabs_show_directory", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),
@@ -2381,6 +2405,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(false),
 	gitIdentityCreateModal: integer("git_identity_create_modal", { mode: "boolean" })
+		.notNull()
+		.default(false),
+	/** 侧栏文件夹右键菜单里的身份入口；与上面两个开关互相独立。 */
+	gitIdentityFolderContextMenu: integer("git_identity_folder_context_menu", { mode: "boolean" })
 		.notNull()
 		.default(false),
 	/**
@@ -2643,6 +2671,58 @@ export const userRecentTabs = sqliteTable(
 		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
+	],
+);
+
+// === recent_tab_archive_marks ===
+// Where a narrator sat in one user's sidebar when they archived it. Archiving removes the
+// sidebar row, and `folder_id` goes with it, so restoring would otherwise drop the session
+// back at the top of the list. This remembers the folder just long enough to put it back on
+// unarchive; one row per (user × narrator), overwritten by another archive, consumed by the
+// restore.
+export const recentTabArchiveMarks = sqliteTable(
+	"recent_tab_archive_marks",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** The sidebar folder the row was in; null when it sat at the top level. */
+		folderId: text("folder_id"),
+		archivedAt: text("archived_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_recent_tab_archive_mark").on(table.userId, table.narratorId)],
+);
+
+// === folder_git_identity_bindings ===
+// Per (user × sidebar folder) choice of identity. A narrator with no pick of its own
+// inherits the folder it sits in before falling back to the user's default, so organising
+// sessions into folders is also how a person says "work commits as X".
+//
+// `folderId` is the folder's `user_recent_tabs.entity_id` (see `folder_id` above), not that
+// row's primary key, so it carries no foreign key: the sidebar service validates ownership
+// and a binding whose folder no longer exists is simply ignored. Deleting a folder is a
+// layout change and must not silently rewrite anyone's commit identity.
+export const folderGitIdentityBindings = sqliteTable(
+	"folder_git_identity_bindings",
+	{
+		id: text("id").primaryKey(),
+		folderId: text("folder_id").notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** The picked identity, which must belong to the same `userId` (enforced by the service). */
+		identityId: text("identity_id")
+			.notNull()
+			.references(() => userGitIdentities.id, { onDelete: "cascade" }),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_folder_git_identity_unique").on(table.folderId, table.userId),
+		index("idx_folder_git_identity_user").on(table.userId),
 	],
 );
 
@@ -3469,6 +3549,12 @@ export const workspaces = sqliteTable(
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
+		// Conservative migration/import default: existing names must never be auto-renamed.
+		titleSource: text("title_source", { enum: ["default", "auto", "manual"] })
+			.notNull()
+			.default("manual"),
+		// Also invalidated when title inputs change, so generated candidates cannot become stale.
+		titleRevision: integer("title_revision").notNull().default(0),
 		/**
 		 * Serialized dockview layout — ARRANGEMENT ONLY.
 		 *
@@ -3569,6 +3655,8 @@ export const workspacePanels = sqliteTable(
 		 */
 		uniqueIndex("idx_workspace_panels_narrator").on(table.workspaceId, table.narratorId),
 		index("idx_workspace_panels_narrator_lookup").on(table.narratorId),
+		// Cursor-paged outline invalidation never scans layouts or non-outline memberships.
+		index("idx_workspace_panels_kind_workspace").on(table.kind, table.workspaceId, table.id),
 	],
 );
 
@@ -3581,6 +3669,11 @@ export const apiRequests = sqliteTable(
 		/** Request initiator, frozen at start; null for unknown legacy/system usage.
 		 * No FK: removing a user must not rewrite the accounting identity. */
 		userId: text("user_id"),
+		/** Who pays: the owner of the (root) narrator, else the initiator. Frozen at write.
+		 * Differs from userId when a collaborator drives someone else's narrator. No FK. */
+		billingUserId: text("billing_user_id"),
+		/** The narrator's primary project at request time; never rewritten. No FK. */
+		projectId: text("project_id"),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		// 外部 Agent 写入时可自带的叙述者文本（无 narrator 关联时用于占位显示）
 		agentLabel: text("agent_label"),
@@ -3666,6 +3759,45 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 	lastUsedAt: text("last_used_at").notNull(),
 });
 
+// === usage_daily ===
+// Durable per-day usage ledger: one row per (UTC day, billing user, project, provider,
+// credential, model), upserted in the same transaction as the api_requests detail row and
+// never touched by narrator cleanup. Backs usage analysis and budgets without scanning
+// api_requests. Key columns store "" for "none" so the unique index always matches.
+// Costs are reference-price USD (server/lib/model-pricing.ts).
+export const usageDaily = sqliteTable(
+	"usage_daily",
+	{
+		id: text("id").primaryKey(),
+		/** UTC calendar day, YYYY-MM-DD. */
+		day: text("day").notNull(),
+		billingUserId: text("billing_user_id").notNull(),
+		projectId: text("project_id").notNull(),
+		provider: text("provider").notNull(),
+		credentialId: text("credential_id").notNull(),
+		model: text("model").notNull(),
+		requestCount: integer("request_count").notNull().default(0),
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+		cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		costUsd: real("cost_usd").notNull().default(0),
+		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	},
+	(table) => [
+		// Natural key; leading `day` also serves every date-range read.
+		uniqueIndex("idx_usage_daily_key").on(
+			table.day,
+			table.billingUserId,
+			table.projectId,
+			table.provider,
+			table.credentialId,
+			table.model,
+		),
+	],
+);
+
 // === credential_usage_totals ===
 // Lifetime token/cost rollup per (provider, credential, model).
 //
@@ -3680,15 +3812,11 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 // server/lib/model-pricing.ts). For subscription-based access that is an
 // equivalent-consumption figure, not an amount actually billed.
 //
-// SCOPE — this is NOT a full ledger of the deployment's spend. Rows only exist
-// for providers that have credential management (codex). Anthropic and
-// OpenAI direct connections carry credentialId = null (see
-// usage-history-service.getCredentialName) and are deliberately not rolled up
-// here: a synthetic bucket would give every unrelated keyless provider one
-// shared row, and the natural key would stop meaning "one credential".
-// "How much has this deployment spent in total" is answered from `api_requests`
-// for as long as those rows live. Do not read a sum over this table as the
-// deployment total.
+// SCOPE — rows exist for every source that can be identified: pooled credentials
+// (codex accounts, plugins) and API connections (keyed by their stable connection
+// id, see lib/request-source.ts). Requests from an unidentifiable source are not
+// rolled up here, and neither are failed requests, so a sum over this table is not
+// a deployment total; use usage_daily for that.
 export const credentialUsageTotals = sqliteTable(
 	"credential_usage_totals",
 	{
@@ -5153,6 +5281,10 @@ export const knowledgeSubmissions = sqliteTable(
 		verdict: text("verdict", { enum: ["approve", "request_changes", "reject", "comment_only"] }),
 		findingsJson: text("findings_json", { mode: "json" }),
 		reviewedAt: text("reviewed_at"),
+		// When the AUTHOR opened this verdict. NULL = still unread, which is what the
+		// notification bell counts. Symmetric with `reviewedAt` on the other side of the same
+		// handshake: the reviewer marks the review, the author marks having read it.
+		authorReadAt: text("author_read_at"),
 		// The main revision produced when this submission was merged.
 		mergedRevisionId: text("merged_revision_id"),
 		createdAt: text("created_at").notNull(),
@@ -5168,6 +5300,9 @@ export const knowledgeSubmissions = sqliteTable(
 		index("idx_ks_reviewer_user").on(table.reviewerUserId),
 		index("idx_ks_collection").on(table.collectionId),
 		index("idx_ks_draft").on(table.draftId),
+		// Serves the author's unread-verdict count and the per-row "mark read" update: both
+		// filter on submitter + author_read_at IS NULL.
+		index("idx_ks_submitter_author_read").on(table.submitterUserId, table.authorReadAt),
 	],
 );
 

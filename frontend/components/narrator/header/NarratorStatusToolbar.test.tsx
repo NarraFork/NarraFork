@@ -611,6 +611,7 @@ describe("HeaderToolbar saved recordings entry", () => {
 						}}
 						inlineControls={{
 							executionDevicesQuery: { data: { devices: [] } },
+							onRequireDeviceDirectory: () => {},
 							updateExecutionDeviceMutation: { isPending: false, mutate: () => {} },
 							renderLod: 4,
 							renderLodIsDefault: true,

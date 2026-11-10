@@ -1,0 +1,1 @@
+CREATE INDEX "idx_workspace_panels_kind_workspace" ON "workspace_panels" USING btree ("kind","workspace_id","id");

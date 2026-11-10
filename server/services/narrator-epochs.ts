@@ -30,6 +30,7 @@ import {
 import { resolveToolJsonSchema, toolRegistry } from "../lib/agent/tool-registry";
 import type { ToolDefinition } from "../lib/agent/types";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { sqliteErrorCode } from "../lib/db-resilience";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -256,9 +257,13 @@ export async function reconcileEpoch(input: ReconcileEpochInput): Promise<Reconc
 				return { ...result, ...(loading ? { loading } : {}) };
 			} catch (error) {
 				if (error instanceof PrefixContextChangedError) throw error;
+				// A lock here terminates the whole loop, so keep the origin identifiable:
+				// the message alone cannot tell BUSY from BUSY_SNAPSHOT, nor which write.
 				logger.warn("Prefix epoch could not be prepared", {
 					narratorId: input.narratorId,
 					error: String(error),
+					code: sqliteErrorCode(error),
+					stack: error instanceof Error ? error.stack : undefined,
 				});
 				throw new ToolEpochError(error);
 			}

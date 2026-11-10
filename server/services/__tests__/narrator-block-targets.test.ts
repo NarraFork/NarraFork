@@ -6,7 +6,7 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -16,6 +16,7 @@ mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
 const { narratorStore } = await import("../narrator-store");
 const { settings } = await import("../../lib/settings");
+const compactJson = settings.narratorBlocks.compactJson;
 const blockSync = await import("../narrator-block-sync");
 const targets = await import("../narrator-block-targets");
 const session = await import("../narrator-session");
@@ -34,6 +35,7 @@ beforeEach(() => {
 });
 afterEach(() => {
 	settings.narratorBlocks.write = true;
+	settings.narratorBlocks.compactJson = compactJson;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -59,10 +61,7 @@ function rows(messageId: string): Row[] {
 }
 
 function content(messageId: string): Array<Record<string, unknown>> {
-	const row = sqlite
-		.prepare("SELECT content_json AS json FROM narrator_messages WHERE id = ?")
-		.get(messageId) as { json: string } | null;
-	return row ? JSON.parse(row.json) : [];
+	return readTestMessageContent(sqlite, messageId);
 }
 
 function assembled(messageId: string): unknown[] {
@@ -168,6 +167,8 @@ describe("resolving block ids", () => {
 	});
 
 	test("a tool block's call element is found past elements that ride with it", async () => {
+		// Exercise a legacy writer changing the dual-written projection.
+		settings.narratorBlocks.compactJson = false;
 		const stepId = await step();
 		const tool = content(stepId).find((element) => element.type === "tool_use");
 		// Content written outside the store: an element without a block of its own leads.
@@ -192,6 +193,7 @@ describe("resolving block ids", () => {
 	});
 
 	test("an envelope waiting in the sync queue is brought current first", async () => {
+		settings.narratorBlocks.compactJson = false;
 		const stepId = await step();
 		const kept = blockOf(stepId, "tool");
 		sqlite.run("UPDATE narrator_messages SET content_json = ? WHERE id = ?", [

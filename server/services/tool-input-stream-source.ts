@@ -84,6 +84,8 @@ export interface ToolInputStreamSourceOptions {
 	readTimeoutMs?: number;
 	/** Only trusted bounded readers may take over a source; the production singleton retains raw storage. */
 	readPersisted?: PersistedRangeReader;
+	/** Bounded durable-marker probe; injected only by the production singleton. */
+	isPayloadCleared?: (toolCallId: string, executionAttempt?: number) => Promise<boolean>;
 	loadHistoricalIdentity?: (
 		narratorId: string,
 		toolUseId: string,
@@ -345,6 +347,7 @@ export class ToolInputStreamSourceService {
 				toolUseId,
 				reference,
 			);
+			if (metadata.payloadCleared) throw sourceError("TEXT_DOCUMENT_HISTORY_CLEARED", 410);
 			row = {
 				toolCallId: metadata.id,
 				messageId: metadata.messageId,
@@ -790,6 +793,7 @@ export class ToolInputStreamSourceService {
 					const count = Math.min(limit, TEXT_DOCUMENT_PAGE_CHARS, state.ref.length - offset);
 					const ref = this.descriptor(refId);
 					const text = await this.readText(state, offset, count, controller.signal);
+					this.require(refId, narratorId);
 					const range = { ref, offset, text };
 					if (Buffer.byteLength(JSON.stringify(range)) > TEXT_DOCUMENT_PACKET_BYTES)
 						throw sourceError("TEXT_DOCUMENT_PACKET_LIMIT", 413);
@@ -880,6 +884,15 @@ export class ToolInputStreamSourceService {
 		this.invalidateHistoricalIdentity(alias);
 		const state = this.require(refId);
 		await state.tail;
+		this.require(refId);
+		if (
+			alias.toolCallId &&
+			(await this.options.isPayloadCleared?.(alias.toolCallId, alias.executionAttempt))
+		) {
+			await this.discard(refId);
+			throw sourceError("TEXT_DOCUMENT_HISTORY_CLEARED", 410);
+		}
+		this.require(refId);
 		if (!alias.toolCallId || !alias.messageId || finalLength !== state.ref.length)
 			throw sourceError("TEXT_DOCUMENT_HANDOFF_MISMATCH");
 		if (!state.ref.source) throw sourceError("TEXT_DOCUMENT_INVALID_SOURCE");
@@ -919,6 +932,23 @@ export class ToolInputStreamSourceService {
 		if (state.path) await unlink(state.path).catch(() => {});
 		state.file = undefined;
 		state.path = undefined;
+	}
+
+	/** Revoke original/spilled copies synchronously, then remove their files asynchronously. */
+	async clearRetainedToolPayload(alias: HistoricalWriteDocumentReference): Promise<void> {
+		this.invalidateHistoricalIdentity(alias);
+		const ids: string[] = [];
+		for (const [id, state] of this.sources) {
+			if (
+				state.ref.source?.toolCallId !== alias.toolCallId ||
+				state.ref.source.messageId !== alias.messageId ||
+				state.ref.source.executionAttempt !== alias.executionAttempt
+			)
+				continue;
+			state.closed = true;
+			ids.push(id);
+		}
+		await Promise.all(ids.map((id) => this.discard(id)));
 	}
 
 	async discard(refId: string): Promise<void> {
@@ -972,6 +1002,21 @@ export const toolInputStreamSource = hotSafe(
 	"toolInputStreamSource",
 	() =>
 		new ToolInputStreamSourceService({
+			isPayloadCleared: async (toolCallId, executionAttempt) => {
+				const { sqlite, activeDatabaseBackend } = await import("../db");
+				if (activeDatabaseBackend !== "sqlite") return false;
+				const { CLEARED_TOOL_OUTPUT_SQL } = await import("./narrator-block-sync");
+				const row = sqlite
+					.query<{ cleared: number; attempt: number }, [string]>(
+						`SELECT (${CLEARED_TOOL_OUTPUT_SQL}) AS cleared, execution_attempt AS attempt FROM narrator_tool_calls WHERE id = ?`,
+					)
+					.get(toolCallId);
+				return (
+					!row ||
+					!!row.cleared ||
+					(executionAttempt !== undefined && row.attempt !== executionAttempt)
+				);
+			},
 			// A short content field does not imply a small row (output/other input metadata may be huge).
 			// Retain bounded raw memory/spill; historical regeneration reads ONLY input_json in a Worker.
 			slowLog: (metadata) => {

@@ -51,8 +51,9 @@ export function deriveCodexWindowId(conversationId: string): string {
 
 export function createCodexRequestIdentity(
 	conversationId: string = randomUUID(),
+	/** The credential's own device id; absent = this instance's installation id. */
+	installationId: string = getInstallationId(),
 ): CodexRequestIdentity {
-	const installationId = getInstallationId();
 	return {
 		conversationId,
 		clientMetadata: {
