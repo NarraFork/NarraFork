@@ -31,7 +31,6 @@ import {
 	useRef,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { reportLineDisplay } from "../../lib/outline-report-line";
 import { type OutlineHrefTarget, outlineTargetHref } from "../../lib/outline-href";
 import { isOpenClick, wantsNewPanel } from "../../lib/outline-opener";
 import {
@@ -41,6 +40,7 @@ import {
 	outlinePanelTitle,
 	sameOutlinePanelState,
 } from "../../lib/outline-panel";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineSurfaceHistory, OutlineSurfaceLoaded } from "./OutlineSurface";
 import { OutlineView } from "./OutlineView";
 import type { OutlineLinkProps, OutlineTarget } from "./outline-nav";
@@ -82,8 +82,7 @@ export function OutlinePanelContent({
 	const { t, i18n } = useTranslation("outline");
 	// The tab's name is shown, not stored: a report container's line reads as on its page.
 	const shownTitle = useRef((title: string) => title);
-	shownTitle.current = (title) =>
-		reportLineDisplay(title, { t, locale: i18n?.language }) ?? title;
+	shownTitle.current = (title) => reportLineDisplay(title, { t, locale: i18n?.language }) ?? title;
 	const stateRef = useRef(state);
 	stateRef.current = state;
 	const handlers = useRef({ onChange, onOpenNew, onTitle });

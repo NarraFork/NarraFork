@@ -22,7 +22,6 @@ import type { OutlineSpaceKind, OutlineSpaceSummary } from "@shared/outline-api"
 import { IconFolder, IconMessages, IconSearch, IconUser } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { reportLineDisplay } from "../../lib/outline-report-line";
 import {
 	useEnsurePersonalOutlineSpace,
 	useOutlineSearch,
@@ -30,6 +29,7 @@ import {
 } from "../../hooks/useOutline";
 import { formatSmartTime } from "../../lib/format";
 import { readOutlineRecents } from "../../lib/outline-recents";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
