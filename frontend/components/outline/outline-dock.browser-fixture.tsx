@@ -26,6 +26,7 @@ import { I18nextProvider, initReactI18next } from "react-i18next";
 import { type OutlineOpener, useOutlineOpener } from "../../lib/outline-opener";
 import type { OutlinePanelState } from "../../lib/outline-panel";
 import outlineEn from "../../locales/en/outline.json";
+import outlineZh from "../../locales/zh-CN/outline.json";
 import { DockviewSurface } from "../dockview";
 import { InlineComposerEditor } from "../narrator/composer/InlineComposerEditor";
 import { dockPanelId } from "../narrator/dock/dock-panel-types";
@@ -36,9 +37,11 @@ import { liveSessionsOn, setLiveSessionGraceForTests } from "./editor/live-sessi
 import { overrideLiveTransportForTests } from "./editor/transport";
 
 const instance = i18next.createInstance();
-await instance
-	.use(initReactI18next)
-	.init({ lng: "en", resources: { en: { outline: outlineEn } }, react: { useSuspense: false } });
+await instance.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { outline: outlineEn }, "zh-CN": { outline: outlineZh } },
+	react: { useSuspense: false },
+});
 
 /** Sessions the server ended for this tab (a refused join among them), by close code. */
 const closedFrames: string[] = [];
@@ -207,6 +210,11 @@ export function open(options: { wsUrl: string }): void {
 			</QueryClientProvider>
 		</I18nextProvider>,
 	);
+}
+
+/** Switch the interface language (`en`, `zh-CN`). */
+export async function setLanguage(language: string): Promise<void> {
+	await instance.changeLanguage(language);
 }
 
 /** Open a place the way a tool card or a chat link does (Ctrl/Cmd: `newPanel`). */

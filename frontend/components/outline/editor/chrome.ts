@@ -1,15 +1,26 @@
 /**
- * A block's frame (folding arrow, bullet, checkbox, presence marker) and static body rendering,
- * as native DOM (no React root per block, design §6.7), shared with the mind map (§6.10). The
- * arrow and the checkbox are the read-only tree's Tabler icons as inline SVG
- * (`../outline-icons.ts`); the bullet is a dot drawn by CSS from the `has-kids` / `collapsed`
- * classes on the container.
+ * A block's frame (folding arrow, one marker, presence marker) and static body rendering, as
+ * native DOM (no React root per block, design §6.7), shared with the mind map (§6.10). The arrow
+ * and the checkbox are the read-only tree's Tabler icons as inline SVG (`../outline-icons.ts`);
+ * the bullet is a dot drawn by CSS from the `has-kids` / `collapsed` classes on the container.
+ *
+ * One marker per row (`rowMarker`): a task shows its checkbox, a question its mark, anything else
+ * the bullet. The arrow is always drawn for a block with children. The bullet is also how a block
+ * is focused; a row without one carries a focus handle (`Gutter.zoom`) that its owner places at
+ * the row's end and wires to the same action.
  */
 import { titleOf } from "@shared/outline";
 import type { OutlineTaskStatus } from "@shared/outline-api";
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
 import { DOMSerializer } from "prosemirror-model";
-import { FOLD_ICONS, QUESTION_ICON, setIcon, taskIconOf } from "../outline-icons";
+import {
+	FOCUS_ICON,
+	FOLD_ICONS,
+	QUESTION_ICON,
+	rowMarker,
+	setIcon,
+	taskIconOf,
+} from "../outline-icons";
 import { parseToPM } from "./convert";
 import { schema } from "./schema";
 
@@ -40,6 +51,11 @@ export const chromeText = {
 	pending: "Waiting for confirmation",
 	/** The mark of a question put to a person (`Ask`), where a task has its checkbox. */
 	question: "A question for a person: answered in the inbox. Deleting it withdraws it.",
+	/**
+	 * A subagent report's container line as a person reads it (their language and time zone), or
+	 * `null` for any other text (`lib/outline-report-line.ts`; set from the page's i18n).
+	 */
+	reportLine: ((_content: string) => null) as (content: string) => string | null,
 	/** A task's status, said by its icon in the "in progress" list. */
 	status: {
 		todo: "To do",
@@ -63,6 +79,11 @@ export interface Gutter {
 	bullet: HTMLElement;
 	check: HTMLElement;
 	peers: HTMLElement;
+	/**
+	 * The focus handle of a row without a bullet. Not inside `el`: the owner appends it where the
+	 * row ends (the outline floats it right, the mind map puts it after the body).
+	 */
+	zoom: HTMLElement;
 }
 
 export interface ChromeState {
@@ -90,7 +111,14 @@ export function createGutter(): Gutter {
 	const peers = document.createElement("span");
 	peers.className = "ob-peers";
 	el.append(arrow, bullet, check, peers);
-	return { el, arrow, bullet, check, peers };
+	const zoom = document.createElement("span");
+	zoom.className = "ob-zoom";
+	zoom.contentEditable = "false";
+	zoom.title = chromeText.focus;
+	zoom.setAttribute("role", "button");
+	zoom.setAttribute("aria-label", chromeText.focus);
+	setIcon(zoom, FOCUS_ICON);
+	return { el, arrow, bullet, check, peers, zoom };
 }
 
 /** Write the frame's state onto the container and the frame. */
@@ -101,6 +129,12 @@ export function applyChrome(container: HTMLElement, g: Gutter, s: ChromeState): 
 	container.dataset.task = s.task ?? "";
 	const question = !s.task && s.question === true;
 	container.dataset.question = question ? "1" : "";
+	// One marker: the bullet only where there is no checkbox or question mark, and then the
+	// focus handle stands in for it.
+	const marker = rowMarker({ task: !!s.task, question });
+	container.dataset.marker = marker;
+	g.bullet.style.display = marker === "bullet" ? "" : "none";
+	g.zoom.style.display = marker === "bullet" ? "none" : "";
 	g.check.classList.toggle("is-question", question);
 	if (question) {
 		setIcon(g.check, QUESTION_ICON);

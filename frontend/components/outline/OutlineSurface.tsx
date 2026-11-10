@@ -492,12 +492,7 @@ function SurfaceBody({
 		content = (
 			<>
 				<div className={classes.toolbar}>
-					<OutlineBreadcrumbs
-						view={view}
-						rootTitle={crumbs ? crumbs.title : rootTitle}
-						search={linkSearch}
-						path={crumbs?.path}
-					/>
+					<OutlineBreadcrumbs view={view} search={linkSearch} path={crumbs?.path} />
 					<Group gap="xs" wrap="nowrap">
 						{history && (
 							<Group gap={2} wrap="nowrap">

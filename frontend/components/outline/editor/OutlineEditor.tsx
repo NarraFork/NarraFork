@@ -35,6 +35,7 @@ import type { LiveCloseCode } from "@shared/outline-live-protocol";
 import { IconArrowDown, IconArrowRight, IconArrowsMaximize, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { reportLineDisplay } from "../../../lib/outline-report-line";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
 import type { OutlineViewState } from "../view-state";
@@ -186,7 +187,7 @@ function firstLine(text: string): string {
 
 function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSession }) {
 	const { focusId, lens, spaceKey, viewState, shared, pageId } = props;
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const client = shared.client;
 	useEffect(() => {
 		retainLiveSession(shared);
@@ -201,6 +202,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	// Structure refused while connecting: the "connecting" badge nudges.
 	const [nudge, setNudge] = useState(0);
 
+	// Stable per language: the editor caches report-line decorations by this function.
+	const reportLine = useMemo(
+		() => (content: string) => reportLineDisplay(content, { t, locale: i18n?.language }),
+		[t, i18n?.language],
+	);
 	chromeText.fold = t("page.collapse");
 	chromeText.focus = t("page.focus");
 	chromeText.task = t("editor.changeStatus");
@@ -211,6 +217,7 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.locked = (name) => t("lock.badge", { name });
 	chromeText.pending = t("pending.badge");
 	chromeText.question = t("editor.questionMark");
+	chromeText.reportLine = reportLine;
 	chromeText.status = {
 		todo: t("page.task.todo"),
 		doing: t("page.task.doing"),

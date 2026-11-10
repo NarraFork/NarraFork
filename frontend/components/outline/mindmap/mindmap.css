@@ -133,27 +133,25 @@
 	height: var(--nf-type-body-line);
 }
 
-/* A heading node's frame sits on the heading's first line (no effect on the node's size). */
-.nf-outline-editor .mm-node:has(> .mm-body > h1:first-child) > .ob-gutter {
-	height: var(--nf-type-h1-line);
-}
-
-.nf-outline-editor .mm-node:has(> .mm-body > h2:first-child) > .ob-gutter {
-	height: var(--nf-type-h2-line);
-}
-
-.nf-outline-editor .mm-node:has(> .mm-body > h3:first-child) > .ob-gutter {
-	height: var(--nf-type-h3-line);
-}
-
-/* `frameWidth(true)` (measure.ts): the arrow and the bullet, then the checkbox's column. */
+/*
+ * `frameWidth(true)` (measure.ts): the arrow, then the checkbox's column where the bullet would
+ * be. A task has ONE marker; its focus handle follows the body (`frameTail`).
+ */
 .nf-outline-editor .mm-node[data-task]:not([data-task=""]) > .ob-gutter {
-	width: calc(28px + var(--nf-outline-icon) + 4px);
+	width: calc(14px + var(--nf-outline-icon) + 4px);
 }
 
 .nf-outline-editor .mm-node .ob-arrow,
 .nf-outline-editor .mm-node .ob-bullet {
 	width: 14px;
+}
+
+.nf-outline-editor .mm-node > .ob-zoom {
+	float: none;
+	flex: none;
+	width: 14px;
+	margin-left: 0;
+	height: var(--nf-type-body-line);
 }
 
 .nf-outline-editor .mm-node .mm-body {
@@ -189,19 +187,11 @@
 	min-height: 0;
 }
 
-.nf-outline-editor .mm-node .mm-body h1 {
-	font-size: var(--nf-type-h1-size);
-	line-height: var(--nf-type-h1-line);
-}
-
-.nf-outline-editor .mm-node .mm-body h2 {
-	font-size: var(--nf-type-h2-size);
-	line-height: var(--nf-type-h2-line);
-}
-
-.nf-outline-editor .mm-node .mm-body h3 {
-	font-size: var(--nf-type-h3-size);
-	line-height: var(--nf-type-h3-line);
+/* A heading inside a node is body text in bold, as `measure.ts` measures it. */
+.nf-outline-editor .mm-node .mm-body :is(h1, h2, h3) {
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+	font-weight: 700;
 }
 
 .nf-outline-editor .mm-node .mm-body code {

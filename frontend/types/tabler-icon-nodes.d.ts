@@ -13,6 +13,10 @@ declare module "@tabler/icons-react/dist/esm/icons/IconChevronRight.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }
 
+declare module "@tabler/icons-react/dist/esm/icons/IconFocusCentered.mjs" {
+	export const __iconNode: import("@tabler/icons-react").IconNode;
+}
+
 declare module "@tabler/icons-react/dist/esm/icons/IconHelpCircle.mjs" {
 	export const __iconNode: import("@tabler/icons-react").IconNode;
 }

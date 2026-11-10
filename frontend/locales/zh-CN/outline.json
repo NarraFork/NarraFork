@@ -246,6 +246,22 @@
 	"workspace": {
 		"addTitle": "添加大纲页"
 	},
+	"crumbs": {
+		"label": "这一页的位置",
+		"more_one": "还有 {{count}} 层",
+		"more_other": "还有 {{count}} 层"
+	},
+	"reportLine": {
+		"title": "子代理报告",
+		"lateEnded": "迟到的子代理报告（派出后任务已被结束）",
+		"lateReopened": "迟到的子代理报告（派出后任务已退回待办）",
+		"lateTakenOver": "迟到的子代理报告（派出后任务已转手）",
+		"from": "来自 {{name}}",
+		"timedOut": "未完成：超时",
+		"failed": "未完成：出错",
+		"interrupted": "未完成：被中断",
+		"empty": "没有输出"
+	},
 	"lock": {
 		"badge": "已锁定 · {{name}}",
 		"someone": "某人",

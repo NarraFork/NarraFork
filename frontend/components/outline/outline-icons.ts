@@ -12,6 +12,7 @@ import { LIVE_STATUS_OF_TASK, type LiveTaskChar } from "@shared/outline-live-pro
 import {
 	IconChevronDown,
 	IconChevronRight,
+	IconFocusCentered,
 	IconHelpCircle,
 	type IconNode,
 	IconSquare,
@@ -23,6 +24,7 @@ import {
 // The same icons' SVG nodes (what each React component draws), for the native DOM frames.
 import { __iconNode as chevronDownNode } from "@tabler/icons-react/dist/esm/icons/IconChevronDown.mjs";
 import { __iconNode as chevronRightNode } from "@tabler/icons-react/dist/esm/icons/IconChevronRight.mjs";
+import { __iconNode as focusCenteredNode } from "@tabler/icons-react/dist/esm/icons/IconFocusCentered.mjs";
 import { __iconNode as helpCircleNode } from "@tabler/icons-react/dist/esm/icons/IconHelpCircle.mjs";
 import { __iconNode as squareNode } from "@tabler/icons-react/dist/esm/icons/IconSquare.mjs";
 import { __iconNode as squareCheckNode } from "@tabler/icons-react/dist/esm/icons/IconSquareCheck.mjs";
@@ -57,6 +59,28 @@ export const FOLD_ICONS: Record<"expanded" | "collapsed", OutlineIcon> = {
 	expanded: { name: "chevron-down", Icon: IconChevronDown, node: chevronDownNode },
 	collapsed: { name: "chevron-right", Icon: IconChevronRight, node: chevronRightNode },
 };
+
+/**
+ * The focus handle at the end of a row that has no bullet (a task, a question): the bullet is how
+ * a block is focused, and those rows show their checkbox or mark in its place.
+ */
+export const FOCUS_ICON: OutlineIcon = {
+	name: "focus-centered",
+	Icon: IconFocusCentered,
+	node: focusCenteredNode,
+};
+
+/** What a row shows where its text starts: exactly one of these, after the folding arrow. */
+export type OutlineRowMarker = "task" | "question" | "bullet";
+
+/**
+ * One marker per row (the read-only tree, the live editor's frame, the mind map's nodes): a
+ * task's checkbox, else a question's mark, else the bullet. The folding arrow is not a marker:
+ * it is always drawn for a block with children.
+ */
+export function rowMarker(row: { task: boolean; question: boolean }): OutlineRowMarker {
+	return row.task ? "task" : row.question ? "question" : "bullet";
+}
 
 /** The checkbox of a task as the live page writes it (`[ ]`, `[/]`, `[x]`, `[-]`). */
 export function taskIconOf(task: LiveTaskChar): OutlineIcon {

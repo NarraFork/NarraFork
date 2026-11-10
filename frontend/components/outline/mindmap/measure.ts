@@ -18,8 +18,9 @@
  * The fonts must be the ones `mindmap.css` gives `.mm-node`: named families (pretext measures
  * `system-ui` inaccurately on macOS), the app's own sans and mono stacks.
  *
- * Typography is the conversation's (外观 · 排版): body, heading, inline-code and code-block
- * sizes and line boxes come from `typographyMetrics()` / `headingMetrics()` at MEASURE time —
+ * Typography is the conversation's (外观 · 排版): body, inline-code and code-block sizes and
+ * line boxes come from `typographyMetrics()` at MEASURE time (a heading inside a node is body
+ * text in bold) —
  * the same numbers `mindmap.css` paints with through the `--nf-type-*` variables
  * (`shared/pretext-layout/typography-css.ts`). A change of setting changes the cache key
  * (`typographySignature`), the Worker request (it carries the setting) and the line box, so
@@ -31,12 +32,7 @@ import {
 	prepareRichInline,
 	type RichInlineItem,
 } from "@chenglou/pretext/rich-inline";
-import {
-	headingMetrics,
-	MONO_FAMILY,
-	SANS_FAMILY,
-	typographyMetrics,
-} from "@shared/pretext-layout/pretext-fonts";
+import { MONO_FAMILY, SANS_FAMILY, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
 import {
 	getTypography,
 	getTypographyRevision,
@@ -53,7 +49,9 @@ export const MAP_MONO_FAMILY = MONO_FAMILY;
 export const NODE = {
 	padX: 8,
 	padY: 4,
-	/** The arrow and the bullet (`.mm-node > .ob-gutter`, 14px each). */
+	/** A column of the frame: the arrow, the bullet, the focus handle (14px each). */
+	part: 14,
+	/** The arrow and the bullet of a node that is not a task (`.mm-node > .ob-gutter`). */
 	gutter: 28,
 	/** After a task's checkbox icon, before its text (`.ob-check`): see {@link frameWidth}. */
 	checkGap: 4,
@@ -83,8 +81,6 @@ export interface MapType {
 	/** Code blocks: the conversation's fenced-code font and line box. */
 	codeBlockFont: string;
 	codeBlockLineH: number;
-	/** Headings h1–h3: the conversation's markdown heading sizes and line boxes. */
-	heading: Record<1 | 2 | 3, { px: number; lineH: number }>;
 }
 
 let typeCache: MapType | null = null;
@@ -95,17 +91,12 @@ export function mapType(): MapType {
 	const revision = getTypographyRevision();
 	if (typeCache && typeRevision === revision) return typeCache;
 	const m = typographyMetrics();
-	const h = (level: 1 | 2 | 3) => {
-		const hm = headingMetrics(level);
-		return { px: hm.size, lineH: hm.lineHeight };
-	};
 	typeCache = {
 		px: m.size.sm,
 		lineH: m.line.body,
 		codeFont: `${m.size.xs}px ${MAP_MONO_FAMILY}`,
 		codeBlockFont: `${m.codeSize}px ${MAP_MONO_FAMILY}`,
 		codeBlockLineH: m.line.code,
-		heading: { 1: h(1), 2: h(2), 3: h(3) },
 	};
 	typeRevision = revision;
 	return typeCache;
@@ -412,11 +403,10 @@ function measureInline(
 function measureBodyContent(body: PMNode, maxW: number, labelOf: LabelOf): BodySize {
 	const t = mapType();
 	switch (body.type.name) {
-		case "heading": {
-			const h = t.heading[body.attrs.level as 1 | 2 | 3];
-			if (!h) return measureInline(body, t.px, t.lineH, true, maxW, labelOf);
-			return measureInline(body, h.px, h.lineH, true, maxW, labelOf);
-		}
+		// A heading inside a block is body text in bold (`mindmap.css`): never larger than a
+		// task's title, whatever its level.
+		case "heading":
+			return measureInline(body, t.px, t.lineH, true, maxW, labelOf);
 		case "quote": {
 			// A quote: 3 px left border + 8 px left padding.
 			const r = measureInline(body, t.px, t.lineH, false, maxW - 11, labelOf);
@@ -576,17 +566,27 @@ export function checkIconPx(): number {
 	return Math.min(Math.max(mapType().px + 2, 12), 24);
 }
 
-/** A node's frame: the arrow and the bullet, and a task's checkbox column (icon + gap). */
+/**
+ * A node's frame before its body (`.mm-node > .ob-gutter`): the arrow, then ONE marker: the
+ * bullet, or a task's checkbox column (icon + gap) in the bullet's place.
+ */
 export function frameWidth(task: boolean): number {
-	return NODE.gutter + (task ? checkIconPx() + NODE.checkGap : 0);
+	return task ? NODE.part + checkIconPx() + NODE.checkGap : NODE.gutter;
 }
 
-/** A node's outer size: padding + frame (arrow, bullet, checkbox) + body. */
+/**
+ * What follows a node's body: a task has no bullet, so the focus handle the bullet would be
+ * stands at its end (`.mm-node > .ob-zoom`).
+ */
+export function frameTail(task: boolean): number {
+	return task ? NODE.part : 0;
+}
+
+/** A node's outer size: padding + frame (arrow, marker) + body + a task's focus handle. */
 export function nodeSize(body: BodySize, task: boolean): { w: number; h: number; bodyW: number } {
 	const bodyW = Math.ceil(Math.max(NODE.minBody, body.w)) + 1;
-	const gutter = frameWidth(task);
 	return {
-		w: NODE.padX * 2 + gutter + bodyW + NODE.border * 2,
+		w: NODE.padX * 2 + frameWidth(task) + bodyW + frameTail(task) + NODE.border * 2,
 		h: NODE.padY * 2 + Math.max(mapType().lineH, body.h) + NODE.border * 2,
 		bodyW,
 	};

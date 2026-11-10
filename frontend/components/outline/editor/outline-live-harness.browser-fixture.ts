@@ -249,7 +249,14 @@ export async function openEditor(
 	h: Harness,
 	userId: string,
 	pageId: string,
-	options: { canWrite?: boolean; focusId?: string; lens?: "facts" | "all"; width?: number } = {},
+	options: {
+		canWrite?: boolean;
+		focusId?: string;
+		lens?: "facts" | "all";
+		width?: number;
+		/** The viewer's time zone (IANA), for what is shown in local time. */
+		timezone?: string;
+	} = {},
 ): Promise<Editor> {
 	const context = await h.browser.createBrowserContext();
 	h.contexts.push(context);
@@ -261,6 +268,7 @@ export async function openEditor(
 	const page = await context.newPage();
 	h.pages.push(page);
 	if (options.width) await page.setViewport({ width: options.width, height: 800 });
+	if (options.timezone) await page.emulateTimezone(options.timezone);
 	const errors: string[] = [];
 	page.on("pageerror", (error) => errors.push(String(error)));
 	await page.goto(h.server.url.origin);

@@ -12,6 +12,7 @@ import {
 	iconSvg,
 	type OutlineIcon,
 	QUESTION_ICON,
+	rowMarker,
 	setIcon,
 	TASK_ICONS,
 	taskIconOf,
@@ -131,6 +132,52 @@ describe("outline icons", () => {
 		// The bullet is drawn by CSS: no glyph in the DOM.
 		expect(g.bullet.textContent).toBe("");
 		expect(g.el.textContent).toBe("");
+	});
+
+	test("one marker per row: a task or a question drops the bullet and gets a focus handle", () => {
+		expect(rowMarker({ task: false, question: false })).toBe("bullet");
+		expect(rowMarker({ task: true, question: false })).toBe("task");
+		expect(rowMarker({ task: false, question: true })).toBe("question");
+		// A task that is also marked as a question is a task (the frame draws its checkbox).
+		expect(rowMarker({ task: true, question: true })).toBe("task");
+
+		const block = document.createElement("div");
+		const g = createGutter();
+		const shown = (el: HTMLElement) => el.style.display !== "none";
+		const markers = () =>
+			[shown(g.bullet) && "bullet", shown(g.check) && "check"].filter(Boolean).join("+");
+
+		applyChrome(block, g, { hasKids: true, collapsed: false, task: null });
+		expect(markers()).toBe("bullet");
+		expect(block.dataset.marker).toBe("bullet");
+		expect(shown(g.zoom)).toBe(false);
+		// The arrow is not a marker: always there for a block with children.
+		expect(g.arrow.dataset.icon).toBe("chevron-down");
+
+		for (const task of [" ", "/", "x", "-"] as LiveTaskChar[]) {
+			applyChrome(block, g, { hasKids: true, collapsed: false, task });
+			expect(markers()).toBe("check");
+			expect(block.dataset.marker).toBe("task");
+			expect(shown(g.zoom)).toBe(true);
+			expect(g.arrow.dataset.icon).toBe("chevron-down");
+		}
+
+		applyChrome(block, g, { hasKids: false, collapsed: false, task: null, question: true });
+		expect(markers()).toBe("check");
+		expect(block.dataset.marker).toBe("question");
+		expect(shown(g.zoom)).toBe(true);
+
+		// Back to a plain block: the bullet returns, the handle goes.
+		applyChrome(block, g, { hasKids: false, collapsed: false, task: null });
+		expect(markers()).toBe("bullet");
+		expect(shown(g.zoom)).toBe(false);
+
+		// The focus handle is an icon with the bullet's label, outside the gutter (its owner
+		// places it at the row's end).
+		expect(g.zoom.dataset.icon).toBe("focus-centered");
+		expect(g.zoom.getAttribute("aria-label")).toBe(chromeText.focus);
+		expect(g.zoom.textContent).toBe("");
+		expect(g.el.contains(g.zoom)).toBe(false);
 	});
 
 	test("an icon is built in the document it goes into, not the first one it was built for", () => {

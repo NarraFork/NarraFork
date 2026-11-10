@@ -668,7 +668,11 @@ for (const host of HOSTS) {
 		await settled(a);
 		expect(await focus()).toBe(t2);
 		await waitHost(t2);
-		expect((await a.call((f) => f.crumbs())).at(-1)).toBe("T2 编辑器文档只是投影");
+		// The breadcrumbs follow: they end at the block's parent (here the page), and never repeat
+		// the focused block's own title (the page title below them says it).
+		const crumbs = await a.call((f) => f.crumbs());
+		expect(crumbs.at(-1)).toBe(`Focus ${host}`);
+		expect(crumbs).not.toContain("T2 编辑器文档只是投影");
 		expect((await a.call((f) => f.selection()))?.head.blockId).toBe(t2);
 		await a.call((f, x) => f.caret(x as never, 0), t2a);
 		await press(a.page, "Alt", "ArrowRight");
@@ -1320,9 +1324,47 @@ test("page: a node's frame icons take real clicks: the checkbox cycles, the arro
 	await click(parent, "ob-arrow");
 	expect((await state(a)).collapsed).toContain(parent);
 	expect(await part(parent, "ob-arrow")).toMatchObject({ icon: "chevron-right" });
+	// One marker per node: a task has its checkbox and no bullet, a plain node its bullet.
+	const drawn = (id: string) =>
+		a.page.evaluate((x) => {
+			const node = document.querySelector<HTMLElement>(`.mm-node[data-id="${x}"]`);
+			const shows = (sel: string) => {
+				const el = node?.querySelector<HTMLElement>(sel);
+				return !!el && el.getBoundingClientRect().width > 0;
+			};
+			const zoom = node?.querySelector<HTMLElement>(":scope > .ob-zoom");
+			const zr = zoom?.getBoundingClientRect();
+			const nr = node?.getBoundingClientRect();
+			return {
+				bullet: shows(":scope > .ob-gutter > .ob-bullet"),
+				check: shows(":scope > .ob-gutter > .ob-check"),
+				// The focus handle, when drawn: inside the node's box, where it was measured.
+				zoom:
+					zr && nr && zr.width > 0
+						? {
+								x: zr.x + zr.width / 2,
+								y: zr.y + zr.height / 2,
+								inside: zr.right <= nr.right + 0.5,
+							}
+						: null,
+			};
+		}, id);
+	expect(await drawn(task)).toMatchObject({ bullet: false, check: true, zoom: { inside: true } });
+	expect(await drawn(parent)).toEqual({ bullet: true, check: false, zoom: null });
 	await click(parent, "ob-bullet");
 	await settled(a);
 	expect((await state(a)).focus).toBe(parent);
+	// A task has no bullet: its focus handle (after its text) focuses it, with a real click.
+	await a.call((f, x) => f.focusBlock(x as never), pageId);
+	await settled(a);
+	await a.call((f) => f.mapFit());
+	await a.call((f) => f.mapFlush());
+	const handle = (await drawn(task)).zoom;
+	if (!handle) throw new Error("no focus handle on the task node");
+	await a.page.mouse.click(handle.x, handle.y);
+	await settle(a);
+	await settled(a);
+	expect((await state(a)).focus).toBe(task);
 	expect(a.errors).toEqual([]);
 }, 60_000);
 

@@ -8,11 +8,12 @@ import type {
 import { IconLock } from "@tabler/icons-react";
 import { memo, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { reportLineDisplay } from "../../lib/outline-report-line";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { visibleRows } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
-import { FOLD_ICONS, QUESTION_ICON, TASK_ICONS } from "./outline-icons";
+import { FOCUS_ICON, FOLD_ICONS, QUESTION_ICON, rowMarker, TASK_ICONS } from "./outline-icons";
 import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 /** Indentation stops growing past this depth so deep outlines stay inside a phone's width. */
@@ -73,6 +74,11 @@ function FoldIcon({ collapsed }: { collapsed: boolean }) {
 	return <Icon size={14} />;
 }
 
+function FocusIcon() {
+	const { Icon } = FOCUS_ICON;
+	return <Icon size={14} />;
+}
+
 interface RowProps {
 	block: OutlineViewBlock;
 	depth: number;
@@ -94,8 +100,13 @@ const OutlineRow = memo(function OutlineRow({
 	search,
 	onToggle,
 }: RowProps) {
-	const { t } = useTranslation("outline");
+	const { t, i18n } = useTranslation("outline");
 	const done = block.task?.status === "done" || block.task?.status === "cancelled";
+	// One marker per row: a task's checkbox or a question's mark, else the bullet. The bullet is
+	// also how a block is focused, so a row without one gets a focus handle at its end.
+	const marker = rowMarker({ task: !!block.task, question: !!block.question });
+	// A subagent report's container line reads in the viewer's language and time zone.
+	const reportLine = reportLineDisplay(block.content, { t, locale: i18n?.language });
 	const focusLink = (children: React.ReactNode, className: string, label?: string) => (
 		<OutlineLink
 			to={outlineBlockTarget(spaceId, block.id, search.view, search.asOf)}
@@ -106,7 +117,7 @@ const OutlineRow = memo(function OutlineRow({
 		</OutlineLink>
 	);
 	return (
-		<div className={classes.row} data-block-id={block.id}>
+		<div className={classes.row} data-block-id={block.id} data-marker={marker}>
 			<span
 				className={classes.indent}
 				style={{ width: Math.min(depth, MAX_INDENT_DEPTH) * INDENT_PX }}
@@ -125,17 +136,24 @@ const OutlineRow = memo(function OutlineRow({
 					</ActionIcon>
 				)}
 			</span>
-			{focusLink(
-				<span className={classes.bulletDot} data-collapsed={hasChildren && collapsed} />,
-				classes.bullet,
-				t("page.focus"),
-			)}
-			{block.task && <OutlineTaskIcon status={block.task.status} />}
-			{!block.task && block.question && (
+			{marker === "bullet" &&
+				focusLink(
+					<span className={classes.bulletDot} data-collapsed={hasChildren && collapsed} />,
+					classes.bullet,
+					t("page.focus"),
+				)}
+			{marker === "task" && block.task && <OutlineTaskIcon status={block.task.status} />}
+			{marker === "question" && block.question && (
 				<OutlineQuestionIcon state={block.question.state} proceed={block.question.proceed} />
 			)}
 			<div className={classes.content} data-done={done}>
-				<OutlineBlockBody content={block.content} />
+				{reportLine !== null ? (
+					<span className="nf-type-scope" data-testid="outline-report-line" title={block.content}>
+						{reportLine}
+					</span>
+				) : (
+					<OutlineBlockBody content={block.content} />
+				)}
 				{(block.alias ||
 					block.tags.length > 0 ||
 					block.task?.assignee ||
@@ -217,6 +235,7 @@ const OutlineRow = memo(function OutlineRow({
 					</div>
 				)}
 			</div>
+			{marker !== "bullet" && focusLink(<FocusIcon />, classes.focusHandle, t("page.focus"))}
 		</div>
 	);
 });

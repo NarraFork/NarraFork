@@ -246,6 +246,22 @@
 	"workspace": {
 		"addTitle": "Add an outline page"
 	},
+	"crumbs": {
+		"label": "Where this page is",
+		"more_one": "{{count}} more level",
+		"more_other": "{{count}} more levels"
+	},
+	"reportLine": {
+		"title": "Subagent report",
+		"lateEnded": "Late subagent report (the task was ended after it was sent)",
+		"lateReopened": "Late subagent report (the task went back to do after it was sent)",
+		"lateTakenOver": "Late subagent report (the task changed hands after it was sent)",
+		"from": "from {{name}}",
+		"timedOut": "unfinished: timed out",
+		"failed": "unfinished: failed",
+		"interrupted": "unfinished: interrupted",
+		"empty": "no output"
+	},
 	"lock": {
 		"badge": "Locked · {{name}}",
 		"someone": "someone",
