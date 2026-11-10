@@ -36,7 +36,7 @@ import { sqliteErrorCode } from "../lib/db-resilience";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { refineContextDisplay } from "./context-display-refiners";
+import { baselineContextDisplays, refineContextDisplay } from "./context-display-refiners";
 import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
 import {
 	getPrefixToolDefinitions,
@@ -392,6 +392,16 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 				tools: await putPrefixToolDefinitions(definitions, signal),
 			};
 		}
+		// Reader-only: the summaries of the parts this baseline holds, for the epoch's first update
+		// row to be compared with. Stored on the marker; no part of the prefix or its hashes.
+		const baselineDisplays =
+			prefix && input.prompt
+				? baselineContextDisplays({
+						parts: prefix.parts,
+						keepParts: input.prompt.keepParts,
+						displays: input.prompt.displays,
+					})
+				: undefined;
 		const record: EpochRecord = {
 			reason:
 				targetChanged || profileChanged
@@ -413,6 +423,7 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 						...(profile.protocol ? { protocol: profile.protocol } : {}),
 					}
 				: { definitionSnapshots: definitions }),
+			...(baselineDisplays ? { baselineDisplays } : {}),
 		};
 		const marker = await withPrefixSnapshotPublication(
 			prefix ? [prefix.contract, prefix.tools, ...prefix.parts.map((part) => part.hash)] : [],
@@ -497,6 +508,7 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 				display: contextUpdateDisplayEntries(changes, input.prompt.displays),
 				messages,
 				epochId: epoch.markerId,
+				baseline: epoch.baselineDisplays,
 				signal,
 			}),
 		);

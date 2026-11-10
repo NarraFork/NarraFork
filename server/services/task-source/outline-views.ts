@@ -604,14 +604,14 @@ async function readTasksView(
 		...(read.truncated || delegated.more ? { more: true as const } : {}),
 	};
 	// Every open task read, by address under its state: what the next update is compared with
-	// (`refineTasksViewDisplay`). A task a subagent holds is delegated, whatever its checkbox says.
-	const handed = new Set(delegated.entries.map((entry) => entry.task.address));
-	const own = read.entries.filter((entry) => !handed.has(entry.ref.address));
+	// (`refineTasksViewDisplay`). The two reads do not overlap: a task a subagent holds on a live
+	// lease is delegated and is not among the session's own (`findContinuationCandidates` leaves
+	// out what another holder has claimed), so no address needs choosing between two states.
 	const table = boundOutlineTasksViewStates({
-		doing: addressesOf(own, "doing"),
-		delegated: [...handed],
-		waiting: addressesOf(own, "blocked"),
-		todo: addressesOf(own, "todo"),
+		doing: addressesOf(read.entries, "doing"),
+		delegated: delegated.entries.map((entry) => entry.task.address),
+		waiting: addressesOf(read.entries, "blocked"),
+		todo: addressesOf(read.entries, "todo"),
 	});
 	display.states = table.states;
 	if (table.cut || read.truncated || delegated.more) display.statesMore = true;

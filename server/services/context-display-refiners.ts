@@ -7,7 +7,9 @@
  * one, and returns the summary to store (the outline current-tasks view names the tasks that
  * were finished or started in between).
  *
- * The baseline is what the session was last SHOWN (its own stored rows), never a read cache.
+ * The baseline is what the session was last SHOWN, never a read cache: its previous row of the
+ * epoch, or, for the epoch's first row, the summary stored on the epoch marker beside the prefix
+ * baseline that held the part ({@link baselineContextDisplays}).
  * A refiner only shapes the reader's `display`: the model-facing update is rendered before it
  * runs and never reads it.
  *
@@ -18,6 +20,7 @@
 import { hotSafe } from "@server/lib/hot-safe";
 import type { DbMessage } from "@shared/agent-protocol/types";
 import {
+	boundContextUpdateDisplay,
 	type ContextUpdateBlockLike,
 	contextUpdateKeys,
 	contextUpdateOf,
@@ -27,9 +30,10 @@ import { logger } from "../lib/logger";
 export interface ContextDisplayRefineInput {
 	narratorId: string;
 	/**
-	 * What the previous row of this epoch that changed the part stored for it: `null` when that
-	 * row removed the part, `undefined` when there is no such row or it stored no summary (the
-	 * epoch's baseline, a row written before summaries existed).
+	 * What the session was last shown of the part in this epoch: the summary its previous row that
+	 * changed the part stored, or else the one the epoch's baseline stored. `null` when the part
+	 * was absent then (removed, or not in the baseline); `undefined` when that is not known (a row
+	 * or an epoch written before summaries existed).
 	 */
 	previous: unknown;
 	/** The part's summary now; `null` when this row removes the part. */
@@ -50,14 +54,38 @@ export function registerContextDisplayRefiner(key: string, refiner: ContextDispl
 }
 
 /**
- * What the last row of `epochId` that changed `key` stored as the part's summary (see
- * {@link ContextDisplayRefineInput.previous}). One backward pass over history already in memory,
- * stopping at the first row that names the key.
+ * The reader summaries an epoch marker stores beside its prefix baseline: for each part that has
+ * a refiner, its summary when the baseline holds the part, `null` when the baseline goes without
+ * it. A part that could not be read (`keepParts`) or that supplied no summary is left out: what
+ * the session saw of it is not known. Undefined when there is nothing to store, or it would
+ * exceed {@link CONTEXT_UPDATE_DISPLAY_MAX_BYTES}.
+ */
+export function baselineContextDisplays(input: {
+	parts: readonly { key: string }[];
+	keepParts?: readonly string[];
+	displays?: Readonly<Record<string, unknown>>;
+}): Record<string, unknown> | undefined {
+	const out: Record<string, unknown> = {};
+	const present = new Set(input.parts.map((part) => part.key));
+	for (const key of refiners.keys()) {
+		if (!present.has(key)) {
+			if (!input.keepParts?.includes(key)) out[key] = null;
+		} else if (input.displays?.[key] !== undefined) out[key] = input.displays[key];
+	}
+	return boundContextUpdateDisplay(out);
+}
+
+/**
+ * What the session was last shown of `key` in the epoch `epochId` (see
+ * {@link ContextDisplayRefineInput.previous}): the summary of the last row that changed it, or,
+ * when no row of the epoch did, the one the epoch's baseline stored (`baseline`). One backward
+ * pass over history already in memory, stopping at the first row that names the key.
  */
 export function previousContextDisplay(
 	messages: readonly DbMessage[],
 	epochId: string | undefined,
 	key: string,
+	baseline?: Readonly<Record<string, unknown>>,
 ): unknown {
 	if (!epochId) return undefined;
 	for (let index = messages.length - 1; index >= 0; index--) {
@@ -74,7 +102,7 @@ export function previousContextDisplay(
 		const display = update.display;
 		return display && typeof display === "object" && key in display ? display[key] : undefined;
 	}
-	return undefined;
+	return baseline && key in baseline ? baseline[key] : undefined;
 }
 
 /**
@@ -86,6 +114,8 @@ export async function refineContextDisplay(input: {
 	display: Record<string, unknown>;
 	messages: readonly DbMessage[];
 	epochId: string | undefined;
+	/** The summaries the epoch's marker stored beside its prefix baseline, when it has them. */
+	baseline?: Readonly<Record<string, unknown>>;
 	signal?: AbortSignal;
 }): Promise<Record<string, unknown>> {
 	let out = input.display;
@@ -95,7 +125,7 @@ export async function refineContextDisplay(input: {
 		try {
 			const refined = await refiner({
 				narratorId: input.narratorId,
-				previous: previousContextDisplay(input.messages, input.epochId, key),
+				previous: previousContextDisplay(input.messages, input.epochId, key, input.baseline),
 				current: input.display[key],
 				...(input.signal ? { signal: input.signal } : {}),
 			});

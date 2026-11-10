@@ -5,17 +5,20 @@
  * "Current tasks updated". Each row now also stores a state table of the open tasks (at most 60
  * addresses), and the next row of the same epoch is compared with it: the tasks finished,
  * started, cancelled, added, waiting or delegated in between are named (five at most, the rest
- * counted). The baseline is the row the session was last shown, never the view's read cache.
+ * counted). The baseline is what the session was last shown (its previous row, or the epoch's
+ * prefix baseline), never the view's read cache.
  *
  * Pinned here, through the real path (`taskSource.contextParts` → `buildEffectiveSystemPrompt` →
- * `reconcileEpoch`): each kind of change; the first row of an epoch has nothing to compare with;
- * a row written before tables existed is not a baseline; the last task finishing names it; more
+ * `reconcileEpoch`): each kind of change; the first row of an epoch (after session start, a
+ * compact, a model switch) is compared with the summary its marker stored beside the prefix
+ * baseline; an epoch or a row written before tables existed is not a baseline; the last task finishing names it; more
  * than 60 open tasks never report a task as gone on absence alone; a change of order alone names
  * no change; the model's text is the view's text, byte for byte, with or without the changes.
  *
  * ISOLATION: the isolated database of `tests/preload.ts`; every case makes its own session.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { EpochRecord } from "@server/lib/agent/tool-loading";
 import type { DbMessage } from "@shared/agent-protocol/types";
 import type { OutlineTasksViewDisplay } from "@shared/outline-task-notice";
 import { contextUpdateOf, renderContextUpdate } from "@shared/prefix-context";
@@ -23,7 +26,11 @@ import { db } from "../../../db";
 import { narrators } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
-import { previousContextDisplay, refineContextDisplay } from "../../context-display-refiners";
+import {
+	baselineContextDisplays,
+	previousContextDisplay,
+	refineContextDisplay,
+} from "../../context-display-refiners";
 import { buildEffectiveSystemPrompt } from "../../narrator-prompt";
 import { narratorService } from "../../narrator-service";
 import { ensureSessionSpace } from "../../outline/spaces";
@@ -140,11 +147,10 @@ const setTask = (s: Seeded, title: string, status: "todo" | "doing" | "done" | "
 		task: { status },
 	}) as OutlineOp;
 
-/** One provider request's prefix reconciliation, with the session's views as context parts. */
-async function request(id: string) {
-	const { reconcileEpoch } = await import("../../narrator-epochs");
+/** The prompt a request of the session is prepared with: its views as context parts. */
+async function promptOf(id: string) {
 	resetOutlineViewCache();
-	const built = await buildEffectiveSystemPrompt({
+	return await buildEffectiveSystemPrompt({
 		basePrompt: null,
 		cwd: "/tmp",
 		locale: "en",
@@ -152,13 +158,26 @@ async function request(id: string) {
 		runtimeHints: "runtime",
 		contextParts: await (await taskSourceForNarrator(id)).contextParts("en"),
 	});
-	return await reconcileEpoch({
+}
+
+/** One provider request's prefix reconciliation, with the session's views as context parts. */
+async function request(id: string, model = "default") {
+	return await requestWith(id, await promptOf(id), model);
+}
+
+async function requestWith(
+	id: string,
+	built: Awaited<ReturnType<typeof promptOf>>,
+	model = "default",
+) {
+	const { reconcileEpoch } = await import("../../narrator-epochs");
+	const result = await reconcileEpoch({
 		narratorId: id,
 		messages: [],
 		managed: new Set<string>(),
 		current: [],
 		candidates: [],
-		model: "default",
+		model,
 		provider: "changes-p",
 		registryRevision: "r",
 		prompt: {
@@ -168,8 +187,20 @@ async function request(id: string) {
 			displays: built.displays,
 		},
 		noticeText: (kind, name) => `${kind}: ${name}`,
-		resolveTarget: (model, p) => ({ fingerprint: `${p}:${model}`, cacheTtlMs: 1 }),
+		resolveTarget: (m, p) => ({ fingerprint: `${p}:${m}`, cacheTtlMs: 1 }),
 	});
+	return { ...result, narratorId: id };
+}
+
+/** The session's epoch markers, as stored. */
+async function markers(id: string): Promise<EpochRecord[]> {
+	const out: EpochRecord[] = [];
+	for (const row of await narratorService.getModelHistorySinceLastCompact(id)) {
+		const block = Array.isArray(row.contentJson) ? row.contentJson[0] : undefined;
+		if ((block as { type?: string } | undefined)?.type !== "epoch") continue;
+		out.push((block as unknown as { epoch: EpochRecord }).epoch);
+	}
+	return out;
 }
 
 /** The session's `context_update` rows: their stored block and the view's summary. */
@@ -195,31 +226,167 @@ const named = (view: OutlineTasksViewDisplay | null) =>
 	(view?.changes ?? []).map((c) => `${c.kind}:${c.title}${c.from ? `<${c.from}` : ""}`);
 
 describe("what changed since the view the session saw before", () => {
-	test("the first row of an epoch has nothing to compare with; the next one names the changes", async () => {
+	test("session start: the first row is compared with the view the prefix baseline held", async () => {
 		const id = await session();
 		const s = await seed(id, ["Add tests", "Fix the race", "Write docs"]);
 		await write(s, id, [setTask(s, "Add tests", "doing")]);
 		await request(id);
-		// The epoch's baseline holds the view: no row yet.
+		// The epoch's baseline holds the view: no row yet. Its marker keeps the view's summary
+		// (the list and its state table) for the first row to be compared with.
 		expect(await updates(id)).toEqual([]);
+		const baseline = (await markers(id))[0]?.baselineDisplays?.[KEY] as OutlineTasksViewDisplay;
+		expect(baseline.states).toEqual({
+			doing: [s.task["Add tests"]?.address as string],
+			todo: [s.task["Fix the race"]?.address, s.task["Write docs"]?.address] as string[],
+		});
+		expect(baseline.changes).toBeUndefined();
 
-		await write(s, id, [setTask(s, "Fix the race", "doing")]);
+		await write(s, id, [setTask(s, "Add tests", "done"), setTask(s, "Fix the race", "doing")]);
 		await request(id);
 		const first = await latest(id);
-		// Nothing was shown to the reader before this row: it lists, it does not compare.
-		expect(first?.changes).toBeUndefined();
-		expect(first?.changed).toBeUndefined();
+		expect(named(first)).toEqual(["done:Add tests<doing", "started:Fix the race<todo"]);
+		expect(first?.changed).toBe(2);
+		expect(first?.changes?.[0]?.address).toBe(s.task["Add tests"]?.address as string);
 		expect(first?.states).toEqual({
-			doing: [s.task["Add tests"]?.address, s.task["Fix the race"]?.address] as string[],
+			doing: [s.task["Fix the race"]?.address as string],
 			todo: [s.task["Write docs"]?.address as string],
 		});
 
-		await write(s, id, [setTask(s, "Add tests", "done"), setTask(s, "Write docs", "doing")]);
+		// The next row is compared with that row, not with the baseline again.
+		await write(s, id, [setTask(s, "Write docs", "doing")]);
 		await request(id);
-		const second = await latest(id);
-		expect(named(second)).toEqual(["done:Add tests<doing", "started:Write docs<todo"]);
-		expect(second?.changed).toBe(2);
-		expect(second?.changes?.[0]?.address).toBe(s.task["Add tests"]?.address as string);
+		expect(named(await latest(id))).toEqual(["started:Write docs<todo"]);
+	});
+
+	test("session start with no task open: the first tasks are named as they appear", async () => {
+		const id = await session();
+		await request(id);
+		// The baseline went without the view: a known, empty list.
+		expect((await markers(id))[0]?.baselineDisplays).toEqual({ [KEY]: null });
+		const s = await seed(id, ["Add tests", "Fix the race"]);
+		await write(s, id, [setTask(s, "Add tests", "doing")]);
+		await request(id);
+		expect(named(await latest(id))).toEqual(["started:Add tests", "added:Fix the race"]);
+	});
+
+	test("after a compact the first row is compared with the new baseline, not an older row", async () => {
+		const { narratorPersistence } = await import("../../narrator-persistence");
+		const id = await session();
+		const s = await seed(id, ["Add tests", "Fix the race", "Write docs"]);
+		await write(s, id, [setTask(s, "Add tests", "doing")]);
+		await request(id);
+		await write(s, id, [setTask(s, "Fix the race", "doing")]);
+		await request(id);
+		expect(named(await latest(id))).toEqual(["started:Fix the race<todo"]);
+		// Between that row and the compact a task finishes: the compact's baseline holds the list
+		// without it, so the first row after the compact must not report it again.
+		await write(s, id, [setTask(s, "Add tests", "done")]);
+		const compact = await narratorPersistence.persistCompactingMessage(id);
+		expect(
+			await narratorPersistence.finalizeCompactingMessage(compact.id, id, "Summary so far"),
+		).not.toBeNull();
+		const opened = await request(id);
+		expect(opened.epoch?.reason).toBe("compact");
+		expect(await updates(id)).toEqual([]);
+		await write(s, id, [setTask(s, "Write docs", "doing")]);
+		await request(id);
+		const rows = await updates(id);
+		expect(rows).toHaveLength(1);
+		expect(named(rows[0]?.view ?? null)).toEqual(["started:Write docs<todo"]);
+	});
+
+	test("after a model switch the first row is compared with the new baseline", async () => {
+		const id = await session();
+		const s = await seed(id, ["Add tests", "Fix the race", "Write docs"]);
+		await write(s, id, [setTask(s, "Add tests", "doing")]);
+		await request(id);
+		await write(s, id, [setTask(s, "Fix the race", "doing")]);
+		await request(id);
+		await write(s, id, [setTask(s, "Add tests", "done")]);
+		const switched = await request(id, "other-model");
+		expect(switched.epoch?.reason).toBe("target");
+		expect((await markers(id)).map((m) => Object.keys(m.baselineDisplays ?? {}))).toEqual([
+			[KEY],
+			[KEY],
+		]);
+		// The switch itself wrote no row; the finished task is in neither the new baseline nor the
+		// row after it.
+		expect(await updates(id)).toHaveLength(1);
+		await write(s, id, [setTask(s, "Write docs", "doing")]);
+		await request(id, "other-model");
+		expect(named(await latest(id))).toEqual(["started:Write docs<todo"]);
+	});
+
+	test("an epoch opened before baselines were stored: its first row lists, it does not compare", async () => {
+		const { narratorPersistence } = await import("../../narrator-persistence");
+		const id = await session();
+		const s = await seed(id, ["Add tests", "Fix the race"]);
+		await write(s, id, [setTask(s, "Add tests", "doing")]);
+		// The marker as it was written before this field existed.
+		const original = narratorPersistence.persistEpochMarker;
+		const spy = spyOn(narratorPersistence, "persistEpochMarker").mockImplementation(
+			(narratorId, { baselineDisplays: _dropped, ...record }) =>
+				original.call(narratorPersistence, narratorId, record),
+		);
+		try {
+			await request(id);
+		} finally {
+			spy.mockRestore();
+		}
+		expect((await markers(id))[0]).toBeDefined();
+		expect((await markers(id))[0]?.baselineDisplays).toBeUndefined();
+		await write(s, id, [setTask(s, "Fix the race", "doing")]);
+		await request(id);
+		const first = await latest(id);
+		expect(first?.changes).toBeUndefined();
+		expect(first?.changed).toBeUndefined();
+		expect(first?.states?.doing).toHaveLength(2);
+		// From its second row on it compares as any epoch does.
+		await write(s, id, [setTask(s, "Add tests", "done")]);
+		await request(id);
+		expect(named(await latest(id))).toEqual(["done:Add tests<doing"]);
+	});
+
+	test("the baseline's summary is the marker's alone: the prefix and its hashes do not move", async () => {
+		const { getPrefixText } = await import("../../narrator-prefix-snapshots");
+		const { narratorPersistence } = await import("../../narrator-persistence");
+		const id = await session();
+		const s = await seed(id, ["Add tests", "Fix the race"]);
+		await write(s, id, [setTask(s, "Add tests", "doing")]);
+		const withBaseline = await request(id);
+		const [marker] = await markers(id);
+		resetOutlineViewCache();
+		const text = (await outlineTasksView(id, "en")) as string;
+		// The view's part of the prefix is the view's text, byte for byte.
+		const part = marker?.prefix?.parts.find((p) => p.key === KEY);
+		expect(await getPrefixText(part?.hash as string)).toBe(text);
+		expect(withBaseline.systemPrompt).toContain(text);
+		for (const word of ["baselineDisplays", "states", '"counts"']) {
+			expect(withBaseline.systemPrompt).not.toContain(word);
+		}
+		// The same session opened without the field (as before this change): the same prefix
+		// references and the same prompt, to the byte.
+		const twin = await session();
+		const original = narratorPersistence.persistEpochMarker;
+		const spy = spyOn(narratorPersistence, "persistEpochMarker").mockImplementation(
+			(narratorId, { baselineDisplays: _dropped, ...record }) =>
+				original.call(narratorPersistence, narratorId, record),
+		);
+		let without: Awaited<ReturnType<typeof request>>;
+		try {
+			without = await requestWith(twin, await promptOf(id));
+		} finally {
+			spy.mockRestore();
+		}
+		const again = await requestWith(await session(), await promptOf(id));
+		expect(without.systemPrompt).toBe(again.systemPrompt as string);
+		const [bare] = await markers(twin);
+		expect(bare?.baselineDisplays).toBeUndefined();
+		const [full] = await markers(again.narratorId);
+		expect(full?.baselineDisplays).toBeDefined();
+		expect(full?.prefix).toEqual(bare?.prefix as never);
+		const { baselineDisplays: _b, ...rest } = full as unknown as Record<string, unknown>;
+		expect(rest).toEqual(bare as never);
 	});
 
 	test("cancelled, removed, added and put back are told apart", async () => {
@@ -227,10 +394,9 @@ describe("what changed since the view the session saw before", () => {
 		const s = await seed(id, ["Keep", "Drop", "Delete me", "Pause me", "Uncheck me"]);
 		await write(s, id, [setTask(s, "Keep", "doing"), setTask(s, "Pause me", "doing")]);
 		await request(id);
-		await write(s, id, [{ op: "insert", parent: { id: s.pageId }, content: "Seed row" }]);
 		await write(s, id, [setTask(s, "Drop", "doing")]);
 		await request(id);
-		expect((await latest(id))?.changes).toBeUndefined();
+		expect(named(await latest(id))).toEqual(["started:Drop<todo"]);
 
 		await write(s, id, [
 			setTask(s, "Drop", "cancelled"),
@@ -302,15 +468,15 @@ describe("what changed since the view the session saw before", () => {
 		const s = await seed(id, ["Only task"]);
 		await write(s, id, [setTask(s, "Only task", "doing")]);
 		await request(id);
-		// Nothing to compare with yet: the view going away stores null, as before.
+		// As the epoch's first row too (compared with its baseline).
 		const other = await session();
 		const o = await seed(other, ["Solo"]);
 		await request(other);
 		await write(o, other, [setTask(o, "Solo", "done")]);
 		await request(other);
-		expect((await updates(other)).map((row) => row.block.display)).toEqual([{ [KEY]: null }]);
+		expect(named(await latest(other))).toEqual(["done:Solo<todo"]);
+		expect((await latest(other))?.states).toEqual({});
 
-		// With a row to compare with: an empty list that says what emptied it.
 		await write(s, id, [
 			{ op: "insert", parent: { id: s.pageId }, content: "Next", task: { status: "todo" } },
 		]);
@@ -539,6 +705,38 @@ describe("the baseline is the session's previous row of the same epoch", () => {
 		expect(previousContextDisplay(messages, "e2", KEY)).toBeUndefined();
 		expect(previousContextDisplay(messages, undefined, KEY)).toBeUndefined();
 		expect(previousContextDisplay([], "e1", KEY)).toBeUndefined();
+		// No row of the epoch changed the part: what the epoch's baseline stored, when it did.
+		expect(previousContextDisplay([], "e1", KEY, { [KEY]: { v: 0 } })).toEqual({ v: 0 });
+		expect(previousContextDisplay([], "e1", KEY, { [KEY]: null })).toBeNull();
+		expect(previousContextDisplay([], "e1", KEY, { other: 1 })).toBeUndefined();
+		expect(previousContextDisplay(messages, "e2", KEY, { [KEY]: { v: 0 } })).toEqual({ v: 0 });
+		// A row of the epoch always wins over its baseline, a row without a summary included.
+		expect(previousContextDisplay(messages, "e1", KEY, { [KEY]: { v: 0 } })).toEqual({ v: 2 });
+		expect(
+			previousContextDisplay([...messages, row("6", "e1", KEY)], "e1", KEY, { [KEY]: { v: 0 } }),
+		).toBeUndefined();
+	});
+
+	test("what a marker stores: the part's summary, null without the part, nothing if unread", () => {
+		const view = { doing: [], states: {} };
+		expect(
+			baselineContextDisplays({
+				parts: [{ key: KEY }, { key: "mode" }],
+				displays: { [KEY]: view },
+			}),
+		).toEqual({ [KEY]: view });
+		expect(baselineContextDisplays({ parts: [{ key: "mode" }] })).toEqual({ [KEY]: null });
+		// Kept from before because it could not be read: what the session saw is not known.
+		expect(baselineContextDisplays({ parts: [{ key: "mode" }], keepParts: [KEY] })).toBeUndefined();
+		// In the prefix but without a summary: not known either.
+		expect(baselineContextDisplays({ parts: [{ key: KEY }] })).toBeUndefined();
+		// Too large to keep on a marker.
+		expect(
+			baselineContextDisplays({
+				parts: [{ key: KEY }],
+				displays: { [KEY]: { blob: "x".repeat(9000) } },
+			}),
+		).toBeUndefined();
 	});
 
 	test("a part without a refiner is stored as it is; a refiner that throws keeps the summary", async () => {
