@@ -72,9 +72,6 @@
 	 * opens, but nothing of it is visible or clickable.
 	 */
 	--dv-overlay-z-index: 999;
-	/* Keep Dockview's internal layer numbers below app-level portaled menus/modals.
-	 * Unlike transform/contain, isolation does not rebase fixed-position children. */
-	isolation: isolate;
 
 	/* Icons */
 	--dv-icon-hover-background-color: var(--mantine-color-default-hover);
@@ -89,6 +86,15 @@
 
 	height: 100%;
 	width: 100%;
+}
+
+/* Keep internal layers below app-level portaled menus, at the outer boundary only.
+ * Dockview repeats the theme class on its shell/popovers; isolating those would trap
+ * floating groups below Director. Workspace can override this boundary because it
+ * already isolates Dockview and Director together. :where keeps specificity low.
+ * Unlike transform/contain, isolation does not rebase fixed-position children. */
+.dockview-theme-narrafork:where(:not(.dockview-theme-narrafork *)) {
+	isolation: isolate;
 }
 
 /*
