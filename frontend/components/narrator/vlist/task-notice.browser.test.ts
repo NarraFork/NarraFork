@@ -174,7 +174,7 @@ for (const { name, options } of CASES) {
 		if (options.expanded) {
 			// Short names whole; a long one cut, but a good part of it still there.
 			expect(activity?.by.map((by) => [by.text, by.truncated])).toEqual([
-				["一个名字非常长的会话标题用来测试这一行会不会被截断", true],
+				["A deliberately long session title for browser truncation", true],
 				["alice", false],
 				["B", false],
 			]);

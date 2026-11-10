@@ -219,7 +219,8 @@ function notices(): AdapterSegment[] {
 							address: `${K}/mSsl3Ccf`,
 							title:
 								"改刷新逻辑，确保在网络断开后重连时不会重复提交同一个刷新请求并且要覆盖所有边界",
-							by: "一个名字非常长的会话标题用来测试这一行会不会被截断",
+							// Overflow without relying on the runner's CJK fallback font metrics.
+							by: "A deliberately long session title for browser truncation",
 							changes: [{ kind: "status", from: "todo", to: "done" }],
 						},
 						{
