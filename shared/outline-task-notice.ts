@@ -35,7 +35,15 @@ export type OutlineTaskNoticeChange =
 	 */
 	| { kind: "notes" | "reports" | "answers"; n: number }
 	| { kind: "claimable" }
-	| { kind: "overlap"; path: string };
+	| { kind: "overlap"; path: string }
+	/**
+	 * Team events (outline P2 PR 10a, `outline_team`): the task was assigned to this session by
+	 * name; a prerequisite of it was ended (`still`: it waits for something else all the same);
+	 * the task is one this session created (its status change says how it ended).
+	 */
+	| { kind: "assignedHere" }
+	| { kind: "unblocked"; by: "done" | "cancelled"; still?: true }
+	| { kind: "created" };
 
 /** One task a notice names. */
 export interface OutlineTaskNoticeItem {
@@ -117,6 +125,13 @@ function boundChange(raw: unknown): OutlineTaskNoticeChange | null {
 		}
 		case "claimable":
 			return { kind: "claimable" };
+		case "assignedHere":
+			return { kind: "assignedHere" };
+		case "created":
+			return { kind: "created" };
+		case "unblocked":
+			if (raw.by !== "done" && raw.by !== "cancelled") return null;
+			return { kind: "unblocked", by: raw.by, ...(raw.still === true ? { still: true } : {}) };
 		case "overlap":
 			return typeof raw.path === "string" && raw.path.trim()
 				? { kind: "overlap", path: clipNoticeLine(raw.path) }

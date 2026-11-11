@@ -258,12 +258,14 @@ export type SideCarBody =
 	 * (`outline_task_edit`); `finished`, tasks the session created were finished by another
 	 * session or a person (`outline_task_finished`, outline P2 PR 9b); `activity`, what other
 	 * sessions and people did around the session's tasks since its last turn
-	 * (`outline_team_activity`, outline P2 PR 10b), each item with who did it. The reader sees the
+	 * (`outline_team_activity`, outline P2 PR 10b), each item with who did it; `team`, one commit
+	 * of someone else that concerns the session in more than one way (`outline_team`, outline P2
+	 * PR 10a: assigned to it, a prerequisite ended, a task it created ended). The reader sees the
 	 * tasks as titled outline links with status chips.
 	 */
 	| {
 			kind: "outlineTasks";
-			variant: "turnEnd" | "edited" | "finished" | "activity";
+			variant: "turnEnd" | "edited" | "finished" | "activity" | "team";
 			items: OutlineTaskNoticeItem[];
 			/** Tasks (or changes) the notice counts without naming. */
 			more?: number;
@@ -342,7 +344,10 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			return {
 				kind: "outlineTasks",
 				variant:
-					body.variant === "edited" || body.variant === "finished" || body.variant === "activity"
+					body.variant === "edited" ||
+					body.variant === "finished" ||
+					body.variant === "activity" ||
+					body.variant === "team"
 						? body.variant
 						: "turnEnd",
 				items: boundOutlineTaskNoticeItems(body.items),
@@ -476,6 +481,7 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	outlineTaskEditedHeading: "{n} task(s) changed by people",
 	outlineTaskFinishedHeading: "{n} task(s) this session created were finished elsewhere",
 	outlineTaskActivityHeading: "Team activity: {n} change(s)",
+	outlineTaskTeamHeading: "{n} task event(s) for this session",
 	outlineTaskMore: "{n} more not listed",
 	outlineAnswersHeading: "{who} answered {n} question(s)",
 	outlineAnswersSomeone: "Someone",
@@ -811,7 +817,11 @@ function projectSideCarBody(
 								? labelWith(labels, "outlineTaskActivityHeading", {
 										n: body.items.length + (body.more ?? 0),
 									})
-								: label(labels, "outlineTaskTurnEndHeading"),
+								: body.variant === "team"
+									? labelWith(labels, "outlineTaskTeamHeading", {
+											n: body.items.length + (body.more ?? 0),
+										})
+									: label(labels, "outlineTaskTurnEndHeading"),
 				lines,
 			};
 		}
@@ -1204,6 +1214,7 @@ const PLAIN_TICKLESS_SOURCES: ReadonlySet<string> = new Set([
 	"outline_task_turn_end",
 	"outline_task_edit",
 	"outline_task_finished",
+	"outline_team",
 	"interrupt_task_guard",
 ]);
 

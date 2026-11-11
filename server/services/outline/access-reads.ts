@@ -264,6 +264,57 @@ export async function readTeamActivityFacts(
 }
 
 /**
+ * The session a handle names (`@agent:<handle>`, outline P2 PR 10a): the narrator holding the
+ * folded handle (the unique index `idx_narrators_handle_fold`), with its type. Null when nobody
+ * holds it.
+ */
+export async function readNarratorByHandleFold(
+	folded: string,
+): Promise<{ id: string; type: string } | null> {
+	if (!folded) return null;
+	const rows = await all(sql`
+		select id, type from narrators where handle_fold = ${folded} limit 1
+	`);
+	const row = rows[0];
+	return row ? { id: text(row, "id"), type: text(row, "type") } : null;
+}
+
+/**
+ * What decides whether a team event may wake a session (outline P2 PR 10a): its status, whether
+ * it is in plan mode (the `plan` trait), how its last run stopped, and its handle. By primary
+ * key; null when the narrator does not exist.
+ */
+export async function readNarratorWakeFacts(narratorId: string): Promise<{
+	status: string;
+	planMode: boolean;
+	lastStopReason: string | null;
+	handle: string | null;
+} | null> {
+	const rows = await all(sql`
+		select status, traits, last_stop_reason, handle from narrators
+		where id = ${narratorId} limit 1
+	`);
+	const row = rows[0];
+	if (!row) return null;
+	// `traits` is JSON text on SQLite and jsonb on PostgreSQL.
+	const raw = row.traits;
+	let traits: unknown = raw;
+	if (typeof raw === "string") {
+		try {
+			traits = JSON.parse(raw);
+		} catch {
+			traits = [];
+		}
+	}
+	return {
+		status: text(row, "status"),
+		planMode: Array.isArray(traits) && traits.includes("plan"),
+		lastStopReason: textOrNull(row, "last_stop_reason"),
+		handle: textOrNull(row, "handle"),
+	};
+}
+
+/**
  * Running state of narrators for the live editor's agent presence (outline P2 PR 10b): status,
  * title, type and session root, by primary key, chunked. Missing narrators are left out.
  */

@@ -1648,12 +1648,16 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/digest-job")
 		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
 		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
-	// Outline tasks a session created and someone else finished: that session is told.
-	import("./services/outline/task-finished")
-		.then(({ startOutlineTaskFinishedNotices }) => startOutlineTaskFinishedNotices())
-		.catch((err) =>
-			logger.warn("Outline task-finished notices failed to start", { error: String(err) }),
-		);
+	// Outline team events: a session is told when a task is assigned to it by name, when a
+	// prerequisite of its task ends, and when a task it created ends. The commits of the last
+	// minutes are pushed again in the background (what a stop between a commit and its rows left
+	// untold; a row written before is found and not written twice).
+	import("./services/outline/team-events")
+		.then(({ startOutlineTeamEvents, repushRecentOutlineTeamEvents }) => {
+			startOutlineTeamEvents();
+			return repushRecentOutlineTeamEvents();
+		})
+		.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
 	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
 	import("./services/outline/plugin-task-events")
 		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())

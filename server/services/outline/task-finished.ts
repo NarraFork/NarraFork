@@ -30,17 +30,19 @@
  * person's commit, whose message waits for the session's next turn (PR 5's rule: a person tidying
  * up must not cost a request). On PostgreSQL the row is written and nothing is woken (the session
  * runtime does not run there yet), and the chosen id is not used. The row's id follows from
- * (commit, session, tasks): delivering the same commit again finds it and writes nothing. There is
- * no retry queue: a process that stops between the commit and the delivery loses the message
- * (PR 10 folds this into the runtime inbox's `team` channel, with persistence).
+ * (commit, session, tasks): delivering the same commit again finds it and writes nothing.
+ *
+ * Since outline P2 PR 10a this is one of three team events read from a commit (`team-events.ts`,
+ * which owns the listener, the delivery, the wake rules and the re-push of recent commits after a
+ * start): a commit that concerns a session only by ending tasks it created is told exactly as
+ * described here (this source, this id, this text); one that also assigns it tasks or ends a
+ * prerequisite of its tasks is told in one `outline_team` row. What is derived here is unchanged.
  *
  * Every read is indexed and bounded: the commit's versions by `(space_id, seq)`, the versions just
  * before by primary key, the commit row, the tasks' heads and claims, the sessions' roots; the
  * listener only queues the work, never blocks the commit.
  */
 import { createHash } from "node:crypto";
-import { eventBus } from "@server/lib/event-bus";
-import { hotOnce, hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import {
 	getOutlineTaskFinishedNote,
@@ -59,8 +61,14 @@ import { readDisplayNames, readNarrator } from "./access-reads";
 import { isOutlineEnabled } from "./feature";
 import { OUTLINE_CHANGE, type OutlineTaskJson } from "./model";
 import { outlineStore } from "./store";
-import type { OutlineStore } from "./store/port";
+import type { OutlineRangeChange, OutlineVersionMeta } from "./store/digest-port";
+import type { OutlineCommitRow, OutlineSpaceRow, OutlineStore } from "./store/port";
 import { isFinishedTask, isOpenTask } from "./task-json";
+import {
+	deliverOutlineTeamMessage,
+	settleOutlineTeamEventsForTests,
+	startOutlineTeamEvents,
+} from "./team-events";
 
 export const OUTLINE_TASK_FINISHED_LIMITS = {
 	/** Versions of one commit read back (a commit holds at most 200 operations). */
@@ -102,6 +110,13 @@ export interface OutlineTaskFinishedMessage {
 	 * request, PR 5's rule): the row waits for the session's next turn.
 	 */
 	wake: boolean;
+	/**
+	 * The injection source; {@link OUTLINE_TASK_FINISHED_SOURCE} when absent. A commit that
+	 * concerns the session in more ways is one `outline_team` row (`team-events.ts`).
+	 */
+	source?: string;
+	/** Tasks the commit assigned to the session by name (`team-events.ts` remembers them). */
+	assigned?: string[];
 }
 
 /** What delivering needs from the session layer: a seam tests replace. */
@@ -156,7 +171,7 @@ export function outlineTaskFinishedInjection(
 		...(postgres ? {} : { messageId: message.messageId }),
 		content: message.content,
 		body: message.body,
-		source: OUTLINE_TASK_FINISHED_SOURCE,
+		source: message.source ?? OUTLINE_TASK_FINISHED_SOURCE,
 		role: "sys" as const,
 		schedule: postgres || !message.wake ? ("none" as const) : ("wakeIfIdle" as const),
 		locale: message.locale,
@@ -183,43 +198,115 @@ export function shareOutNames(counts: readonly number[], limit: number): number[
 	return named;
 }
 
+/** The delivery tests put in place, if any (`team-events.ts` asks before the real one). */
+export function outlineTaskFinishedDeliverySeam(): OutlineTaskFinishedDelivery | null {
+	return deliverySeam;
+}
+
 /**
- * The real delivery. SQLite: a row already under the chosen id means the commit was delivered
- * before: nothing is written again (and no wake: the first delivery woke it). PostgreSQL: the row
- * is written through the narrator store's port and nothing is woken.
+ * The versions of a commit whose task changed (created ones too, deleted ones left out), and the
+ * versions just before of those that existed: one read of the commit's versions without content
+ * (at most {@link OUTLINE_TASK_FINISHED_LIMITS.versionsPerCommit}), and one seek per block that
+ * a team event may be read from (it ended, or an agent is assigned it). What every team event of
+ * the commit is derived from (`team-events.ts`), read once.
  */
-const realDelivery: OutlineTaskFinishedDelivery = {
-	async deliver(message) {
-		const [{ getNarratorMessageRefsPort }, { deliverInjection }] = await Promise.all([
-			import("../narrator-refs/store"),
-			import("../narrator-injection"),
-		]);
-		const postgres = !!getNarratorMessageRefsPort();
-		if (!postgres) {
-			const [{ db }, { narratorMessages }, { and, eq }] = await Promise.all([
-				import("@server/db"),
-				import("@server/db/schema"),
-				import("drizzle-orm"),
-			]);
-			const existing = db
-				.select({ id: narratorMessages.id })
-				.from(narratorMessages)
-				.where(
-					and(
-						eq(narratorMessages.id, message.messageId),
-						eq(narratorMessages.narratorId, message.narratorId),
-					),
+export interface OutlineCommitTaskRead {
+	changed: OutlineRangeChange[];
+	before: Map<string, OutlineVersionMeta>;
+}
+
+export async function readOutlineCommitTasks(
+	store: OutlineStore,
+	event: OutlineCommitEvent,
+): Promise<OutlineCommitTaskRead> {
+	const versions = await store.listCommitRangeChanges(
+		event.spaceId,
+		event.seq - 1,
+		event.seq,
+		OUTLINE_TASK_FINISHED_LIMITS.versionsPerCommit,
+	);
+	const changed = versions.filter(
+		(v) => v.seq === event.seq && (v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 && !v.deleted,
+	);
+	const existed = changed.filter(
+		(v) =>
+			(v.changeFlags & OUTLINE_CHANGE.CREATE) === 0 &&
+			(isFinishedTask(v.taskJson) || v.taskJson?.assignee?.startsWith("agent:") === true),
+	);
+	const before = new Map(
+		(existed.length > 0
+			? await store.listVersionMetasAt(
+					existed.map((v) => ({ blockId: v.blockId, seq: event.seq - 1 })),
 				)
-				.get();
-			if (existing) return { written: true, woke: false };
-		}
-		const result = await deliverInjection(
-			message.narratorId,
-			outlineTaskFinishedInjection(message, postgres),
-		);
-		return { written: result.messageId !== null, woke: result.started };
-	},
-};
+			: []
+		).map((v) => [v.blockId, v]),
+	);
+	return { changed, before };
+}
+
+/**
+ * Who made a commit, as a team notice names them: the session (its root) or the person, by a name
+ * of no language for the reader's card, and worded for the model in the recipient's language.
+ */
+export interface OutlineCommitWriter {
+	space: OutlineSpaceRow;
+	commit: OutlineCommitRow;
+	person: boolean;
+	/** The root of the session the commit is the work of; null for a person's or a system job's. */
+	writerRoot: string | null;
+	/** The reader's name for them: a session's title, a person's username; null for the system. */
+	neutralBy: string | null;
+	/** The model's words for them. */
+	words(locale: Locale): string;
+}
+
+export async function readOutlineCommitWriter(
+	store: OutlineStore,
+	event: OutlineCommitEvent,
+): Promise<OutlineCommitWriter | null> {
+	const [space, [commit]] = await Promise.all([
+		store.getSpace(event.spaceId),
+		store.getCommitsBySeqs(event.spaceId, [event.seq]),
+	]);
+	if (!space || !commit) return null;
+	// Who made it: the commit's session (an agent's own, a system commit's), or a person.
+	const writer =
+		commit.narratorId ?? (commit.actorKind === "agent" ? commit.actorId : null) ?? null;
+	const writerRoot = writer
+		? ((await store.getNarratorRoots([writer])).get(writer)?.root ?? writer)
+		: null;
+	const person = commit.actorKind === "human";
+	const names = await readDisplayNames(
+		person ? { userIds: [commit.actorId] } : { narratorIds: writerRoot ? [writerRoot] : [] },
+	).catch(() => null);
+	const sessionName = writerRoot ? clip(names?.narrators.get(writerRoot) ?? writerRoot) : null;
+	const neutralBy = person ? (names?.users.get(commit.actorId) ?? commit.actorId) : sessionName;
+	return {
+		space,
+		commit,
+		person,
+		writerRoot: person ? null : writerRoot,
+		neutralBy,
+		words: (locale) =>
+			person && neutralBy
+				? neutralBy
+				: sessionName
+					? locale === "zh-CN"
+						? `会话「${sessionName}」`
+						: `session "${sessionName}"`
+					: locale === "zh-CN"
+						? "系统"
+						: "the system",
+	};
+}
+
+/** The language a session is told in: its owner's. */
+export async function outlineSessionLocale(narratorId: string): Promise<Locale> {
+	const owner = await readNarrator(narratorId)
+		.then((row) => row?.ownerUserId ?? null)
+		.catch(() => null);
+	return owner ? await getUserLanguage(owner).catch(() => "en" as const) : "en";
+}
 
 /** A task finished in the commit, with what is needed to name it. */
 interface Finished {
@@ -231,34 +318,17 @@ interface Finished {
 }
 
 /** The tasks a commit finished whose manager is a session, by block id (as the versions are read). */
-async function finishedInCommit(store: OutlineStore, event: OutlineCommitEvent) {
-	const versions = await store.listCommitRangeChanges(
-		event.spaceId,
-		event.seq - 1,
-		event.seq,
-		OUTLINE_TASK_FINISHED_LIMITS.versionsPerCommit,
-	);
-	// Only versions whose task changed, finished after it, of a task a session created.
-	const candidates = versions.filter(
-		(v) =>
-			v.seq === event.seq &&
-			(v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 &&
-			(v.changeFlags & OUTLINE_CHANGE.CREATE) === 0 &&
-			!v.deleted &&
-			isFinishedTask(v.taskJson) &&
-			v.taskJson?.manager?.kind === "agent",
-	);
-	if (candidates.length === 0) return [];
-	const before = new Map(
-		(
-			await store.listVersionMetasAt(
-				candidates.map((v) => ({ blockId: v.blockId, seq: event.seq - 1 })),
-			)
-		).map((v) => [v.blockId, v]),
-	);
+function finishedInCommit(read: OutlineCommitTaskRead): Finished[] {
 	const out: Finished[] = [];
-	for (const v of candidates) {
-		const prior = before.get(v.blockId);
+	for (const v of read.changed) {
+		// Only versions whose task changed, finished after it, of a task a session created.
+		if (
+			(v.changeFlags & OUTLINE_CHANGE.CREATE) !== 0 ||
+			!isFinishedTask(v.taskJson) ||
+			v.taskJson?.manager?.kind !== "agent"
+		)
+			continue;
+		const prior = read.before.get(v.blockId);
 		if (!prior || prior.deleted || !isOpenTask(prior.taskJson)) continue;
 		const task = v.taskJson as OutlineTaskJson;
 		out.push({
@@ -276,7 +346,7 @@ async function finishedInCommit(store: OutlineStore, event: OutlineCommitEvent) 
  * The sessions PR 5 tells of a person's commit for these tasks (`readCommitTaskChanges`): the
  * session whose space holds them, else whoever holds or last held each one (by root).
  */
-async function toldByPeopleEdits(
+export async function toldByPeopleEdits(
 	store: OutlineStore,
 	space: { kind: string; narratorId: string | null },
 	taskIds: readonly string[],
@@ -296,29 +366,49 @@ async function toldByPeopleEdits(
 	return out;
 }
 
-function clip(text: string): string {
+export function clip(text: string): string {
 	const line = text.replace(/\s+/g, " ").trim();
 	const max = OUTLINE_TASK_FINISHED_LIMITS.titleChars;
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
+/** What one session is told of the tasks it created that a commit finished. */
+export interface OutlineTaskFinishedPart {
+	/** The session told (a root). */
+	narratorId: string;
+	locale: Locale;
+	/** The tasks it is about (block ids), named or counted. */
+	taskIds: string[];
+	/** The tasks named, for the model's text. */
+	entries: OutlineTaskFinishedEntry[];
+	/** The tasks named, for the reader's card. */
+	items: OutlineTaskNoticeItem[];
+	/** Tasks of the session the commit finished that are not named. */
+	more: number;
+	/** A message that names nothing never wakes; a person's commit never does (PR 5's rule). */
+	wake: boolean;
+}
+
 /**
- * The messages one commit makes: for each session that created tasks the commit finished (and is
- * told, see the module header), its tasks named (within the commit's limit) and counted. Reads
- * only; nothing is written.
+ * What each session is told of the tasks it created that the commit finished (see the module
+ * header for who is told), its tasks named (within the commit's limit) and counted. Reads only.
  */
-export async function readOutlineTaskFinishedMessages(
+export async function readOutlineTaskFinishedParts(
 	event: OutlineCommitEvent,
-	options: { store?: OutlineStore } = {},
-): Promise<OutlineTaskFinishedMessage[]> {
+	options: {
+		store?: OutlineStore;
+		/** The commit's task versions and its writer, when the caller read them already. */
+		read?: OutlineCommitTaskRead;
+		writer?: OutlineCommitWriter | null;
+	} = {},
+): Promise<OutlineTaskFinishedPart[]> {
 	const store = options.store ?? outlineStore;
-	const finished = await finishedInCommit(store, event);
+	const finished = finishedInCommit(options.read ?? (await readOutlineCommitTasks(store, event)));
 	if (finished.length === 0) return [];
-	const [space, [commit]] = await Promise.all([
-		store.getSpace(event.spaceId),
-		store.getCommitsBySeqs(event.spaceId, [event.seq]),
-	]);
-	if (!space || !commit) return [];
+	const writer =
+		options.writer === undefined ? await readOutlineCommitWriter(store, event) : options.writer;
+	if (!writer) return [];
+	const { space, commit, person, neutralBy } = writer;
 	// Who finished them: the commit's session (an agent's own, a system commit's), or a person.
 	const finisher =
 		commit.narratorId ?? (commit.actorKind === "agent" ? commit.actorId : null) ?? null;
@@ -326,14 +416,13 @@ export async function readOutlineTaskFinishedMessages(
 		...new Set([...finished.map((f) => f.manager), ...(finisher ? [finisher] : [])]),
 	]);
 	const finisherRoot = finisher ? (sessions.get(finisher)?.root ?? finisher) : null;
-	const told =
-		commit.actorKind === "human"
-			? await toldByPeopleEdits(
-					store,
-					space,
-					finished.map((f) => f.blockId),
-				)
-			: new Map<string, string>();
+	const told = person
+		? await toldByPeopleEdits(
+				store,
+				space,
+				finished.map((f) => f.blockId),
+			)
+		: new Map<string, string>();
 	const byManager = new Map<string, Finished[]>();
 	const backends = new Map<string, boolean>();
 	const { readTaskBackend } = await import("../task-source/backend");
@@ -386,40 +475,15 @@ export async function readOutlineTaskFinishedMessages(
 	]);
 	const sids = new Map(metas.map((m) => [m.id, m.sid]));
 	const titles = new Map(heads.map((h) => [h.id, clip(blockTitle(h.contentHead))]));
-	const names = await readDisplayNames(
-		commit.actorKind === "human"
-			? { userIds: [commit.actorId] }
-			: { narratorIds: finisherRoot ? [finisherRoot] : [] },
-	).catch(() => null);
 
 	const sessionsTold = [...byManager];
 	const named = shareOutNames(
 		sessionsTold.map(([, tasks]) => tasks.length),
 		OUTLINE_TASK_FINISHED_LIMITS.listedPerCommit,
 	);
-	// Who finished them, as the reader's card names them (a name, in no language) and as the
-	// model's text does (in the session's language).
-	const sessionName = finisherRoot
-		? clip(names?.narrators.get(finisherRoot) ?? finisherRoot)
-		: null;
-	const person = commit.actorKind === "human";
-	const neutralBy = person ? (names?.users.get(commit.actorId) ?? commit.actorId) : sessionName;
-	const out: OutlineTaskFinishedMessage[] = [];
+	const out: OutlineTaskFinishedPart[] = [];
 	for (const [index, [root, tasks]] of sessionsTold.entries()) {
-		const owner = await readNarrator(root)
-			.then((row) => row?.ownerUserId ?? null)
-			.catch(() => null);
-		const locale: Locale = owner ? await getUserLanguage(owner).catch(() => "en" as const) : "en";
-		const by =
-			person && neutralBy
-				? neutralBy
-				: sessionName
-					? locale === "zh-CN"
-						? `会话「${sessionName}」`
-						: `session "${sessionName}"`
-					: locale === "zh-CN"
-						? "系统"
-						: "the system";
+		const locale = await outlineSessionLocale(root);
 		const shown = tasks.slice(0, named[index] ?? 0);
 		const more = tasks.length - shown.length;
 		const entries: OutlineTaskFinishedEntry[] = shown.map((task) => ({
@@ -439,19 +503,13 @@ export async function readOutlineTaskFinishedMessages(
 			});
 			return item ? [item] : [];
 		});
-		const taskIds = tasks.map((task) => task.blockId);
 		out.push({
 			narratorId: root,
-			messageId: outlineTaskFinishedMessageId(event, root, taskIds),
 			locale,
-			content: getOutlineTaskFinishedNote({ by, entries, more }, locale),
-			body: {
-				kind: "outlineTasks",
-				variant: "finished",
-				items,
-				...(more > 0 ? { more } : {}),
-			},
-			taskIds,
+			taskIds: tasks.map((task) => task.blockId),
+			entries,
+			items,
+			more,
 			// A message that names nothing never wakes; a person's commit never does (PR 5's rule).
 			wake: !person && items.length > 0,
 		});
@@ -459,21 +517,65 @@ export async function readOutlineTaskFinishedMessages(
 	return out;
 }
 
+/** The message a session gets of a commit that only finished tasks it created. */
+export function outlineTaskFinishedMessage(
+	event: OutlineCommitEvent,
+	part: OutlineTaskFinishedPart,
+	writer: OutlineCommitWriter,
+): OutlineTaskFinishedMessage {
+	return {
+		narratorId: part.narratorId,
+		messageId: outlineTaskFinishedMessageId(event, part.narratorId, part.taskIds),
+		locale: part.locale,
+		content: getOutlineTaskFinishedNote(
+			{ by: writer.words(part.locale), entries: part.entries, more: part.more },
+			part.locale,
+		),
+		body: {
+			kind: "outlineTasks",
+			variant: "finished",
+			items: part.items,
+			...(part.more > 0 ? { more: part.more } : {}),
+		},
+		taskIds: part.taskIds,
+		wake: part.wake,
+	};
+}
+
 /**
- * Tell the sessions a commit finished tasks of (see the module header). Errors are logged per
- * session: one that fails does not keep the others from being told.
+ * The messages one commit makes: for each session that created tasks the commit finished (and is
+ * told, see the module header), its tasks named (within the commit's limit) and counted. Reads
+ * only; nothing is written.
+ */
+export async function readOutlineTaskFinishedMessages(
+	event: OutlineCommitEvent,
+	options: { store?: OutlineStore } = {},
+): Promise<OutlineTaskFinishedMessage[]> {
+	const store = options.store ?? outlineStore;
+	const read = await readOutlineCommitTasks(store, event);
+	if (finishedInCommit(read).length === 0) return [];
+	const writer = await readOutlineCommitWriter(store, event);
+	if (!writer) return [];
+	const parts = await readOutlineTaskFinishedParts(event, { store, read, writer });
+	return parts.map((part) => outlineTaskFinishedMessage(event, part, writer));
+}
+
+/**
+ * Tell the sessions a commit finished tasks of (see the module header), and nothing else the
+ * commit may concern them with (`deliverOutlineTeamEvents` tells everything; this is the part 9b
+ * built, kept for its callers). Errors are logged per session: one that fails does not keep the
+ * others from being told.
  */
 export async function deliverOutlineTaskFinished(
 	event: OutlineCommitEvent,
 	options: { store?: OutlineStore } = {},
 ): Promise<{ told: string[]; woke: number }> {
 	if (!isOutlineEnabled()) return { told: [], woke: 0 };
-	const delivery = deliverySeam ?? realDelivery;
 	const told: string[] = [];
 	let woke = 0;
 	for (const message of await readOutlineTaskFinishedMessages(event, options)) {
 		try {
-			const result = await delivery.deliver(message);
+			const result = await deliverOutlineTeamMessage(message);
 			if (!result.written) continue;
 			told.push(message.narratorId);
 			if (result.woke) woke++;
@@ -489,28 +591,15 @@ export async function deliverOutlineTaskFinished(
 	return { told, woke };
 }
 
-const inflight = hotSafe("narrafork.outlineTaskFinished.inflight", () => new Set<Promise<void>>());
-
 /** Wait for every commit being read and told (tests). */
 export async function settleOutlineTaskFinishedForTests(): Promise<void> {
-	await Promise.allSettled([...inflight]);
+	await settleOutlineTeamEventsForTests();
 }
 
-/** Listen for commits (once per process; the server starts it with the outline jobs). */
+/**
+ * Listen for commits (once per process; the server starts it with the outline jobs): the team
+ * events listener (`team-events.ts`), of which these notices are one part.
+ */
 export function startOutlineTaskFinishedNotices(): void {
-	if (!hotOnce("narrafork.outlineTaskFinished.listener")) return;
-	eventBus.on("outline:committed", (event) => {
-		if (!isOutlineEnabled()) return;
-		const work = deliverOutlineTaskFinished(event)
-			.then(() => {})
-			.catch((error) =>
-				logger.warn("Failed to read a commit's finished tasks", {
-					spaceId: event.spaceId,
-					seq: event.seq,
-					error: String(error),
-				}),
-			);
-		inflight.add(work);
-		void work.finally(() => inflight.delete(work));
-	});
+	startOutlineTeamEvents();
 }

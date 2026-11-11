@@ -623,3 +623,117 @@ export function getOutlineTaskFinishedNote(
 		? `系统通知（不是用户发言）：本会话在大纲里建的任务在别处结束了。\n\n${lines.join("\n")}\n\n结果和报告在各自的任务下面，用 OutlineRead 读；不满意可以重开（设回待办）。`
 		: `System notice (not the user speaking): tasks this session created in the outline were finished elsewhere.\n\n${lines.join("\n")}\n\nThe results and any reports are under each task; read them with OutlineRead. If one does not meet what you wanted, reopen it (set it to do).`;
 }
+
+// ─── Team events: assigned, a prerequisite ended, created tasks ended (outline P2 PR 10a) ───
+
+/** A task assigned to the session by name, as the team notice names it. */
+export interface OutlineTeamAssignedEntry {
+	/** `key/sid`. */
+	address: string;
+	title: string;
+	humanCreated: boolean;
+}
+
+/** A task of the session whose prerequisite was ended, as the team notice names it. */
+export interface OutlineTeamUnblockedEntry {
+	address: string;
+	title: string;
+	prerequisite: { address: string; title: string; status: "done" | "cancelled" };
+	/** It still waits for something else (another prerequisite, a person, a confirmation). */
+	stillWaiting: boolean;
+}
+
+/**
+ * The notice a session gets when one commit of someone else concerns it in more than one way
+ * (design §D.2 「合并」: one row per commit and session): tasks assigned to it by name, tasks of its
+ * own whose prerequisite was ended, tasks it created that were ended. A system notice (not the
+ * user speaking), in the past tense: it says what happened in that commit, and the session reads
+ * the tasks for what they are now. `by` is who made the commit, as the caller names them; `more`
+ * counts what the commit's limit left out.
+ */
+export function getOutlineTeamEventsNote(
+	input: {
+		by: string;
+		assigned: readonly OutlineTeamAssignedEntry[];
+		unblocked: readonly OutlineTeamUnblockedEntry[];
+		finished: readonly OutlineTaskFinishedEntry[];
+		more: number;
+	},
+	locale: Locale,
+): string {
+	const zh = locale === "zh-CN";
+	const sep = zh ? "：" : ": ";
+	const blocks: string[] = [];
+	if (input.assigned.length > 0) {
+		const lines = input.assigned.map((entry) => {
+			const mark = entry.humanCreated ? (zh ? "（人建）" : " (set by a person)") : "";
+			return `- \`${entry.address}\` ${entry.title}${mark}`;
+		});
+		blocks.push(
+			[
+				zh
+					? `${input.by}把这些任务指派给了本会话（还没开始；要做时把它设成进行中）：`
+					: `Assigned to this session by ${input.by} (not started; set one in progress when you take it up):`,
+				...lines,
+			].join("\n"),
+		);
+	}
+	if (input.unblocked.length > 0) {
+		const lines = input.unblocked.map((entry) => {
+			const p = entry.prerequisite;
+			const what = zh
+				? p.status === "done"
+					? `它的前置 \`${p.address}\` ${p.title} 已完成`
+					: `它的前置 \`${p.address}\` ${p.title} 被取消了，先看看这个任务还要不要做`
+				: p.status === "done"
+					? `its prerequisite \`${p.address}\` ${p.title} was ticked done`
+					: `its prerequisite \`${p.address}\` ${p.title} was cancelled; check whether this task is still needed`;
+			const rest = entry.stillWaiting
+				? zh
+					? "；它还在等别的"
+					: "; it still waits for something else"
+				: zh
+					? "；它不再等了"
+					: "; it no longer waits";
+			return `- \`${entry.address}\` ${entry.title}${sep}${what}${rest}`;
+		});
+		blocks.push(
+			[
+				zh
+					? `${input.by}结束了本会话任务的前置：`
+					: `Prerequisites of this session's tasks were ended by ${input.by}:`,
+				...lines,
+			].join("\n"),
+		);
+	}
+	if (input.finished.length > 0) {
+		const lines = input.finished.map((entry) => {
+			const mark = entry.humanCreated ? (zh ? "（人建）" : " (set by a person)") : "";
+			const what = zh
+				? entry.status === "done"
+					? "已勾成完成"
+					: "已取消"
+				: entry.status === "done"
+					? "ticked done"
+					: "cancelled";
+			return `- \`${entry.address}\` ${entry.title}${mark}${sep}${what}`;
+		});
+		blocks.push(
+			[
+				zh
+					? `${input.by}结束了本会话建的任务（结果和报告在各自的任务下面；不满意可以重开）：`
+					: `Tasks this session created were ended by ${input.by} (the results and any reports are under each task; reopen one that does not meet what you wanted):`,
+				...lines,
+			].join("\n"),
+		);
+	}
+	if (input.more > 0)
+		blocks.push(
+			zh
+				? `同一次改动里还有 ${input.more} 处与本会话有关，未列出。`
+				: `${input.more} more changes of the same commit concern this session (not listed).`,
+		);
+	return zh
+		? `系统通知（不是用户发言）：大纲里与本会话有关的任务有了变化。\n\n${blocks.join("\n\n")}\n\n动手前先用 OutlineRead 读这些任务，以它们现在的样子为准。`
+		: `System notice (not the user speaking): tasks in the outline that concern this session changed.\n\n${blocks.join("\n\n")}\n\nRead the tasks with OutlineRead before acting on them: what they are now decides.`;
+}
