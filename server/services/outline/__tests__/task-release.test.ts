@@ -19,7 +19,9 @@ import { db } from "../../../db";
 import { narrators, projects, userPreferences, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
+import { bindNarratorMessageRefs } from "../../narrator-refs/store";
 import {
+	directoryInProject,
 	handoffBlockId,
 	handoffOps,
 	isHandoffBlockId,
@@ -540,6 +542,13 @@ describe("the handoff", () => {
 		);
 		// The title is text, never a link.
 		expect((ops[0] as { content: string }).content).not.toMatch(/(^|[^\\])\[\[link\]\]/);
+		expect(directoryInProject("/srv/project/.worktrees/fix", "/srv/project")).toBe(
+			".worktrees/fix",
+		);
+		expect(directoryInProject("/srv/project", "/srv/project")).toBeNull();
+		expect(directoryInProject("/srv/project-other/x", "/srv/project")).toBeNull();
+		expect(directoryInProject("/home/alice/secret", "/srv/project")).toBeNull();
+		expect(directoryInProject("relative/path", "/srv/project")).toBeNull();
 		expect(handoffBlockId("task", 2)).not.toBe(handoffBlockId("task", 3));
 		expect(isHandoffBlockId(handoffBlockId("task", 2))).toBe(true);
 		expect(isHandoffBlockId("dlrpAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).toBe(false);
@@ -713,6 +722,36 @@ describe("cost and where it does not apply", () => {
 		const off = keepOutlineTaskLeases(s, { store: proxy, enabled: () => false, intervalMs: 0 });
 		await off.stop({ natural: true });
 		expect(calls).toEqual([]);
+	});
+
+	test("where sessions do not run (PostgreSQL): nothing is given back at a run's end, and the lease job writes the note it always wrote", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(p.space.id, alice, ["Fix the refresh logic"]);
+		const [task] = team.tasks as [string];
+		await start(p.space.id, s, [task]);
+		bindNarratorMessageRefs({ backend: "postgres", port: {} as never });
+		try {
+			expect(await settle(s, true)).toEqual({ kept: 1, grace: 0, released: 0 });
+			expect(await stateOf(task)).toMatchObject({
+				status: "doing",
+				holder: s,
+				expiresAt: leaseEnd(OUTLINE_TASK_IDLE_LEASE_MS),
+			});
+			const done = await expireOutlineTaskLeases({
+				store,
+				now: at(60_000 + OUTLINE_TASK_IDLE_LEASE_MS),
+			});
+			// (With what earlier cases left on the idle lease.)
+			expect(done.reopened).toBeGreaterThanOrEqual(1);
+			expect(await stateOf(task)).toMatchObject({ status: "todo", holder: null });
+		} finally {
+			bindNarratorMessageRefs(undefined);
+		}
+		expect(await handoffsUnder(task)).toHaveLength(0);
+		const note = (await store.listChildren(p.space.id, task, 10)).at(-1);
+		expect(note?.content).toContain("lease expired");
 	});
 
 	test("an archived session lets go of everything, as before: no handoff is written for it here", async () => {
