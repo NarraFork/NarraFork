@@ -237,7 +237,7 @@ function createChannel(name: string, limits: EditTextChannelLimits): EditTextCha
 		};
 		task.timer = setTimeout(() => {
 			logger.warn("Outline edit text job timed out", {
-				channel: name,
+				channel: name === "" ? "interactive" : "background",
 				bytes: editTextJobBytes(task.job),
 				elapsedMs: Math.round(performance.now() - started),
 			});

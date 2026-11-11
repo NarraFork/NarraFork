@@ -4513,8 +4513,9 @@ export async function createNarratorForPlugin(
 		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
 		// The recruiting plugin drives its members through the Dynamic Spec commands (dispatch,
 		// read, write); members stay spec (D27d), as OAuth-provisioned sessions do. Since outline P2
-		// PR 12a those commands work on outline sessions too (converted), so whether new members
-		// start in the outline is left to the import (plan PR 12b).
+		// PR 12a those commands work on outline sessions too (converted). A member starts in
+		// Dynamic Spec and is moved by the import like any spec session (outline P2 PR 12b): before
+		// its next run or while idle, with whatever the plugin dispatched to it by then.
 		taskBackend: "spec",
 	});
 	return {
