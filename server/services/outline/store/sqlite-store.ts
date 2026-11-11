@@ -1302,6 +1302,25 @@ export const sqliteOutlineStore: OutlineStore = {
 		return out;
 	},
 
+	async listOpenQuestionBlocksOnPage(spaceId, pageId, limit) {
+		return db
+			.select({ id: outlineQuestions.blockId })
+			.from(outlineQuestions)
+			.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineQuestions.blockId))
+			.where(
+				and(
+					eq(outlineQuestions.spaceId, spaceId),
+					sql`${outlineQuestions.state} = 'open'`,
+					eq(outlineBlocks.pageId, pageId),
+					eq(outlineBlocks.deleted, false),
+				),
+			)
+			.orderBy(desc(outlineQuestions.createdAt), asc(outlineQuestions.blockId))
+			.limit(limit)
+			.all()
+			.map((row) => row.id);
+	},
+
 	async listOpenQuestionsForUser(userId, limit) {
 		return db
 			.select()

@@ -774,16 +774,17 @@ outlineRoutes.get("/spaces/:spaceId/pages/:pageId/pending", async (c) => {
 	);
 	const manages = views.size > 0 ? await canManageSpace(principal, space) : false;
 	for (const lock of views.values()) lock.canUnlock = unlockAllowed(principal, lock, manages);
-	// The space's unanswered questions (one indexed read): a folded row of the page counts those
-	// it hides.
-	const questions = await outlineStore.listOpenQuestionsBySpaces(
-		[space.id],
+	// This page's unanswered questions (one indexed read): a block over one is never folded by
+	// default, and a row the reader folded counts those it hides.
+	const questions = await outlineStore.listOpenQuestionBlocksOnPage(
+		space.id,
+		block.pageId,
 		OUTLINE_PENDING_API_LIMITS.openQuestions,
 	);
 	const body: OutlinePagePendingResponse = {
 		pending: await describePending(principal, space, pending),
 		locks: [...views.values()],
-		questions: questions.map((q) => q.blockId),
+		questions,
 	};
 	return c.json(body);
 });

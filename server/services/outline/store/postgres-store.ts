@@ -1472,6 +1472,24 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return out;
 		},
 
+		async listOpenQuestionBlocksOnPage(spaceId, pageId, limit) {
+			const rows = await db
+				.select({ id: outlineQuestions.blockId })
+				.from(outlineQuestions)
+				.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineQuestions.blockId))
+				.where(
+					and(
+						eq(outlineQuestions.spaceId, spaceId),
+						sql`${outlineQuestions.state} = 'open'`,
+						eq(outlineBlocks.pageId, pageId),
+						eq(outlineBlocks.deleted, false),
+					),
+				)
+				.orderBy(desc(outlineQuestions.createdAt), sql`${outlineQuestions.blockId} COLLATE "C"`)
+				.limit(limit);
+			return rows.map((row) => row.id);
+		},
+
 		async listOpenQuestionsForUser(userId, limit) {
 			const rows = await db
 				.select()

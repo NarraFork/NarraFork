@@ -941,6 +941,12 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort, Outlin
 		spaceIds: readonly string[],
 		limitPerSpace: number,
 	): Promise<OutlineQuestionRow[]>;
+	/**
+	 * Block ids of the open questions that are live blocks of one page, newest first, at most
+	 * `limit`: the page's own, whatever else the space has open (a folded row of the page counts
+	 * the ones it hides). The space's open questions by their index, each block by primary key.
+	 */
+	listOpenQuestionBlocksOnPage(spaceId: string, pageId: string, limit: number): Promise<string[]>;
 	/** Open questions put to a person, oldest first, at most `limit`. */
 	listOpenQuestionsForUser(userId: string, limit: number): Promise<OutlineQuestionRow[]>;
 	/** Open questions a session asked, oldest first, at most `limit`. */

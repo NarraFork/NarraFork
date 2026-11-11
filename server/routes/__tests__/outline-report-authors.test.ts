@@ -10,6 +10,7 @@
  */
 import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
+	OUTLINE_PENDING_API_LIMITS,
 	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	type OutlineBlockViewResponse,
 	type OutlinePagePendingResponse,
@@ -321,12 +322,59 @@ describe("who wrote a subagent report", () => {
 });
 
 describe("a page's summary names the unanswered questions", () => {
+	const pending = (who: string, page = pageId) =>
+		get<OutlinePagePendingResponse>(who, `/spaces/${spaceId}/pages/${page}/pending`);
+
 	test("the list is there (empty without questions) beside the pending changes and locks", async () => {
-		const read = await get<OutlinePagePendingResponse>(
-			alice,
-			`/spaces/${spaceId}/pages/${pageId}/pending`,
-		);
+		const read = await pending(alice);
 		expect(read.status).toBe(200);
 		expect(read.body).toEqual({ pending: [], locks: [], questions: [] });
+	});
+
+	test("this page's own, however many older ones the space has open elsewhere", async () => {
+		const asks = (parent: string | null, content: string) => ({
+			op: "insert" as const,
+			parent: parent ? { id: parent } : null,
+			content,
+			ask: {
+				to: { kind: "human" as const, id: alice },
+				options: [],
+				recommend: { text: "Go ahead", reason: "It is small" },
+			},
+		});
+		const write = (ops: Parameters<typeof writeOutline>[0]["ops"]) =>
+			writeOutline(
+				{
+					spaceId,
+					ops,
+					actor: { kind: "agent", id: scout },
+					narratorId: scout,
+					responsibleUserId: alice,
+				},
+				{ question: { askerNarratorId: scout, askerUserId: alice, askerToolCallId: "call-1" } },
+			);
+		// More open questions on another page than one summary names, all older.
+		const made = await write([{ op: "insert", parent: null, content: "Another page" }]);
+		const otherPage = made.results[0]?.blockId as string;
+		const many = OUTLINE_PENDING_API_LIMITS.openQuestions + 5;
+		for (let at = 0; at < many; at += 100) {
+			await write(
+				Array.from({ length: Math.min(100, many - at) }, (_, i) =>
+					asks(otherPage, `Elsewhere ${at + i}`),
+				),
+			);
+		}
+		// One on this page, under the task, asked last.
+		const here = await write([asks(taskId, "Which way here?")]);
+		const question = here.results[0]?.blockId as string;
+		const read = await pending(alice);
+		expect(read.body.questions).toEqual([question]);
+		// The other page names its own, bounded.
+		const other = await pending(alice, otherPage);
+		expect(other.body.questions?.length).toBe(OUTLINE_PENDING_API_LIMITS.openQuestions);
+		expect(other.body.questions).not.toContain(question);
+		// A reader of the page reads the same; someone who may not read the space reads nothing.
+		expect((await pending(bob)).body.questions).toEqual([question]);
+		expect((await pending(carol)).status).toBe(404);
 	});
 });

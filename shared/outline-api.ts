@@ -384,8 +384,8 @@ export interface OutlineViewStatePutRequest {
 export const OUTLINE_PENDING_API_LIMITS = {
 	/** Tasks one "in progress" marker lists. */
 	inProgressItems: 10,
-	/** Unanswered questions of a space a page's summary names. */
-	openQuestions: 50,
+	/** Unanswered questions of a page its summary names (the newest). */
+	openQuestions: 200,
 	/** Characters of a rejection's reason. */
 	maxReasonChars: 500,
 } as const;
@@ -432,9 +432,9 @@ export interface OutlinePagePendingResponse {
 	/** Locked tasks of the page. */
 	locks: OutlineLockView[];
 	/**
-	 * Blocks of the page's space that are questions put to a person and not answered yet (the
-	 * oldest {@link OUTLINE_PENDING_API_LIMITS.openQuestions}): a folded row counts the ones it
-	 * hides. Absent from an older server.
+	 * Blocks of the page that are questions put to a person and not answered yet (the newest
+	 * {@link OUTLINE_PENDING_API_LIMITS.openQuestions}): the blocks above them are not folded by
+	 * default, and a row the reader folded counts the ones it hides. Absent from an older server.
 	 */
 	questions?: string[];
 }
