@@ -21,6 +21,7 @@
 
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
+import { coerceInjectionTarget } from "@shared/pretext-layout/injection-target";
 import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
 import { QUOTE_ROLE_ATTR } from "../composer/quote-source-attrs";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
@@ -35,6 +36,7 @@ import type {
 	InjectionGuardActions,
 	SpecCarryoverActions,
 } from "./render/RenderSystemText";
+import type { ContentTargetResolver } from "./render/RenderToolCall";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { renderLabelsForKind, type VListRenderLabels } from "./useVListLabels";
@@ -57,7 +59,11 @@ import {
 	TOGGLEABLE_CARD_KINDS,
 	TRACE_KINDS,
 } from "./vlist-exact-row-state";
-import { type InjectionNavigation, injectInjectionBubbleChrome } from "./vlist-injection-header";
+import {
+	type InjectionNavigation,
+	injectInjectionBubbleChrome,
+	resolveInjectionOpener,
+} from "./vlist-injection-header";
 import { VListInteractionRowBoundsContext } from "./vlist-interaction-admission-context";
 import { traceRowFoldChannel } from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
@@ -401,7 +407,10 @@ export const ExactRow = memo(
 		onQuoteJump,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
+		const resolveContentTarget: ContentTargetResolver = (target) =>
+			resolveInjectionOpener(target, injectionNavigation);
 		const kind = item.spec.kind;
+		if (kind === "auxiliary-content") extra.resolveTargetOpener = resolveContentTarget;
 		// Read-only shares retain this reader-owned fold without enabling mutation/menu actions.
 		extra.textPreviewLabels = renderLabels.textPreview;
 		extra.onToggleTextExpanded = toggles.onToggleTextExpanded;
@@ -614,7 +623,11 @@ export const ExactRow = memo(
 				// the take-over button's row is reserved by measure-reflection-notice
 				// whenever `hasTakeOver` is set. Nothing here can move the row, so the
 				// zero-DOM height prediction is untouched.
-				if (onTerminate && canTerminateTool(card.toolName)) {
+				if (
+					row.cardKind !== "auxiliary-content" &&
+					onTerminate &&
+					canTerminateTool(card.toolName)
+				) {
 					cardExtra.onTerminate = onTerminate;
 				}
 				// "Open full session" for an Await-agent / single-target Send row. The
@@ -651,7 +664,13 @@ export const ExactRow = memo(
 						cardExtra.viewControls = viewControls;
 					}
 				}
-				return renderElement("tool-call", card, cardExtra);
+				if (row.cardKind === "auxiliary-content")
+					cardExtra.resolveTargetOpener = resolveContentTarget;
+				return renderElement(
+					row.cardKind === "auxiliary-content" ? "auxiliary-content" : "tool-call",
+					card,
+					cardExtra,
+				);
 			};
 		}
 		// The recovery card owns a checkbox list plus two submit buttons. Its rows
@@ -909,16 +928,25 @@ export const ExactRow = memo(
 			) : (
 				body
 			);
+		const sourceTarget =
+			kind === "auxiliary-content"
+				? coerceInjectionTarget((item.spec.data as { target?: unknown })?.target)
+				: undefined;
+		const openSource = sourceTarget ? resolveContentTarget(sourceTarget) : undefined;
+		const interactionActions =
+			interaction && openSource
+				? { ...interaction.actions, onJumpToSource: openSource }
+				: interaction?.actions;
 		const interactiveBody =
 			interaction && editorSlot === undefined ? (
-				<MessageContextMenuCtx.Provider value={interaction.actions}>
+				<MessageContextMenuCtx.Provider value={interactionActions ?? interaction.actions}>
 					<VListRowInteraction
 						blockId={interaction.blockId}
 						messageId={interaction.messageId}
 						blockIndex={interaction.blockIndex}
 						blockIndices={interaction.blockIndices}
 						copyText={interaction.copyText}
-						actions={interaction.actions}
+						actions={interactionActions ?? interaction.actions}
 						narratorId={narratorId}
 						toolUseId={interaction.toolUseId}
 						toolDetailRef={interaction.toolDetailRef}

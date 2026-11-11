@@ -71,6 +71,12 @@ async function workerAt<T>(
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let ready = false;
 	let settled = false;
+	// Phase timing: a revert spawns several of these workers per execution, and their
+	// cold start is invisible to SQL tracing. Kept as one summary line per invocation.
+	const startedAt = performance.now();
+	let readyAt = 0;
+	let settledAt = 0;
+	let outcome = "error";
 	try {
 		return await new Promise<T>((resolve, reject) => {
 			const refuse = (error: unknown) => {
@@ -105,6 +111,7 @@ async function workerAt<T>(
 						return;
 					}
 					ready = true;
+					readyAt = performance.now();
 					clearTimeout(timer);
 					onReady();
 					if (signal.aborted) return abort?.();
@@ -125,6 +132,7 @@ async function workerAt<T>(
 					refuse(new RevertTransactionError(code));
 				} else if ("value" in message) {
 					settled = true;
+					outcome = "ok";
 					resolve(message.value as T);
 				} else refuse(new RevertTransactionError("MANIFEST_WORKER_PROTOCOL"));
 			});
@@ -141,8 +149,18 @@ async function workerAt<T>(
 			: new RevertTransactionError("MANIFEST_WORKER_FAILED");
 	} finally {
 		settled = true;
+		settledAt = performance.now();
 		clearTimeout(timer);
 		if (abort) signal.removeEventListener("abort", abort);
 		await thread?.terminate();
+		const terminatedAt = performance.now();
+		logger.info("Revert manifest worker timing", {
+			action: request.action,
+			outcome,
+			readyMs: Math.round(readyAt ? readyAt - startedAt : -1),
+			execMs: Math.round(settledAt - (readyAt || startedAt)),
+			terminateMs: Math.round(terminatedAt - settledAt),
+			totalMs: Math.round(terminatedAt - startedAt),
+		});
 	}
 }

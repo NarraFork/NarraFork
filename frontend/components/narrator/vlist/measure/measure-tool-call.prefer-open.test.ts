@@ -91,6 +91,35 @@ describe("preferOpen — ask cards default-expand at low LOD, fold still wins", 
 		expect(measured.height).toBeGreaterThan(measured.collapsedHeight);
 	});
 
+	test("explicit preferOpen false overrides the category default without hiding pending forms", () => {
+		const data = {
+			toolName: "AskUserQuestion",
+			summary: "Answered",
+			category: "ask" as const,
+			status: "success" as const,
+		};
+		expect(measureToolCall(data, 400, 3, { preferOpen: false }).effectiveOpened).toBe(false);
+		expect(measureToolCall(data, 400, 3).effectiveOpened).toBe(true);
+		expect(
+			measureToolCall(data, 400, 3, { preferOpen: false, hasPendingPermission: true })
+				.effectiveOpened,
+		).toBe(true);
+	});
+
+	test("a presentation default is not mistaken for an explicit reader fold", () => {
+		const data = {
+			toolName: "Bash",
+			summary: "Background result",
+			category: "bash" as const,
+			status: "success" as const,
+		};
+		expect(measureToolCall(data, 400, 4, { defaultOpened: true }).effectiveOpened).toBe(true);
+		expect(
+			measureToolCall(data, 400, 4, { defaultOpened: true, opened: false }).effectiveOpened,
+		).toBe(false);
+		expect(measureToolCall(data, 400, 5, { defaultOpened: false }).effectiveOpened).toBe(true);
+	});
+
 	test("category ask measure collapses when the reader stored a fold", () => {
 		const measured = measureToolCall(
 			{

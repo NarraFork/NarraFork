@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
-import { isAutoModelValue } from "@shared/auto-model";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
@@ -1347,12 +1346,18 @@ async function ensureNarratorUnlocked(
 	const pending = narratorCreationLocks.get(narratorId);
 	if (pending) return pending;
 
+	// A rebuild after interrupt/edit includes prompt assembly, skill-cache warm-up and a git
+	// probe, none of which shows up in SQL tracing. Time it so revert latency is attributable.
+	const activationStarted = performance.now();
 	const creation = createNarrator(narratorId, locale, replyInUserLanguage);
 	narratorCreationLocks.set(narratorId, creation);
 	try {
 		return await creation;
 	} finally {
 		narratorCreationLocks.delete(narratorId);
+		const activationMs = Math.round(performance.now() - activationStarted);
+		if (activationMs >= 100)
+			logger.info("Narrator activation (createNarrator)", { narratorId, durationMs: activationMs });
 	}
 }
 
@@ -1587,15 +1592,16 @@ async function createNarrator(
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
 
+	// Resolve the channel lock before following defaults or a policy source: either may
+	// resolve to auto:, and an evicted runtime must keep this session's own warm source.
+	const stickyProvider = await lastServedProvider(narratorId);
 	const inheritedModel =
-		narrator.model === FOLLOW_PARENT_MODEL ? await resolveSubagentModelForRun(narrator) : null;
+		narrator.model === FOLLOW_PARENT_MODEL
+			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider)
+			: null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
 	const narratorModel =
-		inheritedModel?.model ??
-		resolveEffectiveModel(
-			narratorModelRef,
-			isAutoModelValue(narratorModelRef) ? lastServedProvider(narratorId) : undefined,
-		);
+		inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef, stickyProvider);
 	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {

@@ -22,7 +22,7 @@
  * here and carry their bytes (`data`), which stored rows never do.
  */
 
-import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import { encodeToolOutput, type ToolOutputImageRef } from "@shared/agent-protocol/tool-output";
 import {
 	type MediaContentBlock,
 	type MediaRef,
@@ -41,6 +41,8 @@ export interface TranscriptToolResult {
 	output: string;
 	isError?: boolean;
 	images?: readonly TranscriptImage[];
+	/** Images already saved by a tool worker; do not decode and upload them again. */
+	imageRefs?: readonly Extract<ToolOutputImageRef, { uploadNarratorId: string }>[];
 	/** Replay uses durable original assets; provider bytes never enter transcript rows. */
 	mediaRefs?: readonly MediaContentBlock[];
 	/** The call's input was invalid and it never ran; the model's history leaves it out. */
@@ -164,13 +166,16 @@ export class LoopTranscript {
 				status: result.isError ? "fail" : "success",
 				outputJson: encodeToolOutput(result.output, {
 					...(result.broken ? { broken: true } : {}),
-					...(!result.broken && result.images?.length
+					...(!result.broken && (result.imageRefs?.length || result.images?.length)
 						? {
-								images: result.images.map((image, position) => ({
-									imageId: `${toolUseId}-${position}`,
-									mediaType: mediaType(image.format),
-									data: image.base64,
-								})),
+								images: [
+									...(result.imageRefs ?? []),
+									...(result.images ?? []).map((image, position) => ({
+										imageId: `${toolUseId}-${position}`,
+										mediaType: mediaType(image.format),
+										data: image.base64,
+									})),
+								],
 							}
 						: {}),
 					...(!result.broken && result.mediaRefs?.length ? { media: [...result.mediaRefs] } : {}),

@@ -31,6 +31,7 @@ import {
 	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
 import { AppError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import {
 	bodyLengthSql,
 	boundedBodyText,
@@ -385,6 +386,15 @@ export class RevertSelectionService {
 			await state.worker.close();
 			this.active--;
 			const durationMs = performance.now() - started;
+			if (durationMs >= 100) {
+				logger.info("Revert selection collect", {
+					narratorId: state.result.narratorId,
+					durationMs: Math.round(durationMs),
+					messages: state.result.history.messages.length,
+					queries: state.queries,
+					completed,
+				});
+			}
 			if (durationMs >= 1000) {
 				const event = { service: "revert-selection" as const, durationMs, queries: state.queries };
 				if (this.options.onSlow) this.options.onSlow(event);

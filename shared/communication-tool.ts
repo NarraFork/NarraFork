@@ -8,7 +8,7 @@ export function isParentSelector(selector: string): boolean {
 	return PARENT_SELECTORS.has(selector.trim().toLowerCase());
 }
 
-/** Communication is conversation content, never a foldable activity/tool row. */
+/** Communication fact used by delivery receipts and hand-off de-duplication. */
 export function isCommunicationTool(tool: { toolName: string; inputJson?: unknown }): boolean {
 	if (tool.toolName === "Send") return true;
 	if (tool.toolName !== "TeamStatus") return false;
@@ -21,6 +21,31 @@ export function isCommunicationTool(tool: { toolName: string; inputJson?: unknow
 				? settled.action
 				: input.action;
 	return action === "send" || action === "broadcast";
+}
+
+/** Read settled streaming arguments without inferring intent from message text. */
+export function communicationInputField(inputJson: unknown, field: string): unknown {
+	const input = objectValue(inputJson);
+	if (input._streamingFieldName === field && Object.hasOwn(input, "_streamingFieldValue")) {
+		return input._streamingFieldValue;
+	}
+	const settled = objectValue(input._streamingFields);
+	return Object.hasOwn(settled, field) ? settled[field] : input[field];
+}
+
+/** Display policy only. Internal communication remains an ordinary, inspectable tool row. */
+export function shouldShowCommunicationBubble(
+	tool: { toolName: string; inputJson?: unknown },
+	compactAuxiliaryContent: boolean,
+): boolean {
+	if (!isCommunicationTool(tool)) return false;
+	if (!compactAuxiliaryContent) return true;
+	return (
+		communicationInputField(tool.inputJson, "show_to_user") === true ||
+		(tool.toolName === "Send" &&
+			typeof communicationInputField(tool.inputJson, "user") === "string" &&
+			(communicationInputField(tool.inputJson, "user") as string).trim().length > 0)
+	);
 }
 
 /** Inline parsing budget, shared by the adapter and defensive measure entry point. */

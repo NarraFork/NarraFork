@@ -41,6 +41,7 @@ test("composition injects exactly its Promise port and disposal restores fail-cl
 		copyRefs: unavailable,
 		page: unavailable,
 		creator: unavailable,
+		lastServedProvider: unavailable,
 	};
 	bindNarratorMessageRefs({ backend: "postgres", port });
 	expect(getNarratorMessageRefsPort()).toBe(port);

@@ -419,6 +419,26 @@ function sanitizeProviderConfigView(value: unknown): RouteResult {
 }
 
 /** Convert catalog/manager data to a bounded public summary. */
+function sanitizeHealth(value: unknown): Record<string, unknown> {
+	if (!value || typeof value !== "object") return {};
+	const item = value as Record<string, unknown>;
+	const result: Record<string, unknown> = {};
+	for (const key of [
+		"surface",
+		"state",
+		"requests",
+		"successes",
+		"failures",
+		"consecutiveFailures",
+		"lastSuccessAt",
+		"lastFailureAt",
+		"averageDurationMs",
+	] as const) {
+		if (item[key] !== undefined) result[key] = item[key];
+	}
+	return result;
+}
+
 function sanitizeSummary(value: unknown): RouteResult {
 	if (!value || typeof value !== "object") return value;
 	if (Array.isArray(value)) return value.map(sanitizeSummary);
@@ -427,6 +447,7 @@ function sanitizeSummary(value: unknown): RouteResult {
 	for (const key of [
 		"pluginId",
 		"status",
+		"builtin",
 		"desiredState",
 		"runtimeState",
 		"compatibility",
@@ -458,6 +479,7 @@ function sanitizeSummary(value: unknown): RouteResult {
 	}
 	if (Array.isArray(item.contributions))
 		result.contributions = item.contributions.map(sanitizeContribution);
+	if (Array.isArray(item.health)) result.health = item.health.map(sanitizeHealth);
 	if (Array.isArray(item.plugins)) result.plugins = item.plugins.map(sanitizeSummary);
 	if (Array.isArray(item.packages)) {
 		result.packages = item.packages.map((entry) => {

@@ -16,11 +16,40 @@
 const PREFER_OPEN_TOOL_NAMES = new Set(["AskUserQuestion", "ExitPlanMode", "GenUI"]);
 
 /** True when a tool call should default-open at every LOD (still collapsible). */
-export function isPreferOpenTool(tool: {
-	toolName: string;
-	status?: string | null;
-	inputJson?: unknown;
-}): boolean {
+export function isPreferOpenTool(
+	tool: {
+		toolName: string;
+		status?: string | null;
+		inputJson?: unknown;
+		outputJson?: unknown;
+		_metadata?: unknown;
+	},
+	policy?: { compactAuxiliaryContent?: boolean; questionStatus?: string },
+): boolean {
+	if (policy?.compactAuxiliaryContent) {
+		const input = objectValue(tool.inputJson);
+		const metadata = objectValue(tool._metadata ?? objectValue(tool.outputJson)._metadata);
+		if (tool.toolName === "AskUserQuestion") {
+			if (policy.questionStatus === "open") return true;
+			if (
+				policy.questionStatus &&
+				["answered", "dismissed", "withdrawn", "resolved"].includes(policy.questionStatus)
+			)
+				return false;
+			// Async success is only an acknowledgement, never proof of an answer.
+			if (Object.keys(objectValue(input.answers)).length > 0) return false;
+			if (input.async === true) return true;
+			return !isTerminal(tool.status);
+		}
+		if (tool.toolName === "ExitPlanMode") return !isTerminal(tool.status);
+		if (tool.toolName === "GenUI") {
+			const action = input.action;
+			if (action === "inspect" || action === "kit_status" || action === "create") return false;
+			if (action === "render" || action === "show" || action === undefined) return true;
+			const kitRequest = objectValue(objectValue(metadata.genUiKit).request);
+			return action === "kit_build" && (!isTerminal(tool.status) || kitRequest.state === "pending");
+		}
+	}
 	if (PREFER_OPEN_TOOL_NAMES.has(tool.toolName)) return true;
 	// A question wait is an answer surface, not an ordinary task-status card.
 	const input = tool.inputJson;
@@ -44,6 +73,19 @@ export function isPreferOpenTool(tool: {
 		input !== null &&
 		"type" in input &&
 		input.type === "question"
+	);
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: {};
+}
+
+function isTerminal(status?: string | null): boolean {
+	return (
+		status != null &&
+		["success", "fail", "error", "denied", "cancelled", "interrupted", "completed"].includes(status)
 	);
 }
 

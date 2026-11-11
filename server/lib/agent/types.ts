@@ -348,6 +348,11 @@ export interface ToolResult {
 	fatal?: boolean;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Images already persisted by the tool; do not load their bytes in the loop. */
+	imageRefs?: Extract<
+		import("@shared/agent-protocol/tool-output").ToolOutputImageRef,
+		{ uploadNarratorId: string }
+	>[];
 	/** Actual bytes for the next provider request, never persisted in events. */
 	media?: NativeMediaInput[];
 	/** Durable asset references used to reconstruct native media on history replay. */
@@ -493,6 +498,11 @@ export type AgentEvent =
 			metadata?: Record<string, unknown>;
 			/** Images the tool returned; the consumer saves them and stores references. */
 			images?: Array<{ format: string; base64: string }>;
+			/** Images already persisted by the tool; preserve references without loading bytes. */
+			imageRefs?: Extract<
+				import("@shared/agent-protocol/tool-output").ToolOutputImageRef,
+				{ uploadNarratorId: string }
+			>[];
 	  }
 	/**
 	 * The tool passed its permission gate and final admission — execution begins NOW.
@@ -778,7 +788,10 @@ export type AgentEvent =
 	| {
 			type: "image_generation";
 			id: string;
+			/** `completed` is authoritative only when a final payload has a result. */
 			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			partialImageIndex?: number;
@@ -788,6 +801,7 @@ export type AgentEvent =
 			width?: number;
 			height?: number;
 			outputIndex?: number;
+			final?: boolean;
 	  }
 	| {
 			type: "model_switched";
@@ -890,11 +904,15 @@ export type ContentBlock =
 	| {
 			type: "image_generation";
 			id: string;
+			status?: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			savedPath?: string;
 			partialSavedPath?: string;
 			partialImageIndex?: number;
+			partialImageB64?: string;
 			outputIndex?: number;
 			width?: number;
 			height?: number;

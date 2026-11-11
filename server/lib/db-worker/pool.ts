@@ -29,6 +29,9 @@ import { cpus } from "node:os";
 import { compiledWorkerSpecifiers } from "../compiled-worker";
 import { hotOnce, hotSafe, hotTimerClear } from "../hot-safe";
 import { logger } from "../logger";
+import { RUNTIME_BUILD_ID } from "../runtime-target";
+import { currentSqlTraceSpan } from "../sql-trace";
+import { assertWorkerBuildId, workerFailureDetails } from "./failure";
 import {
 	DB_WORKER_PROBE_READY_TIMEOUT_MS,
 	DB_WORKER_READY_TIMEOUT_MS,
@@ -43,6 +46,38 @@ const IDLE_REAP_MS = 60_000;
 const IDLE_REAP_INTERVAL_MS = 15_000;
 /** After this many consecutive spawn/ready failures, stop trying and report unavailability. */
 const MAX_SPAWN_FAILURES = 2;
+export const DB_WORKER_MAX_QUEUE = 32;
+
+export class DbReadTaskOverloadedError extends Error {
+	readonly code = "DB_READ_TASK_OVERLOADED";
+	constructor() {
+		super("Database read worker queue is full");
+		this.name = "DbReadTaskOverloadedError";
+	}
+}
+
+function checkTaskDeadline(deadlineAt: number, signal?: AbortSignal): void {
+	if (signal?.aborted) throw new Error("database read task aborted");
+	if (Date.now() >= deadlineAt)
+		throw new DbReadTaskTimeoutError("database read task timed out before dispatch");
+}
+
+function logWorkerFailure(
+	pooled: Pick<PooledWorker, "specifier">,
+	phase: string,
+	error: unknown,
+): void {
+	try {
+		logger.warn("Database read worker failure", {
+			phase,
+			entry: pooled.specifier,
+			buildId: RUNTIME_BUILD_ID,
+			...workerFailureDetails(error, phase === "create" || phase === "ready"),
+		});
+	} catch {
+		/* diagnostics cannot prevent cleanup */
+	}
+}
 
 const REAPER_TIMER_KEY = "narrafork.dbWorkerPool.reaper";
 
@@ -108,6 +143,8 @@ interface QueueWaiter {
 
 interface PooledWorker {
 	worker: Worker;
+	specifier: string;
+	detach: () => void;
 	readySignal: ReadySignal;
 	/** Set once a task's requestId is known; used by the idle reaper and crash accounting. */
 	busyWith: string | null;
@@ -145,6 +182,8 @@ interface PoolState {
 	 * the `workers.length < concurrency` check and the pool would overshoot its cap.
 	 */
 	pendingSpawns: number;
+	starting: Set<PooledWorker>;
+	generation: number;
 	/**
 	 * TEST ONLY (see {@link setDbWorkerSpecifiersForTest}). Overrides the candidate list so a test can
 	 * make spawning fail for real rather than by mocking pool internals.
@@ -153,7 +192,7 @@ interface PoolState {
 }
 
 function state(): PoolState {
-	return hotSafe<PoolState>("narrafork.dbWorkerPool", () => ({
+	const s = hotSafe<PoolState>("narrafork.dbWorkerPool", () => ({
 		workers: [],
 		pending: new Map(),
 		queue: [],
@@ -163,8 +202,14 @@ function state(): PoolState {
 		requestCounter: 0,
 		resolvedWorkerSpecifier: null,
 		pendingSpawns: 0,
+		starting: new Set(),
+		generation: 0,
 		testSpecifiers: null,
 	}));
+	// Source --hot can reuse a pool created before startup bookkeeping existed.
+	s.starting ??= new Set();
+	s.generation ??= 0;
+	return s;
 }
 
 /** Specifiers to try, most likely first. Dev has exactly one; compiled probes every layout. */
@@ -228,6 +273,16 @@ function handleWorkerMessage(pooled: PooledWorker, message: DbWorkerOutbound): v
 	} else if (message.type === "result") {
 		pending.resolve(message.result);
 	} else {
+		try {
+			logger.warn("Database read worker query failed", {
+				entry: pooled.specifier,
+				phase: "read",
+				buildId: RUNTIME_BUILD_ID,
+				...message.diagnostic,
+			});
+		} catch {
+			/* diagnostics must not prevent settlement */
+		}
 		pending.reject(Object.assign(new Error(message.message), { code: message.code }));
 	}
 	drainQueue();
@@ -245,6 +300,8 @@ function retireWorker(pooled: PooledWorker, reason: string): void {
 	const s = state();
 	if (pooled.terminated) return;
 	pooled.terminated = true;
+	pooled.detach?.(); // pre-upgrade source hot-state workers have no detach callback
+	s.starting.delete(pooled);
 	s.workers = s.workers.filter((candidate) => candidate !== pooled);
 	// A worker that dies before reporting ready must not leave a spawner waiting on its budget.
 	settleReady(pooled.readySignal, new Error(`database worker died (${reason})`));
@@ -283,29 +340,50 @@ function settleReady(signal: ReadySignal, error: Error | null): void {
  * mark the worker as failed (the caller retires it explicitly). That separation is what lets probing
  * three candidate paths cost milliseconds instead of one full ready timeout each.
  */
-function awaitReady(pooled: PooledWorker, timeoutMs: number): Promise<void> {
+function awaitReady(
+	pooled: PooledWorker,
+	timeoutMs: number,
+	deadlineAt: number,
+	abortSignal?: AbortSignal,
+): Promise<void> {
+	checkTaskDeadline(deadlineAt, abortSignal);
 	const signal = pooled.readySignal;
 	if (signal.state === "ready") return Promise.resolve();
 	if (signal.state === "failed") {
 		return Promise.reject(signal.error ?? new Error("database worker failed to start"));
 	}
 	return new Promise<void>((resolve, reject) => {
+		const cleanup = () => {
+			clearTimeout(timer);
+			abortSignal?.removeEventListener("abort", abort);
+			const index = signal.waiters.indexOf(waiter);
+			if (index >= 0) signal.waiters.splice(index, 1);
+		};
 		const waiter = {
 			resolve: () => {
-				clearTimeout(timer);
+				cleanup();
 				resolve();
 			},
 			reject: (error: Error) => {
-				clearTimeout(timer);
+				cleanup();
 				reject(error);
 			},
 		};
-		const timer = setTimeout(() => {
-			const index = signal.waiters.indexOf(waiter);
-			if (index >= 0) signal.waiters.splice(index, 1);
-			reject(new Error(`database worker did not become ready within ${timeoutMs}ms`));
-		}, timeoutMs);
+		const abort = () => waiter.reject(new Error("database read task aborted"));
+		const remaining = Math.max(0, deadlineAt - Date.now());
+		const timer = setTimeout(
+			() => {
+				waiter.reject(
+					remaining <= timeoutMs
+						? new DbReadTaskTimeoutError("database read task timed out during worker startup")
+						: new Error(`database worker did not become ready within ${timeoutMs}ms`),
+				);
+			},
+			Math.min(timeoutMs, remaining),
+		);
 		signal.waiters.push(waiter);
+		abortSignal?.addEventListener("abort", abort, { once: true });
+		if (abortSignal?.aborted) abort();
 	});
 }
 
@@ -316,6 +394,14 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
 	const worker = new Worker(specifier);
 	const pooled: PooledWorker = {
 		worker,
+		specifier,
+		detach: () => {
+			removeReadyListeners();
+			worker.onmessage = null;
+			worker.onerror = null;
+			worker.removeEventListener("close", onClose);
+			worker.removeEventListener("messageerror", onMessageError);
+		},
 		busyWith: null,
 		claimed: false,
 		idleSince: Date.now(),
@@ -330,30 +416,35 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
 	const onFirstMessage = (event: MessageEvent<DbWorkerOutbound>) => {
 		if (event.data?.type !== "ready") return;
 		removeReadyListeners();
-		settleReady(pooled.readySignal, null);
-	};
-	const onStartupError = (event: ErrorEvent) => {
-		removeReadyListeners();
-		settleReady(pooled.readySignal, new Error(event?.message ?? "database worker failed to start"));
+		try {
+			assertWorkerBuildId(event.data.buildId);
+			settleReady(pooled.readySignal, null);
+		} catch (error) {
+			settleReady(pooled.readySignal, error as Error);
+		}
 	};
 	function removeReadyListeners(): void {
 		worker.removeEventListener("message", onFirstMessage as EventListener);
-		worker.removeEventListener("error", onStartupError as EventListener);
 	}
 	worker.addEventListener("message", onFirstMessage as EventListener);
-	worker.addEventListener("error", onStartupError as EventListener);
 
 	worker.onmessage = (event: MessageEvent<DbWorkerOutbound>) =>
 		handleWorkerMessage(pooled, event.data);
 	worker.onerror = (event: ErrorEvent) => {
-		retireWorker(
-			pooled,
-			pooled.privatePgTask ? "PostgreSQL read worker failed" : (event?.message ?? "worker error"),
-		);
+		logWorkerFailure(pooled, pooled.readySignal.state === "pending" ? "ready" : "run", event);
+		retireWorker(pooled, pooled.privatePgTask ? "PostgreSQL read worker failed" : "worker error");
 	};
-	// Bun fires this when the worker thread exits (including our own shutdown request).
-	worker.addEventListener("close", (() => retireWorker(pooled, "closed")) as EventListener);
-
+	const onClose = () => {
+		logWorkerFailure(pooled, "close", new Error("worker closed before completion"));
+		retireWorker(pooled, "closed");
+	};
+	const onMessageError = (event: Event) => {
+		logWorkerFailure(pooled, "message", event);
+		retireWorker(pooled, "message deserialization failed");
+	};
+	worker.addEventListener("close", onClose);
+	worker.addEventListener("messageerror", onMessageError);
+	state().starting.add(pooled);
 	ensureReaper();
 	return pooled;
 }
@@ -369,23 +460,34 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
  * worker still deserves the full ready budget. Earlier candidates get the short probe budget, which
  * is what keeps a compiled binary's first spawn from costing 3 x DB_WORKER_READY_TIMEOUT_MS.
  */
-async function spawnReadyWorker(): Promise<PooledWorker> {
+async function spawnReadyWorker(
+	deadlineAt: number,
+	signal: AbortSignal | undefined,
+	generation: number,
+): Promise<PooledWorker> {
 	const candidates = workerSpecifierCandidates();
-	const failures: string[] = [];
 	for (const [index, specifier] of candidates.entries()) {
+		checkTaskDeadline(deadlineAt, signal);
 		const isLastCandidate = index === candidates.length - 1;
 		const budget = isLastCandidate ? DB_WORKER_READY_TIMEOUT_MS : DB_WORKER_PROBE_READY_TIMEOUT_MS;
-		const pooled = spawnWorkerFrom(specifier);
+		let pooled: PooledWorker | undefined;
 		try {
-			await awaitReady(pooled, budget);
+			pooled = spawnWorkerFrom(specifier);
+			await awaitReady(pooled, budget, deadlineAt, signal);
+			checkTaskDeadline(deadlineAt, signal);
+			if (state().generation !== generation) throw new WorkersUnavailableError("pool_shutdown");
 			state().resolvedWorkerSpecifier = specifier;
+			state().starting.delete(pooled);
 			return pooled;
 		} catch (err) {
-			failures.push(`${specifier}: ${err instanceof Error ? err.message : String(err)}`);
-			retireWorker(pooled, "candidate rejected");
+			if (pooled) retireWorker(pooled, "candidate rejected");
+			if (state().generation !== generation) throw new WorkersUnavailableError("pool_shutdown");
+			checkTaskDeadline(deadlineAt, signal);
+			if (err instanceof DbReadTaskTimeoutError) throw err;
+			logWorkerFailure({ specifier }, pooled ? "ready" : "create", err);
 		}
 	}
-	throw new Error(`no usable database worker entry (tried ${failures.join(" | ")})`);
+	throw new Error("no usable database worker entry");
 }
 
 /**
@@ -407,8 +509,10 @@ type AcquireOutcome =
  * Claims synchronously (before the first `await`) so two concurrent callers can never be handed the
  * same worker.
  */
-async function acquireWorker(): Promise<AcquireOutcome> {
+async function acquireWorker(deadlineAt: number, signal?: AbortSignal): Promise<AcquireOutcome> {
+	checkTaskDeadline(deadlineAt, signal);
 	const s = state();
+	const generation = s.generation;
 	// Also checked at the `runReadTask` entry point, but a caller released from the queue re-enters
 	// here directly — without this the pool would keep paying for spawns after being declared dead.
 	const disabled = workersDisabled();
@@ -429,28 +533,31 @@ async function acquireWorker(): Promise<AcquireOutcome> {
 	s.pendingSpawns += 1;
 
 	try {
-		const pooled = await spawnReadyWorker();
+		const pooled = await spawnReadyWorker(deadlineAt, signal, generation);
+		if (s.generation !== generation || signal?.aborted || Date.now() >= deadlineAt) {
+			retireWorker(pooled, "acquisition cancelled");
+			checkTaskDeadline(deadlineAt, signal);
+			throw new WorkersUnavailableError("pool_shutdown");
+		}
 		// Claimed before returning, so a concurrent caller grows the pool rather than taking this one.
 		pooled.claimed = true;
 		s.workers.push(pooled);
 		s.spawnFailures = 0;
 		return { kind: "worker", worker: pooled };
 	} catch (err) {
+		checkTaskDeadline(deadlineAt, signal);
+		if (err instanceof DbReadTaskTimeoutError || err instanceof WorkersUnavailableError) throw err;
 		s.spawnFailures += 1;
 		if (s.spawnFailures >= MAX_SPAWN_FAILURES) {
 			s.disabledReason = "worker_unavailable";
-			logger.warn("Database read workers disabled after repeated startup failures", {
-				error: err instanceof Error ? err.message : String(err),
-			});
+			logWorkerFailure({ specifier: "pool" }, "ready", err);
 		} else {
-			logger.warn("Database read worker failed to start", {
-				error: err instanceof Error ? err.message : String(err),
-				spawnFailures: s.spawnFailures,
-			});
+			logWorkerFailure({ specifier: "pool" }, "ready", err);
 		}
 		return { kind: "spawn_failed", reason: "worker_spawn_failed" };
 	} finally {
-		s.pendingSpawns -= 1;
+		if (s.generation === generation) s.pendingSpawns -= 1;
+		drainQueue();
 	}
 }
 
@@ -475,6 +582,11 @@ function availableCapacity(): number {
  */
 function drainQueue(): void {
 	const s = state();
+	const disabled = workersDisabled();
+	if (disabled) {
+		for (const waiter of s.queue.splice(0)) waiter.fail(new WorkersUnavailableError(disabled));
+		return;
+	}
 	let quota = availableCapacity();
 	while (quota > 0 && s.queue.length > 0) {
 		const next = s.queue.shift();
@@ -520,7 +632,9 @@ function ensureReaper(): void {
  * drain does not release a dead slot.
  */
 function waitForCapacity(deadlineAt: number, signal: AbortSignal | undefined): Promise<void> {
+	checkTaskDeadline(deadlineAt, signal);
 	const s = state();
+	if (s.queue.length >= DB_WORKER_MAX_QUEUE) throw new DbReadTaskOverloadedError();
 	return new Promise<void>((resolve, reject) => {
 		const waiter: QueueWaiter = {
 			release: () => {
@@ -583,12 +697,15 @@ async function dispatch(
 	deadlineAt: number,
 ): Promise<unknown> {
 	const s = state();
+	const traceParent = currentSqlTraceSpan()?.id;
+	const generation = s.generation;
 
 	// Loop rather than recurse: a released waiter may still lose the race for the freed worker, and
 	// retrying must not grow the stack or reset the deadline.
 	let pooled: PooledWorker | null = null;
 	while (!pooled) {
-		const outcome = await acquireWorker();
+		if (s.generation !== generation) throw new WorkersUnavailableError("pool_shutdown");
+		const outcome = await acquireWorker(deadlineAt, options.signal);
 		if (outcome.kind === "worker") {
 			pooled = outcome.worker;
 			break;
@@ -599,6 +716,14 @@ async function dispatch(
 		await waitForCapacity(deadlineAt, options.signal);
 	}
 	const worker = pooled;
+	try {
+		checkTaskDeadline(deadlineAt, options.signal);
+		if (worker.terminated) throw new WorkersUnavailableError("pool_shutdown");
+	} catch (error) {
+		releaseWorker(worker);
+		drainQueue();
+		throw error;
+	}
 
 	s.requestCounter += 1;
 	const requestId = `dbr-${Date.now().toString(36)}-${s.requestCounter.toString(36)}`;
@@ -623,6 +748,7 @@ async function dispatch(
 		const requestCancellation = (error: Error, reason: string) => {
 			const pending = s.pending.get(requestId);
 			if (!pending || pending.cancellingError) return;
+			if (reason === "task timeout") logWorkerFailure(worker, "task-timeout", error);
 			if (params.kind === "displayPageMessagesPostgres") {
 				// PG SQL is async: let native Query.cancel() stop the remote statement and
 				// close its connection BEFORE releasing/reusing this pool slot. The outer
@@ -682,8 +808,9 @@ async function dispatch(
 		}
 
 		try {
-			worker.worker.postMessage({ type: "task", requestId, dbPath, params });
+			worker.worker.postMessage({ type: "task", requestId, dbPath, params, traceParent });
 		} catch (err) {
+			logWorkerFailure(worker, "dispatch", err);
 			s.pending.delete(requestId);
 			retireWorker(worker, "postMessage failed");
 			settleReject(err instanceof Error ? err : new Error(String(err)));
@@ -712,10 +839,12 @@ export async function runEphemeralReadTask<T>(
 	options: RunReadTaskOptions = {},
 ): Promise<T> {
 	const specifiers = workerSpecifierCandidates();
+	const deadlineAt = Date.now() + (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
 	let lastError: Error | null = null;
 	for (const specifier of specifiers) {
 		try {
-			return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options);
+			checkTaskDeadline(deadlineAt, options.signal);
+			return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options, deadlineAt);
 		} catch (err) {
 			if (
 				options.signal?.aborted ||
@@ -734,9 +863,11 @@ function runEphemeralOnSpecifier<T>(
 	dbPath: string,
 	params: DbReadTaskParams,
 	options: RunReadTaskOptions,
+	deadlineAt: number,
 ): Promise<T> {
 	const requestId = `ephemeral-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-	const timeoutMs = options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
+	const timeoutMs = Math.max(0, deadlineAt - Date.now());
+	const traceParent = currentSqlTraceSpan()?.id;
 	return new Promise<T>((resolve, reject) => {
 		const worker = new Worker(specifier);
 		let settled = false;
@@ -745,6 +876,11 @@ function runEphemeralOnSpecifier<T>(
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			clearTimeout(readyTimer);
+			worker.onmessage = null;
+			worker.onerror = null;
+			worker.removeEventListener("close", onClose);
+			worker.removeEventListener("messageerror", onMessageError);
 			options.signal?.removeEventListener("abort", onAbort);
 			try {
 				worker.terminate();
@@ -766,6 +902,26 @@ function runEphemeralOnSpecifier<T>(
 			() => finish(new DbReadTaskTimeoutError(`database read task timed out after ${timeoutMs}ms`)),
 			timeoutMs,
 		);
+		const readyTimer = setTimeout(
+			() => finish(new Error("database worker did not become ready")),
+			DB_WORKER_READY_TIMEOUT_MS,
+		);
+		const onClose = () => {
+			const error = ready
+				? new DbReadTaskExecutionError("database worker closed before completion")
+				: new Error("database worker closed before readiness");
+			logWorkerFailure({ specifier }, ready ? "close" : "startup-close", error);
+			finish(error);
+		};
+		const onMessageError = () => {
+			const error = ready
+				? new DbReadTaskExecutionError("database worker message failed")
+				: new Error("database worker message failed before readiness");
+			logWorkerFailure({ specifier }, "message", error);
+			finish(error);
+		};
+		worker.addEventListener("close", onClose);
+		worker.addEventListener("messageerror", onMessageError);
 		if (options.signal) {
 			if (options.signal.aborted) {
 				finish(new Error("database read task aborted"));
@@ -774,7 +930,12 @@ function runEphemeralOnSpecifier<T>(
 			options.signal.addEventListener("abort", onAbort, { once: true });
 		}
 		worker.onerror = (event: ErrorEvent) => {
-			finish(new Error(event?.message ?? "database worker failed to start"));
+			logWorkerFailure({ specifier }, ready ? "run" : "ready", event);
+			finish(
+				ready
+					? new DbReadTaskExecutionError("database worker failed")
+					: new Error("database worker failed to start"),
+			);
 		};
 		worker.onmessage = (event: MessageEvent<DbWorkerOutbound>) => {
 			const message = event.data;
@@ -783,9 +944,12 @@ function runEphemeralOnSpecifier<T>(
 					finish(new Error("database worker sent no ready handshake"));
 					return;
 				}
-				ready = true;
 				try {
-					worker.postMessage({ type: "task", requestId, dbPath, params });
+					assertWorkerBuildId(message.buildId);
+					checkTaskDeadline(deadlineAt, options.signal);
+					ready = true;
+					clearTimeout(readyTimer);
+					worker.postMessage({ type: "task", requestId, dbPath, params, traceParent });
 				} catch (err) {
 					finish(err instanceof Error ? err : new Error(String(err)));
 				}
@@ -804,7 +968,11 @@ function runEphemeralOnSpecifier<T>(
 				return;
 			}
 			if (message?.type === "error" && message.requestId === requestId) {
-				finish(new DbReadTaskExecutionError(message.message || "database worker failed"));
+				finish(
+					Object.assign(new DbReadTaskExecutionError(message.message || "database worker failed"), {
+						code: message.code,
+					}),
+				);
 			}
 		};
 	});
@@ -844,6 +1012,8 @@ export async function runReadTask<T>(
 /** Terminate all workers and clear pool state. Safe to call repeatedly. */
 export function shutdownDbWorkerPool(): void {
 	const s = state();
+	s.generation += 1;
+	s.pendingSpawns = 0;
 	hotTimerClear(REAPER_TIMER_KEY);
 	// Empty the queue FIRST. Retiring a worker calls `drainQueue`, which would otherwise release a
 	// waiter mid-shutdown; that waiter then sees free capacity and spawns a brand new worker just as
@@ -854,7 +1024,7 @@ export function shutdownDbWorkerPool(): void {
 	for (const waiter of waiters) {
 		waiter.fail(new WorkersUnavailableError("pool_shutdown"));
 	}
-	for (const pooled of [...s.workers]) {
+	for (const pooled of [...s.workers, ...s.starting]) {
 		try {
 			pooled.worker.postMessage({ type: "shutdown" });
 		} catch {
@@ -916,6 +1086,9 @@ export function getDbWorkerPoolStats(): {
 	inFlight: number;
 	disabledReason: string | null;
 	concurrency: number;
+	starting: number;
+	claimed: number;
+	spawnFailures: number;
 } {
 	const s = state();
 	return {
@@ -925,6 +1098,9 @@ export function getDbWorkerPoolStats(): {
 		inFlight: s.inFlight.size,
 		disabledReason: workersDisabled(),
 		concurrency: getConfiguredConcurrency(),
+		starting: s.pendingSpawns,
+		claimed: s.workers.filter((pooled) => pooled.claimed).length,
+		spawnFailures: s.spawnFailures,
 	};
 }
 

@@ -28,6 +28,8 @@ export type VListElementKind =
 	| "ask-in-passing"
 	| "subagent-recovery"
 	| "tool-call"
+	/** A real message or system event using the shared tool-card presentation. */
+	| "auxiliary-content"
 	| "tool-call-group"
 	| "tool-run-count"
 	| "activity-trace"

@@ -31,6 +31,7 @@ import {
 	toolNamesSpecPath,
 	toolSpecPathError,
 } from "../spec-uri";
+import { withSqlTraceSpan } from "../sql-trace";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
@@ -92,6 +93,8 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Already saved image assets; never re-decode these through the upload lane. */
+	imageRefs?: ToolResult["imageRefs"];
 	media?: NativeMediaInput[];
 	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
@@ -788,10 +791,21 @@ export function getOutlineSpecRejection(
 	};
 }
 
-export async function executeTool(
+export function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
+): Promise<ToolExecResult> {
+	// SQL tracing (NF_SQL_TRACE): statements run by this tool call are attributed to it.
+	return withSqlTraceSpan("tool", `tool ${tu.name}`, { narratorId: config.narratorId }, () =>
+		executeToolUntraced(tu, config, options),
+	);
+}
+
+async function executeToolUntraced(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	options: ExecuteToolOptions,
 ): Promise<ToolExecResult> {
 	const reflectionRejection = getReflectionToolRejection(tu, config);
 	if (reflectionRejection) {
@@ -1774,6 +1788,7 @@ export async function executeTool(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						imageRefs: result.imageRefs,
 						media: result.media,
 						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
@@ -1795,6 +1810,7 @@ export async function executeTool(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					imageRefs: result.imageRefs,
 					media: result.media,
 					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
@@ -1813,6 +1829,7 @@ export async function executeTool(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				imageRefs: result.imageRefs,
 				media: result.media,
 				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,

@@ -154,7 +154,9 @@ export async function resolveProjectionAssets(
 				continue;
 			}
 			if (block.kind === "tool" && block.subtype === "image_generation") {
+				if (block.phase !== "done") continue;
 				const result = block.providerMeta?.result as Record<string, unknown> | undefined;
+				if (result?.status && result.status !== "completed") continue;
 				const savedPath = typeof result?.savedPath === "string" ? result.savedPath : undefined;
 				if (!savedPath || (typeof result?.result === "string" && result.result)) continue;
 				try {

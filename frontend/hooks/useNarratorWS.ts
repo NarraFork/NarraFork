@@ -733,7 +733,7 @@ export interface NarratorWSCallbacks {
 	) => void;
 	onImageGeneration?: (
 		id: string,
-		status: "in_progress" | "generating" | "completed",
+		status: string,
 		revisedPrompt?: string,
 		outputIndex?: number,
 		partialImageIndex?: number,
@@ -742,6 +742,8 @@ export interface NarratorWSCallbacks {
 		width?: number,
 		height?: number,
 		parentToolUseId?: string,
+		error?: string,
+		errorCode?: string,
 	) => void;
 	onNarratorError?: (
 		error: string,
@@ -868,6 +870,8 @@ export interface NarratorWSCallbacks {
 					type: "image_generation";
 					id: string;
 					status: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					result?: string;
 					partialImageIndex?: number;
@@ -1524,7 +1528,7 @@ export function useNarratorWS(
 					case "image_generation":
 						callbackOwner.callbacks.onImageGeneration?.(
 							data.id as string,
-							data.status as "in_progress" | "generating" | "completed",
+							data.status as string,
 							data.revisedPrompt as string | undefined,
 							data.outputIndex as number | undefined,
 							data.partialImageIndex as number | undefined,
@@ -1533,6 +1537,8 @@ export function useNarratorWS(
 							data.width as number | undefined,
 							data.height as number | undefined,
 							data.parentToolUseId as string | undefined,
+							data.error as string | undefined,
+							data.errorCode as string | undefined,
 						);
 						break;
 					case "narrator_error":
@@ -1802,8 +1808,15 @@ export function useNarratorWS(
 										type: "image_generation";
 										id: string;
 										status: string;
+										error?: string;
+										errorCode?: string;
 										revisedPrompt?: string;
 										result?: string;
+										partialImageIndex?: number;
+										partialSavedPath?: string;
+										savedPath?: string;
+										width?: number;
+										height?: number;
 										outputIndex?: number;
 								  }
 								| {

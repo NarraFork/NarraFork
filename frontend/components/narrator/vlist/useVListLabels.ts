@@ -322,6 +322,7 @@ export function useVListLabels(): VListLabels {
 		() => ({
 			historyCleared: t("historyCleared"),
 			toolDetailsCleared: t("toolDetailsCleared"),
+			status_fail: t("traceRowMark.failed"),
 			// ── compact / segment-compact indicator lines ───────────────────────────
 			compacting: t("compacting"),
 			compacted: t("compacted"),
@@ -376,6 +377,10 @@ export function useVListLabels(): VListLabels {
 			imageGenerated: t("imageGenerated"),
 			imageGenerating: t("imageGenerating"),
 			imageGenerationPreparing: t("imageGenerationPreparing"),
+			imageGenerationFailed: t("imageGenerationFailed"),
+			imageGenerationCancelled: t("imageGenerationCancelled"),
+			imageGenerationIncomplete: t("imageGenerationIncomplete"),
+			imageGenerationNoImage: t("imageGenerationNoImage"),
 			// ── web_search header status ─────────────────────────────────────────────
 			webSearched: t("webSearched"),
 			webSearching: t("webSearching"),
@@ -1011,6 +1016,7 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 	switch (kind) {
 		case "reasoning":
 			return labels.reasoning;
+		case "auxiliary-content":
 		case "tool-call":
 			return labels.toolCall;
 		case "activity-trace":

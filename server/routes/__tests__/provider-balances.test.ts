@@ -1,9 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { getNarraforkPath } from "../../lib/narrafork-home";
 import * as outbound from "../../lib/net/outbound-fetch";
 import { providerBalanceCache } from "../../lib/provider-balance-cache";
+import { getProviderKeyStore } from "../../lib/provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
+import { quotaKeyOwner } from "../../lib/settings/provider-keys-projection";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { providerBalanceRoutes } from "../provider-balances";
@@ -168,6 +172,53 @@ describe("provider balance API and settings integration", () => {
 		expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer key-replaced");
 	});
 
+	test("settings masks site tokens and a masked PATCH preserves the separate stored credential", async () => {
+		const app = appForRole("admin");
+		const store = getProviderKeyStore();
+		const owner = quotaKeyOwner(config().id);
+		const patch = async (value: CustomApiProviderConfig) => {
+			const response = await app.request("/api/settings", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ customApiProviders: [value] }),
+			});
+			expect(response.status).toBe(200);
+			const body = await response.json();
+			expect(JSON.stringify(body)).not.toContain("site-route-secret");
+			return body.customApiProviders[0] as CustomApiProviderConfig;
+		};
+		try {
+			await patch({ ...config(), quotaAccessToken: "site-route-secret", quotaUserId: "42" });
+			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
+			expect(store.firstKey(owner)).toBe("site-route-secret");
+			expect(store.firstKey(config().id)).toBe("key-current");
+			for (const role of ["admin", "user"] as const) {
+				const response = await appForRole(role).request("/api/settings");
+				expect(response.status).toBe(200);
+				const body = await response.json();
+				expect(JSON.stringify(body)).not.toContain("site-route-secret");
+				expect(body.customApiProviders[0].quotaAccessToken).toMatch(/^\*/);
+			}
+			const masked = (await (await app.request("/api/settings")).json())
+				.customApiProviders[0] as CustomApiProviderConfig;
+			await patch({ ...masked, name: "Renamed without re-entering credentials" });
+			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-route-secret");
+			expect(store.firstKey(owner)).toBe("site-route-secret");
+			expect(store.firstKey(config().id)).toBe("key-current");
+			for (const file of ["settings.json", "provider-keys.json"]) {
+				expect(readFileSync(getNarraforkPath(file), "utf8")).not.toContain("site-route-secret");
+			}
+			await patch({ ...masked, quotaAccessToken: "" });
+			expect(store.list(owner)).toEqual([]);
+			expect(settings.customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
+			expect(store.firstKey(config().id)).toBe("key-current");
+		} finally {
+			saveSettings({ ...settings, customApiProviders: [] });
+			store.removeProvider(config().id);
+			store.removeProvider(owner);
+		}
+	});
+
 	test("failed save cannot start discovery", async () => {
 		const response = await appForRole("admin").request("/api/settings", {
 			method: "PATCH",
@@ -176,5 +227,63 @@ describe("provider balance API and settings integration", () => {
 		});
 		expect(response.status).toBe(400);
 		expect(outbound.outboundFetch).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * The bundled `apikey-quota` plugin is the default answerer for every entry point that reads
+ * balance data. These cases pin the entry points themselves, so a change in the engine cannot
+ * make the settings projection and the route disagree about the same provider.
+ */
+describe("apikey-quota answers every entry point consistently", () => {
+	afterEach(async () => {
+		const { resetProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
+		resetProviderBalanceEngine();
+		providerBalanceCache.sync();
+	});
+
+	test("settings generation and the route snapshot are the same key", async () => {
+		await providerBalanceCache.request(config().id);
+		const settingsBody = (await (await appForRole("admin").request("/api/settings")).json()) as {
+			providerBalanceGenerations?: Record<string, unknown>;
+		};
+		const routeBody = (await (
+			await appForRole("user").request("/api/provider-balances")
+		).json()) as Record<string, { generation?: unknown; status?: unknown }>;
+
+		// The badge hook keys its query on the settings generation and treats a mismatch with
+		// the route snapshot as "settings are stale" (see useProviderBalance). Both surfaces
+		// must therefore report the same generation for the same provider.
+		expect(settingsBody.providerBalanceGenerations?.[config().id]).toBe(
+			routeBody[config().id]?.generation,
+		);
+		expect(routeBody[config().id]?.status).toBe("supported");
+	});
+
+	test("a disabled plugin reports plugin_not_enabled instead of answering the route", async () => {
+		const { createApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
+		const { setProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
+		// The plugin owns the capability, so disabling it must be visible on the route the UI
+		// reads — and the bundled transport must not answer the question behind its back.
+		const engine = createApikeyQuotaEngine({
+			tools: {
+				invoke: async () => {
+					throw Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" });
+				},
+			},
+			activator: { activate: async () => undefined },
+		});
+		setProviderBalanceEngine(engine);
+		try {
+			await providerBalanceCache.request(config().id);
+			const response = await appForRole("user").request("/api/provider-balances");
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({
+				[config().id]: { status: "error", error: "plugin_not_enabled", balance: null },
+			});
+			expect(outbound.outboundFetch).not.toHaveBeenCalled();
+		} finally {
+			await engine.dispose();
+		}
 	});
 });

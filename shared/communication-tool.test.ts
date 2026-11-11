@@ -1,9 +1,60 @@
 import { expect, test } from "bun:test";
 import {
+	isCommunicationTool,
 	knownSendDeliveryTargets,
 	mergeSendDeliveryTargetCount,
 	mergeSendDeliveryTargets,
+	shouldShowCommunicationBubble,
 } from "./communication-tool";
+
+test("communication fact is independent from compact bubble intent", () => {
+	for (const tool of [
+		{ toolName: "Send", inputJson: { id: "child", message: "internal" } },
+		{ toolName: "TeamStatus", inputJson: { action: "send", message: "internal" } },
+		{ toolName: "TeamStatus", inputJson: { action: "broadcast", message: "internal" } },
+	]) {
+		expect(isCommunicationTool(tool)).toBe(true);
+		expect(shouldShowCommunicationBubble(tool, false)).toBe(true);
+		expect(shouldShowCommunicationBubble(tool, true)).toBe(false);
+		expect(
+			shouldShowCommunicationBubble(
+				{ ...tool, inputJson: { ...tool.inputJson, show_to_user: false } },
+				true,
+			),
+		).toBe(false);
+		expect(
+			shouldShowCommunicationBubble(
+				{ ...tool, inputJson: { ...tool.inputJson, show_to_user: true } },
+				true,
+			),
+		).toBe(true);
+	}
+	expect(
+		shouldShowCommunicationBubble({ toolName: "Send", inputJson: { user: "person" } }, true),
+	).toBe(true);
+	expect(
+		shouldShowCommunicationBubble(
+			{ toolName: "Send", inputJson: { _streamingFields: { show_to_user: true } } },
+			true,
+		),
+	).toBe(true);
+	expect(
+		shouldShowCommunicationBubble(
+			{
+				toolName: "Send",
+				inputJson: {
+					show_to_user: true,
+					_streamingFieldName: "show_to_user",
+					_streamingFieldValue: false,
+				},
+			},
+			true,
+		),
+	).toBe(false);
+	expect(
+		shouldShowCommunicationBubble({ toolName: "Read", inputJson: { show_to_user: true } }, true),
+	).toBe(false);
+});
 
 test("stable receipt retains adopted revision while COW updates its address", () => {
 	const [target] = mergeSendDeliveryTargets(

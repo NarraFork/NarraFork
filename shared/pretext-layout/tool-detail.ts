@@ -52,6 +52,7 @@ import {
 	type DiffSourcePoint,
 	MAX_DIFF_INPUT_CHARS,
 } from "./diff-core";
+import type { InjectionTarget } from "./injection-target";
 import {
 	isOutlineDecisionCall,
 	OUTLINE_CARD_LABEL_FALLBACKS,
@@ -465,6 +466,8 @@ export interface ToolStructuredEntry {
 	title: string;
 	/** External link for the title (render layer draws an <a>). Height-neutral. */
 	href?: string;
+	/** In-app destination; the host decides whether it can open it. */
+	target?: InjectionTarget;
 	/** Secondary info shown after/below the title (domain / time / seq). */
 	meta?: string;
 	/** Body excerpt (wraps, clamped to a fixed number of lines). */
@@ -1117,11 +1120,13 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				? single("gen-ui", { kind: "gen-ui", file: null, ...uiKitFields })
 				: null;
 	const base = withErrorSection(
-		toolName === "GenUI"
-			? uiInput?.action === "inspect"
-				? classifyGenUiInspection(output)
-				: (uiDetail ?? sections([textSection("output.main", output, "output")]))
-			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
+		toolName === "ImageGen"
+			? classifyToolImages(output)
+			: toolName === "GenUI"
+				? uiInput?.action === "inspect"
+					? classifyToolImages(output)
+					: (uiDetail ?? sections([textSection("output.main", output, "output")]))
+				: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
 		input.outputJson,
 	);
@@ -1165,7 +1170,7 @@ function liveAppFile(
 }
 
 /** Inspection screenshots use the existing private upload lane, not diagnostic metadata URLs. */
-function classifyGenUiInspection(output: unknown): ToolDetailData | null {
+function classifyToolImages(output: unknown): ToolDetailData | null {
 	return sections([
 		textSection("output.main", output, "output"),
 		...toolOutputImages(output).flatMap((image, index) => {
