@@ -195,8 +195,22 @@
 	border-radius: 50%;
 }
 
-.bullet:hover {
-	color: var(--mantine-color-indigo-5);
+/*
+ * The folding arrow: a plain button (no hover style on a frame part, as in the live editor:
+ * touch has no hover, and Chromium retargets a nearby long press to an element with one).
+ */
+.toggleButton {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 0;
+	background: none;
+	color: var(--mantine-color-dimmed);
+	border-radius: var(--mantine-radius-sm);
+	cursor: pointer;
 }
 
 /* The outline's icons (`outline-icons.ts`), sized as the live editor's frame draws them. */
@@ -318,6 +332,64 @@
 .focusHandle svg {
 	width: var(--nf-outline-chevron);
 	height: var(--nf-outline-chevron);
+}
+
+/*
+ * The row's quick control (everything inside it: expand, or back to the default view): always
+ * drawn, on the first line, before the focus handle. No `:hover` rule (see `.focusHandle`).
+ */
+.foldAll {
+	flex: 0 0 20px;
+	height: var(--nf-type-body-line);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	border: 0;
+	background: none;
+	color: var(--mantine-color-dimmed);
+	border-radius: var(--mantine-radius-sm);
+	cursor: pointer;
+}
+
+/* The page's control: 「全部展开 / 全部收起」, at the tree's top right. */
+.foldPage {
+	align-self: flex-end;
+	flex: none;
+}
+
+/*
+ * What a closed row holds, as ONE line under it: the first line of its first block, cut with an
+ * ellipsis, and how much more there is. It starts where the row's text does (the indentation,
+ * the arrow's column, the marker's column and the three 4px gaps between them).
+ */
+.preview {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	padding-left: calc(var(--nf-fold-indent, 0px) + 32px + max(16px, var(--nf-outline-icon)));
+	padding-bottom: 2px;
+	white-space: nowrap;
+	cursor: pointer;
+	color: var(--mantine-color-dimmed);
+	font-size: var(--nf-type-body-size);
+	line-height: var(--nf-type-body-line);
+	border-radius: var(--mantine-radius-sm);
+	content-visibility: auto;
+	contain-intrinsic-size: auto calc(var(--nf-type-body-line) + 2px);
+}
+
+.previewText {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.previewLabel {
+	flex: 0 0 auto;
+	color: var(--mantine-color-anchor);
 }
 
 .meta {

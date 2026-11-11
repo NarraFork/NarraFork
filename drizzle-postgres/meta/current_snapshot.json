@@ -1,6 +1,6 @@
 {
-  "id": "c15812ac-e414-43f9-aee6-4290c568a3e5",
-  "prevId": "c62a7648-b67f-432a-b39e-aa9145a2c13d",
+  "id": "1363fe77-68fa-4135-8d93-e64136d06a6d",
+  "prevId": "c15812ac-e414-43f9-aee6-4290c568a3e5",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -19535,6 +19535,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'::text"
+        },
+        "expanded_json": {
+          "name": "expanded_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "layout": {
           "name": "layout",
