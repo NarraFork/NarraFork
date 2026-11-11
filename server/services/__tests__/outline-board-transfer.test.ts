@@ -342,7 +342,7 @@ describe("转交并开始", () => {
 		const { owner, projectId, space } = await world();
 		for (const [options, reason] of [
 			[{ status: "working" as const }, "busy"],
-			[{ traits: ["standalone", "plan"] }, "plan_mode"],
+			[{ traits: ["standalone", "plan"] as string[] }, "plan_mode"],
 			[{ continuation: "protectedOnly" as const }, "continuation_mode"],
 		] as const) {
 			const target = await session(owner, projectId, options);

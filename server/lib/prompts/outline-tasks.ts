@@ -548,6 +548,19 @@ function changeText(change: OutlineTaskEditChange, locale: Locale): string {
 			return zh ? "放进了可领取池" : "put in the claim pool";
 		case "overlap":
 			return zh ? `也在改 ${change.path}` : `also changing ${change.path}`;
+		// Team events' changes (P2 PR 10a): worded by `getOutlineTeamEventsNote`; a fallback too.
+		case "assignedHere":
+			return zh ? "指派给了本会话" : "assigned to this session";
+		case "created":
+			return zh ? "本会话建的" : "created by this session";
+		case "unblocked":
+			return zh
+				? change.by === "done"
+					? "一个前置已完成"
+					: "一个前置被取消了"
+				: change.by === "done"
+					? "a prerequisite was finished"
+					: "a prerequisite was cancelled";
 	}
 }
 

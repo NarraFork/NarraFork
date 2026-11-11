@@ -307,7 +307,7 @@ describe("the row and its wake", () => {
 
 	test("plan mode, or a last run stopped by its person or by an error: the row is written, nobody is woken", async () => {
 		for (const [change, expectWake] of [
-			[{ traits: ["plan"] }, false],
+			[{ traits: ["plan"] as string[] }, false],
 			[{ lastStopReason: "user_interrupt" as const }, false],
 			[{ lastStopReason: "error" as const }, false],
 			[{ lastStopReason: "normal" as const }, true],
