@@ -7,6 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { OUTLINE_DELEGATION_LIMITS, renderDelegationBrief } from "../delegation";
+import { DELEGATION_TEXT } from "../delegation-text";
 import { outlineTaskStartBlocker } from "../task-json";
 import { OUTLINE_TASK_BRIEF_LIMITS, renderTaskBrief, type TaskBriefInput } from "../task-session";
 import { delegationFixtures } from "./task-brief-fixtures";
@@ -47,12 +48,22 @@ function input(over: Partial<TaskBriefInput> = {}): TaskBriefInput {
 }
 
 describe("the delegation brief is unchanged", () => {
-	// Rendered by the renderer as it was on main before this change (compared output to output).
+	// Rendered by the renderer as it was on main before the opening brief's sections (compared
+	// output to output), then re-pinned once for the closing line alone: task tree readability
+	// PR D made it "report conclusion first" (`DELEGATION_TEXT.brief.closing`). The two briefs
+	// that fit their budget are also held to their earlier bytes with the earlier closing put
+	// back (below), so nothing but that line moved.
 	const pinned: Record<string, [string, number]> = {
+		bare: ["418f677ea60c59f927a851263d489fd83ca8f063eb04d790b51fe8110780fc01", 461],
+		nested: ["20205f20d72232dba6c805684cd0183c60021ddd3652e11eaf099d869d8e6eea", 828],
+		"over the budget": ["9baca39315e1c6488cd47cdee1f6a4422d7fe744868cb17b6d0f8776b746a138", 15916],
+		"a small budget": ["c6c57faf8399081315316ea50ef930a6d60e089eeff0bdd997a34d307cfa2619", 1867],
+	};
+	const earlierClosing =
+		"When you are done, reply with a report: what you did, your conclusions, the evidence (file:line, the commands you ran and their results), what is left undone, and what needs a person's decision.";
+	const earlier: Record<string, [string, number]> = {
 		bare: ["b0d25788fc149a2bbb928cd3fb069cc5e5099a99f1f10093274b57a8d8a964b7", 209],
 		nested: ["9bc7ae45f19d3d9b4d09d7f9357058dc3bea968ed55ce1e55d022dcf46fbe34a", 576],
-		"over the budget": ["5d761f8834f265770b26a3e873ea25758cac92ee60560f636b7cfa1774342918", 15916],
-		"a small budget": ["3b3b8fbd1d7fcb9356238f33500a26401fcad6f79d3607734c2b80196a507bae", 1867],
 	};
 	for (const [name, fixture, budget] of delegationFixtures()) {
 		test(`${name}: the same bytes`, () => {
@@ -61,6 +72,12 @@ describe("the delegation brief is unchanged", () => {
 				pinned[name] as [string, number],
 			);
 			expect(brief).toContain("When you are done, reply with a report");
+			expect(brief.endsWith(DELEGATION_TEXT.brief.closing)).toBe(true);
+			const before = earlier[name];
+			if (before) {
+				const was = brief.replace(DELEGATION_TEXT.brief.closing, earlierClosing);
+				expect([createHash("sha256").update(was).digest("hex"), bytes(was)]).toEqual(before);
+			}
 			expect(bytes(brief)).toBeLessThanOrEqual(budget ?? OUTLINE_DELEGATION_LIMITS.briefBytes);
 		});
 	}
