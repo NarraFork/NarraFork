@@ -1756,15 +1756,16 @@ test("a closed row wholly inside a text selection opens first too; the whole pag
 	const selectOver = (offset: number) => selectRange([ship, offset], [lone, 3]);
 
 	// With the keyboard: the cursor at the end of the row above, Shift+Down twice, Backspace.
-	// (A press right after the cursor is put there may come before the browser has it: each
-	// press is given the time to move the selection, and pressed again when it did not.)
+	// Exactly two presses: each is followed by a wait for the selection's head to move.
 	await caret(a, ship);
-	for (let i = 0; i < 8 && (await head(a))?.blockId !== lone; i++) {
-		const was = await head(a);
+	for (const press_ of ["first", "second"]) {
+		const was = JSON.stringify(await head(a));
 		await press(a, "Shift+ArrowDown");
-		const end = Date.now() + 500;
-		while (Date.now() < end && JSON.stringify(await head(a)) === JSON.stringify(was))
-			await new Promise((r) => setTimeout(r, 20));
+		await eventually(
+			async () => JSON.stringify(await head(a)),
+			(now) => now !== was,
+			`the ${press_} Shift+Down moved the selection`,
+		);
 	}
 	const typed = await a.call((f) => f.selection());
 	expect(typed?.anchor).toEqual({ blockId: ship, offset: "Ship the fold".length });

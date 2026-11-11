@@ -8,9 +8,12 @@
  * ------------------------------------------------
  * Only an agent's `OutlineEdit` calls this at all: people's edits, the system's writes (a report
  * attached under a task, an import, a lease note) never pass here. Of an agent's writes, these
- * are left alone: blocks inside a plan's tree, being planned or approved (`ExitPlanMode` holds
- * the plan to its own format, `outline-plan-structure.ts`), blocks inside a subagent report, and
- * blocks under a question put to a person.
+ * are left alone: blocks inside a plan still being planned (`ExitPlanMode` holds the plan to its
+ * own format, `outline-plan-structure.ts`), blocks inside a subagent report, and blocks under a
+ * question put to a person. Under an APPROVED plan ({@link NoteAnchor.approvedPlan}) the work has
+ * begun: what a call adds there is checked like anywhere under a task, and only the own text of
+ * an existing block it rewrites is left alone (the plan's background and details were accepted
+ * in the plan's format, which allows more than a note's).
  *
  * ONE CALL, IN ORDER ({@link NoteAnchorReader})
  * --------------------------------------------
@@ -52,6 +55,8 @@ export interface NoteAnchor {
 	depth: number | null;
 	/** Not held to the note rules (see the module header). */
 	skip: boolean;
+	/** Inside an approved plan's tree: the own text of a rewritten block is not checked. */
+	approvedPlan: boolean;
 }
 
 /**
@@ -105,7 +110,7 @@ export class NoteAnchorReader {
 
 	/** Where `blockId` sits now, the call's earlier edits applied. */
 	async anchor(blockId: string): Promise<NoteAnchor> {
-		const anchor: NoteAnchor = { depth: null, skip: false };
+		const anchor: NoteAnchor = { depth: null, skip: false, approvedPlan: false };
 		let at: string | null = blockId;
 		for (let level = 0; at !== null && level < NOTE_RULE_READS.maxLevels; level++) {
 			await this.load([at]);
@@ -114,8 +119,10 @@ export class NoteAnchorReader {
 			if (meta.askJson || isOutlineReportBlockId(meta.id)) return { ...anchor, skip: true };
 			if (this.tasks.get(at) ?? meta.taskJson !== null) {
 				if (anchor.depth === null) anchor.depth = level;
-				// A plan's tree, being planned or approved: the plan format's, not the note rules'.
-				if (meta.taskJson?.plan) return { ...anchor, skip: true };
+				// A plan being planned is the plan format's; an approved one is being worked on.
+				const plan = meta.taskJson?.plan;
+				if (plan?.state === "planning") return { ...anchor, skip: true };
+				if (plan) anchor.approvedPlan = true;
 			}
 			at = this.parents.has(at) ? (this.parents.get(at) ?? null) : meta.parentId;
 		}

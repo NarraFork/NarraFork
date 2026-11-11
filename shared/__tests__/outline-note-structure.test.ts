@@ -299,6 +299,30 @@ describe("bare URLs", () => {
 		expect(noteTextChars("no link here")).toBe(12);
 	});
 
+	test("text in another script after a URL is the note's text, with or without a space", () => {
+		const cjk = "字".repeat(700);
+		const short = "https://a.cn/x";
+		for (const [text, chars] of [
+			[`见${short}${cjk}`, 1 + short.length + 700],
+			[`见 ${short}，${cjk}`, 2 + short.length + 1 + 700],
+			[`见 ${short} ${cjk}`, 2 + short.length + 1 + 700],
+			[`见${url}${cjk}`, 1 + OUTLINE_NOTE_RULES.urlChars + 700],
+			[`${url}。${cjk}`, OUTLINE_NOTE_RULES.urlChars + 1 + 700],
+		] as const) {
+			expect({ text: text.slice(0, 30), chars: noteTextChars(text) }).toEqual({
+				text: text.slice(0, 30),
+				chars,
+			});
+			const report = noteWriteIssues([
+				{ kind: "under", parent: { ref: "task", depth: 0 }, blocks: [block("n", text)] },
+			]);
+			expect(report.clear).toBe(1);
+			expect(noteWriteRefused(report, "reject")).toBe(true);
+			// And the tick-done check sees it as long.
+			expect(taskResultCheck([{ ref: "n", head: text, other: false }]).longTotal).toBe(1);
+		}
+	});
+
 	test("a short note with a long URL is within the limit; long text beside it is not", () => {
 		const report = noteWriteIssues([
 			{

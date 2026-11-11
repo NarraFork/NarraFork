@@ -924,7 +924,7 @@ export async function outlineEdit(
 				};
 			};
 			if (at?.skip) {
-				// Not held to the rules (a plan's tree, a report, a question).
+				// Not held to the rules (a plan being planned, a report, a question).
 			} else if (edit.kind === "add") {
 				const ref = anchor?.kind === "block" ? anchor.block.sid : "/";
 				if (anchor?.kind === "block")
@@ -935,11 +935,18 @@ export async function outlineEdit(
 					blocks: edit.items.map((p) => toBlock(p, anchorDepth === null ? null : anchorDepth + 1)),
 				});
 			} else if (anchor?.kind === "block") {
-				noteWrites.push({
-					kind: "self",
-					depth: anchorDepth,
-					block: toBlock(edit.items[0] as PlannedItem, anchorDepth, anchor.block.sid),
-				});
+				const self = toBlock(edit.items[0] as PlannedItem, anchorDepth, anchor.block.sid);
+				// An approved plan's block rewritten: its own text was accepted in the plan's
+				// format; what the rewrite adds under it is checked like any other addition.
+				noteWrites.push(
+					at?.approvedPlan
+						? {
+								kind: "under",
+								parent: { ref: self.ref, depth: self.task ? 0 : anchorDepth },
+								blocks: self.children,
+							}
+						: { kind: "self", depth: anchorDepth, block: self },
+				);
 			}
 		}
 		// What this edit changes for the edits after it.

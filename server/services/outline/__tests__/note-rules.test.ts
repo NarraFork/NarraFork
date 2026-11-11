@@ -297,7 +297,7 @@ describe("who is not held to the rules", () => {
 		expect(noteRules(out)).toBeUndefined();
 	});
 
-	test("an approved plan's tree is the plan's too: not checked", async () => {
+	test("an approved plan: what a call adds under it is checked; a plan block's own text rewritten is not", async () => {
 		const w = await world();
 		const { root } = await ensurePlanRoot({
 			session: w.session,
@@ -305,6 +305,17 @@ describe("who is not held to the rules", () => {
 			title: "Plan",
 			locale: "en",
 		});
+		const space = await ensureSessionSpace(w.session);
+		const s = { ...w, space };
+		// The plan as it was accepted: a background longer than a note, a step with a long detail.
+		const background = "背".repeat(noteChars * 3);
+		const made = await edit(
+			s,
+			[{ add: root.address, markdown: `- ${background}\n- [ ] A step\n  - ${long}` }],
+			"reject",
+		);
+		expect(made.isError).toBeFalsy();
+		const [bg, step] = ids(made.output) as [string, string];
 		const row = await outlineStore.getBlock(root.blockId);
 		const plan = row?.taskJson?.plan;
 		expect(plan?.state).toBe("planning");
@@ -312,14 +323,29 @@ describe("who is not held to the rules", () => {
 			.update(outlineBlocks)
 			.set({ taskJson: { ...row?.taskJson, plan: { ...plan, state: "approved" } } as never })
 			.where(eq(outlineBlocks.id, root.blockId));
-		const space = await ensureSessionSpace(w.session);
-		const out = await edit(
-			{ ...w, space },
-			[{ add: root.address, markdown: `- [ ] A step\n  - ${long}` }],
-			"reject",
+
+		// Work under the approved plan: a long note added under a step is refused, or flagged.
+		const stored = (await blocks(space)).length;
+		const refused = await edit(s, [{ add: step, markdown: `- ${long}` }], "reject");
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(TEXT.refusedHeader);
+		expect((await blocks(space)).length).toBe(stored);
+		const warned = await edit(s, [{ add: step, markdown: `- ${long}` }], "warn");
+		expect(warned.isError).toBeFalsy();
+		expect(warned.output).toContain(TEXT.warnHeader);
+		expect(noteRules(warned)).toMatchObject({ mode: "warn", clear: 1 });
+		// So is one added directly under the plan root.
+		expect((await edit(s, [{ add: root.address, markdown: `- ${long}` }], "reject")).isError).toBe(
+			true,
 		);
-		expect(out.isError).toBeFalsy();
-		expect(out.output).not.toContain(TEXT.warnHeader);
+
+		// A plan block's own text rewritten stays the plan format's: not checked.
+		const rewritten = await edit(s, [{ replace: bg, text: `${background}。` }], "reject");
+		expect(rewritten.isError).toBeFalsy();
+		expect(rewritten.output).not.toContain(TEXT.warnHeader);
+		// What that rewrite adds under the block is an addition like any other.
+		const withChild = await edit(s, [{ replace: step, text: `[ ] A step\n  - ${long}` }], "reject");
+		expect(withChild.isError).toBe(true);
 	});
 
 	test("blocks under a question put to a person are not the session's notes", async () => {
@@ -347,7 +373,11 @@ describe("who is not held to the rules", () => {
 		});
 		const reader = new NoteAnchorReader(outlineStore, space.id);
 		expect((await reader.anchor(question)).skip).toBe(true);
-		expect(await reader.anchor(parent?.id as string)).toEqual({ depth: 0, skip: false });
+		expect(await reader.anchor(parent?.id as string)).toEqual({
+			depth: 0,
+			skip: false,
+			approvedPlan: false,
+		});
 	});
 
 	test("a plan still being planned: ExitPlanMode holds it to the plan format instead", async () => {
@@ -554,6 +584,26 @@ describe("one call, in order", () => {
 });
 
 describe("naming and counting", () => {
+	test("text after a URL is counted: a URL does not carry a long note past the check", async () => {
+		const w = await world();
+		const t = await task(w);
+		const cjk = "字".repeat(700);
+		for (const text of [`见https://a.cn/x${cjk}`, `见 https://a.cn/x，${cjk}`]) {
+			const stored = (await blocks(w.space)).length;
+			const refused = await edit(w, [{ add: t, markdown: `- ${text}` }], "reject");
+			expect(refused.isError).toBe(true);
+			expect(refused.output).toContain(TEXT.refusedHeader);
+			expect((await blocks(w.space)).length).toBe(stored);
+		}
+		// Written in mode warn, it is also what ticking the task off names as long.
+		const warned = await edit(w, [{ add: t, markdown: `- 见https://a.cn/x${cjk}` }], "warn");
+		expect(warned.output).toContain(TEXT.warnHeader);
+		const [sid] = ids(warned.output);
+		const done = await edit(w, [{ set: t, checkbox: "x" }], "warn");
+		expect(done.output).toContain(`[${sid}] (`);
+		expect(done.output).toContain("longer than a conclusion");
+	});
+
 	test("a bare URL counts as a link's label, not in full", async () => {
 		const w = await world();
 		const t = await task(w);

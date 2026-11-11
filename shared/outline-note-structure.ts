@@ -136,7 +136,11 @@ export function noteBlockLimit(role: NoteBlockRole): number {
 	return limitOf(role);
 }
 
-const BARE_URL = /\bhttps?:\/\/[^\s<>"'）)\]]+/g;
+/**
+ * A bare URL: the characters a URL is written in, and nothing else — text in another script
+ * right after it (no space between, a full-width comma) is the note's text and is counted.
+ */
+const BARE_URL = /\bhttps?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/g;
 
 /**
  * Characters of a block's text (`planBlockText`) as the note rules count them: as a reader
