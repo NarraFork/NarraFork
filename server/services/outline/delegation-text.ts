@@ -102,7 +102,7 @@ export const DELEGATION_TEXT = {
 		unreadable: "(a block this session cannot read)",
 		truncated: "…",
 		closing:
-			"When you are done, reply with a report: what you did, your conclusions, the evidence (file:line, the commands you ran and their results), what is left undone, and what needs a person's decision.",
+			"When you are done, reply with a report, conclusion first. Open with the conclusion in at most three sentences: what you did and what you found. Then the evidence (file:line, the commands you ran and their results). Last, what is left undone and what needs a person's decision. Do not retell the process, and do not divide the report into major sections with headings: the report is attached under the task and shown folded to its first paragraph.",
 	},
 
 	// ── The note added to a delegated subagent's result. ──
@@ -115,7 +115,7 @@ export const DELEGATION_TEXT = {
 		tail: "</outline_report>",
 		blocks: (n: number) => (n === 1 ? "1 block" : `${n} blocks`),
 		current: (task: string, report: string, blocks: string) =>
-			`The report is attached under the task ${task} as ${report} (${blocks}). The task is still in progress and yours: read the report, write a line or two of summary under the task, use Ask for anything a person must decide, and add what is left as subtasks; tick the task done if it meets its acceptance, otherwise delegate it again or do it yourself.`,
+			`The report is attached under the task ${task} as ${report} (${blocks}). The task is still in progress and yours: read the report, write its conclusion in one line as the first block under the task (evidence in blocks under that line), use Ask for anything a person must decide, and add what is left as subtasks; tick the task done if it meets its acceptance, otherwise delegate it again or do it yourself.`,
 		doneBySubagent: (task: string, report: string, blocks: string) =>
 			`The subagent ticked the task ${task} done itself. Its report is attached under the task as ${report} (${blocks}); if the task does not meet its acceptance, reopen it.`,
 		late: {

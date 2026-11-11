@@ -17,11 +17,13 @@ import { narrators, outlineBlocks, outlineCommits, projects, users } from "../..
 import { outlineEditTool } from "../../../lib/agent/tools/outline";
 import type { ToolContext, ToolResult } from "../../../lib/agent/types";
 import { generateId } from "../../../lib/id";
+import { getOutlineTaskSystemReminder } from "../../../lib/prompts/outline-tasks";
 import { settings } from "../../../lib/settings";
 import "../../../lib/agent/tools";
 import { type OutlineEditRequest, outlineEdit } from "../agent-edit";
 import type { OutlineToolOutput } from "../agent-read";
 import { OutlineAgentScope } from "../agent-scope";
+import { DELEGATION_TEXT } from "../delegation-text";
 import { stopEditTextWorker } from "../edit-text-runner";
 import { OUTLINE_TOOL_TEXT } from "../messages";
 import { ensurePlanRoot } from "../plans";
@@ -410,5 +412,42 @@ describe("ticking a task off", () => {
 		);
 		expect(out.output).toContain(TEXT.tidyFlat(t, 17, false, maxChildren));
 		expect(out.output).not.toContain("with no result under it");
+	});
+});
+
+describe("the rules as the prompts state them", () => {
+	const numbers = [noteChars, detailChars, maxChildren].map(String);
+
+	test("the session's system section: both languages, the check's numbers, the same text every time", () => {
+		for (const locale of ["en", "zh-CN"] as const) {
+			const text = getOutlineTaskSystemReminder(locale);
+			for (const n of numbers) expect(text).toContain(n);
+			expect(getOutlineTaskSystemReminder(locale)).toBe(text);
+		}
+		const en = getOutlineTaskSystemReminder("en");
+		expect(en).toContain("conclusion first");
+		expect(en).toContain("its first block must say the result in one line");
+		const zh = getOutlineTaskSystemReminder("zh-CN");
+		expect(zh).toContain("结论 → 依据 → 细节");
+		expect(zh).toContain("任务下第一块要是一行结果");
+		// Still three conventions.
+		expect(en).toContain("Three conventions");
+		expect(zh).toContain("三条约定");
+		expect(en.match(/^\d\. /gm)).toHaveLength(3);
+		expect(zh.match(/^\d\. /gm)).toHaveLength(3);
+	});
+
+	test("OutlineEdit's description states them with the same numbers", () => {
+		const text = outlineEditTool.description as string;
+		expect(text).toContain("Notes under a task go conclusion first");
+		for (const n of numbers) expect(text).toContain(n);
+	});
+
+	test("a delegated subagent is told to report conclusion first", () => {
+		expect(DELEGATION_TEXT.brief.closing).toContain("conclusion first");
+		expect(DELEGATION_TEXT.brief.closing).toContain("at most three sentences");
+		expect(DELEGATION_TEXT.note.current("t", "r", "3 blocks")).toContain(
+			"its conclusion in one line as the first block under the task",
+		);
 	});
 });
