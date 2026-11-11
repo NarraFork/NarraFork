@@ -90,6 +90,8 @@ import type {
 	OutlineStore,
 	OutlineTaskClaimRow,
 } from "./store/port";
+import { isPlanningRoot, outlineTaskStartBlocker } from "./task-json";
+import { outlineTaskSessionProjectDir, outlineTaskSessionsAvailable } from "./task-session";
 import { deriveOutlineTaskWaits, inDocumentOrder, isClaimLive } from "./tasks";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -338,6 +340,11 @@ interface Context {
 	store: OutlineStore;
 	principal: OutlinePrincipal;
 	spaces: Map<string, OutlineSpaceRow>;
+	/**
+	 * Project spaces whose startable tasks the reader may open a new session for (outline P2
+	 * PR 10c-1): decided once per board, see `readProjectTaskBoard`.
+	 */
+	openSessionSpaces?: ReadonlySet<string>;
 }
 
 /** The space of a session: its root narrator's, by id. */
@@ -466,6 +473,24 @@ async function describe(
 		return owner ? session(owner) : { kind: "none" };
 	};
 
+	// "Open a new session for this" (`task-session.ts` decides again when asked): to do, held by
+	// nobody, startable as a delegation would find it, in a space the reader may open sessions in.
+	const canOpenSession = (
+		meta: OutlineBlockMeta,
+		task: OutlineTaskJson,
+		wait: Parameters<typeof outlineTaskStartBlocker>[0]["wait"],
+	): boolean => {
+		if (!options.open || !ctx.openSessionSpaces?.has(meta.spaceId)) return false;
+		if (task.status !== "todo" || isClaimLive(claims.get(meta.id), now)) return false;
+		let planning = false;
+		let above: OutlineBlockMeta | undefined = meta;
+		for (let depth = 0; above && depth <= OUTLINE_LIMITS.maxDepth && !planning; depth++) {
+			planning = isPlanningRoot(above.taskJson);
+			above = above.parentId === null ? undefined : known.get(above.parentId);
+		}
+		return outlineTaskStartBlocker({ task, planning, wait }) === null;
+	};
+
 	const out: OutlineBoardTask[] = [];
 	for (const meta of ordered) {
 		const task = meta.taskJson;
@@ -510,6 +535,7 @@ async function describe(
 				: null,
 			versionSeq: meta.versionSeq,
 			...(newlyDone.has(meta.id) ? { newlyDone: true as const } : {}),
+			...(canOpenSession(meta, task, wait) ? { openSession: true as const } : {}),
 		});
 	}
 	return out;
@@ -780,6 +806,27 @@ export async function readSessionTaskBoard(
 }
 
 /**
+ * Whether the person may open new sessions for the project space's tasks (outline P2 PR 10c-1):
+ * the session runtime runs here (not on PostgreSQL), they may create sessions in the project (its
+ * write access) and write its space, and the project has a working directory. A few keyed reads,
+ * once per board.
+ */
+async function mayOpenTaskSessions(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+	projectId: string,
+): Promise<boolean> {
+	if (!outlineTaskSessionsAvailable()) return false;
+	const project = await readProject(projectId);
+	if (!project) return false;
+	const creates =
+		principal.isAdmin ||
+		(await projectUsersWith(project, [principal.userId], "write")).has(principal.userId);
+	if (!creates || !(await canWriteSpace(principal, space))) return false;
+	return (await outlineTaskSessionProjectDir(projectId)) !== null;
+}
+
+/**
  * The board of a project (the project page): the project space on the first page, then the
  * session spaces of its sessions that the person may read, a page at a time. The caller has
  * checked that the person may read the project.
@@ -795,7 +842,11 @@ export async function readProjectTaskBoard(
 	const spaces: OutlineSpaceRow[] = [];
 	if (after === undefined) {
 		const projectSpace = await store.findSpace({ kind: "project", projectId });
-		if (projectSpace && (await canReadSpace(principal, projectSpace))) spaces.push(projectSpace);
+		if (projectSpace && (await canReadSpace(principal, projectSpace))) {
+			spaces.push(projectSpace);
+			if (await mayOpenTaskSessions(principal, projectSpace, projectId))
+				ctx.openSessionSpaces = new Set([projectSpace.id]);
+		}
 	}
 	const page = await readProjectSessionSpacePage(principal, projectId, {
 		afterNarratorId: after,

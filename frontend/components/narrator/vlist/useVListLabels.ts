@@ -589,6 +589,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceOutlineTaskEdit: t("sidecar.sources.outline_task_edit"),
 			sidecarSourceOutlineTaskFinished: t("sidecar.sources.outline_task_finished"),
 			sidecarSourceOutlineTeamActivity: t("sidecar.sources.outline_team_activity"),
+			sidecarSourceOutlineTaskBrief: t("sidecar.sources.outline_task_brief"),
 			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
 			// ── task notices (`shared/pretext-layout/task-notice.ts`) ────────────────
 			taskNoticeStatusTodo: t("sidecar.taskNotice.statusTodo"),

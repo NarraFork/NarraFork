@@ -112,7 +112,7 @@ import { loadBodies, loadBodiesWithin, readSubtree } from "./read";
 import { OUTLINE_REPORT_LIMITS, type ReportBlock, type ReportConversion } from "./report-text";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineStore, OutlineTaskClaimRow } from "./store/port";
-import { hasHumanAssignee, isPlanningRoot } from "./task-json";
+import { isPlanningRoot, outlineTaskStartBlocker } from "./task-json";
 import {
 	deriveOutlineTaskWaits,
 	getOutlineTaskClaims,
@@ -168,7 +168,7 @@ export class OutlineDelegationError extends ValidationError {
 	}
 }
 
-function clip(text: string, max: number = OUTLINE_DELEGATION_LIMITS.titleChars): string {
+export function clip(text: string, max: number = OUTLINE_DELEGATION_LIMITS.titleChars): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	const chars = Array.from(flat);
 	return chars.length <= max ? flat : `${chars.slice(0, max - 1).join("")}…`;
@@ -180,7 +180,7 @@ function linkTo(address: string, title: string): string {
 	return text ? `[[${address}|${text}]]` : `[[${address}]]`;
 }
 
-function statusWord(status: TaskStatus): string {
+export function statusWord(status: TaskStatus): string {
 	switch (status) {
 		case "todo":
 			return "to do";
@@ -258,12 +258,12 @@ export interface DelegationBriefInput {
 	prompt?: string | null;
 }
 
-function utf8(text: string): number {
+export function utf8(text: string): number {
 	return Buffer.byteLength(text, "utf8");
 }
 
 /** Text cut to at most `max` UTF-8 bytes, marked when cut. */
-function cutText(text: string, max: number): string {
+export function cutText(text: string, max: number): string {
 	if (utf8(text) <= max) return text;
 	let out = "";
 	let bytes = utf8(DELEGATION_TEXT.brief.truncated);
@@ -291,6 +291,27 @@ function subtreeSize(node: DelegationBriefNode): number {
 }
 
 /**
+ * What another brief written from a task tree adds to the delegation's (the opening brief of a
+ * session opened for a task, `task-session.ts`). A delegation passes none of it, and its
+ * instructions are then byte for byte what they were.
+ */
+export interface DelegationBriefOptions {
+	/** Lines of the head, after the goals. */
+	head?: readonly string[];
+	/** UTF-8 bytes the task's own text takes at most (default: half the budget). */
+	bodyBytes?: number;
+	/** Bytes of the budget kept back from the notes, for `after`. */
+	reserve?: number;
+	/**
+	 * Sections after the prerequisites, given the bytes of the budget still unused (the reserve and
+	 * whatever the task's text and notes left): what earlier sections do not use, later ones may.
+	 */
+	after?: (left: number) => string[];
+	/** The last lines, in place of the delegation's request for a report. */
+	closing?: readonly string[];
+}
+
+/**
  * The subagent's instructions (see the module header): plain markdown within `budget` bytes,
  * the caller's prompt aside. Pure. What is under the task is taken breadth first while it fits; a
  * line `… N more` stands for what did not.
@@ -298,23 +319,36 @@ function subtreeSize(node: DelegationBriefNode): number {
 export function renderDelegationBrief(
 	input: DelegationBriefInput,
 	budget: number = OUTLINE_DELEGATION_LIMITS.briefBytes,
+	options: DelegationBriefOptions = {},
 ): string {
 	const text = DELEGATION_TEXT.brief;
 	const head: string[] = [text.title(clip(input.title, 200))];
 	if (input.goals.length > 0) head.push(text.goals(input.goals.map((g) => clip(g))));
+	if (options.head) head.push(...options.head);
 	const tail: string[] = [];
 	if (input.prerequisites.length > 0) {
 		tail.push("", text.prerequisites);
 		for (const p of input.prerequisites)
 			tail.push(text.prerequisite(clip(p.title), statusWord(p.status)));
 	}
-	const closing = ["", "---", text.closing];
+	const closing = ["", "---", ...(options.closing ?? [text.closing])];
 	const fixed = utf8([...head, ...tail, ...closing].join("\n")) + 64;
-	// The task's own text is always given, within half the budget.
+	// The task's own text is always given, within half the budget (or the caller's share of it).
+	const bodyMax = Math.max(256, Math.floor(budget / 2) - fixed);
 	const body = input.body?.trim()
-		? ["", text.body, cutText(input.body.trim(), Math.max(256, Math.floor(budget / 2) - fixed))]
+		? [
+				"",
+				text.body,
+				cutText(
+					input.body.trim(),
+					options.bodyBytes === undefined
+						? bodyMax
+						: Math.max(256, Math.min(bodyMax, options.bodyBytes)),
+				),
+			]
 		: [];
-	let left = budget - fixed - utf8(body.join("\n")) - utf8(text.notes) - 2;
+	const reserve = Math.max(0, options.reserve ?? 0);
+	let left = budget - fixed - utf8(body.join("\n")) - utf8(text.notes) - 2 - reserve;
 
 	// Breadth first over what is under the task, while it fits; a block that may need a
 	// `… N more` line under it is charged for one.
@@ -363,6 +397,7 @@ export function renderDelegationBrief(
 	const out = [...head, ...body];
 	if (notes.length > 0) out.push("", text.notes, ...notes);
 	out.push(...tail);
+	if (options.after) out.push(...options.after(Math.max(0, left) + reserve));
 	if (input.prompt?.trim()) out.push("", text.instructions, input.prompt.trim());
 	out.push(...closing);
 	return out.join("\n");
@@ -376,7 +411,7 @@ function unescapeRef(text: string): string {
 }
 
 /** Link targets (`key/sid`) a content names. */
-function contentTargets(content: string): string[] {
+export function contentTargets(content: string): string[] {
 	if (/^(?:`{3,}|~{3,})/.test(content)) return [];
 	const out: string[] = [];
 	for (const m of content.matchAll(MENTION_RE)) {
@@ -388,7 +423,7 @@ function contentTargets(content: string): string[] {
 }
 
 /** A content with its links shown as text: the label, the target's title, or a placeholder. */
-function linksAsText(content: string, titles: ReadonlyMap<string, string>): string {
+export function linksAsText(content: string, titles: ReadonlyMap<string, string>): string {
 	if (/^(?:`{3,}|~{3,})/.test(content)) return content;
 	return content.replace(MENTION_RE, (...m: unknown[]) => {
 		const [whole, , rawRef, rawLabel, at] = m as [
@@ -513,31 +548,38 @@ export async function prepareOutlineDelegation(args: {
 
 	const subtree = await readSubtree(block.id, { store });
 	if (!subtree) return refuse(text.deleted(address));
-	if ([subtree.root, ...subtree.path].some((node) => isPlanningRoot(node.task)))
-		refuse(text.planning(address));
+	// The conditions shared with the board's "open a new session for this" (`task-json.ts`).
+	const planning = [subtree.root, ...subtree.path].some((node) => isPlanningRoot(node.task));
+	if (planning) refuse(text.planning(address));
 
 	const wait = (
 		await deriveOutlineTaskWaits([{ id: block.id, spaceId: block.spaceId, taskJson: task }], {
 			store,
 		})
 	).get(block.id);
-	if (wait && wait.prerequisites.length > 0) {
-		const metas = await store.getBlockMetasByIds(
-			wait.prerequisites.slice(0, OUTLINE_DELEGATION_LIMITS.prerequisites),
-		);
-		const keys = new Map<string, string>();
-		for (const spaceId of new Set(metas.map((m) => m.spaceId)))
-			keys.set(spaceId, (await store.getSpace(spaceId))?.key ?? "?");
-		refuse(
-			text.waitsPrerequisites(
-				address,
-				metas.map((m) => `${keys.get(m.spaceId)}/${m.sid}`),
-			),
-		);
+	switch (outlineTaskStartBlocker({ task, planning, wait })) {
+		case "prerequisites": {
+			const metas = await store.getBlockMetasByIds(
+				(wait?.prerequisites ?? []).slice(0, OUTLINE_DELEGATION_LIMITS.prerequisites),
+			);
+			const keys = new Map<string, string>();
+			for (const spaceId of new Set(metas.map((m) => m.spaceId)))
+				keys.set(spaceId, (await store.getSpace(spaceId))?.key ?? "?");
+			return refuse(
+				text.waitsPrerequisites(
+					address,
+					metas.map((m) => `${keys.get(m.spaceId)}/${m.sid}`),
+				),
+			);
+		}
+		case "people":
+			return refuse(text.waitsPeople(address));
+		case "confirmation":
+			return refuse(text.waitsConfirmation(address));
+		case "assigned_to_person":
+			return refuse(text.assignedToPerson(address, task.assignee as string));
+		default:
 	}
-	if (wait?.people) refuse(text.waitsPeople(address));
-	if (wait?.confirmation) refuse(text.waitsConfirmation(address));
-	if (hasHumanAssignee(task)) refuse(text.assignedToPerson(address, task.assignee as string));
 
 	const now = (args.now ?? new Date()).toISOString();
 	const claim = (await getOutlineTaskClaims([block.id], { store })).get(block.id) ?? null;
@@ -605,12 +647,18 @@ async function isRunning(narratorId: string): Promise<boolean> {
 	return !!getRunControl(narratorId) || !!getExecutionOwner(narratorId);
 }
 
-/** What the instructions show, read from the task's subtree (bounded; see the limits). */
-async function readBriefInput(
+/**
+ * What the instructions show, read from the task's subtree (bounded; see the limits). Shared with
+ * the opening brief of a session opened for a task (`task-session.ts`), which also takes the link
+ * targets found on the way (`found.targets`: the task's own first, then those of the blocks under
+ * it whose content was read, in that order).
+ */
+export async function readBriefInput(
 	block: OutlineBlockRow,
 	subtree: NonNullable<Awaited<ReturnType<typeof readSubtree>>>,
 	scope: OutlineAgentScope,
 	store: OutlineStore,
+	found?: { targets: string[] },
 ): Promise<Omit<DelegationBriefInput, "prompt">> {
 	const limits = OUTLINE_DELEGATION_LIMITS;
 	const goals = subtree.path.slice(-limits.goals);
@@ -629,6 +677,15 @@ async function readBriefInput(
 	const targets = new Set<string>();
 	for (const node of loaded) for (const t of contentTargets(node.content as string)) targets.add(t);
 	for (const t of contentTargets(block.content)) targets.add(t);
+	if (found) {
+		const ordered = new Set(contentTargets(block.content));
+		for (const node of loaded) {
+			// A report's links are the subagent's findings, not what the task was linked to.
+			if (isReportBlockId(node.id)) continue;
+			for (const t of contentTargets(node.content as string)) ordered.add(t);
+		}
+		found.targets.push(...ordered);
+	}
 	const titles = await linkTitles(targets, {
 		store,
 		canRead: (space) => scope.canRead(space),

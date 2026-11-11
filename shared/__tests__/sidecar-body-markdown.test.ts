@@ -93,6 +93,16 @@ describe("sideCarBodyToMarkdown — the 7 body kinds", () => {
 		);
 	});
 
+	it("prose: an opening brief is headed by its first line only, the task's title", () => {
+		// Outline P2 PR 10c-1: up to 16 KiB of brief unfolds under one line naming the task.
+		const out = md("outline_task_brief", {
+			kind: "prose",
+			text: "# Task: Fix the refresh logic\nPart of: Tasks\n\n## What to do\nTwo tabs refresh at once.",
+		});
+		expect(out.split("\n")[0]).toBe("###### Task: Fix the refresh logic");
+		expect(out).toContain("Two tabs refresh at once.");
+	});
+
 	it("prose: unnamed prose uses its own first line as the heading", () => {
 		// `presentSideCarBody` flattens the text for the headline AND keeps it in the
 		// lines, so a one-line body legitimately appears twice — once as the title.
