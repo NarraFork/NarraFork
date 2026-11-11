@@ -317,6 +317,59 @@ describe("task notices: one line naming the task, rows when unfolded", () => {
 		expect(measured.rowCount).toBe(6);
 	});
 
+	it("team events: one commit's writer in the heading, a row per task and what happened to it", () => {
+		const segment = injection("m-team", "outline_team", "系统通知（…）", {
+			kind: "outlineTasks",
+			variant: "team",
+			items: [
+				{
+					address: `${K}/mSsl3Ccf`,
+					title: "补测试",
+					by: "Doer",
+					changes: [{ kind: "assignedHere" }],
+				},
+				{
+					address: `${K}/Qp93LkaA`,
+					title: "发布",
+					by: "Doer",
+					changes: [{ kind: "unblocked", by: "done" }],
+				},
+				{
+					address: `${K}/Zx81aaQe`,
+					title: "写客户端",
+					by: "Doer",
+					waiting: true,
+					changes: [{ kind: "unblocked", by: "cancelled", still: true }],
+				},
+				{
+					address: `${K}/Gh5iJk6L`,
+					title: "构建",
+					by: "Doer",
+					changes: [{ kind: "status", from: "doing", to: "done" }, { kind: "created" }],
+				},
+			],
+			more: 2,
+		});
+		const data = specOf(segment).data as TaskNoticeData;
+		expect(data.title).toBe("Doer：与本会话有关的 6 件任务事件");
+		expect(
+			data.rows.map((row) => [row.title, row.note ?? null, row.status?.label ?? null]),
+		).toEqual([
+			["补测试", "指派给了本会话", null],
+			["发布", "一个前置已完成", null],
+			["写客户端", "一个前置被取消了；还在等别的", "等待中"],
+			["构建", "本会话建的", "完成"],
+			["还有 2 项未列出", null, null],
+		]);
+		expect(data.rows[3]).toMatchObject({ statusFrom: { label: "进行中" } });
+		// Measured like the other task notices: a row a line.
+		const open = specOf(segment, true);
+		const measured = VLIST_REGISTRY[open.kind].measure(open.data, 800, 5, open.opts) as never as {
+			rowCount: number;
+		};
+		expect(measured.rowCount).toBe(5);
+	});
+
 	it("the interrupt guard: how many are open, outline tasks linked, spec tasks plain", () => {
 		const outline = specOf(
 			injection("m-guard", "interrupt_task_guard", "…", {
