@@ -1,11 +1,19 @@
 import type { Database } from "bun:sqlite";
 import type { SQL } from "bun";
 import { compiledWorkerSpecifiers } from "../../lib/compiled-worker";
+import { withDbRetry } from "../../lib/db-resilience";
+import {
+	assertWorkerBuildId,
+	safeSqliteCode,
+	workerFailureDetails,
+} from "../../lib/db-worker/failure";
+import { getConfiguredConcurrency } from "../../lib/db-worker/pool";
+import { DB_WORKER_READY_TIMEOUT_MS } from "../../lib/db-worker/protocol";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { logger } from "../../lib/logger";
 import { hasRowsOnlyBodies } from "../../lib/narrator-bodies";
-import { isCompiledRuntime } from "../../lib/runtime-target";
+import { isCompiledRuntime, RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { settings } from "../../lib/settings";
 import { modelHistoryManifest } from "./model-history-delta";
 import {
@@ -197,7 +205,36 @@ export function modelHistoryWorkerSpecifiers(
 }
 
 /** Sentinel distinguishing a worker that never started from one that failed mid-query. */
-const WORKER_STARTUP_ERROR = new AppError("Model history read-only worker failed to start");
+class HistoryWorkerStartupError extends AppError {}
+export const MODEL_HISTORY_MAX_QUEUE = 32;
+
+function checkWorkerEnabled(): void {
+	if (process.env.NARRAFORK_DB_WORKER === "off" || getConfiguredConcurrency() === 0)
+		throw new AppError(
+			"Model history read-only worker disabled",
+			503,
+			"MODEL_HISTORY_WORKER_DISABLED",
+		);
+}
+
+function logHistoryWorkerFailure(
+	entry: string,
+	phase: string,
+	error: unknown,
+	diagnostic?: object,
+): void {
+	try {
+		logger.error("Model history worker failure", {
+			entry,
+			phase,
+			buildId: RUNTIME_BUILD_ID,
+			...workerFailureDetails(error, phase === "create" || phase === "ready"),
+			...diagnostic,
+		});
+	} catch {
+		/* diagnostics must not prevent cleanup */
+	}
+}
 
 type ModelHistoryProgress = {
 	phase: "signature" | "cache" | "queue" | "worker" | "read";
@@ -209,11 +246,29 @@ type ModelHistoryProgress = {
 /** Hand a released slot directly to the next reader instead of polling every millisecond. */
 function acquireWorkerSlot(signal?: AbortSignal): Promise<() => void> {
 	signal?.throwIfAborted();
+	checkWorkerEnabled();
+	if (state.workers >= 2 && state.workerWaiters.length >= MODEL_HISTORY_MAX_QUEUE)
+		throw new AppError(
+			"Model history worker queue is full",
+			503,
+			"MODEL_HISTORY_WORKER_OVERLOADED",
+		);
 	return new Promise((resolve, reject) => {
 		const start = () => {
 			signal?.removeEventListener("abort", abort);
+			try {
+				signal?.throwIfAborted();
+				checkWorkerEnabled();
+			} catch (error) {
+				reject(error);
+				state.workerWaiters.shift()?.();
+				return;
+			}
 			state.workers++;
+			let released = false;
 			resolve(() => {
+				if (released) return;
+				released = true;
 				state.workers--;
 				state.workerWaiters.shift()?.();
 			});
@@ -255,10 +310,15 @@ async function readWorker(
 		for (const specifier of candidates) {
 			options.signal?.throwIfAborted();
 			// Global Worker: a file: href resolves inside $bunfs. node:worker_threads would reject it.
-			const worker = new Worker(specifier);
-			// A module-load failure surfaces as onerror with no message at all; a running
-			// worker always communicates before dying. That difference gates the probe.
-			let received = false;
+			let worker: Worker;
+			try {
+				worker = new Worker(specifier);
+			} catch (error) {
+				logHistoryWorkerFailure(specifier, "create", error);
+				lastError = new HistoryWorkerStartupError("Model history read-only worker failed to start");
+				continue;
+			}
+			let ready = false;
 			try {
 				const loaded = await new Promise<{
 					source: ModelHistorySource;
@@ -281,8 +341,17 @@ async function readWorker(
 					) => {
 						if (finished) return;
 						finished = true;
+						clearTimeout(startupTimer);
 						options.signal?.removeEventListener("abort", abort);
-						worker.terminate();
+						worker.onmessage = null;
+						worker.onerror = null;
+						worker.removeEventListener("close", onClose);
+						worker.removeEventListener("messageerror", onMessageError);
+						try {
+							worker.terminate();
+						} catch {
+							/* already closed */
+						}
 						if (error || !counters)
 							reject(error ?? new AppError("Model history worker did not complete"));
 						else {
@@ -296,94 +365,143 @@ async function readWorker(
 					const send = (message: unknown) => {
 						try {
 							worker.postMessage(message);
-						} catch {
+						} catch (error) {
+							logHistoryWorkerFailure(specifier, "dispatch", error);
 							finish(new AppError("Model history read-only worker dispatch failed"));
 						}
 					};
 					options.signal?.addEventListener("abort", abort, { once: true });
-					worker.onerror = () =>
+					worker.onerror = (event) => {
+						logHistoryWorkerFailure(specifier, ready ? "run" : "ready", event);
 						finish(
-							received
+							ready
 								? new AppError("Model history read-only worker failed")
-								: WORKER_STARTUP_ERROR,
+								: new HistoryWorkerStartupError("Model history read-only worker failed to start"),
 						);
-					// Bun emits close even for an early, otherwise silent exit. finish marks
-					// completion before terminate, so our own shutdown cannot reject success.
-					worker.addEventListener("close", () =>
-						finish(new AppError("Model history read-only worker closed before completion")),
-					);
-					worker.addEventListener("messageerror", () =>
-						finish(new AppError("Model history read-only worker message failed")),
-					);
+					};
+					const onClose = () => {
+						const error = new AppError("Model history read-only worker closed before completion");
+						logHistoryWorkerFailure(specifier, ready ? "close" : "startup-close", error);
+						finish(error);
+					};
+					const onMessageError = (event: Event) => {
+						logHistoryWorkerFailure(specifier, "message", event);
+						finish(new AppError("Model history read-only worker message failed"));
+					};
+					worker.addEventListener("close", onClose);
+					worker.addEventListener("messageerror", onMessageError);
+					// Startup only. Valid slow reads remain governed solely by caller cancellation.
+					const startupTimer = setTimeout(() => {
+						const error = new HistoryWorkerStartupError("Model history worker readiness timed out");
+						logHistoryWorkerFailure(specifier, "ready-timeout", error);
+						finish(error);
+					}, DB_WORKER_READY_TIMEOUT_MS);
 					worker.onmessage = (event) => {
-						if (finished) return;
-						received = true;
-						if (options.signal?.aborted) return abort();
-						if (event.data.type === "page") {
-							for (const row of event.data.rows as ModelSourceRowBuilder[]) {
-								messages.push(row);
-								byId.set(row.id, row);
+						try {
+							if (finished) return;
+							if (options.signal?.aborted) return abort();
+							if (!ready) {
+								try {
+									if (event.data?.type !== "ready") throw new Error("Missing ready handshake");
+									assertWorkerBuildId(event.data.buildId);
+									checkWorkerEnabled();
+								} catch (error) {
+									logHistoryWorkerFailure(specifier, "ready", error);
+									return finish(new AppError("Model history worker readiness validation failed"));
+								}
+								ready = true;
+								clearTimeout(startupTimer);
+								return sendRequest();
 							}
-							send({ type: "ack" });
-						} else if (event.data.type === "tools") {
-							for (const { messageId, ...tool } of event.data.rows as Array<
-								ModelToolSourceRow & { messageId: string }
-							>)
-								byId.get(messageId)?.toolCalls.push(tool);
-							send({ type: "ack" });
-						} else if (event.data.type === "reuseBodies") {
-							for (const id of event.data.ids as string[]) {
-								const old = previousById.get(id);
-								if (!old) return finish(new AppError("Model history delta source unavailable"));
-								const row = { ...old, toolCalls: [] };
-								messages.push(row);
-								byId.set(id, row);
+							if (event.data.type === "page") {
+								for (const row of event.data.rows as ModelSourceRowBuilder[]) {
+									messages.push(row);
+									byId.set(row.id, row);
+								}
+								send({ type: "ack" });
+							} else if (event.data.type === "tools") {
+								for (const { messageId, ...tool } of event.data.rows as Array<
+									ModelToolSourceRow & { messageId: string }
+								>)
+									byId.get(messageId)?.toolCalls.push(tool);
+								send({ type: "ack" });
+							} else if (event.data.type === "reuseBodies") {
+								for (const id of event.data.ids as string[]) {
+									const old = previousById.get(id);
+									if (!old) return finish(new AppError("Model history delta source unavailable"));
+									const row = { ...old, toolCalls: [] };
+									messages.push(row);
+									byId.set(id, row);
+								}
+								send({ type: "ack" });
+							} else if (event.data.type === "reuseTools") {
+								for (const { id, messageId } of event.data.rows as Array<{
+									id: string;
+									messageId: string;
+								}>) {
+									const old = previousTools.get(id);
+									if (!old)
+										return finish(new AppError("Model history delta tool source unavailable"));
+									byId.get(messageId)?.toolCalls.push(old);
+								}
+								send({ type: "ack" });
+							} else if (event.data.type === "order") {
+								if (event.data.reset) messages.length = 0;
+								for (const id of event.data.ids as string[])
+									messages.push(byId.get(id) as ModelSourceRowBuilder);
+								send({ type: "ack" });
+							} else if (event.data.type === "done")
+								finish(undefined, event.data.counters, event.data.compactSeq, event.data.signature);
+							// The worker only sends its fixed public error messages, never raw driver errors.
+							else if (event.data.type === "error") {
+								const code = backend.backend === "sqlite" ? safeSqliteCode(event.data) : undefined;
+								const error = new AppError(
+									event.data.message,
+									500,
+									code ?? "MODEL_HISTORY_READ_FAILED",
+								);
+								logHistoryWorkerFailure(specifier, "read", error, event.data.diagnostic);
+								finish(error);
 							}
-							send({ type: "ack" });
-						} else if (event.data.type === "reuseTools") {
-							for (const { id, messageId } of event.data.rows as Array<{
-								id: string;
-								messageId: string;
-							}>) {
-								const old = previousTools.get(id);
-								if (!old)
-									return finish(new AppError("Model history delta tool source unavailable"));
-								byId.get(messageId)?.toolCalls.push(old);
-							}
-							send({ type: "ack" });
-						} else if (event.data.type === "order") {
-							if (event.data.reset) messages.length = 0;
-							for (const id of event.data.ids as string[])
-								messages.push(byId.get(id) as ModelSourceRowBuilder);
-							send({ type: "ack" });
-						} else if (event.data.type === "done")
-							finish(undefined, event.data.counters, event.data.compactSeq, event.data.signature);
-						// The worker only sends its fixed public error messages, never raw driver errors.
-						else if (event.data.type === "error") finish(new AppError(event.data.message));
-						progress.refs = messages.length;
-						if (event.data.type === "tools" || event.data.type === "reuseTools")
-							progress.toolRows += event.data.rows.length;
+							progress.refs = messages.length;
+							if (event.data.type === "tools" || event.data.type === "reuseTools")
+								progress.toolRows += event.data.rows.length;
+						} catch (error) {
+							logHistoryWorkerFailure(specifier, "message", error);
+							// Request preparation also performs bounded SQLite metadata reads. Preserve
+							// their result code so the outer whole-read retry can release this slot first.
+							const code = backend.backend === "sqlite" ? safeSqliteCode(error) : undefined;
+							finish(
+								new AppError(
+									"Model history read-only worker message failed",
+									500,
+									code ?? "MODEL_HISTORY_READ_FAILED",
+								),
+							);
+						}
 					};
 					if (options.signal?.aborted) return abort();
-					send({
-						narratorId,
-						limit: options.limit,
-						maxBytes: MODEL_HISTORY_MAX_BYTES,
-						versioned,
-						bodiesFromBlocks: backend.backend === "sqlite" && blockBodies(backend.sqlite),
-						previous: previous ? modelHistoryManifest(previous.source) : undefined,
-						previousCatalogIdentity: previous?.catalogIdentity,
-						...(backend.backend === "sqlite"
-							? { backend: "sqlite", path: backend.sqlite.filename }
-							: { backend: "postgres", url: backend.url }),
-					});
+					const sendRequest = () =>
+						send({
+							narratorId,
+							limit: options.limit,
+							maxBytes: MODEL_HISTORY_MAX_BYTES,
+							versioned,
+							bodiesFromBlocks: backend.backend === "sqlite" && blockBodies(backend.sqlite),
+							previous: previous ? modelHistoryManifest(previous.source) : undefined,
+							previousCatalogIdentity: previous?.catalogIdentity,
+							...(backend.backend === "sqlite"
+								? { backend: "sqlite", path: backend.sqlite.filename }
+								: { backend: "postgres", url: backend.url }),
+						});
 				});
 				state.workerSpecifier = specifier;
 				return loaded;
 			} catch (error) {
 				// Only a candidate that never started is probed against the next path shape;
 				// a worker that died mid-query must surface its real error unchanged.
-				if (error !== WORKER_STARTUP_ERROR || specifier === candidates.at(-1)) throw error as Error;
+				if (!(error instanceof HistoryWorkerStartupError) || specifier === candidates.at(-1))
+					throw error;
 				lastError = error as Error;
 			}
 		}
@@ -430,6 +548,7 @@ async function readModelHistorySource(
 			return cached;
 		}
 	}
+	checkWorkerEnabled();
 	state.loads++;
 	// Test-only in-memory fixtures cannot be opened by a worker. The query's metadata preflight
 	// still bounds rows/bytes; production file/PG reads NEVER fall back to inline JSON parsing.
@@ -513,7 +632,18 @@ export async function loadModelHistorySource(
 	const timer = setTimeout(warnIfSlow, 10_000);
 	timer.unref();
 	try {
-		return await readModelHistorySource(backend, narratorId, options, progress);
+		const read = () => {
+			progress.phase = "signature";
+			return readModelHistorySource(backend, narratorId, options, progress);
+		};
+		return backend.backend === "sqlite"
+			? await withDbRetry(read, {
+					label: "model_history_read",
+					maxRetries: 3,
+					signal: options.signal,
+					retryLegacyMessages: false,
+				})
+			: await read();
 	} finally {
 		clearTimeout(timer);
 		// Also covers synchronous work that delayed the timer until after completion.

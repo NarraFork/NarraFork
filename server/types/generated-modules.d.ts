@@ -25,3 +25,14 @@ declare module "@server/generated/parcel-native-loader" {
 declare module "@server/generated/embedded-frontend" {
 	export const embeddedAssets: Record<string, string>;
 }
+
+// Local runtime and release builds embed the same immutable migration inputs.
+declare module "@server/generated/embedded-migrations-data" {
+	export const embeddedMigrationJournalJson: string;
+	export const embeddedMigrationSqlFiles: ReadonlyArray<{ name: string; content: string }>;
+}
+
+declare module "@server/generated/embedded-postgres-migrations-data" {
+	export const embeddedPostgresMigrationJournalJson: string;
+	export const embeddedPostgresMigrationSqlFiles: ReadonlyArray<{ name: string; content: string }>;
+}

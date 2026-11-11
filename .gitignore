@@ -68,6 +68,12 @@ scripts/lib/*
 !scripts/lib/github-release-baseline.ts
 !scripts/lib/github-release-summary.ts
 !scripts/lib/build-repository.ts
+# Local immutable runtime builds reuse release materials without publishing.
+!scripts/build-runtime.ts
+!scripts/lib/build-materials.ts
+!scripts/lib/compiled-build.ts
+!scripts/lib/runtime-compiler.ts
+!scripts/lib/runtime-build-process.ts
 !scripts/lib/update-index*.ts
 # Protected CI update-server bridge and immutable mirror restoration.
 !scripts/lib/update-server-bridge-*.ts
