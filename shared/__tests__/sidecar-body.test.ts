@@ -753,6 +753,43 @@ describe("coerceSideCarBody / readSideCarBody", () => {
 		expect(coerceSideCarBody([{ kind: "notice" }])).toBeUndefined();
 	});
 
+	it.each([
+		undefined,
+		false,
+		true,
+	])("preserves optional boolean display intent %s in messages", (showToUser) => {
+		const item = {
+			fromId: "agent",
+			text: "Report",
+			...(showToUser === undefined ? {} : { showToUser }),
+		};
+		const body: SideCarBody = { kind: "messages", items: [item] };
+		expect(coerceSideCarBody(body)).toEqual(body);
+		expect(readSideCarBody({ bodyJson: JSON.parse(JSON.stringify(body)) })).toEqual(body);
+		if (showToUser === undefined) expect(item).not.toHaveProperty("showToUser");
+	});
+
+	it.each(
+		["false", "true", 0, 1, null, {}, []].map((showToUser) => ({ showToUser })),
+	)("rejects non-boolean display intent %j", ({ showToUser }) => {
+		expect(
+			coerceSideCarBody({ kind: "messages", items: [{ text: "Report", showToUser }] }),
+		).toBeUndefined();
+	});
+
+	it("display intent changes neither model-facing text nor the full reader projection", () => {
+		const body: SideCarBody = { kind: "messages", items: [{ fromTitle: "Agent", text: "Report" }] };
+		for (const showToUser of [false, true]) {
+			const marked: SideCarBody = { kind: "messages", items: [{ ...body.items[0], showToUser }] };
+			expect(renderSideCarBodyToText("subagent_message", marked, EN)).toBe(
+				renderSideCarBodyToText("subagent_message", body, EN),
+			);
+			expect(sideCarBodyToMarkdown("subagent_message", marked)).toBe(
+				sideCarBodyToMarkdown("subagent_message", body),
+			);
+		}
+	});
+
 	it("reads either wire shape: `body` (WS) or `bodyJson` (DB row)", () => {
 		expect(readSideCarBody({ body: { kind: "notice" } })?.kind).toBe("notice");
 		expect(readSideCarBody({ bodyJson: { kind: "prose", text: "x" } })?.kind).toBe("prose");

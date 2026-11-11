@@ -36,3 +36,12 @@ declare module "@server/generated/embedded-postgres-migrations-data" {
 	export const embeddedPostgresMigrationJournalJson: string;
 	export const embeddedPostgresMigrationSqlFiles: ReadonlyArray<{ name: string; content: string }>;
 }
+
+declare module "@server/generated/embedded-builtin-plugins" {
+	export const embeddedBuiltinPlugins: ReadonlyArray<{
+		dir: string;
+		pluginId: string;
+		version: string;
+		files: ReadonlyArray<{ path: string; content: string }>;
+	}>;
+}

@@ -108,6 +108,7 @@ import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
+import { isApikeyQuotaCapabilityEnabled } from "../services/apikey-quota-plugin-engine";
 import {
 	CodexImageGenerationFixError,
 	disableCodexImageGenerationForPrefix,
@@ -185,6 +186,9 @@ const customApiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
+	quotaSiteUrl: z.string().max(2048).optional(),
+	quotaAccessToken: z.string().max(4096).optional(),
+	quotaUserId: z.string().max(128).optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -951,6 +955,9 @@ async function buildSettingsResponse(
 		tokendance: getTokenDanceConnection(),
 		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		providerBalanceGenerations: getProviderBalanceGenerations(),
+		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
+		// know whether it is on before rendering the site-quota inputs and the balance row.
+		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -966,6 +973,7 @@ async function buildSettingsResponse(
 		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+			quotaAccessToken: p.quotaAccessToken ? maskApiKey(p.quotaAccessToken) : "",
 		})),
 		openaiProviders: (source.openaiProviders ?? []).map((p) => ({
 			...p,
@@ -1664,6 +1672,13 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			for (const p of normalizedCustomApiProviders) {
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
+				}
+				// The site access token is a credential of its own: a masked display value must
+				// keep the stored token instead of overwriting it with the mask.
+				if (p.quotaAccessToken?.startsWith("*")) {
+					p.quotaAccessToken =
+						currentCustomApiProviders.find((candidate) => candidate.id === p.id)
+							?.quotaAccessToken ?? "";
 				}
 			}
 			validated.customApiProviders = normalizedCustomApiProviders;

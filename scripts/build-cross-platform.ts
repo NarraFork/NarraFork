@@ -192,7 +192,11 @@ const buildInfo = {
 };
 const generatedDir = join(ROOT, "server", "generated");
 mkdirSync(generatedDir, { recursive: true });
-for (const [name, source] of collectBuildModules(ROOT, assetsUnder(FRONTEND_DIR), buildInfo)) {
+for (const [name, source] of await collectBuildModules(
+	ROOT,
+	assetsUnder(FRONTEND_DIR),
+	buildInfo,
+)) {
 	const path = join(generatedDir, name);
 	writeFileSync(path, source);
 	console.log(`Generated ${relative(ROOT, path)}`);

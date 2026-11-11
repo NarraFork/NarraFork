@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { renderBuiltinPluginModule } from "../scripts/generate-builtin-plugins";
+import { compileRuntimeBundle } from "../scripts/lib/runtime-compiler";
 import { testEnvironment } from "../tests/preload";
 import { safeSpawn } from "./lib/spawn";
 
@@ -191,6 +193,68 @@ try {
 					: { version: "0.0.0", sourceReads: 0 },
 			);
 		}
+	} finally {
+		await rm(temp, { recursive: true, force: true });
+	}
+}, 60_000);
+
+test("frozen builds embed builtin plugins without sharing mutable materialized copies", async () => {
+	const temp = await mkdtemp(join(testEnvironment.isolatedHome, "frozen-plugins-"));
+	try {
+		const source = join(temp, "source");
+		const plugin = join(source, "server/builtin-plugins/fixture");
+		await mkdir(plugin, { recursive: true });
+		await writeFile(
+			join(plugin, "manifest.json"),
+			JSON.stringify({ pluginId: "fixture", version: "1.0.0" }),
+		);
+		const entry = join(temp, "probe.ts");
+		await writeFile(
+			entry,
+			`
+import { materializeBuiltinPlugins } from ${JSON.stringify(join(root, "server/builtin-plugins/materialize.ts"))};
+const [directory] = await materializeBuiltinPlugins();
+if (!directory) throw new Error("builtin package missing from frozen build");
+console.log(JSON.stringify({ directory, content: await Bun.file(directory + "/index.js").text() }));
+`,
+		);
+		const binaries = new Map<string, string>();
+		for (const id of ["A", "B"]) {
+			await writeFile(join(plugin, "index.js"), `export const marker = "${id}";`);
+			const binary = join(temp, `probe-${id}${process.platform === "win32" ? ".exe" : ""}`);
+			await compileRuntimeBundle({
+				root,
+				entrypoints: [entry],
+				outfile: binary,
+				buildId: id,
+				repository: "fixture/repository",
+				modules: new Map([
+					["embedded-builtin-plugins.ts", await renderBuiltinPluginModule(source)],
+					[
+						"build-info.ts",
+						'export const buildVersion = "fixture"; export const buildCommit = "fixture";',
+					],
+				]),
+			});
+			binaries.set(id, binary);
+		}
+		await rm(source, { recursive: true });
+		const directories: string[] = [];
+		for (const id of ["A", "B", "A"]) {
+			const result = await safeSpawn({
+				cmd: [binaries.get(id) as string],
+				cwd: temp,
+				env: { ...process.env, NARRAFORK_HOME: join(temp, "home") },
+				timeout: 10_000,
+				maxOutputBytes: 32 * 1024,
+			});
+			expect(result.exitCode, result.stderr).toBe(0);
+			const output = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "");
+			expect(output.content).toBe(`export const marker = "${id}";`);
+			directories.push(output.directory);
+		}
+		expect(directories[0]).not.toBe(directories[1]);
+		expect(directories[0]).toBe(directories[2]);
 	} finally {
 		await rm(temp, { recursive: true, force: true });
 	}

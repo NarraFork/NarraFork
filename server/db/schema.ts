@@ -2297,6 +2297,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
 	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(true),
+	/** Account-wide transcript display preference; false preserves the original cards. */
+	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
+		.notNull()
+		.default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**

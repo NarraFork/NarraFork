@@ -63,7 +63,7 @@ test("backend assets need no frontend build; full frontend refuses missing index
 	expect(runtimeAssets(root, true).has("/unrelated.js")).toBe(true);
 });
 
-test("asset budgets reject excessive input before collecting migration data", () => {
+test("asset budgets reject excessive input before collecting migration data", async () => {
 	const root = temporary();
 	const path = join(root, "oversized.asset");
 	put(path, "");
@@ -75,11 +75,11 @@ test("asset budgets reject excessive input before collecting migration data", ()
 		repository: "fixture/repository",
 		helperDistribution: createHelperDistributionDependencies(),
 	};
-	expect(() => collectBuildModules(root, new Map([["/oversized.asset", path]]), info)).toThrow(
-		"Build asset budget exceeded",
-	);
+	await expect(
+		collectBuildModules(root, new Map([["/oversized.asset", path]]), info),
+	).rejects.toThrow("Build asset budget exceeded");
 	const entries = new Map(Array.from({ length: 20_001 }, (_, index) => [`/${index}`, path]));
-	expect(() => collectBuildModules(root, entries, info)).toThrow("20000 files");
+	await expect(collectBuildModules(root, entries, info)).rejects.toThrow("20000 files");
 });
 
 test("missing inputs and cancellation never start source, run migrations, or reuse old artifacts", async () => {

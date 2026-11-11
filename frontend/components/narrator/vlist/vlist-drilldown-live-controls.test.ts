@@ -33,7 +33,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { shellSource } from "./guard-source";
+import { shellModule, shellSource } from "./guard-source";
 import { sliceBracketedRegion } from "./source-slice";
 
 const DIR = import.meta.dir;
@@ -41,13 +41,15 @@ const SHELL = shellSource();
 const MEASURE_NOTICE = readFileSync(join(DIR, "measure", "measure-reflection-notice.ts"), "utf8");
 const RENDER_CARD = readFileSync(join(DIR, "render", "RenderToolCall.tsx"), "utf8");
 
-/** The body of the shell's `rowCard` drill-down slot. */
+/** The whole drill-down callback, independent of its return branches. */
 function rowCardBody(): string {
-	const start = SHELL.indexOf("extra.rowCard = (row: MeasuredTraceRow) => {");
-	expect(start).toBeGreaterThan(0);
-	const end = SHELL.indexOf('return renderElement("tool-call", card, cardExtra);', start);
-	expect(end).toBeGreaterThan(start);
-	return SHELL.slice(start, end);
+	const body = sliceBracketedRegion(
+		shellModule("ExactRow.tsx"),
+		"extra.rowCard = (row: MeasuredTraceRow) => {",
+	);
+	expect(body).not.toBeNull();
+	if (!body) throw new Error("Missing rowCard drill-down callback");
+	return body;
 }
 
 describe("drilled-in card: live header controls", () => {

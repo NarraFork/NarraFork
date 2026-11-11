@@ -7,6 +7,7 @@ import {
 import { buildLicenseManifestFromDisk } from "../../server/lib/licenses/manifest";
 import type { HelperDistributionDependencies } from "../../shared/helper-distribution";
 import type { LocalizedValue } from "../../shared/i18n-locales";
+import { renderBuiltinPluginModule } from "../generate-builtin-plugins";
 
 /** Shared by release and local builds; these functions never write into the checkout. */
 function collectAssetFiles(directory: string): string[] {
@@ -138,11 +139,11 @@ export const embeddedLicenseGeneratedAt = ${manifest.generatedAt};
 }
 
 /** Paths are logical server/generated basenames, suitable for disk output or an in-memory plugin. */
-export function collectBuildModules(
+export async function collectBuildModules(
 	root: string,
 	assets: ReadonlyMap<string, string>,
 	info: BuildInfo,
-): Map<string, string> {
+): Promise<Map<string, string>> {
 	// Account for assets before handing them to Bun, not after reading them into memory.
 	let bytes = 0;
 	if (assets.size > 20_000) throw new Error("Build assets exceed 20000 files");
@@ -163,5 +164,6 @@ export function collectBuildModules(
 		["build-info.ts", renderBuildInfo(info)],
 		["embedded-changelog.ts", renderChangelogs(root)],
 		["embedded-licenses.ts", renderLicenses(root)],
+		["embedded-builtin-plugins.ts", await renderBuiltinPluginModule(root)],
 	]);
 }

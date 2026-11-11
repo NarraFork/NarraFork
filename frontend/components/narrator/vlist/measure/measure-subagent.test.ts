@@ -18,6 +18,37 @@ const BASE = {
 };
 
 describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
+	it("compact display folds completed cards like ordinary tools but leaves live controls visible", async () => {
+		const { resolveSubagentExpanded, measureSubagentCard } = await import("./measure-subagent");
+		const input = {
+			isActive: false,
+			hasSelfPermission: false,
+			pendingPermissionCount: 0,
+			isRecent: true,
+			opened: true,
+			compactAuxiliaryContent: true,
+		};
+		for (const lod of [1, 2, 3] as const) expect(resolveSubagentExpanded(lod, input)).toBe(false);
+		expect(resolveSubagentExpanded(4, input)).toBe(true);
+		expect(resolveSubagentExpanded(4, { ...input, isRecent: false })).toBe(false);
+		expect(resolveSubagentExpanded(5, { ...input, opened: false })).toBe(true);
+		expect(resolveSubagentExpanded(5, { ...input, userCollapsed: true })).toBe(false);
+		expect(resolveSubagentExpanded(1, { ...input, hasSelfPermission: true })).toBe(true);
+		expect(resolveSubagentExpanded(1, { ...input, isActive: true })).toBe(true);
+		expect(
+			measureSubagentCard(BASE, WIDTH, 3, { compactAuxiliaryContent: true }).effectiveExpanded,
+		).toBe(false);
+		expect(measureSubagentCard(BASE, WIDTH, 3).effectiveExpanded).toBe(true);
+		expect(
+			measureSubagentCard(BASE, WIDTH, 4, { compactAuxiliaryContent: true, isRecent: true })
+				.effectiveExpanded,
+		).toBe(true);
+		expect(
+			measureSubagentCard(BASE, WIDTH, 4, { compactAuxiliaryContent: true, isRecent: false })
+				.effectiveExpanded,
+		).toBe(false);
+	});
+
 	it("lodExempt (active | selfPermission | pending) is always expanded", async () => {
 		const { resolveSubagentExpanded } = await import("./measure-subagent");
 		const base = { isRecent: false, opened: false };

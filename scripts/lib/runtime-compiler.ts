@@ -118,7 +118,7 @@ async function compileApplication(
 	} catch {
 		// Source archives need not contain Git metadata.
 	}
-	const modules = collectBuildModules(root, runtimeAssets(root, frontend), {
+	const modules = await collectBuildModules(root, runtimeAssets(root, frontend), {
 		version: pkg.version ?? "0.0.0",
 		commit,
 		platform: `${process.platform === "win32" ? "win" : process.platform}-${process.arch}`,

@@ -88,7 +88,7 @@ export function resolveItemViewTargets(
 			{ sections: renderLabels.toolCall.sections },
 		);
 	}
-	if (kind === "tool-call") {
+	if (kind === "tool-call" || kind === "auxiliary-content") {
 		const labels = { sections: renderLabels.toolCall.sections };
 		const model = (item.spec.data as { detail?: ToolSectionsDetail } | null)?.detail;
 		return fromSource && model
@@ -220,6 +220,7 @@ export function resolveTraceRowViewTargets(
 export const TOGGLEABLE_CARD_KINDS = new Set([
 	"reasoning",
 	"tool-call",
+	"auxiliary-content",
 	"subagent-card",
 	// Slash-command bubbles fold their expanded prompt behind a toggle. Plain user
 	// bubbles carry no `commandText`, so the render layer ignores the callback.
