@@ -76,8 +76,9 @@
  * neither claims nor ends it.
  *
  * Handing a task on (outline P2 PR 10a, design §E.1): an agent's write that gives a task in
- * progress another assignee (not the writer's own session, not whoever is doing it) ends the
- * work in the same commit: the task goes back to to-do, which releases the claim as above (and
+ * progress to someone else (a person, `@human:name`; or another session, `@agent:<its id or
+ * handle>`; not the writer's own session, not whoever is doing it, and not an `@agent:` name no
+ * session has, which stays a label) ends the work in the same commit: the task goes back to to-do, which releases the claim as above (and
  * is refused as above when someone else is doing it). The new executor claims it when it starts,
  * with the next claim generation, so a result the previous one still hands in is told as late
  * (`delegation.ts`). Reported as a `handed-over` adjustment. The board does the same for a person
@@ -3447,8 +3448,8 @@ class OutlinePlanner {
 
 	/**
 	 * An agent's hand-over (see TASK CLAIMS in the header): a task in progress before and after
-	 * the commit whose assignee the commit changed to someone who is neither the writer's session
-	 * nor whoever is doing it goes back to to-do. Reads the claims of those tasks only, and the
+	 * the commit whose assignee the commit changed to a person or a session that is neither the
+	 * writer's session nor whoever is doing it goes back to to-do. Reads the claims of those tasks only, and the
 	 * sessions and people they and the new assignees name; a write that changes no assignee of a
 	 * task in progress reads nothing.
 	 */
@@ -3465,9 +3466,17 @@ class OutlinePlanner {
 		const rows = new Map(
 			(await this.store.getTaskClaims(moved.map((b) => b.id))).map((r) => [r.taskBlockId, r]),
 		);
-		const { assigneeNamesSession, assigneeNamesUser } = await import("./assignee");
+		const { assigneeNamesSession, assigneeNamesUser, resolveAgentAssignee } = await import(
+			"./assignee"
+		);
 		for (const block of moved) {
 			const assignee = block.taskJson?.assignee as string;
+			// An `@agent:` name no session has is a label, as it always was: nobody takes over.
+			if (
+				assignee.startsWith("agent:") &&
+				!(await resolveAgentAssignee(assignee, { store: this.store }))
+			)
+				continue;
 			// The writer names itself: it is taking the task up, not handing it on.
 			if (writer && (await assigneeNamesSession(assignee, writer, this.store))) continue;
 			const row = rows.get(block.id);

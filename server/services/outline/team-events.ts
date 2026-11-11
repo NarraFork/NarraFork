@@ -386,6 +386,12 @@ async function unblockedInCommit(
 		})),
 		{ store },
 	);
+	// The link index gives them in no order a reader would know: by space, page and sibling order.
+	const place = (t: OutlineBlockMeta) =>
+		`${t.spaceId}\u0000${t.pageId}\u0000${t.orderKey}\u0000${t.id}`;
+	found.sort((a, b) =>
+		place(a.task) < place(b.task) ? -1 : place(a.task) > place(b.task) ? 1 : 0,
+	);
 	for (const { root, pair, task } of found) {
 		const entry: Unblocked = {
 			task,
