@@ -84,6 +84,7 @@ import {
 	type OutlineWriteRefusal,
 	spaceRootName,
 } from "./agent-scope";
+import { checkAgentAssignees } from "./assignee";
 import {
 	EDIT_LABEL_RE,
 	type EditTextItem,
@@ -1282,6 +1283,28 @@ export async function outlineEdit(
 				}
 			}
 
+			// An `@agent:` assignee this write gives a task (design §2.2): a session that could not
+			// do the task there refuses the write; a name no session has is written as a name.
+			const given = ops.flatMap((op) => {
+				if (op.op !== "insert" && op.op !== "setTask" && op.op !== "restore") return [];
+				const assignee = op.task?.assignee;
+				if (!assignee?.startsWith("agent:")) return [];
+				// Unchanged on an existing task: nothing is assigned.
+				if (op.op === "setTask" && "id" in op.block) {
+					if (current.get(op.block.id)?.taskJson?.assignee === assignee) return [];
+				}
+				return [assignee];
+			});
+			if (given.length > 0) {
+				const checked = await checkAgentAssignees(given, space, { store: scope.store });
+				if (checked.refused.length > 0)
+					return {
+						output: failed(checked.refused.map(OUTLINE_TOOL_TEXT.edit.assigneeCannotWork)),
+					};
+				for (const name of checked.unknown)
+					globalNotes.push(OUTLINE_TOOL_TEXT.edit.assigneeUnknown(name));
+			}
+
 			// Write.
 			let result: OutlineWriteResult;
 			try {
@@ -1324,6 +1347,14 @@ export async function outlineEdit(
 				if (error instanceof NotFoundError) return { output: failed([error.message]) };
 				throw error;
 			}
+
+			// A hand-over ended the work on a task in progress: said beside its edit.
+			result.results.forEach((r, i) => {
+				if (!r?.adjustments?.some((a) => a.kind === "handed-over")) return;
+				edits[opEdit[i] as number]?.notes.push(
+					OUTLINE_TOOL_TEXT.edit.handedOver(scope.labelIn(space)(r.sid)),
+				);
+			});
 
 			// The read ledger follows the agent's own writes: what it added and the texts it wrote.
 			// A merged block counts as read only once the result shows it (below), so until then

@@ -75,6 +75,15 @@
  * commit makes it plan again. Rewriting a task that stays in progress (its text, its place)
  * neither claims nor ends it.
  *
+ * Handing a task on (outline P2 PR 10a, design §E.1): an agent's write that gives a task in
+ * progress to someone else (a person, `@human:name`; or another session, `@agent:<its id or
+ * handle>`; not the writer's own session, not whoever is doing it, and not an `@agent:` name no
+ * session has, which stays a label) ends the work in the same commit: the task goes back to to-do, which releases the claim as above (and
+ * is refused as above when someone else is doing it). The new executor claims it when it starts,
+ * with the next claim generation, so a result the previous one still hands in is told as late
+ * (`delegation.ts`). Reported as a `handed-over` adjustment. The board does the same for a person
+ * (`person-tasks.ts`); a person's edit elsewhere is written as it is.
+ *
  * A delegation (`delegation.ts`, outline P2 PR 9a) is the one write that moves a claim within a
  * session: `OutlineWriteOptions.delegateClaim` hands the task to the subagent sent to do it, on the
  * running lease, with the next claim generation, whoever of the session held it; anyone else
@@ -406,7 +415,12 @@ export type OutlineAdjustment =
 	 * back someone else's lock, which the writer may not do: the task's lock stays as it was
 	 * before the commit (`blockId`), the rest is written.
 	 */
-	| { kind: "lock-kept"; blockId: string };
+	| { kind: "lock-kept"; blockId: string }
+	/**
+	 * An agent gave a task in progress another assignee: the work ended in the same commit (the
+	 * task is to do, its claim released), so the new executor claims it afresh (`blockId`).
+	 */
+	| { kind: "handed-over"; blockId: string };
 
 /**
  * A task someone else was doing that this commit finished or reopened: a person's commit, or a
@@ -2719,6 +2733,7 @@ class OutlinePlanner {
 
 	private async assemble(): Promise<Planned | null> {
 		this.checkQuestionsAreNotTasks();
+		await this.endHandedOverWork();
 		this.leaveUnclaimedToDo();
 		await this.guardLocks();
 		await this.checkRepage();
@@ -3429,6 +3444,61 @@ class OutlinePlanner {
 		if (session === null || this.endedSessions.has(session)) return null;
 		const root = roots.get(session);
 		return root === undefined ? null : { narratorId: root };
+	}
+
+	/**
+	 * An agent's hand-over (see TASK CLAIMS in the header): a task in progress before and after
+	 * the commit whose assignee the commit changed to a person or a session that is neither the
+	 * writer's session nor whoever is doing it goes back to to-do. Reads the claims of those tasks only, and the
+	 * sessions and people they and the new assignees name; a write that changes no assignee of a
+	 * task in progress reads nothing.
+	 */
+	private async endHandedOverWork(): Promise<void> {
+		if (this.input.actor.kind !== "agent" || this.commitKind !== "edit") return;
+		if (this.leaseExpiry || this.extra.delegateClaim) return;
+		const moved = [...this.blocks.values()].filter((block) => {
+			if (!doingBefore(block) || block.deleted || block.taskJson?.status !== "doing") return false;
+			const after = block.taskJson.assignee ?? null;
+			return after !== null && after !== (block.base?.taskJson?.assignee ?? null);
+		});
+		if (moved.length === 0) return;
+		const writer = this.claimer?.narratorId;
+		const rows = new Map(
+			(await this.store.getTaskClaims(moved.map((b) => b.id))).map((r) => [r.taskBlockId, r]),
+		);
+		const { assigneeNamesSession, assigneeNamesUser, resolveAgentAssignee } = await import(
+			"./assignee"
+		);
+		for (const block of moved) {
+			const assignee = block.taskJson?.assignee as string;
+			// An `@agent:` name no session has is a label, as it always was: nobody takes over.
+			if (
+				assignee.startsWith("agent:") &&
+				!(await resolveAgentAssignee(assignee, { store: this.store }))
+			)
+				continue;
+			// The writer names itself: it is taking the task up, not handing it on.
+			if (writer && (await assigneeNamesSession(assignee, writer, this.store))) continue;
+			const row = rows.get(block.id);
+			if (row && liveClaim(row, this.now)) {
+				// Whoever is doing it is named: nothing changes hands.
+				if (
+					row.holderNarratorId !== null &&
+					(await assigneeNamesSession(assignee, row.holderNarratorId, this.store))
+				)
+					continue;
+				if (row.holderUserId !== null && (await assigneeNamesUser(assignee, row.holderUserId)))
+					continue;
+			}
+			block.taskJson = canonicalTaskJson({ ...block.taskJson, status: "todo" });
+			this.claimIntent.delete(block.id);
+			const opIndex = this.taskOp.get(block.id);
+			const result = opIndex === undefined ? undefined : this.results[opIndex];
+			if (result) {
+				const adjustment: OutlineAdjustment = { kind: "handed-over", blockId: block.id };
+				result.adjustments = [...(result.adjustments ?? []), adjustment];
+			}
+		}
 	}
 
 	/**

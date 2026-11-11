@@ -86,7 +86,9 @@ const link = (r: OutlineOpResult, title: string) => `[[${r.address}|${title}]]`;
 /**
  * A project with sessions A (the one looking), B and C of one person, a page with A's tree
  * (`auth 模块稳定` > `改刷新逻辑`, `补测试`; A holds `补测试`) and the project task page with a task
- * nobody started, all written well before the window.
+ * nobody started, all written well before the window. `改刷新逻辑` is a person's task in A's tree
+ * (its manager is the person): a task A created itself ending elsewhere is told to A by its team
+ * row (`team-events.ts`, outline P2 PR 10a), and team activity leaves it out (the last scenario).
  */
 async function project(ctx: TeamActivityContext) {
 	const t = clock();
@@ -114,7 +116,7 @@ async function project(ctx: TeamActivityContext) {
 				op: "insert",
 				parent: { tempId: "root" },
 				content: "改刷新逻辑",
-				task: { status: "todo" },
+				task: { status: "todo", manager: { kind: "human", id: alice.id } },
 			},
 			{ op: "insert", parent: { tempId: "root" }, content: "补测试", task: { status: "doing" } },
 		],
@@ -400,7 +402,8 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 								op: "insert",
 								parent: { tempId: "root" },
 								content: `${long} ${i}.${j}`,
-								task: { status: "todo" },
+								// A person's steps in A's trees (see `project`).
+								task: { status: "todo", manager: { kind: "human", id: p.alice.id } },
 							}),
 						),
 					],
@@ -622,6 +625,38 @@ export const OUTLINE_TEAM_ACTIVITY_SCENARIOS: TeamActivityScenario[] = [
 			expect(await readOutlineTeamActivity(helper, { locale: "en", now: p.t.look })).toBeNull();
 			// C relates to nothing B did (its tree is A's, not on the task page).
 			expect(await readOutlineTeamActivity(p.c, { locale: "en", now: p.t.look })).toBeNull();
+		},
+	},
+	{
+		name: "what a team row already told the session is left out: a task it created ending, a task handed to it by name",
+		async run(ctx) {
+			resetOutlineTeamActivityForTests();
+			const p = await project(ctx);
+			const { t, space } = p;
+			const tasksPage = (await pageOf(p.upgrade)).id;
+			// B ends a task A created (its team row tells A), hands A one that exists and creates
+			// one for it (both its team row's too), and starts a person's task in A's tree (nobody
+			// tells A of that but team activity).
+			await write(
+				space.id,
+				agent(p.b, p.alice.id),
+				[
+					{ op: "setTask", block: { id: p.tests.blockId }, task: { status: "done" } },
+					{ op: "setTask", block: { id: p.upgrade.blockId }, task: { assignee: `agent:${p.a}` } },
+					{
+						op: "insert",
+						parent: { id: tasksPage },
+						content: "替主线建的",
+						task: { status: "todo", assignee: `agent:${p.a}` },
+					},
+					{ op: "setTask", block: { id: p.refresh.blockId }, task: { status: "doing" } },
+				],
+				t.next(),
+			);
+			const look = await readOutlineTeamActivity(p.a, { locale: "zh-CN", now: t.look });
+			expect(look?.content.split("\n").slice(1)).toEqual([
+				`- ${link(p.root, "auth 模块稳定")} 下：会话「B」开始做 ${link(p.refresh, "改刷新逻辑")}`,
+			]);
 		},
 	},
 ];
