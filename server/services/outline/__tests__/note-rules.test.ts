@@ -23,11 +23,13 @@ import "../../../lib/agent/tools";
 import { type OutlineEditRequest, outlineEdit } from "../agent-edit";
 import type { OutlineToolOutput } from "../agent-read";
 import { OutlineAgentScope } from "../agent-scope";
+import { reportBlockId } from "../delegation";
 import { DELEGATION_TEXT } from "../delegation-text";
 import { stopEditTextWorker } from "../edit-text-runner";
 import { OUTLINE_TOOL_TEXT } from "../messages";
 import { ensurePlanRoot } from "../plans";
 import { clearOutlineReads } from "../read-ledger";
+import { OUTLINE_REPORT_ACTOR } from "../report-authors";
 import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import type { OutlineSpaceRow } from "../store/port";
@@ -307,6 +309,34 @@ describe("who is not held to the rules", () => {
 		);
 		expect(out.isError).toBeFalsy();
 		expect(out.output).not.toContain(TEXT.warnHeader);
+	});
+
+	test("blocks inside a subagent report: the report is not the session's notes", async () => {
+		const w = await world();
+		const t = await task(w);
+		const parent = (await blocks(w.space)).find((b) => b.sid === t);
+		const container = reportBlockId(generateId(), "run-1");
+		await writeOutline({
+			spaceId: w.space.id,
+			ops: [
+				{
+					op: "insert",
+					tempId: "report",
+					id: container,
+					parent: { id: parent?.id as string },
+					content: "Report (generation 1 · 2026-11-09 17:38 UTC)",
+				},
+			],
+			actor: { kind: "system", id: OUTLINE_REPORT_ACTOR },
+			responsibleUserId: w.alice,
+		});
+		const report = (await blocks(w.space)).find((b) => b.id === container);
+		const out = await edit(w, [{ add: report?.sid as string, markdown: `- ${long}` }], "reject");
+		expect(out.isError).toBeFalsy();
+		expect(out.output).not.toContain(TEXT.warnHeader);
+		// The same block directly under the task is refused.
+		const refused = await edit(w, [{ add: t, markdown: `- ${long}` }], "reject");
+		expect(refused.isError).toBe(true);
 	});
 
 	test("a person's write under a task is never checked", async () => {
