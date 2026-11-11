@@ -134,13 +134,13 @@ jobs:
         run: test -f dist/frontend/index.html
       - name: Install test system dependencies
         run: |
-          # Avoid the runner mirror-list resolver retaining a failed Azure DNS lookup.
+          # Use an independent Ubuntu mirror during Canonical DNS outages.
           # Keep Ubuntu's signed repository metadata and all package verification enabled.
           sudo python3 - <<'PY'
           from pathlib import Path
           path = Path("/etc/apt/sources.list.d/ubuntu.sources")
           sources = path.read_text()
-          path.write_text(sources.replace("mirror+file:/etc/apt/apt-mirrors.txt", "https://archive.ubuntu.com/ubuntu/"))
+          path.write_text(sources.replace("mirror+file:/etc/apt/apt-mirrors.txt", "https://mirrors.edge.kernel.org/ubuntu/"))
           PY
           sudo apt-get update
           sudo apt-get install --yes zstd podman git ripgrep acl python3

@@ -401,7 +401,7 @@ describe("generic CI workflow", () => {
 		);
 	});
 
-	test("uses the signed Ubuntu archive directly before installing test dependencies", () => {
+	test("uses an independently hosted signed Ubuntu mirror before installing test dependencies", () => {
 		const dependencies = step("tests", (value) => !!value.run?.includes("apt-get install"));
 		const script = dependencies.run ?? "";
 		const updateOffset = script.indexOf("sudo apt-get update");
@@ -424,7 +424,10 @@ describe("generic CI workflow", () => {
 		const result = shell(`sudo() { "$@"; }\n${prepare}`);
 		expect(result.status).toBe(0);
 		expect(readFileSync(path, "utf8")).toBe(
-			sources.replace("mirror+file:/etc/apt/apt-mirrors.txt", "https://archive.ubuntu.com/ubuntu/"),
+			sources.replace(
+				"mirror+file:/etc/apt/apt-mirrors.txt",
+				"https://mirrors.edge.kernel.org/ubuntu/",
+			),
 		);
 		expect(script).not.toMatch(/allow-unauthenticated|trusted=yes|Check-Valid-Until=false/);
 		expect(updateOffset).toBeLessThan(script.indexOf("sudo apt-get install"));
