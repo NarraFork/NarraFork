@@ -39,9 +39,12 @@ export interface TailMetaOptions {
 	findSpecTasksToolUseId: (messages: TailMetaMessage[]) => string | null;
 }
 
-/** True when a message is a system error card (excluded from lastRealMessage). */
-function isErrorSystemMessage(msg: TailMetaMessage): boolean {
-	return msg.role === "system" && messageBody(msg).some((block) => block?.type === "error");
+/** Error cards and hidden epoch bookkeeping do not replace the conversation tail. */
+function isNonTurnSystemMessage(msg: TailMetaMessage): boolean {
+	if (msg.role !== "system") return false;
+	const blocks = messageBody(msg);
+	// Match message-segments' hidden epoch rule; do not skip compact boundaries.
+	return blocks[0]?.type === "epoch" || blocks.some((block) => block?.type === "error");
 }
 
 /**
@@ -63,7 +66,7 @@ export function buildTailMeta(
 		const msg = messages[i]!;
 		const id = typeof msg.id === "string" ? msg.id : undefined;
 		if (!id || isNestedRow(msg)) continue;
-		if (!lastRealMessage && id !== opts.streamingMsgId && !isErrorSystemMessage(msg)) {
+		if (!lastRealMessage && id !== opts.streamingMsgId && !isNonTurnSystemMessage(msg)) {
 			lastRealMessage = { id, role: msg.role };
 		}
 		if (!lastUserMessageId && msg.role === "user" && !id.startsWith("optimistic-")) {
