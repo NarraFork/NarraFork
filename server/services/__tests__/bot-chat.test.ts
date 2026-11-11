@@ -385,6 +385,22 @@ describe("Send({ user })", () => {
 		expect(page.messages.at(-1)?.contentText).toBe("Done.");
 	});
 
+	test.each([
+		false,
+		true,
+	])("display intent %s never hides or suppresses a real chat post", async (showToUser) => {
+		const message = `Bot post with show_to_user=${showToUser}`;
+		const result = await sendTool.execute(
+			{ user: aliceName, message, show_to_user: showToUser },
+			ctx(openBot),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.targets).toEqual([{ label: aliceName, status: "sent" }]);
+		const room = await resolveBotRoom(openBot, alice);
+		const page = await listMessages({ roomId: room.id, userId: alice });
+		expect(page.messages.at(-1)?.contentText).toBe(message);
+	});
+
 	test("strips native-search citation markers before the person sees them", async () => {
 		const marker = "\ue200cite\ue202turn0search0\ue202turn0search3\ue201";
 		const result = await sendTool.execute(

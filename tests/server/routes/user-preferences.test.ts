@@ -108,6 +108,71 @@ afterAll(() => {
 	mock.restore();
 });
 
+describe("auxiliary content display preference", () => {
+	async function patch(body: Record<string, unknown>) {
+		return requestJson("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("defaults to compact display before and after an unrelated first save", async () => {
+		seedUser();
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+		expect((await patch({ wordWrapCode: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+	});
+
+	it("persists an explicit legacy choice on first save and across clients", async () => {
+		seedUser();
+		const saved = await patch({ compactAuxiliaryContent: false });
+		expect(saved.status).toBe(200);
+		expect(saved.body).toMatchObject({ compactAuxiliaryContent: false });
+		// A separate request reads the account preference, not browser-local state.
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: false });
+		expect((await patch({ wordWrapCode: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({
+			compactAuxiliaryContent: false,
+			wordWrapCode: false,
+		});
+		expect((await patch({ compactAuxiliaryContent: true })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+	});
+
+	it("updates existing preferences without changing another user's choice", async () => {
+		seedPreferences([]);
+		expect((await patch({ compactAuxiliaryContent: false })).status).toBe(200);
+		db.insert(users)
+			.values({
+				id: "other-user",
+				username: "other-user",
+				passwordHash: "test",
+				role: "user",
+				createdAt: NOW,
+			})
+			.run();
+		authUser.sub = "other-user";
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: true });
+		expect((await patch({ compactAuxiliaryContent: true })).status).toBe(200);
+		authUser.sub = "user-1";
+		expect((await requestJson("/")).body).toMatchObject({ compactAuxiliaryContent: false });
+	});
+
+	it("accepts only boolean choices", () => {
+		for (const value of [true, false]) {
+			expect(
+				updateUserPreferencesSchema.safeParse({ compactAuxiliaryContent: value }).success,
+			).toBe(true);
+		}
+		for (const value of ["false", 0, null, {}]) {
+			expect(
+				updateUserPreferencesSchema.safeParse({ compactAuxiliaryContent: value }).success,
+			).toBe(false);
+		}
+	});
+});
+
 describe("local access preference", () => {
 	async function patch(body: Record<string, unknown>) {
 		return requestJson("/", {

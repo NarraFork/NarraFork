@@ -322,6 +322,7 @@ export function useVListLabels(): VListLabels {
 		() => ({
 			historyCleared: t("historyCleared"),
 			toolDetailsCleared: t("toolDetailsCleared"),
+			status_fail: t("traceRowMark.failed"),
 			// ── compact / segment-compact indicator lines ───────────────────────────
 			compacting: t("compacting"),
 			compacted: t("compacted"),
@@ -1015,6 +1016,7 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 	switch (kind) {
 		case "reasoning":
 			return labels.reasoning;
+		case "auxiliary-content":
 		case "tool-call":
 			return labels.toolCall;
 		case "activity-trace":

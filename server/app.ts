@@ -14,6 +14,7 @@ import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
+import { setProviderBalanceEngine } from "./lib/provider-balance-engine";
 import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
@@ -106,7 +107,12 @@ import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { workspaceRoutes } from "./routes/workspaces";
+import {
+	builtinApikeyQuotaEngine,
+	setApikeyQuotaActivation,
+} from "./services/apikey-quota-plugin-engine";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
+import { pluginManager } from "./services/plugin-manager";
 
 export interface AppEnv {
 	Bindings: {
@@ -365,6 +371,15 @@ app.route("/api/auth/sso", ssoRoutes);
 // Plugin UI asset/shell routes use short-lived, session-bound capabilities; control
 // endpoints inside pluginUiRoutes still apply session-only authentication explicitly.
 app.route("/api/plugins", pluginUiRoutes);
+
+// Provider balance (API-key quota) querying is answered by the built-in `apikey-quota`
+// plugin, which ships with the app and is enabled by default. It is a normal plugin: the tool
+// goes through `pluginToolRegistry`, so its process lifecycle, capabilities and health are the
+// shared ones. The plugin owns the capability, so disabling it in the plugin list turns quota
+// querying off: the snapshot then reports `plugin_not_enabled` instead of quietly answering
+// from the bundled adapters, and re-enabling it restores the value on the next discovery.
+setApikeyQuotaActivation(pluginManager);
+setProviderBalanceEngine(builtinApikeyQuotaEngine);
 
 // Public: OAuth 2.0 provider endpoints. NarraFork is the authorization server
 // here — external apps fetch metadata, exchange codes and revoke tokens without

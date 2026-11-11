@@ -122,7 +122,7 @@
 	"scripts": {
 		"approve": "bun server/scripts/approve-all.ts",
 		"sql:report": "bun scripts/sql-trace-report.ts",
-		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts",
+		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts && bun scripts/generate-builtin-plugins.ts",
 		"build:cross": "bun scripts/build-cross-platform.ts",
 		"build:update-server": "bun scripts/build-update-server.ts",
 		"build:linux": "bun scripts/build-cross-platform.ts --platform=linux",
@@ -149,15 +149,17 @@
 		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
 		"format": "bunx @biomejs/biome check --write .",
 		"i18n:check": "bun server/scripts/check-i18n.ts",
-		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",
-		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production NF_SQL_TRACE=${NF_SQL_TRACE:-summary} bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts --mode production",
+		"build:runtime": "bun scripts/build-runtime.ts",
+		"start": "bun server/dev-all.ts --production",
+		"start:dev": "bun server/dev-all.ts --production --frontend-dev",
 		"test": "bun test --isolate",
 		"test:fast": "bun test",
 		"smoke:dock": "bun scripts/smoke-narrator-dock.ts",
 		"smoke:dock:visual": "bun scripts/visualize-dock-drag.ts",
 		"benchmark:narrator-history": "bun server/scripts/benchmark-narrator-history.ts",
 		"typecheck": "tsgo --noEmit",
-		"test:watch": "bun test --isolate --watch"
+		"test:watch": "bun test --isolate --watch",
+		"build:builtin-plugins": "bun scripts/generate-builtin-plugins.ts"
 	},
 	"trustedDependencies": [
 		"@parcel/watcher",

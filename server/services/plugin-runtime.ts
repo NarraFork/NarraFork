@@ -1729,6 +1729,11 @@ export class PluginRuntime {
 			{ jsonrpc: "2.0", id, method, params: params as never },
 			timeoutMs,
 		);
+		// Both sides are raced and only one settles the round: the loser is cancelled in
+		// `finally`, and a rejection with no handler would surface as an unhandled rejection
+		// even though this call already got its answer.
+		responseWait.catch(() => undefined);
+		notificationWait.promise.catch(() => undefined);
 		try {
 			const response = await Promise.race([responseWait, notificationWait.promise]);
 			if ("error" in response) {
@@ -2211,6 +2216,9 @@ function createAbortError(reason?: unknown): Error {
 
 async function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	// The raced promise can settle after the timeout has already answered the caller; without
+	// a handler that late rejection would be reported as an unhandled rejection.
+	promise.catch(() => undefined);
 	try {
 		return await Promise.race([
 			promise,

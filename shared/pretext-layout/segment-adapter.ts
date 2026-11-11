@@ -18,7 +18,12 @@
  */
 
 import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
-import { isCommunicationTool, limitCommunicationPreview } from "../communication-tool";
+import {
+	communicationInputField,
+	isCommunicationTool,
+	limitCommunicationPreview,
+	shouldShowCommunicationBubble,
+} from "../communication-tool";
 import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
@@ -65,6 +70,12 @@ type ToolTimingRecord = Partial<
 
 import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
+import {
+	type AuxiliaryContentProjection,
+	auxiliaryContentKey,
+	auxiliaryContentViews,
+	buildAuxiliaryContentData,
+} from "./auxiliary-content";
 import {
 	type CommunicationState,
 	communicationSelectors,
@@ -513,8 +524,68 @@ function isTerminalStatus(status?: string | null): boolean {
  * that made Edit/Write headers render with no target path. `getSummary` resolves
  * those through `_hints` / a preview scan, hence the injection.
  */
+function compactSummaryPrefix(value: unknown, max = 160): string {
+	return (readLeafText(value) ?? "").slice(0, max).replace(/\s+/g, " ").trim();
+}
+
 function toolSummary(tc: AdapterToolItem["tc"], ctx?: AdapterContext): string {
 	if (toolPayloadCleared(tc)) return sysLabel(ctx ?? { lod: 5 }, "toolDetailsCleared");
+	if (ctx?.compactAuxiliaryContent) {
+		if (isCommunicationTool(tc) && !shouldShowCommunicationBubble(tc, true)) {
+			const metadata = asObject(resolveToolMetadata(tc));
+			const targets = resolveCommunicationTargets(metadata, tc._sendDeliveryTargets);
+			const recipients =
+				targets.length > 0
+					? targets.slice(0, 3).map(communicationTargetLabel)
+					: communicationSelectors(tc.inputJson).slice(0, 3);
+			const recipient = recipients
+				.map((label) => compactSummaryPrefix(label, 48))
+				.filter(Boolean)
+				.join(", ");
+			const message = compactSummaryPrefix(communicationInputField(tc.inputJson, "message"));
+			if (recipient || message)
+				return recipient && message ? `${recipient}：${message}` : recipient || message;
+		}
+		if (tc.toolName === "AskUserQuestion") {
+			const answers = asObject(asObject(tc.inputJson).answers);
+			const selected = Object.values(answers)
+				.slice(0, 3)
+				.map((value) =>
+					Array.isArray(value)
+						? value
+								.slice(0, 3)
+								.map((answer) => compactSummaryPrefix(answer, 48))
+								.join(", ")
+						: compactSummaryPrefix(value, 120),
+				)
+				.filter(Boolean);
+			if (selected.length > 0)
+				return `${ctx.labels?.askAnswerPrefix ?? "Answer:"} ${selected.join(" · ")}`;
+		}
+		if (
+			tc.toolName === "ExitPlanMode" &&
+			tc.status &&
+			["success", "completed", "fail", "error", "denied", "cancelled", "interrupted"].includes(
+				tc.status,
+			)
+		) {
+			const status =
+				ctx.labels?.[`status_${tc.status}`] ??
+				(
+					{
+						success: "Completed",
+						completed: "Completed",
+						fail: "Failed",
+						error: "Failed",
+						denied: "Denied",
+						cancelled: "Cancelled",
+						interrupted: "Interrupted",
+					} as Record<string, string>
+				)[tc.status];
+			const decision = compactSummaryPrefix(tc.permissionDenyMessage);
+			return decision ? `${status} · ${decision}` : status;
+		}
+	}
 	const resolved = ctx?.resolveToolSummary?.(tc);
 	if (typeof resolved === "string") return resolved;
 	const input = (tc.inputJson ?? {}) as Record<string, unknown>;
@@ -555,6 +626,14 @@ export type AdapterSegment =
 	| { kind: "tool-run"; items: AdapterToolItem[]; sourceMessages: AdapterMessage[] };
 
 export type AdapterActivityInput =
+	| {
+			kind: "auxiliary";
+			msg: AdapterMessage;
+			blockIndex: number;
+			sourceIndices: number[];
+			block: AdapterContentBlock;
+			source: string;
+	  }
 	| {
 			kind: "reasoning";
 			msg?: AdapterMessage;
@@ -605,6 +684,12 @@ export type AdapterActivityInput =
  * passes it through and never reads it for layout.
  */
 export interface AdapterTraceRowIdentity {
+	/** Real source content, not a fabricated tool identity. */
+	auxiliary?: true;
+	source?: string;
+	modelFacing?: string;
+	inspectContent?: string;
+	target?: InjectionTarget | null;
 	/** Owning message id. */
 	messageId: string;
 	/**
@@ -630,6 +715,8 @@ export interface AdapterTraceRowIdentity {
 }
 
 interface AdapterTraceItem {
+	contentRole?: "auxiliary";
+	sourceStatus?: string | null;
 	title: string;
 	hasIcon?: boolean;
 	iconColor?: string;
@@ -747,7 +834,7 @@ interface AdapterTraceItem {
 	 * to pick `measureSubagentCard` vs `measureToolCall`, and by the render shell to
 	 * dispatch `renderElement` the same way.
 	 */
-	cardKind?: "tool-call" | "subagent-card";
+	cardKind?: "tool-call" | "subagent-card" | "auxiliary-content";
 	/**
 	 * The row is drilled open by the SYSTEM, not the reader: its call is blocked on a
 	 * live permission request, and the card it opens onto is the only place the
@@ -888,6 +975,10 @@ function adapterTextExpanded(
 
 export interface AdapterContext {
 	lod: RenderLod;
+	/** Explicit opt-in; absent/false preserves the historical projection. */
+	compactAuxiliaryContent?: boolean;
+	/** Actual question lifecycle from the existing async-question slot, never tool success alone. */
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
 	/** Explicit interaction override; undefined preserves the measure's default. */
 	isExpanded?: (key: string) => boolean | undefined;
 	/** Full body expansion; separate from the surrounding card's fold. */
@@ -1528,6 +1619,96 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 // Public: segment → ElementSpec[]
 // ─────────────────────────────────────────────────────────────────────────────
 
+function adaptAuxiliaryContent(
+	msg: AdapterMessage,
+	projection: AuxiliaryContentProjection,
+	ctx: AdapterContext,
+): ElementSpec {
+	const key = auxiliaryContentKey(msg, projection.blockIndex);
+	const opened = ctx.isExpanded?.(key);
+	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
+	const recent = !ctx.recentMessageIds || (!!msg.id && ctx.recentMessageIds.has(msg.id));
+	const defaultOpened = ctx.lod === 5 || (ctx.lod === 4 && recent);
+	const includeDetail =
+		opened === true || lodUserOverride || (ctx.lod >= 4 && defaultOpened && opened !== false);
+	return {
+		kind: "auxiliary-content",
+		key,
+		unitId: key,
+		lifecycleId: contentBlockLifecycleId(projection.block as AdapterContentBlock),
+		data: buildAuxiliaryContentData(projection, {
+			labels: ctx.labels,
+			includeDetail,
+			preview: ctx.lod === 4 && opened !== true && !lodUserOverride,
+			id: key,
+		}),
+		opts: {
+			isRecent: recent,
+			defaultOpened,
+			lodUserOverride,
+			...(opened === undefined ? {} : { opened }),
+			preferOpen: false,
+			viewportHeight: ctx.viewportHeight,
+			collapsesByLod: ctx.lod <= 3 || (ctx.lod === 4 && !recent),
+		},
+	};
+}
+
+/** New-mode path: visible physical order is authoritative, including mixed messages. */
+function adaptOrderedContextBlocks(
+	msg: AdapterMessage,
+	visibleBlockIndices: number[] | undefined,
+	ctx: AdapterContext,
+): ElementSpec[] | null {
+	if (msg.origin === "user") return null;
+	const blocks = messageBody(msg);
+	const auxiliary = auxiliaryContentViews(msg, visibleBlockIndices);
+	const allViews = [...contextBlockViews(blocks), ...injectionBlockViews(blocks)];
+	// Whole messages without auxiliary content keep their specialized receipt/control path.
+	// Only a filtered remainder needs the ordered dispatcher after grouping split a message.
+	if (auxiliary.length === 0 && (!visibleBlockIndices || allViews.length === 0)) return null;
+	const visible = visibleBlockIndices ? new Set(visibleBlockIndices) : undefined;
+	const visibleViews = allViews.filter((view) => !visible || visible.has(view.blockIndex));
+	const views = new Map(visibleViews.map((view) => [view.blockIndex, view]));
+	const auxiliaryByIndex = new Map(auxiliary.map((view) => [view.blockIndex, view]));
+	const owned = new Set(visibleViews.flatMap((view) => view.sourceIndices));
+	const auxiliaryOwned = new Set(auxiliary.flatMap((view) => view.sourceIndices));
+	const indices = [...(visibleBlockIndices ?? blocks.map((_, index) => index))].sort(
+		(a, b) => a - b,
+	);
+	const specs: ElementSpec[] = [];
+	const idBase = msg.id ?? "msg";
+	for (const index of indices) {
+		const projection = auxiliaryByIndex.get(index);
+		if (projection) {
+			specs.push(adaptAuxiliaryContent(msg, projection, ctx));
+			continue;
+		}
+		const view = views.get(index);
+		if (view) {
+			const block = { ...blocks[index], ...view.block } as AdapterContentBlock;
+			const spoken = adaptSpokenInjection(block, idBase, index, block.modelText ?? "", msg, ctx);
+			const framed =
+				!spoken && adaptFramedSystemCard(block, idBase, index, msg, block.modelText ?? "", ctx);
+			if (spoken) specs.push(...spoken);
+			else if (framed) specs.push(framed);
+			else specs.push(adaptSystemBlock(block.type, block, idBase, msg, ctx, index));
+			continue;
+		}
+		if (owned.has(index) || auxiliaryOwned.has(index)) continue;
+		const block = blocks[index];
+		if (!block) continue;
+		if (msg.role === "assistant") {
+			specs.push(...adaptMessage(msg, [index], { ...ctx, compactAuxiliaryContent: false }));
+		} else if (block.type === "text" && block.text?.trim()) {
+			specs.push({ kind: "markdown", key: elementKey(idBase, msg, index), data: block.text });
+		} else if (isRecognizedSystemBlockType(block.type)) {
+			specs.push(adaptSystemBlock(block.type, block, idBase, msg, ctx, index));
+		}
+	}
+	return specs;
+}
+
 /** Render native/legacy context blocks independently while preserving physical order. */
 function adaptContextBlocks(
 	blocks: readonly AdapterContentBlock[],
@@ -1724,6 +1905,10 @@ function adaptMessage(
 	const blocks = messageBody(msg);
 	const indices = visibleBlockIndices ?? blocks.map((_, i) => i);
 	const idBase = msg.id ?? "msg";
+	if (ctx.compactAuxiliaryContent) {
+		const ordered = adaptOrderedContextBlocks(msg, visibleBlockIndices, ctx);
+		if (ordered) return ordered;
+	}
 
 	// user messages: a single bubble with plain pre-wrap text (not markdown) plus
 	// its attachments (images / text files), which live INSIDE the same bubble —
@@ -2264,6 +2449,7 @@ function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
  * testable. Keys mirror MessageBubble's i18n keys (narrator namespace).
  */
 const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
+	status_fail: "Failed",
 	// Body of a background-task bubble whose task produced no output. Needs a fallback
 	// like every other composed string: without one, `sysLabel` returns the raw key and
 	// the reader would see the literal "empty" in the bubble.
@@ -3816,6 +4002,10 @@ function isLatestSpecTasksToolItem(
 export function groupToolItemsForLod(
 	items: AdapterToolItem[],
 	latestSpecTasksToolUseId?: string | null,
+	policy?: {
+		compactAuxiliaryContent?: boolean;
+		resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
+	},
 ): ToolLodGroup[] {
 	const groups: ToolLodGroup[] = [];
 	let pending: AdapterToolItem[] = [];
@@ -3829,10 +4019,13 @@ export function groupToolItemsForLod(
 		const item = items[i];
 		if (!item) continue;
 		if (
-			isCommunicationTool(item.tc) ||
-			item.isSubagent ||
+			shouldShowCommunicationBubble(item.tc, policy?.compactAuxiliaryContent === true) ||
+			(item.isSubagent && !policy?.compactAuxiliaryContent) ||
 			isActiveToolItem(item) ||
-			isPreferOpenTool(item.tc) ||
+			isPreferOpenTool(item.tc, {
+				...policy,
+				questionStatus: policy?.resolveQuestionStatus?.(item.tc.toolUseId),
+			}) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
 			flush();
@@ -4077,7 +4270,10 @@ function adaptToolItemFull(
 ): ElementSpec {
 	item = visibleToolItem(item, ctx);
 	const cleared = item.tc.payloadCleared === true;
-	const isCommunication = !cleared && isCommunicationTool(item.tc);
+	if (ctx.compactAuxiliaryContent && isCommunicationTool(item.tc))
+		item = { ...item, isSubagent: false };
+	const isCommunication =
+		!cleared && shouldShowCommunicationBubble(item.tc, ctx.compactAuxiliaryContent === true);
 	const hasPendingPermission =
 		!cleared && (ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false);
 	// Approval controls only mount on a generic tool card. Once the decision lands,
@@ -4086,7 +4282,12 @@ function adaptToolItemFull(
 	const key = toolItemKey(item);
 	const opened = ctx.isExpanded?.(key);
 	const defaultOpened =
-		opened === undefined && item.isSubagent && runContext.isSoleSubagent ? true : opened;
+		opened === undefined &&
+		item.isSubagent &&
+		runContext.isSoleSubagent &&
+		!ctx.compactAuxiliaryContent
+			? true
+			: opened;
 	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
 	// The latest tasks.json call stays expanded at every LOD (the task board is the
 	// narrator's live working state). Like the permission flag it folds into the
@@ -4100,7 +4301,12 @@ function adaptToolItemFull(
 	// exactly the L5 bug `userCollapsed` was introduced to fix. `collapsesByLod`
 	// must stay false so the header toggle writes `expanded` rather than
 	// `lodUserOverride` (the override channel FORCE-expands and cannot fold).
-	const preferOpen = !cleared && isPreferOpenTool(item.tc);
+	const preferOpen =
+		!cleared &&
+		isPreferOpenTool(item.tc, {
+			compactAuxiliaryContent: ctx.compactAuxiliaryContent,
+			questionStatus: ctx.resolveQuestionStatus?.(item.tc.toolUseId),
+		});
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -4114,7 +4320,11 @@ function adaptToolItemFull(
 		// Same contract for the pinned tasks card: it never collapses to a header,
 		// even at L3 or as an older card at L4.
 		...(isPinnedSpecTasks ? { forceExpanded: true } : {}),
-		...(preferOpen ? { preferOpen: true } : {}),
+		...(ctx.compactAuxiliaryContent
+			? { preferOpen, compactAuxiliaryContent: true }
+			: preferOpen
+				? { preferOpen: true }
+				: {}),
 		collapsesByLod:
 			!hasPendingPermission &&
 			!preferOpen &&
@@ -5179,8 +5389,13 @@ function toolTraceItem(
 	const cleared = item.tc.payloadCleared === true;
 	const summary = toolSummary(item.tc, ctx);
 	const name = item.tc.toolName === "Task" ? "Agent" : item.tc.toolName;
+	const compactTitle =
+		ctx.compactAuxiliaryContent &&
+		(isCommunicationTool(item.tc) || name === "AskUserQuestion" || name === "ExitPlanMode");
 	const fallbackTitle = summary ? `${name} · ${summary}` : name;
-	const rawTitle = cleared ? fallbackTitle : (ctx.resolveToolTitle?.(item.tc) ?? fallbackTitle);
+	const rawTitle = cleared
+		? fallbackTitle
+		: ((!compactTitle ? ctx.resolveToolTitle?.(item.tc) : undefined) ?? fallbackTitle);
 	// Only a real, identifiable tool call can be drilled into: the card's detail
 	// classification and its on-demand payload fetch are both keyed by tool use id.
 	const canDrillDown = !!item.tc.toolUseId;
@@ -5281,8 +5496,11 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			// A bubble breaks the surrounding tool frame as well as the low-LOD fold.
 			const previous = items[index - 1];
 			const next = items[index + 1];
-			const previousIsTool = !!previous && !isCommunicationTool(previous.tc);
-			const nextIsTool = !!next && !isCommunicationTool(next.tc);
+			const previousIsTool =
+				!!previous &&
+				!shouldShowCommunicationBubble(previous.tc, ctx.compactAuxiliaryContent === true);
+			const nextIsTool =
+				!!next && !shouldShowCommunicationBubble(next.tc, ctx.compactAuxiliaryContent === true);
 			return adaptToolItemFull(item, ctx, {
 				inRun: previousIsTool || nextIsTool,
 				isLast: !nextIsTool,
@@ -5293,7 +5511,7 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 	}
 	// Resolved once per run: the resolver is a shell closure over the latest id,
 	// and the grouping below only ever compares against it.
-	const groups = groupToolItemsForLod(items, ctx.resolveLatestSpecTasksToolUseId?.());
+	const groups = groupToolItemsForLod(items, ctx.resolveLatestSpecTasksToolUseId?.(), ctx);
 	const specs: ElementSpec[] = [];
 	for (const group of groups) {
 		if (group.kind === "active") {
@@ -5487,6 +5705,52 @@ function adaptActivityItems(
 	const consumedReasoningBlocks = new Set<number>();
 	const pinnedRowIndices: number[] = [];
 	for (const [itemIndex, item] of items.entries()) {
+		if (item.kind === "auxiliary") {
+			const rowKey = auxiliaryContentKey(item.msg, item.blockIndex);
+			const data = buildAuxiliaryContentData(item, { labels: ctx.labels });
+			const expanded =
+				(ctx.isRowExpanded?.(traceKey, rowKey) ?? false) ||
+				ctx.isExpanded?.(rowKey) === true ||
+				(ctx.isLodUserOverride?.(rowKey) ?? false);
+			if (expanded) expandedIndices.push(traceItems.length);
+			traceItems.push({
+				title: truncateTitle(data.summary ? `${data.toolName} · ${data.summary}` : data.toolName),
+				contentRole: "auxiliary",
+				sourceStatus: data.sourceStatus,
+				hasIcon: true,
+				iconColor: data.category === "bash" ? "teal" : "gray",
+				toolName: data.toolName,
+				category: data.category,
+				summary: data.summary,
+				key: rowKey,
+				unitId: rowKey,
+				status: data.sourceStatus ? data.status : null,
+				canDrillDown: true,
+				cardKind: "auxiliary-content",
+				identity: item.msg.id
+					? {
+							messageId: item.msg.id,
+							blockIndex: item.blockIndex,
+							blockIndices: item.sourceIndices,
+							auxiliary: true,
+							source: data.source,
+							modelFacing: data.modelFacing,
+							inspectContent: data.inspectContent,
+							target: data.target,
+						}
+					: undefined,
+				...(expanded
+					? {
+							card: buildAuxiliaryContentData(item, {
+								labels: ctx.labels,
+								includeDetail: true,
+								id: rowKey,
+							}),
+						}
+					: {}),
+			});
+			continue;
+		}
 		if (item.kind === "reasoning") {
 			if (consumedReasoningBlocks.has(itemIndex)) continue;
 			// Collect this run's remaining blocks: the grouper gives every block of one
@@ -5629,7 +5893,8 @@ function adaptActivityItems(
 			// Carried in from the render-unit fold: a subagent row must drill into a
 			// subagent CARD, and hard-coding `false` here is what made every folded
 			// Agent call expand into the generic tool card at L1/L2.
-			isSubagent: item.isSubagent === true,
+			isSubagent:
+				item.isSubagent === true && (!ctx.compactAuxiliaryContent || !isCommunicationTool(item.tc)),
 			tc: item.tc,
 		};
 		// The row's FINAL key, resolved BEFORE the expansion lookup.
@@ -5724,6 +5989,20 @@ export function adaptActivityUnit(
 	const hasPinnedRow = activity.pinnedRowIndices.length > 0;
 	const firstVisibleIndex = Math.max(0, activity.traceItems.length - ADAPTER_ACTIVITY_MAX_VISIBLE);
 	const pinnedRowHidden = activity.pinnedRowIndices.some((index) => index < firstVisibleIndex);
+	const hasOpenedRow = ctx.compactAuxiliaryContent === true && activity.expandedIndices.length > 0;
+	const openedRowHidden =
+		ctx.compactAuxiliaryContent === true &&
+		activity.expandedIndices.some((index) => index < firstVisibleIndex);
+	const auxiliaryCount = items.filter((item) => item.kind === "auxiliary").length;
+	const failureCount = activity.traceItems.filter(
+		(row) => row.status != null && ["fail", "error", "failed"].includes(row.status),
+	).length;
+	const countLabel =
+		auxiliaryCount > 0
+			? String(activity.traceItems.length)
+			: sysLabel(ctx, "activityTraceCount")
+					.replace(/\{reasoning\}/g, String(activity.reasoningCount))
+					.replace(/\{tools\}/g, String(activity.toolCount));
 	return {
 		kind: "activity-trace",
 		key,
@@ -5733,16 +6012,19 @@ export function adaptActivityUnit(
 		data: {
 			items: activity.traceItems,
 			headerLabel: sysLabel(ctx, "activityTraceLabel"),
-			headerCount: sysLabel(ctx, "activityTraceCount")
-				.replace(/\{reasoning\}/g, String(activity.reasoningCount))
-				.replace(/\{tools\}/g, String(activity.toolCount)),
+			headerCount:
+				ctx.compactAuxiliaryContent && failureCount > 0
+					? `${countLabel} · ${failureCount} ${sysLabel(ctx, "status_fail")}`
+					: countLabel,
+			...(ctx.compactAuxiliaryContent ? { auxiliaryCount, failureCount } : {}),
 		},
 		opts: {
 			// L1 folds history behind the header but keeps the current run's rows on
 			// screen, so live activity stays readable at the simplest level.
-			collapsed: ctx.lod === 1 && !hasPinnedRow && !isRecentActivityUnit(items, ctx),
+			collapsed:
+				ctx.lod === 1 && !hasPinnedRow && !hasOpenedRow && !isRecentActivityUnit(items, ctx),
 			itemsOpened: ctx.isExpanded?.(key) ?? false,
-			showEarlier: pinnedRowHidden || (ctx.showEarlier?.(key) ?? false),
+			showEarlier: pinnedRowHidden || openedRowHidden || (ctx.showEarlier?.(key) ?? false),
 			// Derived while the rows were emitted, never resolved a second time — see
 			// adaptActivityItems on why a stored index cannot survive a live run.
 			expandedIndices: activity.expandedIndices,
