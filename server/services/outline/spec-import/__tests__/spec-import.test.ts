@@ -219,6 +219,42 @@ describe("which sessions", () => {
 		expect(await backendOf(sub.id)).toBe("spec");
 	});
 
+	test("a session provisioned through the external API keeps Dynamic Spec", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "driven by its client" }]);
+		const { db } = await import("../../../../db");
+		const { integrationResourceBindings } = await import("../../../../db/schema");
+		await db.insert(integrationResourceBindings).values({
+			id: `bind-${id}`,
+			resourceType: "narrator",
+			resourceId: id,
+			sourceType: "oauth_client",
+			sourceId: "client-1",
+			authorityType: "oauth_grant",
+			authorityId: "grant-1",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+		});
+		expect(await run(id)).toEqual({ status: "skipped", reason: "external" });
+		expect(await backendOf(id)).toBe("spec");
+		// A plugin's recruit (bound to the plugin) is imported like any session.
+		const recruit = await makeSession();
+		await writeTasks(recruit.id, [{ text: "dispatched" }]);
+		await db.insert(integrationResourceBindings).values({
+			id: `bind-${recruit.id}`,
+			resourceType: "narrator",
+			resourceId: recruit.id,
+			sourceType: "plugin",
+			sourceId: "com.example.team",
+			authorityType: "plugin_installation",
+			authorityId: "install-1",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+		});
+		expect((await run(recruit.id)).status).toBe("imported");
+		expect(await backendOf(recruit.id)).toBe("outline");
+	});
+
 	test("nothing is imported while the setting is off or the outline is", async () => {
 		const { id } = await makeSession();
 		await writeTasks(id, [{ text: "a" }]);
@@ -312,6 +348,35 @@ describe("an attempt met again", () => {
 		]);
 		expect(after[0]?.holder).toBe(id);
 		expect(after.map((t) => t.id)).toEqual(before.map((t) => t.id));
+	});
+
+	test("an imported task that no longer matches its source moves nothing (needs attention)", async () => {
+		const { id, owner } = await makeSession();
+		await writeTasks(id, [{ text: "the goal", protected: true }], "user");
+		const cut = new AbortController();
+		let commits = 0;
+		const off = onCommit(() => {
+			if (++commits === 2) cut.abort(new Error("cut"));
+		});
+		expect((await importSpecSession(id, { trigger: "sweep", signal: cut.signal })).status).toBe(
+			"failed",
+		);
+		off();
+		const [task] = await taskPage(id);
+		expect(task?.lockedBy).toBe(`human:${owner}`);
+		// Its person unlocks it before the session is moved: no longer what the source says.
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		await writeOutline({
+			spaceId: space?.id as string,
+			ops: [{ op: "setTask", block: { id: task?.id as string }, task: { lock: null } }],
+			actor: { kind: "human", id: owner as string },
+			responsibleUserId: owner,
+		});
+		const outcome = await run(id);
+		expect(outcome).toMatchObject({ status: "failed", attention: true });
+		expect((outcome as { error: string }).error).toContain("its lock");
+		expect(await backendOf(id)).toBe("spec");
+		expect(specImportRecord(id)?.status).toBe("attention");
 	});
 
 	test("two imports of one session at once are one import", async () => {
