@@ -54,9 +54,8 @@ mock.module("../../../../server/lib/agent/provider", () => ({
 }));
 
 const { db, sqlite } = await import("../../../../server/db");
-const { narratorMessageRefs, narratorMessages, narrators, projects, users } = await import(
-	"../../../../server/db/schema"
-);
+const { aclGrants, narratorMessageRefs, narratorMessages, narrators, projects, users } =
+	await import("../../../../server/db/schema");
 const { AppError } = await import("../../../../server/lib/errors");
 const { generateId } = await import("../../../../server/lib/id");
 const { settings } = await import("../../../../server/lib/settings");
@@ -500,8 +499,32 @@ test("a task in progress handed to a running session: back to to do, said why it
 	}
 }, 60_000);
 
-test("the picker in Chinese light at 360 px and English dark: the same sessions and actions", async () => {
+test("the picker in Chinese light at 360 px and English dark: the same sessions and actions; no 「转交并开始」 for a session the person may not write", async () => {
 	const w = await world();
+	// A teammate's session of the project that alice may read, not write: it can be handed the
+	// task, but starting it is not hers to ask.
+	const bob = generateId();
+	await db.insert(users).values({
+		id: bob,
+		username: `bob${Date.now()}`,
+		passwordHash: "x",
+		role: "user",
+		createdAt: NOW,
+	});
+	const theirs = await session(w.projectId, "A teammate's session", { ownerUserId: bob });
+	for (const [scopeType, scopeId, principalId, capability] of [
+		["project", w.projectId, bob, "write"],
+		["narrator", theirs, alice, "read"],
+	] as const)
+		await db.insert(aclGrants).values({
+			id: generateId(),
+			scopeType,
+			scopeId,
+			principalType: "user",
+			principalId,
+			capability,
+			createdAt: NOW,
+		});
 	for (const [scheme, language, width, words] of [
 		["light", "zh-CN", 360, { only: "转交", start: "转交并开始" }],
 		["dark", "en", 900, { only: "Hand over", start: "Hand over and start" }],
@@ -518,8 +541,9 @@ test("the picker in Chinese light at 360 px and English dark: the same sessions 
 			await until(page, "the board", (f) => f.count("[data-testid=task-row]") === 3);
 			await openPicker(page, "Fix the login bug");
 			const picker = await call(page, (f) => f.picker());
-			expect(picker?.sessions).toHaveLength(3);
-			for (const s of picker?.sessions ?? []) expect(s).toMatchObject(words);
+			expect(picker?.sessions).toHaveLength(4);
+			for (const s of picker?.sessions ?? [])
+				expect(s).toMatchObject(s.id === theirs ? { only: words.only, start: "" } : words);
 			expect(picker?.left).toBeGreaterThanOrEqual(0);
 			expect(picker?.right).toBeLessThanOrEqual(width);
 			expect(picker?.pageScrollWidth).toBeLessThanOrEqual(width);

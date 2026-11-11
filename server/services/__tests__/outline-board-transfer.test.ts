@@ -309,6 +309,53 @@ describe("转交并开始", () => {
 		closeNarrator(target);
 	});
 
+	test("a task with steps under it: the task is claimed for the session, and its first step is started for it too", async () => {
+		const { owner, projectId, space } = await world();
+		const target = await session(owner, projectId);
+		const written = await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{
+					op: "insert",
+					tempId: "goal",
+					parent: null,
+					content: "Ship the importer",
+					task: { status: "todo" },
+				},
+				{
+					op: "insert",
+					parent: { tempId: "goal" },
+					content: "Parse the file",
+					task: { status: "todo" },
+				},
+				{
+					op: "insert",
+					parent: { tempId: "goal" },
+					content: "Write the rows",
+					task: { status: "todo" },
+				},
+			],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const [goal, first, second] = written.results as Array<{ blockId: string; address: string }>;
+		if (!goal || !first || !second) throw new Error("seed");
+		const block = await outlineStore.getBlock(goal.blockId);
+		const response = await transfer(
+			owner,
+			{ blockId: goal.blockId, versionSeq: block?.versionSeq as number },
+			{ assign: { kind: "narrator", narratorId: target }, start: true },
+		);
+		expect(await response.json()).toMatchObject({ started: true });
+		await waitIdleAfterTurns(target, 1);
+		expect(await state(goal.blockId)).toMatchObject({ status: "doing", holder: target });
+		// The continuation names the first step that can start, started for the session as well.
+		expect(await state(first.blockId)).toMatchObject({ status: "doing", holder: target });
+		expect((await state(second.blockId)).status).toBe("todo");
+		expect(providerInputs[0]).toContain(first.address);
+		closeNarrator(target);
+	});
+
 	test("a task another session was doing: its work ends in the person's commit, and the session started claims the next generation", async () => {
 		const { owner, projectId, space } = await world();
 		const previous = await session(owner, projectId, { title: "Previous" });
