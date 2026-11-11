@@ -661,7 +661,13 @@ export async function deliverOutlineTeamMessage(
 		import("../narrator-injection"),
 	]);
 	const postgres = !!getNarratorMessageRefsPort();
-	if (message.assigned?.length) noteOutlineAssignedTasks(message.narratorId, message.assigned);
+	if (message.assigned?.length) {
+		noteOutlineAssignedTasks(message.narratorId, message.assigned);
+		// Its current-tasks view lists them: read again.
+		void import("../task-source/outline-views")
+			.then(({ invalidateOutlineTasksView }) => invalidateOutlineTasksView(message.narratorId))
+			.catch(() => {});
+	}
 	if (postgres) {
 		const result = await deliverInjection(
 			message.narratorId,

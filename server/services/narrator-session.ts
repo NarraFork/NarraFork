@@ -4907,6 +4907,24 @@ async function pluginStartBlocker(
 	narratorId: string,
 	task: { blockId: string; status: string },
 ): Promise<PluginTaskNotStarted | undefined> {
+	return await outlineTaskStartBlocker(narratorId, task);
+}
+
+/**
+ * Why starting session `narratorId` on an outline task would not continue on it, decided BEFORE
+ * anything is claimed (the decision a plugin's start makes, above; and the board's 「转交并开始」,
+ * outline P2 PR 10a, which claims the task for the session first and must not leave a claim on a
+ * session that then does not run).
+ *   - `explicit`: a person asked for this start (the board): it starts once even when
+ *     continuation is `off`, as `/goal` and "Add and start" do. The other modes still decide.
+ *   - `personWork`: the task will count as work a person wants of the session once it holds it
+ *     (`isPersonWork`), though the session's tasks as read now do not include it yet.
+ */
+export async function outlineTaskStartBlocker(
+	narratorId: string,
+	task: { blockId: string; status: string },
+	options: { explicit?: boolean; personWork?: boolean } = {},
+): Promise<PluginTaskNotStarted | undefined> {
 	const status = task.status;
 	if (status !== "todo" && status !== "doing") return "finished";
 	if (isLoopRunning(narratorId)) return "busy";
@@ -4917,8 +4935,8 @@ async function pluginStartBlocker(
 		narrator.autoContinuationOverride,
 		normalizeAutoContinuationMode(settings.agent.autoContinuationMode),
 	);
-	if (mode === "off") return "continuation_off";
-	if (mode === "protectedOnly") {
+	if (mode === "off" && !options.explicit) return "continuation_off";
+	if (mode === "protectedOnly" && !options.personWork) {
 		// Read only (no promotion, no preferred task): nothing is claimed by asking.
 		const source = await taskSourceForNarrator(narratorId);
 		const target = await source.prepareContinuation({ promoteTodo: false });

@@ -298,6 +298,15 @@ export const OUTLINE_TOOL_TEXT = {
 			`${n} more link targets were kept as written without resolving them`,
 		tooManyAliases: (prefix: string) =>
 			`the space has too many aliases starting with ${prefix} to number the next one; give the alias explicitly`,
+		/** An agent's hand-over ended the work on a task in progress (`write.ts`, `handed-over`). */
+		handedOver: (address: string) =>
+			`${address} was in progress and got a new assignee: it is back to to-do, so whoever takes it up claims it afresh`,
+		/** `@agent:name` names no session: written as a name, nobody is told. */
+		assigneeUnknown: (name: string) =>
+			`no session has the id or handle ${quoted(name)}: @agent:${name} was written as a name, and nobody is told`,
+		/** `@agent:name` names a session that could not do the task. */
+		assigneeCannotWork: (name: string) =>
+			`the session @agent:${name} names cannot work in this space (it is archived, or the person it works for may not write here); nothing was written`,
 		taskPropsIgnored: (n: number) =>
 			`edit ${n}: depends:: and due:: belong to tasks and were left out on a block without a checkbox`,
 		samePageTitle: (title: string, addresses: readonly string[]) =>

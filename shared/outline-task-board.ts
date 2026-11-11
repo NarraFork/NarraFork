@@ -170,7 +170,39 @@ export type OutlineBoardAssignTarget =
 	| { kind: "me" }
 	| { kind: "user"; username: string }
 	/** Back to the session: no assignee. */
-	| { kind: "session" };
+	| { kind: "session" }
+	/**
+	 * To a session by name (「转交给会话」, outline P2 PR 10a): `@agent:<its id>`. A root session of
+	 * the task's project the caller may read, that could do the task.
+	 */
+	| { kind: "narrator"; narratorId: string };
+
+/** A session a task may be handed to (`GET /outline/tasks/:blockId/transfer-sessions`). */
+export interface OutlineBoardTransferSession {
+	narratorId: string;
+	title: string | null;
+	/** A named session's handle: named sessions come first. */
+	handle?: string;
+}
+
+export interface OutlineBoardTransferSessionsResponse {
+	sessions: OutlineBoardTransferSession[];
+	/** The project has more sessions than the board offers. */
+	truncated: boolean;
+}
+
+/**
+ * Why 「转交并开始」 handed the task over but did not start the session: it is running; it is in
+ * plan mode; its continuation mode would not continue on this task; the task is finished; or the
+ * start declined all the same.
+ */
+export type OutlineBoardNotStarted =
+	| "finished"
+	| "busy"
+	| "plan_mode"
+	| "continuation_off"
+	| "continuation_mode"
+	| "not_started";
 
 /** A person's change to one task on the board. */
 export interface OutlineBoardTaskUpdateRequest {
@@ -180,8 +212,9 @@ export interface OutlineBoardTaskUpdateRequest {
 	status?: "todo" | "done" | "cancelled";
 	assign?: OutlineBoardAssignTarget;
 	/**
-	 * Start the session whose space holds the task right away when it is idle ("Reopen and
-	 * start", Q5). Only for a task of a session space.
+	 * Start a session on the task right away when it is idle. With `assign` to a session
+	 * (`narrator`): that session (「转交并开始」). Otherwise the session whose space holds the task
+	 * ("Reopen and start", Q5), only for a task of a session space.
 	 */
 	start?: boolean;
 }
@@ -190,6 +223,8 @@ export interface OutlineBoardTaskUpdateResponse {
 	/** The task's new `version_seq`, or null when nothing changed. */
 	versionSeq: number | null;
 	started: boolean;
+	/** 「转交并开始」: why the session was not started (the hand-over was written all the same). */
+	notStarted?: OutlineBoardNotStarted;
 }
 
 /**

@@ -208,9 +208,13 @@ const tasksViewText = {
 	},
 	waiting: { en: "Waiting:", "zh-CN": "等待中：" },
 	next: { en: "Next:", "zh-CN": "下一个：" },
+	assigned: {
+		en: "Assigned to you, not started (set one in progress when you take it up):",
+		"zh-CN": "指派给你、还没开始（要做时把它设成进行中）：",
+	},
 } satisfies Record<string, LocalizedValue<string>>;
 
-export type OutlineTasksViewSection = "doing" | "delegated" | "waiting" | "next";
+export type OutlineTasksViewSection = "doing" | "delegated" | "waiting" | "next" | "assigned";
 
 /** The first line of the current-tasks view. */
 export function getOutlineTasksViewHeading(locale: Locale): string {

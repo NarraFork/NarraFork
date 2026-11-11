@@ -69,6 +69,7 @@ import type {
 	OutlineBoardFinishedResponse,
 	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateResponse,
+	OutlineBoardTransferSessionsResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { type Context, Hono } from "hono";
@@ -160,6 +161,7 @@ import {
 	readProjectTaskBoard,
 	readSessionTaskBoard,
 } from "../services/outline/task-board";
+import { listTransferSessions, startSessionOnTransferredTask } from "../services/outline/transfer";
 import { readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeLocks,
@@ -1089,11 +1091,22 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 	if (!block || !space || !(await canReadSpace(principal, space)))
 		throw new NotFoundError("Outline task", blockId);
 	const input = parse(outlineBoardTaskUpdateBodySchema, await c.req.json().catch(() => ({})));
-	// Starting a session runs a turn on the person's behalf: only someone who may write it.
-	const startable =
-		input.start && space.kind === "session" && space.narratorId
-			? await readNarrator(space.narratorId)
+	// Handed to a session by name (「转交给会话」): one the person may read (404 otherwise, as for
+	// any session they cannot see).
+	const handedTo =
+		input.assign?.kind === "narrator"
+			? await readableNarrator(principal, input.assign.narratorId)
 			: null;
+	// Starting a session runs a turn on the person's behalf: only someone who may write it. With
+	// a hand-over to a session that is the session started (「转交并开始」); otherwise the session
+	// whose space holds the task.
+	const startable = !input.start
+		? null
+		: handedTo
+			? handedTo
+			: space.kind === "session" && space.narratorId
+				? await readNarrator(space.narratorId)
+				: null;
 	if (input.start && !(startable && (await holds(principal, "write", { narrator: startable }))))
 		throw new ForbiddenError("You cannot start this session");
 	const { result } = await changePersonTask({
@@ -1103,14 +1116,43 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 		status: input.status,
 		assign: input.assign,
 	});
-	const started =
-		startable && (await resolveTaskBackend(startable.id)) === "outline"
-			? await startSessionOn(startable.id, principal.userId, blockId)
-			: false;
+	let started = false;
+	let notStarted: OutlineBoardTaskUpdateResponse["notStarted"];
+	if (startable && (await resolveTaskBackend(startable.id)) === "outline") {
+		if (handedTo) {
+			// Decided before anything is claimed; a start that declines gives the claim back.
+			const outcome = await startSessionOnTransferredTask({
+				narratorId: handedTo.id,
+				userId: principal.userId,
+				blockId,
+			});
+			started = outcome.started;
+			notStarted = outcome.notStarted;
+		} else started = await startSessionOn(startable.id, principal.userId, blockId);
+	}
 	const body: OutlineBoardTaskUpdateResponse = {
 		versionSeq: result?.commit?.seq ?? null,
 		started,
+		...(notStarted ? { notStarted } : {}),
 	};
+	return c.json(body);
+});
+
+/**
+ * The sessions a task may be handed to on the board (「转交给会话…」, outline P2 PR 10a): root
+ * sessions of the task's project the person may read that could do the task, named ones first,
+ * at most 50. Write access to the task's space (404 when it cannot be read).
+ */
+outlineRoutes.get("/tasks/:blockId/transfer-sessions", async (c) => {
+	const principal = principalOf(c);
+	const blockId = idParam(c, "blockId");
+	const block = await outlineStore.getBlock(blockId);
+	const space = block ? await outlineStore.getSpace(block.spaceId) : null;
+	if (!block || block.deleted || !block.taskJson || !space)
+		throw new NotFoundError("Outline task", blockId);
+	if (!(await canReadSpace(principal, space))) throw new NotFoundError("Outline task", blockId);
+	if (!(await canWriteSpace(principal, space))) throw new ForbiddenError();
+	const body: OutlineBoardTransferSessionsResponse = await listTransferSessions(principal, space);
 	return c.json(body);
 });
 

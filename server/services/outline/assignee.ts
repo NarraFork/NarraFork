@@ -19,7 +19,12 @@
  */
 import { foldHandle } from "@shared/narrator-handle";
 import { canAgentWriteSpace } from "./access";
-import { readNarrator, readNarratorByHandleFold, readNonAdminUserIds } from "./access-reads";
+import {
+	readDisplayNames,
+	readNarrator,
+	readNarratorByHandleFold,
+	readNonAdminUserIds,
+} from "./access-reads";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
 
@@ -70,6 +75,36 @@ export async function resolveAgentAssignee(
 	const session = (await store.getNarratorRoots([named.id])).get(named.id);
 	if (!session || session.root !== named.id) return null;
 	return { narratorId: named.id, archived: session.archived || session.sessionArchived };
+}
+
+/**
+ * Whether `assignee` names the session narrator `narratorId` belongs to: the id of the session or
+ * of any narrator of it (a subagent's id names its session here: the question is whose work it
+ * is), or the session's handle.
+ */
+export async function assigneeNamesSession(
+	assignee: string | null | undefined,
+	narratorId: string,
+	store: OutlineStore = outlineStore,
+): Promise<boolean> {
+	const name = agentAssigneeName(assignee);
+	if (name === null) return false;
+	const roots = await store.getNarratorRoots([...new Set([name, narratorId])]);
+	const session = roots.get(narratorId)?.root ?? narratorId;
+	const named = roots.get(name);
+	if (named) return named.root === session;
+	const byHandle = await readNarratorByHandleFold(foldHandle(name.trim()));
+	return byHandle !== null && byHandle.id === session;
+}
+
+/** Whether `assignee` names the person `userId` (`human:<their username>`). */
+export async function assigneeNamesUser(
+	assignee: string | null | undefined,
+	userId: string,
+): Promise<boolean> {
+	if (!assignee?.startsWith("human:")) return false;
+	const username = (await readDisplayNames({ userIds: [userId] })).users.get(userId);
+	return username !== undefined && assignee === `human:${username}`;
 }
 
 /**

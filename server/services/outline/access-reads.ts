@@ -682,6 +682,54 @@ export async function readProjectSessionSpacePage(
 	return rows.map(toSpace);
 }
 
+/** A session a task may be handed to on the board (outline P2 PR 10a). */
+export interface TransferSessionRow {
+	id: string;
+	title: string | null;
+	handle: string | null;
+	ownerUserId: string | null;
+}
+
+/**
+ * The root sessions of a project a task could be handed to, as the board's 「转交给会话」 lists
+ * them: sessions of the project (as {@link readProjectSessionSpacePage} counts them), not
+ * archived, not subagents, keeping their tasks in the outline, that the principal can read (the
+ * narrator list's predicate, in SQL before the LIMIT; admins read every one). Named sessions
+ * (with a handle) first, then the most recently active; at most `limit`. Whether each could work
+ * in the task's space is the caller's check (`canSessionWorkIn`).
+ */
+export async function readProjectTransferSessions(
+	principal: { userId: string; isAdmin: boolean },
+	projectId: string,
+	limit: number,
+): Promise<TransferSessionRow[]> {
+	const visible = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(narratorReadableText("n"), principal.userId)}`;
+	const rows = await all(sql`
+		select n.id, n.title, n.handle, n.owner_user_id
+		from narrators n
+		where n.id in (
+				select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId}
+				union
+				select n2.id from narrators n2 where n2.context_project_id = ${projectId}
+			)
+			and n.status <> 'archived'
+			and n.type <> 'subagent'
+			and n.task_backend = 'outline'
+			${visible}
+		order by (case when n.handle is null then 1 else 0 end),
+			coalesce(n.last_message_at, n.updated_at) desc, n.id
+		limit ${limit}
+	`);
+	return rows.map((row) => ({
+		id: text(row, "id"),
+		title: textOrNull(row, "title"),
+		handle: textOrNull(row, "handle"),
+		ownerUserId: textOrNull(row, "owner_user_id"),
+	}));
+}
+
 /** What a session's write rule is decided from, for many sessions at once (the task board). */
 export interface SessionWriteFacts {
 	id: string;

@@ -159,6 +159,7 @@ export const outlineBoardTaskUpdateBodySchema = z
 					username: z.string().trim().min(1).max(OUTLINE_TASK_BOARD_LIMITS.maxUsernameChars),
 				}),
 				z.object({ kind: z.literal("session") }),
+				z.object({ kind: z.literal("narrator"), narratorId: outlineIdSchema }),
 			])
 			.optional(),
 		start: z.boolean().optional(),

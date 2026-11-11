@@ -75,6 +75,7 @@ import {
 } from "@shared/prefix-context";
 import { registerContextDisplayRefiner } from "../context-display-refiners";
 import { readDisplayNames, readNarrator } from "../outline/access-reads";
+import { listOutlineAssignedTasks } from "../outline/assigned";
 import { loadBodies, readSubtree } from "../outline/read";
 import { renderOutline } from "../outline/render";
 import { outlineStore } from "../outline/store";
@@ -110,6 +111,8 @@ export const OUTLINE_VIEW_LIMITS = {
 	delegatedRead: 20,
 	/** Waiting tasks it lists. */
 	waiting: 5,
+	/** Tasks assigned to the session by name that it has not started (outline P2 PR 10a). */
+	assigned: 5,
 	/** Characters of the current-tasks view. */
 	tasksChars: 1500,
 	/** Characters of a task title in a view. */
@@ -490,6 +493,50 @@ export async function readDelegated(
 	return { entries, more: rows.length > limit };
 }
 
+/**
+ * The tasks assigned to the session by name that it has not started (`outline/assigned.ts`: what
+ * its team notices told it of, checked by primary key), at most
+ * {@link OUTLINE_VIEW_LIMITS.assigned}, those the session's own read lists already left out.
+ * Their spaces become dependencies of the view; a new assignment makes the view read again
+ * ({@link invalidateOutlineTasksView}).
+ */
+async function readAssigned(
+	session: OutlineSession,
+	deps: ViewDeps,
+): Promise<Array<OutlineTaskPromptTask & { address: string }>> {
+	const root = session.sessionNarratorId;
+	if (session.subagent || root === null) return [];
+	const metas = (await listOutlineAssignedTasks(root)).slice(0, OUTLINE_VIEW_LIMITS.assigned);
+	if (metas.length === 0) return [];
+	const heads = new Map(
+		(await outlineStore.getBlockHeads(metas.map((m) => m.id))).map((h) => [h.id, h.contentHead]),
+	);
+	const keys = new Map<string, string>();
+	const out: Array<OutlineTaskPromptTask & { address: string }> = [];
+	for (const meta of metas) {
+		// A task of its own space is among its own tasks already.
+		if (meta.spaceId === session.spaceId) continue;
+		deps.spaces.add(meta.spaceId);
+		if (!keys.has(meta.spaceId)) {
+			const space = await outlineStore.getSpace(meta.spaceId);
+			if (space) keys.set(meta.spaceId, space.key);
+		}
+		const key = keys.get(meta.spaceId);
+		if (!key) continue;
+		out.push({
+			text: clip(blockTitle(heads.get(meta.id) ?? "") || meta.sid, OUTLINE_VIEW_LIMITS.titleChars),
+			address: `${key}/${meta.sid}`,
+			humanCreated: meta.taskJson?.humanCreated === true,
+		});
+	}
+	return out;
+}
+
+/** A task was assigned to session `narratorId` (a root): its current-tasks view is read again. */
+export function invalidateOutlineTasksView(narratorId: string): void {
+	dropWhere(null, narratorId, "tasks:");
+}
+
 async function readTasksView(
 	narratorId: string,
 	locale: Locale,
@@ -500,9 +547,14 @@ async function readTasksView(
 	if (session.spaceId) deps.spaces.add(session.spaceId);
 	else deps.anySpace = true;
 	if (session.subagent) return { text: null };
-	const [read, delegated] = await Promise.all([readOpen(session), readDelegated(session, deps)]);
+	const [read, delegated, assigned] = await Promise.all([
+		readOpen(session),
+		readDelegated(session, deps),
+		readAssigned(session, deps),
+	]);
 	for (const entry of read.entries) deps.spaces.add(entry.ref.spaceId);
-	if (read.entries.length === 0 && delegated.entries.length === 0) return { text: null };
+	if (read.entries.length === 0 && delegated.entries.length === 0 && assigned.length === 0)
+		return { text: null };
 
 	const doing = read.entries
 		.filter((entry) => entry.status === "doing")
@@ -562,6 +614,23 @@ async function readTasksView(
 			used += line.length + 1;
 			shown++;
 			printed.add(entries[index] as OpenEntry);
+		}
+	}
+	// Last: what was assigned to the session by name and it has not started (outline P2 PR 10a).
+	// Only in the model's text: the reader's summary below lists the session's own tasks.
+	if (assigned.length > 0) {
+		const sectionLine = getOutlineTasksViewSection("assigned", locale);
+		const assignedLines = assigned.map((task) =>
+			getOutlineViewTaskLine({ ...task, checkbox: "todo", wait: null }, locale),
+		);
+		if (used + sectionLine.length + (assignedLines[0] as string).length + 2 <= room) {
+			lines.push(sectionLine);
+			used += sectionLine.length + 1;
+			for (const line of assignedLines) {
+				if (used + line.length + 1 > room) break;
+				lines.push(line);
+				used += line.length + 1;
+			}
 		}
 	}
 	const hidden = read.entries.length - shown + delegated.entries.length - printedDelegated.length;
