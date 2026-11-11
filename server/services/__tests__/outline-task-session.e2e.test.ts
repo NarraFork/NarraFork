@@ -18,7 +18,7 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; each case makes its own project.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asc, eq } from "drizzle-orm";
@@ -43,6 +43,8 @@ const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots"
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
 /** One entry per model request: what the model was sent, its system prompt and tools. */
 const requests: Array<{ input: string; system: string; tools: string }> = [];
+/** What the model stand-in does in a turn besides replying (its tool calls, in effect). */
+let onTurn: ((turn: number) => Promise<void>) | null = null;
 let lastSystem = "";
 let lastTools = "";
 const testProvider: ProviderAdapter = {
@@ -61,6 +63,7 @@ const testProvider: ProviderAdapter = {
 			tools: lastTools,
 		});
 		params.onRequestStart?.();
+		await onTurn?.(requests.length);
 		yield { text: "task turn ran" };
 	},
 	generate: async () => "",
@@ -81,7 +84,9 @@ mock.module("../../lib/agent/provider", () => ({
 const { outlineRoutes } = await import("../../routes/outline");
 const { settings } = await import("../../lib/settings");
 const { generateId } = await import("../../lib/id");
-const { closeNarrator, startSpecContinuationIfPossible } = await import("../narrator-session");
+const { closeNarrator, sendMessage, startSpecContinuationIfPossible } = await import(
+	"../narrator-session"
+);
 const { narratorService } = await import("../narrator-service");
 const { outlineStore } = await import("../outline/store");
 const { ensurePersonalSpace, ensureProjectSpace, ensureSessionSpace } = await import(
@@ -131,6 +136,7 @@ beforeEach(() => {
 	resetOutlineTaskSessionsForTests();
 	setOutlineTaskSessionRuntime(null);
 	requests.length = 0;
+	onTurn = null;
 });
 
 afterEach(async () => {
@@ -1219,5 +1225,232 @@ describe("openTaskSession", () => {
 			}),
 		).rejects.toMatchObject({ reason: "unavailable" });
 		expect(await sessionsOf(p.id)).toHaveLength(0);
+	});
+});
+
+describe("the whole loop: not finished, handed off, continued by the next session (PR 10c-2)", () => {
+	/** A write the model stand-in makes as the session (what its OutlineEdit would do). */
+	const asSession = (spaceId: string, narratorId: string, userId: string, ops: Op[]) =>
+		writeOutline({
+			spaceId,
+			ops,
+			actor: { kind: "agent", id: narratorId },
+			narratorId,
+			responsibleUserId: userId,
+		});
+
+	test("the first session leaves a note and one step done; the task goes back with a handoff; the second session's brief carries it and it finishes", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const page = await write(p.space.id, alice, [
+			{ op: "insert", tempId: "p", parent: null, content: "Tasks" },
+			{
+				op: "insert",
+				tempId: "t",
+				parent: { tempId: "p" },
+				content: "Fix the refresh logic",
+				task: { status: "todo" },
+			},
+			{
+				op: "insert",
+				parent: { tempId: "t" },
+				content: "Write the test",
+				task: { status: "todo" },
+			},
+			{
+				op: "insert",
+				parent: { tempId: "t" },
+				content: "Change the code",
+				task: { status: "todo" },
+			},
+		]);
+		const [, t, s1, s2] = page.results as Array<{ blockId: string; sid: string }>;
+		const task = t?.blockId as string;
+		const versionOf = async () => (await outlineStore.getBlock(task))?.versionSeq as number;
+
+		// ── The first session: a note, the first step done, then its turn ends. ──
+		let first = "";
+		onTurn = async () => {
+			await asSession(p.space.id, first, alice, [
+				{
+					op: "insert",
+					parent: { id: task },
+					content:
+						"Refresh takes two paths; the second is not changed yet\nNext: the concurrency test",
+				},
+				{ op: "setTask", block: { id: s1?.blockId as string }, task: { status: "done" } },
+			]);
+		};
+		// The id is known only once the session exists: the first turn starts after the claim.
+		const opening = open(alice, { id: task, versionSeq: await versionOf() });
+		const waitForSession = async () => {
+			for (let i = 0; i < 400 && !first; i++) {
+				first = (await sessionsOf(p.id))[0]?.id ?? "";
+				if (!first) await Bun.sleep(2);
+			}
+		};
+		await waitForSession();
+		const one = await opening;
+		expect(one.status).toBe(201);
+		expect(one.body.narratorId).toBe(first);
+		await idle(first, 1);
+
+		expect(await stateOf(task)).toMatchObject({
+			status: "todo",
+			holder: null,
+			lastHolder: first,
+			epoch: 1,
+		});
+		expect(await stateOf(s1?.blockId as string)).toMatchObject({ status: "done" });
+		expect(await outlineStore.listClaimedTasks(first, 10)).toHaveLength(0);
+		const [handoff, ...others] = await handoffsUnder(task);
+		expect(others).toHaveLength(0);
+		expect(handoff?.text).toContain("Handoff (generation 1");
+		expect(handoff?.text).toContain("not finished; back to do");
+		expect(handoff?.lines[0]).toContain("Refresh takes two paths; the second is not changed yet");
+		expect(handoff?.lines).toContain("Steps: 1 of 2 done");
+		// The model wrote its note, so its last reply is not copied into the project space.
+		expect(handoff?.lines.join("\n")).not.toContain("task turn ran");
+		// The board: to do again, a session can be opened for it, and it says it was handed off.
+		const board = await readProjectTaskBoard({ userId: alice, isAdmin: false }, p.id);
+		const onBoard = board.sections.flatMap((s) => s.open).find((entry) => entry.id === task);
+		expect(onBoard).toMatchObject({ status: "todo", openSession: true, handoffs: 1 });
+		expect(onBoard?.previousDirectory).toBeUndefined();
+
+		// ── The second session: its brief has the handoff and the note in full; it finishes. ──
+		let second = "";
+		onTurn = async () => {
+			await asSession(p.space.id, second, alice, [
+				{ op: "setTask", block: { id: s2?.blockId as string }, task: { status: "done" } },
+				{ op: "setTask", block: { id: task }, task: { status: "done" } },
+			]);
+		};
+		const reopening = open(alice, { id: task, versionSeq: await versionOf() });
+		for (let i = 0; i < 400 && !second; i++) {
+			second = (await sessionsOf(p.id)).find((row) => row.id !== first)?.id ?? "";
+			if (!second) await Bun.sleep(2);
+		}
+		const two = await reopening;
+		expect(two.status).toBe(201);
+		expect(two.body).toMatchObject({ narratorId: second, epoch: 2 });
+		await idle(second, 2);
+
+		const brief = (await history(second))[0]?.text ?? "";
+		expect(brief).toContain("claim generation 2");
+		expect(brief).toContain("## Handoff from the previous session");
+		expect(brief).toContain("This task was given back unfinished once.");
+		expect(brief).toContain("- Handoff (generation 1");
+		expect(brief).toContain("  - Steps: 1 of 2 done");
+		expect(brief).toContain("The notes it points to, in full:");
+		expect(brief).toContain("  Next: the concurrency test");
+		const pos = (text: string) => brief.indexOf(text);
+		expect(pos("## Handoff from the previous session")).toBeGreaterThan(-1);
+		expect(pos("## Handoff from the previous session")).toBeLessThan(
+			pos("## Notes and steps so far"),
+		);
+		// The handoff is in its own section only.
+		expect(brief.split("Handoff (generation 1").length).toBe(2);
+
+		expect(await stateOf(task)).toMatchObject({ status: "done", holder: null, epoch: 2 });
+		expect(await handoffsUnder(task)).toHaveLength(1);
+		expect(await outlineStore.listClaimedTasks(second, 10)).toHaveLength(0);
+		// Finished: no handoff mark is left to act on, and nothing was written by the release.
+		const after = await readProjectTaskBoard({ userId: alice, isAdmin: false }, p.id);
+		expect(
+			after.sections.flatMap((s) => s.open).find((entry) => entry.id === task),
+		).toBeUndefined();
+	});
+
+	test("a person talks to the session: its turn's end keeps the task for an hour instead of giving it back", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const { body } = await open(alice, task);
+		await idle(body.narratorId, 1);
+		expect(await stateOf(task.id)).toMatchObject({ status: "todo", holder: null, epoch: 1 });
+
+		// The person says "carry on"; the session takes the task up again (the next generation).
+		onTurn = async () => {
+			await asSession(p.space.id, body.narratorId, alice, [
+				{ op: "setTask", block: { id: task.id }, task: { status: "doing" } },
+			]);
+		};
+		const before = Date.now();
+		await sendMessage(body.narratorId, "carry on with it", undefined, "en", false, null, alice);
+		await idle(body.narratorId, 2);
+		const kept = await stateOf(task.id);
+		expect(kept).toMatchObject({ status: "doing", holder: body.narratorId, epoch: 2 });
+		const [claim] = await outlineStore.getTaskClaims([task.id]);
+		const lease = Date.parse(claim?.expiresAt as string) - before;
+		// About an hour: neither the running lease (10 min) nor the idle one (24 h).
+		expect(lease).toBeGreaterThan(50 * 60_000);
+		expect(lease).toBeLessThan(70 * 60_000);
+		expect(await handoffsUnder(task.id)).toHaveLength(1);
+	});
+
+	test("opened in the previous session's directory: offered on the board when it is inside the project and still there, and used when asked", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const worktree = join(p.dir, ".worktrees", "fix");
+		mkdirSync(worktree, { recursive: true });
+		const first = await open(alice, task, { cwd: worktree });
+		expect(first.status).toBe(201);
+		await idle(first.body.narratorId, 1);
+		const [handoff] = await handoffsUnder(task.id);
+		expect(handoff?.lines).toContain("Working directory: `.worktrees/fix`");
+		const read = async () =>
+			(await readProjectTaskBoard({ userId: alice, isAdmin: false }, p.id)).sections
+				.flatMap((s) => s.open)
+				.find((entry) => entry.id === task.id);
+		const onBoard = await read();
+		expect(onBoard).toMatchObject({ handoffs: 1, previousDirectory: ".worktrees/fix" });
+
+		const second = await open(
+			alice,
+			{ id: task.id, versionSeq: onBoard?.versionSeq as number },
+			{ previousDirectory: true, cwd: "/ignored" },
+		);
+		expect(second.status).toBe(201);
+		const session = await db.query.narrators.findFirst({
+			where: eq(narrators.id, second.body.narratorId),
+			columns: { cwd: true },
+		});
+		expect(session?.cwd).toBe(worktree);
+		await idle(second.body.narratorId, 2);
+
+		// Gone from the disk: no longer offered, and asking for it is refused with nothing created.
+		rmSync(worktree, { recursive: true, force: true });
+		const gone = await read();
+		expect(gone?.handoffs).toBe(2);
+		expect(gone?.previousDirectory).toBeUndefined();
+		const sessions = (await sessionsOf(p.id)).length;
+		const refused = await open(
+			alice,
+			{ id: task.id, versionSeq: gone?.versionSeq as number },
+			{ previousDirectory: true },
+		);
+		expect(refused.status).toBe(409);
+		expect(refused.body.details?.reason).toBe("no_directory");
+		expect(await sessionsOf(p.id)).toHaveLength(sessions);
+	});
+
+	test("a reader of the project sees the mark; someone who cannot read the space sees nothing of the task or its handoff", async () => {
+		const alice = await person("alice");
+		const reader = await person("reader");
+		const stranger = await person("stranger");
+		const p = await project(alice);
+		await grant("project", p.id, reader, "read");
+		const task = await taskIn(p.space.id, alice);
+		const { body } = await open(alice, task);
+		await idle(body.narratorId, 1);
+		const seen = await readProjectTaskBoard({ userId: reader, isAdmin: false }, p.id);
+		const entry = seen.sections.flatMap((s) => s.open).find((e) => e.id === task.id);
+		expect(entry?.handoffs).toBe(1);
+		// A reader cannot open sessions: no button, and no directory is looked up for them.
+		expect(entry?.openSession).toBeUndefined();
+		expect(entry?.previousDirectory).toBeUndefined();
+		const hidden = await readProjectTaskBoard({ userId: stranger, isAdmin: false }, p.id);
+		expect(hidden.sections.flatMap((s) => [...s.open, ...s.finished])).toHaveLength(0);
 	});
 });
