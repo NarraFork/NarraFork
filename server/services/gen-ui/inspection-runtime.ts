@@ -3,18 +3,24 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_PATH,
 	PLUGIN_UI_RUNTIME_JS_PATH,
 } from "@frontend/plugin-runtime/paths";
+import { isCompiledRuntime } from "../../lib/runtime-target";
 import { uiError } from "./files";
 
 const MAX_RUNTIME_BYTES = 8 * 1024 * 1024;
 
 /** Read only host-owned build assets, never an agent-supplied path or authenticated URL. */
 export async function readInspectionRuntime(signal: AbortSignal) {
-	const compiled = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+	const compiled = isCompiledRuntime();
 	let assets: Record<string, string> | undefined;
 	if (compiled) {
-		const modulePath = "../../generated/embedded-frontend";
-		const module = (await import(modulePath)) as { embeddedAssets?: Record<string, string> };
-		assets = module.embeddedAssets;
+		try {
+			const module = (await import("@server/generated/embedded-frontend")) as {
+				embeddedAssets?: Record<string, string>;
+			};
+			assets = module.embeddedAssets;
+		} catch {
+			throw uiError("GenUI inspection runtime is unavailable in this build", 503);
+		}
 	}
 	let remaining = MAX_RUNTIME_BYTES;
 	async function read(path: string): Promise<string> {

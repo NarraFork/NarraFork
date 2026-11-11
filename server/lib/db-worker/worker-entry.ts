@@ -25,6 +25,7 @@ import {
 	scanDatabaseObjectStorage,
 	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
+import { RUNTIME_BUILD_ID } from "../runtime-target";
 import { instrumentSqliteConnection, runInSqlTraceSpan, startSqlTraceSpan } from "../sql-trace";
 import {
 	runBlockBackfillSlice,
@@ -35,6 +36,7 @@ import {
 } from "./block-backfill-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
+import { workerFailureDetails } from "./failure";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
@@ -272,6 +274,7 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 		post({
 			type: "error",
 			requestId: message.requestId,
+			diagnostic: workerFailureDetails(err, false),
 			message: unknownPgError
 				? "PostgreSQL read-only display worker failed"
 				: err instanceof Error
@@ -291,4 +294,4 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 
 // Aggregation deliberately stays on the main thread (see pool.ts): merging there, after every
 // shard has returned, is what makes the result independent of shard completion order.
-post({ type: "ready" });
+post({ type: "ready", buildId: RUNTIME_BUILD_ID });

@@ -156,6 +156,7 @@ export interface AdapterContentBlock {
 	query?: string | null;
 	queries?: string[] | null;
 	status?: string | null;
+	errorCode?: string | null;
 	revisedPrompt?: string | null;
 	result?: string | null;
 	width?: number | null;
@@ -1556,18 +1557,25 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 	};
 }
 
-/**
- * Localized header text of an image_generation block, mirroring MessageBubble's
- * `imageGenerating / imageGenerationPreparing / imageGenerated` ternary.
- *
- * MEASURED: the header line wraps together with the revised prompt, so the
- * wording belongs to the adapter (ctx.labels) rather than the render layer. A
- * persisted block carries no `status` at all (the event handler stores only the
- * saved path + size), which correctly reads as "generated".
- */
-function imageGenerationStatusText(ctx: AdapterContext, status: string | null | undefined): string {
-	if (!status || status === "completed") return sysLabel(ctx, "imageGenerated");
-	return sysLabel(ctx, status === "generating" ? "imageGenerating" : "imageGenerationPreparing");
+/** The header is measured, including real upstream diagnostics; never infer an error. */
+function imageGenerationStatusText(ctx: AdapterContext, block: AdapterContentBlock): string {
+	let key = "imageGenerationNoImage";
+	if (block.status === "generating") key = "imageGenerating";
+	else if (block.status === "in_progress") key = "imageGenerationPreparing";
+	else if (block.status === "failed") key = "imageGenerationFailed";
+	else if (block.status === "cancelled") key = "imageGenerationCancelled";
+	else if (block.status === "incomplete") key = "imageGenerationIncomplete";
+	else if (
+		(!block.status || block.status === "completed") &&
+		((typeof block.result === "string" && block.result.trim()) ||
+			(typeof block.savedPath === "string" && block.savedPath.trim()))
+	)
+		key = "imageGenerated";
+	const label = sysLabel(ctx, key);
+	const diagnostic = [block.errorCode, block.error]
+		.filter((value) => typeof value === "string" && value.trim())
+		.join(": ");
+	return diagnostic ? `${label}: ${diagnostic}` : label;
 }
 
 function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
@@ -1590,6 +1598,8 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 		filename: block.filename ?? null,
 		mediaType: block.mediaType ?? null,
 		status: block.status ?? null,
+		error: block.error ?? null,
+		errorCode: block.errorCode ?? null,
 		revisedPrompt: block.revisedPrompt ?? null,
 		// The image SOURCE fields. `savedPath` is the normal one (the base64 payload
 		// is written to disk and only the path persisted); `result` survives only when
@@ -1600,7 +1610,7 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 		width: block.width ?? null,
 		height: block.height ?? null,
 		...(block.type === "image_generation"
-			? { statusText: imageGenerationStatusText(ctx, block.status) }
+			? { statusText: imageGenerationStatusText(ctx, block) }
 			: {}),
 	};
 }
@@ -2513,6 +2523,10 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	imageGenerated: "Generated image",
 	imageGenerating: "Generating image…",
 	imageGenerationPreparing: "Preparing image generation…",
+	imageGenerationFailed: "Image generation failed",
+	imageGenerationCancelled: "Image generation cancelled",
+	imageGenerationIncomplete: "Image generation incomplete",
+	imageGenerationNoImage: "No image received",
 	// Trace / count-line chrome (CollapsibleTrace headers + ToolRun/Reasoning
 	// count lines). Interpolated entries keep literal {count}/{reasoning}/{tools}
 	// placeholders that the composers substitute with live values.

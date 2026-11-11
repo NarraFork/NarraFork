@@ -11,6 +11,17 @@
  * `compiled-worker.ts`.)
  */
 
+declare const __NARRAFORK_RUNTIME_BUILD_ID__: string;
+declare const __NARRAFORK_LOCAL_RUNTIME__: boolean;
+
+/** Embedded in every entry of one build; source development has no frozen identity. */
+export const RUNTIME_BUILD_ID: string | null =
+	typeof __NARRAFORK_RUNTIME_BUILD_ID__ === "string" ? __NARRAFORK_RUNTIME_BUILD_ID__ : null;
+
+/** Local launch artifacts are compiled, but are not self-updating release installations. */
+export const IS_LOCAL_RUNTIME =
+	typeof __NARRAFORK_LOCAL_RUNTIME__ !== "undefined" && __NARRAFORK_LOCAL_RUNTIME__;
+
 /** True when running inside a compiled single-file binary. */
 export function isCompiledRuntime(): boolean {
 	const url = import.meta.url;

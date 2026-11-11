@@ -2,11 +2,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { renderBuildInfo } from "../../scripts/lib/build-materials";
 import {
 	githubRepositoryFromOrigin,
 	resolveBuildGitHubRepository,
 } from "../../scripts/lib/build-repository";
+import { compileRuntimeBundle } from "../../scripts/lib/runtime-compiler";
 import { OFFICIAL_GITHUB_REPOSITORY } from "../../shared/github-repository";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -79,7 +82,7 @@ console.log(JSON.stringify(value.define.__NARRAFORK_BUILD_REPOSITORY__));`,
 		});
 		expect(JSON.parse(output)).toBe(JSON.stringify("Example/ViteFork"));
 	}, 35_000);
-	test("compiled fixture freezes both frontend and backend defaults despite runtime env/cwd", () => {
+	test("compiled fixture freezes both frontend and backend defaults despite runtime env/cwd", async () => {
 		const root = temp();
 		const fixture = join(root, "fixture.ts");
 		const binary = join(root, process.platform === "win32" ? "fixture.exe" : "fixture");
@@ -105,22 +108,25 @@ console.log(JSON.stringify({ build: BUILD_GITHUB_REPOSITORY, frontend,
  legacy: normalizeUpdateSourceSettings({ update: { ...DEFAULT_UPDATE_SETTINGS, ...legacy } }, { update: legacy }).update }));
 `,
 		);
-		execFileSync(
-			process.execPath,
-			[
-				"build",
-				fixture,
-				"--compile",
-				`--define=__NARRAFORK_BUILD_REPOSITORY__=${JSON.stringify(repository)}`,
-				"--outfile",
-				binary,
-			],
-			{
-				cwd: process.cwd(),
-				timeout: 60_000,
-				maxBuffer: 1024 * 1024,
-			},
-		);
+		await compileRuntimeBundle({
+			root: process.cwd(),
+			entrypoints: [fixture],
+			outfile: binary,
+			buildId: "repository-fixture",
+			repository,
+			modules: new Map([
+				[
+					"build-info.ts",
+					renderBuildInfo({
+						version: "0.0.0",
+						commit: "fixture",
+						platform: "fixture",
+						repository,
+						helperDistribution: createHelperDistributionDependencies(),
+					}),
+				],
+			]),
+		});
 		const result = JSON.parse(
 			execFileSync(binary, [], {
 				cwd: root,
