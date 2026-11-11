@@ -44,6 +44,7 @@ import type {
 	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
 	OutlineBoardTaskUpdateResponse,
+	OutlineBoardTransferSessionsResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { request } from "./client";
@@ -239,6 +240,11 @@ export const outlineApi = {
 			method: "PATCH",
 			body: JSON.stringify(body),
 		}),
+	/** The sessions a task may be handed to on the board (「转交给会话…」). */
+	getTransferSessions: (blockId: string) =>
+		request<OutlineBoardTransferSessionsResponse>(
+			`/outline/tasks/${enc(blockId)}/transfer-sessions`,
+		),
 	/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
 	openTaskSession: (blockId: string, body: OutlineBoardOpenSessionRequest) =>
 		request<OutlineBoardOpenSessionResponse>(`/outline/tasks/${enc(blockId)}/open-session`, {
