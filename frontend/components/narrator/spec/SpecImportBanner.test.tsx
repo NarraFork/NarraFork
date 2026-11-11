@@ -197,9 +197,9 @@ test("every string exists in both languages", () => {
 	const keys = Object.keys(en.spec).filter((key) => key.startsWith("specImport"));
 	expect(keys.length).toBeGreaterThanOrEqual(9);
 	for (const key of keys) {
-		expect((zh.spec as Record<string, string>)[key]).toBeTruthy();
-		expect((zh.spec as Record<string, string>)[key]).not.toBe(
-			(en.spec as Record<string, string>)[key],
+		expect((zh.spec as unknown as Record<string, string>)[key]).toBeTruthy();
+		expect((zh.spec as unknown as Record<string, string>)[key]).not.toBe(
+			(en.spec as unknown as Record<string, string>)[key],
 		);
 	}
 });

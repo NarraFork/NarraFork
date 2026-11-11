@@ -9,8 +9,8 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { settings } from "../../../../lib/settings";
 import { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, TEAM_SOP_PLUGIN_ID } from "../../../behavior-fence-sop";
-import type { ActiveNarrator } from "../../../narrator-session";
 import { prepareOutlineRun } from "../../../narrator-session";
+import type { ActiveNarrator } from "../../../narrator-session-state";
 import { readSpecTasksCompat } from "../../../plugin-spec-compat";
 import { readSpecFile, writeSpecFile } from "../../../spec-vfs-service";
 import { invalidateTaskBackend, taskSourceForNarrator } from "../../../task-source";
