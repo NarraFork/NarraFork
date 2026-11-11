@@ -71,6 +71,7 @@ import {
 	readProjectSessionSpacePage,
 	readSessionWriteFacts,
 } from "./access-reads";
+import { agentAssigneeName } from "./assignee";
 import {
 	OUTLINE_BEHAVIOR_ALIAS,
 	OUTLINE_LIMITS,
@@ -418,6 +419,11 @@ async function describe(
 		const lock = meta.taskJson?.lock;
 		if (lock?.by.kind === "human") userIds.add(lock.by.id);
 		else if (lock) holderNarrators.add(lock.by.id);
+		// Handed to a session by its id (the board's 「转交给会话」, outline P2 PR 10a): shown as
+		// that session. Read with the holders, by primary key; a name that is no narrator's id
+		// (a handle, a label) stays a name.
+		const assigned = agentAssigneeName(meta.taskJson?.assignee);
+		if (assigned) holderNarrators.add(assigned);
 	}
 	const roots = await store.getNarratorRoots([...holderNarrators]);
 	const narratorIds = new Set<string>([...holderNarrators]);
@@ -451,8 +457,12 @@ async function describe(
 		}
 		if (task.assignee?.startsWith("human:"))
 			return { kind: "human", userId: null, name: task.assignee.slice("human:".length) };
-		if (task.assignee?.startsWith("agent:"))
-			return { kind: "agent", name: task.assignee.slice("agent:".length) };
+		if (task.assignee?.startsWith("agent:")) {
+			const name = task.assignee.slice("agent:".length);
+			// A root session's id: that session will do it. Anything else is a name.
+			if (roots.get(name)?.root === name) return session(name);
+			return { kind: "agent", name };
+		}
 		if (!open && claim) {
 			if (claim.lastHolderUserId)
 				return {

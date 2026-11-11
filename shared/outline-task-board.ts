@@ -34,8 +34,9 @@ export const OUTLINE_TASK_BOARD_LIMITS = {
 
 /**
  * Who does a task, as the board groups it:
- *   - `session`: a session holds it (its claim, lease running or lapsed), or it is an open task of
- *     the session's own space that nobody else is assigned (the session will take it up);
+ *   - `session`: a session holds it (its claim, lease running or lapsed), or it is handed to a
+ *     session by its id (`@agent:<session id>`, 「转交给会话」), or it is an open task of the
+ *     session's own space that nobody else is assigned (the session will take it up);
  *   - `human`: a person holds it, or it is assigned to a person (`@human:name`);
  *   - `agent`: assigned by name to an agent (`@agent:name`) that holds nothing yet;
  *   - `none`: nobody (an unassigned task of a project space).

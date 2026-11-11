@@ -584,12 +584,31 @@
 			"assignMe": "交给我",
 			"assignUser": "交给其他人…",
 			"assignSession": "交回本会话",
+			"transferSession": "转交给会话…",
 			"usernamePlaceholder": "用户名",
 			"assign": "转交",
 			"open": "在大纲里打开",
 			"failed": "修改任务失败",
 			"conflict": "任务刚被改过，看板已重新加载。",
 			"updated": "任务已更新"
+		},
+		"transfer": {
+			"note": "旧会话带着以前的上下文；一般让新会话做更合适。",
+			"only": "转交",
+			"andStart": "转交并开始",
+			"empty": "这个项目里没有能接手的会话。",
+			"failed": "读取会话列表失败",
+			"more": "只列出前 50 个会话。",
+			"untitled": "未命名会话",
+			"started": "已转交，会话已开始做。",
+			"notStarted": {
+				"finished": "已转交。任务已经结束，没有启动会话。",
+				"busy": "已转交。会话正在运行，没有另外启动；它会读到这次转交。",
+				"plan_mode": "已转交。会话在计划模式，没有启动。",
+				"continuation_off": "已转交。会话关了续跑，没有启动。",
+				"continuation_mode": "已转交。按会话的续跑设置，它不会接着做这个任务，没有启动。",
+				"not_started": "已转交，但会话没有启动。"
+			}
 		},
 		"completion": {
 			"asks": "agent 把它标为{{status}}：等你确认",

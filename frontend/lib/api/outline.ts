@@ -41,6 +41,7 @@ import type {
 	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
 	OutlineBoardTaskUpdateResponse,
+	OutlineBoardTransferSessionsResponse,
 	OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { request } from "./client";
@@ -231,6 +232,11 @@ export const outlineApi = {
 			method: "PATCH",
 			body: JSON.stringify(body),
 		}),
+	/** The sessions a task may be handed to on the board (「转交给会话…」). */
+	getTransferSessions: (blockId: string) =>
+		request<OutlineBoardTransferSessionsResponse>(
+			`/outline/tasks/${enc(blockId)}/transfer-sessions`,
+		),
 	/**
 	 * The person saw these tasks marked 「新完成」 on a board (outline P2 PR 9b); `keepalive` when
 	 * the page is going away.
