@@ -226,7 +226,12 @@ export async function readOutlineCommitTasks(
 		OUTLINE_TASK_FINISHED_LIMITS.versionsPerCommit,
 	);
 	const changed = versions.filter(
-		(v) => v.seq === event.seq && (v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 && !v.deleted,
+		(v) =>
+			v.seq === event.seq &&
+			!v.deleted &&
+			// A block created as a task carries `CREATE`, not always `TASK`.
+			((v.changeFlags & OUTLINE_CHANGE.TASK) !== 0 ||
+				((v.changeFlags & OUTLINE_CHANGE.CREATE) !== 0 && v.taskJson !== null)),
 	);
 	const existed = changed.filter(
 		(v) =>

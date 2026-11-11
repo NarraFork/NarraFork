@@ -17,8 +17,10 @@
  * WHAT IT LEAVES OUT (noise): the session's own commits and its subagents'; a person's change to a
  * task the session holds or held last (PR 5's notice already told it, `outline-task-edits.ts`);
  * people tidying (rewording, moving, reordering: not task events); session spaces (the session's
- * own place; people's changes there are PR 5's). The design's "what team rows already told it"
- * excludes nothing yet: the team channel is PR 10a.
+ * own place; people's changes there are PR 5's); and what a team row already told it
+ * (`team-events.ts`, outline P2 PR 10a): a task handed to this session by name, and a task this
+ * session created being done or cancelled (the prerequisite event names the session's own
+ * waiting task, which team activity never lists).
  *
  * WHERE IT GOES (prompt cache): appended to the history as a persisted `sys` row
  * (`outline_team_activity`), never into the system prompt, the tool definitions or a named
@@ -72,6 +74,7 @@ import {
 	type OutlineTeamTask,
 	outlineTeamLineText,
 } from "@server/lib/prompts/outline-team";
+import { foldHandle } from "@shared/narrator-handle";
 import { blockTitle } from "@shared/outline";
 import {
 	boundOutlineTaskNoticeItem,
@@ -97,6 +100,7 @@ import type {
 	OutlineStore,
 	OutlineTaskClaimRow,
 } from "./store/port";
+import { isOpenTask } from "./task-json";
 
 /** The injection source of the row (`docs/INJECTION.md`). */
 export const OUTLINE_TEAM_ACTIVITY_SOURCE = "outline_team_activity";
@@ -521,6 +525,24 @@ async function lookAtSpace(
 		const holder = claim ? (claim.holderNarratorId ?? claim.lastHolderNarratorId) : null;
 		return holder !== null && (holderRoots.get(holder) ?? holder) === root;
 	};
+	// What a team row told the session of the same commit (`team-events.ts`): a task assigned to
+	// it by name, and a task it created (or a subagent of it did) ending.
+	const mine = new Set([
+		`agent:${root}`,
+		...(ctx.handle ? [`agent:${foldHandle(ctx.handle)}`] : []),
+	]);
+	const assignedHere = (assignee: string | null | undefined): boolean =>
+		!!assignee?.startsWith("agent:") &&
+		(mine.has(assignee) || mine.has(`agent:${foldHandle(assignee.slice("agent:".length))}`));
+	const managerRoots = await rootsOf(
+		store,
+		changes.flatMap((c) =>
+			!c.deleted && c.taskJson?.manager?.kind === "agent" ? [c.taskJson.manager.id] : [],
+		),
+	);
+	const createdHere = (task: OutlineTaskJson | null): boolean =>
+		task?.manager?.kind === "agent" &&
+		(managerRoots.get(task.manager.id) ?? task.manager.id) === root;
 
 	const counts = new Map<string, { draft: Draft & { where: "tree" }; n: number }>();
 	const statusAt = new Map<string, number>();
@@ -563,6 +585,8 @@ async function lookAtSpace(
 			const person = commit.actorKind === "human";
 			if (person && toldByPeopleEdits(blockId)) continue;
 			if (created) {
+				// Created for this session by name: its team row said so.
+				if (isOpenTask(after) && assignedHere(after?.assignee)) continue;
 				look.drafts.push({
 					...base,
 					event: { kind: "added", taskId: blockId, claimable: after?.claimable === true },
@@ -571,7 +595,10 @@ async function lookAtSpace(
 				continue;
 			}
 			const t = taskTransition(before, after, false);
-			const status = t.event ?? (t.started ? "started" : null);
+			// Its own task ending elsewhere: its team row said so (a person's commit too, unless
+			// PR 5 told it, which is skipped above).
+			const ended = (t.event === "done" || t.event === "cancelled") && createdHere(after);
+			const status = ended ? null : (t.event ?? (t.started ? "started" : null));
 			if (status) {
 				// One status line per (task, actor): the last one says where it ended.
 				const key = `${blockId}\u0000${actor}`;
@@ -588,7 +615,7 @@ async function lookAtSpace(
 					look.drafts.push(draft);
 				}
 			}
-			if (t.assignedTo)
+			if (t.assignedTo && !(isOpenTask(after) && assignedHere(t.assignedTo)))
 				look.drafts.push({
 					...base,
 					event: { kind: "assigned", taskId: blockId, to: t.assignedTo },
