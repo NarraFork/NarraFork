@@ -44,6 +44,13 @@ import { revertCommit } from "../revert";
 import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace } from "../spaces";
 import { outlineStore } from "../store";
+import {
+	hasDeferredTeamWake,
+	OUTLINE_TEAM_WAKE_LIMITS,
+	resetOutlineTeamWakeForTests,
+	setOutlineTeamWakeClock,
+	takeTeamWake,
+} from "../team-wake";
 import { writeOutline } from "../write";
 
 const NOW = "2026-11-03T00:00:00.000Z";
@@ -692,6 +699,60 @@ describe("telling", () => {
 			.where(eq(narratorMessages.narratorId, w.a));
 		expect(rows.map((r) => r.id)).toEqual([id]);
 		expect((await outlineStore.getQuestions([q]))[0]?.deliveredAt).not.toBeNull();
+	});
+
+	test("an answer's wake counts against the session's wake limit: past it the answer is written, and one wake follows when there is room (P2 PR 10a)", async () => {
+		const w = await world();
+		const asked = await ask(w.ca, { questions: [{ question: "Format?", recommend: "v2" }] });
+		const { id: q } = await questionOf(asked);
+		// A clock the test moves: nothing waits for real time.
+		let now = Date.parse("2026-11-10T08:00:00.000Z");
+		const timers: Array<{ at: number; fn: () => void; done: boolean }> = [];
+		resetOutlineTeamWakeForTests();
+		const previous = setOutlineTeamWakeClock({
+			now: () => now,
+			after(ms, fn) {
+				const timer = { at: now + ms, fn, done: false };
+				timers.push(timer);
+				return () => {
+					timer.done = true;
+				};
+			},
+		});
+		try {
+			// Six team wakes of this session within the minute already.
+			for (let i = 0; i < OUTLINE_TEAM_WAKE_LIMITS.perWindow; i++)
+				expect(takeTeamWake(w.a)).toBe(true);
+			setOutlineAnswerDelivery(null);
+			const wakes = fakeWakes(true);
+			const done = await answerOutlineQuestions({
+				userId: w.alice.id,
+				answers: [{ blockId: q, adopt: true }],
+			});
+			expect(done.commitId).toBeTruthy();
+			// Written and marked delivered; the seventh wake of the minute is not made.
+			expect((await outlineStore.getQuestions([q]))[0]?.deliveredAt).not.toBeNull();
+			const rows = await db
+				.select({ id: narratorMessages.id, role: narratorMessages.role })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, w.a));
+			expect(rows.filter((r) => r.role === "user")).toHaveLength(1);
+			expect(wakes).toEqual([]);
+			expect(hasDeferredTeamWake(w.a)).toBe(true);
+			// The window has room again: the one wake that was owed, as the person it ran for.
+			now += OUTLINE_TEAM_WAKE_LIMITS.windowMs + 1;
+			for (const timer of timers.filter((t) => !t.done && t.at <= now)) {
+				timer.done = true;
+				timer.fn();
+			}
+			for (let i = 0; i < 50 && wakes.length === 0; i++)
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(wakes).toEqual([{ narratorId: w.a, userId: w.alice.id }]);
+			expect(hasDeferredTeamWake(w.a)).toBe(false);
+		} finally {
+			resetOutlineTeamWakeForTests();
+			setOutlineTeamWakeClock(previous);
+		}
 	});
 
 	test("a retry does not wake a session that already replied after the answer (review N-2)", async () => {
