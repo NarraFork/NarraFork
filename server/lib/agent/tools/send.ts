@@ -12,6 +12,13 @@ const USER_TARGET_DESCRIPTION =
 	"they ever see (Markdown renders, up to 32,000 characters). Use it alone: no agent " +
 	"targets, replyTo, doInterrupt, resume or model.";
 
+const SHOW_TO_USER_DESCRIPTION =
+	"Agent messages only: display intent, default false. Set true only for conclusions or " +
+	"deliverables genuinely worth the user's reading; internal coordination and progress stay " +
+	"false. This controls display only: false messages remain expandable by the user. It is " +
+	"not a privacy or permission flag, and does not change delivery or model-facing text. " +
+	"Ignored for Send({ user }), which always posts to the person's chat.";
+
 const RESUME_DESCRIPTION =
 	"Direct child subagents only: restart a target whose last turn ended with an error. Agent " +
 	"messages alone never restart such a subagent (Send then reports status `blocked` and the " +
@@ -47,6 +54,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 			items: { type: "string" },
 		},
 		message: { description: "Message to send to the target subagent(s).", type: "string" },
+		show_to_user: { description: SHOW_TO_USER_DESCRIPTION, type: "boolean" },
 		doInterrupt: {
 			description:
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
@@ -74,6 +82,9 @@ export const sendTool: ToolDefinition = {
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
 		'Subagents may also report progress to the narrator that launched them via "parent" (or "main"). Ordinary asynchronous messages may mix parent and sibling targets in one call; aliases for the same recipient are deduplicated. ' +
 		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization; partial failures preserve successful deliveries. " +
+		"Agent messages default to show_to_user=false for internal coordination; set it true only " +
+		"for conclusions or deliverables worth the user's reading. This is display intent only, " +
+		"not privacy or permission: false messages remain expandable by the user. " +
 		"Messages have a 256 KiB UTF-8 body limit; larger content must use a file reference or summary. " +
 		"Send may wake the recipient's session and trigger an unnecessary extra agent turn, so send messages only when genuinely necessary. " +
 		"Do not send agents courtesy acknowledgements, redundant progress updates, or messages merely to check status. " +
@@ -102,6 +113,7 @@ export const sendTool: ToolDefinition = {
 			.optional()
 			.describe("Target subagent titles, aliases, or unique ID prefixes."),
 		message: z.string().describe("Message to send to the target subagent(s)."),
+		show_to_user: z.boolean().optional().describe(SHOW_TO_USER_DESCRIPTION),
 		user: z.string().optional().describe(USER_TARGET_DESCRIPTION),
 		doInterrupt: z
 			.boolean()
@@ -121,6 +133,7 @@ export const sendTool: ToolDefinition = {
 			name?: string;
 			names?: string[];
 			message?: string;
+			show_to_user?: boolean;
 			user?: string;
 			doInterrupt?: boolean;
 			resume?: boolean;
@@ -145,6 +158,7 @@ export const sendTool: ToolDefinition = {
 				name: raw.name,
 				names: raw.names,
 				message: raw.message,
+				showToUser: raw.show_to_user ?? false,
 				doInterrupt: raw.doInterrupt,
 				resume: raw.resume,
 				model: raw.model,

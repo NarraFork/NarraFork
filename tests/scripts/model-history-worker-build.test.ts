@@ -4,9 +4,12 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { renderBuildInfo } from "../../scripts/lib/build-materials";
+import { compileRuntimeBundle } from "../../scripts/lib/runtime-compiler";
 import { safeSpawn } from "../../server/lib/spawn";
 import { modelHistoryFixtureSql } from "../../server/services/agent-runtime/model-history-fixture";
 import { renderModelHistoryRevisionSql } from "../../server/services/agent-runtime/model-history-revision-sql";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 // Real native compile/worker smoke. The temporary main entry shares server/'s
 // common root with the shipped worker, exactly as build-cross-platform does.
@@ -45,29 +48,32 @@ try {
 `,
 			{ flag: "wx" },
 		);
-		const compiled = await safeSpawn({
-			cmd: [
-				process.execPath,
-				"build",
-				"--compile",
-				entry,
-				join(root, "server/services/agent-runtime/model-history-worker.ts"),
-				"--outfile",
-				binary,
-			],
-			cwd: root,
-			timeout: 60_000,
-			maxOutputBytes: 256 * 1024,
+		await compileRuntimeBundle({
+			root,
+			entrypoints: [entry, join(root, "server/services/agent-runtime/model-history-worker.ts")],
+			outfile: binary,
+			buildId: "model-history-fixture",
+			repository: "fixture/repository",
+			modules: new Map([
+				[
+					"build-info.ts",
+					renderBuildInfo({
+						version: "0.0.0",
+						commit: "fixture",
+						platform: "fixture",
+						repository: "fixture/repository",
+						helperDistribution: createHelperDistributionDependencies(),
+					}),
+				],
+			]),
 		});
-		expect(compiled.exitCode).toBe(0);
-		expect(compiled.stdoutTruncated || compiled.stderrTruncated).toBe(false);
 		const result = await safeSpawn({
 			cmd: [binary, databasePath],
 			cwd: root,
 			timeout: 15_000,
 			maxOutputBytes: 64 * 1024,
 		});
-		expect(result.exitCode).toBe(0);
+		expect(result.exitCode, result.stderr).toBe(0);
 		expect(result.stdoutTruncated || result.stderrTruncated).toBe(false);
 		expect(JSON.parse(result.stdout.trim())).toEqual({
 			id: "probe-message",

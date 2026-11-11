@@ -143,6 +143,8 @@ export interface SideCarInboundMessage {
 	revision?: number;
 	/** Team channel only: the message went to everyone. */
 	isBroadcast?: boolean;
+	/** Display intent only; false or absent messages remain user-readable, never private. */
+	showToUser?: boolean;
 	text: string;
 }
 
@@ -312,8 +314,17 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			return typeof body.text === "string" ? body : undefined;
 		case "knowledge":
 			return Array.isArray(body.hits) ? body : undefined;
-		case "tasksDone":
 		case "messages":
+			return Array.isArray(body.items) &&
+				body.items.every(
+					(item) =>
+						item !== null &&
+						typeof item === "object" &&
+						(item.showToUser === undefined || typeof item.showToUser === "boolean"),
+				)
+				? body
+				: undefined;
+		case "tasksDone":
 		case "specUpdates":
 		case "asyncQuestionAnswers":
 			return Array.isArray(body.items) ? body : undefined;

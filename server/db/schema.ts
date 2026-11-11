@@ -701,6 +701,8 @@ export const narrators = sqliteTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		// Startup recovery and legacy backfills look up active/legacy rows by status.
+		index("idx_narrators_status").on(table.status),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
 		index("idx_narrators_owner").on(table.ownerUserId),
 		// Leads the visibility predicate pushed down into the paginated list query.
@@ -713,6 +715,16 @@ export const narrators = sqliteTable(
 		// Dependents of a policy source (permission-mode propagation, deletion guard).
 		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
+		// List pages filter by variant + hidden + status before ordering by recency, and count
+		// the same predicate per tab. Covering all three avoids a per-row filter over the
+		// whole variant bucket (measured: ~10ms -> <1ms for both the count and the page).
+		index("idx_narrators_variant_list").on(
+			table.variant,
+			table.hiddenFromLists,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 		// 一个模型只有一个 ModelTrace 舱；SQLite 的唯一索引允许多个 NULL。
@@ -2285,6 +2297,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default(true),
 	showTokenUsage: integer("show_token_usage", { mode: "boolean" }).notNull().default(false),
 	showOutputStats: integer("show_output_stats", { mode: "boolean" }).notNull().default(true),
+	/** Account-wide transcript display preference; false preserves the original cards. */
+	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
+		.notNull()
+		.default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**

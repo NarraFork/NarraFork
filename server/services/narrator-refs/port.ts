@@ -22,6 +22,11 @@ export interface RefOperationOptions {
 
 /** Networked domain port. All results are Promises; no SQLite transaction handles cross it. */
 export interface NarratorMessageRefsPort {
+	/** Latest own assistant provider after the last compact; inherited fork replies do not count. */
+	lastServedProvider(
+		narratorId: string,
+		options?: RefOperationOptions,
+	): Promise<string | undefined>;
 	creator(userId: string): Promise<{
 		id: string;
 		username: string;

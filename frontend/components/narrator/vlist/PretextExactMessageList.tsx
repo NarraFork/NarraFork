@@ -1087,10 +1087,6 @@ export const PretextExactMessageList = memo(
 					subagentRecentCallSummary(toolName, normalizeSubagentToolInputSummary(inputSummary)),
 				[],
 			);
-			const resolveRecentMessageIds = useCallback(
-				(messages: readonly NarratorMsg[]) => recentRunSegmentMessageIds([...messages], 2),
-				[],
-			);
 			const readCurrentView = useCallback(() => {
 				// A parked display:none node has no reading geometry. Semantic patches
 				// keep the last visible view (plus deferred anchored corrections).
@@ -1709,6 +1705,11 @@ export const PretextExactMessageList = memo(
 					toolUseId ? pendingPermissionToolUseIds.has(toolUseId) : false,
 				[pendingPermissionToolUseIds],
 			);
+			const resolveQuestionStatus = useCallback(
+				(toolUseId: string | undefined) =>
+					toolUseId ? permCb?.asyncQuestions?.get(toolUseId)?.question?.status : undefined,
+				[permCb?.asyncQuestions],
+			);
 			// ⚠️ The pinned latest-tasks card is NOT resolved here.
 			//
 			// The shell tracks its own `latestSpecTasksToolUseId` (the `LatestTodosToolUseIdCtx`
@@ -2116,6 +2117,12 @@ export const PretextExactMessageList = memo(
 				isFetched: userPrefsFetched,
 			} = useUserPreferences();
 			const showTokenUsage = userPrefs?.showTokenUsage ?? false;
+			const compactAuxiliaryContent = userPrefs?.compactAuxiliaryContent ?? true;
+			const resolveRecentMessageIds = useCallback(
+				(messages: readonly NarratorMsg[]) =>
+					recentRunSegmentMessageIds([...messages], 2, { compactAuxiliaryContent }),
+				[compactAuxiliaryContent],
+			);
 			// During a resize, the live breakpoint selects visible usage specs locally.
 			// Only the settled breakpoint reaches the full document build below.
 			// Height as the LAYOUT sees it (see the buildOptions comment below). Derived here
@@ -2142,6 +2149,7 @@ export const PretextExactMessageList = memo(
 				[dataSource?.fetchPage, dataSource?.locateMessage],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				compactAuxiliaryContent,
 				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
 				keepEmptyReasoningLive: isActive,
@@ -2188,6 +2196,7 @@ export const PretextExactMessageList = memo(
 				canOfferModelTest: errorNotice.canOfferModelTest,
 				resolveSubagentRecentSummary: resolveExactSubagentRecentSummary,
 				resolveRecentMessageIds,
+				resolveQuestionStatus,
 				resolveHasPendingPermission,
 				resolvePermissionFormPrediction,
 				resolvePermissionFormHeight,
@@ -5103,7 +5112,7 @@ export const PretextExactMessageList = memo(
 							? (item.spec.data as { modelFacing?: unknown; title?: unknown })
 							: null;
 					const injectionData =
-						item.spec.kind === "injection-bubble"
+						item.spec.kind === "injection-bubble" || item.spec.kind === "auxiliary-content"
 							? (item.spec.data as {
 									modelFacing?: unknown;
 									speaker?: unknown;

@@ -2,11 +2,17 @@ import { describe, expect, test } from "bun:test";
 import {
 	BalanceProbeRequestError,
 	type BalanceRequest,
+	balanceRootCandidates,
 	buildBalanceRoots,
+	hasSiteQuotaConfig,
 	parseNewApiBalance,
+	parseNewApiUserQuota,
 	parseSub2ApiBalance,
 	probeProviderBalance,
+	probeSiteQuota,
 	refreshProviderBalance,
+	refreshSiteQuota,
+	resolveSiteQuotaConfig,
 } from "../provider-balance-adapters";
 
 const wallet = { mode: "unrestricted", isValid: true, unit: "USD", balance: 12.5 };
@@ -25,6 +31,12 @@ const metadata = (data: Record<string, unknown>) => ({
 	success: true,
 	data: { quota_per_unit: 500_000, ...data },
 });
+/** A provider whose site-account credit query is fully configured. */
+const credentials = {
+	baseUrl: "https://site.test",
+	quotaAccessToken: "site-token",
+	quotaUserId: "42",
+};
 
 describe("sub2api shape validation", () => {
 	test.each([0, -3, 2.5])("wallet preserves explicit balance %s", (balance) => {
@@ -393,7 +405,7 @@ describe("protocol discovery and refresh", () => {
 				amounts: [{ unit: "USD", remaining: 12.5 }],
 			},
 		});
-		expect(calls).toEqual([["https://relay.test/prefix/v1/usage", true]]);
+		expect(calls).toEqual([["https://relay.test/prefix/v1/usage", "provider-key"]]);
 	});
 
 	test("tries at most four introspections and one unauthenticated metadata request", async () => {
@@ -408,11 +420,11 @@ describe("protocol discovery and refresh", () => {
 		expect(result?.adapter).toBe("new-api");
 		expect(result?.balance.amounts[0]?.remaining).toBe(1);
 		expect(calls).toEqual([
-			["https://relay.test/prefix/v1/usage", true],
-			["https://relay.test/prefix/api/usage/token/", true],
-			["https://relay.test/prefix/v1/v1/usage", true],
-			["https://relay.test/prefix/v1/api/usage/token/", true],
-			["https://relay.test/prefix/v1/api/status", false],
+			["https://relay.test/prefix/v1/usage", "provider-key"],
+			["https://relay.test/prefix/api/usage/token/", "provider-key"],
+			["https://relay.test/prefix/v1/v1/usage", "provider-key"],
+			["https://relay.test/prefix/v1/api/usage/token/", "provider-key"],
+			["https://relay.test/prefix/v1/api/status", "none"],
 		]);
 	});
 
@@ -476,7 +488,7 @@ describe("protocol discovery and refresh", () => {
 			unlimited: false,
 			amounts: [{ unit: "USD", remaining: 12.5 }],
 		});
-		expect(calls).toEqual([["https://relay.test/v1/v1/usage", true]]);
+		expect(calls).toEqual([["https://relay.test/v1/v1/usage", "provider-key"]]);
 	});
 
 	test("new-api refresh optionally reloads public metadata", async () => {
@@ -491,8 +503,8 @@ describe("protocol discovery and refresh", () => {
 		);
 		expect(balance.amounts[0]?.remaining).toBe(1);
 		expect(calls).toEqual([
-			["https://relay.test/team/api/usage/token/", true],
-			["https://relay.test/team/api/status", false],
+			["https://relay.test/team/api/usage/token/", "provider-key"],
+			["https://relay.test/team/api/status", "none"],
 		]);
 	});
 
@@ -505,5 +517,155 @@ describe("protocol discovery and refresh", () => {
 				throw new Error("private data");
 			}),
 		).rejects.toMatchObject({ kind: "transient", message: "Balance request failed" });
+	});
+});
+
+describe("site-account credit query (/api/user/self)", () => {
+	// One US dollar is 500000 internal quota units on New API sites.
+	const site = {
+		success: true,
+		message: "",
+		data: { quota: 2_500_000, used_quota: 500_000, group: "default" },
+	};
+
+	test("converts quota units to USD and reports the group", () => {
+		expect(parseNewApiUserQuota(site)).toEqual({
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: 5, used: 1, total: 6 }],
+			planName: "default",
+		});
+	});
+
+	test("accepts the numeric-string form emitted by some builds", () => {
+		expect(
+			parseNewApiUserQuota({
+				success: true,
+				data: { quota: "2500000", used_quota: "500000", group: "vip" },
+			}),
+		).toMatchObject({
+			amounts: [{ unit: "USD", remaining: 5, used: 1, total: 6 }],
+			planName: "vip",
+		});
+	});
+
+	test("omits the group when the site reports none", () => {
+		const parsed = parseNewApiUserQuota({ success: true, data: { quota: 0, used_quota: 0 } });
+		expect(parsed).toEqual({
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: 0, used: 0, total: 0 }],
+		});
+		expect(parsed).not.toHaveProperty("planName");
+	});
+
+	test("quota -1 is unlimited rather than a negative balance", () => {
+		expect(parseNewApiUserQuota({ success: true, data: { quota: -1, used_quota: 0 } })).toEqual({
+			scope: "wallet",
+			unlimited: true,
+			amounts: [],
+		});
+	});
+
+	test.each([
+		{ data: { quota: 1, used_quota: 0 } },
+		{ success: false, data: { quota: 1, used_quota: 0 } },
+		{ success: "true", data: { quota: 1, used_quota: 0 } },
+		{ success: true },
+		{ success: true, data: null },
+		{ success: true, data: { used_quota: 0 } },
+		{ success: true, data: { quota: 1 } },
+		{ success: true, data: { quota: "1e5", used_quota: 0 } },
+		{ success: true, data: { quota: -2, used_quota: 0 } },
+		{ success: true, data: { quota: 1, used_quota: -1 } },
+	])("rejects a body that is not an allowance answer %#", (body) => {
+		expect(parseNewApiUserQuota(body)).toBeNull();
+	});
+
+	test("a configured site root is independent of the inference base URL", () => {
+		// The base URL keeps /v1 (Codex/Grok/OpenCode presets); the site root does not.
+		expect(resolveSiteQuotaConfig({ ...credentials, baseUrl: "https://site.test/v1" })).toEqual({
+			root: "https://site.test",
+			accessToken: "site-token",
+			userId: "42",
+		});
+		// Trailing slashes and a pasted /v1 on the site root are both tolerated.
+		expect(
+			resolveSiteQuotaConfig({
+				...credentials,
+				baseUrl: "https://site.test/v1",
+				quotaSiteUrl: "https://site.test/v1/",
+			}),
+		).toMatchObject({ root: "https://site.test" });
+		expect(
+			resolveSiteQuotaConfig({ ...credentials, baseUrl: "x", quotaSiteUrl: "https://site.test/" }),
+		).toMatchObject({ root: "https://site.test" });
+	});
+
+	test.each([
+		{ quotaAccessToken: "site-token" },
+		{ quotaUserId: "42" },
+		{},
+	])("a half-filled site configuration is a deterministic error %#", (config) => {
+		expect(() => resolveSiteQuotaConfig({ baseUrl: "https://site.test", ...config })).toThrow(
+			BalanceProbeRequestError,
+		);
+		expect(() => resolveSiteQuotaConfig({ baseUrl: "https://site.test", ...config })).toThrow(
+			expect.objectContaining({ kind: "invalid_configuration" }),
+		);
+	});
+
+	test("any single site field switches the query to the site account", () => {
+		expect(hasSiteQuotaConfig({})).toBe(false);
+		expect(hasSiteQuotaConfig({ quotaSiteUrl: "  " })).toBe(false);
+		expect(hasSiteQuotaConfig({ quotaSiteUrl: "https://site.test" })).toBe(true);
+		expect(hasSiteQuotaConfig({ quotaAccessToken: "t" })).toBe(true);
+		expect(hasSiteQuotaConfig({ quotaUserId: "42" })).toBe(true);
+	});
+
+	test("probe sends the site token, the user header and the site path", async () => {
+		const calls: Array<[string, string | undefined]> = [];
+		const result = await probeSiteQuota(
+			{ ...credentials, baseUrl: "https://site.test/v1" },
+			async (url, auth) => {
+				calls.push([url, auth]);
+				return site;
+			},
+		);
+		expect(calls).toEqual([["https://site.test/api/user/self", "site-token"]]);
+		expect(result.adapter).toBe("new-api-user");
+		expect(result.root).toBe("https://site.test");
+		expect(result.balance.amounts[0]).toMatchObject({
+			unit: "USD",
+			remaining: 5,
+			used: 1,
+			total: 6,
+		});
+	});
+
+	test("an unparsable site answer is invalid_response, not unsupported", async () => {
+		await expect(
+			probeSiteQuota(credentials, async () => ({ success: true, data: { nothing: 1 } })),
+		).rejects.toMatchObject({ kind: "invalid_response" });
+	});
+
+	test("refresh reuses the stored root and the same authentication", async () => {
+		const calls: Array<[string, string | undefined]> = [];
+		const balance = await refreshSiteQuota(credentials, "https://site.test/", async (url, auth) => {
+			calls.push([url, auth]);
+			return site;
+		});
+		expect(calls).toEqual([["https://site.test/api/user/self", "site-token"]]);
+		expect(balance.amounts[0]).toMatchObject({ remaining: 5, used: 1, total: 6 });
+	});
+
+	test("root candidates exclude the /v1 form once the site account is configured", () => {
+		expect(balanceRootCandidates({ baseUrl: "https://site.test/v1" })).toEqual([
+			"https://site.test",
+			"https://site.test/v1",
+		]);
+		expect(balanceRootCandidates({ ...credentials, baseUrl: "https://site.test/v1" })).toEqual([
+			"https://site.test",
+		]);
 	});
 });

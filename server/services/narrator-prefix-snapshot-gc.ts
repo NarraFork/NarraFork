@@ -2,6 +2,8 @@ import { bodySql } from "../lib/narrator-bodies";
 import { isPrefixToolsManifest, PREFIX_TOOLS_FORMAT } from "./narrator-prefix-snapshot-values";
 
 export const PREFIX_SNAPSHOT_GRACE_MS = 24 * 60 * 60 * 1000;
+// Bound the number of arbitrarily large bodies materialized together by one scan query.
+const PREFIX_SNAPSHOT_BODY_BATCH_SIZE = 8;
 export interface PrefixSnapshotGcOptions {
 	/** Test/maintenance clock; production callers should leave this unset. */
 	now?: number;
@@ -112,22 +114,18 @@ export class PrefixSnapshotCollector {
 				// Preserve legacy projections as conservative roots through the body layer;
 				// the separate blocks phase also protects current/rows-only bodies.
 				const column = state.phase === "messages" ? bodySql(table, false) : "payload";
-				// One body at a time: one historical item may itself be arbitrarily large.
-				const rows = await this.query<{ id: string }>(
-					`SELECT id FROM ${table} WHERE id > ? ORDER BY id LIMIT ?`,
-					[state.cursor, batch],
+				const bodyBatch = Math.min(batch, PREFIX_SNAPSHOT_BODY_BATCH_SIZE);
+				const rows = await this.query<{ id: string; body: string }>(
+					`SELECT id, CAST(${column} AS TEXT) AS body FROM ${table} WHERE id > ? ORDER BY id LIMIT ?`,
+					[state.cursor, bodyBatch],
 				);
 				for (const row of rows) {
-					const body = await this.query<{ body: string }>(
-						`SELECT CAST(${column} AS TEXT) AS body FROM ${table} WHERE id = ?`,
-						[row.id],
-					);
-					if (body[0]) await this.markBody(body[0].body);
+					await this.markBody(row.body);
 					state.cursor = row.id;
 					visited++;
 					if (Date.now() >= sliceDeadline) break;
 				}
-				if (rows.length < batch && visited === rows.length)
+				if (rows.length < bodyBatch && visited === rows.length)
 					next(state.phase === "messages" ? "blocks" : "manifests");
 			} else if (state.phase === "manifests") {
 				const rows = await this.query<{ sha256: string; prefix: string }>(

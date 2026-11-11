@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "ece47bea-5dfb-4cee-95ce-ea2cf28094e7",
+  "id": "09bf202b-c828-47de-bf6c-5828d51d6e41",
   "prevId": "66b96eb7-896d-4401-afea-7e5da606d8f8",
   "tables": {
     "acl_events": {
@@ -12812,6 +12812,13 @@
           ],
           "isUnique": false
         },
+        "idx_narrators_status": {
+          "name": "idx_narrators_status",
+          "columns": [
+            "status"
+          ],
+          "isUnique": false
+        },
         "idx_narrators_owner": {
           "name": "idx_narrators_owner",
           "columns": [
@@ -12851,6 +12858,17 @@
           "name": "idx_narrators_variant_updated",
           "columns": [
             "variant",
+            "updated_at",
+            "id"
+          ],
+          "isUnique": false
+        },
+        "idx_narrators_variant_list": {
+          "name": "idx_narrators_variant_list",
+          "columns": [
+            "variant",
+            "hidden_from_lists",
+            "status",
             "updated_at",
             "id"
           ],
@@ -16102,13 +16120,6 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'[]'"
-        },
-        "expanded_json": {
-          "name": "expanded_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
         },
         "layout": {
           "name": "layout",
