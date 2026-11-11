@@ -429,6 +429,10 @@ describe("the wake limit", () => {
 		expect(teamWakesLeft(worker)).toBe(OUTLINE_TEAM_WAKE_LIMITS.perWindow);
 	});
 
+	test("the limit is six wakes in a minute", () => {
+		expect(OUTLINE_TEAM_WAKE_LIMITS).toMatchObject({ perWindow: 6, windowMs: 60_000 });
+	});
+
 	test("the limit is per session, and the window slides", async () => {
 		const calls: string[] = [];
 		const wake = (id: string) => async () => {
@@ -514,8 +518,16 @@ describe("the re-push after a start", () => {
 			expect(commits.mock.calls.some(([id]) => id === space.id)).toBe(false);
 			expect(before.spaces).toBeLessThanOrEqual(OUTLINE_TEAM_EVENT_LIMITS.repushSpaces);
 
-			// More recent commits than one space pushes: the newest ones, each within the window.
+			// A recent commit lists the space; its commit from before the window is still left out.
 			const recent = new Date(now.getTime() - 60_000);
+			await commit(space.id, by, [assignTo("Just now", worker)], recent);
+			await repushRecentOutlineTeamEvents({ now });
+			await settleOutlineTeamEventsForTests();
+			expect((await rows(worker)).map((r) => r.text.match(/Too old|Just now/)?.[0])).toEqual([
+				"Just now",
+			]);
+
+			// More recent commits than one space pushes: the newest ones, each within the window.
 			const extra = 3;
 			for (let i = 0; i < OUTLINE_TEAM_EVENT_LIMITS.repushCommitsPerSpace + extra; i++)
 				await commit(space.id, by, [assignTo(`Recent ${i}`, worker)], recent);
@@ -531,7 +543,8 @@ describe("the re-push after a start", () => {
 				OUTLINE_TEAM_EVENT_LIMITS.repushCommitsPerSpace,
 			);
 			const told = await rows(worker);
-			expect(told).toHaveLength(OUTLINE_TEAM_EVENT_LIMITS.repushCommitsPerSpace);
+			// The one told above, and the newest of the rest but one (it takes one of the fifty).
+			expect(told).toHaveLength(OUTLINE_TEAM_EVENT_LIMITS.repushCommitsPerSpace + 1);
 			// The oldest of the recent ones were left out, and the one before the window too.
 			expect(told.some((r) => r.text.includes("Too old"))).toBe(false);
 			expect(told.some((r) => r.text.includes("Recent 0\n"))).toBe(false);

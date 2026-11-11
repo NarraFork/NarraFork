@@ -249,8 +249,30 @@ describe("an agent hands a task in progress on", () => {
 		]);
 		expect(adjustments(same)).toEqual([]);
 		expect(await claimOf(task.blockId)).toMatchObject({ holderNarratorId: first, epoch: 1 });
-		// The lease lapsed (nobody is doing it any more): the hand-over goes through.
+		// The lease lapsed (nobody is doing it any more). A session that names itself is taking the
+		// task over, not handing it on: it stays in progress, now its own.
 		const later = new Date(Date.now() + 2 * 60 * 60_000);
+		const other = await doing(space, first, owner.id, "Taken over");
+		const taken = await writeOutline(
+			{
+				spaceId: space.id,
+				ops: [
+					{
+						op: "setTask",
+						block: { id: other.blockId },
+						task: { status: "doing", assignee: `agent:${second}` },
+					},
+				],
+				actor: { kind: "agent", id: second },
+				narratorId: second,
+				responsibleUserId: owner.id,
+			},
+			{ now: () => later },
+		);
+		expect(adjustments(taken)).toEqual([]);
+		expect((await taskOf(other.blockId))?.status).toBe("doing");
+		expect(await claimOf(other.blockId)).toMatchObject({ holderNarratorId: second, epoch: 2 });
+		// Handed to a third: the hand-over goes through.
 		const handed = await writeOutline(
 			{
 				spaceId: space.id,

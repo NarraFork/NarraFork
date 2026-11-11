@@ -379,6 +379,11 @@ export const OUTLINE_TEAM_EVENTS_SCENARIOS: TeamEventsScenario[] = [
 				{ title: "By bare alias", status: "doing", depends: ["base-task"] },
 			]);
 			expect(dependents.tasks).toHaveLength(6);
+			// In a session's own space, one its person is doing themselves: theirs, not the session's.
+			const namedSpace = await ensureSessionSpace(named);
+			await tasks(namedSpace.id, human(owner.id), [
+				{ title: "The person does this one", status: "doing", depends: [base.address] },
+			]);
 			const done = await write(space.id, agent(doer, owner.id), [
 				setTask(base.blockId, { status: "done" }),
 			]);
@@ -391,6 +396,9 @@ export const OUTLINE_TEAM_EVENTS_SCENARIOS: TeamEventsScenario[] = [
 			expect(held?.content).not.toContain("Nobody's");
 			expect(held?.content).not.toContain("A person's");
 			expect(messages.find((m) => m.narratorId === named)?.content).toContain("Named:");
+			expect(messages.find((m) => m.narratorId === named)?.content).not.toContain(
+				"The person does this one",
+			);
 			// The session that ends its own prerequisite is told nothing.
 			const own = await tasks(space.id, agent(doer, owner.id), [
 				{ title: "Mine first", status: "doing" },
