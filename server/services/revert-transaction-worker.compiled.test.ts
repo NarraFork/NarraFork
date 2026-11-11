@@ -199,7 +199,8 @@ describe("revert manifest worker in a real compiled executable", () => {
 			for (const binary of [complete, missing]) {
 				const { stdout, stderr } = await execFileAsync(binary, [], {
 					cwd,
-					env: { ...process.env },
+					// Keep stdout machine-readable; worker startup warnings still reach stderr.
+					env: { ...process.env, NARRAFORK_LOG_LEVEL: "warn" },
 					timeout: 20_000,
 					maxBuffer,
 				});
