@@ -1615,11 +1615,94 @@ test("a selection reaching into a closed block never deletes what the block hide
 	await press(a, "Control+z");
 	await settle(a);
 	expect(await alive()).toBe(4);
-	// And a selection that covers its whole line (from its start into the next row).
-	await shows(a, DEFAULT_ROWS, "default before the whole-line selection");
-	await caret(a, note, 0);
-	await press(a, "Shift+ArrowDown");
+	// (A text selection from the very start of its line is not the whole row: the next test.)
+	expect(await a.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
+	expect(a.errors).toEqual([]);
+}, 60_000);
+
+test("a selection from the very start of a closed row opens it first, like one from inside its line", async () => {
+	const { pageId, idOf } = await page();
+	const a = await openHost(h, "page", pageId);
+	await shows(a, DEFAULT_ROWS);
+	const note = idOf("First note line");
+	const lone = idOf("A lone note");
+	const hiddenIds = ["Detail one", "Deep detail", "Detail two", "Detail three"].map(idOf);
+	const alive = async () =>
+		(
+			await a.call(
+				(f, ids) => (ids as unknown as string[]).filter((id) => !!f.client().visible.alive(id)),
+				hiddenIds,
+			)
+		).length;
+	const selectFromStart = async () => {
+		await caret(a, note, 0);
+		await press(a, "Shift+ArrowDown");
+		const sel = await a.call((f) => f.selection());
+		expect(sel?.anchor).toEqual({ blockId: note, offset: 0 });
+		expect(sel?.head.blockId).toBe(lone);
+		return sel;
+	};
+	const toDefault = async (label: string) => {
+		await a.call((f) => f.surface().foldAll(false));
+		if ((await rowOf(a, note))?.state === "open") await click(a, note, "arrow");
+		await shows(a, DEFAULT_ROWS, label);
+	};
+
+	// The first key deletes nothing and types nothing: the row opens, with the selection kept.
+	for (const key of ["Backspace", "Delete", "Control+x", "X"]) {
+		await toDefault(`default before ${key}`);
+		const sel = await selectFromStart();
+		if (key === "X") await a.page.keyboard.type("X");
+		else await press(a, key);
+		await settle(a);
+		expect({ key, alive: await alive() }).toEqual({ key, alive: 4 });
+		expect(serverText(pageId, note)).toBe("First note line");
+		expect(serverText(pageId, lone)).toBe("A lone note");
+		await eventually(
+			() => rowOf(a, note),
+			(row) => row?.state === "open",
+			`the row opened instead (${key})`,
+		);
+		expect(await a.call((f) => f.selection())).toEqual(sel as never);
+	}
+	// The same key again deletes what the reader now sees; undo brings it back.
 	await a.page.keyboard.press("Backspace");
+	await settle(a);
+	expect(await alive()).toBe(0);
+	await press(a, "Control+z");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	expect(serverText(pageId, note)).toBe("First note line");
+	expect(serverText(pageId, lone)).toBe("A lone note");
+
+	// An input method starting over such a selection composes at the cursor instead.
+	await toDefault("default before composing");
+	await selectFromStart();
+	const input = ime(a as never);
+	await input.set("ni");
+	await input.commit("你");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	expect(serverText(pageId, note)).toBe("First note line");
+	await press(a, "Control+z");
+	await settle(a);
+
+	// A true block selection of the closed row still takes what the row holds, in one key.
+	await toDefault("default before the block selection");
+	await caret(a, note, 0);
+	await a.page.keyboard.press("Escape");
+	await a.page.keyboard.press("Backspace");
+	await settle(a);
+	expect(await alive()).toBe(0);
+	expect(await a.call((f, id) => !!f.client().visible.alive(id as never), note)).toBe(false);
+	await press(a, "Control+z");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	// And so does cutting it as a block.
+	await toDefault("default before cutting the block");
+	await caret(a, note, 0);
+	await a.page.keyboard.press("Escape");
+	await press(a, "Control+x");
 	await settle(a);
 	expect(await alive()).toBe(0);
 	await press(a, "Control+z");
@@ -1628,6 +1711,104 @@ test("a selection reaching into a closed block never deletes what the block hide
 	expect(await a.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
 	expect(a.errors).toEqual([]);
 }, 60_000);
+
+test("a task kept open for the cursor stays open while the reader folds elsewhere", async () => {
+	const { pageId, idOf } = await page();
+	const a = await openHost(h, "page", pageId);
+	await shows(a, DEFAULT_ROWS);
+	const sub = idOf("A subtask");
+	const subnote = idOf("Subtask note");
+	const done = idOf("Wire the store");
+	const note = idOf("First note line");
+	const held = async (label: string) => {
+		expect({ label, state: (await rowOf(a, sub))?.state }).toEqual({ label, state: "open" });
+		expect({ label, at: (await head(a))?.blockId }).toEqual({ label, at: subnote });
+	};
+	const tickAround = async (label: string) => {
+		await caret(a, subnote);
+		await a.call((f, id) => f.setTask(id as never, "x"), sub);
+		await settle(a);
+		await held(label);
+	};
+	await tickAround("ticked done around the cursor");
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+
+	// An arrow elsewhere on the page: that row opens, the task around the cursor stays.
+	await click(a, done, "arrow");
+	await eventually(
+		() => rowOf(a, done),
+		(row) => row?.state === "open",
+		"the other row opened",
+	);
+	await held("after an arrow elsewhere");
+	expect(await foldState(a)).toEqual({ expanded: [done], collapsed: [] });
+	// And closing it again.
+	await click(a, done, "arrow");
+	await eventually(
+		() => rowOf(a, done),
+		(row) => row?.state === "closed",
+		"the other row closed",
+	);
+	await held("after closing elsewhere");
+	// A quick control elsewhere (everything inside another row).
+	await click(a, note, "quick");
+	await eventually(
+		() => texts(a),
+		(t) => t.includes("Deep detail"),
+		"everything inside the other row",
+	);
+	await held("after a quick control elsewhere");
+	// The keyboard on the cursor's own block: it opens, the task around it stays.
+	await press(a, "Control+.");
+	await eventually(
+		() => texts(a),
+		(t) => t.includes("Subtask deep"),
+		"the cursor's block opened",
+	);
+	await held("after folding the cursor's own block");
+	// The page's control opening everything.
+	await a.call((f) => f.surface().foldAll(true));
+	await eventually(
+		() => texts(a),
+		(t) => t.includes("store.ts:12"),
+		"everything open",
+	);
+	await held("after opening everything");
+
+	// The cursor leaving lets it go, whatever was folded meanwhile.
+	await a.call((f) => f.surface().foldAll(false));
+	await a.call((f, id) => f.setTask(id as never, "/"), sub);
+	await settle(a);
+	await tickAround("ticked done again");
+	await click(a, done, "arrow");
+	await eventually(
+		() => rowOf(a, done),
+		(row) => row?.state === "open",
+		"the other row opened again",
+	);
+	await held("still held");
+	await caret(a, done);
+	await eventually(
+		() => rowOf(a, sub),
+		(row) => row?.state === "closed",
+		"closed once the cursor left",
+	);
+
+	// The reader's own fold of a block around the cursor is not held against them: the arrow
+	// of the task above closes it, and the cursor goes to that task's line.
+	await a.call((f, id) => f.setTask(id as never, "/"), sub);
+	await settle(a);
+	await tickAround("ticked done a third time");
+	const top = idOf("Ship the fold");
+	await click(a, top, "arrow");
+	await eventually(
+		() => rowOf(a, top),
+		(row) => row?.state === "closed",
+		"the task above closed",
+	);
+	expect((await head(a))?.blockId).toBe(top);
+	expect(a.errors).toEqual([]);
+}, 40_000);
 
 test("deleting the block after a closed row leaves the row closed; held fold keys toggle once", async () => {
 	const { pageId, idOf } = await page();

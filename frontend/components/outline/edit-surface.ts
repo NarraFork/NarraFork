@@ -1092,7 +1092,7 @@ export class EditSurface {
 		if (this.destroyed) return false;
 		const tree = this.foldTree();
 		if (!tree || !this.state.fold(tree, action, true)) return false;
-		this.applyCollapse();
+		this.applyCollapse(action);
 		return true;
 	}
 
@@ -1130,8 +1130,8 @@ export class EditSurface {
 		this.opts.onPageFold(now);
 	}
 
-	private applyCollapse(): void {
-		for (const v of this.outlines()) v.foldChanged();
+	private applyCollapse(action?: FoldAction): void {
+		for (const v of this.outlines()) v.foldChanged(action);
 		this.map.schedule();
 		if (this.state.view === "map") this.map.flush();
 		this.state.noteCollapsed();
