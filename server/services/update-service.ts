@@ -44,6 +44,7 @@ import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
 import { replacementLaunchArgs } from "../lib/replacement-launch";
+import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "../lib/runtime-target";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -303,12 +304,11 @@ function getPlatform(): string {
 /**
  * Get the current executable path.
  * For compiled binaries, this is the running executable.
- * For dev mode, returns null.
+ * For source development and local launch artifacts, returns null.
  */
 function getCurrentExecutablePath(): string | null {
-	// Check if running as compiled binary
-	// Linux/macOS: $bunfs, Windows: ~BUN/%7EBUN
-	if (import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/")) {
+	// Local launch artifacts are frozen source builds, not release installations.
+	if (!IS_LOCAL_RUNTIME && isCompiledRuntime()) {
 		return process.execPath;
 	}
 	return null;
@@ -649,6 +649,12 @@ export async function downloadUpdate(
 	placed?: boolean;
 	preparedIdentity?: PreparedUpdateIdentity;
 }> {
+	if (IS_LOCAL_RUNTIME) {
+		return {
+			success: false,
+			error: "Local runtime builds must be rebuilt from source, not self-updated",
+		};
+	}
 	const forceDownload = options.forceDownload ?? false;
 	const sourceIdentity = parseUpdateSourceIdentity(releaseInfo.sourceIdentity);
 	let recoveryManifestVersions: number[];
@@ -1141,7 +1147,9 @@ export function getUpdateInstructions(
 	if (!execPath) {
 		return {
 			manual: true,
-			message: "Running in development mode. Update rebuilt and saved to the update cache.",
+			message: IS_LOCAL_RUNTIME
+				? "Local runtime builds must be rebuilt from source, not self-updated"
+				: "Running in development mode. Update rebuilt and saved to the update cache.",
 		};
 	}
 
@@ -1276,6 +1284,13 @@ export async function applyUpdate(
 	replacementPid?: number;
 	drainStartedAt?: string;
 }> {
+	if (IS_LOCAL_RUNTIME) {
+		return {
+			success: false,
+			error: "Local runtime builds must be rebuilt from source, not self-updated",
+			code: "NOT_COMPILED_BINARY",
+		};
+	}
 	if (!options.preparedId || !/^[a-f0-9]{64}$/.test(options.preparedId)) {
 		return {
 			success: false,

@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sqliteErrorCode } from "./db-resilience";
+import { sqliteErrorCode, withDbRetry } from "./db-resilience";
+import { logger } from "./logger";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -64,4 +65,124 @@ test("non-SQLite errors have no code", () => {
 	expect(sqliteErrorCode(new Error("boom"))).toBeUndefined();
 	expect(sqliteErrorCode(null)).toBeUndefined();
 	expect(sqliteErrorCode("database is locked")).toBeUndefined();
+});
+
+test("WAL lock retry rolls back the complete transaction before backing off", async () => {
+	const { a, b } = pair();
+	let attempts = 0;
+	b.run("BEGIN IMMEDIATE");
+	const warn = spyOn(logger, "warn").mockImplementation(() => {
+		expect(a.inTransaction).toBe(false);
+		b.run("COMMIT");
+	});
+	try {
+		await withDbRetry(
+			async () => {
+				attempts++;
+				a.transaction(() => {
+					a.query("SELECT v FROM t").get();
+					a.run("UPDATE t SET v='retried'");
+				})();
+			},
+			{ retryLegacyMessages: false },
+		);
+		expect(attempts).toBe(2);
+		expect(a.query("SELECT v FROM t").get()).toEqual({ v: "retried" });
+		expect(warn.mock.calls[0][1]?.code).toBe("SQLITE_BUSY");
+	} finally {
+		warn.mockRestore();
+		a.close();
+		b.close();
+	}
+});
+
+test("BUSY_SNAPSHOT retries a new transaction rather than repeating a stale upgrade", async () => {
+	const { a, b } = pair();
+	let attempts = 0;
+	try {
+		await withDbRetry(
+			async () => {
+				attempts++;
+				a.transaction(() => {
+					a.query("SELECT v FROM t").get();
+					if (attempts === 1) b.run("UPDATE t SET v='concurrent'");
+					a.run("UPDATE t SET v='fresh'");
+				})();
+			},
+			{ retryLegacyMessages: false },
+		);
+		expect(attempts).toBe(2);
+		expect(a.inTransaction).toBe(false);
+		expect(a.query("SELECT v FROM t").get()).toEqual({ v: "fresh" });
+	} finally {
+		a.close();
+		b.close();
+	}
+});
+
+test("abort during backoff clears the timer and leaves no active transaction", async () => {
+	const { a, b } = pair();
+	const signal = new AbortController();
+	const retrying = Promise.withResolvers<void>();
+	const warn = spyOn(logger, "warn").mockImplementation(() => retrying.resolve());
+	const clear = spyOn(globalThis, "clearTimeout");
+	let attempts = 0;
+	b.run("BEGIN IMMEDIATE");
+	try {
+		const pending = withDbRetry(
+			async () => {
+				attempts++;
+				a.transaction(() => {
+					a.run("UPDATE t SET v='cancelled'");
+				})();
+			},
+			{ signal: signal.signal, retryLegacyMessages: false },
+		);
+		await retrying.promise;
+		expect(a.inTransaction).toBe(false);
+		signal.abort(new Error("cancel backoff"));
+		await expect(pending).rejects.toThrow("cancel backoff");
+		expect(attempts).toBe(1);
+		expect(clear).toHaveBeenCalled();
+		b.run("COMMIT");
+		a.run("UPDATE t SET v='released'");
+	} finally {
+		warn.mockRestore();
+		clear.mockRestore();
+		a.close();
+		b.close();
+	}
+});
+
+test.each([
+	undefined,
+	"SQLITE_ERROR",
+	"SQLITE_CONSTRAINT",
+	"DB_WORKER_BUILD_MISMATCH",
+])("non-lock code %s never retries even when the text says locked", async (code) => {
+	let attempts = 0;
+	await expect(
+		withDbRetry(
+			async () => {
+				attempts++;
+				throw Object.assign(new Error("database is locked"), { code });
+			},
+			{ retryLegacyMessages: false },
+		),
+	).rejects.toThrow("database is locked");
+	expect(attempts).toBe(1);
+});
+
+test("explicit LOCKED results have at most three complete attempts", async () => {
+	let attempts = 0;
+	await expect(
+		withDbRetry(
+			async () => {
+				attempts++;
+				throw Object.assign(new Error("locked"), { code: "SQLITE_LOCKED_SHAREDCACHE" });
+			},
+			{ retryLegacyMessages: false },
+		),
+	).rejects.toThrow("locked");
+	expect(attempts).toBe(3);
 });
