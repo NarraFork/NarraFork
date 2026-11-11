@@ -1005,8 +1005,10 @@ export class OutlineView implements CmdHost, ClientView {
 	 */
 	foldAct(action: FoldAction): boolean {
 		if (this.destroyed || !this.foldTree) return false;
-		if (!applyFoldAction(this.foldTree, this.foldView, action)) return false;
-		// The reader's own folding is not held open against them.
+		// The reader's own folding is not held open against them: a block kept open for the
+		// cursor closes when they close it (nothing was stored for it, so nothing changes there).
+		const held = this.caretPins.length > 0;
+		if (!applyFoldAction(this.foldTree, this.foldView, action) && !held) return false;
 		this.caretPins = [];
 		this.folding = true;
 		try {
@@ -1081,37 +1083,28 @@ export class OutlineView implements CmdHost, ClientView {
 
 	/**
 	 * Blocks a change would delete although the reader cannot see them: hidden under a closed
-	 * block that itself stays, and whose own line the selection does not cover whole. (A closed
-	 * block deleted as a whole takes what it holds with it, as it always did.)
+	 * block that itself stays. (A closed block that goes as a whole — block selection, or a
+	 * selection from the start of its line on — takes what it holds with it, as it always did.)
 	 */
 	private hiddenLoss(before: EditorState, after: PMNode): string[] {
-		const { from, to } = before.selection;
 		const kept = new Set<string>();
 		after.descendants((n) => {
 			if (n.type === N.block) kept.add(n.attrs.id);
 			return n.type === N.block || n.type === N.children;
 		});
 		const lost: string[] = [];
-		const walk = (node: PMNode, pos: number, closed: { id: string; whole: boolean } | null) => {
+		// `closed`: the outermost closed block above (the row the reader sees).
+		const walk = (node: PMNode, closed: string | null) => {
 			const id = node.attrs.id as string;
-			if (closed && !kept.has(id) && kept.has(closed.id) && !closed.whole) lost.push(id);
+			if (closed !== null && !kept.has(id) && kept.has(closed)) lost.push(id);
 			if (node.childCount < 2) return;
-			const body = node.child(0);
-			const under =
-				closed ??
-				(node.attrs.collapsed && pos > 0
-					? { id, whole: from <= pos + 2 && to >= pos + 2 + body.content.size }
-					: null);
-			let p = pos + 1 + body.nodeSize + 1;
+			const under = closed ?? (node.attrs.collapsed ? id : null);
 			node.child(1).forEach((kid) => {
-				walk(kid, p, under);
-				p += kid.nodeSize;
+				walk(kid, under);
 			});
 		};
-		let pos = 0;
 		before.doc.forEach((n) => {
-			walk(n, pos, null);
-			pos += n.nodeSize;
+			walk(n, null);
 		});
 		return lost;
 	}

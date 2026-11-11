@@ -1671,6 +1671,26 @@ test("a task the reader ticks done with the cursor inside closes when the cursor
 	expect((await rowOf(a, sub))?.state).toBe("open");
 	expect((await head(a))?.blockId).toBe(subnote);
 	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	// Kept open for the cursor, not against the reader: their own click on its arrow closes it,
+	// and the cursor goes to the task's line.
+	await click(a, sub, "arrow");
+	await eventually(
+		() => rowOf(a, sub),
+		(row) => row?.state === "closed",
+		"the reader closes it",
+	);
+	expect((await head(a))?.blockId).toBe(sub);
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	await caret(a, subnote);
+	expect((await foldState(a)).expanded).toEqual([sub]);
+	await click(a, sub, "arrow");
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	await a.call((f, id) => f.setTask(id as never, "/"), sub);
+	await caret(a, subnote);
+	await a.call((f, id) => f.setTask(id as never, "x"), sub);
+	await settle(a);
+	expect((await rowOf(a, sub))?.state).toBe("open");
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
 	// Moving inside it keeps it open; leaving closes it.
 	await caret(a, sub);
 	expect((await rowOf(a, sub))?.state).toBe("closed");
@@ -1712,6 +1732,9 @@ test("a task finished by someone else above the reader does not move what they r
 			for (let p = el.parentElement; p; p = p.parentElement) scroll += p.scrollTop;
 			return { top: Math.round(el.getBoundingClientRect().top), scroll: Math.round(scroll) };
 		}, reading);
+	// (After a keystroke: the browser's own scroll anchoring no longer holds the row then.)
+	await a.page.keyboard.type("x");
+	await settle(a, b);
 	const before = await where();
 	expect(before.scroll).toBeGreaterThan(100);
 	// Bob finishes three tasks above: fifteen rows become three.
