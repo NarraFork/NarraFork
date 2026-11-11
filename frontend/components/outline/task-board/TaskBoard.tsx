@@ -51,6 +51,7 @@ import {
 } from "@shared/outline-task-board";
 import {
 	IconArrowBackUp,
+	IconArrowsExchange,
 	IconChevronDown,
 	IconChevronRight,
 	IconDots,
@@ -77,6 +78,7 @@ import { useEditorPanelVisible } from "../../narrator/narrator-panel-visibility"
 import { DiffEntry } from "../OutlinePendingPanel";
 import { OutlineStatusChip, OutlineStatusIcon } from "../OutlineStatusIcon";
 import { OpenSessionForm, useOpenSessionControl } from "./OpenTaskSession";
+import { TransferSessions } from "./TransferSessions";
 
 // Task text paints with the reader's typography variables (TYPE_ROLE_STYLE).
 ensureTypographyCssVars();
@@ -617,7 +619,8 @@ function TaskRow({
 			: task.executor.kind === "session"
 				? task.executor.title
 				: null;
-	const [assigning, setAssigning] = useState(false);
+	// The popover under the menu: a username to hand to, or the sessions to hand to.
+	const [assigning, setAssigning] = useState<false | "user" | "session">(false);
 	const [username, setUsername] = useState("");
 	const canWrite = section?.canWrite ?? false;
 	const sessionSpace = section?.space.kind === "session";
@@ -634,9 +637,17 @@ function TaskRow({
 		update.mutate(
 			{ blockId: task.id, body: { baseVersionSeq: task.versionSeq, ...body } },
 			{
-				onSuccess: () => {
+				onSuccess: (result) => {
 					setAssigning(false);
 					setUsername("");
+					// 「转交并开始」: whether the session was started, and why not.
+					if (body.start && body.assign?.kind === "narrator")
+						notifications.show({
+							color: result.started ? "green" : "yellow",
+							message: result.started
+								? t("board.transfer.started")
+								: t(`board.transfer.notStarted.${result.notStarted ?? "not_started"}`),
+						});
 				},
 				onError: (error) => {
 					const conflict = error instanceof ApiError && error.status === 409;
@@ -726,11 +737,16 @@ function TaskRow({
 								{t("board.waitConfirmation")}
 							</OutlineStatusChip>
 						)}
-						{task.assignee && (
-							<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
-								@{task.assignee}
-							</Text>
-						)}
+						{/* Handed to a session by its id: the group it is under names that session. */}
+						{task.assignee &&
+							!(
+								task.executor.kind === "session" &&
+								task.assignee === `agent:${task.executor.narratorId}`
+							) && (
+								<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
+									@{task.assignee}
+								</Text>
+							)}
 						<Text size="xs" c="dimmed" ff="monospace" style={TYPE_ROLE_STYLE.code}>
 							{task.address}
 						</Text>
@@ -821,7 +837,14 @@ function TaskRow({
 						</Text>
 					)}
 				</Stack>
-				<Popover opened={assigning} onChange={setAssigning} withinPortal position="bottom-end">
+				<Popover
+					opened={assigning !== false}
+					onChange={(opened) => {
+						if (!opened) setAssigning(false);
+					}}
+					withinPortal
+					position="bottom-end"
+				>
 					<Popover.Target>
 						<div>
 							<Menu shadow="md" position="bottom-end" withinPortal>
@@ -924,11 +947,21 @@ function TaskRow({
 											)}
 											<Menu.Item
 												leftSection={<IconUserShare size={14} />}
-												onClick={() => setAssigning(true)}
+												onClick={() => setAssigning("user")}
 												data-testid="task-action-user"
 											>
 												{t("board.action.assignUser")}
 											</Menu.Item>
+											{/* A session space's task goes to others by handing it out (a later PR). */}
+											{!sessionSpace && (
+												<Menu.Item
+													leftSection={<IconArrowsExchange size={14} />}
+													onClick={() => setAssigning("session")}
+													data-testid="task-action-transfer"
+												>
+													{t("board.action.transferSession")}
+												</Menu.Item>
+											)}
 											{task.assignee && (
 												<Menu.Item
 													leftSection={<IconArrowBackUp size={14} />}
@@ -959,7 +992,16 @@ function TaskRow({
 						</div>
 					</Popover.Target>
 					<Popover.Dropdown>
-						<Group gap={4} wrap="nowrap">
+						{assigning === "session" && (
+							<TransferSessions
+								task={task}
+								pending={update.isPending}
+								onTransfer={(narratorId, start) =>
+									change({ assign: { kind: "narrator", narratorId }, ...(start ? { start } : {}) })
+								}
+							/>
+						)}
+						<Group gap={4} wrap="nowrap" display={assigning === "session" ? "none" : undefined}>
 							<TextInput
 								size="xs"
 								placeholder={t("board.action.usernamePlaceholder")}

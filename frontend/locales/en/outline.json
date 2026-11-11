@@ -616,12 +616,31 @@
 			"assignMe": "Hand to me",
 			"assignUser": "Hand to someone…",
 			"assignSession": "Hand back to the session",
+			"transferSession": "Hand to a session…",
 			"usernamePlaceholder": "Username",
 			"assign": "Hand over",
 			"open": "Open in the outline",
 			"failed": "Could not change the task",
 			"conflict": "The task changed meanwhile; the board was reloaded.",
 			"updated": "Task updated"
+		},
+		"transfer": {
+			"note": "An existing session brings its earlier context along. A new session is usually the better choice.",
+			"only": "Hand over",
+			"andStart": "Hand over and start",
+			"empty": "No session of this project can take it.",
+			"failed": "Could not list the sessions",
+			"more": "Only the first {{n}} sessions are listed.",
+			"untitled": "Untitled session",
+			"started": "Handed over; the session started on it.",
+			"notStarted": {
+				"finished": "Handed over. The task is finished already, so the session was not started.",
+				"busy": "Handed over. The session is running, so it was not started; it will read the hand-over.",
+				"plan_mode": "Handed over. The session is in plan mode, so it was not started.",
+				"continuation_off": "Handed over. The session's continuation is off, so it was not started.",
+				"continuation_mode": "Handed over. The session's continuation setting does not continue on this task, so it was not started.",
+				"not_started": "Handed over, but the session did not start."
+			}
 		},
 		"completion": {
 			"asks": "The agent marked it {{status}}: waiting for your confirmation",

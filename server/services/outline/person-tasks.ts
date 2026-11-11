@@ -30,7 +30,9 @@
  * CHANGING (the board)
  * --------------------
  * Finish, cancel or reopen a task; hand it to a person (`@human:name`, who must be able to write
- * its space) or back to the session (no assignee). A task in progress that someone else is doing
+ * its space), to a session by name (`@agent:<its id>`, 「转交给会话」, outline P2 PR 10a: a root
+ * session that could do the task, `transfer.ts`) or back to the session (no assignee). A task in
+ * progress that someone else is doing
  * is stopped in the same commit (back to to-do, which releases the claim): handing it on means
  * the previous executor no longer does it. Every change is a person's commit, based on the
  * version the board read, so a change made since is refused (409) and the board reads again.
@@ -43,11 +45,13 @@ import {
 } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
 import { readDisplayNames, readUserByUsername } from "./access-reads";
+import { sessionAssignee } from "./assignee";
 import { OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
 import { OUTLINE_PAGE_HEAD_CHARS } from "./store/read-port";
+import { isTransferSession } from "./transfer";
 import { type OutlineTaskPatch, type OutlineWriteResult, writeOutline } from "./write";
 
 export { OUTLINE_TASKS_PAGE_ALIAS };
@@ -328,8 +332,18 @@ export async function changePersonTask(args: {
 	if (args.assign) {
 		const assignee = await assigneeOf(principal, space, args.assign);
 		if (assignee !== (task.assignee ?? null)) patch.assignee = assignee;
-		// Handed on: whoever is doing it now stops (to-do releases the claim, write.ts).
-		if (task.status === "doing" && patch.status === undefined && patch.assignee !== undefined)
+		// Handed on: whoever is doing it now stops (to-do releases the claim, write.ts), unless
+		// the session it is handed to is the one doing it.
+		const kept =
+			args.assign.kind === "narrator" &&
+			task.status === "doing" &&
+			(await heldBySession(store, block.id, args.assign.narratorId));
+		if (
+			task.status === "doing" &&
+			patch.status === undefined &&
+			patch.assignee !== undefined &&
+			!kept
+		)
 			patch.status = "todo";
 	}
 	if (Object.keys(patch).length === 0) return { result: null, space };
@@ -352,13 +366,37 @@ export async function changePersonTask(args: {
 	return { result, space };
 }
 
-/** The assignee a hand-over writes: `human:name` of someone who can write the space, or none. */
+/** Whether session `narratorId` (or a subagent of it) holds the task, its lease running. */
+async function heldBySession(
+	store: OutlineStore,
+	taskId: string,
+	narratorId: string,
+): Promise<boolean> {
+	const [claim] = await store.getTaskClaims([taskId]);
+	const holder = claim?.holderNarratorId ?? null;
+	if (!claim || holder === null) return false;
+	if (claim.expiresAt !== null && claim.expiresAt <= new Date().toISOString()) return false;
+	return ((await store.getNarratorRoots([holder])).get(holder)?.root ?? holder) === narratorId;
+}
+
+/**
+ * The assignee a hand-over writes: `human:name` of someone who can write the space,
+ * `agent:<id>` of a session that could do the task, or none.
+ */
 async function assigneeOf(
 	principal: OutlinePrincipal,
 	space: OutlineSpaceRow,
 	target: OutlineBoardAssignTarget,
 ): Promise<string | null> {
 	if (target.kind === "session") return null;
+	if (target.kind === "narrator") {
+		// A session the board's picker would list (`transfer.ts`: a root session of the task's
+		// project that keeps its tasks in the outline, is not archived, that the person may read
+		// and that could do the task there). Any other is the same answer as an unknown one.
+		if (!(await isTransferSession(principal, space, target.narratorId)))
+			throw new ValidationError("This session cannot work on this task");
+		return sessionAssignee(target.narratorId);
+	}
 	if (target.kind === "me") {
 		const name = (await readDisplayNames({ userIds: [principal.userId] })).users.get(
 			principal.userId,
