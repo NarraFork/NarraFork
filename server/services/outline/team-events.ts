@@ -25,7 +25,13 @@
  * A session that a commit concerns in several ways gets one row, source {@link OUTLINE_TEAM_SOURCE},
  * id derived from (space, seq, session). A commit that concerns it only by ending tasks it created
  * is told exactly as PR 9b told it (source `outline_task_finished`, 9b's id and text), so rows
- * written before this module existed are still found, and never told twice.
+ * written before this module existed are still found, and never told twice. Which of the two a
+ * commit is for a session depends on what is read when it is read (who does a dependent task
+ * now), so a delivery looks for a row under either id and writes none when it finds one
+ * (`alsoIds`): one row per commit and session, whatever the commit reads as later. A dependence
+ * written after the commit is not read into it (a task that came to depend on an ended task
+ * later was never waiting for that commit). A session is told of a task only in a space it may
+ * read.
  *
  * NO MAILBOX; DIRECT WRITE, AND A RE-PUSH AFTER A START
  * ---------------------------------------------------
@@ -38,6 +44,7 @@
  * {@link OUTLINE_TEAM_EVENT_LIMITS.repushCommitsPerSpace} commits of each. The ids are derived,
  * so a row written before is found and not written again; when it is still the last row of its
  * session (nothing happened there since), the wake the stop may have cut off is tried once more.
+ * Not on PostgreSQL: its rows have no chosen id to find them by, so nothing is pushed again.
  *
  * WHEN A ROW WAKES ITS SESSION
  * ----------------------------
@@ -48,7 +55,9 @@
  *   - the session is idle and not in plan mode (the session layer checks again), and its last run
  *     was not stopped by its person or by an error (they speak next);
  *   - its wake limit has room (`team-wake.ts`: 6 a minute); else the row is written and one wake
- *     follows when there is room, if the row is still unread then.
+ *     follows when there is room, if the row is still unread then;
+ *   - the task is not one the session itself handed away in the last ten minutes (two sessions
+ *     passing a task to and fro record it, and do not keep each other running).
  * A running session is not woken: it reads the row at its next tool boundary. On PostgreSQL the
  * row is written and nothing is woken (the session runtime does not run there; as PR 7 and 9b).
  *
