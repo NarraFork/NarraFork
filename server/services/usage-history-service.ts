@@ -71,14 +71,21 @@ export interface UsageHistoryFilters {
 }
 
 /**
- * 命中率 = 缓存读取 / 总输入（读取 + 写入 + 未缓存输入），**全部请求**参与。
+ * 命中率 = 缓存读取 / 总输入（读取 + 写入 + 未缓存输入）。
  *
- * 不排除"写了缓存却一条没读到"的请求（新会话首轮、缓存过期重建）：那正是未命中，
- * 排除它们只会把比率抬高，让数字和页面上并列的读/写/输入对不上。
+ * 参与条件是"这条请求有任何缓存活动"（读到过或写过），而不是"读到过缓存"：
+ *   - `cached = 0` 但写过缓存的请求是真实未命中（新会话首轮、缓存过期重建），必须进分母；
+ *   - 读写全为 0 的是根本不上报缓存的 provider，算进来只会把比率压低。
+ * 这样命中率与页面上并列的读/写/输入能对上（都只覆盖有缓存活动的那批请求）。
+ *
+ * 注意不能靠 `IS NULL` 判断"未上报"：`cached_input_tokens` 在库里是 DEFAULT 0 NOT NULL
+ * （见 drizzle/0180），未上报与上报 0 无法区分。
  */
+const reportsCacheUsage = sql`(coalesce(${apiRequests.cachedInputTokens}, 0) > 0 or coalesce(${apiRequests.cacheCreationInputTokens}, 0) > 0)`;
+
 const cacheHitRateSelection = {
-	cacheHitRateReadTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`,
-	cacheHitRateInputTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens} + coalesce(${apiRequests.cacheCreationInputTokens}, 0) + coalesce(${apiRequests.inputTokens}, 0)), 0)`,
+	cacheHitRateReadTokens: sql<number>`coalesce(sum(case when ${reportsCacheUsage} then coalesce(${apiRequests.cachedInputTokens}, 0) else 0 end), 0)`,
+	cacheHitRateInputTokens: sql<number>`coalesce(sum(case when ${reportsCacheUsage} then coalesce(${apiRequests.cachedInputTokens}, 0) + coalesce(${apiRequests.cacheCreationInputTokens}, 0) + coalesce(${apiRequests.inputTokens}, 0) else 0 end), 0)`,
 };
 
 interface CacheHitRateTotals {
