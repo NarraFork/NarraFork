@@ -243,6 +243,6 @@ export const TASK_BRIEF_TEXT = {
 		"- Do this task and its steps, and nothing beyond them. As you go, record what you find under the task with OutlineEdit: the conclusion first, the evidence under it, the details one level further down.",
 		"- When it is done: tick the task `[x]` and leave one result line under it (the conclusion first).",
 		"- When a person must decide something: put the question with Ask and leave the task in progress. It stays yours, and this session is woken when the answer comes.",
-		"- When you cannot finish it: write a handoff note under the task (what is done, what comes next, which branch and commit hold the code), then end your turn. Do not set the task back to `[ ]` yourself: it goes back to do, and the next session opened for it continues from your note.",
+		"- When you cannot finish it: write a handoff note under the task saying where you stopped (what is done, what comes next, which branch and commit hold the code), then end your turn. Do not set the task back to `[ ]` yourself: whoever continues the task picks it up from your note.",
 	],
 } as const;

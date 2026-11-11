@@ -419,7 +419,13 @@ test("the button: on startable project tasks, for those who may open sessions; a
 
 test("the options form: model, working directory and a note, which reaches the session's brief", async () => {
 	const p = await project();
-	sessionRuntime();
+	const asked: Array<{ model?: string }> = [];
+	sessionRuntime({
+		createSession: async (input) => {
+			asked.push({ model: input.model });
+			return await createSession(input);
+		},
+	});
 	const { page, errors } = await openPage(alice);
 	try {
 		await call(page, (f, id: string) => f.openProject(id), p.id);
@@ -434,6 +440,24 @@ test("the options form: model, working directory and a note, which reaches the s
 			"at least one model request",
 		);
 		await call(page, (f) => f.type("[data-testid=task-open-session-note]", "Keep the public API."));
+		// Picking a model keeps the form open and what was typed in it.
+		await page.click("[data-testid=task-open-session-model]");
+		const option = '[data-testid=task-open-session-form] [role=option][value="__summary__"]';
+		await page.waitForSelector(option, { visible: true });
+		await page.click(option);
+		await page.waitForFunction(
+			() =>
+				document.querySelector<HTMLInputElement>("[data-testid=task-open-session-model]")?.value ===
+				"__summary__",
+			{ timeout: 5_000, polling: 50 },
+		);
+		expect(await call(page, (f) => f.count("[data-testid=task-open-session-form]"))).toBe(1);
+		expect(
+			await page.$eval(
+				"[data-testid=task-open-session-note]",
+				(el) => (el as HTMLTextAreaElement).value,
+			),
+		).toBe("Keep the public API.");
 		await shot(page, "04-options-form-en-light");
 		await page.click("[data-testid=task-open-session-submit]");
 		await until(
@@ -446,6 +470,7 @@ test("the options form: model, working directory and a note, which reaches the s
 		expect(session?.status).not.toBe("archived");
 		const brief = await firstRow(session?.id as string);
 		expect(brief.text).toContain("## Further instructions\nKeep the public API.");
+		expect(asked).toEqual([{ model: "__summary__" }]);
 		// The same from the row's menu.
 		await page.click(`${ROW("For Pat")} [data-testid=task-row-menu]`);
 		await page.waitForSelector("[data-testid=task-action-open]", { visible: true });

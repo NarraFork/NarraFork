@@ -107,6 +107,8 @@ const opened: string[] = [];
 const defaults = {
 	mode: settings.agent.autoContinuationMode,
 	model: settings.agent.defaultModel,
+	planMode: settings.agent.defaultStartInPlanMode,
+	visibility: settings.agent.defaultNarratorVisibility,
 };
 
 afterAll(async () => {
@@ -136,6 +138,8 @@ afterEach(async () => {
 	}
 	settings.agent.autoContinuationMode = defaults.mode;
 	settings.agent.defaultModel = defaults.model;
+	settings.agent.defaultStartInPlanMode = defaults.planMode;
+	settings.agent.defaultNarratorVisibility = defaults.visibility;
 });
 
 async function person(name: string): Promise<string> {
@@ -447,6 +451,88 @@ describe("a click opens a session that does the task", () => {
 		expect(await stateOf(task.id)).toMatchObject({ holder: again.body.narratorId, epoch: 2 });
 		await idle(again.body.narratorId, 2);
 		expect((await history(again.body.narratorId))[0]?.text).toContain("claim generation 2");
+	});
+});
+
+describe("whatever the instance's defaults for new sessions", () => {
+	test("sessions start in plan mode by default: the task session does not, and it runs", async () => {
+		settings.agent.defaultStartInPlanMode = true;
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const { status, body } = await open(alice, task);
+		expect(status).toBe(201);
+		await idle(body.narratorId, 1);
+		const session = await db.query.narrators.findFirst({
+			where: eq(narrators.id, body.narratorId),
+		});
+		expect(JSON.stringify(session?.traits ?? [])).not.toContain("plan");
+		expect(requests).toHaveLength(1);
+		expect(await stateOf(task.id)).toMatchObject({ status: "doing", holder: body.narratorId });
+	});
+
+	test("sessions are public by default, the project is private: the task session is the project's, and reads its space", async () => {
+		settings.agent.defaultNarratorVisibility = "public";
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice, "A confidential task\nWith a confidential body");
+		const { status, body } = await open(alice, task);
+		expect(status).toBe(201);
+		await idle(body.narratorId, 1);
+		const session = await db.query.narrators.findFirst({
+			where: eq(narrators.id, body.narratorId),
+		});
+		// Not public: only the project's readers read the session, its title and its brief.
+		expect(session?.visibility).toBe("project");
+		const { canSessionReadSpace } = await import("../outline/session-scope");
+		expect(await canSessionReadSpace(body.narratorId, p.space, { executingUserId: null })).toBe(
+			true,
+		);
+		expect((await history(body.narratorId))[0]?.text).toContain("With a confidential body");
+		// With the instance default private, the session is the person's alone.
+		settings.agent.defaultNarratorVisibility = "private";
+		const second = await taskIn(p.space.id, alice, "Another task");
+		const again = await open(alice, second);
+		expect(again.status).toBe(201);
+		await idle(again.body.narratorId, 2);
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, again.body.narratorId) }))
+				?.visibility,
+		).toBe("private");
+	});
+
+	test("a session that cannot read the task's space is given nothing: no claim, no brief, archived", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice, "A confidential task\nWith a confidential body");
+		let created = "";
+		// However it came to be public (a creation path that ignores the rule above).
+		setOutlineTaskSessionRuntime({
+			async createSession(input) {
+				created = (
+					await narratorService.create({
+						contextProjectId: input.projectId,
+						cwd: input.cwd,
+						ownerUserId: input.ownerUserId,
+						title: "x",
+						taskBackend: "outline",
+						visibility: "public",
+					})
+				).id;
+				return created;
+			},
+		});
+		const { status, body } = await open(alice, task);
+		expect([status, body.details?.reason]).toEqual([409, "unreadable"]);
+		expect(await stateOf(task.id)).toMatchObject({
+			status: "todo",
+			holder: null,
+			epoch: 0,
+			versionSeq: task.versionSeq,
+		});
+		expect(await history(created)).toEqual([]);
+		expect(await sessionsOf(p.id)).toEqual([expect.objectContaining({ status: "archived" })]);
+		expect(requests).toHaveLength(0);
 	});
 });
 
@@ -946,6 +1032,103 @@ describe("the session keeps working on the task it was opened for", () => {
 		});
 		// The turn names the step it was started on.
 		expect((await history(body.narratorId))[1]?.text).toContain(`${p.space.key}/${s1?.sid}`);
+	});
+});
+
+describe("a step under a task someone is doing", () => {
+	test("is theirs: no button on the board, and the route refuses it naming them", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const other = await narratorService.create({
+			contextProjectId: p.id,
+			cwd: p.dir,
+			ownerUserId: alice,
+			title: "The session on the parent",
+			taskBackend: "outline",
+		});
+		const page = await write(p.space.id, alice, [
+			{ op: "insert", tempId: "p", parent: null, content: "Tasks" },
+			{
+				op: "insert",
+				tempId: "t",
+				parent: { tempId: "p" },
+				content: "Parent",
+				task: { status: "todo" },
+			},
+			{ op: "insert", parent: { tempId: "t" }, content: "Its step", task: { status: "todo" } },
+			{ op: "insert", parent: { tempId: "p" }, content: "Free", task: { status: "todo" } },
+		]);
+		const [, parent, step] = page.results as Array<{ blockId: string }>;
+		const offered = async () =>
+			(await readProjectTaskBoard({ userId: alice, isAdmin: false }, p.id)).sections[0]?.open
+				.filter((t) => t.openSession)
+				.map((t) => t.title)
+				.sort();
+		expect(await offered()).toEqual(["Free", "Its step", "Parent"]);
+		await writeOutline({
+			spaceId: p.space.id,
+			ops: [{ op: "setTask", block: { id: parent?.blockId as string }, task: { status: "doing" } }],
+			actor: { kind: "agent", id: other.id },
+			narratorId: other.id,
+			responsibleUserId: alice,
+		});
+		expect(await offered()).toEqual(["Free"]);
+		const block = await outlineStore.getBlock(step?.blockId as string);
+		const { status, body } = await open(alice, {
+			id: step?.blockId as string,
+			versionSeq: block?.versionSeq as number,
+		});
+		expect([status, body.details?.reason]).toEqual([409, "claimed"]);
+		expect(body.details?.holder).toMatchObject({
+			kind: "session",
+			name: "The session on the parent",
+		});
+		expect(await stateOf(step?.blockId as string)).toMatchObject({ status: "todo", holder: null });
+		expect(await sessionsOf(p.id)).toHaveLength(1);
+	});
+
+	test("a project task a session holds but was not named: its to-do steps are not started for it", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const plain = await narratorService.create({
+			contextProjectId: p.id,
+			cwd: p.dir,
+			ownerUserId: alice,
+			title: "Holder",
+			taskBackend: "outline",
+			startInPlanMode: false,
+		});
+		opened.push(plain.id);
+		const page = await write(p.space.id, alice, [
+			{ op: "insert", tempId: "p", parent: null, content: "Tasks" },
+			{
+				op: "insert",
+				tempId: "t",
+				parent: { tempId: "p" },
+				content: "Held",
+				task: { status: "todo" },
+			},
+			{ op: "insert", parent: { tempId: "t" }, content: "Held step", task: { status: "todo" } },
+		]);
+		const [, held, step] = page.results as Array<{ blockId: string }>;
+		await writeOutline({
+			spaceId: p.space.id,
+			ops: [{ op: "setTask", block: { id: held?.blockId as string }, task: { status: "doing" } }],
+			actor: { kind: "agent", id: plain.id },
+			narratorId: plain.id,
+			responsibleUserId: alice,
+		});
+		// A start that names no task (as a continuation's promotion would).
+		expect((await startSpecContinuationIfPossible(plain.id, "en", false, alice)).started).toBe(
+			true,
+		);
+		await idle(plain.id, 1);
+		expect(requests).toHaveLength(1);
+		expect(await stateOf(step?.blockId as string)).toMatchObject({ status: "todo", holder: null });
+		expect(await stateOf(held?.blockId as string)).toMatchObject({
+			status: "doing",
+			holder: plain.id,
+		});
 	});
 });
 

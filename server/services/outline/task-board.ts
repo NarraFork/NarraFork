@@ -409,6 +409,19 @@ async function describe(
 	]);
 	const titles = new Map(heads.map((h) => [h.id, blockTitle(h.contentHead)]));
 	const claims = new Map<string, OutlineTaskClaimRow>(claimRows.map((c) => [c.taskBlockId, c]));
+	// For "open a new session": the claims of tasks in progress above the tasks listed that are
+	// not listed themselves (a step under a task someone is doing is theirs). One keyed read.
+	if (options.open && ctx.openSessionSpaces) {
+		const above = [...known.values()].filter(
+			(m) =>
+				!claims.has(m.id) &&
+				ctx.openSessionSpaces?.has(m.spaceId) &&
+				m.taskJson?.status === "doing",
+		);
+		if (above.length > 0)
+			for (const claim of await store.getTaskClaims(above.map((m) => m.id)))
+				claims.set(claim.taskBlockId, claim);
+	}
 	const newlyDone = options.open
 		? new Set<string>()
 		: await newlyDoneFor(ctx, ordered, claims, nowDate);
@@ -486,6 +499,8 @@ async function describe(
 		let above: OutlineBlockMeta | undefined = meta;
 		for (let depth = 0; above && depth <= OUTLINE_LIMITS.maxDepth && !planning; depth++) {
 			planning = isPlanningRoot(above.taskJson);
+			// Someone is doing a task above it: its steps are theirs.
+			if (above !== meta && above.taskJson && isClaimLive(claims.get(above.id), now)) return false;
 			above = above.parentId === null ? undefined : known.get(above.parentId);
 		}
 		return outlineTaskStartBlocker({ task, planning, wait }) === null;

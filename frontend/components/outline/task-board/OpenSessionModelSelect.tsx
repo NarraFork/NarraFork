@@ -31,7 +31,9 @@ export default function OpenSessionModelSelect({
 			value={value || FOLLOW_DEFAULT_MODEL}
 			onChange={(next) => onChange(!next || next === FOLLOW_DEFAULT_MODEL ? "" : next)}
 			maxDropdownHeight={240}
-			comboboxProps={{ withinPortal: true }}
+			// Inside the form's popover, not in a portal of its own: a click on an option would
+			// otherwise count as a click outside the popover and close the form with what was typed.
+			comboboxProps={{ withinPortal: false }}
 			data-testid="task-open-session-model"
 		/>
 	);

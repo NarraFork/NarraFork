@@ -118,7 +118,9 @@ describe("the opening brief", () => {
 		expect(brief).toContain("put the question with Ask and leave the task in progress");
 		expect(brief).toContain("write a handoff note under the task");
 		expect(brief).toContain("Do not set the task back to `[ ]` yourself");
-		expect(brief.endsWith("continues from your note.")).toBe(true);
+		// True before and after a session's unfinished task is released at once (10c-2).
+		expect(brief).not.toContain("goes back to do");
+		expect(brief.endsWith("whoever continues the task picks it up from your note.")).toBe(true);
 	});
 
 	test("the same input renders the same bytes, and nothing in it tells the time", () => {

@@ -239,6 +239,7 @@ export type OutlineBoardOpenSessionRefusal =
 	| "no_directory"
 	| "in_progress"
 	| "claimed"
+	| "unreadable"
 	| "changed"
 	| "start_failed";
 

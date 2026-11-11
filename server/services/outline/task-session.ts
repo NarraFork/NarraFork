@@ -137,6 +137,8 @@ export const OUTLINE_TASK_BRIEF_LIMITS = {
 	/** Pages of the project space the map lists, and first lines of each. */
 	pages: 20,
 	pageLines: 5,
+	/** Pages read (their heads only) to count those the map does not list. */
+	pagesCounted: 200,
 	/** Structure rows read for the map's pages in all. */
 	pageBlocks: 2000,
 	/** Characters of a line of the map. */
@@ -162,7 +164,9 @@ export const OUTLINE_TASK_SESSION_LIMITS = {
  * PostgreSQL), `not_project_task`, `no_directory` (the project has no working directory, or the
  * one given is not a directory), `in_progress` (in progress already: someone was doing it until
  * their lease ran out), `claimed` (someone holds it: `holder` says who), `changed` (since the
- * board read it), `start_failed` (the session could not be started; the claim was given back).
+ * board read it), `unreadable` (the session created could not read the task's space: it was
+ * archived before anything was claimed or written), `start_failed` (the session could not be
+ * started; the claim was given back).
  */
 export type OutlineTaskSessionRefusal = OutlineBoardOpenSessionRefusal;
 // The shared conditions are all refusals (a new one must be told to the client too).
@@ -189,6 +193,7 @@ const REFUSAL_TEXT: Record<OutlineTaskSessionRefusal, string> = {
 	no_directory: "The project has no working directory to open a session in",
 	in_progress: "The task is in progress already",
 	claimed: "Someone is doing the task already",
+	unreadable: "The new session could not read the task's space, so it was not given the task",
 	changed: "The task changed since it was read",
 	start_failed: "The session could not be started; the task is back to do",
 };
@@ -254,7 +259,7 @@ const realRuntime: OutlineTaskSessionRuntime = {
 	async createSession(input) {
 		const [
 			{ narratorService },
-			{ resolveNarratorAudiences },
+			{ normalizeDefaultNarratorVisibility, resolveNarratorAudiences },
 			{ settings },
 			{ normalizeAutoModelValueForSave },
 		] = await Promise.all([
@@ -263,9 +268,15 @@ const realRuntime: OutlineTaskSessionRuntime = {
 			import("@server/lib/settings"),
 			import("@server/lib/settings/provider"),
 		]);
-		// The defaults of a session created on the project's page (`routes/narrators.ts`).
+		// The defaults of a session created on the project's page (`routes/narrators.ts`), except
+		// that a task session is never public by default: a public session cannot read a private
+		// project's space, and its brief and title are the task's content. The narrowest audience
+		// whose readers all read the project space: the owner alone when the instance default is
+		// private, the project's readers otherwise.
 		const audiences = resolveNarratorAudiences(
-			undefined,
+			normalizeDefaultNarratorVisibility(settings.agent.defaultNarratorVisibility) === "private"
+				? "private"
+				: "project",
 			undefined,
 			input.projectId,
 			settings.agent.defaultNarratorVisibility,
@@ -279,6 +290,8 @@ const realRuntime: OutlineTaskSessionRuntime = {
 			ownerUserId: input.ownerUserId,
 			title: input.title,
 			taskBackend: "outline",
+			// Whatever the instance default: a session in plan mode would not start on the task.
+			startInPlanMode: false,
 		});
 		return narrator.id;
 	},
@@ -312,7 +325,8 @@ const realRuntime: OutlineTaskSessionRuntime = {
 	},
 	async archive(narratorId) {
 		const { interruptAndArchiveSubagent } = await import("../subagent-lifecycle");
-		await interruptAndArchiveSubagent(narratorId);
+		const result = await interruptAndArchiveSubagent(narratorId);
+		if (!result.ok) throw new Error(result.error ?? "the session was not archived");
 	},
 };
 
@@ -558,6 +572,8 @@ export async function readTaskBrief(args: {
 	const { block, space, scope } = args;
 	const store = args.store ?? outlineStore;
 	const limits = OUTLINE_TASK_BRIEF_LIMITS;
+	// Nothing of a space the session may not read is ever put into its history.
+	if (!(await scope.canRead(space))) return null;
 	const subtree = await readSubtree(block.id, { store });
 	if (!subtree) return null;
 	const found = { targets: [] as string[] };
@@ -631,9 +647,7 @@ export async function readTaskBrief(args: {
 	}
 
 	// The map: the project space's pages (the task's own page is process, not facts).
-	const listed = (await scope.canRead(space))
-		? await store.listSpacePages(space.id, { limit: limits.pages + 2 })
-		: [];
+	const listed = await store.listSpacePages(space.id, { limit: limits.pagesCounted });
 	const candidates = listed.filter((page) => page.id !== block.pageId && !page.isTask);
 	const mapped = candidates.slice(0, limits.pages);
 	const lines = new Map<string, string[]>();
@@ -768,7 +782,8 @@ function isRefusedClaim(error: unknown): boolean {
 
 /**
  * Whether a session can be opened for the task now, as far as the task itself says: the checks
- * of step 2 that need no person. Null when it can.
+ * of step 2 that need no person. Null when it can. `claimLive`: someone holds the task, or a
+ * task above it (its steps are then theirs).
  */
 export async function taskSessionBlocker(
 	block: Pick<OutlineBlockRow, "id" | "spaceId" | "taskJson">,
@@ -856,19 +871,28 @@ async function openOne(
 
 	const subtree = await readSubtree(taskId, { store });
 	if (!subtree) throw new NotFoundError("Outline task", taskId);
+	// A task above it that someone is doing: its steps are theirs (nearest first).
+	const above = subtree.path.filter((node) => node.task !== null).reverse();
+	const aboveClaims =
+		above.length > 0
+			? new Map((await store.getTaskClaims(above.map((n) => n.id))).map((c) => [c.taskBlockId, c]))
+			: new Map();
+	const heldAbove =
+		above.map((node) => aboveClaims.get(node.id)).find((c) => c && isClaimLive(c, now)) ?? null;
+	const blocking = live ? claim : heldAbove;
 	const refusal = await taskSessionBlocker(
 		block,
 		{
 			planning: [subtree.root, ...subtree.path].some((node) => isPlanningRoot(node.task)),
-			claimLive: live,
+			claimLive: live || heldAbove !== null,
 		},
 		{ store },
 	);
 	if (refusal) {
 		const holder =
-			refusal === "claimed" && claim
+			refusal === "claimed" && blocking
 				? await holderFor(
-						{ narratorId: claim.holderNarratorId, userId: claim.holderUserId },
+						{ narratorId: blocking.holderNarratorId, userId: blocking.holderUserId },
 						narratorVisibility(principal),
 						store,
 					)
@@ -890,6 +914,13 @@ async function openOne(
 		title,
 	});
 	const address = `${space.key}/${block.sid}`;
+	// The session's own read scope, with no person behind it (see the module header). A session
+	// that cannot read the task's space is given nothing: no claim, no brief.
+	const scope = await OutlineAgentScope.open({ narratorId, userId: null }).catch(() => null);
+	if (!scope || !(await scope.canRead(space).catch(() => false))) {
+		await archiveQuietly(run, narratorId);
+		throw new OutlineTaskSessionError("unreadable");
+	}
 
 	// ── 4. The claim. ──
 	let claimedSeq: number;
@@ -942,8 +973,6 @@ async function openOne(
 	// ── 5 and 6. The brief, then the first turn; a failure gives the claim back. ──
 	try {
 		const claimed = (await store.getBlock(taskId)) ?? block;
-		// The session's own read scope, with no person behind it (see the module header).
-		const scope = await OutlineAgentScope.open({ narratorId, userId: null });
 		const input = await readTaskBrief({ block: claimed, space, scope, epoch, store });
 		if (!input) throw new Error("the task is gone");
 		const brief = renderTaskBrief({ ...input, prompt: args.options?.note ?? null });
