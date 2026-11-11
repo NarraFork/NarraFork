@@ -249,10 +249,12 @@ describe("outlineTaskStartBlocker", () => {
 		...over,
 	});
 	test("the conditions, in the order they are told", () => {
-		const todo = { status: "todo" as const };
+		const todo = { status: "todo" as const, assignee: null };
 		expect(outlineTaskStartBlocker({ task: todo, planning: false, wait: wait() })).toBeNull();
 		expect(outlineTaskStartBlocker({ task: todo, planning: false })).toBeNull();
-		expect(outlineTaskStartBlocker({ task: { status: "doing" }, planning: false })).toBeNull();
+		expect(
+			outlineTaskStartBlocker({ task: { ...todo, status: "doing" }, planning: false }),
+		).toBeNull();
 		const all = {
 			planning: true,
 			wait: wait({ prerequisites: ["a"], people: true, confirmation: true }),

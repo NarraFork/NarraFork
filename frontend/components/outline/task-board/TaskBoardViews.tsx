@@ -36,9 +36,12 @@ export function SessionTaskBoard({
 export function ProjectTaskBoard({
 	projectId,
 	onOpenTask,
+	onOpenSession,
 }: {
 	projectId: string;
 	onOpenTask?: (task: OutlineBoardTask) => void;
+	/** Open the session doing a task (the host navigates; a plain link otherwise). */
+	onOpenSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const board = useProjectTaskBoard(projectId);
@@ -58,6 +61,7 @@ export function ProjectTaskBoard({
 		<TaskBoard
 			pages={board.pages}
 			onOpenTask={onOpenTask}
+			onOpenSession={onOpenSession}
 			hasMoreSpaces={board.hasNextPage}
 			loadingMoreSpaces={board.isFetchingNextPage}
 			onLoadMoreSpaces={board.fetchNextPage}

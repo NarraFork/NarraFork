@@ -540,6 +540,7 @@
 		"thisSession": "本会话",
 		"untitledSession": "未命名会话",
 		"nobody": "未指派",
+		"readyToStart": "待开工",
 		"agent": "agent {{name}}",
 		"you": "{{name}}（你）",
 		"status": {
@@ -611,6 +612,39 @@
 			"awaitingYou": "{{count}} 个目标等你确认",
 			"awaitingFrom": "{{count}} 个目标等 {{names}} 确认",
 			"awaitingOthers": "{{count}} 个目标等人确认"
+		},
+		"openSession": {
+			"button": "开新会话做这个",
+			"options": "开新会话做这个…",
+			"doing": "会话「{{title}}」在做",
+			"doingUntitled": "有会话在做",
+			"hint": "在这个项目里开一个新会话，领取这个任务并开始做；开工说明由系统从大纲整理。每开一个会话，至少花一轮请求。",
+			"model": "模型",
+			"followDefault": "跟随默认",
+			"cwd": "工作目录",
+			"cwdPlaceholder": "项目目录",
+			"note": "补充说明",
+			"notePlaceholder": "可选：原样写进会话的开工说明",
+			"submit": "开会话",
+			"opened": "会话已开，开始做这个任务",
+			"failed": "没能开会话",
+			"error": {
+				"finished": "任务已经结束。",
+				"planning": "任务在一份还没批准的计划里。",
+				"prerequisites": "任务在等前置任务。",
+				"people": "任务在等它下面一个提问的回答。",
+				"confirmation": "任务在等一处改动的确认。",
+				"assigned_to_person": "任务已指派给人。",
+				"unavailable": "这个部署上不能为任务开会话。",
+				"not_project_task": "只有项目空间里的任务能开新会话来做。",
+				"no_directory": "项目没有工作目录（或给的目录不存在）。请在「开新会话做这个…」里选一个。",
+				"in_progress": "任务已经在进行中。",
+				"claimed": "已经有人在做这个任务。",
+				"claimedBy": "{{name}} 已经在做这个任务。",
+				"changed": "任务刚被改过，看板已重新加载。",
+				"start_failed": "会话没能启动，任务已放回待办，请再试一次。",
+				"forbidden": "你不能为这个项目的任务开会话。"
+			}
 		}
 	}
 }

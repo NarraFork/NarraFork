@@ -154,7 +154,7 @@ async function grant(
 	scopeType: "project" | "narrator",
 	scopeId: string,
 	userId: string,
-	capability: string,
+	capability: "read" | "write",
 ) {
 	await db.insert(aclGrants).values({
 		id: generateId(),

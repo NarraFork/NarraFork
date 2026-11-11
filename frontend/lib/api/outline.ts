@@ -37,6 +37,8 @@ import type {
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardOpenSessionRequest,
+	OutlineBoardOpenSessionResponse,
 	OutlineBoardSeenRequest,
 	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
@@ -229,6 +231,12 @@ export const outlineApi = {
 	updateBoardTask: (blockId: string, body: OutlineBoardTaskUpdateRequest) =>
 		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
 			method: "PATCH",
+			body: JSON.stringify(body),
+		}),
+	/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
+	openTaskSession: (blockId: string, body: OutlineBoardOpenSessionRequest) =>
+		request<OutlineBoardOpenSessionResponse>(`/outline/tasks/${enc(blockId)}/open-session`, {
+			method: "POST",
 			body: JSON.stringify(body),
 		}),
 	/**

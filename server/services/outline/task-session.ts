@@ -331,9 +331,16 @@ function runtime(): OutlineTaskSessionRuntime {
 	return runtimeSeam ? { ...realRuntime, ...runtimeSeam } : realRuntime;
 }
 
-/** Whether sessions can be opened for tasks on this deployment (the board hides the button). */
+/**
+ * Whether sessions can be opened for tasks on this deployment (the board hides the button). A
+ * store binding that cannot be resolved counts as "no": a board must not fail on it.
+ */
 export function outlineTaskSessionsAvailable(): boolean {
-	return runtime().available();
+	try {
+		return runtime().available();
+	} catch {
+		return false;
+	}
 }
 
 /** A project's working directory, for the board (null: no button). */
@@ -830,7 +837,7 @@ async function openOne(
 		(await projectUsersWith(project, [principal.userId], "write")).has(principal.userId);
 	if (!mayCreate || !(await canWriteSpace(principal, space)))
 		throw new ForbiddenError("You cannot open a session for this task");
-	if (!run.available()) throw new OutlineTaskSessionError("unavailable");
+	if (!outlineTaskSessionsAvailable()) throw new OutlineTaskSessionError("unavailable");
 
 	const now = (args.now?.() ?? new Date()).toISOString();
 	const claim = (await store.getTaskClaims([taskId]))[0] ?? null;
