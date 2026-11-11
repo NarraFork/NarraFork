@@ -251,7 +251,7 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 - 新会话不按实例默认建成公开会话（默认是 private 时归点的人自己，否则是项目可见），也不按实例默认进计划模式；建好后先确认它读得到任务所在的空间，读不到就归档、拒绝（`unreadable`），不领取也不写说明。
 - 权限：用新会话自己的读范围整理（`OutlineAgentScope`，不带人，所以不读任何人的个人空间），不用点的人的范围；它读不到的链接目标写成 `(a block this session cannot read)`，不带标题和地址。
 - 读者看到的 body 是 `prose`，标题行是说明的第一行（任务标题），其余折叠；来源标签「Opening brief / 开工说明」。
-- 交接本身不是注入（P2 PR 10c-2，`server/services/outline/handoff.ts`、`release.ts`）：会话一轮运行结束时放手团队任务，是一次系统提交（actor `outline-handoff`）在任务下写一块大纲块，不往任何会话的历史里写行，也不唤醒谁；放手的那个会话下次运行时从「当前任务」视图看到任务不在它名下了。下一个会话只通过上面那一节读到交接。同一个 PR 在大纲会话的系统提示（`getOutlineTaskSystemReminder`，属于 contract，不是注入）里加了一段话：项目空间的任务这一轮做不完时先在任务下写交接。发布时所有大纲会话的提示缓存前缀失效一次。
+- 交接本身不是注入（P2 PR 10c-2，`server/services/outline/handoff.ts`、`release.ts`）：会话一轮运行结束时放手团队任务，是一次系统提交（actor `outline-handoff`）在任务下写一块大纲块，不往任何会话的历史里写行，也不唤醒谁；放手的那个会话下次运行时从「当前任务」视图看到任务不在它名下了。下一个会话只通过上面那一节读到交接。同一个 PR 在大纲会话的系统提示（`getOutlineTaskSystemReminder`，属于 contract，不是注入）里加了一段话：项目空间的任务不得不停下、对话里又没人在等时，先在任务下留一段说明（停在哪、下一步、分支和提交），系统可能把任务交给新会话。发布时所有大纲会话的提示缓存前缀失效一次。
 - 命名上下文的注意点：每代基线渲染在系统提示里，其中 `outline.tasks` 是每个会话自己的当前任务，所以两个会话的系统提示在这一部分本来就不同；开工说明不改变这一点（`outline-task-session.e2e.test.ts` 逐字节比较了这一部分之前和之后）。
 
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）

@@ -52,6 +52,12 @@ export interface TaskView {
 
 export interface OpenTaskView extends TaskView {
 	status: OpenTaskStatus;
+	/**
+	 * Outline: the task is not of the session's own space (a team task of a project space it
+	 * holds). Such a task may be given back when the run ends (outline P2 PR 10c-2), so the
+	 * turn-end note does not name it then.
+	 */
+	elsewhere?: true;
 }
 
 export interface OpenTaskList {

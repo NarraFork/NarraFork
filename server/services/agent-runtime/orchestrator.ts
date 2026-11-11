@@ -400,7 +400,12 @@ export async function runAgentLoopUnlocked(
 	let freshInput = false;
 	// A person's message started this run or joined it (outline: such a run keeps the session's
 	// unfinished team tasks for a while; one the system started gives them back when it ends).
-	let personSpoke = text.trim() !== "" || (images?.length ?? 0) > 0 || (media?.length ?? 0) > 0;
+	// Said by the run's entry point, never read off the input (a Retry or a Continue carries no
+	// text): unset is a person. A person's queued message taken up later makes it theirs too.
+	let personSpoke = active._runInitiatedBy !== "system";
+	const runForTaskId = active._runForTaskId ?? null;
+	active._runInitiatedBy = undefined;
+	active._runForTaskId = undefined;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -3505,7 +3510,9 @@ export async function runAgentLoopUnlocked(
 				// before the drain (its reads are awaited), and written only once this run has
 				// settled terminal below, so nothing awaited sits between the drain and the
 				// arbitration. The drain or a hold continuing the run drops it.
-				const turnEndNote = await decideOutlineTurnEndNote(active);
+				const turnEndNote = await decideOutlineTurnEndNote(active, {
+					givingBackTeamTasks: !personSpoke && !runState.wasInterrupted,
+				});
 
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
 				// This closes the window where status is already idle (visible to clients /
@@ -3588,13 +3595,17 @@ export async function runAgentLoopUnlocked(
 		// started that ended by itself are given back with a handoff (not waited for).
 		void outlineLeases?.stop({
 			natural:
-				!personSpoke &&
 				!freshInput &&
 				!runState.hadError &&
 				!runState.wasInterrupted &&
 				!active.abortController.signal.aborted,
+			person: personSpoke,
 			reply: runState.finalText,
-			pendingInput: () => hasInboxKind(narratorId, ["user_input"]),
+			forTaskId: runForTaskId,
+			// What the finalizer restarts the session for, and what will wake it when it finishes.
+			pending: async () =>
+				(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
+				(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0,
 		});
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;

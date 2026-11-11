@@ -2011,6 +2011,15 @@ export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
  */
 export async function decideOutlineTurnEndNote(
 	active: ActiveNarrator,
+	options: {
+		/**
+		 * The run is the system's and ends by itself: the session's unfinished team tasks are
+		 * given back right after (outline P2 PR 10c-2, `release.ts`), so a note saying one of them
+		 * was left in progress would be false by the time it is read. Only a task of the session's
+		 * own space is named then.
+		 */
+		givingBackTeamTasks?: boolean;
+	} = {},
 ): Promise<InterruptGuardNote | null> {
 	const start = active._outlineTurnStart;
 	if (!start) return null;
@@ -2021,7 +2030,9 @@ export async function decideOutlineTurnEndNote(
 		if (!source.turnEndNote) return null;
 		const { tasks, revision } = await source.openTasks();
 		if (revision !== start.revision) return null;
-		const doing = tasks.find((task) => task.status === "doing");
+		const doing = tasks.find(
+			(task) => task.status === "doing" && !(options.givingBackTeamTasks && task.elsewhere),
+		);
 		if (!doing) return null;
 		return source.turnEndNote(doing, active.locale);
 	} catch (err) {
@@ -3368,11 +3379,25 @@ export async function runAgentLoop(
 	images?: ImageRef[],
 	{
 		recoveryStart,
+		initiatedBy,
+		forTaskId,
 		...options
 	}: Omit<
 		import("./agent-runtime/run").StartNarratorRunRequest,
 		"narratorId" | "locale" | "text" | "images" | "active" | "admission"
-	> & { recoveryStart?: RecoveryContinuationStart } = {},
+	> & {
+		recoveryStart?: RecoveryContinuationStart;
+		/**
+		 * Who starts this run (see `ActiveNarrator._runInitiatedBy`): said by every entry point,
+		 * never inferred from the input. A person: their message, Continue, Retry, an edit, a start
+		 * they asked for. The system: a wake (an injected row, a message of an agent, a background
+		 * result) and a session opened for a task. Every entry point in this module says which;
+		 * left out (a test driving the loop directly), the run counts as a person's.
+		 */
+		initiatedBy?: "person" | "system";
+		/** The outline task the run is started for (a session opened for it). */
+		forTaskId?: string;
+	} = {},
 ): Promise<{ started: boolean }> {
 	const narratorId = active.narratorId;
 	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
@@ -3380,6 +3405,15 @@ export async function runAgentLoop(
 		return { started: false };
 	}
 	const { startNarratorRun } = await import("./agent-runtime/run");
+	// Taken by the run when it starts (`runAgentLoopUnlocked`); a start that does not happen
+	// leaves nothing behind for the next run.
+	active._runInitiatedBy = initiatedBy;
+	active._runForTaskId = forTaskId;
+	const forget = () => {
+		if (active._loopRunning) return;
+		active._runInitiatedBy = undefined;
+		active._runForTaskId = undefined;
+	};
 	try {
 		const handle = await startNarratorRun({
 			narratorId,
@@ -3390,10 +3424,14 @@ export async function runAgentLoop(
 			...options,
 			...(recoveryStart ? { admission: recoveryStart } : {}),
 		});
-		if (!handle.started) return { started: false };
+		if (!handle.started) {
+			forget();
+			return { started: false };
+		}
 		await handle.completion;
 		return { started: true };
 	} catch (error) {
+		forget();
 		if (recoveryStart?.cancelled()) return { started: false };
 		if (!narratorLoopAdmissions.has(narratorId)) {
 			active._loopRunning = false;
@@ -3752,6 +3790,7 @@ async function feedMessageUnlocked(
 			prePromptBashCommand: input.prePromptBashCommand,
 			media,
 			recoveryStart,
+			initiatedBy: "person",
 		});
 		terminal.catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
@@ -5010,6 +5049,13 @@ export async function startSpecContinuationIfPossible(
 		 * `off`. Default true; a plugin's start (`addOutlineTaskForPlugin`) passes false.
 		 */
 		explicitStart?: boolean;
+		/**
+		 * Who this start is for (`runAgentLoop`): by default a person's when it is explicit (`/goal`,
+		 * the board's start for a session, a hand-over "and start"), the system's otherwise. A
+		 * session opened for a task says `system`: it exists for that task alone, and gives it back
+		 * when its run ends unfinished (outline P2 PR 10c-2).
+		 */
+		initiatedBy?: "person" | "system";
 	} = {},
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
@@ -5037,7 +5083,11 @@ export async function startSpecContinuationIfPossible(
 		if (!prompt) return { started: false };
 
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "", undefined, { principal: userId }).catch(async (err) => {
+		runAgentLoop(active, "", undefined, {
+			principal: userId,
+			initiatedBy: options.initiatedBy ?? (options.explicitStart !== false ? "person" : "system"),
+			...(options.preferTaskId ? { forTaskId: options.preferTaskId } : {}),
+		}).catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (spec continuation)", {
 				narratorId,
 				error: String(err),
@@ -5622,15 +5672,16 @@ export async function startInjectionContinuationIfPossible(
 		active._turnStartedAt = new Date().toISOString();
 
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "", undefined, { principal: executionPrincipal?.userId }).catch(
-			async (err) => {
-				logger.error("runAgentLoop unhandled error (injection)", {
-					narratorId,
-					error: String(err),
-				});
-				await reportUnsettledRunLoopError(narratorId, err);
-			},
-		);
+		runAgentLoop(active, "", undefined, {
+			principal: executionPrincipal?.userId,
+			initiatedBy: "system",
+		}).catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (injection)", {
+				narratorId,
+				error: String(err),
+			});
+			await reportUnsettledRunLoopError(narratorId, err);
+		});
 		return { started: true };
 	});
 }
@@ -5763,7 +5814,10 @@ export async function startParentInboundContinuationIfPossible(
 		active._turnStartedAt = new Date().toISOString();
 
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "", undefined, { principal: principal.userId }).catch(async (err) => {
+		runAgentLoop(active, "", undefined, {
+			principal: principal.userId,
+			initiatedBy: "system",
+		}).catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (subagent message)", {
 				narratorId,
 				error: String(err),
@@ -6005,6 +6059,7 @@ async function retryLastMessageUnlocked(
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined, {
 		principal: userId,
 		media: mediaRefs.length > 0 ? mediaRefs : undefined,
+		initiatedBy: "person",
 	}).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
 		await reportUnsettledRunLoopError(narratorId, err);
@@ -6251,6 +6306,7 @@ async function continueNarratorUnlocked(
 		...run,
 		...(userId !== undefined ? { principal: userId } : {}),
 		recoveryStart,
+		initiatedBy: "person",
 	});
 	terminal.catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
@@ -7911,7 +7967,11 @@ async function editAndRegenerateUnlocked(
 		active,
 		projectFileReferenceText(effectivePrompt, selectedReferences),
 		imageRefs.length > 0 ? imageRefs : undefined,
-		{ principal: opts?.userId, media: existingMedia.length > 0 ? existingMedia : undefined },
+		{
+			principal: opts?.userId,
+			media: existingMedia.length > 0 ? existingMedia : undefined,
+			initiatedBy: "person",
+		},
 	).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
 			narratorId,

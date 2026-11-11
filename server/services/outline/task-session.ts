@@ -330,8 +330,11 @@ const realRuntime: OutlineTaskSessionRuntime = {
 			getUserLanguage(userId),
 			getUserReplyInLanguage(userId),
 		]);
+		// The session exists for this task alone: its run is the system's, so a run that ends with
+		// the task unfinished gives it back at once (`release.ts`).
 		const { started } = await startSpecContinuationIfPossible(narratorId, locale, reply, userId, {
 			preferTaskId: taskId,
+			initiatedBy: "system",
 		});
 		return started;
 	},

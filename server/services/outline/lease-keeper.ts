@@ -20,14 +20,16 @@
  * belongs to the session, and the root's next run renews it back to the running lease. The
  * unfinished tasks of a project space that do not wait are the exception (outline P2 PR 10c-2,
  * D54; `release.ts`): given back at once with a handoff when the system started the run and it
- * ended by itself, kept for an hour otherwise. When that fails, every claim goes on the idle
+ * ended by itself with nothing pending, kept for an hour otherwise; and for an hour after a
+ * person's run ended, no run of the session gives them back (remembered here per session, in
+ * memory). When that fails, every claim goes on the idle
  * lease, as before that rule. A server that crashes stops no keeper: its leases run out after
  * `leaseMs`. An archived session (or one whose session is) holds nothing: its end lets go of
  * its claims instead.
  */
 import { logger } from "@server/lib/logger";
 import { isOutlineEnabled } from "./feature";
-import { OUTLINE_TASK_LEASE } from "./model";
+import { OUTLINE_TASK_GRACE_LEASE_MS, OUTLINE_TASK_LEASE } from "./model";
 import { settleOutlineTaskClaimsAtRunEnd } from "./release";
 import type { OutlineStore } from "./store/port";
 import { idleOutlineTaskClaims, renewOutlineTaskLeases } from "./tasks";
@@ -56,12 +58,33 @@ export interface OutlineLeaseKeeper {
 
 /** How the run ended, as the runtime knows it. */
 export interface OutlineLeaseRunEnd {
-	/** The system started the run, no person's message joined it, and it ended by itself. */
+	/** The run ended by itself: not stopped, not failed, not cut short for fresh input. */
 	natural: boolean;
-	/** The session's last reply (a handoff may quote it). */
+	/**
+	 * A person started the run or joined it (a message, Continue, Retry, a start they asked for):
+	 * its end keeps the session's unfinished team tasks for an hour, and so does the end of any
+	 * run of the session within that hour.
+	 */
+	person?: boolean;
+	/** The session's last reply (a handoff may quote it under `forTaskId`). */
 	reply?: string | null;
-	/** Whether a person's input waits to start the next run: then nothing is given back at once. */
-	pendingInput?: () => Promise<boolean>;
+	/** The task the run was started for (a session opened for it). */
+	forTaskId?: string | null;
+	/**
+	 * Whether something will start the session's next run (input of a person, a message of an
+	 * agent, a task notice waiting), or still works for it in the background (a command, a
+	 * subagent): then nothing is given back at once. Asked only when it would be.
+	 */
+	pending?: () => Promise<boolean>;
+}
+
+/** Sessions whose person-driven run ended lately, by session: when (ms). Bounded. */
+const lastPersonRunEnd = new Map<string, number>();
+const PERSON_RUN_ENDS_REMEMBERED = 2000;
+
+/** Forget whose runs were a person's (tests: what a restart does). */
+export function resetOutlinePersonRunEndsForTests(): void {
+	lastPersonRunEnd.clear();
 }
 
 /** When each session last renewed (ms), shared by its runs. */
@@ -208,6 +231,22 @@ export function keepOutlineTaskLeases(
 	};
 	async function finish(end: OutlineLeaseRunEnd | undefined): Promise<void> {
 		if (timer) clearInterval(timer);
+		const endedAt = clock();
+		const person = end?.person === true;
+		// Within the hour after a person's run, the session's runs end as that one did: a wake in
+		// between does not take the person's task away.
+		const lastPerson = lastPersonRunEnd.get(narratorId);
+		const inPersonHour =
+			lastPerson !== undefined && endedAt - lastPerson < OUTLINE_TASK_GRACE_LEASE_MS;
+		if (person) {
+			lastPersonRunEnd.delete(narratorId);
+			lastPersonRunEnd.set(narratorId, endedAt);
+			while (lastPersonRunEnd.size > PERSON_RUN_ENDS_REMEMBERED) {
+				const oldest = lastPersonRunEnd.keys().next().value;
+				if (oldest === undefined) break;
+				lastPersonRunEnd.delete(oldest);
+			}
+		} else if (lastPerson !== undefined && !inPersonHour) lastPersonRunEnd.delete(narratorId);
 		const left = (running.get(narratorId) ?? 1) - 1;
 		if (left > 0) {
 			running.set(narratorId, left);
@@ -223,13 +262,15 @@ export function keepOutlineTaskLeases(
 		if (!enabled()) return;
 		const now = new Date(clock());
 		try {
-			// Unknown counts as waiting: a task is never given back under a person's next message.
+			// Unknown counts as pending: a task is never given back under what is about to run.
 			const natural =
 				end?.natural === true &&
-				!(await (end.pendingInput ? end.pendingInput().catch(() => true) : false));
+				!person &&
+				!inPersonHour &&
+				!(await (end.pending ? end.pending().catch(() => true) : false));
 			await settleOutlineTaskClaimsAtRunEnd(
 				narratorId,
-				{ natural, reply: end?.reply ?? null },
+				{ natural, person, reply: end?.reply ?? null, forTaskId: end?.forTaskId ?? null },
 				{ now, ...store, isRunning: (id) => (running.get(id) ?? 0) > 0 },
 			);
 		} catch (error) {

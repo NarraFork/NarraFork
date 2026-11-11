@@ -13,13 +13,15 @@
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; each case makes its own project.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../../db";
 import { narrators, projects, userPreferences, users } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
+import { logger } from "../../../lib/logger";
 import { settings } from "../../../lib/settings";
 import { bindNarratorMessageRefs } from "../../narrator-refs/store";
+import { OutlineAgentScope } from "../agent-scope";
 import {
 	directoryInProject,
 	handoffBlockId,
@@ -28,14 +30,24 @@ import {
 	OUTLINE_HANDOFF_ACTOR,
 	OUTLINE_HANDOFF_LIMITS,
 } from "../handoff";
-import { keepOutlineTaskLeases, outlineLeaseKeepersOf } from "../lease-keeper";
+import {
+	keepOutlineTaskLeases,
+	outlineLeaseKeepersOf,
+	resetOutlinePersonRunEndsForTests,
+} from "../lease-keeper";
 import {
 	OUTLINE_TASK_GRACE_LEASE_MS,
 	OUTLINE_TASK_IDLE_LEASE_MS,
 	OUTLINE_TASK_LEASE,
 } from "../model";
+import { lockOutlineTask } from "../pending";
+import { outlineAsk } from "../questions";
 import { loadBodies, readSubtree } from "../read";
-import { settleOutlineTaskClaimsAtRunEnd } from "../release";
+import {
+	OUTLINE_RELEASE_LIMITS,
+	resetOutlineGraceLeasesForTests,
+	settleOutlineTaskClaimsAtRunEnd,
+} from "../release";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import type { OutlineStore } from "../store/port";
 import { sqliteOutlineStore as store } from "../store/sqlite-store";
@@ -52,6 +64,9 @@ const enabled = settings.outline.enabled;
 
 beforeEach(() => {
 	settings.outline.enabled = true;
+	// What a fresh process knows: nobody's hour, nobody's last run.
+	resetOutlineGraceLeasesForTests();
+	resetOutlinePersonRunEndsForTests();
 });
 afterEach(() => {
 	settings.outline.enabled = enabled;
@@ -193,11 +208,22 @@ async function handoffsUnder(taskId: string) {
 const settle = (
 	narratorId: string,
 	natural: boolean,
-	options: Parameters<typeof settleOutlineTaskClaimsAtRunEnd>[2] & { reply?: string } = {},
+	options: Parameters<typeof settleOutlineTaskClaimsAtRunEnd>[2] & {
+		reply?: string;
+		/** The task the run was started for. */
+		forTaskId?: string;
+		/** A person started or joined the run. */
+		person?: boolean;
+	} = {},
 ) =>
 	settleOutlineTaskClaimsAtRunEnd(
 		narratorId,
-		{ natural, reply: options.reply ?? null },
+		{
+			natural,
+			person: options.person === true,
+			reply: options.reply ?? null,
+			forTaskId: options.forTaskId ?? null,
+		},
 		{ store, now: at(60_000), ...options },
 	);
 
@@ -473,26 +499,38 @@ describe("the handoff", () => {
 		expect(handoff?.lines.join("\n")).not.toContain("I ran out of turns");
 	});
 
-	test("the session's last reply: only with no note, only for one task, and never from a private session", async () => {
+	test("the session's last reply: only under the task the run was started for, with no note, and only from a session this project's readers read", async () => {
 		const alice = await person();
 		const p = await project(alice);
+		const elsewhere = await project(alice, "/srv/elsewhere");
 		const reply =
 			"Looked at   the token store;\nthe second path is `refreshLater`. [[secret/page]]";
 		const cases = [
-			{ visibility: "project" as const, tasks: 1, shown: true },
-			{ visibility: "public" as const, tasks: 1, shown: true },
-			{ visibility: "private" as const, tasks: 1, shown: false },
-			{ visibility: "project" as const, tasks: 2, shown: false },
-		];
+			{ name: "this project's session", projectId: p.id, visibility: "project", shown: true },
+			{ name: "a public session", projectId: p.id, visibility: "public", shown: true },
+			{ name: "a private session", projectId: p.id, visibility: "private", shown: false },
+			// Its readers are the other project's people, not this space's.
+			{ name: "another project's", projectId: elsewhere.id, visibility: "project", shown: false },
+			{
+				name: "not started for it",
+				projectId: p.id,
+				visibility: "project",
+				shown: false,
+				forOther: true,
+			},
+		] as const;
 		for (const c of cases) {
-			const s = await session(alice, p.id, { visibility: c.visibility });
-			const team = await tasks(p.space.id, alice, ["First", "Second"].slice(0, c.tasks));
+			const s = await session(alice, c.projectId, { visibility: c.visibility });
+			const team = await tasks(p.space.id, alice, ["First", "Second"]);
+			const [first, second] = team.tasks as [string, string];
 			await start(p.space.id, s, team.tasks);
-			await settle(s, true, { reply });
-			const text = (await handoffsUnder(team.tasks[0] as string))
-				.flatMap((h) => [h.text, ...h.lines])
-				.join("\n");
-			expect(text.includes("token store")).toBe(c.shown);
+			await settle(s, true, { reply, forTaskId: "forOther" in c ? generateId() : first });
+			const under = async (id: string) =>
+				(await handoffsUnder(id)).flatMap((h) => [h.text, ...h.lines]).join("\n");
+			const text = await under(first);
+			expect([c.name, text.includes("token store")]).toEqual([c.name, c.shown]);
+			// Never under a task the run was not started for.
+			expect([c.name, (await under(second)).includes("token store")]).toEqual([c.name, false]);
 			if (c.shown) {
 				// Plain text, on one line: nothing of it is outline syntax.
 				expect(text).toContain(
@@ -507,11 +545,45 @@ describe("the handoff", () => {
 		const s = await session(alice, p.id);
 		const team = await tasks(p.space.id, alice, ["Talked about"]);
 		await start(p.space.id, s, team.tasks);
-		await settle(s, false, { reply });
+		await settle(s, false, { reply, person: true, forTaskId: team.tasks[0] as string });
 		await expireOutlineTaskLeases({ store, now: at(60_000 + OUTLINE_TASK_GRACE_LEASE_MS) });
 		const later = await handoffsUnder(team.tasks[0] as string);
 		expect(later).toHaveLength(1);
 		expect(later.flatMap((h) => [h.text, ...h.lines]).join("\n")).not.toContain("token store");
+	});
+
+	test("a private session is named by its id only; its title stays its own", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id, { visibility: "private", title: "Salary review notes" });
+		const team = await tasks(p.space.id, alice, ["Fix the refresh logic"]);
+		await start(p.space.id, s, team.tasks);
+		await settle(s, true);
+		const [handoff] = await handoffsUnder(team.tasks[0] as string);
+		expect(handoff?.text).toBe(
+			`Handoff (generation 1 · session \`${s}\` · 2026-11-11 08:13 UTC): no progress recorded; back to do`,
+		);
+	});
+
+	test("thirty held steps under one held task: one handoff, under the task", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(
+			p.space.id,
+			alice,
+			["Big"],
+			Array.from({ length: 30 }, (_, i) => `step ${i}`),
+		);
+		await start(p.space.id, s, [...team.tasks, ...team.steps]);
+		expect(await settle(s, true)).toEqual({ kept: 0, grace: 0, released: 31 });
+		expect(await handoffsUnder(team.tasks[0] as string)).toHaveLength(1);
+		let underSteps = 0;
+		for (const id of team.steps) {
+			underSteps += (await store.listChildren(p.space.id, id, 5)).length;
+			expect((await stateOf(id)).status).toBe("todo");
+		}
+		expect(underSteps).toBe(0);
 	});
 
 	test("a directory outside the project, or the project's own, is not written; a long reply is cut", () => {
@@ -560,14 +632,174 @@ describe("the handoff", () => {
 		const s = await session(alice, p.id);
 		const team = await tasks(p.space.id, alice, ["Named", "Someone else's name"]);
 		const [named, other] = team.tasks as [string, string];
+		// By its handle too (outline P2 PR 10a: `@agent:<handle>` names a named session).
+		const handled = await session(alice, p.id, { handle: "Fixer", handleFold: "fixer" });
+		const more = await tasks(p.space.id, alice, ["By handle"]);
+		const [byHandle] = more.tasks as [string];
 		await human(p.space.id, alice, [
 			{ op: "setTask", block: { id: named }, task: { assignee: `agent:${s}` } },
 			{ op: "setTask", block: { id: other }, task: { assignee: "agent:reviewer" } },
+			{ op: "setTask", block: { id: byHandle }, task: { assignee: "agent:Fixer" } },
 		]);
 		await start(p.space.id, s, [named, other]);
+		await start(p.space.id, handled, [byHandle]);
 		await settle(s, true);
+		await settle(handled, true);
 		expect(await stateOf(named)).toMatchObject({ status: "todo", assignee: null });
 		expect(await stateOf(other)).toMatchObject({ status: "todo", assignee: "agent:reviewer" });
+		expect(await stateOf(byHandle)).toMatchObject({ status: "todo", assignee: null });
+	});
+});
+
+describe("the hour after a person's run is the person's", () => {
+	/** A run of the session through its keeper, ending at `ms` after NOW. */
+	async function run(
+		narratorId: string,
+		ms: number,
+		end: NonNullable<Parameters<ReturnType<typeof keepOutlineTaskLeases>["stop"]>[0]>,
+	) {
+		const keeper = keepOutlineTaskLeases(narratorId, {
+			store,
+			now: () => Date.parse(NOW) + ms,
+			intervalMs: 0,
+		});
+		// As a run does while it goes: every lease is back on the running one.
+		await keeper.touch();
+		await keeper.stop({ pending: async () => false, ...end });
+	}
+
+	test("a person's run ends, then a system wake ends by itself inside the hour: the task stays, no handoff, the hour is not moved; the expiry job gives it back once", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(p.space.id, alice, ["Fix the refresh logic"]);
+		const [task] = team.tasks as [string];
+		await start(p.space.id, s, [task]);
+
+		await run(s, 60_000, { natural: true, person: true });
+		const hour = at(60_000 + OUTLINE_TASK_GRACE_LEASE_MS).toISOString();
+		expect(await stateOf(task)).toMatchObject({ status: "doing", holder: s, expiresAt: hour });
+
+		// Two wakes (a team notice, a task notice), each a system run that ends by itself.
+		for (const ms of [10 * 60_000, 40 * 60_000]) {
+			await run(s, ms, { natural: true, person: false });
+			expect(await stateOf(task)).toMatchObject({ status: "doing", holder: s, expiresAt: hour });
+			expect(await handoffsUnder(task)).toHaveLength(0);
+		}
+		// Nobody came back: the expiry job gives it back when the hour is over, with one handoff.
+		const early = await expireOutlineTaskLeases({ store, now: new Date(Date.parse(hour) - 1) });
+		expect(early.reopened).toBe(0);
+		const late = await expireOutlineTaskLeases({ store, now: new Date(hour) });
+		expect(late.reopened).toBe(1);
+		expect(await stateOf(task)).toMatchObject({ status: "todo", holder: null, epoch: 1 });
+		expect(await handoffsUnder(task)).toHaveLength(1);
+	});
+
+	test("each half of the rule alone holds the task: the session's last person run, and the hour the claim is on", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(p.space.id, alice, ["Fix the refresh logic"]);
+		const [task] = team.tasks as [string];
+		await start(p.space.id, s, [task]);
+		await run(s, 60_000, { natural: true, person: true });
+
+		// Only the keeper remembers (the claim's hour forgotten): still not given back.
+		resetOutlineGraceLeasesForTests();
+		await run(s, 10 * 60_000, { natural: true, person: false });
+		expect(await stateOf(task)).toMatchObject({ status: "doing", holder: s });
+		expect(await handoffsUnder(task)).toHaveLength(0);
+		// Only the claim's hour is remembered (the keeper forgot the person's run): the same.
+		const hour = (await stateOf(task)).expiresAt;
+		resetOutlinePersonRunEndsForTests();
+		await run(s, 20 * 60_000, { natural: true, person: false });
+		expect(await stateOf(task)).toMatchObject({ status: "doing", holder: s, expiresAt: hour });
+		// Past the hour of the person's run, a system run that ends by itself gives it back.
+		resetOutlineGraceLeasesForTests();
+		resetOutlinePersonRunEndsForTests();
+		await run(s, 60_000, { natural: true, person: true });
+		resetOutlineGraceLeasesForTests();
+		await run(s, 60_000 + OUTLINE_TASK_GRACE_LEASE_MS, { natural: true, person: false });
+		expect(await stateOf(task)).toMatchObject({ status: "todo", holder: null });
+		expect(await handoffsUnder(task)).toHaveLength(1);
+	});
+
+	test("a person's next run starts the hour afresh; a stopped system run does not move an hour that is running", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(p.space.id, alice, ["Fix the refresh logic"]);
+		const [task] = team.tasks as [string];
+		await start(p.space.id, s, [task]);
+		await run(s, 60_000, { natural: true, person: true });
+		await run(s, 30 * 60_000, { natural: true, person: true });
+		const hour = at(30 * 60_000 + OUTLINE_TASK_GRACE_LEASE_MS).toISOString();
+		expect((await stateOf(task)).expiresAt).toBe(hour);
+		await run(s, 45 * 60_000, { natural: false, person: false });
+		expect((await stateOf(task)).expiresAt).toBe(hour);
+	});
+});
+
+describe("a tree something else is at work in, or waits in, is kept", () => {
+	test("another session is doing a step under the held task", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const other = await session(alice, p.id);
+		const team = await tasks(p.space.id, alice, ["Parent", "Alone"], ["Step"]);
+		const [parent, alone] = team.tasks as [string, string];
+		await start(p.space.id, s, [parent, alone]);
+		await start(p.space.id, other, team.steps);
+		expect(await settle(s, true)).toEqual({ kept: 1, grace: 0, released: 1 });
+		expect(await stateOf(parent)).toMatchObject({ status: "doing", holder: s });
+		expect(await stateOf(alone)).toMatchObject({ status: "todo", holder: null });
+		expect(await stateOf(team.steps[0] as string)).toMatchObject({
+			status: "doing",
+			holder: other,
+		});
+	});
+
+	test("an unanswered question under a step the session does not hold; and one right under the held task", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(p.space.id, alice, ["Deep", "Direct", "Free"], ["Step of Deep"]);
+		const [deep, direct, free] = team.tasks as [string, string, string];
+		await start(p.space.id, s, [deep, direct, free]);
+		const scope = await OutlineAgentScope.open({ narratorId: s, userId: alice });
+		for (const under of [team.steps[0] as string, direct]) {
+			const sid = (await store.getBlock(under))?.sid;
+			const asked = await outlineAsk(
+				scope,
+				{
+					questions: [{ question: "Which way?", options: ["A", "B"], recommend: 1 }],
+					under: `${p.space.key}/${sid}`,
+				},
+				{ messageId: null, toolCallId: null },
+			);
+			expect([asked.output, asked.isError ?? false]).toEqual([asked.output, false]);
+		}
+		expect(await settle(s, true)).toEqual({ kept: 2, grace: 0, released: 1 });
+		expect(await stateOf(deep)).toMatchObject({ status: "doing", holder: s });
+		expect(await stateOf(direct)).toMatchObject({ status: "doing", holder: s });
+		expect(await stateOf(free)).toMatchObject({ status: "todo", holder: null });
+	});
+
+	test("a change waiting for a person's confirmation in the tree", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(p.space.id, alice, ["Locked plan", "Free"], ["Its step"]);
+		const [plan, free] = team.tasks as [string, string];
+		await start(p.space.id, s, [plan, free]);
+		await lockOutlineTask({ blockId: team.steps[0] as string, userId: alice, store });
+		const proposed = await agent(p.space.id, s, [
+			{ op: "update", block: { id: team.steps[0] as string }, content: "Its step, reworded" },
+		]);
+		expect(proposed.pending?.id).toBeTruthy();
+		expect(await settle(s, true)).toEqual({ kept: 1, grace: 0, released: 1 });
+		expect(await stateOf(plan)).toMatchObject({ status: "doing", holder: s });
+		expect(await stateOf(free)).toMatchObject({ status: "todo", holder: null });
 	});
 });
 
@@ -693,6 +925,28 @@ describe("cost and where it does not apply", () => {
 		expect(calls).toEqual(["getNarratorRoots", "listClaimedTasks", "getSpace", "renewTaskClaims"]);
 	});
 
+	test("more claims than one run end decides on: the first hundred are decided, and a line says so", async () => {
+		const alice = await person();
+		const p = await project(alice);
+		const s = await session(alice, p.id);
+		const team = await tasks(
+			p.space.id,
+			alice,
+			Array.from({ length: OUTLINE_RELEASE_LIMITS.claims + 5 }, (_, i) => `task ${i}`),
+		);
+		await start(p.space.id, s, team.tasks);
+		const info = spyOn(logger, "info");
+		try {
+			const result = await settle(s, true);
+			expect(result.released).toBe(OUTLINE_RELEASE_LIMITS.claims);
+			expect(
+				info.mock.calls.filter(([message]) => String(message).includes("more claims than")),
+			).toHaveLength(1);
+		} finally {
+			info.mockRestore();
+		}
+	});
+
 	test("through the keeper: a stop without a word on how the run ended gives nothing back at once; with the outline off it reads nothing", async () => {
 		const alice = await person();
 		const p = await project(alice);
@@ -709,13 +963,25 @@ describe("cost and where it does not apply", () => {
 			holder: s,
 			expiresAt: leaseEnd(OUTLINE_TASK_GRACE_LEASE_MS),
 		});
-		// A person's message waiting to start the next run: not given back either.
+		// Something waits to start the next run, or still works in the background: not given back.
+		resetOutlineGraceLeasesForTests();
 		const waiting = keepOutlineTaskLeases(s, { store, now: clock, intervalMs: 0 });
-		await waiting.stop({ natural: true, pendingInput: async () => true });
+		await waiting.stop({ natural: true, pending: async () => true });
 		expect(await stateOf(task)).toMatchObject({ status: "doing", holder: s });
-		// A natural end, nothing waiting: given back.
+		// Asking failed: unknown counts as pending.
+		resetOutlineGraceLeasesForTests();
+		const unknown = keepOutlineTaskLeases(s, { store, now: clock, intervalMs: 0 });
+		await unknown.stop({
+			natural: true,
+			pending: async () => {
+				throw new Error("not available");
+			},
+		});
+		expect(await stateOf(task)).toMatchObject({ status: "doing", holder: s });
+		// A natural end, nothing pending, on nobody's hour: given back.
+		resetOutlineGraceLeasesForTests();
 		const natural = keepOutlineTaskLeases(s, { store, now: clock, intervalMs: 0 });
-		await natural.stop({ natural: true, pendingInput: async () => false });
+		await natural.stop({ natural: true, pending: async () => false });
 		expect(await stateOf(task)).toMatchObject({ status: "todo", holder: null });
 
 		const { calls, proxy } = counting();

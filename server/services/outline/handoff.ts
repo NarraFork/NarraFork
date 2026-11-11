@@ -38,12 +38,14 @@
  * once, under the topmost.
  *
  * WHAT IT MAY SHOW (the block is read by everyone who reads the project space)
- *   - the session's id and title (as the lease job's note always did);
+ *   - the session's id, and its title unless the session is private (the board names a session
+ *     only to its readers);
  *   - links to blocks under the task itself, which are in the same space;
  *   - a directory only as a path inside the project's own directory;
- *   - the session's last reply only when the caller passes it (a run the system started for this
- *     one task, with no note written) AND the session is readable by the project (`project` or
- *     `public` visibility): a private session's words are never copied into the project space.
+ *   - the session's last reply only under the task the run was started for (the caller says
+ *     which), with no note written, AND only for a session the readers of THIS project's space
+ *     read: a public one, or a `project`-visible one whose own project is this one. A private
+ *     session's words, or those of another project's session, are never copied here.
  *
  * COST
  * One page-structure read per task detailed (at most {@link OUTLINE_HANDOFF_LIMITS.detailed} per
@@ -55,11 +57,18 @@ import { createHash } from "node:crypto";
 import { isAbsolute, relative } from "node:path";
 import { logger } from "@server/lib/logger";
 import { blockTitle, type Inline, serializeBody } from "@shared/outline";
+import { resolveNarratorProjectId } from "../narrator-project";
 import { type NarratorHandoffRow, readNarratorHandoffRows, readProjectDir } from "./access-reads";
+import { assigneeNamesSession } from "./assignee";
 import { type DelegationLocale, delegationLocale } from "./delegation-text";
 import { OUTLINE_CHANGE } from "./model";
 import { readSubtree } from "./read";
-import type { OutlineSpaceRow, OutlineStore, OutlineTaskClaimRow } from "./store/port";
+import type {
+	OutlineBlockMeta,
+	OutlineSpaceRow,
+	OutlineStore,
+	OutlineTaskClaimRow,
+} from "./store/port";
 import type { OutlineNarratorWrite } from "./store/read-port";
 import { type OutlineNode, subtreeNodes } from "./tree";
 import type { OutlineOp } from "./write";
@@ -302,15 +311,58 @@ export function directoryInProject(cwd: string | null, projectDir: string | null
 }
 
 /**
+ * The blocks above the given ones, read by primary key level by level into `known` (at most
+ * `depth` levels): what tells which held tasks are above one another.
+ */
+export async function loadOutlineAncestors(
+	store: OutlineStore,
+	known: Map<string, OutlineBlockMeta>,
+	depth = 64,
+): Promise<void> {
+	for (let level = 0; level < depth; level++) {
+		const missing = new Set<string>();
+		for (const block of known.values())
+			if (block.parentId !== null && !known.has(block.parentId)) missing.add(block.parentId);
+		if (missing.size === 0) return;
+		const found = await store.getBlockMetasByIds([...missing]);
+		if (found.length === 0) return;
+		for (const meta of found) known.set(meta.id, meta);
+	}
+}
+
+/** The ids above a block, nearest first, as far as `known` holds them. */
+export function outlineAncestorIds(
+	known: ReadonlyMap<string, OutlineBlockMeta>,
+	id: string,
+): string[] {
+	const out: string[] = [];
+	let current = known.get(id);
+	current = current?.parentId ? known.get(current.parentId) : undefined;
+	while (current && out.length <= 1000) {
+		out.push(current.id);
+		current = current.parentId === null ? undefined : known.get(current.parentId);
+	}
+	return out;
+}
+
+/**
  * Plan the handoffs of tasks of project spaces being given back (see the module header): for
- * each, the operations to write with its reopening. `reply` is the session's last reply, passed
- * only when it speaks of the one task given back; it is shown only for a session the project's
- * readers can read. A task that cannot be read gets no plan (the caller reopens it bare).
+ * each, the operations to write with its reopening. A task under another one the same session
+ * gives back gets none: one handoff per tree, under its top (decided from the blocks above each
+ * task, whatever the number of tasks). `reply` is the session's last reply, for the one task the
+ * run was started for (`replyTaskId`); it is shown only for a session the readers of that
+ * project's space can read. A task that cannot be read gets no plan (the caller reopens it bare).
  */
 export async function planOutlineHandoffs(
 	store: OutlineStore,
 	subjects: readonly OutlineHandoffSubject[],
-	options: { reason: OutlineHandoffReason; at: Date; reply?: string | null },
+	options: {
+		reason: OutlineHandoffReason;
+		at: Date;
+		reply?: string | null;
+		/** The task the run was started for: the only one the reply is quoted under. */
+		replyTaskId?: string | null;
+	},
 ): Promise<Map<string, OutlineHandoffPlan>> {
 	const out = new Map<string, OutlineHandoffPlan>();
 	const project = subjects.filter(
@@ -325,10 +377,15 @@ export async function planOutlineHandoffs(
 	);
 	const locales = new Map<string, DelegationLocale>();
 	const projectDirs = new Map<string, string | null>();
+	const mainProjects = new Map<string, string | null>();
 	const writes = new Map<string, OutlineNarratorWrite[]>();
 	const given = new Map(
 		project.map((s) => [s.claim.taskBlockId, rootOf(s.claim.holderNarratorId as string)]),
 	);
+	// Which tasks are under another one given back: from the blocks above each (primary keys).
+	const known = new Map<string, OutlineBlockMeta>();
+	for (const meta of await store.getBlockMetasByIds([...given.keys()])) known.set(meta.id, meta);
+	await loadOutlineAncestors(store, known);
 
 	let detailed = 0;
 	for (const subject of project) {
@@ -337,19 +394,23 @@ export async function planOutlineHandoffs(
 		const root = rootOf(holder);
 		const session = sessions.get(root) ?? null;
 		try {
+			const assignee = known.get(claim.taskBlockId)?.taskJson?.assignee ?? null;
+			// By id or by handle (`assignee.ts`): the session giving the task back, or its subagent.
+			const clearAssignee =
+				assignee?.startsWith("agent:") === true &&
+				(await assigneeNamesSession(assignee, holder, store).catch(
+					() => assignee === `agent:${holder}` || assignee === `agent:${root}`,
+				));
+			// Under another task the same session gives back: that one carries the handoff.
+			if (outlineAncestorIds(known, claim.taskBlockId).some((id) => given.get(id) === root)) {
+				out.set(claim.taskBlockId, { ops: [], clearAssignee, noted: false });
+				continue;
+			}
 			const subtree =
 				detailed < OUTLINE_HANDOFF_LIMITS.detailed
 					? await readSubtree(claim.taskBlockId, { store })
 					: null;
 			if (subtree) detailed++;
-			const task = subtree?.root.task ?? null;
-			const clearAssignee =
-				task?.assignee === `agent:${holder}` || task?.assignee === `agent:${root}`;
-			// Under another task the same session gives back: that one carries the handoff.
-			if (subtree?.path.some((node) => given.get(node.id) === root)) {
-				out.set(claim.taskBlockId, { ops: [], clearAssignee, noted: false });
-				continue;
-			}
 			let locale = session?.ownerUserId ? locales.get(session.ownerUserId) : undefined;
 			if (!locale) {
 				locale = "en";
@@ -370,7 +431,25 @@ export async function planOutlineHandoffs(
 					projectDirs.set(space.projectId, await readProjectDir(space.projectId).catch(() => null));
 				directory = directoryInProject(session.cwd, projectDirs.get(space.projectId) ?? null);
 			}
-			const readable = session?.visibility === "project" || session?.visibility === "public";
+			// Whose words may be copied into this project's space: a public session's, or those of a
+			// session of this very project that the project reads. A session of another project is
+			// read by that project's people, not this one's.
+			let readable = session?.visibility === "public";
+			if (session?.visibility === "project") {
+				if (!mainProjects.has(root))
+					mainProjects.set(
+						root,
+						await resolveNarratorProjectId({
+							id: root,
+							contextProjectId: session.contextProjectId,
+						}).catch(() => null),
+					);
+				readable = space.projectId !== null && mainProjects.get(root) === space.projectId;
+			}
+			const reply =
+				readable && options.replyTaskId === claim.taskBlockId && options.reply?.trim()
+					? options.reply
+					: null;
 			out.set(claim.taskBlockId, {
 				clearAssignee,
 				noted: notes.length > 0,
@@ -378,7 +457,8 @@ export async function planOutlineHandoffs(
 					taskBlockId: claim.taskBlockId,
 					epoch: claim.epoch,
 					narratorId: root,
-					title: session?.title ?? null,
+					// A private session's title is its own (the board names it only to its readers).
+					title: session && session.visibility !== "private" ? session.title : null,
 					at: options.at,
 					reason: options.reason,
 					locale,
@@ -390,7 +470,7 @@ export async function planOutlineHandoffs(
 							}
 						: null,
 					directory,
-					reply: readable && options.reply?.trim() ? options.reply : null,
+					reply,
 				}),
 			});
 		} catch (error) {

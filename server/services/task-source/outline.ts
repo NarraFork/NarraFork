@@ -521,13 +521,18 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		currentTask: () => single("doing"),
 		nextTask: () => single("todo"),
 		async openTasks(): Promise<OpenTaskList> {
-			const read = await readOpen(await session());
+			const current = await session();
+			const read = await readOpen(current);
 			// The list is a prefix in document order (its readers show fewer: the interrupt guard
 			// eight); the revision key still covers every task read.
 			const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.openTasks);
 			const titles = await titlesOf(listed);
 			return {
-				tasks: listed.map((entry) => toView(entry, titles)),
+				tasks: listed.map((entry) => {
+					const view = toView(entry, titles);
+					if (entry.ref.spaceId !== current.spaceId) view.elsewhere = true;
+					return view;
+				}),
 				revision: revisionOf(read),
 			};
 		},

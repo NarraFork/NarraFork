@@ -9,13 +9,29 @@
  *   | task                                                              | at the run's end        |
  *   |-------------------------------------------------------------------|-------------------------|
  *   | of the session's own space, or a personal space                   | kept (idle lease, 24 h) |
- *   | waiting: a prerequisite open, a question unanswered, a change     | kept (idle lease)       |
- *   | waiting for confirmation                                          |                         |
- *   | a subagent of the session is doing a task under it (or it)        | kept (idle lease)       |
- *   | of a project space, none of the above; the run was started by the | given back at once      |
- *   | system and ended by itself                                        |                         |
- *   | of a project space, none of the above; a person started or joined | kept for                |
- *   | the run, or it was stopped, or it failed                          | `OUTLINE_TASK_GRACE_LEASE_MS`, then given back by the expiry job |
+ *   | waiting: a prerequisite open; a question unanswered or a change   | kept (idle lease)       |
+ *   | waiting for confirmation anywhere in its tree                     |                         |
+ *   | a subagent of the session is doing a task under it (or it), or    | kept (idle lease)       |
+ *   | another session is doing a task under it                          |                         |
+ *   | of a project space, none of the above; the run ended `natural`    | given back at once      |
+ *   | of a project space, none of the above; a person's run ended       | kept for an hour from   |
+ *   |                                                                   | now, then the expiry job|
+ *   | of a project space, none of the above; any other end              | kept until the hour it  |
+ *   |                                                                   | is on ends (a new hour  |
+ *   |                                                                   | when it is on none)     |
+ *
+ * `natural` is the runtime's word (`OutlineRunEnd`): the SYSTEM started the run (a continuation,
+ * a wake, the session opened for the task), no person's message joined it, it ended by itself
+ * (not stopped, not failed), nothing of the session still works in the background, nothing waits
+ * to start its next run, and no person's run of the session ended within the last hour. A
+ * PERSON's run is one a person started or joined: a message, Continue, Retry, the board's start
+ * for an existing session, a hand-over "and start".
+ *
+ * THE HOUR IS THE PERSON'S. A task on the hour's lease after a person's run is not given back by
+ * a system run that ends meanwhile (a wake, a notice), and that run does not move the hour
+ * either: remembered here per task ({@link graceLeases}, in memory, bounded), since a run renews
+ * every lease while it goes. After a restart the memory is gone: the lease in the database is
+ * what the expiry job reads, and a system run that then ends by itself gives the task back.
  *
  * WHOLE TREES. Tasks the session holds that are above one another are one group, and a group is
  * kept or given back together: a task kept under a task given back could not be worked by the
@@ -40,14 +56,22 @@
  * `lease-keeper.ts`.
  *
  * COST, once per run end: one indexed read of the session's claims (and nothing else when it
- * holds none); for project tasks, their ancestors by primary key level by level, the wait
- * derivation of those tasks only, the claims of the session's subagents (bounded), one conditional
- * write of the leases, and for tasks given back the handoff's reads and one commit per space.
+ * holds none); for project tasks, their ancestors by primary key level by level, the claims of
+ * the session's subagents (bounded), one page-structure read per tree not kept already (at most
+ * {@link OUTLINE_RELEASE_LIMITS.trees}; the rest are not looked into) with the claims and waits of
+ * the open tasks in it (bounded), one conditional write of the leases, and for tasks given back
+ * the handoff's reads and one commit per space.
  */
 import { logger } from "@server/lib/logger";
 import { readNarratorHandoffRows } from "./access-reads";
-import { OUTLINE_HANDOFF_ACTOR, planOutlineHandoffs } from "./handoff";
-import { OUTLINE_LIMITS, OUTLINE_TASK_GRACE_LEASE_MS, OUTLINE_TASK_IDLE_LEASE_MS } from "./model";
+import {
+	loadOutlineAncestors,
+	OUTLINE_HANDOFF_ACTOR,
+	outlineAncestorIds,
+	planOutlineHandoffs,
+} from "./handoff";
+import { OUTLINE_TASK_GRACE_LEASE_MS, OUTLINE_TASK_IDLE_LEASE_MS } from "./model";
+import { readSubtree } from "./read";
 import { outlineStore } from "./store";
 import type {
 	OutlineBlockMeta,
@@ -62,40 +86,45 @@ import {
 	isClaimLive,
 	isWaiting,
 	type OutlineLeaseExpiryResult,
+	type OutlineTaskSubject,
 	outlineSessionsRunHere,
 	type Reopening,
 	renewOutlineTaskLeases,
 	reopenTasks,
 } from "./tasks";
+import { subtreeNodes } from "./tree";
 
 export const OUTLINE_RELEASE_LIMITS = {
-	/** Claims of a session one run end reads and decides on. */
+	/** Claims of a session one run end reads and decides on; past it, a line is logged. */
 	claims: 100,
 	/** Claims of the session's subagents read to find the tasks being done for it. */
 	subagentClaims: 100,
 	/** Levels of ancestors read above the tasks held. */
 	depth: 64,
+	/** Trees looked into for other sessions' work and for questions (one page read each). */
+	trees: 20,
+	/** Open tasks of the trees whose claims and waits are read, in all. */
+	treeTasks: 500,
+	/** Tasks whose hour is remembered (in memory). */
+	remembered: 2000,
 } as const;
 
 /** How a run ended, as far as the release is concerned. */
 export interface OutlineRunEnd {
-	/**
-	 * The system started the run (a continuation, the board's button, a wake) and it ended by
-	 * itself: no person's message started or joined it, it was not stopped, it did not fail, and
-	 * no input of a person waits to start the next one.
-	 */
+	/** See the module header: only such an end gives tasks back at once. */
 	natural: boolean;
-	/**
-	 * The session's last reply. Shown in a handoff only when exactly one task is given back and
-	 * the session wrote no note under it, and only for a session the project can read.
-	 */
+	/** A person started or joined the run: its end starts the hour afresh. */
+	person?: boolean;
+	/** The session's last reply (a handoff may quote it under `forTaskId`). */
 	reply?: string | null;
+	/** The task the run was started for (the session opened for it): where the reply belongs. */
+	forTaskId?: string | null;
 }
 
 export interface OutlineRunEndResult {
 	/** Claims left on the idle lease. */
 	kept: number;
-	/** Claims put on the hour's lease. */
+	/** Claims on the hour's lease. */
 	grace: number;
 	/** Tasks given back with a handoff. */
 	released: number;
@@ -108,11 +137,43 @@ export interface OutlineRunEndOptions {
 	isRunning?: (narratorId: string) => boolean;
 }
 
+/**
+ * The hour each task is on (see the module header), by task: whose it is, at which claim
+ * generation, and when it ends (ms). In memory; the oldest entry goes when it is full.
+ */
+const graceLeases = new Map<string, { root: string; epoch: number; until: number }>();
+
+function rememberGrace(taskId: string, entry: { root: string; epoch: number; until: number }) {
+	graceLeases.delete(taskId);
+	graceLeases.set(taskId, entry);
+	while (graceLeases.size > OUTLINE_RELEASE_LIMITS.remembered) {
+		const oldest = graceLeases.keys().next().value;
+		if (oldest === undefined) break;
+		graceLeases.delete(oldest);
+	}
+}
+
+/** The end (ms) of the hour a claim is on, when it is on one that has not ended. */
+function graceOf(task: OutlineClaimedTask, root: string, nowMs: number): number | null {
+	const entry = graceLeases.get(task.block.id);
+	if (!entry) return null;
+	if (entry.root !== root || entry.epoch !== task.claim.epoch || entry.until <= nowMs) {
+		graceLeases.delete(task.block.id);
+		return null;
+	}
+	return entry.until;
+}
+
+/** Forget every remembered hour (tests: what a restart does). */
+export function resetOutlineGraceLeasesForTests(): void {
+	graceLeases.clear();
+}
+
 const end = (now: Date, ms: number) => new Date(now.getTime() + ms).toISOString();
 
 /**
  * A run of `narratorId` ended: settle its claims (see the module header). Returns what became of
- * them; a session archived or deleted lets go of everything, as before (counted as released).
+ * them; a session archived or deleted lets go of everything, as before.
  */
 export async function settleOutlineTaskClaimsAtRunEnd(
 	narratorId: string,
@@ -139,23 +200,28 @@ export async function settleOutlineTaskClaimsAtRunEnd(
 		const kept = await idleOutlineTaskClaims(narratorId, { store, now });
 		if (handed.length === 0 || options.isRunning?.(session.root))
 			return { kept, grace: 0, released: 0 };
-		const settled = await settleRoot(store, session.root, "grace", now, {
+		const settled = await settleRoot(store, session.root, "hold", now, {
 			only: new Set(handed),
 			...options,
 		});
 		return { kept: Math.max(0, kept - settled.grace), grace: settled.grace, released: 0 };
 	}
-	return await settleRoot(store, narratorId, how.natural ? "release" : "grace", now, {
-		...options,
-		reply: how.reply ?? null,
-	});
+	return await settleRoot(
+		store,
+		narratorId,
+		how.natural ? "release" : how.person ? "hour" : "hold",
+		now,
+		{ ...options, reply: how.reply ?? null, forTaskId: how.forTaskId ?? null },
+	);
 }
 
 interface Decision {
 	claimed: OutlineClaimedTask[];
 	spaces: Map<string, OutlineSpaceRow>;
-	/** Ids of the tasks to give back (or put on the hour's lease), whole groups. */
+	/** Ids of the tasks not kept (given back, or put on the hour's lease), whole groups. */
 	loose: Set<string>;
+	/** The group (its topmost held task) of each team task. */
+	groupOf: Map<string, string>;
 }
 
 /** Read the session's claims and decide which are kept and which are not (the header's table). */
@@ -165,9 +231,15 @@ async function decide(
 	now: Date,
 	only: ReadonlySet<string> | undefined,
 ): Promise<Decision | null> {
-	const claimed = (await store.listClaimedTasks(root, OUTLINE_RELEASE_LIMITS.claims)).filter(
-		({ claim }) => claim.holderNarratorId === root,
-	);
+	const read = await store.listClaimedTasks(root, OUTLINE_RELEASE_LIMITS.claims + 1);
+	if (read.length > OUTLINE_RELEASE_LIMITS.claims)
+		logger.info("Outline run end: more claims than one run end decides on; the rest keep theirs", {
+			narratorId: root,
+			decided: OUTLINE_RELEASE_LIMITS.claims,
+		});
+	const claimed = read
+		.slice(0, OUTLINE_RELEASE_LIMITS.claims)
+		.filter(({ claim }) => claim.holderNarratorId === root);
 	if (claimed.length === 0) return null;
 	const spaces = new Map<string, OutlineSpaceRow>();
 	for (const spaceId of new Set(claimed.map(({ block }) => block.spaceId))) {
@@ -178,7 +250,8 @@ async function decide(
 		({ block }) =>
 			spaces.get(block.spaceId)?.kind === "project" && !block.deleted && isOpenTask(block.taskJson),
 	);
-	if (team.length === 0) return { claimed, spaces, loose: new Set() };
+	const groupOf = new Map<string, string>();
+	if (team.length === 0) return { claimed, spaces, loose: new Set(), groupOf };
 
 	// The blocks above the team tasks (and above what the session's subagents are doing), by
 	// primary key, level by level.
@@ -194,31 +267,12 @@ async function decide(
 		.filter((id) => !known.has(id));
 	if (delegatedIds.length > 0)
 		for (const meta of await store.getBlockMetasByIds(delegatedIds)) known.set(meta.id, meta);
-	for (let depth = 0; depth < OUTLINE_RELEASE_LIMITS.depth; depth++) {
-		const missing = new Set<string>();
-		for (const block of known.values())
-			if (block.parentId !== null && !known.has(block.parentId)) missing.add(block.parentId);
-		if (missing.size === 0) break;
-		const found = await store.getBlockMetasByIds([...missing]);
-		if (found.length === 0) break;
-		for (const meta of found) known.set(meta.id, meta);
-	}
-	/** The block and everything above it, nearest first. */
-	const chain = (id: string): string[] => {
-		const out: string[] = [];
-		let current = known.get(id);
-		while (current && out.length <= OUTLINE_LIMITS.maxDepth) {
-			out.push(current.id);
-			current = current.parentId === null ? undefined : known.get(current.parentId);
-		}
-		return out;
-	};
+	await loadOutlineAncestors(store, known, OUTLINE_RELEASE_LIMITS.depth);
 
 	// Groups: team tasks above one another (the topmost held task above each names its group).
 	const teamIds = new Set(team.map(({ block }) => block.id));
-	const groupOf = new Map<string, string>();
 	for (const { block } of team) {
-		const held = chain(block.id).filter((id) => teamIds.has(id));
+		const held = outlineAncestorIds(known, block.id).filter((id) => teamIds.has(id));
 		groupOf.set(block.id, held[held.length - 1] ?? block.id);
 	}
 	const keptGroups = new Set<string>();
@@ -230,7 +284,7 @@ async function decide(
 		if (isWaiting(waits.get(block.id))) keptGroups.add(groupOf.get(block.id) as string);
 	// A subagent of the session is doing a task at or under a held one: that tree is in work.
 	for (const { claim } of delegated)
-		for (const id of chain(claim.taskBlockId)) {
+		for (const id of [claim.taskBlockId, ...outlineAncestorIds(known, claim.taskBlockId)]) {
 			const group = groupOf.get(id);
 			if (group) keptGroups.add(group);
 		}
@@ -239,6 +293,11 @@ async function decide(
 				team.filter(({ block }) => only.has(block.id)).map(({ block }) => groupOf.get(block.id)),
 			)
 		: null;
+	const candidates = [...new Set(groupOf.values())].filter(
+		(group) => !keptGroups.has(group) && (!touched || touched.has(group)),
+	);
+	for (const group of await treesInWork(store, root, candidates, teamIds, nowIso))
+		keptGroups.add(group);
 	const loose = new Set<string>();
 	for (const { block } of team) {
 		const group = groupOf.get(block.id) as string;
@@ -246,74 +305,140 @@ async function decide(
 		if (touched && !touched.has(group)) continue;
 		loose.add(block.id);
 	}
-	return { claimed, spaces, loose };
+	return { claimed, spaces, loose, groupOf };
+}
+
+/**
+ * Of the trees (by their topmost held task), those something else keeps: another session is
+ * doing a task in it, or a question or a change waiting for confirmation is open anywhere in it
+ * (the session waits for people there, even when the nearest task above is not one it holds).
+ * One page-structure read per tree, at most {@link OUTLINE_RELEASE_LIMITS.trees}; the claims and
+ * the waits of at most {@link OUTLINE_RELEASE_LIMITS.treeTasks} open tasks not held by the
+ * session. Trees past the limits are not looked into.
+ */
+async function treesInWork(
+	store: OutlineStore,
+	root: string,
+	groups: readonly string[],
+	heldIds: ReadonlySet<string>,
+	nowIso: string,
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	const groupOfTask = new Map<string, string>();
+	const subjects: OutlineTaskSubject[] = [];
+	for (const group of groups.slice(0, OUTLINE_RELEASE_LIMITS.trees)) {
+		const subtree = await readSubtree(group, { store }).catch(() => null);
+		if (!subtree) continue;
+		for (const node of subtreeNodes(subtree.root).slice(1)) {
+			if (subjects.length >= OUTLINE_RELEASE_LIMITS.treeTasks) break;
+			if (!node.task || !isOpenTask(node.task) || heldIds.has(node.id)) continue;
+			groupOfTask.set(node.id, group);
+			subjects.push({ id: node.id, spaceId: subtree.state.space.id, taskJson: node.task });
+		}
+	}
+	if (subjects.length === 0) return out;
+	const claims = (await store.getTaskClaims(subjects.map((s) => s.id))).filter(
+		(claim) => claim.holderNarratorId !== null && isClaimLive(claim, nowIso),
+	);
+	if (claims.length > 0) {
+		const holders = await store.getNarratorRoots([
+			...new Set(claims.map((claim) => claim.holderNarratorId as string)),
+		]);
+		for (const claim of claims) {
+			const holder = claim.holderNarratorId as string;
+			if ((holders.get(holder)?.root ?? holder) !== root)
+				out.add(groupOfTask.get(claim.taskBlockId) as string);
+		}
+	}
+	const waits = await deriveOutlineTaskWaits(subjects, { store });
+	for (const subject of subjects) {
+		const wait = waits.get(subject.id);
+		if (wait?.people || wait?.confirmation) out.add(groupOfTask.get(subject.id) as string);
+	}
+	return out;
 }
 
 async function settleRoot(
 	store: OutlineStore,
 	root: string,
-	mode: "release" | "grace",
+	/** `release`: give back at once; `hour`: a new hour; `hold`: the hour it is on, or a new one. */
+	mode: "release" | "hour" | "hold",
 	now: Date,
-	options: OutlineRunEndOptions & { only?: ReadonlySet<string>; reply?: string | null },
+	options: OutlineRunEndOptions & {
+		only?: ReadonlySet<string>;
+		reply?: string | null;
+		forTaskId?: string | null;
+	},
 ): Promise<OutlineRunEndResult> {
 	const idle = end(now, OUTLINE_TASK_IDLE_LEASE_MS);
-	const nowIso = now.toISOString();
+	const nowMs = now.getTime();
 	const none: OutlineRunEndResult = { kept: 0, grace: 0, released: 0 };
 	// The leases of the tasks not kept are written only while their claims are as read; a claim
 	// that moved meanwhile (a commit released one, a run renewed) makes it decide again, once.
 	for (let attempt = 0; attempt < 2; attempt++) {
 		const decision = await decide(store, root, now, options.only);
 		if (!decision) return none;
-		const { claimed, spaces, loose } = decision;
+		const { claimed, spaces, loose, groupOf } = decision;
 		// First everything on the idle lease, in one statement, as before this rule existed: what
 		// follows only shortens the leases of the tasks not kept, and may fail without harm.
 		const all = options.only ? 0 : await store.renewTaskClaims(root, idle);
 		if (loose.size === 0) return { ...none, kept: all };
-		const going = claimed.filter(({ block }) => loose.has(block.id));
-		const releasing = mode === "release";
-		const plans = releasing
-			? await planOutlineHandoffs(
-					store,
-					going.map(({ claim, block }) => ({
-						claim,
-						space: spaces.get(block.spaceId) as OutlineSpaceRow,
-					})),
-					{
-						reason: "unfinished",
-						at: now,
-						// The reply speaks of the task only when there is one to speak of.
-						reply: looseTops(going) === 1 ? (options.reply ?? null) : null,
-					},
-				).catch(() => new Map() as Awaited<ReturnType<typeof planOutlineHandoffs>>)
-			: null;
+		const looseTasks = claimed.filter(({ block }) => loose.has(block.id));
+		// The hour a tree is on (the latest of its tasks'), when it is on one.
+		const hourOfGroup = new Map<string, number>();
+		for (const task of looseTasks) {
+			const until = graceOf(task, root, nowMs);
+			const group = groupOf.get(task.block.id) as string;
+			if (until !== null) hourOfGroup.set(group, Math.max(until, hourOfGroup.get(group) ?? 0));
+		}
+		const onHour = (task: OutlineClaimedTask) =>
+			hourOfGroup.get(groupOf.get(task.block.id) as string) ?? null;
+		// Given back at once: only at a natural end, and never a tree on a person's hour.
+		const going = mode === "release" ? looseTasks.filter((task) => onHour(task) === null) : [];
+		const goingIds = new Set(going.map(({ block }) => block.id));
+		const held = looseTasks.filter(({ block }) => !goingIds.has(block.id));
+		const plans =
+			going.length > 0
+				? await planOutlineHandoffs(
+						store,
+						going.map(({ claim, block }) => ({
+							claim,
+							space: spaces.get(block.spaceId) as OutlineSpaceRow,
+						})),
+						{
+							reason: "unfinished",
+							at: now,
+							reply: options.reply ?? null,
+							replyTaskId: options.forTaskId ?? null,
+						},
+					).catch(() => new Map() as Awaited<ReturnType<typeof planOutlineHandoffs>>)
+				: null;
 		// A run of the session started meanwhile: the tasks are its own again.
 		if (options.isRunning?.(root)) return { ...none, kept: all };
-		const until = releasing ? nowIso : end(now, OUTLINE_TASK_GRACE_LEASE_MS);
+		const fresh = nowMs + OUTLINE_TASK_GRACE_LEASE_MS;
+		const untilOf = (task: OutlineClaimedTask): number =>
+			goingIds.has(task.block.id) ? nowMs : mode === "hour" ? fresh : (onHour(task) ?? fresh);
 		const written = await store.updateTaskClaims(
-			going.map(({ claim }) => ({
-				row: { ...claim, expiresAt: until },
-				expect: options.only ? claim : { ...claim, expiresAt: idle },
+			looseTasks.map((task) => ({
+				row: { ...task.claim, expiresAt: new Date(untilOf(task)).toISOString() },
+				expect: options.only ? task.claim : { ...task.claim, expiresAt: idle },
 			})),
 		);
 		if (!written) continue;
-		const kept = Math.max(0, all - going.length);
-		if (!releasing) return { kept, grace: going.length, released: 0 };
+		for (const task of held)
+			rememberGrace(task.block.id, { root, epoch: task.claim.epoch, until: untilOf(task) });
+		for (const task of going) graceLeases.delete(task.block.id);
+		const kept = Math.max(0, all - looseTasks.length);
+		if (going.length === 0) return { kept, grace: held.length, released: 0 };
 		if (options.isRunning?.(root)) {
 			// It started between the check and the write: its leases run again.
 			await renewOutlineTaskLeases(root, { store, now });
 			return { ...none, kept: all };
 		}
 		const result = await giveBack(store, root, going, plans ?? new Map(), now);
-		return { kept, grace: 0, released: result.reopened };
+		return { kept, grace: held.length, released: result.reopened };
 	}
 	return none;
-}
-
-/** How many of the tasks given back are not directly under another one given back. */
-function looseTops(going: readonly OutlineClaimedTask[]): number {
-	const ids = new Set(going.map(({ block }) => block.id));
-	// Deeper nesting counts both; the reply is then left out, which is the careful side.
-	return going.filter(({ block }) => block.parentId === null || !ids.has(block.parentId)).length;
 }
 
 async function giveBack(

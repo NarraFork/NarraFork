@@ -103,6 +103,9 @@ const {
 } = await import("../outline/task-session");
 const { readProjectTaskBoard } = await import("../outline/task-board");
 const { outlineRunEndsSettled } = await import("../outline/lease-keeper");
+// The run's end asks whether anything still works for the session in the background.
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+await backgroundOccupancyStore.start();
 const { isHandoffBlockId, OUTLINE_HANDOFF_ACTOR } = await import("../outline/handoff");
 const { readSubtree, loadBodies } = await import("../outline/read");
 const { OUTLINE_TASK_START_ACTOR } = await import("../task-source/outline");
