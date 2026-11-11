@@ -84,8 +84,14 @@ mock.module("../../lib/agent/provider", () => ({
 const { outlineRoutes } = await import("../../routes/outline");
 const { settings } = await import("../../lib/settings");
 const { generateId } = await import("../../lib/id");
-const { closeNarrator, continueNarrator, sendMessage, startSpecContinuationIfPossible } =
-	await import("../narrator-session");
+const {
+	closeNarrator,
+	continueNarrator,
+	decideOutlineTurnEndNote,
+	prepareOutlineRun,
+	sendMessage,
+	startSpecContinuationIfPossible,
+} = await import("../narrator-session");
 const { narratorService } = await import("../narrator-service");
 const { outlineStore } = await import("../outline/store");
 const { ensurePersonalSpace, ensureProjectSpace, ensureSessionSpace } = await import(
@@ -1436,6 +1442,35 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		await hourFrom(before);
 
 		expect(await handoffsUnder(task.id)).toHaveLength(1);
+	});
+
+	test("the turn-end note does not say a team task was left in progress when that task is being given back", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice, "Fix the refresh logic");
+		const plain = await narratorService.create({
+			contextProjectId: p.id,
+			cwd: p.dir,
+			ownerUserId: alice,
+			title: "Holder",
+			taskBackend: "outline",
+			startInPlanMode: false,
+		});
+		opened.push(plain.id);
+		await asSession(p.space.id, plain.id, alice, [
+			{ op: "setTask", block: { id: task.id }, task: { status: "doing" } },
+		]);
+		const active = {
+			narratorId: plain.id,
+			locale: "en",
+			_todoReminderCompletedToolCount: 0,
+		} as never as Parameters<typeof decideOutlineTurnEndNote>[0];
+		await prepareOutlineRun(active);
+		(active as { _todoReminderCompletedToolCount: number })._todoReminderCompletedToolCount = 40;
+		// A person's run keeps the task: the note names it, as before.
+		expect((await decideOutlineTurnEndNote(active))?.content).toContain("Fix the refresh logic");
+		// A system run ending by itself gives it back right after: no note about it.
+		expect(await decideOutlineTurnEndNote(active, { givingBackTeamTasks: true })).toBeNull();
 	});
 
 	test("opened in the previous session's directory: offered on the board when it is inside the project and still there, and used when asked", async () => {
