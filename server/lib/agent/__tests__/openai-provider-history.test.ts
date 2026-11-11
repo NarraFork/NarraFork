@@ -667,6 +667,159 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(parsed?.messageId).toBe("msg_remote_2");
 	});
 
+	test.each([
+		"failed",
+		"cancelled",
+		"canceled",
+		"incomplete",
+	])("parseResponsesAPIEvent preserves terminal image status %s and sanitized errors", (status) => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.done",
+				output_index: 2,
+				item: {
+					type: "image_generation_call",
+					id: "ig_failure",
+					status,
+					error: {
+						message: "upstream refused Authorization: Bearer secret-image-key",
+						code: "content_filter",
+					},
+				},
+			},
+			new Map(),
+			new Map(),
+		);
+		const image = events.find((event) => event.imageGeneration)?.imageGeneration;
+		expect(image?.status).toBe(status === "canceled" ? "cancelled" : status);
+		expect(image?.errorCode).toBe("content_filter");
+		expect(image?.error).toContain("upstream refused");
+		expect(image?.error).not.toContain("secret-image-key");
+		expect(image?.final).toBe(true);
+		expect(image?.result).toBeUndefined();
+	});
+
+	test("parseResponsesAPIEvent treats an item error as failure despite completed status", () => {
+		const image = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "image_generation_call",
+					id: "ig_error",
+					status: "completed",
+					error: "image backend failed",
+				},
+			},
+			new Map(),
+			new Map(),
+		).find((event) => event.imageGeneration)?.imageGeneration;
+		expect(image).toMatchObject({ status: "failed", error: "image backend failed", final: true });
+	});
+
+	test("parseResponsesAPIEvent keeps image failure lifecycle errors on the image event", () => {
+		const image = parseResponsesAPIEvent(
+			{
+				type: "response.image_generation_call.failed",
+				item_id: "ig_lifecycle_failure",
+				output_index: 1,
+				error: { message: "image backend unavailable", code: "server_error" },
+			} as Parameters<typeof parseResponsesAPIEvent>[0],
+			new Map(),
+			new Map(),
+		).find((event) => event.imageGeneration)?.imageGeneration;
+		expect(image).toMatchObject({
+			id: "ig_lifecycle_failure",
+			status: "failed",
+			error: "image backend unavailable",
+			errorCode: "server_error",
+		});
+	});
+
+	test("SDK completed lifecycle is terminal even though it carries no base64", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.image_generation_call.completed",
+				item_id: "ig_sdk_lifecycle",
+				output_index: 1,
+				sequence_number: 3,
+			},
+			new Map(),
+			new Map(),
+		);
+		expect(events[0]?.imageGeneration).toMatchObject({
+			id: "ig_sdk_lifecycle",
+			status: "completed",
+			final: true,
+		});
+	});
+
+	test("SDK response.output recovers a final image with no output_item.done or status", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.completed",
+				response: {
+					status: "completed",
+					output: [
+						{
+							id: "ig_sdk_final",
+							type: "image_generation_call",
+							result: SAMPLE_PNG_BASE64,
+						},
+					],
+				},
+			},
+			new Map(),
+			new Map(),
+		);
+		expect(events.find((event) => event.imageGeneration)?.imageGeneration).toMatchObject({
+			id: "ig_sdk_final",
+			status: "completed",
+			result: SAMPLE_PNG_BASE64,
+			final: true,
+		});
+	});
+
+	test("SDK completed output_item with result but omitted status retains the final image", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.done",
+				output_index: 1,
+				item: { id: "ig_sdk_done", type: "image_generation_call", result: SAMPLE_PNG_BASE64 },
+			},
+			new Map(),
+			new Map(),
+		);
+		expect(events[0]?.imageGeneration).toMatchObject({
+			id: "ig_sdk_done",
+			status: "completed",
+			result: SAMPLE_PNG_BASE64,
+			final: true,
+		});
+	});
+
+	test("SDK in_progress output_item with a result is not promoted to completed", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.done",
+				output_index: 1,
+				item: {
+					id: "ig_sdk_progress",
+					type: "image_generation_call",
+					status: "in_progress",
+					result: SAMPLE_PNG_BASE64,
+				},
+			},
+			new Map(),
+			new Map(),
+		);
+		expect(events[0]?.imageGeneration).toMatchObject({
+			id: "ig_sdk_progress",
+			status: "in_progress",
+			result: SAMPLE_PNG_BASE64,
+			final: true,
+		});
+	});
+
 	test("parseResponsesAPIEvent captures partial image previews", () => {
 		const events = parseResponsesAPIEvent(
 			{

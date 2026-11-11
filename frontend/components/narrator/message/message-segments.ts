@@ -593,6 +593,8 @@ export type StreamingBlock =
 			type: "image_generation";
 			id: string;
 			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			partialImageIndex?: number;
@@ -650,6 +652,8 @@ export interface StreamingWebSearchUpdate {
 export interface StreamingImageGenerationUpdate {
 	id: string;
 	status: string;
+	error?: string;
+	errorCode?: string;
 	revisedPrompt?: string;
 	result?: string;
 	partialImageIndex?: number;
@@ -716,6 +720,8 @@ export function upsertStreamingImageGenerationBlock(
 		id: update.id,
 		status: update.status,
 	};
+	if (update.error !== undefined) next.error = update.error;
+	if (update.errorCode !== undefined) next.errorCode = update.errorCode;
 	if (update.revisedPrompt !== undefined) next.revisedPrompt = update.revisedPrompt;
 	if (update.result !== undefined) next.result = update.result;
 	if (update.partialImageIndex !== undefined) next.partialImageIndex = update.partialImageIndex;
@@ -878,6 +884,8 @@ export function buildStreamingMsg(opts: {
 					type: "image_generation",
 					id: sb.id,
 					status: sb.status,
+					error: sb.error,
+					errorCode: sb.errorCode,
 					revisedPrompt: sb.revisedPrompt,
 					result: sb.result,
 					partialImageIndex: sb.partialImageIndex,

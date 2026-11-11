@@ -72,6 +72,7 @@ const SECRET_HOME_DIRS: readonly string[] = [
 	"editor-transfers",
 	"editor-native",
 	"editor-native-operations",
+	"image-generation-responses",
 	...PRIVATE_RECORDING_DIRS,
 ];
 

@@ -32,6 +32,8 @@ import type {
 	DbMessage,
 	GenerateMetaResult,
 	GenerateOptions,
+	ImageGenerationRequest,
+	ImageGenerationResponse,
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
@@ -173,6 +175,7 @@ export class PooledProvider implements ProviderAdapter {
 	supportsNativeMediaInput?: ProviderAdapter["supportsNativeMediaInput"];
 	toolLoadingTarget?: ProviderAdapter["toolLoadingTarget"];
 	getActiveReasoningSource?: ProviderAdapter["getActiveReasoningSource"];
+	generateImage?: (params: ImageGenerationRequest) => Promise<ImageGenerationResponse>;
 	generateWithHistoryWithMeta?: ProviderAdapter["generateWithHistoryWithMeta"];
 
 	constructor(
@@ -190,6 +193,19 @@ export class PooledProvider implements ProviderAdapter {
 		}
 		if (probe.getActiveReasoningSource) {
 			this.getActiveReasoningSource = () => this.current().getActiveReasoningSource?.();
+		}
+		if (probe.generateImage) {
+			this.generateImage = (params) => {
+				const key = selectProviderKey(this.providerId, params.conversationId);
+				if (!key) throw new Error("This provider has no usable API key");
+				const adapter = this.adapterFor(key);
+				const generateImage = adapter.generateImage;
+				if (!generateImage) throw new Error("This provider does not support image generation");
+				return generateImage.call(adapter, params).then((result) => ({
+					...result,
+					credentialId: key.id,
+				}));
+			};
 		}
 		if (probe.generateWithHistoryWithMeta) {
 			this.generateWithHistoryWithMeta = (systemInstruction, content, model, locale, options) =>
