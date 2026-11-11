@@ -225,9 +225,11 @@ describe("cache hit rate eligibility", () => {
 			.run();
 	}
 
-	test("summary and time buckets only use positive cache-read rows without filtering ordinary totals", async () => {
+	test("summary and time buckets include every request with cache activity, ignoring ordinary totals", async () => {
 		seedCacheRequests();
 		const stats = await service.getUsageStats(filters);
+		// 参与分母：cache-large 1600 + cache-small 100 + zero-cache 13000 + write-only 34000。
+		// `missing-cache` 读写全为 0（provider 不上报缓存），不进分母。
 		expect(stats).toMatchObject({
 			totalRequests: 5,
 			totalInputTokens: 60200,
@@ -237,49 +239,50 @@ describe("cache hit rate eligibility", () => {
 			totalTokens: 68950,
 			totalCost: 15,
 			cacheHitRateReadTokens: 900,
-			cacheHitRateInputTokens: 1700,
+			cacheHitRateInputTokens: 48700,
 		});
-		expect(stats.cacheHitRate).toBeCloseTo(900 / 1700);
+		expect(stats.cacheHitRate).toBeCloseTo(900 / 48700);
 		const points = (await service.getUsageTimeSeries(filters)).points;
 		expect(points.map((point) => point.requestCount)).toEqual([4, 1, 0]);
-		expect(points[0].cacheHitRate).toBeCloseTo(900 / 1700);
-		expect(points[1].cacheHitRate).toBeNull();
+		// 第一天只有前三条有缓存活动；第二天只有 write-only，写了 4000 却一条没读到。
+		expect(points[0].cacheHitRate).toBeCloseTo(900 / 14700);
+		expect(points[1].cacheHitRate).toBeCloseTo(0);
 		expect(points[2].cacheHitRate).toBeNull();
+		// 这个 provider 写了缓存但从未命中：命中率是 0，不是"没有数据"。
 		expect(
 			(await service.getUsageStats({ ...filters, provider: "uncached" })).cacheHitRate,
-		).toBeNull();
+		).toBeCloseTo(0);
 		expect(
 			(await service.getUsageStats({ ...filters, provider: "missing" })).cacheHitRate,
 		).toBeNull();
 	});
 
 	for (const dimension of ["provider", "model", "kind", "user"] as const) {
-		test(`keeps ${dimension} breakdown and stacked ratios weighted and null when ineligible`, async () => {
+		test(`keeps ${dimension} breakdown and stacked ratios weighted, zero when cached-but-never-read`, async () => {
 			seedCacheRequests();
 			const breakdown = await service.getUsageBreakdown(filters, {
 				dimension,
 				metric: "cacheHitRate",
 			});
-			expect(breakdown.total).toBeCloseTo(900 / 1700);
-			expect(breakdown.entries.filter((entry) => entry.value != null)).toHaveLength(1);
-			expect(breakdown.entries.find((entry) => entry.value != null)?.value).toBeCloseTo(900 / 1700);
+			expect(breakdown.total).toBeCloseTo(900 / 48700);
+			// 每组都含至少一条有缓存活动的请求，所以每组都有值；只写不读的组是 0。
+			expect(breakdown.entries.every((entry) => entry.value != null)).toBe(true);
 			expect(breakdown.entries.reduce((sum, entry) => sum + entry.count, 0)).toBe(5);
 			const stacked = await service.getUsageTimeSeriesStacked(filters, {
 				dimension,
 				metric: "cacheHitRate",
 			});
-			const participating = stacked.series.find((series) => series.data[0].value != null);
-			expect(participating?.data[0].value).toBeCloseTo(900 / 1700);
+			expect(stacked.series.some((series) => series.data[0].value != null)).toBe(true);
+			// 第三天没有任何请求，所有系列都该是 null。
 			for (const series of stacked.series) {
-				expect(series.data[1].value).toBeNull();
 				expect(series.data[2].value).toBeNull();
 			}
+			// 只写缓存、从未读到的 provider 现在是 0，而不是"没有数据"。
 			const empty = await service.getUsageBreakdown(
 				{ ...filters, provider: "uncached" },
 				{ dimension, metric: "cacheHitRate" },
 			);
-			expect(empty.total).toBeNull();
-			expect(empty.entries.every((entry) => entry.value === null)).toBe(true);
+			expect(empty.total).toBeCloseTo(0);
 		});
 	}
 
