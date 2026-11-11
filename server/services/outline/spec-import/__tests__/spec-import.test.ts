@@ -14,6 +14,7 @@ import { invalidateTaskBackend } from "../../../task-source";
 import { readTaskBackend } from "../../../task-source/backend";
 import { stopEditTextWorker } from "../../edit-text-runner";
 import { outlineStore } from "../../store";
+import { writeOutline } from "../../write";
 import { importSpecSession, resetSpecImportRecords, specImportRecord } from "../importer";
 import {
 	backendOf,
@@ -267,5 +268,120 @@ describe("the guard", () => {
 		expect(String((refused as { code?: string })?.code)).toBe("SPEC_OUTLINE_SESSION");
 		// The spec rows are still readable.
 		expect((await readSpecFile(id, "spec://tasks.json")).content).toContain('"a"');
+	});
+});
+
+describe("an attempt met again", () => {
+	test("a task deleted or reopened between attempts is put back before the session moves", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [
+			{ text: "a", status: "doing" },
+			{ text: "b" },
+			{ text: "c", status: "done" },
+		]);
+		// First attempt: everything written, then cut before the move.
+		const cut = new AbortController();
+		let commits = 0;
+		const off = onCommit(() => {
+			if (++commits === 2) cut.abort(new Error("cut"));
+		});
+		expect((await importSpecSession(id, { trigger: "sweep", signal: cut.signal })).status).toBe(
+			"failed",
+		);
+		off();
+		expect(await backendOf(id)).toBe("spec");
+		const before = await taskPage(id);
+		expect(before.map((t) => t.text)).toEqual(["a", "b", "c"]);
+		const space = await outlineStore.findSpace({ kind: "session", narratorId: id });
+		// Meanwhile: the lease job reopened what was in progress, and someone deleted a task.
+		await writeOutline({
+			spaceId: space?.id as string,
+			ops: [
+				{ op: "setTask", block: { id: before[0]?.id as string }, task: { status: "todo" } },
+				{ op: "delete", block: { id: before[1]?.id as string } },
+			],
+			actor: { kind: "system", id: "outline-task-lease" },
+			responsibleUserId: null,
+		});
+		expect((await run(id)).status).toBe("imported");
+		const after = await taskPage(id);
+		expect(after.map((t) => [t.text, t.status])).toEqual([
+			["a", "doing"],
+			["b", "todo"],
+			["c", "done"],
+		]);
+		expect(after[0]?.holder).toBe(id);
+		expect(after.map((t) => t.id)).toEqual(before.map((t) => t.id));
+	});
+
+	test("two imports of one session at once are one import", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "a" }, { text: "b" }]);
+		const [first, second] = await Promise.all([run(id), run(id)]);
+		expect(first.status).toBe("imported");
+		expect(second).toEqual(first);
+		expect((await taskPage(id)).map((t) => t.text)).toEqual(["a", "b"]);
+	});
+
+	test("a source that changes while the import runs moves nothing", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "a" }]);
+		const { db } = await import("../../../../db");
+		const { specNamespaceFiles, specNamespaces } = await import("../../../../db/schema");
+		const { eq } = await import("drizzle-orm");
+		const ns = await db.query.specNamespaces.findFirst({
+			where: eq(specNamespaces.narratorId, id),
+		});
+		let changed = false;
+		const off = onCommit(() => {
+			if (changed) return;
+			changed = true;
+			// Past the guard, as a write of another process would be.
+			db.insert(specNamespaceFiles)
+				.values({
+					id: `late-${id}`,
+					namespaceId: ns?.id as string,
+					path: "late.md",
+					revisionId: null,
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				})
+				.run();
+		});
+		const outcome = await run(id);
+		off();
+		expect(outcome).toMatchObject({ status: "failed", attention: false });
+		expect(await backendOf(id)).toBe("spec");
+		// The next attempt imports what is there now, and nothing twice.
+		expect((await run(id)).status).toBe("imported");
+		expect((await taskPage(id)).map((t) => t.text)).toEqual(["a"]);
+	});
+});
+
+describe("limits", () => {
+	test("a task text of several paragraphs is the task and what is under it, as /goal splits it", async () => {
+		const { id } = await makeSession();
+		await writeTasks(id, [{ text: "The goal\n\nA second paragraph" }, { text: "plain" }]);
+		expect((await run(id)).status).toBe("imported");
+		const tasks = await taskPage(id);
+		expect(tasks.map((t) => t.text)).toEqual(["The goal", "plain"]);
+		expect(tasks[0]?.children).toEqual(["A second paragraph"]);
+	});
+
+	test("a full task list (100 tasks of 1000 characters) arrives whole, in order, in several commits", async () => {
+		const { id } = await makeSession();
+		const tasks = Array.from({ length: 100 }, (_, i) => ({
+			text: `${i} ${"字".repeat(990)}`,
+			status: (["todo", "doing", "done", "blocked"] as const)[i % 4],
+		}));
+		await writeTasks(id, tasks);
+		const outcome = await run(id);
+		expect(outcome).toMatchObject({ status: "imported", tasks: 100 });
+		expect((outcome as { commits: number }).commits).toBeGreaterThan(2);
+		const imported = await taskPage(id);
+		expect(imported).toHaveLength(100);
+		expect(imported.map((t) => t.text.split(" ")[0])).toEqual(tasks.map((_, i) => String(i)));
+		expect(imported.map((t) => t.status)).toEqual(
+			tasks.map((t) => (t.status === "blocked" ? "doing" : t.status)),
+		);
 	});
 });
