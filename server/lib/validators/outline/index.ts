@@ -1,6 +1,7 @@
 import {
 	OUTLINE_BLOCK_ID_RE,
 	OUTLINE_PENDING_API_LIMITS,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_RESOLVE_REQUEST_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
@@ -83,14 +84,41 @@ export const outlineResolveQuerySchema = z
 		message: "commit needs space",
 	});
 
-/** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
-export const outlineViewStatePutSchema = z.object({
-	// Block ids only: not free text (a reader may write this for every page they can read).
-	collapsed: z
-		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
-		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
-	layout: z.enum(["right", "down"]),
+/** The report containers to name the subagents of (`GET /spaces/:spaceId/report-authors`). */
+export const outlineReportAuthorsQuerySchema = z.object({
+	ids: z
+		.string()
+		.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds * (OUTLINE_VIEW_STATE_LIMITS.maxIdChars + 1))
+		.transform((value) => value.split(",").filter(Boolean))
+		.pipe(
+			z
+				.array(z.string().regex(OUTLINE_BLOCK_ID_RE))
+				.min(1)
+				.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds),
+		),
 });
+
+/** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
+export const outlineViewStatePutSchema = z
+	.object({
+		// Block ids only: not free text (a reader may write this for every page they can read).
+		collapsed: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
+		// What the reader opened that is folded by default; absent from an older client.
+		expanded: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)
+			.optional(),
+		layout: z.enum(["right", "down"]),
+	})
+	// The two sets share one budget (what is stored is bounded the same way).
+	.refine(
+		(body) =>
+			body.collapsed.length + (body.expanded?.length ?? 0) <=
+			OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+		{ message: "collapsed and expanded together exceed the limit" },
+	);
 
 /** Locking a task tree: the session that may confirm step changes on the locker's behalf. */
 export const outlineLockBodySchema = z.object({

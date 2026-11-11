@@ -38,6 +38,7 @@ import { type OutlineOpener, useOutlineOpener } from "../../lib/outline-opener";
 import { outlineRouterLink, useOutlineRouterNavigate } from "../../lib/outline-router";
 import { parseOutlineBlockSearch } from "../../lib/outline-view";
 import outlineEn from "../../locales/en/outline.json";
+import outlineZh from "../../locales/zh-CN/outline.json";
 import { DockviewSurface } from "../dockview";
 import { dockPanelId } from "../narrator/dock/dock-panel-types";
 import { NarratorDockProvider, useNarratorDockContext } from "../narrator/dock/NarratorDockContext";
@@ -65,9 +66,11 @@ import { quickSwitcherIndexOf } from "./QuickSwitcher";
 import { OutlineViewStates } from "./view-state";
 
 const instance = i18next.createInstance();
-await instance
-	.use(initReactI18next)
-	.init({ lng: "en", resources: { en: { outline: outlineEn } }, react: { useSuspense: false } });
+await instance.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { outline: outlineEn }, "zh-CN": { outline: outlineZh } },
+	react: { useSuspense: false },
+});
 
 class SocketTransport implements LiveTransport {
 	connected = false;
@@ -164,11 +167,15 @@ export function ready(): boolean {
 	return true;
 }
 
+let scheme: "light" | "dark" | undefined;
+
 function providers(children: React.ReactNode, queryClient: QueryClient) {
 	return (
 		<I18nextProvider i18n={instance}>
 			<QueryClientProvider client={queryClient}>
-				<MantineProvider>{children}</MantineProvider>
+				<MantineProvider {...(scheme ? { forceColorScheme: scheme } : {})}>
+					{children}
+				</MantineProvider>
 			</QueryClientProvider>
 		</I18nextProvider>
 	);
@@ -236,6 +243,11 @@ export interface OpenOptions {
 	blockId: string;
 	/** The page's lens: everything (the default here) or the facts view. */
 	lens?: "facts" | "all";
+	/** The reader's language and colour scheme (English and light by default). */
+	lang?: "en" | "zh-CN";
+	scheme?: "light" | "dark";
+	/** Open the page as of a commit (the read-only tree) instead of the live page. */
+	asOf?: number;
 }
 
 let lens: "facts" | "all" = "all";
@@ -244,16 +256,22 @@ let lens: "facts" | "all" = "all";
 export function open(options: OpenOptions): void {
 	host = options.host;
 	lens = options.lens ?? "all";
+	scheme = options.scheme;
+	if (options.lang) void instance.changeLanguage(options.lang);
 	window.addEventListener("error", (e) => errors.push(String(e.message)));
 	transport = new SocketTransport(options.wsUrl);
 	overrideLiveTransportForTests(transport);
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
 	if (options.host === "page") {
+		const search = new URLSearchParams();
+		if (lens === "all") search.set("view", "all");
+		if (options.asOf !== undefined) search.set("asOf", String(options.asOf));
+		const query = search.toString();
 		window.history.replaceState(
 			null,
 			"",
-			`/outline/${options.spaceId}/${options.blockId}${lens === "all" ? "?view=all" : ""}`,
+			`/outline/${options.spaceId}/${options.blockId}${query ? `?${query}` : ""}`,
 		);
 		router = createRouter({
 			routeTree: rootRoute.addChildren([pageRoute]),
@@ -370,6 +388,7 @@ export function state() {
 		view: s.view,
 		focus: s.focus,
 		collapsed: s.collapsed,
+		expanded: s.expanded,
 		caret: s.caret,
 		blocks: s.blocks,
 		layout: s.layout,
@@ -1268,4 +1287,333 @@ export async function switcherEnterToFocus(
 	while (!surfaceEditable() && performance.now() < end) await new Promise((r) => setTimeout(r, 2));
 	const editableMs = surfaceEditable() ? performance.now() - t0 : -1;
 	return { ms, focused, editableMs, wasSeeded };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Folding (task tree readability, PR C): the default view, previews, the controls
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface FoldRowDom {
+	id: string;
+	/** The row's own text (its first line box), without its children's. */
+	text: string;
+	state: "open" | "closed" | null;
+	preview: { kind: string; text: string; label: string } | null;
+	quick: "expand" | "collapse" | null;
+	/** Counts of what the closed row hides, by kind. */
+	hidden: Record<string, number>;
+	/** Markers drawn on the row (exactly one). */
+	markers: number;
+}
+
+function shown(el: Element | null | undefined): el is HTMLElement {
+	return el instanceof HTMLElement && el.getClientRects().length > 0;
+}
+
+/** Which surface is on screen: the live editor's outline, or the read-only tree. */
+export function foldSurface(): "editor" | "tree" | "none" {
+	if (document.querySelector("[data-testid=outline-block-tree]")) return "tree";
+	return liveEditSurfaces().length > 0 ? "editor" : "none";
+}
+
+/** The rows on screen, in document order, as either surface draws them. */
+export function foldRows(): FoldRowDom[] {
+	const hiddenOf = (scope: Element): Record<string, number> => {
+		const out: Record<string, number> = {};
+		for (const chip of scope.querySelectorAll<HTMLElement>("[data-testid=outline-fold-hidden]")) {
+			if (chip.closest(".ob-children")?.parentElement?.parentElement === scope) continue;
+			out[chip.dataset.kind ?? ""] = Number(chip.textContent);
+		}
+		return out;
+	};
+	if (foldSurface() === "tree") {
+		const tree = document.querySelector("[data-testid=outline-block-tree]") as HTMLElement;
+		return [...tree.querySelectorAll<HTMLElement>("[data-block-id]")].map((row) => {
+			const id = row.dataset.blockId as string;
+			const line = tree.querySelector<HTMLElement>(`[data-fold-of="${id}"]`);
+			const body = row.querySelector<HTMLElement>(".nf-type-scope");
+			return {
+				id,
+				text: (body?.textContent ?? "").trim(),
+				state: (row.dataset.fold as "open" | "closed" | undefined) ?? null,
+				preview: line
+					? {
+							kind: line.dataset.foldPreview ?? "",
+							text: line.querySelector("[data-fold-preview-text]")?.textContent ?? "",
+							label: line.querySelector("[data-fold-preview-label]")?.textContent ?? "",
+						}
+					: null,
+				quick:
+					(row.querySelector<HTMLElement>("[data-fold-subtree]")?.dataset.foldSubtree as
+						| "expand"
+						| "collapse"
+						| undefined) ?? null,
+				hidden: hiddenOf(row),
+				markers: row.querySelectorAll(
+					":scope > a > [data-collapsed], :scope > [role=img], :scope > span > [role=img]",
+				).length,
+			};
+		});
+	}
+	const v = view();
+	const out: FoldRowDom[] = [];
+	// The root is the page's title, not a row.
+	for (const el of v.pm.dom.querySelectorAll<HTMLElement>(".ob-block .ob-block")) {
+		if (!shown(el)) continue;
+		const part = (cls: string) => el.querySelector<HTMLElement>(`:scope > ${cls}`);
+		const line = part(".ob-preview");
+		const quick = part(".ob-subtree");
+		const hasKids = el.classList.contains("has-kids");
+		const marks = part(".ob-marks");
+		const hidden: Record<string, number> = {};
+		for (const chip of marks?.querySelectorAll<HTMLElement>(".ob-fold-hidden") ?? [])
+			hidden[chip.dataset.kind ?? ""] = Number(chip.textContent);
+		const gutter = part(".ob-gutter") as HTMLElement;
+		out.push({
+			id: el.dataset.id ?? "",
+			text: (el.querySelector(":scope > .ob-content > :first-child")?.textContent ?? "").trim(),
+			state: hasKids ? (el.classList.contains("collapsed") ? "closed" : "open") : null,
+			preview: shown(line)
+				? {
+						kind: line.dataset.foldPreview ?? "",
+						text: shown(line.querySelector(".ob-preview-text"))
+							? (line.querySelector(".ob-preview-text")?.textContent ?? "")
+							: "",
+						label: shown(line.querySelector(".ob-preview-label"))
+							? (line.querySelector(".ob-preview-label")?.textContent ?? "")
+							: "",
+					}
+				: null,
+			quick: shown(quick) ? ((quick.dataset.foldSubtree as "expand" | "collapse") ?? null) : null,
+			hidden,
+			markers: [...gutter.querySelectorAll<HTMLElement>(".ob-bullet, .ob-check")].filter(shown)
+				.length,
+		});
+	}
+	return out;
+}
+
+/** The centre of a row's folding control, in the viewport (for a real click or tap). */
+export function foldPoint(
+	id: string,
+	part: "arrow" | "quick" | "preview",
+): { x: number; y: number } | null {
+	let el: HTMLElement | null;
+	if (foldSurface() === "tree") {
+		const sel = { arrow: "[data-fold-toggle]", quick: "[data-fold-subtree]" };
+		el =
+			part === "preview"
+				? document.querySelector(`[data-fold-of="${id}"]`)
+				: document.querySelector(`[data-block-id="${id}"] ${sel[part]}`);
+	} else {
+		const block = view().blockEls.get(id);
+		const sel = { arrow: ".ob-gutter > .ob-arrow", quick: ".ob-subtree", preview: ".ob-preview" };
+		el = block?.querySelector(`:scope > ${sel[part]}`) ?? null;
+	}
+	if (!shown(el)) return null;
+	el.scrollIntoView({ block: "nearest" });
+	const r = el.getBoundingClientRect();
+	// A preview line is as wide as its row: its text starts at the left.
+	return { x: part === "preview" ? r.left + 12 : r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
+/** A row's folding control (to focus it, read its name, send it keys). */
+export function foldControl(id: string, part: "arrow" | "quick" | "preview"): HTMLElement | null {
+	if (foldSurface() === "tree") {
+		const sel = { arrow: "[data-fold-toggle]", quick: "[data-fold-subtree]" };
+		return part === "preview"
+			? document.querySelector(`[data-fold-of="${id}"]`)
+			: document.querySelector(`[data-block-id="${id}"] ${sel[part]}`);
+	}
+	const block = view().blockEls.get(id);
+	const sel = { arrow: ".ob-gutter > .ob-arrow", quick: ".ob-subtree", preview: ".ob-preview" };
+	return block?.querySelector(`:scope > ${sel[part]}`) ?? null;
+}
+
+/** Focus a folding control; false when it is not there. */
+export function foldFocus(id: string, part: "arrow" | "quick" | "preview"): boolean {
+	const el = foldControl(id, part);
+	if (!shown(el)) return false;
+	el.focus();
+	return document.activeElement === el;
+}
+
+/** Which folding control has the keyboard: `<part>:<block id>`, or what else does. */
+export function foldFocused(): string {
+	const a = document.activeElement as HTMLElement | null;
+	if (!a) return "none";
+	const editorBlock = a.closest<HTMLElement>(".ob-block");
+	if (a.classList.contains("ob-arrow")) return `arrow:${editorBlock?.dataset.id}`;
+	if (a.classList.contains("ob-subtree")) return `quick:${editorBlock?.dataset.id}`;
+	if (a.classList.contains("ob-preview")) return `preview:${editorBlock?.dataset.id}`;
+	if (a.dataset.foldToggle !== undefined)
+		return `arrow:${a.closest<HTMLElement>("[data-block-id]")?.dataset.blockId}`;
+	if (a.dataset.foldSubtree !== undefined)
+		return `quick:${a.closest<HTMLElement>("[data-block-id]")?.dataset.blockId}`;
+	if (a.dataset.foldOf !== undefined) return `preview:${a.dataset.foldOf}`;
+	if (a.classList.contains("ProseMirror")) return "editor";
+	return a.tagName.toLowerCase();
+}
+
+/** The accessible name, state and hint of a folding control. */
+export function foldAria(id: string, part: "arrow" | "quick" | "preview") {
+	const el = foldControl(id, part);
+	return el
+		? {
+				role: el.getAttribute("role") ?? el.tagName.toLowerCase(),
+				label: el.getAttribute("aria-label"),
+				expanded: el.getAttribute("aria-expanded"),
+				title: el.getAttribute("title"),
+				tabIndex: el.tabIndex,
+			}
+		: null;
+}
+
+/** The page's own control (「全部展开 / 全部收起」): what it offers, its name, where it is. */
+export function foldAll(): { offers: string; label: string; x: number; y: number } | null {
+	const el = document.querySelector<HTMLElement>("[data-testid=outline-fold-all]");
+	if (!shown(el)) return null;
+	const r = el.getBoundingClientRect();
+	return {
+		offers: el.dataset.foldAll ?? "",
+		label: el.getAttribute("aria-label") ?? el.textContent ?? "",
+		x: r.left + r.width / 2,
+		y: r.top + r.height / 2,
+	};
+}
+
+/** The reader's folding as this surface holds it (what is stored for them). */
+export function foldState(): { expanded: string[]; collapsed: string[] } {
+	const s = surface().state.snapshot();
+	return { expanded: s.expanded, collapsed: s.collapsed };
+}
+
+/** Keys that reached the window while a test pressed them on a control (they must not). */
+const leaked: string[] = [];
+let leakWatch = false;
+export function watchKeyLeaks(): void {
+	leaked.length = 0;
+	if (leakWatch) return;
+	leakWatch = true;
+	window.addEventListener("keydown", (e) => {
+		// A modifier going down by itself is nobody's key.
+		if (e.key === "Alt" || e.key === "Control" || e.key === "Shift" || e.key === "Meta") return;
+		leaked.push(`${e.key}${e.defaultPrevented ? ":prevented" : ""}`);
+	});
+}
+export function keyLeaks(): string[] {
+	return [...leaked];
+}
+
+/** Layout facts of the fold's parts: one-line previews, nothing wider than the surface. */
+export function foldLayout(): {
+	overflowX: boolean;
+	previews: Array<{ id: string; lines: number; cut: boolean; labelSeen: boolean }>;
+	hoverRules: string[];
+} {
+	const lineOf = (el: HTMLElement) => Number.parseFloat(getComputedStyle(el).lineHeight) || 20;
+	const tree = foldSurface() === "tree";
+	const lines = tree
+		? [...document.querySelectorAll<HTMLElement>("[data-fold-preview]")]
+		: [...view().pm.dom.querySelectorAll<HTMLElement>(".ob-preview")].filter(shown);
+	const scroller = tree
+		? (document.querySelector("[data-testid=outline-surface]") as HTMLElement)
+		: surface().scroller;
+	// No `:hover` rule may name a frame part (touch adjustment retargets long presses to them).
+	const hoverRules: string[] = [];
+	for (const sheet of document.styleSheets) {
+		let rules: CSSRuleList;
+		try {
+			rules = sheet.cssRules;
+		} catch {
+			continue;
+		}
+		for (const rule of rules) {
+			const sel = (rule as CSSStyleRule).selectorText ?? "";
+			if (
+				/:hover/.test(sel) &&
+				/\.ob-(arrow|bullet|check|zoom|subtree|preview|fold-hidden)/.test(sel)
+			)
+				hoverRules.push(sel);
+		}
+	}
+	return {
+		overflowX:
+			scroller.scrollWidth > scroller.clientWidth + 1 ||
+			document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+		previews: lines.map((el) => {
+			const text = el.querySelector<HTMLElement>(
+				tree ? "[data-fold-preview-text]" : ".ob-preview-text",
+			);
+			const label = el.querySelector<HTMLElement>(
+				tree ? "[data-fold-preview-label]" : ".ob-preview-label",
+			);
+			const r = el.getBoundingClientRect();
+			const lr = label && shown(label) ? label.getBoundingClientRect() : null;
+			return {
+				id: tree
+					? (el.dataset.foldOf ?? "")
+					: (el.closest<HTMLElement>(".ob-block")?.dataset.id ?? ""),
+				lines: Math.round(r.height / lineOf(el)),
+				cut: !!text && text.scrollWidth > text.clientWidth + 1,
+				// The label is inside the line's box (never pushed out by a long text).
+				labelSeen: !lr || (lr.right <= r.right + 1 && lr.width > 0),
+			};
+		}),
+		hoverRules,
+	};
+}
+
+/** Locks, pending changes and unanswered questions as the page's summary would mark them. */
+export function setMarks(
+	marks: Record<string, { lockedBy?: string; pending?: string[]; openQuestion?: boolean }>,
+): void {
+	surface().setMarks(new Map(Object.entries(marks)), true);
+}
+
+/** The report lines the editor draws (the readable line of each container on screen). */
+export function reportLines(): Array<{ id: string; label: string }> {
+	if (foldSurface() === "tree")
+		return [...document.querySelectorAll<HTMLElement>("[data-testid=outline-report-line]")].map(
+			(el) => ({
+				id: el.closest<HTMLElement>("[data-block-id]")?.dataset.blockId ?? "",
+				label: el.textContent ?? "",
+			}),
+		);
+	return [...view().pm.dom.querySelectorAll<HTMLElement>(".ob-report-line")]
+		.filter(shown)
+		.map((el) => ({
+			id: el.closest<HTMLElement>(".ob-block")?.dataset.id ?? "",
+			label: el.dataset.reportLabel ?? "",
+		}));
+}
+
+/** The map's nodes on screen with their count badges ("" for none). */
+export function mapBadges(): Record<string, string> {
+	const out: Record<string, string> = {};
+	const m = surface().map;
+	for (const [id, ne] of m.els) out[id] = ne.badge.textContent ?? "";
+	return out;
+}
+
+/** The centre of a map node's folding arrow, in the viewport. */
+export function mapArrowPoint(id: string): { x: number; y: number } | null {
+	const arrow = surface().map.els.get(id)?.el.querySelector<HTMLElement>(".ob-arrow");
+	if (!shown(arrow)) return null;
+	const r = arrow.getBoundingClientRect();
+	return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
+/** Set a block's checkbox through the editor (another person ticking a task). */
+export function setTask(blockId: string, task: " " | "/" | "x" | "-" | null): boolean {
+	const v = view();
+	const pos = findBlockPos(v.pm.state.doc, blockId);
+	if (pos == null) return false;
+	v.pm.dispatch(v.pm.state.tr.setNodeAttribute(pos, "task", task));
+	return true;
+}
+
+/** Jump to a block as the quick switcher does (focus it and put the cursor on it). */
+export function reveal(id: string): boolean {
+	return surface().reveal(id);
 }

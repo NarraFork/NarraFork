@@ -61,6 +61,7 @@ mock.module("../../hooks/useOutline", () => ({
 	useOutlineTimeline: () => ({ ...idle, hasNextPage: false }),
 	useRevertOutlineCommit: () => ({ mutate: () => {}, isPending: false }),
 	useOutlinePagePending: () => idle,
+	useOutlineReportAuthors: () => idle,
 	useOutlinePendingDetail: () => idle,
 	useDecideOutlinePending: () => ({ mutate: () => {}, isPending: false }),
 	useOutlineLock: () => ({ mutate: () => {}, isPending: false }),

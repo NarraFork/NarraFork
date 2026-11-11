@@ -40,6 +40,7 @@
 
 import { blockTitle, isSpaceKey } from "@shared/outline";
 import {
+	OUTLINE_PENDING_API_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 	type OutlineAnswerResponse,
@@ -56,6 +57,7 @@ import {
 	type OutlinePendingSummary,
 	type OutlinePlanDiffResponse,
 	type OutlineQuestionGroupResponse,
+	type OutlineReportAuthorsResponse,
 	type OutlineResolveResponse,
 	type OutlineRevertResponse,
 	type OutlineSearchResponse,
@@ -66,6 +68,7 @@ import {
 	type OutlineTimelineResponse,
 	type OutlineViewStateResponse,
 } from "@shared/outline-api";
+import { isOutlineReportBlockId } from "@shared/outline-report-line";
 import {
 	OUTLINE_TASK_BOARD_LIMITS,
 	type OutlineBoardAddResponse,
@@ -96,6 +99,7 @@ import {
 	outlinePageListQuerySchema,
 	outlinePendingRejectBodySchema,
 	outlinePlanDiffQuerySchema,
+	outlineReportAuthorsQuerySchema,
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
@@ -141,6 +145,7 @@ import {
 	reviewDiffOptions,
 } from "../services/outline/plans";
 import { commitSeqAt } from "../services/outline/read";
+import { readReportAuthors } from "../services/outline/report-authors";
 import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "../services/outline/search";
@@ -774,10 +779,38 @@ outlineRoutes.get("/spaces/:spaceId/pages/:pageId/pending", async (c) => {
 	);
 	const manages = views.size > 0 ? await canManageSpace(principal, space) : false;
 	for (const lock of views.values()) lock.canUnlock = unlockAllowed(principal, lock, manages);
+	// This page's unanswered questions (one indexed read): a block over one is never folded by
+	// default, and a row the reader folded counts those it hides.
+	const questions = await outlineStore.listOpenQuestionBlocksOnPage(
+		space.id,
+		block.pageId,
+		OUTLINE_PENDING_API_LIMITS.openQuestions,
+	);
 	const body: OutlinePagePendingResponse = {
 		pending: await describePending(principal, space, pending),
 		locks: [...views.values()],
+		questions,
 	};
+	return c.json(body);
+});
+
+/**
+ * Who wrote the subagent reports of a page the live editor shows (their container lines say
+ * 「来自 …」): the subagent's session title, for the containers whose session the person may
+ * read. The read-only view gets the same with its blocks (`readBlockView`).
+ */
+outlineRoutes.get("/spaces/:spaceId/report-authors", async (c) => {
+	const principal = principalOf(c);
+	const space = await readableSpace(principal, idParam(c, "spaceId"));
+	const { ids } = parse(outlineReportAuthorsQuerySchema, c.req.query());
+	// Live report containers of this space only (ids of other spaces are not found).
+	const metas = (await outlineStore.getBlockMetas(space.id, { ids: [...new Set(ids)] })).filter(
+		(meta) => !meta.deleted && isOutlineReportBlockId(meta.id),
+	);
+	const authors = await readReportAuthors(space.id, metas, {
+		narratorVisible: narratorVisibility(principal),
+	});
+	const body: OutlineReportAuthorsResponse = { authors: Object.fromEntries(authors) };
 	return c.json(body);
 });
 
