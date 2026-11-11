@@ -11,6 +11,9 @@
  *     cancelling it from the menu is not offered meanwhile, so no waiting change is left behind.
  *   - Cancelled tasks are folded under their count until opened.
  *   - Every task opens in the outline.
+ *   - A task of the project's space that can be started has "Open a new session for this" (outline
+ *     P2 PR 10c-1, D54; `OpenTaskSession.tsx`): a new session takes it and starts on it; the row
+ *     then says which session is on it. Such tasks are grouped as "Ready to start".
  *   - A task the reader manages that an agent finished is marked 「新完成」 (D50 ④, outline P2
  *     PR 9b) until they have seen it: once its row has been on screen, the board tells the server
  *     (`useNewlyDoneMarks`); the mark stays for as long as this board is open, and is gone the
@@ -74,6 +77,7 @@ import { ensureTypographyCssVars, TYPE_ROLE_STYLE } from "../../../lib/typograph
 import { useEditorPanelVisible } from "../../narrator/narrator-panel-visibility";
 import { DiffEntry } from "../OutlinePendingPanel";
 import { OutlineStatusChip, OutlineStatusIcon } from "../OutlineStatusIcon";
+import { OpenSessionForm, useOpenSessionControl } from "./OpenTaskSession";
 import { TransferSessions } from "./TransferSessions";
 
 // Task text paints with the reader's typography variables (TYPE_ROLE_STYLE).
@@ -143,6 +147,7 @@ function executorLabel(
 	executor: OutlineBoardExecutor,
 	ownSession: string | null,
 	me: string,
+	scopeKind?: "session" | "project",
 ): string {
 	switch (executor.kind) {
 		case "session":
@@ -154,7 +159,8 @@ function executorLabel(
 		case "agent":
 			return t("board.agent", { name: executor.name });
 		default:
-			return t("board.nobody");
+			// A project's unassigned tasks wait for someone to open a session for them (D54).
+			return scopeKind === "project" ? t("board.readyToStart") : t("board.nobody");
 	}
 }
 
@@ -337,6 +343,8 @@ export interface TaskBoardProps {
 	pages: readonly OutlineTaskBoardResponse[];
 	/** Open a task in the outline (the host decides where: a dock panel, the outline page). */
 	onOpenTask?: (task: OutlineBoardTask) => void;
+	/** Open a session (the one doing a task); without it the row links to the session's page. */
+	onOpenSession?: (narratorId: string) => void;
 	/** A project board's next page of spaces. */
 	onLoadMoreSpaces?: () => void;
 	hasMoreSpaces?: boolean;
@@ -346,6 +354,7 @@ export interface TaskBoardProps {
 export function TaskBoard({
 	pages,
 	onOpenTask,
+	onOpenSession,
 	onLoadMoreSpaces,
 	hasMoreSpaces,
 	loadingMoreSpaces,
@@ -425,12 +434,13 @@ export function TaskBoard({
 				<ExecutorGroupView
 					key={group.key}
 					group={group}
-					label={executorLabel(t, group.executor, ownSession, me)}
+					label={executorLabel(t, group.executor, ownSession, me, scope?.kind)}
 					sectionOf={sectionOf}
 					scopeKind={scope?.kind ?? "session"}
 					me={me}
 					newly={newly}
 					onOpenTask={onOpenTask}
+					onOpenSession={onOpenSession}
 				/>
 			))}
 			{truncated.map((section) => (
@@ -483,6 +493,7 @@ function ExecutorGroupView({
 	me,
 	newly,
 	onOpenTask,
+	onOpenSession,
 }: {
 	group: ExecutorGroup;
 	label: string;
@@ -491,6 +502,7 @@ function ExecutorGroupView({
 	me: string;
 	newly: NewlyDoneMarks;
 	onOpenTask?: (task: OutlineBoardTask) => void;
+	onOpenSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const [showCancelled, setShowCancelled] = useState(false);
@@ -560,6 +572,7 @@ function ExecutorGroupView({
 										me={me}
 										newly={newly}
 										onOpenTask={onOpenTask}
+										onOpenSession={onOpenSession}
 									/>
 								))}
 						</Stack>
@@ -577,6 +590,7 @@ function TaskRow({
 	me,
 	newly,
 	onOpenTask,
+	onOpenSession,
 }: {
 	task: OutlineBoardTask;
 	section: OutlineBoardSection | undefined;
@@ -584,10 +598,27 @@ function TaskRow({
 	me: string;
 	newly: NewlyDoneMarks;
 	onOpenTask?: (task: OutlineBoardTask) => void;
+	onOpenSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const queryClient = useQueryClient();
 	const update = useUpdateBoardTask();
+	const session = useOpenSessionControl(task, t);
+	// The session doing a project task: the one this row just opened, or the one the board names.
+	const doingSession =
+		session.opened ??
+		(scopeKind === "project" &&
+		section?.space.kind === "project" &&
+		task.status === "doing" &&
+		task.executor.kind === "session"
+			? task.executor.narratorId
+			: null);
+	const doingTitle =
+		session.opened !== null
+			? task.title
+			: task.executor.kind === "session"
+				? task.executor.title
+				: null;
 	// The popover under the menu: a username to hand to, or the sessions to hand to.
 	const [assigning, setAssigning] = useState<false | "user" | "session">(false);
 	const [username, setUsername] = useState("");
@@ -708,6 +739,81 @@ function TaskRow({
 							</Text>
 						)}
 					</Group>
+					{(session.offered || doingSession) && (
+						<Group gap={4} justify="flex-end" wrap="wrap" data-testid="task-open-session-row">
+							{session.offered && (
+								<Popover
+									opened={session.formOpen}
+									onChange={session.setFormOpen}
+									withinPortal
+									position="bottom-end"
+									shadow="md"
+								>
+									<Popover.Target>
+										<Button.Group>
+											<Button
+												size="compact-xs"
+												leftSection={<IconPlayerPlay size={12} />}
+												loading={session.pending}
+												onClick={() => session.submit()}
+												data-testid="task-open-session"
+											>
+												{t("board.openSession.button")}
+											</Button>
+											<Button
+												size="compact-xs"
+												px={4}
+												disabled={session.pending}
+												aria-label={t("board.openSession.options")}
+												aria-expanded={session.formOpen}
+												onClick={() => session.setFormOpen(!session.formOpen)}
+												data-testid="task-open-session-options"
+											>
+												<IconChevronDown size={12} />
+											</Button>
+										</Button.Group>
+									</Popover.Target>
+									<Popover.Dropdown>
+										<OpenSessionForm control={session} t={t} />
+									</Popover.Dropdown>
+								</Popover>
+							)}
+							{doingSession && (
+								<Button
+									component="a"
+									href={`/narrators/${encodeURIComponent(doingSession)}`}
+									size="compact-xs"
+									variant="light"
+									leftSection={<IconExternalLink size={12} />}
+									onClick={(event) => {
+										if (!onOpenSession) return;
+										event.preventDefault();
+										onOpenSession(doingSession);
+									}}
+									styles={{ label: { whiteSpace: "normal", textAlign: "left" } }}
+									h="auto"
+									mih={22}
+									data-testid="task-open-session-doing"
+									data-narrator-id={doingSession}
+								>
+									{doingTitle
+										? t("board.openSession.doing", { title: doingTitle })
+										: t("board.openSession.doingUntitled")}
+								</Button>
+							)}
+						</Group>
+					)}
+					{session.error && !session.formOpen && (
+						<Text
+							size="xs"
+							c="red"
+							role="alert"
+							style={TYPE_ROLE_STYLE.xs}
+							data-testid="task-open-session-error"
+						>
+							{session.error}
+						</Text>
+					)}
 				</Stack>
 				<Popover
 					opened={assigning !== false}
@@ -733,6 +839,27 @@ function TaskRow({
 									</ActionIcon>
 								</Menu.Target>
 								<Menu.Dropdown>
+									{session.offered && (
+										<>
+											<Menu.Item
+												leftSection={<IconPlayerPlay size={14} />}
+												disabled={session.pending}
+												onClick={() => session.submit()}
+												data-testid="task-action-open-session"
+											>
+												{t("board.openSession.button")}
+											</Menu.Item>
+											<Menu.Item
+												leftSection={<IconChevronDown size={14} />}
+												disabled={session.pending}
+												onClick={() => session.setFormOpen(true)}
+												data-testid="task-action-open-session-options"
+											>
+												{t("board.openSession.options")}
+											</Menu.Item>
+											<Menu.Divider />
+										</>
+									)}
 									{canWrite && open && (
 										<>
 											{ending && (

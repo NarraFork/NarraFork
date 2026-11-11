@@ -2621,6 +2621,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceOutlineTaskFinished: "Tasks this session created were finished elsewhere",
 	sidecarSourceOutlineTeamActivity: "Team activity",
 	sidecarSourceOutlineTeam: "Task events for this session",
+	sidecarSourceOutlineTaskBrief: "Opening brief",
 	sidecarSourceOutlineAnswer: "Answers to your questions",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
@@ -2747,6 +2748,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	outline_team_activity: "sidecarSourceOutlineTeamActivity",
 	// One commit of someone else that concerns the session's tasks (P2 PR 10a).
 	outline_team: "sidecarSourceOutlineTeam",
+	// The opening brief of a session opened to do a project task (P2 PR 10c-1).
+	outline_task_brief: "sidecarSourceOutlineTaskBrief",
 	outline_answer: "sidecarSourceOutlineAnswer",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",

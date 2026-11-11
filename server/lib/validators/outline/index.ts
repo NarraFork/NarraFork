@@ -196,6 +196,14 @@ export const outlineBoardTaskUpdateBodySchema = z
 		message: "nothing to change",
 	});
 
+/** Open a new session for a project task (outline P2 PR 10c-1). */
+export const outlineBoardOpenSessionBodySchema = z.object({
+	baseVersionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+	model: z.string().trim().min(1).max(256).optional(),
+	cwd: z.string().trim().min(1).max(4096).optional(),
+	note: z.string().max(OUTLINE_TASK_BOARD_LIMITS.maxOpenNoteChars).optional(),
+});
+
 /** The reader saw these tasks marked 「新完成」 on a board (outline P2 PR 9b). */
 export const outlineBoardSeenBodySchema = z.object({
 	tasks: z

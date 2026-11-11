@@ -38,6 +38,8 @@ import type {
 	OutlineBoardAddRequest,
 	OutlineBoardAddResponse,
 	OutlineBoardFinishedResponse,
+	OutlineBoardOpenSessionRequest,
+	OutlineBoardOpenSessionResponse,
 	OutlineBoardSeenRequest,
 	OutlineBoardSeenResponse,
 	OutlineBoardTaskUpdateRequest,
@@ -243,6 +245,12 @@ export const outlineApi = {
 		request<OutlineBoardTransferSessionsResponse>(
 			`/outline/tasks/${enc(blockId)}/transfer-sessions`,
 		),
+	/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
+	openTaskSession: (blockId: string, body: OutlineBoardOpenSessionRequest) =>
+		request<OutlineBoardOpenSessionResponse>(`/outline/tasks/${enc(blockId)}/open-session`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
 	/**
 	 * The person saw these tasks marked 「新完成」 on a board (outline P2 PR 9b); `keepalive` when
 	 * the page is going away.

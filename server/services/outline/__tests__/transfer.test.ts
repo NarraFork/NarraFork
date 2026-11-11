@@ -568,7 +568,7 @@ describe("the picker", () => {
 describe("转交并开始, when the start declines or the task is held", () => {
 	/** A session layer whose start declines after the blocker let it through. */
 	const declining = {
-		outlineTaskStartBlocker: async () => undefined,
+		outlineSessionStartBlocker: async () => undefined,
 		startSpecContinuationIfPossible: async () => ({ started: false }),
 	};
 
@@ -627,7 +627,7 @@ describe("转交并开始, when the start declines or the task is held", () => {
 			userId: owner.id,
 			blockId: task.blockId,
 			session: {
-				outlineTaskStartBlocker: async () => undefined,
+				outlineSessionStartBlocker: async () => undefined,
 				startSpecContinuationIfPossible: async () => {
 					asked++;
 					return { started: true };

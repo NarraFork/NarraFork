@@ -655,8 +655,14 @@ function projectSideCarBody(
 			// (a buffered user message) has no name and its own first line is the best
 			// headline. Either way the full text stays in `lines`, because the headline
 			// is a one-line flattening and the reader must be able to see the rest.
+			// The opening brief of a session opened for a task (outline P2 PR 10c-1) is headed by
+			// its first line, the task's title; the rest (up to 16 KiB) unfolds.
 			const headline =
-				source === "behavior_fence" ? label(labels, "proseFenceHeading") : flatten(body.text);
+				source === "behavior_fence"
+					? label(labels, "proseFenceHeading")
+					: source === "outline_task_brief"
+						? flatten((body.text.split("\n", 1)[0] ?? "").replace(/^#+\s*/, ""))
+						: flatten(body.text);
 			return { headline, lines: proseLines(body.text) };
 		}
 

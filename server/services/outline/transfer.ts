@@ -12,7 +12,7 @@
  *
  * AND START: a person's explicit start, so it is the one case where a person's commit leads to a
  * turn (owner rule: 「…并开始」). Decided before anything is claimed
- * (`outlineTaskStartBlocker`, as a plugin's start is): the session must be idle, not in plan
+ * (`outlineSessionStartBlocker`, as a plugin's start is): the session must be idle, not in plan
  * mode, and its continuation mode must continue on this task (`off` starts once, as `/goal` and
  * "Add and start" do). Then the task is started for the session by the system (the write path
  * claims it; actor {@link OUTLINE_TASK_START_ACTOR}), and the session is started on it
@@ -154,7 +154,7 @@ export async function isTransferSession(
 
 /** What starting needs of the session layer (`narrator-session.ts`). */
 export interface TransferSessionLayer {
-	outlineTaskStartBlocker(
+	outlineSessionStartBlocker(
 		narratorId: string,
 		task: { blockId: string; status: string },
 		options?: { explicit?: boolean; personWork?: boolean },
@@ -211,7 +211,7 @@ export async function startSessionOnTransferredTask(args: {
 		if (!own) return { started: false, notStarted: "not_started" };
 	}
 	// Decided before anything is claimed.
-	const blocker = await session.outlineTaskStartBlocker(
+	const blocker = await session.outlineSessionStartBlocker(
 		args.narratorId,
 		{ blockId: block.id, status: block.taskJson.status },
 		{ explicit: true, personWork: isPersonWork(block.taskJson, args.narratorId) },

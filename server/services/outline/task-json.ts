@@ -180,3 +180,34 @@ export function isFinishedTask(task: OutlineTaskJson | null): boolean {
 export function hasHumanAssignee(task: OutlineTaskJson | null): boolean {
 	return task?.assignee?.startsWith("human:") === true;
 }
+
+/** Why a task cannot be handed to an agent to start now (`outlineTaskStartBlocker`). */
+export type OutlineTaskStartBlocker =
+	| "finished"
+	| "planning"
+	| "prerequisites"
+	| "people"
+	| "confirmation"
+	| "assigned_to_person";
+
+/**
+ * Why an agent cannot be set to work on a task now, or null when it can: the conditions a
+ * delegation (`Agent({ task })`, `delegation.ts`) and the board's "open a new session for this"
+ * (`task-session.ts`) share, in the order they are told. Pure: the caller reads the facts.
+ * Who holds the task is not judged here (the two differ on it).
+ */
+export function outlineTaskStartBlocker(facts: {
+	task: OutlineTaskJson;
+	/** The task, or a block above it, is the root of a plan not approved yet. */
+	planning: boolean;
+	/** What it waits for, as `deriveOutlineTaskWaits` derives it. */
+	wait?: { prerequisites: readonly unknown[]; people: boolean; confirmation: boolean } | null;
+}): OutlineTaskStartBlocker | null {
+	if (isFinishedTask(facts.task)) return "finished";
+	if (facts.planning) return "planning";
+	if (facts.wait && facts.wait.prerequisites.length > 0) return "prerequisites";
+	if (facts.wait?.people) return "people";
+	if (facts.wait?.confirmation) return "confirmation";
+	if (hasHumanAssignee(facts.task)) return "assigned_to_person";
+	return null;
+}

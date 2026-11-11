@@ -564,6 +564,7 @@
 		"thisSession": "This session",
 		"untitledSession": "Untitled session",
 		"nobody": "Unassigned",
+		"readyToStart": "Ready to start",
 		"agent": "Agent {{name}}",
 		"you": "{{name}} (you)",
 		"status": {
@@ -654,6 +655,38 @@
 			"awaitingYou": "{{count}} goal(s) wait for your confirmation",
 			"awaitingFrom": "{{count}} goal(s) wait for {{names}} to confirm",
 			"awaitingOthers": "{{count}} goal(s) wait for confirmation"
+		},
+		"openSession": {
+			"button": "Open a new session for this",
+			"options": "Open a new session for this…",
+			"doing": "Session “{{title}}” is on it",
+			"doingUntitled": "A session is on it",
+			"hint": "A new session of this project takes the task and starts on it with a brief put together from the outline. Every session opened costs at least one model request.",
+			"model": "Model",
+			"cwd": "Working directory",
+			"cwdPlaceholder": "The project's directory",
+			"note": "Further instructions",
+			"notePlaceholder": "Optional: added to the session's brief as written",
+			"submit": "Open session",
+			"failed": "Could not open a session",
+			"error": {
+				"finished": "The task is finished already.",
+				"planning": "The task is part of a plan that is not approved yet.",
+				"prerequisites": "The task waits for its prerequisites.",
+				"people": "The task waits for an answer to a question under it.",
+				"confirmation": "The task waits for a change to be confirmed.",
+				"assigned_to_person": "The task is assigned to a person.",
+				"unavailable": "Sessions cannot be opened for tasks on this deployment.",
+				"not_project_task": "Only a task of the project's own space can be given a new session.",
+				"no_directory": "The project has no working directory (or the one given does not exist). Choose one under “Open a new session for this…”.",
+				"in_progress": "The task is in progress already.",
+				"claimed": "Someone is doing this task already.",
+				"claimedBy": "{{name}} is doing this task already.",
+				"changed": "The task changed meanwhile; the board was reloaded.",
+				"start_failed": "The session could not be started. The task is back to do; try again.",
+				"forbidden": "You may not open sessions for this project's tasks.",
+				"unreadable": "The new session could not read this project's outline, so it was not given the task. Check the project's and the sessions' visibility settings."
+			}
 		}
 	}
 }

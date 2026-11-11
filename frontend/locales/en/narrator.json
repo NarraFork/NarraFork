@@ -2190,6 +2190,7 @@
 			"outline_task_finished": "Tasks this session created were finished elsewhere",
 			"outline_team_activity": "Team activity",
 			"outline_team": "Task events for this session",
+			"outline_task_brief": "Opening brief",
 			"tutorial_lesson": "Tutorial lesson",
 			"turn_nudge": "Turn budget",
 			"broken_call": "Invalid tool call",
