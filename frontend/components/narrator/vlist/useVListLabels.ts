@@ -376,6 +376,10 @@ export function useVListLabels(): VListLabels {
 			imageGenerated: t("imageGenerated"),
 			imageGenerating: t("imageGenerating"),
 			imageGenerationPreparing: t("imageGenerationPreparing"),
+			imageGenerationFailed: t("imageGenerationFailed"),
+			imageGenerationCancelled: t("imageGenerationCancelled"),
+			imageGenerationIncomplete: t("imageGenerationIncomplete"),
+			imageGenerationNoImage: t("imageGenerationNoImage"),
 			// ── web_search header status ─────────────────────────────────────────────
 			webSearched: t("webSearched"),
 			webSearching: t("webSearching"),

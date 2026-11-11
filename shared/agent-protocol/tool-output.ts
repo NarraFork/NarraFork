@@ -125,6 +125,12 @@ export function isBrokenToolOutput(value: unknown): boolean {
 	return outputRecord(value)?._broken === true;
 }
 
+/** Keep saved image references in a live text preview without sending inline image bytes. */
+export function toolOutputImagePreview(preview: unknown, persistedOutput: unknown): unknown {
+	const images = toolOutputImages(persistedOutput).filter((image) => "uploadNarratorId" in image);
+	return images.length ? { _text: preview, _images: images } : preview;
+}
+
 /** Image references of a stored output; malformed entries are skipped. */
 export function toolOutputImages(value: unknown): ToolOutputImageRef[] {
 	const images = outputRecord(value)?._images;

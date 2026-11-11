@@ -8,6 +8,7 @@ import {
 } from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
+import { redactSecretPatterns } from "../net/diagnostic-redaction";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
@@ -31,6 +32,11 @@ import {
 } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
+import {
+	buildImageGenerationBody,
+	type ImageGenerationRequest,
+	type ImageGenerationResponse,
+} from "./image-generation-api";
 import {
 	markRuntimeInstructions,
 	markRuntimeSystemMessage,
@@ -1227,6 +1233,26 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			yield evt;
 		}
+	}
+
+	async generateImage(params: ImageGenerationRequest): Promise<ImageGenerationResponse> {
+		const apiKey = await this.getEffectiveApiKey();
+		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
+		if (!apiKey && !this.config.authorizationHeader?.trim()) {
+			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
+		}
+		const headers = new Headers(this.buildHeaders(apiKey, params.conversationId));
+		headers.set("Authorization", this.config.authorizationHeader?.trim() || `Bearer ${apiKey}`);
+		// This is the Images JSON endpoint, not the Codex Responses SSE transport.
+		headers.set("Accept", "application/json");
+		const response = await this.pfetch(`${baseUrl}/images/generations`, {
+			method: "POST",
+			headers,
+			body: await stringifyRequestBody(buildImageGenerationBody(params), params.signal),
+			signal: params.signal,
+			redirect: "error",
+		});
+		return { response };
 	}
 
 	async generate(text: string, model: string): Promise<string> {
@@ -2488,7 +2514,8 @@ export function parseResponsesAPIEvent(
 			? (chunk.response as Record<string, unknown>)
 			: undefined;
 	const responseError = parseUpstreamErrorEnvelope(response);
-	const envelope = parseUpstreamErrorEnvelope(payload);
+	const imageLifecycle = type?.startsWith("response.image_generation_call.");
+	const envelope = imageLifecycle ? null : parseUpstreamErrorEnvelope(payload);
 	const failureState =
 		response?.status === "failed" || response?.status === "incomplete"
 			? response.status
@@ -2780,13 +2807,60 @@ export function parseResponsesAPIEvent(
 		return results;
 	}
 
+	const imageLifecycleError = parseUpstreamErrorEnvelope(
+		chunk.item && typeof chunk.item === "object" ? chunk.item : payload,
+	);
+	const imageStatus = (raw: unknown): string => {
+		if (typeof raw !== "string") return imageLifecycleError ? "failed" : "in_progress";
+		const normalized = raw.trim().toLowerCase();
+		if (normalized === "canceled" || normalized === "cancelled") return "cancelled";
+		if (normalized === "failed" || normalized === "incomplete") return normalized;
+		return raw;
+	};
+	const imageDiagnostics = imageLifecycleError
+		? parseErrorDiagnostics(
+				{
+					error: {
+						message: redactSecretPatterns(imageLifecycleError.message),
+						code: imageLifecycleError.code,
+					},
+				},
+				{ source: "provider", phase: "image_generation" },
+			)
+		: undefined;
+	const imageErrorFields = imageLifecycleError
+		? {
+				error: imageDiagnostics?.message,
+				...(imageDiagnostics?.code ? { errorCode: imageDiagnostics.code } : {}),
+			}
+		: {};
+
 	// ── Image generation: lifecycle events ──
+	if (
+		imageLifecycle &&
+		(type === "response.image_generation_call.in_progress" ||
+			type === "response.image_generation_call.failed" ||
+			type === "response.image_generation_call.cancelled" ||
+			type === "response.image_generation_call.canceled" ||
+			type === "response.image_generation_call.incomplete")
+	) {
+		results.push({
+			imageGeneration: {
+				id: chunk.item_id ?? "",
+				status: imageStatus(type.slice("response.image_generation_call.".length)),
+				outputIndex: chunk.output_index,
+				...imageErrorFields,
+			},
+		});
+		return results;
+	}
 	if (type === "response.image_generation_call.generating") {
 		results.push({
 			imageGeneration: {
 				id: chunk.item_id ?? "",
-				status: "generating",
+				status: imageStatus(imageLifecycleError ? "failed" : "generating"),
 				outputIndex: chunk.output_index,
+				...imageErrorFields,
 			},
 		});
 		return results;
@@ -2795,10 +2869,11 @@ export function parseResponsesAPIEvent(
 		results.push({
 			imageGeneration: {
 				id: chunk.item_id ?? "",
-				status: "generating",
+				status: imageStatus(imageLifecycleError ? "failed" : "generating"),
 				outputIndex: chunk.output_index,
 				partialImageIndex: chunk.partial_image_index,
 				partialImageB64: chunk.partial_image_b64,
+				...imageErrorFields,
 			},
 		});
 		return results;
@@ -2807,8 +2882,12 @@ export function parseResponsesAPIEvent(
 		results.push({
 			imageGeneration: {
 				id: chunk.item_id ?? "",
-				status: "completed",
+				status: imageStatus(imageLifecycleError ? "failed" : "completed"),
 				outputIndex: chunk.output_index,
+				// The SDK documents this event as terminal: the final image is available,
+				// but its bytes live on output_item.done / response.output, not here.
+				final: true,
+				...imageErrorFields,
 			},
 		});
 		return results;
@@ -2816,14 +2895,20 @@ export function parseResponsesAPIEvent(
 
 	// ── Image generation: output_item.done (type=image_generation_call) — final result ──
 	if (type === "response.output_item.done" && chunk.item?.type === "image_generation_call") {
+		const itemError = parseUpstreamErrorEnvelope(chunk.item);
+		const rawStatus = imageStatus(chunk.item.status ?? "completed");
+		const itemStatus =
+			itemError && rawStatus !== "cancelled" && rawStatus !== "incomplete" ? "failed" : rawStatus;
+		const itemResult = typeof chunk.item.result === "string" ? chunk.item.result : undefined;
 		results.push({
 			imageGeneration: {
 				id: chunk.item.id ?? "",
-				status: chunk.item.status ?? "completed",
+				status: itemStatus,
 				revisedPrompt: chunk.item.revised_prompt ?? undefined,
-				result: chunk.item.result ?? "",
+				...(itemResult ? { result: itemResult } : {}),
 				outputIndex: chunk.output_index,
 				final: true,
+				...imageErrorFields,
 			},
 		});
 		return results;
@@ -4021,7 +4106,16 @@ function responsesWireHistory(
 					break;
 				}
 				case "image_generation":
-					if (!item.result) break;
+					if (!item.result || (item.status && item.status !== "completed")) {
+						history.push(
+							assistantText(
+								`[Image generation ${item.status ?? "incomplete"}` +
+									(item.errorCode ? ` (${item.errorCode})` : "") +
+									`: ${item.error || "No complete image result was received."}]`,
+							),
+						);
+						break;
+					}
 					history.push({
 						type: "image_generation_call",
 						id: item.wireId,
