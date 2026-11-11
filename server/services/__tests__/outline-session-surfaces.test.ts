@@ -127,6 +127,11 @@ describe("system prompt: the task section", () => {
 			expect(text).not.toContain("tasks.json");
 		}
 		expect(getOutlineTaskSystemReminder("zh-CN")).toContain("三条约定");
+		// A team task that cannot be finished is handed off in writing first (P2 PR 10c-2).
+		expect(getOutlineTaskSystemReminder("en")).toContain(
+			"write a handoff note under it before you end",
+		);
+		expect(getOutlineTaskSystemReminder("zh-CN")).toContain("结束前在任务下写一段交接");
 		expect(taskSectionFor("spec", "primary")).toBe("spec");
 		expect(taskSectionFor("spec", "subagent")).toBe("spec");
 		expect(taskSectionFor("outline", "primary")).toBe("outline");
