@@ -1570,6 +1570,24 @@ test("a selection reaching into a closed block never deletes what the block hide
 		expect((await rowOf(a, note))?.state).toBe("open");
 	}
 
+	// Pasting over such a selection: the same.
+	await a.call((f) => f.surface().foldAll(false));
+	await closeNote();
+	await shows(a, DEFAULT_ROWS, "default before pasting");
+	await selectDown();
+	await a.call((f) => {
+		const data = new DataTransfer();
+		data.setData("text/plain", "pasted over");
+		f.view().pm.dom.dispatchEvent(
+			new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }),
+		);
+	});
+	await settle(a);
+	expect(await alive()).toBe(4);
+	expect(serverText(pageId, note)).toBe("First note line");
+	expect(serverOutline(pageId)).not.toContain("pasted over");
+	expect((await rowOf(a, note))?.state).toBe("open");
+
 	// An input method starting over such a selection composes at the cursor instead.
 	await a.call((f) => f.surface().foldAll(false));
 	await shows(a, DEFAULT_ROWS, "default before composing");
