@@ -26,9 +26,14 @@
  *     line in their place. The preview, the quick control and the counts of what is hidden are
  *     frame DOM projected from a derived attribute (`fold`): never part of the block model, of
  *     what is saved, or of the undo stack. The cursor never stays in hidden content: a selection
- *     that lands there (undo, a jump, an indent under a closed block) opens its ancestors, and
- *     folding a block around the cursor moves the cursor onto that block. While an input method
- *     composes, the block it composes in stays on screen whatever closes around it.
+ *     put there (undo, a jump) opens its ancestors for good; a change that closes a block around
+ *     the cursor (a task ticked done, an indent under a closed block) keeps that block open while
+ *     the cursor is in it and lets it close when the cursor leaves; folding a block around the
+ *     cursor moves the cursor onto that block. While an input method composes, the block it
+ *     composes in stays on screen whatever closes around it. A selection that reaches into a
+ *     closed block never deletes what the block hides: the block opens first, so the reader sees
+ *     what would go. A change by someone else that folds or adds rows above keeps the reader's
+ *     row where it is on screen.
  */
 import {
 	type DeltaOp,
@@ -305,6 +310,17 @@ export class OutlineView implements CmdHost, ClientView {
 	blockViews = new Map<string, BlockView>();
 	/** Locks and pending changes of the page's blocks (P2 PR 6), from the page's summary. */
 	marks: ReadonlyMap<string, BlockMark> = new Map();
+	/** The page's summary (its unanswered questions among it) arrived; see `setMarks`. */
+	marksKnown = false;
+	/**
+	 * Blocks kept on screen because the cursor is in them while a change closed a block around
+	 * them (a task ticked done with the cursor in its notes): open until the cursor leaves, and
+	 * nothing is stored for it.
+	 */
+	private caretPins: string[] = [];
+	/** The last projection added, removed or folded rows (what can move the rows below). */
+	private rowsChanged = false;
+	private scrollBox: HTMLElement | null = null;
 	/** Block selection: the selected sibling range, anchor and head ids. */
 	blockSel: { anchor: string; head: string } | null = null;
 	lens: OutlineLens;
@@ -352,10 +368,14 @@ export class OutlineView implements CmdHost, ClientView {
 			handlePaste: (_v, ev) => this.handlePaste(ev),
 			clipboardTextSerializer: (slice) => this.copyText(slice),
 			handleTextInput: (_v, from, to, text) => this.handleTextInput(from, to, text),
-			handleKeyDown: (_v, ev) => this.handleBlockKeys(ev) || this.stepOverHidden(ev),
+			handleKeyDown: (_v, ev) =>
+				this.handleBlockKeys(ev) || this.swallowFoldRepeat(ev) || this.stepOverHidden(ev),
 			handleScrollToSelection: () => this.noScroll,
 			handleDOMEvents: {
 				compositionstart: () => {
+					// Composing over a selection that reaches into a closed block would delete what
+					// it hides: the block opens and the composition starts at the cursor instead.
+					this.guardSelectionDelete(true);
 					const p = this.locate(this.pm.state.doc, this.pm.state.selection.head);
 					this.composingBlock = p?.blockId ?? null;
 					this.compositionDirty = false;
@@ -579,12 +599,36 @@ export class OutlineView implements CmdHost, ClientView {
 	}
 
 	/** Show these locks and pending changes on the blocks (the page's pending summary). */
-	setMarks(marks: ReadonlyMap<string, BlockMark>): void {
-		const changed = new Set([...this.marks.keys(), ...marks.keys()]);
+	/**
+	 * `known`: the page's summary arrived. Until it does, every question on the page counts as
+	 * unanswered for the folding (the blocks above a question are never folded away by mistake:
+	 * at worst an answered one's stay open a moment longer, or for good if the summary never
+	 * comes).
+	 */
+	setMarks(marks: ReadonlyMap<string, BlockMark>, known = true): void {
+		const sig = (m: BlockMark | undefined) =>
+			m
+				? `${m.lockedBy ?? ""}\u0000${m.pending?.join("\u0001") ?? ""}\u0000${m.openQuestion ? 1 : 0}`
+				: "";
+		// What the folding counts of a mark: whether there is a lock, a change, a question.
+		const counted = (m: BlockMark | undefined) =>
+			m ? `${m.lockedBy ? 1 : 0}${m.pending?.length ? 1 : 0}${m.openQuestion ? 1 : 0}` : "000";
+		const old = this.marks;
+		let refold = known !== this.marksKnown;
+		const redraw: string[] = [];
+		for (const id of new Set([...old.keys(), ...marks.keys()])) {
+			const a = old.get(id);
+			const b = marks.get(id);
+			if (sig(a) === sig(b)) continue;
+			redraw.push(id);
+			if (counted(a) !== counted(b)) refold = true;
+		}
 		this.marks = marks;
-		for (const id of changed) this.blockViews.get(id)?.renderMarks();
-		// A closed block counts the marks it hides: its frame follows (nothing else changes).
-		if (changed.size > 0 && !this.destroyed && this.pm) this.sync();
+		this.marksKnown = known;
+		for (const id of redraw) this.blockViews.get(id)?.renderMarks();
+		// A closed block counts the marks it hides, and a question holds the blocks above it open:
+		// the frames follow when that changed (and only then).
+		if (refold && !this.destroyed && this.pm) this.sync();
 	}
 
 	/**
@@ -645,9 +689,12 @@ export class OutlineView implements CmdHost, ClientView {
 		const single = this.surface.kind === "node";
 		const source = liveFoldSource(this.client, {
 			marks: this.marks,
+			questionsKnown: this.marksKnown,
 			...(facts ? { omit: (id) => !!(v.get(id)?.task || v.get(id)?.question) } : {}),
 		});
 		const composing = this.pm?.composing ? this.composingBlock : null;
+		const pinned = composing ? [composing, ...this.caretPins] : this.caretPins;
+		let rowsChanged = false;
 		const tree = single
 			? null
 			: buildFoldTree(
@@ -655,7 +702,7 @@ export class OutlineView implements CmdHost, ClientView {
 					{
 						rootId: this.rootId,
 						rootDetail: liveUnderTask(this.client, this.rootId),
-						...(composing ? { pinned: [composing] } : {}),
+						...(pinned.length > 0 ? { pinned } : {}),
 					},
 					this.foldView,
 				);
@@ -720,6 +767,7 @@ export class OutlineView implements CmdHost, ClientView {
 						)
 					: "";
 			const question = rec.question === true;
+			if (!c || c.collapsed !== collapsed || c.kids.length !== kids.length) rowsChanged = true;
 			let node: PMNode;
 			if (
 				c &&
@@ -757,6 +805,7 @@ export class OutlineView implements CmdHost, ClientView {
 		}
 		if (!nodes.length) nodes.push(N.block.create({ id: this.placeholderId }, N.paragraph.create()));
 		this.hiddenByLens = hiddenTotal;
+		this.rowsChanged = rowsChanged || staged.size !== this.nodeCache.size;
 		return { doc: N.outline.create(null, nodes), staged, changed };
 	}
 
@@ -788,10 +837,98 @@ export class OutlineView implements CmdHost, ClientView {
 
 	sync() {
 		if (this.destroyed) return;
+		// Not the reader's own folding: what they are reading stays where it is on screen.
+		const anchor = this.folding ? null : this.scrollAnchor();
 		this.project();
-		// A change may have closed a block around the cursor (someone ticked a task done): while
-		// the person is in the editor it opens again; otherwise the cursor moves out of it.
-		if (!this.folding) this.keepSelectionVisible(this.pm.hasFocus() ? "reveal" : "move");
+		// A change may have closed a block around the cursor (a task ticked done): while the
+		// person is in the editor it stays open until the cursor leaves it; otherwise the cursor
+		// moves out of it.
+		if (!this.folding) this.keepSelectionVisible(this.pm.hasFocus() ? "hold" : "move");
+		if (anchor && this.rowsChanged) this.restoreScroll(anchor);
+	}
+
+	/**
+	 * The reader folded somewhere else (another view of the page, the toolbar, the stored folding
+	 * arriving): this view follows, nothing is held open against it, and a cursor it hides moves
+	 * onto the nearest block still shown.
+	 */
+	foldChanged(): void {
+		if (this.destroyed) return;
+		this.caretPins = [];
+		this.folding = true;
+		try {
+			this.sync();
+			this.keepSelectionVisible("move");
+		} finally {
+			this.folding = false;
+		}
+	}
+
+	/** The element that scrolls the editor (found once; the window's when none does). */
+	private scroller(): HTMLElement | null {
+		if (this.scrollBox?.isConnected) return this.scrollBox;
+		this.scrollBox = null;
+		for (let el = this.pm.dom.parentElement; el; el = el.parentElement) {
+			const overflow = getComputedStyle(el).overflowY;
+			if (overflow === "auto" || overflow === "scroll") {
+				this.scrollBox = el;
+				break;
+			}
+		}
+		return this.scrollBox;
+	}
+
+	/**
+	 * The row the reader is at, and where it is on screen: the cursor's row while the editor has
+	 * the keyboard and that row is in view, else the first row in view. Null when the view is not
+	 * on screen. One hit test and one box read, before the projection (the layout is clean then).
+	 */
+	private scrollAnchor(): { id: string; top: number } | null {
+		if (this.noScroll || !this.pm || this.surface.kind !== "focus") return null;
+		const dom = this.pm.dom as HTMLElement;
+		const box = this.scroller();
+		const frame = box
+			? box.getBoundingClientRect()
+			: { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
+		const top = Math.max(frame.top, 0);
+		const bottom = Math.min(frame.bottom, window.innerHeight);
+		if (bottom - top < 8) return null;
+		const rowOf = (id: string) =>
+			this.blockEls.get(id)?.querySelector<HTMLElement>(":scope > .ob-content > :first-child");
+		if (this.pm.hasFocus()) {
+			const at = this.locate(this.pm.state.doc, this.pm.state.selection.head)?.blockId;
+			const r = at ? rowOf(at)?.getBoundingClientRect() : undefined;
+			if (at && r && r.height > 0 && r.bottom > top && r.top < bottom)
+				return { id: at, top: r.top };
+		}
+		const rect = dom.getBoundingClientRect();
+		if (rect.width === 0 || rect.bottom <= top || rect.top >= bottom) return null;
+		const hit = dom.ownerDocument
+			.elementFromPoint(rect.left + Math.min(rect.width / 2, 120), Math.max(top, rect.top) + 6)
+			?.closest<HTMLElement>(".ob-block");
+		const id = hit && dom.contains(hit) ? hit.dataset.id : undefined;
+		const r = id ? rowOf(id)?.getBoundingClientRect() : undefined;
+		return id && r ? { id, top: r.top } : null;
+	}
+
+	/** Put the anchor row back where it was on screen (or the nearest row above it still shown). */
+	private restoreScroll(anchor: { id: string; top: number }): void {
+		let id: string | null = anchor.id;
+		let rect: DOMRect | undefined;
+		for (let guard = 0; id && guard < 200; guard++) {
+			const el: HTMLElement | null | undefined = this.blockEls
+				.get(id)
+				?.querySelector<HTMLElement>(":scope > .ob-content > :first-child");
+			rect = el?.getClientRects().length ? el.getBoundingClientRect() : undefined;
+			if (rect) break;
+			id = this.foldTree?.nodes.get(id)?.parent ?? this.client.visible.get(id)?.parentId ?? null;
+		}
+		if (!rect) return;
+		const delta = rect.top - anchor.top;
+		if (Math.abs(delta) < 1) return;
+		const box = this.scroller();
+		if (box) box.scrollTop += delta;
+		else window.scrollBy(0, delta);
 	}
 
 	/** Bring the editor's document in line with the block model, the texts and the folding. */
@@ -869,6 +1006,8 @@ export class OutlineView implements CmdHost, ClientView {
 	foldAct(action: FoldAction): boolean {
 		if (this.destroyed || !this.foldTree) return false;
 		if (!applyFoldAction(this.foldTree, this.foldView, action)) return false;
+		// The reader's own folding is not held open against them.
+		this.caretPins = [];
 		this.folding = true;
 		try {
 			this.sync();
@@ -889,7 +1028,10 @@ export class OutlineView implements CmdHost, ClientView {
 	toggleSubtree(id: string, open?: boolean) {
 		const node = this.foldTree?.nodes.get(id);
 		if (!node) return;
-		this.foldAct({ kind: "subtree", id, open: open ?? foldSubtreeControl(node) !== "collapse" });
+		// One level of children only: "everything inside" is what the arrow does.
+		const control = foldSubtreeControl(node);
+		if (open === undefined && control === null) return this.toggleCollapse(id);
+		this.foldAct({ kind: "subtree", id, open: open ?? control !== "collapse" });
 	}
 
 	/**
@@ -922,10 +1064,96 @@ export class OutlineView implements CmdHost, ClientView {
 		const p = this.locate(this.pm.state.doc, this.pm.state.selection.head);
 		const node = p ? this.foldTree?.nodes.get(p.blockId) : undefined;
 		if (!node || node.parent === null || node.kids.length === 0) return false;
-		if (everything) {
-			if (foldSubtreeControl(node) === null) return false;
-			this.toggleSubtree(node.id);
-		} else this.toggleCollapse(node.id);
+		if (everything) this.toggleSubtree(node.id);
+		else this.toggleCollapse(node.id);
+		return true;
+	}
+
+	/** Mod-. and Alt-Enter held down: one toggle per press (the repeats are swallowed). */
+	private swallowFoldRepeat(ev: KeyboardEvent): boolean {
+		if (!ev.repeat) return false;
+		const mod = ev.ctrlKey || ev.metaKey;
+		const fold = (ev.key === "." && mod && !ev.altKey) || (ev.key === "Enter" && ev.altKey && !mod);
+		if (!fold) return false;
+		ev.preventDefault();
+		return true;
+	}
+
+	/**
+	 * Blocks a change would delete although the reader cannot see them: hidden under a closed
+	 * block that itself stays, and whose own line the selection does not cover whole. (A closed
+	 * block deleted as a whole takes what it holds with it, as it always did.)
+	 */
+	private hiddenLoss(before: EditorState, after: PMNode): string[] {
+		const { from, to } = before.selection;
+		const kept = new Set<string>();
+		after.descendants((n) => {
+			if (n.type === N.block) kept.add(n.attrs.id);
+			return n.type === N.block || n.type === N.children;
+		});
+		const lost: string[] = [];
+		const walk = (node: PMNode, pos: number, closed: { id: string; whole: boolean } | null) => {
+			const id = node.attrs.id as string;
+			if (closed && !kept.has(id) && kept.has(closed.id) && !closed.whole) lost.push(id);
+			if (node.childCount < 2) return;
+			const body = node.child(0);
+			const under =
+				closed ??
+				(node.attrs.collapsed && pos > 0
+					? { id, whole: from <= pos + 2 && to >= pos + 2 + body.content.size }
+					: null);
+			let p = pos + 1 + body.nodeSize + 1;
+			node.child(1).forEach((kid) => {
+				walk(kid, p, under);
+				p += kid.nodeSize;
+			});
+		};
+		let pos = 0;
+		before.doc.forEach((n) => {
+			walk(n, pos, null);
+			pos += n.nodeSize;
+		});
+		return lost;
+	}
+
+	/** Open the closed blocks over `ids` for the reader, keeping the selection as it is. */
+	private showBeforeDelete(ids: readonly string[]): void {
+		if (!this.foldTree) return;
+		let changed = false;
+		const tree = this.foldTree;
+		// (Opening is by each block's own default, so the tree as it was serves them all.)
+		for (const id of ids)
+			if (applyFoldAction(tree, this.foldView, { kind: "reveal", id })) changed = true;
+		if (!changed) return;
+		this.folding = true;
+		try {
+			this.sync();
+		} finally {
+			this.folding = false;
+		}
+		this.opts.onCollapse?.();
+	}
+
+	/**
+	 * Would deleting the selection take hidden blocks with it? Then the closed blocks open and
+	 * nothing is deleted (true). With `collapse`, the selection also becomes a cursor at its head
+	 * (an input method is about to compose there).
+	 */
+	private guardSelectionDelete(collapse = false): boolean {
+		const state = this.pm.state;
+		const sel = state.selection;
+		if (sel.empty || sel.$from.sameParent(sel.$to) || !this.client.editable) return false;
+		const lost = this.hiddenLoss(state, state.tr.deleteSelection().doc);
+		if (lost.length === 0) return false;
+		this.showBeforeDelete(lost);
+		if (collapse) {
+			const now = this.pm.state;
+			this.pm.dispatch(
+				now.tr
+					.setSelection(TextSelection.create(now.doc, now.selection.head))
+					.setMeta("remote", true),
+			);
+		}
 		return true;
 	}
 
@@ -1031,13 +1259,14 @@ export class OutlineView implements CmdHost, ClientView {
 	private keepingVisible = false;
 
 	/**
-	 * The cursor never stays in hidden content. `reveal`: the blocks around it open (a jump, undo
-	 * putting a selection back, an indent under a closed block: the person meant to be there).
-	 * `move`: the cursor goes to the end of the nearest block still shown (the reader folded a
-	 * block around it, or is not in the editor at all). Never while an input method composes: its
+	 * The cursor never stays in hidden content. `reveal`: the blocks around it open for good (a
+	 * jump, undo putting a selection back: the person meant to be there). `hold`: they stay open
+	 * while the cursor is in them (a change closed a block around the cursor: a task ticked done,
+	 * an indent under a closed block). `move`: the cursor goes to the end of the nearest block
+	 * still shown (the reader folded a block around it, or is not in the editor at all). Never while an input method composes: its
 	 * block is kept on screen by the projection.
 	 */
-	private keepSelectionVisible(mode: "reveal" | "move"): void {
+	private keepSelectionVisible(mode: "reveal" | "hold" | "move"): void {
 		if (this.destroyed || this.keepingVisible || !this.foldTree || this.pm.composing) return;
 		const sel = this.pm.state.selection;
 		if (!(sel instanceof TextSelection) && !(sel instanceof NodeSelection)) return;
@@ -1052,6 +1281,17 @@ export class OutlineView implements CmdHost, ClientView {
 		if (head === undefined) return;
 		this.keepingVisible = true;
 		try {
+			if (mode === "hold") {
+				// Open while the cursor is in it; nothing stored (`afterSelection` lets go).
+				this.caretPins = hidden;
+				this.folding = true;
+				try {
+					this.sync();
+				} finally {
+					this.folding = false;
+				}
+				return;
+			}
 			if (mode === "reveal") {
 				let changed = false;
 				for (const id of hidden) {
@@ -1179,6 +1419,12 @@ export class OutlineView implements CmdHost, ClientView {
 		}
 		if (p.blockId === this.lastSelBlock) return;
 		this.lastSelBlock = p.blockId;
+		// The cursor left a block that was kept open for it: what closed around it closes now
+		// (and holds again if the cursor is still inside).
+		if (this.caretPins.length > 0 && !this.caretPins.includes(p.blockId) && !this.keepingVisible) {
+			this.caretPins = [];
+			this.sync();
+		}
 		this.opts.onSelect?.(p.blockId);
 	}
 
@@ -1364,6 +1610,19 @@ export class OutlineView implements CmdHost, ClientView {
 	/** Delete whole blocks (with their subtrees) in one transaction. */
 	deleteBlocks(ids: readonly string[]) {
 		const tr = this.pm.state.tr;
+		// Where the cursor goes: the end of the block shown before the first one deleted (not
+		// into what a closed block before it hides).
+		let target: string | null = null;
+		const first = ids.length > 0 ? findBlockPos(tr.doc, ids[0] as string) : null;
+		if (first != null) {
+			const $p = tr.doc.resolve(first);
+			if ($p.index() > 0) {
+				let prev = $p.parent.child($p.index() - 1);
+				while (prev.childCount > 1 && !prev.attrs.collapsed)
+					prev = prev.child(1).lastChild as PMNode;
+				target = prev.attrs.id;
+			} else if ($p.depth > 1) target = $p.node($p.depth - 1).attrs.id;
+		}
 		for (const id of [...ids].reverse()) {
 			const pos = findBlockPos(tr.doc, id);
 			if (pos == null) continue;
@@ -1373,8 +1632,12 @@ export class OutlineView implements CmdHost, ClientView {
 				tr.delete($p.before(), $p.after());
 			else tr.delete(pos, pos + n.nodeSize);
 		}
-		const near = Math.max(0, Math.min(tr.mapping.map(tr.selection.from), tr.doc.content.size));
-		tr.setSelection(TextSelection.near(tr.doc.resolve(near), -1));
+		const at = target === null ? null : findBlockPos(tr.doc, target);
+		if (at != null) tr.setSelection(caretIn(tr.doc, at, -1));
+		else {
+			const near = Math.max(0, Math.min(tr.mapping.map(tr.selection.from), tr.doc.content.size));
+			tr.setSelection(TextSelection.near(tr.doc.resolve(near), -1));
+		}
 		this.blockSel = null;
 		this.pm.dispatch(tr);
 		this.setBlockSelection(null);
@@ -1675,6 +1938,22 @@ export class OutlineView implements CmdHost, ClientView {
 		const fast = this.bodyOnly(tr);
 		// Shown from an HTTP read, not live yet: typing is queued, structure waits.
 		if (!fast && this.client.provisional) return this.refuse(before, "connecting");
+		// A selection reaching into a closed block: typing over it, deleting, cutting or pasting
+		// over it would take what the block hides. The block opens instead and nothing changes;
+		// the same key again deletes what the reader now sees.
+		if (
+			!fast &&
+			!before.selection.empty &&
+			!before.selection.$from.sameParent(before.selection.$to)
+		) {
+			const lost = this.hiddenLoss(before, state.doc);
+			if (lost.length > 0) {
+				this.stats.refused++;
+				this.pm.updateState(before);
+				this.showBeforeDelete(lost);
+				return;
+			}
+		}
 		if (!fast) state = this.fixIds(state);
 		this.pm.updateState(state);
 		if (fast && this.pm.composing && fast.length === 1 && fast[0] === this.composingBlock) {
@@ -1744,13 +2023,31 @@ export class OutlineView implements CmdHost, ClientView {
 			// those blocks through the mapping, keeping the cursor.
 			for (const [id, f] of rebased) this.pendingMap.set(id, f);
 			this.sync();
-		} else if (!fast) {
+		} else if (!fast && this.foldMayChange(ops)) {
 			// A structural edit changes what folds (a task ticked done closes, a block indented
-			// under a closed one is hidden): the frames follow at once, and a cursor left under a
-			// closed block opens it.
+			// under a closed one is hidden): the frames follow at once, and a block closed around
+			// the cursor stays open while the cursor is in it.
 			this.sync();
 		}
 		this.afterSelection();
+	}
+
+	/**
+	 * Whether a structural edit can change what a frame shows of the folding. New blocks without
+	 * children under a block that is open and on screen cannot (Enter, a paste of plain lines):
+	 * the projection is skipped for them.
+	 */
+	private foldMayChange(ops: readonly ClientOp[]): boolean {
+		const tree = this.foldTree;
+		if (!tree) return true;
+		for (const op of ops) {
+			if (op.t !== "i") return true;
+			const parent = tree.nodes.get(op.p);
+			if (!parent || parent.kids.length === 0 || !parent.open || !parent.visible) return true;
+			// In the facts view a new task is left out (its parent counts it).
+			if (op.task && this.lens === "facts") return true;
+		}
+		return false;
 	}
 
 	/** Composition ended: what was typed goes into Yjs, rebased over what arrived meanwhile. */

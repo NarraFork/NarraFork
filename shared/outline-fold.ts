@@ -97,8 +97,11 @@ export const DEFAULT_FOLD_VIEW: FoldView = Object.freeze({
 
 /** Ids both sets hold together at most (`OUTLINE_VIEW_STATE_LIMITS.maxCollapsed`). */
 export const FOLD_VIEW_MAX_IDS = 2000;
-/** Depth past which a tree is not walked (a cycle in bad data; the editor's own guard is 100). */
-const MAX_DEPTH = 200;
+/**
+ * Blocks this deep and deeper are closed whatever the rules and the reader say (an outline nobody
+ * wrote by hand; the editor's own limit is 100 levels). They stay in the tree, behind their row.
+ */
+export const FOLD_MAX_OPEN_DEPTH = 200;
 /** Characters of a preview line (one visual line shows far fewer). */
 export const FOLD_PREVIEW_CHARS = 240;
 
@@ -140,6 +143,8 @@ export interface FoldNode {
 	allOpen: boolean;
 	/** … and by default. */
 	defaultAllOpen: boolean;
+	/** Something under it has children of its own: there is more than one level to open. */
+	deep: boolean;
 	/** The marks of the blocks under it (not its own); null: none. */
 	under: FoldMarks | null;
 }
@@ -192,7 +197,7 @@ export function buildFoldTree(
 		// A block reached twice (bad data) is shown once.
 		if (nodes.has(id)) continue;
 		const depth = parent ? parent.depth + 1 : 0;
-		const kids = depth >= MAX_DEPTH ? [] : source.children(id);
+		const kids = source.children(id);
 		const task = source.task(id);
 		const report = source.report(id);
 		const detail = parent
@@ -212,6 +217,7 @@ export function buildFoldTree(
 			size: 0,
 			allOpen: true,
 			defaultAllOpen: true,
+			deep: false,
 			under: null,
 		};
 		nodes.set(id, node);
@@ -224,6 +230,7 @@ export function buildFoldTree(
 		if (node.parent === null) continue;
 		const parent = nodes.get(node.parent) as FoldNode;
 		parent.size += node.size + 1;
+		if (node.kids.length > 0) parent.deep = true;
 		parent.under = addMarks(addMarks(parent.under, node.under), source.marks?.(node.id));
 	}
 	const forced = new Set<string>();
@@ -238,8 +245,10 @@ export function buildFoldTree(
 		// A question waiting for an answer is never folded away by default: the blocks above it
 		// are open until the reader closes them (then the closed row counts it).
 		if ((node.under?.question ?? 0) > 0) node.defaultOpen = true;
+		if (node.depth >= FOLD_MAX_OPEN_DEPTH) node.defaultOpen = false;
 		node.open =
 			node.kids.length > 0 &&
+			node.depth < FOLD_MAX_OPEN_DEPTH &&
 			(parent === null ||
 				forced.has(id) ||
 				(view.expanded.has(id) ? true : view.collapsed.has(id) ? false : node.defaultOpen));
@@ -322,10 +331,12 @@ export function foldPreview(tree: FoldTree, source: FoldSource, id: string): Fol
 /**
  * The row's quick control for everything inside it: `expand` while something inside is closed,
  * `collapse` (back to the default view inside it) when all of it is open and the default would
- * close some; null when there is nothing to fold inside, and for the root (the page's control).
+ * close some. Null when it would do no more than the row's arrow (nothing under the row has
+ * children of its own), when there is nothing to fold inside, and for the root (the page's
+ * control).
  */
 export function foldSubtreeControl(node: FoldNode): "expand" | "collapse" | null {
-	if (node.parent === null || node.kids.length === 0) return null;
+	if (node.parent === null || node.kids.length === 0 || !node.deep) return null;
 	if (!node.allOpen) return "expand";
 	return node.defaultAllOpen ? null : "collapse";
 }

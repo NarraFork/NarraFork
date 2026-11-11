@@ -99,18 +99,26 @@ export const outlineReportAuthorsQuerySchema = z.object({
 });
 
 /** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
-export const outlineViewStatePutSchema = z.object({
-	// Block ids only: not free text (a reader may write this for every page they can read).
-	collapsed: z
-		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
-		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
-	// What the reader opened that is folded by default; absent from an older client.
-	expanded: z
-		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
-		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)
-		.optional(),
-	layout: z.enum(["right", "down"]),
-});
+export const outlineViewStatePutSchema = z
+	.object({
+		// Block ids only: not free text (a reader may write this for every page they can read).
+		collapsed: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
+		// What the reader opened that is folded by default; absent from an older client.
+		expanded: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)
+			.optional(),
+		layout: z.enum(["right", "down"]),
+	})
+	// The two sets share one budget (what is stored is bounded the same way).
+	.refine(
+		(body) =>
+			body.collapsed.length + (body.expanded?.length ?? 0) <=
+			OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+		{ message: "collapsed and expanded together exceed the limit" },
+	);
 
 /** Locking a task tree: the session that may confirm step changes on the locker's behalf. */
 export const outlineLockBodySchema = z.object({

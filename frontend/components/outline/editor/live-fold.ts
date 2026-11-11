@@ -19,12 +19,18 @@ export interface LiveFoldOptions {
 	omit?: (id: string) => boolean;
 	/** Locks, pending changes and unanswered questions of the page's blocks. */
 	marks: ReadonlyMap<string, BlockMark>;
+	/**
+	 * Whether `marks` knows the page's unanswered questions (its summary arrived). While it does
+	 * not, every question block counts as unanswered: nothing over a question folds by mistake.
+	 */
+	questionsKnown?: boolean;
 }
 
 /** The page's live blocks as a fold source. */
 export function liveFoldSource(client: LiveClient, options: LiveFoldOptions): FoldSource {
 	const v = client.visible;
 	const { omit, marks } = options;
+	const guess = options.questionsKnown === false;
 	return {
 		children: (id) => {
 			const kids = v.children(id);
@@ -39,9 +45,10 @@ export function liveFoldSource(client: LiveClient, options: LiveFoldOptions): Fo
 		heading: (id) => /^#{1,6}\s/.test(client.textOf(id)),
 		marks: (id) => {
 			const mark = marks.get(id);
-			if (!mark) return null;
+			const asked = guess && v.get(id)?.question === true;
+			if (!mark) return asked ? { question: 1 } : null;
 			const own: Partial<FoldMarks> = {};
-			if (mark.openQuestion) own.question = 1;
+			if (mark.openQuestion || asked) own.question = 1;
 			if (mark.pending?.length) own.pending = 1;
 			if (mark.lockedBy) own.locked = 1;
 			return own;
@@ -56,7 +63,7 @@ export function liveUnderTask(client: LiveClient, id: string): boolean {
 	for (let guard = 0; cur && guard < 10_000; guard++) {
 		const rec = v.get(cur);
 		if (!rec) return false;
-		if (rec.task || isOutlineReportBlockId(cur)) return true;
+		if (rec.task || isOutlineReportContainer(cur, client.textOf(cur))) return true;
 		cur = rec.parentId;
 	}
 	return false;

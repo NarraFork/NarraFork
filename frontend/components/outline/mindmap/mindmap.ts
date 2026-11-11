@@ -97,9 +97,6 @@ export const GAP: Record<LayoutDirection, { gapDepth: number; gapSibling: number
 	down: { gapDepth: 40, gapSibling: 14 },
 };
 
-/** The map counts no marks on its closed nodes (the outline's rows do). */
-const NO_MARKS: ReadonlyMap<string, BlockMark> = new Map();
-
 /** Words the map shows (set from the page's i18n once). */
 export const mapText = {
 	more: (count: number) => `… ${count}`,
@@ -122,6 +119,11 @@ export interface MapHost {
 	openBlock(id: string): void;
 	/** Everything inside a block: opened, or back to the default view (Alt on its arrow). */
 	toggleSubtree(id: string, open: boolean): void;
+	/**
+	 * The page's marks as the outline folds by them (a question waiting for an answer holds the
+	 * blocks above it open), and whether the page's summary arrived.
+	 */
+	foldMarks(): { marks: ReadonlyMap<string, BlockMark>; known: boolean };
 	/** Keys shared by the outline, the map and node editors (collapse all, levels, …). */
 	surfaceKeys(): Record<string, Command>;
 	restoreSel(sel: SelInfo): boolean;
@@ -443,7 +445,8 @@ export class MindMapView {
 		// outline (`@shared/outline-fold`). A closed node carries a count badge.
 		const tree = buildFoldTree(
 			liveFoldSource(client, {
-				marks: NO_MARKS,
+				marks: this.host.foldMarks().marks,
+				questionsKnown: this.host.foldMarks().known,
 				...(facts ? { omit: (id) => !!v.get(id)?.task } : {}),
 			}),
 			{ rootId, rootDetail: liveUnderTask(client, rootId) },

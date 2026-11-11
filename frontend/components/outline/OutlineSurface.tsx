@@ -665,6 +665,7 @@ function SurfaceBody({
 								onUnavailable={setFallback}
 								onHiddenChange={setHiddenLive}
 								marks={marks}
+								marksKnown={pagePending.data !== undefined}
 								onFocusInfo={setFocusInfo}
 								onSurface={setEditSurface}
 								onOpenSwitcher={openSwitcher}

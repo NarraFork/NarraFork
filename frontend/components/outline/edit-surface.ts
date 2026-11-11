@@ -187,6 +187,7 @@ export class EditSurface {
 				focusUp: () => this.focusUp(),
 				toggleCollapse: (id) => this.toggleCollapse(id),
 				openBlock: (id) => this.openBlock(id),
+				foldMarks: () => ({ marks: this.marks, known: this.marksKnown }),
 				toggleSubtree: (id, open) => {
 					this.foldAct({ kind: "subtree", id, open });
 				},
@@ -399,9 +400,15 @@ export class EditSurface {
 	/** Locks and pending changes of the page's blocks (shown on both outline views). */
 	private marks: ReadonlyMap<string, BlockMark> = new Map();
 
-	setMarks(marks: ReadonlyMap<string, BlockMark>): void {
+	private marksKnown = false;
+
+	/** `known`: the page's summary arrived (see `OutlineView.setMarks`). */
+	setMarks(marks: ReadonlyMap<string, BlockMark>, known = true): void {
 		this.marks = marks;
-		for (const v of this.outlines()) v.setMarks(marks);
+		this.marksKnown = known;
+		for (const v of this.outlines()) v.setMarks(marks, known);
+		// The map folds by the unanswered questions too.
+		this.map.schedule();
 	}
 
 	setLens(lens: OutlineLens): void {
@@ -456,7 +463,7 @@ export class EditSurface {
 			onBullet: (id) => this.focusBlock(id),
 			onCollapse: () => {
 				// Folding is shared: the other outline view and the map follow.
-				for (const o of this.outlines()) if (o !== v) o.sync();
+				for (const o of this.outlines()) if (o !== v) o.foldChanged();
 				this.map.schedule();
 				this.state.noteCollapsed();
 				this.reportFold();
@@ -476,7 +483,7 @@ export class EditSurface {
 			onQuestions: (ids, under) => this.opts.onOpenQuestions?.(ids, under),
 		});
 		v.noScroll = this.state.view === "map";
-		if (this.marks.size > 0) v.setMarks(this.marks);
+		if (this.marks.size > 0 || this.marksKnown) v.setMarks(this.marks, this.marksKnown);
 		return v;
 	}
 
@@ -604,7 +611,7 @@ export class EditSurface {
 
 	/** The stored folding and direction arrived: every view follows. */
 	private onStored(): void {
-		for (const v of this.outlines()) v.sync();
+		for (const v of this.outlines()) v.foldChanged();
 		this.map.schedule();
 		if (this.state.view === "map") this.map.flush();
 		this.renderAttrs();
@@ -1124,7 +1131,7 @@ export class EditSurface {
 	}
 
 	private applyCollapse(): void {
-		for (const v of this.outlines()) v.sync();
+		for (const v of this.outlines()) v.foldChanged();
 		this.map.schedule();
 		if (this.state.view === "map") this.map.flush();
 		this.state.noteCollapsed();

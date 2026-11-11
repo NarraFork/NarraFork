@@ -8,6 +8,7 @@ import {
 	applyFoldAction,
 	boundedFoldView,
 	buildFoldTree,
+	FOLD_MAX_OPEN_DEPTH,
 	FOLD_PREVIEW_CHARS,
 	type FoldAction,
 	type FoldMarks,
@@ -328,6 +329,13 @@ describe("the reader's view", () => {
 		expect(control("page")).toBeNull();
 		expect(control("note1")).toBe("expand");
 		expect(control("done")).toBe("expand");
+		// One level of children only: the arrow does all there is, so there is no second control.
+		expect(t.nodes.get("note3")).toMatchObject({ open: false, deep: false });
+		expect(control("note3")).toBeNull();
+		expect(control("cancelled")).toBeNull();
+		expect(control("donebare")).toBeNull();
+		// (A subtask whose note has a detail is two levels.)
+		expect(control("sub")).toBe("expand");
 		// A fact the reader closed something in offers to open it again.
 		const closed = tree({ expanded: new Set(), collapsed: new Set(["factkid"]) });
 		expect(foldSubtreeControl(closed.nodes.get("fact") as never)).toBe("expand");
@@ -575,10 +583,22 @@ describe("large and broken trees", () => {
 		let chain: Spec = { id: "leaf" };
 		for (let i = 0; i < 5000; i++) chain = { id: `c${i}`, kids: [chain] };
 		const deep = sourceOf(chain);
-		const deepTree = buildFoldTree(deep, { rootId: "c4999" });
-		// Cut at the depth limit instead of walking bad data for ever.
-		expect(deepTree.order.length).toBeLessThan(5000);
-		expect(deepTree.order.length).toBeGreaterThan(100);
+		const deepView = emptyView();
+		const deepTree = buildFoldTree(deep, { rootId: "c4999" }, deepView);
+		// Nothing is dropped: past the depth limit a block is closed, with the rest behind its row.
+		expect(deepTree.order.length).toBe(5001);
+		const shownDeep = visibleFoldRows(deepTree, deep).rows;
+		expect(shownDeep.length).toBe(FOLD_MAX_OPEN_DEPTH);
+		const last = shownDeep[shownDeep.length - 1];
+		expect(last?.node).toMatchObject({ depth: FOLD_MAX_OPEN_DEPTH, open: false });
+		expect(last?.node.size).toBe(5000 - FOLD_MAX_OPEN_DEPTH);
+		expect(last?.preview).toMatchObject({ kind: "details", rest: 0 });
+		// Neither the reader nor "expand all" opens past the limit.
+		applyFoldAction(deepTree, deepView, { kind: "all", open: true });
+		deepView.expanded.add(last?.node.id as string);
+		expect(
+			visibleFoldRows(buildFoldTree(deep, { rootId: "c4999" }, deepView), deep).rows.length,
+		).toBe(FOLD_MAX_OPEN_DEPTH);
 	});
 
 	test("a block reached twice is shown once", () => {

@@ -101,6 +101,11 @@ export interface OutlineEditorProps {
 	onHiddenChange?: (count: number) => void;
 	/** Locks and pending changes of the page's blocks (the page's pending summary). */
 	marks?: ReadonlyMap<string, BlockMark>;
+	/**
+	 * The page's summary arrived (`marks` knows the page's unanswered questions). Until then the
+	 * editor folds as if every question on the page were unanswered.
+	 */
+	marksKnown?: boolean;
 	/** The focused block's path and title, whenever they change. */
 	onFocusInfo?: (info: OutlineFocusInfo) => void;
 	/** The editing surface (the quick switcher focuses through it), and null when it goes. */
@@ -447,10 +452,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 		surfaceRef.current?.setLens(lens);
 	}, [lens]);
 	const marks = props.marks;
+	const marksKnown = props.marksKnown === true;
 	// biome-ignore lint/correctness/useExhaustiveDependencies: a new surface takes the marks too
 	useEffect(() => {
-		surfaceRef.current?.setMarks(marks ?? new Map());
-	}, [marks, client, pageId]);
+		surfaceRef.current?.setMarks(marks ?? new Map(), marksKnown);
+	}, [marks, marksKnown, client, pageId]);
 
 	useEffect(() => {
 		if (!refusal) return;

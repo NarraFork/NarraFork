@@ -523,6 +523,14 @@ describe("OutlineBlockTree: the default view of a task page", () => {
 		expect(quick("report")).toBe("expand");
 		expect(quick("fact")).toBeNull();
 		expect(quick("leaf")).toBeNull();
+		// One level of children only: the arrow is all the row needs.
+		expect(quick("bare")).toBeNull();
+		expect(quick("gone")).toBeNull();
+		expect(doc.querySelector('[data-block-id="gone"] [data-fold-toggle]')).not.toBeNull();
+		// The arrow is a plain button (no component with a hover style of its own).
+		expect(
+			doc.querySelector('[data-block-id="note"] [data-fold-toggle]')?.getAttribute("class"),
+		).not.toContain("ActionIcon");
 		const control = doc.querySelector('[data-block-id="note"] [data-fold-subtree]');
 		expect(control?.getAttribute("aria-label")).toBe("fold.subtree:title=First note");
 		expect(control?.getAttribute("aria-expanded")).toBe("false");

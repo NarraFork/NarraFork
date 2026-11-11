@@ -1568,7 +1568,7 @@ export function foldLayout(): {
 export function setMarks(
 	marks: Record<string, { lockedBy?: string; pending?: string[]; openQuestion?: boolean }>,
 ): void {
-	surface().setMarks(new Map(Object.entries(marks)));
+	surface().setMarks(new Map(Object.entries(marks)), true);
 }
 
 /** The report lines the editor draws (the readable line of each container on screen). */

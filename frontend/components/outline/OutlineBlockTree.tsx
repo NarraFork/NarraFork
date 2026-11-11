@@ -10,7 +10,7 @@
  * inside, a preview line opens everything inside its row, and the tree's own control the page.
  * Nothing is hover-only: every control is drawn on touch too.
  */
-import { ActionIcon, Anchor, Badge, Box, Popover, Stack, Text, Tooltip } from "@mantine/core";
+import { Anchor, Badge, Box, Popover, Stack, Text, Tooltip } from "@mantine/core";
 import { blockTitle } from "@shared/outline";
 import type {
 	OutlineBlockViewResponse,
@@ -231,11 +231,10 @@ const OutlineRow = memo(function OutlineRow({
 				<span className={classes.indent} style={{ width: indent }} />
 				<span className={classes.toggle}>
 					{hasChildren && (
-						<ActionIcon
+						<button
+							type="button"
+							className={`${classes.toggleButton} mantine-focus-auto`}
 							ref={arrowRef}
-							size="xs"
-							variant="subtle"
-							color="gray"
 							aria-label={`${arrowAction} · ${title}`}
 							aria-expanded={!collapsed}
 							title={`${arrowAction} · ${t("fold.altHint")}`}
@@ -248,7 +247,7 @@ const OutlineRow = memo(function OutlineRow({
 							onKeyDown={ownKeys((alt) => (alt ? toggleSubtree() : toggleNode()))}
 						>
 							<FoldIcon collapsed={collapsed} />
-						</ActionIcon>
+						</button>
 					)}
 				</span>
 				{marker === "bullet" &&

@@ -195,8 +195,22 @@
 	border-radius: 50%;
 }
 
-.bullet:hover {
-	color: var(--mantine-color-indigo-5);
+/*
+ * The folding arrow: a plain button (no hover style on a frame part, as in the live editor:
+ * touch has no hover, and Chromium retargets a nearby long press to an element with one).
+ */
+.toggleButton {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 0;
+	background: none;
+	color: var(--mantine-color-dimmed);
+	border-radius: var(--mantine-radius-sm);
+	cursor: pointer;
 }
 
 /* The outline's icons (`outline-icons.ts`), sized as the live editor's frame draws them. */

@@ -401,7 +401,8 @@ export function useOutlinePagePending(spaceId: string, pageId: string | undefine
 		queryKey: outlineKeys.pagePending(spaceId, pageId ?? ""),
 		queryFn: () => api.getOutlinePagePending(spaceId, pageId as string),
 		enabled: enabled && !!pageId,
-		retry: false,
+		// The live editor folds by the unanswered questions in it: a failed read is tried again.
+		retry: 2,
 		staleTime: 5_000,
 	});
 }

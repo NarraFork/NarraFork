@@ -313,6 +313,28 @@ describe("outline view state", () => {
 			(await call(alice, "PUT", pageId, { collapsed: [], expanded: "all", layout: "right" }))
 				.status,
 		).toBe(400);
+		// The two sets share one budget: each within its own limit, together over it.
+		const half = tooMany
+			.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed / 2 + 1)
+			.map((id) => id.padEnd(8, "0"));
+		expect(
+			(
+				await call(alice, "PUT", pageId, {
+					collapsed: half,
+					expanded: half.map((id) => `${id}e`),
+					layout: "right",
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await call(alice, "PUT", pageId, {
+					collapsed: half.slice(1),
+					expanded: half.slice(1).map((id) => `${id}e`),
+					layout: "right",
+				})
+			).status,
+		).toBe(200);
 		expect((await call(alice, "PUT", pageId, "not json")).status).toBe(400);
 		const huge = JSON.stringify({
 			collapsed: [],

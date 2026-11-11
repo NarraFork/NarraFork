@@ -214,8 +214,9 @@ function expectDefault(got: FoldRowDom[], report: string): void {
 		preview: { kind: "result", text: "Both stores write the column", label: "1 more ▸" },
 		quick: "expand",
 	});
-	// Only subtasks under it: the title is all there is.
-	expect(row("Only subtasks")).toMatchObject({ state: "closed", preview: null, quick: "expand" });
+	// Only subtasks under it: the title is all there is. One level: the arrow is the only control.
+	expect(row("Only subtasks")).toMatchObject({ state: "closed", preview: null, quick: null });
+	expect(row("Subtask note")).toMatchObject({ quick: null });
 	expect(row("Dropped idea")).toMatchObject({
 		state: "closed",
 		preview: { kind: "result", text: "Superseded by the fold", label: "" },
@@ -658,7 +659,7 @@ test("someone else's edits inside a closed block apply; a task they finish close
 	expect((await rowOf(a, sub))?.preview).toMatchObject({ kind: "result", text: "Subtask note" });
 	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
 	// He reopens it; she puts her cursor in its note; he finishes it again: it stays open for
-	// her (her cursor is in it), and that is remembered as her own opening.
+	// her while her cursor is in it, and closes when the cursor leaves. Nothing is stored.
 	await b.call((f, id) => f.setTask(id as never, " "), sub);
 	await settle(a, b);
 	await eventually(
@@ -670,12 +671,26 @@ test("someone else's edits inside a closed block apply; a task they finish close
 	await b.call((f, id) => f.setTask(id as never, "x"), sub);
 	await settle(a, b);
 	await eventually(
-		() => foldState(a),
-		(s) => s.expanded.includes(sub),
-		"kept open around the cursor",
+		() => a.call((f, id) => f.client().visible.get(id as never)?.task ?? null, sub),
+		(task) => task === "x",
+		"finished again",
 	);
 	expect((await rowOf(a, sub))?.state).toBe("open");
 	expect((await head(a))?.blockId).toBe(subnote);
+	// Typing goes on where it was.
+	await a.page.keyboard.type("!");
+	await settle(a, b);
+	expect(serverText(pageId, subnote)).toBe("Subtask note!");
+	expect((await rowOf(a, sub))?.state).toBe("open");
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	// The cursor leaves: the finished task closes, as it would for anyone.
+	await caret(a, idOf("A fact"));
+	await eventually(
+		() => rowOf(a, sub),
+		(row) => row?.state === "closed",
+		"closes when the cursor leaves",
+	);
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
 	expect(await a.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
 	expect([...a.errors, ...b.errors]).toEqual([]);
 }, 40_000);
@@ -706,13 +721,17 @@ test("an input method keeps composing while its block's task is closed around it
 	await input.commit("你好");
 	await settle(a, b);
 	expect(serverText(pageId, subnote)).toBe("Subtask note你好");
-	// After the composition the block stays open for the person typing in it.
-	await eventually(
-		() => foldState(a),
-		(s) => s.expanded.includes(sub),
-		"open after composing",
-	);
+	// After the composition the block stays open while the cursor is in it (nothing stored),
+	// and closes when the cursor leaves.
+	expect((await rowOf(a, sub))?.state).toBe("open");
 	expect((await head(a))?.blockId).toBe(subnote);
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	await caret(a, idOf("A fact"));
+	await eventually(
+		() => rowOf(a, sub),
+		(row) => row?.state === "closed",
+		"closes when the cursor leaves",
+	);
 	expect(await a.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
 	expect([...a.errors, ...b.errors]).toEqual([]);
 }, 40_000);
@@ -1477,4 +1496,266 @@ test("an unanswered question is never folded away; a closed row's count opens to
 	} finally {
 		setOutlineAnswerDelivery(previousDelivery);
 	}
+}, 60_000);
+
+test("a selection reaching into a closed block never deletes what the block hides", async () => {
+	const { pageId, idOf } = await page();
+	const a = await openHost(h, "page", pageId);
+	await shows(a, DEFAULT_ROWS);
+	const note = idOf("First note line");
+	const lone = idOf("A lone note");
+	const hiddenIds = ["Detail one", "Deep detail", "Detail two", "Detail three"].map(idOf);
+	const alive = async () =>
+		(
+			await a.call(
+				(f, ids) => (ids as unknown as string[]).filter((id) => !!f.client().visible.alive(id)),
+				hiddenIds,
+			)
+		).length;
+	const selectDown = async () => {
+		// From the middle of the closed block's line into the next row.
+		await caret(a, note, 5);
+		await press(a, "Shift+ArrowDown");
+		const sel = await a.call((f) => f.selection());
+		expect(sel?.anchor).toEqual({ blockId: note, offset: 5 });
+		expect(sel?.head.blockId).toBe(lone);
+		return sel;
+	};
+	const closeNote = async () => {
+		if ((await rowOf(a, note))?.state !== "open") return;
+		await click(a, note, "arrow");
+		await eventually(
+			() => rowOf(a, note),
+			(row) => row?.state === "closed",
+			"closed again",
+		);
+	};
+
+	// Typing over it: nothing is typed or deleted; the block opens with the selection kept, so
+	// the reader sees what the selection covers.
+	const sel = await selectDown();
+	await a.page.keyboard.type("X");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	expect(serverText(pageId, note)).toBe("First note line");
+	expect(serverText(pageId, lone)).toBe("A lone note");
+	await eventually(
+		() => texts(a),
+		(t) => t.includes("Deep detail") && t.includes("Detail three"),
+		"the closed block opened instead",
+	);
+	expect(await a.call((f) => f.selection())).toEqual(sel as never);
+	// The same key again deletes what is now on screen.
+	await a.page.keyboard.type("X");
+	await settle(a);
+	expect(await alive()).toBe(0);
+	expect(serverText(pageId, note)).toMatch(/^FirstX/);
+	// Undo brings the blocks back.
+	await press(a, "Control+z");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	expect(serverText(pageId, note)).toBe("First note line");
+	expect(serverText(pageId, lone)).toBe("A lone note");
+
+	// Backspace, Delete and cut over such a selection: the same.
+	for (const key of ["Backspace", "Delete", "Control+x"]) {
+		await a.call((f) => f.surface().foldAll(false));
+		await closeNote();
+		await shows(a, DEFAULT_ROWS, `default before ${key}`);
+		await selectDown();
+		await press(a, key);
+		await settle(a);
+		expect({ key, alive: await alive() }).toEqual({ key, alive: 4 });
+		expect(serverText(pageId, note)).toBe("First note line");
+		expect((await rowOf(a, note))?.state).toBe("open");
+	}
+
+	// An input method starting over such a selection composes at the cursor instead.
+	await a.call((f) => f.surface().foldAll(false));
+	await shows(a, DEFAULT_ROWS, "default before composing");
+	await selectDown();
+	const input = ime(a as never);
+	await input.set("ni");
+	await input.commit("你");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	expect(serverText(pageId, note)).toBe("First note line");
+	expect(serverText(pageId, lone)).toContain("你");
+	expect((await rowOf(a, note))?.state).toBe("open");
+	await press(a, "Control+z");
+	await settle(a);
+
+	// A closed block deleted as a whole still takes what it holds: block selection and Delete.
+	await a.call((f) => f.surface().foldAll(false));
+	await shows(a, DEFAULT_ROWS, "default before deleting the row");
+	await caret(a, note);
+	await a.page.keyboard.press("Escape");
+	await a.page.keyboard.press("Delete");
+	await settle(a);
+	expect(await alive()).toBe(0);
+	expect(await a.call((f, id) => !!f.client().visible.alive(id as never), note)).toBe(false);
+	await press(a, "Control+z");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	// And a selection that covers its whole line (from its start into the next row).
+	await shows(a, DEFAULT_ROWS, "default before the whole-line selection");
+	await caret(a, note, 0);
+	await press(a, "Shift+ArrowDown");
+	await a.page.keyboard.press("Backspace");
+	await settle(a);
+	expect(await alive()).toBe(0);
+	await press(a, "Control+z");
+	await settle(a);
+	expect(await alive()).toBe(4);
+	expect(await a.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
+	expect(a.errors).toEqual([]);
+}, 60_000);
+
+test("deleting the block after a closed row leaves the row closed; held fold keys toggle once", async () => {
+	const { pageId, idOf } = await page();
+	const a = await openHost(h, "page", pageId);
+	await shows(a, DEFAULT_ROWS);
+	const note = idOf("First note line");
+	const lone = idOf("A lone note");
+	// Block selection and Delete on the row after a closed one.
+	await caret(a, lone);
+	await a.page.keyboard.press("Escape");
+	await a.page.keyboard.press("Delete");
+	await settle(a);
+	expect(await a.call((f, id) => !!f.client().visible.alive(id as never), lone)).toBe(false);
+	// The cursor is at the end of the closed row's own line; nothing opened, nothing stored.
+	expect(await head(a)).toEqual({ blockId: note, offset: "First note line".length });
+	expect((await rowOf(a, note))?.state).toBe("closed");
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	// The first block under an open task: the cursor goes to the task's line.
+	await caret(a, note);
+	await a.page.keyboard.press("Escape");
+	await a.page.keyboard.press("Delete");
+	await settle(a);
+	expect((await head(a))?.blockId).toBe(idOf("Ship the fold"));
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+
+	// Mod-. held down: one toggle. Alt-Enter held down: one toggle.
+	const done = idOf("Wire the store");
+	await caret(a, done);
+	await a.page.keyboard.down("Control");
+	await a.page.keyboard.down(".");
+	await a.page.keyboard.down(".");
+	await a.page.keyboard.down(".");
+	await a.page.keyboard.up(".");
+	await a.page.keyboard.up("Control");
+	expect((await rowOf(a, done))?.state).toBe("open");
+	expect(await foldState(a)).toEqual({ expanded: [done], collapsed: [] });
+	await a.page.keyboard.down("Alt");
+	await a.page.keyboard.down("Enter");
+	await a.page.keyboard.down("Enter");
+	await a.page.keyboard.up("Enter");
+	await a.page.keyboard.up("Alt");
+	expect((await texts(a)).includes("store.ts:12")).toBe(true);
+	// Nothing was typed by the repeats.
+	await settle(a);
+	expect(serverText(pageId, done)).toBe("Wire the store");
+	expect(a.errors).toEqual([]);
+}, 40_000);
+
+test("a task the reader ticks done with the cursor inside closes when the cursor leaves", async () => {
+	const { pageId, idOf } = await page();
+	const a = await openHost(h, "page", pageId);
+	await shows(a, DEFAULT_ROWS);
+	const sub = idOf("A subtask");
+	const subnote = idOf("Subtask note");
+	await caret(a, subnote);
+	await a.call((f, id) => f.setTask(id as never, "x"), sub);
+	await settle(a);
+	// Still open around the cursor, and not as something the reader opened.
+	expect((await rowOf(a, sub))?.state).toBe("open");
+	expect((await head(a))?.blockId).toBe(subnote);
+	expect(await foldState(a)).toEqual({ expanded: [], collapsed: [] });
+	// Moving inside it keeps it open; leaving closes it.
+	await caret(a, sub);
+	expect((await rowOf(a, sub))?.state).toBe("closed");
+	// (On the task's own line the cursor is outside what the task holds.)
+	await caret(a, subnote);
+	expect((await rowOf(a, sub))?.state).toBe("open");
+	expect((await foldState(a)).expanded).toEqual([sub]);
+	expect(a.errors).toEqual([]);
+}, 30_000);
+
+test("a task finished by someone else above the reader does not move what they read", async () => {
+	// Tall enough to scroll: tasks in progress with notes, the reader near the end.
+	const lines: string[] = [];
+	for (let t = 0; t < 24; t++) {
+		lines.push(`[/] Task ${t}`);
+		for (let n = 0; n < 4; n++) lines.push(`  Note ${t}.${n}`);
+	}
+	const { pageId, ids } = await seedPage(h, "Tall page", lines);
+	const idOfLine = (text: string) => ids[lines.indexOf(text)] as string;
+	const a = await openHost(h, "page", pageId, { width: 900, height: 600 });
+	const b = await openBob(h, pageId);
+	await eventually(
+		() => texts(a),
+		(t) => t.length === lines.length,
+		"the tall page is shown",
+	);
+	const reading = idOfLine("  Note 20.1");
+	await caret(a, reading);
+	await a.call(
+		(f, id) =>
+			(f.view().blockEls.get(id as never) as HTMLElement).scrollIntoView({ block: "center" }),
+		reading,
+	);
+	const where = () =>
+		a.call((f, id) => {
+			const el = f.view().blockEls.get(id as never) as HTMLElement;
+			// Whatever scrolls the page (the surface's own scroller, or a box around it).
+			let scroll = window.scrollY;
+			for (let p = el.parentElement; p; p = p.parentElement) scroll += p.scrollTop;
+			return { top: Math.round(el.getBoundingClientRect().top), scroll: Math.round(scroll) };
+		}, reading);
+	const before = await where();
+	expect(before.scroll).toBeGreaterThan(100);
+	// Bob finishes three tasks above: fifteen rows become three.
+	for (const t of [2, 5, 9])
+		await b.call((f, id) => f.setTask(id as never, "x"), idOfLine(`[/] Task ${t}`));
+	await settle(a, b);
+	await eventually(
+		() => texts(a),
+		(t) => t.length === lines.length - 12,
+		"the finished tasks closed",
+	);
+	const after = await where();
+	expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+	expect(after.scroll).toBeLessThan(before.scroll - 100);
+	// He adds rows above: the same.
+	await b.call((f, id) => f.cmd("split", id as never, 9999), idOfLine("  Note 0.0"));
+	await b.call((f, id) => f.cmd("split", id as never, 9999), idOfLine("  Note 0.1"));
+	await settle(a, b);
+	await eventually(
+		() => texts(a),
+		(t) => t.length === lines.length - 10,
+		"the new rows arrived",
+	);
+	expect(Math.abs((await where()).top - before.top)).toBeLessThanOrEqual(1);
+	// Without the keyboard in the editor the first row in view is what stays put.
+	await a.page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+	const first = await a.call((f) => {
+		const box = f.surface().scroller.getBoundingClientRect();
+		const rows = [...f.view().pm.dom.querySelectorAll<HTMLElement>(".ob-block .ob-block")];
+		const el = rows.find((row) => row.getBoundingClientRect().top >= box.top) as HTMLElement;
+		return { id: el.dataset.id as string, top: Math.round(el.getBoundingClientRect().top) };
+	});
+	await b.call((f, id) => f.setTask(id as never, "x"), idOfLine("[/] Task 12"));
+	await settle(a, b);
+	await eventually(
+		() => texts(a),
+		(t) => t.length === lines.length - 14,
+		"one more closed",
+	);
+	const firstNow = await a.call(
+		(f, id) =>
+			Math.round((f.view().blockEls.get(id as never) as HTMLElement).getBoundingClientRect().top),
+		first.id,
+	);
+	expect(Math.abs(firstNow - first.top)).toBeLessThanOrEqual(1);
+	expect([...a.errors, ...b.errors]).toEqual([]);
 }, 60_000);

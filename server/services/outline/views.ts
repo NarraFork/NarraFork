@@ -41,7 +41,7 @@ import {
 	type OutlineViewBlock,
 	type OutlineViewMode,
 } from "@shared/outline-api";
-import { isOutlineReportBlockId } from "@shared/outline-report-line";
+import { isOutlineReportBlockId, isOutlineReportContainer } from "@shared/outline-report-line";
 import type { OutlinePrincipal } from "./access";
 import { readDisplayNames } from "./access-reads";
 import {
@@ -355,7 +355,9 @@ export async function readBlockView(
 		seq: state.seq,
 		current: state.current,
 		view,
-		rootInTask: path.some((node) => node.task !== null || isOutlineReportBlockId(node.id)),
+		rootInTask: path.some(
+			(node) => node.task !== null || isOutlineReportContainer(node.id, node.content ?? ""),
+		),
 		path: path.map((node) => ({
 			id: node.id,
 			sid: node.sid,
