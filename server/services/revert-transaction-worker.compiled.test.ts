@@ -197,13 +197,21 @@ describe("revert manifest worker in a real compiled executable", () => {
 			expect(await readdir(cwd)).toEqual([]);
 			const results: ProbeResult[] = [];
 			for (const binary of [complete, missing]) {
-				const { stdout } = await execFileAsync(binary, [], {
+				const { stdout, stderr } = await execFileAsync(binary, [], {
 					cwd,
 					env: { ...process.env },
 					timeout: 20_000,
 					maxBuffer,
 				});
-				const result = JSON.parse(stdout.trim()) as ProbeResult;
+				let result: ProbeResult;
+				try {
+					result = JSON.parse(stdout.trim()) as ProbeResult;
+				} catch (cause) {
+					throw new Error(
+						`Invalid ${binary === complete ? "with-worker" : "without-worker"} probe output: stdout(${Buffer.byteLength(stdout)} bytes)=${JSON.stringify(stdout.slice(0, 4096))}; stderr(${Buffer.byteLength(stderr)} bytes)=${JSON.stringify(stderr.slice(0, 4096))}`,
+						{ cause },
+					);
+				}
 				expect(result.compiled).toBe(true);
 				expect(result.moduleUrl).toMatch(/\$bunfs\/|%7EBUN\/|~BUN\//i);
 				expect(
