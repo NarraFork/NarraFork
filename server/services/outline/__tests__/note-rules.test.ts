@@ -4,7 +4,9 @@
  * `warn` (the first version, and what the tool runs) everything is written and the result says
  * what is over; in mode `reject` a clearly over-limit write writes nothing, and the same content
  * restructured as the refusal says goes through. Ticking a task off without a result line
- * succeeds with a hint. People's writes, facts, plans being planned are not held to the rules.
+ * succeeds with a hint. People's writes, facts, a plan's tree, reports and questions are not held
+ * to the rules. The edits of one call are judged in order, each where its blocks sit once the
+ * edits before it have applied.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own users,
  * projects and sessions.
@@ -27,11 +29,14 @@ import { reportBlockId } from "../delegation";
 import { DELEGATION_TEXT } from "../delegation-text";
 import { stopEditTextWorker } from "../edit-text-runner";
 import { OUTLINE_TOOL_TEXT } from "../messages";
+import { NoteAnchorReader } from "../note-rules";
+import { lockOutlineTask } from "../pending";
 import { ensurePlanRoot } from "../plans";
 import { clearOutlineReads } from "../read-ledger";
 import { OUTLINE_REPORT_ACTOR } from "../report-authors";
 import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
+import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
 import { writeOutline } from "../write";
 
@@ -160,7 +165,6 @@ describe("a note clearly over the limit", () => {
 			refused: false,
 			issues: 1,
 			clear: 1,
-			headings: 0,
 		});
 		// The same call through the service in mode `warn` reads the same.
 		const again = await edit(w, [{ add: t, markdown: `- ${long}` }], "warn");
@@ -293,6 +297,59 @@ describe("who is not held to the rules", () => {
 		expect(noteRules(out)).toBeUndefined();
 	});
 
+	test("an approved plan's tree is the plan's too: not checked", async () => {
+		const w = await world();
+		const { root } = await ensurePlanRoot({
+			session: w.session,
+			userId: w.alice,
+			title: "Plan",
+			locale: "en",
+		});
+		const row = await outlineStore.getBlock(root.blockId);
+		const plan = row?.taskJson?.plan;
+		expect(plan?.state).toBe("planning");
+		await db
+			.update(outlineBlocks)
+			.set({ taskJson: { ...row?.taskJson, plan: { ...plan, state: "approved" } } as never })
+			.where(eq(outlineBlocks.id, root.blockId));
+		const space = await ensureSessionSpace(w.session);
+		const out = await edit(
+			{ ...w, space },
+			[{ add: root.address, markdown: `- [ ] A step\n  - ${long}` }],
+			"reject",
+		);
+		expect(out.isError).toBeFalsy();
+		expect(out.output).not.toContain(TEXT.warnHeader);
+	});
+
+	test("blocks under a question put to a person are not the session's notes", async () => {
+		const w = await world();
+		const space = await ensureSessionSpace(w.session);
+		const made = await edit(
+			{ ...w, space },
+			[{ add: "session/", markdown: "- Tasks\n  - [/] A task" }],
+			"reject",
+		);
+		const t = ids(made.output)[1] as string;
+		const parent = (await blocks(space)).find((b) => b.sid === t.split("/").pop());
+		const question = generateId();
+		await db.insert(outlineBlocks).values({
+			...(parent as NonNullable<typeof parent>),
+			id: question,
+			sid: "Qq1aB2cD",
+			parentId: parent?.id as string,
+			content: "Which format first?",
+			contentHash: "x",
+			alias: null,
+			taskJson: null,
+			askJson: { v: 1 } as never,
+			orderKey: "a0",
+		});
+		const reader = new NoteAnchorReader(outlineStore, space.id);
+		expect((await reader.anchor(question)).skip).toBe(true);
+		expect(await reader.anchor(parent?.id as string)).toEqual({ depth: 0, skip: false });
+	});
+
 	test("a plan still being planned: ExitPlanMode holds it to the plan format instead", async () => {
 		const w = await world();
 		const { root } = await ensurePlanRoot({
@@ -354,24 +411,173 @@ describe("who is not held to the rules", () => {
 });
 
 describe("headings under a task", () => {
-	test("the mark is dropped and the result says so; a fact keeps its heading", async () => {
+	test("kept as written, with a hint in both modes; a fact's heading is not mentioned", async () => {
+		for (const mode of ["warn", "reject"] as const) {
+			const w = await world();
+			const t = await task(w);
+			const out = await edit(
+				w,
+				[
+					{ add: t, markdown: "- ## Root cause\n  - The token is read twice" },
+					{ add: "/", markdown: "- Facts\n  - ## A heading" },
+				],
+				mode,
+			);
+			expect(out.isError).toBeFalsy();
+			const [heading] = ids(out.output);
+			const stored = await blocks(w.space);
+			expect(stored.find((b) => b.sid === heading)?.content).toBe("## Root cause");
+			expect(stored.some((b) => b.content === "## A heading")).toBe(true);
+			expect(out.output).toContain(TEXT.warnHeader);
+			expect(out.output).toContain(TEXT.heading(`[${heading}]`));
+			expect(out.output.match(/is a heading under a task/g)).toHaveLength(1);
+			expect(noteRules(out)).toEqual({ mode, refused: false, issues: 1, clear: 0 });
+		}
+	});
+
+	test("a heading standing first under a finished task is not its result", async () => {
+		const w = await world();
+		const t = await task(w);
+		const added = await edit(
+			w,
+			[{ add: t, markdown: "- ## Result\n- Fixed: the second refresh waits" }],
+			"warn",
+		);
+		const [heading] = ids(added.output);
+		const out = await edit(w, [{ set: t, checkbox: "x" }], "warn");
+		expect(out.isError).toBeFalsy();
+		expect(out.output).toContain(TEXT.noResult(t, false, heading as string, heading as string));
+	});
+});
+
+describe("one call, in order", () => {
+	const long = "word ".repeat(150).trim();
+
+	test("a block an earlier edit of the call made a task: what is added under it is checked", async () => {
+		const w = await world();
+		const page = ids(
+			(await edit(w, [{ add: "/", markdown: "- Plain parent" }], "reject")).output,
+		)[0];
+		const stored = (await blocks(w.space)).length;
+		const refused = await edit(
+			w,
+			[
+				{ set: page as string, checkbox: " " },
+				{ add: page as string, markdown: `- ${long}` },
+			],
+			"reject",
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(TEXT.refusedHeader);
+		expect((await blocks(w.space)).length).toBe(stored);
+		// The other way round, the note is written before the block is a task: not checked.
+		const ok = await edit(
+			w,
+			[
+				{ add: page as string, markdown: `- ${long}` },
+				{ set: page as string, checkbox: " " },
+			],
+			"reject",
+		);
+		expect(ok.isError).toBeFalsy();
+		expect(ok.output).not.toContain(TEXT.warnHeader);
+	});
+
+	test("a task an earlier edit of the call made a plain block: what is added under it is a fact", async () => {
 		const w = await world();
 		const t = await task(w);
 		const out = await edit(
 			w,
 			[
-				{ add: t, markdown: "- ## Root cause\n  - The token is read twice" },
-				{ add: "/", markdown: "- Facts\n  - ## A heading" },
+				{ set: t, checkbox: "none" },
+				{ add: t, markdown: `- ${long}` },
 			],
-			"warn",
+			"reject",
 		);
 		expect(out.isError).toBeFalsy();
-		const [heading] = ids(out.output);
-		const stored = await blocks(w.space);
-		expect(stored.find((b) => b.sid === heading)?.content).toBe("Root cause");
-		expect(stored.some((b) => b.content === "## A heading")).toBe(true);
-		expect(out.output).toContain(TEXT.headingsDropped([heading as string]));
-		expect(noteRules(out)).toMatchObject({ headings: 1, issues: 0 });
+		expect(out.output).not.toContain(TEXT.warnHeader);
+		expect(noteRules(out)).toBeUndefined();
+	});
+
+	test("a rewrite that gives a block its checkbox counts for the edits after it", async () => {
+		const w = await world();
+		const page = ids(
+			(await edit(w, [{ add: "/", markdown: "- Plain parent" }], "reject")).output,
+		)[0];
+		const refused = await edit(
+			w,
+			[
+				{ replace: page as string, text: "[ ] Now a task" },
+				{ add: page as string, markdown: `- ${long}` },
+			],
+			"reject",
+		);
+		expect(refused.isError).toBe(true);
+	});
+
+	test("moves: a block moved under a task is not rewritten, so not checked; what is added to it afterwards is", async () => {
+		const w = await world();
+		const t = await task(w);
+		const added = await edit(
+			w,
+			[{ add: "/", markdown: `- Facts\n  - ${long}\n  - A short fact` }],
+			"reject",
+		);
+		const [, longFact, shortFact] = ids(added.output);
+		// Moving what was written before is not a write of its text.
+		const moved = await edit(w, [{ move: longFact as string, to: t }], "reject");
+		expect(moved.isError).toBeFalsy();
+		expect(moved.output).not.toContain(TEXT.warnHeader);
+		// Moved under the task by this call, then written under: one level below the task's notes.
+		const refused = await edit(
+			w,
+			[
+				{ move: shortFact as string, to: t },
+				{ replace: shortFact as string, text: long },
+			],
+			"reject",
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(TEXT.longNote(`[${shortFact}]`, long.length, noteChars));
+		// Moved out from under the task by this call, then rewritten: a fact.
+		const out = await edit(
+			w,
+			[
+				{ move: longFact as string, to: "/" },
+				{ replace: longFact as string, text: `${long} again` },
+			],
+			"reject",
+		);
+		expect(out.isError).toBeFalsy();
+		expect(out.output).not.toContain(TEXT.warnHeader);
+	});
+});
+
+describe("naming and counting", () => {
+	test("a bare URL counts as a link's label, not in full", async () => {
+		const w = await world();
+		const t = await task(w);
+		const url = `https://example.com/${"a".repeat(130)}`;
+		const out = await edit(w, [{ add: t, markdown: `- see ${url}` }], "reject");
+		expect(out.isError).toBeFalsy();
+		expect(out.output).not.toContain(TEXT.warnHeader);
+	});
+
+	test("a block of an edit held for confirmation is named by its edit, not by an id it does not have yet", async () => {
+		const w = await world();
+		const made = await edit(w, [{ add: "/", markdown: "- [ ] Ship it\n  - [ ] Step one" }], "warn");
+		const t = ids(made.output)[0] as string;
+		const root = (await blocks(w.space)).find((b) => b.sid === t);
+		await lockOutlineTask({ blockId: root?.id as string, userId: w.alice });
+		const title = "t".repeat(titleChars + 1);
+		const out = await edit(w, [{ add: t, markdown: `- Phase 2\n  - [ ] ${title}` }], "warn");
+		expect(out.isError).toBeFalsy();
+		expect(out.output).toContain("Held for confirmation as P");
+		expect(out.output).toContain(
+			TEXT.longTitle(TEXT.unwritten(1, `${"t".repeat(39)}…`), titleChars + 1, 1, titleChars),
+		);
+		// The step does not exist yet.
+		expect((await blocks(w.space)).some((b) => b.content === title)).toBe(false);
 	});
 });
 
@@ -383,13 +589,13 @@ describe("ticking a task off", () => {
 		const out = await tool(w, [{ set: t, checkbox: "x" }]);
 		expect(out.isError).toBeFalsy();
 		expect((await blocks(w.space)).find((b) => b.sid === t)?.taskJson?.status).toBe("done");
-		expect(out.output).toContain(TEXT.noResult(t, false, sub as string));
+		expect(out.output).toContain(TEXT.noResult(t, false, sub as string, null));
 		expect((out.metadata as { finishHints?: number }).finishHints).toBe(1);
 		// The same in mode `reject`: ticking off is never refused for want of a result.
 		const other = await task(w, "Another task");
 		const rejected = await edit(w, [{ set: other, checkbox: "-" }], "reject");
 		expect(rejected.isError).toBeFalsy();
-		expect(rejected.output).toContain(TEXT.noResult(other, true, null));
+		expect(rejected.output).toContain(TEXT.noResult(other, true, null, null));
 	});
 
 	test("with a result line, or one added by the same call: no hint", async () => {
@@ -413,7 +619,7 @@ describe("ticking a task off", () => {
 		const t = await task(w);
 		const out = await edit(w, [{ replace: t, text: "[x] Fix the refresh race" }], "warn");
 		expect(out.isError).toBeFalsy();
-		expect(out.output).toContain(TEXT.noResult(t, false, null));
+		expect(out.output).toContain(TEXT.noResult(t, false, null, null));
 		const again = await edit(w, [{ set: t, checkbox: "x" }], "warn");
 		expect(again.output).not.toContain("with no result under it");
 	});
@@ -460,6 +666,9 @@ describe("the rules as the prompts state them", () => {
 		const zh = getOutlineTaskSystemReminder("zh-CN");
 		expect(zh).toContain("结论 → 依据 → 细节");
 		expect(zh).toContain("任务下第一块要是一行结果");
+		// The title's limit, in both.
+		expect(en).toContain(`A task's title is one line (at most ${titleChars} characters)`);
+		expect(zh).toContain(`任务标题只写一行（不超过 ${titleChars} 字）`);
 		// Still three conventions.
 		expect(en).toContain("Three conventions");
 		expect(zh).toContain("三条约定");
@@ -470,6 +679,9 @@ describe("the rules as the prompts state them", () => {
 	test("OutlineEdit's description states them with the same numbers", () => {
 		const text = outlineEditTool.description as string;
 		expect(text).toContain("Notes under a task go conclusion first");
+		expect(text).toContain(`a task's title is one line (at most ${titleChars} characters)`);
+		// Headings are kept as written (and named in the result), not dropped.
+		expect(text).not.toContain("dropped) and no record");
 		for (const n of numbers) expect(text).toContain(n);
 	});
 

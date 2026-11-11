@@ -63,7 +63,6 @@ import {
 import {
 	type NoteWrite,
 	type NoteWriteBlock,
-	noteHeadingAsParagraph,
 	noteWriteIssues,
 	noteWriteRefused,
 	OUTLINE_NOTE_RULES,
@@ -117,7 +116,13 @@ import {
 	outlinePendingIdOf,
 	outlinePendingLabel,
 } from "./model";
-import { finishedTaskHints, noteAnchors, noteIssueLines, type TickedTask } from "./note-rules";
+import {
+	finishedTaskHints,
+	type NoteAnchor,
+	NoteAnchorReader,
+	noteIssueLines,
+	type TickedTask,
+} from "./note-rules";
 import {
 	confirmOutlinePending,
 	OUTLINE_PENDING_TEXT,
@@ -882,64 +887,74 @@ export async function outlineEdit(
 	const noteMode = options.noteRules ?? OUTLINE_NOTE_RULES.mode;
 	const noteText = OUTLINE_TOOL_TEXT.edit.noteRules;
 	const anchorOf = (edit: EditState) => (edit.kind === "add" ? edit.parent : edit.located);
-	const anchorIds = new Set<string>();
-	for (const edit of edits) {
-		const anchor = edit.items?.length ? anchorOf(edit) : undefined;
-		if (anchor?.kind === "block") anchorIds.add(anchor.block.id);
-	}
-	const anchors =
-		anchorIds.size > 0 ? await noteAnchors(scope.store, space.id, [...anchorIds]) : new Map();
+	// The edits apply in order: each is judged where its blocks sit once the edits before it
+	// have applied (a block an earlier edit made a task or a plain block, or moved).
+	const reader = new NoteAnchorReader(scope.store, space.id);
+	if (edits.some((edit) => edit.items?.length))
+		await reader.prefetch(
+			edits.flatMap((edit) =>
+				[edit.located, edit.parent].flatMap((l) => (l?.kind === "block" ? [l.block.id] : [])),
+			),
+		);
 	/** The blocks the check names: an existing block, or one the call adds (by its edit). */
 	const noteRefs = new Map<string, { edit: EditState; existing: boolean; text: string }>();
 	const noteWrites: NoteWrite[] = [];
-	const headingsDropped: string[] = [];
 	for (const edit of edits) {
-		if (!edit.items?.length) continue;
+		const r = edit.request;
 		const anchor = anchorOf(edit);
-		const at = anchor?.kind === "block" ? anchors.get(anchor.block.id) : undefined;
-		if (at?.skip) continue;
-		const anchorDepth: number | null = at?.depth ?? null;
-		const toBlock = (p: PlannedItem, above: number | null, self?: string): NoteWriteBlock => {
-			// A rewrite that leaves the checkbox out keeps it.
-			const task = p.item.task !== null || (self !== undefined && anchorDepth === 0);
-			const depth = task ? 0 : above;
-			const ref = self ?? p.sid;
-			if (depth !== null) {
-				const plain = noteHeadingAsParagraph(p.content);
-				if (plain !== null) {
-					p.content = plain;
-					headingsDropped.push(ref);
-				}
-			}
-			noteRefs.set(ref, { edit, existing: self !== undefined, text: p.item.title || p.content });
-			return {
-				ref,
-				content: p.content,
-				task,
-				children: p.children.map((child) => toBlock(child, depth === null ? null : depth + 1)),
+		if (edit.items?.length) {
+			const at: NoteAnchor | undefined =
+				anchor?.kind === "block" ? await reader.anchor(anchor.block.id) : undefined;
+			const anchorDepth: number | null = at?.depth ?? null;
+			const toBlock = (p: PlannedItem, above: number | null, self?: string): NoteWriteBlock => {
+				// A rewrite that leaves the checkbox out keeps it.
+				const task = p.item.task !== null || (self !== undefined && anchorDepth === 0);
+				const depth = task ? 0 : above;
+				const ref = self ?? p.sid;
+				noteRefs.set(ref, {
+					edit,
+					existing: self !== undefined,
+					text: p.item.title || p.content,
+				});
+				return {
+					ref,
+					content: p.content,
+					task,
+					children: p.children.map((child) => toBlock(child, depth === null ? null : depth + 1)),
+				};
 			};
-		};
-		if (edit.kind === "add") {
-			const ref = anchor?.kind === "block" ? anchor.block.sid : "/";
-			if (anchor?.kind === "block")
-				noteRefs.set(ref, { edit, existing: true, text: anchor.block.title });
-			noteWrites.push({
-				kind: "under",
-				parent: { ref, depth: anchorDepth },
-				blocks: edit.items.map((p) => toBlock(p, anchorDepth === null ? null : anchorDepth + 1)),
-			});
-		} else if (anchor?.kind === "block") {
-			noteWrites.push({
-				kind: "self",
-				depth: anchorDepth,
-				block: toBlock(edit.items[0] as PlannedItem, anchorDepth, anchor.block.sid),
-			});
+			if (at?.skip) {
+				// Not held to the rules (a plan's tree, a report, a question).
+			} else if (edit.kind === "add") {
+				const ref = anchor?.kind === "block" ? anchor.block.sid : "/";
+				if (anchor?.kind === "block")
+					noteRefs.set(ref, { edit, existing: true, text: anchor.block.title });
+				noteWrites.push({
+					kind: "under",
+					parent: { ref, depth: anchorDepth },
+					blocks: edit.items.map((p) => toBlock(p, anchorDepth === null ? null : anchorDepth + 1)),
+				});
+			} else if (anchor?.kind === "block") {
+				noteWrites.push({
+					kind: "self",
+					depth: anchorDepth,
+					block: toBlock(edit.items[0] as PlannedItem, anchorDepth, anchor.block.sid),
+				});
+			}
 		}
+		// What this edit changes for the edits after it.
+		if (edit.located?.kind !== "block") continue;
+		const id = edit.located.block.id;
+		if ("set" in r && r.checkbox !== undefined) reader.setTask(id, r.checkbox !== "none");
+		else if ("replace" in r && edit.items?.[0]?.item.task) reader.setTask(id, true);
+		else if ("move" in r)
+			reader.move(id, edit.parent?.kind === "block" ? edit.parent.block.id : null);
 	}
 	const noteReport = noteWriteIssues(noteWrites);
-	const noteAt = (written: boolean) => (ref: string) => {
+	/** A block by its id once it exists (`written`: whether a block the edit adds does). */
+	const noteAt = (written: (edit: EditState) => boolean) => (ref: string) => {
 		const named = noteRefs.get(ref);
-		return !named || named.existing || written
+		return !named || named.existing || written(named.edit)
 			? noteText.written(scope.addressIn(space)(ref))
 			: noteText.unwritten(named.edit.index + 1, clip(named.text, 40));
 	};
@@ -948,25 +963,23 @@ export async function outlineEdit(
 		refused,
 		issues: noteReport.total,
 		clear: noteReport.clear,
-		headings: headingsDropped.length,
 	});
 	if (noteWriteRefused(noteReport, noteMode)) {
 		const clear = { ...noteReport, issues: noteReport.issues.filter((issue) => issue.clear) };
 		return {
 			output: [
 				noteText.refusedHeader,
-				...noteIssueLines({ ...clear, total: noteReport.clear }, noteAt(false)).map(
-					(l) => `- ${l}`,
-				),
+				...noteIssueLines(
+					{ ...clear, total: noteReport.clear },
+					noteAt(() => false),
+				).map((l) => `- ${l}`),
 				noteText.refusedRecover,
 			].join("\n"),
 			isError: true,
 			metadata: { ...meta, commit: null, noteRules: noteMeta(true) },
 		};
 	}
-	if (noteReport.total > 0 || headingsDropped.length > 0) meta.noteRules = noteMeta(false);
-	if (headingsDropped.length > 0)
-		globalNotes.push(noteText.headingsDropped(headingsDropped.map(scope.addressIn(space))));
+	if (noteReport.total > 0) meta.noteRules = noteMeta(false);
 
 	// Hints, read before the barrier (it holds the space's live sessions while it runs): a new
 	// page whose title another page of the space already has.
@@ -1517,7 +1530,17 @@ export async function outlineEdit(
 			{
 				globalNotes,
 				hints,
-				noteLines: outcome.written.commit ? noteIssueLines(noteReport, noteAt(true)) : [],
+				// A block of an edit held for confirmation does not exist yet: named by its edit.
+				noteLines:
+					outcome.written.commit || outcome.written.pending
+						? noteIssueLines(
+								noteReport,
+								noteAt(
+									(edit) =>
+										outcome.written.commit !== null && !edit.opIndexes.some((i) => heldOps.has(i)),
+								),
+							)
+						: [],
 				meta,
 				held: held?.lines ?? [],
 				display: {

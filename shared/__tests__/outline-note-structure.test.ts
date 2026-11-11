@@ -5,8 +5,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	isNoteHeading,
 	type NoteWriteBlock,
-	noteHeadingAsParagraph,
+	noteTextChars,
 	noteWriteIssues,
 	noteWriteRefused,
 	OUTLINE_NOTE_RULES,
@@ -250,20 +251,72 @@ describe("warn or refuse", () => {
 	});
 });
 
-describe("noteHeadingAsParagraph", () => {
-	test("drops the heading mark and keeps the text and its marks", () => {
-		expect(noteHeadingAsParagraph("## Root **cause**")).toBe("Root **cause**");
-		expect(noteHeadingAsParagraph("# 结论")).toBe("结论");
+describe("headings under a task", () => {
+	test("a heading under a task is an issue, never a clear one; a task's own title and facts are not", () => {
+		const report = noteWriteIssues([
+			{
+				kind: "under",
+				parent: { ref: "task", depth: 0 },
+				blocks: [
+					block("h", "## Root cause", [block("deep", "### Deeper")]),
+					block("plain", "Root cause"),
+					block("tag", "#tag is not a heading"),
+					block("code", "```\n# a comment\n```"),
+				],
+			},
+			{
+				kind: "under",
+				parent: { ref: "page", depth: null },
+				blocks: [block("fact", "## A fact's heading"), block("t", "# Title", [], true)],
+			},
+		]);
+		expect(report.issues).toEqual([
+			{ kind: "heading", ref: "h", clear: false },
+			{ kind: "heading", ref: "deep", clear: false },
+		]);
+		expect(report.clear).toBe(0);
+		expect(noteWriteRefused(report, "reject")).toBe(false);
 	});
-	test("text that would read as something else as a paragraph is escaped", () => {
-		const plain = noteHeadingAsParagraph("# 1. first") as string;
-		expect(plain).not.toBe("1. first");
-		expect(plain.replace(/\\/g, "")).toBe("1. first");
+
+	test("isNoteHeading", () => {
+		expect(isNoteHeading("## Root **cause**")).toBe(true);
+		expect(isNoteHeading("### three")).toBe(true);
+		// (The dialect has three heading levels: deeper marks are text.)
+		expect(isNoteHeading("###### six")).toBe(false);
+		expect(isNoteHeading("A paragraph")).toBe(false);
+		expect(isNoteHeading("#notheading")).toBe(false);
+		expect(isNoteHeading("```\n# code\n```")).toBe(false);
 	});
-	test("anything else is left alone", () => {
-		expect(noteHeadingAsParagraph("A paragraph")).toBeNull();
-		expect(noteHeadingAsParagraph("#tag not a heading")).toBeNull();
-		expect(noteHeadingAsParagraph("```\n# code\n```")).toBeNull();
+});
+
+describe("bare URLs", () => {
+	const url = `https://example.com/${"a".repeat(130)}`;
+
+	test("a bare URL counts as a link's label would, not in full", () => {
+		expect(noteTextChars(`see ${url}`)).toBe(4 + OUTLINE_NOTE_RULES.urlChars);
+		expect(noteTextChars("see https://a.io/x")).toBe(18);
+		expect(noteTextChars(`${url} and ${url}`)).toBe(5 + 2 * OUTLINE_NOTE_RULES.urlChars);
+		expect(noteTextChars("no link here")).toBe(12);
+	});
+
+	test("a short note with a long URL is within the limit; long text beside it is not", () => {
+		const report = noteWriteIssues([
+			{
+				kind: "under",
+				parent: { ref: "task", depth: 0 },
+				blocks: [block("ok", `see ${url}`), block("long", `${"字".repeat(noteChars)} ${url}`)],
+			},
+		]);
+		expect(report.issues).toEqual([
+			{
+				kind: "long",
+				ref: "long",
+				chars: noteChars + 1 + OUTLINE_NOTE_RULES.urlChars,
+				lines: 1,
+				role: "note",
+				clear: false,
+			},
+		]);
 	});
 });
 
@@ -274,6 +327,7 @@ describe("taskResultCheck", () => {
 	test("a note under the task is its result", () => {
 		expect(taskResultCheck([other("sub"), note("r", "Fixed in auth.ts:12")])).toEqual({
 			hasResult: true,
+			heading: null,
 			long: [],
 			longTotal: 0,
 			flat: null,
@@ -285,6 +339,17 @@ describe("taskResultCheck", () => {
 		expect(taskResultCheck([other("sub"), other("report"), note("blank", " ")]).hasResult).toBe(
 			false,
 		);
+	});
+
+	test("a heading standing first is a label, not the result", () => {
+		expect(
+			taskResultCheck([other("sub"), note("h", "## Result"), note("r", "Fixed in auth.ts:12")]),
+		).toMatchObject({ hasResult: false, heading: "h" });
+		// A heading further down does not take the result's place.
+		expect(taskResultCheck([note("r", "Fixed"), note("h", "## Notes")])).toMatchObject({
+			hasResult: true,
+			heading: null,
+		});
 	});
 
 	test("long notes are named (a few), with their length when all of it was read", () => {

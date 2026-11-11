@@ -1874,7 +1874,7 @@ test("a closed row wholly inside a text selection opens first too; the whole pag
 		});
 		for (let i = 0; i < 2; i++) {
 			if (key === "X") await a.page.keyboard.type("X");
-			else await a.page.keyboard.press(key);
+			else await a.page.keyboard.press(key as never);
 			await settle(a);
 			expect({ key, i, outline: serverOutline(pageId) }).toEqual({ key, i, outline: original });
 		}

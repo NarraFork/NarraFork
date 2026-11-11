@@ -382,20 +382,20 @@ export const OUTLINE_TOOL_TEXT = {
 			longTitle: (at: string, chars: number, lines: number, limit: number) =>
 				`${at} (a task's title) has ${chars} characters${lines > 1 ? ` on ${lines} lines` : ""}: a title is one line (at most ${limit} characters) saying what done means; put the rest in blocks under it.`,
 			longNote: (at: string, chars: number, limit: number) =>
-				`${at} has ${chars} characters directly under a task: that level holds one-line conclusions (at most ${limit} characters). Keep the conclusion as the block's text and put the evidence and details in blocks under it (indented items).`,
+				`${at} has ${chars} characters directly under a task: a block there is read as one line (at most ${limit} characters) — a conclusion, or what a description or a brief opens with. Keep that line as the block's text and put the rest (the evidence, the details, the body of the brief) in blocks under it (indented items).`,
 			longDetail: (at: string, chars: number, limit: number) =>
 				`${at} has ${chars} characters: evidence or a detail is at most ${limit} characters; split it into several blocks, or put the finer parts under it.`,
 			flat: (at: string, children: number, limit: number, task: boolean) =>
 				`${at} gets ${children} blocks directly under it in this call: at most ${limit} on one level; ${task ? "group them under a few conclusions (subtasks under phases)" : "group them"}.`,
+			heading: (at: string) =>
+				`${at} is a heading under a task: make it a one-line conclusion (no #) and indent what follows under it; under a task the levels are the indentation.`,
 			more: (n: number) => `${n} more like these.`,
-			/** The refusal's last line: what else was fine, and what to do. */
+			/** The refusal's last line: what happened to the rest, and what to do. */
 			refusedRecover:
-				"Send the call again with those blocks restructured; the rest of the call was fine and was not written either.",
-			headingsDropped: (ids: readonly string[]) =>
-				`heading marks (#) were dropped from ${ids.length === 1 ? "1 block" : `${ids.length} blocks`} under tasks (${list(ids.map((id) => `[${id}]`))}): under a task, levels are what the indentation says`,
+				"Send the call again with those blocks restructured; nothing of the call was written, and the rest of it was not checked further.",
 			/** A task ticked done or cancelled with no note under it. */
-			noResult: (id: string, cancelled: boolean, before: string | null) =>
-				`[${id}] is ${cancelled ? "cancelled" : "done"} with no result under it, so folded it shows only its title: add one line saying ${cancelled ? "why it was cancelled" : "what came of it"} as its first block ({ add: "${id}", markdown: "- …"${before ? `, before: "${before}"` : ""} }).`,
+			noResult: (id: string, cancelled: boolean, before: string | null, heading: string | null) =>
+				`[${id}] is ${cancelled ? "cancelled" : "done"} with ${heading ? `a heading ([${heading}]) where its result should be, so folded it shows that label` : "no result under it, so folded it shows only its title"}: add one line saying ${cancelled ? "why it was cancelled" : "what came of it"} as its first block ({ add: "${id}", markdown: "- …"${before ? `, before: "${before}"` : ""} }).`,
 			tidyLong: (id: string, blocks: readonly string[], more: number, limit: number) =>
 				`under the finished task [${id}], ${blocks.join(", ")}${more > 0 ? ` and ${more} more` : ""} ${blocks.length + more === 1 ? "is" : "are"} longer than a conclusion (at most ${limit} characters): compress each into one line with its evidence in blocks under it, and delete what only records the process.`,
 			tidyBlock: (id: string, chars: number | null) =>

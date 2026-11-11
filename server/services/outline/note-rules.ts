@@ -8,14 +8,21 @@
  * ------------------------------------------------
  * Only an agent's `OutlineEdit` calls this at all: people's edits, the system's writes (a report
  * attached under a task, an import, a lease note) never pass here. Of an agent's writes, these
- * are left alone: blocks inside a plan still being planned (`ExitPlanMode` holds the plan to its
- * own format, `outline-plan-structure.ts`), blocks inside a subagent report, and blocks under a
- * question put to a person.
+ * are left alone: blocks inside a plan's tree, being planned or approved (`ExitPlanMode` holds
+ * the plan to its own format, `outline-plan-structure.ts`), blocks inside a subagent report, and
+ * blocks under a question put to a person.
+ *
+ * ONE CALL, IN ORDER ({@link NoteAnchorReader})
+ * --------------------------------------------
+ * The edits of a call apply in order, so each is judged where its blocks will sit once the
+ * edits before it have applied: a block an earlier edit made a task (or a plain block), and a
+ * block an earlier edit moved, are read as that edit leaves them.
  *
  * MAIN THREAD
  * -----------
  * Small indexed reads only. The ancestor walk is one batched point read per level for all the
- * call's anchors (at most {@link NOTE_RULE_READS.maxLevels}); a ticked task reads the metas of at
+ * call's anchors (at most {@link NOTE_RULE_READS.maxLevels}; a block moved by the call may add
+ * single point reads); a ticked task reads the metas of at
  * most {@link OUTLINE_NOTE_RULES.tidyChildren} + 1 children and the first
  * {@link OUTLINE_NOTE_RULES.tidyHeadChars} characters of the notes among them, for at most
  * {@link NOTE_RULE_READS.maxTicked} tasks a call. No block body is read whole.
@@ -47,44 +54,73 @@ export interface NoteAnchor {
 	skip: boolean;
 }
 
-/** {@link NoteAnchor} of each of `blockIds` (blocks of `spaceId`). */
-export async function noteAnchors(
-	store: OutlineStore,
-	spaceId: string,
-	blockIds: readonly string[],
-): Promise<Map<string, NoteAnchor>> {
-	const metas = new Map<string, OutlineBlockMeta | null>();
-	const walks = blockIds.map((id) => ({
-		id,
-		at: id as string | null,
-		level: 0,
-		anchor: { depth: null, skip: false } as NoteAnchor,
-	}));
-	for (let level = 0; level < NOTE_RULE_READS.maxLevels; level++) {
-		const active = walks.filter((w) => w.at !== null && !w.anchor.skip);
-		if (active.length === 0) break;
-		const missing = [...new Set(active.map((w) => w.at as string))].filter((id) => !metas.has(id));
-		if (missing.length > 0) {
-			for (const id of missing) metas.set(id, null);
-			for (const meta of await store.getBlockMetas(spaceId, { ids: missing }))
-				metas.set(meta.id, meta);
-		}
-		for (const walk of active) {
-			const meta = metas.get(walk.at as string);
-			if (!meta) {
-				walk.at = null;
-				continue;
+/**
+ * Where the existing blocks of one space sit relative to a task, as the edits of one call change
+ * it (see the module header). {@link prefetch} reads the ancestors of the call's anchors level by
+ * level; {@link anchor} then answers from what was read.
+ */
+export class NoteAnchorReader {
+	private readonly metas = new Map<string, OutlineBlockMeta | null>();
+	/** Blocks an earlier edit of the call gave a checkbox (true) or took it from (false). */
+	private readonly tasks = new Map<string, boolean>();
+	/** Blocks an earlier edit of the call moved: their parent now (null: a page). */
+	private readonly parents = new Map<string, string | null>();
+
+	constructor(
+		private readonly store: OutlineStore,
+		private readonly spaceId: string,
+	) {}
+
+	private async load(ids: readonly string[]): Promise<void> {
+		const missing = [...new Set(ids)].filter((id) => !this.metas.has(id));
+		if (missing.length === 0) return;
+		for (const id of missing) this.metas.set(id, null);
+		for (const meta of await this.store.getBlockMetas(this.spaceId, { ids: missing }))
+			this.metas.set(meta.id, meta);
+	}
+
+	/** Read the ancestors of `blockIds` as stored: one batched read per level. */
+	async prefetch(blockIds: readonly string[]): Promise<void> {
+		let at = [...new Set(blockIds)];
+		for (let level = 0; level < NOTE_RULE_READS.maxLevels && at.length > 0; level++) {
+			await this.load(at);
+			const up = new Set<string>();
+			for (const id of at) {
+				const parent = this.metas.get(id)?.parentId;
+				if (parent && !this.metas.has(parent)) up.add(parent);
 			}
-			if (meta.askJson || isOutlineReportBlockId(meta.id)) walk.anchor.skip = true;
-			if (meta.taskJson) {
-				if (walk.anchor.depth === null) walk.anchor.depth = walk.level;
-				if (meta.taskJson.plan?.state === "planning") walk.anchor.skip = true;
-			}
-			walk.at = meta.parentId;
-			walk.level++;
+			at = [...up];
 		}
 	}
-	return new Map(walks.map((w) => [w.id, w.anchor]));
+
+	/** An earlier edit of the call gave the block a checkbox, or took it away. */
+	setTask(blockId: string, task: boolean): void {
+		this.tasks.set(blockId, task);
+	}
+
+	/** An earlier edit of the call moved the block under `parentId` (null: a page). */
+	move(blockId: string, parentId: string | null): void {
+		this.parents.set(blockId, parentId);
+	}
+
+	/** Where `blockId` sits now, the call's earlier edits applied. */
+	async anchor(blockId: string): Promise<NoteAnchor> {
+		const anchor: NoteAnchor = { depth: null, skip: false };
+		let at: string | null = blockId;
+		for (let level = 0; at !== null && level < NOTE_RULE_READS.maxLevels; level++) {
+			await this.load([at]);
+			const meta: OutlineBlockMeta | null = this.metas.get(at) ?? null;
+			if (!meta) break;
+			if (meta.askJson || isOutlineReportBlockId(meta.id)) return { ...anchor, skip: true };
+			if (this.tasks.get(at) ?? meta.taskJson !== null) {
+				if (anchor.depth === null) anchor.depth = level;
+				// A plan's tree, being planned or approved: the plan format's, not the note rules'.
+				if (meta.taskJson?.plan) return { ...anchor, skip: true };
+			}
+			at = this.parents.has(at) ? (this.parents.get(at) ?? null) : meta.parentId;
+		}
+		return anchor;
+	}
 }
 
 /** The lines of a note report, each naming its block with `at`. */
@@ -93,6 +129,7 @@ export function noteIssueLines(report: NoteWriteReport, at: (ref: string) => str
 	const line = (issue: NoteIssue): string => {
 		if (issue.kind === "flat")
 			return text.flat(at(issue.ref), issue.children, OUTLINE_NOTE_RULES.maxChildren, issue.clear);
+		if (issue.kind === "heading") return text.heading(at(issue.ref));
 		const limit = noteBlockLimit(issue.role);
 		if (issue.role === "title")
 			return text.longTitle(at(issue.ref), issue.chars, issue.lines, limit);
@@ -151,7 +188,14 @@ export async function finishedTaskHints(
 		// Not all children were read, in no order: a result may be among the others.
 		if (!report.hasResult && !more) {
 			const first = children[0];
-			hints.push(text.noResult(id(task.sid), task.cancelled, first ? id(first.sid) : null));
+			hints.push(
+				text.noResult(
+					id(task.sid),
+					task.cancelled,
+					first ? id(first.sid) : null,
+					report.heading === null ? null : id(report.heading),
+				),
+			);
 		}
 		if (report.long.length > 0)
 			hints.push(

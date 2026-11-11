@@ -34,11 +34,19 @@
  *
  * Text is counted as the plan format counts it (`planBlockText`, `planTextChars`): what a reader
  * sees, one per character whatever the script; code blocks and tables are not prose and are not
- * held to the length limits.
+ * held to the length limits. One thing more than the plan format: a bare URL counts as a link's
+ * label would ({@link OUTLINE_NOTE_RULES.urlChars} characters at most), since a reader takes it
+ * in as one thing and an agent cannot shorten it ({@link noteTextChars}).
+ *
+ * HEADINGS
+ * --------
+ * A heading under a task is kept as written and named as an issue (never a clear one): under a
+ * task the levels are the indentation, and a heading that stands first is a label, not the
+ * task's result ({@link taskResultCheck} does not take it for one).
  *
  * Pure: no database, no DOM. Content is the block's canonical dialect markdown.
  */
-import { parseBlock, serializeBody } from "./outline/dialect";
+import { parseBlock } from "./outline/dialect";
 import { OUTLINE_PLAN_STRUCTURE, planBlockText, planTextChars } from "./outline-plan-structure";
 
 /** What a clearly over-limit write gets: written with a warning, or refused. */
@@ -60,6 +68,8 @@ export const OUTLINE_NOTE_RULES = {
 	clearNoteChars: OUTLINE_PLAN_STRUCTURE.pointChars * 5,
 	/** Blocks one call adds directly under one block. */
 	maxChildren: OUTLINE_PLAN_STRUCTURE.maxChildren,
+	/** Characters a bare URL counts as at most. */
+	urlChars: 24,
 	/** Issues one result names (the rest are counted). */
 	listed: 8,
 	/** Blocks a finished task's hint names. */
@@ -103,7 +113,9 @@ export type NoteIssue =
 	/** A block longer than its role allows (`lines` > 1: a title on several lines). */
 	| { kind: "long"; ref: string; chars: number; lines: number; role: NoteBlockRole; clear: boolean }
 	/** Too many blocks added directly under one block by this call (`ref`: that block). */
-	| { kind: "flat"; ref: string; children: number; clear: boolean };
+	| { kind: "flat"; ref: string; children: number; clear: boolean }
+	/** A markdown heading under a task (kept as written; never clear). */
+	| { kind: "heading"; ref: string; clear: false };
 
 export interface NoteWriteReport {
 	/** The first {@link OUTLINE_NOTE_RULES.listed} issues: the clear ones first, each in order. */
@@ -124,6 +136,28 @@ export function noteBlockLimit(role: NoteBlockRole): number {
 	return limitOf(role);
 }
 
+const BARE_URL = /\bhttps?:\/\/[^\s<>"'）)\]]+/g;
+
+/**
+ * Characters of a block's text (`planBlockText`) as the note rules count them: as a reader
+ * counts, with a bare URL no longer than a link's label.
+ */
+export function noteTextChars(text: string): number {
+	let chars = planTextChars(text);
+	if (!text.includes("://")) return chars;
+	for (const url of text.match(BARE_URL) ?? []) {
+		const length = planTextChars(url);
+		if (length > OUTLINE_NOTE_RULES.urlChars) chars -= length - OUTLINE_NOTE_RULES.urlChars;
+	}
+	return chars;
+}
+
+/** Whether a block's content is a markdown heading. */
+export function isNoteHeading(content: string): boolean {
+	// Every heading starts with `#` (canonical content has no leading space).
+	return content.startsWith("#") && parseBlock(content).body.type === "heading";
+}
+
 function longIssue(block: NoteWriteBlock, role: NoteBlockRole): NoteIssue | null {
 	const limit = limitOf(role);
 	const content = block.content;
@@ -131,7 +165,7 @@ function longIssue(block: NoteWriteBlock, role: NoteBlockRole): NoteIssue | null
 	if (content.length <= limit && (role !== "title" || !content.includes("\n"))) return null;
 	const { text, prose } = planBlockText(content);
 	if (!prose) return null;
-	const chars = planTextChars(text);
+	const chars = noteTextChars(text);
 	const lines = role === "title" ? text.split("\n").length : 1;
 	if (chars <= limit && lines <= 1) return null;
 	return {
@@ -166,6 +200,8 @@ export function noteWriteIssues(writes: readonly NoteWrite[]): NoteWriteReport {
 			const depth = block.task ? 0 : at;
 			if (depth !== null) {
 				push(longIssue(block, depth === 0 ? "title" : depth === 1 ? "note" : "detail"));
+				if (depth > 0 && isNoteHeading(block.content))
+					push({ kind: "heading", ref: block.ref, clear: false });
 				push(flat(block.ref, block.children.length, depth === 0));
 			}
 			for (let i = block.children.length - 1; i >= 0; i--)
@@ -211,18 +247,6 @@ export function noteWriteRefused(
 	return mode === "reject" && report.clear > 0;
 }
 
-/**
- * A heading block's content as a paragraph (the `#` dropped, its text kept), or null when the
- * block is not a heading. Under a task, levels are what the indentation says.
- */
-export function noteHeadingAsParagraph(content: string): string | null {
-	// Every heading starts with `#` (canonical content has no leading space).
-	if (!content.startsWith("#")) return null;
-	const { body } = parseBlock(content);
-	if (body.type !== "heading") return null;
-	return serializeBody({ type: "paragraph", content: body.content });
-}
-
 /** A block directly under a task being ticked off, as {@link taskResultCheck} sees it. */
 export interface TaskResultChild {
 	ref: string;
@@ -233,8 +257,13 @@ export interface TaskResultChild {
 }
 
 export interface TaskResultReport {
-	/** A note with text is under the task: the line a folded finished task shows. */
+	/**
+	 * The first note with text under the task is its result: the line a folded finished task
+	 * shows. False without a note, and when that first note is a heading (a label, not a result).
+	 */
 	hasResult: boolean;
+	/** The heading that stands where the result should, when that is why there is none. */
+	heading: string | null;
 	/** Notes over a note's limit, at most {@link OUTLINE_NOTE_RULES.tidyListed} (`chars` null: past what was read). */
 	long: Array<{ ref: string; chars: number | null }>;
 	/** Notes over the limit in all. */
@@ -252,6 +281,7 @@ export function taskResultCheck(
 	more = false,
 ): TaskResultReport {
 	let hasResult = false;
+	let heading: string | null = null;
 	let notes = 0;
 	let longTotal = 0;
 	const long: TaskResultReport["long"] = [];
@@ -261,9 +291,13 @@ export function taskResultCheck(
 		const { text, prose } = planBlockText(child.head);
 		if (!text.trim()) continue;
 		notes++;
-		hasResult = true;
+		// The first note is what a folded task shows.
+		if (notes === 1) {
+			if (isNoteHeading(child.head)) heading = child.ref;
+			else hasResult = true;
+		}
 		if (!prose) continue;
-		const chars = planTextChars(text);
+		const chars = noteTextChars(text);
 		if (!cut && chars <= OUTLINE_NOTE_RULES.noteChars) continue;
 		longTotal++;
 		if (long.length < OUTLINE_NOTE_RULES.tidyListed)
@@ -271,6 +305,7 @@ export function taskResultCheck(
 	}
 	return {
 		hasResult,
+		heading,
 		long,
 		longTotal,
 		flat: more || notes > OUTLINE_NOTE_RULES.maxChildren ? notes : null,
