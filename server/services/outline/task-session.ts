@@ -15,6 +15,9 @@
  *      (prerequisites, an unanswered question, a change waiting for confirmation) and is not
  *      assigned to a person (`outlineTaskStartBlocker`, shared with delegation); it is still at
  *      the version the board read; the project has a working directory (or one was given).
+ *      Asked to continue in the previous session's directory (`previousDirectory`), that is the
+ *      directory of the session that last held the task, only when it is inside the project's
+ *      own and still exists; otherwise `no_directory`.
  *   3. The session: a root session in the project, owned by the person, its tasks in the outline,
  *      titled after the task, with the defaults of any session created there (audiences,
  *      permission mode, continuation).
@@ -41,7 +44,10 @@
  * snapshot: what changes later reaches the session through its current-tasks view and the team
  * activity. Its text does not depend on the time: the same outline renders the same bytes.
  * Within {@link OUTLINE_TASK_BRIEF_LIMITS.bytes} (the person's own note aside), in this order:
- * the head (title, goals above, address, the claim generation); the task's own text; the notes,
+ * the head (title, goals above, address, the claim generation); the task's own text; the handoff
+ * of the sessions that had the task before, when there is one (outline P2 PR 10c-2, `handoff.ts`:
+ * the newest whole with the notes it links to, earlier ones by their first line; they are left
+ * out of the notes that follow); the notes,
  * steps and questions under it and its prerequisites (the delegation brief's rendering,
  * `renderDelegationBrief`); the background (the nearest tasks above with their first paragraph,
  * and the nearest one's tasks, to place this one); the facts the task links to; a map of the
