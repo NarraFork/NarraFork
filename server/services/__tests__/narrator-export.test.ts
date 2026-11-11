@@ -36,6 +36,7 @@ const {
 	EXPORT_TOOL_ERROR_LIMIT,
 	EXPORT_TOOL_FIELD_LIMIT,
 	fenceFor,
+	listNarratorExportTurns,
 	NARRATOR_EXPORT_DEFAULTS,
 	streamNarratorExport,
 } = await import("../narrator-export");
@@ -1299,5 +1300,51 @@ describe("subagent narrators", () => {
 		await seedMessage({ id: "s1", narratorId: "sub", seq: 1, contentText: "subagent-work" });
 		const md = await collect("sub");
 		expect(md).toContain("subagent-work");
+	});
+});
+
+describe("导出消息范围", () => {
+	/** 三轮：每轮一条用户消息 + 一条助手回复。 */
+	async function seedTurns() {
+		seedNarrator();
+		const rows: Array<[string, "user" | "assistant"]> = [
+			["TURN1-USER", "user"],
+			["TURN1-ASSISTANT", "assistant"],
+			["TURN2-USER", "user"],
+			["TURN2-ASSISTANT", "assistant"],
+			["TURN3-USER", "user"],
+			["TURN3-ASSISTANT", "assistant"],
+		];
+		for (const [index, [text, role]] of rows.entries()) {
+			await seedMessage({ id: text, narratorId: "n1", seq: index + 1, role, contentText: text });
+		}
+	}
+
+	test("只导出选中的轮次，助手回复跟着所在轮", async () => {
+		await seedTurns();
+		const md = await collect("n1", { format: "markdown", range: "2" });
+		expect(md).toContain("TURN2-USER");
+		expect(md).toContain("TURN2-ASSISTANT");
+		expect(md).not.toContain("TURN1-USER");
+		expect(md).not.toContain("TURN3-ASSISTANT");
+	});
+
+	test("轮次索引按用户消息编号，助手预览归到同一轮", async () => {
+		await seedTurns();
+		const list = await listNarratorExportTurns("n1", "visible");
+		expect(list.truncated).toBe(false);
+		expect(list.turns.map((turn) => turn.turn)).toEqual([1, 2, 3]);
+		expect(list.turns[1]).toMatchObject({
+			turn: 2,
+			userPreview: "TURN2-USER",
+			assistantPreview: "TURN2-ASSISTANT",
+		});
+	});
+
+	test("范围串坏掉时导出全部，而不是产出一份空文件", async () => {
+		await seedTurns();
+		const md = await collect("n1", { format: "markdown", range: "oops" });
+		expect(md).toContain("TURN1-USER");
+		expect(md).toContain("TURN3-ASSISTANT");
 	});
 });

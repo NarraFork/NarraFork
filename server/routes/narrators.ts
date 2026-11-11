@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { type ComposerDocument, composerQuoteBlock } from "@shared/composer-document";
+import { expandTurnRange, parseTurnRange } from "@shared/export-turn-range";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -213,6 +214,7 @@ import {
 	humanAttentionListQuerySchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
+	narratorExportTurnsQuerySchema,
 	narratorGrantCreateSchema,
 	narratorGrantUpdateSchema,
 	narratorTransferOwnerSchema,
@@ -352,7 +354,11 @@ import {
 	restoreNarratorDraftPrevious,
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
-import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
+import {
+	buildExportFileName,
+	listNarratorExportTurns,
+	streamNarratorExport,
+} from "../services/narrator-export";
 import { getNarratorGitSummary } from "../services/narrator-git-summary";
 import {
 	countNarratorMessageRefs,
@@ -4175,11 +4181,32 @@ narratorRoutes.get("/:id/search", async (c) => {
  * generator pages with the event loop yielded in between, so the response starts
  * flowing immediately and other requests keep being served.
  */
+/**
+ * 导出范围选择弹窗的数据：与导出同一 scope 的轮次摘要。
+ *
+ * 弹窗只列"将要导出的那份内容"里的轮次，所以选到的轮次一定导得出来。
+ */
+narratorRoutes.get("/:id/export-turns", async (c) => {
+	const parsed = narratorExportTurnsQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const id = c.req.param("id");
+	// 先确认会话存在，再走可能很长的遍历。
+	await narratorService.getById(id);
+	return c.json(await listNarratorExportTurns(id, parsed.data.scope));
+});
+
 narratorRoutes.get("/:id/export", async (c) => {
 	const id = c.req.param("id");
 	const parsed = narratorExportQuerySchema.safeParse(c.req.query());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const options = parsed.data;
+	// 范围在这里挡掉：导出是一份要下载的文件，格式错误不该变成"导出了全部"。
+	if (options.range.trim()) {
+		const ranges = parseTurnRange(options.range);
+		if (!ranges || ranges.length === 0 || !expandTurnRange(ranges)) {
+			throw new ValidationError("Invalid export message range");
+		}
+	}
 
 	// Resolve the narrator up front so a bad id is a clean 404 rather than an
 	// attachment whose body happens to contain an error.

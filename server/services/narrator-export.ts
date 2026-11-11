@@ -33,6 +33,7 @@
  */
 
 import { parseCompactMessageBlock } from "@shared/compact-message";
+import { expandTurnRange, parseTurnRange, TURN_RANGE_MAX_TURNS } from "@shared/export-turn-range";
 import {
 	GEN_UI_PUBLIC_SUMMARY,
 	GEN_UI_PUBLIC_SUMMARY_CODE,
@@ -184,6 +185,13 @@ export interface NarratorExportOptions {
 	scope: NarratorExportScope;
 	includeToolIO: boolean;
 	lang: NarratorExportLang;
+	/**
+	 * 轮次区间串（`1,2,3-10`）；空串表示不限制。
+	 *
+	 * 一轮 = 一条用户消息及其后的助手/工具消息。范围在 scope 之后过滤，所以可见范围
+	 * 之外的轮号不会被导出。
+	 */
+	range?: string;
 }
 
 export const NARRATOR_EXPORT_DEFAULTS: NarratorExportOptions = {
@@ -1640,6 +1648,99 @@ function markdownFooter(
  * detectable (no sentinel / parse failure) and nothing further can be written to
  * a closed connection anyway.
  */
+/** 轮次摘要里每条消息保留的字符数：弹窗只用来辨认，不展示正文。 */
+const TURN_PREVIEW_CHARS = 200;
+
+/**
+ * 导出范围 → 轮号集合；`null` 表示不限制。
+ *
+ * 路由已经校验过一次，这里兜底：串坏掉或展开过大时宁可导出全部，也不要悄悄产出
+ * 一份空文件。
+ */
+function resolveSelectedTurns(range?: string): Set<number> | null {
+	if (!range?.trim()) return null;
+	const parsed = parseTurnRange(range);
+	if (!parsed || parsed.length === 0) return null;
+	const turns = expandTurnRange(parsed);
+	if (!turns) {
+		logger.warn("Narrator export range exceeds the turn limit; exporting every turn", { range });
+		return null;
+	}
+	return turns;
+}
+
+export interface ExportTurnSummary {
+	turn: number;
+	userPreview: string;
+	assistantPreview: string | null;
+	createdAt: string;
+}
+
+/**
+ * 选择弹窗用的轮次索引：与导出同一套 scope，只读预览。
+ *
+ * 不读 `content_json`：一页几十条消息的正文可以到几 MB，而这里只需要"这是哪一轮"。
+ */
+export async function listNarratorExportTurns(
+	narratorId: string,
+	scope: NarratorExportScope,
+): Promise<{ turns: ExportTurnSummary[]; truncated: boolean }> {
+	const transcript = await resolveTranscriptScope(narratorId, scope);
+	const turns: ExportTurnSummary[] = [];
+	let current: ExportTurnSummary | null = null;
+
+	for await (const page of iterateNarratorTranscript(narratorId, transcript)) {
+		if (page.refs.length === 0) continue;
+		const summaries = await loadTurnSummaries(page.refs.map((ref) => ref.messageId));
+		for (const ref of page.refs) {
+			const row = summaries.get(ref.messageId);
+			if (!row) continue;
+			if (row.role === "user") {
+				if (turns.length >= TURN_RANGE_MAX_TURNS) return { turns, truncated: true };
+				current = {
+					turn: turns.length + 1,
+					userPreview: row.preview,
+					assistantPreview: null,
+					createdAt: row.createdAt,
+				};
+				turns.push(current);
+				continue;
+			}
+			// 会话不是以用户消息开头时，前导内容算第 1 轮。
+			if (!current) {
+				if (turns.length >= TURN_RANGE_MAX_TURNS) return { turns, truncated: true };
+				current = {
+					turn: 1,
+					userPreview: "",
+					assistantPreview: null,
+					createdAt: row.createdAt,
+				};
+				turns.push(current);
+			}
+			if (row.role === "assistant" && !current.assistantPreview) {
+				current.assistantPreview = row.preview;
+			}
+		}
+	}
+	return { turns, truncated: false };
+}
+
+async function loadTurnSummaries(
+	messageIds: string[],
+): Promise<Map<string, { role: string; preview: string; createdAt: string }>> {
+	if (messageIds.length === 0) return new Map();
+	const rows = await db
+		.select({
+			id: narratorMessages.id,
+			role: narratorMessages.role,
+			createdAt: narratorMessages.createdAt,
+			preview: sql<string>`substr(coalesce(${narratorMessages.contentText}, ''), 1, ${TURN_PREVIEW_CHARS})`,
+		})
+		.from(narratorMessages)
+		.where(inArray(narratorMessages.id, messageIds));
+	return new Map(rows.map((row) => [row.id, row]));
+}
+
 export async function* streamNarratorExport(
 	narratorId: string,
 	options: NarratorExportOptions,
@@ -1658,6 +1759,9 @@ export async function* streamNarratorExport(
 	let messageCount = 0;
 	let failure: string | null = null;
 	let lastSeq = 0;
+	const selectedTurns = resolveSelectedTurns(options.range);
+	/** 当前轮号：遇到用户消息才推进，助手/工具消息跟着所在轮。 */
+	let turn = 0;
 
 	const header = await loadHeader(narratorId);
 
@@ -1739,6 +1843,11 @@ export async function* streamNarratorExport(
 			);
 
 			for (const message of assembled) {
+				if (!message.isCompactMarker && message.row.role === "user") {
+					turn = turn === 0 ? 1 : turn + 1;
+				}
+				// 选了范围就只输出选中轮次；压缩标记不属于任何一轮，一并跳过。
+				if (selectedTurns && (message.isCompactMarker || !selectedTurns.has(turn))) continue;
 				if (isJson) {
 					yield `${first ? "\n" : ",\n"}${JSON.stringify(jsonMessage(message, options.includeToolIO))}`;
 					first = false;
@@ -1780,5 +1889,6 @@ export async function* streamNarratorExport(
 
 export const narratorExportService = {
 	streamNarratorExport,
+	listNarratorExportTurns,
 	buildExportFileName,
 };
