@@ -56,8 +56,9 @@
  *     was not stopped by its person or by an error (they speak next);
  *   - its wake limit has room (`team-wake.ts`: 6 a minute); else the row is written and one wake
  *     follows when there is room, if the row is still unread then;
- *   - the task is not one the session itself handed away in the last ten minutes (two sessions
- *     passing a task to and fro record it, and do not keep each other running).
+ *   - it is not the writer's second hand-over of that task within ten minutes (a first
+ *     hand-over wakes, a hand-back included; two sessions passing a task to and fro after that
+ *     record it, and do not keep each other running).
  * A running session is not woken: it reads the row at its next tool boundary. On PostgreSQL the
  * row is written and nothing is woken (the session runtime does not run there; as PR 7 and 9b).
  *
@@ -132,7 +133,7 @@ export const OUTLINE_TEAM_EVENT_LIMITS = {
 	spacesAtOnce: 4,
 	/** Commits one space may have waiting to be read; past it they are dropped and logged. */
 	queuedPerSpace: 500,
-	/** An assignment back to the session that handed the task away within this long wakes nobody. */
+	/** A session's second hand-over of the same task within this long wakes nobody. */
 	handBackQuietMs: 10 * 60_000,
 	/** Tasks whose last hand-over is remembered (memory only). */
 	handOversRemembered: 2000,
@@ -166,9 +167,10 @@ interface Assigned {
 	blockId: string;
 	humanCreated: boolean;
 	/**
-	 * The session handed this task away itself a moment ago and now gets it back: recorded, but
-	 * not a reason to wake it (two sessions passing a task to and fro must not keep each other
-	 * running).
+	 * The writer already handed this same task over within the quiet time: the task is being
+	 * passed to and fro. Recorded, but not a reason to wake (two sessions must not keep each
+	 * other running). A session's FIRST hand-over of a task wakes as usual, a hand-back included:
+	 * "I cannot do this" is worth a turn.
 	 */
 	back: boolean;
 }
@@ -202,7 +204,7 @@ function noteHandedAway(taskId: string, by: string, at: number, commitId: string
 	}
 }
 
-/** Whether session `root` handed the task away itself within the quiet time before `at`. */
+/** Whether session `root` handed the task over (in another commit) within the quiet time before `at`. */
 function handedAwayBy(taskId: string, root: string, at: number, commitId: string): boolean {
 	return (handedAway.get(taskId) ?? []).some(
 		(h) =>
@@ -302,8 +304,10 @@ async function assignedInCommit(
 	for (const candidate of candidates) {
 		const root = sessions.get(candidate.assignee);
 		if (root === undefined) continue;
-		// Handed back within minutes by the session it was handed to: no wake (see `Assigned`).
-		const back = handedAwayBy(candidate.blockId, root, at, writer.commit.id);
+		// The writer's second hand-over of this task within minutes: no wake (see `Assigned`).
+		const back =
+			writer.writerRoot !== null &&
+			handedAwayBy(candidate.blockId, writer.writerRoot, at, writer.commit.id);
 		if (writer.writerRoot !== null && writer.writerRoot !== root)
 			noteHandedAway(candidate.blockId, writer.writerRoot, at, writer.commit.id);
 		// Its own session (or a subagent of it) assigned it: nothing to tell.
@@ -501,8 +505,9 @@ async function unblockedInCommit(
 }
 
 /**
- * The rows one commit makes, one per session it concerns (see the module header). Reads only;
- * nothing is written.
+ * The rows one commit makes, one per session it concerns (see the module header). Reads the
+ * store and writes nothing to it; the one thing it keeps is in memory: who handed which task over
+ * in this commit (`handedAway`, by commit id, so reading a commit again changes nothing).
  */
 export async function readOutlineTeamMessages(
 	event: OutlineCommitEvent,

@@ -492,7 +492,7 @@ describe("one row per commit and session, whatever the commit is read as later",
 });
 
 describe("a task passed to and fro", () => {
-	test("handed back within ten minutes to the session that handed it away: recorded, not woken; later it wakes again", async () => {
+	test("a first hand-back wakes; from a session's second hand-over of the same task within ten minutes it is recorded, not woken; later it wakes again", async () => {
 		const { owner, space, planner, worker, by } = await pair();
 		const t0 = Date.parse("2026-11-10T08:00:00.000Z");
 		const at = (minutes: number) => new Date(t0 + minutes * 60_000);
@@ -509,23 +509,26 @@ describe("a task passed to and fro", () => {
 				[{ op: "setTask", block: { id: task.blockId }, task: { assignee: `agent:${to}` } }],
 				at(minutes),
 			);
-		// The worker hands it straight back: the planner gets the row, and no wake.
+		const first = async (written: Awaited<ReturnType<typeof hand>>) =>
+			(await readOutlineTeamMessages(written.event))[0];
+		// The worker hands it back ("I cannot do this"): its first hand-over, the planner is woken.
 		const back = await hand(planner, worker, 2);
-		const [toPlanner] = await readOutlineTeamMessages(back.event);
-		expect(toPlanner).toMatchObject({ narratorId: planner, wake: false });
-		expect(toPlanner?.content).toContain("Ping");
+		expect(await first(back)).toMatchObject({ narratorId: planner, wake: true });
 		// Read again (a retry, the re-push): the same answer.
-		expect((await readOutlineTeamMessages(back.event))[0]?.wake).toBe(false);
-		// And on again, and back again, all within minutes: nobody is woken by the bouncing.
-		expect(
-			(await readOutlineTeamMessages((await hand(worker, planner, 3)).event))[0],
-		).toMatchObject({ narratorId: worker, wake: false });
-		expect((await readOutlineTeamMessages((await hand(planner, worker, 4)).event))[0]?.wake).toBe(
-			false,
-		);
+		expect((await first(back))?.wake).toBe(true);
+		// The planner hands it over a second time within minutes: recorded, nobody woken.
+		const again = await hand(worker, planner, 3);
+		const quiet = await first(again);
+		expect(quiet).toMatchObject({ narratorId: worker, wake: false });
+		expect(quiet?.content).toContain("Ping");
+		expect((await first(again))?.wake).toBe(false);
+		// And the worker's second hand-back: quiet too.
+		expect(await first(await hand(planner, worker, 4))).toMatchObject({
+			narratorId: planner,
+			wake: false,
+		});
 		// Ten minutes on, a hand-over is a hand-over again.
-		const later = await hand(worker, planner, 4 + 11);
-		expect((await readOutlineTeamMessages(later.event))[0]).toMatchObject({
+		expect(await first(await hand(worker, planner, 4 + 11))).toMatchObject({
 			narratorId: worker,
 			wake: true,
 		});

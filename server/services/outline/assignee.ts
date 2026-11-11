@@ -115,7 +115,14 @@ export async function canSessionWorkIn(
 	narratorId: string,
 	space: OutlineSpaceRow,
 ): Promise<boolean> {
-	const owner = (await readNarrator(narratorId))?.ownerUserId ?? null;
+	return await canOwnerWorkIn((await readNarrator(narratorId))?.ownerUserId ?? null, space);
+}
+
+/** {@link canSessionWorkIn} for a session whose owner is known: may that person write the space. */
+export async function canOwnerWorkIn(
+	owner: string | null,
+	space: OutlineSpaceRow,
+): Promise<boolean> {
 	if (!owner) return false;
 	const nonAdmins = await readNonAdminUserIds([owner]);
 	return await canAgentWriteSpace({ userId: owner, isAdmin: !nonAdmins.has(owner) }, space);

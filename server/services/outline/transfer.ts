@@ -27,7 +27,7 @@ import type {
 } from "@shared/outline-task-board";
 import { narratorUsersWith, type OutlinePrincipal } from "./access";
 import { readNarrator, readProjectTransferSessions } from "./access-reads";
-import { canSessionWorkIn } from "./assignee";
+import { canOwnerWorkIn, canSessionWorkIn } from "./assignee";
 import {
 	OutlineBusyError,
 	OutlineConflictError,
@@ -82,12 +82,26 @@ export async function listTransferSessions(
 	const { sessions: limit, scanned, page } = OUTLINE_TRANSFER_LIMITS;
 	const sessions: OutlineBoardTransferSession[] = [];
 	let truncated = false;
+	// A row can show on two pages when the order moves between the reads (a session gets a
+	// message): each session once. And "could it do the task" is its owner's answer: once an owner.
+	const seen = new Set<string>();
+	const owners = new Map<string | null, Promise<boolean>>();
+	const couldWork = (owner: string | null): Promise<boolean> => {
+		let verdict = owners.get(owner);
+		if (!verdict) {
+			verdict = canOwnerWorkIn(owner, space);
+			owners.set(owner, verdict);
+		}
+		return verdict;
+	};
 	for (let offset = 0; offset < scanned; offset += page) {
 		const rows = await readProjectTransferSessions(principal, projectId, { limit: page, offset });
 		for (const row of rows) {
 			// The session whose space holds the task has it already ("back to the session").
 			if (space.kind === "session" && space.narratorId === row.id) continue;
-			if (!(await canSessionWorkIn(row.id, space))) continue;
+			if (seen.has(row.id)) continue;
+			seen.add(row.id);
+			if (!(await couldWork(row.ownerUserId))) continue;
 			if (sessions.length >= limit) {
 				truncated = true;
 				break;
