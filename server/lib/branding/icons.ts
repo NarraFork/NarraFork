@@ -68,9 +68,8 @@ const MIME_BY_EXTENSION: Record<string, string> = {
  *
  * Mirrors the static-file strategy in `server/main.ts`: a compiled binary reads
  * from the embedded asset map, a source production run reads `dist/frontend`, and
- * dev reads `frontend/public`. All three are probed rather than selected up front
- * because `bun run start` and `bun run dev` differ only by whether the build
- * output exists, and a partially built tree should still yield an icon.
+ * dev reads `frontend/public`. Only source runs probe filesystem alternatives;
+ * compiled builds never borrow assets from a mutable checkout.
  */
 async function readSourceAsset(fileName: string): Promise<Uint8Array | null> {
 	const candidates: string[] = [];
@@ -79,8 +78,7 @@ async function readSourceAsset(fileName: string): Promise<Uint8Array | null> {
 		try {
 			// Dynamic so a non-compiled run (where the generated file is absent) does
 			// not fail at import time.
-			const generatedModulePath = "../../generated/embedded-frontend";
-			const generated = (await import(generatedModulePath)) as {
+			const generated = (await import("@server/generated/embedded-frontend")) as {
 				embeddedAssets?: Record<string, string>;
 			};
 			const embedded = generated.embeddedAssets ?? {};
@@ -91,16 +89,17 @@ async function readSourceAsset(fileName: string): Promise<Uint8Array | null> {
 				}
 			}
 		} catch {
-			// Not available — fall through to the filesystem candidates.
+			// A frozen runtime must not borrow newer source assets from disk.
+			return null;
 		}
+	} else {
+		candidates.push(
+			// fileURLToPath 而不是 URL.pathname：后者在 Windows 上会给出 `/D:/...` 这种
+			// 带前导斜杠的无效路径，开发模式下素材会永远找不到。
+			fileURLToPath(new URL(`../../../dist/frontend/${fileName}`, import.meta.url)),
+			fileURLToPath(new URL(`../../../frontend/public/${fileName}`, import.meta.url)),
+		);
 	}
-
-	candidates.push(
-		// fileURLToPath 而不是 URL.pathname：后者在 Windows 上会给出 `/D:/...` 这种
-		// 带前导斜杠的无效路径，开发模式下素材会永远找不到。
-		fileURLToPath(new URL(`../../../dist/frontend/${fileName}`, import.meta.url)),
-		fileURLToPath(new URL(`../../../frontend/public/${fileName}`, import.meta.url)),
-	);
 
 	for (const candidate of candidates) {
 		try {

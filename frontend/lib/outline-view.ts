@@ -1,14 +1,16 @@
 /**
- * Pure helpers of the read-only outline pages: the URL search of a block page, the rows a
- * collapsed tree shows, and stepping through a page's timeline. No React, no requests.
+ * Pure helpers of the read-only outline pages: the URL search of a block page, a view as the
+ * tree its folding is worked out on, and stepping through a page's timeline. No React, no
+ * requests.
  */
 import type {
 	OutlineBlockViewResponse,
 	OutlineCommitSummary,
 	OutlineSpaceSummary,
-	OutlineViewBlock,
 	OutlineViewMode,
 } from "@shared/outline-api";
+import { buildFoldTree, type FoldSource, type FoldTree, type FoldView } from "@shared/outline-fold";
+import { isOutlineReportContainer } from "@shared/outline-report-line";
 
 export interface OutlineBlockSearch {
 	/** Commit seq to show the page as of; absent for the current state. */
@@ -26,44 +28,39 @@ export function parseOutlineBlockSearch(raw: Record<string, unknown>): OutlineBl
 	return out;
 }
 
-export interface OutlineRow {
-	block: OutlineViewBlock;
-	depth: number;
-	/** The block has children in this view, shown or not. */
-	hasChildren: boolean;
-	collapsed: boolean;
+/**
+ * A view's blocks as the tree the default folding reads (`@shared/outline-fold`): the children a
+ * read loaded, each block's task and whether it is a subagent report's container, and its own
+ * marks (an unanswered question, a change waiting for confirmation, a lock).
+ */
+export function viewFoldSource(view: Pick<OutlineBlockViewResponse, "blocks">): FoldSource {
+	const byId = new Map(view.blocks.map((block) => [block.id, block]));
+	return {
+		children: (id) => byId.get(id)?.childIds ?? [],
+		task: (id) => byId.get(id)?.task?.status ?? null,
+		report: (id) => {
+			const block = byId.get(id);
+			return !!block && isOutlineReportContainer(block.id, block.content);
+		},
+		heading: (id) => /^#{1,6}\s/.test(byId.get(id)?.content ?? ""),
+		marks: (id) => {
+			const block = byId.get(id);
+			if (!block) return null;
+			const question = block.question?.state === "open" ? 1 : 0;
+			const pending = block.pending.length > 0 ? 1 : 0;
+			const locked = block.lock ? 1 : 0;
+			return question || pending || locked ? { question, pending, locked } : null;
+		},
+	};
 }
 
-/**
- * The rows of a view, depth first from its root, leaving out what is under a collapsed block.
- * The root itself is the page's heading and is not a row.
- */
-export function visibleRows(
-	view: Pick<OutlineBlockViewResponse, "blocks" | "rootId">,
-	collapsed: ReadonlySet<string>,
-): OutlineRow[] {
-	const byId = new Map(view.blocks.map((block) => [block.id, block]));
-	const root = byId.get(view.rootId);
-	if (!root) return [];
-	const rows: OutlineRow[] = [];
-	// An explicit stack keeps deep outlines off the call stack.
-	const stack: Array<{ id: string; depth: number }> = [];
-	for (let i = root.childIds.length - 1; i >= 0; i--) {
-		stack.push({ id: root.childIds[i] as string, depth: 0 });
-	}
-	while (stack.length > 0) {
-		const { id, depth } = stack.pop() as { id: string; depth: number };
-		const block = byId.get(id);
-		if (!block) continue;
-		const hasChildren = block.childIds.length > 0 || block.hidden > 0;
-		const isCollapsed = hasChildren && collapsed.has(id);
-		rows.push({ block, depth, hasChildren, collapsed: isCollapsed });
-		if (isCollapsed) continue;
-		for (let i = block.childIds.length - 1; i >= 0; i--) {
-			stack.push({ id: block.childIds[i] as string, depth: depth + 1 });
-		}
-	}
-	return rows;
+/** The tree of a view with the reader's folding over the default (`@shared/outline-fold`). */
+export function viewFoldTree(
+	view: Pick<OutlineBlockViewResponse, "blocks" | "rootId" | "rootInTask">,
+	source: FoldSource,
+	fold: FoldView,
+): FoldTree {
+	return buildFoldTree(source, { rootId: view.rootId, rootDetail: view.rootInTask === true }, fold);
 }
 
 /** Commits from newest-first pages, oldest first, without duplicates. */

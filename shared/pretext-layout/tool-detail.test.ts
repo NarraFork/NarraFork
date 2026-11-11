@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { toolOutputImagePreview } from "../agent-protocol/tool-output";
 import { diffDocumentLineNoWidth, projectDiffDocument } from "./diff-core";
 import { createSourceText } from "./source-text";
 import {
@@ -3008,4 +3009,69 @@ describe("classifyToolDetail — outline", () => {
 		);
 		expect(search.entries?.[0]?.href).toBe("/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
 	});
+});
+
+describe("ImageGen stored image results", () => {
+	it("shows all worker-saved upload references as media sections", () => {
+		const detail = classifyToolDetail({
+			previewId: "image-gen-test",
+			toolName: "ImageGen",
+			category: "generic",
+			status: "success",
+			inputJson: { prompt: "Logo", model: "image-model" },
+			outputJson: {
+				_text: "Generated two images",
+				_images: [
+					{ imageId: "image-a", mediaType: "image/png", uploadNarratorId: "owner" },
+					{ imageId: "image-b", mediaType: "image/webp", uploadNarratorId: "owner" },
+				],
+			},
+		});
+		const media = asSections(detail).sections.flatMap((part) =>
+			part.body.kind === "capped" && part.body.format === "media" ? [part.body.media] : [],
+		);
+		expect(media).toEqual([
+			{ imageId: "image-a", uploadNarratorId: "owner" },
+			{ imageId: "image-b", uploadNarratorId: "owner" },
+		]);
+	});
+
+	it("keeps recoverable errors readable without inventing a generated image", () => {
+		const detail = classifyToolDetail({
+			previewId: "image-gen-test",
+			toolName: "ImageGen",
+			category: "generic",
+			status: "fail",
+			outputJson: {
+				_text: "Saved response_id: saved. Recover without generating again.",
+				_metadata: { imageGeneration: { responseId: "saved" } },
+			},
+		});
+		expect(
+			asSections(detail).sections.some(
+				(part) => part.body.kind === "capped" && part.body.format === "media",
+			),
+		).toBe(false);
+		expect(JSON.stringify(detail)).toContain("response_id");
+	});
+});
+
+it("ImageGen live completion keeps persisted images without broadcasting inline bytes", () => {
+	const image = { imageId: "live-image", mediaType: "image/png", uploadNarratorId: "owner" };
+	const output = toolOutputImagePreview("Generated image", {
+		_text: "Generated image",
+		_images: [image, { imageId: "inline", mediaType: "image/png", data: "base64-bytes" }],
+	});
+	expect(output).toEqual({ _text: "Generated image", _images: [image] });
+	const detail = classifyToolDetail({
+		previewId: "live-image-gen",
+		toolName: "ImageGen",
+		category: "generic",
+		status: "success",
+		outputJson: output,
+	});
+	const media = cappedSectionBody(detail, "media");
+	expect(media.media).toEqual({ imageId: "live-image", uploadNarratorId: "owner" });
+	expect(JSON.stringify(detail)).not.toContain("base64-bytes");
+	expect(toolOutputImagePreview("ordinary tool", "stored text")).toBe("ordinary tool");
 });

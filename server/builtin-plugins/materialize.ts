@@ -11,8 +11,9 @@
  * real directory. Materializing keeps exactly one package-reading path for both distributions
  * instead of a second, weaker in-memory one.
  *
- * Where: `~/.narrafork/builtin-plugins/<dir>/<version>/`. Writing under the app's own home
- * (never a temp dir) means the files survive restarts, are covered by the same backup and
+ * Where: `~/.narrafork/builtin-plugins/<buildId>/<dir>/<version>/` for frozen builds
+ * (legacy/source fixtures omit buildId). Writing under the app's own home means the files
+ * survive restarts, are covered by the same backup and
  * permission story as the rest of the data directory, and cannot be planted by another user
  * via a shared temp directory.
  *
@@ -24,14 +25,13 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
+import { RUNTIME_BUILD_ID } from "../lib/runtime-target";
 
 /**
  * Shape of the build-time generated module.
  *
- * Declared here instead of importing it: `server/generated/` is not tracked, so a clean
- * checkout has no such file and a static import would fail `tsgo --noEmit` on every CI job.
- * `server/db/run-migrations.ts` reads its own generated module the same way — dynamic import
- * through a variable path plus a local type — so both survive a tree without generated files.
+ * An ambient declaration covers source checkouts without generated files. Keep the import
+ * literal so both release builds and the local runtime's in-memory build plugin collect it.
  */
 interface EmbeddedBuiltinFile {
 	path: string;
@@ -61,10 +61,7 @@ let materializing: Promise<readonly string[]> | undefined;
  */
 export function materializeBuiltinPlugins(): Promise<readonly string[]> {
 	materializing ??= (async () => {
-		// Variable path so a clean tree (no generated files) still type-checks; see the type
-		// declaration above. A compiled binary always has the module inlined.
-		const generatedModulePath = "../generated/embedded-builtin-plugins";
-		const generated = (await import(generatedModulePath)) as
+		const generated = (await import("@server/generated/embedded-builtin-plugins")) as
 			| EmbeddedBuiltinPluginsModule
 			| undefined;
 		const packages = generated?.embeddedBuiltinPlugins;
@@ -72,7 +69,11 @@ export function materializeBuiltinPlugins(): Promise<readonly string[]> {
 			logger.warn("no embedded builtin plugin packages in this build");
 			return [];
 		}
-		const root = getNarraforkPath(BUILTIN_PLUGIN_MATERIALIZED_ROOT);
+		// Different frozen builds may ship different bytes under the same plugin version.
+		const root = getNarraforkPath(
+			BUILTIN_PLUGIN_MATERIALIZED_ROOT,
+			...(RUNTIME_BUILD_ID ? [RUNTIME_BUILD_ID] : []),
+		);
 		const dirs: string[] = [];
 		for (const pkg of packages) {
 			const dir = join(root, pkg.dir, pkg.version);

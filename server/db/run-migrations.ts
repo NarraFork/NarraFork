@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
+import { isCompiledRuntime } from "../lib/runtime-target";
 import { reportStartupStep } from "../lib/startup-status";
 import {
 	MODEL_HISTORY_REVISION_CONTRACT,
@@ -46,39 +47,46 @@ function materializeEmbeddedMigrations(data: EmbeddedMigrationDataModule): {
 	folder: string;
 	cleanup: () => void;
 } {
+	const journal = JSON.parse(data.embeddedMigrationJournalJson);
+	if (journal.dialect !== "sqlite" || !Array.isArray(journal.entries) || !journal.entries.length) {
+		throw new Error("Invalid or empty embedded SQLite migration journal");
+	}
 	const tempRoot = mkdtempSync(join(tmpdir(), "narrafork-migrations-"));
 	const migrationsRoot = join(tempRoot, "drizzle");
-	const metaDir = join(migrationsRoot, "meta");
-	mkdirSync(metaDir, { recursive: true });
-
-	writeFileSync(join(metaDir, "_journal.json"), data.embeddedMigrationJournalJson);
-	for (const file of data.embeddedMigrationSqlFiles) {
-		writeFileSync(join(migrationsRoot, file.name), file.content);
+	const cleanup = () => rmSync(tempRoot, { recursive: true, force: true });
+	try {
+		const metaDir = join(migrationsRoot, "meta");
+		mkdirSync(metaDir, { recursive: true });
+		writeFileSync(join(metaDir, "_journal.json"), data.embeddedMigrationJournalJson);
+		for (const file of data.embeddedMigrationSqlFiles) {
+			writeFileSync(join(migrationsRoot, file.name), file.content);
+		}
+		// Detect incomplete build materials before opening the migration transaction.
+		readMigrationFiles({ migrationsFolder: migrationsRoot });
+		return { folder: migrationsRoot, cleanup };
+	} catch (error) {
+		cleanup();
+		throw error;
 	}
-
-	return {
-		folder: migrationsRoot,
-		cleanup: () => {
-			rmSync(tempRoot, { recursive: true, force: true });
-		},
-	};
 }
 
 export async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolder> {
-	// Prefer filesystem migrations in source/dev mode so the latest SQL is always used.
-	if (existsSync(FILESYSTEM_MIGRATIONS_FOLDER)) {
+	// Only source development may pick up SQL from a mutable checkout. A compiled
+	// process and its workers must use the migrations that were built with them.
+	const compiled = isCompiledRuntime();
+	if (!compiled && existsSync(FILESYSTEM_MIGRATIONS_FOLDER)) {
 		return { folder: FILESYSTEM_MIGRATIONS_FOLDER, source: "filesystem" };
 	}
 
-	// Fallback for compiled single-binary mode where ./drizzle doesn't exist on disk.
+	// Mandatory for compiled builds; source mode also supports embedded-only installs.
 	try {
-		const generatedMigrationsDataModulePath = "../generated/embedded-migrations-data";
-		const generatedModule = (await import(generatedMigrationsDataModulePath)) as
+		const generatedModule = (await import("@server/generated/embedded-migrations-data")) as
 			| EmbeddedMigrationDataModule
 			| undefined;
 		if (
 			typeof generatedModule?.embeddedMigrationJournalJson === "string" &&
-			Array.isArray(generatedModule.embeddedMigrationSqlFiles)
+			Array.isArray(generatedModule.embeddedMigrationSqlFiles) &&
+			generatedModule.embeddedMigrationSqlFiles.length > 0
 		) {
 			const materialized = materializeEmbeddedMigrations(generatedModule);
 			return {
@@ -87,8 +95,11 @@ export async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolde
 				cleanup: materialized.cleanup,
 			};
 		}
-	} catch {
-		// No embedded migration data module available.
+		throw new Error("Invalid or empty embedded SQLite migration data");
+	} catch (cause) {
+		if (compiled) {
+			throw new Error("SQLite migrations blocked: no valid embedded migration data", { cause });
+		}
 	}
 
 	return { folder: FILESYSTEM_MIGRATIONS_FOLDER, source: "filesystem" };
@@ -192,16 +203,17 @@ export async function resolveMigrationsForDriver(
 	if (driver === "sqlite") return resolveMigrationsFolder();
 	if (driver !== "postgresql") throw new Error(`Unsupported migration driver: ${driver}`);
 	const folder = postgres.folder ?? "./drizzle-postgres";
-	if (existsSync(folder)) {
+	if (!isCompiledRuntime() && existsSync(folder)) {
 		// Validate the journal and its exact SQL set before handing it to a PG runner.
 		collectPostgresMigrationData(folder);
 		return { folder, source: "filesystem" };
 	}
 	try {
-		const generatedPostgresModulePath = "../generated/embedded-postgres-migrations-data";
 		const data = postgres.loadEmbedded
 			? await postgres.loadEmbedded()
-			: ((await import(generatedPostgresModulePath)) as PostgresMigrationData);
+			: ((await import(
+					"@server/generated/embedded-postgres-migrations-data"
+				)) as PostgresMigrationData);
 		return materializePostgresMigrations(data);
 	} catch (cause) {
 		throw new Error("PostgreSQL migrations blocked: no valid PostgreSQL migration data", { cause });
