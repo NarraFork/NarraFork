@@ -97,6 +97,9 @@ const {
 	setOutlineTaskSessionRuntime,
 } = await import("../outline/task-session");
 const { readProjectTaskBoard } = await import("../outline/task-board");
+const { outlineRunEndsSettled } = await import("../outline/lease-keeper");
+const { isHandoffBlockId, OUTLINE_HANDOFF_ACTOR } = await import("../outline/handoff");
+const { readSubtree, loadBodies } = await import("../outline/read");
 const { OUTLINE_TASK_START_ACTOR } = await import("../task-source/outline");
 const { invalidateTaskBackend } = await import("../task-source");
 const { resetOutlineTaskEditsForTests } = await import("../outline-task-edits");
@@ -259,7 +262,11 @@ async function idle(narratorId: string, turns = 0): Promise<void> {
 			where: eq(narrators.id, narratorId),
 			columns: { status: true },
 		});
-		if (requests.length >= turns && row?.status !== "working") return;
+		if (requests.length >= turns && row?.status !== "working") {
+			// The run's end also settles the session's claims (not waited for by the runtime).
+			await outlineRunEndsSettled(narratorId);
+			return;
+		}
 		await Bun.sleep(5);
 	}
 	throw new Error("timed out waiting for the session to go idle");
@@ -305,9 +312,24 @@ async function stateOf(taskId: string) {
 		status: block?.taskJson?.status,
 		assignee: block?.taskJson?.assignee ?? null,
 		holder: claim?.holderNarratorId ?? null,
+		lastHolder: claim?.lastHolderNarratorId ?? null,
+		claimSeq: claim?.taskVersionAtClaim ?? null,
 		epoch: claim?.epoch ?? 0,
 		versionSeq: block?.versionSeq,
 	};
+}
+
+/** The handoffs under a task, oldest first: each block's text and the texts of its lines. */
+async function handoffsUnder(taskId: string) {
+	const subtree = await readSubtree(taskId);
+	const blocks = (subtree?.root.children ?? []).filter((child) => isHandoffBlockId(child.id));
+	if (subtree)
+		await loadBodies(subtree.state, [...blocks, ...blocks.flatMap((block) => block.children)]);
+	return blocks.map((block) => ({
+		id: block.id,
+		text: block.content ?? "",
+		lines: block.children.map((line) => line.content ?? ""),
+	}));
 }
 
 describe("a click opens a session that does the task", () => {
@@ -364,17 +386,18 @@ describe("a click opens a session that does the task", () => {
 			cwd: p.dir,
 		});
 
-		// The claim: in progress, held by the session, generation 1, one system commit for it; the
-		// assignment to another agent by name went with it.
-		expect(await stateOf(t.blockId)).toMatchObject({
-			status: "doing",
-			holder: body.narratorId,
+		// The claim: taken for the session at generation 1 by one system commit; the assignment to
+		// another agent by name went with it. (The stand-in's one turn ends without finishing the
+		// task, so by now it is given back: PR 10c-2, covered in its own cases below.)
+		const claimed = await stateOf(t.blockId);
+		expect(claimed).toMatchObject({
+			status: "todo",
+			holder: null,
+			lastHolder: body.narratorId,
 			epoch: 1,
 			assignee: null,
 		});
-		const [commit] = await outlineStore.getCommitsBySeqs(p.space.id, [
-			(await outlineStore.getBlock(t.blockId))?.versionSeq as number,
-		]);
+		const [commit] = await outlineStore.getCommitsBySeqs(p.space.id, [claimed.claimSeq as number]);
 		expect(commit).toMatchObject({
 			actorKind: "system",
 			actorId: OUTLINE_TASK_OPEN_ACTOR,
@@ -468,7 +491,7 @@ describe("whatever the instance's defaults for new sessions", () => {
 		});
 		expect(JSON.stringify(session?.traits ?? [])).not.toContain("plan");
 		expect(requests).toHaveLength(1);
-		expect(await stateOf(task.id)).toMatchObject({ status: "doing", holder: body.narratorId });
+		expect(await stateOf(task.id)).toMatchObject({ epoch: 1, lastHolder: body.narratorId });
 	});
 
 	test("sessions are public by default, the project is private: the task session is the project's, and reads its space", async () => {
@@ -970,7 +993,9 @@ describe("the session keeps working on the task it was opened for", () => {
 		await idle(body.narratorId, 2);
 		expect(requests.length).toBeGreaterThanOrEqual(2);
 		expect(requests[1]?.input).toContain("Outline task continuation");
-		expect(await stateOf(id)).toMatchObject({ status: "doing", holder: body.narratorId });
+		// It was the session's all along; only when the continuation gave up was it given back.
+		expect(await stateOf(id)).toMatchObject({ epoch: 1, lastHolder: body.narratorId });
+		expect(await handoffsUnder(id)).toHaveLength(1);
 	});
 
 	test("a task with steps: its first step is started for the session; a project task that was not named is not", async () => {
@@ -1013,18 +1038,27 @@ describe("the session keeps working on the task it was opened for", () => {
 		expect(status).toBe(201);
 		await idle(body.narratorId, 1);
 		expect(await stateOf(t?.blockId as string)).toMatchObject({
-			status: "doing",
-			holder: body.narratorId,
+			epoch: 1,
+			lastHolder: body.narratorId,
 		});
-		// The first step: in progress, the session's, started by the system start.
-		expect(await stateOf(s1?.blockId as string)).toMatchObject({
-			status: "doing",
-			holder: body.narratorId,
-		});
-		const stepSeq = (await outlineStore.getBlock(s1?.blockId as string))?.versionSeq as number;
-		expect((await outlineStore.getCommitsBySeqs(p.space.id, [stepSeq]))[0]?.actorId).toBe(
-			OUTLINE_TASK_START_ACTOR,
-		);
+		// The first step: claimed for the session by the system start.
+		const first = await stateOf(s1?.blockId as string);
+		expect(first).toMatchObject({ epoch: 1, lastHolder: body.narratorId });
+		expect(
+			(await outlineStore.getCommitsBySeqs(p.space.id, [first.claimSeq as number]))[0]?.actorId,
+		).toBe(OUTLINE_TASK_START_ACTOR);
+		// The run ended with neither finished: the task and its step go back together, in one
+		// commit, with one handoff, under the task (PR 10c-2).
+		expect(await stateOf(t?.blockId as string)).toMatchObject({ status: "todo", holder: null });
+		expect(first).toMatchObject({ status: "todo", holder: null });
+		expect(await handoffsUnder(t?.blockId as string)).toHaveLength(1);
+		expect(await handoffsUnder(s1?.blockId as string)).toHaveLength(0);
+		const back = await outlineStore.getCommitsBySeqs(p.space.id, [
+			(await outlineStore.getBlock(t?.blockId as string))?.versionSeq as number,
+			(await outlineStore.getBlock(s1?.blockId as string))?.versionSeq as number,
+		]);
+		expect(back).toHaveLength(1);
+		expect(back[0]).toMatchObject({ actorKind: "system", actorId: OUTLINE_HANDOFF_ACTOR });
 		expect(await stateOf(s2?.blockId as string)).toMatchObject({ status: "todo", holder: null });
 		expect(await stateOf(otherTask?.blockId as string)).toMatchObject({
 			status: "todo",
@@ -1124,10 +1158,14 @@ describe("a step under a task someone is doing", () => {
 		);
 		await idle(plain.id, 1);
 		expect(requests).toHaveLength(1);
-		expect(await stateOf(step?.blockId as string)).toMatchObject({ status: "todo", holder: null });
+		expect(await stateOf(step?.blockId as string)).toMatchObject({
+			status: "todo",
+			holder: null,
+			epoch: 0,
+		});
 		expect(await stateOf(held?.blockId as string)).toMatchObject({
-			status: "doing",
-			holder: plain.id,
+			epoch: 1,
+			lastHolder: plain.id,
 		});
 	});
 });

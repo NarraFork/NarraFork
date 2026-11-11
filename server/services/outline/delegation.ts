@@ -300,6 +300,8 @@ export interface DelegationBriefOptions {
 	head?: readonly string[];
 	/** UTF-8 bytes the task's own text takes at most (default: half the budget). */
 	bodyBytes?: number;
+	/** Lines between the task's own text and the notes under it (charged to the budget). */
+	before?: readonly string[];
 	/** Bytes of the budget kept back from the notes, for `after`. */
 	reserve?: number;
 	/**
@@ -348,7 +350,15 @@ export function renderDelegationBrief(
 			]
 		: [];
 	const reserve = Math.max(0, options.reserve ?? 0);
-	let left = budget - fixed - utf8(body.join("\n")) - utf8(text.notes) - 2 - reserve;
+	const before = options.before ?? [];
+	let left =
+		budget -
+		fixed -
+		utf8(body.join("\n")) -
+		utf8(text.notes) -
+		2 -
+		reserve -
+		(before.length > 0 ? utf8(before.join("\n")) + 1 : 0);
 
 	// Breadth first over what is under the task, while it fits; a block that may need a
 	// `… N more` line under it is charged for one.
@@ -394,7 +404,7 @@ export function renderDelegationBrief(
 	};
 	walk(input.children, 0);
 
-	const out = [...head, ...body];
+	const out = [...head, ...body, ...before];
 	if (notes.length > 0) out.push("", text.notes, ...notes);
 	out.push(...tail);
 	if (options.after) out.push(...options.after(Math.max(0, left) + reserve));
@@ -658,7 +668,11 @@ export async function readBriefInput(
 	subtree: NonNullable<Awaited<ReturnType<typeof readSubtree>>>,
 	scope: OutlineAgentScope,
 	store: OutlineStore,
-	found?: { targets: string[] },
+	found?: {
+		targets: string[];
+		/** Blocks directly under the task that are left out (shown elsewhere by the caller). */
+		omit?: (node: OutlineNode) => boolean;
+	},
 ): Promise<Omit<DelegationBriefInput, "prompt">> {
 	const limits = OUTLINE_DELEGATION_LIMITS;
 	const goals = subtree.path.slice(-limits.goals);
@@ -666,7 +680,10 @@ export async function readBriefInput(
 	// What is under the task, breadth first, at most `subtreeBlocks`; content loaded while it may
 	// still fit the budget.
 	const order: OutlineNode[] = [];
-	const queue = [...subtree.root.children];
+	const omit = found?.omit;
+	const queue = omit
+		? subtree.root.children.filter((child) => !omit(child))
+		: [...subtree.root.children];
 	while (queue.length > 0 && order.length < limits.subtreeBlocks) {
 		const node = queue.shift() as OutlineNode;
 		order.push(node);

@@ -398,6 +398,9 @@ export async function runAgentLoopUnlocked(
 	let continuationStopNote: string | null = null;
 	let abortedBeforeCleanup: boolean | undefined;
 	let freshInput = false;
+	// A person's message started this run or joined it (outline: such a run keeps the session's
+	// unfinished team tasks for a while; one the system started gives them back when it ends).
+	let personSpoke = text.trim() !== "" || (images?.length ?? 0) > 0 || (media?.length ?? 0) > 0;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -640,6 +643,7 @@ export async function runAgentLoopUnlocked(
 			throw error;
 		}
 		if (buffered) {
+			personSpoke = true;
 			const bufferedClaim = buffered._mailboxClaim;
 			if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
 			active._bufferSoftStopTaken = false;
@@ -3580,8 +3584,18 @@ export async function runAgentLoopUnlocked(
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
 		// The run ended: the session's claims go on the idle lease while it waits for its next
-		// turn, a subagent's pass to its root (not waited for).
-		void outlineLeases?.stop();
+		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
+		// started that ended by itself are given back with a handoff (not waited for).
+		void outlineLeases?.stop({
+			natural:
+				!personSpoke &&
+				!freshInput &&
+				!runState.hadError &&
+				!runState.wasInterrupted &&
+				!active.abortController.signal.aborted,
+			reply: runState.finalText,
+			pendingInput: () => hasInboxKind(narratorId, ["user_input"]),
+		});
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;
 		unregisterUpdateLoop();
