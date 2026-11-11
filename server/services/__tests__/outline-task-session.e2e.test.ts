@@ -651,6 +651,14 @@ describe("failures leave nothing behind", () => {
 		await write(p.space.id, alice, [
 			{ op: "setTask", block: { id: mineId }, task: { status: "doing" } },
 		]);
+		// The board offers the button on the one task that can be started, and on no other.
+		const board = await readProjectTaskBoard({ userId: alice, isAdmin: false }, p.id);
+		expect(board.sections[0]?.open.filter((t) => t.openSession).map((t) => t.title)).toEqual([
+			"First",
+		]);
+		expect(board.sections[0]?.open.map((t) => t.title).sort()).toEqual(
+			["A plan being planned", "First", "For a person", "Its step", "Mine", "Second"].sort(),
+		);
 		const expectRefused = async (id: string, reason: string) => {
 			const block = await outlineStore.getBlock(id);
 			const { status, body } = await open(alice, { id, versionSeq: block?.versionSeq as number });
@@ -942,6 +950,42 @@ describe("the session keeps working on the task it was opened for", () => {
 });
 
 describe("openTaskSession", () => {
+	test("a click of the same person after the minute is a refusal, not the same session again", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const by = { kind: "human" as const, userId: alice, isAdmin: false };
+		const at = Date.now();
+		const first = await openTaskSession({
+			taskId: task.id,
+			baseVersionSeq: task.versionSeq,
+			by,
+			now: () => new Date(at),
+		});
+		opened.push(first.narratorId);
+		const soon = await openTaskSession({
+			taskId: task.id,
+			baseVersionSeq: task.versionSeq,
+			by,
+			now: () => new Date(at + 59_000),
+		});
+		expect(soon).toMatchObject({ narratorId: first.narratorId, already: true });
+		await expect(
+			openTaskSession({
+				taskId: task.id,
+				baseVersionSeq: task.versionSeq,
+				by,
+				now: () => new Date(at + 61_000),
+			}),
+		).rejects.toMatchObject({
+			reason: "claimed",
+			// The person may read their own session: it is named.
+			holder: { kind: "session", narratorId: first.narratorId, name: "Fix the refresh logic" },
+		});
+		expect(await sessionsOf(p.id)).toHaveLength(1);
+		await idle(first.narratorId, 1);
+	});
+
 	test("the automatic opener is not built: refused", async () => {
 		const alice = await person("alice");
 		const p = await project(alice);
