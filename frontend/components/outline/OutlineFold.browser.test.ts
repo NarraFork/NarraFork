@@ -1712,6 +1712,178 @@ test("a selection from the very start of a closed row opens it first, like one f
 	expect(a.errors).toEqual([]);
 }, 60_000);
 
+test("a closed row wholly inside a text selection opens first too; the whole page takes two presses", async () => {
+	const { pageId, idOf } = await page();
+	const a = await openHost(h, "page", pageId);
+	await shows(a, DEFAULT_ROWS);
+	const ship = idOf("Ship the fold");
+	const note = idOf("First note line");
+	const lone = idOf("A lone note");
+	const aliveOf = async (names: string[]) =>
+		(
+			await a.call(
+				(f, ids) => (ids as unknown as string[]).filter((id) => !!f.client().visible.alive(id)),
+				names.map(idOf),
+			)
+		).length;
+	const hidden = ["Detail one", "Deep detail", "Detail two", "Detail three"];
+	const original = serverOutline(pageId);
+	const toDefault = async (label: string) => {
+		await a.call((f) => f.surface().foldAll(false));
+		if ((await rowOf(a, note))?.state === "open") await click(a, note, "arrow");
+		await shows(a, DEFAULT_ROWS, label);
+	};
+	/** A text selection between two rows, as dragging or Shift with the arrows leaves it. */
+	const selectRange = async (from: [string, number], to: [string, number]) => {
+		await a.call(
+			(f, range) => {
+				const [anchor, head] = range as unknown as Array<{ blockId: string; offset: number }>;
+				const v = f.view();
+				v.applySelection({ anchor, head, view: v } as never);
+				v.pm.focus();
+			},
+			[
+				{ blockId: from[0], offset: from[1] },
+				{ blockId: to[0], offset: to[1] },
+			],
+		);
+		const sel = await a.call((f) => f.selection());
+		expect(sel?.anchor).toEqual({ blockId: from[0], offset: from[1] });
+		expect(sel?.head).toEqual({ blockId: to[0], offset: to[1] });
+		return sel;
+	};
+	/** From the row above, over the closed row, into the row after it. */
+	const selectOver = (offset: number) => selectRange([ship, offset], [lone, 3]);
+
+	// With the keyboard: the cursor at the end of the row above, Shift+Down twice, Backspace.
+	// (A press right after the cursor is put there may come before the browser has it: each
+	// press is given the time to move the selection, and pressed again when it did not.)
+	await caret(a, ship);
+	for (let i = 0; i < 8 && (await head(a))?.blockId !== lone; i++) {
+		const was = await head(a);
+		await press(a, "Shift+ArrowDown");
+		const end = Date.now() + 500;
+		while (Date.now() < end && JSON.stringify(await head(a)) === JSON.stringify(was))
+			await new Promise((r) => setTimeout(r, 20));
+	}
+	const typed = await a.call((f) => f.selection());
+	expect(typed?.anchor).toEqual({ blockId: ship, offset: "Ship the fold".length });
+	expect(typed?.head.blockId).toBe(lone);
+	await a.page.keyboard.press("Backspace");
+	await settle(a);
+	expect(await aliveOf([...hidden, "First note line"])).toBe(5);
+	expect(serverOutline(pageId)).toBe(original);
+	await eventually(
+		() => texts(a),
+		(t) => t.includes("Deep detail") && t.includes("Detail three"),
+		"the closed row opened instead (keyboard)",
+	);
+	expect(await a.call((f) => f.selection())).toEqual(typed as never);
+
+	// From the end of the row above (on screen: from the start of the closed row), Backspace;
+	// from the middle of the row above, typing one character.
+	for (const [offset, key] of [
+		[13, "Backspace"],
+		[4, "X"],
+		[4, "Delete"],
+		[13, "Control+x"],
+	] as const) {
+		await toDefault(`default before ${key} from ${offset}`);
+		const sel = await selectOver(offset);
+		if (key === "X") await a.page.keyboard.type("X");
+		else await press(a, key);
+		await settle(a);
+		const label = `${key} from ${offset}`;
+		expect({ label, alive: await aliveOf([...hidden, "First note line"]) }).toEqual({
+			label,
+			alive: 5,
+		});
+		expect({ label, outline: serverOutline(pageId) }).toEqual({ label, outline: original });
+		await eventually(
+			() => texts(a),
+			(t) => t.includes("Deep detail") && t.includes("Detail three"),
+			`the closed row opened instead (${label})`,
+		);
+		expect(await a.call((f) => f.selection())).toEqual(sel as never);
+	}
+	// The same key again deletes what the reader now sees; undo brings it back.
+	await a.page.keyboard.type("X");
+	await settle(a);
+	expect(await aliveOf([...hidden, "First note line"])).toBe(0);
+	await press(a, "Control+z");
+	await settle(a);
+	expect(serverOutline(pageId)).toBe(original);
+
+	// Finished tasks wholly inside a selection: typing over them opens each of them first.
+	await toDefault("default before typing over finished tasks");
+	const finished = [
+		"Subtask deep",
+		"A done subtask",
+		"Both stores write the column",
+		"store.ts:12",
+		"Nested done",
+	];
+	await selectRange([idOf("Subtask note"), 3], [idOf("Dropped idea"), 2]);
+	await a.page.keyboard.type("X");
+	await settle(a);
+	expect(await aliveOf(finished)).toBe(finished.length);
+	expect(serverOutline(pageId)).toBe(original);
+	await eventually(
+		() => texts(a),
+		(t) => finished.every((text) => t.includes(text)),
+		"the finished tasks opened instead",
+	);
+
+	// Every row of the page selected as text, from the first row's first character to the end
+	// of the last: the first Delete opens everything that is closed and deletes nothing; the
+	// second deletes what is now on screen.
+	await toDefault("default before selecting the whole page");
+	const everything = [...hidden, ...finished, "Superseded by the fold"];
+	await selectRange([ship, 0], [idOf("Deep under a fact"), "Deep under a fact".length]);
+	await a.page.keyboard.press("Delete");
+	await settle(a);
+	expect(serverOutline(pageId)).toBe(original);
+	await eventually(
+		() => texts(a),
+		(t) => everything.every((text) => t.includes(text)),
+		"every closed row opened first",
+	);
+	await a.page.keyboard.press("Delete");
+	await settle(a);
+	expect(await aliveOf([...everything, "First note line", "Wire the store", "A fact"])).toBe(0);
+	await press(a, "Control+z");
+	await settle(a);
+	expect(serverOutline(pageId)).toBe(original);
+
+	// Select all (Mod-A twice) is the editor's whole document, the page's own block included,
+	// and that block always stays: Delete and typing over it change nothing, however often.
+	await toDefault("default before select all");
+	for (const key of ["Delete", "Backspace", "X"]) {
+		await caret(a, lone, 2);
+		await press(a, "Control+a");
+		await press(a, "Control+a");
+		const all = await a.call((f) => {
+			const v = f.view();
+			const sel = v.pm.state.selection;
+			return { blocks: v.selectedBlocks().length, from: sel.from, to: sel.to };
+		});
+		expect(all).toEqual({
+			blocks: 0,
+			from: 0,
+			to: await a.call((f) => f.view().pm.state.doc.content.size),
+		});
+		for (let i = 0; i < 2; i++) {
+			if (key === "X") await a.page.keyboard.type("X");
+			else await a.page.keyboard.press(key);
+			await settle(a);
+			expect({ key, i, outline: serverOutline(pageId) }).toEqual({ key, i, outline: original });
+		}
+	}
+	await shows(a, DEFAULT_ROWS, "nothing opened, nothing deleted");
+	expect(await a.call((f) => f.viewOutline())).toBe(serverOutline(pageId));
+	expect(a.errors).toEqual([]);
+}, 90_000);
+
 test("a task kept open for the cursor stays open while the reader folds elsewhere", async () => {
 	const { pageId, idOf } = await page();
 	const a = await openHost(h, "page", pageId);

@@ -30,9 +30,9 @@
  *     the cursor (a task ticked done, an indent under a closed block) keeps that block open while
  *     the cursor is in it and lets it close when the cursor leaves; folding a block around the
  *     cursor moves the cursor onto that block. While an input method composes, the block it
- *     composes in stays on screen whatever closes around it. A selection that reaches into a
- *     closed block never deletes what the block hides: the block opens first, so the reader sees
- *     what would go. A change by someone else that folds or adds rows above keeps the reader's
+ *     composes in stays on screen whatever closes around it. A text selection that reaches into
+ *     a closed block, or covers one, never deletes what the block hides: the block opens first,
+ *     so the reader sees what would go (rows deleted as blocks take what they hold). A change by someone else that folds or adds rows above keeps the reader's
  *     row where it is on screen.
  */
 import {
@@ -1124,14 +1124,14 @@ export class OutlineView implements CmdHost, ClientView {
 	}
 
 	/**
-	 * Blocks a change would delete although the reader cannot see them: hidden under a closed
-	 * block that itself stays, or under the closed block `first` the selection starts in (a
-	 * selection from the very start of its line reads on screen like one from its second
-	 * character: it is not the whole row). A closed block that goes as a whole — block selection,
-	 * or a row wholly inside a selection that starts above it — takes what it holds with it, as
-	 * it always did.
+	 * Blocks a change would delete although the reader cannot see them. With a text selection
+	 * (`text`), every block hidden under a closed row that the change removes: whether the row
+	 * itself stays (the selection starts or ends inside its line) or goes with it (the selection
+	 * starts at the very start of its line, or covers the row from a row above — select all
+	 * too). Rows deleted as blocks (a block selection: `deleteBlocks`) take what they hold with
+	 * them, as they always did: only what hides under a closed block that stays counts then.
 	 */
-	private hiddenLoss(before: EditorState, after: PMNode, first: string | null = null): string[] {
+	private hiddenLoss(before: EditorState, after: PMNode, text: boolean): string[] {
 		const kept = new Set<string>();
 		after.descendants((n) => {
 			if (n.type === N.block) kept.add(n.attrs.id);
@@ -1141,7 +1141,7 @@ export class OutlineView implements CmdHost, ClientView {
 		// `closed`: the outermost closed block above (the row the reader sees).
 		const walk = (node: PMNode, closed: string | null) => {
 			const id = node.attrs.id as string;
-			if (closed !== null && !kept.has(id) && (kept.has(closed) || closed === first)) lost.push(id);
+			if (closed !== null && !kept.has(id) && (text || kept.has(closed))) lost.push(id);
 			if (node.childCount < 2) return;
 			const under = closed ?? (node.attrs.collapsed ? id : null);
 			node.child(1).forEach((kid) => {
@@ -1181,7 +1181,7 @@ export class OutlineView implements CmdHost, ClientView {
 		const state = this.pm.state;
 		const sel = state.selection;
 		if (sel.empty || sel.$from.sameParent(sel.$to) || !this.client.editable) return false;
-		const lost = this.hiddenLoss(state, state.tr.deleteSelection().doc, this.selectionRow(state));
+		const lost = this.hiddenLoss(state, state.tr.deleteSelection().doc, !this.blockSel);
 		if (lost.length === 0) return false;
 		this.showBeforeDelete(lost);
 		if (collapse) {
@@ -1193,12 +1193,6 @@ export class OutlineView implements CmdHost, ClientView {
 			);
 		}
 		return true;
-	}
-
-	/** The block a text selection starts in (null in block selection: whole rows are meant). */
-	private selectionRow(state: EditorState): string | null {
-		if (this.blockSel) return null;
-		return this.locate(state.doc, state.selection.from)?.blockId ?? null;
 	}
 
 	/** Whether a block is folded away under a closed ancestor. */
@@ -1991,8 +1985,8 @@ export class OutlineView implements CmdHost, ClientView {
 			!before.selection.$from.sameParent(before.selection.$to)
 		) {
 			// (Whole blocks deleted as blocks take what they hold: `deleteBlocks`.)
-			const first = tr.getMeta(WHOLE_BLOCKS) ? null : this.selectionRow(before);
-			const lost = this.hiddenLoss(before, state.doc, first);
+			const text = !tr.getMeta(WHOLE_BLOCKS) && !this.blockSel;
+			const lost = this.hiddenLoss(before, state.doc, text);
 			if (lost.length > 0) {
 				this.stats.refused++;
 				this.pm.updateState(before);
