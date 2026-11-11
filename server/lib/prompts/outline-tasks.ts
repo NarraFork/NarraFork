@@ -698,13 +698,15 @@ export function getOutlineTeamEventsNote(
 	if (input.unblocked.length > 0) {
 		const lines = input.unblocked.map((entry) => {
 			const p = entry.prerequisite;
+			// Its title only when the session may read it (the caller leaves it empty otherwise).
+			const named = p.title ? `\`${p.address}\` ${p.title}` : `\`${p.address}\``;
 			const what = zh
 				? p.status === "done"
-					? `它的前置 \`${p.address}\` ${p.title} 已完成`
-					: `它的前置 \`${p.address}\` ${p.title} 被取消了，先看看这个任务还要不要做`
+					? `它的前置 ${named} 已完成`
+					: `它的前置 ${named} 被取消了，先看看这个任务还要不要做`
 				: p.status === "done"
-					? `its prerequisite \`${p.address}\` ${p.title} was ticked done`
-					: `its prerequisite \`${p.address}\` ${p.title} was cancelled; check whether this task is still needed`;
+					? `its prerequisite ${named} was ticked done`
+					: `its prerequisite ${named} was cancelled; check whether this task is still needed`;
 			const rest = entry.stillWaiting
 				? zh
 					? "；它还在等别的"

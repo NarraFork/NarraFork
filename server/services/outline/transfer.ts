@@ -19,13 +19,13 @@
  * (`startSpecContinuationIfPossible`, naming the task). A start that declines after all gives the
  * claim back (to-do), so no task is left in progress on a session that does not run.
  */
-import { getUserLanguage, getUserReplyInLanguage } from "@server/lib/i18n";
+import { getUserLanguage, getUserReplyInLanguage, type Locale } from "@server/lib/i18n";
 import { logger } from "@server/lib/logger";
 import type {
 	OutlineBoardNotStarted,
 	OutlineBoardTransferSession,
 } from "@shared/outline-task-board";
-import type { OutlinePrincipal } from "./access";
+import { narratorUsersWith, type OutlinePrincipal } from "./access";
 import { readNarrator, readProjectTransferSessions } from "./access-reads";
 import { canSessionWorkIn } from "./assignee";
 import {
@@ -44,6 +44,9 @@ import { writeOutline } from "./write";
 export const OUTLINE_TRANSFER_LIMITS = {
 	/** Sessions the board offers. */
 	sessions: 50,
+	/** Sessions of the project looked at to find them, a page at a time. */
+	scanned: 200,
+	page: 50,
 } as const;
 
 /** The system actor of a start made for a session (as continuation's promotion). */
@@ -63,27 +66,92 @@ export async function transferProjectOf(space: OutlineSpaceRow): Promise<string 
 	return null;
 }
 
-/** The sessions a task of `space` may be handed to by `principal` (see the module header). */
+/**
+ * The sessions a task of `space` may be handed to by `principal` (see the module header). The
+ * project's sessions are read a page at a time, in the list's order, until
+ * {@link OUTLINE_TRANSFER_LIMITS.sessions} that could do the task are found or
+ * {@link OUTLINE_TRANSFER_LIMITS.scanned} were looked at; `truncated` says there are (or may be)
+ * more that could. `canStart`: the person may write the session, so 「转交并开始」 is theirs to ask.
+ */
 export async function listTransferSessions(
 	principal: OutlinePrincipal,
 	space: OutlineSpaceRow,
 ): Promise<{ sessions: OutlineBoardTransferSession[]; truncated: boolean }> {
 	const projectId = await transferProjectOf(space);
 	if (!projectId) return { sessions: [], truncated: false };
-	const limit = OUTLINE_TRANSFER_LIMITS.sessions;
-	const rows = await readProjectTransferSessions(principal, projectId, limit + 1);
+	const { sessions: limit, scanned, page } = OUTLINE_TRANSFER_LIMITS;
 	const sessions: OutlineBoardTransferSession[] = [];
-	for (const row of rows.slice(0, limit)) {
-		// The session whose space holds the task has it already ("back to the session").
-		if (space.kind === "session" && space.narratorId === row.id) continue;
-		if (!(await canSessionWorkIn(row.id, space))) continue;
-		sessions.push({
-			narratorId: row.id,
-			title: row.title,
-			...(row.handle ? { handle: row.handle } : {}),
-		});
+	let truncated = false;
+	for (let offset = 0; offset < scanned; offset += page) {
+		const rows = await readProjectTransferSessions(principal, projectId, { limit: page, offset });
+		for (const row of rows) {
+			// The session whose space holds the task has it already ("back to the session").
+			if (space.kind === "session" && space.narratorId === row.id) continue;
+			if (!(await canSessionWorkIn(row.id, space))) continue;
+			if (sessions.length >= limit) {
+				truncated = true;
+				break;
+			}
+			sessions.push({
+				narratorId: row.id,
+				title: row.title,
+				...(row.handle ? { handle: row.handle } : {}),
+				canStart: await mayStart(principal, row),
+			});
+		}
+		if (truncated || rows.length < page) break;
+		// The scan's end with a full page behind it: there may be more.
+		if (offset + page >= scanned) truncated = true;
 	}
-	return { sessions, truncated: rows.length > limit };
+	return { sessions, truncated };
+}
+
+/** Whether the person may write the session: a turn started on it runs on their behalf. */
+async function mayStart(
+	principal: OutlinePrincipal,
+	row: { id: string; ownerUserId: string | null },
+): Promise<boolean> {
+	if (principal.isAdmin || row.ownerUserId === principal.userId) return true;
+	const narrator = await readNarrator(row.id);
+	return (
+		narrator !== null &&
+		(await narratorUsersWith(narrator, [principal.userId], "write")).has(principal.userId)
+	);
+}
+
+/**
+ * Whether `narratorId` is a session the board would offer for a task of `space` (the list's own
+ * predicate, for the one id): what a hand-over to it is checked with, so the board accepts no
+ * session it would never list (one of another project, one keeping its tasks in Dynamic Spec).
+ */
+export async function isTransferSession(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+	narratorId: string,
+): Promise<boolean> {
+	const projectId = await transferProjectOf(space);
+	if (!projectId) return false;
+	const [row] = await readProjectTransferSessions(principal, projectId, {
+		limit: 1,
+		onlyId: narratorId,
+	});
+	return !!row && (await canSessionWorkIn(row.id, space));
+}
+
+/** What starting needs of the session layer (`narrator-session.ts`). */
+export interface TransferSessionLayer {
+	outlineTaskStartBlocker(
+		narratorId: string,
+		task: { blockId: string; status: string },
+		options?: { explicit?: boolean; personWork?: boolean },
+	): Promise<OutlineBoardNotStarted | undefined>;
+	startSpecContinuationIfPossible(
+		narratorId: string,
+		locale: Locale,
+		replyInUserLanguage: boolean,
+		userId: string | null,
+		options: { preferTaskId?: string },
+	): Promise<{ started: boolean }>;
 }
 
 function refused(error: unknown): boolean {
@@ -104,6 +172,8 @@ export async function startSessionOnTransferredTask(args: {
 	userId: string;
 	blockId: string;
 	store?: OutlineStore;
+	/** The session layer's two entries (tests replace them; the real module by default). */
+	session?: TransferSessionLayer;
 }): Promise<{ started: boolean; notStarted?: OutlineBoardNotStarted }> {
 	const store = args.store ?? outlineStore;
 	const block = await store.getBlock(args.blockId);
@@ -112,7 +182,20 @@ export async function startSessionOnTransferredTask(args: {
 		return { started: false, notStarted: "not_started" };
 	// The row that tells the session of the hand-over is written before its turn reads history.
 	await flushOutlineTeamEvents(space.id);
-	const session = await import("../narrator-session");
+	const session: TransferSessionLayer = args.session ?? (await import("../narrator-session"));
+	// A task already in progress: only when this session is the one doing it. One someone else
+	// holds is theirs (the hand-over would have ended their work; a claim made since is not this
+	// start's to override), and one nobody holds is not started on a claim that does not exist.
+	if (block.taskJson.status === "doing") {
+		const [claim] = await store.getTaskClaims([block.id]);
+		const holder = claim?.holderNarratorId ?? null;
+		const live =
+			holder !== null && (claim?.expiresAt == null || claim.expiresAt > new Date().toISOString());
+		const own =
+			live &&
+			((await store.getNarratorRoots([holder])).get(holder)?.root ?? holder) === args.narratorId;
+		if (!own) return { started: false, notStarted: "not_started" };
+	}
 	// Decided before anything is claimed.
 	const blocker = await session.outlineTaskStartBlocker(
 		args.narratorId,
@@ -127,6 +210,8 @@ export async function startSessionOnTransferredTask(args: {
 		responsibleUserId: args.userId,
 		narratorId: args.narratorId,
 	};
+	// Only a claim this start made is its to give back.
+	let claimedHere = false;
 	if (block.taskJson.status !== "doing") {
 		try {
 			const claimed = await writeOutline(
@@ -145,6 +230,7 @@ export async function startSessionOnTransferredTask(args: {
 				{ store },
 			);
 			if (!claimed.commit) return { started: false, notStarted: "not_started" };
+			claimedHere = true;
 		} catch (error) {
 			// Taken or changed meanwhile: the hand-over stands, the start does not happen.
 			if (refused(error)) return { started: false, notStarted: "not_started" };
@@ -168,7 +254,9 @@ export async function startSessionOnTransferredTask(args: {
 			return { started: false };
 		});
 	if (started) return { started: true };
-	// The start declined after all: the claim made for it is given back.
+	// The start declined after all: a claim made for it is given back. A claim the session held
+	// before stays its own.
+	if (!claimedHere) return { started: false, notStarted: "not_started" };
 	await writeOutline(
 		{
 			...system,

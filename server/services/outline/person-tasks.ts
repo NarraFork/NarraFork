@@ -45,12 +45,13 @@ import {
 } from "@shared/outline-task-board";
 import { canWriteSpace, type OutlinePrincipal } from "./access";
 import { readDisplayNames, readUserByUsername } from "./access-reads";
-import { canSessionWorkIn, resolveAgentAssignee, sessionAssignee } from "./assignee";
+import { sessionAssignee } from "./assignee";
 import { OUTLINE_TASKS_PAGE_ALIAS, type OutlineTaskJson } from "./model";
 import { resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
 import type { OutlineSpaceRow, OutlineStore } from "./store/port";
 import { OUTLINE_PAGE_HEAD_CHARS } from "./store/read-port";
+import { isTransferSession } from "./transfer";
 import { type OutlineTaskPatch, type OutlineWriteResult, writeOutline } from "./write";
 
 export { OUTLINE_TASKS_PAGE_ALIAS };
@@ -389,17 +390,12 @@ async function assigneeOf(
 ): Promise<string | null> {
 	if (target.kind === "session") return null;
 	if (target.kind === "narrator") {
-		// A root session that is not archived and could do the task there. Whether the person may
-		// read it is the route's check; one that cannot is the same answer as an unknown one.
-		const session = await resolveAgentAssignee(sessionAssignee(target.narratorId));
-		if (
-			!session ||
-			session.archived ||
-			session.narratorId !== target.narratorId ||
-			!(await canSessionWorkIn(session.narratorId, space))
-		)
+		// A session the board's picker would list (`transfer.ts`: a root session of the task's
+		// project that keeps its tasks in the outline, is not archived, that the person may read
+		// and that could do the task there). Any other is the same answer as an unknown one.
+		if (!(await isTransferSession(principal, space, target.narratorId)))
 			throw new ValidationError("This session cannot work on this task");
-		return sessionAssignee(session.narratorId);
+		return sessionAssignee(target.narratorId);
 	}
 	if (target.kind === "me") {
 		const name = (await readDisplayNames({ userIds: [principal.userId] })).users.get(

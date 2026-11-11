@@ -76,14 +76,18 @@ export function TransferSessions({
 									>
 										{t("board.transfer.only")}
 									</Button>
-									<Button
-										size="compact-xs"
-										loading={pending}
-										onClick={() => onTransfer(session.narratorId, true)}
-										data-testid="task-transfer-start"
-									>
-										{t("board.transfer.andStart")}
-									</Button>
+									{/* Starting it runs a turn on the person's behalf: theirs to ask only where
+									    they may write the session. */}
+									{session.canStart && (
+										<Button
+											size="compact-xs"
+											loading={pending}
+											onClick={() => onTransfer(session.narratorId, true)}
+											data-testid="task-transfer-start"
+										>
+											{t("board.transfer.andStart")}
+										</Button>
+									)}
 								</Group>
 							</Stack>
 						))}
@@ -92,7 +96,7 @@ export function TransferSessions({
 			)}
 			{sessions.data?.truncated && (
 				<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
-					{t("board.transfer.more")}
+					{t("board.transfer.more", { count: sessions.data.limit })}
 				</Text>
 			)}
 		</Stack>

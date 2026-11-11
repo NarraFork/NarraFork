@@ -117,6 +117,12 @@ export interface OutlineTaskFinishedMessage {
 	source?: string;
 	/** Tasks the commit assigned to the session by name (`team-events.ts` remembers them). */
 	assigned?: string[];
+	/**
+	 * Other ids a row of this session for this commit may have been written under (the commit
+	 * read at another time may concern the session in other ways: `team-events.ts`). A row under
+	 * any of them means the commit was delivered to the session.
+	 */
+	alsoIds?: string[];
 }
 
 /** What delivering needs from the session layer: a seam tests replace. */

@@ -8,9 +8,13 @@
  * A wake that finds no room is not lost: the row is written without one, and the session gets ONE
  * later wake when the window has room again ({@link wakeForTeam} returns `deferred`). A session
  * has at most one such timer, however many rows wait: they are all in its history, and the turn
- * that wake starts reads them together. The later wake is asked through the callback given with
- * the LAST deferral, which decides for itself whether a wake is still due (the session may have
- * run meanwhile and read the rows).
+ * that wake starts reads them together. Every deferral leaves a callback that says, when the
+ * timer fires, whether a wake is still due for its row (the session may have run meanwhile and
+ * read it), and makes it; they are asked newest first until one starts a turn. Callbacks are kept
+ * by `key`: rows that ask the same question (team rows: "is the newest of them still the last
+ * row") share one, so the newest replaces the older; a row with a question of its own (a person's
+ * answer: "did the session reply after it") keeps its own, and a later team row cannot drop it.
+ * At most {@link OUTLINE_TEAM_WAKE_LIMITS.deferredKeys} are kept (the oldest goes first).
  *
  * Memory only, O(1) per call: a process that restarts starts with empty windows (the startup
  * re-push of `team-events.ts` wakes what a crash cut off, through this same limit). At most
@@ -24,6 +28,8 @@ export const OUTLINE_TEAM_WAKE_LIMITS = {
 	/** Wakes one session takes in a window. */
 	perWindow: 6,
 	windowMs: 60_000,
+	/** Deferred wakes of one session kept by key. */
+	deferredKeys: 8,
 	/** Sessions remembered at most. */
 	sessions: 2000,
 } as const;
@@ -31,8 +37,8 @@ export const OUTLINE_TEAM_WAKE_LIMITS = {
 interface WakeState {
 	/** When its wakes of the current window were taken (ms), oldest first. */
 	taken: number[];
-	/** The later wake waiting for room, with how to cancel its timer. */
-	deferred: { wake: () => Promise<boolean>; cancel: () => void } | null;
+	/** The later wakes waiting for room (by key, oldest first), with how to cancel their timer. */
+	deferred: { wakes: Map<string, () => Promise<boolean>>; cancel: () => void } | null;
 }
 
 /** The clock and the timer: a seam tests replace. */
@@ -131,8 +137,34 @@ export function hasDeferredTeamWake(narratorId: string): boolean {
 	return state.sessions.get(narratorId)?.deferred != null;
 }
 
-function arm(narratorId: string, session: WakeState, wake: () => Promise<boolean>): void {
+/** Ask the waiting callbacks, newest first, until one starts a turn. */
+async function wakeDeferred(wakes: ReadonlyArray<() => Promise<boolean>>): Promise<boolean> {
+	for (const wake of [...wakes].reverse()) {
+		try {
+			if (await wake()) return true;
+		} catch (error) {
+			logger.warn("A deferred team wake failed", { error: String(error) });
+		}
+	}
+	return false;
+}
+
+function arm(
+	narratorId: string,
+	session: WakeState,
+	key: string,
+	wake: () => Promise<boolean>,
+): void {
+	const wakes = session.deferred?.wakes ?? new Map<string, () => Promise<boolean>>();
 	session.deferred?.cancel();
+	// The newest of a key replaces the older, and counts as the newest of all.
+	wakes.delete(key);
+	wakes.set(key, wake);
+	while (wakes.size > OUTLINE_TEAM_WAKE_LIMITS.deferredKeys) {
+		const [oldest] = wakes.keys();
+		if (oldest === undefined) break;
+		wakes.delete(oldest);
+	}
 	const now = state.clock.now();
 	const taken = live(session, now);
 	const oldest = taken[0];
@@ -144,37 +176,34 @@ function arm(narratorId: string, session: WakeState, wake: () => Promise<boolean
 	const cancel = state.clock.after(wait, () => {
 		const current = state.sessions.get(narratorId);
 		if (current !== session || session.deferred === null) return;
-		const due = session.deferred.wake;
+		const due = session.deferred.wakes;
 		session.deferred = null;
 		const at = state.clock.now();
 		if (live(session, at).length >= OUTLINE_TEAM_WAKE_LIMITS.perWindow) {
 			// Not yet (the clock ran early): wait again.
-			arm(narratorId, session, due);
+			for (const [k, w] of due) arm(narratorId, session, k, w);
 			return;
 		}
 		session.taken.push(at);
-		void due()
-			.then((woke) => {
-				if (!woke) giveBack(narratorId, at);
-			})
-			.catch((error) => {
-				giveBack(narratorId, at);
-				logger.warn("A deferred team wake failed", { narratorId, error: String(error) });
-			});
+		void wakeDeferred([...due.values()]).then((woke) => {
+			if (!woke) giveBack(narratorId, at);
+		});
 	});
-	session.deferred = { wake, cancel };
+	session.deferred = { wakes, cancel };
 }
 
 /**
  * Wake the session for a team event: now when its window has room (`wake` is called, its result
  * returned as `woke`), or once later when it has not (`deferred`). The later wake is `later`
- * (default: `wake`), which replaces the one already waiting, and is called when there is room.
- * Both return whether a turn was started.
+ * (default: `wake`), kept under `key` (see the module header: it replaces the one waiting under
+ * the same key, and is asked with the others when there is room). Both return whether a turn was
+ * started.
  */
 export async function wakeForTeam(
 	narratorId: string,
 	wake: () => Promise<boolean>,
 	later: () => Promise<boolean> = wake,
+	key = "team",
 ): Promise<{ woke: boolean; deferred: boolean }> {
 	if (takeTeamWake(narratorId)) {
 		const at = state.sessions.get(narratorId)?.taken.at(-1);
@@ -188,6 +217,6 @@ export async function wakeForTeam(
 		return { woke, deferred: false };
 	}
 	const session = sessionOf(narratorId, state.clock.now());
-	arm(narratorId, session, later);
+	arm(narratorId, session, key, later);
 	return { woke: false, deferred: true };
 }

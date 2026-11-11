@@ -1364,8 +1364,11 @@ const realDelivery: OutlineAnswerDelivery = {
 				const { assistantReplyFollowsAnswer } = await import("../narrator-session");
 				if (ref && assistantReplyFollowsAnswer(narratorId, ref.seq))
 					return { written: true, woke: false };
-				const again = await wakeForTeam(narratorId, () =>
-					wakeIdleAfterDelivery(narratorId, "en", executionPrincipal),
+				const again = await wakeForTeam(
+					narratorId,
+					() => wakeIdleAfterDelivery(narratorId, "en", executionPrincipal),
+					undefined,
+					`answer:${existing.id}`,
 				);
 				return { written: true, woke: again.woke };
 			}
@@ -1409,6 +1412,9 @@ const realDelivery: OutlineAnswerDelivery = {
 				if (ref && assistantReplyFollowsAnswer(narratorId, ref.seq)) return false;
 				return await wakeIdleAfterDelivery(narratorId, "en", executionPrincipal);
 			},
+			// Its own question ("did the session reply after it"): a later team row's deferral
+			// does not take its place.
+			`answer:${answerId}`,
 		);
 		return { written: true, woke: woken.woke };
 	},

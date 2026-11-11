@@ -598,7 +598,7 @@
 			"andStart": "转交并开始",
 			"empty": "这个项目里没有能接手的会话。",
 			"failed": "读取会话列表失败",
-			"more": "只列出前 50 个会话。",
+			"more": "只列出前 {{count}} 个会话。",
 			"untitled": "未命名会话",
 			"started": "已转交，会话已开始做。",
 			"notStarted": {

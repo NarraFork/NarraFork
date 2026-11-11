@@ -94,6 +94,7 @@ import {
 	outlineTaskFinishedDeliverySeam,
 	outlineTaskFinishedInjection,
 	outlineTaskFinishedMessage,
+	outlineTaskFinishedMessageId,
 	readOutlineCommitTasks,
 	readOutlineCommitWriter,
 	readOutlineTaskFinishedParts,
@@ -122,6 +123,10 @@ export const OUTLINE_TEAM_EVENT_LIMITS = {
 	spacesAtOnce: 4,
 	/** Commits one space may have waiting to be read; past it they are dropped and logged. */
 	queuedPerSpace: 500,
+	/** An assignment back to the session that handed the task away within this long wakes nobody. */
+	handBackQuietMs: 10 * 60_000,
+	/** Tasks whose last hand-over is remembered (memory only). */
+	handOversRemembered: 2000,
 	/** After a start: how far back commits are pushed again. */
 	repushWindowMs: 15 * 60_000,
 	/** After a start: spaces pushed again at most. */
@@ -151,6 +156,39 @@ export function outlineTeamMessageId(
 interface Assigned {
 	blockId: string;
 	humanCreated: boolean;
+	/**
+	 * The session handed this task away itself a moment ago and now gets it back: recorded, but
+	 * not a reason to wake it (two sessions passing a task to and fro must not keep each other
+	 * running).
+	 */
+	back: boolean;
+}
+
+/**
+ * Who handed each task away last, in memory: what {@link Assigned.back} is read from. Keyed by
+ * task; times are the commits' own, so reading a commit again says the same.
+ */
+const handedAway = hotSafe(
+	"narrafork.outlineTeamEvents.handedAway",
+	() => new Map<string, { by: string; at: number; commitId: string }>(),
+);
+
+/** Forget who handed what away (tests). */
+export function resetOutlineTeamHandOversForTests(): void {
+	handedAway.clear();
+}
+
+function noteHandedAway(taskId: string, by: string, at: number, commitId: string): void {
+	const known = handedAway.get(taskId);
+	// A commit read again (a retry, the re-push) changes nothing; an older one never replaces.
+	if (known && (known.commitId === commitId || known.at > at)) return;
+	handedAway.delete(taskId);
+	handedAway.set(taskId, { by, at, commitId });
+	while (handedAway.size > OUTLINE_TEAM_EVENT_LIMITS.handOversRemembered) {
+		const [oldest] = handedAway.keys();
+		if (oldest === undefined) break;
+		handedAway.delete(oldest);
+	}
 }
 
 interface Unblocked {
@@ -238,9 +276,20 @@ async function assignedInCommit(
 				candidates.map((c) => c.blockId),
 			)
 		: new Map<string, string>();
+	const at = Date.parse(writer.commit.createdAt);
 	for (const candidate of candidates) {
 		const root = sessions.get(candidate.assignee);
 		if (root === undefined) continue;
+		// Handed back within minutes by the session it was handed to: no wake (see `Assigned`).
+		const before = handedAway.get(candidate.blockId);
+		const back =
+			before !== undefined &&
+			before.by === root &&
+			before.commitId !== writer.commit.id &&
+			at >= before.at &&
+			at - before.at < OUTLINE_TEAM_EVENT_LIMITS.handBackQuietMs;
+		if (writer.writerRoot !== null && writer.writerRoot !== root)
+			noteHandedAway(candidate.blockId, writer.writerRoot, at, writer.commit.id);
 		// Its own session (or a subagent of it) assigned it: nothing to tell.
 		if (writer.writerRoot !== null && root === writer.writerRoot) continue;
 		// A person's change PR 5 already tells this session of.
@@ -249,7 +298,7 @@ async function assignedInCommit(
 		// A session that may not read the space could not do the task, and is told nothing of it.
 		if (!(await canSessionReadSpace(root, writer.space).catch(() => false))) continue;
 		const list = out.get(root);
-		const entry = { blockId: candidate.blockId, humanCreated: candidate.humanCreated };
+		const entry = { blockId: candidate.blockId, humanCreated: candidate.humanCreated, back };
 		if (list) list.push(entry);
 		else out.set(root, [entry]);
 	}
@@ -289,6 +338,21 @@ async function unblockedInCommit(
 			m,
 		]),
 	);
+	// Whether a link was written after the commit: by seq in the commit's own space, by its
+	// commit's time in another (one commit read by `(space, seq)`, memoized).
+	const linkCommits = new Map<string, Promise<boolean>>();
+	const writtenAfter = (link: { spaceId: string; fromSeq: number }): Promise<boolean> => {
+		if (link.spaceId === space.id) return Promise.resolve(link.fromSeq > writer.commit.seq);
+		const key = `${link.spaceId}\u0000${link.fromSeq}`;
+		let verdict = linkCommits.get(key);
+		if (!verdict) {
+			verdict = store
+				.getCommitsBySeqs(link.spaceId, [link.fromSeq])
+				.then(([commit]) => !!commit && commit.createdAt > writer.commit.createdAt);
+			linkCommits.set(key, verdict);
+		}
+		return verdict;
+	};
 	// (dependent, prerequisite) pairs, the dependents read once.
 	const pairs: Array<{ from: string; prerequisite: string; status: "done" | "cancelled" }> = [];
 	for (const v of looked) {
@@ -307,13 +371,17 @@ async function unblockedInCommit(
 			OUTLINE_TEAM_EVENT_LIMITS.dependentsPerTask,
 			{ kinds: ["depends"] },
 		);
-		for (const link of links)
-			if (link.fromBlockId !== v.blockId)
-				pairs.push({
-					from: link.fromBlockId,
-					prerequisite: v.blockId,
-					status: (v.taskJson as OutlineTaskJson).status as "done" | "cancelled",
-				});
+		for (const link of links) {
+			if (link.fromBlockId === v.blockId) continue;
+			// A dependence written after this commit did not wait for it: a task that came to
+			// depend on an ended task later is not "unblocked" by the old commit (the re-push).
+			if (await writtenAfter(link)) continue;
+			pairs.push({
+				from: link.fromBlockId,
+				prerequisite: v.blockId,
+				status: (v.taskJson as OutlineTaskJson).status as "done" | "cancelled",
+			});
+		}
 	}
 	if (pairs.length === 0) return out;
 	const dependents = new Map(
@@ -336,8 +404,19 @@ async function unblockedInCommit(
 		return spaces.get(id) ?? null;
 	};
 	const assignees = new Map<string, string | null>();
-	/** Who does a dependent task: see the module header. */
+	/**
+	 * Who does a dependent task (see the module header), and only a session that may read the
+	 * task's space: a row names the task by its title, and a session that cannot read it could
+	 * not do it either (the rule the assigned event applies).
+	 */
 	const doerOf = async (task: OutlineBlockMeta): Promise<string | null> => {
+		const root = await namedDoerOf(task);
+		if (root === null) return null;
+		const taskSpace = await spaceOf(task.spaceId);
+		if (!taskSpace) return null;
+		return (await canSessionReadSpace(root, taskSpace).catch(() => false)) ? root : null;
+	};
+	const namedDoerOf = async (task: OutlineBlockMeta): Promise<string | null> => {
 		const claim = claims.get(task.id);
 		if (claim && isClaimLive(claim, now)) {
 			// A person doing it is not told here.
@@ -498,7 +577,12 @@ export async function readOutlineTeamMessages(
 		const e = events.get(root) as SessionEvents;
 		if (e.assigned.length + e.unblocked.length === 0) {
 			// Only tasks it created ended: told as 9b tells it.
-			if (part) out.push(outlineTaskFinishedMessage(event, part, writer));
+			if (part)
+				out.push({
+					...outlineTaskFinishedMessage(event, part, writer),
+					// Read at another time the commit may have concerned it in more ways.
+					alsoIds: [outlineTeamMessageId(event, root)],
+				});
 			continue;
 		}
 		const locale: Locale = part?.locale ?? (await outlineSessionLocale(root));
@@ -572,7 +656,7 @@ export async function readOutlineTeamMessages(
 		// A person's commit never wakes. An agent's wakes for what can be acted on now.
 		const wake =
 			!writer.person &&
-			(shownAssigned.length > 0 ||
+			(shownAssigned.some((a) => !a.back) ||
 				shownUnblocked.some((u) => !u.stillWaiting) ||
 				(part?.wake ?? false));
 		out.push({
@@ -594,6 +678,8 @@ export async function readOutlineTeamMessages(
 			wake,
 			source: OUTLINE_TEAM_SOURCE,
 			...(e.assigned.length > 0 ? { assigned: e.assigned.map((a) => a.blockId) } : {}),
+			// Read at another time it may have been only the tasks it created ending (9b's row).
+			...(part ? { alsoIds: [outlineTaskFinishedMessageId(event, root, part.taskIds)] } : {}),
 		});
 	}
 	return out;
@@ -681,25 +767,29 @@ export async function deliverOutlineTeamMessage(
 		);
 		return { written: result.messageId !== null, woke: false, deferred: false };
 	}
-	const [{ db }, { narratorMessages }, { and, eq }] = await Promise.all([
+	const [{ db }, { narratorMessages }, { and, eq, inArray }] = await Promise.all([
 		import("@server/db"),
 		import("@server/db/schema"),
 		import("drizzle-orm"),
 	]);
+	// A row of this session for this commit, under the id it has now or the one it would have had
+	// read at another time (see `alsoIds`): delivered before, never written twice.
 	const existing = db
 		.select({ id: narratorMessages.id })
 		.from(narratorMessages)
 		.where(
 			and(
-				eq(narratorMessages.id, message.messageId),
+				inArray(narratorMessages.id, [message.messageId, ...(message.alsoIds ?? [])]),
 				eq(narratorMessages.narratorId, message.narratorId),
 			),
 		)
+		.limit(1)
 		.get();
 	if (existing) {
 		if (!options.repush || !message.wake) return { written: true, woke: false, deferred: false };
 		// After a start: the first delivery may have stopped between the write and the wake.
-		const again = await wakeForTeam(message.narratorId, () => wakeIfStillUnread(message));
+		const row = { ...message, messageId: existing.id };
+		const again = await wakeForTeam(message.narratorId, () => wakeIfStillUnread(row));
 		return { written: true, ...again };
 	}
 	// Written first, without a wake: the wake is decided on its own, and may come later.
@@ -857,6 +947,11 @@ export async function repushRecentOutlineTeamEvents(
 	options: { store?: OutlineStore; now?: Date } = {},
 ): Promise<{ spaces: number; commits: number }> {
 	if (!isOutlineEnabled()) return { spaces: 0, commits: 0 };
+	// PostgreSQL writes its rows without a chosen id, so a row written before cannot be found
+	// again: pushing a commit twice would tell it twice. Nothing is pushed again there (a commit
+	// whose row a stop cut off stays untold, as before this module; nothing is woken there anyway).
+	const { getNarratorMessageRefsPort } = await import("../narrator-refs/store");
+	if (getNarratorMessageRefsPort()) return { spaces: 0, commits: 0 };
 	const store = options.store ?? outlineStore;
 	const limits = OUTLINE_TEAM_EVENT_LIMITS;
 	const since = new Date(

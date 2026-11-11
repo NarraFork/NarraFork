@@ -184,12 +184,16 @@ export interface OutlineBoardTransferSession {
 	title: string | null;
 	/** A named session's handle: named sessions come first. */
 	handle?: string;
+	/** The caller may write the session: 「转交并开始」 is theirs to ask. */
+	canStart: boolean;
 }
 
 export interface OutlineBoardTransferSessionsResponse {
 	sessions: OutlineBoardTransferSession[];
-	/** The project has more sessions than the board offers. */
+	/** The project has (or may have) more sessions that could take it than the board offers. */
 	truncated: boolean;
+	/** How many the board offers at most. */
+	limit: number;
 }
 
 /**

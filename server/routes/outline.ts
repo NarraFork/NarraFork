@@ -161,7 +161,11 @@ import {
 	readProjectTaskBoard,
 	readSessionTaskBoard,
 } from "../services/outline/task-board";
-import { listTransferSessions, startSessionOnTransferredTask } from "../services/outline/transfer";
+import {
+	listTransferSessions,
+	OUTLINE_TRANSFER_LIMITS,
+	startSessionOnTransferredTask,
+} from "../services/outline/transfer";
 import { readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeLocks,
@@ -1152,7 +1156,10 @@ outlineRoutes.get("/tasks/:blockId/transfer-sessions", async (c) => {
 		throw new NotFoundError("Outline task", blockId);
 	if (!(await canReadSpace(principal, space))) throw new NotFoundError("Outline task", blockId);
 	if (!(await canWriteSpace(principal, space))) throw new ForbiddenError();
-	const body: OutlineBoardTransferSessionsResponse = await listTransferSessions(principal, space);
+	const body: OutlineBoardTransferSessionsResponse = {
+		...(await listTransferSessions(principal, space)),
+		limit: OUTLINE_TRANSFER_LIMITS.sessions,
+	};
 	return c.json(body);
 });
 

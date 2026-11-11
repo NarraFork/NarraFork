@@ -303,7 +303,7 @@ export const OUTLINE_TOOL_TEXT = {
 			`${address} was in progress and got a new assignee: it is back to to-do, so whoever takes it up claims it afresh`,
 		/** `@agent:name` names no session: written as a name, nobody is told. */
 		assigneeUnknown: (name: string) =>
-			`no session has the id or handle ${quoted(name)}: @agent:${name} was written as a name, and nobody is told`,
+			`no session has the id or handle ${quoted(name)}: @agent:${name} was written as a label only. Nobody is told and nothing changes hands: a task of yours that is in progress is still in progress and still yours`,
 		/** `@agent:name` names a session that could not do the task. */
 		assigneeCannotWork: (name: string) =>
 			`the session @agent:${name} names cannot work in this space (it is archived, or the person it works for may not write here); nothing was written`,

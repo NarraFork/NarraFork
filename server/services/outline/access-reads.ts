@@ -695,13 +695,15 @@ export interface TransferSessionRow {
  * them: sessions of the project (as {@link readProjectSessionSpacePage} counts them), not
  * archived, not subagents, keeping their tasks in the outline, that the principal can read (the
  * narrator list's predicate, in SQL before the LIMIT; admins read every one). Named sessions
- * (with a handle) first, then the most recently active; at most `limit`. Whether each could work
- * in the task's space is the caller's check (`canSessionWorkIn`).
+ * (with a handle) first, then the most recently active; `limit` rows after `offset`. With
+ * `onlyId`: that one session, when it passes the same predicate (what a hand-over to it is
+ * checked with). Whether each could work in the task's space is the caller's check
+ * (`canSessionWorkIn`).
  */
 export async function readProjectTransferSessions(
 	principal: { userId: string; isAdmin: boolean },
 	projectId: string,
-	limit: number,
+	options: { limit: number; offset?: number; onlyId?: string },
 ): Promise<TransferSessionRow[]> {
 	const visible = principal.isAdmin
 		? sql``
@@ -717,10 +719,11 @@ export async function readProjectTransferSessions(
 			and n.status <> 'archived'
 			and n.type <> 'subagent'
 			and n.task_backend = 'outline'
+			${options.onlyId !== undefined ? sql`and n.id = ${options.onlyId}` : sql``}
 			${visible}
 		order by (case when n.handle is null then 1 else 0 end),
 			coalesce(n.last_message_at, n.updated_at) desc, n.id
-		limit ${limit}
+		limit ${options.limit} offset ${Math.max(0, options.offset ?? 0)}
 	`);
 	return rows.map((row) => ({
 		id: text(row, "id"),
