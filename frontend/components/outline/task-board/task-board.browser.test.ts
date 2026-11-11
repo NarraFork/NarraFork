@@ -526,7 +526,8 @@ test("a project's board: readable sessions only, grouped by executor, no actions
 		const rows = await call(reader.page, (f) => f.rows());
 		expect(rows.map((r) => [r.title, r.group]).sort()).toEqual([
 			["Shared task", "Shared session"],
-			["Team task", "Unassigned"],
+			// A project's unassigned tasks are "Ready to start" (outline P2 PR 10c-1).
+			["Team task", "Ready to start"],
 		]);
 		// A reader may open a task but not change it.
 		await reader.page.click(

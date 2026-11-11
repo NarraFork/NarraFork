@@ -111,6 +111,8 @@ const ROUTINE_SYSTEM_ACTORS = new Set([
 	OUTLINE_PLAN_ACTOR,
 	OUTLINE_PLAN_REVIEW_ACTOR,
 	"outline-task-start",
+	// A session opened for a task from the board: its claim, and a claim given back (P2 PR 10c-1).
+	"outline-task-open",
 	"outline-questions",
 	"outline-live",
 	"outline-live-sync",

@@ -31,7 +31,9 @@
  *      hand over) write access to its space (404 when it cannot be read, 403 otherwise).
  *   8. Questions and the digest (P2 PR 7): the questions under a block, answering those put to
  *      the person (one `answer` commit), and acknowledging what agents confirmed on their behalf.
- *   9. Reports (P2 PR 11, `/digests`): only the person's own; see `routes/outline-digest.ts`.
+ *   9. "Open a new session for this" (P2 PR 10c-1): write access to the task's project (to create a
+ *      session in it) and to its space; see the route.
+ *  10. Reports (P2 PR 11, `/digests`): only the person's own; see `routes/outline-digest.ts`.
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
@@ -67,12 +69,14 @@ import {
 	type OutlineViewStateResponse,
 } from "@shared/outline-api";
 import { isOutlineReportBlockId } from "@shared/outline-report-line";
-import type {
-	OutlineBoardAddResponse,
-	OutlineBoardFinishedResponse,
-	OutlineBoardSeenResponse,
-	OutlineBoardTaskUpdateResponse,
-	OutlineTaskBoardResponse,
+import {
+	OUTLINE_TASK_BOARD_LIMITS,
+	type OutlineBoardAddResponse,
+	type OutlineBoardFinishedResponse,
+	type OutlineBoardOpenSessionResponse,
+	type OutlineBoardSeenResponse,
+	type OutlineBoardTaskUpdateResponse,
+	type OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -84,6 +88,7 @@ import {
 	outlineBacklinksQuerySchema,
 	outlineBlockViewQuerySchema,
 	outlineBoardAddBodySchema,
+	outlineBoardOpenSessionBodySchema,
 	outlineBoardSeenBodySchema,
 	outlineBoardTaskUpdateBodySchema,
 	outlineDigestSeenBodySchema,
@@ -1146,6 +1151,43 @@ outlineRoutes.patch("/tasks/:blockId", bodyLimit({ maxSize: 16 * 1024 }), async 
 	};
 	return c.json(body);
 });
+
+/**
+ * "Open a new session for this" (outline P2 PR 10c-1, D54): a new session of the task's project,
+ * owned by the person, is created, claims the task and starts on it with an opening brief written
+ * from the outline (`services/outline/task-session.ts`, which holds every check). 404 when the
+ * task cannot be read; 403 when the person may not create sessions in the project or write the
+ * task's space; 409 (`details.reason`) when the task cannot be started now, someone took it
+ * meanwhile (`details.holder`), or the session runtime does not run on this store (PostgreSQL);
+ * 500 when the session could not be started (the claim is given back, the session archived).
+ */
+outlineRoutes.post(
+	"/tasks/:blockId/open-session",
+	bodyLimit({
+		maxSize: OUTLINE_TASK_BOARD_LIMITS.openSessionBodyBytes,
+		onError: (c) =>
+			c.json(
+				{
+					code: "PAYLOAD_TOO_LARGE",
+					message: `Request body exceeds ${OUTLINE_TASK_BOARD_LIMITS.openSessionBodyBytes} bytes`,
+				},
+				413,
+			),
+	}),
+	async (c) => {
+		const principal = principalOf(c);
+		const blockId = idParam(c, "blockId");
+		const input = parse(outlineBoardOpenSessionBodySchema, await c.req.json().catch(() => ({})));
+		const { openTaskSession } = await import("../services/outline/task-session");
+		const body: OutlineBoardOpenSessionResponse = await openTaskSession({
+			taskId: blockId,
+			baseVersionSeq: input.baseVersionSeq,
+			by: { kind: "human", userId: principal.userId, isAdmin: principal.isAdmin },
+			options: { model: input.model, cwd: input.cwd, note: input.note },
+		});
+		return c.json(body, body.already ? 200 : 201);
+	},
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // View state

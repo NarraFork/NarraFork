@@ -304,3 +304,53 @@ it("dropping on a folder member's slot sends the membership with the anchor", as
 		{ afterKey: "narrator:m", folderId: "F" },
 	]);
 });
+
+function dispatchMouse(type: string, fields: Record<string, number>) {
+	const event = document.createEvent("Event");
+	event.initEvent(type, true, true);
+	Object.assign(event, fields);
+	document.dispatchEvent(event);
+}
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+it("a release @dnd-kit never reports (quick click/double click) still ends the drag", async () => {
+	let final: unknown = "unseen";
+	const unsubscribe = onPanelDragEnd((state) => {
+		final = state;
+	});
+	start();
+	expect(getPanelDrag()?.id).toBe("a");
+	dispatchMouse("mouseup", { clientX: 50, clientY: 20, buttons: 0 });
+	await tick();
+	render();
+	expect(final).toBeNull();
+	expect(getPanelDrag()).toBeNull();
+	expect(result.draggingId).toBeNull();
+	expect(result.draggingRef.current).toBe(false);
+	unsubscribe();
+});
+it("a buttonless move after a missed release also ends the drag", async () => {
+	start();
+	dispatchMouse("mousemove", { clientX: 60, clientY: 20, buttons: 1 });
+	await tick();
+	expect(getPanelDrag()?.id).toBe("a");
+	dispatchMouse("mousemove", { clientX: 400, clientY: 20, buttons: 0 });
+	await tick();
+	render();
+	expect(getPanelDrag()).toBeNull();
+	expect(result.draggingId).toBeNull();
+});
+it("a normal drop is not cancelled by the release watchdog", async () => {
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: true,
+		baseRevision: 0,
+		revision: 1,
+		operations: [],
+	});
+	spies.push(move);
+	start();
+	dispatchMouse("mouseup", { clientX: 50, clientY: 85, buttons: 0 });
+	await end(70);
+	await tick();
+	expect(move).toHaveBeenCalledTimes(1);
+});
