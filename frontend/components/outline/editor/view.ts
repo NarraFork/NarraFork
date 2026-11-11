@@ -2369,57 +2369,14 @@ class BlockView implements NodeView {
 		this.marksEl = document.createElement("span");
 		this.marksEl.className = "ob-marks";
 		this.marksEl.contentEditable = "false";
-		// The row's quick control: everything inside it, expanded or back to the default view.
-		// Always drawn (touch has no hover); a control for assistive technology, not a tab stop.
-		this.subtreeEl = document.createElement("span");
-		this.subtreeEl.className = "ob-subtree";
-		this.subtreeEl.contentEditable = "false";
-		this.subtreeEl.setAttribute("role", "button");
-		this.subtreeEl.tabIndex = -1;
-		this.subtreeEl.addEventListener("mousedown", (e) => {
-			e.preventDefault();
-			if (plainClick(e)) this.owner.toggleSubtree(this.node.attrs.id);
-		});
-		this.subtreeEl.addEventListener("keydown", (e) => {
-			takeFoldKey(e, () => this.owner.toggleSubtree(this.node.attrs.id));
-		});
-		// What a closed block holds, as one line in its children's place: frame DOM, never part of
-		// the document (nothing to type into, select, save or undo).
-		this.previewEl = document.createElement("div");
-		this.previewEl.className = "ob-preview";
-		this.previewEl.contentEditable = "false";
-		this.previewEl.setAttribute("role", "button");
-		this.previewEl.tabIndex = -1;
-		this.previewText = document.createElement("span");
-		this.previewText.className = "ob-preview-text";
-		this.previewLabel = document.createElement("span");
-		this.previewLabel.className = "ob-preview-label";
-		this.previewEl.append(this.previewText, this.previewLabel);
-		this.previewEl.addEventListener("mousedown", (e) => {
-			e.preventDefault();
-			if (plainClick(e)) this.owner.toggleSubtree(this.node.attrs.id, true);
-		});
-		this.previewEl.addEventListener("keydown", (e) => {
-			takeFoldKey(e, () => this.owner.toggleSubtree(this.node.attrs.id, true));
-		});
-		this.dom.append(
-			this.g.el,
-			this.chip,
-			this.g.zoom,
-			this.subtreeEl,
-			this.marksEl,
-			this.contentDOM,
-			this.previewEl,
-		);
+		this.dom.append(this.g.el, this.chip, this.g.zoom, this.marksEl, this.contentDOM);
 		this.render();
 	}
 
 	private chip: HTMLElement;
 	private marksEl: HTMLElement;
-	private subtreeEl: HTMLElement;
-	private previewEl: HTMLElement;
-	private previewText: HTMLElement;
-	private previewLabel: HTMLElement;
+	private subtreeEl: HTMLElement | null = null;
+	private preview: { el: HTMLElement; text: HTMLElement; label: HTMLElement } | null = null;
 	/** The folding the frame last drew (`fold` attribute and the texts it showed). */
 	private foldKey = "";
 	private taskList: HTMLElement | null = null;
@@ -2548,6 +2505,12 @@ class BlockView implements NodeView {
 			question: n.attrs.question === true,
 			title,
 		});
+		// A body that is one box (a code block, a table): the quick control sits over its corner.
+		const box = n.child(0).type === N.code_block || n.child(0).type === N.table;
+		if (box !== (this.dom.dataset.box === "1")) {
+			if (box) this.dom.dataset.box = "1";
+			else delete this.dom.dataset.box;
+		}
 		this.renderFold(n, collapsed, title);
 		const hidden = (n.attrs.hidden as number) ?? 0;
 		const open = hidden > 0 ? this.owner.hiddenTasks(id).length : 0;
@@ -2596,38 +2559,90 @@ class BlockView implements NodeView {
 		this.foldKey = key;
 		const sub = fold.subtree;
 		if (sub) {
-			setIcon(this.subtreeEl, FOLD_ALL_ICONS[sub]);
-			this.subtreeEl.dataset.foldSubtree = sub;
-			this.subtreeEl.setAttribute("aria-expanded", String(sub === "collapse"));
-			this.subtreeEl.setAttribute("aria-label", chromeText.foldSubtree(title));
-			this.subtreeEl.title =
-				sub === "collapse" ? chromeText.foldSubtreeCollapse : chromeText.foldSubtreeExpand;
-			this.subtreeEl.style.display = "";
-		} else {
+			const el = this.subtreeControl();
+			setIcon(el, FOLD_ALL_ICONS[sub]);
+			el.dataset.foldSubtree = sub;
+			el.setAttribute("aria-expanded", String(sub === "collapse"));
+			el.setAttribute("aria-label", chromeText.foldSubtree(title));
+			el.title = sub === "collapse" ? chromeText.foldSubtreeCollapse : chromeText.foldSubtreeExpand;
+			if (!el.parentNode) this.marksEl.before(el);
+		} else if (this.subtreeEl?.parentNode) {
 			// Its focus (assistive technology) goes to the arrow, which stays.
 			if (this.subtreeEl.ownerDocument.activeElement === this.subtreeEl) this.g.arrow.focus();
-			this.subtreeEl.style.display = "none";
-			delete this.subtreeEl.dataset.foldSubtree;
+			this.subtreeEl.remove();
 		}
 		if (preview) {
-			this.previewText.textContent = text;
-			this.previewText.style.display = text ? "" : "none";
-			this.previewLabel.textContent = label;
-			this.previewLabel.style.display = label ? "" : "none";
-			this.previewEl.dataset.foldPreview = preview.kind;
-			this.previewEl.setAttribute("aria-expanded", "false");
-			this.previewEl.setAttribute(
+			const line = this.previewLine();
+			line.text.textContent = text;
+			line.text.style.display = text ? "" : "none";
+			line.label.textContent = label;
+			line.label.style.display = label ? "" : "none";
+			line.el.dataset.foldPreview = preview.kind;
+			line.el.setAttribute("aria-expanded", "false");
+			line.el.setAttribute(
 				"aria-label",
 				`${chromeText.foldShowInside}: ${text || title}${label ? ` (${spokenLabel(label)})` : ""}`,
 			);
-			this.previewEl.style.display = "";
-		} else {
+			if (!line.el.parentNode) this.dom.append(line.el);
+		} else if (this.preview?.el.parentNode) {
 			// The line goes when it is used: its focus moves to the row's own control.
-			if (this.previewEl.ownerDocument.activeElement === this.previewEl)
-				(sub ? this.subtreeEl : this.g.arrow).focus();
-			this.previewEl.style.display = "none";
-			delete this.previewEl.dataset.foldPreview;
+			const el = this.preview.el;
+			if (el.ownerDocument.activeElement === el)
+				(sub && this.subtreeEl ? this.subtreeEl : this.g.arrow).focus();
+			el.remove();
 		}
+	}
+
+	/**
+	 * The row's quick control (everything inside it, expanded or back to the default view), made
+	 * when the row first needs one: most blocks never do, and a page has thousands of frames.
+	 * Always drawn where it applies (touch has no hover); a control for assistive technology,
+	 * not a tab stop.
+	 */
+	private subtreeControl(): HTMLElement {
+		if (this.subtreeEl) return this.subtreeEl;
+		const el = document.createElement("span");
+		el.className = "ob-subtree";
+		el.contentEditable = "false";
+		el.setAttribute("role", "button");
+		el.tabIndex = -1;
+		el.addEventListener("mousedown", (e) => {
+			e.preventDefault();
+			if (plainClick(e)) this.owner.toggleSubtree(this.node.attrs.id);
+		});
+		el.addEventListener("keydown", (e) => {
+			takeFoldKey(e, () => this.owner.toggleSubtree(this.node.attrs.id));
+		});
+		this.subtreeEl = el;
+		return el;
+	}
+
+	/**
+	 * What a closed block holds, as one line in its children's place, made when the block is
+	 * first closed: frame DOM, never part of the document (nothing to type into, select, save or
+	 * undo).
+	 */
+	private previewLine(): { el: HTMLElement; text: HTMLElement; label: HTMLElement } {
+		if (this.preview) return this.preview;
+		const el = document.createElement("div");
+		el.className = "ob-preview";
+		el.contentEditable = "false";
+		el.setAttribute("role", "button");
+		el.tabIndex = -1;
+		const text = document.createElement("span");
+		text.className = "ob-preview-text";
+		const label = document.createElement("span");
+		label.className = "ob-preview-label";
+		el.append(text, label);
+		el.addEventListener("mousedown", (e) => {
+			e.preventDefault();
+			if (plainClick(e)) this.owner.toggleSubtree(this.node.attrs.id, true);
+		});
+		el.addEventListener("keydown", (e) => {
+			takeFoldKey(e, () => this.owner.toggleSubtree(this.node.attrs.id, true));
+		});
+		this.preview = { el, text, label };
+		return this.preview;
 	}
 
 	update(node: PMNode) {
@@ -2653,8 +2668,8 @@ class BlockView implements NodeView {
 		return (
 			this.g.el.contains(target) ||
 			this.g.zoom.contains(target) ||
-			this.subtreeEl.contains(target) ||
-			this.previewEl.contains(target) ||
+			(this.subtreeEl?.contains(target) ?? false) ||
+			(this.preview?.el.contains(target) ?? false) ||
 			this.chip.contains(target) ||
 			this.marksEl.contains(target) ||
 			(this.taskList?.contains(target) ?? false)

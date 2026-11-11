@@ -265,8 +265,12 @@
 	pointer-events: none;
 }
 
-/* Beside a body that is one box (see `.ob-zoom` above): over its corner, left of the handle. */
-.nf-outline-editor .ob-block:has(> .ob-content > :is(pre, table):first-child) > .ob-subtree {
+/*
+ * Beside a body that is one box (see `.ob-zoom` above): over its corner, left of the handle. The
+ * frame marks such a block itself (`data-box`): a second `:has()` rule over every block costs a
+ * style pass on each structural edit of a large page.
+ */
+.nf-outline-editor .ob-block[data-box] > .ob-subtree {
 	float: none;
 	position: absolute;
 	right: 24px;
