@@ -84,9 +84,8 @@ mock.module("../../lib/agent/provider", () => ({
 const { outlineRoutes } = await import("../../routes/outline");
 const { settings } = await import("../../lib/settings");
 const { generateId } = await import("../../lib/id");
-const { closeNarrator, sendMessage, startSpecContinuationIfPossible } = await import(
-	"../narrator-session"
-);
+const { closeNarrator, continueNarrator, sendMessage, startSpecContinuationIfPossible } =
+	await import("../narrator-session");
 const { narratorService } = await import("../narrator-service");
 const { outlineStore } = await import("../outline/store");
 const { ensurePersonalSpace, ensureProjectSpace, ensureSessionSpace } = await import(
@@ -102,7 +101,10 @@ const {
 	setOutlineTaskSessionRuntime,
 } = await import("../outline/task-session");
 const { readProjectTaskBoard } = await import("../outline/task-board");
-const { outlineRunEndsSettled } = await import("../outline/lease-keeper");
+const { outlineRunEndsSettled, resetOutlinePersonRunEndsForTests } = await import(
+	"../outline/lease-keeper"
+);
+const { resetOutlineGraceLeasesForTests } = await import("../outline/release");
 // The run's end asks whether anything still works for the session in the background.
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 await backgroundOccupancyStore.start();
@@ -140,6 +142,8 @@ beforeEach(() => {
 	setOutlineTaskSessionRuntime(null);
 	requests.length = 0;
 	onTurn = null;
+	resetOutlinePersonRunEndsForTests();
+	resetOutlineGraceLeasesForTests();
 });
 
 afterEach(async () => {
@@ -1172,9 +1176,11 @@ describe("a step under a task someone is doing", () => {
 			holder: null,
 			epoch: 0,
 		});
+		// An explicit start of an existing session is a person's: the task it holds stays with it.
 		expect(await stateOf(held?.blockId as string)).toMatchObject({
+			status: "doing",
+			holder: plain.id,
 			epoch: 1,
-			lastHolder: plain.id,
 		});
 	});
 });
@@ -1273,7 +1279,10 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 
 		// ── The first session: a note, the first step done, then its turn ends. ──
 		let first = "";
+		let during: Awaited<ReturnType<typeof stateOf>> | null = null;
 		onTurn = async () => {
+			// While its turn runs the task is the session's, in progress.
+			during = await stateOf(task);
 			await asSession(p.space.id, first, alice, [
 				{
 					op: "insert",
@@ -1297,6 +1306,7 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		expect(one.status).toBe(201);
 		expect(one.body.narratorId).toBe(first);
 		await idle(first, 1);
+		expect(during).toMatchObject({ status: "doing", holder: first, epoch: 1 });
 
 		expect(await stateOf(task)).toMatchObject({
 			status: "todo",
@@ -1388,6 +1398,43 @@ describe("the whole loop: not finished, handed off, continued by the next sessio
 		// About an hour: neither the running lease (10 min) nor the idle one (24 h).
 		expect(lease).toBeGreaterThan(50 * 60_000);
 		expect(lease).toBeLessThan(70 * 60_000);
+		expect(await handoffsUnder(task.id)).toHaveLength(1);
+	});
+
+	test("Continue carries no text and is a person's all the same: the task stays for the hour", async () => {
+		const alice = await person("alice");
+		const p = await project(alice);
+		const task = await taskIn(p.space.id, alice);
+		const { body } = await open(alice, task);
+		const id = body.narratorId;
+		await idle(id, 1);
+		expect(await stateOf(task.id)).toMatchObject({ status: "todo", holder: null, epoch: 1 });
+		const takeUp = async () => {
+			if ((await stateOf(task.id)).holder === id) return;
+			await asSession(p.space.id, id, alice, [
+				{ op: "setTask", block: { id: task.id }, task: { status: "doing" } },
+			]);
+		};
+		const hourFrom = async (before: number) => {
+			const [claim] = await outlineStore.getTaskClaims([task.id]);
+			const lease = Date.parse(claim?.expiresAt as string) - before;
+			expect(lease).toBeGreaterThan(50 * 60_000);
+			expect(lease).toBeLessThan(70 * 60_000);
+		};
+		/** What only this run's own start decides: nothing remembered of earlier runs. */
+		const forget = () => {
+			resetOutlinePersonRunEndsForTests();
+			resetOutlineGraceLeasesForTests();
+		};
+
+		onTurn = takeUp;
+		forget();
+		const before = Date.now();
+		expect((await continueNarrator(id, "en", false, alice)).ok).toBe(true);
+		await idle(id, 2);
+		expect(await stateOf(task.id)).toMatchObject({ status: "doing", holder: id, epoch: 2 });
+		await hourFrom(before);
+
 		expect(await handoffsUnder(task.id)).toHaveLength(1);
 	});
 

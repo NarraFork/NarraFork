@@ -488,9 +488,178 @@ describe("outline task leases", () => {
 		await outlineRunEndsSettled(h.session.narratorId);
 		expect(settled).toHaveBeenCalledTimes(1);
 		expect(settled.mock.calls[0]?.[0]).toBe(h.session.narratorId);
-		expect(typeof settled.mock.calls[0]?.[1].natural).toBe("boolean");
+		// Nothing said who started it: a person's run, which gives nothing back at once.
+		expect(settled.mock.calls[0]?.[1]).toMatchObject({ natural: false, person: true });
 		renew.mockRestore();
 		settled.mockRestore();
+	});
+	/**
+	 * How the run's end is told to the release (outline P2 PR 10c-2): `natural` (only then are the
+	 * session's unfinished team tasks given back at once) and `person`, by who started the run and
+	 * how it ended. Each case runs the real loop and reads what `release.ts` was handed.
+	 */
+	describe("what the release is told of a run's end", () => {
+		type Script = Parameters<typeof fixture>[1];
+		async function endOf(
+			script: Script,
+			options: {
+				by?: "person" | "system";
+				text?: string;
+				forTaskId?: string;
+				during?: (h: ReturnType<typeof fixture>, run: Promise<unknown>) => Promise<void>;
+			} = {},
+		) {
+			const release = await import("../outline/release");
+			const { outlineRunEndsSettled, resetOutlinePersonRunEndsForTests } = await import(
+				"../outline/lease-keeper"
+			);
+			resetOutlinePersonRunEndsForTests();
+			const settled = spyOn(release, "settleOutlineTaskClaimsAtRunEnd").mockResolvedValue({
+				kept: 0,
+				grace: 0,
+				released: 0,
+			});
+			const enabled = settings.outline.enabled;
+			settings.outline.enabled = true;
+			const h = fixture(profiles[0], script);
+			// What the entry point says (`runAgentLoop`): taken by the run when it starts.
+			if (options.by) h.session._runInitiatedBy = options.by;
+			if (options.forTaskId) h.session._runForTaskId = options.forTaskId;
+			try {
+				const run = h.run(options.text ?? "");
+				if (options.during) await options.during(h, run);
+				await run;
+				await outlineRunEndsSettled(h.session.narratorId);
+				expect(settled).toHaveBeenCalledTimes(1);
+				expect(settled.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+				// Taken, not left for the next run.
+				expect(h.session._runInitiatedBy).toBeUndefined();
+				expect(h.session._runForTaskId).toBeUndefined();
+				return settled.mock.calls[0]?.[1];
+			} finally {
+				settings.outline.enabled = enabled;
+				settled.mockRestore();
+			}
+		}
+
+		test("a person's message: not natural, a person's", async () => {
+			expect(await endOf([finished], { by: "person", text: "do this" })).toMatchObject({
+				natural: false,
+				person: true,
+			});
+		});
+
+		test("a person's Continue or Retry carries no text and is still a person's", async () => {
+			expect(await endOf([finished], { by: "person", text: "" })).toMatchObject({
+				natural: false,
+				person: true,
+			});
+		});
+
+		test("a system run that ends by itself: natural, with the task it was started for and its last reply", async () => {
+			expect(await endOf([finished], { by: "system", forTaskId: "task-1" })).toEqual({
+				natural: true,
+				person: false,
+				reply: "finished",
+				forTaskId: "task-1",
+			});
+		});
+
+		test("a system run with text (a wake that carries its content) is still the system's", async () => {
+			expect(await endOf([finished], { by: "system", text: "a notice" })).toMatchObject({
+				natural: true,
+				person: false,
+			});
+		});
+
+		test("a system run a person's queued message joined: a person's", async () => {
+			const end = await endOf([finished, finished], {
+				by: "system",
+				during: async (h) => {
+					setRunHold(h.session.narratorId, { released: false });
+					const deadline = Date.now() + 3_000;
+					while (!h.runControl.wake) {
+						if (Date.now() > deadline) throw new Error("Held run never parked");
+						await new Promise((resolve) => setTimeout(resolve, 2));
+					}
+					const { enqueueBufferedMessage } = await import("../narrator-buffer");
+					expect((await enqueueBufferedMessage(h.session.narratorId, "one more thing")).ok).toBe(
+						true,
+					);
+					setRunHold(h.session.narratorId, { released: true });
+					h.runControl.wake?.("input");
+				},
+			});
+			expect(end).toMatchObject({ natural: false, person: true });
+		});
+
+		test("a system run that was stopped: not natural", async () => {
+			let session: ActiveNarrator | undefined;
+			const end = await endOf(
+				[
+					async () => {
+						session?.abortController.abort();
+						return { ...finished, aborted: true, completedNaturally: false };
+					},
+				],
+				{
+					by: "system",
+					during: async (h) => {
+						session = h.session;
+					},
+				},
+			);
+			expect(end).toMatchObject({ natural: false, person: false });
+		});
+
+		test("a system run that failed: not natural", async () => {
+			const end = await endOf(
+				[
+					{
+						...finished,
+						completedNaturally: false,
+						paymentRequired: { message: "fixture balance exhausted", resumeAction: "retry" },
+					},
+				],
+				{ by: "system" },
+			);
+			expect(end).toMatchObject({ natural: false, person: false });
+		});
+
+		test("a system run that ends while something still works for the session in the background: not natural", async () => {
+			const { backgroundTaskService } = await import("../background-task-service");
+			const busy = spyOn(backgroundTaskService, "countActiveKindsByParent").mockResolvedValue({
+				activeCount: 1,
+				activeWorkCount: 1,
+				activeServiceCount: 0,
+			});
+			try {
+				expect(await endOf([finished], { by: "system" })).toMatchObject({
+					natural: false,
+					person: false,
+				});
+			} finally {
+				busy.mockRestore();
+			}
+		});
+
+		for (const kind of ["agent_message", "task_notice", "user_input"] as const)
+			test(`a system run that ends with a ${kind} waiting to start the next: not natural`, async () => {
+				const inbox = await import("../agent-runtime/inbox");
+				const real = inbox.hasInboxKind;
+				// Only the run end's own question (all three kinds) is answered here.
+				const waiting = spyOn(inbox, "hasInboxKind").mockImplementation(async (id, kinds) =>
+					kinds.length === 3 ? kinds.includes(kind) : real(id, kinds),
+				);
+				try {
+					expect(await endOf([finished], { by: "system" })).toMatchObject({
+						natural: false,
+						person: false,
+					});
+				} finally {
+					waiting.mockRestore();
+				}
+			});
 	});
 });
 
