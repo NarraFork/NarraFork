@@ -79,6 +79,7 @@ import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import type { DelegatedTaskRegistration } from "@server/lib/validators/runtime-registration";
 import { blockTitle, parseAddress, TASK_BOX, type TaskStatus } from "@shared/outline";
+import { isOutlineReportBlockId, OUTLINE_REPORT_ID_PREFIX } from "@shared/outline-report-line";
 import {
 	OUTLINE_REPORT_NOTE_HEAD_RE,
 	OUTLINE_REPORT_NOTE_WINDOW,
@@ -109,6 +110,7 @@ import { linkTitles } from "./link-display";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import type { OutlineAskJson, OutlineTaskJson } from "./model";
 import { loadBodies, loadBodiesWithin, readSubtree } from "./read";
+import { OUTLINE_REPORT_ACTOR } from "./report-authors";
 import { OUTLINE_REPORT_LIMITS, type ReportBlock, type ReportConversion } from "./report-text";
 import { outlineStore } from "./store";
 import type { OutlineBlockRow, OutlineStore, OutlineTaskClaimRow } from "./store/port";
@@ -125,7 +127,7 @@ import { type OutlineOp, writeOutline } from "./write";
 /** The system actor of the commit that hands a task to a subagent. */
 export const OUTLINE_DELEGATION_ACTOR = "outline-delegate";
 /** The system actor of the commit that attaches a subagent's report under its task. */
-export const OUTLINE_REPORT_ACTOR = "outline-report";
+export { OUTLINE_REPORT_ACTOR };
 
 export const OUTLINE_DELEGATION_LIMITS = {
 	/** UTF-8 bytes of the instructions written from the task tree (the caller's prompt aside). */
@@ -145,7 +147,7 @@ export const OUTLINE_DELEGATION_LIMITS = {
 } as const;
 
 /** Ids of report containers start with this, then a hash of (subagent, logical run). */
-const REPORT_ID_PREFIX = "dlrp";
+const REPORT_ID_PREFIX = OUTLINE_REPORT_ID_PREFIX;
 
 /** The container block of a subagent's report for one logical run: the same on every retry. */
 export function reportBlockId(subagentId: string, logicalRunId: string): string {
@@ -157,7 +159,7 @@ export function reportBlockId(subagentId: string, logicalRunId: string): string 
 
 /** Whether a block is a report container (`reportBlockId`). */
 export function isReportBlockId(id: string): boolean {
-	return id.length === REPORT_ID_PREFIX.length + 28 && id.startsWith(REPORT_ID_PREFIX);
+	return isOutlineReportBlockId(id);
 }
 
 /** A refusal of `Agent({ task })`, or of the delegation's commit: the message is the agent's. */

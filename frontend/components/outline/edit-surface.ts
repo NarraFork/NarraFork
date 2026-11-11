@@ -31,6 +31,7 @@
  * editors and the map's stage.
  */
 import type { OutlineMapLayout } from "@shared/outline-api";
+import { type FoldAction, type FoldTree, foldPageControl } from "@shared/outline-fold";
 import { getTypographyRevision, onTypographyChange } from "@shared/pretext-layout/typography";
 import type { Command } from "prosemirror-state";
 import { ensureTypographyCssVars } from "../../lib/typography-css-vars";
@@ -107,6 +108,10 @@ export interface EditSurfaceOptions {
 	onHiddenChange?: (count: number) => void;
 	/** Measure the map's nodes ahead in a Worker (default on). */
 	premeasure?: boolean;
+	/** The reader asked for the unanswered questions a closed row hid (they are on screen now). */
+	onOpenQuestions?: (ids: string[], under: string | null) => void;
+	/** What the page's folding control offers now (see `EditSurface.pageFold`), when it changes. */
+	onPageFold?: (state: "expand" | "collapse" | null) => void;
 }
 
 export class EditSurface {
@@ -181,6 +186,11 @@ export class EditSurface {
 				focusBlock: (id) => this.focusBlock(id),
 				focusUp: () => this.focusUp(),
 				toggleCollapse: (id) => this.toggleCollapse(id),
+				openBlock: (id) => this.openBlock(id),
+				foldMarks: () => ({ marks: this.marks, known: this.marksKnown }),
+				toggleSubtree: (id, open) => {
+					this.foldAct({ kind: "subtree", id, open });
+				},
 				surfaceKeys: () => this.surfaceKeys(),
 				restoreSel: (sel) => this.restoreSel(sel),
 				onSelect: (id) => this.onMapSelect(id),
@@ -390,9 +400,15 @@ export class EditSurface {
 	/** Locks and pending changes of the page's blocks (shown on both outline views). */
 	private marks: ReadonlyMap<string, BlockMark> = new Map();
 
-	setMarks(marks: ReadonlyMap<string, BlockMark>): void {
+	private marksKnown = false;
+
+	/** `known`: the page's summary arrived (see `OutlineView.setMarks`). */
+	setMarks(marks: ReadonlyMap<string, BlockMark>, known = true): void {
 		this.marks = marks;
-		for (const v of this.outlines()) v.setMarks(marks);
+		this.marksKnown = known;
+		for (const v of this.outlines()) v.setMarks(marks, known);
+		// The map folds by the unanswered questions too.
+		this.map.schedule();
 	}
 
 	setLens(lens: OutlineLens): void {
@@ -441,15 +457,16 @@ export class EditSurface {
 	private makeView(rootId: string, host: HTMLElement): OutlineView {
 		const v: OutlineView = new OutlineView(this.client, { kind: "focus", rootId }, host, {
 			lens: this.lens,
-			collapsed: this.state.collapsed,
+			fold: this.state,
 			keys: this.surfaceKeys(),
 			resolveMention: this.opts.resolveMention,
 			onBullet: (id) => this.focusBlock(id),
 			onCollapse: () => {
 				// Folding is shared: the other outline view and the map follow.
-				for (const o of this.outlines()) if (o !== v) o.sync();
+				for (const o of this.outlines()) if (o !== v) o.foldChanged();
 				this.map.schedule();
 				this.state.noteCollapsed();
+				this.reportFold();
 			},
 			onSelect: (blockId) => {
 				if (this.restoring || this.state.view !== "outline") return;
@@ -463,9 +480,10 @@ export class EditSurface {
 			},
 			onRefused: this.opts.onRefused,
 			restoreSel: (sel) => this.restoreSel(sel),
+			onQuestions: (ids, under) => this.opts.onOpenQuestions?.(ids, under),
 		});
 		v.noScroll = this.state.view === "map";
-		if (this.marks.size > 0) v.setMarks(this.marks);
+		if (this.marks.size > 0 || this.marksKnown) v.setMarks(this.marks, this.marksKnown);
 		return v;
 	}
 
@@ -588,14 +606,26 @@ export class EditSurface {
 		}
 		this.map.schedule();
 		this.reportHidden();
+		this.reportFold();
 	}
 
 	/** The stored folding and direction arrived: every view follows. */
 	private onStored(): void {
-		for (const v of this.outlines()) v.sync();
+		for (const v of this.outlines()) v.foldChanged();
 		this.map.schedule();
 		if (this.state.view === "map") this.map.flush();
 		this.renderAttrs();
+		this.reportFold();
+	}
+
+	/**
+	 * Words the frames draw changed without the page changing (the language, who wrote a
+	 * report): the outline's report lines are worked out again and the map lays out again.
+	 */
+	refreshChrome(): void {
+		if (this.destroyed) return;
+		for (const v of this.outlines()) v.refreshDecorations();
+		this.map.schedule();
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1046,52 +1076,81 @@ export class EditSurface {
 	// Folding
 	// ─────────────────────────────────────────────────────────────────────────
 
-	toggleCollapse(id: string): void {
-		const c = this.state.collapsed;
-		if (c.has(id)) c.delete(id);
-		else c.add(id);
-		this.applyCollapse();
+	/**
+	 * The tree the view on screen folds (`@shared/outline-fold`), as its last projection worked
+	 * it out: the outline's, or the map's while the outline behind it is not built.
+	 */
+	private foldTree(): FoldTree | null {
+		const outline = this.focusView ?? this.pageView;
+		if (this.state.view === "map" || !outline)
+			return this.map.foldTree ?? outline?.foldTree ?? null;
+		return outline.foldTree;
 	}
 
-	/** Blocks under the focused one (not itself) with their level (its children are level 1). */
-	private subtree(): Array<{ id: string; depth: number; kids: number }> {
-		const v = this.client.visible;
-		const root = this.state.focus;
-		const out: Array<{ id: string; depth: number; kids: number }> = [];
-		const stack: Array<{ id: string; depth: number }> = [{ id: root, depth: 0 }];
-		while (stack.length) {
-			const { id, depth } = stack.pop() as { id: string; depth: number };
-			const kids = v.children(id);
-			if (id !== root) out.push({ id, depth, kids: kids.length });
-			for (const k of kids) stack.push({ id: k, depth: depth + 1 });
-		}
-		return out;
+	/** The reader folds (the map, the toolbar, the keyboard): every view follows. */
+	foldAct(action: FoldAction): boolean {
+		if (this.destroyed) return false;
+		const tree = this.foldTree();
+		if (!tree || !this.state.fold(tree, action, true)) return false;
+		this.applyCollapse();
+		return true;
+	}
+
+	toggleCollapse(id: string): void {
+		this.foldAct({ kind: "node", id });
+	}
+
+	/** Make sure a block shows its children (a child is about to be added or dropped into it). */
+	openBlock(id: string): void {
+		this.foldAct({ kind: "node", id, open: true });
+	}
+
+	/**
+	 * What the page's control offers: 「全部展开」 while something under the focused block is
+	 * closed, 「全部收起」 (back to the default view) when all of it is open; null: neither.
+	 */
+	pageFold(): "expand" | "collapse" | null {
+		const tree = this.foldTree();
+		return tree ? foldPageControl(tree, this.state) : null;
+	}
+
+	/** The page's control: everything open, or the default view again. */
+	foldAll(open: boolean): void {
+		this.foldAct({ kind: "all", open });
+	}
+
+	private lastPageFold: "expand" | "collapse" | null | undefined;
+
+	/** Tell the host when what the page's control offers changed. */
+	private reportFold(): void {
+		if (!this.opts.onPageFold) return;
+		const now = this.pageFold();
+		if (now === this.lastPageFold) return;
+		this.lastPageFold = now;
+		this.opts.onPageFold(now);
 	}
 
 	private applyCollapse(): void {
-		for (const v of this.outlines()) v.sync();
+		for (const v of this.outlines()) v.foldChanged();
 		this.map.schedule();
 		if (this.state.view === "map") this.map.flush();
 		this.state.noteCollapsed();
+		this.reportFold();
 	}
 
+	/** Mod-ArrowUp: every block with children closed. */
 	collapseAll(): void {
-		for (const b of this.subtree()) if (b.kids) this.state.collapsed.add(b.id);
-		this.applyCollapse();
+		this.foldAct({ kind: "closeAll" });
 	}
 
+	/** Mod-ArrowDown: everything open. */
 	expandAll(): void {
-		for (const b of this.subtree()) this.state.collapsed.delete(b.id);
-		this.applyCollapse();
+		this.foldAct({ kind: "all", open: true });
 	}
 
 	/** Alt+N: open down to level N (level N and deeper folded). */
 	expandToLevel(n: number): void {
-		for (const b of this.subtree()) {
-			if (b.kids && b.depth >= n) this.state.collapsed.add(b.id);
-			else this.state.collapsed.delete(b.id);
-		}
-		this.applyCollapse();
+		this.foldAct({ kind: "level", level: n });
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -1146,6 +1205,7 @@ export class EditSurface {
 		else this.zoomOutline(prev, id, animate, t0, takeFocus);
 		noteFocusVisit(id);
 		st.emit("focus");
+		this.reportFold();
 		if (opts.notify !== false) {
 			const told = { id, sent: false };
 			this.echo.push(told);
