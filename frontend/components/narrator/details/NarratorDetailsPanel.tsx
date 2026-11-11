@@ -28,7 +28,6 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { formatTurnRange, parseTurnRange } from "@shared/export-turn-range";
 import { isSubagentModelInheritance } from "@shared/model-inheritance";
 import { formatTokensPerSecond } from "@shared/pretext-layout/turn-usage";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
@@ -586,6 +585,11 @@ function NarratorDetailsContent({
 	const [exportFullHistory, setExportFullHistory] = useState(false);
 	// 空串 = 不限制，导出当前 scope 的全部消息。
 	const [exportRange, setExportRange] = useState("");
+	// 轮号随 scope 重排：切换完整历史后，旧范围会指到别的轮次上，直接清掉。
+	const changeExportFullHistory = (next: boolean) => {
+		setExportFullHistory(next);
+		setExportRange("");
+	};
 	const [rangePickerOpen, setRangePickerOpen] = useState(false);
 	const [exporting, setExporting] = useState(false);
 
@@ -1847,7 +1851,7 @@ function NarratorDetailsContent({
 								label={t("details.exportFullHistory")}
 								description={t("details.exportFullHistoryDescription")}
 								checked={exportFullHistory}
-								onChange={(event) => setExportFullHistory(event.currentTarget.checked)}
+								onChange={(event) => changeExportFullHistory(event.currentTarget.checked)}
 								disabled={exporting}
 							/>
 							<Group align="flex-end" gap="xs" wrap="nowrap">
@@ -1885,9 +1889,14 @@ function NarratorDetailsContent({
 					opened={rangePickerOpen}
 					onClose={() => setRangePickerOpen(false)}
 					narratorId={narratorId}
-					scope={exportFullHistory ? "full" : "visible"}
-					initialRanges={parseTurnRange(exportRange) ?? []}
-					onConfirm={(ranges) => setExportRange(formatTurnRange(ranges))}
+					format={exportFormat === "json" ? "json" : "markdown"}
+					onFormatChange={setExportFormat}
+					includeToolIO={exportIncludeToolIO}
+					onIncludeToolIOChange={setExportIncludeToolIO}
+					fullHistory={exportFullHistory}
+					onFullHistoryChange={changeExportFullHistory}
+					range={exportRange}
+					onRangeChange={setExportRange}
 				/>
 
 				<DetailsPanelSection

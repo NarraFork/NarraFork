@@ -1936,7 +1936,7 @@
 	"details.exportRangeTruncated": "轮次过多，这里只列出前 2000 轮",
 	"details.exportRangeExpand": "展开叙述者回复",
 	"details.exportRangeCollapse": "收起叙述者回复",
-	"details.exportRangeApply": "确定",
+	"details.exportRangeDone": "完成",
 	"details.exportRangeNoUserMessage": "（没有用户消息）",
 	"details.exportAction": "导出",
 	"details.exportDoneTitle": "导出完成",

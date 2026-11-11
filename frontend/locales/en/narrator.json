@@ -1938,7 +1938,7 @@
 	"details.exportRangeTruncated": "Too many turns: only the first 2000 are listed",
 	"details.exportRangeExpand": "Show the assistant reply",
 	"details.exportRangeCollapse": "Hide the assistant reply",
-	"details.exportRangeApply": "Apply",
+	"details.exportRangeDone": "Done",
 	"details.exportRangeNoUserMessage": "(no user message)",
 	"details.exportAction": "Export",
 	"details.exportDoneTitle": "Export ready",

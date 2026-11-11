@@ -431,6 +431,8 @@ async function loadRefPage(
 	cursor: { seq: number; refId: string } | null,
 	latestCompactSeq: number | null,
 	ownPlacement: OwnTurnPlacement,
+	/** Rows per query; callers that only need a summary may read wider pages. */
+	pageSize: number = EXPORT_PAGE_REFS,
 ): Promise<ExportRefRow[]> {
 	const conditions = [scopeClause];
 	if (cursor) {
@@ -456,7 +458,7 @@ async function loadRefPage(
 		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 		.where(and(...conditions))
 		.orderBy(narratorMessageRefs.seq, narratorMessageRefs.id)
-		.limit(EXPORT_PAGE_REFS);
+		.limit(pageSize);
 
 	return rows.map((row) => ({
 		refId: row.refId,
@@ -527,6 +529,7 @@ export async function* iterateNarratorTranscript(
 	narratorId: string,
 	scope: TranscriptScope,
 	signal?: AbortSignal,
+	pageSize: number = EXPORT_PAGE_REFS,
 ): AsyncGenerator<TranscriptRefPage> {
 	const seenMessageIds = new Set<string>();
 	let cursor: { seq: number; refId: string } | null = null;
@@ -540,6 +543,7 @@ export async function* iterateNarratorTranscript(
 			cursor,
 			scope.latestCompactSeq,
 			scope.ownTurnPlacement,
+			pageSize,
 		);
 		if (refs.length === 0) return;
 		const lastRef = refs[refs.length - 1];
@@ -571,7 +575,7 @@ export async function* iterateNarratorTranscript(
 			});
 		}
 
-		if (refs.length < EXPORT_PAGE_REFS) return;
+		if (refs.length < pageSize) return;
 		// Hand the event loop back so a long export cannot stall other requests.
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
@@ -1652,6 +1656,12 @@ function markdownFooter(
 const TURN_PREVIEW_CHARS = 200;
 
 /**
+ * 轮次索引用大页读取：它只要摘要，单页 500 条也只回传几百字节/条，
+ * 却能把长会话的往返次数压到导出的五分之一。
+ */
+const TURN_INDEX_PAGE_REFS = 500;
+
+/**
  * 导出范围 → 轮号集合；`null` 表示不限制。
  *
  * 路由已经校验过一次，这里兜底：串坏掉或展开过大时宁可导出全部，也不要悄悄产出
@@ -1689,7 +1699,12 @@ export async function listNarratorExportTurns(
 	const turns: ExportTurnSummary[] = [];
 	let current: ExportTurnSummary | null = null;
 
-	for await (const page of iterateNarratorTranscript(narratorId, transcript)) {
+	for await (const page of iterateNarratorTranscript(
+		narratorId,
+		transcript,
+		undefined,
+		TURN_INDEX_PAGE_REFS,
+	)) {
 		if (page.refs.length === 0) continue;
 		const summaries = await loadTurnSummaries(page.refs.map((ref) => ref.messageId));
 		for (const ref of page.refs) {
