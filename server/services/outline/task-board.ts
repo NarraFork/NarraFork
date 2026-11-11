@@ -53,6 +53,7 @@
  * exception is 「新完成」: the commits of the reader's own finished tasks are read per space that
  * has one (at most the page's spaces), and not at all when none does.
  */
+import { stat } from "node:fs/promises";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import { blockTitle } from "@shared/outline";
 import type { OutlineBoardSeenRequest } from "@shared/outline-task-board";
@@ -71,6 +72,7 @@ import {
 	readProjectSessionSpacePage,
 	readSessionWriteFacts,
 } from "./access-reads";
+import { handoffBlockIdsOf, previousSessionDirectory } from "./handoff";
 import {
 	OUTLINE_BEHAVIOR_ALIAS,
 	OUTLINE_LIMITS,
@@ -344,7 +346,7 @@ interface Context {
 	 * Project spaces whose startable tasks the reader may open a new session for (outline P2
 	 * PR 10c-1): decided once per board, see `readProjectTaskBoard`.
 	 */
-	openSessionSpaces?: ReadonlySet<string>;
+	openSessionSpaces?: ReadonlyMap<string, string>;
 }
 
 /** The space of a session: its root narrator's, by id. */
@@ -421,6 +423,24 @@ async function describe(
 		if (above.length > 0)
 			for (const claim of await store.getTaskClaims(above.map((m) => m.id)))
 				claims.set(claim.taskBlockId, claim);
+	}
+	// 「有交接」: the handoffs under the open tasks of project spaces, looked up by the ids a
+	// handoff of each claim generation would have (primary keys, bounded).
+	const handoffs = new Map<string, number>();
+	if (options.open) {
+		const wanted = new Map<string, string>();
+		for (const meta of ordered) {
+			if (wanted.size >= OUTLINE_BOARD_HANDOFF_LIMITS.ids) break;
+			const epoch = claims.get(meta.id)?.epoch ?? 0;
+			if (epoch < 1 || ctx.spaces.get(meta.spaceId)?.kind !== "project") continue;
+			for (const id of handoffBlockIdsOf(meta.id, epoch)) wanted.set(id, meta.id);
+		}
+		if (wanted.size > 0)
+			for (const block of await store.getBlockMetasByIds([...wanted.keys()])) {
+				const task = wanted.get(block.id) as string;
+				if (!block.deleted && block.parentId === task)
+					handoffs.set(task, (handoffs.get(task) ?? 0) + 1);
+			}
 	}
 	const newlyDone = options.open
 		? new Set<string>()
@@ -506,6 +526,8 @@ async function describe(
 		return outlineTaskStartBlocker({ task, planning, wait }) === null;
 	};
 
+	// The directory the session before worked in, for the tasks a session can be opened for.
+	const previousDirs = new Map<string, string>();
 	const out: OutlineBoardTask[] = [];
 	for (const meta of ordered) {
 		const task = meta.taskJson;
@@ -521,6 +543,20 @@ async function describe(
 					}
 				: null;
 		const completion = completions.get(meta.id);
+		const openable = canOpenSession(meta, task, wait);
+		if (
+			openable &&
+			handoffs.has(meta.id) &&
+			previousDirs.size < OUTLINE_BOARD_HANDOFF_LIMITS.directories
+		) {
+			const previous = await previousSessionDirectory(
+				store,
+				claims.get(meta.id),
+				ctx.openSessionSpaces?.get(meta.spaceId) ?? null,
+			).catch(() => null);
+			if (previous && (await isDirectory(previous.path)))
+				previousDirs.set(meta.id, previous.relative);
+		}
 		const lock = task.lock ?? null;
 		out.push({
 			id: meta.id,
@@ -550,7 +586,9 @@ async function describe(
 				: null,
 			versionSeq: meta.versionSeq,
 			...(newlyDone.has(meta.id) ? { newlyDone: true as const } : {}),
-			...(canOpenSession(meta, task, wait) ? { openSession: true as const } : {}),
+			...(openable ? { openSession: true as const } : {}),
+			...(handoffs.has(meta.id) ? { handoffs: handoffs.get(meta.id) } : {}),
+			...(previousDirs.has(meta.id) ? { previousDirectory: previousDirs.get(meta.id) } : {}),
 		});
 	}
 	return out;
@@ -830,15 +868,31 @@ async function mayOpenTaskSessions(
 	principal: OutlinePrincipal,
 	space: OutlineSpaceRow,
 	projectId: string,
-): Promise<boolean> {
-	if (!outlineTaskSessionsAvailable()) return false;
+): Promise<string | null> {
+	if (!outlineTaskSessionsAvailable()) return null;
 	const project = await readProject(projectId);
-	if (!project) return false;
+	if (!project) return null;
 	const creates =
 		principal.isAdmin ||
 		(await projectUsersWith(project, [principal.userId], "write")).has(principal.userId);
-	if (!creates || !(await canWriteSpace(principal, space))) return false;
-	return (await outlineTaskSessionProjectDir(projectId)) !== null;
+	if (!creates || !(await canWriteSpace(principal, space))) return null;
+	return await outlineTaskSessionProjectDir(projectId);
+}
+
+/** Limits of the board's handoff marks. */
+const OUTLINE_BOARD_HANDOFF_LIMITS = {
+	/** Handoff ids looked up for one list of tasks. */
+	ids: 2000,
+	/** Tasks of one list whose previous session's directory is looked up (and checked on disk). */
+	directories: 20,
+} as const;
+
+async function isDirectory(path: string): Promise<boolean> {
+	try {
+		return (await stat(path)).isDirectory();
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -859,8 +913,8 @@ export async function readProjectTaskBoard(
 		const projectSpace = await store.findSpace({ kind: "project", projectId });
 		if (projectSpace && (await canReadSpace(principal, projectSpace))) {
 			spaces.push(projectSpace);
-			if (await mayOpenTaskSessions(principal, projectSpace, projectId))
-				ctx.openSessionSpaces = new Set([projectSpace.id]);
+			const dir = await mayOpenTaskSessions(principal, projectSpace, projectId);
+			if (dir !== null) ctx.openSessionSpaces = new Map([[projectSpace.id, dir]]);
 		}
 	}
 	const page = await readProjectSessionSpacePage(principal, projectId, {

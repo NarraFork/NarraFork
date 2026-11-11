@@ -98,7 +98,7 @@ import {
 	OutlineTaskClaimedError,
 	OutlineWriteError,
 } from "./errors";
-import { isHandoffBlockId, OUTLINE_HANDOFF_LIMITS } from "./handoff";
+import { isHandoffBlockId, OUTLINE_HANDOFF_LIMITS, previousSessionDirectory } from "./handoff";
 import { linkDisplayTitle, linkTitles } from "./link-display";
 import { oneAtATime } from "./person-tasks";
 import { loadBodies, readOutline, readSubtree } from "./read";
@@ -925,6 +925,11 @@ export async function openTaskSession(args: {
 		model?: string;
 		/** A working directory other than the project's. */
 		cwd?: string;
+		/**
+		 * The directory of the session that last held the task (`previousSessionDirectory`): the
+		 * person continues where its uncommitted work is. Refused when there is none any more.
+		 */
+		previousDirectory?: boolean;
 		/** The person's own note, added to the brief as it is. */
 		note?: string;
 	};
@@ -1007,7 +1012,10 @@ async function openOne(
 		throw new OutlineTaskSessionError(refusal, holder);
 	}
 	if (block.versionSeq !== args.baseVersionSeq) throw new OutlineTaskSessionError("changed");
-	const cwd = args.options?.cwd?.trim() || (await run.projectDir(space.projectId));
+	const projectDir = await run.projectDir(space.projectId);
+	const cwd = args.options?.previousDirectory
+		? ((await previousSessionDirectory(store, claim, projectDir).catch(() => null))?.path ?? null)
+		: args.options?.cwd?.trim() || projectDir;
 	if (!cwd || !isAbsolute(cwd) || !isDirectory(cwd))
 		throw new OutlineTaskSessionError("no_directory");
 

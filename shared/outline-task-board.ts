@@ -104,6 +104,18 @@ export interface OutlineBoardTask {
 	 * Absent otherwise (the server decides again when asked).
 	 */
 	openSession?: true;
+	/**
+	 * 「有交接 · N 次」 (outline P2 PR 10c-2): how many times a session gave this open task of a
+	 * project space back unfinished, leaving a handoff under it (at most the newest 20 claim
+	 * generations are counted). Absent: never.
+	 */
+	handoffs?: number;
+	/**
+	 * With `openSession` and a handoff: the directory of the session that last held the task, as
+	 * a path inside the project's directory, when it still exists. The form offers to open the new
+	 * session there (`previousDirectory` of the request). Absent otherwise.
+	 */
+	previousDirectory?: string;
 }
 
 export interface OutlineBoardSpace {
@@ -212,6 +224,11 @@ export interface OutlineBoardOpenSessionRequest {
 	model?: string;
 	/** A working directory other than the project's. */
 	cwd?: string;
+	/**
+	 * Open the session in the directory of the session that last held the task (the server finds
+	 * it; refused with `no_directory` when there is none any more). `cwd` is then ignored.
+	 */
+	previousDirectory?: boolean;
 	/** The person's own note, added to the session's opening brief as it is. */
 	note?: string;
 }

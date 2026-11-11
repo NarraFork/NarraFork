@@ -70,6 +70,7 @@ export interface DigestTallies {
 	tasksCreated: number;
 	tasksStarted: number;
 	leaseReturned: number;
+	handedBack: number;
 	reviewComments: number;
 	/** Spaces whose day was summarized in part. */
 	truncated: OutlineDigestSpaceView[];
@@ -117,6 +118,7 @@ export function digestModel(
 			tasksCreated: sum((s) => s.tasksCreated),
 			tasksStarted: sum((s) => s.tasksStarted),
 			leaseReturned: sum((s) => s.leaseReturned),
+			handedBack: sum((s) => s.handedBack ?? 0),
 			reviewComments: sum((s) => s.reviewComments),
 			truncated: spaces.filter((s) => s.truncated),
 		},

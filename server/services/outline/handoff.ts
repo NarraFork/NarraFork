@@ -274,6 +274,25 @@ export interface OutlineHandoffPlan {
 	noted: boolean;
 }
 
+/**
+ * The directory of the session that last held a task, when the next session may be opened in it
+ * (the board's "continue in the previous session's directory"): only a directory inside the
+ * project's own (and not that directory itself), which is all a handoff ever shows of it. Whether
+ * it still exists is the caller's check. Two reads by primary key.
+ */
+export async function previousSessionDirectory(
+	store: OutlineStore,
+	claim: OutlineTaskClaimRow | null | undefined,
+	projectDir: string | null,
+): Promise<{ path: string; relative: string } | null> {
+	const holder = claim?.lastHolderNarratorId;
+	if (!holder || !projectDir) return null;
+	const root = (await store.getNarratorRoots([holder])).get(holder)?.root ?? holder;
+	const session = (await readNarratorHandoffRows([root])).get(root);
+	const rel = directoryInProject(session?.cwd ?? null, projectDir);
+	return rel && session?.cwd ? { path: session.cwd, relative: rel } : null;
+}
+
 /** A session's directory as a path inside the project's directory, or null. */
 export function directoryInProject(cwd: string | null, projectDir: string | null): string | null {
 	if (!cwd || !projectDir || !isAbsolute(cwd) || !isAbsolute(projectDir)) return null;
