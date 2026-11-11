@@ -49,6 +49,8 @@ export interface VListLayoutResult {
 }
 
 export interface ComputeLayoutOptions {
+	/** Account display preference; absent keeps compatibility for pure/preview callers. */
+	compactAuxiliaryContent?: boolean;
 	/** Available content width (px) for each element. */
 	contentWidth: number;
 	/** Render LOD (height master switch). */
@@ -112,6 +114,7 @@ export interface ComputeLayoutOptions {
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	resolveQuestionStatus?: (toolUseId: string | undefined) => string | undefined;
 	/** First-frame layout of a live InlinePermission form (see AdapterContext). */
 	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;
 	/** Painted height of that form once mounted (see AdapterContext). */
@@ -174,6 +177,7 @@ export function computePretextVListLayout(
 	measureElement: MeasureElement,
 ): VListLayoutResult {
 	const ctx: AdapterContext = {
+		compactAuxiliaryContent: opts.compactAuxiliaryContent,
 		lod: opts.lod,
 		isExpanded: opts.isExpanded,
 		isTextExpanded: opts.isTextExpanded,
@@ -196,6 +200,7 @@ export function computePretextVListLayout(
 		canOfferProviderFix: opts.canOfferProviderFix,
 		canOfferModelTest: opts.canOfferModelTest,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
+		resolveQuestionStatus: opts.resolveQuestionStatus,
 		resolvePermissionFormPrediction: opts.resolvePermissionFormPrediction,
 		resolvePermissionFormHeight: opts.resolvePermissionFormHeight,
 		resolveLatestSpecTasksToolUseId: opts.resolveLatestSpecTasksToolUseId,

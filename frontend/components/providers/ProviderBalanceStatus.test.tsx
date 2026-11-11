@@ -26,11 +26,15 @@ function render(
 	generation: string | null = "A",
 	status: ProviderBalanceSnapshot["status"] = "supported",
 	queryState: "cached" | "loading" | "error" = "cached",
+	capabilityEnabled?: boolean,
 ) {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	client.setQueryData(["auth", "me"], { role });
 	client.setQueryData(["settings"], {
 		providerBalanceGenerations: generation ? { p: generation } : {},
+		...(capabilityEnabled === undefined
+			? {}
+			: { providerBalanceCapability: { enabled: capabilityEnabled } }),
 	});
 	client.setQueryData(providerBalanceKey("p", "A"), {
 		generation: "A",
@@ -89,4 +93,14 @@ test("noncandidate official providers show no unsupported status or operation", 
 	const html = render("admin", false, null);
 	expect(html).not.toContain("Rediscover balance");
 	expect(html).not.toContain("Balance discovery not supported");
+});
+test("a disabled capability plugin removes the row and its rediscover action", () => {
+	const html = render("admin", false, "A", "error", "cached", false);
+	// Mantine still emits its style tags around a null render, so assert on the content.
+	expect(html).not.toContain("Rediscover balance");
+	expect(html).not.toContain("Balance discovery failed");
+	expect(html).not.toContain("plugin");
+	// Enabled, and an unknown answer (older server), both keep the row.
+	expect(render("admin", false, "A", "supported", "cached", true)).toContain("Rediscover balance");
+	expect(render("admin", false, "A", "supported")).toContain("Rediscover balance");
 });

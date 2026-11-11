@@ -38,6 +38,65 @@ function message(id: string, seq: number, role: "user" | "assistant", text: stri
 	) as unknown as NarratorMsg;
 }
 
+describe("compact auxiliary layout", () => {
+	const event = rowWithElements(
+		{ ...message("background-event", 12, "assistant", ""), role: "sys", origin: "system" },
+		[
+			{
+				type: "system_injection",
+				source: "bg_bash",
+				modelText: "original model input",
+				body: {
+					kind: "tasksDone",
+					flavor: "bash",
+					items: [
+						{
+							id: "build-job",
+							title: "Build",
+							status: "completed",
+							preview: "log line\n".repeat(80),
+						},
+					],
+				},
+			},
+		],
+	) as unknown as NarratorMsg;
+	const build = (lod: 2 | 3 | 5, compact = true, open = false) =>
+		buildPretextDocumentLayout([event], {
+			layoutRevision: "auxiliary-layout",
+			documentRevision: 1,
+			lod,
+			contentWidth: 640,
+			widthBucket: "640",
+			compactAuxiliaryContent: compact,
+			isRowExpanded: () => open,
+		});
+
+	it("uses one short trace row rather than a log bubble and retains exact source ownership", () => {
+		const compact = build(2);
+		expect(compact.items[0]?.spec.kind).toBe("activity-trace");
+		expect(compact.items[0]?.measured.height).toBeLessThan(70);
+		expect(compact.manifest.items[0]?.sourceMessageIds).toEqual(["background-event"]);
+		const legacy = build(2, false);
+		expect(legacy.items[0]?.spec.kind).toBe("injection-bubble");
+		expect(legacy.items[0]?.measured.height).toBeGreaterThan(200);
+	});
+
+	it("keeps content identity across LOD and opens the same auxiliary card inside a trace", () => {
+		const folded = build(2);
+		const row = (folded.items[0]?.measured as MeasuredCollapsibleTrace).rows[0];
+		const detailed = build(5);
+		expect(detailed.items[0]?.spec.kind).toBe("auxiliary-content");
+		expect(detailed.items[0]?.spec.unitId).toBe(row?.unitId);
+		expect(detailed.manifest.items[0]?.sourceMessageIds).toEqual(["background-event"]);
+		const opened = build(2, true, true);
+		const openRow = (opened.items[0]?.measured as MeasuredCollapsibleTrace).rows[0];
+		expect(openRow?.cardKind).toBe("auxiliary-content");
+		expect(openRow?.cardMeasured?.height).toBeGreaterThan(100);
+		expect(build(3).items[0]?.measured.height).toBeLessThan(100);
+	});
+});
+
 function historyFixture(count: number): NarratorMsg[] {
 	return Array.from({ length: count }, (_, index) => {
 		if (index % 17 === 0) {

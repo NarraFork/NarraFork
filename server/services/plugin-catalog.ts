@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { formatZodError } from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
@@ -18,6 +19,29 @@ const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAX_FILES_PER_PACKAGE = 10_000;
 const READ_TIMEOUT_MS = 10_000;
 const HOST_API_VERSION = "1.0";
+
+/**
+ * Stable identity for a builtin package.
+ *
+ * A shipped package has no `<hash>` directory to quote. Deriving it from the manifest keeps the
+ * shape the rest of the host expects (`version` + 64-hex `hash`) without inventing a second
+ * identity scheme, and it changes exactly when the manifest does.
+ */
+/**
+ * The "current" pointer for a builtin plugin: whatever its single shipped package is.
+ * Builtin packages are not versioned by `current.json`, so the pointer is derived from the
+ * package that was actually read.
+ */
+function builtinCurrentPointer(
+	packages: PluginPackageSummary[],
+): CurrentPackagePointer | undefined {
+	const shipped = packages.find((item) => item.builtin);
+	return shipped ? { version: shipped.version, hash: shipped.hash } : undefined;
+}
+
+function builtinPackageHash(manifest: Manifest): string {
+	return createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+}
 
 export type PluginPackageStatus = "compatible" | "incompatible" | "corrupt" | "missing";
 export type PluginStatus = PluginPackageStatus | "installed" | "empty";
@@ -92,6 +116,8 @@ export interface PluginPackageSummary {
 	path: string;
 	status: PluginPackageStatus;
 	isCurrent: boolean;
+	/** Shipped with the application instead of installed into the package store. */
+	builtin?: boolean;
 	manifest?: PluginManifestSummary;
 	contributions: PluginContributionSummary[];
 	diagnostics: PluginDiagnostic[];
@@ -104,6 +130,8 @@ export interface PluginCatalogPlugin {
 	packages: PluginPackageSummary[];
 	contributions: PluginContributionSummary[];
 	diagnostics: PluginDiagnostic[];
+	/** Shipped with the application instead of installed into the package store. */
+	builtin?: boolean;
 }
 
 export interface PluginCatalogSnapshot {
@@ -115,6 +143,12 @@ export interface PluginCatalogSnapshot {
 
 export interface PluginCatalogOptions {
 	root?: string;
+	/**
+	 * Package directories that ship with the application. Each is read with the same package
+	 * reader as an installed package; only the directory layout differs (a builtin package is
+	 * its own manifest root rather than `<store>/<id>/<version>/<hash>`).
+	 */
+	builtinRoots?: readonly string[];
 	maxManifestBytes?: number;
 	maxFilesPerPackage?: number;
 	timeoutMs?: number;
@@ -356,6 +390,7 @@ export class PluginCatalog {
 	readonly root: string;
 	readonly packagesPath: string;
 	readonly currentPath: string;
+	readonly builtinRoots: readonly string[];
 	readonly maxManifestBytes: number;
 	readonly maxFilesPerPackage: number;
 	readonly timeoutMs: number;
@@ -365,6 +400,7 @@ export class PluginCatalog {
 		this.root = options.root ? resolve(options.root) : getNarraforkPath("plugins");
 		this.packagesPath = join(this.root, "packages");
 		this.currentPath = join(this.root, "current.json");
+		this.builtinRoots = (options.builtinRoots ?? []).map((entry) => resolve(entry));
 		this.maxManifestBytes = options.maxManifestBytes ?? MAX_MANIFEST_BYTES;
 		this.maxFilesPerPackage = options.maxFilesPerPackage ?? MAX_FILES_PER_PACKAGE;
 		this.timeoutMs = options.timeoutMs ?? READ_TIMEOUT_MS;
@@ -458,6 +494,22 @@ export class PluginCatalog {
 				),
 			]);
 		}
+		// Builtin packages ship with the application, so they are read the same way but are
+		// never recorded in `current.json` — they are always current by construction.
+		const builtinPackageIds = new Set<string>();
+		for (const builtinRoot of this.builtinRoots) {
+			const summary = await this.scanBuiltinPackage(builtinRoot);
+			if (!summary) continue;
+			packageSummaries.push(summary);
+			builtinPackageIds.add(summary.pluginId);
+			packagePluginIds.add(summary.pluginId);
+			if (summary.diagnostics.length) {
+				pluginDiagnostics.set(summary.pluginId, [
+					...(pluginDiagnostics.get(summary.pluginId) ?? []),
+					...summary.diagnostics,
+				]);
+			}
+		}
 		packageSummaries.sort(packageSort);
 
 		const pluginIds = new Set([...packagePluginIds, ...Object.keys(current.plugins)]);
@@ -465,7 +517,10 @@ export class PluginCatalog {
 			const packages = packageSummaries
 				.filter((item) => item.pluginId === pluginId)
 				.sort(packageSort);
-			const currentPointer = current.plugins[pluginId] ?? null;
+			const builtin = builtinPackageIds.has(pluginId);
+			const currentPointer: CurrentPackagePointer | null = builtin
+				? (builtinCurrentPointer(packages) ?? null)
+				: (current.plugins[pluginId] ?? null);
 			const currentPackage = currentPointer
 				? packages.find(
 						(item) => item.version === currentPointer.version && item.hash === currentPointer.hash,
@@ -479,7 +534,15 @@ export class PluginCatalog {
 			const diagnostics = [...(pluginDiagnostics.get(pluginId) ?? [])];
 			const status: PluginStatus =
 				currentPackage?.status ?? (packages.length ? "installed" : "missing");
-			return { pluginId, status, current: currentPointer, packages, contributions, diagnostics };
+			return {
+				pluginId,
+				status,
+				current: currentPointer,
+				packages,
+				contributions,
+				diagnostics,
+				builtin: builtin || undefined,
+			};
 		});
 		return {
 			generatedAt: new Date().toISOString(),
@@ -652,9 +715,11 @@ export class PluginCatalog {
 		version: string,
 		hash: string,
 		current: CurrentPackagePointer | undefined,
+		location?: { packagePath: string; resolutionRoot: string; builtin: true },
 	): Promise<PluginPackageSummary> {
-		const packagePath = join(this.packagesPath, pluginId, version, hash);
-		const isCurrent = current?.version === version && current.hash === hash;
+		const packagePath = location?.packagePath ?? join(this.packagesPath, pluginId, version, hash);
+		const resolutionRoot = location?.resolutionRoot ?? this.packagesPath;
+		const isCurrent = location ? true : current?.version === version && current.hash === hash;
 		const diagnostics: PluginDiagnostic[] = [];
 		const base: PluginPackageSummary = {
 			pluginId,
@@ -663,6 +728,7 @@ export class PluginCatalog {
 			path: packagePath,
 			status: "corrupt",
 			isCurrent,
+			builtin: location?.builtin,
 			contributions: [],
 			diagnostics,
 		};
@@ -672,7 +738,7 @@ export class PluginCatalog {
 				this.timeoutMs,
 				"package realpath",
 			);
-			if (!isInsidePath(this.packagesPath, packageRealPath)) {
+			if (!isInsidePath(resolutionRoot, packageRealPath)) {
 				diagnostics.push(
 					diagnostic(
 						"PACKAGE_PATH_ESCAPE",
@@ -806,6 +872,80 @@ export class PluginCatalog {
 			);
 			return base;
 		}
+	}
+
+	/**
+	 * Read one builtin package through the installed-package reader.
+	 *
+	 * A builtin package is its own manifest root, so its identity and version come from the
+	 * manifest rather than from a `<id>/<version>/<hash>` path. Every other rule — size caps,
+	 * JSON parsing, schema validation, entry existence, compatibility, symlink and escape
+	 * checks — is the store reader's, so a broken builtin manifest fails the same way an
+	 * installed one would.
+	 */
+	private async scanBuiltinPackage(root: string): Promise<PluginPackageSummary | undefined> {
+		let realRoot: string;
+		let manifest: Manifest;
+		try {
+			realRoot = await withTimeout(realpath(root), this.timeoutMs, "builtin realpath");
+			const manifestPath = join(realRoot, "manifest.json");
+			const manifestInfo = await withTimeout(lstat(manifestPath), this.timeoutMs, "manifest stat");
+			if (manifestInfo.isSymbolicLink() || !manifestInfo.isFile()) return undefined;
+			if (manifestInfo.size > this.maxManifestBytes) {
+				return {
+					pluginId: relative(this.builtinBase(), realRoot).split(sep).join("/"),
+					version: "0.0.0",
+					hash: "0".repeat(64),
+					path: realRoot,
+					status: "corrupt",
+					isCurrent: true,
+					builtin: true,
+					contributions: [],
+					diagnostics: [
+						diagnostic("MANIFEST_TOO_LARGE", "manifest.json exceeds the size limit", manifestPath),
+					],
+				};
+			}
+			const manifestBytes = await withTimeout(
+				readFile(manifestPath),
+				this.timeoutMs,
+				"manifest read",
+			);
+			const raw: unknown = JSON.parse(new TextDecoder().decode(manifestBytes));
+			const parsed = safeParseManifest(raw);
+			if (!parsed.success) {
+				return {
+					pluginId: relative(this.builtinBase(), realRoot).split(sep).join("/"),
+					version: "0.0.0",
+					hash: "0".repeat(64),
+					path: realRoot,
+					status: "corrupt",
+					isCurrent: true,
+					builtin: true,
+					contributions: [],
+					diagnostics: [diagnostic("MANIFEST_INVALID", formatZodError(parsed.error), manifestPath)],
+				};
+			}
+			manifest = parsed.data;
+		} catch {
+			return undefined;
+		}
+		return this.scanPackage(
+			manifest.pluginId,
+			manifest.version,
+			builtinPackageHash(manifest),
+			undefined,
+			{
+				packagePath: realRoot,
+				resolutionRoot: realRoot,
+				builtin: true,
+			},
+		);
+	}
+
+	/** Parent directory the builtin roots live in, used only to name an unreadable package. */
+	private builtinBase(): string {
+		return this.builtinRoots.length > 0 ? dirname(this.builtinRoots[0] as string) : this.root;
 	}
 
 	private async inspectPackageEntries(

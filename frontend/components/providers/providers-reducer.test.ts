@@ -314,4 +314,35 @@ describe("平台 provider 的开关走草稿", () => {
 		}
 		expect(isPlatformProviderPrefix("custom-api")).toBe(false);
 	});
+
+	/**
+	 * The custom-provider state is built by an explicit field list, so anything missing there is
+	 * dropped on every rebuild. A dropped value makes the site-quota inputs behave like they are
+	 * read-only: the keystroke lands in state, then the next rebuild erases it.
+	 */
+	test("site quota fields survive the settings→state mapping and a server re-sync", () => {
+		const site = {
+			...provider,
+			protocol: "completions-compatible" as const,
+			quotaSiteUrl: "https://api.example.com",
+			quotaAccessToken: "********wxyz",
+			quotaUserId: "12345",
+		};
+		const settings = { customApiProviders: [site], agent: {} };
+
+		const mapped = providersStateFromSettings(settings).customApiProviders[0];
+		expect(mapped?.quotaSiteUrl).toBe("https://api.example.com");
+		expect(mapped?.quotaAccessToken).toBe("********wxyz");
+		expect(mapped?.quotaUserId).toBe("12345");
+
+		// A server re-sync rebuilds the whole list through the same normalizer, which is what
+		// used to erase a value the operator had just typed.
+		const resynced = providersReducer(providersStateFromSettings(settings), {
+			type: "SYNC_FROM_SETTINGS",
+			settings,
+		}).customApiProviders[0];
+		expect(resynced?.quotaSiteUrl).toBe("https://api.example.com");
+		expect(resynced?.quotaAccessToken).toBe("********wxyz");
+		expect(resynced?.quotaUserId).toBe("12345");
+	});
 });

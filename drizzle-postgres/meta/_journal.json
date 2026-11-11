@@ -484,6 +484,13 @@
 			"when": 1794325379040,
 			"tag": "0068_narrator_status_and_list_indexes",
 			"breakpoints": true
+		},
+		{
+			"idx": 69,
+			"version": "7",
+			"when": 1794332183087,
+			"tag": "0069_compact_auxiliary_content",
+			"breakpoints": true
 		}
   ]
 }

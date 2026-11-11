@@ -52,6 +52,7 @@ import {
 	type DiffSourcePoint,
 	MAX_DIFF_INPUT_CHARS,
 } from "./diff-core";
+import type { InjectionTarget } from "./injection-target";
 import {
 	isOutlineDecisionCall,
 	OUTLINE_CARD_LABEL_FALLBACKS,
@@ -465,6 +466,8 @@ export interface ToolStructuredEntry {
 	title: string;
 	/** External link for the title (render layer draws an <a>). Height-neutral. */
 	href?: string;
+	/** In-app destination; the host decides whether it can open it. */
+	target?: InjectionTarget;
 	/** Secondary info shown after/below the title (domain / time / seq). */
 	meta?: string;
 	/** Body excerpt (wraps, clamped to a fixed number of lines). */

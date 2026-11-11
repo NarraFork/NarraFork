@@ -1879,6 +1879,9 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
+		// The built-in apikey-quota plugin's process is owned by the shared plugin runtime
+		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
+		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}

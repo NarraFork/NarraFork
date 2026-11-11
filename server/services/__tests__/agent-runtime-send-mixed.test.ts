@@ -174,6 +174,41 @@ test("foreground child sends parent+sibling in one call, all durable, parent own
 	).toBe(true);
 });
 
+test.each([
+	undefined,
+	false,
+	true,
+])("display intent %s survives parent+sibling fanout without changing receipts", async (showToUser) => {
+	const request = { ...input(), ...(showToUser === undefined ? {} : { showToUser }) };
+	const result = await sendSubagentMessageDetailed(request);
+	expect(result.targets.map((target) => [target.id, target.status])).toEqual([
+		["parent-root", "queued"],
+		["sibling-a", "queued"],
+	]);
+	for (const id of ["parent-root", "sibling-a"]) {
+		const [saved] = await inbox.listInboxRows(id, ["agent_message"]);
+		expect(JSON.parse(saved.metadataJson ?? "{}").delivery.showToUser).toBe(showToUser ?? false);
+		expect(inbox.inboxDelivery(saved).showToUser).toBe(showToUser ?? false);
+		expect(inbox.inboxDelivery(saved).text).toBe(request.message);
+		expect(result.targets.find((target) => target.id === id)).not.toHaveProperty("showToUser");
+	}
+});
+
+test.each([
+	undefined,
+	false,
+	true,
+])("display intent %s survives primary-to-child delivery", async (showToUser) => {
+	const request = {
+		...input("parent-root", ["sibling-a"]),
+		...(showToUser === undefined ? {} : { showToUser }),
+	};
+	const result = await sendSubagentMessageDetailed(request);
+	const [saved] = await inbox.listInboxRows("sibling-a", ["agent_message"]);
+	expect(inbox.inboxDelivery(saved).showToUser).toBe(showToUser ?? false);
+	expect(result.targets[0]).toMatchObject({ id: "sibling-a", status: "queued", revision: 1 });
+});
+
 test("parent/main/id and sibling alias/title/id deduplicate by actual recipient", async () => {
 	const result = await sendSubagentMessageDetailed(
 		input("sender-child", ["parent", "main", "parent-root", "alpha", "Alpha analyst", "sibling-a"]),
