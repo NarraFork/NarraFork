@@ -4,6 +4,8 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { parse } from "@babel/parser";
+import { compiledBuildArguments } from "../../scripts/lib/compiled-build";
 import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 
 const execFileAsync = promisify(execFile);
@@ -12,32 +14,55 @@ const manifestEntry = "./server/services/revert-transaction-manifest-worker.ts";
 const mainEntry = "./server/index.ts";
 const maxBuffer = 1024 * 1024;
 
-/** The production compile command spreads the shared worker registry, not a local path list. */
+/** Read the real compile call structurally: nested arrays must not truncate its argument list. */
 async function productionCompileArguments(): Promise<string[]> {
 	const source = await readFile(join(root, "scripts/build-cross-platform.ts"), "utf8");
-	const command = source.match(/const compile = await runBuildStep\(\s*\[([\s\S]*?)\]\s*,?\s*\)/);
-	if (!command) throw new Error("Production Bun compile argument array was not found");
-	const withoutComments = command[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
-	expect(withoutComments).toMatch(/^\s*process\.execPath\s*,/);
-	expect(withoutComments).toContain('"./server/index.ts"');
-	expect(withoutComments).toContain("...compiledWorkerBuildEntrypoints()");
+	const ast = parse(source, { sourceType: "module", plugins: ["typescript"] });
+	const declaration = ast.program.body
+		.flatMap((node) =>
+			node.type === "ForOfStatement" && node.body.type === "BlockStatement" ? node.body.body : [],
+		)
+		.flatMap((node) => (node.type === "VariableDeclaration" ? node.declarations : []))
+		.find((node) => node.id.type === "Identifier" && node.id.name === "compile");
+	const call =
+		declaration?.init?.type === "AwaitExpression" ? declaration.init.argument : undefined;
+	if (
+		call?.type !== "CallExpression" ||
+		call.callee.type !== "Identifier" ||
+		call.callee.name !== "runBuildStep"
+	)
+		throw new Error("Production Bun compile call was not found");
+	const command = call.arguments[0];
+	if (command?.type !== "ArrayExpression")
+		throw new Error("Production compile arguments must be an array");
+	expect(command.elements[0]).toMatchObject({
+		type: "MemberExpression",
+		object: { name: "process" },
+		property: { name: "execPath" },
+	});
+	expect(command.elements[1]).toMatchObject({ type: "StringLiteral", value: "build" });
+	expect(command.elements[2]).toMatchObject({ type: "StringLiteral", value: mainEntry });
+	const spreadCalls = command.elements.flatMap((node) =>
+		node?.type === "SpreadElement" &&
+		node.argument.type === "CallExpression" &&
+		node.argument.callee.type === "Identifier"
+			? [node.argument.callee.name]
+			: [],
+	);
+	expect(spreadCalls).toContain("compiledWorkerBuildEntrypoints");
+	expect(spreadCalls).toContain("compiledBuildArguments");
 	const { stdout } = await execFileAsync(
 		process.execPath,
 		["--eval", "process.stdout.write(Bun.version)"],
-		{
-			timeout: 10_000,
-			maxBuffer: 1024,
-		},
+		{ timeout: 10_000, maxBuffer: 1024 },
 	);
 	expect(stdout).toBe(Bun.version);
-	const literals = [...withoutComments.matchAll(/"([^"\r\n]+)"/g)].map((match) => match[1]);
-	const index = literals.indexOf("./server/index.ts");
-	const compileFlag = literals.indexOf("--compile");
 	return [
 		process.execPath,
-		...literals.slice(0, index + 1),
+		"build",
+		mainEntry,
 		...compiledWorkerBuildEntrypoints(),
-		...literals.slice(compileFlag),
+		...compiledBuildArguments(),
 	];
 }
 
@@ -160,10 +185,7 @@ describe("revert manifest worker in a real compiled executable", () => {
 						),
 						"--root",
 						join(root, "server"),
-						"--compile",
-						"--minify",
-						"--asset-naming=[dir]/[name].[ext]",
-						"--external=electron",
+						...compiledBuildArguments(),
 						"--outfile",
 						binary,
 					],
