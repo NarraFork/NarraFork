@@ -253,6 +253,39 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 	// Asked once per process from here on, whatever happens: a failed import is not retried on
 	// every run (the behavior view shows the fence text that stayed behind instead).
 	nothingToImport.add(narratorId);
+	if ((await importBehaviorFenceText(narratorId, locale, fence.own)) === "nothing")
+		return "nothing";
+
+	// The page holds the text now; the fence keeps only the plugin's channel. It is read again
+	// right before the write so a plugin SOP update that landed during the import is kept. The
+	// fence's own text is compared without whitespace: the plugin's update rejoins the text
+	// around an SOP in the middle of the fence without the blank line it had, and that must not
+	// leave the moved text behind to be imported again (glued) after a restart. Own text that
+	// really changed meanwhile is left alone (the view shows it, a later run imports it).
+	const current = await readOldBehaviorFence(narratorId);
+	if (squeezed(current.own) !== squeezed(fence.own)) return "imported";
+	await writeSpecFile(narratorId, BEHAVIOR_FENCE_URI, current.sopSections, {
+		actor: "system",
+		createdBy: "system",
+		pluginSop: true,
+	});
+	return "imported";
+}
+
+/**
+ * Write a fence's own text `own` (everything but the plugin's SOP) onto the session's behavior
+ * page, as described in the module header; the fence itself is neither read nor rewritten. What
+ * the import of a whole Dynamic Spec session calls before it moves the session to the outline
+ * (outline P2 PR 12b, which reads the fence through its own port): the short ids follow from the
+ * text, so the session's first run as an outline session finds the text there and only empties
+ * the fence. Rejects when a commit fails (what was not written is kept for the behavior view).
+ */
+export async function importBehaviorFenceText(
+	narratorId: string,
+	locale: Locale,
+	own: string,
+): Promise<"imported" | "nothing"> {
+	const fence = { own };
 	leftovers.delete(narratorId);
 	if (!fence.own) return "nothing";
 	const [parsed] = await processEditText({
@@ -421,20 +454,6 @@ async function runImport(narratorId: string, locale: Locale): Promise<OutlineBeh
 	// not show the moved text a second time. (The commits marked the cached views stale; when
 	// none landed, nothing reached the page and the leftover is the fence's whole text.)
 	leftovers.set(narratorId, { own: fence.own, text: "" });
-
-	// The page holds the text now; the fence keeps only the plugin's channel. It is read again
-	// right before the write so a plugin SOP update that landed during the import is kept. The
-	// fence's own text is compared without whitespace: the plugin's update rejoins the text
-	// around an SOP in the middle of the fence without the blank line it had, and that must not
-	// leave the moved text behind to be imported again (glued) after a restart. Own text that
-	// really changed meanwhile is left alone (the view shows it, a later run imports it).
-	const current = await readOldBehaviorFence(narratorId);
-	if (squeezed(current.own) !== squeezed(fence.own)) return "imported";
-	await writeSpecFile(narratorId, BEHAVIOR_FENCE_URI, current.sopSections, {
-		actor: "system",
-		createdBy: "system",
-		pluginSop: true,
-	});
 	return "imported";
 }
 

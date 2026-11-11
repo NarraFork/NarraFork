@@ -330,6 +330,35 @@ export async function setOutlinePluginRules(args: {
 	});
 }
 
+/**
+ * Write the SOP `sop` of a session's old fence as the marked plugin's block on its behavior page,
+ * unless that plugin has a block there already (then the fence's copy is stale). For the import of
+ * a whole Dynamic Spec session (outline P2 PR 12b), which calls it before the session is an
+ * outline one and reads the fence through its own port; the fence is not touched. Returns whether
+ * a block was written.
+ */
+export async function writeImportedFenceSop(
+	session: PluginTaskSession,
+	sop: string,
+	options: { store?: OutlineStore } = {},
+): Promise<boolean> {
+	const store = options.store ?? outlineStore;
+	if (!sop.trim()) return false;
+	return await oneAtATime(`rules:${session.narratorId}`, async () => {
+		const space = await store.findSpace({ kind: "session", narratorId: session.narratorId });
+		const sid = pluginRulesSid(TEAM_SOP_PLUGIN_ID);
+		const [held] = space ? await store.getBlockMetas(space.id, { sids: [sid] }) : [];
+		if (held) return false;
+		// The SOP is cut to what a plugin's rules may hold: the old command's limit.
+		const text = [...sop].slice(0, OUTLINE_PLUGIN_RULES_LIMITS.textChars).join("");
+		await writeRulesBlock(session, TEAM_SOP_PLUGIN_ID, text, {
+			store,
+			summary: OUTLINE_TEXT.pluginSopMoved(TEAM_SOP_PLUGIN_ID),
+		});
+		return true;
+	});
+}
+
 /** Sessions whose old fence was looked at for an SOP in this process. */
 const sopLooked = hotSafe("narrafork.outlinePluginRules.sopLooked", () => new Set<string>());
 

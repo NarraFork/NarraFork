@@ -680,6 +680,13 @@ export interface NarraForkSettings {
 		 * as a spec session until it is back on (`services/task-source`).
 		 */
 		enabled: boolean;
+		/**
+		 * How sessions that still keep their tasks in Dynamic Spec are imported into the outline
+		 * (outline P2 PR 12b), while `enabled` is on. `auto` (the default): before a session's next
+		 * run, by a background job while it is idle, and from the Spec panel's button. `manual`:
+		 * only from the button. `off`: not at all.
+		 */
+		specImport?: "auto" | "manual" | "off";
 	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */

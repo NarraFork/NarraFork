@@ -4536,9 +4536,12 @@ async function pluginSpecRoute(
 	narratorId: string,
 	command: "tasks" | "fence",
 ): Promise<"spec" | "outline"> {
-	const { assertSpecTasksUsed, readTaskBackend, readTaskSession } = await import(
+	const { assertSpecTasksUsed, readTaskBackend, readTaskSession, waitForSpecImport } = await import(
 		"./task-source/backend"
 	);
+	// An import under way decides where the session's tasks are: the command waits for it (a
+	// moment), then goes there (outline P2 PR 12b).
+	await waitForSpecImport(narratorId);
 	if ((await readTaskBackend(narratorId)) !== "outline") return "spec";
 	if ((await readTaskSession(narratorId))?.subagent === true) {
 		if (command === "fence") return "spec";

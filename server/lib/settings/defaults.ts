@@ -42,6 +42,7 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	outline: {
 		enabled: false,
+		specImport: "auto",
 	},
 	requestEvidence: {
 		ringEnabled: true,
@@ -408,6 +409,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示；现有的 spec:// 和知识库不受影响。",
 		type: "boolean",
 		valid: "true / false，默认 false",
+	},
+	"outline.specImport": {
+		desc: "大纲开关打开后，还在用 Dynamic Spec 记任务的旧会话怎样导入大纲。auto：会话下一次开始运行前、后台在会话空闲时、以及 Spec 面板的「现在导入」都会导入；manual：只在点「现在导入」时导入；off：不导入。导入不删除 Dynamic Spec 的数据。",
+		type: "string",
+		valid: "auto / manual / off，默认 auto",
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────
