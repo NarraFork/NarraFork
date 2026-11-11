@@ -2550,10 +2550,16 @@ const sqliteNarratorPersistence = {
 			| {
 					type: "image_generation";
 					id: string;
+					status?: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					outputIndex?: number;
 					savedPath?: string;
 					result?: string;
+					partialSavedPath?: string;
+					partialImageIndex?: number;
+					partialImageB64?: string;
 					width?: number;
 					height?: number;
 			  },

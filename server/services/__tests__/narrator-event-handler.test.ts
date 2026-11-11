@@ -1489,6 +1489,172 @@ describe("工具展示事件与执行快照解耦", () => {
 	});
 });
 
+describe("native image generation persistence", () => {
+	test.each([
+		"failed",
+		"cancelled",
+		"incomplete",
+	])("persists %s with errors and partial previews", async (status) => {
+		const id = `image-terminal-${status}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		try {
+			await processEvent(
+				{
+					type: "image_generation",
+					id: "ig",
+					status: "generating",
+					partialSavedPath: "/tmp/preview.png",
+					partialImageIndex: 1,
+				},
+				ctx,
+			);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: {
+						type: "image_generation",
+						id: "ig",
+						status,
+						error: "image provider rejected",
+						errorCode: "content_filter",
+						partialImageIndex: 1,
+					},
+				},
+				ctx,
+			);
+			if (!partialId) throw new Error("missing persisted image message");
+			const content = readTestMessageContent(sqlite, partialId);
+			expect(content).toEqual([
+				expect.objectContaining({
+					type: "image_generation",
+					status,
+					error: "image provider rejected",
+					errorCode: "content_filter",
+					partialSavedPath: "/tmp/preview.png",
+				}),
+			]);
+			expect(getStreamingSnapshot(id)?.streamingBlocks).toEqual([
+				expect.objectContaining({
+					status,
+					partialSavedPath: "/tmp/preview.png",
+					error: "image provider rejected",
+				}),
+			]);
+			expect(broadcastMessages).toContainEqual(
+				expect.objectContaining({
+					type: "image_generation",
+					narratorId: id,
+					status,
+					errorCode: "content_filter",
+					partialSavedPath: "/tmp/preview.png",
+				}),
+			);
+		} finally {
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test.each([
+		"completed",
+		"incomplete",
+	])("stores image bytes for %s without losing a partial-only artifact", async (status) => {
+		const id = `image-artifact-${status}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			conversationId: id,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		const png =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+		try {
+			await processEvent(
+				{
+					type: "block_complete",
+					block: {
+						type: "image_generation",
+						id: "ig_artifact",
+						status,
+						...(status === "completed"
+							? { result: png }
+							: { partialImageB64: png, partialImageIndex: 0 }),
+					},
+				},
+				ctx,
+			);
+			if (!partialId) throw new Error("missing persisted image message");
+			const content = readTestMessageContent(sqlite, partialId) as Array<Record<string, unknown>>;
+			expect(content).toHaveLength(1);
+			expect(content[0]).toMatchObject({ type: "image_generation", status, width: 1, height: 1 });
+			const path = content[0][status === "completed" ? "savedPath" : "partialSavedPath"];
+			expect(typeof path).toBe("string");
+			expect(await Bun.file(String(path)).exists()).toBe(true);
+			expect(content[0].result).toBeUndefined();
+			expect(content[0].partialImageB64).toBeUndefined();
+		} finally {
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("completed lifecycle alone remains active instead of looking like a generated image", async () => {
+		const ctx = makeMainContext();
+		await processEvent({ type: "image_generation", id: "ig_lifecycle", status: "completed" }, ctx);
+		expect(getStreamingSnapshot(ctx.narratorId)?.streamingBlocks).toContainEqual(
+			expect.objectContaining({ id: "ig_lifecycle", status: "generating" }),
+		);
+		expect(broadcastMessages).toContainEqual(
+			expect.objectContaining({
+				type: "image_generation",
+				id: "ig_lifecycle",
+				status: "generating",
+			}),
+		);
+	});
+
+	test("already persisted tool image refs are encoded directly without upload re-save", async () => {
+		const { toolResultLedgerOutput } = await import("../narrator-event-handler");
+		const uploads = await import("../../lib/uploads");
+		const save = spyOn(uploads, "saveUploadedImage");
+		try {
+			const ref = {
+				imageId: "image-from-worker",
+				mediaType: "image/png",
+				uploadNarratorId: "image-owner",
+			};
+			const output = await toolResultLedgerOutput("caller", {
+				type: "tool_result",
+				toolUseId: "image-tool",
+				toolName: "Image",
+				output: "saved",
+				isError: false,
+				imageRefs: [ref],
+			});
+			expect(output).toEqual({ _text: "saved", _images: [ref] });
+			expect(save).not.toHaveBeenCalled();
+		} finally {
+			save.mockRestore();
+		}
+	});
+});
+
 describe("完成工具输入传递", () => {
 	test("onGitTrack 收到 tool_result 携带的实际完成输入", async () => {
 		const ctx = makeSubagentContext();
@@ -1588,7 +1754,7 @@ describe("完成工具输入传递", () => {
 			{
 				type: "image_generation",
 				id: "image-partial",
-				status: "completed",
+				status: "incomplete",
 				revisedPrompt: undefined,
 				partialSavedPath: "/tmp/image-partial.png",
 				outputIndex: 3,
@@ -1738,7 +1904,7 @@ describe("完成工具输入传递", () => {
 			{
 				type: "image_generation",
 				id: "child-partial",
-				status: "completed",
+				status: "incomplete",
 				revisedPrompt: undefined,
 				partialSavedPath: "/tmp/child-partial.png",
 				outputIndex: 1,

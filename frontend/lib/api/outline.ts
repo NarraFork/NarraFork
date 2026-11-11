@@ -14,6 +14,7 @@ import type {
 	OutlinePlanDecisionResponse,
 	OutlinePlanDiffResponse,
 	OutlineQuestionGroupResponse,
+	OutlineReportAuthorsResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
@@ -123,6 +124,11 @@ export const outlineApi = {
 		request<OutlineRevertResponse>(`/outline/commits/${enc(commitId)}/revert`, {
 			method: "POST",
 		}),
+	/** Who wrote the subagent reports with these container ids (the names the caller may see). */
+	getOutlineReportAuthors: (spaceId: string, ids: readonly string[]) =>
+		request<OutlineReportAuthorsResponse>(
+			`/outline/spaces/${enc(spaceId)}/report-authors${query({ ids: ids.join(",") })}`,
+		),
 	/** What waits for confirmation on a page, and its locked tasks. */
 	getOutlinePagePending: (spaceId: string, pageId: string) =>
 		request<OutlinePagePendingResponse>(

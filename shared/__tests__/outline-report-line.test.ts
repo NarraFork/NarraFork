@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { DELEGATION_BLOCK_TEXT } from "@server/services/outline/delegation-text";
-import { parseOutlineReportLine } from "../outline-report-line";
+import {
+	isOutlineReportBlockId,
+	isOutlineReportContainer,
+	parseOutlineReportLine,
+} from "../outline-report-line";
 
 const AT = "2026-11-09 17:38 UTC";
 const ISO = "2026-11-09T17:38:00.000Z";
@@ -89,5 +93,26 @@ describe("parseOutlineReportLine", () => {
 			`${"x".repeat(5000)}报告（第 2 代 · ${AT}）`,
 		];
 		for (const text of raw) expect(parseOutlineReportLine(text), text).toBeNull();
+	});
+});
+
+describe("report containers", () => {
+	test("the writer's ids are recognised, nothing else is", () => {
+		const id = `dlrp${"aB3_-".repeat(6).slice(0, 28)}`;
+		expect(isOutlineReportBlockId(id)).toBe(true);
+		expect(isOutlineReportBlockId(`${id}x`)).toBe(false);
+		expect(isOutlineReportBlockId(id.slice(1))).toBe(false);
+		expect(isOutlineReportBlockId("dlrp")).toBe(false);
+		expect(isOutlineReportBlockId(`x${id.slice(1)}`)).toBe(false);
+	});
+
+	test("a container is known by its id, or by a line that is exactly a report line", () => {
+		const id = `dlrp${"aB3_-".repeat(6).slice(0, 28)}`;
+		expect(isOutlineReportContainer(id, "edited by someone")).toBe(true);
+		expect(isOutlineReportContainer("b1234567", "报告（第 2 代 · 2026-11-09 17:38 UTC）")).toBe(
+			true,
+		);
+		expect(isOutlineReportContainer("b1234567", "报告（见下）")).toBe(false);
+		expect(isOutlineReportContainer("b1234567", "a note")).toBe(false);
 	});
 });

@@ -149,6 +149,255 @@ afterAll(() => {
 	mock.restore();
 });
 
+describe("native image generation terminal state", () => {
+	function imageBlocks(events: AgentEvent[]) {
+		return events.flatMap((event) =>
+			event.type === "block_complete" && event.block.type === "image_generation"
+				? [event.block]
+				: [],
+		);
+	}
+
+	test.each([
+		"in_progress",
+		"generating",
+		"completed",
+	])("request end settles %s without a final image and never retries it", async (status) => {
+		const events = await runLoop([
+			[{ imageGeneration: { id: "ig_unfinished", status, outputIndex: 1 } }],
+		]);
+		expect(providerCalls()).toBe(1);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({
+				type: "image_generation",
+				id: "ig_unfinished",
+				status: "incomplete",
+			}),
+		]);
+		expect(
+			events
+				.filter((event) => event.type === "image_generation")
+				.some((event) => event.status === "completed"),
+		).toBe(false);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+	});
+
+	test.each([
+		"failed",
+		"cancelled",
+		"incomplete",
+	])("persists empty %s final payload with its real error", async (status) => {
+		const events = await runLoop([
+			[
+				{
+					imageGeneration: {
+						id: "ig_terminal",
+						status,
+						final: true,
+						error: "upstream image rejection",
+						errorCode: "content_filter",
+					},
+				},
+			],
+		]);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({
+				status,
+				error: "upstream image rejection",
+				errorCode: "content_filter",
+			}),
+		]);
+		expect(providerCalls()).toBe(1);
+	});
+
+	test.each([
+		{ status: "in_progress" },
+		{ status: "generating" },
+		{ status: "completed" },
+	])("a final item with omitted result is incomplete rather than a false success: $status", async ({
+		status,
+	}) => {
+		const events = await runLoop([
+			[{ imageGeneration: { id: "ig_sdk_empty", status, final: true } }],
+		]);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({ status: "incomplete", result: undefined }),
+		]);
+	});
+
+	test("empty completed final is incomplete and explains the missing result", async () => {
+		for (const result of [undefined, "", "   "]) {
+			const events = await runLoop([
+				[{ imageGeneration: { id: "ig_empty", status: "completed", result, final: true } }],
+			]);
+			expect(imageBlocks(events)).toEqual([
+				expect.objectContaining({
+					status: "incomplete",
+					result: undefined,
+					error: "Image generation completed without a result",
+				}),
+			]);
+		}
+	});
+
+	test("completed lifecycle waits for a valid final and duplicate lifecycle cannot reopen it", async () => {
+		const events = await runLoop([
+			[
+				{ imageGeneration: { id: "ig_complete", status: "completed" } },
+				{
+					imageGeneration: {
+						id: "ig_complete",
+						status: "completed",
+						result: "final-image-bytes",
+						final: true,
+					},
+				},
+				{ imageGeneration: { id: "ig_complete", status: "generating" } },
+			],
+		]);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({ status: "completed", result: "final-image-bytes" }),
+		]);
+		const progress = events.filter((event) => event.type === "image_generation");
+		expect(progress.map((event) => event.status)).toEqual(["generating", "completed"]);
+	});
+
+	test("the completed lifecycle does not erase a result accumulated before it", async () => {
+		const events = await runLoop([
+			[
+				{
+					imageGeneration: {
+						id: "ig_accumulated",
+						status: "completed",
+						result: "complete-image-bytes",
+						final: true,
+					},
+				},
+				{ imageGeneration: { id: "ig_accumulated", status: "completed", final: true } },
+			],
+		]);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({ status: "completed", result: "complete-image-bytes" }),
+		]);
+	});
+
+	test("the SDK result field alone does not make an unfinished stream a success", async () => {
+		const events = await runLoop([
+			[{ imageGeneration: { id: "ig_result_only", status: "generating", result: "late-base64" } }],
+		]);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({ status: "incomplete", result: undefined }),
+		]);
+	});
+
+	test("a final item with no status and no result is incomplete, not a success", async () => {
+		const events = await runLoop([
+			[{ imageGeneration: { id: "ig_sdk_empty", status: "in_progress", final: true } }],
+		]);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({ status: "incomplete", result: undefined }),
+		]);
+	});
+
+	test("SDK result without a status is preserved on the completed response", async () => {
+		const events = await runLoop([
+			[
+				{
+					imageGeneration: {
+						id: "ig_sdk_done",
+						status: "completed",
+						result: "final-image-bytes",
+						final: true,
+					},
+				},
+			],
+		]);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({ status: "completed", result: "final-image-bytes" }),
+		]);
+	});
+
+	test.each([
+		"throw",
+		"silent",
+	])("%s disconnect settles the partial image before request end", async (ending) => {
+		const events = await runLoop([
+			[
+				{
+					imageGeneration: {
+						id: "ig_partial",
+						status: "generating",
+						partialImageIndex: 2,
+						partialImageB64: "preview-bytes",
+					},
+				},
+				ending === "silent"
+					? { silentDisconnect: true }
+					: throwMarker(new Error("socket disconnected")),
+			],
+		]);
+		const blocks = imageBlocks(events);
+		expect(blocks).toEqual([
+			expect.objectContaining({
+				id: "ig_partial",
+				status: ending === "silent" ? "incomplete" : "failed",
+				partialImageIndex: 2,
+				partialImageB64: "preview-bytes",
+			}),
+		]);
+		expect(providerCalls()).toBe(1);
+		const settledIndex = events.findIndex(
+			(event) => event.type === "block_complete" && event.block.type === "image_generation",
+		);
+		expect(settledIndex).toBeGreaterThanOrEqual(0);
+		expect(settledIndex).toBeLessThan(
+			events.findIndex((event) => event.type === "api_request_end"),
+		);
+	});
+
+	test("retryable response failure after native image start does not replay generation", async () => {
+		const events = await runLoop([
+			[
+				{ imageGeneration: { id: "ig_retry", status: "generating", partialImageB64: "preview" } },
+				{ invalidState: { reason: "server_error", message: "image stream failed" } },
+			],
+		]);
+		expect(providerCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({
+				status: "failed",
+				error: "image stream failed",
+				partialImageB64: "preview",
+			}),
+		]);
+	});
+
+	test("user cancellation settles the native call with its latest partial preview", async () => {
+		const controller = new AbortController();
+		attempts = [
+			[
+				{
+					imageGeneration: {
+						id: "ig_cancel",
+						status: "generating",
+						partialImageIndex: 0,
+						partialImageB64: "preview",
+					},
+				},
+			],
+		];
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(makeConfig(controller.signal), "image", { rows: [] })) {
+			events.push(event);
+			if (event.type === "image_generation") controller.abort();
+		}
+		expect(imageBlocks(events)).toEqual([
+			expect.objectContaining({ status: "cancelled", partialImageB64: "preview" }),
+		]);
+	});
+});
+
 describe("resumable interruption: reasoning-only → discard and hand off for continuation", () => {
 	test("discards truncated reasoning, emits stream_reset, and yields resumable_error instead of replaying", async () => {
 		const events = await runLoop([

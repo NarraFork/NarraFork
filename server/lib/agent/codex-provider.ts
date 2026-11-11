@@ -47,6 +47,8 @@ import type {
 	DbMessage,
 	GenerateMetaResult,
 	GenerateOptions,
+	ImageGenerationRequest,
+	ImageGenerationResponse,
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
@@ -871,6 +873,12 @@ export class CodexProvider implements ProviderAdapter {
 
 		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
 		return request;
+	}
+
+	async generateImage(params: ImageGenerationRequest): Promise<ImageGenerationResponse> {
+		const ctx = await this.getContext(params.conversationId);
+		const response = await this.createProvider(ctx).generateImage(params);
+		return { ...response, credentialId: ctx.id };
 	}
 
 	async generate(text: string, model: string): Promise<string> {

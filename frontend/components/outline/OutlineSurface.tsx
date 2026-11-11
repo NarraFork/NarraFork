@@ -51,6 +51,7 @@ import {
 import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
+import type { FoldAction, FoldTree, FoldView } from "@shared/outline-fold";
 import {
 	IconArrowLeft,
 	IconArrowRight,
@@ -74,6 +75,7 @@ import {
 	useOutlineBlock,
 	useOutlinePageLive,
 	useOutlinePagePending,
+	useOutlineReportAuthors,
 	useOutlineSeed,
 	useOutlineViewStateSync,
 } from "../../hooks/useOutline";
@@ -272,6 +274,8 @@ function SurfaceBody({
 				out.set(id, { ...mark, pending: [...(mark.pending ?? []), change.label] });
 			}
 		}
+		// Questions nobody answered yet: a folded row counts the ones it hides.
+		for (const id of data.questions ?? []) out.set(id, { ...out.get(id), openQuestion: true });
 		return out;
 	}, [pagePending.data, lockedLabel]);
 
@@ -296,16 +300,65 @@ function SurfaceBody({
 			}),
 		[viewState],
 	);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: foldVersion says the set changed
-	const collapsed = useMemo<ReadonlySet<string>>(
-		() => new Set(viewState?.collapsed ?? []),
+	// The reader's folding as the read-only tree takes it: a new object when it changed.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: foldVersion says the sets changed
+	const fold = useMemo<FoldView>(
+		() => ({
+			expanded: new Set(viewState?.expanded ?? []),
+			collapsed: new Set(viewState?.collapsed ?? []),
+		}),
 		[viewState, foldVersion],
 	);
 	useOutlineViewStateSync(pageId, viewState);
+	// Who wrote the live page's subagent reports (the editor names the containers it holds).
+	const [reportContainers, setReportContainers] = useState<string[]>([]);
+	const reportAuthors = useOutlineReportAuthors(spaceId, reportContainers, editing).data;
+	// A closed row's count of unanswered questions was used: the rows are open now, and the
+	// reader goes to where the first of them is answered. The form in the page's body holds the
+	// questions directly under the focused block (and their sub-questions): when the question is
+	// deeper, the block it is under is focused, and its form takes the keyboard once it is there.
+	const formWatch = useRef<MutationObserver | null>(null);
+	useEffect(() => () => formWatch.current?.disconnect(), []);
+	const openQuestionForm = useCallback((ids: string[], under: string | null) => {
+		const host = pageRef.current;
+		if (!host || ids.length === 0) return;
+		const focusForm = (): boolean => {
+			for (const id of ids) {
+				const card = host.querySelector<HTMLElement>(`[data-testid="outline-question-${id}"]`);
+				if (!card) continue;
+				card.scrollIntoView({ block: "nearest" });
+				card.querySelector<HTMLElement>("input:not(:disabled), textarea:not(:disabled)")?.focus();
+				return true;
+			}
+			return false;
+		};
+		formWatch.current?.disconnect();
+		formWatch.current = null;
+		if (focusForm()) return;
+		if (under) goRef.current({ blockId: under });
+		// The form arrives with the focused block's questions (bounded: a few seconds, then quiet).
+		const watch = new MutationObserver(() => {
+			if (focusForm()) stop();
+		});
+		const timer = setTimeout(() => stop(), 8000);
+		const stop = () => {
+			clearTimeout(timer);
+			watch.disconnect();
+			if (formWatch.current === watch) formWatch.current = null;
+		};
+		formWatch.current = watch;
+		watch.observe(host, { childList: true, subtree: true });
+	}, []);
+	const pageRef = useRef<HTMLDivElement | null>(null);
 	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
 	const switcher = useRef<QuickSwitcherHandle | null>(null);
 	const openSwitcher = useCallback(() => switcher.current?.open(), []);
-	const toggle = useCallback((id: string) => viewState?.toggleCollapsed(id), [viewState]);
+	const onFold = useCallback(
+		(tree: FoldTree, action: FoldAction) => {
+			viewState?.fold(tree, action);
+		},
+		[viewState],
+	);
 
 	const mobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const { ref: surfaceRef, width } = useElementSize();
@@ -612,9 +665,13 @@ function SurfaceBody({
 								onUnavailable={setFallback}
 								onHiddenChange={setHiddenLive}
 								marks={marks}
+								marksKnown={pagePending.data !== undefined}
 								onFocusInfo={setFocusInfo}
 								onSurface={setEditSurface}
 								onOpenSwitcher={openSwitcher}
+								reportAuthors={reportAuthors}
+								onReportContainers={setReportContainers}
+								onOpenQuestions={openQuestionForm}
 								seed={seed && seed.pageId === (pageId ?? view.pageId) ? seed : null}
 							/>
 						) : (
@@ -641,9 +698,10 @@ function SurfaceBody({
 								)}
 								<OutlineBlockTree
 									view={view}
-									collapsed={collapsed}
+									fold={fold}
 									search={linkSearch}
-									onToggle={toggle}
+									onFold={onFold}
+									onOpenQuestions={openQuestionForm}
 								/>
 							</>
 						)}
@@ -683,7 +741,9 @@ function SurfaceBody({
 			data-testid="outline-surface"
 			onKeyDown={onKeyDown}
 		>
-			<Box className={classes.page}>{content}</Box>
+			<Box className={classes.page} ref={pageRef}>
+				{content}
+			</Box>
 			{drawer}
 			<QuickSwitcherHost
 				ref={switcher}

@@ -1772,6 +1772,13 @@
       "when": 1794332179178,
       "tag": "0252_compact_auxiliary_content",
       "breakpoints": true
+    },
+    {
+      "idx": 253,
+      "version": "6",
+      "when": 1794365827385,
+      "tag": "0253_outline_view_state_expanded",
+      "breakpoints": true
     }
   ]
 }

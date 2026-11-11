@@ -2,6 +2,49 @@ import { describe, expect, it } from "bun:test";
 import { rowWithElements } from "../narrator-blocks/message-blocks";
 import { adaptSegment, classifyContentBlock } from "./segment-adapter";
 
+describe("native image status projection", () => {
+	const project = (block: Record<string, unknown>) =>
+		adaptSegment(
+			{
+				kind: "message",
+				msg: rowWithElements({ id: "native-image", role: "assistant" }, [
+					{ type: "image_generation", ...block },
+				]),
+			},
+			{ lod: 5 },
+		)[0]?.data;
+
+	it("requires a real final artifact before labeling legacy history generated", () => {
+		expect(project({})).toMatchObject({ statusText: "No image received" });
+		expect(project({ partialSavedPath: "/preview.png" })).toMatchObject({
+			statusText: "No image received",
+		});
+		expect(project({ savedPath: "/final.png" })).toMatchObject({ statusText: "Generated image" });
+		expect(project({ result: "image-bytes" })).toMatchObject({ statusText: "Generated image" });
+		expect(project({ status: "completed" })).toMatchObject({ statusText: "No image received" });
+	});
+
+	for (const [status, label] of [
+		["failed", "Image generation failed"],
+		["cancelled", "Image generation cancelled"],
+		["incomplete", "Image generation incomplete"],
+	]) {
+		it(`keeps ${status} and its partial preview without inventing a reason`, () => {
+			expect(project({ status, partialSavedPath: "/preview.png" })).toMatchObject({
+				status,
+				statusText: label,
+				partialSavedPath: "/preview.png",
+			});
+			expect(project({ status, error: "upstream detail", errorCode: "policy" })).toMatchObject({
+				status,
+				error: "upstream detail",
+				errorCode: "policy",
+				statusText: `${label}: policy: upstream detail`,
+			});
+		});
+	}
+});
+
 const audio = {
 	type: "audio",
 	mediaId: "a1",
