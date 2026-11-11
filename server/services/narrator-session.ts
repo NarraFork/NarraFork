@@ -1955,7 +1955,8 @@ async function maybeDeliverInterruptTaskGuard(
 export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
 
 /**
- * At the start of a run of an outline session: move the old behavior fence's text to the
+ * At the start of a run: import a session that still keeps its tasks in Dynamic Spec (outline P2
+ * PR 12b, `spec-import/triggers.ts`). Then, for an outline session: move the old behavior fence's text to the
  * session's behavior page (once; `importOutlineBehaviorFence`) and a plugin's SOP left in it to the
  * plugin's block there (once; `moveOutlineFenceSop`, outline P2 PR 12a), then note where the run
  * starts for the turn-end note (the completed tool count and the revision of the open tasks).
@@ -1964,6 +1965,13 @@ export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
 export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 	active._outlineTurnStart = undefined;
 	try {
+		// A session still in Dynamic Spec is imported first (outline P2 PR 12b): when that moves
+		// it, this run is an outline run from its first request.
+		const { importSpecAtRunStart } = await import("./outline/spec-import/triggers");
+		await importSpecAtRunStart(active.narratorId, {
+			subagentsRunning: () =>
+				listNarratorAdmissionOwners(active.narratorId).some((id) => id !== active.narratorId),
+		});
 		if ((await resolveTaskBackend(active.narratorId)) !== "outline") return;
 		const { readTaskSession } = await import("./task-source/backend");
 		if ((await readTaskSession(active.narratorId))?.subagent === true) return;

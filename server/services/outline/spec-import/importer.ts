@@ -61,6 +61,7 @@ import { parseSpecTasksDocument, SPEC_TASKS_PATH, taskTextHash } from "../../spe
 import { beginSpecImport, invalidateTaskBackend, isSpecImporting } from "../../task-source/backend";
 import { importBehaviorFenceText } from "../../task-source/outline-behavior";
 import { writeImportedFenceSop } from "../../task-source/outline-plugin-rules";
+import { outlineAccessBackend } from "../access-reads";
 import { processBackgroundText } from "../edit-text-runner";
 import { isOutlineEnabled } from "../feature";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../model";
@@ -417,6 +418,19 @@ async function afterMove(session: SpecImportSession, options: SpecImportOptions)
 			narratorId,
 			error: String(error),
 		});
+	}
+	// The old fence still holds what step 5 copied: emptied through the paths that own it (PR 4's
+	// import finds its text on the page and leaves only the SOP; 12a's move finds the plugin's
+	// block and drops the SOP), so nothing shows twice. They never reject. Dynamic Spec is
+	// written through the SQLite handle only: on PostgreSQL the old fence stays as it is.
+	if (outlineAccessBackend() === "sqlite") {
+		const locale: Locale = session.ownerUserId
+			? await getUserLanguage(session.ownerUserId).catch(() => "en" as const)
+			: "en";
+		const { importOutlineBehaviorFence } = await import("../../task-source/outline-behavior");
+		await importOutlineBehaviorFence(narratorId, locale);
+		const { moveOutlineFenceSop } = await import("../../task-source/outline-plugin-rules");
+		await moveOutlineFenceSop(narratorId);
 	}
 	try {
 		options.onMoved?.(narratorId);
