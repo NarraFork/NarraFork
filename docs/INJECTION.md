@@ -230,6 +230,15 @@ setInjectionScheduler({ requestSoftStop, wakeIfIdle })
 - 窗口：每个（会话，空间）一个 seq 游标，只在内存；第一次（新进程、新会话、fork）从会话上一次运行结束（`narrator_turns`，没有就是会话创建）开始，最多往回 2 小时。读的都是有界、走索引的：每个空间最多 50 个提交、300 条不带正文的版本、30 个标题。会话运行时只在 SQLite 上跑，所以只在 SQLite 上写行；读的部分两种方言共用，PG 上有同一组场景测试。
 - 重叠提示（同一个 PR）不是注入：它是 Write、Edit 工具结果末尾的一行（`trackFileChange` 返回，`withOverlapHint` 接上），见 `outline/overlap.ts`。
 
+**开工说明（`outline_task_brief`，`server/services/outline/task-session.ts`，outline P2 PR 10c-1）**：人在项目看板上点「开新会话做这个」时，系统给新会话写的第一条消息。新会话建好、任务替它领取之后写，再按 `preferTaskId` 启动第一轮；所以它是这个会话历史里的第一行，续跑提示是第二行。
+- `role: sys`、不带 `createdBy`、`schedule: none`（启动由 `openTaskSession` 自己做）。每个为任务开的会话只写这一次，之后不改、不重发：任务状态的变化走「当前任务」视图，别人做的事走团队动态；compact 之后它被摘要掉，不补发。
+- 只在历史里，不进系统提示、工具定义和命名上下文：同项目会话的工具定义和系统提示（各自的命名上下文部分除外，见下）不因它多一个字节；说明自己在第一次请求之后就在缓存的前缀里。正文是确定的（没有相对时间、租约时间），重建历史、重试请求发出去的字节一样。
+- 正文最多 16 KiB（点的人写的补充说明不计），给模型看的框架文字是英文，任务、笔记的内容保持原文。顺序：头（标题、上级目标、地址、领取代数）→ 任务正文（最多 3 KiB）→ 任务下的笔记、步骤、提问和前置（复用委派说明的渲染 `renderDelegationBrief`）→ 背景（往上最近 3 个任务的标题和第一段，最近那个的子任务列表）→ 任务里链接的事实（任务和它下面的块里的链接、再到上级任务里的链接，合计最多 8 个，各按事实视图读最多 600 字节；放不下的只留标题和地址）→ 项目空间的页目录（最多 20 页，每页最多 5 行）→ 补充说明 → 规则（做完勾 `[x]` 留一行结果；要人定用 `Ask`；做不完在任务下写交接、说明停在哪，再结束）。前面的节没用完的预算顺延给后面的节。不做检索（D54）。
+- 新会话不按实例默认建成公开会话（默认是 private 时归点的人自己，否则是项目可见），也不按实例默认进计划模式；建好后先确认它读得到任务所在的空间，读不到就归档、拒绝（`unreadable`），不领取也不写说明。
+- 权限：用新会话自己的读范围整理（`OutlineAgentScope`，不带人，所以不读任何人的个人空间），不用点的人的范围；它读不到的链接目标写成 `(a block this session cannot read)`，不带标题和地址。
+- 读者看到的 body 是 `prose`，标题行是说明的第一行（任务标题），其余折叠；来源标签「Opening brief / 开工说明」。
+- 命名上下文的注意点：每代基线渲染在系统提示里，其中 `outline.tasks` 是每个会话自己的当前任务，所以两个会话的系统提示在这一部分本来就不同；开工说明不改变这一点（`outline-task-session.e2e.test.ts` 逐字节比较了这一部分之前和之后）。
+
 ### 5.2 Agent Loop（`server/lib/agent/loop.ts`）
 
 loop 自己抬起的提醒进 `pendingLoopInjections` 队列，在 turn 边界由 `flushLoopInjections()` 经宿主的 `deliverInjectionRow` 钩子落库：
@@ -334,7 +343,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 `silent_progress`、`todo_reminder`（`living_work_spec` 映射到它）、`relaxed_plan`、`knowledge_base_hint`、`bg_agent`、`bg_bash`、`team_message`、`buffered_user`、`subagent_message`、`spec_update`、`behavior_fence`、`pipeline_exit_confirmation`。
 
-之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）、`outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）、`outline_task_finished`（P2 PR 9b，会话建的任务在别处结束了，标签「Tasks this session created were finished elsewhere / 本会话建的任务在别处结束了」）和 `outline_team_activity`（P2 PR 10b，团队动态，标签「Team activity / 团队动态」）。
+之后加入的标签见 `shared/pretext-layout/segment-adapter.ts` 的 `INJECTION_SOURCE_LABEL_KEYS`，其中大纲会话的：`outline_task_turn_end`（plan PR 4，长回合结束时仍有没碰过的进行中任务）、`outline_task_edit`（P2 PR 5，有人改了会话的任务，标签「Task changes by people / 有人改了任务」）、`outline_task_finished`（P2 PR 9b，会话建的任务在别处结束了，标签「Tasks this session created were finished elsewhere / 本会话建的任务在别处结束了」）`outline_team_activity`（P2 PR 10b，团队动态，标签「Team activity / 团队动态」）和 `outline_task_brief`（P2 PR 10c-1，为任务开的会话的开工说明，标签「Opening brief / 开工说明」）。
 
 ---
 

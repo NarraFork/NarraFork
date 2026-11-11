@@ -30,6 +30,10 @@ export const OUTLINE_TASK_BOARD_LIMITS = {
 	maxUsernameChars: 128,
 	/** Tasks one "seen" request (「新完成」, outline P2 PR 9b) names at most. */
 	seenPerRequest: 100,
+	/** Characters of the note a person adds when opening a session for a task (P2 PR 10c-1). */
+	maxOpenNoteChars: 4000,
+	/** Bytes of the request that opens a session for a task. */
+	openSessionBodyBytes: 64 * 1024,
 } as const;
 
 /**
@@ -92,6 +96,14 @@ export interface OutlineBoardTask {
 	 * reader has not seen on a board since (`POST /outline/tasks/seen`). Absent otherwise.
 	 */
 	newlyDone?: true;
+	/**
+	 * The reader may open a new session for it now (outline P2 PR 10c-1, D54): an open task of a
+	 * project space that is to do, that nobody holds, that does not wait, is not in a plan being
+	 * planned and is not assigned to a person; the reader may create sessions in the project and
+	 * write its space; the project has a working directory and the session runtime runs here.
+	 * Absent otherwise (the server decides again when asked).
+	 */
+	openSession?: true;
 }
 
 export interface OutlineBoardSpace {
@@ -191,6 +203,45 @@ export interface OutlineBoardTaskUpdateResponse {
 	versionSeq: number | null;
 	started: boolean;
 }
+
+/** Open a new session for a project task and start it on the task (outline P2 PR 10c-1). */
+export interface OutlineBoardOpenSessionRequest {
+	/** The task's `version_seq` as the board read it; a change since then is refused (409). */
+	baseVersionSeq: number;
+	/** The session's model; absent follows the default, as creating any session does. */
+	model?: string;
+	/** A working directory other than the project's. */
+	cwd?: string;
+	/** The person's own note, added to the session's opening brief as it is. */
+	note?: string;
+}
+
+export interface OutlineBoardOpenSessionResponse {
+	narratorId: string;
+	/** The session's first turn was started. */
+	started: boolean;
+	/** The claim generation the session holds the task at. */
+	epoch: number;
+	/** The session a click just before this one opened: nothing new was created. */
+	already?: true;
+}
+
+/** Why a session was not opened (`details.reason` of the 409; `OUTLINE_TASK_SESSION_*` codes). */
+export type OutlineBoardOpenSessionRefusal =
+	| "finished"
+	| "planning"
+	| "prerequisites"
+	| "people"
+	| "confirmation"
+	| "assigned_to_person"
+	| "unavailable"
+	| "not_project_task"
+	| "no_directory"
+	| "in_progress"
+	| "claimed"
+	| "unreadable"
+	| "changed"
+	| "start_failed";
 
 /**
  * The reader saw these tasks marked 「新完成」 on a board, each at the version shown (outline P2
