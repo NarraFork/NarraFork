@@ -10,7 +10,9 @@
  *   - `turnEnd`   — `outline_task_turn_end`: a long turn ended with a task still in progress;
  *   - `edited`    — `outline_task_edit`: people changed tasks of the session; also
  *                   `outline_task_finished`: tasks the session created were finished elsewhere
- *                   (outline P2 PR 9b), titled by who finished them; also
+ *                   (outline P2 PR 9b), titled by who finished them; also `outline_team`: one
+ *                   commit of someone else that concerns the session (assigned to it, a
+ *                   prerequisite ended, tasks it created ended; outline P2 PR 10a); also
  *                   `outline_team_activity`: what others did around the session's tasks since its
  *                   last turn (outline P2 PR 10b), each row naming who;
  *   - `interrupt` — `interrupt_task_guard`: the open tasks after a user interrupt (outline and spec);
@@ -162,7 +164,13 @@ export const TASK_NOTICE_LABEL_FALLBACKS: Readonly<Record<string, string>> = {
 	taskNoticeChangeClaimable: "put in the claim pool",
 	taskNoticeChangeOverlap: "also changing {path}",
 	taskNoticeChangeOverlapHidden: "another session's task is also changing it",
+	taskNoticeChangeAssignedHere: "assigned to this session",
+	taskNoticeChangeUnblockedDone: "a prerequisite was finished",
+	taskNoticeChangeUnblockedCancelled: "a prerequisite was cancelled",
+	taskNoticeChangeStillWaiting: "still waiting",
+	taskNoticeChangeCreated: "created by this session",
 	taskNoticeActivityTitle: "Team activity: {n} change(s)",
+	taskNoticeTeamTitle: "{who}: {n} task event(s) for this session",
 	taskNoticeJoin: "; ",
 	taskNoticeWhoJoin: ", ",
 	taskNoticeEditedTitle: "{who} changed {n} task(s)",
@@ -289,6 +297,21 @@ function changeNote(change: OutlineTaskNoticeChange, labels: Labels): string | n
 			return label(labels, "taskNoticeChangeClaimable");
 		case "overlap":
 			return label(labels, "taskNoticeChangeOverlap", { path: change.path });
+		case "assignedHere":
+			return label(labels, "taskNoticeChangeAssignedHere");
+		case "created":
+			return label(labels, "taskNoticeChangeCreated");
+		case "unblocked": {
+			const what = label(
+				labels,
+				change.by === "done"
+					? "taskNoticeChangeUnblockedDone"
+					: "taskNoticeChangeUnblockedCancelled",
+			);
+			return change.still
+				? `${what}${label(labels, "taskNoticeJoin")}${label(labels, "taskNoticeChangeStillWaiting")}`
+				: what;
+		}
 	}
 }
 
@@ -423,6 +446,23 @@ export function taskNoticeFromBody(
 			return notice(
 				"edited",
 				label(labels, "taskNoticeActivityTitle", { n }),
+				{
+					row: rows[0],
+					...(n > 1 ? { tail: label(labels, "taskNoticeMoreTail", { n: n - 1 }) } : {}),
+				},
+				rows,
+			);
+		}
+		if (body.variant === "team") {
+			// Team events (outline P2 PR 10a): one commit of one writer, named in the heading; a row
+			// per task and what happened to it.
+			const who = body.items.find((item) => item.by)?.by ?? sourceTitle;
+			const rows = body.items.map((item) => itemRow(item, labels, false));
+			if (body.more) rows.push(moreRow(body.more, labels));
+			const n = body.items.length + (body.more ?? 0);
+			return notice(
+				"edited",
+				label(labels, "taskNoticeTeamTitle", { who, n }),
 				{
 					row: rows[0],
 					...(n > 1 ? { tail: label(labels, "taskNoticeMoreTail", { n: n - 1 }) } : {}),

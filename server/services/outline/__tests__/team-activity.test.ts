@@ -151,7 +151,14 @@ async function changed() {
 			responsibleUserId: owner.id,
 			ops: [
 				{ op: "insert", tempId: "page", parent: null, content: "Work" },
-				{ op: "insert", parent: { tempId: "page" }, content: "Ship it", task: { status: "doing" } },
+				// A person's task A is doing: one A created itself ending elsewhere is its team row's
+				// to tell (outline P2 PR 10a), not team activity's.
+				{
+					op: "insert",
+					parent: { tempId: "page" },
+					content: "Ship it",
+					task: { status: "doing", manager: { kind: "human", id: owner.id } },
+				},
 			],
 		},
 		{ now: () => new Date(base - 2.5 * 60 * 60_000) },
