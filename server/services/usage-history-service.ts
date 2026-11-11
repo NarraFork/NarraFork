@@ -70,10 +70,15 @@ export interface UsageHistoryFilters {
 	includeSubagents?: boolean;
 }
 
-// Only requests with an actual cache read participate; ordinary totals stay unfiltered.
+/**
+ * 命中率 = 缓存读取 / 总输入（读取 + 写入 + 未缓存输入），**全部请求**参与。
+ *
+ * 不排除"写了缓存却一条没读到"的请求（新会话首轮、缓存过期重建）：那正是未命中，
+ * 排除它们只会把比率抬高，让数字和页面上并列的读/写/输入对不上。
+ */
 const cacheHitRateSelection = {
-	cacheHitRateReadTokens: sql<number>`coalesce(sum(case when ${apiRequests.cachedInputTokens} > 0 then ${apiRequests.cachedInputTokens} else 0 end), 0)`,
-	cacheHitRateInputTokens: sql<number>`coalesce(sum(case when ${apiRequests.cachedInputTokens} > 0 then ${apiRequests.cachedInputTokens} + coalesce(${apiRequests.cacheCreationInputTokens}, 0) + coalesce(${apiRequests.inputTokens}, 0) else 0 end), 0)`,
+	cacheHitRateReadTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`,
+	cacheHitRateInputTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens} + coalesce(${apiRequests.cacheCreationInputTokens}, 0) + coalesce(${apiRequests.inputTokens}, 0)), 0)`,
 };
 
 interface CacheHitRateTotals {
