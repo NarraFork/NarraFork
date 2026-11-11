@@ -96,7 +96,7 @@ export function TransferSessions({
 			)}
 			{sessions.data?.truncated && (
 				<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
-					{t("board.transfer.more", { count: sessions.data.limit })}
+					{t("board.transfer.more", { n: sessions.data.limit })}
 				</Text>
 			)}
 		</Stack>

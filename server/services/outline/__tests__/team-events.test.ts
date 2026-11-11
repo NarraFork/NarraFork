@@ -41,7 +41,9 @@ import {
 	OUTLINE_TEAM_EVENT_LIMITS,
 	OUTLINE_TEAM_SOURCE,
 	outlineTeamMessageId,
+	readOutlineTeamMessages,
 	repushRecentOutlineTeamEvents,
+	resetOutlineTeamHandOversForTests,
 	settleOutlineTeamEventsForTests,
 	startOutlineTeamEvents,
 } from "../team-events";
@@ -107,6 +109,7 @@ beforeEach(() => {
 	invalidateSessionReadScopes();
 	resetOutlineTeamActivityForTests();
 	resetOutlineAssignedForTests();
+	resetOutlineTeamHandOversForTests();
 	resetOutlineViewCache();
 	wakes = [];
 	started = true;
@@ -379,7 +382,189 @@ describe("the row and its wake", () => {
 	});
 });
 
+describe("one row per commit and session, whatever the commit is read as later", () => {
+	/** A row follows the session's last one: it ran on (a re-push then owes it no wake). */
+	const ranOn = (narratorId: string) =>
+		injection.deliverInjection(narratorId, { content: "went on", source: "test", role: "user" });
+
+	test("told as a team row; by the re-push the commit only ended a task it created: no second row, no second wake", async () => {
+		const { owner, space, planner, worker, by } = await pair();
+		// The planner created P, and is doing D, which waits for P.
+		const made = await commit(space.id, by, [
+			{ op: "insert", parent: null, content: "Prereq P", task: { status: "todo" } },
+		]);
+		const p = made.results[0] as OutlineOpResult;
+		const waiting = await commit(space.id, by, [
+			{
+				op: "insert",
+				parent: null,
+				content: "Dependent D",
+				task: { status: "doing", depends: [{ target: p.address, label: null }] },
+			},
+		]);
+		const d = waiting.results[0] as OutlineOpResult;
+		const finished = await commit(space.id, { agent: worker, owner: owner.id }, [
+			{ op: "setTask", block: { id: p.blockId }, task: { status: "done" } },
+		]);
+		expect(await deliverOutlineTeamEvents(finished.event)).toEqual({
+			told: [planner],
+			woke: 1,
+			deferred: 0,
+		});
+		const [first, ...rest] = await rows(planner);
+		expect(rest).toEqual([]);
+		expect(first?.source).toBe(OUTLINE_TEAM_SOURCE);
+		// The planner ran, and finished D: read again, the commit is no longer a prerequisite
+		// ending for it, only a task it created ending.
+		await ranOn(planner);
+		await commit(space.id, by, [
+			{ op: "setTask", block: { id: d.blockId }, task: { status: "done" } },
+		]);
+		wakes = [];
+		const again = await deliverOutlineTeamEvents(finished.event, { repush: true });
+		expect(again).toEqual({ told: [planner], woke: 0, deferred: 0 });
+		expect(await rows(planner)).toHaveLength(1);
+		expect(wakes).toEqual([]);
+	});
+
+	test("told as 9b's row; by the re-push the commit is also a prerequisite ending: still that one row", async () => {
+		const { owner, space, planner, worker, by } = await pair();
+		const made = await commit(space.id, by, [
+			{ op: "insert", parent: null, content: "Prereq P", task: { status: "todo" } },
+			{
+				op: "insert",
+				parent: null,
+				content: "Held by the worker",
+				task: { status: "todo" },
+			},
+		]);
+		const p = made.results[0] as OutlineOpResult;
+		const other = made.results[1] as OutlineOpResult;
+		// A task that waits for P exists, but the worker (who ends P) is doing it.
+		await commit(space.id, { agent: worker, owner: owner.id }, [
+			{
+				op: "setTask",
+				block: { id: other.blockId },
+				task: { status: "doing", depends: [{ target: p.address, label: null }] },
+			},
+		]);
+		const finished = await commit(space.id, { agent: worker, owner: owner.id }, [
+			{ op: "setTask", block: { id: p.blockId }, task: { status: "done" } },
+		]);
+		await deliverOutlineTeamEvents(finished.event);
+		const [first, ...rest] = await rows(planner);
+		expect(rest).toEqual([]);
+		expect(first?.source).toBe(OUTLINE_TASK_FINISHED_SOURCE);
+		await ranOn(planner);
+		// The waiting task passes to the planner (the worker stops, the planner takes it up).
+		await commit(space.id, { agent: worker, owner: owner.id }, [
+			{ op: "setTask", block: { id: other.blockId }, task: { status: "todo" } },
+		]);
+		await commit(space.id, by, [
+			{ op: "setTask", block: { id: other.blockId }, task: { status: "doing" } },
+		]);
+		wakes = [];
+		const again = await deliverOutlineTeamEvents(finished.event, { repush: true });
+		expect(again).toEqual({ told: [planner], woke: 0, deferred: 0 });
+		expect(await rows(planner)).toHaveLength(1);
+		expect(wakes).toEqual([]);
+	});
+
+	test("PostgreSQL: nothing is pushed again after a start (a row there has no id to find it by)", async () => {
+		const { space, worker, by } = await pair();
+		await commit(space.id, by, [assignTo("Would be told twice", worker)]);
+		const port = spyOn(refsStore, "getNarratorMessageRefsPort").mockReturnValue(
+			{} as ReturnType<typeof refsStore.getNarratorMessageRefsPort>,
+		);
+		const listed = spyOn(outlineStore, "listSpacesCommittedSince");
+		const deliver = spyOn(injection, "deliverInjection");
+		try {
+			expect(await repushRecentOutlineTeamEvents()).toEqual({ spaces: 0, commits: 0 });
+			await settleOutlineTeamEventsForTests();
+			expect(listed).not.toHaveBeenCalled();
+			expect(deliver).not.toHaveBeenCalled();
+		} finally {
+			port.mockRestore();
+			listed.mockRestore();
+			deliver.mockRestore();
+		}
+	});
+});
+
+describe("a task passed to and fro", () => {
+	test("handed back within ten minutes to the session that handed it away: recorded, not woken; later it wakes again", async () => {
+		const { owner, space, planner, worker, by } = await pair();
+		const t0 = Date.parse("2026-11-10T08:00:00.000Z");
+		const at = (minutes: number) => new Date(t0 + minutes * 60_000);
+		const made = await commit(space.id, by, [assignTo("Ping", worker)], at(0));
+		const task = made.results[0] as OutlineOpResult;
+		expect((await readOutlineTeamMessages(made.event))[0]).toMatchObject({
+			narratorId: worker,
+			wake: true,
+		});
+		const hand = (to: string, from: string, minutes: number) =>
+			commit(
+				space.id,
+				{ agent: from, owner: owner.id },
+				[{ op: "setTask", block: { id: task.blockId }, task: { assignee: `agent:${to}` } }],
+				at(minutes),
+			);
+		// The worker hands it straight back: the planner gets the row, and no wake.
+		const back = await hand(planner, worker, 2);
+		const [toPlanner] = await readOutlineTeamMessages(back.event);
+		expect(toPlanner).toMatchObject({ narratorId: planner, wake: false });
+		expect(toPlanner?.content).toContain("Ping");
+		// Read again (a retry, the re-push): the same answer.
+		expect((await readOutlineTeamMessages(back.event))[0]?.wake).toBe(false);
+		// And on again, and back again, all within minutes: nobody is woken by the bouncing.
+		expect(
+			(await readOutlineTeamMessages((await hand(worker, planner, 3)).event))[0],
+		).toMatchObject({ narratorId: worker, wake: false });
+		expect((await readOutlineTeamMessages((await hand(planner, worker, 4)).event))[0]?.wake).toBe(
+			false,
+		);
+		// Ten minutes on, a hand-over is a hand-over again.
+		const later = await hand(worker, planner, 4 + 11);
+		expect((await readOutlineTeamMessages(later.event))[0]).toMatchObject({
+			narratorId: worker,
+			wake: true,
+		});
+	});
+});
+
 describe("the wake limit", () => {
+	test("a deferred wake with a question of its own is kept beside the team rows', and asked when theirs says no", async () => {
+		const calls: string[] = [];
+		for (let i = 0; i < OUTLINE_TEAM_WAKE_LIMITS.perWindow; i++)
+			expect(takeTeamWake("s")).toBe(true);
+		const never = async () => true;
+		// A person's answer waits for room; then two team rows, the later replacing the earlier.
+		await wakeForTeam(
+			"s",
+			never,
+			async () => {
+				calls.push("answer");
+				return true;
+			},
+			"answer:m1",
+		);
+		await wakeForTeam("s", never, async () => {
+			calls.push("team-1");
+			return false;
+		});
+		await wakeForTeam("s", never, async () => {
+			calls.push("team-2");
+			return false;
+		});
+		expect(time.pending()).toBe(1);
+		await time.advance(OUTLINE_TEAM_WAKE_LIMITS.windowMs + 1);
+		// The newest first; the team row is no longer the last row, the answer is still owed.
+		expect(calls).toEqual(["team-2", "answer"]);
+		expect(hasDeferredTeamWake("s")).toBe(false);
+		// One wake was made of it.
+		expect(teamWakesLeft("s")).toBe(OUTLINE_TEAM_WAKE_LIMITS.perWindow - 1);
+	});
+
 	test(`${OUTLINE_TEAM_WAKE_LIMITS.perWindow} wakes a minute; the next row is written without one, and one wake follows when there is room`, async () => {
 		const { space, worker, by } = await pair();
 		for (let i = 0; i < OUTLINE_TEAM_WAKE_LIMITS.perWindow; i++) {

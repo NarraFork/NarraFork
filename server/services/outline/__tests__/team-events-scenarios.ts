@@ -414,6 +414,63 @@ export const OUTLINE_TEAM_EVENTS_SCENARIOS: TeamEventsScenario[] = [
 		},
 	},
 	{
+		name: "a prerequisite ended: a session named on a task in a space it may not read is told nothing",
+		async run(ctx) {
+			// A private project of one person; a session of someone else, elsewhere.
+			const insiderOwner = await ctx.person("pat");
+			const outsiderOwner = await ctx.person("uma");
+			const secret = await ctx.project(insiderOwner.id);
+			const elsewhere = await ctx.project(outsiderOwner.id);
+			const space = await ensureProjectSpace(secret);
+			const outsider = await ctx.session(outsiderOwner.id, elsewhere, { title: "Outsider" });
+			const insider = await ctx.session(insiderOwner.id, secret, { title: "Insider" });
+			const seeded = await tasks(space.id, human(insiderOwner.id), [{ title: "Base" }]);
+			const base = seeded.tasks[0] as OutlineOpResult;
+			// The person types the outsider's id on a task that waits for Base (the editor
+			// checks no assignee).
+			const named = await tasks(space.id, human(insiderOwner.id), [
+				{
+					title: "Secret plan title",
+					assignee: `agent:${outsider}`,
+					depends: [base.address],
+				},
+			]);
+			// Not told of the assignment, and not of the prerequisite ending: neither row may
+			// carry the task's title to a session that cannot read it.
+			expect(await read(named.written)).toEqual([]);
+			const done = await write(space.id, agent(insider, insiderOwner.id), [
+				setTask(base.blockId, { status: "done" }),
+			]);
+			expect((await read(done)).filter((m) => m.narratorId === outsider)).toEqual([]);
+		},
+	},
+	{
+		name: "a task that came to depend on an ended task afterwards is not told of the old commit",
+		async run(ctx) {
+			const { owner, space, sessions } = await team(ctx, ["Planner", "Doer"]);
+			const [planner, doer] = sessions as [string, string];
+			const seeded = await tasks(space.id, agent(doer, owner.id), [
+				{ title: "Done early", status: "doing" },
+			]);
+			const early = seeded.tasks[0] as OutlineOpResult;
+			const done = await write(space.id, agent(doer, owner.id), [
+				setTask(early.blockId, { status: "done" }),
+			]);
+			expect(await read(done)).toEqual([]);
+			// Later: tasks of the planner name the ended task as a prerequisite, in the same space
+			// and in its own.
+			await tasks(space.id, agent(planner, owner.id), [
+				{ title: "Written later here", status: "doing", depends: [early.address] },
+			]);
+			const own = await ensureSessionSpace(planner);
+			await tasks(own.id, agent(planner, owner.id), [
+				{ title: "Written later in its own space", depends: [early.address] },
+			]);
+			// The old commit read again (the re-push after a start) still concerns nobody.
+			expect(await read(done)).toEqual([]);
+		},
+	},
+	{
 		name: "one commit that concerns a session in three ways is one row; another session it only finished tasks of is told as before",
 		async run(ctx) {
 			const { owner, space, sessions } = await team(ctx, ["Planner", "Doer", "Creator"]);

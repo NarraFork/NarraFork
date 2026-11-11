@@ -165,13 +165,16 @@ interface Assigned {
 }
 
 /**
- * Who handed each task away last, in memory: what {@link Assigned.back} is read from. Keyed by
- * task; times are the commits' own, so reading a commit again says the same.
+ * Who handed each task away lately, in memory: what {@link Assigned.back} is read from. The last
+ * few hand-overs of a task, by commit; times are the commits' own, so reading a commit again (a
+ * retry, the re-push) says the same.
  */
+type HandOver = { by: string; at: number; commitId: string };
 const handedAway = hotSafe(
 	"narrafork.outlineTeamEvents.handedAway",
-	() => new Map<string, { by: string; at: number; commitId: string }>(),
+	() => new Map<string, HandOver[]>(),
 );
+const HAND_OVERS_PER_TASK = 4;
 
 /** Forget who handed what away (tests). */
 export function resetOutlineTeamHandOversForTests(): void {
@@ -179,16 +182,26 @@ export function resetOutlineTeamHandOversForTests(): void {
 }
 
 function noteHandedAway(taskId: string, by: string, at: number, commitId: string): void {
-	const known = handedAway.get(taskId);
-	// A commit read again (a retry, the re-push) changes nothing; an older one never replaces.
-	if (known && (known.commitId === commitId || known.at > at)) return;
+	const known = handedAway.get(taskId) ?? [];
+	if (known.some((h) => h.commitId === commitId)) return;
 	handedAway.delete(taskId);
-	handedAway.set(taskId, { by, at, commitId });
+	handedAway.set(taskId, [...known, { by, at, commitId }].slice(-HAND_OVERS_PER_TASK));
 	while (handedAway.size > OUTLINE_TEAM_EVENT_LIMITS.handOversRemembered) {
 		const [oldest] = handedAway.keys();
 		if (oldest === undefined) break;
 		handedAway.delete(oldest);
 	}
+}
+
+/** Whether session `root` handed the task away itself within the quiet time before `at`. */
+function handedAwayBy(taskId: string, root: string, at: number, commitId: string): boolean {
+	return (handedAway.get(taskId) ?? []).some(
+		(h) =>
+			h.by === root &&
+			h.commitId !== commitId &&
+			at >= h.at &&
+			at - h.at < OUTLINE_TEAM_EVENT_LIMITS.handBackQuietMs,
+	);
 }
 
 interface Unblocked {
@@ -281,13 +294,7 @@ async function assignedInCommit(
 		const root = sessions.get(candidate.assignee);
 		if (root === undefined) continue;
 		// Handed back within minutes by the session it was handed to: no wake (see `Assigned`).
-		const before = handedAway.get(candidate.blockId);
-		const back =
-			before !== undefined &&
-			before.by === root &&
-			before.commitId !== writer.commit.id &&
-			at >= before.at &&
-			at - before.at < OUTLINE_TEAM_EVENT_LIMITS.handBackQuietMs;
+		const back = handedAwayBy(candidate.blockId, root, at, writer.commit.id);
 		if (writer.writerRoot !== null && writer.writerRoot !== root)
 			noteHandedAway(candidate.blockId, writer.writerRoot, at, writer.commit.id);
 		// Its own session (or a subagent of it) assigned it: nothing to tell.

@@ -22,7 +22,7 @@ import { eventBus } from "../../../lib/event-bus";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { outlineAnswerBodySchema } from "../../../lib/validators/outline";
-import { setInjectionScheduler } from "../../narrator-injection";
+import { deliverInjection, setInjectionScheduler } from "../../narrator-injection";
 import { narratorPersistence } from "../../narrator-persistence";
 import { narratorStore } from "../../narrator-store";
 import { endTurn, startTurn } from "../../narrator-turns";
@@ -44,6 +44,7 @@ import { revertCommit } from "../revert";
 import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace } from "../spaces";
 import { outlineStore } from "../store";
+import { deliverOutlineTeamEvents } from "../team-events";
 import {
 	hasDeferredTeamWake,
 	OUTLINE_TEAM_WAKE_LIMITS,
@@ -739,6 +740,34 @@ describe("telling", () => {
 			expect(rows.filter((r) => r.role === "user")).toHaveLength(1);
 			expect(wakes).toEqual([]);
 			expect(hasDeferredTeamWake(w.a)).toBe(true);
+			// Meanwhile a team row for the same session waits for room too, and a row that wakes
+			// nobody follows it. The team row is then no longer the last row (it is owed no wake
+			// of its own), and must not take the answer's wake with it.
+			const other = await narrator(w.alice.id, w.projectId, "Planner");
+			const handed = await writeOutline({
+				spaceId: w.space.id,
+				ops: [
+					{
+						op: "insert",
+						parent: null,
+						content: "Also for the asker",
+						task: { status: "todo", assignee: `agent:${w.a}` },
+					},
+				],
+				actor: { kind: "agent", id: other },
+				narratorId: other,
+				responsibleUserId: w.alice.id,
+			});
+			const told = await deliverOutlineTeamEvents({
+				spaceId: w.space.id,
+				commitId: handed.commit?.id as string,
+				seq: handed.commit?.seq as number,
+				actorKind: "agent",
+				actorId: other,
+			});
+			expect(told).toEqual({ told: [w.a], woke: 0, deferred: 1 });
+			await deliverInjection(w.a, { content: "a note", source: "test", role: "sys" });
+			expect(wakes).toEqual([]);
 			// The window has room again: the one wake that was owed, as the person it ran for.
 			now += OUTLINE_TEAM_WAKE_LIMITS.windowMs + 1;
 			for (const timer of timers.filter((t) => !t.done && t.at <= now)) {

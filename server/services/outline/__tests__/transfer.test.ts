@@ -28,7 +28,11 @@ import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace } from "../spaces";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
-import { listTransferSessions } from "../transfer";
+import {
+	listTransferSessions,
+	OUTLINE_TRANSFER_LIMITS,
+	startSessionOnTransferredTask,
+} from "../transfer";
 import { type OutlineOp, type OutlineWriteResult, writeOutline } from "../write";
 
 const NOW = "2026-11-10T00:00:00.000Z";
@@ -373,6 +377,7 @@ describe("OutlineEdit", () => {
 		);
 		expect(label.isError).toBeFalsy();
 		expect(label.output).toContain('no session has the id or handle "w-docs"');
+		expect(label.output).toContain("still in progress and still yours");
 		// Writing the same label again assigns nothing, and says nothing.
 		await outlineReadTool.execute({ address: page, view: "all" }, c);
 		const again = await outlineEditTool.execute(
@@ -452,7 +457,12 @@ describe("who a task may be handed to", () => {
 		const principal = { userId: owner.id, isAdmin: false };
 		const offered = await listTransferSessions(principal, space);
 		expect(offered.truncated).toBe(false);
-		expect(offered.sessions[0]).toEqual({ narratorId: named, title: "Ops", handle });
+		expect(offered.sessions[0]).toEqual({
+			narratorId: named,
+			title: "Ops",
+			handle,
+			canStart: true,
+		});
 		expect(offered.sessions.map((s) => s.narratorId).sort()).toEqual([first, second, named].sort());
 		expect(offered.sessions.some((s) => s.narratorId === hidden)).toBe(false);
 
@@ -484,10 +494,22 @@ describe("who a task may be handed to", () => {
 			assignee: `agent:${first}`,
 		});
 		expect(await claimOf(kept.blockId)).toMatchObject({ holderNarratorId: first, epoch: 1 });
-		// A session that could not do it, an archived one, a subagent, an unknown id: refused.
+		// Only a session the picker would list is accepted: not one that could not do it, an
+		// unknown id, a session of another project, or one keeping its tasks in Dynamic Spec.
 		const stranger = await person("stranger");
 		const outsider = await session(stranger.id, null);
-		for (const narratorId of [outsider, "no-such-session"]) {
+		const otherProject = generateId();
+		await db.insert(projects).values({
+			id: otherProject,
+			name: `elsewhere-${otherProject}`,
+			ownerUserId: owner.id,
+			visibility: "private",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		const elsewhere = await session(owner.id, otherProject, { title: "Elsewhere" });
+		const spec = await session(owner.id, projectId, { title: "Spec too", taskBackend: "spec" });
+		for (const narratorId of [outsider, "no-such-session", elsewhere, spec]) {
 			await expect(
 				changePersonTask({
 					principal,
@@ -497,5 +519,124 @@ describe("who a task may be handed to", () => {
 				}),
 			).rejects.toThrow("This session cannot work on this task");
 		}
+	});
+});
+
+describe("the picker", () => {
+	test("sessions that could not do the task do not use up the list: those that could are found past them, and `truncated` counts only those", async () => {
+		const { owner, projectId, space, first, second } = await world();
+		// More sessions of the project than one page that could NOT take the task (their person
+		// may not write the project), named so they sort first.
+		const stranger = await person("stranger");
+		const many = OUTLINE_TRANSFER_LIMITS.page + 5;
+		for (let i = 0; i < many; i++) {
+			const handle = `Zz${i}x${generateId()
+				.replace(/[^A-Za-z0-9]/g, "")
+				.slice(0, 8)}`;
+			await session(stranger.id, projectId, { handle, handleFold: foldHandle(handle) });
+		}
+		// An admin reads them all, so only "could it do the task" leaves them out.
+		const offered = await listTransferSessions({ userId: owner.id, isAdmin: true }, space);
+		expect(offered.sessions.map((s) => s.narratorId).sort()).toEqual([first, second].sort());
+		expect(offered.truncated).toBe(false);
+	});
+
+	test("「转交并开始」 is offered only where the person may write the session", async () => {
+		const { owner, projectId, space, first } = await world();
+		const other = await person("other");
+		const theirs = await session(other.id, projectId, { title: "Theirs" });
+		for (const [scopeType, scopeId, principalId, capability] of [
+			["project", projectId, other.id, "write"],
+			["narrator", theirs, owner.id, "read"],
+		] as const)
+			await db.insert(aclGrants).values({
+				id: generateId(),
+				scopeType,
+				scopeId,
+				principalType: "user",
+				principalId,
+				capability,
+				createdAt: NOW,
+			});
+		const offered = await listTransferSessions({ userId: owner.id, isAdmin: false }, space);
+		const by = new Map(offered.sessions.map((s) => [s.narratorId, s.canStart]));
+		expect(by.get(first)).toBe(true);
+		expect(by.get(theirs)).toBe(false);
+	});
+});
+
+describe("转交并开始, when the start declines or the task is held", () => {
+	/** A session layer whose start declines after the blocker let it through. */
+	const declining = {
+		outlineTaskStartBlocker: async () => undefined,
+		startSpecContinuationIfPossible: async () => ({ started: false }),
+	};
+
+	test("a claim the start made is given back: the task is to do again, nobody holds it", async () => {
+		const { owner, space, second } = await world();
+		const written = await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{
+					op: "insert",
+					parent: null,
+					content: "Start me",
+					task: { status: "todo", assignee: `agent:${second}` },
+				},
+			],
+			actor: { kind: "human", id: owner.id },
+			responsibleUserId: owner.id,
+		});
+		const id = written.results[0]?.blockId as string;
+		const out = await startSessionOnTransferredTask({
+			narratorId: second,
+			userId: owner.id,
+			blockId: id,
+			session: declining,
+		});
+		expect(out).toEqual({ started: false, notStarted: "not_started" });
+		expect((await taskOf(id))?.status).toBe("todo");
+		// Claimed for the start (generation 1), then released.
+		expect(await claimOf(id)).toMatchObject({
+			holderNarratorId: null,
+			epoch: 1,
+			lastHolderNarratorId: second,
+		});
+	});
+
+	test("a claim the session held before the click stays its own", async () => {
+		const { owner, space, second } = await world();
+		const task = await doing(space, second, owner.id, "Already mine");
+		const out = await startSessionOnTransferredTask({
+			narratorId: second,
+			userId: owner.id,
+			blockId: task.blockId,
+			session: declining,
+		});
+		expect(out).toEqual({ started: false, notStarted: "not_started" });
+		expect((await taskOf(task.blockId))?.status).toBe("doing");
+		expect(await claimOf(task.blockId)).toMatchObject({ holderNarratorId: second, epoch: 1 });
+	});
+
+	test("a task someone else is doing is not started on, and their claim is left alone", async () => {
+		const { owner, space, first, second } = await world();
+		const task = await doing(space, first, owner.id, "Theirs");
+		let asked = 0;
+		const out = await startSessionOnTransferredTask({
+			narratorId: second,
+			userId: owner.id,
+			blockId: task.blockId,
+			session: {
+				outlineTaskStartBlocker: async () => undefined,
+				startSpecContinuationIfPossible: async () => {
+					asked++;
+					return { started: true };
+				},
+			},
+		});
+		expect(out).toEqual({ started: false, notStarted: "not_started" });
+		expect(asked).toBe(0);
+		expect((await taskOf(task.blockId))?.status).toBe("doing");
+		expect(await claimOf(task.blockId)).toMatchObject({ holderNarratorId: first, epoch: 1 });
 	});
 });

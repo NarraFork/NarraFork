@@ -598,7 +598,7 @@
 			"andStart": "Hand over and start",
 			"empty": "No session of this project can take it.",
 			"failed": "Could not list the sessions",
-			"more": "Only the first {{count}} sessions are listed.",
+			"more": "Only the first {{n}} sessions are listed.",
 			"untitled": "Untitled session",
 			"started": "Handed over; the session started on it.",
 			"notStarted": {
